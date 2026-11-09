@@ -1,8 +1,7 @@
-# RDS activation executor (separate-database layout) — interface
+# RDS activation executor (separate-database layout)
 
-Contract id: **`rds-activation/v1`**. Status: interface, then a reviewed implementation in
-the same draft PR. Nothing here authorizes running it against a real database. A live
-run needs Khaliq's explicit OK in his own words.
+Contract id: **`rds-activation/v1`**. Nothing here authorizes running it against a real
+database. A live run needs Khaliq's explicit OK in his own words.
 
 Target, fixed by the infra postgres-layout contract (infra #107, separate service
 databases on one RDS PostgreSQL instance):
@@ -14,9 +13,12 @@ databases on one RDS PostgreSQL instance):
 | Migration owner (LOGIN) | `hoop` |
 | Runtime role (LOGIN) | `sessions_pipeline_runtime` |
 | Named executor (NOLOGIN, transaction-scoped) | `hoopdb_activation_executor` |
+| Fixed service roles | generated from the repository's role SQL (below) |
 
 The names are constants of `rds-activation/v1`, not inputs. A different set is a
-different contract id.
+different contract id. PostgreSQL 16 or later is required. PostgreSQL 15 is refused
+before any change, because its CREATEROLE semantics differ: it records no creator
+ADMIN edge, and any CREATEROLE role there can alter any non-superuser role.
 
 ## Entrypoint
 
@@ -27,80 +29,133 @@ bun src/hoopdb/rds-activation.ts <command> [flags]
 | Command | What it does | Connects as | Database | Transaction |
 |---|---|---|---|---|
 | `artifact` | Writes the artifact identity to the result channel. No connection. | none | none | none |
-| `create-database` | Step 1. `CREATE DATABASE hoopdb` if absent, then verifies it. Idempotent. | provisioning login (`--provisioner`, the RDS master) | `--maintenance-db` (default `postgres`) | none (autocommit; PostgreSQL forbids `CREATE DATABASE` in a transaction block) |
-| `activate` | Step 2. All role, grantor-graph, LOGIN, default-privilege, ownership and cleanup work, then the final graph validation. | provisioning login | `hoopdb` | exactly one (`BEGIN` ... `COMMIT`); any failure rolls back everything |
-| `verify` | Step 3. Read-only. Proves `hoop` and `sessions_pipeline_runtime` log in with their passwords and re-derives the final graph. | `hoop`, then `sessions_pipeline_runtime` | `hoopdb` | read-only |
-| `run` | `create-database`, then `activate` (skipped if the shared catalogs already show the activated state), then `verify`. | as above | as above | as above |
+| `create-database` | Step 1. `CREATE DATABASE hoopdb TEMPLATE template0` if absent, then verifies it (UTF8, not a template, owner = provisioner or `hoop`). Idempotent; a concurrent creator (42P04) is tolerated and verified. | provisioning login (`--provisioner`, the RDS master) | `--maintenance-db` (default `postgres`) | none. PostgreSQL forbids `CREATE DATABASE` in a transaction block, because it copies the template on disk and cannot be rolled back. |
+| `activate` | Step 2. All role, grantor-graph, setting, LOGIN, default-privilege, ownership and cleanup work, then the final graph validation. Skipped (status `already_activated`) when the shared catalogs show the activated state. | provisioning login | `hoopdb` | exactly one (`BEGIN` ... `COMMIT`); any failure rolls back everything |
+| `verify` | Step 3. Read-only. Proves `hoop` and `sessions_pipeline_runtime` log in with their passwords, and re-derives the final graph as `hoop`. | `hoop`, then `sessions_pipeline_runtime` | `hoopdb` | `READ ONLY` |
+| `run` | `create-database`, then `activate`, then `verify`. | as above | as above | as above |
+| `rotate-self` | One LOGIN role changes its own password, then proves that the new one logs in and the old one is refused (28P01). | the role itself (`--role`) | `hoopdb` | single statement |
 
-Who does what inside `activate` (one transaction, in this order):
+### Transaction boundary and who does what inside `activate`
 
-1. Provisioning login: read-only preconditions; sets the function defaults of
-   `rds_superuser` and of itself **in `hoopdb` only** (`pg_default_acl` is per database).
-2. Provisioning login: `CREATE ROLE hoopdb_activation_executor NOLOGIN NOINHERIT CREATEROLE`,
-   then grants itself `SET` (not `INHERIT`) on it, then `SET LOCAL ROLE` to it.
-3. `hoopdb_activation_executor`: creates `hoop`, `sessions_pipeline_runtime` and the fixed
-   NOLOGIN roles, all NOLOGIN first; checks the grantor graph; arms LOGIN with the
-   password verifiers; grants itself `SET` on `hoop`.
-4. Provisioning login: `ALTER DATABASE hoopdb OWNER TO hoop` (through the SET chain).
-5. `hoop` (`SET LOCAL ROLE`): database ACL (`REVOKE ALL ... FROM PUBLIC`,
-   `GRANT CONNECT ... TO sessions_pipeline_runtime`), `CREATE SCHEMA sessions`, its own
-   global function default.
-6. `RESET ROLE`; the provisioning login drops `hoopdb_activation_executor`, which removes
-   every membership edge the bootstrap created.
-7. Final validation of attributes, the membership graph, ownership, the database ACL
-   and the default ACLs. A mismatch raises and the whole transaction rolls back.
+The steps run in this order inside one transaction, with `lock_timeout = 10s` and a
+session advisory lock, so two executors never interleave:
 
-After `activate` commits: no helper role, no membership edge touching any HoopDb role,
-`hoop` is not a member of `rds_superuser` and has no CREATEROLE/CREATEDB, and the
-provisioning login holds nothing on `hoopdb` (it cannot even CONNECT).
+| Fragment | Runs as | Does |
+|---|---|---|
+| `00_preconditions` | provisioner | Read-only. Checks PG16+, session_user = current_user = the named provisioner, non-superuser with CREATEROLE and CREATEDB that inherits `rds_superuser`, `rdsadmin` SUPERUSER, `hoopdb` still owned by the provisioner and pristine (no schema besides `public`, no extension besides plpgsql, empty `public`, no foreign default ACL), every spec role and the executor absent, and the verifiers well-formed and distinct. |
+| `10_provisioner_function_defaults` | provisioner | `ALTER DEFAULT PRIVILEGES FOR ROLE rds_superuser` and `FOR ROLE <provisioner>` `REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`, **in `hoopdb` only**. On RDS both can CREATE in `sessions` (#389), and only an `rds_superuser` inheritor can set that role's default. |
+| `20_executor` | provisioner | `CREATE ROLE hoopdb_activation_executor NOLOGIN NOINHERIT CREATEROLE`, then a SET-only self grant, then `SET LOCAL ROLE`. Asserts the executor's exact two edges. |
+| `30_roles` | executor | Creates every spec role NOLOGIN with its exact settings, then asserts the grantor graph (below). |
+| `40_login` | executor | `ALTER ROLE ... LOGIN PASSWORD <verifier>` for every LOGIN role, clears the bound verifiers, then grants itself SET on `hoop`. |
+| `50_owner_handoff` | provisioner, then `hoop` | `ALTER DATABASE hoopdb OWNER TO hoop` (through the SET chain). Then, as `hoop`: `REVOKE ALL ON DATABASE hoopdb FROM PUBLIC`, `GRANT CONNECT` to each LOGIN role, `CREATE SCHEMA sessions`, and hoop's own global function default. |
+| `60_cleanup` | provisioner | `DROP ROLE hoopdb_activation_executor`. |
+| `70_validate` | provisioner | Final validation (below). A mismatch raises, and the whole transaction rolls back. |
+
+### Grantor graph
+
+```
+during the transaction (PostgreSQL 16+; "a" ADMIN, "i" INHERIT, "s" SET)
+
+  provisioner ──(a, grantor rdsadmin: automatic creator edge)──────────▶ executor
+  provisioner ──(s, grantor provisioner: self grant, no INHERIT)───────▶ executor
+  executor    ──(a, grantor rdsadmin: automatic creator edge)──────────▶ hoop
+  executor    ──(a, grantor rdsadmin)──────────────────────────────────▶ sessions_pipeline_runtime
+  executor    ──(a, grantor rdsadmin)──────────────────────────────────▶ each fixed service role
+  executor    ──(s, grantor executor: SET chain for ALTER DATABASE OWNER)▶ hoop
+
+after DROP ROLE hoopdb_activation_executor (fragment 60)
+
+  (no edges) No pg_auth_members row has a HoopDb role or the executor as role,
+  member or grantor. hoop is a member of nothing (not rds_superuser) and has no
+  members, and the provisioner holds no edge on any HoopDb role.
+```
+
+`DROP ROLE` removes every row in which the dropped role is the role, the member or
+the grantor. This was measured on PostgreSQL 16.11 and 17.11: 0 edges and 0 dangling
+grantors remain. The automatic creator edges cannot be revoked by a non-superuser
+beforehand, and nothing is re-granted under another grantor, because the target graph
+is empty. Fragment 70 asserts the empty graph, the absence of the executor and of any
+dangling grantor, the exact attributes and settings of every spec role, that `hoop`
+owns `hoopdb` and `sessions`, an exact `hoopdb` ACL (`hoop` as owner, CONNECT only for
+each LOGIN role, nothing for PUBLIC or the provisioner), the exact three global function
+defaults, no other default-ACL row, and that no role other than `hoop` holds CREATE or
+TEMPORARY.
+
+After commit, the provisioner cannot CONNECT to `hoopdb` (42501) or ALTER, SET ROLE
+to, GRANT or DROP any HoopDb role, and `hoop` cannot CREATE ROLE.
+
+## Role set (generated, never hand-maintained)
+
+The driver builds the role spec at runtime from these files, all of which are part of
+the artifact identity:
+
+- `rds_migration_roles.sql`: the fixed NOLOGIN inventory.
+- `session_consumer_roles.sql`: the bare consumer role.
+- `session_directory_search_worker.sql` and every operator `*_role.sql` (except the
+  legacy runtime-role files): LOGIN and every `ALTER ROLE ... SET k = v`.
+
+A unit test fails when any bootstrap file creates or alters, by name, a role that the
+spec does not cover. A second unit test fails when a file that arms LOGIN or sets a role
+setting is not a spec source. After activation, `hoop` holds no ADMIN or CREATEROLE.
+So on this layout every LOGIN and every setting must be created by activation, and the
+operator `*_role.sql` files must not still need to create or alter a role.
+
+One deliberate exception: `bulls96_babysitter_retention` is created NOLOGIN, with its
+settings. The landed (frozen) migration `20261105042000_babysitter_evidence_retention.sql`
+refuses a role that can already log in when it first applies. Nobody can arm LOGIN
+later on this layout, so that login is unavailable until a reviewed path exists. A unit
+test pins the exception to the migration text.
 
 ## Inputs
 
-Non-secret inputs: a flag or an environment variable. The flag wins only when the
-environment variable is unset. When both are set and differ, the input is refused.
+Non-secret inputs are a flag or an environment variable. When both are set and differ,
+the input is refused.
 
 | Flag | Env | Required | Meaning |
 |---|---|---|---|
-| `--host` | `HOOPDB_ACTIVATION_HOST` | yes (not `artifact`) | RDS writer endpoint |
+| `--host` | `HOOPDB_ACTIVATION_HOST` | yes (not `artifact`) | RDS writer endpoint host name |
 | `--port` | `HOOPDB_ACTIVATION_PORT` | no (5432) | |
-| `--provisioner` | `HOOPDB_ACTIVATION_PROVISIONER` | `create-database`, `activate`, `run` | Name of the provisioning login (the RDS master). Must equal `session_user`. |
-| `--maintenance-db` | `HOOPDB_ACTIVATION_MAINTENANCE_DB` | no (`postgres`) | Database for step 1 |
+| `--provisioner` | `HOOPDB_ACTIVATION_PROVISIONER` | all except `artifact`, `rotate-self` | Name of the provisioning login (the RDS master). Must equal `session_user`. It may not be a HoopDb, executor or RDS platform role. |
+| `--maintenance-db` | `HOOPDB_ACTIVATION_MAINTENANCE_DB` | no (`postgres`) | Database for step 1 and the activated-state probe |
 | `--tls` | `HOOPDB_ACTIVATION_TLS` | no (`verify-full`) | `verify-full` or `disable`. `disable` is refused unless the host is a loopback address (emulation only). |
-| `--ca-file` | `HOOPDB_ACTIVATION_CA_FILE` | with `verify-full` | Path to the pinned RDS CA bundle (public data, not a credential). Chain and hostname are both verified. |
-| `--secrets-stdin` | none | no | Read secrets from stdin (below) instead of the environment |
-| `--result-file` | `HOOPDB_ACTIVATION_RESULT_FILE` | one of the two | Path for the JSON result (created with mode 0600; refused if it exists) |
-| `--result-fd` | `HOOPDB_ACTIVATION_RESULT_FD` | one of the two | Already-open file descriptor (3 or above) for the JSON result |
+| `--ca-file` | `HOOPDB_ACTIVATION_CA_FILE` | with `verify-full` | Path to the pinned RDS CA bundle (public data). Chain and host name are both verified; an IP host is refused. |
+| `--role` | `HOOPDB_ACTIVATION_ROLE` | `rotate-self` only | A LOGIN role of the spec |
+| `--secrets-stdin` | none | no | Read secrets from stdin instead of the environment |
+| `--result-file` | `HOOPDB_ACTIVATION_RESULT_FILE` | one of the two | Path for the JSON result. It is created with mode 0600 and refused if it exists. |
+| `--result-fd` | `HOOPDB_ACTIVATION_RESULT_FD` | one of the two | Already-open file descriptor, 3 or above |
 
 Secrets come only from the environment or stdin at runtime, never from argv, a file or a
-connection URL:
+connection URL. Arguments that look like a secret or a URL are refused.
 
-| Env | stdin JSON key | Needed by |
+| Env | stdin JSON | Needed by |
 |---|---|---|
 | `HOOPDB_ACTIVATION_PROVISIONER_PASSWORD` | `provisioner_password` | `create-database`, `activate`, `run` |
-| `HOOPDB_ACTIVATION_HOOP_PASSWORD` | `hoop_password` | `activate` (fresh), `verify`, `run` |
-| `HOOPDB_ACTIVATION_RUNTIME_PASSWORD` | `runtime_password` | `activate` (fresh), `verify`, `run` |
+| `HOOPDB_ACTIVATION_PASSWORD_<ROLE>` (upper-case role name, for example `HOOPDB_ACTIVATION_PASSWORD_HOOP`) | `role_passwords: {"<role>": "..."}` | every LOGIN role for `activate` and `run`; `hoop` and `sessions_pipeline_runtime` for `verify` |
+| `HOOPDB_ACTIVATION_CURRENT_PASSWORD`, `HOOPDB_ACTIVATION_NEW_PASSWORD` | `current_password`, `new_password` | `rotate-self` |
 
 With `--secrets-stdin`, stdin must be one JSON object with only these keys, and none of
-the three variables may be set. The two role passwords must be distinct and at least 32
-characters long, and neither may equal the provisioner password. The driver sends only
-a client-computed SCRAM-SHA-256 verifier to the server, never the plaintext. Nothing is
+the secret variables may be set. A password variable for a role outside the spec is
+refused. Role passwords must be printable ASCII, at least 32 characters, all distinct,
+and different from the provisioner password. The driver sends only a client-computed
+SCRAM-SHA-256 verifier (4096 iterations, random salt) to the server, never the
+plaintext. The verifiers are bound as bind parameters and used through `EXECUTE`, so
+they appear in no top-level statement text, and they are cleared after use. Nothing is
 written to disk except the result, which never contains a secret or a verifier.
 
 ## Outputs
 
 stdout and stderr carry human-readable progress only. They are **not** an interface and
 must never be parsed. The machine-readable result is one JSON document written once, at
-exit, to `--result-file` or `--result-fd`, and nowhere else.
-
-Exit codes:
+exit, to `--result-file` or `--result-fd`, and nowhere else. Invalid input (exit 2)
+writes no result, because the result channel may itself be the invalid input.
 
 | Code | `status` | Meaning |
 |---|---|---|
-| 0 | `activated`, `already_activated`, `verified`, `database_ready`, `artifact` | success |
-| 2 | `invalid_input` | bad flags, environment or secrets; no connection was made |
-| 3 | `refused` | a precondition failed; nothing was changed (step 1 may report `database.created=false`) |
-| 4 | `rolled_back` | the `activate` transaction failed and was rolled back; an empty `hoopdb` from step 1 may remain, and re-running is safe |
-| 5 | `verify_failed` | post-commit verification failed; `activate` did commit |
+| 0 | `activated`, `already_activated`, `verified`, `database_ready`, `rotated`, `artifact` | success |
+| 2 | (no result) | bad flags, environment or secrets; no connection was made |
+| 3 | `refused` | a precondition failed (step 1, the state probe, fragment 00, or `rotate-self` login); nothing was changed |
+| 4 | `rolled_back` | the `activate` transaction failed after fragment 00 and was rolled back; an empty `hoopdb` from step 1 may remain, and a re-run is safe |
+| 5 | `verify_failed` | post-commit verification (or the `rotate-self` re-login check) failed; `activate` did commit |
 | 1 | `internal_error` | anything else |
 
 Result document (v1):
@@ -115,27 +170,29 @@ Result document (v1):
   "status": "activated",
   "exit_code": 0,
   "server_version_num": 170004,
-  "steps": [{ "name": "create-database", "status": "ok", "sqlstate": null, "message": null }],
+  "steps": [{ "name": "create-database", "status": "ok", "sqlstate": null, "message": "created" }],
   "database": { "name": "hoopdb", "created": true, "owner": "hoop" },
-  "graph": { "edges": [], "helper_present": false, "roles": [] }
+  "graph": { "edges": [], "helper_present": false, "roles": ["anon", "..."] }
 }
 ```
 
-`steps[].message` is a server or driver message with any secret material removed. The
-result never contains passwords, SCRAM verifiers or connection strings.
+`steps[].message` is a server or driver message, scrubbed of every secret and of any
+SCRAM verifier.
 
 ## Artifact identity
 
-`artifact_sha256` is the SHA-256 of the UTF-8 JSON array `artifact_files`: the ordered
-list of `[repo-relative path, sha256(file bytes)]` for every SQL fragment in execution
-order, followed by the driver `src/hoopdb/rds-activation.ts`. Any byte change to a
-fragment or the driver changes the identity. `bun src/hoopdb/rds-activation.ts artifact
---result-fd 3` prints it without connecting. `migration_generation` is reported for
-pairing with the migrator, but it is not part of the artifact hash.
+`artifact_sha256` is the SHA-256 of the UTF-8 JSON array `artifact_files`. That array
+is the ordered list of `[repo-relative path, sha256(file bytes)]`: every SQL fragment in
+execution order, then the role-spec source files (sorted), then the driver
+`src/hoopdb/rds-activation.ts`. Any byte change to any of them changes the identity.
+`bun src/hoopdb/rds-activation.ts artifact --result-fd 3 3>artifact.json` produces it
+without connecting. `migration_generation` is reported for pairing with the migrator,
+but it is not part of the artifact hash.
 
 ## Migrator contract after activation
 
-Run the phase-1 bootstrap chain and then the migrator as `hoop`, with:
+Run the phase-1 bootstrap chain (`SESSION_BOOTSTRAP_FILES`), then the migrator, as
+`hoop`, with:
 
 ```
 HOOPDB_DB_MODE=rds
@@ -145,9 +202,55 @@ HOOPDB_RUNTIME_ROLE_LOGIN=true
 HOOPDB_FUNCTION_BOUNDARY_MODE=global-default-revoke
 ```
 
-`HOOPDB_RDS_LAYOUT=separate-database` selects the separate-database owner preflight.
-It requires `hoop` to be a non-superuser with no CREATEROLE, CREATEDB, REPLICATION or
-BYPASSRLS, to be a member of no role (so not `rds_superuser`), and to have no members.
-`hoop` must own the current database and `sessions`. The fixed `rdsadmin` SUPERUSER and
-a NOLOGIN, non-superuser `rds_superuser` must exist, and the activation executor must be
-gone. Unset, or `master-owner`, keeps today's rds contract unchanged.
+Why the existing preflight refuses a plain `hoop`: in rds mode `rdsOwnerPreflight`
+requires the migration owner to be a CREATEROLE member of `rds_superuser`. That
+membership is its proof that the server is RDS-shaped, and the legacy `rds_*`
+bootstrap files run as that identity. A plain `hoop` therefore fails with
+`rds_profile_unproven` on both `owner_rds_superuser` and `owner_createrole`.
+`HOOPDB_RDS_LAYOUT=separate-database` selects `rdsSeparateOwnerPreflight` instead. It
+requires:
+
+- `hoop` is not a superuser, and has no CREATEROLE, CREATEDB, REPLICATION or BYPASSRLS;
+- `hoop` is a member of no role (so not `rds_superuser`), and has no members;
+- `hoop` owns the current database and `sessions`;
+- the fixed `rdsadmin` SUPERUSER exists, and so does a NOLOGIN, non-superuser `rds_superuser`;
+- the activation executor is gone, and the session uses no SET ROLE.
+
+In this layout the runtime role must have no member at all: the master-owner creator
+edge is refused. With the variable unset or set to `master-owner`, today's rds contract
+is unchanged. The function-boundary gate is the same rds gate: `rdsadmin` is the
+excluded trust root, and `rds_superuser` and the provisioner are covered by fragment
+10.
+
+Emulated on PG16 and PG17: the phase-1 chain, a full migrate, runtime readiness
+(`schemaVerdict` as `sessions_pipeline_runtime`), a second migrate (0 applied) and
+`verify` all pass after activation.
+
+## Security model and trade-offs
+
+- **No standing capability.** After `activate`, only `rdsadmin` (AWS) holds ADMIN on any
+  HoopDb role. The provisioner holds nothing on `hoopdb`, and `hoop` cannot create or
+  alter roles.
+- **Rotation is self-rotation only** (`rotate-self`). Each LOGIN role changes its own
+  password while logged in with the current one. A master-driven rotation cannot work:
+  after activation the master can neither grant a helper ADMIN on a role ("permission
+  denied to grant role") nor alter it ("permission denied to alter role"). Measured on
+  PG16 and PG17. Keeping a master creator edge instead would let the master grant
+  itself SET and become the role, which breaks "the provisioning login holds nothing".
+  1Password is the system of record, with each secret versioned.
+- **A lost service-role password has no customer-held recovery.** On the same instance
+  the master is refused `DROP ROLE` on the HoopDb roles, so the existing roles block
+  re-activation. A snapshot restore brings back the same roles and verifiers. The
+  break-glass path is therefore one of:
+  - a new RDS instance, with a logical dump/restore of `hoopdb`, re-activated there; or
+  - AWS support.
+- **Fresh instance only.** Roles are instance-wide, so a second activation on the same
+  instance is refused by fragment 00 (each existing role is listed).
+- **Database ACL is ours.** PUBLIC loses CONNECT, TEMPORARY and CREATE on `hoopdb`.
+  Denying our roles CONNECT to *other* databases (for example `postgres` or
+  `relaycontrol`, which keep the PostgreSQL default PUBLIC CONNECT) is each database
+  owner's job under infra #107, not this executor's.
+- **Not covered by the emulation.** Real `rds_superuser` behaviour (#389 CREATE, any
+  hidden ADMIN path), IAM authentication, parameter groups and `log_statement` settings
+  that might log bind parameters (the verifiers, never plaintext). These are live gates
+  for the approved live run.

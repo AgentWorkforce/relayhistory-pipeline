@@ -269,6 +269,8 @@ describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
         runtimeRole: "hoop_runtime",
         runtimeLogin: true,
         functionBoundary: "global-default-revoke",
+        // Unset HOOPDB_RDS_LAYOUT keeps today's master-owner contract.
+        rdsLayout: "master-owner",
       });
   });
 

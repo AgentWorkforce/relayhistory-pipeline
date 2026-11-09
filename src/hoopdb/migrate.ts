@@ -119,7 +119,16 @@ export interface MigrationProfile {
    * itself proves the selected control. Required outside local mode.
    */
   functionBoundary?: FunctionBoundaryMode;
+  /**
+   * HOOPDB_RDS_LAYOUT, rds mode only. "master-owner" (default, today's contract): the
+   * migration owner is the RDS master, a CREATEROLE member of rds_superuser.
+   * "separate-database" (rds-activation/v1, infra #107): the owner is a plain hoop that
+   * owns its dedicated database and sessions, and is a member of no role. See
+   * rdsSeparateOwnerPreflight and docs/rds-activation-executor.md.
+   */
+  rdsLayout?: RdsLayout;
 }
+export type RdsLayout = "master-owner" | "separate-database";
 
 function profileError(code: string, message: string): Error {
   return Object.assign(new Error(`96bulls: ${message}`), { code });
@@ -157,6 +166,11 @@ export function migrationProfile(
   const shim = strictFlag(env, "HOOPDB_SUPABASE_SHIM");
   const bootstrap = strictFlag(env, "HOOPDB_ROLE_BOOTSTRAP");
   const verify = strictFlag(env, "HOOPDB_ROLE_VERIFY") ?? true;
+  if (mode !== "rds" && env.HOOPDB_RDS_LAYOUT)
+    throw profileError(
+      "db_profile_invalid",
+      "HOOPDB_RDS_LAYOUT is only valid with HOOPDB_DB_MODE=rds",
+    );
   if (mode === "supabase" && shim)
     throw profileError(
       "shim_forbidden",
@@ -251,8 +265,15 @@ export function migrationProfile(
       );
     return { mode, shim: false, bootstrap: false, verify, ...runtime };
   }
-  if (mode === "rds")
-    return { mode, shim: false, bootstrap: false, verify, ...runtime };
+  if (mode === "rds") {
+    const layout = env.HOOPDB_RDS_LAYOUT || "master-owner";
+    if (layout !== "master-owner" && layout !== "separate-database")
+      throw profileError(
+        "db_profile_invalid",
+        `HOOPDB_RDS_LAYOUT must be master-owner or separate-database (got "${layout}")`,
+      );
+    return { mode, shim: false, bootstrap: false, verify, ...runtime, rdsLayout: layout };
+  }
   if (shim === undefined)
     throw profileError(
       "shim_unset",
@@ -402,7 +423,10 @@ async function migrationPreflight(client: MigrationClient, profile: MigrationPro
       },
     );
   }
-  if (profile.mode === "rds") await rdsOwnerPreflight(client);
+  if (profile.mode === "rds")
+    await (profile.rdsLayout === "separate-database"
+      ? rdsSeparateOwnerPreflight(client)
+      : rdsOwnerPreflight(client));
   const runtime = await runtimeRolePreflight(client, profile);
   // Durable function boundary gate, every non-local mode: the selected control must be
   // proven by the catalog. Only explicit local (Docker dev) mode is ungated.
@@ -707,6 +731,7 @@ const runtimeCfg = (p: MigrationProfile) => ({
   role: p.runtimeRole,
   ...(p.runtimeLogin === undefined ? {} : { login: p.runtimeLogin }),
   ...(p.workloadRole ? { workload: p.workloadRole } : {}),
+  ...(p.rdsLayout ? { rdsLayout: p.rdsLayout } : {}),
 });
 
 /**
@@ -859,6 +884,89 @@ async function rdsOwnerPreflight(client: MigrationClient): Promise<void> {
     throw profileError(
       "rds_profile_unproven",
       `rds mode needs PostgreSQL 16+, a non-superuser CREATEROLE rds_superuser member as migration owner and the fixed rdsadmin SUPERUSER: ${JSON.stringify(r ?? null)}; nothing was written`,
+    );
+}
+
+/**
+ * rds mode with HOOPDB_RDS_LAYOUT=separate-database (rds-activation/v1), read-only,
+ * before any write.
+ *
+ * Why the master-owner preflight cannot be reused: it requires the migration owner to
+ * be a CREATEROLE member of rds_superuser. That membership is how it proves the server
+ * is RDS-shaped, and it is the identity the legacy rds_* bootstrap files run as. In the
+ * separate-database layout, hoop must be neither (infra #107: the master is
+ * provisioning-only; docs/shared-database-isolation.md section 2). So a plain hoop that
+ * owns its database fails with rds_profile_unproven, on both owner_rds_superuser and
+ * owner_createrole.
+ *
+ * What this preflight proves instead (each failure is rds_profile_unproven):
+ *   - PostgreSQL 16+; session_user = current_user (no SET ROLE).
+ *   - The owner is NOT SUPERUSER, CREATEROLE, CREATEDB, REPLICATION or BYPASSRLS.
+ *   - The owner is a member of NO role (so not rds_superuser), and no role is a member
+ *     of the owner (nobody can SET ROLE to it or inherit it).
+ *   - RDS shape without membership: the fixed rdsadmin is SUPERUSER and is not the
+ *     owner, and rds_superuser exists as NOLOGIN and not SUPERUSER.
+ *   - The owner owns the current database and the sessions schema. The activation
+ *     creates sessions, so a missing schema means the activation did not run.
+ *   - The activation executor (hoopdb_activation_executor) no longer exists.
+ * The rds function-boundary gate is unchanged: rds_superuser and the provisioner hold
+ * exact defaults in this database (rds_activation/10), and rdsadmin stays the
+ * excluded trust root.
+ */
+export async function rdsSeparateOwnerPreflight(client: MigrationClient): Promise<void> {
+  const r = (
+    await client.query<{
+      server_version_num: number;
+      same_session: boolean;
+      owner_super: boolean;
+      owner_createrole: boolean;
+      owner_createdb: boolean;
+      owner_replication: boolean;
+      owner_bypassrls: boolean;
+      owner_memberships: number;
+      owner_members: number;
+      rdsadmin_super: boolean;
+      rds_superuser_shape: boolean;
+      owns_database: boolean;
+      owns_sessions: boolean;
+      executor_present: boolean;
+    }>(
+      `SELECT current_setting('server_version_num')::int AS server_version_num,
+              session_user = current_user AS same_session,
+              me.rolsuper AS owner_super, me.rolcreaterole AS owner_createrole, me.rolcreatedb AS owner_createdb,
+              me.rolreplication AS owner_replication, me.rolbypassrls AS owner_bypassrls,
+              (SELECT count(*)::int FROM pg_auth_members m WHERE m.member = me.oid) AS owner_memberships,
+              (SELECT count(*)::int FROM pg_auth_members m WHERE m.roleid = me.oid) AS owner_members,
+              coalesce((SELECT a.rolsuper AND a.oid <> me.oid FROM pg_roles a WHERE a.rolname = 'rdsadmin'), false) AS rdsadmin_super,
+              coalesce((SELECT NOT s.rolsuper AND NOT s.rolcanlogin FROM pg_roles s WHERE s.rolname = 'rds_superuser'), false) AS rds_superuser_shape,
+              EXISTS (SELECT 1 FROM pg_database d WHERE d.datname = current_database() AND d.datdba = me.oid) AS owns_database,
+              EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspname = 'sessions' AND n.nspowner = me.oid) AS owns_sessions,
+              EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'hoopdb_activation_executor') AS executor_present
+         FROM pg_roles me WHERE me.rolname = current_user`,
+    )
+  ).rows[0];
+  const problems = !r
+    ? ["owner role not found"]
+    : [
+        ...(r.server_version_num >= 160000 ? [] : ["PostgreSQL 16+ required"]),
+        ...(r.same_session ? [] : ["session_user differs from current_user (SET ROLE)"]),
+        ...(r.owner_super ? ["owner is SUPERUSER"] : []),
+        ...(r.owner_createrole ? ["owner has CREATEROLE"] : []),
+        ...(r.owner_createdb ? ["owner has CREATEDB"] : []),
+        ...(r.owner_replication ? ["owner has REPLICATION"] : []),
+        ...(r.owner_bypassrls ? ["owner has BYPASSRLS"] : []),
+        ...(r.owner_memberships ? [`owner is a member of ${r.owner_memberships} role(s)`] : []),
+        ...(r.owner_members ? [`owner has ${r.owner_members} member(s)`] : []),
+        ...(r.rdsadmin_super ? [] : ["the fixed rdsadmin SUPERUSER was not proven"]),
+        ...(r.rds_superuser_shape ? [] : ["rds_superuser (NOLOGIN, not SUPERUSER) was not proven"]),
+        ...(r.owns_database ? [] : ["owner does not own the current database"]),
+        ...(r.owns_sessions ? [] : ["owner does not own schema sessions (run rds-activation first)"]),
+        ...(r.executor_present ? ["the activation executor hoopdb_activation_executor still exists"] : []),
+      ];
+  if (problems.length)
+    throw profileError(
+      "rds_profile_unproven",
+      `rds separate-database layout needs a plain migration owner (member of no role, no CREATEROLE) that owns this database and sessions on an RDS-shaped server: ${problems.join("; ")}; nothing was written`,
     );
 }
 
