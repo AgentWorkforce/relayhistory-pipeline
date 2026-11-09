@@ -17,6 +17,7 @@ import {deliveryAccount} from "../../session-ingest/vendor/delivery/prepare.ts";
 import {DELIVERY_MAPPING_VERSION} from "../../session-ingest/vendor/delivery/delivery-contracts.ts";
 import {TURN_KIND,TURN_ORIGIN_ID,turnRecordId} from "../../session-ingest/turns.ts";
 import {TENANT,scratchStore} from "../../session-ingest/__tests__/support.ts";
+import {SESSION_BOOTSTRAP_FILES} from "../../hoopdb/session-bootstrap-chain.ts";
 import {GATE_SQL,gateHeadParams,parseControlHead} from "../buffered-search-gate.ts";
 setDefaultTimeout(120000);
 
@@ -30,7 +31,9 @@ afterEach(async()=>{for(const close of open.splice(0).reverse())await close()});
 async function fixture(){
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(()=>db.close());const read=(p:string)=>readFileSync(join(root,p),"utf8");
  await db.exec(read("supabase/tests/supabase_shim.sql"));
- for(const f of ["session_directory_search_worker","session_token_verifier","session_ingest_roles","session_read_api_roles"])await db.exec(read("supabase/bootstrap/"+f+".sql"));
+ // Single-sourced bootstrap chain: the grant migration FAILs closed without the
+ // bare consumer grantee, so provision it exactly like migrate's bootstrap step.
+ for(const f of SESSION_BOOTSTRAP_FILES)await db.exec(read(f));
  for(const f of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())await db.exec(read("supabase/migrations/"+f));
  // The read role's approved shape (schema USAGE, the session_index column grant, RLS), as the operator applies it.
  await db.exec(psql("supabase/bootstrap/session_read_api_role.sql"));
@@ -379,8 +382,10 @@ test("read-only: the reader takes no row or advisory lock",async()=>{
  const f=await healthy();const h=await f.hit(S(1));
  const rows=await f.asReader("SELECT (SELECT count(*) FROM sessions.buffered_search_gate_for($1,$2,$3,$4,$5,$6,$7,$8,$9::boolean,$10,$11::jsonb)) AS n,(SELECT count(*) FROM pg_locks WHERE locktype IN ('advisory','tuple','transactionid') AND pid=pg_backend_pid()) AS locks",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,...hp(at(7)),JSON.stringify([h])]);
  expect(rows.map((r)=>[Number(r.n),Number(r.locks)])).toEqual([[1,0]]);
- const def=readFileSync(join(root,"supabase/migrations/20261105043860_buffered_search_gate.sql"),"utf8");
- expect(def).not.toMatch(/FOR (UPDATE|SHARE)|pg_advisory|\b(INSERT|UPDATE|DELETE)\s+(INTO\s+)?sessions\./u);
+ for(const file of ["20261105043860_buffered_search_gate.sql","20261105043890_buffered_search_gate_retired_witness.sql"]){
+  const def=readFileSync(join(root,"supabase/migrations",file),"utf8");
+  expect(def).not.toMatch(/FOR (UPDATE|SHARE)|pg_advisory|\b(INSERT|UPDATE|DELETE)\s+(INTO\s+)?sessions\./u);
+ }
 });
 
 /** Owner-side fixture surgery with triggers and FK actions off (replica), so a test can plant a row state the
@@ -390,6 +395,69 @@ async function raw(f:{db:PGlite},sql:string,params:unknown[]=[]){
  try{await f.db.query(sql,params as never);await f.db.exec("COMMIT")}catch(e){await f.db.exec("ROLLBACK");throw e}
 }
 const BATCH_OF="(org_id,workspace_id,origin_id,batch_id)=(SELECT org_id,workspace_id,origin_id,batch_id FROM sessions.ingest_claim_attempts WHERE claim_token=$1::uuid)";
+
+/** 043860's exact gate body (the 043890 rollback's), for the causal check below. */
+const GATE_043860=(()=>{const src=readFileSync(join(root,"supabase/migrations/20261105043860_buffered_search_gate.sql"),"utf8");
+ return src.match(/CREATE FUNCTION sessions\.buffered_search_gate_for\([\s\S]*?\n\$gate\$;/)![0].replace("CREATE FUNCTION","CREATE OR REPLACE FUNCTION")})();
+
+test("043890 retired witness: a claim the REAL 043880 Phase A retires stays hidden (retired), not re-exposed by its deleted ACK decisions",async()=>{
+ const f=await healthy();const h=await f.hit(S(1)),control=await f.hit(S(2));
+ // Before the cleanup: one lazy ACK decision of S(1)'s claim disagrees with the claim's version.
+ await f.db.query("UPDATE sessions.ingest_lazy_ack_decisions SET source_control_version=6 WHERE claim_token=$1::uuid",[h.claim_token]);
+ const decisions=async(t:string)=>Number(((await f.db.query("SELECT count(*) AS n FROM sessions.ingest_lazy_ack_decisions WHERE claim_token=$1::uuid",[t])).rows[0] as any).n);
+ const tombstoned=async(t:string)=>((await f.db.query("SELECT EXISTS(SELECT 1 FROM sessions.ingest_bookkeeping_retired_claims WHERE claim_token=$1::uuid) AS x",[t])).rows[0] as any).x as boolean;
+ const before=await decisions(h.claim_token),controlBefore=await decisions(control.claim_token);
+ expect([before>0,controlBefore>0]).toEqual([true,true]);
+ expect(await f.verdict(h,at(7))).toBe("admission_version_mismatch");
+ expect(await f.verdict(control,at(7))).toBeNull();
+ // Make ONLY S(1)'s claim terminal for Phase A: its batch committed 2 days ago (min age 1 day), its stage
+ // intents redacted, no Babysitter evidence. S(2)'s batch stays young, so Phase A blocks it.
+ await raw(f,"UPDATE sessions.ingest_batches SET committed_at=clock_timestamp()-interval '2 days' WHERE "+BATCH_OF,[h.claim_token]);
+ await raw(f,"UPDATE sessions.ingest_stage_intents SET cleanup_state='redacted' WHERE claim_token=$1::uuid",[h.claim_token]);
+ // The operator's Phase A index (scripts/ops/ingest-bookkeeping-cleanup/phase_a_index.sql, without CONCURRENTLY) and
+ // the owner switch, then one REAL execute page of sessions.ingest_bookkeeping_cleanup_decisions as the owner.
+ await f.db.exec("CREATE INDEX babysitter_evidence_index_claim_idx ON sessions.babysitter_evidence_index(claim_token)");
+ await f.db.query("SELECT sessions.ingest_bookkeeping_cleanup_configure($1::jsonb)",[JSON.stringify({enabled:true,dryRun:false,decisions:true,minAgeDays:1})]);
+ await f.db.exec("BEGIN;SET LOCAL statement_timeout=5000");
+ let page:any;
+ try{page=((await f.db.query("SELECT sessions.ingest_bookkeeping_cleanup_decisions($1::jsonb) AS r",[JSON.stringify({after:null,rowBudget:500,execute:true})])).rows[0] as any).r;await f.db.exec("COMMIT")}
+ catch(e){await f.db.exec("ROLLBACK");throw e}
+ expect([page.mode,page.terminalClaims,page.blocked.uncommittedOrYoung,page.skipped,page.deleted]).toEqual(["execute",1,1,0,before]);
+ expect([await tombstoned(h.claim_token),await decisions(h.claim_token)]).toEqual([true,0]);
+ expect([await tombstoned(control.claim_token),await decisions(control.claim_token)]).toEqual([false,controlBefore]);
+ // Re-prove the owner's parity row, in case the batch/stage surgery moved a parity input.
+ await f.prove(at(7));
+ // After the cleanup the same hit is hidden as retired; the untouched control claim's verdict is unchanged.
+ expect(await f.verdict(h,at(7))).toBe("retired");
+ expect(await f.verdict(control,at(7))).toBeNull();
+ // Causal: the 043860 body (no retired witness) would now SHOW the hit, because the disagreeing decision is gone.
+ await f.db.exec(GATE_043860);
+ expect(await f.verdict(h,at(7))).toBeNull();
+ expect(await f.verdict(control,at(7))).toBeNull();
+ await f.db.exec(readFileSync(join(root,"supabase/migrations/20261105043890_buffered_search_gate_retired_witness.sql"),"utf8"));
+ expect(await f.verdict(h,at(7))).toBe("retired");
+ // retired sits after the epoch witness and before every later reason: an epoch mismatch still wins.
+ await f.db.query("UPDATE sessions.ingest_claim_attempts SET source_identity_sha256=$1 WHERE claim_token=$2::uuid",["f".repeat(64),h.claim_token]);
+ expect(await f.verdict(h,at(7))).toBe("admission_epoch_mismatch");
+ const closed=at(7,D3,{pending:true});
+ await f.db.query("UPDATE sessions.ingest_claim_attempts SET source_identity_sha256=$1 WHERE claim_token=$2::uuid",[identity,h.claim_token]);
+ expect([await f.verdict(h,closed),await f.verdict(control,closed)]).toEqual(["retired","gate_closed"]);
+});
+
+test("043890 keeps 043860's ACL: SECURITY DEFINER, STABLE, pinned search_path, EXECUTE for bulls96_read_api only; the down is refused once a claim is retired",async()=>{
+ const f=await healthy();
+ const p=(await f.db.query("SELECT p.prosecdef,p.provolatile,p.proconfig,p.prosrc LIKE '%ingest_bookkeeping_retired_claims%' AS witness,array(SELECT r.rolname FROM aclexplode(p.proacl) a JOIN pg_roles r ON r.oid=a.grantee WHERE a.privilege_type='EXECUTE' AND a.grantee<>p.proowner ORDER BY 1) AS grantees FROM pg_proc p WHERE p.oid='sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)'::regprocedure")).rows[0] as any;
+ expect(p).toEqual({prosecdef:true,provolatile:"s",proconfig:["search_path=pg_catalog, sessions, pg_temp"],witness:true,grantees:["bulls96_read_api"]});
+ // bulls96_read_api still cannot read the tombstone table directly.
+ expect(await code(f.asReader("SELECT count(*) FROM sessions.ingest_bookkeeping_retired_claims"))).toBe("42501");
+ const down=readFileSync(join(root,"supabase/rollbacks/20261105043890_buffered_search_gate_retired_witness.down.sql"),"utf8");
+ // With a tombstone (owner insert), the down refuses and changes nothing.
+ await f.db.query("INSERT INTO sessions.ingest_bookkeeping_retired_claims(claim_token) VALUES($1::uuid)",[(await f.hit(S(1))).claim_token]);
+ const e=await f.db.exec("BEGIN;"+down+"COMMIT;").then(()=>null,(e)=>e) as any;
+ await f.db.exec("ROLLBACK").catch(()=>{});
+ expect([e?.code,e?.message]).toEqual(["55000","buffered search gate retired witness: claims were retired; turn the gate off instead of rolling back"]);
+ expect(await f.verdict(await f.hit(S(1)),at(7))).toBe("retired");
+});
 
 test("043700 batch predicate: not committed, not buffered, committed_at NULL, other digest/user or a missing batch row drops",async()=>{
  const cases:[string,string][]=[

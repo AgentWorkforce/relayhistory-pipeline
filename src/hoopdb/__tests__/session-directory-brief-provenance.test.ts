@@ -65,7 +65,7 @@ async function databaseBefore(before: string): Promise<PGlite> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   for (const f of ["supabase/tests/supabase_shim.sql", "supabase/bootstrap/session_directory_search_worker.sql",
                    "supabase/bootstrap/session_token_verifier.sql", "supabase/bootstrap/session_ingest_roles.sql",
-                   "supabase/bootstrap/session_read_api_roles.sql"]) await db.exec(read(f));
+                   "supabase/bootstrap/session_read_api_roles.sql", "supabase/bootstrap/session_consumer_roles.sql"]) await db.exec(read(f));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort())
     if (file < before) await db.exec(read(`supabase/migrations/${file}`));
   for (const file of readdirSync(join(root, "src/hoopdb/migrations")).filter((f) => f.endsWith(".sql")).sort())

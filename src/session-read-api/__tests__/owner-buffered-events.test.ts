@@ -17,10 +17,16 @@ import { CursorError, decodeBackendCursor, decodeCursor, encodeBufferedCursor, e
 import {
   BufferedFenced,
   BufferedProjectionFailed,
+  OWNER_BUFFERED_PHASES,
   OwnerBufferedEventsFlagError,
+  OwnerBufferedPhaseTimer,
+  OwnerBufferedStageConcurrencyError,
   eventRowFromIndex,
   ownerBufferedEventsEnabled,
+  ownerBufferedPhaseLogEnabled,
+  ownerBufferedStageConcurrency,
   readOwnerBufferedEvents,
+  readOwnerBufferedTurns,
   type BufferedScope,
   type BufferedStageRow,
 } from "../owner-buffered.ts";
@@ -32,7 +38,7 @@ import { prepareBufferedStage, putBufferedStage } from "../../session-ingest/sta
 import { TENANT, batch, record } from "../../session-ingest/__tests__/support.ts";
 import { TURN_ORIGIN_ID } from "../../session-ingest/turns.ts";
 import { objectKey, type ObjectStore } from "../../shared/vendor.ts";
-import { E1, SCOPE, SESSION, authority, deps, fencedGate, putStage, scratch, scriptedGate, scriptedReads, turn, unzip } from "./owner-buffered-support.ts";
+import { E1, SCOPE, SESSION, authority, deferred, deps, fencedGate, indexChecked, putStage, scratch, scriptedGate, scriptedReads, traced, turn, unzip } from "./owner-buffered-support.ts";
 
 const cleanup: Array<() => void> = [];
 afterEach(() => {
@@ -225,6 +231,32 @@ describe("readOwnerBufferedEvents: gate, scrub, bounds, tenant", () => {
     expect(calls).toHaveLength(0);
   });
 
+  test("READ_API_OWNER_BUFFERED_INDEX_VERIFY=on, index not proven: unverified before candidate with the reason name; no gate, no RPC, no S3, no phase fields", async () => {
+    const s = store();
+    const st = await putStage(s, 1, [ev("e1")]);
+    for (const [answer, name] of [["missing", "index_missing"], ["invalid", "index_invalid"], [new Error("timeout"), "index_unverified"]] as const) {
+      const t = traced(s);
+      const gate = scriptedGate(authority("7"));
+      const { reads, calls } = scriptedReads({ stages: [[st.row]] });
+      const { indexCheck, probe } = indexChecked(answer);
+      const phases = new OwnerBufferedPhaseTimer();
+      expect(await readOwnerBufferedEvents(deps({ store: t.store, reads, gate, indexCheck }), SCOPE, "claude", SESSION, { phases })).toEqual({ unverifiedBeforeCandidate: name });
+      expect([probe.calls.length, gate.calls.length, calls.length, t.starts()]).toEqual([1, 0, 0, 0]);
+      expect(phases.fields()).toEqual({});
+    }
+  });
+
+  test("READ_API_OWNER_BUFFERED_INDEX_VERIFY=on, index present: the same rows as without the check", async () => {
+    const s = store();
+    const st = await putStage(s, 1, [ev("e1"), ev("e2")]);
+    const { indexCheck, probe } = indexChecked("valid");
+    const on = await readOwnerBufferedEvents(deps({ store: s, reads: scriptedReads({ stages: [[st.row]] }).reads, indexCheck }), SCOPE, "claude", SESSION);
+    const off = await readOwnerBufferedEvents(deps({ store: s, reads: scriptedReads({ stages: [[st.row]] }).reads }), SCOPE, "claude", SESSION);
+    expect(on).not.toBeNull();
+    expect(on).toEqual(off);
+    expect(probe.calls).toHaveLength(1);
+  });
+
   test("the final observation after all I/O: pending or a moved head is fenced (no rows)", async () => {
     const s = store();
     const st = await putStage(s, 1, [ev("e1")]);
@@ -408,5 +440,207 @@ describe("readBufferedEventPage", () => {
     const rows = FIXTURE.map(toRow);
     const last = [...FIXTURE].sort(comparePositions).at(-1)!;
     expect(readBufferedEventPage(rows, { order: "asc", limit: 10, cursor: last }).events).toEqual([]);
+  });
+});
+
+// ---- READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY and READ_API_OWNER_BUFFERED_PHASE_LOG ----
+
+describe("READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY and READ_API_OWNER_BUFFERED_PHASE_LOG flags", () => {
+  test("stage concurrency: unset, empty, \"0\" and \"1\" are serial (1); \"2\"..\"32\" are N; anything else refuses (names the flag, never the value)", () => {
+    for (const v of [undefined, "", "0", "1"]) expect(ownerBufferedStageConcurrency(v), String(v)).toBe(1);
+    for (const n of [2, 3, 9, 10, 16, 31, 32]) expect(ownerBufferedStageConcurrency(String(n))).toBe(n);
+    for (const bad of ["33", "99", "100", "02", "00", "-2", "+2", "2.0", " 2", "2 ", "on", "true", "0x2", "1e1", "two"]) {
+      let thrown: unknown;
+      try {
+        ownerBufferedStageConcurrency(bad);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown, bad).toBeInstanceOf(OwnerBufferedStageConcurrencyError);
+      expect((thrown as Error).message).toContain("READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY");
+      if (!/^\d+$/.test(bad.trim())) expect((thrown as Error).message).not.toContain(bad);
+    }
+  });
+
+  test("phase log: exactly \"1\" enables; anything else is off and never throws", () => {
+    expect(ownerBufferedPhaseLogEnabled("1")).toBe(true);
+    for (const v of [undefined, "", "0", "true", "on", " 1", "1 ", "01", "yes"]) expect(ownerBufferedPhaseLogEnabled(v), String(v)).toBe(false);
+  });
+});
+
+describe("readOwnerBufferedEvents: bounded-concurrency stage fetch", () => {
+  /** n one-event stages in one store; stage i holds event e<i>. */
+  async function stagesOf(s: ObjectStore, n: number): Promise<{ rows: BufferedStageRow[]; keys: string[] }> {
+    const rows: BufferedStageRow[] = [];
+    const keys: string[] = [];
+    for (let i = 1; i <= n; i++) {
+      const st = await putStage(s, i, [ev(`e${i}`, { ts_ms: TS + i, text: `stage ${i}` })]);
+      rows.push(st.row);
+      keys.push(st.key);
+    }
+    return { rows, keys };
+  }
+  const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+  const served = (out: Awaited<ReturnType<typeof readOwnerBufferedEvents>>) => {
+    if (out === null || "unverifiedBeforeCandidate" in out || out.erased) throw new Error(`unexpected ${JSON.stringify(out)}`);
+    return out.rows;
+  };
+  /** One read through a traced store, gate and readers; `stages` answers per stages() call. */
+  async function run(s: ObjectStore, stages: BufferedStageRow[][], over: { stageConcurrency?: number; gate?: Array<ReturnType<typeof authority> | Error>; hold?: Parameters<typeof traced>[1]["hold"]; fail?: Parameters<typeof traced>[1]["fail"]; signal?: AbortSignal; phases?: OwnerBufferedPhaseTimer } = {}) {
+    const t = traced(s, { hold: over.hold, fail: over.fail });
+    const gate = t.gate(...(over.gate ?? [authority("7")]));
+    const { reads, calls } = scriptedReads({ stages });
+    const d = deps({ store: t.store, decompress: t.decompress, gate, reads: t.reads(reads), ...(over.stageConcurrency === undefined ? {} : { stageConcurrency: over.stageConcurrency }) });
+    const out = readOwnerBufferedEvents(d, SCOPE, "claude", SESSION, { signal: over.signal, phases: over.phases });
+    return { t, gate, calls, out };
+  }
+
+  test("flag off (absent or 1): the serial loop, one GetObject at a time in stage order, between the stages SQL and the recheck", async () => {
+    const s = store();
+    const { rows, keys } = await stagesOf(s, 4);
+    // Later stages answer faster; serial still fetches them strictly one after another.
+    const hold = (_k: string, n: number) => sleep((4 - n) * 3);
+    for (const stageConcurrency of [undefined, 1]) {
+      const { t, out } = await run(s, [rows], { stageConcurrency, hold });
+      expect(served(await out).map((r) => r.content)).toEqual(["stage 1", "stage 2", "stage 3", "stage 4"]);
+      expect(t.maxInFlight).toBe(1);
+      expect(t.events).toEqual(["observe", "stages", ...keys.flatMap((k) => [`get:${k}`, "decompressed"]), "stages", "observe"]);
+    }
+  });
+
+  test("concurrency on: at most N in flight, every stage fetched once, fold order and rows identical to serial, final observation after the last fetch", async () => {
+    const s = store();
+    const { rows, keys } = await stagesOf(s, 7);
+    const serial = served(await (await run(s, [rows])).out);
+    // Reverse completion order: the first stages answer last.
+    const hold = (_k: string, n: number) => sleep((7 - n) * 4);
+    for (const n of [2, 3, 7, 32]) {
+      const { t, gate, calls, out } = await run(s, [rows], { stageConcurrency: n, hold });
+      expect(served(await out), String(n)).toEqual(serial);
+      expect(t.maxInFlight, String(n)).toBe(Math.min(n, rows.length));
+      expect(t.events.filter((e) => e.startsWith("get:")).sort()).toEqual(keys.map((k) => `get:${k}`).sort());
+      expect(t.events.filter((e) => e === "decompressed")).toHaveLength(rows.length);
+      // Authority placement unchanged: observe, stages SQL, every S3 fetch, recheck, final observe last.
+      expect(t.events.slice(0, 2)).toEqual(["observe", "stages"]);
+      expect(t.events.slice(-2)).toEqual(["stages", "observe"]);
+      expect(t.events.lastIndexOf("observe")).toBeGreaterThan(t.events.lastIndexOf("decompressed"));
+      expect(gate.calls).toHaveLength(2);
+      expect(calls.map((c) => c.fn)).toEqual(["stages", "stages"]);
+    }
+  });
+
+  test("concurrency on, revisions and tombstones across stages: folded exactly as the serial read folds them", async () => {
+    const s = store();
+    const a = await putStage(s, 1, [ev("r1", { text: "first draft" }), ev("r2", { text: "to be deleted" }), ev("r3", { text: "kept as is", ts_ms: TS + 5 })]);
+    const b = await putStage(s, 2, [{ ...ev("r1", { text: "second draft" }), revision: "2" }, { ...ev("r2"), revision: "2", operation: "delete", payload: null }]);
+    const serial = served(await (await run(s, [[a.row, b.row]])).out);
+    const { out } = await run(s, [[a.row, b.row]], { stageConcurrency: 2, hold: (_k, n) => (n === 0 ? sleep(15) : undefined) });
+    const rowsOut = served(await out);
+    expect(rowsOut).toEqual(serial);
+    const text = rowsOut.map((r) => r.content).join("|");
+    expect(text).toContain("second draft");
+    expect(text).not.toContain("first draft");
+    expect(text).not.toContain("to be deleted");
+  });
+
+  test("a failing stage fails as the serial read does (same error); the lowest failing stage wins; no new fetch, no recheck, no final observation", async () => {
+    const s = store();
+    const { rows, keys } = await stagesOf(s, 6);
+    const named = (name: string) => Object.assign(new Error("synthetic"), { name });
+    const fail = (k: string) => (k === keys[1] ? named("S3Down") : undefined);
+    const serial = await reason((await run(s, [rows], { fail })).out);
+    expect(serial).toBe("other:S3Down");
+    const { t, gate, calls, out } = await run(s, [rows], { stageConcurrency: 2, fail, hold: (_k, n) => (n === 0 ? sleep(10) : undefined) });
+    expect(await reason(out)).toBe(serial);
+    expect(t.starts()).toBe(2);
+    expect(gate.calls).toHaveLength(1);
+    expect(calls).toHaveLength(1);
+
+    // Stage 1 fails late, stage 2 fails first: stage 1's error, as the serial loop would throw.
+    const both = (k: string) => (k === keys[0] ? named("First") : k === keys[1] ? named("Second") : undefined);
+    expect(await reason((await run(s, [rows], { fail: both })).out)).toBe("other:First");
+    expect(await reason((await run(s, [rows], { stageConcurrency: 4, fail: both, hold: (_k, n) => (n === 0 ? sleep(15) : undefined) })).out)).toBe("other:First");
+
+    // A stage over the decompressed bound: BufferedTooLarge either way.
+    const big = await putStage(s, 8, [ev("big", { text: "x".repeat(4096) })]);
+    for (const stageConcurrency of [undefined, 3]) {
+      const t2 = traced(s);
+      const d = deps({ store: t2.store, reads: scriptedReads({ stages: [[rows[0]!, big.row, rows[2]!]] }).reads, decompress: (b: Uint8Array) => unzip(b, 1024), ...(stageConcurrency ? { stageConcurrency } : {}) });
+      expect(await reason(readOwnerBufferedEvents(d, SCOPE, "claude", SESSION))).toBe("other:BufferedTooLarge");
+    }
+  });
+
+  test("a stage object missing (404): the same refresh-and-refetch outcome as serial, one refresh SQL however many 404s", async () => {
+    const s = store();
+    const { rows, keys } = await stagesOf(s, 4);
+    await s.delete(objectKey(keys[1]!));
+    await s.delete(objectKey(keys[2]!));
+    for (const stageConcurrency of [undefined, 4]) {
+      // Still listed: hidden, never partial.
+      expect(await (await run(s, [rows], { stageConcurrency })).out, String(stageConcurrency)).toBeNull();
+      // Dropped from the refreshed list (and the recheck): the remaining stages serve.
+      const kept = [rows[0]!, rows[3]!];
+      const { calls, out } = await run(s, [rows, kept, kept], { stageConcurrency });
+      expect(served(await out).map((r) => r.content)).toEqual(["stage 1", "stage 4"]);
+      expect(calls.map((c) => c.fn)).toEqual(["stages", "stages", "stages"]);
+    }
+  });
+
+  test("an abort stops new fetches: in-flight ones settle, the read fails closed (request_aborted), no recheck and no final observation", async () => {
+    const s = store();
+    const { rows } = await stagesOf(s, 6);
+    const ac = new AbortController();
+    const held = rows.map(() => deferred());
+    const { t, gate, calls, out } = await run(s, [rows], { stageConcurrency: 2, signal: ac.signal, hold: (_k, n) => held[n]!.promise });
+    while (t.starts() < 2) await sleep(1);
+    ac.abort();
+    for (const h of held) h.resolve();
+    expect(await reason(out)).toBe("request_aborted");
+    expect(t.starts()).toBe(2);
+    expect(gate.calls).toHaveLength(1);
+    expect(calls).toHaveLength(1);
+    // Serial (flag off) is unchanged: the signal is not consulted.
+    const serial = await run(s, [rows], { signal: AbortSignal.abort() });
+    expect(served(await serial.out)).toHaveLength(6);
+    // Aborted after every fetch was issued and settled: nothing skipped, served.
+    const late = new AbortController();
+    const done = await run(s, [rows], { stageConcurrency: 8, signal: late.signal, hold: (_k, n) => (n === 5 ? Promise.resolve().then(() => late.abort()) : undefined) });
+    expect(served(await done.out)).toHaveLength(6);
+  });
+
+  test("turns stay serial whatever the stage concurrency (it applies to the events read only)", async () => {
+    const s = store();
+    const stages = [await putStage(s, 1, [turn(0)]), await putStage(s, 2, [turn(1)]), await putStage(s, 3, [turn(2)])].map((x) => x.row);
+    const t = traced(s, { hold: (_k, n) => sleep((3 - n) * 3) });
+    const out = await readOwnerBufferedTurns(deps({ store: t.store, decompress: t.decompress, reads: scriptedReads({ stages: [stages] }).reads, stageConcurrency: 8 }), SCOPE, "claude", SESSION);
+    expect(out && !("unverifiedBeforeCandidate" in out) && out.rows).toHaveLength(3);
+    expect(t.maxInFlight).toBe(1);
+  });
+
+  test("phase timer: every read phase as a number and s3_stage_count when served; a failed phase is aborted_phase, phases never reached absent", async () => {
+    const s = store();
+    const { rows, keys } = await stagesOf(s, 3);
+    for (const stageConcurrency of [undefined, 3]) {
+      const phases = new OwnerBufferedPhaseTimer();
+      served(await (await run(s, [rows], { stageConcurrency, phases })).out);
+      const f = phases.fields();
+      expect(Object.keys(f).sort()).toEqual([...OWNER_BUFFERED_PHASES.filter((p) => p !== "session_start").map((p) => `${p}_ms`), "s3_stage_count"].sort());
+      for (const [k, v] of Object.entries(f)) if (k.endsWith("_ms")) expect(Number.isInteger(v) && (v as number) >= 0, k).toBe(true);
+      expect(f.s3_stage_count).toBe(3);
+      expect(f).not.toHaveProperty("aborted_phase");
+
+      const moved = new OwnerBufferedPhaseTimer();
+      expect(await reason((await run(s, [rows], { stageConcurrency, phases: moved, gate: [authority("7"), authority("8")] })).out)).toBe("gate_moved");
+      expect(moved.fields()).toMatchObject({ aborted_phase: "control_head_2", s3_stage_count: 3 });
+      // The record parse (counted as fold) runs before the final gate, as it always has.
+      expect(typeof moved.fields().control_head_2_ms).toBe("number");
+
+      const s3 = new OwnerBufferedPhaseTimer();
+      await reason((await run(s, [rows], { stageConcurrency, phases: s3, fail: (k) => (k === keys[2] ? new Error("x") : undefined) })).out);
+      expect(s3.fields()).toMatchObject({ aborted_phase: "s3_fetch" });
+      expect(typeof s3.fields().s3_fetch_ms).toBe("number");
+      expect(s3.fields()).not.toHaveProperty("recheck_ms");
+      expect(JSON.stringify(s3.fields())).not.toMatch(/buffered-batches|e\d|sess-|u-1|org-a|ws-a/u);
+    }
   });
 });

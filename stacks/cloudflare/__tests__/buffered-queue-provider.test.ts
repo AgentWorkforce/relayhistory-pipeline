@@ -286,6 +286,22 @@ test("buffered mode captures inline0/off and rejects accidental canonical settin
     { ...input, acceptanceMode: "canonical" },
   ])
     expect(() => assertSessionIngestInputs(value, refuse)).toThrow();
+  // Bounded generation overlap: absent by default; one other explicit hex64 value renders the accepted set.
+  expect(sessionIngestVars(input).INGEST_ACCEPT_GENERATIONS).toBeUndefined();
+  const overlap = { ...input, overlapGeneration: "f".repeat(64) };
+  assertSessionIngestInputs(overlap, refuse);
+  expect(sessionIngestVars(overlap).INGEST_ACCEPT_GENERATIONS).toBe("e".repeat(64) + "," + "f".repeat(64));
+  for (const value of [
+    { ...input, overlapGeneration: "*" },
+    { ...input, overlapGeneration: "e".repeat(64) },
+    { ...input, overlapGeneration: "F".repeat(64) },
+    { ...input, overlapGeneration: "f".repeat(64) + "," + "a".repeat(64) },
+    { ...input, overlapGeneration: ["f".repeat(64)] },
+    { ...input, acceptanceMode: "canonical", expectedGeneration: undefined, inlineMaxSessions: 1, overlapGeneration: "f".repeat(64) },
+  ]) {
+    expect(() => assertSessionIngestInputs(value, refuse)).toThrow();
+    expect(() => sessionIngestVars(value as never)).toThrow();
+  }
 });
 
 test("operator pause capability requires captured buffered mode, observed exact queue ID and true-only settings", async () => {

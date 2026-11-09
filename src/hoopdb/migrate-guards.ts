@@ -7,7 +7,14 @@
  */
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { MIGRATION_SENTINELS } from "./migration-sentinels.ts";
+import {
+  ADOPTABLE_INDEX_STATE_SQL,
+  ADOPTABLE_INDEX_STEPS,
+  ADOPTABLE_INDEXES,
+  type AdoptableIndex,
+  type ExactBody,
+  MIGRATION_SENTINELS,
+} from "./migration-sentinels.ts";
 
 export interface GuardClient {
   query<R = Record<string, unknown>>(
@@ -41,6 +48,47 @@ export const MIGRATION_CHECKSUM_ALIASES = [
   },
 ] as const;
 
+// Two migrations were renamed append-only on 2026-11-03 (09666e18) to sort after the
+// upstream steps that were released before them. An existing self-host HoopDb that
+// applied them under their original names would otherwise stop at
+// ledger_unknown_step. Each original ledger row is adopted in memory (never written) as
+// its release name only when all four values match: the original name with its last
+// released sha, and the release file with exactly this sha. Only adoption accepts
+// `ledger_sha`: a row physically stored under the release name with the original sha is
+// hand-edited history and fails closed (migration_changed), as does any other sha. Bodies are statement-for-
+// statement equal apart from the provenance header, except that the original ingest
+// ledger also granted the seed RPCs to bulls96_session_ingest_seeder, which
+// 20261104040000_ingest_s3_proof_seed (always on this image, after both) REVOKEs ALL,
+// so the end schema is identical. That REVOKE is the forward repair the ingest row
+// depends on: it is adopted only while `repair` is in the plan with exactly
+// `repair_sha` (ported from #396). Earlier drafts of the original file (other shas) are
+// not adopted, and any future edit of a release or repair file fails closed.
+// The original file bytes are pinned by the fixtures in
+// __tests__/fixtures/released-migration-history/.
+export const MIGRATION_RENAME_ALIASES = [
+  {
+    ledger_name: "upstream:20261103010000_session_directory_event_metadata.sql",
+    ledger_sha:
+      "fe07b2ef2b3e18634b024f35f4272bee9100ea39d0383ce33e8c6d969b77a476",
+    migration: "upstream:20261104021000_session_directory_event_metadata.sql",
+    accepted_as_alias_of:
+      "4fb1337524c8335dd5bd507f60ea896a41a031ace0c7a2da8a8f7dedc1245e01",
+  },
+  {
+    ledger_name: "upstream:20261102010000_session_ingest_ledger.sql",
+    ledger_sha:
+      "21a0be7dc69afa7d3b1d1b27e31fee9778c1a6a0c3b20246e3029fa2f1356fa6",
+    migration: "upstream:20261104022000_session_ingest_ledger.sql",
+    accepted_as_alias_of:
+      "69f4157ea3a615344aa1b383fc6af7405c1ff9f1568e7c8ab97e58fbc78fe1b5",
+    repair: "upstream:20261104040000_ingest_s3_proof_seed.sql",
+    repair_sha:
+      "18ea54ed1aa50e5ea44bab01a65177e2fc9c92919ac23b973f820e8af8b75b86",
+  },
+] as const;
+
+export type MigrationAlias = (typeof MIGRATION_CHECKSUM_ALIASES)[number];
+
 export function migrationChecksumMatches(
   name: string,
   recorded: string,
@@ -48,12 +96,7 @@ export function migrationChecksumMatches(
 ): boolean {
   return (
     recorded === actual ||
-    MIGRATION_CHECKSUM_ALIASES.some(
-      (a) =>
-        a.migration === name &&
-        a.ledger_sha === recorded &&
-        a.accepted_as_alias_of === actual,
-    )
+    migrationChecksumAlias(name, recorded, actual) !== undefined
   );
 }
 
@@ -61,13 +104,107 @@ export function migrationChecksumAlias(
   name: string,
   recorded: string,
   actual: string,
-): (typeof MIGRATION_CHECKSUM_ALIASES)[number] | undefined {
+): MigrationAlias | undefined {
+  // Rename aliases are deliberately absent: their original sha is accepted only by
+  // resolveRenamedLedger, for a row recorded under the original name only.
   return MIGRATION_CHECKSUM_ALIASES.find(
     (a) =>
       a.migration === name &&
       a.ledger_sha === recorded &&
       a.accepted_as_alias_of === actual,
   );
+}
+
+/**
+ * True when `alias` pins a forward repair that is not in the plan with its exact sha
+ * (`fileSha` returns undefined for a step that is not planned).
+ */
+export function renameAliasRepairMissing(
+  alias: (typeof MIGRATION_RENAME_ALIASES)[number],
+  fileSha: (name: string) => string | undefined,
+): boolean {
+  return "repair" in alias && fileSha(alias.repair) !== alias.repair_sha;
+}
+
+export type RenameAlias = (typeof MIGRATION_RENAME_ALIASES)[number];
+
+/** Why one MIGRATION_RENAME_ALIASES entry could not be adopted; the migrator throws it. */
+export interface RenameRefusal {
+  code:
+    | "ledger_alias_collision"
+    | "ledger_unknown_step"
+    | "ledger_alias_repair_missing"
+    | "migration_changed";
+  alias: RenameAlias;
+  message: string;
+}
+
+/**
+ * The one rename-alias verdict, shared by the migrator (migrationPreflight) and
+ * readiness (schemaVerdict), so both reach the same answer from the same physical
+ * ledger. Pure: `physical` is never modified and nothing is written.
+ *
+ * For each MIGRATION_RENAME_ALIASES entry (skipped when the plan itself contains the
+ * original name, i.e. an old image's plan):
+ *  - only the original name, with exactly `ledger_sha`, the release file planned with
+ *    exactly `accepted_as_alias_of` and the pinned repair (if any) planned with exactly
+ *    `repair_sha`: adopted. The effective ledger holds the release name with the release
+ *    file's sha, so the checksum guard needs no rename lookup afterwards;
+ *  - both the original and the release name recorded: ledger_alias_collision, whatever
+ *    the shas (never a supported state);
+ *  - only the original name with another sha, or a release file that is not planned
+ *    with exactly `accepted_as_alias_of`: ledger_unknown_step;
+ *  - an exact original row whose pinned repair is missing: ledger_alias_repair_missing;
+ *  - only the release name, physically carrying the original `ledger_sha` (hand-edited
+ *    history), or any other sha the checksum guard would not accept for the planned
+ *    release file: migration_changed.
+ * A refused alias's release name is absent from `effective`, so readiness reports it
+ * as not applied; the migrator throws the first refusal before any write.
+ * `fileSha` returns the planned step's file sha256, or undefined if it is not planned.
+ */
+export function resolveRenamedLedger(
+  physical: ReadonlyMap<string, string>,
+  fileSha: (name: string) => string | undefined,
+): { effective: Map<string, string>; adopted: RenameAlias[]; refusals: RenameRefusal[] } {
+  const effective = new Map(physical);
+  const adopted: RenameAlias[] = [];
+  const refusals: RenameRefusal[] = [];
+  const refuse = (alias: RenameAlias, code: RenameRefusal["code"], message: string) => {
+    effective.delete(alias.migration);
+    refusals.push({ code, alias, message });
+  };
+  for (const a of MIGRATION_RENAME_ALIASES) {
+    if (fileSha(a.ledger_name) !== undefined) continue;
+    const original = physical.get(a.ledger_name);
+    const release = physical.get(a.migration);
+    if (original !== undefined && release !== undefined)
+      refuse(a, "ledger_alias_collision",
+        `the ledger records both ${a.ledger_name} and its release name ${a.migration}; nothing is marked, see the runbook decision point`);
+    else if (release !== undefined) {
+      const planned = fileSha(a.migration);
+      if (release === a.ledger_sha)
+        refuse(a, "migration_changed",
+          `migration ${a.migration} is recorded with the checksum of ${a.ledger_name}; that is hand-edited history, nothing is marked, see the runbook decision point`);
+      else if (planned !== undefined && !migrationChecksumMatches(a.migration, release, planned))
+        // The migrator's checksum guard refuses this row too; refusing it here keeps
+        // readiness (which reads only `effective`) in agreement with the migrator.
+        refuse(a, "migration_changed",
+          `migration ${a.migration} changed after it was applied; add a new migration instead`);
+    } else if (original !== undefined) {
+      if (original !== a.ledger_sha || fileSha(a.migration) !== a.accepted_as_alias_of)
+        refuse(a, "ledger_unknown_step",
+          `the ledger records ${a.ledger_name}, which this image doesn't have or adopt; nothing is marked, see the runbook decision point`);
+      else if (renameAliasRepairMissing(a, fileSha))
+        refuse(a, "ledger_alias_repair_missing",
+          `released migration ${a.ledger_name} requires its exact forward repair`);
+      else {
+        effective.delete(a.ledger_name);
+        effective.set(a.migration, a.accepted_as_alias_of);
+        adopted.push(a);
+      }
+    }
+  }
+  return { effective, adopted, refusals };
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +218,12 @@ export interface RuntimeRoleConfig {
   login?: boolean;
   /** HOOPDB_RUNTIME_WORKLOAD_ROLE: the one role allowed to be a member of the runtime role (no ADMIN OPTION). */
   workload?: string;
+  /**
+   * HOOPDB_RDS_LAYOUT (rds mode only). "separate-database" (rds-activation/v1) leaves
+   * the runtime role with no member at all, so the master-owner creator edge is not
+   * accepted there.
+   */
+  rdsLayout?: "master-owner" | "separate-database";
 }
 
 export interface RuntimeTables {
@@ -161,6 +304,29 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.session_brief_wakeups",
   "sessions.session_brief_attempts",
 ] as const;
+
+/**
+ * The runtime application relations and functions, read through one function by the ACL
+ * install (migrate.ts installRuntimeApplicationAcl), runtimeRoleViolations and the function
+ * ACL drift check/preview. Always exactly the three constants above plus
+ * RUNTIME_APPLICATION_FUNCTIONS below: every listed relation and function is granted and
+ * verified, fail-closed. The indirection exists only so a test can model a previous
+ * release's binary (which could not list a relation or function a later migration creates)
+ * the way it spies sessionsFunctionAclManifest.
+ */
+export function runtimeApplicationAclCatalog(): {
+  tables: Readonly<Record<string, readonly string[]>>;
+  sequences: readonly string[];
+  rlsTables: readonly string[];
+  functions: readonly string[];
+} {
+  return {
+    tables: RUNTIME_APPLICATION_TABLE_PRIVILEGES,
+    sequences: RUNTIME_APPLICATION_SEQUENCES,
+    rlsTables: RUNTIME_APPLICATION_RLS_TABLES,
+    functions: RUNTIME_APPLICATION_FUNCTIONS,
+  };
+}
 
 export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.ack_session_brief_documents(uuid,jsonb)",
@@ -266,16 +432,19 @@ export function isSupabaseCreatorEdge(
  * neither INHERIT nor SET, and the creator cannot revoke it. The owner keeps only the
  * ability to manage the role (set or rotate its password, drop it); it gains none of
  * the runtime role's privileges, and the runtime role gains nothing. The member must be
- * the connected migration owner itself, never a configurable name.
+ * the connected migration owner itself, never a configurable name. Master-owner layout
+ * only: under HOOPDB_RDS_LAYOUT=separate-database the activation executor is dropped,
+ * so the runtime role has no member and any edge is refused.
  */
 export function isRdsCreatorEdge(
-  cfg: Pick<RuntimeRoleConfig, "mode">,
+  cfg: Pick<RuntimeRoleConfig, "mode" | "rdsLayout">,
   serverVersion: number,
   edge: RoleGrantEdge,
   migrationOwner: string,
 ): boolean {
   return (
     cfg.mode === "rds" &&
+    cfg.rdsLayout !== "separate-database" &&
     serverVersion >= 160000 &&
     edge.rolname === migrationOwner &&
     edge.grantor === "rdsadmin" &&
@@ -469,7 +638,8 @@ export async function runtimeRoleViolations(
     );
   }
 
-  const applicationTables = Object.keys(RUNTIME_APPLICATION_TABLE_PRIVILEGES);
+  const catalog = runtimeApplicationAclCatalog();
+  const applicationTables = Object.keys(catalog.tables);
   const ids = (
     await client.query<{
       db: number;
@@ -490,10 +660,10 @@ export async function runtimeRoleViolations(
       [
         tables.ledger,
         tables.marker,
-        [...applicationTables, ...RUNTIME_APPLICATION_SEQUENCES],
-        [...RUNTIME_APPLICATION_FUNCTIONS],
+        [...applicationTables, ...catalog.sequences],
+        [...catalog.functions],
         RUNTIME_APPLICATION_POLICY,
-        [...RUNTIME_APPLICATION_RLS_TABLES],
+        [...catalog.rlsTables],
       ],
     )
   ).rows[0]!;
@@ -689,7 +859,7 @@ export async function runtimeRoleViolations(
   const expectedTablePrivileges = new Map<string, readonly string[]>([
     [tables.ledger, ["SELECT"]],
     [tables.marker, ["SELECT"]],
-    ...Object.entries(RUNTIME_APPLICATION_TABLE_PRIVILEGES),
+    ...Object.entries(catalog.tables),
   ]);
   for (const t of effectiveTables) {
     const actual = t.privs ? t.privs.split(",") : [];
@@ -714,15 +884,13 @@ export async function runtimeRoleViolations(
     )
   ).rows;
   for (const q of effectiveSequences) {
-    const approved = RUNTIME_APPLICATION_SEQUENCES.includes(
-      q.rel as (typeof RUNTIME_APPLICATION_SEQUENCES)[number],
-    );
+    const approved = catalog.sequences.includes(q.rel);
     if (!approved && q.privs) out.push(`privileges on sequence ${q.rel}`);
     if (approved && q.privs !== "USAGE")
       out.push(`${q.privs} on sequence ${q.rel} (only USAGE is approved)`);
   }
   if (phase === "post")
-    for (const sequence of RUNTIME_APPLICATION_SEQUENCES)
+    for (const sequence of catalog.sequences)
       if (!effectiveSequences.some((q) => q.rel === sequence && q.privs === "USAGE"))
         out.push(`missing USAGE on sequence ${sequence}`);
   const effectiveFunctions = (
@@ -739,10 +907,10 @@ export async function runtimeRoleViolations(
     )
   ).rows;
   for (const fnr of effectiveFunctions)
-    if (!RUNTIME_APPLICATION_FUNCTIONS.includes(fnr.fn as (typeof RUNTIME_APPLICATION_FUNCTIONS)[number]))
+    if (!catalog.functions.includes(fnr.fn))
       out.push(`EXECUTE on ${fnr.fn}`);
   if (phase === "post")
-    for (const fn of RUNTIME_APPLICATION_FUNCTIONS)
+    for (const fn of catalog.functions)
       if (!effectiveFunctions.some((row) => row.fn === fn))
         out.push(`missing EXECUTE on ${fn}`);
 
@@ -779,7 +947,7 @@ export async function runtimeRoleViolations(
   ).rows;
   for (const policy of policies) {
     const exact =
-      RUNTIME_APPLICATION_RLS_TABLES.includes(policy.rel as (typeof RUNTIME_APPLICATION_RLS_TABLES)[number]) &&
+      catalog.rlsTables.includes(policy.rel) &&
       policy.name === RUNTIME_APPLICATION_POLICY &&
       policy.permissive && policy.command === "*" &&
       policy.roles.length === 1 && policy.roles[0] === role.oid &&
@@ -787,7 +955,7 @@ export async function runtimeRoleViolations(
     if (!exact) out.push(`unapproved policy ${policy.name} on ${policy.rel}`);
   }
   if (phase === "post")
-    for (const rel of RUNTIME_APPLICATION_RLS_TABLES)
+    for (const rel of catalog.rlsTables)
       if (!policies.some((p) => p.rel === rel && p.name === RUNTIME_APPLICATION_POLICY))
         out.push(`missing policy ${RUNTIME_APPLICATION_POLICY} on ${rel}`);
   // Detection only: a per-schema default-privileges GRANT in sessions naming PUBLIC or the
@@ -976,6 +1144,183 @@ async function exists(
   }
 }
 
+type AdoptableIndexState = "absent" | "adoptable" | "not_ready" | "mismatch";
+
+/** The declared index's catalog state (ADOPTABLE_INDEX_STATE_SQL). Throws if it can't look. */
+async function adoptableIndexState(
+  client: GuardClient,
+  x: AdoptableIndex,
+): Promise<{ state: AdoptableIndexState; tableExists: boolean }> {
+  const row = (
+    await client.query<{ state: AdoptableIndexState; table_exists: boolean }>(
+      ADOPTABLE_INDEX_STATE_SQL,
+      [x.name, x.table, x.def],
+    )
+  ).rows[0];
+  if (!row) throw new Error("no catalog row");
+  return { state: row.state, tableExists: Boolean(row.table_exists) };
+}
+
+/**
+ * The reviewed adoptable-index allowance (ADOPTABLE_INDEXES): true only when `step`
+ * declares index `name` adoptable, the step's whole inventory is its declared indexes
+ * plus the functions it declares it only replaces (ADOPTABLE_INDEX_STEPS[step].replaces),
+ * and the live index is the exact declared one (state `adoptable`, see
+ * ADOPTABLE_INDEX_STATE_SQL). Fails closed.
+ */
+async function adoptableIndex(
+  client: GuardClient,
+  step: string,
+  inventory: InventoryObject[],
+  name: string,
+): Promise<boolean> {
+  const declared = ADOPTABLE_INDEXES[step];
+  const x = declared?.find((d) => d.name === name);
+  if (!declared || !x) return false;
+  const replaces = ADOPTABLE_INDEX_STEPS[step]?.replaces ?? [];
+  if (
+    !inventory.every((o) =>
+      o.kind === "index"
+        ? declared.some((d) => d.name === o.name)
+        : o.kind === "function" && replaces.includes(o.name),
+    )
+  )
+    return false;
+  try {
+    return (await adoptableIndexState(client, x)).state === "adoptable";
+  } catch {
+    return false; // can't look: fail closed, not adoptable
+  }
+}
+
+/** Why a declared index of `step` is not adoptable, for the refusal text (empty if unknown). */
+async function adoptableIndexReason(
+  client: GuardClient,
+  step: string,
+  name: string,
+): Promise<string> {
+  const x = ADOPTABLE_INDEXES[step]?.find((d) => d.name === name);
+  if (!x) return "";
+  try {
+    const { state } = await adoptableIndexState(client, x);
+    if (state === "not_ready")
+      return ": INVALID or still building (a CREATE INDEX CONCURRENTLY may still be running: check pg_stat_progress_create_index before any DROP INDEX CONCURRENTLY)";
+    if (state === "mismatch")
+      return `: not the declared definition (${x.def}), or backs a constraint, or a second index of that name exists`;
+  } catch {
+    // can't look: the generic refusal stands
+  }
+  return "";
+}
+
+/**
+ * The adoptable-index steps' blocking-build decision, read-only, before any write (the
+ * migrator writes its 'pending' readiness marker only after this passes, and the release
+ * plan runs the same check). For every UNLEDGERED step in ADOPTABLE_INDEXES and each of its
+ * declared indexes, the same table the step itself applies (20261105044020):
+ *   adoptable (exact, valid, ready, no constraint)             accepted, the step adopts it;
+ *   absent, table not created yet                              accepted (an earlier step creates it empty);
+ *   absent, table empty                                        accepted, the step creates it;
+ *   absent, table populated, no opt-in                         REFUSED: prebuild it CONCURRENTLY;
+ *   absent, table populated, allowBlockingIndexBuild           accepted (blocking build; never production);
+ *   absent, emptiness not provable (probe error, RLS, ...)     REFUSED (the step would raise too);
+ *   not_ready (INVALID / still building), mismatch             REFUSED.
+ * Emptiness is `SELECT EXISTS(SELECT 1 FROM <table> LIMIT 1)` with row_security off, so RLS
+ * can never make a populated table look empty (a role RLS applies to gets an error, which
+ * refuses). It takes ACCESS SHARE only; row_security is restored afterwards.
+ *   index_prebuild_required   any refusal above, naming each index and table.
+ */
+export async function adoptableIndexBuildPreflight(
+  client: GuardClient,
+  schemaSteps: GuardStep[],
+  ledger: Map<string, string>,
+  opts: { allowBlockingIndexBuild?: boolean } = {},
+): Promise<void> {
+  const allow = opts.allowBlockingIndexBuild === true;
+  const refused: string[] = [];
+  const packets = new Set<string>();
+  for (const step of schemaSteps) {
+    const declared = ADOPTABLE_INDEXES[step.name];
+    if (!declared?.length || ledger.has(step.name)) continue;
+    const before = refused.length;
+    for (const x of declared) {
+      const where = `index sessions.${x.name} on ${x.table} (${step.name})`;
+      let state: AdoptableIndexState;
+      let tableExists: boolean;
+      try {
+        ({ state, tableExists } = await adoptableIndexState(client, x));
+      } catch {
+        refused.push(`${where}: its catalog state could not be read`);
+        continue;
+      }
+      if (state === "adoptable") continue;
+      if (state === "not_ready") {
+        refused.push(
+          `${where} is INVALID or still building: if a CREATE INDEX CONCURRENTLY is still running (pg_stat_progress_create_index) let it finish and rerun; only a failed build is dropped, with DROP INDEX CONCURRENTLY`,
+        );
+        continue;
+      }
+      if (state === "mismatch") {
+        refused.push(
+          `${where} exists but is not the declared index (expected exactly: ${x.def}; not backing a constraint, the only index of that name); reconcile it by hand`,
+        );
+        continue;
+      }
+      if (!tableExists) continue;
+      let populated: boolean;
+      try {
+        populated = await tablePopulated(client, x.table);
+      } catch {
+        refused.push(
+          `${where} is absent and ${x.table} could not be proven empty (the probe failed, e.g. row-level security applies to this role)`,
+        );
+        continue;
+      }
+      if (populated && !allow)
+        refused.push(
+          `${where} is absent and table ${x.table} is not empty; a blocking CREATE INDEX on a populated table is refused`,
+        );
+    }
+    if (refused.length > before)
+      packets.add(ADOPTABLE_INDEX_STEPS[step.name]?.packet ?? "see the runbook");
+  }
+  if (refused.length)
+    throw guardError(
+      "index_prebuild_required",
+      `${refused.join("; ")}. Prebuild each absent index out of band with CREATE INDEX CONCURRENTLY (${[...packets].join("; ")}), then rerun: the step adopts it. Nothing was written. HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true is for non-production databases only (the release and owner-apply profiles cannot set it); see the runbook`,
+    );
+}
+
+/**
+ * Read-only existence probe with row_security off (an error, never an empty answer, if RLS
+ * would hide rows). Session-level set and restore, so it works both inside the release
+ * plan's READ ONLY transaction and on the migrator's autocommit connection. Fails closed:
+ * if row_security is not observably off for the probe itself, the table counts as populated.
+ */
+async function tablePopulated(client: GuardClient, table: string): Promise<boolean> {
+  if (!/^sessions\.[a-z_][a-z0-9_]*$/.test(table)) throw new Error(`unexpected table name ${table}`);
+  const prior = (
+    await client.query<{ v: string }>("SELECT current_setting('row_security') AS v")
+  ).rows[0]?.v;
+  if (prior === undefined) throw new Error("row_security unreadable");
+  await client.query("SELECT set_config('row_security', 'off', false)");
+  try {
+    const row = (
+      await client.query<{ off: boolean; populated: boolean }>(
+        `SELECT current_setting('row_security') = 'off' AS off, EXISTS (SELECT 1 FROM ${table} LIMIT 1) AS populated`,
+      )
+    ).rows[0];
+    if (!row?.off) return true; // can't prove RLS off: fail closed
+    return Boolean(row.populated);
+  } finally {
+    try {
+      await client.query("SELECT set_config('row_security', $1, false)", [prior]);
+    } catch {
+      // aborted transaction: its rollback restores the setting
+    }
+  }
+}
+
 /**
  * Refuses, before any write, unless the database is either empty of this migration
  * set or exactly a ledgered prefix of each migration lane. Upstream and 96Bulls are
@@ -985,6 +1330,11 @@ async function exists(
  *   ledger_gap            one lane isn't a contiguous prefix of its ordered steps;
  *   migration_changed     a ledgered step's file changed;
  *   unledgered_schema     an object that an unledgered step creates already exists.
+ * The one exception is ADOPTABLE_INDEXES: a declared index built out of band, exact,
+ * valid and ready, is accepted for its step (the step adopts it). A step that also
+ * replaces functions (ADOPTABLE_INDEX_STEPS) keeps its body sentinel; that sentinel is only
+ * set aside when the step declares exactBodies and every one is live byte-identical to the
+ * step file's own body with the declared attributes (exactBodiesLive).
  * Nothing is ever imported into, or marked in, the ledger.
  */
 export async function sequencePreflight(
@@ -1051,13 +1401,20 @@ export async function sequencePreflight(
   const found: string[] = [];
   for (let i = 0; i < names.length; i++) {
     if (ledger.has(names[i]!)) continue;
-    for (const o of inventoryOf(sql[i]!)) {
+    const inventory = inventoryOf(sql[i]!);
+    for (const o of inventory) {
       const id = key(o);
       if (seen.has(id)) continue;
       seen.add(id);
-      if (await exists(client, o))
+      if (
+        (await exists(client, o)) &&
+        !(o.kind === "index" &&
+          (await adoptableIndex(client, names[i]!, inventory, o.name)))
+      )
         found.push(
-          `${o.kind} ${o.name}${o.on ? ` on ${o.on}` : ""} (${names[i]})`,
+          `${o.kind} ${o.name}${o.on ? ` on ${o.on}` : ""} (${names[i]})${
+            o.kind === "index" ? await adoptableIndexReason(client, names[i]!, o.name) : ""
+          }`,
         );
     }
   }
@@ -1079,6 +1436,21 @@ export async function sequencePreflight(
     } catch {
       applied = true; // can't look: fail closed, as if the step had run
     }
+    // An index-only adoptable step's sentinel is its declared indexes: accepted only when every one
+    // is adoptable. A step that also replaces functions has a body sentinel, never overridden by
+    // index adoption; only its exactBodies (byte-identical to the file, declared attributes) set it aside.
+    const declared = ADOPTABLE_INDEXES[names[i]!];
+    const replacesFunctions = (ADOPTABLE_INDEX_STEPS[names[i]!]?.replaces.length ?? 0) > 0;
+    if (applied && declared?.length && !replacesFunctions) {
+      const inventory = inventoryOf(sql[i]!);
+      let all = true;
+      for (const d of declared)
+        if (!(await adoptableIndex(client, names[i]!, inventory, d.name))) all = false;
+      if (all) applied = false;
+    }
+    const exact = ADOPTABLE_INDEX_STEPS[names[i]!]?.exactBodies;
+    if (applied && replacesFunctions && exact?.length && (await exactBodiesLive(client, sql[i]!, exact)))
+      applied = false;
     if (applied) found.push(`sentinel ${sentinel.evidence} (${names[i]})`);
   }
   if (found.length)
@@ -1086,6 +1458,49 @@ export async function sequencePreflight(
       "unledgered_schema",
       `objects of unrecorded migrations already exist: ${found.slice(0, 5).join("; ")}${found.length > 5 ? `; and ${found.length - 5} more` : ""}. Nothing is imported or marked, see the runbook decision point`,
     );
+}
+
+/**
+ * The text between a step file's `AS $tag$` and the closing `$tag$`, exactly as PostgreSQL stores it in
+ * prosrc; null unless the tag occurs exactly twice and the first is `AS $tag$`.
+ */
+export function dollarQuotedBody(sql: string, tag: string): string | null {
+  const quote = `$${tag}$`;
+  const parts = sql.split(quote);
+  if (parts.length !== 3 || !/\bAS\s+$/.test(parts[0]!)) return null;
+  return parts[1]!;
+}
+
+/**
+ * Exact-body adoption (ADOPTABLE_INDEX_STEPS[step].exactBodies): true only when every declared function
+ * is live with the step file's own body, byte for byte, and the declared attributes. Any error, missing
+ * function or unparsable body is false (the caller keeps refusing).
+ */
+export async function exactBodiesLive(
+  client: GuardClient,
+  stepSql: string,
+  bodies: readonly ExactBody[],
+): Promise<boolean> {
+  for (const b of bodies) {
+    const body = dollarQuotedBody(stepSql, b.tag);
+    if (body === null) return false;
+    try {
+      const ok = (
+        await client.query<{ ok: boolean }>(
+          `SELECT (p.prosrc = $2 AND p.prosecdef AND p.provolatile = 's'
+                   AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql')
+                   AND p.proconfig IS NOT DISTINCT FROM ARRAY[$3::text]
+                   AND p.proowner = (SELECT oid FROM pg_roles WHERE rolname = current_user)) AS ok
+             FROM pg_proc p WHERE p.oid = to_regprocedure($1)`,
+          [b.fn, body, b.config],
+        )
+      ).rows[0]?.ok;
+      if (ok !== true) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1125,7 +1540,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "58802461894bbcb75534eeb0e8f96c8f2df8ea48527996465b46a639b401f0b7";
+  "a2ec492648b20cb435460df4135bdf3e734b94073af67d0ece25dc2752042d68";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;
@@ -1630,10 +2045,11 @@ export async function sessionsFunctionAclDrift(
   runtimeRole: string,
 ): Promise<string[]> {
   const manifest = await sessionsFunctionAclManifest();
+  const runtimeFunctions = runtimeApplicationAclCatalog().functions;
   const expected: Record<string, string[]> = Object.fromEntries(
     Object.entries(manifest).map(([fn, entries]) => [
       fn,
-      (RUNTIME_APPLICATION_FUNCTIONS as readonly string[]).includes(fn)
+      runtimeFunctions.includes(fn)
         ? [...entries, `${runtimeRole}:EXECUTE`]
         : entries,
     ]),
@@ -1686,6 +2102,7 @@ export async function sessionsFunctionAclPreview(
   pendingMigrations = false,
 ): Promise<FunctionAclPreview> {
   const manifest = await sessionsFunctionAclManifest();
+  const runtimeFunctions = runtimeApplicationAclCatalog().functions;
   const actual = await sessionsFunctionAcl(client);
   const extra: string[] = [];
   const missing: string[] = [];
@@ -1700,7 +2117,7 @@ export async function sessionsFunctionAclPreview(
   };
   for (const fn of [...new Set([...Object.keys(manifest), ...Object.keys(actual)])].sort()) {
     const runtimeEntry =
-      runtimeRole && (RUNTIME_APPLICATION_FUNCTIONS as readonly string[]).includes(fn)
+      runtimeRole && runtimeFunctions.includes(fn)
         ? `${runtimeRole}:EXECUTE`
         : null;
     const expectedList = [...(manifest[fn] ?? []), ...(runtimeEntry ? [runtimeEntry] : [])];

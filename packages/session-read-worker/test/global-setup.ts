@@ -22,6 +22,7 @@ import pg from "pg";
 import type { TestProject } from "vitest/node";
 import { createClickHouseClient } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
 import { schemaStatements } from "../../../src/session-pipeline/vendor/search-index/schema.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../../src/hoopdb/session-bootstrap-chain.js";
 
 declare module "vitest" {
   export interface ProvidedContext {
@@ -115,12 +116,11 @@ export default async function setup(project: TestProject) {
   const db = new pg.Client({ connectionString: adminUrl.toString() });
   await db.connect();
   await db.query(read("supabase/tests/supabase_shim.sql"));
-  await db.query(read("supabase/bootstrap/session_directory_search_worker.sql"));
-  await db.query(read("supabase/bootstrap/session_token_verifier.sql"));
   // The disposable database replays the ingest ledger too; provision its
-  // restricted roles through the same privileged bootstrap used by migrate.
-  await db.query(read("supabase/bootstrap/session_ingest_roles.sql"));
-  await db.query(read("supabase/bootstrap/session_read_api_roles.sql"));
+  // restricted roles through the single-sourced bootstrap chain used by
+  // migrate (the function-grants migration FAILs closed without the bare
+  // consumer grantee).
+  for (const f of SESSION_BOOTSTRAP_FILES) await db.query(read(f));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) await db.query(read(`supabase/migrations/${file}`));
   await db.query(sql("supabase/bootstrap/session_read_api_role.sql"));
   // Roles are cluster-wide: the password is per run, so a stale one never logs in.

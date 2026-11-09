@@ -23,6 +23,15 @@
  *   PIPELINE_ORG_FROM_PREFIX  must be exactly "true" (startup refuses otherwise): see below
  *   PIPELINE_KEY_PREFIX       the base of the org-derived key layout the ingest writes
  *   READ_API_TIMING_ASSUME_NO_TURNS                   as on the Worker (exactly "true")
+ *   READ_API_TURNS_ASSUME_NO_LEGACY                   exactly "true": this deployment never had a Neon source, so a
+ *                             scope with no legacy export marker serves its canonical turns instead of 501 turns_unknown
+ *   READ_API_CANONICAL_PIN_LAGGING_POINTER            exactly "true" (default off; read only here, so never on the
+ *                             hosted Lambda): a manifest that advanced past its sessions.session_index pointer row
+ *                             (async admission CAS'd revision N+k after the reconcile poll indexed N) is served
+ *                             pinned to the indexed generation N (canonical.ts pinnedToPointer: strict chunk-prefix
+ *                             hash-chain match, manifest revision > pointer revision >= 1) instead of 501
+ *                             `*_canonical_manifest_mismatch`; the newer chunks appear after the next reconcile.
+ *                             Unset: any manifest/pointer difference is refused, exactly as before.
  *
  * The store is built by src/shared/locker.ts buildLockerStore, the builder
  * every other service uses, so credentials, provider selection and egress rules
@@ -56,6 +65,7 @@ import type { TimingDeps, TurnsDeps } from "./app.ts";
 import type { CatalogDeps } from "./selfhost.ts";
 
 export interface ServiceCanonicalDeps {
+  events: import("./canonical-events.ts").CanonicalEventsDeps;
   timing: TimingDeps;
   turns: TurnsDeps;
   catalog: CatalogDeps;
@@ -91,19 +101,22 @@ export async function serviceCanonicalDeps(
   const gcsToken = gcs ? cachedProvider(() => gcsMetadataToken(env)) : undefined;
   const prefix = { PIPELINE_KEY_PREFIX: env.PIPELINE_KEY_PREFIX || undefined, PIPELINE_ORG_FROM_PREFIX: "true" };
   const pointers = sqlCanonicalPointers(run);
-  async function source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows> {
+  // Self-host only, default off: see READ_API_CANONICAL_PIN_LAGGING_POINTER in the header.
+  const pinLaggingPointer = env.READ_API_CANONICAL_PIN_LAGGING_POINTER?.trim() === "true";
+  async function source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows & { generation: string; exists: boolean }> {
     // Every object read of this request is aborted at the route's deadline.
     const bounded: typeof fetch = (input, init) => fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal });
     const raw = buildLockerStore(env, { fetch: bounded, ...(credentials ? { credentials } : {}), ...(gcsToken ? { gcsToken } : {}) });
     const snapshot = await canonicalSnapshot(
-      { store: raw.store, provider: raw.provider, bucket: raw.bucket, prefix, pointers: pointers.pointers, decompress },
+      { store: raw.store, provider: raw.provider, bucket: raw.bucket, prefix, pointers: pointers.pointers, decompress, ...(pinLaggingPointer ? { pinLaggingPointer } : {}) },
       identity,
     );
-    return { rows: snapshot.rows, legacyCoverage: snapshot.legacyCoverage };
+    return { rows: snapshot.rows, legacyCoverage: snapshot.legacyCoverage, generation: snapshot.generation, exists: snapshot.exists };
   }
   return {
+    events: { source },
     timing: { state: pointers.state, source, assumeNoTurns: env.READ_API_TIMING_ASSUME_NO_TURNS?.trim() === "true" },
-    turns: { harnesses: sqlSessionHarnesses(run), source },
+    turns: { harnesses: sqlSessionHarnesses(run), source, assumeNoLegacy: env.READ_API_TURNS_ASSUME_NO_LEGACY === "true" },
     catalog: { state: pointers.state, source },
   };
 }

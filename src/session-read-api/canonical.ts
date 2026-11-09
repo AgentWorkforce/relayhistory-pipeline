@@ -1,4 +1,9 @@
-import {isManifestRest} from "../../packages/object-store/src/index.ts";
+import {
+  isManifestRest,
+  contentSha256Chain,
+  validateManifest,
+  type ManifestV1,
+} from "../../packages/object-store/src/index.ts";
 import { nodeReadBudget, type NodeReadProfile } from "./node-read-profile.ts";
 /** Canonical S3 session projections, shared with the live S3 -> CH writer.
  * The successful claim-bound pointer RPC is the authentication boundary. No
@@ -57,10 +62,62 @@ export interface CanonicalDeps {
   bucket: string;
   prefix: { PIPELINE_ORG_FROM_PREFIX?: string; PIPELINE_KEY_PREFIX?: string };
   decompress(bytes: Uint8Array, maxBytes: number): Uint8Array;
+  /**
+   * Self-host only (serviceCanonicalDeps, READ_API_CANONICAL_PIN_LAGGING_POINTER):
+   * a manifest that advanced past its pointer row (the reconcile has not
+   * re-indexed it yet) is read pinned to the pointer's generation, see
+   * pinnedToPointer. Unset: any difference is `manifest_mismatch`, as before.
+   */
+  pinLaggingPointer?: boolean;
 }
 export const CANONICAL_SCOPE_BYTES = 16 * 1024 * 1024;
 const MAX_POINTERS = 64; // RPC has LIMIT 64 without a sentinel: refuse the boundary.
 const digest = (value: string) => value.replace(/^\\x/u, "").toLowerCase();
+/**
+ * `m` cut back to the generation a lagging pointer indexed, or null (the caller
+ * then refuses with `manifest_mismatch`, as without pinning). Chunks are
+ * append-only, so the generation at pointer revision `revision` is a chunk
+ * prefix of `m`; it is pinned only when `m.revision > revision >= 1` and the
+ * hash chain over some prefix chunks[0..k], k >= 1, equals `want` (the pointer's
+ * content_sha256, lowercase hex). The pinned body carries the pointer revision
+ * and the prefix's chunk_count, raw_bytes, stored_bytes, next_offset, epochs
+ * (those opened before chunk k: first_seq is a chunk index) and epoch, and must
+ * pass validateManifest. Everything else (session, user, extensions) is `m`'s
+ * and is still checked against the pointer by the caller.
+ */
+export async function pinnedToPointer(
+  m: ManifestV1,
+  want: string,
+  revision: number,
+): Promise<ManifestV1 | null> {
+  if (!Number.isSafeInteger(revision) || revision < 1 || !(m.revision > revision))
+    return null;
+  if (!/^[0-9a-f]{64}$/u.test(want)) return null;
+  let k = 0;
+  for await (const step of contentSha256Chain(m.raw.chunks)) {
+    k++;
+    if (step !== want) continue;
+    const chunks = m.raw.chunks.slice(0, k);
+    const last = chunks[k - 1]!;
+    const pinned: ManifestV1 = {
+      ...m,
+      revision,
+      raw: {
+        ...m.raw,
+        chunks,
+        chunk_count: k,
+        content_sha256: want,
+        raw_bytes: chunks.reduce((n, c) => n + c.bytes, 0),
+        stored_bytes: chunks.reduce((n, c) => n + c.stored_bytes, 0),
+        next_offset: last.start_offset + last.bytes,
+        epochs: m.raw.epochs.filter((e) => e.first_seq < k),
+        epoch: last.epoch,
+      },
+    };
+    return (await validateManifest(pinned)).length === 0 ? pinned : null;
+  }
+  return null;
+}
 function checked(
   pointers: CanonicalPointer[],
   identity: CanonicalIdentity,
@@ -177,8 +234,10 @@ async function snapshotWithLimits(
           if (!p) throw new CanonicalReadError("pointer_invalid");
           const read = await reader.read(key);
           if (!read) throw new CanonicalReadError("object_missing");
-          const m = read.manifest,
-            canonical = canonicalManifestIdentity(m);
+          let m = read.manifest;
+          if (deps.pinLaggingPointer && m.raw.content_sha256 !== digest(p.content_sha256))
+            m = (await pinnedToPointer(m, digest(p.content_sha256), Number(p.revision))) ?? m;
+          const canonical = canonicalManifestIdentity(m);
           // content_sha256 is the RAW CHUNK HASH CHAIN, not SHA256(manifest bytes).
           if (
             m.raw.content_sha256 !== digest(p.content_sha256) ||
@@ -200,7 +259,7 @@ async function snapshotWithLimits(
             !prefixAllowed(deps.prefix, at.prefix, identity.orgId)
           )
             throw new CanonicalReadError("prefix_mismatch");
-          return read;
+          return m === read.manifest ? read : { ...read, manifest: m };
         },
       },
     },

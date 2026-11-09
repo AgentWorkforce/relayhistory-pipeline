@@ -16,6 +16,7 @@ import {
 } from "@rhc/auth/relaycontrol.ts";
 import { AuthError, type Verifier } from "./app.ts";
 import type { LoginExchange } from "./selfhost.ts";
+import { hashToken, isAccessBearer, normalizedOrigin, type SelfIssuedDeps, type TokenStore } from "./self-issued.ts";
 
 export interface AuthConfig {
   /** This service's origin, e.g. https://xyz.lambda-url.us-east-1.on.aws. Unset: every token is refused. */
@@ -26,15 +27,39 @@ export interface AuthConfig {
    * Present only with RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true: relaycontrol
    * user access tokens (`sh_at_`) are introspected. A missing URL or secret
    * refuses those tokens (401 not_configured); RelayAuth tokens are unaffected.
+   * `positiveTtlMs` is READ_API_INTROSPECT_POSITIVE_TTL_MS (lambda.ts
+   * readApiIntrospectPositiveTtlMs): how long an admit is reused, 0..60000;
+   * absent is READ_API_INTROSPECT_POSITIVE_TTL_MS_DEFAULT (60000). It is always
+   * passed to the introspector explicitly, never inherited.
    */
-  relaycontrol?: { url?: string; secret?: string };
+  relaycontrol?: { url?: string; secret?: string; positiveTtlMs?: number };
   /**
    * READ_API_AUTH_MODE=relaycontrol_only (lambda.ts readApiAuthConfig): only
    * `sh_at_` tokens through relaycontrol; relayAuthVerifier is never built, so
    * no JWKS is fetched and every other bearer is 401 with no outbound call.
    * Absent: the default dual path, unchanged.
    */
-  mode?: "relaycontrol_only";
+  mode?: "relaycontrol_only" | "self_issued";
+  /** READ_API_AUTH_MODE=self_issued only: the origin (normalized), internal secrets and access TTL. */
+  selfIssued?: Pick<SelfIssuedDeps, "audience" | "internalSecrets" | "accessTtlSeconds">;
+}
+
+/** The read path's positive introspection cache when READ_API_INTROSPECT_POSITIVE_TTL_MS is unset (the hosted behaviour). */
+export const READ_API_INTROSPECT_POSITIVE_TTL_MS_DEFAULT = 60_000;
+/** The largest positive TTL the read path accepts; relaycontrol.ts also caps at this. */
+export const READ_API_INTROSPECT_POSITIVE_TTL_MS_MAX = 60_000;
+
+/**
+ * The introspector options for the read path. The positive TTL is explicit;
+ * the negative TTL is left to the client's own default (5 s, capped there), so
+ * refusals are never cached longer than relaycontrol.ts already does.
+ */
+function introspectorOptions(
+  relaycontrol: NonNullable<AuthConfig["relaycontrol"]>,
+  url: string,
+  secret: string,
+): RelaycontrolIntrospectorOptions {
+  return { url, secret, positiveTtlMs: relaycontrol.positiveTtlMs ?? READ_API_INTROSPECT_POSITIVE_TTL_MS_DEFAULT };
 }
 
 export function relayAuthVerifier(config: AuthConfig, verify = verifyAgentRelayToken): Verifier {
@@ -89,7 +114,7 @@ export function relaycontrolVerifier(
       throw new AuthError(401, "not_configured", "this read API has no relaycontrol introspection configured");
     let auth;
     try {
-      const verifier = await introspector({ url, secret });
+      const verifier = await introspector(introspectorOptions(config.relaycontrol!, url, secret));
       auth = await verifier.verifyRelaycontrolToken(bearer, {
         aud: config.origin,
         ...(request?.workspace ? { workspace: request.workspace } : {}),
@@ -133,6 +158,27 @@ export function readApiVerifier(
 }
 
 /**
+ * READ_API_AUTH_MODE=self_issued: only this service's own access and service tokens. The hash is
+ * looked up on every request and nothing is cached, so a deleted row is refused at once. Identity
+ * is only the row's. Any store failure, including a statement timeout, denies with 503 (retryable;
+ * a 401 would tell a client to drop a good token) and serves nothing.
+ */
+export function selfIssuedVerifier(store: TokenStore, audience: string, now: () => number = Date.now): Verifier {
+  return async (bearer) => {
+    if (!isAccessBearer(bearer)) throw new AuthError(401, "invalid_token", "token is not valid");
+    const hash = await hashToken(bearer);
+    let row;
+    try {
+      row = await store.verify(hash, new Date(now()));
+    } catch {
+      throw new AuthError(503, "token_store_unavailable", "the token store is unavailable");
+    }
+    if (!row || normalizedOrigin(row.audience) !== audience) throw new AuthError(401, "invalid_token", "token is not valid");
+    return { userId: row.userId, orgId: row.orgId, workspaceId: row.workspaceId, scopes: row.scopes };
+  };
+}
+
+/**
  * POST /v1/cli/login's exchange (RELAYHISTORY_SELFHOST_READ_API): the presented
  * `sh_at_` token through the same introspection as every relaycontrol read, with
  * `aud` = READ_API_ORIGIN and no workspace (the response's is authoritative).
@@ -155,7 +201,7 @@ export function relaycontrolLogin(
     if (!isRelaycontrolToken(token)) throw new AuthError(401, "invalid_token", "token is not valid");
     let auth;
     try {
-      const verifier = await introspector({ url, secret });
+      const verifier = await introspector(introspectorOptions(config.relaycontrol, url, secret));
       auth = await verifier.verifyRelaycontrolToken(token, { aud: config.origin });
     } catch (error) {
       if (error instanceof RelaycontrolUnavailableError) throw new AuthError(503, error.code, error.message);

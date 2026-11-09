@@ -1,6 +1,11 @@
 -- Amazon RDS for PostgreSQL 16+ migration compatibility roles (HOOPDB_DB_MODE=rds;
 -- RDS for PostgreSQL only, NOT Aurora). Same contract as cloudsql_migration_roles.sql.
 --
+-- MASTER-OWNER LAYOUT ONLY. Do not run this file for the infra #107 separate-database
+-- layout: there rds-activation/v1 (src/hoopdb/rds-activation.ts) creates the complete
+-- role set in its one transaction. It still reads this file's role inventory below to
+-- generate that set, so this file is part of its artifact identity.
+--
 -- RDS exposes no customer SUPERUSER: the master is a CREATEROLE member of rds_superuser.
 -- PostgreSQL 16+ records an automatic ADMIN membership, granted by the bootstrap
 -- superuser (rdsadmin on RDS), when a non-superuser CREATEROLE user creates a role, and
@@ -10,14 +15,20 @@
 -- service_role cannot be created at all without BYPASSRLS.
 -- https://www.postgresql.org/docs/17/role-attributes.html
 --
--- Use a disposable CREATEROLE trampoline instead: it creates the twelve fixed NOLOGIN
+-- Use a disposable CREATEROLE trampoline instead: it creates the fixed NOLOGIN
 -- roles, the same set as cloudsql_migration_roles.sql (ingest, canonical producer,
--- project-events and read API included; their migrations only verify roles), then the migration owner drops the trampoline. DROP ROLE removes the
+-- project-events and read API included; their
+-- migrations only verify roles), then the migration owner drops the trampoline. DROP ROLE removes the
 -- trampoline's automatic memberships, leaving every target membership-free, so the
 -- existing strict verifiers and historical migration guards pass unchanged. The
 -- trampoline and every target are created in this one transaction, so any refusal rolls
 -- the entire operation back. Consequence (by design): nobody but rdsadmin can later
 -- alter or drop these NOLOGIN roles.
+--
+-- search_consumer_runtime is NOT in that set: the migration owner creates it
+-- directly with supabase/bootstrap/session_consumer_roles.sql (like the runtime
+-- LOGIN role below), keeping the owner's ADMIN creator edge so the owner can
+-- promote it. A trampoline copy would leave it manageable only by rdsadmin.
 --
 -- service_role is deliberately NOBYPASSRLS, as on Cloud SQL: there is no Supabase or
 -- PostgREST service-role runtime on RDS; the role exists only because the shared schema
@@ -86,6 +97,15 @@ BEGIN
       v_missing := true;
       CONTINUE;
     END IF;
+    -- search_consumer_runtime is deliberately NOT in this inventory: the
+    -- migration owner creates it directly with
+    -- supabase/bootstrap/session_consumer_roles.sql (same pattern as
+    -- hoopdb_runtime_role_rds.sql), keeping the unavoidable PG16+ ADMIN
+    -- creator edge so the owner can promote it to LOGIN. A trampoline would
+    -- create it in the disposable seed context, and the final membership
+    -- recheck below would then refuse the owner's promotion path, so the
+    -- trampoline must never provision it. Its claimed-LOGIN steady state
+    -- converges in session_consumer_roles.sql instead.
     IF v_row.rolcanlogin THEN v_problems := array_append(v_problems, format('%I has LOGIN', v_role)::text); END IF;
     IF v_row.rolinherit THEN v_problems := array_append(v_problems, format('%I has INHERIT', v_role)::text); END IF;
     IF v_row.rolbypassrls THEN v_problems := array_append(v_problems, format('%I has BYPASSRLS', v_role)::text); END IF;
@@ -176,6 +196,9 @@ BEGIN
       CREATE ROLE bulls96_babysitter_retention
         NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
+    -- search_consumer_runtime is never created here (see the inventory note
+    -- above): the migration owner provisions it with
+    -- session_consumer_roles.sql so the owner's ADMIN creator edge survives.
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_acquisition_installer') THEN
       CREATE ROLE bulls96_acquisition_installer
         NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
@@ -198,7 +221,8 @@ BEGIN
        'session_token_verifier',
        'bulls96_session_ingest', 'bulls96_session_ingest_seeder',
        'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events',
-       'bulls96_privacy_eraser', 'bulls96_babysitter_retention', 'bulls96_acquisition_installer',
+       'bulls96_privacy_eraser', 'bulls96_babysitter_retention',
+       'bulls96_acquisition_installer',
        'buffered_search_feed_runtime'
      )
   ) THEN

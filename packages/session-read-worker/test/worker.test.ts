@@ -12,6 +12,7 @@ import { beforeAll, describe, expect, test } from "vitest";
 import { createClickHouseClient, type ClickHouseClient } from "../../../src/session-pipeline/vendor/search-index/clickhouse.ts";
 import { row } from "../../../src/session-read-api/__tests__/support.ts";
 import { boundedClickHouse, connectPg, handle, ownerBufferedDeps, type Env } from "../src/index.ts";
+import { BufferedFenced, BufferedIndexVerifier } from "../../../src/session-read-api/owner-buffered.ts";
 
 type TestEnv = Env & {
   TEST_PG_ADMIN: Hyperdrive;
@@ -224,6 +225,120 @@ describe("entry and configuration", () => {
     };
     for (const bad of ["true", "1", "ON", " on", "off", "yes"]) {
       const r = await call({ READ_API_OWNER_BUFFERED_EVENTS: bad });
+      expect(r.status, bad).toBe(503);
+      expect((await body(r)).error.code).toBe("backend_unavailable");
+    }
+  });
+
+  test("READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: unset keeps 2000; 2000..6000 is passed to the buffered RPCs; a bad value is a 503", async () => {
+    const seen: string[] = [];
+    const run = (async (_org: string, _ws: string, work: (q: { query(sql: string, params?: unknown[]): Promise<{ rows: unknown[] }> }) => Promise<unknown>) =>
+      work({
+        async query(sql: string) {
+          seen.push(sql);
+          return { rows: [] };
+        },
+      })) as never;
+    const keys = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", READ_API_OWNER_BUFFERED_WORKSPACES: "ws-a", INGEST_S3_BUCKET: "ingest-bucket-example", PIPELINE_RAW_S3_ACCESS_KEY_ID: "k", PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "s" };
+    const head = { cutoverEpoch: "1".repeat(64), privacyBaselineSha256: "4".repeat(64), head: { epoch: "1".repeat(64), version: "7", digest: "3".repeat(64), kind: "selection", pending: false } } as never;
+    const scope = { orgId: "org-a", workspaceId: "ws-a", userId: "u-1" };
+    for (const [flag, want] of [[undefined, 2000], ["", 2000], ["2000", 2000], ["5000", 5000], ["6000", 6000]] as const) {
+      seen.length = 0;
+      const d = ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: flag } as Env, run);
+      await d!.reads.list(scope, head, { limit: 1 });
+      expect(seen[0], String(flag)).toBe(`SET LOCAL statement_timeout = ${want}`);
+      seen.length = 0;
+      await d!.reads.stages(scope, head, "claude", "s-x");
+      expect(seen[0], `stages ${String(flag)}`).toBe(`SET LOCAL statement_timeout = ${want}`);
+    }
+
+    const t = tenant();
+    const call = async (over: Partial<Env>) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}/v1/sessions/s-x/events?workspace=${t.ws}&source=claude`, { headers: { authorization: `Bearer ${await token(t)}` } }), { ...E, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    for (const bad of ["1999", "6001", "10000", "02000", " 3000", "on"]) {
+      const r = await call({ READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: bad });
+      expect(r.status, bad).toBe(503);
+      expect((await body(r)).error.code).toBe("backend_unavailable");
+    }
+  });
+
+  test("READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY and _PHASE_LOG: default off leaves the deps unchanged; 2..32 and exactly \"1\" set them; a bad concurrency is a 503", async () => {
+    const run = (async () => {
+      throw new Error("no database in this test");
+    }) as never;
+    const keys = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", READ_API_OWNER_BUFFERED_WORKSPACES: "ws-a", INGEST_S3_BUCKET: "ingest-bucket-example", PIPELINE_RAW_S3_ACCESS_KEY_ID: "k", PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "s" };
+    const keysOf = (d: object | undefined) => Object.keys(d ?? {}).sort();
+    const base = ownerBufferedDeps({ ...E, ...keys } as Env, run);
+    expect("stageConcurrency" in base!).toBe(false);
+    expect("phaseLog" in base!).toBe(false);
+    for (const flag of [undefined, "", "0", "1"]) {
+      const d = ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY: flag } as Env, run);
+      expect(keysOf(d), String(flag)).toEqual(keysOf(base));
+    }
+    for (const flag of [undefined, "", "0", "true", "on", " 1"]) {
+      const d = ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_PHASE_LOG: flag } as Env, run);
+      expect(keysOf(d), String(flag)).toEqual(keysOf(base));
+    }
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY: "2" } as Env, run)?.stageConcurrency).toBe(2);
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY: "32" } as Env, run)?.stageConcurrency).toBe(32);
+    expect(ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_PHASE_LOG: "1" } as Env, run)?.phaseLog).toBe(true);
+    // Neither flag enables owner-buffered reads on its own.
+    expect(ownerBufferedDeps({ ...E, ...keys, RELAYHISTORY_READ_OWNER_BUFFERED: undefined, READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY: "8", READ_API_OWNER_BUFFERED_PHASE_LOG: "1" } as Env, run)).toBeUndefined();
+
+    const t = tenant();
+    const call = async (over: Partial<Env>) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}/v1/sessions/s-x/events?workspace=${t.ws}&source=claude`, { headers: { authorization: `Bearer ${await token(t)}` } }), { ...E, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    for (const bad of ["33", "02", "-2", "2.0", " 4", "on", "true"]) {
+      const r = await call({ READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY: bad });
+      expect(r.status, bad).toBe(503);
+      expect((await body(r)).error.code).toBe("backend_unavailable");
+    }
+  });
+
+  test("READ_API_OWNER_BUFFERED_INDEX_VERIFY: only \"on\" adds the index check; unset/empty leaves the deps unchanged; any other value is a 503 before any read", async () => {
+    let probes = 0;
+    const run = (async () => {
+      probes += 1;
+      throw new Error("no database in this test");
+    }) as never;
+    const keys = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", READ_API_OWNER_BUFFERED_WORKSPACES: "ws-a", INGEST_S3_BUCKET: "ingest-bucket-example", PIPELINE_RAW_S3_ACCESS_KEY_ID: "k", PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "s" };
+    const keysOf = (d: object | undefined) => Object.keys(d ?? {}).sort();
+    const base = ownerBufferedDeps({ ...E, ...keys } as Env, run);
+    expect("indexCheck" in base!).toBe(false);
+    for (const flag of [undefined, ""]) {
+      const d = ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_INDEX_VERIFY: flag } as Env, run);
+      expect(keysOf(d), String(flag)).toEqual(keysOf(base));
+    }
+    expect(probes).toBe(0);
+    // On: a fresh verifier (not the isolate one) proves the check is wired to this request's runner and
+    // that a probe error fences as index_unverified rather than throwing anything else.
+    const verifier = new BufferedIndexVerifier();
+    const on = ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_INDEX_VERIFY: "on" } as Env, run, undefined, verifier);
+    expect(on?.indexCheck).toBeDefined();
+    const err = await on!.indexCheck!.ensure({ orgId: "o", workspaceId: "ws-a", userId: "u" } as never).then(() => undefined, (e: unknown) => e);
+    expect(err).toBeInstanceOf(BufferedFenced);
+    expect((err as BufferedFenced).reason).toBe("index_unverified");
+    expect(probes).toBe(1);
+    // The flag alone never enables owner-buffered reads.
+    expect(ownerBufferedDeps({ ...E, ...keys, RELAYHISTORY_READ_OWNER_BUFFERED: undefined, READ_API_OWNER_BUFFERED_INDEX_VERIFY: "on" } as Env, run)).toBeUndefined();
+
+    const t = tenant();
+    const call = async (over: Partial<Env>) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}/v1/sessions/s-x/events?workspace=${t.ws}&source=claude`, { headers: { authorization: `Bearer ${await token(t)}` } }), { ...E, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    for (const bad of ["true", "1", "ON", " on", "off", "yes"]) {
+      const r = await call({ READ_API_OWNER_BUFFERED_INDEX_VERIFY: bad });
       expect(r.status, bad).toBe(503);
       expect((await body(r)).error.code).toBe("backend_unavailable");
     }

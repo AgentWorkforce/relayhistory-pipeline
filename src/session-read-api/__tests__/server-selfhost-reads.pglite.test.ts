@@ -35,6 +35,7 @@ import { readApiVerifier } from "../auth.ts";
 import { readApiDepsFromSecret, readAppFromSecret } from "../lambda.ts";
 import { startReadApiService, type ReadApiService } from "../server.ts";
 import { readerLoginAnswer } from "./reader-login-support.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -195,6 +196,33 @@ async function writeSession(location = locationFor(ORG)): Promise<ManifestV1> {
   return manifest;
 }
 
+/**
+ * org_4: the session above, then one more chunk (an extra assistant event) CAS'd to revision 2
+ * after the reconcile indexed revision 1, so the pointer row lags the manifest
+ * (READ_API_CANONICAL_PIN_LAGGING_POINTER). Returns the revision-1 manifest the pointer names.
+ */
+async function writeLaggingSession(): Promise<ManifestV1> {
+  const location = locationFor("org_4");
+  const first = await writeSession(location);
+  const line = { kind: "session_event", origin_id: "origin-1", record_id: "a2", revision: "1", operation: "upsert", received_at: new Date(AT).toISOString(), payload: { ts_ms: AT + 9_200, role: "assistant", text: "later", message_id: "m-a2" } };
+  const raw = new TextEncoder().encode(JSON.stringify(line) + "\n");
+  const stored = new Uint8Array(zstdCompressSync(raw));
+  const sha = await sha256Hex(raw);
+  const prev = first.raw.chunks[0]!;
+  const chunk: ChunkEntry = {
+    seq: 1, epoch: 0, start_offset: prev.bytes, bytes: raw.byteLength, stored_bytes: stored.byteLength, sha256: sha, sha256_8: sha.slice(0, 8),
+    stored_sha256: await sha256Hex(stored), stored_raw_bytes: raw.byteLength, raw_sha256: sha, compression: "zstd", records: 1,
+  };
+  const chunks = [prev, chunk];
+  const second = {
+    ...first, revision: 2,
+    raw: { ...first.raw, chunks, chunk_count: 2, raw_bytes: prev.bytes + raw.byteLength, stored_bytes: prev.stored_bytes + stored.byteLength, next_offset: prev.bytes + raw.byteLength, content_sha256: await computeContentSha256(chunks) },
+  } as ManifestV1;
+  objects.set(String(rawChunkKey(location, 1, prev.bytes, sha, "ndjson")), stored);
+  objects.set(String(objectKey(manifestKey(location))), new TextEncoder().encode(JSON.stringify(second)));
+  return first;
+}
+
 // ---------------------------------------------------------------------------
 // Outbound fetch accounting: every fetch this process makes, bar the test's own calls to the service.
 
@@ -206,10 +234,8 @@ const RealPool = pg.Pool;
 beforeAll(async () => {
   supa = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await supa.exec(read("supabase/tests/supabase_shim.sql"));
-  await supa.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
-  await supa.exec(read("supabase/bootstrap/session_token_verifier.sql"));
-  await supa.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
-  await supa.exec(read("supabase/bootstrap/session_read_api_roles.sql"));
+  // Single-sourced bootstrap chain: the grant migration FAILs closed without the bare consumer grantee.
+  for (const f of SESSION_BOOTSTRAP_FILES) await supa.exec(read(f));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) await supa.exec(read(`supabase/migrations/${file}`));
   await supa.exec(psql("supabase/bootstrap/session_read_api_role.sql"));
   await supa.exec(psql("supabase/bootstrap/session_read_api_role_verify.sql"));
@@ -220,6 +246,8 @@ beforeAll(async () => {
   // org_3 keeps its session in a GCS Locker (served by the same loopback stub as a GCS emulator).
   const gcsManifest = await writeSession(locationFor("org_3"));
   await pointerRow(gcsManifest, { org: "org_3", objectsOrg: "org_3", provider: "gcs" });
+  // org_4: a pointer at revision 1 whose manifest is already at revision 2.
+  await pointerRow(await writeLaggingSession(), { org: "org_4", objectsOrg: "org_4" });
 
   s3 = await listen((req, res) => {
     objectAuth.push(req.headers.authorization ?? "");
@@ -637,6 +665,48 @@ describe("startup and wiring rules", () => {
     } finally {
       await close();
     }
+  });
+
+  test("the hosted Lambda assembly ignores READ_API_CANONICAL_PIN_LAGGING_POINTER: nothing canonical is wired", async () => {
+    const env = baseEnv({ READ_API_AUTH_MODE: undefined, RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS: undefined, RELAYHISTORY_SELFHOST_READ_API: undefined, READ_API_CANONICAL_PIN_LAGGING_POINTER: "true", READ_API_EVENT_MESSAGE_IDS: "true" });
+    const { deps, close } = await readApiDepsFromSecret(env.RELAYHISTORY_READ_API_SECRET!, env, undefined, { entry: "lambda" });
+    try {
+      for (const k of ["timing", "turns", "canonicalEvents", "eventMessageIds", "selfhost"] as const) expect([k, deps[k as keyof typeof deps]]).toEqual([k, undefined]);
+      expect(s3.hits).toEqual([]);
+    } finally {
+      await close();
+    }
+    // The flag is read in exactly one place, the self-host service's canonical source, which the
+    // Lambda entry never builds (lambda.ts: `entry === "service" ? await serviceCanonicalDeps(...)`).
+    const readers = (await Array.fromAsync(new Bun.Glob("src/**/*.ts").scan({ cwd: root })))
+      .filter((f) => !f.includes("/__tests__/") && read(f).replace(/^\s*(?:\*|\/\/).*$/gmu, "").includes("READ_API_CANONICAL_PIN_LAGGING_POINTER"));
+    expect(readers).toEqual(["src/session-read-api/service-canonical.ts"]);
+    expect(read("src/session-read-api/lambda.ts")).toContain('const canonical = entry === "service" ? await serviceCanonicalDeps(');
+  });
+
+  test("READ_API_CANONICAL_PIN_LAGGING_POINTER on the service: off a lagging pointer is 501 manifest_mismatch, on it serves the indexed generation", async () => {
+    const token = "sh_at_synthetic-lag";
+    answers.set(token, (_b, res) => json(res, 200, active({ org: "org_4", token_id: "tokid_lag" })));
+    for (const flag of [undefined, "", "1", "TRUE"]) {
+      const get = await start(baseEnv(flag === undefined ? {} : { READ_API_CANONICAL_PIN_LAGGING_POINTER: flag }));
+      const r = await get(ROUTES[0]!, token);
+      expect([flag, r.status]).toEqual([flag, 501]);
+      expect(await code(r)).toMatchObject({ code: "unsupported_by_backend", reason: "timing_canonical_manifest_mismatch" });
+      for (const s of running.splice(0)) await s.close();
+    }
+    const get = await start(baseEnv({ READ_API_CANONICAL_PIN_LAGGING_POINTER: "true" }));
+    const timing = await get(ROUTES[0]!, token);
+    expect(timing.status).toBe(200);
+    // Revision 1's two events only: the third (chunk 1, revision 2) waits for the next reconcile.
+    expect(((await timing.json()) as { coverage: { eventCount: number } }).coverage.eventCount).toBe(2);
+    for (const path of ROUTES.slice(1)) expect([path, (await get(path, token)).status]).toEqual([path, 200]);
+    // The same session's pointer at the manifest's revision (as after the next tick) serves all three.
+    await supa.query(`UPDATE sessions.session_index SET revision = 2, content_sha256 = decode($1, 'hex') WHERE org_id = 'org_4'`, [
+      (JSON.parse(new TextDecoder().decode(objects.get(String(objectKey(manifestKey(locationFor("org_4"))))))) as ManifestV1).raw.content_sha256,
+    ]);
+    const healed = await get(ROUTES[0]!, token);
+    expect([healed.status, healed.status === 200 ? null : await healed.text()]).toEqual([200, null]);
+    expect(((await healed.json()) as { coverage: { eventCount: number } }).coverage.eventCount).toBe(3);
   });
 
   test("readApiVerifier relaycontrol_only never calls the RelayAuth verifier", async () => {

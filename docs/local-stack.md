@@ -122,6 +122,7 @@ keep their path unchanged either way.
 | `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS` | ingest, read API (Lambda, Worker and the self-host SERVICE) | Exactly `true` enables; anything else is off. Off, a `sh_at_` bearer is refused exactly as before. |
 | `RELAYCONTROL_INTROSPECT_URL` | same | Relaycontrol's base URL, configuration only. Same transport rule as every destination: https, loopback, or `http` to an in-cluster Service name with `ALLOW_IN_CLUSTER_HTTP=true` (the Worker: https or loopback only). |
 | `RELAYCONTROL_INTROSPECT_SECRET` | same | The dedicated service secret, sent as `Authorization: Bearer`. From the secret store only, never a file. |
+| `READ_API_INTROSPECT_POSITIVE_TTL_MS` | read API (Lambda and the self-host SERVICE; the Worker ignores it) | How long (ms) an admitted `sh_at_` token is reused before it is introspected again: the read path's revocation lag. Unset: `60000` (unchanged hosted behaviour). An integer `0`-`60000`; `0` introspects every request (strict revocation, recommended for self-host). Anything else, `""` included, fails startup. See "Cache and revocation lag" below. |
 | `RELAYHISTORY_SELFHOST_READ_API` | read API | Exactly `true` adds `POST /v1/cli/login` (pass-through `sh_at_` exchange through the introspection above, no refresh) and `GET /v1/sessions/:id/catalog`; unset/`""`/`false` off; anything else fails startup. See docs/session-read-api-design.md §2a. |
 | `SEARCH_INDEX_BACKEND` | session-read-api (enabled) | `postgres` (default; no ClickHouse, any known `PIPELINE_RUNTIME`) or `clickhouse` (hosted binding; needs the secret's `clickhouse` block). Anything else, including a name with no implementation in this build (`opensearch`), fails startup; the error names the variable, never the value. |
 | `SEARCH_INDEX_POSTGRES_BACKEND_ID` | session-read-api (enabled, `postgres`) | Required, `[a-zA-Z0-9._-]{1,128}`: the projection-state backend id the search writer records under. Coverage is `READ_API_COMPLETE_SINCE`. Not a credential. |
@@ -131,6 +132,8 @@ keep their path unchanged either way.
 | `PIPELINE_ORG_FROM_PREFIX`, `PIPELINE_KEY_PREFIX` | session-read-api (with `LOCKER_BUCKET`) | `PIPELINE_ORG_FROM_PREFIX` must be exactly `true`, or startup fails. The org-prefix key layout is the only thing that binds an object to its org, so a static layout is refused, as in the session pipeline Lambda. `PIPELINE_KEY_PREFIX` must match the ingest's key layout. |
 | `READ_API_DIRECTORY_WORKSPACES` | read API | The canary allowlist for directory, timing, turns, catalog and login: comma-separated workspace ids or `*`. Unset means none (501 `*_workspace_not_enabled`). |
 | `READ_API_TIMING_ASSUME_NO_TURNS` | read API (Worker, self-host SERVICE) | Exactly `true`: time a session that has no legacy turn evidence as having no turns. Otherwise such a session is 501 `timing_turns_unknown`. |
+| `READ_API_TURNS_ASSUME_NO_LEGACY` | read API (self-host SERVICE only) | Exactly `true`: this deployment never had a Neon source, so `/turns` and `/metadata` serve a session's canonical turns without the legacy coverage marker. Otherwise such a session is 501 `turns_unknown`. Never set it on a deployment with legacy history. |
+| `READ_API_CANONICAL_PIN_LAGGING_POINTER` | read API (self-host SERVICE only) | Exactly `true` (default off; the self-host compose sets it): when the session pointer lags an append-only manifest (async admission answers before the consumer re-indexes), `/timing`, `/turns`, `/metadata`, `/catalog` and message-id reads serve the indexed generation instead of 501 `*_manifest_mismatch`, but only when the pointer digest is an exact prefix of the manifest chain and its revision is older. Newer chunks appear after the next reconcile. Any other value is off. Never read by the hosted Lambda. |
 
 - **Dual accept.** A bearer starting `sh_at_` goes to relaycontrol and never to
   the RelayAuth verifiers (it is never JWT-parsed); every other bearer goes to
@@ -170,7 +173,21 @@ keep their path unchanged either way.
   for at most 5 s, at most 1000 entries, single-flight per key. A revoked token
   can therefore keep working for up to 60 s per process. Unavailability is never
   cached, an expired entry is never reused, and a result is never reused for a
-  different claimed machine.
+  different claimed machine. Per path:
+  - **Read API** (Lambda and the self-host SERVICE, reads and
+    `POST /v1/cli/login`): the admit window is
+    `READ_API_INTROSPECT_POSITIVE_TTL_MS`, always passed to the introspector
+    explicitly. Unset is `60000`, the hosted behaviour. Otherwise it must be a
+    plain decimal integer from `0` to `60000` (no sign, spaces, exponent or
+    leading zero). Any other value, `""` included, fails startup, with the flag
+    on or off. `0` introspects every request, so a revoked token or a removed
+    scope is refused on the next read. **Self-host operators who want strict
+    revocation set `READ_API_INTROSPECT_POSITIVE_TTL_MS=0`.** The refusal
+    window stays the client's own (at most 5 s); this setting never lengthens
+    it. The Worker does not read the variable and keeps 60 s.
+  - **Self-host ingest edge** (`src/session-ingest/selfhost-auth.ts`): no
+    positive cache at all (every request introspects); not configurable.
+  - **Hosted ingest middleware**: the client default of 60 s.
 - **Machine verification (AlleyOop courier surface only).** At the ingest the
   request's `X-Machine-Id` (which the courier sends on chunk and manifest
   writes) is forwarded verbatim as `machine`, a claim for relaycontrol to
@@ -190,6 +207,38 @@ keep their path unchanged either way.
   configured introspection URL (in-cluster for a self-host); nothing new leaves
   the cluster.
 
+## End-to-end acceptance test
+
+One command, from a clean checkout, with only Docker and Bun installed:
+
+```sh
+bun run e2e:selfhost
+```
+
+It builds the services image, starts the stack in `e2e/selfhost/compose.yaml`,
+runs the checks, and removes everything (containers and volumes) when done.
+`E2E_KEEP=1` leaves the stack up; `E2E_SKIP_BUILD=1` reuses a built image. CI runs
+the same command on every pull request (`ci.yml`, job `selfhost-e2e`, part of
+the required `checks` result).
+
+The stack is what `docs/selfhost-composition.md` describes: Postgres, MinIO, the
+migrations, the operator role step (`e2e/selfhost/roles.sh`), `session-ingest`,
+the `session-pipeline-consumer` (the only processing worker on the canonical
+self-host path; `session-publication` is only for buffered acceptance and stays
+off), and `session-read-api`. Credentials and the Postgres CA are generated per
+run and never written outside the run's own `.96bulls/e2e-*` directory.
+
+The only stub is `control-stub`, at the real boundary: Control's token
+introspection endpoint. The ingest and read API run their real introspection
+client against it with `READ_API_AUTH_MODE=relaycontrol_only`.
+
+Checks, each reported PASS, FAIL or BLOCKED: authenticated upload (no token 401,
+read-only token 403, cross-tenant refused), processing by the consumer, reads
+through the read API (list, turns, search, activity), tenant isolation (org B's
+token gets nothing from org A), durability across a restart of Postgres, MinIO
+and all services, and erase through the session selection route (BLOCKED, not
+FAIL, on a build where that route still answers 501).
+
 ## Ports and credentials
 
 Host ports are bound to `127.0.0.1` only; the ingest API is the boundary, and
@@ -204,6 +253,23 @@ explicit backfill mode and is set explicitly by the fixture stack. Fixed bearer
 tokens require `COURIER_ALLOW_FIXED_TOKEN=1`. `JWT_PRIVATE_KEY_PEM` is local
 fixture auth only and is refused in `new` mode unless
 `COURIER_ALLOW_LOCAL_SIGNING_KEY=1` is explicitly set.
+
+## Search backend
+
+The local stack keeps the default search backend, Postgres (`SEARCH_INDEX_BACKEND`
+unset or `postgres`). The `opensearch` backend (OpenSearch or Elasticsearch) is
+configured with `SEARCH_INDEX_BACKEND=opensearch`, `SEARCH_INDEX_OPENSEARCH_URL`
+(required), `SEARCH_INDEX_OPENSEARCH_DIALECT` (`opensearch` or `elasticsearch`),
+`SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX`, `SEARCH_INDEX_OPENSEARCH_AUTH` (`none`,
+`basic`, or `sigv4` with EKS Pod Identity and `SEARCH_INDEX_OPENSEARCH_AWS_REGION`), `SEARCH_INDEX_OPENSEARCH_USERNAME`, the
+`SEARCH_INDEX_OPENSEARCH_PASSWORD` secret, `SEARCH_INDEX_OPENSEARCH_CA_FILE` and
+`SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS` (see
+`docs/search-and-runtime-adapters.md`). `basic` is accepted only when
+`SEARCH_INDEX_OPENSEARCH_URL` is https or a loopback host; a plain-http service
+hostname (for example a compose service name) fails at startup with
+`basic_auth_needs_https`. No local container runs it yet, and the
+worker entry points still allow only `postgres`; the backend's proof runs against
+disposable containers (`docs/session-search-proof.md`).
 
 ## Known limits
 

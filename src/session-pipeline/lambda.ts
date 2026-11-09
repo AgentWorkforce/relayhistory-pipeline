@@ -261,14 +261,39 @@ export function analysisSourceReadonlyUrl(value: unknown): string {
 /**
  * A pg pool that verifies Supabase's certificate against the pinned root. The
  * URL's own ssl parameters are dropped so they cannot weaken that.
+ *
+ * `options` is pinned non-empty (mirroring owner-pg-config): node-pg resolves
+ * a missing `options` from process.env.PGOPTIONS, so without this pin ambient
+ * PGOPTIONS could smuggle session GUCs (role, search_path, timeouts) past
+ * authentication into every connection this pool opens. A set PGOPTIONS is
+ * refused loudly below instead of silently ignored.
  */
+/**
+ * The environment half of startup-option smuggling: node-pg resolves a
+ * missing pool `options` from process.env.PGOPTIONS, so ambient PGOPTIONS can
+ * smuggle session GUCs (role, search_path, timeouts) past authentication into
+ * every pooled connection. The pools pin a non-empty `options` (see below),
+ * which shadows the environment, and pool creation refuses a set PGOPTIONS
+ * loudly here instead of silently ignoring it. PGlite never reads this
+ * variable. Accepts an env for tests; defaults to the process environment.
+ */
+export function refuseEnvOptions(env: NodeJS.ProcessEnv = process.env): void {
+  if (env.PGOPTIONS !== undefined && env.PGOPTIONS !== "")
+    throw new Error("pipeline consumer: refusing PGOPTIONS environment fallback (pool options are pinned)");
+}
+
 export function supabasePool(url: string, max: number, tls = postgresTlsOptions()): HoopDb {
+  refuseEnvOptions();
   const pool = new pg.Pool({
     connectionString: postgresConnectionString(url),
     max,
     application_name: "96bulls-session-pipeline",
     ssl: tls,
     idleTimeoutMillis: 60_000,
+    // Inert by itself (the tick sets tighter per-statement timeouts); its
+    // purpose is to shadow the environment: a non-empty config value wins
+    // over PGOPTIONS in node-pg's resolution, so the env fallback is dead.
+    options: "-c idle_in_transaction_session_timeout=60000",
   });
   pool.on("error", (err) => log.error("hoopdb pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
   return {

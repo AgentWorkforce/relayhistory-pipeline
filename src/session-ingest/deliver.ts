@@ -30,11 +30,17 @@ import {validatedCustodyAck} from "./custody-ack.ts";
  * relayhistory's jittered `Retry-After` (2-10 s), never from waiting on a
  * lock. A slot is taken only for a batch that has something to write, after
  * the claim; a refused batch stays `pending` and its retry resumes it.
+ * Exception, default off (INGEST_CLAIM_LOCK_BUSY=on, `DeliverDeps.claimLockBusy`):
+ * a claim whose single autocommit statement lost its lock wait (55P03/40P01,
+ * `ledger_lock_timeout`) is a 429 `ClaimLockBusy` with `Retry-After` 5-10 s instead
+ * of a 503. The statement rolled back, so nothing was written and the retry is the
+ * same idempotent claim; 57014 (`ledger_timeout`) and every other cause stay 503.
  */
 import type { Ledger, LedgerTenant, RevisionConflict, SlotRequest } from "./ledger.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
 import type { DbErrorDiagnosis } from "./db-error-class.ts";
 import {
+  DELIVERY_BUSY_RETRY_AFTER,
   DELIVERY_LIMITS,
   DeliveryBusyError,
   DeliveryError,
@@ -94,6 +100,24 @@ export interface DeliverDeps {
    * failures alike. Unset (the default): no line, no behaviour change.
    */
   stageLatency?: StageLatencyObserver;
+  /**
+   * INGEST_CLAIM_LOCK_BUSY=on: a claim-stage lock-wait failure (cause `ledger_lock_timeout`,
+   * SQLSTATE 55P03/40P01) is refused as a 429 `ClaimLockBusy` with `Retry-After` in
+   * CLAIM_LOCK_RETRY_AFTER instead of a 503, so a second concurrent claim for the same
+   * tenant backs off past the holder's statement_timeout instead of stacking behind it.
+   * Unset (the default): the 503 `IngestUnavailable`, unchanged.
+   */
+  claimLockBusy?: true;
+  /** Test seam for the ClaimLockBusy jitter: a value in [0, 1). Default Math.random. */
+  random?: () => number;
+  /**
+   * Async admission only (async-admission.ts): runs AFTER a `claimed`/`resume` claim and BEFORE
+   * any slot, S3 write or receipt, and throws to refuse. The consumer uses it for the
+   * upload-time privacy fence (a reset or re-enable that started after the upload refuses
+   * the batch). Never set on the request path. A replay / replay_fast claim never calls it:
+   * those admit nothing new.
+   */
+  admissionGate?: () => Promise<void>;
 }
 
 /** Whether this deployment routes Babysitter upserts to retention buckets (see `DeliverDeps.babysitterRetention`). */
@@ -158,6 +182,33 @@ export class IngestUnavailable extends DeliveryError {
   }
 }
 
+/**
+ * Retry-After for a claim lock-wait refusal, in seconds: inside the 429 contract
+ * (DELIVERY_BUSY_RETRY_AFTER, 2-10) but at least the role statement_timeout (5 s,
+ * supabase/bootstrap/session_ingest_role.sql), so the retry arrives after the holding
+ * claim has committed or been cancelled.
+ */
+export const CLAIM_LOCK_RETRY_AFTER = Object.freeze({ min: 5, max: DELIVERY_BUSY_RETRY_AFTER.max });
+
+/**
+ * A claim refused because its statement lost the lock wait to a concurrent claim for the
+ * same tenant (INGEST_CLAIM_LOCK_BUSY=on). A 429 `delivery_busy` (lock `ledger_claim`):
+ * the single autocommit statement rolled back, nothing was written. Keeps the stage, cause
+ * and database diagnosis of the 503 it replaces, for the route line and the lock alert.
+ */
+export class ClaimLockBusy extends DeliveryBusyError {
+  readonly stage = "claim";
+  constructor(readonly cause_code: string, readonly db: DbErrorDiagnosis | undefined, retryAfterSeconds: number) {
+    super("ledger_claim", retryAfterSeconds);
+  }
+}
+
+function claimLockRetryAfter(random: () => number): number {
+  const { min, max } = CLAIM_LOCK_RETRY_AFTER;
+  const r = random();
+  return min + Math.floor((Number.isFinite(r) && r >= 0 && r < 1 ? r : 0) * (max - min + 1));
+}
+
 function causeCode(error: unknown): string {
   if (error instanceof LedgerUnavailableError || error instanceof IngestWriteError) return error.code;
   const code = (error as { code?: unknown })?.code;
@@ -177,7 +228,7 @@ function revisionConflict(originId: string, conflicts: RevisionConflict[], count
   return new DeliveryError("delivery_conflict", 409, "Delivery record revision was reused with different content", items[0], items, count);
 }
 
-function batchIdConflict(prepared: PreparedDelivery, currentDigest: string): DeliveryError {
+export function batchIdConflict(prepared: PreparedDelivery, currentDigest: string): DeliveryError {
   return new DeliveryError("delivery_conflict", 409, "Delivery batch identity was reused with different content", {
     type: "batch_id",
     originId: prepared.originId,
@@ -232,6 +283,17 @@ function stagesFor(deps: Pick<DeliverDeps, "stageLatency">) {
   return <T>(name: string, work: () => Promise<T>): Promise<T> => runStage(name, work, deps.stageLatency);
 }
 
+/** The claim stage; with `claimLockBusy`, its lock-wait 503 becomes a 429 ClaimLockBusy (nothing else changes). */
+async function claimStage<T>(deps: Pick<DeliverDeps, "stageLatency" | "claimLockBusy" | "random">, work: () => Promise<T>): Promise<T> {
+  try {
+    return await runStage("claim", work, deps.stageLatency);
+  } catch (error) {
+    if (deps.claimLockBusy && error instanceof IngestUnavailable && error.stage === "claim" && error.cause_code === "ledger_lock_timeout")
+      throw new ClaimLockBusy(error.cause_code, error.db, claimLockRetryAfter(deps.random ?? Math.random));
+    throw error;
+  }
+}
+
 export async function deliverBatch(deps: DeliverDeps, tenant: LedgerTenant, batch: HistoryExportBatch): Promise<DeliverResult> {
   const started = Date.now();
   // 403 delivery_account_mismatch, 413 delivery_too_large, exactly as relayhistory.
@@ -267,7 +329,7 @@ async function deliverPreparedCore(deps: DeliverDeps, tenant: LedgerTenant, prep
   mark(firstTiming);
 
   const sessions = [...new Map(prepared.records.filter((r) => r.session_id).map((r) => [pair(r.source, r.session_id), [r.source, r.session_id!] as [string, string]])).values()];
-  const claim = await stage("claim", () =>
+  const claim = await claimStage(deps, () =>
     deps.ledger.claim({
       tenant,
       ...(deps.custody?{custody:deps.custody}:{}),
@@ -291,6 +353,7 @@ async function deliverPreparedCore(deps: DeliverDeps, tenant: LedgerTenant, prep
   if (claim.kind === "replay_fast")
     return { custodyAck:claim.custodyAck,receipt: withLimits(prepared), outcome: "replay_fast", stats: { ...base, deleted_sessions: claim.deleted.length, stale: claim.stale.length, timing_ms: timing } };
 
+  if (deps.admissionGate) await stage("admission_gate", deps.admissionGate);
   // The deletion filter (records of sessions the user deleted from this origin are
   // acknowledged, not stored) and the replay fast path (records already stored at or
   // above their revision are acknowledged, not written again).
