@@ -250,6 +250,11 @@ REVOKE ALL ON FUNCTION sessions.legacy_remote(text) FROM search_consumer_runtime
 -- SQL helper (not SECURITY DEFINER); without EXECUTE every pointer upsert
 -- fails 42501 after the lock succeeds.
 REVOKE ALL ON FUNCTION sessions.session_directory_search_text(text, text, text, text, text, text, text, text) FROM search_consumer_runtime;
+-- The partial expression index session_directory_tenant_project_text_trgm_idx
+-- evaluates this immutable SQL helper as the writing role on every live
+-- session_directory write carrying a project id, project key or repository;
+-- without EXECUTE those writes fail 42501 (migration 20261105045030).
+REVOKE ALL ON FUNCTION sessions.session_directory_project_text(text, text, text) FROM search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.applied_repo_evidence(jsonb, jsonb) TO search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.canonical_remote(text) TO search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.clean_root_commit(text) TO search_consumer_runtime;
@@ -258,6 +263,7 @@ GRANT EXECUTE ON FUNCTION sessions.resolve_repo(text, text, text, timestamp with
 GRANT EXECUTE ON FUNCTION sessions.repo_live(text, uuid) TO search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.legacy_remote(text) TO search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.session_directory_search_text(text, text, text, text, text, text, text, text) TO search_consumer_runtime;
+GRANT EXECUTE ON FUNCTION sessions.session_directory_project_text(text, text, text) TO search_consumer_runtime;
 REVOKE ALL ON sessions.repos FROM search_consumer_runtime;
 REVOKE ALL ON sessions.repo_names FROM search_consumer_runtime;
 GRANT SELECT, INSERT, UPDATE ON sessions.repos TO search_consumer_runtime;
