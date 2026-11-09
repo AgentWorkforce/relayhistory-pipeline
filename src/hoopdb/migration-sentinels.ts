@@ -123,6 +123,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_buffer_gc_claim(jsonb)') AND prosecdef AND prosrc LIKE '%96bulls:buffer-gc-user-v1%') AS applied",
   },
   "upstream:20261105043850_ingest_acquisition_owner.sql": { evidence: "table sessions.ingest_acquisition_owners", sql: relation("sessions.ingest_acquisition_owners") },
+  "upstream:20261105044030_session_brief_summary_read.sql": { evidence: "function sessions.session_brief_summary_for", sql: "SELECT to_regprocedure('sessions.session_brief_summary_for(text,text,text)') IS NOT NULL AS applied" },
   "upstream:20261105043000_brief_titles.sql": { evidence: "column sessions.session_briefs.origin", sql: column("sessions.session_briefs", "origin") },
   "upstream:20261105043500_lazy_claim_clock_narrowing.sql": {
     evidence: "replacement: lazy claim reads the seat clock under KEY SHARE with one advisory lock per (org, workspace, origin)",
