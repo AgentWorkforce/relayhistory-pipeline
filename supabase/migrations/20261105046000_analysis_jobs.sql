@@ -502,6 +502,7 @@ RETURNS integer LANGUAGE plpgsql VOLATILE SECURITY DEFINER
 SET search_path = pg_catalog, sessions, pg_temp AS $purge_owned$
 DECLARE
   v_jobs integer;
+  s record;
 BEGIN
   -- Caller pin: lane A's privacy authority (bulls96_session_ingest, inside its begin, which
   -- sets bulls96.privacy_authority_writer) or the migration owner (operator).
@@ -560,11 +561,13 @@ BEGIN
   -- Serialize with the scope writers that take the per-scope transaction lock (request/job
   -- admission, sessions.analysis_request_v1 below): a
   -- writer that took its snapshot before this purge either blocks here and then sees the fence,
-  -- or commits first and its rows are deleted below. Scopes are locked in a stable scope order
-  -- so concurrent purges contend on the same locks in the same order.
-  PERFORM pg_advisory_xact_lock(hashtextextended('session-analysis-scope:' || s.org_id || '/' || s.workspace_id || '/' || s.session_id, 0))
-     FROM (SELECT DISTINCT o.org_id, o.workspace_id, o.session_id FROM pg_temp.analysis_purge_owned AS o
-            ORDER BY o.org_id, o.workspace_id, o.session_id) AS s;
+  -- or commits first and its rows are deleted below. Scopes are locked one at a time in
+  -- (org_id, workspace_id, session_id) order, so concurrent purges contend on the same locks
+  -- in the same order (a cursor loop: PostgreSQL does not guarantee the row-visit order of a
+  -- set-returning PERFORM over an ORDER BY subquery).
+  FOR s IN SELECT DISTINCT o.org_id, o.workspace_id, o.session_id FROM pg_temp.analysis_purge_owned AS o ORDER BY 1, 2, 3 LOOP
+    PERFORM pg_advisory_xact_lock(hashtextextended('session-analysis-scope:' || s.org_id || '/' || s.workspace_id || '/' || s.session_id, 0));
+  END LOOP;
   -- Fence first (same transaction): reads hide, admission refuses and in-flight jobs cannot
   -- publish from here on, before any object is gone.
   INSERT INTO sessions.session_analysis_purge_fences (org_id, workspace_id, session_id)

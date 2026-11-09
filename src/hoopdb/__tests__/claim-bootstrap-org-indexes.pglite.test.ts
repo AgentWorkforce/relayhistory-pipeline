@@ -63,7 +63,9 @@ async function before044020(): Promise<PGlite> {
   const names = (await plan(LOCAL)).map((s) => s.name).filter((n) => !n.startsWith("verify:"));
   expect(names).toContain(STEP);
   const steps = (await plan(LOCAL)).filter((s) => s.name < STEP && !s.name.startsWith("verify:"));
-  expect(steps.every((s) => s.name < STEP)).toBe(true);
+  // Pin the excluded set exactly: the only planned steps not strictly before 044020 are
+  // 044020 itself and 046000 (a later slot recorded with 044020 missing is a ledger gap).
+  expect((await plan(LOCAL)).map((s) => s.name).filter((n) => !n.startsWith("verify:") && !(n < STEP))).toEqual([STEP, "upstream:20261105046000_analysis_jobs.sql"]);
   await runMigrations(client(db), { profile: { ...LOCAL, verify: false }, steps });
   return db;
 }

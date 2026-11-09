@@ -2,7 +2,9 @@
 -- Stop the session-analysis worker and remove the read route first. Dropping the tables
 -- forgets every v2 request and job row (native and backfilled); the result objects in S3
 -- are left in place (they are re-referenced by a re-apply of the backfill, or erased with
--- their session).
+-- their session). The pending (supabase/pending) CONCURRENTLY index
+-- ingest_frozen_source_records_session_idx is NOT dropped here: it goes with
+-- DROP INDEX CONCURRENTLY IF EXISTS outside a transaction.
 DO $rollback_guard$
 DECLARE v_later boolean;
 BEGIN

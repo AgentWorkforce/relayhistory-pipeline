@@ -662,13 +662,18 @@ test("analysis ABI: the begin's refusal is the ABI mismatch itself (55000), call
 
 /** Issue #310 (relayhistory-pipeline): each 046000 purge/grant clause missing or wrong in isolation refuses
  * with exactly 55000 at begin, for a RESET and for a DISABLE. (The analysis jobs tables are always
- * present in setup, so "table only" means both tables with no functions.) */
+ * present in setup, so "table only" means both tables with no functions. The grant-name case goes
+ * further and removes the tables and both purge overloads too, so the stray-name pg_proc clause is
+ * the ONLY trigger left: the tables' own to_regclass clauses cannot fire on their own.) */
 for (const [name, ddl] of [
   ["no-grant (both purges, no grant helper)", "DROP FUNCTION IF EXISTS sessions.session_analysis_purge_grant(text,text,text)"],
   ["tables only, no functions", `DROP FUNCTION IF EXISTS sessions.purge_session_analysis_for_owned(text,text,text,jsonb);
     DROP FUNCTION IF EXISTS sessions.purge_session_analysis_for_owned(text,text,text);
     DROP FUNCTION IF EXISTS sessions.session_analysis_purge_grant(text,text,text)`],
-  ["grant-name only (another overload)", `DROP FUNCTION IF EXISTS sessions.session_analysis_purge_grant(text,text,text);
+  ["grant-name only (another overload, nothing else)", `DROP FUNCTION IF EXISTS sessions.session_analysis_purge_grant(text,text,text);
+    DROP FUNCTION IF EXISTS sessions.purge_session_analysis_for_owned(text,text,text,jsonb);
+    DROP FUNCTION IF EXISTS sessions.purge_session_analysis_for_owned(text,text,text);
+    DROP TABLE IF EXISTS sessions.session_analysis_jobs_v2, sessions.session_analysis_purge_authority CASCADE;
     CREATE FUNCTION sessions.session_analysis_purge_grant(p_x jsonb) RETURNS void LANGUAGE sql AS $$ SELECT $$`],
 ] as const)
   test(`#310 analysis ABI footprint (${name}): a reset AND a disable begin refuse with exactly 55000 "analysis purge ABI mismatch"`, async () => {

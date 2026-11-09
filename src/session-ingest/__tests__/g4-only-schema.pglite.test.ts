@@ -128,16 +128,13 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       expect((await f.db.query<{ n: number }>("SELECT count(*)::int AS n FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='sessions' AND p.proname=$1", [name])).rows[0]!.n).toBeGreaterThan(0);
     // A plpgsql EXCEPTION block could swallow a 42883 the guard never sees: no G4 function body may
     // even name a post-G4 function or table (or the acquisition_epoch column).
-    // Exception: 041000's derived purge names the digest (045000) and analysis (046000) objects only
+    // Exception: 041000's authority apply names the analysis (046000) objects only
     // through its guarded integrations (to_regprocedure/to_regclass presence checks, ABI-mismatch
     // on partial presence, no-op when absent): not a swallowed 42883. Everything else must stay clean.
+    // (041000's derived purge names no analysis object, so those allowlist entries could never
+    // match; 045000's digest names are not in this tree yet, so the two derived-purge digest
+    // entries return when 045000 lands.)
     const guarded = new Set([
-      "ingest_privacy_authority_purge_derived -> purge_daily_digest_narratives",
-      "ingest_privacy_authority_purge_derived -> daily_digest_narratives",
-      "ingest_privacy_authority_purge_derived -> session_analysis_jobs_v2",
-      "ingest_privacy_authority_purge_derived -> session_analysis_purge_authority",
-      "ingest_privacy_authority_purge_derived -> purge_session_analysis_for_owned",
-      "ingest_privacy_authority_purge_derived -> session_analysis_purge_grant",
       "ingest_privacy_authority_apply -> session_analysis_jobs_v2",
       "ingest_privacy_authority_apply -> session_analysis_purge_authority",
       "ingest_privacy_authority_apply -> purge_session_analysis_for_owned",
@@ -147,6 +144,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
     const names = [...OBJECTS.newFunctions, ...OBJECTS.newTables, "acquisition_epoch"];
     const hits = bodies.flatMap((b) => names.filter((x) => new RegExp(`\\b${x}\\b`, "i").test(b.prosrc)).map((x) => `${b.proname} -> ${x}`));
     expect(hits.filter((h) => !guarded.has(h))).toEqual([]);
+    // Pin the matched set exactly: a dead allowlist entry (or a new match) fails loudly.
+    expect([...new Set(hits)].sort()).toEqual([...guarded].sort());
     expectClean(f.undefinedObjects);
   });
 
