@@ -28,6 +28,10 @@
  *   INGEST_SUBREQUEST_REDIRECTS  worst-case redirects per S3 fetch (0..20, default 20)
  *   INGEST_STAGE_LATENCY_LOG   unset/off (default) | on (any case): one `ingest.stage_latency` line
  *                              per deliver stage { stage, outcome, duration_ms, sqlstate } (deliver.ts)
+ *   INGEST_ACCEPT_GENERATIONS  buffered only, optional: "<INGEST_EXPECT_GENERATION>[,<one other>]", 1 or 2
+ *                              distinct explicit hex64 generations (never a wildcard) the Worker may offer the
+ *                              generation fence; the second is tried only on a 55000 refusal of the first
+ *                              (docs/design/zero-503-schema-windows.md). Unset: INGEST_EXPECT_GENERATION only.
  *   INGEST_CLAIM_LOCK_BUSY     unset/off (default) | on (any case): a claim that loses its lock wait
  *                              (55P03/40P01) is a 429 delivery_busy with Retry-After 5-10 s instead of a
  *                              503 (deliver.ts ClaimLockBusy); 57014 and every other cause stay 503
@@ -95,6 +99,8 @@ export interface IngestWorkerEnv {
   INGEST_REPLICA_MODE?: string;
   INGEST_ACCEPTANCE_MODE?: string;
   INGEST_EXPECT_GENERATION?:string;
+  /** Bounded generation overlap: INGEST_EXPECT_GENERATION plus at most one other explicit hex64 generation. */
+  INGEST_ACCEPT_GENERATIONS?: string;
   /** P1: relayhistory (default) | shadow | frozen-supabase (sessions.ingest_frozen_source_witness). */
   INGEST_CUSTODY_SOURCE?: string;
   /** C3: "supabase" makes the Supabase frozen custody heads the privacy authority (requires INGEST_CUSTODY_SOURCE=frozen-supabase). */
@@ -164,6 +170,8 @@ export interface IngestSettings {
   replicaMode: ReplicaMode;
   acceptanceMode: IngestAcceptanceMode;
   expectedGeneration?:string;
+  /** INGEST_ACCEPT_GENERATIONS, validated (1 or 2 explicit hex64 values including expectedGeneration). */
+  acceptGenerations?: readonly string[];
   /** Babysitter retention: present (true) only when INGEST_BABYSITTER_RETENTION_ROUTING=on. */
   babysitterRetention?: true;
   /** Babysitter retention budget (babysitter-retention.ts worstCaseSubrequests). */
@@ -203,6 +211,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   const acceptanceMode = env.INGEST_ACCEPTANCE_MODE ?? "canonical";
   if (acceptanceMode !== "canonical" && acceptanceMode !== "buffered") throw new Error("session ingest: acceptance mode invalid");
   if(acceptanceMode==="buffered"&&(!/^[a-f0-9]{64}$/.test(env.INGEST_EXPECT_GENERATION??"")||env.INGEST_KEY_ROOT&&env.INGEST_KEY_ROOT!=="96bulls"))throw new Error("session ingest: buffered generation or prefix invalid");
+  const acceptGenerations = acceptedGenerations(env, acceptanceMode);
   const raw = env.INGEST_REPLICA_MODE ?? "off";
   if (!["off", "queue", "required", "best_effort"].includes(raw)) throw new Error("session ingest: INGEST_REPLICA_MODE must be off, queue, required or best_effort");
   const mode: ReplicaMode = raw === "queue" ? "required" : (raw as ReplicaMode);
@@ -243,6 +252,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     inlineMaxSessions: acceptanceMode === "buffered" ? 0 : limit(env.INGEST_INLINE_MAX_SESSIONS, 40, "INGEST_INLINE_MAX_SESSIONS"),
     acceptanceMode,
     ...(acceptanceMode==="buffered"?{expectedGeneration:env.INGEST_EXPECT_GENERATION!}:{}),
+    ...(acceptGenerations ? { acceptGenerations } : {}),
     replicaMode: mode,
     // Babysitter retention (additive; babysitter-retention.ts).
     ...(routingFlag(env.INGEST_BABYSITTER_RETENTION_ROUTING) ? { babysitterRetention: true as const } : {}),
@@ -255,6 +265,23 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(syncFrozenReceipt === "on" ? { syncAdmissionFrozenReceipt: true as const } : {}),
     ...(sessionErase ? { sessionErase } : {}),
   };
+}
+
+/**
+ * INGEST_ACCEPT_GENERATIONS: unset, or a comma list of 1-2 distinct explicit lowercase hex64 generations that
+ * includes INGEST_EXPECT_GENERATION, in buffered mode only. Anything else (a wildcard, a third value, a value
+ * without the expected generation, whitespace inside a value, an explicitly empty value) is a configuration
+ * error, never a silent narrowing or widening.
+ */
+export function acceptedGenerations(env: Pick<IngestWorkerEnv, "INGEST_ACCEPT_GENERATIONS" | "INGEST_EXPECT_GENERATION">, acceptanceMode: string): readonly string[] | undefined {
+  const raw = env.INGEST_ACCEPT_GENERATIONS;
+  if (raw === undefined) return undefined;
+  if (acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_ACCEPT_GENERATIONS needs buffered acceptance");
+  const list = raw.split(",");
+  if (list.length < 1 || list.length > 2 || !list.every((g) => /^[0-9a-f]{64}$/.test(g)) || new Set(list).size !== list.length
+      || !list.includes(env.INGEST_EXPECT_GENERATION ?? ""))
+    throw new Error("session ingest: INGEST_ACCEPT_GENERATIONS must be 1 or 2 distinct hex64 generations including INGEST_EXPECT_GENERATION");
+  return Object.freeze(list);
 }
 
 function custodySourceOf(env: IngestWorkerEnv): string {
@@ -291,7 +318,7 @@ function custodyConfig(env: IngestWorkerEnv) {
 /** The deliver deps for one invocation (request or admission consumer): the same ledger, slots and target. */
 export function deliverDepsFor(settings: IngestSettings, run: Run, target: WriteTarget, replica?: ReplicaSink): DeliverDeps {
   return {
-    ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration}),
+    ledger: sqlLedger(run, {acceptanceMode:settings.acceptanceMode,expectedGeneration:settings.expectedGeneration,...(settings.acceptGenerations?{acceptGenerations:settings.acceptGenerations}:{})}),
     acceptanceMode:settings.acceptanceMode,
     target,
     replica,

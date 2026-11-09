@@ -11,14 +11,15 @@ import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, test } from "bun:test";
 import { AuthError, createReadApi, type TurnsDeps, type VerifiedIdentity } from "../app.ts";
 import { decodeCompositeListCursor, encodeCompositeListCursor, type Directory, type DirectoryListRow } from "../directory.ts";
-import { BUFFERED_USER_SQL, BufferedFenced, serviceBindingControlHead, sqlOwnerBufferedReads, type BufferedStageRow, type ControlHeadGate, type OwnerBufferedDeps, type OwnerBufferedReads } from "../owner-buffered.ts";
+import { BUFFERED_INDEX_SQL, BUFFERED_USER_SQL, BufferedFenced, BufferedIndexVerifier, serviceBindingControlHead, sqlBufferedIndexProbe, sqlOwnerBufferedReads, type BufferedStageRow, type ControlHeadGate, type OwnerBufferedDeps, type OwnerBufferedReads } from "../owner-buffered.ts";
 import { memoryLiveness } from "./support.ts";
+import { logLine } from "../../shared/log.ts";
 import { BUFFERED_STAGE_MAX_BYTES } from "../owner-buffered.ts";
 import { encodeBufferedCursor, encodeCursor } from "../cursor.ts";
 import { deliveryMachine } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
 import { TURN_ORIGIN_ID } from "../../session-ingest/turns.ts";
 import { at } from "./support.ts";
-import { E1, SESSION, authority, bufferedRow, deferred, fencedGate, headBody, putStage, scratch, scriptedGate, scriptedReads, turn, unzip } from "./owner-buffered-support.ts";
+import { E1, SESSION, authority, bufferedRow, deferred, fencedGate, headBody, indexChecked, putStage, scratch, scriptedGate, scriptedIndexProbe, scriptedReads, turn, unzip } from "./owner-buffered-support.ts";
 
 const ID: VerifiedIdentity = { userId: "u-1", orgId: "org-a", workspaceId: "ws-a", scopes: ["rth:read"] };
 const cleanup: Array<() => void> = [];
@@ -67,6 +68,8 @@ interface Harness {
   phaseLog?: boolean;
   /** READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY (ownerBuffered.stageConcurrency); default absent (serial). */
   stageConcurrency?: number;
+  /** READ_API_OWNER_BUFFERED_INDEX_VERIFY=on (ownerBuffered.indexCheck); default absent (no check). */
+  indexCheck?: OwnerBufferedDeps["indexCheck"];
   /** READ_API_COMPLETE_SINCE as ms; default 0. */
   completeSinceMs?: number;
   /** Erased canonical sessions (tombstones: pointers without a live pointer). */
@@ -107,6 +110,7 @@ function api(h: Harness = {}) {
     ...(h.events ? { events: true } : {}),
     ...(h.phaseLog ? { phaseLog: true } : {}),
     ...(h.stageConcurrency ? { stageConcurrency: h.stageConcurrency } : {}),
+    ...(h.indexCheck ? { indexCheck: h.indexCheck } : {}),
   };
   const chQueries: string[] = [];
   const select = h.canonical
@@ -181,7 +185,7 @@ describe("GET /v1/sessions with owner buffered rows", () => {
     expect(r.headers.get("x-relayhistory-buffered-ids")).toBeNull();
     expect((await json(r)).sessions.map((s: any) => s.sessionId)).toEqual(["s-1"]);
     expect(calls).toHaveLength(0);
-    expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", gate: "gate_timeout" }));
+    expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", error_code: "gate_timeout" }));
   });
 
   test("gate moves between observations: fenced header, buffered rows dropped", async () => {
@@ -233,7 +237,7 @@ describe("GET /v1/sessions with owner buffered rows", () => {
         const body = await json(r);
         expect(body.sessions.map((s: any) => s.sessionId)).toEqual(["s-1"]);
         expect(JSON.stringify(body)).not.toContain(SESSION);
-        expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", gate: gateReason }));
+        expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", error_code: gateReason }));
       });
     test("mirror: nothing changes while liveness is blocked: the buffered row is emitted", async () => {
       const { r, observed } = await interleaved(null)();
@@ -332,14 +336,16 @@ describe("GET /v1/sessions with owner buffered rows", () => {
   });
 
   test("RPC timeout (57014) or any RPC error is fenced, never a 500: canonical page with the fenced header", async () => {
-    for (const [err, gate] of [[Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }), "rpc_timeout"], [new Error("connection terminated"), "rpc_error"]] as const) {
+    for (const [err, subtype, sqlstate] of [[Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }), "rpc_timeout", "57"], [new Error("connection terminated"), "rpc_error", undefined]] as const) {
       const run = (async (_o: string, _w: string, work: (q: unknown) => Promise<unknown>) =>
         work({ async query(sql: string) { if (sql.includes("buffered_sessions_for")) throw err; return { rows: [] }; } })) as never;
       const { get, logs } = api({ reads: sqlOwnerBufferedReads(run) });
       const r = await get(L);
       expect(r.status).toBe(200);
       expect(r.headers.get("x-relayhistory-buffered")).toBe("fenced");
-      expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", gate }));
+      const fenced = logs.find((l) => l.reason === "buffered_fenced");
+      expect(fenced).toMatchObject({ error_code: subtype });
+      expect(fenced?.sqlstate).toBe(sqlstate);
     }
   });
 
@@ -388,6 +394,100 @@ describe("GET /v1/sessions with owner buffered rows", () => {
 
 const T = `/v1/sessions/${SESSION}/turns?workspace=ws-a&source=claude`;
 const M = `/v1/sessions/${SESSION}/metadata?workspace=ws-a&source=claude`;
+describe("buffered fence logs: closed subtype as error_code, SQLSTATE class only, through the real log filter", () => {
+  const SECRET = "sk-live-FENCESECRET0123456789abcdef";
+  const line = (fields: Record<string, unknown>) => JSON.parse(logLine("info", "read api", fields)) as Record<string, unknown>;
+  const fencedLine = (logs: Record<string, unknown>[]) => {
+    const fields = logs.find((l) => l.reason === "buffered_fenced");
+    expect(fields).toBeDefined();
+    return { fields: fields!, text: logLine("info", "read api", fields!) };
+  };
+  const rpcFailing = (err: unknown) =>
+    sqlOwnerBufferedReads((async (_o: string, _w: string, work: (q: unknown) => Promise<unknown>) =>
+      work({ async query(sql: string) { if (sql.includes("buffered_sessions_for")) throw err; return { rows: [] }; } })) as never);
+
+  test("a known gate subtype survives the log filter as error_code; no gate field", async () => {
+    const { get, logs } = api({ gate: fencedGate("gate_status"), reads: scriptedReads({ list: [bufferedRow()] }).reads });
+    expect((await get(L)).headers.get("x-relayhistory-buffered")).toBe("fenced");
+    const { fields, text } = fencedLine(logs);
+    expect(line(fields)).toMatchObject({ reason: "buffered_fenced", error_code: "gate_status" });
+    expect("gate" in line(fields)).toBe(false);
+    expect("sqlstate" in line(fields)).toBe(false);
+    expect(text).not.toContain('"gate"');
+  });
+
+  test("an unknown reason (long, secret-looking) is logged as fence_other and never appears", async () => {
+    const unknown = `gate_${SECRET}_${"x".repeat(300)}`;
+    const { get, logs } = api({ gate: fencedGate(unknown), reads: scriptedReads({ list: [bufferedRow()] }).reads });
+    expect((await get(L)).headers.get("x-relayhistory-buffered")).toBe("fenced");
+    const { fields, text } = fencedLine(logs);
+    expect(line(fields)).toMatchObject({ reason: "buffered_fenced", error_code: "fence_other" });
+    expect(text).not.toContain("FENCESECRET");
+    expect(text).not.toContain("xxxxxxxxxx");
+    expect(JSON.stringify(logs)).not.toContain("FENCESECRET");
+  });
+
+  test("rpc_error from a Postgres error 42501: error_code rpc_error, sqlstate 42, no message or full code", async () => {
+    const err = Object.assign(new Error(`permission denied for function buffered_sessions_for ${SECRET}`), { code: "42501", detail: SECRET });
+    const { get, logs } = api({ reads: rpcFailing(err) });
+    const r = await get(L);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("x-relayhistory-buffered")).toBe("fenced");
+    const { fields, text } = fencedLine(logs);
+    expect(line(fields)).toMatchObject({ reason: "buffered_fenced", error_code: "rpc_error", sqlstate: "42" });
+    expect(text).not.toContain("FENCESECRET");
+    expect(text).not.toContain("permission denied");
+    expect(text).not.toContain("42501");
+    expect(JSON.stringify(logs)).not.toContain("FENCESECRET");
+  });
+
+  test("early path: the initial stages RPC failing logs buffered_unverified with the subtype and SQLSTATE class only", async () => {
+    const stagesFailing = (err: unknown) =>
+      sqlOwnerBufferedReads((async (_o: string, _w: string, work: (q: unknown) => Promise<unknown>) =>
+        work({ async query(sql: string) { if (sql.includes("buffered_session_stages_for")) throw err; return { rows: [] }; } })) as never);
+    const cases: Array<[unknown, string, string | undefined, string]> = [
+      [Object.assign(new Error(`permission denied ${SECRET}`), { code: "42501" }), "rpc_error", "42", "42501"],
+      [Object.assign(new Error(`canceling statement due to statement timeout ${SECRET}`), { code: "57014" }), "rpc_timeout", "57", "57014"],
+      [Object.assign(new Error(`socket hang up ${SECRET}`), { code: "ECONNRESET" }), "rpc_error", undefined, "ECONNRESET"],
+    ];
+    for (const path of [T, M]) {
+      const main = await api({ enabled: false }).get(path);
+      const mainBody = strip(await json(main));
+      for (const [err, subtype, sqlstate, code] of cases) {
+        const { get, logs } = api({ reads: stagesFailing(err) });
+        const r = await get(path);
+        expect(r.status).toBe(main.status);
+        expect(r.status).toBe(501);
+        expect(r.headers.get("x-relayhistory-buffered")).toBeNull();
+        expect(strip(await json(r))).toEqual(mainBody);
+        const fields = logs.find((l) => l.reason === "buffered_unverified");
+        expect(fields).toBeDefined();
+        const text = logLine("info", "read api", fields!);
+        const out = line(fields!);
+        expect(out).toMatchObject({ reason: "buffered_unverified", error_code: subtype });
+        expect(out.sqlstate).toBe(sqlstate);
+        expect("sqlstate" in out).toBe(sqlstate !== undefined);
+        expect("gate" in out).toBe(false);
+        expect(text).not.toContain("FENCESECRET");
+        expect(text).not.toContain(code);
+        expect(JSON.stringify(logs)).not.toContain("FENCESECRET");
+      }
+    }
+  });
+
+  test("a malformed code yields no sqlstate field", async () => {
+    for (const code of ["x", "4", "ab501", " 42", "ECONNRESET", "42-this-is-not-sqlstate", "42", "4250", "42501x", 42501, null, { toString: () => "42501" }]) {
+      const { get, logs } = api({ reads: rpcFailing(Object.assign(new Error("boom"), { code })) });
+      expect((await get(L)).headers.get("x-relayhistory-buffered")).toBe("fenced");
+      const { fields, text } = fencedLine(logs);
+      expect("sqlstate" in fields).toBe(false);
+      expect(line(fields)).toMatchObject({ error_code: "rpc_error" });
+      expect("sqlstate" in line(fields)).toBe(false);
+      expect(text).not.toContain("boom");
+    }
+  });
+});
+
 describe("GET /v1/sessions/:id/turns and /metadata from buffered stages", () => {
   test("no canonical pointer, own kept stages: served with X-Relayhistory-Buffered: 1", async () => {
     const s = store();
@@ -411,11 +511,11 @@ describe("GET /v1/sessions/:id/turns and /metadata from buffered stages", () => 
     for (const path of [T, M]) {
       const main = await api({ enabled: false }).get(path);
       const mainBody = strip(await json(main));
-      for (const gateOf of [() => fencedGate("gate_unbound"), () => fencedGate("gate_timeout"), () => fencedGate("gate_shape")]) {
+      for (const subtype of ["gate_unbound", "gate_timeout", "gate_shape"]) {
         // A caller with no buffered stages, and one with stages: the gate failing first answers like main either way.
         for (const stages of [[[]], [[st.row]]] as const) {
           const { reads, calls } = scriptedReads({ stages: stages as never });
-          const { get, logs } = api({ store: s, gate: gateOf(), reads });
+          const { get, logs } = api({ store: s, gate: fencedGate(subtype), reads });
           const r = await get(path);
           expect(r.status).toBe(main.status);
           expect(r.status).toBe(501);
@@ -426,6 +526,7 @@ describe("GET /v1/sessions/:id/turns and /metadata from buffered stages", () => 
           expect(text).not.toContain("UNVERIFIED-CONTENT");
           expect(calls).toHaveLength(0);
           expect(logs.some((l) => l.reason === "buffered_unverified")).toBe(true);
+          expect(logs.find((l) => l.reason === "buffered_unverified")).toMatchObject({ error_code: subtype });
         }
       }
     }
@@ -1009,5 +1110,126 @@ describe("GET /v1/sessions/:id/events: READ_API_OWNER_BUFFERED_PHASE_LOG and REA
     ac.abort();
     expect(logs.some((l) => l.reason === "request_aborted")).toBe(false);
     expect(requestLine(logs)).toHaveProperty("fold_ms");
+  });
+});
+
+describe("READ_API_OWNER_BUFFERED_INDEX_VERIFY=on: the out-of-band index check on every owner-buffered route", () => {
+  const E = `/v1/sessions/${SESSION}/events?workspace=ws-a&source=claude`;
+  const answer = async (r: Response) => ({ status: r.status, buffered: r.headers.get("x-relayhistory-buffered"), ids: r.headers.get("x-relayhistory-buffered-ids"), body: strip(await json(r)) });
+  const NOT_PROVEN = [["missing", "index_missing"], ["invalid", "index_invalid"], [new Error("canceling statement due to statement timeout"), "index_unverified"]] as const;
+  /** No SQL, catalog name, value or error text in any log line: the reason name only. */
+  const namesOnly = (logs: Record<string, unknown>[]) => expect(JSON.stringify(logs)).not.toMatch(/pg_|SELECT|ingest_buffer_outbox|statement timeout|canceling/u);
+  const ev = (id: string, content: string) => ({ kind: "session_event", origin_id: TURN_ORIGIN_ID, record_id: id, revision: "1", operation: "upsert", received_at: "2026-11-05T12:00:00Z", payload: { text: content, ts_ms: 1_793_000_000_000, role: "user" } });
+  /** One stage per route family: turns for turns/metadata, events for the events route. */
+  async function stagedFor(content: string) {
+    const s = store();
+    const turns = await putStage(s, 1, [turn(0, { content })]);
+    const events = await putStage(s, 2, [ev("e1", content)]);
+    return { s, rowFor: (path: string) => (path === E ? events.row : turns.row) };
+  }
+
+  test("index present: list, turns, metadata and events are served exactly as without the check; one probe for the isolate", async () => {
+    const { s, rowFor } = await stagedFor("SERVED-CONTENT");
+    const { indexCheck, probe } = indexChecked("valid");
+    for (const path of [L, T, M, E]) {
+      const reads = () => (path === L ? scriptedReads({ list: [bufferedRow()] }).reads : scriptedReads({ stages: [[rowFor(path)]] }).reads);
+      const without = await answer(await api({ events: true, store: s, reads: reads() }).get(path));
+      const { get, logs } = api({ events: true, store: s, reads: reads(), indexCheck });
+      const r = await answer(await get(path));
+      expect(r, path).toEqual(without);
+      expect(r.status, path).toBe(200);
+      if (path === L) expect(r.ids).toBe(`claude:${SESSION}`);
+      else expect(r.buffered, path).toBe("1");
+      if (path === T || path === E) expect(JSON.stringify(r.body)).toContain("SERVED-CONTENT");
+      expect(logs.some((l) => typeof l.error_code === "string" && (l.error_code as string).startsWith("index_"))).toBe(false);
+    }
+    expect(probe.calls).toHaveLength(1); // cached valid: no second query
+  });
+
+  test("index missing, invalid or unverified: detail routes answer exactly as owner-buffered off (501, no row data), logged buffered_unverified with the reason name", async () => {
+    const { s, rowFor } = await stagedFor("UNVERIFIED-CONTENT");
+    for (const [result, name] of NOT_PROVEN) {
+      for (const path of [T, M, E]) {
+        const main = await answer(await api({ events: true, noOwnerBuffered: true }).get(path));
+        const { reads, calls } = scriptedReads({ stages: [[rowFor(path)]] });
+        const gate = scriptedGate(authority("7"));
+        const { indexCheck, probe } = indexChecked(result);
+        const { get, logs } = api({ events: true, store: s, reads, gate, indexCheck });
+        const res = await get(path);
+        const text = await res.clone().text();
+        expect(await answer(res), `${name} ${path}`).toEqual(main);
+        if (path !== E) expect(res.status).toBe(501); // turns/metadata: 501 turns_no_pointers; events: whatever canonical answers
+        expect(text).not.toContain("UNVERIFIED-CONTENT");
+        expect([probe.calls.length, gate.calls.length, calls.length]).toEqual([1, 0, 0]);
+        expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_unverified", error_code: name }));
+        namesOnly(logs);
+      }
+    }
+  });
+
+  test("index missing, invalid or unverified: the list serves the canonical page alone, X-Relayhistory-Buffered: fenced, logged buffered_fenced with the reason name", async () => {
+    for (const [result, name] of NOT_PROVEN) {
+      const { reads, calls } = scriptedReads({ list: [bufferedRow()] });
+      const gate = scriptedGate(authority("7"));
+      const { indexCheck } = indexChecked(result);
+      const { get, logs } = api({ gate, reads, indexCheck });
+      const r = await get(L);
+      expect(r.status).toBe(200);
+      expect(r.headers.get("x-relayhistory-buffered")).toBe("fenced");
+      expect(r.headers.get("x-relayhistory-buffered-ids")).toBeNull();
+      expect((await json(r)).sessions.map((x: any) => x.sessionId)).toEqual(["s-1"]);
+      expect([gate.calls.length, calls.length]).toEqual([0, 0]);
+      expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", error_code: name }));
+      namesOnly(logs);
+    }
+  });
+
+  test("an index-verify fence survives the real log filter as error_code index_unverified, with no error text", async () => {
+    const { indexCheck } = indexChecked(new Error("canceling statement due to statement timeout on pg_index"));
+    const { get, logs } = api({ reads: scriptedReads({ list: [bufferedRow()] }).reads, indexCheck });
+    expect((await get(L)).headers.get("x-relayhistory-buffered")).toBe("fenced");
+    const fields = logs.find((l) => l.reason === "buffered_fenced");
+    expect(fields).toBeDefined();
+    const text = logLine("info", "read api", fields!);
+    expect(JSON.parse(text)).toMatchObject({ reason: "buffered_fenced", error_code: "index_unverified" });
+    expect(text).not.toContain("fence_other");
+    expect(text).not.toMatch(/canceling|statement timeout|pg_index|"gate"/u);
+  });
+
+  test("a failure is cached across requests for the TTL (no query), then re-checked; a fix then serves", async () => {
+    let t = 0;
+    const probe = scriptedIndexProbe("missing", "valid");
+    const indexCheck = new BufferedIndexVerifier({ now: () => t }).check(probe);
+    const run = () => api({ reads: scriptedReads({ list: [bufferedRow()] }).reads, indexCheck }).get(L);
+    expect((await run()).headers.get("x-relayhistory-buffered")).toBe("fenced");
+    expect((await run()).headers.get("x-relayhistory-buffered")).toBe("fenced");
+    expect(probe.calls).toHaveLength(1);
+    t = 60_000;
+    const fixed = await run();
+    expect(fixed.headers.get("x-relayhistory-buffered-ids")).toBe(`claude:${SESSION}`);
+    expect(probe.calls).toHaveLength(2);
+  });
+
+  test("owner-buffered off for the request (flag off, workspace not listed, no user): zero probes, even with the check configured", async () => {
+    const probe = scriptedIndexProbe("missing");
+    const indexCheck = new BufferedIndexVerifier().check(probe);
+    for (const h of [{ enabled: false }, { obWorkspaces: new Set(["ws-other"]) }, { identity: { ...ID, userId: undefined } as never }] as Harness[]) {
+      for (const path of [L, T, M]) await api({ ...h, indexCheck }).get(path);
+    }
+    expect(probe.calls).toHaveLength(0);
+  });
+
+  test("the probe over a real-shaped runner reaches only the catalog query (no user binding, no RPC)", async () => {
+    const seen: string[] = [];
+    const run = (async (_o: string, _w: string, work: (q: { query: (sql: string) => Promise<{ rows: unknown[] }> }) => Promise<unknown>) =>
+      work({ async query(sql) { seen.push(sql); return { rows: [] }; } })) as never;
+    const indexCheck = new BufferedIndexVerifier().check(sqlBufferedIndexProbe(run));
+    const { reads, calls } = scriptedReads({ list: [bufferedRow()] });
+    const { get, logs } = api({ reads, indexCheck });
+    expect((await get(L)).headers.get("x-relayhistory-buffered")).toBe("fenced");
+    expect(seen).toEqual(["SET LOCAL statement_timeout = 2000", BUFFERED_INDEX_SQL]);
+    expect(seen).not.toContain(BUFFERED_USER_SQL);
+    expect(calls).toHaveLength(0);
+    expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", error_code: "index_missing" }));
   });
 });

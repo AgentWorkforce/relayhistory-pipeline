@@ -90,6 +90,7 @@ import {
   BUFFERED_IDS_HEADER,
   BUFFERED_LIST_MAX_LIMIT,
   BufferedFenced,
+  fenceSubtype,
   BufferedTooLarge,
   bufferedIdsHeader,
   bufferedSessionSummary,
@@ -102,6 +103,7 @@ import {
   type BufferedScope,
   type BufferedSessionRow,
   type OwnerBufferedDeps,
+  type UnverifiedBeforeCandidate,
   OwnerBufferedPhaseTimer,
   type OwnerBufferedReadOptions,
 } from "./owner-buffered.ts";
@@ -573,7 +575,11 @@ export function createReadApi(deps: ReadApiDeps) {
    * the token carries a user, and the token's workspace is on both READ_API_DIRECTORY_WORKSPACES
    * and the owner-buffered canary allowlist READ_API_OWNER_BUFFERED_WORKSPACES (each "*" or
    * listing it; unset/empty = none). Otherwise undefined and the caller's route runs exactly as
-   * without the flag.
+   * without the flag. With READ_API_OWNER_BUFFERED_INDEX_VERIFY=on the deps carry indexCheck, and
+   * every gated read (owner-buffered.ts) proves ingest_buffer_outbox_user_buffered_idx first: not
+   * proven is a BufferedFenced before any candidate (detail routes answer as without the flag,
+   * logged buffered_unverified; the list is fenced), with error_code index_missing, index_invalid or
+   * index_unverified.
    */
   function ownerBufferedFor(identity: VerifiedIdentity): OwnerBufferedDeps | undefined {
     const ob = deps.ownerBuffered;
@@ -619,11 +625,11 @@ export function createReadApi(deps: ReadApiDeps) {
     return () => signal.removeEventListener("abort", onAbort);
   }
 
-  async function bufferedDetail<T extends object>(c: Context, read: () => Promise<T | null | { unverifiedBeforeCandidate: string }>): Promise<T | null> {
+  async function bufferedDetail<T extends object>(c: Context, read: () => Promise<T | null | UnverifiedBeforeCandidate>): Promise<T | null> {
     try {
       const served = await read();
       if (served && "unverifiedBeforeCandidate" in served) {
-        log({ route: c.req.routePath, reason: "buffered_unverified", gate: served.unverifiedBeforeCandidate, correlation_id: c.get("correlationId") });
+        log({ route: c.req.routePath, reason: "buffered_unverified", error_code: fenceSubtype(served.unverifiedBeforeCandidate), ...(served.unverifiedSqlstateClass ? { sqlstate: served.unverifiedSqlstateClass } : {}), correlation_id: c.get("correlationId") });
         return null;
       }
       return served as T | null;
@@ -633,7 +639,7 @@ export function createReadApi(deps: ReadApiDeps) {
         return null;
       }
       if (error instanceof BufferedFenced) {
-        log({ route: c.req.routePath, reason: "buffered_fenced", gate: error.reason, correlation_id: c.get("correlationId") });
+        log({ route: c.req.routePath, reason: "buffered_fenced", error_code: fenceSubtype(error.reason), ...(error.sqlstateClass ? { sqlstate: error.sqlstateClass } : {}), correlation_id: c.get("correlationId") });
         throw bufferedFenced();
       }
       if (error instanceof TenantMismatchError || error instanceof HttpError) throw error;
@@ -893,7 +899,8 @@ export function createReadApi(deps: ReadApiDeps) {
    * ("canonical wins"; pointers decide nothing else). The cursor carries both positions.
    * Buffered rows come only through readOwnerBufferedList (authority observed before the RPC
    * and again after the RPC and the live-pointer await, immediately before emit); a row whose admission fails the final head advances the buffered position but is
-   * never shown. Fenced: the canonical page alone with X-Relayhistory-Buffered: fenced. Any
+   * never shown. Fenced (including the READ_API_OWNER_BUFFERED_INDEX_VERIFY index check, error_code
+   * index_*): the canonical page alone with X-Relayhistory-Buffered: fenced. Any
    * other buffered failure: the canonical page alone, logged `buffered_list_error`. A row of
    * another user is a 500.
    */
@@ -930,7 +937,7 @@ export function createReadApi(deps: ReadApiDeps) {
       if (error instanceof TenantMismatchError) throw error;
       if (error instanceof BufferedFenced) {
         fenced = true;
-        log({ route: c.req.routePath, reason: "buffered_fenced", gate: error.reason, correlation_id: c.get("correlationId") });
+        log({ route: c.req.routePath, reason: "buffered_fenced", error_code: fenceSubtype(error.reason), ...(error.sqlstateClass ? { sqlstate: error.sqlstateClass } : {}), correlation_id: c.get("correlationId") });
       } else log({ route: c.req.routePath, reason: "buffered_list_error", error_code: (error as { name?: string })?.name ?? "error", correlation_id: c.get("correlationId") });
     }
     const { sources, notSources, bounds } = q;

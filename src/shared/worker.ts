@@ -37,10 +37,16 @@ import { setTimeout as idleDelay } from "node:timers/promises";
 import { createWorkerRuntime } from "@rhc/runtime/workers.ts";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
 import { expectedSchema } from "../hoopdb/migrate.ts";
-import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
+import { type SearchIndexBackendName, validateAdapterEnv } from "@rhc/adapters/registry.ts";
 
 export interface WorkerOptions {
   service: string;
+  /**
+   * SEARCH_INDEX_BACKEND values this entry point really dispatches on. Unset
+   * means postgres only, so a worker that never reads the variable still fails
+   * closed on a mis-set selection.
+   */
+  searchBackends?: readonly SearchIndexBackendName[];
   stages: QueuedStage[];
   /** Builds the handlers once the database is open. */
   handlers: (
@@ -319,10 +325,17 @@ export async function workerTick<S>(io: {
   return { claimed, gated: false };
 }
 
+/** The adapter selection an entry point admits at boot. Exported for tests. */
+export function workerAdapterEntry(
+  opts: Pick<WorkerOptions, "searchBackends">,
+): { runtime: readonly ["workers"]; search?: readonly SearchIndexBackendName[] } {
+  return { runtime: ["workers"], ...(opts.searchBackends ? { search: opts.searchBackends } : {}) };
+}
+
 export async function runWorker(opts: WorkerOptions): Promise<never> {
   // Fail closed on a mis-set adapter selection (docs/search-and-runtime-adapters.md).
   // Unset (every current install) resolves to postgres + workers: no change.
-  validateAdapterEnv(process.env, { runtime: ["workers"] });
+  validateAdapterEnv(process.env, workerAdapterEntry(opts));
   process.env.OTEL_SERVICE_NAME ||= opts.service;
   initTelemetry(opts.service);
   const health: WorkerHealth = {

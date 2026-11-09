@@ -11,16 +11,16 @@ BEGIN
  END IF;
  LOCK TABLE sessions.__96bulls_migrations IN SHARE ROW EXCLUSIVE MODE;
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations
-   WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105044030_session_brief_summary_read.sql') THEN
+   WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105044040_session_brief_summary_read.sql') THEN
   RAISE EXCEPTION USING ERRCODE='55000', MESSAGE='brief summary: a later migration is applied; roll it back first';
  END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations
-  WHERE name='upstream:20261105044030_session_brief_summary_read.sql' FOR UPDATE;
+  WHERE name='upstream:20261105044040_session_brief_summary_read.sql' FOR UPDATE;
  IF NOT FOUND OR v_sha<>'a6b4049e186f632cccc1b29e596cc11d8fcbcbb7b5f91c0da579918a0d31d93f' THEN
   RAISE EXCEPTION USING ERRCODE='55000', MESSAGE='brief summary: own applied checksum required';
  END IF;
 END
 $rollback_guard$;
 DROP FUNCTION sessions.session_brief_summary_for(text,text,text);
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105044030_session_brief_summary_read.sql';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105044040_session_brief_summary_read.sql';
 COMMIT;

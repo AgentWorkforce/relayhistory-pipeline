@@ -48,6 +48,16 @@
  * the same gated read, projected by canonical-projection.ts projectEventRows (the one projection
  * both readers run), scrubbed and tenant-checked per row. GET /v1/events stays canonical-only.
  *
+ * Out-of-band index (READ_API_OWNER_BUFFERED_INDEX_VERIFY, default off; ownerBufferedIndexVerifyEnabled):
+ * the readers depend on the partial index ingest_buffer_outbox_user_buffered_idx on
+ * sessions.ingest_buffer_outbox, which migration 20261105043700 leaves to an operator's CREATE
+ * INDEX CONCURRENTLY. With the flag on, every exported read path first proves it exists and is
+ * valid (BufferedIndexVerifier: a catalog probe over the same read connection and statement
+ * timeout, a valid answer cached for the isolate's lifetime, a failure re-probed after 60 s,
+ * concurrent requests sharing one probe). Not proven: fenced before any candidate as
+ * index_missing, index_invalid or index_unverified, so detail routes answer as without the flag
+ * and the list serves the canonical page with X-Relayhistory-Buffered: fenced. Off: no probe.
+ *
  * Erasure, reset and fence gating come only from the RPCs, the recheck after the S3 fetch and
  * the authority gate, never from canonical liveness. Canonical liveness (pointers) is used only
  * to decide that a canonical session wins over a buffered one of the same id.
@@ -135,6 +145,29 @@ export const OWNER_BUFFERED_PHASE_LOG_FLAG = "READ_API_OWNER_BUFFERED_PHASE_LOG"
 /** READ_API_OWNER_BUFFERED_PHASE_LOG: exactly "1" enables the per-phase log fields; anything else is off. */
 export function ownerBufferedPhaseLogEnabled(raw: string | undefined): boolean {
   return raw === "1";
+}
+
+export const OWNER_BUFFERED_INDEX_VERIFY_FLAG = "READ_API_OWNER_BUFFERED_INDEX_VERIFY";
+
+/** READ_API_OWNER_BUFFERED_INDEX_VERIFY holds a value other than unset, empty or "on". Names the field, never the value. */
+export class OwnerBufferedIndexVerifyFlagError extends Error {
+  constructor() {
+    super(`${OWNER_BUFFERED_INDEX_VERIFY_FLAG} must be unset or "on"`);
+    this.name = "OwnerBufferedIndexVerifyFlagError";
+  }
+}
+
+/**
+ * READ_API_OWNER_BUFFERED_INDEX_VERIFY: unset or empty is off, exactly "on" enables, anything else
+ * throws OwnerBufferedIndexVerifyFlagError (the Worker refuses the deploy's requests, as it does
+ * for READ_API_OWNER_BUFFERED_EVENTS). On, every owner-buffered read first proves the out-of-band
+ * index BUFFERED_INDEX_NAME exists and is valid (BufferedIndexVerifier); no effect unless
+ * owner-buffered reads are on and the workspace is on both allowlists.
+ */
+export function ownerBufferedIndexVerifyEnabled(raw: string | undefined): boolean {
+  if (raw === undefined || raw === "") return false;
+  if (raw === "on") return true;
+  throw new OwnerBufferedIndexVerifyFlagError();
 }
 
 /** The owner-buffered events read's phases, in order; each logs as `<phase>_ms`. */
@@ -242,10 +275,54 @@ export interface BufferedScope {
  * is for logs only.
  */
 export class BufferedFenced extends Error {
-  constructor(readonly reason: string = "fenced") {
+  /** For logs only: the SQLSTATE class (two chars) of an RPC failure, never the message or full code. */
+  readonly sqlstateClass?: string;
+  constructor(readonly reason: string = "fenced", sqlstateClass?: unknown) {
     super("buffered read fenced");
     this.name = "BufferedFenced";
+    const cls = sqlstateClassOf(sqlstateClass);
+    if (cls !== undefined) this.sqlstateClass = cls;
   }
+}
+
+/** The class (first two chars) of a code that is exactly SQLSTATE-shaped ([0-9A-Z]{5}); anything else is undefined. */
+function sqlstateClassOf(code: unknown): string | undefined {
+  return typeof code === "string" && /^[0-9A-Z]{5}$/.test(code) ? code.slice(0, 2) : undefined;
+}
+
+/**
+ * A fence before any buffered candidate was found (the route's existing answer). Both fields are
+ * for logs only: the closed reason and, for an RPC failure, the validated SQLSTATE class.
+ */
+export interface UnverifiedBeforeCandidate {
+  unverifiedBeforeCandidate: string;
+  unverifiedSqlstateClass?: string;
+}
+
+function unverified(error: BufferedFenced): UnverifiedBeforeCandidate {
+  const cls = error.sqlstateClass;
+  return typeof cls === "string" && /^[0-9A-Z]{2}$/.test(cls)
+    ? { unverifiedBeforeCandidate: error.reason, unverifiedSqlstateClass: cls }
+    : { unverifiedBeforeCandidate: error.reason };
+}
+
+/**
+ * Every reason this module fences with (plus the default). Logs carry a fence reason only
+ * through fenceSubtype, so a reason outside this closed set can never reach a log line.
+ */
+export const FENCE_SUBTYPES: readonly string[] = Object.freeze([
+  "fenced",
+  "rpc_fenced", "rpc_timeout", "rpc_error",
+  "gate_unbound", "gate_identity", "gate_status", "gate_cache", "gate_shape", "gate_timeout", "gate_error",
+  "gate_echo", "gate_pending", "gate_epoch", "gate_moved",
+  "request_aborted",
+  // BUFFERED_INDEX_REASONS (READ_API_OWNER_BUFFERED_INDEX_VERIFY); declared below, so listed literally.
+  "index_missing", "index_invalid", "index_unverified",
+]);
+
+/** A fence reason for logs: the reason when it is a known subtype, else "fence_other". */
+export function fenceSubtype(reason: unknown): string {
+  return typeof reason === "string" && FENCE_SUBTYPES.includes(reason) ? reason : "fence_other";
 }
 
 /** The RPC's explicit refusal (SQLSTATE 55006 or its message). */
@@ -267,9 +344,10 @@ export function isBufferedTimeoutError(error: unknown): boolean {
  */
 function rethrowBuffered(error: unknown): never {
   if (error instanceof BufferedFenced) throw error;
-  if (isBufferedFencedError(error)) throw new BufferedFenced("rpc_fenced");
-  if (isBufferedTimeoutError(error)) throw new BufferedFenced("rpc_timeout");
-  throw new BufferedFenced("rpc_error");
+  const code = error !== null && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+  if (isBufferedFencedError(error)) throw new BufferedFenced("rpc_fenced", code);
+  if (isBufferedTimeoutError(error)) throw new BufferedFenced("rpc_timeout", code);
+  throw new BufferedFenced("rpc_error", code);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -595,6 +673,12 @@ export interface OwnerBufferedDeps {
   stageConcurrency?: number;
   /** READ_API_OWNER_BUFFERED_PHASE_LOG=1: the events route logs per-phase times. */
   phaseLog?: boolean;
+  /**
+   * READ_API_OWNER_BUFFERED_INDEX_VERIFY=on: every owner-buffered read (list, turns, metadata,
+   * events) first runs ensure(), which throws BufferedFenced (index_missing, index_invalid or
+   * index_unverified) unless BUFFERED_INDEX_NAME is proven valid. Absent: no check, no query.
+   */
+  indexCheck?: BufferedIndexCheck;
 }
 
 /** One stage object: the compressed and the decompressed bound (staging.ts BUFFER_STAGE_MAX_BYTES). */
@@ -716,6 +800,38 @@ export function boundedStreamDecompress(Stream: StreamDecompressor): OwnerBuffer
 /** The RPC page bound (PR A clamps p_limit to 1..100). */
 export const BUFFERED_LIST_MAX_LIMIT = 100;
 export const BUFFERED_STATEMENT_TIMEOUT_MS = 2000;
+export const OWNER_BUFFERED_STATEMENT_TIMEOUT_FLAG = "READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS";
+/**
+ * The largest READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS accepted: a ceiling, not a budget
+ * guarantee. A detail read runs the stages RPC at least twice (initial and recheck; a stage 404
+ * adds a refresh) plus two control-head calls and the S3 fetch, inside the caller's 15 s budget,
+ * so the value deployed must come from the measured whole-path latency with margin.
+ */
+export const OWNER_BUFFERED_STATEMENT_TIMEOUT_MAX_MS = 6000;
+
+/** READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS holds an unaccepted value. Names the field, never the value. */
+export class OwnerBufferedStatementTimeoutError extends Error {
+  constructor() {
+    super(`${OWNER_BUFFERED_STATEMENT_TIMEOUT_FLAG} must be unset or an integer ${BUFFERED_STATEMENT_TIMEOUT_MS}..${OWNER_BUFFERED_STATEMENT_TIMEOUT_MAX_MS}`);
+    this.name = "OwnerBufferedStatementTimeoutError";
+  }
+}
+
+/**
+ * READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: unset or empty is 2000 (the read role's default,
+ * unchanged); an integer 2000..6000 (digits only) is the per-transaction SET LOCAL
+ * statement_timeout of the two owner-buffered RPCs; anything else throws
+ * OwnerBufferedStatementTimeoutError (the Worker refuses the deploy's requests). It never changes
+ * the role default or any other read.
+ */
+export function ownerBufferedStatementTimeoutMs(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return BUFFERED_STATEMENT_TIMEOUT_MS;
+  if (/^[1-9][0-9]{3}$/.test(raw)) {
+    const n = Number(raw);
+    if (n >= BUFFERED_STATEMENT_TIMEOUT_MS && n <= OWNER_BUFFERED_STATEMENT_TIMEOUT_MAX_MS) return n;
+  }
+  throw new OwnerBufferedStatementTimeoutError();
+}
 
 export const BUFFERED_USER_SQL = "SELECT set_config('bulls96_read.user_id', $1, true)";
 const HEAD_ARGS =
@@ -837,6 +953,166 @@ export function sqlOwnerBufferedReads(run: TenantRunner, options: { statementTim
       return rows.map(stageRow);
     },
   };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Out-of-band index verification (READ_API_OWNER_BUFFERED_INDEX_VERIFY, default off)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * The partial index the buffered readers depend on. Migration 20261105043700 leaves it out of
+ * band on purpose (the migrator is transactional; it must be built CONCURRENTLY by an operator
+ * before owner-buffered reads are enabled):
+ *
+ *   CREATE INDEX CONCURRENTLY IF NOT EXISTS ingest_buffer_outbox_user_buffered_idx
+ *     ON sessions.ingest_buffer_outbox (org_id, workspace_id, user_id, created_at)
+ *     WHERE state = 'buffered';
+ *
+ * Without it sessions.buffered_sessions_for / buffered_session_stages_for scan the outbox and
+ * hit the statement timeout (rpc_timeout).
+ */
+export const BUFFERED_INDEX_SCHEMA = "sessions";
+export const BUFFERED_INDEX_TABLE = "ingest_buffer_outbox";
+export const BUFFERED_INDEX_NAME = "ingest_buffer_outbox_user_buffered_idx";
+
+/**
+ * The catalog probe: one row per index of that name on that table, `valid` true only when the
+ * index is usable (indisvalid, indisready, indislive). A failed or in-progress CONCURRENTLY build
+ * leaves indisvalid false (and IF NOT EXISTS then skips it: the operator must drop it first).
+ * Catalog views are readable by every role, so the read role needs no grant. Constants only, no
+ * parameter.
+ */
+export const BUFFERED_INDEX_SQL =
+  "SELECT (i.indisvalid AND i.indisready AND i.indislive) AS valid " +
+  "FROM pg_catalog.pg_index i " +
+  "JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid " +
+  "JOIN pg_catalog.pg_class t ON t.oid = i.indrelid " +
+  "JOIN pg_catalog.pg_namespace n ON n.oid = t.relnamespace " +
+  `WHERE n.nspname = '${BUFFERED_INDEX_SCHEMA}' AND t.relname = '${BUFFERED_INDEX_TABLE}' AND c.relname = '${BUFFERED_INDEX_NAME}'`;
+
+/** The probe's answer: present and valid, present but not valid, or absent. */
+export type BufferedIndexState = "valid" | "invalid" | "missing";
+/** One catalog probe over a request's read connection; may throw (timeout, connection). */
+export type BufferedIndexProbe = (scope: BufferedScope) => Promise<BufferedIndexState>;
+
+/** The fence reasons (logs only, by name) a failed index check throws BufferedFenced with. */
+export const BUFFERED_INDEX_REASONS = Object.freeze({
+  /** No index of that name on the table. */
+  missing: "index_missing",
+  /** Present but not valid (a failed or unfinished CONCURRENTLY build). */
+  invalid: "index_invalid",
+  /** The probe itself failed (statement timeout, connection, any error) or did not answer in time. */
+  unverified: "index_unverified",
+} as const);
+
+/** A failed check is re-probed after this long (an operator's CREATE INDEX takes effect without a redeploy). */
+export const BUFFERED_INDEX_RETRY_MS = 60_000;
+/**
+ * The most one request waits for a probe (its own or a shared in-flight one): the statement
+ * timeout plus the pg connect timeout plus slack. Past it the request is fenced
+ * index_unverified and the probe is forgotten, so a probe whose request was canceled (or whose
+ * promise never settles in this request's context) cannot hang later requests.
+ */
+export const BUFFERED_INDEX_WAIT_MS = 5_000;
+
+/**
+ * The probe over the read role: one READ ONLY transaction of the TenantRunner with the same
+ * per-transaction statement_timeout as the buffered readers, then BUFFERED_INDEX_SQL. Errors
+ * propagate (the verifier fences them as index_unverified).
+ */
+export function sqlBufferedIndexProbe(run: TenantRunner, options: { statementTimeoutMs?: number } = {}): BufferedIndexProbe {
+  const timeout = statementTimeoutSql(options.statementTimeoutMs ?? BUFFERED_STATEMENT_TIMEOUT_MS);
+  return (scope) =>
+    run(scope.orgId, scope.workspaceId, async (q) => {
+      await q.query(timeout);
+      const rows = (await q.query<{ valid?: unknown }>(BUFFERED_INDEX_SQL)).rows;
+      if (rows.length === 0) return "missing";
+      return rows.some((r) => r.valid === true) ? "valid" : "invalid";
+    });
+}
+
+/** The per-request check the app's read paths call: resolves when the index is proven valid, else throws BufferedFenced. */
+export interface BufferedIndexCheck {
+  ensure(scope: BufferedScope): Promise<void>;
+}
+
+type IndexOutcome = "ok" | (typeof BUFFERED_INDEX_REASONS)[keyof typeof BUFFERED_INDEX_REASONS];
+
+/**
+ * The per-isolate cache of the index check (the Worker holds one at module scope; each request
+ * binds its own probe with check()). A valid answer is remembered for the isolate's lifetime and
+ * no query runs again. A missing, invalid or failed answer is remembered for `retryMs`
+ * (fenced without a query), then probed again. Concurrent requests share one in-flight probe;
+ * each waits at most `waitMs` for it. `now` is injectable for tests.
+ */
+export class BufferedIndexVerifier {
+  private verified = false;
+  private failure: { reason: Exclude<IndexOutcome, "ok">; at: number } | undefined;
+  private inflight: Promise<IndexOutcome> | undefined;
+  private readonly now: () => number;
+  private readonly retryMs: number;
+  private readonly waitMs: number;
+
+  constructor(options: { now?: () => number; retryMs?: number; waitMs?: number } = {}) {
+    this.now = options.now ?? (() => Date.now());
+    this.retryMs = options.retryMs ?? BUFFERED_INDEX_RETRY_MS;
+    this.waitMs = options.waitMs ?? BUFFERED_INDEX_WAIT_MS;
+  }
+
+  /** The check one request runs, over that request's probe. */
+  check(probe: BufferedIndexProbe): BufferedIndexCheck {
+    return { ensure: (scope) => this.ensure(scope, probe) };
+  }
+
+  async ensure(scope: BufferedScope, probe: BufferedIndexProbe): Promise<void> {
+    if (this.verified) return;
+    if (this.failure && this.now() - this.failure.at < this.retryMs) throw new BufferedFenced(this.failure.reason);
+    const shared = (this.inflight ??= this.start(scope, probe));
+    const outcome = await this.within(shared);
+    if (outcome === "ok") return;
+    throw new BufferedFenced(outcome);
+  }
+
+  private start(scope: BufferedScope, probe: BufferedIndexProbe): Promise<IndexOutcome> {
+    const run = (async (): Promise<IndexOutcome> => {
+      try {
+        const state = await probe(scope);
+        return state === "valid" ? "ok" : state === "invalid" ? BUFFERED_INDEX_REASONS.invalid : BUFFERED_INDEX_REASONS.missing;
+      } catch {
+        return BUFFERED_INDEX_REASONS.unverified;
+      }
+    })();
+    const settled = run.then((outcome) => {
+      if (this.inflight === settled) this.inflight = undefined;
+      this.record(outcome);
+      return outcome;
+    });
+    return settled;
+  }
+
+  /** The shared outcome, or index_unverified (remembered for retryMs, probe forgotten) past waitMs. */
+  private async within(shared: Promise<IndexOutcome>): Promise<IndexOutcome> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<"late">((resolve) => {
+      timer = setTimeout(() => resolve("late"), this.waitMs);
+    });
+    try {
+      const outcome = await Promise.race([shared, late]);
+      if (outcome !== "late") return outcome;
+      if (this.inflight === shared) this.inflight = undefined;
+      this.record(BUFFERED_INDEX_REASONS.unverified);
+      return BUFFERED_INDEX_REASONS.unverified;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private record(outcome: IndexOutcome): void {
+    if (outcome === "ok") {
+      this.verified = true;
+      this.failure = undefined;
+    } else if (!this.verified) this.failure = { reason: outcome, at: this.now() };
+  }
 }
 
 /**
@@ -1124,7 +1400,7 @@ export type OwnerBufferedTurns =
    * The authority (or the RPC's own fence) refused before any buffered candidate was found:
    * nothing is known about this session, so the route answers as without the flag (501).
    */
-  | { unverifiedBeforeCandidate: string }
+  | UnverifiedBeforeCandidate
   | { erased: true; rows: [] }
   | { erased: false; rows: Record<string, unknown>[] };
 
@@ -1146,7 +1422,7 @@ export async function readOwnerBufferedTurns(deps: OwnerBufferedDeps, scope: Buf
 
 type GatedSession =
   | null
-  | { unverifiedBeforeCandidate: string }
+  | UnverifiedBeforeCandidate
   | { erased: true }
   | {
       erased: false;
@@ -1169,10 +1445,12 @@ async function readGatedSession(deps: OwnerBufferedDeps, scope: BufferedScope, s
   let first: AuthorityHead;
   let initial: BufferedStageRow[];
   try {
+    // READ_API_OWNER_BUFFERED_INDEX_VERIFY=on: the out-of-band index first (cached per isolate).
+    if (deps.indexCheck) await deps.indexCheck.ensure(scope);
     first = await timed(phases, "control_head_1", () => deps.gate.observe(scope));
     initial = await timed(phases, "stages_sql", () => deps.reads.stages(scope, first, source, sessionId));
   } catch (error) {
-    if (error instanceof BufferedFenced) return { unverifiedBeforeCandidate: error.reason };
+    if (error instanceof BufferedFenced) return unverified(error);
     throw error;
   }
   if (initial.length === 0) return null;
@@ -1191,7 +1469,7 @@ async function readGatedSession(deps: OwnerBufferedDeps, scope: BufferedScope, s
 export type OwnerBufferedEvents =
   | null /** not a visible buffered session of this caller: the route's existing answer */
   /** The authority refused before any buffered candidate was found: the route's existing answer. */
-  | { unverifiedBeforeCandidate: string }
+  | UnverifiedBeforeCandidate
   | { erased: true; rows: [] }
   | { erased: false; rows: EventRow[] };
 
@@ -1287,6 +1565,8 @@ export async function readOwnerBufferedList(
   args: { cursor?: BufferedListPosition; limit: number },
   presence?: (sessionIds: string[]) => Promise<ReadonlySet<string>>,
 ): Promise<Array<BufferedSessionRow & { visible: boolean; live: boolean }>> {
+  // READ_API_OWNER_BUFFERED_INDEX_VERIFY=on: the out-of-band index first (cached per isolate).
+  if (deps.indexCheck) await deps.indexCheck.ensure(scope);
   const first = await deps.gate.observe(scope);
   const rows = await deps.reads.list(scope, first, args);
   const candidates = [...new Set(rows.filter((r) => admissionVisible(first, r)).map((r) => r.session_id))];
