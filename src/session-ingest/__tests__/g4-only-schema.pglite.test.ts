@@ -106,6 +106,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105044010_selfhost_erase_lock_fences.sql",
       // Eight org_id btree indexes on existing ingest tables only; no function or column.
       "20261105044020_claim_bootstrap_org_indexes.sql",
+      // Read-role-only summary RPC and EXECUTE; no ingest RPC is replaced or calls it.
+      "20261105044030_session_brief_summary_read.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
