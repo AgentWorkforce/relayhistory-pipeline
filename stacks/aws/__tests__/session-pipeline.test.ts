@@ -382,6 +382,27 @@ describe("session pipeline: deploy plan contract", () => {
     expect(bufferedSearchFeedScheduleProps({names:p,functionArn:"fn",p:off,tags:{}}).state).toBe("DISABLED");
     expect(sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:off}).INGEST_BUFFERED_SEARCH_FEED).toBeUndefined();
   });
+  it("buffered feed page/rate/budget knobs are passed through only when configured, within the feeder's bounds",()=>{
+    const knobs={pageSize:100,stagesPerSecond:10,budgetMs:60000};
+    const env=sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:{searchIndex:true,bufferedSearchFeed:{enabled:false,...knobs}}});
+    expect(env).toMatchObject({INGEST_BUFFERED_SEARCH_FEED_PAGE:"100",INGEST_BUFFERED_SEARCH_FEED_RATE:"10",INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS:"60000"});
+    expect(env.INGEST_BUFFERED_SEARCH_FEED).toBeUndefined();
+    const refused=(v:unknown)=>{let why="";try{assertSessionPipelineInputs(v,(w:string)=>{throw new Error(w)})}catch(e){why=(e as Error).message}return why};
+    expect(refused({searchIndex:true,bufferedSearchFeed:{enabled:false,...knobs}})).toBe("");
+    expect(refused({bufferedSearchFeed:{enabled:false,pageSize:0}})).toMatch(/pageSize must be an integer from 1 to 200/);
+    expect(refused({bufferedSearchFeed:{enabled:false,pageSize:201}})).toMatch(/pageSize/);
+    expect(refused({bufferedSearchFeed:{enabled:false,stagesPerSecond:51}})).toMatch(/stagesPerSecond must be an integer from 1 to 50/);
+    expect(refused({bufferedSearchFeed:{enabled:false,budgetMs:4999}})).toMatch(/budgetMs must be an integer from 5000 to 240000/);
+    expect(refused({bufferedSearchFeed:{enabled:false,budgetMs:1.5}})).toMatch(/budgetMs/);
+  });
+  it("buffered feed knobs are absent when not configured, so the feeder defaults apply",()=>{
+    for(const cfg of [{},{searchIndex:true,bufferedSearchFeed:{enabled:true,gateDeclared:BUFFERED_SEARCH_FEED_GATE_CONTRACT}}]){
+      const env=sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:cfg});
+      for(const k of ["INGEST_BUFFERED_SEARCH_FEED_PAGE","INGEST_BUFFERED_SEARCH_FEED_RATE","INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS"])expect(Object.hasOwn(env,k)).toBe(false);
+    }
+    const c=bufferedFeedConfig(sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:{}}));
+    expect([c.pageSize,c.stagesPerSecond,c.budgetMs]).toEqual([50,5,50000]);
+  });
   it("buffered feed arms only with the gate's exact contract, and the feeder accepts that env",()=>{
     expect(BUFFERED_SEARCH_FEED_GATE_CONTRACT).toBe(BUFFERED_SEARCH_GATE_CONTRACT);
     expect(bufferedSearchFeedScheduleProps({names:p,functionArn:"fn",p:armed,tags:{}}).state).toBe("ENABLED");

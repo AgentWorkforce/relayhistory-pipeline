@@ -26,6 +26,14 @@
  * rows alone. Because `bf` never equals `s3`, the first canonical pass over the same events
  * rewrites them once with its newer `version` (origin back to canonical).
  *
+ * Stage binding. A buffered fingerprint is `bf<body>:<stageToken>:<ordinals>` (bufferedFingerprint):
+ * the s3 body without `s3`, the stage token the row was projected from, and the record's original
+ * claim ordinals (sorted, comma separated, possibly empty). `origin_claim_token` alone names the
+ * admission, not a stage, and the 043870 `stage` RPC accepts only a stage token or key, so this is
+ * how the later-erasure lane (buffered-erasure-delete.ts) finds the stage to re-check and which rows
+ * retention still keeps, without a new RPC or column. Rows written before the suffix carry the bare
+ * `bf<body>` and stay with the query-time gate.
+ *
  * Arming. INGEST_BUFFERED_SEARCH_FEED=on is refused unless the deployment also declares
  * BUFFERED_SEARCH_FEED_GATE_DECLARED equal to the read gate's contract id
  * (BUFFERED_SEARCH_GATE_CONTRACT, #338 buffered-search-gate.ts; exact match, default unset):
@@ -35,9 +43,11 @@
  *
  * Idempotency. The row identity is ClickHouse's sort key (org, workspace, ts, session, source,
  * machine, kind, event_id), all derived from the record; `version` is the stage's
- * `received_at` (epoch ms), not the wall clock. A replay, a backfill re-run or a GC
- * replacement of the same batch re-inserts byte-identical rows that ReplacingMergeTree folds,
- * and any later canonical pass (version = its wall clock) wins over them.
+ * `received_at` (epoch ms), not the wall clock. A replay or a backfill re-run of the same stage
+ * re-inserts byte-identical rows; a GC replacement of the same batch re-inserts rows with the same
+ * identity and version that differ only in the fingerprint's stage token, which ReplacingMergeTree
+ * folds the same way (equal version: the last inserted survives a merge). Any later canonical pass
+ * (version = its wall clock) wins over them.
  *
  * Privacy and erasure. Only what the buffered GC's own retention authority keeps is indexed
  * (`sessions.ingest_buffer_gc_ordinals`, via the feed RPC in
@@ -47,8 +57,9 @@
  * record retention no longer keeps are deleted: only the exact physical rows this claim wrote
  * (origin, origin_claim_token, fingerprint and version all bound; never a prefix match), so a
  * stale claim's cleanup never removes a newer claim's row for the same event. Deletes for
- * erasure that happens LATER (session delete/reset/GC) are a separate lane; until it lands the
- * query-time check keeps deleted sessions out.
+ * erasure that happens LATER (GC, redaction, a batch leaving the buffer) are the separate,
+ * default-off lane in buffered-erasure-delete.ts (INGEST_BUFFERED_ERASURE_DELETE); the query-time
+ * gate keeps deleted sessions out either way.
  *
  * Nothing here logs content; errors and summaries carry codes and counts only.
  */
@@ -83,6 +94,27 @@ export const BUFFERED_FEED_DEFAULT_SINCE = "2026-11-05T05:33:45.000Z";
 export const BUFFERED_FEED_DEFAULT_CURSOR = "backfill-20261105";
 
 export const isBufferedOriginFingerprint = (fingerprint: string) => fingerprint.startsWith(BUFFERED_FINGERPRINT_PREFIX);
+
+const BOUND_FINGERPRINT = /^bf([0-9a-f]+):([0-9a-f-]{36}):((?:0|[1-9]\d{0,2})(?:,(?:0|[1-9]\d{0,2}))*)?$/;
+
+/** `bf<body>:<stageToken>:<ordinals>`: the row's stage and original claim ordinals (sorted, deduplicated). */
+export function bufferedFingerprint(s3Fingerprint: string, stageToken: string, ordinals: readonly number[]): string {
+  const body = s3Fingerprint.replace(/^s3/, "");
+  if (!/^[0-9a-f]+$/.test(body) || !UUID.test(stageToken) || ordinals.some((o) => !Number.isInteger(o) || o < 0 || o > 999))
+    throw new BufferedFeedError("fingerprint_unbindable");
+  return `${BUFFERED_FINGERPRINT_PREFIX}${body}:${stageToken}:${[...new Set(ordinals)].sort((a, b) => a - b).join(",")}`;
+}
+
+/** The stage token and ordinals of a stage-bound buffered fingerprint, or null (legacy or malformed). */
+export function parseBufferedFingerprint(fingerprint: string): { stageToken: string; ordinals: number[] } | null {
+  const m = BOUND_FINGERPRINT.exec(fingerprint);
+  if (!m || !UUID.test(m[2]!)) return null;
+  return { stageToken: m[2]!, ordinals: m[3] ? m[3].split(",").map(Number) : [] };
+}
+
+/** ClickHouse (re2) expressions over `fingerprint`: the bound stage token ('' when legacy) and ordinal strings. */
+export const FINGERPRINT_STAGE_SQL = "extract(fingerprint, '^bf[0-9a-f]+:([0-9a-f-]{36}):')";
+export const FINGERPRINT_ORDINALS_SQL = "arrayFilter(x -> x != '', splitByChar(',', extract(fingerprint, '^bf[0-9a-f]+:[0-9a-f-]{36}:([0-9,]*)$')))";
 export const isBufferedStageKey = (key: string) => key.includes("/buffered-batches/v1/");
 
 export class BufferedFeedError extends Error {
@@ -255,6 +287,8 @@ export function sqlBufferedFeedSource(db: SqlExecutor): BufferedFeedSource {
 
 /** An index row as the feeder writes it: the canonical shape plus the read gate's origin marker. */
 export type BufferedIndexRow = IndexRow & { origin: typeof ORIGIN_BUFFERED; origin_claim_token: string };
+/** The columns deleteBufferedRows binds: the event identity and the full buffered provenance. */
+export type BufferedRowKey = Pick<BufferedIndexRow, "org_id" | "session_id" | "workspace_id" | "machine_id" | "source" | "kind" | "event_id" | "ts" | "origin" | "origin_claim_token" | "fingerprint" | "version">;
 /** One projected row and the original claim ordinals of the record it came from. */
 export interface BufferedRow { row: BufferedIndexRow; ordinals: number[] }
 
@@ -272,7 +306,7 @@ const admitted = (v: string) => v.length > 0 && Array.from(v).length <= 255 && !
  * The index rows a live manifest written from this stage's retained lines would give
  * `indexSearchScope`, fingerprinted as buffered-origin. Pure: no IO.
  */
-export function projectBufferedStage(decoded: DecodedBufferedStage, retained: ReadonlySet<number>, keyRoot: string): StageProjection {
+export function projectBufferedStage(decoded: DecodedBufferedStage, retained: ReadonlySet<number>, keyRoot: string, stageToken: string): StageProjection {
   const { header, groups, spec } = decoded;
   if (!spec.key.startsWith(`${keyRoot}/${header.org_id}/buffered-batches/v1/`)) throw new BufferedFeedError("stage_key_tenant_mismatch");
   const version = Date.parse(header.received_at);
@@ -307,9 +341,10 @@ export function projectBufferedStage(decoded: DecodedBufferedStage, retained: Re
       if (table !== "convergence_events") continue;
       const canonicalRow = { ...row, session_id: row.delivery_record_id ? sessionId : row.session_id, user_id: row.user_id ?? userId };
       const base = toIndexRow(projectedToNeonRow(canonicalRow, scope, userId), version);
-      const indexRow: BufferedIndexRow = { ...base, fingerprint: BUFFERED_FINGERPRINT_PREFIX + base.fingerprint.replace(/^s3/, ""), origin: ORIGIN_BUFFERED, origin_claim_token: header.claim_token };
       const recordId = String(row.delivery_record_id ?? row.event_id);
-      out.push({ row: indexRow, ordinals: byRecord.get(recordId) ?? [] });
+      const ordinals = byRecord.get(recordId) ?? [];
+      const indexRow: BufferedIndexRow = { ...base, fingerprint: bufferedFingerprint(base.fingerprint, stageToken, ordinals), origin: ORIGIN_BUFFERED, origin_claim_token: header.claim_token };
+      out.push({ row: indexRow, ordinals });
     }
   });
   return { rows: out, reasons, version };
@@ -341,7 +376,7 @@ export async function assertOriginColumns(ch: ClickHouseClient): Promise<void> {
  * remove a row a newer claim has already written and advanced the cursor past. Rows that do not
  * carry a buffered provenance are refused (no unbound delete is ever issued).
  */
-export async function deleteBufferedRows(ch: ClickHouseClient, rows: readonly BufferedIndexRow[], maxKeys = 500): Promise<number> {
+export async function deleteBufferedRows(ch: ClickHouseClient, rows: readonly BufferedRowKey[], maxKeys = 500): Promise<number> {
   const { createHash } = await import("node:crypto");
   for (const r of rows)
     if (r.origin !== ORIGIN_BUFFERED || !UUID.test(r.origin_claim_token) || !isBufferedOriginFingerprint(r.fingerprint) || r.fingerprint.length <= BUFFERED_FINGERPRINT_PREFIX.length || !Number.isSafeInteger(r.version) || r.version <= 0)
@@ -423,7 +458,7 @@ async function loadLive(state: StageState, deps: BufferedFeedDeps, fromMs: numbe
     if (error instanceof BufferedFeedError) return { skip: error.code };
     throw error;
   }
-  const projection = projectBufferedStage(decoded, new Set(state.retained), deps.keyRoot);
+  const projection = projectBufferedStage(decoded, new Set(state.retained), deps.keyRoot, state.stage!.stageToken);
   // The canonical indexer's window: older rows are not indexed by either path.
   projection.rows = projection.rows.filter((r) => tsMillis(`${r.row.ts.replace(" ", "T")}Z`) >= fromMs);
   return { state, projection };
