@@ -436,7 +436,7 @@ missing briefs and changed canonical revisions without the legacy indexer.
 initial qualification; do not enable the legacy indexer to produce wakeups.
 
 Apply the complete migration plan, including
-`20261105044040_session_brief_summary_read.sql`, before starting services with
+`20261105044060_session_brief_summary_read.sql`, before starting services with
 the new schema generation. The Node read service then serves
 `GET /v1/sessions/:id/summary?workspace=<id>&source=<source>&kind=short` for its
 existing directory-workspace allowlist. It returns only a fresh ready native

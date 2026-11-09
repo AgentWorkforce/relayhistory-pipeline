@@ -6,9 +6,9 @@ import {TENANT_SETTINGS_SQL} from "../../session-read-api/liveness.ts";
 const ROLE=read("supabase/bootstrap/session_read_api_role.sql").split("\n").filter(l=>!l.startsWith("\\")).join("\n");
 const text:BriefText={title:"Actual native title",description:"Actual model description.",state:"completed",scrubRuleset:"relayhistory-scrub",scrubVersion:1,fingerprint:"f".repeat(64),promptVersion:"session-summary-v3",engineVersion:"session-brief-v3",model:"gpt-5.6-luna",messageCount:2,shortenedMessages:0,inputTokens:10,outputTokens:5,durationMs:3,generatedAt:new Date("2026-11-09T00:00:00Z")};
 const logical="01a1bd4d-ab36-70cf-9580-642a1096361f";
-const NAME="upstream:20261105044040_session_brief_summary_read.sql";
-const UP="supabase/migrations/20261105044040_session_brief_summary_read.sql";
-const DOWN="supabase/rollbacks/20261105044040_session_brief_summary_read.down.sql";
+const NAME="upstream:20261105044060_session_brief_summary_read.sql";
+const UP="supabase/migrations/20261105044060_session_brief_summary_read.sql";
+const DOWN="supabase/rollbacks/20261105044060_session_brief_summary_read.down.sql";
 const SHA=createHash("sha256").update(read(UP)).digest("hex");
 async function ledger(pg:Awaited<ReturnType<typeof database>>){
  await pg.exec("CREATE TABLE sessions.__96bulls_migrations(name text PRIMARY KEY,sha256 text NOT NULL,applied_at timestamptz NOT NULL DEFAULT now())");
@@ -49,7 +49,7 @@ test("read function ACL and role binding reject foreign/invalid callers without 
  await ledger(pg);expect(await down(pg)).toBe("accepted");
  expect((await pg.query("SELECT name FROM sessions.__96bulls_migrations WHERE name=$1",[NAME])).rows).toEqual([]);
  expect((await pg.query<{n:number}>("SELECT count(*)::int n FROM sessions.session_briefs")).rows[0]!.n).toBe(1);
- await pg.exec(read("supabase/migrations/20261105044040_session_brief_summary_read.sql"));expect(await summary(pg)).toHaveLength(1);
+ await pg.exec(read("supabase/migrations/20261105044060_session_brief_summary_read.sql"));expect(await summary(pg)).toHaveLength(1);
 }),60000);
 
 test("multi-physical canonical group is unsupported instead of falsely fresh",async()=>withDb(async pg=>{
