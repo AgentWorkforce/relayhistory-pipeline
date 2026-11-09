@@ -7,8 +7,10 @@ import { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pg
 import { createFsStore } from "../../../packages/object-store/src/fs.ts";
 import { rawChunkKey, objectKey } from "../../shared/vendor.ts";
 import { masterKeyring, parseMasterKeys } from "../../shared/keyring.ts";
-import { bobCostasHandler } from "../handler.ts";
-import { extractiveSummarizer } from "../summarizer.ts";
+import { bobCostasHandler, directorySource } from "../handler.ts";
+import { extractiveSummarizer, type SummaryContext } from "../summarizer.ts";
+import { createModelSummarizer, modelSummarizerConfig } from "../model-summarizer.ts";
+import { SessionAnalysisProviderError } from "../../session-brief/engine/transport.ts";
 import { readSummaryObject } from "../summary-objects.ts";
 
 const MIG = (f: string) =>
@@ -79,6 +81,64 @@ const noDirectory = {
 };
 
 describe("Bob Costas stores summaries as encrypted Locker objects, pointers in HoopDb", () => {
+  it("directory provenance folds any valid model id into the directory source alphabet", () => {
+    const SOURCE = /^[a-z0-9][a-z0-9._/-]{0,63}$/;
+    expect(directorySource("extractive/v1")).toBe("bob-costas/extractive/v1");
+    expect(directorySource("Org/Model-X:2026")).toBe("bob-costas/org/model-x-2026");
+    for (const id of ["gpt-5.6-luna", "Qwen/Qwen3:latest", "a".repeat(128)]) expect(directorySource(id)).toMatch(SOURCE);
+  });
+
+  it("passes ids-only context to the summariser; a failing model still publishes the extractive summary", async () => {
+    const { pg, db } = await setup();
+    const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bch-")) });
+    const line = JSON.stringify({ type: "user", message: { role: "user", content: "PLANTED-PROMPT fix the build" } });
+    await store.put(rawChunkKey(loc, 0, 0, "abcdef12", "jsonl"), zstdCompressSync(Buffer.from(line + "\n")));
+    const m = manifest(true, [{ seq: 0, start_offset: 0, sha256_8: "abcdef12" }]);
+    const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
+    const seen: (SummaryContext | undefined)[] = [];
+    let calls = 0;
+    const model = createModelSummarizer({
+      transport: {
+        complete: async () => {
+          calls += 1;
+          throw new SessionAnalysisProviderError("model_auth_failed", false);
+        },
+      },
+      config: modelSummarizerConfig("gpt-test-mini", {}),
+      log: { info() {}, warn() {} },
+    });
+    const summarizer = {
+      id: model.id,
+      summarize: (kind: "short" | "long", d: never, ctx?: SummaryContext) => {
+        seen.push(ctx);
+        return model.summarize(kind, d, ctx);
+      },
+    };
+    await bobCostasHandler("long", {
+      db,
+      reader: { provider: "fs", read: async () => ({ manifest: m }) } as never,
+      store,
+      summarizer,
+      directory: noDirectory,
+      keyring,
+    })(message, recorder);
+    expect(seen).toEqual([{ orgId: "o", sessionKey: JSON.stringify(["w", "claude", "s1"]), traceId: m.trace_id }]);
+    expect(calls).toBe(1);
+    const row = (await pg.query<Record<string, unknown>>(`SELECT status, object_key, object_sha256 FROM sessions.session_summaries`)).rows[0]!;
+    expect(row.status).toBe("ready");
+    const rec = await readSummaryObject({
+      store,
+      keyring,
+      ids: { orgId: "o", workspaceId: "w" },
+      key: String(row.object_key),
+      sha256: String(row.object_sha256),
+      kind: "long",
+      revision: 2,
+    });
+    expect(rec?.model).toBe("extractive/v1");
+    expect(rec?.summary).toContain("PLANTED-PROMPT");
+  });
+
   it("ready: object summary/short.json.enc decrypts; the row has only the pointer; old plaintext rows are gone", async () => {
     const { pg, db } = await setup();
     expect(
