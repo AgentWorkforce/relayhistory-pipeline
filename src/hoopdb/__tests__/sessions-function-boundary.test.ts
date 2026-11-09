@@ -24,7 +24,7 @@ import type { LaneManifest } from "../../../scripts/sessions-function-boundary/t
 import { VERIFIERS } from "../../../scripts/sessions-function-boundary/verifiers.ts";
 import { run } from "../../../scripts/sync-sessions-function-boundary.ts";
 import { BUFFERED_SEARCH_FEED_RUNTIME_ROLE } from "../../session-pipeline/buffered-feed-role.ts";
-import { pendingExecuteGrants } from "../migrate-guards.ts";
+import { CONSUMER_RUNTIME_FUNCTIONS, CONSUMER_RUNTIME_FUNCTIONS_ROLE, RUNTIME_APPLICATION_FUNCTIONS, pendingExecuteGrants } from "../migrate-guards.ts";
 
 const root = join(import.meta.dir, "../../..");
 const reader = (base: string): Reader => async (p) => { try { return readFileSync(join(base, p), "utf8"); } catch { return undefined; } };
@@ -463,6 +463,25 @@ describe("unified sessions function-boundary generator", () => {
     expect(down).toContain("REVOKE USAGE ON SCHEMA sessions FROM buffered_search_feed_runtime;");
     expect(down).not.toMatch(/DROP ROLE/);
     expect(down).toContain("DELETE FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105043870_buffered_search_feed_cursor.sql'");
+  });
+
+  test("every function the manifest grants search_consumer_runtime is exempt from the live gate for it; the consumer writer list matches its verifier and stays out of the runtime list", () => {
+    const acl = JSON.parse(readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8")).functions as Record<string, string[]>;
+    const runtime = new Set<string>(RUNTIME_APPLICATION_FUNCTIONS);
+    const consumer = new Set<string>(CONSUMER_RUNTIME_FUNCTIONS);
+    const granted = Object.entries(acl).filter(([, entries]) => entries.includes(`${CONSUMER_RUNTIME_FUNCTIONS_ROLE}:EXECUTE`)).map(([fn]) => fn);
+    expect(granted.length).toBeGreaterThan(0);
+    expect(granted.filter((fn) => !runtime.has(fn) && !consumer.has(fn))).toEqual([]);
+    // Each consumer-only writer is granted to the consumer (and nobody but the owner), never to the general runtime role.
+    for (const fn of CONSUMER_RUNTIME_FUNCTIONS) {
+      expect(acl[fn], fn).toEqual(["<owner>:EXECUTE", `${CONSUMER_RUNTIME_FUNCTIONS_ROLE}:EXECUTE`]);
+      expect(runtime.has(fn), fn).toBe(false);
+    }
+    // The consumer role verifier allowlists exactly the same writers (both of its lists).
+    const verify = readFileSync(join(root, "supabase/bootstrap/session_consumer_role_verify.sql"), "utf8");
+    const listed = [...verify.matchAll(/'(sessions\.output_facts_[a-z_]+\([^']*\))'/g)].map((m) => m[1]!);
+    expect([...new Set(listed)].sort()).toEqual([...CONSUMER_RUNTIME_FUNCTIONS].sort());
+    for (const fn of CONSUMER_RUNTIME_FUNCTIONS) expect(listed.filter((x) => x === fn).length, fn).toBe(2);
   });
 
   test("043890 retired witness: replaces 043860's gate only (ACL/boundary/verifiers unchanged) and derives the exact 043860 rollback", async () => {

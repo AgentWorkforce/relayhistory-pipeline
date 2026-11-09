@@ -4,7 +4,7 @@ import {database,hoopDb,pointer,KEY} from "./harness.ts";
 
 test("historical JSONL recovery is native-only, scoped, exact-error and excludes active wakeups",async()=>{
  const pg=await database(),db=hoopDb(pg);
- const native={includeChanged:true,recoverJsonlInputFailures:true,workspaceIds:[KEY.workspaceId]};
+ const native={includeChanged:true,refreshCanonicalInput:true,recoverJsonlInputFailures:true,workspaceIds:[KEY.workspaceId]};
  try {
   await pointer(pg);await recordBrief(db,KEY,{'m-1':1},{status:'failed',error:'canonical_input_refused'});
   expect(await sweepUnbriefed(db,10,{includeChanged:true})).toBe(0);

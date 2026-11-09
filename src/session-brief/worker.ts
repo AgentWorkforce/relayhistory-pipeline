@@ -43,6 +43,7 @@ import {
   type ClaimedWakeup,
 } from "./store.ts";
 import {
+  SESSION_BRIEF_CANONICAL_ENGINE_VERSION,
   SESSION_BRIEF_ENGINE_VERSION,
   SESSION_BRIEF_PROMPT_VERSION,
 } from "./versions.ts";
@@ -137,7 +138,8 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
     }
     const print = fingerprint(built.input);
     // A brief from another prompt (v2 had no state) is regenerated even for the same input.
-    if (stored?.title && stored.briefFingerprint === print && stored.promptVersion === SESSION_BRIEF_PROMPT_VERSION) {
+    if (stored?.title && stored.briefFingerprint === print && stored.promptVersion === SESSION_BRIEF_PROMPT_VERSION &&
+        (!deps.canonicalInput || stored.engineVersion === SESSION_BRIEF_CANONICAL_ENGINE_VERSION)) {
       const { written } = await publish(built.sourceRevisions, {
         status: "reused",
         fingerprint: print,
@@ -178,7 +180,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
         ...scrubbed,
         fingerprint: print,
         promptVersion: SESSION_BRIEF_PROMPT_VERSION,
-        engineVersion: SESSION_BRIEF_ENGINE_VERSION,
+        engineVersion: deps.canonicalInput ? SESSION_BRIEF_CANONICAL_ENGINE_VERSION : SESSION_BRIEF_ENGINE_VERSION,
         model,
         messageCount: built.input.messages.length,
         shortenedMessages: built.input.messages.filter((m) => m.truncated).length,
@@ -247,7 +249,9 @@ export function briefTick(deps: Omit<BriefDeps, "db">) {
     }
     if (deps.config.sweepSeconds > 0 && now.getTime() - lastSweep >= deps.config.sweepSeconds * 1000) {
       lastSweep = now.getTime();
-      const armed = await sweepUnbriefed(db, 100, { includeChanged: deps.canonicalInput !== undefined, recoverJsonlInputFailures: deps.canonicalInput !== undefined, workspaceIds: deps.config.workspaceIds });
+      const armed = await sweepUnbriefed(db, 100, { includeChanged: deps.canonicalInput !== undefined,
+        refreshCanonicalInput: deps.canonicalInput !== undefined, recoverJsonlInputFailures: deps.canonicalInput !== undefined,
+        workspaceIds: deps.config.workspaceIds });
       if (armed) log.info("session brief sweep armed", { stage: "session-brief", count: armed });
     }
     if (!deps.transport) return null;

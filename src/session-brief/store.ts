@@ -15,7 +15,7 @@ import {
 } from "../hoopdb/session-directory-summary.ts";
 import { SESSION_SUMMARY_STATES, type SessionSummaryState } from "./engine/summary-contract.ts";
 import type { BriefPointer } from "./input.ts";
-import { SESSION_BRIEF_PROMPT_VERSION, SESSION_BRIEF_SOURCE_PREFIX } from "./versions.ts";
+import { SESSION_BRIEF_CANONICAL_ENGINE_VERSION, SESSION_BRIEF_PROMPT_VERSION, SESSION_BRIEF_SOURCE_PREFIX } from "./versions.ts";
 
 const KEY = `org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4`;
 const keyParams = (k: SessionDirectoryKey) => [k.orgId, k.workspaceId, k.harness, k.sessionId];
@@ -197,6 +197,7 @@ export interface StoredBrief {
   state: SessionSummaryState | null;
   /** The prompt that wrote the stored text; a brief from another prompt is not reused. */
   promptVersion: string | null;
+  engineVersion: string | null;
   briefFingerprint: string | null;
   model: string | null;
   generatedAt: Date | null;
@@ -207,7 +208,7 @@ export interface StoredBrief {
 
 export async function storedBrief(db: SqlExecutor, key: SessionDirectoryKey): Promise<StoredBrief | null> {
   const { rows } = await db.query<Record<string, unknown>>(
-    `SELECT status, revision::text AS revision, title, description, state, prompt_version,
+    `SELECT status, revision::text AS revision, title, description, state, prompt_version, engine_version,
             brief_fingerprint, model,
             generated_at, attempted_at, extract(epoch FROM now() - attempted_at)::float8 AS ago
        FROM sessions.session_briefs WHERE ${KEY}`,
@@ -222,6 +223,7 @@ export async function storedBrief(db: SqlExecutor, key: SessionDirectoryKey): Pr
     description: (r.description as string | null) ?? null,
     state: (r.state as SessionSummaryState | null) ?? null,
     promptVersion: (r.prompt_version as string | null) ?? null,
+    engineVersion: (r.engine_version as string | null) ?? null,
     briefFingerprint: (r.brief_fingerprint as string | null) ?? null,
     model: (r.model as string | null) ?? null,
     generatedAt: r.generated_at ? new Date(r.generated_at as string) : null,
@@ -606,7 +608,7 @@ async function projectBriefTitle(db: SqlExecutor, key: SessionDirectoryKey, titl
 }
 
 /** Sweep: arm indexed sessions that have neither a brief nor a wakeup (backfill after enabling). */
-export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: { includeChanged?: boolean; recoverJsonlInputFailures?: boolean; workspaceIds?: readonly string[] } = {}): Promise<number> {
+export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: { includeChanged?: boolean; refreshCanonicalInput?: boolean; recoverJsonlInputFailures?: boolean; workspaceIds?: readonly string[] } = {}): Promise<number> {
   const { rows } = await db.query<{ n: number }>(
     `WITH missing AS (
        SELECT d.org_id, d.workspace_id, d.harness, physical.session_id
@@ -631,7 +633,11 @@ export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: { 
                                 WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id
                                   AND p.harness = d.harness AND p.session_id = physical.session_id
                                   AND p.deleted_at IS NULL AND p.manifest_key IS NOT NULL))
-                             AND NOT ($4::boolean AND b.status = 'failed' AND b.error IS NOT DISTINCT FROM 'canonical_input_refused'
+                             AND ($4::text IS NULL OR b.origin <> 'native' OR b.status <> 'ready'
+                                  OR b.engine_version LIKE 'neon-backfill:%'
+                                  OR (b.engine_version IS NOT DISTINCT FROM $4::text
+                                      AND b.prompt_version IS NOT DISTINCT FROM $5::text))
+                             AND NOT ($6::boolean AND b.status = 'failed' AND b.error IS NOT DISTINCT FROM 'canonical_input_refused'
                                AND EXISTS (SELECT 1 FROM sessions.session_index AS p
                                  WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id
                                    AND p.harness = d.harness AND p.session_id = physical.session_id
@@ -651,7 +657,9 @@ export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: { 
        SELECT org_id, workspace_id, harness, session_id, 'sweep', now() FROM missing
        ON CONFLICT DO NOTHING RETURNING 1)
      SELECT count(*)::int AS n FROM armed`,
-    [limit, options.includeChanged === true, options.workspaceIds ?? null, options.recoverJsonlInputFailures === true],
+    [limit, options.includeChanged === true, options.workspaceIds ?? null,
+      options.refreshCanonicalInput === true ? SESSION_BRIEF_CANONICAL_ENGINE_VERSION : null,
+      SESSION_BRIEF_PROMPT_VERSION, options.recoverJsonlInputFailures === true],
   );
   return rows[0]?.n ?? 0;
 }

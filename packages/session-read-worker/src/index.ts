@@ -69,6 +69,7 @@ import pg from "pg";
 import { Decompress, decompress } from "fzstd";
 import { canonicalAnalysisHandle } from "./analysis-cache.ts";
 import { canonicalHandle, type CanonicalEnv } from "./canonical.ts";
+import { endPg, isPgEnding, pgClientErrorLog } from "./pg-close.ts";
 import { rawStoreFromEnv } from "../../pipeline/src/lib/pipeline/adapter.ts";
 import { canonicalSnapshot, CanonicalReadError } from "../../../src/session-read-api/canonical.ts";
 import { sqlCanonicalPointers } from "../../../src/session-read-api/session-timing-source.ts";
@@ -324,7 +325,7 @@ export function requestTenantRunner(
     async close() {
       if (!client) return;
       const c = await client.catch(() => undefined);
-      await c?.end().catch(() => {});
+      if (c) await endPg(c).catch(() => {});
     },
   };
 }
@@ -338,7 +339,10 @@ export function requestTenantRunner(
  */
 export async function connectPg(connectionString: string): Promise<pg.Client> {
   const client = new pg.Client({ connectionString, application_name: SERVICE, connectionTimeoutMillis: 2_000 });
-  client.on("error", (err) => log("error", "read worker pg error", { error_code: (err as { code?: string }).code ?? "pg_error" }));
+  client.on("error", (err) => {
+    const line = pgClientErrorLog(isPgEnding(client), err);
+    log(line.level, line.message, { error_code: line.error_code });
+  });
   await client.connect();
   (client as unknown as { connection?: { stream?: { on(event: "error", fn: () => void): void } } }).connection?.stream?.on("error", () => {});
   return client;
