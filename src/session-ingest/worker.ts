@@ -31,6 +31,7 @@
  *   INGEST_CLAIM_LOCK_BUSY     unset/off (default) | on (any case): a claim that loses its lock wait
  *                              (55P03/40P01) is a 429 delivery_busy with Retry-After 5-10 s instead of a
  *                              503 (deliver.ts ClaimLockBusy); 57014 and every other cause stay 503
+ *                              (HTTP only: the admission consumer keeps its normal backoff)
  *   INGEST_ASYNC_ADMISSION     unset/off (default) | on | drain: S3-first async admission
  *                              (async-admission.ts, docs/design/s3-first-async-ingest.md); on/drain need
  *                              buffered acceptance and the INGEST_ADMISSION queue (producer + consumer)

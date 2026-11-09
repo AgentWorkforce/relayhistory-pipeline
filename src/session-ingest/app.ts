@@ -260,7 +260,8 @@ const LOCK_ALERT_SQLSTATES = new Set(["55P03", "57014"]);
 
 /** The one alert line for a 55P03 (lock_not_available) / 57014 (query_canceled) ledger failure on a
  * lock-alert stage: `{ route, stage, sqlstate }` and nothing else (no tenant data, no ids). Diagnostic only.
- * A claim lock wait refused as 429 (ClaimLockBusy, INGEST_CLAIM_LOCK_BUSY=on) still alerts. */
+ * A claim lock wait refused as 429 (ClaimLockBusy, INGEST_CLAIM_LOCK_BUSY=on) still alerts for 55P03
+ * (a 40P01 alerts in neither flag state). */
 export function lockAlertFields(error: unknown, acceptanceMode: string | undefined): { route: "ingest.lock_alert"; stage: LockAlertStage; sqlstate: string } | undefined {
   if (!(error instanceof IngestUnavailable || error instanceof ClaimLockBusy)) return undefined;
   const sqlstate = error.db?.db_error_code;

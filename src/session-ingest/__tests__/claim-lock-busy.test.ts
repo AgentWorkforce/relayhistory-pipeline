@@ -2,8 +2,11 @@
  * (55P03 / 40P01, `ledger_lock_timeout`) is a 429 `delivery_busy` with Retry-After 5-10 s instead of the
  * 503, so a concurrent same-tenant claim backs off past the holder instead of stacking behind it. Off:
  * byte-identical 503. 57014 and every other cause stay 503 with the flag on. */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC_SCOPE } from "../app.ts";
+import { backoffSeconds } from "../admission-consumer.ts";
+import { enqueueAdmission } from "../async-admission.ts";
+import { prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { CLAIM_LOCK_RETRY_AFTER, ClaimLockBusy, deliverBatch, IngestUnavailable } from "../deliver.ts";
 import { sqlLedger } from "../ledger-sql.ts";
 import { DELIVERY_BUSY_RETRY_AFTER, DeliveryBusyError } from "../vendor/delivery/delivery-contracts.ts";
@@ -117,5 +120,67 @@ describe("claim lock-wait busy (INGEST_CLAIM_LOCK_BUSY)", () => {
       expect(deliverDepsFor(on, async () => ({ rows: [] }), target as never).claimLockBusy).toBe(true);
     }
     for (const v of ["", "off", "1", "true", "yes"]) expect((await ingestSettings({ ...full, INGEST_CLAIM_LOCK_BUSY: v }))?.claimLockBusy).toBeUndefined();
+  });
+});
+
+/** One INGEST_ADMISSION message through the real Worker queue handler (admitQueueBatch -> deliverDepsFor ->
+ * admitMessage), the SQL ledger failing every statement with `sqlstate`: the retry delay and the log lines. */
+async function consume(sqlstate: string, attempts: number, claimLockBusy: boolean) {
+  const { admitQueueBatch } = await import("../worker.ts");
+  const s = scratchStore();
+  cleanups.push(s.done);
+  const prepared = await prepareDelivery(TENANT, await batch([record({ record_id: "q1" })]));
+  const key = await enqueueAdmission({ store: s.store, keyRoot: "96bulls", enqueue: async () => {} }, TENANT, prepared, Date.now(), 0);
+  const results: string[] = [];
+  const message = { body: { v: 1, kind: "ingest-admission", key }, attempts, ack: () => results.push("ack"), retry: (o?: { delaySeconds?: number }) => results.push(`retry:${o?.delaySeconds}`) };
+  const settings = { bucket: "b", region: "us-east-1", keyRoot: "96bulls", kmsKeyArn: "a", accessKeyId: "k", secretAccessKey: "s", signingKey: "x", maxPerUser: 4, maxPerOrg: 32, inlineMaxSessions: 0, replicaMode: "off" as const, acceptanceMode: "buffered" as const, expectedGeneration: "a".repeat(64), asyncAdmission: "on" as const, ...(claimLockBusy ? { claimLockBusy: true as const } : {}) };
+  const sql: string[] = [];
+  const connect = () => ({ run: async (t: string) => { sql.push(t); throw Object.assign(new Error(`canceling statement ${TENANT.orgId}`), { code: sqlstate }); }, end: async () => {} });
+  const lines: string[] = [];
+  const err = spyOn(process.stderr, "write").mockImplementation(((chunk: string) => { lines.push(String(chunk)); return true; }) as never);
+  const out = spyOn(process.stdout, "write").mockImplementation(((chunk: string) => { lines.push(String(chunk)); return true; }) as never);
+  try {
+    await admitQueueBatch([message as never], { INGEST_ACCEPTANCE_MODE: "buffered" }, settings as never, connect, { store: s.store, keyRoot: "96bulls" });
+  } finally {
+    err.mockRestore();
+    out.mockRestore();
+  }
+  const logged = lines.flatMap((l) => l.split("\n")).filter(Boolean).map((l) => {
+    const { ts: _ts, ...rest } = JSON.parse(l) as Record<string, unknown>;
+    return rest;
+  });
+  return { results, logged, sql };
+}
+
+describe("claim lock-wait busy on the admission consumer (the flag changes nothing there)", () => {
+  test("off and on: a claim 55P03 / 40P01 retries with backoffSeconds(attempts), same error_code, stage and db fields, same lock alert", async () => {
+    for (const code of ["55P03", "40P01"]) {
+      for (const attempts of [1, 3, 7, 20]) {
+        const off = await consume(code, attempts, false);
+        const on = await consume(code, attempts, true);
+        expect(off.results).toEqual([`retry:${backoffSeconds(attempts)}`]);
+        expect(on.results).toEqual(off.results);
+        expect(on.sql.length).toBe(1);
+        expect(off.sql.length).toBe(1);
+        expect(off.sql[0]).toContain("ingest_claim_buffered_batch");
+        const retry = off.logged.find((f) => f.route === "ingest.admission")!;
+        expect(retry).toMatchObject({ outcome: "retry", error_code: "ledger_lock_timeout", stage: "claim", db_error_code: code, attempt: attempts });
+        // Byte-identical lines apart from the timestamp and duration: no delivery_busy, no lost stage.
+        const norm = (rows: Record<string, unknown>[]) => rows.map(({ duration_ms: _d, ...rest }) => rest);
+        expect(norm(on.logged)).toEqual(norm(off.logged));
+        expect(JSON.stringify(on.logged)).not.toContain("delivery_busy");
+        // The admission lock alert: 55P03 only (LOCK_ALERT_SQLSTATES has no 40P01), in both flag states.
+        const alert = on.logged.find((f) => f.route === "ingest.admission_lock_alert");
+        if (code === "55P03") expect(alert).toMatchObject({ stage: "lazy_claim", sqlstate: "55P03" });
+        else expect(alert).toBeUndefined();
+      }
+    }
+  });
+
+  test("on: a non-lock claim failure (57014) is also unchanged on the consumer", async () => {
+    const off = await consume("57014", 2, false);
+    const on = await consume("57014", 2, true);
+    expect(on.results).toEqual(off.results);
+    expect(on.results).toEqual([`retry:${backoffSeconds(2)}`]);
   });
 });

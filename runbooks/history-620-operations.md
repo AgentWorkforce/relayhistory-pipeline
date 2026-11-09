@@ -131,12 +131,19 @@ Claim lock-wait busy (default off): with `INGEST_CLAIM_LOCK_BUSY=on` a claim (an
 mode) whose statement loses its lock wait (55P03 or 40P01, `error_code` `ledger_lock_timeout`)
 answers 429 `delivery_busy` with `Retry-After` 5-10 s instead of the 503. The lower bound is the
 role `statement_timeout` (5 s), so the retry lands after the holding claim has committed or been
-cancelled. The statement rolled back, so nothing was written; the retry is the same idempotent claim,
-and the admission consumer retries it after the same delay. The route line keeps `stage` `claim`,
-`error_code` and `db_error_code`, with `outcome` `delivery_busy`. The `ingest.lock_alert`
-`lazy_claim` line still fires. 57014 (`ledger_timeout`) and every other cause stay 503. With
-the flag on, the 503 claim-path alert above no longer counts 55P03. Watch `outcome=delivery_busy`
-with `stage=claim`, or the `lazy_claim` lock alert. Unset or `off`: unchanged.
+cancelled. The statement rolled back, so nothing was written; the retry is the same idempotent claim.
+The flag changes only the HTTP answer: the async admission consumer still retries a claim lock wait
+with the normal admission backoff (15, 30, 60 ... 300 s by attempt), with the same `error_code`
+`ledger_lock_timeout`, `stage` `claim` and `db_*` fields on its `ingest.admission` retry line. The
+route line keeps `stage` `claim`, `error_code` and `db_error_code`, with `outcome` `delivery_busy`.
+The `ingest.lock_alert` `lazy_claim` line still fires for 55P03 (buffered mode) only: the lock
+alert set is 55P03 and 57014, so a 40P01 (deadlock) turned into 429 emits no lock alert and shows
+only as `outcome=delivery_busy` with `stage=claim` and `db_error_code` `40P01`. The
+`ingest.stage_latency` line (if enabled) still records the converted claim as `outcome`
+`unavailable`, because it is observed before the conversion. 57014 (`ledger_timeout`) and every
+other cause stay 503. With the flag on, the 503 claim-path alert above no longer counts 55P03 or
+40P01. Watch `outcome=delivery_busy` with `stage=claim` (all claim lock waits), or the `lazy_claim`
+lock alert (55P03 only). Unset or `off`: unchanged.
 
 No Workers analytics or Logpush observer is named in these runbooks, so the alert is not wired
 yet. It is to be wired by the release owner in the G3 window, using the fields `route`, `stage`,
