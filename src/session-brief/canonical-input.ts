@@ -9,6 +9,8 @@ import { serviceCanonicalDeps, type ServiceCanonicalDeps } from "../session-read
 import { CanonicalReadError } from "../session-read-api/canonical.ts";
 import { briefInputFromEvents, eventFromConvergenceRow, type BriefInput, type BriefPointer } from "./input.ts";
 import { SESSION_SUMMARY_SOURCES } from "./engine/summary-contract.ts";
+import { briefWorkspaceIds } from "./config.ts";
+import type { TenantRunner } from "../session-read-api/liveness.ts";
 import type { CanonicalRows } from "../session-read-api/session-timing-source.ts";
 
 export type CanonicalBriefInput = (db: HoopDb, key: SessionDirectoryKey, pointers: readonly BriefPointer[]) => Promise<BriefInput>;
@@ -31,6 +33,25 @@ export function briefInputFromCanonical(
   return briefInputFromEvents(key, sourceRevisions, events);
 }
 
+
+/** One physical source only. Never summarize a canonical union while publishing
+ * freshness for only one of its physical aliases. */
+export async function canonicalBriefScope(run: TenantRunner, key: SessionDirectoryKey): Promise<SessionDirectoryKey> {
+  return run(key.orgId, key.workspaceId, async tx => {
+    const mapped = await tx.query<{ id: string }>(`SELECT DISTINCT coalesce(canonical_session_id,session_id) AS id
+      FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4
+        AND deleted_at IS NULL AND manifest_key IS NOT NULL LIMIT 2`, [key.orgId,key.workspaceId,key.harness,key.sessionId]);
+    if (mapped.rows.length !== 1) throw new PipelineError("canonical_input_scope_changed", "canonical source unavailable", true);
+    const logical = mapped.rows[0]!.id;
+    const physical = await tx.query<{ id: string }>(`SELECT DISTINCT session_id AS id FROM sessions.session_index
+      WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND coalesce(canonical_session_id,session_id)=$4
+        AND deleted_at IS NULL AND manifest_key IS NOT NULL LIMIT 2`, [key.orgId,key.workspaceId,key.harness,logical]);
+    if (physical.rows.length !== 1 || physical.rows[0]!.id !== key.sessionId)
+      throw new PipelineError("canonical_input_multiple_sources", "multiple physical sources are not qualified", false);
+    return { ...key, sessionId: logical };
+  });
+}
+
 /** Default off. Configuration is validated before the worker opens or claims
  * anything. Credentials remain in the existing Locker/HoopDb bindings. */
 export function canonicalBriefInputFromEnv(env: NodeJS.ProcessEnv = process.env): CanonicalBriefInput | undefined {
@@ -39,15 +60,22 @@ export function canonicalBriefInputFromEnv(env: NodeJS.ProcessEnv = process.env)
   if (flag !== "true") throw new Error("SESSION_BRIEF_CANONICAL_INPUT must be true or false");
   if (env.SESSION_BRIEF_ENABLED !== "true" || !env.LOCKER_BUCKET?.trim() || env.PIPELINE_ORG_FROM_PREFIX !== "true")
     throw new Error("canonical brief input requires SESSION_BRIEF_ENABLED, LOCKER_BUCKET and org-prefix layout");
+  const workspaces = briefWorkspaceIds(env.SESSION_BRIEF_WORKSPACE_IDS);
+  if (!workspaces?.length) throw new Error("canonical brief input requires SESSION_BRIEF_WORKSPACE_IDS");
   const cache = new WeakMap<HoopDb, Promise<ServiceCanonicalDeps | undefined>>();
   return async (db, key, pointers) => {
+    if (!workspaces.includes(key.workspaceId)) throw new PipelineError("canonical_input_workspace", "workspace is not selected", false);
+    const run = poolTenantRunner(db.pool as never);
+    const logicalKey = await canonicalBriefScope(run, key);
     let canonical = cache.get(db);
     if (!canonical) { canonical = serviceCanonicalDeps(env, poolTenantRunner(db.pool as never)); cache.set(db, canonical); }
     const bound = await canonical;
     if (!bound) throw new PipelineError("canonical_input_unconfigured", "canonical input not configured", false);
     try {
-      const snapshot = await bound.events.source({ orgId: key.orgId, workspaceId: key.workspaceId, source: key.harness, sessionId: key.sessionId }, AbortSignal.timeout(15000));
-      return briefInputFromCanonical(key, pointers, snapshot);
+      const snapshot = await bound.events.source({ orgId: key.orgId, workspaceId: key.workspaceId, source: key.harness, sessionId: logicalKey.sessionId }, AbortSignal.timeout(15000));
+      const after = await canonicalBriefScope(run, key);
+      if (after.sessionId !== logicalKey.sessionId) throw new PipelineError("canonical_input_scope_changed", "canonical source changed", true);
+      return { ...briefInputFromCanonical(logicalKey, pointers, snapshot), canonicalSessionId: logicalKey.sessionId };
     } catch (error) {
       if (error instanceof CanonicalReadError) {
         // Match the legacy input's quarantine outcome: never retain derived

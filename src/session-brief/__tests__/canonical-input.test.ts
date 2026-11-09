@@ -1,8 +1,15 @@
 import { expect, test } from "bun:test";
-import { briefInputFromCanonical, canonicalBriefInputFromEnv } from "../canonical-input.ts";
+import { briefInputFromCanonical, canonicalBriefInputFromEnv, canonicalBriefScope } from "../canonical-input.ts";
 import { briefSession } from "../worker.ts";
-import { armWakeup, claimWakeups, sweepUnbriefed } from "../store.ts";
+import { armWakeup, claimWakeups, sweepUnbriefed, recordBrief } from "../store.ts";
 import { database, hoopDb, pointer, KEY, FakeModel, testConfig } from "./harness.ts";
+import { poolTenantRunner } from "../../session-read-api/liveness.ts";
+import { sqlCanonicalPointers } from "../../session-read-api/session-timing-source.ts";
+import { canonicalSnapshot } from "../../session-read-api/canonical.ts";
+import { objectKey, manifestKey } from "../../../packages/object-store/src/index.ts";
+import { zstdDecompressSync } from "node:zlib";
+import { recordStream, tempStore, loc } from "./harness.ts";
+import { briefConfig } from "../config.ts";
 import type { CanonicalRows } from "../../session-read-api/session-timing-source.ts";
 
 const pointers = [{ machineId: "m-1", manifestKey: "opaque-pointer", revision: 1 }];
@@ -36,7 +43,7 @@ test("canonical source selection is explicit, strict and refuses incomplete conf
   expect(canonicalBriefInputFromEnv({ SESSION_BRIEF_CANONICAL_INPUT: "false" })).toBeUndefined();
   expect(() => canonicalBriefInputFromEnv({ SESSION_BRIEF_CANONICAL_INPUT: "yes" })).toThrow("must be true or false");
   expect(() => canonicalBriefInputFromEnv({ SESSION_BRIEF_CANONICAL_INPUT: "true" })).toThrow("requires");
-  expect(canonicalBriefInputFromEnv({ SESSION_BRIEF_CANONICAL_INPUT: "true", SESSION_BRIEF_ENABLED: "true", LOCKER_BUCKET: "owned-bucket", PIPELINE_ORG_FROM_PREFIX: "true" })).toBeFunction();
+  expect(canonicalBriefInputFromEnv({ SESSION_BRIEF_CANONICAL_INPUT: "true", SESSION_BRIEF_ENABLED: "true", LOCKER_BUCKET: "owned-bucket", PIPELINE_ORG_FROM_PREFIX: "true", SESSION_BRIEF_WORKSPACE_IDS: "ws-a" })).toBeFunction();
 });
 
 test("native changed-revision sweep re-arms the existing leased worker without touching consumer privileges", async () => {
@@ -56,5 +63,88 @@ test("native changed-revision sweep re-arms the existing leased worker without t
     expect(await sweepUnbriefed(db, 100)).toBe(0); // legacy unchanged
     expect(await sweepUnbriefed(db, 100, { includeChanged: true })).toBe(1);
     expect(await sweepUnbriefed(db, 100, { includeChanged: true })).toBe(0); // existing wakeup preserved
+  } finally { await pg.close(); }
+}, 60000);
+
+test("actual SQL physical→logical mapping reads verified alias objects, rejects foreign/multiple sources before object IO", async () => {
+  const pg = await database(); const db = hoopDb(pg); const store = tempStore();
+  const physical = { ...KEY, sessionId: "sess_1" }, logical = { ...physical, sessionId: "sess:1" };
+  try {
+    const records = ["user", "assistant"].map((role, n) => ({ kind: "session_event", origin_id: "original", record_id: `r${n}`, revision: "1", operation: "upsert", received_at: "2026-10-30T12:00:00Z", payload: { ts_ms: Date.parse(`2026-10-29T10:00:0${n}Z`), role, text: `${role} canonical text` } }));
+    const manifest = await recordStream(store, records, { key: physical });
+    manifest.extensions!["96bulls"] = { user_id: "u-1", canonical_session_id: logical.sessionId };
+    (manifest.extensions!["client.relayhistory_export"] as any).source_user_id = "u-1";
+    const path = manifestKey(loc(physical)); await store.put(objectKey(path), new TextEncoder().encode(JSON.stringify(manifest)));
+    await pointer(pg, { key: physical, manifestKey: path });
+    await pg.query("UPDATE sessions.session_index SET canonical_session_id=$1,raw_format='ndjson',storage_provider='s3',content_sha256=decode($2,'hex') WHERE session_id=$3", [logical.sessionId, manifest.raw.content_sha256, physical.sessionId]);
+    const run = poolTenantRunner(db.pool as never);
+    expect(await canonicalBriefScope(run, physical)).toEqual(logical);
+    await expect(canonicalBriefScope(run, { ...physical, workspaceId: "other" })).rejects.toThrow("canonical source unavailable");
+    let objectReads = 0; const counted = new Proxy(store, { get(target, prop) {
+      const value = Reflect.get(target, prop);
+      if (prop === "getObject") return async (...args: Parameters<typeof store.getObject>) => { objectReads++; return target.getObject(...args); };
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+    const snapshot = await canonicalSnapshot({ pointers: sqlCanonicalPointers(run).pointers, store: counted, provider: "s3", bucket: "bucket", prefix: {}, decompress: b => new Uint8Array(zstdDecompressSync(b)) }, { orgId: logical.orgId, workspaceId: logical.workspaceId, source: logical.harness, sessionId: logical.sessionId });
+    const built = briefInputFromCanonical(logical, pointers, snapshot); expect(built.kind).toBe("ready");
+    if (built.kind === "ready") { expect(built.input.sessionId).toBe(logical.sessionId); expect(built.input.messages.map(m => m.text)).toEqual(["user canonical text", "assistant canonical text"]); }
+    expect(objectReads).toBeGreaterThan(0);
+    const before = objectReads;
+    await pointer(pg, { key: physical, machine: "m-2", manifestKey: "not-read" });
+    await pg.query("UPDATE sessions.session_index SET canonical_session_id='other-logical' WHERE machine_id='m-2'");
+    await expect(canonicalBriefScope(run, physical)).rejects.toThrow("canonical source unavailable");
+    expect(objectReads).toBe(before);
+    await pg.exec("DELETE FROM sessions.session_index WHERE machine_id='m-2'");
+    await pointer(pg, { key: { ...physical, sessionId: "another-physical" }, manifestKey: "not-read" });
+    await pg.query("UPDATE sessions.session_index SET canonical_session_id=$1 WHERE session_id='another-physical'", [logical.sessionId]);
+    await expect(canonicalBriefScope(run, physical)).rejects.toThrow("multiple physical sources are not qualified");
+    expect(objectReads).toBe(before);
+  } finally { await pg.close(); }
+}, 60000);
+
+test("workspace scope filters sweep and claim before any lease or model call", async () => {
+  const pg = await database(); const db = hoopDb(pg);
+  try {
+    await pointer(pg);await pointer(pg, { key: { ...KEY, workspaceId: "other" } });
+    expect(await sweepUnbriefed(db, 100, { includeChanged: true, workspaceIds: [KEY.workspaceId] })).toBe(1);
+    await armWakeup(db, { ...KEY, workspaceId: "other" }, { idleSeconds: 0, maxWaitSeconds: 0 });
+    const claimed = await claimWakeups(db, 10, 300, [KEY.workspaceId]);expect(claimed).toHaveLength(1);expect(claimed[0]!.workspaceId).toBe(KEY.workspaceId);
+    expect((await pg.query<{ lease_id: string | null }>("SELECT lease_id::text FROM sessions.session_brief_wakeups WHERE workspace_id='other'")).rows[0]!.lease_id).toBeNull();
+    expect(() => briefConfig({ SESSION_BRIEF_WORKSPACE_IDS: "*" })).toThrow("explicit workspace list");
+  } finally { await pg.close(); }
+}, 60000);
+
+test("native publication rejects a second physical source introduced during model execution", async () => {
+  const pg = await database(); const db = hoopDb(pg);
+  try {
+    await pointer(pg, { manifestKey: "opaque-pointer" });
+    await armWakeup(db, KEY, { idleSeconds: 0, maxWaitSeconds: 0 });
+    const wakeup = (await claimWakeups(db, 1, 300))[0]!;
+    const ready = snapshot();ready.rows.forEach(r => { r.row.source = KEY.harness; });
+    const model = new FakeModel(); const original = model.complete.bind(model);
+    model.complete = async request => {
+      await pointer(pg, { key: { ...KEY, sessionId: "new-physical" }, manifestKey: "never-read" });
+      await pg.query("UPDATE sessions.session_index SET canonical_session_id=$1 WHERE session_id='new-physical'", [KEY.sessionId]);
+      return original(request);
+    };
+    const result = await briefSession({ db, reader: {} as never, store: {} as never, transport: model, config: testConfig({ throttleSeconds: 0 }), canonicalInput: async (_db, key, actual) => ({ ...briefInputFromCanonical(key, actual, ready), canonicalSessionId: key.sessionId }) }, wakeup);
+    expect(result).toBe("stale");expect(model.requests).toHaveLength(1);
+    expect((await pg.query("SELECT 1 FROM sessions.session_briefs")).rows).toEqual([]);
+    expect((await pg.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.session_directory WHERE short_summary IS NOT NULL")).rows[0]!.n).toBe(0);
+  } finally { await pg.close(); }
+}, 60000);
+
+test("native publication rejects an unchanged-revision machine remap during model execution", async () => {
+  const pg = await database(); const db = hoopDb(pg);
+  try {
+    await pointer(pg, { manifestKey: "opaque-pointer" });await pointer(pg, { machine: "m-2", manifestKey: "opaque-second" });
+    await armWakeup(db, KEY, { idleSeconds: 0, maxWaitSeconds: 0 });
+    const wakeup = (await claimWakeups(db, 1, 300))[0]!;
+    const ready = snapshot();ready.rows.forEach(r => { r.row.source = KEY.harness; });
+    const model = new FakeModel(); const original = model.complete.bind(model);
+    model.complete = async request => { await pg.exec("UPDATE sessions.session_index SET canonical_session_id='other-logical' WHERE machine_id='m-2'");return original(request); };
+    const result = await briefSession({ db, reader: {} as never, store: {} as never, transport: model, config: testConfig({ throttleSeconds: 0 }), canonicalInput: async (_db, key, actual) => ({ ...briefInputFromCanonical(key, actual, ready), canonicalSessionId: key.sessionId }) }, wakeup);
+    expect(result).toBe("stale");expect(model.requests).toHaveLength(1);
+    expect((await pg.query("SELECT 1 FROM sessions.session_briefs")).rows).toEqual([]);
   } finally { await pg.close(); }
 }, 60000);

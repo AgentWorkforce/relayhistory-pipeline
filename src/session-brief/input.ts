@@ -49,9 +49,10 @@ export interface BriefPointer {
   revision: number;
 }
 
-export type BriefInput =
+export type BriefInput = (
   | { kind: "ready"; input: SessionSummaryInput; sourceRevisions: Record<string, number> }
-  | { kind: "quarantined" | "empty" | "ineligible"; error: string; sourceRevisions: Record<string, number> };
+  | { kind: "quarantined" | "empty" | "ineligible"; error: string; sourceRevisions: Record<string, number> }
+) & { canonicalSessionId?: string };
 
 /** Raw bytes read for one session, all machines together. relayhistory-transform's own bound. */
 export const MAX_BRIEF_SESSION_BYTES = 256 * 1024 * 1024;
