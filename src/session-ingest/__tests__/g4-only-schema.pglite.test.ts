@@ -103,6 +103,7 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105043910_selfhost_session_selection_erase.sql",
       // A new table and read API functions only; no ingest path touches them.
       "20261105044000_read_api_tokens.sql",
+      "20261105044010_selfhost_erase_lock_fences.sql",
       // Operator per-session erase: new tables and entry points; no ingest path calls them.
       "20261105050000_operator_session_erase.sql",
     ]);

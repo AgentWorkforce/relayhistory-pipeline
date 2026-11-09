@@ -200,6 +200,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
       "DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)",
     sql: column("sessions.session_summaries", "object_key"),
   },
+  "upstream:20261105044010_selfhost_erase_lock_fences.sql": {
+    evidence: "replacement: ingest_selfhost_set_session_uploads takes the user's fence lock before reading ownership",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)') AND prosecdef AND prosrc LIKE '%ingest_lock_fences(v_org,v_ws,v_user)%') AS applied",
+  },
   "upstream:20261105043910_selfhost_session_selection_erase.sql": {
     evidence: "CREATE FUNCTION: sessions.ingest_selfhost_set_session_uploads(jsonb) (self-host per-session erase)",
     sql: "SELECT to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)') IS NOT NULL AS applied",
