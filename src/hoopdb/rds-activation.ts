@@ -211,6 +211,14 @@ const OPTIONS: Record<string, { env: string; flag: boolean }> = {
   "--secrets-stdin": { env: "", flag: true },
 };
 const IDENT = /^[a-z_][a-z0-9_]{0,62}$/;
+const DNS_LABEL = "[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?";
+const DNS_NAME = new RegExp(`^${DNS_LABEL}(?:\\.${DNS_LABEL})*\\.?$`);
+/** A bare DNS name (at most 253 characters) or an IPv4/IPv6 literal; nothing else. */
+export function isBareHost(host: string): boolean {
+  if (host.length > 253) return false;
+  if (isIP(host) !== 0) return true;
+  return DNS_NAME.test(host);
+}
 const LOOPBACK = new Set(["localhost", "127.0.0.1", "::1"]);
 const needs = {
   provisionerName: (c: Command) => c !== "artifact" && c !== "rotate-self",
@@ -273,6 +281,11 @@ export function parseInputs(
 
   const host = opt("--host") ?? "";
   if (c !== "artifact" && !host) throw new InvalidInput("--host / HOOPDB_ACTIVATION_HOST is required");
+  // A bare DNS name or IP literal only: never a URL, userinfo or anything with "@", ":"
+  // (outside an IPv6 literal), "/" or "?". The value is never echoed, since it could
+  // carry credentials, and connection errors can then only echo a credential-free host.
+  if (host && !isBareHost(host))
+    throw new InvalidInput("--host / HOOPDB_ACTIVATION_HOST must be a bare host name or IP address (value not shown)");
   const portText = opt("--port") ?? "5432";
   if (!/^[0-9]{1,5}$/.test(portText) || Number(portText) < 1 || Number(portText) > 65535)
     throw new InvalidInput("--port must be 1-65535");
@@ -559,7 +572,7 @@ export async function activate(cfg: Config, opts: ActivateOptions = {}): Promise
     const lock = (await client.query("SELECT pg_try_advisory_lock($1) AS ok", [LOCK_KEY])).rows[0];
     if (!lock.ok) throw Object.assign(new Error("another rds-activation holds the lock"), { code: "55P03" });
     current = "begin";
-    await client.query("BEGIN");
+    await client.query("BEGIN READ WRITE");
     await client.query("SET LOCAL lock_timeout = '10s'");
     await bindSettings(client, cfg, "activate", verifiers);
     for (const f of FRAGMENTS) {
@@ -648,6 +661,17 @@ export async function verify(cfg: Config): Promise<{ steps: Step[]; graph: Resul
   return { steps, graph };
 }
 
+/** rotate-self statements, exported so the committed SQL tests run exactly these. */
+export const ROTATE_BEGIN_SQL = "BEGIN READ WRITE";
+export const ROTATE_BIND_SQL = "SELECT set_config('hoopdb_activation.new_verifier', $1, true)";
+export const ROTATE_APPLY_SQL = `DO $rotate$ BEGIN
+      IF current_setting('hoopdb_activation.new_verifier') !~ '^SCRAM-SHA-256\\$4096:[A-Za-z0-9+/=]+\\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$' THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'rotate-self: malformed verifier';
+      END IF;
+      EXECUTE format('ALTER ROLE CURRENT_USER PASSWORD %L', current_setting('hoopdb_activation.new_verifier'));
+      PERFORM set_config('hoopdb_activation.new_verifier', '', true);
+    END $rotate$`;
+
 /**
  * rotate-self: the role logs in with its current password and sets its own new SCRAM
  * verifier (ALTER ROLE CURRENT_USER, which PostgreSQL allows any role for its own
@@ -663,16 +687,12 @@ export async function rotateSelf(cfg: Config): Promise<Step[]> {
     if (who.s !== role || who.c !== role)
       throw new StepFailure("refused", [{ name, status: "failed", sqlstate: "42501", message: "connected identity is not the named role" }]);
     // Same handling as activate: bound as a parameter, used through EXECUTE (never in a
-    // top-level statement text), then cleared, all in one transaction.
-    await before.query("BEGIN");
-    await before.query("SELECT set_config('hoopdb_activation.new_verifier', $1, true)", [scramVerifier(cfg.secrets.new_password!)]);
-    await before.query(`DO $rotate$ BEGIN
-      IF current_setting('hoopdb_activation.new_verifier') !~ '^SCRAM-SHA-256\\$4096:[A-Za-z0-9+/=]+\\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$' THEN
-        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'rotate-self: malformed verifier';
-      END IF;
-      EXECUTE format('ALTER ROLE CURRENT_USER PASSWORD %L', current_setting('hoopdb_activation.new_verifier'));
-      PERFORM set_config('hoopdb_activation.new_verifier', '', true);
-    END $rotate$`);
+    // top-level statement text), then cleared, all in one transaction. READ WRITE
+    // explicitly: bulls96_read_api carries default_transaction_read_only=on, under which
+    // ALTER ROLE is refused (25006).
+    await before.query(ROTATE_BEGIN_SQL);
+    await before.query(ROTATE_BIND_SQL, [scramVerifier(cfg.secrets.new_password!)]);
+    await before.query(ROTATE_APPLY_SQL);
     await before.query("COMMIT");
   } catch (e) {
     if (e instanceof StepFailure) throw e;
@@ -699,8 +719,9 @@ export async function rotateSelf(cfg: Config): Promise<Step[]> {
   } catch (e) {
     if (e instanceof StepFailure) throw e;
     if ((e as { code?: string }).code !== "28P01") {
+      // Only a server verdict proves anything here; a lost connection does not.
       steps.push(failed(cfg, `${name}:old-login`, e));
-      throw new StepFailure("verify_failed", steps);
+      throw new StepFailure(verifyFailureStatus(e), steps);
     }
   } finally {
     await stale.end().catch(() => undefined);
@@ -827,6 +848,13 @@ export function openResultChannel(target: Config["result"]): ResultChannel {
       fstatSync(target.fd);
     } catch {
       throw new InvalidInput(`--result-fd ${target.fd} is not an open descriptor`);
+    }
+    // Zero-byte write probe: the kernel checks that the descriptor is open for writing
+    // before it looks at the length (EBADF on a read-only fd), and writes nothing.
+    try {
+      writeSync(target.fd, Buffer.alloc(0), 0, 0);
+    } catch (e) {
+      throw new InvalidInput(`--result-fd ${target.fd} is not writable (${(e as { code?: string }).code ?? "error"})`);
     }
     return { fd: target.fd };
   }

@@ -38,7 +38,7 @@ regress.
 | `activate` | Step 2. All role, grantor-graph, setting, LOGIN, default-privilege, ownership and cleanup work, then the final graph validation. Skipped (status `already_activated`) when the shared catalogs show the activated state. | provisioning login | `hoopdb` | exactly one (`BEGIN` ... `COMMIT`); any failure rolls back everything |
 | `verify` | Step 3. Read-only. Proves `hoop` and `sessions_pipeline_runtime` log in with their passwords, and re-derives the final graph as `hoop`. | `hoop`, then `sessions_pipeline_runtime` | `hoopdb` | `READ ONLY` |
 | `run` | `create-database`, then `activate`, then `verify`. | as above | as above | as above |
-| `rotate-self` | One LOGIN role changes its own password, then proves that the new one logs in and the old one is refused (28P01). | the role itself (`--role`) | `hoopdb` | one (the verifier is bound and used through `EXECUTE`, as in `activate`) |
+| `rotate-self` | One LOGIN role changes its own password, then proves that the new one logs in and the old one is refused (28P01). | the role itself (`--role`) | `hoopdb` | one, explicitly `READ WRITE`. `bulls96_read_api` has `default_transaction_read_only=on`, under which `ALTER ROLE` would be refused (25006). The verifier is bound and used through `EXECUTE`, as in `activate`. A lost connection during the old-password probe is `internal_error`, not `verify_failed` |
 
 ### Transaction boundary and who does what inside `activate`
 
@@ -120,7 +120,7 @@ the input is refused.
 
 | Flag | Env | Required | Meaning |
 |---|---|---|---|
-| `--host` | `HOOPDB_ACTIVATION_HOST` | yes (not `artifact`) | RDS writer endpoint host name |
+| `--host` | `HOOPDB_ACTIVATION_HOST` | yes (not `artifact`) | RDS writer endpoint host name. Only a bare DNS name or IP literal is accepted. A URL, userinfo, `@`, a port, a path or a query string is refused (exit 2), and the value is never echoed, because it could hold credentials. |
 | `--port` | `HOOPDB_ACTIVATION_PORT` | no (5432) | |
 | `--provisioner` | `HOOPDB_ACTIVATION_PROVISIONER` | all except `artifact`, `rotate-self` | Name of the provisioning login (the RDS master). Must equal `session_user`. It may not be a HoopDb, executor or RDS platform role. |
 | `--maintenance-db` | `HOOPDB_ACTIVATION_MAINTENANCE_DB` | no (`postgres`) | Database for step 1 and the activated-state probe |
@@ -152,7 +152,8 @@ written to disk except the result, which never contains a secret or a verifier.
 ## Outputs
 
 The result target is validated and opened **before any database work**. A file is
-created exclusively (0600, refused if it exists); a descriptor must be open. A bad
+created exclusively (0600, refused if it exists); a descriptor must be open **for
+writing**, which a zero-byte write probe checks (a read-only fd gives EBADF). A bad
 channel is exit 2, with no server contact. The write loops over short writes and
 retries `EAGAIN`, and a result file is fsynced before close.
 

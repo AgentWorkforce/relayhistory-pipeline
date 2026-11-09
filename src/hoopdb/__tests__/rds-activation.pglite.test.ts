@@ -10,7 +10,7 @@
  */
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/index.js";
@@ -18,6 +18,7 @@ import { rdsSeparateOwnerPreflight, type MigrationClient } from "../migrate.ts";
 import {
   commitRecheckStatus,
   EXIT,
+  isBareHost,
   execute,
   isServerError,
   openResultChannel,
@@ -25,7 +26,12 @@ import {
   parseRoleSpec,
   passwordEnv,
   roleSpecSources,
+  ROTATE_APPLY_SQL,
+  ROTATE_BEGIN_SQL,
+  ROTATE_BIND_SQL,
+  scramVerifier,
   scrub,
+  verifyFailureStatus,
   writeAll,
   writeResult,
 } from "../rds-activation.ts";
@@ -218,5 +224,93 @@ describe("Node erasable-only type stripping (infra #67 guest)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("review fixes (Devin threads)", () => {
+  test("rotate-self works for a role with default_transaction_read_only=on (bulls96_read_api)", async () => {
+    const db = new PGlite();
+    open.push(db);
+    await db.exec("CREATE ROLE bulls96_read_api LOGIN NOINHERIT; SET SESSION AUTHORIZATION bulls96_read_api; SET default_transaction_read_only = on");
+    const verifier = scramVerifier("n".repeat(40));
+    // The bug: a plain BEGIN inherits the read-only default and ALTER ROLE is refused (25006).
+    await db.exec("BEGIN");
+    await db.query(ROTATE_BIND_SQL, [verifier]);
+    let plain = "ok";
+    try {
+      await db.exec(ROTATE_APPLY_SQL);
+    } catch (e) {
+      plain = (e as { code?: string }).code ?? "error";
+    }
+    await db.exec("ROLLBACK");
+    expect(plain).toBe("25006");
+    // The fix: the driver's explicit READ WRITE transaction succeeds.
+    expect(ROTATE_BEGIN_SQL).toBe("BEGIN READ WRITE");
+    await db.exec(ROTATE_BEGIN_SQL);
+    await db.query(ROTATE_BIND_SQL, [verifier]);
+    await db.exec(ROTATE_APPLY_SQL);
+    await db.exec("COMMIT");
+    expect((await db.query<{ v: string }>("SELECT current_setting('hoopdb_activation.new_verifier', true) AS v")).rows[0]!.v ?? "").toBe("");
+  });
+  test("the activate transaction is explicitly READ WRITE too", () => {
+    expect(readFileSync(join(root, "src/hoopdb/rds-activation.ts"), "utf8")).toContain('await client.query("BEGIN READ WRITE");');
+  });
+  test("a read-only --result-fd is refused before any database work", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rds-activation-"));
+    const file = join(dir, "ro.json");
+    writeFileSync(file, "");
+    const ro = openSync(file, "r");
+    try {
+      expect(() => openResultChannel({ fd: ro })).toThrow(/not writable \(EBADF\)/);
+      const rw = openSync(join(dir, "rw.json"), "w");
+      try {
+        expect(openResultChannel({ fd: rw })).toEqual({ fd: rw });
+      } finally {
+        closeSync(rw);
+      }
+      expect(readFileSync(file, "utf8")).toBe("");
+    } finally {
+      closeSync(ro);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("CLI: a read-only result fd is exit 2 before any connection", () => {
+    // The host is unreachable on purpose: reaching it would be internal_error (exit 1).
+    const r = spawnSync("bash", ["-c", `exec 3</etc/hostname; exec bun ${join(root, "src/hoopdb/rds-activation.ts")} artifact --result-fd 3`],
+      { encoding: "utf8", env: { PATH: process.env.PATH ?? "" } });
+    expect(r.status).toBe(2);
+    expect(r.stderr).toMatch(/not writable/);
+  });
+  test("a lost connection on the old-password probe is internal_error, a server refusal is verify_failed", () => {
+    expect(verifyFailureStatus(new Error("Connection terminated unexpectedly"))).toBe("internal_error");
+    expect(verifyFailureStatus(Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }))).toBe("internal_error");
+    expect(verifyFailureStatus({ severity: "FATAL", code: "28000" })).toBe("verify_failed");
+    const src = readFileSync(join(root, "src/hoopdb/rds-activation.ts"), "utf8");
+    const probe = src.slice(src.indexOf(":old-login`, e"), src.indexOf(":old-login`, e") + 200);
+    expect(probe).toContain("verifyFailureStatus(e)");
+  });
+  test("--host refuses URLs, userinfo and anything but a bare host, without echoing the value", () => {
+    const spec = parseRoleSpec(roleSpecSources());
+    const base = { HOOPDB_ACTIVATION_PROVISIONER: "rds_master_login", HOOPDB_ACTIVATION_RESULT_FD: "3",
+      HOOPDB_ACTIVATION_CA_FILE: "/ca.pem", HOOPDB_ACTIVATION_PROVISIONER_PASSWORD: "p".repeat(40) };
+    const bad = ["postgres://user:hunter2-secret@server/db", "user:hunter2-secret@server", "hunter2-secret@server",
+      "server/db", "server:5432", "server?sslmode=disable", "a..b", "-bad", "with space", "x".repeat(254)];
+    for (const h of bad) {
+      expect(isBareHost(h)).toBe(false);
+      for (const [argv, env] of [[["create-database"], { ...base, HOOPDB_ACTIVATION_HOST: h }], [["create-database", "--host", h], base]] as const) {
+        let msg = "accepted";
+        try {
+          parseInputs([...argv], env as Record<string, string>, () => "", spec);
+        } catch (e) {
+          msg = (e as Error).message;
+        }
+        expect(msg).not.toBe("accepted");
+        expect(msg).not.toContain("hunter2");
+        expect(msg).not.toContain(h);
+      }
+    }
+    for (const h of ["hoop.cluster-abc.us-east-1.rds.amazonaws.com", "localhost", "127.0.0.1", "::1"]) expect(isBareHost(h)).toBe(true);
+    expect(parseInputs(["create-database"], { ...base, HOOPDB_ACTIVATION_HOST: "hoop.rds.example.internal" }, () => "", spec).host)
+      .toBe("hoop.rds.example.internal");
   });
 });
