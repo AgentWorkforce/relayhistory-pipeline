@@ -339,6 +339,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   },
   "upstream:20261105033000_canonical_project_events.sql": { evidence: "table sessions.canonical_project_events", sql: relation("sessions.canonical_project_events") },
   "upstream:20261105045000_digest_narrative_cache.sql": { evidence: "table sessions.daily_digest_narratives", sql: relation("sessions.daily_digest_narratives") },
+  "upstream:20261105045040_selfhost_output_facts.sql": { evidence: "table sessions.session_output_facts", sql: relation("sessions.session_output_facts") },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),
@@ -381,10 +382,12 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     sql: "SELECT to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)') IS NOT NULL AS applied",
   },
   "upstream:20261105043900_session_consumer_function_grants.sql": {
+    // Narrowed to the twelve named functions when 045040 granted search_consumer_runtime four
+    // more EXECUTEs: an unnamed count would turn false on every later step.
     evidence: "twelve search_consumer_runtime EXECUTEs (composed writer path)",
-    // session_directory_project_text is 045030's grant, so it is left out: the count stays exactly twelve
-    // whether or not 045030 has run.
-    sql: "SELECT count(*) = 12 AS applied FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE n.nspname = 'sessions' AND p.proname <> 'session_directory_project_text' AND r.rolname = 'search_consumer_runtime' AND a.privilege_type = 'EXECUTE'",
+    // The named list also leaves out session_directory_project_text (045030's grant), so the count stays
+    // exactly twelve whether or not 045030 or 045040 has run.
+    sql: "SELECT count(*) = 12 AS applied FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE n.nspname = 'sessions' AND r.rolname = 'search_consumer_runtime' AND a.privilege_type = 'EXECUTE' AND p.proname IN ('upsert_session_index', 'session_index_batch', 'session_publication_is_managed', 'session_publication_lock', 'applied_repo_evidence', 'canonical_remote', 'clean_root_commit', 'lock_repo_catalog', 'resolve_repo', 'repo_live', 'legacy_remote', 'session_directory_search_text')",
   },
   "upstream:20261105045030_session_consumer_project_text_grant.sql": {
     evidence: "search_consumer_runtime EXECUTE on sessions.session_directory_project_text (project-text index expression)",

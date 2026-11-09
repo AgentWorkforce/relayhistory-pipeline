@@ -1,6 +1,12 @@
 /** HoopDb access: a pg Pool that satisfies the vendored SqlExecutor, plus readiness gates. */
 import { readFileSync } from "node:fs";
-import { migrationChecksumMatches, resolveRenamedLedger, RUNTIME_APPLICATION_FUNCTIONS } from "../hoopdb/migrate-guards.ts";
+import {
+  CONSUMER_RUNTIME_FUNCTIONS,
+  CONSUMER_RUNTIME_FUNCTIONS_ROLE,
+  migrationChecksumMatches,
+  resolveRenamedLedger,
+  RUNTIME_APPLICATION_FUNCTIONS,
+} from "../hoopdb/migrate-guards.ts";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
@@ -130,11 +136,14 @@ export interface SchemaVerifierSql {searchWorker:string;tokenVerifier:string;ing
  * PUBLIC EXECUTE on every migrate, but a function created in sessions after a migrate,
  * outside the migrator, is PUBLIC-executable by PostgreSQL's built-in default until the
  * next migrate; this check turns readiness (and worker claiming) off at the next probe
- * instead (55000).
+ * instead (55000). The self-host consumer writers (CONSUMER_RUNTIME_FUNCTIONS) are accepted
+ * only when current_user is the consumer login (CONSUMER_RUNTIME_FUNCTIONS_ROLE); the PUBLIC and
+ * missing-ACL checks still apply to them for every role.
  */
-const RUNTIME_FUNCTION_REGPROCEDURES = RUNTIME_APPLICATION_FUNCTIONS.map(
-  (fn) => `'${fn.replaceAll("'", "''")}'::regprocedure`,
-).join(", ");
+const regprocedures = (fns: readonly string[]) =>
+  fns.map((fn) => `'${fn.replaceAll("'", "''")}'::regprocedure`).join(", ");
+const RUNTIME_FUNCTION_REGPROCEDURES = regprocedures(RUNTIME_APPLICATION_FUNCTIONS);
+const CONSUMER_FUNCTION_REGPROCEDURES = regprocedures(CONSUMER_RUNTIME_FUNCTIONS);
 
 export const SESSIONS_FUNCTION_GATE_SQL = `DO $sessions_fn_gate$
 DECLARE v text;
@@ -147,7 +156,9 @@ BEGIN
           OR (has_function_privilege(current_user, p.oid, 'EXECUTE')
               AND p.proowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
               AND NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
-              AND p.oid <> ALL (ARRAY[${RUNTIME_FUNCTION_REGPROCEDURES}]::oid[])));
+              AND p.oid <> ALL (ARRAY[${RUNTIME_FUNCTION_REGPROCEDURES}]::oid[])
+              AND NOT (current_user = '${CONSUMER_RUNTIME_FUNCTIONS_ROLE}'
+                       AND p.oid = ANY (ARRAY[${CONSUMER_FUNCTION_REGPROCEDURES}]::oid[]))));
   IF v IS NOT NULL THEN
     RAISE EXCEPTION USING ERRCODE = '55000',
       MESSAGE = 'live gate: sessions functions executable by PUBLIC or the runtime role: ' || v;
