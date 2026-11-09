@@ -2266,6 +2266,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const CG = "upstream:20261105043900_session_consumer_function_grants.sql";
     const SE = "upstream:20261105043910_selfhost_session_selection_erase.sql";
     const SL = "upstream:20261105044010_selfhost_erase_lock_fences.sql";
+    const OE = "upstream:20261105050000_operator_session_erase.sql";
+    const OF = "upstream:20261105050010_operator_session_erase_fence_check.sql";
     const BK = "upstream:20261105043880_ingest_bookkeeping_cleanup.sql";
     const GR = "upstream:20261105043890_buffered_search_gate_retired_witness.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
@@ -2274,7 +2276,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, OE, OF]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
@@ -2316,7 +2318,32 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105044010 (erase takes the fence lock) is the newest: 043910's down refuses (55000) while it is
+    // 20261105050010 (erase fence check) is the newest: 050000's down refuses (55000) while it is applied,
+    // and its own down restores 043850's claim/commit bodies and drops the session_index trigger.
+    const claimSrc = async () => (await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.ingest_claim_batch_mode(jsonb,text)'::regprocedure")).rows[0]!.s;
+    const indexGuard = async () => (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname='ingest_erase_fence_index_guard'")).rows[0]!.n;
+    expect(await claimSrc()).toContain("ingest_erase_fence_extend");
+    expect(await indexGuard()).toBe(1);
+    expect((await failure(rollback("20261105050000_operator_session_erase.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(OE);
+    await rollback("20261105050010_operator_session_erase_fence_check.down.sql");
+    expect(await names()).not.toContain(OF);
+    expect(await claimSrc()).not.toContain("ingest_erase_fence_extend");
+    expect(await indexGuard()).toBe(0);
+    expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_erase_fence_extend(text,text,text,text,jsonb)')::text AS p")).rows[0]!.p).toBeNull();
+    // Its ledger row is gone, so running it again refuses.
+    expect((await failure(rollback("20261105050010_operator_session_erase_fence_check.down.sql")))?.code).toBe("55000");
+    // 20261105050000 (operator per-session erase) is then the newest: 044010's down refuses (55000) while it is
+    // applied, and its own down drops the erase tables and functions.
+    expect(await relation("sessions.session_erasure_receipts")).toBe("sessions.session_erasure_receipts");
+    expect((await failure(rollback("20261105044010_selfhost_erase_lock_fences.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(SL);
+    await rollback("20261105050000_operator_session_erase.down.sql");
+    expect(await names()).not.toContain(OE);
+    expect(await relation("sessions.session_erasure_receipts")).toBeNull();
+    expect(await relation("sessions.session_erasure_fences")).toBeNull();
+    expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_operator_erase_session(text,text,text,text,text,text,text)')::text AS p")).rows[0]!.p).toBeNull();
+    // 20261105044010 (erase takes the fence lock) is then the newest: 043910's down refuses (55000) while it is
     // applied, and its own down restores 043910's exact body, without the lock.
     const eraseSrc = async () => (await db.query<{ s: string | null }>("SELECT prosrc s FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)')")).rows[0]!.s;
     expect(await eraseSrc()).toContain("ingest_lock_fences(v_org,v_ws,v_user)");
@@ -2716,7 +2743,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
 
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
-    // Newer than 043900, so its down refuses until they are rolled back, newest first: 044010, 044000, 043910.
+    // Newer than 043900, so its down refuses until they are rolled back, newest first: 050010, 050000, 044010, 044000, 043910.
+    const fenceCheckDown = readFileSync(join(root, "supabase/rollbacks/20261105050010_operator_session_erase_fence_check.down.sql"), "utf8");
+    const eraseDown = readFileSync(join(root, "supabase/rollbacks/20261105050000_operator_session_erase.down.sql"), "utf8");
     const lockDown = readFileSync(join(root, "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql"), "utf8");
     const readTokensDown = readFileSync(join(root, "supabase/rollbacks/20261105044000_read_api_tokens.down.sql"), "utf8");
     const newerDown = readFileSync(join(root, "supabase/rollbacks/20261105043910_selfhost_session_selection_erase.down.sql"), "utf8");
@@ -2739,6 +2768,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       await db.exec(ET_BOOT);
       await runMigrations(client(db), { profile: SUPA_ET });
       expect(await holds(db)).toBe(true);
+      await db.exec(fenceCheckDown);
+      await db.exec(eraseDown);
       await db.exec(lockDown);
       expect(await failure(db.exec(readTokensDown))).toBeNull();
       await db.exec(newerDown);
@@ -2754,6 +2785,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       await runMigrations(client(db), { profile: SUPA_ET });
       await db.exec(`DROP OWNED BY search_consumer_runtime`);
       await db.exec(`DROP ROLE search_consumer_runtime`);
+      await db.exec(fenceCheckDown);
+      await db.exec(eraseDown);
       await db.exec(lockDown);
       expect(await failure(db.exec(readTokensDown))).toBeNull();
       await db.exec(newerDown);

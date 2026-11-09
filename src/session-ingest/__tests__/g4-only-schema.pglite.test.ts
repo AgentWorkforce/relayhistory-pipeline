@@ -106,6 +106,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105044010_selfhost_erase_lock_fences.sql",
       // Operator per-session erase: new tables and entry points; no ingest path calls them.
       "20261105050000_operator_session_erase.sql",
+      // Its fence check: re-replaces three 043850 functions (already listed below) and adds a session_index trigger.
+      "20261105050010_operator_session_erase_fence_check.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
