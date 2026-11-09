@@ -15,7 +15,7 @@ ClickHouse; this list never reads transcript content.
 | --- | --- | --- |
 | source (harness), latest model, counts, tokens, cost, first/last activity, users, machines | `session_directory` (20261030010000) | projector, from `session_index` |
 | project id, repository, branch | `session_directory` | `writeDirectoryCatalog` from the complete raw-record projection; pointer values are a fallback |
-| title | `session_directory.title` | projector (pointer title); the brief writer (feat/model-session-brief) projects the model-written title with precedence |
+| title | `session_directory.title` | native model title, latest pointer title, then current complete recorded catalog title (`recorded_catalog_title`) |
 | short summary | `session_directory.short_summary` (20261030020000) | `writeShortSummary` |
 | **agent names (several per session)** | **`session_directory.agent_names` + `session_directory_agents`** (new) | **`writeDirectoryCatalog`** |
 | **catalog models** | **`session_directory.catalog_models`** (new); the RPC returns them united with the pointer model | `writeDirectoryCatalog` |
@@ -228,3 +228,27 @@ privately. It is optional context and is not needed to follow this section.
   `search_session_directory` and is not here. The brief `generated_at`
   lives in `session_briefs`, owned by feat/model-session-brief. This RPC
   returns `short_summary_generated_at`.
+
+
+### Recorded title fallback (unreleased source proposal)
+
+The complete canonical catalog supplies its existing scrubbed `title` metadata to
+`recorded_catalog_title`; the list still serves `title` through its existing RPC.
+Both catalog writer paths bind the physical source to the logical session, current
+event epoch, live row and ready projection. Display priority is the native model
+brief, latest live pointer, then the recorded title. Replays and model quarantine
+recompute that priority instead of retaining a previous generated value.
+
+The recorded title is at most 90 UTF-16 code units, trimmed, and contains no control
+characters. Invalid titles are not inferred from prompts or transcript text. Source
+invalidation (including an epoch transition left marked ready) and tombstones clear
+the recorded slot; a new complete projection must
+rebuild it. If an authoritative title equals the invalidated recorded value, the
+trigger conservatively clears the displayed copy until the normal priority projector
+recomputes it; equality never decides normal ready publication priority.
+This adds no model call, project-ID inference, object read per list row,
+or database privilege. Local paths remain excluded from project IDs/keys.
+
+The test-only column/trigger proposal is not an independently numbered migration.
+It must be folded into the reserved, unapplied summary migration and qualified with
+that migration's generation, rollback and boundary manifest before deployment.

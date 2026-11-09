@@ -497,8 +497,8 @@ export async function recordBrief(
         generatedAt: new Date(),
       });
     } else if (outcome.status === "quarantined") {
-      // Fall back to the pointer title, and remove a description this stage wrote, so a
-      // quarantined brief leaves nothing searchable. Another producer's summary is kept.
+      // Fall back to the pointer then current recorded catalog title, and remove a description this stage wrote, so a
+      // quarantined generated text stays out of search. Another producer's summary is kept.
       await projectBriefTitle(client, key, null);
       await clearBriefDescription(client, key);
     }
@@ -554,7 +554,8 @@ async function clearBriefDescription(db: SqlExecutor, key: SessionDirectoryKey):
 
 /**
  * The brief title on the directory row (the projector keeps it: a brief title wins over
- * the pointer title). `null` restores the latest live pointer's title.
+ * the pointer title). `null` restores the latest live pointer title, then only the
+ * current complete recorded catalog title. It never reuses the old generated title.
  */
 async function projectBriefTitle(db: SqlExecutor, key: SessionDirectoryKey, title: string | null): Promise<void> {
   await db.query(
@@ -576,15 +577,16 @@ async function projectBriefTitle(db: SqlExecutor, key: SessionDirectoryKey, titl
           ORDER BY p.last_activity_at DESC, p.revision DESC, p.machine_id DESC LIMIT 1)) AS title
      )
      UPDATE sessions.session_directory AS d
-        SET title = t.title,
+        SET title = coalesce(t.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END),
             search_text = sessions.session_directory_search_text(
-              t.title, d.task_title, d.agent_name, d.project_id, d.git_repo, d.git_branch,
+              coalesce(t.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END), d.task_title, d.agent_name, d.project_id, d.git_repo, d.git_branch,
               d.model, d.short_summary),
             projected_at = now()
        FROM title_value AS t CROSS JOIN target AS target
       WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3
         AND d.session_id = target.session_id
-        AND d.deleted_at IS NULL AND d.title IS DISTINCT FROM t.title`,
+        AND d.deleted_at IS NULL AND d.title IS DISTINCT FROM
+          coalesce(t.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END)`,
     [...keyParams(key), title],
   );
 }

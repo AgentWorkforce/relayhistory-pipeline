@@ -343,7 +343,7 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     if(complete){
       const directoryKey={orgId:scope.orgId,workspaceId:scope.workspaceId,harness:scope.harness,sessionId:pointerSnapshot.canonicalId};
       const written=await (deps.writeEvents??writeDirectoryEvents)(tx,directoryKey,{sourceSessionId:scope.sessionId,expectedEpoch:pointerSnapshot.epoch,sources:s3.sources,events:s3.events});
-      if(written.written)await (deps.writeCatalog??directoryCatalogWriter(deps.desktopCatalog===true))(tx,directoryKey,s3.catalog,{expectedEpoch:pointerSnapshot.epoch});
+      if(written.written)await (deps.writeCatalog??directoryCatalogWriter(deps.desktopCatalog===true))(tx,directoryKey,s3.catalog,{expectedEpoch:pointerSnapshot.epoch,sourceSessionId:scope.sessionId});
       else {complete=false;s3.reasons.push("directory_event_sources_changed");await invalidateDirectoryEvents(tx,scope);}
     }
     // Only a complete pass makes the session current; any other leaves it owing one.
