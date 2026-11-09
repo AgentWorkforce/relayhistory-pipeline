@@ -1,0 +1,571 @@
+{
+  "version": 1,
+  "scope": {
+    "orgId": "synthetic-org",
+    "workspaceId": "synthetic-workspace"
+  },
+  "provenance": {
+    "kind": "synthetic",
+    "reader": "hand-authored regression fixture",
+    "capturedAt": "2026-11-08T00:00:00Z",
+    "expiresAt": "2099-01-01T00:00:00Z",
+    "userIds": [
+      "person-a",
+      "person-b"
+    ],
+    "selection": "Twelve deliberately constructed pairs; not a sample of production activity. Six opportunity types plus negative and uncertain controls.",
+    "complete": true
+  },
+  "sessions": [
+    {
+      "source": "synthetic",
+      "id": "collision-a",
+      "userId": "person-a",
+      "title": "collision task",
+      "repository": "https://git.example.test/demo/collision.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "collision-a-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "I am changing billing retries to stop after two failures in the charge handler.",
+          "files": [
+            {
+              "path": "src/handler.ts",
+              "operation": "write"
+            }
+          ],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "collision-b",
+      "userId": "person-b",
+      "title": "collision task",
+      "repository": "https://git.example.test/demo/collision.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "collision-b-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "I am changing billing retries to continue for five failures in the charge handler.",
+          "files": [
+            {
+              "path": "src/handler.ts",
+              "operation": "write"
+            }
+          ],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "duplicate-a",
+      "userId": "person-a",
+      "title": "duplicate task",
+      "repository": "https://git.example.test/demo/duplicate.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "duplicate-a-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Investigating upload stalls after manifest acknowledgement; I will trace the receipt checkpoint.",
+          "files": [],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "duplicate-b",
+      "userId": "person-b",
+      "title": "duplicate task",
+      "repository": "https://git.example.test/demo/duplicate.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "duplicate-b-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Investigating upload stalls after manifest acknowledgement; tracing the receipt checkpoint from scratch.",
+          "files": [],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "contract-a",
+      "userId": "person-a",
+      "title": "contract task",
+      "repository": "https://git.example.test/demo/contract-a.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "contract-a-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "The notification drawer is blocked until the alert cursor pagination contract is implemented.",
+          "files": [],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "contract-b",
+      "userId": "person-b",
+      "title": "contract task",
+      "repository": "https://git.example.test/demo/contract-b.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "contract-b-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Implementing the alert cursor pagination contract so the notification drawer can fetch results.",
+          "files": [],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "discovery-a",
+      "userId": "person-a",
+      "title": "discovery task",
+      "repository": "https://git.example.test/demo/discovery-a.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "discovery-a-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "finding",
+          "text": "Found why bearer refresh loops: the audience comparison includes a trailing slash. Normalize the origin before comparison.",
+          "files": [],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "discovery-b",
+      "userId": "person-b",
+      "title": "discovery task",
+      "repository": "https://git.example.test/demo/discovery-b.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "discovery-b-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Blocked debugging bearer refresh loops; audience comparison looks suspicious but the cause is unknown.",
+          "files": [],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "feature-a",
+      "userId": "person-a",
+      "title": "feature task",
+      "repository": "https://git.example.test/demo/feature-a.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "feature-a-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Building enterprise onboarding enrollment. Acceptance requires the device to appear before the first session upload.",
+          "files": [],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "feature-b",
+      "userId": "person-b",
+      "title": "feature task",
+      "repository": "https://git.example.test/demo/feature-b.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "feature-b-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Building enterprise onboarding ingestion. Need to agree when the enrolled device appears before the first session upload.",
+          "files": [],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "ownership-a",
+      "userId": "person-a",
+      "title": "ownership task",
+      "repository": "https://git.example.test/demo/ownership-a.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "ownership-a-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Search schema migration ownership belongs to the indexer agent; I am only updating the reader.",
+          "files": [],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "ownership-b",
+      "userId": "person-b",
+      "title": "ownership task",
+      "repository": "https://git.example.test/demo/ownership-b.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "ownership-b-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Search schema migration ownership belongs to the reader agent; I am only updating the indexer.",
+          "files": [],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "review-a",
+      "userId": "person-a",
+      "title": "review task",
+      "repository": "https://git.example.test/demo/review.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [
+        "[\"synthetic\",\"review-b\"]"
+      ],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "review-a-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Independent verification of the archive retention handler as assigned by the coordinator.",
+          "files": [
+            {
+              "path": "src/handler.ts",
+              "operation": "write"
+            }
+          ],
+          "taskRefs": []
+        }
+      ],
+      "relationshipsAvailableAt": "2026-11-07T10:00:00Z"
+    },
+    {
+      "source": "synthetic",
+      "id": "review-b",
+      "userId": "person-b",
+      "title": "review task",
+      "repository": "https://git.example.test/demo/review.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [
+        "[\"synthetic\",\"review-a\"]"
+      ],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "review-b-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Independent verification of the archive retention handler; coordinator requested separate conclusions.",
+          "files": [
+            {
+              "path": "src/handler.ts",
+              "operation": "write"
+            }
+          ],
+          "taskRefs": []
+        }
+      ],
+      "relationshipsAvailableAt": "2026-11-07T10:00:00Z"
+    },
+    {
+      "source": "synthetic",
+      "id": "reads-a",
+      "userId": "person-a",
+      "title": "reads task",
+      "repository": "https://git.example.test/demo/reads.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "reads-a-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Read the shared clock helper while adjusting keyboard shortcuts.",
+          "files": [
+            {
+              "path": "src/handler.ts",
+              "operation": "read"
+            }
+          ],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "reads-b",
+      "userId": "person-b",
+      "title": "reads task",
+      "repository": "https://git.example.test/demo/reads.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "reads-b-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Read the shared clock helper while changing invoice rounding.",
+          "files": [
+            {
+              "path": "src/handler.ts",
+              "operation": "read"
+            }
+          ],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "fork-a",
+      "userId": "person-a",
+      "title": "fork task",
+      "repository": "https://git.example.test/demo/fork-a.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "fork-a-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Changing the timeout handler for the desktop widget.",
+          "files": [
+            {
+              "path": "src/handler.ts",
+              "operation": "write"
+            }
+          ],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "fork-b",
+      "userId": "person-b",
+      "title": "fork task",
+      "repository": "https://git.example.test/demo/fork-b.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "fork-b-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Changing the timeout handler for the crawler scheduler.",
+          "files": [
+            {
+              "path": "src/handler.ts",
+              "operation": "write"
+            }
+          ],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "generic-a",
+      "userId": "person-a",
+      "title": "generic task",
+      "repository": "https://git.example.test/demo/generic.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "generic-a-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Investigating authentication settings for archived accounts.",
+          "files": [],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "generic-b",
+      "userId": "person-b",
+      "title": "generic task",
+      "repository": "https://git.example.test/demo/generic.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "generic-b-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Updating authentication settings for service identities.",
+          "files": [],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "unproven-a",
+      "userId": "person-a",
+      "title": "unproven task",
+      "repository": "https://git.example.test/demo/unproven.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "unproven-a-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Looking into delivery receipt latency.",
+          "files": [],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "unproven-b",
+      "userId": "person-b",
+      "title": "unproven task",
+      "repository": "https://git.example.test/demo/unproven.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "unproven-b-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Looking into delivery receipt latency.",
+          "files": [],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "future-a",
+      "userId": "person-a",
+      "title": "future task",
+      "repository": "https://git.example.test/demo/future.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "future-a-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T10:01:00Z",
+          "kind": "intent",
+          "text": "Blocked on nonce cache eviction after a reconnect.",
+          "files": [],
+          "taskRefs": []
+        }
+      ]
+    },
+    {
+      "source": "synthetic",
+      "id": "future-b",
+      "userId": "person-b",
+      "title": "future task",
+      "repository": "https://git.example.test/demo/future.git",
+      "visibility": "shared",
+      "relatedSessionKeys": [],
+      "complete": true,
+      "evidence": [
+        {
+          "id": "future-b-e1",
+          "at": "2026-11-07T10:00:00Z",
+          "availableAt": "2026-11-07T14:00:00Z",
+          "kind": "intent",
+          "text": "Found the nonce cache eviction cause after a reconnect: the generation check was stale.",
+          "files": [],
+          "taskRefs": []
+        }
+      ]
+    }
+  ]
+}

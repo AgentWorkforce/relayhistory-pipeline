@@ -36,7 +36,12 @@
     "migration:verify": "bun run src/migration/relayhistory-verify.ts",
     "migration:neon-s3-sync": "bun run src/migration/neon-s3-sync/main.ts",
     "migration:neon-s3-erasure": "bun run src/migration/neon-s3-erasure/main.ts",
-    "e2e:selfhost": "bun run e2e/selfhost/run.ts"
+    "e2e:selfhost": "bun run e2e/selfhost/run.ts",
+    "alerts:collect": "bun run src/overlap-alerts/cli.ts collect",
+    "alerts:eval": "bun run src/overlap-alerts/cli.ts eval",
+    "alerts:import": "bun run src/overlap-alerts/cli.ts import",
+    "alerts:erase": "bun run src/overlap-alerts/cli.ts erase",
+    "alerts:purge": "bun run src/overlap-alerts/cli.ts purge"
   },
   "dependencies": {
     "@96bulls/pipeline": "workspace:*",

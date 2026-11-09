@@ -8,3 +8,6 @@ dist/
 node_modules/
 vendor/relayhistory/target/
 supabase/.temp/
+
+# Private production-derived coordination datasets and alert runs.
+.overlap-eval/
