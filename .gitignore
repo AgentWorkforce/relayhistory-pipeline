@@ -5,6 +5,7 @@
 .env
 .env.*
 dist/
-node_modules/
+# No trailing slash: also matches node_modules symlinks (a trailing slash matches directories only).
+node_modules
 vendor/relayhistory/target/
 supabase/.temp/
