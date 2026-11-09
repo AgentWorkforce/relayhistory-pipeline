@@ -1,11 +1,11 @@
 /**
- * The output facts bootstrap's SQL on PGlite with every migration (045020 included, applied
+ * The output facts bootstrap's SQL on PGlite with every migration (045040 included, applied
  * the way src/hoopdb/__tests__/selfhost-output-facts.pglite.test.ts applies it) plus the
  * consumer bootstrap's service tables: the Phase A enqueue into the consumer's pending queue,
  * the progress counts, the Phase B watermark (written only for complete workspaces, never
  * lowered, tombstoned sessions ignored, idempotent), and the owner and ledger gates.
  *
- * State rows are seeded directly as the superuser: the 045020 writers are the consumer's
+ * State rows are seeded directly as the superuser: the 045040 writers are the consumer's
  * (runtime role only) and are covered by selfhost-output-facts.pglite.test.ts; this job
  * never calls them.
  */

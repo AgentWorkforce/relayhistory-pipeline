@@ -6,7 +6,7 @@
  * Sessions ingested before RELAYHISTORY_SELFHOST_OUTPUT_FACTS was turned on have no facts,
  * and nothing marks a workspace's facts complete. This job closes both gaps, in two phases:
  *
- * Phase A, reprojection (enqueue, never inline). The migration 045020 writers refuse every
+ * Phase A, reprojection (enqueue, never inline). The migration 045040 writers refuse every
  * role except search_consumer_runtime, the owner included, so this job never writes facts.
  * It reuses the consumer's own durable replay queue, sessions.search_consumer_pending: one
  * row per live manifest key of every live directory session whose facts state is missing,
@@ -47,8 +47,8 @@ import { CONSUMER_OUTPUT_FACTS_VAR, consumerServiceConfig } from "./consumer-con
 export const SERVICE = "session-pipeline-output-facts-bootstrap";
 export const DEADLINE_VAR = "RELAYHISTORY_SELFHOST_OUTPUT_FACTS_BOOTSTRAP_DEADLINE_SECONDS";
 export const ALLOW_PARTIAL_VAR = "RELAYHISTORY_SELFHOST_OUTPUT_FACTS_BOOTSTRAP_ALLOW_PARTIAL";
-/** The ledger name of migration 045020; the job refuses unless it is recorded. */
-export const OUTPUT_FACTS_MIGRATION = "upstream:20261105045020_selfhost_output_facts.sql";
+/** The ledger name of migration 045040; the job refuses unless it is recorded. */
+export const OUTPUT_FACTS_MIGRATION = "upstream:20261105045040_selfhost_output_facts.sql";
 export const DEFAULT_DEADLINE_SECONDS = 7200;
 export const MAX_DEADLINE_SECONDS = 86_400;
 export const ENQUEUE_BATCH = 500;
@@ -109,12 +109,12 @@ interface Expected {
 }
 
 /**
- * 045020 is planned by this image and recorded in the ledger with a checksum the migrator
+ * 045040 is planned by this image and recorded in the ledger with a checksum the migrator
  * accepts: the same rename-alias and checksum rules as readiness (schemaVerdict).
  */
 export async function assertOutputFactsLedger(db: SqlExecutor, expected: Expected): Promise<void> {
   if (!expected.names.includes(OUTPUT_FACTS_MIGRATION))
-    throw new BootstrapRefused("this image does not plan migration 045020");
+    throw new BootstrapRefused("this image does not plan migration 045040");
   const { rows: table } = await db.query<{ t: string | null }>("SELECT to_regclass('sessions.__96bulls_migrations')::text AS t");
   if (!table[0]?.t) throw new BootstrapRefused("migration ledger missing: run hoopdb-migrate first");
   const physical = new Map(
@@ -125,7 +125,7 @@ export async function assertOutputFactsLedger(db: SqlExecutor, expected: Expecte
   const recorded = effective.get(OUTPUT_FACTS_MIGRATION);
   const planned = shas[OUTPUT_FACTS_MIGRATION];
   if (recorded === undefined || (planned !== undefined && !migrationChecksumMatches(OUTPUT_FACTS_MIGRATION, recorded, planned)))
-    throw new BootstrapRefused("migration 045020 is not recorded in the ledger: run hoopdb-migrate first");
+    throw new BootstrapRefused("migration 045040 is not recorded in the ledger: run hoopdb-migrate first");
 }
 
 /** Every relation this job reads or writes, all of which it must reach as their owner. */
@@ -140,7 +140,7 @@ export const BOOTSTRAP_RELATIONS = [
 /**
  * Owner proof: each relation exists (search_consumer_pending comes from the consumer
  * bootstrap) and the current role owns it without FORCE ROW LEVEL SECURITY, or is a
- * superuser. The 045020 tables have RLS on and no policy or grant, so only that identity
+ * superuser. The 045040 tables have RLS on and no policy or grant, so only that identity
  * can read the state rows or write the watermark. Catalog lookup by name, not to_regclass,
  * so a role without USAGE on the schema is refused (exit 2) rather than erroring (exit 1).
  */

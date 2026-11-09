@@ -1,7 +1,7 @@
 # Self-host output facts bootstrap
 
 `SERVICE=session-pipeline-output-facts-bootstrap` is a one-shot Job. It backfills output
-facts (migration `045020`) for sessions ingested before the consumer's facts flag was on,
+facts (migration `045040`) for sessions ingested before the consumer's facts flag was on,
 then writes the per-workspace watermark (`sessions.output_facts_workspace_state.complete_since`)
 that readers use to tell "no facts yet" apart from "no activity".
 Source: `src/session-pipeline/output-facts-bootstrap.ts`. Composition: section 7 of
@@ -19,7 +19,7 @@ and needs the database owner's explicit OK (on the 96Bulls dev stack, Khaliq's o
 
 Prerequisites, in order:
 
-1. `hoopdb-migrate` has applied `20261105045020_selfhost_output_facts.sql` (the ledger row is
+1. `hoopdb-migrate` has applied `20261105045040_selfhost_output_facts.sql` (the ledger row is
    checked against this image's checksum).
 2. `session-pipeline-consumer-bootstrap` has run (it creates `sessions.search_consumer_pending`).
 3. `session-pipeline-consumer` is running from the same image with
@@ -42,7 +42,7 @@ Same image, same env as `session-pipeline-consumer-bootstrap`:
 
 Load the secret from 1Password into the Job's Secret. Never write it to disk.
 
-Why it needs the owner identity: the `045020` tables have RLS on with no policy or grant, so
+Why it needs the owner identity: the `045040` tables have RLS on with no policy or grant, so
 only their owner (without FORCE RLS) or a superuser can read the session state or write the
 watermark. The Job checks this before anything else and refuses with exit 2 otherwise.
 
@@ -55,7 +55,7 @@ What it does:
    (`attempts 0`, due now, marker `output_facts_bootstrap`, `ON CONFLICT DO NOTHING`). It
    never touches existing rows, including dead ones. The consumer loads due rows on every
    tick and reprojects them through the normal search-index pass, which writes facts only
-   through the `045020` writers. The Job polls every 15 s until no session owes facts, the
+   through the `045040` writers. The Job polls every 15 s until no session owes facts, the
    backend's live queue is empty, or the deadline passes. It logs counts only.
 2. **Phase B, watermark.** In one transaction holding
    `pg_advisory_xact_lock(hashtextextended('output-facts-bootstrap', 0))`, it inserts,
@@ -70,7 +70,7 @@ What it does:
 | --- | --- | --- |
 | 0 | every workspace is marked, or was already marked (or partial was allowed) | verify, done |
 | 1 | failed (connection, SQL, unexpected error); the Phase B transaction rolled back | read the `error_code` in the log, fix, rerun |
-| 2 | refused: flag not exactly `true`, consumer config invalid or dormant, deadline or partial value invalid, `045020` not in the ledger or checksum mismatch, required table missing, or not the owner identity | fix the env, identity or migrate order; nothing was written |
+| 2 | refused: flag not exactly `true`, consumer config invalid or dormant, deadline or partial value invalid, `045040` not in the ledger or checksum mismatch, required table missing, or not the owner identity | fix the env, identity or migrate order; nothing was written |
 | 3 | some workspaces still owe facts; they got no watermark (the complete ones did) | check the consumer and the dead rows (below), then rerun |
 
 ## Verification

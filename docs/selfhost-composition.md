@@ -649,12 +649,12 @@ turned on, then records each fully covered workspace in
   `SESSION_POSTGRES_TLS_PROFILE`), with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS`
   exactly `true`. The secret's `hoopdb_url` must be the **owner** identity, the
   same one `session-pipeline-consumer-bootstrap` uses, not the consumer's runtime
-  role. The ledger must record migration `045020` with this image's checksum.
+  role. The ledger must record migration `045040` with this image's checksum.
 - **Phase A (reprojection):** this phase writes no facts itself. It queues the manifest
   of every live session that owes facts into `sessions.search_consumer_pending`, the
   running consumer's retry queue. The consumer (`SERVICE=session-pipeline-consumer`,
   with the facts flag on) then reprojects each one through the normal search-index
-  pass and the `045020` writers. The job polls until nothing is owed, the queue for
+  pass and the `045040` writers. The job polls until nothing is owed, the queue for
   its backend is empty, or
   `RELAYHISTORY_SELFHOST_OUTPUT_FACTS_BOOTSTRAP_DEADLINE_SECONDS` runs out
   (default 7200, range 1..86400).

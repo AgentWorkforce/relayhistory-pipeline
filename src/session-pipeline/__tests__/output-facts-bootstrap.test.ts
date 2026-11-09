@@ -83,11 +83,11 @@ describe("ledger gate", () => {
   });
   const expected = { names: ["upstream:20261025000000_sessions_index.sql", OUTPUT_FACTS_MIGRATION], shas: { [OUTPUT_FACTS_MIGRATION]: SHA } };
 
-  test("045020 recorded with the planned checksum passes", async () => {
+  test("045040 recorded with the planned checksum passes", async () => {
     await assertOutputFactsLedger(ledger(true, [{ name: OUTPUT_FACTS_MIGRATION, sha256: SHA }]), expected);
   });
 
-  test("refuses: image does not plan 045020, no ledger, not recorded, wrong checksum", async () => {
+  test("refuses: image does not plan 045040, no ledger, not recorded, wrong checksum", async () => {
     const refused = (p: Promise<void>) => expect(p).rejects.toBeInstanceOf(BootstrapRefused);
     await refused(assertOutputFactsLedger(ledger(true, [{ name: OUTPUT_FACTS_MIGRATION, sha256: SHA }]), { names: [] }));
     await refused(assertOutputFactsLedger(ledger(false, []), expected));
