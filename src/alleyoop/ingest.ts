@@ -78,6 +78,14 @@ export interface IngestOverrides {
  *    recomputed upload identity, chunk bounds, single-use ledger).
  *  - With `RELAYHISTORY_ORIGIN` set, the upload routes take only origin-bound
  *    assertions (or migration assertions), even with the interim bearer on.
+ *  - Relaycontrol user access tokens (`sh_at_`) are introspected against
+ *    `RELAYCONTROL_INTROSPECT_URL` only with
+ *    `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true` (default off), `aud` =
+ *    `RELAYHISTORY_ORIGIN`, the workspace from the optional
+ *    `x-relayhistory-workspace-id` header, and the caller-claimed `X-Machine-Id`
+ *    as `machine` (contract v1.2). The machine claim the live-write machine
+ *    gate reads comes only from relaycontrol's verified `machine_id`; without
+ *    one their writes are refused (machine_claim_refused); reads pass.
  */
 /** One row per day, org, caller and client version. Every use is a read. */
 function recordClaimlessUse(db: SqlExecutor, use: ClaimlessUse) {
@@ -128,6 +136,27 @@ export function assertIngestDestinations(env: NodeJS.ProcessEnv = process.env) {
     if (origin.replace(/\/$/, "").toLowerCase() !== url.origin)
       throw new Error("96bulls: RELAYHISTORY_ORIGIN must be an exact bare origin");
   }
+  // Relaycontrol introspection: in-cluster, so http needs ALLOW_IN_CLUSTER_HTTP
+  // and a Service name, as every other destination. Checked only when enabled.
+  if (relaycontrolEnabled(env)) {
+    const introspect = env.RELAYCONTROL_INTROSPECT_URL?.trim();
+    if (introspect)
+      assertDestinationUrl("RELAYCONTROL_INTROSPECT_URL", introspect, policy);
+  }
+}
+
+/** `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS`: exactly "true" enables; anything else is off. */
+export function relaycontrolEnabled(env: NodeJS.ProcessEnv = process.env) {
+  return env.RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS === "true";
+}
+
+/** The flag on with both introspection values set: relaycontrol can admit tokens. */
+export function relaycontrolConfigured(env: NodeJS.ProcessEnv = process.env) {
+  return (
+    relaycontrolEnabled(env) &&
+    !!env.RELAYCONTROL_INTROSPECT_URL?.trim() &&
+    !!env.RELAYCONTROL_INTROSPECT_SECRET?.trim()
+  );
 }
 
 export async function buildIngestApp(overrides: IngestOverrides = {}) {
@@ -204,14 +233,25 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
             process.env.RELAYHISTORY_MIGRATION_GRANTS,
         }
       : {}),
+    // Relaycontrol user access tokens: default off; only exactly "true" enables.
+    ...(relaycontrolEnabled()
+      ? {
+          RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS: "true",
+          RELAYCONTROL_INTROSPECT_URL: process.env.RELAYCONTROL_INTROSPECT_URL,
+          RELAYCONTROL_INTROSPECT_SECRET:
+            process.env.RELAYCONTROL_INTROSPECT_SECRET,
+        }
+      : {}),
     // The v2 pre-mint base read: its own default-off gate (issuer spec section 9).
     ...(process.env.RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ === "true"
       ? { RELAYHISTORY_ACCEPT_MIGRATION_BASE_READ: "true" }
       : {}),
   }) as unknown as Bindings;
-  if (!jwks && !process.env.RELAYAUTH_JWKS_URL)
+  // A self-host on relaycontrol alone needs no RelayAuth key source: RelayAuth
+  // JWTs then fail closed against the unserved loopback JWKS (401).
+  if (!jwks && !process.env.RELAYAUTH_JWKS_URL && !relaycontrolConfigured())
     throw new Error(
-      "96bulls: ingest needs JWKS_JSON, JWT_PRIVATE_KEY_PEM or RELAYAUTH_JWKS_URL",
+      "96bulls: ingest needs JWKS_JSON, JWT_PRIVATE_KEY_PEM, RELAYAUTH_JWKS_URL or relaycontrol introspection",
     );
 
   let db: SqlExecutor;

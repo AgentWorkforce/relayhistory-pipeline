@@ -16,9 +16,45 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "model_id", "tokens_in", "tokens_out",
   "count", "inserted", "deleted", "manifests", "claimed", "acked", "retried", "exhausted", "listed", "enqueued", "skipped", "failed",
   "state", "rule", "kind", "port", "ok", "reason", "key_sha256", "manifest_key_sha256",
-  "migration", "ledger_sha", "accepted_as_alias_of",
+  "migration", "ledger_name", "ledger_sha", "accepted_as_alias_of",
   "route", "correlation_id",
+  // Closed values only (src/session-ingest/db-error-class.ts): never a message or stack.
+  "db_error_class", "db_error_code", "db_error_basis", "error_name",
+  // Lock-wait alert line (session-ingest lockAlertFields): 55P03 / 57014 only.
+  "sqlstate",
+  // Read API buffered search gate (src/session-read-api/app.ts gatedPage): bounded counts only,
+  // see BOUNDED_COUNT_FIELDS.
+  "buffered_checked", "buffered_dropped",
 ]);
+
+/**
+ * Count fields that are emitted only as non-negative integers clamped to a ceiling. Anything else
+ * (a string, a fraction, NaN, a negative or non-number value) is dropped, so these fields can
+ * never carry free text or an identifier.
+ */
+export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
+  ["buffered_checked", 100_000],
+  ["buffered_dropped", 100_000],
+]);
+
+function boundedCount(v: unknown, max: number): number | undefined {
+  if (typeof v !== "number" || !Number.isInteger(v) || v < 0) return undefined;
+  return Math.min(v, max);
+}
+
+/**
+ * The one field rule shared by log lines (logLine/emit) and span attributes (telemetry.ts
+ * spanAttrs): the value to emit for `key`, or undefined to drop it. A key off the allowlist is
+ * dropped; a BOUNDED_COUNT_FIELDS key survives only as a clamped non-negative integer; a string
+ * is scrubbed and truncated. Other values pass through (callers narrow further by type).
+ */
+export function sanitizeLogField(key: string, value: unknown): unknown {
+  if (!ALLOWED_LOG_FIELDS.has(key) || value === undefined) return undefined;
+  const max = BOUNDED_COUNT_FIELDS.get(key);
+  if (max !== undefined) return boundedCount(value, max);
+  // Strings are scrubbed again before emit as a backstop; ids never match a rule.
+  return typeof value === "string" ? scrubText(value).slice(0, 256) : value;
+}
 
 export type Level = "debug" | "info" | "warn" | "error";
 const service = process.env.OTEL_SERVICE_NAME ?? "96bulls";
@@ -28,10 +64,8 @@ const deploymentId = process.env.DEPLOYMENT_ID ?? "local";
 function filter(fields: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(fields)) {
-    if (!ALLOWED_LOG_FIELDS.has(k)) continue;
-    if (v === undefined) continue;
-    // Strings are scrubbed again before emit as a backstop; ids never match a rule.
-    out[k] = typeof v === "string" ? scrubText(v).slice(0, 256) : v;
+    const safe = sanitizeLogField(k, v);
+    if (safe !== undefined) out[k] = safe;
   }
   return out;
 }

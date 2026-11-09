@@ -8,6 +8,7 @@ import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { runMigrations, generation } from "../../src/hoopdb/migrate.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../src/hoopdb/session-bootstrap-chain.ts";
 if (process.env.PGPROOF_AUTH_UPGRADE_DISPOSABLE !== "1")
   throw Error("disposable cluster opt-in required");
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -120,6 +121,19 @@ try {
         m[2] ? migrationFiles().map((f) => "supabase/migrations/" + f) : [m[1]],
       );
       assert(files.length > 2, "setup sequence empty");
+      // Fidelity binding: the operational T0 harness must provision exactly
+      // the single-sourced bootstrap chain (plus the test-only shim) before
+      // the migration chain. If the harness drifts, this fails explicitly
+      // instead of the grant migration failing closed downstream.
+      const expectedPrefix = [
+        "supabase/tests/supabase_shim.sql",
+        ...SESSION_BOOTSTRAP_FILES,
+      ];
+      const prefix = files.filter((f) => !f.startsWith("supabase/migrations/"));
+      assert(
+        JSON.stringify(prefix) === JSON.stringify(expectedPrefix),
+        "T0 harness drifted from session-bootstrap-chain.ts: " + JSON.stringify(prefix),
+      );
       for (const f of files) await c.query(read(f));
       assert(
         (

@@ -2,7 +2,24 @@ import { PGlite } from "@electric-sql/pglite";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { describe, expect, it } from "vitest";
 import { searchIndexConformance, syntheticDoc } from "../src/search-index/conformance.js";
-import { createPostgresSearchIndex, likeLiteral, planScopeReconcile, positionOf, type SqlClient } from "../src/search-index/index.js";
+import {
+  TENANT_SETTINGS_SQL,
+  createPostgresSearchIndex,
+  likeLiteral,
+  planScopeReconcile,
+  positionOf,
+  type SqlClient,
+  type TenantSqlRunner,
+} from "../src/search-index/index.js";
+
+/** One PGlite transaction per tenant call, with the tenant settings bound. */
+function pgliteTenants(db: PGlite): TenantSqlRunner {
+  return (orgId, workspaceId, work) =>
+    db.transaction(async (tx) => {
+      await tx.query(TENANT_SETTINGS_SQL, [orgId, workspaceId]);
+      return work(tx as unknown as SqlClient);
+    });
+}
 
 // In-process PGlite with pg_trgm (no database service). CI's pg-proof job
 // also runs this file against real PostgreSQL 15/16/17 via
@@ -10,7 +27,7 @@ import { createPostgresSearchIndex, likeLiteral, planScopeReconcile, positionOf,
 searchIndexConformance("postgres (pglite + pg_trgm)", async () => {
   const db = new PGlite({ extensions: { pg_trgm } });
   await db.exec("CREATE EXTENSION IF NOT EXISTS pg_trgm");
-  return { adapter: createPostgresSearchIndex({ client: db as unknown as SqlClient }), dispose: () => db.close() };
+  return { adapter: createPostgresSearchIndex({ client: db as unknown as SqlClient, tenantRunner: pgliteTenants(db) }), dispose: () => db.close() };
 });
 
 describe("postgres search index specifics", () => {
@@ -45,7 +62,7 @@ describe("postgres search index specifics", () => {
     // planner picks for a tenant-filtered query is a cost decision on real stats.
     const db = new PGlite({ extensions: { pg_trgm } });
     await db.exec("CREATE EXTENSION IF NOT EXISTS pg_trgm");
-    const adapter = createPostgresSearchIndex({ client: db as unknown as SqlClient });
+    const adapter = createPostgresSearchIndex({ client: db as unknown as SqlClient, tenantRunner: pgliteTenants(db) });
     await adapter.ensureSchema();
     const docs = Array.from({ length: 2000 }, (_, i) =>
       syntheticDoc({ orgId: "o", workspaceId: "w", eventId: `p${i}`, tsMs: i, content: `row ${i} filler text ${i * 7919}` }),
@@ -61,5 +78,53 @@ describe("postgres search index specifics", () => {
     expect(text).toContain("transcript_events_content_trgm");
     expect(text).toContain("transcript_events_title_trgm");
     await db.close();
+  });
+
+  it("a client outside a transaction never silently erases, deletes or reads nothing: it throws tenant_unbound", async () => {
+    // The tenant settings are transaction-local; in autocommit they lapse
+    // before the next statement, and under forced RLS a DELETE would match
+    // nothing and report success. Each call must throw instead.
+    const db = new PGlite({ extensions: { pg_trgm } });
+    await db.exec("CREATE EXTENSION IF NOT EXISTS pg_trgm");
+    const bare = createPostgresSearchIndex({ client: db as unknown as SqlClient });
+    const bound = createPostgresSearchIndex({ client: db as unknown as SqlClient, tenantRunner: pgliteTenants(db) });
+    await bare.ensureSchema();
+    const doc = syntheticDoc({ orgId: "org-a", sessionId: "sa", content: "erasable" });
+    const tenant = { orgId: "org-a", workspaceId: doc.workspaceId };
+    const scope = { ...tenant, source: doc.source, sessionIds: ["sa"] };
+    const count = async () => Number((await db.query<{ n: string }>("SELECT count(*)::text AS n FROM search_index.transcript_events")).rows[0]!.n);
+    await bound.upsert([doc]);
+    const unbound = { code: "unavailable", detail: "tenant_unbound" };
+    await expect(bare.eraseScope(scope)).rejects.toMatchObject(unbound);
+    await expect(bare.deleteEvents(tenant, [positionOf(doc)])).rejects.toMatchObject(unbound);
+    await expect(bare.query({ tenant, order: "asc", limit: 1 })).rejects.toMatchObject(unbound);
+    await expect(bare.scanFingerprints(scope, { fromMs: 0, limit: 1 })).rejects.toMatchObject(unbound);
+    await expect(bare.upsert([{ ...doc, eventId: "other" }])).rejects.toMatchObject(unbound);
+    expect(await count()).toBe(1);
+    // Inside one transaction the same client binds the tenant and erases.
+    await db.transaction(async (tx) => {
+      await createPostgresSearchIndex({ client: tx as unknown as SqlClient }).eraseScope(scope);
+    });
+    expect(await count()).toBe(0);
+    await db.close();
+  });
+
+  it("a delete that removed fewer rows than it saw, or an erase that leaves a scope row, throws delete_incomplete", async () => {
+    // Inert fixture client: the settings check holds; only the counts differ.
+    const answer = (erase: { present: number; deleted: number }, left: number): SqlClient => ({
+      async query<T>(text: string) {
+        const rows = text.startsWith("WITH present AS") ? [{ bound: true, ...erase }]
+          : text.includes("AS bound, count(*)") ? [{ bound: true, n: left }]
+          : text.includes("AS bound") ? [{ bound: true }] : [];
+        return { rows: rows as T[] };
+      },
+    });
+    const doc = syntheticDoc({ orgId: "org-a", sessionId: "sa" });
+    const scope = { orgId: "org-a", workspaceId: doc.workspaceId, source: doc.source, sessionIds: ["sa"] };
+    const incomplete = { code: "unavailable", detail: "delete_incomplete", retryable: true };
+    await expect(createPostgresSearchIndex({ client: answer({ present: 2, deleted: 1 }, 0) }).eraseScope(scope)).rejects.toMatchObject(incomplete);
+    await expect(createPostgresSearchIndex({ client: answer({ present: 1, deleted: 1 }, 1) }).eraseScope(scope)).rejects.toMatchObject(incomplete);
+    await expect(createPostgresSearchIndex({ client: answer({ present: 1, deleted: 0 }, 0) }).deleteEvents(scope, [positionOf(doc)])).rejects.toMatchObject(incomplete);
+    await expect(createPostgresSearchIndex({ client: answer({ present: 1, deleted: 1 }, 0) }).eraseScope(scope)).resolves.toBeUndefined();
   });
 });

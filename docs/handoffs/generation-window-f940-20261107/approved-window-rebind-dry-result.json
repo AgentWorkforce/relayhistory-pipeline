@@ -1,0 +1,16 @@
+{
+  "mode": "dry",
+  "startedAt": "2026-11-07T22:52:52.652428+00:00",
+  "completedAt": "2026-11-07T22:52:56.324928+00:00",
+  "exitCode": 0,
+  "result": {
+    "from": "78c7b28e5ebce7f5f534a1f3f41a55845251e950b6c4c49f676f2bda358c91d6",
+    "to": "e778dbb6cb68bc0e8939797691565db0b1dd8d357d7d790b375036e0070923ce",
+    "policy": "rebound",
+    "admissionsRebound": 1031,
+    "admissionsTotal": 1031,
+    "dryRun": true
+  },
+  "stderrPresent": false,
+  "automaticRetry": false
+}

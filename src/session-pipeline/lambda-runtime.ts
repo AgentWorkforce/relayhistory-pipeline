@@ -6,14 +6,14 @@ import type { BatchResponse } from "./consumer.ts";
 
 export interface PipelineLambdaEvent {
   Records?: { messageId: string; body: string; eventSource?: string; attributes?: Record<string, string> }[];
-  reconcile?: unknown; brief?: unknown; sessionAnalysis?: unknown; analysisCache?: unknown; analysisCacheReconcile?: unknown; semanticCopy?: unknown;
+  reconcile?: unknown; brief?: unknown; sessionAnalysis?: unknown; analysisCache?: unknown; analysisCacheReconcile?: unknown; semanticCopy?: unknown; bufferedSearchFeed?: unknown;
   schedule?: string; analysisCursor?: unknown; cursor?: string; since?: string; link?: number;
 }
 export interface LambdaRuntimeBinding {
   handler(event: unknown): Promise<BatchResponse | void>;
 }
 export type PipelineInvoker = (event: PipelineLambdaEvent) => Promise<BatchResponse | { ok: boolean }>;
-const SCHEDULES = { reconcile: "reconcile", brief: "brief", "session-analysis": "sessionAnalysis", "analysis-cache": "analysisCache", "analysis-cache-reconcile": "analysisCacheReconcile", "semantic-copy": "semanticCopy" } as const;
+const SCHEDULES = { reconcile: "reconcile", brief: "brief", "session-analysis": "sessionAnalysis", "analysis-cache": "analysisCache", "analysis-cache-reconcile": "analysisCacheReconcile", "semantic-copy": "semanticCopy", "buffered-search-feed": "bufferedSearchFeed" } as const;
 type Schedule = keyof typeof SCHEDULES;
 
 function queueBody(item: Extract<WorkItem, { type: "manifest-landed" }>): string {

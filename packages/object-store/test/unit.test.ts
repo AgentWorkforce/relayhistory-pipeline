@@ -32,6 +32,27 @@ describe("SigV4", () => {
     );
   });
 
+  // Independently computed (Python hmac/hashlib): service "es", path double-encoded.
+  it("signs a non-S3 service with its scope and a double-encoded path", async () => {
+    const headers = new Headers();
+    await signRequest({
+      method: "POST",
+      url: new URL("https://search.example.com/my%2Findex/_search?refresh=true"),
+      headers,
+      payloadSha256: "015abd7f5cc57a2dd94b7590f04ad8084273905ee33ec5cebeae62276a97f862",
+      region: "us-east-1",
+      service: "es",
+      credentials: {
+        accessKeyId: "AKIDEXAMPLE",
+        secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+      },
+      now: new Date("2015-08-30T12:36:00Z"),
+    });
+    expect(headers.get("authorization")).toBe(
+      "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/es/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=0f6e7ef329ff450191ea48bd01cfaf45682547ada824f0c09480a0bdbf517132",
+    );
+  });
+
   // AWS's published "GET Object" header-auth example (range request).
   it("matches the AWS GET object header-signing test vector", async () => {
     const headers = new Headers({ range: "bytes=0-9" });

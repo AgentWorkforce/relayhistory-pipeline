@@ -30,6 +30,10 @@ export interface Sentinel {
 }
 
 export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
+  "upstream:20261105041000_ingest_privacy_authority.sql": {
+    evidence: "table sessions.ingest_privacy_authority + lazy-current adoption uses the EXACT source-table list (no prefix)",
+    sql: "SELECT to_regclass('sessions.ingest_privacy_authority') IS NOT NULL AND (SELECT count(*)=2 FROM pg_proc WHERE oid IN(to_regprocedure('sessions.ingest_lazy_user(jsonb,text,jsonb)'),to_regprocedure('sessions.ingest_lazy_begin(jsonb,text)')) AND position('NOT IN(''ingest_frozen_source_records''' in prosrc)>0 AND position('''ingest_frozen_source_owned_sessions'')' in prosrc)>0 AND position('NOT LIKE ''ingest' in prosrc)=0) AS applied",
+  },
   "upstream:20261105040000_ingest_lazy_source_tables.sql": {
     evidence: "replacement: lazy-current adoption checks exclude the source-side tables",
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lazy_user(jsonb,text,jsonb)') AND prosrc LIKE '%ingest_source_control_heads%') AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lazy_begin(jsonb,text)') AND prosrc LIKE '%ingest_source_control_heads%') AS applied",
@@ -38,6 +42,27 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105039000_buffered_gc_single_candidate.sql": {
     evidence: "replacement: GC claim has its single-candidate advisory admission domain",
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_buffer_gc_claim(jsonb)') AND prosecdef AND prosrc LIKE '%96bulls:buffer-gc-user-v1%') AS applied",
+  },
+  "upstream:20261105043850_ingest_acquisition_owner.sql": { evidence: "table sessions.ingest_acquisition_owners", sql: relation("sessions.ingest_acquisition_owners") },
+  "upstream:20261105043000_brief_titles.sql": { evidence: "column sessions.session_briefs.origin", sql: column("sessions.session_briefs", "origin") },
+  "upstream:20261105043500_lazy_claim_clock_narrowing.sql": {
+    evidence: "replacement: lazy claim reads the seat clock under KEY SHARE with one advisory lock per (org, workspace, origin)",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lazy_records(jsonb)') AND NOT prosecdef AND prosrc LIKE '%lazy-native-origin-v1%') AS applied",
+  },
+  "upstream:20261105043700_owner_buffered_read.sql": { evidence: "function sessions.buffered_sessions_for", sql: "SELECT to_regprocedure('sessions.buffered_sessions_for(text,timestamptz,text,text,integer,text,text,text,text,text,boolean,text)') IS NOT NULL AS applied" },
+  "upstream:20261105043800_lazy_ack_clock_no_key_update.sql": {
+    evidence: "replacement: staged ACK locks the seat clock FOR NO KEY UPDATE (claims' KEY SHARE no longer queues behind it), then the bounded origin advisory lock before any slot",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lazy_ack_batch(jsonb)') AND NOT prosecdef AND prosrc LIKE '%WHERE singleton FOR NO KEY UPDATE;%' AND prosrc LIKE '%pg_advisory_xact_lock(hashtextextended(jsonb_build_array(''96bulls:lazy-native-origin-v1'',p->>''org_id'',p->>''workspace_id'',p->>''origin_id'')::text,0));%') AS applied",
+  },
+  "upstream:20261105043860_buffered_search_gate.sql": { evidence: "function sessions.buffered_search_gate_for", sql: "SELECT to_regprocedure('sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)') IS NOT NULL AS applied" },
+  "upstream:20261105043870_buffered_search_feed_cursor.sql": { evidence: "table sessions.buffered_search_feed_cursors", sql: relation("sessions.buffered_search_feed_cursors") },
+  "upstream:20261105043880_ingest_bookkeeping_cleanup.sql": {
+    evidence: "table sessions.ingest_bookkeeping_retired_claims + Babysitter register carries the retirement interlock",
+    sql: "SELECT to_regclass('sessions.ingest_bookkeeping_retired_claims') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_babysitter_retention_register(jsonb)') AND prosecdef AND prosrc LIKE '%ingest_bookkeeping_claim_lock_key%') AS applied",
+  },
+  "upstream:20261105043890_buffered_search_gate_retired_witness.sql": {
+    evidence: "replacement: buffered_search_gate_for hides claims with an ingest_bookkeeping_retired_claims tombstone (drop reason retired)",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)') AND prosecdef AND prosrc LIKE '%ingest_bookkeeping_retired_claims%') AS applied",
   },
   "upstream:20261105024000_session_brief_documents.sql": { evidence: "table sessions.session_brief_document_outbox", sql: relation("sessions.session_brief_document_outbox") },
   "upstream:20261105025000_canonical_feature_journal.sql": { evidence: "table sessions.canonical_feature_journal", sql: relation("sessions.canonical_feature_journal") },
@@ -49,6 +74,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105036000_canonical_consumer_lease.sql": { evidence: "table sessions.canonical_feature_consumer_lease", sql: relation("sessions.canonical_feature_consumer_lease") },
   "upstream:20261105037000_session_directory_document_pool.sql": { evidence: "function sessions.canonical_feature_document_finish", sql: "SELECT to_regprocedure('sessions.canonical_feature_document_finish(bigint,jsonb,text,text,text,text,text)') IS NOT NULL AS applied" },
   "upstream:20261105038000_claim_attempt_records_retirement.sql": { evidence: "column sessions.ingest_claim_attempts.records_retired_at", sql: column("sessions.ingest_claim_attempts", "records_retired_at") },
+  "upstream:20261105042000_babysitter_evidence_retention.sql": { evidence: "table sessions.babysitter_retention_objects", sql: relation("sessions.babysitter_retention_objects") },
   "upstream:20261105010000_frozen_source_custody.sql": {evidence:"table sessions.ingest_frozen_source_completeness",sql:relation("sessions.ingest_frozen_source_completeness")},
   "upstream:20261104055000_lazy_current_custody.sql": {evidence:"table sessions.ingest_lazy_policy",sql:relation("sessions.ingest_lazy_policy")},
   "upstream:20261104054000_ingest_custody_baseline.sql": {evidence:"table sessions.ingest_custody_imports",sql:relation("sessions.ingest_custody_imports")},
@@ -174,16 +200,31 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
       "DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)",
     sql: column("sessions.session_summaries", "object_key"),
   },
+  "upstream:20261105043910_selfhost_session_selection_erase.sql": {
+    evidence: "CREATE FUNCTION: sessions.ingest_selfhost_set_session_uploads(jsonb) (self-host per-session erase)",
+    sql: "SELECT to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)') IS NOT NULL AS applied",
+  },
+  "upstream:20261105043900_session_consumer_function_grants.sql": {
+    evidence: "twelve search_consumer_runtime EXECUTEs (composed writer path)",
+    sql: "SELECT count(*) = 12 AS applied FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE n.nspname = 'sessions' AND r.rolname = 'search_consumer_runtime' AND a.privilege_type = 'EXECUTE'",
+  },
+  "upstream:20261105044000_read_api_tokens.sql": {
+    evidence: "table sessions.read_api_tokens",
+    sql: relation("sessions.read_api_tokens"),
+  },
   "upstream:20261105046000_analysis_jobs.sql": { evidence: "table sessions.session_analysis_jobs_v2", sql: relation("sessions.session_analysis_jobs_v2") },
 };
 
 /** The ALTER-only and replacement steps the CREATE inventory alone can't see. */
 export const NON_CREATE_STEPS = [
   "upstream:20261105039000_buffered_gc_single_candidate.sql",
+  "upstream:20261105043500_lazy_claim_clock_narrowing.sql",
+  "upstream:20261105043800_lazy_ack_clock_no_key_update.sql",
   "upstream:20261025000300_upsert_keep_on_null.sql",
   "upstream:20261030000000_relayhistory_machines_compat.sql",
   "upstream:20261102010000_session_directory_canonical_ids.sql",
   "upstream:20261102020000_session_brief_state.sql",
   "96bulls:0003_fanout_ledger.sql",
   "96bulls:0004_summary_pointers.sql",
+  "upstream:20261105043900_session_consumer_function_grants.sql",
 ] as const;

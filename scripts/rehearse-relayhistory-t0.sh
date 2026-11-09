@@ -54,6 +54,7 @@ step "target: 96Bulls supabase migrations (test-only role shim, then the role bo
 cat "$WORK/bulls/supabase/tests/supabase_shim.sql" "$WORK/bulls/supabase/bootstrap/session_directory_search_worker.sql" \
   "$WORK/bulls/supabase/bootstrap/session_token_verifier.sql" "$WORK/bulls/supabase/bootstrap/session_ingest_roles.sql" \
   "$WORK/bulls/supabase/bootstrap/session_read_api_roles.sql" \
+  "$WORK/bulls/supabase/bootstrap/session_consumer_roles.sql" \
   "$WORK/bulls"/supabase/migrations/*.sql | psql_in dst
 
 step "source and target: relayhistory-cloud runner over TCP"

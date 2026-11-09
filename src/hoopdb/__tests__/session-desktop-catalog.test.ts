@@ -4,6 +4,7 @@ import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
 import {
   directoryCatalogFromProjection,
   directoryCatalogWriter,
@@ -20,10 +21,7 @@ async function database(before?: string) {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   opened.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
-  await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
-  await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
-  await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
-  await db.exec(read("supabase/bootstrap/session_read_api_roles.sql"));
+  for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort())
     if (before === undefined || file < before)
       await db.exec(read("supabase/migrations/" + file));

@@ -72,6 +72,16 @@ export function sqlShortSummaryDirectory(db: HoopDb): ShortSummaryDirectory {
 }
 
 /**
+ * The directory provenance for a summary model: `bob-costas/<model>`, folded into the
+ * directory's source alphabet (lower-case `[a-z0-9._/-]`, at most 64 characters), since a
+ * model id may hold upper case or `:` (MODEL_PATTERN) that the directory would refuse.
+ * `extractive/v1` is unchanged.
+ */
+export function directorySource(model: string): string {
+  return `bob-costas/${model.toLowerCase().replace(/[^a-z0-9._/-]/g, "-")}`.slice(0, 64);
+}
+
+/**
  * Publish (or clear) the directory short summary. Idempotent: writeShortSummary only
  * replaces an older-or-equal generated_at, clearShortSummary is a no-op when empty.
  */
@@ -89,7 +99,7 @@ async function publishShortSummary(
     await directory.write({
       ...key,
       summary: ready.summary,
-      source: `bob-costas/${ready.model}`,
+      source: directorySource(ready.model),
       generatedAt: ready.generatedAt,
     });
   } catch (err) {
@@ -139,6 +149,7 @@ async function buildOutcome(
   m: ManifestV1,
   deps: BobCostasDeps,
   manifestKey: string,
+  orgId: string,
 ): Promise<Outcome> {
   const none = { tokensIn: 0, tokensOut: 0, records: 0 };
   // Scrub quarantine: an unscrubbed session is never read.
@@ -173,7 +184,13 @@ async function buildOutcome(
   }
   const digest = digestRecords(s.harness, lines);
   if (digest.records === 0) return { status: "empty", ...none };
-  const summary = await deps.summarizer.summarize(kind, digest);
+  // Ids only: the model summariser's per-org budget and per-session cap key on these.
+  // The summariser never throws for a model failure; it falls back to extractive.
+  const summary = await deps.summarizer.summarize(kind, digest, {
+    orgId,
+    sessionKey: JSON.stringify([s.workspace_id, s.harness, canonicalManifestIdentity(m).sessionId]),
+    traceId: m.trace_id,
+  });
   return {
     status: "ready",
     summary: summary.text,
@@ -345,7 +362,7 @@ export function bobCostasHandler(
       return { status: "skipped", reason: "summary_current" };
     }
 
-    const outcome = await buildOutcome(kind, m, deps, pointer.manifestKey);
+    const outcome = await buildOutcome(kind, m, deps, pointer.manifestKey, message.ctx.orgId);
     const loc = sessionLocation(m, pointer.manifestKey);
     const key = summaryObjectKey(loc, kind);
     const current = { revision: m.revision, manifestSha256: manifestSha256(m) };

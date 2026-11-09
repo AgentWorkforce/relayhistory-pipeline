@@ -60,8 +60,9 @@ Each guarantee below has a mutation in `scripts/aws-hardening-mutations.ts` (`--
    ```sh
    psql -v ON_ERROR_STOP=1 -X -d "$HOOPDB" -f supabase/bootstrap/session_read_api_role.sql
    psql -X -d "$HOOPDB" -c '\password bulls96_read_api'
-   psql -v ON_ERROR_STOP=1 -X -d "$HOOPDB" -f supabase/bootstrap/session_read_api_role_verify.sql   # NOTICE: PASS
+   PGOPTIONS='-c hoopdb.db_mode=supabase' psql -v ON_ERROR_STOP=1 -X -d "$HOOPDB" -f supabase/bootstrap/session_read_api_role_verify.sql   # NOTICE: PASS
    ```
+   The verifier refuses any member of `bulls96_read_api` (a member could `SET ROLE` into it); on Supabase PG16+ it tolerates only the non-assumable creator edge (member `postgres`, grantor `supabase_admin`, ADMIN without INHERIT or SET), and only with `hoopdb.db_mode=supabase` bound as above.
 3. **Inputs.** In `.96bulls/aws-sessions-prod/aws-inputs.json`, add:
    ```json
    "sessionReadApi": { "completeSince": "<backfill start, ISO UTC>" }
