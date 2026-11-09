@@ -42,6 +42,8 @@ import {
   scrubBufferedText,
   serviceBindingControlHead,
   sqlOwnerBufferedReads,
+  ownerBufferedStatementTimeoutMs,
+  OwnerBufferedStatementTimeoutError,
   type AuthorityHead,
   type BufferedStageRow,
 } from "../owner-buffered.ts";
@@ -684,6 +686,21 @@ describe("sqlOwnerBufferedReads", () => {
     expect(seen[2]!.params).toEqual(["ws-a", E1, E1, "9007199254740993", DIGEST, "selection", false, BASELINE, "2026-11-05T12:05:00.000000Z", "s", "codex", 100]);
     for (const p of ["p_workspace => $1", "p_cutover_epoch => $2", "p_head_epoch => $3", "p_head_version => $4::text", "p_head_digest => $5", "p_head_kind => $6", "p_head_pending => $7::boolean", "p_privacy_baseline_sha256 => $8", "p_cursor_ts => $9::timestamptz", "p_limit => $12::integer"])
       expect(BUFFERED_SESSIONS_SQL).toContain(p);
+  });
+  test("READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: unset is 2000; 2000..6000 accepted; anything else refused; the RPCs SET LOCAL it", async () => {
+    for (const v of [undefined, ""]) expect(ownerBufferedStatementTimeoutMs(v), String(v)).toBe(2000);
+    for (const n of [2000, 2001, 4500, 6000]) expect(ownerBufferedStatementTimeoutMs(String(n))).toBe(n);
+    for (const bad of ["1999", "6001", "0", "02000", " 3000", "3000 ", "3e3", "3000.0", "-3000", "10000", "on", "true"])
+      expect(() => ownerBufferedStatementTimeoutMs(bad), bad).toThrow(OwnerBufferedStatementTimeoutError);
+    // The error names the field, never the value.
+    try {
+      ownerBufferedStatementTimeoutMs("9999");
+    } catch (error) {
+      expect(String((error as Error).message)).not.toContain("9999");
+    }
+    const { run, seen } = runner([sessionRaw()]);
+    await sqlOwnerBufferedReads(run, { statementTimeoutMs: 5000 }).list(SCOPE, authority("7"), { limit: 10 });
+    expect(seen[0]!.sql).toBe("SET LOCAL statement_timeout = 5000");
   });
   test("both readers name the same authority args, baseline and kind included", () => {
     for (const p of ["p_cutover_epoch => $2", "p_head_epoch => $3", "p_head_version => $4::text", "p_head_digest => $5", "p_head_kind => $6", "p_head_pending => $7::boolean", "p_privacy_baseline_sha256 => $8"])

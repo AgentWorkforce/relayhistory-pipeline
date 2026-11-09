@@ -230,6 +230,37 @@ describe("entry and configuration", () => {
     }
   });
 
+  test("READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: unset keeps 2000; 2000..6000 is passed to the buffered RPCs; a bad value is a 503", async () => {
+    const seen: string[] = [];
+    const run = (async (_org: string, _ws: string, work: (q: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }>) => Promise<unknown>) =>
+      work(async (sql: string) => {
+        seen.push(sql);
+        return { rows: [] };
+      })) as never;
+    const keys = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", READ_API_OWNER_BUFFERED_WORKSPACES: "ws-a", INGEST_S3_BUCKET: "ingest-bucket-example", PIPELINE_RAW_S3_ACCESS_KEY_ID: "k", PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "s" };
+    const head = { cutoverEpoch: "1".repeat(64), privacyBaselineSha256: "4".repeat(64), head: null } as never;
+    const scope = { orgId: "org-a", workspaceId: "ws-a", userId: "u-1" };
+    for (const [flag, want] of [[undefined, 2000], ["", 2000], ["2000", 2000], ["5000", 5000], ["6000", 6000]] as const) {
+      seen.length = 0;
+      const d = ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: flag } as Env, run);
+      await d!.reads.list(scope, head, { limit: 1 }).catch(() => undefined);
+      expect(seen[0], String(flag)).toBe(`SET LOCAL statement_timeout = ${want}`);
+    }
+
+    const t = tenant();
+    const call = async (over: Partial<Env>) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}/v1/sessions/s-x/events?workspace=${t.ws}&source=claude`, { headers: { authorization: `Bearer ${await token(t)}` } }), { ...E, ...over }, ctx);
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    for (const bad of ["1999", "6001", "10000", "02000", " 3000", "on"]) {
+      const r = await call({ READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: bad });
+      expect(r.status, bad).toBe(503);
+      expect((await body(r)).error.code).toBe("backend_unavailable");
+    }
+  });
+
   test("READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY and _PHASE_LOG: default off leaves the deps unchanged; 2..32 and exactly \"1\" set them; a bad concurrency is a 503", async () => {
     const run = (async () => {
       throw new Error("no database in this test");
