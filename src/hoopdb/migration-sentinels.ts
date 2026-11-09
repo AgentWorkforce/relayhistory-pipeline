@@ -212,6 +212,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.read_api_tokens",
     sql: relation("sessions.read_api_tokens"),
   },
+  "upstream:20261105050000_operator_session_erase.sql": {
+    evidence: "table sessions.session_erasure_receipts (operator per-session erase)",
+    sql: relation("sessions.session_erasure_receipts"),
+  },
 };
 
 /** The ALTER-only and replacement steps the CREATE inventory alone can't see. */

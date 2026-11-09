@@ -103,6 +103,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105043910_selfhost_session_selection_erase.sql",
       // A new table and read API functions only; no ingest path touches them.
       "20261105044000_read_api_tokens.sql",
+      // Operator per-session erase: new tables and entry points; no ingest path calls them.
+      "20261105050000_operator_session_erase.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

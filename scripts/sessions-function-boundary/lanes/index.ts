@@ -23,6 +23,7 @@ import { semanticCopy } from "./semantic-copy.ts";
 import { ingestBookkeepingCleanup } from "./ingest-bookkeeping-cleanup.ts";
 import { bufferedSearchGateRetiredWitness } from "./buffered-search-gate-retired-witness.ts";
 import { selfhostSessionSelectionErase } from "./selfhost-session-selection-erase.ts";
+import { operatorSessionErase } from "./operator-session-erase.ts";
 
 /** Every lane the unified generator composes. Order does not affect the output. */
-export const LANES: readonly LaneManifest[] = [briefDocuments, ingestHistory, readApi, readApiTokens, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention, briefTitles, lazyClaimClockNarrowing, ownerBufferedRead, lazyAckClockNoKeyUpdate, acquisitionOwner, bufferedSearchGate, bufferedSearchFeed, ingestBookkeepingCleanup, bufferedSearchGateRetiredWitness, selfhostSessionSelectionErase];
+export const LANES: readonly LaneManifest[] = [briefDocuments, ingestHistory, readApi, readApiTokens, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention, briefTitles, lazyClaimClockNarrowing, ownerBufferedRead, lazyAckClockNoKeyUpdate, acquisitionOwner, bufferedSearchGate, bufferedSearchFeed, ingestBookkeepingCleanup, bufferedSearchGateRetiredWitness, selfhostSessionSelectionErase, operatorSessionErase];
