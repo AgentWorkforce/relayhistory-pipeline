@@ -2372,13 +2372,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const SF = "upstream:20261105044040_buffered_stages_session_first.sql";
     const SP = "upstream:20261105044050_selfhost_erase_short_summary_provenance.sql";
     const ST = "upstream:20261105044070_selfhost_erase_search_text_rebuild.sql";
+    const CS = "upstream:20261105044080_ingest_claim_sessions.sql";
+    const CR = "upstream:20261105044090_claim_sessions_reader.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
@@ -2423,12 +2425,55 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // A successor such as the read-only summary RPC must roll back first.
     // Preserve an explicit out-of-order refusal before using every successor's
     // guarded down script, so newer additive lanes need no fixture rewrites.
-    const newerThanSearchRebuild = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > ST).reverse();
-    if (newerThanSearchRebuild.length)
-      expect((await failure(rollback("20261105044070_selfhost_erase_search_text_rebuild.down.sql")))?.code).toBe("55000");
-    for (const { name } of newerThanSearchRebuild)
+    const newerThanClaimReaders = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > CR).reverse();
+    if (newerThanClaimReaders.length)
+      expect((await failure(rollback("20261105044090_claim_sessions_reader.down.sql")))?.code).toBe("55000");
+    for (const { name } of newerThanClaimReaders)
       await rollback(`${name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`);
-    expect((await names()).filter((n) => newerThanSearchRebuild.some((s) => s.name === n))).toEqual([]);
+    expect((await names()).filter((n) => newerThanClaimReaders.some((s) => s.name === n))).toEqual([]);
+    // 20261105044090 (claim sessions reader) is the newest: 044080's down refuses (55000) while it is applied, and its
+    // own down restores 044040's exact readers and 044080's exact guard (owner, SECURITY DEFINER and ACL unchanged),
+    // drops the refresh trigger and function, the read_enabled CHECK and column, and removes its ledger row.
+    const fnSrc = async (sig: string) => (await db.query<{ s: string | null; d: boolean | null }>("SELECT prosrc s,prosecdef d FROM pg_proc WHERE oid=to_regprocedure($1)", [sig])).rows[0] ?? null;
+    const readerSigs = ["sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)", "sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)"];
+    const crReaderAcl = async () => (await db.query<{ a: string }>("SELECT string_agg(coalesce(proacl::text,''),'|' ORDER BY oid) a FROM pg_proc WHERE oid IN (to_regprocedure($1),to_regprocedure($2))", readerSigs)).rows[0]!.a;
+    const readerObjects = async () => (await db.query<{ n: number }>("SELECT ((SELECT count(*) FROM pg_proc WHERE proname='ingest_batch_claim_sessions_refresh')+(SELECT count(*) FROM pg_trigger WHERE tgname='ingest_batch_claim_sessions_refresh')+(SELECT count(*) FROM pg_constraint WHERE conname='ingest_claim_sessions_policy_read_check')+(SELECT count(*) FROM pg_attribute WHERE attrelid=to_regclass('sessions.ingest_claim_sessions_policy') AND attname='read_enabled' AND NOT attisdropped))::int AS n")).rows[0]!.n;
+    const crAclBefore = await crReaderAcl();
+    expect(await readerObjects()).toBe(4);
+    for (const sig of readerSigs) expect((await fnSrc(sig))?.s).toContain("ingest_claim_sessions");
+    expect((await fnSrc("sessions.ingest_claim_sessions_policy_guard()"))?.s).toContain("NEW.read_enabled:=false;");
+    expect((await failure(rollback("20261105044080_ingest_claim_sessions.down.sql")))?.code).toBe("55000");
+    expect(await names()).toEqual(expect.arrayContaining([CS, CR]));
+    await rollback("20261105044090_claim_sessions_reader.down.sql");
+    expect(await names()).not.toContain(CR);
+    expect(await readerObjects()).toBe(0);
+    const sessionFirst = readFileSync(join(root, "supabase/migrations/20261105044040_buffered_stages_session_first.sql"), "utf8");
+    for (const sig of readerSigs) {
+      const f = await fnSrc(sig);
+      expect(f?.d).toBe(true);
+      expect(f?.s).not.toContain("ingest_claim_sessions");
+      expect(sessionFirst.includes(f!.s!)).toBe(true);
+    }
+    expect(await crReaderAcl()).toBe(crAclBefore);
+    const guardSrc = (await fnSrc("sessions.ingest_claim_sessions_policy_guard()"))!.s!;
+    expect(guardSrc).not.toContain("read_enabled");
+    expect(readFileSync(join(root, "supabase/migrations/20261105044080_ingest_claim_sessions.sql"), "utf8").includes(guardSrc)).toBe(true);
+    // Its ledger row is gone, so running it again refuses and changes nothing.
+    expect((await failure(rollback("20261105044090_claim_sessions_reader.down.sql")))?.code).toBe("55000");
+    // 20261105044080 (claim sessions side table) is the newest: 044070's down refuses (55000) while it is applied, and
+    // its own down drops the writer trigger, the side and policy tables and both functions, and removes its ledger row.
+    const claimSessionObjects = async () => (await db.query<{ n: number }>("SELECT ((SELECT count(*) FROM pg_proc WHERE proname LIKE 'ingest_claim_sessions_%')+(SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'ingest_claim_sessions_%')+(SELECT count(*) FROM pg_class WHERE relname LIKE 'ingest_claim_sessions%'))::int AS n")).rows[0]!.n;
+    expect(await relation("sessions.ingest_claim_sessions")).toBe("sessions.ingest_claim_sessions");
+    expect(await claimSessionObjects()).toBe(2 + 3 + 6); // 2 functions, 3 triggers, 2 tables + 2 pkeys + 2 indexes
+    expect((await failure(rollback("20261105044070_selfhost_erase_search_text_rebuild.down.sql")))?.code).toBe("55000");
+    expect(await names()).toEqual(expect.arrayContaining([ST, CS]));
+    await rollback("20261105044080_ingest_claim_sessions.down.sql");
+    expect(await names()).not.toContain(CS);
+    expect(await relation("sessions.ingest_claim_sessions")).toBeNull();
+    expect(await relation("sessions.ingest_claim_sessions_policy")).toBeNull();
+    expect(await claimSessionObjects()).toBe(0);
+    // Its ledger row is gone, so running it again refuses and changes nothing.
+    expect((await failure(rollback("20261105044080_ingest_claim_sessions.down.sql")))?.code).toBe("55000");
     // 20261105044070 (erase and retire fence rebuild search_text) is the newest: 044050's, 044040's and 044030's downs refuse
     // (55000) while it is applied, and its own down restores 044050's exact erase and retire trigger function (the
     // provenance clear, without the search_text rebuild; still SECURITY DEFINER, both triggers kept).
@@ -2938,7 +2983,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
     // Newer than 043900, so its down refuses until they are rolled back, newest first: every upstream step after
-    // 044020 (rollbackLaterThan044020: 044070, 044050, 044040, 044030), then 044020, 044010, 044000, 043910.
+    // 044020 (rollbackLaterThan044020: 044090, 044080, 044070, 044050, 044040, 044030), then 044020, 044010, 044000, 043910.
     const orgIndexesDown = readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8");
     const lockDown = readFileSync(join(root, "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql"), "utf8");
     const readTokensDown = readFileSync(join(root, "supabase/rollbacks/20261105044000_read_api_tokens.down.sql"), "utf8");
@@ -3579,7 +3624,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       expect(await ledgered(db)).toBe(false);
     });
 
-    test("a later slot (synthetic step, no migration file added) cannot break the previous release: its relation and function are modelled out of the ACL catalog and manifest", async () => {
+    test("a later slot (synthetic step, no migration file added) cannot break the previous release: its relation and function are modelled out of the ACL catalog and manifest (the control models out every other later step and leaves only the probe unmodelled)", async () => {
       // A future upstream slot creating a table (with its implied serial sequence) and a function, which a current
       // binary's catalog and manifest would list. Written under this test's own tmpdir, never under supabase/.
       const dir = mkdtempSync(join(tmpdir(), "prev-release-later-slot-"));
@@ -3588,16 +3633,26 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
 CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'SELECT 1';
 `);
       const probe = { name: "upstream:20261105099999_zz_future_probe.sql", path } as PlanStep;
+      // A second later step that also creates a table: it stands in for a real later slot on a branch that carries
+      // one. The negative control must keep failing on the probe alone, so this one is modelled out of the control.
+      const realLaterPath = join(dir, "20261105088888_zz_real_later.sql");
+      writeFileSync(realLaterPath, `CREATE TABLE sessions.zz_real_later (id bigserial PRIMARY KEY, v text);
+`);
+      const realLater = { name: "upstream:20261105088888_zz_real_later.sql", path: realLaterPath } as PlanStep;
       const real = await plan(SUPA_ET);
-      const full = [...real, probe];
+      const full = [...real, realLater, probe];
       const manifest = await migrateGuards.sessionsFunctionAclManifest();
       const catalog = migrateGuards.runtimeApplicationAclCatalog();
       const current = {
         manifest: { ...manifest, "sessions.zz_future_probe_fn()": ["<owner>:EXECUTE", "service_role:EXECUTE"] },
         catalog: {
-          tables: { ...catalog.tables, "sessions.zz_future_probe": ["SELECT", "INSERT"] },
-          sequences: [...catalog.sequences, "sessions.zz_future_probe_id_seq"],
-          rlsTables: [...catalog.rlsTables, "sessions.zz_future_probe"],
+          tables: {
+            ...catalog.tables,
+            "sessions.zz_real_later": ["SELECT", "INSERT"],
+            "sessions.zz_future_probe": ["SELECT", "INSERT"],
+          },
+          sequences: [...catalog.sequences, "sessions.zz_real_later_id_seq", "sessions.zz_future_probe_id_seq"],
+          rlsTables: [...catalog.rlsTables, "sessions.zz_real_later", "sessions.zz_future_probe"],
           functions: [...catalog.functions, "sessions.zz_future_probe_fn()"],
         },
       };
@@ -3605,8 +3660,10 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
       // manifest and catalog with the same later steps.
       const laterSteps = laterUpstream(full, SF);
       expect(laterSteps.map((s) => s.name)).toContain(probe.name);
+      expect(laterSteps.map((s) => s.name)).toContain(realLater.name);
       const derived = previousReleaseAcl(laterSteps, current.manifest, current.catalog);
       expect([...derived.laterRels]).toContain("sessions.zz_future_probe");
+      expect([...derived.laterRels]).toContain("sessions.zz_real_later");
       expect([...derived.laterFns]).toContain("sessions.zz_future_probe_fn");
       expect(Object.keys(derived.previousManifest)).not.toContain("sessions.zz_future_probe_fn()");
       expect(Object.keys(derived.previousCatalog.tables)).not.toContain("sessions.zz_future_probe");
@@ -3614,14 +3671,19 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
       expect(derived.previousCatalog.rlsTables).not.toContain("sessions.zz_future_probe");
       expect(derived.previousCatalog.functions).not.toContain("sessions.zz_future_probe_fn()");
       expect(derived).toEqual(previousReleaseAcl(laterSteps, manifest, catalog) as typeof derived);
-      // Negative control: the same truncated migrate with the current (unmodelled) catalog and manifest fails on the
-      // relation the truncated plan never created (42P01), which is the defect the model prevents.
+      // Negative control: the same truncated migrate, with every OTHER later step modelled out of the catalog and
+      // manifest and only the probe left unmodelled, fails on the relation the truncated plan never created (42P01),
+      // which is the defect the model prevents. Modelling out the other later steps keeps the failure on the probe
+      // however many real later slots a branch carries (their grants would otherwise fail first, with another message).
       const db = await supabaseLike();
       await db.exec(ET_BOOT);
       const steps = full.filter((s) => s.name !== SF && !laterSteps.includes(s));
       expect(steps).not.toContain(probe);
-      const unmodelledManifest = spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(current.manifest);
-      const unmodelledCatalog = spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(current.catalog);
+      const control = previousReleaseAcl(laterSteps.filter((s) => s !== probe), current.manifest, current.catalog);
+      expect([...control.laterRels]).toContain("sessions.zz_real_later");
+      expect([...control.laterRels]).not.toContain("sessions.zz_future_probe");
+      const unmodelledManifest = spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(control.previousManifest);
+      const unmodelledCatalog = spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(control.previousCatalog);
       try {
         const error = await failure(runMigrations(client(db), { profile: SUPA_ET, steps }));
         expect(error?.code).toBe("42P01");
@@ -3635,6 +3697,7 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
       const modelled = await previousRelease(full, current);
       expect(await ledgered(modelled)).toBe(false);
       expect((await modelled.query<{ r: string | null }>("SELECT to_regclass('sessions.zz_future_probe')::text r")).rows[0]!.r).toBeNull();
+      expect((await modelled.query<{ r: string | null }>("SELECT to_regclass('sessions.zz_real_later')::text r")).rows[0]!.r).toBeNull();
       expect((await modelled.query<{ p: string | null }>("SELECT to_regprocedure('sessions.zz_future_probe_fn()')::text p")).rows[0]!.p).toBeNull();
       expect(migrateGuards.runtimeApplicationAclCatalog()).toEqual(catalog);
       expect(await migrateGuards.sessionsFunctionAclManifest()).toEqual(manifest);

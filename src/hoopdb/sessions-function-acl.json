@@ -325,6 +325,9 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_batch_claim_sessions_refresh()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_batch_key(jsonb)": [
       "<owner>:EXECUTE"
     ],
@@ -408,6 +411,12 @@
     "sessions.ingest_claim_buffered_batch(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_claim_sessions_policy_guard()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_claim_sessions_sync()": [
+      "<owner>:EXECUTE"
     ],
     "sessions.ingest_commit_batch(jsonb)": [
       "<owner>:EXECUTE",
