@@ -31,7 +31,9 @@
 --                                                whose from = g and whose to = the marker's generation, with
 --                                                the marker 'pass' (or 'pending' when the owner opted into
 --                                                admitDuringApply), and only for the two runtime ingest roles
---                                                (bulls96_session_ingest, bulls96_babysitter_retention).
+--                                                (bulls96_session_ingest, bulls96_babysitter_retention); while
+--                                                'pending', only for the buffered upload entry points (never
+--                                                canonical publication or any other fence caller).
 --
 -- What it replaces (same signature, owner and ACL kept; CREATE OR REPLACE):
 --   sessions.ingest_require_generation(text)  exact PASS equality as before, OR the window's `from`.
@@ -179,14 +181,32 @@ CREATE TRIGGER ingest_generation_overlap_policy_retire BEFORE INSERT OR UPDATE O
 -- The one admission predicate. Owner-only invoker helper: callers are the two replaced fence helpers.
 -- FOR SHARE on the window row: a close (UPDATE) waits for every in-flight admitted transaction, and once it
 -- commits no transaction admitted by that window can start.
+-- While the marker is still 'pending' (admitDuringApply: the apply is not yet verified) the window admits
+-- only the Worker's buffered upload entry points: the OUTERMOST sessions function on the call stack must be
+-- one of them, and no publication, history, project-event or Babysitter-retention function may be on it.
+-- Canonical publication and every other caller of the shared fence stay on the strict fence until PASS.
+-- The stack is the server's own PG_CONTEXT; a runtime role cannot create a function in schema sessions, so
+-- it cannot fake a sessions frame. Anything unrecognized is refused (fail closed).
 CREATE FUNCTION sessions.ingest_generation_overlap_admits(p_generation text,p_marker_generation text,p_marker_status text) RETURNS boolean
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $overlap_admits$
+DECLARE v_ctx text;v_frames text[];
 BEGIN
  IF p_generation IS NULL OR p_generation!~'^[0-9a-f]{64}$' OR p_marker_generation IS NULL
   OR p_marker_status IS NULL OR p_marker_status NOT IN('pass','pending') OR p_generation=p_marker_generation THEN RETURN false;END IF;
  -- Runtime ingest roles only: owner/operator paths (seat initialize, policy set) stay on exact PASS.
  IF coalesce(nullif(current_setting('role',true),'none'),session_user::text) NOT IN('bulls96_session_ingest','bulls96_babysitter_retention')
  THEN RETURN false;END IF;
+ IF p_marker_status='pending' THEN
+  GET DIAGNOSTICS v_ctx=PG_CONTEXT;
+  SELECT array_agg(t.m[1] ORDER BY t.n) INTO v_frames
+   FROM regexp_matches(v_ctx,'(?:^|\n)PL/pgSQL function (sessions\.[a-z_0-9]+)\(','g') WITH ORDINALITY AS t(m,n);
+  IF v_frames IS NULL OR v_frames[array_upper(v_frames,1)] NOT IN(
+    'sessions.ingest_claim_buffered_batch','sessions.ingest_prepare_buffer_stage','sessions.ingest_commit_buffered_batch',
+    'sessions.ingest_set_session_uploads','sessions.ingest_reset_uploaded_sessions')
+   OR EXISTS(SELECT 1 FROM unnest(v_frames) AS f(x)
+    WHERE f.x~'^sessions\.(ingest_publication_|ingest_history_|session_history_|canonical_project_events_|ingest_babysitter_retention_)')
+  THEN RETURN false;END IF;
+ END IF;
  PERFORM 1 FROM sessions.ingest_generation_overlap_windows w
   WHERE w.closed_at IS NULL AND w.expires_at>clock_timestamp()
    AND w.from_generation=p_generation AND w.to_generation=p_marker_generation

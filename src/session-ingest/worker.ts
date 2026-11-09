@@ -270,11 +270,12 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
 /**
  * INGEST_ACCEPT_GENERATIONS: unset, or a comma list of 1-2 distinct explicit lowercase hex64 generations that
  * includes INGEST_EXPECT_GENERATION, in buffered mode only. Anything else (a wildcard, a third value, a value
- * without the expected generation, whitespace inside a value) is a configuration error, never a widening.
+ * without the expected generation, whitespace inside a value, an explicitly empty value) is a configuration
+ * error, never a silent narrowing or widening.
  */
 export function acceptedGenerations(env: Pick<IngestWorkerEnv, "INGEST_ACCEPT_GENERATIONS" | "INGEST_EXPECT_GENERATION">, acceptanceMode: string): readonly string[] | undefined {
   const raw = env.INGEST_ACCEPT_GENERATIONS;
-  if (raw === undefined || raw === "") return undefined;
+  if (raw === undefined) return undefined;
   if (acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_ACCEPT_GENERATIONS needs buffered acceptance");
   const list = raw.split(",");
   if (list.length < 1 || list.length > 2 || !list.every((g) => /^[0-9a-f]{64}$/.test(g)) || new Set(list).size !== list.length

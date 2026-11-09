@@ -14,7 +14,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105044030_ingest_generation_overlap.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='generation overlap: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105044030_ingest_generation_overlap.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'02f24daf5c366aceb719f9b119121d533ca4e5ac21fe4999df490eda6beeb20b'
+ IF NOT FOUND OR v_sha<>'cd18205603e6ad192654ecac57619b7a3a99c2b7be008cbdcb4399f6fa8c9d47'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='generation overlap: own applied checksum required';END IF;
  UPDATE sessions.__96bulls_role_validation SET status='pending',updated_at=clock_timestamp() WHERE name='session_directory_search_worker';
  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='generation overlap: validation marker required';END IF;
@@ -54,5 +54,5 @@ DROP FUNCTION sessions.ingest_generation_overlap_policy_retire();
 DROP FUNCTION sessions.ingest_generation_overlap_admits(text,text,text);
 DROP FUNCTION sessions.ingest_generation_overlap_open(jsonb);
 DROP FUNCTION sessions.ingest_generation_overlap_close(jsonb);
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105044030_ingest_generation_overlap.sql' AND sha256='02f24daf5c366aceb719f9b119121d533ca4e5ac21fe4999df490eda6beeb20b';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105044030_ingest_generation_overlap.sql' AND sha256='cd18205603e6ad192654ecac57619b7a3a99c2b7be008cbdcb4399f6fa8c9d47';
 COMMIT;

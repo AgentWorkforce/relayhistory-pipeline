@@ -101,6 +101,27 @@ test("zero-503 window: a Worker at A keeps admitting while the DB moves to B; {B
  expect(await rebindIngestGeneration(f.client,{from:A,to:B})).toMatchObject({policy:"already",overlapClosed:false});
 });
 
+test("admitDuringApply admits only buffered upload entry points while B is pending: canonical publication stays on the strict fence until PASS",async()=>{
+ const f=await fixture();
+ await openGenerationOverlap(f.client,{from:A,to:B,ttlSeconds:600,admitDuringApply:true,approvalSha256:APPROVAL});
+ const input=(g:string)=>JSON.stringify({limit:1,generation:g,keyRoot:"96bulls",bucket:"b",region:"r"});
+ const candidates=(g:string)=>f.run("SELECT sessions.ingest_publication_candidates($1::jsonb) AS r",[input(g)]);
+ const refusal=async(p:Promise<unknown>)=>{try{await p;return null}catch(e){return [(e as {code?:string}).code,String((e as Error).message)]}};
+ // Before the apply: A is the PASS generation, publication at A is served.
+ expect(await refusal(candidates(A))).toBeNull();
+ await f.marker(B,"pending");
+ // An upload at A is admitted through the window (a buffered entry point)...
+ await f.ok(f.worker(A));
+ // ...but a publication call at A is refused exactly as without a window: never during the unverified apply.
+ expect(await refusal(candidates(A))).toEqual(["55000","session ingest: generation not ready"]);
+ // The same refusal when a non-sessions wrapper (a DO block) makes the publication call.
+ expect(await code(f.run("DO $w$ BEGIN PERFORM sessions.ingest_publication_candidates('"+input(A)+"'::jsonb);END $w$"))).toBe("55000");
+ // Once B has PASSED, the window admits A for publication too (until the rebind closes it).
+ await f.marker(B,"pass");
+ expect(await refusal(candidates(A))).toBeNull();
+ await f.ok(f.worker(A));
+});
+
 test("admitDuringApply false: the old generation is admitted only once B has PASSED (never during the apply)",async()=>{
  const f=await fixture();
  await openGenerationOverlap(f.client,{from:A,to:B,ttlSeconds:600,admitDuringApply:false,approvalSha256:APPROVAL});
@@ -239,7 +260,7 @@ test("Worker config: INGEST_ACCEPT_GENERATIONS is 1-2 explicit hex64 values incl
  expect(acceptedGenerations({INGEST_EXPECT_GENERATION:A},"buffered")).toBeUndefined();
  expect(acceptedGenerations({INGEST_EXPECT_GENERATION:A,INGEST_ACCEPT_GENERATIONS:`${A},${B}`},"buffered")).toEqual([A,B]);
  expect(acceptedGenerations({INGEST_EXPECT_GENERATION:A,INGEST_ACCEPT_GENERATIONS:`${B},${A}`},"buffered")).toEqual([B,A]);
- for(const bad of ["*",`${A},*`,`${A},${B},${C}`,`${B},${C}`,`${A},${A}`,`${A}, ${B}`,`${A},`,A.toUpperCase(),`${A};${B}`])
+ for(const bad of ["","*",`${A},*`,`${A},${B},${C}`,`${B},${C}`,`${A},${A}`,`${A}, ${B}`,`${A},`,A.toUpperCase(),`${A};${B}`])
   expect(()=>acceptedGenerations({INGEST_EXPECT_GENERATION:A,INGEST_ACCEPT_GENERATIONS:bad},"buffered")).toThrow();
  expect(()=>acceptedGenerations({INGEST_EXPECT_GENERATION:A,INGEST_ACCEPT_GENERATIONS:A},"canonical")).toThrow();
  const run=async()=>({rows:[]});

@@ -129,7 +129,14 @@ ACL manifest shows `<owner>:EXECUTE` only.
   - a window is open and unexpired;
   - the window's `from` = g, and the window's `to` = the marker's current generation;
   - the marker is `pass`, or it is `pending` and the owner chose `admitDuringApply`;
-  - the caller is a runtime ingest role (`bulls96_session_ingest`, `bulls96_babysitter_retention`).
+  - the caller is a runtime ingest role (`bulls96_session_ingest`, `bulls96_babysitter_retention`);
+  - while the marker is `pending`, the call is a buffered upload: the outermost `sessions` function on the
+    server's call stack (`PG_CONTEXT`) is one of `ingest_claim_buffered_batch`, `ingest_prepare_buffer_stage`,
+    `ingest_commit_buffered_batch`, `ingest_set_session_uploads` or `ingest_reset_uploaded_sessions`, and no
+    publication, history, project-event or Babysitter-retention function is on the stack. Canonical
+    publication and every other caller of the shared fence stay strict until PASS, so nothing but buffered
+    uploads persists during an unverified apply. A runtime role cannot create a function in `sessions`, so it
+    cannot fake a frame; an unrecognized stack is refused.
 
   It takes the window row `FOR SHARE`. Owner and operator paths (seat initialize, policy set) never use the
   window.
@@ -290,6 +297,8 @@ that covers steps 3–5. The maximum is 4 h.
   - After the rebind, G is refused and H and `{H,G}` admit. Attempts are recorded at the generation each
     claim was admitted with.
   - `admitDuringApply=false`: G is refused during pending and admitted after PASS.
+  - `admitDuringApply=true`: during pending, a G upload is admitted but a G publication call is refused 55000,
+    directly or from a DO-block wrapper. After PASS it is admitted.
   - The window bridges only `from → marker`. A third generation is never admitted.
   - Owner close and expiry both refuse G again. `open` sweeps an expired window.
   - Owner-only: the ingest role cannot execute, read or insert, and a granted non-owner still gets 42501.
