@@ -1,6 +1,16 @@
 -- Amazon RDS for PostgreSQL entry point for the dedicated HoopDb runtime role
 -- (HOOPDB_DB_MODE=rds; RDS for PostgreSQL only, NOT Aurora).
 --
+-- MASTER-OWNER LAYOUT ONLY (HOOPDB_RDS_LAYOUT unset or master-owner). Not for the
+-- infra #107 separate-database layout (hoopdb / hoop / sessions_pipeline_runtime),
+-- whose RDS master is provisioning-only. There, rds-activation/v1
+-- (src/hoopdb/rds-activation.ts, supabase/bootstrap/rds_activation/,
+-- docs/rds-activation-executor.md) creates the runtime role through a
+-- transaction-scoped executor that it then drops. So no master creator edge survives,
+-- and the password rotation path below does not exist there: each role rotates its
+-- own password (rotate-self). The rationale below keeps the master's ADMIN edge on
+-- purpose, and applies to the master-owner layout only.
+--
 -- The selfhosted hoopdb_runtime_role.sql refuses a non-superuser creator (42501), and
 -- the RDS master is not a superuser. Unlike the fixed NOLOGIN roles
 -- (rds_migration_roles.sql), the runtime LOGIN role must stay manageable by the master
