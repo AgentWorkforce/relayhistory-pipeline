@@ -35,6 +35,7 @@ import {
   SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS,
   SUPABASE_PLATFORM_SUPERUSERS,
 } from "../migrate-guards.ts";
+import * as migrateGuards from "../migrate-guards.ts";
 import { gateOpen, workerTick } from "../../shared/worker.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
 import {
@@ -3265,9 +3266,23 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const LAZY = "ingest_lazy_native_slots_org_id_idx";
     // The previous release: everything but 044020 (and no later upstream step: that would be a ledger gap), validated (marker 'pass').
     const full = await plan(SUPA_ET);
-    const later = laterUpstream(full).map((s) => s.name);
+    const laterSteps = laterUpstream(full) as typeof full;
+    const later = laterSteps.map((s) => s.name);
     const steps = full.filter((s) => s.name !== CB && !later.includes(s.name));
-    expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps }))).toBeNull();
+    // That release's binary shipped the function ACL manifest of its day, which could not yet list a
+    // function a later step creates; the current manifest does, so the non-local exact-ACL check would
+    // refuse (function_acl_drift) a database without them. Validate against the previous manifest:
+    // the current one minus the functions later steps CREATE. No later step: the current manifest, unmocked.
+    const laterFns = new Set(laterSteps.flatMap((s) =>
+      [...readFileSync(s.path, "utf8").matchAll(/\bCREATE\s+FUNCTION\s+(sessions\.\w+)\s*\(/gi)].map((m) => m[1]!.toLowerCase())));
+    const manifest = await migrateGuards.sessionsFunctionAclManifest();
+    const previousManifest = Object.fromEntries(Object.entries(manifest).filter(([fn]) => !laterFns.has(fn.slice(0, fn.indexOf("(")))));
+    const previousRelease = later.length ? spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(previousManifest) : undefined;
+    try {
+      expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps }))).toBeNull();
+    } finally {
+      previousRelease?.mockRestore();
+    }
     // Production shape: seven prebuilt CONCURRENTLY, the lazy-slot one held, its table populated.
     for (const x of ADOPTABLE_INDEXES[CB]!) if (x.name !== LAZY) await db.exec(x.def);
     await db.query(
