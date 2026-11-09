@@ -47,6 +47,11 @@
  *   SELFHOST_ADMISSION_SCAN_MS       the inbox ListBucket scan interval, 1000..600000, default 15000
  *   SELFHOST_ADMISSION_MAX_ATTEMPTS  attempts before an inbox object is dead-lettered, 1..100, default 20
  *
+ *   ANALYTICS_SINK                   unset | "" | "noop" (default: no analytics) | "collector"; "posthog" and any
+ *                                    ANALYTICS_POSTHOG_* value refuse startup (src/shared/analytics-config.ts).
+ *                                    collector needs ANALYTICS_DEPLOYMENT_ID, ANALYTICS_COLLECTOR_URL (the full
+ *                                    in-cluster URL ending in /v1/events) and ANALYTICS_COLLECTOR_TOKEN (Secret-injected)
+ *
  * Refused when enabled (they describe hosted-only edges this process does not have):
  * INGEST_ACCEPTANCE_MODE other than canonical, INGEST_INLINE_MAX_SESSIONS (no fan-out queue: every
  * batch is written inline, see selfhost-server.ts), INGEST_REPLICA_MODE other than off,
@@ -58,6 +63,7 @@ import { normalizedAudience } from "@rhc/auth/relaycontrol.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import type pg from "pg";
 import { sessionEraseConfig, type SessionEraseConfig } from "./session-erase.ts";
+import { analyticsConfig, type AnalyticsConfig } from "../shared/analytics-config.ts";
 
 export const SELFHOST_INGEST_FLAG = "RELAYHISTORY_SELFHOST_INGEST";
 export const SELFHOST_INGEST_PORT_VAR = "RELAYHISTORY_INGEST_PORT";
@@ -99,6 +105,8 @@ export interface SelfhostIngestSettings {
   sessionErase: SessionEraseConfig;
   /** Present only for SELFHOST_INGEST_ADMISSION=async|drain. */
   admission?: SelfhostAdmissionSettings;
+  /** ANALYTICS_* (src/shared/analytics-config.ts, self-host profile: noop or collector). Absent = noop. */
+  analytics?: AnalyticsConfig;
 }
 
 export type SelfhostIngestConfig = { enabled: false; port: number } | ({ enabled: true } & SelfhostIngestSettings);
@@ -220,6 +228,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   const keyRoot = env.INGEST_KEY_ROOT?.trim() || "96bulls";
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u.test(keyRoot)) throw new Error("96bulls: INGEST_KEY_ROOT must be a single key segment");
   const admission = selfhostAdmissionSettings(env);
+  const analytics = analyticsConfig(env, "selfhost");
   return {
     enabled: true,
     port: port(env),
@@ -234,5 +243,6 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     heartbeatAccept,
     sessionErase,
     ...(admission ? { admission } : {}),
+    ...(analytics.sink !== "noop" ? { analytics } : {}),
   };
 }
