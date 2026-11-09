@@ -48,3 +48,12 @@ test("multi-physical canonical group is unsupported instead of falsely fresh",as
  await pg.exec("UPDATE sessions.session_index SET deleted_at=now() WHERE session_id='second'");
  expect(await summary(pg,logical)).toHaveLength(1);
 }),60000);
+
+test("one physical session with divergent machine canonical IDs refuses instead of mixing descriptions",async()=>withDb(async pg=>{
+ await pointer(pg,{machine:"m-2"});
+ await recordBrief(hoopDb(pg),KEY,{"m-1":1,"m-2":1},{status:"ready",text});
+ await pg.query("UPDATE sessions.session_index SET canonical_session_id=$1 WHERE machine_id='m-1'",[logical]);
+ expect(await code(summary(pg,logical))).toBe("0A000");
+ await pg.query("UPDATE sessions.session_index SET canonical_session_id=$1",[logical]);
+ expect(await summary(pg,logical)).toHaveLength(1);
+}),60000);

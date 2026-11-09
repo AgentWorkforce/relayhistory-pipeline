@@ -20,6 +20,13 @@ BEGIN
        AND coalesce(p.canonical_session_id,p.session_id)=p_session_id AND p.deleted_at IS NULL)>1 THEN
   RAISE EXCEPTION USING ERRCODE='0A000', MESSAGE='brief summary: multiple physical aliases unsupported';
  END IF;
+ IF EXISTS(SELECT 1 FROM sessions.session_index a JOIN sessions.session_index p
+   ON p.org_id=a.org_id AND p.workspace_id=a.workspace_id AND p.harness=a.harness AND p.session_id=a.session_id
+   WHERE a.org_id=v_org AND a.workspace_id=p_workspace_id AND a.harness=p_harness
+    AND coalesce(a.canonical_session_id,a.session_id)=p_session_id AND a.deleted_at IS NULL
+    AND p.deleted_at IS NULL AND coalesce(p.canonical_session_id,p.session_id)<>p_session_id) THEN
+  RAISE EXCEPTION USING ERRCODE='0A000', MESSAGE='brief summary: inconsistent canonical mapping';
+ END IF;
  -- Managed history needs qualified metadata, exactly as the existing brief RPC.
  IF sessions.ingest_history_live() AND EXISTS(
   SELECT 1 FROM sessions.ingest_history_scope_current h
