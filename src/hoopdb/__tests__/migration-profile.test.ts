@@ -38,6 +38,7 @@ import {
 import { gateOpen, workerTick } from "../../shared/worker.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
 import {
+  ADOPTABLE_INDEXES,
   MIGRATION_SENTINELS,
   NON_CREATE_STEPS,
 } from "../migration-sentinels.ts";
@@ -3241,6 +3242,44 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const error = await failure(inspectMigrations(client(db), SUPA_ET));
     await db.exec("ROLLBACK");
     expect(error?.code).toBe("migration_changed");
+  });
+
+  test("release read-only plan goes red on 20261105044020 when a claim-bootstrap index is absent on a populated table; the apply refuses before the pending marker", async () => {
+    const db = await supabaseLike();
+    await db.exec(ET_BOOT);
+    const CB = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
+    const LAZY = "ingest_lazy_native_slots_org_id_idx";
+    // The previous release: everything but 044020, validated (marker 'pass').
+    const steps = (await plan(SUPA_ET)).filter((s) => s.name !== CB);
+    expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps }))).toBeNull();
+    // Production shape: seven prebuilt CONCURRENTLY, the lazy-slot one held, its table populated.
+    for (const x of ADOPTABLE_INDEXES[CB]!) if (x.name !== LAZY) await db.exec(x.def);
+    await db.query(
+      `INSERT INTO sessions.ingest_lazy_native_slots(key_sha256,key_material,org_id,workspace_id,origin_id,record_id,
+         source_identity_sha256,control_epoch,initialized_witness_sha256) VALUES ($1,'{}','org-probe','ws-probe','o','r',$1,$1,$1)`,
+      ["a".repeat(64)],
+    );
+    const before = await snapshot(db);
+    expect((before.marker as Array<{ status: string }>).map((r) => r.status)).toEqual(["pass"]);
+    // Plan mode (read-only): red, naming the index and the packet.
+    await db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const planned = await failure(inspectMigrations(client(db), SUPA_ET));
+    await db.exec("ROLLBACK");
+    expect(planned?.code).toBe("index_prebuild_required");
+    expect(planned?.message).toContain(`index sessions.${LAZY} on sessions.ingest_lazy_native_slots (${CB}) is absent and table sessions.ingest_lazy_native_slots is not empty`);
+    expect(planned?.message).toContain("claim-bootstrap index packet");
+    // Apply: the same refusal, before anything is written; the marker stays 'pass'.
+    const applied = await failure(runMigrations(client(db), { profile: SUPA_ET }));
+    expect(applied?.code).toBe("index_prebuild_required");
+    expect(await snapshot(db)).toEqual(before);
+    // After the operator's CONCURRENTLY build: the plan is green with 044020 pending, the apply adopts it.
+    await db.exec(`CREATE INDEX CONCURRENTLY ${LAZY} ON sessions.ingest_lazy_native_slots USING btree (org_id)`);
+    await db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const report = await inspectMigrations(client(db), SUPA_ET);
+    await db.exec("ROLLBACK");
+    expect(report.inventory.filter((s) => s.pending).map((s) => s.name)).toEqual([CB]);
+    expect(await failure(runMigrations(client(db), { profile: SUPA_ET, expectedLedgerSha256: report.ledgerSha256 }))).toBeNull();
+    expect(((await snapshot(db)).marker as Array<{ status: string }>).map((r) => r.status)).toEqual(["pass"]);
   });
 
   test("release read-only plan shows rename adoptions, nothing pending, and binds the ledger as stored", async () => {
