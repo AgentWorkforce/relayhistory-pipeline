@@ -316,6 +316,8 @@ export const FENCE_SUBTYPES: readonly string[] = Object.freeze([
   "gate_unbound", "gate_identity", "gate_status", "gate_cache", "gate_shape", "gate_timeout", "gate_error",
   "gate_echo", "gate_pending", "gate_epoch", "gate_moved",
   "request_aborted",
+  // BUFFERED_INDEX_REASONS (READ_API_OWNER_BUFFERED_INDEX_VERIFY); declared below, so listed literally.
+  "index_missing", "index_invalid", "index_unverified",
 ]);
 
 /** A fence reason for logs: the reason when it is a known subtype, else "fence_other". */

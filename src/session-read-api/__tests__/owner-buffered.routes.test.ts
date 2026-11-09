@@ -1141,7 +1141,7 @@ describe("READ_API_OWNER_BUFFERED_INDEX_VERIFY=on: the out-of-band index check o
       if (path === L) expect(r.ids).toBe(`claude:${SESSION}`);
       else expect(r.buffered, path).toBe("1");
       if (path === T || path === E) expect(JSON.stringify(r.body)).toContain("SERVED-CONTENT");
-      expect(logs.some((l) => typeof l.gate === "string" && (l.gate as string).startsWith("index_"))).toBe(false);
+      expect(logs.some((l) => typeof l.error_code === "string" && (l.error_code as string).startsWith("index_"))).toBe(false);
     }
     expect(probe.calls).toHaveLength(1); // cached valid: no second query
   });
@@ -1161,7 +1161,7 @@ describe("READ_API_OWNER_BUFFERED_INDEX_VERIFY=on: the out-of-band index check o
         if (path !== E) expect(res.status).toBe(501); // turns/metadata: 501 turns_no_pointers; events: whatever canonical answers
         expect(text).not.toContain("UNVERIFIED-CONTENT");
         expect([probe.calls.length, gate.calls.length, calls.length]).toEqual([1, 0, 0]);
-        expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_unverified", gate: name }));
+        expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_unverified", error_code: name }));
         namesOnly(logs);
       }
     }
@@ -1179,9 +1179,21 @@ describe("READ_API_OWNER_BUFFERED_INDEX_VERIFY=on: the out-of-band index check o
       expect(r.headers.get("x-relayhistory-buffered-ids")).toBeNull();
       expect((await json(r)).sessions.map((x: any) => x.sessionId)).toEqual(["s-1"]);
       expect([gate.calls.length, calls.length]).toEqual([0, 0]);
-      expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", gate: name }));
+      expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", error_code: name }));
       namesOnly(logs);
     }
+  });
+
+  test("an index-verify fence survives the real log filter as error_code index_unverified, with no error text", async () => {
+    const { indexCheck } = indexChecked(new Error("canceling statement due to statement timeout on pg_index"));
+    const { get, logs } = api({ reads: scriptedReads({ list: [bufferedRow()] }).reads, indexCheck });
+    expect((await get(L)).headers.get("x-relayhistory-buffered")).toBe("fenced");
+    const fields = logs.find((l) => l.reason === "buffered_fenced");
+    expect(fields).toBeDefined();
+    const text = logLine("info", "read api", fields!);
+    expect(JSON.parse(text)).toMatchObject({ reason: "buffered_fenced", error_code: "index_unverified" });
+    expect(text).not.toContain("fence_other");
+    expect(text).not.toMatch(/canceling|statement timeout|pg_index|"gate"/u);
   });
 
   test("a failure is cached across requests for the TTL (no query), then re-checked; a fix then serves", async () => {
@@ -1218,6 +1230,6 @@ describe("READ_API_OWNER_BUFFERED_INDEX_VERIFY=on: the out-of-band index check o
     expect(seen).toEqual(["SET LOCAL statement_timeout = 2000", BUFFERED_INDEX_SQL]);
     expect(seen).not.toContain(BUFFERED_USER_SQL);
     expect(calls).toHaveLength(0);
-    expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", gate: "index_missing" }));
+    expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", error_code: "index_missing" }));
   });
 });

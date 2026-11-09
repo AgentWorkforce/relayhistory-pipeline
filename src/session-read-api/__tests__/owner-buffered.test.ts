@@ -973,6 +973,15 @@ describe("fence subtypes for logs (fenceSubtype, BufferedFenced.sqlstateClass)",
     expect(ownerBuffered.fenceSubtype(new BufferedFenced().reason)).toBe("fenced");
   });
 
+  test("every index-verify reason (BUFFERED_INDEX_REASONS) is its own subtype, not fence_other", () => {
+    expect(Object.values(BUFFERED_INDEX_REASONS)).toHaveLength(3);
+    for (const r of Object.values(BUFFERED_INDEX_REASONS)) {
+      expect(ownerBuffered.FENCE_SUBTYPES).toContain(r);
+      expect(ownerBuffered.fenceSubtype(r)).toBe(r);
+      expect(ownerBuffered.fenceSubtype(new BufferedFenced(r).reason)).toBe(r);
+    }
+  });
+
   test("anything outside the set is fence_other", () => {
     for (const r of ["", "gate_", "GATE_SHAPE", "gate_shape ", "fixture_timeout", `rpc_error${"x".repeat(300)}`, undefined, null, 42, {}, ["gate_shape"]])
       expect(ownerBuffered.fenceSubtype(r)).toBe("fence_other");
