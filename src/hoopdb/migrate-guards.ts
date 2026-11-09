@@ -262,19 +262,12 @@ export const RUNTIME_APPLICATION_TABLE_PRIVILEGES = {
   "sessions.session_briefs": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_brief_wakeups": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_brief_attempts": ["SELECT", "INSERT", "UPDATE", "DELETE"],
-  // Lane F1 (20261105046000): the session-analysis worker's claim/reserve/complete/fail and sweep.
-  "sessions.session_analysis_jobs_v2": ["SELECT", "INSERT", "UPDATE", "DELETE"],
-  "sessions.session_analysis_requests_v2": ["SELECT", "INSERT", "UPDATE", "DELETE"],
-  "sessions.session_analysis_result_tickets": ["SELECT", "INSERT", "UPDATE", "DELETE"],
-  "sessions.session_analysis_ticket_invocations": ["SELECT", "INSERT", "UPDATE", "DELETE"],
-  "sessions.session_analysis_ticket_reservations": ["SELECT", "INSERT"],
 } as const satisfies Record<string, readonly string[]>;
 
 export const RUNTIME_APPLICATION_SEQUENCES = [
   "sessions.pipeline_jobs_id_seq",
   "sessions.migration_ingest_audit_id_seq",
   "sessions.session_verdicts_id_seq",
-  "sessions.session_analysis_ticket_rev_seq",
 ] as const;
 
 export const RUNTIME_APPLICATION_RLS_TABLES = [
@@ -308,31 +301,7 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.session_briefs",
   "sessions.session_brief_wakeups",
   "sessions.session_brief_attempts",
-  "sessions.session_analysis_jobs_v2",
-  "sessions.session_analysis_requests_v2",
-  "sessions.session_analysis_result_tickets",
-  "sessions.session_analysis_ticket_invocations",
-  "sessions.session_analysis_ticket_reservations",
 ] as const;
-
-/**
- * The runtime application relations, read through one function by the ACL install
- * (migrate.ts installRuntimeApplicationAcl) and runtimeRoleViolations. Always exactly the
- * three constants above: every listed relation is granted and verified, fail-closed. The
- * indirection exists only so a test can model a previous release's binary (which could not
- * list a relation a later migration creates) the way it spies sessionsFunctionAclManifest.
- */
-export function runtimeApplicationAclCatalog(): {
-  tables: Readonly<Record<string, readonly string[]>>;
-  sequences: readonly string[];
-  rlsTables: readonly string[];
-} {
-  return {
-    tables: RUNTIME_APPLICATION_TABLE_PRIVILEGES,
-    sequences: RUNTIME_APPLICATION_SEQUENCES,
-    rlsTables: RUNTIME_APPLICATION_RLS_TABLES,
-  };
-}
 
 export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.ack_session_brief_documents(uuid,jsonb)",
@@ -646,8 +615,7 @@ export async function runtimeRoleViolations(
     );
   }
 
-  const catalog = runtimeApplicationAclCatalog();
-  const applicationTables = Object.keys(catalog.tables);
+  const applicationTables = Object.keys(RUNTIME_APPLICATION_TABLE_PRIVILEGES);
   const ids = (
     await client.query<{
       db: number;
@@ -668,10 +636,10 @@ export async function runtimeRoleViolations(
       [
         tables.ledger,
         tables.marker,
-        [...applicationTables, ...catalog.sequences],
+        [...applicationTables, ...RUNTIME_APPLICATION_SEQUENCES],
         [...RUNTIME_APPLICATION_FUNCTIONS],
         RUNTIME_APPLICATION_POLICY,
-        [...catalog.rlsTables],
+        [...RUNTIME_APPLICATION_RLS_TABLES],
       ],
     )
   ).rows[0]!;
@@ -867,7 +835,7 @@ export async function runtimeRoleViolations(
   const expectedTablePrivileges = new Map<string, readonly string[]>([
     [tables.ledger, ["SELECT"]],
     [tables.marker, ["SELECT"]],
-    ...Object.entries(catalog.tables),
+    ...Object.entries(RUNTIME_APPLICATION_TABLE_PRIVILEGES),
   ]);
   for (const t of effectiveTables) {
     const actual = t.privs ? t.privs.split(",") : [];
@@ -892,13 +860,15 @@ export async function runtimeRoleViolations(
     )
   ).rows;
   for (const q of effectiveSequences) {
-    const approved = catalog.sequences.includes(q.rel);
+    const approved = RUNTIME_APPLICATION_SEQUENCES.includes(
+      q.rel as (typeof RUNTIME_APPLICATION_SEQUENCES)[number],
+    );
     if (!approved && q.privs) out.push(`privileges on sequence ${q.rel}`);
     if (approved && q.privs !== "USAGE")
       out.push(`${q.privs} on sequence ${q.rel} (only USAGE is approved)`);
   }
   if (phase === "post")
-    for (const sequence of catalog.sequences)
+    for (const sequence of RUNTIME_APPLICATION_SEQUENCES)
       if (!effectiveSequences.some((q) => q.rel === sequence && q.privs === "USAGE"))
         out.push(`missing USAGE on sequence ${sequence}`);
   const effectiveFunctions = (
@@ -955,7 +925,7 @@ export async function runtimeRoleViolations(
   ).rows;
   for (const policy of policies) {
     const exact =
-      catalog.rlsTables.includes(policy.rel) &&
+      RUNTIME_APPLICATION_RLS_TABLES.includes(policy.rel as (typeof RUNTIME_APPLICATION_RLS_TABLES)[number]) &&
       policy.name === RUNTIME_APPLICATION_POLICY &&
       policy.permissive && policy.command === "*" &&
       policy.roles.length === 1 && policy.roles[0] === role.oid &&
@@ -963,7 +933,7 @@ export async function runtimeRoleViolations(
     if (!exact) out.push(`unapproved policy ${policy.name} on ${policy.rel}`);
   }
   if (phase === "post")
-    for (const rel of catalog.rlsTables)
+    for (const rel of RUNTIME_APPLICATION_RLS_TABLES)
       if (!policies.some((p) => p.rel === rel && p.name === RUNTIME_APPLICATION_POLICY))
         out.push(`missing policy ${RUNTIME_APPLICATION_POLICY} on ${rel}`);
   // Detection only: a per-schema default-privileges GRANT in sessions naming PUBLIC or the
@@ -1484,7 +1454,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "e3454b75bc16c4fa7a55b476bb95b1ee6732c5930ffa4cca7dd30c0787503099";
+  "5bc6143c03bcdbee94c0c1c1207c147b8e3af8a28dd9a3725359948187e2e8a1";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

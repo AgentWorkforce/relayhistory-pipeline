@@ -3,7 +3,8 @@
  * 20261105043800_lazy_ack_clock_no_key_update.sql (plus bootstrap), WITHOUT 043850 (#332
  * acquisition owner), 043860 (#338 buffered search gate), 043870 (#339 buffered search feed
  * cursor), 043880 (#327 bookkeeping cleanup), 043890 (#384), 043900 (#336 consumer function grants,
- * EXECUTE grants only) and any later migration (pglite-schema.ts
+ * EXECUTE grants only), 044030 (#386 generation overlap: owner-only window, retired record and policy
+ * trigger; replaces ingest_require_generation / ingest_lazy_guard) and any later migration (pglite-schema.ts
  * derives POST_G4_MIGRATIONS from the sorted list). The app runs with the Worker's default flags
  * (canonical acceptance, async admission / babysitter routing / replica off, relayhistory
  * custody), and the buffered acceptance mode it is cut over to; every main sync ingest path
@@ -106,6 +107,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105044010_selfhost_erase_lock_fences.sql",
       // Eight org_id btree indexes on existing ingest tables only; no function or column.
       "20261105044020_claim_bootstrap_org_indexes.sql",
+      // #386 generation overlap: owner-only window, retired record and policy trigger; replaces
+      // ingest_require_generation / ingest_lazy_guard (in OBJECTS.replacedFunctions below).
+      "20261105044030_ingest_generation_overlap.sql",
       // Lane F1 (this branch): analysis jobs/requests/tickets/invocations/reservations tables,
       // the purge functions and their grant helper, the admit scope function and the request entry point.
       // (045000 digest is not in this tree yet; it lands first and this list gains it on merge.)
@@ -113,7 +117,7 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
-    expect(OBJECTS.replacedFunctions).toEqual(["ingest_babysitter_retention_register", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_prepare_buffer_stage", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_publish"]);
+    expect(OBJECTS.replacedFunctions).toEqual(["ingest_babysitter_retention_register", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_lazy_guard", "ingest_prepare_buffer_stage", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_publish", "ingest_require_generation"]);
   });
 
   test("no new table, function or column exists; the replaced RPCs exist in their prior form; no G4 body names a post-G4 object", async () => {

@@ -2294,6 +2294,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const SE = "upstream:20261105043910_selfhost_session_selection_erase.sql";
     const SL = "upstream:20261105044010_selfhost_erase_lock_fences.sql";
     const BK = "upstream:20261105043880_ingest_bookkeeping_cleanup.sql";
+    const V = "upstream:20261105044030_ingest_generation_overlap.sql";
     const GR = "upstream:20261105043890_buffered_search_gate_retired_witness.sql";
     const AJ = "upstream:20261105046000_analysis_jobs.sql";
     const TK = "upstream:20261105044000_read_api_tokens.sql";
@@ -2304,13 +2305,13 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, AJ]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, AJ]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
     );
     expect(outOfOrder?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, AJ]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, TK, V, AJ]));
     // P3b (034000) refuses while a later lane (035000, 036000, 037000) is applied.
     expect((await failure(rollback("20261105034000_session_directory_read_api.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(R);
@@ -2350,14 +2351,44 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105040000_ingest_lazy_source_tables.down.sql")))?.code).toBe("55000");
     await rollback("20261105046000_analysis_jobs.down.sql");
     expect(await names()).not.toContain("upstream:20261105046000_analysis_jobs.sql");
-    // 20261105044020 (claim-bootstrap org_id indexes) is then the latest: 044010's and 044000's downs refuse (55000)
+    // 20261105044030 (generation overlap) is then the newest: 044020, 044010, 044000, 043910, 043900 and 043880 refuse (55000)
+    // while it is applied, so it rolls back FIRST; its own down restores the exact strict 050000
+    // ingest_require_generation and 055000 ingest_lazy_guard, drops the window and retired tables, the policy
+    // retirement trigger and its six functions, and marks the validation pending (the fence bodies changed).
+    const overlapFns = async () =>
+      (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE proname LIKE 'ingest_generation_overlap_%'")).rows[0]!.n;
+    const fenceSrc = async () =>
+      (await db.query<{ s: string }>("SELECT string_agg(prosrc, '' ORDER BY oid) s FROM pg_proc WHERE oid IN ('sessions.ingest_require_generation(text)'::regprocedure, 'sessions.ingest_lazy_guard(text)'::regprocedure)")).rows[0]!.s;
+    expect(await names()).toContain(V);
+    expect(await overlapFns()).toBe(6);
+    expect(await fenceSrc()).toContain("ingest_generation_overlap_admits");
+    expect((await failure(rollback("20261105044020_claim_bootstrap_org_indexes.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105044010_selfhost_erase_lock_fences.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105044000_read_api_tokens.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105043910_selfhost_session_selection_erase.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105043900_session_consumer_function_grants.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105043880_ingest_bookkeeping_cleanup.down.sql")))?.code).toBe("55000");
+    expect(await names()).toEqual(expect.arrayContaining([CB, SL, SE, CG, BK]));
+    expect(await relation("sessions.read_api_tokens")).toBe("sessions.read_api_tokens");
+    await rollback("20261105044030_ingest_generation_overlap.down.sql");
+    expect(await names()).not.toContain(V);
+    expect(await overlapFns()).toBe(0);
+    expect(await relation("sessions.ingest_generation_overlap_windows")).toBeNull();
+    expect(await relation("sessions.ingest_generation_overlap_retired")).toBeNull();
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname='ingest_generation_overlap_policy_retire'")).rows[0]!.n).toBe(0);
+    expect(await fenceSrc()).not.toContain("ingest_generation_overlap");
+    expect(await fenceSrc()).toContain("AND generation=p_expected AND status='pass' FOR SHARE;");
+    expect(await passed()).toBe(false);
+    // 20261105044020 (claim-bootstrap org_id indexes) is then the newest: 044010's and 044000's downs refuse (55000)
     // while it is applied; its own down drops the eight indexes first.
     expect((await failure(rollback("20261105044010_selfhost_erase_lock_fences.down.sql")))?.code).toBe("55000");
     expect((await failure(rollback("20261105044000_read_api_tokens.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(SL);
     expect(await relation("sessions.read_api_tokens")).toBe("sessions.read_api_tokens");
     expect(await relation("sessions.ingest_seed_captures_org_id_idx")).toBe("sessions.ingest_seed_captures_org_id_idx");
-    await rollbackLaterThan044020(db, SUPA_ET);
+    // Every later upstream step is already rolled back here (046000 and 044030, explicitly above), so no helper call.
+    const laterNames = (await plan(SUPA_ET)).filter((s) => s.name.startsWith("upstream:") && s.name > CB).map((s) => s.name);
+    expect((await names()).filter((n) => laterNames.includes(n))).toEqual([]);
     await rollback("20261105044020_claim_bootstrap_org_indexes.down.sql");
     expect(await names()).not.toContain(CB);
     expect(await relation("sessions.ingest_seed_captures_org_id_idx")).toBeNull();
@@ -2389,7 +2420,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).toContain(CG);
     expect(await writerGrants()).toBe(12);
     expect((await failure(rollback("20261105043890_buffered_search_gate_retired_witness.down.sql")))?.code).toBe("55000");
-    expect(await names()).toContain(GR);
+    expect((await failure(rollback("20261105043880_ingest_bookkeeping_cleanup.down.sql")))?.code).toBe("55000");
+    expect(await names()).toEqual(expect.arrayContaining([GR, BK]));
     await rollback("20261105043900_session_consumer_function_grants.down.sql");
     expect(await names()).not.toContain(CG);
     expect(await writerGrants()).toBe(0);
@@ -2417,7 +2449,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     await rollback("20261105043880_ingest_bookkeeping_cleanup.down.sql");
     expect(await names()).not.toContain(BK);
     expect(await relation("sessions.ingest_bookkeeping_retired_claims")).toBeNull();
-    // 043870 (buffered search feed cursor) is the latest: 043860 and 043850 refuse (55000) while it is applied;
+    // 043870 (buffered search feed cursor) is then the latest: 043860 and 043850 refuse (55000) while it is applied;
     // its own down drops only the three feed functions, the cursor table and its ledger row (the validation stays as it was).
     const feedFns = async () =>
       (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE oid IN (to_regprocedure('sessions.buffered_search_feed_page(jsonb)'), to_regprocedure('sessions.buffered_search_feed_stage(jsonb)'), to_regprocedure('sessions.buffered_search_feed_advance(jsonb)'))")).rows[0]!.n;
@@ -2617,8 +2649,10 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await failure(runMigrations(client(db), { profile: SUPA_A }))).toBeNull();
     // Up again: 041000's exact source-table list is back in both lazy functions, 043500's lazy claim
     // narrowing is back, 043700's four functions and parity table, 043800's staged-ACK NO KEY UPDATE,
-    // 043860's gate reader (with 043890's retired witness) and 043870's feed functions and cursor table.
+    // 043860's gate reader (with 043890's retired witness), 043870's feed functions and cursor table and 044030's overlap fence.
     expect(await lazyRecords()).toContain("lazy-native-origin-v1");
+    expect(await overlapFns()).toBe(6);
+    expect(await fenceSrc()).toContain("ingest_generation_overlap_admits");
     expect(await gateFn()).not.toBeNull();
     expect(await gateSrc()).toContain("ingest_bookkeeping_retired_claims");
     expect(await gateGrantees()).toEqual(["bulls96_read_api"]);
@@ -2628,7 +2662,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await ownerReadFns()).toBe(4);
     expect(await parityTable()).toBe("sessions.owner_buffered_parity");
     expect((await lazySrc()).match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, AJ]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, V, AJ]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
     expect(await catalogRpc()).toContain("forget_tracking_not_enabled");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
@@ -2762,8 +2796,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
     // Newer than 043900, so the grants' down refuses until they are rolled back,
-    // newest first: everything later than 044020 (via rollbackLaterThan044020), then 044020
-    // (org indexes), 044010 (erase lock), 044000 (tokens), 043910 (erase).
+    // newest first: every upstream step after 044020 (rollbackLaterThan044020: 046000, 044030),
+    // then 044020 (org indexes), 044010 (erase lock), 044000 (tokens), 043910 (erase).
     const orgIndexesDown = readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8");
     const lockDown = readFileSync(join(root, "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql"), "utf8");
     const readTokensDown = readFileSync(join(root, "supabase/rollbacks/20261105044000_read_api_tokens.down.sql"), "utf8");

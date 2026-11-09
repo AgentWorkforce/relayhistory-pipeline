@@ -38,7 +38,7 @@ import { prepareBufferedStage, putBufferedStage } from "../../session-ingest/sta
 import { TENANT, batch, record } from "../../session-ingest/__tests__/support.ts";
 import { TURN_ORIGIN_ID } from "../../session-ingest/turns.ts";
 import { objectKey, type ObjectStore } from "../../shared/vendor.ts";
-import { E1, SCOPE, SESSION, authority, deferred, deps, fencedGate, putStage, scratch, scriptedGate, scriptedReads, traced, turn, unzip } from "./owner-buffered-support.ts";
+import { E1, SCOPE, SESSION, authority, deferred, deps, fencedGate, indexChecked, putStage, scratch, scriptedGate, scriptedReads, traced, turn, unzip } from "./owner-buffered-support.ts";
 
 const cleanup: Array<() => void> = [];
 afterEach(() => {
@@ -229,6 +229,32 @@ describe("readOwnerBufferedEvents: gate, scrub, bounds, tenant", () => {
     const { reads, calls } = scriptedReads({ stages: [[]] });
     expect(await readOwnerBufferedEvents(deps({ store: store(), reads, gate: fencedGate("gate_timeout") }), SCOPE, "claude", SESSION)).toEqual({ unverifiedBeforeCandidate: "gate_timeout" });
     expect(calls).toHaveLength(0);
+  });
+
+  test("READ_API_OWNER_BUFFERED_INDEX_VERIFY=on, index not proven: unverified before candidate with the reason name; no gate, no RPC, no S3, no phase fields", async () => {
+    const s = store();
+    const st = await putStage(s, 1, [ev("e1")]);
+    for (const [answer, name] of [["missing", "index_missing"], ["invalid", "index_invalid"], [new Error("timeout"), "index_unverified"]] as const) {
+      const t = traced(s);
+      const gate = scriptedGate(authority("7"));
+      const { reads, calls } = scriptedReads({ stages: [[st.row]] });
+      const { indexCheck, probe } = indexChecked(answer);
+      const phases = new OwnerBufferedPhaseTimer();
+      expect(await readOwnerBufferedEvents(deps({ store: t.store, reads, gate, indexCheck }), SCOPE, "claude", SESSION, { phases })).toEqual({ unverifiedBeforeCandidate: name });
+      expect([probe.calls.length, gate.calls.length, calls.length, t.starts()]).toEqual([1, 0, 0, 0]);
+      expect(phases.fields()).toEqual({});
+    }
+  });
+
+  test("READ_API_OWNER_BUFFERED_INDEX_VERIFY=on, index present: the same rows as without the check", async () => {
+    const s = store();
+    const st = await putStage(s, 1, [ev("e1"), ev("e2")]);
+    const { indexCheck, probe } = indexChecked("valid");
+    const on = await readOwnerBufferedEvents(deps({ store: s, reads: scriptedReads({ stages: [[st.row]] }).reads, indexCheck }), SCOPE, "claude", SESSION);
+    const off = await readOwnerBufferedEvents(deps({ store: s, reads: scriptedReads({ stages: [[st.row]] }).reads }), SCOPE, "claude", SESSION);
+    expect(on).not.toBeNull();
+    expect(on).toEqual(off);
+    expect(probe.calls).toHaveLength(1);
   });
 
   test("the final observation after all I/O: pending or a moved head is fenced (no rows)", async () => {
