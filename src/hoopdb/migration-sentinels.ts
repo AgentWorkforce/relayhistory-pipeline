@@ -41,6 +41,8 @@ export interface AdoptableIndex {
 
 const CLAIM_BOOTSTRAP_ORG_INDEXES_STEP =
   "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
+const BUFFERED_STAGES_SESSION_FIRST_STEP =
+  "upstream:20261105044040_buffered_stages_session_first.sql";
 const orgIndex = (table: string, columns: string): AdoptableIndex => ({
   name: `${table}_org_id_idx`,
   table: `sessions.${table}`,
@@ -60,6 +62,8 @@ const orgIndex = (table: string, columns: string): AdoptableIndex => ({
  *
  * Claim-bootstrap org_id probes, 20261105044020 (packet:
  * docs/packets/claim-bootstrap-org-index-packet-20261108.md), in the operator's build order.
+ * Buffered stages session-first records GIN, 20261105044040 (packet:
+ * docs/handoffs/buffered-stages-session-first-044040/operator-packet.md).
  */
 export const ADOPTABLE_INDEXES: Readonly<Record<string, readonly AdoptableIndex[]>> = {
   [CLAIM_BOOTSTRAP_ORG_INDEXES_STEP]: [
@@ -72,6 +76,38 @@ export const ADOPTABLE_INDEXES: Readonly<Record<string, readonly AdoptableIndex[
     orgIndex("ingest_custody_records", "org_id, workspace_id, user_id"),
     orgIndex("ingest_lazy_native_slots", "org_id"),
   ],
+  [BUFFERED_STAGES_SESSION_FIRST_STEP]: [
+    {
+      name: "ingest_claim_attempts_records_gin_idx",
+      table: "sessions.ingest_claim_attempts",
+      def: "CREATE INDEX ingest_claim_attempts_records_gin_idx ON sessions.ingest_claim_attempts USING gin (records jsonb_path_ops)",
+    },
+  ],
+};
+
+/** How an ADOPTABLE_INDEXES step is prebuilt, and what else its CREATE inventory names. */
+export interface AdoptableIndexStep {
+  /** The out-of-band CONCURRENTLY packet the index_prebuild_required refusal names. */
+  packet: string;
+  /**
+   * Functions the step only REPLACES (CREATE OR REPLACE of a function an earlier, ledgered step
+   * created). They are the only non-index inventory an adoptable step may have; their existence is
+   * not evidence that the step ran, so the step's sentinel must detect the replaced bodies instead.
+   * A step that replaces anything never has its sentinel overridden by index adoptability.
+   */
+  replaces: readonly string[];
+}
+
+/** One entry per ADOPTABLE_INDEXES step (a test keeps the key sets equal). */
+export const ADOPTABLE_INDEX_STEPS: Readonly<Record<string, AdoptableIndexStep>> = {
+  [CLAIM_BOOTSTRAP_ORG_INDEXES_STEP]: {
+    packet: "claim-bootstrap index packet docs/packets/claim-bootstrap-org-index-packet-20261108.md, PR #407",
+    replaces: [],
+  },
+  [BUFFERED_STAGES_SESSION_FIRST_STEP]: {
+    packet: "buffered-stages session-first operator packet docs/handoffs/buffered-stages-session-first-044040/operator-packet.md",
+    replaces: ["sessions.buffered_sessions_for", "sessions.buffered_session_stages_for"],
+  },
 };
 
 /**
@@ -300,6 +336,12 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   [CLAIM_BOOTSTRAP_ORG_INDEXES_STEP]: {
     evidence: "the eight claim-bootstrap <table>_org_id_idx indexes, exact definition, valid and ready",
     sql: adoptableIndexesSentinel(CLAIM_BOOTSTRAP_ORG_INDEXES_STEP),
+  },
+  // Adoptable index + replacement: the sentinel is the replaced bodies only (never overridden), so an
+  // operator-built GIN alone is adopted while an unledgered apply of the readers is still caught.
+  [BUFFERED_STAGES_SESSION_FIRST_STEP]: {
+    evidence: "replacement: buffered_sessions_for and buffered_session_stages_for count duplicate ordinals with a window (044040, session-first detail)",
+    sql: "SELECT count(*)=2 AS applied FROM pg_proc WHERE oid IN(to_regprocedure('sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)'),to_regprocedure('sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)')) AND prosecdef AND prosrc LIKE '%count(*) OVER (PARTITION BY rc.stage_token, rc.ord)%'",
   },
 };
 

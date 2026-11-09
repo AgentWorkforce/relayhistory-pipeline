@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
   ADOPTABLE_INDEX_STATE_SQL,
+  ADOPTABLE_INDEX_STEPS,
   ADOPTABLE_INDEXES,
   type AdoptableIndex,
   MIGRATION_SENTINELS,
@@ -1139,7 +1140,8 @@ async function adoptableIndexState(
 
 /**
  * The reviewed adoptable-index allowance (ADOPTABLE_INDEXES): true only when `step`
- * declares index `name` adoptable, the step's whole inventory is its declared indexes,
+ * declares index `name` adoptable, the step's whole inventory is its declared indexes
+ * plus the functions it declares it only replaces (ADOPTABLE_INDEX_STEPS[step].replaces),
  * and the live index is the exact declared one (state `adoptable`, see
  * ADOPTABLE_INDEX_STATE_SQL). Fails closed.
  */
@@ -1152,7 +1154,14 @@ async function adoptableIndex(
   const declared = ADOPTABLE_INDEXES[step];
   const x = declared?.find((d) => d.name === name);
   if (!declared || !x) return false;
-  if (!inventory.every((o) => o.kind === "index" && declared.some((d) => d.name === o.name)))
+  const replaces = ADOPTABLE_INDEX_STEPS[step]?.replaces ?? [];
+  if (
+    !inventory.every((o) =>
+      o.kind === "index"
+        ? declared.some((d) => d.name === o.name)
+        : o.kind === "function" && replaces.includes(o.name),
+    )
+  )
     return false;
   try {
     return (await adoptableIndexState(client, x)).state === "adoptable";
@@ -1206,9 +1215,11 @@ export async function adoptableIndexBuildPreflight(
 ): Promise<void> {
   const allow = opts.allowBlockingIndexBuild === true;
   const refused: string[] = [];
+  const packets = new Set<string>();
   for (const step of schemaSteps) {
     const declared = ADOPTABLE_INDEXES[step.name];
     if (!declared?.length || ledger.has(step.name)) continue;
+    const before = refused.length;
     for (const x of declared) {
       const where = `index sessions.${x.name} on ${x.table} (${step.name})`;
       let state: AdoptableIndexState;
@@ -1247,11 +1258,13 @@ export async function adoptableIndexBuildPreflight(
           `${where} is absent and table ${x.table} is not empty; a blocking CREATE INDEX on a populated table is refused`,
         );
     }
+    if (refused.length > before)
+      packets.add(ADOPTABLE_INDEX_STEPS[step.name]?.packet ?? "see the runbook");
   }
   if (refused.length)
     throw guardError(
       "index_prebuild_required",
-      `${refused.join("; ")}. Prebuild each absent index out of band with CREATE INDEX CONCURRENTLY (claim-bootstrap index packet docs/packets/claim-bootstrap-org-index-packet-20261108.md, PR #407), then rerun: the step adopts it. Nothing was written. HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true is for non-production databases only (the release and owner-apply profiles cannot set it); see the runbook`,
+      `${refused.join("; ")}. Prebuild each absent index out of band with CREATE INDEX CONCURRENTLY (${[...packets].join("; ")}), then rerun: the step adopts it. Nothing was written. HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true is for non-production databases only (the release and owner-apply profiles cannot set it); see the runbook`,
     );
 }
 
@@ -1295,7 +1308,8 @@ async function tablePopulated(client: GuardClient, table: string): Promise<boole
  *   migration_changed     a ledgered step's file changed;
  *   unledgered_schema     an object that an unledgered step creates already exists.
  * The one exception is ADOPTABLE_INDEXES: a declared index built out of band, exact,
- * valid and ready, is accepted for its step (the step adopts it).
+ * valid and ready, is accepted for its step (the step adopts it). A step that also
+ * replaces functions (ADOPTABLE_INDEX_STEPS) keeps its body sentinel.
  * Nothing is ever imported into, or marked in, the ledger.
  */
 export async function sequencePreflight(
@@ -1397,9 +1411,11 @@ export async function sequencePreflight(
     } catch {
       applied = true; // can't look: fail closed, as if the step had run
     }
-    // An adoptable step's sentinel is its declared indexes: accepted only when every one is adoptable.
+    // An index-only adoptable step's sentinel is its declared indexes: accepted only when every one
+    // is adoptable. A step that also replaces functions has a body sentinel, never overridden.
     const declared = ADOPTABLE_INDEXES[names[i]!];
-    if (applied && declared?.length) {
+    const replacesFunctions = (ADOPTABLE_INDEX_STEPS[names[i]!]?.replaces.length ?? 0) > 0;
+    if (applied && declared?.length && !replacesFunctions) {
       const inventory = inventoryOf(sql[i]!);
       let all = true;
       for (const d of declared)
