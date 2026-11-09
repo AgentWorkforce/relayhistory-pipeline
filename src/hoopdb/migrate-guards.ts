@@ -217,6 +217,12 @@ export interface RuntimeRoleConfig {
   login?: boolean;
   /** HOOPDB_RUNTIME_WORKLOAD_ROLE: the one role allowed to be a member of the runtime role (no ADMIN OPTION). */
   workload?: string;
+  /**
+   * HOOPDB_RDS_LAYOUT (rds mode only). "separate-database" (rds-activation/v1) leaves
+   * the runtime role with no member at all, so the master-owner creator edge is not
+   * accepted there.
+   */
+  rdsLayout?: "master-owner" | "separate-database";
 }
 
 export interface RuntimeTables {
@@ -402,16 +408,19 @@ export function isSupabaseCreatorEdge(
  * neither INHERIT nor SET, and the creator cannot revoke it. The owner keeps only the
  * ability to manage the role (set or rotate its password, drop it); it gains none of
  * the runtime role's privileges, and the runtime role gains nothing. The member must be
- * the connected migration owner itself, never a configurable name.
+ * the connected migration owner itself, never a configurable name. Master-owner layout
+ * only: under HOOPDB_RDS_LAYOUT=separate-database the activation executor is dropped,
+ * so the runtime role has no member and any edge is refused.
  */
 export function isRdsCreatorEdge(
-  cfg: Pick<RuntimeRoleConfig, "mode">,
+  cfg: Pick<RuntimeRoleConfig, "mode" | "rdsLayout">,
   serverVersion: number,
   edge: RoleGrantEdge,
   migrationOwner: string,
 ): boolean {
   return (
     cfg.mode === "rds" &&
+    cfg.rdsLayout !== "separate-database" &&
     serverVersion >= 160000 &&
     edge.rolname === migrationOwner &&
     edge.grantor === "rdsadmin" &&

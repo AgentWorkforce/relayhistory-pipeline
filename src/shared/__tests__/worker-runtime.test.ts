@@ -83,3 +83,13 @@ describe("stage worker orchestration", () => {
     expect(seen).toEqual(["a", "b", "side", "a", "b", "side"]);
   });
 });
+
+describe("workerAdapterEntry", () => {
+  test("defaults to postgres, and the writer admits opensearch", async () => {
+    const { workerAdapterEntry } = await import("../worker.ts");
+    const { validateAdapterEnv } = await import("@rhc/adapters/registry.ts");
+    const env = { SEARCH_INDEX_BACKEND: "opensearch" };
+    expect(() => validateAdapterEnv(env, workerAdapterEntry({}))).toThrow();
+    expect(validateAdapterEnv(env, workerAdapterEntry({ searchBackends: ["postgres", "opensearch"] })).search).toBe("opensearch");
+  });
+});

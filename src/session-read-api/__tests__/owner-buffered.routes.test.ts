@@ -11,14 +11,14 @@ import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, test } from "bun:test";
 import { AuthError, createReadApi, type TurnsDeps, type VerifiedIdentity } from "../app.ts";
 import { decodeCompositeListCursor, encodeCompositeListCursor, type Directory, type DirectoryListRow } from "../directory.ts";
-import { BUFFERED_USER_SQL, BufferedFenced, serviceBindingControlHead, sqlOwnerBufferedReads, type ControlHeadGate, type OwnerBufferedDeps, type OwnerBufferedReads } from "../owner-buffered.ts";
+import { BUFFERED_USER_SQL, BufferedFenced, serviceBindingControlHead, sqlOwnerBufferedReads, type BufferedStageRow, type ControlHeadGate, type OwnerBufferedDeps, type OwnerBufferedReads } from "../owner-buffered.ts";
 import { memoryLiveness } from "./support.ts";
 import { BUFFERED_STAGE_MAX_BYTES } from "../owner-buffered.ts";
 import { encodeBufferedCursor, encodeCursor } from "../cursor.ts";
 import { deliveryMachine } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
 import { TURN_ORIGIN_ID } from "../../session-ingest/turns.ts";
 import { at } from "./support.ts";
-import { E1, SESSION, authority, bufferedRow, fencedGate, headBody, putStage, scratch, scriptedGate, scriptedReads, turn, unzip } from "./owner-buffered-support.ts";
+import { E1, SESSION, authority, bufferedRow, deferred, fencedGate, headBody, putStage, scratch, scriptedGate, scriptedReads, turn, unzip } from "./owner-buffered-support.ts";
 
 const ID: VerifiedIdentity = { userId: "u-1", orgId: "org-a", workspaceId: "ws-a", scopes: ["rth:read"] };
 const cleanup: Array<() => void> = [];
@@ -63,6 +63,10 @@ interface Harness {
   identity?: VerifiedIdentity;
   /** READ_API_OWNER_BUFFERED_EVENTS=on (ownerBuffered.events); default off. */
   events?: boolean;
+  /** READ_API_OWNER_BUFFERED_PHASE_LOG=1 (ownerBuffered.phaseLog); default off. */
+  phaseLog?: boolean;
+  /** READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY (ownerBuffered.stageConcurrency); default absent (serial). */
+  stageConcurrency?: number;
   /** READ_API_COMPLETE_SINCE as ms; default 0. */
   completeSinceMs?: number;
   /** Erased canonical sessions (tombstones: pointers without a live pointer). */
@@ -101,6 +105,8 @@ function api(h: Harness = {}) {
     store: h.store ?? store(),
     decompress: unzip,
     ...(h.events ? { events: true } : {}),
+    ...(h.phaseLog ? { phaseLog: true } : {}),
+    ...(h.stageConcurrency ? { stageConcurrency: h.stageConcurrency } : {}),
   };
   const chQueries: string[] = [];
   const select = h.canonical
@@ -128,7 +134,8 @@ function api(h: Harness = {}) {
     turns,
     ownerBuffered,
   });
-  const get = (path: string) => app.request(path, { headers: { authorization: "Bearer good" } });
+  const get = (path: string, signal?: AbortSignal) =>
+    signal ? app.request(new Request(`http://localhost${path}`, { headers: { authorization: "Bearer good" }, signal })) : app.request(path, { headers: { authorization: "Bearer good" } });
   return { get, logs, dirCalls, chQueries };
 }
 const json = async (r: Response) => (await r.json()) as Record<string, any>;
@@ -894,5 +901,113 @@ describe("GET /v1/sessions/:id/events with READ_API_OWNER_BUFFERED_EVENTS=on", (
     expect(r.status).toBe(200);
     expect(r.headers.get("x-relayhistory-buffered")).toBe("1");
     expect(strip(await json(r))).toEqual({ sessionId: SESSION, events: [], nextCursor: null, correlationId: undefined });
+  });
+});
+
+describe("GET /v1/sessions/:id/events: READ_API_OWNER_BUFFERED_PHASE_LOG and READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY", () => {
+  const TS = 1_793_000_000_000;
+  const P = `/v1/sessions/${SESSION}/events?workspace=ws-a&source=claude`;
+  const FIELDS = ["session_start_ms", "control_head_1_ms", "stages_sql_ms", "s3_fetch_ms", "s3_stage_count", "recheck_ms", "control_head_2_ms", "fold_ms"];
+  const NEW = [...FIELDS, "aborted_phase"];
+  const ev = (id: string, over: Record<string, unknown> = {}) => ({ kind: "session_event", origin_id: TURN_ORIGIN_ID, record_id: id, revision: "1", operation: "upsert", received_at: "2026-11-05T12:00:00Z", payload: { text: `buffered ${id}`, ts_ms: TS, role: "user", ...over } });
+  async function staged(n = 3) {
+    const s = store();
+    const rows: BufferedStageRow[] = [];
+    for (let i = 1; i <= n; i++) rows.push((await putStage(s, i, [ev(`e${i}`, { ts_ms: TS + i })])).row);
+    return { s, rows };
+  }
+  const requestLine = (logs: Record<string, unknown>[]) => {
+    // The middleware's request line: status and duration, no reason.
+    const lines = logs.filter((l) => "duration_ms" in l && !("reason" in l));
+    expect(lines).toHaveLength(1);
+    return lines[0]!;
+  };
+
+  test("phase log off (default): the request line carries no new field, served or failed", async () => {
+    const { s, rows } = await staged();
+    for (const gate of [scriptedGate(authority("7")), scriptedGate(authority("7"), authority("8"))]) {
+      const { get, logs } = api({ events: true, store: s, reads: scriptedReads({ stages: [rows] }).reads, gate, stageConcurrency: 2 });
+      await get(P);
+      expect(Object.keys(requestLine(logs)).sort()).toEqual(["correlation_id", "duration_ms", "route", "status"]);
+      for (const l of logs) for (const f of NEW) expect(l, f).not.toHaveProperty(f);
+    }
+  });
+
+  test("phase log on, served: every phase field a non-negative integer, s3_stage_count the stage count, no aborted_phase, nothing else added", async () => {
+    for (const stageConcurrency of [undefined, 2]) {
+      const { s, rows } = await staged(3);
+      const { get, logs } = api({ events: true, phaseLog: true, store: s, reads: scriptedReads({ stages: [rows] }).reads, stageConcurrency });
+      const r = await get(P);
+      expect(r.status).toBe(200);
+      expect((await json(r)).events).toHaveLength(3);
+      const line = requestLine(logs);
+      expect(Object.keys(line).sort()).toEqual(["correlation_id", "duration_ms", "route", "status", ...FIELDS].sort());
+      for (const f of FIELDS) expect(Number.isInteger(line[f]) && (line[f] as number) >= 0, f).toBe(true);
+      expect(line.s3_stage_count).toBe(3);
+      const text = JSON.stringify(logs.map(({ correlation_id: _c, ...l }) => l));
+      expect(text).not.toMatch(/buffered-batches|stage_key|ordinal|sess-|"e1|buffered e|u-1|org-a|ws-a/u);
+    }
+  });
+
+  test("phase log on, failed: the request line carries the reached phases and aborted_phase; the status is unchanged from flag off", async () => {
+    const { s, rows } = await staged(2);
+    const moved = () => scriptedGate(authority("7"), authority("8"));
+    const off = await api({ events: true, store: s, reads: scriptedReads({ stages: [rows] }).reads, gate: moved() }).get(P);
+    const { get, logs } = api({ events: true, phaseLog: true, store: s, reads: scriptedReads({ stages: [rows] }).reads, gate: moved() });
+    const r = await get(P);
+    expect(r.status).toBe(off.status);
+    const line = requestLine(logs);
+    expect(line).toMatchObject({ aborted_phase: "control_head_2", s3_stage_count: 2 });
+    for (const f of ["session_start_ms", "control_head_1_ms", "stages_sql_ms", "s3_fetch_ms", "recheck_ms", "control_head_2_ms"]) expect(typeof line[f], f).toBe("number");
+
+    // A failed S3 fetch under concurrency: same status as serial, aborted_phase s3_fetch, later phases absent.
+    const failing = { ...s, getObject: async () => { throw Object.assign(new Error("synthetic"), { name: "S3Down" }); } } as typeof s;
+    const serial = await api({ events: true, store: failing, reads: scriptedReads({ stages: [rows] }).reads }).get(P);
+    const h = api({ events: true, phaseLog: true, stageConcurrency: 2, store: failing, reads: scriptedReads({ stages: [rows] }).reads });
+    const fr = await h.get(P);
+    expect(fr.status).toBe(serial.status);
+    expect(await strip(await json(fr))).toEqual(strip(await json(serial)));
+    const fl = requestLine(h.logs);
+    expect(fl).toMatchObject({ aborted_phase: "s3_fetch", s3_stage_count: 2 });
+    expect(fl).not.toHaveProperty("recheck_ms");
+    expect(fl).not.toHaveProperty("control_head_2_ms");
+  });
+
+  test("phase log on, canceled request: one request_aborted line with the phase in progress; the request line does not repeat the fields", async () => {
+    const { s, rows } = await staged(4);
+    const held = deferred();
+    let started = 0;
+    const slow = new Proxy(s, {
+      get(t, prop) {
+        if (prop === "getObject") return async (...a: Parameters<typeof s.getObject>) => (started++, await held.promise, t.getObject(...a));
+        const v = Reflect.get(t, prop, t);
+        return typeof v === "function" ? v.bind(t) : v;
+      },
+    });
+    const ac = new AbortController();
+    const { get, logs } = api({ events: true, phaseLog: true, stageConcurrency: 2, store: slow, reads: scriptedReads({ stages: [rows] }).reads });
+    const pending = get(P, ac.signal);
+    while (started < 2) await new Promise((r) => setTimeout(r, 1));
+    ac.abort();
+    held.resolve();
+    const r = await pending;
+    expect(r.status).toBe(503);
+    expect(started).toBe(2);
+    const aborted = logs.filter((l) => l.reason === "request_aborted");
+    expect(aborted).toHaveLength(1);
+    expect(aborted[0]).toMatchObject({ route: "/v1/sessions/:sessionId/events", aborted_phase: "s3_fetch", s3_stage_count: 4 });
+    expect(typeof aborted[0]!.duration_ms).toBe("number");
+    expect(typeof aborted[0]!.correlation_id).toBe("string");
+    for (const l of logs) if (l !== aborted[0]) for (const f of NEW) expect(l, f).not.toHaveProperty(f);
+  });
+
+  test("phase log on, canceled after the response: no request_aborted line (the listener is removed)", async () => {
+    const { s, rows } = await staged(1);
+    const ac = new AbortController();
+    const { get, logs } = api({ events: true, phaseLog: true, store: s, reads: scriptedReads({ stages: [rows] }).reads });
+    expect((await get(P, ac.signal)).status).toBe(200);
+    ac.abort();
+    expect(logs.some((l) => l.reason === "request_aborted")).toBe(false);
+    expect(requestLine(logs)).toHaveProperty("fold_ms");
   });
 });

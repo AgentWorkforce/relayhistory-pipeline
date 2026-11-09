@@ -40,6 +40,14 @@
  * than off/on, on with owner_buffered off, and a template that already declares the var (in every
  * mode and for every owner_buffered_events value, including the default and gate-only renders).
  *
+ * owner_buffered_stage_concurrency=2..32 and owner_buffered_phase_log=on (owner-buffered events
+ * read latency): valid only with owner_buffered_events=on (they act on that read only); add vars
+ * READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY=<n> (at most n stage GetObjects in flight) and
+ * READ_API_OWNER_BUFFERED_PHASE_LOG=1 (per-phase *_ms fields on the request log line).
+ * off (the default, empty = off) changes nothing: every render is byte-identical to the render
+ * before these inputs existed. Refused: any other value, either set without
+ * owner_buffered_events=on, and a template that already declares either var (in every mode).
+ *
  * agent_match=on (agent-name prefix search, docs/agent-name-search-contract.md, migration
  * 20261105050020): adds vars READ_API_AGENT_MATCH="true" (the Worker enables it only on exactly
  * "true") to whichever render the other inputs select; no binding, no workspace list. Independent
@@ -58,6 +66,7 @@
  *   HYPERDRIVE_ID, OWNER_BUFFERED (off|on; empty = off), OWNER_BUFFERED_WORKSPACES,
  *   OWNER_BUFFERED_S3_BUCKET, OWNER_BUFFERED_S3_REGION, DIRECTORY_WORKSPACES,
  *   BUFFERED_SEARCH_GATE (off|on; empty = off), OWNER_BUFFERED_EVENTS (off|on; empty = off),
+ *   OWNER_BUFFERED_STAGE_CONCURRENCY (off|2..32; empty = off), OWNER_BUFFERED_PHASE_LOG (off|on; empty = off),
  *   AGENT_MATCH (off|on; empty = off).
  */
 import { readFileSync, writeFileSync } from "node:fs";
@@ -78,9 +87,14 @@ export const BUFFERED_SEARCH_GATE_VAR = "READ_API_BUFFERED_SEARCH_GATE";
 
 /** The owner-buffered events flag (index.ts Env; ownerBufferedEventsEnabled accepts only "on"). */
 export const OWNER_BUFFERED_EVENTS_VAR = "READ_API_OWNER_BUFFERED_EVENTS";
-
+/** The owner-buffered events read's stage concurrency (index.ts Env; ownerBufferedStageConcurrency accepts 2..32). */
+export const OWNER_BUFFERED_STAGE_CONCURRENCY_VAR = "READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY";
+/** The owner-buffered events read's per-phase log fields (index.ts Env; ownerBufferedPhaseLogEnabled accepts only "1"). */
+export const OWNER_BUFFERED_PHASE_LOG_VAR = "READ_API_OWNER_BUFFERED_PHASE_LOG";
 /** The agent-name prefix search flag (src/session-read-api/config.ts agentMatchEnabled accepts only "true"). */
 export const AGENT_MATCH_VAR = "READ_API_AGENT_MATCH";
+/** Vars only this render adds; a template declaring any of them is refused in every mode. */
+const RENDER_ONLY_VARS = [OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, AGENT_MATCH_VAR] as const;
 
 export interface RenderInputs {
   hyperdriveId: string;
@@ -95,6 +109,10 @@ export interface RenderInputs {
   bufferedSearchGate?: string;
   /** The owner_buffered_events workflow_dispatch input; "" (no input) = off; on needs owner_buffered=on. */
   ownerBufferedEvents?: string;
+  /** The owner_buffered_stage_concurrency workflow_dispatch input; "" or "off" = off, else 2..32; needs owner_buffered_events=on. */
+  ownerBufferedStageConcurrency?: string;
+  /** The owner_buffered_phase_log workflow_dispatch input; "" (no input) = off; on needs owner_buffered_events=on. */
+  ownerBufferedPhaseLog?: string;
   /** The agent_match workflow_dispatch input; "" (no input) = off. */
   agentMatch?: string;
 }
@@ -147,7 +165,7 @@ function leaveUnset(vars: Record<string, string>, keys: readonly string[]): void
   }
 }
 
-/** Refuses a template whose vars already declare one of `keys`, in every mode; an unparsable template is left to the paths that parse it. */
+/** Refuses a template whose vars already declare one of `keys` (a render-only flag), in every mode; an unparsable template is left to the paths that parse it. */
 function refusePredeclared(template: string, hyperdriveId: string, keys: readonly string[]): void {
   const parsed = ts.parseConfigFileTextToJson("wrangler.jsonc", renderDefault(template, hyperdriveId));
   if (parsed.error) return;
@@ -160,7 +178,6 @@ export function renderDeployConfig(template: string, inputs: RenderInputs): stri
   const agentMode = (inputs.agentMatch ?? "").trim() || "off";
   if (agentMode !== "off" && agentMode !== "on") throw new RenderError('agent_match must be "off" or "on"');
   const out = renderWithoutAgentMatch(template, inputs);
-  refusePredeclared(template, inputs.hyperdriveId, [AGENT_MATCH_VAR]);
   if (agentMode === "off") return out;
   // agent_match=on: the selected render plus the flag, nothing else. The off renders are JSON or the
   // default JSONC; both parse here, and the default one is checked for services/env like the gate-only render.
@@ -183,7 +200,15 @@ function renderWithoutAgentMatch(template: string, inputs: RenderInputs): string
   const eventsMode = (inputs.ownerBufferedEvents ?? "").trim() || "off";
   if (eventsMode !== "off" && eventsMode !== "on") throw new RenderError('owner_buffered_events must be "off" or "on"');
   const events = eventsMode === "on";
-  refusePredeclared(template, inputs.hyperdriveId, [OWNER_BUFFERED_EVENTS_VAR]);
+  const concurrencyMode = (inputs.ownerBufferedStageConcurrency ?? "").trim() || "off";
+  if (concurrencyMode !== "off" && !/^(?:[2-9]|[12][0-9]|3[0-2])$/.test(concurrencyMode)) throw new RenderError('owner_buffered_stage_concurrency must be "off" or an integer 2..32');
+  const concurrency = concurrencyMode === "off" ? undefined : concurrencyMode;
+  const phaseLogMode = (inputs.ownerBufferedPhaseLog ?? "").trim() || "off";
+  if (phaseLogMode !== "off" && phaseLogMode !== "on") throw new RenderError('owner_buffered_phase_log must be "off" or "on"');
+  const phaseLog = phaseLogMode === "on";
+  refusePredeclared(template, inputs.hyperdriveId, RENDER_ONLY_VARS);
+  if (concurrency !== undefined && !events) throw new RenderError("owner_buffered_stage_concurrency needs owner_buffered_events=on; refusing a flag that would have no effect");
+  if (phaseLog && !events) throw new RenderError("owner_buffered_phase_log=on needs owner_buffered_events=on; refusing a flag that would have no effect");
   const workspacesRaw = (inputs.ownerBufferedWorkspaces ?? "").trim();
   if (events && mode !== "on") throw new RenderError("owner_buffered_events=on needs owner_buffered=on; refusing a flag that would have no effect");
   if (mode === "off") {
@@ -217,6 +242,8 @@ function renderWithoutAgentMatch(template: string, inputs: RenderInputs): string
   leaveUnset(vars, ["RELAYHISTORY_READ_OWNER_BUFFERED", "READ_API_OWNER_BUFFERED_WORKSPACES", "INGEST_S3_BUCKET", "INGEST_S3_REGION"]);
   if (gate) leaveUnset(vars, [BUFFERED_SEARCH_GATE_VAR]);
   if (events) leaveUnset(vars, [OWNER_BUFFERED_EVENTS_VAR]);
+  if (concurrency !== undefined) leaveUnset(vars, [OWNER_BUFFERED_STAGE_CONCURRENCY_VAR]);
+  if (phaseLog) leaveUnset(vars, [OWNER_BUFFERED_PHASE_LOG_VAR]);
   const rendered = {
     ...config,
     services: [{ ...CONTROL_HEAD_BINDING }],
@@ -229,6 +256,8 @@ function renderWithoutAgentMatch(template: string, inputs: RenderInputs): string
       // One binding serves both readers; the gate adds only its flag.
       ...(gate ? { [BUFFERED_SEARCH_GATE_VAR]: "on" } : {}),
       ...(events ? { [OWNER_BUFFERED_EVENTS_VAR]: "on" } : {}),
+      ...(concurrency !== undefined ? { [OWNER_BUFFERED_STAGE_CONCURRENCY_VAR]: concurrency } : {}),
+      ...(phaseLog ? { [OWNER_BUFFERED_PHASE_LOG_VAR]: "1" } : {}),
     },
   };
   return `${JSON.stringify(rendered, null, 2)}\n`;
@@ -246,6 +275,8 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
       directoryWorkspaces: process.env.DIRECTORY_WORKSPACES,
       bufferedSearchGate: process.env.BUFFERED_SEARCH_GATE,
       ownerBufferedEvents: process.env.OWNER_BUFFERED_EVENTS,
+      ownerBufferedStageConcurrency: process.env.OWNER_BUFFERED_STAGE_CONCURRENCY,
+      ownerBufferedPhaseLog: process.env.OWNER_BUFFERED_PHASE_LOG,
       agentMatch: process.env.AGENT_MATCH,
     });
     writeFileSync(here("../wrangler.deploy.jsonc"), out);
@@ -255,6 +286,9 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     const binding = `${CONTROL_HEAD_BINDING.binding} -> ${CONTROL_HEAD_BINDING.service}#${CONTROL_HEAD_BINDING.entrypoint}`;
     console.log(on ? `deploy config: owner-buffered ON (${all ? "all workspaces" : "canary list"}), ${binding}` : gate ? "deploy config: owner-buffered off" : "deploy config: owner-buffered off (Hyperdrive id only)");
     if (((process.env.OWNER_BUFFERED_EVENTS ?? "").trim() || "off") === "on") console.log(`deploy config: owner-buffered events ON, ${OWNER_BUFFERED_EVENTS_VAR}=on`);
+    const concurrencyOut = (process.env.OWNER_BUFFERED_STAGE_CONCURRENCY ?? "").trim() || "off";
+    if (concurrencyOut !== "off") console.log(`deploy config: owner-buffered events stage concurrency ON, ${OWNER_BUFFERED_STAGE_CONCURRENCY_VAR}=${concurrencyOut}`);
+    if (((process.env.OWNER_BUFFERED_PHASE_LOG ?? "").trim() || "off") === "on") console.log(`deploy config: owner-buffered events phase log ON, ${OWNER_BUFFERED_PHASE_LOG_VAR}=1`);
     if (((process.env.AGENT_MATCH ?? "").trim() || "off") === "on") console.log(`deploy config: agent-name prefix search ON, ${AGENT_MATCH_VAR}=true`);
     if (gate) console.log(`deploy config: buffered search gate ON, ${BUFFERED_SEARCH_GATE_VAR}=on, ${binding}${on ? " (shared with owner-buffered, rendered once)" : ""}`);
   } catch (error) {

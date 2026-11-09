@@ -97,6 +97,8 @@ import {
   type BufferedScope,
   type BufferedSessionRow,
   type OwnerBufferedDeps,
+  OwnerBufferedPhaseTimer,
+  type OwnerBufferedReadOptions,
 } from "./owner-buffered.ts";
 import { BRIEF_TITLES_MAX_KEYS, BriefTitlesError, briefTitleEntries, type BriefTitleKey, type BriefTitles } from "./brief-titles.ts";
 import {
@@ -347,7 +349,16 @@ function attestWorkspace(c: Context, identity: VerifiedIdentity): void {
 export function createReadApi(deps: ReadApiDeps) {
   if (Boolean(deps.ch) === Boolean(deps.adapter)) throw new Error("read API requires exactly one search service binding");
   if (deps.bufferedSearchGate && !deps.ch) throw new Error("buffered search gate requires the ClickHouse binding");
-  const app = new Hono<{ Variables: { identity: VerifiedIdentity; correlationId: string } }>();
+  const app = new Hono<{
+    Variables: {
+      identity: VerifiedIdentity;
+      correlationId: string;
+      /** Date.now() when the request entered the log middleware. */
+      requestStarted: number;
+      /** READ_API_OWNER_BUFFERED_PHASE_LOG=1: the events route's owner-buffered phase times, added to the request line. */
+      obPhases?: OwnerBufferedPhaseTimer;
+    };
+  }>();
   const log = deps.log ?? (() => {});
 
   app.use("*", async (c, next) => {
@@ -355,11 +366,16 @@ export function createReadApi(deps: ReadApiDeps) {
     const correlationId = incoming && /^[A-Za-z0-9._:-]{1,128}$/.test(incoming) ? incoming : crypto.randomUUID();
     c.set("correlationId", correlationId);
     const started = Date.now();
+    c.set("requestStarted", started);
     await next();
     c.header("Cache-Control", "private, no-store");
     c.header("X-Sessions-Read-Backend", "96bulls");
     c.header("X-Correlation-Id", correlationId);
-    log({ route: c.req.routePath, status: c.res.status, duration_ms: Date.now() - started, correlation_id: correlationId });
+    const phases = c.get("obPhases");
+    log({
+      route: c.req.routePath, status: c.res.status, duration_ms: Date.now() - started, correlation_id: correlationId,
+      ...(phases && !phases.emitted ? phases.fields() : {}),
+    });
   });
 
   app.get("/health", (c) => c.json({ ok: true }));
@@ -582,8 +598,28 @@ export function createReadApi(deps: ReadApiDeps) {
   const bufferedTurns = (c: Context, identity: VerifiedIdentity, ob: OwnerBufferedDeps, sessionId: string, source: string) =>
     bufferedDetail(c, () => readOwnerBufferedTurns(ob, bufferedScope(identity), source, sessionId));
   /** The caller's buffered event rows of one session (readOwnerBufferedEvents), with bufferedTurns' outcomes. */
-  const bufferedEvents = (c: Context, identity: VerifiedIdentity, ob: OwnerBufferedDeps, sessionId: string, source: string) =>
-    bufferedDetail(c, () => readOwnerBufferedEvents(ob, bufferedScope(identity), source, sessionId));
+  const bufferedEvents = (c: Context, identity: VerifiedIdentity, ob: OwnerBufferedDeps, sessionId: string, source: string, opts: OwnerBufferedReadOptions) =>
+    bufferedDetail(c, () => readOwnerBufferedEvents(ob, bufferedScope(identity), source, sessionId, opts));
+
+  /**
+   * READ_API_OWNER_BUFFERED_PHASE_LOG=1: when the client cancels the request (request.signal
+   * aborts; in workerd only with the enable_request_signal compatibility flag), log the phase
+   * times once, at once, with `aborted_phase` (the phase in progress, else "none"): the request
+   * line may never be written for a canceled invocation. Returns the listener's removal.
+   */
+  function logPhasesOnAbort(c: Context, phases: OwnerBufferedPhaseTimer): () => void {
+    const signal = c.req.raw.signal;
+    const onAbort = () => {
+      if (phases.emitted) return;
+      phases.emitted = true;
+      log({
+        route: c.req.routePath, reason: "request_aborted", duration_ms: Date.now() - (c.get("requestStarted") as number),
+        correlation_id: c.get("correlationId"), ...phases.fields("none"),
+      });
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    return () => signal.removeEventListener("abort", onAbort);
+  }
 
   async function bufferedDetail<T extends object>(c: Context, read: () => Promise<T | null | { unverifiedBeforeCandidate: string }>): Promise<T | null> {
     try {
@@ -663,6 +699,7 @@ export function createReadApi(deps: ReadApiDeps) {
   }
 
   app.get("/v1/sessions/:sessionId/events", async (c) => {
+    let stopAbortLog: (() => void) | undefined;
     try {
       const identity = c.get("identity");
       attestWorkspace(c, identity);
@@ -683,9 +720,16 @@ export function createReadApi(deps: ReadApiDeps) {
       const ob = source !== undefined ? ownerBufferedFor(identity) : undefined;
       if (ob?.events === true && source !== undefined) {
         const presented = decodeBackendCursor(rawCursor);
-        start = await deps.liveness.sessionStart(identity.orgId, identity.workspaceId, sessionId, source);
+        // READ_API_OWNER_BUFFERED_PHASE_LOG=1: per-phase times on the request line (durations only).
+        const phases = ob.phaseLog === true ? new OwnerBufferedPhaseTimer() : undefined;
+        if (phases) {
+          c.set("obPhases", phases);
+          stopAbortLog = logPhasesOnAbort(c, phases);
+        }
+        const sessionStart = () => deps.liveness.sessionStart(identity.orgId, identity.workspaceId, sessionId, source);
+        start = await (phases ? phases.time("session_start", sessionStart) : sessionStart());
         if (start.pointers === 0) {
-          const served = await bufferedEvents(c, identity, ob, sessionId, source);
+          const served = await bufferedEvents(c, identity, ob, sessionId, source, { signal: c.req.raw.signal, phases });
           if (served && (served.erased || served.rows.length > 0)) {
             if (served.erased) {
               c.header(BUFFERED_HEADER, "1");
@@ -713,6 +757,8 @@ export function createReadApi(deps: ReadApiDeps) {
     } catch (error) {
       if (error instanceof CanonicalReadError) return fail(c, unsupported(`message_id_canonical_${error.reason}`));
       return fail(c, error);
+    } finally {
+      stopAbortLog?.();
     }
   });
 
