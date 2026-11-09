@@ -16,6 +16,7 @@ import {
   SESSION_PIPELINE_RESOURCES,
   SESSION_SEMANTIC_COPY_RESOURCES,
   SESSION_BUFFERED_SEARCH_FEED_RESOURCES,
+  SESSION_BUFFERED_ERASURE_DELETE_RESOURCES,
 } from "../session-pipeline.ts";
 import {
   ABORT_INCOMPLETE_UPLOAD_DAYS,
@@ -627,6 +628,7 @@ describe("transcript store: deploy plan contract", () => {
       ...SESSION_ANALYSIS_CACHE_RESOURCES,
       ...SESSION_SEMANTIC_COPY_RESOURCES,
       ...SESSION_BUFFERED_SEARCH_FEED_RESOURCES,
+      ...SESSION_BUFFERED_ERASURE_DELETE_RESOURCES,
     ];
     const compact = plan({ "transcript-srv-writer": "update" }, undefined, deployedContext);
     const full = withNativeInboxPolicyDiff(compact);
@@ -638,10 +640,11 @@ describe("transcript store: deploy plan contract", () => {
       SESSION_ANALYSIS_CACHE_RESOURCES[0],
       SESSION_SEMANTIC_COPY_RESOURCES[0],
       SESSION_BUFFERED_SEARCH_FEED_RESOURCES[0],
+      SESSION_BUFFERED_ERASURE_DELETE_RESOURCES[0],
     ]) {
       const mixed = plan({ "transcript-srv-writer": "update", [changedResource]: "update" }, undefined, deployedContext);
       const mixedFull = withNativeInboxPolicyDiff(mixed);
-      expect(() => check(mixed, mixedFull, provenance(mixed, mixedFull))).toThrow(/session read api|session brief|session analysis cache|semantic copy|buffered search feed/);
+      expect(() => check(mixed, mixedFull, provenance(mixed, mixedFull))).toThrow(/session read api|session brief|session analysis cache|semantic copy|buffered search feed|buffered erasure delete/);
     }
   });
 
