@@ -26,7 +26,10 @@ try {
   const known = new Set(["--batch-size", "--statement-timeout-ms", "--max-batches", "--dry-run"]);
   for (let i = 0; i < args.length; i++) {
     if (!known.has(args[i]!)) throw Error("unknown_flag");
-    if (args[i] !== "--dry-run") i++;
+    if (args[i] !== "--dry-run") {
+      if (args[i + 1] === undefined || args[i + 1]!.startsWith("--")) throw Error("flag_value_required");
+      i++;
+    }
   }
   const flag = (n: string) => { const i = args.indexOf("--" + n); return i < 0 ? undefined : args[i + 1]; };
   const int = (v: string | undefined, d: number | undefined, code: string) => {
