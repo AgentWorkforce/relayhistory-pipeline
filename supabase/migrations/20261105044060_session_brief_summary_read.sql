@@ -1,5 +1,5 @@
--- Native model descriptions for the service read API. No table grants, no generation,
--- no backfilled text. The existing read-role tenant binding is the only authority.
+-- Native model descriptions and recorded catalog title fallback. No new table grants
+-- or model calls. Existing read-role tenant binding and consumer authority are kept.
 CREATE FUNCTION sessions.session_brief_summary_for(
  p_workspace_id text, p_harness text, p_session_id text
 ) RETURNS TABLE(org_id text, workspace_id text, harness text, session_id text,
@@ -57,7 +57,7 @@ BEGIN
 END
 $summary$;
 REVOKE ALL ON FUNCTION sessions.session_brief_summary_for(text,text,text)
- FROM PUBLIC, anon, authenticated, service_role;
+ FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION sessions.session_brief_summary_for(text,text,text) TO bulls96_read_api;
 DO $revoke$
 DECLARE v_grantee text; v_fn regprocedure := 'sessions.session_brief_summary_for(text,text,text)'::regprocedure;
@@ -69,3 +69,67 @@ BEGIN
  LOOP EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %I',v_fn,v_grantee); END LOOP;
 END
 $revoke$;
+
+-- Persist recorded scrubbed catalog titles separately from model/pointer titles.
+ALTER TABLE sessions.session_directory
+  ADD COLUMN recorded_catalog_title text
+  CHECK (recorded_catalog_title IS NULL OR
+    (char_length(recorded_catalog_title) BETWEEN 1 AND 90
+      AND recorded_catalog_title = btrim(recorded_catalog_title)
+      AND recorded_catalog_title !~ '[[:cntrl:]]')),
+  ADD CONSTRAINT session_directory_recorded_title_live CHECK
+    (recorded_catalog_title IS NULL OR (deleted_at IS NULL AND event_projection_ready));
+
+COMMENT ON COLUMN sessions.session_directory.recorded_catalog_title IS
+  'Bounded already-scrubbed recorded session catalog title, written only after a complete canonical projection; below native brief and pointer title in display precedence.';
+
+CREATE FUNCTION sessions.session_directory_recorded_title_invalidate()
+RETURNS trigger LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp AS $recorded$
+DECLARE invalidated boolean;
+BEGIN
+  invalidated := NEW.deleted_at IS NOT NULL OR NEW.event_projection_ready IS NOT TRUE;
+  IF TG_OP = 'UPDATE' THEN
+    invalidated := invalidated OR NEW.event_projection_epoch IS DISTINCT FROM OLD.event_projection_epoch;
+  END IF;
+  IF invalidated THEN
+    NEW.recorded_catalog_title := NULL;
+    -- A derived title may not retain invalidated recorded content. Never retain an
+    -- old model title here as a fallback; normal projectors recompute priority.
+    IF TG_OP = 'UPDATE' AND OLD.recorded_catalog_title IS NOT NULL
+      AND NEW.title IS NOT DISTINCT FROM OLD.recorded_catalog_title THEN
+      NEW.title := NULL;
+    END IF;
+    IF TG_OP = 'UPDATE' AND OLD.recorded_catalog_title IS NOT NULL THEN
+      NEW.search_text := '';
+    END IF;
+  END IF;
+  RETURN NEW;
+END
+$recorded$;
+CREATE TRIGGER session_directory_recorded_title_invalidate
+  BEFORE INSERT OR UPDATE ON sessions.session_directory
+  FOR EACH ROW EXECUTE FUNCTION sessions.session_directory_recorded_title_invalidate();
+REVOKE ALL ON FUNCTION sessions.session_directory_recorded_title_invalidate() FROM PUBLIC;
+DO $optional_roles$
+DECLARE role_name text;
+BEGIN
+  FOREACH role_name IN ARRAY ARRAY['anon','authenticated','service_role','search_consumer_runtime'] LOOP
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname=role_name) THEN
+      EXECUTE format('REVOKE ALL ON FUNCTION sessions.session_directory_recorded_title_invalidate() FROM %I', role_name);
+    END IF;
+  END LOOP;
+END
+$optional_roles$;
+
+-- Default ACLs may include other roles. The trigger function remains owner-only.
+DO $recorded_acl$
+DECLARE v_grantee text; v_fn regprocedure := 'sessions.session_directory_recorded_title_invalidate()'::regprocedure;
+BEGIN
+ FOR v_grantee IN SELECT r.rolname FROM pg_catalog.pg_proc p
+  CROSS JOIN LATERAL pg_catalog.aclexplode(coalesce(p.proacl,pg_catalog.acldefault('f',p.proowner))) a
+  JOIN pg_catalog.pg_roles r ON r.oid=a.grantee
+  WHERE p.oid=v_fn AND a.privilege_type='EXECUTE' AND a.grantee<>p.proowner
+ LOOP EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %I',v_fn,v_grantee); END LOOP;
+END
+$recorded_acl$;

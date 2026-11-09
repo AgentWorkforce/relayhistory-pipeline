@@ -230,7 +230,7 @@ privately. It is optional context and is not needed to follow this section.
   returns `short_summary_generated_at`.
 
 
-### Recorded title fallback (unreleased source proposal)
+### Recorded title fallback (044060)
 
 The complete canonical catalog supplies its existing scrubbed `title` metadata to
 `recorded_catalog_title`; the list still serves `title` through its existing RPC.
@@ -249,6 +249,9 @@ recomputes it; equality never decides normal ready publication priority.
 This adds no model call, project-ID inference, object read per list row,
 or database privilege. Local paths remain excluded from project IDs/keys.
 
-The test-only column/trigger proposal is not an independently numbered migration.
-It must be folded into the reserved, unapplied summary migration and qualified with
-that migration's generation, rollback and boundary manifest before deployment.
+The storage and invoker-only invalidation trigger are part of the summary read
+migration, `20261105044060_session_brief_summary_read.sql`. Complete canonical
+replays also clear a removed or invalid recorded title at the same source epoch.
+A denied schema-metadata read fails closed; pre-044060 no-title metadata callers
+retain their prior behavior. Deployments require this migration's exact generation,
+rollback and boundary manifest qualification.

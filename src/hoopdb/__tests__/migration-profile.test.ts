@@ -149,7 +149,7 @@ type RuntimeAclCatalog = ReturnType<typeof migrateGuards.runtimeApplicationAclCa
 
 /**
  * The previous release's ACL view: the current function ACL manifest and runtime application ACL catalog minus
- * everything the later steps CREATE. A previous release's binary shipped the manifest and catalog of its day, which
+ * everything omitted from that prefix CREATEs. A previous release's binary shipped the manifest and catalog of its day, which
  * could not yet list a function, table or sequence a later step creates; the current ones do, so on a database without
  * them the ACL install regclass/regprocedure-casts a missing object (42P01/42883) and the non-local exact-ACL check
  * refuses (function_acl_drift). Relations: CREATE [UNLOGGED|TEMP] TABLE/SEQUENCE in sessions, plus the
@@ -178,7 +178,7 @@ function previousReleaseAcl(laterSteps: ReadonlyArray<{ path: string }>, manifes
  * Model the previous release that stopped just before `cutoff`: `steps` is the full plan without `cutoff` and without
  * every later upstream step (a ledger gap otherwise); `later` names those later steps. When there are later steps,
  * sessionsFunctionAclManifest and runtimeApplicationAclCatalog are spied to return the previous release's ACL view
- * (previousReleaseAcl) until `restore()`; with no later step nothing is mocked (the current manifest and catalog are
+ * (previousReleaseAcl) until `restore()`; the cutoff's own CREATE FUNCTION definitions are omitted too. With no omitted step nothing is mocked (the current manifest and catalog are
  * that release's). `current` replaces the manifest/catalog the view is derived from (the regression test's synthetic
  * later slot); by default it is the real one. Every truncated `runMigrations` in this file goes through this model,
  * with `restore()` in a `finally` right after it.
@@ -191,13 +191,14 @@ async function previousReleaseModel(
   const laterSteps = laterUpstream(full, cutoff);
   const later = laterSteps.map((s) => s.name);
   const steps = full.filter((s) => s.name !== cutoff && !later.includes(s.name));
+  const omittedSteps = full.filter((s) => s.name === cutoff || later.includes(s.name));
   const { previousManifest, previousCatalog } = previousReleaseAcl(
-    laterSteps,
+    omittedSteps,
     current?.manifest ?? await migrateGuards.sessionsFunctionAclManifest(),
     current?.catalog ?? migrateGuards.runtimeApplicationAclCatalog(),
   );
-  const manifestSpy = later.length ? spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(previousManifest) : undefined;
-  const catalogSpy = later.length ? spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(previousCatalog) : undefined;
+  const manifestSpy = omittedSteps.length ? spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(previousManifest) : undefined;
+  const catalogSpy = omittedSteps.length ? spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(previousCatalog) : undefined;
   return {
     steps,
     later,
@@ -4471,6 +4472,42 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
       manifestWithRuntime("g6_rt"),
     );
   });
+
+// The reserved summary lane owns both its read RPC and recorded-title schema.
+test("044060 real prefix upgrade/fresh/noop/rollback/up preserves pointers and exact owner-only invalidation ACL", async () => {
+  const db=await supabaseLike(); await db.exec(ET_BOOT);
+  const name="upstream:20261105044060_session_brief_summary_read.sql";
+  const full=await plan(SUPA_ET), previous=await previousReleaseModel(full,name);
+  try { expect(await failure(runMigrations(client(db),{profile:SUPA_ET,steps:previous.steps}))).toBeNull(); }
+  finally { previous.restore(); }
+  expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(false);
+  // A real pointer is preserved through the supported upgrade and rollback, not a
+  // synthetic title-only table standing in for the session schema.
+  await db.query(`INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,
+    created_at,last_activity_at,storage_provider,bucket,manifest_key,content_sha256,raw_format,trace_id,revision,title)
+    VALUES('org-title','ws-title','codex','session-title','machine-title','user-title',now(),now(),'fs','bucket','manifest/title',
+    decode(repeat('ab',32),'hex'),'jsonl','019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18',1,'Pointer retained')`);
+  const preserved=async()=>expect((await db.query<{title:string}>("SELECT title FROM sessions.session_index WHERE session_id='session-title'")).rows).toEqual([{title:"Pointer retained"}]);
+  expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(1);
+  expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(true);await preserved();
+  const acl=await db.query<{secdef:boolean;acl:string[]}>(`SELECT p.prosecdef AS secdef,
+    ARRAY(SELECT CASE WHEN a.grantee=p.proowner THEN '<owner>' ELSE coalesce(r.rolname,'PUBLIC') END||':'||a.privilege_type
+      FROM aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a LEFT JOIN pg_roles r ON r.oid=a.grantee ORDER BY 1) AS acl
+    FROM pg_proc p WHERE p.oid='sessions.session_directory_recorded_title_invalidate()'::regprocedure`);
+  expect(acl.rows).toEqual([{secdef:false,acl:["<owner>:EXECUTE"]}]);
+  const ledgerHash=async()=>migrationLedgerSha256(new Map((await db.query<{name:string;sha256:string}>("SELECT name,sha256 FROM sessions.__96bulls_migrations")).rows.map(r=>[r.name,r.sha256])));
+  const ledgerBefore=await ledgerHash();
+  expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(0);
+  expect(await ledgerHash()).toBe(ledgerBefore);await preserved();
+  await db.exec(readFileSync(join(root,"supabase/rollbacks/20261105044060_session_brief_summary_read.down.sql"),"utf8"));
+  expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(false);await preserved();
+  expect((await db.query("SELECT name FROM sessions.__96bulls_migrations WHERE name=$1",[name])).rows).toEqual([]);
+  expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(1);await preserved();
+  const freshDb=await supabaseLike();await freshDb.exec(ET_BOOT);
+  expect(await failure(runMigrations(client(freshDb),{profile:SUPA_ET,steps:full}))).toBeNull();
+  expect((await freshDb.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(true);
+},120000);
+
 });
 
 describe("every worker claim path runs the live gate first", () => {

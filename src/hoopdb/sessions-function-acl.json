@@ -1145,6 +1145,9 @@
     "sessions.session_directory_record_fences()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_directory_recorded_title_invalidate()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.session_directory_replay_pages(text,text,text)": [
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"

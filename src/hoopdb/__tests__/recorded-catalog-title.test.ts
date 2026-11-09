@@ -1,7 +1,12 @@
-/** Unreleased source proposal: the fixture DDL is to be folded into reserved 044060. */
+/** Real 044060 storage/invalidation and runtime writer/projector contracts. */
 import { afterEach, expect, test } from "bun:test";
-import type { PGlite } from "@electric-sql/pglite";
-import { database, hoopDb, KEY, pointer, read } from "../../session-brief/__tests__/harness.ts";
+import { PGlite } from "@electric-sql/pglite";
+import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
+import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
+import { readdirSync } from "node:fs";
+import { join } from "node:path";
+import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
+import { database, hoopDb, KEY, pointer, read, root } from "../../session-brief/__tests__/harness.ts";
 import { recordBrief, type BriefText } from "../../session-brief/store.ts";
 import { projectSessionDirectory } from "../session-directory-projector.ts";
 import { directoryCatalogFromProjection, writeDirectoryCatalog, writeLegacyDirectoryCatalog } from "../session-directory-catalog.ts";
@@ -11,10 +16,19 @@ afterEach(async () => { for (const db of opened.splice(0)) await db.close(); });
 const values = Object.values(KEY);
 async function setup() {
   const db = await database(); opened.push(db);
-  await db.exec(read("src/hoopdb/__tests__/fixtures/recorded-catalog-title-proposal.sql"));
   await pointer(db, { title: null });
   await db.query(`UPDATE sessions.session_directory SET event_projection_ready=true,
     event_projection_version=1,event_projected_at=now(),event_projection_sources='{"m-1":1}'::jsonb`);
+  return db;
+}
+async function before060() {
+  const db=new PGlite({extensions:{btree_gin,pg_trgm}}); opened.push(db);
+  await db.exec(read("supabase/tests/supabase_shim.sql"));
+  for(const file of SESSION_BOOTSTRAP_FILES) await db.exec(read(file));
+  for(const file of readdirSync(join(root,"supabase/migrations")).sort())
+    if(file<"20261105044060_session_brief_summary_read.sql") await db.exec(read("supabase/migrations/"+file));
+  for(const file of readdirSync(join(root,"src/hoopdb/migrations")).filter(f=>f.endsWith(".sql")).sort())
+    await db.exec(read("src/hoopdb/migrations/"+file));
   return db;
 }
 const input = (title: unknown) => directoryCatalogFromProjection([{ table: "session_catalog", row: { title, models: [], project_key: "/Users/example", project_key_method: "path" } }]);
@@ -36,6 +50,9 @@ for (const [name, writer] of [["current", writeDirectoryCatalog], ["legacy", wri
     expect((await state(db)).title).toBe("Recorded session title");
     // Replays do not erase recorded metadata or replace a genuine model title.
     expect(await recordBrief(hoopDb(db), KEY, { "m-1": 1 }, { status: "ready", text })).toEqual({ written: true });
+    await writer(db as never, KEY, input(undefined), opts);
+    expect((await state(db)).recorded_catalog_title).toBeNull();
+    expect((await state(db)).title).toBe(text.title);
     await writer(db as never, KEY, input("Changed recorded title"), opts);
     expect((await state(db)).recorded_catalog_title).toBe("Changed recorded title");
     expect((await state(db)).title).toBe(text.title);
@@ -84,15 +101,18 @@ test("invalid recorded titles never reach the column, while legitimate redacted 
   expect((await state(db)).recorded_catalog_title).toBe("[REDACTED]");
   // Source validation is re-applied at the write boundary, even for a manually built DTO.
   await writeDirectoryCatalog(db as never, KEY, { ...input(null), recordedTitle: "x".repeat(91) }, opts);
-  expect((await state(db)).recorded_catalog_title).toBe("[REDACTED]");
+  expect((await state(db)).recorded_catalog_title).toBeNull();
+  expect((await state(db)).title).toBeNull();
 });
 
 test("recorded writes require the schema and legacy epoch contract instead of silently losing metadata", async () => {
-  const db = await database(); opened.push(db);
+  const db = await before060();
   await pointer(db, { title: null });
   await db.query(`UPDATE sessions.session_directory SET event_projection_ready=true,event_projection_version=1,event_projected_at=now(),event_projection_sources='{"m-1":1}'::jsonb`);
   await expect(writeDirectoryCatalog(db as never, KEY, input("Recorded title"), { expectedEpoch: await epoch(db) })).rejects.toMatchObject({ code: "42703" });
-  await expect(writeLegacyDirectoryCatalog(db as never, KEY, input("Recorded title"))).rejects.toThrow("directory_catalog_epoch_invalid");
+  await expect(writeLegacyDirectoryCatalog(db as never, KEY, input("Recorded title"))).rejects.toThrow("directory_recorded_title_not_migrated");
+  const current=await setup();
+  await expect(writeLegacyDirectoryCatalog(current as never, KEY, input("Recorded title"))).rejects.toThrow("directory_catalog_epoch_invalid");
 });
 
 
@@ -130,6 +150,9 @@ for (const priority of ["model", "pointer"] as const) {
     await writeDirectoryCatalog(db as never, KEY, input("Same recorded title"), opts);
     if (priority === "model") {
       await recordBrief(hoopDb(db), KEY, {"m-1":1}, {status:"ready",text:{...text,title:"Same recorded title"}});
+      await writeDirectoryCatalog(db as never, KEY, input("Different recorded title"), opts);
+      expect((await state(db)).title).toBe("Same recorded title");
+      await writeDirectoryCatalog(db as never, KEY, input("Same recorded title"), opts);
     } else {
       // The pointer title change invalidates the projection, so publish a fresh complete catalog.
       await db.query("UPDATE sessions.session_index SET title='Same recorded title' WHERE session_id=$1", [KEY.sessionId]);
@@ -150,3 +173,42 @@ for (const priority of ["model", "pointer"] as const) {
     }
   });
 }
+
+
+for(const [name,writer] of [["current",writeDirectoryCatalog],["legacy",writeLegacyDirectoryCatalog]]as const){
+ test(`${name}: same-epoch complete replay removes absent/invalid recorded metadata without retaining stale title`,async()=>{
+  const db=await setup(),opts={expectedEpoch:await epoch(db)};
+  for(const removed of [undefined,"x".repeat(91),"bad\ntitle"]){
+   await writer(db as never,KEY,input("Former recorded title"),opts);
+   expect((await state(db)).title).toBe("Former recorded title");
+   await writer(db as never,KEY,input(removed),opts);
+   expect((await state(db)).recorded_catalog_title).toBeNull();
+   expect((await state(db)).title).toBeNull();
+   expect((await state(db)).search_text).not.toContain("Former recorded title");
+   expect(await epoch(db)).toBe(opts.expectedEpoch);
+  }
+ });
+}
+
+test("schema metadata denial/malformed result refuses before catalog writes",async()=>{
+ let writes=0;
+ const deniedCalls:string[]=[];
+ const denied={query:async(sql:string)=>{deniedCalls.push(sql);throw Object.assign(new Error("fixture denial"),{code:"42501"});}};
+ await expect(writeDirectoryCatalog(denied as never,KEY,input("Recorded"),{expectedEpoch:"0"})).rejects.toMatchObject({code:"42501"});
+ expect(deniedCalls).toHaveLength(1);
+ expect(deniedCalls[0]).toMatch(/^SELECT /);
+ const malformed={query:async(sql:string)=>{if(!sql.startsWith("SELECT EXISTS"))writes++;return{rows:[]};}};
+ await expect(writeDirectoryCatalog(malformed as never,KEY,input("Recorded"),{expectedEpoch:"0"})).rejects.toThrow("directory_catalog_schema_unavailable");
+ expect(writes).toBe(0);
+});
+
+
+test("real 044060 strips default EXECUTE grants and keeps the invalidation function owner-only",async()=>{
+ const db=await before060();
+ await db.exec("CREATE ROLE unrelated_title_caller NOLOGIN; ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO unrelated_title_caller");
+ await db.exec(read("supabase/migrations/20261105044060_session_brief_summary_read.sql"));
+ for(const fn of ["sessions.session_directory_recorded_title_invalidate()","sessions.session_brief_summary_for(text,text,text)"]){
+  expect((await db.query<{allowed:boolean}>("SELECT has_function_privilege('unrelated_title_caller',$1,'EXECUTE') AS allowed",[fn])).rows[0]!.allowed).toBe(false);
+ }
+ expect((await db.query<{secdef:boolean}>("SELECT prosecdef AS secdef FROM pg_proc WHERE oid='sessions.session_directory_recorded_title_invalidate()'::regprocedure")).rows).toEqual([{secdef:false}]);
+});

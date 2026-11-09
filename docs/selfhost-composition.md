@@ -443,7 +443,14 @@ existing directory-workspace allowlist. It returns only a fresh ready native
 model description with its stored model and generation timestamp; missing or
 pending output is explicitly empty. State is `null` because the brief's state
 enum is not the dashboard state contract. The reader receives only a scoped
-function grant, and the consumer receives no summary table access.
+function grant. The consumer receives no new summary-table privileges; its
+existing SELECT is retained for native title precedence.
+
+The same migration stores bounded recorded catalog titles separately. Native model
+titles win over pointer titles; a current complete recorded title is the final list
+fallback and does not require a model credential or model call. Source invalidation
+and deletion clear that fallback. Existing sessions need a normal complete canonical
+reprojection to populate the new slot; no direct title backfill is implied.
 
 ### Enabling the Bob Costas model summariser
 

@@ -74,18 +74,24 @@ test("one physical session with divergent machine canonical IDs refuses instead 
 test("summary rollback requires exact applied history, refuses later migrations and preserves content on every path",async()=>withDb(async pg=>{
  await recordBrief(hoopDb(pg),KEY,{"m-1":1},{status:"ready",text});
  const retained=async()=>expect((await pg.query<{description:string}>("SELECT description FROM sessions.session_briefs")).rows).toEqual([{description:text.description}]);
- expect(await down(pg)).toBe("55000");expect(await summary(pg)).toHaveLength(1);await retained();
+ expect(await down(pg)).toBe("55000");expect(await summary(pg)).toHaveLength(1);
+ expect((await pg.query("SELECT to_regprocedure('sessions.session_directory_recorded_title_invalidate()') IS NOT NULL AS exists")).rows).toEqual([{exists:true}]);await retained();
  await ledger(pg);
  await pg.query("DELETE FROM sessions.__96bulls_migrations WHERE name=$1",[NAME]);
- expect(await down(pg)).toBe("55000");expect(await summary(pg)).toHaveLength(1);await retained();
+ expect(await down(pg)).toBe("55000");expect(await summary(pg)).toHaveLength(1);
+ expect((await pg.query("SELECT to_regprocedure('sessions.session_directory_recorded_title_invalidate()') IS NOT NULL AS exists")).rows).toEqual([{exists:true}]);await retained();
  await pg.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES($1,$2)",[NAME,SHA]);
  await pg.query("UPDATE sessions.__96bulls_migrations SET sha256=repeat('0',64) WHERE name=$1",[NAME]);
- expect(await down(pg)).toBe("55000");expect(await summary(pg)).toHaveLength(1);await retained();
+ expect(await down(pg)).toBe("55000");expect(await summary(pg)).toHaveLength(1);
+ expect((await pg.query("SELECT to_regprocedure('sessions.session_directory_recorded_title_invalidate()') IS NOT NULL AS exists")).rows).toEqual([{exists:true}]);await retained();
  await pg.query("UPDATE sessions.__96bulls_migrations SET sha256=$1 WHERE name=$2",[SHA,NAME]);
  await pg.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES($1,repeat('a',64))",["upstream:99999999999999_later.sql"]);
- expect(await down(pg)).toBe("55000");expect(await summary(pg)).toHaveLength(1);await retained();
+ expect(await down(pg)).toBe("55000");expect(await summary(pg)).toHaveLength(1);
+ expect((await pg.query("SELECT to_regprocedure('sessions.session_directory_recorded_title_invalidate()') IS NOT NULL AS exists")).rows).toEqual([{exists:true}]);await retained();
  await pg.exec("DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:99999999999999_later.sql'");
  expect(await down(pg)).toBe("accepted");await retained();
+ expect((await pg.query("SELECT to_regprocedure('sessions.session_directory_recorded_title_invalidate()') AS fn")).rows).toEqual([{fn:null}]);
+ expect((await pg.query("SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='sessions.session_directory'::regclass AND attname='recorded_catalog_title' AND NOT attisdropped) AS exists")).rows).toEqual([{exists:false}]);
  expect((await pg.query("SELECT to_regprocedure('sessions.session_brief_summary_for(text,text,text)') AS fn")).rows).toEqual([{fn:null}]);
  expect((await pg.query("SELECT name FROM sessions.__96bulls_migrations WHERE name=$1",[NAME])).rows).toEqual([]);
  expect(await down(pg)).toBe("55000");await retained();
