@@ -216,7 +216,8 @@ BEGIN
         ('sessions.resolve_repo(text,text,text,timestamp with time zone)', 'EXECUTE'),
         ('sessions.repo_live(text,uuid)', 'EXECUTE'),
         ('sessions.legacy_remote(text)', 'EXECUTE'),
-        ('sessions.session_directory_search_text(text,text,text,text,text,text,text,text)', 'EXECUTE')
+        ('sessions.session_directory_search_text(text,text,text,text,text,text,text,text)', 'EXECUTE'),
+        ('sessions.session_directory_project_text(text,text,text)', 'EXECUTE')
     )
     -- held.grantee is a role name (or 'PUBLIC' for grantee 0): the writer's
     -- own rows must all be allowlisted, and any PUBLIC row in its schemas is
@@ -264,7 +265,7 @@ BEGIN
     WHERE p.pronamespace = to_regnamespace('sessions')
       AND p.proname IN ('session_index_batch', 'session_publication_is_managed', 'session_publication_lock', 'upsert_session_index',
         'applied_repo_evidence', 'canonical_remote', 'clean_root_commit', 'lock_repo_catalog', 'resolve_repo', 'session_directory_search_text',
-        'repo_live', 'legacy_remote')
+        'repo_live', 'legacy_remote', 'session_directory_project_text')
       AND NOT has_function_privilege(v_role, p.oid, 'EXECUTE')
   LOOP
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: missing EXECUTE on %s', v_role, v_bad);

@@ -500,7 +500,9 @@ export async function inspectMigrations(client: MigrationClient, profile: Migrat
     throw profileError("release_profile", "release inspection requires Supabase, verifier enabled, shim/bootstrap disabled");
   const steps = await schemaSteps();
   const { ledger, ledgerSha256, renameAliases } = await migrationPreflight(client, profile, steps);
-  const acl = await sessionsFunctionAclPreview(client, profile.runtimeRole, steps.some(s => !ledger.has(s.name)));
+  // The pending steps' SQL: the preview credits the EXECUTE grants they add (pending-added).
+  const pendingSql = await Promise.all(steps.filter(s => !ledger.has(s.name)).map(s => readFile(s.path, "utf8")));
+  const acl = await sessionsFunctionAclPreview(client, profile.runtimeRole, pendingSql);
   if (acl.function_acl_drift_extra.length || acl.function_acl_missing_refused.length)
     throw profileError("function_acl_drift", "release inspection refused ACL drift");
   // Prerequisites only, no provisioning. Authoritative migration/phase-2 SQL still
@@ -1086,27 +1088,35 @@ async function cliHistoryPreflight(
 }
 
 /** Read-only: does the ledger lack any migration this image would apply? */
-async function pendingMigrationsExist(
+/**
+ * The SQL of every step the migrator would still run (no ledger row, or a recorded checksum
+ * it would not skip), in step order; read-only. The ACL preview credits the EXECUTE grants
+ * this SQL adds.
+ */
+export async function pendingMigrationSql(
   client: MigrationClient,
-): Promise<boolean> {
+): Promise<string[]> {
+  const steps = await schemaSteps();
   const has = await client.query<{ t: string | null }>(
     `SELECT to_regclass('${MIGRATION_LEDGER}')::text AS t`,
   );
-  if (!has.rows[0]?.t) return true;
-  const done = new Map(
-    (
-      await client.query<{ name: string; sha256: string }>(
-        `SELECT name, sha256 FROM ${MIGRATION_LEDGER}`,
+  const done = has.rows[0]?.t
+    ? new Map(
+        (
+          await client.query<{ name: string; sha256: string }>(
+            `SELECT name, sha256 FROM ${MIGRATION_LEDGER}`,
+          )
+        ).rows.map((r) => [r.name, r.sha256]),
       )
-    ).rows.map((r) => [r.name, r.sha256]),
-  );
-  const shas = await stepSha256s(await schemaSteps());
+    : new Map<string, string>();
+  const shas = await stepSha256s(steps);
   const { effective } = resolveRenamedLedger(done, (name) => shas.get(name));
   // A recorded row counts as applied only with a checksum the migrator would skip.
-  return [...shas].some(([n, sha]) => {
-    const seen = effective.get(n);
-    return seen === undefined || !migrationChecksumMatches(n, seen, sha);
+  const pending = steps.filter((s) => {
+    const seen = effective.get(s.name);
+    return seen === undefined || !migrationChecksumMatches(s.name, seen, shas.get(s.name)!);
   });
+  return Promise.all(pending.map((s) => readFile(s.path, "utf8")));
 }
 
 function migrationProfileMode(): FunctionBoundaryMode | undefined {
@@ -1190,11 +1200,11 @@ if (import.meta.main) {
       // mode has no drift check, so neither runs there.
       dbMode === "local" || !process.env.HOOPDB_RUNTIME_ROLE
         ? Promise.resolve(null)
-        : pendingMigrationsExist(db).then((pending) =>
+        : pendingMigrationSql(db).then((pendingSql) =>
             sessionsFunctionAclPreview(
               db,
               process.env.HOOPDB_RUNTIME_ROLE!,
-              pending,
+              pendingSql,
             ),
           ),
     ])
