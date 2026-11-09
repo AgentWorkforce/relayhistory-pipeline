@@ -62,6 +62,8 @@ import {
 } from "./pointer.ts";
 import { processBatch, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
+import { postgresOutputFactsStore } from "./output-facts-store.ts";
+import type { SearchIndexDeps } from "./search-index.ts";
 import {
   ingestLoginIdentity,
   type IngestLoginIdentityRefusal,
@@ -340,6 +342,15 @@ export async function runConsumerTick(io: ConsumerTickIo, since: Date): Promise<
  * other coverage_from_ms as stale, so a mismatched writer never converges.
  * Throws "search state configuration invalid" on a bad id.
  */
+/**
+ * RELAYHISTORY_SELFHOST_OUTPUT_FACTS (default off): output facts go to the Postgres store
+ * (migration 045020) on the search pass's own transaction. Off: the key is absent and
+ * indexSearchScope calls no output facts function.
+ */
+export function outputFactsDeps(config: { outputFacts: boolean }): Pick<SearchIndexDeps, "outputFactsStore"> {
+  return config.outputFacts ? { outputFactsStore: postgresOutputFactsStore } : {};
+}
+
 export function writerComposition(backendId: string, fromMs: number, backend: ConsumerSearchBackend = "postgres", env: NodeJS.ProcessEnv = {}): SearchComposition {
   return backend === "opensearch" ? createOpenSearchSearchComposition({ env, backendId, fromMs }) : createPostgresSearchComposition({ backendId, fromMs });
 }
@@ -1183,6 +1194,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     store: raw.store,
     adapter: binding,
     prefixFor: (orgId) => `${config.keyPrefix}/${orgId}`,
+    ...outputFactsDeps(config),
   };
 
   let lastRun = 0;

@@ -50,7 +50,8 @@ import { chNow, deleteRows, windowStart, type PendingDelete } from "./vendor/sea
 import { scopeLockKey, type SessionScope } from "./pointer.ts";
 import { directoryCatalogWriter, type writeDirectoryCatalog } from "../hoopdb/session-directory-catalog.ts";
 import { writeDirectoryEvents, invalidateDirectoryEvents, completeErasedDirectoryEvents } from "../hoopdb/session-directory-events.ts";
-import { eraseOutputFacts, outputFactsFromScope, outputFactsSchema, passVersion, previousOutputFactsState, reconcileOutputFacts, recordOutputFactsState, type OutputFactsScope } from "./output-facts.ts";
+import { outputFactsFromScope, passVersion, type OutputFactsScope } from "./output-facts.ts";
+import { clickhouseOutputFactsStore, type OutputFactsStore } from "./output-facts-store.ts";
 import { adapterProjectionIo, type SearchProjectionIo, type SearchServiceBinding } from "./search-adapter.ts";
 /** Kept in sync with buffered-search-feed.ts (not imported: that module pulls in the ingest stage reader). */
 const BUFFERED_FINGERPRINT_PREFIX = "bf";
@@ -90,6 +91,16 @@ export interface SearchIndexDeps {
    * Absent or false: no fact table is touched.
    */
   outputFacts?: boolean;
+  /**
+   * RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true only (the self-host consumer, no ClickHouse): the
+   * Postgres store of migration 20261105045020 on this pass's transaction
+   * (output-facts-store.ts postgresOutputFactsStore). A complete pass reconciles the facts and
+   * records the state after the directory events, in the same transaction; a partial read
+   * records the state incomplete; erasure deletes the scope's facts and state. The source
+   * version is the directory event_projection_epoch the pass read: an older pass is a no-op.
+   * Absent: no output facts function is called.
+   */
+  outputFactsStore?: (tx: SqlExecutor) => OutputFactsStore;
 }
 
 export interface SearchIndexLimits {
@@ -262,10 +273,13 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
   if (Boolean(deps.ch) === Boolean(deps.adapter)) throw new Error("search requires exactly one service binding");
   // The Output/digest facts are ClickHouse tables: a portable adapter has no home for them.
   if (deps.outputFacts && !deps.ch) throw new Error("output facts require the ClickHouse search binding");
+  if (deps.outputFacts && deps.outputFactsStore) throw new Error("output facts: choose the ClickHouse or the Postgres store, not both");
   const limits = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...deps.limits };
   const now = deps.now ?? (() => new Date());
   return deps.transact(async (tx) => {
     const io = deps.adapter ? adapterProjectionIo(deps.adapter, tx) : legacyProjectionIo(deps.ch!);
+    const chFacts = deps.ch ? clickhouseOutputFactsStore(deps.ch, { maxRows: limits.maxRows, insertBatch: limits.insertBatch }) : undefined;
+    const pgFacts = deps.outputFactsStore?.(tx);
     // Non-blocking: a pass already running for this session is busy for as long
     // as its ClickHouse work takes. The caller re-enqueues this event with a
     // delay instead of waiting (and timing out into the DLQ behind a hot session).
@@ -301,17 +315,20 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       await io.erase(scope,pointerSnapshot.canonicalId);
       // Erasure purges the fact tables whenever they exist, flag or not: turning the producer
       // off must never leave an erased session's facts behind.
-      if (deps.ch) {
-        const schema = await outputFactsSchema(deps.ch);
+      if (chFacts) {
+        const schema = await chFacts.schemaReady();
         if (schema.present) {
           const fScope = factsScope(scope, pointerSnapshot.canonicalId);
-          await eraseOutputFacts(deps.ch, fScope);
+          await chFacts.erase(fScope);
           if (schema.ready) {
-            const prior = await previousOutputFactsState(deps.ch, fScope);
-            await recordOutputFactsState(deps.ch, fScope, true, at, null, "final", passVersion(at, prior.version));
+            const prior = await chFacts.previousState(fScope);
+            await chFacts.recordState(fScope, { complete: true, at, range: null, phase: "final", sourceVersion: passVersion(at, prior.version) });
           }
         }
       }
+      // Postgres (flag on): the scope's facts and state rows go in this transaction; a re-upload
+      // starts from no state, so its fresh epoch is never refused as stale.
+      if (pgFacts) await pgFacts.erase(factsScope(scope, pointerSnapshot.canonicalId));
       await io.record(scope,0,0,true,at,pointerSnapshot.canonicalId);
       await completeErasedDirectoryEvents(tx,scope);
       return { manifests: 0, rows: 0, inserted: 0, deleted: 0, complete: true, reasons: ["erased"] };
@@ -323,10 +340,15 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       await io.record(scope,s3.revision,0,false,at,pointerSnapshot.canonicalId);
       // The facts are not rewritten from a partial read: they now owe a pass too (over the
       // span they last covered, so only windows that span overlaps are refused).
-      if (deps.outputFacts && (await outputFactsSchema(deps.ch!)).ready) {
+      if (deps.outputFacts && (await chFacts!.schemaReady()).ready) {
         const fScope = factsScope(scope, pointerSnapshot.canonicalId);
-        const prior = await previousOutputFactsState(deps.ch!, fScope);
-        await recordOutputFactsState(deps.ch!, fScope, false, at, prior.range, "final", passVersion(at, prior.version));
+        const prior = await chFacts!.previousState(fScope);
+        await chFacts!.recordState(fScope, { complete: false, at, range: prior.range, phase: "final", sourceVersion: passVersion(at, prior.version) });
+      }
+      if (pgFacts) {
+        const fScope = factsScope(scope, pointerSnapshot.canonicalId);
+        const prior = await pgFacts.previousState(fScope);
+        await pgFacts.recordState(fScope, { complete: false, at, range: prior.range, sourceVersion: Number(pointerSnapshot.epoch) });
       }
       return {manifests:s3.manifests,rows:0,inserted:0,deleted:0,complete:false,...(s3.partial?{partial:true}:{}),reasons:s3.reasons.length?s3.reasons:["canonical_metadata_incomplete"]};
     }
@@ -389,13 +411,13 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       // carries): the facts are all written under the canonical id, and the state rows, the delete
       // filter and the route's readiness join all use this same set.
       const fScope = factsScope(scope, pointerSnapshot.canonicalId, s3.projectionRows);
-      if (!(await outputFactsSchema(deps.ch!)).ready) {
+      if (!(await chFacts!.schemaReady()).ready) {
         // Flag on before the owner applied the DDL (or an older skeleton): write nothing, say why.
         // Search is unaffected; the Output route has no state rows and refuses.
         outputFacts = { inserted: 0, deleted: 0, complete: false, reasons: ["output_facts_schema_missing"] };
       } else {
         // Strictly increasing per scope, even for two passes in one ms (fact rows and state alike).
-        const prev = await previousOutputFactsState(deps.ch!, fScope);
+        const prev = await chFacts!.previousState(fScope);
         const base = passVersion(at, prev.version);
         const facts = outputFactsFromScope(fScope, { projectionRows: s3.projectionRows, records: s3.records, complete }, base);
         const range = facts.range ?? null;
@@ -403,10 +425,25 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
         // dies mid-reconcile must leave the scope incomplete, never complete over torn facts.
         const prior = prev.range;
         const span = prior && range ? { min: prior.min < range.min ? prior.min : range.min, max: prior.max > range.max ? prior.max : range.max } : (range ?? prior);
-        await recordOutputFactsState(deps.ch!, fScope, false, at, span, "pending", base);
-        const r = await reconcileOutputFacts(deps.ch!, fScope, facts, { maxRows: limits.maxRows, insertBatch: limits.insertBatch });
+        await chFacts!.recordState(fScope, { complete: false, at, range: span, phase: "pending", sourceVersion: base });
+        const r = await chFacts!.reconcile(fScope, { eventFacts: facts.events, outputFacts: facts.facts, complete: facts.complete, reasons: facts.reasons }, base);
         outputFacts = { inserted: r.inserted, deleted: r.deleted, complete: r.complete, reasons: r.reasons };
-        await recordOutputFactsState(deps.ch!, fScope, r.complete, at, r.complete ? range : span, "final", base);
+        await chFacts!.recordState(fScope, { complete: r.complete, at, range: r.complete ? range : span, phase: "final", sourceVersion: base });
+      }
+    } else if (pgFacts) {
+      // Self-host: the same builder over the same validated read, written after the directory
+      // events on this transaction. Versioned by the directory epoch this pass read.
+      const fScope = factsScope(scope, pointerSnapshot.canonicalId, s3.projectionRows);
+      const sourceVersion = Number(pointerSnapshot.epoch);
+      const prev = await pgFacts.previousState(fScope);
+      const facts = outputFactsFromScope(fScope, { projectionRows: s3.projectionRows, records: s3.records, complete }, sourceVersion);
+      const range = facts.range ?? null;
+      const r = await pgFacts.reconcile(fScope, { eventFacts: facts.events, outputFacts: facts.facts, complete: facts.complete, reasons: facts.reasons }, sourceVersion);
+      outputFacts = { inserted: r.inserted, deleted: r.deleted, complete: r.complete, reasons: r.reasons };
+      if (r.applied) {
+        const prior = prev.range;
+        const span = prior && range ? { min: prior.min < range.min ? prior.min : range.min, max: prior.max > range.max ? prior.max : range.max } : (range ?? prior);
+        await pgFacts.recordState(fScope, { complete: r.complete, at, range: r.complete ? range : span, sourceVersion });
       }
     }
     // Only a complete pass makes the session current; any other leaves it owing one.

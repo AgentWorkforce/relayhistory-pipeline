@@ -58,6 +58,7 @@ import {
   scoreFailedAttempt,
   scoreRequeuedAttempt,
   writerComposition,
+  outputFactsDeps,
   type ConsumerTickIo,
 } from "../consumer-service.ts";
 import {
@@ -68,6 +69,7 @@ import { refuseEnvOptions, reconcileRecent, supabasePool } from "../lambda.ts";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { TenantRunner } from "../../session-read-api/liveness.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
+import { postgresOutputFactsStore } from "../output-facts-store.ts";
 
 const SECRET = JSON.stringify({ hoopdb_url: "postgresql://owner:secret@postgres:5432/hoopdb" });
 
@@ -137,6 +139,18 @@ describe("consumer service flag", () => {
 });
 
 describe("consumer service config", () => {
+  test("RELAYHISTORY_SELFHOST_OUTPUT_FACTS: exactly true enables the Postgres facts store; anything else is off, never an error", () => {
+    expect(consumerServiceConfig(env())).toMatchObject({ enabled: true, outputFacts: false });
+    expect(consumerServiceConfig(env({ RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true" }))).toMatchObject({ enabled: true, outputFacts: true });
+    for (const raw of ["", "false", "TRUE", " true", "true ", "1", "yes"])
+      expect(consumerServiceConfig(env({ RELAYHISTORY_SELFHOST_OUTPUT_FACTS: raw }))).toMatchObject({ enabled: true, outputFacts: false });
+    // Dormant consumer: the facts flag is not even read.
+    expect(consumerServiceConfig({ RELAYHISTORY_SELFHOST_OUTPUT_FACTS: "true" })).toEqual({ enabled: false });
+    // The search deps carry the store only when on: off means indexSearchScope calls no facts function.
+    expect(outputFactsDeps({ outputFacts: false })).toEqual({});
+    expect("outputFactsStore" in outputFactsDeps({ outputFacts: false })).toBe(false);
+    expect(outputFactsDeps({ outputFacts: true })).toEqual({ outputFactsStore: postgresOutputFactsStore });
+  });
   test("minimal valid config enables with the reader floor", () => {
     const config = consumerServiceConfig(env());
     expect(config).toMatchObject({ enabled: true, backendId: "selfhost-pg", keyPrefix: "96bulls", floorMs: 0 });

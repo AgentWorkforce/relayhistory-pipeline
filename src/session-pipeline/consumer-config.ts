@@ -43,6 +43,15 @@
  *                                   failures force an exit (for a compose
  *                                   healthcheck or watcher); default
  *                                   /tmp/session-pipeline-consumer.unhealthy
+ *   RELAYHISTORY_SELFHOST_OUTPUT_FACTS        enabled only: exactly "true" (no trimming,
+ *                                   case-sensitive) also writes output facts
+ *                                   (sessions.session_event_facts /
+ *                                   session_output_facts, migration 045020) through the
+ *                                   Postgres facts store inside the same transaction as
+ *                                   the directory events; unset or any other value is
+ *                                   off (default off, never a startup error). Sessions
+ *                                   ingested before the flag have no facts (bootstrap
+ *                                   is a later PR)
  *   HOOPDB_URL                                runWorker (health/readiness gates) opens its
  *                                   own pool from this variable. It must equal the
  *                                   secret's hoopdb_url (same role, same database);
@@ -64,6 +73,7 @@ export const CONSUMER_BACKEND_VAR = "SEARCH_INDEX_BACKEND";
 export const CONSUMER_BACKEND_ID_VAR = "SEARCH_INDEX_POSTGRES_BACKEND_ID";
 export const CONSUMER_KEY_PREFIX_VAR = "PIPELINE_KEY_PREFIX";
 export const CONSUMER_TLS_PROFILE_VAR = "SESSION_POSTGRES_TLS_PROFILE";
+export const CONSUMER_OUTPUT_FACTS_VAR = "RELAYHISTORY_SELFHOST_OUTPUT_FACTS";
 
 export interface ConsumerSecret {
   hoopdb_url: string;
@@ -86,6 +96,8 @@ export type ConsumerServiceConfig =
       everyMinutes: number;
       fanout: "off";
       unhealthyFile: string;
+      /** RELAYHISTORY_SELFHOST_OUTPUT_FACTS is exactly "true" (default off). */
+      outputFacts: boolean;
     };
 
 /** `RELAYHISTORY_SELFHOST_PIPELINE_CONSUMER`: exactly "true" enables; unset, empty or "false" is off; anything throws. */
@@ -152,5 +164,6 @@ export function consumerServiceConfig(env: NodeJS.ProcessEnv = process.env): Con
   // The writer must record the reader's floor or partials lists every session as stale.
   const floorMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
   const unhealthyFile = env.CONSUMER_UNHEALTHY_FILE ?? "/tmp/session-pipeline-consumer.unhealthy";
-  return { enabled: true, secret: parseConsumerSecret(secretText), searchBackend: backend, backendId, floorMs, keyPrefix, lookbackMinutes, everyMinutes, fanout, unhealthyFile };
+  return { enabled: true, secret: parseConsumerSecret(secretText), searchBackend: backend, backendId, floorMs, keyPrefix, lookbackMinutes, everyMinutes, fanout, unhealthyFile,
+    outputFacts: env[CONSUMER_OUTPUT_FACTS_VAR] === "true" };
 }

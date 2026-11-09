@@ -2425,8 +2425,22 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105045000 (digest narrative cache) is the newest: its own down drops the table first, with assertions.
-    // (044090/044100 roll back next via the successor helper below; DG is excluded there since it is already gone.)
+    // 20261105045020 (self-host output facts) is newer than DG: it refuses nothing below it, so it rolls back first
+    // with assertions (its down drops its four tables and nine functions and its ledger row).
+    const OF = "upstream:20261105045020_selfhost_output_facts.sql";
+    expect(await names()).toContain(OF);
+    expect((await failure(rollback("20261105045000_digest_narrative_cache.down.sql")))?.code).toBe("55000");
+    expect(await relation("sessions.session_output_facts")).toBe("sessions.session_output_facts");
+    await rollback("20261105045020_selfhost_output_facts.down.sql");
+    expect(await names()).not.toContain(OF);
+    for (const t of ["session_event_facts", "session_output_facts", "output_facts_session_state", "output_facts_workspace_state"])
+      expect(await relation(`sessions.${t}`)).toBeNull();
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'output\\_facts\\_%'")).rows[0]!.n).toBe(0);
+    // Any other step newer than DG (none on this branch beyond 045020) rolls back newest-first before it.
+    for (const { name } of (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > DG && s.name !== OF).reverse())
+      await rollback(`${name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`);
+    // 20261105045000 (digest narrative cache) is next: its own down drops the table first, with assertions.
+    // (044090/044100 roll back next via the successor helper below; DG and newer are excluded there since they are gone.)
     expect(await names()).toContain(DG);
     expect(await relation("sessions.daily_digest_narratives")).toBe("sessions.daily_digest_narratives");
     await rollback("20261105045000_digest_narrative_cache.down.sql");
@@ -2436,7 +2450,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // Preserve an explicit out-of-order refusal before using every successor's
     // guarded down script, so newer additive lanes need no fixture rewrites.
     // (DG is already rolled back with assertions above, so it is excluded here.)
-    const newerThanClaimReaders = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > CR && s.name !== DG).reverse();
+    const newerThanClaimReaders = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > CR && s.name < DG).reverse();
     if (newerThanClaimReaders.length)
       expect((await failure(rollback("20261105044090_claim_sessions_reader.down.sql")))?.code).toBe("55000");
     for (const { name } of newerThanClaimReaders)
@@ -4606,6 +4620,8 @@ test("044100 real prefix upgrade/fresh/noop/rollback/up preserves pointers and e
   // Branches with lanes newer than 044100 (045000 digest here) roll back newest-first:
   // the 044100 down script refuses while a later migration is applied.
   // (Literal name, not the DG const: this test lives outside that const's describe.)
+  for (const later of ["20261105045020_selfhost_output_facts"])
+    if (full.some((s) => s.name === `upstream:${later}.sql`)) await db.exec(readFileSync(join(root,`supabase/rollbacks/${later}.down.sql`),"utf8"));
   if (full.some((s) => s.name === "upstream:20261105045000_digest_narrative_cache.sql")) await db.exec(readFileSync(join(root,"supabase/rollbacks/20261105045000_digest_narrative_cache.down.sql"),"utf8"));
   await db.exec(readFileSync(join(root,"supabase/rollbacks/20261105044100_session_brief_summary_read.down.sql"),"utf8"));
   expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(false);await preserved();

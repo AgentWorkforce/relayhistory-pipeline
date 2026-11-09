@@ -304,6 +304,21 @@ off; anything else, `true` included, fails startup).
 the operator-erase contract fixes the literal `1`. `true` is not accepted; it
 fails startup like any other unknown value, so it is never silently off.
 
+`RELAYHISTORY_SELFHOST_OUTPUT_FACTS` (pipeline consumer,
+`SERVICE=session-pipeline-consumer`, next to `SEARCH_INDEX_BACKEND` and
+`RELAYHISTORY_SELFHOST_PIPELINE_CONSUMER`; documented in
+`src/session-pipeline/consumer-config.ts`) is an optional behaviour flag like
+`READ_API_CANONICAL_PIN_LAGGING_POINTER`: exactly `true` enables it; unset or
+any other value is off (default off), never a startup error. When on, every
+search-index pass also builds the session's output facts with the shared
+builder and writes them through the Postgres facts store
+(`sessions.session_event_facts`, `sessions.session_output_facts` and
+`sessions.output_facts_session_state`, migration `045020`) inside the same
+transaction as the directory events; a pass older than the stored source
+version is a no-op, and the erase path deletes the session's facts. Default
+off; sessions ingested before the flag have no facts (bootstrap is a later PR).
+Sessions erased while the flag is off keep any facts written earlier.
+
 ### session-ingest admission mode (config contract)
 
 `SELFHOST_INGEST_ADMISSION` is `sync` (the default; unset or empty is the same),
