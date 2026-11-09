@@ -124,6 +124,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Owner-only claim-session side table, its policy row and an inert writer trigger on ingest_claim_attempts
       // (no ingest function body changes; the trigger does nothing until the policy enables it).
       "20261105044080_ingest_claim_sessions.sql",
+      // Replaces the two buffered read RPCs again (already in OBJECTS.replacedFunctions; gate off they run 044040's
+      // query) and 044080's post-G4 policy guard; adds a post-G4 column and an owner-only refresh trigger function.
+      "20261105044090_claim_sessions_reader.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

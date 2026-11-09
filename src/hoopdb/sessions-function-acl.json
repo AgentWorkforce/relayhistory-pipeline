@@ -325,6 +325,9 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_batch_claim_sessions_refresh()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_batch_key(jsonb)": [
       "<owner>:EXECUTE"
     ],

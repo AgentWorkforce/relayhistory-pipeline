@@ -2372,13 +2372,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const SP = "upstream:20261105044050_selfhost_erase_short_summary_provenance.sql";
     const ST = "upstream:20261105044070_selfhost_erase_search_text_rebuild.sql";
     const CS = "upstream:20261105044080_ingest_claim_sessions.sql";
+    const CR = "upstream:20261105044090_claim_sessions_reader.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
@@ -2420,6 +2421,35 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
+    // 20261105044090 (claim sessions reader) is the newest: 044080's down refuses (55000) while it is applied, and its
+    // own down restores 044040's exact readers and 044080's exact guard (owner, SECURITY DEFINER and ACL unchanged),
+    // drops the refresh trigger and function, the read_enabled CHECK and column, and removes its ledger row.
+    const fnSrc = async (sig: string) => (await db.query<{ s: string | null; d: boolean | null }>("SELECT prosrc s,prosecdef d FROM pg_proc WHERE oid=to_regprocedure($1)", [sig])).rows[0] ?? null;
+    const readerSigs = ["sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)", "sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)"];
+    const crReaderAcl = async () => (await db.query<{ a: string }>("SELECT string_agg(coalesce(proacl::text,''),'|' ORDER BY oid) a FROM pg_proc WHERE oid IN (to_regprocedure($1),to_regprocedure($2))", readerSigs)).rows[0]!.a;
+    const readerObjects = async () => (await db.query<{ n: number }>("SELECT ((SELECT count(*) FROM pg_proc WHERE proname='ingest_batch_claim_sessions_refresh')+(SELECT count(*) FROM pg_trigger WHERE tgname='ingest_batch_claim_sessions_refresh')+(SELECT count(*) FROM pg_constraint WHERE conname='ingest_claim_sessions_policy_read_check')+(SELECT count(*) FROM pg_attribute WHERE attrelid=to_regclass('sessions.ingest_claim_sessions_policy') AND attname='read_enabled' AND NOT attisdropped))::int AS n")).rows[0]!.n;
+    const crAclBefore = await crReaderAcl();
+    expect(await readerObjects()).toBe(4);
+    for (const sig of readerSigs) expect((await fnSrc(sig))?.s).toContain("ingest_claim_sessions");
+    expect((await fnSrc("sessions.ingest_claim_sessions_policy_guard()"))?.s).toContain("NEW.read_enabled:=false;");
+    expect((await failure(rollback("20261105044080_ingest_claim_sessions.down.sql")))?.code).toBe("55000");
+    expect(await names()).toEqual(expect.arrayContaining([CS, CR]));
+    await rollback("20261105044090_claim_sessions_reader.down.sql");
+    expect(await names()).not.toContain(CR);
+    expect(await readerObjects()).toBe(0);
+    const sessionFirst = readFileSync(join(root, "supabase/migrations/20261105044040_buffered_stages_session_first.sql"), "utf8");
+    for (const sig of readerSigs) {
+      const f = await fnSrc(sig);
+      expect(f?.d).toBe(true);
+      expect(f?.s).not.toContain("ingest_claim_sessions");
+      expect(sessionFirst.includes(f!.s!)).toBe(true);
+    }
+    expect(await crReaderAcl()).toBe(crAclBefore);
+    const guardSrc = (await fnSrc("sessions.ingest_claim_sessions_policy_guard()"))!.s!;
+    expect(guardSrc).not.toContain("read_enabled");
+    expect(readFileSync(join(root, "supabase/migrations/20261105044080_ingest_claim_sessions.sql"), "utf8").includes(guardSrc)).toBe(true);
+    // Its ledger row is gone, so running it again refuses and changes nothing.
+    expect((await failure(rollback("20261105044090_claim_sessions_reader.down.sql")))?.code).toBe("55000");
     // 20261105044080 (claim sessions side table) is the newest: 044070's down refuses (55000) while it is applied, and
     // its own down drops the writer trigger, the side and policy tables and both functions, and removes its ledger row.
     const claimSessionObjects = async () => (await db.query<{ n: number }>("SELECT ((SELECT count(*) FROM pg_proc WHERE proname LIKE 'ingest_claim_sessions_%')+(SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'ingest_claim_sessions_%')+(SELECT count(*) FROM pg_class WHERE relname LIKE 'ingest_claim_sessions%'))::int AS n")).rows[0]!.n;
@@ -2943,7 +2973,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
     // Newer than 043900, so its down refuses until they are rolled back, newest first: every upstream step after
-    // 044020 (rollbackLaterThan044020: 044080, 044070, 044050, 044040, 044030), then 044020, 044010, 044000, 043910.
+    // 044020 (rollbackLaterThan044020: 044090, 044080, 044070, 044050, 044040, 044030), then 044020, 044010, 044000, 043910.
     const orgIndexesDown = readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8");
     const lockDown = readFileSync(join(root, "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql"), "utf8");
     const readTokensDown = readFileSync(join(root, "supabase/rollbacks/20261105044000_read_api_tokens.down.sql"), "utf8");
