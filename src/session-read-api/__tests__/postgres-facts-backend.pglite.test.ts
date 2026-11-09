@@ -1,7 +1,7 @@
 /**
  * The Postgres Output / digest backends (READ_API_OUTPUT_BACKEND / READ_API_DIGEST_BACKEND =
- * postgres) on PGlite with every migration through 20261105045020: facts written by the
- * consumer store from the shared fixture, read back as bulls96_read_api through the 045020
+ * postgres) on PGlite with every migration through 20261105045040: facts written by the
+ * consumer store from the shared fixture, read back as bulls96_read_api through the 045040
  * readers only, inside a READ ONLY tenant transaction (the read pool's poolTenantRunner shape).
  * Covers each readiness code in order, the Output and digest values (the ClickHouse-verified
  * fixture numbers), paging, liveness, the deadline, the read role's grants, and schema-missing.
@@ -26,7 +26,7 @@ import { postgresDigestBackend } from "../postgres/digest-query.ts";
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
 const sqlFile = (path: string) => read(path).split("\n").filter((l) => !l.startsWith("\\")).join("\n");
-const MIGRATION = "supabase/migrations/20261105045020_selfhost_output_facts.sql";
+const MIGRATION = "supabase/migrations/20261105045040_selfhost_output_facts.sql";
 const TABLES = ["session_event_facts", "session_output_facts", "output_facts_session_state", "output_facts_workspace_state"];
 const SCOPE = OUTPUT_FIXTURE_SCOPE;
 const ORG = SCOPE.orgId, WS = SCOPE.workspaceId;
@@ -100,7 +100,7 @@ const watermark = (db: PGlite, since: string) =>
   db.query(`INSERT INTO sessions.output_facts_workspace_state (org_id, workspace_id, complete_since, marked_by) VALUES ($1, $2, $3, 'test')
             ON CONFLICT (org_id, workspace_id) DO UPDATE SET complete_since = excluded.complete_since`, [ORG, WS, since]);
 
-describe("postgres output/digest backends over 045020", () => {
+describe("postgres output/digest backends over 045040", () => {
   test("readiness codes in the ClickHouse order, for both backends and both window kinds", async () => {
     const db = await database();
     const out = postgresOutputBackend(deps(db));

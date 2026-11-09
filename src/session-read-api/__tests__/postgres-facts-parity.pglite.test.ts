@@ -2,7 +2,7 @@
  * Parity of the Postgres facts backends with the ClickHouse ones, for the same producer rows
  * (fixture -> outputFactsFromScope):
  *   - always (PGlite): the rows written through the consumer store and read back through the
- *     045020 readers give exactly what the pure aggregation gives over the producer's own rows
+ *     045040 readers give exactly what the pure aggregation gives over the producer's own rows
  *     (the store/reader round trip loses nothing: timestamps stay µs-exact, nulls stay null),
  *     over several windows including sub-second edges, and the same computeStatsHash;
  *     the whole-day values are the ones the ClickHouse route tests verify (output-route,
@@ -36,7 +36,7 @@ import { OUTPUT_FACTS_STATE_TABLE, outputFactsSchemaStatements } from "../../ses
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
 const sqlFile = (path: string) => read(path).split("\n").filter((l) => !l.startsWith("\\")).join("\n");
-const MIGRATION = "supabase/migrations/20261105045020_selfhost_output_facts.sql";
+const MIGRATION = "supabase/migrations/20261105045040_selfhost_output_facts.sql";
 const SCOPE = OUTPUT_FIXTURE_SCOPE;
 const ORG = SCOPE.orgId, WS = SCOPE.workspaceId;
 const FACTS = outputFactsFromScope(SCOPE, outputFixture(), 1);

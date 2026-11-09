@@ -49,9 +49,30 @@ class ImageCopyTests(unittest.TestCase):
             return SimpleNamespace(stdout=self.index)
 
         self.assertEqual(module.copy_image(self.env, run, self.auth), self.env["IMAGE_DIGEST"])
-        self.assertEqual([args[1] for args in calls], ["copy", "inspect"])
-        self.assertIn("--all", calls[0])
-        self.assertIn("--preserve-digests", calls[0])
+        self.assertEqual([args[1] for args in calls], ["copy", "inspect", "copy", "inspect"])
+        for copy in (calls[0], calls[2]):
+            self.assertIn("--all", copy)
+            self.assertIn("--preserve-digests", copy)
+        tag = "sha-" + self.env["SOURCE_SHA"]
+        self.assertEqual([args[-1] for args in calls],
+                         [f"docker://ghcr.io/agentworkforce/sessions-pipeline:{tag}"] * 2 +
+                         [f"docker://ghcr.io/agentworkforce/96bulls-services:{tag}"] * 2)
+
+    def test_repositories_match_the_signed_dual_publish_list(self):
+        source = (Path(__file__).parents[3] / "scripts/image-release-provenance.mjs").read_text()
+        self.assertEqual(module.REPOSITORIES, ("ghcr.io/agentworkforce/sessions-pipeline", "ghcr.io/agentworkforce/96bulls-services"))
+        for repository in module.REPOSITORIES:
+            self.assertIn(f'"{repository}"', source)
+
+    def test_second_repository_mismatch_issues_no_success(self):
+        calls = []
+        def run(args, **options):
+            calls.append(args)
+            inspected = sum(1 for call in calls if call[1] == "inspect")
+            return SimpleNamespace(stdout=self.index if inspected < 2 else b"changed")
+        with self.assertRaisesRegex(RuntimeError, "signed digest"):
+            module.copy_image(self.env, run, self.auth)
+        self.assertTrue(calls[-1][-1].startswith("docker://ghcr.io/agentworkforce/96bulls-services:"))
 
     def test_foreign_or_malformed_authority_never_calls_registry(self):
         for field, value in [("SOURCE_SHA", "main"), ("IMAGE_DIGEST", "latest"),

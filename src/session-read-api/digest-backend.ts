@@ -3,7 +3,7 @@
  * epics, sessions) over one of two facts stores, plus the readiness of the day window.
  *
  *   clickhouse  today's ClickHouse facts (clickhouse/digest-query.ts), unchanged; the default
- *   postgres    the self-host Postgres facts of migration 045020 (postgres/digest-query.ts),
+ *   postgres    the self-host Postgres facts of migration 045040 (postgres/digest-query.ts),
  *               READ_API_DIGEST_BACKEND=postgres on the self-host service
  *
  * The narrative stays outside the backend (digest-narrative.ts, deps.digest), and so does

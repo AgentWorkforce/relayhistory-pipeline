@@ -86,7 +86,8 @@ function fakeClickHouse(seed: Row[], opts: { ignoreDeletes?: boolean; mutate?: (
       log.selects += 1;
       const p = options?.params ?? {};
       if (query.includes("system.columns"))
-        return [{ name: "origin", type: "LowCardinality(String)", default_expression: "'canonical'" }, { name: "origin_claim_token", type: "String", default_expression: "''" }] as T[];
+        // assertOriginColumns also checks default_kind (a plain DEFAULT stores the inserted origin).
+        return [{ name: "origin", type: "LowCardinality(String)", default_kind: "DEFAULT", default_expression: "'canonical'" }, { name: "origin_claim_token", type: "String", default_kind: "DEFAULT", default_expression: "''" }] as T[];
       if (query.includes("search_ingest_state")) {
         const held = state.filter((s) => s.name === p.name).sort((a, b) => a.updated_at.localeCompare(b.updated_at)).at(-1);
         return (held ? [{ value: held.value, n: 1 }] : []) as T[];

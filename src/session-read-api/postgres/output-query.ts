@@ -1,8 +1,8 @@
 /**
  * Output (`GET /v1/sessions/output`) and its window readiness over the self-host Postgres facts
- * (migration 20261105045020): the same result as clickhouse/output-query.ts for the same facts.
+ * (migration 20261105045040): the same result as clickhouse/output-query.ts for the same facts.
  *
- * Access is only through 045020's SECURITY DEFINER readers, EXECUTE to bulls96_read_api alone,
+ * Access is only through 045040's SECURITY DEFINER readers, EXECUTE to bulls96_read_api alone,
  * on the read pool inside one READ ONLY tenant transaction (liveness.ts poolTenantRunner):
  *   output_facts_events_for / output_facts_outputs_for(ws, from, to, after_row_id, limit)
  *       keyset pages (row_id order, at most 10000 rows) of `from <= ts < to`
@@ -30,7 +30,7 @@
  *   session_unindexed    more distinct (source, session_id) in the window's event facts than
  *                        state rows overlapping it. A narrower signal than ClickHouse's, which
  *                        reads raw transcript_events: the Postgres facts have no row for a
- *                        session never processed with the facts flag on, and 045020 exposes no
+ *                        session never processed with the facts flag on, and 045040 exposes no
  *                        per-session state to the read role. The pre-flag sessions are what the
  *                        PR4 bootstrap backfills, and the watermark (complete_since) is only
  *                        written after it; see docs/selfhost-composition.md.
@@ -40,7 +40,7 @@ import type { SqlQuery, TenantRunner } from "../liveness.ts";
 import { keyOf, type Liveness } from "../page.ts";
 import type { OutputBackend } from "../output-backend.ts";
 
-/** The reader's own page cap (045020: limit 1..10000). */
+/** The reader's own page cap (045040: limit 1..10000). */
 export const FACTS_PAGE_LIMIT = 10_000;
 const LIVENESS_BATCH = 1_000;
 const DEFAULT_TIMEOUT_MS = 3_000;
@@ -63,7 +63,7 @@ export class FactsReadDeadline extends Error {
   }
 }
 
-/** undefined_function, undefined_table, invalid_schema_name, undefined_column: 045020 not applied. */
+/** undefined_function, undefined_table, invalid_schema_name, undefined_column: 045040 not applied. */
 const PG_SCHEMA_MISSING = new Set(["42883", "42P01", "3F000", "42703"]);
 export function isPostgresFactsSchemaMissing(error: unknown): boolean {
   const code = (error as { code?: unknown } | null)?.code;

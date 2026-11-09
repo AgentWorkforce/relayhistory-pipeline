@@ -3,7 +3,7 @@
  *
  * - clickhouseOutputFactsStore: today's ClickHouse functions, called exactly as before
  *   (SEARCH_INDEX_OUTPUT_FACTS=1 with the ClickHouse search binding).
- * - postgresOutputFactsStore: the self-host Postgres tables of migration 20261105045020,
+ * - postgresOutputFactsStore: the self-host Postgres tables of migration 20261105045040,
  *   written through its SECURITY DEFINER functions on the consumer's transaction
  *   (RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true, consumer-config.ts). One transaction holds
  *   the directory events and the facts, so a failed pass leaves neither.
@@ -93,7 +93,7 @@ function sourceVersionOf(v: number): number {
 }
 
 /**
- * The self-host Postgres store on one transaction (migration 20261105045020). The source
+ * The self-host Postgres store on one transaction (migration 20261105045040). The source
  * version is the session directory event_projection_epoch the pass read: a pass older than the
  * stored one is a no-op in the database. There is no pending phase: the writes are
  * transactional, so a dead pass leaves the prior state intact.

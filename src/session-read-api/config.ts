@@ -11,7 +11,7 @@ export function parseCompleteSince(raw: string | undefined): number {
   return t;
 }
 
-/** The facts store an Output or digest backend reads: today's ClickHouse facts, or the self-host Postgres facts (migration 045020). */
+/** The facts store an Output or digest backend reads: today's ClickHouse facts, or the self-host Postgres facts (migration 045040). */
 export type FactsBackendKind = "clickhouse" | "postgres";
 export const READ_API_OUTPUT_BACKEND = "READ_API_OUTPUT_BACKEND";
 export const READ_API_DIGEST_BACKEND = "READ_API_DIGEST_BACKEND";

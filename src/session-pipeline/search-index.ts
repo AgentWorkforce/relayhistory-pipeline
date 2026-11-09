@@ -93,7 +93,7 @@ export interface SearchIndexDeps {
   outputFacts?: boolean;
   /**
    * RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true only (the self-host consumer, no ClickHouse): the
-   * Postgres store of migration 20261105045020 on this pass's transaction
+   * Postgres store of migration 20261105045040 on this pass's transaction
    * (output-facts-store.ts postgresOutputFactsStore). A complete pass reconciles the facts and
    * records the state after the directory events, in the same transaction; a partial read
    * records the state incomplete; erasure deletes the scope's facts and state. The source

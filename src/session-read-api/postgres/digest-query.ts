@@ -1,9 +1,9 @@
 /**
  * The daily digest's deterministic half over the self-host Postgres facts (migration
- * 20261105045020): clickhouse/digest-query.ts buildDailyDigest, the same DailyDigest for the
+ * 20261105045040): clickhouse/digest-query.ts buildDailyDigest, the same DailyDigest for the
  * same facts, so computeStatsHash (and the narrative cache key) agree across backends.
  *
- * Reads only through 045020's readers (postgres/output-query.ts), in one READ ONLY tenant
+ * Reads only through 045040's readers (postgres/output-query.ts), in one READ ONLY tenant
  * transaction on the read pool, under the request deadline:
  *   the day's event facts [since, until), and every output fact of the workspace (outcome
  *   facts are unwindowed, as in ClickHouse; the reader has no kind filter).

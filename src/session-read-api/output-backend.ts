@@ -3,7 +3,7 @@
  * one interface, two stores.
  *
  *   clickhouse  today's ClickHouse facts (clickhouse/output-query.ts), unchanged; the default
- *   postgres    the self-host Postgres facts of migration 045020 (postgres/output-query.ts),
+ *   postgres    the self-host Postgres facts of migration 045040 (postgres/output-query.ts),
  *               READ_API_OUTPUT_BACKEND=postgres on the self-host service
  *
  * Readiness codes and their order are the contract (output-query.ts outputWindowReadiness):

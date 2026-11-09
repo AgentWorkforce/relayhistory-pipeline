@@ -6,6 +6,13 @@
  */
 import { scrubText } from "@rhc/lib/scrub.ts";
 
+/** The analytics sink's operator counters (never analytics events themselves). */
+const ANALYTICS_COUNTER_FIELDS = [
+  "analytics_accepted", "analytics_dropped_queue_full", "analytics_dropped_invalid", "analytics_dropped_oversize",
+  "analytics_dropped_rejected", "analytics_dropped_auth", "analytics_dropped_exhausted", "analytics_dropped_shutdown",
+  "analytics_export_failures",
+];
+
 export const ALLOWED_LOG_FIELDS = new Set([
   "service", "deployment", "deployment_id", "stage", "status", "outcome", "attempt",
   "trace_id", "span_id", "traceparent", "session_uuid", "session_uuid_source",
@@ -31,6 +38,11 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // Search index failures (searchIndexErrorDetail): the adapter's bounded detail code only
   // (e.g. `http_429:bulk_items_812:bulk_bytes_4190000`), never backend text or a reason.
   "error_detail",
+  // Canonical projection reason codes (src/session-read-api/canonical.ts canonicalReasonCodeFields):
+  // snake_case codes joined by `,`, never ids, keys or values.
+  "reason_codes",
+  // Analytics export counters (src/shared/analytics-config.ts analyticsCounterFields): bounded counts only.
+  ...ANALYTICS_COUNTER_FIELDS,
 ]);
 
 /**
@@ -45,6 +57,7 @@ export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ["admission_oldest_age_ms", 10 * 365 * 24 * 3600 * 1000],
   ["admission_dead_letters", 10_000_000],
   ["admission_in_flight", 1_000],
+  ...ANALYTICS_COUNTER_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
 ]);
 
 function boundedCount(v: unknown, max: number): number | undefined {

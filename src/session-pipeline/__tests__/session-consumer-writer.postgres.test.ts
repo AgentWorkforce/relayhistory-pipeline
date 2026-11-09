@@ -678,7 +678,7 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
     }
   }, 120_000);
 
-  test("writer executes exactly the twelve composed-path functions, nothing else in sessions", async () => {
+  test("writer executes exactly the thirteen composed-path functions, nothing else in sessions", async () => {
     // The closed call-graph of the production tick (pointer upsert through
     // the publication-authority retry, directory projection, repo catalog).
     // Reachability, precisely: eight fail 42501 in the composed e2e below
@@ -687,6 +687,10 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
     // carrying git fields (the e2e seeds carry none, so resolve_repo
     // returns before the catalog lock); session_publication_is_managed is
     // reachable by code path only (srv_ machine prefix, pointer.ts).
+    // session_directory_project_text (045030) is reached by no statement:
+    // the partial expression index session_directory_tenant_project_text_trgm_idx
+    // evaluates it as the writing role on every directory write that
+    // carries a project id, project key or repository (proved below).
     // The static closure in the merge notes proves no other sessions
     // function is reachable.
     const fns = await wpool.query<{ fn: string }>(
@@ -703,6 +707,7 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
       "sessions.lock_repo_catalog(text)",
       "sessions.repo_live(text,uuid)",
       "sessions.resolve_repo(text,text,text,timestamp with time zone)",
+      "sessions.session_directory_project_text(text,text,text)",
       "sessions.session_directory_search_text(text,text,text,text,text,text,text,text)",
       "sessions.session_index_batch(jsonb)",
       "sessions.session_publication_is_managed(text,text,text,text,text)",
@@ -711,13 +716,13 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
     ]);
   }, 120_000);
 
-  test("function ACL drift is zero: the twelve consumer grants are manifest-authorized", async () => {
-    // B2 receipt: the twelve EXECUTE grants now sit inside the migrator's
+  test("function ACL drift is zero: the thirteen consumer grants are manifest-authorized", async () => {
+    // B2 receipt: the twelve 043900 EXECUTE grants plus 045030's project-text grant now sit inside the migrator's
     // function-ACL manifest (installed by the grant migration on every
     // migrate), so the boundary preview for the role that holds them must
     // report no extras: any thirteenth writer grant outside the manifest
     // fails here. Missing is not pinned for a non-runtime role (the
-    // migrator installs runtime grants itself); the twelve-installed side
+    // migrator installs runtime grants itself); the thirteen-installed side
     // is pinned by the exact-grant test above.
     const client = await admin.connect();
     try {
@@ -727,6 +732,106 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
       client.release();
     }
   }, 120_000);
+
+  test("directory writes carrying project fields need the project-text EXECUTE (045030): success, then revoke, 42501", async () => {
+    // The partial expression index session_directory_tenant_project_text_trgm_idx
+    // (20261101050000) calls sessions.session_directory_project_text, and
+    // PostgreSQL evaluates index expressions as the role doing the INSERT or
+    // UPDATE. Every live directory row with a project id, project key or
+    // repository therefore needs the writer's EXECUTE: the projector INSERT
+    // (session-directory-projector.ts:98) and its ON CONFLICT UPDATE, and the
+    // catalog UPDATE that sets project_key. Rows without those fields miss
+    // the index predicate, which is why the plain seeds above never hit it.
+    const adminClient = await admin.connect();
+    const sessions = ["wproj", "wproj2"];
+    const keyOf = (sessionId: string) => ({ orgId: ORG, workspaceId: "w", harness: "h", sessionId });
+    const catalogWith = (projectKey: string): DirectoryCatalog => ({
+      models: [], agentNames: [], projectKey, projectKeyMethod: "git_remote",
+      projectId: null, gitRepo: null, gitBranch: null, initialCommit: null,
+      originator: null, agentVersion: null, relationships: [],
+    });
+    const seed = (sessionId: string, projectId: string) =>
+      adminClient.query(
+        `INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,trace_id,project_id,git_repo)
+         VALUES($1,'w','h',$2,'m','u',now(),now(),'s3','b',$3,'00000000-0000-0000-0000-000000000000',$4,'https://github.com/acme/widget')
+         ON CONFLICT (org_id,workspace_id,harness,session_id,machine_id) DO UPDATE SET project_id = excluded.project_id`,
+        [ORG, sessionId, `96bulls/pgtest/${sessionId}.json`, projectId],
+      );
+    const epochOf = async (sessionId: string) =>
+      (await writerRun(ORG, "w", (tx) =>
+        tx.query<{ e: string }>(
+          `SELECT event_projection_epoch::text AS e FROM sessions.session_directory WHERE org_id=$1 AND session_id=$2`,
+          [ORG, sessionId],
+        ),
+      )).rows[0]!.e;
+    const refusal = (p: Promise<unknown>) =>
+      p.then(
+        () => null,
+        (error: { code?: unknown; message?: unknown }) => error,
+      );
+    try {
+      // Success as the writer: INSERT, catalog UPDATE (project_key), and the
+      // projector's ON CONFLICT UPDATE with a changed project id.
+      await seed("wproj", "proj-1");
+      await expect(writerRun(ORG, "w", (tx) => projectSessionDirectory(tx, keyOf("wproj"))))
+        .resolves.toMatchObject({ projected: true });
+      const firstEpoch = await epochOf("wproj");
+      await expect(
+        writerRun(ORG, "w", (tx) =>
+          writeDirectoryCatalog(tx, keyOf("wproj"), catalogWith("github.com/acme/widget"), { expectedEpoch: firstEpoch })),
+      ).resolves.toMatchObject({ written: true });
+      await seed("wproj", "proj-2");
+      await expect(writerRun(ORG, "w", (tx) => projectSessionDirectory(tx, keyOf("wproj"))))
+        .resolves.toMatchObject({ projected: true });
+      const row = await writerRun(ORG, "w", (tx) =>
+        tx.query(
+          `SELECT project_id, project_key, git_repo FROM sessions.session_directory WHERE org_id=$1 AND session_id='wproj'`,
+          [ORG],
+        ),
+      );
+      expect(row.rows[0]).toMatchObject({
+        project_id: "proj-2",
+        project_key: "github.com/acme/widget",
+        git_repo: "https://github.com/acme/widget",
+      });
+
+      // Without the grant the same writes fail 42501 naming the function.
+      await adminClient.query(
+        `REVOKE EXECUTE ON FUNCTION sessions.session_directory_project_text(text, text, text) FROM search_consumer_runtime`,
+      );
+      try {
+        await seed("wproj2", "proj-9");
+        const inserted = await refusal(writerRun(ORG, "w", (tx) => projectSessionDirectory(tx, keyOf("wproj2"))));
+        expect(inserted).toMatchObject({ code: "42501" });
+        expect(String(inserted?.message ?? "")).toContain("session_directory_project_text");
+        await seed("wproj", "proj-3");
+        const upserted = await refusal(writerRun(ORG, "w", (tx) => projectSessionDirectory(tx, keyOf("wproj"))));
+        expect(upserted).toMatchObject({ code: "42501" });
+        expect(String(upserted?.message ?? "")).toContain("session_directory_project_text");
+        const epoch = await epochOf("wproj");
+        const updated = await refusal(
+          writerRun(ORG, "w", (tx) =>
+            writeDirectoryCatalog(tx, keyOf("wproj"), catalogWith("github.com/acme/gadget"), { expectedEpoch: epoch })),
+        );
+        expect(updated).toMatchObject({ code: "42501" });
+        expect(String(updated?.message ?? "")).toContain("session_directory_project_text");
+      } finally {
+        await adminClient.query(
+          `GRANT EXECUTE ON FUNCTION sessions.session_directory_project_text(text, text, text) TO search_consumer_runtime`,
+        );
+      }
+      // Restored: the refused insert now lands.
+      await expect(writerRun(ORG, "w", (tx) => projectSessionDirectory(tx, keyOf("wproj2"))))
+        .resolves.toMatchObject({ projected: true });
+    } finally {
+      for (const sessionId of sessions) {
+        await adminClient.query(`DELETE FROM sessions.session_directory WHERE org_id=$1 AND session_id=$2`, [ORG, sessionId]).catch(() => {});
+        await adminClient.query(`DELETE FROM sessions.session_directory_event_pending WHERE org_id=$1 AND source_session_id=$2`, [ORG, sessionId]).catch(() => {});
+        await adminClient.query(`DELETE FROM sessions.session_index WHERE org_id=$1 AND session_id=$2`, [ORG, sessionId]).catch(() => {});
+      }
+      adminClient.release();
+    }
+  }, 180_000);
 
   test("exact committed grant set, no TRUNCATE, nothing unlisted", async () => {
     const grants = await wpool.query(

@@ -54,7 +54,7 @@ describe("self-host service facts backends", () => {
       expect(built.deps.digest?.backend?.kind).toBe("postgres");
       expect(built.deps.digest?.cache).toBeDefined();
       expect(built.deps.digest?.generator).toBeUndefined();
-      // The readiness read goes to 045020's coverage reader in a READ ONLY tenant transaction.
+      // The readiness read goes to 045040's coverage reader in a READ ONLY tenant transaction.
       sql = [];
       expect(await built.deps.output!.backend!.windowReadiness("org-a", "ws-a", new Date("2026-11-05T00:00:00Z"), new Date("2026-11-06T00:00:00Z"))).toBe("backfill_incomplete");
       const at = sql.findIndex((s) => s.text.includes("sessions.output_facts_coverage_for"));

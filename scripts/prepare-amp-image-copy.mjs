@@ -2,7 +2,7 @@ import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { REPOSITORY, REPOSITORY_ID, githubJSON, verifyAncestry, verifySourceCI } from "./check-image-release.mjs";
-import { IMAGE, LEGACY_SIGNER_REPOSITORY, PUBLICATION_SIGNER_REPOSITORIES, verifyRelease } from "./image-release-provenance.mjs";
+import { LEGACY_SIGNER_REPOSITORY, PUBLICATION_SIGNER_REPOSITORIES, RELEASE_LAYOUTS, verifyRelease } from "./image-release-provenance.mjs";
 // The legacy name is accepted only for publications created before the rename
 // (2026-11-07 ~05:56Z; no publish-image run exists between this bound and it),
 // so a later repository reusing the freed old name cannot sign accepted releases.
@@ -21,13 +21,24 @@ export function validateCopyRequest(e) {
       !/^[a-f0-9]{32}$/.test(e.CLOUDFLARE_ACCOUNT_ID ?? "") || /^0+$/.test(e.CLOUDFLARE_ACCOUNT_ID))
     fail("exact approved source, signed image, publication and target account required");
 }
+// The receipt selects exactly one known image layout: a dual-published release
+// (primary sessions-pipeline image plus the exact ordered list of every
+// repository it was published to) or a pre-dual-publish release (96bulls-services
+// only, no list). The signed claims are then verified under that same layout.
+export function receiptLayout(receipt, digest) {
+  const listed = layout => layout.images === undefined ? receipt.images === undefined :
+    Array.isArray(receipt.images) && receipt.images.length === layout.images.length &&
+    layout.images.every((name, i) => receipt.images[i] === `${name}@${digest}`);
+  return Object.values(RELEASE_LAYOUTS).find(layout => receipt.image === `${layout.image}@${digest}` && listed(layout));
+}
 export function validatePublication(e, receipt, run) {
   validateCopyRequest(e);
   // A publication signed before the rename names the old repository; accept
   // only the exact allow-listed names and verify it under that one name.
   const signer = PUBLICATION_SIGNER_REPOSITORIES.find(name => receipt.repository === `https://github.com/${name}`);
-  if (!signer ||
-      receipt.source_sha !== e.SOURCE_SHA || receipt.image !== `${IMAGE}@${e.IMAGE_DIGEST}` ||
+  const layout = receiptLayout(receipt, e.IMAGE_DIGEST);
+  if (!signer || !layout ||
+      receipt.source_sha !== e.SOURCE_SHA ||
       receipt.source_ref !== "refs/heads/main" || receipt.attestation_backend !== "sigstore" ||
       !sha(receipt.workflow_sha) || !id(receipt.ci_run_id) || receipt.publish_run_id !== e.PUBLISH_RUN_ID ||
       !id(receipt.publish_run_attempt)) fail("publication receipt does not match approval");
@@ -42,7 +53,7 @@ export function validatePublication(e, receipt, run) {
   if (signer === LEGACY_SIGNER_REPOSITORY && !(typeof run.created_at === "string" &&
       Date.parse(run.created_at) < Date.parse(LEGACY_SIGNER_CREATED_BEFORE)))
     fail("legacy repository name is accepted only for publications before the rename");
-  return signer;
+  return { signer, layout };
 }
 async function main() {
   const e = process.env; validateCopyRequest(e);
@@ -52,13 +63,13 @@ async function main() {
   const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
   const get = githubJSON(e.GH_TOKEN);
   const run = await get(`/repos/${REPOSITORY}/actions/runs/${e.PUBLISH_RUN_ID}`);
-  const signer = validatePublication(e, receipt, run);
+  const { signer, layout } = validatePublication(e, receipt, run);
   verifyAncestry(e.SOURCE_SHA); verifyAncestry(receipt.workflow_sha);
   const currentCI = await verifySourceCI(e.SOURCE_SHA, get);
   if (String(currentCI) !== receipt.ci_run_id) fail("source CI changed after signing");
   verifyRelease({ SOURCE_SHA: e.SOURCE_SHA, WORKFLOW_SHA: receipt.workflow_sha,
     SOURCE_CI_RUN: receipt.ci_run_id, PUBLISH_RUN_ID: e.PUBLISH_RUN_ID,
-    PUBLISH_RUN_ATTEMPT: receipt.publish_run_attempt, IMAGE_DIGEST: e.IMAGE_DIGEST }, e.ARTIFACT_DIR, undefined, signer);
+    PUBLISH_RUN_ATTEMPT: receipt.publish_run_attempt, IMAGE_DIGEST: e.IMAGE_DIGEST }, e.ARTIFACT_DIR, undefined, signer, layout);
   const index = JSON.parse(readFileSync(join(e.ARTIFACT_DIR, "services-index.json"), "utf8"));
   const native = index.manifests.filter(m => m.platform?.os === "linux" && m.platform?.architecture === "amd64");
   if (native.length !== 1 || !/^sha256:[a-f0-9]{64}$/.test(native[0].digest ?? ""))

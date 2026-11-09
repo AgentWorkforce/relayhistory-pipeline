@@ -1,5 +1,6 @@
 -- Self-host output facts in Postgres (PR1 of the self-host digest/output plan; registry slot
--- 045020 by the lead's ruling, ordered after 045000 digest_narrative_cache and 045010).
+-- 045040, taken after 045030 landed on main first; ordered after 045000
+-- digest_narrative_cache, 045010 and 045030).
 -- The ClickHouse fact tables (src/session-pipeline/output-facts-schema.ts, schema v4) have no
 -- home in a ClickHouse-free self-host stack. These tables hold the same rows, built by the same
 -- builder (output-facts.ts outputFactsFromScope), written by the self-host consumer
@@ -53,7 +54,7 @@
 --
 -- Transactional (no CONCURRENTLY, no enum change): migrate.ts wraps it with its ledger row.
 -- Code only; applying it to a real database needs Khaliq's explicit OK. Down path:
--- supabase/rollbacks/20261105045020_selfhost_output_facts.down.sql.
+-- supabase/rollbacks/20261105045040_selfhost_output_facts.down.sql.
 
 DO $roles$
 DECLARE
