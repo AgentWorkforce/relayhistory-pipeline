@@ -20,9 +20,7 @@ import {
   resolveRenamedLedger,
   RUNTIME_APPLICATION_FUNCTIONS,
   RUNTIME_APPLICATION_POLICY,
-  RUNTIME_APPLICATION_RLS_TABLES,
-  RUNTIME_APPLICATION_SEQUENCES,
-  RUNTIME_APPLICATION_TABLE_PRIVILEGES,
+  runtimeApplicationAclCatalog,
   runtimeRoleViolations,
   sequencePreflight,
   adoptableIndexBuildPreflight,
@@ -791,16 +789,15 @@ async function installRuntimeApplicationAcl(
   client: MigrationClient,
   role: string,
 ): Promise<void> {
-  for (const [relation, privileges] of Object.entries(
-    RUNTIME_APPLICATION_TABLE_PRIVILEGES,
-  )) {
+  const catalog = runtimeApplicationAclCatalog();
+  for (const [relation, privileges] of Object.entries(catalog.tables)) {
     const grant = await client.query<{ sql: string }>(
       "SELECT format('GRANT %s ON TABLE %s TO %I', $1::text, $2::regclass, $3::text) AS sql",
       [privileges.join(", "), relation, role],
     );
     await client.query(grant.rows[0]!.sql);
   }
-  for (const sequence of RUNTIME_APPLICATION_SEQUENCES) {
+  for (const sequence of catalog.sequences) {
     const grant = await client.query<{ sql: string }>(
       "SELECT format('GRANT USAGE ON SEQUENCE %s TO %I', $1::regclass, $2::text) AS sql",
       [sequence, role],
@@ -814,7 +811,7 @@ async function installRuntimeApplicationAcl(
     );
     await client.query(grant.rows[0]!.sql);
   }
-  for (const relation of RUNTIME_APPLICATION_RLS_TABLES) {
+  for (const relation of catalog.rlsTables) {
     const exists = await client.query<{ present: boolean }>(
       `SELECT EXISTS (SELECT 1 FROM pg_policy
         WHERE polrelid = $1::regclass AND polname = $2) AS present`,
