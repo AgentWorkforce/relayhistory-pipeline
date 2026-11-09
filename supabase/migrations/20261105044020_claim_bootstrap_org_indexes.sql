@@ -15,14 +15,22 @@
 --    definition and that is valid, ready and live: adopted, nothing is executed for it (production after the
 --    operator's build). CREATE INDEX IF NOT EXISTS is deliberately NOT used: it takes a SHARE lock on the table
 --    before it notices the name, and it silently keeps an INVALID or drifted index;
---  * no relation of that name in sessions: plain CREATE INDEX with the expected definition;
+--  * no relation of that name in sessions and the table EMPTY (fresh, dev, kind, CI): plain CREATE INDEX with
+--    the expected definition;
+--  * no relation of that name in sessions and the table POPULATED: REFUSE (55000), naming the index, the table
+--    and the CONCURRENTLY prebuild packet, unless the run explicitly opts into a blocking build
+--    (HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true on the migrator, which binds hoopdb.allow_blocking_index_build=on
+--    for each migration transaction; default off). A blocking build on a populated table is never silent;
 --  * anything else (an INVALID or not-ready index left by a failed CONCURRENTLY build, a different definition,
 --    another table, a non-index relation of that name): RAISE, never adopted, nothing is dropped.
 --
 -- The migrator runs every migration inside one transaction, so CONCURRENTLY is impossible here. The create
--- path takes a SHARE lock on the table (writes wait) for the duration of the build. That is fine on fresh and
--- small databases (dev, self-host, kind, CI). On a large database, build the index out of band with
--- CREATE INDEX CONCURRENTLY first (the packet), then this migration adopts it.
+-- path takes a SHARE lock on the table (writes wait) for the duration of the build. Emptiness is an existence
+-- probe (SELECT 1 ... LIMIT 1 with row_security off, so RLS can never make a populated table look empty; not
+-- reltuples), first without that lock, so a refusal never queues behind writers, then again under the SHARE
+-- lock right before the build, so a row inserted in between is seen. On a populated database, build the index
+-- out of band with CREATE INDEX CONCURRENTLY first (packet: docs/packets/claim-bootstrap-org-index-packet-20261108.md,
+-- PR #407), then this migration adopts it.
 --
 -- The migrator's sequencePreflight would otherwise refuse production (an unledgered step whose objects exist):
 -- these eight names are declared adoptable for this step only (ADOPTABLE_INDEXES in
@@ -35,6 +43,9 @@ DECLARE
  v_rel record;
  v_idx record;
  v_def text;
+ v_rows boolean;
+ v_allow boolean:=coalesce(current_setting('hoopdb.allow_blocking_index_build',true),'')='on';
+ v_rls text:=current_setting('row_security');
 BEGIN
  FOREACH v_spec SLICE 1 IN ARRAY ARRAY[
   ['ingest_history_mask_pages_org_id_idx','ingest_history_mask_pages',
@@ -62,6 +73,24 @@ BEGIN
   SELECT c.oid,c.relkind INTO v_rel FROM pg_class c
    WHERE c.relnamespace='sessions'::regnamespace AND c.relname=v_spec[1];
   IF NOT FOUND THEN
+   -- Absent. Only an empty table, or an explicit opt-in, may take the blocking build.
+   PERFORM set_config('row_security','off',true);
+   EXECUTE format('SELECT EXISTS(SELECT 1 FROM %s LIMIT 1)',v_tbl) INTO v_rows;
+   IF v_rows AND NOT v_allow THEN
+    RAISE EXCEPTION USING ERRCODE='55000',
+     MESSAGE=format('claim bootstrap org indexes: index sessions.%s is absent and table sessions.%s is not empty; refusing a blocking CREATE INDEX on a populated table',v_spec[1],v_spec[2]),
+     HINT=format('prebuild it out of band, CONCURRENTLY, with the claim-bootstrap index packet (docs/packets/claim-bootstrap-org-index-packet-20261108.md, PR #407) and rerun, this migration then adopts it; or opt into a blocking build with HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true (expected: %s)',v_spec[3]);
+   END IF;
+   EXECUTE format('LOCK TABLE %s IN SHARE MODE',v_tbl);
+   IF NOT v_allow THEN
+    EXECUTE format('SELECT EXISTS(SELECT 1 FROM %s LIMIT 1)',v_tbl) INTO v_rows;
+    IF v_rows THEN
+     RAISE EXCEPTION USING ERRCODE='55000',
+      MESSAGE=format('claim bootstrap org indexes: index sessions.%s is absent and table sessions.%s is not empty; refusing a blocking CREATE INDEX on a populated table',v_spec[1],v_spec[2]),
+      HINT=format('prebuild it out of band, CONCURRENTLY, with the claim-bootstrap index packet (docs/packets/claim-bootstrap-org-index-packet-20261108.md, PR #407) and rerun, this migration then adopts it; or opt into a blocking build with HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true (expected: %s)',v_spec[3]);
+    END IF;
+   END IF;
+   PERFORM set_config('row_security',v_rls,true);
    EXECUTE v_spec[3];
    SELECT c.oid,c.relkind INTO STRICT v_rel FROM pg_class c
     WHERE c.relnamespace='sessions'::regnamespace AND c.relname=v_spec[1];

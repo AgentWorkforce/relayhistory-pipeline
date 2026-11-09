@@ -14,7 +14,7 @@ import { btree_gin } from "../../../packages/pipeline/node_modules/@electric-sql
 import { pg_trgm } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/pg_trgm.js";
 import { inventoryOf, sequencePreflight } from "../migrate-guards.ts";
 import { ADOPTABLE_INDEXES, MIGRATION_SENTINELS } from "../migration-sentinels.ts";
-import { plan, runMigrations, type MigrationClient, type MigrationProfile } from "../migrate.ts";
+import { migrationProfile, plan, runMigrations, type MigrationClient, type MigrationProfile } from "../migrate.ts";
 
 setDefaultTimeout(300_000);
 const root = join(import.meta.dir, "../../..");
@@ -76,6 +76,15 @@ const applyFile = async (db: PGlite, sql: string) => {
   try { await db.exec(sql); await db.exec("COMMIT"); }
   catch (error) { await db.exec("ROLLBACK"); throw error; }
 };
+const H = "a".repeat(64);
+/** One row in sessions.ingest_lazy_native_slots: the table production still lacks the index on. */
+const populateLazySlots = (db: PGlite) =>
+  db.query(
+    `INSERT INTO sessions.ingest_lazy_native_slots(key_sha256,key_material,org_id,workspace_id,origin_id,record_id,
+       source_identity_sha256,control_epoch,initialized_witness_sha256) VALUES ($1,'{}','org-probe','ws-probe','o','r',$1,$1,$1)`,
+    [H],
+  );
+const LAZY = "ingest_lazy_native_slots_org_id_idx";
 const expectedRows = PACKET.map(([t, c]) => ({ name: `${t}_org_id_idx`, def: def(t, c) })).sort((a, b) => (a.name < b.name ? -1 : 1));
 
 describe("20261105044020 claim-bootstrap org_id indexes", () => {
@@ -87,9 +96,15 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
     // The migrator's inventory sees the eight literal names and nothing else.
     expect(inventoryOf(SQL).map((o) => `${o.kind}:${o.name}`).sort()).toEqual(IDX.map((x) => `index:${x.name}`).sort());
     // Outside comments and messages: no CONCURRENTLY, no IF NOT EXISTS, no DROP; the only EXECUTE runs a declared def.
-    const code = SQL.replace(/--[^\n]*/g, "").replace(/MESSAGE=format\('[^']*'/g, "MESSAGE");
+    const code = SQL.replace(/--[^\n]*/g, "").replace(/(MESSAGE|HINT)=format\('[^']*'/g, "$1");
     expect(code).not.toMatch(/CONCURRENTLY|IF NOT EXISTS|\bDROP\b/i);
-    expect([...code.matchAll(/\bEXECUTE\s+([^;]+);/g)].map((m) => m[1])).toEqual(["v_spec[3]"]);
+    // The only EXECUTEs: the emptiness probe (twice: unlocked, then under the SHARE lock), the lock, a declared def.
+    expect([...code.matchAll(/\bEXECUTE\s+([^;]+);/g)].map((m) => m[1]!.trim())).toEqual([
+      "format('SELECT EXISTS(SELECT 1 FROM %s LIMIT 1)',v_tbl) INTO v_rows",
+      "format('LOCK TABLE %s IN SHARE MODE',v_tbl)",
+      "format('SELECT EXISTS(SELECT 1 FROM %s LIMIT 1)',v_tbl) INTO v_rows",
+      "v_spec[3]",
+    ]);
     expect(MIGRATION_SENTINELS[STEP]).toBeDefined();
   });
 
@@ -167,6 +182,71 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
     const after = await orgIndexes(db);
     expect(after.map(({ name, def }) => ({ name, def }))).toEqual(expectedRows);
     for (const b of before) expect(after.find((a) => a.name === b.name)).toEqual(b);
+  });
+
+  describe("absent index: never a silent blocking build on a populated table", () => {
+    test("absent + empty table (fresh, kind, CI): created, no opt-in needed", async () => {
+      const db = await before044020();
+      expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.ingest_lazy_native_slots")).rows[0]!.n).toBe(0);
+      expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+      expect((await orgIndexes(db)).map(({ name, def }) => ({ name, def }))).toEqual(expectedRows);
+    });
+
+    test("production shape (7 prebuilt valid, lazy_native_slots absent, populated), no opt-in: refused naming index, table and packet; nothing changes", async () => {
+      const db = await before044020();
+      for (const x of IDX) if (x.name !== LAZY) await db.exec(x.def);
+      await populateLazySlots(db);
+      const before = await orgIndexes(db);
+      expect(before).toHaveLength(7);
+      const error = (await failure(runMigrations(client(db), { profile: LOCAL }))) as { code?: string; message?: string; hint?: string } | null;
+      expect(error?.code).toBe("55000");
+      expect(error?.message).toContain(`index sessions.${LAZY} is absent and table sessions.ingest_lazy_native_slots is not empty`);
+      expect(error?.message).toContain("refusing a blocking CREATE INDEX on a populated table");
+      expect(error?.hint).toContain("prebuild it out of band, CONCURRENTLY, with the claim-bootstrap index packet (docs/packets/claim-bootstrap-org-index-packet-20261108.md, PR #407)");
+      expect(error?.hint).toContain("HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true");
+      expect(await orgIndexes(db)).toEqual(before);
+      expect(await ledgered(db)).toBe(false);
+      // The opt-in GUC set to anything but exactly 'on' is not an opt-in.
+      await db.exec("BEGIN");
+      await db.exec("SELECT set_config('hoopdb.allow_blocking_index_build', 'true', true)");
+      const raised = await failure(db.exec(SQL));
+      await db.exec("ROLLBACK");
+      expect(raised?.code).toBe("55000");
+    });
+
+    test("absent + populated + opt-in (HOOPDB_ALLOW_BLOCKING_INDEX_BUILD): created; the seven prebuilt ones are adopted untouched", async () => {
+      const db = await before044020();
+      for (const x of IDX) if (x.name !== LAZY) await db.exec(x.def);
+      await populateLazySlots(db);
+      const before = await orgIndexes(db);
+      expect(await failure(runMigrations(client(db), { profile: { ...LOCAL, allowBlockingIndexBuild: true } }))).toBeNull();
+      expect(await ledgered(db)).toBe(true);
+      const after = await orgIndexes(db);
+      expect(after.map(({ name, def }) => ({ name, def }))).toEqual(expectedRows);
+      for (const b of before) expect(after.find((a) => a.name === b.name)).toEqual(b);
+      expect(after.find((a) => a.name === LAZY)).toMatchObject({ valid: true, ready: true });
+      // The opt-in is per migration transaction: it is not left set on the session.
+      expect((await db.query<{ v: string | null }>("SELECT current_setting('hoopdb.allow_blocking_index_build', true) v")).rows[0]!.v ?? "").not.toBe("on");
+    });
+
+    test("the populated probe cannot be fooled by row-level security hiding rows", async () => {
+      const db = await before044020();
+      await populateLazySlots(db);
+      await db.exec(`ALTER TABLE sessions.ingest_lazy_native_slots ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE sessions.ingest_lazy_native_slots FORCE ROW LEVEL SECURITY`);
+      const raised = await failure(applyFile(db, SQL));
+      // Superuser bypasses RLS: the row is seen and the build refused (a non-bypass owner would get 42501 instead).
+      expect(raised?.code).toBe("55000");
+      expect(raised?.message).toContain(LAZY);
+    });
+
+    test("HOOPDB_ALLOW_BLOCKING_INDEX_BUILD: strict true/false, default off", () => {
+      const env = { HOOPDB_DB_MODE: "local", HOOPDB_SUPABASE_SHIM: "true", HOOPDB_RUNTIME_ROLE: "hoop" };
+      expect(migrationProfile(env).allowBlockingIndexBuild).toBeUndefined();
+      expect(migrationProfile({ ...env, HOOPDB_ALLOW_BLOCKING_INDEX_BUILD: "false" }).allowBlockingIndexBuild).toBeUndefined();
+      expect(migrationProfile({ ...env, HOOPDB_ALLOW_BLOCKING_INDEX_BUILD: "true" }).allowBlockingIndexBuild).toBe(true);
+      expect(() => migrationProfile({ ...env, HOOPDB_ALLOW_BLOCKING_INDEX_BUILD: "yes" })).toThrow(/HOOPDB_ALLOW_BLOCKING_INDEX_BUILD must be/);
+    });
   });
 
   const MISMATCH: Array<[string, string]> = [

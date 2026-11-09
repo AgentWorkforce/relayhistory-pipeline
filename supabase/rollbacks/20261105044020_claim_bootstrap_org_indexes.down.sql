@@ -15,7 +15,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105044020_claim_bootstrap_org_indexes.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='claim bootstrap org indexes: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105044020_claim_bootstrap_org_indexes.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'0f24a00180d3c84cb858ee53744c5df64f5cae0973c88bdc0e638e1324cfd49b'
+ IF NOT FOUND OR v_sha<>'35787e1db39a74dbc0d3520efac2f1bb920d8e559edc78292649cfddb09a7a25'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='claim bootstrap org indexes: own applied checksum required';END IF;
 END $rollback_guard$;
 -- Reverse build order; only the eight declared names.
