@@ -26,6 +26,9 @@
  * Errors carry bounded codes only (`http_<status>`, `timeout`, `network`, and
  * for an HTTP error the server's `error.type` / `error.caused_by.type` names),
  * never response bodies or `reason` text, which can quote document content or q.
+ * A failed `_bulk` write also names its item count and body bytes, and for
+ * failed items the first failing item's status and error type names
+ * (e.g. `http_429:bulk_items_812:bulk_bytes_4190000`).
  */
 import {
   CONTENT_PREFIX_CHARS,
@@ -78,6 +81,12 @@ export interface OpenSearchSearchIndexConfig {
   readonly ca?: string;
   /** Per request. Default 10000. */
   readonly requestTimeoutMs?: number;
+  /**
+   * Upper bound (bytes) of one `_bulk` NDJSON body. Default
+   * DEFAULT_OPENSEARCH_BULK_MAX_BYTES. A single document larger than this is
+   * still written, alone in its own request.
+   */
+  readonly bulkMaxBytes?: number;
   /** Injected for tests; defaults to the global fetch. */
   readonly fetch?: FetchLike;
   /** Injected for tests; waits between deleted-key write retries. */
@@ -94,8 +103,14 @@ const WINDOW = 4096;
 const STRIDE = 2048;
 /** Rows per search_after page of a fingerprint scan (under index.max_result_window). */
 const SCAN_PAGE = 5000;
-/** Bulk request body bound (bytes); well under the default http.max_content_length of 100mb. */
-const BULK_BYTES = 8 * 1024 * 1024;
+/**
+ * Default bound of one `_bulk` request body (bytes, the serialized NDJSON).
+ * Amazon OpenSearch Service caps an HTTP request body at 10 MiB on its small
+ * instance types (and answers 429 / 502 near that size), well below the
+ * engine's default http.max_content_length of 100mb. Override with
+ * `bulkMaxBytes` (SEARCH_INDEX_OPENSEARCH_BULK_MAX_BYTES).
+ */
+export const DEFAULT_OPENSEARCH_BULK_MAX_BYTES = 4 * 1024 * 1024;
 const ERASE_ATTEMPTS = 5;
 /**
  * Waits before re-writing a key whose only conflict is a delete tombstone.
@@ -270,6 +285,15 @@ function httpDetail(status: number, body: unknown): string {
   return [`http_${status}`, type, cause].filter((x) => x !== undefined).join(":");
 }
 
+/** The bounded error type names of a bulk item error (never `reason`, which can quote document content). */
+function itemErrorTypes(error: unknown): string[] {
+  if (!error || typeof error !== "object") return [];
+  const named = (v: unknown) => (typeof v === "string" && ERROR_TYPE.test(v) ? v : undefined);
+  const type = named((error as { type?: unknown }).type);
+  const cause = named((error as { caused_by?: { type?: unknown } }).caused_by?.type);
+  return [type, cause].filter((x): x is string => x !== undefined);
+}
+
 function toSource(d: SearchEventDocument) {
   return {
     org_id: d.orgId,
@@ -386,6 +410,8 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
   const index = `${prefix}-transcript-events`;
   const timeoutMs = config.requestTimeoutMs ?? DEFAULT_OPENSEARCH_TIMEOUT_MS;
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_OPENSEARCH_TIMEOUT_MS) throw new SearchIndexError("invalid_argument", false, "timeout");
+  const bulkMaxBytes = config.bulkMaxBytes ?? DEFAULT_OPENSEARCH_BULK_MAX_BYTES;
+  if (!Number.isSafeInteger(bulkMaxBytes) || bulkMaxBytes < 1) throw new SearchIndexError("invalid_argument", false, "bulk_max_bytes");
   const auth = config.auth ?? { kind: "none" };
   let authorization: string | undefined;
   let sigv4: { region: string; credentials: () => Promise<AwsCredentials> } | undefined;
@@ -601,21 +627,47 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
         entries.push({ id, line: `${JSON.stringify(action)}\n${JSON.stringify(toSource(doc))}\n` });
       }
       let written = 0;
-      /** One _bulk call; returns the lines that hit a version conflict. */
+      /**
+       * One _bulk call; returns the lines that hit a version conflict. A failure
+       * keeps its code and retryable flag; its detail gains the request's item
+       * count and body bytes (and, for failed items, the first failing item's
+       * status and error type names and the failed count). Never a reason or
+       * any document text.
+       */
       const bulk = async (batch: { id: string; line: string }[]) => {
-        const reply = await request("POST", "_bulk?refresh=wait_for", undefined, context, { ndjson: batch.map((b) => b.line).join("") });
-        const items = (reply.body as { items?: { index?: { status?: unknown; error?: { type?: unknown } } }[] } | undefined)?.items;
+        const ndjson = batch.map((b) => b.line).join("");
+        const shape = `bulk_items_${batch.length}:bulk_bytes_${new TextEncoder().encode(ndjson).length}`;
+        let reply: Awaited<ReturnType<typeof request>>;
+        try {
+          reply = await request("POST", "_bulk?refresh=wait_for", undefined, context, { ndjson });
+        } catch (error) {
+          if (error instanceof SearchIndexError && error.code === "unavailable") {
+            throw new SearchIndexError(error.code, error.retryable, `${error.detail ?? "error"}:${shape}`);
+          }
+          throw error;
+        }
+        const items = (reply.body as { items?: { index?: { status?: unknown; error?: unknown } }[] } | undefined)?.items;
         if (!Array.isArray(items) || items.length !== batch.length) invalidReply();
-        let failure: number | undefined;
+        let failure: { status: number; types: string[] } | undefined;
+        let failed = 0;
         const conflicts: { id: string; line: string }[] = [];
         items.forEach((item, i) => {
           const status = item?.index?.status;
           if (typeof status !== "number") invalidReply();
           if (status >= 200 && status < 300) written += 1;
-          else if (status === 409 && item.index!.error?.type === "version_conflict_engine_exception") conflicts.push(batch[i]!);
-          else failure = failure === undefined || retryableStatus(status) ? status : failure;
+          else if (status === 409 && (item.index!.error as { type?: unknown } | undefined)?.type === "version_conflict_engine_exception") conflicts.push(batch[i]!);
+          else {
+            failed += 1;
+            // The first failure, or the first retryable one: a retryable item keeps the whole call retryable.
+            if (failure === undefined || (retryableStatus(status) && !retryableStatus(failure.status))) {
+              failure = { status, types: itemErrorTypes(item.index!.error) };
+            }
+          }
         });
-        if (failure !== undefined) throw new SearchIndexError("unavailable", retryableStatus(failure), `bulk_item_${failure}`);
+        if (failure !== undefined) {
+          const detail = [`bulk_item_${failure.status}`, ...failure.types, `bulk_failed_${failed}`, shape].join(":");
+          throw new SearchIndexError("unavailable", retryableStatus(failure.status), detail);
+        }
         return conflicts;
       };
       /** The conflicts with no live document: the conflict is a delete tombstone, not a newer row. */
@@ -642,11 +694,16 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
         }
         if (pending.length > 0) throw new SearchIndexError("unavailable", true, "deleted_key_conflict");
       };
+      // Batches bounded by bytes (the exact NDJSON body size: the lines are
+      // joined as-is) and by MAX_UPSERT_BATCH actions. A batch is flushed
+      // before an entry that would push it past either bound; the first entry
+      // of a batch is always taken, so a document larger than the byte bound is
+      // sent alone rather than dropped or retried forever.
       let batch: { id: string; line: string }[] = [];
       let batchBytes = 0;
       for (const entry of entries) {
         const bytes = new TextEncoder().encode(entry.line).length;
-        if (batch.length > 0 && batchBytes + bytes > BULK_BYTES) {
+        if (batch.length > 0 && (batchBytes + bytes > bulkMaxBytes || batch.length >= MAX_UPSERT_BATCH)) {
           await flush(batch);
           batch = [];
           batchBytes = 0;

@@ -318,6 +318,17 @@ components retain their existing timing checks.
 | `SEARCH_INDEX_OPENSEARCH_PASSWORD` | secret, from the secret loader (`secrets`), never env | required for `basic` |
 | `SEARCH_INDEX_OPENSEARCH_CA_FILE` | path to a PEM bundle | unset; https only, Bun runtime only |
 | `SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS` | integer, 1 to 600000 | `10000` |
+| `SEARCH_INDEX_OPENSEARCH_BULK_MAX_BYTES` | positive integer (bytes) | `4194304` (4 MiB); upper bound of one `_bulk` request body (NDJSON), well under the 10 MiB request limit of small Amazon OpenSearch instance types. A write splits into several requests at this bound or at 5000 documents; a single larger document is sent alone. Unset, zero or malformed means the default |
+
+A failed OpenSearch write keeps its code and retryable flag (429 and 5xx,
+timeouts and network errors are retryable) and carries a bounded detail: the
+HTTP status and the server's error type names, the `_bulk` item count and body
+bytes, and for item failures the first failing item's status and type names and
+the failed count (for example
+`http_429:es_rejected_execution_exception:bulk_items_812:bulk_bytes_4190000` or
+`bulk_item_400:mapper_parsing_exception:bulk_failed_2:bulk_items_812:bulk_bytes_4190000`).
+The self-host consumer logs it as `error_detail` on `search index failed`. Never
+the server's `reason` text or any document content.
 
 Empty or unset selection variables use each entry point's existing behavior.
 Unknown names and recognized but unsupported choices fail at boot. Workers use
