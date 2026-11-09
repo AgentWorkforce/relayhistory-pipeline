@@ -122,6 +122,12 @@ export interface MigrationProfile {
    * itself proves the selected control. Required outside local mode.
    */
   functionBoundary?: FunctionBoundaryMode;
+  /**
+   * HOOPDB_ALLOW_BLOCKING_INDEX_BUILD (default off): lets an index migration run a blocking
+   * CREATE INDEX on a populated table instead of refusing. Bound per migration transaction as
+   * hoopdb.allow_blocking_index_build (on/off); read by 20261105044020.
+   */
+  allowBlockingIndexBuild?: boolean;
 }
 
 function profileError(code: string, message: string): Error {
@@ -235,11 +241,14 @@ export function migrationProfile(
       "db_profile_invalid",
       "HOOPDB_FUNCTION_BOUNDARY_MODE must be global-default-revoke or (supabase only) event-trigger",
     );
+  // Explicit opt-in only (strict true/false); unset or false keeps the refusal.
+  const allowBlockingIndexBuild = strictFlag(env, "HOOPDB_ALLOW_BLOCKING_INDEX_BUILD");
   const runtime = {
     runtimeRole,
     ...(runtimeLogin === undefined ? {} : { runtimeLogin }),
     ...(workloadRole ? { workloadRole } : {}),
     ...(fb ? { functionBoundary: fb as FunctionBoundaryMode } : {}),
+    ...(allowBlockingIndexBuild ? { allowBlockingIndexBuild: true } : {}),
   };
   if (mode === "supabase") {
     if (shim)
@@ -602,9 +611,10 @@ export async function runMigrations(
         );
     };
     const bindDbMode = () =>
-      client.query("SELECT set_config('hoopdb.db_mode', $1, true)", [
-        profile.mode,
-      ]);
+      client.query(
+        "SELECT set_config('hoopdb.db_mode', $1, true), set_config('hoopdb.allow_blocking_index_build', $2, true)",
+        [profile.mode, profile.allowBlockingIndexBuild === true ? "on" : "off"],
+      );
     let postChecked = false;
     // The validation marker flips to 'pass' once, after every phase-2 verifier
     // has passed: only the last verify step does the UPDATE, so an earlier

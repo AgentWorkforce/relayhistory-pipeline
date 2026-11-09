@@ -1,6 +1,6 @@
 /** HoopDb access: a pg Pool that satisfies the vendored SqlExecutor, plus readiness gates. */
 import { readFileSync } from "node:fs";
-import { resolveRenamedLedger, RUNTIME_APPLICATION_FUNCTIONS } from "../hoopdb/migrate-guards.ts";
+import { migrationChecksumMatches, resolveRenamedLedger, RUNTIME_APPLICATION_FUNCTIONS } from "../hoopdb/migrate-guards.ts";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
@@ -211,14 +211,18 @@ export async function schemaVerdict(
       // The physical ledger goes through the migrator's own rename-alias verdict
       // (resolveRenamedLedger, in memory, never a write): exact original-name rows count
       // as their release names; any alias state the migrator refuses (collision, wrong
-      // sha, missing repair, original sha under the release name) leaves it missing.
+      // sha, missing repair, original or any other unaccepted sha under the release
+      // name) leaves it missing, as does any row whose sha the migrator would refuse.
       const physical = new Map(
         (await tx.query<{ name: string; sha256: string }>("SELECT name, sha256 FROM sessions.__96bulls_migrations")).rows
           .map((r) => [r.name, r.sha256]),
       );
       const shas = expected.shas ?? {};
+      const { effective } = resolveRenamedLedger(physical, (n) => (Object.hasOwn(shas, n) ? shas[n] : undefined));
+      // A recorded row counts only with a checksum the migrator would accept for the
+      // planned file (its migration_changed guard), alias-adopted or not.
       const have = new Set(
-        resolveRenamedLedger(physical, (n) => (Object.hasOwn(shas, n) ? shas[n] : undefined)).effective.keys(),
+        [...effective].filter(([n, sha]) => !Object.hasOwn(shas, n) || migrationChecksumMatches(n, sha, shas[n]!)).map(([n]) => n),
       );
       // The role shim, bootstrap and verify steps are not schema; the marker covers verify.
       const missing = expected.names.filter((n) => !isPrerequisiteStep(n) && !have.has(n));

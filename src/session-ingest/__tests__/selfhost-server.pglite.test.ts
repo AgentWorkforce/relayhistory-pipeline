@@ -285,7 +285,7 @@ describe("self-host ingest edge over node:http", () => {
     expect((await fetch(url("/nope"))).status).toBe(404);
     expect(rc.calls).toHaveLength(0);
     const health = await fetch(url("/healthz"));
-    expect(await health.json()).toEqual({ ok: true, enabled: true });
+    expect(await health.json()).toEqual({ ok: true, enabled: true, admission: "sync" });
     expect((await fetch(url("/readyz"))).status).toBe(200);
   });
 
