@@ -52,7 +52,10 @@ import {
 } from "./auth.ts";
 import { parseSelfhostLoginSync, parseSelfhostReadApi } from "./selfhost.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
-import { parseCompleteSince } from "./config.ts";
+import { parseCompleteSince, parseFactsBackend, readApiRouteEnabled, READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND } from "./config.ts";
+import { sqlNarrativeCache } from "./digest-narrative.ts";
+import { postgresOutputBackend } from "./postgres/output-query.ts";
+import { postgresDigestBackend } from "./postgres/digest-query.ts";
 import { poolTenantRunner, sqlLiveness, type SqlQuery } from "./liveness.ts";
 import { serviceCanonicalDeps } from "./service-canonical.ts";
 import {
@@ -453,6 +456,7 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env, composition?: Sear
   parseCompleteSince(env.READ_API_COMPLETE_SINCE);
   parseSelfhostReadApi(env);
   parseSelfhostLoginSync(env);
+  factsBackends(env, "lambda");
   postgresTlsOptions(env);
   searchBackend(env, composition); // reject unsupported selections before secret lookup
   const { SecretString } = await awsJsonCall<{ SecretString?: string }>({
@@ -466,6 +470,20 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env, composition?: Sear
   return (await readAppFromSecret(SecretString, env, composition)).app;
 }
 
+/**
+ * READ_API_OUTPUT_BACKEND / READ_API_DIGEST_BACKEND (config.ts parseFactsBackend): which facts
+ * store serves Output and the digest. Unset = "clickhouse", today's behaviour. "postgres" (the
+ * self-host Postgres facts, migration 045020) is served only by the self-host service: the hosted
+ * Lambda refuses it rather than ignore it. Any other value refuses to start.
+ */
+export function factsBackends(env: NodeJS.ProcessEnv, entry: ReadAppEntry) {
+  const output = parseFactsBackend(env, READ_API_OUTPUT_BACKEND);
+  const digest = parseFactsBackend(env, READ_API_DIGEST_BACKEND);
+  if (entry !== "service" && (output === "postgres" || digest === "postgres"))
+    throw new Error("session read api: READ_API_OUTPUT_BACKEND/READ_API_DIGEST_BACKEND=postgres is served only by the self-host service");
+  return { output, digest };
+}
+
 /** The read API's dependencies except its verifier: the read-role pool, the
  * selected search binding (the ClickHouse client or the composition's adapter,
  * never both), directory/liveness SQL and the self-host login. `close` releases
@@ -476,6 +494,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
   const selfhostReadApi = parseSelfhostReadApi(env);
   const loginSync = parseSelfhostLoginSync(env);
+  const facts = factsBackends(env, entry);
   // The self-host service never inherits the hosted Supabase pin by omission.
   if (entry === "service" && !env.SESSION_POSTGRES_TLS_PROFILE)
     throw new Error("session read api: the self-host service needs SESSION_POSTGRES_TLS_PROFILE set explicitly");
@@ -515,9 +534,20 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   // metadata and catalog. The hosted Lambda never builds it (those routes keep
   // their 501 `*_not_configured` there).
   const canonical = entry === "service" ? await serviceCanonicalDeps(env, poolTenantRunner(pool as never)) : undefined;
+  const liveness = sqlLiveness(poolTenantRunner(pool as never));
+  // The self-host service only (factsBackends refuses postgres elsewhere): Output and the digest
+  // from the Postgres facts through the read role, no ClickHouse. "clickhouse" there wires
+  // nothing, as before (the service has no ClickHouse client: 501 *_not_configured).
+  const factsDeps = { run: poolTenantRunner(pool as never), liveness };
+  const outputDeps = facts.output === "postgres" && readApiRouteEnabled(env.READ_API_OUTPUT_ENABLED)
+    ? { output: { enabled: true as const, backend: postgresOutputBackend(factsDeps) } } : {};
+  // Narrative: the Supabase cache only (cache-only, no generator) until the self-host narrative
+  // provider (selfhostNarrativeFromEnv) lands; a miss is 200 `narrative.unavailable`.
+  const digestDeps = facts.digest === "postgres" && readApiRouteEnabled(env.READ_API_DIGEST_ENABLED)
+    ? { digest: { cache: sqlNarrativeCache(poolTenantRunner(pool as never)), backend: postgresDigestBackend(factsDeps) } } : {};
   const deps: Omit<ReadApiDeps, "verify"> = {
     ...(adapter ? { adapter } : { ch: createClickHouseClient(secret.clickhouse!) }),
-    liveness: sqlLiveness(poolTenantRunner(pool as never)),
+    liveness,
     directory: sqlDirectory(poolTenantRunner(pool as never)),
     directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
     ...(entry === "service" ? {briefSummary: sqlBriefSummary(poolTenantRunner(pool as never))} : {}),
@@ -526,6 +556,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     completeSinceMs,
     ...(canonical ? { timing: canonical.timing, turns: canonical.turns, canonicalEvents: canonical.events } : {}),
     ...eventMessageIdDeps(env, canonical?.turns),
+    ...outputDeps,
+    ...digestDeps,
     ...(authConfig.selfIssued ? { selfIssued: { ...authConfig.selfIssued, store: sqlTokenStore(pool as never) } } : {}),
     ...(corsAllowedOrigins?.size ? { corsAllowedOrigins } : {}),
     ...(selfhostReadApi ? { selfhost: { ...(authConfig.mode === "self_issued" ? {} : { login: relaycontrolLogin(authConfig) }), ...(canonical ? { catalog: canonical.catalog } : {}), ...(loginSync ? { syncServed: true as const } : {}) } } : {}),

@@ -36,13 +36,15 @@ import { BriefSummaryError, briefSummaryResponse, type BriefSummary } from "./br
  *                                   (session-timing-source.ts, timing.ts), same allowlist.
  *   GET /v1/sessions/:id/turns      the relay session journal from canonical S3 (legacy
  *   GET /v1/sessions/:id/metadata   export + live turns: session-turns-source.ts), same allowlist.
- *   GET /v1/sessions/output         Output from the ClickHouse facts (output-query.ts), off unless
+ *   GET /v1/sessions/output         Output from the output facts (output-backend.ts: ClickHouse by
+ *                                   default, the self-host Postgres facts with
+ *                                   READ_API_OUTPUT_BACKEND=postgres), off unless
  *                                   READ_API_OUTPUT_ENABLED=1 (deps.output), same allowlist; 501
  *                                   until the workspace's backfill watermark exists.
- *   GET /v1/digest/daily            the daily digest from the ClickHouse facts + the directory,
- *                                   narrative from the Supabase cache / narrative Worker
- *                                   (digest-query.ts, digest-narrative.ts), off unless
- *                                   READ_API_DIGEST_ENABLED=1 (deps.digest), same allowlist.
+ *   GET /v1/digest/daily            the daily digest from the output facts (digest-backend.ts,
+ *                                   READ_API_DIGEST_BACKEND) + the directory, narrative from the
+ *                                   Supabase cache / narrative Worker (digest-narrative.ts), off
+ *                                   unless READ_API_DIGEST_ENABLED=1 (deps.digest), same allowlist.
  *   GET /v1/sessions/titles         cached brief titles of up to 100 `key=<source>:<sessionId>`
  *                                   keys, from Supabase session_briefs (brief-titles.ts). Its
  *                                   own allowlist, READ_API_BRIEF_TITLES_WORKSPACES (unset = none,
@@ -71,10 +73,11 @@ import { timingFromCanonical, type CanonicalRows } from "./session-timing-source
 import { TimingInputError } from "./timing.ts";
 import { EvidenceRequestError, readBabysitterEvidence, type EvidenceDeps } from "./babysitter-evidence.ts";
 import { MAX_TURN_HARNESSES, TurnsInputError, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
-import { isOutputSchemaShort, outputWindowReadiness, readSessionOutput } from "./output-query.ts";
+import { clickhouseOutputBackend, type OutputBackend } from "./output-backend.ts";
+import { clickhouseDigestBackend, type DigestBackend } from "./digest-backend.ts";
 import { READ_SETTINGS } from "./queries.ts";
 import { DigestInputError, resolveDayWindow } from "./day-window.ts";
-import { DIGEST_OMITTED_FIELDS, DigestDirectoryUnavailable, buildDailyDigest, computeStatsHash } from "./digest-query.ts";
+import { DIGEST_OMITTED_FIELDS, DigestDirectoryUnavailable, computeStatsHash } from "./digest-query.ts";
 import { resolveDigestNarrative, type DigestNarrativeDeps } from "./digest-narrative.ts";
 import {
   DIRECTORY_LIST_MAX_LIMIT,
@@ -182,16 +185,18 @@ export interface ReadApiDeps {
   /** Relay session turns and metadata from canonical S3 (session-turns-source.ts); absent = 501 `turns_not_configured`. */
   turns?: TurnsDeps;
   /**
-   * READ_API_OUTPUT_ENABLED=1: serve GET /v1/sessions/output from the ClickHouse facts
-   * (output-query.ts) with `ch`. Absent = 501 `output_not_configured`.
+   * READ_API_OUTPUT_ENABLED=1: serve GET /v1/sessions/output from `backend`
+   * (output-backend.ts), or, without one, the ClickHouse facts (clickhouse/output-query.ts)
+   * with `ch`. Absent, or neither a backend nor `ch` = 501 `output_not_configured`.
    */
-  output?: { enabled: true };
+  output?: { enabled: true; backend?: OutputBackend };
   /**
-   * READ_API_DIGEST_ENABLED=1: serve GET /v1/digest/daily (digest-query.ts) with `ch` and
-   * `directory`; the narrative from `cache` and the service-bound `generator`. Absent = 501
+   * READ_API_DIGEST_ENABLED=1: serve GET /v1/digest/daily from `backend` (digest-backend.ts),
+   * or, without one, the ClickHouse facts with `ch`, plus `directory`; the narrative from
+   * `cache` and the service-bound `generator`. Absent, or neither a backend nor `ch` = 501
    * `digest_not_configured`.
    */
-  digest?: DigestNarrativeDeps;
+  digest?: DigestNarrativeDeps & { backend?: DigestBackend };
   /** Service-only verified canonical object reads for exact sessions outside search retention. */
   canonicalEvents?: CanonicalEventsDeps;
   /** Babysitter evidence reader (babysitter-evidence.ts); absent = 501 `delivery_records_not_configured`. */
@@ -1140,14 +1145,14 @@ export function createReadApi(deps: ReadApiDeps) {
   /**
    * GET /v1/sessions/output (relayhistory routes/recall.ts + lib/session-output.ts): the
    * workspace's agent messages and unique commits in [since, until] (inclusive), from the
-   * ClickHouse facts (output-query.ts), never Neon. The 400s are relayhistory's, in its
+   * output facts (output-backend.ts: ClickHouse, or the self-host Postgres facts), never Neon. The 400s are relayhistory's, in its
    * order. Then the canary allowlist, and a 501 for every case not answerable exactly:
    *   output_not_configured      READ_API_OUTPUT_ENABLED is off
    *   output_backfill_incomplete no backfill watermark for the workspace yet
    *   output_before_watermark    `since` is earlier than the watermark's complete_since
    *   output_session_partial     a session whose facts are inexact and whose span overlaps the window
    *   output_session_unindexed   a session with transcript events in the window and no complete
-   *                              facts state (output-query.ts outputWindowReadiness)
+   *                              facts state (the backend's windowReadiness)
    *   output_schema_missing      the output-facts DDL (or one of its columns) is not applied
    */
   app.get("/v1/sessions/output", async (c) => {
@@ -1166,18 +1171,19 @@ export function createReadApi(deps: ReadApiDeps) {
           Math.max(0, Math.floor(until.getTime() / day) - Math.floor(since.getTime() / day) + 1) > 366)
         throw bad("Invalid output date range");
       requireCanary(identity, "output");
-      // The facts are ClickHouse tables: a portable search adapter cannot serve Output.
-      const ch = deps.ch;
-      if (!deps.output || !ch) throw unsupported("output_not_configured");
+      // The facts are ClickHouse tables or the self-host Postgres facts (deps.output.backend):
+      // a portable search adapter cannot serve Output.
+      const backend = deps.output?.backend ?? (deps.output && deps.ch ? clickhouseOutputBackend(deps.ch) : undefined);
+      if (!deps.output || !backend) throw unsupported("output_not_configured");
       const opts = { settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 };
       let output;
       try {
-        const readiness = await outputWindowReadiness(ch, identity.orgId, identity.workspaceId, since, until, opts);
+        const readiness = await backend.windowReadiness(identity.orgId, identity.workspaceId, since, until, opts);
         if (readiness !== "ready") throw unsupported(`output_${readiness}`);
-        output = await readSessionOutput(ch, { orgId: identity.orgId, workspaceIds: [identity.workspaceId] }, { since, until }, opts);
+        output = await backend.readOutput({ orgId: identity.orgId, workspaceIds: [identity.workspaceId] }, { since, until }, opts);
       } catch (error) {
         // The fact tables are owner-applied DDL: a missing table or column is a 501, not a 500.
-        if (isOutputSchemaShort(error)) throw unsupported("output_schema_missing");
+        if (backend.isSchemaMissing(error)) throw unsupported("output_schema_missing");
         throw error;
       }
       log({ route: c.req.routePath, reason: "output_served", correlation_id: c.get("correlationId") });
@@ -1339,7 +1345,7 @@ export function createReadApi(deps: ReadApiDeps) {
   });
   /**
    * GET /v1/digest/daily (relayhistory routes/digest.ts): one civil day's rollup from the
-   * ClickHouse facts and the directory, plus the cached model narrative, never Neon. The 400s
+   * output facts (digest-backend.ts: ClickHouse, or the self-host Postgres facts) and the directory, plus the cached model narrative, never Neon. The 400s
    * are resolveDayWindow's (ported verbatim). A workspace off the allowlist, or a backend not
    * ready, is a 501 naming why:
    *   digest_not_configured       READ_API_DIGEST_ENABLED is off
@@ -1367,19 +1373,20 @@ export function createReadApi(deps: ReadApiDeps) {
       const projectId = c.req.query("project")?.trim() || null;
       const refresh = c.req.query("refresh") === "true";
       requireCanary(identity, "digest");
-      // The digest reads the ClickHouse facts: a portable search adapter cannot serve it.
-      const ch = deps.ch;
-      if (!deps.digest || !ch) throw unsupported("digest_not_configured");
+      // The digest reads the ClickHouse facts or the self-host Postgres facts
+      // (deps.digest.backend): a portable search adapter cannot serve it.
+      const backend = deps.digest?.backend ?? (deps.digest && deps.ch ? clickhouseDigestBackend(deps.ch) : undefined);
+      if (!deps.digest || !backend) throw unsupported("digest_not_configured");
       const opts = { settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 };
       let digest;
       try {
         // Exactly the stats window, half-open [since, until), so no event the stats count escapes
         // the readiness check (an event at until - 0.5 ms is in both).
-        const readiness = await outputWindowReadiness(ch, identity.orgId, identity.workspaceId, window.since, window.until, { ...opts, untilExclusive: true });
+        const readiness = await backend.windowReadiness(identity.orgId, identity.workspaceId, window.since, window.until, { ...opts, untilExclusive: true });
         if (readiness !== "ready") throw unsupported(`digest_${readiness}`);
-        digest = await buildDailyDigest(ch, deps.directory, { orgId: identity.orgId, workspaceId: identity.workspaceId, since: window.since, until: window.until, projectId }, opts);
+        digest = await backend.buildDailyDigest(deps.directory, { orgId: identity.orgId, workspaceId: identity.workspaceId, since: window.since, until: window.until, projectId }, opts);
       } catch (error) {
-        if (isOutputSchemaShort(error)) throw unsupported("digest_schema_missing");
+        if (backend.isSchemaMissing(error)) throw unsupported("digest_schema_missing");
         throw error;
       }
       const statsHash = await computeStatsHash(digest, identity.workspaceId);
