@@ -102,6 +102,132 @@ export function ownerBufferedEventsEnabled(raw: string | undefined): boolean {
   throw new OwnerBufferedEventsFlagError();
 }
 
+export const OWNER_BUFFERED_STAGE_CONCURRENCY_FLAG = "READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY";
+/** The largest READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY accepted (S3 GetObjects in flight per read). */
+export const OWNER_BUFFERED_STAGE_CONCURRENCY_MAX = 32;
+
+/** READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY holds an unaccepted value. Names the field, never the value. */
+export class OwnerBufferedStageConcurrencyError extends Error {
+  constructor() {
+    super(`${OWNER_BUFFERED_STAGE_CONCURRENCY_FLAG} must be unset, "0", "1" or an integer 2..${OWNER_BUFFERED_STAGE_CONCURRENCY_MAX}`);
+    this.name = "OwnerBufferedStageConcurrencyError";
+  }
+}
+
+/**
+ * READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY: unset, empty, "0" or "1" is 1 (the serial stage
+ * fetch, unchanged); an integer "2".."32" (digits only, no sign, no leading zero, no spaces) is
+ * the most S3 stage GetObjects one buffered detail read keeps in flight; anything else throws
+ * OwnerBufferedStageConcurrencyError (the Worker refuses the deploy's requests, as it does for
+ * READ_API_OWNER_BUFFERED_EVENTS). The authority checks keep their order and placement either way.
+ */
+export function ownerBufferedStageConcurrency(raw: string | undefined): number {
+  if (raw === undefined || raw === "" || raw === "0" || raw === "1") return 1;
+  if (/^[1-9][0-9]?$/.test(raw)) {
+    const n = Number(raw);
+    if (n >= 2 && n <= OWNER_BUFFERED_STAGE_CONCURRENCY_MAX) return n;
+  }
+  throw new OwnerBufferedStageConcurrencyError();
+}
+
+export const OWNER_BUFFERED_PHASE_LOG_FLAG = "READ_API_OWNER_BUFFERED_PHASE_LOG";
+
+/** READ_API_OWNER_BUFFERED_PHASE_LOG: exactly "1" enables the per-phase log fields; anything else is off. */
+export function ownerBufferedPhaseLogEnabled(raw: string | undefined): boolean {
+  return raw === "1";
+}
+
+/** The owner-buffered events read's phases, in order; each logs as `<phase>_ms`. */
+export const OWNER_BUFFERED_PHASES = ["session_start", "control_head_1", "stages_sql", "s3_fetch", "recheck", "control_head_2", "fold"] as const;
+export type OwnerBufferedPhase = (typeof OWNER_BUFFERED_PHASES)[number];
+
+/**
+ * READ_API_OWNER_BUFFERED_PHASE_LOG=1: per-phase wall time of one owner-buffered events read,
+ * added to the request's existing log line. Holds durations and a stage count only (never
+ * content, keys or ids). A phase that throws keeps its elapsed time and is named by
+ * `aborted_phase`; a phase never reached has no field. `fold` accumulates the CPU-only work
+ * (stage record parse after the recheck, cross-stage fold, projection and scrub): workerd does
+ * not advance timers during pure CPU work, so in the Worker it may read 0.
+ */
+export class OwnerBufferedPhaseTimer {
+  private readonly elapsed = new Map<OwnerBufferedPhase, number>();
+  private current: OwnerBufferedPhase | undefined;
+  private stageCount: number | undefined;
+  /** Set once the fields went out on an abort line; the request line then omits them. */
+  emitted = false;
+  constructor(private readonly now: () => number = () => performance.now()) {}
+
+  async time<T>(phase: OwnerBufferedPhase, fn: () => Promise<T>): Promise<T> {
+    this.current = phase;
+    const started = this.now();
+    try {
+      const out = await fn();
+      this.current = undefined;
+      return out;
+    } finally {
+      this.add(phase, started);
+    }
+  }
+
+  timeSync<T>(phase: OwnerBufferedPhase, fn: () => T): T {
+    this.current = phase;
+    const started = this.now();
+    try {
+      const out = fn();
+      this.current = undefined;
+      return out;
+    } finally {
+      this.add(phase, started);
+    }
+  }
+
+  /** The number of stages the S3 phase fetches (the first stages() answer). */
+  stages(count: number): void {
+    this.stageCount = count;
+  }
+
+  /** The phase in progress or the one that threw; undefined when none is. */
+  get inProgress(): OwnerBufferedPhase | undefined {
+    return this.current;
+  }
+
+  /** `<phase>_ms` (rounded) for every phase reached, `s3_stage_count`, and `aborted_phase` when a phase did not complete. */
+  fields(aborted?: string): Record<string, number | string> {
+    const out: Record<string, number | string> = {};
+    for (const phase of OWNER_BUFFERED_PHASES) {
+      const ms = this.elapsed.get(phase);
+      if (ms !== undefined) out[`${phase}_ms`] = Math.round(ms);
+    }
+    if (this.stageCount !== undefined) out.s3_stage_count = this.stageCount;
+    const phase = this.current ?? aborted;
+    if (phase !== undefined) out.aborted_phase = phase;
+    return out;
+  }
+
+  private add(phase: OwnerBufferedPhase, started: number): void {
+    this.elapsed.set(phase, (this.elapsed.get(phase) ?? 0) + Math.max(0, this.now() - started));
+  }
+}
+
+/** Optional per-request context of one gated buffered read (the events route passes it; turns do not). */
+export interface OwnerBufferedReadOptions {
+  /** The request's signal: with stage concurrency, an abort stops new GetObjects and fails the read. */
+  signal?: AbortSignal;
+  /** READ_API_OWNER_BUFFERED_PHASE_LOG=1: records each phase's time. */
+  phases?: OwnerBufferedPhaseTimer;
+}
+
+/** Module-private: the events read adds its stage concurrency; the turns read never does (serial). */
+type GatedReadOptions = OwnerBufferedReadOptions & { stageConcurrency?: number };
+
+function timed<T>(phases: OwnerBufferedPhaseTimer | undefined, phase: OwnerBufferedPhase, fn: () => Promise<T>): Promise<T> {
+  return phases ? phases.time(phase, fn) : fn();
+}
+
+function timedSync<T>(phases: OwnerBufferedPhaseTimer | undefined, phase: OwnerBufferedPhase, fn: () => T): T {
+  return phases ? phases.timeSync(phase, fn) : fn();
+}
+
 /** The caller: org and workspace from the verified token, user from its verified subject. */
 export interface BufferedScope {
   orgId: string;
@@ -156,6 +282,7 @@ export const FENCE_SUBTYPES: readonly string[] = Object.freeze([
   "rpc_fenced", "rpc_timeout", "rpc_error",
   "gate_unbound", "gate_identity", "gate_status", "gate_cache", "gate_shape", "gate_timeout", "gate_error",
   "gate_echo", "gate_pending", "gate_epoch", "gate_moved",
+  "request_aborted",
 ]);
 
 /** A fence reason for logs: the reason when it is a known subtype, else "fence_other". */
@@ -503,6 +630,14 @@ export interface OwnerBufferedDeps {
    * Absent or false: it never does (every events response exactly as without the flag).
    */
   events?: boolean;
+  /**
+   * READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY (ownerBufferedStageConcurrency): the most stage
+   * GetObjects in flight in one buffered events read (readOwnerBufferedEvents; turns stay
+   * serial). Absent or 1: the serial fetch.
+   */
+  stageConcurrency?: number;
+  /** READ_API_OWNER_BUFFERED_PHASE_LOG=1: the events route logs per-phase times. */
+  phaseLog?: boolean;
 }
 
 /** One stage object: the compressed and the decompressed bound (staging.ts BUFFER_STAGE_MAX_BYTES). */
@@ -881,7 +1016,9 @@ type RawSessionRead =
  */
 async function readStagesUngated(
   deps: OwnerBufferedDeps, scope: BufferedScope, authority: AuthorityHead, source: string, sessionId: string, first: BufferedStageRow[],
+  opts: GatedReadOptions = {},
 ): Promise<RawSessionRead> {
+  const { phases } = opts;
   assertCompressedBounds(first);
   let refreshed: BufferedStageRow[] | undefined;
   let decompressed = 0;
@@ -897,43 +1034,112 @@ async function readStagesUngated(
     return { row, stage };
   };
   const fetched: Array<{ row: BufferedStageRow; stage: Awaited<ReturnType<typeof readBufferedStage>> }> = [];
-  for (const row of first) {
-    try {
-      fetched.push(await fetchOne(row));
-    } catch (error) {
-      if (!isObjectStoreError(error, "not_found")) throw error;
-      refreshed ??= await deps.reads.stages(scope, authority, source, sessionId);
-      assertCompressedBounds(refreshed);
-      const again = refreshed.find((r) => r.stage_key === row.stage_key);
-      if (!again) continue;
+  const concurrency = opts.stageConcurrency ?? 1;
+  phases?.stages(first.length);
+  await timed(phases, "s3_fetch", async () => {
+    if (concurrency >= 2) {
+      // Bounded concurrency: the same fetch, refetch-on-404 and bounds, at most `concurrency`
+      // GetObjects in flight, kept in `first` order. Decompress is synchronous, so the shared
+      // `decompressed` total is never raced.
+      let refreshing: Promise<BufferedStageRow[]> | undefined;
+      const refresh = () => (refreshing ??= deps.reads.stages(scope, authority, source, sessionId).then((rows) => {
+        assertCompressedBounds(rows);
+        return rows;
+      }));
+      fetched.push(...(await fetchStagesBounded(first, concurrency, opts.signal, async (row) => {
+        try {
+          return await fetchOne(row);
+        } catch (error) {
+          if (!isObjectStoreError(error, "not_found")) throw error;
+          const again = (await refresh()).find((r) => r.stage_key === row.stage_key);
+          if (!again) return undefined;
+          try {
+            return await fetchOne(again);
+          } catch (retryError) {
+            if (!isObjectStoreError(retryError, "not_found")) throw retryError;
+            return undefined;
+          }
+        }
+      })));
+      return;
+    }
+    for (const row of first) {
       try {
-        fetched.push(await fetchOne(again));
-      } catch (retryError) {
-        if (!isObjectStoreError(retryError, "not_found")) throw retryError;
+        fetched.push(await fetchOne(row));
+      } catch (error) {
+        if (!isObjectStoreError(error, "not_found")) throw error;
+        refreshed ??= await deps.reads.stages(scope, authority, source, sessionId);
+        assertCompressedBounds(refreshed);
+        const again = refreshed.find((r) => r.stage_key === row.stage_key);
+        if (!again) continue;
+        try {
+          fetched.push(await fetchOne(again));
+        } catch (retryError) {
+          if (!isObjectStoreError(retryError, "not_found")) throw retryError;
+        }
       }
     }
-  }
-  const recheck = await deps.reads.stages(scope, authority, source, sessionId);
+  });
+  const recheck = await timed(phases, "recheck", () => deps.reads.stages(scope, authority, source, sessionId));
   if (recheck.length === 0) return { kind: "erased" };
   if (recheck.length !== fetched.length || !fetched.every(({ row }) => recheck.some((r) => sameStage(r, row))) ||
       !recheck.every((r) => fetched.some(({ row }) => sameStage(r, row)))) return { kind: "changed" };
   const stages: Array<{ row: BufferedStageRow; records: RelayhistoryStreamRecord[] }> = [];
-  for (const { row, stage } of fetched) {
-    const h = stage.header;
-    if (h.org_id !== scope.orgId || h.workspace_id !== scope.workspaceId || h.user_id !== scope.userId) throw new TenantMismatchError();
-    const records: RelayhistoryStreamRecord[] = [];
-    for (const sel of bufferedOrdinalSelection(row.group_ordinals, row.kept_ordinals, row.group_indexes)) {
-      const group = stage.groups[sel.groupIndex];
-      if (!group || group.source !== source || group.sessionId !== sessionId) throw new Error("buffered_group_mismatch");
-      for (const i of sel.lineIndexes) {
-        const record = parseRelayhistoryRecord(group.lines[i]!);
-        if (record.origin_id !== h.origin_id) throw new Error("buffered_origin_mismatch");
-        records.push(record);
+  timedSync(phases, "fold", () => {
+    for (const { row, stage } of fetched) {
+      const h = stage.header;
+      if (h.org_id !== scope.orgId || h.workspace_id !== scope.workspaceId || h.user_id !== scope.userId) throw new TenantMismatchError();
+      const records: RelayhistoryStreamRecord[] = [];
+      for (const sel of bufferedOrdinalSelection(row.group_ordinals, row.kept_ordinals, row.group_indexes)) {
+        const group = stage.groups[sel.groupIndex];
+        if (!group || group.source !== source || group.sessionId !== sessionId) throw new Error("buffered_group_mismatch");
+        for (const i of sel.lineIndexes) {
+          const record = parseRelayhistoryRecord(group.lines[i]!);
+          if (record.origin_id !== h.origin_id) throw new Error("buffered_origin_mismatch");
+          records.push(record);
+        }
+      }
+      stages.push({ row, records });
+    }
+  });
+  return { kind: "stages", stages };
+}
+
+/**
+ * The bounded-concurrency stage fetch (READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY >= 2): `fetch`
+ * runs for each row in `first` order with at most `limit` in flight; results come back in `first`
+ * order (an undefined result, a stage no longer listed, is dropped). The first failure stops new
+ * fetches; once the in-flight ones settle, the failure of the lowest failing row is thrown (the
+ * row the serial loop would have stopped at among those attempted). An aborted `signal` stops new
+ * fetches; once the in-flight ones settle, a read left incomplete throws
+ * BufferedFenced("request_aborted") (fail closed: never a partial session).
+ */
+async function fetchStagesBounded<T>(
+  first: BufferedStageRow[], limit: number, signal: AbortSignal | undefined, fetch: (row: BufferedStageRow) => Promise<T | undefined>,
+): Promise<T[]> {
+  const results: Array<{ value: T | undefined } | undefined> = new Array(first.length);
+  let next = 0;
+  let failedAt = -1;
+  let failure: unknown;
+  const lane = async () => {
+    for (;;) {
+      if (failedAt !== -1 || signal?.aborted) return;
+      const i = next++;
+      if (i >= first.length) return;
+      try {
+        results[i] = { value: await fetch(first[i]!) };
+      } catch (error) {
+        if (failedAt === -1 || i < failedAt) {
+          failedAt = i;
+          failure = error;
+        }
       }
     }
-    stages.push({ row, records });
-  }
-  return { kind: "stages", stages };
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, first.length) }, lane));
+  if (failedAt !== -1) throw failure;
+  if (next < first.length || results.some((r) => r === undefined)) throw new BufferedFenced("request_aborted");
+  return results.flatMap((r) => (r!.value === undefined ? [] : [r!.value]));
 }
 
 /** Before any GetObject: each stage and the session's sum of compressed sizes within bounds. */
@@ -947,10 +1153,12 @@ function assertCompressedBounds(rows: BufferedStageRow[]): void {
 }
 
 /** The final observation: after every S3 read and RPC, before any byte; must equal the first. */
-async function finalGate(deps: OwnerBufferedDeps, scope: BufferedScope, first: AuthorityHead): Promise<AuthorityHead> {
-  const last = await deps.gate.observe(scope);
-  if (!sameAuthority(first, last)) throw new BufferedFenced("gate_moved");
-  return last;
+async function finalGate(deps: OwnerBufferedDeps, scope: BufferedScope, first: AuthorityHead, phases?: OwnerBufferedPhaseTimer): Promise<AuthorityHead> {
+  return timed(phases, "control_head_2", async () => {
+    const last = await deps.gate.observe(scope);
+    if (!sameAuthority(first, last)) throw new BufferedFenced("gate_moved");
+    return last;
+  });
 }
 
 export type OwnerBufferedTurns =
@@ -999,25 +1207,28 @@ type GatedSession =
  * identical; this is the last I/O), then every kept stage's admission against the final head.
  * Its result is plain records; callers only compute from them.
  */
-async function readGatedSession(deps: OwnerBufferedDeps, scope: BufferedScope, source: string, sessionId: string): Promise<GatedSession> {
+async function readGatedSession(deps: OwnerBufferedDeps, scope: BufferedScope, source: string, sessionId: string, opts: GatedReadOptions = {}): Promise<GatedSession> {
+  const { phases } = opts;
   let first: AuthorityHead;
   let initial: BufferedStageRow[];
   try {
-    first = await deps.gate.observe(scope);
-    initial = await deps.reads.stages(scope, first, source, sessionId);
+    first = await timed(phases, "control_head_1", () => deps.gate.observe(scope));
+    initial = await timed(phases, "stages_sql", () => deps.reads.stages(scope, first, source, sessionId));
   } catch (error) {
     if (error instanceof BufferedFenced) return unverified(error);
     throw error;
   }
   if (initial.length === 0) return null;
-  const raw = await readStagesUngated(deps, scope, first, source, sessionId, initial);
-  const authority = await finalGate(deps, scope, first);
+  const raw = await readStagesUngated(deps, scope, first, source, sessionId, initial, opts);
+  const authority = await finalGate(deps, scope, first, phases);
   if (raw.kind === "erased") return { erased: true };
   if (raw.kind === "changed") return null;
-  if (!raw.stages.every(({ row }) => admissionVisible(authority, row))) return null;
-  const origins = [...new Set(raw.stages.flatMap((s) => s.records.map((r) => r.origin_id)))];
-  const records = normalizeRelayhistoryRecords(raw.stages.flatMap((s) => s.records));
-  return { erased: false, records, origins, admissionVersion: raw.stages[0]?.row.admission_version ?? "0" };
+  return timedSync(phases, "fold", () => {
+    if (!raw.stages.every(({ row }) => admissionVisible(authority, row))) return null;
+    const origins = [...new Set(raw.stages.flatMap((s) => s.records.map((r) => r.origin_id)))];
+    const records = normalizeRelayhistoryRecords(raw.stages.flatMap((s) => s.records));
+    return { erased: false as const, records, origins, admissionVersion: raw.stages[0]?.row.admission_version ?? "0" };
+  });
 }
 
 export type OwnerBufferedEvents =
@@ -1049,8 +1260,11 @@ export class BufferedProjectionFailed extends Error {
  * key, ordinal or raw line. A version beyond Number's safe range is clamped for the (unemitted)
  * index-row version. A projection failure: BufferedProjectionFailed (the route hides the session).
  */
-export async function readOwnerBufferedEvents(deps: OwnerBufferedDeps, scope: BufferedScope, source: string, sessionId: string): Promise<OwnerBufferedEvents> {
-  const read = await readGatedSession(deps, scope, source, sessionId);
+export async function readOwnerBufferedEvents(
+  deps: OwnerBufferedDeps, scope: BufferedScope, source: string, sessionId: string, opts: OwnerBufferedReadOptions = {},
+): Promise<OwnerBufferedEvents> {
+  // READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY applies to this read only (turns stay serial).
+  const read = await readGatedSession(deps, scope, source, sessionId, { ...opts, stageConcurrency: deps.stageConcurrency });
   if (read === null || "unverifiedBeforeCandidate" in read) return read;
   if (read.erased) return { erased: true, rows: [] };
   // The projection's index-row version is the admission version. It never reaches an EventRow
@@ -1058,7 +1272,7 @@ export async function readOwnerBufferedEvents(deps: OwnerBufferedDeps, scope: Bu
   // compared as BigInt by the gate above, is clamped here rather than hiding a visible session.
   const exact = Number(read.admissionVersion);
   const version = Number.isSafeInteger(exact) ? exact : Number.MAX_SAFE_INTEGER;
-  return { erased: false, rows: bufferedEventRows(scope, source, sessionId, read.records, read.origins, version) };
+  return { erased: false, rows: timedSync(opts.phases, "fold", () => bufferedEventRows(scope, source, sessionId, read.records, read.origins, version)) };
 }
 
 type ProjectedIndexRow = Extract<ReturnType<typeof projectEventRows>, { events: unknown }>["events"][number]["indexRow"];
