@@ -18,11 +18,8 @@ import {
   migrationChecksumAlias,
   migrationChecksumMatches,
   resolveRenamedLedger,
-  RUNTIME_APPLICATION_FUNCTIONS,
   RUNTIME_APPLICATION_POLICY,
-  RUNTIME_APPLICATION_RLS_TABLES,
-  RUNTIME_APPLICATION_SEQUENCES,
-  RUNTIME_APPLICATION_TABLE_PRIVILEGES,
+  runtimeApplicationAclCatalog,
   runtimeRoleViolations,
   sequencePreflight,
   adoptableIndexBuildPreflight,
@@ -476,7 +473,7 @@ async function migrationPreflight(client: MigrationClient, profile: MigrationPro
   }
   await cliHistoryPreflight(client, schema);
   await sequencePreflight(client, schema, ledger);
-  // Adoptable-index steps (20261105044020): an absent index on a populated table without the
+  // Adoptable-index steps (20261105044020, 20261105044040): an absent index on a populated table without the
   // opt-in refuses HERE, read-only, so the release plan goes red and a refused apply never
   // reaches the 'pending' readiness marker below.
   await adoptableIndexBuildPreflight(client, schema, ledger, {
@@ -791,30 +788,29 @@ async function installRuntimeApplicationAcl(
   client: MigrationClient,
   role: string,
 ): Promise<void> {
-  for (const [relation, privileges] of Object.entries(
-    RUNTIME_APPLICATION_TABLE_PRIVILEGES,
-  )) {
+  const catalog = runtimeApplicationAclCatalog();
+  for (const [relation, privileges] of Object.entries(catalog.tables)) {
     const grant = await client.query<{ sql: string }>(
       "SELECT format('GRANT %s ON TABLE %s TO %I', $1::text, $2::regclass, $3::text) AS sql",
       [privileges.join(", "), relation, role],
     );
     await client.query(grant.rows[0]!.sql);
   }
-  for (const sequence of RUNTIME_APPLICATION_SEQUENCES) {
+  for (const sequence of catalog.sequences) {
     const grant = await client.query<{ sql: string }>(
       "SELECT format('GRANT USAGE ON SEQUENCE %s TO %I', $1::regclass, $2::text) AS sql",
       [sequence, role],
     );
     await client.query(grant.rows[0]!.sql);
   }
-  for (const fn of RUNTIME_APPLICATION_FUNCTIONS) {
+  for (const fn of catalog.functions) {
     const grant = await client.query<{ sql: string }>(
       "SELECT format('GRANT EXECUTE ON FUNCTION %s TO %I', $1::regprocedure, $2::text) AS sql",
       [fn, role],
     );
     await client.query(grant.rows[0]!.sql);
   }
-  for (const relation of RUNTIME_APPLICATION_RLS_TABLES) {
+  for (const relation of catalog.rlsTables) {
     const exists = await client.query<{ present: boolean }>(
       `SELECT EXISTS (SELECT 1 FROM pg_policy
         WHERE polrelid = $1::regclass AND polname = $2) AS present`,
