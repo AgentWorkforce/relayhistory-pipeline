@@ -25,6 +25,8 @@ export const ALLOWED_LOG_FIELDS = new Set([
   // Read API buffered search gate (src/session-read-api/app.ts gatedPage): bounded counts only,
   // see BOUNDED_COUNT_FIELDS.
   "buffered_checked", "buffered_dropped",
+  // Self-host async admission consumer (src/session-ingest/selfhost-admission.ts): bounded counts only.
+  "admission_backlog", "admission_oldest_age_ms", "admission_dead_letters", "admission_in_flight",
 ]);
 
 /**
@@ -35,6 +37,10 @@ export const ALLOWED_LOG_FIELDS = new Set([
 export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ["buffered_checked", 100_000],
   ["buffered_dropped", 100_000],
+  ["admission_backlog", 10_000_000],
+  ["admission_oldest_age_ms", 10 * 365 * 24 * 3600 * 1000],
+  ["admission_dead_letters", 10_000_000],
+  ["admission_in_flight", 1_000],
 ]);
 
 function boundedCount(v: unknown, max: number): number | undefined {
