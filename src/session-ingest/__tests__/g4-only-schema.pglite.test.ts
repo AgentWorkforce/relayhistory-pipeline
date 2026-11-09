@@ -121,6 +121,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Replaces the same two functions again (already in OBJECTS.replacedFunctions); both now rebuild search_text
       // without the summary when they clear it.
       "20261105044070_selfhost_erase_search_text_rebuild.sql",
+      // Owner-only claim-session side table, its policy row and an inert writer trigger on ingest_claim_attempts
+      // (no ingest function body changes; the trigger does nothing until the policy enables it).
+      "20261105044080_ingest_claim_sessions.sql",
       // Lane F1 (this branch): analysis jobs/requests/tickets/invocations/reservations tables,
       // the purge functions and their grant helper, the admit scope function and the request entry point.
       // (045000 digest is not in this tree yet; it lands first and this list gains it on merge.)
