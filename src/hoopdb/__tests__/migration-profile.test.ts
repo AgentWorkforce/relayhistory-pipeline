@@ -30,6 +30,7 @@ import {
   RUNTIME_APPLICATION_FUNCTIONS,
   sessionsFunctionAcl,
   sessionsFunctionAclPreview,
+  pendingExecuteGrants,
   SESSIONS_FUNCTION_EVENT_TRIGGER,
   SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256,
   SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS,
@@ -50,6 +51,7 @@ import {
   migrationLedgerSha256,
   migrate,
   migrationProfile,
+  pendingMigrationSql,
   plan,
   runMigrations,
   type MigrationClient,
@@ -4322,6 +4324,80 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
       (await sessionsFunctionAclPreview(client(db), "g6_rt"))
         .function_acl_missing,
     ).toEqual(["sessions.jwt_org_id(): g6_rt:EXECUTE"]);
+  });
+
+  test("pendingExecuteGrants: literal EXECUTE grants in manifest spelling; comments, GRANT OPTION, other schemas and dynamic SQL are not credited", () => {
+    expect([...pendingExecuteGrants([`
+      -- GRANT EXECUTE ON FUNCTION sessions.commented(text) TO search_consumer_runtime;
+      /* GRANT EXECUTE ON FUNCTION sessions.blocked(text) TO search_consumer_runtime; */
+      DO $g$ BEGIN
+        GRANT EXECUTE ON FUNCTION sessions.resolve_repo(text, text, text, timestamptz) TO search_consumer_runtime;
+      END $g$;
+      grant execute on function "sessions"."two"(p_a int4, in p_b varchar[], double precision) to role_a, "role_b";
+      GRANT EXECUTE ON FUNCTION sessions.f1(jsonb), sessions.f2() TO role_c;
+      GRANT EXECUTE ON FUNCTION sessions.opt(text) TO role_d WITH GRANT OPTION;
+      GRANT EXECUTE ON FUNCTION public.other(text) TO role_e;
+      GRANT EXECUTE ON FUNCTION sessions.noargs TO role_f;
+      GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions TO role_g;
+      EXECUTE format('GRANT EXECUTE ON FUNCTION sessions.dyn(text) TO %I', v_role);
+    `])].sort()).toEqual([
+      "sessions.f1(jsonb) role_c:EXECUTE",
+      "sessions.f2() role_c:EXECUTE",
+      "sessions.resolve_repo(text,text,text,timestamp with time zone) search_consumer_runtime:EXECUTE",
+      "sessions.two(integer,character varying[],double precision) role_a:EXECUTE",
+      "sessions.two(integer,character varying[],double precision) role_b:EXECUTE",
+    ]);
+    // Every literal EXECUTE grant in a landed migration resolves to a manifest key.
+    const manifest = JSON.parse(readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8")).functions as Record<string, string[]>;
+    const keys = new Set(Object.entries(manifest).flatMap(([fn, es]) => es.map((e) => `${fn} ${e}`)));
+    const dir = join(root, "supabase/migrations");
+    const parsed = readdirSync(dir).filter((f) => f.endsWith(".sql")).flatMap((f) => [...pendingExecuteGrants([readFileSync(join(dir, f), "utf8")])]);
+    expect(parsed.length).toBeGreaterThan(100);
+    expect(parsed.filter((g) => !keys.has(g))).toEqual([]);
+  });
+
+  test("read-only ACL preview: at a checkpoint before 043900 is ledgered its twelve grants are pending-added (not red); a missing grant no pending step adds stays refused", async () => {
+    const db = await fresh();
+    await db.exec(
+      `CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}; ${OWNER_FN_DEFAULT_REVOKE}`,
+    );
+    const profile: MigrationProfile = {
+      ...LOCAL,
+      mode: "selfhosted",
+      runtimeRole: "g6_rt",
+      runtimeLogin: false,
+      functionBoundary: "global-default-revoke",
+    };
+    expect(await failure(runMigrations(client(db), { profile }))).toBeNull();
+    const B2 = "upstream:20261105043900_session_consumer_function_grants.sql";
+    const b2Grants = [...pendingExecuteGrants([readFileSync(join(root, "supabase/migrations", B2.slice("upstream:".length)), "utf8")])];
+    expect(b2Grants.length).toBe(12);
+    expect(b2Grants.every((g) => g.endsWith(" search_consumer_runtime:EXECUTE"))).toBe(true);
+    // The checkpoint: 043900 and every later upstream step unledgered, 043900's grants absent.
+    await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name >= $1 AND name LIKE 'upstream:%'", [B2]);
+    for (const g of b2Grants)
+      await db.exec(`REVOKE EXECUTE ON FUNCTION ${g.slice(0, g.lastIndexOf(" "))} FROM search_consumer_runtime`);
+    const pendingSql = await pendingMigrationSql(client(db));
+    expect(pendingSql.length).toBeGreaterThan(0);
+    const asEntry = (g: string) => `${g.slice(0, g.lastIndexOf(" "))}: ${g.slice(g.lastIndexOf(" ") + 1)}`;
+    const atCheckpoint = await sessionsFunctionAclPreview(client(db), "g6_rt", pendingSql);
+    expect(atCheckpoint.function_acl_missing_refused).toEqual([]);
+    expect(atCheckpoint.function_acl_drift_extra).toEqual([]);
+    expect([...atCheckpoint.function_acl_missing].sort()).toEqual(b2Grants.map(asEntry).sort());
+    // Only pending steps count: a flag-only caller, or a caller whose pending SQL lacks 043900, refuses them.
+    expect([...(await sessionsFunctionAclPreview(client(db), "g6_rt", true)).function_acl_missing_refused].sort())
+      .toEqual(b2Grants.map(asEntry).sort());
+    const without = pendingSql.filter((sql) => !sql.includes("GRANT EXECUTE ON FUNCTION sessions.upsert_session_index(jsonb) TO search_consumer_runtime;"));
+    expect(without.length).toBe(pendingSql.length - 1);
+    expect((await sessionsFunctionAclPreview(client(db), "g6_rt", without)).function_acl_missing_refused.length).toBe(12);
+    // Role matched exactly: the same grants to another role are not credited.
+    const otherRole = pendingSql.map((sql) => sql.replaceAll(" TO search_consumer_runtime;", " TO someone_else;"));
+    expect((await sessionsFunctionAclPreview(client(db), "g6_rt", otherRole)).function_acl_missing_refused.length).toBe(12);
+    // A missing manifest grant that no pending step grants stays refused, next to the credited ones.
+    await db.exec("REVOKE EXECUTE ON FUNCTION sessions.repo_backfill_report() FROM service_role");
+    const mixed = await sessionsFunctionAclPreview(client(db), "g6_rt", pendingSql);
+    expect(mixed.function_acl_missing_refused).toEqual(["sessions.repo_backfill_report(): service_role:EXECUTE"]);
+    expect(mixed.function_acl_missing.length).toBe(12);
   });
 
   test("read-only ACL preview agrees with the migrator: a missing non-runtime manifest grant and a duplicate-grantor surplus are refused by both", async () => {
