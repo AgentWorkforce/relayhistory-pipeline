@@ -8,8 +8,9 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
-  ADOPTABLE_INDEX_SQL,
+  ADOPTABLE_INDEX_STATE_SQL,
   ADOPTABLE_INDEXES,
+  type AdoptableIndex,
   MIGRATION_SENTINELS,
 } from "./migration-sentinels.ts";
 
@@ -1103,10 +1104,28 @@ async function exists(
   }
 }
 
+type AdoptableIndexState = "absent" | "adoptable" | "not_ready" | "mismatch";
+
+/** The declared index's catalog state (ADOPTABLE_INDEX_STATE_SQL). Throws if it can't look. */
+async function adoptableIndexState(
+  client: GuardClient,
+  x: AdoptableIndex,
+): Promise<{ state: AdoptableIndexState; tableExists: boolean }> {
+  const row = (
+    await client.query<{ state: AdoptableIndexState; table_exists: boolean }>(
+      ADOPTABLE_INDEX_STATE_SQL,
+      [x.name, x.table, x.def],
+    )
+  ).rows[0];
+  if (!row) throw new Error("no catalog row");
+  return { state: row.state, tableExists: Boolean(row.table_exists) };
+}
+
 /**
  * The reviewed adoptable-index allowance (ADOPTABLE_INDEXES): true only when `step`
  * declares index `name` adoptable, the step's whole inventory is its declared indexes,
- * and the live index is the exact declared one (see ADOPTABLE_INDEX_SQL). Fails closed.
+ * and the live index is the exact declared one (state `adoptable`, see
+ * ADOPTABLE_INDEX_STATE_SQL). Fails closed.
  */
 async function adoptableIndex(
   client: GuardClient,
@@ -1120,12 +1139,133 @@ async function adoptableIndex(
   if (!inventory.every((o) => o.kind === "index" && declared.some((d) => d.name === o.name)))
     return false;
   try {
-    return Boolean(
-      (await client.query<{ e: boolean }>(ADOPTABLE_INDEX_SQL, [x.name, x.table, x.def]))
-        .rows[0]?.e,
-    );
+    return (await adoptableIndexState(client, x)).state === "adoptable";
   } catch {
     return false; // can't look: fail closed, not adoptable
+  }
+}
+
+/** Why a declared index of `step` is not adoptable, for the refusal text (empty if unknown). */
+async function adoptableIndexReason(
+  client: GuardClient,
+  step: string,
+  name: string,
+): Promise<string> {
+  const x = ADOPTABLE_INDEXES[step]?.find((d) => d.name === name);
+  if (!x) return "";
+  try {
+    const { state } = await adoptableIndexState(client, x);
+    if (state === "not_ready")
+      return ": INVALID or still building (a CREATE INDEX CONCURRENTLY may still be running: check pg_stat_progress_create_index before any DROP INDEX CONCURRENTLY)";
+    if (state === "mismatch")
+      return `: not the declared definition (${x.def}), or backs a constraint, or a second index of that name exists`;
+  } catch {
+    // can't look: the generic refusal stands
+  }
+  return "";
+}
+
+/**
+ * The adoptable-index steps' blocking-build decision, read-only, before any write (the
+ * migrator writes its 'pending' readiness marker only after this passes, and the release
+ * plan runs the same check). For every UNLEDGERED step in ADOPTABLE_INDEXES and each of its
+ * declared indexes, the same table the step itself applies (20261105044020):
+ *   adoptable (exact, valid, ready, no constraint)             accepted, the step adopts it;
+ *   absent, table not created yet                              accepted (an earlier step creates it empty);
+ *   absent, table empty                                        accepted, the step creates it;
+ *   absent, table populated, no opt-in                         REFUSED: prebuild it CONCURRENTLY;
+ *   absent, table populated, allowBlockingIndexBuild           accepted (blocking build; never production);
+ *   absent, emptiness not provable (probe error, RLS, ...)     REFUSED (the step would raise too);
+ *   not_ready (INVALID / still building), mismatch             REFUSED.
+ * Emptiness is `SELECT EXISTS(SELECT 1 FROM <table> LIMIT 1)` with row_security off, so RLS
+ * can never make a populated table look empty (a role RLS applies to gets an error, which
+ * refuses). It takes ACCESS SHARE only; row_security is restored afterwards.
+ *   index_prebuild_required   any refusal above, naming each index and table.
+ */
+export async function adoptableIndexBuildPreflight(
+  client: GuardClient,
+  schemaSteps: GuardStep[],
+  ledger: Map<string, string>,
+  opts: { allowBlockingIndexBuild?: boolean } = {},
+): Promise<void> {
+  const allow = opts.allowBlockingIndexBuild === true;
+  const refused: string[] = [];
+  for (const step of schemaSteps) {
+    const declared = ADOPTABLE_INDEXES[step.name];
+    if (!declared?.length || ledger.has(step.name)) continue;
+    for (const x of declared) {
+      const where = `index sessions.${x.name} on ${x.table} (${step.name})`;
+      let state: AdoptableIndexState;
+      let tableExists: boolean;
+      try {
+        ({ state, tableExists } = await adoptableIndexState(client, x));
+      } catch {
+        refused.push(`${where}: its catalog state could not be read`);
+        continue;
+      }
+      if (state === "adoptable") continue;
+      if (state === "not_ready") {
+        refused.push(
+          `${where} is INVALID or still building: if a CREATE INDEX CONCURRENTLY is still running (pg_stat_progress_create_index) let it finish and rerun; only a failed build is dropped, with DROP INDEX CONCURRENTLY`,
+        );
+        continue;
+      }
+      if (state === "mismatch") {
+        refused.push(
+          `${where} exists but is not the declared index (expected exactly: ${x.def}; not backing a constraint, the only index of that name); reconcile it by hand`,
+        );
+        continue;
+      }
+      if (!tableExists) continue;
+      let populated: boolean;
+      try {
+        populated = await tablePopulated(client, x.table);
+      } catch {
+        refused.push(
+          `${where} is absent and ${x.table} could not be proven empty (the probe failed, e.g. row-level security applies to this role)`,
+        );
+        continue;
+      }
+      if (populated && !allow)
+        refused.push(
+          `${where} is absent and table ${x.table} is not empty; a blocking CREATE INDEX on a populated table is refused`,
+        );
+    }
+  }
+  if (refused.length)
+    throw guardError(
+      "index_prebuild_required",
+      `${refused.join("; ")}. Prebuild each absent index out of band with CREATE INDEX CONCURRENTLY (claim-bootstrap index packet docs/packets/claim-bootstrap-org-index-packet-20261108.md, PR #407), then rerun: the step adopts it. Nothing was written. HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true is for non-production databases only (the release and owner-apply profiles cannot set it); see the runbook`,
+    );
+}
+
+/**
+ * Read-only existence probe with row_security off (an error, never an empty answer, if RLS
+ * would hide rows). Session-level set and restore, so it works both inside the release
+ * plan's READ ONLY transaction and on the migrator's autocommit connection. Fails closed:
+ * if row_security is not observably off for the probe itself, the table counts as populated.
+ */
+async function tablePopulated(client: GuardClient, table: string): Promise<boolean> {
+  if (!/^sessions\.[a-z_][a-z0-9_]*$/.test(table)) throw new Error(`unexpected table name ${table}`);
+  const prior = (
+    await client.query<{ v: string }>("SELECT current_setting('row_security') AS v")
+  ).rows[0]?.v;
+  if (prior === undefined) throw new Error("row_security unreadable");
+  await client.query("SELECT set_config('row_security', 'off', false)");
+  try {
+    const row = (
+      await client.query<{ off: boolean; populated: boolean }>(
+        `SELECT current_setting('row_security') = 'off' AS off, EXISTS (SELECT 1 FROM ${table} LIMIT 1) AS populated`,
+      )
+    ).rows[0];
+    if (!row?.off) return true; // can't prove RLS off: fail closed
+    return Boolean(row.populated);
+  } finally {
+    try {
+      await client.query("SELECT set_config('row_security', $1, false)", [prior]);
+    } catch {
+      // aborted transaction: its rollback restores the setting
+    }
   }
 }
 
@@ -1217,7 +1357,9 @@ export async function sequencePreflight(
           (await adoptableIndex(client, names[i]!, inventory, o.name)))
       )
         found.push(
-          `${o.kind} ${o.name}${o.on ? ` on ${o.on}` : ""} (${names[i]})`,
+          `${o.kind} ${o.name}${o.on ? ` on ${o.on}` : ""} (${names[i]})${
+            o.kind === "index" ? await adoptableIndexReason(client, names[i]!, o.name) : ""
+          }`,
         );
     }
   }

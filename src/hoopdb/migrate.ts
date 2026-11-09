@@ -25,6 +25,7 @@ import {
   RUNTIME_APPLICATION_TABLE_PRIVILEGES,
   runtimeRoleViolations,
   sequencePreflight,
+  adoptableIndexBuildPreflight,
   sessionsFunctionAclDrift,
   sessionsFunctionAclPreview,
   type FunctionBoundaryMode,
@@ -451,6 +452,12 @@ async function migrationPreflight(client: MigrationClient, profile: MigrationPro
   }
   await cliHistoryPreflight(client, schema);
   await sequencePreflight(client, schema, ledger);
+  // Adoptable-index steps (20261105044020): an absent index on a populated table without the
+  // opt-in refuses HERE, read-only, so the release plan goes red and a refused apply never
+  // reaches the 'pending' readiness marker below.
+  await adoptableIndexBuildPreflight(client, schema, ledger, {
+    allowBlockingIndexBuild: profile.allowBlockingIndexBuild === true,
+  });
   return { ledger, ledgerSha256, renameAliases, runtime };
 }
 /** Each step's file sha256, by step name. */
