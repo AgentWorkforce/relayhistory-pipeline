@@ -4,6 +4,8 @@ Status: code only. Nothing here has been applied to any database. Applying
 migration 044080, enabling the writer, or running the backfill against any real
 database needs Khaliq's separate, explicit OK in his own words.
 
+Production order, apply path, bounds and stop rules: [list-fix operator packet](../ingest-claim-sessions-list-fix-20261109/operator-packet.md).
+
 ## What the migration adds (inert)
 
 `supabase/migrations/20261105044080_ingest_claim_sessions.sql`:
