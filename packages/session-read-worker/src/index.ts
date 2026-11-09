@@ -48,7 +48,12 @@
  * (default unset = the serial stage fetch; "0"/"1" the same; "2".."32" = that many stage GetObjects
  * in flight per buffered events read; any other value answers 503) and READ_API_OWNER_BUFFERED_PHASE_LOG
  * (default off; exactly "1" adds per-phase *_ms fields to the request log line) apply to the
- * owner-buffered events read only. Flag, allowlist, bucket and binding are
+ * owner-buffered events read only. READ_API_OWNER_BUFFERED_INDEX_VERIFY=on (default off; any value
+ * but unset/empty/"on" answers 503) makes every owner-buffered read first prove, through the
+ * catalog on the same read connection, that the out-of-band index
+ * ingest_buffer_outbox_user_buffered_idx exists and is valid (cached per isolate: valid for its
+ * lifetime, a failure re-probed after 60 s); not proven, the buffered read is fenced before any
+ * candidate (detail routes answer as without the flag, the list as fenced). Flag, allowlist, bucket and binding are
  * all unset in wrangler.jsonc; only the deploy workflow's owner_buffered=on render
  * (scripts/render-deploy-config.ts) adds them.
  */
@@ -81,7 +86,19 @@ import {
   type ServiceBinding,
 } from "../../../src/session-read-api/buffered-search-gate.ts";
 import { createS3Store } from "../../../src/shared/vendor.ts";
-import { boundedStreamDecompress, ownerBufferedEnabled, ownerBufferedEventsEnabled, ownerBufferedPhaseLogEnabled, ownerBufferedStageConcurrency, serviceBindingControlHead, sqlOwnerBufferedReads, type OwnerBufferedDeps } from "../../../src/session-read-api/owner-buffered.ts";
+import {
+  BufferedIndexVerifier,
+  boundedStreamDecompress,
+  ownerBufferedEnabled,
+  ownerBufferedEventsEnabled,
+  ownerBufferedIndexVerifyEnabled,
+  ownerBufferedPhaseLogEnabled,
+  ownerBufferedStageConcurrency,
+  serviceBindingControlHead,
+  sqlBufferedIndexProbe,
+  sqlOwnerBufferedReads,
+  type OwnerBufferedDeps,
+} from "../../../src/session-read-api/owner-buffered.ts";
 
 export interface Env extends CanonicalEnv {
   SUPABASE: Hyperdrive;
@@ -139,6 +156,14 @@ export interface Env extends CanonicalEnv {
    * fold_ms, s3_stage_count, aborted_phase) to the request log line; anything else is off (default).
    */
   READ_API_OWNER_BUFFERED_PHASE_LOG?: string;
+  /**
+   * Owner-buffered reads: verify the out-of-band index ingest_buffer_outbox_user_buffered_idx
+   * (valid, per the catalog) before serving any buffered read. Unset or empty = off (default, no
+   * query), exactly "on" enables, any other value refuses every request (503, logged
+   * missing_READ_API_OWNER_BUFFERED_INDEX_VERIFY). No effect unless RELAYHISTORY_READ_OWNER_BUFFERED
+   * is on and the workspace is on both allowlists.
+   */
+  READ_API_OWNER_BUFFERED_INDEX_VERIFY?: string;
   /** The owner-buffered canary allowlist (parseDirectoryWorkspaces syntax); unset/empty = none. */
   READ_API_OWNER_BUFFERED_WORKSPACES?: string;
   /** The ingest bucket holding buffered-batches/ stage objects (owner-buffered reads only). */
@@ -329,6 +354,12 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     } catch {
       throw new ConfigError("READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY");
     }
+    // The index verify flag accepts only unset/empty or "on"; anything else is a misconfigured deploy.
+    try {
+      ownerBufferedIndexVerifyEnabled(env.READ_API_OWNER_BUFFERED_INDEX_VERIFY);
+    } catch {
+      throw new ConfigError("READ_API_OWNER_BUFFERED_INDEX_VERIFY");
+    }
   } catch (error) {
     // Configuration errors name a field, never a value.
     log("error", "read worker not configured", { error_code: error instanceof ConfigError ? `missing_${error.field}` : (error as { name?: string })?.name ?? "config" });
@@ -431,6 +462,13 @@ export function babysitterEvidenceDeps(env: Env, run: TenantRunner, fetcher: typ
 }
 
 /**
+ * The isolate's index verifier (READ_API_OWNER_BUFFERED_INDEX_VERIFY=on): module scope, so a valid
+ * answer is kept for the isolate's lifetime and a failure is re-probed after 60 s, across
+ * requests. Each request's probe runs on that request's own pg client.
+ */
+const ISOLATE_INDEX_VERIFIER = new BufferedIndexVerifier();
+
+/**
  * Owner-only buffered reads (Option C): the two SECURITY DEFINER readers through the read role
  * (tenant-bound, user bound per call) and GetObject on the ingest bucket's buffered-batches/
  * stage objects, gated by the HISTORY_CONTROL_HEAD binding (absent with the flag on: handle()
@@ -438,7 +476,12 @@ export function babysitterEvidenceDeps(env: Env, run: TenantRunner, fetcher: typ
  * workspaces on READ_API_OWNER_BUFFERED_WORKSPACES (and the directory allowlist). Undefined unless RELAYHISTORY_READ_OWNER_BUFFERED is "1"/"true", the bucket
  * is named and the raw-store keys exist.
  */
-export function ownerBufferedDeps(env: Env, run: TenantRunner, fetcher: typeof fetch = (input, init) => fetch(input, init)): OwnerBufferedDeps | undefined {
+export function ownerBufferedDeps(
+  env: Env,
+  run: TenantRunner,
+  fetcher: typeof fetch = (input, init) => fetch(input, init),
+  indexVerifier: BufferedIndexVerifier = ISOLATE_INDEX_VERIFIER,
+): OwnerBufferedDeps | undefined {
   if (!ownerBufferedEnabled(env.RELAYHISTORY_READ_OWNER_BUFFERED)) return undefined;
   const bucket = env.INGEST_S3_BUCKET?.trim();
   const accessKeyId = env.PIPELINE_RAW_S3_ACCESS_KEY_ID;
@@ -457,7 +500,19 @@ export function ownerBufferedDeps(env: Env, run: TenantRunner, fetcher: typeof f
     ...(ownerBufferedStageConcurrencyFlag(env) > 1 ? { stageConcurrency: ownerBufferedStageConcurrencyFlag(env) } : {}),
     // Per-phase log fields only with READ_API_OWNER_BUFFERED_PHASE_LOG=1.
     ...(ownerBufferedPhaseLogEnabled(env.READ_API_OWNER_BUFFERED_PHASE_LOG) ? { phaseLog: true } : {}),
+    // Out-of-band index check only with READ_API_OWNER_BUFFERED_INDEX_VERIFY=on: this request's
+    // read connection probes; the isolate's verifier caches the answer.
+    ...(ownerBufferedIndexVerifyFlag(env) ? { indexCheck: indexVerifier.check(sqlBufferedIndexProbe(run)) } : {}),
   };
+}
+
+/** READ_API_OWNER_BUFFERED_INDEX_VERIFY as a boolean; a refused value is off here (handle() already answered 503 for it). */
+function ownerBufferedIndexVerifyFlag(env: Env): boolean {
+  try {
+    return ownerBufferedIndexVerifyEnabled(env.READ_API_OWNER_BUFFERED_INDEX_VERIFY);
+  } catch {
+    return false;
+  }
 }
 
 /** READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY as a number; a refused value is 1, serial (handle() already answered 503 for it). */
