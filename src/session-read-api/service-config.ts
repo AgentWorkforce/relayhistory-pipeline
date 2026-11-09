@@ -18,6 +18,11 @@
  *                                   records under (required; not a credential)
  *   SESSION_POSTGRES_TLS_PROFILE    enabled: required explicitly (supabase | custom-ca with
  *                                   SESSION_POSTGRES_CA_FILE / SESSION_POSTGRES_CA_SHA256); no implicit default
+ *   ANALYTICS_SINK                  enabled: unset | "" | "noop" (default: no analytics) | "collector" (one
+ *                                   session_read.request_completed per verified /v1 request to
+ *                                   ANALYTICS_COLLECTOR_URL with ANALYTICS_COLLECTOR_TOKEN and
+ *                                   ANALYTICS_DEPLOYMENT_ID). "posthog" and any ANALYTICS_POSTHOG_* value refuse
+ *                                   startup (src/shared/analytics-config.ts, checked in lambda.ts readApiDepsFromSecret)
  *
  * Dormant (flag off): nothing else is read or required; the process starts and
  * answers 503 not_configured on every route but /healthz. Enabled: the secret is

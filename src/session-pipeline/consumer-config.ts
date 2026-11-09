@@ -67,6 +67,11 @@
  *                                   and refuses to start on a mismatch, so the live
  *                                   gates can never evaluate a different identity
  *                                   than the one that writes
+ *   ANALYTICS_SINK                            unset | "" | "noop" (default: no analytics) |
+ *                                   "collector" (one installation-scoped
+ *                                   session_pipeline.index_tick_completed per completed
+ *                                   tick: counts only). "posthog" and any ANALYTICS_POSTHOG_*
+ *                                   value refuse startup (src/shared/analytics-config.ts)
  *
  * Dormant (flag off): nothing else is read or required; the process idles
  * without opening the database. Errors name the variable, never its value.
@@ -74,6 +79,7 @@
 import { searchSecret } from "../shared/search-composition.ts";
 import { parseCompleteSince } from "../session-read-api/config.ts";
 import { destinationPolicy } from "../shared/destination-url.ts";
+import { analyticsConfig, type AnalyticsConfig } from "../shared/analytics-config.ts";
 
 export const CONSUMER_SERVICE_FLAG = "RELAYHISTORY_SELFHOST_PIPELINE_CONSUMER";
 export const CONSUMER_SECRET_VAR = "RELAYHISTORY_PIPELINE_CONSUMER_SECRET";
@@ -106,6 +112,8 @@ export type ConsumerServiceConfig =
       unhealthyFile: string;
       /** RELAYHISTORY_SELFHOST_OUTPUT_FACTS is exactly "true" (default off). */
       outputFacts: boolean;
+      /** ANALYTICS_* (src/shared/analytics-config.ts, self-host profile: noop or collector). Absent = noop. */
+      analytics?: AnalyticsConfig;
     };
 
 /** `RELAYHISTORY_SELFHOST_PIPELINE_CONSUMER`: exactly "true" enables; unset, empty or "false" is off; anything throws. */
@@ -172,6 +180,10 @@ export function consumerServiceConfig(env: NodeJS.ProcessEnv = process.env): Con
   // The writer must record the reader's floor or partials lists every session as stale.
   const floorMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
   const unhealthyFile = env.CONSUMER_UNHEALTHY_FILE ?? "/tmp/session-pipeline-consumer.unhealthy";
-  return { enabled: true, secret: parseConsumerSecret(secretText), searchBackend: backend, backendId, floorMs, keyPrefix, lookbackMinutes, everyMinutes, fanout, unhealthyFile,
-    outputFacts: env[CONSUMER_OUTPUT_FACTS_VAR] === "true" };
+  const analytics = analyticsConfig(env, "selfhost");
+  return {
+    enabled: true, secret: parseConsumerSecret(secretText), searchBackend: backend, backendId, floorMs, keyPrefix, lookbackMinutes, everyMinutes, fanout, unhealthyFile,
+    outputFacts: env[CONSUMER_OUTPUT_FACTS_VAR] === "true",
+    ...(analytics.sink !== "noop" ? { analytics } : {}),
+  };
 }
