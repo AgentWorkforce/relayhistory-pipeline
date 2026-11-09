@@ -130,26 +130,47 @@ History origin. A read bearer or login token is introspected with
 `wrong_audience` or `unauthorized`. One origin means one audience, and the
 session-ingest service must check the same value.
 
-Read-api auth env:
+Read-api auth env, one of three `READ_API_AUTH_MODE` settings
+(`src/session-read-api/lambda.ts` `readApiAuthMode`; errors name variables,
+never values):
 
-- `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true`
-- `RELAYCONTROL_INTROSPECT_URL`, which passes the transport rule
-  (`ALLOW_IN_CLUSTER_HTTP`)
-- `RELAYCONTROL_INTROSPECT_SECRET`, injected from the secret store
+- **Native (Control issues read sessions): `READ_API_AUTH_MODE=self_issued`.**
+  The read API serves only its own opaque `rth_at_read_` tokens
+  (`src/session-read-api/self-issued.ts`, hash rows from migration 044000,
+  `aud = READ_API_ORIGIN`). relaycontrol's `POST /api/v1/workspaces/{ws}/relayhistory/session`
+  in `RELAYHISTORY_BACKEND=native` mode decides membership and calls
+  `POST /internal/v1/session-read/sessions` (and `/refresh`) over the in-cluster
+  Service URL with `READ_API_INTERNAL_SECRET` (relaycontrol's
+  `SESSION_READ_API_SECRET`). This mode refuses `RELAYAUTH_JWKS_URL`,
+  `RELAYAUTH_ISSUER`, `RELAYCONTROL_INTROSPECT_URL`,
+  `RELAYCONTROL_INTROSPECT_SECRET`, `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS`
+  and `RELAYHISTORY_SELFHOST_LOGIN_ADVERTISES_SYNC` at startup: the read API
+  never calls Control or RelayAuth, and `POST /v1/cli/login` is not registered
+  (`RELAYHISTORY_SELFHOST_READ_API=true` then adds only the catalog route). No
+  RelayAuth anywhere. This is the self-host target (lead-desktop, 2026-11-09).
+- **Control-proxied reads: `READ_API_AUTH_MODE=relaycontrol_only`.** Only
+  relaycontrol `sh_at_` bearers, introspected at `RELAYCONTROL_INTROSPECT_URL`
+  (transport rule `ALLOW_IN_CLUSTER_HTTP`) with `RELAYCONTROL_INTROSPECT_SECRET`
+  and `aud = READ_API_ORIGIN`; needs `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true`
+  and refuses the `RELAYAUTH_*` variables. No JWKS is fetched and every other
+  bearer is 401 without an outbound call. With `RELAYHISTORY_SELFHOST_READ_API=true`
+  this mode also registers `POST /v1/cli/login` (pass-through exchange of the
+  `sh_at_` token, `docs/session-read-api-design.md` section 2a).
+- **Default (unset): the hosted dual path.** `sh_at_` tokens through
+  relaycontrol when `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true`, every other
+  bearer through the RelayAuth JWKS verifier (hosted defaults when
+  `RELAYAUTH_JWKS_URL` and `RELAYAUTH_ISSUER` are unset). This is the only mode
+  that still trusts RelayAuth; a self-host install uses one of the two above.
 
-There is no switch to turn RelayAuth verification off. With `RELAYAUTH_JWKS_URL`
-and `RELAYAUTH_ISSUER` unset, the verifier falls back to the hosted RelayAuth
-defaults (`lambda.ts` `readApiAuthConfig`). Those tokens are still bound to
-`aud = READ_API_ORIGIN`, so the hosted issuer would have to mint one for this
-self-host origin. This is a residual trust in hosted RelayAuth. A self-host
-that wants Control as its only authority needs a read-api change. This PR does
-not make it.
-
-**Known gap.** The `/v1/cli/login` response advertises only `rth:read`
-(`docs/session-read-api-design.md` section 2a), so relaycontrol refuses
-`mode=sync` against this origin. A single origin that also syncs needs the
-login to advertise `rth:sync` when an ingest is configured. That is a
-read-api change, not made here.
+**`rth:sync` on one origin.** In native mode relaycontrol's `mode=sync` answer
+hands the Desktop its own `sh_at_` token as the upload bearer with `baseUrl` =
+this public origin; the session-ingest service (section 3) introspects it on
+every request and requires the granted `rth:sync` scope. No read-api setting is
+involved. Only the `relaycontrol_only` + `/v1/cli/login` path has the login
+reply advertise scopes: there, `RELAYHISTORY_SELFHOST_LOGIN_ADVERTISES_SYNC=true`
+(Pattern A, default off, `docs/session-ingest-design.md`) adds `rth:sync` to the
+reply when introspection granted it; without it relaycontrol refuses
+`mode=sync` against this origin.
 
 ## 3. session-ingest contract
 

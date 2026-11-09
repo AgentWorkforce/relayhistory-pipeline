@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, test } from "vitest";
-import { AGENT_MATCH_VAR, ALL_WORKSPACES, BUFFERED_SEARCH_GATE_VAR, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
+import { AGENT_MATCH_VAR, ALL_WORKSPACES, BUFFERED_SEARCH_GATE_VAR, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 const TEMPLATE = readFileSync(here("../wrangler.jsonc"), "utf8");
@@ -345,10 +345,49 @@ describe("deploy config render, owner_buffered_stage_concurrency and owner_buffe
   });
 });
 
+describe("deploy config render, owner_buffered_index_verify", () => {
+  const EV = { ...ON, ownerBufferedEvents: "on" };
+  test("off (no input, empty, off) is byte-identical to the render without it, for every existing input combination", () => {
+    const combos: RenderInputs[] = [{ hyperdriveId: HD }, { hyperdriveId: HD, bufferedSearchGate: "on" }, ON, EV, { ...EV, ownerBufferedPhaseLog: "on", ownerBufferedStageConcurrency: "4" }];
+    for (const combo of combos) {
+      const without = renderDeployConfig(TEMPLATE, combo);
+      for (const off of [undefined, "", " ", "off", " off "]) {
+        const out = renderDeployConfig(TEMPLATE, { ...combo, ownerBufferedIndexVerify: off });
+        expect(out, JSON.stringify({ combo, off })).toBe(without);
+        expect(out).not.toContain(OWNER_BUFFERED_INDEX_VERIFY_VAR);
+      }
+    }
+    expect(renderDeployConfig(TEMPLATE, { hyperdriveId: HD, ownerBufferedIndexVerify: "off" })).toBe(sedRender(HD));
+    expect(TEMPLATE).not.toContain(OWNER_BUFFERED_INDEX_VERIFY_VAR);
+  });
+
+  test("on with owner_buffered=on adds exactly the var \"on\" (with or without events)", () => {
+    for (const base of [ON, EV]) {
+      const without = parse(renderDeployConfig(TEMPLATE, base));
+      const out = parse(renderDeployConfig(TEMPLATE, { ...base, ownerBufferedIndexVerify: " on " }));
+      expect(out.vars[OWNER_BUFFERED_INDEX_VERIFY_VAR]).toBe("on");
+      const { [OWNER_BUFFERED_INDEX_VERIFY_VAR]: _, ...rest } = out.vars;
+      expect({ ...out, vars: rest }).toEqual(without);
+    }
+  });
+
+  test("a bad value, on without owner_buffered=on, or a template that predeclares the var, fails closed", () => {
+    for (const bad of ["1", "true", "ON", "yes"]) expect(() => renderDeployConfig(TEMPLATE, { ...ON, ownerBufferedIndexVerify: bad }), bad).toThrow(/owner_buffered_index_verify must be/);
+    for (const base of [{ hyperdriveId: HD }, { hyperdriveId: HD, bufferedSearchGate: "on" }]) {
+      expect(() => renderDeployConfig(TEMPLATE, { ...base, ownerBufferedIndexVerify: "on" })).toThrow(/owner_buffered_index_verify=on needs owner_buffered=on/);
+    }
+    const flagged = TEMPLATE.replace(/"vars"\s*:\s*\{/, `"vars": { "${OWNER_BUFFERED_INDEX_VERIFY_VAR}": "on",`);
+    expect(flagged).not.toBe(TEMPLATE);
+    for (const inputs of [{ hyperdriveId: HD }, { hyperdriveId: HD, bufferedSearchGate: "on" }, ON, EV, { ...ON, ownerBufferedIndexVerify: "on" }]) {
+      expect(() => renderDeployConfig(flagged, inputs), JSON.stringify(inputs)).toThrow(new RegExp(`must leave ${OWNER_BUFFERED_INDEX_VERIFY_VAR} unset`));
+    }
+  });
+});
+
 describe("deploy config render, agent_match", () => {
   const GATE = { hyperdriveId: HD, bufferedSearchGate: "on" };
   const EVENTS = { ...ON, ownerBufferedEvents: "on" };
-  const BASES: Array<[string, RenderInputs]> = [["default", { hyperdriveId: HD }], ["gate-only", GATE], ["owner-buffered", ON], ["owner-buffered+gate", { ...ON, bufferedSearchGate: "on" }], ["owner-buffered+events", EVENTS], ["owner-buffered+events+concurrency+phase-log", { ...EVENTS, ownerBufferedStageConcurrency: "8", ownerBufferedPhaseLog: "on" }]];
+  const BASES: Array<[string, RenderInputs]> = [["default", { hyperdriveId: HD }], ["gate-only", GATE], ["owner-buffered", ON], ["owner-buffered+gate", { ...ON, bufferedSearchGate: "on" }], ["owner-buffered+events", EVENTS], ["owner-buffered+events+concurrency+phase-log", { ...EVENTS, ownerBufferedStageConcurrency: "8", ownerBufferedPhaseLog: "on" }], ["owner-buffered+index-verify", { ...ON, ownerBufferedIndexVerify: "on" }]];
 
   test("agent_match off (no input, empty, off) is byte-identical to the render without the input, for every existing input combination", () => {
     for (const [label, base] of BASES) {
@@ -400,6 +439,8 @@ describe("deploy workflow wiring", () => {
     expect(WORKFLOW).toContain("OWNER_BUFFERED_STAGE_CONCURRENCY: ${{ inputs.owner_buffered_stage_concurrency }}");
     expect(WORKFLOW).toMatch(/owner_buffered_phase_log:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
     expect(WORKFLOW).toContain("OWNER_BUFFERED_PHASE_LOG: ${{ inputs.owner_buffered_phase_log }}");
+    expect(WORKFLOW).toMatch(/owner_buffered_index_verify:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+    expect(WORKFLOW).toContain("OWNER_BUFFERED_INDEX_VERIFY: ${{ inputs.owner_buffered_index_verify }}");
     expect(WORKFLOW).toMatch(/agent_match:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
     expect(WORKFLOW).toContain("AGENT_MATCH: ${{ inputs.agent_match }}");
   });
@@ -414,6 +455,7 @@ describe("deploy workflow wiring", () => {
     expect(WORKFLOW).not.toContain("--var \"READ_API_OWNER_BUFFERED_EVENTS");
     expect(WORKFLOW).not.toContain("--var \"READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY");
     expect(WORKFLOW).not.toContain("--var \"READ_API_OWNER_BUFFERED_PHASE_LOG");
+    expect(WORKFLOW).not.toContain("--var \"READ_API_OWNER_BUFFERED_INDEX_VERIFY");
     expect(WORKFLOW).not.toContain("--var \"READ_API_AGENT_MATCH");
   });
 });

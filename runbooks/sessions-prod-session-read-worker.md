@@ -42,6 +42,7 @@ The same `b96e1:` cursors are issued and accepted. A cursor that the Lambda issu
 | `READ_API_OWNER_BUFFERED_EVENTS` | rendered only by a `owner_buffered_events=on` dispatch together with `owner_buffered=on` (`scripts/render-deploy-config.ts`) | Owner-buffered session events (see "Owner-buffered events"); unset = off; any value other than `on` = 503 `backend_unavailable` |
 | `READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY` | rendered only by an `owner_buffered_stage_concurrency=<2..32>` dispatch together with `owner_buffered_events=on` (`scripts/render-deploy-config.ts`) | Bounded-concurrency S3 stage fetches for the owner-buffered events read (see "Owner-buffered events latency flags"); unset, empty, `0` or `1` = the serial loop; `2`..`32` = at most N in flight; any other value = 503 `backend_unavailable` |
 | `READ_API_OWNER_BUFFERED_PHASE_LOG` | rendered only by an `owner_buffered_phase_log=on` dispatch together with `owner_buffered_events=on` (`scripts/render-deploy-config.ts`) | Per-phase times on the events request log line (see "Owner-buffered events latency flags"); exactly `1` enables, anything else is off |
+| `READ_API_OWNER_BUFFERED_INDEX_VERIFY` | rendered only by an `owner_buffered_index_verify=on` dispatch together with `owner_buffered=on` (`scripts/render-deploy-config.ts`) | Owner-buffered reads first prove the out-of-band index `ingest_buffer_outbox_user_buffered_idx` exists and is valid (see "Owner-buffered index verify"); unset = off; any value other than `on` = 503 `backend_unavailable` |
 | `READ_API_BUFFERED_SEARCH_GATE`, binding `HISTORY_CONTROL_HEAD` | rendered only by a `buffered_search_gate=on` dispatch (`scripts/render-deploy-config.ts`) | Per-hit privacy gate for buffered-origin search hits (#338), default off; see "Buffered search gate" below |
 
 **Fail-closed defaults:**
@@ -90,6 +91,14 @@ Both default off and both need `owner_buffered_events=on` in the same dispatch (
 - **`owner_buffered_phase_log=on`** renders `READ_API_OWNER_BUFFERED_PHASE_LOG=1`. The events request log line then also carries, in whole milliseconds: `session_start_ms`, `control_head_1_ms`, `stages_sql_ms`, `s3_fetch_ms`, `recheck_ms`, `control_head_2_ms`, `fold_ms`, and the count `s3_stage_count`. A phase never reached has no field. A phase that threw adds `aborted_phase` (that phase), also when the route then answers as without the flag (for example the control head refusing before a candidate). A canceled request logs one line `reason: "request_aborted"` with the same fields and `aborted_phase` (the phase in progress, else `none`), and its request line does not repeat them. The fields are durations and one count only: no content, keys or ids beyond the line's existing `route` and `correlation_id`. `s3_fetch_ms` includes any refresh SQL after a missing stage object; `fold_ms` covers the record parse, the fold, normalize and the projection/scrub. Workerd does not advance timers during pure CPU work, so `fold_ms` (and other CPU-only phases) can read `0`.
 
 Turning either on is a production deploy: dispatch is Khaliq's call. To turn them off, dispatch again without the inputs.
+
+### Owner-buffered index verify
+
+Default off and needs `owner_buffered=on` in the same dispatch (the render refuses it alone, any value other than `off`/`on`, and a `wrangler.jsonc` that already sets the var). Off renders byte-identically to a deploy without the input.
+
+**`owner_buffered_index_verify=on`** renders `READ_API_OWNER_BUFFERED_INDEX_VERIFY=on`. Every owner-buffered read (list, turns, metadata, events) then first checks, through the read role and the buffered statement timeout, that `sessions.ingest_buffer_outbox` has a valid index `ingest_buffer_outbox_user_buffered_idx` (the out-of-band `CREATE INDEX CONCURRENTLY` from migration 20261105043700). A valid answer is cached for the isolate's lifetime; a failure is re-checked after 60 s. Not proven: the list is served canonical-only with `X-Relayhistory-Buffered: fenced` (log `buffered_fenced`), detail routes answer 501 as without owner-buffered reads (log `buffered_unverified`), with `error_code` = `index_missing`, `index_invalid` (drop the invalid index before rebuilding it; `IF NOT EXISTS` skips it) or `index_unverified` (the probe failed or timed out). Building or dropping the index is a separate operator apply.
+
+Turning it on is a production deploy: dispatch is Khaliq's call. To turn it off, dispatch again without the input.
 
 ## Buffered search gate
 
