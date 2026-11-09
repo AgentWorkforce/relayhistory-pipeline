@@ -275,10 +275,52 @@ export interface BufferedScope {
  * is for logs only.
  */
 export class BufferedFenced extends Error {
-  constructor(readonly reason: string = "fenced") {
+  /** For logs only: the SQLSTATE class (two chars) of an RPC failure, never the message or full code. */
+  readonly sqlstateClass?: string;
+  constructor(readonly reason: string = "fenced", sqlstateClass?: unknown) {
     super("buffered read fenced");
     this.name = "BufferedFenced";
+    const cls = sqlstateClassOf(sqlstateClass);
+    if (cls !== undefined) this.sqlstateClass = cls;
   }
+}
+
+/** The class (first two chars) of a code that is exactly SQLSTATE-shaped ([0-9A-Z]{5}); anything else is undefined. */
+function sqlstateClassOf(code: unknown): string | undefined {
+  return typeof code === "string" && /^[0-9A-Z]{5}$/.test(code) ? code.slice(0, 2) : undefined;
+}
+
+/**
+ * A fence before any buffered candidate was found (the route's existing answer). Both fields are
+ * for logs only: the closed reason and, for an RPC failure, the validated SQLSTATE class.
+ */
+export interface UnverifiedBeforeCandidate {
+  unverifiedBeforeCandidate: string;
+  unverifiedSqlstateClass?: string;
+}
+
+function unverified(error: BufferedFenced): UnverifiedBeforeCandidate {
+  const cls = error.sqlstateClass;
+  return typeof cls === "string" && /^[0-9A-Z]{2}$/.test(cls)
+    ? { unverifiedBeforeCandidate: error.reason, unverifiedSqlstateClass: cls }
+    : { unverifiedBeforeCandidate: error.reason };
+}
+
+/**
+ * Every reason this module fences with (plus the default). Logs carry a fence reason only
+ * through fenceSubtype, so a reason outside this closed set can never reach a log line.
+ */
+export const FENCE_SUBTYPES: readonly string[] = Object.freeze([
+  "fenced",
+  "rpc_fenced", "rpc_timeout", "rpc_error",
+  "gate_unbound", "gate_identity", "gate_status", "gate_cache", "gate_shape", "gate_timeout", "gate_error",
+  "gate_echo", "gate_pending", "gate_epoch", "gate_moved",
+  "request_aborted",
+]);
+
+/** A fence reason for logs: the reason when it is a known subtype, else "fence_other". */
+export function fenceSubtype(reason: unknown): string {
+  return typeof reason === "string" && FENCE_SUBTYPES.includes(reason) ? reason : "fence_other";
 }
 
 /** The RPC's explicit refusal (SQLSTATE 55006 or its message). */
@@ -300,9 +342,10 @@ export function isBufferedTimeoutError(error: unknown): boolean {
  */
 function rethrowBuffered(error: unknown): never {
   if (error instanceof BufferedFenced) throw error;
-  if (isBufferedFencedError(error)) throw new BufferedFenced("rpc_fenced");
-  if (isBufferedTimeoutError(error)) throw new BufferedFenced("rpc_timeout");
-  throw new BufferedFenced("rpc_error");
+  const code = error !== null && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+  if (isBufferedFencedError(error)) throw new BufferedFenced("rpc_fenced", code);
+  if (isBufferedTimeoutError(error)) throw new BufferedFenced("rpc_timeout", code);
+  throw new BufferedFenced("rpc_error", code);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1323,7 +1366,7 @@ export type OwnerBufferedTurns =
    * The authority (or the RPC's own fence) refused before any buffered candidate was found:
    * nothing is known about this session, so the route answers as without the flag (501).
    */
-  | { unverifiedBeforeCandidate: string }
+  | UnverifiedBeforeCandidate
   | { erased: true; rows: [] }
   | { erased: false; rows: Record<string, unknown>[] };
 
@@ -1345,7 +1388,7 @@ export async function readOwnerBufferedTurns(deps: OwnerBufferedDeps, scope: Buf
 
 type GatedSession =
   | null
-  | { unverifiedBeforeCandidate: string }
+  | UnverifiedBeforeCandidate
   | { erased: true }
   | {
       erased: false;
@@ -1373,7 +1416,7 @@ async function readGatedSession(deps: OwnerBufferedDeps, scope: BufferedScope, s
     first = await timed(phases, "control_head_1", () => deps.gate.observe(scope));
     initial = await timed(phases, "stages_sql", () => deps.reads.stages(scope, first, source, sessionId));
   } catch (error) {
-    if (error instanceof BufferedFenced) return { unverifiedBeforeCandidate: error.reason };
+    if (error instanceof BufferedFenced) return unverified(error);
     throw error;
   }
   if (initial.length === 0) return null;
@@ -1392,7 +1435,7 @@ async function readGatedSession(deps: OwnerBufferedDeps, scope: BufferedScope, s
 export type OwnerBufferedEvents =
   | null /** not a visible buffered session of this caller: the route's existing answer */
   /** The authority refused before any buffered candidate was found: the route's existing answer. */
-  | { unverifiedBeforeCandidate: string }
+  | UnverifiedBeforeCandidate
   | { erased: true; rows: [] }
   | { erased: false; rows: EventRow[] };
 
