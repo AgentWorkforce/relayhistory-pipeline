@@ -18,6 +18,7 @@ import { privacyAuthority, originalLazyBodies, originalMirrorBodies } from "../.
 import { bufferedSearchGateRetiredWitness, originalGateBody } from "../../../scripts/sessions-function-boundary/lanes/buffered-search-gate-retired-witness.ts";
 import { createHash } from "node:crypto";
 import { ingestGenerationOverlap, originalBodies as originalOverlapBodies } from "../../../scripts/sessions-function-boundary/lanes/ingest-generation-overlap.ts";
+import { ingestClaimSessions } from "../../../scripts/sessions-function-boundary/lanes/ingest-claim-sessions.ts";
 import type { LaneManifest } from "../../../scripts/sessions-function-boundary/types.ts";
 import { VERIFIERS } from "../../../scripts/sessions-function-boundary/verifiers.ts";
 import { run } from "../../../scripts/sync-sessions-function-boundary.ts";
@@ -77,7 +78,24 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105044030_ingest_generation_overlap.down.sql",
       "supabase/rollbacks/20261105044050_selfhost_erase_short_summary_provenance.down.sql",
       "supabase/rollbacks/20261105044070_selfhost_erase_search_text_rebuild.down.sql",
+      "supabase/rollbacks/20261105044080_ingest_claim_sessions.down.sql",
     ]);
+  });
+
+  test("the 044080 claim sessions lane adds two owner-only trigger functions, grants no runtime role anything, and derives its guarded rollback", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    const without = await generate(repo, LANES.filter((l) => l !== ingestClaimSessions), VERIFIERS);
+    expect(withLane.summary.lanes["ingest-claim-sessions"]).toEqual({ functions: 2, replaces: 0, grants: 0 });
+    for (const v of VERIFIERS) expect(withLane.outputs[v.path]).toBe(without.outputs[v.path]);
+    const acl = JSON.parse(withLane.outputs["src/hoopdb/sessions-function-acl.json"]!).functions as Record<string, string[]>;
+    const mine = Object.keys(acl).filter((k) => k.startsWith("sessions.ingest_claim_sessions_")).sort();
+    expect(mine).toEqual(["sessions.ingest_claim_sessions_policy_guard()", "sessions.ingest_claim_sessions_sync()"]);
+    for (const k of mine) expect(acl[k]).toEqual(["<owner>:EXECUTE"]);
+    const down = withLane.outputs["supabase/rollbacks/20261105044080_ingest_claim_sessions.down.sql"]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, ingestClaimSessions.migration!), "utf8")).digest("hex"));
+    expect(down.indexOf("own applied checksum required")).toBeLessThan(down.indexOf("DROP TRIGGER ingest_claim_sessions_sync ON sessions.ingest_claim_attempts;"));
+    expect(down).toContain("a later migration is applied");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
   });
 
   test("the 044030 generation overlap adds six owner-only functions, grants no runtime role anything, and derives its exact guarded rollback", async () => {
