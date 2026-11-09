@@ -1,3 +1,4 @@
+import { sqlBriefSummary } from "./brief-summary.ts";
 /**
  * AWS Lambda entry for the session read API (Function URL, payload v2;
  * stacks/aws/session-read-api.ts, runbooks/sessions-prod-session-read-api.md).
@@ -519,6 +520,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     liveness: sqlLiveness(poolTenantRunner(pool as never)),
     directory: sqlDirectory(poolTenantRunner(pool as never)),
     directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
+    ...(entry === "service" ? {briefSummary: sqlBriefSummary(poolTenantRunner(pool as never))} : {}),
     briefTitles: sqlBriefTitles(poolTenantRunner(pool as never)),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,

@@ -1059,6 +1059,10 @@
     "sessions.session_brief_document_json(sessions.session_directory,boolean)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_brief_summary_for(text,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.session_brief_titles_for(text,text[],text[])": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
@@ -1148,6 +1152,9 @@
       "session_directory_search_worker:EXECUTE"
     ],
     "sessions.session_directory_record_fences()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_directory_recorded_title_invalidate()": [
       "<owner>:EXECUTE"
     ],
     "sessions.session_directory_replay_pages(text,text,text)": [

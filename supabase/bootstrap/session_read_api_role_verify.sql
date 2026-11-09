@@ -123,6 +123,7 @@ BEGIN
          'sessions.read_api_token_issue(text,text,text,text,text,text,text,text,timestamp with time zone,text,timestamp with time zone,text,timestamp with time zone)',
          'sessions.read_api_token_refresh(text,text,text,text,text,text,timestamp with time zone,text,timestamp with time zone,timestamp with time zone)',
          'sessions.read_api_token_verify(text,timestamp with time zone)',
+         'sessions.session_brief_summary_for(text,text,text)',
          'sessions.session_brief_titles_for(text,text[],text[])',
          'sessions.session_directory_activity_for(text,timestamp with time zone,timestamp with time zone)')
   LOOP

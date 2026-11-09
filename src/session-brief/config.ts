@@ -19,6 +19,12 @@
  *   SESSION_BRIEF_MAX_ATTEMPTS      2: a retryable failure is retried once (one requeue).
  *   SESSION_BRIEF_BATCH             5 wakeups per tick; SESSION_BRIEF_LEASE_SECONDS 300.
  *   SESSION_BRIEF_SWEEP_SECONDS     0 (off): how often to queue indexed sessions that have no brief.
+ *   SESSION_BRIEF_CANONICAL_INPUT   default off. Explicit true uses the verified self-host canonical
+ *                                   object source and also sweeps changed pointer revisions, so native
+ *                                   ingest does not need the legacy indexer's brief fanout. Requires
+ *                                   SESSION_BRIEF_ENABLED, LOCKER_BUCKET, org-prefix layout and a workspace list.
+ *   SESSION_BRIEF_WORKSPACE_IDS     optional comma-separated explicit workspace ids; required for native
+ *                                   canonical input. Restricts sweep, claims and housekeeping.
  *
  * Values are read once per process; nothing here is logged.
  */
@@ -29,6 +35,7 @@ import {
 
 export interface BriefConfig {
   enabled: boolean;
+  workspaceIds?: readonly string[];
   model: string;
   idleSeconds: number;
   maxWaitSeconds: number;
@@ -62,10 +69,20 @@ function int(
 
 export const MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 
+export function briefWorkspaceIds(raw: string | undefined): readonly string[] | undefined {
+  if (raw === undefined || raw.trim() === "") return;
+  const ids = raw.split(",").map(v => v.trim());
+  if (ids.length > 100 || new Set(ids).size !== ids.length || ids.some(v => !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$/.test(v)))
+    throw new Error("SESSION_BRIEF_WORKSPACE_IDS must be a bounded explicit workspace list");
+  return Object.freeze(ids);
+}
+
 export function briefConfig(env: NodeJS.ProcessEnv = process.env): BriefConfig {
   const model = env.SESSION_BRIEF_MODEL?.trim();
+  const workspaceIds = briefWorkspaceIds(env.SESSION_BRIEF_WORKSPACE_IDS);
   return {
     enabled: env.SESSION_BRIEF_ENABLED === "true",
+    ...(workspaceIds ? { workspaceIds } : {}),
     model: model && MODEL_PATTERN.test(model) ? model : "gpt-5.6-luna",
     idleSeconds: int(env, "SESSION_BRIEF_IDLE_SECONDS", 600, 0, 86_400),
     maxWaitSeconds: int(env, "SESSION_BRIEF_MAX_WAIT_SECONDS", 3_600, 0, 7 * 86_400),
