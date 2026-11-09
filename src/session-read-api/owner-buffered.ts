@@ -800,6 +800,38 @@ export function boundedStreamDecompress(Stream: StreamDecompressor): OwnerBuffer
 /** The RPC page bound (PR A clamps p_limit to 1..100). */
 export const BUFFERED_LIST_MAX_LIMIT = 100;
 export const BUFFERED_STATEMENT_TIMEOUT_MS = 2000;
+export const OWNER_BUFFERED_STATEMENT_TIMEOUT_FLAG = "READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS";
+/**
+ * The largest READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS accepted: a ceiling, not a budget
+ * guarantee. A detail read runs the stages RPC at least twice (initial and recheck; a stage 404
+ * adds a refresh) plus two control-head calls and the S3 fetch, inside the caller's 15 s budget,
+ * so the value deployed must come from the measured whole-path latency with margin.
+ */
+export const OWNER_BUFFERED_STATEMENT_TIMEOUT_MAX_MS = 6000;
+
+/** READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS holds an unaccepted value. Names the field, never the value. */
+export class OwnerBufferedStatementTimeoutError extends Error {
+  constructor() {
+    super(`${OWNER_BUFFERED_STATEMENT_TIMEOUT_FLAG} must be unset or an integer ${BUFFERED_STATEMENT_TIMEOUT_MS}..${OWNER_BUFFERED_STATEMENT_TIMEOUT_MAX_MS}`);
+    this.name = "OwnerBufferedStatementTimeoutError";
+  }
+}
+
+/**
+ * READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: unset or empty is 2000 (the read role's default,
+ * unchanged); an integer 2000..6000 (digits only) is the per-transaction SET LOCAL
+ * statement_timeout of the two owner-buffered RPCs; anything else throws
+ * OwnerBufferedStatementTimeoutError (the Worker refuses the deploy's requests). It never changes
+ * the role default or any other read.
+ */
+export function ownerBufferedStatementTimeoutMs(raw: string | undefined): number {
+  if (raw === undefined || raw === "") return BUFFERED_STATEMENT_TIMEOUT_MS;
+  if (/^[1-9][0-9]{3}$/.test(raw)) {
+    const n = Number(raw);
+    if (n >= BUFFERED_STATEMENT_TIMEOUT_MS && n <= OWNER_BUFFERED_STATEMENT_TIMEOUT_MAX_MS) return n;
+  }
+  throw new OwnerBufferedStatementTimeoutError();
+}
 
 export const BUFFERED_USER_SQL = "SELECT set_config('bulls96_read.user_id', $1, true)";
 const HEAD_ARGS =
