@@ -16,7 +16,7 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "model_id", "tokens_in", "tokens_out",
   "count", "inserted", "deleted", "manifests", "claimed", "acked", "retried", "exhausted", "listed", "enqueued", "skipped", "failed",
   "state", "rule", "kind", "port", "ok", "reason", "key_sha256", "manifest_key_sha256",
-  "migration", "ledger_sha", "accepted_as_alias_of",
+  "migration", "ledger_name", "ledger_sha", "accepted_as_alias_of",
   "route", "correlation_id",
   // Closed values only (src/session-ingest/db-error-class.ts): never a message or stack.
   "db_error_class", "db_error_code", "db_error_basis", "error_name",

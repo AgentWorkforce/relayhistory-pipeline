@@ -10,9 +10,11 @@ import { ConditionalWriteUnsupported, assertConditionalWrites } from "../../shar
 import { createGcsStore, createS3Store, type ObjectStore } from "../../shared/vendor.ts";
 import { selfhostAdmissionSettings, selfhostIngestConfig } from "../selfhost-config.ts";
 import { admissionStartupGate, conditionalWriteProbeKey } from "../selfhost-server.ts";
-import { DEAD_LETTER_RETENTION_MS, deadLetterKey } from "../selfhost-admission.ts";
-import { inboxKey } from "../async-admission.ts";
-import { TENANT, scratchStore } from "./support.ts";
+import { DEAD_LETTER_RETENTION_MS, deadLetterKey, selfhostAdmissionConsumer } from "../selfhost-admission.ts";
+import { enqueueAdmission, inboxKey } from "../async-admission.ts";
+import { LedgerUnavailableError } from "../ledger.ts";
+import { prepareDelivery } from "../vendor/delivery/prepare.ts";
+import { MemoryLedger, TENANT, batch, record, scratchStore } from "./support.ts";
 import { VersionedMemoryStore } from "./versioned-store.ts";
 
 const cleanups: (() => void)[] = [];
@@ -196,5 +198,41 @@ describe("hosted boundary", () => {
     const selfhost = [...seen].filter((f) => /session-ingest\/selfhost-|shared\/locker\.ts$/.test(f));
     expect(selfhost).toEqual([]);
     expect(seen.size).toBeGreaterThan(10);
+  });
+});
+
+describe("#405 INGEST_CLAIM_LOCK_BUSY through the self-host consumer", () => {
+  test("a claim lock wait (ClaimLockBusy) backs off like IngestUnavailable and never dead-letters early", async () => {
+    const fs = scratchStore();
+    cleanups.push(fs.done);
+    const ledger = new MemoryLedger();
+    let claims = 0;
+    ledger.claim = async () => { claims++; throw new LedgerUnavailableError("ledger_lock_timeout", { db_error_class: "lock", db_error_code: "55P03", db_error_basis: "sqlstate" } as never); };
+    const prepared = await prepareDelivery(TENANT, await batch([record({ record_id: "lock-1" })]));
+    let clock = Date.now();
+    const key = await enqueueAdmission({ store: fs.store, keyRoot: "96bulls", enqueue: async () => {} }, TENANT, prepared, clock, 0);
+    const lines: Record<string, unknown>[] = [];
+    const sink = (_m: string, f: Record<string, unknown> = {}) => void lines.push(f);
+    const consumer = selfhostAdmissionConsumer({
+      mode: "on", concurrency: 1, scanIntervalMs: 15_000, maxAttempts: 3, nowMs: () => clock, log: { info: sink, warn: sink, error: sink },
+      deliver: { ledger, acceptanceMode: "canonical", target: { store: fs.store, keyRoot: "96bulls" }, claimLockBusy: true, random: () => 0 },
+    });
+    await consumer.scan();
+    await consumer.settle();
+    // The HTTP 429 never reaches the queue path: the IngestUnavailable cause, stage and backoff.
+    expect(lines.find((l) => l.route === "ingest.admission")).toMatchObject({ outcome: "retry", error_code: "ledger_lock_timeout", stage: "claim", attempt: 1 });
+    // (The lock-wait alert line covers buffered claims only, as on hosted; canonical claims are not an alert stage.)
+    // Backed off 15 s (attempt 1): nothing re-runs before it, then it does; no dead-letter marker.
+    clock += 14_000;
+    await consumer.scan();
+    await consumer.settle();
+    expect(claims).toBe(1);
+    clock += 2_000;
+    await consumer.scan();
+    await consumer.settle();
+    expect(claims).toBe(2);
+    expect(await fs.store.head(deadLetterKey("96bulls", key) as never)).toBeUndefined();
+    expect(consumer.status()).toMatchObject({ backlog: 1, deadLetters: 0 });
+    await consumer.stop();
   });
 });

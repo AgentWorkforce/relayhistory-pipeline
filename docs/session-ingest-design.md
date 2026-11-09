@@ -50,7 +50,7 @@ S3 manifest.json -> SQS -> session-pipeline Lambda (async, unchanged) -> Supabas
 | `message_too_large` | the 128 KB queue message limit | Fixed by #262. The replica keeps the descriptor path. |
 | `fenced` | a fence or replay only Neon could decide | The fence and the receipt live in Supabase (section 3). **Decided here.** |
 | 409 `record_revision` on regenerated jobs | old Desktops re-export whole histories at the same revisions with changed bytes (linuyc: 124k quarantined) | #250 rules: an equal revision is a replay. The **replay fast path** costs one round trip (section 2a). |
-| 429 `delivery_busy` | Neon's per-user advisory lock (0039), the per-org `memory_claims` lock and the per-origin `FOR UPDATE` (0038) | No database lock is waited on. A 429 means only that the tenant is over its in-flight limit, with `Retry-After` (section 5). |
+| 429 `delivery_busy` | Neon's per-user advisory lock (0039), the per-org `memory_claims` lock and the per-origin `FOR UPDATE` (0038) | No database lock is waited on. A 429 means only that the tenant is over its in-flight limit, with `Retry-After` (section 5). With `INGEST_CLAIM_LOCK_BUSY=on` (default off), it can also mean a claim lost its lock wait to a concurrent claim (section 5). |
 | zstd `unexpected end of file` | workerd's compressor limit | relayhistory #258's one-frame encoder, ported into the pipeline's `raw-chunks.ts`. |
 
 **Every batch lands in S3 before the response, and there is no fallback path.** A failure is a retryable 503. The claim stays `pending` until the commit, so the retry resumes the same idempotent write.
@@ -164,6 +164,7 @@ Migration `supabase/migrations/20261104022000_session_ingest_ledger.sql`. It nev
   - Per batch id: its row.
   - Per record id: its committed-revision row, written at commit. The fast path only reads.
   - Per session: the manifest CAS, retried with jitter up to 8 times.
+  - Caveat: the claim SQL itself waits on the fence row and the origin lock (runbooks/history-620-operations.md, lock order), bounded by the role's 2 s `lock_timeout`. By default the loser gets a 503. With `INGEST_CLAIM_LOCK_BUSY=on` (default off), a claim that loses its 2 s `lock_timeout` wait to a concurrent claim for the same tenant answers 429 `delivery_busy` with `Retry-After` 5-10 s instead of 503. Nothing was written. See runbooks/history-620-operations.md, "Lock-wait alert".
 - **Per-tenant concurrency instead of a lock.** `ingest_tenant_slots` holds one lease per in-flight batch that writes. The limits are `INGEST_MAX_PER_USER` (default 4) and `INGEST_MAX_PER_ORG` (default 32). The lease TTL is 90 s, so a lost release frees itself.
   - Over a limit: 429 `delivery_busy` with relayhistory's jittered `Retry-After` of 2 to 10 s. The claim stays pending, so the retry resumes it.
   - It is a soft limit: two racing acquires can both pass by one.
