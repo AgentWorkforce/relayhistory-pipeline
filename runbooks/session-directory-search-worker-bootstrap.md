@@ -441,6 +441,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105044030_ingest_generation_overlap.sql` | table sessions.ingest_generation_overlap_windows (slot 044030, zero-503 schema windows; owner-only, no role prerequisite) |
 | `upstream:20261105044040_buffered_stages_session_first.sql` | buffered_session_stages_for and buffered_sessions_for replaced (duplicate ordinals counted with a window; the detail is session-first); `ingest_claim_attempts_records_gin_idx` is adopted or created (`ADOPTABLE_INDEXES`; absent on a populated table is `index_prebuild_required`), it does not by itself mark the step |
 | `upstream:20261105044050_selfhost_erase_short_summary_provenance.sql` | replacement: ingest_selfhost_set_session_uploads and ingest_publication_retire_fence clear the short_summary provenance columns with short_summary |
+| `upstream:20261105044070_selfhost_erase_search_text_rebuild.sql` | replacement: ingest_selfhost_set_session_uploads and ingest_publication_retire_fence rebuild search_text without the summary when they clear it |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
