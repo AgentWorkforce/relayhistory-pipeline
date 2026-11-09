@@ -1,4 +1,4 @@
--- Session pipeline consumer grant (045030): EXECUTE on
+-- Session pipeline consumer grant (045015): EXECUTE on
 -- sessions.session_directory_project_text(text, text, text) for the self-host
 -- writer (search_consumer_runtime).
 --

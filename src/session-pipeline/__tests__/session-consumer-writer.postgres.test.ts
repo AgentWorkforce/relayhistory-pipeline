@@ -687,7 +687,7 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
     // carrying git fields (the e2e seeds carry none, so resolve_repo
     // returns before the catalog lock); session_publication_is_managed is
     // reachable by code path only (srv_ machine prefix, pointer.ts).
-    // session_directory_project_text (045030) is reached by no statement:
+    // session_directory_project_text (045015) is reached by no statement:
     // the partial expression index session_directory_tenant_project_text_trgm_idx
     // evaluates it as the writing role on every directory write that
     // carries a project id, project key or repository (proved below).
@@ -717,7 +717,7 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
   }, 120_000);
 
   test("function ACL drift is zero: the thirteen consumer grants are manifest-authorized", async () => {
-    // B2 receipt: the twelve 043900 EXECUTE grants plus 045030's project-text grant now sit inside the migrator's
+    // B2 receipt: the twelve 043900 EXECUTE grants plus 045015's project-text grant now sit inside the migrator's
     // function-ACL manifest (installed by the grant migration on every
     // migrate), so the boundary preview for the role that holds them must
     // report no extras: any thirteenth writer grant outside the manifest
@@ -733,7 +733,7 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
     }
   }, 120_000);
 
-  test("directory writes carrying project fields need the project-text EXECUTE (045030): success, then revoke, 42501", async () => {
+  test("directory writes carrying project fields need the project-text EXECUTE (045015): success, then revoke, 42501", async () => {
     // The partial expression index session_directory_tenant_project_text_trgm_idx
     // (20261101050000) calls sessions.session_directory_project_text, and
     // PostgreSQL evaluates index expressions as the role doing the INSERT or

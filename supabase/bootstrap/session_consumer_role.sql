@@ -253,7 +253,7 @@ REVOKE ALL ON FUNCTION sessions.session_directory_search_text(text, text, text, 
 -- The partial expression index session_directory_tenant_project_text_trgm_idx
 -- evaluates this immutable SQL helper as the writing role on every live
 -- session_directory write carrying a project id, project key or repository;
--- without EXECUTE those writes fail 42501 (migration 20261105045030).
+-- without EXECUTE those writes fail 42501 (migration 20261105045015).
 REVOKE ALL ON FUNCTION sessions.session_directory_project_text(text, text, text) FROM search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.applied_repo_evidence(jsonb, jsonb) TO search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.canonical_remote(text) TO search_consumer_runtime;

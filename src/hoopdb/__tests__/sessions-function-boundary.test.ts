@@ -84,7 +84,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105044080_ingest_claim_sessions.down.sql",
       "supabase/rollbacks/20261105044090_claim_sessions_reader.down.sql",
       "supabase/rollbacks/20261105045010_buffered_search_feed_same_second.down.sql",
-      "supabase/rollbacks/20261105045030_session_consumer_project_text_grant.down.sql",
+      "supabase/rollbacks/20261105045015_session_consumer_project_text_grant.down.sql",
     ]);
   });
 
@@ -391,7 +391,7 @@ describe("unified sessions function-boundary generator", () => {
     expect(down).toContain("DELETE FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105043860_buffered_search_gate.sql'");
   });
 
-  test("045030 grant-only lane: appends search_consumer_runtime to project_text's ACL, is credited by the ACL preview while pending, and refuses SQL/manifest disagreement", async () => {
+  test("045015 grant-only lane: appends search_consumer_runtime to project_text's ACL, is credited by the ACL preview while pending, and refuses SQL/manifest disagreement", async () => {
     const g = await generate(repo, LANES, VERIFIERS);
     expect(g.summary.lanes["consumer-project-text-grant"]).toEqual({ functions: 0, replaces: 0, grants: 1 });
     const acl = JSON.parse(g.outputs[ACL_PATH]!).functions as Record<string, string[]>;
@@ -416,10 +416,10 @@ describe("unified sessions function-boundary generator", () => {
     // An empty slot may not carry grantsOn.
     await expect(generate(repo, [...LANES.filter((l) => l !== lane), { ...lane, migration: null, extraOutputs: undefined }], VERIFIERS))
       .rejects.toThrow("empty slot consumer-project-text-grant must not claim");
-    const down = g.outputs["supabase/rollbacks/20261105045030_session_consumer_project_text_grant.down.sql"]!;
+    const down = g.outputs["supabase/rollbacks/20261105045015_session_consumer_project_text_grant.down.sql"]!;
     expect(down).toContain("REVOKE EXECUTE ON FUNCTION sessions.session_directory_project_text(text,text,text) FROM search_consumer_runtime;");
     expect(down).toContain("a later migration is applied");
-    expect(down).toContain("DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105045030_session_consumer_project_text_grant.sql'");
+    expect(down).toContain("DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105045015_session_consumer_project_text_grant.sql'");
   });
 
   test("043870 buffered search feed: three SECDEF RPCs for the dedicated runtime login, ACL +3, not runtime functions, no table grant", async () => {

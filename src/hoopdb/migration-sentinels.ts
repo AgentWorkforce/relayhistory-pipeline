@@ -382,11 +382,11 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   },
   "upstream:20261105043900_session_consumer_function_grants.sql": {
     evidence: "twelve search_consumer_runtime EXECUTEs (composed writer path)",
-    // session_directory_project_text is 045030's grant, so it is left out: the count stays exactly twelve
-    // whether or not 045030 has run.
+    // session_directory_project_text is 045015's grant, so it is left out: the count stays exactly twelve
+    // whether or not 045015 has run.
     sql: "SELECT count(*) = 12 AS applied FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE n.nspname = 'sessions' AND p.proname <> 'session_directory_project_text' AND r.rolname = 'search_consumer_runtime' AND a.privilege_type = 'EXECUTE'",
   },
-  "upstream:20261105045030_session_consumer_project_text_grant.sql": {
+  "upstream:20261105045015_session_consumer_project_text_grant.sql": {
     evidence: "search_consumer_runtime EXECUTE on sessions.session_directory_project_text (project-text index expression)",
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc p, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE p.oid = to_regprocedure('sessions.session_directory_project_text(text,text,text)') AND r.rolname = 'search_consumer_runtime' AND a.privilege_type = 'EXECUTE') AS applied",
   },
@@ -419,5 +419,5 @@ export const NON_CREATE_STEPS = [
   "96bulls:0003_fanout_ledger.sql",
   "96bulls:0004_summary_pointers.sql",
   "upstream:20261105043900_session_consumer_function_grants.sql",
-  "upstream:20261105045030_session_consumer_project_text_grant.sql",
+  "upstream:20261105045015_session_consumer_project_text_grant.sql",
 ] as const;
