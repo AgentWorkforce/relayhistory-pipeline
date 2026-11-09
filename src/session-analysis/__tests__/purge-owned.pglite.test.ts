@@ -14,11 +14,8 @@ afterEach(async () => {
   pg = undefined;
 });
 
-/** 041000's owned-set table (lane A, #289); the delivery records are 010000's. */
-const LANE_A = `
-CREATE TABLE sessions.ingest_frozen_source_owned_sessions(
- org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,origin_id text NOT NULL,
- source text NOT NULL,session_id text NOT NULL,PRIMARY KEY(org_id,workspace_id,user_id,origin_id,source,session_id));`;
+/** 041000's owned-set table (lane A, #289) now comes from the migration itself; the delivery records are 010000's. */
+const LANE_A = `SELECT 1`;
 
 let n = 0;
 async function backfilled(db: PGlite, org: string, ws: string, session: string) {

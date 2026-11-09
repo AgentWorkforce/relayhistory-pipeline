@@ -462,6 +462,9 @@ test("analysis purge (guarded, ordering): a reset calls purge_session_analysis_f
   open.push(n.close);
   await n.pg.query("INSERT INTO sessions.uploaded_support_identities VALUES($1,$2,'o1','r1',$3,'claude','NEON-ERA')", [TENANT.orgId, TENANT.workspaceId, TENANT.userId]);
   await activateFrom(f, n);
+  await f.db.exec(`DROP FUNCTION IF EXISTS sessions.purge_session_analysis_for_owned(text,text,text,jsonb);
+    DROP FUNCTION IF EXISTS sessions.purge_session_analysis_for_owned(text,text,text);
+    DROP FUNCTION IF EXISTS sessions.session_analysis_purge_grant(text,text,text);`);
   await f.db.exec(`CREATE TABLE sessions.__c3_analysis_purge_calls(org_id text,user_id text,owned_seen bigint);
     CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_workspace text,p_user text) RETURNS bigint LANGUAGE sql AS $$
       INSERT INTO sessions.__c3_analysis_purge_calls SELECT p_org,p_user,(SELECT count(*) FROM sessions.ingest_frozen_source_owned_sessions WHERE org_id=p_org AND workspace_id=p_workspace AND user_id=p_user) RETURNING 0::bigint $$;
@@ -475,7 +478,11 @@ test("analysis purge (guarded, ordering): a reset calls purge_session_analysis_f
 /** #292's workspace-scoped purge_session_analysis_for_owned (both forms) + its per-transaction grant, VERBATIM from #292 fe120007 (046000). */
 async function withAnalysis(f: F) {
   await f.db.exec("DO $$BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bulls96_analysis_admit') THEN CREATE ROLE bulls96_analysis_admit NOLOGIN NOINHERIT; END IF; END$$;");
-  await f.db.exec(await Bun.file(new URL("./fixtures/analysis-jobs-046000.sql", import.meta.url)).text());
+  // Once 046000 has landed, the fixture copy is byte-equal to the migration (registry
+  // guard below), so applying it again would collide; the in-tree migration is the real
+  // function under test.
+  const landed = (await f.db.query<{ r: string | null }>("SELECT to_regclass('sessions.session_analysis_jobs_v2')::text AS r")).rows[0]?.r;
+  if (landed === null) await f.db.exec(await Bun.file(new URL("./fixtures/analysis-jobs-046000.sql", import.meta.url)).text());
   const job = (ws: string, sid: string) =>
     f.db.query("INSERT INTO sessions.session_analysis_jobs_v2(org_id,workspace_id,session_id,analysis_version,schema_version,model_version) VALUES($1,$2,$3,'session-analysis-v2.4',2,'gpt-5.4')", [TENANT.orgId, ws, sid]);
   const owned = (ws: string, user: string, sid: string, o: string) =>
@@ -602,17 +609,23 @@ test("analysis purge (real #292 function): the ingest role cannot call it outsid
 
 /** 046000 present in any form, but without BOTH exact workspace-scoped signatures (e.g. #292's older f7f49308 ABI). */
 async function staleAnalysisAbi(f: F, variant: "old-signatures" | "table-only" | "reset-form-only" | "no-grant") {
-  if (variant !== "reset-form-only") await f.db.exec("CREATE TABLE sessions.session_analysis_jobs_v2(org_id text, workspace_id text, session_id text)");
+  // 046000 is landed, so stale states are built by removing from the real footprint.
+  const dropAll = `DROP FUNCTION IF EXISTS sessions.purge_session_analysis_for_owned(text,text,text,jsonb);
+    DROP FUNCTION IF EXISTS sessions.purge_session_analysis_for_owned(text,text,text);
+    DROP FUNCTION IF EXISTS sessions.session_analysis_purge_grant(text,text,text);`;
+  if (variant === "table-only")
+    await f.db.exec(`${dropAll}
+      DROP TABLE IF EXISTS sessions.session_analysis_purge_authority;`);
   if (variant === "old-signatures")
-    await f.db.exec(`CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_user text) RETURNS integer LANGUAGE sql AS $$ SELECT 0 $$;
+    await f.db.exec(`${dropAll}
+      CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_user text) RETURNS integer LANGUAGE sql AS $$ SELECT 0 $$;
       CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_user text,p_sessions jsonb) RETURNS integer LANGUAGE sql AS $$ SELECT 0 $$;`);
   if (variant === "no-grant")
     // Both exact workspace-scoped purges, but 046000's grant helper is missing (its purge-authority table is present).
-    await f.db.exec(`CREATE TABLE sessions.session_analysis_purge_authority(txid bigint, org_id text, workspace_id text, user_id text);
-      CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_workspace text,p_user text) RETURNS integer LANGUAGE sql AS $$ SELECT 0 $$;
-      CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_workspace text,p_user text,p_sessions jsonb) RETURNS integer LANGUAGE sql AS $$ SELECT 0 $$;`);
+    await f.db.exec("DROP FUNCTION IF EXISTS sessions.session_analysis_purge_grant(text,text,text);");
   if (variant === "reset-form-only")
-    await f.db.exec("CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_workspace text,p_user text) RETURNS integer LANGUAGE sql AS $$ SELECT 0 $$;");
+    await f.db.exec(`DROP FUNCTION IF EXISTS sessions.purge_session_analysis_for_owned(text,text,text,jsonb);
+      DROP FUNCTION IF EXISTS sessions.session_analysis_purge_grant(text,text,text);`);
 }
 
 for (const variant of ["old-signatures", "table-only", "reset-form-only", "no-grant"] as const)
@@ -649,10 +662,12 @@ test("analysis ABI: the begin's refusal is the ABI mismatch itself (55000), call
 /** Issue #310 (relayhistory-pipeline): each 046000 footprint clause in isolation (and the no-grant variant) refuses
  * with exactly 55000 at begin, for a RESET and for a DISABLE. */
 for (const [name, ddl] of [
-  ["no-grant (both purges, no grant helper)", `CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_workspace text,p_user text) RETURNS integer LANGUAGE sql AS $$ SELECT 0 $$;
-    CREATE FUNCTION sessions.purge_session_analysis_for_owned(p_org text,p_workspace text,p_user text,p_sessions jsonb) RETURNS integer LANGUAGE sql AS $$ SELECT 0 $$;`],
-  ["purge-authority table only", "CREATE TABLE sessions.session_analysis_purge_authority(txid bigint, org_id text, workspace_id text, user_id text)"],
-  ["grant-name only (another overload)", "CREATE FUNCTION sessions.session_analysis_purge_grant(p_x jsonb) RETURNS void LANGUAGE sql AS $$ SELECT $$"],
+  ["no-grant (both purges, no grant helper)", "DROP FUNCTION IF EXISTS sessions.session_analysis_purge_grant(text,text,text)"],
+  ["purge-authority table only", `DROP FUNCTION IF EXISTS sessions.purge_session_analysis_for_owned(text,text,text,jsonb);
+    DROP FUNCTION IF EXISTS sessions.purge_session_analysis_for_owned(text,text,text);
+    DROP FUNCTION IF EXISTS sessions.session_analysis_purge_grant(text,text,text)`],
+  ["grant-name only (another overload)", `DROP FUNCTION IF EXISTS sessions.session_analysis_purge_grant(text,text,text);
+    CREATE FUNCTION sessions.session_analysis_purge_grant(p_x jsonb) RETURNS void LANGUAGE sql AS $$ SELECT $$`],
 ] as const)
   test(`#310 analysis ABI footprint (${name}): a reset AND a disable begin refuse with exactly 55000 "analysis purge ABI mismatch"`, async () => {
     const f = await setup();

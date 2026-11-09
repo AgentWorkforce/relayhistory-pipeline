@@ -402,6 +402,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105043900_session_consumer_function_grants.sql` | twelve search_consumer_runtime EXECUTEs (composed writer path) |
 | `upstream:20261105043910_selfhost_session_selection_erase.sql` | function sessions.ingest_selfhost_set_session_uploads |
 | `upstream:20261105044000_read_api_tokens.sql` | table sessions.read_api_tokens |
+| `upstream:20261105044010_selfhost_erase_lock_fences.sql` | replacement: ingest_selfhost_set_session_uploads takes the user's fence lock before reading ownership |
 | `upstream:20261105046000_analysis_jobs.sql` | table `sessions.session_analysis_jobs_v2` |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
