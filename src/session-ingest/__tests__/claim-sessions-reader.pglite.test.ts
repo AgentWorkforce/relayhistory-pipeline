@@ -239,7 +239,7 @@ test("(2) gate on: a first page reads a bounded number of side rows, not the who
  expect((await f.list(LIST_FN,100)).length).toBe(10);
 });
 
-test("(4) commit refresh: accepted_at becomes the batch's committed_at at commit; off while the writer is off; never breaks a commit",async()=>{
+test("(4) commit refresh: accepted_at becomes the batch's committed_at at commit; off while the writer is off; errors and lock timeouts swallowed, lock_timeout restored",async()=>{
  const f=await fixture();
  const T={orgId:TENANT.orgId,workspaceId:TENANT.workspaceId,userId:TENANT.userId},o="origin-r";let n=0;
  const pending=async()=>{const b="rb-"+(++n),token=crypto.randomUUID();
@@ -270,7 +270,7 @@ test("(4) commit refresh: accepted_at becomes the batch's committed_at at commit
  await f.writer(false);
  await commit(b2);
  expect(await acc(b2)).toEqual([null,null]);
- // An error inside the refresh never breaks the commit: the row stays NULL.
+ // An error inside the refresh (WHEN OTHERS) does not break the commit: the row stays NULL.
  await f.writer(true);
  const b3=await pending();
  await f.db.exec("CREATE FUNCTION pg_temp.boom() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN RAISE EXCEPTION 'boom';END$$;CREATE TRIGGER zz_boom BEFORE UPDATE ON sessions.ingest_claim_sessions FOR EACH ROW EXECUTE FUNCTION pg_temp.boom()");
@@ -278,6 +278,39 @@ test("(4) commit refresh: accepted_at becomes the batch's committed_at at commit
  expect((await f.db.query("SELECT state FROM sessions.ingest_batches WHERE batch_id=$1",[b3])).rows).toEqual([{state:"committed"}]);
  expect(await acc(b3)).toEqual([null,null]);
  await f.db.exec("DROP TRIGGER zz_boom ON sessions.ingest_claim_sessions");
+ // A lock timeout (55P03) inside the refresh is swallowed too, and the caller's lock_timeout survives both the
+ // swallowed error and a successful refresh (the refresh's 100ms is transaction-local and restored).
+ const b4=await pending(),b5=await pending();
+ await f.db.exec("CREATE FUNCTION pg_temp.locked() RETURNS trigger LANGUAGE plpgsql AS $$BEGIN IF current_setting('lock_timeout')<>'100ms' THEN RAISE EXCEPTION 'lock_timeout not bounded: %',current_setting('lock_timeout');END IF;RAISE EXCEPTION USING ERRCODE='55P03',MESSAGE='lock timeout';END$$;CREATE TRIGGER zz_locked BEFORE UPDATE ON sessions.ingest_claim_sessions FOR EACH ROW EXECUTE FUNCTION pg_temp.locked()");
+ await f.db.exec("BEGIN;SET LOCAL lock_timeout='7s'");
+ await commit(b4);
+ expect((await f.db.query("SELECT current_setting('lock_timeout') t")).rows).toEqual([{t:"7s"}]);
+ await f.db.exec("COMMIT;DROP TRIGGER zz_locked ON sessions.ingest_claim_sessions");
+ expect((await f.db.query("SELECT state FROM sessions.ingest_batches WHERE batch_id=$1",[b4])).rows).toEqual([{state:"committed"}]);
+ expect(await acc(b4)).toEqual([null,null]);
+ await f.db.exec("BEGIN;SET LOCAL lock_timeout='7s'");
+ await commit(b5);
+ expect((await f.db.query("SELECT current_setting('lock_timeout') t")).rows).toEqual([{t:"7s"}]);
+ await f.db.exec("COMMIT");
+ expect(await acc(b5)).toEqual(["2026-11-05 10:00:00+00","2026-11-05 10:00:00+00"]);
+ expect((await f.db.query("SELECT current_setting('lock_timeout') t")).rows).toEqual([{t:"0"}]);
+ // A non-owner committer that cannot read the owner-only policy (a role granted UPDATE on ingest_batches): the
+ // commit succeeds and refreshes nothing, instead of raising 42501 outside the EXCEPTION block.
+ const b6=await pending();
+ await f.db.exec("CREATE ROLE claim_refresh_committer BYPASSRLS;GRANT USAGE ON SCHEMA sessions TO claim_refresh_committer;GRANT SELECT,UPDATE ON sessions.ingest_batches TO claim_refresh_committer");
+ await f.db.exec("BEGIN;SET LOCAL ROLE claim_refresh_committer");
+ await commit(b6);
+ await f.db.exec("COMMIT");
+ expect((await f.db.query("SELECT state FROM sessions.ingest_batches WHERE batch_id=$1",[b6])).rows).toEqual([{state:"committed"}]);
+ expect(await acc(b6)).toEqual([null,null]);
+ // Shape: the policy is read before the subtransaction, and only the side-table write is inside it, taking its
+ // rows FOR UPDATE SKIP LOCKED (never waits on a row lock held by the backfill or another writer).
+ const src=(await f.db.query<{s:string}>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.ingest_batch_claim_sessions_refresh()'::regprocedure")).rows[0]!.s;
+ const policyAt=src.indexOf("FROM sessions.ingest_claim_sessions_policy"),blockAt=src.indexOf("\n BEGIN\n");
+ expect(policyAt).toBeGreaterThan(0);expect(blockAt).toBeGreaterThan(policyAt);
+ expect(src.slice(blockAt)).not.toContain("ingest_claim_sessions_policy");
+ expect(src.slice(blockAt)).toContain("FOR UPDATE OF s SKIP LOCKED");
+ expect(src.slice(blockAt)).toContain("set_config('lock_timeout','100ms',true)");
 });
 
 test("(5) the CHECK refuses read_enabled without the writer and completion; any write_enabled change clears read_enabled",async()=>{

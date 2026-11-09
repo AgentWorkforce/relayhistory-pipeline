@@ -29,10 +29,12 @@
 -- An AFTER UPDATE trigger on sessions.ingest_batches sets the batch's side rows to NEW.committed_at when the
 -- batch becomes committed (every commit path sets state and committed_at in one UPDATE; committed_at never
 -- changes afterwards, batches are never deleted or uncommitted). Fast-path batches are inserted committed and
--- their claims come after (FK), so the writer reads committed_at directly. The refresh does nothing while
--- write_enabled is false and never raises: any error is swallowed (one subtransaction per enabled commit), and
--- the list's pre-pass evaluates every session that has a NULL accepted_at under a committed batch, so a missed
--- refresh costs time, never a row.
+-- their claims come after (FK), so the writer reads committed_at directly. While write_enabled is false the
+-- refresh is one policy read (no subtransaction). While it is on, it skips side rows another transaction has
+-- locked, waits at most 100ms for any other lock, and swallows every error WHEN OTHERS catches (one
+-- subtransaction per committed batch row); it does not catch a cancel or the caller's statement_timeout. The
+-- list's pre-pass evaluates every session that has a NULL accepted_at under a committed batch, so a skipped or
+-- failed refresh costs time, never a row.
 --
 -- Complexity (gate on): list = the owner's side rows newer than the page's last row (plus one chunk, growing
 -- 4x from 4*limit) and the stages of the sessions they name, plus the owner's NULL-accepted rows of committed
@@ -89,19 +91,40 @@ END $claim_sessions_policy$;
 -- The commit-time accepted_at refresh (owner only; not SECURITY DEFINER, like the 044080 writer: commits run
 -- inside the owner's SECURITY DEFINER ingest functions). Claims of the batch by ingest_claim_attempts_batch_idx,
 -- side rows by their primary key prefix.
+-- The policy is read first, outside any subtransaction (a plain read, no row lock; skipped, refreshing nothing,
+-- when the current role cannot read the owner-only policy, so that read cannot raise 42501; like any statement
+-- it can wait only on DDL holding the policy table): while the writer is off the refresh costs one index probe
+-- and opens no subtransaction. While it is on, only the side-table write sits in the EXCEPTION block, and it
+-- never waits on a row lock: the rows are taken FOR UPDATE SKIP LOCKED (a side row locked by the backfill, a
+-- retirement or another writer is skipped and keeps its value), and any other lock wait (a table lock held by
+-- DDL) is cut at 100ms by a transaction-local lock_timeout. Any error there (55P03 lock timeout, 40P01 deadlock,
+-- anything else WHEN OTHERS catches) is swallowed. A skipped or failed refresh leaves the row NULL (or the value
+-- the backfill writes), which the list's pre-pass evaluates, so it costs time, never a row. lock_timeout is
+-- restored to the caller's value before the block ends (an aborted block restores it itself), so the commit's
+-- later statements keep the caller's setting. Not caught: 57014 (the caller's statement_timeout or a cancel),
+-- which cancels the caller's statement as it would without this trigger.
 CREATE FUNCTION sessions.ingest_batch_claim_sessions_refresh() RETURNS trigger
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $claim_sessions_refresh$
-DECLARE v_enabled boolean;
+DECLARE v_enabled boolean;v_lock_timeout text;
 BEGIN
+ -- A non-owner committer (a role with UPDATE on ingest_batches but no access to the owner-only policy) refreshes
+ -- nothing instead of raising 42501 outside the EXCEPTION block.
+ IF NOT has_table_privilege('sessions.ingest_claim_sessions_policy','SELECT') THEN RETURN NULL;END IF;
+ SELECT p.write_enabled INTO v_enabled FROM sessions.ingest_claim_sessions_policy AS p WHERE p.singleton;
+ IF NOT coalesce(v_enabled,false) THEN RETURN NULL;END IF;
+ v_lock_timeout:=current_setting('lock_timeout');
  BEGIN
-  SELECT p.write_enabled INTO v_enabled FROM sessions.ingest_claim_sessions_policy AS p WHERE p.singleton;
-  IF NOT coalesce(v_enabled,false) THEN RETURN NULL;END IF;
+  PERFORM set_config('lock_timeout','100ms',true);
   UPDATE sessions.ingest_claim_sessions AS cs SET accepted_at=NEW.committed_at
-    FROM sessions.ingest_claim_attempts AS a
-   WHERE a.org_id=NEW.org_id AND a.workspace_id=NEW.workspace_id AND a.origin_id=NEW.origin_id AND a.batch_id=NEW.batch_id
-     AND cs.claim_token=a.claim_token
-     AND cs.org_id=NEW.org_id AND cs.workspace_id=NEW.workspace_id AND cs.origin_id=NEW.origin_id AND cs.batch_id=NEW.batch_id
-     AND cs.accepted_at IS DISTINCT FROM NEW.committed_at;
+    FROM (SELECT s.claim_token,s.source,s.session_id
+            FROM sessions.ingest_claim_attempts AS a
+            JOIN sessions.ingest_claim_sessions AS s ON s.claim_token=a.claim_token
+           WHERE a.org_id=NEW.org_id AND a.workspace_id=NEW.workspace_id AND a.origin_id=NEW.origin_id AND a.batch_id=NEW.batch_id
+             AND s.org_id=NEW.org_id AND s.workspace_id=NEW.workspace_id AND s.origin_id=NEW.origin_id AND s.batch_id=NEW.batch_id
+             AND s.accepted_at IS DISTINCT FROM NEW.committed_at
+           FOR UPDATE OF s SKIP LOCKED) AS k
+   WHERE cs.claim_token=k.claim_token AND cs.source=k.source AND cs.session_id=k.session_id;
+  PERFORM set_config('lock_timeout',v_lock_timeout,true);
  EXCEPTION WHEN OTHERS THEN
   -- Never break a commit. The row stays NULL and the list's pre-pass evaluates its session.
   RETURN NULL;
