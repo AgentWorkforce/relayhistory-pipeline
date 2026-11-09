@@ -2300,13 +2300,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const TK = "upstream:20261105044000_read_api_tokens.sql";
     const CB = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
     const SF = "upstream:20261105044040_buffered_stages_session_first.sql";
+    const SP = "upstream:20261105044050_selfhost_erase_short_summary_provenance.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, AJ]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, AJ]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
@@ -2352,6 +2353,28 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105040000_ingest_lazy_source_tables.down.sql")))?.code).toBe("55000");
     await rollback("20261105046000_analysis_jobs.down.sql");
     expect(await names()).not.toContain("upstream:20261105046000_analysis_jobs.sql");
+    // 20261105044050 (erase clears the short_summary provenance) is the newest: 044040's, 044030's and 044010's downs refuse
+    // (55000) while it is applied, and its own down restores 044010's exact erase (the lock, without the provenance clear)
+    // and 060000's exact retire trigger function (still SECURITY DEFINER, both triggers kept).
+    const eraseSrc = async () => (await db.query<{ s: string | null }>("SELECT prosrc s FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)')")).rows[0]!.s;
+    const retireSrc = async () => (await db.query<{ s: string | null }>("SELECT prosrc s FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_publication_retire_fence()') AND prosecdef")).rows[0]?.s ?? null;
+    const retireTriggers = async () => (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname IN ('ingest_publication_retire_version','ingest_publication_retire_reset') AND tgfoid=to_regprocedure('sessions.ingest_publication_retire_fence()')")).rows[0]!.n;
+    expect(await eraseSrc()).toContain("short_summary_generated_at=NULL");
+    expect(await retireSrc()).toContain("short_summary_generated_at=NULL");
+    expect(await retireTriggers()).toBe(2);
+    expect((await failure(rollback("20261105044040_buffered_stages_session_first.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105044030_ingest_generation_overlap.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105044010_selfhost_erase_lock_fences.down.sql")))?.code).toBe("55000");
+    expect(await names()).toEqual(expect.arrayContaining([SF, V, SL]));
+    await rollback("20261105044050_selfhost_erase_short_summary_provenance.down.sql");
+    expect(await names()).not.toContain(SP);
+    expect(await eraseSrc()).not.toContain("short_summary_generated_at");
+    expect(await eraseSrc()).toContain("ingest_lock_fences(v_org,v_ws,v_user)");
+    expect(await retireSrc()).toContain("UPDATE sessions.session_directory d SET short_summary=NULL,\n   deleted_at=");
+    expect(await retireSrc()).not.toContain("short_summary_generated_at");
+    expect(await retireTriggers()).toBe(2);
+    // Its ledger row is gone, so running it again refuses and changes nothing.
+    expect((await failure(rollback("20261105044050_selfhost_erase_short_summary_provenance.down.sql")))?.code).toBe("55000");
     // 20261105044040 (session-first buffered stages) is then the newest: 044030's down refuses (55000) while it is
     // applied; its own down restores 043700's exact two reader bodies (same ACL, still SECURITY DEFINER) and
     // keeps the records GIN, and a second run refuses (its ledger row is gone).
@@ -2418,7 +2441,6 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await relation("sessions.ingest_seed_captures_org_id_idx")).toBeNull();
     // 20261105044010 (erase takes the fence lock) is then the newest: 043910's down refuses (55000) while it is
     // applied, and its own down restores 043910's exact body, without the lock.
-    const eraseSrc = async () => (await db.query<{ s: string | null }>("SELECT prosrc s FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)')")).rows[0]!.s;
     expect(await eraseSrc()).toContain("ingest_lock_fences(v_org,v_ws,v_user)");
     expect((await failure(rollback("20261105043910_selfhost_session_selection_erase.down.sql")))?.code).toBe("55000");
     await rollback("20261105044010_selfhost_erase_lock_fences.down.sql");
@@ -2820,7 +2842,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
     // Newer than 043900, so the grants' down refuses until they are rolled back,
-    // newest first: every upstream step after 044020 (rollbackLaterThan044020: 046000, 044040, 044030),
+    // newest first: every upstream step after 044020 (rollbackLaterThan044020: 046000, 044050, 044040, 044030),
     // then 044020 (org indexes), 044010 (erase lock), 044000 (tokens), 043910 (erase).
     const orgIndexesDown = readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8");
     const lockDown = readFileSync(join(root, "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql"), "utf8");
