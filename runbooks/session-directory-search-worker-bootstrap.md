@@ -182,6 +182,7 @@ never infers anything from the hostname. An invalid profile writes nothing anywh
 | `HOOPDB_RUNTIME_ROLE_LOGIN`     | required in `selfhosted`, `cloudsql`, `supabase` and `rds` (`runtime_role_login_unset`): `true` if the runtime role logs in itself, `false` if the services log in as a workload role that is a member of it.                                                                                                            |
 | `HOOPDB_RUNTIME_WORKLOAD_ROLE`  | optional: the one role allowed to be a member of the runtime role (without ADMIN OPTION). Refused in `rds` (`db_profile_invalid`): its grantor would be the non-superuser master.                                                                                                                                                                                                                         |
 | `HOOPDB_FUNCTION_BOUNDARY_MODE` | required in `selfhosted`, `cloudsql`, `supabase` and `rds`: `global-default-revoke`, or `event-trigger` (supabase only; refused elsewhere with `function_boundary_mode_unsupported`). The catalog must prove the selected control, see "Function boundary". The old `HOOPDB_FUNCTION_BOUNDARY_APPROVED` name is refused. |
+| `HOOPDB_ALLOW_BLOCKING_INDEX_BUILD` | optional, default off, strict `true`/`false`: lets an index migration (20261105044020) run a blocking `CREATE INDEX` on a populated table. Off: an absent index on a non-empty table is refused (55000); prebuild it with `CREATE INDEX CONCURRENTLY` (claim-bootstrap index packet, PR #407) and the migration adopts it. Bound per migration transaction as `hoopdb.allow_blocking_index_build`. |
 
 **Runtime role: dedicated, exact least privilege.** It is checked under the migrator's
 advisory lock before any write (before the ledger and marker tables are created, before
@@ -320,7 +321,8 @@ lock and before any write, the migrator refuses:
 
 - `mixed_migration_authority`: `supabase_migrations.schema_migrations` (the
   `supabase db push` history) records any of these migrations, or exists but can't be
-  read.
+  read. For every selected rename alias, the check covers both the original and the
+  current version.
 - `ledger_unknown_step`: the ledger names a schema step this image doesn't have.
 - `ledger_gap`: the ledger is not one contiguous prefix of the ordered steps (upstream,
   then 96bulls). A first 96bulls row with no upstream rows is refused, never backfilled.
@@ -401,6 +403,8 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105043900_session_consumer_function_grants.sql` | twelve search_consumer_runtime EXECUTEs (composed writer path) |
 | `upstream:20261105043910_selfhost_session_selection_erase.sql` | function sessions.ingest_selfhost_set_session_uploads |
 | `upstream:20261105044000_read_api_tokens.sql` | table sessions.read_api_tokens |
+| `upstream:20261105044010_selfhost_erase_lock_fences.sql` | replacement: ingest_selfhost_set_session_uploads takes the user's fence lock before reading ownership |
+| `upstream:20261105044020_claim_bootstrap_org_indexes.sql` | the eight claim-bootstrap `<table>_org_id_idx` indexes, exact definition, valid and ready (an operator-built exact, valid set is adopted, not refused: `ADOPTABLE_INDEXES`) |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
@@ -942,6 +946,22 @@ left unchanged, while a fresh database executes and records
 Both hashes, the migration name and the fact that this is the sole alias are pinned by a
 test. Any third checksum or any other migration name fails closed. The alias is emitted
 in migration logs and `--activation-check`; generation remains based on the current file.
+
+Renamed migrations are adopted only through `MIGRATION_RENAME_ALIASES` (`migrate-guards.ts`),
+never by editing `sessions.__96bulls_migrations`: an original-name row is read as its release
+name in memory, only when both pinned shas match, logged and shown in the release plan and
+`--activation-check`; any other original name or sha still refuses as `ledger_unknown_step`.
+The ingest row is adopted only while `20261104040000_ingest_s3_proof_seed.sql` (which revokes
+the original's seed grants) is planned with its pinned sha, else `ledger_alias_repair_missing`.
+A ledger that records both the original and the release name refuses as
+`ledger_alias_collision`, whatever the shas. A release-name row that holds the original sha is
+hand-edited history: the original sha is accepted only through adoption, so it refuses as
+`migration_changed`. The migrator and readiness (`schemaVerdict`) call the same
+`resolveRenamedLedger`, so they reach the same verdict. The migrator refuses before any write;
+readiness reports a refused alias as `schema_pending`. CLI authority checks cover both the
+original and the current version of every selected alias.
+The original file bytes and the released ledger are pinned as test fixtures
+(`src/hoopdb/__tests__/fixtures/released-migration-history/`).
 
 ### Auth verifier append-only upgrade and membership
 

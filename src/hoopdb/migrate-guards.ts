@@ -7,7 +7,11 @@
  */
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { MIGRATION_SENTINELS } from "./migration-sentinels.ts";
+import {
+  ADOPTABLE_INDEX_SQL,
+  ADOPTABLE_INDEXES,
+  MIGRATION_SENTINELS,
+} from "./migration-sentinels.ts";
 
 export interface GuardClient {
   query<R = Record<string, unknown>>(
@@ -41,6 +45,47 @@ export const MIGRATION_CHECKSUM_ALIASES = [
   },
 ] as const;
 
+// Two migrations were renamed append-only on 2026-11-03 (09666e18) to sort after the
+// upstream steps that were released before them. An existing self-host HoopDb that
+// applied them under their original names would otherwise stop at
+// ledger_unknown_step. Each original ledger row is adopted in memory (never written) as
+// its release name only when all four values match: the original name with its last
+// released sha, and the release file with exactly this sha. Only adoption accepts
+// `ledger_sha`: a row physically stored under the release name with the original sha is
+// hand-edited history and fails closed (migration_changed), as does any other sha. Bodies are statement-for-
+// statement equal apart from the provenance header, except that the original ingest
+// ledger also granted the seed RPCs to bulls96_session_ingest_seeder, which
+// 20261104040000_ingest_s3_proof_seed (always on this image, after both) REVOKEs ALL,
+// so the end schema is identical. That REVOKE is the forward repair the ingest row
+// depends on: it is adopted only while `repair` is in the plan with exactly
+// `repair_sha` (ported from #396). Earlier drafts of the original file (other shas) are
+// not adopted, and any future edit of a release or repair file fails closed.
+// The original file bytes are pinned by the fixtures in
+// __tests__/fixtures/released-migration-history/.
+export const MIGRATION_RENAME_ALIASES = [
+  {
+    ledger_name: "upstream:20261103010000_session_directory_event_metadata.sql",
+    ledger_sha:
+      "fe07b2ef2b3e18634b024f35f4272bee9100ea39d0383ce33e8c6d969b77a476",
+    migration: "upstream:20261104021000_session_directory_event_metadata.sql",
+    accepted_as_alias_of:
+      "4fb1337524c8335dd5bd507f60ea896a41a031ace0c7a2da8a8f7dedc1245e01",
+  },
+  {
+    ledger_name: "upstream:20261102010000_session_ingest_ledger.sql",
+    ledger_sha:
+      "21a0be7dc69afa7d3b1d1b27e31fee9778c1a6a0c3b20246e3029fa2f1356fa6",
+    migration: "upstream:20261104022000_session_ingest_ledger.sql",
+    accepted_as_alias_of:
+      "69f4157ea3a615344aa1b383fc6af7405c1ff9f1568e7c8ab97e58fbc78fe1b5",
+    repair: "upstream:20261104040000_ingest_s3_proof_seed.sql",
+    repair_sha:
+      "18ea54ed1aa50e5ea44bab01a65177e2fc9c92919ac23b973f820e8af8b75b86",
+  },
+] as const;
+
+export type MigrationAlias = (typeof MIGRATION_CHECKSUM_ALIASES)[number];
+
 export function migrationChecksumMatches(
   name: string,
   recorded: string,
@@ -48,12 +93,7 @@ export function migrationChecksumMatches(
 ): boolean {
   return (
     recorded === actual ||
-    MIGRATION_CHECKSUM_ALIASES.some(
-      (a) =>
-        a.migration === name &&
-        a.ledger_sha === recorded &&
-        a.accepted_as_alias_of === actual,
-    )
+    migrationChecksumAlias(name, recorded, actual) !== undefined
   );
 }
 
@@ -61,13 +101,107 @@ export function migrationChecksumAlias(
   name: string,
   recorded: string,
   actual: string,
-): (typeof MIGRATION_CHECKSUM_ALIASES)[number] | undefined {
+): MigrationAlias | undefined {
+  // Rename aliases are deliberately absent: their original sha is accepted only by
+  // resolveRenamedLedger, for a row recorded under the original name only.
   return MIGRATION_CHECKSUM_ALIASES.find(
     (a) =>
       a.migration === name &&
       a.ledger_sha === recorded &&
       a.accepted_as_alias_of === actual,
   );
+}
+
+/**
+ * True when `alias` pins a forward repair that is not in the plan with its exact sha
+ * (`fileSha` returns undefined for a step that is not planned).
+ */
+export function renameAliasRepairMissing(
+  alias: (typeof MIGRATION_RENAME_ALIASES)[number],
+  fileSha: (name: string) => string | undefined,
+): boolean {
+  return "repair" in alias && fileSha(alias.repair) !== alias.repair_sha;
+}
+
+export type RenameAlias = (typeof MIGRATION_RENAME_ALIASES)[number];
+
+/** Why one MIGRATION_RENAME_ALIASES entry could not be adopted; the migrator throws it. */
+export interface RenameRefusal {
+  code:
+    | "ledger_alias_collision"
+    | "ledger_unknown_step"
+    | "ledger_alias_repair_missing"
+    | "migration_changed";
+  alias: RenameAlias;
+  message: string;
+}
+
+/**
+ * The one rename-alias verdict, shared by the migrator (migrationPreflight) and
+ * readiness (schemaVerdict), so both reach the same answer from the same physical
+ * ledger. Pure: `physical` is never modified and nothing is written.
+ *
+ * For each MIGRATION_RENAME_ALIASES entry (skipped when the plan itself contains the
+ * original name, i.e. an old image's plan):
+ *  - only the original name, with exactly `ledger_sha`, the release file planned with
+ *    exactly `accepted_as_alias_of` and the pinned repair (if any) planned with exactly
+ *    `repair_sha`: adopted. The effective ledger holds the release name with the release
+ *    file's sha, so the checksum guard needs no rename lookup afterwards;
+ *  - both the original and the release name recorded: ledger_alias_collision, whatever
+ *    the shas (never a supported state);
+ *  - only the original name with another sha, or a release file that is not planned
+ *    with exactly `accepted_as_alias_of`: ledger_unknown_step;
+ *  - an exact original row whose pinned repair is missing: ledger_alias_repair_missing;
+ *  - only the release name, physically carrying the original `ledger_sha` (hand-edited
+ *    history), or any other sha the checksum guard would not accept for the planned
+ *    release file: migration_changed.
+ * A refused alias's release name is absent from `effective`, so readiness reports it
+ * as not applied; the migrator throws the first refusal before any write.
+ * `fileSha` returns the planned step's file sha256, or undefined if it is not planned.
+ */
+export function resolveRenamedLedger(
+  physical: ReadonlyMap<string, string>,
+  fileSha: (name: string) => string | undefined,
+): { effective: Map<string, string>; adopted: RenameAlias[]; refusals: RenameRefusal[] } {
+  const effective = new Map(physical);
+  const adopted: RenameAlias[] = [];
+  const refusals: RenameRefusal[] = [];
+  const refuse = (alias: RenameAlias, code: RenameRefusal["code"], message: string) => {
+    effective.delete(alias.migration);
+    refusals.push({ code, alias, message });
+  };
+  for (const a of MIGRATION_RENAME_ALIASES) {
+    if (fileSha(a.ledger_name) !== undefined) continue;
+    const original = physical.get(a.ledger_name);
+    const release = physical.get(a.migration);
+    if (original !== undefined && release !== undefined)
+      refuse(a, "ledger_alias_collision",
+        `the ledger records both ${a.ledger_name} and its release name ${a.migration}; nothing is marked, see the runbook decision point`);
+    else if (release !== undefined) {
+      const planned = fileSha(a.migration);
+      if (release === a.ledger_sha)
+        refuse(a, "migration_changed",
+          `migration ${a.migration} is recorded with the checksum of ${a.ledger_name}; that is hand-edited history, nothing is marked, see the runbook decision point`);
+      else if (planned !== undefined && !migrationChecksumMatches(a.migration, release, planned))
+        // The migrator's checksum guard refuses this row too; refusing it here keeps
+        // readiness (which reads only `effective`) in agreement with the migrator.
+        refuse(a, "migration_changed",
+          `migration ${a.migration} changed after it was applied; add a new migration instead`);
+    } else if (original !== undefined) {
+      if (original !== a.ledger_sha || fileSha(a.migration) !== a.accepted_as_alias_of)
+        refuse(a, "ledger_unknown_step",
+          `the ledger records ${a.ledger_name}, which this image doesn't have or adopt; nothing is marked, see the runbook decision point`);
+      else if (renameAliasRepairMissing(a, fileSha))
+        refuse(a, "ledger_alias_repair_missing",
+          `released migration ${a.ledger_name} requires its exact forward repair`);
+      else {
+        effective.delete(a.ledger_name);
+        effective.set(a.migration, a.accepted_as_alias_of);
+        adopted.push(a);
+      }
+    }
+  }
+  return { effective, adopted, refusals };
 }
 
 // ---------------------------------------------------------------------------
@@ -986,6 +1120,32 @@ async function exists(
 }
 
 /**
+ * The reviewed adoptable-index allowance (ADOPTABLE_INDEXES): true only when `step`
+ * declares index `name` adoptable, the step's whole inventory is its declared indexes,
+ * and the live index is the exact declared one (see ADOPTABLE_INDEX_SQL). Fails closed.
+ */
+async function adoptableIndex(
+  client: GuardClient,
+  step: string,
+  inventory: InventoryObject[],
+  name: string,
+): Promise<boolean> {
+  const declared = ADOPTABLE_INDEXES[step];
+  const x = declared?.find((d) => d.name === name);
+  if (!declared || !x) return false;
+  if (!inventory.every((o) => o.kind === "index" && declared.some((d) => d.name === o.name)))
+    return false;
+  try {
+    return Boolean(
+      (await client.query<{ e: boolean }>(ADOPTABLE_INDEX_SQL, [x.name, x.table, x.def]))
+        .rows[0]?.e,
+    );
+  } catch {
+    return false; // can't look: fail closed, not adoptable
+  }
+}
+
+/**
  * Refuses, before any write, unless the database is either empty of this migration
  * set or exactly a ledgered prefix of each migration lane. Upstream and 96Bulls are
  * independent append-only lanes: a later upstream release must remain deployable after
@@ -994,6 +1154,8 @@ async function exists(
  *   ledger_gap            one lane isn't a contiguous prefix of its ordered steps;
  *   migration_changed     a ledgered step's file changed;
  *   unledgered_schema     an object that an unledgered step creates already exists.
+ * The one exception is ADOPTABLE_INDEXES: a declared index built out of band, exact,
+ * valid and ready, is accepted for its step (the step adopts it).
  * Nothing is ever imported into, or marked in, the ledger.
  */
 export async function sequencePreflight(
@@ -1060,11 +1222,16 @@ export async function sequencePreflight(
   const found: string[] = [];
   for (let i = 0; i < names.length; i++) {
     if (ledger.has(names[i]!)) continue;
-    for (const o of inventoryOf(sql[i]!)) {
+    const inventory = inventoryOf(sql[i]!);
+    for (const o of inventory) {
       const id = key(o);
       if (seen.has(id)) continue;
       seen.add(id);
-      if (await exists(client, o))
+      if (
+        (await exists(client, o)) &&
+        !(o.kind === "index" &&
+          (await adoptableIndex(client, names[i]!, inventory, o.name)))
+      )
         found.push(
           `${o.kind} ${o.name}${o.on ? ` on ${o.on}` : ""} (${names[i]})`,
         );
@@ -1087,6 +1254,15 @@ export async function sequencePreflight(
       );
     } catch {
       applied = true; // can't look: fail closed, as if the step had run
+    }
+    // An adoptable step's sentinel is its declared indexes: accepted only when every one is adoptable.
+    const declared = ADOPTABLE_INDEXES[names[i]!];
+    if (applied && declared?.length) {
+      const inventory = inventoryOf(sql[i]!);
+      let all = true;
+      for (const d of declared)
+        if (!(await adoptableIndex(client, names[i]!, inventory, d.name))) all = false;
+      if (all) applied = false;
     }
     if (applied) found.push(`sentinel ${sentinel.evidence} (${names[i]})`);
   }

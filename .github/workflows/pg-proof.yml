@@ -9,6 +9,11 @@ on:
     branches: [main]
 permissions:
   contents: read
+concurrency:
+  # One live run per pull request: a new push cancels the previous head's run.
+  # Pushes to main (and any non-PR event) are grouped by sha and never cancelled.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   real-postgres:
     name: real PostgreSQL ${{ matrix.pg }}
@@ -225,6 +230,16 @@ jobs:
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
         run: bun test --timeout 300000 src/session-ingest/__tests__/claim-clock-lock.postgres.test.ts
+      - name: Prove the self-host erase serializes with a concurrent claim on the fence lock (044010)
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: |
+          # pg-proof checks out the PR head; heads predating this step lack the test. Remove once no open PR predates it.
+          if [ ! -f src/session-ingest/__tests__/selfhost-erase-lock.postgres.test.ts ]; then
+            echo "::warning title=pg-proof::selfhost-erase-lock.postgres.test.ts absent at this head; forward-merge main to run the erase lock proof"
+            exit 0
+          fi
+          bun test --timeout 300000 src/session-ingest/__tests__/selfhost-erase-lock.postgres.test.ts
       - name: Prove the acquisition installer login refuses a superuser SET SESSION AUTHORIZATION (pg_stat_activity usename)
         env:
           ACQUISITION_LOGIN_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
@@ -263,7 +278,7 @@ jobs:
         run: docker rm -f "$PG_LOCK_NAME" || true
   acquisition-owner-postgres:
     name: acquisition owner contract PostgreSQL ${{ matrix.pg }}
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -308,7 +323,7 @@ jobs:
     # frontier-plan capture on real PostgreSQL. Both describe.skipIf() without their
     # connection env, so each step also fails when anything was skipped.
     name: ingest publication and frontier PostgreSQL ${{ matrix.pg }}
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false

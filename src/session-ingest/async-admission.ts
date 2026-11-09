@@ -31,6 +31,7 @@ import { assertTenantSegment, liveMachineId } from "./writer.ts";
 import type { LedgerTenant } from "./ledger.ts";
 import { DELIVERY_KINDS, DeliveryError, MAX_DELIVERY_RECORDS } from "./vendor/delivery/delivery-contracts.ts";
 import { digest, type PreparedDelivery, type PreparedDeliveryRecord } from "./vendor/delivery/prepare.ts";
+import { TURN_KIND, TURN_ORIGIN_ID } from "./turns.ts";
 
 /** INGEST_ASYNC_ADMISSION. off: today's synchronous path only, and admission messages wait.
  * on: async ACK for callers that opt in; journal written; consumer admits.
@@ -175,7 +176,7 @@ function inboxRecord(id: unknown, line: unknown, originId: string): PreparedDeli
   const [record_id, revision_id, revision, digest, kind, source, session_id, operation] = id as unknown[];
   const payload = (line as Record<string, unknown>).p;
   if (!ident(record_id) || !ident(revision_id) || typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1 ||
-      typeof digest !== "string" || !HEX64.test(digest) || !DELIVERY_KINDS.includes(kind as never) || !ident(source) ||
+      typeof digest !== "string" || !HEX64.test(digest) || !(DELIVERY_KINDS.includes(kind as never) || (kind === TURN_KIND && originId === TURN_ORIGIN_ID)) || !ident(source) ||
       !(session_id === null || ident(session_id)) ||
       !((operation === "delete" && payload === null) || (operation === "upsert" && isObject(payload)))) bad();
   const record = { schema_version: 1, origin_id: originId, record_id, revision_id, revision, kind, source, session_id, operation, payload, digest } as unknown as PreparedDeliveryRecord;

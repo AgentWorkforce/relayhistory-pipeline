@@ -28,6 +28,7 @@ const EXPECTED: Record<string, string[]> = {
   "session-pipeline-consumer": ["run", "/app/src/session-pipeline/consumer-service.ts"],
   "session-pipeline-consumer-bootstrap": ["run", "/app/src/session-pipeline/consumer-bootstrap.ts"],
   acquisition: ["run", "/app/src/acquisition/main.ts"],
+  "session-erase-bytes": ["run", "/app/src/session-erase/selfhost-eraser-main.ts"],
 };
 
 let bin = "";
