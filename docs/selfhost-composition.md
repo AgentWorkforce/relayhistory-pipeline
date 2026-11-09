@@ -318,6 +318,12 @@ transaction as the directory events; a pass older than the stored source
 version is a no-op, and the erase path deletes the session's facts. Default
 off; sessions ingested before the flag have no facts (bootstrap is a later PR).
 Sessions erased while the flag is off keep any facts written earlier.
+Migration `045020` grants the four writers to `search_consumer_runtime` whatever
+the flag says, so turning the flag on needs no extra grants. The consumer's live
+sessions-function gate (`SESSIONS_FUNCTION_GATE_SQL`) accepts those writers only
+when it runs as `search_consumer_runtime` (`CONSUMER_RUNTIME_FUNCTIONS` in
+`src/hoopdb/migrate-guards.ts`); any other role that can execute them, or
+PUBLIC, still closes the gate.
 
 ### session-ingest admission mode (config contract)
 

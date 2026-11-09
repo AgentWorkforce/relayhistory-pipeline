@@ -70,6 +70,12 @@ import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import type { TenantRunner } from "../../session-read-api/liveness.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 import { postgresOutputFactsStore } from "../output-facts-store.ts";
+import { SESSIONS_FUNCTION_GATE_SQL } from "../../shared/db.ts";
+import {
+  CONSUMER_RUNTIME_FUNCTIONS,
+  CONSUMER_RUNTIME_FUNCTIONS_ROLE,
+  RUNTIME_APPLICATION_FUNCTIONS,
+} from "../../hoopdb/migrate-guards.ts";
 
 const SECRET = JSON.stringify({ hoopdb_url: "postgresql://owner:secret@postgres:5432/hoopdb" });
 
@@ -906,6 +912,72 @@ describe("writer role SQL (PGlite, real files, real migrations)", () => {
       expect(seen.rows[0]).toMatchObject({ n: 0 });
       // No password assertion: the password is set separately by the operator,
       // and PGlite stores an 8-char placeholder for every role regardless.
+    } finally {
+      await pg.close();
+    }
+  }, 180_000);
+
+  test("live sessions-function gate: passes as the consumer login after every migration and the role SQL; the writer exemption is the consumer's only", async () => {
+    const { pg } = await installed();
+    // The gate as `role` (SET ROLE, as runWorker's readiness check sees current_user): null on pass, else code + message.
+    const gate = async (role: string) => {
+      await pg.exec(`SET ROLE ${role}`);
+      try {
+        await pg.exec(SESSIONS_FUNCTION_GATE_SQL);
+        return null;
+      } catch (error) {
+        const e = error as { code?: string; message?: string };
+        return { code: e.code, message: e.message ?? "" };
+      } finally {
+        await pg.exec(`RESET ROLE`);
+      }
+    };
+    try {
+      await pg.exec(stripPsqlMeta(readFileSync(ROLE_SQL, "utf8")));
+      await pg.exec(stripPsqlMeta(readFileSync(VERIFY_SQL, "utf8")));
+      expect(CONSUMER_RUNTIME_FUNCTIONS_ROLE).toBe(CONSUMER_RUNTIME_ROLE);
+      // The consumer really holds EXECUTE on all four writers (the 045020 grants), and the gate passes.
+      for (const fn of CONSUMER_RUNTIME_FUNCTIONS) {
+        const r = await pg.query<{ ok: boolean }>(`SELECT has_function_privilege('search_consumer_runtime', $1::regprocedure, 'EXECUTE') AS ok`, [fn]);
+        expect(r.rows[0]?.ok, fn).toBe(true);
+      }
+      expect(await gate("search_consumer_runtime")).toBeNull();
+      // A different login granted one writer directly is still refused (55000) and named.
+      await pg.exec(`CREATE ROLE gate_probe_direct NOLOGIN; GRANT USAGE ON SCHEMA sessions TO gate_probe_direct;
+        GRANT EXECUTE ON FUNCTION sessions.output_facts_state(text,text,text,text[],text) TO gate_probe_direct`);
+      const direct = await gate("gate_probe_direct");
+      expect(direct?.code).toBe("55000");
+      expect(direct?.message).toContain("sessions.output_facts_state(");
+      // So is a role that inherits the consumer's grants through membership: the exemption is keyed
+      // on current_user, not on the privilege.
+      await pg.exec(`CREATE ROLE gate_probe_member NOLOGIN; GRANT search_consumer_runtime TO gate_probe_member`);
+      const member = await gate("gate_probe_member");
+      expect(member?.code).toBe("55000");
+      for (const fn of ["output_facts_erase", "output_facts_reconcile", "output_facts_record_state", "output_facts_state"])
+        expect(member?.message).toContain(`sessions.${fn}(`);
+      // PUBLIC EXECUTE on a writer is refused even for the consumer itself.
+      await pg.exec(`GRANT EXECUTE ON FUNCTION sessions.output_facts_erase(text,text,text,text[]) TO PUBLIC`);
+      const pub = await gate("search_consumer_runtime");
+      expect(pub?.code).toBe("55000");
+      expect(pub?.message).toContain("sessions.output_facts_erase(");
+      await pg.exec(`REVOKE EXECUTE ON FUNCTION sessions.output_facts_erase(text,text,text,text[]) FROM PUBLIC`);
+      expect(await gate("search_consumer_runtime")).toBeNull();
+      // Any other sessions function granted to the consumer outside both lists is still refused.
+      const other = (
+        await pg.query<{ fn: string }>(
+          `SELECT p.oid::regprocedure::text AS fn FROM pg_proc p
+            WHERE p.pronamespace = 'sessions'::regnamespace AND p.prokind = 'f'
+              AND NOT has_function_privilege('search_consumer_runtime', p.oid, 'EXECUTE')
+            ORDER BY 1`,
+        )
+      ).rows.map((r) => r.fn).find(
+        (fn) => !(RUNTIME_APPLICATION_FUNCTIONS as readonly string[]).includes(fn) && !(CONSUMER_RUNTIME_FUNCTIONS as readonly string[]).includes(fn),
+      )!;
+      expect(other).toBeDefined();
+      await pg.query(`GRANT EXECUTE ON FUNCTION ${other} TO search_consumer_runtime`);
+      const extra = await gate("search_consumer_runtime");
+      expect(extra?.code).toBe("55000");
+      expect(extra?.message).toContain(other);
     } finally {
       await pg.close();
     }

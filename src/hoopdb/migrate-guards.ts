@@ -383,6 +383,22 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
 ] as const;
 
 /**
+ * Self-host output-facts writers (migration 045020) granted EXECUTE to the consumer login
+ * `search_consumer_runtime` only. The live sessions-function gate (db.ts
+ * SESSIONS_FUNCTION_GATE_SQL) accepts them when, and only when, current_user is that role.
+ * Deliberately NOT part of RUNTIME_APPLICATION_FUNCTIONS: that list feeds
+ * installRuntimeApplicationAcl, which would grant them to the general runtime role. Keep in
+ * step with the allowlist in supabase/bootstrap/session_consumer_role_verify.sql.
+ */
+export const CONSUMER_RUNTIME_FUNCTIONS_ROLE = "search_consumer_runtime";
+export const CONSUMER_RUNTIME_FUNCTIONS = [
+  "sessions.output_facts_erase(text,text,text,text[])",
+  "sessions.output_facts_reconcile(text,text,text,text[],text,jsonb,jsonb,boolean,bigint)",
+  "sessions.output_facts_record_state(text,text,text,text[],text,boolean,timestamp with time zone,timestamp with time zone,bigint,timestamp with time zone)",
+  "sessions.output_facts_state(text,text,text,text[],text)",
+] as const;
+
+/**
  * The pods use one reviewed, multi-tenant backend identity. This policy is deliberately
  * all-row for that identity: tenant isolation for user-facing requests remains in the
  * authenticated RPCs and application filters, while this role is constrained by exact
