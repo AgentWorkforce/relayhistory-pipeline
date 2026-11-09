@@ -43,8 +43,12 @@ function boundary lane `buffered-stages-session-first`).
 * The catch for A: the 044040 catalog sentinel (`src/hoopdb/migration-sentinels.ts`, the
   `BUFFERED_STAGES_SESSION_FIRST_STEP` entry) is the replaced BODIES, `count(*) = 2` over both readers with
   the `count(*) OVER (PARTITION BY rc.stage_token, rc.ord)` text, and for a step that replaces functions it
-  is never overridden by index adoption (`src/hoopdb/migrate-guards.ts:1415-1418`). If both bodies are
-  replaced out of band, the next migrate refuses with `unledgered_schema` (`migrate-guards.ts:1427-1430`).
+  is never overridden by index adoption (`src/hoopdb/migrate-guards.ts:1417-1422`). If both bodies are
+  replaced out of band, the next migrate refuses with `unledgered_schema` (`migrate-guards.ts:1432-1438`),
+  UNLESS both live bodies are byte-identical to this file's `$buffered_sessions$` / `$buffered_stages$`
+  bodies with plpgsql, SECURITY DEFINER, STABLE, the file's `search_path` proconfig and the migrating
+  role as owner (exact-body adoption, `migrate-guards.ts:1429-1431`, `exactBodiesLive`; declared in
+  `migration-sentinels.ts` `exactBodies`). Then the step runs normally and writes its ledger row.
   Replacing ONLY `buffered_session_stages_for` leaves the sentinel false (1 of 2), so B later applies 044040
   normally (CREATE OR REPLACE is idempotent for the stages body).
 
@@ -99,8 +103,8 @@ and nothing else; no `hoopdb.*` GUC is needed (the trigger body reads none: the 
 calls, `supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql:69,82,101`, are in the installer,
 not in the trigger body at `:102-445`). The session `search_path` does not matter (the name is
 schema-qualified, the return types are built-ins, the function carries its own `SET search_path`).
-Do NOT replace `buffered_sessions_for` out of band (that would trip `unledgered_schema` at the next migrate,
-see above).
+Do NOT replace `buffered_sessions_for` out of band. A byte-identical apply of both is adopted (see above),
+but any difference in either body refuses the next migrate with `unledgered_schema`.
 
 Why the boundary event trigger admits it (supabase, `hoopdb_sessions_function_boundary`, ddl_command_end;
 CREATE OR REPLACE reports the tag `CREATE FUNCTION`):
@@ -142,8 +146,12 @@ SELECT s.stage_token
    AND o.org_id = '<org>' AND o.workspace_id = '<ws>' AND o.user_id = '<user>' AND o.state = 'buffered';
 ```
 
-The output must name `ingest_claim_attempts_records_gin_idx` (no ANALYZE option: nothing is executed). Then
-re-run the timeout canary; the existing G2 proofs are unchanged and valid (no generation move).
+The output must name `ingest_claim_attempts_records_gin_idx` (no ANALYZE option: nothing is executed). This
+EXPLAIN does NOT certify the function's own cached plan (PL/pgSQL switches to a generic plan after five
+executions in a session). The certification is the timed full call: the timeout canary, plus the pg-proof
+latency test, which calls `buffered_session_stages_for` cold and then warm 11 more times in one session, with
+the default plan cache and again with `plan_cache_mode = force_generic_plan`, and asserts warm p50/p95 <
+1,000 ms. Then re-run the timeout canary; the existing G2 proofs are unchanged and valid (no generation move).
 
 A rollback: CREATE OR REPLACE `buffered_session_stages_for` with its 043700 body (the stages statement in
 the 044040 down file). The index stays (harmless; B adopts it).
@@ -190,6 +198,9 @@ The rollback is itself a generation-neutral body change (no file is added), but 
 * PGlite (2,000 to 2,001 batches, 200 sessions): stages 39-64 ms per session; the 043700 body 63 ms at 500.
   List: 1.8 s at 2,000 batches (0.34 s at 500) against 155 s for the 043700 body at 250 batches.
 * Real PostgreSQL: `src/session-read-api/__tests__/buffered-stages-latency.postgres.test.ts` (pg-proof,
-  brief-postgres job): up to 167,000 batches for one user over 1,000 sessions, asserts the GIN in the
-  `stg` plan and a stages call under 1,000 ms, and logs the list time. It has not run on this host (no
-  PostgreSQL); see the CI log for the numbers.
+  brief-postgres job): up to 167,000 batches for one user over 1,000 sessions. It asserts the GIN in the
+  `stg` plan. For the FULL `buffered_session_stages_for` call it runs a fresh session: 1 cold call, then
+  11 warm calls (default plan cache, and again with `force_generic_plan`), and asserts warm p50 and p95 <
+  1,000 ms. It logs the same cold/p50/p95 for `buffered_sessions_for`, not asserted: the list is linear
+  in the backlog. Real-PG numbers: NOT YET MEASURED. There is no PostgreSQL on the authoring host; take
+  them from the pg-proof brief-postgres log (`[044040 latency]` lines) of the merged head.

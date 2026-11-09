@@ -87,22 +87,55 @@ describe.skipIf(!url)("044040 buffered stages latency on actual PostgreSQL", () 
   const owner = async (fn: string, p: unknown) =>
     (await db.query(`SELECT sessions.${fn}($1::jsonb) AS r`, [JSON.stringify(p)])).rows[0];
 
-  async function asReader<R extends pg.QueryResultRow>(q: string, params: unknown[]): Promise<R[]> {
-    await db.query("BEGIN READ ONLY");
+  let targetUrl = "";
+  async function asReader<R extends pg.QueryResultRow>(q: string, params: unknown[], conn: pg.Client = db): Promise<R[]> {
+    await conn.query("BEGIN READ ONLY");
     try {
-      await db.query("SELECT set_config('bulls96_read.org_id',$1,true),set_config('bulls96_read.workspace_id',$2,true),set_config('bulls96_read.user_id',$3,true)",
+      await conn.query("SELECT set_config('bulls96_read.org_id',$1,true),set_config('bulls96_read.workspace_id',$2,true),set_config('bulls96_read.user_id',$3,true)",
         [TENANT.orgId, TENANT.workspaceId, TENANT.userId]);
-      await db.query("SET LOCAL ROLE bulls96_read_api");
-      const r = await db.query<R>(q, params);
-      await db.query("COMMIT");
+      await conn.query("SET LOCAL ROLE bulls96_read_api");
+      const r = await conn.query<R>(q, params);
+      await conn.query("COMMIT");
       return r.rows;
     } catch (error) {
-      await db.query("ROLLBACK").catch(() => undefined);
+      await conn.query("ROLLBACK").catch(() => undefined);
       throw error;
     }
   }
   // No head: the G2 proof below is written with no_head.
   const head = [epoch, null, null, null, null, false, baseline];
+  const pct = (xs: number[], p: number) => {
+    const a = [...xs].sort((x, y) => x - y);
+    return a[Math.min(a.length - 1, Math.ceil((p / 100) * a.length) - 1)]!;
+  };
+  /**
+   * The full function call, timed in ONE fresh session (empty PL/pgSQL plan cache): call 1 is cold; the
+   * rest are warm, and past the fifth execution PL/pgSQL's saved plans may switch to the generic plan
+   * (the cached plan a long-lived production connection keeps). `generic` forces the generic plan for
+   * the whole series. Stops early once budgetMs is spent; returns cold, the warm samples and the last rows.
+   */
+  async function series<R extends pg.QueryResultRow>(q: string, params: unknown[], calls: number, generic: boolean, budgetMs: number) {
+    const conn = new pg.Client({ connectionString: targetUrl });
+    await conn.connect();
+    try {
+      await conn.query("SET TIME ZONE 'UTC'");
+      if (generic) await conn.query("SET plan_cache_mode = force_generic_plan");
+      const t0 = performance.now();
+      const warm: number[] = [];
+      let cold = 0;
+      let rows: R[] = [];
+      for (let i = 0; i < calls && (i === 0 || performance.now() - t0 < budgetMs); i++) {
+        const t = performance.now();
+        rows = await asReader<R>(q, params, conn);
+        const ms = performance.now() - t;
+        if (i === 0) cold = ms; else warm.push(ms);
+      }
+      return { cold: Math.round(cold), warm, p50: warm.length ? Math.round(pct(warm, 50)) : NaN,
+        p95: warm.length ? Math.round(pct(warm, 95)) : NaN, rows };
+    } finally {
+      await conn.end();
+    }
+  }
 
   beforeAll(async () => {
     const configured = new URL(url!);
@@ -114,6 +147,7 @@ describe.skipIf(!url)("044040 buffered stages latency on actual PostgreSQL", () 
     await admin.query(`CREATE DATABASE ${name}`);
     const target = new URL(url!);
     target.pathname = `/${name}`;
+    targetUrl = target.toString();
     db = new pg.Client({ connectionString: target.toString() });
     await db.connect();
     await db.query("SET TIME ZONE 'UTC'; CREATE SCHEMA sessions; CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin");
@@ -210,31 +244,33 @@ describe.skipIf(!url)("044040 buffered stages latency on actual PostgreSQL", () 
     expect(plan).toContain(GIN);
   });
 
-  test("one session's stages answer in under 1,000 ms at the backlog", async () => {
-    for (const session of ["sess-7", "sess-0"]) {
-      const want = Array.from({ length: n }, (_, i) => i + 1).filter((i) => i % SESSIONS === Number(session.slice(5))).length;
-      // First call warms the plan cache and buffers; the second is the measured one.
-      await asReader("SELECT batch_id FROM sessions.buffered_session_stages_for($1,'claude',$2,$3,$4,$5,$6,$7,$8,$9)",
-        [TENANT.workspaceId, session, ...head]);
-      const t = performance.now();
-      const rows = await asReader<{ batch_id: string; kept_ordinals: number[] }>(
-        "SELECT batch_id, kept_ordinals FROM sessions.buffered_session_stages_for($1,'claude',$2,$3,$4,$5,$6,$7,$8,$9)",
-        [TENANT.workspaceId, session, ...head]);
-      const ms = Math.round(performance.now() - t);
-      console.log(`[044040 latency] buffered_session_stages_for ${session}: ${rows.length} stages in ${ms} ms (backlog ${n + 1})`);
-      expect(rows.length).toBe(want);
-      expect(rows.every((r) => r.kept_ordinals.length === 5)).toBe(true);
-      expect(want).toBeGreaterThan(0);
-      expect(ms).toBeLessThan(1_000);
-    }
-  }, 120_000);
+  // The full call (not an EXPLAIN of a reduced query): the function's own cached plan is what is timed.
+  const STAGES_SQL = "SELECT batch_id, kept_ordinals FROM sessions.buffered_session_stages_for($1,'claude',$2,$3,$4,$5,$6,$7,$8,$9)";
+  const LIST_SQL = "SELECT session_id FROM sessions.buffered_sessions_for($1,NULL,NULL,NULL,NULL,$2,$3,$4,$5,$6,$7,$8)";
+  const CALLS = 12; // 1 cold + 11 warm: more than 5 executions, so PL/pgSQL's plan cache considers the generic plan
 
-  test("the list is measured (linear in the backlog; logged, not asserted)", async () => {
-    const t = performance.now();
-    const rows = await asReader<{ session_id: string }>(
-      "SELECT session_id FROM sessions.buffered_sessions_for($1,NULL,NULL,NULL,NULL,$2,$3,$4,$5,$6,$7,$8)",
-      [TENANT.workspaceId, ...head]);
-    console.log(`[044040 latency] buffered_sessions_for: ${rows.length} sessions in ${Math.round(performance.now() - t)} ms (backlog ${n + 1})`);
-    expect(rows.length).toBeGreaterThan(0);
-  }, 600_000);
+  for (const generic of [false, true])
+    test(`one session's stages: full call, cold + ${CALLS - 1} warm (${generic ? "plan_cache_mode = force_generic_plan" : "default plan cache"}); warm p50/p95 under 1,000 ms`, async () => {
+      for (const session of ["sess-7", "sess-0"]) {
+        const want = Array.from({ length: n }, (_, i) => i + 1).filter((i) => i % SESSIONS === Number(session.slice(5))).length;
+        const r = await series<{ batch_id: string; kept_ordinals: number[] }>(STAGES_SQL, [TENANT.workspaceId, session, ...head], CALLS, generic, 240_000);
+        console.log(`[044040 latency] buffered_session_stages_for ${session} ${generic ? "generic" : "default"}: ${r.rows.length} stages; ` +
+          `cold ${r.cold} ms; warm n=${r.warm.length} p50 ${r.p50} ms p95 ${r.p95} ms max ${Math.round(Math.max(...r.warm))} ms (backlog ${n + 1})`);
+        expect(want).toBeGreaterThan(0);
+        expect(r.rows.length).toBe(want);
+        expect(r.rows.every((x) => x.kept_ordinals.length === 5)).toBe(true);
+        expect(r.warm.length).toBe(CALLS - 1);
+        expect(r.p50).toBeLessThan(1_000);
+        expect(r.p95).toBeLessThan(1_000);
+      }
+    }, 600_000);
+
+  for (const generic of [false, true])
+    test(`the list: full call, cold + warm (${generic ? "force_generic_plan" : "default plan cache"}); linear in the backlog, logged, not asserted`, async () => {
+      // Every list call scans the whole backlog; the series stops once ~150 s are spent (after the call in flight).
+      const r = await series<{ session_id: string }>(LIST_SQL, [TENANT.workspaceId, ...head], CALLS, generic, 150_000);
+      console.log(`[044040 latency] buffered_sessions_for ${generic ? "generic" : "default"}: ${r.rows.length} sessions; ` +
+        `cold ${r.cold} ms; warm n=${r.warm.length} p50 ${r.p50} ms p95 ${r.p95} ms (backlog ${n + 1})`);
+      expect(r.rows.length).toBeGreaterThan(0);
+    }, 900_000);
 });
