@@ -350,6 +350,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
       "DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)",
     sql: column("sessions.session_summaries", "object_key"),
   },
+  "upstream:20261105044090_claim_sessions_reader.sql": {
+    evidence: "ALTER + replacement: column sessions.ingest_claim_sessions_policy.read_enabled (the claim-sessions reader switch)",
+    sql: column("sessions.ingest_claim_sessions_policy", "read_enabled"),
+  },
   "upstream:20261105044080_ingest_claim_sessions.sql": {
     evidence: "table sessions.ingest_claim_sessions",
     sql: relation("sessions.ingest_claim_sessions"),

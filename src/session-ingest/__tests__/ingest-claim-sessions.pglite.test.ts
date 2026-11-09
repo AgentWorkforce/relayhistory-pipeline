@@ -101,8 +101,9 @@ test("enabled: exactly the distinct (source, session_id) pairs; duplicates colla
  const c=await f.claim(records);
  expect(await f.pairs(c.token)).toEqual([["claude","s-1"],["claude","s-2"],["codex","s-1"]]);
  const row=(await f.db.query<any>("SELECT org_id,workspace_id,user_id,origin_id,batch_id,digest,reset_epoch::int AS reset_epoch,accepted_at FROM sessions.ingest_claim_sessions WHERE claim_token=$1 LIMIT 1",[c.token])).rows[0];
- // The claim is written before its batch commits, so the trigger finds no committed batch: accepted_at NULL.
- expect(row).toEqual({org_id:T.orgId,workspace_id:T.workspaceId,user_id:T.userId,origin_id:origin,batch_id:c.batch,digest:hash(c.batch),reset_epoch:7,accepted_at:null});
+ // The claim is written before its batch commits, so the writer trigger finds no committed batch (NULL); since
+ // 044090 the commit-time refresh on ingest_batches then sets accepted_at to the batch's committed_at.
+ expect(row).toEqual({org_id:T.orgId,workspace_id:T.workspaceId,user_id:T.userId,origin_id:origin,batch_id:c.batch,digest:hash(c.batch),reset_epoch:7,accepted_at:new Date("2026-11-05T10:00:00Z")});
  // Empty and NULL records write nothing.
  const empty=await f.claim([]),none=await f.claim(null);
  expect(await f.pairs(empty.token)).toEqual([]);expect(await f.pairs(none.token)).toEqual([]);
@@ -203,11 +204,30 @@ test("backfill reconciles: stale rows of a claim retired while the writer was of
  expect(await f.pairs(a.token)).toEqual([["claude","s-1"]]); // writer off: stale
  await f.enable(true);
  const r=await f.backfill();
- expect(r).toMatchObject({claimsScanned:2,rowsInserted:0,rowsRefreshed:1,rowsDeleted:1,completionMarked:true});
+ // rowsRefreshed 0: b's accepted_at was already set by 044090's commit-time refresh (the writer was on at commit).
+ expect(r).toMatchObject({claimsScanned:2,rowsInserted:0,rowsRefreshed:0,rowsDeleted:1,completionMarked:true});
  expect(await f.pairs(a.token)).toEqual([]);
  expect(await f.pairs(b.token)).toEqual([["claude","s-2"]]);
  expect((await f.db.query<{a:string}>("SELECT accepted_at::text a FROM sessions.ingest_claim_sessions WHERE claim_token=$1",[b.token])).rows[0]!.a).toBe("2026-11-05 10:00:00+00");
  await expect(backfillClaimSessions({sql:{query:async()=>({rows:[]})},batchSize:0,statementTimeoutMs:30000,dryRun:true})).rejects.toMatchObject({code:"batch_size_invalid"});
+});
+
+test("backfill repairs accepted_at: a NULL (missed refresh) and a wrong value become the batch's committed_at; a pending batch stays NULL",async()=>{
+ const f=await fixture();
+ await f.enable(true);
+ const x=await f.claim([f.rec("claude","s-1")]),y=await f.claim([f.rec("claude","s-2"),f.rec("codex","s-2",1)]),z=await f.claim([f.rec("claude","s-3")]);
+ const p=await f.claim([f.rec("claude","s-4")],{committed:false});
+ const acc=async(token:string)=>(await f.db.query<{a:string|null}>("SELECT accepted_at::text a FROM sessions.ingest_claim_sessions WHERE claim_token=$1 ORDER BY source,session_id",[token])).rows.map(r=>r.a);
+ const at="2026-11-05 10:00:00+00";
+ // The commit-time refresh (044090) set the committed batches; break x (missed refresh) and y (drifted).
+ expect([await acc(x.token),await acc(y.token),await acc(z.token),await acc(p.token)]).toEqual([[at],[at,at],[at],[null]]);
+ await f.db.query("UPDATE sessions.ingest_claim_sessions SET accepted_at=NULL WHERE claim_token=$1",[x.token]);
+ await f.db.query("UPDATE sessions.ingest_claim_sessions SET accepted_at=timestamptz '2000-01-01 00:00:00+00' WHERE claim_token=$1",[y.token]);
+ const r=await f.backfill({batchSize:2});
+ // Three side rows repaired by ON CONFLICT DO UPDATE (x's one, y's two); z already right and p's NULL (no committed batch) untouched.
+ expect(r).toMatchObject({claimsScanned:4,rowsInserted:0,rowsRefreshed:3,rowsDeleted:0,completionMarked:true});
+ expect([await acc(x.token),await acc(y.token),await acc(z.token),await acc(p.token)]).toEqual([[at],[at,at],[at],[null]]);
+ expect((await f.db.query<{n:number}>("SELECT count(*)::int n FROM sessions.ingest_claim_sessions s JOIN sessions.ingest_batches b USING(org_id,workspace_id,origin_id,batch_id) WHERE b.state='committed' AND s.accepted_at IS DISTINCT FROM b.committed_at")).rows[0]!.n).toBe(0);
 });
 
 test("real buffered upload as bulls96_session_ingest: writer off writes nothing, writer on writes one row per session",async()=>{
