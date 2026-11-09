@@ -3313,10 +3313,29 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const manifest = await migrateGuards.sessionsFunctionAclManifest();
     const previousManifest = Object.fromEntries(Object.entries(manifest).filter(([fn]) => !laterFns.has(fn.slice(0, fn.indexOf("(")))));
     const previousRelease = later.length ? spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(previousManifest) : undefined;
+    // Likewise its runtime application ACL catalog could not list a table, sequence or function a later step creates;
+    // the current one does, so the ACL install (and the exact-ACL verifier) would fail on the missing relation
+    // (42P01). Install and verify the previous catalog: the current one minus the relations later steps CREATE
+    // (and the <table>_<column>_seq a serial/identity column of such a table implies). No later step: the
+    // current catalog, unmocked.
+    const laterRels = new Set(laterSteps.flatMap((s) =>
+      [...readFileSync(s.path, "utf8").matchAll(
+        /\bCREATE\s+(?:(?:UNLOGGED|TEMP|TEMPORARY)\s+)?(?:TABLE|SEQUENCE)\s+(?:IF\s+NOT\s+EXISTS\s+)?(sessions\.\w+)/gi,
+      )].map((m) => m[1]!.toLowerCase())));
+    const catalog = migrateGuards.runtimeApplicationAclCatalog();
+    const previousCatalog = {
+      tables: Object.fromEntries(Object.entries(catalog.tables).filter(([rel]) => !laterRels.has(rel))),
+      sequences: catalog.sequences.filter((rel) => !laterRels.has(rel) && ![...laterRels].some((t) => rel.startsWith(`${t}_`) && rel.endsWith("_seq"))),
+      rlsTables: catalog.rlsTables.filter((rel) => !laterRels.has(rel)),
+      // Its runtime EXECUTE grants likewise could not name a function a later step creates ($1::regprocedure).
+      functions: catalog.functions.filter((fn) => !laterFns.has(fn.slice(0, fn.indexOf("(")))),
+    };
+    const previousAcl = later.length ? spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(previousCatalog) : undefined;
     try {
       expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps }))).toBeNull();
     } finally {
       previousRelease?.mockRestore();
+      previousAcl?.mockRestore();
     }
     // Production shape: seven prebuilt CONCURRENTLY, the lazy-slot one held, its table populated.
     for (const x of ADOPTABLE_INDEXES[CB]!) if (x.name !== LAZY) await db.exec(x.def);

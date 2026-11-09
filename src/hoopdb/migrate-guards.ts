@@ -303,6 +303,29 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.session_brief_attempts",
 ] as const;
 
+/**
+ * The runtime application relations and functions, read through one function by the ACL
+ * install (migrate.ts installRuntimeApplicationAcl), runtimeRoleViolations and the function
+ * ACL drift check/preview. Always exactly the three constants above plus
+ * RUNTIME_APPLICATION_FUNCTIONS below: every listed relation and function is granted and
+ * verified, fail-closed. The indirection exists only so a test can model a previous
+ * release's binary (which could not list a relation or function a later migration creates)
+ * the way it spies sessionsFunctionAclManifest.
+ */
+export function runtimeApplicationAclCatalog(): {
+  tables: Readonly<Record<string, readonly string[]>>;
+  sequences: readonly string[];
+  rlsTables: readonly string[];
+  functions: readonly string[];
+} {
+  return {
+    tables: RUNTIME_APPLICATION_TABLE_PRIVILEGES,
+    sequences: RUNTIME_APPLICATION_SEQUENCES,
+    rlsTables: RUNTIME_APPLICATION_RLS_TABLES,
+    functions: RUNTIME_APPLICATION_FUNCTIONS,
+  };
+}
+
 export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.ack_session_brief_documents(uuid,jsonb)",
   "sessions.applied_repo_evidence(jsonb,jsonb)",
@@ -613,7 +636,8 @@ export async function runtimeRoleViolations(
     );
   }
 
-  const applicationTables = Object.keys(RUNTIME_APPLICATION_TABLE_PRIVILEGES);
+  const catalog = runtimeApplicationAclCatalog();
+  const applicationTables = Object.keys(catalog.tables);
   const ids = (
     await client.query<{
       db: number;
@@ -634,10 +658,10 @@ export async function runtimeRoleViolations(
       [
         tables.ledger,
         tables.marker,
-        [...applicationTables, ...RUNTIME_APPLICATION_SEQUENCES],
-        [...RUNTIME_APPLICATION_FUNCTIONS],
+        [...applicationTables, ...catalog.sequences],
+        [...catalog.functions],
         RUNTIME_APPLICATION_POLICY,
-        [...RUNTIME_APPLICATION_RLS_TABLES],
+        [...catalog.rlsTables],
       ],
     )
   ).rows[0]!;
@@ -833,7 +857,7 @@ export async function runtimeRoleViolations(
   const expectedTablePrivileges = new Map<string, readonly string[]>([
     [tables.ledger, ["SELECT"]],
     [tables.marker, ["SELECT"]],
-    ...Object.entries(RUNTIME_APPLICATION_TABLE_PRIVILEGES),
+    ...Object.entries(catalog.tables),
   ]);
   for (const t of effectiveTables) {
     const actual = t.privs ? t.privs.split(",") : [];
@@ -858,15 +882,13 @@ export async function runtimeRoleViolations(
     )
   ).rows;
   for (const q of effectiveSequences) {
-    const approved = RUNTIME_APPLICATION_SEQUENCES.includes(
-      q.rel as (typeof RUNTIME_APPLICATION_SEQUENCES)[number],
-    );
+    const approved = catalog.sequences.includes(q.rel);
     if (!approved && q.privs) out.push(`privileges on sequence ${q.rel}`);
     if (approved && q.privs !== "USAGE")
       out.push(`${q.privs} on sequence ${q.rel} (only USAGE is approved)`);
   }
   if (phase === "post")
-    for (const sequence of RUNTIME_APPLICATION_SEQUENCES)
+    for (const sequence of catalog.sequences)
       if (!effectiveSequences.some((q) => q.rel === sequence && q.privs === "USAGE"))
         out.push(`missing USAGE on sequence ${sequence}`);
   const effectiveFunctions = (
@@ -883,10 +905,10 @@ export async function runtimeRoleViolations(
     )
   ).rows;
   for (const fnr of effectiveFunctions)
-    if (!RUNTIME_APPLICATION_FUNCTIONS.includes(fnr.fn as (typeof RUNTIME_APPLICATION_FUNCTIONS)[number]))
+    if (!catalog.functions.includes(fnr.fn))
       out.push(`EXECUTE on ${fnr.fn}`);
   if (phase === "post")
-    for (const fn of RUNTIME_APPLICATION_FUNCTIONS)
+    for (const fn of catalog.functions)
       if (!effectiveFunctions.some((row) => row.fn === fn))
         out.push(`missing EXECUTE on ${fn}`);
 
@@ -923,7 +945,7 @@ export async function runtimeRoleViolations(
   ).rows;
   for (const policy of policies) {
     const exact =
-      RUNTIME_APPLICATION_RLS_TABLES.includes(policy.rel as (typeof RUNTIME_APPLICATION_RLS_TABLES)[number]) &&
+      catalog.rlsTables.includes(policy.rel) &&
       policy.name === RUNTIME_APPLICATION_POLICY &&
       policy.permissive && policy.command === "*" &&
       policy.roles.length === 1 && policy.roles[0] === role.oid &&
@@ -931,7 +953,7 @@ export async function runtimeRoleViolations(
     if (!exact) out.push(`unapproved policy ${policy.name} on ${policy.rel}`);
   }
   if (phase === "post")
-    for (const rel of RUNTIME_APPLICATION_RLS_TABLES)
+    for (const rel of catalog.rlsTables)
       if (!policies.some((p) => p.rel === rel && p.name === RUNTIME_APPLICATION_POLICY))
         out.push(`missing policy ${RUNTIME_APPLICATION_POLICY} on ${rel}`);
   // Detection only: a per-schema default-privileges GRANT in sessions naming PUBLIC or the
@@ -1957,10 +1979,11 @@ export async function sessionsFunctionAclDrift(
   runtimeRole: string,
 ): Promise<string[]> {
   const manifest = await sessionsFunctionAclManifest();
+  const runtimeFunctions = runtimeApplicationAclCatalog().functions;
   const expected: Record<string, string[]> = Object.fromEntries(
     Object.entries(manifest).map(([fn, entries]) => [
       fn,
-      (RUNTIME_APPLICATION_FUNCTIONS as readonly string[]).includes(fn)
+      runtimeFunctions.includes(fn)
         ? [...entries, `${runtimeRole}:EXECUTE`]
         : entries,
     ]),
@@ -2013,6 +2036,7 @@ export async function sessionsFunctionAclPreview(
   pendingMigrations = false,
 ): Promise<FunctionAclPreview> {
   const manifest = await sessionsFunctionAclManifest();
+  const runtimeFunctions = runtimeApplicationAclCatalog().functions;
   const actual = await sessionsFunctionAcl(client);
   const extra: string[] = [];
   const missing: string[] = [];
@@ -2027,7 +2051,7 @@ export async function sessionsFunctionAclPreview(
   };
   for (const fn of [...new Set([...Object.keys(manifest), ...Object.keys(actual)])].sort()) {
     const runtimeEntry =
-      runtimeRole && (RUNTIME_APPLICATION_FUNCTIONS as readonly string[]).includes(fn)
+      runtimeRole && runtimeFunctions.includes(fn)
         ? `${runtimeRole}:EXECUTE`
         : null;
     const expectedList = [...(manifest[fn] ?? []), ...(runtimeEntry ? [runtimeEntry] : [])];
