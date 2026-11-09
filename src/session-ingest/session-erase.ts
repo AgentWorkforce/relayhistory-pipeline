@@ -7,7 +7,8 @@
  *
  * Default off. SESSION_ERASE_API_ENABLED must be exactly "1"; unset, "" or "0" is off and anything else
  * refuses startup. While it is off, or SESSION_ERASE_API_SECRET is unset, every request under the prefix
- * answers 501 NOT_IMPLEMENTED_BODY and nothing is read. With both set, the request is authenticated
+ * answers 501 NOT_IMPLEMENTED_BODY and nothing is read. A hosted Worker whose erase settings are invalid keeps
+ * serving ingest and answers 503 UNAVAILABLE_BODY here instead (reason "config_invalid"). With both set, the request is authenticated
  * (Bearer SESSION_ERASE_API_SECRET, or SESSION_ERASE_API_SECRET_PREVIOUS during a rotation, compared in
  * constant time), the path and body are validated, and the answer is still 501: the erase itself ships in
  * a later PR. Control decides membership before calling; this service never calls Control. The secret,
@@ -25,19 +26,24 @@ export const SESSION_ERASE_MAX_BODY_BYTES = 8 * 1024;
 export const SESSION_ERASE_FEATURE = "session_erase";
 /** The exact 501 body Control maps (contract section 4). */
 export const NOT_IMPLEMENTED_BODY = Object.freeze({ error: "not_implemented", feature: SESSION_ERASE_FEATURE });
+/** The 503 body for "config_invalid": the route fails closed and Control retries (contract sections 2 and 5). */
+export const UNAVAILABLE_BODY = Object.freeze({ error: "unavailable", feature: SESSION_ERASE_FEATURE });
+export const SESSION_ERASE_RETRY_AFTER_SECONDS = "60";
 const REQUEST_ID_MAX_BYTES = 128;
 
 export type SessionEraseConfig =
-  | { enabled: false; reason: "flag_off" | "secret_unset" }
+  | { enabled: false; reason: "flag_off" | "secret_unset" | "config_invalid" }
   | { enabled: true; secrets: readonly string[] };
 
 export const SESSION_ERASE_DISABLED: SessionEraseConfig = Object.freeze({ enabled: false, reason: "flag_off" });
+/** The Worker's isolation of an invalid flag or secret: erase fails closed, the rest of ingest keeps working. */
+export const SESSION_ERASE_CONFIG_INVALID: SessionEraseConfig = Object.freeze({ enabled: false, reason: "config_invalid" });
 
 function eraseSecret(env: Record<string, string | undefined>, name: string): string | undefined {
   const raw = env[name];
   if (raw === undefined || raw === "") return undefined;
-  // The route compares the exact bearer, so a padded secret could never match.
-  if (raw !== raw.trim()) throw new Error(`session ingest: ${name} must not have leading or trailing whitespace`);
+  // The bearer is one token (\S+) compared exactly, so a secret holding any whitespace could never match.
+  if (/\s/u.test(raw)) throw new Error(`session ingest: ${name} must not contain whitespace`);
   if (raw.length < SESSION_ERASE_SECRET_MIN_LENGTH) throw new Error(`session ingest: ${name} must be at least ${SESSION_ERASE_SECRET_MIN_LENGTH} characters`);
   return raw;
 }
@@ -168,6 +174,12 @@ export function registerSessionEraseRoutes(app: Hono<any>, config: SessionEraseC
     const line = (status: number, outcome: string) =>
       log({ route: "operator.session_erase", kind: c.req.method, status, outcome, correlation_id: c.get("correlationId") });
     if (!config.enabled) {
+      if (config.reason === "config_invalid") {
+        // Fail closed and retryable: the operator fixes the setting; nothing is authenticated or read.
+        line(503, config.reason);
+        c.header("Retry-After", SESSION_ERASE_RETRY_AFTER_SECONDS);
+        return c.json(UNAVAILABLE_BODY, 503);
+      }
       line(501, config.reason);
       return c.json(NOT_IMPLEMENTED_BODY, 501);
     }

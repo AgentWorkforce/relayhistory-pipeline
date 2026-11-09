@@ -58,7 +58,7 @@ import { routingFlag } from "./babysitter-retention.ts";
 import { asyncAdmissionMode, syncAdmissionFrozenReceiptMode, type AdmissionMessage, type AsyncAdmissionMode } from "./async-admission.ts";
 import { admitMessage, type AdmissionAction } from "./admission-consumer.ts";
 import { lockAlertFields } from "./app.ts";
-import { sessionEraseConfig, sessionEraseEnabled, SESSION_ERASE_FLAG_VAR, SESSION_ERASE_SECRET_PREVIOUS_VAR, SESSION_ERASE_SECRET_VAR, type SessionEraseConfig } from "./session-erase.ts";
+import { sessionEraseConfig, sessionEraseEnabled, SESSION_ERASE_CONFIG_INVALID, SESSION_ERASE_FLAG_VAR, SESSION_ERASE_SECRET_PREVIOUS_VAR, SESSION_ERASE_SECRET_VAR, type SessionEraseConfig } from "./session-erase.ts";
 import type { DeliverDeps } from "./deliver.ts";
 
 interface QueueLike<T> {
@@ -207,14 +207,22 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   // Async admission without its queue would refuse every opted-in batch: not configured.
   if (asyncMode !== "off" && !env.INGEST_ADMISSION) return null;
   const syncFrozenReceipt = syncAdmissionFrozenReceiptMode(env.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT);
-  // Default off; the secrets are read and validated only when the flag is exactly "1".
-  const sessionErase = sessionEraseEnabled(env.SESSION_ERASE_API_ENABLED)
-    ? sessionEraseConfig({
-        [SESSION_ERASE_FLAG_VAR]: env.SESSION_ERASE_API_ENABLED,
-        [SESSION_ERASE_SECRET_VAR]: await secret(env.SESSION_ERASE_API_SECRET),
-        [SESSION_ERASE_SECRET_PREVIOUS_VAR]: await secret(env.SESSION_ERASE_API_SECRET_PREVIOUS),
-      })
-    : undefined;
+  // Default off; the secrets are read and validated only when the flag is exactly "1". Isolated: the
+  // secrets are runtime-mutable Secrets Store values, so an invalid flag or secret must never fail delivery
+  // or the queue consumer. The erase route alone fails closed (503 unavailable); the log carries a code only.
+  let sessionErase: SessionEraseConfig | undefined;
+  try {
+    sessionErase = sessionEraseEnabled(env.SESSION_ERASE_API_ENABLED)
+      ? sessionEraseConfig({
+          [SESSION_ERASE_FLAG_VAR]: env.SESSION_ERASE_API_ENABLED,
+          [SESSION_ERASE_SECRET_VAR]: await secret(env.SESSION_ERASE_API_SECRET),
+          [SESSION_ERASE_SECRET_PREVIOUS_VAR]: await secret(env.SESSION_ERASE_API_SECRET_PREVIOUS),
+        })
+      : undefined;
+  } catch {
+    log.error("session ingest settings invalid", { error_code: "session_erase_config_invalid" });
+    sessionErase = SESSION_ERASE_CONFIG_INVALID;
+  }
   return {
     bucket,
     region: env.INGEST_S3_REGION ?? "us-east-1",

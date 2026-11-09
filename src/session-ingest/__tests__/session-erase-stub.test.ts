@@ -5,12 +5,13 @@
  * introspection throw if they are ever reached.
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createIngestApp } from "../app.ts";
 import { selfhostIngestConfig } from "../selfhost-config.ts";
 import { selfhostIngestHttpServer, selfhostIngestRuntime } from "../selfhost-server.ts";
 import {
-  NOT_IMPLEMENTED_BODY, SESSION_ERASE_MAX_BODY_BYTES, parseSessionErasePath, sessionEraseConfig, type SessionEraseConfig,
+  NOT_IMPLEMENTED_BODY, SESSION_ERASE_CONFIG_INVALID, SESSION_ERASE_MAX_BODY_BYTES, UNAVAILABLE_BODY, parseSessionErasePath, sessionEraseConfig, type SessionEraseConfig,
 } from "../session-erase.ts";
 import { ingestSettings } from "../worker.ts";
 import { MemoryLedger, scratchStore } from "./support.ts";
@@ -63,6 +64,15 @@ describe("disabled (default)", () => {
     const p = await post(a);
     expect([p.status, await p.json()]).toEqual([501, NOT_IMPLEMENTED_BODY]);
     expect(lines[0]).toMatchObject({ route: "operator.session_erase", status: 501, outcome: "secret_unset" });
+  });
+
+  test("config_invalid (hosted Worker, invalid flag or secret): 503 unavailable with Retry-After, before auth", async () => {
+    const { a, lines } = app(SESSION_ERASE_CONFIG_INVALID);
+    for (const res of [await post(a), await a.request(PATH), await a.request(PATH, { method: "DELETE" })]) {
+      expect([res.status, await res.json(), res.headers.get("retry-after")]).toEqual([503, UNAVAILABLE_BODY, "60"]);
+    }
+    expect(lines.map((l) => [l.status, l.outcome])).toEqual([[503, "config_invalid"], [503, "config_invalid"], [503, "config_invalid"]]);
+    expect((await a.request("/healthz")).status).toBe(200);
   });
 
   test("the rest of the app is unchanged: /healthz and the /v1 fallbacks", async () => {
@@ -140,6 +150,12 @@ describe("enabled with a secret", () => {
     expect(nl.status).toBe(404);
   });
 
+  test("the bootstrap bearer's actor {kind: bootstrap, id: bootstrap} is a valid actor", async () => {
+    const { a } = app(enabled());
+    const res = await post(a, JSON.stringify({ requestId: "req-1", actor: { kind: "bootstrap", id: "bootstrap" } }));
+    expect([res.status, await res.json()]).toEqual([501, NOT_IMPLEMENTED_BODY]);
+  });
+
   test("a valid POST and a valid GET are 501 not_implemented", async () => {
     const { a, lines } = app(enabled());
     const p = await post(a, JSON.stringify({ requestId: "req-1", actor: { kind: "bootstrap", id: "boot-1" } }));
@@ -167,6 +183,9 @@ describe("configuration", () => {
     const cases: [Record<string, string>, RegExp][] = [
       [{ SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: "too-short" }, /SESSION_ERASE_API_SECRET must be at least 32/],
       [{ SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: ` ${SECRET}` }, /whitespace/],
+      [{ SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: `${SECRET}\n` }, /whitespace/],
+      [{ SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: `erase-secret ${SECRET}` }, /SESSION_ERASE_API_SECRET must not contain whitespace/],
+      [{ SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: SECRET, SESSION_ERASE_API_SECRET_PREVIOUS: `erase-secret\t${PREVIOUS}` }, /SESSION_ERASE_API_SECRET_PREVIOUS must not contain whitespace/],
       [{ SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: SECRET, SESSION_ERASE_API_SECRET_PREVIOUS: "short" }, /SESSION_ERASE_API_SECRET_PREVIOUS must be at least 32/],
       [{ SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: SECRET, SESSION_ERASE_API_SECRET_PREVIOUS: SECRET }, /must differ/],
       [{ SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET_PREVIOUS: PREVIOUS }, /needs SESSION_ERASE_API_SECRET/],
@@ -184,13 +203,46 @@ describe("configuration", () => {
     }
   });
 
-  test("the Worker settings resolve the secret only with the flag on; an invalid secret refuses the settings", async () => {
+  test("the Worker settings resolve the secret only with the flag on; an invalid erase setting disables erase only", async () => {
     const full = { HYPERDRIVE: { connectionString: "postgres://x" }, INGEST_FANOUT: {} as never, S3_ACCESS_KEY_ID: "k", S3_SECRET_ACCESS_KEY: "s", INGEST_SIGNING_KEY: "sign", INGEST_S3_BUCKET: "b", INGEST_KMS_KEY_ARN: "arn" };
     expect((await ingestSettings({ ...full, SESSION_ERASE_API_SECRET: "short" }))?.sessionErase).toBeUndefined();
     expect((await ingestSettings({ ...full, SESSION_ERASE_API_ENABLED: "1" }))?.sessionErase).toEqual({ enabled: false, reason: "secret_unset" });
     expect((await ingestSettings({ ...full, SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: SECRET }))?.sessionErase?.enabled).toBe(true);
-    await expect(ingestSettings({ ...full, SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: "short" })).rejects.toThrow(/SESSION_ERASE_API_SECRET must be at least 32/);
-    await expect(ingestSettings({ ...full, SESSION_ERASE_API_ENABLED: "true" })).rejects.toThrow(/must be unset/);
+  });
+
+  test("Worker: flag 1 with a short secret (or an unknown flag value) never rejects ingestSettings; erase is disabled, logged by code only", async () => {
+    const full = { HYPERDRIVE: { connectionString: "postgres://x" }, INGEST_FANOUT: {} as never, S3_ACCESS_KEY_ID: "k", S3_SECRET_ACCESS_KEY: "s", INGEST_SIGNING_KEY: "sign", INGEST_S3_BUCKET: "b", INGEST_KMS_KEY_ARN: "arn" };
+    const shortSecret = "erase-short-secret-value";
+    const written: string[] = [];
+    const out = process.stdout.write.bind(process.stdout);
+    const err = process.stderr.write.bind(process.stderr);
+    process.stdout.write = ((chunk: unknown, ...rest: unknown[]) => (written.push(String(chunk)), (out as (...a: unknown[]) => boolean)(chunk, ...rest))) as typeof process.stdout.write;
+    process.stderr.write = ((chunk: unknown, ...rest: unknown[]) => (written.push(String(chunk)), (err as (...a: unknown[]) => boolean)(chunk, ...rest))) as typeof process.stderr.write;
+    const results = [];
+    try {
+      for (const env of [
+        { SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: shortSecret },
+        { SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: `${SECRET}\n` },
+        { SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: SECRET, SESSION_ERASE_API_SECRET_PREVIOUS: SECRET },
+        { SESSION_ERASE_API_ENABLED: "true", SESSION_ERASE_API_SECRET: SECRET },
+      ]) results.push(await ingestSettings({ ...full, ...env }));
+    } finally {
+      process.stdout.write = out;
+      process.stderr.write = err;
+    }
+    for (const settings of results) {
+      expect(settings).not.toBeNull();
+      expect(settings!.sessionErase?.enabled).toBe(false);
+      expect(settings!.sessionErase).toEqual({ enabled: false, reason: "config_invalid" });
+      // Delivery settings are intact.
+      expect(settings!.bucket).toBe("b");
+    }
+    const codes = written.filter((l) => l.includes("session_erase_config_invalid"));
+    expect(codes.length).toBe(4);
+    for (const line of written) {
+      expect(line).not.toContain(shortSecret);
+      expect(line).not.toContain(SECRET);
+    }
   });
 
   test("self-host config carries the erase config; default disabled", () => {
@@ -257,6 +309,59 @@ describe("self-host node:http wrapper", () => {
       expect(line).not.toContain(SECRET);
       expect(line).not.toContain(PREVIOUS);
       expect(line).not.toContain("sess-1");
+    }
+  });
+
+  test("an encoded-dot traversal out of the erase prefix takes the identity-bound path (verify is called)", async () => {
+    const { url, counts } = await serve(enabled());
+    const { port } = new URL(url);
+    // Raw request line: fetch() would normalise the dots client-side before sending.
+    const status = await new Promise<number>((resolve, reject) => {
+      const r = httpRequest({ host: "127.0.0.1", port: Number(port), method: "POST", path: "/internal/v1/session-erase/%2e%2e/%2e%2e/%2e%2e/v1/delivery/batches", headers: auth() }, (res) => {
+        res.resume();
+        resolve(res.statusCode ?? 0);
+      });
+      r.on("error", reject);
+      r.end("{}");
+    });
+    expect(status).toBe(503); // verify threw: relaycontrol_unavailable, never the erase handler
+    expect(counts()).toEqual({ verifyCalls: 1, sqlCalls: 0 });
+  });
+
+  test("Authorization is still stripped before the app on a /v1 path", async () => {
+    const s = scratchStore();
+    cleanups.push(s.done);
+    const base = selfhostIngestRuntime({ keyRoot: "96bulls", maxPerUser: 4, maxPerOrg: 16, sessionErase: enabled() }, {
+      run: (async () => { throw new Error("no database"); }) as never,
+      store: s.store,
+      verify: async () => { throw new Error("replaced below"); },
+      ready: async () => true,
+      close: async () => {},
+    });
+    const seen: (string | null)[] = [];
+    const verified: (string | undefined)[] = [];
+    const runtime = {
+      ...base,
+      verify: async (authorization: string | undefined) => { verified.push(authorization); return { userId: "u", orgId: "o" } as never; },
+      app: { fetch: (req: Request) => { seen.push(req.headers.get("authorization")); return Response.json({ ok: true }); } },
+    };
+    const server = selfhostIngestHttpServer(runtime);
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    cleanups.push(() => new Promise<void>((r) => { server.closeAllConnections?.(); server.close(() => r()); }));
+    const res = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/delivery/batches`, { method: "POST", headers: auth("tenant-token"), body: "{}" });
+    expect(res.status).toBe(200);
+    expect(verified).toEqual(["Bearer tenant-token"]);
+    expect(seen).toEqual([null]);
+  });
+
+  test("an unsupported method on the erase path is 405 Allow: GET, POST at the wrapper", async () => {
+    for (const config of [enabled(), sessionEraseConfig({})]) {
+      const { url, counts } = await serve(config);
+      for (const method of ["PUT", "DELETE", "PATCH"]) {
+        const res = await fetch(url, { method, headers: auth(), body: "x" });
+        expect([method, res.status, res.headers.get("allow")]).toEqual([method, 405, "GET, POST"]);
+      }
+      expect(counts()).toEqual({ verifyCalls: 0, sqlCalls: 0 });
     }
   });
 

@@ -354,16 +354,19 @@ export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null):
           return sendJson(req, res, 401, envelope("refresh_not_supported", "this session cannot be refreshed; sign in again", correlationId), { "www-authenticate": "Bearer", "x-correlation-id": correlationId });
         }
         // The operator erase route authenticates its own bearer in the app (session-erase.ts), never through
-        // relaycontrol introspection, and has no tenant identity: forward it as is (method included).
+        // relaycontrol introspection, and has no tenant identity: forward it as is. Only GET and POST are
+        // forwarded; any other method is refused here (405, Allow: GET, POST) and never reaches the app.
         const erase = isSessionErasePath(path);
-        const method = erase ? (req.method ?? "GET") : runtime.routes[path];
+        const method = erase ? (req.method === "POST" ? "POST" : "GET") : runtime.routes[path];
         if (!method) {
           if (path.startsWith("/v1/"))
             return sendJson(req, res, 501, envelope("unsupported_by_backend", "this route is not served by the self-host session ingest", correlationId, { reason: "route_not_served_selfhost" }), { "x-correlation-id": correlationId });
           return sendJson(req, res, 404, envelope("not_found", "not found", correlationId), { "x-correlation-id": correlationId });
         }
-        if (req.method !== method)
-          return sendJson(req, res, 405, envelope("method_not_allowed", `${method} only`, correlationId), { allow: method, "x-correlation-id": correlationId });
+        if (req.method !== method) {
+          const allow = erase ? "GET, POST" : method;
+          return sendJson(req, res, 405, envelope("method_not_allowed", `${allow} only`, correlationId), { allow, "x-correlation-id": correlationId });
+        }
 
         // Identity before any body byte is read.
         let identity: IngestIdentity | undefined;

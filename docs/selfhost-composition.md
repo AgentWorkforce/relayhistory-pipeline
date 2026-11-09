@@ -159,7 +159,7 @@ the original sketch below in four ways:
   no pointer to tombstone.
 - Operator session erase: `/internal/v1/session-erase/...`
   (`docs/operator-session-erase-contract.md`) is reachable only from inside the
-  cluster, for relay-control. The wrapper forwards it to the app without
+  cluster, for relay-control. The wrapper forwards GET and POST (other methods: 405) to the app without
   relaycontrol introspection; the app checks its own bearer,
   `SESSION_ERASE_API_SECRET`. It is default off (`SESSION_ERASE_API_ENABLED`),
   and today it always answers 501 `not_implemented`, even when enabled.
