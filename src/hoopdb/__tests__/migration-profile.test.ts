@@ -4495,9 +4495,9 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
   });
 
 // The reserved summary lane owns both its read RPC and recorded-title schema.
-test("044060 real prefix upgrade/fresh/noop/rollback/up preserves pointers and exact owner-only invalidation ACL", async () => {
+test("044100 real prefix upgrade/fresh/noop/rollback/up preserves pointers and exact owner-only invalidation ACL", async () => {
   const db=await supabaseLike(); await db.exec(ET_BOOT);
-  const name="upstream:20261105044060_session_brief_summary_read.sql";
+  const name="upstream:20261105044100_session_brief_summary_read.sql";
   const full=await plan(SUPA_ET), previous=await previousReleaseModel(full,name);
   try { expect(await failure(runMigrations(client(db),{profile:SUPA_ET,steps:previous.steps}))).toBeNull(); }
   finally { previous.restore(); }
@@ -4520,7 +4520,7 @@ test("044060 real prefix upgrade/fresh/noop/rollback/up preserves pointers and e
   const ledgerBefore=await ledgerHash();
   expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(0);
   expect(await ledgerHash()).toBe(ledgerBefore);await preserved();
-  await db.exec(readFileSync(join(root,"supabase/rollbacks/20261105044060_session_brief_summary_read.down.sql"),"utf8"));
+  await db.exec(readFileSync(join(root,"supabase/rollbacks/20261105044100_session_brief_summary_read.down.sql"),"utf8"));
   expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(false);await preserved();
   expect((await db.query("SELECT name FROM sessions.__96bulls_migrations WHERE name=$1",[name])).rows).toEqual([]);
   expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(1);await preserved();

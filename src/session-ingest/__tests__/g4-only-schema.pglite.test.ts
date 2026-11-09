@@ -123,7 +123,7 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105044070_selfhost_erase_search_text_rebuild.sql",
       // Read-role-only summary RPC, recorded-title metadata column and invoker trigger;
       // no ingest RPC is replaced or calls them.
-      "20261105044060_session_brief_summary_read.sql",
+      "20261105044100_session_brief_summary_read.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

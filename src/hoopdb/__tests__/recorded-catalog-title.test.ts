@@ -1,4 +1,4 @@
-/** Real 044060 storage/invalidation and runtime writer/projector contracts. */
+/** Real 044100 storage/invalidation and runtime writer/projector contracts. */
 import { afterEach, expect, test } from "bun:test";
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
@@ -21,12 +21,12 @@ async function setup() {
     event_projection_version=1,event_projected_at=now(),event_projection_sources='{"m-1":1}'::jsonb`);
   return db;
 }
-async function before060() {
+async function before100() {
   const db=new PGlite({extensions:{btree_gin,pg_trgm}}); opened.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   for(const file of SESSION_BOOTSTRAP_FILES) await db.exec(read(file));
   for(const file of readdirSync(join(root,"supabase/migrations")).sort())
-    if(file<"20261105044060_session_brief_summary_read.sql") await db.exec(read("supabase/migrations/"+file));
+    if(file<"20261105044100_session_brief_summary_read.sql") await db.exec(read("supabase/migrations/"+file));
   for(const file of readdirSync(join(root,"src/hoopdb/migrations")).filter(f=>f.endsWith(".sql")).sort())
     await db.exec(read("src/hoopdb/migrations/"+file));
   return db;
@@ -106,7 +106,7 @@ test("invalid recorded titles never reach the column, while legitimate redacted 
 });
 
 test("recorded writes require the schema and legacy epoch contract instead of silently losing metadata", async () => {
-  const db = await before060();
+  const db = await before100();
   await pointer(db, { title: null });
   await db.query(`UPDATE sessions.session_directory SET event_projection_ready=true,event_projection_version=1,event_projected_at=now(),event_projection_sources='{"m-1":1}'::jsonb`);
   await expect(writeDirectoryCatalog(db as never, KEY, input("Recorded title"), { expectedEpoch: await epoch(db) })).rejects.toMatchObject({ code: "42703" });
@@ -203,10 +203,10 @@ test("schema metadata denial/malformed result refuses before catalog writes",asy
 });
 
 
-test("real 044060 strips default EXECUTE grants and keeps the invalidation function owner-only",async()=>{
- const db=await before060();
+test("real 044100 strips default EXECUTE grants and keeps the invalidation function owner-only",async()=>{
+ const db=await before100();
  await db.exec("CREATE ROLE unrelated_title_caller NOLOGIN; ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO unrelated_title_caller");
- await db.exec(read("supabase/migrations/20261105044060_session_brief_summary_read.sql"));
+ await db.exec(read("supabase/migrations/20261105044100_session_brief_summary_read.sql"));
  for(const fn of ["sessions.session_directory_recorded_title_invalidate()","sessions.session_brief_summary_for(text,text,text)"]){
   expect((await db.query<{allowed:boolean}>("SELECT has_function_privilege('unrelated_title_caller',$1,'EXECUTE') AS allowed",[fn])).rows[0]!.allowed).toBe(false);
  }

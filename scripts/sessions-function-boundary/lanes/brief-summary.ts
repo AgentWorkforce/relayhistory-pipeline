@@ -1,5 +1,5 @@
 import type { LaneManifest } from "../types.ts";
-const migration = "supabase/migrations/20261105044060_session_brief_summary_read.sql";
+const migration = "supabase/migrations/20261105044100_session_brief_summary_read.sql";
 export const briefSummary: LaneManifest = {
  lane: "brief-summary", owner: "native brief summary read API", migration,
  prefixes: ["sessions.session_brief_summary_for(", "sessions.session_directory_recorded_title_invalidate("],
