@@ -403,13 +403,17 @@ describe("session pipeline: deploy plan contract", () => {
     const c=bufferedFeedConfig(sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:{}}));
     expect([c.pageSize,c.stagesPerSecond,c.budgetMs]).toEqual([50,5,50000]);
   });
-  it("buffered feed arms only with the gate's exact contract, and the feeder accepts that env",()=>{
+  it("buffered feed arms only with the gate's exact contract; the feeder then still needs the S version encoding",()=>{
     expect(BUFFERED_SEARCH_FEED_GATE_CONTRACT).toBe(BUFFERED_SEARCH_GATE_CONTRACT);
     expect(bufferedSearchFeedScheduleProps({names:p,functionArn:"fn",p:armed,tags:{}}).state).toBe("ENABLED");
     const env=sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:armed});
     expect(env).toMatchObject({INGEST_BUFFERED_SEARCH_FEED:"on",BUFFERED_SEARCH_FEED_GATE_DECLARED:BUFFERED_SEARCH_GATE_CONTRACT});
-    expect(bufferedFeedConfig(env).enabled).toBe(true);
     expect(bufferedFeedGateRefusal(env)).toBeNull();
+    // The stack does not set INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION, and BUFFERED_VERSION_CEILING is unpinned,
+    // so the feeder refuses this env fail closed (buffered-feed-version-encoding-s.md); with both, it accepts it.
+    expect(()=>bufferedFeedConfig(env)).toThrow(/version_encoding_not_armed/);
+    expect(()=>bufferedFeedConfig({...env,INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION:"on"})).toThrow(/buffered_version_ceiling_unpinned/);
+    expect(bufferedFeedConfig({...env,INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION:"on"},1_000_000_000_000).enabled).toBe(true);
     const refused=(v:unknown)=>{let why="";try{assertSessionPipelineInputs(v,(w:string)=>{throw new Error(w)})}catch(e){why=(e as Error).message}return why};
     expect(refused(armed)).toBe("");
     expect(refused({searchIndex:true,bufferedSearchFeed:{enabled:false}})).toBe("");

@@ -17,6 +17,14 @@
  *   SEARCH_INDEX_BACKEND                      enabled only: postgres | opensearch (managed
  *                                   AWS index, SEARCH_INDEX_OPENSEARCH_*; projection state
  *                                   stays in Postgres); anything else fails startup
+ *   SEARCH_INDEX_OPENSEARCH_BULK_MAX_BYTES    opensearch only: upper bound of one _bulk
+ *                                   request body in bytes, default 4194304 (4 MiB;
+ *                                   Amazon OpenSearch caps a request at 10 MiB on
+ *                                   small instance types). A positive integer; unset,
+ *                                   zero or malformed means the default. A larger
+ *                                   single document is sent alone. Read by the
+ *                                   adapter (openSearchConfigFromInput), passed
+ *                                   through with the other SEARCH_INDEX_OPENSEARCH_*
  *   SEARCH_INDEX_POSTGRES_BACKEND_ID          enabled only: the projection-state backend id
  *                                   the search writer records under (required;
  *                                   not a credential). Format is validated by the
@@ -43,6 +51,15 @@
  *                                   failures force an exit (for a compose
  *                                   healthcheck or watcher); default
  *                                   /tmp/session-pipeline-consumer.unhealthy
+ *   RELAYHISTORY_SELFHOST_OUTPUT_FACTS        enabled only: exactly "true" (no trimming,
+ *                                   case-sensitive) also writes output facts
+ *                                   (sessions.session_event_facts /
+ *                                   session_output_facts, migration 045040) through the
+ *                                   Postgres facts store inside the same transaction as
+ *                                   the directory events; unset or any other value is
+ *                                   off (default off, never a startup error). Sessions
+ *                                   ingested before the flag have no facts (bootstrap
+ *                                   is a later PR)
  *   HOOPDB_URL                                runWorker (health/readiness gates) opens its
  *                                   own pool from this variable. It must equal the
  *                                   secret's hoopdb_url (same role, same database);
@@ -50,6 +67,11 @@
  *                                   and refuses to start on a mismatch, so the live
  *                                   gates can never evaluate a different identity
  *                                   than the one that writes
+ *   ANALYTICS_SINK                            unset | "" | "noop" (default: no analytics) |
+ *                                   "collector" (one installation-scoped
+ *                                   session_pipeline.index_tick_completed per completed
+ *                                   tick: counts only). "posthog" and any ANALYTICS_POSTHOG_*
+ *                                   value refuse startup (src/shared/analytics-config.ts)
  *
  * Dormant (flag off): nothing else is read or required; the process idles
  * without opening the database. Errors name the variable, never its value.
@@ -57,6 +79,7 @@
 import { searchSecret } from "../shared/search-composition.ts";
 import { parseCompleteSince } from "../session-read-api/config.ts";
 import { destinationPolicy } from "../shared/destination-url.ts";
+import { analyticsConfig, type AnalyticsConfig } from "../shared/analytics-config.ts";
 
 export const CONSUMER_SERVICE_FLAG = "RELAYHISTORY_SELFHOST_PIPELINE_CONSUMER";
 export const CONSUMER_SECRET_VAR = "RELAYHISTORY_PIPELINE_CONSUMER_SECRET";
@@ -64,6 +87,7 @@ export const CONSUMER_BACKEND_VAR = "SEARCH_INDEX_BACKEND";
 export const CONSUMER_BACKEND_ID_VAR = "SEARCH_INDEX_POSTGRES_BACKEND_ID";
 export const CONSUMER_KEY_PREFIX_VAR = "PIPELINE_KEY_PREFIX";
 export const CONSUMER_TLS_PROFILE_VAR = "SESSION_POSTGRES_TLS_PROFILE";
+export const CONSUMER_OUTPUT_FACTS_VAR = "RELAYHISTORY_SELFHOST_OUTPUT_FACTS";
 
 export interface ConsumerSecret {
   hoopdb_url: string;
@@ -86,6 +110,10 @@ export type ConsumerServiceConfig =
       everyMinutes: number;
       fanout: "off";
       unhealthyFile: string;
+      /** RELAYHISTORY_SELFHOST_OUTPUT_FACTS is exactly "true" (default off). */
+      outputFacts: boolean;
+      /** ANALYTICS_* (src/shared/analytics-config.ts, self-host profile: noop or collector). Absent = noop. */
+      analytics?: AnalyticsConfig;
     };
 
 /** `RELAYHISTORY_SELFHOST_PIPELINE_CONSUMER`: exactly "true" enables; unset, empty or "false" is off; anything throws. */
@@ -152,5 +180,10 @@ export function consumerServiceConfig(env: NodeJS.ProcessEnv = process.env): Con
   // The writer must record the reader's floor or partials lists every session as stale.
   const floorMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
   const unhealthyFile = env.CONSUMER_UNHEALTHY_FILE ?? "/tmp/session-pipeline-consumer.unhealthy";
-  return { enabled: true, secret: parseConsumerSecret(secretText), searchBackend: backend, backendId, floorMs, keyPrefix, lookbackMinutes, everyMinutes, fanout, unhealthyFile };
+  const analytics = analyticsConfig(env, "selfhost");
+  return {
+    enabled: true, secret: parseConsumerSecret(secretText), searchBackend: backend, backendId, floorMs, keyPrefix, lookbackMinutes, everyMinutes, fanout, unhealthyFile,
+    outputFacts: env[CONSUMER_OUTPUT_FACTS_VAR] === "true",
+    ...(analytics.sink !== "noop" ? { analytics } : {}),
+  };
 }

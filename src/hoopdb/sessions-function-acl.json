@@ -947,6 +947,40 @@
     "sessions.migration_ingest_audit_append_only()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.output_facts_coverage_for(text,timestamp with time zone,timestamp with time zone)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.output_facts_erase(text,text,text,text[])": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
+    "sessions.output_facts_events_for(text,timestamp with time zone,timestamp with time zone,text,integer)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.output_facts_outputs_for(text,timestamp with time zone,timestamp with time zone,text,integer)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.output_facts_reconcile(text,text,text,text[],text,jsonb,jsonb,boolean,bigint)": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
+    "sessions.output_facts_record_state(text,text,text,text[],text,boolean,timestamp with time zone,timestamp with time zone,bigint,timestamp with time zone)": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
+    "sessions.output_facts_state(text,text,text,text[],text)": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
+    "sessions.output_facts_stored_version(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.output_facts_writer_scope(text,text,text,text[],text)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.owner_buffered_parity_expected(text,text,text,text,bigint,text,text)": [
       "<owner>:EXECUTE"
     ],
@@ -1193,7 +1227,8 @@
     ],
     "sessions.session_directory_project_text(text,text,text)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "service_role:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
     ],
     "sessions.session_directory_read_api_scope(text)": [
       "<owner>:EXECUTE"

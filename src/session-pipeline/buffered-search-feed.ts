@@ -15,6 +15,22 @@
  * `user_id`). The parity test writes the same group through `writeGroups` and compares with
  * `indexSearchScope`'s rows.
  *
+ * Settle holdback (INGEST_BUFFERED_SEARCH_FEED_SETTLE_S, seconds, 180-3600, default 300). The
+ * page RPC lists acknowledged stages in (created_at, stage_token) order behind a server-held,
+ * forward-only cursor, and created_at is the intent's insert time, not its ack time. A stage
+ * still in flight when the cursor passed its position would be acknowledged behind the cursor
+ * and never listed (a late-ack skip). So each page only processes stages created at least the
+ * holdback before the run's clock; at the first younger one the page stops and the cursor waits
+ * before it. A fresh upload's ack is refused once its intent expires (created_at + 120 s), so
+ * nothing can be acknowledged behind a position older than that; the remainder of the default
+ * margin covers the commit tail and Lambda-vs-database clock skew. Nothing is re-scanned or
+ * re-emitted: the cursor never rewinds and every stage is still processed once. The tail lags
+ * by the holdback; the per-object keep-up path is unaffected. Residual: a GC replacement child
+ * keeps its own created_at and can be adopted and acknowledged by a later GC claim; its rows are
+ * its active parent's retained rows (same fingerprint and version), which the parent already
+ * wrote, so a skip there loses no content. A re-scan horizon is not used: the cursor cannot be
+ * rewound through the 043870 RPCs, and the page exposes no ack time.
+ *
  * Provenance marker. Every row written here has `origin = 'buffered'` and
  * `origin_claim_token` = the stage's ORIGINAL claim token (a GC replacement keeps it), the two
  * columns the read-side gate (#338, buffered-search-gate.ts) reads; every other writer leaves
@@ -41,13 +57,42 @@
  * the read Worker must be deployed with READ_API_BUFFERED_SEARCH_GATE=on first. A missing or
  * stale declaration is a logged refusal (reason code only) and the feed does nothing.
  *
- * Idempotency. The row identity is ClickHouse's sort key (org, workspace, ts, session, source,
- * machine, kind, event_id), all derived from the record; `version` is the stage's
- * `received_at` (epoch ms), not the wall clock. A replay or a backfill re-run of the same stage
- * re-inserts byte-identical rows; a GC replacement of the same batch re-inserts rows with the same
- * identity and version that differ only in the fingerprint's stage token, which ReplacingMergeTree
- * folds the same way (equal version: the last inserted survives a merge). Any later canonical pass
- * (version = its wall clock) wins over them.
+ * Version (INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION=off|on, default off; design
+ * docs/design/buffered-feed-version-encoding-s.md). The row identity is ClickHouse's sort key
+ * (org, workspace, ts, session, source, machine, kind, event_id), all derived from the record,
+ * and ReplacingMergeTree(version) keeps the highest `version` per identity. Canonical writers
+ * stamp raw epoch milliseconds of their wall clock. With the flag off the buffered row's
+ * version is the stage header's `received_at` in epoch ms: the receiver's clock, the same
+ * domain as canonical, so a buffered row can outrank (and hide) a canonical row of the same
+ * event, and of two stages the later-received wins rather than the later-created. That is the
+ * defect; INGEST_BUFFERED_SEARCH_FEED=on is therefore refused (`version_encoding_not_armed`)
+ * unless this flag is on too. With the flag on:
+ *  - version = floor(epoch seconds of the stage's PG `created_at`) (encodeBufferedVersion), an
+ *    immutable column, so a replay, a backfill re-run and keep-up all write the same version and
+ *    the exact-version deletes (deleteBufferedRows, the erasure lane) stay valid. A GC replacement
+ *    child has its own created_at, so its rows carry its own (later) version and outrank the
+ *    parent's rows of the same identity; the erasure lane reads each row's version back from
+ *    ClickHouse, so it deletes either exactly. Seconds sit about
+ *    1000x below any raw-ms canonical version, so any canonical row outranks every buffered row
+ *    (B1: 0 < version < BUFFERED_VERSION_CEILING, the proved canonical minimum; unpinned refuses);
+ *  - two stages of one (org, workspace, origin, user) created in the same second would tie. The
+ *    stage RPC (20261105045010) reports `sameSecond: {siblings, pending}` and the feeder refuses
+ *    such a stage whole, fail closed: `same_second_pending` (pending > 0: keep-up requeues, the
+ *    backfill blocks before it), `same_second_tie` (siblings > 0: no ClickHouse insert; the
+ *    backfill records it in the refusal ledger, `search_ingest_state` name `buffered-tie:<token>`,
+ *    reads it back, and only then may advance past it; the run reports ok=false while any refusal
+ *    is outstanding; keep-up only logs and skips). A refusal is never coverage;
+ *  - before a write, rows whose identity already has a non-buffered row in any physical part
+ *    (raw read, no FINAL) are dropped and counted `canonical_present`;
+ *  - the page and stage results are checked strictly: `createdAt` is exactly six fractional
+ *    digits and a real calendar instant, a page is strictly increasing in (createdAt, stageToken)
+ *    after its cursor, and a stage result must match its page candidate (`sql_stage_page_mismatch`).
+ * With the flag off none of this runs and the feeder behaves exactly as before (idempotency: a
+ * replay or a backfill re-run of the same stage re-inserts byte-identical rows; a GC replacement of
+ * the same batch re-inserts rows with the same identity and version that differ only in the
+ * fingerprint's stage token, which ReplacingMergeTree folds the same way: equal version, the last
+ * inserted survives a merge). Under either encoding any later canonical pass (version = its wall
+ * clock) wins over buffered rows.
  *
  * Privacy and erasure. Only what the buffered GC's own retention authority keeps is indexed
  * (`sessions.ingest_buffer_gc_ordinals`, via the feed RPC in
@@ -79,8 +124,8 @@ import { layoutComponent } from "../shared/layout-component.ts";
 import { isObjectStoreError, type ObjectStore } from "../shared/vendor.ts";
 import { arrayLiteral, tuple, type ClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { rowBytes, toIndexRow, tsMillis, type IndexRow } from "./vendor/search-index/rows.ts";
-import { EVENTS_TABLE } from "./vendor/search-index/schema.ts";
-import { windowStart } from "./vendor/search-index/reconcile.ts";
+import { EVENTS_TABLE, INGEST_STATE_TABLE } from "./vendor/search-index/schema.ts";
+import { readState, windowStart, writeState } from "./vendor/search-index/reconcile.ts";
 import type { SessionScope } from "./pointer.ts";
 import { BUFFERED_SEARCH_GATE_CONTRACT } from "../session-read-api/buffered-search-gate.ts";
 
@@ -88,7 +133,15 @@ import { BUFFERED_SEARCH_GATE_CONTRACT } from "../session-read-api/buffered-sear
 export const BUFFERED_FINGERPRINT_PREFIX = "bf";
 /** The read-side gate's marker values and columns (#338 buffered-search-gate.ts ORIGIN_*). */
 export const ORIGIN_BUFFERED = "buffered";
-export const ORIGIN_COLUMNS = { origin: { type: "LowCardinality(String)", default: "'canonical'" }, origin_claim_token: { type: "String", default: "''" } } as const;
+/**
+ * Each origin column's exact system.columns definition. `kind` is system.columns.default_kind: only
+ * a plain DEFAULT stores what the feeder inserts (a MATERIALIZED or ALIAS column of the same type
+ * and expression would reject or ignore the explicit value and read back 'canonical').
+ */
+export const ORIGIN_COLUMNS = {
+  origin: { type: "LowCardinality(String)", kind: "DEFAULT", default: "'canonical'" },
+  origin_claim_token: { type: "String", kind: "DEFAULT", default: "''" },
+} as const;
 /** The buffered cutover: the first buffered acceptance in production. */
 export const BUFFERED_FEED_DEFAULT_SINCE = "2026-11-05T05:33:45.000Z";
 export const BUFFERED_FEED_DEFAULT_CURSOR = "backfill-20261105";
@@ -135,9 +188,65 @@ export interface BufferedFeedConfig {
   cursor: string;
   /** Wall budget of one invocation; stays under the one-minute schedule so runs do not overlap. */
   budgetMs: number;
+  /** INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION=on: the S version encoding and its same-second refusal. */
+  secondVersion: boolean;
+  /** Only stages created at least this long before the run's clock are processed (late-ack guard). 180-3600 s, default 300. */
+  settleMs: number;
 }
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/;
+
+/**
+ * B1 ceiling of the buffered version band: every buffered version must be below it. It is the exact
+ * positive canonical minimum `min(version)` of transcript_events (origin 'canonical'), no safety factor.
+ * TODO(buffered-feed S, activation prerequisite 1): pin this from the operator's counts-only read
+ * (canonical count, min(version), countIf(version = 0), countIf(version < 1e12); buffered count and
+ * max(version); docs/design/buffered-feed-version-encoding-s.md sections 1 and 10), with the read's
+ * date, in a later commit. Pin it only if that read proves canonical count > 0, no version-0 or
+ * below-1e12 canonical row, and no buffered row. Until then it is unpinned and the S encoding refuses
+ * (`buffered_version_ceiling_unpinned`), so the feed cannot be armed.
+ */
+export const BUFFERED_VERSION_CEILING: number | undefined = undefined;
+
+/** The exact createdAt the feed RPCs emit (to_char ... .US): six fractional digits, UTC. */
+const CREATED_AT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.\d{6}Z$/;
+
+/**
+ * Whole epoch seconds of an RPC createdAt, or null unless it has the exact grammar and names a real
+ * calendar instant (fixed fields through Date.UTC, then reformatted and compared; never Date.parse).
+ */
+export function createdAtSeconds(value: unknown): number | null {
+  if (typeof value !== "string") return null;
+  const m = CREATED_AT.exec(value);
+  if (!m) return null;
+  const [y, mo, d, h, mi, sec] = m.slice(1).map(Number) as [number, number, number, number, number, number];
+  const ms = Date.UTC(y, mo - 1, d, h, mi, sec);
+  if (!Number.isFinite(ms) || new Date(ms).toISOString().slice(0, 19) !== value.slice(0, 19)) return null;
+  return Math.floor(ms / 1000);
+}
+
+/**
+ * S encoding: the buffered row version is floor(epoch seconds of the stage's created_at). Refuses an
+ * unpinned ceiling, a createdAt outside the exact grammar, and a value outside 0 < v < ceiling (B1).
+ */
+export function encodeBufferedVersion(createdAt: string, ceiling: number | undefined = BUFFERED_VERSION_CEILING): number {
+  if (ceiling === undefined) throw new BufferedFeedError("buffered_version_ceiling_unpinned");
+  const seconds = createdAtSeconds(createdAt);
+  if (seconds === null) throw new BufferedFeedError("stage_created_at_invalid");
+  if (!Number.isSafeInteger(seconds) || seconds <= 0 || seconds >= ceiling) throw new BufferedFeedError("buffered_version_out_of_band");
+  return seconds;
+}
+
+/**
+ * The version-encoding guard: why INGEST_BUFFERED_SEARCH_FEED=on must not run, or null. The legacy
+ * received_at version is the defect, so `on` needs INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION=on
+ * (`version_encoding_not_armed`) and a pinned BUFFERED_VERSION_CEILING (`buffered_version_ceiling_unpinned`).
+ */
+export function bufferedFeedVersionRefusal(env: NodeJS.ProcessEnv, ceiling: number | undefined = BUFFERED_VERSION_CEILING):
+  "version_encoding_not_armed" | "buffered_version_ceiling_unpinned" | null {
+  if (env.INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION !== "on") return "version_encoding_not_armed";
+  return ceiling === undefined ? "buffered_version_ceiling_unpinned" : null;
+}
 
 export { BUFFERED_SEARCH_GATE_CONTRACT };
 
@@ -154,13 +263,18 @@ export function bufferedFeedGateRefusal(env: NodeJS.ProcessEnv): "gate_not_decla
 
 /**
  * Only the literals `off` (default) and `on`; every other value refuses, so a typo never arms it.
- * `on` is refused unless BUFFERED_SEARCH_FEED_GATE_DECLARED declares the read gate's contract.
+ * `on` is refused unless BUFFERED_SEARCH_FEED_GATE_DECLARED declares the read gate's contract, and
+ * unless the version encoding is armed (bufferedFeedVersionRefusal; `versionCeiling` is for tests).
  */
-export function bufferedFeedConfig(env: NodeJS.ProcessEnv): BufferedFeedConfig {
+export function bufferedFeedConfig(env: NodeJS.ProcessEnv, versionCeiling: number | undefined = BUFFERED_VERSION_CEILING): BufferedFeedConfig {
   const flag = env.INGEST_BUFFERED_SEARCH_FEED ?? "off";
   if (flag !== "off" && flag !== "on") throw new BufferedFeedError("config_flag_invalid");
   const refusal = flag === "on" ? bufferedFeedGateRefusal(env) : null;
   if (refusal) throw new BufferedFeedError(refusal);
+  const second = env.INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION ?? "off";
+  if (second !== "off" && second !== "on") throw new BufferedFeedError("config_second_version_invalid");
+  const versionRefusal = flag === "on" ? bufferedFeedVersionRefusal(env, versionCeiling) : null;
+  if (versionRefusal) throw new BufferedFeedError(versionRefusal);
   const int = (name: string, fallback: number, min: number, max: number) => {
     const raw = env[name];
     if (raw === undefined || raw === "") return fallback;
@@ -178,6 +292,8 @@ export function bufferedFeedConfig(env: NodeJS.ProcessEnv): BufferedFeedConfig {
     since,
     cursor,
     budgetMs: int("INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS", 50_000, 5_000, 240_000),
+    secondVersion: second === "on",
+    settleMs: int("INGEST_BUFFERED_SEARCH_FEED_SETTLE_S", 300, 180, 3_600) * 1_000,
   };
 }
 
@@ -198,6 +314,8 @@ export interface StageState {
   /** The stage's original admission (ingest_claim_attempts); the read gate looks it up. */
   claimToken?: string;
   stage?: BufferedStageSpec & { stageToken: string; createdAt: string };
+  /** 20261105045010: other intents of the same tuple in the same second (parsed only with secondVersion). */
+  sameSecond?: { siblings: number; pending: number };
 }
 export interface FeedPage { after: { createdAt: string; stageToken: string } | null; stages: StageCandidate[] }
 
@@ -223,8 +341,17 @@ function checkOrdinals(v: unknown): number[] {
   return v as number[];
 }
 
-/** The 043870 feed RPCs, one autocommit statement each (each its own short transaction). */
-export function sqlBufferedFeedSource(db: SqlExecutor): BufferedFeedSource {
+/** Strictly increasing keyset order: (createdAt, stageToken) with both validated, so string order is time/uuid order. */
+const keysetBefore = (a: { createdAt: string; stageToken: string }, b: { createdAt: string; stageToken: string }) =>
+  a.createdAt < b.createdAt || (a.createdAt === b.createdAt && a.stageToken < b.stageToken);
+
+/**
+ * The 043870 feed RPCs, one autocommit statement each (each its own short transaction). With
+ * `secondVersion` (INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION=on) every createdAt has the exact grammar,
+ * a page is a strict keyset after its cursor, and a found stage must carry 045010's `sameSecond`.
+ */
+export function sqlBufferedFeedSource(db: SqlExecutor, options: { secondVersion?: boolean } = {}): BufferedFeedSource {
+  const strict = options.secondVersion === true;
   const call = async (name: "page" | "stage" | "advance", p: unknown): Promise<Record<string, unknown>> => {
     let value: unknown;
     try { value = (await db.query<{ r: unknown }>(`SELECT sessions.buffered_search_feed_${name}($1::jsonb) AS r`, [JSON.stringify(p)])).rows[0]?.r; }
@@ -251,6 +378,12 @@ export function sqlBufferedFeedSource(db: SqlExecutor): BufferedFeedSource {
       for (let i = 1; i < stages.length; i++)
         if (stages[i - 1]!.createdAt > stages[i]!.createdAt) bad("sql_page_order");
       const after = r.after === null ? null : obj(r.after) && str(r.after.createdAt) && str(r.after.stageToken) ? { createdAt: r.after.createdAt, stageToken: r.after.stageToken } : bad("sql_page_after");
+      if (strict) {
+        if (after && (createdAtSeconds(after.createdAt) === null || !UUID.test(after.stageToken))) bad("sql_page_after");
+        if (stages.some((s) => createdAtSeconds(s.createdAt) === null)) bad("sql_page_row");
+        for (let i = 0; i < stages.length; i++)
+          if (!keysetBefore(i === 0 ? after ?? { createdAt: "", stageToken: "" } : stages[i - 1]!, stages[i]!)) bad("sql_page_order");
+      }
       return { after, stages };
     },
     async stage(ref) {
@@ -266,6 +399,14 @@ export function sqlBufferedFeedSource(db: SqlExecutor): BufferedFeedSource {
       const groupOrdinals = (spec.groupOrdinals as unknown[]).map(checkOrdinals);
       if ("stageToken" in ref && spec.stageToken !== ref.stageToken) bad("sql_stage_identity");
       if ("stageKey" in ref && spec.key !== ref.stageKey) bad("sql_stage_identity");
+      let sameSecond: StageState["sameSecond"];
+      if (strict) {
+        if (createdAtSeconds(spec.createdAt) === null) bad("sql_stage_spec");
+        if (!("sameSecond" in r)) bad("sql_same_second_unavailable");
+        const ss = r.sameSecond;
+        if (!obj(ss) || !Number.isSafeInteger(ss.siblings) || !Number.isSafeInteger(ss.pending) || (ss.pending as number) < 0 || (ss.siblings as number) < (ss.pending as number)) bad("sql_same_second_malformed");
+        sameSecond = { siblings: (ss as Record<string, number>).siblings!, pending: (ss as Record<string, number>).pending! };
+      }
       return {
         ...state,
         tenant: checkTenant(r.tenant),
@@ -273,6 +414,7 @@ export function sqlBufferedFeedSource(db: SqlExecutor): BufferedFeedSource {
         batchId: r.batchId as string,
         claimToken: r.claimToken as string,
         stage: { stageToken: spec.stageToken as string, key: spec.key as string, sha256: spec.sha256 as string, bytes: spec.bytes as number, groupOrdinals, createdAt: spec.createdAt as string },
+        ...(sameSecond ? { sameSecond } : {}),
       };
     },
     async advance(cursor, to, counts) {
@@ -304,13 +446,18 @@ const admitted = (v: string) => v.length > 0 && Array.from(v).length <= 255 && !
 
 /**
  * The index rows a live manifest written from this stage's retained lines would give
- * `indexSearchScope`, fingerprinted as buffered-origin. Pure: no IO.
+ * `indexSearchScope`, fingerprinted as buffered-origin. Pure: no IO. `version` is the S encoding
+ * (encodeBufferedVersion) when INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION is on; omitted, the legacy
+ * `received_at` epoch ms (the defect; see the header). `received_at` is parse-checked either way.
+ * `stageToken` binds each row's fingerprint to this stage (bufferedFingerprint) for the erasure lane.
  */
-export function projectBufferedStage(decoded: DecodedBufferedStage, retained: ReadonlySet<number>, keyRoot: string, stageToken: string): StageProjection {
+export function projectBufferedStage(decoded: DecodedBufferedStage, retained: ReadonlySet<number>, keyRoot: string, stageToken: string, encoded?: number): StageProjection {
   const { header, groups, spec } = decoded;
   if (!spec.key.startsWith(`${keyRoot}/${header.org_id}/buffered-batches/v1/`)) throw new BufferedFeedError("stage_key_tenant_mismatch");
-  const version = Date.parse(header.received_at);
-  if (!Number.isSafeInteger(version) || version <= 0) throw new BufferedFeedError("stage_received_at_invalid");
+  const received = Date.parse(header.received_at);
+  if (!Number.isSafeInteger(received) || received <= 0) throw new BufferedFeedError("stage_received_at_invalid");
+  if (encoded !== undefined && (!Number.isSafeInteger(encoded) || encoded <= 0)) throw new BufferedFeedError("buffered_version_out_of_band");
+  const version = encoded ?? received;
   const workspace = layoutComponent(header.workspace_id);
   const machineId = liveMachineId(header.workspace_id, header.origin_id, header.user_id);
   const userId = admitted(header.user_id) ? header.user_id : "";
@@ -353,17 +500,18 @@ export function projectBufferedStage(decoded: DecodedBufferedStage, retained: Re
 // ---------------------------------------------------------------- ClickHouse
 
 /**
- * The origin columns exist with exactly the read gate's definitions. Without them an insert
- * would either fail or (on a server that drops unknown JSON fields) land rows as canonical.
+ * The origin columns exist with exactly the read gate's definitions (type, default kind and
+ * default expression). Without them an insert would either fail or (on a server that drops
+ * unknown JSON fields, or with a MATERIALIZED/ALIAS column) land rows as canonical.
  */
 export async function assertOriginColumns(ch: ClickHouseClient): Promise<void> {
-  const rows = await ch.select<{ name: string; type: string; default_expression: string }>(
-    `SELECT name, type, default_expression FROM system.columns
+  const rows = await ch.select<{ name: string; type: string; default_kind: string; default_expression: string }>(
+    `SELECT name, type, default_kind, default_expression FROM system.columns
      WHERE database = currentDatabase() AND table = {table:String} AND name IN ('origin', 'origin_claim_token')`,
     { params: { table: EVENTS_TABLE }, timeoutMs: 10_000 });
   for (const [name, want] of Object.entries(ORIGIN_COLUMNS)) {
     const got = rows.find((r) => r.name === name);
-    if (!got || got.type !== want.type || got.default_expression !== want.default) throw new BufferedFeedError("origin_columns_missing");
+    if (!got || got.type !== want.type || got.default_kind !== want.kind || got.default_expression !== want.default) throw new BufferedFeedError("origin_columns_missing");
   }
 }
 
@@ -397,6 +545,90 @@ export async function deleteBufferedRows(ch: ClickHouseClient, rows: readonly Bu
   return rows.length;
 }
 
+/**
+ * Guard (c), INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION only: which of these rows' identities already have
+ * a non-buffered row in transcript_events. A raw read (no FINAL), so every physical part counts, merged or
+ * not; lightweight-deleted rows are masked. Same identity tuple as deleteBufferedRows. Returns the indexes
+ * of the matched rows. Defense in depth: the B1 band, not this check, is what makes canonical outrank.
+ */
+export async function canonicalPresent(ch: ClickHouseClient, rows: readonly IndexRow[], maxKeys = 500): Promise<Set<number>> {
+  const { createHash } = await import("node:crypto");
+  const keyOf = (v: readonly unknown[]) => JSON.stringify(v.map(String));
+  const keys = rows.map((r) => [r.org_id, r.session_id, r.workspace_id, r.machine_id, r.source, r.kind,
+    createHash("sha256").update(r.event_id).digest("hex"), tsMillis(`${r.ts.replace(" ", "T")}Z`)] as const);
+  const present = new Set<string>();
+  for (let i = 0; i < keys.length; i += maxKeys) {
+    const literals = keys.slice(i, i + maxKeys).map((k) => arrayLiteral([tuple(...k)]).slice(1, -1));
+    const found = await ch.select<{ org_id: string; session_id: string; workspace_id: string; machine_id: string; source: string; kind: string; e: string; t: string }>(
+      `SELECT org_id, session_id, workspace_id, machine_id, source, kind, lower(hex(SHA256(event_id))) AS e, toString(toUnixTimestamp64Milli(ts)) AS t
+       FROM ${EVENTS_TABLE}
+       WHERE (org_id, session_id, workspace_id, machine_id, source, kind, lower(hex(SHA256(event_id))), toUnixTimestamp64Milli(ts))
+         IN [${literals.join(",")}] AND origin <> '${ORIGIN_BUFFERED}'`,
+      { settings: { max_query_size: 1_048_576 }, timeoutMs: 60_000 });
+    for (const f of found) present.add(keyOf([f.org_id, f.session_id, f.workspace_id, f.machine_id, f.source, f.kind, f.e, f.t]));
+  }
+  const out = new Set<number>();
+  keys.forEach((k, i) => { if (present.has(keyOf(k))) out.add(i); });
+  return out;
+}
+
+/** One same-second refusal, durable in `search_ingest_state` (no content: counts, a timestamp and a state). */
+export interface TieLedgerEntry { siblings: number; firstSeen: string; revisits: number; state: string }
+/** The refusal ledger the backfill writes and reads back before its cursor may pass a refused stage. */
+export interface BufferedTieLedger {
+  read(stageToken: string): Promise<TieLedgerEntry | null>;
+  write(stageToken: string, entry: TieLedgerEntry): Promise<void>;
+  /** Refusals not resolved (every entry until a resolution lane marks it `resolved_*`). */
+  outstanding(): Promise<number>;
+}
+export const BUFFERED_TIE_LEDGER_PREFIX = "buffered-tie:";
+
+function parseTieEntry(value: string): TieLedgerEntry {
+  let v: unknown;
+  try { v = JSON.parse(value); } catch { v = null; }
+  if (!obj(v) || !Number.isSafeInteger(v.siblings) || !str(v.firstSeen) || !Number.isSafeInteger(v.revisits) || !str(v.state)) bad("tie_ledger_malformed");
+  const e = v as Record<string, unknown>;
+  return { siblings: e.siblings as number, firstSeen: e.firstSeen as string, revisits: e.revisits as number, state: e.state as string };
+}
+
+/** The ledger in ClickHouse `search_ingest_state` (the vendored named-state table), one name per stage. */
+export function clickhouseTieLedger(ch: ClickHouseClient, now: () => number = Date.now): BufferedTieLedger {
+  return {
+    async read(stageToken) {
+      const value = await readState(ch, BUFFERED_TIE_LEDGER_PREFIX + stageToken);
+      return value === null ? null : parseTieEntry(value);
+    },
+    async write(stageToken, entry) {
+      await writeState(ch, BUFFERED_TIE_LEDGER_PREFIX + stageToken,
+        JSON.stringify({ siblings: entry.siblings, firstSeen: entry.firstSeen, revisits: entry.revisits, state: entry.state }), new Date(now()));
+    },
+    async outstanding() {
+      const rows = await ch.select<{ n: string | number }>(
+        `SELECT count() AS n FROM (
+           SELECT name, argMax(value, updated_at) AS v FROM ${INGEST_STATE_TABLE}
+           WHERE startsWith(name, {prefix:String}) GROUP BY name)
+         WHERE NOT startsWith(JSONExtractString(v, 'state'), 'resolved_')`,
+        { params: { prefix: BUFFERED_TIE_LEDGER_PREFIX }, timeoutMs: 30_000 });
+      const n = Number(rows[0]?.n ?? 0);
+      if (!Number.isSafeInteger(n) || n < 0) bad("tie_ledger_outstanding");
+      return n;
+    },
+  };
+}
+
+/**
+ * Durably record a same-second refusal and read it back. An existing entry is kept as is (a replay
+ * after a crash). Throws (the cursor stays) if the write fails or the read-back differs.
+ */
+async function recordTie(ledger: BufferedTieLedger, stageToken: string, siblings: number, nowMs: number): Promise<void> {
+  if (await ledger.read(stageToken)) return;
+  const entry: TieLedgerEntry = { siblings, firstSeen: new Date(nowMs).toISOString(), revisits: 0, state: "refused" };
+  await ledger.write(stageToken, entry);
+  const back = await ledger.read(stageToken);
+  if (!back || back.siblings !== entry.siblings || back.firstSeen !== entry.firstSeen || back.revisits !== entry.revisits || back.state !== entry.state)
+    throw new BufferedFeedError("tie_ledger_readback");
+}
+
 // ---------------------------------------------------------------- feeder
 
 export interface BufferedFeedDeps {
@@ -411,6 +643,12 @@ export interface BufferedFeedDeps {
   insertBatch?: number;
   /** Projected bytes held before a page writes what it has (rows.ts rowBytes). */
   flushBytes?: number;
+  /**
+   * INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION=on (the source must be built with `secondVersion` too).
+   * Absent: the legacy path, unchanged. `versionCeiling` is for tests only; production uses
+   * BUFFERED_VERSION_CEILING.
+   */
+  secondVersion?: { ledger: BufferedTieLedger; versionCeiling?: number };
 }
 
 const originChecked = new WeakMap<ClickHouseClient, Promise<void>>();
@@ -441,7 +679,7 @@ function assertStageTenant(state: StageState, decoded: DecodedBufferedStage, key
  * Read and project one live stage. A skip (with its code) when the object is gone or does not
  * match the ledger: never indexed, and never a reason to stall the cursor. Transient reads throw.
  */
-async function loadLive(state: StageState, deps: BufferedFeedDeps, fromMs: number): Promise<Loaded | { skip: string }> {
+async function loadLive(state: StageState, deps: BufferedFeedDeps, fromMs: number, version?: number): Promise<Loaded | { skip: string }> {
   let decoded: DecodedBufferedStage;
   try {
     decoded = await readBufferedStage(deps.store, state.stage!, deps.decompress ?? defaultDecompress);
@@ -458,15 +696,23 @@ async function loadLive(state: StageState, deps: BufferedFeedDeps, fromMs: numbe
     if (error instanceof BufferedFeedError) return { skip: error.code };
     throw error;
   }
-  const projection = projectBufferedStage(decoded, new Set(state.retained), deps.keyRoot, state.stage!.stageToken);
+  const projection = projectBufferedStage(decoded, new Set(state.retained), deps.keyRoot, state.stage!.stageToken, version);
   // The canonical indexer's window: older rows are not indexed by either path.
   projection.rows = projection.rows.filter((r) => tsMillis(`${r.row.ts.replace(" ", "T")}Z`) >= fromMs);
   return { state, projection };
 }
 
 /** Insert, then re-check each stage and delete rows of records retention no longer keeps. */
-async function writeAndRecheck(loaded: Loaded[], deps: BufferedFeedDeps): Promise<{ rows: number; deleted: number }> {
+async function writeAndRecheck(loaded: Loaded[], deps: BufferedFeedDeps): Promise<{ rows: number; deleted: number; canonicalPresent?: number }> {
   await originReady(deps.ch);
+  let dropped: number | undefined;
+  if (deps.secondVersion) {
+    // Guard (c): an identity that already has a canonical row anywhere in the table is not written.
+    const present = await canonicalPresent(deps.ch, loaded.flatMap((l) => l.projection.rows.map((r) => r.row)));
+    let i = 0;
+    for (const l of loaded) l.projection.rows = l.projection.rows.filter(() => !present.has(i++));
+    dropped = present.size;
+  }
   const batch = deps.insertBatch ?? 5_000;
   const all = loaded.flatMap((l) => l.projection.rows.map((r) => r.row));
   for (let i = 0; i < all.length; i += batch) await deps.ch.insert(EVENTS_TABLE, all.slice(i, i + batch), { timeoutMs: 60_000 });
@@ -479,10 +725,20 @@ async function writeAndRecheck(loaded: Loaded[], deps: BufferedFeedDeps): Promis
     for (const r of l.projection.rows) if (!r.ordinals.some((o) => keep.has(o))) stale.push(r.row);
   }
   const deleted = stale.length ? await deleteBufferedRows(deps.ch, stale) : 0;
-  return { rows: all.length, deleted };
+  return dropped === undefined ? { rows: all.length, deleted } : { rows: all.length, deleted, canonicalPresent: dropped };
 }
 
-export type KeepUpOutcome = { outcome: "indexed"; rows: number; deleted: number } | { outcome: "requeue" | "skipped"; reason: string };
+/** Same-second decision for a live stage under the S encoding: null (write it), or the refusal. */
+function sameSecondRefusal(state: StageState): "same_second_pending" | "same_second_tie" | null {
+  const ss = state.sameSecond;
+  if (!ss) throw new BufferedFeedError("sql_same_second_unavailable");
+  if (ss.pending > 0) return "same_second_pending";
+  return ss.siblings > 0 ? "same_second_tie" : null;
+}
+
+export type KeepUpOutcome =
+  | { outcome: "indexed"; rows: number; deleted: number; canonicalPresent?: number }
+  | { outcome: "requeue" | "skipped"; reason: string; siblings?: number; ageMs?: number };
 
 /** KEEP-UP: one stage named by its object key (an S3 event on the pipeline queue, or a requeue). */
 export async function feedBufferedStageByKey(key: string, deps: BufferedFeedDeps): Promise<KeepUpOutcome> {
@@ -493,8 +749,18 @@ export async function feedBufferedStageByKey(key: string, deps: BufferedFeedDeps
   // which cannot pass an undecided stage.
   if (state.status === "pending" || (state.status === "deferred" && state.reason === "gc_in_flight")) return { outcome: "requeue", reason: state.reason ?? state.status };
   if (state.status !== "live") return { outcome: "skipped", reason: state.reason ?? state.status };
+  let version: number | undefined;
+  if (deps.secondVersion) {
+    // Keep-up never writes the refusal ledger: the backfill/tail cursor is the one authority that
+    // classifies the stage, and a keep-up skip is never coverage.
+    const refusal = sameSecondRefusal(state);
+    const ageMs = (deps.now ?? Date.now)() - (createdAtSeconds(state.stage!.createdAt) ?? 0) * 1000;
+    if (refusal === "same_second_pending") return { outcome: "requeue", reason: refusal, ageMs };
+    if (refusal) return { outcome: "skipped", reason: refusal, siblings: state.sameSecond!.siblings };
+    version = encodeBufferedVersion(state.stage!.createdAt, deps.secondVersion.versionCeiling ?? BUFFERED_VERSION_CEILING);
+  }
   const fromMs = Date.parse(await windowStart(deps.ch, new Date((deps.now ?? Date.now)())));
-  const loaded = await loadLive(state, deps, fromMs);
+  const loaded = await loadLive(state, deps, fromMs, version);
   if ("skip" in loaded) return { outcome: "skipped", reason: loaded.skip };
   const written = await writeAndRecheck([loaded], deps);
   return { outcome: "indexed", ...written };
@@ -507,11 +773,17 @@ export interface BackfillSummary {
   skipped: number;
   rows: number;
   deleted: number;
-  /** The cursor reached the newest accepted stage. */
+  /** The cursor reached the newest accepted stage past the settle holdback. */
   caughtUp: boolean;
   /** A stage could not be decided yet (GC in flight, privacy fenced): the cursor waits before it. */
   blocked?: string;
   reasons: Record<string, number>;
+  /** S encoding only: same-second refusals recorded this run (never coverage). */
+  refused?: number;
+  /** S encoding only: unresolved refusals in the durable ledger after this run. */
+  refusalsOutstanding?: number;
+  /** S encoding only: rows not written because a canonical row of the identity exists (guard (c)). */
+  canonicalPresent?: number;
 }
 
 /**
@@ -519,16 +791,21 @@ export interface BackfillSummary {
  * past stages that were indexed (and re-checked) or are terminally not indexable, and only after
  * the ClickHouse writes, so a crash replays at most one page (idempotent).
  */
-export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<BufferedFeedConfig, "pageSize" | "stagesPerSecond" | "since" | "cursor" | "budgetMs">): Promise<BackfillSummary> {
+export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<BufferedFeedConfig, "pageSize" | "stagesPerSecond" | "since" | "cursor" | "budgetMs"> & { settleMs?: number }): Promise<BackfillSummary> {
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const deadline = now() + config.budgetMs;
   const interval = 1_000 / config.stagesPerSecond;
   const summary: BackfillSummary = { pages: 0, stages: 0, indexed: 0, skipped: 0, rows: 0, deleted: 0, caughtUp: false, reasons: {} };
+  const s2 = deps.secondVersion;
+  if (s2) { summary.refused = 0; summary.canonicalPresent = 0; }
   const count = (reason: string) => (summary.reasons[reason] = (summary.reasons[reason] ?? 0) + 1);
   const fromMs = Date.parse(await windowStart(deps.ch, new Date(now())));
   let next = now();
+  let settling = false;
   while (now() < deadline) {
+    // Taken before the page is read: every stage listed at or before it is past its ack window.
+    const horizon = now() - (config.settleMs ?? 300_000);
     const page = await deps.source.page(config.cursor, config.since, config.pageSize);
     summary.pages += 1;
     let loaded: Loaded[] = [];
@@ -538,6 +815,10 @@ export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<Buffe
       const written = await writeAndRecheck(loaded, deps);
       summary.rows += written.rows;
       summary.deleted += written.deleted;
+      if (written.canonicalPresent !== undefined) {
+        summary.canonicalPresent! += written.canonicalPresent;
+        if (written.canonicalPresent) summary.reasons.canonical_present = (summary.reasons.canonical_present ?? 0) + written.canonicalPresent;
+      }
       loaded = [];
       held = 0;
     };
@@ -545,14 +826,45 @@ export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<Buffe
     let indexed = 0, skipped = 0;
     for (const candidate of page.stages) {
       if (now() >= deadline) break;
+      // Too young to be settled (or unparseable): stop here; the cursor waits before it.
+      if (!(Date.parse(candidate.createdAt) <= horizon)) { settling = true; break; }
       const wait = next - now();
       if (wait > 0) await sleep(wait);
       next = Math.max(next, now()) + interval;
       const state = await deps.source.stage({ stageToken: candidate.stageToken });
       summary.stages += 1;
+      let version: number | undefined;
+      if (s2) {
+        // (d2) The stage result must be the page candidate's own stage, on every bound field.
+        if (state.found && (state.stage?.stageToken !== candidate.stageToken || state.stage.createdAt !== candidate.createdAt ||
+            state.originId !== candidate.originId || state.batchId !== candidate.batchId || state.tenant?.orgId !== candidate.tenant.orgId ||
+            state.tenant.workspaceId !== candidate.tenant.workspaceId || state.tenant.userId !== candidate.tenant.userId))
+          throw new BufferedFeedError("sql_stage_page_mismatch");
+      }
       if (state.status === "deferred" || state.status === "pending") { summary.blocked = state.reason ?? state.status; break; }
+      if (state.status === "live" && s2) {
+        const refusal = sameSecondRefusal(state);
+        if (refusal === "same_second_pending") { summary.blocked = refusal; break; }
+        // Cross-check of the PG count: the previous candidate on this page shares the sibling tuple and second.
+        const prev = page.stages[page.stages.indexOf(candidate) - 1];
+        if (!refusal && prev && prev.tenant.orgId === candidate.tenant.orgId && prev.tenant.workspaceId === candidate.tenant.workspaceId &&
+            prev.originId === candidate.originId && prev.tenant.userId === candidate.tenant.userId &&
+            createdAtSeconds(prev.createdAt) === createdAtSeconds(candidate.createdAt))
+          throw new BufferedFeedError("same_second_count_disagrees");
+        if (refusal === "same_second_tie") {
+          // Terminal and deterministic (intents are never deleted): no ClickHouse insert. Durable ledger
+          // entry, read back, before the cursor may pass it; a failure throws and the cursor stays.
+          await recordTie(s2.ledger, candidate.stageToken, state.sameSecond!.siblings, now());
+          count(refusal);
+          summary.refused! += 1;
+          skipped += 1;
+          last = candidate;
+          continue;
+        }
+        version = encodeBufferedVersion(state.stage!.createdAt, s2.versionCeiling ?? BUFFERED_VERSION_CEILING);
+      }
       if (state.status === "live") {
-        const got = await loadLive(state, deps, fromMs);
+        const got = await loadLive(state, deps, fromMs, version);
         if ("skip" in got) { count(got.skip); skipped += 1; }
         else {
           for (const reason of got.projection.reasons) count(reason);
@@ -570,7 +882,11 @@ export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<Buffe
     summary.indexed += indexed;
     summary.skipped += skipped;
     if (summary.blocked) break;
+    // Caught up to the settle horizon; the younger stages are listed again on a later run.
+    if (settling) { summary.caughtUp = true; break; }
     if (page.stages.length < config.pageSize && (page.stages.length === 0 || last === page.stages.at(-1))) { summary.caughtUp = true; break; }
   }
+  // A recorded refusal stays outstanding (the run is not ok) until a resolution lane marks it.
+  if (s2) summary.refusalsOutstanding = await s2.ledger.outstanding();
   return summary;
 }

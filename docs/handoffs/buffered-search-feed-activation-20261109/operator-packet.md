@@ -48,7 +48,7 @@ stays the incumbent this week; no replacement is planned.
 | 4 | Reader deploy with `READ_API_BUFFERED_SEARCH_GATE=on` | Khaliq | steps 1 and 3 | mostly carries over (gate SQL and rules); the origin columns in the CH query are WASTED | 3 |
 | 5 | Feed role `LOGIN` plus the secret fields | Khaliq | step 3 | carries over | 2.4 |
 | 6 | Feeder rollout (DISABLED rule) | Khaliq | none in code | carries over (the scheduler); the CH sink is WASTED | 4 |
-| 7 | Feeder enable (`INGEST_BUFFERED_SEARCH_FEED=on`) | Khaliq | **G1, G2, G3, G4** | the projection and cursor carry over; the CH insert is WASTED | 4, 5 |
+| 7 | Feeder enable (`INGEST_BUFFERED_SEARCH_FEED=on`) | Khaliq | **G1** (in progress, 045010), **G2** (#449, PR open), **G3** (#383), **G4** (in-repo audit done; readers outside this repo unverified) | the projection and cursor carry over; the CH insert is WASTED | 4, 5, 7.1 |
 | 8 | Backfill from 2026-11-05 05:33:45Z | Khaliq (the same enable) | step 7 | the cursor and projection carry over; the CH inserts are WASTED | 5 |
 
 PR verdicts (ADDENDUM A). Detail is in section 7.
@@ -69,6 +69,19 @@ PR verdicts (ADDENDUM A). Detail is in section 7.
   its section 10 prerequisites) is a MUST before the enable. The S encoding itself is
   ReplacingMergeTree-specific (WASTED on a backend change); its PG same-second refusal carries
   over.
+
+Lane results 2026-11-09 (section 7.1). None of these changes the verdict: the feeder must still
+NOT be enabled.
+
+* **#449** (fix/buffered-feed-late-ack-20261109, head 60de08a9): the G2 fix, a settle holdback.
+  PR open, CI green pending merge.
+* **#448** (feat/buffered-feed-stack-knobs-20261109, head 9db9d79b): the G6 stack knobs for
+  page, rate and budget. PR open, CI green pending merge. It does not pass through #449's
+  `INGEST_BUFFERED_SEARCH_FEED_SETTLE_S`; that is a one-line follow-up.
+* **G1**: in progress on fix/buffered-feed-version-s-20261109, migration slot 045010. Not yet
+  a PR.
+* **G4**: the in-repo audit is done. No reader in this repo serves buffered rows unfiltered.
+  Readers outside this repo are still unverified, so G4 stays a blocker for those only.
 
 ## 1. ClickHouse DDL
 
@@ -306,7 +319,9 @@ Runtime facts:
   `state` and `reason` (`lambda.ts:679-701`).
 * Defaults: page 50 (1-200), rate 5 stages/s (1-50), budget 50 s (5-240 s), since = cutover,
   cursor `backfill-20261105` (`buffered-search-feed.ts:81-82,134-150`). **The stack exposes
-  none of these knobs** (`session-pipeline.ts:183-196,346`), so prod runs the defaults (G6).
+  none of these knobs on main** (`session-pipeline.ts:183-196,346`), so prod runs the defaults
+  (G6). #448 (PR open) adds page, rate and budget; SINCE, CURSOR and #449's SETTLE_S stay
+  unexposed (section 7.1).
 * The page RPC lists only `receipt_state='acknowledged'`, `cleanup_state='live'` stages that are
   the active outbox stage, keyset on `(created_at, stage_token)`
   (`20261105043870_buffered_search_feed_cursor.sql:150-166`). This is the late-ack gap (G2).
@@ -427,12 +442,17 @@ the backend-change marker.
    **PRs:** #382 advisable (the regression base, plus the `default_kind` check); #385 not
    superseded (the design of record). **Backend:** the S encoding is WASTED (specific to
    ReplacingMergeTree); the PG same-second refusal carries over.
+   **Status 2026-11-09: in progress** (section 7.1). Branch fix/buffered-feed-version-s-20261109,
+   migration slot 045010.
 2. **G2: late-ack skip (MUST, blocker).** The page RPC lists only stages already acknowledged,
    keyset on `(created_at, stage_token)` (`20261105043870_buffered_search_feed_cursor.sql:150-166`).
    A stage acknowledged after the cursor has passed it is skipped forever (#385 Q7/R2). This
    needs a durable revisit. Landed migration bytes are frozen, so the fix is a new slot or
    code-side, which is outside window 1. Suggested flag
    `INGEST_BUFFERED_SEARCH_FEED_LATE_ACK_REVISIT`. **Backend:** carries over (PG-side).
+   **Status 2026-11-09: fixed code-side in #449, PR open, CI green pending merge** (section
+   7.1). It is a settle holdback with no new migration. It has no separate flag; it acts only
+   while the feed flag is on. Knob `INGEST_BUFFERED_SEARCH_FEED_SETTLE_S`.
 3. **G3: erasure lane (MUST, blocker), PR #383.**
    `src/session-pipeline/buffered-erasure-delete.ts` (new), with flag
    `INGEST_BUFFERED_ERASURE_DELETE=off|on` and schedule `{"bufferedErasureDelete":true}`. It
@@ -463,6 +483,9 @@ the backend-change marker.
    side) reads without an origin filter is **unverified** and not derivable from this repo.
    Such a reader would show buffered rows that were never gated, including erased ones.
    No flag; this is a verification. **Backend:** n/a.
+   **Status 2026-11-09: in-repo audit done** (section 7.1). No reader in this repo serves
+   buffered rows unfiltered. There are low, fail-safe items only, and no in-repo hardening was
+   made. Readers outside this repo stay unverified.
 5. **G5: no sink abstraction (follow-up).** `BufferedFeedDeps` holds `ch: ClickHouseClient`
    directly (`buffered-search-feed.ts:367-379`). There is no sink interface, unlike
    `SearchProjectionIo` for the canonical path (`src/session-pipeline/search-adapter.ts:57-60`).
@@ -476,6 +499,8 @@ the backend-change marker.
    and `gateDeclared` (`stacks/aws/session-pipeline.ts:183-196,346`). Prod cannot slow or speed
    the backfill without code. Suggested: optional stack settings that default to absent
    (= the code defaults), so no new flag. **Backend:** carries over.
+   **Status 2026-11-09: #448, PR open, CI green pending merge** (section 7.1). It covers PAGE,
+   RATE and BUDGET_MS. SINCE, CURSOR and #449's SETTLE_S are not covered.
 7. **G7: window-start skip (risk / follow-up).** See section 5. Rows before the CH window start
    are dropped and the cursor still advances (`buffered-search-feed.ts:428,461,494`;
    `reconcile.ts:47,112-119`). This becomes time-sensitive from about 2026-11-19. Suggested
@@ -496,6 +521,126 @@ the backend-change marker.
     anyway, so this does not block. CH-only: small, acceptable, CH remains incumbent.
 11. **G11: role presence before window 1 (operator pre-check, blocker for window 1, not a code
     gap).** See section 2.3.
+
+### 7.1 Lane results 2026-11-09
+
+Four lanes ran today. Code only: nothing was applied, deployed or enabled, and no lane touched
+the production database or ClickHouse. Citations in this subsection are against main d5c383a2,
+or against the named PR head where stated.
+
+**Slot order (lead).** 045000 (#299, landed) -> 045010 G1 -> 046000 #292 -> 046010 #301.
+
+**G1: version order. In progress.**
+
+* Branch fix/buffered-feed-version-s-20261109, migration slot 045010. It is not on origin yet
+  and has no PR.
+* Same-second refusal: a `CREATE OR REPLACE` of `sessions.buffered_search_feed_stage` in the
+  new slot. The landed 043870 function does not return the sibling counts that #385 section 3
+  needs, and no later migration on main redefines it.
+* Flag: `INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION`, default off.
+* The canonical ceiling constant (#385 B1) stays **unpinned** until the operator's counts-only
+  read (#385 section 10, prerequisite 1). Applying the slot to a real database needs Khaliq.
+
+**G2: late-ack skip. #449 (fix/buffered-feed-late-ack-20261109, head 60de08a9). PR open, CI
+green pending merge.**
+
+* **Mechanism: settle holdback.** Before each page, `runBufferedFeed` takes
+  `horizon = now - settleMs`. It processes only stages whose `createdAt <= horizon`. The first
+  stage that is younger, or whose time cannot be parsed, stops the page: that stage is not
+  processed, the cursor waits before it, and the run reports `caughtUp=true`. The next run
+  lists it again from the same cursor. Nothing is re-scanned or re-emitted, and every stage is
+  still processed once (#449 `buffered-search-feed.ts`, header and `runBufferedFeed`).
+* **Knob.** `INGEST_BUFFERED_SEARCH_FEED_SETTLE_S`, in seconds, 180..3600, default 300. It is
+  parsed by the same guard as PAGE, RATE and BUDGET_MS. A malformed or out-of-range value is
+  refused with `config_settle_s_invalid`, which disarms only the feed. The Lambda passes the
+  whole parsed config to `runBufferedFeed` (`src/session-pipeline/lambda.ts:705`), so the knob
+  takes effect without a Lambda change.
+* **Why it is sound.** A fresh upload's intent is inserted with
+  `expires_at = clock_timestamp() + 120 s`, in the same row that sets `created_at`
+  (043850, `supabase/migrations/…_ingest_acquisition_owner.sql:1259-1262`). The commit
+  raises 55000 once `clock_timestamp() >= expires_at` (`:1328`). 043850 is still the latest
+  definition on main. So a 300 s horizon only ever sees settled stages. The remaining 180 s of
+  margin covers the commit tail and the clock skew between Lambda and the database. That margin
+  is reasoned, not measured.
+* **Residual.** A GC replacement child keeps its own `created_at` and can be acknowledged
+  later by a GC claim. Its rows are its parent's retained rows, with the same fingerprint and
+  version, and the parent already wrote them. A skipped child therefore loses no content.
+* **Alternatives rejected.**
+  * A re-scan: the cursor is forward-only, `since` is fixed per cursor (22023), and there is no
+    delete RPC.
+  * An ack-time cursor: it needs an `acknowledged_at` migration, which is not authorized.
+* **Flag.** No separate default-off flag. The holdback acts only while
+  `INGEST_BUFFERED_SEARCH_FEED=on`, and switching it off would bring the defect back. The
+  suggested `..._LATE_ACK_REVISIT` flag is not used. Once on, the tail lags by up to the
+  holdback (about 5 min).
+* **Stack.** The `SETTLE_S` pass-through is **not** in #448. Until a one-line follow-up adds
+  it, prod runs the 300 s default.
+
+**G4: other CH readers. In-repo audit done.**
+
+**Verdict:** no reader in this repo serves buffered rows unfiltered. Every reader either has
+the `origin = 'canonical'` filter or goes through the per-hit buffered gate.
+
+| Reader | Where (main d5c383a2, approximate) | Origin filter |
+|--------|------------------------------------|---------------|
+| Candidate query | `src/session-read-api/queries.ts:188-221` `buildCandidateQuery` | `origin = 'canonical'` in canonical mode; gate mode has no SQL filter, and each buffered hit goes through `buffered-search-gate.ts` |
+| Newest-version query | `queries.ts:244-283` `buildNewestQuery` | `origin = 'canonical'` on the newest version only, so a newer buffered version drops the event and never serves the stale canonical one |
+| Page recheck | `src/session-read-api/page.ts:196-204` `selectPage` | JS recheck `r.origin === "canonical"` in canonical mode (defense in depth) |
+| Legacy fallback | `page.ts:160-185` `readEventPage` | used only on missing-column codes 8/16/47; after the unfiltered read it probes `system.columns`, and returns 503 `origin_column_changed` once the column exists (fails closed) |
+| Workspace partial check | `queries.ts:123-136` `buildWorkspacePartialSessionsQuery` (the `in_workspace` subquery), called before `gatedPage` (`src/session-read-api/app.ts:861,865`) | **none**; low item (a) |
+| Output/digest readiness | `src/session-read-api/output-query.ts:202-208` `outputWindowReadiness` | **none**; came with #299, after the audit's base. See below |
+| Indexer scope diff | `src/session-pipeline/search-index.ts:176-201` `clickhouseScope` | none; uses the `bf` fingerprint prefix instead. Internal, never served |
+| Erase / feeder delete | `search-index.ts:453`; `buffered-search-feed.ts:344-363` | deletes every origin by design; the feeder's delete is bound to origin, claim token, fingerprint and version |
+| Vendored reconcile | `src/session-pipeline/vendor/search-index/reconcile.ts:274,368` | none; not called in this repo |
+| Proof probe | `src/proof/aws/transcript.ts:129` | none, by design; low item (c) |
+
+No materialized view, `CREATE VIEW` or projection over `transcript_events` exists in the repo.
+
+**Low items.** All are fail-safe: none returns ids or content.
+
+* **(a)** The workspace partial check has no origin filter. At worst a buffered row causes a
+  spurious `session_partial` fallback.
+* **(b)** Version shadowing. A newer buffered version hides the canonical event. This is G1.
+* **(c)** The proof probe is unfiltered by design: synthetic proof tables lack the column, and
+  the default backend is `none`.
+* **(not in the audit)** `outputWindowReadiness` counts `transcript_events` sessions without
+  complete output facts, with no origin filter. It came with #299, after the audit's base.
+  Buffered-only sessions would have no facts state, so once buffered rows exist,
+  `/v1/sessions/output` and `/v1/digest/daily` can return 501 `*_session_unindexed` for windows
+  that contain them (`app.ts:1149,1349`). It returns a count only. This is an availability
+  effect, not exposure. Not yet reviewed by the lane owner.
+
+**Hardening decision:** (a) and (c) are **not** changed.
+
+* For (a): the page read's origin-columns state exists only in a local try/catch in
+  `readEventPage`, and the partial check runs before it. A filter there needs a restructure, or
+  a second probe plus a new 503 path, and that is too much for a fail-safe low item.
+* In gate mode, any later fix must not filter `in_workspace`, to match the candidate and newest
+  queries.
+* For (c): the proof probe must not filter.
+
+**Open outside this repo:**
+
+* relayhistory-cloud's legacy keyword search over `transcript_events`, and its Neon tail
+  reconcile. A question went to the cloud owner and is unanswered. Without an origin filter,
+  the keyword search would serve buffered rows that never passed the gate. Treat it as high
+  until verified.
+* CH-side grants, roles, row policies and `system.query_log`. These are operator reads that
+  need Khaliq's own word.
+
+**G6: stack knobs. #448 (feat/buffered-feed-stack-knobs-20261109, head 9db9d79b). PR open, CI
+green pending merge.**
+
+* `stacks/aws/session-pipeline.ts` `bufferedSearchFeed` gains three optional settings:
+  * `pageSize` -> `INGEST_BUFFERED_SEARCH_FEED_PAGE`, 1..200
+  * `stagesPerSecond` -> `INGEST_BUFFERED_SEARCH_FEED_RATE`, 1..50
+  * `budgetMs` -> `INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS`, 5000..240000
+* The bounds are checked in `assertSessionPipelineInputs`, and match the feeder's.
+* Each env var is set only when its setting is defined. The knobs apply even when
+  `enabled=false`.
+* Three runbook lines are added in `runbooks/sessions-prod-session-pipeline.md`, after the
+  feeder-secret paragraph.
+* Not covered: SINCE, CURSOR and SETTLE_S.
 
 ## 8. Order-of-operations checklist for Brian's session
 

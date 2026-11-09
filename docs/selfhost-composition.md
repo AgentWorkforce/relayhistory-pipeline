@@ -241,6 +241,7 @@ the migration owner.
 | `hoopdb-migrate` | the database superuser / migration owner | `HOOPDB_URL` (Job only) |
 | workers (`hoopdb-indexer`, `referee`, `bob-costas`, `session-brief`, `alleyoop-*`) | `HOOPDB_RUNTIME_ROLE` (exact app ACL from `migrate-guards.ts`) | `HOOPDB_URL` |
 | `session-read-api` | `bulls96_read_api`: `LOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS`, read-only, and not owner of the search schema (checked at startup) | `supabase_url` inside `RELAYHISTORY_READ_API_SECRET` (JSON) |
+| `session-read-api` digest narrative writer (optional, off by default; section 6) | `bulls96_digest_narrative`: `LOGIN NOINHERIT`, EXECUTE on `sessions.digest_narrative_upsert` only (checked at startup) | `READ_API_DIGEST_NARRATIVE_DB_URL` |
 | session-ingest, `session-publication` | `bulls96_session_ingest` (the publisher refuses any other `current_user`) | ingest: its Secret; publisher: `hoopdb_url` in the Secrets Manager secret `INGEST_PUBLISH_SECRET_ARN` |
 
 Order (plain Postgres or CNPG, `HOOPDB_DB_MODE=selfhosted`):
@@ -275,6 +276,8 @@ Order (plain Postgres or CNPG, `HOOPDB_DB_MODE=selfhosted`):
      design, "Postgres search prerequisites").
    - The search worker marker
      (`runbooks/session-directory-search-worker-bootstrap.md`).
+   - Only for the optional digest narrative writer (section 6):
+     `digest_narrative_role.sql`, then the password. Needs Khaliq's OK.
 
    Passwords go straight from the secret store into the Secrets. They are
    never written to disk or into a file in this repository.
@@ -294,15 +297,42 @@ off; anything else, `true` included, fails startup).
 
 | SERVICE | Flag | Required when enabled | Secret material (from the secret store, never on disk) |
 | --- | --- | --- | --- |
-| `session-read-api` | `RELAYHISTORY_SELFHOST_READ_API` | `READ_API_ORIGIN`, `READ_API_COMPLETE_SINCE` (ISO or `epoch`), `READ_API_DIRECTORY_WORKSPACES` (canary allowlist; login answers 501 for an unlisted workspace), `SEARCH_INDEX_BACKEND` (`postgres`), `SEARCH_INDEX_POSTGRES_BACKEND_ID`, `SESSION_POSTGRES_TLS_PROFILE`, the relaycontrol trio in section 2, optional `ALLOW_IN_CLUSTER_HTTP`, `RELAYHISTORY_READ_API_PORT`, `READ_API_CANONICAL_PIN_LAGGING_POINTER` (recommended `true` with `SELFHOST_INGEST_ADMISSION=async`; default off; any value other than `true` is off, see `docs/selfhost-async-admission.md`) | `RELAYHISTORY_READ_API_SECRET` (JSON `{supabase_url}`; no `clickhouse` with `postgres`), `RELAYCONTROL_INTROSPECT_SECRET` |
+| `session-read-api` | `RELAYHISTORY_SELFHOST_READ_API` | `READ_API_ORIGIN`, `READ_API_COMPLETE_SINCE` (ISO or `epoch`), `READ_API_DIRECTORY_WORKSPACES` (canary allowlist; login answers 501 for an unlisted workspace), `SEARCH_INDEX_BACKEND` (`postgres`), `SEARCH_INDEX_POSTGRES_BACKEND_ID`, `SESSION_POSTGRES_TLS_PROFILE`, the relaycontrol trio in section 2, optional `ALLOW_IN_CLUSTER_HTTP`, `RELAYHISTORY_READ_API_PORT`, `READ_API_CANONICAL_PIN_LAGGING_POINTER` (recommended `true` with `SELFHOST_INGEST_ADMISSION=async`; default off; any value other than `true` is off, see `docs/selfhost-async-admission.md`), `READ_API_CANONICAL_SCOPE_BYTES` / `READ_API_CANONICAL_SCOPE_EVENTS` (canonical snapshot budget; defaults 32 MiB / 100000 (raise bytes only with the pod memory limit), bytes accepted 16 MiB..2 GiB, events up to 4000000; out of range fails startup, see `docs/local-stack.md`) | `RELAYHISTORY_READ_API_SECRET` (JSON `{supabase_url}`; no `clickhouse` with `postgres`), `RELAYCONTROL_INTROSPECT_SECRET` |
 | `session-publication` | `INGEST_PUBLISH_ENABLED` | `INGEST_PUBLISH_{BUCKET,EXPECT_GENERATION,AWS_ACCOUNT_ID,SUPABASE_PROJECT_REF,INSTANCE_ID,SECRET_ARN,KMS_KEY_ARN,INSTANCE_PROFILE_ARN,ROLE_NAME}`, `AWS_REGION=us-east-1`, `HOOPDB_DB_MODE=supabase`, optional `INGEST_PUBLISH_BUDGET_MS`, `INGEST_PUBLISH_BATCH_LIMIT`, `WORKER_HEALTH_PORT` | none in env: IMDSv2 plus Secrets Manager (see the caveat in section 1) |
 | `session-ingest` | `RELAYHISTORY_SELFHOST_INGEST` | `RELAYHISTORY_INGEST_ORIGIN`, `RELAYCONTROL_INTROSPECT_URL`, `RELAYHISTORY_INGEST_DATABASE_URL`, `SESSION_POSTGRES_TLS_PROFILE`, `LOCKER_BUCKET` (+ Locker endpoint/region or Pod Identity/GCS), optional `RELAYHISTORY_INGEST_PORT`, `INGEST_KEY_ROOT`, `INGEST_MAX_PER_USER`, `INGEST_MAX_PER_ORG`, `RELAYHISTORY_INGEST_PG_POOL_MAX`, `ALLOW_IN_CLUSTER_HTTP`, `SELFHOST_INGEST_ADMISSION` (`sync` default, `async`, `drain`) with `SELFHOST_ADMISSION_CONCURRENCY` / `_SCAN_MS` / `_MAX_ATTEMPTS`, `SESSION_ERASE_API_ENABLED` (`1`; default off), `RELAYHISTORY_SELFHOST_SESSION_SELECTION`, `RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT` (both `true`; default off) | `RELAYCONTROL_INTROSPECT_SECRET`, `RELAYHISTORY_INGEST_DATABASE_URL` (password), Locker keys, `SESSION_ERASE_API_SECRET` (+ `_PREVIOUS` during a rotation; at least 32 characters; only read when the erase flag is on) |
 | `session-erase-bytes` (Job) | `SESSION_ERASE_BYTES_ENABLED` (exactly `1`; see below) | `SESSION_ERASE_S3_BUCKET`, `SESSION_ERASE_S3_REGION`, `SESSION_ERASE_REQUEST_FILE`, optional `SESSION_ERASE_S3_ENDPOINT` (bare origin; https, loopback, or a Service name with `ALLOW_IN_CLUSTER_HTTP`), `SESSION_ERASE_KEY_ROOT` (default `96bulls`, must equal `INGEST_KEY_ROOT`), `SESSION_ERASE_DRY_RUN` (`1` = list and count only), `SESSION_ERASE_CONCURRENCY` (1..16, default 4) | `SESSION_ERASE_S3_ACCESS_KEY_ID[_FILE]`, `SESSION_ERASE_S3_SECRET_ACCESS_KEY[_FILE]`: a separate eraser key (ListBucketVersions + DeleteObjectVersion on the key root), not the ingest writer's key |
 | workers | per service (`docs/local-stack.md`) | `HOOPDB_URL`, `WORKER_HEALTH_PORT` | `HOOPDB_URL` password |
 
+Installs with bigger sessions must raise the read API container memory limit and
+`READ_API_CANONICAL_SCOPE_BYTES` together, because a raw scope is held several times over per request. The shipped
+pairing is the 32 MiB default against the charts' 512Mi read API limit (umbrella chart 1Gi), so keep roughly that
+ratio when raising the budget (for example 64 MiB needs at least 1Gi, and a 1.5Gi limit is the pairing used for a
+64 MiB dev budget). The hosted Worker budget stays 16 MiB and is not affected.
+
 `SESSION_ERASE_BYTES_ENABLED` is the one exception to the `true` rule above:
 the operator-erase contract fixes the literal `1`. `true` is not accepted; it
 fails startup like any other unknown value, so it is never silently off.
+
+`RELAYHISTORY_SELFHOST_OUTPUT_FACTS` (pipeline consumer,
+`SERVICE=session-pipeline-consumer`, next to `SEARCH_INDEX_BACKEND` and
+`RELAYHISTORY_SELFHOST_PIPELINE_CONSUMER`; documented in
+`src/session-pipeline/consumer-config.ts`) is an optional behaviour flag like
+`READ_API_CANONICAL_PIN_LAGGING_POINTER`: exactly `true` enables it; unset or
+any other value is off (default off), never a startup error. When on, every
+search-index pass also builds the session's output facts with the shared
+builder and writes them through the Postgres facts store
+(`sessions.session_event_facts`, `sessions.session_output_facts` and
+`sessions.output_facts_session_state`, migration `045040`) inside the same
+transaction as the directory events; a pass older than the stored source
+version is a no-op, and the erase path deletes the session's facts. Default
+off; sessions ingested before the flag have no facts (bootstrap is a later PR).
+Sessions erased while the flag is off keep any facts written earlier.
+Migration `045040` grants the four writers to `search_consumer_runtime` whatever
+the flag says, so turning the flag on needs no extra grants. The consumer's live
+sessions-function gate (`SESSIONS_FUNCTION_GATE_SQL`) accepts those writers only
+when it runs as `search_consumer_runtime` (`CONSUMER_RUNTIME_FUNCTIONS` in
+`src/hoopdb/migrate-guards.ts`); any other role that can execute them, or
+PUBLIC, still closes the gate.
 
 ### session-ingest admission mode (config contract)
 
@@ -408,7 +438,7 @@ Supabase CA. There is no implicit default for the service.
 
 ## 6. Summaries and the model transport (Bob Costas, session-brief)
 
-Both model users are off by default. With no change, Bob Costas writes
+Every model user is off by default. With no change, Bob Costas writes
 extractive summaries (no model call) and session-brief claims nothing.
 
 ### Native canonical session briefs
@@ -519,6 +549,53 @@ BOB_COSTAS_MODEL=<the gateway's model id>
 The IAM role belongs to the gateway, not to the 96bulls workers. Plain http is
 accepted only for a Kubernetes Service name with `ALLOW_IN_CLUSTER_HTTP=true`;
 anything else needs https.
+
+### Daily digest narrative on the read API service
+
+The read API service (`SERVICE=session-read-api`, the `service` entry of
+`src/session-read-api/lambda.ts`) can generate the daily digest narrative
+in-process (`src/session-read-api/digest-narrative-selfhost.ts`, whose header is
+the reference). It reuses the hosted narrative's prompt, its 10 s model timeout,
+its 3 s read deadline and the migration `20261105045000` cache. No new
+migration is needed. Everything is off by default:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `READ_API_DIGEST_ENABLED` | unset (off) | exactly `1`: build the narrative deps. Anything else: no narrative variable is read and the service is unchanged |
+| `READ_API_DIGEST_NARRATIVE_MODEL` | unset | unset or blank: `provider_not_configured` (no model call, no writer pool). Otherwise the chat-completions model id (`MODEL_PATTERN`); an invalid id fails startup |
+| `OPENAI_API_KEY` | unset | shared with session-brief and Bob Costas. Unset, blank or `*-disabled`: no generation |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | calls go to `<base>/chat/completions` (not the Responses API), under the same destination rule (`ALLOW_IN_CLUSTER_HTTP=true` for an in-cluster Service). A Bedrock gateway must serve chat completions too |
+| `READ_API_DIGEST_NARRATIVE_DB_URL` | unset | the narrative writer login. Unset: the narrative is read-only from the cache (hits served, a miss is `provider_not_configured`, no model call) |
+
+The writer is a separate pool, never the read pool. It has 1 connection, a 5 s
+`statement_timeout` (the role's own pin), the `SESSION_POSTGRES_TLS_PROFILE`
+trust, and discrete URL fields (nothing in the query string reaches pg). It
+runs only `sessions.digest_narrative_upsert`. Migration `20261105045000` grants
+EXECUTE on that function to `bulls96_digest_narrative` alone, and the function
+refuses any other caller. So the URL must be that role's login (provisioned by
+`supabase/bootstrap/digest_narrative_role.sql`). Startup refuses a writer login
+that is not exactly that role, or that is superuser or BYPASSRLS. The read pool
+stays read-only as `bulls96_read_api` and reads the cache through
+`digest_narrative_read`.
+
+Trust note: the writer role can upsert a narrative for any tenant. On the hosted
+stack, that credential lives only in the separate narrative Worker. Here it
+lives in the read API process, and the verified caller's tenant is the only
+guard. Provisioning the role's password and the URL secret, through the
+operator's secret store and never on disk, needs Khaliq's explicit OK, as do
+deploys and applying `20261105045000`.
+
+Generation runs detached from the request. A slow miss answers
+`provider_error` at the 3 s deadline, then the model call finishes within its
+10 s timeout and is cached for the next read. Concurrent reads of one key share
+one call. At most 4 generations run per process. The prompt is the digest's
+aggregates plus up to 15 session summaries, project ids and branches. It is
+scrubbed before it is sent, and the narrative is scrubbed before it is cached.
+Logs carry outcome codes only.
+
+This entry does not serve `GET /v1/digest/daily` yet: the route needs a digest
+backend on this service. Until that wiring passes these deps to the route, it
+answers 501 `digest_not_configured` whatever these variables say.
 
 ### Follow-up: native Bedrock provider (scope only, no code now)
 

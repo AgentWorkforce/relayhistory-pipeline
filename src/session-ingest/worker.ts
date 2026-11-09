@@ -38,13 +38,23 @@
  *                              (HTTP only: the admission consumer keeps its normal backoff)
  *   INGEST_ASYNC_ADMISSION     unset/off (default) | on | drain: S3-first async admission
  *                              (async-admission.ts, docs/design/s3-first-async-ingest.md); on/drain need
- *                              buffered acceptance and the INGEST_ADMISSION queue (producer + consumer)
+ *                              buffered acceptance and the INGEST_ADMISSION queue (producer + consumer).
+ *                              The Cloudflare stack renders this var (a buffered stage defaults to "on"
+ *                              there); the runtime default stays off on purpose, so a Worker version or
+ *                              self-host deployment without the var never starts admitting asynchronously
+ *                              (no flip on a gradual version split, no queue it was not given).
  *   INGEST_SYNC_ADMISSION_FROZEN_RECEIPT  unset/off (default) | on: under frozen-supabase custody, a queued-v1
  *                              caller on the synchronous path reads the frozen legacy receipt before any claim
  *                              (app.ts acceptBatch, as the admission consumer does)
  *   SESSIONS_NEON_EXIT         unset/false (default) | true: refuse every Neon edge at startup
  *                              (replica, NEON_REPLICA binding, a custody source other than
  *                              frozen-supabase in buffered mode); docs/neon-exit-edge-map.md
+ *   ANALYTICS_SINK             unset/""/noop (default: none) | posthog (src/shared/analytics-config.ts, hosted
+ *                              profile; collector and anything else = 503 not_configured, logged
+ *                              missing_<variable>): one session_ingest.batch_completed per batch to
+ *                              ANALYTICS_POSTHOG_HOST (default https://i.agentrelay.com) with ANALYTICS_DEPLOYMENT_ID
+ *                              and the ANALYTICS_POSTHOG_KEY Secrets Store key, flushed in waitUntil. It reserves
+ *                              WORKER_LIMITS.maxRequestsPerDrain (2) of INGEST_SUBREQUEST_CAP for that flush
  *
  * Until the S3 key, the KMS key ARN and Hyperdrive are present, every request
  * is 503 `not_configured` and nothing is written.
@@ -68,6 +78,9 @@ import { admitMessage, type AdmissionAction } from "./admission-consumer.ts";
 import { lockAlertFields } from "./app.ts";
 import { sessionEraseConfig, sessionEraseEnabled, SESSION_ERASE_CONFIG_INVALID, SESSION_ERASE_FLAG_VAR, SESSION_ERASE_SECRET_PREVIOUS_VAR, SESSION_ERASE_SECRET_VAR, type SessionEraseConfig } from "./session-erase.ts";
 import type { DeliverDeps } from "./deliver.ts";
+import type { AnalyticsPort } from "../shared/analytics.ts";
+import { WORKER_LIMITS } from "../shared/analytics-export.ts";
+import { AnalyticsConfigError, analyticsConfig, analyticsCounterFields, createAnalyticsSink, type AnalyticsConfig } from "../shared/analytics-config.ts";
 
 interface QueueLike<T> {
   send(body: T): Promise<void>;
@@ -122,6 +135,13 @@ export interface IngestWorkerEnv {
   SESSION_ERASE_API_SECRET?: SecretBinding | string;
   /** Secrets Store: the previous bearer, accepted during a rotation only. */
   SESSION_ERASE_API_SECRET_PREVIOUS?: SecretBinding | string;
+  /** Product analytics (src/shared/analytics-config.ts, hosted profile): unset/""/noop (default) | posthog. */
+  ANALYTICS_SINK?: string;
+  ANALYTICS_DEPLOYMENT_ID?: string;
+  /** Default https://i.agentrelay.com. */
+  ANALYTICS_POSTHOG_HOST?: string;
+  /** Secrets Store: the PostHog project key. Read only with ANALYTICS_SINK=posthog; never logged. */
+  ANALYTICS_POSTHOG_KEY?: SecretBinding | string;
 }
 
 interface SecretBinding {
@@ -336,7 +356,30 @@ export function deliverDepsFor(settings: IngestSettings, run: Run, target: Write
   };
 }
 
-export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: Run, target: WriteTarget) {
+/**
+ * The analytics selection (hosted profile: noop or posthog), with the Secrets Store key read only when
+ * PostHog is selected. Throws AnalyticsConfigError for a refused value.
+ */
+export async function ingestAnalyticsConfig(env: IngestWorkerEnv): Promise<AnalyticsConfig> {
+  const key = env.ANALYTICS_SINK === "posthog" ? await secret(env.ANALYTICS_POSTHOG_KEY) : typeof env.ANALYTICS_POSTHOG_KEY === "string" ? env.ANALYTICS_POSTHOG_KEY : undefined;
+  return analyticsConfig({ ...env, ANALYTICS_POSTHOG_KEY: key }, "hosted");
+}
+
+/**
+ * With analytics on, its flush (in waitUntil, same invocation) may spend up to WORKER_LIMITS.maxRequestsPerDrain
+ * subrequests, so the Babysitter routing budget is computed against a cap that much smaller; the proven
+ * INGEST_SUBREQUEST_CAP is never exceeded by analytics. Off (the default): the settings are unchanged.
+ * A cap the reservation would exhaust while Babysitter routing is on is refused (AnalyticsConfigError,
+ * every request 503 not_configured) rather than silently turning routing off.
+ */
+export function reserveAnalyticsSubrequests(settings: IngestSettings, selection: AnalyticsConfig): IngestSettings {
+  if (selection.sink === "noop" || settings.subrequestCap === undefined) return settings;
+  const reserved = settings.subrequestCap - WORKER_LIMITS.maxRequestsPerDrain;
+  if (reserved < 1 && settings.babysitterRetention) throw new AnalyticsConfigError("INGEST_SUBREQUEST_CAP", `must exceed the ${WORKER_LIMITS.maxRequestsPerDrain} subrequests ANALYTICS_SINK reserves while Babysitter routing is on`);
+  return { ...settings, subrequestCap: Math.max(0, reserved) };
+}
+
+export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: Run, target: WriteTarget, analytics?: AnalyticsPort) {
   const replica: ReplicaSink | undefined = settings.replicaMode !== "off" && env.NEON_REPLICA
     ? {
         mode: settings.replicaMode,
@@ -363,6 +406,7 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: R
       fanout: (messages) => env.INGEST_FANOUT!.sendBatch(messages.map((body) => ({ body }))),
     },
     onboarding: { run },
+    ...(analytics ? { analytics } : {}),
     ...(settings.asyncAdmission && env.INGEST_ADMISSION
       ? { asyncAdmission: { mode: settings.asyncAdmission, enqueue: (message: AdmissionMessage) => env.INGEST_ADMISSION!.send(message) } }
       : {}),
@@ -419,7 +463,7 @@ export async function admitQueueBatch(messages: QueueMessage[], env: IngestWorke
 
 /** A malformed setting or a Neon-exit refusal: a code, never the setting's value. */
 function logSettingsInvalid(error: unknown): void {
-  log.error("session ingest settings invalid", { error_code: error instanceof NeonExitRefusal ? error.code : "settings_invalid" });
+  log.error("session ingest settings invalid", { error_code: error instanceof NeonExitRefusal ? error.code : error instanceof AnalyticsConfigError ? `missing_${error.variable}` : "settings_invalid" });
 }
 
 const NOT_CONFIGURED = () =>
@@ -430,14 +474,21 @@ const zstd = (bytes: Uint8Array) => new Uint8Array(zstdDecompressSync(bytes));
 export default {
   async fetch(request: Request, env: IngestWorkerEnv, ctx: Ctx): Promise<Response> {
     let settings: IngestSettings | null;
+    let analyticsSelection: AnalyticsConfig;
     try {
       settings = await ingestSettings(env);
+      analyticsSelection = await ingestAnalyticsConfig(env);
+      if (settings) settings = reserveAnalyticsSubrequests(settings, analyticsSelection);
     } catch (error) {
       // A malformed setting: relayhistory's envelope, retryable, never a bare 500.
       logSettingsInvalid(error);
       return NOT_CONFIGURED();
     }
     if (!settings) return NOT_CONFIGURED();
+    // One sink per invocation: captured during the request, exported once in waitUntil (WORKER_LIMITS).
+    const analytics = createAnalyticsSink(analyticsSelection, "session-ingest", "worker", {
+      report: (counters) => log.warn("analytics export degraded", analyticsCounterFields(analyticsSelection.sink, counters)),
+    });
     // One Hyperdrive connection per request; Hyperdrive pools the real ones.
     const client = new pg.Client({ connectionString: env.HYPERDRIVE!.connectionString });
     // A dropped socket surfaces on the next query as a coded 503, never as an uncaught error.
@@ -448,11 +499,13 @@ export default {
       await connected;
       return (await client.query(text, params as unknown[])) as unknown as { rows: Record<string, unknown>[] };
     };
-    const app = ingestApp(env, settings, run, { store: store(settings), keyRoot: settings.keyRoot });
+    const app = ingestApp(env, settings, run, { store: store(settings), keyRoot: settings.keyRoot }, analyticsSelection.sink !== "noop" ? analytics : undefined);
     try {
       return await app.fetch(request);
     } finally {
       if (connected) ctx.waitUntil(client.end().catch(() => {}));
+      // Bounded and never rejecting; the response is already final.
+      if (analyticsSelection.sink !== "noop") ctx.waitUntil(analytics.shutdown());
     }
   },
 

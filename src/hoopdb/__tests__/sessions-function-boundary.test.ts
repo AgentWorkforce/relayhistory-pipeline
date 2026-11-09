@@ -24,6 +24,7 @@ import type { LaneManifest } from "../../../scripts/sessions-function-boundary/t
 import { VERIFIERS } from "../../../scripts/sessions-function-boundary/verifiers.ts";
 import { run } from "../../../scripts/sync-sessions-function-boundary.ts";
 import { BUFFERED_SEARCH_FEED_RUNTIME_ROLE } from "../../session-pipeline/buffered-feed-role.ts";
+import { CONSUMER_RUNTIME_FUNCTIONS, CONSUMER_RUNTIME_FUNCTIONS_ROLE, RUNTIME_APPLICATION_FUNCTIONS, pendingExecuteGrants } from "../migrate-guards.ts";
 
 const root = join(import.meta.dir, "../../..");
 const reader = (base: string): Reader => async (p) => { try { return readFileSync(join(base, p), "utf8"); } catch { return undefined; } };
@@ -82,6 +83,8 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105044070_selfhost_erase_search_text_rebuild.down.sql",
       "supabase/rollbacks/20261105044080_ingest_claim_sessions.down.sql",
       "supabase/rollbacks/20261105044090_claim_sessions_reader.down.sql",
+      "supabase/rollbacks/20261105045010_buffered_search_feed_same_second.down.sql",
+      "supabase/rollbacks/20261105045030_session_consumer_project_text_grant.down.sql",
     ]);
   });
 
@@ -388,6 +391,37 @@ describe("unified sessions function-boundary generator", () => {
     expect(down).toContain("DELETE FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105043860_buffered_search_gate.sql'");
   });
 
+  test("045030 grant-only lane: appends search_consumer_runtime to project_text's ACL, is credited by the ACL preview while pending, and refuses SQL/manifest disagreement", async () => {
+    const g = await generate(repo, LANES, VERIFIERS);
+    expect(g.summary.lanes["consumer-project-text-grant"]).toEqual({ functions: 0, replaces: 0, grants: 1 });
+    const acl = JSON.parse(g.outputs[ACL_PATH]!).functions as Record<string, string[]>;
+    expect(acl["sessions.session_directory_project_text(text,text,text)"]).toEqual(["<owner>:EXECUTE", "service_role:EXECUTE", "search_consumer_runtime:EXECUTE"]);
+    // The ACL preview credits a pending step's literal EXECUTE grants (pendingExecuteGrants):
+    // for every grant-only lane that is exactly its grantsOn, in manifest key spelling.
+    for (const l of LANES.filter((x) => x.grantsOn)) {
+      const declared = Object.entries(l.grantsOn!).flatMap(([sig, roles]) => roles.map((r) => `${sig} ${r}:EXECUTE`));
+      expect([...pendingExecuteGrants([readFileSync(join(root, l.migration!), "utf8")])].sort()).toEqual(declared.sort());
+    }
+    const lane = LANES.find((l) => l.lane === "consumer-project-text-grant")!;
+    const SIG = "sessions.session_directory_project_text(text,text,text)";
+    // grantsOn naming another role than the SQL grants: drift.
+    await expect(generate(repo, [...LANES.filter((l) => l !== lane), { ...lane, grantsOn: { [SIG]: ["service_role"] } }], VERIFIERS))
+      .rejects.toThrow("grants EXECUTE to search_consumer_runtime, which the lane's grant sources do not declare");
+    // No grantsOn at all: the SQL grant is an undeclared grantee.
+    await expect(generate(repo, [...LANES.filter((l) => l !== lane), { ...lane, grantsOn: {} }], VERIFIERS))
+      .rejects.toThrow("grants EXECUTE to search_consumer_runtime, which the lane's grant sources do not declare");
+    // A grantsOn entry the SQL does not grant: drift.
+    await expect(generate(repo, [...LANES.filter((l) => l !== lane), { ...lane, grantsOn: { [SIG]: ["search_consumer_runtime"], "sessions.canonical_remote(text)": ["search_consumer_runtime"] } }], VERIFIERS))
+      .rejects.toThrow("manifest drift (consumer-project-text-grant): sessions.canonical_remote(text) grant-only grants are [] in SQL");
+    // An empty slot may not carry grantsOn.
+    await expect(generate(repo, [...LANES.filter((l) => l !== lane), { ...lane, migration: null, extraOutputs: undefined }], VERIFIERS))
+      .rejects.toThrow("empty slot consumer-project-text-grant must not claim");
+    const down = g.outputs["supabase/rollbacks/20261105045030_session_consumer_project_text_grant.down.sql"]!;
+    expect(down).toContain("REVOKE EXECUTE ON FUNCTION sessions.session_directory_project_text(text,text,text) FROM search_consumer_runtime;");
+    expect(down).toContain("a later migration is applied");
+    expect(down).toContain("DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105045030_session_consumer_project_text_grant.sql'");
+  });
+
   test("043870 buffered search feed: three SECDEF RPCs for the dedicated runtime login, ACL +3, not runtime functions, no table grant", async () => {
     const g = await generate(repo, LANES, VERIFIERS);
     expect(g.summary.lanes["buffered-search-feed"]).toEqual({ functions: 3, replaces: 0, grants: 3 });
@@ -429,6 +463,25 @@ describe("unified sessions function-boundary generator", () => {
     expect(down).toContain("REVOKE USAGE ON SCHEMA sessions FROM buffered_search_feed_runtime;");
     expect(down).not.toMatch(/DROP ROLE/);
     expect(down).toContain("DELETE FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105043870_buffered_search_feed_cursor.sql'");
+  });
+
+  test("every function the manifest grants search_consumer_runtime is exempt from the live gate for it; the consumer writer list matches its verifier and stays out of the runtime list", () => {
+    const acl = JSON.parse(readFileSync(join(root, "src/hoopdb/sessions-function-acl.json"), "utf8")).functions as Record<string, string[]>;
+    const runtime = new Set<string>(RUNTIME_APPLICATION_FUNCTIONS);
+    const consumer = new Set<string>(CONSUMER_RUNTIME_FUNCTIONS);
+    const granted = Object.entries(acl).filter(([, entries]) => entries.includes(`${CONSUMER_RUNTIME_FUNCTIONS_ROLE}:EXECUTE`)).map(([fn]) => fn);
+    expect(granted.length).toBeGreaterThan(0);
+    expect(granted.filter((fn) => !runtime.has(fn) && !consumer.has(fn))).toEqual([]);
+    // Each consumer-only writer is granted to the consumer (and nobody but the owner), never to the general runtime role.
+    for (const fn of CONSUMER_RUNTIME_FUNCTIONS) {
+      expect(acl[fn], fn).toEqual(["<owner>:EXECUTE", `${CONSUMER_RUNTIME_FUNCTIONS_ROLE}:EXECUTE`]);
+      expect(runtime.has(fn), fn).toBe(false);
+    }
+    // The consumer role verifier allowlists exactly the same writers (both of its lists).
+    const verify = readFileSync(join(root, "supabase/bootstrap/session_consumer_role_verify.sql"), "utf8");
+    const listed = [...verify.matchAll(/'(sessions\.output_facts_[a-z_]+\([^']*\))'/g)].map((m) => m[1]!);
+    expect([...new Set(listed)].sort()).toEqual([...CONSUMER_RUNTIME_FUNCTIONS].sort());
+    for (const fn of CONSUMER_RUNTIME_FUNCTIONS) expect(listed.filter((x) => x === fn).length, fn).toBe(2);
   });
 
   test("043890 retired witness: replaces 043860's gate only (ACL/boundary/verifiers unchanged) and derives the exact 043860 rollback", async () => {

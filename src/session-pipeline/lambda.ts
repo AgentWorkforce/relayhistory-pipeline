@@ -73,7 +73,7 @@ import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
 import { searchIndexLimits } from "./search-index.ts";
-import { BufferedFeedError, bufferedFeedConfig, bufferedFeedGateRefusal, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
+import { BufferedFeedError, bufferedFeedConfig, bufferedFeedGateRefusal, bufferedFeedVersionRefusal, clickhouseTieLedger, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
 import { bufferedErasureConfig, runBufferedErasureDelete, type BufferedErasureConfig, type BufferedErasureDeps } from "./buffered-erasure-delete.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { BUFFERED_FEED_CA_FIELD, BUFFERED_FEED_URL_FIELD, bufferedFeedClientConfig, loginCheckedFeedExecutor } from "./buffered-feed-login.ts";
@@ -455,9 +455,15 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     else if (feedConfig) {
       const feedPool = new pg.Pool({ ...feedConfig, max: 1, idleTimeoutMillis: 60_000 });
       feedPool.on("error", (err) => log.error("buffered search feed pool error", { stage: "buffered-search-feed", error_code: (err as { code?: string }).code ?? "pool_error" }));
-      const source = sqlBufferedFeedSource(loginCheckedFeedExecutor(feedPool));
-      if (env.bufferedSearchFeed?.enabled) deps.bufferedFeed = { source, store, ch: deps.search.ch, keyRoot: env.keyPrefix };
-      if (env.bufferedErasureDelete?.enabled) bufferedErasure = { source, ch: deps.search.ch };
+      const feedExecutor = loginCheckedFeedExecutor(feedPool);
+      if (env.bufferedSearchFeed?.enabled) {
+        const secondVersion = env.bufferedSearchFeed.secondVersion;
+        deps.bufferedFeed = { source: sqlBufferedFeedSource(feedExecutor, secondVersion ? { secondVersion } : {}), store, ch: deps.search.ch, keyRoot: env.keyPrefix,
+          ...(secondVersion ? { secondVersion: { ledger: clickhouseTieLedger(deps.search.ch) } } : {}) };
+      }
+      // The erasure lane reads only `stage` status and retention, never sameSecond or createdAt, so it keeps the
+      // legacy (non-strict) source: its deletes do not depend on 045010 or the version flag.
+      if (env.bufferedErasureDelete?.enabled) bufferedErasure = { source: sqlBufferedFeedSource(feedExecutor), ch: deps.search.ch };
     }
   }
   if (env.replayPagesEnabled) {
@@ -748,7 +754,8 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
     // Default off before secret lookup, connection pools or object access.
     if (process.env.INGEST_BUFFERED_SEARCH_FEED !== "on") return { ok: true };
     // The ordering guard, also before any secret or connection: no declared read gate, no run.
-    const refusal = bufferedFeedGateRefusal(process.env);
+    // The version guard too: no run without the S encoding armed and its ceiling pinned.
+    const refusal = bufferedFeedGateRefusal(process.env) ?? bufferedFeedVersionRefusal(process.env);
     if (refusal) {
       log.error("buffered search feed refused", { stage: "buffered-search-feed", reason: refusal });
       return { ok: false };
@@ -758,8 +765,13 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
       const rt = await ready();
       if (!rt.deps.bufferedFeed || !rt.env.bufferedSearchFeed) throw new Error("buffered search feed unavailable");
       const s = await runBufferedFeed(rt.deps.bufferedFeed, rt.env.bufferedSearchFeed);
+      // A same-second refusal is never coverage: the run is not ok while any is recorded or outstanding.
+      const refusals = (s.refused ?? 0) + (s.refusalsOutstanding ?? 0);
+      if (refusals) log.warn("buffered search feed refusals", { stage: "buffered-search-feed", count: s.refused,
+        reason: `same_second_tie:${s.refused ?? 0},outstanding:${s.refusalsOutstanding ?? 0}` });
       log.info("buffered search feed run", { stage: "buffered-search-feed", listed: s.stages, inserted: s.indexed, skipped: s.skipped,
-        count: s.rows, deleted: s.deleted, ok: !s.blocked, state: s.caughtUp ? "caught_up" : s.blocked ? "blocked" : "continuation",
+        count: s.rows, deleted: s.deleted, ok: !s.blocked && !refusals,
+        state: s.caughtUp ? (refusals ? "caught_up_with_refusals" : "caught_up") : s.blocked ? "blocked" : "continuation",
         reason: s.blocked ?? (Object.entries(s.reasons).map(([k, n]) => `${k}:${n}`).join(",") || undefined), duration_ms: Date.now() - started });
       return { ok: true };
     } catch (error) {

@@ -18,6 +18,7 @@ import { BUFFERED_SEARCH_FEED_RUNTIME_ROLE } from "../buffered-feed-role.ts";
 import { BUFFERED_SEARCH_GATE_CONTRACT } from "../../session-read-api/buffered-search-gate.ts";
 import type { SessionScope } from "../pointer.ts";
 import {
+  assertOriginColumns,
   BUFFERED_FEED_DEFAULT_SINCE,
   bufferedFeedConfig,
   bufferedFeedGateRefusal,
@@ -27,6 +28,14 @@ import {
   projectBufferedStage,
   runBufferedFeed,
   sqlBufferedFeedSource,
+  BUFFERED_VERSION_CEILING,
+  bufferedFeedVersionRefusal,
+  canonicalPresent,
+  clickhouseTieLedger,
+  createdAtSeconds,
+  encodeBufferedVersion,
+  type BufferedTieLedger,
+  type TieLedgerEntry,
   type BufferedFeedDeps,
   type BufferedFeedSource,
   type StageCandidate,
@@ -34,6 +43,9 @@ import {
 } from "../buffered-search-feed.ts";
 
 const NOW = Date.parse("2026-11-07T12:00:00.000Z");
+/** Synthetic B1 ceiling for tests only (the production BUFFERED_VERSION_CEILING is unpinned). */
+const TEST_CEILING = 1_000_000_000_000;
+const SECOND = { INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION: "on" } as const;
 const RECEIVED = new Date("2026-11-07T11:30:00.000Z");
 const TS = NOW - 3_600_000;
 const ORG = "org-a", WS = "ws-a", USER = "user-1", ORIGIN = "origin-1";
@@ -56,8 +68,15 @@ function batchRecords(tag = "") {
   ];
 }
 
+/** system.columns rows for the origin columns as the feeder's DDL creates them (plain DEFAULT). */
+type ColumnRow = { name: string; type: string; default_kind: string; default_expression: string };
+const ORIGIN_COLUMN_ROWS: readonly ColumnRow[] = [
+  { name: "origin", type: "LowCardinality(String)", default_kind: "DEFAULT", default_expression: "'canonical'" },
+  { name: "origin_claim_token", type: "String", default_kind: "DEFAULT", default_expression: "''" },
+];
+
 /** An in-memory transcript_events speaking the statements both indexers send. */
-function fakeClickHouse(opts: { originColumns?: boolean } = {}) {
+function fakeClickHouse(opts: { originColumns?: false | readonly ColumnRow[] } = {}) {
   const rows: (IndexRow & { origin?: string; origin_claim_token?: string })[] = [];
   const tsMs = (r: IndexRow) => Date.parse(`${r.ts.replace(" ", "T")}Z`);
   const identity = (r: IndexRow) => [r.org_id, r.workspace_id, tsMs(r), r.session_id, r.source, r.machine_id, r.kind, r.event_id].join("|");
@@ -96,8 +115,23 @@ function fakeClickHouse(opts: { originColumns?: boolean } = {}) {
     },
     async select<T>(query: string, options?: { params?: Record<string, unknown> }) {
       if (query.includes("search_ingest_state")) return [] as T[];
-      if (query.includes("system.columns"))
-        return (opts.originColumns === false ? [] : [{ name: "origin", type: "LowCardinality(String)", default_expression: "'canonical'" }, { name: "origin_claim_token", type: "String", default_expression: "''" }]) as T[];
+      // The output-facts schema probe (erasure path): no fact tables exist in this fake.
+      if (query.includes("system.columns") && query.includes("{tables:Array(String)}")) return [] as T[];
+      if (query.includes("system.columns")) {
+        // The check must read the default kind, not only type and expression.
+        expect(query).toContain("default_kind");
+        return (opts.originColumns === false ? [] : [...(opts.originColumns ?? ORIGIN_COLUMN_ROWS)]) as T[];
+      }
+      if (query.includes("origin <> 'buffered'")) {
+        // canonicalPresent: a raw read (every physical row, no fold) of non-buffered rows by identity.
+        expect(query).not.toContain("FINAL");
+        const token = /'((?:[^'\\]|\\.)*)'|(\d+)/g;
+        const wanted = new Set([...query.slice(query.indexOf("IN [")).matchAll(/\(((?:'(?:[^'\\]|\\.)*'|\d+)(?:,(?:'(?:[^'\\]|\\.)*'|\d+))*)\)/g)]
+          .map((m) => [...m[1]!.matchAll(token)].map((t) => t[1] ?? t[2]!).join("|")));
+        return rows.filter((r) => (r.origin ?? "canonical") !== "buffered")
+          .map((r) => ({ org_id: r.org_id, session_id: r.session_id, workspace_id: r.workspace_id, machine_id: r.machine_id, source: r.source, kind: r.kind, e: sha(r.event_id), t: String(tsMs(r)) }))
+          .filter((r) => wanted.has([r.org_id, r.session_id, r.workspace_id, r.machine_id, r.source, r.kind, r.e, r.t].join("|"))) as T[];
+      }
       const p = options!.params!;
       return final()
         .filter((r) => r.org_id === p.org && (r.session_id === p.session || r.session_id === p.canonical) && r.workspace_id === p.workspace && r.source === p.source && tsMs(r) >= Number(p.from))
@@ -463,7 +497,10 @@ describe("buffered-stage search feed", () => {
     const base = { AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "bucket", PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true", SESSION_PIPELINE_SECRET_ARN: "arn", SESSION_PIPELINE_QUEUE_URL: "https://sqs" };
     expect(lambdaEnv(base).bufferedSearchFeed).toMatchObject({ enabled: false });
     const gate = { BUFFERED_SEARCH_FEED_GATE_DECLARED: BUFFERED_SEARCH_GATE_CONTRACT };
-    expect(lambdaEnv({ ...base, ...gate, INGEST_BUFFERED_SEARCH_FEED: "on" }).bufferedSearchFeed).toMatchObject({ enabled: true });
+    // The S version encoding must be armed, and BUFFERED_VERSION_CEILING is unpinned: refused either way.
+    expect(lambdaEnv({ ...base, ...gate, INGEST_BUFFERED_SEARCH_FEED: "on" }).bufferedSearchFeed).toBeUndefined();
+    expect(lambdaEnv({ ...base, ...gate, INGEST_BUFFERED_SEARCH_FEED: "on", ...SECOND }).bufferedSearchFeed).toBeUndefined();
+    expect(bufferedFeedConfig({ ...base, ...gate, INGEST_BUFFERED_SEARCH_FEED: "on", ...SECOND }, TEST_CEILING)).toMatchObject({ enabled: true, secondVersion: true });
     // The old read-flag declaration alone no longer arms it; only the contract id does.
     expect(lambdaEnv({ ...base, READ_API_BUFFERED_SEARCH_GATE: "on", INGEST_BUFFERED_SEARCH_FEED: "on" }).bufferedSearchFeed).toBeUndefined();
     expect(lambdaEnv({ ...base, BUFFERED_SEARCH_FEED_GATE_DECLARED: "buffered-search-gate/v0", INGEST_BUFFERED_SEARCH_FEED: "on" }).bufferedSearchFeed).toBeUndefined();
@@ -475,11 +512,14 @@ describe("buffered-stage search feed", () => {
 
   test("lambda runtime: the feed arms only with its own valid login fields; absent or malformed leaves it off", () => {
     const base = { AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "bucket", PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true", SESSION_PIPELINE_SECRET_ARN: "arn", SESSION_PIPELINE_QUEUE_URL: "https://sqs",
-      SEARCH_INDEX_ENABLED: "1", INGEST_BUFFERED_SEARCH_FEED: "on", BUFFERED_SEARCH_FEED_GATE_DECLARED: BUFFERED_SEARCH_GATE_CONTRACT };
+      SEARCH_INDEX_ENABLED: "1", INGEST_BUFFERED_SEARCH_FEED: "on", BUFFERED_SEARCH_FEED_GATE_DECLARED: BUFFERED_SEARCH_GATE_CONTRACT, ...SECOND };
     const clickhouse = { url: "https://ch.synthetic.invalid", user: "u", password: "p", database: "d" };
     const feedUrl = `postgresql://${BUFFERED_SEARCH_FEED_RUNTIME_ROLE}:pw-test-only@db.synthetic.invalid:5432/history`;
-    const armed = (extra: Record<string, unknown>, env: Record<string, string> = base) =>
-      runtimeFromSecret(lambdaEnv(env), JSON.stringify({ hoopdb_url: "postgresql://synthetic.invalid/fixture", clickhouse, ...extra }), "fixture-generation").deps.bufferedFeed !== undefined;
+    // The production ceiling is unpinned, so the config is built here with a synthetic one.
+    const feed = (extra: Record<string, unknown>, env: Record<string, string> = base, pinned = true) =>
+      runtimeFromSecret({ ...lambdaEnv(env), bufferedSearchFeed: (() => { try { return bufferedFeedConfig(env, pinned ? TEST_CEILING : undefined); } catch { return undefined; } })() },
+        JSON.stringify({ hoopdb_url: "postgresql://synthetic.invalid/fixture", clickhouse, ...extra }), "fixture-generation").deps.bufferedFeed;
+    const armed = (extra: Record<string, unknown>, env: Record<string, string> = base) => feed(extra, env) !== undefined;
     // Flag on, gate declared, ClickHouse present, but no feeder login: the feed stays off (never the shared pool).
     expect(armed({})).toBe(false);
     // Malformed or partial login fields disarm it too.
@@ -490,6 +530,11 @@ describe("buffered-stage search feed", () => {
     expect(armed({ buffered_search_feed_database_url: feedUrl, buffered_search_feed_database_ca_pem: "not a pem" })).toBe(false);
     // Valid fields arm it (pools connect lazily; the login check runs before the first feed RPC).
     expect(armed({ buffered_search_feed_database_url: feedUrl, buffered_search_feed_database_ca_pem: SUPABASE_PROD_CA_2021 })).toBe(true);
+    // Armed means the S encoding: the refusal ledger is wired.
+    expect(feed({ buffered_search_feed_database_url: feedUrl, buffered_search_feed_database_ca_pem: SUPABASE_PROD_CA_2021 })?.secondVersion?.ledger).toBeDefined();
+    // The ceiling unpinned (production today): nothing is built.
+    expect(feed({ buffered_search_feed_database_url: feedUrl, buffered_search_feed_database_ca_pem: SUPABASE_PROD_CA_2021 }, base, false)).toBeUndefined();
+    expect(runtimeFromSecret(lambdaEnv(base), JSON.stringify({ hoopdb_url: "postgresql://synthetic.invalid/fixture", clickhouse, buffered_search_feed_database_url: feedUrl, buffered_search_feed_database_ca_pem: SUPABASE_PROD_CA_2021 }), "fixture-generation").deps.bufferedFeed).toBeUndefined();
     // Flag off: valid fields still build nothing.
     const { INGEST_BUFFERED_SEARCH_FEED: _, ...off } = base;
     expect(armed({ buffered_search_feed_database_url: feedUrl, buffered_search_feed_database_ca_pem: SUPABASE_PROD_CA_2021 }, off)).toBe(false);
@@ -509,10 +554,38 @@ describe("buffered-stage search feed", () => {
     expect(ch.rows).toEqual([]);
   });
 
+  test("origin columns: type, default kind and default expression must all match; MATERIALIZED or ALIAS refuses", async () => {
+    await expect(assertOriginColumns(fakeClickHouse().ch)).resolves.toBeUndefined();
+    const variants: [string, Partial<ColumnRow>][] = [
+      ["MATERIALIZED", { default_kind: "MATERIALIZED" }],
+      ["ALIAS", { default_kind: "ALIAS" }],
+      ["EPHEMERAL", { default_kind: "EPHEMERAL" }],
+      ["no default", { default_kind: "", default_expression: "" }],
+      ["type", { type: "String" }],
+      ["expression", { default_expression: "'buffered'" }],
+    ];
+    for (const column of ORIGIN_COLUMN_ROWS)
+      for (const [label, over] of variants) {
+        if (label === "type" && column.name === "origin_claim_token") continue; // String is already its type
+        const rows = ORIGIN_COLUMN_ROWS.map((r) => (r.name === column.name ? { ...r, ...over } : r));
+        await expect(assertOriginColumns(fakeClickHouse({ originColumns: rows }).ch), `${column.name} ${label}`).rejects.toMatchObject({ code: "origin_columns_missing" });
+      }
+    // Only one of the two columns present.
+    await expect(assertOriginColumns(fakeClickHouse({ originColumns: ORIGIN_COLUMN_ROWS.slice(0, 1) }).ch)).rejects.toMatchObject({ code: "origin_columns_missing" });
+    // Through the feeder: a MATERIALIZED origin column refuses before any row is written.
+    const store = newStore();
+    const { prepared } = await stageBatch(store);
+    const t = "00000000-0000-4000-8000-000000000009";
+    const materialized = fakeClickHouse({ originColumns: ORIGIN_COLUMN_ROWS.map((r) => (r.name === "origin" ? { ...r, default_kind: "MATERIALIZED" } : r)) });
+    const source = memorySource([{ candidate: { stageToken: t, createdAt: "x", tenant: { orgId: ORG, workspaceId: WS, userId: USER }, originId: ORIGIN, batchId: "b" }, state: () => liveState(prepared, t, "x") }]).source;
+    await expect(feedBufferedStageByKey(prepared.spec.key, feedDeps(source, store, materialized.ch))).rejects.toMatchObject({ code: "origin_columns_missing" });
+    expect(materialized.rows).toEqual([]);
+  });
+
   test("config: default off; only the literal 'on' arms it; bounds refuse", () => {
     expect(bufferedFeedConfig({})).toMatchObject({ enabled: false, pageSize: 50, stagesPerSecond: 5, since: BUFFERED_FEED_DEFAULT_SINCE, cursor: "backfill-20261105" });
     const declared = { BUFFERED_SEARCH_FEED_GATE_DECLARED: BUFFERED_SEARCH_GATE_CONTRACT };
-    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: "on", ...declared }).enabled).toBe(true);
+    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: "on", ...declared, ...SECOND }, TEST_CEILING).enabled).toBe(true);
     // The declaration alone never arms it: the feed's own flag stays the switch.
     expect(bufferedFeedConfig(declared).enabled).toBe(false);
     for (const v of ["1", "true", "ON", "yes"]) expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: v, ...declared })).toThrow(expect.objectContaining({ code: "config_flag_invalid" }));
@@ -536,10 +609,10 @@ describe("buffered-stage search feed", () => {
     }
     // Both set: armed.
     expect(bufferedFeedGateRefusal({ BUFFERED_SEARCH_FEED_GATE_DECLARED: BUFFERED_SEARCH_GATE_CONTRACT })).toBeNull();
-    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: "on", BUFFERED_SEARCH_FEED_GATE_DECLARED: BUFFERED_SEARCH_GATE_CONTRACT }).enabled).toBe(true);
+    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED: "on", BUFFERED_SEARCH_FEED_GATE_DECLARED: BUFFERED_SEARCH_GATE_CONTRACT, ...SECOND }, TEST_CEILING).enabled).toBe(true);
 
     // The scheduled run: refused before any runtime load (no secret, pool or object access).
-    const keys = ["INGEST_BUFFERED_SEARCH_FEED", "BUFFERED_SEARCH_FEED_GATE_DECLARED"] as const;
+    const keys = ["INGEST_BUFFERED_SEARCH_FEED", "BUFFERED_SEARCH_FEED_GATE_DECLARED", "INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION"] as const;
     const saved = keys.map((k) => process.env[k]);
     let loaded = 0;
     const handler = createPipelineLambdaHandler({ loadRuntime: async () => { loaded++; throw new Error("synthetic runtime unavailable"); } });
@@ -550,14 +623,18 @@ describe("buffered-stage search feed", () => {
       process.env.BUFFERED_SEARCH_FEED_GATE_DECLARED = "buffered-search-gate/v0";
       expect(await handler({ bufferedSearchFeed: true })).toEqual({ ok: false });
       expect(loaded).toBe(0);
-      // Declared: the run proceeds to load the runtime (which this test makes fail).
+      // Declared, but the version encoding not armed (version_encoding_not_armed), then armed with the
+      // ceiling unpinned (buffered_version_ceiling_unpinned): still refused before any runtime load.
       process.env.BUFFERED_SEARCH_FEED_GATE_DECLARED = BUFFERED_SEARCH_GATE_CONTRACT;
+      delete process.env.INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION;
       expect(await handler({ bufferedSearchFeed: true })).toEqual({ ok: false });
-      expect(loaded).toBe(1);
+      process.env.INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION = "on";
+      expect(await handler({ bufferedSearchFeed: true })).toEqual({ ok: false });
+      expect(loaded).toBe(0);
       // The feed's own flag off: nothing at all, whatever is declared.
       process.env.INGEST_BUFFERED_SEARCH_FEED = "off";
       expect(await handler({ bufferedSearchFeed: true })).toEqual({ ok: true });
-      expect(loaded).toBe(1);
+      expect(loaded).toBe(0);
     } finally {
       keys.forEach((k, i) => { if (saved[i] === undefined) delete process.env[k]; else process.env[k] = saved[i]; });
     }
@@ -571,5 +648,349 @@ describe("buffered-stage search feed", () => {
     const failing = (code: string): SqlExecutor => ({ query: async () => { throw Object.assign(new Error("x"), { code }); } });
     await expect(sqlBufferedFeedSource(failing("40001")).stage({ stageToken: randomUUID() })).rejects.toMatchObject({ code: "sql_40001", retryable: true });
     await expect(sqlBufferedFeedSource(failing("42501")).stage({ stageToken: randomUUID() })).rejects.toMatchObject({ code: "sql_42501", retryable: false });
+  });
+
+  /** Stages at fixed offsets (ms) before NOW; `listed` decides which the page RPC returns (acknowledged). */
+  async function settleStages(store: ObjectStore, ages: number[]) {
+    const out = [];
+    for (let n = 0; n < ages.length; n++) {
+      const { prepared } = await stageBatch(store, batchRecords(`-settle-${n}`));
+      const candidate: StageCandidate = { stageToken: `00000000-0000-4000-8000-00000000002${n}`, createdAt: new Date(NOW - ages[n]!).toISOString().replace("Z", "000Z"), tenant: { orgId: ORG, workspaceId: WS, userId: USER }, originId: ORIGIN, batchId: `s${n}` };
+      out.push({ candidate, state: () => liveState(prepared, candidate.stageToken, candidate.createdAt) });
+    }
+    return out;
+  }
+  const clockDeps = (source: BufferedFeedSource, store: ObjectStore, ch: ClickHouseClient, clock: { t: number }): BufferedFeedDeps => ({ ...feedDeps(source, store, ch), now: () => clock.t });
+  const settleCfg = { pageSize: 10, stagesPerSecond: 50, since: BUFFERED_FEED_DEFAULT_SINCE, cursor: "settle-test", budgetMs: 60_000 };
+
+  test("late ack: a stage acknowledged after a younger stage was listed is still indexed on the next run", async () => {
+    const store = newStore();
+    // 0: settled; 1: created 4 min ago, acknowledged only after the first run; 2: created 2 min ago, acknowledged.
+    const [old, late, young] = await settleStages(store, [600_000, 240_000, 120_000]);
+    const run = async (settleMs?: number) => {
+      const ch = fakeClickHouse(), clock = { t: NOW };
+      const listed = [old!, young!];
+      const mem = memorySource(listed);
+      const first = await runBufferedFeed(clockDeps(mem.source, store, ch.ch, clock), settleMs === undefined ? settleCfg : { ...settleCfg, settleMs });
+      const afterFirst = mem.cursor.after?.stageToken;
+      listed.push(late!);
+      clock.t = NOW + 600_000;
+      const second = await runBufferedFeed(clockDeps(mem.source, store, ch.ch, clock), settleMs === undefined ? settleCfg : { ...settleCfg, settleMs });
+      const stagesWritten = new Set(ch.rows.map((r) => (r as { origin_claim_token?: string }).origin_claim_token));
+      return { first, second, mem, afterFirst, stagesWritten };
+    };
+    const claimOf = (s: typeof old) => claims.get(s!.state().stage!.key)!;
+    // Default holdback (300 s): the first run stops before the young stage without checking it.
+    const held = await run();
+    expect(held.first).toMatchObject({ indexed: 1, stages: 1, caughtUp: true });
+    expect(held.afterFirst).toBe(old!.candidate.stageToken);
+    expect(held.second).toMatchObject({ indexed: 2, stages: 2, caughtUp: true });
+    expect(held.mem.cursor).toMatchObject({ after: { stageToken: young!.candidate.stageToken }, indexed: 3, skipped: 0 });
+    expect(held.stagesWritten).toEqual(new Set([claimOf(old), claimOf(late), claimOf(young)]));
+    // Control, the defect: without a holdback the cursor passes the young stage first and the late one is never listed.
+    const unguarded = await run(0);
+    expect(unguarded.first).toMatchObject({ indexed: 2 });
+    expect(unguarded.afterFirst).toBe(young!.candidate.stageToken);
+    expect(unguarded.second).toMatchObject({ indexed: 0, caughtUp: true });
+    expect(unguarded.stagesWritten.has(claimOf(late))).toBe(false);
+  });
+
+  test("settle holdback: stopping and resuming neither duplicates nor alters rows", async () => {
+    const store = newStore();
+    const stages = await settleStages(store, [900_000, 700_000, 200_000, 100_000]);
+    const canonicalOrder = (rows: IndexRow[]) => rows.map((r) => JSON.stringify(r)).sort();
+    // Reference: one run long after every stage settled.
+    const once = fakeClickHouse();
+    await runBufferedFeed(clockDeps(memorySource(stages).source, store, once.ch, { t: NOW + 3_600_000 }), settleCfg);
+    // Held: the first run stops at stage 2, later runs resume as the clock moves; then one more run past the end.
+    const held = fakeClickHouse(), clock = { t: NOW };
+    const mem = memorySource(stages);
+    let inserts = 0;
+    const original = held.ch.insert.bind(held.ch);
+    held.ch.insert = async (table, rows, o) => { if (table === EVENTS_TABLE) inserts += rows.length; return original(table, rows, o); };
+    const summaries = [];
+    for (const t of [NOW, NOW + 150_000, NOW + 3_600_000, NOW + 7_200_000]) { clock.t = t; summaries.push(await runBufferedFeed(clockDeps(mem.source, store, held.ch, clock), settleCfg)); }
+    expect(summaries.map((s) => s.indexed)).toEqual([2, 1, 1, 0]);
+    expect(summaries.every((s) => s.caughtUp)).toBe(true);
+    // Every stage written exactly once, and byte-identical (fingerprint and version included) to the one-shot run.
+    expect(inserts).toBe(once.rows.length);
+    expect(canonicalOrder(held.rows)).toEqual(canonicalOrder(once.rows));
+    expect(new Set(held.rows.map((r) => `${r.fingerprint}|${r.version}`))).toEqual(new Set(once.rows.map((r) => `${r.fingerprint}|${r.version}`)));
+    expect(mem.cursor).toMatchObject({ after: { stageToken: stages[3]!.candidate.stageToken }, indexed: 4, skipped: 0 });
+    // A createdAt the clock cannot place is held, never processed.
+    const odd = memorySource([{ ...stages[0]!, candidate: { ...stages[0]!.candidate, createdAt: "not-a-time" } }]);
+    expect(await runBufferedFeed(clockDeps(odd.source, store, fakeClickHouse().ch, { t: NOW + 3_600_000 }), settleCfg)).toMatchObject({ stages: 0, indexed: 0, caughtUp: true });
+    expect(odd.cursor.after).toBeNull();
+  });
+
+  test("config: the settle holdback defaults to 300 s and refuses values outside 180-3600 s", () => {
+    expect(bufferedFeedConfig({}).settleMs).toBe(300_000);
+    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_SETTLE_S: "" }).settleMs).toBe(300_000);
+    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_SETTLE_S: "180" }).settleMs).toBe(180_000);
+    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_SETTLE_S: "3600" }).settleMs).toBe(3_600_000);
+    for (const v of ["0", "179", "3601", "1000000", "-300", "300.5", " 300", "5m", "3e2"])
+      expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_SETTLE_S: v })).toThrow(expect.objectContaining({ code: "config_settle_s_invalid" }));
+  });
+});
+
+describe("buffered feed version (S): created_at seconds with same-second refusal", () => {
+  const tenant = { orgId: ORG, workspaceId: WS, userId: USER };
+  const tok = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+  const cfg = { pageSize: 10, stagesPerSecond: 50, since: BUFFERED_FEED_DEFAULT_SINCE, cursor: "backfill-test", budgetMs: 60_000 };
+  /** The in-memory refusal ledger; `failWrite`/`corrupt` exercise the durable-record path. */
+  function memoryLedger(opts: { failWrite?: boolean; corrupt?: boolean } = {}) {
+    const entries = new Map<string, TieLedgerEntry>();
+    const writes: string[] = [];
+    const ledger: BufferedTieLedger = {
+      async read(t) { return entries.get(t) ?? null; },
+      async write(t, e) {
+        if (opts.failWrite) throw new Error("ch down");
+        writes.push(t);
+        entries.set(t, opts.corrupt ? { ...e, siblings: e.siblings + 1 } : e);
+      },
+      async outstanding() { return [...entries.values()].filter((e) => !e.state.startsWith("resolved_")).length; },
+    };
+    return { ledger, entries, writes };
+  }
+  const sDeps = (source: BufferedFeedSource, store: ObjectStore, ch: ClickHouseClient, ledger: BufferedTieLedger): BufferedFeedDeps =>
+    ({ ...feedDeps(source, store, ch), secondVersion: { ledger, versionCeiling: TEST_CEILING } });
+  const live = (prepared: Awaited<ReturnType<typeof stageBatch>>["prepared"], n: number, createdAt: string, sameSecond?: { siblings: number; pending: number }): StageState =>
+    ({ ...liveState(prepared, tok(n), createdAt), ...(sameSecond ? { sameSecond } : {}) });
+  const cand = (n: number, createdAt: string, over: Partial<StageCandidate> = {}): StageCandidate =>
+    ({ stageToken: tok(n), createdAt, tenant, originId: ORIGIN, batchId: "batch-1", ...over });
+
+  test("encoder: exact grammar, real calendar instants only, floor seconds, B1 band, unpinned ceiling refuses", () => {
+    expect(createdAtSeconds("2026-11-07T11:30:00.000000Z")).toBe(Date.UTC(2026, 10, 7, 11, 30, 0) / 1000);
+    expect(createdAtSeconds("2026-11-07T11:30:00.999999Z")).toBe(Date.UTC(2026, 10, 7, 11, 30, 0) / 1000);
+    expect(createdAtSeconds("2024-02-29T23:59:59.000001Z")).toBe(Date.UTC(2024, 1, 29, 23, 59, 59) / 1000);
+    for (const bad of ["2026-11-07T11:30:00Z", "2026-11-07T11:30:00.000Z", "2026-11-07T11:30:00.0000000Z", "2026-11-07T11:30:00.000000+00:00",
+      "2026-11-07 11:30:00.000000Z", "2026-11-07T11:30:00.000000z", " 2026-11-07T11:30:00.000000Z", "2026-11-07T11:30:00.000000Z\n",
+      "2025-02-29T00:00:00.000000Z", "2026-02-30T00:00:00.000000Z", "2026-13-01T00:00:00.000000Z", "2026-11-07T24:00:00.000000Z",
+      "2026-11-07T11:60:00.000000Z", "2026-12-31T23:59:60.000000Z", "+02026-11-07T11:30:00.000000Z", "x", ""])
+      expect(createdAtSeconds(bad)).toBeNull();
+    expect(encodeBufferedVersion("2026-11-07T11:30:00.123456Z", TEST_CEILING)).toBe(Date.UTC(2026, 10, 7, 11, 30, 0) / 1000);
+    // Seconds sit far below any raw-ms canonical version of the same era.
+    expect(encodeBufferedVersion("2026-11-07T11:30:00.123456Z", TEST_CEILING)).toBeLessThan(Date.UTC(2020, 0, 1));
+    expect(() => encodeBufferedVersion("2026-11-07T11:30:00.000Z", TEST_CEILING)).toThrow(expect.objectContaining({ code: "stage_created_at_invalid" }));
+    expect(() => encodeBufferedVersion("1970-01-01T00:00:00.000000Z", TEST_CEILING)).toThrow(expect.objectContaining({ code: "buffered_version_out_of_band" }));
+    expect(() => encodeBufferedVersion("2026-11-07T11:30:00.000000Z", 1_000)).toThrow(expect.objectContaining({ code: "buffered_version_out_of_band" }));
+    // The production ceiling is not pinned in this change (operator counts-only read first): refuse.
+    expect(BUFFERED_VERSION_CEILING).toBeUndefined();
+    expect(() => encodeBufferedVersion("2026-11-07T11:30:00.000000Z")).toThrow(expect.objectContaining({ code: "buffered_version_ceiling_unpinned" }));
+  });
+
+  test("config and guard: the second-version flag is literal off/on; on with the legacy encoding or an unpinned ceiling refuses", () => {
+    const declared = { BUFFERED_SEARCH_FEED_GATE_DECLARED: BUFFERED_SEARCH_GATE_CONTRACT, INGEST_BUFFERED_SEARCH_FEED: "on" };
+    expect(bufferedFeedConfig({}).secondVersion).toBe(false);
+    expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION: "on" }).secondVersion).toBe(true);
+    for (const v of ["1", "true", "ON", ""]) expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION: v })).toThrow(expect.objectContaining({ code: "config_second_version_invalid" }));
+    expect(bufferedFeedVersionRefusal({})).toBe("version_encoding_not_armed");
+    expect(bufferedFeedVersionRefusal({ INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION: "off" }, TEST_CEILING)).toBe("version_encoding_not_armed");
+    expect(bufferedFeedVersionRefusal(SECOND)).toBe("buffered_version_ceiling_unpinned");
+    expect(bufferedFeedVersionRefusal(SECOND, TEST_CEILING)).toBeNull();
+    expect(() => bufferedFeedConfig(declared, TEST_CEILING)).toThrow(expect.objectContaining({ code: "version_encoding_not_armed" }));
+    expect(() => bufferedFeedConfig({ ...declared, ...SECOND })).toThrow(expect.objectContaining({ code: "buffered_version_ceiling_unpinned" }));
+    expect(bufferedFeedConfig({ ...declared, ...SECOND }, TEST_CEILING)).toMatchObject({ enabled: true, secondVersion: true });
+  });
+
+  test("strict SQL source: page grammar and keyset, stage grammar, sameSecond present and well formed", async () => {
+    const answer = (r: unknown): SqlExecutor => ({ query: async <R>() => ({ rows: [{ r }] as R[] }) });
+    const strict = (r: unknown) => sqlBufferedFeedSource(answer(r), { secondVersion: true });
+    const row = (n: number, createdAt: string) => ({ stageToken: tok(n), createdAt, tenant, originId: ORIGIN, batchId: "b" });
+    const a = "2026-11-07T11:30:00.000001Z", b = "2026-11-07T11:30:00.000002Z";
+    expect((await strict({ stages: [row(1, a), row(2, b)], after: null }).page("c", BUFFERED_FEED_DEFAULT_SINCE, 5)).stages.length).toBe(2);
+    // Same createdAt: the token breaks the tie, strictly.
+    expect((await strict({ stages: [row(1, a), row(2, a)], after: null }).page("c", BUFFERED_FEED_DEFAULT_SINCE, 5)).stages.length).toBe(2);
+    for (const bad of [[row(2, a), row(1, a)], [row(1, a), row(1, a)], [row(1, b), row(2, a)]])
+      await expect(strict({ stages: bad, after: null }).page("c", BUFFERED_FEED_DEFAULT_SINCE, 5)).rejects.toMatchObject({ code: "sql_page_order" });
+    // The first row must be after the cursor.
+    await expect(strict({ stages: [row(1, a)], after: { createdAt: a, stageToken: tok(1) } }).page("c", BUFFERED_FEED_DEFAULT_SINCE, 5)).rejects.toMatchObject({ code: "sql_page_order" });
+    await expect(strict({ stages: [row(1, a)], after: { createdAt: b, stageToken: tok(0) } }).page("c", BUFFERED_FEED_DEFAULT_SINCE, 5)).rejects.toMatchObject({ code: "sql_page_order" });
+    expect((await strict({ stages: [row(2, a)], after: { createdAt: a, stageToken: tok(1) } }).page("c", BUFFERED_FEED_DEFAULT_SINCE, 5)).stages.length).toBe(1);
+    await expect(strict({ stages: [], after: { createdAt: "2026-11-07T11:30:00.000Z", stageToken: tok(1) } }).page("c", BUFFERED_FEED_DEFAULT_SINCE, 5)).rejects.toMatchObject({ code: "sql_page_after" });
+    await expect(strict({ stages: [], after: { createdAt: a, stageToken: "nope" } }).page("c", BUFFERED_FEED_DEFAULT_SINCE, 5)).rejects.toMatchObject({ code: "sql_page_after" });
+    await expect(strict({ stages: [row(1, "2026-11-07T11:30:00.000000+00:00")], after: null }).page("c", BUFFERED_FEED_DEFAULT_SINCE, 5)).rejects.toMatchObject({ code: "sql_page_row" });
+    // The legacy source keeps its old (loose) checks: an equal-key page still passes, byte-identical.
+    expect((await sqlBufferedFeedSource(answer({ stages: [row(1, a), row(1, a)], after: null })).page("c", BUFFERED_FEED_DEFAULT_SINCE, 5)).stages.length).toBe(2);
+
+    const t = tok(7);
+    const stageResult = (over: Record<string, unknown> = {}) => ({ found: true, status: "live", reason: null, retained: [0], tenant, originId: ORIGIN, batchId: "b", claimToken: tok(9),
+      stage: { stageToken: t, key: "k", sha256: "0".repeat(64), bytes: 10, groupOrdinals: [[0]], createdAt: a }, sameSecond: { siblings: 0, pending: 0 }, ...over });
+    expect((await strict(stageResult()).stage({ stageToken: t })).sameSecond).toEqual({ siblings: 0, pending: 0 });
+    expect((await strict(stageResult({ sameSecond: { siblings: 3, pending: 1 } })).stage({ stageToken: t })).sameSecond).toEqual({ siblings: 3, pending: 1 });
+    const { sameSecond: _, ...without } = stageResult();
+    await expect(strict(without).stage({ stageToken: t })).rejects.toMatchObject({ code: "sql_same_second_unavailable" });
+    for (const ss of [null, {}, { siblings: "1", pending: 0 }, { siblings: 0, pending: -1 }, { siblings: 0, pending: 1 }, { siblings: 1.5, pending: 0 }])
+      await expect(strict(stageResult({ sameSecond: ss })).stage({ stageToken: t })).rejects.toMatchObject({ code: "sql_same_second_malformed" });
+    await expect(strict(stageResult({ stage: { ...stageResult().stage, createdAt: "2026-11-07T11:30:00Z" } })).stage({ stageToken: t })).rejects.toMatchObject({ code: "sql_stage_spec" });
+    // The legacy source neither needs nor surfaces it (flag off: unchanged).
+    expect((await sqlBufferedFeedSource(answer(without)).stage({ stageToken: t })).sameSecond).toBeUndefined();
+    expect("sameSecond" in (await sqlBufferedFeedSource(answer(stageResult())).stage({ stageToken: t }))).toBe(false);
+  });
+
+  test("flag off is unchanged: received_at ms version, sameSecond ignored, no canonical probe, no ledger", async () => {
+    const store = newStore(), ch = fakeClickHouse();
+    const { prepared } = await stageBatch(store);
+    const at = "2026-11-07T11:30:00.000000Z";
+    const mem = memorySource([{ candidate: cand(1, at), state: () => live(prepared, 1, at, { siblings: 5, pending: 2 }) }]);
+    const selects: string[] = [];
+    const spy: ClickHouseClient = { ...ch.ch, async select(q, o) { selects.push(q); return ch.ch.select(q, o); } };
+    const summary = await runBufferedFeed(feedDeps(mem.source, store, spy), cfg);
+    expect(summary).toEqual({ pages: 1, stages: 1, indexed: 1, skipped: 0, rows: 6, deleted: 0, caughtUp: true, reasons: {} });
+    expect(new Set(ch.rows.map((r) => r.version))).toEqual(new Set([RECEIVED.getTime()]));
+    expect(selects.some((q) => q.includes("origin <> 'buffered'") || q.includes("buffered-tie"))).toBe(false);
+    expect(await feedBufferedStageByKey(prepared.spec.key, feedDeps(mem.source, store, ch.ch))).toEqual({ outcome: "indexed", rows: 6, deleted: 0 });
+  });
+
+  test("flag on: version is the stage created_at second; replays fold to the same rows (keep-up and backfill)", async () => {
+    const store = newStore(), ch = fakeClickHouse();
+    const { prepared } = await stageBatch(store);
+    const at = "2026-11-07T11:31:07.654321Z", second = Date.UTC(2026, 10, 7, 11, 31, 7) / 1000;
+    const { ledger, writes } = memoryLedger();
+    const mem = memorySource([{ candidate: cand(1, at), state: () => live(prepared, 1, at, { siblings: 0, pending: 0 }) }]);
+    expect(await feedBufferedStageByKey(prepared.spec.key, sDeps(mem.source, store, ch.ch, ledger))).toEqual({ outcome: "indexed", rows: 6, deleted: 0, canonicalPresent: 0 });
+    expect(new Set(ch.rows.map((r) => r.version))).toEqual(new Set([second]));
+    const first = ch.final().sort(byIdentity);
+    const summary = await runBufferedFeed(sDeps(mem.source, store, ch.ch, ledger), cfg);
+    expect(summary).toMatchObject({ indexed: 1, rows: 6, refused: 0, refusalsOutstanding: 0, canonicalPresent: 0, caughtUp: true });
+    expect(await feedBufferedStageByKey(prepared.spec.key, sDeps(mem.source, store, ch.ch, ledger))).toMatchObject({ outcome: "indexed", rows: 6 });
+    expect(ch.final().sort(byIdentity)).toEqual(first);
+    expect(writes).toEqual([]);
+    // The exact-version cleanup still matches what was written (the version is a pure function of created_at).
+    expect(await deleteBufferedRows(ch.ch, ch.final() as never)).toBe(6);
+    expect(ch.rows).toEqual([]);
+  });
+
+  test("same_second_tie: backfill writes no rows, records the refusal, reads it back, then advances; the run is not coverage", async () => {
+    const store = newStore(), ch = fakeClickHouse();
+    const one = await stageBatch(store, batchRecords("-1")), two = await stageBatch(store, batchRecords("-2"));
+    const tieAt = "2026-11-07T11:30:00.000000Z", okAt = "2026-11-07T11:30:05.000000Z";
+    const m = memoryLedger();
+    const mem = memorySource([
+      { candidate: cand(1, tieAt), state: () => live(one.prepared, 1, tieAt, { siblings: 1, pending: 0 }) },
+      { candidate: cand(2, okAt), state: () => live(two.prepared, 2, okAt, { siblings: 0, pending: 0 }) },
+    ]);
+    const summary = await runBufferedFeed(sDeps(mem.source, store, ch.ch, m.ledger), cfg);
+    expect(summary).toMatchObject({ indexed: 1, skipped: 1, refused: 1, refusalsOutstanding: 1, caughtUp: true, reasons: { same_second_tie: 1 } });
+    expect(ch.rows.every((r) => r.origin_claim_token === claims.get(two.prepared.spec.key))).toBe(true);
+    expect(ch.rows.length).toBe(6);
+    expect(m.entries.get(tok(1))).toEqual({ siblings: 1, firstSeen: new Date(NOW).toISOString(), revisits: 0, state: "refused" });
+    expect(mem.cursor).toMatchObject({ after: { stageToken: tok(2) }, skipped: 1, indexed: 1 });
+    // Replay (a fresh cursor): the entry is kept as first recorded, not rewritten.
+    const again = memorySource([{ candidate: cand(1, tieAt), state: () => live(one.prepared, 1, tieAt, { siblings: 2, pending: 0 }) }]);
+    expect(await runBufferedFeed(sDeps(again.source, store, ch.ch, m.ledger), cfg)).toMatchObject({ refused: 1, refusalsOutstanding: 1 });
+    expect(m.writes).toEqual([tok(1)]);
+    expect(m.entries.get(tok(1))!.siblings).toBe(1);
+    // Keep-up never writes the ledger: it skips (logged by the consumer) and never indexes.
+    const k = memoryLedger();
+    expect(await feedBufferedStageByKey(one.prepared.spec.key, sDeps(again.source, store, ch.ch, k.ledger))).toEqual({ outcome: "skipped", reason: "same_second_tie", siblings: 2 });
+    expect(k.writes).toEqual([]);
+  });
+
+  test("same_second_tie: a failed or mismatched ledger write throws and the cursor stays", async () => {
+    const store = newStore(), ch = fakeClickHouse();
+    const { prepared } = await stageBatch(store);
+    const at = "2026-11-07T11:30:00.000000Z";
+    for (const [opts, code] of [[{ failWrite: true }, "ch down"], [{ corrupt: true }, "tie_ledger_readback"]] as const) {
+      const mem = memorySource([{ candidate: cand(1, at), state: () => live(prepared, 1, at, { siblings: 1, pending: 0 }) }]);
+      const run = runBufferedFeed(sDeps(mem.source, store, ch.ch, memoryLedger(opts).ledger), cfg);
+      if (code === "ch down") await expect(run).rejects.toThrow("ch down");
+      else await expect(run).rejects.toMatchObject({ code });
+      expect(mem.cursor.after).toBeNull();
+      expect(mem.calls).not.toContain("advance");
+    }
+    expect(ch.rows).toEqual([]);
+  });
+
+  test("same_second_pending: backfill blocks before the stage; keep-up requeues", async () => {
+    const store = newStore(), ch = fakeClickHouse();
+    const one = await stageBatch(store, batchRecords("-1")), two = await stageBatch(store, batchRecords("-2"));
+    const a = "2026-11-07T11:29:00.000000Z", b = "2026-11-07T11:30:00.000000Z";
+    const m = memoryLedger();
+    const mem = memorySource([
+      { candidate: cand(1, a), state: () => live(one.prepared, 1, a, { siblings: 0, pending: 0 }) },
+      { candidate: cand(2, b), state: () => live(two.prepared, 2, b, { siblings: 1, pending: 1 }) },
+    ]);
+    const summary = await runBufferedFeed(sDeps(mem.source, store, ch.ch, m.ledger), cfg);
+    expect(summary).toMatchObject({ indexed: 1, blocked: "same_second_pending", caughtUp: false, refused: 0 });
+    expect(mem.cursor.after?.stageToken).toBe(tok(1));
+    expect(m.writes).toEqual([]);
+    expect(await feedBufferedStageByKey(two.prepared.spec.key, sDeps(mem.source, store, ch.ch, m.ledger))).toEqual({ outcome: "requeue", reason: "same_second_pending", ageMs: NOW - Date.parse(b) });
+  });
+
+  test("hardening: sameSecond missing, stage/page mismatch, and a count that disagrees with the page all throw before any write", async () => {
+    const store = newStore(), ch = fakeClickHouse();
+    const one = await stageBatch(store, batchRecords("-1")), two = await stageBatch(store, batchRecords("-2"));
+    const a = "2026-11-07T11:30:00.100000Z", b = "2026-11-07T11:30:00.900000Z";
+    const run = (stages: Parameters<typeof memorySource>[0]) => runBufferedFeed(sDeps(memorySource(stages).source, store, ch.ch, memoryLedger().ledger), cfg);
+    await expect(run([{ candidate: cand(1, a), state: () => live(one.prepared, 1, a) }])).rejects.toMatchObject({ code: "sql_same_second_unavailable" });
+    await expect(feedBufferedStageByKey(one.prepared.spec.key, sDeps(memorySource([{ candidate: cand(1, a), state: () => live(one.prepared, 1, a) }]).source, store, ch.ch, memoryLedger().ledger)))
+      .rejects.toMatchObject({ code: "sql_same_second_unavailable" });
+    // (d2) Every bound field of the stage must be the page candidate's.
+    for (const over of [{ createdAt: b }, { originId: "origin-2" }, { batchId: "batch-2" }, { tenant: { ...tenant, userId: "user-2" } }, { tenant: { ...tenant, orgId: "org-b" } }])
+      await expect(run([{ candidate: cand(1, a, over), state: () => live(one.prepared, 1, a, { siblings: 0, pending: 0 }) }])).rejects.toMatchObject({ code: "sql_stage_page_mismatch" });
+    await expect(run([{ candidate: cand(1, a), state: () => ({ ...live(one.prepared, 1, a, { siblings: 0, pending: 0 }), stage: { ...live(one.prepared, 1, a).stage!, stageToken: tok(3) } }) }]))
+      .rejects.toMatchObject({ code: "sql_stage_page_mismatch" });
+    // Two page neighbours of one (org, workspace, origin, user) in one second, yet PG says no sibling.
+    await expect(run([
+      { candidate: cand(1, a), state: () => live(one.prepared, 1, a, { siblings: 0, pending: 0 }) },
+      { candidate: cand(2, b), state: () => live(two.prepared, 2, b, { siblings: 0, pending: 0 }) },
+    ])).rejects.toMatchObject({ code: "same_second_count_disagrees" });
+    // A different user in that second is not a sibling.
+    expect(await run([
+      { candidate: cand(1, a), state: () => live(one.prepared, 1, a, { siblings: 0, pending: 0 }) },
+      { candidate: cand(2, b, { tenant: { ...tenant, userId: "user-2" } }), state: () => ({ ...live(two.prepared, 2, b, { siblings: 0, pending: 0 }), tenant: { ...tenant, userId: "user-2" } }) },
+    ])).toMatchObject({ stages: 2 });
+    expect(ch.rows.filter((r) => r.origin_claim_token === claims.get(one.prepared.spec.key)).length).toBe(6);
+  });
+
+  test("guard (c): an identity with a canonical row in any part is not written and is counted canonical_present", async () => {
+    const store = newStore(), ch = fakeClickHouse();
+    const { prepared, decoded } = await stageBatch(store);
+    const at = "2026-11-07T11:30:00.000000Z";
+    const rows = projectBufferedStage(decoded, new Set(decoded.spec.groupOrdinals.flat()), "96bulls", randomUUID()).rows.map((r) => r.row);
+    // One canonical row (no origin column value = canonical default) and one buffered row of another identity.
+    const { origin: _o, origin_claim_token: _t, ...canonical } = rows[0]! as typeof rows[0] & { origin?: string; origin_claim_token?: string };
+    ch.rows.push({ ...canonical, fingerprint: "s3x", version: NOW }, { ...rows[1]! });
+    expect([...await canonicalPresent(ch.ch, rows)]).toEqual([0]);
+    expect((await canonicalPresent(ch.ch, rows, 1)).size).toBe(1);
+    ch.rows.splice(1, 1);
+    const m = memoryLedger();
+    const mem = memorySource([{ candidate: cand(1, at), state: () => live(prepared, 1, at, { siblings: 0, pending: 0 }) }]);
+    const summary = await runBufferedFeed(sDeps(mem.source, store, ch.ch, m.ledger), cfg);
+    expect(summary).toMatchObject({ indexed: 1, rows: 5, canonicalPresent: 1, reasons: { canonical_present: 1 } });
+    expect(ch.rows.filter((r) => r.fingerprint.startsWith("bf")).length).toBe(5);
+    expect(await feedBufferedStageByKey(prepared.spec.key, sDeps(mem.source, store, ch.ch, m.ledger))).toEqual({ outcome: "indexed", rows: 5, deleted: 0, canonicalPresent: 1 });
+  });
+
+  test("ClickHouse ledger: one search_ingest_state name per stage, JSON counts only, latest wins, resolved entries are not outstanding", async () => {
+    const state: { name: string; value: string; updated_at: string }[] = [];
+    const ch: ClickHouseClient = {
+      database: "test",
+      async command() { throw new Error("unexpected command"); },
+      async insert(table, batch) { expect(table).toBe("search_ingest_state"); state.push(...(batch as typeof state)); },
+      async select<T>(query: string, options?: { params?: Record<string, unknown> }) {
+        const latest = new Map<string, (typeof state)[number]>();
+        for (const r of state) { const held = latest.get(r.name); if (!held || r.updated_at >= held.updated_at) latest.set(r.name, r); }
+        if (query.includes("{name:String}")) { const hit = latest.get(String(options!.params!.name)); return (hit ? [{ value: hit.value, n: 1 }] : []) as T[]; }
+        expect(options!.params!.prefix).toBe("buffered-tie:");
+        return [{ n: String([...latest.values()].filter((r) => r.name.startsWith("buffered-tie:") && !JSON.parse(r.value).state.startsWith("resolved_")).length) }] as T[];
+      },
+    };
+    let clock = NOW;
+    const ledger = clickhouseTieLedger(ch, () => clock);
+    expect(await ledger.read(tok(1))).toBeNull();
+    const entry = { siblings: 2, firstSeen: new Date(NOW).toISOString(), revisits: 0, state: "refused" };
+    await ledger.write(tok(1), entry);
+    expect(state.map((r) => r.name)).toEqual([`buffered-tie:${tok(1)}`]);
+    expect(JSON.parse(state[0]!.value)).toEqual(entry);
+    expect(await ledger.read(tok(1))).toEqual(entry);
+    await ledger.write(tok(2), entry);
+    expect(await ledger.outstanding()).toBe(2);
+    clock += 1_000;
+    await ledger.write(tok(2), { ...entry, state: "resolved_indexed" });
+    expect(await ledger.outstanding()).toBe(1);
+    state.push({ name: `buffered-tie:${tok(3)}`, value: "{\"siblings\":\"x\"}", updated_at: "2026-11-07 12:00:00.000" });
+    await expect(ledger.read(tok(3))).rejects.toMatchObject({ code: "tie_ledger_malformed" });
   });
 });

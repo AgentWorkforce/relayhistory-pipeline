@@ -39,6 +39,7 @@ import { createPostgresSearchIndex, TENANT_SETTINGS_SQL, type TenantSqlRunner } 
 import { writerTransactionSql } from "../transaction-sql.ts";
 import { createReadApi, AuthError } from "../../session-read-api/app.ts";
 import type { SearchProjectionState } from "../search-adapter.ts";
+import { postgresOutputFactsStore, type OutputFactsStore } from "../output-facts-store.ts";
 
 const TRACE = "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18";
 const NOW = new Date("2026-11-01T12:00:00.000Z");
@@ -287,6 +288,53 @@ test("registered Postgres projection serves the actual read API, fences stale wr
     expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, reasons: ["erased"] });
     expect((await query()).hits).toHaveLength(0);
     expect((await index.query({ tenant: { ...tenant, workspaceId: "other" }, order: "asc", limit: 100 })).hits).toHaveLength(1);
+  } finally { await db.close(); }
+}, 30_000);
+
+test("self-host output facts (RELAYHISTORY_SELFHOST_OUTPUT_FACTS): off calls no facts function; on writes them through the store on the pass's own transaction", async () => {
+  const db = new PGlite({ extensions: { pg_trgm } });
+  await db.exec("CREATE EXTENSION pg_trgm");
+  let keys = [await writeSession("srv_of", [event("r1", "1", Date.parse(AT), "hello facts")])];
+  const state: SearchProjectionState = { async fromMs() { return 0; }, async record() {}, async partials() { return { sessions: [], overflow: false }; } };
+  const adapter = composeSearchService({ registry: createSearchIndexRegistry(), state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: db }, "writer", pgliteTenants(db));
+  await adapter.index.ensureSchema();
+  const calls: Array<[string, SqlExecutor]> = [];
+  const spy = (tx: SqlExecutor): OutputFactsStore => ({
+    async previousState() { calls.push(["previousState", tx]); return { range: null, version: 0 }; },
+    async reconcile(_s, input, v) { calls.push(["reconcile", tx]); expect(v).toBe(0); return { inserted: input.eventFacts.length + input.outputFacts.length, deleted: 0, complete: input.complete, reasons: input.reasons, applied: true }; },
+    async recordState(_s, st) { calls.push(["recordState", tx]); expect(st.sourceVersion).toBe(0); return true; },
+    async erase() { calls.push(["erase", tx]); },
+    async schemaReady() { calls.push(["schemaReady", tx]); return { ready: true, present: true }; },
+  });
+  try {
+    // Off (no store): no facts SQL at all, and no facts in the result.
+    const off = fakeSupabase(() => keys);
+    const offResult = await indexSearchScope(scope, { transact: off.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => NOW });
+    expect(offResult).toMatchObject({ complete: true });
+    expect(offResult.outputFacts).toBeUndefined();
+    expect(off.calls.some((c) => c.includes("output_facts"))).toBe(false);
+    // On: the store is built from, and every call runs on, the pass's own transaction.
+    const on = fakeSupabase(() => keys);
+    const onResult = await indexSearchScope(scope, { transact: on.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => NOW, outputFactsStore: spy });
+    expect(onResult).toMatchObject({ complete: true, outputFacts: { complete: true } });
+    expect(calls.map(([name]) => name)).toEqual(["previousState", "reconcile", "recordState"]);
+    expect(calls.every(([, tx]) => tx === on.tx)).toBe(true);
+    // The real Postgres store sends its SQL to that same executor.
+    const real = fakeSupabase(() => keys);
+    const realResult = await indexSearchScope(scope, { transact: real.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => NOW, outputFactsStore: postgresOutputFactsStore });
+    expect(real.calls.some((c) => c.includes("sessions.output_facts_reconcile("))).toBe(true);
+    // The fake database answers no row: the store reads that as a stale refusal and records no state.
+    expect(realResult.outputFacts?.reasons).toContain("output_facts_stale_source_version");
+    expect(real.calls.some((c) => c.includes("sessions.output_facts_record_state("))).toBe(false);
+    // Erasure deletes the scope's facts on the same transaction.
+    calls.length = 0;
+    keys = [];
+    const gone = fakeSupabase(() => keys);
+    expect(await indexSearchScope(scope, { transact: gone.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => NOW, outputFactsStore: spy })).toMatchObject({ complete: true, reasons: ["erased"] });
+    expect(calls.map(([name]) => name)).toEqual(["erase"]);
+    expect(calls[0]![1]).toBe(gone.tx);
+    // The ClickHouse flag and the Postgres store are exclusive.
+    await expect(indexSearchScope(scope, { transact: gone.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, outputFacts: true, outputFactsStore: spy })).rejects.toThrow();
   } finally { await db.close(); }
 }, 30_000);
 

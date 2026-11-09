@@ -17,9 +17,11 @@
  * This module is the contract lane F1 (session analysis) calls for its brief
  * inputs, per session: `{ source, sessionId }` and no window. Read-only: SELECTs only.
  */
-import type { ClickHouseClient, QueryParams } from "../session-pipeline/vendor/search-index/clickhouse.ts";
+import { ClickHouseError, type ClickHouseClient, type QueryParams } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { OUTPUT_FACTS_SESSION_STATE_TABLE, OUTPUT_FACTS_STATE_TABLE, OUTPUT_FACTS_TABLE } from "../session-pipeline/output-facts-schema.ts";
 import { EVENTS_TABLE } from "../session-pipeline/vendor/search-index/schema.ts";
+import { ORIGIN_CANONICAL } from "./buffered-search-gate.ts";
+import { buildOriginColumnProbe, MISSING_COLUMN_CODES } from "./queries.ts";
 
 export interface SessionOutput {
   agentMessages: number;
@@ -198,20 +200,50 @@ export async function outputWindowReadiness(
           AND (isNull(min_ts) OR (max_ts >= toDateTime64({since:String}, 6, 'UTC') AND min_ts ${lt} toDateTime64({until:String}, 6, 'UTC')))`,
       o,
     ),
-    ch.select<{ n: string | number }>(
-      `SELECT count() AS n FROM (
-         SELECT DISTINCT session_id, source FROM ${EVENTS_TABLE} FINAL
-          WHERE org_id = {org:String} AND workspace_id = {workspace:String}
-            AND ts >= toDateTime64({since:String}, 6, 'UTC') AND ts ${lt} toDateTime64({until:String}, 6, 'UTC'))
-        WHERE (session_id, source) NOT IN (
-         SELECT session_id, source FROM ${OUTPUT_FACTS_SESSION_STATE_TABLE} FINAL
-          WHERE org_id = {org:String} AND workspace_id = {workspace:String} AND complete = 1)`,
-      o,
-    ),
+    unindexedSessionCount(ch, lt, o),
   ]);
   if (Number(partial?.n ?? 0) > 0) return "session_partial";
   if (Number(unindexed?.n ?? 0) > 0) return "session_unindexed";
   return "ready";
+}
+
+/**
+ * Sessions with CANONICAL transcript events in the window but no complete facts state row.
+ * Facts are built from the canonical S3 read only (output-facts.ts), so a buffered-origin
+ * row (`origin = 'buffered'`, buffered-search-feed.ts) never gets a facts state row and must
+ * not count here, or every window holding a buffered-only session is a 501. FINAL first, so
+ * the filter applies to each event's newest version (a canonical pass rewrites a buffered
+ * row with origin back to canonical), as queries.ts "canonical" mode serves it.
+ *
+ * A table without the origin column (the column is owner-applied DDL) fails the filtered
+ * query; the count is then taken unfiltered only if the column is STILL absent after that
+ * read (page.ts readEventPage: columns are only ever added and the feeder writes no row
+ * before they exist, so every row read was canonical).
+ */
+async function unindexedSessionCount(
+  ch: ClickHouseClient,
+  lt: "<" | "<=",
+  o: { params: QueryParams; timeoutMs: number; settings?: Record<string, string | number> },
+): Promise<Array<{ n: string | number }>> {
+  const query = (canonicalOnly: boolean) =>
+    `SELECT count() AS n FROM (
+       SELECT DISTINCT session_id, source FROM ${EVENTS_TABLE} FINAL
+        WHERE org_id = {org:String} AND workspace_id = {workspace:String}
+          AND ts >= toDateTime64({since:String}, 6, 'UTC') AND ts ${lt} toDateTime64({until:String}, 6, 'UTC')${canonicalOnly ? `
+          AND origin = '${ORIGIN_CANONICAL}'` : ""})
+      WHERE (session_id, source) NOT IN (
+       SELECT session_id, source FROM ${OUTPUT_FACTS_SESSION_STATE_TABLE} FINAL
+        WHERE org_id = {org:String} AND workspace_id = {workspace:String} AND complete = 1)`;
+  try {
+    return await ch.select<{ n: string | number }>(query(true), o);
+  } catch (error) {
+    if (!(error instanceof ClickHouseError) || !error.code || !MISSING_COLUMN_CODES.has(error.code)) throw error;
+    const rows = await ch.select<{ n: string | number }>(query(false), o);
+    const probe = buildOriginColumnProbe(ch.database);
+    const [found] = await ch.select<{ n: number | string }>(probe.query, { ...o, params: probe.params });
+    if (found === undefined || Number(found.n) !== 0) throw new ClickHouseError(503, null, "origin_column_changed");
+    return rows;
+  }
 }
 
 /** ClickHouse codes for a table or column the query names but the database lacks (DDL not applied / older skeleton). */

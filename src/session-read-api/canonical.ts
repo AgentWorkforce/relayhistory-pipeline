@@ -56,6 +56,18 @@ export class CanonicalReadError extends Error {
     this.name = "CanonicalReadError";
   }
 }
+/** A reason code token: snake_case only, so no id, key, path or free text can pass. */
+const REASON_CODE = /^[a-z][a-z0-9_]{0,63}$/u;
+/**
+ * Log fields for the codes behind a refusal (CanonicalReadError.details), e.g.
+ * `{ reason_codes: "manifest_missing,scope_too_large" }`: deduplicated, in order,
+ * non-code values dropped, `{}` when none survive. One string, so the shared log
+ * sanitizer (src/shared/log.ts, allowlisted `reason_codes`) scrubs and truncates it.
+ */
+export function canonicalReasonCodeFields(codes: readonly unknown[] | undefined): { reason_codes?: string } {
+  const kept = [...new Set((codes ?? []).filter((c): c is string => typeof c === "string" && REASON_CODE.test(c)))];
+  return kept.length > 0 ? { reason_codes: kept.join(",").slice(0, 256) } : {};
+}
 export interface CanonicalDeps {
   pointers(identity: CanonicalIdentity): Promise<CanonicalPointer[]>;
   store: ObjectStore;
@@ -183,8 +195,22 @@ export function canonicalSourceGeneration(
  * every other read does no display work and returns exactly the pre-#184 snapshot. When
  * projected, a display-value refusal omits those rows (`displayOmitted`) instead of failing.
  */
-export function canonicalSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity, options: { directoryValues?: boolean } = {}) {
-  return snapshotWithLimits(deps, identity, CANONICAL_SCOPE_BYTES, 100000, MAX_POINTERS, 500000, options.directoryValues === true ? "optional" : undefined);
+export const CANONICAL_SCOPE_EVENTS = 100000;
+export function canonicalSnapshot(
+  deps: CanonicalDeps,
+  identity: CanonicalIdentity,
+  /**
+   * scopeBytes / scopeEvents: self-host only (serviceCanonicalDeps,
+   * READ_API_CANONICAL_SCOPE_BYTES / _EVENTS, validated there at startup).
+   * Absent: CANONICAL_SCOPE_BYTES / CANONICAL_SCOPE_EVENTS, as before.
+   */
+  options: { directoryValues?: boolean; scopeBytes?: number; scopeEvents?: number } = {},
+) {
+  return snapshotWithLimits(
+    deps, identity,
+    options.scopeBytes ?? CANONICAL_SCOPE_BYTES, options.scopeEvents ?? CANONICAL_SCOPE_EVENTS,
+    MAX_POINTERS, 500000, options.directoryValues === true ? "optional" : undefined,
+  );
 }
 /** Trusted Node producer only. Never called by the raw Worker request path. */
 export function canonicalProducerSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity, profile: NodeReadProfile = "standard") {

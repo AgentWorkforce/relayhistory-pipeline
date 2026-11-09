@@ -32,6 +32,8 @@ import { createServer } from "node:http";
 import { unlinkSync, writeFileSync } from "node:fs";
 import { isTenantOnlyPolicy, type TenantPolicyRow } from "./postgres-search-state.ts";
 import { log } from "../shared/log.ts";
+import { captureSafely } from "../shared/analytics.ts";
+import { ANALYTICS_OFF, analyticsCounterFields, createAnalyticsSink } from "../shared/analytics-config.ts";
 import { integer } from "../shared/env.ts";
 import { inTransaction, type HoopDb } from "../shared/db.ts";
 import { expectedSchema } from "../hoopdb/migrate.ts";
@@ -62,6 +64,8 @@ import {
 } from "./pointer.ts";
 import { processBatch, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
+import { postgresOutputFactsStore } from "./output-facts-store.ts";
+import type { SearchIndexDeps } from "./search-index.ts";
 import {
   ingestLoginIdentity,
   type IngestLoginIdentityRefusal,
@@ -340,6 +344,15 @@ export async function runConsumerTick(io: ConsumerTickIo, since: Date): Promise<
  * other coverage_from_ms as stale, so a mismatched writer never converges.
  * Throws "search state configuration invalid" on a bad id.
  */
+/**
+ * RELAYHISTORY_SELFHOST_OUTPUT_FACTS (default off): output facts go to the Postgres store
+ * (migration 045040) on the search pass's own transaction. Off: the key is absent and
+ * indexSearchScope calls no output facts function.
+ */
+export function outputFactsDeps(config: { outputFacts: boolean }): Pick<SearchIndexDeps, "outputFactsStore"> {
+  return config.outputFacts ? { outputFactsStore: postgresOutputFactsStore } : {};
+}
+
 export function writerComposition(backendId: string, fromMs: number, backend: ConsumerSearchBackend = "postgres", env: NodeJS.ProcessEnv = {}): SearchComposition {
   return backend === "opensearch" ? createOpenSearchSearchComposition({ env, backendId, fromMs }) : createPostgresSearchComposition({ backendId, fromMs });
 }
@@ -1183,10 +1196,14 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     store: raw.store,
     adapter: binding,
     prefixFor: (orgId) => `${config.keyPrefix}/${orgId}`,
+    ...outputFactsDeps(config),
   };
 
   let lastRun = 0;
   let consecutiveFailures = 0;
+  const analytics = createAnalyticsSink(config.analytics ?? ANALYTICS_OFF, "session-pipeline-consumer", "service", {
+    report: (counters) => log.warn("analytics export degraded", analyticsCounterFields(analytics.destination, counters)),
+  });
   log.info("pipeline consumer starting", { service: "session-pipeline-consumer", generation: expected.generation });
 
   let exitCode = 0;
@@ -1197,6 +1214,8 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
       searchBackends: ["postgres", "opensearch"],
       stages: [],
       handlers: () => ({}),
+      // runWorker exits the process itself after a SIGTERM drain, so the flush rides its cleanup.
+      onShutdown: () => analytics.shutdown(),
       tick: async () => {
         const now = Date.now();
         if (now - lastRun < config.everyMinutes * 60_000) return;
@@ -1343,6 +1362,11 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
             pending: summary.pending,
             complete: summary.complete,
           });
+          // Installation-scoped and counts only: no tenant, session or manifest identity.
+          captureSafely(analytics, {
+            kind: "session_pipeline.index_tick_completed", collected: summary.collected, failed: summary.failed, requeued: summary.requeued,
+            stale: summary.stale, tombstoned: summary.tombstoned, complete: summary.complete, durationMs: Date.now() - now,
+          });
         } catch (error) {
           consecutiveFailures = nextFailureCount(consecutiveFailures, true);
           log.error("pipeline consumer tick failed; next poll retries", {
@@ -1362,6 +1386,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
               consecutive_failures: consecutiveFailures,
               unhealthy_file: config.unhealthyFile,
             });
+            await analytics.shutdown();
             try {
               await db.end();
             } catch {}
@@ -1376,6 +1401,9 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     });
     exitCode = 1;
   } finally {
+    // runWorker failed to start or threw: flush here (bounded by SERVICE_LIMITS.shutdownMs, never rejecting,
+    // a no-op after onShutdown already ran).
+    await analytics.shutdown();
     try {
       await db.end();
     } catch {}

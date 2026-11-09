@@ -5,7 +5,26 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { REPOSITORY, validateRequest } from "./check-image-release.mjs";
 
-export const IMAGE = "ghcr.io/agentworkforce/96bulls-services";
+// Primary image repository (matches the sessions-pipeline Helm chart). Every
+// new release also publishes the SAME signed index to LEGACY_IMAGE, which dev
+// installs and chart defaults still pin; both are named in the signed claims.
+export const IMAGE = "ghcr.io/agentworkforce/sessions-pipeline";
+export const LEGACY_IMAGE = "ghcr.io/agentworkforce/96bulls-services";
+export const PUBLISHED_IMAGES = Object.freeze([IMAGE, LEGACY_IMAGE]);
+// Exact claim layouts accepted when verifying. CURRENT is what this workflow
+// signs: primary `image` plus the exact ordered `images` list. LEGACY_ONLY is
+// a release signed before the dual publish: `image` is the old repository and
+// no `images` claim exists. One layout is used for every check of a release.
+export const RELEASE_LAYOUTS = Object.freeze({
+  current: Object.freeze({ image: IMAGE, images: PUBLISHED_IMAGES }),
+  legacyOnly: Object.freeze({ image: LEGACY_IMAGE, images: undefined }),
+});
+const knownLayout = layout => {
+  if (!Object.values(RELEASE_LAYOUTS).includes(layout)) refuse("unknown image layout");
+  return layout;
+};
+const sameList = (actual, expected) => Array.isArray(actual) && actual.length === expected.length &&
+  actual.every((value, i) => typeof value === "string" && value === expected[i]);
 export const SOURCE_TYPE = "https://agentrelay.com/attestations/reviewed-image-source/v1";
 export const BUILD_TYPE = "https://slsa.dev/provenance/v1";
 const refuse = reason => { throw new Error(`Image provenance refused: ${reason}`); };
@@ -38,17 +57,20 @@ export function releaseParams(env) {
   return values;
 }
 
-export function predicates(env, repository = REPOSITORY) {
+export function predicates(env, repository = REPOSITORY, layout = RELEASE_LAYOUTS.current) {
   const p = releaseParams(env);
   const { url: REPO_URL, workflow: WORKFLOW } = signerIdentity(repository);
+  const { image, images } = knownLayout(layout);
   const source = {
     repository: REPO_URL, source_sha: p.source, workflow_sha: p.workflow,
-    source_ref: "refs/heads/main", ci_run_id: p.ci, image: `${IMAGE}@${p.digest}`,
+    source_ref: "refs/heads/main", ci_run_id: p.ci, image: `${image}@${p.digest}`,
+    ...(images ? { images: images.map(name => `${name}@${p.digest}`) } : {}),
   };
   const build = {
     buildDefinition: {
       buildType: "https://agentrelay.com/builders/services-image/v1",
-      externalParameters: { repository: REPO_URL, source_sha: p.source, source_ref: "refs/heads/main", image: IMAGE },
+      externalParameters: { repository: REPO_URL, source_sha: p.source, source_ref: "refs/heads/main", image,
+        ...(images ? { images: [...images] } : {}) },
       resolvedDependencies: [{ uri: `git+${REPO_URL}`, digest: { gitCommit: p.source } }],
     },
     runDetails: {
@@ -91,12 +113,16 @@ function statement(bytes, type, p) {
   } catch { refuse("verified attestation subject or type does not match"); }
 }
 
-export function verifyRelease(env, directory, run = execFileSync, repository = REPOSITORY) {
+export function verifyRelease(env, directory, run = execFileSync, repository = REPOSITORY, layout = RELEASE_LAYOUTS.current) {
   const p = releaseParams(env);
   const { url: REPO_URL, workflow: WORKFLOW } = signerIdentity(repository);
+  knownLayout(layout);
   const index = artifactBytes(join(directory, "services-index.json"));
   verifyIndex(index, p);
-  const expected = predicates(env, repository);
+  const expected = predicates(env, repository, layout);
+  // Array claims must match exactly; a layout without them must not carry any.
+  const claimMatches = (claims, key, value) => Array.isArray(value) ? sameList(claims?.[key], value) : claims?.[key] === value;
+  const noExtraImages = claims => layout.images !== undefined || claims?.images === undefined;
   for (const [file, type, kind] of [
     ["build-provenance.sigstore.json", BUILD_TYPE, "build"],
     ["reviewed-source.sigstore.json", SOURCE_TYPE, "source"],
@@ -117,12 +143,14 @@ export function verifyRelease(env, directory, run = execFileSync, repository = R
     if (!artifactBytes(bundlePath).equals(bytes)) refuse("attestation changed during verification");
     const claims = statement(bytes, type, p);
     if (kind === "source") {
-      if (!claims || Object.entries(expected.source).some(([key, value]) => claims[key] !== value))
+      if (!claims || Object.entries(expected.source).some(([key, value]) => !claimMatches(claims, key, value)) ||
+          !noExtraImages(claims))
         refuse("reviewed source, workflow, image or CI does not match");
     } else {
       const definition = claims?.buildDefinition;
       if (definition?.buildType !== expected.build.buildDefinition.buildType ||
-          Object.entries(expected.build.buildDefinition.externalParameters).some(([key, value]) => definition?.externalParameters?.[key] !== value) ||
+          Object.entries(expected.build.buildDefinition.externalParameters).some(([key, value]) => !claimMatches(definition?.externalParameters, key, value)) ||
+          !noExtraImages(definition?.externalParameters) ||
           !Array.isArray(definition?.resolvedDependencies) || definition.resolvedDependencies.length !== 1 ||
           definition.resolvedDependencies[0].uri !== `git+${REPO_URL}` ||
           definition.resolvedDependencies[0].digest?.gitCommit !== p.source ||
@@ -131,7 +159,8 @@ export function verifyRelease(env, directory, run = execFileSync, repository = R
         refuse("build provenance does not match the approved invocation");
     }
   }
-  return { image: `${IMAGE}@${p.digest}`, source_sha: p.source, workflow_sha: p.workflow, ci_run_id: p.ci };
+  return { image: `${layout.image}@${p.digest}`, ...(layout.images ? { images: layout.images.map(name => `${name}@${p.digest}`) } : {}),
+    source_sha: p.source, workflow_sha: p.workflow, ci_run_id: p.ci };
 }
 
 function main() {
@@ -146,8 +175,12 @@ function main() {
     writeFileSync(join(directory, "build-predicate.json"), JSON.stringify(values.build) + "\n");
     writeFileSync(join(directory, "source-predicate.json"), JSON.stringify(values.source) + "\n");
   } else if (process.argv[2] === "verify") {
-    const receipt = verifyRelease(process.env, directory);
-    console.log(`Verified image provenance for ${receipt.image}`);
+    // Default is the layout this workflow signs. A release signed before the
+    // dual publish is verified only when the operator names that layout.
+    const name = process.env.IMAGE_LAYOUT ?? "current";
+    if (!Object.hasOwn(RELEASE_LAYOUTS, name)) refuse("unknown image layout");
+    const receipt = verifyRelease(process.env, directory, execFileSync, REPOSITORY, RELEASE_LAYOUTS[name]);
+    console.log(`Verified image provenance for ${(receipt.images ?? [receipt.image]).join(", ")}`);
   } else refuse("expected prepare or verify");
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
