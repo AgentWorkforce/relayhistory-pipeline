@@ -278,7 +278,7 @@ jobs:
         run: docker rm -f "$PG_LOCK_NAME" || true
   acquisition-owner-postgres:
     name: acquisition owner contract PostgreSQL ${{ matrix.pg }}
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -323,7 +323,7 @@ jobs:
     # frontier-plan capture on real PostgreSQL. Both describe.skipIf() without their
     # connection env, so each step also fails when anything was skipped.
     name: ingest publication and frontier PostgreSQL ${{ matrix.pg }}
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
