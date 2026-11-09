@@ -166,6 +166,9 @@ services:
       READ_API_DIRECTORY_WORKSPACES: "*"
       READ_API_TIMING_ASSUME_NO_TURNS: "true"
       READ_API_TURNS_ASSUME_NO_LEGACY: "true"
+      # Self-host default (code default off): serve the indexed generation while the pointer lags an
+      # async-admitted append; see docs/selfhost-async-admission.md "Reads right after an async upload".
+      READ_API_CANONICAL_PIN_LAGGING_POINTER: "true"
       READ_API_INTROSPECT_POSITIVE_TTL_MS: "0"
       RELAYHISTORY_READ_API_SECRET: '{"supabase_url":"postgresql://bulls96_read_api:${E2E_READ_PASSWORD:?}@db:5432/postgres"}'
     volumes:

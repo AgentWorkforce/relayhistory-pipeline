@@ -133,6 +133,7 @@ keep their path unchanged either way.
 | `READ_API_DIRECTORY_WORKSPACES` | read API | The canary allowlist for directory, timing, turns, catalog and login: comma-separated workspace ids or `*`. Unset means none (501 `*_workspace_not_enabled`). |
 | `READ_API_TIMING_ASSUME_NO_TURNS` | read API (Worker, self-host SERVICE) | Exactly `true`: time a session that has no legacy turn evidence as having no turns. Otherwise such a session is 501 `timing_turns_unknown`. |
 | `READ_API_TURNS_ASSUME_NO_LEGACY` | read API (self-host SERVICE only) | Exactly `true`: this deployment never had a Neon source, so `/turns` and `/metadata` serve a session's canonical turns without the legacy coverage marker. Otherwise such a session is 501 `turns_unknown`. Never set it on a deployment with legacy history. |
+| `READ_API_CANONICAL_PIN_LAGGING_POINTER` | read API (self-host SERVICE only) | Exactly `true` (default off; the self-host compose sets it): when the session pointer lags an append-only manifest (async admission answers before the consumer re-indexes), `/timing`, `/turns`, `/metadata`, `/catalog` and message-id reads serve the indexed generation instead of 501 `*_manifest_mismatch`, but only when the pointer digest is an exact prefix of the manifest chain and its revision is older. Newer chunks appear after the next reconcile. Any other value is off. Never read by the hosted Lambda. |
 
 - **Dual accept.** A bearer starting `sh_at_` goes to relaycontrol and never to
   the RelayAuth verifiers (it is never JWT-parsed); every other bearer goes to
