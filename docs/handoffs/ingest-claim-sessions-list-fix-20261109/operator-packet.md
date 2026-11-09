@@ -6,6 +6,8 @@ code-only to production. The SQL for each flag flip, the backfill and the verifi
 packet adds the apply-path decision, the order, the bounds, the stop rules, a canary and a
 rollback for each step, and what to report. Citations are `path:line` against main 368b32c0.
 
+Related packets: [buffered search feed activation](../buffered-search-feed-activation-20261109/operator-packet.md) (search for post-cutover sessions; its Postgres slots ride window 1).
+
 ## 0. Status
 
 * Code only. Nothing in this packet has been applied to any database. 044080 and 044090 are on
