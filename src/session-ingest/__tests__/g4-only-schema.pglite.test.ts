@@ -4,7 +4,8 @@
  * acquisition owner), 043860 (#338 buffered search gate), 043870 (#339 buffered search feed
  * cursor), 043880 (#327 bookkeeping cleanup), 043890 (#384), 043900 (#336 consumer function grants,
  * EXECUTE grants only), 044030 (#386 generation overlap: owner-only window, retired record and policy
- * trigger; replaces ingest_require_generation / ingest_lazy_guard) and any later migration (pglite-schema.ts
+ * trigger; replaces ingest_require_generation / ingest_lazy_guard), 044040 (records GIN and the session-first
+ * owner read RPCs) and any later migration (pglite-schema.ts
  * derives POST_G4_MIGRATIONS from the sorted list). The app runs with the Worker's default flags
  * (canonical acceptance, async admission / babysitter routing / replica off, relayhistory
  * custody), and the buffered acceptance mode it is cut over to; every main sync ingest path
@@ -110,13 +111,17 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // #386 generation overlap: owner-only window, retired record and policy trigger; replaces
       // ingest_require_generation / ingest_lazy_guard (in OBJECTS.replacedFunctions below).
       "20261105044030_ingest_generation_overlap.sql",
+      // A jsonb_path_ops GIN on ingest_claim_attempts(records) and CREATE OR REPLACE of the two owner
+      // read RPCs (buffered_sessions_for / buffered_session_stages_for, in OBJECTS.replacedFunctions
+      // below); the ingest Worker never calls either.
+      "20261105044040_buffered_stages_session_first.sql",
       // Replaces the self-host erase and the G4 retire trigger function ingest_publication_retire_fence (in
       // OBJECTS.replacedFunctions below); both now clear the short_summary provenance columns with the summary.
       "20261105044050_selfhost_erase_short_summary_provenance.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
-    expect(OBJECTS.replacedFunctions).toEqual(["ingest_babysitter_retention_register", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_lazy_guard", "ingest_prepare_buffer_stage", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_publish", "ingest_publication_retire_fence", "ingest_require_generation"]);
+    expect(OBJECTS.replacedFunctions).toEqual(["buffered_session_stages_for", "buffered_sessions_for", "ingest_babysitter_retention_register", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_lazy_guard", "ingest_prepare_buffer_stage", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_publish", "ingest_publication_retire_fence", "ingest_require_generation"]);
   });
 
   test("no new table, function or column exists; the replaced RPCs exist in their prior form; no G4 body names a post-G4 object", async () => {

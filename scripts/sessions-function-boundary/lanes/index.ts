@@ -22,10 +22,11 @@ import { readApiTokens } from "./read-api-tokens.ts";
 import { semanticCopy } from "./semantic-copy.ts";
 import { ingestBookkeepingCleanup } from "./ingest-bookkeeping-cleanup.ts";
 import { ingestGenerationOverlap } from "./ingest-generation-overlap.ts";
+import { bufferedStagesSessionFirst } from "./buffered-stages-session-first.ts";
 import { bufferedSearchGateRetiredWitness } from "./buffered-search-gate-retired-witness.ts";
 import { selfhostSessionSelectionErase } from "./selfhost-session-selection-erase.ts";
 import { selfhostEraseLockFences } from "./selfhost-erase-lock-fences.ts";
 import { selfhostEraseShortSummaryProvenance } from "./selfhost-erase-short-summary-provenance.ts";
 
 /** Every lane the unified generator composes. Order does not affect the output. */
-export const LANES: readonly LaneManifest[] = [briefDocuments, ingestHistory, readApi, readApiTokens, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention, briefTitles, lazyClaimClockNarrowing, ownerBufferedRead, lazyAckClockNoKeyUpdate, acquisitionOwner, bufferedSearchGate, bufferedSearchFeed, ingestBookkeepingCleanup, bufferedSearchGateRetiredWitness, selfhostSessionSelectionErase, selfhostEraseLockFences, ingestGenerationOverlap, selfhostEraseShortSummaryProvenance];
+export const LANES: readonly LaneManifest[] = [briefDocuments, ingestHistory, readApi, readApiTokens, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention, briefTitles, lazyClaimClockNarrowing, ownerBufferedRead, lazyAckClockNoKeyUpdate, acquisitionOwner, bufferedSearchGate, bufferedSearchFeed, ingestBookkeepingCleanup, bufferedSearchGateRetiredWitness, selfhostSessionSelectionErase, selfhostEraseLockFences, ingestGenerationOverlap, bufferedStagesSessionFirst, selfhostEraseShortSummaryProvenance];
