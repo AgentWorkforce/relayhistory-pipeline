@@ -16,7 +16,8 @@ import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 import { objectKey, type ObjectStore } from "../../shared/vendor.ts";
-import { IDENTITY_HEADER, encodeIdentity } from "../app.ts";
+import { IDENTITY_HEADER, contentEncodings, encodeIdentity } from "../app.ts";
+import { DELIVERY_LIMITS } from "../vendor/delivery/delivery-contracts.ts";
 import type { SqlRun } from "../ledger-sql.ts";
 import { relaycontrolIngestIdentity, selfhostIntrospector } from "../selfhost-auth.ts";
 import { selfhostIngestConfig } from "../selfhost-config.ts";
@@ -174,6 +175,21 @@ describe("self-host ingest edge over node:http", () => {
     expect(rc.calls).toHaveLength(3);
   });
 
+  test("the limits answer says sessionDeletion:false and sessionReset:false at the top level, after auth", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url } = await start(rc);
+    const limits = await fetch(url("/v1/delivery/limits"), { headers: { authorization: `Bearer ${TOKEN}` } });
+    expect(limits.status).toBe(200);
+    const text = await limits.text();
+    const body = JSON.parse(text) as Record<string, unknown>;
+    expect(body).toEqual({ ...DELIVERY_LIMITS, contentEncodings: contentEncodings(), sessionDeletion: false, sessionReset: false });
+    expect(limits.headers.get("content-type")).toContain("application/json");
+    expect(rc.calls).toHaveLength(1);
+    // Unauthenticated: the same refusal as before, with no capabilities leaked.
+    const anon = await fetch(url("/v1/delivery/limits"));
+    expect([anon.status, await code(anon)]).toEqual([401, "missing_authorization"]);
+  });
+
   test("a revoked token is refused on the very next request (no positive cache)", async () => {
     let revoked = false;
     const rc = await relaycontrol(() => (revoked ? { status: 200, body: { active: false, reason: "revoked", token_id: "tok-1" } } : active(["rth:sync"])));
@@ -311,6 +327,65 @@ describe("self-host ingest edge over node:http", () => {
     // The edge closes the connection once the 413 is out; a client still uploading may see a reset instead.
     if (res instanceof Response) expect([res.status, await code(res)]).toEqual([413, "delivery_too_large"]);
     expect(await chunkKeys(store)).toEqual([]);
+  });
+});
+
+describe("onboarding heartbeat (RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT=true)", () => {
+  const HEARTBEAT = "/v1/onboarding/heartbeat";
+  const on = { RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT: "true" };
+  const progress = JSON.stringify({ phase: "uploading", uploaded: 3, total: 10 });
+
+  test("off by default: 501 unsupported_by_backend, no introspection", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url } = await start(rc);
+    const res = await post(url(HEARTBEAT), progress);
+    expect([res.status, await code(res)]).toEqual([501, "unsupported_by_backend"]);
+    expect(rc.calls).toHaveLength(0);
+  });
+
+  test("an unexpected flag value refuses startup", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    await expect(start(rc, { RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT: "1" })).rejects.toThrow("RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT");
+  });
+
+  test("on: an authenticated heartbeat is 204 with no body, introspected, nothing written", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, store } = await start(rc, on);
+    const res = await post(url(HEARTBEAT), progress, { "x-correlation-id": "hb-1" });
+    expect(res.status).toBe(204);
+    expect(await res.text()).toBe("");
+    expect(res.headers.get("x-correlation-id")).toBe("hb-1");
+    expect(rc.calls.map((c) => c.body)).toEqual([{ token: TOKEN, aud: ORIGIN }]);
+    // Keep-alive survives a drained small body: a second heartbeat on the same client works.
+    expect((await post(url(HEARTBEAT), progress)).status).toBe(204);
+    expect(await chunkKeys(store)).toEqual([]);
+  });
+
+  test("on: unauthenticated is 401, without rth:sync is 403, GET is 405; none introspects past the gate", async () => {
+    const rc = await relaycontrol(() => active(["rth:read"]));
+    const { url } = await start(rc, on);
+    const anon = await fetch(url(HEARTBEAT), { method: "POST", headers: { "content-type": "application/json" }, body: progress });
+    expect([anon.status, anon.headers.get("www-authenticate"), await code(anon)]).toEqual([401, "Bearer", "missing_authorization"]);
+    expect(rc.calls).toHaveLength(0);
+    const unscoped = await post(url(HEARTBEAT), progress);
+    expect([unscoped.status, await code(unscoped)]).toEqual([403, "forbidden"]);
+    const wrong = await fetch(url(HEARTBEAT), { headers: { authorization: `Bearer ${TOKEN}` } });
+    expect([wrong.status, wrong.headers.get("allow"), await code(wrong)]).toEqual([405, "POST", "method_not_allowed"]);
+    expect(rc.calls).toHaveLength(1);
+    // The rest of /v1/onboarding stays unserved.
+    const connection = await fetch(url("/v1/onboarding/connection"), { headers: { authorization: `Bearer ${TOKEN}` } });
+    expect([connection.status, await code(connection)]).toEqual([501, "unsupported_by_backend"]);
+  });
+
+  test("on: a body past the drain cap is not read; still 204 and the connection closes", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url } = await start(rc, on);
+    const res = await post(url(HEARTBEAT), "x".repeat(4 * 1024 * 1024)).catch((e: unknown) => e);
+    // The edge closes the connection once the 204 is out; a client still uploading may see a reset instead.
+    if (res instanceof Response) {
+      expect(res.status).toBe(204);
+      expect(res.headers.get("connection")).toBe("close");
+    }
   });
 });
 

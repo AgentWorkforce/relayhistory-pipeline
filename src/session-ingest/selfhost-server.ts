@@ -13,7 +13,9 @@
  *                              deadLettered, inFlight, lastScanAgeMs }. A dormant edge reports neither.
  *   POST /v1/delivery/batches  rth:sync   (app.ts, unchanged handler)
  *   POST /v1/turns/batches     rth:sync   (app.ts, unchanged handler)
- *   GET  /v1/delivery/limits   rth:sync   (app.ts, unchanged handler)
+ *   GET  /v1/delivery/limits   rth:sync   (app.ts, unchanged handler) plus sessionDeletion:false and sessionReset:false
+ *                              at the top level (SELFHOST_CAPABILITIES): the Desktop shows its delete and reset
+ *                              controls only when the limits answer says true, and neither hosted route is served here
  *   POST /v1/auth/token/refresh  401 refresh_not_supported, always (see SELFHOST_REFRESH_PATH)
  *   POST /v1/delivery/sessions/selection  rth:sync, only with RELAYHISTORY_SELFHOST_SESSION_SELECTION=true:
  *                              per-session erase (enabled:false; enabled:true answers 400 unsupported_by_backend). The app.ts handler is
@@ -23,6 +25,10 @@
  *                              WITHOUT relaycontrol introspection: the app checks its own bearer
  *                              (SESSION_ERASE_API_SECRET). Default off: 501 not_implemented. Internal only;
  *                              the edge must never route /internal/* (docs/selfhost-composition.md section 2).
+ *   POST /v1/onboarding/heartbeat  rth:sync, only with RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT=true: 204, no body.
+ *                              The Desktop's best-effort upload progress; the body is discarded unread past
+ *                              REFRESH_DRAIN_BYTES (connection closed, as the refresh path), never stored or logged.
+ *                              Off (default): 501 like any other unserved /v1 path.
  *   any other /v1 path         501 unsupported_by_backend (reset, recovery, custody,
  *                              onboarding are relayhistory-internal and not served self-host)
  *
@@ -113,6 +119,30 @@ async function drainSmallBody(req: IncomingMessage): Promise<void> {
 
 export const SELFHOST_SESSION_SELECTION_PATH = "/v1/delivery/sessions/selection";
 
+/** RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT=true only: the Desktop's onboarding heartbeat, answered 204 here (never reaches the app). */
+export const SELFHOST_HEARTBEAT_PATH = "/v1/onboarding/heartbeat";
+
+export const SELFHOST_LIMITS_PATH = "/v1/delivery/limits";
+/**
+ * Merged at the top level of the app's GET /v1/delivery/limits answer, self-host only (the hosted app.ts
+ * answer is unchanged). The Desktop enables session deletion / reset only on an explicit true.
+ */
+export const SELFHOST_CAPABILITIES = Object.freeze({ sessionDeletion: false, sessionReset: false });
+
+/** The app, with the self-host capabilities merged into a successful limits answer; every other response untouched. */
+function withSelfhostCapabilities(app: FetchApp): FetchApp {
+  return {
+    async fetch(request) {
+      const response = await app.fetch(request);
+      if (request.method !== "GET" || new URL(request.url).pathname !== SELFHOST_LIMITS_PATH || response.status !== 200) return response;
+      const body = (await response.json()) as Record<string, unknown>;
+      const headers = new Headers(response.headers);
+      headers.delete("content-length");
+      return new Response(JSON.stringify({ ...body, ...SELFHOST_CAPABILITIES }), { status: response.status, headers });
+    },
+  };
+}
+
 /** One assembled ingest: the app, the per-request verifier, readiness and teardown. */
 export interface SelfhostIngestRuntime {
   app: FetchApp;
@@ -148,7 +178,7 @@ export interface SelfhostRuntimeOptions {
 }
 
 /** The ingest app over the given parts. Canonical acceptance, inline writes, no fan-out, no replica, no custody. */
-export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
+export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
   const sessionSelection = settings.sessionSelection === true;
   const verified = new WeakMap<Request, IngestIdentity>();
   const deliver: DeliverDeps = {
@@ -167,11 +197,17 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   };
   // SESSION_ERASE_API_ENABLED (session-erase.ts): the same operator route in every admission mode.
   const sessionErase = settings.sessionErase ? { sessionErase: settings.sessionErase } : {};
-  const routes = sessionSelection ? Object.freeze({ ...SELFHOST_INGEST_ROUTES, [SELFHOST_SESSION_SELECTION_PATH]: "POST" as const }) : SELFHOST_INGEST_ROUTES;
+  const routes: Readonly<Record<string, "GET" | "POST">> = sessionSelection || settings.heartbeatAccept === true
+    ? Object.freeze({
+      ...SELFHOST_INGEST_ROUTES,
+      ...(sessionSelection ? { [SELFHOST_SESSION_SELECTION_PATH]: "POST" as const } : {}),
+      ...(settings.heartbeatAccept === true ? { [SELFHOST_HEARTBEAT_PATH]: "POST" as const } : {}),
+    })
+    : SELFHOST_INGEST_ROUTES;
   const admission = settings.admission;
   if (!admission) {
     // SELFHOST_INGEST_ADMISSION=sync (the default): exactly the app this file always built.
-    const app = createIngestApp({ identify, deliver, log: (fields) => log.info("session ingest", fields), ...sessionErase });
+    const app = withSelfhostCapabilities(createIngestApp({ identify, deliver, log: (fields) => log.info("session ingest", fields), ...sessionErase }));
     return { app, routes, verify: parts.verify, bind: (request, identity) => void verified.set(request, identity), ready: parts.ready, close: parts.close, admissionMode: "sync" };
   }
   const mode = admission.mode === "async" ? "on" as const : "drain" as const;
@@ -181,7 +217,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   });
   options.onConsumer?.(consumer);
   const inboxRoot = `${settings.keyRoot}/${INBOX_NAMESPACE}/`;
-  const app = createIngestApp({
+  const app = withSelfhostCapabilities(createIngestApp({
     identify,
     deliver,
     log: (fields) => log.info("session ingest", fields),
@@ -196,7 +232,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
       selfhost: { identityOf: (request) => verified.get(request), reEnableRefusedByLedger: sessionSelection },
     },
     ...sessionErase,
-  });
+  }));
   if (options.startConsumer !== false) consumer.start();
   return {
     app,
@@ -487,6 +523,19 @@ export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null):
             ...(e.status === 503 ? { "retry-after": "1" } : {}),
             ...(e.status === 401 ? { "www-authenticate": "Bearer" } : {}),
           });
+        }
+
+        // RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT=true (only then is the path in the route table): authenticated
+        // above, so answer 204 and discard the body. A small declared body is drained; anything else (past the
+        // cap, or no length) is left unread and the connection closes after the answer, as on the refresh path.
+        if (path === SELFHOST_HEARTBEAT_PATH) {
+          await drainSmallBody(req);
+          const unread = !req.complete;
+          res.writeHead(204, { "cache-control": "private, no-store", "x-correlation-id": correlationId, ...(unread ? { connection: "close" } : {}) });
+          res.end(() => {
+            if (unread) req.socket?.destroy();
+          });
+          return;
         }
 
         const headers = new Headers();
