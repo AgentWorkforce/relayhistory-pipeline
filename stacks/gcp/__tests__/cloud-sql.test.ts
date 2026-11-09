@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import {
   ALCHEMY_GCP_BETA_84_SQL,
   CLOUD_SQL_PROXY_IMAGE,
@@ -559,37 +559,44 @@ describe("SQL Admin idempotent poster", () => {
   test("uses one outer deadline through lookup, insert, operation, and final confirmation", async () => {
     const spec = privateCloudSqlSpec(input);
     let nowMs = 0;
-    const calls: SqlAdminEnsureRequest[] = [];
-    const steps: SqlAdminEnsureResponse[] = [
-      { status: 404 },
-      { status: 200, body: { name: "op-1", status: "PENDING" } },
-      { status: 200, body: { status: "DONE" } },
-      { status: 200, body: matchingInstance(spec) },
-    ];
-    await expect(
-      ensurePrivateCloudSql(
-        spec,
-        credential,
-        {
-          request: async (call) => {
-            calls.push(call);
-            nowMs += 4;
-            return steps.shift()!;
+    // The deadline also reads the monotonic clock; drive it from the same virtual time so a slow
+    // runner's real milliseconds cannot expire the 10 ms budget before the insert.
+    const monotonic = spyOn(performance, "now").mockImplementation(() => nowMs);
+    try {
+      const calls: SqlAdminEnsureRequest[] = [];
+      const steps: SqlAdminEnsureResponse[] = [
+        { status: 404 },
+        { status: 200, body: { name: "op-1", status: "PENDING" } },
+        { status: 200, body: { status: "DONE" } },
+        { status: 200, body: matchingInstance(spec) },
+      ];
+      await expect(
+        ensurePrivateCloudSql(
+          spec,
+          credential,
+          {
+            request: async (call) => {
+              calls.push(call);
+              nowMs += 4;
+              return steps.shift()!;
+            },
           },
-        },
-        {
-          now: () => nowMs,
-          sleep: async (ms) => {
-            nowMs += ms;
+          {
+            now: () => nowMs,
+            sleep: async (ms) => {
+              nowMs += ms;
+            },
+            deadlineMs: 10,
+            requestTimeoutMs: 100,
+            intervalMs: 1,
+            maxPolls: 10,
           },
-          deadlineMs: 10,
-          requestTimeoutMs: 100,
-          intervalMs: 1,
-          maxPolls: 10,
-        },
-      ),
-    ).rejects.toThrow(/outcome is uncertain/);
-    expect(calls.map((call) => call.method)).toEqual(["GET", "POST", "GET"]);
+        ),
+      ).rejects.toThrow(/outcome is uncertain/);
+      expect(calls.map((call) => call.method)).toEqual(["GET", "POST", "GET"]);
+    } finally {
+      monotonic.mockRestore();
+    }
   });
 
   test("rechecks the fixed apply lease after lookup and refuses the insert", async () => {
