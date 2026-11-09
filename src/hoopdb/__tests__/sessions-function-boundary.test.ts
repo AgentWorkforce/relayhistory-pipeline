@@ -82,6 +82,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105044070_selfhost_erase_search_text_rebuild.down.sql",
       "supabase/rollbacks/20261105044080_ingest_claim_sessions.down.sql",
       "supabase/rollbacks/20261105044090_claim_sessions_reader.down.sql",
+      "supabase/rollbacks/20261105045010_buffered_search_feed_same_second.down.sql",
     ]);
   });
 

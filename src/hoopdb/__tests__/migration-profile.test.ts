@@ -4572,7 +4572,7 @@ test("044100 real prefix upgrade/fresh/noop/rollback/up preserves pointers and e
     VALUES('org-title','ws-title','codex','session-title','machine-title','user-title',now(),now(),'fs','bucket','manifest/title',
     decode(repeat('ab',32),'hex'),'jsonl','019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18',1,'Pointer retained')`);
   const preserved=async()=>expect((await db.query<{title:string}>("SELECT title FROM sessions.session_index WHERE session_id='session-title'")).rows).toEqual([{title:"Pointer retained"}]);
-  expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(1);
+  expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(1+previous.later.length);
   expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(true);await preserved();
   const acl=await db.query<{secdef:boolean;acl:string[]}>(`SELECT p.prosecdef AS secdef,
     ARRAY(SELECT CASE WHEN a.grantee=p.proowner THEN '<owner>' ELSE coalesce(r.rolname,'PUBLIC') END||':'||a.privilege_type
@@ -4583,10 +4583,13 @@ test("044100 real prefix upgrade/fresh/noop/rollback/up preserves pointers and e
   const ledgerBefore=await ledgerHash();
   expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(0);
   expect(await ledgerHash()).toBe(ledgerBefore);await preserved();
+  // Later steps first (newest first): 044100's rollback refuses while a later migration is applied.
+  for (const later of [...previous.later].reverse())
+    await db.exec(readFileSync(join(root,"supabase/rollbacks",`${later.slice("upstream:".length).replace(/\.sql$/,"")}.down.sql`),"utf8"));
   await db.exec(readFileSync(join(root,"supabase/rollbacks/20261105044100_session_brief_summary_read.down.sql"),"utf8"));
   expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(false);await preserved();
   expect((await db.query("SELECT name FROM sessions.__96bulls_migrations WHERE name=$1",[name])).rows).toEqual([]);
-  expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(1);await preserved();
+  expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(1+previous.later.length);await preserved();
   const freshDb=await supabaseLike();await freshDb.exec(ET_BOOT);
   expect(await failure(runMigrations(client(freshDb),{profile:SUPA_ET,steps:full}))).toBeNull();
   expect((await freshDb.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(true);

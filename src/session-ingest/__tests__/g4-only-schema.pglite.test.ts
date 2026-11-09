@@ -130,6 +130,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Read-role-only summary RPC, recorded-title metadata column and invoker trigger;
       // no ingest RPC is replaced or calls them.
       "20261105044100_session_brief_summary_read.sql",
+      // Replaces the feed's stage RPC (043870, post-G4) to add the sameSecond sibling counts; no ingest RPC changes.
+      "20261105045010_buffered_search_feed_same_second.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
