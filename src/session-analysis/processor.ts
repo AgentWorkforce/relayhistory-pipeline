@@ -169,6 +169,8 @@ export interface StoredAnalysisResult {
   key: string;
   sha256: string;
   bytes: number;
+  /** The exact object version the PUT created or found (S3 version id), when the store has one. */
+  versionId?: string;
 }
 
 export interface AnalysisJobStore {
@@ -180,7 +182,7 @@ export interface AnalysisJobStore {
    */
   reserve(job: AnalysisJob, output: AnalysisJobOutput, planned: { sha256: string; bytes: number }): Promise<string | null>;
   /** Create-only put of the planned bytes at the reserved key. */
-  put(key: string, bytes: Uint8Array, sha256: string): Promise<void>;
+  put(key: string, bytes: Uint8Array, sha256: string, job?: AnalysisJob): Promise<{ versionId?: string } | void>;
   /** One transaction: the same three checks, the result recorded, the ticket retired. */
   complete(input: { job: AnalysisJob; output: AnalysisJobOutput; stored: StoredAnalysisResult }): Promise<boolean>;
   /** Lease-fenced (token and expiry); false when the lease was lost. `error` is a controlled code. */
@@ -229,8 +231,9 @@ export async function runAnalysisJob(
     // Nothing is written unless the reservation (lease + liveness + revision + ticket) holds.
     const key = await store.reserve(job, output, { sha256, bytes: bytes.length });
     if (!key) return "lease-lost";
-    await store.put(key, bytes, sha256);
-    return (await store.complete({ job, output, stored: { key, sha256, bytes: bytes.length } }))
+    const put = await store.put(key, bytes, sha256, job);
+    const versionId = put && put.versionId ? put.versionId : undefined;
+    return (await store.complete({ job, output, stored: { key, sha256, bytes: bytes.length, ...(versionId ? { versionId } : {}) } }))
       ? "completed"
       : "lease-lost";
   } catch (error) {

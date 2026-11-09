@@ -582,7 +582,7 @@ describe("runtime role: required, existing, SELECT only", () => {
               AND (SELECT oid FROM pg_roles WHERE rolname = 'g6_rt') = ANY(p.polroles)`,
         )
       ).rows[0]?.n,
-    ).toBe(30);
+    ).toBe(35); // 30 + lane F1's five analysis tables (20261105046000: jobs, requests, tickets, invocations, reservations)
     const role = (
       await db.query<Record<string, unknown>>(
         `SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb,
@@ -2377,6 +2377,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const BK = "upstream:20261105043880_ingest_bookkeeping_cleanup.sql";
     const V = "upstream:20261105044030_ingest_generation_overlap.sql";
     const GR = "upstream:20261105043890_buffered_search_gate_retired_witness.sql";
+    const AJ = "upstream:20261105046000_analysis_jobs.sql";
     const TK = "upstream:20261105044000_read_api_tokens.sql";
     const CB = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
     const SF = "upstream:20261105044040_buffered_stages_session_first.sql";
@@ -2391,14 +2392,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, TK, CB, V, SF, SP, ST, CS, CR, DG]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
     );
     expect(outOfOrder?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, TK, V, DG]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, TK, V, DG, AJ]));
     // P3b (034000) refuses while a later lane (035000, 036000, 037000) is applied.
     expect((await failure(rollback("20261105034000_session_directory_read_api.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(R);
@@ -2434,7 +2435,12 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105045040 (self-host output facts) is the newest step: it refuses nothing below it, so it rolls back first
+    // Lane F1 (046000) is the newest: 040000 and 039000 refuse while it is applied; it rolls back first, with assertions.
+    // (045040, 045030 and 045010 roll back next newest-first with assertions, then 045000, then 044090/044100 via the successor helper below.)
+    expect((await failure(rollback("20261105040000_ingest_lazy_source_tables.down.sql")))?.code).toBe("55000");
+    await rollback("20261105046000_analysis_jobs.down.sql");
+    expect(await names()).not.toContain("upstream:20261105046000_analysis_jobs.sql");
+    // 20261105045040 (self-host output facts) is the next-newest step: it refuses nothing below it, so it rolls back
     // with assertions (its down drops its four tables and nine functions and its ledger row).
     const OF = "upstream:20261105045040_selfhost_output_facts.sql";
     expect(await names()).toContain(OF);
@@ -2446,14 +2452,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       expect(await relation(`sessions.${t}`)).toBeNull();
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'output\\_facts\\_%'")).rows[0]!.n).toBe(0);
     // Other lanes newer than 20261105045000 (045010 same-second feed, 045030 consumer project-text grant) roll back next, newest first: 045000's down
-    // refuses (55000) while any of them is applied.
-    const newerThanDigest = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > DG && s.name !== OF).reverse();
+    // refuses (55000) while any of them is applied. (046000 already rolled back above, so it is excluded here.)
+    const newerThanDigest = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > DG && s.name !== OF && s.name !== "upstream:20261105046000_analysis_jobs.sql").reverse();
     if (newerThanDigest.length)
       expect((await failure(rollback("20261105045000_digest_narrative_cache.down.sql")))?.code).toBe("55000");
     for (const { name } of newerThanDigest)
       await rollback(`${name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`);
     // 20261105045000 (digest narrative cache) is then the newest: its own down drops the table first, with assertions.
-    // (044090/044100 roll back next via the successor helper below; DG and newer are excluded there since they are gone.)
+    // (044090/044100 roll back next via the successor helper below; AJ, OF, the 045010/045030 lanes and DG are excluded there since all are already gone.)
     expect(await names()).toContain(DG);
     expect(await relation("sessions.daily_digest_narratives")).toBe("sessions.daily_digest_narratives");
     await rollback("20261105045000_digest_narrative_cache.down.sql");
@@ -2462,7 +2468,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // A successor such as the read-only summary RPC must roll back first.
     // Preserve an explicit out-of-order refusal before using every successor's
     // guarded down script, so newer additive lanes need no fixture rewrites.
-    // (DG is already rolled back with assertions above, so it is excluded here.)
+    // (AJ, OF, the 045010/045030 lanes and DG are already rolled back with assertions above, so all are excluded here.)
     const newerThanClaimReaders = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > CR && s.name < DG).reverse();
     if (newerThanClaimReaders.length)
       expect((await failure(rollback("20261105044090_claim_sessions_reader.down.sql")))?.code).toBe("55000");
@@ -2612,7 +2618,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).toContain(SL);
     expect(await relation("sessions.read_api_tokens")).toBe("sessions.read_api_tokens");
     expect(await relation("sessions.ingest_seed_captures_org_id_idx")).toBe("sessions.ingest_seed_captures_org_id_idx");
-    // Every later upstream step is already rolled back here (045000, 044100, 044090, 044040 and 044030, explicitly above), so no helper call.
+    // Every later upstream step is already rolled back here (046000, 045000, 044100, 044090, 044040 and 044030, explicitly above), so no helper call.
     const laterNames = (await plan(SUPA_ET)).filter((s) => s.name.startsWith("upstream:") && s.name > CB).map((s) => s.name);
     expect((await names()).filter((n) => laterNames.includes(n))).toEqual([]);
     await rollback("20261105044020_claim_bootstrap_org_indexes.down.sql");
@@ -2893,7 +2899,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await ownerReadFns()).toBe(4);
     expect(await parityTable()).toBe("sessions.owner_buffered_parity");
     expect((await lazySrc()).match(/NOT IN\('ingest_frozen_source_records'/g)?.length).toBe(2);
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, V]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, V, AJ]));
     expect(await relation("sessions.session_desktop_catalog_reproject")).toBe("sessions.session_desktop_catalog_reproject");
     expect(await catalogRpc()).toContain("forget_tracking_not_enabled");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
@@ -3027,7 +3033,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
     // Newer than 043900, so the grants' down refuses until they are rolled back,
-    // newest first: every upstream step after 044020 (rollbackLaterThan044020: 045040, 045030, 045010, 045000, 044100, 044090, 044080, 044070, 044050, 044040, 044030),
+    // newest first: every upstream step after 044020 (rollbackLaterThan044020: 046000, 045040, 045030, 045010, 045000, 044100, 044090, 044080, 044070, 044050, 044040, 044030),
     // then 044020 (claim-bootstrap indexes), 044010 (erase lock), 044000 (tokens), 043910 (erase).
     const orgIndexesDown = readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8");
     const lockDown = readFileSync(join(root, "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql"), "utf8");
@@ -3235,12 +3241,12 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
               (SELECT count(*)::int FROM pg_auth_members membership
                 WHERE membership.roleid = role.oid OR membership.member = role.oid) AS memberships
          FROM pg_roles role
-        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_digest_narrative', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention', 'search_consumer_runtime', 'bulls96_acquisition_installer', 'buffered_search_feed_runtime')
+        WHERE role.rolname IN ('anon', 'authenticated', 'service_role', 'session_directory_search_worker', 'session_token_verifier', 'bulls96_session_ingest', 'bulls96_session_ingest_seeder', 'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events', 'bulls96_analysis_admit', 'bulls96_digest_narrative', 'bulls96_privacy_eraser', 'bulls96_babysitter_retention', 'search_consumer_runtime', 'bulls96_acquisition_installer', 'buffered_search_feed_runtime')
         ORDER BY 1`,
     );
-    expect(targets.rows).toHaveLength(16);
+    expect(targets.rows).toHaveLength(17);
     const trampolined = targets.rows.filter(r => r.rolname !== "search_consumer_runtime");
-    expect(trampolined).toHaveLength(15);
+    expect(trampolined).toHaveLength(16);
     expect(trampolined.every(r => !r.rolcanlogin && !r.rolinherit && !r.rolbypassrls && r.memberships === 0)).toBe(true);
     // The owner-created consumer carries exactly the creator edge: the owner
     // as member WITH ADMIN, neither INHERIT nor SET.
@@ -4748,7 +4754,7 @@ test("044100 real prefix upgrade/fresh/noop/rollback/up preserves pointers and e
     VALUES('org-title','ws-title','codex','session-title','machine-title','user-title',now(),now(),'fs','bucket','manifest/title',
     decode(repeat('ab',32),'hex'),'jsonl','019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18',1,'Pointer retained')`);
   const preserved=async()=>expect((await db.query<{title:string}>("SELECT title FROM sessions.session_index WHERE session_id='session-title'")).rows).toEqual([{title:"Pointer retained"}]);
-  // Newer lanes (045000 digest, 045010 same-second, 045030 consumer grant, 045040 output facts) also apply on a full upgrade;
+  // Newer lanes (045000 digest, 045010 same-second, 045030 consumer grant, 045040 output facts, 046000 analysis jobs) also apply on a full upgrade;
   // expect exactly the pending steps, which is 1 where 044100 is newest.
   expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(full.length - previous.steps.length);
   expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(true);await preserved();
@@ -4761,7 +4767,7 @@ test("044100 real prefix upgrade/fresh/noop/rollback/up preserves pointers and e
   const ledgerBefore=await ledgerHash();
   expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(0);
   expect(await ledgerHash()).toBe(ledgerBefore);await preserved();
-  // Lanes newer than 044100 (045000 digest, 045010 same-second, 045030 consumer grant, 045040 output facts) roll back newest first:
+  // Lanes newer than 044100 (046000 analysis jobs, 045040 output facts, 045030 consumer grant, 045010 same-second, 045000 digest here) roll back newest first:
   // the 044100 down script refuses while a later migration is applied.
   for (const later of [...previous.later].reverse())
     await db.exec(readFileSync(join(root,"supabase/rollbacks",`${later.slice("upstream:".length).replace(/\.sql$/,"")}.down.sql`),"utf8"));
@@ -4956,5 +4962,74 @@ describe("release pre-write fences", () => {
     expect(error?.code).toBe("live_release_refused");
     expect(invoked).toBe(true);
     expect(await snapshot(db)).toEqual({ledger:null,marker:null});
+  });
+});
+
+describe("lane F1 (20261105046000) under the dedicated runtime role", () => {
+  const sql = (path: string) => readFileSync(join(root, path), "utf8").split("\n").filter((l) => !l.startsWith("\\")).join("\n");
+  const asRole = (db: PGlite, role: string) => ({
+    async query<R>(text: string, params?: unknown[]) {
+      await db.exec(`SET ROLE ${role}`);
+      try {
+        return { rows: (await db.query<R>(text, params as never)).rows };
+      } finally {
+        await db.exec("RESET ROLE");
+      }
+    },
+  });
+
+  test("P0-1: the worker claims, reserves, completes and sweeps as the configured runtime role", async () => {
+    const db = await fresh();
+    await db.exec(`CREATE ROLE g6_rt NOLOGIN; ${NO_PUBLIC_TEMP}`);
+    await runMigrations(client(db), { profile: { ...LOCAL, runtimeRole: "g6_rt", runtimeLogin: false } });
+    await db.query(
+      `INSERT INTO sessions.session_index (org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at,
+         storage_provider, bucket, manifest_key, content_sha256, raw_format, trace_id, revision, title)
+       VALUES ('o', 'w', 'claude', 's', 'm', 'u', now(), now(), 'fs', 'b', 'o/w/m/claude/2026-11-01/s/manifest.json',
+         decode(repeat('ab', 32), 'hex'), 'ndjson', '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18', 1, 't')`,
+    );
+    await db.query(
+      `INSERT INTO sessions.session_analysis_jobs_v2 (org_id, workspace_id, session_id, analysis_version, schema_version, model_version, summary_version, summary_model_version)
+       VALUES ('o', 'w', 's', 'session-analysis-v2.4:96bulls-s3-v1', 2, 'gpt-5.4', 'session-summary-v3:workspace-output-v2', 'gpt-5.6-luna')`,
+    );
+    const { postgresAnalysisJobStore, sweepAnalysisTickets } = await import("../../session-analysis/store.ts");
+    const { createFsStore } = await import("../../../packages/object-store/src/fs.ts");
+    const { objectKey } = await import("../../../packages/object-store/src/index.ts");
+    const objects = createFsStore({ root: mkdtempSync(join(tmpdir(), "f1-rt-")) });
+    const runtime = asRole(db, "g6_rt");
+    const store = postgresAnalysisJobStore({ db: runtime as never, store: objects, anchorManifestKey: async () => "o/w/m/claude/2026-11-01/s/manifest.json" });
+    const job = (await store.claim({ leaseSeconds: 600 }))!;
+    expect(job.sourceRevision).toMatch(/^[0-9a-f]{64}$/);
+    const output = { harness: "claude", sourceFingerprint: "f".repeat(64), sourceGeneration: "e".repeat(64), inputTokens: 1, outputTokens: 1, result: { a: 1 } as never };
+    const bytes = new TextEncoder().encode(JSON.stringify(output.result));
+    const sha256 = createHash("sha256").update(bytes).digest("hex");
+    const key = (await store.reserve(job, output, { sha256, bytes: bytes.length }))!;
+    await store.put(key, bytes, sha256);
+    expect(await store.complete({ job, output, stored: { key, sha256, bytes: bytes.length } })).toBe(true);
+    await db.query("UPDATE sessions.session_index SET deleted_at = now()");
+    expect(await sweepAnalysisTickets(objects, { graceSeconds: 0, transact: (work) => work(runtime as never), eraser: (await import("../../migration/neon-s3-erasure/eraser.ts")).storeEraser(objects) })).toBe(1);
+    // P0-b: the never-in-Neon proof is callable as the runtime role (SECURITY DEFINER) without
+    // the runtime role reading the frozen custody tables itself.
+    expect((await runtime.query<{ f: boolean }>("SELECT sessions.session_analysis_neon_free('o', 'w', 's') AS f")).rows[0]!.f).toBe(false);
+    await expect(runtime.query("SELECT count(*) FROM sessions.ingest_frozen_source_records")).rejects.toThrow(/permission denied/);
+    // The runtime role is exactly the reviewed surface: no TRUNCATE, no ownership.
+    const p = (await db.query<{ t: boolean }>("SELECT has_table_privilege('g6_rt', 'sessions.session_analysis_jobs_v2', 'TRUNCATE') AS t")).rows[0]!;
+    expect(p.t).toBe(false);
+  });
+
+  test("P0-3: the admission principal's LOGIN step passes its verifier, and an extra privilege fails it", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), { profile: LOCAL });
+    await db.exec(sql("supabase/bootstrap/session_analysis_admit_role.sql"));
+    await db.exec(sql("supabase/bootstrap/session_analysis_admit_role_verify.sql"));
+    await db.exec("GRANT SELECT ON sessions.session_analysis_jobs_v2 TO bulls96_analysis_admit");
+    expect((await failure(db.exec(sql("supabase/bootstrap/session_analysis_admit_role_verify.sql"))))?.code).toBe("55000");
+    await db.exec("REVOKE SELECT ON sessions.session_analysis_jobs_v2 FROM bulls96_analysis_admit");
+    await db.exec(sql("supabase/bootstrap/session_analysis_admit_role_verify.sql"));
+    // P2-b: a read-only default (or any other setting) fails the verifier.
+    await db.exec("ALTER ROLE bulls96_analysis_admit SET default_transaction_read_only = on");
+    expect((await failure(db.exec(sql("supabase/bootstrap/session_analysis_admit_role_verify.sql"))))?.message).toMatch(/role settings/);
+    await db.exec(sql("supabase/bootstrap/session_analysis_admit_role.sql"));
+    await db.exec(sql("supabase/bootstrap/session_analysis_admit_role_verify.sql"));
   });
 });

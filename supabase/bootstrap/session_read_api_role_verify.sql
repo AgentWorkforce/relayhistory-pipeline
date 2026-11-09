@@ -113,6 +113,7 @@ BEGIN
     SELECT p.oid::regprocedure::text AS fn FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
      WHERE n.nspname = 'sessions' AND p.prosecdef AND has_function_privilege(v_role.oid, p.oid, 'EXECUTE')
        AND p.oid::regprocedure::text NOT IN (
+         'sessions.analysis_read_v1(text,text)',
          'sessions.babysitter_evidence_page_for(text,jsonb)',
          'sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)',
          'sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)',

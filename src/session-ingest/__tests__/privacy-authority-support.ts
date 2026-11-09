@@ -80,7 +80,6 @@ export async function authorityFixture(opts: { pending?: boolean; lazyFix?: bool
   return { db, owner, ownerRpc, run, rpc, ledger, deps, seal, witnessFor, queryable, close: async () => { for (const c of closers.reverse()) await c(); } };
 }
 
-/** relayhistory's exact privacy tables (0038 deleted_upload_sessions, 0039 session_resets, 0078 control heads). */
 /** relayhistory's privacy tables and the owned-identity sources, for a fake "Neon" (PGlite or a real PG database). */
 export function fakeNeonDdl(): string {
   const v38 = read("vendor/relayhistory-cloud/migrations/0038_session_upload_deletion.sql");

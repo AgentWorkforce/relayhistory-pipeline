@@ -88,6 +88,9 @@ import {checkedAnalysisCursor,reconcileAnalysisPage} from "./analysis-reconcile.
 import {analysisRefreshTick,enqueueAnalysisScope,type AnalysisRefreshDeps} from "./analysis-refresh.ts";
 import {readonlyAnalysisPool,readonlyAnalysisSource} from "./analysis-snapshot.ts";
 import { briefTick } from "../session-brief/worker.ts";
+import { analysisConfig, analysisTick } from "../session-analysis/worker.ts";
+import { zstdDecompressSync } from "node:zlib";
+import { createS3Eraser } from "../migration/neon-s3-erasure/eraser.ts";
 import{derivedSchemaAssets}from "./derived-schema.ts";
 import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
 import {runSemanticCopyTick,semanticFailureReason} from "../search-features/semantic-copy-job.ts";
@@ -345,6 +348,8 @@ export interface Runtime {
   env: LambdaEnv;
   deps: ConsumerDeps;
   brief: ReturnType<typeof briefTick>;
+  /** Session analysis jobs (lane F1); claims nothing unless enabled AND a model key is set. */
+  sessionAnalysis: ReturnType<typeof analysisTick>;
   store: ReturnType<typeof createS3Store>;
   /** Raw, unvalidated secret field; see analysisDeps(). */
   analysisSourceUrl?: unknown;
@@ -475,11 +480,33 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     transport: key ? createAnalysisTransport({ apiKey: () => key }) : null,
     config: briefConfig(),
   });
+  // Session analysis (lane F1): the same secret-only model key; no key = no claim.
+  const sessionAnalysis = analysisTick({
+    config: analysisConfig(),
+    db,
+    store,
+    canonical: {
+      store,
+      provider: "s3",
+      bucket: env.bucket,
+      prefix: bindings,
+      decompress: (bytes, maxBytes) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: maxBytes })),
+    },
+    transport: key ? createAnalysisTransport({ apiKey: () => key }) : null,
+    transact: (work) => transaction(db, work),
+    // The bucket is versioned: the sweeper erases, by exact version id and in resumable strict
+    // pages, every version of a ticketed result key that no published job owns.
+    // Built per call so each step signs with the current Lambda credentials.
+    eraser: {
+      eraseStep: (prefix, opts) => createS3Eraser({ bucket: env.bucket, region: env.region, credentials: lambdaCredentials() }).eraseStep(prefix, opts),
+      verifyErased: (prefix, opts) => createS3Eraser({ bucket: env.bucket, region: env.region, credentials: lambdaCredentials() }).verifyErased(prefix, opts),
+    },
+  });
   log.info("session pipeline ready", { stage: "init", ok: true, state: env.searchEnabled ? "search_on" : "search_off" });
   // Semantic copier fields are carried raw and validated only in semanticCopyDeps().
   const semanticSecret = env.semanticCopyEnabled ? { hoopdbUrl: secret.hoopdb_url, clickhouse: secret.clickhouse, sourceUrl: secret.analysis_source_readonly_url } : undefined;
   // Neon-exit: the readonly source URL is dropped here, so no later branch can build its pool.
-  return { env, deps, brief, store, analysisSourceUrl: env.neonExit ? undefined : secret.analysis_source_readonly_url, semanticSecret, ...(bufferedErasure ? { bufferedErasure } : {}) };
+  return { env, deps, brief, sessionAnalysis, store, analysisSourceUrl: env.neonExit ? undefined : secret.analysis_source_readonly_url, semanticSecret, ...(bufferedErasure ? { bufferedErasure } : {}) };
 }
 
 /**
@@ -807,6 +834,23 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
     } catch (error) {
       log.error("session brief tick failed", { stage: "session-brief", ...errorFields(error), duration_ms: Date.now() - started });
       return { ok: false };
+    }
+  }
+  if (event?.sessionAnalysis === true) {
+    // Off: return before init (no secret read, no pool), as the brief tick does.
+    if (!analysisConfig().enabled) return { ok: true };
+    const started = Date.now();
+    try {
+      const rt = await ready();
+      const counts = await rt.sessionAnalysis();
+      // A job that fails is a recorded job outcome (its code is on the row), not a tick error.
+      log.info("session analysis tick", { stage: "session-analysis", count: counts.completed ?? 0, failed: counts.failed ?? 0, skipped: counts["lease-lost"] ?? 0, duration_ms: Date.now() - started });
+      return { ok: true };
+    } catch (error) {
+      log.error("session analysis tick failed", { stage: "session-analysis", ...errorFields(error), duration_ms: Date.now() - started });
+      // Surface it: the invocation fails, so the Lambda Errors metric (and its alarm) and the
+      // schedule's async retry see it; a swallowed {ok:false} would be invisible.
+      throw new Error("session analysis tick failed");
     }
   }
   log.warn("unknown invocation", { stage: "init", reason: "unknown_event" });
