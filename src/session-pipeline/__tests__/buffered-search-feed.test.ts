@@ -23,6 +23,7 @@ import {
   bufferedFeedGateRefusal,
   deleteBufferedRows,
   feedBufferedStageByKey,
+  parseBufferedFingerprint,
   projectBufferedStage,
   runBufferedFeed,
   sqlBufferedFeedSource,
@@ -198,13 +199,16 @@ describe("buffered-stage search feed", () => {
       const result = await indexSearchScope(scopeOf(g), canonicalDeps(store, canonical.ch, [written.manifests[i]!.key], g.sessionId));
       expect(result).toMatchObject({ complete: true });
     }
-    const projected = projectBufferedStage(decoded, new Set(decoded.spec.groupOrdinals.flat()), "96bulls");
+    const stageToken = randomUUID();
+    const projected = projectBufferedStage(decoded, new Set(decoded.spec.groupOrdinals.flat()), "96bulls", stageToken);
     expect(projected.reasons).toEqual([]);
     const ours = projected.rows.map((r) => r.row).sort(byIdentity), theirs = canonical.final().sort(byIdentity);
     expect(ours.length).toBe(6);
     expect(ours.map(shape)).toEqual(theirs.map(shape));
     // Same fingerprint body; only the provenance prefix differs.
-    expect(ours.map((r) => r.fingerprint.slice(2))).toEqual(theirs.map((r) => r.fingerprint.slice(2)));
+    // The s3 body, then the stage binding the later-erasure lane reads (buffered-erasure-delete.ts).
+    expect(ours.map((r) => r.fingerprint.slice(2).split(":")[0])).toEqual(theirs.map((r) => r.fingerprint.slice(2)));
+    expect(ours.every((r) => parseBufferedFingerprint(r.fingerprint)?.stageToken === stageToken)).toBe(true);
     expect(ours.every((r) => r.fingerprint.startsWith("bf"))).toBe(true);
     expect(theirs.every((r) => r.fingerprint.startsWith("s3"))).toBe(true);
     // The read gate's marker: origin and the stage's ORIGINAL claim token; canonical rows name neither.
@@ -301,7 +305,7 @@ describe("buffered-stage search feed", () => {
   test("buffered cleanup refuses a row without a bound buffered provenance and never issues a prefix delete", async () => {
     const store = newStore(), ch = fakeClickHouse();
     const { decoded } = await stageBatch(store);
-    const [row] = projectBufferedStage(decoded, new Set(decoded.spec.groupOrdinals.flat()), "96bulls").rows.map((r) => r.row);
+    const [row] = projectBufferedStage(decoded, new Set(decoded.spec.groupOrdinals.flat()), "96bulls", randomUUID()).rows.map((r) => r.row);
     const sent: string[] = [];
     const spy: ClickHouseClient = { ...ch.ch, async command(q, o) { sent.push(q); return ch.ch.command(q, o); } };
     for (const bad of [{ ...row!, origin_claim_token: "" }, { ...row!, fingerprint: "bf" }, { ...row!, fingerprint: `s3${row!.fingerprint.slice(2)}` }, { ...row!, version: 0 }, { ...row!, origin: "canonical" }])
