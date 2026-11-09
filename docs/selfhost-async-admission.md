@@ -162,6 +162,26 @@ cannot delete, one small probe object per pod start remains.
 The exact per-prefix contract (operations, the startup probe and its cleanup, S3 and GCS notes) is in
 `docs/selfhost-composition.md` section 5.
 
+## Reads right after an async upload
+
+`async` answers 200 once the upload is in the inbox. The manifest gains the new chunks when the
+consumer admits it, but the session pointer row (`sessions.session_index`) only moves on the
+consumer's next reconcile. Between the two, the manifest is at revision N+k while the pointer still
+names revision N, and the read API's canonical routes (`/timing`, `/turns`, `/metadata`, `/catalog`,
+message ids) refuse the session with 501 `unsupported_by_backend` and a `*_manifest_mismatch` reason.
+The refusal is correct: the pointer and the manifest disagree.
+
+`READ_API_CANONICAL_PIN_LAGGING_POINTER=true` on the self-host read API serves the indexed
+generation instead: the first chunks of the current manifest whose content hash chain equals the
+pointer's digest, at the pointer's revision. It pins only when the manifest revision is newer than
+the pointer's, the pointer digest is an exact prefix of the chain, and the pinned manifest passes
+the same validation as a stored one. Every other pointer check (user, session, machine, workspace,
+harness) is unchanged, so a rewritten chunk, a revision regression, another user or an erased
+session is still refused. The newer chunks appear after the next reconcile.
+
+The flag is self-host only (the hosted Lambda never reads it), exactly `true` enables it and
+anything else is off, and the code default is off. `e2e/selfhost/compose.yaml` sets it.
+
 ## Env
 
 | Variable | Values | Default |
@@ -170,6 +190,7 @@ The exact per-prefix contract (operations, the startup probe and its cleanup, S3
 | `SELFHOST_ADMISSION_CONCURRENCY` | 1..32 | 4 |
 | `SELFHOST_ADMISSION_SCAN_MS` | 1000..600000 | 15000 |
 | `SELFHOST_ADMISSION_MAX_ATTEMPTS` | 1..100 | 20 |
+| `READ_API_CANONICAL_PIN_LAGGING_POINTER` (read API, not ingest) | exactly `true`, anything else is off | off |
 
 The knobs are read only in `async` and `drain`. No new secret, role, grant, migration or bucket
 setting is needed. The Locker credential must be able to put, get and list under `<keyRoot>/`,

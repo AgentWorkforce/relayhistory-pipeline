@@ -68,6 +68,7 @@ export {
   chunkKeys,
   commitBackfillEpoch,
   computeContentSha256,
+  contentSha256Chain,
   exportWatermarks,
   liveEpoch,
   liveNextOffset,
