@@ -75,6 +75,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105043910_selfhost_session_selection_erase.down.sql",
       "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql",
       "supabase/rollbacks/20261105044030_ingest_generation_overlap.down.sql",
+      "supabase/rollbacks/20261105044040_buffered_stages_session_first.down.sql",
     ]);
   });
 

@@ -182,7 +182,7 @@ never infers anything from the hostname. An invalid profile writes nothing anywh
 | `HOOPDB_RUNTIME_ROLE_LOGIN`     | required in `selfhosted`, `cloudsql`, `supabase` and `rds` (`runtime_role_login_unset`): `true` if the runtime role logs in itself, `false` if the services log in as a workload role that is a member of it.                                                                                                            |
 | `HOOPDB_RUNTIME_WORKLOAD_ROLE`  | optional: the one role allowed to be a member of the runtime role (without ADMIN OPTION). Refused in `rds` (`db_profile_invalid`): its grantor would be the non-superuser master.                                                                                                                                                                                                                         |
 | `HOOPDB_FUNCTION_BOUNDARY_MODE` | required in `selfhosted`, `cloudsql`, `supabase` and `rds`: `global-default-revoke`, or `event-trigger` (supabase only; refused elsewhere with `function_boundary_mode_unsupported`). The catalog must prove the selected control, see "Function boundary". The old `HOOPDB_FUNCTION_BOUNDARY_APPROVED` name is refused. |
-| `HOOPDB_ALLOW_BLOCKING_INDEX_BUILD` | optional, default off, strict `true`/`false` (`1`/`0` too; anything else is `db_profile_invalid`): lets an index migration (20261105044020) run a blocking `CREATE INDEX` on a populated table. **Never set it on production**: the build holds a SHARE lock (all writes wait) for the whole build. The production release workflow (`releaseProfile`, `src/hoopdb/schema-release-inspect.ts`) and the owner apply (`ownerProfile`, `src/hoopdb/owner-operator-apply.ts`) build their profile from a literal env, so they cannot opt in; only the CLI (`bun src/hoopdb/migrate.ts`) and self-host read it from the process env. Off: an absent index on a non-empty table is refused read-only before any write (`index_prebuild_required`, and 55000 from the migration itself); prebuild it with `CREATE INDEX CONCURRENTLY` (claim-bootstrap index packet, PR #407) and the migration adopts it. Bound per migration transaction as `hoopdb.allow_blocking_index_build`, which the migration accepts only as exactly `on`; the binding is run-wide (every step of that run sees it). |
+| `HOOPDB_ALLOW_BLOCKING_INDEX_BUILD` | optional, default off, strict `true`/`false` (`1`/`0` too; anything else is `db_profile_invalid`): lets an index migration (20261105044020, 20261105044040) run a blocking `CREATE INDEX` on a populated table. **Never set it on production**: the build holds a SHARE lock (all writes wait) for the whole build. The production release workflow (`releaseProfile`, `src/hoopdb/schema-release-inspect.ts`) and the owner apply (`ownerProfile`, `src/hoopdb/owner-operator-apply.ts`) build their profile from a literal env, so they cannot opt in; only the CLI (`bun src/hoopdb/migrate.ts`) and self-host read it from the process env. Off: an absent index on a non-empty table is refused read-only before any write (`index_prebuild_required`, and 55000 from the migration itself); prebuild it with `CREATE INDEX CONCURRENTLY` (claim-bootstrap index packet, PR #407) and the migration adopts it. Bound per migration transaction as `hoopdb.allow_blocking_index_build`, which the migration accepts only as exactly `on`; the binding is run-wide (every step of that run sees it). |
 
 **Runtime role: dedicated, exact least privilege.** It is checked under the migrator's
 advisory lock before any write (before the ledger and marker tables are created, before
@@ -334,8 +334,8 @@ lock and before any write, the migrator refuses:
   `sessions.session_directory` exists is refused before any write, not after seven
   ledger rows.
 - `index_prebuild_required`: an unrecorded step that declares adoptable indexes
-  (`ADOPTABLE_INDEXES`, today only 20261105044020, the eight claim-bootstrap
-  `<table>_org_id_idx` indexes) would refuse or could not be applied safely. Read-only, the
+  (`ADOPTABLE_INDEXES`: 20261105044020, the eight claim-bootstrap
+  `<table>_org_id_idx` indexes; 20261105044040, `ingest_claim_attempts_records_gin_idx`) would refuse or could not be applied safely. Read-only, the
   same decision the step makes: an exact, valid, ready index that backs no constraint is
   adopted; an absent index on a table that does not exist yet or is empty is created by
   the step; an absent index on a **populated** table is refused unless the run opts in
@@ -347,7 +347,9 @@ lock and before any write, the migrator refuses:
   the readiness marker is set to `pending`, so a refused apply leaves running images
   ready. Fix: build each named index with `CREATE INDEX CONCURRENTLY` from the
   claim-bootstrap index packet (`docs/packets/claim-bootstrap-org-index-packet-20261108.md`,
-  PR #407), then plan and apply again.
+  PR #407) or, for 20261105044040, the buffered-stages session-first operator packet
+  (`docs/handoffs/buffered-stages-session-first-044040/operator-packet.md`); the refusal names
+  the packet of each step. Then plan and apply again.
 - **INVALID or still building** (`index_prebuild_required`, `unledgered_schema` naming
   "INVALID or still building", or 55000 "INVALID or not ready" from the migration): an
   index whose `indisvalid`/`indisready` is false is what a failed `CREATE INDEX
@@ -359,7 +361,7 @@ lock and before any write, the migrator refuses:
   index still INVALID, drop it with `DROP INDEX CONCURRENTLY` and rebuild it with the
   packet. The migration's own message ("a failed CONCURRENTLY build; drop it ...") predates
   this check and is frozen with the migration; follow this runbook, not that message.
-- Known limitations of 20261105044020, frozen with the migration: the opt-in is run-wide
+- Known limitations of 20261105044020 (and of 20261105044040, which reuses its adopt-or-create block), frozen with the migration: the opt-in is run-wide
   (a later step reading the same setting would inherit it), and the create path's `LOCK
   TABLE ... IN SHARE MODE` sets no `lock_timeout` of its own (it waits behind a long
   transaction, and writers queue behind it). Neither matters on an empty table, the only
@@ -438,6 +440,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105044010_selfhost_erase_lock_fences.sql` | replacement: ingest_selfhost_set_session_uploads takes the user's fence lock before reading ownership |
 | `upstream:20261105044020_claim_bootstrap_org_indexes.sql` | the eight claim-bootstrap `<table>_org_id_idx` indexes, exact definition, valid and ready, backing no constraint (an operator-built exact, valid set is adopted, not refused: `ADOPTABLE_INDEXES`; an absent one on a populated table is `index_prebuild_required`) |
 | `upstream:20261105044030_ingest_generation_overlap.sql` | table sessions.ingest_generation_overlap_windows (slot 044030, zero-503 schema windows; owner-only, no role prerequisite) |
+| `upstream:20261105044040_buffered_stages_session_first.sql` | buffered_session_stages_for and buffered_sessions_for replaced (duplicate ordinals counted with a window; the detail is session-first); `ingest_claim_attempts_records_gin_idx` is adopted or created (`ADOPTABLE_INDEXES`; absent on a populated table is `index_prebuild_required`), it does not by itself mark the step |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
