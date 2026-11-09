@@ -68,7 +68,8 @@
  */
 import { zstdDecompressSync } from "node:zlib";
 import { cachedProvider } from "../../packages/object-store/src/core.ts";
-import { CANONICAL_SCOPE_BYTES, CANONICAL_SCOPE_EVENTS, canonicalSnapshot, type CanonicalIdentity } from "./canonical.ts";
+import { CANONICAL_SCOPE_BYTES, CANONICAL_SCOPE_EVENTS, canonicalSnapshot, type CanonicalIdentity, type CanonicalDeps } from "./canonical.ts";
+import { canonicalTranscriptSnapshot, type CanonicalTranscript } from "./canonical-transcript.ts";
 import type { TenantRunner } from "./liveness.ts";
 import { sqlCanonicalPointers, type CanonicalRows } from "./session-timing-source.ts";
 import { sqlSessionHarnesses } from "./session-turns-source.ts";
@@ -76,6 +77,8 @@ import type { TimingDeps, TurnsDeps } from "./app.ts";
 import type { CatalogDeps } from "./selfhost.ts";
 
 export interface ServiceCanonicalDeps {
+  /** Native brief-only JSONL. Public record-stream routes never invoke this. */
+  transcriptSource(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalTranscript | undefined>;
   events: import("./canonical-events.ts").CanonicalEventsDeps;
   timing: TimingDeps;
   turns: TurnsDeps;
@@ -148,20 +151,21 @@ export async function serviceCanonicalDeps(
   const pointers = sqlCanonicalPointers(run);
   // Self-host only, default off: see READ_API_CANONICAL_PIN_LAGGING_POINTER in the header.
   const pinLaggingPointer = env.READ_API_CANONICAL_PIN_LAGGING_POINTER?.trim() === "true";
-  // Self-host only, bytes default 32 MiB, events default unchanged: see READ_API_CANONICAL_SCOPE_BYTES / _EVENTS in the header.
+  // Existing public ndjson reader budgets remain managed separately. The
+  // brief-only JSONL reader retains its fixed canonical byte/record bounds.
   const scope = canonicalScopeBudget(env);
-  async function source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows & { generation: string; exists: boolean }> {
+  function deps(signal: AbortSignal): CanonicalDeps {
     // Every object read of this request is aborted at the route's deadline.
     const bounded: typeof fetch = (input, init) => fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal });
     const raw = buildLockerStore(env, { fetch: bounded, ...(credentials ? { credentials } : {}), ...(gcsToken ? { gcsToken } : {}) });
-    const snapshot = await canonicalSnapshot(
-      { store: raw.store, provider: raw.provider, bucket: raw.bucket, prefix, pointers: pointers.pointers, decompress, ...(pinLaggingPointer ? { pinLaggingPointer } : {}) },
-      identity,
-      scope,
-    );
+    return { store: raw.store, provider: raw.provider, bucket: raw.bucket, prefix, pointers: pointers.pointers, decompress, ...(pinLaggingPointer ? { pinLaggingPointer } : {}) };
+  }
+  async function source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows & { generation: string; exists: boolean }> {
+    const snapshot = await canonicalSnapshot(deps(signal), identity, scope);
     return { rows: snapshot.rows, legacyCoverage: snapshot.legacyCoverage, generation: snapshot.generation, exists: snapshot.exists };
   }
   return {
+    transcriptSource: (identity, signal) => canonicalTranscriptSnapshot(deps(signal), identity, signal),
     events: { source },
     timing: { state: pointers.state, source, assumeNoTurns: env.READ_API_TIMING_ASSUME_NO_TURNS?.trim() === "true" },
     turns: { harnesses: sqlSessionHarnesses(run), source, assumeNoLegacy: env.READ_API_TURNS_ASSUME_NO_LEGACY === "true" },

@@ -8,20 +8,21 @@ import { poolTenantRunner } from "../session-read-api/liveness.ts";
 import { serviceCanonicalDeps, type ServiceCanonicalDeps } from "../session-read-api/service-canonical.ts";
 import { CanonicalReadError, canonicalReasonCodeFields } from "../session-read-api/canonical.ts";
 import { log } from "../shared/log.ts";
-import { briefInputFromEvents, eventFromConvergenceRow, type BriefInput, type BriefPointer } from "./input.ts";
+import { briefInputFromEvents, eventFromConvergenceRow, eventFromTranscriptRecord, type BriefInput, type BriefPointer } from "./input.ts";
 import { SESSION_SUMMARY_SOURCES } from "./engine/summary-contract.ts";
 import { briefWorkspaceIds } from "./config.ts";
 import { canonicalHistoryWithoutMirrors } from "./history-mirrors.ts";
 import type { TenantRunner } from "../session-read-api/liveness.ts";
+import type { CanonicalTranscript } from "../session-read-api/canonical-transcript.ts";
 import type { CanonicalRows } from "../session-read-api/session-timing-source.ts";
 
 /**
  * A CanonicalReadError from the canonical object reader: quarantine an explicitly
- * unscrubbed manifest, otherwise `canonical_input_refused` (retryable on 503). The
+ * unscrubbed manifest, otherwise the controlled input-refusal code (retryable on 503). The
  * PipelineError carries only its code, so the canonical reason and its projection
  * reason codes (codes only, never ids or values) are logged for the operator.
  */
-export function canonicalInputRefusal(error: CanonicalReadError, pointers: readonly BriefPointer[]): BriefInput {
+export function canonicalInputRefusal(error: CanonicalReadError, pointers: readonly BriefPointer[], code: "canonical_input_refused" | "canonical_jsonl_input_refused" = "canonical_input_refused"): BriefInput {
   // Match the legacy input's quarantine outcome: never retain derived
   // text when the current authoritative manifest is explicitly unscrubbed.
   if (error.details.includes("manifest_unscrubbed")) return {
@@ -30,10 +31,10 @@ export function canonicalInputRefusal(error: CanonicalReadError, pointers: reado
   };
   const retryable = error.status === 503;
   log.warn("canonical brief input refused", {
-    stage: "session-brief", error_code: "canonical_input_refused", retryable,
+    stage: "session-brief", error_code: code, retryable,
     reason: error.reason, ...canonicalReasonCodeFields(error.details),
   });
-  throw new PipelineError("canonical_input_refused", "canonical input refused", retryable);
+  throw new PipelineError(code, "canonical input refused", retryable);
 }
 
 export type CanonicalBriefInput = (db: HoopDb, key: SessionDirectoryKey, pointers: readonly BriefPointer[]) => Promise<BriefInput>;
@@ -57,6 +58,18 @@ export function briefInputFromCanonical(
     return event ? [event] : [];
   });
   return briefInputFromEvents(key, sourceRevisions, events);
+}
+
+
+export function briefInputFromTranscript(key: SessionDirectoryKey, pointers: readonly BriefPointer[], snapshot: CanonicalTranscript): BriefInput {
+  const revisions = Object.fromEntries(pointers.map(p => [p.machineId,p.revision]));
+  if (!SESSION_SUMMARY_SOURCES.includes(key.harness)) return {kind:"ineligible",error:"session_source_unsupported",sourceRevisions:revisions};
+  if (!/^[a-f0-9]{64}$/.test(snapshot.generation)) throw new PipelineError("canonical_source_changed","canonical input is unavailable",true);
+  const events = snapshot.records.flatMap(({machineId,index,record}) => {
+    const event = eventFromTranscriptRecord(record,key.harness,key.sessionId,machineId,index);
+    return event ? [event] : [];
+  });
+  return briefInputFromEvents(key,revisions,events);
 }
 
 
@@ -97,13 +110,21 @@ export function canonicalBriefInputFromEnv(env: NodeJS.ProcessEnv = process.env)
     if (!canonical) { canonical = serviceCanonicalDeps(env, poolTenantRunner(db.pool as never)); cache.set(db, canonical); }
     const bound = await canonical;
     if (!bound) throw new PipelineError("canonical_input_unconfigured", "canonical input not configured", false);
+    let readingTranscript = true;
     try {
-      const snapshot = await bound.events.source({ orgId: key.orgId, workspaceId: key.workspaceId, source: key.harness, sessionId: logicalKey.sessionId }, AbortSignal.timeout(15000));
+      const identity = { orgId: key.orgId, workspaceId: key.workspaceId, source: key.harness, sessionId: logicalKey.sessionId };
+      const deadline = AbortSignal.timeout(15000);
+      const transcript = await bound.transcriptSource(identity, deadline);
+      readingTranscript = transcript !== undefined;
+      const snapshot = transcript ? undefined : await bound.events.source(identity, deadline);
       const after = await canonicalBriefScope(run, key);
       if (after.sessionId !== logicalKey.sessionId) throw new PipelineError("canonical_input_scope_changed", "canonical source changed", true);
-      return { ...briefInputFromCanonical(logicalKey, pointers, snapshot), canonicalSessionId: logicalKey.sessionId };
+      if (transcript) {
+        return { ...briefInputFromTranscript(logicalKey,pointers,transcript), canonicalSessionId: logicalKey.sessionId };
+      }
+      return { ...briefInputFromCanonical(logicalKey, pointers, snapshot!), canonicalSessionId: logicalKey.sessionId };
     } catch (error) {
-      if (error instanceof CanonicalReadError) return canonicalInputRefusal(error, pointers);
+      if (error instanceof CanonicalReadError) return canonicalInputRefusal(error, pointers, readingTranscript ? "canonical_jsonl_input_refused" : "canonical_input_refused");
       throw error;
     }
   };
