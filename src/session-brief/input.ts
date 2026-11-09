@@ -331,6 +331,15 @@ export async function buildBriefInput(
         : await transcriptEvents(manifest, manifestKey, deps.store, budget)),
     );
   }
+  return briefInputFromEvents(key, sourceRevisions, collected);
+}
+
+/** Same bounded model-input contract for raw transcript and verified canonical replay. */
+export function briefInputFromEvents(
+  key: { harness: string; sessionId: string },
+  sourceRevisions: Record<string, number>,
+  collected: Omit<NormalizedEvent, "id">[],
+): BriefInput {
   // relayhistory loadSessionSource order: event time, then event uid.
   collected.sort((a, b) => a.tsMs - b.tsMs || a.eventUid.localeCompare(b.eventUid));
   const events: NormalizedEvent[] = collected.map((event, i) => ({ ...event, id: i + 1 }));

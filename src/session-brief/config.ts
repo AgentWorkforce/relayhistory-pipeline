@@ -19,6 +19,10 @@
  *   SESSION_BRIEF_MAX_ATTEMPTS      2: a retryable failure is retried once (one requeue).
  *   SESSION_BRIEF_BATCH             5 wakeups per tick; SESSION_BRIEF_LEASE_SECONDS 300.
  *   SESSION_BRIEF_SWEEP_SECONDS     0 (off): how often to queue indexed sessions that have no brief.
+ *   SESSION_BRIEF_CANONICAL_INPUT   default off. Explicit true uses the verified self-host canonical
+ *                                   object source and also sweeps changed pointer revisions, so native
+ *                                   ingest does not need the legacy indexer's brief fanout. Requires
+ *                                   SESSION_BRIEF_ENABLED, LOCKER_BUCKET and org-prefix layout.
  *
  * Values are read once per process; nothing here is logged.
  */

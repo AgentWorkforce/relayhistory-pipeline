@@ -590,7 +590,7 @@ async function projectBriefTitle(db: SqlExecutor, key: SessionDirectoryKey, titl
 }
 
 /** Sweep: arm indexed sessions that have neither a brief nor a wakeup (backfill after enabling). */
-export async function sweepUnbriefed(db: SqlExecutor, limit: number): Promise<number> {
+export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: { includeChanged?: boolean } = {}): Promise<number> {
   const { rows } = await db.query<{ n: number }>(
     `WITH missing AS (
        SELECT d.org_id, d.workspace_id, d.harness, physical.session_id
@@ -607,7 +607,13 @@ export async function sweepUnbriefed(db: SqlExecutor, limit: number): Promise<nu
         WHERE d.deleted_at IS NULL
           AND NOT EXISTS (SELECT 1 FROM sessions.session_briefs AS b
                            WHERE b.org_id = d.org_id AND b.workspace_id = d.workspace_id
-                             AND b.harness = d.harness AND b.session_id = physical.session_id)
+                             AND b.harness = d.harness AND b.session_id = physical.session_id
+                             AND (NOT $2::boolean OR b.source_revisions IS NOT DISTINCT FROM (
+                               SELECT jsonb_object_agg(p.machine_id, p.revision)
+                                 FROM sessions.session_index AS p
+                                WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id
+                                  AND p.harness = d.harness AND p.session_id = physical.session_id
+                                  AND p.deleted_at IS NULL AND p.manifest_key IS NOT NULL)))
           AND NOT EXISTS (SELECT 1 FROM sessions.session_brief_wakeups AS w
                            WHERE w.org_id = d.org_id AND w.workspace_id = d.workspace_id
                              AND w.harness = d.harness AND w.session_id = physical.session_id)
@@ -618,7 +624,7 @@ export async function sweepUnbriefed(db: SqlExecutor, limit: number): Promise<nu
        SELECT org_id, workspace_id, harness, session_id, 'sweep', now() FROM missing
        ON CONFLICT DO NOTHING RETURNING 1)
      SELECT count(*)::int AS n FROM armed`,
-    [limit],
+    [limit, options.includeChanged === true],
   );
   return rows[0]?.n ?? 0;
 }

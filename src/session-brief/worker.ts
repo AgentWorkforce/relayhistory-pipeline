@@ -54,6 +54,8 @@ export interface BriefDeps {
   /** Null when no model is configured: nothing is claimed. */
   transport: AnalysisModelTransport | null;
   config: BriefConfig;
+  /** Explicit self-host canonical-object input. Absent preserves the raw/export reader. */
+  canonicalInput?: import("./canonical-input.ts").CanonicalBriefInput;
 }
 
 export type BriefResult =
@@ -123,7 +125,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
     }
   };
   try {
-    const built = await buildBriefInput(deps, w, pointers);
+    const built = deps.canonicalInput ? await deps.canonicalInput(db, w, pointers) : await buildBriefInput(deps, w, pointers);
     if (built.kind !== "ready") {
       await recordBrief(db, w, built.sourceRevisions, { status: built.kind, error: built.error });
       await finish();
@@ -241,7 +243,7 @@ export function briefTick(deps: Omit<BriefDeps, "db">) {
     }
     if (deps.config.sweepSeconds > 0 && now.getTime() - lastSweep >= deps.config.sweepSeconds * 1000) {
       lastSweep = now.getTime();
-      const armed = await sweepUnbriefed(db, 100);
+      const armed = await sweepUnbriefed(db, 100, { includeChanged: deps.canonicalInput !== undefined });
       if (armed) log.info("session brief sweep armed", { stage: "session-brief", count: armed });
     }
     if (!deps.transport) return null;
