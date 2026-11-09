@@ -11,6 +11,7 @@ import { log } from "../shared/log.ts";
 import { briefInputFromEvents, eventFromConvergenceRow, type BriefInput, type BriefPointer } from "./input.ts";
 import { SESSION_SUMMARY_SOURCES } from "./engine/summary-contract.ts";
 import { briefWorkspaceIds } from "./config.ts";
+import { canonicalHistoryWithoutMirrors } from "./history-mirrors.ts";
 import type { TenantRunner } from "../session-read-api/liveness.ts";
 import type { CanonicalRows } from "../session-read-api/session-timing-source.ts";
 
@@ -44,11 +45,14 @@ export function briefInputFromCanonical(
   const sourceRevisions = Object.fromEntries(pointers.map(p => [p.machineId, p.revision]));
   if (!SESSION_SUMMARY_SOURCES.includes(key.harness)) return { kind: "ineligible", error: "session_source_unsupported", sourceRevisions };
   if (!snapshot.exists || !/^[a-f0-9]{64}$/.test(snapshot.generation)) throw new PipelineError("canonical_source_changed", "canonical input is unavailable", true);
-  const events = snapshot.rows.filter(r => r.table === "convergence_events").flatMap(({ row }) => {
+  const rows = snapshot.rows.filter(r => r.table === "convergence_events").map(({ row }) => {
     if (row.session_id !== key.sessionId || row.source !== key.harness ||
         (row.org_id !== undefined && row.org_id !== key.orgId) ||
         (row.workspace_id !== undefined && row.workspace_id !== key.workspaceId))
       throw new PipelineError("canonical_input_scope", "canonical input scope refused", false);
+    return row;
+  });
+  const events = canonicalHistoryWithoutMirrors(rows, key).flatMap(row => {
     const event = eventFromConvergenceRow(row, key.harness, key.sessionId);
     return event ? [event] : [];
   });
