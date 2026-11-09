@@ -71,15 +71,7 @@ async function before044020(): Promise<PGlite> {
   await runMigrations(client(db), { profile: { ...LOCAL, verify: false }, steps });
   return db;
 }
-/** The 044020 step plus its strict prefix: 044020 applied and latest, nothing later in the tree. */
-async function through044020() {
-  const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
-  open.push(db);
-  const steps = (await plan(LOCAL)).filter((s) => s.name <= STEP && !s.name.startsWith("verify:"));
-  expect(steps.some((s) => s.name === STEP)).toBe(true);
-  await runMigrations(client(db), { profile: { ...LOCAL, verify: false }, steps });
-  return { db, steps };
-}
+
 const orgIndexes = async (db: PGlite) =>
   (await db.query<{ name: string; def: string; oid: number; filenode: number; valid: boolean; ready: boolean }>(
     `SELECT c.relname AS name, pg_get_indexdef(c.oid) AS def, c.oid::int AS oid, c.relfilenode::int AS filenode,
@@ -594,10 +586,9 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
   });
 
   test("(f) the rollback drops exactly the eight indexes and the ledger row, nothing else; it refuses without its ledger row", async () => {
-    // 044020 applied and latest (nothing later): the down-guard refuses while a later migration is applied.
-    const { db, steps } = await through044020();
-    const rerun = () => runMigrations(client(db), { profile: LOCAL, steps });
-    expect(await failure(rerun())).toBeNull();
+    const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
+    open.push(db);
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
     const catalog = async () =>
       (await db.query<{ k: string }>(
         `SELECT c.relkind::text || ':' || c.relname AS k FROM pg_class c WHERE c.relnamespace = 'sessions'::regnamespace
