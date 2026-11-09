@@ -247,7 +247,7 @@ export function briefTick(deps: Omit<BriefDeps, "db">) {
     }
     if (deps.config.sweepSeconds > 0 && now.getTime() - lastSweep >= deps.config.sweepSeconds * 1000) {
       lastSweep = now.getTime();
-      const armed = await sweepUnbriefed(db, 100, { includeChanged: deps.canonicalInput !== undefined, workspaceIds: deps.config.workspaceIds });
+      const armed = await sweepUnbriefed(db, 100, { includeChanged: deps.canonicalInput !== undefined, recoverJsonlInputFailures: deps.canonicalInput !== undefined, workspaceIds: deps.config.workspaceIds });
       if (armed) log.info("session brief sweep armed", { stage: "session-brief", count: armed });
     }
     if (!deps.transport) return null;

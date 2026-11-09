@@ -7,10 +7,11 @@ import type { SessionDirectoryKey } from "../hoopdb/session-directory-summary.ts
 import { poolTenantRunner } from "../session-read-api/liveness.ts";
 import { serviceCanonicalDeps, type ServiceCanonicalDeps } from "../session-read-api/service-canonical.ts";
 import { CanonicalReadError } from "../session-read-api/canonical.ts";
-import { briefInputFromEvents, eventFromConvergenceRow, type BriefInput, type BriefPointer } from "./input.ts";
+import { briefInputFromEvents, eventFromConvergenceRow, eventFromTranscriptRecord, type BriefInput, type BriefPointer } from "./input.ts";
 import { SESSION_SUMMARY_SOURCES } from "./engine/summary-contract.ts";
 import { briefWorkspaceIds } from "./config.ts";
 import type { TenantRunner } from "../session-read-api/liveness.ts";
+import type { CanonicalTranscript } from "../session-read-api/canonical-transcript.ts";
 import type { CanonicalRows } from "../session-read-api/session-timing-source.ts";
 
 export type CanonicalBriefInput = (db: HoopDb, key: SessionDirectoryKey, pointers: readonly BriefPointer[]) => Promise<BriefInput>;
@@ -31,6 +32,18 @@ export function briefInputFromCanonical(
     return event ? [event] : [];
   });
   return briefInputFromEvents(key, sourceRevisions, events);
+}
+
+
+export function briefInputFromTranscript(key: SessionDirectoryKey, pointers: readonly BriefPointer[], snapshot: CanonicalTranscript): BriefInput {
+  const revisions = Object.fromEntries(pointers.map(p => [p.machineId,p.revision]));
+  if (!SESSION_SUMMARY_SOURCES.includes(key.harness)) return {kind:"ineligible",error:"session_source_unsupported",sourceRevisions:revisions};
+  if (!/^[a-f0-9]{64}$/.test(snapshot.generation)) throw new PipelineError("canonical_source_changed","canonical input is unavailable",true);
+  const events = snapshot.records.flatMap(({machineId,index,record}) => {
+    const event = eventFromTranscriptRecord(record,key.harness,key.sessionId,machineId,index);
+    return event ? [event] : [];
+  });
+  return briefInputFromEvents(key,revisions,events);
 }
 
 
@@ -71,11 +84,19 @@ export function canonicalBriefInputFromEnv(env: NodeJS.ProcessEnv = process.env)
     if (!canonical) { canonical = serviceCanonicalDeps(env, poolTenantRunner(db.pool as never)); cache.set(db, canonical); }
     const bound = await canonical;
     if (!bound) throw new PipelineError("canonical_input_unconfigured", "canonical input not configured", false);
+    let readingTranscript = true;
     try {
-      const snapshot = await bound.events.source({ orgId: key.orgId, workspaceId: key.workspaceId, source: key.harness, sessionId: logicalKey.sessionId }, AbortSignal.timeout(15000));
+      const identity = { orgId: key.orgId, workspaceId: key.workspaceId, source: key.harness, sessionId: logicalKey.sessionId };
+      const deadline = AbortSignal.timeout(15000);
+      const transcript = await bound.transcriptSource(identity, deadline);
+      readingTranscript = transcript !== undefined;
+      const snapshot = transcript ? undefined : await bound.events.source(identity, deadline);
       const after = await canonicalBriefScope(run, key);
       if (after.sessionId !== logicalKey.sessionId) throw new PipelineError("canonical_input_scope_changed", "canonical source changed", true);
-      return { ...briefInputFromCanonical(logicalKey, pointers, snapshot), canonicalSessionId: logicalKey.sessionId };
+      if (transcript) {
+        return { ...briefInputFromTranscript(logicalKey,pointers,transcript), canonicalSessionId: logicalKey.sessionId };
+      }
+      return { ...briefInputFromCanonical(logicalKey, pointers, snapshot!), canonicalSessionId: logicalKey.sessionId };
     } catch (error) {
       if (error instanceof CanonicalReadError) {
         // Match the legacy input's quarantine outcome: never retain derived
@@ -84,7 +105,9 @@ export function canonicalBriefInputFromEnv(env: NodeJS.ProcessEnv = process.env)
           kind: "quarantined", error: "session_quarantined",
           sourceRevisions: Object.fromEntries(pointers.map(p => [p.machineId, p.revision])),
         };
-        throw new PipelineError("canonical_input_refused", "canonical input refused", error.status === 503);
+        // A failed JSONL recovery must not match the historical ndjson-only
+        // refusal again. The sweep admits that old failure only once.
+        throw new PipelineError(readingTranscript ? "canonical_jsonl_input_refused" : "canonical_input_refused", "canonical input refused", error.status === 503);
       }
       throw error;
     }

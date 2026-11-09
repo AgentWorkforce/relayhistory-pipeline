@@ -118,11 +118,12 @@ export async function pinnedToPointer(
   }
   return null;
 }
-function checked(
+export function checkedCanonicalPointers(
   pointers: CanonicalPointer[],
   identity: CanonicalIdentity,
   deps: CanonicalDeps,
   maxPointersExclusive = MAX_POINTERS,
+  format: "ndjson" | "jsonl" = "ndjson",
 ): CanonicalPointer[] {
   if (!Array.isArray(pointers) || pointers.length >= maxPointersExclusive)
     throw new CanonicalReadError("pointer_bound");
@@ -145,7 +146,7 @@ function checked(
       !/^([0-9a-f]{64})$/u.test(digest(p.content_sha256)) ||
       !Number.isSafeInteger(Number(p.revision)) ||
       Number(p.revision) < 1 ||
-      p.raw_format !== "ndjson"
+      p.raw_format !== format
     )
       throw new CanonicalReadError("pointer_invalid");
     seen.add(p.manifest_key);
@@ -195,7 +196,7 @@ async function snapshotWithLimits(
   maxScopeBytes: number, maxScopeEvents: number, maxPointersExclusive: number, maxRows: number,
   directoryValues: "required" | "optional" | undefined,
 ) {
-  const pointers = checked(await deps.pointers(identity), identity, deps, maxPointersExclusive),
+  const pointers = checkedCanonicalPointers(await deps.pointers(identity), identity, deps, maxPointersExclusive),
     version = canonicalSourceGeneration(pointers, identity);
   if (!pointers.length)
     return {
@@ -275,7 +276,7 @@ async function snapshotWithLimits(
   );
   if (!result.complete || result.directorySessionId !== identity.sessionId)
     throw new CanonicalReadError("canonical_projection_incomplete", 503, result.reasons);
-  const fresh = checked(await deps.pointers(identity), identity, deps, maxPointersExclusive);
+  const fresh = checkedCanonicalPointers(await deps.pointers(identity), identity, deps, maxPointersExclusive);
   if (canonicalSourceGeneration(fresh, identity) !== version)
     throw new CanonicalReadError("source_generation_changed");
   const legacy = canonicalLegacy(result.records, identity);
