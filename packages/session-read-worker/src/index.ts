@@ -53,7 +53,10 @@
  * catalog on the same read connection, that the out-of-band index
  * ingest_buffer_outbox_user_buffered_idx exists and is valid (cached per isolate: valid for its
  * lifetime, a failure re-probed after 60 s); not proven, the buffered read is fenced before any
- * candidate (detail routes answer as without the flag, the list as fenced). Flag, allowlist, bucket and binding are
+ * candidate (detail routes answer as without the flag, the list as fenced).
+ * READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS (default unset = 2000; "2000".."6000" = the
+ * per-transaction statement_timeout of both owner-buffered RPCs; any other value answers 503) never
+ * changes the role default or any other read. Flag, allowlist, bucket and binding are
  * all unset in wrangler.jsonc; only the deploy workflow's owner_buffered=on render
  * (scripts/render-deploy-config.ts) adds them.
  */
@@ -94,6 +97,7 @@ import {
   ownerBufferedIndexVerifyEnabled,
   ownerBufferedPhaseLogEnabled,
   ownerBufferedStageConcurrency,
+  ownerBufferedStatementTimeoutMs,
   serviceBindingControlHead,
   sqlBufferedIndexProbe,
   sqlOwnerBufferedReads,
@@ -156,6 +160,12 @@ export interface Env extends CanonicalEnv {
    * fold_ms, s3_stage_count, aborted_phase) to the request log line; anything else is off (default).
    */
   READ_API_OWNER_BUFFERED_PHASE_LOG?: string;
+  /**
+   * Owner-buffered RPCs (list and detail): the per-transaction statement_timeout in ms. Unset or
+   * empty = 2000 (default, the read role's own bound); an integer 2000..6000 = that bound; any
+   * other value refuses every request (503, logged missing_READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS).
+   */
+  READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS?: string;
   /**
    * Owner-buffered reads: verify the out-of-band index ingest_buffer_outbox_user_buffered_idx
    * (valid, per the catalog) before serving any buffered read. Unset or empty = off (default, no
@@ -354,6 +364,12 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     } catch {
       throw new ConfigError("READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY");
     }
+    // The buffered statement timeout accepts only unset/empty or 2000..6000; anything else is a misconfigured deploy.
+    try {
+      ownerBufferedStatementTimeoutMs(env.READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS);
+    } catch {
+      throw new ConfigError("READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS");
+    }
     // The index verify flag accepts only unset/empty or "on"; anything else is a misconfigured deploy.
     try {
       ownerBufferedIndexVerifyEnabled(env.READ_API_OWNER_BUFFERED_INDEX_VERIFY);
@@ -490,7 +506,7 @@ export function ownerBufferedDeps(
   return {
     enabled: true,
     workspaces: parseDirectoryWorkspaces(env.READ_API_OWNER_BUFFERED_WORKSPACES),
-    reads: sqlOwnerBufferedReads(run),
+    reads: sqlOwnerBufferedReads(run, { statementTimeoutMs: ownerBufferedStatementTimeoutFlag(env) }),
     gate: serviceBindingControlHead(env.HISTORY_CONTROL_HEAD),
     store: createS3Store({ bucket, region: env.INGEST_S3_REGION?.trim() || "us-east-1", credentials: { accessKeyId, secretAccessKey }, fetch: fetcher }),
     decompress: boundedStreamDecompress(Decompress) /* stops at the bound; fzstd's one-shot form with a fixed buffer silently truncates */,
@@ -512,6 +528,15 @@ function ownerBufferedIndexVerifyFlag(env: Env): boolean {
     return ownerBufferedIndexVerifyEnabled(env.READ_API_OWNER_BUFFERED_INDEX_VERIFY);
   } catch {
     return false;
+  }
+}
+
+/** READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS as ms; a refused value is 2000 (handle() already answered 503 for it). */
+function ownerBufferedStatementTimeoutFlag(env: Env): number {
+  try {
+    return ownerBufferedStatementTimeoutMs(env.READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS);
+  } catch {
+    return 2000;
   }
 }
 
