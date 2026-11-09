@@ -590,9 +590,18 @@ export async function rotateSelf(cfg: Config): Promise<Step[]> {
     const who = (await before.query("SELECT session_user::text AS s, current_user::text AS c")).rows[0];
     if (who.s !== role || who.c !== role)
       throw new StepFailure("refused", [{ name, status: "failed", sqlstate: "42501", message: "connected identity is not the named role" }]);
-    const verifier = scramVerifier(cfg.secrets.new_password!);
-    if (!/^SCRAM-SHA-256\$4096:[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$/.test(verifier)) throw new Error("bad verifier");
-    await before.query(`ALTER ROLE CURRENT_USER PASSWORD '${verifier}'`);
+    // Same handling as activate: bound as a parameter, used through EXECUTE (never in a
+    // top-level statement text), then cleared, all in one transaction.
+    await before.query("BEGIN");
+    await before.query("SELECT set_config('hoopdb_activation.new_verifier', $1, true)", [scramVerifier(cfg.secrets.new_password!)]);
+    await before.query(`DO $rotate$ BEGIN
+      IF current_setting('hoopdb_activation.new_verifier') !~ '^SCRAM-SHA-256\\$4096:[A-Za-z0-9+/=]+\\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$' THEN
+        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'rotate-self: malformed verifier';
+      END IF;
+      EXECUTE format('ALTER ROLE CURRENT_USER PASSWORD %L', current_setting('hoopdb_activation.new_verifier'));
+      PERFORM set_config('hoopdb_activation.new_verifier', '', true);
+    END $rotate$`);
+    await before.query("COMMIT");
   } catch (e) {
     if (e instanceof StepFailure) throw e;
     throw new StepFailure("refused", [failed(cfg, name, e)]);

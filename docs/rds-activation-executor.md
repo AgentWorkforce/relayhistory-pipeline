@@ -33,7 +33,7 @@ bun src/hoopdb/rds-activation.ts <command> [flags]
 | `activate` | Step 2. All role, grantor-graph, setting, LOGIN, default-privilege, ownership and cleanup work, then the final graph validation. Skipped (status `already_activated`) when the shared catalogs show the activated state. | provisioning login | `hoopdb` | exactly one (`BEGIN` ... `COMMIT`); any failure rolls back everything |
 | `verify` | Step 3. Read-only. Proves `hoop` and `sessions_pipeline_runtime` log in with their passwords, and re-derives the final graph as `hoop`. | `hoop`, then `sessions_pipeline_runtime` | `hoopdb` | `READ ONLY` |
 | `run` | `create-database`, then `activate`, then `verify`. | as above | as above | as above |
-| `rotate-self` | One LOGIN role changes its own password, then proves that the new one logs in and the old one is refused (28P01). | the role itself (`--role`) | `hoopdb` | single statement |
+| `rotate-self` | One LOGIN role changes its own password, then proves that the new one logs in and the old one is refused (28P01). | the role itself (`--role`) | `hoopdb` | one (the verifier is bound and used through `EXECUTE`, as in `activate`) |
 
 ### Transaction boundary and who does what inside `activate`
 
@@ -71,7 +71,7 @@ after DROP ROLE hoopdb_activation_executor (fragment 60)
 ```
 
 `DROP ROLE` removes every row in which the dropped role is the role, the member or
-the grantor. This was measured on PostgreSQL 16.11 and 17.11: 0 edges and 0 dangling
+the grantor. This was measured on PostgreSQL 16.15 and 17.11: 0 edges and 0 dangling
 grantors remain. The automatic creator edges cannot be revoked by a non-superuser
 beforehand, and nothing is re-granted under another grantor, because the target graph
 is empty. Fragment 70 asserts the empty graph, the absence of the executor and of any
