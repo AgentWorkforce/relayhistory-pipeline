@@ -54,6 +54,13 @@ export interface LaneManifest {
   readonly grantSources: readonly GrantSource[];
   readonly functions: Readonly<Record<string, OwnedFunction>>;
   readonly replaces: Readonly<Record<string, ReplacedFunction>>;
+  /**
+   * Grant-only entries: EXECUTE grants the lane migration adds on functions it neither defines nor
+   * owns (signature -> roles, compared as a set with the migration's GRANT statements). The roles are
+   * appended to the function's existing ACL entry, which must already exist; the entry itself stays
+   * with its owner (hand-maintained or another lane).
+   */
+  readonly grantsOn?: Readonly<Record<string, readonly string[]>>;
   /** Lane-specific generated files (e.g. a rollback derived from the same SQL). */
   extraOutputs?(ctx: LaneContext): Promise<Record<string, string>>;
 }

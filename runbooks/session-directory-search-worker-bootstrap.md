@@ -417,7 +417,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105032000_session_large_read_routing_fixes.sql` | table sessions.session_large_read_scope_errors |
 | `upstream:20261105033000_canonical_project_events.sql` | table sessions.canonical_project_events |
 | `upstream:20261105045000_digest_narrative_cache.sql` | table sessions.daily_digest_narratives |
-| `upstream:20261105045020_selfhost_output_facts.sql` | table sessions.session_output_facts |
+| `upstream:20261105045040_selfhost_output_facts.sql` | table sessions.session_output_facts |
 | `upstream:20261105035000_semantic_copy_state.sql` | table sessions.search_feature_copy_state |
 | `upstream:20261105036000_canonical_consumer_lease.sql`        | table sessions.canonical_feature_consumer_lease |
 | `upstream:20261105037000_session_directory_document_pool.sql` | function sessions.canonical_feature_document_finish |
@@ -435,7 +435,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105043870_buffered_search_feed_cursor.sql` | table sessions.buffered_search_feed_cursors (needs the `buffered_search_feed_runtime` role from the role bootstrap: absent fails closed `42704`, elevated/member/unexpected member `55000`) |
 | `upstream:20261105043880_ingest_bookkeeping_cleanup.sql` | table sessions.ingest_bookkeeping_retired_claims + Babysitter register carries the retirement interlock |
 | `upstream:20261105043890_buffered_search_gate_retired_witness.sql` | replacement: buffered_search_gate_for hides claims with an ingest_bookkeeping_retired_claims tombstone (drop reason retired) |
-| `upstream:20261105043900_session_consumer_function_grants.sql` | twelve search_consumer_runtime EXECUTEs (composed writer path) |
+| `upstream:20261105043900_session_consumer_function_grants.sql` | twelve search_consumer_runtime EXECUTEs (composed writer path; `session_directory_project_text` is not counted, it is 045030's) |
 | `upstream:20261105043910_selfhost_session_selection_erase.sql` | function sessions.ingest_selfhost_set_session_uploads |
 | `upstream:20261105044000_read_api_tokens.sql` | table sessions.read_api_tokens |
 | `upstream:20261105044010_selfhost_erase_lock_fences.sql` | replacement: ingest_selfhost_set_session_uploads takes the user's fence lock before reading ownership |
@@ -447,6 +447,8 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105044080_ingest_claim_sessions.sql` | table sessions.ingest_claim_sessions (slot 044080; owner-only side table, policy row and writer trigger, inert until the operator enables write_enabled) |
 | `upstream:20261105044090_claim_sessions_reader.sql` | column sessions.ingest_claim_sessions_policy.read_enabled (slot 044090; default false; buffered_sessions_for / buffered_session_stages_for read the side table only while read_enabled, write_enabled and backfill completion all hold; owner-only commit-time accepted_at refresh trigger on ingest_batches) |
 | `upstream:20261105044100_session_brief_summary_read.sql` | tenant-scoped `sessions.session_brief_summary_for(text,text,text)` read RPC with EXECUTE only for `bulls96_read_api`; bounded recorded-title column and owner-only invoker invalidation trigger; no new table grants or changes to G4 ingest functions |
+| `upstream:20261105045010_buffered_search_feed_same_second.sql` | replacement: buffered_search_feed_stage returns the `sameSecond` sibling counts (slot 045010; same signature, SECURITY DEFINER and ACL; must be applied before `INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION=on`, else the feeder refuses every stage `sql_same_second_unavailable`) |
+| `upstream:20261105045030_session_consumer_project_text_grant.sql` | search_consumer_runtime EXECUTE on `sessions.session_directory_project_text(text,text,text)` (slot 045030; grant only; the partial expression index `session_directory_tenant_project_text_trgm_idx` evaluates it as the writing role, so without it consumer directory writes carrying a project id, project key or repository fail `42501`; needs the bare consumer role first, absent fails closed `55000`) |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |

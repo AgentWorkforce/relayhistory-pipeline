@@ -65,6 +65,8 @@ export interface WorkerOptions {
   attests?: ManifestReaderName[];
   /** Runs once per loop tick, for side loops such as reconcile. */
   tick?: (db: HoopDb, now: Date) => Promise<void>;
+  /** Bounded best-effort flushes (product analytics) run with the telemetry shutdown, before the exit. */
+  onShutdown?: () => Promise<void>;
 }
 
 /**
@@ -503,6 +505,7 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
     ]);
     const cleanup = [...serverCleanup, ...await Promise.allSettled([
       shutdownTelemetry(),
+      ...(opts.onShutdown ? [opts.onShutdown()] : []),
       db.end(),
     ])];
     const failed = cleanup.filter(r => r.status === "rejected");

@@ -217,7 +217,9 @@ BEGIN
         ('sessions.repo_live(text,uuid)', 'EXECUTE'),
         ('sessions.legacy_remote(text)', 'EXECUTE'),
         ('sessions.session_directory_search_text(text,text,text,text,text,text,text,text)', 'EXECUTE'),
-        -- 20261105045020: the self-host output facts writers (SECURITY DEFINER, each checks the caller).
+        -- 20261105045030: the project-text index helper.
+        ('sessions.session_directory_project_text(text,text,text)', 'EXECUTE'),
+        -- 20261105045040: the self-host output facts writers (SECURITY DEFINER, each checks the caller).
         ('sessions.output_facts_state(text,text,text,text[],text)', 'EXECUTE'),
         ('sessions.output_facts_reconcile(text,text,text,text[],text,jsonb,jsonb,boolean,bigint)', 'EXECUTE'),
         ('sessions.output_facts_record_state(text,text,text,text[],text,boolean,timestamp with time zone,timestamp with time zone,bigint,timestamp with time zone)', 'EXECUTE'),
@@ -263,14 +265,14 @@ BEGIN
   -- publication guard and its lock are SECURITY DEFINER and the writer must
   -- call both (every pointer upsert runs through withPublicationAuthority),
   -- so they are allowlisted exactly, as are the four self-host output facts
-  -- writers (20261105045020; each checks its caller is this role); no other
+  -- writers (20261105045040; each checks its caller is this role); no other
   -- SECURITY DEFINER function may execute.
   FOR v_bad IN
     SELECT p.oid::regprocedure::text FROM pg_proc p
     WHERE p.pronamespace = to_regnamespace('sessions')
       AND p.proname IN ('session_index_batch', 'session_publication_is_managed', 'session_publication_lock', 'upsert_session_index',
         'applied_repo_evidence', 'canonical_remote', 'clean_root_commit', 'lock_repo_catalog', 'resolve_repo', 'session_directory_search_text',
-        'repo_live', 'legacy_remote')
+        'repo_live', 'legacy_remote', 'session_directory_project_text')
       AND NOT has_function_privilege(v_role, p.oid, 'EXECUTE')
   LOOP
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = format('verify %s: missing EXECUTE on %s', v_role, v_bad);

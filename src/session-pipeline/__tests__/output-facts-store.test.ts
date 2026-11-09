@@ -1,7 +1,7 @@
 /**
  * OutputFactsStore with fakes: the ClickHouse store issues exactly the calls today's functions
  * do (same order, same statements, same rows), and the Postgres store maps the interface onto
- * the 20261105045020 functions (row shape, timestamps, versions, stale refusals). The SQL
+ * the 20261105045040 functions (row shape, timestamps, versions, stale refusals). The SQL
  * functions themselves run on PGlite in src/hoopdb/__tests__/selfhost-output-facts.pglite.test.ts.
  */
 import { describe, expect, test } from "bun:test";

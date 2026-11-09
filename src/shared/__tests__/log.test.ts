@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { ALLOWED_LOG_FIELDS, BOUNDED_COUNT_FIELDS, errorFields, logLine, sanitizeLogField } from "../log.ts";
+import { ALLOWED_LOG_FIELDS, BOUNDED_COUNT_FIELDS, errorFields, logLine, sanitizeLogField, searchIndexErrorDetail } from "../log.ts";
+import { SearchIndexError } from "@rhc/search-index/contracts.ts";
 import { spanAttrs } from "../telemetry.ts";
 
 describe("telemetry allowlist", () => {
@@ -60,5 +61,23 @@ describe("telemetry allowlist", () => {
     const f = errorFields(Object.assign(new Error("Authorization: Bearer sk-live-123"), { code: "chunk_empty", retryable: false }));
     expect(f).toEqual({ error_code: "chunk_empty", retryable: false });
     expect(JSON.stringify(f)).not.toContain("sk-live");
+  });
+});
+
+describe("searchIndexErrorDetail", () => {
+  test("carries a SearchIndexError's bounded detail into the log line as error_detail", () => {
+    const error = new SearchIndexError("unavailable", true, "http_429:es_rejected_execution_exception:bulk_items_812:bulk_bytes_4190000");
+    const line = JSON.parse(logLine("error", "search index failed", { stage: "search-index", ...errorFields(error), ...searchIndexErrorDetail(error) }));
+    expect(line).toMatchObject({ error_code: "unavailable", retryable: true, error_detail: "http_429:es_rejected_execution_exception:bulk_items_812:bulk_bytes_4190000" });
+  });
+  test("never takes another error's detail or a detail that is not a bounded code", () => {
+    const pg = Object.assign(new Error("duplicate key"), { code: "23505", detail: "Key (content)=(secret transcript) already exists." });
+    expect(searchIndexErrorDetail(pg)).toEqual({});
+    expect(searchIndexErrorDetail(Object.assign(new Error("x"), { name: "SearchIndexError", detail: "Has spaces: secret" }))).toEqual({});
+    expect(searchIndexErrorDetail(new SearchIndexError("unavailable", true, "")).error_detail).toBeUndefined();
+    // A long code is truncated, not dropped.
+    expect(searchIndexErrorDetail(new SearchIndexError("unavailable", true, "x".repeat(300))).error_detail).toBe("x".repeat(256));
+    expect(searchIndexErrorDetail(new SearchIndexError("aborted"))).toEqual({});
+    expect(searchIndexErrorDetail(undefined)).toEqual({});
   });
 });

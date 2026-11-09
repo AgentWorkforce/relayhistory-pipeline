@@ -59,6 +59,7 @@ import { BriefSummaryError, briefSummaryResponse, type BriefSummary } from "./br
  * Org and workspace come only from the verified claims.
  */
 import { Hono, type Context } from "hono";
+import { captureSafely, type AnalyticsPort } from "../shared/analytics.ts";
 import { bodyLimit } from "hono/body-limit";
 import { ClickHouseError, type ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import type { SearchServiceBinding } from "../session-pipeline/search-adapter.ts";
@@ -66,7 +67,7 @@ import { CursorError, decodeBackendCursor, decodeCursor } from "./cursor.ts";
 import { TenantMismatchError, partialSessions, partialSessionsInWorkspace, readBufferedEventPage, readEventPage, type Liveness } from "./page.ts";
 import type { EventQuery } from "./queries.ts";
 import { CANONICAL_CURSOR_PREFIX, canonicalEventPage, type CanonicalEventsDeps } from "./canonical-events.ts";
-import { CanonicalReadError, type CanonicalIdentity } from "./canonical.ts";
+import { CanonicalReadError, canonicalReasonCodeFields, type CanonicalIdentity } from "./canonical.ts";
 import { timingFromCanonical, type CanonicalRows } from "./session-timing-source.ts";
 import { TimingInputError } from "./timing.ts";
 import { EvidenceRequestError, readBabysitterEvidence, type EvidenceDeps } from "./babysitter-evidence.ts";
@@ -166,6 +167,12 @@ export interface ReadApiDeps {
   /** Epoch ms from which ClickHouse holds complete history; 0 = complete. */
   completeSinceMs: number;
   log?: (fields: Record<string, unknown>) => void;
+  /**
+   * Product analytics (src/shared/analytics.ts): one `session_read.request_completed` per /v1 request
+   * whose bearer verified (route pattern, outcome, latency bucket, the verified org/workspace). Absent =
+   * none. Captured after the answer is final; a sink can never change or fail the response.
+   */
+  analytics?: AnalyticsPort;
   timeoutMs?: number;
   /** The Supabase directory (list, activity); absent = those routes answer 501. */
   directory?: Directory;
@@ -316,11 +323,19 @@ export function continuationUntil(floorMs: number): string {
 }
 
 class HttpError extends Error {
-  constructor(readonly status: number, readonly code: string, message: string, readonly reason?: string) {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+    readonly reason?: string,
+    /** Log-only reason codes (e.g. CanonicalReadError.details); never sent in the response body. */
+    readonly details: readonly string[] = [],
+  ) {
     super(message);
   }
 }
-const unsupported = (reason: string) => new HttpError(501, "unsupported_by_backend", `not served by this backend: ${reason}`, reason);
+const unsupported = (reason: string, details: readonly string[] = []) =>
+  new HttpError(501, "unsupported_by_backend", `not served by this backend: ${reason}`, reason, details);
 const bad = (message: string) => new HttpError(400, "bad_request", message);
 
 /** relayhistory clampLimit: truncate, clamp to [1, max]; junk gives the default. */
@@ -394,9 +409,16 @@ export function createReadApi(deps: ReadApiDeps) {
     c.header("X-Sessions-Read-Backend", "96bulls");
     c.header("X-Correlation-Id", correlationId);
     const phases = c.get("obPhases");
+    const durationMs = Date.now() - started;
     log({
-      route: c.req.routePath, status: c.res.status, duration_ms: Date.now() - started, correlation_id: correlationId,
+      route: c.req.routePath, status: c.res.status, duration_ms: durationMs, correlation_id: correlationId,
       ...(phases && !phases.emitted ? phases.fields() : {}),
+    });
+    // Only a verified identity is attributed (workspace scope); an unauthenticated request is not an event.
+    const identity = c.get("identity") as VerifiedIdentity | undefined;
+    if (identity) captureSafely(deps.analytics, {
+      kind: "session_read.request_completed", traceId: correlationId, orgId: identity.orgId, workspaceId: identity.workspaceId,
+      route: c.req.routePath, status: c.res.status, durationMs,
     });
   });
 
@@ -536,7 +558,14 @@ export function createReadApi(deps: ReadApiDeps) {
         c.header("Retry-After", "1");
         log({ route: c.req.routePath, reason: "buffered_fenced", status: 503, correlation_id: correlationId });
       }
-      if (error.status === 501) log({ route: c.req.routePath, reason: error.reason, status: 501, correlation_id: correlationId });
+      if (error.status === 501)
+        log({
+          route: c.req.routePath,
+          reason: error.reason,
+          status: 501,
+          ...canonicalReasonCodeFields(error.details),
+          correlation_id: correlationId,
+        });
       return c.json({ error: { code: error.code, message: error.message, ...(error.reason ? { reason: error.reason } : {}) }, correlationId }, error.status as never);
     }
     if (error instanceof CursorError) {
@@ -789,7 +818,7 @@ export function createReadApi(deps: ReadApiDeps) {
             page = await canonicalEventPage(deps.canonicalEvents, deps.liveness,
               { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId, source, order, limit, maxContent, cursor }, objectCursor ? rawCursor : undefined);
           } catch (error) {
-            if (error instanceof CanonicalReadError) throw error.status === 400 ? bad("canonical cursor is not valid") : unsupported(`events_canonical_${error.reason}`);
+            if (error instanceof CanonicalReadError) throw error.status === 400 ? bad("canonical cursor is not valid") : unsupported(`events_canonical_${error.reason}`, error.details);
             throw error;
           }
           const events = includeMessageId ? await withMessageIds(identity, sessionId, source, page.events) : page.events;
@@ -807,7 +836,7 @@ export function createReadApi(deps: ReadApiDeps) {
       const events = includeMessageId ? await withMessageIds(identity, sessionId, source, page.events) : page.events;
       return c.json({ sessionId, events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
     } catch (error) {
-      if (error instanceof CanonicalReadError) return fail(c, unsupported(`message_id_canonical_${error.reason}`));
+      if (error instanceof CanonicalReadError) return fail(c, unsupported(`message_id_canonical_${error.reason}`, error.details));
       return fail(c, error);
     } finally {
       stopAbortLog?.();
@@ -1131,7 +1160,7 @@ export function createReadApi(deps: ReadApiDeps) {
       });
       return c.json({ ...payload, correlationId: c.get("correlationId") });
     } catch (error) {
-      if (error instanceof CanonicalReadError) return fail(c, unsupported(`timing_canonical_${error.reason}`));
+      if (error instanceof CanonicalReadError) return fail(c, unsupported(`timing_canonical_${error.reason}`, error.details));
       if (error instanceof TimingInputError) return fail(c, unsupported(`timing_${error.reason}`));
       return fail(c, error);
     }
@@ -1302,7 +1331,7 @@ export function createReadApi(deps: ReadApiDeps) {
     }
   };
   const turnsFail = (c: Context, error: unknown) => {
-    if (error instanceof CanonicalReadError) return fail(c, unsupported(`turns_canonical_${error.reason}`));
+    if (error instanceof CanonicalReadError) return fail(c, unsupported(`turns_canonical_${error.reason}`, error.details));
     if (error instanceof TurnsInputError) return fail(c, unsupported(error.reason.startsWith("turns_") ? error.reason : `turns_${error.reason}`));
     // A malformed canonical row (canonical-legacy.ts / canonical-turns.ts) is not answerable exactly.
     if (error instanceof Error && /^canonical (legacy evidence|live turn) invalid$/u.test(error.message)) return fail(c, unsupported("turns_canonical_invalid"));
@@ -1491,7 +1520,7 @@ export function createReadApi(deps: ReadApiDeps) {
         });
         return c.json({ workspaceId: identity.workspaceId, ...payload });
       } catch (error) {
-        if (error instanceof CanonicalReadError) return fail(c, unsupported(`catalog_canonical_${error.reason}`));
+        if (error instanceof CanonicalReadError) return fail(c, unsupported(`catalog_canonical_${error.reason}`, error.details));
         if (error instanceof CatalogInputError) return fail(c, unsupported(`catalog_${error.reason}`));
         return fail(c, error);
       }

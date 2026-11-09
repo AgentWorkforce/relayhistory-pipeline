@@ -121,7 +121,7 @@ test("documented verification stops if build provenance fails", () => {
  const dir=mkdtempSync(join(tmpdir(),"image-verification-"));
  try {
   const script=`node() { return 42; }; cosign() { echo unexpected-later-check; };\n${block}\necho unexpected-later-check`;
-  const result=Bun.spawnSync(["bash","-c",script],{cwd:dir,env:{PATH:process.env.PATH??"",image:"ghcr.io/agentworkforce/96bulls-services@sha256:"+"c".repeat(64),source_sha:sha,workflow_sha:sha,ci_run_id:"123",publish_run_id:"456",publish_run_attempt:"1",receipt_dir:dir},stdout:"pipe",stderr:"pipe"});
+  const result=Bun.spawnSync(["bash","-c",script],{cwd:dir,env:{PATH:process.env.PATH??"",image:"ghcr.io/agentworkforce/sessions-pipeline@sha256:"+"c".repeat(64),source_sha:sha,workflow_sha:sha,ci_run_id:"123",publish_run_id:"456",publish_run_attempt:"1",receipt_dir:dir},stdout:"pipe",stderr:"pipe"});
   expect(result.exitCode).toBe(42);expect(result.stdout.toString()).not.toContain("unexpected-later-check");
  } finally {rmSync(dir,{recursive:true,force:true});}
 });

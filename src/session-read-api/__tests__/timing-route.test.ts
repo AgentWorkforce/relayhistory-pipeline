@@ -117,6 +117,25 @@ describe("GET /v1/sessions/:id/timing from canonical S3", () => {
     expect((await body(r)).error).toMatchObject({ code: "unsupported_by_backend", reason });
   });
 
+  test("canonical_projection_incomplete logs its projection reason codes, the 501 body is unchanged", async () => {
+    const refuse = (details?: string[]) => ({ timing: { source: async () => { throw new CanonicalReadError("canonical_projection_incomplete", 503, details); } } });
+    const reason = "timing_canonical_canonical_projection_incomplete";
+    // Codes only: a value that is not a snake_case code (an id, a key, free text) never reaches the log.
+    const { get, logs } = api(refuse(["manifest_missing", "scope_too_large", "manifest_missing", "org-a/ws-a/s-1.json", "Bad Value"]));
+    const r = await get(PATH);
+    expect(r.status).toBe(501);
+    const text = await r.text();
+    const { correlationId } = JSON.parse(text) as { correlationId: string };
+    expect(text).toBe(JSON.stringify({ error: { code: "unsupported_by_backend", message: `not served by this backend: ${reason}`, reason }, correlationId }));
+    expect(text).not.toContain("manifest_missing");
+    const line = logs.find((l) => l.status === 501);
+    expect(line).toEqual({ route: "/v1/sessions/:sessionId/timing", reason, status: 501, reason_codes: "manifest_missing,scope_too_large", correlation_id: correlationId });
+    // No details: the 501 line is exactly today's.
+    const bare = api(refuse());
+    expect((await bare.get(PATH)).status).toBe(501);
+    expect(Object.keys(bare.logs.find((l) => l.status === 501)!).sort()).toEqual(["correlation_id", "reason", "route", "status"]);
+  });
+
   test("org-wide (no workspace) stays on relayhistory; another workspace is 403; no token 401", async () => {
     const { get, calls } = api();
     const org = await get("/v1/sessions/s-1/timing?source=codex");

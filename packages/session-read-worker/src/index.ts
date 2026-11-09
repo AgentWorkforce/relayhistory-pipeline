@@ -86,6 +86,7 @@ import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/
 import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
 import { repeatableReadEnabled, sqlLiveness, TENANT_SETTINGS_SQL, tenantBeginSql, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
 import { parseCompleteSince } from "../../../src/session-read-api/config.ts";
+import { AnalyticsConfigError, analyticsConfig, analyticsCounterFields, createAnalyticsSink, type AnalyticsConfig } from "../../../src/shared/analytics-config.ts";
 import {
   createBufferedSearchGate,
   parseBufferedSearchGate,
@@ -198,6 +199,17 @@ export interface Env extends CanonicalEnv {
    * #328 a06a58f9, GET /v1/session-read/control-head). Unbound = every buffered read fenced.
    */
   HISTORY_CONTROL_HEAD?: Fetcher;
+  /**
+   * Product analytics (src/shared/analytics-config.ts, hosted profile): unset, empty or "noop" = off
+   * (default); "posthog" sends one session_read.request_completed per verified /v1 request to
+   * ANALYTICS_POSTHOG_HOST (default https://i.agentrelay.com) with the ANALYTICS_POSTHOG_KEY secret and
+   * ANALYTICS_DEPLOYMENT_ID, flushed in waitUntil after the response (at most 2 subrequests). Any other
+   * value, or "collector", refuses every request (503, logged missing_<variable>).
+   */
+  ANALYTICS_SINK?: string;
+  ANALYTICS_DEPLOYMENT_ID?: string;
+  ANALYTICS_POSTHOG_HOST?: string;
+  ANALYTICS_POSTHOG_KEY?: string;
 }
 
 /** The read verifier's config from Worker env; the introspection URL passes the https/loopback rule. */
@@ -356,8 +368,14 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
   let ch: ClickHouseClient;
   let completeSinceMs: number;
   let authConfig: AuthConfig;
+  let analyticsSelection: AnalyticsConfig;
   try {
     completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
+    try {
+      analyticsSelection = analyticsConfig(env as unknown as Record<string, unknown>, "hosted");
+    } catch (error) {
+      throw new ConfigError(error instanceof AnalyticsConfigError ? error.variable : "ANALYTICS_SINK");
+    }
     authConfig = workerAuthConfig(env);
     ch = boundedClickHouse(createClickHouseClient(clickHouseConfig(env), overrides.fetcher));
     if (!overrides.connect && !env.SUPABASE?.connectionString) throw new ConfigError("SUPABASE");
@@ -396,7 +414,13 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
   const tenant = requestTenantRunner(overrides.connect ?? hyperdriveClient(env.SUPABASE), {
     repeatableRead: repeatableReadEnabled(env.READ_API_REPEATABLE_READ),
   });
+  // One sink per invocation (no state crosses requests): captured during the request, exported once in waitUntil.
+  const analytics = createAnalyticsSink(analyticsSelection, "session-read-api", "worker", {
+    ...(overrides.fetcher ? { fetch: overrides.fetcher } : {}),
+    report: (counters) => log("warn", "analytics export degraded", analyticsCounterFields(analyticsSelection.sink, counters)),
+  });
   const app = createReadApi({
+    ...(analyticsSelection.sink !== "noop" ? { analytics } : {}),
     timing: timingDeps(env, tenant.run, overrides.fetcher),
     turns: turnsDeps(env, tenant.run, overrides.fetcher),
     babysitter: babysitterEvidenceDeps(env, tenant.run, overrides.fetcher),
@@ -420,6 +444,8 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     return await app.fetch(request);
   } finally {
     ctx.waitUntil(tenant.close());
+    // Bounded (WORKER_LIMITS) and never rejecting; the response is already final.
+    if (analyticsSelection.sink !== "noop") ctx.waitUntil(analytics.shutdown());
   }
 }
 

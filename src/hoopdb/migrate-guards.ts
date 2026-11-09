@@ -383,6 +383,22 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
 ] as const;
 
 /**
+ * Self-host output-facts writers (migration 045040) granted EXECUTE to the consumer login
+ * `search_consumer_runtime` only. The live sessions-function gate (db.ts
+ * SESSIONS_FUNCTION_GATE_SQL) accepts them when, and only when, current_user is that role.
+ * Deliberately NOT part of RUNTIME_APPLICATION_FUNCTIONS: that list feeds
+ * installRuntimeApplicationAcl, which would grant them to the general runtime role. Keep in
+ * step with the allowlist in supabase/bootstrap/session_consumer_role_verify.sql.
+ */
+export const CONSUMER_RUNTIME_FUNCTIONS_ROLE = "search_consumer_runtime";
+export const CONSUMER_RUNTIME_FUNCTIONS = [
+  "sessions.output_facts_erase(text,text,text,text[])",
+  "sessions.output_facts_reconcile(text,text,text,text[],text,jsonb,jsonb,boolean,bigint)",
+  "sessions.output_facts_record_state(text,text,text,text[],text,boolean,timestamp with time zone,timestamp with time zone,bigint,timestamp with time zone)",
+  "sessions.output_facts_state(text,text,text,text[],text)",
+] as const;
+
+/**
  * The pods use one reviewed, multi-tenant backend identity. This policy is deliberately
  * all-row for that identity: tenant isolation for user-facing requests remains in the
  * authenticated RPCs and application filters, while this role is constrained by exact
@@ -1540,7 +1556,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "7866dfb036f5d68acd29f52070ebdf2880b5c1ed1a112a1cd6fcb5d11ff969a9";
+  "9e17a82bbcf9cb401553a37e9a3781fec41ade8ef0980aa6f852a0e9cd930115";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;
@@ -2065,6 +2081,99 @@ export async function sessionsFunctionAclDrift(
   return drift;
 }
 
+/** Type spellings PostgreSQL accepts in a signature, mapped to the regprocedure (format_type) spelling. */
+const SIGNATURE_TYPE_ALIASES: Readonly<Record<string, string>> = Object.freeze({
+  int: "integer", int4: "integer", int2: "smallint", int8: "bigint",
+  bool: "boolean", float4: "real", float8: "double precision",
+  varchar: "character varying", char: "character", decimal: "numeric",
+  timestamptz: "timestamp with time zone", timestamp: "timestamp without time zone",
+  timetz: "time with time zone", time: "time without time zone",
+});
+const MULTI_WORD_TYPES = new Set([
+  "double precision", "character varying", "timestamp with time zone",
+  "timestamp without time zone", "time with time zone", "time without time zone",
+]);
+
+/** Splits on commas outside parentheses. */
+function splitTopLevel(s: string): string[] {
+  const out: string[] = [];
+  let depth = 0;
+  let cur = "";
+  for (const ch of s) {
+    if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+    if (ch === "," && depth === 0) {
+      out.push(cur);
+      cur = "";
+    } else cur += ch;
+  }
+  if (cur.trim()) out.push(cur);
+  return out;
+}
+
+/** One signature argument in regprocedure spelling: no mode, no name, canonical type name. */
+function normalizeSignatureArg(raw: string): string {
+  let a = raw.trim().replace(/\s+/g, " ");
+  let array = "";
+  while (a.endsWith("[]")) {
+    array += "[]";
+    a = a.slice(0, -2).trim();
+  }
+  let words = a.split(" ");
+  if (words.length > 1 && /^(in|inout|variadic)$/.test(words[0]!)) words = words.slice(1);
+  const typeOf = (w: string[]) => {
+    const t = w.join(" ");
+    return SIGNATURE_TYPE_ALIASES[t] ?? t;
+  };
+  let t = typeOf(words);
+  // "p_name type": a leading argument name before a single- or known multi-word type.
+  if (words.length > 1 && !MULTI_WORD_TYPES.has(t)) t = typeOf(words.slice(1));
+  return t + array;
+}
+
+/**
+ * The manifest key ("sessions.fn(type,type)", the oid::regprocedure::text spelling the
+ * manifest uses) for a GRANT target, or null if it is not a schema-qualified sessions
+ * function with an argument list.
+ */
+function normalizeGrantTarget(raw: string): string | null {
+  const m = /^\s*([a-z_][a-z0-9_]*)\.([a-z_][a-z0-9_]*)\s*\(([\s\S]*)\)\s*$/.exec(raw.replace(/"/g, ""));
+  if (!m || m[1] !== "sessions") return null;
+  const args = m[3]!.trim() ? splitTopLevel(m[3]!).map(normalizeSignatureArg) : [];
+  return `${m[1]}.${m[2]}(${args.join(",")})`;
+}
+
+/**
+ * The "<fn> <role>:EXECUTE" grants that the given (pending, not-yet-ledgered) migration SQL
+ * installs with a literal `GRANT EXECUTE ON FUNCTION <sessions.fn(args)> TO <role>[, ...];`
+ * (also inside DO blocks). Only plain EXECUTE without GRANT OPTION, only schema-qualified
+ * sessions functions with an argument list; signatures are normalized to the manifest's
+ * regprocedure spelling (argument names and modes dropped, type aliases such as timestamptz
+ * resolved), roles match exactly. Dynamic SQL (EXECUTE format(...)) is not recognized, so
+ * such a grant stays refused by the preview: under-crediting is the safe direction. A later
+ * pending REVOKE is not modelled; the migrator's exact post-apply check stays authoritative.
+ */
+export function pendingExecuteGrants(pendingSql: readonly string[]): Set<string> {
+  const grants = new Set<string>();
+  const statement = /\bgrant\s+execute\s+on\s+function\s+([^;]+?)\s+to\s+([^;]+?)\s*;/g;
+  for (const sql of pendingSql) {
+    const text = sql
+      .replace(/\/\*[\s\S]*?\*\//g, " ")
+      .replace(/--[^\n]*/g, " ")
+      .toLowerCase();
+    for (const m of text.matchAll(statement)) {
+      if (/\bwith\s+grant\s+option\b/.test(m[2]!) || /\bgranted\s+by\b/.test(m[2]!)) continue;
+      const roles = m[2]!.split(",").map((r) => r.trim().replace(/"/g, ""));
+      if (roles.some((r) => !/^[a-z_][a-z0-9_]*$/.test(r))) continue;
+      for (const target of splitTopLevel(m[1]!)) {
+        const fn = normalizeGrantTarget(target);
+        if (fn) for (const role of roles) grants.add(`${fn} ${role}:EXECUTE`);
+      }
+    }
+  }
+  return grants;
+}
+
 /** Read-only preview of the exact-ACL drift check, split by what the migrator would do. */
 export interface FunctionAclPreview {
   /** The runtime role whose RUNTIME_APPLICATION_FUNCTIONS grants are expected (null: none). */
@@ -2073,8 +2182,10 @@ export interface FunctionAclPreview {
   function_acl_drift_extra: string[];
   /**
    * Grants expected but absent that the migrator adds: the runtime role's
-   * RUNTIME_APPLICATION_FUNCTIONS grants (installRuntimeApplicationAcl), and
-   * "fn: <function>" for a manifest function a pending migration still has to create.
+   * RUNTIME_APPLICATION_FUNCTIONS grants (installRuntimeApplicationAcl),
+   * "fn: <function>" for a manifest function a pending migration still has to create, and
+   * a manifest EXECUTE grant on an existing function that a pending migration's SQL grants
+   * (pendingExecuteGrants).
    */
   function_acl_missing: string[];
   /**
@@ -2095,12 +2206,19 @@ export interface FunctionAclPreview {
  * The same comparison as sessionsFunctionAclDrift (manifest plus the runtime application
  * ACL the migrator installs), read-only and split into extras and missing grants. Missing
  * runtime grants are expected before the first migrate; only extras would be refused.
+ * pendingMigrations is either a flag or the SQL of the pending steps (preferred): with the
+ * SQL, a missing manifest EXECUTE grant that a pending step adds is pending-added, not
+ * refused. The migrator's own exact check after apply (sessionsFunctionAclDrift) is unchanged.
  */
 export async function sessionsFunctionAclPreview(
   client: GuardClient,
   runtimeRole: string | undefined,
-  pendingMigrations = false,
+  pendingMigrations: boolean | readonly string[] = false,
 ): Promise<FunctionAclPreview> {
+  // An array is the SQL of the pending (not-yet-ledgered) steps: pending iff non-empty, and
+  // its literal EXECUTE grants are credited. `true` only tolerates absent functions.
+  const pending = Array.isArray(pendingMigrations) ? pendingMigrations.length > 0 : pendingMigrations === true;
+  const pendingGrants = Array.isArray(pendingMigrations) ? pendingExecuteGrants(pendingMigrations) : new Set<string>();
   const manifest = await sessionsFunctionAclManifest();
   const runtimeFunctions = runtimeApplicationAclCatalog().functions;
   const actual = await sessionsFunctionAcl(client);
@@ -2124,7 +2242,7 @@ export async function sessionsFunctionAclPreview(
     const raw = actual[fn];
     if (raw === undefined) {
       if (manifest[fn])
-        (pendingMigrations ? missing : missingRefused).push(`${fn}: <function>`);
+        (pending ? missing : missingRefused).push(`${fn}: <function>`);
       continue;
     }
     // Model the migrator's REVOKE EXECUTE ... FROM PUBLIC: the built-in default becomes
@@ -2142,9 +2260,12 @@ export async function sessionsFunctionAclPreview(
       for (let i = want.get(e) ?? 0; i < n; i++) extra.push(`${fn}: ${e}`);
     for (const [e, n] of [...want].sort())
       for (let i = got.get(e) ?? 0; i < n; i++)
-        // Only the runtime grants are (re)installed by the migrator; any other missing
-        // manifest grant on an existing function is refused.
-        (e === runtimeEntry ? missing : missingRefused).push(`${fn}: ${e}`);
+        // Only the runtime grants are (re)installed by the migrator, plus an EXECUTE grant a
+        // pending migration's SQL adds (pending-added, like a missing function); any other
+        // missing manifest grant on an existing function is refused.
+        (e === runtimeEntry || pendingGrants.has(`${fn} ${e}`) ? missing : missingRefused).push(
+          `${fn}: ${e}`,
+        );
   }
   return {
     runtime_role: runtimeRole ?? null,

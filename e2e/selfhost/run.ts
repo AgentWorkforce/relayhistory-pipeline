@@ -25,6 +25,12 @@ const down = () => {
   stack.cleanup();
 };
 for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => { down(); process.exit(130); });
+const dumpLogs = () => {
+  for (const svc of ["migrate", "consumer-bootstrap", "roles", "session-pipeline-consumer", "session-ingest", "session-read-api"]) {
+    const logs = stack.compose(["logs", "--no-color", "--tail", "80", svc], { quiet: true, allowFail: true });
+    console.error(`--- ${svc}\n${logs.stdout}`);
+  }
+};
 try {
   console.log("starting stack ...");
   // A crashed earlier run must not leak its volumes into this one.
@@ -47,13 +53,11 @@ try {
   for (const c of checks) counts[c.result]++;
   console.log(`\nresult: ${counts.PASS} passed, ${counts.FAIL} failed, ${counts.BLOCKED} blocked`);
   failed = counts.FAIL > 0;
+  if (counts.FAIL > 0 || counts.BLOCKED > 0) dumpLogs();
 } catch (error) {
   failed = true;
   console.error(`e2e aborted: ${(error as Error).message}`);
-  for (const svc of ["session-ingest", "session-read-api", "session-pipeline-consumer"]) {
-    const logs = stack.compose(["logs", "--no-color", "--tail", "20", svc], { quiet: true, allowFail: true });
-    console.error(`--- ${svc}\n${logs.stdout}`);
-  }
+  dumpLogs();
 } finally {
   down();
 }

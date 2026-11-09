@@ -1190,7 +1190,8 @@
     ],
     "sessions.session_directory_project_text(text,text,text)": [
       "<owner>:EXECUTE",
-      "service_role:EXECUTE"
+      "service_role:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
     ],
     "sessions.session_directory_read_api_scope(text)": [
       "<owner>:EXECUTE"
