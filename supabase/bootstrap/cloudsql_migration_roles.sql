@@ -61,6 +61,7 @@ BEGIN
     'bulls96_read_api'::name,
     'bulls96_project_events'::name,
     'bulls96_analysis_admit'::name,
+    'bulls96_digest_narrative'::name,
     'bulls96_privacy_eraser'::name,
     'bulls96_babysitter_retention'::name,
     'bulls96_acquisition_installer'::name,
@@ -157,6 +158,10 @@ BEGIN
       CREATE ROLE bulls96_project_events
         NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_digest_narrative') THEN
+      CREATE ROLE bulls96_digest_narrative
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_canonical_feature_producer') THEN
       CREATE ROLE bulls96_canonical_feature_producer
         NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
@@ -195,6 +200,7 @@ BEGIN
        'bulls96_session_ingest', 'bulls96_session_ingest_seeder',
        'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events',
        'bulls96_analysis_admit',
+       'bulls96_digest_narrative',
        'bulls96_privacy_eraser',
        'bulls96_babysitter_retention',
        'bulls96_acquisition_installer',

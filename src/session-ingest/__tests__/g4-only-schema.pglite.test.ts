@@ -130,9 +130,11 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Read-role-only summary RPC, recorded-title metadata column and invoker trigger;
       // no ingest RPC is replaced or calls them.
       "20261105044100_session_brief_summary_read.sql",
+      // The digest narrative cache table, its purge function and read API functions only; no ingest path touches them.
+      // (045000 landed on main; listed here in slot order, newest branch slot 046000 last.)
+      "20261105045000_digest_narrative_cache.sql",
       // Lane F1 (this branch): analysis jobs/requests/tickets/invocations/reservations tables,
       // the purge functions and their grant helper, the admit scope function and the request entry point.
-      // (045000 digest is not in this tree yet; it lands first and this list gains it on merge.)
       "20261105046000_analysis_jobs.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
@@ -155,14 +157,15 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
     // Exception: 041000's authority apply names the analysis (046000) objects only
     // through its guarded integrations (to_regprocedure/to_regclass presence checks, ABI-mismatch
     // on partial presence, no-op when absent): not a swallowed 42883. Everything else must stay clean.
-    // (041000's derived purge names no analysis object, so those allowlist entries could never
-    // match; 045000's digest names are not in this tree yet, so the two derived-purge digest
-    // entries return when 045000 lands.)
+    // (041000's derived purge names the digest (045000) objects only through its guarded integration;
+    // 045000 has landed, so both entry sets are live.)
     const guarded = new Set([
       "ingest_privacy_authority_apply -> session_analysis_jobs_v2",
       "ingest_privacy_authority_apply -> session_analysis_purge_authority",
       "ingest_privacy_authority_apply -> purge_session_analysis_for_owned",
       "ingest_privacy_authority_apply -> session_analysis_purge_grant",
+      "ingest_privacy_authority_purge_derived -> purge_daily_digest_narratives",
+      "ingest_privacy_authority_purge_derived -> daily_digest_narratives",
     ]);
     const bodies = (await f.db.query<{ proname: string; prosrc: string }>("SELECT p.proname, p.prosrc FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema')")).rows;
     const names = [...OBJECTS.newFunctions, ...OBJECTS.newTables, "acquisition_epoch"];

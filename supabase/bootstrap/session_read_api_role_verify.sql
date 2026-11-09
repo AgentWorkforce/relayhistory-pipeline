@@ -118,6 +118,7 @@ BEGIN
          'sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)',
          'sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)',
          'sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)',
+         'sessions.digest_narrative_read(text,date,text,text)',
          'sessions.list_session_directory_for(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)',
          'sessions.read_api_token_delete_by_hash(text,text)',
          'sessions.read_api_token_delete_for(text,text,text,text)',
