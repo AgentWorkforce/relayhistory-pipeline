@@ -226,6 +226,32 @@ Emulated on PG16 and PG17: the phase-1 chain, a full migrate, runtime readiness
 (`schemaVerdict` as `sessions_pipeline_runtime`), a second migrate (0 applied) and
 `verify` all pass after activation.
 
+## Known limitations (v1, accepted)
+
+- **Babysitter retention is not supported on this layout in v1.**
+  `bulls96_babysitter_retention` is created NOLOGIN. The frozen migration
+  `20261105042000` refuses it if it can already log in, and nobody can arm LOGIN after
+  activation. A unit test pins the exception to the migration text. Follow-up: "arm
+  babysitter retention on separate-database layout" (a forward migration in its own slot).
+- **Activation is the only role-shaping path.** The operator `*_role.sql` files are
+  unsupported on this layout. They issue `ALTER ROLE`, which `hoop` cannot run.
+  Activation and the migrator together cover the full role set. Separate-database
+  variants of their grant and verify parts, which never `ALTER ROLE` and are selected
+  by `HOOPDB_RDS_LAYOUT`, are a follow-up PR.
+- **No new service role in place.** Roles are instance-wide, and nobody holds ADMIN
+  after activation. A future role needs a reviewed activation v2 or a new instance.
+- **Fixed names.** `hoopdb`, `hoop`, `sessions_pipeline_runtime` and the executor name
+  are v1 constants.
+
+## Live-run verification items (infra owner's sandbox run)
+
+- Real `rds_superuser` behaviour:
+  - effective CREATE on `sessions` (#389);
+  - any hidden ADMIN path over the HoopDb roles (confirm that the master is refused ALTER, GRANT and DROP);
+  - whether the master or `rds_superuser` can CONNECT to `hoopdb` despite the revoked PUBLIC grant.
+- `log_statement` and parameter logging in the parameter group. The bound SCRAM verifiers (never plaintext) could be logged.
+- Verified TLS against the pinned RDS CA bundle. A wrong CA and a wrong host name must both be refused.
+
 ## Security model and trade-offs
 
 - **No standing capability.** After `activate`, only `rdsadmin` (AWS) holds ADMIN on any
