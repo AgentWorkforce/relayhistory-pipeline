@@ -32,6 +32,15 @@
  *                             hash-chain match, manifest revision > pointer revision >= 1) instead of 501
  *                             `*_canonical_manifest_mismatch`; the newer chunks appear after the next reconcile.
  *                             Unset: any manifest/pointer difference is refused, exactly as before.
+ *   READ_API_CANONICAL_SCOPE_BYTES                    raw-byte budget of one canonical snapshot (sum over the
+ *                             session's chunks of max(bytes, stored_raw_bytes)), a plain positive integer or an
+ *                             integer with a MiB / GiB suffix; default 16 MiB, accepted 16 MiB..2 GiB. A session past
+ *                             the budget is 501 `*_canonical_canonical_projection_incomplete` (reason `scope_too_large`). Read only here,
+ *                             so never on the hosted Lambda; artifact and producer reads keep their own budgets.
+ *   READ_API_CANONICAL_SCOPE_EVENTS                   record budget of the same snapshot, a plain positive integer;
+ *                             default 100000, accepted 100000..4000000. For both: unset or empty is the default
+ *                             (byte-identical); malformed, below the default or above the bound fails startup,
+ *                             naming the variable (never clamped). The 500000 projected-row bound is unchanged.
  *
  * The store is built by src/shared/locker.ts buildLockerStore, the builder
  * every other service uses, so credentials, provider selection and egress rules
@@ -57,7 +66,7 @@
  */
 import { zstdDecompressSync } from "node:zlib";
 import { cachedProvider } from "../../packages/object-store/src/core.ts";
-import { canonicalSnapshot, type CanonicalIdentity } from "./canonical.ts";
+import { CANONICAL_SCOPE_BYTES, CANONICAL_SCOPE_EVENTS, canonicalSnapshot, type CanonicalIdentity } from "./canonical.ts";
 import type { TenantRunner } from "./liveness.ts";
 import { sqlCanonicalPointers, type CanonicalRows } from "./session-timing-source.ts";
 import { sqlSessionHarnesses } from "./session-turns-source.ts";
@@ -73,6 +82,32 @@ export interface ServiceCanonicalDeps {
 
 /** zstd under the projection's output bound; any failure is the projection's `chunk_decompress_failed` refusal. */
 const decompress = (bytes: Uint8Array, max: number): Uint8Array => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: max }));
+
+const MiB = 1024 * 1024;
+/** READ_API_CANONICAL_SCOPE_BYTES bounds: the canonical.ts default up to the `large` node source budget (node-read-profile.ts). */
+export const SCOPE_BYTES_MIN = CANONICAL_SCOPE_BYTES, SCOPE_BYTES_MAX = 2 * 1024 * MiB;
+/** READ_API_CANONICAL_SCOPE_EVENTS bounds: the canonical.ts default up to 4,000,000 records. */
+export const SCOPE_EVENTS_MIN = CANONICAL_SCOPE_EVENTS, SCOPE_EVENTS_MAX = 4_000_000;
+
+/**
+ * The self-host canonical snapshot budget (see the header). Only a set variable
+ * appears in the result, so an unset one leaves canonicalSnapshot on its
+ * default. Throws at startup on a malformed or out-of-range value, naming the
+ * variable and its range (not the value); never clamps.
+ */
+export function canonicalScopeBudget(env: NodeJS.ProcessEnv): { scopeBytes?: number; scopeEvents?: number } {
+  const parse = (name: string, raw: string | undefined, suffixes: boolean, min: number, max: number, range: string): number | undefined => {
+    if (raw === undefined || raw === "") return undefined;
+    const m = (suffixes ? /^([1-9][0-9]{0,12})(MiB|GiB)?$/u : /^([1-9][0-9]{0,12})()$/u).exec(raw);
+    const value = m ? Number(m[1]) * (m[2] === "GiB" ? 1024 * MiB : m[2] === "MiB" ? MiB : 1) : NaN;
+    if (!Number.isSafeInteger(value) || value < min || value > max)
+      throw new Error(`session read api: ${name} must be ${suffixes ? "a whole number of bytes (optional MiB or GiB suffix)" : "a whole number of records"} in ${range}`);
+    return value;
+  };
+  const scopeBytes = parse("READ_API_CANONICAL_SCOPE_BYTES", env.READ_API_CANONICAL_SCOPE_BYTES, true, SCOPE_BYTES_MIN, SCOPE_BYTES_MAX, "16MiB..2GiB");
+  const scopeEvents = parse("READ_API_CANONICAL_SCOPE_EVENTS", env.READ_API_CANONICAL_SCOPE_EVENTS, false, SCOPE_EVENTS_MIN, SCOPE_EVENTS_MAX, "100000..4000000");
+  return { ...(scopeBytes !== undefined ? { scopeBytes } : {}), ...(scopeEvents !== undefined ? { scopeEvents } : {}) };
+}
 
 /**
  * The canonical source for the service, or undefined when LOCKER_BUCKET is unset
@@ -103,6 +138,8 @@ export async function serviceCanonicalDeps(
   const pointers = sqlCanonicalPointers(run);
   // Self-host only, default off: see READ_API_CANONICAL_PIN_LAGGING_POINTER in the header.
   const pinLaggingPointer = env.READ_API_CANONICAL_PIN_LAGGING_POINTER?.trim() === "true";
+  // Self-host only, defaults unchanged when unset: see READ_API_CANONICAL_SCOPE_BYTES / _EVENTS in the header.
+  const scope = canonicalScopeBudget(env);
   async function source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows & { generation: string; exists: boolean }> {
     // Every object read of this request is aborted at the route's deadline.
     const bounded: typeof fetch = (input, init) => fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal });
@@ -110,6 +147,7 @@ export async function serviceCanonicalDeps(
     const snapshot = await canonicalSnapshot(
       { store: raw.store, provider: raw.provider, bucket: raw.bucket, prefix, pointers: pointers.pointers, decompress, ...(pinLaggingPointer ? { pinLaggingPointer } : {}) },
       identity,
+      scope,
     );
     return { rows: snapshot.rows, legacyCoverage: snapshot.legacyCoverage, generation: snapshot.generation, exists: snapshot.exists };
   }
