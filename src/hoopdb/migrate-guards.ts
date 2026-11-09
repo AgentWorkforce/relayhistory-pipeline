@@ -10,6 +10,7 @@ import { readFile } from "node:fs/promises";
 import {
   ADOPTABLE_INDEX_SQL,
   ADOPTABLE_INDEXES,
+  ADOPTABLE_STEP_OTHER_OBJECTS,
   MIGRATION_SENTINELS,
 } from "./migration-sentinels.ts";
 
@@ -1112,7 +1113,8 @@ async function exists(
 
 /**
  * The reviewed adoptable-index allowance (ADOPTABLE_INDEXES): true only when `step`
- * declares index `name` adoptable, the step's whole inventory is its declared indexes,
+ * declares index `name` adoptable, the step's whole inventory is its declared indexes
+ * (plus, only where ADOPTABLE_STEP_OTHER_OBJECTS lists them, exactly those other objects),
  * and the live index is the exact declared one (see ADOPTABLE_INDEX_SQL). Fails closed.
  */
 async function adoptableIndex(
@@ -1124,7 +1126,14 @@ async function adoptableIndex(
   const declared = ADOPTABLE_INDEXES[step];
   const x = declared?.find((d) => d.name === name);
   if (!declared || !x) return false;
-  if (!inventory.every((o) => o.kind === "index" && declared.some((d) => d.name === o.name)))
+  const others = ADOPTABLE_STEP_OTHER_OBJECTS[step] ?? [];
+  if (
+    !inventory.every((o) =>
+      o.kind === "index"
+        ? declared.some((d) => d.name === o.name)
+        : others.includes(key(o)),
+    )
+  )
     return false;
   try {
     return Boolean(
@@ -1246,9 +1255,11 @@ export async function sequencePreflight(
     } catch {
       applied = true; // can't look: fail closed, as if the step had run
     }
-    // An adoptable step's sentinel is its declared indexes: accepted only when every one is adoptable.
+    // An index-only adoptable step's sentinel is its declared indexes: accepted only when every one
+    // is adoptable. A step that also creates other objects (ADOPTABLE_STEP_OTHER_OBJECTS) keeps its
+    // own sentinel: it is never overridden here.
     const declared = ADOPTABLE_INDEXES[names[i]!];
-    if (applied && declared?.length) {
+    if (applied && declared?.length && !ADOPTABLE_STEP_OTHER_OBJECTS[names[i]!]?.length) {
       const inventory = inventoryOf(sql[i]!);
       let all = true;
       for (const d of declared)

@@ -844,20 +844,36 @@ describe("list_session_directory query plans", () => {
     // is the case its index exists for.
     // Builder flags: 0 source count, 1 project, 2 user count, 3 agent, 4 last after, 5 last
     // before, 6 first after, 7 first before, 8 keys, 9 cursor, 10 excluded sources.
-    const cases: Array<[string, unknown[], string, string | string[]]> = [
+    // The agent shapes: 20261105050020's session_directory_agents_prefix_idx has the same
+    // columns and order as session_directory_agents_recent_idx, with text_pattern_ops on the
+    // name. That opclass supports =, so the equality is served by either index walk in the
+    // same (last_activity_at, session_id, harness) DESC order; the planner may pick either.
+    // "agent prefix" is the statement 20261105050020 runs for agent_match prefix: this
+    // builder's text with the membership predicate rewritten to LIKE, which only the
+    // text_pattern_ops index can serve under a non-C collation.
+    const AGENT_INDEXES = ["session_directory_agents_recent_idx", "session_directory_agents_prefix_idx"];
+    const EXACT = "a.agent_name_normalized = $6)";
+    const PREFIX = "a.agent_name_normalized LIKE $6 ESCAPE '\\')";
+    const cases: Array<[string, unknown[], string, string | string[], boolean?]> = [
       ["workspace", flags({}), params({}), "session_directory_workspace_recent_idx"],
       ["one source", flags({ 0: 1 }), params({ 3: ["gemini"] }), "session_directory_harness_recent_idx"],
       ["project substring", flags({ 1: true }), params({ 4: "%needle-project%" }), "session_directory_tenant_project_text_trgm_idx"],
       ["one user", flags({ 2: 1 }), params({ 5: ["rare-2000"] }), "session_directory_users_recent_idx"],
       ["several users", flags({ 2: 2 }), params({ 5: ["rare-2000", "rare-4000"] }), "session_directory_users_recent_idx"],
-      ["agent", flags({ 3: true }), params({ 6: "agent-42" }), "session_directory_agents_recent_idx"],
-      ["agent + cursor", flags({ 3: true, 9: true }), params({ 6: "agent-42", 11: "2026-01-10T00:00:00Z", 12: "s-1", 13: "codex" }), "session_directory_agents_recent_idx"],
+      ["agent", flags({ 3: true }), params({ 6: "agent-42" }), AGENT_INDEXES],
+      ["agent + cursor", flags({ 3: true, 9: true }), params({ 6: "agent-42", 11: "2026-01-10T00:00:00Z", 12: "s-1", 13: "codex" }), AGENT_INDEXES],
+      ["agent prefix", flags({ 3: true }), params({ 6: "agent-42%" }), "session_directory_agents_prefix_idx", true],
+      ["agent prefix + cursor", flags({ 3: true, 9: true }), params({ 6: "agent-42%", 11: "2026-01-10T00:00:00Z", 12: "s-1", 13: "codex" }), "session_directory_agents_prefix_idx", true],
       ["batch keys", flags({ 8: true }), params({ 15: ["codex", "claude"], 16: ["s-8", "s-9"] }), ["session_directory_pkey", "session_directory_session_lookup_idx"]],
     ];
     const types =
       "text, text, text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, timestamptz, text, text, integer, text[], text[], text[]";
-    for (const [name, builderFlags, values, expected] of cases) {
-      const sql = await statement(builderFlags);
+    for (const [name, builderFlags, values, expected, prefix] of cases) {
+      let sql = await statement(builderFlags);
+      if (prefix) {
+        expect(sql.split(EXACT).length, name).toBe(2);
+        sql = sql.replace(EXACT, PREFIX);
+      }
       await db.exec(`PREPARE list_shape (${types}) AS ${sql}`);
       try {
         const result = await db.query<Record<string, unknown>>(

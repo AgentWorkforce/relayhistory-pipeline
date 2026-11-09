@@ -53,12 +53,15 @@ function client(db: PGlite): MigrationClient {
 const failure = async (run: Promise<unknown>) =>
   (await run.then(() => null, (caught: unknown) => caught)) as { code?: string; message?: string } | null;
 
-/** Every migration before 044020 applied and ledgered through the real migrator. */
+const LATER_UPSTREAM = ["upstream:20261105050020_session_directory_agent_match.sql"];
+
+/** Every migration before 044020 applied and ledgered through the real migrator (no later upstream step either: that would be a ledger gap). */
 async function before044020(): Promise<PGlite> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
-  const steps = (await plan(LOCAL)).filter((s) => s.name !== STEP && !s.name.startsWith("verify:"));
-  expect(steps.length).toBe((await plan(LOCAL)).filter((s) => !s.name.startsWith("verify:")).length - 1);
+  const all = (await plan(LOCAL)).filter((s) => !s.name.startsWith("verify:"));
+  const steps = all.filter((s) => s.name !== STEP && !LATER_UPSTREAM.includes(s.name));
+  expect(steps.length).toBe(all.length - 1 - LATER_UPSTREAM.length);
   await runMigrations(client(db), { profile: { ...LOCAL, verify: false }, steps });
   return db;
 }
@@ -365,8 +368,14 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
          UNION ALL SELECT 'fn:' || p.oid::regprocedure::text FROM pg_proc p WHERE p.pronamespace = 'sessions'::regnamespace ORDER BY 1`,
       )).rows.map((r) => r.k);
     const ledger = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations ORDER BY name")).rows.map((r) => r.name);
-    const before = await catalog(), ledgerBefore = await ledger();
+    const full = await catalog();
+    // A later upstream step is applied (050020): 044020's rollback refuses until it is rolled back first.
     const down = readFileSync(DOWN, "utf8");
+    expect((await failure(db.exec(down).catch(async (e) => { await db.exec("ROLLBACK"); throw e; })))?.code).toBe("55000");
+    expect(await catalog()).toEqual(full);
+    for (const later of [...LATER_UPSTREAM].reverse())
+      await db.exec(readFileSync(join(root, "supabase/rollbacks", later.replace(/^upstream:/, "").replace(/\.sql$/, ".down.sql")), "utf8"));
+    const before = await catalog(), ledgerBefore = await ledger();
     // A later upstream migration applied: refused, nothing changes.
     await db.query("INSERT INTO sessions.__96bulls_migrations (name, sha256) VALUES ('upstream:20261105099000_later.sql', 'x')");
     expect((await failure(db.exec(down).catch(async (e) => { await db.exec("ROLLBACK"); throw e; })))?.code).toBe("55000");
@@ -380,17 +389,17 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
     // Again: its ledger row is gone, so it refuses and changes nothing.
     expect((await failure(db.exec(down).catch(async (e) => { await db.exec("ROLLBACK"); throw e; })))?.code).toBe("55000");
     expect(await catalog()).toEqual(after);
-    // The next migrator run recreates them.
+    // The next migrator run recreates them (and the later steps).
     expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
-    expect(await catalog()).toEqual(before);
+    expect(await catalog()).toEqual(full);
   });
 
-  test("(g) sequence: 044020 is the newest upstream step on this branch and sits after 044000", async () => {
+  test("(g) sequence: 044020 sits after 044000, and only the listed later upstream steps follow it", async () => {
     const names = (await plan(LOCAL)).map((s) => s.name).filter((n) => n.startsWith("upstream:"));
     const i = names.indexOf(STEP);
     expect(i).toBeGreaterThan(0);
     expect(names[i - 1]! < STEP).toBe(true);
     expect(names.indexOf("upstream:20261105044000_read_api_tokens.sql")).toBeLessThan(i);
-    expect(names.filter((n) => n > STEP)).toEqual([]);
+    expect(names.filter((n) => n > STEP)).toEqual(LATER_UPSTREAM);
   });
 });

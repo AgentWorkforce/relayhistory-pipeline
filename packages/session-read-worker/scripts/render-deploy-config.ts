@@ -40,6 +40,15 @@
  * than off/on, on with owner_buffered off, and a template that already declares the var (in every
  * mode and for every owner_buffered_events value, including the default and gate-only renders).
  *
+ * agent_match=on (agent-name prefix search, docs/agent-name-search-contract.md, migration
+ * 20261105050020): adds vars READ_API_AGENT_MATCH="true" (the Worker enables it only on exactly
+ * "true") to whichever render the other inputs select; no binding, no workspace list. Independent
+ * of every other input. agent_match=off (the default, empty = off) changes nothing: every render is
+ * byte-identical to the render before this input existed. Refused: any value other than off/on,
+ * and a template that already declares the var (in every mode and for every agent_match value).
+ * Turn it on only after 20261105050020 is applied to the read database: before that a prefix
+ * request is 501 agent_match_not_migrated.
+ *
  * The binding is production-scoped by living only in this production deploy's on-render, not in
  * wrangler.jsonc: a wrangler `env` block would rename the script (legacy_env appends -<env>) and
  * does not inherit hyperdrive/vars/services, so it would either deploy a second Worker or
@@ -48,7 +57,8 @@
  * CLI: reads wrangler.jsonc and the env below, writes wrangler.deploy.jsonc, prints no value.
  *   HYPERDRIVE_ID, OWNER_BUFFERED (off|on; empty = off), OWNER_BUFFERED_WORKSPACES,
  *   OWNER_BUFFERED_S3_BUCKET, OWNER_BUFFERED_S3_REGION, DIRECTORY_WORKSPACES,
- *   BUFFERED_SEARCH_GATE (off|on; empty = off), OWNER_BUFFERED_EVENTS (off|on; empty = off).
+ *   BUFFERED_SEARCH_GATE (off|on; empty = off), OWNER_BUFFERED_EVENTS (off|on; empty = off),
+ *   AGENT_MATCH (off|on; empty = off).
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -69,6 +79,9 @@ export const BUFFERED_SEARCH_GATE_VAR = "READ_API_BUFFERED_SEARCH_GATE";
 /** The owner-buffered events flag (index.ts Env; ownerBufferedEventsEnabled accepts only "on"). */
 export const OWNER_BUFFERED_EVENTS_VAR = "READ_API_OWNER_BUFFERED_EVENTS";
 
+/** The agent-name prefix search flag (src/session-read-api/config.ts agentMatchEnabled accepts only "true"). */
+export const AGENT_MATCH_VAR = "READ_API_AGENT_MATCH";
+
 export interface RenderInputs {
   hyperdriveId: string;
   /** The workflow_dispatch input; "" (no input) = off. */
@@ -82,6 +95,8 @@ export interface RenderInputs {
   bufferedSearchGate?: string;
   /** The owner_buffered_events workflow_dispatch input; "" (no input) = off; on needs owner_buffered=on. */
   ownerBufferedEvents?: string;
+  /** The agent_match workflow_dispatch input; "" (no input) = off. */
+  agentMatch?: string;
 }
 
 export class RenderError extends Error {
@@ -132,15 +147,33 @@ function leaveUnset(vars: Record<string, string>, keys: readonly string[]): void
   }
 }
 
-/** Refuses a template whose vars already declare the events flag, in every mode; an unparsable template is left to the paths that parse it. */
-function refusePredeclaredEvents(template: string, hyperdriveId: string): void {
+/** Refuses a template whose vars already declare one of `keys`, in every mode; an unparsable template is left to the paths that parse it. */
+function refusePredeclared(template: string, hyperdriveId: string, keys: readonly string[]): void {
   const parsed = ts.parseConfigFileTextToJson("wrangler.jsonc", renderDefault(template, hyperdriveId));
   if (parsed.error) return;
   const vars = (parsed.config as JsoncConfig | undefined)?.vars;
-  if (vars !== null && typeof vars === "object" && OWNER_BUFFERED_EVENTS_VAR in vars) throw new RenderError(`wrangler.jsonc must leave ${OWNER_BUFFERED_EVENTS_VAR} unset`);
+  if (vars === null || typeof vars !== "object") return;
+  for (const k of keys) if (k in vars) throw new RenderError(`wrangler.jsonc must leave ${k} unset`);
 }
 
 export function renderDeployConfig(template: string, inputs: RenderInputs): string {
+  const agentMode = (inputs.agentMatch ?? "").trim() || "off";
+  if (agentMode !== "off" && agentMode !== "on") throw new RenderError('agent_match must be "off" or "on"');
+  const out = renderWithoutAgentMatch(template, inputs);
+  refusePredeclared(template, inputs.hyperdriveId, [AGENT_MATCH_VAR]);
+  if (agentMode === "off") return out;
+  // agent_match=on: the selected render plus the flag, nothing else. The off renders are JSON or the
+  // default JSONC; both parse here, and the default one is checked for services/env like the gate-only render.
+  const parsed = ts.parseConfigFileTextToJson("wrangler.jsonc", out);
+  if (parsed.error) throw new RenderError("wrangler.jsonc is not valid JSONC");
+  const config = parsed.config as JsoncConfig;
+  if (out === renderDefault(template, inputs.hyperdriveId) && (config.services !== undefined || config.env !== undefined)) throw new RenderError("wrangler.jsonc must not declare services or env; the binding is added here only");
+  const vars = config.vars ?? {};
+  leaveUnset(vars, [AGENT_MATCH_VAR]);
+  return `${JSON.stringify({ ...config, vars: { ...vars, [AGENT_MATCH_VAR]: "true" } }, null, 2)}\n`;
+}
+
+function renderWithoutAgentMatch(template: string, inputs: RenderInputs): string {
   if (!/^[0-9a-f]{32}$/.test(inputs.hyperdriveId) || /^0+$/.test(inputs.hyperdriveId)) throw new RenderError("SESSION_READ_HYPERDRIVE_ID must be the Hyperdrive config id (32 hex)");
   if (!template.includes(HYPERDRIVE_PLACEHOLDER)) throw new RenderError("wrangler.jsonc has no Hyperdrive placeholder");
   const gateMode = (inputs.bufferedSearchGate ?? "").trim() || "off";
@@ -150,7 +183,7 @@ export function renderDeployConfig(template: string, inputs: RenderInputs): stri
   const eventsMode = (inputs.ownerBufferedEvents ?? "").trim() || "off";
   if (eventsMode !== "off" && eventsMode !== "on") throw new RenderError('owner_buffered_events must be "off" or "on"');
   const events = eventsMode === "on";
-  refusePredeclaredEvents(template, inputs.hyperdriveId);
+  refusePredeclared(template, inputs.hyperdriveId, [OWNER_BUFFERED_EVENTS_VAR]);
   const workspacesRaw = (inputs.ownerBufferedWorkspaces ?? "").trim();
   if (events && mode !== "on") throw new RenderError("owner_buffered_events=on needs owner_buffered=on; refusing a flag that would have no effect");
   if (mode === "off") {
@@ -213,6 +246,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
       directoryWorkspaces: process.env.DIRECTORY_WORKSPACES,
       bufferedSearchGate: process.env.BUFFERED_SEARCH_GATE,
       ownerBufferedEvents: process.env.OWNER_BUFFERED_EVENTS,
+      agentMatch: process.env.AGENT_MATCH,
     });
     writeFileSync(here("../wrangler.deploy.jsonc"), out);
     const on = ((process.env.OWNER_BUFFERED ?? "").trim() || "off") === "on";
@@ -221,6 +255,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     const binding = `${CONTROL_HEAD_BINDING.binding} -> ${CONTROL_HEAD_BINDING.service}#${CONTROL_HEAD_BINDING.entrypoint}`;
     console.log(on ? `deploy config: owner-buffered ON (${all ? "all workspaces" : "canary list"}), ${binding}` : gate ? "deploy config: owner-buffered off" : "deploy config: owner-buffered off (Hyperdrive id only)");
     if (((process.env.OWNER_BUFFERED_EVENTS ?? "").trim() || "off") === "on") console.log(`deploy config: owner-buffered events ON, ${OWNER_BUFFERED_EVENTS_VAR}=on`);
+    if (((process.env.AGENT_MATCH ?? "").trim() || "off") === "on") console.log(`deploy config: agent-name prefix search ON, ${AGENT_MATCH_VAR}=true`);
     if (gate) console.log(`deploy config: buffered search gate ON, ${BUFFERED_SEARCH_GATE_VAR}=on, ${binding}${on ? " (shared with owner-buffered, rendered once)" : ""}`);
   } catch (error) {
     console.error(`::error::${error instanceof RenderError ? error.message : "render failed"}`);

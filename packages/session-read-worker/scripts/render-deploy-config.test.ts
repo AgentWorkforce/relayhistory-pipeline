@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, test } from "vitest";
-import { ALL_WORKSPACES, BUFFERED_SEARCH_GATE_VAR, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, OWNER_BUFFERED_EVENTS_VAR, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
+import { AGENT_MATCH_VAR, ALL_WORKSPACES, BUFFERED_SEARCH_GATE_VAR, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, OWNER_BUFFERED_EVENTS_VAR, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 const TEMPLATE = readFileSync(here("../wrangler.jsonc"), "utf8");
@@ -289,6 +289,49 @@ describe("deploy config render, owner_buffered_events", () => {
   });
 });
 
+describe("deploy config render, agent_match", () => {
+  const GATE = { hyperdriveId: HD, bufferedSearchGate: "on" };
+  const EVENTS = { ...ON, ownerBufferedEvents: "on" };
+  const BASES: Array<[string, RenderInputs]> = [["default", { hyperdriveId: HD }], ["gate-only", GATE], ["owner-buffered", ON], ["owner-buffered+gate", { ...ON, bufferedSearchGate: "on" }], ["owner-buffered+events", EVENTS]];
+
+  test("agent_match off (no input, empty, off) is byte-identical to the render without the input, for every existing input combination", () => {
+    for (const [label, base] of BASES) {
+      const without = renderDeployConfig(TEMPLATE, base);
+      for (const agentMatch of [undefined, "", " off ", "off"]) expect(renderDeployConfig(TEMPLATE, { ...base, agentMatch }), label).toBe(without);
+    }
+    expect(renderDeployConfig(TEMPLATE, { hyperdriveId: HD, agentMatch: "off" })).toBe(sedRender(HD));
+  });
+
+  test('agent_match on adds exactly READ_API_AGENT_MATCH="true" to whichever render the other inputs select; no binding of its own', () => {
+    for (const [label, base] of BASES) {
+      const before = parse(renderDeployConfig(TEMPLATE, base));
+      const after = parse(renderDeployConfig(TEMPLATE, { ...base, agentMatch: "on" }));
+      expect(after.vars[AGENT_MATCH_VAR], label).toBe("true");
+      const { [AGENT_MATCH_VAR]: _flag, ...restVars } = after.vars;
+      expect(restVars, label).toEqual(before.vars);
+      const { vars: _a, ...restAfter } = after;
+      const { vars: _b, ...restBefore } = before;
+      expect(restAfter, label).toEqual(restBefore);
+    }
+    expect(parse(renderDeployConfig(TEMPLATE, { hyperdriveId: HD, agentMatch: "on" })).services).toBeUndefined();
+  });
+
+  test("agent_match refuses unknown values and a template that predeclares the var, in every mode and for every agent_match value", () => {
+    for (const agentMatch of ["true", "ON", "1", "yes"]) expect(() => renderDeployConfig(TEMPLATE, { hyperdriveId: HD, agentMatch })).toThrow(/agent_match must be "off" or "on"/);
+    const flagged = TEMPLATE.replace(/"vars": \{/, `"vars": {\n    "${AGENT_MATCH_VAR}": "false",`);
+    expect(flagged).not.toBe(TEMPLATE);
+    for (const [label, base] of BASES) {
+      for (const agentMatch of [undefined, "off", "on"]) expect(() => renderDeployConfig(flagged, { ...base, agentMatch }), label).toThrow(/must leave READ_API_AGENT_MATCH unset/);
+    }
+  });
+
+  test("agent_match on with a template that declares services or env is refused (default render)", () => {
+    const withEnv = TEMPLATE.replace(/^\{/, '{\n  "env": {},');
+    expect(withEnv).not.toBe(TEMPLATE);
+    expect(() => renderDeployConfig(withEnv, { hyperdriveId: HD, agentMatch: "on" })).toThrow(/services or env/);
+  });
+});
+
 describe("deploy workflow wiring", () => {
   test("dispatch inputs default to off and none", () => {
     expect(WORKFLOW).toMatch(/owner_buffered:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
@@ -297,6 +340,8 @@ describe("deploy workflow wiring", () => {
     expect(WORKFLOW).toContain("BUFFERED_SEARCH_GATE: ${{ inputs.buffered_search_gate }}");
     expect(WORKFLOW).toMatch(/owner_buffered_events:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
     expect(WORKFLOW).toContain("OWNER_BUFFERED_EVENTS: ${{ inputs.owner_buffered_events }}");
+    expect(WORKFLOW).toMatch(/agent_match:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+    expect(WORKFLOW).toContain("AGENT_MATCH: ${{ inputs.agent_match }}");
   });
 
   test("inputs reach shell only through env, and the render runs this script", () => {
@@ -307,5 +352,6 @@ describe("deploy workflow wiring", () => {
     expect(WORKFLOW).not.toContain("--var \"RELAYHISTORY_READ_OWNER_BUFFERED");
     expect(WORKFLOW).not.toContain("--var \"READ_API_BUFFERED_SEARCH_GATE");
     expect(WORKFLOW).not.toContain("--var \"READ_API_OWNER_BUFFERED_EVENTS");
+    expect(WORKFLOW).not.toContain("--var \"READ_API_AGENT_MATCH");
   });
 });

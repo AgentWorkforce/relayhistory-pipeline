@@ -45,6 +45,13 @@ name: deploy session-read-worker
 # (#339) is enabled. Turning it on is a production change: dispatch is Khaliq's call. Every later
 # dispatch without the input turns the gate off again.
 #
+# Agent-name prefix search (docs/agent-name-search-contract.md), default off. agent_match=off (or no
+# input) changes nothing: the render is byte-identical to the one before this input existed.
+# agent_match=on adds READ_API_AGENT_MATCH=true to whichever render the other inputs select. Turn it
+# on only after migration 20261105050020 is applied to the read database (before that a prefix
+# request is 501 agent_match_not_migrated). Turning it on is a production change: dispatch is
+# Khaliq's call. Every later dispatch without the input turns it off again.
+#
 # The Worker's own secrets (CLICKHOUSE_URL, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD)
 # are never handled here: they are set with `wrangler secret put` from 1Password
 # and survive deploys. This workflow checks that they exist, by name only.
@@ -67,6 +74,11 @@ on:
         default: "off"
       buffered_search_gate:
         description: Per-hit privacy gate for buffered search hits (#338); needs no other input. off = exactly the default deploy
+        type: choice
+        options: ["off", "on"]
+        default: "off"
+      agent_match:
+        description: Agent-name prefix search (READ_API_AGENT_MATCH=true); needs migration 20261105050020 applied. off = exactly the render without it
         type: choice
         options: ["off", "on"]
         default: "off"
@@ -108,6 +120,8 @@ jobs:
       OWNER_BUFFERED_EVENTS: ${{ inputs.owner_buffered_events }}
       # Buffered search gate (default off); renders the flag and the pinned binding when on.
       BUFFERED_SEARCH_GATE: ${{ inputs.buffered_search_gate }}
+      # Agent-name prefix search (default off); renders READ_API_AGENT_MATCH=true when on.
+      AGENT_MATCH: ${{ inputs.agent_match }}
     defaults:
       run:
         working-directory: packages/session-read-worker

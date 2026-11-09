@@ -17,6 +17,9 @@ import { createReadApi } from "../../session-read-api/app.ts";
 import { sqlDirectory } from "../../session-read-api/directory.ts";
 import { agentMatchDeps, agentMatchEnabled } from "../../session-read-api/config.ts";
 import { memoryLiveness } from "../../session-read-api/__tests__/support.ts";
+import { sequencePreflight } from "../migrate-guards.ts";
+import { ADOPTABLE_INDEXES, MIGRATION_SENTINELS } from "../migration-sentinels.ts";
+import { plan, runMigrations, type MigrationClient, type MigrationProfile } from "../migrate.ts";
 
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -72,20 +75,20 @@ async function seed(db: PGlite, sessions: Session[]) {
   }
 }
 
-/** `n` sessions in ws-a, each with one agent `bulk-<i>`. */
-async function bulk(db: PGlite, n: number, from = 1) {
+/** `n` sessions in `workspace` (default ws-a) of org-a, each with one agent `bulk-<i>`. */
+async function bulk(db: PGlite, n: number, from = 1, workspace = "ws-a") {
   await db.query(
     `INSERT INTO sessions.session_directory
        (org_id, workspace_id, harness, session_id, created_at, last_activity_at, user_ids, agent_names, catalog_projected_at)
-     SELECT 'org-a', 'ws-a', 'codex', 'bulk-' || g, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '{}', ARRAY['bulk-' || g], now()
+     SELECT 'org-a', $3, 'codex', 'bulk-' || g, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '{}', ARRAY['bulk-' || g], now()
        FROM generate_series($1::int, $2::int) AS g`,
-    [from, from + n - 1],
+    [from, from + n - 1, workspace],
   );
   await db.query(
     `INSERT INTO sessions.session_directory_agents (org_id, workspace_id, harness, session_id, agent_name, agent_name_normalized, last_activity_at)
-     SELECT 'org-a', 'ws-a', 'codex', 'bulk-' || g, 'bulk-' || g, 'bulk-' || g, '2026-01-01T00:00:00Z'
+     SELECT 'org-a', $3, 'codex', 'bulk-' || g, 'bulk-' || g, 'bulk-' || g, '2026-01-01T00:00:00Z'
        FROM generate_series($1::int, $2::int) AS g`,
-    [from, from + n - 1],
+    [from, from + n - 1, workspace],
   );
 }
 
@@ -152,6 +155,9 @@ describe("list_session_directory_for, p_agent_match (20261105050020)", () => {
     await seed(db, FIXTURE);
     for (const [agent, match] of [["worker", "fuzzy"], ["worker", null], [null, "prefix"], ["wo", "prefix"], ["w  o", "prefix"]] as const)
       expect((await failure(asReadApi(db, () => list(db, agent, match))))?.code).toBe("22023");
+    // Other tenants' rows never count against the budget: 5001 matching rows in ws-b, none in ws-a.
+    await bulk(db, 5001, 1, "ws-b");
+    expect(await asReadApi(db, () => list(db, "bulk", "prefix"))).toEqual([]);
     // 5000 rows under the prefix are served; 5001 are refused.
     await bulk(db, 5000);
     expect((await asReadApi(db, () => list(db, "bulk", "prefix"))).length).toBe(51); // p_limit + 1
@@ -159,8 +165,25 @@ describe("list_session_directory_for, p_agent_match (20261105050020)", () => {
     const broad = await failure(asReadApi(db, () => list(db, "bulk", "prefix")));
     expect(broad?.code).toBe("54000");
     expect(broad?.message).toContain("agent_prefix_too_broad");
-    // Other tenants' rows never count against the budget.
+    // A prefix that is not broad still answers next to the bulk.
     expect(ids(await asReadApi(db, () => list(db, "worker", "prefix")))).toEqual(["s1", "s2"]);
+  }, 300_000);
+
+  test("the budget unit is (session, agent) rows, not distinct agents: one agent in 5001 sessions is too broad", async () => {
+    const db = await database();
+    await db.query(
+      `INSERT INTO sessions.session_directory
+         (org_id, workspace_id, harness, session_id, created_at, last_activity_at, user_ids, agent_names, catalog_projected_at)
+       SELECT 'org-a', 'ws-a', 'codex', 'one-' || g, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', '{}', ARRAY['busy-agent'], now()
+         FROM generate_series(1, 5001) AS g`,
+    );
+    await db.query(
+      `INSERT INTO sessions.session_directory_agents (org_id, workspace_id, harness, session_id, agent_name, agent_name_normalized, last_activity_at)
+       SELECT 'org-a', 'ws-a', 'codex', 'one-' || g, 'busy-agent', 'busy-agent', '2026-01-01T00:00:00Z' FROM generate_series(1, 5001) AS g`,
+    );
+    expect((await failure(asReadApi(db, () => list(db, "busy", "prefix"))))?.message).toContain("agent_prefix_too_broad");
+    // Exact match for that agent is not budgeted.
+    expect(await failure(asReadApi(db, () => list(db, "busy-agent", "exact")))).toBeNull();
   }, 300_000);
 
   test("the candidate budget walks the prefix index", async () => {
@@ -211,6 +234,127 @@ describe("list_session_directory_for, p_agent_match (20261105050020)", () => {
   }, 300_000);
 });
 
+describe("20261105050020 through the migrator: the prefix index is adoptable, the overload is not", () => {
+  const STEP = `upstream:${MIGRATION.split("/").at(-1)!}`;
+  const LOCAL: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: true, runtimeRole: "postgres" };
+  const DECL = ADOPTABLE_INDEXES[STEP]!;
+  function client(db: PGlite): MigrationClient {
+    return {
+      async query<R>(text: string, params?: unknown[]) {
+        if (params?.length) return (await db.query<R>(text, params)) as { rows: R[] };
+        const results = await db.exec(text);
+        return { rows: (results.at(-1)?.rows ?? []) as R[] };
+      },
+    };
+  }
+  /** Every migration before 050020 applied and ledgered through the real migrator; session_directory_agents populated. */
+  async function before050020(): Promise<PGlite> {
+    const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
+    open.push(db);
+    const all = (await plan(LOCAL)).filter((s) => !s.name.startsWith("verify:"));
+    const steps = all.filter((s) => s.name !== STEP);
+    expect(steps.length).toBe(all.length - 1);
+    await runMigrations(client(db), { profile: { ...LOCAL, verify: false }, steps });
+    await seed(db, FIXTURE);
+    return db;
+  }
+  const ledgered = async (db: PGlite) =>
+    (await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name = $1", [STEP])).rows[0]!.n === 1;
+  const indexState = async (db: PGlite) =>
+    (await db.query<{ oid: number; filenode: number; valid: boolean }>(
+      `SELECT c.oid::int AS oid, c.relfilenode::int AS filenode, i.indisvalid AS valid FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+        WHERE c.relnamespace = 'sessions'::regnamespace AND c.relname = '${INDEX}'`,
+    )).rows;
+  const applyFile = async (db: PGlite) => {
+    await db.exec("BEGIN");
+    try { await db.exec(read(MIGRATION)); await db.exec("COMMIT"); }
+    catch (error) { await db.exec("ROLLBACK"); throw error; }
+  };
+
+  test("the declaration is exactly the migration's c_def, byte for byte, and the inventory is the overload and the index only", () => {
+    expect(DECL).toHaveLength(1);
+    expect(DECL[0]!.name).toBe(INDEX);
+    expect(DECL[0]!.table).toBe("sessions.session_directory_agents");
+    expect(read(MIGRATION)).toContain(`c_def CONSTANT text:='${DECL[0]!.def}';`);
+    expect(MIGRATION_SENTINELS[STEP]!.sql).toContain("to_regprocedure");
+  });
+
+  test("populated table, no index, no opt-in: preflight passes, the migration refuses 55000 with the hint main honours; nothing ledgered", async () => {
+    const db = await before050020();
+    const error = await failure(runMigrations(client(db), { profile: LOCAL }));
+    expect(error?.code).toBe("55000");
+    expect(error?.message ?? "").toMatch(/refusing a blocking CREATE INDEX on a populated table/);
+    const raised = await failure(applyFile(db));
+    expect((raised as { hint?: string } | null)?.hint).toContain("HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true on the migrator");
+    expect(await ledgered(db)).toBe(false);
+    expect(await indexState(db)).toEqual([]);
+  }, 300_000);
+
+  test("populated table + HOOPDB_ALLOW_BLOCKING_INDEX_BUILD: the migrator builds it and ledgers", async () => {
+    const db = await before050020();
+    expect(await failure(runMigrations(client(db), { profile: { ...LOCAL, allowBlockingIndexBuild: true } }))).toBeNull();
+    expect(await ledgered(db)).toBe(true);
+    expect((await indexState(db)).map((r) => r.valid)).toEqual([true]);
+  }, 300_000);
+
+  test("an operator-built (CONCURRENTLY-style) exact index is adopted: preflight accepts it, the migrator ledgers, nothing rebuilt, no table lock", async () => {
+    const db = await before050020();
+    await db.exec(DECL[0]!.def);
+    const before = await indexState(db);
+    // The migration's own transaction takes no lock on the table.
+    await db.exec("BEGIN");
+    await db.exec(read(MIGRATION));
+    const locks = (await db.query<{ n: number }>(
+      "SELECT count(*)::int n FROM pg_locks WHERE locktype = 'relation' AND relation = 'sessions.session_directory_agents'::regclass::oid",
+    )).rows[0]!.n;
+    await db.exec("ROLLBACK");
+    expect(locks).toBe(0);
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    expect(await ledgered(db)).toBe(true);
+    expect(await indexState(db)).toEqual(before);
+    expect((await db.query(`SELECT to_regprocedure('${MATCH_SIG}') IS NOT NULL AS installed`)).rows).toEqual([{ installed: true }]);
+  }, 300_000);
+
+  for (const flag of ["indisvalid", "indisready"] as const)
+    test(`an exact index with ${flag}=false (a failed CONCURRENTLY build): preflight refuses unledgered_schema, the migration raises 55000, never dropped`, async () => {
+      const db = await before050020();
+      await db.exec(DECL[0]!.def);
+      await db.exec(`UPDATE pg_index SET ${flag} = false WHERE indexrelid = 'sessions.${INDEX}'::regclass`);
+      const before = await indexState(db);
+      const error = await failure(runMigrations(client(db), { profile: LOCAL }));
+      expect(error?.code).toBe("unledgered_schema");
+      expect(error?.message).toContain(`index ${INDEX} (${STEP})`);
+      const raised = await failure(applyFile(db));
+      expect(raised?.code).toBe("55000");
+      expect(raised?.message).toContain(`index sessions.${INDEX} is INVALID or not ready`);
+      expect(await indexState(db)).toEqual(before);
+      expect(await ledgered(db)).toBe(false);
+    }, 300_000);
+
+  test("a same-name index with another definition: preflight refuses, the migration raises 42P07", async () => {
+    const db = await before050020();
+    await db.exec(`CREATE INDEX ${INDEX} ON sessions.session_directory_agents (org_id, workspace_id, agent_name_normalized)`);
+    const error = await failure(runMigrations(client(db), { profile: LOCAL }));
+    expect(error?.code).toBe("unledgered_schema");
+    expect(error?.message).toContain(`index ${INDEX} (${STEP})`);
+    expect((await failure(applyFile(db)))?.code).toBe("42P07");
+    expect(await ledgered(db)).toBe(false);
+  }, 300_000);
+
+  test("the adoptable index never excuses the overload: an unledgered 17-argument function is still refused by the sentinel", async () => {
+    const db = await before050020();
+    await db.exec(DECL[0]!.def);
+    // The whole migration applied outside the migrator: index and overload present, no ledger row.
+    await applyFile(db);
+    expect(await ledgered(db)).toBe(false);
+    const steps = (await plan(LOCAL)).filter((s) => s.name === STEP);
+    const error = await failure(sequencePreflight(client(db), steps as never, new Map()));
+    expect(error?.code).toBe("unledgered_schema");
+    expect(error?.message).toContain(`sentinel ${MIGRATION_SENTINELS[STEP]!.evidence} (${STEP})`);
+    expect(error?.message).not.toContain(`index ${INDEX}`);
+  }, 300_000);
+});
+
 describe("READ_API_AGENT_MATCH", () => {
   test("on only for the exact string true", () => {
     expect(agentMatchEnabled(undefined)).toBe(false);
@@ -224,9 +368,10 @@ describe("READ_API_AGENT_MATCH", () => {
 });
 
 describe("GET /v1/sessions agent matching over the real functions", () => {
-  async function api(flag: boolean) {
+  async function api(flag: boolean, setup?: (db: PGlite) => Promise<void>) {
     const db = await database();
     await seed(db, FIXTURE);
+    if (setup) await setup(db);
     const statements: string[] = [];
     const pool = {
       async connect() {
@@ -247,14 +392,16 @@ describe("GET /v1/sessions agent matching over the real functions", () => {
       completeSinceMs: 0,
       directory: sqlDirectory(poolTenantRunner(pool)),
       directoryWorkspaces: new Set(["ws-a"]),
+      corsAllowedOrigins: new Set([ORIGIN]),
       ...(flag ? { agentMatch: true } : {}),
     });
     const get = async (query: string) => {
-      const r = await app.request(`/v1/sessions?workspace=ws-a&${query}`, { headers: { authorization: "Bearer t" } });
-      return { status: r.status, header: r.headers.get("x-sessions-read-agent-match"), body: (await r.json()) as Record<string, any> };
+      const r = await app.request(`/v1/sessions?workspace=ws-a&${query}`, { headers: { authorization: "Bearer t", origin: ORIGIN } });
+      return { status: r.status, header: r.headers.get("x-sessions-read-agent-match"), expose: r.headers.get("access-control-expose-headers"), body: (await r.json()) as Record<string, any> };
     };
     return { db, get, statements };
   }
+  const ORIGIN = "https://app.example.test";
   const sessionIds = (body: Record<string, any>) => body.sessions.map((s: { sessionId: string }) => s.sessionId);
 
   test("flag off: exact unchanged, agentMatch and a trailing * are 501 param_agentMatch", async () => {
@@ -266,6 +413,8 @@ describe("GET /v1/sessions agent matching over the real functions", () => {
       expect([r.status, r.body.error?.code ?? r.body.code, JSON.stringify(r.body)]).toMatchObject([501, expect.anything(), expect.stringContaining("param_agentMatch")]);
     }
     expect(statements.some((s) => s.includes("p_agent_match"))).toBe(false);
+    // CORS: flag off, the exposed headers are exactly main's.
+    expect(exact.expose).toBe("X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation");
   }, 300_000);
 
   test("flag on: exact, prefix by agentMatch and by *, header, and the 400s", async () => {
@@ -286,6 +435,26 @@ describe("GET /v1/sessions agent matching over the real functions", () => {
     ]) expect([q, (await get(q)).status]).toEqual([q, 400]);
     // Literal * never reaches SQL as a pattern: a name with an inner * is exact.
     expect((await get("agent=wo*rk")).status).toBe(200);
+    // The whole trailing run of * is stripped: abc** is the prefix abc; the remainder still needs 3 characters.
+    const stars = await get("agent=worker**");
+    expect([stars.status, stars.header, sessionIds(stars.body)]).toEqual([200, "prefix", ["s1", "s2"]]);
+    expect((await get("agent=worker%20*%20*")).status).toBe(200);
+    for (const q of ["agent=wo**", "agent=**", "agent=w%20**"]) expect([q, (await get(q)).status]).toEqual([q, 400]);
+    // CORS: flag on, the agent-match header is exposed to browsers.
+    expect(exact.expose).toBe("X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation, X-Sessions-Read-Agent-Match");
+  }, 300_000);
+
+  test("flag on, 050020's overload not installed: a prefix is 501 agent_match_not_migrated, exact still serves", async () => {
+    const { get } = await api(true, async (db) => {
+      await db.exec(`DROP FUNCTION ${MATCH_SIG}`);
+    });
+    for (const q of ["agent=work&agentMatch=prefix", "agent=worker*"]) {
+      const r = await get(q);
+      expect([q, r.status]).toEqual([q, 501]);
+      expect(JSON.stringify(r.body)).toContain("agent_match_not_migrated");
+    }
+    const exact = await get("agent=worker-one");
+    expect([exact.status, sessionIds(exact.body)]).toEqual([200, ["s1"]]);
   }, 300_000);
 
   test("flag on: a too-broad prefix is 400 agent_prefix_too_broad", async () => {

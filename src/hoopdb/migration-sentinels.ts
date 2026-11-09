@@ -41,6 +41,7 @@ export interface AdoptableIndex {
 
 const CLAIM_BOOTSTRAP_ORG_INDEXES_STEP =
   "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
+const AGENT_MATCH_STEP = "upstream:20261105050020_session_directory_agent_match.sql";
 const orgIndex = (table: string, columns: string): AdoptableIndex => ({
   name: `${table}_org_id_idx`,
   table: `sessions.${table}`,
@@ -50,7 +51,7 @@ const orgIndex = (table: string, columns: string): AdoptableIndex => ({
 /**
  * The reviewed allowance for indexes built out of band before the migration that names
  * them is ledgered (an operator CREATE INDEX CONCURRENTLY on a large production table:
- * the migrator is transactional and cannot build concurrently). For the step listed here,
+ * the migrator is transactional and cannot build concurrently). For the steps listed here,
  * and only for these names, sequencePreflight accepts a present-but-unledgered index when
  * it is the only index of that name, sits in sessions on exactly that table, is valid,
  * ready and live, and its pg_get_indexdef is exactly `def`. Anything else of that name is
@@ -72,6 +73,29 @@ export const ADOPTABLE_INDEXES: Readonly<Record<string, readonly AdoptableIndex[
     orgIndex("ingest_custody_records", "org_id, workspace_id, user_id"),
     orgIndex("ingest_lazy_native_slots", "org_id"),
   ],
+  // Agent-name prefix index, 20261105050020 (docs/agent-name-search-contract.md). That step also
+  // creates a function overload: see ADOPTABLE_STEP_OTHER_OBJECTS.
+  [AGENT_MATCH_STEP]: [
+    {
+      name: "session_directory_agents_prefix_idx",
+      table: "sessions.session_directory_agents",
+      def: "CREATE INDEX session_directory_agents_prefix_idx ON sessions.session_directory_agents USING btree (org_id, workspace_id, agent_name_normalized text_pattern_ops, last_activity_at DESC, session_id DESC, harness DESC)",
+    },
+  ],
+};
+
+/**
+ * The reviewed non-index inventory of an adoptable step (keys as `kind:name`). By default the
+ * allowance holds only while a step's whole CREATE inventory is its declared indexes; a step listed
+ * here may also inventory exactly these objects. They get no allowance of their own: each is still
+ * checked as usual, and the step's own catalog sentinel (not the declared-index sentinel) still
+ * decides whether the step already ran, so an unledgered copy of what it creates is still refused.
+ *
+ * 20261105050020: its inventory names sessions.list_session_directory_for (the 17-argument overload;
+ * the inventory is by name, which 20261105034000 owns); its sentinel is that exact overload.
+ */
+export const ADOPTABLE_STEP_OTHER_OBJECTS: Readonly<Record<string, readonly string[]>> = {
+  [AGENT_MATCH_STEP]: ["function:sessions.list_session_directory_for"],
 };
 
 /** Read-only: one row, `e`, true when `$1` is an adoptable copy of the declared index ($1 name, $2 table, $3 def). */
@@ -269,7 +293,8 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "twelve search_consumer_runtime EXECUTEs (composed writer path)",
     sql: "SELECT count(*) = 12 AS applied FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE n.nspname = 'sessions' AND r.rolname = 'search_consumer_runtime' AND a.privilege_type = 'EXECUTE'",
   },
-  "upstream:20261105050020_session_directory_agent_match.sql": {
+  // Adoptable index, but not an index-only step: this sentinel (the overload) decides, see ADOPTABLE_STEP_OTHER_OBJECTS.
+  [AGENT_MATCH_STEP]: {
     evidence: "CREATE FUNCTION: sessions.list_session_directory_for(..., integer, text) (agent_match overload)",
     sql: "SELECT to_regprocedure('sessions.list_session_directory_for(text, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, text[], text[], timestamptz, text, text, integer, text)') IS NOT NULL AS applied",
   },

@@ -125,7 +125,7 @@ export interface MigrationProfile {
   /**
    * HOOPDB_ALLOW_BLOCKING_INDEX_BUILD (default off): lets an index migration run a blocking
    * CREATE INDEX on a populated table instead of refusing. Bound per migration transaction as
-   * hoopdb.allow_blocking_index_build (on/off); read by 20261105044020.
+   * hoopdb.allow_blocking_index_build (on/off); read by 20261105044020 and 20261105050020.
    */
   allowBlockingIndexBuild?: boolean;
 }

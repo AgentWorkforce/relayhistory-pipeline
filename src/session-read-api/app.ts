@@ -454,7 +454,11 @@ export function createReadApi(deps: ReadApiDeps) {
       c.header("Vary", "Origin");
       if (allowed) {
         c.header("Access-Control-Allow-Origin", origin);
-        c.header("Access-Control-Expose-Headers", "X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation, X-Sessions-Read-Agent-Match");
+        // X-Sessions-Read-Agent-Match only with READ_API_AGENT_MATCH on: flag off, the CORS answer is unchanged.
+        c.header(
+          "Access-Control-Expose-Headers",
+          `X-Correlation-Id, X-Relayhistory-Workspace-Id, X-Sessions-Read-Continuation${deps.agentMatch ? ", X-Sessions-Read-Agent-Match" : ""}`,
+        );
       }
       if (c.req.method === "OPTIONS") {
         if (allowed) {
@@ -903,7 +907,9 @@ export function createReadApi(deps: ReadApiDeps) {
       if (users.length > MAX_LIST_USERS) throw bad(`user accepts at most ${MAX_LIST_USERS} values`);
       if (users.some((u) => u.length > MAX_LIST_ID_LENGTH)) throw bad(`user must be ${MAX_LIST_ID_LENGTH} characters or fewer`);
       let agent = single(c, "agent")?.trim();
-      // READ_API_AGENT_MATCH: `agentMatch=exact|prefix`, or one trailing `*` on agent for prefix.
+      // READ_API_AGENT_MATCH: `agentMatch=exact|prefix`, or a trailing `*` on agent for prefix. The whole
+      // trailing run of `*` (and whitespace between them) is stripped, so `abc**` is the prefix `abc`, never
+      // the literal `abc*`; what remains must still meet the prefix minimum.
       const rawMatch = c.req.queries("agentMatch");
       const star = agent?.endsWith("*") ?? false;
       let agentMatch: "exact" | "prefix" | undefined;
@@ -914,7 +920,7 @@ export function createReadApi(deps: ReadApiDeps) {
         if (m !== undefined && m !== "exact" && m !== "prefix") throw bad("agentMatch must be exact or prefix");
         if (star) {
           if (m === "exact") throw bad("agentMatch=exact contradicts a trailing * on agent");
-          agent = agent!.slice(0, -1).trim();
+          agent = agent!.replace(/[*\s]+$/u, "");
         }
         agentMatch = star ? "prefix" : (m as "exact" | "prefix" | undefined);
         if (agentMatch && !agent) throw bad("agentMatch needs an agent");
