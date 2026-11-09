@@ -227,8 +227,7 @@ describe.skipIf(!url)("044040 buffered stages latency on actual PostgreSQL", () 
     expect(rows[0]).toEqual({ outbox: n + 1, claims: n + 1 });
   });
 
-  test("the session-first stg drives from the records GIN", async () => {
-    const { rows } = await db.query<{ "QUERY PLAN": unknown }>(`EXPLAIN (FORMAT JSON)
+  const stgPlanSql = (session: string) => `EXPLAIN (FORMAT JSON)
       SELECT s.stage_token
         FROM sessions.ingest_claim_attempts AS a
         JOIN sessions.ingest_stage_intents AS s ON a.claim_token = s.claim_token
@@ -236,9 +235,12 @@ describe.skipIf(!url)("044040 buffered stages latency on actual PostgreSQL", () 
         JOIN sessions.ingest_batches AS b
           ON b.org_id = o.org_id AND b.workspace_id = o.workspace_id AND b.origin_id = o.origin_id AND b.batch_id = o.batch_id
        WHERE jsonb_typeof(a.records) = 'array'
-         AND a.records @> jsonb_build_array(jsonb_build_object('source', 'claude', 'session_id', 'sess-7'))
+         AND a.records @> jsonb_build_array(jsonb_build_object('source', 'claude', 'session_id', '${session}'))
          AND o.org_id = '${TENANT.orgId}' AND o.workspace_id = '${TENANT.workspaceId}'
-         AND o.user_id = '${TENANT.userId}' AND o.state = 'buffered'`);
+         AND o.user_id = '${TENANT.userId}' AND o.state = 'buffered'`;
+
+  test("the session-first stg drives from the records GIN", async () => {
+    const { rows } = await db.query<{ "QUERY PLAN": unknown }>(stgPlanSql("sess-7"));
     const plan = JSON.stringify(rows[0]!["QUERY PLAN"]);
     console.log(`[044040 latency] stg plan uses ${GIN}: ${plan.includes(GIN)}`);
     expect(plan).toContain(GIN);
@@ -264,6 +266,26 @@ describe.skipIf(!url)("044040 buffered stages latency on actual PostgreSQL", () 
         expect(r.p95).toBeLessThan(1_000);
       }
     }, 600_000);
+
+  for (const generic of [false, true])
+    test(`no-GIN control: one session's stages with ${GIN} dropped (${generic ? "plan_cache_mode = force_generic_plan" : "default plan cache"}); logged, not asserted`, async () => {
+      await db.query(`DROP INDEX sessions.${GIN};`);
+      try {
+        const { rows } = await db.query<{ "QUERY PLAN": unknown }>(stgPlanSql("sess-7"));
+        const root = (rows[0]!["QUERY PLAN"] as Array<{ Plan: { "Node Type": string } }>)[0]!.Plan;
+        const plan = JSON.stringify(rows[0]!["QUERY PLAN"]);
+        const scans = [...plan.matchAll(/"Node Type":"((?:Seq|Index|Index Only|Bitmap Heap|Bitmap Index) Scan)"(?:[^{}]*?"Index Name":"([^"]+)")?/g)]
+          .map((m) => m[2] ? `${m[1]} ${m[2]}` : m[1]);
+        console.log(`[044040 latency] no-GIN stg plan uses ${GIN}: ${plan.includes(GIN)}; top node ${root["Node Type"]}; scans ${scans.join(", ")}`);
+        for (const session of ["sess-7", "sess-0"]) {
+          const r = await series<{ batch_id: string; kept_ordinals: number[] }>(STAGES_SQL, [TENANT.workspaceId, session, ...head], CALLS, generic, 240_000);
+          console.log(`[044040 latency] no-GIN buffered_session_stages_for ${session} ${generic ? "generic" : "default"}: ${r.rows.length} stages; ` +
+            `cold ${r.cold} ms; warm n=${r.warm.length} p50 ${r.p50} ms p95 ${r.p95} ms max ${Math.round(Math.max(...r.warm))} ms (backlog ${n + 1})`);
+        }
+      } finally {
+        await db.query(`CREATE INDEX ${GIN} ON sessions.ingest_claim_attempts USING gin (records jsonb_path_ops)`);
+      }
+    }, 900_000);
 
   for (const generic of [false, true])
     test(`the list: full call, cold + warm (${generic ? "force_generic_plan" : "default plan cache"}); linear in the backlog, logged, not asserted`, async () => {
