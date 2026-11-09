@@ -1,4 +1,5 @@
-/** The feed RPCs (supabase/migrations/20261105043870_buffered_search_feed_cursor.sql) on every migration in PGlite. */
+/** The feed RPCs (supabase/migrations/20261105043870_buffered_search_feed_cursor.sql, stage replaced by
+ *  20261105045010_buffered_search_feed_same_second.sql) on every migration in PGlite. */
 import {orderedFixtureLedger,initializeFixtureSeatClock} from "../../session-ingest/__tests__/ordered-support.ts";
 import {afterEach,expect,setDefaultTimeout,test} from "bun:test";
 import {readFileSync,readdirSync} from "node:fs";
@@ -39,7 +40,8 @@ async function fixture(){
  const ledger=orderedFixtureLedger(sqlLedger(((s:string,p:unknown[])=>as("bulls96_session_ingest",s,p)) as never,{acceptanceMode:"buffered",expectedGeneration:generation}),db as never);
  let serial=0;
  /** buffer-gc.pglite.test.ts's owner fixture: ordinal 0 in session "gone", 1 in "live", 2 no session. */
- async function stage(opts:{ack?:boolean;createdAt?:string}={}){
+ async function stage(opts:{ack?:boolean;createdAt?:string;userId?:string;originId?:string}={}){
+  const tenant={orgId:"org-a",workspaceId:"ws-a",userId:opts.userId??"user-a"},origin=opts.originId??"origin-a";
   await db.query("SELECT sessions.ingest_lock_fences($1,$2,$3)",[tenant.orgId,tenant.workspaceId,tenant.userId]);
   const batch="batch-"+(++serial),claim=randomUUID(),token=randomUUID(),digest=hash(batch),sha=hash(token);
   const key="96bulls/org-a/buffered-batches/v1/ws=ws-a/m=srv_"+"f".repeat(32)+"/b="+hash(digest).slice(0,32)+"-"+sha.slice(0,16)+"-"+hash(claim).slice(0,32)+".staged.ndjson.zst";
@@ -69,7 +71,7 @@ async function fixture(){
   }finally{await db.exec("SET SESSION AUTHORIZATION postgres")}
  };
  const feeder={query:(text:string,params?:unknown[])=>login(FEED_ROLE,text,params) as never};
- return {db,as,login,stage,disable,source:sqlBufferedFeedSource(feeder)};
+ return {db,as,login,stage,disable,source:sqlBufferedFeedSource(feeder),strict:sqlBufferedFeedSource(feeder,{secondVersion:true})};
 }
 
 test("page lists only acknowledged, live, active stages after the cursor, in keyset order; advance is monotonic",async()=>{
@@ -158,4 +160,83 @@ test("only the genuine buffered_search_feed_runtime login may call the feed RPCs
   await expect(f.login(role,"SELECT * FROM sessions.buffered_search_feed_cursors")).rejects.toMatchObject({code:"42501"});
   await expect(f.login(role,"SELECT * FROM sessions.ingest_stage_intents")).rejects.toMatchObject({code:"42501"});
  }
+});
+
+test("stage sameSecond: siblings of one (org, workspace, origin, user) in one floor-second, every cleanup state, expired preparing excluded",async()=>{
+ const f=await fixture();
+ const ss=async(token:string)=>(await f.strict.stage({stageToken:token})).sameSecond;
+ const a=await f.stage({createdAt:"2026-11-06T00:00:00.100000Z"});
+ expect(await ss(a.token)).toEqual({siblings:0,pending:0});
+ // The next second, and the last microsecond of the previous one, are not this second.
+ const next=await f.stage({createdAt:"2026-11-06T00:00:01.000000Z"});
+ await f.stage({createdAt:"2026-11-05T23:59:59.999999Z"});
+ expect(await ss(a.token)).toEqual({siblings:0,pending:0});
+ expect(await ss(next.token)).toEqual({siblings:0,pending:0});
+ // Same tuple, same second: both see the other.
+ const b=await f.stage({createdAt:"2026-11-06T00:00:00.999999Z"});
+ expect(await ss(a.token)).toEqual({siblings:1,pending:0});
+ expect(await ss(b.token)).toEqual({siblings:1,pending:0});
+ expect((await f.strict.stage({stageToken:b.token})).stage?.createdAt).toBe("2026-11-06T00:00:00.999999Z");
+ // A different user or origin in that second is not a sibling.
+ await f.stage({createdAt:"2026-11-06T00:00:00.500000Z",userId:"user-b"});
+ await f.stage({createdAt:"2026-11-06T00:00:00.500000Z",originId:"origin-b"});
+ expect(await ss(a.token)).toEqual({siblings:1,pending:0});
+ // Unexpired preparing: a pending sibling (counted in siblings too); once expired it is gone, not counted.
+ const p=await f.stage({createdAt:"2026-11-06T00:00:00.200000Z",ack:false});
+ expect(await ss(a.token)).toEqual({siblings:2,pending:1});
+ await f.db.query("UPDATE sessions.ingest_stage_intents SET expires_at=clock_timestamp()-interval '1 second' WHERE stage_token=$1",[p.token]);
+ expect(await ss(a.token)).toEqual({siblings:1,pending:0});
+ // Retired and redacted siblings still count (intents are never deleted: the tie is permanent).
+ await f.db.query("UPDATE sessions.ingest_stage_intents SET cleanup_state='retired' WHERE stage_token=$1",[b.token]);
+ expect(await ss(a.token)).toEqual({siblings:1,pending:0});
+ await f.db.query("UPDATE sessions.ingest_stage_intents SET cleanup_state='redacted' WHERE stage_token=$1",[b.token]);
+ expect(await ss(a.token)).toEqual({siblings:1,pending:0});
+ // GC lineage: a replacement of the same batch created in the same second as its (now retired) parent.
+ const g=await f.stage({createdAt:"2026-11-06T00:00:05.000000Z"});
+ const child=randomUUID();
+ await f.db.query(`INSERT INTO sessions.ingest_stage_intents(stage_token,claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,stage_key,stage_sha256,stage_bytes,group_ordinals,reset_epoch,receipt_state,expires_at,created_at,parent_stage_token)
+  SELECT $1,claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,stage_key||'-r',stage_sha256,stage_bytes,group_ordinals,reset_epoch,'acknowledged',expires_at,created_at+interval '300 milliseconds',stage_token
+  FROM sessions.ingest_stage_intents WHERE stage_token=$2`,[child,g.token]);
+ await f.db.query("UPDATE sessions.ingest_stage_intents SET cleanup_state='retired' WHERE stage_token=$1",[g.token]);
+ expect(await ss(child)).toEqual({siblings:1,pending:0});
+ // The legacy (flag off) source neither requires nor surfaces the key.
+ expect("sameSecond" in await f.source.stage({stageToken:a.token})).toBe(false);
+ // Not found: unchanged, no sameSecond key.
+ expect(await f.strict.stage({stageToken:randomUUID()})).toEqual({found:false,status:"gone",reason:"stage_absent",retained:[]});
+});
+
+test("rollback restores 043870's stage function exactly; the strict source then refuses with sql_same_second_unavailable",async()=>{
+ const f=await fixture();
+ const read=(path:string)=>readFileSync(join(root,path),"utf8");
+ const prosrc=async()=>(await f.db.query<{src:string;secdef:boolean;acl:string}>("SELECT prosrc AS src,prosecdef AS secdef,proacl::text AS acl FROM pg_proc WHERE oid='sessions.buffered_search_feed_stage(jsonb)'::regprocedure")).rows[0]!;
+ const applied=await prosrc();
+ expect(applied.src).toContain("'sameSecond'");
+ const name="upstream:20261105045010_buffered_search_feed_same_second.sql";
+ const sha=hash(read("supabase/migrations/20261105045010_buffered_search_feed_same_second.sql"));
+ await f.db.exec("CREATE TABLE IF NOT EXISTS sessions.__96bulls_migrations(name text PRIMARY KEY,sha256 text NOT NULL,applied_at timestamptz NOT NULL DEFAULT now())");
+ const down=read("supabase/rollbacks/20261105045010_buffered_search_feed_same_second.down.sql");
+ const code=(p:Promise<unknown>)=>p.then(()=>"ok",async(e:any)=>{await f.db.exec("ROLLBACK").catch(()=>{});return e?.code});
+ // Not applied with this checksum, or a later migration applied: refused, nothing changed.
+ expect(await code(f.db.exec(down))).toBe("55000");
+ await f.db.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES($1,'x')",[name]);
+ expect(await code(f.db.exec(down))).toBe("55000");
+ await f.db.query("UPDATE sessions.__96bulls_migrations SET sha256=$1 WHERE name=$2",[sha,name]);
+ await f.db.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES('upstream:20261105099999_later.sql','x')");
+ expect(await code(f.db.exec(down))).toBe("55000");
+ expect((await prosrc()).src).toBe(applied.src);
+ await f.db.query("DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105099999_later.sql'");
+ expect(await code(f.db.exec(down))).toBe("ok");
+ // 043870's body, byte for byte; owner, SECURITY DEFINER and ACL as before.
+ const original=read("supabase/migrations/20261105043870_buffered_search_feed_cursor.sql").match(/CREATE FUNCTION sessions\.buffered_search_feed_stage\(p jsonb\)[\s\S]*?AS \$stage\$([\s\S]*?)\$stage\$/)![1];
+ const after=await prosrc();
+ expect(after.src).toBe(original!);
+ expect(after.secdef).toBe(true);
+ expect(after.acl).toBe(applied.acl);
+ expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.__96bulls_migrations WHERE name=$1",[name])).rows[0]).toEqual({n:0});
+ const s=await f.stage();
+ expect("sameSecond" in await f.source.stage({stageToken:s.token})).toBe(false);
+ await expect(f.strict.stage({stageToken:s.token})).rejects.toMatchObject({code:"sql_same_second_unavailable"});
+ // Re-applying the migration restores the key (CREATE OR REPLACE, idempotent).
+ await f.db.exec(read("supabase/migrations/20261105045010_buffered_search_feed_same_second.sql"));
+ expect((await f.strict.stage({stageToken:s.token})).sameSecond).toEqual({siblings:0,pending:0});
 });
