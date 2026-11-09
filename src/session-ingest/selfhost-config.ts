@@ -10,6 +10,10 @@
  *                                    unset | "" | "false" (default: off) | exactly "true"; anything else is a
  *                                    startup error. Serves POST /v1/delivery/sessions/selection with enabled:false
  *                                    (per-session erase) and needs migration 043910 applied.
+ *   RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT
+ *                                    unset | "" | "false" (default: off, the route answers 501) | exactly "true";
+ *                                    anything else is a startup error. Serves POST /v1/onboarding/heartbeat as an
+ *                                    authenticated (rth:sync) 204 that discards the body: nothing is stored or logged.
  *   SESSION_ERASE_API_ENABLED        operator per-session erase route (session-erase.ts): exactly "1" enables;
  *                                    unset, "" or "0" is off; anything else is a startup error. With it,
  *                                    SESSION_ERASE_API_SECRET (+ _PREVIOUS during a rotation; Secret-injected, min
@@ -58,6 +62,7 @@ import { sessionEraseConfig, type SessionEraseConfig } from "./session-erase.ts"
 export const SELFHOST_INGEST_FLAG = "RELAYHISTORY_SELFHOST_INGEST";
 export const SELFHOST_INGEST_PORT_VAR = "RELAYHISTORY_INGEST_PORT";
 export const SELFHOST_SESSION_SELECTION_FLAG = "RELAYHISTORY_SELFHOST_SESSION_SELECTION";
+export const SELFHOST_HEARTBEAT_ACCEPT_FLAG = "RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT";
 export const SELFHOST_INGEST_ORIGIN_VAR = "RELAYHISTORY_INGEST_ORIGIN";
 export const SELFHOST_INGEST_DATABASE_URL_VAR = "RELAYHISTORY_INGEST_DATABASE_URL";
 export const SELFHOST_INGEST_POOL_MAX_VAR = "RELAYHISTORY_INGEST_PG_POOL_MAX";
@@ -88,6 +93,8 @@ export interface SelfhostIngestSettings {
   maxPerOrg: number;
   /** RELAYHISTORY_SELFHOST_SESSION_SELECTION: serve the per-session erase route. Default off. */
   sessionSelection: boolean;
+  /** RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT: answer the Desktop's onboarding heartbeat 204 (discarded). Default off. */
+  heartbeatAccept: boolean;
   /** SESSION_ERASE_API_ENABLED (session-erase.ts). Default: disabled, the route answers 501. */
   sessionErase: SessionEraseConfig;
   /** Present only for SELFHOST_INGEST_ADMISSION=async|drain. */
@@ -110,6 +117,14 @@ export function selfhostSessionSelectionEnabled(env: NodeJS.ProcessEnv = process
   if (raw === undefined || raw === "" || raw === "false") return false;
   if (raw === "true") return true;
   throw new Error(`96bulls: ${SELFHOST_SESSION_SELECTION_FLAG} must be true or false`);
+}
+
+/** Exactly "true" enables; unset, empty or "false" is off; anything else throws (a typo never silently means either). */
+export function selfhostHeartbeatAcceptEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[SELFHOST_HEARTBEAT_ACCEPT_FLAG];
+  if (raw === undefined || raw === "" || raw === "false") return false;
+  if (raw === "true") return true;
+  throw new Error(`96bulls: ${SELFHOST_HEARTBEAT_ACCEPT_FLAG} must be true or false`);
 }
 
 function port(env: NodeJS.ProcessEnv): number {
@@ -186,6 +201,7 @@ function refuseHostedOnly(env: NodeJS.ProcessEnv): void {
 export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): SelfhostIngestConfig {
   if (!selfhostIngestEnabled(env)) return { enabled: false, port: port(env) };
   const sessionSelection = selfhostSessionSelectionEnabled(env);
+  const heartbeatAccept = selfhostHeartbeatAcceptEnabled(env);
   const sessionErase = sessionEraseConfig(env);
   const policy = destinationPolicy(env);
   refuseHostedOnly(env);
@@ -215,6 +231,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     maxPerUser: bounded(env, "INGEST_MAX_PER_USER", 4, 1, 1000),
     maxPerOrg: bounded(env, "INGEST_MAX_PER_ORG", 32, 1, 1000),
     sessionSelection,
+    heartbeatAccept,
     sessionErase,
     ...(admission ? { admission } : {}),
   };

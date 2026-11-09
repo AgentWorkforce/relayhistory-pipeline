@@ -590,7 +590,11 @@ export function createReadApi(deps: ReadApiDeps) {
    * the token carries a user, and the token's workspace is on both READ_API_DIRECTORY_WORKSPACES
    * and the owner-buffered canary allowlist READ_API_OWNER_BUFFERED_WORKSPACES (each "*" or
    * listing it; unset/empty = none). Otherwise undefined and the caller's route runs exactly as
-   * without the flag.
+   * without the flag. With READ_API_OWNER_BUFFERED_INDEX_VERIFY=on the deps carry indexCheck, and
+   * every gated read (owner-buffered.ts) proves ingest_buffer_outbox_user_buffered_idx first: not
+   * proven is a BufferedFenced before any candidate (detail routes answer as without the flag,
+   * logged buffered_unverified; the list is fenced), with error_code index_missing, index_invalid or
+   * index_unverified.
    */
   function ownerBufferedFor(identity: VerifiedIdentity): OwnerBufferedDeps | undefined {
     const ob = deps.ownerBuffered;
@@ -910,7 +914,8 @@ export function createReadApi(deps: ReadApiDeps) {
    * ("canonical wins"; pointers decide nothing else). The cursor carries both positions.
    * Buffered rows come only through readOwnerBufferedList (authority observed before the RPC
    * and again after the RPC and the live-pointer await, immediately before emit); a row whose admission fails the final head advances the buffered position but is
-   * never shown. Fenced: the canonical page alone with X-Relayhistory-Buffered: fenced. Any
+   * never shown. Fenced (including the READ_API_OWNER_BUFFERED_INDEX_VERIFY index check, error_code
+   * index_*): the canonical page alone with X-Relayhistory-Buffered: fenced. Any
    * other buffered failure: the canonical page alone, logged `buffered_list_error`. A row of
    * another user is a 500.
    */

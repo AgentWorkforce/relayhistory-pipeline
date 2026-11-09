@@ -97,7 +97,7 @@ no rewriting.
 | 2 | `GET /v1/delivery/records` (exact) | session-read-api | babysitter evidence. It must win over rule 4. Default 501 `delivery_records_not_configured` |
 | 3 | `GET /v1/sessions`, `/v1/sessions/*`, `GET /v1/events`, `GET /v1/digest/*` | session-read-api | read routes; read-api answers non-GET with 405 |
 | 4 | `/v1/delivery/*`, `/v1/turns/*` | session-ingest | `POST /v1/delivery/batches`, `GET /v1/delivery/limits`, `POST /v1/delivery/recovery`, `POST /v1/delivery/sessions/{selection,reset}`, `POST /v1/turns/batches` |
-| 5 | `/v1/onboarding/*` | session-ingest | `POST /v1/onboarding/heartbeat`, `GET /v1/onboarding/connection` |
+| 5 | `/v1/onboarding/*` | session-ingest | `POST /v1/onboarding/heartbeat`, `GET /v1/onboarding/connection`. Self-host: the heartbeat answers 204 (body discarded, `rth:sync`) only with `RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT=true`, otherwise 501; `connection` is always 501 |
 | 5a | `POST /v1/auth/token/refresh` (exact) | session-ingest | always 401 `refresh_not_supported`. Required: without it the Desktop's refresh gets this table's 404, which it treats as an outage, and uploads stop when the token expires |
 | 6 | anything else, including `/healthz`, `/readyz`, `/health`, `/v1/custody/*`, `/internal/*` | **none (404 at the edge)** | probes, custody and operator routes are internal |
 
@@ -130,26 +130,47 @@ History origin. A read bearer or login token is introspected with
 `wrong_audience` or `unauthorized`. One origin means one audience, and the
 session-ingest service must check the same value.
 
-Read-api auth env:
+Read-api auth env, one of three `READ_API_AUTH_MODE` settings
+(`src/session-read-api/lambda.ts` `readApiAuthMode`; errors name variables,
+never values):
 
-- `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true`
-- `RELAYCONTROL_INTROSPECT_URL`, which passes the transport rule
-  (`ALLOW_IN_CLUSTER_HTTP`)
-- `RELAYCONTROL_INTROSPECT_SECRET`, injected from the secret store
+- **Native (Control issues read sessions): `READ_API_AUTH_MODE=self_issued`.**
+  The read API serves only its own opaque `rth_at_read_` tokens
+  (`src/session-read-api/self-issued.ts`, hash rows from migration 044000,
+  `aud = READ_API_ORIGIN`). relaycontrol's `POST /api/v1/workspaces/{ws}/relayhistory/session`
+  in `RELAYHISTORY_BACKEND=native` mode decides membership and calls
+  `POST /internal/v1/session-read/sessions` (and `/refresh`) over the in-cluster
+  Service URL with `READ_API_INTERNAL_SECRET` (relaycontrol's
+  `SESSION_READ_API_SECRET`). This mode refuses `RELAYAUTH_JWKS_URL`,
+  `RELAYAUTH_ISSUER`, `RELAYCONTROL_INTROSPECT_URL`,
+  `RELAYCONTROL_INTROSPECT_SECRET`, `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS`
+  and `RELAYHISTORY_SELFHOST_LOGIN_ADVERTISES_SYNC` at startup: the read API
+  never calls Control or RelayAuth, and `POST /v1/cli/login` is not registered
+  (`RELAYHISTORY_SELFHOST_READ_API=true` then adds only the catalog route). No
+  RelayAuth anywhere. This is the self-host target (lead-desktop, 2026-11-09).
+- **Control-proxied reads: `READ_API_AUTH_MODE=relaycontrol_only`.** Only
+  relaycontrol `sh_at_` bearers, introspected at `RELAYCONTROL_INTROSPECT_URL`
+  (transport rule `ALLOW_IN_CLUSTER_HTTP`) with `RELAYCONTROL_INTROSPECT_SECRET`
+  and `aud = READ_API_ORIGIN`; needs `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true`
+  and refuses the `RELAYAUTH_*` variables. No JWKS is fetched and every other
+  bearer is 401 without an outbound call. With `RELAYHISTORY_SELFHOST_READ_API=true`
+  this mode also registers `POST /v1/cli/login` (pass-through exchange of the
+  `sh_at_` token, `docs/session-read-api-design.md` section 2a).
+- **Default (unset): the hosted dual path.** `sh_at_` tokens through
+  relaycontrol when `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true`, every other
+  bearer through the RelayAuth JWKS verifier (hosted defaults when
+  `RELAYAUTH_JWKS_URL` and `RELAYAUTH_ISSUER` are unset). This is the only mode
+  that still trusts RelayAuth; a self-host install uses one of the two above.
 
-There is no switch to turn RelayAuth verification off. With `RELAYAUTH_JWKS_URL`
-and `RELAYAUTH_ISSUER` unset, the verifier falls back to the hosted RelayAuth
-defaults (`lambda.ts` `readApiAuthConfig`). Those tokens are still bound to
-`aud = READ_API_ORIGIN`, so the hosted issuer would have to mint one for this
-self-host origin. This is a residual trust in hosted RelayAuth. A self-host
-that wants Control as its only authority needs a read-api change. This PR does
-not make it.
-
-**Known gap.** The `/v1/cli/login` response advertises only `rth:read`
-(`docs/session-read-api-design.md` section 2a), so relaycontrol refuses
-`mode=sync` against this origin. A single origin that also syncs needs the
-login to advertise `rth:sync` when an ingest is configured. That is a
-read-api change, not made here.
+**`rth:sync` on one origin.** In native mode relaycontrol's `mode=sync` answer
+hands the Desktop its own `sh_at_` token as the upload bearer with `baseUrl` =
+this public origin; the session-ingest service (section 3) introspects it on
+every request and requires the granted `rth:sync` scope. No read-api setting is
+involved. Only the `relaycontrol_only` + `/v1/cli/login` path has the login
+reply advertise scopes: there, `RELAYHISTORY_SELFHOST_LOGIN_ADVERTISES_SYNC=true`
+(Pattern A, default off, `docs/session-ingest-design.md`) adds `rth:sync` to the
+reply when introspection granted it; without it relaycontrol refuses
+`mode=sync` against this origin.
 
 ## 3. session-ingest contract
 
@@ -163,8 +184,17 @@ the original sketch below in four ways:
 - Port: it listens on `RELAYHISTORY_INGEST_PORT`, default 8081, not 8090.
 - Audience: introspection uses `aud = RELAYHISTORY_INGEST_ORIGIN`.
 - Served routes: only `POST /v1/delivery/batches`, `POST /v1/turns/batches`
-  and `GET /v1/delivery/limits`.
-- Not served yet: recovery, reset and onboarding answer 501
+  and `GET /v1/delivery/limits`. The limits answer adds `sessionDeletion: false`
+  and `sessionReset: false` at the top level (next to `maxRecords`,
+  `maxRequestBytes` and `contentEncodings`), so the Desktop hides its delete and
+  reset controls; the hosted answer is unchanged.
+- Onboarding heartbeat: `POST /v1/onboarding/heartbeat` (the Desktop's
+  best-effort upload progress) answers 501 by default. With
+  `RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT=true` (default off) it answers 204
+  with no body after the same introspection and `rth:sync` check; the body is
+  discarded (a body over 8 KiB is not read and the connection closes), never
+  stored or logged.
+- Not served yet: recovery, reset and the rest of onboarding answer 501
   `unsupported_by_backend`. Selection answers 501 too, unless
   `RELAYHISTORY_SELFHOST_SESSION_SELECTION=true` (default off; needs migration
   043910): then `enabled:false` is the per-session erase, one transaction that
@@ -266,7 +296,7 @@ off; anything else, `true` included, fails startup).
 | --- | --- | --- | --- |
 | `session-read-api` | `RELAYHISTORY_SELFHOST_READ_API` | `READ_API_ORIGIN`, `READ_API_COMPLETE_SINCE` (ISO or `epoch`), `READ_API_DIRECTORY_WORKSPACES` (canary allowlist; login answers 501 for an unlisted workspace), `SEARCH_INDEX_BACKEND` (`postgres`), `SEARCH_INDEX_POSTGRES_BACKEND_ID`, `SESSION_POSTGRES_TLS_PROFILE`, the relaycontrol trio in section 2, optional `ALLOW_IN_CLUSTER_HTTP`, `RELAYHISTORY_READ_API_PORT` | `RELAYHISTORY_READ_API_SECRET` (JSON `{supabase_url}`; no `clickhouse` with `postgres`), `RELAYCONTROL_INTROSPECT_SECRET` |
 | `session-publication` | `INGEST_PUBLISH_ENABLED` | `INGEST_PUBLISH_{BUCKET,EXPECT_GENERATION,AWS_ACCOUNT_ID,SUPABASE_PROJECT_REF,INSTANCE_ID,SECRET_ARN,KMS_KEY_ARN,INSTANCE_PROFILE_ARN,ROLE_NAME}`, `AWS_REGION=us-east-1`, `HOOPDB_DB_MODE=supabase`, optional `INGEST_PUBLISH_BUDGET_MS`, `INGEST_PUBLISH_BATCH_LIMIT`, `WORKER_HEALTH_PORT` | none in env: IMDSv2 plus Secrets Manager (see the caveat in section 1) |
-| `session-ingest` | `RELAYHISTORY_SELFHOST_INGEST` | `RELAYHISTORY_INGEST_ORIGIN`, `RELAYCONTROL_INTROSPECT_URL`, `RELAYHISTORY_INGEST_DATABASE_URL`, `SESSION_POSTGRES_TLS_PROFILE`, `LOCKER_BUCKET` (+ Locker endpoint/region or Pod Identity/GCS), optional `RELAYHISTORY_INGEST_PORT`, `INGEST_KEY_ROOT`, `INGEST_MAX_PER_USER`, `INGEST_MAX_PER_ORG`, `RELAYHISTORY_INGEST_PG_POOL_MAX`, `ALLOW_IN_CLUSTER_HTTP`, `SELFHOST_INGEST_ADMISSION` (`sync` default, `async`, `drain`) with `SELFHOST_ADMISSION_CONCURRENCY` / `_SCAN_MS` / `_MAX_ATTEMPTS`, `SESSION_ERASE_API_ENABLED` (`1`; default off) | `RELAYCONTROL_INTROSPECT_SECRET`, `RELAYHISTORY_INGEST_DATABASE_URL` (password), Locker keys, `SESSION_ERASE_API_SECRET` (+ `_PREVIOUS` during a rotation; at least 32 characters; only read when the erase flag is on) |
+| `session-ingest` | `RELAYHISTORY_SELFHOST_INGEST` | `RELAYHISTORY_INGEST_ORIGIN`, `RELAYCONTROL_INTROSPECT_URL`, `RELAYHISTORY_INGEST_DATABASE_URL`, `SESSION_POSTGRES_TLS_PROFILE`, `LOCKER_BUCKET` (+ Locker endpoint/region or Pod Identity/GCS), optional `RELAYHISTORY_INGEST_PORT`, `INGEST_KEY_ROOT`, `INGEST_MAX_PER_USER`, `INGEST_MAX_PER_ORG`, `RELAYHISTORY_INGEST_PG_POOL_MAX`, `ALLOW_IN_CLUSTER_HTTP`, `SELFHOST_INGEST_ADMISSION` (`sync` default, `async`, `drain`) with `SELFHOST_ADMISSION_CONCURRENCY` / `_SCAN_MS` / `_MAX_ATTEMPTS`, `SESSION_ERASE_API_ENABLED` (`1`; default off), `RELAYHISTORY_SELFHOST_SESSION_SELECTION`, `RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT` (both `true`; default off) | `RELAYCONTROL_INTROSPECT_SECRET`, `RELAYHISTORY_INGEST_DATABASE_URL` (password), Locker keys, `SESSION_ERASE_API_SECRET` (+ `_PREVIOUS` during a rotation; at least 32 characters; only read when the erase flag is on) |
 | `session-erase-bytes` (Job) | `SESSION_ERASE_BYTES_ENABLED` (exactly `1`; see below) | `SESSION_ERASE_S3_BUCKET`, `SESSION_ERASE_S3_REGION`, `SESSION_ERASE_REQUEST_FILE`, optional `SESSION_ERASE_S3_ENDPOINT` (bare origin; https, loopback, or a Service name with `ALLOW_IN_CLUSTER_HTTP`), `SESSION_ERASE_KEY_ROOT` (default `96bulls`, must equal `INGEST_KEY_ROOT`), `SESSION_ERASE_DRY_RUN` (`1` = list and count only), `SESSION_ERASE_CONCURRENCY` (1..16, default 4) | `SESSION_ERASE_S3_ACCESS_KEY_ID[_FILE]`, `SESSION_ERASE_S3_SECRET_ACCESS_KEY[_FILE]`: a separate eraser key (ListBucketVersions + DeleteObjectVersion on the key root), not the ingest writer's key |
 | workers | per service (`docs/local-stack.md`) | `HOOPDB_URL`, `WORKER_HEALTH_PORT` | `HOOPDB_URL` password |
 

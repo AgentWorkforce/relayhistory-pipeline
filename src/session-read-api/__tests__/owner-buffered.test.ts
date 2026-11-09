@@ -12,13 +12,21 @@ import { createRequire } from "node:module";
 import { zstdCompressSync } from "node:zlib";
 import * as ownerBuffered from "../owner-buffered.ts";
 import {
+  BUFFERED_INDEX_NAME,
+  BUFFERED_INDEX_REASONS,
+  BUFFERED_INDEX_RETRY_MS,
+  BUFFERED_INDEX_SQL,
   BUFFERED_SESSIONS_SQL,
   BUFFERED_STAGES_SQL,
   BUFFERED_USER_SQL,
   BUFFERED_SESSION_MAX_BYTES,
   BUFFERED_STAGE_MAX_BYTES,
   BufferedFenced,
+  BufferedIndexVerifier,
   BufferedTooLarge,
+  OwnerBufferedIndexVerifyFlagError,
+  ownerBufferedIndexVerifyEnabled,
+  sqlBufferedIndexProbe,
   CONTROL_HEAD_V5_KEYS,
   CONTROL_HEAD_WIRE,
   CONTROL_HEAD_DEADLINE_MS,
@@ -34,12 +42,14 @@ import {
   scrubBufferedText,
   serviceBindingControlHead,
   sqlOwnerBufferedReads,
+  ownerBufferedStatementTimeoutMs,
+  OwnerBufferedStatementTimeoutError,
   type AuthorityHead,
   type BufferedStageRow,
 } from "../owner-buffered.ts";
 import { TenantMismatchError } from "../page.ts";
 import { objectKey } from "../../shared/vendor.ts";
-import { BASELINE, DIGEST, E1, E2, SCOPE, SESSION, authority, bufferedRow, deps, fencedGate, headBody, noHeadBody, putStage, scratch, scriptedGate, scriptedReads, turn, unzip as unzipBounded } from "./owner-buffered-support.ts";
+import { BASELINE, DIGEST, E1, E2, SCOPE, SESSION, authority, bufferedRow, deps, fencedGate, headBody, noHeadBody, indexChecked, putStage, scratch, scriptedGate, scriptedIndexProbe, scriptedReads, turn, unzip as unzipBounded } from "./owner-buffered-support.ts";
 
 const cleanup: Array<() => void> = [];
 afterEach(() => {
@@ -677,6 +687,21 @@ describe("sqlOwnerBufferedReads", () => {
     for (const p of ["p_workspace => $1", "p_cutover_epoch => $2", "p_head_epoch => $3", "p_head_version => $4::text", "p_head_digest => $5", "p_head_kind => $6", "p_head_pending => $7::boolean", "p_privacy_baseline_sha256 => $8", "p_cursor_ts => $9::timestamptz", "p_limit => $12::integer"])
       expect(BUFFERED_SESSIONS_SQL).toContain(p);
   });
+  test("READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: unset is 2000; 2000..6000 accepted; anything else refused; the RPCs SET LOCAL it", async () => {
+    for (const v of [undefined, ""]) expect(ownerBufferedStatementTimeoutMs(v), String(v)).toBe(2000);
+    for (const n of [2000, 2001, 4500, 6000]) expect(ownerBufferedStatementTimeoutMs(String(n))).toBe(n);
+    for (const bad of ["1999", "6001", "0", "02000", " 3000", "3000 ", "3e3", "3000.0", "-3000", "10000", "on", "true"])
+      expect(() => ownerBufferedStatementTimeoutMs(bad), bad).toThrow(OwnerBufferedStatementTimeoutError);
+    // The error names the field, never the value.
+    try {
+      ownerBufferedStatementTimeoutMs("9999");
+    } catch (error) {
+      expect(String((error as Error).message)).not.toContain("9999");
+    }
+    const { run, seen } = runner([sessionRaw()]);
+    await sqlOwnerBufferedReads(run, { statementTimeoutMs: 5000 }).list(SCOPE, authority("7"), { limit: 10 });
+    expect(seen[0]!.sql).toBe("SET LOCAL statement_timeout = 5000");
+  });
   test("both readers name the same authority args, baseline and kind included", () => {
     for (const p of ["p_cutover_epoch => $2", "p_head_epoch => $3", "p_head_version => $4::text", "p_head_digest => $5", "p_head_kind => $6", "p_head_pending => $7::boolean", "p_privacy_baseline_sha256 => $8"])
       expect(BUFFERED_STAGES_SQL).toContain(p);
@@ -736,6 +761,181 @@ describe("sqlOwnerBufferedReads", () => {
   });
 });
 
+describe("out-of-band index verify (READ_API_OWNER_BUFFERED_INDEX_VERIFY)", () => {
+  test("flag: unset or empty is off, exactly \"on\" is on, anything else throws a named error naming no value", () => {
+    expect(ownerBufferedIndexVerifyEnabled(undefined)).toBe(false);
+    expect(ownerBufferedIndexVerifyEnabled("")).toBe(false);
+    expect(ownerBufferedIndexVerifyEnabled("on")).toBe(true);
+    for (const v of ["ON", " on", "on ", "1", "true", "off", "yes", "0"]) {
+      let err: unknown;
+      try {
+        ownerBufferedIndexVerifyEnabled(v);
+      } catch (e) {
+        err = e;
+      }
+      expect(err, v).toBeInstanceOf(OwnerBufferedIndexVerifyFlagError);
+      expect((err as Error).name).toBe("OwnerBufferedIndexVerifyFlagError");
+      expect((err as Error).message).toBe('READ_API_OWNER_BUFFERED_INDEX_VERIFY must be unset or "on"');
+    }
+  });
+
+  test("reason names are fixed", () => {
+    expect(BUFFERED_INDEX_REASONS).toEqual({ missing: "index_missing", invalid: "index_invalid", unverified: "index_unverified" });
+    expect(BUFFERED_INDEX_RETRY_MS).toBe(60_000);
+  });
+
+  test("the probe: catalog SQL only, constants, no parameter; validity needs indisvalid (and ready, live)", () => {
+    expect(BUFFERED_INDEX_NAME).toBe("ingest_buffer_outbox_user_buffered_idx");
+    for (const part of ["pg_catalog.pg_index", "pg_catalog.pg_class", "pg_catalog.pg_namespace", "i.indisvalid", "n.nspname = 'sessions'", "t.relname = 'ingest_buffer_outbox'", "c.relname = 'ingest_buffer_outbox_user_buffered_idx'"])
+      expect(BUFFERED_INDEX_SQL).toContain(part);
+    expect(BUFFERED_INDEX_SQL).not.toMatch(/\$\d/u);
+    expect(BUFFERED_INDEX_SQL).toMatch(/^SELECT /u);
+  });
+
+  function probeRunner(answer: Array<{ valid: unknown }> | Error) {
+    const seen: Array<{ org: string; ws: string; sql: string; params?: unknown[] }> = [];
+    const run = (async (org: string, ws: string, work: (q: { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }> }) => Promise<unknown>) =>
+      work({
+        async query(sql, params) {
+          seen.push({ org, ws, sql, params });
+          if (sql === BUFFERED_INDEX_SQL) {
+            if (answer instanceof Error) throw answer;
+            return { rows: answer };
+          }
+          return { rows: [] };
+        },
+      })) as never;
+    return { run, seen };
+  }
+
+  test("sqlBufferedIndexProbe: the tenant runner, the buffered statement timeout, then the catalog query; maps rows to valid/invalid/missing", async () => {
+    const ok = probeRunner([{ valid: true }]);
+    expect(await sqlBufferedIndexProbe(ok.run)(SCOPE)).toBe("valid");
+    expect(ok.seen.map((s) => s.sql)).toEqual(["SET LOCAL statement_timeout = 2000", BUFFERED_INDEX_SQL]);
+    expect(ok.seen[1]).toMatchObject({ org: "org-a", ws: "ws-a", params: undefined });
+    expect(await sqlBufferedIndexProbe(probeRunner([]).run)(SCOPE)).toBe("missing");
+    expect(await sqlBufferedIndexProbe(probeRunner([{ valid: false }]).run)(SCOPE)).toBe("invalid");
+    expect(await sqlBufferedIndexProbe(probeRunner([{ valid: null }]).run)(SCOPE)).toBe("invalid");
+    const custom = probeRunner([{ valid: true }]);
+    await sqlBufferedIndexProbe(custom.run, { statementTimeoutMs: 750 })(SCOPE);
+    expect(custom.seen[0]!.sql).toBe("SET LOCAL statement_timeout = 750");
+    const boom = new Error("canceling statement due to statement timeout");
+    expect(await sqlBufferedIndexProbe(probeRunner(boom).run)(SCOPE).then(() => "resolved", (e) => e)).toBe(boom);
+  });
+
+  test("valid: served, and remembered for the isolate's lifetime (no second query, even past the TTL)", async () => {
+    let t = 0;
+    const v = new BufferedIndexVerifier({ now: () => t });
+    const probe = scriptedIndexProbe("valid", "missing");
+    expect(await reason(v.check(probe).ensure(SCOPE))).toBe("resolved");
+    expect(probe.calls).toEqual([SCOPE]);
+    t = 10 * BUFFERED_INDEX_RETRY_MS;
+    expect(await reason(v.check(probe).ensure(SCOPE))).toBe("resolved");
+    expect(await reason(v.check(scriptedIndexProbe("missing")).ensure(SCOPE))).toBe("resolved");
+    expect(probe.calls).toHaveLength(1);
+  });
+
+  test("missing, invalid and a query error fence under their own names; each is remembered for the TTL, then re-checked", async () => {
+    for (const [answer, name] of [["missing", "index_missing"], ["invalid", "index_invalid"], [new Error("connection terminated"), "index_unverified"]] as const) {
+      let t = 1_000;
+      const v = new BufferedIndexVerifier({ now: () => t });
+      const probe = scriptedIndexProbe(answer, "valid");
+      expect(await reason(v.check(probe).ensure(SCOPE)), name).toBe(name);
+      expect(probe.calls).toHaveLength(1);
+      t += BUFFERED_INDEX_RETRY_MS - 1;
+      expect(await reason(v.check(probe).ensure(SCOPE)), name).toBe(name);
+      expect(probe.calls).toHaveLength(1); // cached failure: no query
+      t += 1;
+      expect(await reason(v.check(probe).ensure(SCOPE)), name).toBe("resolved");
+      expect(probe.calls).toHaveLength(2); // TTL elapsed: re-checked, now valid
+    }
+  });
+
+  test("concurrent requests share one in-flight probe", async () => {
+    let release!: (s: "valid" | "missing") => void;
+    let calls = 0;
+    const probe = () => {
+      calls += 1;
+      return new Promise<"valid" | "missing">((resolve) => (release = resolve));
+    };
+    const v = new BufferedIndexVerifier();
+    const waiting = [1, 2, 3, 4].map(() => reason(v.check(probe).ensure(SCOPE)));
+    await Promise.resolve();
+    expect(calls).toBe(1);
+    release("missing");
+    expect(await Promise.all(waiting)).toEqual(["index_missing", "index_missing", "index_missing", "index_missing"]);
+    expect(calls).toBe(1);
+  });
+
+  test("a probe that does not answer in time: index_unverified for the waiter, probe forgotten, re-checked after the TTL; a late valid answer still counts", async () => {
+    let t = 0;
+    let release!: (s: "valid") => void;
+    let calls = 0;
+    const hang = () => {
+      calls += 1;
+      return new Promise<"valid">((resolve) => (release = resolve));
+    };
+    const v = new BufferedIndexVerifier({ now: () => t, waitMs: 5 });
+    expect(await reason(v.check(hang).ensure(SCOPE))).toBe("index_unverified");
+    expect(await reason(v.check(hang).ensure(SCOPE))).toBe("index_unverified");
+    expect(calls).toBe(1); // within the TTL: fenced without a query
+    t = BUFFERED_INDEX_RETRY_MS;
+    const second = scriptedIndexProbe("missing");
+    expect(await reason(v.check(second).ensure(SCOPE))).toBe("index_missing"); // forgotten: a new probe ran
+    expect(second.calls).toHaveLength(1);
+    release("valid"); // the first, abandoned probe finally answers
+    await new Promise((r) => setTimeout(r, 0));
+    expect(await reason(v.check(scriptedIndexProbe("missing")).ensure(SCOPE))).toBe("resolved");
+  });
+
+  test("list: not proven is BufferedFenced before the gate, the RPC or presence; proven runs the read unchanged", async () => {
+    for (const [answer, name] of [["missing", "index_missing"], ["invalid", "index_invalid"], [new Error("x"), "index_unverified"]] as const) {
+      const { reads, calls } = scriptedReads({ list: [bufferedRow()] });
+      const gate = scriptedGate(authority("7"));
+      let presence = 0;
+      const { indexCheck, probe } = indexChecked(answer);
+      expect(await reason(readOwnerBufferedList(deps({ store: store(), reads, gate, indexCheck }), SCOPE, { limit: 10 }, async () => (presence++, new Set())))).toBe(name);
+      expect(probe.calls).toEqual([SCOPE]);
+      expect([gate.calls.length, calls.length, presence]).toEqual([0, 0, 0]);
+    }
+    const { reads } = scriptedReads({ list: [bufferedRow()] });
+    const gate = scriptedGate(authority("7"));
+    const { indexCheck, probe } = indexChecked("valid");
+    const rows = await readOwnerBufferedList(deps({ store: store(), reads, gate, indexCheck }), SCOPE, { limit: 10 });
+    expect(rows.map((r) => [r.session_id, r.visible])).toEqual([[SESSION, true]]);
+    expect(probe.calls).toHaveLength(1);
+    expect(gate.calls).toHaveLength(2);
+  });
+
+  test("turns: not proven is unverified before any candidate (no gate, no RPC, no row data); proven reads as without the check", async () => {
+    for (const [answer, name] of [["missing", "index_missing"], ["invalid", "index_invalid"], [new Error("x"), "index_unverified"]] as const) {
+      const { reads, calls } = scriptedReads({ stages: [[]] });
+      const gate = scriptedGate(authority("7"));
+      const { indexCheck } = indexChecked(answer);
+      expect(await readOwnerBufferedTurns(deps({ store: store(), reads, gate, indexCheck }), SCOPE, "claude", SESSION)).toEqual({ unverifiedBeforeCandidate: name });
+      expect([gate.calls.length, calls.length]).toEqual([0, 0]);
+    }
+    const s = store();
+    const st = await putStage(s, 1, [turn(0)]);
+    const gate = scriptedGate(authority("7"));
+    const { indexCheck, probe } = indexChecked("valid");
+    const out = await readOwnerBufferedTurns(deps({ store: s, reads: scriptedReads({ stages: [[st.row]] }).reads, gate, indexCheck }), SCOPE, "claude", SESSION);
+    const without = await readOwnerBufferedTurns(deps({ store: s, reads: scriptedReads({ stages: [[st.row]] }).reads, gate: scriptedGate(authority("7")) }), SCOPE, "claude", SESSION);
+    expect(out).not.toBeNull();
+    expect(out).toEqual(without);
+    expect(probe.calls).toHaveLength(1);
+  });
+
+  test("no indexCheck in the deps (flag off): no probe at all, reads exactly as before", async () => {
+    const probe = scriptedIndexProbe("missing");
+    const { reads } = scriptedReads({ list: [bufferedRow()] });
+    const d = deps({ store: store(), reads });
+    expect("indexCheck" in d).toBe(false);
+    expect((await readOwnerBufferedList(d, SCOPE, { limit: 10 })).map((r) => r.session_id)).toEqual([SESSION]);
+    expect(probe.calls).toHaveLength(0);
+  });
+});
+
 describe("no ungated path", () => {
   test("the module exports only gated readers of buffered content", () => {
     const names = Object.keys(ownerBuffered);
@@ -788,6 +988,15 @@ describe("fence subtypes for logs (fenceSubtype, BufferedFenced.sqlstateClass)",
     expect(Object.isFrozen(ownerBuffered.FENCE_SUBTYPES)).toBe(true);
     for (const r of ownerBuffered.FENCE_SUBTYPES) expect(ownerBuffered.fenceSubtype(r)).toBe(r);
     expect(ownerBuffered.fenceSubtype(new BufferedFenced().reason)).toBe("fenced");
+  });
+
+  test("every index-verify reason (BUFFERED_INDEX_REASONS) is its own subtype, not fence_other", () => {
+    expect(Object.values(BUFFERED_INDEX_REASONS)).toHaveLength(3);
+    for (const r of Object.values(BUFFERED_INDEX_REASONS)) {
+      expect(ownerBuffered.FENCE_SUBTYPES).toContain(r);
+      expect(ownerBuffered.fenceSubtype(r)).toBe(r);
+      expect(ownerBuffered.fenceSubtype(new BufferedFenced(r).reason)).toBe(r);
+    }
   });
 
   test("anything outside the set is fence_other", () => {

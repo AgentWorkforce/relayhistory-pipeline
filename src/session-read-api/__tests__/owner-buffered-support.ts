@@ -10,7 +10,8 @@ import { objectKey, type ObjectStore } from "../../shared/vendor.ts";
 import { scratchStore } from "../../session-ingest/__tests__/support.ts";
 import { TURN_KIND, TURN_ORIGIN_ID, turnRecordId } from "../../session-ingest/turns.ts";
 import type { AuthorityHead, BufferedScope, BufferedSessionRow, BufferedStageRow, ControlHeadGate, OwnerBufferedDeps, OwnerBufferedReads } from "../owner-buffered.ts";
-import { BufferedFenced, BufferedTooLarge } from "../owner-buffered.ts";
+import type { BufferedIndexProbe, BufferedIndexState } from "../owner-buffered.ts";
+import { BufferedFenced, BufferedIndexVerifier, BufferedTooLarge } from "../owner-buffered.ts";
 
 export const SCOPE: BufferedScope = { orgId: "org-a", workspaceId: "ws-a", userId: "u-1" };
 export const SESSION = "sess-b1";
@@ -144,6 +145,28 @@ export function scratch() {
 
 export function deps(over: Partial<OwnerBufferedDeps> & { store: ObjectStore }): OwnerBufferedDeps {
   return { enabled: true, workspaces: "*", reads: scriptedReads().reads, gate: scriptedGate(authority("7")), decompress: unzip, ...over };
+}
+
+/**
+ * A scripted catalog probe for the READ_API_OWNER_BUFFERED_INDEX_VERIFY check: answers per call
+ * (the last repeats; an Error is thrown); every call's scope is recorded.
+ */
+export function scriptedIndexProbe(...answers: Array<BufferedIndexState | Error>): BufferedIndexProbe & { calls: BufferedScope[] } {
+  const calls: BufferedScope[] = [];
+  const probe = (async (scope: BufferedScope) => {
+    calls.push(scope);
+    const a = answers[Math.min(calls.length - 1, answers.length - 1)]!;
+    if (a instanceof Error) throw a;
+    return a;
+  }) as BufferedIndexProbe & { calls: BufferedScope[] };
+  probe.calls = calls;
+  return probe;
+}
+
+/** deps.indexCheck over a fresh verifier (no cache shared between tests) and a scripted probe. */
+export function indexChecked(...answers: Array<BufferedIndexState | Error>) {
+  const probe = scriptedIndexProbe(...answers);
+  return { indexCheck: new BufferedIndexVerifier().check(probe), probe };
 }
 
 /** A promise and its resolver (tests hold a GetObject open until they release it). */
