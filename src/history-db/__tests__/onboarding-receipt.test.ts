@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC_SCOPE } from "../../session-ingest/app.ts";
 import { historyRetentionViolations, runHistoryMigrations, type HistoryClient } from "../migrate.ts";
 import type { Run } from "../onboarding.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 setDefaultTimeout(120_000);
 const root = join(import.meta.dir, "../../..");
@@ -30,8 +31,10 @@ async function setup(opts: { ingestTrack?: boolean } = {}) {
   if (opts.ingestTrack !== false) {
     const read = (f: string) => readFileSync(join(root, f), "utf8");
     await db.exec(read("supabase/tests/supabase_shim.sql"));
-    for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles"])
-      await db.exec(read("supabase/bootstrap/" + f + ".sql"));
+    // Single-sourced bootstrap chain: later migrations FAIL closed without
+    // their bare roles (read API, consumer), so the fixture provisions every
+    // role the chain does.
+    for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
     for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort())
       await db.exec(read("supabase/migrations/" + f));
   }
