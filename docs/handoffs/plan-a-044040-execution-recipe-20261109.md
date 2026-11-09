@@ -130,6 +130,12 @@ The rebind prints JSON counts only (:26), or `{"status":"refused","code":...}` w
 - Final step: a later deploy with expectedGeneration=G_new and no overlap (zero-503 §3.1).
 - **Deploys and dispatches: Khaliq's word, Brian's hands.**
 
+### 5a. Build constraint for plan A (which source each runtime must be built from)
+- The ingest Worker does not compute schema readiness; its generation is configuration (INGEST_EXPECT_GENERATION / INGEST_ACCEPT_GENERATIONS from `sessionIngest.expectedGeneration` / `overlapGeneration`, stacks/cloudflare/session-ingest.ts:124-130, :232; src/session-ingest/worker.ts:105-107). Its code for the window must be 3d0b4191 or later (it carries the two-generation offer). The G_new it is given must be computed from the 3d0b4191 checkout (`bun src/hoopdb/migrate.ts --generation`).
+- Every runtime that computes `expectedSchema()` at start (search worker src/shared/worker.ts:354-355; alleyoop ingest; indexer; consumers src/session-pipeline/consumer-service.ts:1127; buffered GC and publication via derivedSchemaAssets) must be **built from 3d0b4191** for the window: schemaVerdict (src/shared/db.ts:218-236) reports `schema_pending` whenever one of the build's migration names is missing from the ledger, so an image built from main (044050 and later present) waits forever against a 044040 ledger, and a pre-window image expects G_cur and reports `validation_pending` once PASS moves to G_new (db.ts:237-243).
+- The rebind (section 5) and the G2 bulk parity proof (section 6, `--expect-source-sha 3d0b419110f858043962a8a6a18f46cdc7efe154`) run from the same clean 3d0b4191 checkout.
+- Moving those runtimes to a later main (044050+) is a separate later window, with its own pending→PASS cycle and rebind, now protected by the 044030 overlap window (section 9c caveats apply).
+
 ## 6. G2 bulk re-proof (owner-buffered-parity-operator)
 Header and usage are at scripts/owner-buffered-parity-operator.ts:1-40, with allowed flags at :115.
 - Credentials arrive as one JSON object `{neonUrl, supabaseUrl}` on an approved RAM-only pipe. They are never passed in argv, environment or a file.
@@ -166,7 +172,7 @@ Header and usage are at scripts/owner-buffered-parity-operator.ts:1-40, with all
 - Worker rollback: redeploy the previous reviewed sessionIngest inputs (expectedGeneration=G_cur). This only makes sense before the rebind executes. It needs Khaliq's word and Brian's hands.
 - A rebind refusal rolls back its own transaction (ingest-generation-rebind.ts:34, generation-window.md:235).
 
-## 9. Prefix-first variant (044020+044030 now at pin b254b615, 044040 in a later window)
+## 9. Appendix: prefix-first variant (NOT chosen; Khaliq confirmed plan A in pipeline-lead's session, 2026-11-09) (044020+044030 now at pin b254b615, 044040 in a later window)
 Pin: `b254b61511d8c52af5c7c3163a49b38629d935a3` (merge of #433). I verified that it is a first-parent ancestor of main, that `git ls-tree` of its migrations ends at `20261105044030_ingest_generation_overlap.sql`, and that `git diff b254b615 main` on the 044020 and 044030 files is empty.
 - Out of band and before the window: prebuild the index CONCURRENTLY, using the exact definition at 044020:65-66 with CONCURRENTLY added. 044020 then adopts it after its definition and validity checks (:104-112).
 - **Do not set** HOOPDB_ALLOW_BLOCKING_INDEX_BUILD. 044020 refuses with 55000 if the index is still absent (:79-83).
