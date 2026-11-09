@@ -5,6 +5,11 @@ stack, migration, workflow or `generation()` change comes with it. This is the s
 of the hosted design, [`docs/design/s3-first-async-ingest.md`](design/s3-first-async-ingest.md). Read
 that first: this page only lists what is different.
 
+The hosted Cloudflare stack input `sessionIngest.asyncAdmission` now defaults to `"on"` for a buffered
+stage (2026-11-09). That changes nothing here: `SELFHOST_INGEST_ADMISSION` is separate deployment
+config and still defaults to `sync`, and the hosted Worker's runtime default for an absent
+`INGEST_ASYNC_ADMISSION` stays `off`.
+
 Code:
 - `src/session-ingest/selfhost-config.ts`: `SELFHOST_INGEST_ADMISSION` and its knobs.
 - `src/session-ingest/selfhost-server.ts`: wiring, the startup gate, `/readyz`.
