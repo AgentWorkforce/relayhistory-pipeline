@@ -101,7 +101,7 @@ test("readiness and the migrator agree on every rename-alias ledger state (one s
   const repairSteps = (await plan(SELFHOSTED)).map((st) => (st.name === ingest.repair ? { ...st, path: changedRepair } : st));
   const repairExpected: ExpectedSchema = { ...expected, shas: { ...expected.shas, [ingest.repair]: "f".repeat(64) } };
 
-  type Case = { name: string; sql: [string, unknown[]][]; code: string | null; steps?: Step[]; readiness?: ExpectedSchema };
+  type Case = { name: string; sql: [string, unknown[]][]; code: string | null; steps?: Step[]; readiness?: ExpectedSchema; count?: number };
   const current: [string, unknown[]][] = MIGRATION_RENAME_ALIASES.flatMap((a): [string, unknown[]][] => [
     ["DELETE FROM sessions.__96bulls_migrations WHERE name=$1", [a.ledger_name]],
     ["INSERT INTO sessions.__96bulls_migrations(name, sha256) VALUES($1, $2)", [a.migration, a.accepted_as_alias_of]],
@@ -117,6 +117,13 @@ test("readiness and the migrator agree on every rename-alias ledger state (one s
       { name: `${a.migration} collision-good`, sql: [insertRelease(a.accepted_as_alias_of)], code: "ledger_alias_collision" },
       { name: `${a.migration} collision-bad`, sql: [setOriginal("0".repeat(64)), insertRelease(a.accepted_as_alias_of)], code: "ledger_alias_collision" },
       { name: `${a.migration} original-only wrong-sha`, sql: [setOriginal("0".repeat(64))], code: "ledger_unknown_step" },
+      // Parity matrix, alias x sha: the release name under its canonical alias with the
+      // planned sha is current-only (ok/ok above); with any other sha both refuse.
+      {
+        name: `${a.migration} canonical-arbitrary-wrong-sha`,
+        sql: [["DELETE FROM sessions.__96bulls_migrations WHERE name=$1", [a.ledger_name]], insertRelease("0".repeat(64))],
+        code: "migration_changed",
+      },
       {
         name: `${a.migration} new-name-with-original-sha`,
         sql: [["DELETE FROM sessions.__96bulls_migrations WHERE name=$1", [a.ledger_name]], insertRelease(a.ledger_sha)],
@@ -124,7 +131,12 @@ test("readiness and the migrator agree on every rename-alias ledger state (one s
       },
     );
   }
-  cases.push({ name: "repair-missing", sql: [], code: "ledger_alias_repair_missing", steps: repairSteps, readiness: repairExpected });
+  // Parity matrix, non-alias x sha: a step outside MIGRATION_RENAME_ALIASES with its
+  // planned sha is the released baseline (ok/ok above); with another sha both refuse.
+  const plain = baseline.find((r) => r.name.startsWith("96bulls:") && !MIGRATION_RENAME_ALIASES.some((a) => a.ledger_name === r.name || a.migration === r.name))!;
+  cases.push({ name: "non-alias wrong-sha", sql: [["UPDATE sessions.__96bulls_migrations SET sha256=$1 WHERE name=$2", ["0".repeat(64), plain.name]]], code: "migration_changed" });
+  // Readiness also drops the applied repair row, whose sha differs from the edited plan.
+  cases.push({ name: "repair-missing", sql: [], code: "ledger_alias_repair_missing", steps: repairSteps, readiness: repairExpected, count: 2 });
 
   const results: Record<string, { migrator: string; readiness: string }> = {};
   for (const c of cases) {
@@ -144,7 +156,7 @@ test("readiness and the migrator agree on every rename-alias ledger state (one s
     expect(error?.code ?? null).toBe(c.code);
     // The same verdict: ready exactly when the migrator accepts the ledger.
     expect(verdict.ok).toBe(c.code === null);
-    if (!verdict.ok) expect(verdict).toEqual({ ok: false, reason: "schema_pending", count: 1 });
+    if (!verdict.ok) expect(verdict).toEqual({ ok: false, reason: "schema_pending", count: c.count ?? 1 });
     expect(await stored(db)).toEqual(physical);
     expect(await data(db)).toEqual(dataBefore);
     if (c.code !== null) expect(await marker(db)).toEqual(markerBefore);

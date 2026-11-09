@@ -88,6 +88,18 @@ native("native PG17: released image ledger upgrades in place as unchanged non-CR
   // A canonical row cannot conceal an original/current collision, even if
   // the original is corrupt. All negative probes are read-only for history/marker.
   for(const alias of MIGRATION_RENAME_ALIASES){
+   // A canonical-only row with an unrelated checksum must fail both gates too.
+   await owner.query("DELETE FROM sessions.__96bulls_migrations WHERE name=$1",[alias.ledger_name]);
+   await owner.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES($1,$2)",[alias.migration,"0".repeat(64)]);
+   const canonicalBefore=await liveRows(owner),markerBeforeCanonical=(await owner.query("SELECT * FROM sessions.__96bulls_role_validation")).rows;
+   expect(await schemaVerdict({...await expectedSchema(),dbMode:"selfhosted"},txn(runtime))).toEqual({ok:false,reason:"schema_pending",count:1});
+   expect((await rejected(runMigrations(sql(owner),{profile:next})))?.code).toBe("migration_changed");
+   expect(await liveRows(owner)).toEqual(canonicalBefore);
+   expect((await owner.query("SELECT * FROM sessions.__96bulls_role_validation")).rows).toEqual(markerBeforeCanonical);
+   expect(await selected(owner)).toEqual(preserved);
+   await owner.query("DELETE FROM sessions.__96bulls_migrations WHERE name=$1",[alias.migration]);
+   await owner.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES($1,$2)",[alias.ledger_name,alias.ledger_sha]);
+   expect(await schemaVerdict({...await expectedSchema(),dbMode:"selfhosted"},txn(runtime))).toEqual({ok:true});
    for(const hash of [alias.ledger_sha,"0".repeat(64)]){
     await owner.query("UPDATE sessions.__96bulls_migrations SET sha256=$1 WHERE name=$2",[hash,alias.ledger_name]);
     await owner.query("INSERT INTO sessions.__96bulls_migrations(name,sha256) VALUES($1,$2)",[alias.migration,alias.accepted_as_alias_of]);

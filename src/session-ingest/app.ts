@@ -36,7 +36,7 @@ import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { Hono, type Context } from "hono";
 import { log } from "../shared/log.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
-import { assertWithinBudget, batchIdConflict, deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
+import { assertWithinBudget, batchIdConflict, ClaimLockBusy, deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
 import { assertTenantSegment } from "./writer.ts";
 import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, ADMISSION_LEGACY_REPLAY, ADMISSION_QUEUED, abortPrivacyControl, admissionStatus, beginPrivacyControl, enqueueAdmission, settlePrivacyControl, witnessPrivacyJournal, type AdmissionMessage, type AsyncAdmissionMode, type SyncAdmissionFrozenReceiptMode } from "./async-admission.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
@@ -147,7 +147,7 @@ export interface IngestAppDeps {
    * every reset / re-enable raises the privacy journal first. "drain": no new async ACK, the
    * journal is still raised (the consumer is still admitting). Buffered acceptance only.
    */
-  asyncAdmission?: { mode: AsyncAdmissionMode; enqueue: (message: AdmissionMessage) => Promise<void>; nowMs?: () => number };
+  asyncAdmission?: { mode: AsyncAdmissionMode; enqueue: (message: AdmissionMessage) => Promise<void>; nowMs?: () => number; selfhost?: SelfhostAdmissionHooks };
   /**
    * INGEST_SYNC_ADMISSION_FROZEN_RECEIPT (async-admission.ts). Absent or "off": nothing changes. "on":
    * under frozen-supabase custody, a batch whose SIGNED identity carries `admission: queued-v1` but did
@@ -157,6 +157,28 @@ export interface IngestAppDeps {
    * pre-forward read for such a caller.
    */
   syncAdmissionFrozenReceipt?: SyncAdmissionFrozenReceiptMode;
+}
+
+/**
+ * Self-host only (selfhost-server.ts, SELFHOST_INGEST_ADMISSION); the hosted Worker never sets it, and
+ * without it every line below behaves exactly as before. With it:
+ *   - canonical acceptance is allowed (the self-host ingest is canonical). Control routes stay
+ *     fail-closed: `journaled` refuses every non-ordered reset / re-enable before SQL (503), and the
+ *     self-host wrapper does not route them at all;
+ *   - the pre-body journal witness is taken for the identity the wrapper ALREADY verified (relaycontrol
+ *     introspection runs before any body byte), never from a request header;
+ *   - no synchronous fallback: with mode "on", a batch that cannot take the queued path (its witness
+ *     failed, or anything else) is a 503, so the request path never reaches SQL.
+ */
+export interface SelfhostAdmissionHooks {
+  /** The verified identity bound to exactly this Request, or undefined. */
+  identityOf: (request: Request) => IngestIdentity | undefined;
+  /**
+   * The self-host erase ledger (RELAYHISTORY_SELFHOST_SESSION_SELECTION, ledger-sql.ts selfhostSelectionErase)
+   * refuses every re-enable with a 400 before any SQL, so a non-ordered re-enable goes to it unjournaled
+   * (it can never apply) instead of the journal's 503. Never set with a ledger that can apply a re-enable.
+   */
+  reEnableRefusedByLedger?: boolean;
 }
 
 type Env = { Variables: { correlationId: string; identity: IngestIdentity; body: Uint8Array; custody:CurrentCustodyPacket|undefined; journalWitness: { tenant: string; seq: number } | undefined } };
@@ -243,7 +265,7 @@ function errorBody(c: Context<Env>, code: string, message: string, extra: Record
  * error that reached the route outside a delivery stage is reported the same way.
  * Diagnostic only. */
 function unavailableFields(error: unknown): Record<string, unknown> {
-  if (error instanceof IngestUnavailable) return { stage: error.stage, error_code: error.cause_code, ...dbFields(error.db) };
+  if (error instanceof IngestUnavailable || error instanceof ClaimLockBusy) return { stage: error.stage, error_code: error.cause_code, ...dbFields(error.db) };
   if (error instanceof LedgerUnavailableError) return { error_code: error.code, ...dbFields(error.db) };
   return {};
 }
@@ -259,9 +281,11 @@ export type LockAlertStage = "lazy_claim" | "staged_ack" | "staged_intent" | "se
 const LOCK_ALERT_SQLSTATES = new Set(["55P03", "57014"]);
 
 /** The one alert line for a 55P03 (lock_not_available) / 57014 (query_canceled) ledger failure on a
- * lock-alert stage: `{ route, stage, sqlstate }` and nothing else (no tenant data, no ids). Diagnostic only. */
+ * lock-alert stage: `{ route, stage, sqlstate }` and nothing else (no tenant data, no ids). Diagnostic only.
+ * A claim lock wait refused as 429 (ClaimLockBusy, INGEST_CLAIM_LOCK_BUSY=on) still alerts for 55P03
+ * (a 40P01 alerts in neither flag state). */
 export function lockAlertFields(error: unknown, acceptanceMode: string | undefined): { route: "ingest.lock_alert"; stage: LockAlertStage; sqlstate: string } | undefined {
-  if (!(error instanceof IngestUnavailable)) return undefined;
+  if (!(error instanceof IngestUnavailable || error instanceof ClaimLockBusy)) return undefined;
   const sqlstate = error.db?.db_error_code;
   if (sqlstate === undefined || !LOCK_ALERT_SQLSTATES.has(sqlstate)) return undefined;
   const stage: LockAlertStage | undefined =
@@ -365,7 +389,8 @@ export function createIngestApp(deps: IngestAppDeps) {
   const emit = deps.log ?? ((fields) => log.info("session ingest", fields));
   const custodyMode = deps.custodySource ?? "relayhistory";
   const asyncMode: AsyncAdmissionMode = deps.asyncAdmission?.mode ?? "off";
-  if (asyncMode !== "off" && deps.deliver.acceptanceMode !== "buffered") throw new Error("session ingest: async admission requires buffered acceptance");
+  const selfhostAdmission = deps.asyncAdmission?.selfhost;
+  if (asyncMode !== "off" && deps.deliver.acceptanceMode !== "buffered" && !selfhostAdmission) throw new Error("session ingest: async admission requires buffered acceptance");
   const nowMs = deps.asyncAdmission?.nowMs ?? Date.now;
   const syncFrozenReceipt = deps.syncAdmissionFrozenReceipt === "on";
   /**
@@ -447,7 +472,8 @@ export function createIngestApp(deps: IngestAppDeps) {
     const path = new URL(c.req.url).pathname;
     if (asyncMode === "on" && c.req.method === "POST" && (path === "/v1/delivery/batches" || path === "/v1/turns/batches")) {
       try {
-        const claimed = bindingIdentity(c.req.raw);
+        const claimed = selfhostAdmission ? selfhostAdmission.identityOf(c.req.raw) : bindingIdentity(c.req.raw);
+        if (!claimed) throw new Error("no_identity");
         if (claimed.admission === ADMISSION_ACCEPT_VALUE) {
           const tenant = { orgId: claimed.orgId, workspaceId: claimed.workspaceId, userId: claimed.userId };
           c.set("journalWitness", { tenant: JSON.stringify(tenant), seq: await witnessPrivacyJournal(deps.deliver.target.store, deps.deliver.target.keyRoot, tenant) });
@@ -552,6 +578,8 @@ export function createIngestApp(deps: IngestAppDeps) {
         c.header(ADMISSION_HEADER, ADMISSION_QUEUED);
         return c.json({ ...prepared.receipt, limits: { ...DELIVERY_LIMITS, contentEncodings: contentEncodings() } });
       }
+      // Self-host "on": never a synchronous fallback (that would put SQL back on the request path).
+      if (asyncMode === "on" && selfhostAdmission) throw new IngestUnavailable("admission_witness", witness ? "admission_not_queueable" : "privacy_journal_unavailable");
       // INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: a queued-v1 caller's relayhistory skipped its pre-forward legacy-receipt
       // read, so a batch that fell back here gets the consumer's read first (admission-consumer.ts), before any claim.
       if (syncFrozenReceipt && identity.admission === ADMISSION_ACCEPT_VALUE && custodyMode === "frozen-supabase") {
@@ -643,7 +671,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       let controlAck;
       // A re-enable lifts a tombstone: an upload that began before it must not be admitted after it.
       // (A disable needs no journal: the consumer's claim already filters a deleted session.)
-      const journal = <T>(run: () => Promise<T>, outcomeOf: (r: T) => "applied" | "replay" | "stale") => !input.enabled ? run()
+      const journal = <T>(run: () => Promise<T>, outcomeOf: (r: T) => "applied" | "replay" | "stale") => !input.enabled || (selfhostAdmission?.reEnableRefusedByLedger === true && !identity.control) ? run()
         : journaled(selection.tenant, identity.control, run, outcomeOf);
       {const t={ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
        if(identity.control&&!c.get("custody")&&custodyMode==="frozen-supabase")c.set("custody",await frozenWitness(controlWitnessInput("selection",t,input.origin_id)));

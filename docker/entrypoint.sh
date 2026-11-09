@@ -17,5 +17,6 @@ case "${SERVICE:-}" in
   session-pipeline-consumer-bootstrap) exec bun run /app/src/session-pipeline/consumer-bootstrap.ts ;;
   session-ingest)   exec bun run /app/src/session-ingest/selfhost-server.ts ;;
   session-publication) exec bun run /app/src/session-ingest/publication-service.ts --continuous ;;
+  session-erase-bytes) exec bun run /app/src/session-erase/selfhost-eraser-main.ts ;;
   *) echo "96bulls: unknown SERVICE='${SERVICE:-}'" >&2; exit 2 ;;
 esac

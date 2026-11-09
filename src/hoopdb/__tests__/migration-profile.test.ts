@@ -784,6 +784,19 @@ describe("append-only renamed migrations: adopted in memory only when every chec
     expect(r.effective).toEqual(new Map([[ingest!.migration, ingest!.accepted_as_alias_of]]));
   });
 
+  test("a release name with an unknown checksum is refused without changing the physical ledger", () => {
+    for (const alias of MIGRATION_RENAME_ALIASES) {
+      const ledger = new Map(MIGRATION_RENAME_ALIASES.map((a) => [a.migration as string, a.accepted_as_alias_of as string]));
+      ledger.set(alias.migration, "0".repeat(64));
+      const before = new Map(ledger);
+      const result = resolveRenamedLedger(ledger, fileSha);
+      expect(codes(result)).toEqual([[alias.migration, "migration_changed"]]);
+      expect(result.effective.has(alias.migration)).toBe(false);
+      expect(result.adopted).toEqual([]);
+      expect(ledger).toEqual(before);
+    }
+  });
+
   test("a current ledger passes through unchanged, and a plan holding the original name skips the alias", () => {
     const current = new Map(MIGRATION_RENAME_ALIASES.map((a) => [a.migration as string, a.accepted_as_alias_of as string]));
     expect(resolveRenamedLedger(current, fileSha)).toEqual({ effective: current, adopted: [], refusals: [] });
@@ -865,10 +878,11 @@ describe("append-only renamed migrations: adopted in memory only when every chec
     // Without per-step shas nothing is adopted: both release names are missing.
     const { shas: _shas, ...noShas } = expected;
     expect(await schemaVerdict(noShas, transact(db))).toEqual({ ok: false, reason: "schema_pending", count: 2 });
-    // Another planned repair sha: the ingest row is not adopted by readiness either.
+    // Another planned repair sha: the ingest row is not adopted by readiness either, and
+    // the applied repair row no longer matches its planned sha (the migrator's checksum guard).
     expect(
       await schemaVerdict({ ...expected, shas: { ...expected.shas, [ingest!.repair]: "f".repeat(64) } }, transact(db)),
-    ).toEqual({ ok: false, reason: "schema_pending", count: 1 });
+    ).toEqual({ ok: false, reason: "schema_pending", count: 2 });
     // A wrong recorded sha on an original row is never adopted.
     await db.query(
       "UPDATE sessions.__96bulls_migrations SET sha256 = $1 WHERE name = $2",
