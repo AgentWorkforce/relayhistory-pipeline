@@ -43,7 +43,8 @@ Every version and every delete marker, by version id, of:
 (`src/shared/layout-component.ts`). Order: staged objects and transcript
 directories first, then the pointers, then the verification listing. Deleting
 the pointer last means a writer that can still find it does not re-create a
-directory behind the eraser.
+directory behind the eraser. Pointers are erased only when every other target
+was fully traversed in the same run; otherwise they stay for the rerun.
 
 It never deletes anything else:
 

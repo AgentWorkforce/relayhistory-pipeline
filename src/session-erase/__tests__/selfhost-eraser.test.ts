@@ -140,6 +140,7 @@ describe("self-host session byte eraser", () => {
     const r = await eraseSessionBytes(s.eraser(), request(), opts({ maxRunsPerTarget: 1 }));
     expect(r).toMatchObject({ incompleteTargets: 1, verified: false });
     expect(s.count(DIR)).toBeGreaterThan(0);
+    expect(s.count(POINTER)).toBe(3); // the pointer waits for a fully traversed dir
     expect(await eraseSessionBytes(s.eraser(), request(), opts())).toMatchObject({ incompleteTargets: 0, verified: true });
     expect(s.count(DIR)).toBe(0);
   });

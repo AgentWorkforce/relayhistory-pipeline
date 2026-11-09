@@ -285,8 +285,10 @@ export async function eraseSessionBytes(eraser: PagedEraser, req: SessionEraseBy
 
   // Staged batches and transcript dirs first; the live pointer last, so a writer that still
   // finds its pointer never re-creates a dir that was already erased behind it.
+  // A pointer is only erased once every other target was fully traversed (as the cloud eraser
+  // erases it only after the session dir); otherwise it stays for the rerun.
   await pool(targets.filter((t) => t.kind !== "pointer"), width, run);
-  await pool(targets.filter((t) => t.kind === "pointer"), width, run);
+  if (incomplete === 0 || dryRun) await pool(targets.filter((t) => t.kind === "pointer"), width, run);
 
   let remaining = 0, pendingBudget = 0;
   if (!dryRun) {
