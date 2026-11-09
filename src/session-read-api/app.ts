@@ -1,3 +1,4 @@
+import { BriefSummaryError, briefSummaryResponse, type BriefSummary } from "./brief-summary.ts";
 /**
  * The session read API: an API-compatible subset of relayhistory's /v1 read
  * contract (packages/relayhistory/src/routes/recall.ts), served from ClickHouse
@@ -172,6 +173,8 @@ export interface ReadApiDeps {
   directoryWorkspaces?: ReadonlySet<string> | "*";
   /** Cached brief titles (brief-titles.ts); absent = GET /v1/sessions/titles answers 501. */
   briefTitles?: BriefTitles;
+  /** Node self-host only; absence refuses summary reads. Uses directory workspace admission. */
+  briefSummary?: BriefSummary;
   /** READ_API_BRIEF_TITLES_WORKSPACES (parseDirectoryWorkspaces syntax): "*" = all. Absent/empty = none. */
   briefTitleWorkspaces?: ReadonlySet<string> | "*";
   /** Session timing from canonical S3 (session-timing-source.ts); absent = 501 `timing_not_configured`. */
@@ -877,7 +880,7 @@ export function createReadApi(deps: ReadApiDeps) {
   });
 
   /** The P3 canary allowlist (READ_API_DIRECTORY_WORKSPACES), shared by the directory and timing routes. */
-  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "output" | "digest" | "catalog" | "login"): void {
+  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "output" | "digest" | "catalog" | "login" | "summary"): void {
     const allowed = deps.directoryWorkspaces;
     if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported(`${route}_workspace_not_enabled`);
   }
@@ -1213,6 +1216,32 @@ export function createReadApi(deps: ReadApiDeps) {
         return c.json({ error: { code: "backend_unavailable", message: "read backend unavailable" }, correlationId }, 503);
       }
       return fail(c, error);
+    }
+  });
+
+  // 044100 (brief summary): the real /v1/sessions/output route is registered above (this branch);
+  // main's notMigrated output placeholder is dropped to avoid a duplicate registration.
+  app.get("/v1/sessions/:sessionId/summary", async (c) => {
+    try {
+      const identity=c.get("identity");
+      attestWorkspace(c,identity); requireCanary(identity,"summary"); rejectUnsupported(c);
+      if(!deps.briefSummary)throw unsupported("summary_not_configured");
+      for(const name of Object.keys(c.req.query()))if(!["workspace","source","kind"].includes(name))throw unsupported(`param_${name}`);
+      const kind=single(c,"kind")??"short";
+      if(kind!=="short")throw unsupported("summary_kind");
+      const source=single(c,"source"),sessionId=c.req.param("sessionId");
+      if(!source||!HARNESS_NAME.test(source)||!sessionId||sessionId.length>MAX_ID_CHARS)throw bad("invalid session key");
+      const rows=await deps.briefSummary.read(identity.orgId,identity.workspaceId,source,sessionId);
+      if(rows===null)throw unsupported("summary_not_migrated");
+      return c.json({summary:briefSummaryResponse(rows,{...identity,source,sessionId})});
+    } catch(error) {
+      if(error instanceof BriefSummaryError) {
+        if(error.reason==="tenant_mismatch")return fail(c,new TenantMismatchError());
+        if(error.reason==="invalid_argument")return fail(c,bad("invalid session key"));
+        if(error.reason==="unqualified")return fail(c,unsupported("summary_unqualified"));
+        return c.json({error:{code:"backend_unavailable",message:"read backend unavailable"},correlationId:c.get("correlationId")},503);
+      }
+      return fail(c,error);
     }
   });
 

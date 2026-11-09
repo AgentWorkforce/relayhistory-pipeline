@@ -149,7 +149,7 @@ type RuntimeAclCatalog = ReturnType<typeof migrateGuards.runtimeApplicationAclCa
 
 /**
  * The previous release's ACL view: the current function ACL manifest and runtime application ACL catalog minus
- * everything the later steps CREATE. A previous release's binary shipped the manifest and catalog of its day, which
+ * everything omitted from that prefix CREATEs. A previous release's binary shipped the manifest and catalog of its day, which
  * could not yet list a function, table or sequence a later step creates; the current ones do, so on a database without
  * them the ACL install regclass/regprocedure-casts a missing object (42P01/42883) and the non-local exact-ACL check
  * refuses (function_acl_drift). Relations: CREATE [UNLOGGED|TEMP] TABLE/SEQUENCE in sessions, plus the
@@ -178,7 +178,7 @@ function previousReleaseAcl(laterSteps: ReadonlyArray<{ path: string }>, manifes
  * Model the previous release that stopped just before `cutoff`: `steps` is the full plan without `cutoff` and without
  * every later upstream step (a ledger gap otherwise); `later` names those later steps. When there are later steps,
  * sessionsFunctionAclManifest and runtimeApplicationAclCatalog are spied to return the previous release's ACL view
- * (previousReleaseAcl) until `restore()`; with no later step nothing is mocked (the current manifest and catalog are
+ * (previousReleaseAcl) until `restore()`; the cutoff's own CREATE FUNCTION definitions are omitted too. With no omitted step nothing is mocked (the current manifest and catalog are
  * that release's). `current` replaces the manifest/catalog the view is derived from (the regression test's synthetic
  * later slot); by default it is the real one. Every truncated `runMigrations` in this file goes through this model,
  * with `restore()` in a `finally` right after it.
@@ -191,13 +191,14 @@ async function previousReleaseModel(
   const laterSteps = laterUpstream(full, cutoff);
   const later = laterSteps.map((s) => s.name);
   const steps = full.filter((s) => s.name !== cutoff && !later.includes(s.name));
+  const omittedSteps = full.filter((s) => s.name === cutoff || later.includes(s.name));
   const { previousManifest, previousCatalog } = previousReleaseAcl(
-    laterSteps,
+    omittedSteps,
     current?.manifest ?? await migrateGuards.sessionsFunctionAclManifest(),
     current?.catalog ?? migrateGuards.runtimeApplicationAclCatalog(),
   );
-  const manifestSpy = later.length ? spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(previousManifest) : undefined;
-  const catalogSpy = later.length ? spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(previousCatalog) : undefined;
+  const manifestSpy = omittedSteps.length ? spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(previousManifest) : undefined;
+  const catalogSpy = omittedSteps.length ? spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(previousCatalog) : undefined;
   return {
     steps,
     later,
@@ -2373,6 +2374,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const SP = "upstream:20261105044050_selfhost_erase_short_summary_provenance.sql";
     const ST = "upstream:20261105044070_selfhost_erase_search_text_rebuild.sql";
     const CS = "upstream:20261105044080_ingest_claim_sessions.sql";
+    const CR = "upstream:20261105044090_claim_sessions_reader.sql";
     const DG = "upstream:20261105045000_digest_narrative_cache.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
@@ -2380,8 +2382,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, TK, CB, V, SF, SP, ST, CS, DG]));
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, TK, CB, V, SF, SP, ST, CS, CR, DG]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
@@ -2423,13 +2425,52 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105045000 (digest narrative cache) is the newest: its own down drops the table first.
-    // (044080 rolls back next, explicitly below, so no helper call here.)
+    // 20261105045000 (digest narrative cache) is the newest: its own down drops the table first, with assertions.
+    // (044090/044100 roll back next via the successor helper below; DG is excluded there since it is already gone.)
     expect(await names()).toContain(DG);
     expect(await relation("sessions.daily_digest_narratives")).toBe("sessions.daily_digest_narratives");
     await rollback("20261105045000_digest_narrative_cache.down.sql");
     expect(await names()).not.toContain(DG);
     expect(await relation("sessions.daily_digest_narratives")).toBeNull();
+    // A successor such as the read-only summary RPC must roll back first.
+    // Preserve an explicit out-of-order refusal before using every successor's
+    // guarded down script, so newer additive lanes need no fixture rewrites.
+    // (DG is already rolled back with assertions above, so it is excluded here.)
+    const newerThanClaimReaders = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > CR && s.name !== DG).reverse();
+    if (newerThanClaimReaders.length)
+      expect((await failure(rollback("20261105044090_claim_sessions_reader.down.sql")))?.code).toBe("55000");
+    for (const { name } of newerThanClaimReaders)
+      await rollback(`${name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`);
+    expect((await names()).filter((n) => newerThanClaimReaders.some((s) => s.name === n))).toEqual([]);
+    // 20261105044090 (claim sessions reader) is the newest: 044080's down refuses (55000) while it is applied, and its
+    // own down restores 044040's exact readers and 044080's exact guard (owner, SECURITY DEFINER and ACL unchanged),
+    // drops the refresh trigger and function, the read_enabled CHECK and column, and removes its ledger row.
+    const fnSrc = async (sig: string) => (await db.query<{ s: string | null; d: boolean | null }>("SELECT prosrc s,prosecdef d FROM pg_proc WHERE oid=to_regprocedure($1)", [sig])).rows[0] ?? null;
+    const readerSigs = ["sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)", "sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)"];
+    const crReaderAcl = async () => (await db.query<{ a: string }>("SELECT string_agg(coalesce(proacl::text,''),'|' ORDER BY oid) a FROM pg_proc WHERE oid IN (to_regprocedure($1),to_regprocedure($2))", readerSigs)).rows[0]!.a;
+    const readerObjects = async () => (await db.query<{ n: number }>("SELECT ((SELECT count(*) FROM pg_proc WHERE proname='ingest_batch_claim_sessions_refresh')+(SELECT count(*) FROM pg_trigger WHERE tgname='ingest_batch_claim_sessions_refresh')+(SELECT count(*) FROM pg_constraint WHERE conname='ingest_claim_sessions_policy_read_check')+(SELECT count(*) FROM pg_attribute WHERE attrelid=to_regclass('sessions.ingest_claim_sessions_policy') AND attname='read_enabled' AND NOT attisdropped))::int AS n")).rows[0]!.n;
+    const crAclBefore = await crReaderAcl();
+    expect(await readerObjects()).toBe(4);
+    for (const sig of readerSigs) expect((await fnSrc(sig))?.s).toContain("ingest_claim_sessions");
+    expect((await fnSrc("sessions.ingest_claim_sessions_policy_guard()"))?.s).toContain("NEW.read_enabled:=false;");
+    expect((await failure(rollback("20261105044080_ingest_claim_sessions.down.sql")))?.code).toBe("55000");
+    expect(await names()).toEqual(expect.arrayContaining([CS, CR]));
+    await rollback("20261105044090_claim_sessions_reader.down.sql");
+    expect(await names()).not.toContain(CR);
+    expect(await readerObjects()).toBe(0);
+    const sessionFirst = readFileSync(join(root, "supabase/migrations/20261105044040_buffered_stages_session_first.sql"), "utf8");
+    for (const sig of readerSigs) {
+      const f = await fnSrc(sig);
+      expect(f?.d).toBe(true);
+      expect(f?.s).not.toContain("ingest_claim_sessions");
+      expect(sessionFirst.includes(f!.s!)).toBe(true);
+    }
+    expect(await crReaderAcl()).toBe(crAclBefore);
+    const guardSrc = (await fnSrc("sessions.ingest_claim_sessions_policy_guard()"))!.s!;
+    expect(guardSrc).not.toContain("read_enabled");
+    expect(readFileSync(join(root, "supabase/migrations/20261105044080_ingest_claim_sessions.sql"), "utf8").includes(guardSrc)).toBe(true);
+    // Its ledger row is gone, so running it again refuses and changes nothing.
+    expect((await failure(rollback("20261105044090_claim_sessions_reader.down.sql")))?.code).toBe("55000");
     // 20261105044080 (claim sessions side table) is the newest: 044070's down refuses (55000) while it is applied, and
     // its own down drops the writer trigger, the side and policy tables and both functions, and removes its ledger row.
     const claimSessionObjects = async () => (await db.query<{ n: number }>("SELECT ((SELECT count(*) FROM pg_proc WHERE proname LIKE 'ingest_claim_sessions_%')+(SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'ingest_claim_sessions_%')+(SELECT count(*) FROM pg_class WHERE relname LIKE 'ingest_claim_sessions%'))::int AS n")).rows[0]!.n;
@@ -2544,7 +2585,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).toContain(SL);
     expect(await relation("sessions.read_api_tokens")).toBe("sessions.read_api_tokens");
     expect(await relation("sessions.ingest_seed_captures_org_id_idx")).toBe("sessions.ingest_seed_captures_org_id_idx");
-    // Every later upstream step is already rolled back here (045000, 044040 and 044030, explicitly above), so no helper call.
+    // Every later upstream step is already rolled back here (045000, 044100, 044090, 044040 and 044030, explicitly above), so no helper call.
     const laterNames = (await plan(SUPA_ET)).filter((s) => s.name.startsWith("upstream:") && s.name > CB).map((s) => s.name);
     expect((await names()).filter((n) => laterNames.includes(n))).toEqual([]);
     await rollback("20261105044020_claim_bootstrap_org_indexes.down.sql");
@@ -2959,7 +3000,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
     // Newer than 043900, so the grants' down refuses until they are rolled back,
-    // newest first: every upstream step after 044020 (rollbackLaterThan044020: 045000, 044080, 044070, 044050, 044040, 044030),
+    // newest first: every upstream step after 044020 (rollbackLaterThan044020: 045000, 044100, 044090, 044080, 044070, 044050, 044040, 044030),
     // then 044020 (claim-bootstrap indexes), 044010 (erase lock), 044000 (tokens), 043910 (erase).
     const orgIndexesDown = readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8");
     const lockDown = readFileSync(join(root, "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql"), "utf8");
@@ -4533,6 +4574,50 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
       manifestWithRuntime("g6_rt"),
     );
   });
+
+// The reserved summary lane owns both its read RPC and recorded-title schema.
+test("044100 real prefix upgrade/fresh/noop/rollback/up preserves pointers and exact owner-only invalidation ACL", async () => {
+  const db=await supabaseLike(); await db.exec(ET_BOOT);
+  const name="upstream:20261105044100_session_brief_summary_read.sql";
+  const full=await plan(SUPA_ET), previous=await previousReleaseModel(full,name);
+  try { expect(await failure(runMigrations(client(db),{profile:SUPA_ET,steps:previous.steps}))).toBeNull(); }
+  finally { previous.restore(); }
+  expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(false);
+  // A real pointer is preserved through the supported upgrade and rollback, not a
+  // synthetic title-only table standing in for the session schema.
+  await db.query(`INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,
+    created_at,last_activity_at,storage_provider,bucket,manifest_key,content_sha256,raw_format,trace_id,revision,title)
+    VALUES('org-title','ws-title','codex','session-title','machine-title','user-title',now(),now(),'fs','bucket','manifest/title',
+    decode(repeat('ab',32),'hex'),'jsonl','019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18',1,'Pointer retained')`);
+  const preserved=async()=>expect((await db.query<{title:string}>("SELECT title FROM sessions.session_index WHERE session_id='session-title'")).rows).toEqual([{title:"Pointer retained"}]);
+  // Newer additive lanes on this branch (045000 digest) also apply on a full upgrade;
+  // expect exactly the pending steps, which is 1 where 044100 is newest.
+  expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(full.length - previous.steps.length);
+  expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(true);await preserved();
+  const acl=await db.query<{secdef:boolean;acl:string[]}>(`SELECT p.prosecdef AS secdef,
+    ARRAY(SELECT CASE WHEN a.grantee=p.proowner THEN '<owner>' ELSE coalesce(r.rolname,'PUBLIC') END||':'||a.privilege_type
+      FROM aclexplode(coalesce(p.proacl,acldefault('f',p.proowner))) a LEFT JOIN pg_roles r ON r.oid=a.grantee ORDER BY 1) AS acl
+    FROM pg_proc p WHERE p.oid='sessions.session_directory_recorded_title_invalidate()'::regprocedure`);
+  expect(acl.rows).toEqual([{secdef:false,acl:["<owner>:EXECUTE"]}]);
+  const ledgerHash=async()=>migrationLedgerSha256(new Map((await db.query<{name:string;sha256:string}>("SELECT name,sha256 FROM sessions.__96bulls_migrations")).rows.map(r=>[r.name,r.sha256])));
+  const ledgerBefore=await ledgerHash();
+  expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(0);
+  expect(await ledgerHash()).toBe(ledgerBefore);await preserved();
+  // Branches with lanes newer than 044100 (045000 digest here) roll back newest-first:
+  // the 044100 down script refuses while a later migration is applied.
+  // (Literal name, not the DG const: this test lives outside that const's describe.)
+  if (full.some((s) => s.name === "upstream:20261105045000_digest_narrative_cache.sql")) await db.exec(readFileSync(join(root,"supabase/rollbacks/20261105045000_digest_narrative_cache.down.sql"),"utf8"));
+  await db.exec(readFileSync(join(root,"supabase/rollbacks/20261105044100_session_brief_summary_read.down.sql"),"utf8"));
+  expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(false);await preserved();
+  expect((await db.query("SELECT name FROM sessions.__96bulls_migrations WHERE name=$1",[name])).rows).toEqual([]);
+  // Re-applies exactly what was rolled back above (044100 alone where it is newest,
+  // 044100 + 045000 on branches with newer lanes).
+  expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(full.length - previous.steps.length);await preserved();
+  const freshDb=await supabaseLike();await freshDb.exec(ET_BOOT);
+  expect(await failure(runMigrations(client(freshDb),{profile:SUPA_ET,steps:full}))).toBeNull();
+  expect((await freshDb.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(true);
+},120000);
+
 });
 
 describe("every worker claim path runs the live gate first", () => {

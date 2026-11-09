@@ -209,6 +209,10 @@ function fakeSupabase(live: () => string[], busy: () => boolean = () => false, c
   const tx: SqlExecutor = {
     async query<R>(text: string) {
       calls.push(text.trim().replace(/\s+/g, " "));
+      // This fake models the pre-recorded-title catalog schema explicitly. Metadata
+      // denial/malformed rows remain production errors, not a legacy fallback.
+      if (text.includes("pg_catalog.pg_attribute") && text.includes("recorded_catalog_title"))
+        return { rows: [{ supported: false }] as R[] };
       if (text.includes("pg_try_advisory_xact_lock")) return { rows: [{ ok: !busy() }] as R[] };
       if (text.includes("event_projection_sources")) return { rows: [{ written: true }] as R[] };
       if (text.includes("FROM sessions.session_index") && text.includes("deleted_at IS NULL"))

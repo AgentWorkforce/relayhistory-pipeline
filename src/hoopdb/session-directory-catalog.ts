@@ -47,6 +47,8 @@ export type DirectoryCatalog = {
   relationshipsComplete?: boolean;
   /** Sorted, deduplicated reasons behind a false modelsComplete/relationshipsComplete. */
   incompleteReasons?: DirectoryCatalogIncompleteReason[];
+  /** Recorded, already-scrubbed catalog metadata; never inferred from transcript text. */
+  recordedTitle?: string | null;
   agentNames: string[];
   models: string[];
   projectKey: string | null;
@@ -109,6 +111,31 @@ function catalogProjectId(row: Record<string, unknown>): string | null {
   return null;
 }
 
+/** A denied or malformed metadata read is an error, never an old-schema fallback. */
+async function recordedTitleColumn(db: SqlExecutor): Promise<boolean> {
+  const { rows } = await db.query<{ supported: boolean }>(
+    "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass('sessions.session_directory') AND attname='recorded_catalog_title' AND NOT attisdropped) AS supported",
+  );
+  if (typeof rows[0]?.supported !== "boolean") throw new Error("directory_catalog_schema_unavailable");
+  return rows[0].supported;
+}
+
+/** Same native-brief then latest-live-pointer precedence as the directory projector.
+ * Parameters are fixed by the two statements below, never supplied by a request.
+ * The enclosing live CTE binds the physical source to this logical directory row.
+ */
+function recordedTitlePrioritySql(recorded: "$25" | "$18", physical: "$26" | "$20"): string {
+  return `coalesce((SELECT b.title FROM sessions.session_briefs b
+    WHERE b.org_id=d.org_id AND b.workspace_id=d.workspace_id AND b.harness=d.harness
+      AND b.session_id=${physical}::text AND b.title IS NOT NULL
+      AND b.engine_version NOT LIKE 'neon-backfill:%'),
+    (SELECT p.title FROM sessions.session_index p
+      WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness
+        AND p.session_id=${physical}::text AND p.deleted_at IS NULL
+      ORDER BY p.last_activity_at DESC,p.revision DESC,p.machine_id DESC LIMIT 1),
+    ${recorded}::text)`;
+}
+
 /** lower(btrim(x)) as PostgreSQL computes it for the agent companion table. */
 export function normalizeDirectoryAgent(name: string): string {
   return name.trim().toLowerCase();
@@ -133,6 +160,7 @@ export function directoryCatalogFromProjection(
     metadataVersion: 1,
     modelsComplete: true,
     relationshipsComplete: true,
+    recordedTitle: null,
     agentNames: [],
     models: [],
     projectKey: null,
@@ -159,6 +187,12 @@ export function directoryCatalogFromProjection(
   };
   for (const { table, row } of rows) {
     if (table === "session_catalog") {
+      // Match the read DTO bound (UTF-16 length), not only PostgreSQL code points.
+      const title = bounded(row.title, 90);
+      if (title !== null && title.length <= 90 &&
+          !/[\u0000-\u001f\u007f]/.test(row.title as string))
+        catalog.recordedTitle = title;
+
       for (const model of models(row.models)) modelSet.add(model);
       // A missing or unparseable models value (null), or any other non-array, is not a
       // known-empty model list (#182 contextual review, finding 4).
@@ -278,7 +312,7 @@ export async function writeDirectoryCatalog(
   db: SqlExecutor,
   key: SessionDirectoryKey,
   input: DirectoryCatalog,
-  options: { expectedEpoch: string },
+  options: { expectedEpoch: string; sourceSessionId?: string },
 ): Promise<{ written: boolean; staleEpoch?: true }> {
   const expectedEpoch = options?.expectedEpoch;
   if (typeof expectedEpoch !== "string" || !/^(0|[1-9][0-9]{0,18})$/.test(expectedEpoch))
@@ -288,6 +322,7 @@ export async function writeDirectoryCatalog(
     {
       table: "session_catalog",
       row: {
+        title: input.recordedTitle,
         models: input.models,
         project_key: input.projectKey,
         project_key_method: input.projectKeyMethod,
@@ -314,12 +349,32 @@ export async function writeDirectoryCatalog(
       },
     })),
   ]);
+  const hasRecordedValue = catalog.recordedTitle !== null;
+  const hasRecordedTitle = await recordedTitleColumn(db);
+  if (hasRecordedValue && !hasRecordedTitle)
+    throw Object.assign(new Error("directory_recorded_title_not_migrated"), { code: "42703" });
+  const sourceSessionId = options?.sourceSessionId ?? key.sessionId;
+  if (hasRecordedTitle && bounded(sourceSessionId, 255) !== sourceSessionId)
+    throw new Error("directory_catalog_source_invalid");
+  const qualifiedTitle = `d.event_projection_ready AND d.event_projection_epoch=$24::bigint
+    AND EXISTS(SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id
+      AND p.workspace_id=d.workspace_id AND p.harness=d.harness
+      AND p.session_id=$26::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id
+      AND p.deleted_at IS NULL)`;
+  const displayTitle = hasRecordedTitle
+    ? `CASE WHEN ${qualifiedTitle} THEN ${recordedTitlePrioritySql("$25", "$26")} ELSE d.title END`
+    : "d.title";
   const { rows } = await db.query<{ written: boolean; stale_epoch: boolean }>(
     `WITH live AS MATERIALIZED (
        SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.last_activity_at, d.event_projection_epoch
          FROM sessions.session_directory AS d
         WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
           AND d.deleted_at IS NULL AND d.event_projection_epoch = $24::bigint
+          ${hasRecordedValue ? `AND d.event_projection_ready AND EXISTS (
+            SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id
+              AND p.workspace_id=d.workspace_id AND p.harness=d.harness
+              AND p.session_id=$26::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id
+              AND p.deleted_at IS NULL)` : ""}
         FOR UPDATE
      ), children AS MATERIALIZED (
        SELECT c.session_id, c.deleted_at IS NOT NULL AS gone
@@ -330,7 +385,8 @@ export async function writeDirectoryCatalog(
         FOR SHARE OF c
      ), updated AS (
        UPDATE sessions.session_directory AS d
-          SET agent_names = $5::text[], catalog_models = $6::text[],
+          SET ${hasRecordedTitle ? `recorded_catalog_title = CASE WHEN ${qualifiedTitle} THEN $25::text ELSE d.recorded_catalog_title END, title = ${displayTitle},` : ""}
+              agent_names = $5::text[], catalog_models = $6::text[],
               project_key = $7, project_key_method = $8, initial_commit = $9,
               originator = $10, agent_version = $11,
               project_id = coalesce($12, d.project_id),
@@ -341,7 +397,7 @@ export async function writeDirectoryCatalog(
               agent_name = coalesce(d.agent_name, ($5::text[])[1]),
               agent_name_normalized = lower(btrim(coalesce(d.agent_name, ($5::text[])[1]))),
               search_text = sessions.session_directory_search_text(
-                d.title, d.task_title, coalesce(d.agent_name, ($5::text[])[1]),
+                ${displayTitle}, d.task_title, coalesce(d.agent_name, ($5::text[])[1]),
                 coalesce($12, d.project_id), coalesce($13, d.git_repo),
                 coalesce($14, d.git_branch), d.model, d.short_summary),
               catalog_projected_at = now(), catalog_read_projected_at = now(),
@@ -418,6 +474,7 @@ export async function writeDirectoryCatalog(
         input.relationshipsComplete === true &&
         catalog.relationshipsComplete === true,
       expectedEpoch,
+      ...(hasRecordedTitle ? [catalog.recordedTitle, sourceSessionId] : []),
     ],
   );
   if (rows[0]?.stale_epoch === true) return { written: false, staleEpoch: true };
@@ -438,12 +495,14 @@ export async function writeLegacyDirectoryCatalog(
   db: SqlExecutor,
   key: SessionDirectoryKey,
   input: DirectoryCatalog,
+  options?: { expectedEpoch: string; sourceSessionId?: string },
 ): Promise<{ written: boolean }> {
   // Re-derive through the same bounds, so a caller cannot bypass them.
   const catalog = directoryCatalogFromProjection([
     {
       table: "session_catalog",
       row: {
+        title: input.recordedTitle,
         models: input.models,
         project_key: input.projectKey,
         project_key_method: input.projectKeyMethod,
@@ -467,16 +526,41 @@ export async function writeLegacyDirectoryCatalog(
       },
     })),
   ]);
+  const hasRecordedValue = catalog.recordedTitle !== null;
+  const hasRecordedTitle = await recordedTitleColumn(db);
+  if (hasRecordedValue && !hasRecordedTitle)
+    throw Object.assign(new Error("directory_recorded_title_not_migrated"), { code: "42703" });
+  const expectedEpoch = options?.expectedEpoch;
+  if (hasRecordedValue &&
+      (typeof expectedEpoch !== "string" || !/^(0|[1-9][0-9]{0,18})$/.test(expectedEpoch)))
+    throw new Error("directory_catalog_epoch_invalid");
+  const sourceSessionId = options?.sourceSessionId ?? key.sessionId;
+  if (hasRecordedTitle && bounded(sourceSessionId, 255) !== sourceSessionId)
+    throw new Error("directory_catalog_source_invalid");
+  const qualifiedTitle = `d.event_projection_ready AND d.event_projection_epoch=$19::bigint
+    AND EXISTS(SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id
+      AND p.workspace_id=d.workspace_id AND p.harness=d.harness
+      AND p.session_id=$20::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id
+      AND p.deleted_at IS NULL)`;
+  const displayTitle = hasRecordedTitle
+    ? `CASE WHEN ${qualifiedTitle} THEN ${recordedTitlePrioritySql("$18", "$20")} ELSE d.title END`
+    : "d.title";
   const { rows } = await db.query<{ written: boolean }>(
     `WITH live AS MATERIALIZED (
        SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.last_activity_at
          FROM sessions.session_directory AS d
         WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
           AND d.deleted_at IS NULL
+          ${hasRecordedValue ? `AND d.event_projection_ready AND d.event_projection_epoch = $19::bigint
+            AND EXISTS (SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id
+              AND p.workspace_id=d.workspace_id AND p.harness=d.harness
+              AND p.session_id=$20::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id
+              AND p.deleted_at IS NULL)` : ""}
         FOR UPDATE
      ), updated AS (
        UPDATE sessions.session_directory AS d
-          SET agent_names = $5::text[], catalog_models = $6::text[],
+          SET ${hasRecordedTitle ? `recorded_catalog_title = CASE WHEN ${qualifiedTitle} THEN $18::text ELSE d.recorded_catalog_title END, title = ${displayTitle},` : ""}
+              agent_names = $5::text[], catalog_models = $6::text[],
               project_key = $7, project_key_method = $8, initial_commit = $9,
               originator = $10, agent_version = $11,
               project_id = coalesce($12, d.project_id),
@@ -487,7 +571,7 @@ export async function writeLegacyDirectoryCatalog(
               agent_name = coalesce(d.agent_name, ($5::text[])[1]),
               agent_name_normalized = lower(btrim(coalesce(d.agent_name, ($5::text[])[1]))),
               search_text = sessions.session_directory_search_text(
-                d.title, d.task_title, coalesce(d.agent_name, ($5::text[])[1]),
+                ${displayTitle}, d.task_title, coalesce(d.agent_name, ($5::text[])[1]),
                 coalesce($12, d.project_id), coalesce($13, d.git_repo),
                 coalesce($14, d.git_branch), d.model, d.short_summary),
               catalog_projected_at = now()
@@ -547,6 +631,7 @@ export async function writeLegacyDirectoryCatalog(
       catalog.agentNames.map(normalizeDirectoryAgent),
       catalog.relationships.map((edge) => edge.relationshipUid),
       catalog.relationships.map((edge) => edge.childSessionId),
+      ...(hasRecordedTitle ? [catalog.recordedTitle, expectedEpoch ?? null, sourceSessionId] : []),
     ],
   );
   return { written: rows[0]?.written === true };

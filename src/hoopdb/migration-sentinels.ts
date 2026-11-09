@@ -193,6 +193,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_buffer_gc_claim(jsonb)') AND prosecdef AND prosrc LIKE '%96bulls:buffer-gc-user-v1%') AS applied",
   },
   "upstream:20261105043850_ingest_acquisition_owner.sql": { evidence: "table sessions.ingest_acquisition_owners", sql: relation("sessions.ingest_acquisition_owners") },
+  "upstream:20261105044100_session_brief_summary_read.sql": { evidence: "summary read RPC and recorded catalog title storage/invalidation", sql: "SELECT to_regprocedure('sessions.session_brief_summary_for(text,text,text)') IS NOT NULL AND to_regprocedure('sessions.session_directory_recorded_title_invalidate()') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass('sessions.session_directory') AND attname='recorded_catalog_title' AND NOT attisdropped) AND EXISTS(SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid=to_regclass('sessions.session_directory') AND tgname='session_directory_recorded_title_invalidate' AND NOT tgisinternal) AS applied" },
   "upstream:20261105043000_brief_titles.sql": { evidence: "column sessions.session_briefs.origin", sql: column("sessions.session_briefs", "origin") },
   "upstream:20261105043500_lazy_claim_clock_narrowing.sql": {
     evidence: "replacement: lazy claim reads the seat clock under KEY SHARE with one advisory lock per (org, workspace, origin)",
@@ -350,6 +351,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence:
       "DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)",
     sql: column("sessions.session_summaries", "object_key"),
+  },
+  "upstream:20261105044090_claim_sessions_reader.sql": {
+    evidence: "ALTER + replacement: column sessions.ingest_claim_sessions_policy.read_enabled (the claim-sessions reader switch)",
+    sql: column("sessions.ingest_claim_sessions_policy", "read_enabled"),
   },
   "upstream:20261105044080_ingest_claim_sessions.sql": {
     evidence: "table sessions.ingest_claim_sessions",
