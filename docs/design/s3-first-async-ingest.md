@@ -1,6 +1,8 @@
 # S3-first async admission: Supabase off the upload hot path
 
-Status: implemented behind `INGEST_ASYNC_ADMISSION` (default `off`). Merging the code changes
+Status: implemented behind `INGEST_ASYNC_ADMISSION` (runtime default `off`). The Cloudflare stack
+input `sessionIngest.asyncAdmission` defaults to `"on"` for a buffered stage (see "Deploy inputs");
+synchronous admission (`"off"`) is the explicit fallback. Merging the code changes
 nothing in production. Turning it on also needs the stack (PR #367), relayhistory and queue
 retention steps listed under "Rollout".
 
@@ -345,7 +347,10 @@ change.
 
 Flag `INGEST_ASYNC_ADMISSION`: `off` (default) | `on` | `drain`. `on` and `drain` require
 buffered acceptance and the `INGEST_ADMISSION` binding. Without the binding the Worker reports
-`not_configured`.
+`not_configured`. The Cloudflare stack renders this var from `sessionIngest.asyncAdmission`
+(a buffered stage defaults to `"on"` there), but the runtime default stays `off` on purpose: a
+Worker version or self-host deployment without the var must never start admitting asynchronously,
+neither on a gradual version split nor on a stack that did not give it the queue.
 
 | Mode | Async ACK | Controls journaled | Consumer admits |
 | --- | --- | --- | --- |
@@ -383,14 +388,18 @@ Steps:
      **not paused** (separate from the paused buffered fanout queue, whose pause guards
      canonical drain and is untouched)
    - consumer = the ingest Worker, batch 1, max retries 20, max concurrency 4
-   - binding `INGEST_ADMISSION`, var `INGEST_ASYNC_ADMISSION=drain`
+   - binding `INGEST_ADMISSION`, var `INGEST_ASYNC_ADMISSION=drain` (stack input
+     `sessionIngest.asyncAdmission: "drain"`; the plan contract refuses the phase "async admission
+     addition" with `"on"`, including the default, and the retained operator refuses an `"on"`
+     capture that would still create the `INGEST_ADMISSION` binding on a deployed Worker)
    - required post-create step: message retention 1209600 s on both queues (PR #367 body)
 3. **Deploy with `drain`.** The only behaviour change is two S3 compare-and-swaps around each
    reset / re-enable. Let `drain` reach 100% of Worker versions (no gradual split with an `off`
    version still serving) BEFORE `on`. An `off` version would apply a control without journaling
    it while an `on` version's consumer admits.
 4. **relayhistory-cloud:** the paired contract in section (a).
-5. **Flip the ingest to `on`**, then canary one org in relayhistory. Watch:
+5. **Flip the ingest to `on`** (re-capture with `asyncAdmission: "on"` or omitted: a var-only
+   "session ingest update"), then canary one org in relayhistory. Watch:
    - request-path p99 and 5xx rate (the 55P03/57014 503s should vanish from `delivery.batches`)
    - `ingest.admission` outcomes
    - lag (`offset`)
@@ -421,7 +430,15 @@ Rollback:
 ## Deploy inputs (for the Worker deploy actor)
 
 - **Source:** the merge SHA of this change on `main`, with PR #367 merged.
-- **Var:** `INGEST_ASYNC_ADMISSION=drain` first; then `on`, as a var-only update.
+- **Stack input:** `sessionIngest.asyncAdmission` = `"on"` | `"drain"` | `"off"`. Buffered stage:
+  omitted means `"on"` (the three admission resources, the binding and the var); `"off"` renders
+  exactly the pre-admission stage (no queue, DLQ, consumer, binding or var). Canonical stage: omit
+  or `"off"` only; anything else refuses.
+- **Var:** `INGEST_ASYNC_ADMISSION=drain` first; then `on`, as a var-only update. For an already
+  deployed buffered stage the first capture must say `"drain"` explicitly: the plan contract
+  refuses "async admission addition" with `"on"` (or omitted), because `drain` has to reach 100% of
+  Worker versions first (step 3). A fresh "session ingest rollout" (no deployed Worker) may be
+  `"on"` directly.
 - **Queue:** `96bulls-session-ingest-admission` (producer `INGEST_ADMISSION` + consumer, this
   Worker) and DLQ `96bulls-session-ingest-admission-dlq`. Batch 1, max retries 20, max
   concurrency 4, not paused, retention 1209600 s (post-create).
