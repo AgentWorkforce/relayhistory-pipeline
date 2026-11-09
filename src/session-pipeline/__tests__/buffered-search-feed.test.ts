@@ -114,6 +114,8 @@ function fakeClickHouse(opts: { originColumns?: false | readonly ColumnRow[] } =
     },
     async select<T>(query: string, options?: { params?: Record<string, unknown> }) {
       if (query.includes("search_ingest_state")) return [] as T[];
+      // The output-facts schema probe (erasure path): no fact tables exist in this fake.
+      if (query.includes("system.columns") && query.includes("{tables:Array(String)}")) return [] as T[];
       if (query.includes("system.columns")) {
         // The check must read the default kind, not only type and expression.
         expect(query).toContain("default_kind");
