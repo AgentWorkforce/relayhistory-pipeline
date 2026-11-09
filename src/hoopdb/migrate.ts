@@ -473,7 +473,7 @@ async function migrationPreflight(client: MigrationClient, profile: MigrationPro
   }
   await cliHistoryPreflight(client, schema);
   await sequencePreflight(client, schema, ledger);
-  // Adoptable-index steps (20261105044020): an absent index on a populated table without the
+  // Adoptable-index steps (20261105044020, 20261105044040): an absent index on a populated table without the
   // opt-in refuses HERE, read-only, so the release plan goes red and a refused apply never
   // reaches the 'pending' readiness marker below.
   await adoptableIndexBuildPreflight(client, schema, ledger, {

@@ -2299,13 +2299,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const AJ = "upstream:20261105046000_analysis_jobs.sql";
     const TK = "upstream:20261105044000_read_api_tokens.sql";
     const CB = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
+    const SF = "upstream:20261105044040_buffered_stages_session_first.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, AJ]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, AJ]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
@@ -2351,6 +2352,29 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105040000_ingest_lazy_source_tables.down.sql")))?.code).toBe("55000");
     await rollback("20261105046000_analysis_jobs.down.sql");
     expect(await names()).not.toContain("upstream:20261105046000_analysis_jobs.sql");
+    // 20261105044040 (session-first buffered stages) is then the newest: 044030's down refuses (55000) while it is
+    // applied; its own down restores 043700's exact two reader bodies (same ACL, still SECURITY DEFINER) and
+    // keeps the records GIN, and a second run refuses (its ledger row is gone).
+    const readerSrc = async () =>
+      (await db.query<{ s: string }>("SELECT string_agg(prosrc, '' ORDER BY oid) s FROM pg_proc WHERE oid IN (to_regprocedure('sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)'), to_regprocedure('sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)'))")).rows[0]!.s;
+    const readerAcl = async () =>
+      (await db.query<{ a: string }>("SELECT string_agg(proname || ':' || prosecdef || ':' || coalesce(proacl::text, ''), ',' ORDER BY proname) a FROM pg_proc WHERE pronamespace = 'sessions'::regnamespace AND proname IN ('buffered_sessions_for', 'buffered_session_stages_for')")).rows[0]!.a;
+    const original = readFileSync(join(root, "supabase/migrations/20261105043700_owner_buffered_read.sql"), "utf8");
+    const aclBefore = await readerAcl();
+    expect(await names()).toContain(SF);
+    expect(await readerSrc()).toContain("count(*) OVER (PARTITION BY rc.stage_token, rc.ord)");
+    expect(await relation("sessions.ingest_claim_attempts_records_gin_idx")).toBe("sessions.ingest_claim_attempts_records_gin_idx");
+    expect((await failure(rollback("20261105044030_ingest_generation_overlap.down.sql")))?.code).toBe("55000");
+    await rollback("20261105044040_buffered_stages_session_first.down.sql");
+    expect(await names()).not.toContain(SF);
+    expect(await readerSrc()).not.toContain("count(*) OVER (PARTITION BY");
+    for (const [fn, tag] of [["buffered_sessions_for", "buffered_sessions"], ["buffered_session_stages_for", "buffered_stages"]] as const) {
+      const body = original.match(new RegExp(`CREATE FUNCTION sessions\\.${fn}\\([\\s\\S]*?AS \\$${tag}\\$([\\s\\S]*?)\\$${tag}\\$;`))![1]!;
+      expect((await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE pronamespace = 'sessions'::regnamespace AND proname = $1", [fn])).rows[0]!.s).toBe(body);
+    }
+    expect(await readerAcl()).toBe(aclBefore);
+    expect(await relation("sessions.ingest_claim_attempts_records_gin_idx")).toBe("sessions.ingest_claim_attempts_records_gin_idx");
+    expect((await failure(rollback("20261105044040_buffered_stages_session_first.down.sql")))?.code).toBe("55000");
     // 20261105044030 (generation overlap) is then the newest: 044020, 044010, 044000, 043910, 043900 and 043880 refuse (55000)
     // while it is applied, so it rolls back FIRST; its own down restores the exact strict 050000
     // ingest_require_generation and 055000 ingest_lazy_guard, drops the window and retired tables, the policy
@@ -2796,7 +2820,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
     // Newer than 043900, so the grants' down refuses until they are rolled back,
-    // newest first: every upstream step after 044020 (rollbackLaterThan044020: 046000, 044030),
+    // newest first: every upstream step after 044020 (rollbackLaterThan044020: 046000, 044040, 044030),
     // then 044020 (org indexes), 044010 (erase lock), 044000 (tokens), 043910 (erase).
     const orgIndexesDown = readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8");
     const lockDown = readFileSync(join(root, "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql"), "utf8");
@@ -3299,6 +3323,139 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const error = await failure(inspectMigrations(client(db), SUPA_ET));
     await db.exec("ROLLBACK");
     expect(error?.code).toBe("migration_changed");
+  });
+
+  test("release read-only plan goes red on 20261105044040 when the records GIN is absent and ingest_claim_attempts is populated; after the CONCURRENTLY build the apply adopts it and replaces both readers", async () => {
+    const db = await supabaseLike();
+    await db.exec(ET_BOOT);
+    const SF = "upstream:20261105044040_buffered_stages_session_first.sql";
+    const GIN = ADOPTABLE_INDEXES[SF]!;
+    expect(GIN.map((x) => x.name)).toEqual(["ingest_claim_attempts_records_gin_idx"]);
+    // The previous release: everything before 044040 (no later upstream step: a ledger gap), validated.
+    const full = await plan(SUPA_ET);
+    const later = full.filter((s) => s.name.startsWith("upstream:") && s.name > SF).map((s) => s.name);
+    expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps: full.filter((s) => s.name !== SF && !later.includes(s.name)) }))).toBeNull();
+    // Production shape: ingest_claim_attempts populated (FK triggers off for this one superuser insert), no GIN yet.
+    await db.exec(`SET session_replication_role = replica;
+      INSERT INTO sessions.ingest_claim_attempts(claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,epochs,records)
+        VALUES (gen_random_uuid(),'org-probe','ws-probe','u','o','b','d','[]','[{"source":"claude","session_id":"s"}]');
+      SET session_replication_role = origin`);
+    const readerSrc = async () =>
+      (await db.query<{ s: string }>("SELECT string_agg(prosrc, '' ORDER BY proname) s FROM pg_proc WHERE pronamespace = 'sessions'::regnamespace AND proname IN ('buffered_sessions_for', 'buffered_session_stages_for')")).rows[0]!.s;
+    const readerAcl = async () =>
+      (await db.query<{ a: string }>("SELECT string_agg(proname || ':' || prosecdef || ':' || provolatile::text || ':' || coalesce(proacl::text, ''), ',' ORDER BY proname) a FROM pg_proc WHERE pronamespace = 'sessions'::regnamespace AND proname IN ('buffered_sessions_for', 'buffered_session_stages_for')")).rows[0]!.a;
+    const srcBefore = await readerSrc(), aclBefore = await readerAcl();
+    const before = await snapshot(db);
+    expect((before.marker as Array<{ status: string }>).map((r) => r.status)).toEqual(["pass"]);
+    // Plan mode (read-only): red, naming the index and this step's operator packet.
+    await db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const planned = await failure(inspectMigrations(client(db), SUPA_ET));
+    await db.exec("ROLLBACK");
+    expect(planned?.code).toBe("index_prebuild_required");
+    expect(planned?.message).toContain(`index sessions.ingest_claim_attempts_records_gin_idx on sessions.ingest_claim_attempts (${SF}) is absent and table sessions.ingest_claim_attempts is not empty`);
+    expect(planned?.message).toContain("buffered-stages session-first operator packet");
+    expect(planned?.message).not.toContain("claim-bootstrap index packet");
+    // Apply: the same refusal before anything is written; the readers keep 043700's bodies, the marker stays 'pass'.
+    expect((await failure(runMigrations(client(db), { profile: SUPA_ET })))?.code).toBe("index_prebuild_required");
+    expect(await snapshot(db)).toEqual(before);
+    expect(await readerSrc()).toBe(srcBefore);
+    // After the operator's CONCURRENTLY build: green with 044040 pending; the apply adopts the index (same oid)
+    // and replaces both readers, ACL, SECURITY DEFINER and volatility unchanged.
+    await db.exec(`CREATE INDEX CONCURRENTLY ingest_claim_attempts_records_gin_idx ON sessions.ingest_claim_attempts USING gin (records jsonb_path_ops)`);
+    const oid = async () => (await db.query<{ o: number }>("SELECT to_regclass('sessions.ingest_claim_attempts_records_gin_idx')::oid::int o")).rows[0]!.o;
+    const built = await oid();
+    await db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const report = await inspectMigrations(client(db), SUPA_ET);
+    await db.exec("ROLLBACK");
+    expect(report.inventory.filter((s) => s.pending).map((s) => s.name)).toEqual([SF, ...later]);
+    expect(await failure(runMigrations(client(db), { profile: SUPA_ET, expectedLedgerSha256: report.ledgerSha256 }))).toBeNull();
+    expect(await oid()).toBe(built);
+    expect(await readerSrc()).toContain("count(*) OVER (PARTITION BY rc.stage_token, rc.ord)");
+    expect(await readerAcl()).toBe(aclBefore);
+    expect(((await snapshot(db)).marker as Array<{ status: string }>).map((r) => r.status)).toEqual(["pass"]);
+  });
+
+  describe("20261105044040 exact-body adoption: an out-of-band apply of the step's own reader bodies", () => {
+    const SF = "upstream:20261105044040_buffered_stages_session_first.sql";
+    const SF_SQL = readFileSync(join(root, "supabase/migrations/20261105044040_buffered_stages_session_first.sql"), "utf8");
+    /** The standalone CREATE OR REPLACE statement for one reader, exactly as the file has it (packet A's extraction). */
+    const statement = (fn: string, tag: string) => {
+      const start = SF_SQL.indexOf(`CREATE OR REPLACE FUNCTION sessions.${fn}(`);
+      const close = `$${tag}$;`;
+      const end = SF_SQL.indexOf(close, start);
+      expect(start).toBeGreaterThan(0);
+      expect(end).toBeGreaterThan(start);
+      return SF_SQL.slice(start, end + close.length);
+    };
+    const LIST = () => statement("buffered_sessions_for", "buffered_sessions");
+    const STAGES = () => statement("buffered_session_stages_for", "buffered_stages");
+    const SENTINEL = () => MIGRATION_SENTINELS[SF]!.sql;
+    /** The previous release (everything before 044040, no later upstream step), validated, on the supabase/ET shape. */
+    const previousRelease = async () => {
+      const db = await supabaseLike();
+      await db.exec(ET_BOOT);
+      const full = await plan(SUPA_ET);
+      const later = full.filter((s) => s.name.startsWith("upstream:") && s.name > SF).map((s) => s.name);
+      expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps: full.filter((s) => s.name !== SF && !later.includes(s.name)) }))).toBeNull();
+      return db;
+    };
+    const ledgered = async (db: PGlite) =>
+      (await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name = $1", [SF])).rows[0]!.n === 1;
+    const sentinel = async (db: PGlite) => (await db.query<{ applied: boolean }>(SENTINEL())).rows[0]!.applied;
+
+    test("the declared tags parse to exactly the file's two bodies", () => {
+      for (const tag of ["buffered_sessions", "buffered_stages"]) {
+        const body = migrateGuards.dollarQuotedBody(SF_SQL, tag);
+        expect(body).not.toBeNull();
+        expect(body!.startsWith("\n")).toBe(true);
+        expect(body!.trimEnd().endsWith("END")).toBe(true);
+      }
+      expect(migrateGuards.dollarQuotedBody(SF_SQL, "no_such_tag")).toBeNull();
+      expect(migrateGuards.dollarQuotedBody(`${SF_SQL}\n-- $buffered_stages$`, "buffered_stages")).toBeNull();
+    });
+
+    test("both bodies pre-applied byte-identical: the migrator adopts them, applies the step and ledgers it", async () => {
+      const db = await previousRelease();
+      await db.exec(LIST());
+      await db.exec(STAGES());
+      expect(await sentinel(db)).toBe(true);
+      expect(await failure(runMigrations(client(db), { profile: SUPA_ET }))).toBeNull();
+      expect(await ledgered(db)).toBe(true);
+      expect(await sentinel(db)).toBe(true);
+    });
+
+    test("one body differs by a single byte: refused (unledgered_schema) before any write", async () => {
+      const db = await previousRelease();
+      await db.exec(LIST());
+      const stages = STAGES();
+      const tweaked = stages.replace("$buffered_stages$\n", "$buffered_stages$\n ");
+      expect(tweaked).not.toBe(stages);
+      await db.exec(tweaked);
+      expect(await sentinel(db)).toBe(true);
+      const error = await failure(runMigrations(client(db), { profile: SUPA_ET }));
+      expect(error?.code).toBe("unledgered_schema");
+      expect(error?.message).toContain(`(${SF})`);
+      expect(await ledgered(db)).toBe(false);
+    });
+
+    test("both bodies byte-identical but an attribute differs (volatility): refused", async () => {
+      const db = await previousRelease();
+      await db.exec(LIST());
+      await db.exec(STAGES());
+      await db.exec("ALTER FUNCTION sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text) VOLATILE");
+      const error = await failure(runMigrations(client(db), { profile: SUPA_ET }));
+      expect(error?.code).toBe("unledgered_schema");
+      expect(await ledgered(db)).toBe(false);
+    });
+
+    test("only stages pre-applied (packet A): the sentinel does not fire and the migrator applies normally", async () => {
+      const db = await previousRelease();
+      await db.exec(STAGES());
+      expect(await sentinel(db)).toBe(false);
+      expect(await failure(runMigrations(client(db), { profile: SUPA_ET }))).toBeNull();
+      expect(await ledgered(db)).toBe(true);
+      expect(await sentinel(db)).toBe(true);
+    });
   });
 
   test("release read-only plan goes red on 20261105044020 when a claim-bootstrap index is absent on a populated table; the apply refuses before the pending marker", async () => {
