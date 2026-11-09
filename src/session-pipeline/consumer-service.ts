@@ -1193,6 +1193,8 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
   try {
     await runWorker({
       service: "session-pipeline-consumer",
+      // consumerServiceConfig admits exactly these two for the writer.
+      searchBackends: ["postgres", "opensearch"],
       stages: [],
       handlers: () => ({}),
       tick: async () => {
