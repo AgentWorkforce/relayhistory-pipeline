@@ -2347,9 +2347,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
     // 20261105044050 (erase clears the short_summary provenance) is the newest: 044030's and 044010's downs refuse
-    // (55000) while it is applied, and its own down restores 044010's exact body (the lock, without the provenance clear).
+    // (55000) while it is applied, and its own down restores 044010's exact erase (the lock, without the provenance clear)
+    // and 060000's exact retire trigger function (still SECURITY DEFINER, both triggers kept).
     const eraseSrc = async () => (await db.query<{ s: string | null }>("SELECT prosrc s FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)')")).rows[0]!.s;
+    const retireSrc = async () => (await db.query<{ s: string | null }>("SELECT prosrc s FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_publication_retire_fence()') AND prosecdef")).rows[0]?.s ?? null;
+    const retireTriggers = async () => (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname IN ('ingest_publication_retire_version','ingest_publication_retire_reset') AND tgfoid=to_regprocedure('sessions.ingest_publication_retire_fence()')")).rows[0]!.n;
     expect(await eraseSrc()).toContain("short_summary_generated_at=NULL");
+    expect(await retireSrc()).toContain("short_summary_generated_at=NULL");
+    expect(await retireTriggers()).toBe(2);
     expect((await failure(rollback("20261105044030_ingest_generation_overlap.down.sql")))?.code).toBe("55000");
     expect((await failure(rollback("20261105044010_selfhost_erase_lock_fences.down.sql")))?.code).toBe("55000");
     expect(await names()).toEqual(expect.arrayContaining([V, SL]));
@@ -2357,6 +2362,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).not.toContain(SP);
     expect(await eraseSrc()).not.toContain("short_summary_generated_at");
     expect(await eraseSrc()).toContain("ingest_lock_fences(v_org,v_ws,v_user)");
+    expect(await retireSrc()).toContain("UPDATE sessions.session_directory d SET short_summary=NULL,\n   deleted_at=");
+    expect(await retireSrc()).not.toContain("short_summary_generated_at");
+    expect(await retireTriggers()).toBe(2);
     // Its ledger row is gone, so running it again refuses and changes nothing.
     expect((await failure(rollback("20261105044050_selfhost_erase_short_summary_provenance.down.sql")))?.code).toBe("55000");
     // 20261105044030 (generation overlap) is then the newest: 044020, 044010, 044000, 043910, 043900 and 043880 refuse (55000)

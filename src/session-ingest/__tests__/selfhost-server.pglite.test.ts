@@ -491,6 +491,40 @@ describe("per-session erase (RELAYHISTORY_SELFHOST_SESSION_SELECTION=true)", () 
     expect({ ...gone, deleted_at: null }).toEqual({ deleted_at: null, ...cleared });
   });
 
+  test("the managed-head retire trigger clears the short summary with its provenance, never 23514 (044050)", async () => {
+    const { db } = await database();
+    await pointer(db, "sess-1", machine);
+    await pointer(db, "sess-1", "srv_other-machine");
+    await directory(db, "sess-1");
+    await db.query(
+      `UPDATE sessions.session_directory SET short_summary = 'a scrubbed summary', short_summary_scrub_ruleset = 'relayhistory-scrub',
+         short_summary_scrub_version = 1, short_summary_source = 'bob-costas/extractive/v1', short_summary_generated_at = now()
+       WHERE session_id = 'sess-1'`);
+    // A live publication head on the caller's machine (the generation row references the head).
+    const generation = "6f1c2a4e-3b5d-4c7e-8f90-a1b2c3d4e5f6";
+    await db.query(
+      `INSERT INTO sessions.ingest_publication_heads (org_id, workspace_id, user_id, origin_id, source, session_id, physical_workspace,
+         physical_source, physical_session, machine_id, generation, fence_epoch, reset_epoch, pointer_revision, current_key, state)
+       VALUES ($1, $2, $3, $4, 'claude', 'sess-1', $2, 'claude', 'sess-1', $5, $6, 1, 0, 1, 'k/sess-1' || $5, 'live')`,
+      [TENANT.orgId, TENANT.workspaceId, TENANT.userId, ORIGIN_ID, machine, generation]);
+    await db.query(
+      `INSERT INTO sessions.ingest_publication_generations (generation, prefix, org_id, workspace_id, user_id, origin_id, source, session_id,
+         fence_epoch, reset_epoch, state, target_bucket, target_region, key_root)
+       VALUES ($5::uuid, 'p/' || $5, $1, $2, $3, $4, 'claude', 'sess-1', 1, 0, 'live', 'bucket', 'us-east-1', '96bulls')`,
+      [TENANT.orgId, TENANT.workspaceId, TENANT.userId, ORIGIN_ID, generation]);
+    // A user reset moves the reset epoch past the head's, so ingest_publication_retire_reset retires it. The other
+    // machine's copy keeps the directory row live (no tombstone trigger): before 044050 the trigger's directory
+    // UPDATE cleared short_summary alone and broke session_directory_short_summary_provenance (23514).
+    await db.query("INSERT INTO sessions.upload_resets (org_id, workspace_id, user_id, request_id) VALUES ($1, $2, $3, 'r-1')",
+      [TENANT.orgId, TENANT.workspaceId, TENANT.userId]);
+    expect((await db.query("SELECT state FROM sessions.ingest_publication_heads")).rows).toEqual([{ state: "retired" }]);
+    expect((await db.query("SELECT state FROM sessions.ingest_publication_generations")).rows).toEqual([{ state: "retired" }]);
+    expect((await row(db, "sess-1", "srv_other-machine")).deleted_at).toBeNull();
+    expect((await db.query(
+      "SELECT deleted_at, short_summary, short_summary_scrub_ruleset, short_summary_scrub_version, short_summary_source, short_summary_generated_at FROM sessions.session_directory WHERE session_id = 'sess-1'",
+    )).rows).toEqual([{ deleted_at: null, short_summary: null, short_summary_scrub_ruleset: null, short_summary_scrub_version: null, short_summary_source: null, short_summary_generated_at: null }]);
+  });
+
   test("one selection erases every origin of the caller's session, relay turns included; another user's copy stays", async () => {
     const rc = await relaycontrol(() => active(["rth:sync"]));
     const { url, db } = await start(rc, on);
