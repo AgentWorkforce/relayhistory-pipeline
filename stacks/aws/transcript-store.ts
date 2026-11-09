@@ -55,6 +55,7 @@ import {
   SESSION_SEMANTIC_COPY_RESOURCES,
   SESSION_ANALYSIS_JOB_RESOURCES,
   SESSION_BUFFERED_SEARCH_FEED_RESOURCES,
+  SESSION_BUFFERED_ERASURE_DELETE_RESOURCES,
   SESSION_PIPELINE_RESOURCES,
   assertSessionPipelineInputs,
   pipelineBucketStatements,
@@ -250,6 +251,8 @@ export type TranscriptStorePlanPhase =
   | "session analysis jobs update"
   | "session buffered search feed rollout"
   | "session buffered search feed update"
+  | "session buffered erasure delete rollout"
+  | "session buffered erasure delete update"
   | "repo tag rename";
 
 /**
@@ -474,6 +477,30 @@ function sessionBufferedSearchFeedPhase(operations: ReadonlyMap<string, string>,
   return phase;
 }
 
+/** The buffered erasure delete schedule is its own reviewed phase, never a mixed rollout. */
+function sessionBufferedErasureDeletePhase(operations: ReadonlyMap<string, string>, detailedPlanText: string, stateSnapshotText: string | undefined, refuse: (why: string) => never): TranscriptStorePlanPhase | undefined {
+  const [schedule, permission] = SESSION_BUFFERED_ERASURE_DELETE_RESOURCES.map((r) => operations.get(r) ?? "noop");
+  if (schedule === "noop" && permission === "noop") return undefined;
+  const phase: TranscriptStorePlanPhase | undefined = [schedule, permission].every((a) => a === "create" || a === "noop")
+    ? "session buffered erasure delete rollout"
+    : schedule === "update" && permission === "noop"
+      ? "session buffered erasure delete update"
+      : undefined;
+  if (!phase) return refuse("buffered erasure delete resources have an unsafe action combination");
+  const allowed = new Set<string>([...SESSION_BUFFERED_ERASURE_DELETE_RESOURCES, ...SESSION_PIPELINE_RESOURCES, ...ROLE_GRANT_RESOURCES, ...SESSION_READ_API_RESOURCES]);
+  if ([...operations].some(([r, a]) => a !== "noop" && !allowed.has(r))) return refuse("buffered erasure delete requires a separate reviewed phase");
+  const readApi = SESSION_READ_API_RESOURCES as readonly string[];
+  if (!readApi.every((r) => !operations.has(r) || operations.get(r) === "noop")) {
+    if (!readApiCodeOnlyShape(operations)) return refuse("buffered erasure delete: read api may not change in same plan");
+    assertReadApiCodeOnlyCascade(detailedPlanText, stateSnapshotText, (why) => refuse("buffered erasure delete: " + why));
+  }
+  const erasureRest = new Map([...operations].filter(([r]) => !(SESSION_BUFFERED_ERASURE_DELETE_RESOURCES as readonly string[]).includes(r) && !readApi.includes(r)));
+  if ([...erasureRest.values()].every((a) => a === "noop")) return phase;
+  if (sessionPipelinePhase(erasureRest) !== "session pipeline update") return refuse("buffered erasure delete: rest must be noop or session pipeline update");
+  assertPipelineRoleCascadeDiff(erasureRest, detailedPlanText, stateSnapshotText, refuse);
+  return phase;
+}
+
 const TRANSCRIPT_PLAN_PHASES: ReadonlyArray<{ name: TranscriptStorePlanPhase; actions: Readonly<Record<string, "create" | "update">> }> = [
   { name: "initial", actions: Object.fromEntries(TRANSCRIPT_RESOURCES.map((resource) => [resource, "create"])) },
   { name: "principal-propagation recovery", actions: { transcripts: "create", "transcripts-key": "create", "transcripts-key-alias": "create" } },
@@ -517,14 +544,16 @@ function expectedResources(names: Iterable<string>): readonly string[] {
   const withSemantic=list.some(n=>(SESSION_SEMANTIC_COPY_RESOURCES as readonly string[]).includes(n));
   const withAnalysisJobs=list.some(n=>(SESSION_ANALYSIS_JOB_RESOURCES as readonly string[]).includes(n));
   const withBufferedFeed = list.some((n) => (SESSION_BUFFERED_SEARCH_FEED_RESOURCES as readonly string[]).includes(n));
+  const withBufferedErasure = list.some((n) => (SESSION_BUFFERED_ERASURE_DELETE_RESOURCES as readonly string[]).includes(n));
   return [
     ...TRANSCRIPT_RESOURCES,
-    ...(withBrief || withAnalysis || withSemantic || withAnalysisJobs || withBufferedFeed || list.some((n) => pipeline.has(n)) ? SESSION_PIPELINE_RESOURCES : []),
+    ...(withBrief || withAnalysis || withSemantic || withAnalysisJobs || withBufferedFeed || withBufferedErasure || list.some((n) => pipeline.has(n)) ? SESSION_PIPELINE_RESOURCES : []),
     ...(withBrief ? SESSION_BRIEF_RESOURCES : []),
     ...(withAnalysis ? SESSION_ANALYSIS_CACHE_RESOURCES : []),
     ...(withSemantic?SESSION_SEMANTIC_COPY_RESOURCES:[]),
     ...(withAnalysisJobs?SESSION_ANALYSIS_JOB_RESOURCES:[]),
     ...(withBufferedFeed ? SESSION_BUFFERED_SEARCH_FEED_RESOURCES : []),
+    ...(withBufferedErasure ? SESSION_BUFFERED_ERASURE_DELETE_RESOURCES : []),
     ...(list.some((n) => readApi.has(n)) ? SESSION_READ_API_RESOURCES : []),
   ];
 }
@@ -612,6 +641,8 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   if(analysisJobPhase)return analysisJobPhase;
   const bufferedFeedPhase = sessionBufferedSearchFeedPhase(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
   if (bufferedFeedPhase) return bufferedFeedPhase;
+  const bufferedErasurePhase = sessionBufferedErasureDeletePhase(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
+  if (bufferedErasurePhase) return bufferedErasurePhase;
   const briefPhase = sessionBriefPhase(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
   const analysisPhase=sessionAnalysisCachePhase(compact.operations,capture.detailedPlanText,capture.stateSnapshotText,refuse);
   if(analysisPhase)return analysisPhase;

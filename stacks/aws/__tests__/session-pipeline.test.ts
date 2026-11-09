@@ -18,6 +18,8 @@ import {
   SESSION_BUFFERED_SEARCH_FEED_RESOURCES,
   BUFFERED_SEARCH_FEED_GATE_CONTRACT,
   bufferedSearchFeedScheduleProps,
+  SESSION_BUFFERED_ERASURE_DELETE_RESOURCES,
+  bufferedErasureDeleteScheduleProps,
   assertSessionPipelineInputs,
   SESSION_PIPELINE_RESOURCES,
   VISIBILITY_TIMEOUT_SECONDS,
@@ -35,6 +37,7 @@ import {
 } from "../session-pipeline.ts";
 import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, transcriptBucketPolicy, transcriptKeyPolicy, transcriptNames } from "../transcript-store.ts";
 import { bufferedFeedConfig, bufferedFeedGateRefusal, BUFFERED_SEARCH_GATE_CONTRACT } from "../../../src/session-pipeline/buffered-search-feed.ts";
+import { bufferedErasureConfig } from "../../../src/session-pipeline/buffered-erasure-delete.ts";
 
 const STAGE = "aws-sessions-prod";
 const ACCOUNT = "941433935742";
@@ -437,6 +440,96 @@ describe("session pipeline: deploy plan contract", () => {
     expect(()=>check(plan({...creates,trail:"update"},withBufferedFeed))).toThrow(/separate reviewed phase/);
     expect(()=>check(plan({...creates,"session-semantic-copy-schedule":"update"},[...withBufferedFeed,...SESSION_SEMANTIC_COPY_RESOURCES]))).toThrow(/separate reviewed phase/);
     expect(()=>check(plan({...creates,"session-pipeline":"update",transcripts:"update"},withBufferedFeed))).toThrow(/without the role-ARN cascade/);
+  });
+  const NEW_FEED_KEYS = ["INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION", "INGEST_BUFFERED_SEARCH_FEED_SETTLE_S", "INGEST_BUFFERED_ERASURE_DELETE", "INGEST_BUFFERED_ERASURE_PAGE", "INGEST_BUFFERED_ERASURE_RATE", "INGEST_BUFFERED_ERASURE_BUDGET_MS"];
+  const refusedBy=(v:unknown)=>{let why="";try{assertSessionPipelineInputs(v,(w:string)=>{throw new Error(w)})}catch(e){why=(e as Error).message}return why};
+  const envOf=(cfg:SessionPipelineInputs)=>sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:cfg});
+  it("buffered second-version, settle and erasure defaults set no new variable and keep the erasure schedule DISABLED",()=>{
+    for(const cfg of [{},{searchIndex:true},armed,{searchIndex:true,bufferedSearchFeed:{enabled:false}},{searchIndex:true,bufferedSearchFeed:{enabled:false,secondVersion:false}},{searchIndex:true,bufferedErasureDelete:{enabled:false}}] as SessionPipelineInputs[]){
+      const env=envOf(cfg);
+      for(const k of NEW_FEED_KEYS)expect(Object.hasOwn(env,k)).toBe(false);
+      expect(bufferedErasureDeleteScheduleProps({names:p,functionArn:"fn",p:cfg,tags:{}}).state).toBe("DISABLED");
+    }
+    // The default env is unchanged: no feed or gate key at all.
+    const env=envOf({});
+    expect(Object.keys(env).filter(k=>k.includes("BUFFERED"))).toEqual([]);
+    expect(bufferedErasureConfig(env).enabled).toBe(false);
+    expect(bufferedErasureDeleteScheduleProps({names:p,functionArn:"fn",p:{},tags:{}})).toEqual({name:p.bufferedErasureDeleteRule,description:"96bulls bounded buffered-row later-erasure delete",scheduleExpression:"rate(1 minute)",state:"DISABLED",targets:[{Id:"session-pipeline",Arn:"fn",Input:JSON.stringify({bufferedErasureDelete:true})}],tags:{}});
+    expect(p.bufferedErasureDeleteRule).toBe("96bulls-aws-sessions-prod-session-buffered-erasure-delete");
+    // An armed feed keeps its exact env shape and key order.
+    expect(Object.keys(envOf(armed)).filter(k=>k.includes("BUFFERED"))).toEqual(["INGEST_BUFFERED_SEARCH_FEED","BUFFERED_SEARCH_FEED_GATE_DECLARED"]);
+  });
+  it("buffered feed secondVersion and settleSeconds pass through only when set, within the feeder's bounds",()=>{
+    expect(envOf({bufferedSearchFeed:{enabled:false,secondVersion:true}}).INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION).toBe("on");
+    expect(envOf({bufferedSearchFeed:{enabled:false,settleSeconds:300}}).INGEST_BUFFERED_SEARCH_FEED_SETTLE_S).toBe("300");
+    expect(refusedBy({bufferedSearchFeed:{enabled:false,secondVersion:true,settleSeconds:300}})).toBe("");
+    for(const n of [180,3600])expect(refusedBy({bufferedSearchFeed:{enabled:false,settleSeconds:n}})).toBe("");
+    for(const n of [100,179,3601,1.5,"300"])expect(refusedBy({bufferedSearchFeed:{enabled:false,settleSeconds:n}})).toMatch(/bufferedSearchFeed.settleSeconds must be an integer from 180 to 3600/);
+    for(const v of ["yes","on",1,null])expect(refusedBy({bufferedSearchFeed:{enabled:false,secondVersion:v}})).toMatch(/bufferedSearchFeed.secondVersion must be a boolean/);
+    // The feeder accepts what the stack renders: armed with secondVersion, only the (pinned) ceiling remains.
+    const env=envOf({...armed,bufferedSearchFeed:{...armed.bufferedSearchFeed,secondVersion:true,settleSeconds:600}});
+    expect(()=>bufferedFeedConfig(env)).toThrow(/buffered_version_ceiling_unpinned/);
+    const c=bufferedFeedConfig(env,1_000_000_000_000);
+    expect([c.enabled,c.secondVersion,c.settleMs]).toEqual([true,true,600_000]);
+    for(const n of [180,3600])expect(bufferedFeedConfig(envOf({bufferedSearchFeed:{enabled:false,settleSeconds:n}})).settleMs).toBe(n*1000);
+  });
+  it("buffered erasure delete arms only with the gate declaration and searchIndex; knobs are bounded like the lane's",()=>{
+    const gate={enabled:false,gateDeclared:BUFFERED_SEARCH_FEED_GATE_CONTRACT};
+    const erasure={searchIndex:true,bufferedSearchFeed:gate,bufferedErasureDelete:{enabled:true}};
+    expect(refusedBy(erasure)).toBe("");
+    expect(refusedBy({searchIndex:true,bufferedErasureDelete:{enabled:true}})).toMatch(/bufferedErasureDelete.enabled requires bufferedSearchFeed.gateDeclared/);
+    expect(refusedBy({searchIndex:true,bufferedSearchFeed:{enabled:false},bufferedErasureDelete:{enabled:true}})).toMatch(/requires bufferedSearchFeed.gateDeclared/);
+    expect(refusedBy({searchIndex:true,bufferedSearchFeed:{enabled:false,gateDeclared:"buffered-search-gate/v2"},bufferedErasureDelete:{enabled:true}})).toMatch(/must be exactly/);
+    expect(refusedBy({bufferedSearchFeed:gate,bufferedErasureDelete:{enabled:true}})).toMatch(/bufferedErasureDelete.enabled requires searchIndex: true/);
+    expect(refusedBy({searchIndex:false,bufferedSearchFeed:gate,bufferedErasureDelete:{enabled:true}})).toMatch(/requires searchIndex/);
+    expect(refusedBy({bufferedErasureDelete:{enabled:false}})).toBe("");
+    expect(refusedBy({bufferedErasureDelete:{enabled:"on"}})).toMatch(/bufferedErasureDelete.enabled must be a boolean/);
+    expect(refusedBy({bufferedErasureDelete:{}})).toMatch(/bufferedErasureDelete.enabled must be a boolean/);
+    expect(refusedBy({bufferedErasureDelete:[]})).toMatch(/bufferedErasureDelete must be a plain object/);
+    expect(refusedBy({bufferedErasureDelete:null})).toMatch(/bufferedErasureDelete must be a plain object/);
+    expect(refusedBy({bufferedErasureDelete:{enabled:false,extra:1}})).toMatch(/bufferedErasureDelete.extra is not a known setting/);
+    expect(refusedBy({bufferedErasureDelete:{enabled:false,pageSize:1,stagesPerSecond:1,budgetMs:5000}})).toBe("");
+    expect(refusedBy({bufferedErasureDelete:{enabled:false,pageSize:200,stagesPerSecond:20,budgetMs:240000}})).toBe("");
+    for(const n of [0,201,1.5])expect(refusedBy({bufferedErasureDelete:{enabled:false,pageSize:n}})).toMatch(/bufferedErasureDelete.pageSize must be an integer from 1 to 200/);
+    for(const n of [0,21,1.5])expect(refusedBy({bufferedErasureDelete:{enabled:false,stagesPerSecond:n}})).toMatch(/bufferedErasureDelete.stagesPerSecond must be an integer from 1 to 20/);
+    for(const n of [4999,240001,5000.5])expect(refusedBy({bufferedErasureDelete:{enabled:false,budgetMs:n}})).toMatch(/bufferedErasureDelete.budgetMs must be an integer from 5000 to 240000/);
+    // Armed: the lane's flag and the gate declaration (once), the schedule ENABLED; the feed itself stays off.
+    const env=envOf(erasure);
+    expect(env).toMatchObject({INGEST_BUFFERED_ERASURE_DELETE:"on",BUFFERED_SEARCH_FEED_GATE_DECLARED:BUFFERED_SEARCH_GATE_CONTRACT});
+    expect(Object.hasOwn(env,"INGEST_BUFFERED_SEARCH_FEED")).toBe(false);
+    expect(bufferedFeedGateRefusal(env)).toBeNull();
+    expect(bufferedErasureConfig(env)).toEqual({enabled:true,pageSize:25,stagesPerSecond:2,budgetMs:40000});
+    expect(bufferedFeedConfig(env).enabled).toBe(false);
+    expect(bufferedErasureDeleteScheduleProps({names:p,functionArn:"fn",p:erasure,tags:{}}).state).toBe("ENABLED");
+    expect(bufferedSearchFeedScheduleProps({names:p,functionArn:"fn",p:erasure,tags:{}}).state).toBe("DISABLED");
+    const both=envOf({...erasure,bufferedSearchFeed:{...gate,enabled:true}});
+    expect(Object.keys(both).filter(k=>k==="BUFFERED_SEARCH_FEED_GATE_DECLARED")).toHaveLength(1);
+    expect(both).toMatchObject({INGEST_BUFFERED_SEARCH_FEED:"on",INGEST_BUFFERED_ERASURE_DELETE:"on",BUFFERED_SEARCH_FEED_GATE_DECLARED:BUFFERED_SEARCH_GATE_CONTRACT});
+    // Knobs pass through only when set, and the lane accepts them at the edges.
+    for(const [knobs,want] of [[{pageSize:1,stagesPerSecond:1,budgetMs:5000},{pageSize:1,stagesPerSecond:1,budgetMs:5000}],[{pageSize:200,stagesPerSecond:20,budgetMs:240000},{pageSize:200,stagesPerSecond:20,budgetMs:240000}]] as const){
+      const e=envOf({...erasure,bufferedErasureDelete:{enabled:true,...knobs}});
+      expect(e).toMatchObject({INGEST_BUFFERED_ERASURE_PAGE:String(knobs.pageSize),INGEST_BUFFERED_ERASURE_RATE:String(knobs.stagesPerSecond),INGEST_BUFFERED_ERASURE_BUDGET_MS:String(knobs.budgetMs)});
+      expect(bufferedErasureConfig(e)).toEqual({enabled:true,...want});
+    }
+    for(const k of ["INGEST_BUFFERED_ERASURE_PAGE","INGEST_BUFFERED_ERASURE_RATE","INGEST_BUFFERED_ERASURE_BUDGET_MS"])expect(Object.hasOwn(env,k)).toBe(false);
+    expect(JSON.stringify(bufferedErasureDeleteScheduleProps({names:p,functionArn:"fn",p:erasure,tags:{}}))).not.toMatch(/database_url|ca_pem|password/);
+    const permission=sessionPipelinePermissions({accountId:ACCOUNT,functionName:p.function,ruleArn:"old",briefRuleArn:"brief",bufferedSearchFeedRuleArn:"exact-feed-rule",bufferedErasureDeleteRuleArn:"exact-erasure-rule",roleArn:ROLE}).at(-1)!;
+    expect(permission.id).toBe("session-buffered-erasure-delete-permission");
+    expect(permission.props).toEqual({action:"lambda:InvokeFunction",functionName:p.function,principal:"events.amazonaws.com",sourceArn:"exact-erasure-rule",sourceAccount:ACCOUNT});
+  });
+  const withBufferedErasure=[...all,...SESSION_BUFFERED_ERASURE_DELETE_RESOURCES];
+  it("buffered erasure phase keeps permission create-only and refuses mixed schedules and unrelated changes",()=>{
+    const creates=Object.fromEntries(SESSION_BUFFERED_ERASURE_DELETE_RESOURCES.map(r=>[r,"create"]));
+    expect(check(plan(creates,withBufferedErasure))).toBe("session buffered erasure delete rollout");
+    expect(check(plan({"session-buffered-erasure-delete-schedule":"update"},withBufferedErasure))).toBe("session buffered erasure delete update");
+    expect(()=>check(plan({"session-buffered-erasure-delete-permission":"update"},withBufferedErasure))).toThrow(/unsafe action combination/);
+    expect(()=>check(plan(creates,[...all,"session-buffered-erasure-delete-schedule"]))).toThrow(/missing resource session-buffered-erasure-delete-permission/);
+    for(const action of ["delete","replace"])expect(()=>check(plan({"session-buffered-erasure-delete-schedule":action},withBufferedErasure))).toThrow(/forbidden action/);
+    expect(()=>check(plan({...creates,trail:"update"},withBufferedErasure))).toThrow(/separate reviewed phase/);
+    expect(()=>check(plan({...creates,"session-buffered-search-feed-schedule":"update"},[...withBufferedErasure,...SESSION_BUFFERED_SEARCH_FEED_RESOURCES]))).toThrow(/separate reviewed phase/);
+    expect(()=>check(plan({...creates,"session-pipeline":"update",transcripts:"update"},withBufferedErasure))).toThrow(/without the role-ARN cascade/);
+    const withApi=[...withBufferedErasure,"session-read-api","session-read-api-secret","session-read-api-errors-alarm","session-read-api-throttles-alarm"];
+    expect(()=>check(plan({...creates,"session-read-api":"update"},withApi))).toThrow(/only with no declared property changes/);
   });
   const withSemantic=[...all,...SESSION_SEMANTIC_COPY_RESOURCES];
   it("semantic copier defaults disabled with exact rule/account invoke permission",()=>{

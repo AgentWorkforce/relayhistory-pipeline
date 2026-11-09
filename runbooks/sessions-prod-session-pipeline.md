@@ -269,10 +269,25 @@ Optional feed tuning under `bufferedSearchFeed`; each is set on the ingest runti
 - `pageSize` sets `INGEST_BUFFERED_SEARCH_FEED_PAGE` (integer 1 to 200; feeder default 50).
 - `stagesPerSecond` sets `INGEST_BUFFERED_SEARCH_FEED_RATE` (integer 1 to 50; feeder default 5).
 - `budgetMs` sets `INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS` (integer 5000 to 240000; feeder default 50000).
+- `secondVersion: true` sets `INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION=on` (the S version encoding; the feeder refuses `enabled` without it). Absent or `false`: not set (feeder default off).
+- `settleSeconds` sets `INGEST_BUFFERED_SEARCH_FEED_SETTLE_S` (integer 180 to 3600; feeder default 300).
 
 Rolling out this rule alone creates only the DISABLED schedule and its permission. Arming it is a production
 step that needs Khaliq's explicit OK and follows the buffered search activation order: ClickHouse columns,
 read gate verified, then feeder. Do not arm it before the later-erasure delete lane for ClickHouse exists.
+
+### Buffered erasure delete
+
+A second one-minute rule sends `{"bufferedErasureDelete":true}` to the later-erasure delete lane
+(`src/session-pipeline/buffered-erasure-delete.ts`). It stays DISABLED, and `INGEST_BUFFERED_ERASURE_DELETE` is not
+set, until `transcriptStore.sessionPipeline.bufferedErasureDelete` is `{ enabled: true }`. That needs
+`bufferedSearchFeed.gateDeclared: "buffered-search-gate/v1"` and `searchIndex: true`; it then also sets
+`BUFFERED_SEARCH_FEED_GATE_DECLARED`, even with the feed itself off. It uses the feeder's login from the pipeline
+secret. Optional, each set only when provided: `pageSize` (`INGEST_BUFFERED_ERASURE_PAGE`, 1 to 200, default 25),
+`stagesPerSecond` (`INGEST_BUFFERED_ERASURE_RATE`, 1 to 20, default 2), `budgetMs`
+(`INGEST_BUFFERED_ERASURE_BUDGET_MS`, 5000 to 240000, default 40000). Its rule and permission roll out as their own
+reviewed plan phase ("session buffered erasure delete rollout"), never together with the feed's rule. Arming it is
+a production step that needs Khaliq's explicit OK.
 
 ## Repo tag rename (one time, before the read API rollout)
 
