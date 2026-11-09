@@ -3548,7 +3548,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       expect(await ledgered(db)).toBe(false);
     });
 
-    test("a later slot (synthetic step, no migration file added) cannot break the previous release: its relation and function are modelled out of the ACL catalog and manifest", async () => {
+    test("a later slot (synthetic step, no migration file added) cannot break the previous release: its relation and function are modelled out of the ACL catalog and manifest (the control models out every other later step and leaves only the probe unmodelled)", async () => {
       // A future upstream slot creating a table (with its implied serial sequence) and a function, which a current
       // binary's catalog and manifest would list. Written under this test's own tmpdir, never under supabase/.
       const dir = mkdtempSync(join(tmpdir(), "prev-release-later-slot-"));
@@ -3557,16 +3557,26 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
 CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'SELECT 1';
 `);
       const probe = { name: "upstream:20261105099999_zz_future_probe.sql", path } as PlanStep;
+      // A second later step that also creates a table: it stands in for a real later slot on a branch that carries
+      // one. The negative control must keep failing on the probe alone, so this one is modelled out of the control.
+      const realLaterPath = join(dir, "20261105088888_zz_real_later.sql");
+      writeFileSync(realLaterPath, `CREATE TABLE sessions.zz_real_later (id bigserial PRIMARY KEY, v text);
+`);
+      const realLater = { name: "upstream:20261105088888_zz_real_later.sql", path: realLaterPath } as PlanStep;
       const real = await plan(SUPA_ET);
-      const full = [...real, probe];
+      const full = [...real, realLater, probe];
       const manifest = await migrateGuards.sessionsFunctionAclManifest();
       const catalog = migrateGuards.runtimeApplicationAclCatalog();
       const current = {
         manifest: { ...manifest, "sessions.zz_future_probe_fn()": ["<owner>:EXECUTE", "service_role:EXECUTE"] },
         catalog: {
-          tables: { ...catalog.tables, "sessions.zz_future_probe": ["SELECT", "INSERT"] },
-          sequences: [...catalog.sequences, "sessions.zz_future_probe_id_seq"],
-          rlsTables: [...catalog.rlsTables, "sessions.zz_future_probe"],
+          tables: {
+            ...catalog.tables,
+            "sessions.zz_real_later": ["SELECT", "INSERT"],
+            "sessions.zz_future_probe": ["SELECT", "INSERT"],
+          },
+          sequences: [...catalog.sequences, "sessions.zz_real_later_id_seq", "sessions.zz_future_probe_id_seq"],
+          rlsTables: [...catalog.rlsTables, "sessions.zz_real_later", "sessions.zz_future_probe"],
           functions: [...catalog.functions, "sessions.zz_future_probe_fn()"],
         },
       };
@@ -3574,8 +3584,10 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
       // manifest and catalog with the same later steps.
       const laterSteps = laterUpstream(full, SF);
       expect(laterSteps.map((s) => s.name)).toContain(probe.name);
+      expect(laterSteps.map((s) => s.name)).toContain(realLater.name);
       const derived = previousReleaseAcl(laterSteps, current.manifest, current.catalog);
       expect([...derived.laterRels]).toContain("sessions.zz_future_probe");
+      expect([...derived.laterRels]).toContain("sessions.zz_real_later");
       expect([...derived.laterFns]).toContain("sessions.zz_future_probe_fn");
       expect(Object.keys(derived.previousManifest)).not.toContain("sessions.zz_future_probe_fn()");
       expect(Object.keys(derived.previousCatalog.tables)).not.toContain("sessions.zz_future_probe");
@@ -3583,14 +3595,19 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
       expect(derived.previousCatalog.rlsTables).not.toContain("sessions.zz_future_probe");
       expect(derived.previousCatalog.functions).not.toContain("sessions.zz_future_probe_fn()");
       expect(derived).toEqual(previousReleaseAcl(laterSteps, manifest, catalog) as typeof derived);
-      // Negative control: the same truncated migrate with the current (unmodelled) catalog and manifest fails on the
-      // relation the truncated plan never created (42P01), which is the defect the model prevents.
+      // Negative control: the same truncated migrate, with every OTHER later step modelled out of the catalog and
+      // manifest and only the probe left unmodelled, fails on the relation the truncated plan never created (42P01),
+      // which is the defect the model prevents. Modelling out the other later steps keeps the failure on the probe
+      // however many real later slots a branch carries (their grants would otherwise fail first, with another message).
       const db = await supabaseLike();
       await db.exec(ET_BOOT);
       const steps = full.filter((s) => s.name !== SF && !laterSteps.includes(s));
       expect(steps).not.toContain(probe);
-      const unmodelledManifest = spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(current.manifest);
-      const unmodelledCatalog = spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(current.catalog);
+      const control = previousReleaseAcl(laterSteps.filter((s) => s !== probe), current.manifest, current.catalog);
+      expect([...control.laterRels]).toContain("sessions.zz_real_later");
+      expect([...control.laterRels]).not.toContain("sessions.zz_future_probe");
+      const unmodelledManifest = spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(control.previousManifest);
+      const unmodelledCatalog = spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(control.previousCatalog);
       try {
         const error = await failure(runMigrations(client(db), { profile: SUPA_ET, steps }));
         expect(error?.code).toBe("42P01");
@@ -3604,6 +3621,7 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
       const modelled = await previousRelease(full, current);
       expect(await ledgered(modelled)).toBe(false);
       expect((await modelled.query<{ r: string | null }>("SELECT to_regclass('sessions.zz_future_probe')::text r")).rows[0]!.r).toBeNull();
+      expect((await modelled.query<{ r: string | null }>("SELECT to_regclass('sessions.zz_real_later')::text r")).rows[0]!.r).toBeNull();
       expect((await modelled.query<{ p: string | null }>("SELECT to_regprocedure('sessions.zz_future_probe_fn()')::text p")).rows[0]!.p).toBeNull();
       expect(migrateGuards.runtimeApplicationAclCatalog()).toEqual(catalog);
       expect(await migrateGuards.sessionsFunctionAclManifest()).toEqual(manifest);
