@@ -9,20 +9,39 @@ jobs:
   checks:
     # Preserve the existing required check name: neither parallel job may be
     # skipped, canceled or failing when this gate goes green.
-    needs: [unit-tests, aws-hardening-mutations]
+    needs: [unit-tests, aws-hardening-mutations, selfhost-e2e]
     if: ${{ always() }}
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Require unit and mutation checks
         env:
           UNIT_RESULT: ${{ needs.unit-tests.result }}
           MUTATION_RESULT: ${{ needs.aws-hardening-mutations.result }}
+          E2E_RESULT: ${{ needs.selfhost-e2e.result }}
         run: |
           test "$UNIT_RESULT" = "success"
           test "$MUTATION_RESULT" = "success"
+          test "$E2E_RESULT" = "success"
+  selfhost-e2e:
+    # The self-contained end-to-end acceptance test (docs/local-stack.md): no
+    # Control, RelayAuth or other AgentWorkforce service; synthetic data only.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install (root + workspaces)
+        run: bun install --frozen-lockfile
+      - name: End-to-end acceptance test
+        run: bun run e2e:selfhost
   unit-tests:
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     # The serial PGlite suite outgrew 40 minutes on GitHub-hosted runners.
     # Preserve every test and the 30-second per-test limit below.
     timeout-minutes: 90
@@ -79,6 +98,16 @@ jobs:
         run: bunx tsc --noEmit -p tsconfig.json
       - name: Unit tests (stack)
         run: bun test --timeout 30000
+      # The ingest Worker on a database migrated only to the G4 set (through 043800; none of the post-G4 migrations, 043850 onward).
+      # g4-only-schema.pglite.test.ts already ran above (it pins its own cutoff); these are the existing
+      # default-flag ingest suites re-run with the test-only cutoff (src/session-ingest/__tests__/pglite-schema.ts).
+      - name: Unit tests (ingest on the G4-only migration set)
+        env:
+          HOOPDB_MIGRATE_UNTIL: 20261105043800_lazy_ack_clock_no_key_update.sql
+        run: |
+          for suite in ledger turns ordered-controls custody-baseline lazy-custody frozen-custody first-ack-seats; do
+            bun test --timeout 30000 "src/session-ingest/__tests__/${suite}.pglite.test.ts"
+          done
       - name: Unit tests (IaC values, stacks/)
         run: bun test --timeout 30000 ./stacks
       - name: Guard - no Helm hooks in any chart or manifest in this repo
@@ -94,7 +123,7 @@ jobs:
   # Keep every mutation, but give the long unit suite and mutation suite their
   # own budgets. Running both serially exceeded the old 40-minute limit.
   aws-hardening-mutations:
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     # Several mutations exercise the real ClickHouse read API tests.
     services:
@@ -141,7 +170,7 @@ jobs:
         run: git diff --exit-code
   # Build only: no registry login, publish, deploy, or provider credentials.
   amp-transport-image:
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4

@@ -1,0 +1,55 @@
+bun test v1.4.2 (744846f84)
+
+packages/object-store/test/unit.test.ts:
+(pass) SigV4 > matches the AWS presigned GET test vector [0.96ms]
+(pass) SigV4 > matches the AWS GET object header-signing test vector [0.47ms]
+(pass) keys and layout > builds the same keys as the Rust layout [0.44ms]
+(pass) keys and layout > parses chunk names and session keys back [0.17ms]
+(pass) keys and layout > rejects ambiguous keys and components [0.17ms]
+(pass) list cursors > passes an S3 continuation token through exactly once decoded [1.05ms]
+(pass) S3 server-side encryption > requests it on every put when configured, and signs the header [0.80ms]
+(pass) S3 put: abort signal and the created version id > passes the caller's signal to the request and returns x-amz-version-id [0.45ms]
+
+src/session-ingest/__tests__/db-error-class.test.ts:
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > 57P01 admin shutdown [0.17ms]
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > 08006 connection failure
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > pg 'Connection terminated unexpectedly' (no code) [0.04ms]
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > server closed the connection
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > ECONNRESET
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > EPIPE
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > workerd 'Network connection lost.' [0.01ms]
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > socket hang up
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > ETIMEDOUT
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > 57014 statement timeout
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > timeout message [0.01ms]
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > 53300 too many connections
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > ECONNREFUSED
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > remaining connection slots [0.03ms]
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > CERT_HAS_EXPIRED [0.01ms]
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > ERR_TLS_CERT_ALTNAME_INVALID
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > certificate message [0.02ms]
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > no code, no message
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > unmatched SQLSTATE and message
+(pass) classifyDbError: closed classes from codes, then message patterns (in RAM) > non-error inputs are unknown; output is always one of the closed set [0.05ms]
+(pass) dbErrorName / dbClientErrorFields: only closed values leave > allowlisted names pass; any other name is 'other' [0.04ms]
+(pass) dbErrorName / dbClientErrorFields: only closed values leave > error_code keeps only a valid SQLSTATE or a reviewed errno/TLS code, else db_error [0.06ms]
+(pass) dbErrorName / dbClientErrorFields: only closed values leave > opaque token-shaped codes (valid under the old [A-Za-z0-9_]{1,64} test) are normalized, never logged [1.61ms]
+(pass) dbErrorName / dbClientErrorFields: only closed values leave > inherited Object keys as codes stay inside the closed sets [0.44ms]
+{"ts":"2026-11-07T19:32:54.080Z","level":"error","service":"96bulls","deployment":"selfhost","deployment_id":"local","message":"session ingest db error","error_code":"db_error","db_error_class":"unknown","db_error_basis":"none","error_name":"other"}
+{"ts":"2026-11-07T19:32:54.082Z","level":"error","service":"96bulls","deployment":"selfhost","deployment_id":"local","message":"session ingest db error","error_code":"db_error","db_error_class":"unknown","db_error_basis":"none","error_name":"other"}
+{"ts":"2026-11-07T19:32:54.082Z","level":"error","service":"96bulls","deployment":"selfhost","deployment_id":"local","message":"session ingest db error","error_code":"db_error","db_error_class":"unknown","db_error_basis":"none","error_name":"other"}
+{"ts":"2026-11-07T19:32:54.082Z","level":"error","service":"96bulls","deployment":"selfhost","deployment_id":"local","message":"session ingest db error","error_code":"db_error","db_error_class":"unknown","db_error_basis":"none","error_name":"other"}
+(pass) dbErrorName / dbClientErrorFields: only closed values leave > throwing getters, proxies and revoked proxies never throw; they fall back to unknown/other/db_error [1.57ms]
+(pass) dbErrorName / dbClientErrorFields: only closed values leave > statement timeout (57014) and idle-in-transaction kill (25P03) keep distinct safe codes, apart from code-less drops [0.30ms]
+(pass) dbErrorName / dbClientErrorFields: only closed values leave > the class travels with its safe code and basis (a heuristic, not a cause) [0.09ms]
+(pass) dbErrorName / dbClientErrorFields: only closed values leave > a secret-looking message, name or code never appears in the emitted log line [0.17ms]
+(pass) the /v1/delivery/batches 503 path logs the same closed class with the correlation id > a ledger DB failure without a code: unchanged 503 envelope; log line carries stage, error_code, db_error_class, correlation_id; no message text [6.98ms]
+(pass) the /v1/delivery/batches 503 path logs the same closed class with the correlation id > ledger catch path: throwing code/name getters and proxies become LedgerUnavailableError, never escape [0.50ms]
+(pass) the /v1/delivery/batches 503 path logs the same closed class with the correlation id > route boundary: throwing code/name getters, a throwing Proxy trap and a revoked Proxy: unchanged 503/body/Retry-After/calls, closed fields [8.40ms]
+(pass) the /v1/delivery/batches 503 path logs the same closed class with the correlation id > route boundary: 57014 and 25P03 reach the 503 line with distinct ledger and safe codes; response unchanged [2.93ms]
+(pass) the /v1/delivery/batches 503 path logs the same closed class with the correlation id > route boundary: opaque codes, inherited keys and throwing getters change only closed log fields; status, body and retry are unchanged [11.50ms]
+
+ 41 pass
+ 0 fail
+ 521 expect() calls
+Ran 41 tests across 2 files. [83.00ms]

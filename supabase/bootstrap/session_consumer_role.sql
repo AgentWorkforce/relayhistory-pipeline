@@ -1,0 +1,365 @@
+-- Dedicated runtime role for the self-host search-index writer
+-- (SERVICE=session-pipeline-consumer).
+--
+-- The reconciler connects as this role and never as owner, migrator or
+-- reader. Least privilege, derived from the statements the tick actually
+-- issues (pointer upsert + directory projection + tombstone propagation,
+-- search write + erasure, pending/high-water, ledger/marker reads):
+--   * USAGE on the sessions and search_index schemas (without it every
+--     sessions.* call fails 42501);
+--   * exactly the table DML below (session_index_ext and the directory
+--     membership tables are written directly, not only through functions);
+--   * EXECUTE on the pointer functions, including the SECURITY DEFINER
+--     session_publication_is_managed (the writer must call it; verify
+--     allowlists exactly this one and no other SECURITY DEFINER function)
+--     and session_publication_lock (every pointer upsert runs through
+--     withPublicationAuthority, which locks as the writer even for
+--     unmanaged manifests);
+--   * a transparent RLS policy on every sessions table the writer touches
+--     (the member-read policies name only `authenticated`, so without
+--     these the writer sees 0 rows and reports complete wrongly; same
+--     shape as the migrator's trusted policy, scoped to this role). No
+--     writer policy on the search_index tables: both carry forced
+--     tenant_only from the composed ensureSchema, and every search write
+--     binds the tenant GUCs per scope.
+--   * EXECUTE on sessions.session_publication_lock (any-scope): the lock
+--     function takes only a manifest body and delegates to
+--     ingest_publication_scope, which re-checks publication authority
+--     itself; the writer calls it exactly where the composed tick needs
+--     the lock. Accepted residual risk (recorded, reviewable): the grant
+--     itself is not tenant-scoped, so a bug that calls it outside the
+--     tick would run unscoped — bounded by review plus the as-role live
+--     42501 proofs, and any tenant-scoped tightening later needs no
+--     writer change.
+--
+-- Run as the schema owner INSIDE the bootstrap's single transaction (the
+-- bootstrap holds the advisory lock and rolls everything back on failure).
+-- This file holds no BEGIN/COMMIT of its own: its own COMMIT would end the
+-- outer transaction early, drop the lock and lock_timeout, and leave a
+-- partial commit behind when verify later fails. Grants converge on rerun:
+-- every grant below is revoked first, then granted exactly.
+--
+--   psql -v ON_ERROR_STOP=1 -X -d <the HoopDb database> -f supabase/bootstrap/session_consumer_role.sql
+--   psql -X -d <the HoopDb database> -c '\password search_consumer_runtime'
+--   psql -v ON_ERROR_STOP=1 -X -d <the HoopDb database> -f supabase/bootstrap/session_consumer_role_verify.sql
+DO $role$
+DECLARE
+  v_name text := 'search_consumer_runtime';
+  r pg_roles%ROWTYPE;
+  v_created boolean := false;
+  v_probe record;
+  v_password_present boolean;
+  v_probe_source constant text := $expected_probe$
+DECLARE caller_oid oid; target_oid oid; target_login boolean; present boolean;
+BEGIN
+  SELECT oid INTO caller_oid FROM pg_catalog.pg_roles
+    WHERE rolname=session_user AND rolcreaterole AND NOT rolsuper AND NOT rolbypassrls;
+  IF caller_oid IS NULL OR current_setting('role') <> 'none'
+     OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_stat_activity WHERE pid=pg_backend_pid() AND usename=session_user)
+     OR (SELECT count(*) FROM pg_catalog.pg_namespace WHERE nspname IN ('sessions','search_index') AND nspowner=caller_oid) <> 2 THEN
+    RAISE EXCEPTION USING ERRCODE='42501', MESSAGE='consumer credential probe: caller refused';
+  END IF;
+  SELECT oid,rolcanlogin,rolpassword IS NOT NULL INTO target_oid,target_login,present
+    FROM pg_catalog.pg_authid WHERE rolname='search_consumer_runtime';
+  IF target_oid IS NULL OR target_login THEN
+    RAISE EXCEPTION USING ERRCODE='55000', MESSAGE='consumer credential probe: bare fixed role required';
+  END IF;
+  IF current_setting('server_version_num')::integer >= 160000 THEN
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members WHERE roleid=target_oid AND member=caller_oid
+                   AND admin_option AND NOT inherit_option AND NOT set_option) THEN
+      RAISE EXCEPTION USING ERRCODE='42501', MESSAGE='consumer credential probe: creator authority required';
+    END IF;
+  ELSE
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members WHERE roleid=target_oid AND member=caller_oid AND admin_option) THEN
+      RAISE EXCEPTION USING ERRCODE='42501', MESSAGE='consumer credential probe: creator authority required';
+    END IF;
+  END IF;
+  RETURN present;
+END
+$expected_probe$;
+  v_version integer := current_setting('server_version_num')::integer;
+BEGIN
+  -- Never create or elevate a privileged/built-in name under this file: a
+  -- future edit renaming v_name to one of these must fail closed here,
+  -- before any role lookup or grant.
+  IF v_name IN ('public', 'anon', 'authenticated', 'postgres', 'supabase_admin', 'bulls96_read_api')
+     OR left(v_name, 3) = 'pg_' THEN
+    RAISE EXCEPTION USING ERRCODE = '55000',
+      MESSAGE = format('bootstrap %s: refusing a reserved role name', v_name),
+      HINT = 'This file manages only the dedicated search_consumer_runtime role.';
+  END IF;
+  SELECT * INTO r FROM pg_roles WHERE rolname = v_name;
+  IF NOT FOUND THEN
+    CREATE ROLE search_consumer_runtime LOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    v_created := true;
+    SELECT * INTO r FROM pg_roles WHERE rolname = v_name;
+  END IF;
+  -- An existing role is otherwise never altered: it must match the spec,
+  -- except for LOGIN, where the migrate-provisioned bare NOLOGIN role
+  -- (supabase/bootstrap/session_consumer_roles.sql) is promoted by the
+  -- ALTER ROLE LOGIN below as the operator-authorized claim. Anything else
+  -- fails closed.
+  IF r.rolinherit OR r.rolbypassrls OR r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication THEN
+    RAISE EXCEPTION USING ERRCODE = '55000',
+      MESSAGE = format('bootstrap %s: the role exists with different attributes', v_name),
+      HINT = 'Nothing was changed. Fix or drop the role by hand (an operator decision), then rerun.';
+  END IF;
+  -- The creator edge: a CREATEROLE non-superuser invoker unavoidably becomes
+  -- a member of the role WITH ADMIN OPTION (observed on real PG15/16/17;
+  -- INHERIT/SET flags exist only on PG16+ so PG15 checks the admin flag).
+  -- Superuser creators get no such edge on 16+. Tolerate exactly that row
+  -- when the member is the invoker; the writer itself must never be a member
+  -- of another role, and any other membership fails closed.
+  IF v_version >= 160000 THEN
+    IF EXISTS (SELECT 1 FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
+               WHERE (a.roleid = r.oid OR a.member = r.oid)
+                 AND NOT (a.roleid = r.oid AND m.rolname = current_user AND a.admin_option
+                          AND NOT a.inherit_option AND NOT a.set_option)) THEN
+      RAISE EXCEPTION USING ERRCODE = '55000',
+        MESSAGE = format('bootstrap %s: the role has memberships beyond the creator edge', v_name),
+        HINT = 'Nothing was changed. Revoke the membership by hand (an operator decision), then rerun.';
+    END IF;
+  ELSE
+    IF EXISTS (SELECT 1 FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member
+               WHERE (a.roleid = r.oid OR a.member = r.oid)
+                 AND NOT (a.roleid = r.oid AND m.rolname = current_user AND a.admin_option)) THEN
+      RAISE EXCEPTION USING ERRCODE = '55000',
+        MESSAGE = format('bootstrap %s: the role has memberships beyond the creator edge', v_name),
+        HINT = 'Nothing was changed. Revoke the membership by hand (an operator decision), then rerun.';
+    END IF;
+  END IF;
+  -- Promotion edge: the first LOGIN must start from a clean bare role. Refuse
+  -- any pre-existing setting (even statement_timeout itself: the claim marker
+  -- is recorded by this step, not inherited), because extras would survive
+  -- into every genuine writer login. An already-LOGIN role skips this edge:
+  -- reruns converge through the revoke-first grants below and the verify
+  -- file's exact-settings pin.
+  IF NOT r.rolcanlogin THEN
+    IF EXISTS (SELECT 1 FROM pg_db_role_setting WHERE setrole = r.oid) THEN
+      RAISE EXCEPTION USING ERRCODE = '55000',
+        MESSAGE = format('bootstrap %s: refusing to promote a role with pre-existing settings', v_name),
+        HINT = 'Nothing was changed. Reset the role settings by hand (an operator decision), then rerun.';
+    END IF;
+    -- pg_roles.rolpassword is ALWAYS masked, including a NULL credential.
+    -- Read pg_authid directly where authorized. A non-superuser requires the
+    -- explicit fixed-role operator helper, validated below before invocation.
+    -- Missing/changed code or ACLs refuse; no catalog-wide SELECT is granted.
+    IF r.rolvaliduntil IS NOT NULL THEN
+      RAISE EXCEPTION USING ERRCODE = '55000',
+        MESSAGE = format('bootstrap %s: refusing to promote a role with a pre-existing validity', v_name),
+        HINT = 'Nothing was changed. Investigate the existing credential; do not clear it to bypass promotion admission.';
+    END IF;
+    BEGIN
+      PERFORM 1 FROM pg_authid a WHERE a.oid = r.oid AND a.rolpassword IS NOT NULL;
+      IF FOUND THEN
+        RAISE EXCEPTION USING ERRCODE = '55000',
+          MESSAGE = format('bootstrap %s: refusing to promote a role with a pre-existing password', v_name),
+          HINT = 'Nothing was changed. Investigate the existing credential; do not clear it to bypass promotion admission.';
+      END IF;
+    EXCEPTION WHEN insufficient_privilege THEN
+      SELECT p.*, n.nspowner AS schema_owner, n.nspacl AS schema_acl INTO v_probe
+        FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
+       WHERE n.nspname='session_consumer_bootstrap_private' AND p.proname='consumer_has_password'
+         AND p.pronargs=0;
+      IF NOT FOUND OR NOT v_probe.prosecdef OR v_probe.prorettype <> 'boolean'::regtype
+         OR v_probe.prokind <> 'f' OR v_probe.provolatile <> 's' OR v_probe.proisstrict OR v_probe.proleakproof
+         OR v_probe.proparallel <> 'u' OR v_probe.proretset OR v_probe.prosupport <> 0
+         OR v_probe.pronargdefaults <> 0 OR v_probe.prosrc <> v_probe_source
+         OR v_probe.proconfig IS DISTINCT FROM ARRAY['search_path=pg_catalog']::text[]
+         OR v_probe.prolang <> (SELECT oid FROM pg_catalog.pg_language WHERE lanname='plpgsql')
+         OR v_probe.proowner <> v_probe.schema_owner
+         OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE oid=v_probe.proowner AND rolsuper)
+         OR (SELECT count(*) FROM pg_catalog.pg_proc WHERE pronamespace=v_probe.pronamespace) <> 1
+         OR EXISTS (SELECT 1 FROM pg_catalog.pg_class WHERE relnamespace=v_probe.pronamespace)
+         OR EXISTS (SELECT 1 FROM pg_catalog.aclexplode(COALESCE(v_probe.proacl,pg_catalog.acldefault('f',v_probe.proowner))) a
+                     WHERE a.grantee <> v_probe.proowner AND NOT (a.grantee=current_user::regrole AND a.privilege_type='EXECUTE' AND NOT a.is_grantable))
+         OR EXISTS (SELECT 1 FROM pg_catalog.aclexplode(COALESCE(v_probe.schema_acl,pg_catalog.acldefault('n',v_probe.schema_owner))) a
+                     WHERE a.grantee <> v_probe.schema_owner AND NOT (a.grantee=current_user::regrole AND a.privilege_type='USAGE' AND NOT a.is_grantable)) THEN
+        RAISE EXCEPTION USING ERRCODE='55000', MESSAGE='consumer bootstrap: trusted credential probe unavailable',
+          HINT='A privileged operator must install the exact session_consumer_credential_probe.sql prerequisite. No role was promoted.';
+      END IF;
+      EXECUTE 'SELECT session_consumer_bootstrap_private.consumer_has_password()' INTO v_password_present;
+      IF v_password_present IS DISTINCT FROM false THEN
+        RAISE EXCEPTION USING ERRCODE='55000', MESSAGE='consumer bootstrap: refusing a pre-existing or unknown password';
+      END IF;
+    END;
+  ELSIF NOT v_created THEN
+    -- An existing LOGIN must already carry the exact operator claim. Do not
+    -- bless an unrelated LOGIN by writing the timeout marker for the first time.
+    IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_db_role_setting WHERE setrole=r.oid AND setdatabase=0 AND setconfig=ARRAY['statement_timeout=60s']::text[])
+       OR EXISTS (SELECT 1 FROM pg_catalog.pg_db_role_setting WHERE setrole=r.oid AND NOT (setdatabase=0 AND setconfig=ARRAY['statement_timeout=60s']::text[])) THEN
+      RAISE EXCEPTION USING ERRCODE='55000', MESSAGE='consumer bootstrap: existing LOGIN lacks the exact operator claim';
+    END IF;
+  END IF;
+END
+$role$;
+-- PostgreSQL 16+ lets only a superuser name SUPERUSER or REPLICATION in ALTER
+-- ROLE, even as NOSUPERUSER/NOREPLICATION (and BYPASSRLS needs BYPASSRLS).
+-- CREATE ROLE above sets the safe attributes; here LOGIN NOINHERIT are
+-- (re-)asserted, which also promotes the migrate-provisioned bare NOLOGIN
+-- role to the dedicated LOGIN exactly once, by running this operator step.
+-- session_consumer_role_verify.sql fails if an existing role has SUPERUSER,
+-- CREATEDB, CREATEROLE, REPLICATION, BYPASSRLS or INHERIT.
+ALTER ROLE search_consumer_runtime LOGIN NOINHERIT;
+-- Backstop matching the writer transactions' own SET LOCAL (60s); the pointer
+-- publication sets tighter locals per statement.
+ALTER ROLE search_consumer_runtime SET statement_timeout = '60s';
+
+-- Schema access (revoke-first so a rerun converges drift).
+REVOKE ALL ON SCHEMA sessions FROM search_consumer_runtime;
+REVOKE ALL ON SCHEMA search_index FROM search_consumer_runtime;
+GRANT USAGE ON SCHEMA sessions TO search_consumer_runtime;
+GRANT USAGE ON SCHEMA search_index TO search_consumer_runtime;
+
+-- Ledger + marker reads the runWorker readiness gate needs (read-only, no
+-- membership borrowed).
+REVOKE ALL ON sessions.__96bulls_migrations FROM search_consumer_runtime;
+REVOKE ALL ON sessions.__96bulls_role_validation FROM search_consumer_runtime;
+GRANT SELECT ON sessions.__96bulls_migrations TO search_consumer_runtime;
+GRANT SELECT ON sessions.__96bulls_role_validation TO search_consumer_runtime;
+
+-- Pointer surface (revoke-first, then exactly what the tick issues).
+REVOKE ALL ON sessions.session_index FROM search_consumer_runtime;
+REVOKE ALL ON sessions.session_index_ext FROM search_consumer_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.session_index TO search_consumer_runtime;
+GRANT SELECT, INSERT, UPDATE ON sessions.session_index_ext TO search_consumer_runtime;
+REVOKE ALL ON FUNCTION sessions.upsert_session_index(jsonb) FROM search_consumer_runtime;
+REVOKE ALL ON FUNCTION sessions.session_index_batch(jsonb) FROM search_consumer_runtime;
+REVOKE ALL ON FUNCTION sessions.session_publication_is_managed(text, text, text, text, text) FROM search_consumer_runtime;
+REVOKE ALL ON FUNCTION sessions.session_publication_lock(jsonb) FROM search_consumer_runtime;
+GRANT EXECUTE ON FUNCTION sessions.upsert_session_index(jsonb) TO search_consumer_runtime;
+GRANT EXECUTE ON FUNCTION sessions.session_index_batch(jsonb) TO search_consumer_runtime;
+GRANT EXECUTE ON FUNCTION sessions.session_publication_is_managed(text, text, text, text, text) TO search_consumer_runtime;
+GRANT EXECUTE ON FUNCTION sessions.session_publication_lock(jsonb) TO search_consumer_runtime;
+
+-- Repo catalog the pointer upsert maintains through these invoker helpers
+-- (upsert_session_index calls them as the writer, so they need EXECUTE plus
+-- the table DML below, not SECURITY DEFINER). resolve_repo reads repo_live,
+-- and the directory project_name trigger reads legacy_remote, so both are
+-- in the set: a direct upsert carrying git fields 42501s without the
+-- lock/resolve/live trio (the composed e2e seeds carry no git fields, so
+-- resolve_repo returns before the catalog lock).
+REVOKE ALL ON FUNCTION sessions.applied_repo_evidence(jsonb, jsonb) FROM search_consumer_runtime;
+REVOKE ALL ON FUNCTION sessions.canonical_remote(text) FROM search_consumer_runtime;
+REVOKE ALL ON FUNCTION sessions.clean_root_commit(text) FROM search_consumer_runtime;
+REVOKE ALL ON FUNCTION sessions.lock_repo_catalog(text) FROM search_consumer_runtime;
+REVOKE ALL ON FUNCTION sessions.resolve_repo(text, text, text, timestamp with time zone) FROM search_consumer_runtime;
+REVOKE ALL ON FUNCTION sessions.repo_live(text, uuid) FROM search_consumer_runtime;
+REVOKE ALL ON FUNCTION sessions.legacy_remote(text) FROM search_consumer_runtime;
+-- The directory projector rebuilds search_text inline through this immutable
+-- SQL helper (not SECURITY DEFINER); without EXECUTE every pointer upsert
+-- fails 42501 after the lock succeeds.
+REVOKE ALL ON FUNCTION sessions.session_directory_search_text(text, text, text, text, text, text, text, text) FROM search_consumer_runtime;
+GRANT EXECUTE ON FUNCTION sessions.applied_repo_evidence(jsonb, jsonb) TO search_consumer_runtime;
+GRANT EXECUTE ON FUNCTION sessions.canonical_remote(text) TO search_consumer_runtime;
+GRANT EXECUTE ON FUNCTION sessions.clean_root_commit(text) TO search_consumer_runtime;
+GRANT EXECUTE ON FUNCTION sessions.lock_repo_catalog(text) TO search_consumer_runtime;
+GRANT EXECUTE ON FUNCTION sessions.resolve_repo(text, text, text, timestamp with time zone) TO search_consumer_runtime;
+GRANT EXECUTE ON FUNCTION sessions.repo_live(text, uuid) TO search_consumer_runtime;
+GRANT EXECUTE ON FUNCTION sessions.legacy_remote(text) TO search_consumer_runtime;
+GRANT EXECUTE ON FUNCTION sessions.session_directory_search_text(text, text, text, text, text, text, text, text) TO search_consumer_runtime;
+REVOKE ALL ON sessions.repos FROM search_consumer_runtime;
+REVOKE ALL ON sessions.repo_names FROM search_consumer_runtime;
+GRANT SELECT, INSERT, UPDATE ON sessions.repos TO search_consumer_runtime;
+GRANT SELECT, INSERT, UPDATE ON sessions.repo_names TO search_consumer_runtime;
+
+-- Directory projection + tombstone propagation (direct DML, not functions).
+-- The projector reads resurrection fences to gate stale resurrections, so the
+-- writer holds SELECT plus the transparent policy there (same trusted model
+-- as the other directory tables: the writer sees every tenant's fences, and
+-- must, or a stale manifest resurrects a fenced tombstone).
+REVOKE ALL ON sessions.session_directory_resurrection_fences FROM search_consumer_runtime;
+GRANT SELECT ON sessions.session_directory_resurrection_fences TO search_consumer_runtime;
+REVOKE ALL ON sessions.session_directory FROM search_consumer_runtime;
+REVOKE ALL ON sessions.session_directory_users FROM search_consumer_runtime;
+REVOKE ALL ON sessions.session_directory_machines FROM search_consumer_runtime;
+REVOKE ALL ON sessions.session_briefs FROM search_consumer_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.session_directory TO search_consumer_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.session_directory_users TO search_consumer_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.session_directory_machines TO search_consumer_runtime;
+REVOKE ALL ON sessions.session_directory_agents FROM search_consumer_runtime;
+REVOKE ALL ON sessions.session_directory_relationships FROM search_consumer_runtime;
+-- The catalog write diffs existing edges first (INSERT ... SELECT and the
+-- drop CTEs read the tables they maintain), so the writer holds SELECT too.
+GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.session_directory_agents TO search_consumer_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.session_directory_relationships TO search_consumer_runtime;
+GRANT SELECT ON sessions.session_briefs TO search_consumer_runtime;
+
+-- Fanout enqueue: the publication-authority retry runs the pointer upsert with a
+-- real Postgres queue (not the dropped fanout), so every upsert INSERTs its
+-- fanout stages into sessions.pipeline_jobs. INSERT-only: the writer never
+-- reads, claims or deletes queue rows.
+REVOKE ALL ON sessions.pipeline_jobs FROM search_consumer_runtime;
+GRANT INSERT ON sessions.pipeline_jobs TO search_consumer_runtime;
+
+-- Directory event watermarks (the erased and live-complete branches). INSERT on
+-- event_pending is required because the AFTER trigger on session_index
+-- (sessions.session_directory_events_changed, SECURITY INVOKER) inserts the
+-- dirty marker as the writer: without INSERT every pointer write fails 42501.
+-- Only that invoker trigger writes extra tables from the writer's statements;
+-- every other trigger reachable from the writer's writes is SECURITY DEFINER
+-- (replay, history sync, seed, publication guard, brief documents) or touches
+-- only the NEW row (project_name, tombstone), except event_times_forget,
+-- whose DELETE the writer is already granted below.
+REVOKE ALL ON sessions.session_directory_event_pending FROM search_consumer_runtime;
+REVOKE ALL ON sessions.session_directory_event_times FROM search_consumer_runtime;
+GRANT SELECT, INSERT, UPDATE ON sessions.session_directory_event_pending TO search_consumer_runtime;
+GRANT SELECT, INSERT, DELETE ON sessions.session_directory_event_times TO search_consumer_runtime;
+
+-- Search write surface. DELETE on transcript_events is required: the adapter
+-- erases a scope's rows there (synchronousErasure). DELETE on
+-- projection_state is required: the tombstone backstop retires erasure
+-- residue atomically (a complete row_count=0 state with no transcript rows
+-- left), in one statement, so the same tombstones are not re-sent forever.
+REVOKE ALL ON search_index.transcript_events FROM search_consumer_runtime;
+REVOKE ALL ON search_index.projection_state FROM search_consumer_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON search_index.transcript_events TO search_consumer_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON search_index.projection_state TO search_consumer_runtime;
+
+-- The writer's own durable tables (owner-created by the bootstrap Job).
+REVOKE ALL ON sessions.search_consumer_pending FROM search_consumer_runtime;
+REVOKE ALL ON sessions.search_consumer_progress FROM search_consumer_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE ON sessions.search_consumer_pending TO search_consumer_runtime;
+GRANT SELECT, INSERT, UPDATE ON sessions.search_consumer_progress TO search_consumer_runtime;
+
+-- Transparent RLS for the writer: PERMISSIVE FOR ALL USING (true), one policy
+-- per RLS-enabled table the tick touches. Without these the member-read
+-- policies (TO authenticated only) leave the writer blind: reconcile, the
+-- freshness self-check and the tombstone backstop all return empty and the
+-- tick wrongly reports complete. Recreated on rerun so definition drift
+-- converges; verify fails on any other writer-targeted policy.
+DO $policies$
+DECLARE
+  v_tables text[] := ARRAY[
+    'sessions.session_index',
+    'sessions.session_index_ext',
+    'sessions.session_directory',
+    'sessions.session_directory_users',
+    'sessions.session_directory_machines',
+    'sessions.session_directory_agents',
+    'sessions.session_directory_relationships',
+    'sessions.session_briefs',
+    'sessions.session_directory_event_pending',
+    'sessions.session_directory_event_times',
+    'sessions.session_directory_resurrection_fences',
+    'sessions.pipeline_jobs',
+    'sessions.repos',
+    'sessions.repo_names'
+  ];
+  v_search_tables text[] := ARRAY[
+    'search_index.transcript_events',
+    'search_index.projection_state'
+  ];
+  v_table text;
+BEGIN
+  FOREACH v_table IN ARRAY v_tables LOOP
+    EXECUTE format('DROP POLICY IF EXISTS search_consumer_trusted ON %s', v_table);
+    EXECUTE format('CREATE POLICY search_consumer_trusted ON %s AS PERMISSIVE FOR ALL TO search_consumer_runtime USING (true) WITH CHECK (true)', v_table);
+  END LOOP;
+  -- A previous install may have left a writer policy on the search tables;
+  -- drop it so the tenant_only policies are the only gate. None is created.
+  FOREACH v_table IN ARRAY v_search_tables LOOP
+    EXECUTE format('DROP POLICY IF EXISTS search_consumer_trusted ON %s', v_table);
+  END LOOP;
+END
+$policies$;

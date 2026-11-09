@@ -12,6 +12,12 @@
 -- trampoline and every target are created in this one transaction, so any refusal rolls
 -- the entire operation back.
 --
+-- search_consumer_runtime is NOT created here: the migration owner provisions it
+-- directly with supabase/bootstrap/session_consumer_roles.sql (same pattern as
+-- hoopdb_runtime_role_rds.sql on RDS), keeping the owner's ADMIN creator edge so
+-- the owner can promote it to LOGIN. A trampoline copy would leave the owner
+-- unable to promote it, and the membership recheck below would refuse the edge.
+--
 -- service_role is deliberately NOBYPASSRLS. GCP has no Supabase/PostgREST service-role
 -- runtime: this role exists only because the shared schema grants reference it. Giving a
 -- customer-created role BYPASSRLS is both unsupported by Cloud SQL and unnecessary.
@@ -54,13 +60,21 @@ BEGIN
     'bulls96_canonical_feature_producer'::name,
     'bulls96_read_api'::name,
     'bulls96_project_events'::name,
-    'bulls96_digest_narrative'::name
+    'bulls96_digest_narrative'::name,
+    'bulls96_privacy_eraser'::name,
+    'bulls96_babysitter_retention'::name,
+    'bulls96_acquisition_installer'::name,
+    'buffered_search_feed_runtime'::name
   ] LOOP
     SELECT * INTO v_row FROM pg_roles WHERE rolname = v_role;
     IF NOT FOUND THEN
       v_missing := true;
       CONTINUE;
     END IF;
+    -- search_consumer_runtime is deliberately NOT in this inventory (see the
+    -- header note): the migration owner provisions it with
+    -- session_consumer_roles.sql, whose claimed-LOGIN steady state converges
+    -- there instead.
     IF v_row.rolcanlogin THEN v_problems := array_append(v_problems, format('%I has LOGIN', v_role)::text); END IF;
     IF v_row.rolinherit THEN v_problems := array_append(v_problems, format('%I has INHERIT', v_role)::text); END IF;
     IF v_row.rolbypassrls THEN v_problems := array_append(v_problems, format('%I has BYPASSRLS', v_role)::text); END IF;
@@ -135,6 +149,10 @@ BEGIN
       CREATE ROLE bulls96_read_api
         NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_privacy_eraser') THEN
+      CREATE ROLE bulls96_privacy_eraser
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_project_events') THEN
       CREATE ROLE bulls96_project_events
         NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
@@ -145,6 +163,21 @@ BEGIN
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_canonical_feature_producer') THEN
       CREATE ROLE bulls96_canonical_feature_producer
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_babysitter_retention') THEN
+      CREATE ROLE bulls96_babysitter_retention
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
+    -- search_consumer_runtime is never created here (see the header note): the
+    -- migration owner provisions it with session_consumer_roles.sql so the
+    -- owner's ADMIN creator edge survives.
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'bulls96_acquisition_installer') THEN
+      CREATE ROLE bulls96_acquisition_installer
+        NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'buffered_search_feed_runtime') THEN
+      CREATE ROLE buffered_search_feed_runtime
         NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
     END IF;
     RESET ROLE;
@@ -161,7 +194,11 @@ BEGIN
        'session_token_verifier',
        'bulls96_session_ingest', 'bulls96_session_ingest_seeder',
        'bulls96_canonical_feature_producer', 'bulls96_read_api', 'bulls96_project_events',
-       'bulls96_digest_narrative'
+       'bulls96_digest_narrative',
+       'bulls96_privacy_eraser',
+       'bulls96_babysitter_retention',
+       'bulls96_acquisition_installer',
+       'buffered_search_feed_runtime'
      )
   ) THEN
     RAISE EXCEPTION USING ERRCODE = '55000',

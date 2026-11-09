@@ -12,11 +12,64 @@ name: deploy session-read-worker
 #   SESSION_READ_TIMING_ASSUME_NO_TURNS  optional "true" (runbook, "Session timing")
 # Environment secret: CLOUDFLARE_API_TOKEN (Workers Scripts:Edit, Hyperdrive:Read).
 #
+# Owner-buffered reads (Option C, src/session-read-api/owner-buffered.ts), default off.
+# A dispatch without inputs (or owner_buffered=off) renders exactly the config deployed
+# before these inputs existed: no service binding, no flag. owner_buffered=on renders
+# (scripts/render-deploy-config.ts) the HISTORY_CONTROL_HEAD service binding to
+# relayhistory-api's named entrypoint SessionReadPrivacyControls (pinned in the script),
+# RELAYHISTORY_READ_OWNER_BUFFERED=true, READ_API_OWNER_BUFFERED_WORKSPACES from the
+# owner_buffered_workspaces input (explicit ids, each also on
+# SESSION_READ_DIRECTORY_WORKSPACES; or exactly "*", the all-workspaces mode, accepted only
+# when SESSION_READ_DIRECTORY_WORKSPACES is itself exactly "*"; "*" mixed with ids is
+# refused; the per-user privacy gate is unchanged in either case), and, from environment
+# variables required only then:
+#   SESSION_READ_INGEST_S3_BUCKET  the ingest bucket holding buffered-batches/ (INGEST_S3_BUCKET)
+#   SESSION_READ_INGEST_S3_REGION  its region (INGEST_S3_REGION)
+# The S3 credentials are the Worker's PIPELINE_RAW_S3_ACCESS_KEY_ID / _SECRET_ACCESS_KEY
+# secrets (wrangler secret put; GetObject + kms:Decrypt on buffered-batches/ is a separate
+# IAM grant); an on deploy refuses to run unless both exist. Every later dispatch without
+# inputs turns the feature off again.
+#
+# owner_buffered_events=on (valid only with owner_buffered=on; the render refuses it otherwise)
+# adds READ_API_OWNER_BUFFERED_EVENTS=on: owner-buffered session events on
+# GET /v1/sessions/:sessionId/events with `source`. off (or no input) renders exactly the
+# owner_buffered render without it. Turning it on is a production change: dispatch is Khaliq's
+# call. Every later dispatch without the input turns it off again.
+#
+# Buffered search gate (src/session-read-api/buffered-search-gate.ts, PR #338), default off.
+# buffered_search_gate=off (or no input) changes nothing: the render is byte-identical to the one
+# before this input existed. buffered_search_gate=on renders READ_API_BUFFERED_SEARCH_GATE=on and
+# the same pinned HISTORY_CONTROL_HEAD binding (once, also when owner_buffered=on); it needs no
+# workspace list and no S3, and refuses any other value. The gate drops every buffered-origin
+# search hit it cannot prove visible, so it must be deployed BEFORE the buffered search feeder
+# (#339) is enabled. Turning it on is a production change: dispatch is Khaliq's call. Every later
+# dispatch without the input turns the gate off again.
+#
 # The Worker's own secrets (CLICKHOUSE_URL, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD)
 # are never handled here: they are set with `wrangler secret put` from 1Password
 # and survive deploys. This workflow checks that they exist, by name only.
 on:
   workflow_dispatch:
+    inputs:
+      owner_buffered:
+        description: Owner-buffered reads (Option C). off = exactly the default deploy
+        type: choice
+        options: ["off", "on"]
+        default: "off"
+      owner_buffered_workspaces:
+        description: 'Canary workspace ids, comma-separated, or exactly "*" for all workspaces (only if SESSION_READ_DIRECTORY_WORKSPACES is "*"); required when on'
+        type: string
+        default: ""
+      owner_buffered_events:
+        description: Owner-buffered session events (GET /v1/sessions/:id/events with source); valid only with owner_buffered=on. off = exactly the owner_buffered render
+        type: choice
+        options: ["off", "on"]
+        default: "off"
+      buffered_search_gate:
+        description: Per-hit privacy gate for buffered search hits (#338); needs no other input. off = exactly the default deploy
+        type: choice
+        options: ["off", "on"]
+        default: "off"
 permissions:
   contents: read
 concurrency:
@@ -44,7 +97,17 @@ jobs:
       ORIGIN: ${{ vars.SESSION_READ_ORIGIN }}
       COMPLETE_SINCE: ${{ vars.SESSION_READ_COMPLETE_SINCE }}
       DIRECTORY_WORKSPACES: ${{ vars.SESSION_READ_DIRECTORY_WORKSPACES }}
+      BRIEF_TITLES_WORKSPACES: ${{ vars.SESSION_READ_BRIEF_TITLES_WORKSPACES }}
       TIMING_ASSUME_NO_TURNS: ${{ vars.SESSION_READ_TIMING_ASSUME_NO_TURNS }}
+      # Owner-buffered (default off); inputs reach the shell only through env.
+      OWNER_BUFFERED: ${{ inputs.owner_buffered }}
+      OWNER_BUFFERED_WORKSPACES: ${{ inputs.owner_buffered_workspaces }}
+      OWNER_BUFFERED_S3_BUCKET: ${{ vars.SESSION_READ_INGEST_S3_BUCKET }}
+      OWNER_BUFFERED_S3_REGION: ${{ vars.SESSION_READ_INGEST_S3_REGION }}
+      # Owner-buffered session events (default off); the render refuses on without owner_buffered=on.
+      OWNER_BUFFERED_EVENTS: ${{ inputs.owner_buffered_events }}
+      # Buffered search gate (default off); renders the flag and the pinned binding when on.
+      BUFFERED_SEARCH_GATE: ${{ inputs.buffered_search_gate }}
     defaults:
       run:
         working-directory: packages/session-read-worker
@@ -86,11 +149,20 @@ jobs:
             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/hyperdrive/configs/$HYPERDRIVE_ID" \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
             | bun run scripts/check-hyperdrive-config.ts
-      - name: Render the deploy config (Hyperdrive id only)
+      - name: Render the deploy config (Hyperdrive id; control-head binding and flags only when owner_buffered or buffered_search_gate is on)
         run: |
           grep -q '"id": "00000000000000000000000000000000"' wrangler.jsonc
-          sed 's/"id": "00000000000000000000000000000000"/"id": "'"$HYPERDRIVE_ID"'"/' wrangler.jsonc > wrangler.deploy.jsonc
+          bun run scripts/render-deploy-config.ts
           grep -q "\"id\": \"$HYPERDRIVE_ID\"" wrangler.deploy.jsonc
+      - name: Check the owner-buffered Worker secrets exist (names only; on only)
+        if: inputs.owner_buffered == 'on'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          names="$(bunx wrangler secret list --config wrangler.deploy.jsonc --format json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).map(x=>x.name).sort().join(" ")))')"
+          for n in PIPELINE_RAW_S3_ACCESS_KEY_ID PIPELINE_RAW_S3_SECRET_ACCESS_KEY; do
+            case " $names " in *" $n "*) ;; *) echo "::error::Worker secret $n is not set; owner-buffered reads would be silently off. Refusing to deploy owner_buffered=on"; exit 1 ;; esac
+          done
       - name: Deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -99,6 +171,7 @@ jobs:
             --var "READ_API_ORIGIN:$ORIGIN" \
             --var "READ_API_COMPLETE_SINCE:$COMPLETE_SINCE" \
             ${DIRECTORY_WORKSPACES:+--var "READ_API_DIRECTORY_WORKSPACES:$DIRECTORY_WORKSPACES"} \
+            ${BRIEF_TITLES_WORKSPACES:+--var "READ_API_BRIEF_TITLES_WORKSPACES:$BRIEF_TITLES_WORKSPACES"} \
             ${TIMING_ASSUME_NO_TURNS:+--var "READ_API_TIMING_ASSUME_NO_TURNS:$TIMING_ASSUME_NO_TURNS"} \
             --message "96BullSessions ${GITHUB_SHA}"
       - name: Check the Worker's secrets exist (names only)

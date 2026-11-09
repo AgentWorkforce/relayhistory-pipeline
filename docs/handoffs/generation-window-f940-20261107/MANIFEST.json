@@ -1,0 +1,575 @@
+{
+  "version": 1,
+  "at": "2026-11-07T23:14:59.789719+00:00",
+  "kind": "approved_window_and_forward_fix_sources_receipts",
+  "source": "f9409ccb9e46c3f100cf3017847d8ed62bc716c7",
+  "readiness": "G2_WINDOW_VERIFIED_ACCEPTANCE_RESUMED_INTERMITTENT_CLAIM_TIMEOUTS_REMAIN",
+  "files": [
+    {
+      "name": "approved-missing-nologin-bootstrap.ts.txt",
+      "bytes": 6575,
+      "sha256": "50911d8a6a8baa49a77b1d4bf29b88c3f2423662f47d2f2348af96ba6bbb7474"
+    },
+    {
+      "name": "approved-role-bootstrap-after.json",
+      "bytes": 21285,
+      "sha256": "d52d5723bb4be7919ea561bb931edf1a196402f104e998e8a6bb83b764acb85d"
+    },
+    {
+      "name": "approved-role-bootstrap-before.json",
+      "bytes": 17318,
+      "sha256": "b12abf05d7e98efbfbbdc97c571aca1288b1222f98a947825ce2740ab20f2a19"
+    },
+    {
+      "name": "approved-role-bootstrap-observation.md",
+      "bytes": 2057,
+      "sha256": "05ab85406b79f63b683c8ba6549eeeb8cf292040188e225a60895722706484f1"
+    },
+    {
+      "name": "approved-role-bootstrap-result.json",
+      "bytes": 980,
+      "sha256": "c344b597b2bc31b3f79a7ae183bf985a93ba41e07449adbe59d4f337e14e850e"
+    },
+    {
+      "name": "approved-role-bootstrap-verification.json",
+      "bytes": 1929,
+      "sha256": "15b01a1d79e4723fe8e636aef5b54111010f0636afd68a581174652fafc3b9a1"
+    },
+    {
+      "name": "approved-role-bootstrap.sql.txt",
+      "bytes": 4771,
+      "sha256": "c957ae416d707d471b576bea93dee07f2035fb8b930bacaff4207d63ffc0b478"
+    },
+    {
+      "name": "approved-window-aws-user-retry-result.json",
+      "bytes": 1549,
+      "sha256": "9816ec74e6ee3a494ea073182364b2c94d4e8410b96064c8138a60eef9998508"
+    },
+    {
+      "name": "approved-window-current-status.md",
+      "bytes": 5753,
+      "sha256": "08c62f76d59acefefc5a1bc518099f24927c2257d6c7fd3b9bc9f95f471a6f86",
+      "redactionProvenance": {
+        "originalSha256": "52b9572d1530b18d3c92f7e5b2c97e074e724138fbff7590e5f8bee1f8a3095d",
+        "change": "Customer first name replaced with the reporting customer in prose, comments or inert source metadata. Not an executable source update."
+      }
+    },
+    {
+      "name": "approved-window-gc-executor-answer.md",
+      "bytes": 5947,
+      "sha256": "ca1e2737ce91dd8f70dd372b93921b97760a5084ff352ae7428b5df95837e3db"
+    },
+    {
+      "name": "approved-window-gc-existing-session-result.json",
+      "bytes": 502,
+      "sha256": "8e7cbeb13c21674bca458cdc1091db7482037b87b602a0ccf5dad412bc738587"
+    },
+    {
+      "name": "approved-window-gc-native-status-result.json",
+      "bytes": 314,
+      "sha256": "04e8353ad907d8f796ea98cf98b11bb9bcd9218719f460a10f05e24ef4dc8231"
+    },
+    {
+      "name": "approved-window-post-rebind-g2-census.json",
+      "bytes": 2022,
+      "sha256": "ce0fccaaffa72468c399398acf5d3897ec2a856d1447fed1afbff41023cef6e5"
+    },
+    {
+      "name": "approved-window-preapply-g1-census.json",
+      "bytes": 1851,
+      "sha256": "8331d453a51543b0e75aa57492996bea8761024349caa941d2147c2b0c6a7894"
+    },
+    {
+      "name": "approved-window-rebind-dry-result.json",
+      "bytes": 475,
+      "sha256": "c59068e1cf5c44a92e0c7b676761521131920977025137e5c8887e5e735aca78"
+    },
+    {
+      "name": "approved-window-rebind-execute-result.json",
+      "bytes": 480,
+      "sha256": "83716c6b1c703380c13fd466c30c4b25e9c7f2863d9f3cdbfc8f0feb417943da"
+    },
+    {
+      "name": "approved-window-rebind-staged-invocation.json",
+      "bytes": 1056,
+      "sha256": "c03b8b9bd0461f77afeb46fc3e9160e8b87fcfdd656cfdf4600e50deacf84d72"
+    },
+    {
+      "name": "approved-window-refresh-capture-result.json",
+      "bytes": 554,
+      "sha256": "3467764ffdc6aaebc1c71fbad448e17df500dcfd5fe030d1dadfe33de6194c33"
+    },
+    {
+      "name": "approved-window-refresh-capture.json",
+      "bytes": 2428,
+      "sha256": "695aa5bfcf18646aabf9081c6028662017d42d94d0e4629a283e5b215f479c50"
+    },
+    {
+      "name": "approved-window-refresh-readonly-plan.json",
+      "bytes": 20210,
+      "sha256": "95d9012c2183758fd4a81a05f887a8b395c4287e1b9ef37f7d9e7f55a3c7554e"
+    },
+    {
+      "name": "approved-window-refresh-receipt.json",
+      "bytes": 1474,
+      "sha256": "0ab7eec9ba4fdc6a3e81511ed1d09946de969224767539c80c36758de229f90c"
+    },
+    {
+      "name": "approved-window-schema-apply-result.json",
+      "bytes": 505,
+      "sha256": "d690c2b2eaf95f8612bd4b052a54ca87de3c7db7ada53ec00b7aa5926aea25d7"
+    },
+    {
+      "name": "approved-window-schema-approval.json",
+      "bytes": 1507,
+      "sha256": "7ec8a5955da82c2b8e38c8106aefdd3ba00c5556017bf35e883b32de3a28327c"
+    },
+    {
+      "name": "approved-window-step2-coordination.json",
+      "bytes": 1579,
+      "sha256": "0373df88e6cb3d5e177da90bc5290068c603ec8476a75b5c85e382e88f74888b"
+    },
+    {
+      "name": "bootstrap-prerequisite.json",
+      "bytes": 1293,
+      "sha256": "f9e4d9c97c60f77af58341ce81b742f80843422743977b3eb2a1013d1dccfb28"
+    },
+    {
+      "name": "capture.json",
+      "bytes": 2428,
+      "sha256": "f561d85d2b422c5fc0bcc07ff4bede94e071d086d89dcb8c71752c045dcf33e0"
+    },
+    {
+      "name": "claim-lockwait-2486-independent-delta-review-PASS-20261107.json",
+      "bytes": 1380,
+      "sha256": "dea37d2148ae36b143139e1c1561e55a3231bd373d7a0a99eb05ca2d8da790e8"
+    },
+    {
+      "name": "claim-lockwait-attribution-20261107.sql",
+      "bytes": 2224,
+      "sha256": "653631a3fe5fada39df2ca74ebee35c7236bfe2240be51818d515422edde98fa"
+    },
+    {
+      "name": "claim-lockwait-attribution-final-20261107.sql",
+      "bytes": 2545,
+      "sha256": "2486bf707ef7b415d73313375a7f381f68179144d0ef51491a6c23a8a13ea1da"
+    },
+    {
+      "name": "ec2-retained-migration-host-proof.json",
+      "bytes": 464,
+      "sha256": "c8da6a4700d0d6ac80ae7aa2001b546a9be57169c15c7d01711a80d26dac00f8"
+    },
+    {
+      "name": "execution-targets.json",
+      "bytes": 13415,
+      "sha256": "0f093e9ddb38c66a355f1afb12c09dd4970c5ed5ff1ddbd6a56580e818b4cb51"
+    },
+    {
+      "name": "fixed-role-inventory-readonly.ts.txt",
+      "bytes": 10708,
+      "sha256": "36b214ea191c16ddfeba91c8b52c5323b0dc525e2f573be3d8eb2e4e3fb0a81f"
+    },
+    {
+      "name": "fixed-role-inventory.json",
+      "bytes": 11178,
+      "sha256": "8b783e760171d2a9f9b9526002c5d968cf06c08ff169517a32a4d3b5588f7c4e"
+    },
+    {
+      "name": "forward-fix-apply-execution.json",
+      "bytes": 765,
+      "sha256": "83b720530389487fe675d0aa0710131be8c71679499258bb3a79409e48915078"
+    },
+    {
+      "name": "forward-fix-bracket.py.txt",
+      "bytes": 6798,
+      "sha256": "1e2948088498e3c898992ac35abc8b4195dfa367497dab7a462e8776876541e6"
+    },
+    {
+      "name": "forward-fix-driver-v3.py.txt",
+      "bytes": 5469,
+      "sha256": "b554cadbc0bce65861eb0c49cde49b41d14428dffaed6ea2a660b263f13b3aaf"
+    },
+    {
+      "name": "forward-fix-evidence-index.md",
+      "bytes": 1754,
+      "sha256": "4f2ded198e01176da4e177649245f84fb4de83fa5eb67e7bfcec06b16d299468"
+    },
+    {
+      "name": "forward-fix-guard-v3.ts.txt",
+      "bytes": 9437,
+      "sha256": "c3bf3d6c45ef6e9c3136251bac8ced5fbe5472554ca2ed201229ed189b77ebb9"
+    },
+    {
+      "name": "forward-fix-prepare-check.json",
+      "bytes": 679,
+      "sha256": "0062be164614487adfaba6963ff3c4b5d346d552079096f63e9284df05ba7a86"
+    },
+    {
+      "name": "forward-fix-review-packet.json",
+      "bytes": 1174,
+      "sha256": "00e7574e48d2ca26b0f7d7af95b0f9a49f20267110694d3138bd238c6172240b"
+    },
+    {
+      "name": "forward-fix-source-provenance.json",
+      "bytes": 3191,
+      "sha256": "732efbd27cbfe3a205e9ae28c5e5929f13dd50aa6078a82ae68b2705b104737a",
+      "redactionProvenance": {
+        "originalSha256": "234f11336a98cd977dabf004f5db2a53cf04f57d6ce7813169be7f961cae2162",
+        "change": "Customer first name replaced with the reporting customer in prose, comments or inert source metadata. Not an executable source update."
+      }
+    },
+    {
+      "name": "forward-fix-verifier.py.txt",
+      "bytes": 6200,
+      "sha256": "17f83b4abe321357f8d67d282e75854aae2508b87ac397c58e8e72a74cb8ef4a"
+    },
+    {
+      "name": "g1-census-readonly.ts.txt",
+      "bytes": 5582,
+      "sha256": "42c3c8a34ac628f3ee7e277401791d4f49f4223084c69761397c2ee12476d6c7"
+    },
+    {
+      "name": "g1-census.json",
+      "bytes": 1851,
+      "sha256": "71e19b00e7503440259ed1d0dcf9e0ebb40cc8a09a75103d9900f83f461a52fe"
+    },
+    {
+      "name": "g2-f940-after-apply-verify-20261107T225141Z.json",
+      "bytes": 1074,
+      "sha256": "8f0460433c72ac37f9e4fe8276e5643776180fa3befa8b35b0b228541e53cb4e",
+      "historicalCustomerLabel": {
+        "originalBytesPreserved": true,
+        "scope": "Historical kind or boolean-field label contains a customer first name only; no customer IDs or payloads. Retained for receipt hash provenance, explicitly accepted by lead review 244961104601825280."
+      }
+    },
+    {
+      "name": "g2-f940-apply-check-20261107T224202Z.json",
+      "bytes": 679,
+      "sha256": "6e9c4719ee005bcec30d027d98bbf66513dd72b770e047fc9ea6bd5b5edf0cf6"
+    },
+    {
+      "name": "g2-f940-apply-driver-20261107T224204Z.json",
+      "bytes": 603,
+      "sha256": "213427b88ea100e9c589c5f575fdbd985ed1d21a5d60486deb1cf5a431c25180"
+    },
+    {
+      "name": "g2-f940-unknown-reconciliation-20261107T223941Z.json",
+      "bytes": 1316,
+      "sha256": "98b3e9bf20f34393739d2727fd6d96b9b0c80b5dc933f3a6da3328e0376658e3"
+    },
+    {
+      "name": "g2-f940-upload-map-offline-replay-proof-20261107.json",
+      "bytes": 2114,
+      "sha256": "4fc9bd57773ec1d1bb1e76b74da061894dfa6decdc31a7aee33be9515eebede7"
+    },
+    {
+      "name": "g2-ingest-rpc-query-md5-metadata-map-20261107.json",
+      "bytes": 2334,
+      "sha256": "a5cc12c4cdd59e2a5ca57b178966ce83bcdeb0ae6036e22a4c62aaf7f40271fb"
+    },
+    {
+      "name": "gc-last-retained-code-update-receipt.json",
+      "bytes": 1865,
+      "sha256": "a6e39b73c324f4d49ec56d941ba0cdddea0a2118fe3e0f49beec1be027c66b33"
+    },
+    {
+      "name": "generation-window.md",
+      "bytes": 35404,
+      "sha256": "7d13d267202966c569eb9f4adb87d4413c1d7c5e01a7b8585adfb01faa8d32ce"
+    },
+    {
+      "name": "ingest-aggregate-attempt-receipt.json",
+      "bytes": 1132,
+      "sha256": "431b29a4d420f42592266e371c423f8fb54f57e916203970c909c5f2ee288b4d",
+      "historicalCustomerLabel": {
+        "originalBytesPreserved": true,
+        "scope": "Historical kind or boolean-field label contains a customer first name only; no customer IDs or payloads. Retained for receipt hash provenance, explicitly accepted by lead review 244961104601825280."
+      }
+    },
+    {
+      "name": "ingest-aggregate-observation.md",
+      "bytes": 4232,
+      "sha256": "d9c2c90859e0453c3e6399fbafec055ca8755a8d9fb41062b1c3ee11b740ce1b"
+    },
+    {
+      "name": "ingest-aggregate-snapshot-v2.sql.txt",
+      "bytes": 4158,
+      "sha256": "8930e4cfc0497aa4eb56b20add752f8eaa60fadd6c00ee53068a38ee1b4ae3cf"
+    },
+    {
+      "name": "ingest-aggregate-v2-readonly.ts.txt",
+      "bytes": 7909,
+      "sha256": "f568c5581a13ecfce6066b3bb940255247823d5bdf6b39b49a5dc5ed88f3206e",
+      "redactionProvenance": {
+        "originalSha256": "8079a725cbc93ef0f30cd71e4ba01f5c58def43324a624d30e56b8166fddced8",
+        "change": "Customer first name replaced with the reporting customer in prose, comments or inert source metadata. Not an executable source update."
+      }
+    },
+    {
+      "name": "ingest-aggregate-v2-result.json",
+      "bytes": 1916,
+      "sha256": "e54a299c17781ad0b63150d8cd57fb98ec4be7313314b5ec2ab5f09b1236cb32",
+      "historicalCustomerLabel": {
+        "originalBytesPreserved": true,
+        "scope": "Historical kind or boolean-field label contains a customer first name only; no customer IDs or payloads. Retained for receipt hash provenance, explicitly accepted by lead review 244961104601825280."
+      }
+    },
+    {
+      "name": "ingest-claim-inner-statement-stats-readonly-draft-20261107.sql",
+      "bytes": 4773,
+      "sha256": "24fa86fe520d69d279e69659b96c830969bbcc410a6cb86b5537a6b656b48fa7"
+    },
+    {
+      "name": "ingest-unpaired-tail-receipt.json",
+      "bytes": 706,
+      "sha256": "4e77499fb02e73e42c24dd7ad1e9884c33b85dfabec7e42dd3b4b0d500fc1c54"
+    },
+    {
+      "name": "org-publication-cohort-attempt.md",
+      "bytes": 2941,
+      "sha256": "61d04ef0b95b6bfb9252e749a90b572536c2abf697d7a16d153df9602265bdd2",
+      "redactionProvenance": {
+        "originalSha256": "1c398fe3a1749bad2051d14b4b6470dc123c69462ad3ce2edd4efaf2b9a37e8a",
+        "change": "Customer first name replaced with the reporting customer in prose, comments or inert source metadata. Not an executable source update."
+      }
+    },
+    {
+      "name": "org-publication-cohort-readonly.ts.txt",
+      "bytes": 8561,
+      "sha256": "11d518e41f0493b302188d00ad389be348efd5b013557ebd9a035bfe89cebd21",
+      "redactionProvenance": {
+        "originalSha256": "62431be76af7f06fbdb009c3db976e4694b853fb603c29344ddf6ca308eafe99",
+        "change": "Customer first name replaced with the reporting customer in prose, comments or inert source metadata. Not an executable source update."
+      }
+    },
+    {
+      "name": "org-publication-cohort-result.json",
+      "bytes": 773,
+      "sha256": "4193c08c328b0d43674c15e0df62a5b15507889957169f2194c3c6291240a658"
+    },
+    {
+      "name": "org-publication-cohort.sql.txt",
+      "bytes": 6631,
+      "sha256": "35aaac827625f50d5208b0b116b515fce2de45e946b98759a3da4fe4b5ece980",
+      "redactionProvenance": {
+        "originalSha256": "bc431aa6f55eefc755126f5d7a8536c4b72e1f7ede9ff9c40ee65bd6c39481fd",
+        "change": "Customer first name replaced with the reporting customer in prose, comments or inert source metadata. Not an executable source update."
+      }
+    },
+    {
+      "name": "packet-secret-scan-review.json",
+      "bytes": 851,
+      "sha256": "6813545320540e42a62733f2bd2f3464fed0e058a8f26eec6210f9e5b9dc6ced"
+    },
+    {
+      "name": "post-cutover-daily-ack-observation.md",
+      "bytes": 3304,
+      "sha256": "552605f1e456a5f0fc3ea2f83e15ac4ca1ff536543c326d8b565f5d121cee3b8"
+    },
+    {
+      "name": "post-cutover-daily-ack-readonly.ts.txt",
+      "bytes": 6437,
+      "sha256": "07763dd774e41fd0f6ea72d7600160ccef277759471fb76a6026ca1fdb651f06"
+    },
+    {
+      "name": "post-cutover-daily-ack-result.json",
+      "bytes": 2007,
+      "sha256": "1b352675e8facd6116d2f9780c34ac98aeccdf2da81e71bb912bc605fce19ff1"
+    },
+    {
+      "name": "post-cutover-daily-ack.sql.txt",
+      "bytes": 2868,
+      "sha256": "004e9baa07cecfcf663848c0bd421cafdc94aecd3d5310a8319b3c5ba4c792a6"
+    },
+    {
+      "name": "post-rebind-dual-worker-120s-sample.json",
+      "bytes": 4407,
+      "sha256": "bc058ed2e2e31416e6ef33c1f377cefec77206e88e49f65937fadab5ee8257db"
+    },
+    {
+      "name": "post-window-claim-stats-result.json",
+      "bytes": 26282,
+      "sha256": "4a9fd9da38b291cec3ca24bc848d2321a37a0ae0743e55a14c2f9503b384471a"
+    },
+    {
+      "name": "post-window-claim-stats-summary.md",
+      "bytes": 1724,
+      "sha256": "bab08c79cbd46d8f31214f7aad86c328acfbd7a6e79d80b82ddf78caa7bd42eb"
+    },
+    {
+      "name": "post-window-lockwait-final-five-labeled.json",
+      "bytes": 7324,
+      "sha256": "ca34727eccdd868f892e72e9c2f0a03c87a9661ccae718fc862baba27b45cf7c"
+    },
+    {
+      "name": "post-window-lockwait-final-five-results.json",
+      "bytes": 6929,
+      "sha256": "93e2e59a34b6fb08c6908b6152a41a625494ff06287aeab609e73fbae6792b4f"
+    },
+    {
+      "name": "post-window-lockwait-final-five-summary.md",
+      "bytes": 2984,
+      "sha256": "64f8ebcadf8d4d968b26af2b7861223a893a4c00ad51be58b47022dd46d77925"
+    },
+    {
+      "name": "post-window-lockwait-final-readonly.ts.txt",
+      "bytes": 6999,
+      "sha256": "acbb34e6a7b4a6b9aa4d2dd8d25d51b4db45caa056d15e7f3c123bc0e76d347e"
+    },
+    {
+      "name": "publisher-activity-observation.md",
+      "bytes": 2638,
+      "sha256": "28c00fdd1ce9821a4eec332d7f1d12bb162c05fce3326a05cbc5db828e62eb89"
+    },
+    {
+      "name": "publisher-activity-readonly.ts.txt",
+      "bytes": 7438,
+      "sha256": "948c731ca3e0aad9a4203cd38c38c5367f29e26dd63ae8044ebe810bd9c8619c"
+    },
+    {
+      "name": "publisher-activity-result.json",
+      "bytes": 1800,
+      "sha256": "8aae951f892362d70623e44f0aab0a6d4a302c1e8f546730f0d537ad4b358b9f"
+    },
+    {
+      "name": "publisher-activity-snapshot.sql.txt",
+      "bytes": 2959,
+      "sha256": "631ac8c57800c765b93db8e44cc3f930652521266c9602957c1480c812467ffa"
+    },
+    {
+      "name": "readonly-plan.json",
+      "bytes": 20210,
+      "sha256": "9f18fc767ca002522060e53012e861411dc52c7b90d77172254d30cafc4d3100"
+    },
+    {
+      "name": "readonly-preparation-receipt.json",
+      "bytes": 3110,
+      "sha256": "ab2ba135b8086d6f502f18e1df3dab482ce0ff4ab0cc70bda651b2ed3f20e6f0"
+    },
+    {
+      "name": "rehearsal-summary.json",
+      "bytes": 2245,
+      "sha256": "213962668c8c63ecc1a4503f09cc460af35746bb054ce87eab4a5df667ea779c"
+    },
+    {
+      "name": "retained-aws-targets.json",
+      "bytes": 5601,
+      "sha256": "a59e72559a6742e97d9d4eaaec9d5f0f669f6c5c05fb2fdf00e8d0553a8ec51c"
+    },
+    {
+      "name": "retained-aws-targets.md",
+      "bytes": 6716,
+      "sha256": "61ef73779b39f9cc50c4de7442d9c99dfa7c2f175517c2531c64ffac668c4a91"
+    },
+    {
+      "name": "retained-history-neon-readonly-pin.json",
+      "bytes": 1195,
+      "sha256": "6590b44ba815dbc71e8a2f84e9ae753ddcfca41352fff3681e8b0bdc72ff1347"
+    },
+    {
+      "name": "review-notes.md",
+      "bytes": 8278,
+      "sha256": "1ef578f8d644f4362fd720868ed50de7a5db953aa3ad0fc8d3434b4c7f3cd742"
+    },
+    {
+      "name": "session_ingest_roles.sql.txt",
+      "bytes": 4771,
+      "sha256": "c957ae416d707d471b576bea93dee07f2035fb8b930bacaff4207d63ffc0b478"
+    },
+    {
+      "name": "source-evidence.json",
+      "bytes": 7877,
+      "sha256": "904f6ce4e3ab284420c67ffa400fc0403ee16b2b7653d51fb982c7c16d58f074"
+    },
+    {
+      "name": "supabase-nonsystem-catalog-census-observation.md",
+      "bytes": 3442,
+      "sha256": "9f4d21dfbb40edb7ec4a8fd6f75b44c7c3f6126ab28a12dd6588d12b0e4210bf",
+      "redactionProvenance": {
+        "originalSha256": "32ed3bc65a72c6dfdd7785e73ed72f1b4692616bc8d8af64fad37e6cf09088e4",
+        "change": "Customer first name replaced with the reporting customer in prose, comments or inert source metadata. Not an executable source update."
+      }
+    },
+    {
+      "name": "supabase-nonsystem-catalog-census-readonly.ts.txt",
+      "bytes": 6921,
+      "sha256": "28970c259ec051c134fcb51faa8a66d3de9fdc7ab7f36ca1ecbdd62044cb0534"
+    },
+    {
+      "name": "supabase-nonsystem-catalog-census-result.json",
+      "bytes": 172798,
+      "sha256": "94613369617d66de97064b6817d4fd656e648795bb80e2a0d9aec2420f88b219"
+    },
+    {
+      "name": "supabase-nonsystem-catalog-census-summary.json",
+      "bytes": 1110,
+      "sha256": "230b8f60e50ccce7b78691c2dc668cd69e82dd078839e0cf2e4d7b9d124befd4"
+    },
+    {
+      "name": "supabase-nonsystem-catalog-census.sql.txt",
+      "bytes": 2896,
+      "sha256": "6eb326424b3737f3a90f321c8f6e21fcc217bb07d0f34d1eaa476796843b5943"
+    },
+    {
+      "name": "supporting-readiness.md",
+      "bytes": 10922,
+      "sha256": "2bf13916a0d68107a65a5972827176bce71f478e9790b1a33b90a811931c0782"
+    },
+    {
+      "name": "window21-rehearsal-result.json",
+      "bytes": 15563,
+      "sha256": "058f617f93ae0175f71459277959157da0afb81675421f0a0d6159de1c1fc0c8"
+    },
+    {
+      "name": "window21-rehearsal.ts.txt",
+      "bytes": 20530,
+      "sha256": "feba9f9679b0a237e2191ab639430d89c4f4dd0f42604c172eee356c6401e40f"
+    },
+    {
+      "name": "worker-bundle-root-dependency-sources.json",
+      "bytes": 25015,
+      "sha256": "e5ab141cb809e06917c7aca20f38339c386f3d095e7647a057b5e7751c75d141"
+    },
+    {
+      "name": "worker-bundle-root-repo-sources.json",
+      "bytes": 26924,
+      "sha256": "f57dc3ec8b001023d421e22e7fbcfd57541627ecec09baf19d76a933446ff485"
+    },
+    {
+      "name": "worker-bundle-root-review.json",
+      "bytes": 5355,
+      "sha256": "4face92ba0bfa233e888c6804ccc57f559dc35a76b1c7bd0940642717946dfc5"
+    },
+    {
+      "name": "worker-bundle-root-review.md",
+      "bytes": 4804,
+      "sha256": "60b6d11972abb5a5d45a0762b6fe6ca8e154937e5bbaab95b0912805e38cf475"
+    },
+    {
+      "name": "worker-compatibility-receipt.json",
+      "bytes": 1561,
+      "sha256": "8aeb39de56d450862729b708e9832d6fc01ea75f02ee7d1c861ae64e06d561aa"
+    },
+    {
+      "name": "worker-compatibility-review.md",
+      "bytes": 9588,
+      "sha256": "32e59d040278503a1d259bc5ee1a97695a8e05f9fca2e81fd6819e1b937f09d3"
+    },
+    {
+      "name": "worker-delta-focused-tests.log",
+      "bytes": 12583,
+      "sha256": "c81636cfc85b474547cec3b234e81f2f49802ed19836c12afe6fc2087981ee25"
+    },
+    {
+      "name": "worker-shared-delta-tests.log",
+      "bytes": 6575,
+      "sha256": "766e7e2d649df9384274695a9bff84293ebd1e4c46763c2e69c678e58af1ce07"
+    }
+  ],
+  "sourceSnapshotsAreInert": true,
+  "customerLabelDisposition": {
+    "proseAndInertSources": "Redacted to the reporting customer",
+    "hashBoundReceipts": "Three originals retained byte-identical with per-file annotations; label-only, no customer identifiers",
+    "leadReviewMessage": "244961104601825280"
+  }
+}

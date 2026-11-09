@@ -1,0 +1,1549 @@
+{
+  "cases": [
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "begin-and-apply-control-in-one-transaction",
+          "committed": true,
+          "delta": {
+            "neonControlVersion": "8",
+            "neonDeletionPresent": true,
+            "neonPending": true
+          },
+          "sequence": 1,
+          "system": "neon"
+        },
+        {
+          "action": "ordered-fence-write",
+          "committed": false,
+          "delta": {},
+          "outcome": "timeout-or-error-with-rollback",
+          "sequence": 2,
+          "system": "supabase"
+        },
+        {
+          "action": "public-control-response",
+          "sequence": 3,
+          "status": 503,
+          "system": "relayhistory-api"
+        },
+        {
+          "action": "finish-fetch-then-recheck-target-only",
+          "observes": "unchanged-supabase-baseline",
+          "sequence": 4,
+          "system": "session-read-api"
+        },
+        {
+          "action": "authoritative-service-binding-read-after-fetch",
+          "observes": {
+            "neonControlVersion": "8",
+            "neonDeletionPresent": true,
+            "neonPending": true
+          },
+          "sequence": 5,
+          "system": "session-read-api"
+        }
+      ],
+      "id": "neon-selection-off-committed-target-fence-failed",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "authorityGateReason": "pending-control",
+        "finalBufferedContentEmitted": false,
+        "public503DoesNotUndoNeonMutation": true,
+        "targetOnlyPredicateIsInsufficient": true,
+        "targetOnlyPredicateWouldAllow": true
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "prefetch-authority-observation",
+          "observes": "baseline",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "begin-and-apply-control-in-one-transaction",
+          "committed": true,
+          "delta": {
+            "neonControlVersion": "8",
+            "neonDeletionPresent": true,
+            "neonPending": true
+          },
+          "sequence": 2,
+          "system": "neon"
+        },
+        {
+          "action": "ordered-fence-write-not-yet-committed",
+          "delta": {},
+          "sequence": 3,
+          "system": "supabase"
+        },
+        {
+          "action": "s3-fetch-finished",
+          "sequence": 4,
+          "system": "session-read-api"
+        },
+        {
+          "action": "authoritative-service-binding-read-after-fetch",
+          "observes": {
+            "neonControlVersion": "8",
+            "neonDeletionPresent": true,
+            "neonPending": true
+          },
+          "sequence": 5,
+          "system": "session-read-api"
+        }
+      ],
+      "id": "neon-selection-off-between-prefetch-witness-and-s3-finish",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false,
+        "prefetchWitnessAloneIsInsufficient": true
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "begin-and-apply-control-in-one-transaction",
+          "committed": true,
+          "delta": {
+            "neonControlVersion": "8",
+            "neonPending": true,
+            "neonResetEpoch": "3"
+          },
+          "sequence": 1,
+          "system": "neon"
+        },
+        {
+          "action": "ordered-fence-write",
+          "committed": false,
+          "delta": {},
+          "outcome": "timeout-or-error-with-rollback",
+          "sequence": 2,
+          "system": "supabase"
+        },
+        {
+          "action": "public-control-response",
+          "sequence": 3,
+          "status": 503,
+          "system": "relayhistory-api"
+        },
+        {
+          "action": "finish-fetch-then-recheck-target-only",
+          "observes": "unchanged-supabase-baseline",
+          "sequence": 4,
+          "system": "session-read-api"
+        },
+        {
+          "action": "authoritative-service-binding-read-after-fetch",
+          "observes": {
+            "neonControlVersion": "8",
+            "neonPending": true,
+            "neonResetEpoch": "3"
+          },
+          "sequence": 5,
+          "system": "session-read-api"
+        }
+      ],
+      "id": "neon-reset-committed-target-fence-failed",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "authorityGateReason": "pending-control",
+        "finalBufferedContentEmitted": false,
+        "public503DoesNotUndoNeonMutation": true,
+        "targetOnlyPredicateIsInsufficient": true,
+        "targetOnlyPredicateWouldAllow": true
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "prefetch-authority-observation",
+          "observes": "baseline",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "begin-and-apply-control-in-one-transaction",
+          "committed": true,
+          "delta": {
+            "neonControlVersion": "8",
+            "neonPending": true,
+            "neonResetEpoch": "3"
+          },
+          "sequence": 2,
+          "system": "neon"
+        },
+        {
+          "action": "ordered-fence-write-not-yet-committed",
+          "delta": {},
+          "sequence": 3,
+          "system": "supabase"
+        },
+        {
+          "action": "s3-fetch-finished",
+          "sequence": 4,
+          "system": "session-read-api"
+        },
+        {
+          "action": "authoritative-service-binding-read-after-fetch",
+          "observes": {
+            "neonControlVersion": "8",
+            "neonPending": true,
+            "neonResetEpoch": "3"
+          },
+          "sequence": 5,
+          "system": "session-read-api"
+        }
+      ],
+      "id": "neon-reset-between-prefetch-witness-and-s3-finish",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false,
+        "prefetchWitnessAloneIsInsufficient": true
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "s3-fetch-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "outcome": "timeout",
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "authority-gate-timeout",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false,
+        "noFallbackToTargetOnly": true,
+        "noPreGateStreaming": true
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "s3-fetch-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "outcome": "non2xx",
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "authority-gate-non2xx",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false,
+        "noFallbackToTargetOnly": true,
+        "noPreGateStreaming": true
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "s3-fetch-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "outcome": "unbound-service",
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "authority-gate-unbound-service",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false,
+        "noFallbackToTargetOnly": true,
+        "noPreGateStreaming": true
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "s3-fetch-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "outcome": "invalid-response",
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "authority-gate-invalid-response",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false,
+        "noFallbackToTargetOnly": true,
+        "noPreGateStreaming": true
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "s3-fetch-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "outcome": "wrong-user",
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "authority-gate-wrong-user",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false,
+        "noFallbackToTargetOnly": true,
+        "noPreGateStreaming": true
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "s3-fetch-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "outcome": "wrong-workspace",
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "authority-gate-wrong-workspace",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false,
+        "noFallbackToTargetOnly": true,
+        "noPreGateStreaming": true
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "s3-fetch-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "outcome": "wrong-origin",
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "authority-gate-wrong-origin",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false,
+        "noFallbackToTargetOnly": true,
+        "noPreGateStreaming": true
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "s3-fetch-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "outcome": "wrong-epoch",
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "authority-gate-wrong-epoch",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false,
+        "noFallbackToTargetOnly": true,
+        "noPreGateStreaming": true
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": false,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "final-read",
+          "pending": false,
+          "sequence": 1,
+          "system": "authority-service",
+          "visible": true
+        }
+      ],
+      "id": "stale-native-row-after-source-deletion-cleared",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "authorityVisibleDoesNotOverrideNativeCustody": true,
+        "finalBufferedContentEmitted": false
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "call-pipeline-api-directly-with-valid-user-token",
+          "cloudWrapperUsed": false,
+          "sequence": 1,
+          "system": "client"
+        },
+        {
+          "action": "final-read",
+          "pending": true,
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "direct-consumer-must-enforce-final-gate",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false,
+        "serverGateCannotBeBypassed": true
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "all-s3-and-target-checks-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "epochMatches": true,
+          "pending": false,
+          "scopeMatches": true,
+          "sequence": 2,
+          "system": "authority-service",
+          "visible": true
+        }
+      ],
+      "id": "healthy-bounded-row-positive",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": true,
+        "scope": "synthetic-exact-row-only"
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "5",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "selection-off",
+          "controlVersion": "6",
+          "deletionPresent": true,
+          "sequence": 1,
+          "system": "neon"
+        },
+        {
+          "action": "selection-on",
+          "controlVersion": "7",
+          "deletionPresent": false,
+          "sequence": 2,
+          "system": "neon"
+        },
+        {
+          "action": "finish-s3-fetch-for-original-v5-row",
+          "sequence": 3,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "currentControlVersion": "7",
+          "deletionPresent": false,
+          "pending": false,
+          "sequence": 4,
+          "system": "authority-service"
+        }
+      ],
+      "id": "disable-reenable-aba-old-admission-must-stay-hidden",
+      "initial": {
+        "neonControlVersion": "5",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "limits": "Authority-gate unit vector. Does not assert that the existing source schema retains this lineage or that all target-native checks could pass after correctly applied ordered controls.",
+      "required": {
+        "admissionMustBeStrictlyAfterLastApplicableRevocation": true,
+        "currentTombstoneAbsenceIsInsufficient": true,
+        "finalBufferedContentEmitted": false,
+        "revocationLineageMustBeAuthoritativeOrConservativelyRefuse": true
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "all-s3-and-target-checks-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "activeCutoverEpoch": "2222222222222222222222222222222222222222222222222222222222222222",
+          "baselineProven": true,
+          "head": {
+            "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+            "epoch": "2222222222222222222222222222222222222222222222222222222222222222",
+            "pending": false,
+            "version": "7"
+          },
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "same-version-different-control-epoch",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": null,
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "all-s3-and-target-checks-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "activeCutoverEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+          "baselineProven": true,
+          "head": {
+            "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+            "epoch": "1111111111111111111111111111111111111111111111111111111111111111",
+            "pending": false,
+            "version": "7"
+          },
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "missing-immutable-admission-version",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": null,
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "all-s3-and-target-checks-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "activeCutoverEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+          "baselineProven": true,
+          "head": {
+            "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+            "epoch": "1111111111111111111111111111111111111111111111111111111111111111",
+            "pending": false,
+            "version": "7"
+          },
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "missing-immutable-admission-epoch",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "0",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "all-s3-and-target-checks-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "activeCutoverEpoch": null,
+          "baselineProven": false,
+          "head": null,
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "head-none-without-proven-current-epoch",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "all-s3-and-target-checks-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "activeCutoverEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+          "baselineProven": true,
+          "head": null,
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "head-none-with-nonzero-admission",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "0",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "all-s3-and-target-checks-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "activeCutoverEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+          "baselineProven": true,
+          "head": null,
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "head-none-zero-admission-proven-same-epoch",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": true
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "all-s3-and-target-checks-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "activeCutoverEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+          "baselineProven": true,
+          "head": {
+            "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+            "epoch": "1111111111111111111111111111111111111111111111111111111111111111",
+            "pending": false,
+            "version": "8"
+          },
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "any-later-control-conservatively-hides-original-row",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false,
+        "noTombstone": true
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "gcKeptOriginalAdmissionVersion": "7",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "7",
+        "replacementStageAdmissionVersion": "8",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "all-s3-and-target-checks-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "activeCutoverEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+          "baselineProven": true,
+          "head": {
+            "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+            "epoch": "1111111111111111111111111111111111111111111111111111111111111111",
+            "pending": false,
+            "version": "8"
+          },
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "gc-replacement-cannot-lend-newer-admission",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "9007199254740992",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "all-s3-and-target-checks-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "activeCutoverEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+          "baselineProven": true,
+          "head": {
+            "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+            "epoch": "1111111111111111111111111111111111111111111111111111111111111111",
+            "pending": false,
+            "version": "9007199254740993"
+          },
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "decimal-versions-must-not-round-to-same-number",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": false
+      }
+    },
+    {
+      "candidate": {
+        "accepted": true,
+        "allS3ReadsFinished": true,
+        "bodyAccepted": true,
+        "currentDigestMatches": true,
+        "currentNativeOwnerMatches": true,
+        "currentRevisionMatches": true,
+        "fenceEpoch": "5",
+        "immutableAdmissionControlEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+        "immutableAdmissionControlVersion": "9007199254740993",
+        "resetEpoch": "2",
+        "scope": {
+          "orgId": "fixture-org",
+          "originId": "fixture-origin",
+          "sessionId": "fixture-session",
+          "source": "claude",
+          "userId": "fixture-user",
+          "workspaceId": "fixture-workspace"
+        }
+      },
+      "events": [
+        {
+          "action": "all-s3-and-target-checks-finished",
+          "sequence": 1,
+          "system": "session-read-api"
+        },
+        {
+          "action": "final-read",
+          "activeCutoverEpoch": "1111111111111111111111111111111111111111111111111111111111111111",
+          "baselineProven": true,
+          "head": {
+            "digest": "3333333333333333333333333333333333333333333333333333333333333333",
+            "epoch": "1111111111111111111111111111111111111111111111111111111111111111",
+            "pending": false,
+            "version": "9007199254740993"
+          },
+          "sequence": 2,
+          "system": "authority-service"
+        }
+      ],
+      "id": "large-exact-decimal-version-positive",
+      "initial": {
+        "neonControlVersion": "7",
+        "neonDeletionPresent": false,
+        "neonPending": false,
+        "neonResetEpoch": "2",
+        "parityAllowlisted": true,
+        "supabaseControlVersion": "7",
+        "supabaseDeletionPresent": false,
+        "supabaseFenceEpoch": "5",
+        "supabaseResetEpoch": "2"
+      },
+      "required": {
+        "finalBufferedContentEmitted": true
+      }
+    }
+  ],
+  "conservative_rule": "Require authenticated exact-scope authoritative observation after all object reads and before emit, pending=false, active control epoch equals immutable original admission epoch, and exact decimal-string version equality. Null head means0 only with proven same active epoch and baseline; NULL/missing admission is UNKNOWN. Any control after admission conservatively hides even unrelated sessions. Retain all target/native privacy checks.",
+  "control_epoch": "1111111111111111111111111111111111111111111111111111111111111111",
+  "coverage_requirements": [
+    "Run selection/reset failed-fence cases for list,metadata,turns,events,timing and each other buffered-emitting surface.",
+    "Gate occurs after all S3 reads and before first response content is emitted, including streaming.",
+    "Service endpoint not reachable as public route; forged public requests and identity substitution refuse.",
+    "Authority result is request-local and exact-scope, not reused across another request/page/user.",
+    "A later control after final authority read has normal read linearization semantics; fixture does not demand impossible perpetual validity.",
+    "Conservative comparator must be identical for list,turns,metadata in rollout1. Other routes remain canonical-only. Direct service endpoint is internal-only."
+  ],
+  "identity_policy": "All fixture identifiers synthetic. Verified server identity, never client-provided tenant or head. No acceptedAt timestamp-based reset shortcut.",
+  "limitations": [
+    "No endpoint or RPC contract is invented by this file.",
+    "No database migration, local PG execution, production query or observed disclosure claimed.",
+    "Passing a standalone fixture replay does not validate real endpoint, SQL, signing or service-binding wiring; integration tests must drive implementation.",
+    "ABA vector is a required semantic negative; existing Neon control head stores only latest payload, so historical last-revocation availability needs separate source proof. Missing lineage must refuse, not assume zero.",
+    "No precise last-revocation branch is qualified; endpoint head-only response cannot reconstruct erased historical tombstones."
+  ],
+  "purpose": "Contract-neutral causal fixture for R2 final authority gate; builders adapt transport field names without weakening ordering/assertions.",
+  "source": "c7de216335a1633b80314c3fd0000a48da9ff29d",
+  "source_evidence_sha256": "32b5149c7f07574d84653a6fc799bb90a514edd386a1c7ee9facb2f657008c5f",
+  "status": "SYNTHETIC_SOURCE_DERIVED_NOT_LIVE_REPRODUCTION",
+  "supersedes_sha256": "b5846258b38ad8a0d86b2b4ba780f6ae06720de6d1294c52b2b392d2256fea3f",
+  "version": 3
+}

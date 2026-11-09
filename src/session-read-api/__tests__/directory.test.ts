@@ -27,6 +27,7 @@ import {
 } from "../directory.ts";
 import { poolTenantRunner } from "../liveness.ts";
 import { memoryLiveness } from "./support.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 const ID: VerifiedIdentity = { userId: "u-1", orgId: "org-a", workspaceId: "ws-a", scopes: ["rth:read"] };
 
@@ -355,7 +356,7 @@ describe("sqlDirectory against Supabase without migration 20261105034000", () =>
     const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
     open.push(db);
     await db.exec(read("supabase/tests/supabase_shim.sql"));
-    for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await db.exec(read(`supabase/bootstrap/${f}.sql`));
+    for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
     for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
       if (file.startsWith("20261105034000")) continue;
       await db.exec(read(`supabase/migrations/${file}`));

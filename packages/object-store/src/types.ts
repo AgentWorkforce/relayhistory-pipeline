@@ -46,6 +46,11 @@ export interface PutOpts {
   metadata?: Metadata;
   /** Inferred from the key when absent (`.zst`, `.json`). */
   contentType?: string;
+  /**
+   * Aborts the upload where the backend supports it (S3: the HTTP request). An aborted put
+   * rejects; whether the backend committed the bytes is then unknown to the caller.
+   */
+  signal?: AbortSignal;
 }
 
 export interface PutAck {

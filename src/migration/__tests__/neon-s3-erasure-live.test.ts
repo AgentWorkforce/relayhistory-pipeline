@@ -8,6 +8,7 @@
  * That a real reset writes these tombstones is proven against the full
  * relayhistory migration chain in #241's test/write-path-migrated.test.ts.
  */
+import { afterAll as __modeAfterAll, beforeEach as __modeBeforeEach } from "bun:test";
 import { describe, expect, setDefaultTimeout, test } from "bun:test";
 import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -21,6 +22,15 @@ import { DEFAULT_ERASURE_CONFIG, ErasureJob } from "../neon-s3-erasure/job.ts";
 import { liveMachineId, liveTargets } from "../neon-s3-erasure/live.ts";
 import { fencedLivePage } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
+
+// These suites exercise the obligation model (S3X_OBLIGATIONS on); the default-off path has its own suite.
+// The suite's OWN mode, pinned per module (never inherited from another file's leaked env): ON, or OFF when
+// imported as "?mode=off" (the *.off.test.ts wrappers). Re-applied before every test.
+const OBLIGATIONS_MODE: "on" | "off" = new URL(import.meta.url).searchParams.get("mode") === "off" ? "off" : "on";
+const __modeBefore = process.env.S3X_OBLIGATIONS;
+process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE;
+__modeBeforeEach(() => void (process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE));
+__modeAfterAll(() => { if (__modeBefore === undefined) delete process.env.S3X_OBLIGATIONS; else process.env.S3X_OBLIGATIONS = __modeBefore; });
 
 const M = "srv_47a49913c03b1505faf877017e54ae00";
 const DIR = `96bulls/org-1/v1/ws=ws_1/m=${M}/h=claude/d=2026/10/30/s=sess_1/`;
@@ -100,7 +110,7 @@ describe("live (srv_) erasure", () => {
     const neighbour = `96bulls/org-1/v1/ws=ws_1/m=${M}/h=claude/d=2026/10/30/s=sess_10/manifest.json`;
     await put(store, [...WORKER_KEYS, POINTER, otherUserCopy, neighbour]);
     await tombstone(pg, GROUP);
-    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     const job = new ErasureJob(db, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
     await job.sweep();
     expect(await keys(store)).toEqual([neighbour, otherUserCopy].sort());
@@ -118,7 +128,7 @@ describe("live (srv_) erasure", () => {
     // The session delivered after the reset: what a reset leg would match.
     await pg.query("INSERT INTO sessions.delivery_records VALUES ('org-1','ws/1','origin-1','r1','session','claude','sess:1','user-1')");
     await put(store, [...WORKER_KEYS, POINTER]);
-    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     const job = new ErasureJob(db, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
     await job.sweep();
     expect(await keys(store)).toEqual([...WORKER_KEYS, POINTER].sort());
@@ -146,7 +156,7 @@ describe("live (srv_) erasure", () => {
     const store = createFsStore({ root: await tmp() });
     await put(store, [...WORKER_KEYS, POINTER]);
     await tombstone(pg, GROUP);
-    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     const job = new ErasureJob(db, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
     await job.sweep({ dryRun: true });
     expect(await keys(store)).toEqual([...WORKER_KEYS, POINTER].sort());
@@ -167,7 +177,7 @@ describe("live (srv_) erasure", () => {
         return db.query<T>(text, params);
       },
     };
-    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     const job = new ErasureJob(racing, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
     await job.sweep();
     expect(await keys(store)).toEqual([...WORKER_KEYS, POINTER].sort());
@@ -180,7 +190,7 @@ describe("live (srv_) erasure", () => {
     const store = createFsStore({ root: await tmp() });
     await put(store, [...WORKER_KEYS, POINTER]);
     await tombstone(pg, GROUP);
-    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     // The sweep's clock is the objects' own: all of them are within the skew margin.
     const job = new ErasureJob(db, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, Date.now, async () => {});
     await job.sweep();
@@ -197,7 +207,7 @@ describe("live (srv_) erasure", () => {
     const otherMachine = `96bulls/org-1/live-batches/v1/ws=ws_1/m=${liveMachineId("ws/1", "origin-1", "user-2")}/b=${"c".repeat(32)}-${"d".repeat(16)}.staged.ndjson.zst`;
     await put(store, [...WORKER_KEYS, POINTER, staged, marker, otherMachine]);
     await tombstone(pg, GROUP);
-    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     // Within the window: the session goes at once, the staged batch waits (its fan-out may still be redriven).
     const soon = new ErasureJob(db, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
     await soon.sweep();
@@ -221,7 +231,7 @@ describe("live (srv_) erasure", () => {
       listKeys: (p: string) => (calls.list++, inner.listKeys(p)),
       eraseSessionAnyDate: (b: string, s: string, t?: Date) => (calls.dir++, inner.eraseSessionAnyDate(b, s, t)),
     };
-    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     const job = new ErasureJob(db, state, counting, () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
     await job.sweep();
     // Once per (workspace, user, origin) and page: objects, pointers and the session ingest's staged batches.
@@ -235,7 +245,7 @@ describe("live (srv_) erasure", () => {
     const store = createFsStore({ root: await tmp() });
     await put(store, WORKER_KEYS);
     await tombstone(pg, GROUP);
-    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     const job = new ErasureJob(db, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
     await job.sweep();
     expect(await keys(store)).toEqual([]);
@@ -248,7 +258,7 @@ describe("live (srv_) erasure", () => {
     const store = createFsStore({ root: await tmp() });
     await put(store, [POINTER]);
     await tombstone(pg, GROUP);
-    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     const job = new ErasureJob(db, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
     await job.sweep();
     expect(await keys(store)).toEqual([]);
@@ -262,7 +272,7 @@ describe("live (srv_) erasure", () => {
     for (let i = 0; i < 10; i++) await tombstone(pg, { ...GROUP, session_id: `t${i}` });
     let lists = 0;
     const failing = { ...storeEraser(store), listKeys: async () => { lists++; throw new Error("s3 down"); } };
-    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     const job = new ErasureJob(db, state, failing, () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
     await job.sweep();
     expect(lists).toBe(1);
@@ -282,11 +292,109 @@ describe("live (srv_) erasure", () => {
         return db.query<T>(text, params);
       },
     };
-    const state = new SyncState(join(await tmp(), "s.sqlite"));
+    const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
     const job = new ErasureJob(broken, state, storeEraser(store), () => {}, DEFAULT_ERASURE_CONFIG, later, async () => {});
     await job.sweep().catch(() => {});
     expect(await keys(store)).toEqual([]);
     state.close();
     await pg.close();
+  });
+});
+
+/**
+ * C3 (lead ruling, #294): the canonical eraser's strict inventory validation and bounded legacy
+ * listing ship UNFLAGGED to the E3 job. A MALFORMED inventory is refused BEFORE that inventory's
+ * deletes and the tombstone / queued item is never marked done (a later healthy sweep erases it).
+ * A > 10k-version prefix is NOT refused as a whole any more (that was the legacy single-listing
+ * job): #309's paged job traverses it in BOUNDED, RESUMABLE runs, so deletes may be PARTIAL
+ * progress across sweeps, and the pointer is erased only after a fresh strict verification
+ * (erasure_verify_pending until then). A small valid inventory behaves as before. Real
+ * createS3Eraser over the offline versioned provider.
+ */
+describe("E3 on the strict shared eraser (fail closed, retried)", () => {
+  const s3Job = async (s: import("./fake-s3-versions.ts").FakeS3Versions) => {
+    const { pg, db } = await neon();
+    await tombstone(pg, GROUP);
+    const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
+    const logs: Record<string, unknown>[] = [];
+    const job = new ErasureJob(db, state, s.eraser(), (l: Record<string, unknown>) => { logs.push(l); }, DEFAULT_ERASURE_CONFIG, later, async () => {});
+    return { job, logs: () => logs, codes: () => logs.map((l) => l.error_code).filter(Boolean), done: async () => { state.close(); await pg.close(); } };
+  };
+  const live = (s: import("./fake-s3-versions.ts").FakeS3Versions) => [...WORKER_KEYS, POINTER].filter((k) => s.keys.has(k));
+  const old = Date.now() - 60 * 60 * 1000;
+
+  test("a small valid inventory erases as before", async () => {
+    const { FakeS3Versions } = await import("./fake-s3-versions.ts");
+    const s = new FakeS3Versions();
+    for (const k of [...WORKER_KEYS, POINTER]) s.put(k, old);
+    const { job, done } = await s3Job(s);
+    await job.sweep();
+    expect(live(s)).toEqual([]);
+    await done();
+  });
+
+  test("a MALFORMED inventory is refused before any delete; the tombstone stays eligible and a later healthy sweep erases it", async () => {
+    const { FakeS3Versions } = await import("./fake-s3-versions.ts");
+    const s = new FakeS3Versions();
+    for (const k of [...WORKER_KEYS, POINTER]) s.put(k, old);
+    s.rewrite = (_call, xml) => xml.slice(0, xml.length - 30);   // truncated XML on every listing
+    const { job, codes, done } = await s3Job(s);
+    await job.sweep();   // a refusal is logged and counted, never thrown out of the sweep
+    expect(codes()).toContain("erasure_inventory");
+    expect(s.deletes).toEqual([]);
+    expect(live(s)).toHaveLength(3);
+    s.rewrite = undefined;
+    await job.sweep();
+    expect(live(s)).toEqual([]);
+    await done();
+  });
+
+  // #309: a machine prefix over the strict 10k-per-run bound is traversed in BOUNDED, RESUMABLE runs (durable
+  // checkpoint). The tombstoned session's objects are erased across sweeps and the neighbour never; its POINTER is erased
+  // only after a fresh strict verification, which cannot complete while > 10k kept neighbour versions share the prefix
+  // (not proven: retried, never claimed). Once the workload shrinks, the next sweep proves it and erases the pointer.
+  test("a > 10k-version machine prefix: objects erased across bounded sweeps, the neighbour untouched; the pointer only after a strict verification", async () => {
+    const { FakeS3Versions } = await import("./fake-s3-versions.ts");
+    const s = new FakeS3Versions();
+    for (const k of [...WORKER_KEYS, POINTER]) s.put(k, old);
+    const neighbour = `96bulls/org-1/v1/ws=ws_1/m=${M}/h=claude/d=2026/10/30/s=sess_big/raw/`;
+    for (let i = 0; i <= 10_000; i++) s.put(`${neighbour}${String(i).padStart(6, "0")}.ndjson.zst`, old);
+    const { job, codes, logs, done } = await s3Job(s);
+    for (let i = 0; i < 4; i++) await job.sweep();
+    expect(WORKER_KEYS.filter((k) => s.keys.has(k))).toEqual([]); // the session's objects are gone
+    expect(s.keys.has(POINTER)).toBe(true); // not proven yet: the pointer stays (retried)
+    expect(codes()).toContain("erasure_verify_pending"); // and operators see why: the primitive's own reason
+    expect(logs().filter((l) => l.error_code === "erasure_verify_pending").map((l) => l.reason)).toContain("budget");
+    expect(s.deletes.some((d) => d.startsWith(neighbour))).toBe(false);
+    expect(s.count(neighbour)).toBe(10_001);
+    for (const k of [...s.keys.keys()]) if (k.startsWith(neighbour)) s.keys.delete(k);
+    await job.sweep();
+    expect(live(s)).toEqual([]);
+    await done();
+  }, 60_000);
+
+  test("a queued prefix erasure over a MALFORMED inventory is not marked done or removed: it stays queued (backed off) and a later healthy drain erases it", async () => {
+    const { FakeS3Versions } = await import("./fake-s3-versions.ts");
+    const s = new FakeS3Versions();
+    for (const k of WORKER_KEYS) s.put(k, old);
+    // An unbalanced tag (<IsTruncatedX>...</IsTruncated>): refused as malformed XML (erasure_inventory).
+    s.rewrite = (_call, xml) => xml.replace("<IsTruncated>", "<IsTruncatedX>");
+    const { db } = await neon();
+    const state = new SyncState(join(await tmp(), "s.sqlite"), { obligations: OBLIGATIONS_MODE === "on" });
+    state.enqueueErasure([{ key: DIR, kind: "prefix", org_id: "org-1", reason: "test" }], 1);
+    const logs: Record<string, unknown>[] = [];
+    const job = new ErasureJob(db, state, s.eraser(), (l: Record<string, unknown>) => { logs.push(l); }, DEFAULT_ERASURE_CONFIG, later, async () => {});
+    await job.drain();
+    expect(logs.find((l) => l.message === "erasure failed")?.error_code).toBe("erasure_inventory");
+    expect(s.deletes).toEqual([]);
+    expect(job.counters.failed).toBe(1);
+    expect(state.erasureQueued(DIR, 1)).toBe(true);   // not done, not removed
+    s.rewrite = undefined;
+    const healthy = new ErasureJob(db, state, s.eraser(), () => {}, DEFAULT_ERASURE_CONFIG, () => later() + 2 * 3_600_000, async () => {});
+    await healthy.drain();
+    expect(WORKER_KEYS.filter((k) => s.keys.has(k))).toEqual([]);
+    // OFF: done after the strict zero inventory. ON (#309): erased, but never claimed done under the unattested genesis.
+    expect(state.erasureQueued(DIR, 1)).toBe(OBLIGATIONS_MODE === "on"); // the suite's declared mode, not the handle's
+    state.close();
   });
 });

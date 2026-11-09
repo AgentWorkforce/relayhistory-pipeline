@@ -12,6 +12,7 @@ import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { TENANT_SETTINGS_SQL } from "../../session-read-api/liveness.ts";
 import { UPSERT_SQL, narrativeScopeKey } from "../../session-read-api/digest-narrative.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
 
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -30,8 +31,11 @@ async function fresh(withWriter = true): Promise<PGlite> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
-  for (const f of ["session_directory_search_worker.sql", "session_token_verifier.sql", "session_ingest_roles.sql", "session_read_api_roles.sql"])
-    await db.exec(read(`supabase/bootstrap/${f}`));
+  // Single-sourced bootstrap chain: the grant migrations FAIL closed without
+  // the bare consumer grantee, so the fixture must provision every role the
+  // chain does (worker, verifier, ingest, read API incl. the digest writer,
+  // consumer).
+  for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
   // A cluster bootstrapped by an older copy of the file (before the writer role existed).
   if (!withWriter) await db.exec("DROP ROLE bulls96_digest_narrative");
   return db;

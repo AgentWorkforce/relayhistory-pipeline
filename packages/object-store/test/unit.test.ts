@@ -32,6 +32,27 @@ describe("SigV4", () => {
     );
   });
 
+  // Independently computed (Python hmac/hashlib): service "es", path double-encoded.
+  it("signs a non-S3 service with its scope and a double-encoded path", async () => {
+    const headers = new Headers();
+    await signRequest({
+      method: "POST",
+      url: new URL("https://search.example.com/my%2Findex/_search?refresh=true"),
+      headers,
+      payloadSha256: "015abd7f5cc57a2dd94b7590f04ad8084273905ee33ec5cebeae62276a97f862",
+      region: "us-east-1",
+      service: "es",
+      credentials: {
+        accessKeyId: "AKIDEXAMPLE",
+        secretAccessKey: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+      },
+      now: new Date("2015-08-30T12:36:00Z"),
+    });
+    expect(headers.get("authorization")).toBe(
+      "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20150830/us-east-1/es/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=0f6e7ef329ff450191ea48bd01cfaf45682547ada824f0c09480a0bdbf517132",
+    );
+  });
+
   // AWS's published "GET Object" header-auth example (range request).
   it("matches the AWS GET object header-signing test vector", async () => {
     const headers = new Headers({ range: "bytes=0-9" });
@@ -187,5 +208,24 @@ describe("S3 server-side encryption", () => {
       "x-amz-server-side-encryption",
     );
     expect(seen[1]!.has("x-amz-server-side-encryption")).toBe(false);
+  });
+});
+
+describe("S3 put: abort signal and the created version id", () => {
+  it("passes the caller's signal to the request and returns x-amz-version-id", async () => {
+    const { createS3Store } = await import("../src/s3.js");
+    const signals: (AbortSignal | undefined)[] = [];
+    const fetchImpl = (async (_url: URL | string, init?: RequestInit) => {
+      signals.push(init?.signal ?? undefined);
+      return new Response(null, { status: 200, headers: { etag: '"e"', "x-amz-version-id": "v-123" } });
+    }) as typeof fetch;
+    const s = createS3Store({ bucket: "b", region: "us-east-1", endpoint: "http://localhost:1", credentials: { accessKeyId: "k", secretAccessKey: "s" }, fetch: fetchImpl });
+    const controller = new AbortController();
+    const ack = await s.put(objectKey("a/v.json"), new Uint8Array([1]), { ifNoneMatch: true, signal: controller.signal });
+    expect(signals[0]).toBe(controller.signal);
+    expect(ack.version.version).toBe("v-123");
+    controller.abort();
+    await expect(s.put(objectKey("a/w.json"), new Uint8Array([1]), { signal: controller.signal })).rejects.toThrow("put aborted");
+    expect(signals).toHaveLength(1);
   });
 });

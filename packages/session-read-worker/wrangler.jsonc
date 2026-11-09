@@ -55,6 +55,10 @@
     "READ_API_OUTPUT_ENABLED": "",
     // "1" serves GET /v1/digest/daily (lane F4). Its narrative also needs the
     // DIGEST_NARRATIVE service binding (wrangler.digest-narrative.jsonc), added at activation.
-    "READ_API_DIGEST_ENABLED": ""
+    "READ_API_DIGEST_ENABLED": "",
+    // The brief-titles allowlist (F2, GET /v1/sessions/titles). Empty = every workspace gets
+    // 501 brief_titles_workspace_not_enabled; "*" = all; else comma-separated workspace ids.
+    // The deploy workflow sets it from vars.SESSION_READ_BRIEF_TITLES_WORKSPACES (unset = empty).
+    "READ_API_BRIEF_TITLES_WORKSPACES": ""
   }
 }
