@@ -130,13 +130,84 @@ test("managed-provider bootstrap fixed-role inventories stay equal", () => {
   );
 });
 
-/** Upstream plan steps ordered after 20261105044020 (a database "before 044020" must hold none: that is a ledger gap). */
+/**
+ * Upstream plan steps ordered after `after` (default 20261105044020): a database "before" that step must hold none of
+ * them, since an unrecorded step with a later upstream step recorded is a ledger gap.
+ */
 const CB_STEP = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
-const laterUpstream = (steps: Array<{ name: string }>) => steps.filter((s) => s.name.startsWith("upstream:") && s.name > CB_STEP);
+const laterUpstream = <T extends { name: string }>(steps: T[], after: string = CB_STEP) =>
+  steps.filter((s) => s.name.startsWith("upstream:") && s.name > after);
 /** Roll back every upstream step after 044020, newest first, so 044020 is the newest applied step again. */
 async function rollbackLaterThan044020(db: PGlite, profile: MigrationProfile) {
   for (const { name } of laterUpstream(await plan(profile)).reverse())
     await db.exec(readFileSync(join(root, "supabase/rollbacks", `${name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`), "utf8"));
+}
+
+type PlanStep = Awaited<ReturnType<typeof plan>>[number];
+type FunctionAclManifest = Awaited<ReturnType<typeof migrateGuards.sessionsFunctionAclManifest>>;
+type RuntimeAclCatalog = ReturnType<typeof migrateGuards.runtimeApplicationAclCatalog>;
+
+/**
+ * The previous release's ACL view: the current function ACL manifest and runtime application ACL catalog minus
+ * everything the later steps CREATE. A previous release's binary shipped the manifest and catalog of its day, which
+ * could not yet list a function, table or sequence a later step creates; the current ones do, so on a database without
+ * them the ACL install regclass/regprocedure-casts a missing object (42P01/42883) and the non-local exact-ACL check
+ * refuses (function_acl_drift). Relations: CREATE [UNLOGGED|TEMP] TABLE/SEQUENCE in sessions, plus the
+ * <table>_<column>_seq a serial/identity column of such a table implies. Functions: CREATE FUNCTION in sessions
+ * (catalog entries and manifest keys are matched by name, before the argument list).
+ */
+function previousReleaseAcl(laterSteps: ReadonlyArray<{ path: string }>, manifest: FunctionAclManifest, catalog: RuntimeAclCatalog) {
+  const laterFns = new Set(laterSteps.flatMap((s) =>
+    [...readFileSync(s.path, "utf8").matchAll(/\bCREATE\s+FUNCTION\s+(sessions\.\w+)\s*\(/gi)].map((m) => m[1]!.toLowerCase())));
+  const laterRels = new Set(laterSteps.flatMap((s) =>
+    [...readFileSync(s.path, "utf8").matchAll(
+      /\bCREATE\s+(?:(?:UNLOGGED|TEMP|TEMPORARY)\s+)?(?:TABLE|SEQUENCE)\s+(?:IF\s+NOT\s+EXISTS\s+)?(sessions\.\w+)/gi,
+    )].map((m) => m[1]!.toLowerCase())));
+  const previousManifest: FunctionAclManifest = Object.fromEntries(Object.entries(manifest).filter(([fn]) => !laterFns.has(fn.slice(0, fn.indexOf("(")))));
+  const previousCatalog: RuntimeAclCatalog = {
+    tables: Object.fromEntries(Object.entries(catalog.tables).filter(([rel]) => !laterRels.has(rel))),
+    sequences: catalog.sequences.filter((rel) => !laterRels.has(rel) && ![...laterRels].some((t) => rel.startsWith(`${t}_`) && rel.endsWith("_seq"))),
+    rlsTables: catalog.rlsTables.filter((rel) => !laterRels.has(rel)),
+    // Its runtime EXECUTE grants likewise could not name a function a later step creates ($1::regprocedure).
+    functions: catalog.functions.filter((fn) => !laterFns.has(fn.slice(0, fn.indexOf("(")))),
+  };
+  return { laterFns, laterRels, previousManifest, previousCatalog };
+}
+
+/**
+ * Model the previous release that stopped just before `cutoff`: `steps` is the full plan without `cutoff` and without
+ * every later upstream step (a ledger gap otherwise); `later` names those later steps. When there are later steps,
+ * sessionsFunctionAclManifest and runtimeApplicationAclCatalog are spied to return the previous release's ACL view
+ * (previousReleaseAcl) until `restore()`; with no later step nothing is mocked (the current manifest and catalog are
+ * that release's). `current` replaces the manifest/catalog the view is derived from (the regression test's synthetic
+ * later slot); by default it is the real one. Every truncated `runMigrations` in this file goes through this model,
+ * with `restore()` in a `finally` right after it.
+ */
+async function previousReleaseModel(
+  full: PlanStep[],
+  cutoff: string,
+  current?: { manifest: FunctionAclManifest; catalog: RuntimeAclCatalog },
+) {
+  const laterSteps = laterUpstream(full, cutoff);
+  const later = laterSteps.map((s) => s.name);
+  const steps = full.filter((s) => s.name !== cutoff && !later.includes(s.name));
+  const { previousManifest, previousCatalog } = previousReleaseAcl(
+    laterSteps,
+    current?.manifest ?? await migrateGuards.sessionsFunctionAclManifest(),
+    current?.catalog ?? migrateGuards.runtimeApplicationAclCatalog(),
+  );
+  const manifestSpy = later.length ? spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(previousManifest) : undefined;
+  const catalogSpy = later.length ? spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(previousCatalog) : undefined;
+  return {
+    steps,
+    later,
+    previousManifest,
+    previousCatalog,
+    restore: () => {
+      manifestSpy?.mockRestore();
+      catalogSpy?.mockRestore();
+    },
+  };
 }
 
 describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
@@ -2297,6 +2368,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const V = "upstream:20261105044030_ingest_generation_overlap.sql";
     const GR = "upstream:20261105043890_buffered_search_gate_retired_witness.sql";
     const CB = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
+    const SF = "upstream:20261105044040_buffered_stages_session_first.sql";
     const SP = "upstream:20261105044050_selfhost_erase_short_summary_provenance.sql";
     const ST = "upstream:20261105044070_selfhost_erase_search_text_rebuild.sql";
     const CS = "upstream:20261105044080_ingest_claim_sessions.sql";
@@ -2306,7 +2378,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SP, ST, CS]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
@@ -2362,7 +2434,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await claimSessionObjects()).toBe(0);
     // Its ledger row is gone, so running it again refuses and changes nothing.
     expect((await failure(rollback("20261105044080_ingest_claim_sessions.down.sql")))?.code).toBe("55000");
-    // 20261105044070 (erase and retire fence rebuild search_text) is the newest: 044050's and 044030's downs refuse
+    // 20261105044070 (erase and retire fence rebuild search_text) is the newest: 044050's, 044040's and 044030's downs refuse
     // (55000) while it is applied, and its own down restores 044050's exact erase and retire trigger function (the
     // provenance clear, without the search_text rebuild; still SECURITY DEFINER, both triggers kept).
     const eraseSrc = async () => (await db.query<{ s: string | null }>("SELECT prosrc s FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)')")).rows[0]!.s;
@@ -2373,8 +2445,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await retireSrc()).toContain(rebuild);
     expect(await retireTriggers()).toBe(2);
     expect((await failure(rollback("20261105044050_selfhost_erase_short_summary_provenance.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105044040_buffered_stages_session_first.down.sql")))?.code).toBe("55000");
     expect((await failure(rollback("20261105044030_ingest_generation_overlap.down.sql")))?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([SP, V]));
+    expect(await names()).toEqual(expect.arrayContaining([SP, SF, V]));
     await rollback("20261105044070_selfhost_erase_search_text_rebuild.down.sql");
     expect(await names()).not.toContain(ST);
     expect(await eraseSrc()).not.toContain("session_directory_search_text");
@@ -2384,15 +2457,16 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await retireTriggers()).toBe(2);
     // Its ledger row is gone, so running it again refuses and changes nothing.
     expect((await failure(rollback("20261105044070_selfhost_erase_search_text_rebuild.down.sql")))?.code).toBe("55000");
-    // 20261105044050 (erase clears the short_summary provenance) is then the newest: 044030's and 044010's downs refuse
+    // 20261105044050 (erase clears the short_summary provenance) is then the newest: 044040's, 044030's and 044010's downs refuse
     // (55000) while it is applied, and its own down restores 044010's exact erase (the lock, without the provenance clear)
     // and 060000's exact retire trigger function (still SECURITY DEFINER, both triggers kept).
     expect(await eraseSrc()).toContain("short_summary_generated_at=NULL");
     expect(await retireSrc()).toContain("short_summary_generated_at=NULL");
     expect(await retireTriggers()).toBe(2);
+    expect((await failure(rollback("20261105044040_buffered_stages_session_first.down.sql")))?.code).toBe("55000");
     expect((await failure(rollback("20261105044030_ingest_generation_overlap.down.sql")))?.code).toBe("55000");
     expect((await failure(rollback("20261105044010_selfhost_erase_lock_fences.down.sql")))?.code).toBe("55000");
-    expect(await names()).toEqual(expect.arrayContaining([V, SL]));
+    expect(await names()).toEqual(expect.arrayContaining([SF, V, SL]));
     await rollback("20261105044050_selfhost_erase_short_summary_provenance.down.sql");
     expect(await names()).not.toContain(SP);
     expect(await eraseSrc()).not.toContain("short_summary_generated_at");
@@ -2402,6 +2476,29 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await retireTriggers()).toBe(2);
     // Its ledger row is gone, so running it again refuses and changes nothing.
     expect((await failure(rollback("20261105044050_selfhost_erase_short_summary_provenance.down.sql")))?.code).toBe("55000");
+    // 20261105044040 (session-first buffered stages) is then the newest: 044030's down refuses (55000) while it is
+    // applied; its own down restores 043700's exact two reader bodies (same ACL, still SECURITY DEFINER) and
+    // keeps the records GIN, and a second run refuses (its ledger row is gone).
+    const readerSrc = async () =>
+      (await db.query<{ s: string }>("SELECT string_agg(prosrc, '' ORDER BY oid) s FROM pg_proc WHERE oid IN (to_regprocedure('sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)'), to_regprocedure('sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)'))")).rows[0]!.s;
+    const readerAcl = async () =>
+      (await db.query<{ a: string }>("SELECT string_agg(proname || ':' || prosecdef || ':' || coalesce(proacl::text, ''), ',' ORDER BY proname) a FROM pg_proc WHERE pronamespace = 'sessions'::regnamespace AND proname IN ('buffered_sessions_for', 'buffered_session_stages_for')")).rows[0]!.a;
+    const original = readFileSync(join(root, "supabase/migrations/20261105043700_owner_buffered_read.sql"), "utf8");
+    const aclBefore = await readerAcl();
+    expect(await names()).toContain(SF);
+    expect(await readerSrc()).toContain("count(*) OVER (PARTITION BY rc.stage_token, rc.ord)");
+    expect(await relation("sessions.ingest_claim_attempts_records_gin_idx")).toBe("sessions.ingest_claim_attempts_records_gin_idx");
+    expect((await failure(rollback("20261105044030_ingest_generation_overlap.down.sql")))?.code).toBe("55000");
+    await rollback("20261105044040_buffered_stages_session_first.down.sql");
+    expect(await names()).not.toContain(SF);
+    expect(await readerSrc()).not.toContain("count(*) OVER (PARTITION BY");
+    for (const [fn, tag] of [["buffered_sessions_for", "buffered_sessions"], ["buffered_session_stages_for", "buffered_stages"]] as const) {
+      const body = original.match(new RegExp(`CREATE FUNCTION sessions\\.${fn}\\([\\s\\S]*?AS \\$${tag}\\$([\\s\\S]*?)\\$${tag}\\$;`))![1]!;
+      expect((await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE pronamespace = 'sessions'::regnamespace AND proname = $1", [fn])).rows[0]!.s).toBe(body);
+    }
+    expect(await readerAcl()).toBe(aclBefore);
+    expect(await relation("sessions.ingest_claim_attempts_records_gin_idx")).toBe("sessions.ingest_claim_attempts_records_gin_idx");
+    expect((await failure(rollback("20261105044040_buffered_stages_session_first.down.sql")))?.code).toBe("55000");
     // 20261105044030 (generation overlap) is then the newest: 044020, 044010, 044000, 043910, 043900 and 043880 refuse (55000)
     // while it is applied, so it rolls back FIRST; its own down restores the exact strict 050000
     // ingest_require_generation and 055000 ingest_lazy_guard, drops the window and retired tables, the policy
@@ -2846,7 +2943,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
     // Newer than 043900, so its down refuses until they are rolled back, newest first: every upstream step after
-    // 044020 (rollbackLaterThan044020: 044080, 044070, 044050, 044030), then 044020, 044010, 044000, 043910.
+    // 044020 (rollbackLaterThan044020: 044080, 044070, 044050, 044040, 044030), then 044020, 044010, 044000, 043910.
     const orgIndexesDown = readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8");
     const lockDown = readFileSync(join(root, "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql"), "utf8");
     const readTokensDown = readFileSync(join(root, "supabase/rollbacks/20261105044000_read_api_tokens.down.sql"), "utf8");
@@ -3350,29 +3447,228 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(error?.code).toBe("migration_changed");
   });
 
+  test("release read-only plan goes red on 20261105044040 when the records GIN is absent and ingest_claim_attempts is populated; after the CONCURRENTLY build the apply adopts it and replaces both readers", async () => {
+    const db = await supabaseLike();
+    await db.exec(ET_BOOT);
+    const SF = "upstream:20261105044040_buffered_stages_session_first.sql";
+    const GIN = ADOPTABLE_INDEXES[SF]!;
+    expect(GIN.map((x) => x.name)).toEqual(["ingest_claim_attempts_records_gin_idx"]);
+    // The previous release: everything before 044040 (no later upstream step: a ledger gap), validated.
+    // Validated against that release's ACL manifest and catalog (previousReleaseModel), not the current ones.
+    const { steps, later, restore } = await previousReleaseModel(await plan(SUPA_ET), SF);
+    try {
+      expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps }))).toBeNull();
+    } finally {
+      restore();
+    }
+    // Production shape: ingest_claim_attempts populated (FK triggers off for this one superuser insert), no GIN yet.
+    await db.exec(`SET session_replication_role = replica;
+      INSERT INTO sessions.ingest_claim_attempts(claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,epochs,records)
+        VALUES (gen_random_uuid(),'org-probe','ws-probe','u','o','b','d','[]','[{"source":"claude","session_id":"s"}]');
+      SET session_replication_role = origin`);
+    const readerSrc = async () =>
+      (await db.query<{ s: string }>("SELECT string_agg(prosrc, '' ORDER BY proname) s FROM pg_proc WHERE pronamespace = 'sessions'::regnamespace AND proname IN ('buffered_sessions_for', 'buffered_session_stages_for')")).rows[0]!.s;
+    const readerAcl = async () =>
+      (await db.query<{ a: string }>("SELECT string_agg(proname || ':' || prosecdef || ':' || provolatile::text || ':' || coalesce(proacl::text, ''), ',' ORDER BY proname) a FROM pg_proc WHERE pronamespace = 'sessions'::regnamespace AND proname IN ('buffered_sessions_for', 'buffered_session_stages_for')")).rows[0]!.a;
+    const srcBefore = await readerSrc(), aclBefore = await readerAcl();
+    const before = await snapshot(db);
+    expect((before.marker as Array<{ status: string }>).map((r) => r.status)).toEqual(["pass"]);
+    // Plan mode (read-only): red, naming the index and this step's operator packet.
+    await db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const planned = await failure(inspectMigrations(client(db), SUPA_ET));
+    await db.exec("ROLLBACK");
+    expect(planned?.code).toBe("index_prebuild_required");
+    expect(planned?.message).toContain(`index sessions.ingest_claim_attempts_records_gin_idx on sessions.ingest_claim_attempts (${SF}) is absent and table sessions.ingest_claim_attempts is not empty`);
+    expect(planned?.message).toContain("buffered-stages session-first operator packet");
+    expect(planned?.message).not.toContain("claim-bootstrap index packet");
+    // Apply: the same refusal before anything is written; the readers keep 043700's bodies, the marker stays 'pass'.
+    expect((await failure(runMigrations(client(db), { profile: SUPA_ET })))?.code).toBe("index_prebuild_required");
+    expect(await snapshot(db)).toEqual(before);
+    expect(await readerSrc()).toBe(srcBefore);
+    // After the operator's CONCURRENTLY build: green with 044040 pending; the apply adopts the index (same oid)
+    // and replaces both readers, ACL, SECURITY DEFINER and volatility unchanged.
+    await db.exec(`CREATE INDEX CONCURRENTLY ingest_claim_attempts_records_gin_idx ON sessions.ingest_claim_attempts USING gin (records jsonb_path_ops)`);
+    const oid = async () => (await db.query<{ o: number }>("SELECT to_regclass('sessions.ingest_claim_attempts_records_gin_idx')::oid::int o")).rows[0]!.o;
+    const built = await oid();
+    await db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const report = await inspectMigrations(client(db), SUPA_ET);
+    await db.exec("ROLLBACK");
+    expect(report.inventory.filter((s) => s.pending).map((s) => s.name)).toEqual([SF, ...later]);
+    expect(await failure(runMigrations(client(db), { profile: SUPA_ET, expectedLedgerSha256: report.ledgerSha256 }))).toBeNull();
+    expect(await oid()).toBe(built);
+    expect(await readerSrc()).toContain("count(*) OVER (PARTITION BY rc.stage_token, rc.ord)");
+    expect(await readerAcl()).toBe(aclBefore);
+    expect(((await snapshot(db)).marker as Array<{ status: string }>).map((r) => r.status)).toEqual(["pass"]);
+  });
+
+  describe("20261105044040 exact-body adoption: an out-of-band apply of the step's own reader bodies", () => {
+    const SF = "upstream:20261105044040_buffered_stages_session_first.sql";
+    const SF_SQL = readFileSync(join(root, "supabase/migrations/20261105044040_buffered_stages_session_first.sql"), "utf8");
+    /** The standalone CREATE OR REPLACE statement for one reader, exactly as the file has it (packet A's extraction). */
+    const statement = (fn: string, tag: string) => {
+      const start = SF_SQL.indexOf(`CREATE OR REPLACE FUNCTION sessions.${fn}(`);
+      const close = `$${tag}$;`;
+      const end = SF_SQL.indexOf(close, start);
+      expect(start).toBeGreaterThan(0);
+      expect(end).toBeGreaterThan(start);
+      return SF_SQL.slice(start, end + close.length);
+    };
+    const LIST = () => statement("buffered_sessions_for", "buffered_sessions");
+    const STAGES = () => statement("buffered_session_stages_for", "buffered_stages");
+    const SENTINEL = () => MIGRATION_SENTINELS[SF]!.sql;
+    /**
+     * The previous release (everything before 044040, no later upstream step), validated against that release's ACL
+     * manifest and catalog (previousReleaseModel), on the supabase/ET shape. `full` and `current` let the regression
+     * test inject a synthetic later slot.
+     */
+    const previousRelease = async (
+      full?: PlanStep[],
+      current?: { manifest: FunctionAclManifest; catalog: RuntimeAclCatalog },
+    ) => {
+      const db = await supabaseLike();
+      await db.exec(ET_BOOT);
+      const { steps, restore } = await previousReleaseModel(full ?? await plan(SUPA_ET), SF, current);
+      try {
+        expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps }))).toBeNull();
+      } finally {
+        restore();
+      }
+      return db;
+    };
+    const ledgered = async (db: PGlite) =>
+      (await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name = $1", [SF])).rows[0]!.n === 1;
+    const sentinel = async (db: PGlite) => (await db.query<{ applied: boolean }>(SENTINEL())).rows[0]!.applied;
+
+    test("the declared tags parse to exactly the file's two bodies", () => {
+      for (const tag of ["buffered_sessions", "buffered_stages"]) {
+        const body = migrateGuards.dollarQuotedBody(SF_SQL, tag);
+        expect(body).not.toBeNull();
+        expect(body!.startsWith("\n")).toBe(true);
+        expect(body!.trimEnd().endsWith("END")).toBe(true);
+      }
+      expect(migrateGuards.dollarQuotedBody(SF_SQL, "no_such_tag")).toBeNull();
+      expect(migrateGuards.dollarQuotedBody(`${SF_SQL}\n-- $buffered_stages$`, "buffered_stages")).toBeNull();
+    });
+
+    test("both bodies pre-applied byte-identical: the migrator adopts them, applies the step and ledgers it", async () => {
+      const db = await previousRelease();
+      await db.exec(LIST());
+      await db.exec(STAGES());
+      expect(await sentinel(db)).toBe(true);
+      expect(await failure(runMigrations(client(db), { profile: SUPA_ET }))).toBeNull();
+      expect(await ledgered(db)).toBe(true);
+      expect(await sentinel(db)).toBe(true);
+    });
+
+    test("one body differs by a single byte: refused (unledgered_schema) before any write", async () => {
+      const db = await previousRelease();
+      await db.exec(LIST());
+      const stages = STAGES();
+      const tweaked = stages.replace("$buffered_stages$\n", "$buffered_stages$\n ");
+      expect(tweaked).not.toBe(stages);
+      await db.exec(tweaked);
+      expect(await sentinel(db)).toBe(true);
+      const error = await failure(runMigrations(client(db), { profile: SUPA_ET }));
+      expect(error?.code).toBe("unledgered_schema");
+      expect(error?.message).toContain(`(${SF})`);
+      expect(await ledgered(db)).toBe(false);
+    });
+
+    test("both bodies byte-identical but an attribute differs (volatility): refused", async () => {
+      const db = await previousRelease();
+      await db.exec(LIST());
+      await db.exec(STAGES());
+      await db.exec("ALTER FUNCTION sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text) VOLATILE");
+      const error = await failure(runMigrations(client(db), { profile: SUPA_ET }));
+      expect(error?.code).toBe("unledgered_schema");
+      expect(await ledgered(db)).toBe(false);
+    });
+
+    test("a later slot (synthetic step, no migration file added) cannot break the previous release: its relation and function are modelled out of the ACL catalog and manifest", async () => {
+      // A future upstream slot creating a table (with its implied serial sequence) and a function, which a current
+      // binary's catalog and manifest would list. Written under this test's own tmpdir, never under supabase/.
+      const dir = mkdtempSync(join(tmpdir(), "prev-release-later-slot-"));
+      const path = join(dir, "20261105099999_zz_future_probe.sql");
+      writeFileSync(path, `CREATE TABLE sessions.zz_future_probe (id bigserial PRIMARY KEY, v text);
+CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+`);
+      const probe = { name: "upstream:20261105099999_zz_future_probe.sql", path } as PlanStep;
+      const real = await plan(SUPA_ET);
+      const full = [...real, probe];
+      const manifest = await migrateGuards.sessionsFunctionAclManifest();
+      const catalog = migrateGuards.runtimeApplicationAclCatalog();
+      const current = {
+        manifest: { ...manifest, "sessions.zz_future_probe_fn()": ["<owner>:EXECUTE", "service_role:EXECUTE"] },
+        catalog: {
+          tables: { ...catalog.tables, "sessions.zz_future_probe": ["SELECT", "INSERT"] },
+          sequences: [...catalog.sequences, "sessions.zz_future_probe_id_seq"],
+          rlsTables: [...catalog.rlsTables, "sessions.zz_future_probe"],
+          functions: [...catalog.functions, "sessions.zz_future_probe_fn()"],
+        },
+      };
+      // Pure derivation: the synthetic names are excluded, and the rest is exactly the view derived from the real
+      // manifest and catalog with the same later steps.
+      const laterSteps = laterUpstream(full, SF);
+      expect(laterSteps.map((s) => s.name)).toContain(probe.name);
+      const derived = previousReleaseAcl(laterSteps, current.manifest, current.catalog);
+      expect([...derived.laterRels]).toContain("sessions.zz_future_probe");
+      expect([...derived.laterFns]).toContain("sessions.zz_future_probe_fn");
+      expect(Object.keys(derived.previousManifest)).not.toContain("sessions.zz_future_probe_fn()");
+      expect(Object.keys(derived.previousCatalog.tables)).not.toContain("sessions.zz_future_probe");
+      expect(derived.previousCatalog.sequences).not.toContain("sessions.zz_future_probe_id_seq");
+      expect(derived.previousCatalog.rlsTables).not.toContain("sessions.zz_future_probe");
+      expect(derived.previousCatalog.functions).not.toContain("sessions.zz_future_probe_fn()");
+      expect(derived).toEqual(previousReleaseAcl(laterSteps, manifest, catalog) as typeof derived);
+      // Negative control: the same truncated migrate with the current (unmodelled) catalog and manifest fails on the
+      // relation the truncated plan never created (42P01), which is the defect the model prevents.
+      const db = await supabaseLike();
+      await db.exec(ET_BOOT);
+      const steps = full.filter((s) => s.name !== SF && !laterSteps.includes(s));
+      expect(steps).not.toContain(probe);
+      const unmodelledManifest = spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(current.manifest);
+      const unmodelledCatalog = spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(current.catalog);
+      try {
+        const error = await failure(runMigrations(client(db), { profile: SUPA_ET, steps }));
+        expect(error?.code).toBe("42P01");
+        expect(error?.message).toContain("zz_future_probe");
+      } finally {
+        unmodelledManifest.mockRestore();
+        unmodelledCatalog.mockRestore();
+      }
+      // Through the model: the 044040 previous-release setup succeeds (it asserts the migrate is green), never
+      // creates the synthetic slot's objects, and leaves the real manifest and catalog unmocked afterwards.
+      const modelled = await previousRelease(full, current);
+      expect(await ledgered(modelled)).toBe(false);
+      expect((await modelled.query<{ r: string | null }>("SELECT to_regclass('sessions.zz_future_probe')::text r")).rows[0]!.r).toBeNull();
+      expect((await modelled.query<{ p: string | null }>("SELECT to_regprocedure('sessions.zz_future_probe_fn()')::text p")).rows[0]!.p).toBeNull();
+      expect(migrateGuards.runtimeApplicationAclCatalog()).toEqual(catalog);
+      expect(await migrateGuards.sessionsFunctionAclManifest()).toEqual(manifest);
+    });
+
+    test("only stages pre-applied (packet A): the sentinel does not fire and the migrator applies normally", async () => {
+      const db = await previousRelease();
+      await db.exec(STAGES());
+      expect(await sentinel(db)).toBe(false);
+      expect(await failure(runMigrations(client(db), { profile: SUPA_ET }))).toBeNull();
+      expect(await ledgered(db)).toBe(true);
+      expect(await sentinel(db)).toBe(true);
+    });
+  });
+
   test("release read-only plan goes red on 20261105044020 when a claim-bootstrap index is absent on a populated table; the apply refuses before the pending marker", async () => {
     const db = await supabaseLike();
     await db.exec(ET_BOOT);
     const CB = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
     const LAZY = "ingest_lazy_native_slots_org_id_idx";
     // The previous release: everything but 044020 (and no later upstream step: that would be a ledger gap), validated (marker 'pass').
-    const full = await plan(SUPA_ET);
-    const laterSteps = laterUpstream(full) as typeof full;
-    const later = laterSteps.map((s) => s.name);
-    const steps = full.filter((s) => s.name !== CB && !later.includes(s.name));
-    // That release's binary shipped the function ACL manifest of its day, which could not yet list a
-    // function a later step creates; the current manifest does, so the non-local exact-ACL check would
-    // refuse (function_acl_drift) a database without them. Validate against the previous manifest:
-    // the current one minus the functions later steps CREATE. No later step: the current manifest, unmocked.
-    const laterFns = new Set(laterSteps.flatMap((s) =>
-      [...readFileSync(s.path, "utf8").matchAll(/\bCREATE\s+FUNCTION\s+(sessions\.\w+)\s*\(/gi)].map((m) => m[1]!.toLowerCase())));
-    const manifest = await migrateGuards.sessionsFunctionAclManifest();
-    const previousManifest = Object.fromEntries(Object.entries(manifest).filter(([fn]) => !laterFns.has(fn.slice(0, fn.indexOf("(")))));
-    const previousRelease = later.length ? spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(previousManifest) : undefined;
+    // That release's binary shipped the function ACL manifest and runtime application ACL catalog of its day, which
+    // could not yet list a function or relation a later step creates: validate against them (previousReleaseModel).
+    // No later step: the current manifest and catalog, unmocked.
+    const { steps, later, restore } = await previousReleaseModel(await plan(SUPA_ET), CB);
     try {
       expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps }))).toBeNull();
     } finally {
-      previousRelease?.mockRestore();
+      restore();
     }
     // Production shape: seven prebuilt CONCURRENTLY, the lazy-slot one held, its table populated.
     for (const x of ADOPTABLE_INDEXES[CB]!) if (x.name !== LAZY) await db.exec(x.def);

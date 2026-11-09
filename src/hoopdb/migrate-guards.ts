@@ -9,8 +9,10 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import {
   ADOPTABLE_INDEX_STATE_SQL,
+  ADOPTABLE_INDEX_STEPS,
   ADOPTABLE_INDEXES,
   type AdoptableIndex,
+  type ExactBody,
   MIGRATION_SENTINELS,
 } from "./migration-sentinels.ts";
 
@@ -302,6 +304,29 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.session_brief_wakeups",
   "sessions.session_brief_attempts",
 ] as const;
+
+/**
+ * The runtime application relations and functions, read through one function by the ACL
+ * install (migrate.ts installRuntimeApplicationAcl), runtimeRoleViolations and the function
+ * ACL drift check/preview. Always exactly the three constants above plus
+ * RUNTIME_APPLICATION_FUNCTIONS below: every listed relation and function is granted and
+ * verified, fail-closed. The indirection exists only so a test can model a previous
+ * release's binary (which could not list a relation or function a later migration creates)
+ * the way it spies sessionsFunctionAclManifest.
+ */
+export function runtimeApplicationAclCatalog(): {
+  tables: Readonly<Record<string, readonly string[]>>;
+  sequences: readonly string[];
+  rlsTables: readonly string[];
+  functions: readonly string[];
+} {
+  return {
+    tables: RUNTIME_APPLICATION_TABLE_PRIVILEGES,
+    sequences: RUNTIME_APPLICATION_SEQUENCES,
+    rlsTables: RUNTIME_APPLICATION_RLS_TABLES,
+    functions: RUNTIME_APPLICATION_FUNCTIONS,
+  };
+}
 
 export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.ack_session_brief_documents(uuid,jsonb)",
@@ -613,7 +638,8 @@ export async function runtimeRoleViolations(
     );
   }
 
-  const applicationTables = Object.keys(RUNTIME_APPLICATION_TABLE_PRIVILEGES);
+  const catalog = runtimeApplicationAclCatalog();
+  const applicationTables = Object.keys(catalog.tables);
   const ids = (
     await client.query<{
       db: number;
@@ -634,10 +660,10 @@ export async function runtimeRoleViolations(
       [
         tables.ledger,
         tables.marker,
-        [...applicationTables, ...RUNTIME_APPLICATION_SEQUENCES],
-        [...RUNTIME_APPLICATION_FUNCTIONS],
+        [...applicationTables, ...catalog.sequences],
+        [...catalog.functions],
         RUNTIME_APPLICATION_POLICY,
-        [...RUNTIME_APPLICATION_RLS_TABLES],
+        [...catalog.rlsTables],
       ],
     )
   ).rows[0]!;
@@ -833,7 +859,7 @@ export async function runtimeRoleViolations(
   const expectedTablePrivileges = new Map<string, readonly string[]>([
     [tables.ledger, ["SELECT"]],
     [tables.marker, ["SELECT"]],
-    ...Object.entries(RUNTIME_APPLICATION_TABLE_PRIVILEGES),
+    ...Object.entries(catalog.tables),
   ]);
   for (const t of effectiveTables) {
     const actual = t.privs ? t.privs.split(",") : [];
@@ -858,15 +884,13 @@ export async function runtimeRoleViolations(
     )
   ).rows;
   for (const q of effectiveSequences) {
-    const approved = RUNTIME_APPLICATION_SEQUENCES.includes(
-      q.rel as (typeof RUNTIME_APPLICATION_SEQUENCES)[number],
-    );
+    const approved = catalog.sequences.includes(q.rel);
     if (!approved && q.privs) out.push(`privileges on sequence ${q.rel}`);
     if (approved && q.privs !== "USAGE")
       out.push(`${q.privs} on sequence ${q.rel} (only USAGE is approved)`);
   }
   if (phase === "post")
-    for (const sequence of RUNTIME_APPLICATION_SEQUENCES)
+    for (const sequence of catalog.sequences)
       if (!effectiveSequences.some((q) => q.rel === sequence && q.privs === "USAGE"))
         out.push(`missing USAGE on sequence ${sequence}`);
   const effectiveFunctions = (
@@ -883,10 +907,10 @@ export async function runtimeRoleViolations(
     )
   ).rows;
   for (const fnr of effectiveFunctions)
-    if (!RUNTIME_APPLICATION_FUNCTIONS.includes(fnr.fn as (typeof RUNTIME_APPLICATION_FUNCTIONS)[number]))
+    if (!catalog.functions.includes(fnr.fn))
       out.push(`EXECUTE on ${fnr.fn}`);
   if (phase === "post")
-    for (const fn of RUNTIME_APPLICATION_FUNCTIONS)
+    for (const fn of catalog.functions)
       if (!effectiveFunctions.some((row) => row.fn === fn))
         out.push(`missing EXECUTE on ${fn}`);
 
@@ -923,7 +947,7 @@ export async function runtimeRoleViolations(
   ).rows;
   for (const policy of policies) {
     const exact =
-      RUNTIME_APPLICATION_RLS_TABLES.includes(policy.rel as (typeof RUNTIME_APPLICATION_RLS_TABLES)[number]) &&
+      catalog.rlsTables.includes(policy.rel) &&
       policy.name === RUNTIME_APPLICATION_POLICY &&
       policy.permissive && policy.command === "*" &&
       policy.roles.length === 1 && policy.roles[0] === role.oid &&
@@ -931,7 +955,7 @@ export async function runtimeRoleViolations(
     if (!exact) out.push(`unapproved policy ${policy.name} on ${policy.rel}`);
   }
   if (phase === "post")
-    for (const rel of RUNTIME_APPLICATION_RLS_TABLES)
+    for (const rel of catalog.rlsTables)
       if (!policies.some((p) => p.rel === rel && p.name === RUNTIME_APPLICATION_POLICY))
         out.push(`missing policy ${RUNTIME_APPLICATION_POLICY} on ${rel}`);
   // Detection only: a per-schema default-privileges GRANT in sessions naming PUBLIC or the
@@ -1139,7 +1163,8 @@ async function adoptableIndexState(
 
 /**
  * The reviewed adoptable-index allowance (ADOPTABLE_INDEXES): true only when `step`
- * declares index `name` adoptable, the step's whole inventory is its declared indexes,
+ * declares index `name` adoptable, the step's whole inventory is its declared indexes
+ * plus the functions it declares it only replaces (ADOPTABLE_INDEX_STEPS[step].replaces),
  * and the live index is the exact declared one (state `adoptable`, see
  * ADOPTABLE_INDEX_STATE_SQL). Fails closed.
  */
@@ -1152,7 +1177,14 @@ async function adoptableIndex(
   const declared = ADOPTABLE_INDEXES[step];
   const x = declared?.find((d) => d.name === name);
   if (!declared || !x) return false;
-  if (!inventory.every((o) => o.kind === "index" && declared.some((d) => d.name === o.name)))
+  const replaces = ADOPTABLE_INDEX_STEPS[step]?.replaces ?? [];
+  if (
+    !inventory.every((o) =>
+      o.kind === "index"
+        ? declared.some((d) => d.name === o.name)
+        : o.kind === "function" && replaces.includes(o.name),
+    )
+  )
     return false;
   try {
     return (await adoptableIndexState(client, x)).state === "adoptable";
@@ -1206,9 +1238,11 @@ export async function adoptableIndexBuildPreflight(
 ): Promise<void> {
   const allow = opts.allowBlockingIndexBuild === true;
   const refused: string[] = [];
+  const packets = new Set<string>();
   for (const step of schemaSteps) {
     const declared = ADOPTABLE_INDEXES[step.name];
     if (!declared?.length || ledger.has(step.name)) continue;
+    const before = refused.length;
     for (const x of declared) {
       const where = `index sessions.${x.name} on ${x.table} (${step.name})`;
       let state: AdoptableIndexState;
@@ -1247,11 +1281,13 @@ export async function adoptableIndexBuildPreflight(
           `${where} is absent and table ${x.table} is not empty; a blocking CREATE INDEX on a populated table is refused`,
         );
     }
+    if (refused.length > before)
+      packets.add(ADOPTABLE_INDEX_STEPS[step.name]?.packet ?? "see the runbook");
   }
   if (refused.length)
     throw guardError(
       "index_prebuild_required",
-      `${refused.join("; ")}. Prebuild each absent index out of band with CREATE INDEX CONCURRENTLY (claim-bootstrap index packet docs/packets/claim-bootstrap-org-index-packet-20261108.md, PR #407), then rerun: the step adopts it. Nothing was written. HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true is for non-production databases only (the release and owner-apply profiles cannot set it); see the runbook`,
+      `${refused.join("; ")}. Prebuild each absent index out of band with CREATE INDEX CONCURRENTLY (${[...packets].join("; ")}), then rerun: the step adopts it. Nothing was written. HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true is for non-production databases only (the release and owner-apply profiles cannot set it); see the runbook`,
     );
 }
 
@@ -1295,7 +1331,10 @@ async function tablePopulated(client: GuardClient, table: string): Promise<boole
  *   migration_changed     a ledgered step's file changed;
  *   unledgered_schema     an object that an unledgered step creates already exists.
  * The one exception is ADOPTABLE_INDEXES: a declared index built out of band, exact,
- * valid and ready, is accepted for its step (the step adopts it).
+ * valid and ready, is accepted for its step (the step adopts it). A step that also
+ * replaces functions (ADOPTABLE_INDEX_STEPS) keeps its body sentinel; that sentinel is only
+ * set aside when the step declares exactBodies and every one is live byte-identical to the
+ * step file's own body with the declared attributes (exactBodiesLive).
  * Nothing is ever imported into, or marked in, the ledger.
  */
 export async function sequencePreflight(
@@ -1397,15 +1436,21 @@ export async function sequencePreflight(
     } catch {
       applied = true; // can't look: fail closed, as if the step had run
     }
-    // An adoptable step's sentinel is its declared indexes: accepted only when every one is adoptable.
+    // An index-only adoptable step's sentinel is its declared indexes: accepted only when every one
+    // is adoptable. A step that also replaces functions has a body sentinel, never overridden by
+    // index adoption; only its exactBodies (byte-identical to the file, declared attributes) set it aside.
     const declared = ADOPTABLE_INDEXES[names[i]!];
-    if (applied && declared?.length) {
+    const replacesFunctions = (ADOPTABLE_INDEX_STEPS[names[i]!]?.replaces.length ?? 0) > 0;
+    if (applied && declared?.length && !replacesFunctions) {
       const inventory = inventoryOf(sql[i]!);
       let all = true;
       for (const d of declared)
         if (!(await adoptableIndex(client, names[i]!, inventory, d.name))) all = false;
       if (all) applied = false;
     }
+    const exact = ADOPTABLE_INDEX_STEPS[names[i]!]?.exactBodies;
+    if (applied && replacesFunctions && exact?.length && (await exactBodiesLive(client, sql[i]!, exact)))
+      applied = false;
     if (applied) found.push(`sentinel ${sentinel.evidence} (${names[i]})`);
   }
   if (found.length)
@@ -1413,6 +1458,49 @@ export async function sequencePreflight(
       "unledgered_schema",
       `objects of unrecorded migrations already exist: ${found.slice(0, 5).join("; ")}${found.length > 5 ? `; and ${found.length - 5} more` : ""}. Nothing is imported or marked, see the runbook decision point`,
     );
+}
+
+/**
+ * The text between a step file's `AS $tag$` and the closing `$tag$`, exactly as PostgreSQL stores it in
+ * prosrc; null unless the tag occurs exactly twice and the first is `AS $tag$`.
+ */
+export function dollarQuotedBody(sql: string, tag: string): string | null {
+  const quote = `$${tag}$`;
+  const parts = sql.split(quote);
+  if (parts.length !== 3 || !/\bAS\s+$/.test(parts[0]!)) return null;
+  return parts[1]!;
+}
+
+/**
+ * Exact-body adoption (ADOPTABLE_INDEX_STEPS[step].exactBodies): true only when every declared function
+ * is live with the step file's own body, byte for byte, and the declared attributes. Any error, missing
+ * function or unparsable body is false (the caller keeps refusing).
+ */
+export async function exactBodiesLive(
+  client: GuardClient,
+  stepSql: string,
+  bodies: readonly ExactBody[],
+): Promise<boolean> {
+  for (const b of bodies) {
+    const body = dollarQuotedBody(stepSql, b.tag);
+    if (body === null) return false;
+    try {
+      const ok = (
+        await client.query<{ ok: boolean }>(
+          `SELECT (p.prosrc = $2 AND p.prosecdef AND p.provolatile = 's'
+                   AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql')
+                   AND p.proconfig IS NOT DISTINCT FROM ARRAY[$3::text]
+                   AND p.proowner = (SELECT oid FROM pg_roles WHERE rolname = current_user)) AS ok
+             FROM pg_proc p WHERE p.oid = to_regprocedure($1)`,
+          [b.fn, body, b.config],
+        )
+      ).rows[0]?.ok;
+      if (ok !== true) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1957,10 +2045,11 @@ export async function sessionsFunctionAclDrift(
   runtimeRole: string,
 ): Promise<string[]> {
   const manifest = await sessionsFunctionAclManifest();
+  const runtimeFunctions = runtimeApplicationAclCatalog().functions;
   const expected: Record<string, string[]> = Object.fromEntries(
     Object.entries(manifest).map(([fn, entries]) => [
       fn,
-      (RUNTIME_APPLICATION_FUNCTIONS as readonly string[]).includes(fn)
+      runtimeFunctions.includes(fn)
         ? [...entries, `${runtimeRole}:EXECUTE`]
         : entries,
     ]),
@@ -2013,6 +2102,7 @@ export async function sessionsFunctionAclPreview(
   pendingMigrations = false,
 ): Promise<FunctionAclPreview> {
   const manifest = await sessionsFunctionAclManifest();
+  const runtimeFunctions = runtimeApplicationAclCatalog().functions;
   const actual = await sessionsFunctionAcl(client);
   const extra: string[] = [];
   const missing: string[] = [];
@@ -2027,7 +2117,7 @@ export async function sessionsFunctionAclPreview(
   };
   for (const fn of [...new Set([...Object.keys(manifest), ...Object.keys(actual)])].sort()) {
     const runtimeEntry =
-      runtimeRole && (RUNTIME_APPLICATION_FUNCTIONS as readonly string[]).includes(fn)
+      runtimeRole && runtimeFunctions.includes(fn)
         ? `${runtimeRole}:EXECUTE`
         : null;
     const expectedList = [...(manifest[fn] ?? []), ...(runtimeEntry ? [runtimeEntry] : [])];
