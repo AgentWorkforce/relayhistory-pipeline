@@ -10,7 +10,7 @@
  * batch response); SQS redelivers them after the visibility timeout and moves
  * them to the DLQ after `maxReceiveCount`.
  */
-import { errorFields, log } from "../shared/log.ts";
+import { errorFields, log, searchIndexErrorDetail } from "../shared/log.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
 import { indexSearchScope, type SearchIndexDeps } from "./search-index.ts";
@@ -88,6 +88,9 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           if (!deps.requeue) throw new Error("buffered stage pending and no requeue");
           await deps.requeue(event.key);
         }
+        // A same-second refusal is not coverage: warn (keep-up never writes the refusal ledger; the backfill does).
+        if (fed.outcome === "skipped" && fed.reason === "same_second_tie")
+          log.warn("buffered stage search feed refused", { stage: "buffered-search-feed", reason: fed.reason, count: fed.siblings });
         log.info("buffered stage search feed", { stage: "buffered-search-feed", outcome: fed.outcome,
           ...(fed.outcome === "indexed" ? { count: fed.rows, deleted: fed.deleted } : { reason: fed.reason }), duration_ms: Date.now() - started });
       } catch (error) {
@@ -186,6 +189,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           org_id: scope.orgId,
           session_id: scope.sessionId,
           ...errorFields(error),
+          ...searchIndexErrorDetail(error),
           duration_ms: Date.now() - started,
         });
         for (const id of messageIds) failed.add(id);

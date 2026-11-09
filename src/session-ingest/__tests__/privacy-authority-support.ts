@@ -24,6 +24,8 @@ export const BUFFERED_SEARCH_GATE_SQL = "supabase/migrations/20261105043860_buff
 export const BUFFERED_SEARCH_FEED_SQL = "supabase/migrations/20261105043870_buffered_search_feed_cursor.sql";
 /** 043890 replaces 043860's gate, so its creator precondition requires 043860. */
 export const BUFFERED_SEARCH_GATE_RETIRED_SQL = "supabase/migrations/20261105043890_buffered_search_gate_retired_witness.sql";
+/** 045010 replaces 043870's stage RPC, so its precondition requires 043870 (skipped with it on pending:false). */
+export const BUFFERED_SEARCH_FEED_SAME_SECOND_SQL = "supabase/migrations/20261105045010_buffered_search_feed_same_second.sql";
 /** Independent prerequisite fix (also needed by mirror/frozen-supabase without C3). */
 export const LAZY_SOURCE_SQL = "supabase/migrations/20261105040000_ingest_lazy_source_tables.sql";
 /** C3 post-apply index job (non-transactional in production). */
@@ -38,10 +40,10 @@ export async function authorityFixture(opts: { pending?: boolean; lazyFix?: bool
   // lazyFix:false reproduces the pre-040000 state (that migration skipped; it touches nothing later ones depend on).
   // pending:false reproduces the state without 041000; 043700's creator precondition requires 041000's ingest_privacy_authority,
   // so it is skipped with it (and 043860, which requires 043700's parity table, 043870, which requires 041000, and 043890, which
-  // replaces 043860's gate), while 042000/043000/043500 still apply.
+  // replaces 043860's gate, and 045010, which replaces 043870's stage RPC), while 042000/043000/043500 still apply.
   for (const f of readdirSync(join(ROOT, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) {
     const path = "supabase/migrations/" + f;
-    if (opts.pending === false && (path === PENDING_SQL || path === OWNER_BUFFERED_SQL || path === BUFFERED_SEARCH_GATE_SQL || path === BUFFERED_SEARCH_FEED_SQL || path === BUFFERED_SEARCH_GATE_RETIRED_SQL)) continue;
+    if (opts.pending === false && (path === PENDING_SQL || path === OWNER_BUFFERED_SQL || path === BUFFERED_SEARCH_GATE_SQL || path === BUFFERED_SEARCH_FEED_SQL || path === BUFFERED_SEARCH_GATE_RETIRED_SQL || path === BUFFERED_SEARCH_FEED_SAME_SECOND_SQL)) continue;
     if (opts.lazyFix === false && path === LAZY_SOURCE_SQL) continue;
     await db.exec(read(path));
   }

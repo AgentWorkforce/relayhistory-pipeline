@@ -132,6 +132,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105044100_session_brief_summary_read.sql",
       // The digest narrative cache table, its purge function and read API functions only; no ingest path touches them.
       "20261105045000_digest_narrative_cache.sql",
+      // Replaces the feed's stage RPC (043870, post-G4) to add the sameSecond sibling counts; no ingest RPC changes.
+      "20261105045010_buffered_search_feed_same_second.sql",
       // Self-host output facts tables and their writer/read functions only; no ingest path touches them.
       "20261105045020_selfhost_output_facts.sql",
     ]);

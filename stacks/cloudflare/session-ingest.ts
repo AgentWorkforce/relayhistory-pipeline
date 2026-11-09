@@ -58,7 +58,8 @@ export const FANOUT_MAX_RETRIES = 10;
 /**
  * S3-first async admission (docs/design/s3-first-async-ingest.md): its own queue, never paused
  * (the paused fanout queue guards canonical drain; admission must run while drain stays closed).
- * Declared only with `asyncAdmission`; absent, the stage is byte-identical to before.
+ * Declared whenever the RESOLVED async admission mode is not "off" (resolvedAsyncAdmission: a buffered
+ * stage defaults to "on"); with explicit "off" the stage is byte-identical to before the queues existed.
  */
 export const ADMISSION_QUEUE = "96bulls-session-ingest-admission";
 export const ADMISSION_DLQ = "96bulls-session-ingest-admission-dlq";
@@ -86,7 +87,7 @@ export const SESSION_INGEST_RESOURCES = [
   "session-ingest-fanout-consumer",
 ] as const;
 
-/** The three extra resources of an `asyncAdmission` stage: all or none. */
+/** The three extra resources of a stage whose resolved async admission is "on"/"drain": all or none. */
 export const ADMISSION_RESOURCES = [
   "session-ingest-admission-dlq",
   "session-ingest-admission",
@@ -145,16 +146,33 @@ export interface SessionIngestInputs {
   /** Default-off S3 inbox authority. Presence is an all-or-nothing managed selection. */
   authority?: InboxAuthorityDeploymentInputs;
   /**
-   * S3-first async admission (INGEST_ASYNC_ADMISSION), buffered acceptance only. Present: the admission
-   * queue + DLQ + consumer, the INGEST_ADMISSION binding and the var. Omit for none (the default).
+   * S3-first async admission (INGEST_ASYNC_ADMISSION). Buffered acceptance: omitted means "on" (the
+   * hosted default; synchronous admission is the fallback). "on"/"drain": the admission queue + DLQ +
+   * consumer, the INGEST_ADMISSION binding and the var. "off": none of them (byte-identical to the
+   * stage before async admission existed). Canonical acceptance: omit or "off" only (always none).
+   * See resolvedAsyncAdmission and the addition-phase guard in assertSessionIngestPlanContract.
    */
-  asyncAdmission?: "on" | "drain";
+  asyncAdmission?: AsyncAdmissionSetting;
   /**
    * INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: the frozen legacy-receipt read before a synchronous claim for a
    * queued-v1 caller. Buffered acceptance with custodySource frozen-supabase only. Present: the var only
    * (no queue, no binding). Omit for off (the default; vars byte-identical to before).
    */
   syncAdmissionFrozenReceipt?: "on";
+}
+
+/** The stack's async admission setting (the runtime var has the same values; absent there = "off"). */
+export type AsyncAdmissionSetting = "on" | "drain" | "off";
+
+/**
+ * The async admission mode the stack actually declares: an explicit setting wins; omitted is "on" for a
+ * buffered stage and "off" for every other stage. Every resource, binding, var, plan and operator
+ * decision keys on this, never on the raw input.
+ */
+export function resolvedAsyncAdmission(p: { acceptanceMode?: unknown; asyncAdmission?: unknown }): AsyncAdmissionSetting {
+  if (p.asyncAdmission === "on" || p.asyncAdmission === "drain" || p.asyncAdmission === "off") return p.asyncAdmission;
+  if (p.asyncAdmission !== undefined) throw new Error('sessionIngest.asyncAdmission must be "on", "drain" or "off"');
+  return p.acceptanceMode === "buffered" ? "on" : "off";
 }
 
 const HEX32 = /^[0-9a-f]{32}$/;
@@ -265,8 +283,10 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
   if (v.replicaMode === "queue" && v.neonReplicaQueue === undefined) refuse('sessionIngest.replicaMode "queue" needs neonReplicaQueue');
   if (v.replicaMode !== "queue" && v.neonReplicaQueue !== undefined) refuse('sessionIngest.neonReplicaQueue is bound only with replicaMode "queue"');
   inboxAuthority(v.authority, refuse);
-  if (v.asyncAdmission !== undefined && (!(v.asyncAdmission === "on" || v.asyncAdmission === "drain") || v.acceptanceMode !== "buffered"))
-    refuse('sessionIngest.asyncAdmission must be "on" or "drain", in buffered mode only (omit for none)');
+  if (v.asyncAdmission !== undefined && (v.acceptanceMode === "buffered"
+    ? !(v.asyncAdmission === "on" || v.asyncAdmission === "drain" || v.asyncAdmission === "off")
+    : v.asyncAdmission !== "off"))
+    refuse('sessionIngest.asyncAdmission must be "on", "drain" or "off" in buffered mode (omitted = "on"), and omitted or "off" outside buffered mode');
   if (v.syncAdmissionFrozenReceipt !== undefined && (v.syncAdmissionFrozenReceipt !== "on" || v.acceptanceMode !== "buffered" || v.custodySource !== "frozen-supabase"))
     refuse('sessionIngest.syncAdmissionFrozenReceipt must be "on", in buffered mode with custodySource frozen-supabase only (omit for off)');
 }
@@ -284,6 +304,7 @@ export function secretsStoreSecret(storeId: string, secretName: string) {
 /** Plain vars: ids and switches only. */
 export function sessionIngestVars(p: SessionIngestInputs) {
   const expectedGeneration = bufferedGeneration(p, (why) => { throw new Error(why); });
+  const asyncAdmission = resolvedAsyncAdmission(p);
   return {
     INGEST_S3_BUCKET: TRANSCRIPT_BUCKET,
     INGEST_S3_REGION: TRANSCRIPT_REGION,
@@ -298,7 +319,7 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     ...(p.custodySource ? { INGEST_CUSTODY_SOURCE: p.custodySource } : {}),
     ...(p.privacyAuthority ? { INGEST_PRIVACY_AUTHORITY: p.privacyAuthority } : {}),
     ...inboxAuthorityVars(p.authority, (why) => { throw new Error(why); }),
-    ...(p.asyncAdmission ? { INGEST_ASYNC_ADMISSION: p.asyncAdmission } : {}),
+    ...(asyncAdmission !== "off" ? { INGEST_ASYNC_ADMISSION: asyncAdmission } : {}),
     ...(p.syncAdmissionFrozenReceipt === "on" ? { INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: "on" } : {}),
   };
 }
@@ -309,8 +330,9 @@ export function sessionIngestVars(p: SessionIngestInputs) {
  * exactly what is deployed.
  */
 export function sessionIngestWorkerProps(p: SessionIngestInputs, bindings: { HYPERDRIVE: unknown; INGEST_FANOUT: unknown; INGEST_ADMISSION?: unknown }) {
-  if ((p.asyncAdmission !== undefined) !== (bindings.INGEST_ADMISSION !== undefined))
-    throw new Error("the INGEST_ADMISSION binding is declared exactly when sessionIngest.asyncAdmission is");
+  const withAdmission = resolvedAsyncAdmission(p) !== "off";
+  if (withAdmission !== (bindings.INGEST_ADMISSION !== undefined))
+    throw new Error("the INGEST_ADMISSION binding is declared exactly when the resolved sessionIngest.asyncAdmission is on or drain");
   return {
     name: SESSION_INGEST_WORKER,
     main: "src/session-ingest/worker.ts",
@@ -328,7 +350,7 @@ export function sessionIngestWorkerProps(p: SessionIngestInputs, bindings: { HYP
       ...sessionIngestVars(p),
       HYPERDRIVE: bindings.HYPERDRIVE,
       INGEST_FANOUT: bindings.INGEST_FANOUT,
-      ...(p.asyncAdmission ? { INGEST_ADMISSION: bindings.INGEST_ADMISSION } : {}),
+      ...(withAdmission ? { INGEST_ADMISSION: bindings.INGEST_ADMISSION } : {}),
       S3_ACCESS_KEY_ID: secretsStoreSecret(p.secretsStoreId, S3_ACCESS_KEY_SECRET),
       S3_SECRET_ACCESS_KEY: secretsStoreSecret(p.secretsStoreId, S3_SECRET_KEY_SECRET),
       INGEST_SIGNING_KEY: secretsStoreSecret(p.secretsStoreId, SIGNING_KEY_SECRET),
@@ -432,9 +454,15 @@ export type SessionIngestPlanPhase = "session ingest rollout" | "session ingest 
  * rollout creates (all, or the rest after a partial apply), update changes in
  * place, post-apply changes nothing. Never a replacement or deletion, never
  * creates and updates together. The detailed plan must list the same actions
- * and must not show a credential.
+ * and must not show a credential. `admission` is the RESOLVED async admission
+ * mode (resolvedAsyncAdmission): it decides whether the three admission
+ * resources must be present, and an "async admission addition" is "drain" only.
  */
-export function assertSessionIngestPlanContract(planText: string, detailedPlanText: string, withAdmission = false): SessionIngestPlanPhase {
+export function assertSessionIngestPlanContract(planText: string, detailedPlanText: string, admission: AsyncAdmissionSetting = "off"): SessionIngestPlanPhase {
+  if (admission !== "on" && admission !== "drain" && admission !== "off")
+    throw new Error(`96bulls: ${SESSION_INGEST_STAGE} plan contract refused: unknown async admission mode. Nothing was changed.`);
+  // The three admission resources follow the RESOLVED mode (all with on/drain, none with off).
+  const withAdmission = admission !== "off";
   const resources = sessionIngestResources(withAdmission);
   const refuse = (why: string): never => {
     throw new Error(`96bulls: ${SESSION_INGEST_STAGE} plan contract refused: ${why}. Nothing was changed.`);
@@ -479,8 +507,16 @@ export function assertSessionIngestPlanContract(planText: string, detailedPlanTe
   // Adding async admission to a deployed stage: exactly the three admission creates plus the Worker's
   // in-place update (its new binding and var); the fanout queues and their consumer stay untouched.
   if (withAdmission && ADMISSION_RESOURCES.every((r) => compact.ops.get(r) === "create") && compact.ops.get("session-ingest") === "update" &&
-      SESSION_INGEST_RESOURCES.every((r) => r === "session-ingest" || compact.ops.get(r) === "noop"))
+      SESSION_INGEST_RESOURCES.every((r) => r === "session-ingest" || compact.ops.get(r) === "noop")) {
+    // Design (h) step 3: an already-deployed Worker gains admission with "drain" first, and "drain" must
+    // reach 100% of Worker versions before "on" (a var-only "session ingest update"). Going straight to
+    // "on" could leave an older version without journaling serving privacy controls while the new
+    // version's consumer admits, so an "on" addition is refused. A fresh rollout (no Worker deployed
+    // yet) has no older version and may be "on" directly.
+    if (admission === "on")
+      refuse('async admission addition to a deployed Worker must be captured with asyncAdmission "drain" first; let drain reach 100% of Worker versions, then re-capture with "on" (or omitted) as a var-only update');
     return "async admission addition";
+  }
   return refuse(`action set is neither a rollout (creates only) nor an update (in-place only): ${[...compact.ops].filter(([, a]) => a !== "noop").map(([r, a]) => `${r}:${a}`).join(", ")}`);
 }
 
@@ -492,9 +528,10 @@ export const sessionIngestStage = (p: SessionIngestInputs) =>
     };
     const dlq = yield* Cloudflare.Queues.Queue("session-ingest-fanout-dlq", { name: FANOUT_DLQ, ...(p.acceptanceMode === "buffered" ? { deliveryPaused: true } : {}) } as never);
     const fanout = yield* Cloudflare.Queues.Queue("session-ingest-fanout", { name: FANOUT_QUEUE, ...(p.acceptanceMode === "buffered" ? { deliveryPaused: true } : {}) } as never);
-    // Async admission: its own queue + DLQ, never paused (declared only with asyncAdmission).
-    const admissionDlq = p.asyncAdmission ? yield* Cloudflare.Queues.Queue("session-ingest-admission-dlq", { name: ADMISSION_DLQ } as never) : undefined;
-    const admission = p.asyncAdmission ? yield* Cloudflare.Queues.Queue("session-ingest-admission", { name: ADMISSION_QUEUE } as never) : undefined;
+    // Async admission: its own queue + DLQ, never paused (declared when the resolved mode is on/drain).
+    const withAdmission = resolvedAsyncAdmission(p) !== "off";
+    const admissionDlq = withAdmission ? yield* Cloudflare.Queues.Queue("session-ingest-admission-dlq", { name: ADMISSION_DLQ } as never) : undefined;
+    const admission = withAdmission ? yield* Cloudflare.Queues.Queue("session-ingest-admission", { name: ADMISSION_QUEUE } as never) : undefined;
     const props = sessionIngestWorkerProps(p, {
       HYPERDRIVE: Cloudflare.Hyperdrive.lookup("HYPERDRIVE", { hyperdriveId: p.hyperdriveId }),
       INGEST_FANOUT: fanout,

@@ -11,7 +11,7 @@ import * as FetchHttpClient from "effect/http/FetchHttpClient";
 import * as Redacted from "effect/Redacted";
 import { Credentials, apiTokenCredentials } from "@distilled.cloud/cloudflare/Credentials";
 import { liveBufferedQueueApi, pausedQueueService } from "../buffered-queue-provider.ts";
-import { ADMISSION_DLQ, ADMISSION_QUEUE, ADMISSION_RETENTION_SECONDS, FANOUT_DLQ, FANOUT_QUEUE, SESSION_INGEST_WORKER } from "../session-ingest.ts";
+import { ADMISSION_DLQ, ADMISSION_QUEUE, ADMISSION_RETENTION_SECONDS, FANOUT_DLQ, FANOUT_QUEUE, SESSION_INGEST_WORKER, resolvedAsyncAdmission } from "../session-ingest.ts";
 
 const account = "a".repeat(32), qid = "b".repeat(32);
 
@@ -249,4 +249,28 @@ test("real pinned SDK: the UPDATE path for an existing default-retention queue p
   expect(updated.messageRetentionPeriod).toBe(ADMISSION_RETENTION_SECONDS);
   expect(order).toEqual(["GET", "GET", "PATCH", "GET"]);
   expect(await Effect.runPromise(service.diff({ ...request, output: updated }))).toBeUndefined();
+});
+
+test("operator guard scope follows the RESOLVED mode: buffered omitted = on (admission calls allowed), explicit off = today's scope, canonical never", async () => {
+  const secrets = { accountId: account, apiToken: "synthetic-api-token", stateUrl: "https://alchemy-state-store-96bulls.fixture.workers.dev", stateToken: "synthetic-state-token" };
+  const base: typeof fetch = (async () => Response.json({ success: true, result: [{ queue_id: qid, queue_name: FANOUT_QUEUE }] })) as typeof fetch;
+  const root = "https://api.cloudflare.com/client/v4/accounts/" + account + "/queues";
+  const post = (name: string) => ({ method: "POST", body: JSON.stringify({ queue_name: name }) });
+  // The same expression the operator passes to guardOperatorFetch.
+  const guard = (si: { acceptanceMode: string; asyncAdmission?: string }) =>
+    guardOperatorFetch(secrets, "deploy", base, si.acceptanceMode as "buffered" | "canonical", resolvedAsyncAdmission(si) !== "off");
+  for (const si of [{ acceptanceMode: "buffered" }, { acceptanceMode: "buffered", asyncAdmission: "on" }, { acceptanceMode: "buffered", asyncAdmission: "drain" }]) {
+    const g = guard(si);
+    await g(root, post(ADMISSION_QUEUE));
+    await g(root, post(ADMISSION_DLQ));
+    await g(root);
+    // The fanout pause stays true-only whatever the admission mode.
+    await expect(g(root + "/" + qid, { method: "PATCH", body: JSON.stringify({ settings: { delivery_paused: false } }) })).rejects.toThrow("queue_pause_scope");
+  }
+  const off = guard({ acceptanceMode: "buffered", asyncAdmission: "off" });
+  for (const name of [ADMISSION_QUEUE, ADMISSION_DLQ]) await expect(off(root, post(name))).rejects.toThrow("queue_scope");
+  // Canonical: omitted or "off" resolves to off, so the guard gets today's canonical scope (no admission).
+  expect(resolvedAsyncAdmission({ acceptanceMode: "canonical" })).toBe("off");
+  expect(() => guard({ acceptanceMode: "canonical" })).not.toThrow();
+  expect(() => guardOperatorFetch(secrets, "deploy", base, "canonical", true)).toThrow("admission_scope");
 });

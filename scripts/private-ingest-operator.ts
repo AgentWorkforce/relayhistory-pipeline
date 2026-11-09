@@ -53,6 +53,7 @@ import {
   ADMISSION_DLQ,
   ADMISSION_RETENTION_SECONDS,
   sessionIngestResources,
+  resolvedAsyncAdmission,
   admissionConsumerSettings,
   S3_ACCESS_KEY_SECRET,
   S3_SECRET_KEY_SECRET,
@@ -218,15 +219,34 @@ export function operatorSafePlans(
     detailedText: safe(plans.detailedText),
   };
   if (bindings) {
+    // The resolved async admission mode, read back from the verified Worker bindings
+    // (assertOperatorSnapshot bound them to the input): the queue binding and the var
+    // come together, or neither does ("off").
+    const queue = bindings.find((b) => b.sid === "INGEST_ADMISSION"),
+      flag = bindings.find((b) => b.sid === "INGEST_ASYNC_ADMISSION")?.target.text,
+      admission = queue ? flag : "off";
+    if (
+      (queue === undefined) !== (flag === undefined) ||
+      (admission !== "on" && admission !== "drain" && admission !== "off")
+    )
+      refuse("original_plan_contract");
+    let phase: string;
     try {
-      assertSessionIngestPlanContract(
+      phase = assertSessionIngestPlanContract(
         resourcePlanView(result.planText, bindings),
         resourcePlanView(result.detailedText, bindings),
-        bindings.some((b) => b.sid === "INGEST_ADMISSION"),
+        admission,
       );
     } catch {
       refuse("original_plan_contract");
     }
+    // Design (h) step 3, binding level: a deployed Worker that GAINS the admission binding
+    // in this apply must gain it with "drain" (then a var-only re-capture with "on"). The
+    // resource contract refuses the "on" addition phase; this also covers a re-capture
+    // after a partial addition (admission queues already created, Worker not yet updated),
+    // which plans as a plain update. A fresh rollout creates the Worker and may be "on".
+    if (admission === "on" && phase! !== "session ingest rollout" && queue!.action === "create")
+      refuse("admission_drain_first");
   }
   return result;
 }
@@ -361,7 +381,8 @@ export function guardOperatorFetch(
   acceptanceMode: "canonical" | "buffered" = "canonical",
   asyncAdmission = false,
 ): typeof fetch {
-  // Admission queues exist only for a buffered capture that declared asyncAdmission.
+  // Admission queues exist only for a buffered capture whose resolved async admission is on/drain
+  // (the caller passes resolvedAsyncAdmission(...) !== "off").
   if (asyncAdmission && acceptanceMode !== "buffered") refuse("admission_scope");
   const state = operatorStateUrl(secrets.stateUrl),
     queueIds = new Map<string, string>(),
@@ -628,8 +649,9 @@ export function assertOperatorSnapshot(
     "session-ingest": "Cloudflare.Worker",
     "session-ingest-fanout-consumer": "Cloudflare.Queues.Consumer",
   };
-  // Async admission (buffered only): exactly three more resources, all or none.
-  const withAdmission = input.sessionIngest.asyncAdmission !== undefined;
+  // Async admission (buffered only): exactly three more resources, all or none, keyed on the
+  // RESOLVED mode (an omitted setting on a buffered capture is "on").
+  const withAdmission = resolvedAsyncAdmission(input.sessionIngest) !== "off";
   if (withAdmission) {
     if (input.sessionIngest.acceptanceMode !== "buffered") refuse("native_admission_mode");
     expected["session-ingest-admission-dlq"] = "Cloudflare.Queues.Queue";
@@ -983,7 +1005,7 @@ export async function retainedOperatorPlan(
               mode,
               runtime.fetcher,
               input.sessionIngest.acceptanceMode,
-              input.sessionIngest.asyncAdmission !== undefined,
+              resolvedAsyncAdmission(input.sessionIngest) !== "off",
             ),
             mode,
           ),

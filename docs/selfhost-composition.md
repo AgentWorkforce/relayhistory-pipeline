@@ -241,6 +241,7 @@ the migration owner.
 | `hoopdb-migrate` | the database superuser / migration owner | `HOOPDB_URL` (Job only) |
 | workers (`hoopdb-indexer`, `referee`, `bob-costas`, `session-brief`, `alleyoop-*`) | `HOOPDB_RUNTIME_ROLE` (exact app ACL from `migrate-guards.ts`) | `HOOPDB_URL` |
 | `session-read-api` | `bulls96_read_api`: `LOGIN NOINHERIT NOSUPERUSER NOBYPASSRLS`, read-only, and not owner of the search schema (checked at startup) | `supabase_url` inside `RELAYHISTORY_READ_API_SECRET` (JSON) |
+| `session-read-api` digest narrative writer (optional, off by default; section 6) | `bulls96_digest_narrative`: `LOGIN NOINHERIT`, EXECUTE on `sessions.digest_narrative_upsert` only (checked at startup) | `READ_API_DIGEST_NARRATIVE_DB_URL` |
 | session-ingest, `session-publication` | `bulls96_session_ingest` (the publisher refuses any other `current_user`) | ingest: its Secret; publisher: `hoopdb_url` in the Secrets Manager secret `INGEST_PUBLISH_SECRET_ARN` |
 
 Order (plain Postgres or CNPG, `HOOPDB_DB_MODE=selfhosted`):
@@ -275,6 +276,8 @@ Order (plain Postgres or CNPG, `HOOPDB_DB_MODE=selfhosted`):
      design, "Postgres search prerequisites").
    - The search worker marker
      (`runbooks/session-directory-search-worker-bootstrap.md`).
+   - Only for the optional digest narrative writer (section 6):
+     `digest_narrative_role.sql`, then the password. Needs Khaliq's OK.
 
    Passwords go straight from the secret store into the Secrets. They are
    never written to disk or into a file in this repository.
@@ -429,7 +432,7 @@ Supabase CA. There is no implicit default for the service.
 
 ## 6. Summaries and the model transport (Bob Costas, session-brief)
 
-Both model users are off by default. With no change, Bob Costas writes
+Every model user is off by default. With no change, Bob Costas writes
 extractive summaries (no model call) and session-brief claims nothing.
 
 ### Native canonical session briefs
@@ -540,6 +543,53 @@ BOB_COSTAS_MODEL=<the gateway's model id>
 The IAM role belongs to the gateway, not to the 96bulls workers. Plain http is
 accepted only for a Kubernetes Service name with `ALLOW_IN_CLUSTER_HTTP=true`;
 anything else needs https.
+
+### Daily digest narrative on the read API service
+
+The read API service (`SERVICE=session-read-api`, the `service` entry of
+`src/session-read-api/lambda.ts`) can generate the daily digest narrative
+in-process (`src/session-read-api/digest-narrative-selfhost.ts`, whose header is
+the reference). It reuses the hosted narrative's prompt, its 10 s model timeout,
+its 3 s read deadline and the migration `20261105045000` cache. No new
+migration is needed. Everything is off by default:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `READ_API_DIGEST_ENABLED` | unset (off) | exactly `1`: build the narrative deps. Anything else: no narrative variable is read and the service is unchanged |
+| `READ_API_DIGEST_NARRATIVE_MODEL` | unset | unset or blank: `provider_not_configured` (no model call, no writer pool). Otherwise the chat-completions model id (`MODEL_PATTERN`); an invalid id fails startup |
+| `OPENAI_API_KEY` | unset | shared with session-brief and Bob Costas. Unset, blank or `*-disabled`: no generation |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | calls go to `<base>/chat/completions` (not the Responses API), under the same destination rule (`ALLOW_IN_CLUSTER_HTTP=true` for an in-cluster Service). A Bedrock gateway must serve chat completions too |
+| `READ_API_DIGEST_NARRATIVE_DB_URL` | unset | the narrative writer login. Unset: the narrative is read-only from the cache (hits served, a miss is `provider_not_configured`, no model call) |
+
+The writer is a separate pool, never the read pool. It has 1 connection, a 5 s
+`statement_timeout` (the role's own pin), the `SESSION_POSTGRES_TLS_PROFILE`
+trust, and discrete URL fields (nothing in the query string reaches pg). It
+runs only `sessions.digest_narrative_upsert`. Migration `20261105045000` grants
+EXECUTE on that function to `bulls96_digest_narrative` alone, and the function
+refuses any other caller. So the URL must be that role's login (provisioned by
+`supabase/bootstrap/digest_narrative_role.sql`). Startup refuses a writer login
+that is not exactly that role, or that is superuser or BYPASSRLS. The read pool
+stays read-only as `bulls96_read_api` and reads the cache through
+`digest_narrative_read`.
+
+Trust note: the writer role can upsert a narrative for any tenant. On the hosted
+stack, that credential lives only in the separate narrative Worker. Here it
+lives in the read API process, and the verified caller's tenant is the only
+guard. Provisioning the role's password and the URL secret, through the
+operator's secret store and never on disk, needs Khaliq's explicit OK, as do
+deploys and applying `20261105045000`.
+
+Generation runs detached from the request. A slow miss answers
+`provider_error` at the 3 s deadline, then the model call finishes within its
+10 s timeout and is cached for the next read. Concurrent reads of one key share
+one call. At most 4 generations run per process. The prompt is the digest's
+aggregates plus up to 15 session summaries, project ids and branches. It is
+scrubbed before it is sent, and the narrative is scrubbed before it is cached.
+Logs carry outcome codes only.
+
+This entry does not serve `GET /v1/digest/daily` yet: the route needs a digest
+backend on this service. Until that wiring passes these deps to the route, it
+answers 501 `digest_not_configured` whatever these variables say.
 
 ### Follow-up: native Bedrock provider (scope only, no code now)
 
