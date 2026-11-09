@@ -262,6 +262,35 @@ export type EventRowOwner = (
   row: Json,
 ) => { userId: string; sessionId: string } | undefined;
 
+/** The generic delivery projection uses role as type. Codex tool-use captures
+ * carry an explicit non-chat kind; restore it only with a same-origin, same
+ * physical-session/message-id tool-call witness from the verified record union.
+ * This changes classification only: content, identities, ordering and counts stay.
+ */
+function codexToolCaptures(records: readonly RelayhistoryStreamRecord[], scope: SessionScope) {
+  const calls = new Map<string, RelayhistoryStreamRecord | null>();
+  const key = (record: RelayhistoryStreamRecord): string | null => {
+    const p = record.payload;
+    return p && p.source === "codex" && typeof p.session_id === "string" && p.session_id.trim() &&
+      typeof p.message_id === "string" && p.message_id.trim()
+      ? JSON.stringify([record.origin_id, p.session_id, p.message_id]) : null;
+  };
+  if (scope.harness !== "codex") return new Map<string, string>();
+  for (const record of records) {
+    if (record.kind !== "tool_call") continue;
+    const k = key(record);
+    if (!k || typeof record.payload?.name !== "string" || !record.payload.name.trim()) continue;
+    calls.set(k, calls.has(k) ? null : record);
+  }
+  const captures = new Map<string, string>();
+  for (const record of records) {
+    if (record.kind !== "session_event" || record.payload?.kind !== "tool_use" || record.payload.role !== "assistant") continue;
+    const k = key(record), call = k ? calls.get(k) : null;
+    if (call) captures.set(JSON.stringify([deliveryMachine(scope.workspaceId, record.origin_id), record.record_id]), call.payload!.name as string);
+  }
+  return captures;
+}
+
 /**
  * The one record-to-event projection both readers run (readCanonicalScope per manifest
  * group, owner-buffered.ts per buffered origin): projectRelayhistorySession, then each
@@ -294,6 +323,7 @@ export function projectEventRows(
   } catch (error) {
     return { error };
   }
+  const codexTools = codexToolCaptures(records, scope);
   const catalogRows: CatalogProjectionRow[] = [];
   const events: Array<{ row: Json; indexRow: IndexRow }> = [];
   for (const { table, row } of projected.rows) {
@@ -302,8 +332,11 @@ export function projectEventRows(
       continue;
     }
     const found = owner?.(row);
+    const toolName = row.kind === "session_event" && typeof row.delivery_record_id === "string"
+      ? codexTools.get(JSON.stringify([row.machine_id, row.delivery_record_id])) : undefined;
     const canonicalRow = {
       ...row,
+      ...(toolName ? { type: "tool_use", tool_name: toolName } : {}),
       session_id: row.delivery_record_id
         ? (found?.sessionId ?? row.session_id)
         : row.session_id,

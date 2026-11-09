@@ -2345,8 +2345,16 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105044030 (generation overlap) is the newest: 044020, 044010, 044000, 043910, 043900 and 043880 refuse (55000)
-    // while it is applied, so it rolls back FIRST; its own down restores the exact strict 050000
+    // New upstream lanes must be removed newest-first through their guarded downs.
+    // Keep proving that 044030 itself refuses while any such lane is still applied.
+    const newerThanOverlap = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > V).reverse();
+    if (newerThanOverlap.length)
+      expect((await failure(rollback("20261105044030_ingest_generation_overlap.down.sql")))?.code).toBe("55000");
+    for (const { name } of newerThanOverlap)
+      await rollback(`${name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`);
+    expect((await names()).filter((n) => newerThanOverlap.some((s) => s.name === n))).toEqual([]);
+    // 044030 is now newest: 044020, 044010, 044000, 043910, 043900 and 043880 refuse (55000)
+    // while it is applied; its own down restores the exact strict 050000
     // ingest_require_generation and 055000 ingest_lazy_guard, drops the window and retired tables, the policy
     // retirement trigger and its six functions, and marks the validation pending (the fence bodies changed).
     const overlapFns = async () =>
@@ -2380,7 +2388,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).toContain(SL);
     expect(await relation("sessions.read_api_tokens")).toBe("sessions.read_api_tokens");
     expect(await relation("sessions.ingest_seed_captures_org_id_idx")).toBe("sessions.ingest_seed_captures_org_id_idx");
-    // Every later upstream step is already rolled back here (044030, explicitly above), so no helper call.
+    // Every later upstream step is already rolled back here (including 044030 and its successors above).
     const laterNames = (await plan(SUPA_ET)).filter((s) => s.name.startsWith("upstream:") && s.name > CB).map((s) => s.name);
     expect((await names()).filter((n) => laterNames.includes(n))).toEqual([]);
     await rollback("20261105044020_claim_bootstrap_org_indexes.down.sql");
@@ -3313,10 +3321,29 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const manifest = await migrateGuards.sessionsFunctionAclManifest();
     const previousManifest = Object.fromEntries(Object.entries(manifest).filter(([fn]) => !laterFns.has(fn.slice(0, fn.indexOf("(")))));
     const previousRelease = later.length ? spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(previousManifest) : undefined;
+    // Likewise its runtime application ACL catalog could not list a table, sequence or function a later step creates;
+    // the current one does, so the ACL install (and the exact-ACL verifier) would fail on the missing relation
+    // (42P01). Install and verify the previous catalog: the current one minus the relations later steps CREATE
+    // (and the <table>_<column>_seq a serial/identity column of such a table implies). No later step: the
+    // current catalog, unmocked.
+    const laterRels = new Set(laterSteps.flatMap((s) =>
+      [...readFileSync(s.path, "utf8").matchAll(
+        /\bCREATE\s+(?:(?:UNLOGGED|TEMP|TEMPORARY)\s+)?(?:TABLE|SEQUENCE)\s+(?:IF\s+NOT\s+EXISTS\s+)?(sessions\.\w+)/gi,
+      )].map((m) => m[1]!.toLowerCase())));
+    const catalog = migrateGuards.runtimeApplicationAclCatalog();
+    const previousCatalog = {
+      tables: Object.fromEntries(Object.entries(catalog.tables).filter(([rel]) => !laterRels.has(rel))),
+      sequences: catalog.sequences.filter((rel) => !laterRels.has(rel) && ![...laterRels].some((t) => rel.startsWith(`${t}_`) && rel.endsWith("_seq"))),
+      rlsTables: catalog.rlsTables.filter((rel) => !laterRels.has(rel)),
+      // Its runtime EXECUTE grants likewise could not name a function a later step creates ($1::regprocedure).
+      functions: catalog.functions.filter((fn) => !laterFns.has(fn.slice(0, fn.indexOf("(")))),
+    };
+    const previousAcl = later.length ? spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(previousCatalog) : undefined;
     try {
       expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps }))).toBeNull();
     } finally {
       previousRelease?.mockRestore();
+      previousAcl?.mockRestore();
     }
     // Production shape: seven prebuilt CONCURRENTLY, the lazy-slot one held, its table populated.
     for (const x of ADOPTABLE_INDEXES[CB]!) if (x.name !== LAZY) await db.exec(x.def);
