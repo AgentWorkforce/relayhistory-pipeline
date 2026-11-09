@@ -279,12 +279,13 @@ describe("20261105050020 through the migrator: the prefix index is adoptable, th
     expect(MIGRATION_SENTINELS[STEP]!.sql).toContain("to_regprocedure");
   });
 
-  test("populated table, no index, no opt-in: preflight passes, the migration refuses 55000 with the hint main honours; nothing ledgered", async () => {
+  test("populated table, no index, no opt-in: the migrator refuses index_prebuild_required before any write (#421), the migration itself 55000 with the hint; nothing ledgered", async () => {
     const db = await before050020();
     const error = await failure(runMigrations(client(db), { profile: LOCAL }));
-    expect(error?.code).toBe("55000");
-    expect(error?.message ?? "").toMatch(/refusing a blocking CREATE INDEX on a populated table/);
+    expect(error?.code).toBe("index_prebuild_required");
+    expect(error?.message ?? "").toContain(`index sessions.${INDEX} on sessions.session_directory_agents (upstream:20261105050020_session_directory_agent_match.sql) is absent`);
     const raised = await failure(applyFile(db));
+    expect(raised?.code).toBe("55000");
     expect((raised as { hint?: string } | null)?.hint).toContain("HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true on the migrator");
     expect(await ledgered(db)).toBe(false);
     expect(await indexState(db)).toEqual([]);
