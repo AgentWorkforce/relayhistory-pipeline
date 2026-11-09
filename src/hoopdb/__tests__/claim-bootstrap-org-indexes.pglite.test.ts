@@ -53,14 +53,28 @@ function client(db: PGlite): MigrationClient {
 const failure = async (run: Promise<unknown>) =>
   (await run.then(() => null, (caught: unknown) => caught)) as { code?: string; message?: string } | null;
 
-/** Every migration before 044020 applied and ledgered through the real migrator. */
+/** Every migration strictly before 044020 applied and ledgered through the real migrator. Later slots
+ * must stay out entirely (not just unapplied): the migrator ledgers one contiguous prefix, so a
+ * recorded later slot with 044020 missing is a ledger gap, and 044020's own down-guard refuses
+ * while a later migration is applied. */
 async function before044020(): Promise<PGlite> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
-  const steps = (await plan(LOCAL)).filter((s) => s.name !== STEP && !s.name.startsWith("verify:"));
-  expect(steps.length).toBe((await plan(LOCAL)).filter((s) => !s.name.startsWith("verify:")).length - 1);
+  const names = (await plan(LOCAL)).map((s) => s.name).filter((n) => !n.startsWith("verify:"));
+  expect(names).toContain(STEP);
+  const steps = (await plan(LOCAL)).filter((s) => s.name < STEP && !s.name.startsWith("verify:"));
+  expect(steps.every((s) => s.name < STEP)).toBe(true);
   await runMigrations(client(db), { profile: { ...LOCAL, verify: false }, steps });
   return db;
+}
+/** The 044020 step plus its strict prefix: 044020 applied and latest, nothing later in the tree. */
+async function through044020() {
+  const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
+  open.push(db);
+  const steps = (await plan(LOCAL)).filter((s) => s.name <= STEP && !s.name.startsWith("verify:"));
+  expect(steps.some((s) => s.name === STEP)).toBe(true);
+  await runMigrations(client(db), { profile: { ...LOCAL, verify: false }, steps });
+  return { db, steps };
 }
 const orgIndexes = async (db: PGlite) =>
   (await db.query<{ name: string; def: string; oid: number; filenode: number; valid: boolean; ready: boolean }>(
@@ -356,9 +370,10 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
   });
 
   test("(f) the rollback drops exactly the eight indexes and the ledger row, nothing else; it refuses without its ledger row", async () => {
-    const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
-    open.push(db);
-    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    // 044020 applied and latest (nothing later): the down-guard refuses while a later migration is applied.
+    const { db, steps } = await through044020();
+    const rerun = () => runMigrations(client(db), { profile: LOCAL, steps });
+    expect(await failure(rerun())).toBeNull();
     const catalog = async () =>
       (await db.query<{ k: string }>(
         `SELECT c.relkind::text || ':' || c.relname AS k FROM pg_class c WHERE c.relnamespace = 'sessions'::regnamespace
@@ -381,16 +396,17 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
     expect((await failure(db.exec(down).catch(async (e) => { await db.exec("ROLLBACK"); throw e; })))?.code).toBe("55000");
     expect(await catalog()).toEqual(after);
     // The next migrator run recreates them.
-    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    expect(await failure(rerun())).toBeNull();
     expect(await catalog()).toEqual(before);
   });
 
-  test("(g) sequence: 044020 is the newest upstream step on this branch and sits after 044000", async () => {
+  test("(g) sequence: 044020 sits after 044000; later slots are exactly the known stacked lanes", async () => {
     const names = (await plan(LOCAL)).map((s) => s.name).filter((n) => n.startsWith("upstream:"));
     const i = names.indexOf(STEP);
     expect(i).toBeGreaterThan(0);
     expect(names[i - 1]! < STEP).toBe(true);
     expect(names.indexOf("upstream:20261105044000_read_api_tokens.sql")).toBeLessThan(i);
-    expect(names.filter((n) => n > STEP)).toEqual([]);
+    // Later slots known in this tree (045000 digest slots between on merge; keep slot order here).
+    expect(names.filter((n) => n > STEP)).toEqual(["upstream:20261105046000_analysis_jobs.sql"]);
   });
 });
