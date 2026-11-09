@@ -15,6 +15,7 @@ case "${SERVICE:-}" in
   session-read-api) exec bun run /app/src/session-read-api/server.ts ;;
   session-pipeline-consumer) exec bun run /app/src/session-pipeline/consumer-service.ts ;;
   session-pipeline-consumer-bootstrap) exec bun run /app/src/session-pipeline/consumer-bootstrap.ts ;;
+  session-pipeline-output-facts-bootstrap) exec bun run /app/src/session-pipeline/output-facts-bootstrap.ts ;;
   session-ingest)   exec bun run /app/src/session-ingest/selfhost-server.ts ;;
   session-publication) exec bun run /app/src/session-ingest/publication-service.ts --continuous ;;
   session-erase-bytes) exec bun run /app/src/session-erase/selfhost-eraser-main.ts ;;
