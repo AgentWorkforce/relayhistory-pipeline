@@ -1,6 +1,6 @@
 /** HoopDb access: a pg Pool that satisfies the vendored SqlExecutor, plus readiness gates. */
 import { readFileSync } from "node:fs";
-import { RUNTIME_APPLICATION_FUNCTIONS } from "../hoopdb/migrate-guards.ts";
+import { migrationChecksumMatches, resolveRenamedLedger, RUNTIME_APPLICATION_FUNCTIONS } from "../hoopdb/migrate-guards.ts";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
@@ -88,6 +88,11 @@ export const ROLE_VALIDATION_NAME = "session_directory_search_worker";
 export interface ExpectedSchema {
   names: string[];
   generation: string;
+  /**
+   * Each schema step's file sha256 by name (expectedSchema()). Readiness uses it only
+   * for resolveRenamedLedger; absent, no renamed row is adopted.
+   */
+  shas?: Record<string, string>;
   /** Exact database mode bound into the role verifier; absent/invalid never enables compatibility exceptions. */
   dbMode?: "local" | "selfhosted" | "cloudsql" | "supabase" | "rds";
 }
@@ -203,8 +208,21 @@ export async function schemaVerdict(
       await tx.query(`SET LOCAL statement_timeout = ${timeoutMs}`);
       await tx.query("SELECT set_config('hoopdb.db_mode', $1, true)", [expected.dbMode ?? "unspecified"]);
       stage = "ledger";
+      // The physical ledger goes through the migrator's own rename-alias verdict
+      // (resolveRenamedLedger, in memory, never a write): exact original-name rows count
+      // as their release names; any alias state the migrator refuses (collision, wrong
+      // sha, missing repair, original or any other unaccepted sha under the release
+      // name) leaves it missing, as does any row whose sha the migrator would refuse.
+      const physical = new Map(
+        (await tx.query<{ name: string; sha256: string }>("SELECT name, sha256 FROM sessions.__96bulls_migrations")).rows
+          .map((r) => [r.name, r.sha256]),
+      );
+      const shas = expected.shas ?? {};
+      const { effective } = resolveRenamedLedger(physical, (n) => (Object.hasOwn(shas, n) ? shas[n] : undefined));
+      // A recorded row counts only with a checksum the migrator would accept for the
+      // planned file (its migration_changed guard), alias-adopted or not.
       const have = new Set(
-        (await tx.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((r) => r.name),
+        [...effective].filter(([n, sha]) => !Object.hasOwn(shas, n) || migrationChecksumMatches(n, sha, shas[n]!)).map(([n]) => n),
       );
       // The role shim, bootstrap and verify steps are not schema; the marker covers verify.
       const missing = expected.names.filter((n) => !isPrerequisiteStep(n) && !have.has(n));

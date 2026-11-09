@@ -10,6 +10,7 @@ import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 import { createS3Store, type ObjectStore } from "../../../packages/object-store/src/index.ts";
 import { SCRUB_RULESET_VERSION } from "../../../packages/pipeline/src/lib/pipeline/raw-chunks.ts";
 import { parseSessionKey, rawChunkKey } from "../../shared/vendor.ts";
@@ -49,7 +50,8 @@ const asIngest = async (sql: string, args: unknown[] = []) => {
 beforeAll(async () => {
   db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await db.exec(read("supabase/tests/supabase_shim.sql"));
-  for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await db.exec(read("supabase/bootstrap/" + f + ".sql"));
+  // Single-sourced bootstrap chain: the grant migration FAILs closed without the bare consumer grantee.
+  for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
   for (const f of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) await db.exec(read("supabase/migrations/" + f));
   for (const f of readdirSync(join(root, "src/hoopdb/migrations")).filter((f) => f.endsWith(".sql")).sort()) await db.exec(read("src/hoopdb/migrations/" + f));
   // What src/hoopdb/migrate.ts does before its phase 2 verifiers (hardenAndCheck).

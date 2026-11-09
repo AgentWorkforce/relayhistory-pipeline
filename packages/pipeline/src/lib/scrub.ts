@@ -664,6 +664,10 @@ const SECRET_PATTERNS: Rule[] = [
       // AWS secret keys / k8s/YAML dumps): indexOf would land inside the value and leak the
       // body before it.
       const idx = match.search(/[:=]/);
+      // An idempotency key selects a public replay receipt, not authentication.
+      // Keep only this exact identifier. Credential-shaped values still pass
+      // through every independent provider/token/quoted-secret detector.
+      if (match.slice(0, idx).trim().toLowerCase() === "idempotency_key") return match;
       const separator = match[idx];
       return `${match.slice(0, idx)}${separator}${REDACTED}`;
     },

@@ -6,6 +6,18 @@
  *   RELAYHISTORY_SELFHOST_INGEST     unset | "" | "false" (default: dormant) | exactly "true"; anything
  *                                    else is a startup error, so a typo never silently means either
  *   RELAYHISTORY_INGEST_PORT         listen port, default 8081 (parsed even when dormant)
+ *   RELAYHISTORY_SELFHOST_SESSION_SELECTION
+ *                                    unset | "" | "false" (default: off) | exactly "true"; anything else is a
+ *                                    startup error. Serves POST /v1/delivery/sessions/selection with enabled:false
+ *                                    (per-session erase) and needs migration 043910 applied.
+ *   RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT
+ *                                    unset | "" | "false" (default: off, the route answers 501) | exactly "true";
+ *                                    anything else is a startup error. Serves POST /v1/onboarding/heartbeat as an
+ *                                    authenticated (rth:sync) 204 that discards the body: nothing is stored or logged.
+ *   SESSION_ERASE_API_ENABLED        operator per-session erase route (session-erase.ts): exactly "1" enables;
+ *                                    unset, "" or "0" is off; anything else is a startup error. With it,
+ *                                    SESSION_ERASE_API_SECRET (+ _PREVIOUS during a rotation; Secret-injected, min
+ *                                    32 chars). Flag off or secret unset: /internal/v1/session-erase/* answers 501.
  *
  * Enabled only (each missing or malformed value refuses startup, naming the variable, never the value):
  *   RELAYHISTORY_INGEST_ORIGIN       this edge's public origin, sent to relaycontrol as `aud` (must be the
@@ -24,6 +36,17 @@
  *   INGEST_MAX_PER_USER / INGEST_MAX_PER_ORG   in-flight batch slots, defaults 4 / 32 (same as the Worker)
  *   RELAYHISTORY_INGEST_PG_POOL_MAX  pool size, 1..32, default 4
  *
+ *   SELFHOST_INGEST_ADMISSION        unset | "" | "sync" (default: today's synchronous path, unchanged) |
+ *                                    "async" | "drain" (selfhost-admission.ts). Config only: no request
+ *                                    header can select it. async: the upload is ACKed after one create-only
+ *                                    inbox PUT, with no SQL on the request path, and an in-process consumer
+ *                                    admits it. drain: the synchronous path again, while the consumer keeps
+ *                                    admitting what is already in the inbox (the rollback step)
+ *   With async or drain only:
+ *   SELFHOST_ADMISSION_CONCURRENCY   admissions in flight in this process, 1..32, default 4
+ *   SELFHOST_ADMISSION_SCAN_MS       the inbox ListBucket scan interval, 1000..600000, default 15000
+ *   SELFHOST_ADMISSION_MAX_ATTEMPTS  attempts before an inbox object is dead-lettered, 1..100, default 20
+ *
  * Refused when enabled (they describe hosted-only edges this process does not have):
  * INGEST_ACCEPTANCE_MODE other than canonical, INGEST_INLINE_MAX_SESSIONS (no fan-out queue: every
  * batch is written inline, see selfhost-server.ts), INGEST_REPLICA_MODE other than off,
@@ -34,15 +57,28 @@ import { assertDestinationUrl, destinationPolicy } from "../shared/destination-u
 import { normalizedAudience } from "@rhc/auth/relaycontrol.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import type pg from "pg";
+import { sessionEraseConfig, type SessionEraseConfig } from "./session-erase.ts";
 
 export const SELFHOST_INGEST_FLAG = "RELAYHISTORY_SELFHOST_INGEST";
 export const SELFHOST_INGEST_PORT_VAR = "RELAYHISTORY_INGEST_PORT";
+export const SELFHOST_SESSION_SELECTION_FLAG = "RELAYHISTORY_SELFHOST_SESSION_SELECTION";
+export const SELFHOST_HEARTBEAT_ACCEPT_FLAG = "RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT";
 export const SELFHOST_INGEST_ORIGIN_VAR = "RELAYHISTORY_INGEST_ORIGIN";
 export const SELFHOST_INGEST_DATABASE_URL_VAR = "RELAYHISTORY_INGEST_DATABASE_URL";
 export const SELFHOST_INGEST_POOL_MAX_VAR = "RELAYHISTORY_INGEST_PG_POOL_MAX";
 export const SELFHOST_INGEST_DEFAULT_PORT = 8081;
 /** The only login the ledger's SECURITY DEFINER functions admit (supabase/bootstrap/session_ingest_role.sql). */
 export const SELFHOST_INGEST_ROLE = "bulls96_session_ingest";
+
+export const SELFHOST_INGEST_ADMISSION_VAR = "SELFHOST_INGEST_ADMISSION";
+
+/** SELFHOST_INGEST_ADMISSION=async|drain; absent for sync (the default). */
+export interface SelfhostAdmissionSettings {
+  mode: "async" | "drain";
+  concurrency: number;
+  scanIntervalMs: number;
+  maxAttempts: number;
+}
 
 export interface SelfhostIngestSettings {
   port: number;
@@ -55,6 +91,14 @@ export interface SelfhostIngestSettings {
   keyRoot: string;
   maxPerUser: number;
   maxPerOrg: number;
+  /** RELAYHISTORY_SELFHOST_SESSION_SELECTION: serve the per-session erase route. Default off. */
+  sessionSelection: boolean;
+  /** RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT: answer the Desktop's onboarding heartbeat 204 (discarded). Default off. */
+  heartbeatAccept: boolean;
+  /** SESSION_ERASE_API_ENABLED (session-erase.ts). Default: disabled, the route answers 501. */
+  sessionErase: SessionEraseConfig;
+  /** Present only for SELFHOST_INGEST_ADMISSION=async|drain. */
+  admission?: SelfhostAdmissionSettings;
 }
 
 export type SelfhostIngestConfig = { enabled: false; port: number } | ({ enabled: true } & SelfhostIngestSettings);
@@ -65,6 +109,22 @@ export function selfhostIngestEnabled(env: NodeJS.ProcessEnv = process.env): boo
   if (raw === undefined || raw === "" || raw === "false") return false;
   if (raw === "true") return true;
   throw new Error(`96bulls: ${SELFHOST_INGEST_FLAG} must be true or false`);
+}
+
+/** Exactly "true" enables; unset, empty or "false" is off; anything else throws (a typo never silently means either). */
+export function selfhostSessionSelectionEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[SELFHOST_SESSION_SELECTION_FLAG];
+  if (raw === undefined || raw === "" || raw === "false") return false;
+  if (raw === "true") return true;
+  throw new Error(`96bulls: ${SELFHOST_SESSION_SELECTION_FLAG} must be true or false`);
+}
+
+/** Exactly "true" enables; unset, empty or "false" is off; anything else throws (a typo never silently means either). */
+export function selfhostHeartbeatAcceptEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[SELFHOST_HEARTBEAT_ACCEPT_FLAG];
+  if (raw === undefined || raw === "" || raw === "false") return false;
+  if (raw === "true") return true;
+  throw new Error(`96bulls: ${SELFHOST_HEARTBEAT_ACCEPT_FLAG} must be true or false`);
 }
 
 function port(env: NodeJS.ProcessEnv): number {
@@ -87,6 +147,19 @@ function need(env: NodeJS.ProcessEnv, name: string): string {
   const value = env[name]?.trim();
   if (!value) throw new Error(`96bulls: ${SELFHOST_INGEST_FLAG}=true needs ${name}`);
   return value;
+}
+
+/** SELFHOST_INGEST_ADMISSION: exactly sync (or unset / empty), async or drain; anything else refuses startup. */
+export function selfhostAdmissionSettings(env: NodeJS.ProcessEnv): SelfhostAdmissionSettings | undefined {
+  const raw = env[SELFHOST_INGEST_ADMISSION_VAR];
+  if (raw === undefined || raw === "" || raw === "sync") return undefined;
+  if (raw !== "async" && raw !== "drain") throw new Error(`96bulls: ${SELFHOST_INGEST_ADMISSION_VAR} must be sync, async or drain`);
+  return {
+    mode: raw,
+    concurrency: bounded(env, "SELFHOST_ADMISSION_CONCURRENCY", 4, 1, 32),
+    scanIntervalMs: bounded(env, "SELFHOST_ADMISSION_SCAN_MS", 15_000, 1_000, 600_000),
+    maxAttempts: bounded(env, "SELFHOST_ADMISSION_MAX_ATTEMPTS", 20, 1, 100),
+  };
 }
 
 /** Discrete fields from the sanitized URL (the read API service's rule): user, password and database required. */
@@ -127,6 +200,9 @@ function refuseHostedOnly(env: NodeJS.ProcessEnv): void {
 /** Parse everything once at startup. Errors name the variable, never its value. */
 export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): SelfhostIngestConfig {
   if (!selfhostIngestEnabled(env)) return { enabled: false, port: port(env) };
+  const sessionSelection = selfhostSessionSelectionEnabled(env);
+  const heartbeatAccept = selfhostHeartbeatAcceptEnabled(env);
+  const sessionErase = sessionEraseConfig(env);
   const policy = destinationPolicy(env);
   refuseHostedOnly(env);
   const originRaw = need(env, SELFHOST_INGEST_ORIGIN_VAR);
@@ -143,6 +219,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   need(env, "LOCKER_BUCKET");
   const keyRoot = env.INGEST_KEY_ROOT?.trim() || "96bulls";
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u.test(keyRoot)) throw new Error("96bulls: INGEST_KEY_ROOT must be a single key segment");
+  const admission = selfhostAdmissionSettings(env);
   return {
     enabled: true,
     port: port(env),
@@ -153,5 +230,9 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     keyRoot,
     maxPerUser: bounded(env, "INGEST_MAX_PER_USER", 4, 1, 1000),
     maxPerOrg: bounded(env, "INGEST_MAX_PER_ORG", 32, 1, 1000),
+    sessionSelection,
+    heartbeatAccept,
+    sessionErase,
+    ...(admission ? { admission } : {}),
   };
 }

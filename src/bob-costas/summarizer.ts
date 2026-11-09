@@ -1,8 +1,9 @@
 /**
  * Bob Costas summarisers. `extractive` runs with no model and is the default
- * (Khaliq's self-host decision: model calls off unless switched on). A model
- * summariser plugs in behind the same interface; its telemetry carries model
- * id and token counts only, never prompts or outputs.
+ * (Khaliq's self-host decision: model calls off unless switched on). The model
+ * summariser (`model-summarizer.ts`, chosen by BOB_COSTAS_MODEL there in
+ * `summarizerFromEnv`) plugs in behind the same interface; its telemetry carries
+ * model id and token counts only, never prompts or outputs.
  */
 import { scrubText } from "../shared/vendor.ts";
 
@@ -24,9 +25,17 @@ export interface Summary {
   tokensOut: number;
 }
 
+/** Who the summary is for: the model summariser's budget and caps key on it. Ids only. */
+export interface SummaryContext {
+  orgId: string;
+  /** The logical session within the org (workspace, harness, session id). */
+  sessionKey: string;
+  traceId?: string;
+}
+
 export interface Summarizer {
   readonly id: string;
-  summarize(kind: "short" | "long", digest: SessionDigest): Promise<Summary>;
+  summarize(kind: "short" | "long", digest: SessionDigest, ctx?: SummaryContext): Promise<Summary>;
 }
 
 /** Parses scrubbed JSONL transcript records into a digest. Harness-agnostic best effort. */
@@ -100,10 +109,3 @@ export const extractiveSummarizer: Summarizer = {
     return { text: scrubText(text), modelId: this.id, tokensIn: 0, tokensOut: 0 };
   },
 };
-
-/** Chosen by BOB_COSTAS_MODEL: `off` (default) is extractive; anything else is not wired yet. */
-export function summarizerFromEnv(): Summarizer {
-  const model = (process.env.BOB_COSTAS_MODEL ?? "off").trim();
-  if (model === "" || model === "off" || model === "extractive") return extractiveSummarizer;
-  throw new Error(`96bulls: BOB_COSTAS_MODEL=${model} is not wired; only the extractive summariser ships in the local stack`);
-}

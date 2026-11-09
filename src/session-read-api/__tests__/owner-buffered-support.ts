@@ -10,7 +10,8 @@ import { objectKey, type ObjectStore } from "../../shared/vendor.ts";
 import { scratchStore } from "../../session-ingest/__tests__/support.ts";
 import { TURN_KIND, TURN_ORIGIN_ID, turnRecordId } from "../../session-ingest/turns.ts";
 import type { AuthorityHead, BufferedScope, BufferedSessionRow, BufferedStageRow, ControlHeadGate, OwnerBufferedDeps, OwnerBufferedReads } from "../owner-buffered.ts";
-import { BufferedFenced, BufferedTooLarge } from "../owner-buffered.ts";
+import type { BufferedIndexProbe, BufferedIndexState } from "../owner-buffered.ts";
+import { BufferedFenced, BufferedIndexVerifier, BufferedTooLarge } from "../owner-buffered.ts";
 
 export const SCOPE: BufferedScope = { orgId: "org-a", workspaceId: "ws-a", userId: "u-1" };
 export const SESSION = "sess-b1";
@@ -144,4 +145,83 @@ export function scratch() {
 
 export function deps(over: Partial<OwnerBufferedDeps> & { store: ObjectStore }): OwnerBufferedDeps {
   return { enabled: true, workspaces: "*", reads: scriptedReads().reads, gate: scriptedGate(authority("7")), decompress: unzip, ...over };
+}
+
+/**
+ * A scripted catalog probe for the READ_API_OWNER_BUFFERED_INDEX_VERIFY check: answers per call
+ * (the last repeats; an Error is thrown); every call's scope is recorded.
+ */
+export function scriptedIndexProbe(...answers: Array<BufferedIndexState | Error>): BufferedIndexProbe & { calls: BufferedScope[] } {
+  const calls: BufferedScope[] = [];
+  const probe = (async (scope: BufferedScope) => {
+    calls.push(scope);
+    const a = answers[Math.min(calls.length - 1, answers.length - 1)]!;
+    if (a instanceof Error) throw a;
+    return a;
+  }) as BufferedIndexProbe & { calls: BufferedScope[] };
+  probe.calls = calls;
+  return probe;
+}
+
+/** deps.indexCheck over a fresh verifier (no cache shared between tests) and a scripted probe. */
+export function indexChecked(...answers: Array<BufferedIndexState | Error>) {
+  const probe = scriptedIndexProbe(...answers);
+  return { indexCheck: new BufferedIndexVerifier().check(probe), probe };
+}
+
+/** A promise and its resolver (tests hold a GetObject open until they release it). */
+export function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => (resolve = r));
+  return { promise, resolve };
+}
+
+/**
+ * One shared, ordered trace of a buffered read's I/O: `get:<key>` when a stage GetObject starts,
+ * `fail:<key>` when it throws, `decompressed` when its bytes reach the bounded decompress (the
+ * stage fetch's end), `observe` per control-head observation and `stages` per stages() call.
+ * `maxInFlight` is the most GetObjects started and not yet decompressed or failed. `hold(key, n)`
+ * (n = the GetObject's start index) may delay a GetObject; `fail(key)` may throw instead of it.
+ */
+export function traced(inner: ObjectStore, opts: { hold?: (key: string, n: number) => Promise<void> | undefined; fail?: (key: string) => Error | undefined } = {}) {
+  const events: string[] = [];
+  let inFlight = 0;
+  let started = 0;
+  const t = { events, maxInFlight: 0, starts: () => events.filter((e) => e.startsWith("get:")).length };
+  const store = new Proxy(inner, {
+    get(target, prop) {
+      if (prop === "getObject") {
+        return async (key: Parameters<ObjectStore["getObject"]>[0], range?: Parameters<ObjectStore["getObject"]>[1]) => {
+          const k = String(key);
+          const n = started++;
+          events.push(`get:${k}`);
+          inFlight++;
+          t.maxInFlight = Math.max(t.maxInFlight, inFlight);
+          try {
+            await opts.hold?.(k, n);
+            const failure = opts.fail?.(k);
+            if (failure) throw failure;
+            return await target.getObject(key, range);
+          } catch (error) {
+            inFlight--;
+            events.push(`fail:${k}`);
+            throw error;
+          }
+        };
+      }
+      const v = Reflect.get(target, prop, target);
+      return typeof v === "function" ? v.bind(target) : v;
+    },
+  });
+  const decompress = (bytes: Uint8Array, maxBytes: number) => {
+    inFlight--;
+    events.push("decompressed");
+    return unzip(bytes, maxBytes);
+  };
+  const gate = (...answers: Array<AuthorityHead | Error>): ControlHeadGate & { calls: BufferedScope[] } => {
+    const g = scriptedGate(...answers);
+    return { calls: g.calls, observe: (scope) => (events.push("observe"), g.observe(scope)) };
+  };
+  const reads = (r: OwnerBufferedReads): OwnerBufferedReads => ({ list: r.list, stages: (...a) => (events.push("stages"), r.stages(...a)) });
+  return Object.assign(t, { store, decompress, gate, reads });
 }

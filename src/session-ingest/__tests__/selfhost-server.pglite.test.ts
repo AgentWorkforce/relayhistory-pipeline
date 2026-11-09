@@ -14,8 +14,11 @@ import { dirname, join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
+import { SESSION_DIRECTORY_SEARCH_RPC } from "../../hoopdb/search-index-contract.ts";
 import { objectKey, type ObjectStore } from "../../shared/vendor.ts";
-import { IDENTITY_HEADER, encodeIdentity } from "../app.ts";
+import { IDENTITY_HEADER, contentEncodings, encodeIdentity } from "../app.ts";
+import { DELIVERY_LIMITS } from "../vendor/delivery/delivery-contracts.ts";
 import type { SqlRun } from "../ledger-sql.ts";
 import { relaycontrolIngestIdentity, selfhostIntrospector } from "../selfhost-auth.ts";
 import { selfhostIngestConfig } from "../selfhost-config.ts";
@@ -25,6 +28,8 @@ import {
 } from "../selfhost-server.ts";
 import { SIGNING_KEY, TENANT, batch, record, scratchStore, signedHeaders } from "./support.ts";
 import { deliveryAccount } from "../vendor/delivery/prepare.ts";
+import { liveMachineId } from "../writer.ts";
+import { TURN_ORIGIN_ID } from "../turns.ts";
 
 setDefaultTimeout(60_000);
 
@@ -47,7 +52,8 @@ async function database(): Promise<{ db: PGlite; run: SqlRun; runAs: (role: stri
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   cleanups.push(() => db.close());
   await db.exec(read("supabase/tests/supabase_shim.sql"));
-  for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await db.exec(read(`supabase/bootstrap/${f}.sql`));
+  // Single-sourced bootstrap chain: the grant migration FAILs closed without the bare consumer grantee.
+  for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
   for (const file of readdirSync(join(root, "supabase/migrations")).filter((f) => f.endsWith(".sql")).sort()) await db.exec(read(`supabase/migrations/${file}`));
   await db.exec(sql("supabase/bootstrap/session_ingest_role.sql"));
   // PGlite is one connection: serialize so SET ROLE / RESET ROLE never interleave.
@@ -121,7 +127,7 @@ async function chunkKeys(store: ObjectStore): Promise<string[]> {
 }
 
 async function start(rc: { url: string }, over: NodeJS.ProcessEnv = {}) {
-  const { run } = await database();
+  const { run, db } = await database();
   const fs = scratchStore();
   cleanups.push(fs.done);
   // No assertIngestRole here: PGlite has no real login, and the SET ROLE harness is exactly what
@@ -138,7 +144,7 @@ async function start(rc: { url: string }, over: NodeJS.ProcessEnv = {}) {
   const service: SelfhostIngestService = await startSelfhostIngestService(env(rc.url, over), { host: "127.0.0.1", port: 0, build });
   cleanups.push(() => service.close());
   const url = (path: string) => `http://127.0.0.1:${service.port}${path}`;
-  return { service, url, store: fs.store };
+  return { service, url, store: fs.store, db };
 }
 
 const deliveryBody = async (id = "e1", over: Parameters<typeof batch>[1] = {}) =>
@@ -168,6 +174,21 @@ describe("self-host ingest edge over node:http", () => {
     expect(limits.status).toBe(200);
     expect(((await limits.json()) as { contentEncodings: string[] }).contentEncodings).toContain("gzip");
     expect(rc.calls).toHaveLength(3);
+  });
+
+  test("the limits answer says sessionDeletion:false and sessionReset:false at the top level, after auth", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url } = await start(rc);
+    const limits = await fetch(url("/v1/delivery/limits"), { headers: { authorization: `Bearer ${TOKEN}` } });
+    expect(limits.status).toBe(200);
+    const text = await limits.text();
+    const body = JSON.parse(text) as Record<string, unknown>;
+    expect(body).toEqual({ ...DELIVERY_LIMITS, contentEncodings: contentEncodings(), sessionDeletion: false, sessionReset: false });
+    expect(limits.headers.get("content-type")).toContain("application/json");
+    expect(rc.calls).toHaveLength(1);
+    // Unauthenticated: the same refusal as before, with no capabilities leaked.
+    const anon = await fetch(url("/v1/delivery/limits"));
+    expect([anon.status, await code(anon)]).toEqual([401, "missing_authorization"]);
   });
 
   test("a revoked token is refused on the very next request (no positive cache)", async () => {
@@ -281,8 +302,23 @@ describe("self-host ingest edge over node:http", () => {
     expect((await fetch(url("/nope"))).status).toBe(404);
     expect(rc.calls).toHaveLength(0);
     const health = await fetch(url("/healthz"));
-    expect(await health.json()).toEqual({ ok: true, enabled: true });
+    expect(await health.json()).toEqual({ ok: true, enabled: true, admission: "sync" });
     expect((await fetch(url("/readyz"))).status).toBe(200);
+  });
+
+  test("token refresh is a 401 the Desktop reads as a refused refresh, with no introspection", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, store } = await start(rc);
+    // The Desktop's own call: no bearer, a small JSON body holding the refresh token.
+    const res = await fetch(url("/v1/auth/token/refresh"), { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ refreshToken: TOKEN }) });
+    const text = await res.text();
+    expect([res.status, res.headers.get("www-authenticate")]).toEqual([401, "Bearer"]);
+    expect((JSON.parse(text) as { error: { code: string } }).error.code).toBe("refresh_not_supported");
+    expect(text).not.toContain(TOKEN);
+    const wrong = await fetch(url("/v1/auth/token/refresh"));
+    expect([wrong.status, wrong.headers.get("allow")]).toEqual([405, "POST"]);
+    expect(rc.calls).toHaveLength(0);
+    expect(await chunkKeys(store)).toEqual([]);
   });
 
   test("an oversized body is 413 after auth, and nothing is written", async () => {
@@ -292,6 +328,360 @@ describe("self-host ingest edge over node:http", () => {
     // The edge closes the connection once the 413 is out; a client still uploading may see a reset instead.
     if (res instanceof Response) expect([res.status, await code(res)]).toEqual([413, "delivery_too_large"]);
     expect(await chunkKeys(store)).toEqual([]);
+  });
+});
+
+describe("onboarding heartbeat (RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT=true)", () => {
+  const HEARTBEAT = "/v1/onboarding/heartbeat";
+  const on = { RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT: "true" };
+  const progress = JSON.stringify({ phase: "uploading", uploaded: 3, total: 10 });
+
+  test("off by default: 501 unsupported_by_backend, no introspection", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url } = await start(rc);
+    const res = await post(url(HEARTBEAT), progress);
+    expect([res.status, await code(res)]).toEqual([501, "unsupported_by_backend"]);
+    expect(rc.calls).toHaveLength(0);
+  });
+
+  test("an unexpected flag value refuses startup", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    await expect(start(rc, { RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT: "1" })).rejects.toThrow("RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT");
+  });
+
+  test("on: an authenticated heartbeat is 204 with no body, introspected, nothing written", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, store } = await start(rc, on);
+    const res = await post(url(HEARTBEAT), progress, { "x-correlation-id": "hb-1" });
+    expect(res.status).toBe(204);
+    expect(await res.text()).toBe("");
+    expect(res.headers.get("x-correlation-id")).toBe("hb-1");
+    expect(rc.calls.map((c) => c.body)).toEqual([{ token: TOKEN, aud: ORIGIN }]);
+    // Keep-alive survives a drained small body: a second heartbeat on the same client works.
+    expect((await post(url(HEARTBEAT), progress)).status).toBe(204);
+    expect(await chunkKeys(store)).toEqual([]);
+  });
+
+  test("on: unauthenticated is 401, without rth:sync is 403, GET is 405; none introspects past the gate", async () => {
+    const rc = await relaycontrol(() => active(["rth:read"]));
+    const { url } = await start(rc, on);
+    const anon = await fetch(url(HEARTBEAT), { method: "POST", headers: { "content-type": "application/json" }, body: progress });
+    expect([anon.status, anon.headers.get("www-authenticate"), await code(anon)]).toEqual([401, "Bearer", "missing_authorization"]);
+    expect(rc.calls).toHaveLength(0);
+    const unscoped = await post(url(HEARTBEAT), progress);
+    expect([unscoped.status, await code(unscoped)]).toEqual([403, "forbidden"]);
+    const wrong = await fetch(url(HEARTBEAT), { headers: { authorization: `Bearer ${TOKEN}` } });
+    expect([wrong.status, wrong.headers.get("allow"), await code(wrong)]).toEqual([405, "POST", "method_not_allowed"]);
+    expect(rc.calls).toHaveLength(1);
+    // The rest of /v1/onboarding stays unserved.
+    const connection = await fetch(url("/v1/onboarding/connection"), { headers: { authorization: `Bearer ${TOKEN}` } });
+    expect([connection.status, await code(connection)]).toEqual([501, "unsupported_by_backend"]);
+  });
+
+  test("on: a body past the drain cap is not read; still 204 and the connection closes", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url } = await start(rc, on);
+    const res = await post(url(HEARTBEAT), "x".repeat(4 * 1024 * 1024)).catch((e: unknown) => e);
+    // The edge closes the connection once the 204 is out; a client still uploading may see a reset instead.
+    if (res instanceof Response) {
+      expect(res.status).toBe(204);
+      expect(res.headers.get("connection")).toBe("close");
+    }
+  });
+});
+
+describe("per-session erase (RELAYHISTORY_SELFHOST_SESSION_SELECTION=true)", () => {
+  const ORIGIN_ID = "origin-1";
+  const SELECTION = "/v1/delivery/sessions/selection";
+  const machine = liveMachineId(TENANT.workspaceId, ORIGIN_ID, TENANT.userId);
+  const on = { RELAYHISTORY_SELFHOST_SESSION_SELECTION: "true" };
+  const pointer = (db: PGlite, session: string, machineId: string, ws = TENANT.workspaceId) =>
+    db.query(
+      `INSERT INTO sessions.session_index
+         (org_id, workspace_id, harness, session_id, machine_id, user_id, created_at, last_activity_at,
+          storage_provider, bucket, manifest_key, content_sha256, raw_format, trace_id, revision)
+       VALUES ($1, $2, 'claude', $3, $4, $5, now(), now(), 's3', 'bucket', 'k/' || $3 || $4,
+               decode(repeat('ab', 32), 'hex'), 'jsonl', '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18', 2)`,
+      [TENANT.orgId, ws, session, machineId, TENANT.userId],
+    );
+  const directory = (db: PGlite, session: string) =>
+    db.query(
+      `INSERT INTO sessions.session_directory (org_id, workspace_id, harness, session_id, created_at, last_activity_at)
+       VALUES ($1, $2, 'claude', $3, now(), now())`,
+      [TENANT.orgId, TENANT.workspaceId, session],
+    );
+  const row = async (db: PGlite, session: string, machineId: string) =>
+    (await db.query<{ deleted_at: unknown; revision: string }>(
+      "SELECT deleted_at, revision::text FROM sessions.session_index WHERE session_id = $1 AND machine_id = $2 AND workspace_id = $3", [session, machineId, TENANT.workspaceId])).rows[0]!;
+  const selection = async (over: Record<string, unknown> = {}) =>
+    JSON.stringify({ account_id: await deliveryAccount(TENANT), origin_id: ORIGIN_ID, sessions: [{ source: "claude", session_id: "sess-1" }], enabled: false, ...over });
+
+  test("off by default: selection stays 501 and the fence is never reached", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db } = await start(rc);
+    await pointer(db, "sess-1", machine);
+    const res = await post(url(SELECTION), await selection());
+    expect([res.status, await code(res)]).toEqual([501, "unsupported_by_backend"]);
+    expect((await row(db, "sess-1", machine)).deleted_at).toBeNull();
+    expect(rc.calls).toHaveLength(0);
+  });
+
+  test("an unexpected flag value refuses startup", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    await expect(start(rc, { RELAYHISTORY_SELFHOST_SESSION_SELECTION: "1" })).rejects.toThrow("RELAYHISTORY_SELFHOST_SESSION_SELECTION");
+  });
+
+  test("erases the caller's copy: pointer and directory tombstoned, other machine, session and workspace untouched", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db } = await start(rc, on);
+    expect((await post(url("/v1/delivery/batches"), await deliveryBody())).status).toBe(200);
+    await pointer(db, "sess-1", machine);
+    await pointer(db, "sess-1", "srv_other-machine");
+    await pointer(db, "sess-2", machine);
+    await pointer(db, "sess-1", machine, "ws-b");
+    await directory(db, "sess-1");
+    const res = await post(url(SELECTION), await selection());
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ updated: true });
+    const erased = await row(db, "sess-1", machine);
+    expect(erased.deleted_at).not.toBeNull();
+    // Past any manifest revision a queued event could carry: the revision fence can never undelete it.
+    expect(BigInt(erased.revision)).toBeGreaterThanOrEqual(9007199254740991n);
+    expect((await row(db, "sess-1", "srv_other-machine")).deleted_at).toBeNull();
+    expect((await row(db, "sess-2", machine)).deleted_at).toBeNull();
+    const other = await db.query<{ deleted_at: unknown }>("SELECT deleted_at FROM sessions.session_index WHERE workspace_id = 'ws-b'");
+    expect(other.rows[0]!.deleted_at).toBeNull();
+    // Another machine's copy is still live, so the directory row stays; its derived text is cleared.
+    const live = await db.query<{ deleted_at: unknown; short_summary: unknown }>("SELECT deleted_at, short_summary FROM sessions.session_directory WHERE session_id = 'sess-1'");
+    expect(live.rows[0]).toEqual({ deleted_at: null, short_summary: null });
+    const fence = await db.query("SELECT 1 FROM sessions.upload_deletions WHERE session_id = 'sess-1' AND origin_id = $1", [ORIGIN_ID]);
+    expect(fence.rows).toHaveLength(1);
+    // The last live copy gone, the directory row goes too (erased a different machine's copy with the same selection).
+    await db.query("DELETE FROM sessions.session_index WHERE machine_id = 'srv_other-machine'");
+    await post(url(SELECTION), await selection());
+    const gone = await db.query<{ deleted_at: unknown }>("SELECT deleted_at FROM sessions.session_directory WHERE session_id = 'sess-1'");
+    expect(gone.rows[0]!.deleted_at).not.toBeNull();
+  });
+
+  test("a directory row carrying a short summary and its provenance: all five cleared together, never 23514 (044050)", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db } = await start(rc, on);
+    await pointer(db, "sess-1", machine);
+    await pointer(db, "sess-1", "srv_other-machine");
+    await directory(db, "sess-1");
+    await db.query(
+      `UPDATE sessions.session_directory SET short_summary = 'a scrubbed summary', short_summary_scrub_ruleset = 'relayhistory-scrub',
+         short_summary_scrub_version = 1, short_summary_source = 'bob-costas/extractive/v1', short_summary_generated_at = now()
+       WHERE session_id = 'sess-1'`);
+    const summary = async () =>
+      (await db.query("SELECT deleted_at, short_summary, short_summary_scrub_ruleset, short_summary_scrub_version, short_summary_source, short_summary_generated_at FROM sessions.session_directory WHERE session_id = 'sess-1'")).rows[0];
+    const cleared = { short_summary: null, short_summary_scrub_ruleset: null, short_summary_scrub_version: null, short_summary_source: null, short_summary_generated_at: null };
+    // Another machine's copy is still live, so the row is not tombstoned and the tombstone trigger does not clear
+    // the provenance: before 044050 this UPDATE broke session_directory_short_summary_provenance (23514, a 503).
+    const res = await post(url(SELECTION), await selection());
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ updated: true });
+    expect((await row(db, "sess-1", machine)).deleted_at).not.toBeNull();
+    expect((await row(db, "sess-1", "srv_other-machine")).deleted_at).toBeNull();
+    expect(await summary()).toEqual({ deleted_at: null, ...cleared });
+    // The last live copy gone, a second erase tombstones the row; still all five NULL.
+    await db.query("DELETE FROM sessions.session_index WHERE machine_id = 'srv_other-machine'");
+    expect((await post(url(SELECTION), await selection())).status).toBe(200);
+    const gone = await summary();
+    expect(gone!.deleted_at).not.toBeNull();
+    expect({ ...gone, deleted_at: null }).toEqual({ deleted_at: null, ...cleared });
+  });
+
+  test("the managed-head retire trigger clears the short summary with its provenance, never 23514 (044050)", async () => {
+    const { db } = await database();
+    await pointer(db, "sess-1", machine);
+    await pointer(db, "sess-1", "srv_other-machine");
+    await directory(db, "sess-1");
+    await db.query(
+      `UPDATE sessions.session_directory SET short_summary = 'a scrubbed summary', short_summary_scrub_ruleset = 'relayhistory-scrub',
+         short_summary_scrub_version = 1, short_summary_source = 'bob-costas/extractive/v1', short_summary_generated_at = now()
+       WHERE session_id = 'sess-1'`);
+    // A live publication head on the caller's machine (the generation row references the head).
+    const generation = "6f1c2a4e-3b5d-4c7e-8f90-a1b2c3d4e5f6";
+    await db.query(
+      `INSERT INTO sessions.ingest_publication_heads (org_id, workspace_id, user_id, origin_id, source, session_id, physical_workspace,
+         physical_source, physical_session, machine_id, generation, fence_epoch, reset_epoch, pointer_revision, current_key, state)
+       VALUES ($1, $2, $3, $4, 'claude', 'sess-1', $2, 'claude', 'sess-1', $5, $6, 1, 0, 1, 'k/sess-1' || $5, 'live')`,
+      [TENANT.orgId, TENANT.workspaceId, TENANT.userId, ORIGIN_ID, machine, generation]);
+    await db.query(
+      `INSERT INTO sessions.ingest_publication_generations (generation, prefix, org_id, workspace_id, user_id, origin_id, source, session_id,
+         fence_epoch, reset_epoch, state, target_bucket, target_region, key_root)
+       VALUES ($5::uuid, 'p/' || $5, $1, $2, $3, $4, 'claude', 'sess-1', 1, 0, 'live', 'bucket', 'us-east-1', '96bulls')`,
+      [TENANT.orgId, TENANT.workspaceId, TENANT.userId, ORIGIN_ID, generation]);
+    // A user reset moves the reset epoch past the head's, so ingest_publication_retire_reset retires it. The other
+    // machine's copy keeps the directory row live (no tombstone trigger): before 044050 the trigger's directory
+    // UPDATE cleared short_summary alone and broke session_directory_short_summary_provenance (23514).
+    await db.query("INSERT INTO sessions.upload_resets (org_id, workspace_id, user_id, request_id) VALUES ($1, $2, $3, 'r-1')",
+      [TENANT.orgId, TENANT.workspaceId, TENANT.userId]);
+    expect((await db.query("SELECT state FROM sessions.ingest_publication_heads")).rows).toEqual([{ state: "retired" }]);
+    expect((await db.query("SELECT state FROM sessions.ingest_publication_generations")).rows).toEqual([{ state: "retired" }]);
+    expect((await row(db, "sess-1", "srv_other-machine")).deleted_at).toBeNull();
+    expect((await db.query(
+      "SELECT deleted_at, short_summary, short_summary_scrub_ruleset, short_summary_scrub_version, short_summary_source, short_summary_generated_at FROM sessions.session_directory WHERE session_id = 'sess-1'",
+    )).rows).toEqual([{ deleted_at: null, short_summary: null, short_summary_scrub_ruleset: null, short_summary_scrub_version: null, short_summary_source: null, short_summary_generated_at: null }]);
+  });
+
+  // 044070: the erased summary must also leave search_text, which the tenant search path matches (ILIKE). A row that
+  // keeps another live pointer is not tombstoned, so the tombstone trigger does not empty search_text for it.
+  const PHRASE = "zephyrquokka ledger";
+  const TITLE = "Refactor billing gateway";
+  const searchable = async (db: PGlite) => {
+    await db.query(
+      `UPDATE sessions.session_directory SET title = $1, agent_name = 'agent-a', project_id = 'proj-a', git_repo = 'org/repo',
+         git_branch = 'main', model = 'model-a', short_summary = 'notes about the ' || $2 || ' cleanup', short_summary_scrub_ruleset = 'relayhistory-scrub',
+         short_summary_scrub_version = 1, short_summary_source = 'bob-costas/extractive/v1', short_summary_generated_at = now()
+       WHERE session_id = 'sess-1'`, [TITLE, PHRASE]);
+    await db.query(
+      `UPDATE sessions.session_directory SET search_text = sessions.session_directory_search_text(title, task_title, agent_name, project_id,
+         git_repo, git_branch, model, short_summary) WHERE session_id = 'sess-1'`);
+    await db.query("INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+      ["https://issuer.test/session-directory", SESSION_DIRECTORY_SEARCH_RPC.audience]);
+  };
+  /** The tenant search path (sessions.search_session_directory with p_query) as the Worker role sees it. */
+  const search = async (db: PGlite, query: string) => {
+    const iat = Math.floor(Date.now() / 1000);
+    await db.query("SELECT set_config('request.jwt.claims', $1, false)", [JSON.stringify({
+      role: SESSION_DIRECTORY_SEARCH_RPC.workerRole, iss: "https://issuer.test/session-directory", aud: SESSION_DIRECTORY_SEARCH_RPC.audience,
+      iat, exp: iat + 60, app_metadata: { org_id: TENANT.orgId, workspace_ids: [TENANT.workspaceId] } })]);
+    await db.exec(`SET ROLE ${SESSION_DIRECTORY_SEARCH_RPC.workerRole}`);
+    try {
+      return (await db.query<{ session_id: string }>("SELECT session_id FROM sessions.search_session_directory(p_workspace_id => $1, p_query => $2)",
+        [TENANT.workspaceId, query])).rows.map((r) => r.session_id);
+    } finally {
+      await db.exec("RESET ROLE");
+      await db.query("SELECT set_config('request.jwt.claims', '', false)");
+    }
+  };
+  /** After the clear: no summary, no provenance, not tombstoned, search_text is the metadata-only document. */
+  const expectMetadataOnly = async (db: PGlite) => {
+    expect((await db.query(
+      `SELECT deleted_at, short_summary, short_summary_scrub_ruleset, short_summary_scrub_version, short_summary_source, short_summary_generated_at,
+         search_text = sessions.session_directory_search_text(title, task_title, agent_name, project_id, git_repo, git_branch, model, NULL) AS rebuilt,
+         strpos(search_text, $1) = 0 AS phrase_gone, strpos(search_text, $2) > 0 AS title_kept
+       FROM sessions.session_directory WHERE session_id = 'sess-1'`, [PHRASE, TITLE])).rows).toEqual([{
+      deleted_at: null, short_summary: null, short_summary_scrub_ruleset: null, short_summary_scrub_version: null, short_summary_source: null,
+      short_summary_generated_at: null, rebuilt: true, phrase_gone: true, title_kept: true }]);
+    expect(await search(db, PHRASE)).toEqual([]);
+    expect(await search(db, "zephyrquokka")).toEqual([]);
+    expect(await search(db, TITLE)).toEqual(["sess-1"]);
+  };
+
+  test("the erase rebuilds search_text without the summary: an erased summary is no longer searchable on a live row (044070)", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db } = await start(rc, on);
+    await pointer(db, "sess-1", machine);
+    await pointer(db, "sess-1", "srv_other-machine");
+    await directory(db, "sess-1");
+    await searchable(db);
+    expect(await search(db, PHRASE)).toEqual(["sess-1"]);
+    expect(await search(db, TITLE)).toEqual(["sess-1"]);
+    // Another machine's copy is still live, so the row stays untombstoned: before 044070 the summary stayed in
+    // search_text and the phrase still matched.
+    const res = await post(url(SELECTION), await selection());
+    expect(res.status).toBe(200);
+    expect((await row(db, "sess-1", machine)).deleted_at).not.toBeNull();
+    expect((await row(db, "sess-1", "srv_other-machine")).deleted_at).toBeNull();
+    await expectMetadataOnly(db);
+  });
+
+  test("the managed-head retire trigger rebuilds search_text without the summary: no longer searchable on a live row (044070)", async () => {
+    const { db } = await database();
+    await pointer(db, "sess-1", machine);
+    await pointer(db, "sess-1", "srv_other-machine");
+    await directory(db, "sess-1");
+    await searchable(db);
+    expect(await search(db, PHRASE)).toEqual(["sess-1"]);
+    const generation = "7a2d3b5f-4c6e-4d8f-9a01-b2c3d4e5f607";
+    await db.query(
+      `INSERT INTO sessions.ingest_publication_heads (org_id, workspace_id, user_id, origin_id, source, session_id, physical_workspace,
+         physical_source, physical_session, machine_id, generation, fence_epoch, reset_epoch, pointer_revision, current_key, state)
+       VALUES ($1, $2, $3, $4, 'claude', 'sess-1', $2, 'claude', 'sess-1', $5, $6, 1, 0, 1, 'k/sess-1' || $5, 'live')`,
+      [TENANT.orgId, TENANT.workspaceId, TENANT.userId, ORIGIN_ID, machine, generation]);
+    await db.query(
+      `INSERT INTO sessions.ingest_publication_generations (generation, prefix, org_id, workspace_id, user_id, origin_id, source, session_id,
+         fence_epoch, reset_epoch, state, target_bucket, target_region, key_root)
+       VALUES ($5::uuid, 'p/' || $5, $1, $2, $3, $4, 'claude', 'sess-1', 1, 0, 'live', 'bucket', 'us-east-1', '96bulls')`,
+      [TENANT.orgId, TENANT.workspaceId, TENANT.userId, ORIGIN_ID, generation]);
+    // A user reset retires the head (ingest_publication_retire_reset); the other machine's copy keeps the row live.
+    await db.query("INSERT INTO sessions.upload_resets (org_id, workspace_id, user_id, request_id) VALUES ($1, $2, $3, 'r-1')",
+      [TENANT.orgId, TENANT.workspaceId, TENANT.userId]);
+    expect((await db.query("SELECT state FROM sessions.ingest_publication_heads")).rows).toEqual([{ state: "retired" }]);
+    expect((await row(db, "sess-1", machine)).deleted_at).not.toBeNull();
+    expect((await row(db, "sess-1", "srv_other-machine")).deleted_at).toBeNull();
+    await expectMetadataOnly(db);
+  });
+
+  test("one selection erases every origin of the caller's session, relay turns included; another user's copy stays", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db } = await start(rc, on);
+    const secondOrigin = liveMachineId(TENANT.workspaceId, "origin-2", TENANT.userId);
+    const turns = liveMachineId(TENANT.workspaceId, TURN_ORIGIN_ID, TENANT.userId);
+    const otherUser = liveMachineId(TENANT.workspaceId, "origin-2", "user-2");
+    for (const m of [machine, secondOrigin, turns, otherUser]) await pointer(db, "sess-1", m);
+    await db.query(
+      `INSERT INTO sessions.ingest_session_ownership (org_id, workspace_id, user_id, origin_id, source, session_id)
+       VALUES ($1, $2, $3, 'origin-2', 'claude', 'sess-1'), ($1, $2, 'user-2', 'origin-2', 'claude', 'sess-1')`,
+      [TENANT.orgId, TENANT.workspaceId, TENANT.userId],
+    );
+    expect((await post(url(SELECTION), await selection())).status).toBe(200);
+    for (const m of [machine, secondOrigin, turns]) expect((await row(db, "sess-1", m)).deleted_at).not.toBeNull();
+    expect((await row(db, "sess-1", otherUser)).deleted_at).toBeNull();
+    const fences = await db.query<{ user_id: string; origin_id: string }>("SELECT user_id, origin_id FROM sessions.upload_deletions WHERE session_id = 'sess-1' ORDER BY origin_id COLLATE \"C\"");
+    expect(fences.rows).toEqual(["origin-1", "origin-2", TURN_ORIGIN_ID].sort().map((origin_id) => ({ user_id: TENANT.userId, origin_id })));
+  });
+
+  test("a selection naming a session the caller has no pointer for changes no directory row", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db } = await start(rc, on);
+    await pointer(db, "sess-1", "srv_someone-else");
+    await directory(db, "sess-1");
+    expect((await post(url(SELECTION), await selection())).status).toBe(200);
+    expect((await row(db, "sess-1", "srv_someone-else")).deleted_at).toBeNull();
+    const d = await db.query<{ deleted_at: unknown }>("SELECT deleted_at FROM sessions.session_directory WHERE session_id = 'sess-1'");
+    expect(d.rows[0]!.deleted_at).toBeNull();
+  });
+
+  test("a stale retry of the original batch replays its receipt and writes nothing new", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db, store } = await start(rc, on);
+    const first = await post(url("/v1/delivery/batches"), await deliveryBody());
+    const receipt = ((await first.json()) as { receiptId: string }).receiptId;
+    await pointer(db, "sess-1", machine);
+    expect((await post(url(SELECTION), await selection())).status).toBe(200);
+    const keys = await chunkKeys(store);
+    const retry = await post(url("/v1/delivery/batches"), await deliveryBody());
+    expect([retry.status, ((await retry.json()) as { receiptId: string }).receiptId]).toEqual([200, receipt]);
+    expect(await chunkKeys(store)).toEqual(keys);
+    expect((await row(db, "sess-1", machine)).deleted_at).not.toBeNull();
+  });
+
+  test("enabled:true is refused 400 and the fence stays; bad account and scope are refused", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db } = await start(rc, on);
+    await pointer(db, "sess-1", machine);
+    expect((await post(url(SELECTION), await selection())).status).toBe(200);
+    const again = await post(url(SELECTION), await selection({ enabled: true }));
+    expect([again.status, await code(again)]).toEqual([400, "unsupported_by_backend"]);
+    expect((await db.query("SELECT 1 FROM sessions.upload_deletions WHERE session_id = 'sess-1' AND origin_id = $1", [ORIGIN_ID])).rows).toHaveLength(1);
+    const wrongAccount = await post(url(SELECTION), await selection({ account_id: "acct_someone_else" }));
+    expect(wrongAccount.status).toBe(403);
+    const unsigned = await fetch(url(SELECTION), { method: "POST", body: await selection(), headers: { "content-type": "application/json" } });
+    expect([unsigned.status, await code(unsigned)]).toEqual([401, "missing_authorization"]);
+  });
+
+  test("a token without rth:sync is refused before any fence is written", async () => {
+    const rc = await relaycontrol(() => active(["rth:read"]));
+    const { url, db } = await start(rc, on);
+    await pointer(db, "sess-1", machine);
+    const res = await post(url(SELECTION), await selection());
+    expect([res.status, await code(res)]).toEqual([403, "forbidden"]);
+    expect((await db.query("SELECT 1 FROM sessions.upload_deletions")).rows).toHaveLength(0);
+    expect((await row(db, "sess-1", machine)).deleted_at).toBeNull();
   });
 });
 
@@ -306,6 +696,13 @@ describe("dormant and configuration", () => {
     const res = await fetch(url("/v1/delivery/batches"), { method: "POST", body: "{}" });
     expect([res.status, await code(res)]).toEqual([503, "not_configured"]);
     expect(built).toBe(false);
+  });
+
+  test("dormant: token refresh is 503 not_configured, so a Desktop never reads it as a refused sign-in", async () => {
+    const service = await startSelfhostIngestService({}, { host: "127.0.0.1", port: 0 });
+    cleanups.push(() => service.close());
+    const res = await fetch(`http://127.0.0.1:${service.port}/v1/auth/token/refresh`, { method: "POST", body: "{}" });
+    expect([res.status, await code(res)]).toEqual([503, "not_configured"]);
   });
 
   test("strict flag, required settings, hosted-only settings refused; errors never echo values", () => {

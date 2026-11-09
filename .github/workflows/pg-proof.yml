@@ -9,6 +9,11 @@ on:
     branches: [main]
 permissions:
   contents: read
+concurrency:
+  # One live run per pull request: a new push cancels the previous head's run.
+  # Pushes to main (and any non-PR event) are grouped by sha and never cancelled.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   real-postgres:
     name: real PostgreSQL ${{ matrix.pg }}
@@ -170,7 +175,7 @@ jobs:
           EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           jq -e --arg head "$EXPECTED" --argjson major ${{ matrix.pg }} \
-            '.head == $head and .tracked_tree_clean == true and .pg_major == $major and .bootstrap_superuser == "rdsadmin" and .failed == 0 and .passed >= 21 and (.cases | all(.pass))' rds-profile-proof.json
+            '.head == $head and .tracked_tree_clean == true and .pg_major == $major and .bootstrap_superuser == "rdsadmin" and .failed == 0 and .passed >= 26 and (.cases | all(.pass))' rds-profile-proof.json
           jq -r '"\(.passed) passed, \(.failed) failed on PostgreSQL \(.pg_version) (rds emulation) at \(.head)"' rds-profile-proof.json | tee -a "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: always()
@@ -183,7 +188,7 @@ jobs:
   brief-postgres:
     name: brief publication PostgreSQL ${{ matrix.pg }}
     runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -225,6 +230,26 @@ jobs:
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
         run: bun test --timeout 300000 src/session-ingest/__tests__/claim-clock-lock.postgres.test.ts
+      - name: Prove the self-host erase serializes with a concurrent claim on the fence lock (044010)
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: |
+          # pg-proof checks out the PR head; heads predating this step lack the test. Remove once no open PR predates it.
+          if [ ! -f src/session-ingest/__tests__/selfhost-erase-lock.postgres.test.ts ]; then
+            echo "::warning title=pg-proof::selfhost-erase-lock.postgres.test.ts absent at this head; forward-merge main to run the erase lock proof"
+            exit 0
+          fi
+          bun test --timeout 300000 src/session-ingest/__tests__/selfhost-erase-lock.postgres.test.ts
+      - name: Prove one session's buffered stages answer under 1 s on a 167k-batch backlog via the records GIN (044040)
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: |
+          # pg-proof checks out the PR head; heads predating 044040 lack the test. Remove once no open PR predates it.
+          if [ ! -f src/session-read-api/__tests__/buffered-stages-latency.postgres.test.ts ]; then
+            echo "::warning title=pg-proof::buffered-stages-latency.postgres.test.ts absent at this head; forward-merge main to run the 044040 latency proof"
+            exit 0
+          fi
+          bun test --timeout 900000 src/session-read-api/__tests__/buffered-stages-latency.postgres.test.ts
       - name: Prove the acquisition installer login refuses a superuser SET SESSION AUTHORIZATION (pg_stat_activity usename)
         env:
           ACQUISITION_LOGIN_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
@@ -263,7 +288,7 @@ jobs:
         run: docker rm -f "$PG_LOCK_NAME" || true
   acquisition-owner-postgres:
     name: acquisition owner contract PostgreSQL ${{ matrix.pg }}
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -308,7 +333,7 @@ jobs:
     # frontier-plan capture on real PostgreSQL. Both describe.skipIf() without their
     # connection env, so each step also fails when anything was skipped.
     name: ingest publication and frontier PostgreSQL ${{ matrix.pg }}
-    runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -420,6 +445,91 @@ jobs:
             frontier-plan-pg${{ matrix.pg }}.log
           if-no-files-found: ignore
 
+  consumer-writer:
+    name: self-host pipeline consumer writer proof (PG ${{ matrix.pg }})
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["15", "16", "17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          # Disposable container: trust auth means no credential exists anywhere.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record the commit under test
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "commit under test: $actual (expected $EXPECTED), PostgreSQL ${{ matrix.pg }}" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$actual" = "$EXPECTED"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Create the CREATEROLE owner database (production-shaped)
+        env:
+          PG_SUPER_URL: postgres://postgres@127.0.0.1:5432/postgres
+          PG_SUPER_DB_URL: postgres://postgres@127.0.0.1:5432/consumer336
+          PG_HOOP_URL: postgres://hoop@127.0.0.1:5432/consumer336
+        run: |
+          bun - <<'BUN'
+            import pg from "pg";
+            import { readFileSync } from "node:fs";
+            const admin = new pg.Pool({ connectionString: process.env.PG_SUPER_URL });
+            await admin.query("CREATE ROLE hoop LOGIN CREATEROLE");
+            await admin.query("CREATE DATABASE consumer336 OWNER hoop");
+            await admin.end();
+            // Base roles once, as the superuser: the shim service_role
+            // carries BYPASSRLS, which the hoop owner cannot create (and on
+            // PG16+ hoop cannot create the worker/verifier/ingest/read-api
+            // roles either). The suite skips these when its sentinel roles
+            // already exist.
+            const sup = new pg.Pool({ connectionString: process.env.PG_SUPER_DB_URL });
+            const hoop = new pg.Pool({ connectionString: process.env.PG_HOOP_URL });
+            const { SESSION_BOOTSTRAP_FILES } = await import("./src/hoopdb/session-bootstrap-chain.ts");
+            const sql = (p) => readFileSync(p, "utf8").split("\n").filter((l) => !l.startsWith("\\")).join("\n");
+            await sup.query(sql("supabase/tests/supabase_shim.sql"));
+            // Single-sourced bootstrap chain: the grant migration FAILs
+            // without a grantee (migrations never create roles), so the T0
+            // setup provisions it exactly like migrate's bootstrap step. hoop
+            // provisions the consumer bare role itself: it must own the role
+            // (the rollback test drops it), and the bootstrap guard pins the
+            // invoker edge.
+            for (const f of SESSION_BOOTSTRAP_FILES)
+              await (f.endsWith("session_consumer_roles.sql") ? hoop : sup).query(sql(f));
+            await sup.query("CREATE EXTENSION IF NOT EXISTS pg_trgm");
+            await sup.query("CREATE EXTENSION IF NOT EXISTS btree_gin");
+            await sup.end();
+            await hoop.end();
+          BUN
+      - name: Prove the owner bootstrap, dedicated role, and writer surface on real Postgres
+        env:
+          # The native suite self-provisions the migrated schema when it is
+          # absent, then bootstraps and proves the role exactly as written.
+          # Trust auth means neither URL carries a credential. The bootstrap
+          # runs as the CREATEROLE non-superuser owner, exactly like the
+          # operator model (a superuser creator gets no membership edge to
+          # pin, so the suite would prove less as postgres).
+          SESSION_PIPELINE_TEST_OPERATOR_PG_URL: postgres://postgres@127.0.0.1:5432/consumer336
+          SESSION_PIPELINE_TEST_PG_URL: postgres://hoop@127.0.0.1:5432/consumer336
+          SESSION_PIPELINE_TEST_WRITER_PG_URL: postgres://search_consumer_runtime@127.0.0.1:5432/consumer336
+        run: bun test --timeout 300000 src/session-pipeline/__tests__/session-consumer-writer.postgres.test.ts
   consumer-lease:
     name: canonical consumer lease proof (PG ${{ matrix.pg }})
     runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
@@ -504,3 +614,30 @@ jobs:
             exit 0
           fi
           bun test --timeout 300000 src/session-pipeline/__tests__/buffered-feed-login.postgres.test.ts
+
+  consumer-credential-probe:
+    name: consumer credential probe (PG 17)
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Prove exact-helper non-superuser bootstrap and causal refusals
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture=$(docker run --detach --memory=1g --cpus=1 -p 127.0.0.1::5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:17 postgres -c cluster_name=consumer-credential-proof)
+          trap 'docker rm -fv "$fixture" >/dev/null' EXIT
+          for attempt in $(seq 1 60); do
+            if docker exec "$fixture" pg_isready -U postgres; then break; fi
+            sleep 1
+          done
+          port=$(docker port "$fixture" 5432/tcp | awk -F: '{print $NF}')
+          CONSUMER_CREDENTIAL_PROBE_NATIVE=true CONSUMER_CREDENTIAL_PROBE_PG_PORT="$port" \
+            bun test --timeout 120000 src/session-pipeline/__tests__/consumer-credential-probe.postgres.test.ts

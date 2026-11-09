@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { canonicalProjectEventStore } from "../store.ts";
 import { publishCanonicalProjectEvents } from "../publisher.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 setDefaultTimeout(60_000);
 const root = join(import.meta.dir, "../../.."), generation = "a".repeat(64);
 const org = "c4fae7b9-43a9-44e8-94d5-455aa579d67b", ws = "1220c1dc-0ce5-45fe-8b67-e7bb57a2db63", user = "44444444-4444-4444-4444-444444444444";
@@ -19,7 +20,7 @@ beforeAll(async () => {
   db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   const read = (p: string) => readFileSync(join(root, p), "utf8");
   await db.exec(read("supabase/tests/supabase_shim.sql"));
-  for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await db.exec(read("supabase/bootstrap/" + f + ".sql"));
+  for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
   for (const f of readdirSync(join(root, "supabase/migrations")).filter(f => f.endsWith(".sql")).sort()) await db.exec(read("supabase/migrations/" + f));
   await db.exec(read("supabase/bootstrap/canonical_project_events_verify.sql"));
   await db.exec(`CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);

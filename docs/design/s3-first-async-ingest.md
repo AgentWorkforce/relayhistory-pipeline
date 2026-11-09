@@ -4,6 +4,8 @@ Status: implemented behind `INGEST_ASYNC_ADMISSION` (default `off`). Merging the
 nothing in production. Turning it on also needs the stack (PR #367), relayhistory and queue
 retention steps listed under "Rollout".
 
+Self-host (no queue, no Supabase, canonical ledger): [`docs/selfhost-async-admission.md`](../selfhost-async-admission.md).
+
 Code:
 - `src/session-ingest/async-admission.ts`: request path, inbox, privacy journal, outcomes.
 - `src/session-ingest/admission-consumer.ts`: the queue consumer.
@@ -350,6 +352,23 @@ buffered acceptance and the `INGEST_ADMISSION` binding. Without the binding the 
 | off | no | no | no (messages wait, 300 s) |
 | on | yes, for signed opt-ins | yes | yes |
 | drain | no (synchronous path) | yes | yes |
+
+Flag `INGEST_SYNC_ADMISSION_FROZEN_RECEIPT`: `off` (default) | `on` (any other value refuses at
+startup). A request whose signed identity carries `admission: queued-v1` still takes the
+synchronous path when async admission is `off` or `drain`, or when its pre-body journal witness
+failed. Under `frozen-supabase` custody that path builds the frozen witness and claims, but never
+reads the frozen legacy (pre-cutover) receipt, while relayhistory skips its own pre-forward
+legacy-receipt read for an opted-in request. With the flag `on`, such a request first runs the
+consumer's read (`frozenReceipt`): a stored receipt with the same batch digest answers 200 with
+that receipt (`legacy_replay`; a stored receipt without a string `receiptId` gets the prepared receipt's id) and the header `x-relay-admission: {"version":1,"state":"legacy-replay"}`, one with another digest answers the claim's own 409
+`delivery_conflict` (`batch_id`), both with no witness, claim, delivery or custody ACK header (the 409 carries no `x-relay-admission`
+header); no stored receipt continues the unchanged synchronous path (custody ACK header, no
+`x-relay-admission` header); a ledger without `frozenReceipt` is 503
+`custody_source_unavailable`. Callers without the opt-in are unaffected. **Deploy order:** this
+flag must be `on` in the ingest Worker before relayhistory-cloud opts any org into queued-v1
+admission. The Cloudflare stack renders it from the stack input
+`sessionIngest.syncAdmissionFrozenReceipt: "on"` (buffered acceptance with `custodySource:
+"frozen-supabase"` only; omit for `off`, which renders no var).
 
 Steps:
 1. **IAM: none.** The srv-writer resources are unchanged. `96bulls/*/v1/ws=*/m=srv_*` matches

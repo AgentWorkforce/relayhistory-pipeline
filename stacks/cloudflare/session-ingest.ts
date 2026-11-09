@@ -121,6 +121,12 @@ export interface SessionIngestInputs {
   privacyAuthority?: "supabase";
   /** Exact final composed migrator generation(), required only for buffered acceptance. */
   expectedGeneration?: string;
+  /**
+   * Bounded generation overlap (docs/design/zero-503-schema-windows.md), buffered only: ONE other explicit
+   * hex64 generation the Worker may also offer (INGEST_ACCEPT_GENERATIONS = expectedGeneration,overlapGeneration).
+   * Set it to the next generation before a schema window, and drop it after the rebind. Omit for none.
+   */
+  overlapGeneration?: string;
   /** The Hyperdrive config the lead created (Supabase transaction pooler, bulls96_session_ingest). */
   hyperdriveId: string;
   /** The account Secrets Store holding the srv-writer access key. */
@@ -143,6 +149,12 @@ export interface SessionIngestInputs {
    * queue + DLQ + consumer, the INGEST_ADMISSION binding and the var. Omit for none (the default).
    */
   asyncAdmission?: "on" | "drain";
+  /**
+   * INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: the frozen legacy-receipt read before a synchronous claim for a
+   * queued-v1 caller. Buffered acceptance with custodySource frozen-supabase only. Present: the var only
+   * (no queue, no binding). Omit for off (the default; vars byte-identical to before).
+   */
+  syncAdmissionFrozenReceipt?: "on";
 }
 
 const HEX32 = /^[0-9a-f]{32}$/;
@@ -158,7 +170,7 @@ const AUTHORITY_ENV_KEYS = [
   "INGEST_AUTHORITY_EXPECT_AUTH_EPOCH",
   "INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY",
 ] as const;
-const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission"];
+const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt"];
 
 function validAuthorityKeyRoot(value: unknown): value is string {
   if (typeof value !== "string" || !/^96bulls\/[A-Za-z0-9][A-Za-z0-9_/-]{0,151}$/.test(value) || value.endsWith("/")) return false;
@@ -218,6 +230,14 @@ function bufferedGeneration(p: { acceptanceMode?: unknown; expectedGeneration?: 
   return undefined;
 }
 
+/** The one extra generation: explicit hex64, different from expectedGeneration, buffered mode only. */
+function overlapGeneration(p: { acceptanceMode?: unknown; expectedGeneration?: unknown; overlapGeneration?: unknown }, refuse: (why: string) => never): string | undefined {
+  if (p.overlapGeneration === undefined) return undefined;
+  if (p.acceptanceMode !== "buffered" || typeof p.overlapGeneration !== "string" || !HEX64.test(p.overlapGeneration) || p.overlapGeneration === p.expectedGeneration)
+    refuse("sessionIngest.overlapGeneration must be one other 64-character lowercase hex generation, in buffered mode only (omit for none)");
+  return p.overlapGeneration as string;
+}
+
 export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => never): asserts p is SessionIngestInputs {
   if (p === null || typeof p !== "object" || Array.isArray(p) || Object.getPrototypeOf(p) !== Object.prototype) refuse("sessionIngest inputs must be a plain object");
   const v = p as Record<string, unknown>;
@@ -235,6 +255,7 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
   if (v.custodySource !== undefined && (!(v.custodySource === "shadow" || v.custodySource === "frozen-supabase") || v.acceptanceMode !== "buffered")) refuse("sessionIngest.custodySource must be shadow or frozen-supabase, in buffered mode only (omit for relayhistory)");
   if (v.privacyAuthority !== undefined && (v.privacyAuthority !== "supabase" || v.custodySource !== "frozen-supabase")) refuse("sessionIngest.privacyAuthority must be supabase, with custodySource frozen-supabase only (omit for neon)");
   bufferedGeneration(v, refuse);
+  overlapGeneration(v, refuse);
   int("inlineMaxSessions", v.acceptanceMode === "buffered" ? 0 : 1, 48);
   if (v.acceptanceMode === "buffered" && (v.inlineMaxSessions !== 0 || (v.replicaMode ?? "off") !== "off")) refuse("buffered acceptance requires explicit inlineMaxSessions 0 and replicaMode off");
   if (v.maxPerUser !== undefined && v.maxPerOrg !== undefined && (v.maxPerUser as number) > (v.maxPerOrg as number)) refuse("sessionIngest.maxPerUser cannot exceed maxPerOrg");
@@ -246,6 +267,8 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
   inboxAuthority(v.authority, refuse);
   if (v.asyncAdmission !== undefined && (!(v.asyncAdmission === "on" || v.asyncAdmission === "drain") || v.acceptanceMode !== "buffered"))
     refuse('sessionIngest.asyncAdmission must be "on" or "drain", in buffered mode only (omit for none)');
+  if (v.syncAdmissionFrozenReceipt !== undefined && (v.syncAdmissionFrozenReceipt !== "on" || v.acceptanceMode !== "buffered" || v.custodySource !== "frozen-supabase"))
+    refuse('sessionIngest.syncAdmissionFrozenReceipt must be "on", in buffered mode with custodySource frozen-supabase only (omit for off)');
 }
 
 /** A producer binding to a queue this stack does not own (no state row: never created, changed or deleted here). */
@@ -271,10 +294,12 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     INGEST_INLINE_MAX_SESSIONS: String(p.inlineMaxSessions ?? 40),
     INGEST_REPLICA_MODE: p.replicaMode ?? "off",
     ...(p.acceptanceMode === "buffered" ? { INGEST_ACCEPTANCE_MODE: "buffered", INGEST_EXPECT_GENERATION: expectedGeneration! } : {}),
+    ...(overlapGeneration(p, (why) => { throw new Error(why); }) ? { INGEST_ACCEPT_GENERATIONS: `${expectedGeneration},${p.overlapGeneration}` } : {}),
     ...(p.custodySource ? { INGEST_CUSTODY_SOURCE: p.custodySource } : {}),
     ...(p.privacyAuthority ? { INGEST_PRIVACY_AUTHORITY: p.privacyAuthority } : {}),
     ...inboxAuthorityVars(p.authority, (why) => { throw new Error(why); }),
     ...(p.asyncAdmission ? { INGEST_ASYNC_ADMISSION: p.asyncAdmission } : {}),
+    ...(p.syncAdmissionFrozenReceipt === "on" ? { INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: "on" } : {}),
   };
 }
 

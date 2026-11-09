@@ -29,6 +29,155 @@ export interface Sentinel {
   sql: string;
 }
 
+/** An index that an unledgered step may find already built out of band, and adopt. */
+export interface AdoptableIndex {
+  /** Index name, in the sessions schema. */
+  name: string;
+  /** The table it must be on, schema-qualified. */
+  table: string;
+  /** Exactly what pg_get_indexdef must return for it. */
+  def: string;
+}
+
+const CLAIM_BOOTSTRAP_ORG_INDEXES_STEP =
+  "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
+const BUFFERED_STAGES_SESSION_FIRST_STEP =
+  "upstream:20261105044040_buffered_stages_session_first.sql";
+const orgIndex = (table: string, columns: string): AdoptableIndex => ({
+  name: `${table}_org_id_idx`,
+  table: `sessions.${table}`,
+  def: `CREATE INDEX ${table}_org_id_idx ON sessions.${table} USING btree (${columns})`,
+});
+
+/**
+ * The reviewed allowance for indexes built out of band before the migration that names
+ * them is ledgered (an operator CREATE INDEX CONCURRENTLY on a large production table:
+ * the migrator is transactional and cannot build concurrently). For the step listed here,
+ * and only for these names, sequencePreflight accepts a present-but-unledgered index when
+ * it is the only index of that name, sits in sessions on exactly that table, is valid,
+ * ready and live, and its pg_get_indexdef is exactly `def`. Anything else of that name is
+ * still unledgered_schema. The step's migration adopts the same definitions (it skips an
+ * exact valid index without locking its table, creates a missing one, and raises
+ * otherwise); a test keeps the two byte-identical.
+ *
+ * Claim-bootstrap org_id probes, 20261105044020 (packet:
+ * docs/packets/claim-bootstrap-org-index-packet-20261108.md), in the operator's build order.
+ * Buffered stages session-first records GIN, 20261105044040 (packet:
+ * docs/handoffs/buffered-stages-session-first-044040/operator-packet.md).
+ */
+export const ADOPTABLE_INDEXES: Readonly<Record<string, readonly AdoptableIndex[]>> = {
+  [CLAIM_BOOTSTRAP_ORG_INDEXES_STEP]: [
+    orgIndex("ingest_history_mask_pages", "org_id"),
+    orgIndex("ingest_history_plans", "org_id, workspace_id, user_id"),
+    orgIndex("ingest_seed_captures", "org_id"),
+    orgIndex("ingest_publication_attempts", "org_id, workspace_id, user_id"),
+    orgIndex("ingest_publication_generations", "org_id, workspace_id, user_id"),
+    orgIndex("ingest_stage_intents", "org_id, workspace_id, user_id"),
+    orgIndex("ingest_custody_records", "org_id, workspace_id, user_id"),
+    orgIndex("ingest_lazy_native_slots", "org_id"),
+  ],
+  [BUFFERED_STAGES_SESSION_FIRST_STEP]: [
+    {
+      name: "ingest_claim_attempts_records_gin_idx",
+      table: "sessions.ingest_claim_attempts",
+      def: "CREATE INDEX ingest_claim_attempts_records_gin_idx ON sessions.ingest_claim_attempts USING gin (records jsonb_path_ops)",
+    },
+  ],
+};
+
+/** How an ADOPTABLE_INDEXES step is prebuilt, and what else its CREATE inventory names. */
+export interface AdoptableIndexStep {
+  /** The out-of-band CONCURRENTLY packet the index_prebuild_required refusal names. */
+  packet: string;
+  /**
+   * Functions the step only REPLACES (CREATE OR REPLACE of a function an earlier, ledgered step
+   * created). They are the only non-index inventory an adoptable step may have; their existence is
+   * not evidence that the step ran, so the step's sentinel must detect the replaced bodies instead.
+   * A step that replaces anything never has its sentinel overridden by index adoptability.
+   */
+  replaces: readonly string[];
+  /**
+   * Exact-body adoption, for replaced functions only. When the body sentinel fires, the step is still
+   * treated as not applied (so it runs normally and writes its ledger row) if, and only if, EVERY entry
+   * here is live with prosrc byte-identical to the step file's own `AS $tag$ ... $tag$` body (parsed from
+   * the file at guard time), plpgsql, SECURITY DEFINER, STABLE, proconfig exactly [config], and owned by
+   * the migrating role. Anything else keeps the unledgered_schema refusal. The step's CREATE OR REPLACE
+   * re-applies the file's bytes either way; the ACL (which CREATE OR REPLACE keeps) is left to the
+   * run-time exact-manifest check.
+   */
+  exactBodies?: readonly ExactBody[];
+}
+
+/** One replaced function whose out-of-band, byte-identical apply an adoptable step accepts. */
+export interface ExactBody {
+  /** to_regprocedure() input, schema-qualified. */
+  fn: string;
+  /** The dollar-quote tag of the body in the step file (`AS $tag$`). */
+  tag: string;
+  /** The single expected proconfig entry. */
+  config: string;
+}
+
+/** One entry per ADOPTABLE_INDEXES step (a test keeps the key sets equal). */
+export const ADOPTABLE_INDEX_STEPS: Readonly<Record<string, AdoptableIndexStep>> = {
+  [CLAIM_BOOTSTRAP_ORG_INDEXES_STEP]: {
+    packet: "claim-bootstrap index packet docs/packets/claim-bootstrap-org-index-packet-20261108.md, PR #407",
+    replaces: [],
+  },
+  [BUFFERED_STAGES_SESSION_FIRST_STEP]: {
+    packet: "buffered-stages session-first operator packet docs/handoffs/buffered-stages-session-first-044040/operator-packet.md",
+    replaces: ["sessions.buffered_sessions_for", "sessions.buffered_session_stages_for"],
+    // Packet A's out-of-band apply is stages only (the sentinel needs both, so it never fires); a
+    // byte-identical apply of both is adopted here instead of refused.
+    exactBodies: [
+      {
+        fn: "sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)",
+        tag: "buffered_sessions",
+        config: "search_path=pg_catalog, sessions, pg_temp",
+      },
+      {
+        fn: "sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)",
+        tag: "buffered_stages",
+        config: "search_path=pg_catalog, sessions, pg_temp",
+      },
+    ],
+  },
+};
+
+/**
+ * Read-only catalog lookup (pg_class, pg_index, pg_constraint; no table lock): one row for the declared
+ * index ($1 name, $2 schema-qualified table, $3 def), with `state` and `table_exists`. `state` mirrors the
+ * step's own decision (20261105044020) and is one of:
+ *   absent     no relation of that name in sessions (the step creates it, or refuses on a populated table);
+ *   adoptable  the only index of that name anywhere, a plain index in sessions on exactly that table,
+ *              pg_get_indexdef exactly `def`, valid, ready and live, and backing no constraint;
+ *   not_ready  exact definition and table but INVALID or not ready: a failed CONCURRENTLY build, or one
+ *              still running (check pg_stat_progress_create_index before dropping anything);
+ *   mismatch   anything else of that name: another relkind, another table or definition, a second index
+ *              of that name in another schema, or an index backing a constraint (an EXCLUDE ... WITH =
+ *              btree index deparses exactly like the declared one; it is never adopted).
+ */
+export const ADOPTABLE_INDEX_STATE_SQL = `SELECT CASE
+    WHEN r.oid IS NULL THEN 'absent'
+    WHEN r.relkind <> 'i' THEN 'mismatch'
+    WHEN (SELECT count(*) FROM pg_class WHERE relname = $1 AND relkind IN ('i', 'I')) <> 1 THEN 'mismatch'
+    WHEN i.indexrelid IS NULL OR i.indrelid IS DISTINCT FROM to_regclass($2)
+      OR pg_get_indexdef(i.indexrelid) IS DISTINCT FROM $3::text THEN 'mismatch'
+    WHEN i.indisexclusion OR EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid = i.indexrelid) THEN 'mismatch'
+    WHEN NOT (i.indisvalid AND i.indisready AND i.indislive) THEN 'not_ready'
+    ELSE 'adoptable' END AS state,
+  to_regclass($2) IS NOT NULL AS table_exists
+  FROM (SELECT 1) one
+  LEFT JOIN pg_class r ON r.relnamespace = to_regnamespace('sessions') AND r.relname = $1
+  LEFT JOIN pg_index i ON i.indexrelid = r.oid`;
+
+/** All of a step's adoptable indexes are present, exact, valid and ready, and back no constraint. */
+const adoptableIndexesSentinel = (step: string) =>
+  `SELECT count(*) = ${ADOPTABLE_INDEXES[step]!.length} AS applied FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relnamespace = to_regnamespace('sessions') AND i.indisvalid AND i.indisready AND i.indislive
+      AND NOT i.indisexclusion AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid = i.indexrelid)
+      AND (c.relname, i.indrelid, pg_get_indexdef(i.indexrelid)) IN (${ADOPTABLE_INDEXES[step]!.map((x) => `('${x.name}', to_regclass('${x.table}'), '${x.def}')`).join(", ")})`;
+
 export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105041000_ingest_privacy_authority.sql": {
     evidence: "table sessions.ingest_privacy_authority + lazy-current adoption uses the EXACT source-table list (no prefix)",
@@ -44,6 +193,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_buffer_gc_claim(jsonb)') AND prosecdef AND prosrc LIKE '%96bulls:buffer-gc-user-v1%') AS applied",
   },
   "upstream:20261105043850_ingest_acquisition_owner.sql": { evidence: "table sessions.ingest_acquisition_owners", sql: relation("sessions.ingest_acquisition_owners") },
+  "upstream:20261105044100_session_brief_summary_read.sql": { evidence: "summary read RPC and recorded catalog title storage/invalidation", sql: "SELECT to_regprocedure('sessions.session_brief_summary_for(text,text,text)') IS NOT NULL AND to_regprocedure('sessions.session_directory_recorded_title_invalidate()') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass('sessions.session_directory') AND attname='recorded_catalog_title' AND NOT attisdropped) AND EXISTS(SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid=to_regclass('sessions.session_directory') AND tgname='session_directory_recorded_title_invalidate' AND NOT tgisinternal) AS applied" },
   "upstream:20261105043000_brief_titles.sql": { evidence: "column sessions.session_briefs.origin", sql: column("sessions.session_briefs", "origin") },
   "upstream:20261105043500_lazy_claim_clock_narrowing.sql": {
     evidence: "replacement: lazy claim reads the seat clock under KEY SHARE with one advisory lock per (org, workspace, origin)",
@@ -56,6 +206,15 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   },
   "upstream:20261105043860_buffered_search_gate.sql": { evidence: "function sessions.buffered_search_gate_for", sql: "SELECT to_regprocedure('sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)') IS NOT NULL AS applied" },
   "upstream:20261105043870_buffered_search_feed_cursor.sql": { evidence: "table sessions.buffered_search_feed_cursors", sql: relation("sessions.buffered_search_feed_cursors") },
+  "upstream:20261105043880_ingest_bookkeeping_cleanup.sql": {
+    evidence: "table sessions.ingest_bookkeeping_retired_claims + Babysitter register carries the retirement interlock",
+    sql: "SELECT to_regclass('sessions.ingest_bookkeeping_retired_claims') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_babysitter_retention_register(jsonb)') AND prosecdef AND prosrc LIKE '%ingest_bookkeeping_claim_lock_key%') AS applied",
+  },
+  "upstream:20261105044030_ingest_generation_overlap.sql": { evidence: "table sessions.ingest_generation_overlap_windows", sql: relation("sessions.ingest_generation_overlap_windows") },
+  "upstream:20261105043890_buffered_search_gate_retired_witness.sql": {
+    evidence: "replacement: buffered_search_gate_for hides claims with an ingest_bookkeeping_retired_claims tombstone (drop reason retired)",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)') AND prosecdef AND prosrc LIKE '%ingest_bookkeeping_retired_claims%') AS applied",
+  },
   "upstream:20261105024000_session_brief_documents.sql": { evidence: "table sessions.session_brief_document_outbox", sql: relation("sessions.session_brief_document_outbox") },
   "upstream:20261105025000_canonical_feature_journal.sql": { evidence: "table sessions.canonical_feature_journal", sql: relation("sessions.canonical_feature_journal") },
   "upstream:20261105026000_canonical_history_lineage.sql": { evidence: "table sessions.ingest_history_carriers", sql: relation("sessions.ingest_history_carriers") },
@@ -192,6 +351,49 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
       "DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)",
     sql: column("sessions.session_summaries", "object_key"),
   },
+  "upstream:20261105044090_claim_sessions_reader.sql": {
+    evidence: "ALTER + replacement: column sessions.ingest_claim_sessions_policy.read_enabled (the claim-sessions reader switch)",
+    sql: column("sessions.ingest_claim_sessions_policy", "read_enabled"),
+  },
+  "upstream:20261105044080_ingest_claim_sessions.sql": {
+    evidence: "table sessions.ingest_claim_sessions",
+    sql: relation("sessions.ingest_claim_sessions"),
+  },
+  "upstream:20261105044070_selfhost_erase_search_text_rebuild.sql": {
+    evidence: "replacement: ingest_selfhost_set_session_uploads and ingest_publication_retire_fence rebuild search_text without the summary when they clear it",
+    sql: "SELECT (SELECT count(*) FROM pg_proc WHERE oid IN(to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)'),to_regprocedure('sessions.ingest_publication_retire_fence()')) AND prosecdef AND prosrc LIKE '%session_directory_search_text(%')=2 AS applied",
+  },
+  "upstream:20261105044050_selfhost_erase_short_summary_provenance.sql": {
+    evidence: "replacement: ingest_selfhost_set_session_uploads and ingest_publication_retire_fence clear the short_summary provenance columns with short_summary",
+    sql: "SELECT (SELECT count(*) FROM pg_proc WHERE oid IN(to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)'),to_regprocedure('sessions.ingest_publication_retire_fence()')) AND prosecdef AND prosrc LIKE '%short_summary_generated_at=NULL%')=2 AS applied",
+  },
+  "upstream:20261105044010_selfhost_erase_lock_fences.sql": {
+    evidence: "replacement: ingest_selfhost_set_session_uploads takes the user's fence lock before reading ownership",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)') AND prosecdef AND prosrc LIKE '%ingest_lock_fences(v_org,v_ws,v_user)%') AS applied",
+  },
+  "upstream:20261105043910_selfhost_session_selection_erase.sql": {
+    evidence: "CREATE FUNCTION: sessions.ingest_selfhost_set_session_uploads(jsonb) (self-host per-session erase)",
+    sql: "SELECT to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)') IS NOT NULL AS applied",
+  },
+  "upstream:20261105043900_session_consumer_function_grants.sql": {
+    evidence: "twelve search_consumer_runtime EXECUTEs (composed writer path)",
+    sql: "SELECT count(*) = 12 AS applied FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE n.nspname = 'sessions' AND r.rolname = 'search_consumer_runtime' AND a.privilege_type = 'EXECUTE'",
+  },
+  "upstream:20261105044000_read_api_tokens.sql": {
+    evidence: "table sessions.read_api_tokens",
+    sql: relation("sessions.read_api_tokens"),
+  },
+  // Adoptable step: an unledgered "applied" here is accepted when every declared index is adoptable.
+  [CLAIM_BOOTSTRAP_ORG_INDEXES_STEP]: {
+    evidence: "the eight claim-bootstrap <table>_org_id_idx indexes, exact definition, valid and ready",
+    sql: adoptableIndexesSentinel(CLAIM_BOOTSTRAP_ORG_INDEXES_STEP),
+  },
+  // Adoptable index + replacement: the sentinel is the replaced bodies only (never overridden), so an
+  // operator-built GIN alone is adopted while an unledgered apply of the readers is still caught.
+  [BUFFERED_STAGES_SESSION_FIRST_STEP]: {
+    evidence: "replacement: buffered_sessions_for and buffered_session_stages_for count duplicate ordinals with a window (044040, session-first detail)",
+    sql: "SELECT count(*)=2 AS applied FROM pg_proc WHERE oid IN(to_regprocedure('sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)'),to_regprocedure('sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)')) AND prosecdef AND prosrc LIKE '%count(*) OVER (PARTITION BY rc.stage_token, rc.ord)%'",
+  },
 };
 
 /** The ALTER-only and replacement steps the CREATE inventory alone can't see. */
@@ -205,4 +407,5 @@ export const NON_CREATE_STEPS = [
   "upstream:20261102020000_session_brief_state.sql",
   "96bulls:0003_fanout_ledger.sql",
   "96bulls:0004_summary_pointers.sql",
+  "upstream:20261105043900_session_consumer_function_grants.sql",
 ] as const;

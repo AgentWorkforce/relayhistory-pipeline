@@ -35,7 +35,8 @@
     "migration:sequence-fence": "bun run src/migration/relayhistory-sequence-fence.ts",
     "migration:verify": "bun run src/migration/relayhistory-verify.ts",
     "migration:neon-s3-sync": "bun run src/migration/neon-s3-sync/main.ts",
-    "migration:neon-s3-erasure": "bun run src/migration/neon-s3-erasure/main.ts"
+    "migration:neon-s3-erasure": "bun run src/migration/neon-s3-erasure/main.ts",
+    "e2e:selfhost": "bun run e2e/selfhost/run.ts"
   },
   "dependencies": {
     "@96bulls/pipeline": "workspace:*",
@@ -56,7 +57,8 @@
     "alchemy": "2.0.0-beta.84",
     "effect": "4.0.7",
     "hono": "4.12.26",
-    "pg": "8.23.1"
+    "pg": "8.23.1",
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@electric-sql/pglite": "0.5.3",

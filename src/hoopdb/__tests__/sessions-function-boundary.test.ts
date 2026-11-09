@@ -15,7 +15,11 @@ import { lazySourceTables, originalBodies } from "../../../scripts/sessions-func
 import { lazyClaimClockNarrowing, originalBodies as originalClaimClockBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-claim-clock-narrowing.ts";
 import { lazyAckClockNoKeyUpdate, originalBodies as originalAckClockBodies } from "../../../scripts/sessions-function-boundary/lanes/lazy-ack-clock-no-key-update.ts";
 import { privacyAuthority, originalLazyBodies, originalMirrorBodies } from "../../../scripts/sessions-function-boundary/lanes/privacy-authority.ts";
+import { bufferedSearchGateRetiredWitness, originalGateBody } from "../../../scripts/sessions-function-boundary/lanes/buffered-search-gate-retired-witness.ts";
 import { createHash } from "node:crypto";
+import { ingestGenerationOverlap, originalBodies as originalOverlapBodies } from "../../../scripts/sessions-function-boundary/lanes/ingest-generation-overlap.ts";
+import { ingestClaimSessions } from "../../../scripts/sessions-function-boundary/lanes/ingest-claim-sessions.ts";
+import { ingestClaimSessionsReader } from "../../../scripts/sessions-function-boundary/lanes/ingest-claim-sessions-reader.ts";
 import type { LaneManifest } from "../../../scripts/sessions-function-boundary/types.ts";
 import { VERIFIERS } from "../../../scripts/sessions-function-boundary/verifiers.ts";
 import { run } from "../../../scripts/sync-sessions-function-boundary.ts";
@@ -68,7 +72,84 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105043500_lazy_claim_clock_narrowing.down.sql",
       "supabase/rollbacks/20261105043800_lazy_ack_clock_no_key_update.down.sql",
       "supabase/rollbacks/20261105043850_ingest_acquisition_owner.down.sql",
+      "supabase/rollbacks/20261105043880_ingest_bookkeeping_cleanup.down.sql",
+      "supabase/rollbacks/20261105043890_buffered_search_gate_retired_witness.down.sql",
+      "supabase/rollbacks/20261105043910_selfhost_session_selection_erase.down.sql",
+      "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql",
+      "supabase/rollbacks/20261105044030_ingest_generation_overlap.down.sql",
+      "supabase/rollbacks/20261105044040_buffered_stages_session_first.down.sql",
+      "supabase/rollbacks/20261105044050_selfhost_erase_short_summary_provenance.down.sql",
+      "supabase/rollbacks/20261105044070_selfhost_erase_search_text_rebuild.down.sql",
+      "supabase/rollbacks/20261105044080_ingest_claim_sessions.down.sql",
+      "supabase/rollbacks/20261105044090_claim_sessions_reader.down.sql",
     ]);
+  });
+
+  test("the 044080 claim sessions lane adds two owner-only trigger functions, grants no runtime role anything, and derives its guarded rollback", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    const without = await generate(repo, LANES.filter((l) => l !== ingestClaimSessions), VERIFIERS);
+    expect(withLane.summary.lanes["ingest-claim-sessions"]).toEqual({ functions: 2, replaces: 0, grants: 0 });
+    for (const v of VERIFIERS) expect(withLane.outputs[v.path]).toBe(without.outputs[v.path]);
+    const acl = JSON.parse(withLane.outputs["src/hoopdb/sessions-function-acl.json"]!).functions as Record<string, string[]>;
+    const mine = Object.keys(acl).filter((k) => k.startsWith("sessions.ingest_claim_sessions_")).sort();
+    expect(mine).toEqual(["sessions.ingest_claim_sessions_policy_guard()", "sessions.ingest_claim_sessions_sync()"]);
+    for (const k of mine) expect(acl[k]).toEqual(["<owner>:EXECUTE"]);
+    const down = withLane.outputs["supabase/rollbacks/20261105044080_ingest_claim_sessions.down.sql"]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, ingestClaimSessions.migration!), "utf8")).digest("hex"));
+    expect(down.indexOf("own applied checksum required")).toBeLessThan(down.indexOf("DROP TRIGGER ingest_claim_sessions_sync ON sessions.ingest_claim_attempts;"));
+    expect(down).toContain("a later migration is applied");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
+  });
+
+  test("the 044090 claim sessions reader lane adds one owner-only trigger function, keeps the replaced ACLs, grants nothing, and derives its guarded rollback", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    const without = await generate(repo, LANES.filter((l) => l !== ingestClaimSessionsReader), VERIFIERS);
+    expect(withLane.summary.lanes["ingest-claim-sessions-reader"]).toEqual({ functions: 1, replaces: 3, grants: 0 });
+    for (const v of VERIFIERS) expect(withLane.outputs[v.path]).toBe(without.outputs[v.path]);
+    const acl = JSON.parse(withLane.outputs["src/hoopdb/sessions-function-acl.json"]!).functions as Record<string, string[]>;
+    const before = JSON.parse(without.outputs["src/hoopdb/sessions-function-acl.json"]!).functions as Record<string, string[]>;
+    const mine = Object.keys(acl).filter((k) => k.startsWith("sessions.ingest_batch_claim_sessions_")).sort();
+    expect(mine).toEqual(["sessions.ingest_batch_claim_sessions_refresh()"]);
+    expect(acl["sessions.ingest_batch_claim_sessions_refresh()"]).toEqual(["<owner>:EXECUTE"]);
+    // The replaced readers and guard keep exactly their prior ACLs (CREATE OR REPLACE, no GRANT).
+    for (const k of Object.keys(ingestClaimSessionsReader.replaces)) expect([k, acl[k]]).toEqual([k, before[k]]);
+    const down = withLane.outputs["supabase/rollbacks/20261105044090_claim_sessions_reader.down.sql"]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, ingestClaimSessionsReader.migration!), "utf8")).digest("hex"));
+    expect(down.indexOf("own applied checksum required")).toBeLessThan(down.indexOf("CREATE OR REPLACE FUNCTION sessions.buffered_sessions_for("));
+    expect(down.indexOf("CREATE OR REPLACE FUNCTION sessions.ingest_claim_sessions_policy_guard()")).toBeLessThan(down.indexOf("DROP COLUMN read_enabled"));
+    expect(down).toContain("DROP TRIGGER ingest_batch_claim_sessions_refresh ON sessions.ingest_batches;");
+    expect(down).toContain("a later migration is applied");
+    expect(down).not.toContain("read_enabled:=false");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
+  });
+
+  test("the 044030 generation overlap adds six owner-only functions, grants no runtime role anything, and derives its exact guarded rollback", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    const without = await generate(repo, LANES.filter((l) => l !== ingestGenerationOverlap), VERIFIERS);
+    const downPath = "supabase/rollbacks/20261105044030_ingest_generation_overlap.down.sql";
+    expect(withLane.summary.lanes["ingest-generation-overlap"]).toEqual({ functions: 6, replaces: 2, grants: 0 });
+    // Every role verifier is byte-identical with and without the lane: no runtime capability changes.
+    for (const v of VERIFIERS) expect(withLane.outputs[v.path]).toBe(without.outputs[v.path]);
+    const acl = JSON.parse(withLane.outputs["src/hoopdb/sessions-function-acl.json"]!).functions as Record<string, string[]>;
+    const mine = Object.keys(acl).filter((k) => k.startsWith("sessions.ingest_generation_overlap_")).sort();
+    expect(mine).toEqual(["sessions.ingest_generation_overlap_admits(text,text,text)", "sessions.ingest_generation_overlap_close(jsonb)",
+      "sessions.ingest_generation_overlap_immutable()", "sessions.ingest_generation_overlap_open(jsonb)",
+      "sessions.ingest_generation_overlap_policy_retire()", "sessions.ingest_generation_overlap_retired_immutable()"]);
+    for (const k of [...mine, "sessions.ingest_require_generation(text)", "sessions.ingest_lazy_guard(text)"]) expect(acl[k]).toEqual(["<owner>:EXECUTE"]);
+    const down = withLane.outputs[downPath]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, ingestGenerationOverlap.migration!), "utf8")).digest("hex"));
+    const [generationBody, guardBody] = originalOverlapBodies(
+      readFileSync(join(root, "supabase/migrations/20261104050000_buffered_upload_receipts.sql"), "utf8"),
+      readFileSync(join(root, "supabase/migrations/20261104055000_lazy_current_custody.sql"), "utf8"));
+    expect(generationBody).toContain("AND generation=p_expected AND status='pass' FOR SHARE;");
+    expect(guardBody).toContain("IF v_gen IS NULL OR pol.generation<>v_gen");
+    expect(down).toContain(generationBody!);
+    expect(down).toContain(guardBody!);
+    expect(down.indexOf("status='pending'")).toBeLessThan(down.indexOf(generationBody!));
+    expect(down.indexOf(guardBody!)).toBeLessThan(down.indexOf("DROP TABLE sessions.ingest_generation_overlap_windows;"));
+    expect(down).toContain("a later migration is applied");
+    expect(down).toContain("own applied checksum required");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
   });
 
   test("the GC replacement changes no ACL/boundary/verifier capability and derives its exact guarded rollback", async () => {
@@ -348,6 +429,43 @@ describe("unified sessions function-boundary generator", () => {
     expect(down).toContain("REVOKE USAGE ON SCHEMA sessions FROM buffered_search_feed_runtime;");
     expect(down).not.toMatch(/DROP ROLE/);
     expect(down).toContain("DELETE FROM sessions.__96bulls_migrations WHERE name = 'upstream:20261105043870_buffered_search_feed_cursor.sql'");
+  });
+
+  test("043890 retired witness: replaces 043860's gate only (ACL/boundary/verifiers unchanged) and derives the exact 043860 rollback", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    const withoutLane = await generate(repo, LANES.filter((l) => l !== bufferedSearchGateRetiredWitness), VERIFIERS);
+    const downPath = "supabase/rollbacks/20261105043890_buffered_search_gate_retired_witness.down.sql";
+    expect(withLane.summary.lanes["buffered-search-gate-retired-witness"]).toEqual({ functions: 0, replaces: 1, grants: 0 });
+    for (const [path, value] of Object.entries(withoutLane.outputs)) expect(withLane.outputs[path]).toBe(value);
+    expect(Object.keys(withLane.outputs).filter((p) => !(p in withoutLane.outputs))).toEqual([downPath]);
+    const migration = readFileSync(join(root, "supabase/migrations/20261105043890_buffered_search_gate_retired_witness.sql"), "utf8");
+    const original = readFileSync(join(root, "supabase/migrations/20261105043860_buffered_search_gate.sql"), "utf8");
+    // No GRANT at all (the read API grant stays 043860's); the 043860 REVOKE and sweep are re-issued.
+    expect(migration).not.toMatch(/^GRANT /mu);
+    expect(migration).toContain("FROM PUBLIC, anon, authenticated, service_role, bulls96_session_ingest, bulls96_session_ingest_seeder;");
+    // The body is 043860's plus exactly the retired column and the retired CASE branch.
+    const body = migration.match(/CREATE OR REPLACE FUNCTION sessions\.buffered_search_gate_for\([\s\S]*?\n\$gate\$;/)![0];
+    const added = [
+      "           -- 20261105043890: the 043880 cleanup (Phase A) tombstoned this claim and deleted its lazy ACK\n",
+      "           -- decisions, so version_consistent above no longer witnesses anything for it.\n",
+      "           EXISTS (SELECT 1 FROM sessions.ingest_bookkeeping_retired_claims AS r\n",
+      "                    WHERE r.claim_token = a.claim_token) AS retired,\n",
+      "           WHEN j.retired IS NOT FALSE THEN 'retired'\n",
+    ];
+    let stripped = body;
+    for (const line of added) { expect(stripped).toContain(line); stripped = stripped.replace(line, ""); }
+    expect(stripped).toBe(originalGateBody(original));
+    expect(body.indexOf("'admission_epoch_mismatch'")).toBeLessThan(body.indexOf("'retired'"));
+    expect(body.indexOf("'retired'")).toBeLessThan(body.indexOf("'admission_version_mismatch'"));
+    expect(body).toContain("LANGUAGE plpgsql STABLE SECURITY DEFINER");
+    const down = withLane.outputs[downPath]!;
+    expect(readFileSync(join(root, downPath), "utf8")).toBe(down);
+    expect(down).toContain(originalGateBody(original));
+    expect(down).not.toContain("ingest_bookkeeping_retired_claims AS r");
+    expect(down).toContain("a later migration is applied");
+    expect(down).toContain("claims were retired; turn the gate off instead of rolling back");
+    expect(down).not.toMatch(/DROP |GRANT /);
+    expect(down).toContain("DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105043890_buffered_search_gate_retired_witness.sql'");
   });
 
   test("a stale SECDEF signature under a lane's prefix (an old arity) is dropped from the wrapper, not carried forward", async () => {

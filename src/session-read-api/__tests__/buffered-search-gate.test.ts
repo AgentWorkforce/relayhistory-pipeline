@@ -245,6 +245,7 @@ describe("the gate: every fail-closed case drops the hit", () => {
     ["an unknown reason from the reader", { st: store({ verdict: () => "admission_unknown_reason" }) }, "admission_unknown_reason"],
     ...([
       "admission_epoch_mismatch",
+      "retired",
       "admission_version_mismatch",
       "admission_session_mismatch",
       "gate_closed",
@@ -532,14 +533,21 @@ describe("configuration and SQL", () => {
   });
 });
 
-test("GATE_SQL_REASONS is exactly the set of drop reasons 043860 can return", () => {
-  const sql = readFileSync(join(import.meta.dir, "../../../supabase/migrations/20261105043860_buffered_search_gate.sql"), "utf8");
+const gateReasons = (file: string) => {
+  const sql = readFileSync(join(import.meta.dir, "../../../supabase/migrations", file), "utf8");
   const body = sql.slice(sql.indexOf("AS $gate$"), sql.lastIndexOf("$gate$;"));
-  const returned = new Set([
-    ...[...body.matchAll(/THEN '([a-z_]+)'/g)].map((m) => m[1]),
-    ...[...body.matchAll(/v_gate := '([a-z_]+)'/g)].map((m) => m[1]),
+  return new Set([
+    ...[...body.matchAll(/THEN '([a-z_]+)'/g)].map((m) => m[1]!),
+    ...[...body.matchAll(/v_gate := '([a-z_]+)'/g)].map((m) => m[1]!),
   ]);
-  expect([...returned].sort()).toEqual([...GATE_SQL_REASONS].sort());
+};
+
+test("GATE_SQL_REASONS is exactly the set of drop reasons the latest gate (043890) can return: 043860's plus retired", () => {
+  const latest = gateReasons("20261105043890_buffered_search_gate_retired_witness.sql");
+  expect([...latest].sort()).toEqual([...GATE_SQL_REASONS].sort());
+  expect([...latest].sort()).toEqual([...gateReasons("20261105043860_buffered_search_gate.sql"), "retired"].sort());
+  // Order follows the CASE (first match): retired sits between the epoch and version witnesses.
+  expect(GATE_SQL_REASONS.slice(0, 3)).toEqual(["admission_epoch_mismatch", "retired", "admission_version_mismatch"]);
 });
 
 describe("READ_API_REPEATABLE_READ (Worker tenant transaction isolation, default off)", () => {

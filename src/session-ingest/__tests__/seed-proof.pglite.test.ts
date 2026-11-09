@@ -18,6 +18,7 @@ import { deliverBatch } from "../deliver.ts";
 import { normalizeRelayhistoryRecords } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 import { sqlLedger } from "../ledger-sql.ts";
 import { TENANT,batch,record,scratchStore } from "./support.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 setDefaultTimeout(30000);
 const root=join(import.meta.dir,"../../.."),gen="a".repeat(64),head="b".repeat(40);
 const read=(p:string)=>readFileSync(join(root,p),"utf8");
@@ -27,8 +28,8 @@ const args={org_id:TENANT.orgId,workspace_id:TENANT.workspaceId,source:"claude",
 async function fixture(baseline=true,oldOperation:"upsert"|"delete"="upsert"){
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});cleanups.push(()=>db.close());
  await db.exec(read("supabase/tests/supabase_shim.sql"));
- for(const role of ["session_directory_search_worker","session_token_verifier","session_ingest_roles","session_read_api_roles"])
-  await db.exec(read("supabase/bootstrap/"+role+".sql"));
+ for(const role of SESSION_BOOTSTRAP_FILES)
+  await db.exec(read(role));
  for(const file of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())
   await db.exec(read("supabase/migrations/"+file));
  await db.exec(`CREATE TABLE IF NOT EXISTS sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text,updated_at timestamptz DEFAULT now());

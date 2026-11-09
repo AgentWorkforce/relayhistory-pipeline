@@ -31,6 +31,7 @@ import { assertTenantSegment, liveMachineId } from "./writer.ts";
 import type { LedgerTenant } from "./ledger.ts";
 import { DELIVERY_KINDS, DeliveryError, MAX_DELIVERY_RECORDS } from "./vendor/delivery/delivery-contracts.ts";
 import { digest, type PreparedDelivery, type PreparedDeliveryRecord } from "./vendor/delivery/prepare.ts";
+import { TURN_KIND, TURN_ORIGIN_ID } from "./turns.ts";
 
 /** INGEST_ASYNC_ADMISSION. off: today's synchronous path only, and admission messages wait.
  * on: async ACK for callers that opt in; journal written; consumer admits.
@@ -44,6 +45,19 @@ export function asyncAdmissionMode(raw: string | undefined): AsyncAdmissionMode 
   throw new Error("session ingest: INGEST_ASYNC_ADMISSION must be off, on or drain");
 }
 
+/** INGEST_SYNC_ADMISSION_FROZEN_RECEIPT. off (default): today's synchronous path, unchanged.
+ * on: a queued-v1 caller (whose relayhistory skipped its own pre-forward legacy-receipt read) that
+ * lands on the synchronous path under frozen-supabase custody gets the consumer's frozen legacy-receipt
+ * check before any witness, claim or delivery (app.ts acceptBatch). */
+export type SyncAdmissionFrozenReceiptMode = "off" | "on";
+
+export function syncAdmissionFrozenReceiptMode(raw: string | undefined): SyncAdmissionFrozenReceiptMode {
+  const v = raw?.trim().toLowerCase() ?? "";
+  if (v === "" || v === "off") return "off";
+  if (v === "on") return v;
+  throw new Error("session ingest: INGEST_SYNC_ADMISSION_FROZEN_RECEIPT must be off or on");
+}
+
 /**
  * relayhistory opts in per request INSIDE the signed identity (`admission`, app.ts bindingIdentity),
  * never as a loose header; it then accepts ADMISSION_HEADER instead of a custody ACK, and only for a
@@ -53,6 +67,9 @@ export const ADMISSION_ACCEPT_VALUE = "queued-v1";
 /** On an async 2xx: exactly this JSON, and never a custody ACK header. */
 export const ADMISSION_HEADER = "x-relay-admission";
 export const ADMISSION_QUEUED = JSON.stringify({ version: 1, state: "queued" });
+/** On a synchronous legacy replay for a queued-v1 caller (INGEST_SYNC_ADMISSION_FROZEN_RECEIPT): exactly this JSON,
+ * and never a custody ACK header (there was no claim). */
+export const ADMISSION_LEGACY_REPLAY = JSON.stringify({ version: 1, state: "legacy-replay" });
 
 /**
  * A leading `.` keeps the inbox disjoint from every tenant prefix `<keyRoot>/<org>/`: no org id
@@ -159,7 +176,7 @@ function inboxRecord(id: unknown, line: unknown, originId: string): PreparedDeli
   const [record_id, revision_id, revision, digest, kind, source, session_id, operation] = id as unknown[];
   const payload = (line as Record<string, unknown>).p;
   if (!ident(record_id) || !ident(revision_id) || typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1 ||
-      typeof digest !== "string" || !HEX64.test(digest) || !DELIVERY_KINDS.includes(kind as never) || !ident(source) ||
+      typeof digest !== "string" || !HEX64.test(digest) || !(DELIVERY_KINDS.includes(kind as never) || (kind === TURN_KIND && originId === TURN_ORIGIN_ID)) || !ident(source) ||
       !(session_id === null || ident(session_id)) ||
       !((operation === "delete" && payload === null) || (operation === "upsert" && isObject(payload)))) bad();
   const record = { schema_version: 1, origin_id: originId, record_id, revision_id, revision, kind, source, session_id, operation, payload, digest } as unknown as PreparedDeliveryRecord;

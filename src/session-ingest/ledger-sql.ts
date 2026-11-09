@@ -67,6 +67,7 @@ type LedgerFunction =
   | "ingest_acquire_slot"
   | "ingest_release_slot"
   | "ingest_set_session_uploads"
+  | "ingest_selfhost_set_session_uploads"
   | "ingest_reset_uploaded_sessions"
   | "ingest_fanout_fence"
   | "ingest_commit_revisions"
@@ -187,9 +188,46 @@ export function parseClaimResult(r: Record<string, unknown>): ClaimResult {
   }
 }
 
-export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAcceptanceMode;expectedGeneration?:string } = {}): Ledger {
+/**
+ * The accepted generation set (INGEST_ACCEPT_GENERATIONS): the expected generation, optionally plus ONE other
+ * explicit generation. Never a wildcard: exactly 1 or 2 distinct lowercase hex64 values that include
+ * `expected`. Throws otherwise.
+ */
+export function acceptedGenerationSet(expected: string, accept?: readonly string[]): readonly string[] {
+  if (accept === undefined) return [expected];
+  if (!Array.isArray(accept) || accept.length < 1 || accept.length > 2 || !accept.every((g) => typeof g === "string" && HEX64.test(g))
+      || new Set(accept).size !== accept.length || !accept.includes(expected)) throw new LedgerUnavailableError("ledger_generation_set_refused");
+  return Object.freeze([...accept]);
+}
+
+/** Last generation the DB admitted, per accepted set (isolate-wide; only an ordering hint, never an authority). */
+const admittedHint = new Map<string, string>();
+const STICKY_MAX = 256;
+
+export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAcceptanceMode;expectedGeneration?:string;acceptGenerations?:readonly string[];selfhostSelectionErase?:boolean } = {}): Ledger {
   if(options.acceptanceMode==="buffered"&&(typeof options.expectedGeneration!=="string"||!/^[a-f0-9]{64}$/.test(options.expectedGeneration)))throw new LedgerUnavailableError("ledger_generation_required");
-  const buffered=(input:unknown)=>({...input as Record<string,unknown>,generation:options.expectedGeneration});
+  if(options.acceptGenerations!==undefined&&options.acceptanceMode!=="buffered")throw new LedgerUnavailableError("ledger_generation_set_refused");
+  // Bounded overlap (docs/design/zero-503-schema-windows.md): a call that STARTS an operation (claim, ordered
+  // control, selection, reset) is sent with one accepted generation; only when the database refuses it with
+  // 55000 (generation not ready / policy at the other generation) is the SAME call retried once with the other
+  // one. Each call is one statement, so a refused call wrote nothing. Every later call of a claim (stage,
+  // commit, Babysitter evidence) reuses the generation the claim was admitted with: the database binds the
+  // attempt to it (40001 otherwise). The database decides admission; the Worker can only offer its two.
+  const generations=options.acceptanceMode==="buffered"?acceptedGenerationSet(options.expectedGeneration!,options.acceptGenerations):[];
+  const setKey=generations.join(",");
+  const sticky=new Map<string,string>();
+  const remember=(token:unknown,generation:string)=>{if(typeof token!=="string")return;sticky.delete(token);sticky.set(token,generation);if(sticky.size>STICKY_MAX)sticky.delete(sticky.keys().next().value!);};
+  const order=():readonly string[]=>{const h=admittedHint.get(setKey);return h&&generations.length===2&&generations.includes(h)?[h,...generations.filter((g)=>g!==h)]:generations;};
+  const buffered=(input:unknown,generation:string=generations[0]!)=>({...input as Record<string,unknown>,generation});
+  const forClaim=(token:unknown)=>(typeof token==="string"&&sticky.get(token))||order()[0]!;
+  async function admitted<T>(attempt:(generation:string)=>Promise<T>):Promise<{value:T;generation:string}>{
+    const tries=order();let last:unknown;
+    for(const generation of tries){
+      try{const value=await attempt(generation);if(tries.length===2)admittedHint.set(setKey,generation);return{value,generation};}
+      catch(error){if(tries.length<2||!(error instanceof LedgerUnavailableError)||error.code!=="ledger_sqlstate_55000")throw error;last=error;}
+    }
+    throw last;
+  }
   const hex64 = (v: unknown) => typeof v === "string" && /^[a-f0-9]{64}$/.test(v);
   return {
     async frozenWitness(input) {
@@ -241,11 +279,15 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
       if(options.acceptanceMode!=="buffered")throw new LedgerUnavailableError("ledger_mode_refused");
       const control=orderedControl(input.control);
       const fn=control.kind==="selection"?"ingest_set_session_uploads":"ingest_reset_uploaded_sessions";
-      const r=await call(run,fn,buffered(input));
+      const {value:r}=await admitted((g)=>call(run,fn,buffered(input,g)));
       try{return orderedControlResult(r,control)}catch{throw new LedgerUnavailableError("ledger_control_ack_refused")}
     },
     async claim(input: ClaimInput): Promise<ClaimResult> {
-      const raw=(await call(run,options.acceptanceMode==="buffered"?"ingest_claim_buffered_batch":"ingest_claim_batch",options.acceptanceMode==="buffered"?buffered(input):input)) as Record<string,unknown>;
+      let raw:Record<string,unknown>;
+      if(options.acceptanceMode==="buffered"){
+        const claimed=await admitted((g)=>call(run,"ingest_claim_buffered_batch",buffered(input,g)));
+        raw=claimed.value as Record<string,unknown>;remember(raw.claimToken,claimed.generation);
+      }else raw=(await call(run,"ingest_claim_batch",input)) as Record<string,unknown>;
       const result=parseClaimResult(raw);
       if(raw.custodyAck!==undefined){try{result.custodyAck=validatedCustodyAck(raw.custodyAck,input.custody)}catch{throw new LedgerUnavailableError("ledger_custody_ack_refused")}}
       if(input.custody&&!result.custodyAck)throw new LedgerUnavailableError("ledger_custody_ack_missing");
@@ -253,14 +295,14 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
     },
     async prepareBufferStage(input) {
       if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
-      const r = await call(run, "ingest_prepare_buffer_stage", buffered(input)) as Record<string,unknown>;
+      const r = await call(run, "ingest_prepare_buffer_stage", buffered(input,forClaim(input.claimToken))) as Record<string,unknown>;
       if (typeof r.stageToken !== "string" || !/^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(r.stageToken) ||
           typeof r.expiresAt !== "string" || !Number.isFinite(Date.parse(r.expiresAt))) throw new LedgerUnavailableError("ledger_bad_result");
       return {stageToken:r.stageToken,expiresAt:r.expiresAt};
     },
     async commitBuffered(input) {
       if (options.acceptanceMode !== "buffered") throw new LedgerUnavailableError("ledger_mode_refused");
-      const r = await call(run,"ingest_commit_buffered_batch",buffered(input)) as Record<string,unknown>;
+      const r = await call(run,"ingest_commit_buffered_batch",buffered(input,forClaim(input.claimToken))) as Record<string,unknown>;
       if (r.kind === "intent_invalid") throw new LedgerUnavailableError("ledger_stage_invalidated");
       if (r.kind !== "committed") throw new LedgerUnavailableError("ledger_bad_result");
       if(r.custodyAck!==undefined){try{return validatedCustodyAck(r.custodyAck)}catch{throw new LedgerUnavailableError("ledger_custody_ack_refused")}}
@@ -293,7 +335,14 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
       if (typeof r.released !== "boolean") throw new LedgerUnavailableError("ledger_bad_result");
     },
     async setSessionUploads(input: SelectionInput): Promise<void> {
-      const r = (await call(run, "ingest_set_session_uploads", options.acceptanceMode==="buffered"?buffered(input):input)) as Record<string, unknown>;
+      if (options.selfhostSelectionErase) {
+        // The self-host erase front door: fence and tombstone every origin of the caller's session in one transaction. Only a disable is served.
+        if (input.enabled) throw new DeliveryError("unsupported_by_backend", 400, "Re-enabling an erased session is not served by the self-host session ingest");
+        const erased = (await call(run, "ingest_selfhost_set_session_uploads", input)) as Record<string, unknown>;
+        if (typeof erased.updated !== "number") throw new LedgerUnavailableError("ledger_bad_result");
+        return;
+      }
+      const r = (options.acceptanceMode==="buffered"?(await admitted((g)=>call(run,"ingest_set_session_uploads",buffered(input,g)))).value:await call(run, "ingest_set_session_uploads", input)) as Record<string, unknown>;
       if (typeof r.updated !== "number") throw new LedgerUnavailableError("ledger_bad_result");
     },
     async fanoutFence(tenant: LedgerTenant, originId: string, sessions: [string, string][], attempt: StagedAttempt): Promise<[string, string][]> {
@@ -309,7 +358,8 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
       return { committed: r.committed, rearmed: r.rearmed };
     },
     async registerBabysitterRetention(input: BabysitterRetentionRegistration) {
-      const r = (await call(run, "ingest_babysitter_retention_register", input)) as Record<string, unknown>;
+      // Evidence is fenced on the generation its claim was admitted with (the configured one when unknown).
+      const r = (await call(run, "ingest_babysitter_retention_register", sticky.has(input.claimToken)?{...input,generation:sticky.get(input.claimToken)}:input)) as Record<string, unknown>;
       if (!Array.isArray(r.objects) || typeof r.reopened !== "number" || r.objects.length !== input.buckets.length)
         throw new LedgerUnavailableError("ledger_bad_result");
       const objects = r.objects.map((o: unknown) => {
@@ -321,12 +371,12 @@ export function sqlLedger(run: SqlRun, options: { acceptanceMode?: IngestAccepta
       return { objects, reopened: r.reopened };
     },
     async babysitterRetentionWritten(input: BabysitterWriteOutcome) {
-      const r = (await call(run, "ingest_babysitter_retention_written", input)) as Record<string, unknown>;
+      const r = (await call(run, "ingest_babysitter_retention_written", sticky.has(input.claimToken)?{...input,generation:sticky.get(input.claimToken)}:input)) as Record<string, unknown>;
       if (typeof r.updated !== "number") throw new LedgerUnavailableError("ledger_bad_result");
       return r.updated;
     },
     async resetUploadedSessions(tenant: LedgerTenant, requestId: string): Promise<number> {
-      const r = (await call(run, "ingest_reset_uploaded_sessions", options.acceptanceMode==="buffered"?buffered({tenant,requestId}):{tenant,requestId})) as Record<string, unknown>;
+      const r = (options.acceptanceMode==="buffered"?(await admitted((g)=>call(run,"ingest_reset_uploaded_sessions",buffered({tenant,requestId},g)))).value:await call(run, "ingest_reset_uploaded_sessions", {tenant,requestId})) as Record<string, unknown>;
       if (typeof r.deleted !== "number" || !Number.isSafeInteger(r.deleted) || r.deleted < 0) throw new LedgerUnavailableError("ledger_bad_result");
       return r.deleted;
     },

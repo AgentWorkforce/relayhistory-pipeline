@@ -16,6 +16,7 @@ import {
   writeDirectoryCatalog,
 } from "../session-directory-catalog.ts";
 import { projectSessionDirectory } from "../session-directory-projector.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
 
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -35,10 +36,7 @@ async function database(options: { catalogReady?: boolean } = {}): Promise<PGlit
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
-  await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
-  await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
-  await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
-  await db.exec(read("supabase/bootstrap/session_read_api_roles.sql"));
+  for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
     await db.exec(read(`supabase/migrations/${file}`));
   }
@@ -747,16 +745,23 @@ describe("catalog writer and projector", () => {
     expect((await parent()).child_session_count).toBe(0);
   });
 
-  test("the catalog writer is one statement and never outlives a tombstone, in either order (M3)", async () => {
+  test("catalog publication is one locked statement after read-only capability inspection and never outlives a tombstone (M3)", async () => {
     const db = await database();
     await seed(db, [
       { id: "p", created: "2026-10-01T00:00:00Z", last: "2026-10-05T00:00:00Z" },
       { id: "c", created: "2026-10-02T00:00:00Z", last: "2026-10-03T00:00:00Z" },
     ]);
-    // One statement: atomic on any executor, with the live row locked FOR UPDATE first.
-    let statements = 0;
+    // Capability discovery reads only catalogs. Publication remains one statement,
+    // atomic on any executor, with its live directory row locked FOR UPDATE.
+    let statements = 0, metadataReads = 0;
     const counting = {
       query: (text: string, params?: unknown[]) => {
+        if (text.includes("pg_catalog.pg_attribute") && text.includes("recorded_catalog_title")) {
+          metadataReads++;
+          expect(text).toMatch(/^SELECT EXISTS/);
+          expect(text).not.toMatch(/FOR UPDATE/);
+          return db.query(text, params);
+        }
         statements++;
         expect(text).toMatch(/FOR UPDATE/);
         return db.query(text, params);
@@ -765,6 +770,7 @@ describe("catalog writer and projector", () => {
     const write = { ...EMPTY, agentNames: ["bot"], relationships: [{ relationshipUid: "r", childSessionId: "c" }] };
     expect((await writeDirectoryCatalog(counting as never, dirKey("p"), write, await at(db, "p"))).written).toBe(true);
     expect(statements).toBe(1);
+    expect(metadataReads).toBe(1);
     // Tombstone after the write: its triggers remove the agents and edges.
     await db.exec("UPDATE sessions.session_directory SET deleted_at = now() WHERE session_id = 'p'");
     const left = async () =>

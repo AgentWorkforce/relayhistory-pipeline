@@ -2,7 +2,7 @@ import {test,expect,afterEach,setDefaultTimeout} from "bun:test";
 import {PGlite} from "@electric-sql/pglite";
 import {btree_gin} from "@electric-sql/pglite/contrib/btree_gin";
 import {pg_trgm} from "@electric-sql/pglite/contrib/pg_trgm";
-import {readFileSync,readdirSync} from "node:fs";
+import {readFileSync} from "node:fs";
 import {join} from "node:path";
 import {zstdDecompressSync} from "node:zlib";
 import {sqlLedger} from "../ledger-sql.ts";
@@ -14,6 +14,8 @@ import {TURN_KIND,TURN_ORIGIN_ID,parseTurnBatch,turnRecordId} from "../turns.ts"
 import {normalizeRelayhistoryRecords,type RelayhistoryStreamRecord} from "../../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 import {projectRelayhistorySession} from "../../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
 import {TENANT,batch,record,scratchStore} from "./support.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
+import {migrationFiles} from "./pglite-schema.ts";
 setDefaultTimeout(30000);
 
 const root=join(import.meta.dir,"../../.."),generation="a".repeat(64),epoch="3".repeat(64),identity="c".repeat(64),baseline="a".repeat(64);
@@ -24,8 +26,8 @@ afterEach(async()=>{for(const close of open.splice(0).reverse())await close()});
 async function fixture(){
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(()=>db.close());const read=(p:string)=>readFileSync(join(root,p),"utf8");
  await db.exec(read("supabase/tests/supabase_shim.sql"));
- for(const f of ["session_directory_search_worker","session_token_verifier","session_ingest_roles","session_read_api_roles"])await db.exec(read("supabase/bootstrap/"+f+".sql"));
- for(const f of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())await db.exec(read("supabase/migrations/"+f));
+ for(const f of SESSION_BOOTSTRAP_FILES)await db.exec(read(f));
+ for(const f of migrationFiles(root))await db.exec(read("supabase/migrations/"+f));
  await db.exec("CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','"+generation+"','pass')");
  const owner=async(name:string,p:unknown)=>(await db.query("SELECT sessions."+name+"($1::jsonb) AS r",[JSON.stringify(p)])).rows[0]!.r as any;
  await owner("ingest_lazy_policy_set",{baselineMode:"lazy-current",generation,sourceIdentitySha256:identity,controlEpoch:epoch,privacyBaselineSha256:baseline,retentionContractSha256:"b".repeat(64),sourceProofSha256:"d".repeat(64),validUntil:new Date(Date.now()+3600000).toISOString(),issuer:"relayhistory-cloud"});

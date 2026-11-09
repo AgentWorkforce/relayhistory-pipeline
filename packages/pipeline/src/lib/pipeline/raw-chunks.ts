@@ -121,7 +121,9 @@ export const SCRUB_RULESET = "relayhistory-scrub";
  *   `MAX_QUOTED_VALUE` units or more and no private-key boundary inside a
  *   quoted secret value is byte-identical to version 5.
  */
-export const SCRUB_RULESET_VERSION = 6;
+// Version 7 keeps the exact public idempotency_key assignment; all other
+// credential detectors and the record/segment boundaries remain unchanged.
+export const SCRUB_RULESET_VERSION = 7;
 
 /** Object metadata the client's `put_raw_chunk` writes; read back on a lost create race. */
 export const META_RAW_SHA256 = "raw-sha256";

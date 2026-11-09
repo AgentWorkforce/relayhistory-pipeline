@@ -19,8 +19,9 @@ import {sqlLedger} from "../ledger-sql.ts";
 import {deliveryAccount} from "../vendor/delivery/prepare.ts";
 import {DELIVERY_MAPPING_VERSION} from "../vendor/delivery/delivery-contracts.ts";
 import {TURN_KIND,TURN_ORIGIN_ID,turnRecordId} from "../turns.ts";
-import {TENANT,scratchStore} from "./support.ts";
+import {TENANT,scratchStore,record,batch} from "./support.ts";
 import acl from "../../hoopdb/sessions-function-acl.json" with {type:"json"};
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 setDefaultTimeout(60000);
 
 const root=join(import.meta.dir,"../../.."),generation="4".repeat(64),epoch="1".repeat(64),identity="c".repeat(64),baseline="a".repeat(64);
@@ -34,7 +35,7 @@ afterEach(async()=>{for(const close of open.splice(0).reverse())await close()});
 async function fixture(){
  const db=new PGlite({extensions:{btree_gin,pg_trgm}});open.push(()=>db.close());const read=(p:string)=>readFileSync(join(root,p),"utf8");
  await db.exec(read("supabase/tests/supabase_shim.sql"));
- for(const f of ["session_directory_search_worker","session_token_verifier","session_ingest_roles","session_read_api_roles"])await db.exec(read("supabase/bootstrap/"+f+".sql"));
+ for(const f of SESSION_BOOTSTRAP_FILES)await db.exec(read(f));
  for(const f of readdirSync(join(root,"supabase/migrations")).filter(f=>f.endsWith(".sql")).sort())await db.exec(read("supabase/migrations/"+f));
  // The read role's approved shape (schema USAGE, the session_index column grant, RLS), as the operator applies it.
  await db.exec(psql("supabase/bootstrap/session_read_api_role.sql"));
@@ -62,6 +63,17 @@ async function fixture(){
   const r=await app.request("/v1/turns/batches",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({protocolVersion:1,batch:b})});
   who=TENANT;
   if(r.status!==200)throw new Error("upload "+r.status+" "+await r.text());
+  return batchId;
+ }
+ /** One accepted buffered DELIVERY batch holding several sessions (a turn batch holds one); groups of
+  *  [source, session, record ids]; a repeated record id with a higher revision supersedes. Returns the batch id. */
+ async function deliver(groups:Array<[string,string,string[]]>,t:Tenant=TENANT){
+  const batchId="b-"+(++serial);who=t;
+  const records=groups.flatMap(([source,session_id,ids])=>ids.map((id)=>record({record_id:id,revision:serial,revision_id:`${id}:r${serial}`,source,session_id})));
+  const b=await batch(records,{batch_id:batchId,account_id:await deliveryAccount(t)});
+  const r=await app.request("/v1/delivery/batches",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({protocolVersion:1,batch:b})});
+  who=TENANT;
+  if(r.status!==200)throw new Error("deliver "+r.status+" "+await r.text());
   return batchId;
  }
  /** Read as bulls96_read_api, bound like the read API binds a verified identity. */
@@ -101,7 +113,7 @@ async function fixture(){
   await db.query("UPDATE sessions.ingest_claim_attempts SET source_control_version=$1::bigint WHERE user_id=$2 AND "+where,[version,TENANT.userId]);
   if(version!==null)await db.query("UPDATE sessions.ingest_lazy_ack_decisions d SET source_control_version=$1::bigint FROM sessions.ingest_claim_attempts a WHERE a.claim_token=d.claim_token AND a.user_id=$2 AND "+where.replace(/\bbatch_id\b/g,"a.batch_id"),[version,TENANT.userId]);
  };
- return {db,owner,upload,asReader,list,stages,prove,receipts,admit,ledger};
+ return {db,owner,upload,deliver,asReader,list,stages,prove,receipts,admit,ledger};
 }
 type Tenant={orgId:string;workspaceId:string;userId:string};
 type Head={cutover:string|null;epoch:string|null;version:string|null;digest:string|null;kind:string|null;pending:boolean|null;baseline:string|null};
@@ -588,4 +600,144 @@ test("the function ACLs equal the manifest and the read-role verifier passes",as
  expect(tbl).toEqual({rls:true,others:0,n:0});
  for(const r of rows)expect([...r.acl].sort()).toEqual([...manifest[norm(r.fn)]!].sort());
  await f.db.exec(psql("supabase/bootstrap/session_read_api_role_verify.sql"));
+});
+
+// ---- 20261105044040: session-first detail, non-quadratic recn / bad_stage, parity with the 043700 bodies ----
+const SESSION_FIRST="supabase/migrations/20261105044040_buffered_stages_session_first.sql";
+/** 043700's two readers, unchanged, as ref044040.list / ref044040.stages (a separate schema: the sessions
+ *  function manifest stays exact). Same owner, SECURITY DEFINER, search_path and the read role's EXECUTE. */
+async function loadReference(db:PGlite){
+ const src=readFileSync(join(root,MIGRATION),"utf8");
+ const pick=(re:RegExp)=>{const m=src.match(re);if(!m)throw Error("043700 body missing");return m[0]};
+ const list=pick(/CREATE FUNCTION sessions\.buffered_sessions_for\([\s\S]*?END\n\$buffered_sessions\$;/).replace("CREATE FUNCTION sessions.buffered_sessions_for(","CREATE FUNCTION ref044040.list(");
+ const stages=pick(/CREATE FUNCTION sessions\.buffered_session_stages_for\([\s\S]*?END\n\$buffered_stages\$;/).replace("CREATE FUNCTION sessions.buffered_session_stages_for(","CREATE FUNCTION ref044040.stages(");
+ await db.exec("CREATE SCHEMA ref044040;GRANT USAGE ON SCHEMA ref044040 TO bulls96_read_api;"+list+stages+"REVOKE ALL ON ALL FUNCTIONS IN SCHEMA ref044040 FROM PUBLIC;GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA ref044040 TO bulls96_read_api");
+}
+
+test("(bi) 044040 parity: list and stages return exactly the 043700 rows, in order, across deletions, resets, replaced-stage chains, lazy-ACK and duplicate-ordinal states",async()=>{
+ const f=await fixture();await loadReference(f.db);
+ const U2={...TENANT,userId:"user-2"},OB={...TENANT,orgId:"org-b"};
+ // A first upload binds the org admission; the reset (an hour back) then gives later acceptances reset epoch 1.
+ await f.upload(S(90));
+ await f.db.query("INSERT INTO sessions.upload_resets(org_id,workspace_id,user_id,request_id,reset_at) VALUES($1,$2,$3,'r-1',now()-interval '1 hour')",[TENANT.orgId,TENANT.workspaceId,TENANT.userId]);
+ // Several sessions per batch; record r1-a is superseded by b-4 (the ACK keeps only the newest revision).
+ await f.deliver([["claude",S(1),["r1-a","r1-b"]],["claude",S(2),["r2-a","r2-b","r2-c"]],["codex",S(1),["c1-a"]]]);
+ await f.deliver([["claude",S(1),["r1-c"]],["claude",S(3),["r3-a","r3-b"]]]);
+ await f.deliver([["claude",S(2),["r2-d"]],["claude",S(4),["r4-a"]],["codex",S(3),["c3-a","c3-b"]]]);
+ await f.deliver([["claude",S(1),["r1-a"]],["claude",S(5),["r5-a","r5-b"]]]);
+ await f.upload(S(6),3);await f.upload(S(1),2,"claude",0);
+ // Another user in the same workspace with the same session ids, and a foreign org.
+ await f.deliver([["claude",S(1),["u2-a"]],["claude",S(7),["u2-b","u2-c"]]],U2);
+ await f.deliver([["claude",S(1),["ob-a"]]],OB);
+ const binds:Array<[string,{org?:string;user?:string}]>=[["user-1",{}],["user-2",{user:"user-2"}],["org-b",{org:"org-b"}]];
+ const proveAll=async()=>{await f.prove();await f.prove(NONE,{user:"user-2"});await f.prove(NONE,{org:"org-b"})};
+ const keys:Array<[string,string]>=[];for(const src of ["claude","codex"])for(const n of [1,2,3,4,5,6,7,8,90])keys.push([src,S(n)]);
+ const LIST="SELECT source,session_id,first_ts,last_ts,last_ts::text AS cursor_ts,stage_count,bytes::text AS bytes,user_id,admission_epoch,admission_version FROM ";
+ const STAGES="SELECT batch_id,stage_key,stage_sha256,stage_bytes::text AS stage_bytes,group_indexes,group_ordinals,kept_ordinals,reset_epoch::text AS reset_epoch,accepted_at,admission_epoch,admission_version FROM ";
+ const hp=[NONE.cutover,NONE.epoch,NONE.version,NONE.digest,NONE.kind,NONE.pending,NONE.baseline];
+ let compared=0;const trail:Array<[string,number,number]>=[];
+ /** Every binding: the whole list, the list paged by 2, and the detail of every (source, session) key. */
+ const same=async(label:string)=>{
+  const out:Record<string,{list:number;stages:number}>={};
+  for(const [who,bind] of binds){
+   const lists=await Promise.all(["sessions.buffered_sessions_for","ref044040.list"].map((fn)=>f.asReader(LIST+fn+"($1,null,null,null,100,$2,$3,$4,$5,$6,$7,$8)",[TENANT.workspaceId,...hp],bind)));
+   expect([label,who,lists[0]]).toEqual([label,who,lists[1]]);
+   for(const fn of ["sessions.buffered_sessions_for","ref044040.list"]){
+    const pages:any[]=[];let c:[string|null,string|null,string|null]=[null,null,null];
+    for(let i=0;i<20;i++){const r=await f.asReader(LIST+fn+"($1,$2,$3,$4,2,$5,$6,$7,$8,$9,$10,$11)",[TENANT.workspaceId,...c,...hp],bind);if(!r.length)break;pages.push(...r);const l=r.at(-1);c=[l.cursor_ts,l.session_id,l.source]}
+    expect([label,who,fn,pages]).toEqual([label,who,fn,lists[1]]);
+   }
+   let n=0;
+   for(const [src,session] of keys){
+    const got=await Promise.all(["sessions.buffered_session_stages_for","ref044040.stages"].map((fn)=>f.asReader(STAGES+fn+"($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",[TENANT.workspaceId,src,session,...hp],bind)));
+    expect([label,who,src,session,got[0]]).toEqual([label,who,src,session,got[1]]);n+=got[0].length;compared++;
+   }
+   out[who]={list:lists[0].length,stages:n};
+  }
+  trail.push([label,out["user-1"]!.list,out["user-1"]!.stages]);return out;
+ };
+ await proveAll();
+ const base=await same("base");
+ // Non-trivial: user-1 sees eight (source, session) keys over twelve stages (S(90) is hidden), user-2 and org-b their own.
+ expect(base).toEqual({"user-1":{list:8,stages:12},"user-2":{list:2,stages:2},"org-b":{list:1,stages:1}});
+ const one=await f.stages(S(1));
+ expect(one.map((s)=>[s.batch_id,s.kept_ordinals])).toEqual([["b-2",[1]],["b-3",[0]],["b-5",[0]],["b-7",[0,1]]]);
+ // A deletion (any origin) of one session, re-proven.
+ await f.db.query("INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id) VALUES($1,$2,$3,'some-other-origin','claude',$4)",[TENANT.orgId,TENANT.workspaceId,TENANT.userId,S(4)]);
+ await same("deletion, stale proof");await proveAll();
+ expect((await same("deletion"))["user-1"]).toEqual({list:7,stages:11});
+ // A replaced-stage ancestor chain: b-3's stage -> child -> grandchild, all on b-3's original claim.
+ const replace=async(parent:string)=>((await f.db.query(`INSERT INTO sessions.ingest_stage_intents
+   SELECT (jsonb_populate_record(NULL::sessions.ingest_stage_intents,to_jsonb(s)||jsonb_build_object('stage_token',gen_random_uuid(),'stage_key',s.stage_key||'-r','parent_stage_token',s.stage_token))).*
+     FROM sessions.ingest_stage_intents s WHERE s.stage_token=$1::uuid RETURNING stage_token::text t`,[parent])).rows[0] as any).t as string;
+ const orig=((await f.db.query("SELECT active_stage_token::text t FROM sessions.ingest_buffer_outbox WHERE batch_id='b-3'")).rows[0] as any).t as string;
+ const child=await replace(orig),grand=await replace(child);
+ await f.db.query("UPDATE sessions.ingest_buffer_outbox SET active_stage_token=$1::uuid WHERE batch_id='b-3'",[grand]);
+ expect((await same("chain"))["user-1"]).toEqual({list:7,stages:11});
+ expect((await f.stages(S(3))).map((s)=>s.batch_id)).toContain("b-3");
+ // The middle ancestor moved to a copied claim of the same batch: the chain no longer binds the original claim.
+ const copy=((await f.db.query(`INSERT INTO sessions.ingest_claim_attempts
+   SELECT (jsonb_populate_record(NULL::sessions.ingest_claim_attempts,to_jsonb(a)||jsonb_build_object('claim_token',gen_random_uuid()))).*
+     FROM sessions.ingest_claim_attempts a JOIN sessions.ingest_stage_intents s ON s.claim_token=a.claim_token AND s.stage_token=$1::uuid RETURNING claim_token::text t`,[child])).rows[0] as any).t;
+ await f.db.query("UPDATE sessions.ingest_stage_intents SET claim_token=$1::uuid WHERE stage_token=$2::uuid",[copy,child]);
+ const broken=await same("broken chain");
+ expect(broken["user-1"]!.stages).toBeLessThan(11);
+ await f.db.query("UPDATE sessions.ingest_stage_intents SET claim_token=(SELECT claim_token FROM sessions.ingest_stage_intents WHERE stage_token=$1::uuid) WHERE stage_token=$2::uuid",[orig,child]);
+ expect((await same("chain restored"))["user-1"]).toEqual({list:7,stages:11});
+ // A lazy-ACK decision at another admission version hides that claim's records.
+ await f.db.query("UPDATE sessions.ingest_lazy_ack_decisions d SET source_control_version=5 FROM sessions.ingest_claim_attempts a WHERE a.claim_token=d.claim_token AND a.batch_id='b-4'");
+ await same("lazy ack");
+ // Duplicate original ordinals: a repeated claim record (recn) and a repeated group ordinal (bad_stage).
+ await f.db.query("UPDATE sessions.ingest_claim_attempts SET records=records||jsonb_build_array(records->0) WHERE batch_id='b-5'");
+ await same("duplicate record ordinal");
+ await f.db.query("UPDATE sessions.ingest_stage_intents s SET group_ordinals=jsonb_set(s.group_ordinals,'{0}',(s.group_ordinals->0)||jsonb_build_array(s.group_ordinals->0->0)) FROM sessions.ingest_buffer_outbox o WHERE o.active_stage_token=s.stage_token AND o.batch_id='b-6'");
+ await same("duplicate group ordinal");
+ // The reset moves past b-3's acceptance: everything accepted at or before it hides.
+ const acc=((await f.db.query("SELECT committed_at::text t FROM sessions.ingest_batches WHERE batch_id='b-3'")).rows[0] as any).t;
+ await f.db.query("UPDATE sessions.upload_resets SET reset_at=$1::timestamptz WHERE request_id='r-1'",[acc]);
+ await same("reset, stale proof");await proveAll();
+ const reset=await same("reset");
+ expect(reset["user-1"]!.list).toBeGreaterThan(0);expect(reset["user-1"]!.list).toBeLessThan(7);
+ expect(compared).toBeGreaterThan(400);
+ // Each state changed what user-1 sees (user-2 and org-b stay 2/2 and 1/1 throughout), so parity covered every branch.
+ expect(trail).toEqual([["base",8,12],["deletion, stale proof",0,0],["deletion",7,11],["chain",7,11],["broken chain",6,9],["chain restored",7,11],
+  ["lazy ack",6,9],["duplicate record ordinal",6,8],["duplicate group ordinal",5,7],["reset, stale proof",2,2],["reset",2,2]]);
+});
+
+test("(bj) 044040 static: no locks or writes in either reader, and the keep blocks differ only in stg's driving head",async()=>{
+ const sql=readFileSync(join(root,SESSION_FIRST),"utf8");
+ const fns=[...sql.matchAll(/CREATE OR REPLACE FUNCTION sessions\.buffered_(?:sessions|session_stages)_for\([\s\S]*?END\n\$buffered_(?:sessions|stages)\$;/g)].map((m)=>m[0]);
+ expect(fns.length).toBe(2);
+ for(const fn of fns){
+  const code=fn.split("\n").filter((l)=>!l.trim().startsWith("--")).join("\n");
+  expect(code).not.toMatch(/\bFOR\s+(UPDATE|SHARE|NO\s+KEY\s+UPDATE|KEY\s+SHARE)\b|pg_(try_)?advisory|\bLOCK\s+TABLE\b|\b(INSERT|UPDATE|DELETE)\s|\bGRANT\b|\bREVOKE\b/i);
+ }
+ // No GRANT/REVOKE anywhere: CREATE OR REPLACE keeps 043700's ACL.
+ expect(sql.split("\n").filter((l)=>!l.trim().startsWith("--")).join("\n")).not.toMatch(/\b(GRANT|REVOKE)\b/);
+ const blocks=[...sql.matchAll(/-- keep-predicate:begin[\s\S]*?-- keep-predicate:end/g)].map((m)=>m[0]);
+ expect(blocks.length).toBe(2);
+ const noComments=(b:string)=>b.split("\n").filter((l)=>!l.trim().startsWith("--"));
+ const [list,stages]=blocks.map(noComments) as [string[],string[]];
+ const head=(lines:string[])=>{const i=lines.findIndex((l)=>l.includes("FROM sessions.")&&(l.includes("ingest_buffer_outbox AS o")||l.includes("ingest_claim_attempts AS a")));return i};
+ const i=head(list),j=head(stages);
+ // Before stg's FROM: identical.
+ expect(stages.slice(0,j)).toEqual(list.slice(0,i));
+ expect(list.slice(i,i+3)).toEqual(["      FROM sessions.ingest_buffer_outbox AS o","      JOIN sessions.ingest_stage_intents AS s ON s.stage_token = o.active_stage_token","      JOIN sessions.ingest_claim_attempts AS a ON a.claim_token = s.claim_token"]);
+ expect(stages.slice(j,j+3)).toEqual(["      FROM sessions.ingest_claim_attempts AS a","      JOIN sessions.ingest_stage_intents AS s ON a.claim_token = s.claim_token","      JOIN sessions.ingest_buffer_outbox AS o ON s.stage_token = o.active_stage_token"]);
+ // The detail adds exactly the session-first driving predicate; after it, the rest is identical.
+ const rest=(lines:string[],k:number)=>lines.slice(k+3).map((l)=>l.replace("     WHERE o.org_id","       AND o.org_id"));
+ const extra=["     WHERE jsonb_typeof(a.records) = 'array'","       AND a.records @> jsonb_build_array(jsonb_build_object('source', v_source, 'session_id', v_session))"];
+ const s=rest(stages,j),l=rest(list,i);
+ const at=s.findIndex((x)=>x===extra[0]);
+ expect(s.slice(at,at+2)).toEqual(extra);
+ expect([...s.slice(0,at),...s.slice(at+2)]).toEqual(l);
+ // Neither keeps 043700's dead "v_source IS NULL OR" branch, the correlated recn count or the per-stage GROUP BY.
+ const sqlCode=sql.split("\n").filter((l)=>!l.trim().startsWith("--")).join("\n");
+ expect(sqlCode).not.toContain("v_source IS NULL OR a.records");
+ expect(sqlCode).not.toContain("WHERE r2.stage_token = rc.stage_token");
+ expect(sqlCode).not.toContain("WHERE g2.stage_token = st.stage_token GROUP BY g2.ord");
+ // The 043700 keep blocks match 044040's list block, except recn and bad_stage (now MATERIALIZED) and the dropped dead line.
+ const old=[...readFileSync(join(root,MIGRATION),"utf8").matchAll(/-- keep-predicate:begin[\s\S]*?-- keep-predicate:end/g)].map((m)=>noComments(m[0]))[0]!;
+ const strip=(lines:string[])=>lines.filter((x)=>!/v_source IS NULL OR a\.records|g2\.|rc\.\*|r2\.|w\.|PARTITION BY/.test(x)).map((x)=>x.replace("bad_stage AS MATERIALIZED (","bad_stage AS ("));
+ expect(strip(list)).toEqual(strip(old));
 });
