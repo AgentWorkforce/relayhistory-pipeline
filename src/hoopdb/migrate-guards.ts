@@ -149,7 +149,8 @@ export interface RenameRefusal {
  *    with exactly `accepted_as_alias_of`: ledger_unknown_step;
  *  - an exact original row whose pinned repair is missing: ledger_alias_repair_missing;
  *  - only the release name, physically carrying the original `ledger_sha` (hand-edited
- *    history): migration_changed.
+ *    history), or any other sha the checksum guard would not accept for the planned
+ *    release file: migration_changed.
  * A refused alias's release name is absent from `effective`, so readiness reports it
  * as not applied; the migrator throws the first refusal before any write.
  * `fileSha` returns the planned step's file sha256, or undefined if it is not planned.
@@ -173,9 +174,15 @@ export function resolveRenamedLedger(
       refuse(a, "ledger_alias_collision",
         `the ledger records both ${a.ledger_name} and its release name ${a.migration}; nothing is marked, see the runbook decision point`);
     else if (release !== undefined) {
+      const planned = fileSha(a.migration);
       if (release === a.ledger_sha)
         refuse(a, "migration_changed",
           `migration ${a.migration} is recorded with the checksum of ${a.ledger_name}; that is hand-edited history, nothing is marked, see the runbook decision point`);
+      else if (planned !== undefined && !migrationChecksumMatches(a.migration, release, planned))
+        // The migrator's checksum guard refuses this row too; refusing it here keeps
+        // readiness (which reads only `effective`) in agreement with the migrator.
+        refuse(a, "migration_changed",
+          `migration ${a.migration} changed after it was applied; add a new migration instead`);
     } else if (original !== undefined) {
       if (original !== a.ledger_sha || fileSha(a.migration) !== a.accepted_as_alias_of)
         refuse(a, "ledger_unknown_step",
