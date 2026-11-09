@@ -369,10 +369,14 @@ export async function ingestAnalyticsConfig(env: IngestWorkerEnv): Promise<Analy
  * With analytics on, its flush (in waitUntil, same invocation) may spend up to WORKER_LIMITS.maxRequestsPerDrain
  * subrequests, so the Babysitter routing budget is computed against a cap that much smaller; the proven
  * INGEST_SUBREQUEST_CAP is never exceeded by analytics. Off (the default): the settings are unchanged.
+ * A cap the reservation would exhaust while Babysitter routing is on is refused (AnalyticsConfigError,
+ * every request 503 not_configured) rather than silently turning routing off.
  */
 export function reserveAnalyticsSubrequests(settings: IngestSettings, selection: AnalyticsConfig): IngestSettings {
   if (selection.sink === "noop" || settings.subrequestCap === undefined) return settings;
-  return { ...settings, subrequestCap: Math.max(0, settings.subrequestCap - WORKER_LIMITS.maxRequestsPerDrain) };
+  const reserved = settings.subrequestCap - WORKER_LIMITS.maxRequestsPerDrain;
+  if (reserved < 1 && settings.babysitterRetention) throw new AnalyticsConfigError("INGEST_SUBREQUEST_CAP", `must exceed the ${WORKER_LIMITS.maxRequestsPerDrain} subrequests ANALYTICS_SINK reserves while Babysitter routing is on`);
+  return { ...settings, subrequestCap: Math.max(0, reserved) };
 }
 
 export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: Run, target: WriteTarget, analytics?: AnalyticsPort) {
@@ -474,13 +478,13 @@ export default {
     try {
       settings = await ingestSettings(env);
       analyticsSelection = await ingestAnalyticsConfig(env);
+      if (settings) settings = reserveAnalyticsSubrequests(settings, analyticsSelection);
     } catch (error) {
       // A malformed setting: relayhistory's envelope, retryable, never a bare 500.
       logSettingsInvalid(error);
       return NOT_CONFIGURED();
     }
     if (!settings) return NOT_CONFIGURED();
-    settings = reserveAnalyticsSubrequests(settings, analyticsSelection);
     // One sink per invocation: captured during the request, exported once in waitUntil (WORKER_LIMITS).
     const analytics = createAnalyticsSink(analyticsSelection, "session-ingest", "worker", {
       report: (counters) => log.warn("analytics export degraded", analyticsCounterFields(analyticsSelection.sink, counters)),

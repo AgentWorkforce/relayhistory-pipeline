@@ -278,6 +278,8 @@ export class BatchingSink implements AnalyticsSink {
   private readonly sleep: (ms: number, signal: AbortSignal) => Promise<void>;
   private readonly random: () => number;
   private lastReport = Number.NEGATIVE_INFINITY;
+  /** The largest batch to build: maxBatchEvents, lowered by a 413 split (see deliver). */
+  private batchCap = Number.POSITIVE_INFINITY;
   private unreported = false;
 
   constructor(
@@ -322,6 +324,9 @@ export class BatchingSink implements AnalyticsSink {
 
   async flush(deadlineMs: number = this.limits.flushDeadlineMs): Promise<void> {
     const deadlineAt = this.nowMs() + Math.max(0, deadlineMs);
+    // ONE request budget for the whole flush, shared by every drain it starts: a Worker flush never
+    // spends more than maxRequestsPerDrain subrequests, however often it re-drains.
+    const budget = { requests: this.limits.maxRequestsPerDrain, deadlineAt };
     try {
       for (;;) {
         if (this.running) {
@@ -329,9 +334,11 @@ export class BatchingSink implements AnalyticsSink {
           if (this.nowMs() >= deadlineAt || this.stop.signal.aborted) return;
           continue;
         }
-        if (this.queue.length === 0 || this.nowMs() >= deadlineAt) return;
+        if (this.queue.length === 0 || this.nowMs() >= deadlineAt || budget.requests <= 0) return;
         const before = { queued: this.queue.length, requests: this.counters.export_requests };
-        await this.drain(deadlineAt);
+        // Raced against the flush deadline as well: the drain itself also never waits past it.
+        await this.until(this.drain(deadlineAt, budget), deadlineAt);
+        if (this.nowMs() >= deadlineAt) return;
         // A drain that sent nothing and moved nothing (its request budget is spent) ends this flush.
         if (this.counters.export_requests === before.requests && this.queue.length >= before.queued) return;
       }
@@ -365,7 +372,9 @@ export class BatchingSink implements AnalyticsSink {
     const onStop = () => local.abort();
     this.stop.signal.addEventListener("abort", onStop, { once: true });
     try {
-      await Promise.race([work, this.sleep(deadlineAt - this.nowMs(), local.signal)]);
+      // A real timer (never the injectable sleep, which a fake clock may resolve at once): this only
+      // bounds how long the caller waits for `work`.
+      await Promise.race([work, defaultSleep(deadlineAt - this.nowMs(), local.signal)]);
     } finally {
       local.abort();
       this.stop.signal.removeEventListener("abort", onStop);
@@ -389,9 +398,8 @@ export class BatchingSink implements AnalyticsSink {
   }
 
   /** One serialized export loop, bounded by `deadlineAt` and maxRequestsPerDrain. Never rejects. */
-  private drain(deadlineAt: number): Promise<void> {
+  private drain(deadlineAt: number, budget: { requests: number; deadlineAt: number } = { requests: this.limits.maxRequestsPerDrain, deadlineAt }): Promise<void> {
     if (this.running) return this.running;
-    const budget = { requests: this.limits.maxRequestsPerDrain, deadlineAt };
     // Deferred a microtask, so `running` is set before the loop can finish and clear it.
     const run = Promise.resolve().then(async () => {
       try {
@@ -419,7 +427,7 @@ export class BatchingSink implements AnalyticsSink {
     const now = this.nowMs();
     const batch: Queued[] = [];
     let bytes = 0;
-    while (this.queue.length > 0 && batch.length < this.limits.maxBatchEvents) {
+    while (this.queue.length > 0 && batch.length < Math.min(this.limits.maxBatchEvents, this.batchCap)) {
       const head = this.queue[0]!;
       if (head.deadlineAt <= now) {
         this.queue.shift();
@@ -461,6 +469,8 @@ export class BatchingSink implements AnalyticsSink {
       const outcome = await this.attempt(batch, timeout);
       if (outcome.kind === "accepted") {
         this.counters.accepted += batch.length;
+        // An accepted batch lets the 413 cap grow back, doubling, to maxBatchEvents.
+        if (this.batchCap < this.limits.maxBatchEvents) this.batchCap = Math.min(this.limits.maxBatchEvents, Math.max(batch.length, this.batchCap) * 2);
         return "done";
       }
       this.counters.export_failures++;
@@ -471,6 +481,9 @@ export class BatchingSink implements AnalyticsSink {
         // Bounded splitting: halves, each with the same deadline; a lone event that is still too large is lost.
         if (batch.length === 1 || depth >= 16) return this.lose(batch, "dropped_oversize");
         const mid = Math.ceil(batch.length / 2);
+        // Later batches start no larger than the half, so a deferred split is never re-merged into a
+        // batch the destination already refused (and re-sent, 413 after 413, until the deadline).
+        this.batchCap = Math.min(this.batchCap, mid);
         const first = await this.deliver(batch.slice(0, mid), deadlineAt, budget, depth + 1);
         if (first === "deferred") {
           this.requeue(batch.slice(mid));
@@ -482,8 +495,16 @@ export class BatchingSink implements AnalyticsSink {
       if (attempt >= this.limits.maxAttempts) return this.lose(batch, "dropped_exhausted");
       const backoff = Math.min(this.limits.backoffMaxMs, this.limits.backoffBaseMs * 2 ** (attempt - 1)) * (0.5 + this.random() / 2);
       const wait = outcome.retryAfterMs !== undefined ? Math.min(outcome.retryAfterMs, this.limits.retryAfterMaxMs) : backoff;
-      // Waiting consumes the same budget; a wait that would end past the deadline is not started.
+      // Waiting consumes the same budget; a wait that would end past the events' deadline is not started.
       if (this.nowMs() + wait >= deadlineAt) return this.lose(batch, "dropped_exhausted");
+      // Nor one past this drain's own deadline (a flush or shutdown deadline): the batch goes back to
+      // the head instead (a shutdown then counts it dropped_shutdown), so flush/shutdown never overrun.
+      if (this.nowMs() + wait >= budget.deadlineAt) {
+        // Nothing else fits this budget either: end it, so the flush does not re-send and re-defer.
+        budget.requests = 0;
+        this.requeue(batch);
+        return "deferred";
+      }
       await this.sleep(wait, this.stop.signal);
     }
   }

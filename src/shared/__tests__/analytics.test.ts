@@ -107,6 +107,12 @@ describe("envelope projector", () => {
   test("a trace id outside the opaque alphabet is replaced, never exported", () => {
     const p = projectEvent(readEvent({ traceId: "hello world <script>" }), READER) as AnalyticsEnvelope;
     expect(p.trace_id).toMatch(/^[0-9a-f-]{36}$/);
+    // The ingest edge only trims and slices a client X-Correlation-Id; the projector is the gate.
+    for (const traceId of ["a".repeat(129), "user@example.com", "sh_at_secret token", "", "x\ny"]) {
+      const q = projectEvent(readEvent({ traceId }), READER) as AnalyticsEnvelope;
+      expect(q.trace_id).not.toBe(traceId);
+      expect(q.trace_id).toMatch(/^[0-9a-f-]{36}$/);
+    }
     const ids = new Set([p.event_id, (projectEvent(readEvent(), READER) as AnalyticsEnvelope).event_id]);
     expect(ids.size).toBe(2);
   });
@@ -295,6 +301,60 @@ describe("delivery: retries, deadlines and splitting", () => {
     lone.capture(readEvent());
     await lone.flush();
     expect(lone.stats()).toMatchObject({ export_requests: 1, dropped_oversize: 1 });
+  });
+
+  test("shutdown(small) is bounded by its own deadline, not a long Retry-After (review repro: 429 Retry-After 30)", async () => {
+    let calls = 0;
+    const sink = collectorSink(READER, {
+      url: "https://collector.example/v1/events", token: "producer-token-0123456789abcdef", limits: { flushIntervalMs: 0 },
+      fetch: async () => { calls++; return new Response(null, { status: 429, headers: { "retry-after": "30" } }); },
+    });
+    sink.capture(readEvent());
+    const started = Date.now();
+    await sink.shutdown(1_000);
+    expect(Date.now() - started).toBeLessThan(1_500);
+    expect(calls).toBe(1);
+    expect(sink.stats()).toMatchObject({ accepted: 0, dropped_shutdown: 1 });
+  });
+
+  test("a timer drain sleeping on Retry-After cannot hold shutdown past its deadline", async () => {
+    const sink = collectorSink(READER, {
+      url: "https://collector.example/v1/events", token: "producer-token-0123456789abcdef", limits: { flushIntervalMs: 1 },
+      fetch: async () => new Response(null, { status: 503, headers: { "retry-after": "30" } }),
+    });
+    sink.capture(readEvent());
+    await new Promise((r) => setTimeout(r, 30));
+    const started = Date.now();
+    await sink.shutdown(200);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    const s = sink.stats();
+    expect(s.dropped_exhausted + s.dropped_shutdown).toBe(1);
+  });
+
+  test("one flush shares one request budget across all its drains", async () => {
+    const { transport, batches } = scripted({ kind: "accepted" });
+    const sink = new BatchingSink(READER, transport, { limits: { ...WORKER_LIMITS, maxBatchEvents: 2 } });
+    for (let i = 0; i < 10; i++) sink.capture(readEvent());
+    await sink.shutdown();
+    expect(batches.length).toBe(WORKER_LIMITS.maxRequestsPerDrain);
+    expect(sink.stats()).toMatchObject({ accepted: 4, dropped_shutdown: 6 });
+  });
+
+  test("a deferred 413 split is not re-merged into the refused batch size", async () => {
+    const seen: number[] = [];
+    const transport: AnalyticsTransport = { destination: "collector", async send(events) { seen.push(events.length); return events.length > 2 ? { kind: "too_large" } : { kind: "accepted" }; } };
+    const sink = new BatchingSink(READER, transport, { limits: { flushIntervalMs: 0, maxRequestsPerDrain: 2 } });
+    for (let i = 0; i < 8; i++) sink.capture(readEvent());
+    await sink.flush();
+    expect(seen).toEqual([8, 4]);
+    // The next flush starts from the halved size, never the refused 8 again.
+    seen.length = 0;
+    await sink.flush();
+    expect(Math.max(...seen)).toBeLessThanOrEqual(4);
+    await sink.flush();
+    await sink.flush();
+    expect(sink.stats().accepted + sink.queued()).toBe(8);
+    expect(seen.filter((n) => n === 8)).toHaveLength(0);
   });
 
   test("the Worker profile never exceeds its request budget (the ingest Worker's subrequest reservation)", async () => {

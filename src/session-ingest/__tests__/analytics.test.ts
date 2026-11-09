@@ -86,6 +86,9 @@ describe("ingest Worker analytics budget", () => {
     const on = reserveAnalyticsSubrequests(settings, { sink: "posthog", deploymentId: "d", host: "https://i.agentrelay.com", apiKey: "phc_testkey123" });
     expect(on.subrequestCap).toBe(100 - WORKER_LIMITS.maxRequestsPerDrain);
     expect(reserveAnalyticsSubrequests({ subrequestCap: 1 } as IngestSettings, { sink: "posthog", deploymentId: "d", host: "https://i.agentrelay.com", apiKey: "phc_testkey123" }).subrequestCap).toBe(0);
+    // Babysitter routing on with a cap the reservation would exhaust: refused, never silently routed off.
+    expect(() => reserveAnalyticsSubrequests({ subrequestCap: 2, babysitterRetention: true } as IngestSettings, { sink: "posthog", deploymentId: "d", host: "https://i.agentrelay.com", apiKey: "phc_testkey123" })).toThrow(/INGEST_SUBREQUEST_CAP/);
+    expect(reserveAnalyticsSubrequests({ subrequestCap: 3, babysitterRetention: true } as IngestSettings, { sink: "posthog", deploymentId: "d", host: "https://i.agentrelay.com", apiKey: "phc_testkey123" }).subrequestCap).toBe(1);
     const uncapped = {} as IngestSettings;
     expect(reserveAnalyticsSubrequests(uncapped, { sink: "posthog", deploymentId: "d", host: "https://i.agentrelay.com", apiKey: "phc_testkey123" })).toBe(uncapped);
   });
