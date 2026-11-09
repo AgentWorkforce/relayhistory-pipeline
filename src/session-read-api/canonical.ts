@@ -55,6 +55,18 @@ export class CanonicalReadError extends Error {
     this.name = "CanonicalReadError";
   }
 }
+/** A reason code token: snake_case only, so no id, key, path or free text can pass. */
+const REASON_CODE = /^[a-z][a-z0-9_]{0,63}$/u;
+/**
+ * Log fields for the codes behind a refusal (CanonicalReadError.details), e.g.
+ * `{ reason_codes: "manifest_missing,scope_too_large" }`: deduplicated, in order,
+ * non-code values dropped, `{}` when none survive. One string, so the shared log
+ * sanitizer (src/shared/log.ts, allowlisted `reason_codes`) scrubs and truncates it.
+ */
+export function canonicalReasonCodeFields(codes: readonly unknown[] | undefined): { reason_codes?: string } {
+  const kept = [...new Set((codes ?? []).filter((c): c is string => typeof c === "string" && REASON_CODE.test(c)))];
+  return kept.length > 0 ? { reason_codes: kept.join(",").slice(0, 256) } : {};
+}
 export interface CanonicalDeps {
   pointers(identity: CanonicalIdentity): Promise<CanonicalPointer[]>;
   store: ObjectStore;
