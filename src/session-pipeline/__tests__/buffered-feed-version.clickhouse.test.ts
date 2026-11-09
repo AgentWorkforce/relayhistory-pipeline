@@ -202,12 +202,13 @@ async function stage(store: ObjectStore, records: ReturnType<typeof batchRecords
     { claim_token: claim, batch_digest: sha(claim), received_at: receivedAt.toISOString(), org_id: ORG, workspace_id: WS, origin_id: ORIGIN, user_id: USER },
     grouped.groups, grouped.index);
   await putBufferedStage(store, prepared);
-  return { claim, grouped, prepared, decoded: await readBufferedStage(store, prepared.spec, zstd) };
+  // The stage token the feed RPC reports; buffered fingerprints are bound to it (bufferedFingerprint, #383).
+  return { claim, token: randomUUID(), grouped, prepared, decoded: await readBufferedStage(store, prepared.spec, zstd) };
 }
 
 /** A live stage as the 043870 stage() RPC would report it (everything retained). */
 function liveSource(s: Awaited<ReturnType<typeof stage>>, retained?: () => number[]): BufferedFeedSource {
-  const token = randomUUID();
+  const token = s.token;
   const state = (): StageState => ({
     found: true, status: "live", reason: null, retained: retained ? retained() : s.prepared.spec.groupOrdinals.flat().sort((a, b) => a - b),
     tenant: { orgId: ORG, workspaceId: WS, userId: USER }, originId: ORIGIN, batchId: `batch-${token}`, claimToken: s.claim,
@@ -263,7 +264,7 @@ suite("(d) feeder replay after canonical, through feedBufferedStageByKey (real C
   afterEach(() => { for (const done of cleanups.splice(0)) done(); });
   afterAll(async () => { await ch?.drop(); });
 
-  const eventIds = (s: Awaited<ReturnType<typeof stage>>) => projectBufferedStage(s.decoded, new Set(s.prepared.spec.groupOrdinals.flat()), "96bulls").rows.map((r) => r.row.event_id);
+  const eventIds = (s: Awaited<ReturnType<typeof stage>>) => projectBufferedStage(s.decoded, new Set(s.prepared.spec.groupOrdinals.flat()), "96bulls", s.token).rows.map((r) => r.row.event_id);
   const settle = async () => { await ch.command(`OPTIMIZE TABLE ${EVENTS_TABLE} FINAL`); };
 
   test("d1: replay of the SAME stage after its canonical pass: canonical survives (received_at < canonical read time)", async () => {
@@ -309,7 +310,7 @@ suite("(d) feeder replay after canonical, through feedBufferedStageByKey (real C
     await settle();
     // Retention later drops the later stage's records (e.g. GC / deletion): the recheck or the
     // erasure lane deletes exactly the buffered rows it wrote (origin + claim + fingerprint + version).
-    const rows = projectBufferedStage(later.decoded, new Set(later.prepared.spec.groupOrdinals.flat()), "96bulls").rows.map((r) => r.row);
+    const rows = projectBufferedStage(later.decoded, new Set(later.prepared.spec.groupOrdinals.flat()), "96bulls", later.token).rows.map((r) => r.row);
     await deleteBufferedRows(ch, rows);
     for (const id of eventIds(later)) {
       // DEFECT (version-order): the canonical event that S3 still holds is absent from the index
@@ -452,7 +453,7 @@ suite("reconcile deleteRows on an identity with canonical AND buffered copies (r
     const keys = await canonicalPass(store, ch, s, NOW);
     const source = liveSource(s);
     expect(await feedBufferedStageByKey(s.prepared.spec.key, feedDeps(source, store, ch))).toMatchObject({ outcome: "indexed", deleted: 0 });
-    const rows = projectBufferedStage(s.decoded, new Set(s.prepared.spec.groupOrdinals.flat()), "96bulls").rows.map((r) => r.row);
+    const rows = projectBufferedStage(s.decoded, new Set(s.prepared.spec.groupOrdinals.flat()), "96bulls", s.token).rows.map((r) => r.row);
     for (const r of rows) expect(await origins(r.event_id), r.event_id).toEqual(["buffered", "canonical"]);
     // Lightweight DELETE is a mutation; restart merges so it can complete (lightweight_deletes_sync = 2).
     await ch.command(`SYSTEM START MERGES ${EVENTS_TABLE}`);

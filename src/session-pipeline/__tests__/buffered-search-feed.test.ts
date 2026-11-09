@@ -948,7 +948,7 @@ describe("buffered feed version (S): created_at seconds with same-second refusal
     const store = newStore(), ch = fakeClickHouse();
     const { prepared, decoded } = await stageBatch(store);
     const at = "2026-11-07T11:30:00.000000Z";
-    const rows = projectBufferedStage(decoded, new Set(decoded.spec.groupOrdinals.flat()), "96bulls").rows.map((r) => r.row);
+    const rows = projectBufferedStage(decoded, new Set(decoded.spec.groupOrdinals.flat()), "96bulls", randomUUID()).rows.map((r) => r.row);
     // One canonical row (no origin column value = canonical default) and one buffered row of another identity.
     const { origin: _o, origin_claim_token: _t, ...canonical } = rows[0]! as typeof rows[0] & { origin?: string; origin_claim_token?: string };
     ch.rows.push({ ...canonical, fingerprint: "s3x", version: NOW }, { ...rows[1]! });
