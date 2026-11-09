@@ -3320,7 +3320,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const manifest = await migrateGuards.sessionsFunctionAclManifest();
     const previousManifest = Object.fromEntries(Object.entries(manifest).filter(([fn]) => !laterFns.has(fn.slice(0, fn.indexOf("(")))));
     const previousRelease = later.length ? spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(previousManifest) : undefined;
-    // Likewise its runtime application ACL catalog could not list a table or sequence a later step creates;
+    // Likewise its runtime application ACL catalog could not list a table, sequence or function a later step creates;
     // the current one does, so the ACL install (and the exact-ACL verifier) would fail on the missing relation
     // (42P01). Install and verify the previous catalog: the current one minus the relations later steps CREATE
     // (and the <table>_<column>_seq a serial/identity column of such a table implies). No later step: the
@@ -3334,6 +3334,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       tables: Object.fromEntries(Object.entries(catalog.tables).filter(([rel]) => !laterRels.has(rel))),
       sequences: catalog.sequences.filter((rel) => !laterRels.has(rel) && ![...laterRels].some((t) => rel.startsWith(`${t}_`) && rel.endsWith("_seq"))),
       rlsTables: catalog.rlsTables.filter((rel) => !laterRels.has(rel)),
+      // Its runtime EXECUTE grants likewise could not name a function a later step creates ($1::regprocedure).
+      functions: catalog.functions.filter((fn) => !laterFns.has(fn.slice(0, fn.indexOf("(")))),
     };
     const previousAcl = later.length ? spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(previousCatalog) : undefined;
     try {
