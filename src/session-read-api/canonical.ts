@@ -182,8 +182,22 @@ export function canonicalSourceGeneration(
  * every other read does no display work and returns exactly the pre-#184 snapshot. When
  * projected, a display-value refusal omits those rows (`displayOmitted`) instead of failing.
  */
-export function canonicalSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity, options: { directoryValues?: boolean } = {}) {
-  return snapshotWithLimits(deps, identity, CANONICAL_SCOPE_BYTES, 100000, MAX_POINTERS, 500000, options.directoryValues === true ? "optional" : undefined);
+export const CANONICAL_SCOPE_EVENTS = 100000;
+export function canonicalSnapshot(
+  deps: CanonicalDeps,
+  identity: CanonicalIdentity,
+  /**
+   * scopeBytes / scopeEvents: self-host only (serviceCanonicalDeps,
+   * READ_API_CANONICAL_SCOPE_BYTES / _EVENTS, validated there at startup).
+   * Absent: CANONICAL_SCOPE_BYTES / CANONICAL_SCOPE_EVENTS, as before.
+   */
+  options: { directoryValues?: boolean; scopeBytes?: number; scopeEvents?: number } = {},
+) {
+  return snapshotWithLimits(
+    deps, identity,
+    options.scopeBytes ?? CANONICAL_SCOPE_BYTES, options.scopeEvents ?? CANONICAL_SCOPE_EVENTS,
+    MAX_POINTERS, 500000, options.directoryValues === true ? "optional" : undefined,
+  );
 }
 /** Trusted Node producer only. Never called by the raw Worker request path. */
 export function canonicalProducerSnapshot(deps: CanonicalDeps, identity: CanonicalIdentity, profile: NodeReadProfile = "standard") {
