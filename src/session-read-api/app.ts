@@ -59,6 +59,7 @@ import { BriefSummaryError, briefSummaryResponse, type BriefSummary } from "./br
  * Org and workspace come only from the verified claims.
  */
 import { Hono, type Context } from "hono";
+import { captureSafely, type AnalyticsPort } from "../shared/analytics.ts";
 import { bodyLimit } from "hono/body-limit";
 import { ClickHouseError, type ClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import type { SearchServiceBinding } from "../session-pipeline/search-adapter.ts";
@@ -166,6 +167,12 @@ export interface ReadApiDeps {
   /** Epoch ms from which ClickHouse holds complete history; 0 = complete. */
   completeSinceMs: number;
   log?: (fields: Record<string, unknown>) => void;
+  /**
+   * Product analytics (src/shared/analytics.ts): one `session_read.request_completed` per /v1 request
+   * whose bearer verified (route pattern, outcome, latency bucket, the verified org/workspace). Absent =
+   * none. Captured after the answer is final; a sink can never change or fail the response.
+   */
+  analytics?: AnalyticsPort;
   timeoutMs?: number;
   /** The Supabase directory (list, activity); absent = those routes answer 501. */
   directory?: Directory;
@@ -402,9 +409,16 @@ export function createReadApi(deps: ReadApiDeps) {
     c.header("X-Sessions-Read-Backend", "96bulls");
     c.header("X-Correlation-Id", correlationId);
     const phases = c.get("obPhases");
+    const durationMs = Date.now() - started;
     log({
-      route: c.req.routePath, status: c.res.status, duration_ms: Date.now() - started, correlation_id: correlationId,
+      route: c.req.routePath, status: c.res.status, duration_ms: durationMs, correlation_id: correlationId,
       ...(phases && !phases.emitted ? phases.fields() : {}),
+    });
+    // Only a verified identity is attributed (workspace scope); an unauthenticated request is not an event.
+    const identity = c.get("identity") as VerifiedIdentity | undefined;
+    if (identity) captureSafely(deps.analytics, {
+      kind: "session_read.request_completed", traceId: correlationId, orgId: identity.orgId, workspaceId: identity.workspaceId,
+      route: c.req.routePath, status: c.res.status, durationMs,
     });
   });
 
