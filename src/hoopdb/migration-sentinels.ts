@@ -74,17 +74,39 @@ export const ADOPTABLE_INDEXES: Readonly<Record<string, readonly AdoptableIndex[
   ],
 };
 
-/** Read-only: one row, `e`, true when `$1` is an adoptable copy of the declared index ($1 name, $2 table, $3 def). */
-export const ADOPTABLE_INDEX_SQL = `SELECT (SELECT count(*) FROM pg_class WHERE relname = $1 AND relkind IN ('i', 'I')) = 1
-  AND EXISTS (SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
-    WHERE c.relname = $1 AND c.relnamespace = to_regnamespace('sessions') AND c.relkind = 'i'
-      AND i.indrelid = to_regclass($2) AND i.indisvalid AND i.indisready AND i.indislive
-      AND pg_get_indexdef(i.indexrelid) = $3) AS e`;
+/**
+ * Read-only catalog lookup (pg_class, pg_index, pg_constraint; no table lock): one row for the declared
+ * index ($1 name, $2 schema-qualified table, $3 def), with `state` and `table_exists`. `state` mirrors the
+ * step's own decision (20261105044020) and is one of:
+ *   absent     no relation of that name in sessions (the step creates it, or refuses on a populated table);
+ *   adoptable  the only index of that name anywhere, a plain index in sessions on exactly that table,
+ *              pg_get_indexdef exactly `def`, valid, ready and live, and backing no constraint;
+ *   not_ready  exact definition and table but INVALID or not ready: a failed CONCURRENTLY build, or one
+ *              still running (check pg_stat_progress_create_index before dropping anything);
+ *   mismatch   anything else of that name: another relkind, another table or definition, a second index
+ *              of that name in another schema, or an index backing a constraint (an EXCLUDE ... WITH =
+ *              btree index deparses exactly like the declared one; it is never adopted).
+ */
+export const ADOPTABLE_INDEX_STATE_SQL = `SELECT CASE
+    WHEN r.oid IS NULL THEN 'absent'
+    WHEN r.relkind <> 'i' THEN 'mismatch'
+    WHEN (SELECT count(*) FROM pg_class WHERE relname = $1 AND relkind IN ('i', 'I')) <> 1 THEN 'mismatch'
+    WHEN i.indexrelid IS NULL OR i.indrelid IS DISTINCT FROM to_regclass($2)
+      OR pg_get_indexdef(i.indexrelid) IS DISTINCT FROM $3::text THEN 'mismatch'
+    WHEN i.indisexclusion OR EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid = i.indexrelid) THEN 'mismatch'
+    WHEN NOT (i.indisvalid AND i.indisready AND i.indislive) THEN 'not_ready'
+    ELSE 'adoptable' END AS state,
+  to_regclass($2) IS NOT NULL AS table_exists
+  FROM (SELECT 1) one
+  LEFT JOIN pg_class r ON r.relnamespace = to_regnamespace('sessions') AND r.relname = $1
+  LEFT JOIN pg_index i ON i.indexrelid = r.oid`;
 
-/** All of a step's adoptable indexes are present, exact, valid and ready. */
+/** All of a step's adoptable indexes are present, exact, valid and ready, and back no constraint. */
 const adoptableIndexesSentinel = (step: string) =>
   `SELECT count(*) = ${ADOPTABLE_INDEXES[step]!.length} AS applied FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
-    WHERE c.relnamespace = to_regnamespace('sessions') AND i.indisvalid AND i.indisready AND i.indislive AND (c.relname, i.indrelid, pg_get_indexdef(i.indexrelid)) IN (${ADOPTABLE_INDEXES[step]!.map((x) => `('${x.name}', to_regclass('${x.table}'), '${x.def}')`).join(", ")})`;
+    WHERE c.relnamespace = to_regnamespace('sessions') AND i.indisvalid AND i.indisready AND i.indislive
+      AND NOT i.indisexclusion AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid = i.indexrelid)
+      AND (c.relname, i.indrelid, pg_get_indexdef(i.indexrelid)) IN (${ADOPTABLE_INDEXES[step]!.map((x) => `('${x.name}', to_regclass('${x.table}'), '${x.def}')`).join(", ")})`;
 
 export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105041000_ingest_privacy_authority.sql": {
