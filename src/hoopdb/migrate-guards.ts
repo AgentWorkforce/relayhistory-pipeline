@@ -304,21 +304,25 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
 ] as const;
 
 /**
- * The runtime application relations, read through one function by the ACL install
- * (migrate.ts installRuntimeApplicationAcl) and runtimeRoleViolations. Always exactly the
- * three constants above: every listed relation is granted and verified, fail-closed. The
- * indirection exists only so a test can model a previous release's binary (which could not
- * list a relation a later migration creates) the way it spies sessionsFunctionAclManifest.
+ * The runtime application relations and functions, read through one function by the ACL
+ * install (migrate.ts installRuntimeApplicationAcl), runtimeRoleViolations and the function
+ * ACL drift check/preview. Always exactly the three constants above plus
+ * RUNTIME_APPLICATION_FUNCTIONS below: every listed relation and function is granted and
+ * verified, fail-closed. The indirection exists only so a test can model a previous
+ * release's binary (which could not list a relation or function a later migration creates)
+ * the way it spies sessionsFunctionAclManifest.
  */
 export function runtimeApplicationAclCatalog(): {
   tables: Readonly<Record<string, readonly string[]>>;
   sequences: readonly string[];
   rlsTables: readonly string[];
+  functions: readonly string[];
 } {
   return {
     tables: RUNTIME_APPLICATION_TABLE_PRIVILEGES,
     sequences: RUNTIME_APPLICATION_SEQUENCES,
     rlsTables: RUNTIME_APPLICATION_RLS_TABLES,
+    functions: RUNTIME_APPLICATION_FUNCTIONS,
   };
 }
 
@@ -655,7 +659,7 @@ export async function runtimeRoleViolations(
         tables.ledger,
         tables.marker,
         [...applicationTables, ...catalog.sequences],
-        [...RUNTIME_APPLICATION_FUNCTIONS],
+        [...catalog.functions],
         RUNTIME_APPLICATION_POLICY,
         [...catalog.rlsTables],
       ],
@@ -901,10 +905,10 @@ export async function runtimeRoleViolations(
     )
   ).rows;
   for (const fnr of effectiveFunctions)
-    if (!RUNTIME_APPLICATION_FUNCTIONS.includes(fnr.fn as (typeof RUNTIME_APPLICATION_FUNCTIONS)[number]))
+    if (!catalog.functions.includes(fnr.fn))
       out.push(`EXECUTE on ${fnr.fn}`);
   if (phase === "post")
-    for (const fn of RUNTIME_APPLICATION_FUNCTIONS)
+    for (const fn of catalog.functions)
       if (!effectiveFunctions.some((row) => row.fn === fn))
         out.push(`missing EXECUTE on ${fn}`);
 
@@ -1975,10 +1979,11 @@ export async function sessionsFunctionAclDrift(
   runtimeRole: string,
 ): Promise<string[]> {
   const manifest = await sessionsFunctionAclManifest();
+  const runtimeFunctions = runtimeApplicationAclCatalog().functions;
   const expected: Record<string, string[]> = Object.fromEntries(
     Object.entries(manifest).map(([fn, entries]) => [
       fn,
-      (RUNTIME_APPLICATION_FUNCTIONS as readonly string[]).includes(fn)
+      runtimeFunctions.includes(fn)
         ? [...entries, `${runtimeRole}:EXECUTE`]
         : entries,
     ]),
@@ -2031,6 +2036,7 @@ export async function sessionsFunctionAclPreview(
   pendingMigrations = false,
 ): Promise<FunctionAclPreview> {
   const manifest = await sessionsFunctionAclManifest();
+  const runtimeFunctions = runtimeApplicationAclCatalog().functions;
   const actual = await sessionsFunctionAcl(client);
   const extra: string[] = [];
   const missing: string[] = [];
@@ -2045,7 +2051,7 @@ export async function sessionsFunctionAclPreview(
   };
   for (const fn of [...new Set([...Object.keys(manifest), ...Object.keys(actual)])].sort()) {
     const runtimeEntry =
-      runtimeRole && (RUNTIME_APPLICATION_FUNCTIONS as readonly string[]).includes(fn)
+      runtimeRole && runtimeFunctions.includes(fn)
         ? `${runtimeRole}:EXECUTE`
         : null;
     const expectedList = [...(manifest[fn] ?? []), ...(runtimeEntry ? [runtimeEntry] : [])];

@@ -18,7 +18,6 @@ import {
   migrationChecksumAlias,
   migrationChecksumMatches,
   resolveRenamedLedger,
-  RUNTIME_APPLICATION_FUNCTIONS,
   RUNTIME_APPLICATION_POLICY,
   runtimeApplicationAclCatalog,
   runtimeRoleViolations,
@@ -804,7 +803,7 @@ async function installRuntimeApplicationAcl(
     );
     await client.query(grant.rows[0]!.sql);
   }
-  for (const fn of RUNTIME_APPLICATION_FUNCTIONS) {
+  for (const fn of catalog.functions) {
     const grant = await client.query<{ sql: string }>(
       "SELECT format('GRANT EXECUTE ON FUNCTION %s TO %I', $1::regprocedure, $2::text) AS sql",
       [fn, role],
