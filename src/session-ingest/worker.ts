@@ -58,6 +58,7 @@ import { routingFlag } from "./babysitter-retention.ts";
 import { asyncAdmissionMode, syncAdmissionFrozenReceiptMode, type AdmissionMessage, type AsyncAdmissionMode } from "./async-admission.ts";
 import { admitMessage, type AdmissionAction } from "./admission-consumer.ts";
 import { lockAlertFields } from "./app.ts";
+import { sessionEraseConfig, sessionEraseEnabled, SESSION_ERASE_FLAG_VAR, SESSION_ERASE_SECRET_PREVIOUS_VAR, SESSION_ERASE_SECRET_VAR, type SessionEraseConfig } from "./session-erase.ts";
 import type { DeliverDeps } from "./deliver.ts";
 
 interface QueueLike<T> {
@@ -104,6 +105,12 @@ export interface IngestWorkerEnv {
   INGEST_SUBREQUEST_REDIRECTS?: string;
   /** "on" (any case): per-stage latency lines (deliver.ts StageLatencyFields). Default off. */
   INGEST_STAGE_LATENCY_LOG?: string;
+  /** Operator per-session erase route (session-erase.ts): exactly "1" enables; unset, "" or "0" is off (default). */
+  SESSION_ERASE_API_ENABLED?: string;
+  /** Secrets Store: the bearer Control sends on /internal/v1/session-erase/* (min 32 chars). Read only when enabled. */
+  SESSION_ERASE_API_SECRET?: SecretBinding | string;
+  /** Secrets Store: the previous bearer, accepted during a rotation only. */
+  SESSION_ERASE_API_SECRET_PREVIOUS?: SecretBinding | string;
 }
 
 interface SecretBinding {
@@ -165,6 +172,8 @@ export interface IngestSettings {
   asyncAdmission?: Exclude<AsyncAdmissionMode, "off">;
   /** INGEST_SYNC_ADMISSION_FROZEN_RECEIPT=on. Absent (the default): off. */
   syncAdmissionFrozenReceipt?: true;
+  /** SESSION_ERASE_API_ENABLED=1 (session-erase.ts). Absent (the default): the route answers 501. */
+  sessionErase?: SessionEraseConfig;
 }
 
 /** The settings, or null while any required one is missing (every request is then 503 not_configured). */
@@ -198,6 +207,14 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   // Async admission without its queue would refuse every opted-in batch: not configured.
   if (asyncMode !== "off" && !env.INGEST_ADMISSION) return null;
   const syncFrozenReceipt = syncAdmissionFrozenReceiptMode(env.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT);
+  // Default off; the secrets are read and validated only when the flag is exactly "1".
+  const sessionErase = sessionEraseEnabled(env.SESSION_ERASE_API_ENABLED)
+    ? sessionEraseConfig({
+        [SESSION_ERASE_FLAG_VAR]: env.SESSION_ERASE_API_ENABLED,
+        [SESSION_ERASE_SECRET_VAR]: await secret(env.SESSION_ERASE_API_SECRET),
+        [SESSION_ERASE_SECRET_PREVIOUS_VAR]: await secret(env.SESSION_ERASE_API_SECRET_PREVIOUS),
+      })
+    : undefined;
   return {
     bucket,
     region: env.INGEST_S3_REGION ?? "us-east-1",
@@ -220,6 +237,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(routingFlag(env.INGEST_STAGE_LATENCY_LOG) ? { stageLatencyLog: true as const } : {}),
     ...(asyncMode !== "off" ? { asyncAdmission: asyncMode } : {}),
     ...(syncFrozenReceipt === "on" ? { syncAdmissionFrozenReceipt: true as const } : {}),
+    ...(sessionErase ? { sessionErase } : {}),
   };
 }
 
@@ -305,6 +323,7 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: R
       ? { asyncAdmission: { mode: settings.asyncAdmission, enqueue: (message: AdmissionMessage) => env.INGEST_ADMISSION!.send(message) } }
       : {}),
     ...(settings.syncAdmissionFrozenReceipt ? { syncAdmissionFrozenReceipt: "on" as const } : {}),
+    ...(settings.sessionErase ? { sessionErase: settings.sessionErase } : {}),
   });
 }
 

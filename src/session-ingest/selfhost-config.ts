@@ -10,6 +10,10 @@
  *                                    unset | "" | "false" (default: off) | exactly "true"; anything else is a
  *                                    startup error. Serves POST /v1/delivery/sessions/selection with enabled:false
  *                                    (per-session erase) and needs migration 043910 applied.
+ *   SESSION_ERASE_API_ENABLED        operator per-session erase route (session-erase.ts): exactly "1" enables;
+ *                                    unset, "" or "0" is off; anything else is a startup error. With it,
+ *                                    SESSION_ERASE_API_SECRET (+ _PREVIOUS during a rotation; Secret-injected, min
+ *                                    32 chars). Flag off or secret unset: /internal/v1/session-erase/* answers 501.
  *
  * Enabled only (each missing or malformed value refuses startup, naming the variable, never the value):
  *   RELAYHISTORY_INGEST_ORIGIN       this edge's public origin, sent to relaycontrol as `aud` (must be the
@@ -38,6 +42,7 @@ import { assertDestinationUrl, destinationPolicy } from "../shared/destination-u
 import { normalizedAudience } from "@rhc/auth/relaycontrol.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import type pg from "pg";
+import { sessionEraseConfig, type SessionEraseConfig } from "./session-erase.ts";
 
 export const SELFHOST_INGEST_FLAG = "RELAYHISTORY_SELFHOST_INGEST";
 export const SELFHOST_INGEST_PORT_VAR = "RELAYHISTORY_INGEST_PORT";
@@ -62,6 +67,8 @@ export interface SelfhostIngestSettings {
   maxPerOrg: number;
   /** RELAYHISTORY_SELFHOST_SESSION_SELECTION: serve the per-session erase route. Default off. */
   sessionSelection: boolean;
+  /** SESSION_ERASE_API_ENABLED (session-erase.ts). Default: disabled, the route answers 501. */
+  sessionErase: SessionEraseConfig;
 }
 
 export type SelfhostIngestConfig = { enabled: false; port: number } | ({ enabled: true } & SelfhostIngestSettings);
@@ -143,6 +150,7 @@ function refuseHostedOnly(env: NodeJS.ProcessEnv): void {
 export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): SelfhostIngestConfig {
   if (!selfhostIngestEnabled(env)) return { enabled: false, port: port(env) };
   const sessionSelection = selfhostSessionSelectionEnabled(env);
+  const sessionErase = sessionEraseConfig(env);
   const policy = destinationPolicy(env);
   refuseHostedOnly(env);
   const originRaw = need(env, SELFHOST_INGEST_ORIGIN_VAR);
@@ -170,5 +178,6 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     maxPerUser: bounded(env, "INGEST_MAX_PER_USER", 4, 1, 1000),
     maxPerOrg: bounded(env, "INGEST_MAX_PER_ORG", 32, 1, 1000),
     sessionSelection,
+    sessionErase,
   };
 }
