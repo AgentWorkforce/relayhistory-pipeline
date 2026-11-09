@@ -95,7 +95,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: false
           outputs: type=oci,dest=${{ runner.temp }}/services.oci.tar
-          tags: ghcr.io/agentworkforce/96bulls-services:sha-${{ needs.preflight.outputs.sha }}
+          tags: ghcr.io/agentworkforce/sessions-pipeline:sha-${{ needs.preflight.outputs.sha }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.preflight.outputs.sha }}
@@ -135,7 +135,7 @@ jobs:
             --predicate "$RUNNER_TEMP/source-predicate.json" \
             --bundle "$RUNNER_TEMP/reviewed-source.sigstore.json" "$RUNNER_TEMP/services-index.json"
           node "$GITHUB_WORKSPACE/.publisher/scripts/image-release-provenance.mjs" verify
-      - name: Recheck CI then copy the exact OCI index to its source-SHA tag
+      - name: Recheck CI then copy the exact OCI index to its source-SHA tag in both repositories
         working-directory: .source
         env:
           GH_TOKEN: ${{ github.token }}
@@ -170,11 +170,12 @@ jobs:
           if (!/^[0-9a-f]{40}$/.test(e.SOURCE_SHA) || !/^[0-9a-f]{40}$/.test(e.WORKFLOW_SHA) ||
               !/^sha256:[0-9a-f]{64}$/.test(e.IMAGE_DIGEST) || !/^[1-9][0-9]*$/.test(e.SOURCE_CI_RUN)) throw Error('Invalid receipt fields');
           const receipt = { repository: 'https://github.com/AgentWorkforce/relayhistory-pipeline',
-            image: `ghcr.io/agentworkforce/96bulls-services@${e.IMAGE_DIGEST}`,
+            image: `ghcr.io/agentworkforce/sessions-pipeline@${e.IMAGE_DIGEST}`,
+            images: [`ghcr.io/agentworkforce/sessions-pipeline@${e.IMAGE_DIGEST}`, `ghcr.io/agentworkforce/96bulls-services@${e.IMAGE_DIGEST}`],
             source_sha: e.SOURCE_SHA, workflow_sha: e.WORKFLOW_SHA, source_ref: 'refs/heads/main',
             attestation_backend: 'sigstore', ci_run_id: e.SOURCE_CI_RUN, publish_run_id: e.GITHUB_RUN_ID, publish_run_attempt: e.GITHUB_RUN_ATTEMPT };
           writeFileSync(`${e.RUNNER_TEMP}/release-receipt.json`, JSON.stringify(receipt, null, 2) + '\n');
-          appendFileSync(e.GITHUB_STEP_SUMMARY, `Signed image: ${receipt.image}\nSource: ${receipt.source_sha}\nWorkflow: ${receipt.workflow_sha}\nSource CI: ${receipt.ci_run_id}\n`);
+          appendFileSync(e.GITHUB_STEP_SUMMARY, `Signed image: ${receipt.images.join(', ')}\nSource: ${receipt.source_sha}\nWorkflow: ${receipt.workflow_sha}\nSource CI: ${receipt.ci_run_id}\n`);
           JS
       - uses: actions/upload-artifact@v4
         with:
