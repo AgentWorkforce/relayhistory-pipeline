@@ -784,6 +784,19 @@ describe("append-only renamed migrations: adopted in memory only when every chec
     expect(r.effective).toEqual(new Map([[ingest!.migration, ingest!.accepted_as_alias_of]]));
   });
 
+  test("a release name with an unknown checksum is refused without changing the physical ledger", () => {
+    for (const alias of MIGRATION_RENAME_ALIASES) {
+      const ledger = new Map(MIGRATION_RENAME_ALIASES.map((a) => [a.migration as string, a.accepted_as_alias_of as string]));
+      ledger.set(alias.migration, "0".repeat(64));
+      const before = new Map(ledger);
+      const result = resolveRenamedLedger(ledger, fileSha);
+      expect(codes(result)).toEqual([[alias.migration, "migration_changed"]]);
+      expect(result.effective.has(alias.migration)).toBe(false);
+      expect(result.adopted).toEqual([]);
+      expect(ledger).toEqual(before);
+    }
+  });
+
   test("a current ledger passes through unchanged, and a plan holding the original name skips the alias", () => {
     const current = new Map(MIGRATION_RENAME_ALIASES.map((a) => [a.migration as string, a.accepted_as_alias_of as string]));
     expect(resolveRenamedLedger(current, fileSha)).toEqual({ effective: current, adopted: [], refusals: [] });
