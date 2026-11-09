@@ -18,6 +18,7 @@ import { BUFFERED_SEARCH_FEED_RUNTIME_ROLE } from "../buffered-feed-role.ts";
 import { BUFFERED_SEARCH_GATE_CONTRACT } from "../../session-read-api/buffered-search-gate.ts";
 import type { SessionScope } from "../pointer.ts";
 import {
+  assertOriginColumns,
   BUFFERED_FEED_DEFAULT_SINCE,
   bufferedFeedConfig,
   bufferedFeedGateRefusal,
@@ -55,8 +56,15 @@ function batchRecords(tag = "") {
   ];
 }
 
+/** system.columns rows for the origin columns as the feeder's DDL creates them (plain DEFAULT). */
+type ColumnRow = { name: string; type: string; default_kind: string; default_expression: string };
+const ORIGIN_COLUMN_ROWS: readonly ColumnRow[] = [
+  { name: "origin", type: "LowCardinality(String)", default_kind: "DEFAULT", default_expression: "'canonical'" },
+  { name: "origin_claim_token", type: "String", default_kind: "DEFAULT", default_expression: "''" },
+];
+
 /** An in-memory transcript_events speaking the statements both indexers send. */
-function fakeClickHouse(opts: { originColumns?: boolean } = {}) {
+function fakeClickHouse(opts: { originColumns?: false | readonly ColumnRow[] } = {}) {
   const rows: (IndexRow & { origin?: string; origin_claim_token?: string })[] = [];
   const tsMs = (r: IndexRow) => Date.parse(`${r.ts.replace(" ", "T")}Z`);
   const identity = (r: IndexRow) => [r.org_id, r.workspace_id, tsMs(r), r.session_id, r.source, r.machine_id, r.kind, r.event_id].join("|");
@@ -95,8 +103,11 @@ function fakeClickHouse(opts: { originColumns?: boolean } = {}) {
     },
     async select<T>(query: string, options?: { params?: Record<string, unknown> }) {
       if (query.includes("search_ingest_state")) return [] as T[];
-      if (query.includes("system.columns"))
-        return (opts.originColumns === false ? [] : [{ name: "origin", type: "LowCardinality(String)", default_expression: "'canonical'" }, { name: "origin_claim_token", type: "String", default_expression: "''" }]) as T[];
+      if (query.includes("system.columns")) {
+        // The check must read the default kind, not only type and expression.
+        expect(query).toContain("default_kind");
+        return (opts.originColumns === false ? [] : [...(opts.originColumns ?? ORIGIN_COLUMN_ROWS)]) as T[];
+      }
       const p = options!.params!;
       return final()
         .filter((r) => r.org_id === p.org && (r.session_id === p.session || r.session_id === p.canonical) && r.workspace_id === p.workspace && r.source === p.source && tsMs(r) >= Number(p.from))
@@ -503,6 +514,34 @@ describe("buffered-stage search feed", () => {
     const forged = memorySource(entry(() => ({ ...liveState(prepared, t, "x"), claimToken: randomUUID() })));
     expect(await feedBufferedStageByKey(prepared.spec.key, feedDeps(forged.source, store, ch.ch))).toEqual({ outcome: "skipped", reason: "stage_claim_mismatch" });
     expect(ch.rows).toEqual([]);
+  });
+
+  test("origin columns: type, default kind and default expression must all match; MATERIALIZED or ALIAS refuses", async () => {
+    await expect(assertOriginColumns(fakeClickHouse().ch)).resolves.toBeUndefined();
+    const variants: [string, Partial<ColumnRow>][] = [
+      ["MATERIALIZED", { default_kind: "MATERIALIZED" }],
+      ["ALIAS", { default_kind: "ALIAS" }],
+      ["EPHEMERAL", { default_kind: "EPHEMERAL" }],
+      ["no default", { default_kind: "", default_expression: "" }],
+      ["type", { type: "String" }],
+      ["expression", { default_expression: "'buffered'" }],
+    ];
+    for (const column of ORIGIN_COLUMN_ROWS)
+      for (const [label, over] of variants) {
+        if (label === "type" && column.name === "origin_claim_token") continue; // String is already its type
+        const rows = ORIGIN_COLUMN_ROWS.map((r) => (r.name === column.name ? { ...r, ...over } : r));
+        await expect(assertOriginColumns(fakeClickHouse({ originColumns: rows }).ch), `${column.name} ${label}`).rejects.toMatchObject({ code: "origin_columns_missing" });
+      }
+    // Only one of the two columns present.
+    await expect(assertOriginColumns(fakeClickHouse({ originColumns: ORIGIN_COLUMN_ROWS.slice(0, 1) }).ch)).rejects.toMatchObject({ code: "origin_columns_missing" });
+    // Through the feeder: a MATERIALIZED origin column refuses before any row is written.
+    const store = newStore();
+    const { prepared } = await stageBatch(store);
+    const t = "00000000-0000-4000-8000-000000000009";
+    const materialized = fakeClickHouse({ originColumns: ORIGIN_COLUMN_ROWS.map((r) => (r.name === "origin" ? { ...r, default_kind: "MATERIALIZED" } : r)) });
+    const source = memorySource([{ candidate: { stageToken: t, createdAt: "x", tenant: { orgId: ORG, workspaceId: WS, userId: USER }, originId: ORIGIN, batchId: "b" }, state: () => liveState(prepared, t, "x") }]).source;
+    await expect(feedBufferedStageByKey(prepared.spec.key, feedDeps(source, store, materialized.ch))).rejects.toMatchObject({ code: "origin_columns_missing" });
+    expect(materialized.rows).toEqual([]);
   });
 
   test("config: default off; only the literal 'on' arms it; bounds refuse", () => {

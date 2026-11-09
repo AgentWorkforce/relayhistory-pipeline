@@ -77,7 +77,15 @@ import { BUFFERED_SEARCH_GATE_CONTRACT } from "../session-read-api/buffered-sear
 export const BUFFERED_FINGERPRINT_PREFIX = "bf";
 /** The read-side gate's marker values and columns (#338 buffered-search-gate.ts ORIGIN_*). */
 export const ORIGIN_BUFFERED = "buffered";
-export const ORIGIN_COLUMNS = { origin: { type: "LowCardinality(String)", default: "'canonical'" }, origin_claim_token: { type: "String", default: "''" } } as const;
+/**
+ * Each origin column's exact system.columns definition. `kind` is system.columns.default_kind: only
+ * a plain DEFAULT stores what the feeder inserts (a MATERIALIZED or ALIAS column of the same type
+ * and expression would reject or ignore the explicit value and read back 'canonical').
+ */
+export const ORIGIN_COLUMNS = {
+  origin: { type: "LowCardinality(String)", kind: "DEFAULT", default: "'canonical'" },
+  origin_claim_token: { type: "String", kind: "DEFAULT", default: "''" },
+} as const;
 /** The buffered cutover: the first buffered acceptance in production. */
 export const BUFFERED_FEED_DEFAULT_SINCE = "2026-11-05T05:33:45.000Z";
 export const BUFFERED_FEED_DEFAULT_CURSOR = "backfill-20261105";
@@ -318,17 +326,18 @@ export function projectBufferedStage(decoded: DecodedBufferedStage, retained: Re
 // ---------------------------------------------------------------- ClickHouse
 
 /**
- * The origin columns exist with exactly the read gate's definitions. Without them an insert
- * would either fail or (on a server that drops unknown JSON fields) land rows as canonical.
+ * The origin columns exist with exactly the read gate's definitions (type, default kind and
+ * default expression). Without them an insert would either fail or (on a server that drops
+ * unknown JSON fields, or with a MATERIALIZED/ALIAS column) land rows as canonical.
  */
 export async function assertOriginColumns(ch: ClickHouseClient): Promise<void> {
-  const rows = await ch.select<{ name: string; type: string; default_expression: string }>(
-    `SELECT name, type, default_expression FROM system.columns
+  const rows = await ch.select<{ name: string; type: string; default_kind: string; default_expression: string }>(
+    `SELECT name, type, default_kind, default_expression FROM system.columns
      WHERE database = currentDatabase() AND table = {table:String} AND name IN ('origin', 'origin_claim_token')`,
     { params: { table: EVENTS_TABLE }, timeoutMs: 10_000 });
   for (const [name, want] of Object.entries(ORIGIN_COLUMNS)) {
     const got = rows.find((r) => r.name === name);
-    if (!got || got.type !== want.type || got.default_expression !== want.default) throw new BufferedFeedError("origin_columns_missing");
+    if (!got || got.type !== want.type || got.default_kind !== want.kind || got.default_expression !== want.default) throw new BufferedFeedError("origin_columns_missing");
   }
 }
 
