@@ -11,7 +11,7 @@
  * then walks to the DLQ for an operator, never silently dropped).
  */
 import type { DeliverDeps } from "./deliver.ts";
-import { deliverPrepared, IngestUnavailable } from "./deliver.ts";
+import { ClaimLockBusy, deliverPrepared, IngestUnavailable } from "./deliver.ts";
 import { LedgerUnavailableError, type FrozenWitnessInput, type LedgerTenant } from "./ledger.ts";
 import { DeliveryBusyError, DeliveryError } from "./vendor/delivery/delivery-contracts.ts";
 import type { PreparedDelivery } from "./vendor/delivery/prepare.ts";
@@ -54,6 +54,9 @@ function witnessInput(tenant: LedgerTenant, p: PreparedDelivery): FrozenWitnessI
 function classify(error: unknown, attempts: number): AdmissionAction | { terminal: string } {
   // A reset / re-enable is in flight for this user: wait for it (never admit across it).
   if (error instanceof IngestUnavailable && error.cause_code === new PrivacyControlPending().code) return { action: "retry", delaySeconds: 15, code: "privacy_control_pending", stage: error.stage, error };
+  // INGEST_CLAIM_LOCK_BUSY turns a claim lock wait into a 429 for the HTTP client only: the queue keeps
+  // the IngestUnavailable backoff, code and stage, so the flag changes nothing on this path.
+  if (error instanceof ClaimLockBusy) return { action: "retry", delaySeconds: backoffSeconds(attempts), code: error.cause_code, stage: error.stage, error };
   if (error instanceof DeliveryBusyError) return { action: "retry", delaySeconds: error.retryAfterSeconds, code: error.code, error };
   if (error instanceof IngestUnavailable) return { action: "retry", delaySeconds: backoffSeconds(attempts), code: error.cause_code, stage: error.stage, error };
   // 403 (another user's record), 409 (batch id / revision conflict, privacy superseded), 413/422 (budget), 400: the same answer forever.

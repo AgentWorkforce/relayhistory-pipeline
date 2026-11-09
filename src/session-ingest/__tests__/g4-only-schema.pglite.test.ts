@@ -104,6 +104,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // A new table and read API functions only; no ingest path touches them.
       "20261105044000_read_api_tokens.sql",
       "20261105044010_selfhost_erase_lock_fences.sql",
+      // Eight org_id btree indexes on existing ingest tables only; no function or column.
+      "20261105044020_claim_bootstrap_org_indexes.sql",
       // A read API function overload and an index on session_directory_agents; no ingest path touches them.
       "20261105050020_session_directory_agent_match.sql",
     ]);

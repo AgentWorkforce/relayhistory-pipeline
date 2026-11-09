@@ -60,7 +60,7 @@ import {
 } from "../../shared/vendor.ts";
 import { sqlPipelineEventSink } from "../../hoopdb/sink.ts";
 import { buildIngestApp } from "../ingest.ts";
-import { expectedMigrationNames, generation } from "../../hoopdb/migrate.ts";
+import { expectedMigrationNames, expectedSchema, generation } from "../../hoopdb/migrate.ts";
 import { mintToken } from "../auth.ts";
 import { runCourierOnce, type CourierConfig } from "../courier.ts";
 import { mintTenantToken } from "../../proof/aws/ingest.ts";
@@ -511,13 +511,15 @@ describe("buildIngestApp auth (production composition)", () => {
   test("/readyz is 503 until the Worker role validation is PASS for this image's generation", async () => {
     const { app, env } = await ingest();
     // This file applies the migrations directly, so record the ledger the migrator
-    // would have written: the schema gate passes and only the marker is under test.
+    // would have written. The fixture records each file's sha256 so the schema gate
+    // (now checksum-aware) passes and only the marker is under test.
     await db.exec(`CREATE TABLE sessions.__96bulls_migrations (
       name text PRIMARY KEY, sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`);
+    const { shas } = await expectedSchema();
     for (const name of await expectedMigrationNames())
       await db.query(
-        "INSERT INTO sessions.__96bulls_migrations (name, sha256) VALUES ($1, 'x')",
-        [name],
+        "INSERT INTO sessions.__96bulls_migrations (name, sha256) VALUES ($1, $2)",
+        [name, shas[name] ?? "x"],
       );
     const ready = async () => {
       const r = await app.request("/readyz", {}, env);
