@@ -17,6 +17,7 @@ import { lazyAckClockNoKeyUpdate, originalBodies as originalAckClockBodies } fro
 import { privacyAuthority, originalLazyBodies, originalMirrorBodies } from "../../../scripts/sessions-function-boundary/lanes/privacy-authority.ts";
 import { bufferedSearchGateRetiredWitness, originalGateBody } from "../../../scripts/sessions-function-boundary/lanes/buffered-search-gate-retired-witness.ts";
 import { createHash } from "node:crypto";
+import { ingestGenerationOverlap, originalBodies as originalOverlapBodies } from "../../../scripts/sessions-function-boundary/lanes/ingest-generation-overlap.ts";
 import type { LaneManifest } from "../../../scripts/sessions-function-boundary/types.ts";
 import { VERIFIERS } from "../../../scripts/sessions-function-boundary/verifiers.ts";
 import { run } from "../../../scripts/sync-sessions-function-boundary.ts";
@@ -73,8 +74,38 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105043890_buffered_search_gate_retired_witness.down.sql",
       "supabase/rollbacks/20261105043910_selfhost_session_selection_erase.down.sql",
       "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql",
+      "supabase/rollbacks/20261105044030_ingest_generation_overlap.down.sql",
       "supabase/rollbacks/20261105050020_session_directory_agent_match.down.sql",
     ]);
+  });
+
+  test("the 044030 generation overlap adds six owner-only functions, grants no runtime role anything, and derives its exact guarded rollback", async () => {
+    const withLane = await generate(repo, LANES, VERIFIERS);
+    const without = await generate(repo, LANES.filter((l) => l !== ingestGenerationOverlap), VERIFIERS);
+    const downPath = "supabase/rollbacks/20261105044030_ingest_generation_overlap.down.sql";
+    expect(withLane.summary.lanes["ingest-generation-overlap"]).toEqual({ functions: 6, replaces: 2, grants: 0 });
+    // Every role verifier is byte-identical with and without the lane: no runtime capability changes.
+    for (const v of VERIFIERS) expect(withLane.outputs[v.path]).toBe(without.outputs[v.path]);
+    const acl = JSON.parse(withLane.outputs["src/hoopdb/sessions-function-acl.json"]!).functions as Record<string, string[]>;
+    const mine = Object.keys(acl).filter((k) => k.startsWith("sessions.ingest_generation_overlap_")).sort();
+    expect(mine).toEqual(["sessions.ingest_generation_overlap_admits(text,text,text)", "sessions.ingest_generation_overlap_close(jsonb)",
+      "sessions.ingest_generation_overlap_immutable()", "sessions.ingest_generation_overlap_open(jsonb)",
+      "sessions.ingest_generation_overlap_policy_retire()", "sessions.ingest_generation_overlap_retired_immutable()"]);
+    for (const k of [...mine, "sessions.ingest_require_generation(text)", "sessions.ingest_lazy_guard(text)"]) expect(acl[k]).toEqual(["<owner>:EXECUTE"]);
+    const down = withLane.outputs[downPath]!;
+    expect(down).toContain(createHash("sha256").update(readFileSync(join(root, ingestGenerationOverlap.migration!), "utf8")).digest("hex"));
+    const [generationBody, guardBody] = originalOverlapBodies(
+      readFileSync(join(root, "supabase/migrations/20261104050000_buffered_upload_receipts.sql"), "utf8"),
+      readFileSync(join(root, "supabase/migrations/20261104055000_lazy_current_custody.sql"), "utf8"));
+    expect(generationBody).toContain("AND generation=p_expected AND status='pass' FOR SHARE;");
+    expect(guardBody).toContain("IF v_gen IS NULL OR pol.generation<>v_gen");
+    expect(down).toContain(generationBody!);
+    expect(down).toContain(guardBody!);
+    expect(down.indexOf("status='pending'")).toBeLessThan(down.indexOf(generationBody!));
+    expect(down.indexOf(guardBody!)).toBeLessThan(down.indexOf("DROP TABLE sessions.ingest_generation_overlap_windows;"));
+    expect(down).toContain("a later migration is applied");
+    expect(down).toContain("own applied checksum required");
+    expect(down.trim().endsWith("COMMIT;")).toBe(true);
   });
 
   test("the GC replacement changes no ACL/boundary/verifier capability and derives its exact guarded rollback", async () => {

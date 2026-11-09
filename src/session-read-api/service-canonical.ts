@@ -58,6 +58,7 @@ import type { TimingDeps, TurnsDeps } from "./app.ts";
 import type { CatalogDeps } from "./selfhost.ts";
 
 export interface ServiceCanonicalDeps {
+  events: import("./canonical-events.ts").CanonicalEventsDeps;
   timing: TimingDeps;
   turns: TurnsDeps;
   catalog: CatalogDeps;
@@ -93,7 +94,7 @@ export async function serviceCanonicalDeps(
   const gcsToken = gcs ? cachedProvider(() => gcsMetadataToken(env)) : undefined;
   const prefix = { PIPELINE_KEY_PREFIX: env.PIPELINE_KEY_PREFIX || undefined, PIPELINE_ORG_FROM_PREFIX: "true" };
   const pointers = sqlCanonicalPointers(run);
-  async function source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows> {
+  async function source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows & { generation: string; exists: boolean }> {
     // Every object read of this request is aborted at the route's deadline.
     const bounded: typeof fetch = (input, init) => fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal });
     const raw = buildLockerStore(env, { fetch: bounded, ...(credentials ? { credentials } : {}), ...(gcsToken ? { gcsToken } : {}) });
@@ -101,9 +102,10 @@ export async function serviceCanonicalDeps(
       { store: raw.store, provider: raw.provider, bucket: raw.bucket, prefix, pointers: pointers.pointers, decompress },
       identity,
     );
-    return { rows: snapshot.rows, legacyCoverage: snapshot.legacyCoverage };
+    return { rows: snapshot.rows, legacyCoverage: snapshot.legacyCoverage, generation: snapshot.generation, exists: snapshot.exists };
   }
   return {
+    events: { source },
     timing: { state: pointers.state, source, assumeNoTurns: env.READ_API_TIMING_ASSUME_NO_TURNS?.trim() === "true" },
     turns: { harnesses: sqlSessionHarnesses(run), source, assumeNoLegacy: env.READ_API_TURNS_ASSUME_NO_LEGACY === "true" },
     catalog: { state: pointers.state, source },

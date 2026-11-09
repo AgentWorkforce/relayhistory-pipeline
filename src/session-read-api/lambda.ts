@@ -522,7 +522,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     briefTitles: sqlBriefTitles(poolTenantRunner(pool as never)),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
-    ...(canonical ? { timing: canonical.timing, turns: canonical.turns } : {}),
+    ...(canonical ? { timing: canonical.timing, turns: canonical.turns, canonicalEvents: canonical.events } : {}),
     ...eventMessageIdDeps(env, canonical?.turns),
     ...agentMatchDeps(env),
     ...(authConfig.selfIssued ? { selfIssued: { ...authConfig.selfIssued, store: sqlTokenStore(pool as never) } } : {}),
