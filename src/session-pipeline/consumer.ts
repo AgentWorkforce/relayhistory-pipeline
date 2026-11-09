@@ -10,7 +10,7 @@
  * batch response); SQS redelivers them after the visibility timeout and moves
  * them to the DLQ after `maxReceiveCount`.
  */
-import { errorFields, log } from "../shared/log.ts";
+import { errorFields, log, searchIndexErrorDetail } from "../shared/log.ts";
 import { parseQueueBody, sequencerAfter, type LandedEvent } from "./s3-events.ts";
 import { indexPointer, type PointerDeps, type SessionScope } from "./pointer.ts";
 import { indexSearchScope, type SearchIndexDeps } from "./search-index.ts";
@@ -186,6 +186,7 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           org_id: scope.orgId,
           session_id: scope.sessionId,
           ...errorFields(error),
+          ...searchIndexErrorDetail(error),
           duration_ms: Date.now() - started,
         });
         for (const id of messageIds) failed.add(id);

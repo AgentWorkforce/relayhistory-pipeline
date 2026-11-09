@@ -53,11 +53,12 @@ import {
 import { parseSelfhostLoginSync, parseSelfhostReadApi } from "./selfhost.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { parseCompleteSince, parseFactsBackend, readApiRouteEnabled, READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND } from "./config.ts";
-import { sqlNarrativeCache } from "./digest-narrative.ts";
+import { sqlNarrativeCache, type DigestNarrativeDeps } from "./digest-narrative.ts";
 import { postgresOutputBackend } from "./postgres/output-query.ts";
 import { postgresDigestBackend } from "./postgres/digest-query.ts";
 import { poolTenantRunner, sqlLiveness, type SqlQuery } from "./liveness.ts";
 import { serviceCanonicalDeps } from "./service-canonical.ts";
+import { digestEnabled, digestNarrativeModel, selfhostNarrativeFromEnv } from "./digest-narrative-selfhost.ts";
 import {
   ACCESS_TTL_SECONDS_DEFAULT,
   ACCESS_TTL_SECONDS_MAX,
@@ -488,7 +489,7 @@ export function factsBackends(env: NodeJS.ProcessEnv, entry: ReadAppEntry) {
  * selected search binding (the ClickHouse client or the composition's adapter,
  * never both), directory/liveness SQL and the self-host login. `close` releases
  * the pool. readAppFromSecret adds the verifier from `authConfig`. */
-export async function readApiDepsFromSecret(secretText: string, env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition, options: ReadAppOptions = {}): Promise<{ deps: Omit<ReadApiDeps, "verify">; authConfig: AuthConfig; close(): Promise<void> }> {
+export async function readApiDepsFromSecret(secretText: string, env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition, options: ReadAppOptions = {}): Promise<{ deps: Omit<ReadApiDeps, "verify">; authConfig: AuthConfig; close(): Promise<void>; digestNarrative?: DigestNarrativeDeps }> {
   const entry = options.entry ?? "lambda";
   const backend = searchBackend(env, composition, entry);
   const completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
@@ -507,6 +508,9 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   if (authConfig.mode === "self_issued" && entry !== "service")
     throw new Error("session read api: READ_API_AUTH_MODE=self_issued is served only by the self-host service");
   const corsAllowedOrigins = entry === "service" ? readApiCorsOrigins(env) : undefined;
+  // Env only, before any pool opens: with READ_API_DIGEST_ENABLED=1 an invalid narrative model
+  // id refuses the service. With the flag off no narrative variable is read.
+  if (entry === "service" && digestEnabled(env)) digestNarrativeModel(env);
   const pool = new pg.Pool({
     ...target,
     max: 2,
@@ -521,6 +525,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     options: "-c statement_timeout=2000", // Nonempty: pg otherwise uses PGOPTIONS.
   });
   pool.on("error", (err) => log.error("read api pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
+  let narrative: Awaited<ReturnType<typeof selfhostNarrativeFromEnv>>;
   try {
   // Directory, liveness and Postgres search isolation is forced RLS. Checked on
   // the service always and on any portable (Postgres) search binding; the hosted
@@ -535,16 +540,22 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   // their 501 `*_not_configured` there).
   const canonical = entry === "service" ? await serviceCanonicalDeps(env, poolTenantRunner(pool as never)) : undefined;
   const liveness = sqlLiveness(poolTenantRunner(pool as never));
+  // The self-host service only, READ_API_DIGEST_ENABLED=1 (digest-narrative-selfhost.ts): the
+  // narrative cache on this read pool and, with a model, key and READ_API_DIGEST_NARRATIVE_DB_URL,
+  // in-process generation through a separate writer pool. Also returned beside `deps`; it serves
+  // GET /v1/digest/daily only through the Postgres digest backend below (deps.digest).
+  narrative = entry === "service" ? await selfhostNarrativeFromEnv(env, poolTenantRunner(pool as never)) : undefined;
   // The self-host service only (factsBackends refuses postgres elsewhere): Output and the digest
   // from the Postgres facts through the read role, no ClickHouse. "clickhouse" there wires
   // nothing, as before (the service has no ClickHouse client: 501 *_not_configured).
   const factsDeps = { run: poolTenantRunner(pool as never), liveness };
   const outputDeps = facts.output === "postgres" && readApiRouteEnabled(env.READ_API_OUTPUT_ENABLED)
     ? { output: { enabled: true as const, backend: postgresOutputBackend(factsDeps) } } : {};
-  // Narrative: the Supabase cache only (cache-only, no generator) until the self-host narrative
-  // provider (selfhostNarrativeFromEnv) lands; a miss is 200 `narrative.unavailable`.
+  // Narrative: the self-host narrative deps above (the cache, plus the in-process generator when
+  // configured). READ_API_DIGEST_ENABLED=1 always builds them here; the cache-only fallback is
+  // defensive only (a miss is then 200 `provider_not_configured`).
   const digestDeps = facts.digest === "postgres" && readApiRouteEnabled(env.READ_API_DIGEST_ENABLED)
-    ? { digest: { cache: sqlNarrativeCache(poolTenantRunner(pool as never)), backend: postgresDigestBackend(factsDeps) } } : {};
+    ? { digest: { ...(narrative?.deps ?? { cache: sqlNarrativeCache(poolTenantRunner(pool as never)) }), backend: postgresDigestBackend(factsDeps) } } : {};
   const deps: Omit<ReadApiDeps, "verify"> = {
     ...(adapter ? { adapter } : { ch: createClickHouseClient(secret.clickhouse!) }),
     liveness,
@@ -563,8 +574,13 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...(selfhostReadApi ? { selfhost: { ...(authConfig.mode === "self_issued" ? {} : { login: relaycontrolLogin(authConfig) }), ...(canonical ? { catalog: canonical.catalog } : {}), ...(loginSync ? { syncServed: true as const } : {}) } } : {}),
     log: (fields) => log.info("session read", fields),
   };
-  return { deps, authConfig, close: () => pool.end() };
-  } catch (error) { await pool.end(); throw error; }
+  const writer = narrative;
+  return {
+    deps, authConfig,
+    close: writer ? async () => { await Promise.all([pool.end(), writer.close()]); } : () => pool.end(),
+    ...(writer ? { digestNarrative: writer.deps } : {}),
+  };
+  } catch (error) { await narrative?.close().catch(() => {}); await pool.end(); throw error; }
 }
 
 /** The same service assembly used by the Lambda loader, without credential

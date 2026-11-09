@@ -38,7 +38,11 @@
  *                              (HTTP only: the admission consumer keeps its normal backoff)
  *   INGEST_ASYNC_ADMISSION     unset/off (default) | on | drain: S3-first async admission
  *                              (async-admission.ts, docs/design/s3-first-async-ingest.md); on/drain need
- *                              buffered acceptance and the INGEST_ADMISSION queue (producer + consumer)
+ *                              buffered acceptance and the INGEST_ADMISSION queue (producer + consumer).
+ *                              The Cloudflare stack renders this var (a buffered stage defaults to "on"
+ *                              there); the runtime default stays off on purpose, so a Worker version or
+ *                              self-host deployment without the var never starts admitting asynchronously
+ *                              (no flip on a gradual version split, no queue it was not given).
  *   INGEST_SYNC_ADMISSION_FROZEN_RECEIPT  unset/off (default) | on: under frozen-supabase custody, a queued-v1
  *                              caller on the synchronous path reads the frozen legacy receipt before any claim
  *                              (app.ts acceptBatch, as the admission consumer does)
