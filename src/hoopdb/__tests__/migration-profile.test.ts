@@ -130,13 +130,84 @@ test("managed-provider bootstrap fixed-role inventories stay equal", () => {
   );
 });
 
-/** Upstream plan steps ordered after 20261105044020 (a database "before 044020" must hold none: that is a ledger gap). */
+/**
+ * Upstream plan steps ordered after `after` (default 20261105044020): a database "before" that step must hold none of
+ * them, since an unrecorded step with a later upstream step recorded is a ledger gap.
+ */
 const CB_STEP = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
-const laterUpstream = (steps: Array<{ name: string }>) => steps.filter((s) => s.name.startsWith("upstream:") && s.name > CB_STEP);
+const laterUpstream = <T extends { name: string }>(steps: T[], after: string = CB_STEP) =>
+  steps.filter((s) => s.name.startsWith("upstream:") && s.name > after);
 /** Roll back every upstream step after 044020, newest first, so 044020 is the newest applied step again. */
 async function rollbackLaterThan044020(db: PGlite, profile: MigrationProfile) {
   for (const { name } of laterUpstream(await plan(profile)).reverse())
     await db.exec(readFileSync(join(root, "supabase/rollbacks", `${name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`), "utf8"));
+}
+
+type PlanStep = Awaited<ReturnType<typeof plan>>[number];
+type FunctionAclManifest = Awaited<ReturnType<typeof migrateGuards.sessionsFunctionAclManifest>>;
+type RuntimeAclCatalog = ReturnType<typeof migrateGuards.runtimeApplicationAclCatalog>;
+
+/**
+ * The previous release's ACL view: the current function ACL manifest and runtime application ACL catalog minus
+ * everything the later steps CREATE. A previous release's binary shipped the manifest and catalog of its day, which
+ * could not yet list a function, table or sequence a later step creates; the current ones do, so on a database without
+ * them the ACL install regclass/regprocedure-casts a missing object (42P01/42883) and the non-local exact-ACL check
+ * refuses (function_acl_drift). Relations: CREATE [UNLOGGED|TEMP] TABLE/SEQUENCE in sessions, plus the
+ * <table>_<column>_seq a serial/identity column of such a table implies. Functions: CREATE FUNCTION in sessions
+ * (catalog entries and manifest keys are matched by name, before the argument list).
+ */
+function previousReleaseAcl(laterSteps: ReadonlyArray<{ path: string }>, manifest: FunctionAclManifest, catalog: RuntimeAclCatalog) {
+  const laterFns = new Set(laterSteps.flatMap((s) =>
+    [...readFileSync(s.path, "utf8").matchAll(/\bCREATE\s+FUNCTION\s+(sessions\.\w+)\s*\(/gi)].map((m) => m[1]!.toLowerCase())));
+  const laterRels = new Set(laterSteps.flatMap((s) =>
+    [...readFileSync(s.path, "utf8").matchAll(
+      /\bCREATE\s+(?:(?:UNLOGGED|TEMP|TEMPORARY)\s+)?(?:TABLE|SEQUENCE)\s+(?:IF\s+NOT\s+EXISTS\s+)?(sessions\.\w+)/gi,
+    )].map((m) => m[1]!.toLowerCase())));
+  const previousManifest: FunctionAclManifest = Object.fromEntries(Object.entries(manifest).filter(([fn]) => !laterFns.has(fn.slice(0, fn.indexOf("(")))));
+  const previousCatalog: RuntimeAclCatalog = {
+    tables: Object.fromEntries(Object.entries(catalog.tables).filter(([rel]) => !laterRels.has(rel))),
+    sequences: catalog.sequences.filter((rel) => !laterRels.has(rel) && ![...laterRels].some((t) => rel.startsWith(`${t}_`) && rel.endsWith("_seq"))),
+    rlsTables: catalog.rlsTables.filter((rel) => !laterRels.has(rel)),
+    // Its runtime EXECUTE grants likewise could not name a function a later step creates ($1::regprocedure).
+    functions: catalog.functions.filter((fn) => !laterFns.has(fn.slice(0, fn.indexOf("(")))),
+  };
+  return { laterFns, laterRels, previousManifest, previousCatalog };
+}
+
+/**
+ * Model the previous release that stopped just before `cutoff`: `steps` is the full plan without `cutoff` and without
+ * every later upstream step (a ledger gap otherwise); `later` names those later steps. When there are later steps,
+ * sessionsFunctionAclManifest and runtimeApplicationAclCatalog are spied to return the previous release's ACL view
+ * (previousReleaseAcl) until `restore()`; with no later step nothing is mocked (the current manifest and catalog are
+ * that release's). `current` replaces the manifest/catalog the view is derived from (the regression test's synthetic
+ * later slot); by default it is the real one. Every truncated `runMigrations` in this file goes through this model,
+ * with `restore()` in a `finally` right after it.
+ */
+async function previousReleaseModel(
+  full: PlanStep[],
+  cutoff: string,
+  current?: { manifest: FunctionAclManifest; catalog: RuntimeAclCatalog },
+) {
+  const laterSteps = laterUpstream(full, cutoff);
+  const later = laterSteps.map((s) => s.name);
+  const steps = full.filter((s) => s.name !== cutoff && !later.includes(s.name));
+  const { previousManifest, previousCatalog } = previousReleaseAcl(
+    laterSteps,
+    current?.manifest ?? await migrateGuards.sessionsFunctionAclManifest(),
+    current?.catalog ?? migrateGuards.runtimeApplicationAclCatalog(),
+  );
+  const manifestSpy = later.length ? spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(previousManifest) : undefined;
+  const catalogSpy = later.length ? spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(previousCatalog) : undefined;
+  return {
+    steps,
+    later,
+    previousManifest,
+    previousCatalog,
+    restore: () => {
+      manifestSpy?.mockRestore();
+      catalogSpy?.mockRestore();
+    },
+  };
 }
 
 describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
@@ -3347,9 +3418,13 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const GIN = ADOPTABLE_INDEXES[SF]!;
     expect(GIN.map((x) => x.name)).toEqual(["ingest_claim_attempts_records_gin_idx"]);
     // The previous release: everything before 044040 (no later upstream step: a ledger gap), validated.
-    const full = await plan(SUPA_ET);
-    const later = full.filter((s) => s.name.startsWith("upstream:") && s.name > SF).map((s) => s.name);
-    expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps: full.filter((s) => s.name !== SF && !later.includes(s.name)) }))).toBeNull();
+    // Validated against that release's ACL manifest and catalog (previousReleaseModel), not the current ones.
+    const { steps, later, restore } = await previousReleaseModel(await plan(SUPA_ET), SF);
+    try {
+      expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps }))).toBeNull();
+    } finally {
+      restore();
+    }
     // Production shape: ingest_claim_attempts populated (FK triggers off for this one superuser insert), no GIN yet.
     await db.exec(`SET session_replication_role = replica;
       INSERT INTO sessions.ingest_claim_attempts(claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,epochs,records)
@@ -3405,13 +3480,23 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const LIST = () => statement("buffered_sessions_for", "buffered_sessions");
     const STAGES = () => statement("buffered_session_stages_for", "buffered_stages");
     const SENTINEL = () => MIGRATION_SENTINELS[SF]!.sql;
-    /** The previous release (everything before 044040, no later upstream step), validated, on the supabase/ET shape. */
-    const previousRelease = async () => {
+    /**
+     * The previous release (everything before 044040, no later upstream step), validated against that release's ACL
+     * manifest and catalog (previousReleaseModel), on the supabase/ET shape. `full` and `current` let the regression
+     * test inject a synthetic later slot.
+     */
+    const previousRelease = async (
+      full?: PlanStep[],
+      current?: { manifest: FunctionAclManifest; catalog: RuntimeAclCatalog },
+    ) => {
       const db = await supabaseLike();
       await db.exec(ET_BOOT);
-      const full = await plan(SUPA_ET);
-      const later = full.filter((s) => s.name.startsWith("upstream:") && s.name > SF).map((s) => s.name);
-      expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps: full.filter((s) => s.name !== SF && !later.includes(s.name)) }))).toBeNull();
+      const { steps, restore } = await previousReleaseModel(full ?? await plan(SUPA_ET), SF, current);
+      try {
+        expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps }))).toBeNull();
+      } finally {
+        restore();
+      }
       return db;
     };
     const ledgered = async (db: PGlite) =>
@@ -3463,6 +3548,67 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       expect(await ledgered(db)).toBe(false);
     });
 
+    test("a later slot (synthetic step, no migration file added) cannot break the previous release: its relation and function are modelled out of the ACL catalog and manifest", async () => {
+      // A future upstream slot creating a table (with its implied serial sequence) and a function, which a current
+      // binary's catalog and manifest would list. Written under this test's own tmpdir, never under supabase/.
+      const dir = mkdtempSync(join(tmpdir(), "prev-release-later-slot-"));
+      const path = join(dir, "20261105099999_zz_future_probe.sql");
+      writeFileSync(path, `CREATE TABLE sessions.zz_future_probe (id bigserial PRIMARY KEY, v text);
+CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'SELECT 1';
+`);
+      const probe = { name: "upstream:20261105099999_zz_future_probe.sql", path } as PlanStep;
+      const real = await plan(SUPA_ET);
+      const full = [...real, probe];
+      const manifest = await migrateGuards.sessionsFunctionAclManifest();
+      const catalog = migrateGuards.runtimeApplicationAclCatalog();
+      const current = {
+        manifest: { ...manifest, "sessions.zz_future_probe_fn()": ["<owner>:EXECUTE", "service_role:EXECUTE"] },
+        catalog: {
+          tables: { ...catalog.tables, "sessions.zz_future_probe": ["SELECT", "INSERT"] },
+          sequences: [...catalog.sequences, "sessions.zz_future_probe_id_seq"],
+          rlsTables: [...catalog.rlsTables, "sessions.zz_future_probe"],
+          functions: [...catalog.functions, "sessions.zz_future_probe_fn()"],
+        },
+      };
+      // Pure derivation: the synthetic names are excluded, and the rest is exactly the view derived from the real
+      // manifest and catalog with the same later steps.
+      const laterSteps = laterUpstream(full, SF);
+      expect(laterSteps.map((s) => s.name)).toContain(probe.name);
+      const derived = previousReleaseAcl(laterSteps, current.manifest, current.catalog);
+      expect([...derived.laterRels]).toContain("sessions.zz_future_probe");
+      expect([...derived.laterFns]).toContain("sessions.zz_future_probe_fn");
+      expect(Object.keys(derived.previousManifest)).not.toContain("sessions.zz_future_probe_fn()");
+      expect(Object.keys(derived.previousCatalog.tables)).not.toContain("sessions.zz_future_probe");
+      expect(derived.previousCatalog.sequences).not.toContain("sessions.zz_future_probe_id_seq");
+      expect(derived.previousCatalog.rlsTables).not.toContain("sessions.zz_future_probe");
+      expect(derived.previousCatalog.functions).not.toContain("sessions.zz_future_probe_fn()");
+      expect(derived).toEqual(previousReleaseAcl(laterSteps, manifest, catalog) as typeof derived);
+      // Negative control: the same truncated migrate with the current (unmodelled) catalog and manifest fails on the
+      // relation the truncated plan never created (42P01), which is the defect the model prevents.
+      const db = await supabaseLike();
+      await db.exec(ET_BOOT);
+      const steps = full.filter((s) => s.name !== SF && !laterSteps.includes(s));
+      expect(steps).not.toContain(probe);
+      const unmodelledManifest = spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(current.manifest);
+      const unmodelledCatalog = spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(current.catalog);
+      try {
+        const error = await failure(runMigrations(client(db), { profile: SUPA_ET, steps }));
+        expect(error?.code).toBe("42P01");
+        expect(error?.message).toContain("zz_future_probe");
+      } finally {
+        unmodelledManifest.mockRestore();
+        unmodelledCatalog.mockRestore();
+      }
+      // Through the model: the 044040 previous-release setup succeeds (it asserts the migrate is green), never
+      // creates the synthetic slot's objects, and leaves the real manifest and catalog unmocked afterwards.
+      const modelled = await previousRelease(full, current);
+      expect(await ledgered(modelled)).toBe(false);
+      expect((await modelled.query<{ r: string | null }>("SELECT to_regclass('sessions.zz_future_probe')::text r")).rows[0]!.r).toBeNull();
+      expect((await modelled.query<{ p: string | null }>("SELECT to_regprocedure('sessions.zz_future_probe_fn()')::text p")).rows[0]!.p).toBeNull();
+      expect(migrateGuards.runtimeApplicationAclCatalog()).toEqual(catalog);
+      expect(await migrateGuards.sessionsFunctionAclManifest()).toEqual(manifest);
+    });
+
     test("only stages pre-applied (packet A): the sentinel does not fire and the migrator applies normally", async () => {
       const db = await previousRelease();
       await db.exec(STAGES());
@@ -3479,42 +3625,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const CB = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
     const LAZY = "ingest_lazy_native_slots_org_id_idx";
     // The previous release: everything but 044020 (and no later upstream step: that would be a ledger gap), validated (marker 'pass').
-    const full = await plan(SUPA_ET);
-    const laterSteps = laterUpstream(full) as typeof full;
-    const later = laterSteps.map((s) => s.name);
-    const steps = full.filter((s) => s.name !== CB && !later.includes(s.name));
-    // That release's binary shipped the function ACL manifest of its day, which could not yet list a
-    // function a later step creates; the current manifest does, so the non-local exact-ACL check would
-    // refuse (function_acl_drift) a database without them. Validate against the previous manifest:
-    // the current one minus the functions later steps CREATE. No later step: the current manifest, unmocked.
-    const laterFns = new Set(laterSteps.flatMap((s) =>
-      [...readFileSync(s.path, "utf8").matchAll(/\bCREATE\s+FUNCTION\s+(sessions\.\w+)\s*\(/gi)].map((m) => m[1]!.toLowerCase())));
-    const manifest = await migrateGuards.sessionsFunctionAclManifest();
-    const previousManifest = Object.fromEntries(Object.entries(manifest).filter(([fn]) => !laterFns.has(fn.slice(0, fn.indexOf("(")))));
-    const previousRelease = later.length ? spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(previousManifest) : undefined;
-    // Likewise its runtime application ACL catalog could not list a table, sequence or function a later step creates;
-    // the current one does, so the ACL install (and the exact-ACL verifier) would fail on the missing relation
-    // (42P01). Install and verify the previous catalog: the current one minus the relations later steps CREATE
-    // (and the <table>_<column>_seq a serial/identity column of such a table implies). No later step: the
-    // current catalog, unmocked.
-    const laterRels = new Set(laterSteps.flatMap((s) =>
-      [...readFileSync(s.path, "utf8").matchAll(
-        /\bCREATE\s+(?:(?:UNLOGGED|TEMP|TEMPORARY)\s+)?(?:TABLE|SEQUENCE)\s+(?:IF\s+NOT\s+EXISTS\s+)?(sessions\.\w+)/gi,
-      )].map((m) => m[1]!.toLowerCase())));
-    const catalog = migrateGuards.runtimeApplicationAclCatalog();
-    const previousCatalog = {
-      tables: Object.fromEntries(Object.entries(catalog.tables).filter(([rel]) => !laterRels.has(rel))),
-      sequences: catalog.sequences.filter((rel) => !laterRels.has(rel) && ![...laterRels].some((t) => rel.startsWith(`${t}_`) && rel.endsWith("_seq"))),
-      rlsTables: catalog.rlsTables.filter((rel) => !laterRels.has(rel)),
-      // Its runtime EXECUTE grants likewise could not name a function a later step creates ($1::regprocedure).
-      functions: catalog.functions.filter((fn) => !laterFns.has(fn.slice(0, fn.indexOf("(")))),
-    };
-    const previousAcl = later.length ? spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(previousCatalog) : undefined;
+    // That release's binary shipped the function ACL manifest and runtime application ACL catalog of its day, which
+    // could not yet list a function or relation a later step creates: validate against them (previousReleaseModel).
+    // No later step: the current manifest and catalog, unmocked.
+    const { steps, later, restore } = await previousReleaseModel(await plan(SUPA_ET), CB);
     try {
       expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps }))).toBeNull();
     } finally {
-      previousRelease?.mockRestore();
-      previousAcl?.mockRestore();
+      restore();
     }
     // Production shape: seven prebuilt CONCURRENTLY, the lazy-slot one held, its table populated.
     for (const x of ADOPTABLE_INDEXES[CB]!) if (x.name !== LAZY) await db.exec(x.def);
