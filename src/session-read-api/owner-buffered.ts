@@ -126,11 +126,25 @@ export class BufferedFenced extends Error {
   }
 }
 
-/** The first two chars of a SQLSTATE-shaped code when they are [0-9A-Z]{2}; anything else is undefined. */
+/** The class (first two chars) of a code that is exactly SQLSTATE-shaped ([0-9A-Z]{5}); anything else is undefined. */
 function sqlstateClassOf(code: unknown): string | undefined {
-  if (typeof code !== "string") return undefined;
-  const cls = code.slice(0, 2);
-  return /^[0-9A-Z]{2}$/.test(cls) ? cls : undefined;
+  return typeof code === "string" && /^[0-9A-Z]{5}$/.test(code) ? code.slice(0, 2) : undefined;
+}
+
+/**
+ * A fence before any buffered candidate was found (the route's existing answer). Both fields are
+ * for logs only: the closed reason and, for an RPC failure, the validated SQLSTATE class.
+ */
+export interface UnverifiedBeforeCandidate {
+  unverifiedBeforeCandidate: string;
+  unverifiedSqlstateClass?: string;
+}
+
+function unverified(error: BufferedFenced): UnverifiedBeforeCandidate {
+  const cls = error.sqlstateClass;
+  return typeof cls === "string" && /^[0-9A-Z]{2}$/.test(cls)
+    ? { unverifiedBeforeCandidate: error.reason, unverifiedSqlstateClass: cls }
+    : { unverifiedBeforeCandidate: error.reason };
 }
 
 /**
@@ -945,7 +959,7 @@ export type OwnerBufferedTurns =
    * The authority (or the RPC's own fence) refused before any buffered candidate was found:
    * nothing is known about this session, so the route answers as without the flag (501).
    */
-  | { unverifiedBeforeCandidate: string }
+  | UnverifiedBeforeCandidate
   | { erased: true; rows: [] }
   | { erased: false; rows: Record<string, unknown>[] };
 
@@ -967,7 +981,7 @@ export async function readOwnerBufferedTurns(deps: OwnerBufferedDeps, scope: Buf
 
 type GatedSession =
   | null
-  | { unverifiedBeforeCandidate: string }
+  | UnverifiedBeforeCandidate
   | { erased: true }
   | {
       erased: false;
@@ -992,7 +1006,7 @@ async function readGatedSession(deps: OwnerBufferedDeps, scope: BufferedScope, s
     first = await deps.gate.observe(scope);
     initial = await deps.reads.stages(scope, first, source, sessionId);
   } catch (error) {
-    if (error instanceof BufferedFenced) return { unverifiedBeforeCandidate: error.reason };
+    if (error instanceof BufferedFenced) return unverified(error);
     throw error;
   }
   if (initial.length === 0) return null;
@@ -1009,7 +1023,7 @@ async function readGatedSession(deps: OwnerBufferedDeps, scope: BufferedScope, s
 export type OwnerBufferedEvents =
   | null /** not a visible buffered session of this caller: the route's existing answer */
   /** The authority refused before any buffered candidate was found: the route's existing answer. */
-  | { unverifiedBeforeCandidate: string }
+  | UnverifiedBeforeCandidate
   | { erased: true; rows: [] }
   | { erased: false; rows: EventRow[] };
 

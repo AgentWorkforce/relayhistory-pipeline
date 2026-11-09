@@ -97,6 +97,7 @@ import {
   type BufferedScope,
   type BufferedSessionRow,
   type OwnerBufferedDeps,
+  type UnverifiedBeforeCandidate,
 } from "./owner-buffered.ts";
 import { BRIEF_TITLES_MAX_KEYS, BriefTitlesError, briefTitleEntries, type BriefTitleKey, type BriefTitles } from "./brief-titles.ts";
 import {
@@ -574,11 +575,11 @@ export function createReadApi(deps: ReadApiDeps) {
   const bufferedEvents = (c: Context, identity: VerifiedIdentity, ob: OwnerBufferedDeps, sessionId: string, source: string) =>
     bufferedDetail(c, () => readOwnerBufferedEvents(ob, bufferedScope(identity), source, sessionId));
 
-  async function bufferedDetail<T extends object>(c: Context, read: () => Promise<T | null | { unverifiedBeforeCandidate: string }>): Promise<T | null> {
+  async function bufferedDetail<T extends object>(c: Context, read: () => Promise<T | null | UnverifiedBeforeCandidate>): Promise<T | null> {
     try {
       const served = await read();
       if (served && "unverifiedBeforeCandidate" in served) {
-        log({ route: c.req.routePath, reason: "buffered_unverified", error_code: fenceSubtype(served.unverifiedBeforeCandidate), correlation_id: c.get("correlationId") });
+        log({ route: c.req.routePath, reason: "buffered_unverified", error_code: fenceSubtype(served.unverifiedBeforeCandidate), ...(served.unverifiedSqlstateClass ? { sqlstate: served.unverifiedSqlstateClass } : {}), correlation_id: c.get("correlationId") });
         return null;
       }
       return served as T | null;

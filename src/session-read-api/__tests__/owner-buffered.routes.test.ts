@@ -431,8 +431,42 @@ describe("buffered fence logs: closed subtype as error_code, SQLSTATE class only
     expect(JSON.stringify(logs)).not.toContain("FENCESECRET");
   });
 
+  test("early path: the initial stages RPC failing logs buffered_unverified with the subtype and SQLSTATE class only", async () => {
+    const stagesFailing = (err: unknown) =>
+      sqlOwnerBufferedReads((async (_o: string, _w: string, work: (q: unknown) => Promise<unknown>) =>
+        work({ async query(sql: string) { if (sql.includes("buffered_session_stages_for")) throw err; return { rows: [] }; } })) as never);
+    const cases: Array<[unknown, string, string | undefined, string]> = [
+      [Object.assign(new Error(`permission denied ${SECRET}`), { code: "42501" }), "rpc_error", "42", "42501"],
+      [Object.assign(new Error(`canceling statement due to statement timeout ${SECRET}`), { code: "57014" }), "rpc_timeout", "57", "57014"],
+      [Object.assign(new Error(`socket hang up ${SECRET}`), { code: "ECONNRESET" }), "rpc_error", undefined, "ECONNRESET"],
+    ];
+    for (const path of [T, M]) {
+      const main = await api({ enabled: false }).get(path);
+      const mainBody = strip(await json(main));
+      for (const [err, subtype, sqlstate, code] of cases) {
+        const { get, logs } = api({ reads: stagesFailing(err) });
+        const r = await get(path);
+        expect(r.status).toBe(main.status);
+        expect(r.status).toBe(501);
+        expect(r.headers.get("x-relayhistory-buffered")).toBeNull();
+        expect(strip(await json(r))).toEqual(mainBody);
+        const fields = logs.find((l) => l.reason === "buffered_unverified");
+        expect(fields).toBeDefined();
+        const text = logLine("info", "read api", fields!);
+        const out = line(fields!);
+        expect(out).toMatchObject({ reason: "buffered_unverified", error_code: subtype });
+        expect(out.sqlstate).toBe(sqlstate);
+        expect("sqlstate" in out).toBe(sqlstate !== undefined);
+        expect("gate" in out).toBe(false);
+        expect(text).not.toContain("FENCESECRET");
+        expect(text).not.toContain(code);
+        expect(JSON.stringify(logs)).not.toContain("FENCESECRET");
+      }
+    }
+  });
+
   test("a malformed code yields no sqlstate field", async () => {
-    for (const code of ["x", "4", "ab501", " 42", 42501, null, { toString: () => "42501" }]) {
+    for (const code of ["x", "4", "ab501", " 42", "ECONNRESET", "42-this-is-not-sqlstate", "42", "4250", "42501x", 42501, null, { toString: () => "42501" }]) {
       const { get, logs } = api({ reads: rpcFailing(Object.assign(new Error("boom"), { code })) });
       expect((await get(L)).headers.get("x-relayhistory-buffered")).toBe("fenced");
       const { fields, text } = fencedLine(logs);
