@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { PGlite } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/index.js";
 import { btree_gin } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/btree_gin.js";
 import { pg_trgm } from "../../../packages/pipeline/node_modules/@electric-sql/pglite/dist/contrib/pg_trgm.js";
-import { inventoryOf, sequencePreflight } from "../migrate-guards.ts";
+import { adoptableIndexBuildPreflight, inventoryOf, sequencePreflight } from "../migrate-guards.ts";
 import { ADOPTABLE_INDEXES, MIGRATION_SENTINELS } from "../migration-sentinels.ts";
 import { migrationProfile, plan, runMigrations, type MigrationClient, type MigrationProfile } from "../migrate.ts";
 
@@ -53,19 +53,21 @@ function client(db: PGlite): MigrationClient {
 const failure = async (run: Promise<unknown>) =>
   (await run.then(() => null, (caught: unknown) => caught)) as { code?: string; message?: string } | null;
 
-/** Every migration strictly before 044020 applied and ledgered through the real migrator. Later slots
- * must stay out entirely (not just unapplied): the migrator ledgers one contiguous prefix, so a
- * recorded later slot with 044020 missing is a ledger gap, and 044020's own down-guard refuses
- * while a later migration is applied. */
+/**
+ * Upstream steps ordered after 044020 (plan step names are `upstream:<file>`; the file names' lexicographic order is
+ * the migration order). A database "before 044020" must not hold any of them: 044020 unrecorded with a later upstream
+ * step recorded is a ledger gap the migrator refuses.
+ */
+const laterUpstream = (steps: Array<{ name: string }>) => steps.filter((s) => s.name.startsWith("upstream:") && s.name > STEP);
+
+/** Every migration before 044020 applied and ledgered through the real migrator (no later upstream step either: that would be a ledger gap). */
 async function before044020(): Promise<PGlite> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
-  const names = (await plan(LOCAL)).map((s) => s.name).filter((n) => !n.startsWith("verify:"));
-  expect(names).toContain(STEP);
-  const steps = (await plan(LOCAL)).filter((s) => s.name < STEP && !s.name.startsWith("verify:"));
-  // Pin the excluded set exactly: the only planned steps not strictly before 044020 are
-  // 044020 itself and 046000 (a later slot recorded with 044020 missing is a ledger gap).
-  expect((await plan(LOCAL)).map((s) => s.name).filter((n) => !n.startsWith("verify:") && !(n < STEP))).toEqual([STEP, "upstream:20261105046000_analysis_jobs.sql"]);
+  const all = (await plan(LOCAL)).filter((s) => !s.name.startsWith("verify:"));
+  const later = laterUpstream(all).map((s) => s.name);
+  const steps = all.filter((s) => s.name !== STEP && !later.includes(s.name));
+  expect(steps.length).toBe(all.length - 1 - later.length);
   await runMigrations(client(db), { profile: { ...LOCAL, verify: false }, steps });
   return db;
 }
@@ -208,26 +210,61 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
       expect((await orgIndexes(db)).map(({ name, def }) => ({ name, def }))).toEqual(expectedRows);
     });
 
-    test("production shape (7 prebuilt valid, lazy_native_slots absent, populated), no opt-in: refused naming index, table and packet; nothing changes", async () => {
+    test("production shape (7 prebuilt valid, lazy_native_slots absent, populated), no opt-in: the migrator's read-only preflight refuses naming index, table and packet; the migration itself raises 55000; nothing changes", async () => {
       const db = await before044020();
       for (const x of IDX) if (x.name !== LAZY) await db.exec(x.def);
       await populateLazySlots(db);
       const before = await orgIndexes(db);
       expect(before).toHaveLength(7);
-      const error = (await failure(runMigrations(client(db), { profile: LOCAL }))) as { code?: string; message?: string; hint?: string } | null;
-      expect(error?.code).toBe("55000");
-      expect(error?.message).toContain(`index sessions.${LAZY} is absent and table sessions.ingest_lazy_native_slots is not empty`);
-      expect(error?.message).toContain("refusing a blocking CREATE INDEX on a populated table");
-      expect(error?.hint).toContain("prebuild it out of band, CONCURRENTLY, with the claim-bootstrap index packet (docs/packets/claim-bootstrap-org-index-packet-20261108.md, PR #407)");
-      expect(error?.hint).toContain("HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true");
+      const error = (await failure(runMigrations(client(db), { profile: LOCAL }))) as { code?: string; message?: string } | null;
+      expect(error?.code).toBe("index_prebuild_required");
+      expect(error?.message).toContain(`index sessions.${LAZY} on sessions.ingest_lazy_native_slots (${STEP}) is absent and table sessions.ingest_lazy_native_slots is not empty`);
+      expect(error?.message).toContain("CREATE INDEX CONCURRENTLY (claim-bootstrap index packet docs/packets/claim-bootstrap-org-index-packet-20261108.md, PR #407)");
+      expect(error?.message).toContain("HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true is for non-production databases only");
+      // Only the absent one is named: the seven prebuilt ones are adoptable.
+      for (const x of IDX) if (x.name !== LAZY) expect(error?.message).not.toContain(x.name);
       expect(await orgIndexes(db)).toEqual(before);
       expect(await ledgered(db)).toBe(false);
-      // The opt-in GUC set to anything but exactly 'on' is not an opt-in.
-      await db.exec("BEGIN");
-      await db.exec("SELECT set_config('hoopdb.allow_blocking_index_build', 'true', true)");
-      const raised = await failure(db.exec(SQL));
-      await db.exec("ROLLBACK");
+      // Bypassing the migrator: the migration's own refusal (same decision) still holds.
+      const raised = (await failure(applyFile(db, SQL))) as { code?: string; message?: string; hint?: string } | null;
       expect(raised?.code).toBe("55000");
+      expect(raised?.message).toContain(`index sessions.${LAZY} is absent and table sessions.ingest_lazy_native_slots is not empty`);
+      expect(raised?.message).toContain("refusing a blocking CREATE INDEX on a populated table");
+      expect(raised?.hint).toContain("prebuild it out of band, CONCURRENTLY, with the claim-bootstrap index packet (docs/packets/claim-bootstrap-org-index-packet-20261108.md, PR #407)");
+      expect(raised?.hint).toContain("HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true");
+      expect(await orgIndexes(db)).toEqual(before);
+    });
+
+    test("a refused run leaves the readiness marker exactly as it was ('pass' stays 'pass'): the refusal comes before the pending write", async () => {
+      const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
+      open.push(db);
+      // A database validated by the previous release: everything but 044020, verifiers included (and no later
+      // upstream step either: that would be a ledger gap).
+      const full = await plan(LOCAL);
+      const later = laterUpstream(full).map((s) => s.name);
+      const steps = full.filter((s) => s.name !== STEP && !later.includes(s.name));
+      expect(await failure(runMigrations(client(db), { profile: LOCAL, steps }))).toBeNull();
+      const marker = async () =>
+        (await db.query<{ name: string; generation: string; status: string; updated_at: string }>(
+          "SELECT name, generation, status, updated_at::text FROM sessions.__96bulls_role_validation ORDER BY name",
+        )).rows;
+      const ledgerRows = async () =>
+        (await db.query<{ name: string; sha256: string }>("SELECT name, sha256 FROM sessions.__96bulls_migrations ORDER BY name")).rows;
+      const markerBefore = await marker();
+      expect(markerBefore.map((r) => r.status)).toEqual(["pass"]);
+      for (const x of IDX) if (x.name !== LAZY) await db.exec(x.def);
+      await populateLazySlots(db);
+      const ledgerBefore = await ledgerRows();
+      const error = await failure(runMigrations(client(db), { profile: LOCAL }));
+      // The marker first: without the read-only refusal the migration would raise 55000 AFTER 'pending' was written.
+      expect(await marker()).toEqual(markerBefore);
+      expect(await ledgerRows()).toEqual(ledgerBefore);
+      expect(error?.code).toBe("index_prebuild_required");
+      // Prebuilding the absent index (the operator's CONCURRENTLY build) clears it: adopted, ledgered, pass again.
+      await db.exec(`CREATE INDEX CONCURRENTLY ${LAZY} ON sessions.ingest_lazy_native_slots USING btree (org_id)`);
+      expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+      expect(await ledgered(db)).toBe(true);
+      expect((await marker()).map((r) => r.status)).toEqual(["pass"]);
     });
 
     test("absent + populated + opt-in (HOOPDB_ALLOW_BLOCKING_INDEX_BUILD): created; the seven prebuilt ones are adopted untouched", async () => {
@@ -245,23 +282,105 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
       expect((await db.query<{ v: string | null }>("SELECT current_setting('hoopdb.allow_blocking_index_build', true) v")).rows[0]!.v ?? "").not.toBe("on");
     });
 
-    test("the populated probe cannot be fooled by row-level security hiding rows", async () => {
+    test("the populated probe cannot be fooled by row-level security hiding rows (superuser: RLS bypassed, row seen)", async () => {
       const db = await before044020();
       await populateLazySlots(db);
       await db.exec(`ALTER TABLE sessions.ingest_lazy_native_slots ENABLE ROW LEVEL SECURITY;
         ALTER TABLE sessions.ingest_lazy_native_slots FORCE ROW LEVEL SECURITY`);
       const raised = await failure(applyFile(db, SQL));
-      // Superuser bypasses RLS: the row is seen and the build refused (a non-bypass owner would get 42501 instead).
       expect(raised?.code).toBe("55000");
       expect(raised?.message).toContain(LAZY);
     });
 
-    test("HOOPDB_ALLOW_BLOCKING_INDEX_BUILD: strict true/false, default off", () => {
+    /** A NOSUPERUSER NOBYPASSRLS owner of the populated lazy table, with a deny-all policy. The other seven are prebuilt. */
+    async function rlsOwnerDb(force: boolean) {
+      const db = await before044020();
+      for (const x of IDX) if (x.name !== LAZY) await db.exec(x.def);
+      await populateLazySlots(db);
+      await db.exec(`CREATE ROLE probe_owner NOLOGIN NOSUPERUSER NOBYPASSRLS;
+        GRANT USAGE, CREATE ON SCHEMA sessions TO probe_owner;
+        ALTER TABLE sessions.ingest_lazy_native_slots OWNER TO probe_owner;
+        ALTER TABLE sessions.ingest_lazy_native_slots ENABLE ROW LEVEL SECURITY;
+        ${force ? "ALTER TABLE sessions.ingest_lazy_native_slots FORCE ROW LEVEL SECURITY;" : ""}
+        CREATE POLICY probe_deny_all ON sessions.ingest_lazy_native_slots USING (false) WITH CHECK (false);`);
+      const role = (await db.query<{ r: { rolsuper: boolean; rolbypassrls: boolean } }>(
+        "SELECT row(rolsuper, rolbypassrls)::text AS r FROM pg_roles WHERE rolname = 'probe_owner'",
+      )).rows[0]!.r;
+      expect(String(role)).toBe("(f,f)");
+      return db;
+    }
+    const asOwner = async <T>(db: PGlite, run: () => Promise<T>) => {
+      await db.exec("SET ROLE probe_owner");
+      try { return await run(); } finally { await db.exec("RESET ROLE"); }
+    };
+    const lazyStep = [{ name: STEP, path: MIGRATION }] as never;
+
+    test("RLS, non-superuser owner, FORCE + deny-all policy: with row_security on the table LOOKS empty, so the probe's row_security=off is load-bearing; preflight and migration both fail closed", async () => {
+      const db = await rlsOwnerDb(true);
+      // Control: the plain probe, as this owner with row_security on, sees the populated table as EMPTY.
+      const naive = await asOwner(db, async () =>
+        (await db.query<{ e: boolean }>("SELECT EXISTS (SELECT 1 FROM sessions.ingest_lazy_native_slots LIMIT 1) AS e")).rows[0]!.e);
+      expect(naive).toBe(false);
+      // The preflight's probe (row_security off) errors instead, and that refuses: never "empty".
+      const pre = await asOwner(db, () => failure(adoptableIndexBuildPreflight(client(db), lazyStep, new Map())));
+      expect(pre?.code).toBe("index_prebuild_required");
+      expect(pre?.message).toContain(`index sessions.${LAZY} on sessions.ingest_lazy_native_slots (${STEP}) is absent and sessions.ingest_lazy_native_slots could not be proven empty`);
+      // Even the opt-in cannot turn an unprovable table into a build: the migration would raise there too.
+      const preAllow = await asOwner(db, () =>
+        failure(adoptableIndexBuildPreflight(client(db), lazyStep, new Map(), { allowBlockingIndexBuild: true })));
+      expect(preAllow?.code).toBe("index_prebuild_required");
+      // The setting is restored afterwards.
+      expect((await db.query<{ v: string }>("SELECT current_setting('row_security') AS v")).rows[0]!.v).toBe("on");
+      // The migration itself, as this owner: 42501 (RLS would apply with row_security off), never a create.
+      await db.exec("BEGIN; SET LOCAL ROLE probe_owner");
+      const raised = await failure(db.exec(SQL));
+      await db.exec("ROLLBACK");
+      expect(["42501", "55000"]).toContain(raised?.code);
+      expect((await orgIndexes(db)).map((r) => r.name)).not.toContain(LAZY);
+    });
+
+    test("RLS, non-superuser owner, deny-all policy NOT forced: the owner sees the rows, so the probe reports populated and refuses", async () => {
+      const db = await rlsOwnerDb(false);
+      const pre = await asOwner(db, () => failure(adoptableIndexBuildPreflight(client(db), lazyStep, new Map())));
+      expect(pre?.code).toBe("index_prebuild_required");
+      expect(pre?.message).toContain(`index sessions.${LAZY} on sessions.ingest_lazy_native_slots (${STEP}) is absent and table sessions.ingest_lazy_native_slots is not empty`);
+      await db.exec("BEGIN; SET LOCAL ROLE probe_owner");
+      const raised = await failure(db.exec(SQL));
+      await db.exec("ROLLBACK");
+      expect(raised?.code).toBe("55000");
+    });
+
+    test("HOOPDB_ALLOW_BLOCKING_INDEX_BUILD: strict true/false (the shared strictFlag: 1/true/TRUE on, 0/false off), default off; anything else throws", () => {
       const env = { HOOPDB_DB_MODE: "local", HOOPDB_SUPABASE_SHIM: "true", HOOPDB_RUNTIME_ROLE: "hoop" };
+      const flag = (v: string) => migrationProfile({ ...env, HOOPDB_ALLOW_BLOCKING_INDEX_BUILD: v }).allowBlockingIndexBuild;
       expect(migrationProfile(env).allowBlockingIndexBuild).toBeUndefined();
-      expect(migrationProfile({ ...env, HOOPDB_ALLOW_BLOCKING_INDEX_BUILD: "false" }).allowBlockingIndexBuild).toBeUndefined();
-      expect(migrationProfile({ ...env, HOOPDB_ALLOW_BLOCKING_INDEX_BUILD: "true" }).allowBlockingIndexBuild).toBe(true);
-      expect(() => migrationProfile({ ...env, HOOPDB_ALLOW_BLOCKING_INDEX_BUILD: "yes" })).toThrow(/HOOPDB_ALLOW_BLOCKING_INDEX_BUILD must be/);
+      expect(flag("")).toBeUndefined();
+      expect(flag("false")).toBeUndefined();
+      expect(flag("0")).toBeUndefined();
+      expect(flag("true")).toBe(true);
+      expect(flag("TRUE")).toBe(true);
+      expect(flag("1")).toBe(true);
+      for (const v of ["yes", "on", "ON", " true", "2"])
+        expect(() => flag(v)).toThrow(/HOOPDB_ALLOW_BLOCKING_INDEX_BUILD must be/);
+    });
+
+    test("the GUC the migration reads: only exactly 'on' opts in ('1', 'true', 'ON', 'yes', 'On' do not); the migrator binds exactly on/off", async () => {
+      const db = await before044020();
+      for (const x of IDX) if (x.name !== LAZY) await db.exec(x.def);
+      await populateLazySlots(db);
+      for (const v of ["1", "true", "ON", "On", "yes", "off", ""]) {
+        await db.exec("BEGIN");
+        await db.query("SELECT set_config('hoopdb.allow_blocking_index_build', $1, true)", [v]);
+        const raised = await failure(db.exec(SQL));
+        await db.exec("ROLLBACK");
+        expect([v, raised?.code]).toEqual([v, "55000"]);
+      }
+      // Positive control: exactly 'on' builds it.
+      await db.exec("BEGIN");
+      await db.exec("SELECT set_config('hoopdb.allow_blocking_index_build', 'on', true)");
+      expect(await failure(db.exec(SQL))).toBeNull();
+      expect((await orgIndexes(db)).map((r) => r.name)).toContain(LAZY);
+      await db.exec("ROLLBACK");
     });
   });
 
@@ -309,6 +428,9 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
       const error = await failure(runMigrations(client(db), { profile: LOCAL }));
       expect(error?.code).toBe("unledgered_schema");
       expect(error?.message).toContain(`index ingest_custody_records_org_id_idx (${STEP})`);
+      // Named as INVALID or still building, with the in-flight check before any drop.
+      expect(error?.message).toContain("INVALID or still building");
+      expect(error?.message).toContain("check pg_stat_progress_create_index before any DROP INDEX CONCURRENTLY");
       // The all-eight sentinel is false too, but it is not the reason: the one invalid index is.
       expect(error?.message).not.toContain("index ingest_seed_captures_org_id_idx");
       const raised = await failure(applyFile(db, SQL));
@@ -318,6 +440,106 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
       expect(await orgIndexes(db)).toEqual(before);
       expect(await ledgered(db)).toBe(false);
     });
+
+  test("(c) an EXCLUDE USING btree (org_id WITH =) constraint index of a declared name deparses like the declared index but is NOT adoptable", async () => {
+    const db = await before044020();
+    const seed = IDX[2]!;
+    for (const x of IDX) if (x.name !== seed.name) await db.exec(x.def);
+    await db.exec(`ALTER TABLE sessions.ingest_seed_captures ADD CONSTRAINT ${seed.name} EXCLUDE USING btree (org_id WITH =)`);
+    // The trap: byte-identical pg_get_indexdef.
+    expect((await db.query<{ d: string }>(`SELECT pg_get_indexdef('sessions.${seed.name}'::regclass) AS d`)).rows[0]!.d).toBe(seed.def);
+    expect((await db.query<{ applied: boolean }>(MIGRATION_SENTINELS[STEP]!.sql)).rows[0]!.applied).toBe(false);
+    const error = await failure(runMigrations(client(db), { profile: LOCAL }));
+    expect(error?.code).toBe("unledgered_schema");
+    expect(error?.message).toContain(`index ${seed.name} (${STEP}): not the declared definition`);
+    const pre = await failure(adoptableIndexBuildPreflight(client(db), [{ name: STEP, path: MIGRATION }] as never, new Map()));
+    expect(pre?.code).toBe("index_prebuild_required");
+    expect(pre?.message).toContain(`index sessions.${seed.name} on sessions.ingest_seed_captures (${STEP}) exists but is not the declared index`);
+    expect(await ledgered(db)).toBe(false);
+  });
+
+  describe("read-only preflight (release plan and live migrator): the migration's decision table, before anything is written", () => {
+    const steps = [{ name: STEP, path: MIGRATION }] as never;
+    /** Runs the check inside a READ ONLY transaction, as the release plan does; anything written would fail there. */
+    const readOnly = async (db: PGlite, ledger = new Map<string, string>(), allow?: boolean) => {
+      await db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      try {
+        return await failure(adoptableIndexBuildPreflight(client(db), steps, ledger, allow === undefined ? {} : { allowBlockingIndexBuild: allow }));
+      } finally {
+        await db.exec("ROLLBACK");
+      }
+    };
+    const locksHeld = async (db: PGlite) => {
+      await db.exec("BEGIN READ ONLY");
+      await adoptableIndexBuildPreflight(client(db), steps, new Map()).catch(() => undefined);
+      const modes = (await db.query<{ mode: string }>(
+        "SELECT DISTINCT mode FROM pg_locks WHERE locktype = 'relation' AND relation = ANY($1::regclass[]::oid[])",
+        [IDX.map((x) => x.table)],
+      )).rows.map((r) => r.mode);
+      await db.exec("ROLLBACK");
+      return modes;
+    };
+
+    test("fresh database (no tables yet): accepted", async () => {
+      const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
+      open.push(db);
+      expect(await readOnly(db)).toBeNull();
+    });
+
+    test("all absent, tables empty: accepted (the step creates them); populated + absent: refused; + opt-in: accepted", async () => {
+      const db = await before044020();
+      expect(await readOnly(db)).toBeNull();
+      await populateLazySlots(db);
+      const error = await readOnly(db);
+      expect(error?.code).toBe("index_prebuild_required");
+      expect(error?.message).toContain(`index sessions.${LAZY} on sessions.ingest_lazy_native_slots (${STEP}) is absent and table sessions.ingest_lazy_native_slots is not empty`);
+      expect(await readOnly(db, new Map(), false)).toMatchObject({ code: "index_prebuild_required" });
+      expect(await readOnly(db, new Map(), true)).toBeNull();
+      // Only ACCESS SHARE on the probed table, no stronger lock on any of the eight.
+      expect(await locksHeld(db)).toEqual(["AccessShareLock"]);
+      // The setting is restored.
+      expect((await db.query<{ v: string }>("SELECT current_setting('row_security') AS v")).rows[0]!.v).toBe("on");
+    });
+
+    test("populated + the exact valid index present: accepted (adopted)", async () => {
+      const db = await before044020();
+      await populateLazySlots(db);
+      for (const x of IDX) await db.exec(x.def);
+      expect(await readOnly(db)).toBeNull();
+    });
+
+    test("ledgered step: never checked", async () => {
+      const db = await before044020();
+      await populateLazySlots(db);
+      expect(await readOnly(db, new Map([[STEP, "x"]]))).toBeNull();
+    });
+
+    for (const flag of ["indisvalid", "indisready"] as const)
+      test(`${flag}=false (failed or in-flight CONCURRENTLY build): refused, pointing at pg_stat_progress_create_index before any drop`, async () => {
+        const db = await before044020();
+        for (const x of IDX) await db.exec(x.def);
+        await db.exec(`UPDATE pg_index SET ${flag} = false WHERE indexrelid = 'sessions.${LAZY}'::regclass`);
+        const error = await readOnly(db);
+        expect(error?.code).toBe("index_prebuild_required");
+        expect(error?.message).toContain(`index sessions.${LAZY} on sessions.ingest_lazy_native_slots (${STEP}) is INVALID or still building`);
+        expect(error?.message).toContain("pg_stat_progress_create_index");
+      });
+
+    test("a non-index relation of a declared name: refused (the migration raises 42P07)", async () => {
+      const db = await before044020();
+      await db.exec("CREATE TABLE sessions.ingest_seed_captures_org_id_idx (x int)");
+      const error = await readOnly(db);
+      expect(error?.code).toBe("index_prebuild_required");
+      expect(error?.message).toContain("index sessions.ingest_seed_captures_org_id_idx on sessions.ingest_seed_captures");
+      expect(error?.message).toContain("exists but is not the declared index");
+    });
+
+    test("steps without declared adoptable indexes are untouched by this check", async () => {
+      const db = await before044020();
+      await populateLazySlots(db);
+      expect(await failure(adoptableIndexBuildPreflight(client(db), [{ name: "upstream:20261105044000_read_api_tokens.sql", path: MIGRATION }] as never, new Map()))).toBeNull();
+    });
+  });
 
   describe("(e) the preflight allowance is exactly the declared names, tables and definitions", () => {
     const tmp = mkdtempSync(join(tmpdir(), "idx-044020-"));
@@ -382,8 +604,21 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
          UNION ALL SELECT 'fn:' || p.oid::regprocedure::text FROM pg_proc p WHERE p.pronamespace = 'sessions'::regnamespace ORDER BY 1`,
       )).rows.map((r) => r.k);
     const ledger = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations ORDER BY name")).rows.map((r) => r.name);
-    const before = await catalog(), ledgerBefore = await ledger();
+    let before = await catalog(), ledgerBefore = await ledger();
     const down = readFileSync(DOWN, "utf8");
+    const later = laterUpstream(await plan(LOCAL)).map((s) => s.name);
+    if (later.length > 0) {
+      // Real later upstream migrations are applied: 044020's down is refused and nothing changes. Then undo them
+      // newest first (their own rollbacks) so the rest of the test sees 044020 as the newest applied step.
+      expect((await failure(db.exec(down).catch(async (e) => { await db.exec("ROLLBACK"); throw e; })))?.code).toBe("55000");
+      expect(await catalog()).toEqual(before);
+      for (const name of [...later].reverse()) {
+        await db.exec(readFileSync(join(root, "supabase/rollbacks", `${name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`), "utf8"));
+      }
+      expect(await ledger()).toEqual(ledgerBefore.filter((n) => !later.includes(n)));
+    }
+    const withLater = { catalog: before, ledger: ledgerBefore };
+    if (later.length > 0) { before = await catalog(); ledgerBefore = await ledger(); }
     // A later upstream migration applied: refused, nothing changes.
     await db.query("INSERT INTO sessions.__96bulls_migrations (name, sha256) VALUES ('upstream:20261105099000_later.sql', 'x')");
     expect((await failure(db.exec(down).catch(async (e) => { await db.exec("ROLLBACK"); throw e; })))?.code).toBe("55000");
@@ -398,17 +633,16 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
     expect((await failure(db.exec(down).catch(async (e) => { await db.exec("ROLLBACK"); throw e; })))?.code).toBe("55000");
     expect(await catalog()).toEqual(after);
     // The next migrator run recreates them.
-    expect(await failure(rerun())).toBeNull();
-    expect(await catalog()).toEqual(before);
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    expect(await catalog()).toEqual(withLater.catalog);
   });
 
-  test("(g) sequence: 044020 sits after 044000; later slots are exactly the known stacked lanes", async () => {
+  test("(g) sequence: 044020 sits after 044000 and every later upstream step sorts after it", async () => {
     const names = (await plan(LOCAL)).map((s) => s.name).filter((n) => n.startsWith("upstream:"));
     const i = names.indexOf(STEP);
     expect(i).toBeGreaterThan(0);
     expect(names[i - 1]! < STEP).toBe(true);
     expect(names.indexOf("upstream:20261105044000_read_api_tokens.sql")).toBeLessThan(i);
-    // Later slots known in this tree (045000 digest slots between on merge; keep slot order here).
-    expect(names.filter((n) => n > STEP)).toEqual(["upstream:20261105046000_analysis_jobs.sql"]);
+    expect(names.slice(i + 1).every((n) => n > STEP)).toBe(true);
   });
 });

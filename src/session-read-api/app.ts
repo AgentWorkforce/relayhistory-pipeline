@@ -17,6 +17,10 @@
  *
  *   - A partial session (`needs_full = 1`) is checked when pagination starts.
  *     A cursor continues the read that check admitted.
+ *   - The self-host Postgres service can replay an explicitly named older
+ *     session from verified canonical objects. These pages recheck readiness
+ *     and bind their cursor to the source generation; workspace search keeps
+ *     its retention floor.
  *   - A search page that reaches the history floor is a terminal 200 with a
  *     `continuation` (CONTINUATION below): the rows from the floor up, and
  *     where the existing backend must continue strictly below it.
@@ -58,6 +62,7 @@ import type { SearchServiceBinding } from "../session-pipeline/search-adapter.ts
 import { CursorError, decodeBackendCursor, decodeCursor } from "./cursor.ts";
 import { TenantMismatchError, partialSessions, partialSessionsInWorkspace, readBufferedEventPage, readEventPage, type Liveness } from "./page.ts";
 import type { EventQuery } from "./queries.ts";
+import { CANONICAL_CURSOR_PREFIX, canonicalEventPage, type CanonicalEventsDeps } from "./canonical-events.ts";
 import { CanonicalReadError, type CanonicalIdentity } from "./canonical.ts";
 import { timingFromCanonical, type CanonicalRows } from "./session-timing-source.ts";
 import { TimingInputError } from "./timing.ts";
@@ -96,6 +101,8 @@ import {
   type BufferedScope,
   type BufferedSessionRow,
   type OwnerBufferedDeps,
+  OwnerBufferedPhaseTimer,
+  type OwnerBufferedReadOptions,
 } from "./owner-buffered.ts";
 import { BRIEF_TITLES_MAX_KEYS, BriefTitlesError, briefTitleEntries, type BriefTitleKey, type BriefTitles } from "./brief-titles.ts";
 import {
@@ -162,6 +169,8 @@ export interface ReadApiDeps {
   timing?: TimingDeps;
   /** Relay session turns and metadata from canonical S3 (session-turns-source.ts); absent = 501 `turns_not_configured`. */
   turns?: TurnsDeps;
+  /** Service-only verified canonical object reads for exact sessions outside search retention. */
+  canonicalEvents?: CanonicalEventsDeps;
   /** Babysitter evidence reader (babysitter-evidence.ts); absent = 501 `delivery_records_not_configured`. */
   babysitter?: EvidenceDeps;
   /**
@@ -339,7 +348,16 @@ function attestWorkspace(c: Context, identity: VerifiedIdentity): void {
 export function createReadApi(deps: ReadApiDeps) {
   if (Boolean(deps.ch) === Boolean(deps.adapter)) throw new Error("read API requires exactly one search service binding");
   if (deps.bufferedSearchGate && !deps.ch) throw new Error("buffered search gate requires the ClickHouse binding");
-  const app = new Hono<{ Variables: { identity: VerifiedIdentity; correlationId: string } }>();
+  const app = new Hono<{
+    Variables: {
+      identity: VerifiedIdentity;
+      correlationId: string;
+      /** Date.now() when the request entered the log middleware. */
+      requestStarted: number;
+      /** READ_API_OWNER_BUFFERED_PHASE_LOG=1: the events route's owner-buffered phase times, added to the request line. */
+      obPhases?: OwnerBufferedPhaseTimer;
+    };
+  }>();
   const log = deps.log ?? (() => {});
 
   app.use("*", async (c, next) => {
@@ -347,11 +365,16 @@ export function createReadApi(deps: ReadApiDeps) {
     const correlationId = incoming && /^[A-Za-z0-9._:-]{1,128}$/.test(incoming) ? incoming : crypto.randomUUID();
     c.set("correlationId", correlationId);
     const started = Date.now();
+    c.set("requestStarted", started);
     await next();
     c.header("Cache-Control", "private, no-store");
     c.header("X-Sessions-Read-Backend", "96bulls");
     c.header("X-Correlation-Id", correlationId);
-    log({ route: c.req.routePath, status: c.res.status, duration_ms: Date.now() - started, correlation_id: correlationId });
+    const phases = c.get("obPhases");
+    log({
+      route: c.req.routePath, status: c.res.status, duration_ms: Date.now() - started, correlation_id: correlationId,
+      ...(phases && !phases.emitted ? phases.fields() : {}),
+    });
   });
 
   app.get("/health", (c) => c.json({ ok: true }));
@@ -570,8 +593,28 @@ export function createReadApi(deps: ReadApiDeps) {
   const bufferedTurns = (c: Context, identity: VerifiedIdentity, ob: OwnerBufferedDeps, sessionId: string, source: string) =>
     bufferedDetail(c, () => readOwnerBufferedTurns(ob, bufferedScope(identity), source, sessionId));
   /** The caller's buffered event rows of one session (readOwnerBufferedEvents), with bufferedTurns' outcomes. */
-  const bufferedEvents = (c: Context, identity: VerifiedIdentity, ob: OwnerBufferedDeps, sessionId: string, source: string) =>
-    bufferedDetail(c, () => readOwnerBufferedEvents(ob, bufferedScope(identity), source, sessionId));
+  const bufferedEvents = (c: Context, identity: VerifiedIdentity, ob: OwnerBufferedDeps, sessionId: string, source: string, opts: OwnerBufferedReadOptions) =>
+    bufferedDetail(c, () => readOwnerBufferedEvents(ob, bufferedScope(identity), source, sessionId, opts));
+
+  /**
+   * READ_API_OWNER_BUFFERED_PHASE_LOG=1: when the client cancels the request (request.signal
+   * aborts; in workerd only with the enable_request_signal compatibility flag), log the phase
+   * times once, at once, with `aborted_phase` (the phase in progress, else "none"): the request
+   * line may never be written for a canceled invocation. Returns the listener's removal.
+   */
+  function logPhasesOnAbort(c: Context, phases: OwnerBufferedPhaseTimer): () => void {
+    const signal = c.req.raw.signal;
+    const onAbort = () => {
+      if (phases.emitted) return;
+      phases.emitted = true;
+      log({
+        route: c.req.routePath, reason: "request_aborted", duration_ms: Date.now() - (c.get("requestStarted") as number),
+        correlation_id: c.get("correlationId"), ...phases.fields("none"),
+      });
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    return () => signal.removeEventListener("abort", onAbort);
+  }
 
   async function bufferedDetail<T extends object>(c: Context, read: () => Promise<T | null | { unverifiedBeforeCandidate: string }>): Promise<T | null> {
     try {
@@ -651,6 +694,7 @@ export function createReadApi(deps: ReadApiDeps) {
   }
 
   app.get("/v1/sessions/:sessionId/events", async (c) => {
+    let stopAbortLog: (() => void) | undefined;
     try {
       const identity = c.get("identity");
       attestWorkspace(c, identity);
@@ -669,11 +713,18 @@ export function createReadApi(deps: ReadApiDeps) {
       // Any canonical pointer: canonical serves the whole response and no buffered read runs.
       let start: Awaited<ReturnType<Liveness["sessionStart"]>> | undefined;
       const ob = source !== undefined ? ownerBufferedFor(identity) : undefined;
-      if (ob?.events === true && source !== undefined) {
+      if (ob?.events === true && source !== undefined && !rawCursor?.startsWith(CANONICAL_CURSOR_PREFIX)) {
         const presented = decodeBackendCursor(rawCursor);
-        start = await deps.liveness.sessionStart(identity.orgId, identity.workspaceId, sessionId, source);
+        // READ_API_OWNER_BUFFERED_PHASE_LOG=1: per-phase times on the request line (durations only).
+        const phases = ob.phaseLog === true ? new OwnerBufferedPhaseTimer() : undefined;
+        if (phases) {
+          c.set("obPhases", phases);
+          stopAbortLog = logPhasesOnAbort(c, phases);
+        }
+        const sessionStart = () => deps.liveness.sessionStart(identity.orgId, identity.workspaceId, sessionId, source);
+        start = await (phases ? phases.time("session_start", sessionStart) : sessionStart());
         if (start.pointers === 0) {
-          const served = await bufferedEvents(c, identity, ob, sessionId, source);
+          const served = await bufferedEvents(c, identity, ob, sessionId, source, { signal: c.req.raw.signal, phases });
           if (served && (served.erased || served.rows.length > 0)) {
             if (served.erased) {
               c.header(BUFFERED_HEADER, "1");
@@ -689,7 +740,37 @@ export function createReadApi(deps: ReadApiDeps) {
         // Hidden, or canonical now serves: a buffered cursor cannot continue here.
         if (presented?.backend === "buffered") throw cursorTransition();
       }
-      const cursor = decodeCursor(rawCursor);
+      const objectCursor = rawCursor?.startsWith(CANONICAL_CURSOR_PREFIX) === true;
+      const cursor = objectCursor ? undefined : decodeCursor(rawCursor);
+      // Search retention is not canonical object retention. Only the Node
+      // service with a verified Locker source can answer this exact old scope;
+      // workspace search and the hosted/Worker paths retain their floor.
+      if (source !== undefined && deps.selfhost && deps.canonicalEvents && deps.adapter?.index.backend === "postgres" &&
+          (deps.directoryWorkspaces === "*" || deps.directoryWorkspaces?.has(identity.workspaceId))) {
+        start ??= await deps.liveness.sessionStart(identity.orgId, identity.workspaceId, sessionId, source);
+        if (start.live > 0 && start.createdAtMs !== null && (start.createdAtMs < deps.completeSinceMs || objectCursor)) {
+          if (cursor) throw unsupported("canonical_cursor_required");
+          const check = async () => {
+            if ((await partialSessions(pageDeps(), identity.orgId, sessionId, identity.workspaceId)).length > 0)
+              throw unsupported("session_partial");
+          };
+          // Recheck completeness on every page and after the generation-fenced
+          // object read; a cursor never licenses a stale/partial projection.
+          await check();
+          let page;
+          try {
+            page = await canonicalEventPage(deps.canonicalEvents, deps.liveness,
+              { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId, source, order, limit, maxContent, cursor }, objectCursor ? rawCursor : undefined);
+          } catch (error) {
+            if (error instanceof CanonicalReadError) throw error.status === 400 ? bad("canonical cursor is not valid") : unsupported(`events_canonical_${error.reason}`);
+            throw error;
+          }
+          const events = includeMessageId ? await withMessageIds(identity, sessionId, source, page.events) : page.events;
+          await check();
+          return c.json({ sessionId, events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
+        }
+      }
+      if (objectCursor) throw unsupported("canonical_cursor_scope");
       if ((await sessionGate(identity, sessionId, source, cursor !== undefined, start)) === "empty")
         return c.json({ sessionId, events: [], nextCursor: null, correlationId: c.get("correlationId") });
       const page = await gatedPage(
@@ -701,6 +782,8 @@ export function createReadApi(deps: ReadApiDeps) {
     } catch (error) {
       if (error instanceof CanonicalReadError) return fail(c, unsupported(`message_id_canonical_${error.reason}`));
       return fail(c, error);
+    } finally {
+      stopAbortLog?.();
     }
   });
 
