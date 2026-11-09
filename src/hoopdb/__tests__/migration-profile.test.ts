@@ -3283,10 +3283,19 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const db = await supabaseLike();
     await db.exec(ET_BOOT);
     const CB = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
+    const V = "upstream:20261105044030_ingest_generation_overlap.sql";
     const LAZY = "ingest_lazy_native_slots_org_id_idx";
-    // The previous release: everything but 044020, validated (marker 'pass').
-    const steps = (await plan(SUPA_ET)).filter((s) => s.name !== CB);
-    expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps }))).toBeNull();
+    // The previous release: everything below 044020, validated (marker 'pass'). 044030 sorts above 044020, so it
+    // is not applied either (the sequence preflight refuses a pending slot below an applied one). A partial
+    // migrate cannot build that state here (044030's owner-only functions are in the committed ACL manifest, so
+    // validation would report drift), so migrate fully and take both guarded downs, newest first; the overlap
+    // down marks the marker pending only because the fence bodies changed, so the previous release's PASS is
+    // restored on the same generation row.
+    expect(await failure(runMigrations(client(db), { profile: SUPA_ET }))).toBeNull();
+    await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105044030_ingest_generation_overlap.down.sql"), "utf8"));
+    await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8"));
+    await db.exec("UPDATE sessions.__96bulls_role_validation SET status='pass' WHERE name='session_directory_search_worker'");
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name IN ($1,$2)", [CB, V])).rows[0]!.n).toBe(0);
     // Production shape: seven prebuilt CONCURRENTLY, the lazy-slot one held, its table populated.
     for (const x of ADOPTABLE_INDEXES[CB]!) if (x.name !== LAZY) await db.exec(x.def);
     await db.query(
@@ -3307,12 +3316,13 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const applied = await failure(runMigrations(client(db), { profile: SUPA_ET }));
     expect(applied?.code).toBe("index_prebuild_required");
     expect(await snapshot(db)).toEqual(before);
-    // After the operator's CONCURRENTLY build: the plan is green with 044020 pending, the apply adopts it.
+    // After the operator's CONCURRENTLY build: the plan is green with 044020 (and the later 044030) pending, the
+    // apply adopts it.
     await db.exec(`CREATE INDEX CONCURRENTLY ${LAZY} ON sessions.ingest_lazy_native_slots USING btree (org_id)`);
     await db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
     const report = await inspectMigrations(client(db), SUPA_ET);
     await db.exec("ROLLBACK");
-    expect(report.inventory.filter((s) => s.pending).map((s) => s.name)).toEqual([CB]);
+    expect(report.inventory.filter((s) => s.pending).map((s) => s.name)).toEqual([CB, V]);
     expect(await failure(runMigrations(client(db), { profile: SUPA_ET, expectedLedgerSha256: report.ledgerSha256 }))).toBeNull();
     expect(((await snapshot(db)).marker as Array<{ status: string }>).map((r) => r.status)).toEqual(["pass"]);
   });
