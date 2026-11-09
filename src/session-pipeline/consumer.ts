@@ -88,6 +88,9 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           if (!deps.requeue) throw new Error("buffered stage pending and no requeue");
           await deps.requeue(event.key);
         }
+        // A same-second refusal is not coverage: warn (keep-up never writes the refusal ledger; the backfill does).
+        if (fed.outcome === "skipped" && fed.reason === "same_second_tie")
+          log.warn("buffered stage search feed refused", { stage: "buffered-search-feed", reason: fed.reason, count: fed.siblings });
         log.info("buffered stage search feed", { stage: "buffered-search-feed", outcome: fed.outcome,
           ...(fed.outcome === "indexed" ? { count: fed.rows, deleted: fed.deleted } : { reason: fed.reason }), duration_ms: Date.now() - started });
       } catch (error) {

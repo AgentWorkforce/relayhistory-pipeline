@@ -192,6 +192,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "replacement: GC claim has its single-candidate advisory admission domain",
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_buffer_gc_claim(jsonb)') AND prosecdef AND prosrc LIKE '%96bulls:buffer-gc-user-v1%') AS applied",
   },
+  "upstream:20261105045010_buffered_search_feed_same_second.sql": {
+    evidence: "replacement: buffered_search_feed_stage returns the sameSecond sibling counts",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.buffered_search_feed_stage(jsonb)') AND prosecdef AND prosrc LIKE '%''sameSecond''%') AS applied",
+  },
   "upstream:20261105043850_ingest_acquisition_owner.sql": { evidence: "table sessions.ingest_acquisition_owners", sql: relation("sessions.ingest_acquisition_owners") },
   "upstream:20261105044100_session_brief_summary_read.sql": { evidence: "summary read RPC and recorded catalog title storage/invalidation", sql: "SELECT to_regprocedure('sessions.session_brief_summary_for(text,text,text)') IS NOT NULL AND to_regprocedure('sessions.session_directory_recorded_title_invalidate()') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass('sessions.session_directory') AND attname='recorded_catalog_title' AND NOT attisdropped) AND EXISTS(SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid=to_regclass('sessions.session_directory') AND tgname='session_directory_recorded_title_invalidate' AND NOT tgisinternal) AS applied" },
   "upstream:20261105043000_brief_titles.sql": { evidence: "column sessions.session_briefs.origin", sql: column("sessions.session_briefs", "origin") },

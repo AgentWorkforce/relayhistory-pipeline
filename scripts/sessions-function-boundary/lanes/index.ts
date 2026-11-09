@@ -5,6 +5,7 @@ import { briefTitles } from "./brief-titles.ts";
 import { ownerBufferedRead } from "./owner-buffered-read.ts";
 import { bufferedSearchGate } from "./buffered-search-gate.ts";
 import { bufferedSearchFeed } from "./buffered-search-feed.ts";
+import { bufferedSearchFeedSameSecond } from "./buffered-search-feed-same-second.ts";
 import { bufferedGcSingleCandidate } from "./buffered-gc-single-candidate.ts";
 import { acquisitionOwner } from "./acquisition-owner.ts";
 import { babysitterRetention } from "./babysitter-retention.ts";
@@ -34,4 +35,4 @@ import { ingestClaimSessions } from "./ingest-claim-sessions.ts";
 import { ingestClaimSessionsReader } from "./ingest-claim-sessions-reader.ts";
 
 /** Every lane the unified generator composes. Order does not affect the output. */
-export const LANES: readonly LaneManifest[] = [briefSummary, briefDocuments, ingestHistory, readApi, readApiTokens, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention, briefTitles, lazyClaimClockNarrowing, ownerBufferedRead, lazyAckClockNoKeyUpdate, acquisitionOwner, bufferedSearchGate, bufferedSearchFeed, ingestBookkeepingCleanup, bufferedSearchGateRetiredWitness, selfhostSessionSelectionErase, selfhostEraseLockFences, ingestGenerationOverlap, bufferedStagesSessionFirst, selfhostEraseShortSummaryProvenance, selfhostEraseSearchTextRebuild, ingestClaimSessions, ingestClaimSessionsReader, digestNarratives];
+export const LANES: readonly LaneManifest[] = [briefSummary, briefDocuments, ingestHistory, readApi, readApiTokens, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention, briefTitles, lazyClaimClockNarrowing, ownerBufferedRead, lazyAckClockNoKeyUpdate, acquisitionOwner, bufferedSearchGate, bufferedSearchFeed, ingestBookkeepingCleanup, bufferedSearchGateRetiredWitness, selfhostSessionSelectionErase, selfhostEraseLockFences, ingestGenerationOverlap, bufferedStagesSessionFirst, selfhostEraseShortSummaryProvenance, selfhostEraseSearchTextRebuild, ingestClaimSessions, ingestClaimSessionsReader, digestNarratives, bufferedSearchFeedSameSecond];

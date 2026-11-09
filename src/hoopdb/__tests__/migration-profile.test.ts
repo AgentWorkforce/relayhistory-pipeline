@@ -2425,8 +2425,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105045000 (digest narrative cache) is the newest: its own down drops the table first, with assertions.
-    // (044090/044100 roll back next via the successor helper below; DG is excluded there since it is already gone.)
+    // Lanes newer than 20261105045000 (045010 same-second feed) roll back first, newest first: 045000's down
+    // refuses (55000) while any of them is applied.
+    const newerThanDigest = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > DG).reverse();
+    if (newerThanDigest.length)
+      expect((await failure(rollback("20261105045000_digest_narrative_cache.down.sql")))?.code).toBe("55000");
+    for (const { name } of newerThanDigest)
+      await rollback(`${name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`);
+    // 20261105045000 (digest narrative cache) is then the newest: its own down drops the table first, with assertions.
+    // (044090/044100 roll back next via the successor helper below; DG and newer are excluded there since they are gone.)
     expect(await names()).toContain(DG);
     expect(await relation("sessions.daily_digest_narratives")).toBe("sessions.daily_digest_narratives");
     await rollback("20261105045000_digest_narrative_cache.down.sql");
@@ -2436,7 +2443,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // Preserve an explicit out-of-order refusal before using every successor's
     // guarded down script, so newer additive lanes need no fixture rewrites.
     // (DG is already rolled back with assertions above, so it is excluded here.)
-    const newerThanClaimReaders = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > CR && s.name !== DG).reverse();
+    const newerThanClaimReaders = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > CR && s.name < DG).reverse();
     if (newerThanClaimReaders.length)
       expect((await failure(rollback("20261105044090_claim_sessions_reader.down.sql")))?.code).toBe("55000");
     for (const { name } of newerThanClaimReaders)
@@ -4590,7 +4597,7 @@ test("044100 real prefix upgrade/fresh/noop/rollback/up preserves pointers and e
     VALUES('org-title','ws-title','codex','session-title','machine-title','user-title',now(),now(),'fs','bucket','manifest/title',
     decode(repeat('ab',32),'hex'),'jsonl','019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18',1,'Pointer retained')`);
   const preserved=async()=>expect((await db.query<{title:string}>("SELECT title FROM sessions.session_index WHERE session_id='session-title'")).rows).toEqual([{title:"Pointer retained"}]);
-  // Newer additive lanes on this branch (045000 digest) also apply on a full upgrade;
+  // Newer lanes (045000 digest, 045010 same-second) also apply on a full upgrade;
   // expect exactly the pending steps, which is 1 where 044100 is newest.
   expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(full.length - previous.steps.length);
   expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(true);await preserved();
@@ -4603,15 +4610,14 @@ test("044100 real prefix upgrade/fresh/noop/rollback/up preserves pointers and e
   const ledgerBefore=await ledgerHash();
   expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(0);
   expect(await ledgerHash()).toBe(ledgerBefore);await preserved();
-  // Branches with lanes newer than 044100 (045000 digest here) roll back newest-first:
+  // Lanes newer than 044100 (045000 digest, 045010 same-second) roll back newest first:
   // the 044100 down script refuses while a later migration is applied.
-  // (Literal name, not the DG const: this test lives outside that const's describe.)
-  if (full.some((s) => s.name === "upstream:20261105045000_digest_narrative_cache.sql")) await db.exec(readFileSync(join(root,"supabase/rollbacks/20261105045000_digest_narrative_cache.down.sql"),"utf8"));
+  for (const later of [...previous.later].reverse())
+    await db.exec(readFileSync(join(root,"supabase/rollbacks",`${later.slice("upstream:".length).replace(/\.sql$/,"")}.down.sql`),"utf8"));
   await db.exec(readFileSync(join(root,"supabase/rollbacks/20261105044100_session_brief_summary_read.down.sql"),"utf8"));
   expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(false);await preserved();
   expect((await db.query("SELECT name FROM sessions.__96bulls_migrations WHERE name=$1",[name])).rows).toEqual([]);
-  // Re-applies exactly what was rolled back above (044100 alone where it is newest,
-  // 044100 + 045000 on branches with newer lanes).
+  // Re-applies exactly what was rolled back above (044100 plus every later lane).
   expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(full.length - previous.steps.length);await preserved();
   const freshDb=await supabaseLike();await freshDb.exec(ET_BOOT);
   expect(await failure(runMigrations(client(freshDb),{profile:SUPA_ET,steps:full}))).toBeNull();
