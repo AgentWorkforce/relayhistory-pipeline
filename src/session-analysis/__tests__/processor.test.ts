@@ -104,6 +104,7 @@ function projectedRows(recs = records()): CanonicalScopeRows {
     exists: true,
     generation: "a".repeat(64),
     legacyCoverage: { version: 1, tables: ["conversation_turns", "session_links", "session_outcomes"] },
+    neonDerived: false,
     rows: projection.rows.map(({ table, row }) => ({
       table,
       row: { org_id: SCOPE.orgId, workspace_id: SCOPE.workspaceId, ...row },
@@ -278,6 +279,10 @@ describe("canonical evidence adapter", () => {
     ).rejects.toThrow("legacy evidence coverage is unknown");
     // The operator switch still overrides.
     expect((await loadSessionSource(deps({}, noMarker), SCOPE, { assumeNoLegacyTurns: true })).sourceProvider).toBe("claude");
+    // P2: an absent objects half refuses even when the database half says free (never counts as not-derived).
+    await expect(
+      loadSessionSource(deps({ neonFree: neonFree(true) }, { ...noMarker, neonDerived: undefined as never }), SCOPE),
+    ).rejects.toThrow("legacy evidence coverage is unknown");
   });
 
   test("refuses a projected row from another source", async () => {

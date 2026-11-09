@@ -3,10 +3,11 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { BUILD_TYPE, IMAGE, SOURCE_TYPE, predicates, releaseParams, verifyRelease } from "../../../scripts/image-release-provenance.mjs";
+import { BUILD_TYPE, IMAGE, LEGACY_IMAGE, PUBLISHED_IMAGES, RELEASE_LAYOUTS, SOURCE_TYPE, predicates, releaseParams, verifyRelease } from "../../../scripts/image-release-provenance.mjs";
+const NEW_IMAGE = "ghcr.io/agentworkforce/sessions-pipeline", OLD_IMAGE = "ghcr.io/agentworkforce/96bulls-services";
 const REPO = "AgentWorkforce/relayhistory-pipeline", LEGACY = "AgentWorkforce/sessions-pipeline";
 
-function fixture(signer?: string) {
+function fixture(signer?: string, layout?: any) {
   const directory = mkdtempSync(join(tmpdir(), "image-provenance-"));
   const index = JSON.stringify({ schemaVersion: 2, mediaType: "application/vnd.oci.image.index.v1+json", manifests: [
     { platform: { os: "linux", architecture: "amd64" } },
@@ -16,7 +17,7 @@ function fixture(signer?: string) {
   const env = { SOURCE_SHA: "a".repeat(40), WORKFLOW_SHA: "b".repeat(40), SOURCE_CI_RUN: "123",
     PUBLISH_RUN_ID: "456", PUBLISH_RUN_ATTEMPT: "2",
     IMAGE_DIGEST: `sha256:${createHash("sha256").update(index).digest("hex")}` };
-  const values = predicates(env, signer);
+  const values = predicates(env, signer, layout);
   writeFileSync(join(directory, "services-index.json"), index);
   for (const [file, type, predicate] of [
     ["build-provenance.sigstore.json", BUILD_TYPE, values.build],
@@ -61,7 +62,91 @@ test(`verifies both ${label} signatures with exact workflow identity before acce
     expect(calls).toHaveLength(2);
     expect(calls.map(args => args[args.indexOf("--type") + 1])).toEqual([BUILD_TYPE, SOURCE_TYPE]);
     expect(receipt.image).toBe(`${IMAGE}@${f.env.IMAGE_DIGEST}`);
+    expect(receipt.images).toEqual([`${NEW_IMAGE}@${f.env.IMAGE_DIGEST}`, `${OLD_IMAGE}@${f.env.IMAGE_DIGEST}`]);
   } finally { f.cleanup(); }
+});
+
+test("new releases sign the primary sessions-pipeline image and the exact dual-publish list", () => {
+  const f = fixture();
+  try {
+    expect([IMAGE, LEGACY_IMAGE]).toEqual([NEW_IMAGE, OLD_IMAGE]);
+    expect(PUBLISHED_IMAGES).toEqual([NEW_IMAGE, OLD_IMAGE]);
+    const { source, build } = predicates(f.env);
+    expect(source.image).toBe(`${NEW_IMAGE}@${f.env.IMAGE_DIGEST}`);
+    expect(source.images).toEqual([`${NEW_IMAGE}@${f.env.IMAGE_DIGEST}`, `${OLD_IMAGE}@${f.env.IMAGE_DIGEST}`]);
+    expect(build.buildDefinition.externalParameters.image).toBe(NEW_IMAGE);
+    expect(build.buildDefinition.externalParameters.images).toEqual([NEW_IMAGE, OLD_IMAGE]);
+  } finally { f.cleanup(); }
+});
+
+test("a release signed before the dual publish verifies only under the legacy-only layout", () => {
+  for (const signer of [undefined, LEGACY] as const) {
+    const f = fixture(signer, RELEASE_LAYOUTS.legacyOnly);
+    try {
+      const { source, build } = predicates(f.env, signer, RELEASE_LAYOUTS.legacyOnly);
+      expect(source.image).toBe(`${OLD_IMAGE}@${f.env.IMAGE_DIGEST}`);
+      expect("images" in source).toBe(false);
+      expect("images" in build.buildDefinition.externalParameters).toBe(false);
+      const receipt = verifyRelease(f.env, f.directory, () => {}, signer, RELEASE_LAYOUTS.legacyOnly);
+      expect(receipt.image).toBe(`${OLD_IMAGE}@${f.env.IMAGE_DIGEST}`);
+      expect(receipt.images).toBeUndefined();
+      expect(() => verifyRelease(f.env, f.directory, () => {}, signer)).toThrow("does not match");
+    } finally { f.cleanup(); }
+  }
+});
+
+test("dual-publish claims cannot be accepted under the legacy-only layout", () => {
+  const f = fixture();
+  try { expect(() => verifyRelease(f.env, f.directory, () => {}, undefined, RELEASE_LAYOUTS.legacyOnly)).toThrow("does not match"); }
+  finally { f.cleanup(); }
+});
+
+for (const layout of [null, "current", "legacyOnly", { image: OLD_IMAGE, images: undefined },
+  { image: "ghcr.io/attacker/sessions-pipeline", images: undefined }, { ...RELEASE_LAYOUTS.current }])
+  test(`an unknown image layout ${JSON.stringify(layout)} is refused before any crypto command`, () => {
+    const f = fixture(); let calls = 0;
+    try {
+      expect(() => verifyRelease(f.env, f.directory, () => { calls++; }, undefined, layout as any)).toThrow("unknown image layout");
+      expect(() => predicates(f.env, undefined, layout as any)).toThrow("unknown image layout");
+      expect(calls).toBe(0);
+    } finally { f.cleanup(); }
+  });
+
+const listMutations: Array<[string, (list: string[]) => unknown]> = [
+  ["reordered", l => [...l].reverse()], ["missing legacy", l => l.slice(0, 1)], ["missing primary", l => l.slice(1)],
+  ["extra repository", l => [...l, l[0]!.replace("agentworkforce", "attacker")]], ["foreign entry", l => [l[0], "ghcr.io/attacker/x"]],
+  ["string instead of list", l => l.join(",")], ["removed", () => undefined], ["empty", () => []],
+];
+for (const [label, mutate] of listMutations) {
+  test(`a ${label} reviewed-source images claim is refused`, () => {
+    const f = fixture();
+    try {
+      change(f.directory, "reviewed-source.sigstore.json", v => { v.predicate.images = mutate(v.predicate.images); });
+      expect(() => verifyRelease(f.env, f.directory, () => {})).toThrow("reviewed source, workflow, image or CI");
+    } finally { f.cleanup(); }
+  });
+  test(`a ${label} build provenance images claim is refused`, () => {
+    const f = fixture();
+    try {
+      change(f.directory, "build-provenance.sigstore.json", v => {
+        v.predicate.buildDefinition.externalParameters.images = mutate(v.predicate.buildDefinition.externalParameters.images);
+      });
+      expect(() => verifyRelease(f.env, f.directory, () => {})).toThrow("build provenance does not match");
+    } finally { f.cleanup(); }
+  });
+}
+
+test("a legacy-only release that gained an images claim is refused", () => {
+  for (const [file, mutate, message] of [
+    ["reviewed-source.sigstore.json", (v: any) => { v.predicate.images = [`${OLD_IMAGE}@x`]; }, "reviewed source"],
+    ["build-provenance.sigstore.json", (v: any) => { v.predicate.buildDefinition.externalParameters.images = [OLD_IMAGE]; }, "build provenance"],
+  ] as const) {
+    const f = fixture(undefined, RELEASE_LAYOUTS.legacyOnly);
+    try {
+      change(f.directory, file, mutate);
+      expect(() => verifyRelease(f.env, f.directory, () => {}, undefined, RELEASE_LAYOUTS.legacyOnly)).toThrow(message);
+    } finally { f.cleanup(); }
+  }
 });
 
 for (const signer of ["AgentWorkforce/sessions-pipeline-oss", "AgentWorkforce/sessions-pipeline-cloud", "fork/relayhistory-pipeline",
@@ -93,7 +178,7 @@ for (const failingCall of [1, 2]) test(`crypto failure ${failingCall} stops acce
   } finally { f.cleanup(); }
 });
 
-for (const field of ["repository", "source_sha", "workflow_sha", "source_ref", "ci_run_id", "image"]) {
+for (const field of ["repository", "source_sha", "workflow_sha", "source_ref", "ci_run_id", "image", "images"]) {
   test(`a cryptographically accepted but wrong reviewed-source ${field} is refused`, () => {
     const f = fixture();
     try {
@@ -108,6 +193,7 @@ for (const mutate of [
   (v: any) => { v.predicate.runDetails.metadata.invocationId = "other invocation"; },
   (v: any) => { v.predicate.buildDefinition.resolvedDependencies[0].digest.gitCommit = "c".repeat(40); },
   (v: any) => { v.predicate.buildDefinition.externalParameters.source_ref = "refs/heads/topic"; },
+  (v: any) => { v.predicate.buildDefinition.externalParameters.image = "ghcr.io/agentworkforce/96bulls-services"; },
 ]) test("foreign builder, invocation or source dependency is refused", () => {
   const f = fixture();
   try {

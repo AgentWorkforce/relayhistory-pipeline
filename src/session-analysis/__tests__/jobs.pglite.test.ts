@@ -759,8 +759,10 @@ describe("durable unknown-PUT recovery through the shared paged eraser: an abort
   const ticket = async () =>
     (await pg.query<{ k: string; reason: string; sweeps: number }>("SELECT result_key k, reason, sweeps FROM sessions.session_analysis_result_tickets")).rows;
 
-  async function reserved(store: ObjectStore) {
-    const js = postgresAnalysisJobStore({ db: hoopDb(pg), store, anchorManifestKey: async () => ANCHOR, putTimeoutMs: 50 });
+  // No PUT timeout by default: only the tests that deliberately stall the PUT pass one,
+  // so PUTs meant to succeed never race a 50 ms timer on a loaded host.
+  async function reserved(store: ObjectStore, putTimeoutMs?: number) {
+    const js = postgresAnalysisJobStore({ db: hoopDb(pg), store, anchorManifestKey: async () => ANCHOR, ...(putTimeoutMs === undefined ? {} : { putTimeoutMs }) });
     await request();
     const job = (await js.claim({ leaseSeconds: 600 }))!;
     const out = output();
@@ -797,7 +799,7 @@ describe("durable unknown-PUT recovery through the shared paged eraser: an abort
       late = () => v.commit(String(key), body as Uint8Array); // the provider commits it LATER
       opts?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
     }));
-    const { js, job, bytes, sha256, key } = await reserved(aborting);
+    const { js, job, bytes, sha256, key } = await reserved(aborting, 50);
     await expect(js.put(key, bytes, sha256, job)).rejects.toThrow("analysis_put_timeout");
     await pg.query("UPDATE sessions.session_analysis_result_tickets SET created_at = now() - interval '7 days'");
     expect(await sweep(v)).toBe(0); // a strict zero inventory, but the invocation is dispatched: kept

@@ -9,8 +9,10 @@ import { log } from "../shared/log.ts";
 import { briefConfig, modelFetch, modelKey, modelResponsesUrl } from "./config.ts";
 import { createAnalysisTransport } from "./engine/transport.ts";
 import { briefTick } from "./worker.ts";
+import { canonicalBriefInputFromEnv } from "./canonical-input.ts";
 
 const config = briefConfig();
+const canonicalInput = canonicalBriefInputFromEnv();
 const key = modelKey();
 // OPENAI_BASE_URL is validated even with no key, so a bad value fails at startup.
 const fetchModel = modelFetch(modelResponsesUrl());
@@ -27,6 +29,7 @@ const tick = briefTick({
   store: lockerStore().store,
   transport,
   config,
+  ...(canonicalInput ? { canonicalInput } : {}),
 });
 await runWorker({
   service: "session-brief",

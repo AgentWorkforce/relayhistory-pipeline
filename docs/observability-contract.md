@@ -44,6 +44,24 @@ X-Ray cannot, because it interprets the first 32 bits as epoch seconds.
 Structured stage events and DLQs remain in HoopDb; service logs remain
 structured stdout.
 
+**Product analytics is a separate stream** (helm-charts
+`docs/analytics-adapter-contract.md`, `docs/analytics-collector-interface.md`).
+Business logic emits typed events through `AnalyticsPort.capture`
+(`src/shared/analytics.ts`); a per-kind allowlist projects each into the
+versioned envelope (closed classes, latency buckets and clamped counts; verified
+org/workspace ids for workspace events; never content, paths, session/user ids,
+error text or tokens). `ANALYTICS_SINK` selects the destination
+(`src/shared/analytics-config.ts`) and defaults to noop. Self-host services accept
+only `collector` (POST to the in-cluster collector's `/v1/events` with a
+per-producer bearer); the hosted Workers accept only `posthog`
+(`https://i.agentrelay.com`). There is no fallback between them. Export is
+bounded (`src/shared/analytics-export.ts`): a queue that drops the newest event
+when full, batch and byte limits, a total delivery deadline, bounded retries, a
+shutdown flush, and drop/failure counters reported as `analytics export degraded`
+log lines. A failing sink never fails a request. Events: `session_ingest.batch_completed`,
+`session_read.request_completed` and `session_pipeline.index_tick_completed`
+(installation-scoped). Their registration in the producer registry is pending owner review.
+
 **Not yet built:** metrics and SLO alerts (stage lag, DLQ > 0, scrub refusal),
 tail sampling, per-tenant retention/deletion in the telemetry backend, and a
 durable hosted log exporter. Logs are unsampled; errors are never sampled out.

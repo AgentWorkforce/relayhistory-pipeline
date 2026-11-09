@@ -24,19 +24,32 @@ closed at boot.
 | Search contract, validation and query reference semantics | `packages/pipeline/src/search-index/contracts.ts` |
 | Backend-independent scope reconcile | `packages/pipeline/src/search-index/reconcile.ts` |
 | Postgres search using pg_trgm | `packages/pipeline/src/search-index/postgres.ts` |
+| OpenSearch / Elasticsearch search over REST (`fetch` only) | `packages/pipeline/src/search-index/opensearch.ts` |
 | Shared search conformance | `packages/pipeline/src/search-index/conformance.ts` |
 | Runtime contract and shared failure handling | `packages/pipeline/src/runtime/contracts.ts` |
 | Worker poll loop and in-process schedules | `packages/pipeline/src/runtime/workers.ts` |
 | Shared runtime conformance | `packages/pipeline/src/runtime/conformance.ts` |
 | Explicit registration and boot selection | `packages/pipeline/src/adapters/` |
 
-The default registries contain only Postgres search and the worker runtime.
-Recognizing a provider name does not install that implementation. Creating an
-unregistered adapter fails. Each entry point declares the implementations it
-can run; future compositions must explicitly register and allow any additions.
+The default search registry (`createSearchIndexRegistry`) contains only
+Postgres. It backs `createPostgresSearchComposition` and is the registry the
+Lambda composition ABI (`src/lambda-artifact/composition.ts`) exports.
+`createOpenSearchCapableSearchIndexRegistry` adds OpenSearch and is opt-in: the
+ABI does not export it. The self-host read API and the self-host pipeline
+consumer use it (through `src/shared/opensearch-composition.ts`) only when
+`SEARCH_INDEX_BACKEND=opensearch`. The default runtime
+registry contains only the worker runtime. Recognizing a provider name does not
+install that implementation. Creating an unregistered adapter fails. Each entry
+point declares the implementations it can run. Workers refuse
+`SEARCH_INDEX_BACKEND=opensearch` whatever is registered. The Lambda entries
+allow `clickhouse` plus the names their composition's registry holds, so they
+refuse `opensearch` with no composition or with any composition built on the
+ABI's registry (`src/session-pipeline/__tests__/lambda-search-backends.test.ts`).
+Any other composition that runs OpenSearch must choose the opensearch-capable
+registry explicitly, as a reviewed change.
 
-OpenSearch, ClickHouse, Lambda, Cloud Run and Terse implementation ownership,
-distribution and service integration are separate follow-ups. This foundation
+ClickHouse, Lambda, Cloud Run and Terse implementation ownership, distribution
+and service integration are separate follow-ups. This foundation
 does not select their repository placement or advertise them as Helm profiles.
 
 ## SearchIndexAdapter
@@ -83,6 +96,109 @@ each one against the reference oracle (`matchesQuery`):
 Tenant ids must come from verified auth. The adapter filters on them; it does
 not authenticate them.
 
+### OpenSearch / Elasticsearch implementation
+
+`createOpenSearchSearchIndex` speaks the REST API with `fetch` only (no client
+library) and sends requests only to the configured URL (redirects are refused).
+One adapter serves both products; `SEARCH_INDEX_OPENSEARCH_DIALECT` names which
+one, because GCP and Azure have no managed OpenSearch (Elastic Cloud only).
+`ensureSchema` checks the product (`GET /`: `version.distribution` for
+OpenSearch, the `X-Elastic-Product` header for Elasticsearch) and refuses a
+mismatch. The backend name stays `opensearch` for both; the adapter `id` is the
+dialect.
+
+- One index, `<prefix>-transcript-events`, with every field mapped explicitly
+  and `dynamic: strict`. Tenant, session and kind filters are `term` clauses in
+  `bool.filter`; nothing is scored.
+- `q` is matched like the Postgres reference (lower-cased substring of the first
+  4,096 characters of content, or the title) by a `wildcard` over lower-cased
+  keyword windows of 4,096 characters at a 2,048 stride. A 500-character `q`
+  lower-cases to at most 1,000 code points (`İ` becomes two), and any substring
+  of up to 2,049 code points falls wholly inside one window. That arithmetic is
+  unit-tested over a fake `fetch`. The real-server tests run three kinds of `q`:
+  a 500-character `q` containing one `İ` at four window boundaries of a 9,000-character
+  title; `'a'.repeat(500)`; and the maximal folded `'İ'.repeat(500)` and `'ab'.repeat(250)`,
+  within one window and past the first window boundary. Each is compared with
+  `matchesQuery`, plus a repetitive `q` exactly at and one byte past the
+  wildcard bound below. The real-server proof is the `opensearch-proof` CI job.
+- Long-literal fallback: a folded `q` longer than 64 UTF-8 bytes
+  (`WILDCARD_MAX_LITERAL_BYTES`) is not sent as a `wildcard`. Lucene
+  determinizes the `*literal*` automaton under a fixed work limit (10,000), and
+  a repetitive literal such as `'a'.repeat(500)` or `'İ'.repeat(500)` costs
+  roughly the square of its length, so both products reject it with HTTP 400
+  (`too_complex_to_determinize_exception`). The adapter's source comment has the
+  arithmetic for the bound (worst case about 4,800 units at 64 bytes, a 2x
+  margin). Past the bound, `q` is one painless `script` filter that runs
+  `String.contains` over every window value of the two folded fields. `q` is
+  passed as `params.q`, and the script source is fixed, so it compiles once
+  and `q` never becomes code. This is exact (the same windows, and Java and
+  JavaScript both compare UTF-16 code units). It needs doc values on
+  `content_prefix_folded` and `task_title_folded`, which the mapping now enables,
+  and no other index or cluster setting: inline painless is on by default on
+  both products. An index created with the earlier `doc_values: false` mapping
+  fails `ensureSchema` with `mapping_conflict` and has to be recreated. The doc
+  values store the folded windows a second time on disk. Cost: a
+  script filter runs once per candidate document that has already passed the
+  tenant, session, source, kind, project and time filters (Lucene checks it
+  last, as a two-phase check). So its cost grows with the tenant's matching
+  rows, not with the whole index, but every candidate pays a JVM string scan of
+  up to about 4,096 characters per window. A cluster that sets
+  `search.allow_expensive_queries: false` rejects both the leading-wildcard
+  path and the script path.
+- Errors: a 4xx/5xx reply surfaces as `http_<status>`, followed by the server's
+  `error.type` and `error.caused_by.type` names when it sends them (for example
+  `http_400:illegal_argument_exception:too_complex_to_determinize_exception`).
+  The server's `reason` text is never included, because it can quote `q` or
+  content.
+- Cost: a short `q` (the wildcard path) is a leading-wildcard query, so each search enumerates the whole
+  folded-term dictionary of every shard it hits. The tenant `filter` does not
+  narrow that walk, so the cost grows with the whole index, not the tenant,
+  and one tenant's long queries (each up to the request timeout) slow search
+  for every tenant sharing the index. The adapter declares this
+  (`minIndexedQueryChars` is `Number.MAX_SAFE_INTEGER`) but does not limit it.
+  Before shared production use, at least one of these must be in place: a
+  per-tenant index or alias (so the term walk covers one tenant), an n-gram
+  field that turns `q` into term lookups, or a per-tenant rate limit on search
+  at the read API.
+- Upserts are `_bulk?refresh=wait_for` with `version_type=external_gte`, so a
+  newer stored version wins and reads see writes on return. `index.gc_deletes`
+  is `0s`, so a deleted key can be rewritten at any version, as in Postgres.
+  The engine only drops a delete tombstone on a refresh after its coarse clock
+  (200 ms) ticks, so a write that conflicts with no live document (checked by
+  `_mget`) is retried after `_refresh` for up to about 4 s, then fails
+  retryably with `deleted_key_conflict`. A conflict whose `_mget` item has no
+  boolean `found` (an error item) fails with `bad_response` instead of being
+  counted as a newer row. `_bulk` is not atomic, unlike the single Postgres
+  `INSERT`: when one item fails, the request throws `bulk_item_<status>` after
+  earlier items in the same request have been written. A retry is safe, because
+  external versions make each write idempotent. Callers must not assume a failed
+  upsert wrote nothing. A basic-auth user needs
+  read, write, `_delete_by_query`, `_mget` and `_refresh` on the index, plus
+  index creation, mapping updates and reading settings for `ensureSchema`.
+- `ensureSchema` reads `index.gc_deletes` back after creating or confirming the
+  index. An index that already existed or came from a template may keep the
+  60 s default, which the tombstone handling above does not expect. Anything
+  other than `0`, `0s` or `0ms` fails `schema_mismatch` (detail `gc_deletes`).
+  The adapter never applies settings. An operator sets
+  `index.gc_deletes: 0s` (a dynamic setting) and reruns `ensureSchema`.
+- `deleteEvents` and `eraseScope` are `_delete_by_query?refresh=true&conflicts=proceed`
+  under the tenant filter; an erase repeats while version conflicts remain and
+  fails rather than reporting partial erasure.
+- Ordering is the contract key order on keyword/long sort fields; paging and
+  `scanFingerprints` use `search_after`, so results past `max_result_window`
+  are reachable.
+- Errors map to `SearchIndexError` codes without backend text: 404 index →
+  `schema_missing`, 429/5xx/network/timeout → retryable `unavailable`.
+- Auth: `none`, `basic` (password from the secret loader), `sigv4` (service
+  `es`, EKS Pod Identity credentials supplied by the composition). `basic` and
+  `sigv4` need an `https` URL unless the host is loopback (`localhost`, `127.0.0.0/8`, `::1`). Otherwise
+  construction fails `invalid_argument` (detail `basic_auth_needs_https` or `sigv4_needs_https`), so
+  credentials never cross a network in cleartext. `CA_FILE` needs Bun.
+
+`.github/workflows/opensearch-proof.yml` runs the shared conformance suite and an
+end-to-end upload → scrub → index → search → erase proof on real OpenSearch 2
+and Elasticsearch 8 containers (`docs/session-search-proof.md`).
+
 ### Postgres implementation
 
 Postgres uses pg_trgm GIN indexes on normalized content-prefix and title columns.
@@ -93,6 +209,29 @@ The derived index has its own schema (`search_index`, configurable); transcript
 text never goes in the metadata directory, `session_directory` (decision 0002).
 Key columns use `COLLATE "C"` to preserve cursor order. `ensureSchema` requires
 pg_trgm to be installed already and performs DDL only when explicitly called.
+The table has forced row-level security with a `tenant_only` policy (the same
+shape as `projection_state`): rows are visible and writable only where
+`org_id`/`workspace_id` equal the transaction's `bulls96_read.org_id`/
+`bulls96_read.workspace_id` settings. `ensureSchema` creates it and verifies it
+exactly, refusing drift with `schema_missing (tenant_policy_mismatch)`. Every
+tenant-scoped statement binds its own tenant: through the configured
+`tenantRunner` (a reader's tenant transaction), or else by setting the settings
+on the client just before the statement, which only holds inside an open
+transaction (a writer's scope pass). The adapter checks that the settings held
+and otherwise throws `unavailable (tenant_unbound)`, so a bare pool never reads,
+deletes or erases nothing and reports success. Deletes also report, from the
+deleting statement, that they were bound and removed every matching row they
+saw, and an erase then confirms no scope row is left; a shortfall throws
+`unavailable (delete_incomplete)` (retryable). A superuser or `BYPASSRLS` role
+skips the policy.
+
+Under RLS the trigram GIN indexes are not used for `q`: `LIKE` (`textlike`) is
+not leakproof, so PostgreSQL will not evaluate it before the policy, and a
+search filters the tenant's rows from the scope index instead. Search cost is
+therefore linear in one tenant's size (about 20-27 ms per query at 200,000 rows
+in one tenant on PostgreSQL 17, against 2 s `statement_timeout`). That is
+accepted at self-host scale for now; a tenant-scoped search path that keeps
+trigram acceleration is a follow-up.
 
 This adapter does not replace RelayHistory's existing transcript search path.
 Selecting which service owns self-host transcript queries, migrating any data,
@@ -167,9 +306,29 @@ components retain their existing timing checks.
 
 | Variable | Recognized names | Current entry-point behavior |
 | --- | --- | --- |
-| `SEARCH_INDEX_BACKEND` | `postgres`, `clickhouse`, `opensearch` | workers allow `postgres`; the existing Lambda entry allows `clickhouse` |
+| `SEARCH_INDEX_BACKEND` | `postgres`, `clickhouse`, `opensearch` | workers allow `postgres`; the existing Lambda entries allow `clickhouse`, plus `postgres` with a composition from the ABI; the self-host read API (`postgres` default, `clickhouse`, `opensearch`) and the self-host pipeline consumer (`postgres`, `opensearch`, no default) allow `opensearch` with Postgres projection state |
 | `PIPELINE_RUNTIME` | `workers`, `lambda`, `cloudrun`, `terse` | workers allow `workers`; the existing Lambda entry allows `lambda` |
 | `SEARCH_INDEX_POSTGRES_SCHEMA` | SQL identifier | `search_index` unless explicitly configured; validated when constructing the adapter |
+| `SEARCH_INDEX_OPENSEARCH_URL` | `http(s)://host[:port][/path]` | required when `SEARCH_INDEX_BACKEND=opensearch`; creation fails without it. No credentials, query or fragment in the URL |
+| `SEARCH_INDEX_OPENSEARCH_DIALECT` | `opensearch`, `elasticsearch` | `opensearch` |
+| `SEARCH_INDEX_OPENSEARCH_INDEX_PREFIX` | lower-case `[a-z0-9][a-z0-9_-]*` | `relayhistory` (index `relayhistory-transcript-events`) |
+| `SEARCH_INDEX_OPENSEARCH_AUTH` | `none`, `basic`, `sigv4` | `none`; `basic` and `sigv4` need an `https` or loopback URL; `sigv4` signs for service `es` with EKS Pod Identity credentials (service entries only) |
+| `SEARCH_INDEX_OPENSEARCH_AWS_REGION` | AWS region name | required for `sigv4` |
+| `SEARCH_INDEX_OPENSEARCH_USERNAME` | string without `:` | required for `basic` |
+| `SEARCH_INDEX_OPENSEARCH_PASSWORD` | secret, from the secret loader (`secrets`), never env | required for `basic` |
+| `SEARCH_INDEX_OPENSEARCH_CA_FILE` | path to a PEM bundle | unset; https only, Bun runtime only |
+| `SEARCH_INDEX_OPENSEARCH_REQUEST_TIMEOUT_MS` | integer, 1 to 600000 | `10000` |
+| `SEARCH_INDEX_OPENSEARCH_BULK_MAX_BYTES` | positive integer (bytes) | `4194304` (4 MiB); upper bound of one `_bulk` request body (NDJSON), well under the 10 MiB request limit of small Amazon OpenSearch instance types. A write splits into several requests at this bound or at 5000 documents; a single larger document is sent alone. Unset, zero or malformed means the default |
+
+A failed OpenSearch write keeps its code and retryable flag (429 and 5xx,
+timeouts and network errors are retryable) and carries a bounded detail: the
+HTTP status and the server's error type names, the `_bulk` item count and body
+bytes, and for item failures the first failing item's status and type names and
+the failed count (for example
+`http_429:es_rejected_execution_exception:bulk_items_812:bulk_bytes_4190000` or
+`bulk_item_400:mapper_parsing_exception:bulk_failed_2:bulk_items_812:bulk_bytes_4190000`).
+The self-host consumer logs it as `error_detail` on `search index failed`. Never
+the server's `reason` text or any document content.
 
 Empty or unset selection variables use each entry point's existing behavior.
 Unknown names and recognized but unsupported choices fail at boot. Workers use
@@ -209,6 +368,11 @@ bun run --filter @96bulls/pipeline typecheck
 bun run --filter @96bulls/pipeline test
 bun test src/shared src/session-pipeline
 ```
+
+The OpenSearch backend's unit tests use a fake `fetch`
+(`test/search-index-opensearch.test.ts`); its real-server suite runs when
+`SEARCH_INDEX_OPENSEARCH_TEST_URL` names a disposable server
+(`SEARCH_INDEX_OPENSEARCH_TEST_DIALECT=elasticsearch` for Elasticsearch).
 
 The shared search suite exercises PGlite with pg_trgm and can run against a
 disposable PostgreSQL database using `SEARCH_CONFORMANCE_PG_URL`. CI runs that

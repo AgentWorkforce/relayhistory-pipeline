@@ -1,5 +1,5 @@
 /** Strictly synthetic transports; unknown requests throw rather than use real fetch. */
-import { test, expect, spyOn } from "bun:test";
+import { describe, test, expect, spyOn } from "bun:test";
 import * as Stacks from "alchemy/Alchemist/routes/stack";
 import * as Effect from "effect/Effect";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -14,6 +14,7 @@ import {
   guardOperatorFetch,
   OPERATOR_METADATA_MAX_BYTES,
   operatorCapture,
+  operatorSafePlans,
   verifyOperatorCapture,
   EXECUTION_EXCEPTION,
   type OperatorSecrets,
@@ -63,11 +64,25 @@ const tools = {
     nativeBindingsSha256: "f".repeat(64),
   };
 const digest = (v: string) => createHash("sha256").update(v).digest("hex");
-async function actualPlanProof(mode: "canonical" | "buffered") {
+async function actualPlanProof(declared: "canonical" | "buffered" | "admission" | "admission-default" | "admission-drain" | "frozen-receipt") {
+  // "admission": buffered + asyncAdmission "on" (the three admission resources and two more bindings).
+  // "admission-default": buffered with asyncAdmission OMITTED, which resolves to "on" (same as "admission").
+  // "admission-drain": buffered + asyncAdmission "drain" (same resources, the var says drain).
+  // "buffered": buffered + explicit asyncAdmission "off": the four resources, byte-identical to before.
+  // "frozen-receipt": buffered + frozen-supabase custody + syncAdmissionFrozenReceipt, asyncAdmission "off" (two more vars, no resource).
+  const mode = declared === "canonical" ? "canonical" : "buffered";
+  const admission = declared === "admission" || declared === "admission-default" || declared === "admission-drain";
+  const admissionVar = declared === "admission-drain" ? "drain" : "on";
+  const frozenReceipt = declared === "frozen-receipt";
+  const bindingCount = admission || frozenReceipt ? 17 : mode === "buffered" ? 15 : 13;
   const input = {
     ...baseInput,
     sessionIngest: {
       ...baseInput.sessionIngest,
+      ...(declared === "admission" ? { asyncAdmission: "on" as const } : {}),
+      ...(declared === "admission-drain" ? { asyncAdmission: "drain" as const } : {}),
+      ...(declared === "buffered" || frozenReceipt ? { asyncAdmission: "off" as const } : {}),
+      ...(frozenReceipt ? { custodySource: "frozen-supabase" as const, syncAdmissionFrozenReceipt: "on" as const } : {}),
       ...(mode === "buffered"
         ? {
             acceptanceMode: "buffered" as const,
@@ -160,13 +175,20 @@ async function actualPlanProof(mode: "canonical" | "buffered") {
       input,
       (plans, attestation) => {
         reviewed++;
-        expect(plans.planText).toContain("4 to create");
+        expect(plans.planText).toContain(admission ? "7 to create" : "4 to create");
         expect(attestation.stateVersion).toBe(7);
       },
       { directory: dir, emptyEnvPath: empty, fetcher },
     );
     expect(reviewed).toBe(1);
     expect(result.plans.planText).toContain("[session-ingest] create");
+    // Explicit "off" (and canonical): no admission resource, binding or var anywhere in the plan.
+    if (!admission) {
+      expect(result.plans.planText).not.toContain("admission-");
+      expect(result.plans.planText).not.toContain("INGEST_ADMISSION");
+      expect(result.plans.planText).not.toContain("INGEST_ASYNC_ADMISSION");
+      expect(result.plans.detailedText).not.toContain("96bulls-session-ingest-admission");
+    }
     expect(result.plans.detailedText).toContain("workersDev: false");
     expect(result.plans.detailedText).not.toContain(secrets.stateToken);
     expect(calls.every((c) => c.method === "GET")).toBe(true);
@@ -259,7 +281,7 @@ async function actualPlanProof(mode: "canonical" | "buffered") {
       applySpy.mockRestore();
     }
     expect(assertOperatorSnapshot(native, input)).toHaveLength(
-      mode === "buffered" ? 15 : 13,
+      bindingCount,
     );
     // Installed Alchemy's NoopUpdate omits row.props. Check the exact
     // no-op node shape against existing resolved state and keep all guards.
@@ -271,7 +293,7 @@ async function actualPlanProof(mode: "canonical" | "buffered") {
       }));
     const noopSnapshot = { ...native, native: { ...native.native, resources: noopRows } };
     expect(assertOperatorSnapshot(noopSnapshot, input)).toHaveLength(
-      mode === "buffered" ? 15 : 13);
+      bindingCount);
     const fanout = noopRows["session-ingest-fanout"];
     const queueId = "9".repeat(32), queueName = "96bulls-session-ingest-fanout";
     fanout.state.attr = { queueId, queueName, accountId: secrets.accountId };
@@ -280,7 +302,7 @@ async function actualPlanProof(mode: "canonical" | "buffered") {
     noopWorker.bindings = noopWorker.bindings.map((b: any) => b.sid !== "INGEST_FANOUT" ? b :
       { ...b, action: "noop", data: { bindings: [queueData] } });
     expect(assertOperatorSnapshot(noopSnapshot, input)).toHaveLength(
-      mode === "buffered" ? 15 : 13);
+      bindingCount);
     for (const delta of [{ queueName: "foreign" }, { queueId: "8".repeat(32) },
       { queueId: undefined }, { queueName: undefined }, { shim: "foreign" }]) {
       const rows = { ...noopRows, "session-ingest": { ...noopWorker,
@@ -323,6 +345,58 @@ async function actualPlanProof(mode: "canonical" | "buffered") {
         { ...native, native: { ...native.native, resources: rows } }, input)).toThrow();
     }
     const queue = native.native.resources["session-ingest-fanout"];
+    if (admission) {
+      const rowsOf = native.native.resources;
+      const worker = rowsOf["session-ingest"];
+      expect(worker.bindings.find((b: any) => b.sid === "INGEST_ASYNC_ADMISSION").data.bindings[0])
+        .toEqual({ type: "plain_text", name: "INGEST_ASYNC_ADMISSION", text: admissionVar });
+      expect(worker.bindings.some((b: any) => b.sid === "INGEST_ADMISSION")).toBe(true);
+      for (const id of ["session-ingest-admission", "session-ingest-admission-dlq"]) {
+        expect(rowsOf[id].props.deliveryPaused).toBeUndefined();
+        // Paused admission queue, or a foreign name: refused.
+        for (const props of [{ ...rowsOf[id].props, deliveryPaused: true }, { ...rowsOf[id].props, name: "foreign" }])
+          expect(() => assertOperatorSnapshot({ ...native, native: { ...native.native, resources: { ...rowsOf, [id]: { ...rowsOf[id], props } } } }, input)).toThrow();
+      }
+      // The fanout queues stay paused.
+      expect(queue.props.deliveryPaused).toBe(true);
+      const ac = rowsOf["session-ingest-admission-consumer"];
+      expect(ac.props.settings).toEqual({ batchSize: 1, maxRetries: 20, maxConcurrency: 4 });
+      expect(() => assertOperatorSnapshot({ ...native, native: { ...native.native, resources: { ...rowsOf,
+        "session-ingest-admission-consumer": { ...ac, props: { ...ac.props, settings: { ...ac.props.settings, maxConcurrency: 64 } } } } } }, input))
+        .toThrow("native_admission_consumer");
+      // All or none: dropping one admission resource, or the binding, refuses.
+      const { ["session-ingest-admission-consumer"]: _gone, ...partial } = rowsOf;
+      expect(() => assertOperatorSnapshot({ ...native, native: { ...native.native, resources: partial } }, input)).toThrow("native_resource_inventory");
+      expect(() => assertOperatorSnapshot({ ...native, native: { ...native.native, resources: { ...rowsOf, "session-ingest": { ...worker,
+        bindings: worker.bindings.filter((b: any) => b.sid !== "INGEST_ADMISSION") } } } }, input)).toThrow("native_binding_inventory");
+      // The same snapshot against an explicit "off" input: refused (seven resources are not four).
+      expect(() => assertOperatorSnapshot(native, { ...input, sessionIngest: { ...input.sessionIngest, asyncAdmission: "off" } })).toThrow("native_resource_inventory");
+      // Omitted and explicit "on" resolve alike on a buffered capture; "drain" vs "on" differs only in the var.
+      const { asyncAdmission: _a, ...omitted } = input.sessionIngest as any;
+      if (admissionVar === "on") {
+        expect(assertOperatorSnapshot(native, { ...input, sessionIngest: omitted })).toHaveLength(bindingCount);
+        expect(assertOperatorSnapshot(native, { ...input, sessionIngest: { ...omitted, asyncAdmission: "on" } })).toHaveLength(bindingCount);
+      }
+      expect(() => assertOperatorSnapshot(native, { ...input, sessionIngest: { ...omitted, asyncAdmission: admissionVar === "on" ? "drain" : "on" } }))
+        .toThrow("native_binding_target");
+    }
+    if (frozenReceipt) {
+      const rowsOf = native.native.resources;
+      const worker = rowsOf["session-ingest"];
+      expect(worker.bindings.find((b: any) => b.sid === "INGEST_SYNC_ADMISSION_FROZEN_RECEIPT").data.bindings[0])
+        .toEqual({ type: "plain_text", name: "INGEST_SYNC_ADMISSION_FROZEN_RECEIPT", text: "on" });
+      // No admission queue or binding: the var alone.
+      expect(Object.keys(rowsOf).some((id) => id.includes("admission"))).toBe(false);
+      expect(worker.bindings.some((b: any) => b.sid === "INGEST_ADMISSION")).toBe(false);
+      // The read-back refuses the var dropped, changed, or present for an input without the flag.
+      expect(() => assertOperatorSnapshot({ ...native, native: { ...native.native, resources: { ...rowsOf, "session-ingest": { ...worker,
+        bindings: worker.bindings.filter((b: any) => b.sid !== "INGEST_SYNC_ADMISSION_FROZEN_RECEIPT") } } } }, input)).toThrow("native_binding_inventory");
+      expect(() => assertOperatorSnapshot({ ...native, native: { ...native.native, resources: { ...rowsOf, "session-ingest": { ...worker,
+        bindings: worker.bindings.map((b: any) => b.sid !== "INGEST_SYNC_ADMISSION_FROZEN_RECEIPT" ? b :
+          { ...b, data: { bindings: [{ ...b.data.bindings[0], text: "off" }] } }) } } } }, input)).toThrow("native_binding_target");
+      const { syncAdmissionFrozenReceipt: _s, ...withoutFlag } = input.sessionIngest as any;
+      expect(() => assertOperatorSnapshot(native, { ...input, sessionIngest: withoutFlag })).toThrow("native_binding_inventory");
+    }
     if (mode === "buffered") {
       const worker = native.native.resources["session-ingest"];
       expect(worker.props.env.INGEST_EXPECT_GENERATION).toBe("e".repeat(64));
@@ -395,7 +469,7 @@ async function actualPlanProof(mode: "canonical" | "buffered") {
     await rm(dir, { recursive: true, force: true });
   }
 }
-test.each(["canonical", "buffered"] as const)(
+test.each(["canonical", "buffered", "admission", "admission-default", "admission-drain", "frozen-receipt"] as const)(
   "actual original four-resource declaration %s uses authenticated HTTP state and retained plan",
   actualPlanProof,
 );
@@ -601,4 +675,57 @@ test("queue metadata over 64 KiB is observed; over the 2 MiB bound it refuses", 
   expect(ok.status).toBe(200);
   const huge = filler(Math.ceil(OPERATOR_METADATA_MAX_BYTES / 200) + 100);
   await expect(guardOperatorFetch(secrets, "plan", listing(huge) as never)(url)).rejects.toThrow("metadata_bound");
+});
+
+describe("operatorSafePlans: async admission follows the resolved mode; a deployed Worker gains it with drain only", () => {
+  const FOUR = ["session-ingest-fanout-dlq", "session-ingest-fanout", "session-ingest", "session-ingest-fanout-consumer"];
+  const SEVEN = [...FOUR, "session-ingest-admission-dlq", "session-ingest-admission", "session-ingest-admission-consumer"];
+  /** A synthetic retained plan: resource lines, the Worker's binding lines and a matching summary. */
+  const plans = (resources: string[], actions: Record<string, string>, bindings: Array<{ sid: string; action: string; target: Record<string, unknown> }>) => {
+    const counts = new Map<string, number>();
+    for (const r of resources) {
+      const a = actions[r] ?? "noop";
+      if (a !== "noop") counts.set(a, (counts.get(a) ?? 0) + 1);
+    }
+    const changed = bindings.filter((b) => b.action !== "noop").length;
+    const clauses = [...counts].map(([a, n]) => `${n} to ${a}`);
+    const summary = `Plan: ${clauses.length ? clauses.join(", ") : "0 changes"}${changed ? `, ${changed} binding changes` : ""}`;
+    const lines = [summary, ...resources.map((r) => `[${r}] ${actions[r] ?? "noop"}`), ...bindings.map((b) => `[session-ingest/${b.sid}] ${b.action}`)];
+    const text = lines.join("\n") + "\n";
+    return { planText: text, detailedText: lines.map((l) => (l.startsWith("[") ? `  ${l}` : l)).join("\n") + "\n" };
+  };
+  const queue = (action: string) => ({ sid: "INGEST_ADMISSION", action, target: { type: "queue", name: "INGEST_ADMISSION", queue_name: "96bulls-session-ingest-admission", logicalId: "session-ingest-admission" } });
+  const flag = (action: string, text: string) => ({ sid: "INGEST_ASYNC_ADMISSION", action, target: { type: "plain_text", name: "INGEST_ASYNC_ADMISSION", text } });
+  const run = (resources: string[], actions: Record<string, string>, bindings: Array<{ sid: string; action: string; target: Record<string, unknown> }>) =>
+    operatorSafePlans(plans(resources, actions, bindings), secrets, bindings);
+  const addition = { "session-ingest-admission-dlq": "create", "session-ingest-admission": "create", "session-ingest-admission-consumer": "create", "session-ingest": "update" };
+
+  test("addition phase (deployed Worker gains the three resources): drain ok, on refused", () => {
+    expect(() => run(SEVEN, addition, [queue("create"), flag("create", "drain")])).not.toThrow();
+    expect(() => run(SEVEN, addition, [queue("create"), flag("create", "on")])).toThrow("original_plan_contract");
+  });
+
+  test("re-capture after a partial addition (queues exist, Worker not updated) plans as an update: on refused, drain ok", () => {
+    const update = { "session-ingest": "update" };
+    expect(() => run(SEVEN, update, [queue("create"), flag("create", "on")])).toThrow("admission_drain_first");
+    expect(() => run(SEVEN, update, [queue("create"), flag("create", "drain")])).not.toThrow();
+  });
+
+  test("drain at 100%, then the var-only flip to on (or omitted) is an update with the queue binding unchanged", () => {
+    expect(() => run(SEVEN, { "session-ingest": "update" }, [queue("noop"), flag("update", "on")])).not.toThrow();
+    expect(() => run(SEVEN, {}, [queue("noop"), flag("noop", "on")])).not.toThrow();
+  });
+
+  test("fresh rollout (nothing deployed) may be on directly", () => {
+    const creates = Object.fromEntries(SEVEN.map((r) => [r, "create"]));
+    expect(() => run(SEVEN, creates, [queue("create"), flag("create", "on")])).not.toThrow();
+  });
+
+  test("off: four resources and neither binding; the binding and the var come together or not at all", () => {
+    expect(() => run(FOUR, { "session-ingest": "update" }, [])).not.toThrow();
+    expect(() => run(SEVEN, addition, [])).toThrow("original_plan_contract");
+    expect(() => run(SEVEN, addition, [queue("create")])).toThrow("original_plan_contract");
+    expect(() => run(FOUR, { "session-ingest": "update" }, [flag("create", "on")])).toThrow("original_plan_contract");
+    expect(() => run(SEVEN, addition, [queue("create"), flag("create", "yes")])).toThrow("original_plan_contract");
+  });
 });

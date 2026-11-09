@@ -1,0 +1,31 @@
+{
+  // Lane F4: the daily digest narrative Worker. NOT deployed by any workflow in this
+  // repository. It has no route and no workers.dev URL: it is reached only by the read Worker's
+  // DIGEST_NARRATIVE service binding. Activation (lead, with Khaliq's OK):
+  //   1. migration 20261105045000 + supabase/bootstrap/digest_narrative_role.sql;
+  //   2. a Hyperdrive config for bulls96_digest_narrative (password from 1Password);
+  //   3. `wrangler secret put EXTRACTION_API_KEY` (from 1Password);
+  //   4. deploy this config, then add to the read Worker's wrangler.jsonc:
+  //        "services": [{ "binding": "DIGEST_NARRATIVE", "service": "96bulls-digest-narrative" }]
+  //      and set READ_API_DIGEST_ENABLED=1 there.
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "96bulls-digest-narrative",
+  "account_id": "f7232cb80f6fab86a95426302af243e4",
+  "main": "src/digest-narrative.ts",
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": { "enabled": true },
+  "hyperdrive": [
+    {
+      "binding": "NARRATIVE_DB",
+      // Placeholder; set at activation. Hyperdrive ids are not secret.
+      "id": "00000000000000000000000000000000"
+    }
+  ],
+  "vars": {
+    "EXTRACTION_MODEL": "",
+    "EXTRACTION_API_URL": ""
+  }
+}

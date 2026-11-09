@@ -37,10 +37,16 @@ import { setTimeout as idleDelay } from "node:timers/promises";
 import { createWorkerRuntime } from "@rhc/runtime/workers.ts";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
 import { expectedSchema } from "../hoopdb/migrate.ts";
-import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
+import { type SearchIndexBackendName, validateAdapterEnv } from "@rhc/adapters/registry.ts";
 
 export interface WorkerOptions {
   service: string;
+  /**
+   * SEARCH_INDEX_BACKEND values this entry point really dispatches on. Unset
+   * means postgres only, so a worker that never reads the variable still fails
+   * closed on a mis-set selection.
+   */
+  searchBackends?: readonly SearchIndexBackendName[];
   stages: QueuedStage[];
   /** Builds the handlers once the database is open. */
   handlers: (
@@ -59,6 +65,8 @@ export interface WorkerOptions {
   attests?: ManifestReaderName[];
   /** Runs once per loop tick, for side loops such as reconcile. */
   tick?: (db: HoopDb, now: Date) => Promise<void>;
+  /** Bounded best-effort flushes (product analytics) run with the telemetry shutdown, before the exit. */
+  onShutdown?: () => Promise<void>;
 }
 
 /**
@@ -319,10 +327,17 @@ export async function workerTick<S>(io: {
   return { claimed, gated: false };
 }
 
+/** The adapter selection an entry point admits at boot. Exported for tests. */
+export function workerAdapterEntry(
+  opts: Pick<WorkerOptions, "searchBackends">,
+): { runtime: readonly ["workers"]; search?: readonly SearchIndexBackendName[] } {
+  return { runtime: ["workers"], ...(opts.searchBackends ? { search: opts.searchBackends } : {}) };
+}
+
 export async function runWorker(opts: WorkerOptions): Promise<never> {
   // Fail closed on a mis-set adapter selection (docs/search-and-runtime-adapters.md).
   // Unset (every current install) resolves to postgres + workers: no change.
-  validateAdapterEnv(process.env, { runtime: ["workers"] });
+  validateAdapterEnv(process.env, workerAdapterEntry(opts));
   process.env.OTEL_SERVICE_NAME ||= opts.service;
   initTelemetry(opts.service);
   const health: WorkerHealth = {
@@ -490,6 +505,7 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
     ]);
     const cleanup = [...serverCleanup, ...await Promise.allSettled([
       shutdownTelemetry(),
+      ...(opts.onShutdown ? [opts.onShutdown()] : []),
       db.end(),
     ])];
     const failed = cleanup.filter(r => r.status === "rejected");

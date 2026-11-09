@@ -31,8 +31,8 @@ export function checkOwnership(lanes: readonly LaneManifest[]): Map<string, stri
   for (const l of lanes) {
     if (names.has(l.lane)) fail(`duplicate lane name: ${l.lane}`);
     names.add(l.lane);
-    if (l.migration === null && (Object.keys(l.functions).length || Object.keys(l.replaces).length || l.prefixes.length || l.extraOutputs))
-      fail(`empty slot ${l.lane} must not claim functions, prefixes or outputs before its migration is set`);
+    if (l.migration === null && (Object.keys(l.functions).length || Object.keys(l.replaces).length || Object.keys(l.grantsOn ?? {}).length || l.prefixes.length || l.extraOutputs))
+      fail(`empty slot ${l.lane} must not claim functions, grants, prefixes or outputs before its migration is set`);
     for (const sig of Object.keys(l.functions)) {
       const prev = owner.get(sig);
       if (prev) fail(`function ownership conflict: ${sig} is claimed by lanes ${prev} and ${l.lane}`);
@@ -73,20 +73,37 @@ async function checkLaneSource(l: LaneManifest, read: Reader) {
   // Every grantee of the lane migration must be a declared one: an unlisted role (anon, authenticated,
   // a new worker role) is never silently left out of the reviewed manifest.
   const own = l.grantSources.find((s) => s.path === l.migration);
+  const grantsOn = l.grantsOn ?? {};
+  const grantOnlyRoles = [...new Set(Object.values(grantsOn).flat())];
   for (const role of functionGrantees(sql))
-    if (!own?.roles.includes(role)) fail(`manifest drift (${l.lane}): ${l.migration} grants EXECUTE to ${role}, which the lane's grant sources do not declare`);
+    if (!own?.roles.includes(role) && !grantOnlyRoles.includes(role)) fail(`manifest drift (${l.lane}): ${l.migration} grants EXECUTE to ${role}, which the lane's grant sources do not declare`);
   const granted = new Map<string, string[]>();
   for (const src of l.grantSources) {
     const text = await read(src.path);
     if (text === undefined) { if (src.optional) continue; fail(`${l.lane}: grant source ${src.path} is missing`); }
     for (const [sig, role] of functionGrants(text!, src.roles)) {
-      if (!defs.has(sig)) { if (src.path === l.migration) fail(`${l.lane}: grant outside the lane's SQL authority: ${sig}`); continue; }
+      if (!defs.has(sig)) { if (src.path === l.migration && !(sig in grantsOn)) fail(`${l.lane}: grant outside the lane's SQL authority: ${sig}`); continue; }
       if (sig in l.replaces) fail(`${l.lane}: ${sig} is replaced, not owned; its grants belong to its owner`);
       granted.set(sig, [...(granted.get(sig) ?? []), role]);
     }
   }
   for (const [sig, f] of Object.entries(l.functions))
     if (!sameSet(f.grants, granted.get(sig) ?? [])) fail(`manifest drift (${l.lane}): ${sig} grants are [${(granted.get(sig) ?? []).join(",")}] in SQL, [${f.grants.join(",")}] in the manifest`);
+  // Grant-only entries: the migration's grants on functions it does not define must match grantsOn exactly.
+  const grantOnly = new Map<string, string[]>();
+  for (const [sig, role] of functionGrants(sql, grantOnlyRoles)) {
+    if (defs.has(sig)) {
+      if (!own?.roles.includes(role)) fail(`manifest drift (${l.lane}): ${l.migration} grants EXECUTE on its own ${sig} to ${role}, which the lane's grant sources do not declare`);
+      continue;
+    }
+    if (!(sig in grantsOn)) fail(`${l.lane}: grant outside the lane's SQL authority: ${sig}`);
+    grantOnly.set(sig, [...(grantOnly.get(sig) ?? []), role]);
+  }
+  for (const [sig, roles] of Object.entries(grantsOn)) {
+    if (defs.has(sig) || sig in l.functions || sig in l.replaces) fail(`${l.lane}: ${sig} is defined by the lane; list its grants under functions, not grantsOn`);
+    if (!roles.length) fail(`${l.lane}: grantsOn ${sig} lists no roles`);
+    if (!sameSet(roles, grantOnly.get(sig) ?? [])) fail(`manifest drift (${l.lane}): ${sig} grant-only grants are [${(grantOnly.get(sig) ?? []).join(",")}] in SQL, [${roles.join(",")}] in the manifest`);
+  }
   return { sql, defined: [...defs.keys()] };
 }
 
@@ -105,10 +122,22 @@ export async function generate(read: Reader, lanes: readonly LaneManifest[], ver
   // by an older single-purpose generator) is kept as is.
   const acl = JSON.parse((await read(ACL_PATH)) ?? fail(`${ACL_PATH} missing`)) as { functions: Record<string, string[]> };
   for (const key of Object.keys(acl.functions)) if (ownedOrPrefixed(key)) delete acl.functions[key];
-  for (const l of lanes) {
+  for (const l of lanes)
     for (const [sig, f] of Object.entries(l.functions)) acl.functions[sig] = ["<owner>:EXECUTE", ...f.grants.map((r) => r + ":EXECUTE")];
+  // Checked only after EVERY lane's owned entries are back: a lane may replace a function another lane
+  // owns (043880 replaces 042000's register), and lane order must not decide whether that entry exists yet.
+  for (const l of lanes)
     for (const sig of Object.keys(l.replaces)) if (!acl.functions[sig]) fail(`${l.lane}: replaced function ${sig} has no original ACL entry`);
-  }
+  // Grant-only roles are appended (sorted, once) to the existing entry after every owned entry is back,
+  // so lane order cannot decide the result and a rerun over an already-appended entry changes nothing.
+  const appended = new Map<string, Set<string>>();
+  for (const l of lanes)
+    for (const [sig, roles] of Object.entries(l.grantsOn ?? {})) {
+      if (!acl.functions[sig]) fail(`${l.lane}: grant-only function ${sig} has no ACL entry`);
+      for (const r of roles) appended.set(sig, (appended.get(sig) ?? new Set()).add(r + ":EXECUTE"));
+    }
+  for (const [sig, entries] of appended)
+    acl.functions[sig] = [...acl.functions[sig]!, ...[...entries].sort(byCodeUnit).filter((e) => !acl.functions[sig]!.includes(e))];
   acl.functions = Object.fromEntries(Object.entries(acl.functions).sort(([a], [b]) => byCodeUnit(a, b)));
   const runtimeNew = lanes.flatMap((l) => Object.entries(l.functions).filter(([, f]) => f.grants.includes("service_role")).map(([s]) => s));
 
@@ -116,7 +145,7 @@ export async function generate(read: Reader, lanes: readonly LaneManifest[], ver
   wrapper = wrapper.replace(/v_manifest jsonb := \$manifest\$[\s\S]*?\$manifest\$::jsonb;/,
     () => "v_manifest jsonb := $manifest$" + JSON.stringify(acl.functions) + "$manifest$::jsonb;");
   const secdefBlock = listBlock(wrapper, /v_secdef text\[\] := ARRAY\[([\s\S]*?)\]::text\[\];/, "boundary SECDEF");
-  const secdefs = quotedItems(secdefBlock[1]!, "'").filter((k) => !laneDefined(k));
+  const secdefs = quotedItems(secdefBlock[1]!, "'").filter((k) => !ownedOrPrefixed(k) && !laneDefined(k));
   for (const l of lanes) {
     for (const [sig, f] of Object.entries(l.functions)) if (f.secdef) secdefs.push(sig);
     for (const [sig, f] of Object.entries(l.replaces)) if (f.secdef) secdefs.push(sig);
@@ -162,7 +191,7 @@ export async function generate(read: Reader, lanes: readonly LaneManifest[], ver
     lanesSummary[l.lane] = {
       functions: Object.keys(l.functions).length,
       replaces: Object.keys(l.replaces).length,
-      grants: Object.values(l.functions).reduce((n, f) => n + f.grants.length, 0),
+      grants: Object.values(l.functions).reduce((n, f) => n + f.grants.length, 0) + Object.values(l.grantsOn ?? {}).reduce((n, r) => n + r.length, 0),
     };
   return { outputs, summary: { lanes: lanesSummary, boundarySHA } };
 }

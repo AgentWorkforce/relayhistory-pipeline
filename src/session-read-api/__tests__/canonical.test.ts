@@ -809,8 +809,9 @@ test("display values are lazy: a raw snapshot without the request is the pre-#18
   // The opt-in read really projects display values for this fixture...
   expect(requested.rows.some((r) => r.table === "session_directory_event_values")).toBe(true);
   // ...and the default read is exactly the opt-in read minus that table: no new table key,
-  // no displayOmitted key, same generation, same rows in the same order.
-  expect(Object.keys(plain).sort()).toEqual(["exists", "generation", "legacyCoverage", "rows"]);
+  // no displayOmitted key, same generation, same rows in the same order. (neonDerived is
+  // always present since the never-in-Neon objects half fails closed on absence.)
+  expect(Object.keys(plain).sort()).toEqual(["exists", "generation", "legacyCoverage", "neonDerived", "rows"]);
   expect(plain.rows.some((r) => r.table === "session_directory_event_values")).toBe(false);
   expect(JSON.stringify(plain)).toBe(JSON.stringify({ ...requested, rows: requested.rows.filter((r) => r.table !== "session_directory_event_values") }));
   // Raw route: other tables never carry display rows; the display table is served on request.
@@ -818,3 +819,83 @@ test("display values are lazy: a raw snapshot without the request is the pre-#18
   expect((await rows("convergence_events")).length).toBe(2);
   expect((await rows("session_directory_event_values")).length).toBeGreaterThan(0);
 });
+test("READ_API_CANONICAL_SCOPE_BYTES/EVENTS: scopeBytes and scopeEvents raise the budget the projection read enforces", async () => {
+  const record = (i: number, text: string) => ({
+    kind: "session_event",
+    origin_id: "origin",
+    record_id: `r${i}`,
+    revision: "1",
+    operation: "upsert",
+    received_at: AT,
+    payload: { ts_ms: Date.parse(AT) + i, text, role: "assistant", message_id: `msg-${i}` },
+  });
+  // Two chunks (each under the 16 MiB per-chunk bound) of 2 MiB records: about 18 MiB raw
+  // (compresses to a few KiB), past the 16 MiB scope default.
+  const big = (i: number) => record(i, "x".repeat(2 * 1024 * 1024));
+  await replaceCanonicalChunks([[0, 1, 2, 3, 4].map(big), [5, 6, 7, 8].map(big)]);
+  const refused = await canonicalSnapshot(deps, identity).catch((e) => e);
+  expect(refused).toBeInstanceOf(CanonicalReadError);
+  expect(refused).toMatchObject({ reason: "canonical_projection_incomplete", details: ["scope_too_large"] });
+  // An explicit default is the default; a raise of the other knob alone does not help.
+  await expect(canonicalSnapshot(deps, identity, { scopeBytes: 16 * 1024 * 1024 })).rejects.toMatchObject({ details: ["scope_too_large"] });
+  await expect(canonicalSnapshot(deps, identity, { scopeEvents: 4_000_000 })).rejects.toMatchObject({ details: ["scope_too_large"] });
+  const raised = await canonicalSnapshot(deps, identity, { scopeBytes: 32 * 1024 * 1024 });
+  expect(raised.exists).toBe(true);
+  expect(raised.rows.filter((r) => r.table === "convergence_events")).toHaveLength(9);
+
+  // Records: 2 small records, the chunk claiming 100001 (above the 100000 default).
+  await replaceCanonicalChunks([[record(0, "a"), record(1, "b")]]);
+  const key = objectKey(manifestKey(location));
+  const m: any = await new Response(await deps.store.get(key)).json();
+  m.raw.chunks[0].records = 100001;
+  m.raw.content_sha256 = await computeContentSha256(m.raw.chunks);
+  await deps.store.put(key, new TextEncoder().encode(JSON.stringify(m)), {});
+  pointer = { ...pointer, content_sha256: m.raw.content_sha256 };
+  await expect(canonicalSnapshot(deps, identity)).rejects.toMatchObject({ reason: "canonical_projection_incomplete", details: ["scope_too_large"] });
+  await expect(canonicalSnapshot(deps, identity, { scopeBytes: 2 * 1024 ** 3 })).rejects.toMatchObject({ details: ["scope_too_large"] });
+  const counted = await canonicalSnapshot(deps, identity, { scopeEvents: 200000 });
+  expect(counted.rows.filter((r) => r.table === "convergence_events")).toHaveLength(2);
+});
+
+/** replaceCanonicalRecords over several chunks (contiguous seq and offsets). */
+async function replaceCanonicalChunks(chunkRecords: unknown[][]) {
+  const m: any = await new Response(
+    await deps.store.get(objectKey(manifestKey(location))),
+  ).json();
+  const chunks: any[] = [];
+  let offset = 0;
+  for (const [seq, records] of chunkRecords.entries()) {
+    const raw = new TextEncoder().encode(
+      records.map((r) => JSON.stringify(r)).join("\n") + "\n",
+    );
+    const stored = new Uint8Array(zstdCompressSync(raw)),
+      sha = await sha256Hex(raw);
+    chunks.push({
+      ...m.raw.chunks[0],
+      seq,
+      start_offset: offset,
+      bytes: raw.byteLength,
+      stored_bytes: stored.byteLength,
+      sha256: sha,
+      sha256_8: sha.slice(0, 8),
+      stored_sha256: await sha256Hex(stored),
+      stored_raw_bytes: raw.byteLength,
+      raw_sha256: sha,
+      records: records.length,
+    });
+    await deps.store.put(rawChunkKey(location, seq, offset, sha, "ndjson"), stored, {});
+    offset += raw.byteLength;
+  }
+  m.raw.chunks = chunks;
+  m.raw.chunk_count = chunks.length;
+  m.raw.raw_bytes = offset;
+  m.raw.stored_bytes = chunks.reduce((n, c) => n + c.stored_bytes, 0);
+  m.raw.next_offset = offset;
+  m.raw.content_sha256 = await computeContentSha256(chunks);
+  await deps.store.put(
+    objectKey(manifestKey(location)),
+    new TextEncoder().encode(JSON.stringify(m)),
+    {},
+  );
+  pointer = { ...pointer, content_sha256: m.raw.content_sha256 };
+}

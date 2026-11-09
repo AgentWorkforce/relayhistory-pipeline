@@ -8,6 +8,8 @@ import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
  *   SQS batch (S3 object events, reconcile items) -> processBatch -> partial batch response
  *   EventBridge schedule {"reconcile": true}      -> list recent manifests -> SQS
  *   EventBridge schedule {"brief": true}          -> one session-brief tick (src/session-brief)
+ *   schedule {"bufferedSearchFeed": true}         -> one bounded buffered-stage feed run (default off)
+ *   schedule {"bufferedErasureDelete": true}      -> one bounded later-erasure delete pass over buffered rows (default off)
  *
  * Configuration: plain env for ids and switches; credentials only from one
  * Secrets Manager secret (`SESSION_PIPELINE_SECRET_ARN`), read once per
@@ -28,6 +30,27 @@ import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
  * search stage from the pre-#182 catalog writer to the complete desktop catalog writer
  * (migration 20261105022000 columns); SEARCH_INDEX_ENABLED alone never does
  * (docs/session-desktop-catalog.md, Activation blockers).
+ * SEARCH_INDEX_OUTPUT_FACTS=1 (only the literal "1"; default off; needs
+ * SEARCH_INDEX_ENABLED=1) also reconciles the Output/digest fact tables in the same
+ * pass (output-facts.ts); it needs the owner-applied output-facts DDL first.
+ * INGEST_BUFFERED_SEARCH_FEED=on (only the literal "on"; default "off", anything else refuses)
+ * feeds accepted buffered stages into transcript_events (buffered-search-feed.ts); it is refused
+ * unless BUFFERED_SEARCH_FEED_GATE_DECLARED equals the read gate's contract id
+ * (BUFFERED_SEARCH_GATE_CONTRACT, "buffered-search-gate/v1"; the read Worker deploys with
+ * READ_API_BUFFERED_SEARCH_GATE=on first), and needs SEARCH_INDEX_ENABLED=1 on the ClickHouse backend, the feed RPCs
+ * (migration 20261105043870) and the origin columns (docs/proposals/buffered-search-feed.clickhouse.draft.sql) applied.
+ * It also needs its own login: the secret fields buffered_search_feed_database_url and
+ * buffered_search_feed_database_ca_pem (the buffered_search_feed_runtime LOGIN, buffered-feed-login.ts). Without
+ * them, or if malformed, the feed stays off; every pooled backend passes the live login check before its first feed
+ * RPC, and a refusal indexes nothing. Provisioning that LOGIN and credential needs Khaliq's explicit OK.
+ * INGEST_BUFFERED_ERASURE_DELETE=on (only the literal "on"; default "off", anything else refuses) runs the
+ * later-erasure delete lane (buffered-erasure-delete.ts): it re-checks buffered rows' stages through the same
+ * feed RPC (`stage` only) and deletes, through deleteBufferedRows only, buffered rows whose stage is gone or
+ * refused and whose records retention no longer keeps; it never matches canonical rows. Same ordering guard
+ * (BUFFERED_SEARCH_FEED_GATE_DECLARED), same feeder login and ClickHouse prerequisites as the feed; the flag is
+ * checked before any secret lookup, pool or ClickHouse access. Bounds: INGEST_BUFFERED_ERASURE_PAGE (1-200,
+ * default 25), INGEST_BUFFERED_ERASURE_RATE (stage checks/s, 1-20, default 2), INGEST_BUFFERED_ERASURE_BUDGET_MS
+ * (5000-240000, default 40000).
  */
 import pg from "pg";
 import {
@@ -50,7 +73,10 @@ import { createClickHouseClient } from "./vendor/search-index/clickhouse.ts";
 import { processBatch, type BatchResponse, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { droppedFanout, scopeLockKey, type ScopeLock } from "./pointer.ts";
 import { searchIndexLimits } from "./search-index.ts";
+import { BufferedFeedError, bufferedFeedConfig, bufferedFeedGateRefusal, bufferedFeedVersionRefusal, clickhouseTieLedger, runBufferedFeed, sqlBufferedFeedSource, type BufferedFeedConfig } from "./buffered-search-feed.ts";
+import { bufferedErasureConfig, runBufferedErasureDelete, type BufferedErasureConfig, type BufferedErasureDeps } from "./buffered-erasure-delete.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
+import { BUFFERED_FEED_CA_FIELD, BUFFERED_FEED_URL_FIELD, bufferedFeedClientConfig, loginCheckedFeedExecutor } from "./buffered-feed-login.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
 import type { PipelineRuntimeRegistry } from "@rhc/adapters/defaults.ts";
@@ -83,6 +109,13 @@ interface PipelineSecret {
   clickhouse?: { url: string; user: string; password: string; database: string };
   openai_api_key?: string;
   search?: unknown;
+  /**
+   * The buffered search feeder's own login (buffered_search_feed_runtime) and its CA. Carried raw and
+   * validated only when INGEST_BUFFERED_SEARCH_FEED=on (buffered-feed-login.ts); absent leaves the feed
+   * off. Provisioning the LOGIN and this credential needs Khaliq's explicit OK; no deploy wiring sets it.
+   */
+  buffered_search_feed_database_url?: unknown;
+  buffered_search_feed_database_ca_pem?: unknown;
 }
 
 export interface LambdaEnv {
@@ -100,6 +133,8 @@ export interface LambdaEnv {
   analysisCacheEnabled: boolean;
   /** SESSION_DESKTOP_CATALOG_ENABLED=1: the search stage writes the complete desktop catalog; off (default): the pre-#182 writer. */
   desktopCatalogEnabled: boolean;
+  /** SEARCH_INDEX_OUTPUT_FACTS=1: the search stage also writes the Output/digest facts. */
+  outputFactsEnabled?: boolean;
   semanticCopyEnabled?: boolean;
   semanticSourceId?: string;
   /** SESSIONS_NEON_EXIT=true: the legacy readonly source (analysis_source_readonly_url) is never carried or built. */
@@ -107,6 +142,32 @@ export interface LambdaEnv {
   fanout: "off" | "postgres";
   reconcileLookbackMinutes: number;
   dbPoolMax: number;
+  /** INGEST_BUFFERED_SEARCH_FEED*: absent or `enabled: false` (default) builds nothing. */
+  bufferedSearchFeed?: BufferedFeedConfig;
+  /** INGEST_BUFFERED_ERASURE_*: absent or `enabled: false` (default) builds nothing. */
+  bufferedErasureDelete?: BufferedErasureConfig;
+}
+
+/**
+ * The buffered feed's settings without risk to the shared runtime: a malformed value disarms the
+ * feed (logged by code) instead of failing init for SQS/search/reconcile. A typo never arms it.
+ */
+function bufferedFeedEnv(env: NodeJS.ProcessEnv): BufferedFeedConfig | undefined {
+  try { return bufferedFeedConfig(env); }
+  catch (error) {
+    // Refused, not degraded: nothing is written, and every scheduled run reports ok=false.
+    log.error("buffered search feed refused", { stage: "buffered-search-feed", reason: error instanceof BufferedFeedError ? error.code : "config_invalid" });
+    return undefined;
+  }
+}
+
+/** The erasure lane's settings, disarmed (logged by code) instead of failing the shared runtime. */
+function bufferedErasureEnv(env: NodeJS.ProcessEnv): BufferedErasureConfig | undefined {
+  try { return bufferedErasureConfig(env); }
+  catch (error) {
+    log.error("buffered erasure delete refused", { stage: "buffered-erasure-delete", reason: error instanceof BufferedFeedError ? error.code : "config_invalid" });
+    return undefined;
+  }
 }
 
 export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: SearchComposition): LambdaEnv {
@@ -128,6 +189,11 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     "SESSION_ANALYSIS_CACHE_ENABLED=1": env.SESSION_ANALYSIS_CACHE_ENABLED === "1",
     "SESSION_SEMANTIC_COPY_ENABLED=1": env.SESSION_SEMANTIC_COPY_ENABLED === "1",
   });
+  if (env.SEARCH_INDEX_OUTPUT_FACTS === "1" && env.SEARCH_INDEX_ENABLED !== "1")
+    throw new Error("session pipeline: SEARCH_INDEX_OUTPUT_FACTS=1 needs SEARCH_INDEX_ENABLED=1");
+  // The fact tables are ClickHouse DDL: a portable search backend has nowhere to put them.
+  if (env.SEARCH_INDEX_OUTPUT_FACTS === "1" && selected.search !== "clickhouse")
+    throw new Error("session pipeline: SEARCH_INDEX_OUTPUT_FACTS=1 needs the clickhouse search backend");
   return {
     searchBackend: selected.search,
     adapterEnv: Object.freeze(Object.fromEntries(Object.entries(env).filter(([key]) => key.startsWith("SEARCH_INDEX_") || ["PIPELINE_RUNTIME", "AWS_REGION", "READ_API_COMPLETE_SINCE"].includes(key)))),
@@ -138,10 +204,13 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     secretArn: need("SESSION_PIPELINE_SECRET_ARN"),
     queueUrl: need("SESSION_PIPELINE_QUEUE_URL"),
     searchEnabled: env.SEARCH_INDEX_ENABLED === "1",
+    bufferedSearchFeed: bufferedFeedEnv(env),
+    bufferedErasureDelete: bufferedErasureEnv(env),
     replayPagesEnabled: env.SESSION_REPLAY_PAGES_ENABLED === "1",
     largeScopeHandoffEnabled: env.SESSION_LARGE_READ_HANDOFF_ENABLED === "1",
     analysisCacheEnabled: env.SESSION_ANALYSIS_CACHE_ENABLED === "1",
     desktopCatalogEnabled: env.SESSION_DESKTOP_CATALOG_ENABLED === "1",
+    outputFactsEnabled: env.SEARCH_INDEX_OUTPUT_FACTS === "1",
     semanticCopyEnabled: env.SESSION_SEMANTIC_COPY_ENABLED === "1",
     semanticSourceId: env.SESSION_SEARCH_FEATURE_SOURCE_ID,
     ...(neonExit.enabled ? { neonExit: true } : {}),
@@ -173,6 +242,25 @@ export function parseSecret(text: string): PipelineSecret {
 }
 
 /**
+ * The feeder's pinned login config, or undefined (feed disarmed, logged by reason, never a value):
+ * both secret fields absent is "feeder_login_absent"; anything malformed is "feeder_login_invalid".
+ */
+function bufferedFeedLogin(secret: PipelineSecret): pg.ClientConfig | undefined {
+  const url = secret.buffered_search_feed_database_url, ca = secret.buffered_search_feed_database_ca_pem;
+  if (url === undefined && ca === undefined) {
+    log.warn("buffered search feed disarmed", { stage: "buffered-search-feed", reason: "feeder_login_absent" });
+    return undefined;
+  }
+  try { return bufferedFeedClientConfig(url, ca); }
+  catch (error) {
+    const msg = error instanceof Error ? error.message : "";
+    const field = msg.includes(BUFFERED_FEED_CA_FIELD) ? BUFFERED_FEED_CA_FIELD : msg.includes(BUFFERED_FEED_URL_FIELD) ? BUFFERED_FEED_URL_FIELD : "unknown";
+    log.error("buffered search feed disarmed", { stage: "buffered-search-feed", reason: "feeder_login_invalid", error_code: field });
+    return undefined;
+  }
+}
+
+/**
  * Validate the readonly analysis source field. Called only from the analysis
  * branch with the flag on; never echoes the value.
  */
@@ -187,14 +275,39 @@ export function analysisSourceReadonlyUrl(value: unknown): string {
 /**
  * A pg pool that verifies Supabase's certificate against the pinned root. The
  * URL's own ssl parameters are dropped so they cannot weaken that.
+ *
+ * `options` is pinned non-empty (mirroring owner-pg-config): node-pg resolves
+ * a missing `options` from process.env.PGOPTIONS, so without this pin ambient
+ * PGOPTIONS could smuggle session GUCs (role, search_path, timeouts) past
+ * authentication into every connection this pool opens. A set PGOPTIONS is
+ * refused loudly below instead of silently ignored.
  */
+/**
+ * The environment half of startup-option smuggling: node-pg resolves a
+ * missing pool `options` from process.env.PGOPTIONS, so ambient PGOPTIONS can
+ * smuggle session GUCs (role, search_path, timeouts) past authentication into
+ * every pooled connection. The pools pin a non-empty `options` (see below),
+ * which shadows the environment, and pool creation refuses a set PGOPTIONS
+ * loudly here instead of silently ignoring it. PGlite never reads this
+ * variable. Accepts an env for tests; defaults to the process environment.
+ */
+export function refuseEnvOptions(env: NodeJS.ProcessEnv = process.env): void {
+  if (env.PGOPTIONS !== undefined && env.PGOPTIONS !== "")
+    throw new Error("pipeline consumer: refusing PGOPTIONS environment fallback (pool options are pinned)");
+}
+
 export function supabasePool(url: string, max: number, tls = postgresTlsOptions()): HoopDb {
+  refuseEnvOptions();
   const pool = new pg.Pool({
     connectionString: postgresConnectionString(url),
     max,
     application_name: "96bulls-session-pipeline",
     ssl: tls,
     idleTimeoutMillis: 60_000,
+    // Inert by itself (the tick sets tighter per-statement timeouts); its
+    // purpose is to shadow the environment: a non-empty config value wins
+    // over PGOPTIONS in node-pg's resolution, so the env fallback is dead.
+    options: "-c idle_in_transaction_session_timeout=60000",
   });
   pool.on("error", (err) => log.error("hoopdb pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
   return {
@@ -246,6 +359,8 @@ export interface Runtime {
   semanticSecret?: { hoopdbUrl: string; clickhouse?: PipelineSecret["clickhouse"]; sourceUrl?: unknown };
   /** Built on first semantic-copy invocation with the flag on, never in shared init. */
   semanticCopy?: () => Promise<SemanticCopyStats>;
+  /** INGEST_BUFFERED_ERASURE_DELETE=on only: the later-erasure lane over the feeder login's pool. */
+  bufferedErasure?: BufferedErasureDeps;
 }
 
 type SemanticCopyStats = Awaited<ReturnType<typeof runSemanticCopyTick>>;
@@ -323,7 +438,33 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       // Default off and separate from SEARCH_INDEX_ENABLED: off keeps the pre-#182 catalog
       // writer; the desktop catalog writer waits on migration 20261105031000 (docs/session-desktop-catalog.md).
       ...(env.desktopCatalogEnabled ? { desktopCatalog: true as const } : {}),
+      // Default off; the fact tables are owner-applied DDL (output-facts-schema.ts).
+      ...(env.outputFactsEnabled ? { outputFacts: true as const } : {}),
     };
+  }
+  let bufferedErasure: BufferedErasureDeps | undefined;
+  if (env.bufferedSearchFeed?.enabled || env.bufferedErasureDelete?.enabled) {
+    // Writes the legacy transcript_events table only; a portable search backend has no buffered feed.
+    // Missing prerequisites disarm only this feed, never the shared runtime.
+    // The feed RPCs admit only the buffered_search_feed_runtime login, so the feed never runs on the shared
+    // hoopdb pool: it gets its own pinned single-connection pool, and every backend passes the login check
+    // (buffered-feed-login.ts) before its first feed RPC. No login fields: the feed stays off.
+    // The erasure lane calls only the `stage` RPC and shares that one pool.
+    const feedConfig = deps.search?.ch ? bufferedFeedLogin(secret) : undefined;
+    if (!deps.search?.ch) log.warn("buffered search feed disarmed", { stage: "buffered-search-feed", reason: "clickhouse_search_required" });
+    else if (feedConfig) {
+      const feedPool = new pg.Pool({ ...feedConfig, max: 1, idleTimeoutMillis: 60_000 });
+      feedPool.on("error", (err) => log.error("buffered search feed pool error", { stage: "buffered-search-feed", error_code: (err as { code?: string }).code ?? "pool_error" }));
+      const feedExecutor = loginCheckedFeedExecutor(feedPool);
+      if (env.bufferedSearchFeed?.enabled) {
+        const secondVersion = env.bufferedSearchFeed.secondVersion;
+        deps.bufferedFeed = { source: sqlBufferedFeedSource(feedExecutor, secondVersion ? { secondVersion } : {}), store, ch: deps.search.ch, keyRoot: env.keyPrefix,
+          ...(secondVersion ? { secondVersion: { ledger: clickhouseTieLedger(deps.search.ch) } } : {}) };
+      }
+      // The erasure lane reads only `stage` status and retention, never sameSecond or createdAt, so it keeps the
+      // legacy (non-strict) source: its deletes do not depend on 045010 or the version flag.
+      if (env.bufferedErasureDelete?.enabled) bufferedErasure = { source: sqlBufferedFeedSource(feedExecutor), ch: deps.search.ch };
+    }
   }
   if (env.replayPagesEnabled) {
     // This stage needs scoped Put/Get on normalized read artifacts in addition to raw reads.
@@ -365,7 +506,7 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
   // Semantic copier fields are carried raw and validated only in semanticCopyDeps().
   const semanticSecret = env.semanticCopyEnabled ? { hoopdbUrl: secret.hoopdb_url, clickhouse: secret.clickhouse, sourceUrl: secret.analysis_source_readonly_url } : undefined;
   // Neon-exit: the readonly source URL is dropped here, so no later branch can build its pool.
-  return { env, deps, brief, sessionAnalysis, store, analysisSourceUrl: env.neonExit ? undefined : secret.analysis_source_readonly_url, semanticSecret };
+  return { env, deps, brief, sessionAnalysis, store, analysisSourceUrl: env.neonExit ? undefined : secret.analysis_source_readonly_url, semanticSecret, ...(bufferedErasure ? { bufferedErasure } : {}) };
 }
 
 /**
@@ -606,6 +747,58 @@ async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Prom
       return { ok: true };
     } catch (error) {
       log.error("reconcile failed", { stage: "object-landed", ...errorFields(error), duration_ms: Date.now() - started });
+      return { ok: false };
+    }
+  }
+  if (event?.bufferedSearchFeed === true) {
+    // Default off before secret lookup, connection pools or object access.
+    if (process.env.INGEST_BUFFERED_SEARCH_FEED !== "on") return { ok: true };
+    // The ordering guard, also before any secret or connection: no declared read gate, no run.
+    // The version guard too: no run without the S encoding armed and its ceiling pinned.
+    const refusal = bufferedFeedGateRefusal(process.env) ?? bufferedFeedVersionRefusal(process.env);
+    if (refusal) {
+      log.error("buffered search feed refused", { stage: "buffered-search-feed", reason: refusal });
+      return { ok: false };
+    }
+    const started = Date.now();
+    try {
+      const rt = await ready();
+      if (!rt.deps.bufferedFeed || !rt.env.bufferedSearchFeed) throw new Error("buffered search feed unavailable");
+      const s = await runBufferedFeed(rt.deps.bufferedFeed, rt.env.bufferedSearchFeed);
+      // A same-second refusal is never coverage: the run is not ok while any is recorded or outstanding.
+      const refusals = (s.refused ?? 0) + (s.refusalsOutstanding ?? 0);
+      if (refusals) log.warn("buffered search feed refusals", { stage: "buffered-search-feed", count: s.refused,
+        reason: `same_second_tie:${s.refused ?? 0},outstanding:${s.refusalsOutstanding ?? 0}` });
+      log.info("buffered search feed run", { stage: "buffered-search-feed", listed: s.stages, inserted: s.indexed, skipped: s.skipped,
+        count: s.rows, deleted: s.deleted, ok: !s.blocked && !refusals,
+        state: s.caughtUp ? (refusals ? "caught_up_with_refusals" : "caught_up") : s.blocked ? "blocked" : "continuation",
+        reason: s.blocked ?? (Object.entries(s.reasons).map(([k, n]) => `${k}:${n}`).join(",") || undefined), duration_ms: Date.now() - started });
+      return { ok: true };
+    } catch (error) {
+      log.error("buffered search feed failed", { stage: "buffered-search-feed", ...errorFields(error), duration_ms: Date.now() - started });
+      return { ok: false };
+    }
+  }
+  if (event?.bufferedErasureDelete === true) {
+    // Default off before secret lookup, connection pools or ClickHouse access.
+    if (process.env.INGEST_BUFFERED_ERASURE_DELETE !== "on") return { ok: true };
+    // The feeder's ordering guard, also before any secret or connection.
+    const refusal = bufferedFeedGateRefusal(process.env);
+    if (refusal) {
+      log.error("buffered erasure delete refused", { stage: "buffered-erasure-delete", reason: refusal });
+      return { ok: false };
+    }
+    const started = Date.now();
+    try {
+      const rt = await ready();
+      if (!rt.bufferedErasure || !rt.env.bufferedErasureDelete?.enabled) throw new Error("buffered erasure delete unavailable");
+      const s = await runBufferedErasureDelete(rt.bufferedErasure, rt.env.bufferedErasureDelete);
+      log.info("buffered erasure delete run", { stage: "buffered-erasure-delete", listed: s.pairs, count: s.checked, deleted: s.deleted,
+        skipped: s.skipped, failed: s.failed, ok: s.failed === 0, state: s.caughtUp ? "caught_up" : "continuation",
+        reason: Object.entries(s.reasons).map(([k, n]) => `${k}:${n}`).join(",") || undefined, duration_ms: Date.now() - started });
+      return { ok: true };
+    } catch (error) {
+      log.error("buffered erasure delete failed", { stage: "buffered-erasure-delete", ...errorFields(error), duration_ms: Date.now() - started });
       return { ok: false };
     }
   }

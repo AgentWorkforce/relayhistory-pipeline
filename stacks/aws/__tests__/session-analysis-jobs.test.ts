@@ -136,10 +136,19 @@ describe("P0-a: the FINAL aggregate bucket policy lets the analysis worker erase
     // Nobody else gains delete on the results; the eraser keeps it everywhere.
     expect(evaluate(final(true), "arn:aws:iam::941433935742:user/writer", "s3:DeleteObject", result)).toBe("deny");
     expect(evaluate(final(true), eraserArn, "s3:DeleteObjectVersion", transcript)).not.toBe("deny");
+    // The results-root deny exempts the eraser too: it is never denied on a result key.
+    expect(evaluate(final(true), eraserArn, "s3:DeleteObjectVersion", result)).not.toBe("deny");
   });
   test("off: the eraser-only deny is exactly as before (the pipeline cannot delete anything)", () => {
     expect(evaluate(final(false), roleArn, "s3:DeleteObjectVersion", result)).toBe("deny");
     const deny = transcriptBucketPolicy({ bucketArn, keyArn: "k", eraserArn }).find((s: any) => s.Sid === "OnlyTheEraserDeletes") as any;
     expect(deny.Resource).toEqual([`${bucketArn}/*`]);
+  });
+  test("on: the results-root eraser deny keeps its exact principal exemption", () => {
+    const deny = transcriptBucketPolicy({ bucketArn, keyArn: "k", eraserArn, analysisDeleterArn: roleArn }).find(
+      (s: any) => s.Sid === "OnlyTheEraserDeletes" && s.NotResource,
+    ) as any;
+    expect(deny.NotResource).toEqual([`${bucketArn}/96bulls/*/v1/*/normalized/session-analysis-v2/*`]);
+    expect(deny.Condition).toEqual({ ArnNotEquals: { "aws:PrincipalArn": eraserArn } });
   });
 });

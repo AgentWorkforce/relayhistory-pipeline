@@ -12,6 +12,8 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  v_table text:='SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'||
   CASE WHEN current_setting('server_version_num')::int>=170000 THEN ',MAINTAIN' ELSE '' END;
 BEGIN
+ -- Allowed, not required: the verifier also passes before 20261105043910 is applied.
+ v_allowed:=array_remove(v_allowed,CASE WHEN to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)') IS NULL THEN 'sessions.ingest_selfhost_set_session_uploads(jsonb)' END);
  SELECT array_agg(to_regprocedure(fn)::oid) INTO v_oids FROM unnest(v_allowed) fn;
  IF cardinality(v_oids)<>cardinality(v_allowed) OR array_position(v_oids,NULL) IS NOT NULL
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='canonical project events RPC missing';END IF;

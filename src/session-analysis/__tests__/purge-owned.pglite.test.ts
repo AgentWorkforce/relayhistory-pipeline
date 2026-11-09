@@ -14,11 +14,7 @@ afterEach(async () => {
   pg = undefined;
 });
 
-/** 041000's owned-set table (lane A, #289); the delivery records are 010000's. */
-const LANE_A = `
-CREATE TABLE sessions.ingest_frozen_source_owned_sessions(
- org_id text NOT NULL,workspace_id text NOT NULL,user_id text NOT NULL,origin_id text NOT NULL,
- source text NOT NULL,session_id text NOT NULL,PRIMARY KEY(org_id,workspace_id,user_id,origin_id,source,session_id));`;
+/** 041000's owned-set table (lane A, #289) comes from the migration itself; the delivery records are 010000's. */
 
 let n = 0;
 async function backfilled(db: PGlite, org: string, ws: string, session: string) {
@@ -46,7 +42,6 @@ const tickets = async (db: PGlite) =>
 
 async function world() {
   const db = (pg = await database());
-  await db.exec(LANE_A);
   await db.exec(`INSERT INTO sessions.ingest_frozen_source_owned_sessions VALUES
     ('org-a','ws-1','user-1','origin-1','claude','S1'),
     ('org-a','ws-1','user-1','origin-2','claude','S1'),
@@ -103,6 +98,8 @@ test("a publishing ticket for a purged key becomes a lease-free 'unknown' ticket
 test("bad input is refused; without lane A's tables it is a no-op; EXECUTE is owner-only", async () => {
   const db = (pg = await database());
   await backfilled(db, "org-a", "ws-1", "S1");
+  // The table-absent branch: with no owned-set table the purge is a no-op (0), not an error.
+  await db.exec("DROP TABLE sessions.ingest_frozen_source_owned_sessions");
   expect((await db.query<{ n: number }>("SELECT sessions.purge_session_analysis_for_owned('org-a','ws-1','user-1') n")).rows[0]!.n).toBe(0);
   expect(await jobs(db)).toEqual(["org-a/ws-1/S1"]);
   for (const bad of ["SELECT sessions.purge_session_analysis_for_owned('', 'w', 'u')", "SELECT sessions.purge_session_analysis_for_owned('o', 'w', NULL)",

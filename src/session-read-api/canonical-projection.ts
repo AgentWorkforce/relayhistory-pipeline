@@ -47,7 +47,7 @@ import {
   canonicalManifestIdentity,
   manifestUserId as admittedManifestUserId,
 } from "../shared/manifest-identity.ts";
-interface SessionScope {
+export interface SessionScope {
   orgId: string;
   workspaceId: string;
   harness: string;
@@ -248,6 +248,107 @@ export function projectedToNeonRow(
   const { ts_text: _ts, workspace_id: _ws, ...covered } = base;
   const fingerprint = `s3${createHash("sha256").update(JSON.stringify(covered)).digest("hex").slice(0, 14)}`;
   return { ...base, fingerprint };
+}
+
+/** The projection identity of one group of records: whose session, machine and user they are. */
+export interface EventProjectionIdentity {
+  sessionId: string;
+  machineId: string;
+  userId: string;
+}
+
+/** A projected event row's admitted owner (the canonical reader's multi-manifest map). */
+export type EventRowOwner = (
+  row: Json,
+) => { userId: string; sessionId: string } | undefined;
+
+/** The generic delivery projection uses role as type. Codex tool-use captures
+ * carry an explicit non-chat kind; restore it only with a same-origin, same
+ * physical-session/message-id tool-call witness from the verified record union.
+ * This changes classification only: content, identities, ordering and counts stay.
+ */
+function codexToolCaptures(records: readonly RelayhistoryStreamRecord[], scope: SessionScope) {
+  const calls = new Map<string, RelayhistoryStreamRecord | null>();
+  const key = (record: RelayhistoryStreamRecord): string | null => {
+    const p = record.payload;
+    return p && p.source === "codex" && typeof p.session_id === "string" && p.session_id.trim() &&
+      typeof p.message_id === "string" && p.message_id.trim()
+      ? JSON.stringify([record.origin_id, p.session_id, p.message_id]) : null;
+  };
+  if (scope.harness !== "codex") return new Map<string, string>();
+  for (const record of records) {
+    if (record.kind !== "tool_call") continue;
+    const k = key(record);
+    if (!k || typeof record.payload?.name !== "string" || !record.payload.name.trim()) continue;
+    calls.set(k, calls.has(k) ? null : record);
+  }
+  const captures = new Map<string, string>();
+  for (const record of records) {
+    if (record.kind !== "session_event" || record.payload?.kind !== "tool_use" || record.payload.role !== "assistant") continue;
+    const k = key(record), call = k ? calls.get(k) : null;
+    if (call) captures.set(JSON.stringify([deliveryMachine(scope.workspaceId, record.origin_id), record.record_id]), call.payload!.name as string);
+  }
+  return captures;
+}
+
+/**
+ * The one record-to-event projection both readers run (readCanonicalScope per manifest
+ * group, owner-buffered.ts per buffered origin): projectRelayhistorySession, then each
+ * `convergence_events` row with its owner restored and mapped to the index row shape.
+ * Pure. A projection failure is returned as `{ error }` (the canonical reader records the
+ * reason and continues; the buffered reader hides the session); a failure mapping a
+ * projected row throws, as it always has. Catalog rows are returned in projection order.
+ */
+export function projectEventRows(
+  records: RelayhistoryStreamRecord[],
+  scope: SessionScope,
+  identity: EventProjectionIdentity,
+  version: number,
+  owner?: EventRowOwner,
+):
+  | { error: unknown }
+  | {
+      catalogRows: CatalogProjectionRow[];
+      events: Array<{ row: Json; indexRow: IndexRow }>;
+    } {
+  let projected;
+  try {
+    projected = projectRelayhistorySession(records, {
+      workspaceId: scope.workspaceId,
+      source: scope.harness,
+      sessionId: identity.sessionId,
+      machineId: identity.machineId,
+      userId: identity.userId,
+    });
+  } catch (error) {
+    return { error };
+  }
+  const codexTools = codexToolCaptures(records, scope);
+  const catalogRows: CatalogProjectionRow[] = [];
+  const events: Array<{ row: Json; indexRow: IndexRow }> = [];
+  for (const { table, row } of projected.rows) {
+    if (table !== "convergence_events") {
+      catalogRows.push({ table, row });
+      continue;
+    }
+    const found = owner?.(row);
+    const toolName = row.kind === "session_event" && typeof row.delivery_record_id === "string"
+      ? codexTools.get(JSON.stringify([row.machine_id, row.delivery_record_id])) : undefined;
+    const canonicalRow = {
+      ...row,
+      ...(toolName ? { type: "tool_use", tool_name: toolName } : {}),
+      session_id: row.delivery_record_id
+        ? (found?.sessionId ?? row.session_id)
+        : row.session_id,
+      user_id: row.user_id ?? found?.userId ?? identity.userId,
+    };
+    const indexRow = toIndexRow(
+      projectedToNeonRow(canonicalRow, scope, identity.userId),
+      version,
+    );
+    events.push({ row: canonicalRow, indexRow });
+  }
+  return { catalogRows, events };
 }
 
 export interface ScopeRead {
@@ -472,43 +573,31 @@ export async function readCanonicalScope(
   const metadataByKey = new Map<string, Json>();
   const catalogRows: CatalogProjectionRow[] = [];
   for (const { records, part } of groups) {
-    let projected;
-    try {
-      projected = projectRelayhistorySession(records, {
-        workspaceId: scope.workspaceId,
-        source: scope.harness,
+    const projected = projectEventRows(
+      records,
+      scope,
+      {
         sessionId: canonicalManifestIdentity(part.manifest).sessionId,
         machineId: canonicalManifestIdentity(part.manifest).machineId,
         userId: part.userId,
-      });
-    } catch (error) {
+      },
+      version,
+      // Delivery projection is tenant-free; restore the record's admitted owner,
+      // not the uploader/first-manifest owner of a multi-machine logical scope.
+      (row) =>
+        ownerByEvent.get(JSON.stringify([row.machine_id, row.delivery_record_id])),
+    );
+    if ("error" in projected) {
       complete = false;
       reasons.push(
-        error instanceof PipelineError ? error.code : "projection_failed",
+        projected.error instanceof PipelineError
+          ? projected.error.code
+          : "projection_failed",
       );
       continue;
     }
-    for (const { table, row } of projected.rows) {
-      if (table !== "convergence_events") {
-        catalogRows.push({ table, row });
-        continue;
-      }
-      // Delivery projection is tenant-free; restore the record's admitted owner,
-      // not the uploader/first-manifest owner of a multi-machine logical scope.
-      const owner = ownerByEvent.get(
-        JSON.stringify([row.machine_id, row.delivery_record_id]),
-      );
-      const canonicalRow = {
-        ...row,
-        session_id: row.delivery_record_id
-          ? (owner?.sessionId ?? row.session_id)
-          : row.session_id,
-        user_id: row.user_id ?? owner?.userId ?? part.userId,
-      };
-      const indexRow = toIndexRow(
-        projectedToNeonRow(canonicalRow, scope, part.userId),
-        version,
-      );
+    catalogRows.push(...projected.catalogRows);
+    for (const { row: canonicalRow, indexRow } of projected.events) {
       const identity = keyOf({
         machineId: indexRow.machine_id,
         source: indexRow.source,

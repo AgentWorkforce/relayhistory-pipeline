@@ -11,6 +11,10 @@ import re
 import subprocess
 import sys
 
+# Same signed index to every repository, primary first. Must equal
+# PUBLISHED_IMAGES in scripts/image-release-provenance.mjs (both are signed).
+REPOSITORIES = ("ghcr.io/agentworkforce/sessions-pipeline", "ghcr.io/agentworkforce/96bulls-services")
+
 
 @contextlib.contextmanager
 def memory_auth(actor, token):
@@ -36,7 +40,7 @@ def copy_image(env, run=subprocess.run, auth_context=memory_auth):
         raise RuntimeError("Exact source and signed digest required")
     if actor != "khaliqgant" or not token or not root.is_absolute() or not (root / "services.oci.tar").is_file():
         raise RuntimeError("Approved actor, credential and OCI archive required")
-    target = f"docker://ghcr.io/agentworkforce/96bulls-services:sha-{source}"
+    targets = [f"docker://{repository}:sha-{source}" for repository in REPOSITORIES]
     # The copy tool needs only its inherited memory descriptor, not GitHub/OIDC
     # credentials in its environment. Preserve normal executable/TLS/proxy setup.
     allowed = {"PATH", "HOME", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY",
@@ -45,12 +49,13 @@ def copy_image(env, run=subprocess.run, auth_context=memory_auth):
     with auth_context(actor, token) as (descriptor, path):
         options = {"check": True, "pass_fds": (descriptor,), "env": child_env,
                    "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
-        run(["skopeo", "copy", "--all", "--preserve-digests", "--authfile", path,
-             f"oci-archive:{root / 'services.oci.tar'}", target], **options)
-        result = run(["skopeo", "inspect", "--raw", "--authfile", path, target],
-                     **options)
-        if not isinstance(result.stdout, bytes) or "sha256:" + hashlib.sha256(result.stdout).hexdigest() != digest:
-            raise RuntimeError("Registry index does not match the signed digest")
+        for target in targets:
+            run(["skopeo", "copy", "--all", "--preserve-digests", "--authfile", path,
+                 f"oci-archive:{root / 'services.oci.tar'}", target], **options)
+            result = run(["skopeo", "inspect", "--raw", "--authfile", path, target],
+                         **options)
+            if not isinstance(result.stdout, bytes) or "sha256:" + hashlib.sha256(result.stdout).hexdigest() != digest:
+                raise RuntimeError("Registry index does not match the signed digest")
     return digest
 
 

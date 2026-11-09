@@ -1,3 +1,4 @@
+import { afterAll as __modeAfterAll, beforeEach as __modeBeforeEach } from "bun:test";
 import { afterAll, expect, test } from "bun:test";
 import { existsSync, statSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -6,6 +7,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stateForRun } from "../neon-s3-sync/main.ts";
 import { SyncState } from "../neon-s3-sync/state.ts";
+
+// The exporter's dry run copies the real watermark: the OFF (default) behaviour. An ON dry run needs a fresh scratch
+// S3X_STATE instead (runbooks/neon-s3-sync.md).
+// The suite's OWN mode, pinned per module, re-applied before every test and restored after the file (never leaked).
+const OBLIGATIONS_MODE: "on" | "off" = "off";
+const __modeBefore = process.env.S3X_OBLIGATIONS;
+process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE;
+__modeBeforeEach(() => void (process.env.S3X_OBLIGATIONS = OBLIGATIONS_MODE));
+__modeAfterAll(() => { if (__modeBefore === undefined) delete process.env.S3X_OBLIGATIONS; else process.env.S3X_OBLIGATIONS = __modeBefore; });
 
 const dirs: string[] = [];
 afterAll(async () => {
@@ -16,7 +26,7 @@ test("a dry run never writes the real watermark: it works on a private copy that
   const dir = await mkdtemp(join(tmpdir(), "s3x-dry-"));
   dirs.push(dir);
   const real = join(dir, "state.sqlite");
-  const live = new SyncState(real);
+  const live = new SyncState(real, { obligations: OBLIGATIONS_MODE === "on" });
   live.seeRevisions(1, [{ org_id: "o", session_id: "s", revision: "3" }]);
   live.markExported("o", "s", 3, ["96bulls/o/v1/ws=w/m=m/h=h/d=2026/10/20/s=s/manifest.json"]);
   live.close();
@@ -33,7 +43,7 @@ test("a dry run never writes the real watermark: it works on a private copy that
 
   const run = stateForRun(false, real, join(dir, "dry-runs"));
   expect(run.path).not.toBe(real);
-  const dry = new SyncState(run.path);
+  const dry = new SyncState(run.path, { obligations: OBLIGATIONS_MODE === "on" });
   // The copy carries the watermark (a dry run plans from it)...
   expect(dry.exported("o", "s")!.revision).toBe(3);
   // ...and whatever the dry run records stays in the copy.
@@ -44,7 +54,7 @@ test("a dry run never writes the real watermark: it works on a private copy that
 
   expect(existsSync(run.path)).toBe(false);
   expect(dump()).toBe(before);
-  const check = new SyncState(real);
+  const check = new SyncState(real, { obligations: OBLIGATIONS_MODE === "on" });
   expect(check.exported("o", "fake")).toBeUndefined();
   expect(check.exported("o", "s")!.revision).toBe(3);
   check.close();
@@ -57,7 +67,7 @@ test("--execute uses the watermark itself; a dry run with no watermark starts em
   expect(stateForRun(true, real).path).toBe(real);
   const run = stateForRun(false, real, join(dir, "dry-runs"));
   expect(existsSync(real)).toBe(false);
-  const s = new SyncState(run.path);
+  const s = new SyncState(run.path, { obligations: OBLIGATIONS_MODE === "on" });
   expect(s.exported("o", "s")).toBeUndefined();
   s.close();
   run.cleanup();

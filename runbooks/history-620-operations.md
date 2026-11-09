@@ -23,6 +23,21 @@ Lock order on every live path: user fences, then the receipt seat clock
 advisory locks (sorted). The install only try-locks the scope, and begin and install take the switch row
 before any build row.
 
+Since 043500 the lazy batch claim reads the seat clock `FOR KEY SHARE` (claims no longer exclude each
+other there); writers that must exclude claims (`set_live`, control changes, `lazy_clear`, seat
+initialization) still take it `FOR UPDATE`. After the fence lock and the clock read, and
+before any write, each claim takes exactly one transaction advisory lock keyed
+`'96bulls:lazy-native-origin-v1'` per (org, workspace, origin).
+
+Since 043800 the staged ACK (`ingest_lazy_ack_batch`) takes the clock `FOR NO KEY UPDATE`: it writes
+`last_seat` only, so staged ACKs still serialize with each other and with every `FOR SHARE` /
+`FOR UPDATE` holder, but a claim's `KEY SHARE` no longer queues behind an in-flight ACK. Right after
+the clock, and before any stage-row or native-slot lock, the staged ACK takes the same
+`'96bulls:lazy-native-origin-v1'` advisory lock as the claim for its one (org, workspace, origin).
+The ACK lock order is therefore fence -> clock -> origin -> slot, the same as the claim's, so an
+ACK and a same-origin claim of another user cannot deadlock on native slots. A same-origin claim
+that runs while a staged ACK is in flight waits for that ACK's transaction on the origin lock.
+
 ## Kill switch (usable at any time, including after installs)
 
 ```sql
@@ -33,7 +48,8 @@ SELECT sessions.ingest_history_set_live(true);   -- on again
 
 Both calls fail with 55P03 (lock_not_available) when contended; nothing has changed, so retry.
 `set_live(true)` takes the seat clock first and then `session_index` SHARE with **NOWAIT**. Main
-takes those two locks in both orders (the lazy batch claim: seat clock, then a `session_index` write;
+takes those two locks in both orders (the lazy batch claim: seat clock `FOR KEY SHARE`, which still conflicts
+with `set_live`'s `FOR UPDATE`, then a `session_index` write;
 a lazy control: `session_index`, then the seat clock), so resume never waits for `session_index`. It
 fails at once with `history: session_index has an in-flight writer; nothing changed, retry
 ingest_history_set_live(true)` while any indexer write is uncommitted. Retry in a loop with a short
@@ -75,6 +91,65 @@ half-done, so retry the aborted call (the switch or the backfill page).
   were not tracked), so its directory row is cleared and its next build re-derives it. This is five
   set-based statements over all installed scopes (`ingest_history_invalidate_installed`), not a
   per-scope loop; indexer writes wait for it behind the SHARE lock.
+
+## Lock-wait alert (55P03 / 57014)
+
+The ingest Worker writes one extra log line when a buffered lazy claim or a staged ACK fails with
+SQLSTATE 55P03 (`lock_not_available`, e.g. the 2s `lock_timeout`) or 57014 (query cancelled;
+usually the statement timeout, but not provably so): `route` = `ingest.lock_alert`, `stage` =
+`lazy_claim` (`ingest_claim_buffered_batch`) or `staged_ack` (`ingest_commit_buffered_batch`),
+and `sqlstate`. It carries no tenant data and no ids. The request's own 503 line is unchanged
+(`route` `delivery.batches` / `turns.batches` / `delivery.recovery`, `outcome`
+`delivery_unavailable`, `stage` `claim` or `buffer_receipt`, `error_code`, `db_error_code`).
+Since 043800 it also fires with `stage` = `staged_intent` for the buffered stage-intent call
+(`ingest_prepare_buffer_stage`, deliver stage `buffer_intent`), which takes no clock lock but waits
+on the fence and batch rows a staged ACK holds. This line covers only those three calls. Control changes and `lazy_clear` run nested inside the
+ordered selection/reset SQL (`ingest_apply_selection` / reset and the history-control triggers);
+their 55P03/57014 currently reach the Worker's selection/reset routes as a generic unavailable
+error without the SQLSTATE, so this alert line does NOT cover them. A follow-up PR will preserve
+the closed SQLSTATE through that conversion and emit `ingest.lock_alert` with stage tags
+`control_changed`, `lazy_clear`, `set_live`, plus an exact attempt/success counter at the commit
+call site. Until then those paths are observable only in the database/operator log.
+
+Alert when any of these is true:
+
+- commit lock-alert request rate above 1% over 5 minutes (numerator: `ingest.lock_alert` lines
+  with `stage=staged_ack`; denominator: buffered requests that reached `buffer_receipt`, i.e.
+  successful batch/recovery lines plus 503 lines with `stage=buffer_receipt`). This is a request
+  rate, not an exact RPC failure rate: the denominator includes replay/suppressed successes that
+  never called `ingest_commit_buffered_batch`;
+- any 55P03 on `set_live`, `control_changed` or `lazy_clear`, read from the database/operator log
+  (not from the Worker line) until the follow-up lands;
+- more than 1% of claim-path requests return 503 over 5 minutes (`outcome=delivery_unavailable`
+  with `stage=claim`, divided by all batch, turns and recovery requests).
+
+Per-stage latency (default off): with `INGEST_STAGE_LATENCY_LOG=on` the Worker writes one
+`route` = `ingest.stage_latency` line per deliver stage with `stage`, `outcome` (`ok`, `refused`,
+`unavailable`), `duration_ms` and, for a database failure, `sqlstate`; no tenant data, no ids.
+
+Claim lock-wait busy (default off): with `INGEST_CLAIM_LOCK_BUSY=on` a claim (any acceptance
+mode) whose statement loses its lock wait (55P03 or 40P01, `error_code` `ledger_lock_timeout`)
+answers 429 `delivery_busy` with `Retry-After` 5-10 s instead of the 503. The lower bound is the
+role `statement_timeout` (5 s), so the retry lands after the holding claim has committed or been
+cancelled. The statement rolled back, so nothing was written; the retry is the same idempotent claim.
+The flag changes only the HTTP answer: the async admission consumer still retries a claim lock wait
+with the normal admission backoff (15, 30, 60 ... 300 s by attempt), with the same `error_code`
+`ledger_lock_timeout`, `stage` `claim` and `db_*` fields on its `ingest.admission` retry line. The
+route line keeps `stage` `claim`, `error_code` and `db_error_code`, with `outcome` `delivery_busy`.
+The `ingest.lock_alert` `lazy_claim` line still fires for 55P03 (buffered mode) only: the lock
+alert set is 55P03 and 57014, so a 40P01 (deadlock) turned into 429 emits no lock alert and shows
+only as `outcome=delivery_busy` with `stage=claim` and `db_error_code` `40P01`. The
+`ingest.stage_latency` line (if enabled) still records the converted claim as `outcome`
+`unavailable`, because it is observed before the conversion. 57014 (`ledger_timeout`) and every
+other cause stay 503. With the flag on, the 503 claim-path alert above no longer counts 55P03 or
+40P01. Watch `outcome=delivery_busy` with `stage=claim` (all claim lock waits), or the `lazy_claim`
+lock alert (55P03 only). Unset or `off`: unchanged.
+
+No Workers analytics or Logpush observer is named in these runbooks, so the alert is not wired
+yet. It is to be wired by the release owner in the G3 window, using the fields `route`, `stage`,
+`sqlstate`, `outcome` and `db_error_code`. A sustained `lazy_claim` 55P03 with a single origin
+lock holder is expected same-origin serialization (see the lock order above): check the
+uploader for overlapping same-origin uploads before treating it as an incident.
 
 ## Pointer-reference tracking
 

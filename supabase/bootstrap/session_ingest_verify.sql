@@ -8,6 +8,8 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.canonical_project_events_release_v1(jsonb)',
  'sessions.canonical_project_events_sent_v1(jsonb)',
  'sessions.ingest_acquire_slot(jsonb)',
+ 'sessions.ingest_babysitter_retention_register(jsonb)',
+ 'sessions.ingest_babysitter_retention_written(jsonb)',
  'sessions.ingest_buffer_gc_claim(jsonb)',
  'sessions.ingest_buffer_gc_finish(jsonb)',
  'sessions.ingest_buffer_gc_prepare(jsonb)',
@@ -36,6 +38,8 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.ingest_history_scope_capture(jsonb)',
  'sessions.ingest_history_scope_install(jsonb)',
  'sessions.ingest_prepare_buffer_stage(jsonb)',
+ 'sessions.ingest_privacy_authority_begin(jsonb)',
+ 'sessions.ingest_privacy_authority_complete(jsonb)',
  'sessions.ingest_publication_abandon(jsonb)',
  'sessions.ingest_publication_candidates(jsonb)',
  'sessions.ingest_publication_claim(jsonb)',
@@ -48,6 +52,7 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.ingest_publication_register_objects(jsonb)',
  'sessions.ingest_release_slot(jsonb)',
  'sessions.ingest_reset_uploaded_sessions(jsonb)',
+ 'sessions.ingest_selfhost_set_session_uploads(jsonb)',
  'sessions.ingest_set_session_uploads(jsonb)',
  'sessions.ingest_source_control_begin(jsonb)',
  'sessions.ingest_source_control_complete(jsonb)',
@@ -67,6 +72,8 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  v_table text:='SELECT,INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER'||
   CASE WHEN current_setting('server_version_num')::int>=170000 THEN ',MAINTAIN' ELSE '' END;
 BEGIN
+ -- Allowed, not required: the verifier also passes before 20261105043910 is applied.
+ v_allowed:=array_remove(v_allowed,CASE WHEN to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)') IS NULL THEN 'sessions.ingest_selfhost_set_session_uploads(jsonb)' END);
  SELECT array_agg(to_regprocedure(fn)::oid) INTO v_oids FROM unnest(v_allowed) fn;
  IF cardinality(v_oids)<>cardinality(v_allowed) OR array_position(v_oids,NULL) IS NOT NULL
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest RPC missing';END IF;

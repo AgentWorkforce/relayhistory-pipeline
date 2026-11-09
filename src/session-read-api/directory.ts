@@ -72,6 +72,8 @@ export interface DirectoryListArgs {
   firstTsAfter?: Date;
   firstTsBefore?: Date;
   cursor?: DirectoryCursor;
+  /** Exactly these (harness, session id) keys, 1..200 (the RPC's p_session_harnesses/p_session_ids). */
+  sessionKeys?: Array<{ harness: string; sessionId: string }>;
   /** Page size, 1..200; the function returns up to limit + 1 rows. */
   limit: number;
 }
@@ -117,7 +119,7 @@ export const DIRECTORY_LIST_SQL = `SELECT org_id, workspace_id, harness, session
     p_user_ids => $5, p_agent => $6, p_last_ts_after => $7, p_last_ts_before => $8,
     p_first_ts_after => $9, p_first_ts_before => $10,
     p_cursor_last_activity_at => $11, p_cursor_session_id => $12, p_cursor_harness => $13,
-    p_limit => $14)`;
+    p_limit => $14, p_session_harnesses => $15, p_session_ids => $16)`;
 
 export const DIRECTORY_ACTIVITY_SQL = `SELECT to_char(day, 'YYYY-MM-DD') AS day, harness, sessions
   FROM sessions.session_directory_activity_for($1, $2, $3)`;
@@ -157,6 +159,8 @@ export function sqlDirectory(run: TenantRunner): Directory {
             a.cursor?.sessionId ?? null,
             a.cursor?.harness ?? null,
             a.limit,
+            a.sessionKeys?.length ? a.sessionKeys.map((k) => k.harness) : null,
+            a.sessionKeys?.length ? a.sessionKeys.map((k) => k.sessionId) : null,
           ])
           .catch(mapPgError);
         return r.rows;
@@ -188,7 +192,68 @@ export function encodeListCursor(c: DirectoryCursor): string {
   return LIST_CURSOR_PREFIX + btoa(JSON.stringify([c.lastActivityAt, c.sessionId, c.harness])).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/u, "");
 }
 
-/** undefined: no cursor; "foreign": not ours; "invalid": ours but malformed. */
+/**
+ * The owner-buffered list position (RELAYHISTORY_READ_OWNER_BUFFERED): the last buffered row
+ * consumed, as (cursor_ts, sessionId, source). Rides as an optional 4th element of the same
+ * `b96s1:` cursor, so nextCursor stays one opaque string.
+ */
+export interface BufferedListCursor {
+  ts: string;
+  sessionId: string;
+  source: string;
+}
+
+/**
+ * `[cts|null, sid|null, harness|null, [bts, bsid, bsource]]`; the plain 3-tuple when there is
+ * no buffered position. A null canonical part means no canonical row was consumed yet.
+ */
+export function encodeCompositeListCursor(canonical: DirectoryCursor | undefined, buffered: BufferedListCursor | undefined): string {
+  if (!buffered) {
+    if (!canonical) throw new Error("list cursor needs a position");
+    return encodeListCursor(canonical);
+  }
+  const v = [canonical?.lastActivityAt ?? null, canonical?.sessionId ?? null, canonical?.harness ?? null, [buffered.ts, buffered.sessionId, buffered.source]];
+  return LIST_CURSOR_PREFIX + btoa(JSON.stringify(v)).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/u, "");
+}
+
+const validCanonical = (v: unknown[]): boolean =>
+  typeof v[0] === "string" && CURSOR_TS.test(v[0]) && Number.isFinite(Date.parse(v[0])) &&
+  typeof v[1] === "string" && v[1].length >= 1 && v[1].length <= 255 &&
+  typeof v[2] === "string" && HARNESS_NAME.test(v[2]);
+const BUFFERED_CURSOR_TS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/u;
+const validBuffered = (b: unknown): b is [string, string, string] =>
+  Array.isArray(b) && b.length === 3 &&
+  typeof b[0] === "string" && BUFFERED_CURSOR_TS.test(b[0]) && Number.isFinite(Date.parse(b[0])) &&
+  typeof b[1] === "string" && b[1].length >= 1 && b[1].length <= 512 &&
+  typeof b[2] === "string" && b[2].length >= 1 && b[2].length <= 255;
+
+/**
+ * Both parts of a list cursor (owner-buffered list only). undefined: no cursor; "foreign"/"invalid"
+ * as decodeListCursor. A 4-element cursor's canonical part may be all-null (no canonical row
+ * consumed yet).
+ */
+export function decodeCompositeListCursor(raw: string | undefined): { canonical?: DirectoryCursor; buffered?: BufferedListCursor } | undefined | "foreign" | "invalid" {
+  if (raw === undefined || raw === "") return undefined;
+  if (!raw.startsWith(LIST_CURSOR_PREFIX)) return "foreign";
+  try {
+    const b64 = raw.slice(LIST_CURSOR_PREFIX.length).replace(/-/gu, "+").replace(/_/gu, "/");
+    const v = JSON.parse(atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4)));
+    if (!Array.isArray(v)) return "invalid";
+    if (v.length === 3) return validCanonical(v) ? { canonical: { lastActivityAt: v[0], sessionId: v[1], harness: v[2] } } : "invalid";
+    if (v.length !== 4 || !validBuffered(v[3])) return "invalid";
+    const buffered = { ts: v[3][0], sessionId: v[3][1], source: v[3][2] };
+    if (v[0] === null && v[1] === null && v[2] === null) return { buffered };
+    return validCanonical(v) ? { canonical: { lastActivityAt: v[0], sessionId: v[1], harness: v[2] }, buffered } : "invalid";
+  } catch {
+    return "invalid";
+  }
+}
+
+/**
+ * undefined: no cursor; "foreign": not ours; "invalid": ours but malformed. Exactly main's
+ * canonical-only decoder: a composite (owner-buffered, 4-element) cursor is "invalid" here; only
+ * the list route with owner-buffered reads on decodes it (decodeCompositeListCursor).
+ */
 export function decodeListCursor(raw: string | undefined): DirectoryCursor | undefined | "foreign" | "invalid" {
   if (raw === undefined || raw === "") return undefined;
   if (!raw.startsWith(LIST_CURSOR_PREFIX)) return "foreign";

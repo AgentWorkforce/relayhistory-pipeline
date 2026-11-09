@@ -1,0 +1,191 @@
+{
+  "schema": "publication-frontier-attester-design-v3",
+  "at": "2026-11-07T21:03:34.882008+00:00",
+  "status": "SOURCE_ONLY_NARROW_REVIEW_REQUIRED_NO_CODE_OR_ACTIVATION",
+  "supersedes_entire_v2_sha256": "ed1652c5e2c9db45cbca935ceaebe47d062993b555208f5b17f779676de0dfc8",
+  "supersession": "This complete v3 replaces ALL v1/v2 choices, including the new competing frontier codec, 60min TTL, insert-capable fence helper and assumptions about SET authority. No stale v2 section is normative.",
+  "scope": {
+    "registry_slot": "050000 RESERVED, design-only, after final contiguous044000..049000",
+    "mode": "Human-controlled one-shot owner ceremony using a narrow NOLOGIN RPC role, no new LOGIN/secret/daemon",
+    "initial_supported_ceremony": "Supabase PostgreSQL16+ only. RDS and CloudSQL attester execution explicitly UNAVAILABLE pending provider-specific membership/role proofs; do not alter their security guards to force it. Portable schema, reserved names and role inventories still compose for all profiles.",
+    "consumer_contract": "Core SQL/read contracts are consumer-neutral and tested self-host at SQL level. This human task is Cloud-first, then relay-app/relaycontrol; Cloud integration is a separately owned consumer test."
+  },
+  "review_input": {
+    "v2_owner_message": "244928261717749760",
+    "full_adversarial_message": "244928277470109696",
+    "full_contextual_message": "244928284857724928",
+    "both_full_reports_read": true,
+    "source_owner_main": "86eaefea contains f9409ccb",
+    "local_source_context": "f9409ccb existing seed/ownership/publication/role code; 048000 moves bootstrap lines, so use exact final composed sources not numeric line assumptions"
+  },
+  "source_plan_reuse_C3": {
+    "contract": "Use existing canonical-publication-frontier-capture-v1 / canonical-publication-frontier-plan-v1 evaluator and byte adapter. Accept only production-qualified READY with genuine out-of-band export bindings, exact source/target/generation/scope, complete receipt scan and independently verified whole-user recovery supplement.",
+    "pins": {
+      "planner_docs_commit": "b1283b2e6c651ea6c2a80b90287e3c0d92ee343b",
+      "049_design_branch": "codex/scoped-publication-claim-design-20261107",
+      "049_design_head": "47425aca4512bb10ace0626f3832cd2b81339e36",
+      "docs_path": "docs/canonical-frontier-plan.md",
+      "docs_sha256": "a1065fd01354fd54f4b5e9cf7ef86918448dd9e03adeb1dd91f1204207b68a13",
+      "source_owner_confirmed": "244929167081988096"
+    },
+    "exact_mapping": "Persist the exact CanonicalFrontierRow source_frontier_sha256,record_maxima_sha256,valid_until,scope,target and schema_generation from READY. Bind evidenceSha256,planSha256,captureId and planner/verifier source pins in separate immutable evidence. Do not recompute the two DB column hashes using v2 length framing, and do not change expiry after approving planSha256.",
+    "retired": "v2 publication-frontier-evidence-v1 source_frontier_array/record_maxima_hash/receipt_semantic_sha256 are retired. Additional audit/user-recovery roots below are separate commitments, never replacements for planner column hashes.",
+    "known_HOLD": "Current runner intentionally has no complete receipt-seat/stage-root read capability and remains hold/scan_incomplete for production. It cannot be made READY by owner credentials, a file-supplied binding, an asserted empty scan or re-sealing capture JSON. The separately reviewed least-privilege receipt adapter/049000 work is a prerequisite, not an implicit050000 migration/permission change.",
+    "source_sort": "Existing planner canonical JSON/hash is the normative input contract for its outputs, including its ordering. This writer must neither silently re-sort nor amend it. Independent verifier must implement the published planner contract and match byte-level vectors; ordering bugs/unsupported identifiers in that upstream protocol are HOLD or a separately reviewed049000 amendment, never a writer workaround."
+  },
+  "irreversible_user_wide_gate_B1": {
+    "key": [
+      "org_id",
+      "workspace_id",
+      "user_id"
+    ],
+    "before_any_frontier": "Prove COMPLETE recovery/import for the entire user across ALL origins before first frontier for any origin. Include frozen legacy records/tombstones/privacy, pre-switch S3first ACKs not inNeon, preserved queue and DLQ, actual accepted seats and import-completion receipts. A proven-empty origin alone does not prove an empty user.",
+    "effect": "First successful canonical admission sets publication_state=canonical and closes ingest_seed_fence_baselines for the WHOLE user BEFORE any image PUT; existing seed/custody imports then refuse55000. This is irreversible even if PUT fails or frontendread fails. Revoke/delete/flagoff/rollback does not reopen it; never clear closed_at.",
+    "unmeasured": "Any unresolved origin ownership, missing queue/DLQ membership/terminal coverage or required payload/import proof prevents attesting every origin of that user. Independently proved other users can proceed.",
+    "already_closed": "Do not assume prior closure proves recovery completion. A separate reviewed reconciliation/lineage protocol is required; no exemption here.",
+    "empty_legacy": "VERIFIED_EMPTY is an independently proven whole-user zero legacy/receipt/queue/DLQ/S3-history inventory with terminal proof at fixed boundary. Native custody and ownership still must already be initialized by their legitimate protocol; absent owner row is NOT empty proof and the attester must not create one."
+  },
+  "A1_noncreating_owner_lock": {
+    "required": "In attest, renew AND revoke, SELECT the exact EXISTING sessions.ingest_fence_owners row WHERE org_id/workspace_id/user_id match FOR UPDATE; verify the existing authoritative owner/fence shape. If missing, refuse55000 before any frontier/evidence mutation.",
+    "forbidden": "Never call ingest_lock_fences here; never INSERT/UPSERT owner rows, seed baselines or lazy seals. The helper's first-owner insertion would steal seed/privacy-adoption linearization. No generic lock helper with insertion is permitted.",
+    "order": "Existing user row -> exact frontier FOR UPDATE -> fresh lease checks -> CAS/evidence mutation. No client/manual transaction holds a user fence between RPCs. Owner transfer invalidation uses both existing users in canonical raw UTF8 tuple order."
+  },
+  "A2_C1_role_and_membership": {
+    "role": "bulls96_publication_frontier_attester NOLOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; no table/column/sequence/MAINTAIN/TRUNCATE rights and no elevated inherited membership.",
+    "supabase_grant": "After Khaliq's separate explicit OK, qualified bootstrap operator issues GRANT bulls96_publication_frontier_attester TO relayhistory_owner WITH INHERIT FALSE, SET TRUE (and no ADMIN). Owning/administering a role is NOT proof of SET authority. Validate actual parent role is existing non-elevated LOGIN NOINHERIT and exact qualified account/project; no new LOGIN/secret.",
+    "member_exact_verifier": "Add supabase/bootstrap/session_frontier_attester_verify.sql, patterned on session_ingest_seeder_verify.sql: inspect BOTH pg_auth_members directions, grantor, admin_option,inherit_option,set_option, per-role settings, table/column/PUBLIC/MAINTAIN/TRUNCATE/sequence privileges and exact RPC/schema grants. Supabase managed postgres->supabase_admin administrative edge allowed only in the same exact restricted shape as the existing seeder verifier; only relayhistory_owner receives the intended non-admin SET edge. Unexpected members or privileges refuse55000. Missing role42704. PG<16 ceremony unavailable rather than assuming old inheritance semantics.",
+    "complete_source_inventory": [
+      "supabase/bootstrap/session_ingest_roles.sql (all inventory/FOREACH/NOLOGIN/elevation/member checks)",
+      "supabase/bootstrap/rds_migration_roles.sql (inventory/create/postchecks; retain its no-membership restrictions)",
+      "supabase/bootstrap/cloudsql_migration_roles.sql (inventory/create/postchecks)",
+      "supabase/bootstrap/hoopdb_runtime_role_rds.sql reserved-role names",
+      "scripts/pg-proof/rds-profile-proof.ts inventories and profile assertions",
+      "supabase/bootstrap/session_frontier_attester_verify.sql exact members and effective privileges"
+    ],
+    "provider_limit": "RDS migration-role checks refuse memberships in either direction, so NO RDS GRANT or SET ceremony in v3. CloudSQL also unqualified. Their inventory/portable SQL tests must show dormant role presence with no new membership and clear unavailable execution. Enabling them needs separately reviewed provider-specific membership contract + Khaliq OK; no exception is inferred from Supabase proof."
+  },
+  "writer_RPC_and_snapshot_rules_A3_A4": {
+    "single_call": "Each attest/renew/revoke uses ONE bounded parameterized RPC invocation. Qualified transaction declares READ COMMITTED before first destination snapshot and SET LOCAL ROLE without acquiring a user fence in client code; the RPC takes/releases every row lock within that one call. No interactive multi-statement owner transaction holds the fence.",
+    "volatility": "RPC and any lease-check SQL/PLpgSQL helper are VOLATILE, fixed search_path. Lock the existing user row and frontier, then issue separate fresh SQL statements for publication attempts and history plans state IN(admitted,prepared) AND lease_until>clock_timestamp(). STABLE snapshot-sharing helpers are forbidden. Missing frontier is valid only for exact absent insert; missing owner always refuses.",
+    "atomicity": "Validate enabled settings, approved verifier receipt/nonce, exact source READY image, current generation/readiness/admission/privacy/ownership and whole-user completion before CAS. Consume approval and append mutation audit atomically. Normal renewal/revoke refuses any live lease. On ambiguous commit read exact audited receipt, no blind resend.",
+    "role_guard": "Use existing ingest_require_role current_setting(role)/session_user pattern correctly under SECURITY DEFINER; no broad runtime/service_role grants. No owner credential resides in publisher or unattended process."
+  },
+  "codec_and_independent_evidence_B2_A5_A6_A7_C4": {
+    "source_fields": "Take batchDigest and receiptId exactly as computed/validated by existing vendor/delivery/prepare.ts; recompute through that existing protocol when raw inputs are available, never derive new receipt identities in the audit codec. Reuse chooseRelayhistoryRevision and relayhistoryRevisionContent via seed-proof.ts; preserve first durable ACK bodyAccepted seats for resolved destination aliases. Unresolved legacy equal-revision contradictions HOLD.",
+    "audit_codec": "Separate frontier-attestation-audit-v1 objects use existing frontierCanonicalJson key-sorted compact JSON and SHA256, with an independent implementation checked by vectors. For new audit record arrays, sort FIELD-BY-FIELD on raw UTF8 bytes, using Buffer.compare in TS, not encoded row bytes or JS UTF16 string comparison. Legacy component identity includes revision as canonical decimal when multiple revisions are represented; current-maxima scans are explicitly one winner per record, with count closure.",
+    "escaping_and_ranges": "New audit strings reject U0000, invalidUTF8 and lone surrogates. Quote/backslash and short escapes b/f/n/r/t are standard JSON; remaining permitted C0 controls use lowercase unicode escapes. Slash,DEL and nonASCII are not gratuitously escaped. Integers represented as decimal strings in [0,9223372036854775807]; reject -0,+,negative,leadingzero or unsafe numeric coercions. UTC timestamp rendering uses explicit UTC microseconds via to_char (no JSDate truncation), finite AD years0001..9999 only. Existing planner input restrictions remain stricter where applicable.",
+    "every_component": "Every supplementary component commitment hashes canonical {protocol,scope,component,status,rowCount,terminalProofSha256,rowsSha256}. Status is VERIFIED_COMPLETE or VERIFIED_EMPTY; UNMEASURED is not eligible. Bind terminal proof hash even when rowCount0. A precomputable empty hash without real independently approved terminal proof does not authorize anything. Queue/DLQ inventory and whole-user recovery completion are explicit components.",
+    "approval": "Independent verifier recomputes all source-plan outputs and supplementary user-wide/status/terminal commitments from immutable real evidence, checks source/target/receipt/privacy parity, and emits pinned PASS receipt. Assigned independent reviewer approval of that exact receipt is mandatory before each frontier write. Owner writes approval into separate append-only ledger; writer cannot self-approve, accept a preparer boolean, stale report or replayed nonce. Hashes are commitments, not fabricated cryptographic signatures.",
+    "vector": {
+      "purpose": "Fixed audit canonicalization vector, not a complete production frontier or coverage proof. Existing049000 known-answer/source-winner vectors also required before writer implementation.",
+      "input": {
+        "protocol": "frontier-attestation-audit-v1",
+        "componentStatus": "VERIFIED_EMPTY",
+        "count": "0",
+        "revision": "9007199254740993",
+        "terminalProofSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "utf8_hex": "7b22636f6d706f6e656e74537461747573223a2256455249464945445f454d505459222c22636f756e74223a2230222c2270726f746f636f6c223a2266726f6e746965722d6174746573746174696f6e2d61756469742d7631222c227265766973696f6e223a2239303037313939323534373430393933222c227465726d696e616c50726f6f66536861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161227d",
+      "sha256": "204bb74cc098bfc190b73324fe1882586c9a25881611a10afc66ced723706cb2"
+    },
+    "payload_semantics": "Archives may hold scrubbed bodies. Prove the exact reviewed recovery protocol's expected bytes, immutable versions and original metadata where required; do not call scrubbed-body proof original-client-byte fidelity. Missing REQUIRED staged originals or invalid payload semantics => unmeasured whole user. Do not demand unavailable raw originals when the approved protocol expressly accepts verified scrubbed bodies."
+  },
+  "unchanged_frontier_and_append_only_audit_B4": {
+    "row": "No column/PK/positional-arity changes on ingest_publication_frontiers. Pin its eleven columns with a sentinel test. Preserve epoch-normalized publication comparison and raw-row history comparison. Quiesce plans before any function-level UTC normalization; test nonUTC defaults explicitly.",
+    "tables": "Separate frontier_attestation_evidence/audit append-only tables keyed by exact existing frontier image hash, with codec, source plan/evidence/capture roots, verifier/reviewer/source pins, user-wide completion root, nonce and actions. No transcript payloads. Separate default-disabled settings singleton. Exact image uses existing field order and explicitUTCmicrosecond rendering, independent of DBsessionTimeZone.",
+    "append_only": "RLS + REVOKE effective table/column/TRUNCATE rights + UPDATE/DELETE refusal and BEFORE TRUNCATE statement guard. Owner-controlled audited rollback is not a live-history rewrite. Approval/evidence cannot modify current frontier eligibility without the guarded writer.",
+    "anti_ABA": "Normal attest/renew expiry must strictly increase relative to prior image and no prior full image/hash may be restored. New capture/approval/nonce required after revoke. Expire-only revoke is the explicit exception; never revive borrowed attempts."
+  },
+  "flag_and_invalidation_A8": {
+    "flag": "INGEST_FRONTIER_ATTESTER_ENABLED defaultsfalse, only exacttrue/false accepted by one-shot owner CLI; server-side settings enabled=false is a second authoritative write gate. Both must be explicitly armed under separate operation. Flagoff does not revoke existing rows.",
+    "normal_revoke": "ONE RPC, existing user lock then frontierlock; refuse normal revoke with live publication/history lease, otherwise CAS valid_until=least(valid_until,clock_timestamp()), append audit. No deletion or import reopening.",
+    "emergency_revoke": "Separately explicit emergency wrong-evidence revocation may expire active images, knowingly failing their next exact-frontier checks. Preserve ACK buffers, source evidence, published-object lineage and GC obligations; cannot undo closed baselines or already-published data.",
+    "event_hook": "Privacy/reset/disable/source-revocation invalidation runs INDEPENDENTLY of the attester flag, only within existing authoritative paths that already hold the user fence. Never acquire it from a batch/intent trigger that reverses lock order. No NOWAIT or RAISE for absent frontier; it must not block/refuse a legitimate privacy operation. Use least(existingExpiry,DBnow), never extend validity. Check the history control_receipts statement-trigger callers actually hold fences before attaching any hook. Owner transfer locks both existing fences in fixedrawUTF8tuple order. Missing/malformed external ownership does not license owner creation.",
+    "failure_boundary": "Do not swallow a failed invalidation and report privacy complete. Rollback/cancellation/liveness behavior must be proven in existing authoritative privacy protocol; if a safe bounded hook cannot be provided, that scope remains unavailable for attestation. Existing per-stage custody/privacy fences are never weakened. Every valid privacy change requires manual fresh re-attestation afterward."
+  },
+  "generation_drain_and_operational_cost_B3_A9_C5": {
+    "rebind": "Every sessions migration, including050000, changes generation and strands ALL prior frontiers. Existing rebind moves policy/admissions ONLY; never copy frontier generation. Publication stops until fresh independently approved full re-attestation at final composed generation. This planned publication outage recurs after every later migration and privacy invalidation.",
+    "runbooks": "Follow runbooks/buffered-canonical-drain.md publication-off/lease/quiesce/generation steps, composed with runbooks/guarded-session-schema-release.md. Stop new publication claims, let or explicitly resolve existing publication/history leases, prove no live old-binary work, leave canonicalGC armed, apply/rebind through separately approved window, then fresh source/receipt capture and attest. Do not reuse legacy writer drain or revoke broad EXECUTE without its own qualified plan.",
+    "readonly_census": "Add an owner-preview/readiness aggregate count of total/live/expired/stranded frontier rows by schema_generation and current readiness generation; no user IDs output. READONLY3s/250ms/fullvisibility guard. A count is operational evidence only, not recovery coverage or permission. No production census run is requested by this design.",
+    "window": "Adopt existing049000 FRONTIER_MAX_AGE_SECONDS=300 UNMODIFIED: each initial v3 publication window is human-supervised for at most5min from capture time, not60min. Pin maxJobMs<=120000 and require>=150s remaining at admission; if capture/review/IO cannot fit, HOLD. DBclock verifies expiry/remaining validity and measured skew<=30s; never synthesize now+60min or extend plan expiry.",
+    "volume": "Initial canary authorizes at most ONE stage candidate/batch in one supervised300s window, candidateLimit1, concurrency1; actual record count and elapsed time recorded, no throughput/234237-backlog drain ETA claimed. More volume/concurrency, unattended renewal or longer lifetime requires separately reviewed049000/protocol/runtime plan, not a hidden change in050000. This minimal owner ceremony alone is NOT a scalable bulk-backlog solution.",
+    "renewal": "No daemon or unattended renewal. A fresh full source capture, independent verifier/reviewer approval and ONE guarded RPC are required for every renewed window, with strictly newer expiry and no live leases. Continuously busy origin does not renew; expirefailclosed. Source-plan readiness may be impossible for a costly scope under300s, so reportunavailable rather than relax proof."
+  },
+  "implementation_composition_C2": {
+    "boundary": "Register LaneManifest in scripts/sessions-function-boundary/lanes/ and lanes/index.ts, distinct sessions.ingest_frontier_attest_* prefix. No standalone legacy sync script. Generate exact sessions-function-acl entries, wrappers/SECDEF inventories and schema/runtime role verifiers, no broad ingest/seeder/service_role rights.",
+    "migration_checks": "050000 migration refuses42704 missingrole /55000 LOGIN,elevated,badmembers or privilege shape. Add migration-sentinels.ts, scripts/sessions-function-boundary/verifiers.ts registration and before/after runtimeRoleViolations/phase checks in migrate-guards.ts. Compose final048000 provider bootstrap edits and049000 scopedclaim lock/target contracts; never rewrite merged migrations or skip044000..049000.",
+    "rollback": "Generated supabase/rollbacks/<exact050000stem>.down.sql extraOutput using042000 pattern: refuse with55000 if evidence/audit/data or later migration exists; require disabled and drained, drop own functions/guards/tables and ledger only when empty, revokeUSAGE, KEEPtheNOLOGINrole. No frontier rollback reopens a user baseline."
+  },
+  "owners_and_test_gates_C6": {
+    "assignment_source": "pipeline-lead244929117169602560; confirmations required before code starts",
+    "core050000_and_capture_adapter": "layered-sessions-pipeline registry owner",
+    "independent_verifier_implementation": "codex-relayhistory-verify-replica; implements publishedcontract/vectors independently without reading attesterimplementation",
+    "independent_verifier_review": "neonexit-review-finn",
+    "Cloud_readroute_integration": "relayhistory-cloud-expert with cloud-migration-lead confirming actual Cloud-first scope; lives in actual consumer/relayhistory-cloud repo, not claimed by SQL fixture",
+    "contract_and_vectors_author": "codex-relay-desktop-find-prior, contracts/tests only; not an independent verifier of its own writer",
+    "unit_SQL": [
+      "Existing-owner-missing negative proves NO owner/baseline/seal/evidence/frontier insertion",
+      "Whole-user two-origin recovery gating; firstcanonicalclaim irreversibly closes import despite PUTfailure/revoke",
+      "Producer/verifier codec known-answers, >2^53, invalidnumbers/UTF8/escapes, rawfieldsort vs encodedrow sort, legacy multi-revision keys",
+      "Status+terminal-proof bound even for empty; forged/stale/omitted queue/DLQ proof and approval replay refuse",
+      "Existing prepare.ts digest/receipt and seed-proof winner parity, including resolved equal-revision aliases",
+      "Frontiercolumn/positionalINSERT sentinel, UTCimagehash, appendonly UPDATE/DELETE/TRUNCATE, flagdefaultfalse",
+      "SupabasePG16 explicitSETgranted/nonINHERIT exactmember positive plus wronggrantor/admin/inherit/extra-member/missingrole negatives; RDS/CloudSQL executionunavailable/dormantinventories",
+      "S4 formerqueuedACKmissingNeoncommit/receipt/tombstone/terminalinventory => UNMEASURED wholeuser, never VERIFIED_EMPTY; qualifiedmatchingperACKevidencepositive,247DLQseparate."
+    ],
+    "real_PG_CI": "Add named two-session PostgreSQL17 job in .github/workflows/pg-proof.yml (canonical-consumer-lease job precedent), not PGlite-only. Cover READCOMMITTED lock-wait/newclaim visibility, rejectRR/STABLEhelper, rowlock/CAS races, livepublication ANDhistoryplan renewal refusal, singleRPCboundedfence duration, UTCpools, emergencyrevoke/privacy-hook interleavings and delayedcommit/expiry. publication.postgres.test.ts is not currently enoughCI evidence.",
+    "E2E": "Wire actual migrations+managedroles and versionedMinIO proof-canonical-publication into recorded disposable CI/proof; existing fixed source/seed fixtures are not production completeness. Actual Cloudfirst acceptance needs exact approved-user acceptedreceipt->publishedordinal->intendedCloudreadroute, with no payload logs. Selfhost SQL contract proof is separate; relay-app/relaycontrol follow-on tests are not silently declared complete."
+  },
+  "Khaliq_live_decisions_C7": {
+    "rule": "This document grants no live authority. Registry/peer review is source qualification, not Khaliq approval. Do not ask for approval of an incomplete packet or re-request an action already authorized in this session; bind actual current human authorization to each concrete operation before execution.",
+    "explicit_scoped_OK_required": [
+      "Actual role bootstraps and attester SET membership GRANT on a real database",
+      "Applying050000 or any real schema migration",
+      "Enabling attester CLIflag/server settings or publisher",
+      "Recovery imports and external credentialed evidence pulls outside already authorized scope",
+      "Drain/quiesce/outage windows",
+      "Each live attest/renew/revoke ceremony, especially emergency revocation",
+      "Merges/deployments/consumerflagflips governed by their actual repo workflow and human decisions"
+    ],
+    "no_inference": "Peer quotes of a human decision do not create authority. New IAM/LOGIN/secret consumers or provider membership exceptions are out of thisdesign. ExistingDLQpreservation operation does not authorize frontiers or recovery replay."
+  },
+  "external_inputs_still_unavailable": [
+    "Current authoritative user/all-origin ownership and legitimate initialized owner row",
+    "Complete frozenlegacy source/end-page/control receipt evidence",
+    "Immutable archive/queue/DLQ recovery AND required payload/import-completion proof",
+    "Complete current receipt-seat/stage-root read adapter; presentrunnerHOLD is preserved",
+    "Actual post050000 generation/qualified roles/runtime/capacity and safe timedwindow",
+    "Actual intended Cloudreadroute/backend and per-user receipt/record readback",
+    "Checkable complete drainedpre-switch ACKinventory->Neonreceipt/acceptedrevision comparison (or a separately qualified equivalent immutable recovery path); mainqueue0doesnotclose this."
+  ],
+  "current_separate_incident_evidence": {
+    "main_queue": "Point-in-time0messages at20:55:28Z, notarchiveproof",
+    "DLQ": "247messages prechange; retention4->14days verified20:57:51Z, allothersettingsunchanged, receipt3a6b4fa371cc33546c391007e7e16c747ede0097cb4b55bbc72034c99dac64c2. Exactexpiry/archivecoverageUNKNOWN.",
+    "publication": "234237 currentstagedACKrows allstillbuffered in prioraggregate; notper-user proof. Minimal050000design doesnotclaimfullrepair."
+  },
+  "review_mapping": {
+    "A1": "A1_noncreating_owner_lock +unitnegative",
+    "A2": "A2_C1_role_and_membership explicitPG16GRANT; RDS/CloudSQLexecutiondescope",
+    "C1": "complete_source_inventory +member_exact_verifier",
+    "A3_A4": "writer_RPC_and_snapshot_rules",
+    "A5_A6_A7": "codec_and_independent_evidence withupstreamhashreuse +status/terminal audit",
+    "A8": "flag_and_invalidation",
+    "A9_C3_C4_C5": "source_plan_reuse, existinghashbinding, fixedvector,300soperationalcost,drainandstrandedcount",
+    "C2_C6_C7": "implementation_composition, namedowners/realPGCI, Khaliqlivedecisions",
+    "S4_drained_ACKs": "drained_pre_switch_ACK_coverage_S4; no processing/noexpiry inference from queue0"
+  },
+  "actions_for_this_revision": {
+    "source_reads_and_design_only": true,
+    "new_credentials": 0,
+    "provider_calls": 0,
+    "schema_or_frontier_writes": 0,
+    "code_PR": false,
+    "production_authorization": false
+  },
+  "drained_pre_switch_ACK_coverage_S4": {
+    "peer_report": "Owner244929859055513600 relays infragrok244929790366576640: mainqueue reportedly drained afterNov5 07:05Z unpause. Currentread-onlymainmetrics0 andmodified_on07:05Z are verified; they alone DO NOT establish processing target, success, absenceofexpiry, or immutableperACKcoverage.",
+    "required_evidence": "For every affected user, bind the complete original pre-switch s3_first ACK inventory to actual Neon-side batch receipt/digest and accepted record revision/body decisions, with an immutable evidence row/root and independent verifier comparison. A genuine independently verified archive/recovery receipt can be a separate explicitly qualified path, never an assumption based on queueempty or processed status.",
+    "unavailable_case": "No held complete originalACKinventory, perACK Neon commitment comparison or equivalent qualified immutable recovery evidence currently establishes coverage of the former~12.9k. Therefore affectedusers remain UNMEASURED/notcomplete and VERIFIED_EMPTY-ineligible until verified. The247 retainedDLQ envelopes are a separate remaining cohort;14dayretention is nottheirrecoverycompletion.",
+    "gate": "Drained-source coverage is mandatory in whole-user recovery completion and in approved supplemental component commitments, including status and terminalProofSha256. Missing witnesses cannot be papered over by currentNeon rowcounts, sourcefreeze, a zeroqueue, noDLQmatch, or a plannerREADY for a subset."
+  }
+}

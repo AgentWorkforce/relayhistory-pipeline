@@ -15,7 +15,7 @@ ClickHouse; this list never reads transcript content.
 | --- | --- | --- |
 | source (harness), latest model, counts, tokens, cost, first/last activity, users, machines | `session_directory` (20261030010000) | projector, from `session_index` |
 | project id, repository, branch | `session_directory` | `writeDirectoryCatalog` from the complete raw-record projection; pointer values are a fallback |
-| title | `session_directory.title` | projector (pointer title); the brief writer (feat/model-session-brief) projects the model-written title with precedence |
+| title | `session_directory.title` | native model title, latest pointer title, then current complete recorded catalog title (`recorded_catalog_title`) |
 | short summary | `session_directory.short_summary` (20261030020000) | `writeShortSummary` |
 | **agent names (several per session)** | **`session_directory.agent_names` + `session_directory_agents`** (new) | **`writeDirectoryCatalog`** |
 | **catalog models** | **`session_directory.catalog_models`** (new); the RPC returns them united with the pointer model | `writeDirectoryCatalog` |
@@ -34,14 +34,14 @@ absolute paths, `~`, drive letters, UNC paths and `file:` paths.
 The S3 search-index pass calls `writeDirectoryCatalog` after every complete
 logical-session read. A partial, missing, unscrubbed, conflicting, over-limit,
 or ClickHouse-truncated pass never clears or updates catalog fields. Historical
-sessions still need the controlled re-projection in
-`docs/activation/session-directory-parity-reprojection.md`. Until that backfill
-runs, old catalog fields and parent/child links may be empty, and the list
-**refuses `p_agent`** with `0A000 agent_filter_not_ready` instead of answering
-an empty list. relayhistory-cloud falls back to Neon on that error. An operator
-unlocks it with
+sessions still need the controlled re-projection described in "Backfill"
+below. Until that backfill runs and is verified, old catalog fields and
+parent/child links may be empty, and the list **refuses `p_agent`** with
+`0A000 agent_filter_not_ready` instead of answering an empty list.
+relayhistory-cloud falls back to Neon on that error. An operator unlocks it
+with
 `UPDATE sessions.session_directory_catalog_rollout SET completed_at = now()`
-once the backfill is complete.
+only after the "Backfill" verification passes.
 
 `writeDirectoryCatalog` is one statement. It locks the live directory row
 (`FOR UPDATE`) and joins every write to that lock, so a tombstone either
@@ -102,18 +102,114 @@ never picks it.
 ## Backfill
 
 After the migration, existing rows have empty catalog columns and no agent or
-relationship rows. Two paths are possible, and each is an operator step that
-needs Khaliq's OK, like any write to a real database:
+relationship rows. The backfill is a controlled re-projection of those derived
+fields. It is an operator step that needs Khaliq's OK, like any write to a real
+database; this section describes the procedure and does not authorize it. Keep
+relayhistory-cloud on Neon, or in `shadow` mode for the agent and catalog
+fields, until the activation step below.
 
-1. Replay `writeDirectoryCatalog` from a complete projection of each session's
-   canonical raw objects in object storage, one call per session.
+The canonical raw objects in object storage are the content source of truth.
+Neon is a read-only fallback, used only for sessions that have no complete
+history in object storage.
+
+**Invariants.** The run must:
+
+- never write `unknown` as a directory user; leave the user set empty when no
+  trusted user source exists;
+- never store a local path as a project key or project id
+  (`writeDirectoryCatalog` re-derives its input through
+  `directoryCatalogFromProjection`, which enforces this);
+- never write from a partial, missing, unscrubbed, conflicting, unreadable or
+  over-limit read: record the reason and leave the row unchanged;
+- never leave two live directory rows for the same logical session;
+- never roll back tombstone, erasure, reset, fence or epoch state;
+- never mark the catalog rollout complete before the verification below passes;
+- never write Neon.
+
+**Before.**
+
+1. Confirm the target database has this migration and the later migrations
+   `writeDirectoryCatalog` requires (20261105022000 and 20261105031000)
+   applied, the migration ledger is green, and function grants match
+   `src/hoopdb/sessions-function-acl.json`.
+2. Record, as evidence outside the database, the row counts of
+   `sessions.session_directory`, its companion tables
+   (`session_directory_agents`, `session_directory_users`,
+   `session_directory_machines`, `session_directory_relationships`,
+   `session_directory_resurrection_fences`) and both rollout tables
+   (`session_directory_rollout`, `session_directory_catalog_rollout`),
+   together with the current `event_projection_epoch` values. These tables are
+   never restored from a snapshot by this procedure: tombstones and
+   resurrection fences are monotonic history (migration 20261031001000: a
+   later tombstone only raises a fence, `record_fences` keeps the greatest
+   revision, and only erasure removes them with the row), so overwriting them
+   with earlier rows could bring a deleted session back.
+3. Hold the directory projector queue for the rebuild window so its work can be
+   replayed afterwards. Do not pause canonical object-storage writes.
+4. Dry run, read only: for every live session key, build the catalog as in
+   path 1 below without writing, and report how many would be written and how
+   many are incomplete, by reason. Stop on any identity conflict; resolve those
+   rows explicitly rather than choosing a winner.
+
+**Re-projection.** Process stable `(org_id, workspace_id, harness, session_id)`
+keyset batches. Write each logical session in its own transaction and keep an
+external checkpoint with counts.
+
+1. Default path: read every live manifest and verified raw chunk of the
+   session, project the complete record set with `projectRelayhistorySession`
+   (`packages/pipeline`), build the catalog with
+   `directoryCatalogFromProjection`, and call
+   `writeDirectoryCatalog(tx, key, catalog, { expectedEpoch })` with the epoch
+   read for that key. This is the same call the S3 search-index pass makes
+   (`src/session-pipeline/search-index.ts`). A `{ written: false }` result (a
+   stale epoch) is left for a later batch, never forced.
 2. For sessions that only Neon knows, copy from Neon `sessions.session_catalog`,
    `session_catalog_agents` and `session_relationships` (read-only role) into
    `writeDirectoryCatalog` inputs. Neon keeps one agent per session (0058
    primary key).
+3. Desktop-catalog parents that migration 20261105031000 marks pending are
+   drained with the bounded, resumable driver in
+   `src/hoopdb/session-desktop-catalog-reproject.ts` (schema owner connection
+   only).
 
-Until the backfill is done, relayhistory-cloud should stay in `shadow` mode for
-the agent and catalog fields.
+Rate-limit batches by database latency, lock wait, queue age and error rate.
+Stop on any collision, unexpected deletion, dead-letter growth, sustained lock
+pressure or rising mismatch rate, and resume only from the last committed
+checkpoint.
+
+**Verify.** After replaying the held projector work, produce tenant- and
+harness-sliced reports and require:
+
+- no duplicate logical sessions and no `unknown` directory user;
+- every directory machine maps to exactly one live pointer;
+- project id, project key, repository, branch, agent and user filters match
+  Neon for at least 95% of page-1 sessions, with every remaining mismatch
+  classified;
+- `src/hoopdb/__tests__/session-directory-list.test.ts` passes for the deployed
+  code;
+- pagination has no repeats, skips or cursor loops, and queue, dead-letter and
+  query-plan gates stay green;
+- at least 48 hours of list traffic in shadow, comparing keys, ordering,
+  filters and hydrated fields with Neon.
+
+**Activate.** Only after every check passes, and with approval, set
+`session_directory_catalog_rollout.completed_at` (above) and then change
+`LIST_BACKEND`.
+
+**Recovery.** This procedure has no snapshot restore. Before activation, a
+wrong or incomplete re-projection is corrected by re-running step 1 for the
+affected keys: `writeDirectoryCatalog` rewrites only derived catalog fields,
+under the row lock and the expected epoch, and writes nothing for a row that a
+tombstone has claimed. After activation, first return `LIST_BACKEND` to Neon
+and keep the mismatch evidence, then correct derived fields the same way. Any
+recovery that would change tombstone, erasure, reset, fence or epoch state is
+outside this document and needs a schema-owner-reviewed operator procedure,
+backed by isolated tests that delete or reset after a snapshot and replay late
+pointer events, proving that nothing deleted comes back. Never mutate Neon
+during recovery.
+
+A hosted operator copy of this plan, with deployment-specific details, is kept
+privately. It is optional context and is not needed to follow this section.
 
 ## Gaps, not in this migration
 
@@ -132,3 +228,30 @@ the agent and catalog fields.
   `search_session_directory` and is not here. The brief `generated_at`
   lives in `session_briefs`, owned by feat/model-session-brief. This RPC
   returns `short_summary_generated_at`.
+
+
+### Recorded title fallback (044100)
+
+The complete canonical catalog supplies its existing scrubbed `title` metadata to
+`recorded_catalog_title`; the list still serves `title` through its existing RPC.
+Both catalog writer paths bind the physical source to the logical session, current
+event epoch, live row and ready projection. Display priority is the native model
+brief, latest live pointer, then the recorded title. Replays and model quarantine
+recompute that priority instead of retaining a previous generated value.
+
+The recorded title is at most 90 UTF-16 code units, trimmed, and contains no control
+characters. Invalid titles are not inferred from prompts or transcript text. Source
+invalidation (including an epoch transition left marked ready) and tombstones clear
+the recorded slot; a new complete projection must
+rebuild it. If an authoritative title equals the invalidated recorded value, the
+trigger conservatively clears the displayed copy until the normal priority projector
+recomputes it; equality never decides normal ready publication priority.
+This adds no model call, project-ID inference, object read per list row,
+or database privilege. Local paths remain excluded from project IDs/keys.
+
+The storage and invoker-only invalidation trigger are part of the summary read
+migration, `20261105044100_session_brief_summary_read.sql`. Complete canonical
+replays also clear a removed or invalid recorded title at the same source epoch.
+A denied schema-metadata read fails closed; pre-044100 no-title metadata callers
+retain their prior behavior. Deployments require this migration's exact generation,
+rollback and boundary manifest qualification.

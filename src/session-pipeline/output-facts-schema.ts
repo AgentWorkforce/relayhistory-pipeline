@@ -2,9 +2,10 @@
  * ClickHouse DDL for Output (`GET /v1/sessions/output`) and the daily digest
  * (`GET /v1/digest/daily`) off Neon. Design: docs/output-digest-clickhouse-design.md.
  *
- * DORMANT SKELETON. Nothing applies these statements: no deploy, migration
- * runner or Worker imports this module. It exists so the shape is reviewed and
- * exercised against a real ClickHouse in CI before any producer is written.
+ * DORMANT. Nothing applies these statements: no deploy or migration runner
+ * imports this module. The producer (output-facts.ts, default off behind
+ * SEARCH_INDEX_OUTPUT_FACTS=1) and the read route (session-read-api/output-query.ts,
+ * default off behind READ_API_OUTPUT_ENABLED=1) assume the owner applied them.
  *
  * Why sibling tables, not new columns on `transcript_events`: that table's DDL
  * is a verbatim copy owned by relayhistory-cloud (vendor/search-index/SOURCE.json,
@@ -39,8 +40,12 @@
 
 export const EVENT_FACTS_TABLE = "transcript_event_facts";
 export const OUTPUT_FACTS_TABLE = "session_output_facts";
+/** Per-workspace completeness watermark, written only by the operator backfill. */
+export const OUTPUT_FACTS_STATE_TABLE = "output_facts_workspace_state";
+/** Per-session facts state, written by every producer pass (output-facts.ts). */
+export const OUTPUT_FACTS_SESSION_STATE_TABLE = "output_facts_session_state";
 
-export const OUTPUT_FACTS_SCHEMA_VERSION = 1;
+export const OUTPUT_FACTS_SCHEMA_VERSION = 4;
 
 /** `session_output_facts.fact_kind` values. */
 export const OUTPUT_FACT_KINDS = ["message", "legacy_turn_message", "commit", "outcome"] as const;
@@ -64,6 +69,12 @@ export function outputFactsSchemaStatements(): string[] {
     project_id             Nullable(String),
     -- task_ref->>'id' (display only) and the branch after its FIRST '@' (rollups.ts branchSql).
     task_ref_id            Nullable(String),
+    -- 1 when task_ref is '{}' (branchSql's NULL case); kept for the epic rollup's key.
+    task_ref_empty         UInt8 DEFAULT 0,
+    -- The whole task_ref as canonical (key-sorted) JSON, for the digest sessions' taskRefs.
+    task_ref_json          String DEFAULT '{}',
+    task_title             Nullable(String),
+    user_id                Nullable(String),
     branch                 Nullable(String),
     model                  Nullable(String),
     provider               Nullable(String),
@@ -76,8 +87,11 @@ export function outputFactsSchemaStatements(): string[] {
     cache_create_1h_tokens Nullable(Int64),
     -- NULL = no cost reported (relayhistory 0021); sum() skips it as Postgres does.
     cost_usd_micros        Nullable(Int64),
-    files_touched          Array(String),
+    -- jsonb_array_elements_text: a JSON null element is a NULL path, counted as one.
+    files_touched          Array(Nullable(String)),
     retention_days         UInt16 DEFAULT 0,
+    -- sha256 of the identity (the ORDER BY key minus tenant): reconcile deletes by it.
+    row_id                 String,
     fingerprint            String,
     version                UInt64,
     INDEX session_bf session_id TYPE bloom_filter(0.001) GRANULARITY 1,
@@ -96,6 +110,9 @@ SETTINGS index_granularity = 1024`,
     -- message/legacy_turn_message/tool_result: the event time (window-filtered before dedup).
     -- commit_link: coalesce(linked_at, received_at); outcome: coalesce(shipped_at, created_at).
     ts             DateTime64(6, 'UTC'),
+    -- The indexed scope's harness. Differs from source only for a legacy turn whose
+    -- stored (overloaded) conversation_turns.source is not the harness.
+    scope_source   LowCardinality(String),
     source         LowCardinality(String),
     session_id     String,
     -- message: coalesce(request_key, payload.message_id, delivery_record_id, machine_id:event_id);
@@ -110,6 +127,7 @@ SETTINGS index_granularity = 1024`,
     -- outcome rows only: session_outcomes.reverted.
     reverted       UInt8 DEFAULT 0,
     retention_days UInt16 DEFAULT 0,
+    row_id         String,
     fingerprint    String,
     version        UInt64,
     INDEX session_bf session_id TYPE bloom_filter(0.001) GRANULARITY 1,
@@ -120,5 +138,60 @@ PARTITION BY toYYYYMM(ts)
 ORDER BY (org_id, workspace_id, fact_kind, ts, source, session_id, fact_key, origin, row_key)
 -- TTL toDateTime(ts) + toIntervalDay(retention_days) WHERE retention_days > 0
 SETTINGS index_granularity = 1024`,
+    // One row per workspace the backfill has covered completely. `complete_since`:
+    // facts are exact for every scope indexed at or after it (the backfill start).
+    // The read route serves a workspace only with a row here.
+    `CREATE TABLE IF NOT EXISTS ${OUTPUT_FACTS_STATE_TABLE}
+(
+    org_id         LowCardinality(String),
+    workspace_id   String,
+    complete_since DateTime64(6, 'UTC'),
+    marked_at      DateTime64(3, 'UTC'),
+    marked_by      String,
+    version        UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY (org_id, workspace_id)`,
+    // One row per indexed scope (version = 2 * pass ms + phase, so a pass's final row beats its
+    // pending row): complete = 0 when its last pass could not write exact
+    // facts (incomplete read, invalid legacy evidence, truncation). Kept apart from the
+    // search state (needs_full) so a facts problem never degrades transcript search.
+    // The Output route answers 501 while any session of the workspace is incomplete.
+    `CREATE TABLE IF NOT EXISTS ${OUTPUT_FACTS_SESSION_STATE_TABLE}
+(
+    org_id         LowCardinality(String),
+    workspace_id   String,
+    source         LowCardinality(String),
+    session_id     String,
+    complete       UInt8,
+    synced_at      DateTime64(3, 'UTC'),
+    -- The scope's facts span; the Output route blocks only windows it overlaps. NULL =
+    -- unknown (no pass has computed it yet), which blocks every window.
+    min_ts         Nullable(DateTime64(6, 'UTC')),
+    max_ts         Nullable(DateTime64(6, 'UTC')),
+    version        UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY (org_id, workspace_id, source, session_id)`,
+  ];
+}
+
+/**
+ * Idempotent upgrades for a table created from an older copy of this file (CREATE TABLE IF NOT
+ * EXISTS never alters one). Apply after outputFactsSchemaStatements(); a no-op on current tables.
+ * The producer's schema probe (output-facts.ts outputFactsSchema) refuses to write until every
+ * column below exists.
+ */
+export function outputFactsUpgradeStatements(): string[] {
+  return [
+    `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS task_ref_empty UInt8 DEFAULT 0`,
+    `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS task_ref_json String DEFAULT '{}'`,
+    `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS task_title Nullable(String)`,
+    `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS user_id Nullable(String)`,
+    `ALTER TABLE ${EVENT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS row_id String`,
+    `ALTER TABLE ${OUTPUT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS scope_source LowCardinality(String)`,
+    `ALTER TABLE ${OUTPUT_FACTS_TABLE} ADD COLUMN IF NOT EXISTS row_id String`,
+    `ALTER TABLE ${OUTPUT_FACTS_SESSION_STATE_TABLE} ADD COLUMN IF NOT EXISTS min_ts Nullable(DateTime64(6, 'UTC'))`,
+    `ALTER TABLE ${OUTPUT_FACTS_SESSION_STATE_TABLE} ADD COLUMN IF NOT EXISTS max_ts Nullable(DateTime64(6, 'UTC'))`,
   ];
 }
