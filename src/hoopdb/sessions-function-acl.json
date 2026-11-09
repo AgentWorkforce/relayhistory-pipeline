@@ -436,6 +436,12 @@
     "sessions.ingest_digest(jsonb)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_erase_fence_extend(text,text,text,text,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_erase_fence_index_guard()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_exact_keys(jsonb,text[])": [
       "<owner>:EXECUTE"
     ],

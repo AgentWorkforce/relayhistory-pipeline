@@ -25,6 +25,7 @@ import { bufferedSearchGateRetiredWitness } from "./buffered-search-gate-retired
 import { selfhostSessionSelectionErase } from "./selfhost-session-selection-erase.ts";
 import { selfhostEraseLockFences } from "./selfhost-erase-lock-fences.ts";
 import { operatorSessionErase } from "./operator-session-erase.ts";
+import { operatorSessionEraseFenceCheck } from "./operator-session-erase-fence-check.ts";
 
 /** Every lane the unified generator composes. Order does not affect the output. */
-export const LANES: readonly LaneManifest[] = [briefDocuments, ingestHistory, readApi, readApiTokens, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention, briefTitles, lazyClaimClockNarrowing, ownerBufferedRead, lazyAckClockNoKeyUpdate, acquisitionOwner, bufferedSearchGate, bufferedSearchFeed, ingestBookkeepingCleanup, bufferedSearchGateRetiredWitness, selfhostSessionSelectionErase, selfhostEraseLockFences, operatorSessionErase];
+export const LANES: readonly LaneManifest[] = [briefDocuments, ingestHistory, readApi, readApiTokens, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention, briefTitles, lazyClaimClockNarrowing, ownerBufferedRead, lazyAckClockNoKeyUpdate, acquisitionOwner, bufferedSearchGate, bufferedSearchFeed, ingestBookkeepingCleanup, bufferedSearchGateRetiredWitness, selfhostSessionSelectionErase, selfhostEraseLockFences, operatorSessionErase, operatorSessionEraseFenceCheck];

@@ -403,6 +403,8 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105043910_selfhost_session_selection_erase.sql` | function sessions.ingest_selfhost_set_session_uploads |
 | `upstream:20261105044000_read_api_tokens.sql` | table sessions.read_api_tokens |
 | `upstream:20261105044010_selfhost_erase_lock_fences.sql` | replacement: ingest_selfhost_set_session_uploads takes the user's fence lock before reading ownership |
+| `upstream:20261105050000_operator_session_erase.sql` | table sessions.session_erasure_receipts (operator per-session erase) |
+| `upstream:20261105050010_operator_session_erase_fence_check.sql` | trigger ingest_erase_fence_index_guard on sessions.session_index; claim/commit call ingest_erase_fence_extend |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
