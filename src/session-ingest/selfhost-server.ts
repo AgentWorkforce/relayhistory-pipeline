@@ -53,7 +53,8 @@
  *          (x-relay-admission {"version":1,"state":"queued"}) after ONE create-only inbox PUT. The request
  *          path makes no SQL call at all (and never falls back to the synchronous path: a failure is a 503
  *          with nothing acknowledged). The authorization dependency is unchanged: one relaycontrol
- *          introspection per request, no positive cache. An in-process consumer (selfhost-admission.ts)
+ *          introspection per request, no positive cache by default (RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS,
+ *          selfhost-auth.ts, opts into a bounded one). An in-process consumer (selfhost-admission.ts)
  *          admits the inbox through the hosted admitMessage. Startup refuses a Locker backend that does not
  *          honour conditional writes (locker.ts assertConditionalWrites). /readyz follows the consumer.
  *   drain  the synchronous request path again, while the consumer keeps admitting the inbox.
@@ -413,7 +414,10 @@ export async function admissionStartupGate(settings: Pick<SelfhostIngestSettings
 
 export type RuntimeBuilder = (settings: SelfhostIngestSettings, env: NodeJS.ProcessEnv) => Promise<SelfhostIngestRuntime>;
 
-/** Production: pg pool, Locker store, relaycontrol introspection with no positive cache. */
+/**
+ * Production: pg pool, Locker store, relaycontrol introspection with no positive cache unless
+ * RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS sets one (settings.introspectPositiveTtlMs, selfhost-auth.ts).
+ */
 export const productionRuntime: RuntimeBuilder = async (settings, env) => {
   const pool = new pg.Pool({
     ...settings.pool,
