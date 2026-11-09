@@ -36,6 +36,14 @@ name: deploy session-read-worker
 # owner_buffered render without it. Turning it on is a production change: dispatch is Khaliq's
 # call. Every later dispatch without the input turns it off again.
 #
+# owner_buffered_stage_concurrency=2..32 and owner_buffered_phase_log=on (valid only with
+# owner_buffered_events=on; the render refuses them otherwise) add
+# READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY=<n> (at most n S3 stage GetObjects in flight per
+# owner-buffered events read; the authority checks keep their order) and
+# READ_API_OWNER_BUFFERED_PHASE_LOG=1 (per-phase *_ms fields on the request log line). off (or no
+# input) renders exactly the render without them. Dispatch is Khaliq's call; every later dispatch
+# without the inputs turns them off again.
+#
 # Buffered search gate (src/session-read-api/buffered-search-gate.ts, PR #338), default off.
 # buffered_search_gate=off (or no input) changes nothing: the render is byte-identical to the one
 # before this input existed. buffered_search_gate=on renders READ_API_BUFFERED_SEARCH_GATE=on and
@@ -62,6 +70,15 @@ on:
         default: ""
       owner_buffered_events:
         description: Owner-buffered session events (GET /v1/sessions/:id/events with source); valid only with owner_buffered=on. off = exactly the owner_buffered render
+        type: choice
+        options: ["off", "on"]
+        default: "off"
+      owner_buffered_stage_concurrency:
+        description: 'Owner-buffered events: S3 stage GetObjects in flight, "off" or an integer 2..32; valid only with owner_buffered_events=on. off = the serial fetch'
+        type: string
+        default: "off"
+      owner_buffered_phase_log:
+        description: Owner-buffered events per-phase log fields; valid only with owner_buffered_events=on. off = exactly the render without them
         type: choice
         options: ["off", "on"]
         default: "off"
@@ -106,6 +123,9 @@ jobs:
       OWNER_BUFFERED_S3_REGION: ${{ vars.SESSION_READ_INGEST_S3_REGION }}
       # Owner-buffered session events (default off); the render refuses on without owner_buffered=on.
       OWNER_BUFFERED_EVENTS: ${{ inputs.owner_buffered_events }}
+      # Owner-buffered events latency (default off); the render refuses either without owner_buffered_events=on.
+      OWNER_BUFFERED_STAGE_CONCURRENCY: ${{ inputs.owner_buffered_stage_concurrency }}
+      OWNER_BUFFERED_PHASE_LOG: ${{ inputs.owner_buffered_phase_log }}
       # Buffered search gate (default off); renders the flag and the pinned binding when on.
       BUFFERED_SEARCH_GATE: ${{ inputs.buffered_search_gate }}
     defaults:

@@ -138,6 +138,7 @@ Request (exact keys, refused otherwise, with `identifier` rules from `app.ts` l.
 - **Per-session erase ships separately.** The per-session erase (`sessions:[{source,session_id}]`) ships as a separate,
   held, default-off PR. It covers ClickHouse rows, S3 copies, buffered/staged copies, search docs, directory rows and
   PR evidence, under the same fence and witness as reset, consistent with the R2 v5.3 privacy gate.
+  Its Control-to-ingest contract is `docs/operator-session-erase-contract.md`.
 - **Concurrency.**
   - **Same user, same `request_id`, in flight:** a second call while the head is pending with the same digest gets the
     pending head back (`apply:false`, migration l.488-493). The route re-drives fence and complete, which is safe because

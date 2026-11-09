@@ -99,7 +99,7 @@ no rewriting.
 | 4 | `/v1/delivery/*`, `/v1/turns/*` | session-ingest | `POST /v1/delivery/batches`, `GET /v1/delivery/limits`, `POST /v1/delivery/recovery`, `POST /v1/delivery/sessions/{selection,reset}`, `POST /v1/turns/batches` |
 | 5 | `/v1/onboarding/*` | session-ingest | `POST /v1/onboarding/heartbeat`, `GET /v1/onboarding/connection` |
 | 5a | `POST /v1/auth/token/refresh` (exact) | session-ingest | always 401 `refresh_not_supported`. Required: without it the Desktop's refresh gets this table's 404, which it treats as an outage, and uploads stop when the token expires |
-| 6 | anything else, including `/healthz`, `/readyz`, `/health`, `/v1/custody/*` | **none (404 at the edge)** | probes and custody are internal |
+| 6 | anything else, including `/healthz`, `/readyz`, `/health`, `/v1/custody/*`, `/internal/*` | **none (404 at the edge)** | probes, custody and operator routes are internal |
 
 Requirements on the router:
 
@@ -117,7 +117,8 @@ Requirements on the router:
 - Terminate TLS at the edge. Upstream hops may be plain http to Service DNS
   names only when the service sets `ALLOW_IN_CLUSTER_HTTP=true`.
 - Internal-only, never routed publicly: every probe port (8081, plus read-api
-  `/healthz`), `/v1/custody/*`, and `hoopdb-migrate`.
+  `/healthz`), `/v1/custody/*`, `/internal/*` (the operator session-erase route,
+  `docs/operator-session-erase-contract.md`), and `hoopdb-migrate`.
 
 ### Control audience
 
@@ -173,6 +174,12 @@ the original sketch below in four ways:
   session-ingest upload path only; another user's copy is untouched, an origin
   first used after the erase is not fenced, and a session not yet indexed has
   no pointer to tombstone.
+- Operator session erase: `/internal/v1/session-erase/...`
+  (`docs/operator-session-erase-contract.md`) is reachable only from inside the
+  cluster, for relay-control. The wrapper forwards GET and POST (other methods: 405) to the app without
+  relaycontrol introspection; the app checks its own bearer,
+  `SESSION_ERASE_API_SECRET`. It is default off (`SESSION_ERASE_API_ENABLED`),
+  and today it always answers 501 `not_implemented`, even when enabled.
 
 At startup it admits only a real login of `bulls96_session_ingest` with the
 bootstrap's role shape.
@@ -251,13 +258,15 @@ Order (plain Postgres or CNPG, `HOOPDB_DB_MODE=selfhosted`):
 ## 5. Env, Secret and CA names
 
 Every flag is strict: exactly `true` enables, unset or `false` is off, and
-anything else fails startup.
+anything else fails startup. One exception: `SESSION_ERASE_API_ENABLED` shares
+its value with the hosted Worker, so it is exactly `1` (unset, empty or `0` is
+off; anything else, `true` included, fails startup).
 
 | SERVICE | Flag | Required when enabled | Secret material (from the secret store, never on disk) |
 | --- | --- | --- | --- |
 | `session-read-api` | `RELAYHISTORY_SELFHOST_READ_API` | `READ_API_ORIGIN`, `READ_API_COMPLETE_SINCE` (ISO or `epoch`), `READ_API_DIRECTORY_WORKSPACES` (canary allowlist; login answers 501 for an unlisted workspace), `SEARCH_INDEX_BACKEND` (`postgres`), `SEARCH_INDEX_POSTGRES_BACKEND_ID`, `SESSION_POSTGRES_TLS_PROFILE`, the relaycontrol trio in section 2, optional `ALLOW_IN_CLUSTER_HTTP`, `RELAYHISTORY_READ_API_PORT` | `RELAYHISTORY_READ_API_SECRET` (JSON `{supabase_url}`; no `clickhouse` with `postgres`), `RELAYCONTROL_INTROSPECT_SECRET` |
 | `session-publication` | `INGEST_PUBLISH_ENABLED` | `INGEST_PUBLISH_{BUCKET,EXPECT_GENERATION,AWS_ACCOUNT_ID,SUPABASE_PROJECT_REF,INSTANCE_ID,SECRET_ARN,KMS_KEY_ARN,INSTANCE_PROFILE_ARN,ROLE_NAME}`, `AWS_REGION=us-east-1`, `HOOPDB_DB_MODE=supabase`, optional `INGEST_PUBLISH_BUDGET_MS`, `INGEST_PUBLISH_BATCH_LIMIT`, `WORKER_HEALTH_PORT` | none in env: IMDSv2 plus Secrets Manager (see the caveat in section 1) |
-| `session-ingest` | `RELAYHISTORY_SELFHOST_INGEST` | `RELAYHISTORY_INGEST_ORIGIN`, `RELAYCONTROL_INTROSPECT_URL`, `RELAYHISTORY_INGEST_DATABASE_URL`, `SESSION_POSTGRES_TLS_PROFILE`, `LOCKER_BUCKET` (+ Locker endpoint/region or Pod Identity/GCS), optional `RELAYHISTORY_INGEST_PORT`, `INGEST_KEY_ROOT`, `INGEST_MAX_PER_USER`, `INGEST_MAX_PER_ORG`, `RELAYHISTORY_INGEST_PG_POOL_MAX`, `ALLOW_IN_CLUSTER_HTTP`, `SELFHOST_INGEST_ADMISSION` (`sync` default, `async`, `drain`) with `SELFHOST_ADMISSION_CONCURRENCY` / `_SCAN_MS` / `_MAX_ATTEMPTS` | `RELAYCONTROL_INTROSPECT_SECRET`, `RELAYHISTORY_INGEST_DATABASE_URL` (password), Locker keys |
+| `session-ingest` | `RELAYHISTORY_SELFHOST_INGEST` | `RELAYHISTORY_INGEST_ORIGIN`, `RELAYCONTROL_INTROSPECT_URL`, `RELAYHISTORY_INGEST_DATABASE_URL`, `SESSION_POSTGRES_TLS_PROFILE`, `LOCKER_BUCKET` (+ Locker endpoint/region or Pod Identity/GCS), optional `RELAYHISTORY_INGEST_PORT`, `INGEST_KEY_ROOT`, `INGEST_MAX_PER_USER`, `INGEST_MAX_PER_ORG`, `RELAYHISTORY_INGEST_PG_POOL_MAX`, `ALLOW_IN_CLUSTER_HTTP`, `SELFHOST_INGEST_ADMISSION` (`sync` default, `async`, `drain`) with `SELFHOST_ADMISSION_CONCURRENCY` / `_SCAN_MS` / `_MAX_ATTEMPTS`, `SESSION_ERASE_API_ENABLED` (`1`; default off) | `RELAYCONTROL_INTROSPECT_SECRET`, `RELAYHISTORY_INGEST_DATABASE_URL` (password), Locker keys, `SESSION_ERASE_API_SECRET` (+ `_PREVIOUS` during a rotation; at least 32 characters; only read when the erase flag is on) |
 | `session-erase-bytes` (Job) | `SESSION_ERASE_BYTES_ENABLED` (exactly `1`; see below) | `SESSION_ERASE_S3_BUCKET`, `SESSION_ERASE_S3_REGION`, `SESSION_ERASE_REQUEST_FILE`, optional `SESSION_ERASE_S3_ENDPOINT` (bare origin; https, loopback, or a Service name with `ALLOW_IN_CLUSTER_HTTP`), `SESSION_ERASE_KEY_ROOT` (default `96bulls`, must equal `INGEST_KEY_ROOT`), `SESSION_ERASE_DRY_RUN` (`1` = list and count only), `SESSION_ERASE_CONCURRENCY` (1..16, default 4) | `SESSION_ERASE_S3_ACCESS_KEY_ID[_FILE]`, `SESSION_ERASE_S3_SECRET_ACCESS_KEY[_FILE]`: a separate eraser key (ListBucketVersions + DeleteObjectVersion on the key root), not the ingest writer's key |
 | workers | per service (`docs/local-stack.md`) | `HOOPDB_URL`, `WORKER_HEALTH_PORT` | `HOOPDB_URL` password |
 

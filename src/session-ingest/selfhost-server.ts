@@ -19,6 +19,10 @@
  *                              per-session erase (enabled:false; enabled:true answers 400 unsupported_by_backend). The app.ts handler is
  *                              unchanged; the ledger's setSessionUploads fences and tombstones every origin of the caller's session in one transaction
  *                              (migration 043910). 404 afterwards means unreadable, not bytes gone.
+ *   POST|GET /internal/v1/session-erase/...  operator per-session erase (session-erase.ts). Forwarded to the app
+ *                              WITHOUT relaycontrol introspection: the app checks its own bearer
+ *                              (SESSION_ERASE_API_SECRET). Default off: 501 not_implemented. Internal only;
+ *                              the edge must never route /internal/* (docs/selfhost-composition.md section 2).
  *   any other /v1 path         501 unsupported_by_backend (reset, recovery, custody,
  *                              onboarding are relayhistory-internal and not served self-host)
  *
@@ -71,6 +75,7 @@ import { sqlLedger } from "./ledger-sql.ts";
 import type { SqlRun } from "./ledger-sql.ts";
 import { relaycontrolIngestIdentity, selfhostIntrospector } from "./selfhost-auth.ts";
 import { SELFHOST_INGEST_ROLE, selfhostIngestConfig, type SelfhostIngestSettings } from "./selfhost-config.ts";
+import { isSessionErasePath } from "./session-erase.ts";
 
 type FetchApp = { fetch(req: Request): Response | Promise<Response> };
 
@@ -143,7 +148,7 @@ export interface SelfhostRuntimeOptions {
 }
 
 /** The ingest app over the given parts. Canonical acceptance, inline writes, no fan-out, no replica, no custody. */
-export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
+export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
   const sessionSelection = settings.sessionSelection === true;
   const verified = new WeakMap<Request, IngestIdentity>();
   const deliver: DeliverDeps = {
@@ -160,11 +165,13 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     if (!identity) throw new AuthError(401, "missing_authorization", "missing Authorization header");
     return identity;
   };
+  // SESSION_ERASE_API_ENABLED (session-erase.ts): the same operator route in every admission mode.
+  const sessionErase = settings.sessionErase ? { sessionErase: settings.sessionErase } : {};
   const routes = sessionSelection ? Object.freeze({ ...SELFHOST_INGEST_ROUTES, [SELFHOST_SESSION_SELECTION_PATH]: "POST" as const }) : SELFHOST_INGEST_ROUTES;
   const admission = settings.admission;
   if (!admission) {
     // SELFHOST_INGEST_ADMISSION=sync (the default): exactly the app this file always built.
-    const app = createIngestApp({ identify, deliver, log: (fields) => log.info("session ingest", fields) });
+    const app = createIngestApp({ identify, deliver, log: (fields) => log.info("session ingest", fields), ...sessionErase });
     return { app, routes, verify: parts.verify, bind: (request, identity) => void verified.set(request, identity), ready: parts.ready, close: parts.close, admissionMode: "sync" };
   }
   const mode = admission.mode === "async" ? "on" as const : "drain" as const;
@@ -188,6 +195,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
       // journal's 503 (a disable needs no journal: the consumer's claim filters the session).
       selfhost: { identityOf: (request) => verified.get(request), reEnableRefusedByLedger: sessionSelection },
     },
+    ...sessionErase,
   });
   if (options.startConsumer !== false) consumer.start();
   return {
@@ -452,18 +460,24 @@ export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null):
           await drainSmallBody(req);
           return sendJson(req, res, 401, envelope("refresh_not_supported", "this session cannot be refreshed; sign in again", correlationId), { "www-authenticate": "Bearer", "x-correlation-id": correlationId });
         }
-        const method = runtime.routes[path];
+        // The operator erase route authenticates its own bearer in the app (session-erase.ts), never through
+        // relaycontrol introspection, and has no tenant identity: forward it as is. Only GET and POST are
+        // forwarded; any other method is refused here (405, Allow: GET, POST) and never reaches the app.
+        const erase = isSessionErasePath(path);
+        const method = erase ? (req.method === "POST" ? "POST" : "GET") : runtime.routes[path];
         if (!method) {
           if (path.startsWith("/v1/"))
             return sendJson(req, res, 501, envelope("unsupported_by_backend", "this route is not served by the self-host session ingest", correlationId, { reason: "route_not_served_selfhost" }), { "x-correlation-id": correlationId });
           return sendJson(req, res, 404, envelope("not_found", "not found", correlationId), { "x-correlation-id": correlationId });
         }
-        if (req.method !== method)
-          return sendJson(req, res, 405, envelope("method_not_allowed", `${method} only`, correlationId), { allow: method, "x-correlation-id": correlationId });
+        if (req.method !== method) {
+          const allow = erase ? "GET, POST" : method;
+          return sendJson(req, res, 405, envelope("method_not_allowed", `${allow} only`, correlationId), { allow, "x-correlation-id": correlationId });
+        }
 
         // Identity before any body byte is read.
-        let identity: IngestIdentity;
-        try {
+        let identity: IngestIdentity | undefined;
+        if (!erase) try {
           identity = await runtime.verify(req.headers.authorization);
         } catch (error) {
           const e = error instanceof AuthError ? error : new AuthError(503, "relaycontrol_unavailable", "token introspection is unavailable");
@@ -477,7 +491,7 @@ export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null):
 
         const headers = new Headers();
         for (const [k, v] of Object.entries(req.headers)) {
-          if (v === undefined || k === IDENTITY_HEADER || k === SIGNATURE_HEADER || k === "authorization") continue;
+          if (v === undefined || k === IDENTITY_HEADER || k === SIGNATURE_HEADER || (k === "authorization" && !erase)) continue;
           if (Array.isArray(v)) for (const i of v) headers.append(k, i);
           else headers.set(k, v);
         }
@@ -489,7 +503,7 @@ export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null):
           headers,
           ...(post ? { body: Readable.toWeb(req) as unknown as ReadableStream<Uint8Array>, duplex: "half" } : {}),
         } as RequestInit);
-        runtime.bind(request, identity);
+        if (identity) runtime.bind(request, identity);
         const response = await runtime.app.fetch(request);
         const out: Record<string, string> = {};
         response.headers.forEach((v, k) => (out[k] = v));
