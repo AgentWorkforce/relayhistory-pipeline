@@ -35,6 +35,7 @@ import {
   SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS,
   SUPABASE_PLATFORM_SUPERUSERS,
 } from "../migrate-guards.ts";
+import * as migrateGuards from "../migrate-guards.ts";
 import { gateOpen, workerTick } from "../../shared/worker.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
 import {
@@ -128,6 +129,15 @@ test("managed-provider bootstrap fixed-role inventories stay equal", () => {
     declaredRoles("cloudsql_migration_roles.sql"),
   );
 });
+
+/** Upstream plan steps ordered after 20261105044020 (a database "before 044020" must hold none: that is a ledger gap). */
+const CB_STEP = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
+const laterUpstream = (steps: Array<{ name: string }>) => steps.filter((s) => s.name.startsWith("upstream:") && s.name > CB_STEP);
+/** Roll back every upstream step after 044020, newest first, so 044020 is the newest applied step again. */
+async function rollbackLaterThan044020(db: PGlite, profile: MigrationProfile) {
+  for (const { name } of laterUpstream(await plan(profile)).reverse())
+    await db.exec(readFileSync(join(root, "supabase/rollbacks", `${name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`), "utf8"));
+}
 
 describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
   const base = {
@@ -2370,6 +2380,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).toContain(SL);
     expect(await relation("sessions.read_api_tokens")).toBe("sessions.read_api_tokens");
     expect(await relation("sessions.ingest_seed_captures_org_id_idx")).toBe("sessions.ingest_seed_captures_org_id_idx");
+    // Every later upstream step is already rolled back here (044030, explicitly above), so no helper call.
+    const laterNames = (await plan(SUPA_ET)).filter((s) => s.name.startsWith("upstream:") && s.name > CB).map((s) => s.name);
+    expect((await names()).filter((n) => laterNames.includes(n))).toEqual([]);
     await rollback("20261105044020_claim_bootstrap_org_indexes.down.sql");
     expect(await names()).not.toContain(CB);
     expect(await relation("sessions.ingest_seed_captures_org_id_idx")).toBeNull();
@@ -2776,8 +2789,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
 
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
-    // Newer than 043900, so its down refuses until they are rolled back, newest first: 044030, 044020, 044010, 044000, 043910.
-    const overlapDown = readFileSync(join(root, "supabase/rollbacks/20261105044030_ingest_generation_overlap.down.sql"), "utf8");
+    // Newer than 043900, so its down refuses until they are rolled back, newest first: every upstream step after
+    // 044020 (rollbackLaterThan044020: 044030), then 044020, 044010, 044000, 043910.
     const orgIndexesDown = readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8");
     const lockDown = readFileSync(join(root, "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql"), "utf8");
     const readTokensDown = readFileSync(join(root, "supabase/rollbacks/20261105044000_read_api_tokens.down.sql"), "utf8");
@@ -2801,7 +2814,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       await db.exec(ET_BOOT);
       await runMigrations(client(db), { profile: SUPA_ET });
       expect(await holds(db)).toBe(true);
-      await db.exec(overlapDown);
+      await rollbackLaterThan044020(db, SUPA_ET);
       expect(await failure(db.exec(orgIndexesDown))).toBeNull();
       await db.exec(lockDown);
       expect(await failure(db.exec(readTokensDown))).toBeNull();
@@ -2818,7 +2831,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       await runMigrations(client(db), { profile: SUPA_ET });
       await db.exec(`DROP OWNED BY search_consumer_runtime`);
       await db.exec(`DROP ROLE search_consumer_runtime`);
-      await db.exec(overlapDown);
+      await rollbackLaterThan044020(db, SUPA_ET);
       expect(await failure(db.exec(orgIndexesDown))).toBeNull();
       await db.exec(lockDown);
       expect(await failure(db.exec(readTokensDown))).toBeNull();
@@ -3285,19 +3298,26 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const db = await supabaseLike();
     await db.exec(ET_BOOT);
     const CB = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
-    const V = "upstream:20261105044030_ingest_generation_overlap.sql";
     const LAZY = "ingest_lazy_native_slots_org_id_idx";
-    // The previous release: everything below 044020, validated (marker 'pass'). 044030 sorts above 044020, so it
-    // is not applied either (the sequence preflight refuses a pending slot below an applied one). A partial
-    // migrate cannot build that state here (044030's owner-only functions are in the committed ACL manifest, so
-    // validation would report drift), so migrate fully and take both guarded downs, newest first; the overlap
-    // down marks the marker pending only because the fence bodies changed, so the previous release's PASS is
-    // restored on the same generation row.
-    expect(await failure(runMigrations(client(db), { profile: SUPA_ET }))).toBeNull();
-    await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105044030_ingest_generation_overlap.down.sql"), "utf8"));
-    await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8"));
-    await db.exec("UPDATE sessions.__96bulls_role_validation SET status='pass' WHERE name='session_directory_search_worker'");
-    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.__96bulls_migrations WHERE name IN ($1,$2)", [CB, V])).rows[0]!.n).toBe(0);
+    // The previous release: everything but 044020 (and no later upstream step: that would be a ledger gap), validated (marker 'pass').
+    const full = await plan(SUPA_ET);
+    const laterSteps = laterUpstream(full) as typeof full;
+    const later = laterSteps.map((s) => s.name);
+    const steps = full.filter((s) => s.name !== CB && !later.includes(s.name));
+    // That release's binary shipped the function ACL manifest of its day, which could not yet list a
+    // function a later step creates; the current manifest does, so the non-local exact-ACL check would
+    // refuse (function_acl_drift) a database without them. Validate against the previous manifest:
+    // the current one minus the functions later steps CREATE. No later step: the current manifest, unmocked.
+    const laterFns = new Set(laterSteps.flatMap((s) =>
+      [...readFileSync(s.path, "utf8").matchAll(/\bCREATE\s+FUNCTION\s+(sessions\.\w+)\s*\(/gi)].map((m) => m[1]!.toLowerCase())));
+    const manifest = await migrateGuards.sessionsFunctionAclManifest();
+    const previousManifest = Object.fromEntries(Object.entries(manifest).filter(([fn]) => !laterFns.has(fn.slice(0, fn.indexOf("(")))));
+    const previousRelease = later.length ? spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(previousManifest) : undefined;
+    try {
+      expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps }))).toBeNull();
+    } finally {
+      previousRelease?.mockRestore();
+    }
     // Production shape: seven prebuilt CONCURRENTLY, the lazy-slot one held, its table populated.
     for (const x of ADOPTABLE_INDEXES[CB]!) if (x.name !== LAZY) await db.exec(x.def);
     await db.query(
@@ -3318,13 +3338,12 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const applied = await failure(runMigrations(client(db), { profile: SUPA_ET }));
     expect(applied?.code).toBe("index_prebuild_required");
     expect(await snapshot(db)).toEqual(before);
-    // After the operator's CONCURRENTLY build: the plan is green with 044020 (and the later 044030) pending, the
-    // apply adopts it.
+    // After the operator's CONCURRENTLY build: the plan is green with 044020 pending, the apply adopts it.
     await db.exec(`CREATE INDEX CONCURRENTLY ${LAZY} ON sessions.ingest_lazy_native_slots USING btree (org_id)`);
     await db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
     const report = await inspectMigrations(client(db), SUPA_ET);
     await db.exec("ROLLBACK");
-    expect(report.inventory.filter((s) => s.pending).map((s) => s.name)).toEqual([CB, V]);
+    expect(report.inventory.filter((s) => s.pending).map((s) => s.name)).toEqual([CB, ...later]);
     expect(await failure(runMigrations(client(db), { profile: SUPA_ET, expectedLedgerSha256: report.ledgerSha256 }))).toBeNull();
     expect(((await snapshot(db)).marker as Array<{ status: string }>).map((r) => r.status)).toEqual(["pass"]);
   });

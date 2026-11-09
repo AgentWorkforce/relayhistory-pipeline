@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
 import { describe, expect, test } from "vitest";
-import { ALL_WORKSPACES, BUFFERED_SEARCH_GATE_VAR, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, OWNER_BUFFERED_EVENTS_VAR, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
+import { ALL_WORKSPACES, BUFFERED_SEARCH_GATE_VAR, CONTROL_HEAD_BINDING, HYPERDRIVE_PLACEHOLDER, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 const TEMPLATE = readFileSync(here("../wrangler.jsonc"), "utf8");
@@ -289,6 +289,62 @@ describe("deploy config render, owner_buffered_events", () => {
   });
 });
 
+describe("deploy config render, owner_buffered_stage_concurrency and owner_buffered_phase_log", () => {
+  const EV = { ...ON, ownerBufferedEvents: "on" };
+
+  test("both off (no input, empty, off) are byte-identical to the render without the inputs, for every existing input combination", () => {
+    const combos: RenderInputs[] = [
+      { hyperdriveId: HD },
+      { hyperdriveId: HD, bufferedSearchGate: "on" },
+      ON,
+      EV,
+      { ...EV, bufferedSearchGate: "on" },
+    ];
+    for (const combo of combos) {
+      const without = renderDeployConfig(TEMPLATE, combo);
+      for (const off of [undefined, "", " ", "off", " off "]) {
+        const out = renderDeployConfig(TEMPLATE, { ...combo, ownerBufferedStageConcurrency: off, ownerBufferedPhaseLog: off });
+        expect(out, JSON.stringify({ combo, off })).toBe(without);
+        expect(out).not.toContain(OWNER_BUFFERED_STAGE_CONCURRENCY_VAR);
+        expect(out).not.toContain(OWNER_BUFFERED_PHASE_LOG_VAR);
+      }
+    }
+    expect(renderDeployConfig(TEMPLATE, { hyperdriveId: HD, ownerBufferedStageConcurrency: "off", ownerBufferedPhaseLog: "off" })).toBe(sedRender(HD));
+    expect(TEMPLATE).not.toContain(OWNER_BUFFERED_STAGE_CONCURRENCY_VAR);
+    expect(TEMPLATE).not.toContain(OWNER_BUFFERED_PHASE_LOG_VAR);
+  });
+
+  test("with owner_buffered_events=on: concurrency 2..32 adds exactly that var, phase_log=on adds exactly the var \"1\"", () => {
+    const without = parse(renderDeployConfig(TEMPLATE, EV));
+    for (const n of ["2", "8", " 16 ", "32"]) {
+      const out = parse(renderDeployConfig(TEMPLATE, { ...EV, ownerBufferedStageConcurrency: n }));
+      expect(out.vars[OWNER_BUFFERED_STAGE_CONCURRENCY_VAR]).toBe(n.trim());
+      const { [OWNER_BUFFERED_STAGE_CONCURRENCY_VAR]: _, ...rest } = out.vars;
+      expect({ ...out, vars: rest }).toEqual(without);
+    }
+    const logged = parse(renderDeployConfig(TEMPLATE, { ...EV, ownerBufferedPhaseLog: " on " }));
+    expect(logged.vars[OWNER_BUFFERED_PHASE_LOG_VAR]).toBe("1");
+    const { [OWNER_BUFFERED_PHASE_LOG_VAR]: _, ...rest } = logged.vars;
+    expect({ ...logged, vars: rest }).toEqual(without);
+  });
+
+  test("a bad value, either without owner_buffered_events=on, or a template that predeclares either var, fails closed", () => {
+    for (const bad of ["0", "1", "33", "02", "-2", "2.0", "on", "yes"]) expect(() => renderDeployConfig(TEMPLATE, { ...EV, ownerBufferedStageConcurrency: bad }), bad).toThrow(/owner_buffered_stage_concurrency must be/);
+    for (const bad of ["1", "true", "ON", "yes"]) expect(() => renderDeployConfig(TEMPLATE, { ...EV, ownerBufferedPhaseLog: bad }), bad).toThrow(/owner_buffered_phase_log must be/);
+    for (const base of [{ hyperdriveId: HD }, { hyperdriveId: HD, bufferedSearchGate: "on" }, ON, { ...ON, ownerBufferedEvents: "off" }]) {
+      expect(() => renderDeployConfig(TEMPLATE, { ...base, ownerBufferedStageConcurrency: "4" })).toThrow(/needs owner_buffered_events=on/);
+      expect(() => renderDeployConfig(TEMPLATE, { ...base, ownerBufferedPhaseLog: "on" })).toThrow(/needs owner_buffered_events=on/);
+    }
+    for (const v of [OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR]) {
+      const flagged = TEMPLATE.replace(/"vars"\s*:\s*\{/, `"vars": { "${v}": "1",`);
+      expect(flagged).not.toBe(TEMPLATE);
+      for (const inputs of [{ hyperdriveId: HD }, { hyperdriveId: HD, bufferedSearchGate: "on" }, ON, EV, { ...EV, ownerBufferedStageConcurrency: "4", ownerBufferedPhaseLog: "on" }]) {
+        expect(() => renderDeployConfig(flagged, inputs), JSON.stringify({ v, inputs })).toThrow(new RegExp(`must leave ${v} unset`));
+      }
+    }
+  });
+});
+
 describe("deploy workflow wiring", () => {
   test("dispatch inputs default to off and none", () => {
     expect(WORKFLOW).toMatch(/owner_buffered:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
@@ -297,6 +353,10 @@ describe("deploy workflow wiring", () => {
     expect(WORKFLOW).toContain("BUFFERED_SEARCH_GATE: ${{ inputs.buffered_search_gate }}");
     expect(WORKFLOW).toMatch(/owner_buffered_events:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
     expect(WORKFLOW).toContain("OWNER_BUFFERED_EVENTS: ${{ inputs.owner_buffered_events }}");
+    expect(WORKFLOW).toMatch(/owner_buffered_stage_concurrency:\n\s+description:[^\n]*\n\s+type: string\n\s+default: "off"/);
+    expect(WORKFLOW).toContain("OWNER_BUFFERED_STAGE_CONCURRENCY: ${{ inputs.owner_buffered_stage_concurrency }}");
+    expect(WORKFLOW).toMatch(/owner_buffered_phase_log:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+    expect(WORKFLOW).toContain("OWNER_BUFFERED_PHASE_LOG: ${{ inputs.owner_buffered_phase_log }}");
   });
 
   test("inputs reach shell only through env, and the render runs this script", () => {
@@ -307,5 +367,7 @@ describe("deploy workflow wiring", () => {
     expect(WORKFLOW).not.toContain("--var \"RELAYHISTORY_READ_OWNER_BUFFERED");
     expect(WORKFLOW).not.toContain("--var \"READ_API_BUFFERED_SEARCH_GATE");
     expect(WORKFLOW).not.toContain("--var \"READ_API_OWNER_BUFFERED_EVENTS");
+    expect(WORKFLOW).not.toContain("--var \"READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY");
+    expect(WORKFLOW).not.toContain("--var \"READ_API_OWNER_BUFFERED_PHASE_LOG");
   });
 });
