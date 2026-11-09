@@ -1,24 +1,32 @@
 /** READ_API_CANONICAL_SCOPE_BYTES / _EVENTS (service-canonical.ts): self-host canonical snapshot budget. */
 import { describe, expect, test } from "bun:test";
 import { CANONICAL_SCOPE_BYTES, CANONICAL_SCOPE_EVENTS } from "../canonical.ts";
-import { canonicalScopeBudget, serviceCanonicalDeps } from "../service-canonical.ts";
+import { SEARCH_INDEX_DEFAULT_LIMITS } from "../../session-pipeline/search-index.ts";
+import { SELFHOST_CANONICAL_SCOPE_BYTES, canonicalScopeBudget, serviceCanonicalDeps } from "../service-canonical.ts";
 
 const MiB = 1024 * 1024, GiB = 1024 * MiB;
 const bytes = (v: string | undefined) => canonicalScopeBudget(v === undefined ? {} : { READ_API_CANONICAL_SCOPE_BYTES: v });
 const events = (v: string | undefined) => canonicalScopeBudget(v === undefined ? {} : { READ_API_CANONICAL_SCOPE_EVENTS: v });
 
 describe("canonicalScopeBudget", () => {
-  test("unset or empty: no override, so canonicalSnapshot keeps its defaults (16 MiB, 100000)", () => {
+  test("unset or empty: bytes default to the self-host 64 MiB, events stay unset (canonicalSnapshot default 100000)", () => {
     expect(CANONICAL_SCOPE_BYTES).toBe(16 * MiB);
     expect(CANONICAL_SCOPE_EVENTS).toBe(100000);
-    expect(canonicalScopeBudget({})).toEqual({});
-    expect(canonicalScopeBudget({ READ_API_CANONICAL_SCOPE_BYTES: "", READ_API_CANONICAL_SCOPE_EVENTS: "" })).toEqual({});
-    expect(Object.keys(canonicalScopeBudget({}))).toEqual([]);
+    expect(SELFHOST_CANONICAL_SCOPE_BYTES).toBe(64 * MiB);
+    expect(canonicalScopeBudget({})).toEqual({ scopeBytes: 64 * MiB });
+    expect(canonicalScopeBudget({ READ_API_CANONICAL_SCOPE_BYTES: "", READ_API_CANONICAL_SCOPE_EVENTS: "" })).toEqual({ scopeBytes: SELFHOST_CANONICAL_SCOPE_BYTES });
+    expect(Object.keys(canonicalScopeBudget({}))).toEqual(["scopeBytes"]);
+    expect("scopeEvents" in canonicalScopeBudget({})).toBe(false);
+  });
+
+  test("the self-host defaults match the search indexer's", () => {
+    expect(SELFHOST_CANONICAL_SCOPE_BYTES).toBe(SEARCH_INDEX_DEFAULT_LIMITS.maxScopeBytes);
+    expect(CANONICAL_SCOPE_EVENTS).toBe(SEARCH_INDEX_DEFAULT_LIMITS.maxScopeEvents);
   });
 
   test.each([
     ["16777216", 16 * MiB],
-    ["16MiB", 16 * MiB],
+    ["16MiB", 16 * MiB], // lower than the default, at the minimum
     ["64MiB", 64 * MiB],
     ["67108864", 64 * MiB],
     ["1GiB", GiB],
@@ -30,14 +38,14 @@ describe("canonicalScopeBudget", () => {
   });
 
   test.each([["100000", 100000], ["250000", 250000], ["4000000", 4_000_000]])("events %p is accepted", (raw, want) => {
-    expect(events(raw)).toEqual({ scopeEvents: want });
+    expect(events(raw)).toEqual({ scopeBytes: 64 * MiB, scopeEvents: want });
   });
 
   test("both set together", () => {
     expect(canonicalScopeBudget({ READ_API_CANONICAL_SCOPE_BYTES: "64MiB", READ_API_CANONICAL_SCOPE_EVENTS: "200000" })).toEqual({ scopeBytes: 64 * MiB, scopeEvents: 200000 });
   });
 
-  test.each(["16777215", "15MiB", "1", "1MiB", "0GiB"])("bytes below the default %p fails, naming the variable", (raw) => {
+  test.each(["16777215", "15MiB", "1", "1MiB", "0GiB"])("bytes below 16 MiB %p fails, naming the variable", (raw) => {
     expect(() => bytes(raw)).toThrow("READ_API_CANONICAL_SCOPE_BYTES must be a whole number of bytes (optional MiB or GiB suffix) in 16MiB..2GiB");
   });
   test.each([String(2 * GiB + 1), "3GiB", "2049MiB", "9999999999999"])("bytes above 2 GiB %p fails", (raw) => {
