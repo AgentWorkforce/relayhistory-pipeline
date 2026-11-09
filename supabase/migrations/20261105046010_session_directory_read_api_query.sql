@@ -1,5 +1,5 @@
 -- Session list and activity `q` for the self-host Dashboard (#473; registry slot 046010,
--- taken after 046000 (#292), which has not landed on main; nothing here depends on it).
+-- taken after 046000 (#292, landed); nothing here depends on it).
 -- The read API's `GET /v1/sessions` and `GET /v1/sessions/activity` answer `q` (the
 -- Dashboard's GitHub-like session query: free words, `-word`, `field:value`, `@agent`,
 -- dates) from the session directory, behind READ_API_SESSION_QUERY=true (default off;

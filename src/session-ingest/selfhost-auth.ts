@@ -6,11 +6,20 @@
  *
  * Pattern A: POST /v1/cli/login on the self-host read API advertises
  * `rth:sync` only when introspection granted it, but this edge never trusts
- * that login reply, a cached grant or any request header for identity. The
+ * that login reply or any request header for identity. By default the
  * introspector is built with no positive cache (positiveTtlMs 0), so a revoked
  * token or a removed `rth:sync` is refused on the very next request. Only
  * concurrent identical requests share one in-flight call. Refusals are cached
- * for relaycontrol's short negative TTL (fail closed).
+ * for relaycontrol's short negative TTL (at most 5 s, fail closed); outages
+ * are never cached.
+ *
+ * RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS (selfhost-config.ts, default
+ * 0 = off, an integer 0..60000) opts into the shared introspector's positive
+ * cache: an admit is reused for min(TTL, the token's remaining exp) per
+ * process, keyed by sha256(token) with this edge's one `aud` (no workspace or
+ * machine is sent here), at most 1000 entries, LRU. The introspection answer
+ * carries no revocation epoch, so revocation lag (a revoked token, or a removed
+ * `rth:sync`, still admitted) is bounded only by that TTL.
  *
  *   no / malformed Authorization            401 missing_authorization
  *   not `sh_at_`, rejected, wrong audience  401 invalid_token (reason to the log only)
@@ -42,19 +51,30 @@ export interface SelfhostAuthConfig {
   origin: string;
   introspectUrl: string;
   introspectSecret: string;
+  /**
+   * RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS: how long (ms) an admitted
+   * token is reused before it is introspected again (the revocation lag).
+   * Absent or 0: no positive cache, every request introspects.
+   */
+  introspectPositiveTtlMs?: number;
 }
 
 const relaycontrolLog: RelaycontrolLog = (level, message, fields) =>
   log[level](message, { route: "ingest.auth", reason: typeof fields.reason === "string" ? fields.reason : undefined, status: fields.status });
 
-/** The production introspector: no positive cache, the deployment's destination policy on the URL. */
+/**
+ * The production introspector: the deployment's destination policy on the URL,
+ * and no positive cache unless the operator set introspectPositiveTtlMs
+ * (default 0). Negative TTL and the entry bound stay relaycontrol.ts's
+ * defaults (5 s, 1000 entries LRU).
+ */
 export function selfhostIntrospector(config: SelfhostAuthConfig, env: NodeJS.ProcessEnv = process.env, fetcher?: typeof fetch): RelaycontrolIntrospector {
   const policy = destinationPolicy(env);
   return createRelaycontrolIntrospector({
     url: config.introspectUrl,
     secret: config.introspectSecret,
     validateUrl: (url) => void assertDestinationUrl("RELAYCONTROL_INTROSPECT_URL", url, policy),
-    positiveTtlMs: 0,
+    positiveTtlMs: config.introspectPositiveTtlMs ?? 0,
     log: relaycontrolLog,
     ...(fetcher ? { fetch: fetcher } : {}),
   });

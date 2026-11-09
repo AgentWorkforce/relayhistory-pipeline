@@ -42,9 +42,10 @@ A witness failure, an inbox PUT failure or anything else that keeps a batch off 
 (400, 403, 413, 415, 422) keep their synchronous status, code and body (tested side by side).
 
 **The remaining authorization dependency.** The no-SQL claim covers the ingest database only. Every
-request still makes one relaycontrol introspection call, with no positive cache, exactly as in `sync`
-(`selfhost-auth.ts` is unchanged). A revoked token or a removed `rth:sync` is refused on the next
-request. If relaycontrol is down, uploads get a retryable 503 `relaycontrol_unavailable` in every
+request still makes one relaycontrol introspection call, with no positive cache by default, exactly as in `sync`
+(`selfhost-auth.ts`). A revoked token or a removed `rth:sync` is refused on the next
+request. `RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS` (default off, at most 60 s) opts into a bounded positive cache in every
+mode; the revocation lag is then that TTL (`docs/local-stack.md`, "Cache and revocation lag"). If relaycontrol is down, uploads get a retryable 503 `relaycontrol_unavailable` in every
 mode.
 
 **Status read.** In `async` and `drain` only, `GET /v1/delivery/admission?originId=…&receiptId=rhr_…`

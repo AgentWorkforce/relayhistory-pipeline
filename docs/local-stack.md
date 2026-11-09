@@ -123,6 +123,7 @@ keep their path unchanged either way.
 | `RELAYCONTROL_INTROSPECT_URL` | same | Relaycontrol's base URL, configuration only. Same transport rule as every destination: https, loopback, or `http` to an in-cluster Service name with `ALLOW_IN_CLUSTER_HTTP=true` (the Worker: https or loopback only). |
 | `RELAYCONTROL_INTROSPECT_SECRET` | same | The dedicated service secret, sent as `Authorization: Bearer`. From the secret store only, never a file. |
 | `READ_API_INTROSPECT_POSITIVE_TTL_MS` | read API (Lambda and the self-host SERVICE; the Worker ignores it) | How long (ms) an admitted `sh_at_` token is reused before it is introspected again: the read path's revocation lag. Unset: `60000` (unchanged hosted behaviour). An integer `0`-`60000`; `0` introspects every request (strict revocation, recommended for self-host). Anything else, `""` included, fails startup. See "Cache and revocation lag" below. |
+| `RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS` | self-host session-ingest SERVICE only (the Worker and hosted middleware ignore it) | How long (ms) an admitted `sh_at_` upload token is reused before it is introspected again: the ingest edge's revocation lag. Unset, `""` or `0`: off, every upload request is introspected (unchanged default). Otherwise a plain decimal integer `1`-`60000`; `30000`-`60000` recommended when Control load matters. Anything else (negative, fractional, over `60000`, garbage) fails startup and is never clamped. See "Cache and revocation lag" below. |
 | `RELAYHISTORY_SELFHOST_READ_API` | read API | Exactly `true` adds `POST /v1/cli/login` (pass-through `sh_at_` exchange through the introspection above, no refresh) and `GET /v1/sessions/:id/catalog`; unset/`""`/`false` off; anything else fails startup. See docs/session-read-api-design.md §2a. |
 | `SEARCH_INDEX_BACKEND` | session-read-api (enabled) | `postgres` (default; no ClickHouse, any known `PIPELINE_RUNTIME`) or `clickhouse` (hosted binding; needs the secret's `clickhouse` block). Anything else, including a name with no implementation in this build (`opensearch`), fails startup; the error names the variable, never the value. |
 | `SEARCH_INDEX_POSTGRES_BACKEND_ID` | session-read-api (enabled, `postgres`) | Required, `[a-zA-Z0-9._-]{1,128}`: the projection-state backend id the search writer records under. Coverage is `READ_API_COMPLETE_SINCE`. Not a credential. |
@@ -189,7 +190,17 @@ keep their path unchanged either way.
     window stays the client's own (at most 5 s); this setting never lengthens
     it. The Worker does not read the variable and keeps 60 s.
   - **Self-host ingest edge** (`src/session-ingest/selfhost-auth.ts`): no
-    positive cache at all (every request introspects); not configurable.
+    positive cache by default (every upload request introspects, one
+    relaycontrol call and so one Control SQL query per request).
+    `RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS` (default off; an integer `0`-`60000`,
+    anything else fails startup, never clamped; `30000`-`60000` recommended
+    under Desktop upload bursts) turns the positive cache on: an admit is reused
+    for min(TTL, the token's remaining `exp`) per process, keyed by
+    sha256(token) and the edge's one `aud` (it sends no workspace or machine).
+    The introspection answer carries no revocation epoch, so a revoked token or
+    a removed `rth:sync` keeps uploading for at most the TTL. Refusals stay
+    cached at most 5 s, outages are never cached, and the cache is bounded at
+    1000 entries (LRU, the client default; not configurable here).
   - **Hosted ingest middleware**: the client default of 60 s.
 - **Machine verification (AlleyOop courier surface only).** At the ingest the
   request's `X-Machine-Id` (which the courier sends on chunk and manifest

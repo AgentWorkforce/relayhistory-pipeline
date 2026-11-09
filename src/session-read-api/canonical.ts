@@ -15,6 +15,7 @@ import { canonicalLiveTurns, mergeTurnRows } from "./canonical-turns.ts";
 import { createHash } from "node:crypto";
 import { readCanonicalScope, manifestUserId } from "./canonical-projection.ts";
 import { canonicalManifestIdentity } from "../shared/manifest-identity.ts";
+import { neonDerivedManifest } from "../shared/never-in-neon.ts";
 import {
   objectStoreManifestReader,
   prefixAllowed,
@@ -228,9 +229,12 @@ async function snapshotWithLimits(
       generation: version,
       exists: false,
       legacyCoverage: null,
+      neonDerived: false,
       rows: [] as Array<{ table: string; row: Record<string, unknown> }>,
     };
   const byKey = new Map(pointers.map((p) => [p.manifest_key, p]));
+  // Whether any manifest of the scope was written by the Neon export/sync (never-in-Neon proof).
+  let neonDerived = false;
   const reader = objectStoreManifestReader(deps.store, {
     provider: deps.provider as "s3",
     bucket: deps.bucket,
@@ -264,6 +268,7 @@ async function snapshotWithLimits(
           if (deps.pinLaggingPointer && m.raw.content_sha256 !== digest(p.content_sha256))
             m = (await pinnedToPointer(m, digest(p.content_sha256), Number(p.revision))) ?? m;
           const canonical = canonicalManifestIdentity(m);
+          if (neonDerivedManifest(m)) neonDerived = true;
           // content_sha256 is the RAW CHUNK HASH CHAIN, not SHA256(manifest bytes).
           if (
             m.raw.content_sha256 !== digest(p.content_sha256) ||
@@ -312,6 +317,8 @@ async function snapshotWithLimits(
     exists: true,
     legacyCoverage: legacy.coverage,
     rows: [...result.projectionRows, ...mergeTurnRows(legacy.rows, live)],
+    // Always present: the never-in-Neon objects half fails closed on absence (evidence.ts).
+    neonDerived,
     /** Bounded directory_display_* code when display rows were omitted (raw read only). */
     ...(result.displayOmitted ? { displayOmitted: result.displayOmitted } : {}),
   };

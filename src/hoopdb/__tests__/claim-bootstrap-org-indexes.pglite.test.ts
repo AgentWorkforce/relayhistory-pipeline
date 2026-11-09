@@ -71,6 +71,7 @@ async function before044020(): Promise<PGlite> {
   await runMigrations(client(db), { profile: { ...LOCAL, verify: false }, steps });
   return db;
 }
+
 const orgIndexes = async (db: PGlite) =>
   (await db.query<{ name: string; def: string; oid: number; filenode: number; valid: boolean; ready: boolean }>(
     `SELECT c.relname AS name, pg_get_indexdef(c.oid) AS def, c.oid::int AS oid, c.relfilenode::int AS filenode,

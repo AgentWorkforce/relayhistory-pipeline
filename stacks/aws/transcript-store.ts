@@ -53,12 +53,15 @@ import {
   SESSION_BRIEF_RESOURCES,
   SESSION_ANALYSIS_CACHE_RESOURCES,
   SESSION_SEMANTIC_COPY_RESOURCES,
+  SESSION_ANALYSIS_JOB_RESOURCES,
   SESSION_BUFFERED_SEARCH_FEED_RESOURCES,
   SESSION_BUFFERED_ERASURE_DELETE_RESOURCES,
   SESSION_PIPELINE_RESOURCES,
   assertSessionPipelineInputs,
   pipelineBucketStatements,
   pipelineKeyStatement,
+  pipelineAnalysisKeyStatement,
+  ANALYSIS_RESULT_OBJECT_GLOB,
   sessionPipelineFunction,
   sessionPipelineWiring,
   type SessionPipelineInputs,
@@ -244,6 +247,8 @@ export type TranscriptStorePlanPhase =
   | "session analysis cache update"
   | "session semantic copy rollout"
   | "session semantic copy update"
+  | "session analysis jobs rollout"
+  | "session analysis jobs update"
   | "session buffered search feed rollout"
   | "session buffered search feed update"
   | "session buffered erasure delete rollout"
@@ -401,6 +406,33 @@ function sessionAnalysisCachePhase(
   return analysisPhase;
 }
 
+/** The analysis-job schedule (lane F1): its own reviewed phase, exactly as the semantic copier's. */
+function sessionAnalysisJobPhase(operations:ReadonlyMap<string,string>,detailedPlanText:string,stateSnapshotText:string|undefined,refuse:(why:string)=>never):TranscriptStorePlanPhase|undefined{
+ const [schedule,permission]=SESSION_ANALYSIS_JOB_RESOURCES.map(r=>operations.get(r)??"noop");
+ if(schedule==="noop"&&permission==="noop")return undefined;
+ const phase:TranscriptStorePlanPhase|undefined=[schedule,permission].every(a=>a==="create"||a==="noop")?"session analysis jobs rollout":schedule==="update"&&permission==="noop"?"session analysis jobs update":undefined;
+ if(!phase)return refuse("analysis job resources have an unsafe action combination");
+ // Enabling the jobs also adds the pipeline role's analysis-result bucket and key statements:
+ // the bucket and key may update in this phase only when the detailed plan names those Sids.
+ const storeUpdates=["transcripts","transcripts-key"].filter(r=>operations.get(r)==="update");
+ for(const r of storeUpdates){
+  const sid=r==="transcripts"?"SessionPipelineWritesAnalysisResults":"SessionPipelineEncryptsAnalysisResultsViaS3";
+  if(!detailedPlanText.includes(sid))return refuse(`analysis jobs: ${r} may update only to add ${sid}`);
+ }
+ const allowed=new Set<string>([...SESSION_ANALYSIS_JOB_RESOURCES,...SESSION_PIPELINE_RESOURCES,...ROLE_GRANT_RESOURCES,...SESSION_READ_API_RESOURCES,...storeUpdates]);
+ if([...operations].some(([r,a])=>a!=="noop"&&!allowed.has(r)))return refuse("analysis jobs require a separate reviewed phase");
+ const readApi=SESSION_READ_API_RESOURCES as readonly string[];
+ if(!readApi.every(r=>!operations.has(r)||operations.get(r)==="noop")){
+  if(!readApiCodeOnlyShape(operations))return refuse("analysis jobs: read api may not change in same plan");
+  assertReadApiCodeOnlyCascade(detailedPlanText,stateSnapshotText,why=>refuse("analysis jobs: "+why));
+ }
+ const rest=new Map([...operations].filter(([r])=>!(SESSION_ANALYSIS_JOB_RESOURCES as readonly string[]).includes(r)&&!readApi.includes(r)&&!storeUpdates.includes(r)));
+ if([...rest.values()].every(a=>a==="noop"))return phase;
+ if(sessionPipelinePhase(rest)!=="session pipeline update")return refuse("analysis jobs: rest must be noop or session pipeline update");
+ assertPipelineRoleCascadeDiff(rest,detailedPlanText,stateSnapshotText,refuse);
+ return phase;
+}
+
 /** The copier schedule is a separately reviewed phase, never a mixed rollout. */
 function sessionSemanticCopyPhase(operations:ReadonlyMap<string,string>,detailedPlanText:string,stateSnapshotText:string|undefined,refuse:(why:string)=>never):TranscriptStorePlanPhase|undefined{
  const [semanticSchedule,semanticPermission]=SESSION_SEMANTIC_COPY_RESOURCES.map(r=>operations.get(r)??"noop");
@@ -510,14 +542,16 @@ function expectedResources(names: Iterable<string>): readonly string[] {
   const withBrief = list.some((n) => brief.has(n));
   const analysis=new Set<string>(SESSION_ANALYSIS_CACHE_RESOURCES);const withAnalysis=list.some(n=>analysis.has(n));
   const withSemantic=list.some(n=>(SESSION_SEMANTIC_COPY_RESOURCES as readonly string[]).includes(n));
+  const withAnalysisJobs=list.some(n=>(SESSION_ANALYSIS_JOB_RESOURCES as readonly string[]).includes(n));
   const withBufferedFeed = list.some((n) => (SESSION_BUFFERED_SEARCH_FEED_RESOURCES as readonly string[]).includes(n));
   const withBufferedErasure = list.some((n) => (SESSION_BUFFERED_ERASURE_DELETE_RESOURCES as readonly string[]).includes(n));
   return [
     ...TRANSCRIPT_RESOURCES,
-    ...(withBrief || withAnalysis || withSemantic || withBufferedFeed || withBufferedErasure || list.some((n) => pipeline.has(n)) ? SESSION_PIPELINE_RESOURCES : []),
+    ...(withBrief || withAnalysis || withSemantic || withAnalysisJobs || withBufferedFeed || withBufferedErasure || list.some((n) => pipeline.has(n)) ? SESSION_PIPELINE_RESOURCES : []),
     ...(withBrief ? SESSION_BRIEF_RESOURCES : []),
     ...(withAnalysis ? SESSION_ANALYSIS_CACHE_RESOURCES : []),
     ...(withSemantic?SESSION_SEMANTIC_COPY_RESOURCES:[]),
+    ...(withAnalysisJobs?SESSION_ANALYSIS_JOB_RESOURCES:[]),
     ...(withBufferedFeed ? SESSION_BUFFERED_SEARCH_FEED_RESOURCES : []),
     ...(withBufferedErasure ? SESSION_BUFFERED_ERASURE_DELETE_RESOURCES : []),
     ...(list.some((n) => readApi.has(n)) ? SESSION_READ_API_RESOURCES : []),
@@ -603,6 +637,8 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   // The brief schedule changes alone, or with exactly a session pipeline update.
   const semanticPhase=sessionSemanticCopyPhase(compact.operations,capture.detailedPlanText,capture.stateSnapshotText,refuse);
   if(semanticPhase)return semanticPhase;
+  const analysisJobPhase=sessionAnalysisJobPhase(compact.operations,capture.detailedPlanText,capture.stateSnapshotText,refuse);
+  if(analysisJobPhase)return analysisJobPhase;
   const bufferedFeedPhase = sessionBufferedSearchFeedPhase(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
   if (bufferedFeedPhase) return bufferedFeedPhase;
   const bufferedErasurePhase = sessionBufferedErasureDeletePhase(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
@@ -1160,8 +1196,11 @@ export function trailLifecycleRules() {
  * including `aws:kms` without a key id (S3 would use `aws/s3`). SSE-C is blocked
  * separately by the encryption configuration.
  */
-export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string; accountId?: string; bufferedGcRoleArn?: string }) {
+export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string; accountId?: string; bufferedGcRoleArn?: string; analysisDeleterArn?: string }) {
   if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId ?? "");
+  // The eraser+GC principal list is shared by the analysis-on and analysis-off variants of
+  // the eraser-only deny below: a single control point, covered by the hardening mutations.
+  const eraserAndGcPrincipals = i.bufferedGcRoleArn ? [i.eraserArn, i.bufferedGcRoleArn] : i.eraserArn;
   return [
     ...denyInsecureTransport(i.bucketArn),
     {
@@ -1172,14 +1211,36 @@ export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; e
       Resource: [i.bucketArn, `${i.bucketArn}/*`],
       Condition: { NumericLessThan: { "s3:TlsVersion": "1.2" } },
     },
-    {
-      Sid: "OnlyTheEraserDeletes",
-      Effect: "Deny" as const,
-      Principal: "*",
-      Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
-      Resource: [`${i.bucketArn}/*`],
-      Condition: { ArnNotEquals: { "aws:PrincipalArn": i.bufferedGcRoleArn ? [i.eraserArn, i.bufferedGcRoleArn] : i.eraserArn } },
-    },
+    // Lane F1 (analysisJobs on): the session-analysis worker (the pipeline role) erases its own
+    // result objects, so the eraser-only deny excludes exactly that object root, and a second
+    // deny on that root alone exempts the eraser, the buffered GC and the pipeline role.
+    i.analysisDeleterArn
+      ? {
+          Sid: "OnlyTheEraserDeletes",
+          Effect: "Deny" as const,
+          Principal: "*",
+          Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+          NotResource: [`${i.bucketArn}/${ANALYSIS_RESULT_OBJECT_GLOB}`],
+          Condition: { ArnNotEquals: { "aws:PrincipalArn": eraserAndGcPrincipals } },
+        }
+      : {
+          Sid: "OnlyTheEraserDeletes",
+          Effect: "Deny" as const,
+          Principal: "*",
+          Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+          Resource: [`${i.bucketArn}/*`],
+          Condition: { ArnNotEquals: { "aws:PrincipalArn": eraserAndGcPrincipals } },
+        },
+    ...(i.analysisDeleterArn
+      ? [{
+          Sid: "OnlyTheEraserOrAnalysisWorkerDeletesAnalysisResults",
+          Effect: "Deny" as const,
+          Principal: "*",
+          Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+          Resource: [`${i.bucketArn}/${ANALYSIS_RESULT_OBJECT_GLOB}`],
+          Condition: { ArnNotEquals: { "aws:PrincipalArn": [i.eraserArn, ...(i.bufferedGcRoleArn ? [i.bufferedGcRoleArn] : []), i.analysisDeleterArn] } },
+        }]
+      : []),
     {
       Sid: "DenyOtherEncryption",
       Effect: "Deny" as const,
@@ -1252,7 +1313,7 @@ export function trailLogBucketPolicy(i: { bucketArn: string; trailArn: string; a
  * The eraser and every other operator role have no use of it: deleting needs no key,
  * and nobody reads transcripts with the console.
  */
-export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; bufferedGcRoleArn?: string }) {
+export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; bufferedGcRoleArn?: string; analysisResults?: boolean }) {
   if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId);
   const via = {
     StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
@@ -1266,6 +1327,7 @@ export function transcriptKeyPolicy(i: { accountId: string; region: string; buck
       { Sid: "SrvWriterEncryptsAndReadsViaS3", Effect: "Allow" as const, Principal: { AWS: i.srvWriterArn }, Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: "*", Condition: via },
       { Sid: "ReaderDecryptsViaS3", Effect: "Allow" as const, Principal: { AWS: i.readerArn }, Action: ["kms:Decrypt"], Resource: "*", Condition: via },
       ...(i.pipelineRoleArn ? [pipelineKeyStatement({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.pipelineRoleArn })] : []),
+      ...(i.pipelineRoleArn && i.analysisResults ? [pipelineAnalysisKeyStatement({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.pipelineRoleArn })] : []),
       ...(i.bufferedGcRoleArn ? bufferedGcKeyStatements({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.bufferedGcRoleArn }) : []),
     ],
   };
@@ -1505,6 +1567,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
         readerArn: reader.userArn as unknown as string,
         bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn,
         ...(pipelineRoleArn ? { pipelineRoleArn } : {}),
+        ...(pipeline?.analysisJobs?.enabled ? { analysisResults: true } : {}),
       }) as never,
       // Also orders the key after the trail: the trail audits its use from the first call, and the
       // trail chain gives IAM time to propagate the new users KMS validates as principals.
@@ -1533,8 +1596,8 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       publicAccessBlock: PUBLIC_ACCESS_BLOCK,
       objectOwnership: "BucketOwnerEnforced",
       policy: [
-        ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn, accountId: i.accountId, bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn }),
-        ...(pipelineRoleArn ? pipelineBucketStatements({ bucketArn: n.bucketArn, roleArn: pipelineRoleArn }) : []),
+        ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn, accountId: i.accountId, bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn, ...(pipelineRoleArn && pipeline?.analysisJobs?.enabled ? { analysisDeleterArn: pipelineRoleArn } : {}) }),
+        ...(pipelineRoleArn ? pipelineBucketStatements({ bucketArn: n.bucketArn, roleArn: pipelineRoleArn, analysisResults: pipeline?.analysisJobs?.enabled === true }) : []),
       ] as never,
       lifecycleRules: transcriptLifecycleRules() as never,
       logging: { targetBucket: accessLogs.bucketName as unknown as string, targetPrefix: ACCESS_LOG_PREFIX, targetObjectKeyFormat: { PartitionedPrefix: { PartitionDateSource: "EventTime" } } as never },

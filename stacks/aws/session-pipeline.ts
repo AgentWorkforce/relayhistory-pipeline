@@ -48,6 +48,12 @@ export interface SessionPipelineInputs {
   /** Default off; source identity must match the immutable CH copier binding. */
   semanticCopy?: {enabled:boolean;sourceId:string};
   /**
+   * Session analysis jobs (src/session-analysis, lane F1). Absent or `enabled: false`: the
+   * schedule is DISABLED and SESSION_ANALYSIS_ENABLED is "false". The model key comes only
+   * from the pipeline secret's `openai_api_key` (operator-loaded from 1Password).
+   */
+  analysisJobs?: {enabled:boolean};
+  /**
    * Default off: the schedule stays DISABLED and neither feed variable is set. `enabled: true` must
    * name the read gate's exact contract in `gateDeclared`, an operator's assertion that the read
    * Worker already runs that gate, and needs `searchIndex: true`. The feeder's login is not wired
@@ -147,6 +153,8 @@ export const SESSION_PIPELINE_RESOURCES = [
  */
 export const SESSION_BRIEF_RESOURCES = ["session-brief-schedule", "session-brief-permission"] as const;
 export const SESSION_SEMANTIC_COPY_RESOURCES=["session-semantic-copy-schedule","session-semantic-copy-permission"] as const;
+/** The analysis-job schedule (lane F1); its own reviewed phase, like the semantic copier. */
+export const SESSION_ANALYSIS_JOB_RESOURCES=["session-analysis-job-schedule","session-analysis-job-permission"] as const;
 export const SESSION_BUFFERED_SEARCH_FEED_RESOURCES = ["session-buffered-search-feed-schedule", "session-buffered-search-feed-permission"] as const;
 export const SESSION_BUFFERED_ERASURE_DELETE_RESOURCES = ["session-buffered-erasure-delete-schedule", "session-buffered-erasure-delete-permission"] as const;
 /** The read gate's contract id; a test pins it to BUFFERED_SEARCH_GATE_CONTRACT in the gate source. */
@@ -174,6 +182,7 @@ export interface SessionPipelineNames {
   rule: string;
   briefRule: string;
   semanticRule:string;
+  analysisJobRule:string;
   bufferedSearchFeedRule: string;
   bufferedErasureDeleteRule: string;
 }
@@ -191,6 +200,7 @@ export function sessionPipelineNames(stage: string, accountId: string, region: s
     rule: n("session-reconcile"),
     briefRule: n("session-brief"),
     semanticRule:n("session-semantic-copy"),
+    analysisJobRule:n("session-analysis-jobs"),
     bufferedSearchFeedRule: n("session-buffered-search-feed"),
     bufferedErasureDeleteRule: n("session-buffered-erasure-delete"),
   };
@@ -201,7 +211,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
@@ -216,6 +226,8 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
   if (v.reconcileMinutes !== undefined && !(Number.isInteger(v.reconcileMinutes) && (v.reconcileMinutes as number) >= 15 && (v.reconcileMinutes as number) <= 120))
     refuse("transcriptStore.sessionPipeline.reconcileMinutes must be an integer from 15 to 120");
+  if(v.analysisJobs!==undefined){const c=v.analysisJobs as Record<string,unknown>|null;
+    if(!c||typeof c!=="object"||Array.isArray(c)||Object.getPrototypeOf(c)!==Object.prototype||Object.keys(c).some(k=>k!=="enabled")||typeof c.enabled!=="boolean")refuse("transcriptStore.sessionPipeline.analysisJobs requires exactly { enabled: boolean }");}
   if(v.semanticCopy!==undefined){const c=v.semanticCopy as Record<string,unknown>|null;
     if(!c||typeof c!=="object"||Array.isArray(c)||Object.getPrototypeOf(c)!==Object.prototype||Object.keys(c).some(k=>k!=="enabled"&&k!=="sourceId")||typeof c.enabled!=="boolean"||typeof c.sourceId!=="string"||!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(c.sourceId))refuse("transcriptStore.sessionPipeline.semanticCopy requires enabled and an explicit sourceId");
   }
@@ -296,9 +308,54 @@ export function pipelineKeyStatement(i: { accountId: string; region: string; buc
   };
 }
 
-/** Bucket-policy grants for the pipeline role: list keys, read session objects. Nothing else. */
-export function pipelineBucketStatements(i: { bucketArn: string; roleArn: string }) {
+/** The only object root the analysis worker writes (src/session-analysis/results.ts). */
+export const ANALYSIS_RESULT_OBJECT_GLOB = `${TENANT_KEY_BASE}/*/${LAYOUT_VERSION}/*/normalized/session-analysis-v2/*`;
+
+/**
+ * Lane F1, only with analysisJobs enabled: the pipeline role creates, verifies and erases
+ * analysis result objects (and their exact versions, the bucket is versioned), and only
+ * under normalized/session-analysis-v2/.
+ */
+export function pipelineAnalysisBucketStatements(i: { bucketArn: string; roleArn: string }) {
   return [
+    {
+      Sid: "SessionPipelineWritesAnalysisResults",
+      Effect: "Allow" as const,
+      Principal: { AWS: i.roleArn },
+      Action: ["s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion"],
+      Resource: [`${i.bucketArn}/${ANALYSIS_RESULT_OBJECT_GLOB}`],
+    },
+    {
+      // The sweeper's every-version erase lists the versions of exactly its result keys.
+      Sid: "SessionPipelineListsAnalysisResultVersions",
+      Effect: "Allow" as const,
+      Principal: { AWS: i.roleArn },
+      Action: ["s3:ListBucketVersions"],
+      Resource: [i.bucketArn],
+      Condition: { StringLike: { "s3:prefix": [ANALYSIS_RESULT_OBJECT_GLOB] } },
+    },
+  ];
+}
+
+/** Lane F1: SSE-KMS data keys for those objects only (encryption context = the object ARN). */
+export function pipelineAnalysisKeyStatement(i: { accountId: string; region: string; bucketName: string; roleArn: string }) {
+  return {
+    Sid: "SessionPipelineEncryptsAnalysisResultsViaS3",
+    Effect: "Allow" as const,
+    Principal: { AWS: i.roleArn },
+    Action: ["kms:GenerateDataKey", "kms:Encrypt"],
+    Resource: "*",
+    Condition: {
+      StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
+      StringLike: { "kms:EncryptionContext:aws:s3:arn": `arn:aws:s3:::${i.bucketName}/${ANALYSIS_RESULT_OBJECT_GLOB}` },
+    },
+  };
+}
+
+/** Bucket-policy grants for the pipeline role: list keys, read session objects (and, with analysis jobs, write their results). */
+export function pipelineBucketStatements(i: { bucketArn: string; roleArn: string; analysisResults?: boolean }) {
+  return [
+    ...(i.analysisResults ? pipelineAnalysisBucketStatements(i) : []),
     {
       Sid: "SessionPipelineLists",
       Effect: "Allow" as const,
@@ -411,6 +468,7 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     SESSION_DESKTOP_CATALOG_ENABLED: "0",
     SESSION_SEMANTIC_COPY_ENABLED:i.p.semanticCopy?.enabled?"1":"0",
     SESSION_SEARCH_FEATURE_SOURCE_ID:i.p.semanticCopy?.sourceId??"",
+    SESSION_ANALYSIS_ENABLED:i.p.analysisJobs?.enabled?"true":"false",
     // Only when armed, so a default deploy leaves the feed and the erasure lane at their source default of off.
     ...(i.p.bufferedSearchFeed?.enabled === true ? { INGEST_BUFFERED_SEARCH_FEED: "on" } : {}),
     // Both lanes apply the same ordering guard: declared once when either is armed.
@@ -475,7 +533,7 @@ export function sessionPipelineFunctionProps(i: SessionPipelineStageInputs & { b
  * and brief rules, this account) and the function's own role (the reconcile chain),
  * all `lambda:InvokeFunction` only. Nothing public, no Function URL action.
  */
-export function sessionPipelinePermissions(i: { accountId: string; functionName: string; ruleArn: string; briefRuleArn: string; analysisRuleArn?:string; analysisReconcileRuleArn?:string; semanticRuleArn?:string; bufferedSearchFeedRuleArn?: string; bufferedErasureDeleteRuleArn?: string; roleArn: string }) {
+export function sessionPipelinePermissions(i: { accountId: string; functionName: string; ruleArn: string; briefRuleArn: string; analysisRuleArn?:string; analysisReconcileRuleArn?:string; semanticRuleArn?:string; analysisJobRuleArn?:string; bufferedSearchFeedRuleArn?: string; bufferedErasureDeleteRuleArn?: string; roleArn: string }) {
   return [
     {
       id: "session-reconcile-permission",
@@ -510,6 +568,7 @@ export function sessionPipelinePermissions(i: { accountId: string; functionName:
     ...(i.analysisReconcileRuleArn?[{id:"session-analysis-reconcile-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.analysisReconcileRuleArn,sourceAccount:i.accountId}}]:[]),
     ...(i.analysisRuleArn?[{id:"session-analysis-cache-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.analysisRuleArn,sourceAccount:i.accountId}}]:[]),
     ...(i.semanticRuleArn?[{id:"session-semantic-copy-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.semanticRuleArn,sourceAccount:i.accountId}}]:[]),
+    ...(i.analysisJobRuleArn?[{id:"session-analysis-job-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.analysisJobRuleArn,sourceAccount:i.accountId}}]:[]),
     ...(i.bufferedSearchFeedRuleArn ? [{ id: "session-buffered-search-feed-permission", props: { action: "lambda:InvokeFunction", functionName: i.functionName, principal: "events.amazonaws.com", sourceArn: i.bufferedSearchFeedRuleArn, sourceAccount: i.accountId } }] : []),
     ...(i.bufferedErasureDeleteRuleArn ? [{ id: "session-buffered-erasure-delete-permission", props: { action: "lambda:InvokeFunction", functionName: i.functionName, principal: "events.amazonaws.com", sourceArn: i.bufferedErasureDeleteRuleArn, sourceAccount: i.accountId } }] : []),
   ] as const;
@@ -544,6 +603,10 @@ export function semanticCopyScheduleProps(i:{names:SessionPipelineNames;function
  return {name:i.names.semanticRule,description:"96bulls verified global feature copy",scheduleExpression:"rate(1 minute)",state:i.p.semanticCopy?.enabled?("ENABLED" as const):("DISABLED" as const),targets:[{Id:"session-pipeline",Arn:i.functionArn,Input:JSON.stringify({semanticCopy:true})}],tags:i.tags};
 }
 
+/** One analysis-job tick a minute (lane F1); DISABLED unless `analysisJobs.enabled`. */
+export function analysisJobScheduleProps(i:{names:SessionPipelineNames;functionArn:string;p:SessionPipelineInputs;tags:Record<string,string>}){
+ return {name:i.names.analysisJobRule,description:"96bulls session analysis jobs (relayhistory engine port)",scheduleExpression:"rate(1 minute)",state:i.p.analysisJobs?.enabled?("ENABLED" as const):("DISABLED" as const),targets:[{Id:"session-pipeline",Arn:i.functionArn,Input:JSON.stringify({sessionAnalysis:true})}],tags:i.tags};
+}
 /** One bounded buffered-stage feed run per minute; DISABLED by default and carries no credentials. */
 export function bufferedSearchFeedScheduleProps(i: { names: SessionPipelineNames; functionArn: string; p: SessionPipelineInputs; tags: Record<string, string> }) {
   return {
@@ -628,6 +691,7 @@ export const sessionPipelineWiring = (
     const analysisRule=yield* AWS.EventBridge.Rule("session-analysis-cache-schedule",analysisCacheScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
     const analysisReconcileRule=yield* AWS.EventBridge.Rule("session-analysis-reconcile-schedule",analysisReconcileScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
     const semanticRule=yield* AWS.EventBridge.Rule("session-semantic-copy-schedule",semanticCopyScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
+    const analysisJobRule=yield* AWS.EventBridge.Rule("session-analysis-job-schedule",analysisJobScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
     const bufferedSearchFeedRule = yield* AWS.EventBridge.Rule("session-buffered-search-feed-schedule", bufferedSearchFeedScheduleProps({ names, functionArn: i.fn.functionArn as unknown as string, p: i.p, tags: i.tags("session-pipeline") }) as never);
     const bufferedErasureDeleteRule = yield* AWS.EventBridge.Rule("session-buffered-erasure-delete-schedule", bufferedErasureDeleteScheduleProps({ names, functionArn: i.fn.functionArn as unknown as string, p: i.p, tags: i.tags("session-pipeline") }) as never);
     for (const { id, props } of sessionPipelinePermissions({
@@ -638,6 +702,7 @@ export const sessionPipelineWiring = (
       analysisRuleArn:(analysisRule as unknown as {ruleArn:string}).ruleArn,
       analysisReconcileRuleArn:(analysisReconcileRule as unknown as {ruleArn:string}).ruleArn,
       semanticRuleArn:(semanticRule as unknown as {ruleArn:string}).ruleArn,
+      analysisJobRuleArn:(analysisJobRule as unknown as {ruleArn:string}).ruleArn,
       bufferedSearchFeedRuleArn: (bufferedSearchFeedRule as unknown as { ruleArn: string }).ruleArn,
       bufferedErasureDeleteRuleArn: (bufferedErasureDeleteRule as unknown as { ruleArn: string }).ruleArn,
       roleArn,

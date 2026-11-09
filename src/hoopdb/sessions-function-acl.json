@@ -5,6 +5,17 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.analysis_read_v1(text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.analysis_request_json_v1(sessions.session_analysis_requests_v2)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.analysis_request_v1(text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_analysis_admit:EXECUTE"
+    ],
     "sessions.applied_repo_evidence(jsonb,jsonb)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE",
@@ -1001,6 +1012,12 @@
     "sessions.purge_daily_digest_narratives(text,text)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.purge_session_analysis_for_owned(text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.purge_session_analysis_for_owned(text,text,text,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.query_session_directory_activity_for(text,timestamp with time zone,timestamp with time zone,text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],text[],boolean,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone)": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
@@ -1098,7 +1115,27 @@
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
     ],
+    "sessions.session_analysis_admit_scope(text,text)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.session_analysis_cache_demand(text,text,text,text,boolean)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_analysis_neon_free(text,text,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.session_analysis_purge_grant(text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_analysis_require_caller(text[])": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.session_analysis_source_revision(text,text,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.session_analysis_v2_forget()": [
       "<owner>:EXECUTE"
     ],
     "sessions.session_brief(text,text,text)": [

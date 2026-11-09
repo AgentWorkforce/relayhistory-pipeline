@@ -14,6 +14,13 @@
  *                                    unset | "" | "false" (default: off, the route answers 501) | exactly "true";
  *                                    anything else is a startup error. Serves POST /v1/onboarding/heartbeat as an
  *                                    authenticated (rth:sync) 204 that discards the body: nothing is stored or logged.
+ *   RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS
+ *                                    unset | "" | "0" (default: off, every upload request is introspected) | a
+ *                                    plain decimal integer 1..60000 (no sign, spaces, exponent or leading zero);
+ *                                    anything else, a value over 60000 included, is a startup error (never
+ *                                    clamped). How long an admitted token is reused per process before it is
+ *                                    introspected again, also capped at the token's exp: the revocation lag.
+ *                                    Recommended 30000-60000 when Control load matters (selfhost-auth.ts).
  *   SESSION_ERASE_API_ENABLED        operator per-session erase route (session-erase.ts): exactly "1" enables;
  *                                    unset, "" or "0" is off; anything else is a startup error. With it,
  *                                    SESSION_ERASE_API_SECRET (+ _PREVIOUS during a rotation; Secret-injected, min
@@ -69,6 +76,9 @@ export const SELFHOST_INGEST_FLAG = "RELAYHISTORY_SELFHOST_INGEST";
 export const SELFHOST_INGEST_PORT_VAR = "RELAYHISTORY_INGEST_PORT";
 export const SELFHOST_SESSION_SELECTION_FLAG = "RELAYHISTORY_SELFHOST_SESSION_SELECTION";
 export const SELFHOST_HEARTBEAT_ACCEPT_FLAG = "RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT";
+export const SELFHOST_INTROSPECT_POSITIVE_TTL_VAR = "RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS";
+/** The largest positive introspection TTL accepted; relaycontrol.ts also caps at this. */
+export const SELFHOST_INTROSPECT_POSITIVE_TTL_MAX_MS = 60_000;
 export const SELFHOST_INGEST_ORIGIN_VAR = "RELAYHISTORY_INGEST_ORIGIN";
 export const SELFHOST_INGEST_DATABASE_URL_VAR = "RELAYHISTORY_INGEST_DATABASE_URL";
 export const SELFHOST_INGEST_POOL_MAX_VAR = "RELAYHISTORY_INGEST_PG_POOL_MAX";
@@ -101,6 +111,8 @@ export interface SelfhostIngestSettings {
   sessionSelection: boolean;
   /** RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT: answer the Desktop's onboarding heartbeat 204 (discarded). Default off. */
   heartbeatAccept: boolean;
+  /** RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS: positive introspection cache, ms. 0 (default) = none. */
+  introspectPositiveTtlMs: number;
   /** SESSION_ERASE_API_ENABLED (session-erase.ts). Default: disabled, the route answers 501. */
   sessionErase: SessionEraseConfig;
   /** Present only for SELFHOST_INGEST_ADMISSION=async|drain. */
@@ -133,6 +145,20 @@ export function selfhostHeartbeatAcceptEnabled(env: NodeJS.ProcessEnv = process.
   if (raw === undefined || raw === "" || raw === "false") return false;
   if (raw === "true") return true;
   throw new Error(`96bulls: ${SELFHOST_HEARTBEAT_ACCEPT_FLAG} must be true or false`);
+}
+
+/**
+ * RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS: unset, "" or "0" is 0 (no positive cache, today's
+ * behaviour); otherwise exactly a decimal integer up to 60000 (the read API's rule: no sign, spaces,
+ * exponent or leading zero). Anything else throws, a too-large value included (never clamped). Never echoes the value.
+ */
+export function selfhostIntrospectPositiveTtlMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[SELFHOST_INTROSPECT_POSITIVE_TTL_VAR];
+  if (raw === undefined || raw === "") return 0;
+  const value = /^(0|[1-9][0-9]{0,4})$/.test(raw) ? Number(raw) : NaN;
+  if (!Number.isSafeInteger(value) || value < 0 || value > SELFHOST_INTROSPECT_POSITIVE_TTL_MAX_MS)
+    throw new Error(`96bulls: ${SELFHOST_INTROSPECT_POSITIVE_TTL_VAR} must be unset or an integer from 0 to ${SELFHOST_INTROSPECT_POSITIVE_TTL_MAX_MS}`);
+  return value;
 }
 
 function port(env: NodeJS.ProcessEnv): number {
@@ -210,6 +236,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   if (!selfhostIngestEnabled(env)) return { enabled: false, port: port(env) };
   const sessionSelection = selfhostSessionSelectionEnabled(env);
   const heartbeatAccept = selfhostHeartbeatAcceptEnabled(env);
+  const introspectPositiveTtlMs = selfhostIntrospectPositiveTtlMs(env);
   const sessionErase = sessionEraseConfig(env);
   const policy = destinationPolicy(env);
   refuseHostedOnly(env);
@@ -241,6 +268,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     maxPerOrg: bounded(env, "INGEST_MAX_PER_ORG", 32, 1, 1000),
     sessionSelection,
     heartbeatAccept,
+    introspectPositiveTtlMs,
     sessionErase,
     ...(admission ? { admission } : {}),
     ...(analytics.sink !== "noop" ? { analytics } : {}),

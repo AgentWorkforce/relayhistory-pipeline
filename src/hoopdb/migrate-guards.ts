@@ -264,12 +264,19 @@ export const RUNTIME_APPLICATION_TABLE_PRIVILEGES = {
   "sessions.session_briefs": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_brief_wakeups": ["SELECT", "INSERT", "UPDATE", "DELETE"],
   "sessions.session_brief_attempts": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  // Lane F1 (20261105046000): the session-analysis worker's claim/reserve/complete/fail and sweep.
+  "sessions.session_analysis_jobs_v2": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_analysis_requests_v2": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_analysis_result_tickets": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_analysis_ticket_invocations": ["SELECT", "INSERT", "UPDATE", "DELETE"],
+  "sessions.session_analysis_ticket_reservations": ["SELECT", "INSERT"],
 } as const satisfies Record<string, readonly string[]>;
 
 export const RUNTIME_APPLICATION_SEQUENCES = [
   "sessions.pipeline_jobs_id_seq",
   "sessions.migration_ingest_audit_id_seq",
   "sessions.session_verdicts_id_seq",
+  "sessions.session_analysis_ticket_rev_seq",
 ] as const;
 
 export const RUNTIME_APPLICATION_RLS_TABLES = [
@@ -303,6 +310,11 @@ export const RUNTIME_APPLICATION_RLS_TABLES = [
   "sessions.session_briefs",
   "sessions.session_brief_wakeups",
   "sessions.session_brief_attempts",
+  "sessions.session_analysis_jobs_v2",
+  "sessions.session_analysis_requests_v2",
+  "sessions.session_analysis_result_tickets",
+  "sessions.session_analysis_ticket_invocations",
+  "sessions.session_analysis_ticket_reservations",
 ] as const;
 
 /**
@@ -368,6 +380,8 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
   "sessions.retry_session_brief_documents(uuid,text)",
   "sessions.retry_session_large_read(text,text,text,text,uuid,text)",
   "sessions.route_session_large_read(text,text,text,text)",
+  "sessions.session_analysis_neon_free(text,text,text)",
+  "sessions.session_analysis_source_revision(text,text,text)",
   "sessions.session_directory_project_text(text,text,text)",
   "sessions.session_directory_search_text(text,text,text,text,text,text,text,text)",
   "sessions.session_index_batch(jsonb)",
@@ -1556,7 +1570,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "e32befbd2ab9cf104747dce4aaa8cdc197d12039705ca0d1cbada060acca1ba8";
+  "d198f60237ff06fbbe5b7fb50d04a8943d444c5a095848d0d6843f97982e2342";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;
