@@ -134,3 +134,13 @@ test("a configured deadlineMs (READ_API_CANONICAL_DEADLINE_MS on the service) ab
   expect(aborted).toBe(true);
   expect(Date.now() - started).toBeLessThan(2500); // the configured 5 ms, not the 3000 default
 });
+
+test("a source that rejects synchronously on abort still yields the deadline reason (501, not 503)", async () => {
+  const f = fixture();
+  let aborted = false;
+  f.deps.canonicalEvents = { deadlineMs: 5, source: (_id, signal) => new Promise((_, reject) => signal.addEventListener("abort", () => { aborted = true; reject(new Error("aborted")); })) };
+  const res = await f.get();
+  expect(res.status).toBe(501);
+  expect(JSON.stringify(await res.json())).toContain("events_canonical_deadline");
+  expect(aborted).toBe(true);
+});

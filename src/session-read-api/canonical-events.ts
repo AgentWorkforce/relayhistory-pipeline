@@ -35,7 +35,13 @@ export async function canonicalEventPage(deps: CanonicalEventsDeps, liveness: Li
   try {
     const snapshot = await Promise.race([
       deps.source(identity, controller.signal),
-      new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new CanonicalReadError("deadline")); }, deps.deadlineMs ?? 3000); }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          // Settle the race first: aborting can reject the read synchronously.
+          reject(new CanonicalReadError("deadline"));
+          controller.abort();
+        }, deps.deadlineMs ?? 3000);
+      }),
     ]);
     if (!snapshot.exists || !/^[a-f0-9]{64}$/.test(snapshot.generation) || generation !== undefined && generation !== snapshot.generation)
       throw new CanonicalReadError("source_generation_changed");
