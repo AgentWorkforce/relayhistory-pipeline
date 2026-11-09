@@ -7,7 +7,11 @@
  */
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { MIGRATION_SENTINELS } from "./migration-sentinels.ts";
+import {
+  ADOPTABLE_INDEX_SQL,
+  ADOPTABLE_INDEXES,
+  MIGRATION_SENTINELS,
+} from "./migration-sentinels.ts";
 
 export interface GuardClient {
   query<R = Record<string, unknown>>(
@@ -1107,6 +1111,32 @@ async function exists(
 }
 
 /**
+ * The reviewed adoptable-index allowance (ADOPTABLE_INDEXES): true only when `step`
+ * declares index `name` adoptable, the step's whole inventory is its declared indexes,
+ * and the live index is the exact declared one (see ADOPTABLE_INDEX_SQL). Fails closed.
+ */
+async function adoptableIndex(
+  client: GuardClient,
+  step: string,
+  inventory: InventoryObject[],
+  name: string,
+): Promise<boolean> {
+  const declared = ADOPTABLE_INDEXES[step];
+  const x = declared?.find((d) => d.name === name);
+  if (!declared || !x) return false;
+  if (!inventory.every((o) => o.kind === "index" && declared.some((d) => d.name === o.name)))
+    return false;
+  try {
+    return Boolean(
+      (await client.query<{ e: boolean }>(ADOPTABLE_INDEX_SQL, [x.name, x.table, x.def]))
+        .rows[0]?.e,
+    );
+  } catch {
+    return false; // can't look: fail closed, not adoptable
+  }
+}
+
+/**
  * Refuses, before any write, unless the database is either empty of this migration
  * set or exactly a ledgered prefix of each migration lane. Upstream and 96Bulls are
  * independent append-only lanes: a later upstream release must remain deployable after
@@ -1115,6 +1145,8 @@ async function exists(
  *   ledger_gap            one lane isn't a contiguous prefix of its ordered steps;
  *   migration_changed     a ledgered step's file changed;
  *   unledgered_schema     an object that an unledgered step creates already exists.
+ * The one exception is ADOPTABLE_INDEXES: a declared index built out of band, exact,
+ * valid and ready, is accepted for its step (the step adopts it).
  * Nothing is ever imported into, or marked in, the ledger.
  */
 export async function sequencePreflight(
@@ -1181,11 +1213,16 @@ export async function sequencePreflight(
   const found: string[] = [];
   for (let i = 0; i < names.length; i++) {
     if (ledger.has(names[i]!)) continue;
-    for (const o of inventoryOf(sql[i]!)) {
+    const inventory = inventoryOf(sql[i]!);
+    for (const o of inventory) {
       const id = key(o);
       if (seen.has(id)) continue;
       seen.add(id);
-      if (await exists(client, o))
+      if (
+        (await exists(client, o)) &&
+        !(o.kind === "index" &&
+          (await adoptableIndex(client, names[i]!, inventory, o.name)))
+      )
         found.push(
           `${o.kind} ${o.name}${o.on ? ` on ${o.on}` : ""} (${names[i]})`,
         );
@@ -1208,6 +1245,15 @@ export async function sequencePreflight(
       );
     } catch {
       applied = true; // can't look: fail closed, as if the step had run
+    }
+    // An adoptable step's sentinel is its declared indexes: accepted only when every one is adoptable.
+    const declared = ADOPTABLE_INDEXES[names[i]!];
+    if (applied && declared?.length) {
+      const inventory = inventoryOf(sql[i]!);
+      let all = true;
+      for (const d of declared)
+        if (!(await adoptableIndex(client, names[i]!, inventory, d.name))) all = false;
+      if (all) applied = false;
     }
     if (applied) found.push(`sentinel ${sentinel.evidence} (${names[i]})`);
   }

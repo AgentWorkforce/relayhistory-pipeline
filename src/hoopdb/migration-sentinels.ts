@@ -29,6 +29,63 @@ export interface Sentinel {
   sql: string;
 }
 
+/** An index that an unledgered step may find already built out of band, and adopt. */
+export interface AdoptableIndex {
+  /** Index name, in the sessions schema. */
+  name: string;
+  /** The table it must be on, schema-qualified. */
+  table: string;
+  /** Exactly what pg_get_indexdef must return for it. */
+  def: string;
+}
+
+const CLAIM_BOOTSTRAP_ORG_INDEXES_STEP =
+  "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
+const orgIndex = (table: string, columns: string): AdoptableIndex => ({
+  name: `${table}_org_id_idx`,
+  table: `sessions.${table}`,
+  def: `CREATE INDEX ${table}_org_id_idx ON sessions.${table} USING btree (${columns})`,
+});
+
+/**
+ * The reviewed allowance for indexes built out of band before the migration that names
+ * them is ledgered (an operator CREATE INDEX CONCURRENTLY on a large production table:
+ * the migrator is transactional and cannot build concurrently). For the step listed here,
+ * and only for these names, sequencePreflight accepts a present-but-unledgered index when
+ * it is the only index of that name, sits in sessions on exactly that table, is valid,
+ * ready and live, and its pg_get_indexdef is exactly `def`. Anything else of that name is
+ * still unledgered_schema. The step's migration adopts the same definitions (it skips an
+ * exact valid index without locking its table, creates a missing one, and raises
+ * otherwise); a test keeps the two byte-identical.
+ *
+ * Claim-bootstrap org_id probes, 20261105044020 (packet:
+ * docs/packets/claim-bootstrap-org-index-packet-20261108.md), in the operator's build order.
+ */
+export const ADOPTABLE_INDEXES: Readonly<Record<string, readonly AdoptableIndex[]>> = {
+  [CLAIM_BOOTSTRAP_ORG_INDEXES_STEP]: [
+    orgIndex("ingest_history_mask_pages", "org_id"),
+    orgIndex("ingest_history_plans", "org_id, workspace_id, user_id"),
+    orgIndex("ingest_seed_captures", "org_id"),
+    orgIndex("ingest_publication_attempts", "org_id, workspace_id, user_id"),
+    orgIndex("ingest_publication_generations", "org_id, workspace_id, user_id"),
+    orgIndex("ingest_stage_intents", "org_id, workspace_id, user_id"),
+    orgIndex("ingest_custody_records", "org_id, workspace_id, user_id"),
+    orgIndex("ingest_lazy_native_slots", "org_id"),
+  ],
+};
+
+/** Read-only: one row, `e`, true when `$1` is an adoptable copy of the declared index ($1 name, $2 table, $3 def). */
+export const ADOPTABLE_INDEX_SQL = `SELECT (SELECT count(*) FROM pg_class WHERE relname = $1 AND relkind IN ('i', 'I')) = 1
+  AND EXISTS (SELECT 1 FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = $1 AND c.relnamespace = to_regnamespace('sessions') AND c.relkind = 'i'
+      AND i.indrelid = to_regclass($2) AND i.indisvalid AND i.indisready AND i.indislive
+      AND pg_get_indexdef(i.indexrelid) = $3) AS e`;
+
+/** All of a step's adoptable indexes are present, exact, valid and ready. */
+const adoptableIndexesSentinel = (step: string) =>
+  `SELECT count(*) = ${ADOPTABLE_INDEXES[step]!.length} AS applied FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relnamespace = to_regnamespace('sessions') AND i.indisvalid AND i.indisready AND i.indislive AND (c.relname, i.indrelid, pg_get_indexdef(i.indexrelid)) IN (${ADOPTABLE_INDEXES[step]!.map((x) => `('${x.name}', to_regclass('${x.table}'), '${x.def}')`).join(", ")})`;
+
 export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105041000_ingest_privacy_authority.sql": {
     evidence: "table sessions.ingest_privacy_authority + lazy-current adoption uses the EXACT source-table list (no prefix)",
@@ -215,6 +272,11 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105044000_read_api_tokens.sql": {
     evidence: "table sessions.read_api_tokens",
     sql: relation("sessions.read_api_tokens"),
+  },
+  // Adoptable step: an unledgered "applied" here is accepted when every declared index is adoptable.
+  [CLAIM_BOOTSTRAP_ORG_INDEXES_STEP]: {
+    evidence: "the eight claim-bootstrap <table>_org_id_idx indexes, exact definition, valid and ready",
+    sql: adoptableIndexesSentinel(CLAIM_BOOTSTRAP_ORG_INDEXES_STEP),
   },
 };
 
