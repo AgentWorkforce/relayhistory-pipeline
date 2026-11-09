@@ -139,6 +139,43 @@ async function rollbackLaterThan044020(db: PGlite, profile: MigrationProfile) {
     await db.exec(readFileSync(join(root, "supabase/rollbacks", `${name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`), "utf8"));
 }
 
+/** Historical fixture binaries must use the ACL catalogs of their selected migration prefix. */
+async function withPreviousReleaseAcl<T>(laterSteps: Awaited<ReturnType<typeof plan>>, work: () => Promise<T>): Promise<T> {
+  // That release's binary shipped the function ACL manifest of its day, which could not yet list a
+  // function a later step creates; the current manifest does, so the non-local exact-ACL check would
+  // refuse (function_acl_drift) a database without them. Validate against the previous manifest:
+  // the current one minus the functions later steps CREATE. No later step: the current manifest, unmocked.
+  const laterFns = new Set(laterSteps.flatMap((s) =>
+    [...readFileSync(s.path, "utf8").matchAll(/\bCREATE\s+FUNCTION\s+(sessions\.\w+)\s*\(/gi)].map((m) => m[1]!.toLowerCase())));
+  const manifest = await migrateGuards.sessionsFunctionAclManifest();
+  const previousManifest = Object.fromEntries(Object.entries(manifest).filter(([fn]) => !laterFns.has(fn.slice(0, fn.indexOf("(")))));
+  const previousRelease = laterSteps.length ? spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(previousManifest) : undefined;
+  // Likewise its runtime application ACL catalog could not list a table, sequence or function a later step creates;
+  // the current one does, so the ACL install (and the exact-ACL verifier) would fail on the missing relation
+  // (42P01). Install and verify the previous catalog: the current one minus the relations later steps CREATE
+  // (and the <table>_<column>_seq a serial/identity column of such a table implies). No later step: the
+  // current catalog, unmocked.
+  const laterRels = new Set(laterSteps.flatMap((s) =>
+    [...readFileSync(s.path, "utf8").matchAll(
+      /\bCREATE\s+(?:(?:UNLOGGED|TEMP|TEMPORARY)\s+)?(?:TABLE|SEQUENCE)\s+(?:IF\s+NOT\s+EXISTS\s+)?(sessions\.\w+)/gi,
+    )].map((m) => m[1]!.toLowerCase())));
+  const catalog = migrateGuards.runtimeApplicationAclCatalog();
+  const previousCatalog = {
+    tables: Object.fromEntries(Object.entries(catalog.tables).filter(([rel]) => !laterRels.has(rel))),
+    sequences: catalog.sequences.filter((rel) => !laterRels.has(rel) && ![...laterRels].some((t) => rel.startsWith(`${t}_`) && rel.endsWith("_seq"))),
+    rlsTables: catalog.rlsTables.filter((rel) => !laterRels.has(rel)),
+    // Its runtime EXECUTE grants likewise could not name a function a later step creates ($1::regprocedure).
+    functions: catalog.functions.filter((fn) => !laterFns.has(fn.slice(0, fn.indexOf("(")))),
+  };
+  const previousAcl = laterSteps.length ? spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(previousCatalog) : undefined;
+  try {
+    return await work();
+  } finally {
+    previousRelease?.mockRestore();
+    previousAcl?.mockRestore();
+  }
+}
+
 describe("HOOPDB_DB_MODE profile (no default, no host inference)", () => {
   const base = {
     HOOPDB_RUNTIME_ROLE: "hoop_runtime",
@@ -2298,13 +2335,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const GR = "upstream:20261105043890_buffered_search_gate_retired_witness.sql";
     const CB = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
     const SF = "upstream:20261105044040_buffered_stages_session_first.sql";
+    const SP = "upstream:20261105044050_selfhost_erase_short_summary_provenance.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
@@ -2346,7 +2384,38 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105044040 (session-first buffered stages) is the newest: 044030's down refuses (55000) while it is
+    // A successor such as the read-only summary RPC must roll back first.
+    // Preserve an explicit out-of-order refusal before using every successor's
+    // guarded down script, so newer additive lanes need no fixture rewrites.
+    const newerThanProvenance = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > SP).reverse();
+    if (newerThanProvenance.length)
+      expect((await failure(rollback("20261105044050_selfhost_erase_short_summary_provenance.down.sql")))?.code).toBe("55000");
+    for (const { name } of newerThanProvenance)
+      await rollback(`${name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`);
+    expect((await names()).filter((n) => newerThanProvenance.some((s) => s.name === n))).toEqual([]);
+    // 20261105044050 (erase clears the short_summary provenance) is the newest: 044040's, 044030's and 044010's downs refuse
+    // (55000) while it is applied, and its own down restores 044010's exact erase (the lock, without the provenance clear)
+    // and 060000's exact retire trigger function (still SECURITY DEFINER, both triggers kept).
+    const eraseSrc = async () => (await db.query<{ s: string | null }>("SELECT prosrc s FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)')")).rows[0]!.s;
+    const retireSrc = async () => (await db.query<{ s: string | null }>("SELECT prosrc s FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_publication_retire_fence()') AND prosecdef")).rows[0]?.s ?? null;
+    const retireTriggers = async () => (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname IN ('ingest_publication_retire_version','ingest_publication_retire_reset') AND tgfoid=to_regprocedure('sessions.ingest_publication_retire_fence()')")).rows[0]!.n;
+    expect(await eraseSrc()).toContain("short_summary_generated_at=NULL");
+    expect(await retireSrc()).toContain("short_summary_generated_at=NULL");
+    expect(await retireTriggers()).toBe(2);
+    expect((await failure(rollback("20261105044040_buffered_stages_session_first.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105044030_ingest_generation_overlap.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105044010_selfhost_erase_lock_fences.down.sql")))?.code).toBe("55000");
+    expect(await names()).toEqual(expect.arrayContaining([SF, V, SL]));
+    await rollback("20261105044050_selfhost_erase_short_summary_provenance.down.sql");
+    expect(await names()).not.toContain(SP);
+    expect(await eraseSrc()).not.toContain("short_summary_generated_at");
+    expect(await eraseSrc()).toContain("ingest_lock_fences(v_org,v_ws,v_user)");
+    expect(await retireSrc()).toContain("UPDATE sessions.session_directory d SET short_summary=NULL,\n   deleted_at=");
+    expect(await retireSrc()).not.toContain("short_summary_generated_at");
+    expect(await retireTriggers()).toBe(2);
+    // Its ledger row is gone, so running it again refuses and changes nothing.
+    expect((await failure(rollback("20261105044050_selfhost_erase_short_summary_provenance.down.sql")))?.code).toBe("55000");
+    // 20261105044040 (session-first buffered stages) is then the newest: 044030's down refuses (55000) while it is
     // applied; its own down restores 043700's exact two reader bodies (same ACL, still SECURITY DEFINER) and
     // keeps the records GIN, and a second run refuses (its ledger row is gone).
     const readerSrc = async () =>
@@ -2412,7 +2481,6 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await relation("sessions.ingest_seed_captures_org_id_idx")).toBeNull();
     // 20261105044010 (erase takes the fence lock) is then the newest: 043910's down refuses (55000) while it is
     // applied, and its own down restores 043910's exact body, without the lock.
-    const eraseSrc = async () => (await db.query<{ s: string | null }>("SELECT prosrc s FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)')")).rows[0]!.s;
     expect(await eraseSrc()).toContain("ingest_lock_fences(v_org,v_ws,v_user)");
     expect((await failure(rollback("20261105043910_selfhost_session_selection_erase.down.sql")))?.code).toBe("55000");
     await rollback("20261105044010_selfhost_erase_lock_fences.down.sql");
@@ -2814,7 +2882,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
     // Newer than 043900, so its down refuses until they are rolled back, newest first: every upstream step after
-    // 044020 (rollbackLaterThan044020: 044040, 044030), then 044020, 044010, 044000, 043910.
+    // 044020 (rollbackLaterThan044020: 044050, 044040, 044030), then 044020, 044010, 044000, 043910.
     const orgIndexesDown = readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8");
     const lockDown = readFileSync(join(root, "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql"), "utf8");
     const readTokensDown = readFileSync(join(root, "supabase/rollbacks/20261105044000_read_api_tokens.down.sql"), "utf8");
@@ -3327,7 +3395,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // The previous release: everything before 044040 (no later upstream step: a ledger gap), validated.
     const full = await plan(SUPA_ET);
     const later = full.filter((s) => s.name.startsWith("upstream:") && s.name > SF).map((s) => s.name);
-    expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps: full.filter((s) => s.name !== SF && !later.includes(s.name)) }))).toBeNull();
+    expect(await failure(withPreviousReleaseAcl(full.filter((s) => later.includes(s.name)), () =>
+      runMigrations(client(db), { profile: SUPA_ET, steps: full.filter((s) => s.name !== SF && !later.includes(s.name)) })))).toBeNull();
     // Production shape: ingest_claim_attempts populated (FK triggers off for this one superuser insert), no GIN yet.
     await db.exec(`SET session_replication_role = replica;
       INSERT INTO sessions.ingest_claim_attempts(claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,epochs,records)
@@ -3389,7 +3458,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       await db.exec(ET_BOOT);
       const full = await plan(SUPA_ET);
       const later = full.filter((s) => s.name.startsWith("upstream:") && s.name > SF).map((s) => s.name);
-      expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps: full.filter((s) => s.name !== SF && !later.includes(s.name)) }))).toBeNull();
+      expect(await failure(withPreviousReleaseAcl(full.filter((s) => later.includes(s.name)), () =>
+      runMigrations(client(db), { profile: SUPA_ET, steps: full.filter((s) => s.name !== SF && !later.includes(s.name)) })))).toBeNull();
       return db;
     };
     const ledgered = async (db: PGlite) =>
@@ -3461,39 +3531,9 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const laterSteps = laterUpstream(full) as typeof full;
     const later = laterSteps.map((s) => s.name);
     const steps = full.filter((s) => s.name !== CB && !later.includes(s.name));
-    // That release's binary shipped the function ACL manifest of its day, which could not yet list a
-    // function a later step creates; the current manifest does, so the non-local exact-ACL check would
-    // refuse (function_acl_drift) a database without them. Validate against the previous manifest:
-    // the current one minus the functions later steps CREATE. No later step: the current manifest, unmocked.
-    const laterFns = new Set(laterSteps.flatMap((s) =>
-      [...readFileSync(s.path, "utf8").matchAll(/\bCREATE\s+FUNCTION\s+(sessions\.\w+)\s*\(/gi)].map((m) => m[1]!.toLowerCase())));
-    const manifest = await migrateGuards.sessionsFunctionAclManifest();
-    const previousManifest = Object.fromEntries(Object.entries(manifest).filter(([fn]) => !laterFns.has(fn.slice(0, fn.indexOf("(")))));
-    const previousRelease = later.length ? spyOn(migrateGuards, "sessionsFunctionAclManifest").mockResolvedValue(previousManifest) : undefined;
-    // Likewise its runtime application ACL catalog could not list a table, sequence or function a later step creates;
-    // the current one does, so the ACL install (and the exact-ACL verifier) would fail on the missing relation
-    // (42P01). Install and verify the previous catalog: the current one minus the relations later steps CREATE
-    // (and the <table>_<column>_seq a serial/identity column of such a table implies). No later step: the
-    // current catalog, unmocked.
-    const laterRels = new Set(laterSteps.flatMap((s) =>
-      [...readFileSync(s.path, "utf8").matchAll(
-        /\bCREATE\s+(?:(?:UNLOGGED|TEMP|TEMPORARY)\s+)?(?:TABLE|SEQUENCE)\s+(?:IF\s+NOT\s+EXISTS\s+)?(sessions\.\w+)/gi,
-      )].map((m) => m[1]!.toLowerCase())));
-    const catalog = migrateGuards.runtimeApplicationAclCatalog();
-    const previousCatalog = {
-      tables: Object.fromEntries(Object.entries(catalog.tables).filter(([rel]) => !laterRels.has(rel))),
-      sequences: catalog.sequences.filter((rel) => !laterRels.has(rel) && ![...laterRels].some((t) => rel.startsWith(`${t}_`) && rel.endsWith("_seq"))),
-      rlsTables: catalog.rlsTables.filter((rel) => !laterRels.has(rel)),
-      // Its runtime EXECUTE grants likewise could not name a function a later step creates ($1::regprocedure).
-      functions: catalog.functions.filter((fn) => !laterFns.has(fn.slice(0, fn.indexOf("(")))),
-    };
-    const previousAcl = later.length ? spyOn(migrateGuards, "runtimeApplicationAclCatalog").mockReturnValue(previousCatalog) : undefined;
-    try {
+    await withPreviousReleaseAcl(laterSteps, async () => {
       expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps }))).toBeNull();
-    } finally {
-      previousRelease?.mockRestore();
-      previousAcl?.mockRestore();
-    }
+    });
     // Production shape: seven prebuilt CONCURRENTLY, the lazy-slot one held, its table populated.
     for (const x of ADOPTABLE_INDEXES[CB]!) if (x.name !== LAZY) await db.exec(x.def);
     await db.query(
