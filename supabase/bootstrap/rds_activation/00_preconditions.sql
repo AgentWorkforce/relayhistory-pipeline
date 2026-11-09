@@ -17,7 +17,7 @@ DECLARE
   v_spec jsonb := current_setting('hoopdb_activation.role_spec')::jsonb;
   v_verifiers jsonb := current_setting('hoopdb_activation.verifiers')::jsonb;
   v_me record;
-  v_rds oid := (SELECT oid FROM pg_roles WHERE rolname = 'rds_superuser');
+  v_rds oid := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = 'rds_superuser');
   v_row record;
   v_problems text[] := '{}';
   v_details text[];
@@ -40,21 +40,21 @@ BEGIN
     RAISE EXCEPTION USING ERRCODE = '55000',
       MESSAGE = format('rds-activation: connected to %I, not hoopdb', current_database());
   END IF;
-  SELECT * INTO v_me FROM pg_roles WHERE rolname = current_user;
+  SELECT * INTO v_me FROM pg_catalog.pg_roles WHERE rolname = current_user;
   IF v_me.rolsuper OR NOT v_me.rolcreaterole OR NOT v_me.rolcreatedb THEN
     RAISE EXCEPTION USING ERRCODE = '42501',
       MESSAGE = 'rds-activation: the provisioner must be a non-superuser with CREATEROLE and CREATEDB (the RDS master)';
   END IF;
-  IF v_rds IS NULL OR (SELECT rolsuper OR rolcanlogin FROM pg_roles WHERE oid = v_rds)
+  IF v_rds IS NULL OR (SELECT rolsuper OR rolcanlogin FROM pg_catalog.pg_roles WHERE oid = v_rds)
      OR NOT pg_has_role(v_me.oid, v_rds, 'USAGE') THEN
     RAISE EXCEPTION USING ERRCODE = '42501',
       MESSAGE = 'rds-activation: rds_superuser must exist (NOLOGIN, not SUPERUSER) and the provisioner must inherit it';
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rdsadmin' AND rolsuper AND oid <> v_me.oid) THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'rdsadmin' AND rolsuper AND oid <> v_me.oid) THEN
     RAISE EXCEPTION USING ERRCODE = '42501',
       MESSAGE = 'rds-activation: the fixed rdsadmin SUPERUSER was not proven';
   END IF;
-  IF NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = 'hoopdb' AND datdba = v_me.oid) THEN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_database WHERE datname = 'hoopdb' AND datdba = v_me.oid) THEN
     RAISE EXCEPTION USING ERRCODE = '55000',
       MESSAGE = 'rds-activation: hoopdb must still be owned by the provisioner (fresh path)',
       HINT = 'Nothing was changed. An activated hoopdb is owned by hoop: run verify instead.';
@@ -73,13 +73,13 @@ BEGIN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'rds-activation: malformed role spec';
   END IF;
 
-  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'hoopdb_activation_executor') THEN
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'hoopdb_activation_executor') THEN
     RAISE EXCEPTION USING ERRCODE = '55000',
       MESSAGE = 'rds-activation: reserved executor role hoopdb_activation_executor already exists',
       HINT = 'Nothing was changed. This executor never leaves it behind; inspect and remove it as a separate operator action.';
   END IF;
   FOR v_row IN
-    SELECT r.* FROM pg_roles r
+    SELECT r.* FROM pg_catalog.pg_roles r
      WHERE r.rolname IN (SELECT e->>'name' FROM jsonb_array_elements(v_spec) e)
      ORDER BY r.rolname
   LOOP
@@ -89,10 +89,10 @@ BEGIN
     IF v_row.rolcreatedb THEN v_details := v_details || 'CREATEDB'::text; END IF;
     IF v_row.rolreplication THEN v_details := v_details || 'REPLICATION'::text; END IF;
     IF v_row.rolbypassrls THEN v_details := v_details || 'BYPASSRLS'::text; END IF;
-    IF EXISTS (SELECT 1 FROM pg_auth_members WHERE member = v_row.oid) THEN
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members WHERE member = v_row.oid) THEN
       v_details := v_details || 'is a member of another role'::text;
     END IF;
-    IF EXISTS (SELECT 1 FROM pg_auth_members WHERE roleid = v_row.oid) THEN
+    IF EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members WHERE roleid = v_row.oid) THEN
       v_details := v_details || 'has members'::text;
     END IF;
     v_problems := v_problems || format('%I already exists (%s)', v_row.rolname,
@@ -103,18 +103,18 @@ BEGIN
     v_problems := v_problems || 'schema sessions already exists'::text;
   END IF;
   FOR v_row IN
-    SELECT nspname FROM pg_namespace
+    SELECT nspname FROM pg_catalog.pg_namespace
      WHERE nspname NOT IN ('public', 'pg_catalog', 'information_schema', 'pg_toast')
        AND nspname !~ '^pg_(temp|toast_temp)_[0-9]+$'
      ORDER BY 1
   LOOP
     v_problems := v_problems || format('unexpected schema %I in hoopdb', v_row.nspname)::text;
   END LOOP;
-  IF EXISTS (SELECT 1 FROM pg_extension WHERE extname <> 'plpgsql') THEN
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_extension WHERE extname <> 'plpgsql') THEN
     v_problems := v_problems || 'hoopdb has extensions besides plpgsql (expected a fresh template0 copy)'::text;
   END IF;
-  IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public')
-     OR EXISTS (SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public') THEN
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public')
+     OR EXISTS (SELECT 1 FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public') THEN
     v_problems := v_problems || 'schema public is not empty'::text;
   END IF;
   -- Default ACLs: the only rows allowed are the built-in owner/PUBLIC EXECUTE pieces
@@ -122,7 +122,7 @@ BEGIN
   -- both). Any other row in this database is refused.
   FOR v_row IN
     SELECT pg_get_userbyid(d.defaclrole) AS role, d.defaclnamespace, d.defaclobjtype, d.defaclacl::text AS acl
-      FROM pg_default_acl d
+      FROM pg_catalog.pg_default_acl d
      WHERE NOT (
        d.defaclrole IN (v_me.oid, v_rds) AND d.defaclnamespace = 0 AND d.defaclobjtype = 'f'
        AND NOT EXISTS (SELECT 1 FROM aclexplode(d.defaclacl) a
@@ -133,6 +133,13 @@ BEGIN
       v_row.role, v_row.defaclnamespace, v_row.defaclobjtype, v_row.acl)::text;
   END LOOP;
 
+  -- No database-level session defaults in hoopdb (ALTER DATABASE hoopdb SET ..., or
+  -- ALTER ROLE ... IN DATABASE hoopdb SET ...): a search_path or similar default set by
+  -- the database owner must not steer this or any later session.
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_db_role_setting s
+              WHERE s.setdatabase = (SELECT d.oid FROM pg_catalog.pg_database d WHERE d.datname = 'hoopdb')) THEN
+    v_problems := v_problems || 'hoopdb has database-level role settings (ALTER DATABASE or ALTER ROLE ... IN DATABASE)'::text;
+  END IF;
   -- Verifiers: exactly one well-formed, distinct SCRAM verifier per LOGIN role.
   IF jsonb_typeof(v_verifiers) <> 'object'
      OR (SELECT array_agg(k ORDER BY k) FROM jsonb_object_keys(v_verifiers) k)

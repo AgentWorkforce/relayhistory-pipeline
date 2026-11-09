@@ -43,9 +43,9 @@ BEGIN
     SELECT r.rolname AS role, pg_get_userbyid(m.member) AS member, pg_get_userbyid(m.grantor) AS grantor,
            g.rolsuper AS grantor_super, m.admin_option, m.inherit_option, m.set_option,
            m.roleid = r.oid AS as_role
-      FROM pg_roles r
-      JOIN pg_auth_members m ON r.oid IN (m.roleid, m.member, m.grantor)
-      JOIN pg_roles g ON g.oid = m.grantor
+      FROM pg_catalog.pg_roles r
+      JOIN pg_catalog.pg_auth_members m ON r.oid IN (m.roleid, m.member, m.grantor)
+      JOIN pg_catalog.pg_roles g ON g.oid = m.grantor
      WHERE r.rolname IN (SELECT e->>'name' FROM jsonb_array_elements(v_spec) e)
   LOOP
     IF NOT (v_row.as_role AND v_row.member = 'hoopdb_activation_executor'
@@ -55,8 +55,8 @@ BEGIN
                                v_row.grantor, v_row.admin_option, v_row.inherit_option, v_row.set_option)::text;
     END IF;
   END LOOP;
-  IF (SELECT count(*) FROM pg_auth_members WHERE member = 'hoopdb_activation_executor'::regrole
-        AND roleid IN (SELECT oid FROM pg_roles WHERE rolname IN (SELECT e->>'name' FROM jsonb_array_elements(v_spec) e)))
+  IF (SELECT count(*) FROM pg_catalog.pg_auth_members WHERE member = 'hoopdb_activation_executor'::regrole
+        AND roleid IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname IN (SELECT e->>'name' FROM jsonb_array_elements(v_spec) e)))
      <> jsonb_array_length(v_spec) THEN
     v_bad := v_bad || 'a created role lacks its creator edge'::text;
   END IF;

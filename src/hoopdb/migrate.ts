@@ -935,14 +935,14 @@ export async function rdsSeparateOwnerPreflight(client: MigrationClient): Promis
               session_user = current_user AS same_session,
               me.rolsuper AS owner_super, me.rolcreaterole AS owner_createrole, me.rolcreatedb AS owner_createdb,
               me.rolreplication AS owner_replication, me.rolbypassrls AS owner_bypassrls,
-              (SELECT count(*)::int FROM pg_auth_members m WHERE m.member = me.oid) AS owner_memberships,
-              (SELECT count(*)::int FROM pg_auth_members m WHERE m.roleid = me.oid) AS owner_members,
-              coalesce((SELECT a.rolsuper AND a.oid <> me.oid FROM pg_roles a WHERE a.rolname = 'rdsadmin'), false) AS rdsadmin_super,
-              coalesce((SELECT NOT s.rolsuper AND NOT s.rolcanlogin FROM pg_roles s WHERE s.rolname = 'rds_superuser'), false) AS rds_superuser_shape,
-              EXISTS (SELECT 1 FROM pg_database d WHERE d.datname = current_database() AND d.datdba = me.oid) AS owns_database,
-              EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspname = 'sessions' AND n.nspowner = me.oid) AS owns_sessions,
-              EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'hoopdb_activation_executor') AS executor_present
-         FROM pg_roles me WHERE me.rolname = current_user`,
+              (SELECT count(*)::int FROM pg_catalog.pg_auth_members m WHERE m.member = me.oid) AS owner_memberships,
+              (SELECT count(*)::int FROM pg_catalog.pg_auth_members m WHERE m.roleid = me.oid) AS owner_members,
+              coalesce((SELECT a.rolsuper AND a.oid <> me.oid FROM pg_catalog.pg_roles a WHERE a.rolname = 'rdsadmin'), false) AS rdsadmin_super,
+              coalesce((SELECT NOT s.rolsuper AND NOT s.rolcanlogin FROM pg_catalog.pg_roles s WHERE s.rolname = 'rds_superuser'), false) AS rds_superuser_shape,
+              EXISTS (SELECT 1 FROM pg_catalog.pg_database d WHERE d.datname = current_database() AND d.datdba = me.oid) AS owns_database,
+              EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n WHERE n.nspname = 'sessions' AND n.nspowner = me.oid) AS owns_sessions,
+              EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'hoopdb_activation_executor') AS executor_present
+         FROM pg_catalog.pg_roles me WHERE me.rolname = current_user`,
     )
   ).rows[0];
   const problems = !r

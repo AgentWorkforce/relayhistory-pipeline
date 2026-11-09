@@ -17,13 +17,13 @@ BEGIN
     NOLOGIN NOINHERIT CREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS NOSUPERUSER;
   EXECUTE format('GRANT hoopdb_activation_executor TO %I WITH INHERIT FALSE, SET TRUE', current_user);
   -- Exact edge set of the executor: the two edges above, and nothing else.
-  IF (SELECT count(*) FROM pg_auth_members m
+  IF (SELECT count(*) FROM pg_catalog.pg_auth_members m
        WHERE m.roleid = 'hoopdb_activation_executor'::regrole OR m.member = 'hoopdb_activation_executor'::regrole
           OR m.grantor = 'hoopdb_activation_executor'::regrole) <> 2
-     OR NOT EXISTS (SELECT 1 FROM pg_auth_members m
+     OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m
                      WHERE m.roleid = 'hoopdb_activation_executor'::regrole AND m.member = current_user::regrole
                        AND m.grantor = 'rdsadmin'::regrole AND m.admin_option AND NOT m.inherit_option AND NOT m.set_option)
-     OR NOT EXISTS (SELECT 1 FROM pg_auth_members m
+     OR NOT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m
                      WHERE m.roleid = 'hoopdb_activation_executor'::regrole AND m.member = current_user::regrole
                        AND m.grantor = current_user::regrole AND NOT m.admin_option AND NOT m.inherit_option AND m.set_option) THEN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'rds-activation: unexpected executor edge set';

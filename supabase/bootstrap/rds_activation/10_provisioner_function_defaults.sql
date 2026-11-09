@@ -26,7 +26,7 @@ BEGIN
     SELECT coalesce(array_agg(e ORDER BY e), '{}') INTO v_default
       FROM (SELECT CASE WHEN a.grantee = d.defaclrole THEN '<self>' ELSE coalesce(pg_get_userbyid(a.grantee), 'PUBLIC') END
                    || ':' || a.privilege_type || CASE WHEN a.is_grantable THEN '*' ELSE '' END AS e
-              FROM pg_default_acl d, aclexplode(d.defaclacl) a
+              FROM pg_catalog.pg_default_acl d, aclexplode(d.defaclacl) a
              WHERE d.defaclrole = v_target::regrole AND d.defaclnamespace = 0 AND d.defaclobjtype = 'f') x;
     IF v_default IS DISTINCT FROM ARRAY['<self>:EXECUTE']::text[] THEN
       RAISE EXCEPTION USING ERRCODE = '55000',

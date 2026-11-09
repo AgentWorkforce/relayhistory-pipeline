@@ -20,10 +20,10 @@
  * JSON result goes only to --result-file or --result-fd. stdout is a human log.
  */
 import { createHash, createHmac, pbkdf2Sync, randomBytes } from "node:crypto";
-import { closeSync, openSync, readdirSync, readFileSync, writeSync } from "node:fs";
+import { closeSync, fstatSync, fsyncSync, openSync, readdirSync, readFileSync, writeSync } from "node:fs";
 import { isIP } from "node:net";
-import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join, resolve as resolvePath } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import pg from "pg";
 
 export const CONTRACT = "rds-activation/v1";
@@ -401,19 +401,48 @@ export function isPolicyRefusal(e: unknown): boolean {
  * included). At COMMIT, a non-policy failure (connection lost) leaves the outcome
  * unknown, so it is internal_error, and the operator must run verify.
  */
+/** An error reply from the server (it carries severity and a SQLSTATE), not a transport failure. */
+export function isServerError(e: unknown): boolean {
+  const x = e as { severity?: unknown; code?: unknown };
+  return typeof x?.severity === "string" && typeof x?.code === "string" && /^[0-9A-Z]{5}$/.test(x.code);
+}
+
+/**
+ * verify_failed only for a real verification verdict: a server error reply (fragment 70's
+ * 55000, a refused login) or a driver-side mismatch. A transport failure is internal_error.
+ */
+export function verifyFailureStatus(e: unknown): FailStatus {
+  return isServerError(e) || (e as { verifyMismatch?: boolean })?.verifyMismatch === true ? "verify_failed" : "internal_error";
+}
+
+/** After a lost COMMIT reply: the re-checked state decides; anything but fresh/activated is indeterminate. */
+export function commitRecheckStatus(state: "fresh" | "activated" | "inconsistent" | "unreachable"): FailStatus | "activated" {
+  return state === "activated" ? "activated" : state === "fresh" ? "rolled_back" : "internal_error";
+}
+
 export function classifyActivateFailure(at: string, e: unknown): FailStatus {
   if (at === "connect" || at === "lock" || at === "begin" || at === "00_preconditions")
     return isPolicyRefusal(e) ? "refused" : "internal_error";
-  if (at === "commit") return isPolicyRefusal(e) ? "rolled_back" : "internal_error";
+  // A server error reply to COMMIT means it did not commit. A transport failure there is
+  // re-checked by activate() itself; if it reaches here the outcome is unknown.
+  if (at === "commit") return isServerError(e) ? "rolled_back" : "internal_error";
   return "rolled_back";
 }
 class StepFailure extends Error {
-  constructor(readonly status: FailStatus, readonly steps: Step[], readonly graph: Result["graph"] = null) {
+  // Plain fields, not TypeScript parameter properties: the driver must run under Node's
+  // erasable-only type stripping (infra #67 guest), not just Bun.
+  readonly status: FailStatus;
+  readonly steps: Step[];
+  readonly graph: Result["graph"];
+  constructor(status: FailStatus, steps: Step[], graph: Result["graph"] = null) {
     super(steps.at(-1)?.message ?? status);
+    this.status = status;
+    this.steps = steps;
+    this.graph = graph;
   }
 }
 
-function scrub(text: string, cfg: Config): string {
+export function scrub(text: string, cfg: Pick<Config, "secrets">): string {
   let out = text;
   const s = cfg.secrets;
   for (const v of [s.provisioner_password, s.current_password, s.new_password, ...Object.values(s.role_passwords)])
@@ -429,6 +458,9 @@ function connect(cfg: Config, user: string, database: string, password: string):
     database,
     password,
     application_name: "hoopdb-rds-activation",
+    // Startup option: wins over ALTER DATABASE / ALTER ROLE defaults, so a database owner
+    // cannot steer catalog lookups with a search_path (shadow pg_roles and the like).
+    options: "-c search_path=pg_catalog,pg_temp",
     ssl: cfg.tls === "disable" ? false : { ca: readFileSync(cfg.caFile!, "utf8"), rejectUnauthorized: true, servername: cfg.host },
     connectionTimeoutMillis: 15_000,
   });
@@ -446,6 +478,7 @@ const failed = (cfg: Config, name: string, e: unknown): Step => {
 const ok = (name: string, message: string | null = null): Step => ({ name, status: "ok", sqlstate: null, message });
 
 async function bindSettings(client: pg.Client, cfg: Config, phase: "activate" | "verify", verifiers: Record<string, string> = {}) {
+  await client.query("SET LOCAL search_path = pg_catalog, pg_temp");
   await client.query(
     `SELECT set_config('hoopdb_activation.phase', $1, true), set_config('hoopdb_activation.provisioner', $2, true),
             set_config('hoopdb_activation.role_spec', $3, true), set_config('hoopdb_activation.verifiers', $4, true)`,
@@ -464,7 +497,7 @@ export async function createDatabase(cfg: Config): Promise<{ step: Step; created
     if (who.s !== cfg.provisioner || who.c !== cfg.provisioner) throw refuse("42501", "connected identity is not the named provisioner");
     if (who.v < 160000) throw refuse("0A000", "rds-activation/v1 requires PostgreSQL 16 or later (PostgreSQL 15 is refused)");
     let created = false;
-    const exists = async () => (await client.query("SELECT 1 FROM pg_database WHERE datname = $1", [DATABASE])).rowCount === 1;
+    const exists = async () => (await client.query("SELECT 1 FROM pg_catalog.pg_database WHERE datname = $1", [DATABASE])).rowCount === 1;
     if (!(await exists())) {
       try {
         // Not transactional by PostgreSQL design (it copies a template on disk), so this
@@ -477,7 +510,7 @@ export async function createDatabase(cfg: Config): Promise<{ step: Step; created
     }
     const d = (await client.query(
       `SELECT pg_get_userbyid(datdba) AS owner, pg_encoding_to_char(encoding) AS enc, datistemplate, datallowconn
-         FROM pg_database WHERE datname = $1`, [DATABASE])).rows[0];
+         FROM pg_catalog.pg_database WHERE datname = $1`, [DATABASE])).rows[0];
     const problems = [
       ...(d?.enc === "UTF8" ? [] : [`encoding ${d?.enc}`]),
       ...(d?.datistemplate ? ["is a template"] : []),
@@ -500,9 +533,9 @@ export async function activationState(cfg: Config): Promise<"fresh" | "activated
   try {
     await client.connect();
     const r = (await client.query(
-      `SELECT (SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = $1) AS owner,
-              (SELECT count(*)::int FROM pg_roles WHERE rolname = ANY ($2)) AS present,
-              EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $3) AS executor`,
+      `SELECT (SELECT pg_get_userbyid(datdba) FROM pg_catalog.pg_database WHERE datname = $1) AS owner,
+              (SELECT count(*)::int FROM pg_catalog.pg_roles WHERE rolname = ANY ($2)) AS present,
+              EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $3) AS executor`,
       [DATABASE, cfg.spec.map((s) => s.name), EXECUTOR])).rows[0];
     if (r.owner === OWNER && r.present === cfg.spec.length && !r.executor) return "activated";
     // Still the provisioner's database: fragment 00 decides, and lists any pre-existing
@@ -544,6 +577,20 @@ export async function activate(cfg: Config, opts: ActivateOptions = {}): Promise
   } catch (e) {
     await client.query("ROLLBACK").catch(() => undefined);
     steps.push(failed(cfg, current, e));
+    if (current === "commit" && !isServerError(e)) {
+      // The COMMIT reply was lost: the server may have committed. Decide from the shared
+      // catalogs on a fresh connection, never from the client's view.
+      let state: Awaited<ReturnType<typeof activationState>> | "unreachable";
+      try {
+        state = await activationState(cfg);
+      } catch {
+        state = "unreachable";
+      }
+      steps.push({ name: "commit-recheck", status: state === "activated" ? "ok" : "failed", sqlstate: null,
+        message: `COMMIT outcome re-checked on a fresh connection: ${state}` });
+      if (state === "activated") return steps; // committed; the caller goes on to verify
+      throw new StepFailure(commitRecheckStatus(state) as FailStatus, steps);
+    }
     throw new StepFailure(classifyActivateFailure(current, e), steps);
   } finally {
     await client.end().catch(() => undefined);
@@ -563,12 +610,12 @@ export async function verify(cfg: Config): Promise<{ steps: Step[]; graph: Resul
     const g = (await hoop.query(
       `SELECT coalesce((SELECT array_agg(x.e ORDER BY x.e) FROM (
                           SELECT format('%s<-%s/%s', pg_get_userbyid(roleid), pg_get_userbyid(member), pg_get_userbyid(grantor)) AS e
-                            FROM pg_auth_members m
-                           WHERE m.roleid IN (SELECT oid FROM pg_roles WHERE rolname = ANY ($1))
-                              OR m.member IN (SELECT oid FROM pg_roles WHERE rolname = ANY ($1))
-                              OR m.grantor IN (SELECT oid FROM pg_roles WHERE rolname = ANY ($1))) x), '{}') AS edges,
-              EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $2) AS helper,
-              coalesce((SELECT array_agg(rolname::text ORDER BY rolname) FROM pg_roles WHERE rolname = ANY ($1)), '{}') AS roles`,
+                            FROM pg_catalog.pg_auth_members m
+                           WHERE m.roleid IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY ($1))
+                              OR m.member IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY ($1))
+                              OR m.grantor IN (SELECT oid FROM pg_catalog.pg_roles WHERE rolname = ANY ($1))) x), '{}') AS edges,
+              EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = $2) AS helper,
+              coalesce((SELECT array_agg(rolname::text ORDER BY rolname) FROM pg_catalog.pg_roles WHERE rolname = ANY ($1)), '{}') AS roles`,
       [names, EXECUTOR])).rows[0];
     graph = { edges: g.edges, helper_present: g.helper, roles: g.roles };
     await hoop.query(readRepo(fragmentPath("70_validate")).toString("utf8"));
@@ -577,7 +624,7 @@ export async function verify(cfg: Config): Promise<{ steps: Step[]; graph: Resul
   } catch (e) {
     await hoop.query("ROLLBACK").catch(() => undefined);
     steps.push(failed(cfg, "verify:hoop", e));
-    throw new StepFailure("verify_failed", steps, graph);
+    throw new StepFailure(verifyFailureStatus(e), steps, graph);
   } finally {
     await hoop.end().catch(() => undefined);
   }
@@ -590,11 +637,11 @@ export async function verify(cfg: Config): Promise<{ steps: Step[]; graph: Resul
               has_database_privilege(current_user, current_database(), 'TEMPORARY') AS db_temp,
               has_schema_privilege(current_user, 'sessions', 'CREATE') AS schema_create`)).rows[0];
     if (r.s !== RUNTIME || r.c !== RUNTIME || r.db_create || r.db_temp || r.schema_create)
-      throw Object.assign(new Error(`runtime identity or privileges unexpected: ${JSON.stringify(r)}`), { code: "55000" });
+      throw Object.assign(new Error(`runtime identity or privileges unexpected: ${JSON.stringify(r)}`), { code: "55000", verifyMismatch: true });
     steps.push(ok("verify:runtime"));
   } catch (e) {
     steps.push(failed(cfg, "verify:runtime", e));
-    throw new StepFailure("verify_failed", steps, graph);
+    throw new StepFailure(verifyFailureStatus(e), steps, graph);
   } finally {
     await rt.end().catch(() => undefined);
   }
@@ -640,7 +687,7 @@ export async function rotateSelf(cfg: Config): Promise<Step[]> {
     await after.query("SELECT 1");
   } catch (e) {
     steps.push(failed(cfg, `${name}:new-login`, e));
-    throw new StepFailure("verify_failed", steps);
+    throw new StepFailure(verifyFailureStatus(e), steps);
   } finally {
     await after.end().catch(() => undefined);
   }
@@ -766,21 +813,72 @@ export function invalidInputResult(argv: string[], message: string) {
   };
 }
 
-export function writeResult(target: Config["result"], result: object): void {
-  const body = `${JSON.stringify(result, null, 2)}\n`;
+/** An opened, validated result channel. Opened before any database work. */
+export interface ResultChannel { fd: number; file?: string }
+
+/**
+ * Validates and opens the result target before any database work: a file is created
+ * exclusively (0600, refused if it exists); a descriptor must be open (fstat). Throws
+ * InvalidInput, so a bad channel costs nothing on the server.
+ */
+export function openResultChannel(target: Config["result"]): ResultChannel {
   if ("fd" in target) {
-    writeSync(target.fd, body);
-    return;
+    try {
+      fstatSync(target.fd);
+    } catch {
+      throw new InvalidInput(`--result-fd ${target.fd} is not an open descriptor`);
+    }
+    return { fd: target.fd };
   }
-  const fd = openSync(target.file, "wx", 0o600);
   try {
-    writeSync(fd, body);
-  } finally {
-    closeSync(fd);
+    return { fd: openSync(target.file, "wx", 0o600), file: target.file };
+  } catch (e) {
+    throw new InvalidInput(`--result-file cannot be created exclusively (${(e as { code?: string }).code ?? "error"})`);
   }
 }
 
-if (import.meta.main) {
+/** Writes all bytes: loops over short writes and retries EAGAIN (non-blocking pipes). */
+export function writeAll(
+  fd: number,
+  data: Buffer,
+  write: (fd: number, buf: Buffer, off: number, len: number) => number = (f, b, o, l) => writeSync(f, b, o, l),
+): void {
+  let off = 0;
+  let spins = 0;
+  while (off < data.length) {
+    let n: number;
+    try {
+      n = write(fd, data, off, data.length - off);
+    } catch (e) {
+      if ((e as { code?: string }).code !== "EAGAIN" || ++spins > 10_000) throw e;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+      continue;
+    }
+    if (n <= 0) throw new Error("result write made no progress");
+    off += n;
+    spins = 0;
+  }
+}
+
+export function writeChannel(ch: ResultChannel, result: object): void {
+  try {
+    writeAll(ch.fd, Buffer.from(`${JSON.stringify(result, null, 2)}\n`, "utf8"));
+    if (ch.file) fsyncSync(ch.fd);
+  } finally {
+    if (ch.file) closeSync(ch.fd);
+  }
+}
+
+/** Opens and writes in one step (tests, and the invalid-input path). */
+export function writeResult(target: Config["result"], result: object): void {
+  writeChannel(openResultChannel(target), result);
+}
+
+/** Entry point under Bun (import.meta.main) and under Node, where import.meta.main may be absent. */
+const isMain = typeof (import.meta as { main?: boolean }).main === "boolean"
+  ? (import.meta as { main?: boolean }).main
+  : process.argv[1] !== undefined && pathToFileURL(resolvePath(process.argv[1])).href === import.meta.url;
+if (isMain) {
   let cfg: Config;
   try {
     cfg = parseInputs(process.argv.slice(2), process.env);
@@ -798,12 +896,20 @@ if (import.meta.main) {
     }
     process.exit(EXIT.invalid_input);
   }
+  // The result channel is validated and opened before any database work.
+  let channel: ResultChannel;
+  try {
+    channel = openResultChannel(cfg.result);
+  } catch (e) {
+    console.error(`rds-activation: invalid input: ${(e as Error).message}`);
+    process.exit(EXIT.invalid_input);
+  }
   const result = await execute(cfg);
   for (const s of result.steps)
     console.log(`${s.status.toUpperCase().padEnd(7)} ${s.name}${s.sqlstate ? ` ${s.sqlstate}` : ""}${s.message ? ` ${s.message}` : ""}`);
   console.log(`rds-activation: ${result.status} (exit ${result.exit_code}) artifact ${result.artifact_sha256}`);
   try {
-    writeResult(cfg.result, result);
+    writeChannel(channel, result);
   } catch (e) {
     console.error(`rds-activation: could not write the result: ${(e as Error).message}`);
     process.exit(EXIT.internal_error);

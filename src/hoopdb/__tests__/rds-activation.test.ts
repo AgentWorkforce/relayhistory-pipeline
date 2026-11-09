@@ -376,8 +376,10 @@ describe("failure classes: a lost connection is never reported as a policy refus
       expect(classifyActivateFailure(at, conn)).toBe("rolled_back");
     }
     expect(classifyActivateFailure("commit", conn)).toBe("internal_error");
+    // Only a server error reply to COMMIT proves it did not commit.
     expect(classifyActivateFailure("commit", { code: "40001" })).toBe("internal_error");
-    expect(classifyActivateFailure("commit", policy)).toBe("rolled_back");
+    expect(classifyActivateFailure("commit", policy)).toBe("internal_error");
+    expect(classifyActivateFailure("commit", { severity: "ERROR", code: "40001" })).toBe("rolled_back");
   });
 });
 

@@ -23,7 +23,7 @@ BEGIN
   PERFORM set_config('hoopdb_activation.verifiers', '{}', true);
   v_verifiers := NULL;
   IF EXISTS (SELECT 1 FROM jsonb_array_elements(current_setting('hoopdb_activation.role_spec')::jsonb) e
-               JOIN pg_roles r ON r.rolname = e->>'name'
+               JOIN pg_catalog.pg_roles r ON r.rolname = e->>'name'
               WHERE r.rolcanlogin IS DISTINCT FROM (e->>'login')::boolean) THEN
     RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'rds-activation: LOGIN does not match the role spec';
   END IF;

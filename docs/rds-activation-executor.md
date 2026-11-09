@@ -24,7 +24,12 @@ ADMIN edge, and any CREATEROLE role there can alter any non-superuser role.
 
 ```
 bun src/hoopdb/rds-activation.ts <command> [flags]
+node --experimental-strip-types src/hoopdb/rds-activation.ts <command> [flags]   # Node 22.6+
 ```
+
+The driver uses only erasable TypeScript syntax: no parameter properties, enums or
+namespaces. A unit test runs it under `node --experimental-strip-types`, so this cannot
+regress.
 
 | Command | What it does | Connects as | Database | Transaction |
 |---|---|---|---|---|
@@ -146,6 +151,11 @@ written to disk except the result, which never contains a secret or a verifier.
 
 ## Outputs
 
+The result target is validated and opened **before any database work**. A file is
+created exclusively (0600, refused if it exists); a descriptor must be open. A bad
+channel is exit 2, with no server contact. The write loops over short writes and
+retries `EAGAIN`, and a result file is fsynced before close.
+
 stdout and stderr carry human-readable progress only. They are **not** an interface and
 must never be parsed. The machine-readable result is one JSON document written once, at
 exit, to `--result-file` or `--result-fd`, and nowhere else. Invalid input (exit 2)
@@ -160,8 +170,8 @@ or ambiguous part is exit 2 the sole signal.
 | 2 | `invalid_input` | bad flags, environment or secrets; no connection was made |
 | 3 | `refused` | the server reported a policy or precondition refusal (SQLSTATE class 0A, 22, 28, 42 or 55) in step 1, before or in fragment 00, or at the `rotate-self` login; nothing was changed |
 | 4 | `rolled_back` | the `activate` transaction failed after fragment 00 and was rolled back; an empty `hoopdb` from step 1 may remain, and a re-run is safe |
-| 5 | `verify_failed` | post-commit verification (or the `rotate-self` re-login check) failed; `activate` did commit |
-| 1 | `internal_error` | anything else. This includes a lost connection, a socket error or an admin shutdown before or in fragment 00 (no policy verdict; nothing was changed), and a lost connection at `COMMIT` (outcome unknown: run `verify` before anything else) |
+| 5 | `verify_failed` | post-commit verification (or the `rotate-self` re-login check) returned a verdict: fragment 70 or a login was refused by the server, or the runtime probe mismatched. `activate` did commit. A transport failure during verify is `internal_error` instead |
+| 1 | `internal_error` | anything else. This includes a lost connection, a socket error or an admin shutdown before or in fragment 00 (no policy verdict; nothing was changed), and a lost `COMMIT` reply whose outcome could not be decided. On a lost `COMMIT` reply the driver re-checks the shared catalogs on a fresh connection: if activated, it carries on and verifies; if still fresh, the result is `rolled_back`; otherwise it is `internal_error` (indeterminate; run `verify`). A server error reply to `COMMIT` is `rolled_back` |
 
 Result document (v1):
 
@@ -258,6 +268,18 @@ Emulated on PG16 and PG17: the phase-1 chain, a full migrate, runtime readiness
 - Verified TLS against the pinned RDS CA bundle. A wrong CA and a wrong host name must both be refused.
 
 ## Security model and trade-offs
+
+- **Catalog lookups cannot be spoofed by the database owner.** After activation `hoop`
+  owns `hoopdb`. So it could create shadow `pg_roles` or `pg_auth_members` tables and
+  point a search_path at them (`ALTER DATABASE hoopdb SET search_path`, or its own role
+  default). Every connection therefore starts with
+  `-c search_path=pg_catalog,pg_temp` (a startup option, which beats database and role
+  defaults). Every transaction also runs `SET LOCAL search_path = pg_catalog, pg_temp`.
+  Every catalog reference in the fragments, the driver and `rdsSeparateOwnerPreflight`
+  is `pg_catalog`-qualified, and a unit test enforces that. Fragments 00 and 70 also
+  refuse any database-level role setting in `hoopdb`. Emulated on PG16 and PG17: a
+  shadow `pg_auth_members` plus `ALTER DATABASE hoopdb SET search_path` makes `verify`
+  fail closed (exit 5) and still report the real extra edge.
 
 - **No standing capability.** After `activate`, only `rdsadmin` (AWS) holds ADMIN on any
   HoopDb role. The provisioner holds nothing on `hoopdb`, and `hoop` cannot create or
