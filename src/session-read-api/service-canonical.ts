@@ -43,6 +43,12 @@
  *                             default 100000, accepted 100000..4000000. For both: unset or empty is the default
  *                             (byte-identical); malformed, below the default or above the bound fails startup,
  *                             naming the variable (never clamped). The 500000 projected-row bound is unchanged.
+ *   READ_API_CANONICAL_DEADLINE_MS                    per-request deadline (ms) of every canonical read above (timing,
+ *                             turns and message-id reads, metadata/catalog, events), a plain positive integer; accepted
+ *                             3000..60000. Unset or empty: no deadline is passed, so the routes keep their 3000 default
+ *                             (byte-identical); malformed or out of range fails startup, naming the variable (never
+ *                             clamped). Keep it below the ingress/proxy read timeout (stock ingress-nginx: 60 s). Read
+ *                             only here, so never on the hosted Worker/Lambda, which keep 3000.
  *
  * The store is built by src/shared/locker.ts buildLockerStore, the builder
  * every other service uses, so credentials, provider selection and egress rules
@@ -122,6 +128,24 @@ export function canonicalScopeBudget(env: NodeJS.ProcessEnv): { scopeBytes: numb
   return { scopeBytes, ...(scopeEvents !== undefined ? { scopeEvents } : {}) };
 }
 
+/** READ_API_CANONICAL_DEADLINE_MS bounds: the app.ts / canonical-events.ts route default up to 60 s (stock ingress-nginx read timeout). */
+export const CANONICAL_DEADLINE_MS_MIN = 3000, CANONICAL_DEADLINE_MS_MAX = 60_000;
+
+/**
+ * The self-host canonical read deadline (see the header): undefined when unset or empty, so the routes keep their
+ * `?? 3000` default. Throws at startup on a malformed or out-of-range value, naming the variable and its range (not
+ * the value); never clamps.
+ */
+export function canonicalDeadlineMs(env: NodeJS.ProcessEnv): number | undefined {
+  const raw = env.READ_API_CANONICAL_DEADLINE_MS;
+  if (raw === undefined || raw === "") return undefined;
+  const m = /^([1-9][0-9]{0,12})$/u.exec(raw);
+  const value = m ? Number(m[1]) : NaN;
+  if (!Number.isSafeInteger(value) || value < CANONICAL_DEADLINE_MS_MIN || value > CANONICAL_DEADLINE_MS_MAX)
+    throw new Error(`session read api: READ_API_CANONICAL_DEADLINE_MS must be a whole number of milliseconds in ${CANONICAL_DEADLINE_MS_MIN}..${CANONICAL_DEADLINE_MS_MAX}`);
+  return value;
+}
+
 /**
  * The canonical source for the service, or undefined when LOCKER_BUCKET is unset
  * (the routes then answer 501 `*_not_configured`, unchanged). Throws at startup
@@ -154,6 +178,9 @@ export async function serviceCanonicalDeps(
   // Existing public ndjson reader budgets remain managed separately. The
   // brief-only JSONL reader retains its fixed canonical byte/record bounds.
   const scope = canonicalScopeBudget(env);
+  // Self-host only; absent when unset, so every route keeps its `?? 3000` default (see the header).
+  const deadlineMs = canonicalDeadlineMs(env);
+  const deadline = deadlineMs !== undefined ? { deadlineMs } : {};
   function deps(signal: AbortSignal): CanonicalDeps {
     // Every object read of this request is aborted at the route's deadline.
     const bounded: typeof fetch = (input, init) => fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal });
@@ -166,9 +193,9 @@ export async function serviceCanonicalDeps(
   }
   return {
     transcriptSource: (identity, signal) => canonicalTranscriptSnapshot(deps(signal), identity, signal),
-    events: { source },
-    timing: { state: pointers.state, source, assumeNoTurns: env.READ_API_TIMING_ASSUME_NO_TURNS?.trim() === "true" },
-    turns: { harnesses: sqlSessionHarnesses(run), source, assumeNoLegacy: env.READ_API_TURNS_ASSUME_NO_LEGACY === "true" },
-    catalog: { state: pointers.state, source },
+    events: { source, ...deadline },
+    timing: { state: pointers.state, source, assumeNoTurns: env.READ_API_TIMING_ASSUME_NO_TURNS?.trim() === "true", ...deadline },
+    turns: { harnesses: sqlSessionHarnesses(run), source, assumeNoLegacy: env.READ_API_TURNS_ASSUME_NO_LEGACY === "true", ...deadline },
+    catalog: { state: pointers.state, source, ...deadline },
   };
 }
