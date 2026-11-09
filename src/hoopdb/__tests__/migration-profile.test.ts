@@ -2297,13 +2297,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const V = "upstream:20261105044030_ingest_generation_overlap.sql";
     const GR = "upstream:20261105043890_buffered_search_gate_retired_witness.sql";
     const CB = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
+    const SP = "upstream:20261105044050_selfhost_erase_short_summary_provenance.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SP]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
       rollback("20261105024000_session_brief_documents.down.sql"),
@@ -2345,7 +2346,20 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105044030 (generation overlap) is the newest: 044020, 044010, 044000, 043910, 043900 and 043880 refuse (55000)
+    // 20261105044050 (erase clears the short_summary provenance) is the newest: 044030's and 044010's downs refuse
+    // (55000) while it is applied, and its own down restores 044010's exact body (the lock, without the provenance clear).
+    const eraseSrc = async () => (await db.query<{ s: string | null }>("SELECT prosrc s FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)')")).rows[0]!.s;
+    expect(await eraseSrc()).toContain("short_summary_generated_at=NULL");
+    expect((await failure(rollback("20261105044030_ingest_generation_overlap.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105044010_selfhost_erase_lock_fences.down.sql")))?.code).toBe("55000");
+    expect(await names()).toEqual(expect.arrayContaining([V, SL]));
+    await rollback("20261105044050_selfhost_erase_short_summary_provenance.down.sql");
+    expect(await names()).not.toContain(SP);
+    expect(await eraseSrc()).not.toContain("short_summary_generated_at");
+    expect(await eraseSrc()).toContain("ingest_lock_fences(v_org,v_ws,v_user)");
+    // Its ledger row is gone, so running it again refuses and changes nothing.
+    expect((await failure(rollback("20261105044050_selfhost_erase_short_summary_provenance.down.sql")))?.code).toBe("55000");
+    // 20261105044030 (generation overlap) is then the newest: 044020, 044010, 044000, 043910, 043900 and 043880 refuse (55000)
     // while it is applied, so it rolls back FIRST; its own down restores the exact strict 050000
     // ingest_require_generation and 055000 ingest_lazy_guard, drops the window and retired tables, the policy
     // retirement trigger and its six functions, and marks the validation pending (the fence bodies changed).
@@ -2388,7 +2402,6 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await relation("sessions.ingest_seed_captures_org_id_idx")).toBeNull();
     // 20261105044010 (erase takes the fence lock) is then the newest: 043910's down refuses (55000) while it is
     // applied, and its own down restores 043910's exact body, without the lock.
-    const eraseSrc = async () => (await db.query<{ s: string | null }>("SELECT prosrc s FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)')")).rows[0]!.s;
     expect(await eraseSrc()).toContain("ingest_lock_fences(v_org,v_ws,v_user)");
     expect((await failure(rollback("20261105043910_selfhost_session_selection_erase.down.sql")))?.code).toBe("55000");
     await rollback("20261105044010_selfhost_erase_lock_fences.down.sql");
@@ -2790,7 +2803,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
     // Newer than 043900, so its down refuses until they are rolled back, newest first: every upstream step after
-    // 044020 (rollbackLaterThan044020: 044030), then 044020, 044010, 044000, 043910.
+    // 044020 (rollbackLaterThan044020: 044050, 044030), then 044020, 044010, 044000, 043910.
     const orgIndexesDown = readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8");
     const lockDown = readFileSync(join(root, "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql"), "utf8");
     const readTokensDown = readFileSync(join(root, "supabase/rollbacks/20261105044000_read_api_tokens.down.sql"), "utf8");

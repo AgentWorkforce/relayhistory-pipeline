@@ -110,6 +110,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // #386 generation overlap: owner-only window, retired record and policy trigger; replaces
       // ingest_require_generation / ingest_lazy_guard (in OBJECTS.replacedFunctions below).
       "20261105044030_ingest_generation_overlap.sql",
+      // Replacement of the self-host erase only (clears the short_summary provenance columns); no ingest path calls it.
+      "20261105044050_selfhost_erase_short_summary_provenance.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

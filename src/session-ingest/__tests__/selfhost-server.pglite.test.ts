@@ -462,6 +462,35 @@ describe("per-session erase (RELAYHISTORY_SELFHOST_SESSION_SELECTION=true)", () 
     expect(gone.rows[0]!.deleted_at).not.toBeNull();
   });
 
+  test("a directory row carrying a short summary and its provenance: all five cleared together, never 23514 (044050)", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db } = await start(rc, on);
+    await pointer(db, "sess-1", machine);
+    await pointer(db, "sess-1", "srv_other-machine");
+    await directory(db, "sess-1");
+    await db.query(
+      `UPDATE sessions.session_directory SET short_summary = 'a scrubbed summary', short_summary_scrub_ruleset = 'relayhistory-scrub',
+         short_summary_scrub_version = 1, short_summary_source = 'bob-costas/extractive/v1', short_summary_generated_at = now()
+       WHERE session_id = 'sess-1'`);
+    const summary = async () =>
+      (await db.query("SELECT deleted_at, short_summary, short_summary_scrub_ruleset, short_summary_scrub_version, short_summary_source, short_summary_generated_at FROM sessions.session_directory WHERE session_id = 'sess-1'")).rows[0];
+    const cleared = { short_summary: null, short_summary_scrub_ruleset: null, short_summary_scrub_version: null, short_summary_source: null, short_summary_generated_at: null };
+    // Another machine's copy is still live, so the row is not tombstoned and the tombstone trigger does not clear
+    // the provenance: before 044050 this UPDATE broke session_directory_short_summary_provenance (23514, a 503).
+    const res = await post(url(SELECTION), await selection());
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ updated: true });
+    expect((await row(db, "sess-1", machine)).deleted_at).not.toBeNull();
+    expect((await row(db, "sess-1", "srv_other-machine")).deleted_at).toBeNull();
+    expect(await summary()).toEqual({ deleted_at: null, ...cleared });
+    // The last live copy gone, a second erase tombstones the row; still all five NULL.
+    await db.query("DELETE FROM sessions.session_index WHERE machine_id = 'srv_other-machine'");
+    expect((await post(url(SELECTION), await selection())).status).toBe(200);
+    const gone = await summary();
+    expect(gone!.deleted_at).not.toBeNull();
+    expect({ ...gone, deleted_at: null }).toEqual({ deleted_at: null, ...cleared });
+  });
+
   test("one selection erases every origin of the caller's session, relay turns included; another user's copy stays", async () => {
     const rc = await relaycontrol(() => active(["rth:sync"]));
     const { url, db } = await start(rc, on);
