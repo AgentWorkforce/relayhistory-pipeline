@@ -17,6 +17,10 @@
  *
  *   - A partial session (`needs_full = 1`) is checked when pagination starts.
  *     A cursor continues the read that check admitted.
+ *   - The self-host Postgres service can replay an explicitly named older
+ *     session from verified canonical objects. These pages recheck readiness
+ *     and bind their cursor to the source generation; workspace search keeps
+ *     its retention floor.
  *   - A search page that reaches the history floor is a terminal 200 with a
  *     `continuation` (CONTINUATION below): the rows from the floor up, and
  *     where the existing backend must continue strictly below it.
@@ -58,6 +62,7 @@ import type { SearchServiceBinding } from "../session-pipeline/search-adapter.ts
 import { CursorError, decodeBackendCursor, decodeCursor } from "./cursor.ts";
 import { TenantMismatchError, partialSessions, partialSessionsInWorkspace, readBufferedEventPage, readEventPage, type Liveness } from "./page.ts";
 import type { EventQuery } from "./queries.ts";
+import { CANONICAL_CURSOR_PREFIX, canonicalEventPage, type CanonicalEventsDeps } from "./canonical-events.ts";
 import { CanonicalReadError, type CanonicalIdentity } from "./canonical.ts";
 import { timingFromCanonical, type CanonicalRows } from "./session-timing-source.ts";
 import { TimingInputError } from "./timing.ts";
@@ -84,6 +89,7 @@ import {
   BUFFERED_IDS_HEADER,
   BUFFERED_LIST_MAX_LIMIT,
   BufferedFenced,
+  fenceSubtype,
   BufferedTooLarge,
   bufferedIdsHeader,
   bufferedSessionSummary,
@@ -96,6 +102,7 @@ import {
   type BufferedScope,
   type BufferedSessionRow,
   type OwnerBufferedDeps,
+  type UnverifiedBeforeCandidate,
   OwnerBufferedPhaseTimer,
   type OwnerBufferedReadOptions,
 } from "./owner-buffered.ts";
@@ -164,6 +171,8 @@ export interface ReadApiDeps {
   timing?: TimingDeps;
   /** Relay session turns and metadata from canonical S3 (session-turns-source.ts); absent = 501 `turns_not_configured`. */
   turns?: TurnsDeps;
+  /** Service-only verified canonical object reads for exact sessions outside search retention. */
+  canonicalEvents?: CanonicalEventsDeps;
   /** Babysitter evidence reader (babysitter-evidence.ts); absent = 501 `delivery_records_not_configured`. */
   babysitter?: EvidenceDeps;
   /**
@@ -609,11 +618,11 @@ export function createReadApi(deps: ReadApiDeps) {
     return () => signal.removeEventListener("abort", onAbort);
   }
 
-  async function bufferedDetail<T extends object>(c: Context, read: () => Promise<T | null | { unverifiedBeforeCandidate: string }>): Promise<T | null> {
+  async function bufferedDetail<T extends object>(c: Context, read: () => Promise<T | null | UnverifiedBeforeCandidate>): Promise<T | null> {
     try {
       const served = await read();
       if (served && "unverifiedBeforeCandidate" in served) {
-        log({ route: c.req.routePath, reason: "buffered_unverified", gate: served.unverifiedBeforeCandidate, correlation_id: c.get("correlationId") });
+        log({ route: c.req.routePath, reason: "buffered_unverified", error_code: fenceSubtype(served.unverifiedBeforeCandidate), ...(served.unverifiedSqlstateClass ? { sqlstate: served.unverifiedSqlstateClass } : {}), correlation_id: c.get("correlationId") });
         return null;
       }
       return served as T | null;
@@ -623,7 +632,7 @@ export function createReadApi(deps: ReadApiDeps) {
         return null;
       }
       if (error instanceof BufferedFenced) {
-        log({ route: c.req.routePath, reason: "buffered_fenced", gate: error.reason, correlation_id: c.get("correlationId") });
+        log({ route: c.req.routePath, reason: "buffered_fenced", error_code: fenceSubtype(error.reason), ...(error.sqlstateClass ? { sqlstate: error.sqlstateClass } : {}), correlation_id: c.get("correlationId") });
         throw bufferedFenced();
       }
       if (error instanceof TenantMismatchError || error instanceof HttpError) throw error;
@@ -706,7 +715,7 @@ export function createReadApi(deps: ReadApiDeps) {
       // Any canonical pointer: canonical serves the whole response and no buffered read runs.
       let start: Awaited<ReturnType<Liveness["sessionStart"]>> | undefined;
       const ob = source !== undefined ? ownerBufferedFor(identity) : undefined;
-      if (ob?.events === true && source !== undefined) {
+      if (ob?.events === true && source !== undefined && !rawCursor?.startsWith(CANONICAL_CURSOR_PREFIX)) {
         const presented = decodeBackendCursor(rawCursor);
         // READ_API_OWNER_BUFFERED_PHASE_LOG=1: per-phase times on the request line (durations only).
         const phases = ob.phaseLog === true ? new OwnerBufferedPhaseTimer() : undefined;
@@ -733,7 +742,37 @@ export function createReadApi(deps: ReadApiDeps) {
         // Hidden, or canonical now serves: a buffered cursor cannot continue here.
         if (presented?.backend === "buffered") throw cursorTransition();
       }
-      const cursor = decodeCursor(rawCursor);
+      const objectCursor = rawCursor?.startsWith(CANONICAL_CURSOR_PREFIX) === true;
+      const cursor = objectCursor ? undefined : decodeCursor(rawCursor);
+      // Search retention is not canonical object retention. Only the Node
+      // service with a verified Locker source can answer this exact old scope;
+      // workspace search and the hosted/Worker paths retain their floor.
+      if (source !== undefined && deps.selfhost && deps.canonicalEvents && deps.adapter?.index.backend === "postgres" &&
+          (deps.directoryWorkspaces === "*" || deps.directoryWorkspaces?.has(identity.workspaceId))) {
+        start ??= await deps.liveness.sessionStart(identity.orgId, identity.workspaceId, sessionId, source);
+        if (start.live > 0 && start.createdAtMs !== null && (start.createdAtMs < deps.completeSinceMs || objectCursor)) {
+          if (cursor) throw unsupported("canonical_cursor_required");
+          const check = async () => {
+            if ((await partialSessions(pageDeps(), identity.orgId, sessionId, identity.workspaceId)).length > 0)
+              throw unsupported("session_partial");
+          };
+          // Recheck completeness on every page and after the generation-fenced
+          // object read; a cursor never licenses a stale/partial projection.
+          await check();
+          let page;
+          try {
+            page = await canonicalEventPage(deps.canonicalEvents, deps.liveness,
+              { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId, source, order, limit, maxContent, cursor }, objectCursor ? rawCursor : undefined);
+          } catch (error) {
+            if (error instanceof CanonicalReadError) throw error.status === 400 ? bad("canonical cursor is not valid") : unsupported(`events_canonical_${error.reason}`);
+            throw error;
+          }
+          const events = includeMessageId ? await withMessageIds(identity, sessionId, source, page.events) : page.events;
+          await check();
+          return c.json({ sessionId, events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
+        }
+      }
+      if (objectCursor) throw unsupported("canonical_cursor_scope");
       if ((await sessionGate(identity, sessionId, source, cursor !== undefined, start)) === "empty")
         return c.json({ sessionId, events: [], nextCursor: null, correlationId: c.get("correlationId") });
       const page = await gatedPage(
@@ -890,7 +929,7 @@ export function createReadApi(deps: ReadApiDeps) {
       if (error instanceof TenantMismatchError) throw error;
       if (error instanceof BufferedFenced) {
         fenced = true;
-        log({ route: c.req.routePath, reason: "buffered_fenced", gate: error.reason, correlation_id: c.get("correlationId") });
+        log({ route: c.req.routePath, reason: "buffered_fenced", error_code: fenceSubtype(error.reason), ...(error.sqlstateClass ? { sqlstate: error.sqlstateClass } : {}), correlation_id: c.get("correlationId") });
       } else log({ route: c.req.routePath, reason: "buffered_list_error", error_code: (error as { name?: string })?.name ?? "error", correlation_id: c.get("correlationId") });
     }
     const { sources, notSources, bounds } = q;
