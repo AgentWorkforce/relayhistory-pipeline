@@ -139,6 +139,10 @@ async function upload(store: ReturnType<typeof createFsStore>, records: Relayhis
 function fakeMetadata(live: () => string[]) {
   const tx: SqlExecutor = {
     async query<R>(text: string) {
+      // The pre-recorded-title catalog schema (044100 absent), as pipeline.test.ts models it:
+      // the directory catalog probe needs a boolean row, never an empty reply.
+      if (text.includes("pg_catalog.pg_attribute") && text.includes("recorded_catalog_title"))
+        return { rows: [{ supported: false }] as R[] };
       if (text.includes("pg_try_advisory_xact_lock")) return { rows: [{ ok: true }] as R[] };
       if (text.includes("event_projection_sources")) return { rows: [{ written: true }] as R[] };
       if (text.includes("FROM sessions.session_index") && text.includes("deleted_at IS NULL"))
