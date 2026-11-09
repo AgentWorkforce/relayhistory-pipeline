@@ -198,6 +198,14 @@ describe.skipIf(!ownerUrl)("self-host writer bootstrap on real Postgres", () => 
   beforeAll(async () => {
     pool = ownerPool();
     await ensureProvisioned(pool);
+    // Explicit opt-in operator ceremony on the disposable native fixture only.
+    // Product bootstrap never discovers or borrows a privileged connection.
+    if (process.env.SESSION_PIPELINE_TEST_OPERATOR_PG_URL) {
+      await pool.query("CREATE SCHEMA IF NOT EXISTS search_index");
+      const operator = new pg.Pool({ connectionString: process.env.SESSION_PIPELINE_TEST_OPERATOR_PG_URL });
+      try { await operator.query(readSql("supabase/bootstrap/session_consumer_credential_probe.sql")); }
+      finally { await operator.end(); }
+    }
   });
 
   afterAll(async () => {
