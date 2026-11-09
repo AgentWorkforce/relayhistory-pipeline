@@ -240,7 +240,7 @@ export function parseInputs(
       throw new InvalidInput("secrets and connection URLs are never accepted on the command line");
     const name = a.includes("=") ? a.slice(0, a.indexOf("=")) : a;
     const spec = OPTIONS[name];
-    if (!spec) throw new InvalidInput(`unknown argument ${name}`);
+    if (!spec) throw new InvalidInput(name.startsWith("--") ? `unknown argument ${name}` : "unexpected positional argument (value not shown)");
     if (name in flags) throw new InvalidInput(`${name} given twice`);
     if (spec.flag) {
       if (a.includes("=")) throw new InvalidInput(`${name} takes no value`);
@@ -380,7 +380,33 @@ export interface ActivateOptions {
   faultAfter?: Fragment;
 }
 
-type FailStatus = "refused" | "rolled_back" | "verify_failed";
+type FailStatus = "refused" | "rolled_back" | "verify_failed" | "internal_error";
+
+/**
+ * A server-reported policy or precondition outcome (feature, privilege, object state,
+ * lock busy, authentication or data refusal) is a refusal. Anything else (a lost
+ * connection, a socket error, a timeout, an admin shutdown such as 57P01) carries no
+ * policy verdict and is reported as internal_error, so an operator never reads a
+ * dropped connection as a refusal.
+ */
+export function isPolicyRefusal(e: unknown): boolean {
+  const code = (e as { code?: string })?.code;
+  return typeof code === "string" && /^(0A|28|42|55|22)[0-9A-Z]{3}$/.test(code);
+}
+
+/**
+ * Classifies an activate-transaction failure by where it happened and what failed.
+ * Before or in fragment 00: policy refusal -> refused, otherwise internal_error. Inside
+ * fragments 10..70: rolled_back (the server aborts the transaction, connection loss
+ * included). At COMMIT, a non-policy failure (connection lost) leaves the outcome
+ * unknown, so it is internal_error, and the operator must run verify.
+ */
+export function classifyActivateFailure(at: string, e: unknown): FailStatus {
+  if (at === "connect" || at === "lock" || at === "begin" || at === "00_preconditions")
+    return isPolicyRefusal(e) ? "refused" : "internal_error";
+  if (at === "commit") return isPolicyRefusal(e) ? "rolled_back" : "internal_error";
+  return "rolled_back";
+}
 class StepFailure extends Error {
   constructor(readonly status: FailStatus, readonly steps: Step[], readonly graph: Result["graph"] = null) {
     super(steps.at(-1)?.message ?? status);
@@ -462,7 +488,7 @@ export async function createDatabase(cfg: Config): Promise<{ step: Step; created
     return { step: ok(name, created ? "created" : "already present"), created, owner: d.owner, version: who.v };
   } catch (e) {
     if (e instanceof StepFailure) throw e;
-    throw new StepFailure("refused", [failed(cfg, name, e)]);
+    throw new StepFailure(isPolicyRefusal(e) ? "refused" : "internal_error", [failed(cfg, name, e)]);
   } finally {
     await client.end().catch(() => undefined);
   }
@@ -518,8 +544,7 @@ export async function activate(cfg: Config, opts: ActivateOptions = {}): Promise
   } catch (e) {
     await client.query("ROLLBACK").catch(() => undefined);
     steps.push(failed(cfg, current, e));
-    const before = current === "connect" || current === "lock" || current === "00_preconditions";
-    throw new StepFailure(before ? "refused" : "rolled_back", steps);
+    throw new StepFailure(classifyActivateFailure(current, e), steps);
   } finally {
     await client.end().catch(() => undefined);
   }
@@ -604,7 +629,7 @@ export async function rotateSelf(cfg: Config): Promise<Step[]> {
     await before.query("COMMIT");
   } catch (e) {
     if (e instanceof StepFailure) throw e;
-    throw new StepFailure("refused", [failed(cfg, name, e)]);
+    throw new StepFailure(isPolicyRefusal(e) ? "refused" : "internal_error", [failed(cfg, name, e)]);
   } finally {
     await before.end().catch(() => undefined);
   }
@@ -706,6 +731,41 @@ export async function execute(cfg: Config, opts: ActivateOptions = {}): Promise<
   }
 }
 
+/**
+ * For invalid input (exit 2): the result target, if the raw argv/env named a usable one
+ * (--result-file/--result-fd, = or separate form, or their env variables). Never
+ * throws. When the target itself is the invalid part, it returns null and only exit 2
+ * remains.
+ */
+export function rawResultTarget(argv: string[], env: Record<string, string | undefined>): Config["result"] | null {
+  const pick = (flag: string, envName: string): string | undefined => {
+    const vals: string[] = [];
+    argv.forEach((a, i) => {
+      if (a === flag && argv[i + 1] !== undefined) vals.push(argv[i + 1]!);
+      else if (a.startsWith(`${flag}=`)) vals.push(a.slice(flag.length + 1));
+    });
+    if (env[envName]) vals.push(env[envName]!);
+    return new Set(vals).size === 1 ? vals[0] : undefined;
+  };
+  const file = pick("--result-file", "HOOPDB_ACTIVATION_RESULT_FILE");
+  const fd = pick("--result-fd", "HOOPDB_ACTIVATION_RESULT_FD");
+  if (file !== undefined && fd !== undefined) return null;
+  if (fd !== undefined) return /^[0-9]+$/.test(fd) && Number(fd) >= 3 ? { fd: Number(fd) } : null;
+  return file ? { file } : null;
+}
+
+/** The exit-2 result document. The message names flags or variables, never their values. */
+export function invalidInputResult(argv: string[], message: string) {
+  const command = COMMANDS.includes(argv[0] as Command) ? (argv[0] as Command) : null;
+  return {
+    contract: CONTRACT,
+    command,
+    status: "invalid_input",
+    exit_code: EXIT.invalid_input,
+    steps: [{ name: "inputs", status: "failed", sqlstate: null, message }],
+  };
+}
+
 export function writeResult(target: Config["result"], result: object): void {
   const body = `${JSON.stringify(result, null, 2)}\n`;
   if ("fd" in target) {
@@ -725,8 +785,17 @@ if (import.meta.main) {
   try {
     cfg = parseInputs(process.argv.slice(2), process.env);
   } catch (e) {
-    console.error(`rds-activation: ${e instanceof InvalidInput ? "invalid input" : "error"}: ${(e as Error).message}`);
-    // Invalid input never reaches the result channel (it may be the invalid part); exit 2 is the result.
+    const message = e instanceof InvalidInput ? e.message : "input could not be parsed";
+    console.error(`rds-activation: invalid input: ${message}`);
+    // Written whenever a usable result target was given; otherwise exit 2 alone.
+    const target = rawResultTarget(process.argv.slice(2), process.env);
+    if (target) {
+      try {
+        writeResult(target, invalidInputResult(process.argv.slice(2), message));
+      } catch (w) {
+        console.error(`rds-activation: could not write the result: ${(w as Error).message}`);
+      }
+    }
     process.exit(EXIT.invalid_input);
   }
   const result = await execute(cfg);

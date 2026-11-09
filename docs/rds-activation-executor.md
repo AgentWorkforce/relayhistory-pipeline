@@ -87,7 +87,9 @@ to, GRANT or DROP any HoopDb role, and `hoop` cannot CREATE ROLE.
 ## Role set (generated, never hand-maintained)
 
 The driver builds the role spec at runtime from these files, all of which are part of
-the artifact identity:
+the artifact identity. At v1 it holds 17 roles, of which 9 are LOGIN (`hoop`,
+`sessions_pipeline_runtime` and 7 service logins). `bulls96_babysitter_retention` is
+deferred to NOLOGIN (below), and 7 more roles are NOLOGIN by design.
 
 - `rds_migration_roles.sql`: the fixed NOLOGIN inventory.
 - `session_consumer_roles.sql`: the bare consumer role.
@@ -147,16 +149,19 @@ written to disk except the result, which never contains a secret or a verifier.
 stdout and stderr carry human-readable progress only. They are **not** an interface and
 must never be parsed. The machine-readable result is one JSON document written once, at
 exit, to `--result-file` or `--result-fd`, and nowhere else. Invalid input (exit 2)
-writes no result, because the result channel may itself be the invalid input.
+also writes a result (`status: "invalid_input"`, `exit_code: 2`, the reason in
+`steps[0].message`, never a value) whenever the raw arguments or environment name one
+unambiguous, usable result target. Only when the result channel is itself the invalid
+or ambiguous part is exit 2 the sole signal.
 
 | Code | `status` | Meaning |
 |---|---|---|
 | 0 | `activated`, `already_activated`, `verified`, `database_ready`, `rotated`, `artifact` | success |
-| 2 | (no result) | bad flags, environment or secrets; no connection was made |
-| 3 | `refused` | a precondition failed (step 1, the state probe, fragment 00, or `rotate-self` login); nothing was changed |
+| 2 | `invalid_input` | bad flags, environment or secrets; no connection was made |
+| 3 | `refused` | the server reported a policy or precondition refusal (SQLSTATE class 0A, 22, 28, 42 or 55) in step 1, before or in fragment 00, or at the `rotate-self` login; nothing was changed |
 | 4 | `rolled_back` | the `activate` transaction failed after fragment 00 and was rolled back; an empty `hoopdb` from step 1 may remain, and a re-run is safe |
 | 5 | `verify_failed` | post-commit verification (or the `rotate-self` re-login check) failed; `activate` did commit |
-| 1 | `internal_error` | anything else |
+| 1 | `internal_error` | anything else. This includes a lost connection, a socket error or an admin shutdown before or in fragment 00 (no policy verdict; nothing was changed), and a lost connection at `COMMIT` (outcome unknown: run `verify` before anything else) |
 
 Result document (v1):
 

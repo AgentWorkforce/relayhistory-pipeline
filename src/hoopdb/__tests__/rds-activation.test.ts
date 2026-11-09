@@ -8,19 +8,26 @@
  */
 import { describe, expect, test } from "bun:test";
 import { createHash, createHmac, pbkdf2Sync } from "node:crypto";
-import { readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import {
   artifactIdentity,
+  classifyActivateFailure,
   CONTRACT,
   EXECUTOR,
   FRAGMENTS,
   InvalidInput,
+  invalidInputResult,
+  isPolicyRefusal,
   LOGIN_DEFERRED_BY_FROZEN_MIGRATION,
   parseInputs,
   parseRoleSpec,
   passwordEnv,
+  rawResultTarget,
   roleSpecSources,
+  writeResult,
   scramVerifier,
   type RoleSpec,
 } from "../rds-activation.ts";
@@ -337,5 +344,95 @@ describe("migrator: HOOPDB_RDS_LAYOUT=separate-database", () => {
       expect(r).toMatch(/nothing was written/);
     }
     expect(await code(undefined)).toMatch(/^rds_profile_unproven: .*owner role not found/);
+  });
+});
+
+describe("role counts (v1)", () => {
+  test("17 roles, 9 LOGIN: babysitter retention deferred, not 10", () => {
+    expect(SPEC.length).toBe(17);
+    expect(LOGINS.length).toBe(9);
+    expect(LOGINS).not.toContain("bulls96_babysitter_retention");
+  });
+});
+
+describe("failure classes: a lost connection is never reported as a policy refusal", () => {
+  const conn = Object.assign(new Error("Connection terminated unexpectedly"), {});
+  const sock = Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+  const shutdown = Object.assign(new Error("terminating connection due to administrator command"), { code: "57P01" });
+  const policy = Object.assign(new Error("rds-activation refused"), { code: "55000" });
+  test("policy SQLSTATE classes only", () => {
+    for (const c of ["0A000", "28P01", "42501", "55000", "55P03", "22023"]) expect(isPolicyRefusal({ code: c })).toBe(true);
+    for (const e of [conn, sock, shutdown, { code: "08006" }, { code: "57014" }, { code: "XX000" }, undefined]) expect(isPolicyRefusal(e)).toBe(false);
+  });
+  test("before or in fragment 00: refused only for a policy refusal; a lost connection is internal_error", () => {
+    for (const at of ["connect", "lock", "begin", "00_preconditions"]) {
+      expect(classifyActivateFailure(at, policy)).toBe("refused");
+      for (const e of [conn, sock, shutdown]) expect(classifyActivateFailure(at, e)).toBe("internal_error");
+    }
+  });
+  test("inside the transaction: rolled_back; at COMMIT a lost connection is internal_error (outcome unknown)", () => {
+    for (const at of ["10_provisioner_function_defaults", "30_roles", "70_validate", "40_login:injected-fault"]) {
+      expect(classifyActivateFailure(at, policy)).toBe("rolled_back");
+      expect(classifyActivateFailure(at, conn)).toBe("rolled_back");
+    }
+    expect(classifyActivateFailure("commit", conn)).toBe("internal_error");
+    expect(classifyActivateFailure("commit", { code: "40001" })).toBe("internal_error");
+    expect(classifyActivateFailure("commit", policy)).toBe("rolled_back");
+  });
+});
+
+describe("invalid input still writes the result when a usable target was given", () => {
+  test("target recovery from raw argv/env", () => {
+    expect(rawResultTarget(["run", "--result-file", "/x/r.json"], {})).toEqual({ file: "/x/r.json" });
+    expect(rawResultTarget(["run", "--result-fd=4"], {})).toEqual({ fd: 4 });
+    expect(rawResultTarget(["run"], { HOOPDB_ACTIVATION_RESULT_FD: "5" })).toEqual({ fd: 5 });
+    expect(rawResultTarget(["run", "--result-fd", "1"], {})).toBeNull();
+    expect(rawResultTarget(["run", "--result-fd", "4", "--result-file", "/x"], {})).toBeNull();
+    expect(rawResultTarget(["run", "--result-fd", "4"], { HOOPDB_ACTIVATION_RESULT_FD: "6" })).toBeNull();
+    expect(rawResultTarget(["run"], {})).toBeNull();
+  });
+  test("document shape; the message never carries a value", () => {
+    const d = invalidInputResult(["run"], "x");
+    expect(d).toMatchObject({ contract: "rds-activation/v1", command: "run", status: "invalid_input", exit_code: 2 });
+    expect(invalidInputResult(["bogus"], "x").command).toBeNull();
+    let msg = "";
+    try {
+      parseInputs(["run", "hunter2-not-a-flag", "--result-fd", "3"], {}, () => "", SPEC);
+    } catch (e) {
+      msg = (e as Error).message;
+    }
+    expect(msg).not.toContain("hunter2");
+  });
+  test("CLI end to end: exit 2 and a result file with invalid_input", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rds-activation-"));
+    try {
+      const file = join(dir, "result.json");
+      const r = spawnSync("bun", [join(root, "src/hoopdb/rds-activation.ts"), "run", "--result-file", file, "--password=leak-me"], {
+        encoding: "utf8", env: { PATH: process.env.PATH ?? "" },
+      });
+      expect(r.status).toBe(2);
+      const doc = JSON.parse(readFileSync(file, "utf8"));
+      expect(doc).toMatchObject({ contract: "rds-activation/v1", status: "invalid_input", exit_code: 2, command: "run" });
+      expect(doc.steps[0].message).toMatch(/never accepted on the command line/);
+      expect(JSON.stringify(doc) + r.stdout + r.stderr).not.toContain("leak-me");
+      // An existing file is never overwritten; exit 2 stays the signal.
+      const again = spawnSync("bun", [join(root, "src/hoopdb/rds-activation.ts"), "nope", "--result-file", file], {
+        encoding: "utf8", env: { PATH: process.env.PATH ?? "" },
+      });
+      expect(again.status).toBe(2);
+      expect(JSON.parse(readFileSync(file, "utf8")).command).toBe("run");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  test("writeResult refuses to overwrite an existing file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "rds-activation-"));
+    try {
+      const file = join(dir, "r.json");
+      writeResult({ file }, { a: 1 });
+      expect(() => writeResult({ file }, { a: 2 })).toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
