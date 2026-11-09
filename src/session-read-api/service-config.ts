@@ -11,9 +11,10 @@
  *                                   reads from Secrets Manager (lambda.ts parseReadApiSecret), injected
  *                                   from the secret store; never on disk
  *   SEARCH_INDEX_BACKEND            enabled only: postgres (default; no ClickHouse, no Lambda) | clickhouse
- *                                   (the hosted binding, needs the secret's clickhouse block); anything else,
+ *                                   (the hosted binding, needs the secret's clickhouse block) | opensearch
+ *                                   (SEARCH_INDEX_OPENSEARCH_*, see docs/search-and-runtime-adapters.md); anything else,
  *                                   including a name with no implementation in this build, fails startup
- *   SEARCH_INDEX_POSTGRES_BACKEND_ID  enabled + postgres: the projection-state backend id the search writer
+ *   SEARCH_INDEX_POSTGRES_BACKEND_ID  enabled + postgres or opensearch: the projection-state backend id the search writer
  *                                   records under (required; not a credential)
  *   SESSION_POSTGRES_TLS_PROFILE    enabled: required explicitly (supabase | custom-ca with
  *                                   SESSION_POSTGRES_CA_FILE / SESSION_POSTGRES_CA_SHA256); no implicit default

@@ -24,6 +24,7 @@
         "effect": "4.0.7",
         "hono": "4.12.26",
         "pg": "8.23.1",
+        "zod": "4.6.7",
       },
       "devDependencies": {
         "@electric-sql/pglite": "0.5.3",

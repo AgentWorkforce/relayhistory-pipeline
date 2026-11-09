@@ -1,5 +1,5 @@
 /**
- * Operator CLI for the bounded generation overlap (migration 20261105043885; docs/design/zero-503-schema-windows.md).
+ * Operator CLI for the bounded generation overlap (migration 20261105044030; docs/design/zero-503-schema-windows.md).
  * Owner, production Supabase via the CLI temp login + SET ROLE postgres, exactly as scripts/ingest-generation-rebind.ts.
  *   bun scripts/ingest-generation-overlap.ts status
  *   bun scripts/ingest-generation-overlap.ts open --from <PASS64hex> --to <target64hex> --ttl-seconds <60..14400> \

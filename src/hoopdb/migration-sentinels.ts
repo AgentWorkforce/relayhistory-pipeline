@@ -60,7 +60,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.ingest_bookkeeping_retired_claims + Babysitter register carries the retirement interlock",
     sql: "SELECT to_regclass('sessions.ingest_bookkeeping_retired_claims') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_babysitter_retention_register(jsonb)') AND prosecdef AND prosrc LIKE '%ingest_bookkeeping_claim_lock_key%') AS applied",
   },
-  "upstream:20261105043885_ingest_generation_overlap.sql": { evidence: "table sessions.ingest_generation_overlap_windows", sql: relation("sessions.ingest_generation_overlap_windows") },
+  "upstream:20261105044030_ingest_generation_overlap.sql": { evidence: "table sessions.ingest_generation_overlap_windows", sql: relation("sessions.ingest_generation_overlap_windows") },
   "upstream:20261105043890_buffered_search_gate_retired_witness.sql": {
     evidence: "replacement: buffered_search_gate_for hides claims with an ingest_bookkeeping_retired_claims tombstone (drop reason retired)",
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)') AND prosecdef AND prosrc LIKE '%ingest_bookkeeping_retired_claims%') AS applied",
@@ -201,9 +201,21 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
       "DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)",
     sql: column("sessions.session_summaries", "object_key"),
   },
+  "upstream:20261105044010_selfhost_erase_lock_fences.sql": {
+    evidence: "replacement: ingest_selfhost_set_session_uploads takes the user's fence lock before reading ownership",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)') AND prosecdef AND prosrc LIKE '%ingest_lock_fences(v_org,v_ws,v_user)%') AS applied",
+  },
+  "upstream:20261105043910_selfhost_session_selection_erase.sql": {
+    evidence: "CREATE FUNCTION: sessions.ingest_selfhost_set_session_uploads(jsonb) (self-host per-session erase)",
+    sql: "SELECT to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)') IS NOT NULL AS applied",
+  },
   "upstream:20261105043900_session_consumer_function_grants.sql": {
     evidence: "twelve search_consumer_runtime EXECUTEs (composed writer path)",
     sql: "SELECT count(*) = 12 AS applied FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace, aclexplode(p.proacl) a JOIN pg_roles r ON r.oid = a.grantee WHERE n.nspname = 'sessions' AND r.rolname = 'search_consumer_runtime' AND a.privilege_type = 'EXECUTE'",
+  },
+  "upstream:20261105044000_read_api_tokens.sql": {
+    evidence: "table sessions.read_api_tokens",
+    sql: relation("sessions.read_api_tokens"),
   },
 };
 

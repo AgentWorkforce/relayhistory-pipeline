@@ -850,6 +850,10 @@
     "sessions.ingest_seed_source_changed()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_selfhost_set_session_uploads(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
     "sessions.ingest_session_pairs(jsonb)": [
       "<owner>:EXECUTE"
     ],
@@ -942,6 +946,29 @@
     ],
     "sessions.queue_session_brief_document(jsonb)": [
       "<owner>:EXECUTE"
+    ],
+    "sessions.read_api_token_delete_by_hash(text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.read_api_token_delete_for(text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.read_api_token_issue(text,text,text,text,text,text,text,text,timestamp with time zone,text,timestamp with time zone,text,timestamp with time zone)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.read_api_token_refresh(text,text,text,text,text,text,timestamp with time zone,text,timestamp with time zone,timestamp with time zone)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.read_api_token_sweep_expired(timestamp with time zone)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.read_api_token_verify(text,timestamp with time zone)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
     ],
     "sessions.register_search_feature_source(text,text,text,text,text)": [
       "<owner>:EXECUTE",

@@ -2,9 +2,9 @@
  * The session-ingest Worker on a G4-only database: supabase/migrations up to and including
  * 20261105043800_lazy_ack_clock_no_key_update.sql (plus bootstrap), WITHOUT 043850 (#332
  * acquisition owner), 043860 (#338 buffered search gate), 043870 (#339 buffered search feed
- * cursor), 043880 (#327 bookkeeping cleanup), 043885 (#386 generation overlap: owner-only window, retired
- * record and policy trigger; replaces ingest_require_generation / ingest_lazy_guard), 043890 (#384), 043900 (#336 consumer function grants,
- * EXECUTE grants only) and any later migration (pglite-schema.ts
+ * cursor), 043880 (#327 bookkeeping cleanup), 043890 (#384), 043900 (#336 consumer function grants,
+ * EXECUTE grants only), 044030 (#386 generation overlap: owner-only window, retired record and policy
+ * trigger; replaces ingest_require_generation / ingest_lazy_guard) and any later migration (pglite-schema.ts
  * derives POST_G4_MIGRATIONS from the sorted list). The app runs with the Worker's default flags
  * (canonical acceptance, async admission / babysitter routing / replica off, relayhistory
  * custody), and the buffered acceptance mode it is cut over to; every main sync ingest path
@@ -99,9 +99,15 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105043860_buffered_search_gate.sql",
       "20261105043870_buffered_search_feed_cursor.sql",
       "20261105043880_ingest_bookkeeping_cleanup.sql",
-      "20261105043885_ingest_generation_overlap.sql",
       "20261105043890_buffered_search_gate_retired_witness.sql",
       "20261105043900_session_consumer_function_grants.sql",
+      "20261105043910_selfhost_session_selection_erase.sql",
+      // A new table and read API functions only; no ingest path touches them.
+      "20261105044000_read_api_tokens.sql",
+      "20261105044010_selfhost_erase_lock_fences.sql",
+      // #386 generation overlap: owner-only window, retired record and policy trigger; replaces
+      // ingest_require_generation / ingest_lazy_guard (in OBJECTS.replacedFunctions below).
+      "20261105044030_ingest_generation_overlap.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

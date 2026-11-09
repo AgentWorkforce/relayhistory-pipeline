@@ -1,5 +1,5 @@
 /**
- * Owner-side helpers for the bounded generation overlap (migration 20261105043885; design
+ * Owner-side helpers for the bounded generation overlap (migration 20261105044030; design
  * docs/design/zero-503-schema-windows.md).
  *
  * The owner opens ONE window (from = the current PASS generation, to = the generation the apply is about
@@ -28,7 +28,7 @@ export function validateOverlapOpen(input: OverlapOpenInput): void {
   if (typeof input.admitDuringApply !== "boolean") refuse("invalid_admit_during_apply");
 }
 
-/** True once 20261105043885 is installed (the rebind and the open helpers degrade/refuse on this). */
+/** True once 20261105044030 is installed (the rebind and the open helpers degrade/refuse on this). */
 export async function overlapInstalled(client: MigrationClient): Promise<boolean> {
   const r = await client.query<{ t: string | null }>(`SELECT to_regclass('${OVERLAP_TABLE}')::text AS t`);
   return r.rows[0]?.t != null;

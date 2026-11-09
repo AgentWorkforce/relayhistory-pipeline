@@ -29,7 +29,7 @@ import {
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { writerTransactionSql } from "./transaction-sql.ts";
 import { supabasePool } from "./lambda.ts";
-import { writerComposition, type WriterProjectionState } from "./consumer-service.ts";
+import { writerComposition, writerSearchEnv, type WriterProjectionState } from "./consumer-service.ts";
 import {
   CONSUMER_BACKEND_ID_VAR,
   consumerServiceConfig,
@@ -164,6 +164,9 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     };
     const composition = writerComposition(config.backendId, config.floorMs);
     const writerSql = writerTransactionSql({ query: (text: string, params?: unknown[]) => owner.query(text, params) });
+    // The Postgres index schema is always created: the consumer role, its
+    // verifier and the serve-time tenant gate name transcript_events, and with
+    // OpenSearch selected it simply stays empty.
     const binding = composeSearchService(
       composition,
       {
@@ -173,6 +176,13 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
       },
       "writer",
     );
+    const remoteIndex = config.searchBackend === "postgres"
+      ? undefined
+      : composeSearchService(
+          writerComposition(config.backendId, config.floorMs, config.searchBackend, env),
+          { env: writerSearchEnv(config, env), sql: writerSql.sql, secrets: searchSecret(config.secret.search) },
+          "writer",
+        ).index;
     const state = binding.state as WriterProjectionState;
     await owner.query("BEGIN");
     try {
@@ -180,7 +190,10 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
         owner,
         lock: () => bootstrapLock(owner),
         checkOwner: () => bootstrapCheckOwner(owner),
-        ensureIndexSchema: () => binding.index.ensureSchema(),
+        ensureIndexSchema: async () => {
+          await binding.index.ensureSchema();
+          await remoteIndex?.ensureSchema();
+        },
         ensureProjectionState: (o) => state.ensureSchema(o),
         ensureServiceTables: (o) => ensureServiceTables(o),
         ensureRole: (o) => o.query(stripPsqlMeta(roleSql)).then(() => {}),

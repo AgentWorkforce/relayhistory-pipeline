@@ -71,15 +71,17 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105043800_lazy_ack_clock_no_key_update.down.sql",
       "supabase/rollbacks/20261105043850_ingest_acquisition_owner.down.sql",
       "supabase/rollbacks/20261105043880_ingest_bookkeeping_cleanup.down.sql",
-      "supabase/rollbacks/20261105043885_ingest_generation_overlap.down.sql",
       "supabase/rollbacks/20261105043890_buffered_search_gate_retired_witness.down.sql",
+      "supabase/rollbacks/20261105043910_selfhost_session_selection_erase.down.sql",
+      "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql",
+      "supabase/rollbacks/20261105044030_ingest_generation_overlap.down.sql",
     ]);
   });
 
-  test("the 043885 generation overlap adds six owner-only functions, grants no runtime role anything, and derives its exact guarded rollback", async () => {
+  test("the 044030 generation overlap adds six owner-only functions, grants no runtime role anything, and derives its exact guarded rollback", async () => {
     const withLane = await generate(repo, LANES, VERIFIERS);
     const without = await generate(repo, LANES.filter((l) => l !== ingestGenerationOverlap), VERIFIERS);
-    const downPath = "supabase/rollbacks/20261105043885_ingest_generation_overlap.down.sql";
+    const downPath = "supabase/rollbacks/20261105044030_ingest_generation_overlap.down.sql";
     expect(withLane.summary.lanes["ingest-generation-overlap"]).toEqual({ functions: 6, replaces: 2, grants: 0 });
     // Every role verifier is byte-identical with and without the lane: no runtime capability changes.
     for (const v of VERIFIERS) expect(withLane.outputs[v.path]).toBe(without.outputs[v.path]);

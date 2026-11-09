@@ -10,7 +10,7 @@
  * Idempotent: rerunning after success changes nothing. It refuses unless readiness PASS is for `to`,
  * the policy is at `from` (or already `to`), and every admission row is at `from` or `to`.
  *
- * Generation overlap (20261105043885, docs/design/zero-503-schema-windows.md): when installed, an open
+ * Generation overlap (20261105044030, docs/design/zero-503-schema-windows.md): when installed, an open
  * overlap window must be exactly (from -> to); it is locked BEFORE the policy (the ingest lock order is
  * window -> policy, so this cannot deadlock with an admitted upload) and closed in this same transaction.
  * Before that migration is applied the rebind behaves exactly as before.

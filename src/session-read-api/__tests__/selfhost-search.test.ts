@@ -202,8 +202,16 @@ describe("reader admission: the read login must be bound by row-level security",
 });
 
 describe("SEARCH_INDEX_BACKEND selection", () => {
+  test("opensearch composes the opensearch-capable registry and pod-identity credentials for sigv4", () => {
+    const composition = selfhostSearchComposition({ ...ENV, SEARCH_INDEX_BACKEND: "opensearch", SEARCH_INDEX_OPENSEARCH_AUTH: "sigv4" })!;
+    expect(composition.registry.registered()).toContain("opensearch");
+    expect(typeof composition.extras?.awsCredentials).toBe("function");
+    expect(selfhostSearchComposition({ ...ENV, SEARCH_INDEX_BACKEND: "opensearch" })!.extras).toBeUndefined();
+    expect(() => selfhostSearchComposition({ ...ENV, SEARCH_INDEX_BACKEND: "opensearch", SEARCH_INDEX_POSTGRES_BACKEND_ID: "" })).toThrow(/SEARCH_INDEX_BACKEND=opensearch needs SEARCH_INDEX_POSTGRES_BACKEND_ID/);
+  });
+
   test("an unknown or unrunnable name refuses startup naming the variable, never the value", async () => {
-    for (const value of ["nope-synthetic-value", "opensearch", "elasticsearch", "Postgres"]) {
+    for (const value of ["nope-synthetic-value", "elasticsearch", "Postgres"]) {
       const error = await startReadApiService({ ...ENV, SEARCH_INDEX_BACKEND: value }, LOOPBACK).then(() => null, (e: Error) => e);
       expect(error?.message).toMatch(/^SEARCH_INDEX_BACKEND: /);
       expect(error!.message).not.toContain(value);

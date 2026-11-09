@@ -43,6 +43,7 @@ import {
   prefixOrgResolver,
 } from "../shared/vendor.ts";
 import { postgresTlsOptions } from "../shared/postgres-tls.ts";
+import { createOpenSearchSearchComposition } from "../shared/opensearch-composition.ts";
 import {
   composeSearchService,
   createPostgresSearchComposition,
@@ -69,6 +70,7 @@ import { refuseEnvOptions, reconcileRecent, supabasePool, transaction } from "./
 import {
   CONSUMER_BACKEND_ID_VAR,
   consumerServiceConfig,
+  type ConsumerSearchBackend,
 } from "./consumer-config.ts";
 
 /**
@@ -338,8 +340,15 @@ export async function runConsumerTick(io: ConsumerTickIo, since: Date): Promise<
  * other coverage_from_ms as stale, so a mismatched writer never converges.
  * Throws "search state configuration invalid" on a bad id.
  */
-export function writerComposition(backendId: string, fromMs: number): SearchComposition {
-  return createPostgresSearchComposition({ backendId, fromMs });
+export function writerComposition(backendId: string, fromMs: number, backend: ConsumerSearchBackend = "postgres", env: NodeJS.ProcessEnv = {}): SearchComposition {
+  return backend === "opensearch" ? createOpenSearchSearchComposition({ env, backendId, fromMs }) : createPostgresSearchComposition({ backendId, fromMs });
+}
+
+/** The env handed to the search registry: exactly the selection, plus the OpenSearch settings when selected. */
+export function writerSearchEnv(config: { searchBackend: ConsumerSearchBackend; backendId: string }, env: NodeJS.ProcessEnv): Record<string, string | undefined> {
+  const selection = { SEARCH_INDEX_BACKEND: config.searchBackend, [CONSUMER_BACKEND_ID_VAR]: config.backendId };
+  if (config.searchBackend !== "opensearch") return selection;
+  return { ...selection, ...Object.fromEntries(Object.entries(env).filter(([name]) => name.startsWith("SEARCH_INDEX_OPENSEARCH_"))) };
 }
 
 /** Tenant-scoped runner for the writer's own freshness self-check: sets the
@@ -756,6 +765,10 @@ export const MAX_TOMBSTONE_PAGES = 64;
  * 2. The re-send set filters that residue out: only tombstones with an
  *    incomplete state, a state that still counts rows, or leftover transcript
  *    rows are re-sent, while the transcript EXISTS check is kept.
+ *    With the index outside Postgres (opensearch) there is no transcript table
+ *    to check, so a scope with no state row at all is re-sent instead (its
+ *    index may still hold rows from a pass that crashed before recording),
+ *    and the residue state row is kept: it is the proof the erasure finished.
  * 3. Re-sends page by manifest-key cursor per tenant with an overflow
  *    contract, so the same first LIMIT rows are not selected forever while
  *    later scopes starve and the high-water mark never advances. The cursor
@@ -790,6 +803,7 @@ export async function collectFreshnessSend(
   limit: number,
   deferred: Set<string>,
   send: (body: string) => Promise<void>,
+  indexInPostgres = true,
 ): Promise<FreshnessCollection> {
   const dedupe = makeDedupe(db, backendId);
   const staleKept: string[] = [];
@@ -799,7 +813,7 @@ export async function collectFreshnessSend(
   for (const body of staleAlive) await send(body);
   const tombKept: string[] = [];
   const gatedTomb = gateDeferredSends(deferred, async (body) => { tombKept.push(body); });
-  const tombstones = await reconcileTombstonedScopes(db, runInTenant, backendId, keyPrefix, limit, gatedTomb.send);
+  const tombstones = await reconcileTombstonedScopes(db, runInTenant, backendId, keyPrefix, limit, gatedTomb.send, indexInPostgres);
   const tombAlive = await dedupe(tombKept);
   for (const body of tombAlive) await send(body);
   return {
@@ -817,6 +831,7 @@ export async function reconcileTombstonedScopes(
   keyPrefix: string,
   limit: number,
   send: (body: string) => Promise<void>,
+  indexInPostgres = true,
 ): Promise<{ tombstoned: number; overflow: boolean }> {
   const { rows: tenants } = await db.query<{ orgId: string; workspaceId: string }>(
     `SELECT DISTINCT org_id AS "orgId", workspace_id AS "workspaceId"
@@ -832,7 +847,7 @@ export async function reconcileTombstonedScopes(
   }
   for (const tenant of tenants.slice(0, MAX_FRESHNESS_TENANTS)) {
     const out = await runInTenant(tenant.orgId, tenant.workspaceId, async (tx) => {
-      const retired = await tx.query<{ n: string }>(
+      const retired = !indexInPostgres ? { rows: [{ n: "0" }] } : await tx.query<{ n: string }>(
         `WITH retired AS (
            DELETE FROM search_index.projection_state s
            USING sessions.session_index p
@@ -862,11 +877,14 @@ export async function reconcileTombstonedScopes(
                     WHERE s.backend_id=$1 AND s.org_id=p.org_id AND s.workspace_id=p.workspace_id
                       AND s.source=p.harness AND s.session_id=coalesce(p.canonical_session_id,p.session_id)
                       AND (NOT s.complete OR s.row_count > 0))
-               OR EXISTS (SELECT 1 FROM search_index.transcript_events t
+               OR ($7::boolean AND EXISTS (SELECT 1 FROM search_index.transcript_events t
                     WHERE t.org_id=p.org_id AND t.workspace_id=p.workspace_id
                       AND t.source=p.harness AND t.session_id=coalesce(p.canonical_session_id,p.session_id)))
+               OR (NOT $7::boolean AND NOT EXISTS (SELECT 1 FROM search_index.projection_state s
+                    WHERE s.backend_id=$1 AND s.org_id=p.org_id AND s.workspace_id=p.workspace_id
+                      AND s.source=p.harness AND s.session_id=coalesce(p.canonical_session_id,p.session_id))))
            ORDER BY p.manifest_key LIMIT $2`,
-          [backendId, limit, `${likeEscape(keyPrefix)}/%`, cursor, tenant.orgId, tenant.workspaceId],
+          [backendId, limit, `${likeEscape(keyPrefix)}/%`, cursor, tenant.orgId, tenant.workspaceId, indexInPostgres],
         );
         const rows = pageRows.rows;
         if (rows.length === 0) break;
@@ -1115,13 +1133,13 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
   // A healthy start clears a stale UNHEALTHY marker from an earlier crash
   // loop; without this the marker is sticky across restarts.
   clearUnhealthyFile(config.unhealthyFile);
-  const composition = writerComposition(config.backendId, config.floorMs);
+  const composition = writerComposition(config.backendId, config.floorMs, config.searchBackend, env);
   const writerSql = writerTransactionSql(db);
   const tenantRunner = writerTenantRunner(db);
   const binding = composeSearchService(
     composition,
     {
-      env: { SEARCH_INDEX_BACKEND: "postgres", [CONSUMER_BACKEND_ID_VAR]: config.backendId },
+      env: writerSearchEnv(config, env),
       sql: writerSql.sql,
       secrets: searchSecret(config.secret.search),
     },
@@ -1227,6 +1245,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
                   MAX_PENDING_ROWS,
                   deferred,
                   send,
+                  config.searchBackend === "postgres",
                 );
                 if (collected.deferredSkipped) log.info("pipeline consumer tick defers backoff retries", { deferredSkipped: collected.deferredSkipped });
                 return { stale: collected.stale, tombstoned: collected.tombstoned, overflow: collected.overflow };

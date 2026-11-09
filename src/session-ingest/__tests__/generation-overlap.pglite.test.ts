@@ -1,5 +1,5 @@
 /**
- * Zero-503 schema windows (migration 20261105043885, docs/design/zero-503-schema-windows.md), on PGlite over
+ * Zero-503 schema windows (migration 20261105044030, docs/design/zero-503-schema-windows.md), on PGlite over
  * EVERY migration: the bounded overlap keeps an old Worker admitting while readiness moves to the next
  * generation, a Worker at the next generation admits after the rebind, the old one is refused once the window
  * closes or expires, and the window is owner-only, explicit, append-only and never a downgrade.

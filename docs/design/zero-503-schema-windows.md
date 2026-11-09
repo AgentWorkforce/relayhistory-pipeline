@@ -1,7 +1,7 @@
 # Zero-503 schema windows: bounded generation overlap
 
-Status: code and tests only (draft PR). Nothing is applied, deployed, opened or rebound by this change.
-Applying migration `20261105043885`, opening a window on a real database, and any Worker deploy each still
+Status: code and tests only. Nothing is applied, deployed, opened or rebound by this change.
+Applying migration `20261105044030`, opening a window on a real database, and any Worker deploy each still
 need Khaliq's explicit OK in his own words.
 
 ## 1. The failure mode
@@ -75,16 +75,21 @@ Worker-first ordering.
 
 ## 2. The overlap protocol
 
-### 2.1 Database: one owner-opened, time-bounded window (migration `20261105043885`)
+### 2.1 Database: one owner-opened, time-bounded window (migration `20261105044030`)
 
-**SLOT 043885**, assigned by the registry keeper under a recorded registry exception. `migrate.ts` applies
-pending files in sorted order: `043880` (ingest bookkeeping cleanup), `043885` (this), `043890` (buffered
-search gate retired witness) and `043900` (session consumer function grants); the last two landed after the
-slot was assigned. The migration was first drafted as
-`053020`; the renumber changed only the slot header comment and the file names. The rollback chain follows
-the sorted order: `043900` rolls back first, and `043890`, `043885` and `043880` refuse while it is
-applied; then `043890`, with `043885` and `043880` refusing; then `043885`; then `043880`. Neither `043890`
-nor `043900` touches the two functions `043885` replaces or the lazy policy table it puts a trigger on.
+**SLOT 044030.** The migration was first drafted as `053020`, then assigned `043885`; it was re-slotted to
+`044030` after `043890`, `043900`, `043910`, `044000` and `044010` landed on main, because a self-host or kind
+database that already applied those would refuse a pending file sorted below its newest applied slot (the
+sequence preflight). `044020` is reserved for the index catch-up. Each renumber changed only the slot header
+comment, the file names and the derived rollback's sha256. `migrate.ts` applies pending files in sorted order,
+so `044030` applies after every landed slot. The rollback chain follows the sorted order: `044030` rolls back
+first, and `044010`, `044000`, `043910`, `043900` and `043880` refuse while it is applied; then the landed
+chain unwinds as before (`044010`, `044000`, `043910`, `043900`, `043890`, `043880`, ...). None of `043890`
+through `044010` touches the two functions `044030` replaces or the lazy policy table it puts a trigger on:
+`043910`/`044010` define and replace only `ingest_selfhost_set_session_uploads`, which calls the unchanged
+`ingest_set_session_uploads` and `ingest_lock_fences` and sends no generation (the self-host server runs in
+canonical acceptance), so it reaches neither fence helper's new branch; `044000` adds only the read API token
+table and functions.
 
 The migration creates `sessions.ingest_generation_overlap_windows`, an append-only record with these rules:
 - Columns: `from_generation`, `to_generation`, `admit_during_apply`, `approval_sha256`, `opened_by`,
@@ -172,7 +177,7 @@ Properties:
   advisory lock. The policy trigger enforces the same rule again inside the transaction.
 - It moves the policy and admissions as before.
 - It closes the window (`rebind`) in the same transaction and reports `overlapClosed`.
-- Before `043885` exists, it behaves exactly as before.
+- Before `044030` exists, it behaves exactly as before.
 
 ### 2.3 Worker: an explicit set of at most two generations
 
@@ -200,21 +205,21 @@ Properties:
 
 ### 3.1 Shipping this change: the one accepted outage
 
-`043885` is additive and accepts every old caller. It creates new objects, and the two replaced helpers
+`044030` is additive and accepts every old caller. It creates new objects, and the two replaced helpers
 reduce to the old predicate while no window exists. But applying it is itself a schema window: `generation()`
 moves, and the window machinery does not exist until the migration commits.
 
 `migrate.ts` has no target-slot option. The first real migrate run after this lands therefore applies
-**every** pending slot in one window: `043850`..`043900`, including `043885`. That single window is the
+**every** pending slot in one window: everything not yet applied through `044030`, including `044030`. That single window is the
 **one accepted outage** before overlap windows exist. Every window after it is overlap-protected.
 
 To keep that one window as short as possible:
 1. Merge (code only).
 2. Worker deploy of this code with `expectedGeneration = G_cur` and `overlapGeneration = G5`, where G5 is
-   the final composed generation of the source being applied (all pending slots through `043900`). Against
+   the final composed generation of the source being applied (all pending slots through `044030`). Against
    the unchanged database G_cur is admitted first. G5 is offered only after a 55000.
 3. Run the one owner-apply of all pending slots with the normal approval. No overlap window can be opened
-   yet, because the table does not exist until `043885` commits inside this same run. Uploads are refused
+   yet, because the table does not exist until `044030` commits inside this same run. Uploads are refused
    from the pending write until step 4, as today. The Worker PUT is no longer inside this interval.
 4. Run the rebind `G_cur → G5` immediately after PASS. The step-2 Worker switches to G5 on its next request
    with one internal retry. No Worker PUT is needed to recover. From this rebind on, the policy trigger
@@ -313,5 +318,5 @@ that covers steps 3–5. The maximum is 4 h.
 - `src/hoopdb/__tests__/sessions-function-boundary.test.ts`: the lane adds six owner-only functions, every
   role verifier is byte-identical with and without the lane, and the generated rollback contains the exact
   050000/055000 bodies.
-- `src/hoopdb/__tests__/migration-profile.test.ts`: the down/reapply chain. 043880 and 043870 refuse under 043885,
-  043885's down restores the strict fences and drops its objects, and the next migrate reinstalls it.
+- `src/hoopdb/__tests__/migration-profile.test.ts`: the down/reapply chain. 044030 rolls back first: 044010, 044000,
+  043910, 043900 and 043880 refuse under it, 044030's down restores the strict fences and drops its objects, and the next migrate reinstalls it.

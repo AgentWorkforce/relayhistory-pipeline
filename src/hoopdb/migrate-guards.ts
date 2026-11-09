@@ -41,6 +41,47 @@ export const MIGRATION_CHECKSUM_ALIASES = [
   },
 ] as const;
 
+// Two migrations were renamed append-only on 2026-11-03 (09666e18) to sort after the
+// upstream steps that were released before them. An existing self-host HoopDb that
+// applied them under their original names would otherwise stop at
+// ledger_unknown_step. Each original ledger row is adopted in memory (never written) as
+// its release name only when all four values match: the original name with its last
+// released sha, and the release file with exactly this sha. Only adoption accepts
+// `ledger_sha`: a row physically stored under the release name with the original sha is
+// hand-edited history and fails closed (migration_changed), as does any other sha. Bodies are statement-for-
+// statement equal apart from the provenance header, except that the original ingest
+// ledger also granted the seed RPCs to bulls96_session_ingest_seeder, which
+// 20261104040000_ingest_s3_proof_seed (always on this image, after both) REVOKEs ALL,
+// so the end schema is identical. That REVOKE is the forward repair the ingest row
+// depends on: it is adopted only while `repair` is in the plan with exactly
+// `repair_sha` (ported from #396). Earlier drafts of the original file (other shas) are
+// not adopted, and any future edit of a release or repair file fails closed.
+// The original file bytes are pinned by the fixtures in
+// __tests__/fixtures/released-migration-history/.
+export const MIGRATION_RENAME_ALIASES = [
+  {
+    ledger_name: "upstream:20261103010000_session_directory_event_metadata.sql",
+    ledger_sha:
+      "fe07b2ef2b3e18634b024f35f4272bee9100ea39d0383ce33e8c6d969b77a476",
+    migration: "upstream:20261104021000_session_directory_event_metadata.sql",
+    accepted_as_alias_of:
+      "4fb1337524c8335dd5bd507f60ea896a41a031ace0c7a2da8a8f7dedc1245e01",
+  },
+  {
+    ledger_name: "upstream:20261102010000_session_ingest_ledger.sql",
+    ledger_sha:
+      "21a0be7dc69afa7d3b1d1b27e31fee9778c1a6a0c3b20246e3029fa2f1356fa6",
+    migration: "upstream:20261104022000_session_ingest_ledger.sql",
+    accepted_as_alias_of:
+      "69f4157ea3a615344aa1b383fc6af7405c1ff9f1568e7c8ab97e58fbc78fe1b5",
+    repair: "upstream:20261104040000_ingest_s3_proof_seed.sql",
+    repair_sha:
+      "18ea54ed1aa50e5ea44bab01a65177e2fc9c92919ac23b973f820e8af8b75b86",
+  },
+] as const;
+
+export type MigrationAlias = (typeof MIGRATION_CHECKSUM_ALIASES)[number];
+
 export function migrationChecksumMatches(
   name: string,
   recorded: string,
@@ -48,12 +89,7 @@ export function migrationChecksumMatches(
 ): boolean {
   return (
     recorded === actual ||
-    MIGRATION_CHECKSUM_ALIASES.some(
-      (a) =>
-        a.migration === name &&
-        a.ledger_sha === recorded &&
-        a.accepted_as_alias_of === actual,
-    )
+    migrationChecksumAlias(name, recorded, actual) !== undefined
   );
 }
 
@@ -61,13 +97,100 @@ export function migrationChecksumAlias(
   name: string,
   recorded: string,
   actual: string,
-): (typeof MIGRATION_CHECKSUM_ALIASES)[number] | undefined {
+): MigrationAlias | undefined {
+  // Rename aliases are deliberately absent: their original sha is accepted only by
+  // resolveRenamedLedger, for a row recorded under the original name only.
   return MIGRATION_CHECKSUM_ALIASES.find(
     (a) =>
       a.migration === name &&
       a.ledger_sha === recorded &&
       a.accepted_as_alias_of === actual,
   );
+}
+
+/**
+ * True when `alias` pins a forward repair that is not in the plan with its exact sha
+ * (`fileSha` returns undefined for a step that is not planned).
+ */
+export function renameAliasRepairMissing(
+  alias: (typeof MIGRATION_RENAME_ALIASES)[number],
+  fileSha: (name: string) => string | undefined,
+): boolean {
+  return "repair" in alias && fileSha(alias.repair) !== alias.repair_sha;
+}
+
+export type RenameAlias = (typeof MIGRATION_RENAME_ALIASES)[number];
+
+/** Why one MIGRATION_RENAME_ALIASES entry could not be adopted; the migrator throws it. */
+export interface RenameRefusal {
+  code:
+    | "ledger_alias_collision"
+    | "ledger_unknown_step"
+    | "ledger_alias_repair_missing"
+    | "migration_changed";
+  alias: RenameAlias;
+  message: string;
+}
+
+/**
+ * The one rename-alias verdict, shared by the migrator (migrationPreflight) and
+ * readiness (schemaVerdict), so both reach the same answer from the same physical
+ * ledger. Pure: `physical` is never modified and nothing is written.
+ *
+ * For each MIGRATION_RENAME_ALIASES entry (skipped when the plan itself contains the
+ * original name, i.e. an old image's plan):
+ *  - only the original name, with exactly `ledger_sha`, the release file planned with
+ *    exactly `accepted_as_alias_of` and the pinned repair (if any) planned with exactly
+ *    `repair_sha`: adopted. The effective ledger holds the release name with the release
+ *    file's sha, so the checksum guard needs no rename lookup afterwards;
+ *  - both the original and the release name recorded: ledger_alias_collision, whatever
+ *    the shas (never a supported state);
+ *  - only the original name with another sha, or a release file that is not planned
+ *    with exactly `accepted_as_alias_of`: ledger_unknown_step;
+ *  - an exact original row whose pinned repair is missing: ledger_alias_repair_missing;
+ *  - only the release name, physically carrying the original `ledger_sha` (hand-edited
+ *    history): migration_changed.
+ * A refused alias's release name is absent from `effective`, so readiness reports it
+ * as not applied; the migrator throws the first refusal before any write.
+ * `fileSha` returns the planned step's file sha256, or undefined if it is not planned.
+ */
+export function resolveRenamedLedger(
+  physical: ReadonlyMap<string, string>,
+  fileSha: (name: string) => string | undefined,
+): { effective: Map<string, string>; adopted: RenameAlias[]; refusals: RenameRefusal[] } {
+  const effective = new Map(physical);
+  const adopted: RenameAlias[] = [];
+  const refusals: RenameRefusal[] = [];
+  const refuse = (alias: RenameAlias, code: RenameRefusal["code"], message: string) => {
+    effective.delete(alias.migration);
+    refusals.push({ code, alias, message });
+  };
+  for (const a of MIGRATION_RENAME_ALIASES) {
+    if (fileSha(a.ledger_name) !== undefined) continue;
+    const original = physical.get(a.ledger_name);
+    const release = physical.get(a.migration);
+    if (original !== undefined && release !== undefined)
+      refuse(a, "ledger_alias_collision",
+        `the ledger records both ${a.ledger_name} and its release name ${a.migration}; nothing is marked, see the runbook decision point`);
+    else if (release !== undefined) {
+      if (release === a.ledger_sha)
+        refuse(a, "migration_changed",
+          `migration ${a.migration} is recorded with the checksum of ${a.ledger_name}; that is hand-edited history, nothing is marked, see the runbook decision point`);
+    } else if (original !== undefined) {
+      if (original !== a.ledger_sha || fileSha(a.migration) !== a.accepted_as_alias_of)
+        refuse(a, "ledger_unknown_step",
+          `the ledger records ${a.ledger_name}, which this image doesn't have or adopt; nothing is marked, see the runbook decision point`);
+      else if (renameAliasRepairMissing(a, fileSha))
+        refuse(a, "ledger_alias_repair_missing",
+          `released migration ${a.ledger_name} requires its exact forward repair`);
+      else {
+        effective.delete(a.ledger_name);
+        effective.set(a.migration, a.accepted_as_alias_of);
+        adopted.push(a);
+      }
+    }
+  }
+  return { effective, adopted, refusals };
 }
 
 // ---------------------------------------------------------------------------
@@ -1125,7 +1248,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "cb5c5becf18b59b709e930f2d893b851735148dc30fbef7acf961f3c0a54abf1";
+  "42ee52a7463d60fb6c6d939260ed78f6f23aa0f965121d4933713bf2e812af59";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;

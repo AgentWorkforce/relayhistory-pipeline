@@ -32,10 +32,11 @@ async function signingKey(
   secret: string,
   date: string,
   region: string,
+  service: string,
 ): Promise<Uint8Array> {
   const kDate = await hmacSha256(`AWS4${secret}`, date);
   const kRegion = await hmacSha256(kDate, region);
-  const kService = await hmacSha256(kRegion, "s3");
+  const kService = await hmacSha256(kRegion, service);
   return hmacSha256(kService, "aws4_request");
 }
 
@@ -52,8 +53,11 @@ export async function signRequest(args: {
   region: string;
   credentials: AwsCredentials;
   now?: Date;
+  /** Signing service; default "s3". Any other service double-encodes the path, as non-S3 SigV4 requires. */
+  service?: string;
 }): Promise<void> {
   const { method, url, headers, region, credentials } = args;
+  const service = args.service ?? "s3";
   const { date, datetime } = amzDate(args.now ?? new Date());
   headers.set("x-amz-date", datetime);
   headers.set("x-amz-content-sha256", args.payloadSha256);
@@ -70,13 +74,13 @@ export async function signRequest(args: {
   const signedHeaders = signed.map(([k]) => k).join(";");
   const canonicalRequest = [
     method,
-    url.pathname,
+    service === "s3" ? url.pathname : url.pathname.split("/").map(rfc3986).join("/"),
     canonicalQuery(url.searchParams),
     signed.map(([k, v]) => `${k}:${v}\n`).join(""),
     signedHeaders,
     args.payloadSha256,
   ].join("\n");
-  const scope = `${date}/${region}/s3/aws4_request`;
+  const scope = `${date}/${region}/${service}/aws4_request`;
   const stringToSign = [
     "AWS4-HMAC-SHA256",
     datetime,
@@ -85,7 +89,7 @@ export async function signRequest(args: {
   ].join("\n");
   const signature = toHex(
     await hmacSha256(
-      await signingKey(credentials.secretAccessKey, date, region),
+      await signingKey(credentials.secretAccessKey, date, region, service),
       stringToSign,
     ),
   );
@@ -134,7 +138,7 @@ export async function presignUrl(args: {
   ].join("\n");
   const signature = toHex(
     await hmacSha256(
-      await signingKey(credentials.secretAccessKey, date, region),
+      await signingKey(credentials.secretAccessKey, date, region, "s3"),
       stringToSign,
     ),
   );

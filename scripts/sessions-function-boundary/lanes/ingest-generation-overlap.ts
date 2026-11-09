@@ -1,7 +1,7 @@
 /**
- * Lane: ingest-generation-overlap (slot 043885, zero-503 schema windows;
+ * Lane: ingest-generation-overlap (slot 044030, zero-503 schema windows;
  * docs/design/zero-503-schema-windows.md).
- * supabase/migrations/20261105043885_ingest_generation_overlap.sql owns six OWNER-ONLY functions
+ * supabase/migrations/20261105044030_ingest_generation_overlap.sql owns six OWNER-ONLY functions
  * (no runtime grant):
  *   ingest_generation_overlap_open       owner opens one bounded window (from -> to) before an apply
  *   ingest_generation_overlap_close      owner (or the rebind) closes it
@@ -17,11 +17,11 @@
 import { createHash } from "node:crypto";
 import type { LaneContext, LaneManifest } from "../types.ts";
 
-const MIGRATION = "supabase/migrations/20261105043885_ingest_generation_overlap.sql";
+const MIGRATION = "supabase/migrations/20261105044030_ingest_generation_overlap.sql";
 const GENERATION_ORIGINAL = "supabase/migrations/20261104050000_buffered_upload_receipts.sql";
 const GUARD_ORIGINAL = "supabase/migrations/20261104055000_lazy_current_custody.sql";
-const ROLLBACK = "supabase/rollbacks/20261105043885_ingest_generation_overlap.down.sql";
-const NAME = "upstream:20261105043885_ingest_generation_overlap.sql";
+const ROLLBACK = "supabase/rollbacks/20261105044030_ingest_generation_overlap.down.sql";
+const NAME = "upstream:20261105044030_ingest_generation_overlap.sql";
 
 /** The exact prior bodies, as CREATE OR REPLACE (owner/ACL stay unchanged). */
 export function originalBodies(generationSource: string, guardSource: string): string[] {
@@ -78,7 +78,7 @@ async function rollback(ctx: LaneContext): Promise<Record<string, string>> {
 
 export const ingestGenerationOverlap: LaneManifest = {
   lane: "ingest-generation-overlap",
-  owner: "zero-503 schema windows, feat/zero-503-schema-windows (slot 043885)",
+  owner: "zero-503 schema windows, feat/zero-503-schema-windows (slot 044030)",
   migration: MIGRATION,
   prefixes: ["sessions.ingest_generation_overlap_"],
   grantSources: [],

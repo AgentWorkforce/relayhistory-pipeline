@@ -225,6 +225,16 @@ jobs:
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
         run: bun test --timeout 300000 src/session-ingest/__tests__/claim-clock-lock.postgres.test.ts
+      - name: Prove the self-host erase serializes with a concurrent claim on the fence lock (044010)
+        env:
+          SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
+        run: |
+          # pg-proof checks out the PR head; heads predating this step lack the test. Remove once no open PR predates it.
+          if [ ! -f src/session-ingest/__tests__/selfhost-erase-lock.postgres.test.ts ]; then
+            echo "::warning title=pg-proof::selfhost-erase-lock.postgres.test.ts absent at this head; forward-merge main to run the erase lock proof"
+            exit 0
+          fi
+          bun test --timeout 300000 src/session-ingest/__tests__/selfhost-erase-lock.postgres.test.ts
       - name: Prove the acquisition installer login refuses a superuser SET SESSION AUTHORIZATION (pg_stat_activity usename)
         env:
           ACQUISITION_LOGIN_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
@@ -501,6 +511,7 @@ jobs:
           # runs as the CREATEROLE non-superuser owner, exactly like the
           # operator model (a superuser creator gets no membership edge to
           # pin, so the suite would prove less as postgres).
+          SESSION_PIPELINE_TEST_OPERATOR_PG_URL: postgres://postgres@127.0.0.1:5432/consumer336
           SESSION_PIPELINE_TEST_PG_URL: postgres://hoop@127.0.0.1:5432/consumer336
           SESSION_PIPELINE_TEST_WRITER_PG_URL: postgres://search_consumer_runtime@127.0.0.1:5432/consumer336
         run: bun test --timeout 300000 src/session-pipeline/__tests__/session-consumer-writer.postgres.test.ts
@@ -588,3 +599,30 @@ jobs:
             exit 0
           fi
           bun test --timeout 300000 src/session-pipeline/__tests__/buffered-feed-login.postgres.test.ts
+
+  consumer-credential-probe:
+    name: consumer credential probe (PG 17)
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Prove exact-helper non-superuser bootstrap and causal refusals
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture=$(docker run --detach --memory=1g --cpus=1 -p 127.0.0.1::5432 -e POSTGRES_HOST_AUTH_METHOD=trust postgres:17 postgres -c cluster_name=consumer-credential-proof)
+          trap 'docker rm -fv "$fixture" >/dev/null' EXIT
+          for attempt in $(seq 1 60); do
+            if docker exec "$fixture" pg_isready -U postgres; then break; fi
+            sleep 1
+          done
+          port=$(docker port "$fixture" 5432/tcp | awk -F: '{print $NF}')
+          CONSUMER_CREDENTIAL_PROBE_NATIVE=true CONSUMER_CREDENTIAL_PROBE_PG_PORT="$port" \
+            bun test --timeout 120000 src/session-pipeline/__tests__/consumer-credential-probe.postgres.test.ts
