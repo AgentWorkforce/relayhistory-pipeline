@@ -105,6 +105,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // A new table and read API functions only; no ingest path touches them.
       "20261105044000_read_api_tokens.sql",
       "20261105044010_selfhost_erase_lock_fences.sql",
+      // Eight org_id btree indexes on existing ingest tables only; no function or column.
+      "20261105044020_claim_bootstrap_org_indexes.sql",
       // #386 generation overlap: owner-only window, retired record and policy trigger; replaces
       // ingest_require_generation / ingest_lazy_guard (in OBJECTS.replacedFunctions below).
       "20261105044030_ingest_generation_overlap.sql",

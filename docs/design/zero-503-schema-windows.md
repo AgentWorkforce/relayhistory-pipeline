@@ -78,18 +78,18 @@ Worker-first ordering.
 ### 2.1 Database: one owner-opened, time-bounded window (migration `20261105044030`)
 
 **SLOT 044030.** The migration was first drafted as `053020`, then assigned `043885`; it was re-slotted to
-`044030` after `043890`, `043900`, `043910`, `044000` and `044010` landed on main, because a self-host or kind
+`044030` after `043890`, `043900`, `043910`, `044000`, `044010` and `044020` landed on main, because a self-host or kind
 database that already applied those would refuse a pending file sorted below its newest applied slot (the
-sequence preflight). `044020` is reserved for the index catch-up. Each renumber changed only the slot header
+sequence preflight). `044020` is the claim-bootstrap org_id index catch-up. Each renumber changed only the slot header
 comment, the file names and the derived rollback's sha256. `migrate.ts` applies pending files in sorted order,
 so `044030` applies after every landed slot. The rollback chain follows the sorted order: `044030` rolls back
-first, and `044010`, `044000`, `043910`, `043900` and `043880` refuse while it is applied; then the landed
-chain unwinds as before (`044010`, `044000`, `043910`, `043900`, `043890`, `043880`, ...). None of `043890`
-through `044010` touches the two functions `044030` replaces or the lazy policy table it puts a trigger on:
+first, and `044020`, `044010`, `044000`, `043910`, `043900` and `043880` refuse while it is applied; then the landed
+chain unwinds as before (`044020`, `044010`, `044000`, `043910`, `043900`, `043890`, `043880`, ...). None of `043890`
+through `044020` touches the two functions `044030` replaces or the lazy policy table it puts a trigger on:
 `043910`/`044010` define and replace only `ingest_selfhost_set_session_uploads`, which calls the unchanged
 `ingest_set_session_uploads` and `ingest_lock_fences` and sends no generation (the self-host server runs in
 canonical acceptance), so it reaches neither fence helper's new branch; `044000` adds only the read API token
-table and functions.
+table and functions; `044020` adds only eight org_id btree indexes on existing ingest tables.
 
 The migration creates `sessions.ingest_generation_overlap_windows`, an append-only record with these rules:
 - Columns: `from_generation`, `to_generation`, `admit_during_apply`, `approval_sha256`, `opened_by`,
@@ -318,5 +318,5 @@ that covers steps 3–5. The maximum is 4 h.
 - `src/hoopdb/__tests__/sessions-function-boundary.test.ts`: the lane adds six owner-only functions, every
   role verifier is byte-identical with and without the lane, and the generated rollback contains the exact
   050000/055000 bodies.
-- `src/hoopdb/__tests__/migration-profile.test.ts`: the down/reapply chain. 044030 rolls back first: 044010, 044000,
+- `src/hoopdb/__tests__/migration-profile.test.ts`: the down/reapply chain. 044030 rolls back first: 044020, 044010, 044000,
   043910, 043900 and 043880 refuse under it, 044030's down restores the strict fences and drops its objects, and the next migrate reinstalls it.

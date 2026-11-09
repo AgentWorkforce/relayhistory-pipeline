@@ -46,7 +46,7 @@ import { AcquisitionRefusedError } from "./acquisition-refusal.ts";
 import { parseDeliveryRequest, requireDeliveryAccount, prepareDelivery } from "./vendor/delivery/prepare.ts";
 import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protocol.ts";
 import { parseTurnBatch } from "./turns.ts";
-import { heartbeatProgress, ProgressError, readConnection, recordHeartbeat, type Run as OnboardingRun } from "../history-db/onboarding.ts";
+import { heartbeatProgress, ProgressError, readConnection, readSessionReceipt, recordHeartbeat, type Run as OnboardingRun } from "../history-db/onboarding.ts";
 
 /** `admission`: relayhistory's SIGNED opt-in to the queued ACK (async-admission.ts); absent: synchronous. */
 export type IngestIdentity=VerifiedIdentity & {control?:OrderedControl;admission?:typeof ADMISSION_ACCEPT_VALUE};
@@ -54,8 +54,9 @@ export type IngestIdentity=VerifiedIdentity & {control?:OrderedControl;admission
 export const SYNC_SCOPE = "rth:sync";
 export type ContentEncoding = "zstd" | "gzip";
 
-/** relayhistory-cloud's read scope; only the onboarding status read accepts it here. */
+/** relayhistory-cloud's read scope; only the onboarding status reads accept it here. */
 export const READ_SCOPE = "rth:read";
+const READ_PATHS = new Set(["/v1/onboarding/connection", "/v1/onboarding/receipt"]);
 export const IDENTITY_HEADER = "x-relay-ingest-identity";
 export const SIGNATURE_HEADER = "x-relay-ingest-signature";
 /** How old (or how far ahead) a signature may be. */
@@ -504,8 +505,8 @@ export function createIngestApp(deps: IngestAppDeps) {
       emit({ route: "auth", outcome: "error", error_code: "identity_failed" });
       return c.json(errorBody(c, "invalid_token", "invalid or expired token"), 401);
     }
-    // The onboarding status read is the only rth:read route here; everything else needs rth:sync.
-    const scope = c.req.method === "GET" && new URL(c.req.url).pathname === "/v1/onboarding/connection" ? READ_SCOPE : SYNC_SCOPE;
+    // The onboarding status reads are the only rth:read routes here; everything else needs rth:sync.
+    const scope = c.req.method === "GET" && READ_PATHS.has(new URL(c.req.url).pathname) ? READ_SCOPE : SYNC_SCOPE;
     if (!c.get("identity").scopes.includes(scope)) return c.json(errorBody(c, "forbidden", `missing required scope: ${scope}`), 403);
     await next();
   });
@@ -542,6 +543,21 @@ export function createIngestApp(deps: IngestAppDeps) {
       return c.json(await readConnection(deps.onboarding.run, identity));
     } catch (error) {
       emit({ route: "onboarding.connection", outcome: "error", error_code: (error as { code?: string }).code ?? "onboarding_failed" });
+      return c.json(errorBody(c, "onboarding_unavailable", "onboarding is temporarily unavailable"), 503);
+    }
+  });
+
+  // Zero-Neon lane D / W4: the session counters of relayhistory's onboarding status
+  // (sessionCount, lastReceivedAt, sources), from the ingest ledger plus the imported
+  // pre-cutover rollups. relayhistory reads this when ONBOARDING_STATUS_BACKEND=ingest.
+  app.get("/v1/onboarding/receipt", async (c) => {
+    const identity = c.get("identity");
+    if (!deps.onboarding) return c.json(errorBody(c, "not_configured", "onboarding is not configured"), 503);
+    if (!identity.workspaceId) return c.json({ error: "Workspace required" }, 403);
+    try {
+      return c.json(await readSessionReceipt(deps.onboarding.run, identity));
+    } catch (error) {
+      emit({ route: "onboarding.receipt", outcome: "error", error_code: (error as { code?: string }).code ?? "onboarding_failed" });
       return c.json(errorBody(c, "onboarding_unavailable", "onboarding is temporarily unavailable"), 503);
     }
   });

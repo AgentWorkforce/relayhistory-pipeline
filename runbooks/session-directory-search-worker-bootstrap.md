@@ -182,6 +182,7 @@ never infers anything from the hostname. An invalid profile writes nothing anywh
 | `HOOPDB_RUNTIME_ROLE_LOGIN`     | required in `selfhosted`, `cloudsql`, `supabase` and `rds` (`runtime_role_login_unset`): `true` if the runtime role logs in itself, `false` if the services log in as a workload role that is a member of it.                                                                                                            |
 | `HOOPDB_RUNTIME_WORKLOAD_ROLE`  | optional: the one role allowed to be a member of the runtime role (without ADMIN OPTION). Refused in `rds` (`db_profile_invalid`): its grantor would be the non-superuser master.                                                                                                                                                                                                                         |
 | `HOOPDB_FUNCTION_BOUNDARY_MODE` | required in `selfhosted`, `cloudsql`, `supabase` and `rds`: `global-default-revoke`, or `event-trigger` (supabase only; refused elsewhere with `function_boundary_mode_unsupported`). The catalog must prove the selected control, see "Function boundary". The old `HOOPDB_FUNCTION_BOUNDARY_APPROVED` name is refused. |
+| `HOOPDB_ALLOW_BLOCKING_INDEX_BUILD` | optional, default off, strict `true`/`false`: lets an index migration (20261105044020) run a blocking `CREATE INDEX` on a populated table. Off: an absent index on a non-empty table is refused (55000); prebuild it with `CREATE INDEX CONCURRENTLY` (claim-bootstrap index packet, PR #407) and the migration adopts it. Bound per migration transaction as `hoopdb.allow_blocking_index_build`. |
 
 **Runtime role: dedicated, exact least privilege.** It is checked under the migrator's
 advisory lock before any write (before the ledger and marker tables are created, before
@@ -403,6 +404,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105043910_selfhost_session_selection_erase.sql` | function sessions.ingest_selfhost_set_session_uploads |
 | `upstream:20261105044000_read_api_tokens.sql` | table sessions.read_api_tokens |
 | `upstream:20261105044010_selfhost_erase_lock_fences.sql` | replacement: ingest_selfhost_set_session_uploads takes the user's fence lock before reading ownership |
+| `upstream:20261105044020_claim_bootstrap_org_indexes.sql` | the eight claim-bootstrap `<table>_org_id_idx` indexes, exact definition, valid and ready (an operator-built exact, valid set is adopted, not refused: `ADOPTABLE_INDEXES`) |
 | `upstream:20261105044030_ingest_generation_overlap.sql` | table sessions.ingest_generation_overlap_windows (slot 044030, zero-503 schema windows; owner-only, no role prerequisite) |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |

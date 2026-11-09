@@ -1,6 +1,6 @@
--- SLOT 044030 (zero-503 schema windows), re-slotted from 043885 after 043890..044010 landed on main, so it
--- applies after every landed migration (044020 is reserved for the index catch-up). It replaces only
--- ingest_require_generation and ingest_lazy_guard, which no migration from 043890 to 044010 touches.
+-- SLOT 044030 (zero-503 schema windows), re-slotted from 043885 after 043890..044020 landed on main, so it
+-- applies after every landed migration (044020 is the claim-bootstrap index catch-up). It replaces only
+-- ingest_require_generation and ingest_lazy_guard, which no migration from 043890 to 044020 touches.
 -- Design: docs/design/zero-503-schema-windows.md.
 --
 -- Bounded generation overlap for the ingest generation fence.
