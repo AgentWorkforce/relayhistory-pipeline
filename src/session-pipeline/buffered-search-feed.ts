@@ -15,6 +15,22 @@
  * `user_id`). The parity test writes the same group through `writeGroups` and compares with
  * `indexSearchScope`'s rows.
  *
+ * Settle holdback (INGEST_BUFFERED_SEARCH_FEED_SETTLE_S, seconds, 180-3600, default 300). The
+ * page RPC lists acknowledged stages in (created_at, stage_token) order behind a server-held,
+ * forward-only cursor, and created_at is the intent's insert time, not its ack time. A stage
+ * still in flight when the cursor passed its position would be acknowledged behind the cursor
+ * and never listed (a late-ack skip). So each page only processes stages created at least the
+ * holdback before the run's clock; at the first younger one the page stops and the cursor waits
+ * before it. A fresh upload's ack is refused once its intent expires (created_at + 120 s), so
+ * nothing can be acknowledged behind a position older than that; the remainder of the default
+ * margin covers the commit tail and Lambda-vs-database clock skew. Nothing is re-scanned or
+ * re-emitted: the cursor never rewinds and every stage is still processed once. The tail lags
+ * by the holdback; the per-object keep-up path is unaffected. Residual: a GC replacement child
+ * keeps its own created_at and can be adopted and acknowledged by a later GC claim; its rows are
+ * its active parent's retained rows (same fingerprint and version), which the parent already
+ * wrote, so a skip there loses no content. A re-scan horizon is not used: the cursor cannot be
+ * rewound through the 043870 RPCs, and the page exposes no ack time.
+ *
  * Provenance marker. Every row written here has `origin = 'buffered'` and
  * `origin_claim_token` = the stage's ORIGINAL claim token (a GC replacement keeps it), the two
  * columns the read-side gate (#338, buffered-search-gate.ts) reads; every other writer leaves
@@ -25,6 +41,14 @@
  * marker indexSearchScope reads in its existing scan, so its delete pass leaves buffered-only
  * rows alone. Because `bf` never equals `s3`, the first canonical pass over the same events
  * rewrites them once with its newer `version` (origin back to canonical).
+ *
+ * Stage binding. A buffered fingerprint is `bf<body>:<stageToken>:<ordinals>` (bufferedFingerprint):
+ * the s3 body without `s3`, the stage token the row was projected from, and the record's original
+ * claim ordinals (sorted, comma separated, possibly empty). `origin_claim_token` alone names the
+ * admission, not a stage, and the 043870 `stage` RPC accepts only a stage token or key, so this is
+ * how the later-erasure lane (buffered-erasure-delete.ts) finds the stage to re-check and which rows
+ * retention still keeps, without a new RPC or column. Rows written before the suffix carry the bare
+ * `bf<body>` and stay with the query-time gate.
  *
  * Arming. INGEST_BUFFERED_SEARCH_FEED=on is refused unless the deployment also declares
  * BUFFERED_SEARCH_FEED_GATE_DECLARED equal to the read gate's contract id
@@ -45,7 +69,10 @@
  * unless this flag is on too. With the flag on:
  *  - version = floor(epoch seconds of the stage's PG `created_at`) (encodeBufferedVersion), an
  *    immutable column, so a replay, a backfill re-run and keep-up all write the same version and
- *    the exact-version deletes (deleteBufferedRows, the erasure lane) stay valid. Seconds sit about
+ *    the exact-version deletes (deleteBufferedRows, the erasure lane) stay valid. A GC replacement
+ *    child has its own created_at, so its rows carry its own (later) version and outrank the
+ *    parent's rows of the same identity; the erasure lane reads each row's version back from
+ *    ClickHouse, so it deletes either exactly. Seconds sit about
  *    1000x below any raw-ms canonical version, so any canonical row outranks every buffered row
  *    (B1: 0 < version < BUFFERED_VERSION_CEILING, the proved canonical minimum; unpinned refuses);
  *  - two stages of one (org, workspace, origin, user) created in the same second would tie. The
@@ -60,7 +87,12 @@
  *  - the page and stage results are checked strictly: `createdAt` is exactly six fractional
  *    digits and a real calendar instant, a page is strictly increasing in (createdAt, stageToken)
  *    after its cursor, and a stage result must match its page candidate (`sql_stage_page_mismatch`).
- * With the flag off none of this runs and the feeder behaves exactly as before.
+ * With the flag off none of this runs and the feeder behaves exactly as before (idempotency: a
+ * replay or a backfill re-run of the same stage re-inserts byte-identical rows; a GC replacement of
+ * the same batch re-inserts rows with the same identity and version that differ only in the
+ * fingerprint's stage token, which ReplacingMergeTree folds the same way: equal version, the last
+ * inserted survives a merge). Under either encoding any later canonical pass (version = its wall
+ * clock) wins over buffered rows.
  *
  * Privacy and erasure. Only what the buffered GC's own retention authority keeps is indexed
  * (`sessions.ingest_buffer_gc_ordinals`, via the feed RPC in
@@ -70,8 +102,9 @@
  * record retention no longer keeps are deleted: only the exact physical rows this claim wrote
  * (origin, origin_claim_token, fingerprint and version all bound; never a prefix match), so a
  * stale claim's cleanup never removes a newer claim's row for the same event. Deletes for
- * erasure that happens LATER (session delete/reset/GC) are a separate lane; until it lands the
- * query-time check keeps deleted sessions out.
+ * erasure that happens LATER (GC, redaction, a batch leaving the buffer) are the separate,
+ * default-off lane in buffered-erasure-delete.ts (INGEST_BUFFERED_ERASURE_DELETE); the query-time
+ * gate keeps deleted sessions out either way.
  *
  * Nothing here logs content; errors and summaries carry codes and counts only.
  */
@@ -114,6 +147,27 @@ export const BUFFERED_FEED_DEFAULT_SINCE = "2026-11-05T05:33:45.000Z";
 export const BUFFERED_FEED_DEFAULT_CURSOR = "backfill-20261105";
 
 export const isBufferedOriginFingerprint = (fingerprint: string) => fingerprint.startsWith(BUFFERED_FINGERPRINT_PREFIX);
+
+const BOUND_FINGERPRINT = /^bf([0-9a-f]+):([0-9a-f-]{36}):((?:0|[1-9]\d{0,2})(?:,(?:0|[1-9]\d{0,2}))*)?$/;
+
+/** `bf<body>:<stageToken>:<ordinals>`: the row's stage and original claim ordinals (sorted, deduplicated). */
+export function bufferedFingerprint(s3Fingerprint: string, stageToken: string, ordinals: readonly number[]): string {
+  const body = s3Fingerprint.replace(/^s3/, "");
+  if (!/^[0-9a-f]+$/.test(body) || !UUID.test(stageToken) || ordinals.some((o) => !Number.isInteger(o) || o < 0 || o > 999))
+    throw new BufferedFeedError("fingerprint_unbindable");
+  return `${BUFFERED_FINGERPRINT_PREFIX}${body}:${stageToken}:${[...new Set(ordinals)].sort((a, b) => a - b).join(",")}`;
+}
+
+/** The stage token and ordinals of a stage-bound buffered fingerprint, or null (legacy or malformed). */
+export function parseBufferedFingerprint(fingerprint: string): { stageToken: string; ordinals: number[] } | null {
+  const m = BOUND_FINGERPRINT.exec(fingerprint);
+  if (!m || !UUID.test(m[2]!)) return null;
+  return { stageToken: m[2]!, ordinals: m[3] ? m[3].split(",").map(Number) : [] };
+}
+
+/** ClickHouse (re2) expressions over `fingerprint`: the bound stage token ('' when legacy) and ordinal strings. */
+export const FINGERPRINT_STAGE_SQL = "extract(fingerprint, '^bf[0-9a-f]+:([0-9a-f-]{36}):')";
+export const FINGERPRINT_ORDINALS_SQL = "arrayFilter(x -> x != '', splitByChar(',', extract(fingerprint, '^bf[0-9a-f]+:[0-9a-f-]{36}:([0-9,]*)$')))";
 export const isBufferedStageKey = (key: string) => key.includes("/buffered-batches/v1/");
 
 export class BufferedFeedError extends Error {
@@ -136,6 +190,8 @@ export interface BufferedFeedConfig {
   budgetMs: number;
   /** INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION=on: the S version encoding and its same-second refusal. */
   secondVersion: boolean;
+  /** Only stages created at least this long before the run's clock are processed (late-ack guard). 180-3600 s, default 300. */
+  settleMs: number;
 }
 
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/;
@@ -237,6 +293,7 @@ export function bufferedFeedConfig(env: NodeJS.ProcessEnv, versionCeiling: numbe
     cursor,
     budgetMs: int("INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS", 50_000, 5_000, 240_000),
     secondVersion: second === "on",
+    settleMs: int("INGEST_BUFFERED_SEARCH_FEED_SETTLE_S", 300, 180, 3_600) * 1_000,
   };
 }
 
@@ -372,6 +429,8 @@ export function sqlBufferedFeedSource(db: SqlExecutor, options: { secondVersion?
 
 /** An index row as the feeder writes it: the canonical shape plus the read gate's origin marker. */
 export type BufferedIndexRow = IndexRow & { origin: typeof ORIGIN_BUFFERED; origin_claim_token: string };
+/** The columns deleteBufferedRows binds: the event identity and the full buffered provenance. */
+export type BufferedRowKey = Pick<BufferedIndexRow, "org_id" | "session_id" | "workspace_id" | "machine_id" | "source" | "kind" | "event_id" | "ts" | "origin" | "origin_claim_token" | "fingerprint" | "version">;
 /** One projected row and the original claim ordinals of the record it came from. */
 export interface BufferedRow { row: BufferedIndexRow; ordinals: number[] }
 
@@ -390,8 +449,9 @@ const admitted = (v: string) => v.length > 0 && Array.from(v).length <= 255 && !
  * `indexSearchScope`, fingerprinted as buffered-origin. Pure: no IO. `version` is the S encoding
  * (encodeBufferedVersion) when INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION is on; omitted, the legacy
  * `received_at` epoch ms (the defect; see the header). `received_at` is parse-checked either way.
+ * `stageToken` binds each row's fingerprint to this stage (bufferedFingerprint) for the erasure lane.
  */
-export function projectBufferedStage(decoded: DecodedBufferedStage, retained: ReadonlySet<number>, keyRoot: string, encoded?: number): StageProjection {
+export function projectBufferedStage(decoded: DecodedBufferedStage, retained: ReadonlySet<number>, keyRoot: string, stageToken: string, encoded?: number): StageProjection {
   const { header, groups, spec } = decoded;
   if (!spec.key.startsWith(`${keyRoot}/${header.org_id}/buffered-batches/v1/`)) throw new BufferedFeedError("stage_key_tenant_mismatch");
   const received = Date.parse(header.received_at);
@@ -428,9 +488,10 @@ export function projectBufferedStage(decoded: DecodedBufferedStage, retained: Re
       if (table !== "convergence_events") continue;
       const canonicalRow = { ...row, session_id: row.delivery_record_id ? sessionId : row.session_id, user_id: row.user_id ?? userId };
       const base = toIndexRow(projectedToNeonRow(canonicalRow, scope, userId), version);
-      const indexRow: BufferedIndexRow = { ...base, fingerprint: BUFFERED_FINGERPRINT_PREFIX + base.fingerprint.replace(/^s3/, ""), origin: ORIGIN_BUFFERED, origin_claim_token: header.claim_token };
       const recordId = String(row.delivery_record_id ?? row.event_id);
-      out.push({ row: indexRow, ordinals: byRecord.get(recordId) ?? [] });
+      const ordinals = byRecord.get(recordId) ?? [];
+      const indexRow: BufferedIndexRow = { ...base, fingerprint: bufferedFingerprint(base.fingerprint, stageToken, ordinals), origin: ORIGIN_BUFFERED, origin_claim_token: header.claim_token };
+      out.push({ row: indexRow, ordinals });
     }
   });
   return { rows: out, reasons, version };
@@ -463,7 +524,7 @@ export async function assertOriginColumns(ch: ClickHouseClient): Promise<void> {
  * remove a row a newer claim has already written and advanced the cursor past. Rows that do not
  * carry a buffered provenance are refused (no unbound delete is ever issued).
  */
-export async function deleteBufferedRows(ch: ClickHouseClient, rows: readonly BufferedIndexRow[], maxKeys = 500): Promise<number> {
+export async function deleteBufferedRows(ch: ClickHouseClient, rows: readonly BufferedRowKey[], maxKeys = 500): Promise<number> {
   const { createHash } = await import("node:crypto");
   for (const r of rows)
     if (r.origin !== ORIGIN_BUFFERED || !UUID.test(r.origin_claim_token) || !isBufferedOriginFingerprint(r.fingerprint) || r.fingerprint.length <= BUFFERED_FINGERPRINT_PREFIX.length || !Number.isSafeInteger(r.version) || r.version <= 0)
@@ -635,7 +696,7 @@ async function loadLive(state: StageState, deps: BufferedFeedDeps, fromMs: numbe
     if (error instanceof BufferedFeedError) return { skip: error.code };
     throw error;
   }
-  const projection = projectBufferedStage(decoded, new Set(state.retained), deps.keyRoot, version);
+  const projection = projectBufferedStage(decoded, new Set(state.retained), deps.keyRoot, state.stage!.stageToken, version);
   // The canonical indexer's window: older rows are not indexed by either path.
   projection.rows = projection.rows.filter((r) => tsMillis(`${r.row.ts.replace(" ", "T")}Z`) >= fromMs);
   return { state, projection };
@@ -712,7 +773,7 @@ export interface BackfillSummary {
   skipped: number;
   rows: number;
   deleted: number;
-  /** The cursor reached the newest accepted stage. */
+  /** The cursor reached the newest accepted stage past the settle holdback. */
   caughtUp: boolean;
   /** A stage could not be decided yet (GC in flight, privacy fenced): the cursor waits before it. */
   blocked?: string;
@@ -730,7 +791,7 @@ export interface BackfillSummary {
  * past stages that were indexed (and re-checked) or are terminally not indexable, and only after
  * the ClickHouse writes, so a crash replays at most one page (idempotent).
  */
-export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<BufferedFeedConfig, "pageSize" | "stagesPerSecond" | "since" | "cursor" | "budgetMs">): Promise<BackfillSummary> {
+export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<BufferedFeedConfig, "pageSize" | "stagesPerSecond" | "since" | "cursor" | "budgetMs"> & { settleMs?: number }): Promise<BackfillSummary> {
   const now = deps.now ?? Date.now;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const deadline = now() + config.budgetMs;
@@ -741,7 +802,10 @@ export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<Buffe
   const count = (reason: string) => (summary.reasons[reason] = (summary.reasons[reason] ?? 0) + 1);
   const fromMs = Date.parse(await windowStart(deps.ch, new Date(now())));
   let next = now();
+  let settling = false;
   while (now() < deadline) {
+    // Taken before the page is read: every stage listed at or before it is past its ack window.
+    const horizon = now() - (config.settleMs ?? 300_000);
     const page = await deps.source.page(config.cursor, config.since, config.pageSize);
     summary.pages += 1;
     let loaded: Loaded[] = [];
@@ -762,6 +826,8 @@ export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<Buffe
     let indexed = 0, skipped = 0;
     for (const candidate of page.stages) {
       if (now() >= deadline) break;
+      // Too young to be settled (or unparseable): stop here; the cursor waits before it.
+      if (!(Date.parse(candidate.createdAt) <= horizon)) { settling = true; break; }
       const wait = next - now();
       if (wait > 0) await sleep(wait);
       next = Math.max(next, now()) + interval;
@@ -816,6 +882,8 @@ export async function runBufferedFeed(deps: BufferedFeedDeps, config: Pick<Buffe
     summary.indexed += indexed;
     summary.skipped += skipped;
     if (summary.blocked) break;
+    // Caught up to the settle horizon; the younger stages are listed again on a later run.
+    if (settling) { summary.caughtUp = true; break; }
     if (page.stages.length < config.pageSize && (page.stages.length === 0 || last === page.stages.at(-1))) { summary.caughtUp = true; break; }
   }
   // A recorded refusal stays outstanding (the run is not ok) until a resolution lane marks it.

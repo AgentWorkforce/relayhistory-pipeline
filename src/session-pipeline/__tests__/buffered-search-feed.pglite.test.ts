@@ -51,12 +51,14 @@ async function fixture(){
    {ord:2,source:"claude",session_id:null,record_id:"n",revision_id:"n:1",revision:1,digest:hash("n")}];
   await db.query("INSERT INTO sessions.ingest_claim_attempts(claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,epochs,records,reset_epoch,schema_generation) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10)",[claim,tenant.orgId,tenant.workspaceId,tenant.userId,origin,batch,digest,JSON.stringify([{source:"claude",session_id:"gone",epoch:0,reset_epoch:0},{source:"claude",session_id:"live",epoch:0,reset_epoch:0}]),JSON.stringify(records),generation]);
   await db.query("INSERT INTO sessions.ingest_stage_intents(stage_token,claim_token,org_id,workspace_id,user_id,origin_id,batch_id,digest,stage_key,stage_sha256,stage_bytes,group_ordinals,reset_epoch,receipt_state,expires_at,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,10,$11,0,'preparing',clock_timestamp()+interval '5 minutes',$12)",[token,claim,tenant.orgId,tenant.workspaceId,tenant.userId,origin,batch,digest,key,sha,JSON.stringify([[0],[1],[2]]),opts.createdAt??"2026-11-06T00:00:00Z"]);
-  if(opts.ack!==false){
-   await db.query("INSERT INTO sessions.ingest_buffer_outbox(org_id,workspace_id,origin_id,batch_id,user_id,digest,active_stage_token) VALUES($1,$2,$3,$4,$5,$6,$7)",[tenant.orgId,tenant.workspaceId,origin,batch,tenant.userId,digest,token]);
-   await db.query("UPDATE sessions.ingest_stage_intents SET receipt_state='acknowledged' WHERE stage_token=$1",[token]);
-   await db.query("UPDATE sessions.ingest_batches SET state='committed',committed_at=clock_timestamp(),buffer_receipt_kind='staged' WHERE batch_id=$1",[batch]);
-  }
-  return {batch,token,key};
+  if(opts.ack!==false)await ack({batch,token,tenant,origin});
+  return {batch,token,key,tenant,origin};
+ }
+ /** Acknowledge a staged intent as the stage's own (org, workspace, origin, user) tuple (stage() may override user/origin). */
+ async function ack({batch,token,tenant:t=tenant,origin:o=origin}:{batch:string;token:string;tenant?:{orgId:string;workspaceId:string;userId:string};origin?:string}){
+  await db.query("INSERT INTO sessions.ingest_buffer_outbox(org_id,workspace_id,origin_id,batch_id,user_id,digest,active_stage_token) VALUES($1,$2,$3,$4,$5,$6,$7)",[t.orgId,t.workspaceId,o,batch,t.userId,hash(batch),token]);
+  await db.query("UPDATE sessions.ingest_stage_intents SET receipt_state='acknowledged' WHERE stage_token=$1",[token]);
+  await db.query("UPDATE sessions.ingest_batches SET state='committed',committed_at=clock_timestamp(),buffer_receipt_kind='staged' WHERE batch_id=$1",[batch]);
  }
  const disable=()=>ledger.setSessionUploads({tenant,originId:origin,sessions:[["claude","gone"]],enabled:false});
  /** Run sql as a genuine login of `role` (SET SESSION AUTHORIZATION: session_user = role, role GUC 'none'),
@@ -71,7 +73,7 @@ async function fixture(){
   }finally{await db.exec("SET SESSION AUTHORIZATION postgres")}
  };
  const feeder={query:(text:string,params?:unknown[])=>login(FEED_ROLE,text,params) as never};
- return {db,as,login,stage,disable,source:sqlBufferedFeedSource(feeder),strict:sqlBufferedFeedSource(feeder,{secondVersion:true})};
+ return {db,as,login,stage,ack,disable,source:sqlBufferedFeedSource(feeder),strict:sqlBufferedFeedSource(feeder,{secondVersion:true})};
 }
 
 test("page lists only acknowledged, live, active stages after the cursor, in keyset order; advance is monotonic",async()=>{
@@ -97,6 +99,20 @@ test("page lists only acknowledged, live, active stages after the cursor, in key
  // A cursor is bound to its lower bound.
  await expect(f.source.page("backfill-test","2026-11-01T00:00:00.000Z",10)).rejects.toMatchObject({code:"sql_22023"});
  expect((await f.db.query("SELECT stages_indexed::int AS n FROM sessions.buffered_search_feed_cursors WHERE name='backfill-test'")).rows[0]).toEqual({n:2});
+});
+
+test("page orders by created_at, not ack time: a stage acknowledged behind the cursor is never listed (why the feed holds back)",async()=>{
+ const f=await fixture();
+ const late=await f.stage({createdAt:"2026-11-06T00:00:00Z",ack:false});
+ const young=await f.stage({createdAt:"2026-11-06T00:00:01Z"});
+ const p1=await f.source.page("late-ack-test",SINCE,10);
+ expect(p1.stages.map(s=>s.stageToken)).toEqual([young.token]);
+ expect(await f.source.advance("late-ack-test",p1.stages[0]!,{indexed:1,skipped:0})).toBe(true);
+ await f.ack(late);
+ expect((await f.source.stage({stageToken:late.token})).status).toBe("live");
+ expect((await f.source.page("late-ack-test",SINCE,10)).stages).toEqual([]);
+ // A cursor that had not passed it yet lists it.
+ expect((await f.source.page("late-ack-fresh",SINCE,10)).stages.map(s=>s.stageToken)).toEqual([late.token,young.token]);
 });
 
 test("stage: retention comes from the GC authority; redacted, retired, preparing, leased and fenced fail closed",async()=>{

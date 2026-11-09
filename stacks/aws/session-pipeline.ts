@@ -51,7 +51,16 @@ export interface SessionPipelineInputs {
    * Worker already runs that gate, and needs `searchIndex: true`. The feeder's login is not wired
    * here: it is read from the pipeline secret at run time, and without a valid one the feed stays off.
    */
-  bufferedSearchFeed?: {enabled:boolean;gateDeclared?:string};
+  bufferedSearchFeed?: {
+    enabled: boolean;
+    gateDeclared?: string;
+    /** Stages per feed page (INGEST_BUFFERED_SEARCH_FEED_PAGE, 1-200). Absent: not set, so the feeder's default (50) applies. */
+    pageSize?: number;
+    /** Stages per second (INGEST_BUFFERED_SEARCH_FEED_RATE, 1-50). Absent: not set, so the feeder's default (5) applies. */
+    stagesPerSecond?: number;
+    /** Per-run time budget in ms (INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS, 5000-240000). Absent: not set, so the feeder's default (50000) applies. */
+    budgetMs?: number;
+  };
   /** Default off. `true` is refused until the reviewed normalized-prefix PutObject/KMS grant and publication migration exist. */
   replayPages?: boolean;
   /** Dormant full v1 analysis-cache worker; separate readonly source secret required. */
@@ -185,7 +194,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     if (f === null || typeof f !== "object" || Array.isArray(f) || Object.getPrototypeOf(f) !== Object.prototype)
       refuse("transcriptStore.sessionPipeline.bufferedSearchFeed must be a plain object");
     for (const k of Object.keys(f))
-      if (k !== "enabled" && k !== "gateDeclared") refuse(`transcriptStore.sessionPipeline.bufferedSearchFeed.${k} is not a known setting`);
+      if (k !== "enabled" && k !== "gateDeclared" && k !== "pageSize" && k !== "stagesPerSecond" && k !== "budgetMs") refuse(`transcriptStore.sessionPipeline.bufferedSearchFeed.${k} is not a known setting`);
     if (typeof f.enabled !== "boolean") refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.enabled must be a boolean");
     if (f.gateDeclared !== undefined && f.gateDeclared !== BUFFERED_SEARCH_FEED_GATE_CONTRACT)
       refuse(`transcriptStore.sessionPipeline.bufferedSearchFeed.gateDeclared must be exactly ${BUFFERED_SEARCH_FEED_GATE_CONTRACT}`);
@@ -193,6 +202,13 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
       refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.enabled requires gateDeclared: deploy and verify the read gate first");
     if (f.enabled === true && v.searchIndex !== true)
       refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.enabled requires searchIndex: true");
+    // The same bounds as src/session-pipeline/buffered-search-feed.ts, so a value here is never refused at run time.
+    if (f.pageSize !== undefined && !(Number.isInteger(f.pageSize) && (f.pageSize as number) >= 1 && (f.pageSize as number) <= 200))
+      refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.pageSize must be an integer from 1 to 200");
+    if (f.stagesPerSecond !== undefined && !(Number.isInteger(f.stagesPerSecond) && (f.stagesPerSecond as number) >= 1 && (f.stagesPerSecond as number) <= 50))
+      refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.stagesPerSecond must be an integer from 1 to 50");
+    if (f.budgetMs !== undefined && !(Number.isInteger(f.budgetMs) && (f.budgetMs as number) >= 5_000 && (f.budgetMs as number) <= 240_000))
+      refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.budgetMs must be an integer from 5000 to 240000");
   }
   if (v.briefs !== undefined) {
     const b = v.briefs as Record<string, unknown> | null;
@@ -344,6 +360,9 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     SESSION_SEARCH_FEATURE_SOURCE_ID:i.p.semanticCopy?.sourceId??"",
     // Only when armed, so a default deploy leaves the feed at its source default of off.
     ...(i.p.bufferedSearchFeed?.enabled === true ? { INGEST_BUFFERED_SEARCH_FEED: "on", BUFFERED_SEARCH_FEED_GATE_DECLARED: i.p.bufferedSearchFeed.gateDeclared ?? "" } : {}),
+    ...(i.p.bufferedSearchFeed?.pageSize !== undefined ? { INGEST_BUFFERED_SEARCH_FEED_PAGE: String(i.p.bufferedSearchFeed.pageSize) } : {}),
+    ...(i.p.bufferedSearchFeed?.stagesPerSecond !== undefined ? { INGEST_BUFFERED_SEARCH_FEED_RATE: String(i.p.bufferedSearchFeed.stagesPerSecond) } : {}),
+    ...(i.p.bufferedSearchFeed?.budgetMs !== undefined ? { INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS: String(i.p.bufferedSearchFeed.budgetMs) } : {}),
     PIPELINE_FANOUT: "off",
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: String(2 * (i.p.reconcileMinutes ?? 30)),
     HOOPDB_POOL_MAX: "4",

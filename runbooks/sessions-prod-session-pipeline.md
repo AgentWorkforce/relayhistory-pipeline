@@ -264,6 +264,12 @@ operator's assertion that the read Worker is already deployed and verified with 
 does not prove it. No credential is wired here: the feeder reads `buffered_search_feed_database_url` and
 `buffered_search_feed_database_ca_pem` from the pipeline secret and stays off without a valid login.
 
+Optional feed tuning under `bufferedSearchFeed`; each is set on the ingest runtime only when provided, otherwise the feeder's own default applies:
+
+- `pageSize` sets `INGEST_BUFFERED_SEARCH_FEED_PAGE` (integer 1 to 200; feeder default 50).
+- `stagesPerSecond` sets `INGEST_BUFFERED_SEARCH_FEED_RATE` (integer 1 to 50; feeder default 5).
+- `budgetMs` sets `INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS` (integer 5000 to 240000; feeder default 50000).
+
 Rolling out this rule alone creates only the DISABLED schedule and its permission. Arming it is a production
 step that needs Khaliq's explicit OK and follows the buffered search activation order: ClickHouse columns,
 read gate verified, then feeder. Do not arm it before the later-erasure delete lane for ClickHouse exists.
