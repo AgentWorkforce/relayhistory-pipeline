@@ -53,12 +53,17 @@ function client(db: PGlite): MigrationClient {
 const failure = async (run: Promise<unknown>) =>
   (await run.then(() => null, (caught: unknown) => caught)) as { code?: string; message?: string } | null;
 
-/** Every migration before 044020 applied and ledgered through the real migrator. */
+/** The upstream steps that sort after 044020 (044030, the generation overlap): never applied below a pending 044020. */
+const LATER_UPSTREAM = ["upstream:20261105044030_ingest_generation_overlap.sql"];
+/**
+ * Every migration before 044020 applied and ledgered through the real migrator. Later upstream slots are left
+ * pending too: the sequence preflight refuses a pending 044020 below an applied 044030 (ledger_gap).
+ */
 async function before044020(): Promise<PGlite> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
-  const steps = (await plan(LOCAL)).filter((s) => s.name !== STEP && !s.name.startsWith("verify:"));
-  expect(steps.length).toBe((await plan(LOCAL)).filter((s) => !s.name.startsWith("verify:")).length - 1);
+  const steps = (await plan(LOCAL)).filter((s) => s.name !== STEP && !LATER_UPSTREAM.includes(s.name) && !s.name.startsWith("verify:"));
+  expect(steps.length).toBe((await plan(LOCAL)).filter((s) => !s.name.startsWith("verify:")).length - 1 - LATER_UPSTREAM.length);
   await runMigrations(client(db), { profile: { ...LOCAL, verify: false }, steps });
   return db;
 }
@@ -220,8 +225,8 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
     test("a refused run leaves the readiness marker exactly as it was ('pass' stays 'pass'): the refusal comes before the pending write", async () => {
       const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
       open.push(db);
-      // A database validated by the previous release: everything but 044020, verifiers included.
-      const steps = (await plan(LOCAL)).filter((s) => s.name !== STEP);
+      // A database validated by the previous release: everything below 044020 (044030 sorts above it), verifiers included.
+      const steps = (await plan(LOCAL)).filter((s) => s.name !== STEP && !LATER_UPSTREAM.includes(s.name));
       expect(await failure(runMigrations(client(db), { profile: LOCAL, steps }))).toBeNull();
       const marker = async () =>
         (await db.query<{ name: string; generation: string; status: string; updated_at: string }>(
@@ -582,8 +587,14 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
          UNION ALL SELECT 'fn:' || p.oid::regprocedure::text FROM pg_proc p WHERE p.pronamespace = 'sessions'::regnamespace ORDER BY 1`,
       )).rows.map((r) => r.k);
     const ledger = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations ORDER BY name")).rows.map((r) => r.name);
-    const before = await catalog(), ledgerBefore = await ledger();
     const down = readFileSync(DOWN, "utf8");
+    const full = await catalog();
+    // The real later slot (044030) applied: refused, nothing changes; its own guarded down goes first.
+    expect((await failure(db.exec(down).catch(async (e) => { await db.exec("ROLLBACK"); throw e; })))?.code).toBe("55000");
+    expect(await catalog()).toEqual(full);
+    await db.exec(readFileSync(join(root, "supabase/rollbacks/20261105044030_ingest_generation_overlap.down.sql"), "utf8"));
+    const before = await catalog(), ledgerBefore = await ledger();
+    expect(ledgerBefore.filter((n) => LATER_UPSTREAM.includes(n))).toEqual([]);
     // A later upstream migration applied: refused, nothing changes.
     await db.query("INSERT INTO sessions.__96bulls_migrations (name, sha256) VALUES ('upstream:20261105099000_later.sql', 'x')");
     expect((await failure(db.exec(down).catch(async (e) => { await db.exec("ROLLBACK"); throw e; })))?.code).toBe("55000");
@@ -597,17 +608,17 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
     // Again: its ledger row is gone, so it refuses and changes nothing.
     expect((await failure(db.exec(down).catch(async (e) => { await db.exec("ROLLBACK"); throw e; })))?.code).toBe("55000");
     expect(await catalog()).toEqual(after);
-    // The next migrator run recreates them.
+    // The next migrator run recreates them (and reapplies 044030).
     expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
-    expect(await catalog()).toEqual(before);
+    expect(await catalog()).toEqual(full);
   });
 
-  test("(g) sequence: 044020 is the newest upstream step on this branch and sits after 044000", async () => {
+  test("(g) sequence: 044020 sits after 044000, and the only later upstream step is 044030", async () => {
     const names = (await plan(LOCAL)).map((s) => s.name).filter((n) => n.startsWith("upstream:"));
     const i = names.indexOf(STEP);
     expect(i).toBeGreaterThan(0);
     expect(names[i - 1]! < STEP).toBe(true);
     expect(names.indexOf("upstream:20261105044000_read_api_tokens.sql")).toBeLessThan(i);
-    expect(names.filter((n) => n > STEP)).toEqual([]);
+    expect(names.filter((n) => n > STEP)).toEqual(LATER_UPSTREAM);
   });
 });
