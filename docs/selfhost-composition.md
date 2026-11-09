@@ -26,6 +26,7 @@ whole table.
 | `session-read-api` | Deployment (HTTP) | `src/session-read-api/server.ts` | `RELAYHISTORY_READ_API_PORT`, default 8080 | `GET /healthz` (200 `{"ok":true,"enabled":false\|true}`) |
 | `session-publication` | Deployment (worker) | `src/session-ingest/publication-service.ts --continuous` | `WORKER_HEALTH_PORT`, default 8081, probes only | `GET /healthz`, `GET /readyz` (below) |
 | `session-ingest` | Deployment (HTTP) | `src/session-ingest/selfhost-server.ts` | `RELAYHISTORY_INGEST_PORT`, default 8081 | `GET /healthz` (200 `{"ok":true,"enabled":false\|true}`), `GET /readyz` (section 3) |
+| `session-erase-bytes` | Job (one-shot, operator-run, default off) | `src/session-erase/selfhost-eraser-main.ts` | none | exit code (0 verified / disabled / dry run, 3 not verified (rerun), 2 refused or misconfigured (do not retry unchanged), 4 failed, may be partial (rerun)) |
 
 The worker port serves probes only. It must never be reachable from outside
 the cluster.
@@ -65,6 +66,22 @@ dormant; any other value fails startup.
   versioned-bucket requirement are listed in that file's header. Until the
   frontier rows exist, an enabled portable publisher runs but finds nothing to
   publish.
+
+### `SERVICE=session-erase-bytes`
+
+The self-host per-session byte eraser
+(`docs/operator-session-erase-selfhost-eraser.md`). It is a one-shot Job, never
+a Deployment, and is off unless `SESSION_ERASE_BYTES_ENABLED` is exactly `1`
+(not `true`: see the note in section 5). Unset, empty or `0` prints
+`{"enabled":false}` and exits 0 without reading config, credentials or the
+request, and without touching the store. Any other value exits 2.
+
+When enabled it reads one erase request (JSON) from
+`SESSION_ERASE_REQUEST_FILE` (a mounted file), deletes every version and delete
+marker of that session's transcript directories, live pointer and supplied
+staged objects in the versioned S3-compatible store, lists again, and prints
+one count-only result line. It is internal: no port, no route, and it never
+runs on a schedule. The operator orchestrator decides when to run it.
 
 ## 2. One public origin
 
@@ -158,7 +175,14 @@ the original sketch below in four ways:
   no pointer to tombstone.
 
 At startup it admits only a real login of `bulls96_session_ingest` with the
-bootstrap's role shape. The original sketch:
+bootstrap's role shape.
+
+`SELFHOST_INGEST_ADMISSION=async` (default `sync`) moves the database off the
+upload request path: one create-only inbox PUT, then the hosted queued receipt,
+with an in-process consumer that admits the inbox. It also serves
+`GET /v1/delivery/admission` (rule 4 already routes it here), and `/readyz`
+follows the consumer instead of the database. Every upload still makes one
+relaycontrol introspection call. See `docs/selfhost-async-admission.md`. The original sketch:
 
 1. Listen on its own port. 8090 is suggested, and the port is the router's
    upstream. It answers `GET /healthz`, default-off like read-api.
@@ -233,8 +257,110 @@ anything else fails startup.
 | --- | --- | --- | --- |
 | `session-read-api` | `RELAYHISTORY_SELFHOST_READ_API` | `READ_API_ORIGIN`, `READ_API_COMPLETE_SINCE` (ISO or `epoch`), `READ_API_DIRECTORY_WORKSPACES` (canary allowlist; login answers 501 for an unlisted workspace), `SEARCH_INDEX_BACKEND` (`postgres`), `SEARCH_INDEX_POSTGRES_BACKEND_ID`, `SESSION_POSTGRES_TLS_PROFILE`, the relaycontrol trio in section 2, optional `ALLOW_IN_CLUSTER_HTTP`, `RELAYHISTORY_READ_API_PORT` | `RELAYHISTORY_READ_API_SECRET` (JSON `{supabase_url}`; no `clickhouse` with `postgres`), `RELAYCONTROL_INTROSPECT_SECRET` |
 | `session-publication` | `INGEST_PUBLISH_ENABLED` | `INGEST_PUBLISH_{BUCKET,EXPECT_GENERATION,AWS_ACCOUNT_ID,SUPABASE_PROJECT_REF,INSTANCE_ID,SECRET_ARN,KMS_KEY_ARN,INSTANCE_PROFILE_ARN,ROLE_NAME}`, `AWS_REGION=us-east-1`, `HOOPDB_DB_MODE=supabase`, optional `INGEST_PUBLISH_BUDGET_MS`, `INGEST_PUBLISH_BATCH_LIMIT`, `WORKER_HEALTH_PORT` | none in env: IMDSv2 plus Secrets Manager (see the caveat in section 1) |
-| `session-ingest` | `RELAYHISTORY_SELFHOST_INGEST` | `RELAYHISTORY_INGEST_ORIGIN`, `RELAYCONTROL_INTROSPECT_URL`, `RELAYHISTORY_INGEST_DATABASE_URL`, `SESSION_POSTGRES_TLS_PROFILE`, `LOCKER_BUCKET` (+ Locker endpoint/region or Pod Identity/GCS), optional `RELAYHISTORY_INGEST_PORT`, `INGEST_KEY_ROOT`, `INGEST_MAX_PER_USER`, `INGEST_MAX_PER_ORG`, `RELAYHISTORY_INGEST_PG_POOL_MAX`, `ALLOW_IN_CLUSTER_HTTP` | `RELAYCONTROL_INTROSPECT_SECRET`, `RELAYHISTORY_INGEST_DATABASE_URL` (password), Locker keys |
+| `session-ingest` | `RELAYHISTORY_SELFHOST_INGEST` | `RELAYHISTORY_INGEST_ORIGIN`, `RELAYCONTROL_INTROSPECT_URL`, `RELAYHISTORY_INGEST_DATABASE_URL`, `SESSION_POSTGRES_TLS_PROFILE`, `LOCKER_BUCKET` (+ Locker endpoint/region or Pod Identity/GCS), optional `RELAYHISTORY_INGEST_PORT`, `INGEST_KEY_ROOT`, `INGEST_MAX_PER_USER`, `INGEST_MAX_PER_ORG`, `RELAYHISTORY_INGEST_PG_POOL_MAX`, `ALLOW_IN_CLUSTER_HTTP`, `SELFHOST_INGEST_ADMISSION` (`sync` default, `async`, `drain`) with `SELFHOST_ADMISSION_CONCURRENCY` / `_SCAN_MS` / `_MAX_ATTEMPTS` | `RELAYCONTROL_INTROSPECT_SECRET`, `RELAYHISTORY_INGEST_DATABASE_URL` (password), Locker keys |
+| `session-erase-bytes` (Job) | `SESSION_ERASE_BYTES_ENABLED` (exactly `1`; see below) | `SESSION_ERASE_S3_BUCKET`, `SESSION_ERASE_S3_REGION`, `SESSION_ERASE_REQUEST_FILE`, optional `SESSION_ERASE_S3_ENDPOINT` (bare origin; https, loopback, or a Service name with `ALLOW_IN_CLUSTER_HTTP`), `SESSION_ERASE_KEY_ROOT` (default `96bulls`, must equal `INGEST_KEY_ROOT`), `SESSION_ERASE_DRY_RUN` (`1` = list and count only), `SESSION_ERASE_CONCURRENCY` (1..16, default 4) | `SESSION_ERASE_S3_ACCESS_KEY_ID[_FILE]`, `SESSION_ERASE_S3_SECRET_ACCESS_KEY[_FILE]`: a separate eraser key (ListBucketVersions + DeleteObjectVersion on the key root), not the ingest writer's key |
 | workers | per service (`docs/local-stack.md`) | `HOOPDB_URL`, `WORKER_HEALTH_PORT` | `HOOPDB_URL` password |
+
+`SESSION_ERASE_BYTES_ENABLED` is the one exception to the `true` rule above:
+the operator-erase contract fixes the literal `1`. `true` is not accepted; it
+fails startup like any other unknown value, so it is never silently off.
+
+### session-ingest admission mode (config contract)
+
+`SELFHOST_INGEST_ADMISSION` is `sync` (the default; unset or empty is the same),
+`async` or `drain`. Any other value fails startup. The knobs
+`SELFHOST_ADMISSION_CONCURRENCY` (1..32, default 4), `SELFHOST_ADMISSION_SCAN_MS`
+(1000..600000, default 15000) and `SELFHOST_ADMISSION_MAX_ATTEMPTS` (1..100,
+default 20) are read only in `async` and `drain`. The mode is never taken from a
+request. Semantics: `docs/selfhost-async-admission.md`.
+
+Once enabled, both `GET /healthz` and `GET /readyz` pin the effective mode:
+
+```json
+{ "ok": true, "enabled": true, "admission": "sync" }
+```
+
+In `async` and `drain` they also report the consumer:
+
+```json
+{ "ok": true, "enabled": true, "admission": "async",
+  "consumer": { "ok": true, "state": "ok", "backlog": 0, "oldestAgeMs": null,
+                "deadLettered": 0, "inFlight": 0, "lastScanAgeMs": 1200 } }
+```
+
+- `admission`: exactly `sync`, `async` or `drain`. The chart compares it with
+  the value it set and refuses the rollout on a mismatch. An image older than
+  this contract reports no `admission` field.
+- `consumer.state`: `starting` (no scan has completed yet), `ok`, `stale` (no
+  successful scan for max(3 × scan interval, 60 s)) or `stopped`. `consumer.ok`
+  is true only for `ok`. `oldestAgeMs` is `null` when the backlog is empty.
+- `/healthz` stays 200 whatever the consumer says (liveness).
+- `/readyz` status:
+  - `sync`: 200 iff the ledger answers `SELECT 1` (unchanged);
+  - `async`: 200 iff `consumer.ok` (the database is not on the upload path);
+  - `drain`: 200 iff both.
+- A dormant edge (`RELAYHISTORY_SELFHOST_INGEST` unset) reports neither field.
+
+**`drain` semantics.** New uploads take the synchronous path (SQL in the
+request; nothing new enters the inbox). The consumer keeps running and
+admits the backlog already in the inbox. It is not "consumer only": the
+upload routes are served. Roll back `async` -> `drain` -> wait for
+`consumer.backlog` 0 and `consumer.deadLettered` 0 -> `sync`.
+
+**Object-store permissions (async and drain).** `<root>` is `INGEST_KEY_ROOT`
+(default `96bulls`). Every key below sits in the srv-writer shape
+`<root>/*/v1/ws=*/m=srv_*`. The three dot-prefixed roots are disjoint from every
+tenant prefix, because no org id may start with a dot.
+
+Today the request path and the consumer are one process with ONE Locker
+credential, so that credential needs the union of the two role tables below.
+They are split so that a future separate consumer SERVICE can take a narrower
+grant. `J` is the privacy journal,
+`<root>/.admission-inbox/<org>/v1/ws=<ws>/m=srv_<sha256(ws,user)[0:32]>/privacy-journal.json`.
+It is the ONLY privacy object in the store: the deletion fences, reset counts
+and control heads live in SQL (read by the claim), and nothing else in S3 is
+consulted during admission.
+
+*Request-path role (`async` uploads; `drain` and `sync` uploads use the synchronous tenant-data set instead):*
+
+| Prefix / key | Operations |
+| --- | --- |
+| `J` (the upload's witness, read before the body) | GetObject. A missing object must answer 404 (needs `s3:ListBucket`, below). |
+| `<root>/.admission-inbox/<org>/v1/ws=<ws>/m=srv_<machine>/r=<receipt>/a=<ms>-<nonce>.ndjson.zst` | PutObject create-only (`If-None-Match: *`). On a 412 the adapter runs HeadObject, plus GetObject when the digest metadata is missing, to accept identical bytes. |
+| `…/r=<receipt>/outcome-admitted.json`, `outcome-refused.json` | GetObject (the `GET /v1/delivery/admission` status read) |
+
+*Consumer role (`async` and `drain`):*
+
+| Prefix / key | Operations |
+| --- | --- |
+| `<root>/.admission-inbox` | ListBucket with prefix `<root>/.admission-inbox` |
+| the inbox object | GetObject; PutObject **unconditional overwrite** with a small tombstone after the terminal outcome. Never DeleteObject. |
+| `…/r=<receipt>/outcome-admitted.json`, `outcome-refused.json` | PutObject overwrite |
+| `J` (the post-claim privacy gate) | GetObject. PutObject with `If-Match: <etag>` (or `If-None-Match: *` on a missing journal) only to complete a control left pending for more than 120 s. Self-host serves no journaled control today, so this write does not happen in practice, but grant it. |
+| `<root>/.admission-dlq/<inbox path minus .ndjson.zst>.json` | ListBucket with prefix `<root>/.admission-dlq`; PutObject overwrite (the dead-letter marker); DeleteObject (best effort after a later admission; also the operator's redrive) |
+| tenant data `<root>/<org>/…` | exactly the synchronous path's set (chunks, manifests, pointers: GetObject, HeadObject, conditional PutObject). Canonical acceptance stages nothing, so there is no `buffered-batches` stage prefix. |
+
+*Startup gate (whichever role starts with `async` or `drain`; once per process start):*
+
+| Key | Operations |
+| --- | --- |
+| `<root>/.admission-probe/v1/ws=probe/m=srv_<random>/probe.json` | PutObject create-only; a second create that must be refused (with the HeadObject reconcile above); PutObject `If-Match` twice (the stale one must be refused); GetObject; DeleteObject best effort. If DeleteObject is denied, one ~60-byte object per start remains and startup still succeeds. Any other failure refuses startup. |
+
+*Operator (not a service role):* DeleteObject on `<root>/.admission-dlq/…` to redrive.
+
+Backend notes:
+
+- **S3 / MinIO.** Grant `s3:ListBucket` on the bucket (prefix-conditioned to the
+  two listings above, plus whatever the sync path already needs). Without it S3
+  answers a missing key with 403 instead of 404, and a missing privacy journal
+  (the normal case) would read as an error. Every upload would then be a 503.
+  MinIO must honour `If-None-Match` and `If-Match` on PUT; the startup gate
+  checks this.
+- **GCS.** Creates use `x-goog-if-generation-match: 0` and swaps use
+  `x-goog-if-generation-match: <generation>`. Overwriting an existing object
+  (the tombstone, outcome and marker writes) needs `storage.objects.delete` as
+  well as `storage.objects.create`. Listing needs `storage.objects.list`.
+- `sync` touches none of the dot-prefixed roots and runs no probe.
 
 CA: `SESSION_POSTGRES_TLS_PROFILE=custom-ca` with `SESSION_POSTGRES_CA_FILE`
 (a mounted file, at most 128 KiB) and `SESSION_POSTGRES_CA_SHA256` (64 hex

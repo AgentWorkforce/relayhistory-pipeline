@@ -557,8 +557,8 @@ BEGIN
             WHERE e.v ->> 'source' = r.source AND e.v ->> 'session_id' = r.session_id))
     $records$ USING p_org, p_user, p_sessions, p_workspace;
   END IF;
-  -- Serialize with every writer of these scopes (request/job/ticket admission,
-  -- sessions.analysis_request_v1 below, takes the same per-scope transaction lock): a
+  -- Serialize with the scope writers that take the per-scope transaction lock (request/job
+  -- admission, sessions.analysis_request_v1 below): a
   -- writer that took its snapshot before this purge either blocks here and then sees the fence,
   -- or commits first and its rows are deleted below. Scopes are locked in a stable scope order
   -- so concurrent purges contend on the same locks in the same order.

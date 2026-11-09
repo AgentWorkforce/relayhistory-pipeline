@@ -12,7 +12,8 @@
 --   psql -v ON_ERROR_STOP=1 -X -d <the HoopDb database> -f supabase/bootstrap/session_analysis_admit_role.sql
 --   psql -X -d <the HoopDb database> -c '\password bulls96_analysis_admit'
 --   psql -v ON_ERROR_STOP=1 -X -d <the HoopDb database> -f supabase/bootstrap/session_analysis_admit_role_verify.sql
--- The read API secret's `analysis_admit_url` then names this role (src/session-read-api/lambda.ts).
+-- Nothing in code names this role yet (no analysis_admit_url reader): it is the
+-- reserved admission principal for the future read-API analysis path.
 \set ON_ERROR_STOP 1
 BEGIN;
 DO $role$

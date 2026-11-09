@@ -186,8 +186,8 @@ export interface AnalysisEvidenceDeps {
   /**
    * The DATABASE half of the never-in-Neon proof: sessions-pipeline's own records show the
    * session was born after the sealed Neon freeze and is absent from the frozen Neon copy.
-   * The objects half is the snapshot's own `neonDerived`. Absent or false: the marker is
-   * required.
+   * The objects half is the snapshot's own `neonDerived` (always present): absent refuses
+   * outright, false requires the marker.
    */
   neonFree?(identity: AnalysisScope & { source: string }): Promise<boolean>;
 }

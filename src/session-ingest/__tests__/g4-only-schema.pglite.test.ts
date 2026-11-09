@@ -104,6 +104,12 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // A new table and read API functions only; no ingest path touches them.
       "20261105044000_read_api_tokens.sql",
       "20261105044010_selfhost_erase_lock_fences.sql",
+      // Eight org_id btree indexes on existing ingest tables only; no function or column.
+      "20261105044020_claim_bootstrap_org_indexes.sql",
+      // Lane F1 (this branch): analysis jobs/requests/tickets/invocations/reservations tables,
+      // the purge functions and their grant helper, the admit scope function and the request entry point.
+      // (045000 digest is not in this tree yet; it lands first and this list gains it on merge.)
+      "20261105046000_analysis_jobs.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
@@ -122,10 +128,25 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       expect((await f.db.query<{ n: number }>("SELECT count(*)::int AS n FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='sessions' AND p.proname=$1", [name])).rows[0]!.n).toBeGreaterThan(0);
     // A plpgsql EXCEPTION block could swallow a 42883 the guard never sees: no G4 function body may
     // even name a post-G4 function or table (or the acquisition_epoch column).
+    // Exception: 041000's derived purge names the digest (045000) and analysis (046000) objects only
+    // through its guarded integrations (to_regprocedure/to_regclass presence checks, ABI-mismatch
+    // on partial presence, no-op when absent): not a swallowed 42883. Everything else must stay clean.
+    const guarded = new Set([
+      "ingest_privacy_authority_purge_derived -> purge_daily_digest_narratives",
+      "ingest_privacy_authority_purge_derived -> daily_digest_narratives",
+      "ingest_privacy_authority_purge_derived -> session_analysis_jobs_v2",
+      "ingest_privacy_authority_purge_derived -> session_analysis_purge_authority",
+      "ingest_privacy_authority_purge_derived -> purge_session_analysis_for_owned",
+      "ingest_privacy_authority_purge_derived -> session_analysis_purge_grant",
+      "ingest_privacy_authority_apply -> session_analysis_jobs_v2",
+      "ingest_privacy_authority_apply -> session_analysis_purge_authority",
+      "ingest_privacy_authority_apply -> purge_session_analysis_for_owned",
+      "ingest_privacy_authority_apply -> session_analysis_purge_grant",
+    ]);
     const bodies = (await f.db.query<{ proname: string; prosrc: string }>("SELECT p.proname, p.prosrc FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema')")).rows;
     const names = [...OBJECTS.newFunctions, ...OBJECTS.newTables, "acquisition_epoch"];
     const hits = bodies.flatMap((b) => names.filter((x) => new RegExp(`\\b${x}\\b`, "i").test(b.prosrc)).map((x) => `${b.proname} -> ${x}`));
-    expect(hits).toEqual([]);
+    expect(hits.filter((h) => !guarded.has(h))).toEqual([]);
     expectClean(f.undefinedObjects);
   });
 
