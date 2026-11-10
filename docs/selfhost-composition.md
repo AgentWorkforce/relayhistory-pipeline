@@ -556,6 +556,15 @@ missing briefs and changed canonical revisions without the legacy indexer.
 `SESSION_BRIEF_SESSION_DAILY_CAP` bound work and spend. Keep one worker for
 initial qualification; do not enable the legacy indexer to produce wakeups.
 
+A session refused as `rate_limited` waits for the next UTC midnight, but in
+this mode the worker re-checks parked sessions once a minute. It re-arms a
+parked wakeup when the session gets new canonical revisions. It also makes a
+parked wakeup due as soon as the admission checks would pass, for example after
+a cap is raised mid-day; the global daily cap is checked first. The sweep treats
+a `rate_limited` brief as unbriefed, so a session whose parked wakeup expired
+after `SESSION_WAKE_MAX_AGE_HOURS` is found again. None of this changes a cap
+or a default, and claim still enforces every limit.
+
 Apply the complete migration plan, including
 `20261105044100_session_brief_summary_read.sql`, before starting services with
 the new schema generation. The Node read service then serves
