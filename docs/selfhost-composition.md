@@ -370,7 +370,10 @@ for workspaces in `READ_API_DIRECTORY_WORKSPACES` (unchanged allowlist).
 returns `404 {"error":"coordination_overlaps_disabled"}`. Self-hosted installs
 select the existing Postgres facts with
 `READ_API_COORDINATION_OVERLAPS_BACKEND=postgres`; this adds no worker, model,
-secret, or migration. With `postgres` the routes read the Postgres output facts on the read pool, as
+secret, or migration. Its default `outcome-facts` detector ranks duplicate
+migrations, cross-lane reverted commits, and rare different-branch shared
+writes using only those stored facts; the pure detector package retains
+`shared-write-60m` as a named comparison detector. With `postgres` the routes read the Postgres output facts on the read pool, as
 `bulls96_read_api`, through the migration `045040` readers only
 (`sessions.output_facts_events_for`, `_outputs_for`, `_coverage_for`), in one
 READ ONLY tenant transaction, with erased sessions dropped through the session

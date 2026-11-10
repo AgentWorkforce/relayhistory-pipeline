@@ -170,8 +170,36 @@ describe("postgres output/digest backends over 045040", () => {
     expect(response.status).toBe(200);
     const body = await response.json() as any;
     expect(body.contract).toBe("coordination-overlaps/1");
-    expect(body.coverage).toMatchObject({ status: "complete", sessionsConsidered: 1, sessionsTruncated: 0 });
+    expect(body.coverage).toMatchObject({ status: "partial", sessionsConsidered: 1, sessionsTruncated: 0 });
+    expect(body.coverage.notes.join(" ")).toContain("session directory unavailable");
     expect(body.findings).toEqual([]);
+
+    // The Postgres reader normalizes the same T3 facts as the ClickHouse route fixture:
+    // two roots, one project/path, distinct branches, and nearby timestamps.
+    await db.query(`INSERT INTO sessions.session_event_facts
+      (org_id, workspace_id, ts, session_id, source, machine_id, kind, event_id,
+       project_id, task_ref_id, task_ref_empty, task_ref_json, task_title, user_id, branch,
+       model, provider, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens,
+       cache_create_tokens, cache_create_5m_tokens, cache_create_1h_tokens, cost_usd_micros,
+       files_touched, retention_days, row_id, fingerprint, source_version)
+      VALUES
+      ($1, $2, '2026-11-05T01:00:00Z', 'coord-a', 'codex', 'm-a', 'tool', 'coord-a-event',
+       'coord-project', NULL, 0, '{}', NULL, 'u', 'feat/a', NULL, NULL, 0, 0, 0, 0, 0,
+       NULL, NULL, 0, ARRAY['src/parity.ts'], 0, repeat('a', 64), repeat('c', 64), 1),
+      ($1, $2, '2026-11-05T01:05:00Z', 'coord-b', 'codex', 'm-b', 'tool', 'coord-b-event',
+       'coord-project', NULL, 0, '{}', NULL, 'u', 'feat/b', NULL, NULL, 0, 0, 0, 0, 0,
+       NULL, NULL, 0, ARRAY['src/parity.ts'], 0, repeat('b', 64), repeat('d', 64), 1)`, [ORG, WS]);
+    const parity = await app.request(`/v1/coordination/overlaps?workspace=${WS}&project=coord-project&since=${DAY.since.toISOString()}&until=${DAY.until.toISOString()}`, {
+      headers: { authorization: "Bearer good" },
+    });
+    expect(parity.status).toBe(200);
+    const parityBody = await parity.json() as any;
+    expect(parityBody.coverage.status).toBe("partial"); // synthetic rows deliberately have no state rows
+    expect(parityBody.detector).toMatchObject({ name: "outcome-facts", version: "1" });
+    expect(parityBody.findings).toHaveLength(1);
+    expect(parityBody.findings[0]).toMatchObject({ kind: "concurrent_edit", confidence: "low", alertAt: "2026-11-05T01:05:00.000Z" });
+    expect(parityBody.findings[0].artifacts[0]).toMatchObject({ type: "file", value: "src/parity.ts" });
+
     const capped = await coordination.readFacts(directory, { orgId: ORG, workspaceId: WS, ...DAY, rowCap: 1 });
     expect(capped.sessionsTruncated).toBe(1);
     expect(capped.notes.join(" ")).toContain("row cap 1 reached");

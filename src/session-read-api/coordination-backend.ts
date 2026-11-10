@@ -61,7 +61,8 @@ async function directoryRows(directory: Directory | undefined, p: CoordinationPa
       rows.push(row);
     }
   }
-  return { rows, unavailable: false };
+  const found = new Set(rows.map((row) => key(row.harness, row.session_id)));
+  return { rows, unavailable: keys.some(({ harness, sessionId }) => !found.has(key(harness, sessionId))) };
 }
 
 /** Normalize both facts stores to the dependency-free detector input. */
@@ -74,13 +75,21 @@ export async function normalizeCoordinationFacts(
 ): Promise<CoordinationFacts> {
   const filtered = events.filter((event) => !p.projectId || event.project_id === p.projectId);
   const groups = new Map<string, CoordinationEventRow[]>();
+  const identities = new Map<string, { harness: string; sessionId: string }>();
   for (const event of filtered) {
     const k = key(event.source, event.session_id);
     const rows = groups.get(k) ?? [];
     rows.push(event);
     groups.set(k, rows);
+    identities.set(k, { harness: event.source, sessionId: event.session_id });
   }
-  const keys = [...groups].map(([k, rows]) => ({ k, harness: rows[0]!.source, sessionId: rows[0]!.session_id }));
+  // Output-only lanes are material for cross-lane reverts. Under a project filter, however,
+  // output facts have no project column, so retain only lanes corroborated by a filtered event.
+  if (!p.projectId) for (const output of outputs) {
+    const k = key(output.scope_source, output.session_id);
+    identities.set(k, { harness: output.scope_source, sessionId: output.session_id });
+  }
+  const keys = [...identities].map(([k, identity]) => ({ k, ...identity }));
   const directoryResult = await directoryRows(directory, p, keys.map(({ harness, sessionId }) => ({ harness, sessionId })));
   const byDirectoryKey = new Map(directoryResult.rows.map((row) => [key(row.harness, row.session_id), row]));
   const outputsByKey = new Map<string, CoordinationOutputRow[]>();
@@ -89,21 +98,22 @@ export async function normalizeCoordinationFacts(
     // fact provenance (and can differ for legacy turns); `scope_source` is the harness
     // used by event facts, liveness, and every other output-facts aggregate.
     const k = key(output.scope_source, output.session_id);
-    if (!groups.has(k)) continue;
+    if (!identities.has(k)) continue;
     const rows = outputsByKey.get(k) ?? [];
     rows.push(output);
     outputsByKey.set(k, rows);
   }
   const lanes: LaneFacts[] = [];
-  for (const { k } of keys) {
-    const rows = groups.get(k)!.sort((a, b) => compare(a.ts, b.ts) || compare(a.event_id, b.event_id));
+  for (const { k, harness, sessionId } of keys) {
+    const rows = (groups.get(k) ?? []).sort((a, b) => compare(a.ts, b.ts) || compare(a.event_id, b.event_id));
     const out = (outputsByKey.get(k) ?? []).sort((a, b) => compare(a.ts, b.ts) || compare(a.row_id, b.row_id));
     const d = byDirectoryKey.get(k);
     const latest = <K extends "user_id" | "project_id" | "branch" | "task_ref_id" | "task_title">(field: K) => {
       for (let i = rows.length - 1; i >= 0; i--) if (rows[i]![field] !== null) return rows[i]![field] as string;
       return null;
     };
-    const lastAt = [...rows.map((r) => iso(r.ts)), ...out.map((r) => iso(r.ts))].sort(compare).at(-1)!;
+    const factTimes = [...rows.map((r) => iso(r.ts)), ...out.map((r) => iso(r.ts))].sort(compare);
+    const lastAt = factTimes.at(-1)!;
     const parents = d?.parent_session_ids?.filter(Boolean) ?? [];
     const directoryLastAt = d ? iso(d.last_activity_at) : null;
     const usage: LaneFacts["usage"] = rows.map((event) => ({
@@ -116,18 +126,19 @@ export async function normalizeCoordinationFacts(
     if (directoryLastAt && directoryLastAt > lastAt)
       usage.push({ ts: directoryLastAt, eventId: "coverage:directory-last-action", tokens: null, costUsdMicros: null });
     lanes.push({
-      sessionId: rows[0]!.session_id,
-      source: rows[0]!.source,
+      sessionId,
+      source: harness,
       userId: latest("user_id"),
       projectId: latest("project_id"),
+      repo: d?.git_repo ?? null,
       branch: latest("branch") ?? d?.git_branch ?? null,
       taskRef: latest("task_ref_id"),
       title: d?.title ?? latest("task_title"),
       parentSessionId: new Set(parents).size === 1 ? parents[0]! : null,
-      startedAt: d ? iso(d.created_at) : iso(rows[0]!.ts),
+      startedAt: d ? iso(d.created_at) : factTimes[0]!,
       lastActionAt: directoryLastAt ? [directoryLastAt, lastAt].sort(compare).at(-1)! : lastAt,
       writes: rows.flatMap((event) => (event.files_touched ?? []).filter((path): path is string => typeof path === "string" && path !== "")
-        .map((path) => ({ path, ts: iso(event.ts), eventId: event.event_id, kind: event.kind }))),
+        .map((path) => ({ path, ts: iso(event.ts), eventId: event.event_id, kind: event.kind, branch: event.branch }))),
       commits: out.filter((fact) => fact.fact_kind === "commit").map((fact) => ({
         sha: fact.fact_key, ts: iso(fact.ts), eventId: fact.row_id, reverted: null,
       })),
@@ -178,7 +189,10 @@ export function clickhouseCoordinationBackend(ch: ClickHouseClient, liveness: Li
       const truncated = eventRows.length > cap || outputRows.length > cap;
       const events = eventRows.slice(0, cap);
       const outputs = outputRows.slice(0, cap);
-      const candidates = [...new Map(events.map((r) => [key(r.source, r.session_id), { source: r.source, sessionId: r.session_id }])).values()];
+      const candidates = [...new Map([
+        ...events.map((r) => [key(r.source, r.session_id), { source: r.source, sessionId: r.session_id }] as const),
+        ...outputs.map((r) => [key(r.scope_source, r.session_id), { source: r.scope_source, sessionId: r.session_id }] as const),
+      ]).values()];
       const erased = new Set(await liveness.erased(p.orgId, p.workspaceId, candidates));
       return normalizeCoordinationFacts(directory, p,
         events.filter((r) => !erased.has(keyOf({ source: r.source, sessionId: r.session_id }))),
