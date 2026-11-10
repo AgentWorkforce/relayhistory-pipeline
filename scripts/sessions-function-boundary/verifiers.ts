@@ -1,3 +1,4 @@
+import { BUFFERED_SEARCH_FEED_RUNTIME_ROLE } from "../../src/session-pipeline/buffered-feed-role.ts";
 import type { VerifierTarget } from "./types.ts";
 
 const quoted = (sigs: readonly string[]) => sigs.map((k) => " '" + k + "'").join(",\n");
@@ -34,5 +35,41 @@ export const VERIFIERS: readonly VerifierTarget[] = [
     pattern: /v_allowed text\[\] := ARRAY\[[\s\S]*?\]::text\[\];/,
     render: (sigs) => "v_allowed text[] := ARRAY[\n" + quoted(sigs) + "\n ]::text[];",
     transform: (text) => text.replaceAll("bulls96_session_ingest", "bulls96_project_events").replaceAll("session ingest", "canonical project events"),
+  },
+  {
+    // The E3 transcript eraser under the Supabase privacy authority (20261105041000): only the four eraser read RPCs.
+    role: "bulls96_privacy_eraser",
+    path: "supabase/bootstrap/privacy_eraser_verify.sql",
+    template: "supabase/bootstrap/session_ingest_verify.sql",
+    pattern: /v_allowed text\[\] := ARRAY\[[\s\S]*?\]::text\[\];/,
+    render: (sigs) => "v_allowed text[] := ARRAY[\n" + quoted(sigs) + "\n ]::text[];",
+    transform: (text) => text.replaceAll("bulls96_session_ingest", "bulls96_privacy_eraser").replaceAll("session ingest", "privacy eraser"),
+  },
+  {
+    // The E3 erasure phase's registry login (20261105042000): only the retention claim/fence/complete RPCs.
+    role: "bulls96_babysitter_retention",
+    path: "supabase/bootstrap/babysitter_retention_verify.sql",
+    template: "supabase/bootstrap/session_ingest_verify.sql",
+    pattern: /v_allowed text\[\] := ARRAY\[[\s\S]*?\]::text\[\];/,
+    render: (sigs) => "v_allowed text[] := ARRAY[\n" + quoted(sigs) + "\n ]::text[];",
+    transform: (text) => text.replaceAll("bulls96_session_ingest", "bulls96_babysitter_retention").replaceAll("session ingest", "babysitter retention"),
+  },
+  {
+    // The Factory acquisition control role (slot 043850): only install/revoke/rebind/status.
+    role: "bulls96_acquisition_installer",
+    path: "supabase/bootstrap/acquisition_installer_verify.sql",
+    template: "supabase/bootstrap/session_ingest_verify.sql",
+    pattern: /v_allowed text\[\] := ARRAY\[[\s\S]*?\]::text\[\];/,
+    render: (sigs) => "v_allowed text[] := ARRAY[\n" + quoted(sigs) + "\n ]::text[];",
+    transform: (text) => text.replaceAll("bulls96_session_ingest", "bulls96_acquisition_installer").replaceAll("session ingest", "acquisition installer"),
+  },
+  {
+    // The buffered search feed's runtime login (slot 043870): only the three buffered_search_feed_* RPCs.
+    role: BUFFERED_SEARCH_FEED_RUNTIME_ROLE,
+    path: "supabase/bootstrap/buffered_search_feed_runtime_verify.sql",
+    template: "supabase/bootstrap/session_ingest_verify.sql",
+    pattern: /v_allowed text\[\] := ARRAY\[[\s\S]*?\]::text\[\];/,
+    render: (sigs) => "v_allowed text[] := ARRAY[\n" + quoted(sigs) + "\n ]::text[];",
+    transform: (text) => text.replaceAll("bulls96_session_ingest", BUFFERED_SEARCH_FEED_RUNTIME_ROLE).replaceAll("session ingest", "buffered search feed runtime"),
   },
 ];

@@ -1,0 +1,1639 @@
+{
+  "schema": "frontier-attester-contract-vectors-v1",
+  "reviewedDesignSha256": "51d358b293790030dadcd5839358ac18109d570b2b6d05e97433b21efe5ec398",
+  "acceptanceCriteriaSource": "244932553933582336 SF1-SF8/S1-S7",
+  "qualification": "DISPOSABLE_SYNTHETIC_CONTRACT_DATA_ONLY_NOT_PRODUCTION_EVIDENCE",
+  "notImplementation": "No attester RPC or independent verifier is implemented here. Expected S4/SQL outcomes are contract cases, not tests already run against either implementation.",
+  "canonicalization": {
+    "source": "frontierCanonicalJson/frontierSha256 on pinned b1283b2e source; 049 code is UNLANDED and must land separately; do not vendor this copy into core.",
+    "preValidatorRequired": true,
+    "exactAsciiKeys": true,
+    "duplicateKeysRefuseBeforeJSONParseLastWins": true,
+    "numericStrings": "rowCount canonical decimal0..9223372036854775807; numbers/booleans rejected. Null is permitted only to represent explicitly UNMEASURED unknown fields; such status is never eligible.",
+    "stringRules": "All identifiers ASCII printable excluding whitespace/C0/DEL; reject malformed UTF8, lone surrogates and U0000 before hash. Broader Unicode identifiers HOLD until reviewed049 amendment.",
+    "componentSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "scope",
+        "component",
+        "status",
+        "rowCount",
+        "terminalProofSha256",
+        "rowsSha256"
+      ],
+      "properties": {
+        "protocol": {
+          "const": "frontier-attestation-audit-v1"
+        },
+        "scope": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "items": {
+            "type": "string",
+            "pattern": "^[!-~]{1,128}$"
+          }
+        },
+        "component": {
+          "const": "drained_pre_switch_ACK"
+        },
+        "status": {
+          "enum": [
+            "VERIFIED_COMPLETE",
+            "VERIFIED_EMPTY",
+            "UNMEASURED"
+          ]
+        },
+        "rowCount": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^(0|[1-9][0-9]{0,18})$"
+        },
+        "terminalProofSha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "rowsSha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "VERIFIED_COMPLETE",
+                  "VERIFIED_EMPTY"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "rowCount": {
+                "type": "string",
+                "pattern": "^(0|[1-9][0-9]{0,18})$"
+              },
+              "terminalProofSha256": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              "rowsSha256": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "VERIFIED_EMPTY"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "rowCount": {
+                "const": "0"
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "positiveVectors": [
+    {
+      "id": "exact_component_schema",
+      "input": {
+        "protocol": "frontier-attestation-audit-v1",
+        "scope": [
+          "fixture-org",
+          "fixture-workspace",
+          "fixture-user"
+        ],
+        "component": "drained_pre_switch_ACK",
+        "status": "VERIFIED_COMPLETE",
+        "rowCount": "1",
+        "terminalProofSha256": "257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019",
+        "rowsSha256": "d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e"
+      },
+      "canonicalUtf8Hex": "7b22636f6d706f6e656e74223a22647261696e65645f7072655f7377697463685f41434b222c2270726f746f636f6c223a2266726f6e746965722d6174746573746174696f6e2d61756469742d7631222c22726f77436f756e74223a2231222c22726f7773536861323536223a2264343462613862633237326632663138386232616261393835653130333761396363333838353163646238636336623965363139343838346562646431653065222c2273636f7065223a5b22666978747572652d6f7267222c22666978747572652d776f726b7370616365222c22666978747572652d75736572225d2c22737461747573223a2256455249464945445f434f4d504c455445222c227465726d696e616c50726f6f66536861323536223a2232353733333162646563346365643936386139353033626538383433343735303363373633386634373762303136363436383539623661346239323762303139227d",
+      "sha256": "8151663a927a23c8e30bb74ab518f24fb62515cbe0e38276fb0a653e56afbd3e"
+    },
+    {
+      "id": "exact_empty_component_schema",
+      "input": {
+        "protocol": "frontier-attestation-audit-v1",
+        "scope": [
+          "fixture-org",
+          "fixture-workspace",
+          "fixture-empty-user"
+        ],
+        "component": "drained_pre_switch_ACK",
+        "status": "VERIFIED_EMPTY",
+        "rowCount": "0",
+        "terminalProofSha256": "257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019",
+        "rowsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      },
+      "canonicalUtf8Hex": "7b22636f6d706f6e656e74223a22647261696e65645f7072655f7377697463685f41434b222c2270726f746f636f6c223a2266726f6e746965722d6174746573746174696f6e2d61756469742d7631222c22726f77436f756e74223a2230222c22726f7773536861323536223a2234663533636461313863326261613063303335346262356639613365636265356564313261623464386531316261383733633266313131363132303262393435222c2273636f7065223a5b22666978747572652d6f7267222c22666978747572652d776f726b7370616365222c22666978747572652d656d7074792d75736572225d2c22737461747573223a2256455249464945445f454d505459222c227465726d696e616c50726f6f66536861323536223a2232353733333162646563346365643936386139353033626538383433343735303363373633386634373762303136363436383539623661346239323762303139227d",
+      "sha256": "82268b1f86ee74e28b50ee686742455962b0fb3ce3e202b5001db4332efb94c1",
+      "eligibilityRequires": "Separate qualified global-completeness root+exact zero-entry inclusion+terminal proof; this hash alone is not emptiness evidence."
+    }
+  ],
+  "negativeKnownAnswers": [
+    {
+      "id": "duplicate_status_key",
+      "rawJson": "{\"protocol\":\"frontier-attestation-audit-v1\",\"scope\":[\"fixture-org\",\"fixture-workspace\",\"fixture-user\"],\"component\":\"drained_pre_switch_ACK\",\"status\":\"VERIFIED_COMPLETE\",\"status\":\"VERIFIED_EMPTY\",\"rowCount\":\"1\",\"terminalProofSha256\":\"257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019\",\"rowsSha256\":\"d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e\"}",
+      "reason": "duplicate_key"
+    },
+    {
+      "id": "numeric_zero_not_decimal_string",
+      "rawJson": "{\"protocol\":\"frontier-attestation-audit-v1\",\"scope\":[\"fixture-org\",\"fixture-workspace\",\"fixture-user\"],\"component\":\"drained_pre_switch_ACK\",\"status\":\"VERIFIED_COMPLETE\",\"rowCount\":0,\"terminalProofSha256\":\"257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019\",\"rowsSha256\":\"d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e\"}",
+      "reason": "schema_type"
+    },
+    {
+      "id": "unsafe_bare_integer",
+      "rawJson": "{\"protocol\":\"frontier-attestation-audit-v1\",\"scope\":[\"fixture-org\",\"fixture-workspace\",\"fixture-user\"],\"component\":\"drained_pre_switch_ACK\",\"status\":\"VERIFIED_COMPLETE\",\"rowCount\":9007199254740993,\"terminalProofSha256\":\"257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019\",\"rowsSha256\":\"d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e\"}",
+      "reason": "schema_type_before_coercion"
+    },
+    {
+      "id": "boolean_not_decimal_string",
+      "rawJson": "{\"protocol\":\"frontier-attestation-audit-v1\",\"scope\":[\"fixture-org\",\"fixture-workspace\",\"fixture-user\"],\"component\":\"drained_pre_switch_ACK\",\"status\":\"VERIFIED_COMPLETE\",\"rowCount\":true,\"terminalProofSha256\":\"257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019\",\"rowsSha256\":\"d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e\"}",
+      "reason": "schema_type"
+    },
+    {
+      "id": "null_count_for_complete",
+      "rawJson": "{\"protocol\":\"frontier-attestation-audit-v1\",\"scope\":[\"fixture-org\",\"fixture-workspace\",\"fixture-user\"],\"component\":\"drained_pre_switch_ACK\",\"status\":\"VERIFIED_COMPLETE\",\"rowCount\":null,\"terminalProofSha256\":\"257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019\",\"rowsSha256\":\"d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e\"}",
+      "reason": "schema_type"
+    },
+    {
+      "id": "nul_identifier",
+      "rawJson": "{\"protocol\":\"frontier-attestation-audit-v1\",\"scope\":[\"fixture-org\",\"fixture-workspace\",\"fixture-\\u0000-user\"],\"component\":\"drained_pre_switch_ACK\",\"status\":\"VERIFIED_COMPLETE\",\"rowCount\":\"1\",\"terminalProofSha256\":\"257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019\",\"rowsSha256\":\"d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e\"}",
+      "reason": "identifier_character"
+    },
+    {
+      "id": "lone_surrogate_identifier",
+      "rawJson": "{\"protocol\":\"frontier-attestation-audit-v1\",\"scope\":[\"fixture-org\",\"fixture-workspace\",\"fixture-\\ud800-user\"],\"component\":\"drained_pre_switch_ACK\",\"status\":\"VERIFIED_COMPLETE\",\"rowCount\":\"1\",\"terminalProofSha256\":\"257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019\",\"rowsSha256\":\"d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e\"}",
+      "reason": "unpaired_surrogate"
+    },
+    {
+      "id": "c0_identifier",
+      "rawJson": "{\"protocol\":\"frontier-attestation-audit-v1\",\"scope\":[\"fixture-org\",\"fixture-workspace\",\"fixture-\\u0001-user\"],\"component\":\"drained_pre_switch_ACK\",\"status\":\"VERIFIED_COMPLETE\",\"rowCount\":\"1\",\"terminalProofSha256\":\"257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019\",\"rowsSha256\":\"d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e\"}",
+      "reason": "identifier_character"
+    },
+    {
+      "id": "non_ascii_key",
+      "rawJson": "{\"protocol\":\"frontier-attestation-audit-v1\",\"scope\":[\"fixture-org\",\"fixture-workspace\",\"fixture-user\"],\"component\":\"drained_pre_switch_ACK\",\"státus\":\"VERIFIED_COMPLETE\",\"rowCount\":\"1\",\"terminalProofSha256\":\"257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019\",\"rowsSha256\":\"d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e\"}",
+      "reason": "exact_ascii_key_set"
+    },
+    {
+      "id": "extra_key",
+      "rawJson": "{\"unreviewed\":\"x\",\"protocol\":\"frontier-attestation-audit-v1\",\"scope\":[\"fixture-org\",\"fixture-workspace\",\"fixture-user\"],\"component\":\"drained_pre_switch_ACK\",\"status\":\"VERIFIED_COMPLETE\",\"rowCount\":\"1\",\"terminalProofSha256\":\"257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019\",\"rowsSha256\":\"d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e\"}",
+      "reason": "exact_key_set"
+    },
+    {
+      "id": "invalid_decimal_-0",
+      "rawJson": "{\"protocol\":\"frontier-attestation-audit-v1\",\"scope\":[\"fixture-org\",\"fixture-workspace\",\"fixture-user\"],\"component\":\"drained_pre_switch_ACK\",\"status\":\"VERIFIED_COMPLETE\",\"rowCount\":\"-0\",\"terminalProofSha256\":\"257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019\",\"rowsSha256\":\"d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e\"}",
+      "reason": "decimal_range_or_format"
+    },
+    {
+      "id": "invalid_decimal_01",
+      "rawJson": "{\"protocol\":\"frontier-attestation-audit-v1\",\"scope\":[\"fixture-org\",\"fixture-workspace\",\"fixture-user\"],\"component\":\"drained_pre_switch_ACK\",\"status\":\"VERIFIED_COMPLETE\",\"rowCount\":\"01\",\"terminalProofSha256\":\"257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019\",\"rowsSha256\":\"d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e\"}",
+      "reason": "decimal_range_or_format"
+    },
+    {
+      "id": "invalid_decimal_+1",
+      "rawJson": "{\"protocol\":\"frontier-attestation-audit-v1\",\"scope\":[\"fixture-org\",\"fixture-workspace\",\"fixture-user\"],\"component\":\"drained_pre_switch_ACK\",\"status\":\"VERIFIED_COMPLETE\",\"rowCount\":\"+1\",\"terminalProofSha256\":\"257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019\",\"rowsSha256\":\"d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e\"}",
+      "reason": "decimal_range_or_format"
+    },
+    {
+      "id": "invalid_decimal_9223372036854775808",
+      "rawJson": "{\"protocol\":\"frontier-attestation-audit-v1\",\"scope\":[\"fixture-org\",\"fixture-workspace\",\"fixture-user\"],\"component\":\"drained_pre_switch_ACK\",\"status\":\"VERIFIED_COMPLETE\",\"rowCount\":\"9223372036854775808\",\"terminalProofSha256\":\"257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019\",\"rowsSha256\":\"d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e\"}",
+      "reason": "decimal_range_or_format"
+    },
+    {
+      "id": "non_ascii_identifier",
+      "rawJson": "{\"protocol\":\"frontier-attestation-audit-v1\",\"scope\":[\"fixture-org\",\"fixture-workspace\",\"fixture-é-user\"],\"component\":\"drained_pre_switch_ACK\",\"status\":\"VERIFIED_COMPLETE\",\"rowCount\":\"1\",\"terminalProofSha256\":\"257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019\",\"rowsSha256\":\"d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e\"}",
+      "reason": "planner_identifier_HOLD_until_049_amendment"
+    }
+  ],
+  "orderingVector": {
+    "rows": [
+      [
+        "a!",
+        "x"
+      ],
+      [
+        "a",
+        "x"
+      ]
+    ],
+    "plannerEncodedTupleJS_UTF16_Order": [
+      [
+        "a!",
+        "x"
+      ],
+      [
+        "a",
+        "x"
+      ]
+    ],
+    "newAuditRawUTF8_FieldTupleOrder": [
+      [
+        "a",
+        "x"
+      ],
+      [
+        "a!",
+        "x"
+      ]
+    ],
+    "rule": "Reproduce planner ordering for planner outputs; do not change its hashes. Raw Buffer tuple order applies only to the separately defined audit arrays. NonASCII/lone-surrogate identifiers HOLD."
+  },
+  "syntheticPreparedInputs": {
+    "main": {
+      "batch": {
+        "schema_version": 1,
+        "origin_id": "fixture-main-origin",
+        "batch_id": "fixture-main-batch",
+        "job_id": "fixture-job",
+        "generation": 1,
+        "destination_id": "fixture-destination",
+        "instance_id": "fixture-instance",
+        "account_id": "relayhistory:7d1f361ea4fa95af12d49220e5ceefecdf89dbcdaf5e6dd2c5c1d9b22bda13f8",
+        "mapping_version": "relayhistory-delivery-v1",
+        "records": [
+          {
+            "schema_version": 1,
+            "origin_id": "fixture-main-origin",
+            "record_id": "fixture-main-origin:live",
+            "revision_id": "fixture-main-origin:live:r1",
+            "revision": 1,
+            "kind": "session_event",
+            "source": "claude",
+            "session_id": "fixture-main-origin:session",
+            "operation": "upsert",
+            "payload": {
+              "text": "DISPOSABLE_SYNTHETIC_CONTENT",
+              "ts_ms": 1761955200000
+            }
+          },
+          {
+            "schema_version": 1,
+            "origin_id": "fixture-main-origin",
+            "record_id": "fixture-main-origin:terminal",
+            "revision_id": "fixture-main-origin:terminal:r2",
+            "revision": 2,
+            "kind": "session_event",
+            "source": "claude",
+            "session_id": "fixture-main-origin:session",
+            "operation": "delete",
+            "payload": null
+          }
+        ]
+      },
+      "prepared": {
+        "originId": "fixture-main-origin",
+        "batchId": "fixture-main-batch",
+        "batchDigest": "a9a85d760766d659d2a17955900e2ef70c8d486e46a999632f2872809fa3b0b7",
+        "receipt": {
+          "protocolVersion": 1,
+          "receiptId": "rhr_4df431f94c6e8621a78b2e8910935197aad3a8f35f571a9d091faa089a2918fb",
+          "batchId": "fixture-main-batch",
+          "acceptedRevisionIds": [
+            "fixture-main-origin:live:r1",
+            "fixture-main-origin:terminal:r2"
+          ],
+          "unsupportedRevisionIds": [],
+          "acceptanceLevel": "durable"
+        },
+        "records": [
+          {
+            "schema_version": 1,
+            "origin_id": "fixture-main-origin",
+            "record_id": "fixture-main-origin:live",
+            "revision_id": "fixture-main-origin:live:r1",
+            "revision": 1,
+            "kind": "session_event",
+            "source": "claude",
+            "session_id": "fixture-main-origin:session",
+            "operation": "upsert",
+            "payload": {
+              "text": "DISPOSABLE_SYNTHETIC_CONTENT",
+              "ts_ms": 1761955200000
+            },
+            "digest": "8a29a352fe3327eb0a4ce5fd6ebc9e91aecfaabccbb085a87b656dbf0033253f"
+          },
+          {
+            "schema_version": 1,
+            "origin_id": "fixture-main-origin",
+            "record_id": "fixture-main-origin:terminal",
+            "revision_id": "fixture-main-origin:terminal:r2",
+            "revision": 2,
+            "kind": "session_event",
+            "source": "claude",
+            "session_id": "fixture-main-origin:session",
+            "operation": "delete",
+            "payload": null,
+            "digest": "69faa1263bd98ad7f5e6f353164499824467b24d40cb62dae12c6fc287102ee4"
+          }
+        ]
+      }
+    },
+    "dlq": {
+      "batch": {
+        "schema_version": 1,
+        "origin_id": "fixture-dlq-origin",
+        "batch_id": "fixture-dlq-batch",
+        "job_id": "fixture-job",
+        "generation": 1,
+        "destination_id": "fixture-destination",
+        "instance_id": "fixture-instance",
+        "account_id": "relayhistory:7d1f361ea4fa95af12d49220e5ceefecdf89dbcdaf5e6dd2c5c1d9b22bda13f8",
+        "mapping_version": "relayhistory-delivery-v1",
+        "records": [
+          {
+            "schema_version": 1,
+            "origin_id": "fixture-dlq-origin",
+            "record_id": "fixture-dlq-origin:live",
+            "revision_id": "fixture-dlq-origin:live:r1",
+            "revision": 1,
+            "kind": "session_event",
+            "source": "claude",
+            "session_id": "fixture-dlq-origin:session",
+            "operation": "upsert",
+            "payload": {
+              "text": "DISPOSABLE_SYNTHETIC_CONTENT",
+              "ts_ms": 1761955200000
+            }
+          },
+          {
+            "schema_version": 1,
+            "origin_id": "fixture-dlq-origin",
+            "record_id": "fixture-dlq-origin:terminal",
+            "revision_id": "fixture-dlq-origin:terminal:r2",
+            "revision": 2,
+            "kind": "session_event",
+            "source": "claude",
+            "session_id": "fixture-dlq-origin:session",
+            "operation": "delete",
+            "payload": null
+          }
+        ]
+      },
+      "prepared": {
+        "originId": "fixture-dlq-origin",
+        "batchId": "fixture-dlq-batch",
+        "batchDigest": "0c91ca010e855a029180a1efaae72268797ddc711d2f7f5be2c76a1eb996e687",
+        "receipt": {
+          "protocolVersion": 1,
+          "receiptId": "rhr_3adc20573a75a352fe6e8e1e50893e252b5bee1e4f3c7fffdaff68ce25a27e39",
+          "batchId": "fixture-dlq-batch",
+          "acceptedRevisionIds": [
+            "fixture-dlq-origin:live:r1",
+            "fixture-dlq-origin:terminal:r2"
+          ],
+          "unsupportedRevisionIds": [],
+          "acceptanceLevel": "durable"
+        },
+        "records": [
+          {
+            "schema_version": 1,
+            "origin_id": "fixture-dlq-origin",
+            "record_id": "fixture-dlq-origin:live",
+            "revision_id": "fixture-dlq-origin:live:r1",
+            "revision": 1,
+            "kind": "session_event",
+            "source": "claude",
+            "session_id": "fixture-dlq-origin:session",
+            "operation": "upsert",
+            "payload": {
+              "text": "DISPOSABLE_SYNTHETIC_CONTENT",
+              "ts_ms": 1761955200000
+            },
+            "digest": "8682605ca855bf1fe8cea485315e768a06400b1a1fc0e2297ceeccfa8136f7d2"
+          },
+          {
+            "schema_version": 1,
+            "origin_id": "fixture-dlq-origin",
+            "record_id": "fixture-dlq-origin:terminal",
+            "revision_id": "fixture-dlq-origin:terminal:r2",
+            "revision": 2,
+            "kind": "session_event",
+            "source": "claude",
+            "session_id": "fixture-dlq-origin:session",
+            "operation": "delete",
+            "payload": null,
+            "digest": "ceec4ebe27dbb71856e44414f935c3d404b4ce80c6d738d27ee3e8ae8f1c5310"
+          }
+        ]
+      }
+    }
+  },
+  "trustedFixtureBindings": {
+    "qualification": "TEST_ADAPTER_ONLY; production must reject these fixture bindings",
+    "globalInventory": {
+      "root": "6bc82a7861e59ef569a562ed44ede3f74161459f7bbcc7524b8a88c9bbbfbb84",
+      "inventory": [
+        {
+          "scope": [
+            "fixture-org",
+            "fixture-workspace",
+            "fixture-user"
+          ],
+          "mainAckCount": "1",
+          "dlqAckCount": "0"
+        },
+        {
+          "scope": [
+            "fixture-org",
+            "fixture-workspace",
+            "fixture-dlq-user"
+          ],
+          "mainAckCount": "0",
+          "dlqAckCount": "1"
+        },
+        {
+          "scope": [
+            "fixture-org",
+            "fixture-workspace",
+            "fixture-empty-user"
+          ],
+          "mainAckCount": "0",
+          "dlqAckCount": "0"
+        }
+      ],
+      "directoryTerminal": "979a45c3cc12c4edde5d931a18121ce55fd05115f2064f25b1a8629f8c8e774e",
+      "ackTerminal": "257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019"
+    },
+    "mainImport": {
+      "id": "fixture-main-import",
+      "view": {
+        "kind": "new_path_import_custody_receipt",
+        "scope": [
+          "fixture-org",
+          "fixture-workspace",
+          "fixture-user"
+        ],
+        "originId": "fixture-main-origin",
+        "batchId": "fixture-main-batch",
+        "batchDigest": "a9a85d760766d659d2a17955900e2ef70c8d486e46a999632f2872809fa3b0b7",
+        "receiptId": "rhr_4df431f94c6e8621a78b2e8910935197aad3a8f35f571a9d091faa089a2918fb",
+        "records": [
+          {
+            "recordId": "fixture-main-origin:live",
+            "revision": "1",
+            "revisionId": "fixture-main-origin:live:r1",
+            "digest": "8a29a352fe3327eb0a4ce5fd6ebc9e91aecfaabccbb085a87b656dbf0033253f",
+            "decision": "accepted"
+          },
+          {
+            "recordId": "fixture-main-origin:terminal",
+            "revision": "2",
+            "revisionId": "fixture-main-origin:terminal:r2",
+            "digest": "69faa1263bd98ad7f5e6f353164499824467b24d40cb62dae12c6fc287102ee4",
+            "decision": "tombstone_terminal"
+          }
+        ],
+        "bindingSha256": "3e61f734e72c2136d5ecb745b126eb8f558eb5d60cbf40cb13995cec39de6127"
+      }
+    },
+    "existingNeonCommit": {
+      "id": "fixture-existing-neon-commit",
+      "view": {
+        "kind": "existing_neon_receipt",
+        "scope": [
+          "fixture-org",
+          "fixture-workspace",
+          "fixture-user"
+        ],
+        "originId": "fixture-main-origin",
+        "batchId": "fixture-main-batch",
+        "batchDigest": "a9a85d760766d659d2a17955900e2ef70c8d486e46a999632f2872809fa3b0b7",
+        "receiptId": "rhr_4df431f94c6e8621a78b2e8910935197aad3a8f35f571a9d091faa089a2918fb",
+        "records": [
+          {
+            "recordId": "fixture-main-origin:live",
+            "revision": "1",
+            "revisionId": "fixture-main-origin:live:r1",
+            "digest": "8a29a352fe3327eb0a4ce5fd6ebc9e91aecfaabccbb085a87b656dbf0033253f",
+            "decision": "accepted"
+          },
+          {
+            "recordId": "fixture-main-origin:terminal",
+            "revision": "2",
+            "revisionId": "fixture-main-origin:terminal:r2",
+            "digest": "69faa1263bd98ad7f5e6f353164499824467b24d40cb62dae12c6fc287102ee4",
+            "decision": "tombstone_terminal"
+          }
+        ],
+        "bindingSha256": "7722f70fb56bd7d31d57acff6df559f49f2af9fc7c39ed1fe12282663a53d82e"
+      }
+    },
+    "dlqImport": {
+      "id": "fixture-dlq-import",
+      "view": {
+        "kind": "new_path_import_custody_receipt",
+        "scope": [
+          "fixture-org",
+          "fixture-workspace",
+          "fixture-dlq-user"
+        ],
+        "originId": "fixture-dlq-origin",
+        "batchId": "fixture-dlq-batch",
+        "batchDigest": "0c91ca010e855a029180a1efaae72268797ddc711d2f7f5be2c76a1eb996e687",
+        "receiptId": "rhr_3adc20573a75a352fe6e8e1e50893e252b5bee1e4f3c7fffdaff68ce25a27e39",
+        "records": [
+          {
+            "recordId": "fixture-dlq-origin:live",
+            "revision": "1",
+            "revisionId": "fixture-dlq-origin:live:r1",
+            "digest": "8682605ca855bf1fe8cea485315e768a06400b1a1fc0e2297ceeccfa8136f7d2",
+            "decision": "accepted"
+          },
+          {
+            "recordId": "fixture-dlq-origin:terminal",
+            "revision": "2",
+            "revisionId": "fixture-dlq-origin:terminal:r2",
+            "digest": "ceec4ebe27dbb71856e44414f935c3d404b4ce80c6d738d27ee3e8ae8f1c5310",
+            "decision": "tombstone_terminal"
+          }
+        ],
+        "bindingSha256": "b94dda2a38fc4757d440c528633e71fb7f490f4f17881aae3a8edd88f8a4e77d"
+      }
+    }
+  },
+  "s4VerifierCases": [
+    {
+      "id": "exact_new_path_import_matches",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [],
+      "expected": {
+        "componentStatus": "VERIFIED_COMPLETE",
+        "wholeUserStatus": "VERIFIED_COMPLETE"
+      }
+    },
+    {
+      "id": "missing_new_path_commitment",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commitmentViews",
+          "value": []
+        }
+      ],
+      "expected": {
+        "componentStatus": "UNMEASURED",
+        "wholeUserStatus": "UNMEASURED"
+      }
+    },
+    {
+      "id": "tombstone_terminal_witness_retained",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [],
+      "expected": {
+        "componentStatus": "VERIFIED_COMPLETE",
+        "wholeUserStatus": "VERIFIED_COMPLETE",
+        "requiredCheck": "Exact delete revision/digest is covered by terminal custody witness; absence of a live body is not missing evidence."
+      }
+    },
+    {
+      "id": "batch_digest_mismatch",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commitmentViews",
+          "value": [
+            {
+              "kind": "new_path_import_custody_receipt",
+              "scope": [
+                "fixture-org",
+                "fixture-workspace",
+                "fixture-user"
+              ],
+              "originId": "fixture-main-origin",
+              "batchId": "fixture-main-batch",
+              "batchDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "receiptId": "rhr_4df431f94c6e8621a78b2e8910935197aad3a8f35f571a9d091faa089a2918fb",
+              "records": [
+                {
+                  "recordId": "fixture-main-origin:live",
+                  "revision": "1",
+                  "revisionId": "fixture-main-origin:live:r1",
+                  "digest": "8a29a352fe3327eb0a4ce5fd6ebc9e91aecfaabccbb085a87b656dbf0033253f",
+                  "decision": "accepted"
+                },
+                {
+                  "recordId": "fixture-main-origin:terminal",
+                  "revision": "2",
+                  "revisionId": "fixture-main-origin:terminal:r2",
+                  "digest": "69faa1263bd98ad7f5e6f353164499824467b24d40cb62dae12c6fc287102ee4",
+                  "decision": "tombstone_terminal"
+                }
+              ],
+              "bindingSha256": "3e61f734e72c2136d5ecb745b126eb8f558eb5d60cbf40cb13995cec39de6127"
+            }
+          ]
+        }
+      ],
+      "expected": {
+        "componentStatus": "UNMEASURED",
+        "wholeUserStatus": "UNMEASURED"
+      }
+    },
+    {
+      "id": "receipt_id_mismatch",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commitmentViews",
+          "value": [
+            {
+              "kind": "new_path_import_custody_receipt",
+              "scope": [
+                "fixture-org",
+                "fixture-workspace",
+                "fixture-user"
+              ],
+              "originId": "fixture-main-origin",
+              "batchId": "fixture-main-batch",
+              "batchDigest": "a9a85d760766d659d2a17955900e2ef70c8d486e46a999632f2872809fa3b0b7",
+              "receiptId": "rhr_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "records": [
+                {
+                  "recordId": "fixture-main-origin:live",
+                  "revision": "1",
+                  "revisionId": "fixture-main-origin:live:r1",
+                  "digest": "8a29a352fe3327eb0a4ce5fd6ebc9e91aecfaabccbb085a87b656dbf0033253f",
+                  "decision": "accepted"
+                },
+                {
+                  "recordId": "fixture-main-origin:terminal",
+                  "revision": "2",
+                  "revisionId": "fixture-main-origin:terminal:r2",
+                  "digest": "69faa1263bd98ad7f5e6f353164499824467b24d40cb62dae12c6fc287102ee4",
+                  "decision": "tombstone_terminal"
+                }
+              ],
+              "bindingSha256": "3e61f734e72c2136d5ecb745b126eb8f558eb5d60cbf40cb13995cec39de6127"
+            }
+          ]
+        }
+      ],
+      "expected": {
+        "componentStatus": "UNMEASURED",
+        "wholeUserStatus": "UNMEASURED"
+      }
+    },
+    {
+      "id": "terminal_revision_witness_missing",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commitmentViews",
+          "value": [
+            {
+              "kind": "new_path_import_custody_receipt",
+              "scope": [
+                "fixture-org",
+                "fixture-workspace",
+                "fixture-user"
+              ],
+              "originId": "fixture-main-origin",
+              "batchId": "fixture-main-batch",
+              "batchDigest": "a9a85d760766d659d2a17955900e2ef70c8d486e46a999632f2872809fa3b0b7",
+              "receiptId": "rhr_4df431f94c6e8621a78b2e8910935197aad3a8f35f571a9d091faa089a2918fb",
+              "records": [
+                {
+                  "recordId": "fixture-main-origin:live",
+                  "revision": "1",
+                  "revisionId": "fixture-main-origin:live:r1",
+                  "digest": "8a29a352fe3327eb0a4ce5fd6ebc9e91aecfaabccbb085a87b656dbf0033253f",
+                  "decision": "accepted"
+                }
+              ],
+              "bindingSha256": "3e61f734e72c2136d5ecb745b126eb8f558eb5d60cbf40cb13995cec39de6127"
+            }
+          ]
+        }
+      ],
+      "expected": {
+        "componentStatus": "UNMEASURED",
+        "wholeUserStatus": "UNMEASURED"
+      }
+    },
+    {
+      "id": "marker_not_committed",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/cohorts/main",
+          "value": [
+            {
+              "message": {
+                "v": 1,
+                "kind": "neon-replica",
+                "auth": {
+                  "orgId": "fixture-org",
+                  "workspaceId": "fixture-workspace",
+                  "userId": "fixture-user"
+                },
+                "originId": "fixture-main-origin",
+                "batchId": "fixture-main-batch",
+                "batchDigest": "a9a85d760766d659d2a17955900e2ef70c8d486e46a999632f2872809fa3b0b7",
+                "receipt": {
+                  "protocolVersion": 1,
+                  "receiptId": "rhr_4df431f94c6e8621a78b2e8910935197aad3a8f35f571a9d091faa089a2918fb",
+                  "batchId": "fixture-main-batch",
+                  "acceptedRevisionIds": [
+                    "fixture-main-origin:live:r1",
+                    "fixture-main-origin:terminal:r2"
+                  ],
+                  "unsupportedRevisionIds": [],
+                  "acceptanceLevel": "durable"
+                },
+                "parts": [
+                  {
+                    "key": "synthetic-only/fixture-main-origin/chunk.ndjson",
+                    "source": "claude",
+                    "sessionId": "fixture-main-origin:session",
+                    "lines": 2,
+                    "sha256": "c5cd994c395eb39879f47682f5c7538a8f46fa010561b90c05d2986afecf06f5"
+                  }
+                ],
+                "records": [
+                  [
+                    0,
+                    0,
+                    "fixture-main-origin:live:r1",
+                    "8a29a352fe3327eb0a4ce5fd6ebc9e91aecfaabccbb085a87b656dbf0033253f",
+                    "fixture-main-origin:live",
+                    1
+                  ],
+                  [
+                    0,
+                    1,
+                    "fixture-main-origin:terminal:r2",
+                    "69faa1263bd98ad7f5e6f353164499824467b24d40cb62dae12c6fc287102ee4",
+                    "fixture-main-origin:terminal",
+                    2
+                  ]
+                ],
+                "fence": {
+                  "resets": 0
+                },
+                "enqueuedAt": "2026-01-01T00:00:00.000Z"
+              },
+              "marker": {
+                "v": 1,
+                "state": "pending",
+                "claimedAt": "2026-01-01T00:00:00.000Z",
+                "originId": "fixture-main-origin",
+                "batchId": "fixture-main-batch",
+                "digest": "a9a85d760766d659d2a17955900e2ef70c8d486e46a999632f2872809fa3b0b7",
+                "receipt": {
+                  "protocolVersion": 1,
+                  "receiptId": "rhr_4df431f94c6e8621a78b2e8910935197aad3a8f35f571a9d091faa089a2918fb",
+                  "batchId": "fixture-main-batch",
+                  "acceptedRevisionIds": [
+                    "fixture-main-origin:live:r1",
+                    "fixture-main-origin:terminal:r2"
+                  ],
+                  "unsupportedRevisionIds": [],
+                  "acceptanceLevel": "durable"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "expected": {
+        "componentStatus": "UNMEASURED",
+        "wholeUserStatus": "UNMEASURED"
+      }
+    },
+    {
+      "id": "main_proof_does_not_cover_dlq_user",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/scope",
+          "value": [
+            "fixture-org",
+            "fixture-workspace",
+            "fixture-dlq-user"
+          ]
+        },
+        {
+          "op": "replace",
+          "path": "/component/scope",
+          "value": [
+            "fixture-org",
+            "fixture-workspace",
+            "fixture-dlq-user"
+          ]
+        }
+      ],
+      "expected": {
+        "componentStatus": "UNMEASURED",
+        "wholeUserStatus": "UNMEASURED"
+      }
+    },
+    {
+      "id": "presume_affected_without_global_completeness",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/globalCompletenessRoot"
+        }
+      ],
+      "expected": {
+        "componentStatus": "UNMEASURED",
+        "wholeUserStatus": "UNMEASURED"
+      }
+    },
+    {
+      "id": "component_omitted",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/component"
+        }
+      ],
+      "expected": {
+        "componentStatus": "UNMEASURED",
+        "wholeUserStatus": "UNMEASURED"
+      }
+    },
+    {
+      "id": "empty_without_global_root",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/globalCompletenessRoot"
+        },
+        {
+          "op": "replace",
+          "path": "/scope",
+          "value": [
+            "fixture-org",
+            "fixture-workspace",
+            "fixture-empty-user"
+          ]
+        },
+        {
+          "op": "replace",
+          "path": "/component/scope",
+          "value": [
+            "fixture-org",
+            "fixture-workspace",
+            "fixture-empty-user"
+          ]
+        },
+        {
+          "op": "replace",
+          "path": "/component/status",
+          "value": "VERIFIED_EMPTY"
+        },
+        {
+          "op": "replace",
+          "path": "/component/rowCount",
+          "value": "0"
+        },
+        {
+          "op": "replace",
+          "path": "/component/rowsSha256",
+          "value": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        }
+      ],
+      "expected": {
+        "componentStatus": "UNMEASURED",
+        "wholeUserStatus": "UNMEASURED"
+      }
+    },
+    {
+      "id": "empty_without_zero_entry_inclusion",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/scope",
+          "value": [
+            "fixture-org",
+            "fixture-workspace",
+            "fixture-empty-user"
+          ]
+        },
+        {
+          "op": "replace",
+          "path": "/component/scope",
+          "value": [
+            "fixture-org",
+            "fixture-workspace",
+            "fixture-empty-user"
+          ]
+        },
+        {
+          "op": "replace",
+          "path": "/component/status",
+          "value": "VERIFIED_EMPTY"
+        },
+        {
+          "op": "replace",
+          "path": "/component/rowCount",
+          "value": "0"
+        },
+        {
+          "op": "replace",
+          "path": "/component/rowsSha256",
+          "value": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        }
+      ],
+      "expected": {
+        "componentStatus": "UNMEASURED",
+        "wholeUserStatus": "UNMEASURED"
+      }
+    },
+    {
+      "id": "global_proven_empty_user",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/scope",
+          "value": [
+            "fixture-org",
+            "fixture-workspace",
+            "fixture-empty-user"
+          ]
+        },
+        {
+          "op": "replace",
+          "path": "/component/scope",
+          "value": [
+            "fixture-org",
+            "fixture-workspace",
+            "fixture-empty-user"
+          ]
+        },
+        {
+          "op": "replace",
+          "path": "/component/status",
+          "value": "VERIFIED_EMPTY"
+        },
+        {
+          "op": "replace",
+          "path": "/component/rowCount",
+          "value": "0"
+        },
+        {
+          "op": "replace",
+          "path": "/component/rowsSha256",
+          "value": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        {
+          "op": "replace",
+          "path": "/zeroEntryProof",
+          "value": {
+            "globalCompletenessRoot": "6bc82a7861e59ef569a562ed44ede3f74161459f7bbcc7524b8a88c9bbbfbb84",
+            "entryIndex": "2",
+            "entry": {
+              "scope": [
+                "fixture-org",
+                "fixture-workspace",
+                "fixture-empty-user"
+              ],
+              "mainAckCount": "0",
+              "dlqAckCount": "0"
+            }
+          }
+        },
+        {
+          "op": "replace",
+          "path": "/commitmentViews",
+          "value": []
+        },
+        {
+          "op": "replace",
+          "path": "/outOfBandProofBindingIds",
+          "value": [
+            "fixture-global-inventory"
+          ]
+        }
+      ],
+      "expected": {
+        "componentStatus": "VERIFIED_EMPTY",
+        "wholeUserStatus": "VERIFIED_EMPTY",
+        "requiredCheck": "Independent verifier recomputes full qualified global manifest and exact user zero entry, not just proof strings."
+      }
+    },
+    {
+      "id": "queue_metrics_are_not_inventory",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/globalCompletenessRoot"
+        },
+        {
+          "op": "add",
+          "path": "/provenanceOnly",
+          "value": {
+            "backlog_count": 0,
+            "modified_on": "2026-01-01T00:00:00Z"
+          }
+        }
+      ],
+      "expected": {
+        "componentStatus": "UNMEASURED",
+        "wholeUserStatus": "UNMEASURED"
+      }
+    },
+    {
+      "id": "ad_hoc_equivalent_path_unavailable",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commitmentViews",
+          "value": [
+            {
+              "kind": "reviewer_approved_equivalent_archive",
+              "proof": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }
+          ]
+        }
+      ],
+      "expected": {
+        "componentStatus": "UNMEASURED",
+        "wholeUserStatus": "UNMEASURED",
+        "reason": "Equivalent path is UNAVAILABLE until a reviewed protocol amendment defines schema, verifier and negatives."
+      }
+    },
+    {
+      "id": "buffer_http200_is_not_import_proof",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commitmentViews",
+          "value": [
+            {
+              "kind": "http_200_staged_only",
+              "batchId": "fixture-main-batch",
+              "receiptId": "rhr_4df431f94c6e8621a78b2e8910935197aad3a8f35f571a9d091faa089a2918fb"
+            }
+          ]
+        }
+      ],
+      "expected": {
+        "componentStatus": "UNMEASURED",
+        "wholeUserStatus": "UNMEASURED"
+      }
+    },
+    {
+      "id": "existing_neon_receipt_only_if_explicitly_bound",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/commitmentViews",
+          "value": [
+            {
+              "kind": "existing_neon_receipt",
+              "scope": [
+                "fixture-org",
+                "fixture-workspace",
+                "fixture-user"
+              ],
+              "originId": "fixture-main-origin",
+              "batchId": "fixture-main-batch",
+              "batchDigest": "a9a85d760766d659d2a17955900e2ef70c8d486e46a999632f2872809fa3b0b7",
+              "receiptId": "rhr_4df431f94c6e8621a78b2e8910935197aad3a8f35f571a9d091faa089a2918fb",
+              "records": [
+                {
+                  "recordId": "fixture-main-origin:live",
+                  "revision": "1",
+                  "revisionId": "fixture-main-origin:live:r1",
+                  "digest": "8a29a352fe3327eb0a4ce5fd6ebc9e91aecfaabccbb085a87b656dbf0033253f",
+                  "decision": "accepted"
+                },
+                {
+                  "recordId": "fixture-main-origin:terminal",
+                  "revision": "2",
+                  "revisionId": "fixture-main-origin:terminal:r2",
+                  "digest": "69faa1263bd98ad7f5e6f353164499824467b24d40cb62dae12c6fc287102ee4",
+                  "decision": "tombstone_terminal"
+                }
+              ],
+              "bindingSha256": "7722f70fb56bd7d31d57acff6df559f49f2af9fc7c39ed1fe12282663a53d82e"
+            }
+          ]
+        },
+        {
+          "op": "replace",
+          "path": "/outOfBandProofBindingIds",
+          "value": [
+            "fixture-global-inventory",
+            "fixture-existing-neon-commit"
+          ]
+        }
+      ],
+      "expected": {
+        "componentStatus": "VERIFIED_COMPLETE",
+        "wholeUserStatus": "VERIFIED_COMPLETE",
+        "requiredCheck": "Fixture binding confirms this exact ACK actually committed before pause; never assume Neon as recovery destination."
+      }
+    },
+    {
+      "id": "empty_without_terminal_proof",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/scope",
+          "value": [
+            "fixture-org",
+            "fixture-workspace",
+            "fixture-empty-user"
+          ]
+        },
+        {
+          "op": "replace",
+          "path": "/component/scope",
+          "value": [
+            "fixture-org",
+            "fixture-workspace",
+            "fixture-empty-user"
+          ]
+        },
+        {
+          "op": "replace",
+          "path": "/component/status",
+          "value": "VERIFIED_EMPTY"
+        },
+        {
+          "op": "replace",
+          "path": "/component/rowCount",
+          "value": "0"
+        },
+        {
+          "op": "replace",
+          "path": "/component/terminalProofSha256",
+          "value": null
+        },
+        {
+          "op": "replace",
+          "path": "/component/rowsSha256",
+          "value": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        {
+          "op": "replace",
+          "path": "/zeroEntryProof",
+          "value": {
+            "globalCompletenessRoot": "6bc82a7861e59ef569a562ed44ede3f74161459f7bbcc7524b8a88c9bbbfbb84",
+            "entryIndex": "2",
+            "entry": {
+              "scope": [
+                "fixture-org",
+                "fixture-workspace",
+                "fixture-empty-user"
+              ],
+              "mainAckCount": "0",
+              "dlqAckCount": "0"
+            }
+          }
+        }
+      ],
+      "expected": {
+        "componentStatus": "UNMEASURED",
+        "wholeUserStatus": "UNMEASURED"
+      }
+    },
+    {
+      "id": "zero_inclusion_disagrees_with_global_count",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "replace",
+          "path": "/component/status",
+          "value": "VERIFIED_EMPTY"
+        },
+        {
+          "op": "replace",
+          "path": "/component/rowCount",
+          "value": "0"
+        },
+        {
+          "op": "replace",
+          "path": "/component/rowsSha256",
+          "value": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        },
+        {
+          "op": "replace",
+          "path": "/zeroEntryProof",
+          "value": {
+            "globalCompletenessRoot": "6bc82a7861e59ef569a562ed44ede3f74161459f7bbcc7524b8a88c9bbbfbb84",
+            "entryIndex": "0",
+            "entry": {
+              "scope": [
+                "fixture-org",
+                "fixture-workspace",
+                "fixture-user"
+              ],
+              "mainAckCount": "0",
+              "dlqAckCount": "0"
+            }
+          }
+        }
+      ],
+      "expected": {
+        "componentStatus": "UNMEASURED",
+        "wholeUserStatus": "UNMEASURED"
+      }
+    },
+    {
+      "id": "global_inventory_has_no_terminal_closure",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "remove",
+          "path": "/globalCompletenessRoot"
+        },
+        {
+          "op": "add",
+          "path": "/globalInventoryTerminalProof",
+          "value": null
+        }
+      ],
+      "expected": {
+        "componentStatus": "UNMEASURED",
+        "wholeUserStatus": "UNMEASURED"
+      }
+    },
+    {
+      "id": "synthetic_bindings_rejected_in_production_mode",
+      "templateRef": "#/s4CaseTemplate",
+      "patch": [
+        {
+          "op": "add",
+          "path": "/executionMode",
+          "value": "production"
+        }
+      ],
+      "expected": {
+        "componentStatus": "UNMEASURED",
+        "wholeUserStatus": "UNMEASURED",
+        "reason": "Fixture trust bindings are test-adapter only, never authoritative production evidence."
+      }
+    }
+  ],
+  "futureSqlCases": [
+    {
+      "id": "s4_component_unmeasured",
+      "component": {
+        "protocol": "frontier-attestation-audit-v1",
+        "scope": [
+          "fixture-org",
+          "fixture-workspace",
+          "fixture-user"
+        ],
+        "component": "drained_pre_switch_ACK",
+        "status": "UNMEASURED",
+        "rowCount": "1",
+        "terminalProofSha256": "257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019",
+        "rowsSha256": "d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e"
+      },
+      "expectedSqlstate": "55000"
+    },
+    {
+      "id": "s4_component_absent",
+      "component": null,
+      "expectedSqlstate": "55000"
+    },
+    {
+      "id": "s4_empty_without_terminal_proof",
+      "component": {
+        "protocol": "frontier-attestation-audit-v1",
+        "scope": [
+          "fixture-org",
+          "fixture-workspace",
+          "fixture-empty-user"
+        ],
+        "component": "drained_pre_switch_ACK",
+        "status": "VERIFIED_EMPTY",
+        "rowCount": "0",
+        "terminalProofSha256": null,
+        "rowsSha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+      },
+      "expectedSqlstate": "55000"
+    },
+    {
+      "id": "one_origin_cannot_bypass_whole_user_hold",
+      "scope": [
+        "fixture-org",
+        "fixture-workspace",
+        "fixture-user"
+      ],
+      "otherOriginStatus": "UNMEASURED",
+      "expectedSqlstate": "55000"
+    }
+  ],
+  "sqlTestStatus": "NOT_EXECUTED: RPC/migration050000 not implemented. Core owner supplies actual *.pglite.test.ts and realPG16/17 two-session tests, plus PG15 unavailable leg.",
+  "owners": {
+    "core": "layered-sessions-pipeline",
+    "independentVerifier": "codex-relayhistory-verify-replica",
+    "independentReview": "neonexit-review-finn",
+    "contractsOnlyAuthor": "codex-relay-desktop-find-prior"
+  },
+  "liveCalls": 0,
+  "prevalidationOrder": [
+    "bounded UTF8 input and duplicate-key refusing parse",
+    "exact ASCII schema key set",
+    "per-field type, character and int64 decimal constraints",
+    "status/terminal/global-proof eligibility",
+    "canonicalization then hash"
+  ],
+  "plannerNonAsciiOrderVector": {
+    "identifiers": [
+      "𐀀",
+      ""
+    ],
+    "expected": "HOLD_UNTIL_REVIEWED_049_AMENDMENT",
+    "JS_UTF16_Order": [
+      "𐀀",
+      ""
+    ],
+    "RawUTF8_Order": [
+      "",
+      "𐀀"
+    ]
+  },
+  "s4CaseTemplate": {
+    "scope": [
+      "fixture-org",
+      "fixture-workspace",
+      "fixture-user"
+    ],
+    "component": {
+      "protocol": "frontier-attestation-audit-v1",
+      "scope": [
+        "fixture-org",
+        "fixture-workspace",
+        "fixture-user"
+      ],
+      "component": "drained_pre_switch_ACK",
+      "status": "VERIFIED_COMPLETE",
+      "rowCount": "1",
+      "terminalProofSha256": "257331bdec4ced968a9503be884347503c7638f477b016646859b6a4b927b019",
+      "rowsSha256": "d44ba8bc272f2f188b2aba985e1037a9cc38851cdb8cc6b9e6194884ebdd1e0e"
+    },
+    "globalCompletenessRoot": "6bc82a7861e59ef569a562ed44ede3f74161459f7bbcc7524b8a88c9bbbfbb84",
+    "globalInventory": [
+      {
+        "scope": [
+          "fixture-org",
+          "fixture-workspace",
+          "fixture-user"
+        ],
+        "mainAckCount": "1",
+        "dlqAckCount": "0"
+      },
+      {
+        "scope": [
+          "fixture-org",
+          "fixture-workspace",
+          "fixture-dlq-user"
+        ],
+        "mainAckCount": "0",
+        "dlqAckCount": "1"
+      },
+      {
+        "scope": [
+          "fixture-org",
+          "fixture-workspace",
+          "fixture-empty-user"
+        ],
+        "mainAckCount": "0",
+        "dlqAckCount": "0"
+      }
+    ],
+    "zeroEntryProof": null,
+    "cohorts": {
+      "main": [
+        {
+          "message": {
+            "v": 1,
+            "kind": "neon-replica",
+            "auth": {
+              "orgId": "fixture-org",
+              "workspaceId": "fixture-workspace",
+              "userId": "fixture-user"
+            },
+            "originId": "fixture-main-origin",
+            "batchId": "fixture-main-batch",
+            "batchDigest": "a9a85d760766d659d2a17955900e2ef70c8d486e46a999632f2872809fa3b0b7",
+            "receipt": {
+              "protocolVersion": 1,
+              "receiptId": "rhr_4df431f94c6e8621a78b2e8910935197aad3a8f35f571a9d091faa089a2918fb",
+              "batchId": "fixture-main-batch",
+              "acceptedRevisionIds": [
+                "fixture-main-origin:live:r1",
+                "fixture-main-origin:terminal:r2"
+              ],
+              "unsupportedRevisionIds": [],
+              "acceptanceLevel": "durable"
+            },
+            "parts": [
+              {
+                "key": "synthetic-only/fixture-main-origin/chunk.ndjson",
+                "source": "claude",
+                "sessionId": "fixture-main-origin:session",
+                "lines": 2,
+                "sha256": "c5cd994c395eb39879f47682f5c7538a8f46fa010561b90c05d2986afecf06f5"
+              }
+            ],
+            "records": [
+              [
+                0,
+                0,
+                "fixture-main-origin:live:r1",
+                "8a29a352fe3327eb0a4ce5fd6ebc9e91aecfaabccbb085a87b656dbf0033253f",
+                "fixture-main-origin:live",
+                1
+              ],
+              [
+                0,
+                1,
+                "fixture-main-origin:terminal:r2",
+                "69faa1263bd98ad7f5e6f353164499824467b24d40cb62dae12c6fc287102ee4",
+                "fixture-main-origin:terminal",
+                2
+              ]
+            ],
+            "fence": {
+              "resets": 0
+            },
+            "enqueuedAt": "2026-01-01T00:00:00.000Z"
+          },
+          "marker": {
+            "v": 1,
+            "state": "committed",
+            "claimedAt": "2026-01-01T00:00:00.000Z",
+            "originId": "fixture-main-origin",
+            "batchId": "fixture-main-batch",
+            "digest": "a9a85d760766d659d2a17955900e2ef70c8d486e46a999632f2872809fa3b0b7",
+            "receipt": {
+              "protocolVersion": 1,
+              "receiptId": "rhr_4df431f94c6e8621a78b2e8910935197aad3a8f35f571a9d091faa089a2918fb",
+              "batchId": "fixture-main-batch",
+              "acceptedRevisionIds": [
+                "fixture-main-origin:live:r1",
+                "fixture-main-origin:terminal:r2"
+              ],
+              "unsupportedRevisionIds": [],
+              "acceptanceLevel": "durable"
+            }
+          }
+        }
+      ],
+      "dlq": [
+        {
+          "message": {
+            "v": 1,
+            "kind": "neon-replica",
+            "auth": {
+              "orgId": "fixture-org",
+              "workspaceId": "fixture-workspace",
+              "userId": "fixture-dlq-user"
+            },
+            "originId": "fixture-dlq-origin",
+            "batchId": "fixture-dlq-batch",
+            "batchDigest": "0c91ca010e855a029180a1efaae72268797ddc711d2f7f5be2c76a1eb996e687",
+            "receipt": {
+              "protocolVersion": 1,
+              "receiptId": "rhr_3adc20573a75a352fe6e8e1e50893e252b5bee1e4f3c7fffdaff68ce25a27e39",
+              "batchId": "fixture-dlq-batch",
+              "acceptedRevisionIds": [
+                "fixture-dlq-origin:live:r1",
+                "fixture-dlq-origin:terminal:r2"
+              ],
+              "unsupportedRevisionIds": [],
+              "acceptanceLevel": "durable"
+            },
+            "parts": [
+              {
+                "key": "synthetic-only/fixture-dlq-origin/chunk.ndjson",
+                "source": "claude",
+                "sessionId": "fixture-dlq-origin:session",
+                "lines": 2,
+                "sha256": "ee474bc2abdec335a055d056feb0123b2b9c7a96be60d65f6972f52c92b70988"
+              }
+            ],
+            "records": [
+              [
+                0,
+                0,
+                "fixture-dlq-origin:live:r1",
+                "8682605ca855bf1fe8cea485315e768a06400b1a1fc0e2297ceeccfa8136f7d2",
+                "fixture-dlq-origin:live",
+                1
+              ],
+              [
+                0,
+                1,
+                "fixture-dlq-origin:terminal:r2",
+                "ceec4ebe27dbb71856e44414f935c3d404b4ce80c6d738d27ee3e8ae8f1c5310",
+                "fixture-dlq-origin:terminal",
+                2
+              ]
+            ],
+            "fence": {
+              "resets": 0
+            },
+            "enqueuedAt": "2026-01-01T00:00:00.000Z"
+          },
+          "marker": {
+            "v": 1,
+            "state": "committed",
+            "claimedAt": "2026-01-01T00:00:00.000Z",
+            "originId": "fixture-dlq-origin",
+            "batchId": "fixture-dlq-batch",
+            "digest": "0c91ca010e855a029180a1efaae72268797ddc711d2f7f5be2c76a1eb996e687",
+            "receipt": {
+              "protocolVersion": 1,
+              "receiptId": "rhr_3adc20573a75a352fe6e8e1e50893e252b5bee1e4f3c7fffdaff68ce25a27e39",
+              "batchId": "fixture-dlq-batch",
+              "acceptedRevisionIds": [
+                "fixture-dlq-origin:live:r1",
+                "fixture-dlq-origin:terminal:r2"
+              ],
+              "unsupportedRevisionIds": [],
+              "acceptanceLevel": "durable"
+            }
+          }
+        }
+      ]
+    },
+    "commitmentViews": [
+      {
+        "kind": "new_path_import_custody_receipt",
+        "scope": [
+          "fixture-org",
+          "fixture-workspace",
+          "fixture-user"
+        ],
+        "originId": "fixture-main-origin",
+        "batchId": "fixture-main-batch",
+        "batchDigest": "a9a85d760766d659d2a17955900e2ef70c8d486e46a999632f2872809fa3b0b7",
+        "receiptId": "rhr_4df431f94c6e8621a78b2e8910935197aad3a8f35f571a9d091faa089a2918fb",
+        "records": [
+          {
+            "recordId": "fixture-main-origin:live",
+            "revision": "1",
+            "revisionId": "fixture-main-origin:live:r1",
+            "digest": "8a29a352fe3327eb0a4ce5fd6ebc9e91aecfaabccbb085a87b656dbf0033253f",
+            "decision": "accepted"
+          },
+          {
+            "recordId": "fixture-main-origin:terminal",
+            "revision": "2",
+            "revisionId": "fixture-main-origin:terminal:r2",
+            "digest": "69faa1263bd98ad7f5e6f353164499824467b24d40cb62dae12c6fc287102ee4",
+            "decision": "tombstone_terminal"
+          }
+        ],
+        "bindingSha256": "3e61f734e72c2136d5ecb745b126eb8f558eb5d60cbf40cb13995cec39de6127"
+      }
+    ],
+    "outOfBandProofBindingIds": [
+      "fixture-global-inventory",
+      "fixture-main-import"
+    ]
+  },
+  "fixturePatchSemantics": "RFC6902 add/remove/replace only; materialize a fresh deep copy per case. Case inputs/commitment views are test-adapter abstractions, not a new production receipt protocol."
+}

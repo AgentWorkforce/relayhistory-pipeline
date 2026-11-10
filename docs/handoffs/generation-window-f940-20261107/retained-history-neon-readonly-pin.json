@@ -1,0 +1,29 @@
+{
+  "kind": "retained_history_neon_readonly_route_pin",
+  "recordedAt": "2026-11-07T20:34:38.022484+00:00",
+  "projectId": "divine-snow-84812652",
+  "branchId": "br-damp-mud-apbr6ifp",
+  "branchName": "production",
+  "database": "neondb",
+  "endpointHostname": "ep-floral-pond-apkvat38.c-7.us-east-1.aws.neon.tech",
+  "port": 5432,
+  "historicalRequestedRole": "neondb_owner",
+  "roleQualification": "Owner role historically used for bounded READ ONLY transactions, not a restricted read-only database principal. No new credential retrieval, authorization, target validation or Neon query performed here.",
+  "providerIdentityCapturedAt": "2026-11-04T16:02:52.805817+00:00",
+  "providerIdentityReceiptSha256": "f410e78cfacd12fcd5d04f397627310a39d4b2ae8e5b96b76b5022b179cd451e",
+  "producerInventorySha256": "972f2670c8c77fe9a023000dd3c2fb59d0e1520df6828cc0b38ae1fe6af98512",
+  "historicalProducerArgv": [
+    "neonctl",
+    "connection-string",
+    "br-damp-mud-apbr6ifp",
+    "--project-id",
+    "divine-snow-84812652",
+    "--role-name",
+    "neondb_owner",
+    "--database-name",
+    "neondb"
+  ],
+  "credentialValueIncluded": false,
+  "producerExecuted": false,
+  "newUseQualified": false
+}

@@ -30,8 +30,14 @@
  *     every companion's last_activity_at equal to the row's in the row's own transaction,
  *     and on tombstone or delete remove the session's agent rows and its edges as parent
  *     and as child; the tombstone trigger clears the catalog columns.
- *   - a model-written brief title (sessions.session_briefs, src/session-brief) wins over
- *     the latest pointer's title while the brief exists. Deleting a pointer deletes the
+ *   - a NATIVE model-written brief title (sessions.session_briefs, src/session-brief) wins
+ *     over the latest pointer's title while the brief exists. A current complete
+ *     recorded_catalog_title is the final fallback; it never preserves old generated
+ *     text after a model clear or source invalidation. A Neon-backfilled brief
+ *     (20261105043000, engine_version 'neon-backfill:*') never does: it is kept out of the
+ *     directory title, search_text and the publication built from them. Only
+ *     sessions.session_brief_titles_for (Cloud's session list) serves it; sessions.session_brief()
+ *     (the /brief route) reads it as no brief (docs/brief-titles.md). Deleting a pointer deletes the
  *     brief (trigger), so the pointer title returns on the next projection.
  *
  * search_text is always rebuilt with sessions.session_directory_search_text, so the
@@ -73,9 +79,14 @@ export async function projectSessionDirectory(
          ELSE i.canonical_session_id END AS session_id
        FROM identity AS i
      ), brief AS (
+       -- A NATIVE brief title only. A Neon backfill (20261105043000, origin 'neon_backfill',
+       -- engine_version 'neon-backfill:*') never goes into the directory title, search_text or
+       -- the brief-document/search publication built from them. Only
+       -- sessions.session_brief_titles_for serves it (session_brief() reads it as no brief). Filtered on engine_version,
+       -- the column origin is derived from, so this read also works before 043000 is applied.
        SELECT title FROM sessions.session_briefs
         WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4
-          AND title IS NOT NULL
+          AND title IS NOT NULL AND engine_version NOT LIKE 'neon-backfill:%'
      ), agg AS (
        SELECT min(created_at) AS created_at, max(last_activity_at) AS last_activity_at,
               coalesce(array_agg(DISTINCT coalesce(canonical_machine_id, machine_id)
@@ -103,7 +114,7 @@ export async function projectSessionDirectory(
        created_at = LEAST(d.created_at, excluded.created_at),
        deleted_at = NULL,
        last_activity_at = excluded.last_activity_at,
-       title = excluded.title,
+       title = coalesce(excluded.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END),
        project_id = coalesce(excluded.project_id, d.project_id),
        git_repo = coalesce(excluded.git_repo, d.git_repo),
        git_branch = coalesce(excluded.git_branch, d.git_branch),
@@ -116,7 +127,7 @@ export async function projectSessionDirectory(
        machine_ids = excluded.machine_ids,
        user_ids = excluded.user_ids,
        search_text = sessions.session_directory_search_text(
-         excluded.title, d.task_title, d.agent_name, coalesce(excluded.project_id, d.project_id),
+         coalesce(excluded.title, CASE WHEN (to_jsonb(d)->>'event_projection_ready')::boolean THEN nullif(btrim(to_jsonb(d)->>'recorded_catalog_title'), '') END), d.task_title, d.agent_name, coalesce(excluded.project_id, d.project_id),
          coalesce(excluded.git_repo, d.git_repo), coalesce(excluded.git_branch, d.git_branch),
          excluded.model, d.short_summary),
        projected_at = now()

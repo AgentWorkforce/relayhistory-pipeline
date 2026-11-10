@@ -389,8 +389,8 @@ describe("the live gate: the marker is never the sole authority", () => {
       work({
         async query(text: string) {
           seen.push(text);
-          if (text.startsWith("SELECT name FROM sessions.__96bulls_migrations"))
-            return { rows: expected.names.map((name) => ({ name })) } as never;
+          if (text.startsWith("SELECT name, sha256 FROM sessions.__96bulls_migrations"))
+            return { rows: expected.names.map((name) => ({ name, sha256: expected.shas?.[name] ?? "" })) } as never;
           if (text.startsWith("SELECT generation, status FROM"))
             return {
               rows: [{ generation: expected.generation, status: "pass" }],
@@ -405,7 +405,7 @@ describe("the live gate: the marker is never the sole authority", () => {
     expect(seen[1]).toMatch(/^SET LOCAL statement_timeout = \d+$/);
     expect(seen[2]).toBe("SELECT set_config('hoopdb.db_mode', $1, true)");
     expect(seen[3]).toStartWith(
-      "SELECT name FROM sessions.__96bulls_migrations",
+      "SELECT name, sha256 FROM sessions.__96bulls_migrations",
     );
     expect(seen[4]).toStartWith("SELECT generation, status FROM");
     expect(seen[5]).toBe(VERIFY);

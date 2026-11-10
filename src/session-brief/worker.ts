@@ -43,6 +43,7 @@ import {
   type ClaimedWakeup,
 } from "./store.ts";
 import {
+  SESSION_BRIEF_CANONICAL_ENGINE_VERSION,
   SESSION_BRIEF_ENGINE_VERSION,
   SESSION_BRIEF_PROMPT_VERSION,
 } from "./versions.ts";
@@ -54,6 +55,8 @@ export interface BriefDeps {
   /** Null when no model is configured: nothing is claimed. */
   transport: AnalysisModelTransport | null;
   config: BriefConfig;
+  /** Explicit self-host canonical-object input. Absent preserves the raw/export reader. */
+  canonicalInput?: import("./canonical-input.ts").CanonicalBriefInput;
 }
 
 export type BriefResult =
@@ -92,6 +95,9 @@ function failureOf(error: unknown): { code: string; retryable: boolean } {
 /** One claimed wakeup, start to finish. Never throws for a session-level failure. */
 export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<BriefResult> {
   const { db, config } = deps;
+  let canonicalSessionId: string | undefined;
+  const publish = (revisions: Record<string, number>, outcome: Parameters<typeof recordBrief>[3]) =>
+    recordBrief(db, w, revisions, outcome, { canonicalSessionId });
   const pointers = await livePointers(db, w);
   if (!pointers.length) {
     await finishWakeup(db, w, { idleSeconds: config.idleSeconds, maxWaitSeconds: config.maxWaitSeconds });
@@ -123,16 +129,18 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
     }
   };
   try {
-    const built = await buildBriefInput(deps, w, pointers);
+    const built = deps.canonicalInput ? await deps.canonicalInput(db, w, pointers) : await buildBriefInput(deps, w, pointers);
+    canonicalSessionId = built.canonicalSessionId;
     if (built.kind !== "ready") {
-      await recordBrief(db, w, built.sourceRevisions, { status: built.kind, error: built.error });
+      await publish(built.sourceRevisions, { status: built.kind, error: built.error });
       await finish();
       return built.kind;
     }
     const print = fingerprint(built.input);
     // A brief from another prompt (v2 had no state) is regenerated even for the same input.
-    if (stored?.title && stored.briefFingerprint === print && stored.promptVersion === SESSION_BRIEF_PROMPT_VERSION) {
-      const { written } = await recordBrief(db, w, built.sourceRevisions, {
+    if (stored?.title && stored.briefFingerprint === print && stored.promptVersion === SESSION_BRIEF_PROMPT_VERSION &&
+        (!deps.canonicalInput || stored.engineVersion === SESSION_BRIEF_CANONICAL_ENGINE_VERSION)) {
+      const { written } = await publish(built.sourceRevisions, {
         status: "reused",
         fingerprint: print,
       });
@@ -147,7 +155,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
       globalDailyCap: config.globalDailyCap,
     });
     if (!admission.admitted) {
-      await recordBrief(db, w, built.sourceRevisions, {
+      await publish(built.sourceRevisions, {
         status: "rate_limited",
         error:
           admission.reason === "capped"
@@ -166,13 +174,13 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
     const scrubbed = scrubBrief(summary.summary);
     // The provider's reported model id, unless it is not one the column accepts.
     const model = MODEL_PATTERN.test(summary.model) ? summary.model : config.model;
-    const { written } = await recordBrief(db, w, built.sourceRevisions, {
+    const { written } = await publish(built.sourceRevisions, {
       status: "ready",
       text: {
         ...scrubbed,
         fingerprint: print,
         promptVersion: SESSION_BRIEF_PROMPT_VERSION,
-        engineVersion: SESSION_BRIEF_ENGINE_VERSION,
+        engineVersion: deps.canonicalInput ? SESSION_BRIEF_CANONICAL_ENGINE_VERSION : SESSION_BRIEF_ENGINE_VERSION,
         model,
         messageCount: built.input.messages.length,
         shortenedMessages: built.input.messages.filter((m) => m.truncated).length,
@@ -209,7 +217,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
       });
       return "retrying";
     }
-    await recordBrief(db, w, sourceRevisions, { status: "failed", error: failure.code });
+    await publish(sourceRevisions, { status: "failed", error: failure.code });
     await finish();
     log.warn("session brief failed", {
       stage: "session-brief",
@@ -235,18 +243,20 @@ export function briefTick(deps: Omit<BriefDeps, "db">) {
     const full: BriefDeps = { ...deps, db };
     if (now.getTime() - lastPrune >= 60_000) {
       lastPrune = now.getTime();
-      const pruned = await pruneStaleWakeups(db, deps.config.wakeMaxAgeHours);
-      await pruneAttempts(db);
+      const pruned = await pruneStaleWakeups(db, deps.config.wakeMaxAgeHours, 5000, deps.config.workspaceIds);
+      await pruneAttempts(db, deps.config.workspaceIds);
       if (pruned) log.info("stale session brief wakeups dropped", { stage: "session-brief", count: pruned });
     }
     if (deps.config.sweepSeconds > 0 && now.getTime() - lastSweep >= deps.config.sweepSeconds * 1000) {
       lastSweep = now.getTime();
-      const armed = await sweepUnbriefed(db, 100);
+      const armed = await sweepUnbriefed(db, 100, { includeChanged: deps.canonicalInput !== undefined,
+        refreshCanonicalInput: deps.canonicalInput !== undefined, recoverJsonlInputFailures: deps.canonicalInput !== undefined,
+        workspaceIds: deps.config.workspaceIds });
       if (armed) log.info("session brief sweep armed", { stage: "session-brief", count: armed });
     }
     if (!deps.transport) return null;
     const counts = {} as Record<BriefResult, number>;
-    const claimed = await claimWakeups(db, deps.config.batch, deps.config.leaseSeconds);
+    const claimed = await claimWakeups(db, deps.config.batch, deps.config.leaseSeconds, deps.config.workspaceIds);
     for (const w of claimed) {
       const result = await briefSession(full, w);
       counts[result] = (counts[result] ?? 0) + 1;

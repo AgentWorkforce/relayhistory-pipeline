@@ -50,3 +50,28 @@ export async function readConnection(run: Run, t: { orgId: string; workspaceId: 
   const c = (await run("SELECT history.probe_connection($1, $2, $3) AS c", [t.orgId, t.workspaceId, t.userId])).rows[0]?.c as { lastSeenAt: string; progress: unknown } | null | undefined;
   return c ? { lastSeenAt: new Date(c.lastSeenAt).toISOString(), progress: c.progress ?? null } : { lastSeenAt: null, progress: null };
 }
+
+export interface SessionReceipt {
+  sessionCount: number;
+  lastReceivedAt: string | null;
+  sources: string[];
+}
+
+/**
+ * Zero-Neon lane D / W4: the session counters of relayhistory's GET /v1/onboarding/status,
+ * from the ingest ledger plus the imported pre-cutover rollups (history-migrations/0003).
+ * A malformed result throws, so the route answers 503 instead of a wrong count.
+ */
+export async function readSessionReceipt(run: Run, t: { orgId: string; workspaceId: string; userId: string }): Promise<SessionReceipt> {
+  const r = (await run("SELECT history.probe_session_receipt($1, $2, $3) AS r", [t.orgId, t.workspaceId, t.userId])).rows[0]?.r as
+    { sessionCount?: unknown; lastReceivedAt?: unknown; sources?: unknown } | null | undefined;
+  const count = r?.sessionCount;
+  const at = r?.lastReceivedAt;
+  const sources = r?.sources;
+  if (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0 ||
+      !(at === null || (typeof at === "string" && Number.isFinite(Date.parse(at)))) ||
+      !Array.isArray(sources) || !sources.every((s) => typeof s === "string") ||
+      (count === 0) !== (at === null))
+    throw Object.assign(new Error("onboarding receipt is malformed"), { code: "onboarding_receipt_malformed" });
+  return { sessionCount: count, lastReceivedAt: at === null ? null : new Date(at as string).toISOString(), sources: sources as string[] };
+}

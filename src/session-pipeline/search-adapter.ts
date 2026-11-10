@@ -23,7 +23,7 @@ export interface SearchProjectionState {
   /** Must include unknown/missing projection state for live pointer scopes,
    * including a first failed pass that wrote no index rows. Tenant is verified.
    * Return cap+1 rows or overflow; never silently truncate a completeness check. */
-  partials(tenant: SearchTenant, options: { sessionId?: string; limit: number }): Promise<{ sessions: readonly string[]; overflow: boolean }>;
+  partials(tenant: SearchTenant, options: { sessionId?: string; limit: number; after?: string }): Promise<{ sessions: readonly string[]; overflow: boolean }>;
 }
 
 export interface SearchServiceBinding {

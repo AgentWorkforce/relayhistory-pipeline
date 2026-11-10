@@ -35,8 +35,11 @@ import { PGlite } from "@electric-sql/pglite";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { createSearchIndexRegistry } from "@rhc/adapters/defaults.ts";
 import { composeSearchService } from "../../shared/search-composition.ts";
+import { createPostgresSearchIndex, TENANT_SETTINGS_SQL, type TenantSqlRunner } from "@rhc/search-index/postgres.ts";
+import { writerTransactionSql } from "../transaction-sql.ts";
 import { createReadApi, AuthError } from "../../session-read-api/app.ts";
 import type { SearchProjectionState } from "../search-adapter.ts";
+import { postgresOutputFactsStore, type OutputFactsStore } from "../output-facts-store.ts";
 
 const TRACE = "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18";
 const NOW = new Date("2026-11-01T12:00:00.000Z");
@@ -207,6 +210,10 @@ function fakeSupabase(live: () => string[], busy: () => boolean = () => false, c
   const tx: SqlExecutor = {
     async query<R>(text: string) {
       calls.push(text.trim().replace(/\s+/g, " "));
+      // This fake models the pre-recorded-title catalog schema explicitly. Metadata
+      // denial/malformed rows remain production errors, not a legacy fallback.
+      if (text.includes("pg_catalog.pg_attribute") && text.includes("recorded_catalog_title"))
+        return { rows: [{ supported: false }] as R[] };
       if (text.includes("pg_try_advisory_xact_lock")) return { rows: [{ ok: !busy() }] as R[] };
       if (text.includes("event_projection_sources")) return { rows: [{ written: true }] as R[] };
       if (text.includes("FROM sessions.session_index") && text.includes("deleted_at IS NULL"))
@@ -218,6 +225,10 @@ function fakeSupabase(live: () => string[], busy: () => boolean = () => false, c
   };
   return { tx, calls, transact: async <T>(work: (tx: SqlExecutor) => Promise<T>) => work(tx) };
 }
+
+/** The in-process PGlite as a superuser test database: one transaction per tenant call. */
+const pgliteTenants = (db: PGlite): TenantSqlRunner => (orgId, workspaceId, work) =>
+  db.transaction(async tx => { await tx.query(TENANT_SETTINGS_SQL, [orgId, workspaceId]); return work(tx); });
 
 function searchDeps(ch: ClickHouseClient, transact: SearchIndexDeps["transact"], limits?: SearchIndexDeps["limits"]): SearchIndexDeps {
   return { transact, reader, store, ch, prefixFor: (org) => `96bulls/${org}`, now: () => NOW, ...(limits ? { limits } : {}) };
@@ -235,7 +246,7 @@ test("registered Postgres projection serves the actual read API, fences stale wr
     async partials(tenant) { expect(tenant).toEqual({ orgId: scope.orgId, workspaceId: scope.workspaceId }); return { sessions: complete ? [] : [scope.sessionId], overflow: false }; },
   };
   const registry = createSearchIndexRegistry();
-  const adapter = composeSearchService({ registry, state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: db }, "writer");
+  const adapter = composeSearchService({ registry, state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: db }, "writer", pgliteTenants(db));
   const index = adapter.index;
   await index.ensureSchema(); // explicit test bootstrap, never service startup
   const deps: SearchIndexDeps = { transact: sb.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => at };
@@ -280,6 +291,153 @@ test("registered Postgres projection serves the actual read API, fences stale wr
   } finally { await db.close(); }
 }, 30_000);
 
+test("self-host output facts (RELAYHISTORY_SELFHOST_OUTPUT_FACTS): off calls no facts function; on writes them through the store on the pass's own transaction", async () => {
+  const db = new PGlite({ extensions: { pg_trgm } });
+  await db.exec("CREATE EXTENSION pg_trgm");
+  let keys = [await writeSession("srv_of", [event("r1", "1", Date.parse(AT), "hello facts")])];
+  const state: SearchProjectionState = { async fromMs() { return 0; }, async record() {}, async partials() { return { sessions: [], overflow: false }; } };
+  const adapter = composeSearchService({ registry: createSearchIndexRegistry(), state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: db }, "writer", pgliteTenants(db));
+  await adapter.index.ensureSchema();
+  const calls: Array<[string, SqlExecutor]> = [];
+  const spy = (tx: SqlExecutor): OutputFactsStore => ({
+    async previousState() { calls.push(["previousState", tx]); return { range: null, version: 0 }; },
+    async reconcile(_s, input, v) { calls.push(["reconcile", tx]); expect(v).toBe(0); return { inserted: input.eventFacts.length + input.outputFacts.length, deleted: 0, complete: input.complete, reasons: input.reasons, applied: true }; },
+    async recordState(_s, st) { calls.push(["recordState", tx]); expect(st.sourceVersion).toBe(0); return true; },
+    async erase() { calls.push(["erase", tx]); },
+    async schemaReady() { calls.push(["schemaReady", tx]); return { ready: true, present: true }; },
+  });
+  try {
+    // Off (no store): no facts SQL at all, and no facts in the result.
+    const off = fakeSupabase(() => keys);
+    const offResult = await indexSearchScope(scope, { transact: off.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => NOW });
+    expect(offResult).toMatchObject({ complete: true });
+    expect(offResult.outputFacts).toBeUndefined();
+    expect(off.calls.some((c) => c.includes("output_facts"))).toBe(false);
+    // On: the store is built from, and every call runs on, the pass's own transaction.
+    const on = fakeSupabase(() => keys);
+    const onResult = await indexSearchScope(scope, { transact: on.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => NOW, outputFactsStore: spy });
+    expect(onResult).toMatchObject({ complete: true, outputFacts: { complete: true } });
+    expect(calls.map(([name]) => name)).toEqual(["previousState", "reconcile", "recordState"]);
+    expect(calls.every(([, tx]) => tx === on.tx)).toBe(true);
+    // The real Postgres store sends its SQL to that same executor.
+    const real = fakeSupabase(() => keys);
+    const realResult = await indexSearchScope(scope, { transact: real.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => NOW, outputFactsStore: postgresOutputFactsStore });
+    expect(real.calls.some((c) => c.includes("sessions.output_facts_reconcile("))).toBe(true);
+    // The fake database answers no row: the store reads that as a stale refusal and records no state.
+    expect(realResult.outputFacts?.reasons).toContain("output_facts_stale_source_version");
+    expect(real.calls.some((c) => c.includes("sessions.output_facts_record_state("))).toBe(false);
+    // Erasure deletes the scope's facts on the same transaction.
+    calls.length = 0;
+    keys = [];
+    const gone = fakeSupabase(() => keys);
+    expect(await indexSearchScope(scope, { transact: gone.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => NOW, outputFactsStore: spy })).toMatchObject({ complete: true, reasons: ["erased"] });
+    expect(calls.map(([name]) => name)).toEqual(["erase"]);
+    expect(calls[0]![1]).toBe(gone.tx);
+    // The ClickHouse flag and the Postgres store are exclusive.
+    await expect(indexSearchScope(scope, { transact: gone.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, outputFacts: true, outputFactsStore: spy })).rejects.toThrow();
+  } finally { await db.close(); }
+}, 30_000);
+
+test("forced tenant RLS on transcript_events: a non-superuser writer's scope pass still writes and erases; readers see only their tenant; a tampered policy refuses bootstrap", async () => {
+  const db = new PGlite({ extensions: { pg_trgm } });
+  // Synthetic isolated roles only: PGlite's default login is a superuser,
+  // which RLS never binds, so every bound statement below runs as one of these.
+  await db.exec(`CREATE EXTENSION pg_trgm; CREATE ROLE search_owner; CREATE ROLE search_reader;
+    DO $$ BEGIN EXECUTE format('GRANT CREATE ON DATABASE %I TO search_owner', current_database()); END $$`);
+  const asOwner = async <T>(work: () => Promise<T>) => { await db.exec("SET ROLE search_owner"); try { return await work(); } finally { await db.exec("RESET ROLE"); } };
+  const bootstrap = createPostgresSearchIndex({ client: db });
+  await asOwner(async () => {
+    await bootstrap.ensureSchema(); // the owner bootstrap: FORCE binds this owner too
+    await bootstrap.ensureSchema(); // idempotent
+    await db.exec("GRANT USAGE ON SCHEMA search_index TO search_reader; GRANT SELECT ON search_index.transcript_events TO search_reader");
+  });
+  let keys = [await writeSession("srv_bb", [event("r1", "1", Date.parse(AT), "hello one"), event("r2", "1", Date.parse(AT) + 1, "hello two")])];
+  const sb = fakeSupabase(() => keys);
+  const state: SearchProjectionState = {
+    async fromMs() { return 0; },
+    async record() {},
+    async partials() { return { sessions: [], overflow: false }; },
+  };
+  // The writer runtime's binding (lambda.ts): index SQL joins the pass's one
+  // transaction, here as the non-superuser owner. Metadata SQL stays on the fake.
+  const writer = writerTransactionSql(db);
+  const adapter = composeSearchService({ registry: createSearchIndexRegistry(), state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: writer.sql }, "writer");
+  const pass = <T>(work: () => Promise<T>) => db.transaction(async tx => { await tx.exec("SET LOCAL ROLE search_owner"); return writer.run(tx, work); });
+  const deps: SearchIndexDeps = { transact: work => pass(() => sb.transact(work)), reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => NOW };
+  // The read service's runner (liveness.ts poolTenantRunner) as the read role.
+  const tenantRunner: TenantSqlRunner = (orgId, workspaceId, work) => db.transaction(async tx => {
+    await tx.exec("SET LOCAL ROLE search_reader");
+    await tx.query(TENANT_SETTINGS_SQL, [orgId, workspaceId]);
+    return work(tx);
+  });
+  const readerIndex = createPostgresSearchIndex({ client: db, tenantRunner });
+  const tenant = { orgId: scope.orgId, workspaceId: scope.workspaceId };
+  const other = { orgId: "org_2", workspaceId: scope.workspaceId };
+  const hits = async (t: typeof tenant) => (await readerIndex.query({ tenant: t, order: "asc", limit: 100 })).hits.map(h => [h.orgId, h.eventId]);
+  const unfiltered = (role: string, settings?: typeof tenant) => db.transaction(async tx => {
+    await tx.exec(`SET LOCAL ROLE ${role}`);
+    if (settings) await tx.query(TENANT_SETTINGS_SQL, [settings.orgId, settings.workspaceId]);
+    return (await tx.query<{ org_id: string }>("SELECT org_id FROM search_index.transcript_events ORDER BY org_id")).rows.map(r => r.org_id);
+  });
+  try {
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, inserted: 2 });
+    const [first] = (await readerIndex.query({ tenant, order: "asc", limit: 1 })).hits;
+    // One writer transaction, two tenants: each statement binds its own tenant.
+    expect(await pass(() => adapter.index.upsert([
+      { ...first!, ...other, eventId: "b1", fingerprint: "b1", version: 1, taskRefId: "", deliveryRecordId: "" },
+      { ...first!, eventId: "a3", fingerprint: "a3", version: 1, taskRefId: "", deliveryRecordId: "" },
+    ]))).toEqual({ written: 2 });
+    expect((await hits(tenant)).map(([org]) => org)).toEqual([scope.orgId, scope.orgId, scope.orgId]);
+    expect(await hits(other)).toEqual([["org_2", "b1"]]);
+    // Without any WHERE clause the policy alone isolates: the reader sees only the
+    // bound tenant, nothing with no settings, and FORCE binds the owner as well.
+    expect(await unfiltered("search_reader", other)).toEqual(["org_2"]);
+    expect(await unfiltered("search_reader")).toEqual([]);
+    expect(await unfiltered("search_owner")).toEqual([]);
+    expect(await unfiltered("search_reader", { ...tenant, workspaceId: "ws_other" })).toEqual([]);
+    // A writer with no open transaction cannot carry the settings to its
+    // statement. Every call throws rather than writing, reading or erasing
+    // nothing: an erase that matched no row under RLS would lose the erasure.
+    const unbound = { code: "unavailable", detail: "tenant_unbound" };
+    const stored = async () => (await db.query<{ org_id: string }>("SELECT org_id FROM search_index.transcript_events ORDER BY org_id")).rows.length;
+    const before = await stored();
+    await expect(asOwner(() => bootstrap.upsert([{ ...first!, eventId: "loose", fingerprint: "loose", version: 1, taskRefId: "", deliveryRecordId: "" }]))).rejects.toMatchObject(unbound);
+    await expect(asOwner(() => bootstrap.query({ tenant, order: "asc", limit: 10 }))).rejects.toMatchObject(unbound);
+    await expect(asOwner(() => bootstrap.eraseScope({ ...tenant, source: scope.harness, sessionIds: [scope.sessionId] }))).rejects.toMatchObject(unbound);
+    await expect(asOwner(() => bootstrap.deleteEvents(tenant, [first!]))).rejects.toMatchObject(unbound);
+    expect(await stored()).toBe(before);
+    // Settings bound to one tenant never admit a write that moves a row to another.
+    await expect(db.transaction(async tx => {
+      await tx.exec("SET LOCAL ROLE search_owner");
+      await tx.query(TENANT_SETTINGS_SQL, [tenant.orgId, tenant.workspaceId]);
+      await tx.query("UPDATE search_index.transcript_events SET org_id = 'org_2'");
+    })).rejects.toMatchObject({ code: "42501" });
+    // Erasure through the pass removes only this tenant's scope.
+    keys = [];
+    expect(await indexSearchScope(scope, deps)).toMatchObject({ complete: true, reasons: ["erased"] });
+    expect(await hits(tenant)).toEqual([]);
+    expect(await hits(other)).toEqual([["org_2", "b1"]]);
+    // Drift is refused at bootstrap: an added permissive policy, a rewritten
+    // tenant_only, a narrowed command. Lifting FORCE is re-forced, then verified.
+    for (const [tamper, undo] of [
+      ["CREATE POLICY extra ON search_index.transcript_events USING (true)", "DROP POLICY extra ON search_index.transcript_events"],
+      ["ALTER POLICY tenant_only ON search_index.transcript_events USING (true)", "DROP POLICY tenant_only ON search_index.transcript_events"],
+      ["DROP POLICY tenant_only ON search_index.transcript_events; CREATE POLICY tenant_only ON search_index.transcript_events FOR SELECT USING (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true))", "DROP POLICY tenant_only ON search_index.transcript_events"],
+    ] as const) {
+      await db.exec(tamper);
+      await expect(asOwner(() => bootstrap.ensureSchema())).rejects.toMatchObject({ code: "schema_missing", detail: "tenant_policy_mismatch" });
+      await db.exec(undo);
+      await asOwner(() => bootstrap.ensureSchema());
+    }
+    await db.exec("ALTER TABLE search_index.transcript_events NO FORCE ROW LEVEL SECURITY");
+    await asOwner(() => bootstrap.ensureSchema());
+    expect((await db.query("SELECT relforcerowsecurity AS forced FROM pg_class WHERE oid = 'search_index.transcript_events'::regclass")).rows).toEqual([{ forced: true }]);
+    expect(await hits(other)).toEqual([["org_2", "b1"]]);
+    // The reason the read service refuses a superuser login: RLS never binds it.
+    expect(await unfiltered("postgres")).toEqual(["org_2"]);
+  } finally { await db.close(); }
+}, 30_000);
+
 for (const failure of ["none", "throw", "invalid count"] as const) {
   test(`portable reconciliation batches 5001 stale positions with second-batch failure: ${failure}`, async () => {
     const db = new PGlite({ extensions: { pg_trgm } });
@@ -293,7 +451,7 @@ for (const failure of ["none", "throw", "invalid count"] as const) {
       async record(_tx, _scope, value) { records.push(value.complete); },
       async partials() { return { sessions: records.at(-1) === true ? [] : [scope.sessionId], overflow: false }; },
     };
-    const adapter = composeSearchService({ registry: createSearchIndexRegistry(), state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: db }, "writer");
+    const adapter = composeSearchService({ registry: createSearchIndexRegistry(), state: () => state }, { env: { SEARCH_INDEX_BACKEND: "postgres" }, sql: db }, "writer", pgliteTenants(db));
     const tenant = { orgId: scope.orgId, workspaceId: scope.workspaceId };
     const deps: SearchIndexDeps = {
       transact: sb.transact, reader, store, adapter, prefixFor: org => `96bulls/${org}`, now: () => NOW,
@@ -961,4 +1119,107 @@ test('independent: erased stale physical alias must preserve live canonical sibl
  const sb=aliasDb(()=>[],()=>[b]);
  await indexSearchScope({...scope,sessionId:'alias_a'},searchDeps(ch.ch,sb.transact));
  expect(ch.final().map(r=>r.content)).toContain('source B');
+});
+
+// SEARCH_INDEX_OUTPUT_FACTS: the same pass writes the Output facts; erasure removes them.
+const OUTPUT_CH_URL = process.env.READ_API_TEST_CLICKHOUSE_URL;
+(OUTPUT_CH_URL ? describe : describe.skip)("search index with outputFacts on a real ClickHouse", () => {
+  test("facts follow the pass (insert once, idempotent re-pass) and erasure; off writes none", async () => {
+    const { freshClickHouse } = await import("../../session-read-api/__tests__/support.ts");
+    const { outputFactsSchemaStatements, OUTPUT_FACTS_TABLE, EVENT_FACTS_TABLE } = await import("../output-facts-schema.ts");
+    const { readSessionOutput } = await import("../../session-read-api/output-query.ts");
+    const ch = await freshClickHouse();
+    try {
+      for (const s of outputFactsSchemaStatements()) await ch.command(s);
+      const count = async (t: string) => Number((await ch.select<{ n: string }>(`SELECT count() AS n FROM ${t} FINAL`))[0]!.n);
+      let keys = [await writeSession("srv_bb", [event("r1", "1", Date.parse(AT), "first answer"), event("r2", "1", Date.parse(AT) + 1000, "second answer")])];
+      const sb = fakeSupabase(() => keys);
+      // Off: transcript_events only.
+      expect(await indexSearchScope(scope, searchDeps(ch, sb.transact))).toMatchObject({ complete: true, inserted: 2 });
+      expect(await count(EVENT_FACTS_TABLE) + await count(OUTPUT_FACTS_TABLE)).toBe(0);
+      const on = { ...searchDeps(ch, sb.transact), outputFacts: true };
+      const first = await indexSearchScope(scope, on);
+      expect(first).toMatchObject({ complete: true, outputFacts: { inserted: 4, deleted: 0 } });
+      expect(await indexSearchScope(scope, on)).toMatchObject({ complete: true, outputFacts: { inserted: 0, deleted: 0 } });
+      expect(await readSessionOutput(ch, { orgId: scope.orgId, workspaceIds: [scope.workspaceId] })).toMatchObject({ agentMessages: 2, commits: 0 });
+      const facts = async () => (await ch.select<{ complete: number }>("SELECT complete FROM output_facts_session_state FINAL")).map((r) => Number(r.complete));
+      expect(await facts()).toEqual([1]);
+      // A partial read records the facts as owed, separately from search's needs_full.
+      expect(await indexSearchScope(scope, { ...on, limits: { maxScopeEvents: 1 } })).toMatchObject({ complete: false, partial: true });
+      expect(await facts()).toEqual([0]);
+      expect(await indexSearchScope(scope, on)).toMatchObject({ complete: true, outputFacts: { complete: true } });
+      expect(await facts()).toEqual([1]);
+      keys = [];
+      expect(await indexSearchScope(scope, on)).toMatchObject({ complete: true, reasons: ["erased"] });
+      expect(await count(EVENT_FACTS_TABLE) + await count(OUTPUT_FACTS_TABLE)).toBe(0);
+    } finally {
+      await ch.drop();
+    }
+  }, 120_000);
+
+  test("P1-e: erasure purges existing fact tables even with the flag OFF", async () => {
+    const { freshClickHouse } = await import("../../session-read-api/__tests__/support.ts");
+    const { outputFactsSchemaStatements, OUTPUT_FACTS_TABLE, EVENT_FACTS_TABLE } = await import("../output-facts-schema.ts");
+    const ch = await freshClickHouse();
+    try {
+      for (const st of outputFactsSchemaStatements()) await ch.command(st);
+      const count = async (t: string) => Number((await ch.select<{ n: string }>(`SELECT count() AS n FROM ${t} FINAL`))[0]!.n);
+      let keys = [await writeSession("srv_bb", [event("r1", "1", Date.parse(AT), "answer")])];
+      const sb = fakeSupabase(() => keys);
+      await indexSearchScope(scope, { ...searchDeps(ch, sb.transact), outputFacts: true });
+      expect(await count(EVENT_FACTS_TABLE) + await count(OUTPUT_FACTS_TABLE)).toBeGreaterThan(0);
+      keys = [];
+      expect(await indexSearchScope(scope, searchDeps(ch, sb.transact))).toMatchObject({ complete: true, reasons: ["erased"] });
+      expect(await count(EVENT_FACTS_TABLE) + await count(OUTPUT_FACTS_TABLE)).toBe(0);
+    } finally {
+      await ch.drop();
+    }
+  }, 120_000);
+
+  test("P1-d: a pass that dies between its fact writes and its final state leaves the scope incomplete", async () => {
+    const { freshClickHouse } = await import("../../session-read-api/__tests__/support.ts");
+    const { outputFactsSchemaStatements, OUTPUT_FACTS_TABLE } = await import("../output-facts-schema.ts");
+    const ch = await freshClickHouse();
+    try {
+      for (const st of outputFactsSchemaStatements()) await ch.command(st);
+      const keys = [await writeSession("srv_bb", [event("r1", "1", Date.parse(AT), "answer")])];
+      const sb = fakeSupabase(() => keys);
+      const torn: ClickHouseClient = {
+        database: ch.database,
+        command: (q, o) => ch.command(q, o),
+        select: (q, o) => ch.select(q, o),
+        insert: async (table, rows, o) => {
+          if (table === OUTPUT_FACTS_TABLE) throw new Error("crash after event facts were written");
+          return ch.insert(table, rows, o);
+        },
+      };
+      await expect(indexSearchScope(scope, { ...searchDeps(torn, sb.transact), outputFacts: true })).rejects.toThrow("crash");
+      const state = await ch.select<{ complete: number }>("SELECT complete FROM output_facts_session_state FINAL");
+      expect(state.map((r) => Number(r.complete))).toEqual([0]);
+      // The next good pass makes it complete again.
+      expect(await indexSearchScope(scope, { ...searchDeps(ch, sb.transact), outputFacts: true })).toMatchObject({ outputFacts: { complete: true } });
+      expect((await ch.select<{ complete: number }>("SELECT complete FROM output_facts_session_state FINAL")).map((r) => Number(r.complete))).toEqual([1]);
+      // P3: every pass here runs at the same fixed `now`; versions still strictly increase.
+      const v1 = Number((await ch.select<{ v: string }>("SELECT max(version) AS v FROM output_facts_session_state"))[0]!.v);
+      await indexSearchScope(scope, { ...searchDeps(ch, sb.transact), outputFacts: true });
+      const v2 = Number((await ch.select<{ v: string }>("SELECT max(version) AS v FROM output_facts_session_state"))[0]!.v);
+      expect(v2).toBeGreaterThan(v1);
+    } finally {
+      await ch.drop();
+    }
+  }, 120_000);
+
+  test("flag on before the DDL: no fact write, a clear reason, and search is unaffected", async () => {
+    const { freshClickHouse } = await import("../../session-read-api/__tests__/support.ts");
+    const ch = await freshClickHouse();
+    try {
+      const keys = [await writeSession("srv_bb", [event("r1", "1", Date.parse(AT), "answer")])];
+      const sb = fakeSupabase(() => keys);
+      expect(await indexSearchScope(scope, { ...searchDeps(ch, sb.transact), outputFacts: true })).toMatchObject({
+        complete: true, inserted: 1, outputFacts: { inserted: 0, complete: false, reasons: ["output_facts_schema_missing"] },
+      });
+    } finally {
+      await ch.drop();
+    }
+  }, 120_000);
 });

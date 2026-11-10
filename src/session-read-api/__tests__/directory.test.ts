@@ -27,6 +27,7 @@ import {
 } from "../directory.ts";
 import { poolTenantRunner } from "../liveness.ts";
 import { memoryLiveness } from "./support.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 
 const ID: VerifiedIdentity = { userId: "u-1", orgId: "org-a", workspaceId: "ws-a", scopes: ["rth:read"] };
 
@@ -291,10 +292,10 @@ describe("routes not yet migrated answer 501 with the store they need", () => {
     const { get } = api({ directory: stubDirectory().directory });
     for (const [path, reason] of [
       ["/v1/sessions/s-1/timing?workspace=ws-a&source=codex", "timing_not_configured"],
-      ["/v1/sessions/output?workspace=ws-a&since=2026-10-01T00:00:00Z&until=2026-10-02T00:00:00Z", "output_not_migrated"],
+      ["/v1/sessions/output?workspace=ws-a&since=2026-10-01T00:00:00Z&until=2026-10-02T00:00:00Z", "output_not_configured"],
       ["/v1/sessions/s-1/turns?workspace=ws-a", "turns_not_configured"],
       ["/v1/sessions/s-1/metadata?workspace=ws-a", "turns_not_configured"],
-      ["/v1/digest/daily?workspace=ws-a&date=2026-10-01", "digest_not_migrated"],
+      ["/v1/digest/daily?workspace=ws-a&date=2026-10-01", "digest_not_configured"],
     ] as const) {
       const r = await get(path);
       expect(r.status, path).toBe(501);
@@ -355,7 +356,7 @@ describe("sqlDirectory against Supabase without migration 20261105034000", () =>
     const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
     open.push(db);
     await db.exec(read("supabase/tests/supabase_shim.sql"));
-    for (const f of ["session_directory_search_worker", "session_token_verifier", "session_ingest_roles", "session_read_api_roles"]) await db.exec(read(`supabase/bootstrap/${f}.sql`));
+    for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
     for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
       if (file.startsWith("20261105034000")) continue;
       await db.exec(read(`supabase/migrations/${file}`));

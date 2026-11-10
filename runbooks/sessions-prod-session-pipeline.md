@@ -224,8 +224,12 @@ controls them:
   `openai_api_key: ($key | rtrimstr("\n"))` to its output object. Do not use
   `--arg key "$(op read …)"`; command substitution would expose the key in
   `jq`'s argv.
-- Historical sessions are not enqueued: `SESSION_BRIEF_SWEEP_SECONDS` stays 0.
-  A backfill needs its own approval and budget.
+- Historical sessions are not enqueued unless `briefs.sweepSeconds` is set: it emits
+  `SESSION_BRIEF_SWEEP_SECONDS` (an integer 0-86400; absent = not emitted, so the worker
+  default 0, off). Each sweep queues up to 100 indexed sessions that have no brief row at
+  all, under the same budgets. Setting it is a budgeted backfill and needs its own
+  approval. Sessions holding a Neon-backfilled title (docs/brief-titles.md) have a brief
+  row, so the sweep never re-briefs them; new evidence does.
 
 **Turning them on (each step needs Khaliq's OK):**
 
@@ -250,6 +254,40 @@ controls them:
 update). For an immediate stop, run
 `aws events disable-rule --name 96bulls-aws-sessions-prod-session-brief`.
 Then reconcile the inputs, since the next capture would show the drift.
+
+## Buffered search feed
+
+The stack defines a one-minute EventBridge rule for the buffered search feed. It stays DISABLED, and neither
+feed variable is set, until `transcriptStore.sessionPipeline.bufferedSearchFeed` is
+`{ enabled: true, gateDeclared: "buffered-search-gate/v1" }` with `searchIndex: true`. `gateDeclared` is an
+operator's assertion that the read Worker is already deployed and verified with the gate on; the deployment
+does not prove it. No credential is wired here: the feeder reads `buffered_search_feed_database_url` and
+`buffered_search_feed_database_ca_pem` from the pipeline secret and stays off without a valid login.
+
+Optional feed tuning under `bufferedSearchFeed`; each is set on the ingest runtime only when provided, otherwise the feeder's own default applies:
+
+- `pageSize` sets `INGEST_BUFFERED_SEARCH_FEED_PAGE` (integer 1 to 200; feeder default 50).
+- `stagesPerSecond` sets `INGEST_BUFFERED_SEARCH_FEED_RATE` (integer 1 to 50; feeder default 5).
+- `budgetMs` sets `INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS` (integer 5000 to 240000; feeder default 50000).
+- `secondVersion: true` sets `INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION=on` (the S version encoding; the feeder refuses `enabled` without it). Absent or `false`: not set (feeder default off).
+- `settleSeconds` sets `INGEST_BUFFERED_SEARCH_FEED_SETTLE_S` (integer 180 to 3600; feeder default 300).
+
+Rolling out this rule alone creates only the DISABLED schedule and its permission. Arming it is a production
+step that needs Khaliq's explicit OK and follows the buffered search activation order: ClickHouse columns,
+read gate verified, then feeder. Do not arm it before the later-erasure delete lane for ClickHouse exists.
+
+### Buffered erasure delete
+
+A second one-minute rule sends `{"bufferedErasureDelete":true}` to the later-erasure delete lane
+(`src/session-pipeline/buffered-erasure-delete.ts`). It stays DISABLED, and `INGEST_BUFFERED_ERASURE_DELETE` is not
+set, until `transcriptStore.sessionPipeline.bufferedErasureDelete` is `{ enabled: true }`. That needs
+`bufferedSearchFeed.gateDeclared: "buffered-search-gate/v1"` and `searchIndex: true`; it then also sets
+`BUFFERED_SEARCH_FEED_GATE_DECLARED`, even with the feed itself off. It uses the feeder's login from the pipeline
+secret. Optional, each set only when provided: `pageSize` (`INGEST_BUFFERED_ERASURE_PAGE`, 1 to 200, default 25),
+`stagesPerSecond` (`INGEST_BUFFERED_ERASURE_RATE`, 1 to 20, default 2), `budgetMs`
+(`INGEST_BUFFERED_ERASURE_BUDGET_MS`, 5000 to 240000, default 40000). Its rule and permission roll out as their own
+reviewed plan phase ("session buffered erasure delete rollout"), never together with the feed's rule. Arming it is
+a production step that needs Khaliq's explicit OK.
 
 ## Repo tag rename (one time, before the read API rollout)
 

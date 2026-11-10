@@ -1,0 +1,51 @@
+/** Read-only generation census: no row locks, no updates, no rebind. */
+import {execFileSync} from "node:child_process";
+import {readFileSync} from "node:fs";
+import {createHash} from "node:crypto";
+import pg from "pg";
+import {parseCliLogin} from "../../scripts/schema-release-owner-operator-plan.ts";
+import {ownerApplySourceFiles} from "../../scripts/schema-release-owner-apply.ts";
+import {generation} from "../../src/hoopdb/migrate.ts";
+import {ROLE_VALIDATION_TABLE,ROLE_VALIDATION_NAME} from "../../src/shared/db.ts";
+import {SUPABASE_PROD_CA_2021} from "../../src/session-pipeline/supabase-ca.ts";
+const ROOT="/home/khaliqgant/Projects/AgentWorkforce/sessions-pipeline-worktrees/root-readonly-release-f9409ccb-20261107";
+const SHA="f9409ccb9e46c3f100cf3017847d8ed62bc716c7",G1="78c7b28e5ebce7f5f534a1f3f41a55845251e950b6c4c49f676f2bda358c91d6",G2="e778dbb6cb68bc0e8939797691565db0b1dd8d357d7d790b375036e0070923ce",PROJECT="pyamkrhoyszgzirqqffq",HOST="aws-0-us-east-1.pooler.supabase.com";
+const no=(code:string):never=>{throw Object.assign(new Error(code),{code});};
+const env=Object.fromEntries(["PATH","HOME","XDG_CONFIG_HOME","XDG_DATA_HOME","DBUS_SESSION_BUS_ADDRESS"].flatMap(k=>process.env[k]?[[k,process.env[k]!]]:[]));
+const run=(exe:string,args:string[])=>execFileSync(exe,args,{cwd:ROOT,env,encoding:"utf8",stdio:["ignore","pipe","pipe"],timeout:30000,maxBuffer:65536});
+function source(){
+ if(run("git",["rev-parse","HEAD"]).trim()!==SHA)no("source_mismatch");
+ const files=[...run("git",["diff","HEAD","--name-only","-z"]).split("\0"),...run("git",["ls-files","--others","--exclude-standard","-z"]).split("\0")].filter(Boolean);
+ ownerApplySourceFiles(files,files.includes("supabase/.temp/cli-latest")?readFileSync(ROOT+"/supabase/.temp/cli-latest","utf8"):undefined);
+}
+async function main(){
+ source();if(await generation()!==G2)no("source_generation");
+ const sql=readFileSync(ROOT+"/.96bulls/role-inventory/post-cutover-supabase-ack-all-org-daily-draft-20261107.sql","utf8");
+ const sqlSha256="004e9baa07cecfcf663848c0bd421cafdc94aecd3d5310a8319b3c5ba4c792a6";
+ if(createHash("sha256").update(sql).digest("hex")!==sqlSha256)no("sql_sha_mismatch");
+ const startAt="2026-11-05T05:33:45Z",endAt="2026-11-07T20:00:00Z";
+ if(!Number.isFinite(Date.parse(endAt))||Date.parse(endAt)<=Date.parse(startAt)||Date.parse(endAt)-Date.parse(startAt)>14*86400000||new Date(endAt).getUTCMinutes()!==0)no("parameter_shape");
+ const cli="/home/khaliqgant/.local/bin/supabase";if(run(cli,["--version"]).trim()!=="2.122.0")no("cli_version");
+ let raw=run(cli,["db","dump","--linked","--project-ref",PROJECT,"--dry-run"]);const login=parseCliLogin(raw);raw="";
+ const c=new pg.Client({host:HOST,port:5432,database:"postgres",user:"cli_login_postgres."+PROJECT,password:login.password,ssl:{ca:SUPABASE_PROD_CA_2021,rejectUnauthorized:true,servername:HOST},connectionTimeoutMillis:10000,query_timeout:5000,options:"-c default_transaction_read_only=on -c statement_timeout=3000 -c lock_timeout=250 -c idle_in_transaction_session_timeout=10000",application_name:"96bulls-post-cutover-daily-ack-readonly"});login.password="";c.on("error",()=>{});
+ const startedAt=new Date().toISOString();let connected=false,began=false,phase="connect",aggregateExecuted=false;let preflight:any=null;
+ const base=()=>({version:1,kind:"post_cutover_all_org_daily_ack_readonly",startedAt,sqlSha256,sourceSha:SHA,project:PROJECT,startAt,endAt,executionRole:"current_user postgres / session_user cli_login_postgres; READ ONLY",preflight,aggregateExecuted,productionWrites:false});
+ try{
+  await c.connect();connected=true;phase="preflight";await c.query("BEGIN READ ONLY");began=true;
+  await c.query("SET LOCAL ROLE postgres");await c.query("SET LOCAL TIME ZONE 'UTC'");await c.query("SET LOCAL search_path=pg_catalog,pg_temp");
+  preflight=(await c.query(`SELECT current_user='postgres' AND session_user='cli_login_postgres' AND current_database()='postgres' AND current_setting('transaction_read_only')='on' AND (SELECT pg_get_userbyid(nspowner)='postgres' FROM pg_namespace WHERE nspname='sessions') AS expected_owner_readonly_target, has_table_privilege(current_user,'sessions.ingest_batches','SELECT') AS table_select, row_security_active('sessions.ingest_batches') AS rls_active, (SELECT relkind='r' AND pg_get_userbyid(relowner)='postgres' FROM pg_class WHERE oid='sessions.ingest_batches'::regclass) AS owner_table`)).rows[0];
+  if(preflight?.expected_owner_readonly_target!==true||preflight?.table_select!==true||preflight?.rls_active!==false||preflight?.owner_table!==true)no("preflight_refused");
+  phase="aggregate";const aggregateStartedAt=new Date().toISOString();aggregateExecuted=true;
+  const result=await c.query(sql,[startAt,endAt]);
+  if(result.rows.length!==1||Object.keys(result.rows[0]).join()!=="aggregate")no("result_shape");
+  const a=result.rows[0].aggregate;const counts=["durable_ack_batches","staged_ack_batches","suppressed_ack_batches","still_buffered_ack_batches","canonical_claim_or_publish_staged_batches"];
+  if(a?.input_scope_valid!==true||!Array.isArray(a.days)||a.days.length<1||a.days.length>15||Object.keys(a).sort().join()!=="days,input_scope_valid")no("result_shape");
+  for(const d of a.days){
+   if(Object.keys(d).sort().join()!==["day_utc",...counts,"newest_ingest_ack_age_at_end"].sort().join()||typeof d.day_utc!=="string"||!/^2026-[0-9]{2}-[0-9]{2}$/.test(d.day_utc)||counts.some(k=>!Number.isSafeInteger(d[k])||d[k]<0)||!["none_in_window","future_unknown","lt1h","1to24h","1to7d","ge7d"].includes(d.newest_ingest_ack_age_at_end))no("result_shape");
+  }
+  const aggregateCompletedAt=new Date().toISOString();await c.query("ROLLBACK");began=false;source();
+  console.log(JSON.stringify({...base(),status:"observed_aggregates",aggregateStartedAt,aggregateCompletedAt,resultRows:result.rows,completedAt:new Date().toISOString()}));
+ }catch(e:any){const x=e?.code;const code=typeof x==="string"&&/^[A-Za-z0-9_]{1,64}$/.test(x)?x:"aggregate_failed";console.log(JSON.stringify({...base(),status:"refused",code,phase,statistics:"UNKNOWN",completedAt:new Date().toISOString()}));process.exitCode=1;}
+ finally{if(connected&&began)await c.query("ROLLBACK").catch(()=>{});await c.end().catch(()=>{});}
+}
+main().catch(e=>{const x=e?.code;const code=typeof x==="string"&&/^[A-Za-z0-9_]{1,64}$/.test(x)?x:"aggregate_failed";console.log(JSON.stringify({status:"refused",code,productionWrites:false}));process.exitCode=1;});

@@ -34,7 +34,7 @@ import {
   type PipelineQueue,
   type StageMessage,
 } from "../shared/vendor.ts";
-import type { ObjectLanded } from "@rhc/lib/pipeline/adapter.ts";
+import { RETENTION_BUCKET_HARNESS, type ObjectLanded } from "@rhc/lib/pipeline/adapter.ts";
 import type { HoopDb,Transact } from "../shared/db.ts";
 import { enrichMessage } from "../shared/enrich.ts";
 import { hoopDbSessionIndex } from "../hoopdb/index.ts";
@@ -88,6 +88,8 @@ export async function indexPointer(landed: ObjectLanded, deps: PointerDeps): Pro
   const location = parseSessionKey(landed.key);
   if (!location) return { status: "ignored", reason: "not_a_session_key" };
   if(location.prefix?.includes('/upload-generations/'))return{status:"ignored",reason:"managed_publication_hint"};
+  // Babysitter retention buckets (src/session-ingest/babysitter-retention.ts) are not sessions.
+  if (location.harness === RETENTION_BUCKET_HARNESS) return { status: "ignored", reason: "retention_bucket" };
   if (location.rest !== "manifest.json") return { status: "ignored", reason: "not_a_manifest" };
   if (landed.bucket && deps.reader.bucket && landed.bucket !== deps.reader.bucket)
     return { status: "ignored", reason: "other_bucket" };
