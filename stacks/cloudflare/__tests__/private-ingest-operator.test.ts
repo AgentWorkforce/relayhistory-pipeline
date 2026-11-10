@@ -803,7 +803,10 @@ describe("operatorSafePlans: async admission follows the resolved mode; a deploy
 
   test("generation overlap cleanup renders one reviewed binding deletion", () => {
     const generation = "e".repeat(64), overlap = "f".repeat(64);
-    expect(() => run(SEVEN, { "session-ingest": "update" }, [
+    // Alchemy emits this env-only Worker change as resource noop plus binding
+    // update/delete rows. The verified adapter presents it to the original
+    // stage guard as the in-place Worker update it represents.
+    expect(() => run(SEVEN, {}, [
       queue("noop"),
       flag("noop", "drain"),
       {

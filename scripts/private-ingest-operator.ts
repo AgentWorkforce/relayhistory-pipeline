@@ -636,6 +636,29 @@ export function resourcePlanView(
     return false;
   });
   if (seen.size !== expected.size) refuse("binding_render_inventory");
+  // Alchemy models a Worker env-only change as binding actions while the
+  // Worker resource row remains noop. After the exact native binding inventory
+  // above is verified, present that one binding-only Worker change to the
+  // original resource contract as an in-place update. Never normalize a plan
+  // that already changes any resource.
+  const resourceRows = lines.flatMap((line, index) => {
+    const match = /^\s*\[([^\]]+)\]\s+(\S+)\s*$/u.exec(line);
+    return match ? [{ index, id: match[1]!, action: match[2]! }] : [];
+  });
+  if (
+    bindingCount > 0 &&
+    resourceRows.every(({ action }) => action === "noop")
+  ) {
+    const worker = resourceRows.filter(({ id }) => id === "session-ingest");
+    if (worker.length !== 1) refuse("binding_render_inventory");
+    lines[worker[0]!.index] = lines[worker[0]!.index]!.replace(
+      /(\[session-ingest\]\s+)noop(\s*)$/u,
+      "$1update$2",
+    );
+    const summaryIndex = lines.findIndex((line) => line.startsWith("Plan:"));
+    if (summaryIndex < 0) refuse("binding_render_summary");
+    lines[summaryIndex] = "Plan: 1 to update";
+  }
   return lines.join("\n");
 }
 export function assertOperatorSnapshot(
