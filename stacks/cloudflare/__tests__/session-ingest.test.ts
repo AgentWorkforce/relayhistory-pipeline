@@ -507,3 +507,67 @@ describe("session ingest: INGEST_SYNC_ADMISSION_FROZEN_RECEIPT (default off)", (
     expect(assertSessionIngestPlanContract(text, text)).toBe("session ingest update");
   });
 });
+
+describe("session ingest: INGEST_CLAIM_LOCK_BUSY (default off)", () => {
+  // Explicit asyncAdmission "off" on the buffered shape: this block isolates the claim lock-busy var.
+  const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };
+  const canonical: SessionIngestInputs = { ...inputs, acceptanceMode: "canonical" };
+  const admissionQueue = { Type: "Cloudflare.Queues.Queue", queueName: ADMISSION_QUEUE };
+
+  it("omitted: no INGEST_CLAIM_LOCK_BUSY key at all, vars and props byte-identical to a stack without the input", () => {
+    for (const p of [inputs, canonical, buffered, { ...buffered, asyncAdmission: "on" as const }]) {
+      const b = resolvedAsyncAdmission(p) !== "off" ? { ...bindings, INGEST_ADMISSION: admissionQueue } : bindings;
+      expect(Object.hasOwn(sessionIngestVars(p), "INGEST_CLAIM_LOCK_BUSY")).toBe(false);
+      const env = (sessionIngestWorkerProps(p, b) as unknown as { env: Record<string, unknown> }).env;
+      expect(Object.hasOwn(env, "INGEST_CLAIM_LOCK_BUSY")).toBe(false);
+      expect(JSON.stringify(sessionIngestWorkerProps(p, b))).toBe(JSON.stringify(sessionIngestWorkerProps({ ...p, claimLockBusy: undefined }, b)));
+    }
+  });
+
+  it('"on": exactly one more var in canonical and buffered acceptance, no new binding or resource', () => {
+    const env = { CLOUDFLARE_ACCOUNT_ID: hex("a") };
+    for (const base of [inputs, canonical, buffered]) {
+      const on = { ...base, claimLockBusy: "on" as const };
+      expect(() => assertSessionIngestInputs(on, refuse)).not.toThrow();
+      expect(sessionIngestVars(on)).toEqual({ ...sessionIngestVars(base), INGEST_CLAIM_LOCK_BUSY: "on" });
+      const p = props(on);
+      expect(p.env.INGEST_CLAIM_LOCK_BUSY).toBe("on");
+      expect(Object.keys(p.env).sort()).toEqual([...Object.keys(props(base).env), "INGEST_CLAIM_LOCK_BUSY"].sort());
+      expect(p.env.INGEST_ADMISSION).toBeUndefined();
+      expect(() => assertNoSecretLiterals(p.env, refuse)).not.toThrow();
+      expect(() => assertPrivateWorker(p, refuse)).not.toThrow();
+      expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: on }, env)).not.toThrow();
+    }
+    // Together with async admission on and the frozen receipt: every var, only async admission's binding.
+    const all = { ...buffered, custodySource: "frozen-supabase" as const, syncAdmissionFrozenReceipt: "on" as const, asyncAdmission: "on" as const, claimLockBusy: "on" as const };
+    expect(() => assertSessionIngestInputs(all, refuse)).not.toThrow();
+    const both = sessionIngestWorkerProps(all, { ...bindings, INGEST_ADMISSION: admissionQueue }) as unknown as { env: Record<string, unknown> };
+    expect(both.env.INGEST_ASYNC_ADMISSION).toBe("on");
+    expect(both.env.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT).toBe("on");
+    expect(both.env.INGEST_CLAIM_LOCK_BUSY).toBe("on");
+    expect(sessionIngestResources()).toBe(SESSION_INGEST_RESOURCES);
+  });
+
+  it('is refused for any value but "on"', () => {
+    for (const base of [inputs, canonical, buffered])
+      for (const value of ["off", "ON", "On", true, 1, "", null, "yes"])
+        expect(() => assertSessionIngestInputs({ ...base, claimLockBusy: value }, refuse)).toThrow('sessionIngest.claimLockBusy must be "on" (omit for off)');
+    const env = { CLOUDFLARE_ACCOUNT_ID: hex("a") };
+    expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: { ...inputs, claimLockBusy: "off" } }, env)).toThrow(/claimLockBusy.*Nothing was changed/);
+  });
+
+  it("an unknown key next to it is still refused", () => {
+    expect(() => assertSessionIngestInputs({ ...inputs, claimLockBusy: "on", claimLockBusyRetryAfter: 5 }, refuse)).toThrow("sessionIngest.claimLockBusyRetryAfter is not a known setting");
+    expect(() => assertSessionIngestInputs({ ...inputs, INGEST_CLAIM_LOCK_BUSY: "on" }, refuse)).toThrow("sessionIngest.INGEST_CLAIM_LOCK_BUSY is not a known setting");
+  });
+
+  it("the var-only change (Worker updated in place, nothing else) plans as a session ingest update", () => {
+    // Same shape as the frozen-receipt var-only test above, for the canonical and the admission-on resource lists.
+    for (const withAdmission of [false, true]) {
+      const resources = sessionIngestResources(withAdmission);
+      const lines = resources.map((r) => `  [${r}] ${r === "session-ingest" ? "update" : "noop"}`).join("\n");
+      const text = `Plan: 1 to update\n${lines}\n`;
+      expect(assertSessionIngestPlanContract(text, text, withAdmission ? "on" : "off")).toBe("session ingest update");
+    }
+  });
+});
