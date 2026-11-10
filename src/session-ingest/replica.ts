@@ -28,7 +28,7 @@
  * batch, and Neon converges when the read routes move off it.
  */
 import { createHash } from "node:crypto";
-import { scrubRecords } from "@rhc/lib/pipeline/raw-chunks.ts";
+import { scrubRecords } from "@rhc/lib/scrub-engine/index.ts";
 import type { PreparedDelivery } from "./vendor/delivery/prepare.ts";
 import type { LedgerTenant } from "./ledger.ts";
 import type { WriteResult } from "./writer.ts";

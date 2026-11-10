@@ -36,6 +36,7 @@ import {
   type ExpectedSchema,
 } from "../shared/db.ts";
 import { log } from "../shared/log.ts";
+import { initScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
 import { optional } from "../shared/env.ts";
 import { SESSION_BOOTSTRAP_FILES } from "./session-bootstrap-chain.ts";
 
@@ -1171,6 +1172,8 @@ async function checksumAliasEvidence(client: MigrationClient) {
 
 if (import.meta.main) {
   process.env.OTEL_SERVICE_NAME ||= "hoopdb-migrate";
+  // SCRUB_ENGINE (docs/scrub-engine.md): every service selects (and for wasm verifies) at startup.
+  await initScrubEngine();
   if (process.argv.includes("--activation-check")) {
     // For an operator or the activation dossier: the function-boundary evidence (names and
     // booleans only) for HOOPDB_URL, HOOPDB_FUNCTION_BOUNDARY_MODE and HOOPDB_DB_MODE.

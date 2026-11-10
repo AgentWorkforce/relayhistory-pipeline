@@ -38,7 +38,8 @@
  */
 import { createHash } from "node:crypto";
 import { LAYOUT_VERSION } from "@rhc-object-store";
-import { SCRUB_RULESET, sealRawChunk } from "@rhc/lib/pipeline/raw-chunks.ts";
+import { SCRUB_RULESET } from "@rhc/lib/pipeline/raw-chunks.ts";
+import { sealRawChunk } from "@rhc/lib/scrub-engine/index.ts";
 import {
   computeContentSha256,
   isObjectStoreError,

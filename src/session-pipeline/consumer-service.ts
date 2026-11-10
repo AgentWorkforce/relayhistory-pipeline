@@ -32,6 +32,7 @@ import { createServer } from "node:http";
 import { unlinkSync, writeFileSync } from "node:fs";
 import { isTenantOnlyPolicy, type TenantPolicyRow } from "./postgres-search-state.ts";
 import { log } from "../shared/log.ts";
+import { initScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
 import { captureSafely } from "../shared/analytics.ts";
 import { ANALYTICS_OFF, analyticsCounterFields, createAnalyticsSink } from "../shared/analytics-config.ts";
 import { integer } from "../shared/env.ts";
@@ -1411,4 +1412,8 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
   process.exit(exitCode);
 }
 
-if (import.meta.main) await serve();
+// SCRUB_ENGINE (docs/scrub-engine.md): select, and for wasm verify the pinned engine, before serving.
+if (import.meta.main) {
+  await initScrubEngine();
+  await serve();
+}

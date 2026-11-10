@@ -32,7 +32,8 @@
  * the same object.
  */
 import { createHash } from "node:crypto";
-import { rawZstdFrame, scrubRecords } from "@rhc/lib/pipeline/raw-chunks.ts";
+import { rawZstdFrame } from "@rhc/lib/pipeline/raw-chunks.ts";
+import { scrubRecords } from "@rhc/lib/scrub-engine/index.ts";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../shared/vendor.ts";
 import { layoutComponent } from "../shared/layout-component.ts";
 import { liveMachineId, writeGroups, type Group, type LineMeta, type WriteTarget } from "./writer.ts";

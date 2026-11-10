@@ -76,6 +76,7 @@ import type { AddressInfo } from "node:net";
 import { Readable } from "node:stream";
 import pg from "pg";
 import { errorFields, log } from "../shared/log.ts";
+import { initScrubEngine, scrubEngineReady } from "@rhc/lib/scrub-engine/index.ts";
 import { assertConditionalWrites, buildLockerStore } from "../shared/locker.ts";
 import type { ObjectStore } from "../shared/vendor.ts";
 import { AuthError } from "../session-read-api/app.ts";
@@ -508,7 +509,8 @@ export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null):
         const path = url.pathname;
         if (req.method === "GET" && path === "/healthz") return sendJson(req, res, 200, { ok: true, enabled: runtime !== null, ...probeFields(runtime) });
         if (req.method === "GET" && path === "/readyz") {
-          const ok = runtime ? await runtime.ready() : false;
+          // Not ready while the selected scrub engine cannot scrub (SCRUB_ENGINE=wasm not initialised, or trapped).
+          const ok = runtime ? scrubEngineReady() && (await runtime.ready()) : false;
           return sendJson(req, res, ok ? 200 : 503, { ok, enabled: runtime !== null, ...probeFields(runtime) });
         }
         if (!runtime)
@@ -658,4 +660,8 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<void>
   process.on("SIGINT", stop);
 }
 
-if (import.meta.main) await serve();
+// SCRUB_ENGINE (docs/scrub-engine.md): select, and for wasm verify the pinned engine, before serving.
+if (import.meta.main) {
+  await initScrubEngine();
+  await serve();
+}

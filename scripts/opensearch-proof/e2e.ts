@@ -37,7 +37,7 @@ import { sha256Hex } from "../../packages/object-store/src/crypto.ts";
 import { createOpenSearchCapableSearchIndexRegistry } from "../../packages/pipeline/src/adapters/defaults.ts";
 import { syntheticDoc } from "../../packages/pipeline/src/search-index/conformance.ts";
 import { matchesQuery, positionOf } from "../../packages/pipeline/src/search-index/contracts.ts";
-import { scrubRecords } from "../../packages/pipeline/src/lib/pipeline/raw-chunks.ts";
+import { scrubRecords } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import type { SqlExecutor } from "../../packages/pipeline/src/lib/pipeline/queue.ts";
 import { PLANTED_CONTENT_MARKER, PLANTED_SECRETS } from "../../src/concourse/seed.ts";
 import { composeSearchService } from "../../src/shared/search-composition.ts";
