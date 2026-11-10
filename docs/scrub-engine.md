@@ -454,8 +454,10 @@ Operationally, deploy and verify every relevant reader with ceiling 10 **while t
 Leave `READER_MAX_RULESET` absent to preserve legacy reads. An explicit value
 opts into strict marker and chunk checks, including canonical decimal metadata;
 older metadata such as `"08"` or `"8.0"` is accepted by the legacy courier path
-but refused by the explicit policy. Explicit policy also checks zero-chunk
-manifest markers. Verify existing retained objects before opting in.
+but refused by the explicit policy. The courier always requires family
+`relayhistory-scrub` and a positive manifest version, including zero-chunk
+manifests, as main does. Explicit policy additionally checks the ceiling and
+canonical chunk metadata. Verify existing retained objects before opting in.
 
 Empty, malformed, padded, unsupported or number-typed Worker bindings are
 configuration errors. In ingest, engine initialization fails closed and

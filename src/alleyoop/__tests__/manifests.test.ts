@@ -858,9 +858,14 @@ test("manifest admission respects mixed-version chunk metadata without changing 
 
 test("unset courier policy preserves main's empty-manifest and numeric metadata admission",async()=>{
  const f=await fixture();const manifest=await f.build(1);const raw={store:f.store,provider:"fs" as const,bucket:"raw"};
- for(const marker of [{ruleset:"relayhistory-scrub",version:9},{ruleset:"foreign-family",version:8}]) {
+ for(const [marker, accepted] of [
+  [{ruleset:"relayhistory-scrub",version:9}, true],
+  [{ruleset:"foreign-family",version:8}, false],
+  [{ruleset:"relayhistory-scrub",version:0}, false],
+  [{ruleset:"relayhistory-scrub",version:-1}, false],
+ ] as const) {
   const empty={...manifest,raw:{...manifest.raw,chunks:[],scrub:marker}};
-  expect(await chunksAreServerSealed(raw,empty,undefined)).toBe(true);
+  expect(await chunksAreServerSealed(raw,empty,undefined)).toBe(accepted);
   expect(await chunksAreServerSealed(raw,empty,undefined,8)).toBe(false);
  }
  const {rawChunkKey,readAll}=await import("../../shared/vendor.ts");const c=manifest.raw.chunks[0]!;

@@ -647,12 +647,14 @@ export async function chunksAreServerSealed(
   maximum?: number,
 ): Promise<boolean> {
   const scrub = manifest.raw.scrub;
+  // Keep main's courier guard even when the optional strict policy is absent.
+  if (!scrub || scrub.ruleset !== "relayhistory-scrub" || scrub.version < 1)
+    return false;
   try { assertReaderScrubMarker(scrub, maximum); }
   catch (error) {
     if (error instanceof PipelineError && error.code === "scrub_ruleset_unsupported") return false;
     throw error;
   }
-  if (!scrub) return false;
   const location = {
     ...(prefix ? { prefix } : {}),
     workspaceId: manifest.session.workspace_id,

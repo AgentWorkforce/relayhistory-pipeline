@@ -14,7 +14,7 @@
  */
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { SCRUB_RULESET, SCRUB_RULESET_VERSION } from "../shared/vendor.ts";
-import { ScrubEngineUnavailable, activeScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
+import { ScrubberError, ScrubEngineUnavailable, activeScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
 import { meaningfulChars } from "./search-query.ts";
 
 /** Hard bound, in Unicode code points (PostgreSQL `char_length`). */
@@ -97,7 +97,8 @@ export function scrubShortSummary(
   } catch (error) {
     if (error instanceof ShortSummaryRejected) throw error;
     // The engine failed, not this summary: retryable, nothing is refused or cleared.
-    if (error instanceof ScrubEngineUnavailable) throw error;
+    if (error instanceof ScrubEngineUnavailable || (error instanceof ScrubberError && error.retryable))
+      throw error;
     throw new ShortSummaryRejected("scrub_failed");
   }
   text = text.trim();
