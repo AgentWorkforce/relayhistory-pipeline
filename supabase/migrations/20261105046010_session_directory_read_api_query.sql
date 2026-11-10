@@ -8,7 +8,9 @@
 -- directory row:
 --
 --   free word      d.search_text <> '' AND d.search_text ILIKE '%word%'   (the tenant-scoped
---                  trigram index session_directory_tenant_search_trgm_idx). search_text is
+--                  trigram index session_directory_tenant_search_trgm_idx). A word of 1 or 2
+--                  meaningful characters is allowed only beside a positive word of 3 or more
+--                  (the index's anchor); it filters the anchor's rows in the same WHERE. search_text is
 --                  sessions.session_directory_search_text: title, task title, agent name,
 --                  project id, git repo and branch, model and the scrubbed short summary;
 --                  never transcript or event content.
@@ -135,6 +137,9 @@ DECLARE
   v_list jsonb;
   v_value jsonb;
   v_total integer := 0;
+  v_word text;
+  v_short boolean := false;
+  v_anchor boolean := false;
   v_agent text;
   v_project text;
 BEGIN
@@ -148,15 +153,35 @@ BEGIN
       IF v_key IN ('harness', 'not_harness') AND (v_value #>> '{}') !~ '^[a-z0-9][a-z0-9._-]{0,63}$' THEN
         RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session query: harness terms must be valid harness names';
       END IF;
-      -- Free words are already normalized by the read API (search-query.ts), the same rule.
-      IF v_key IN ('free', 'not_free')
-         AND sessions.session_directory_search_query(v_value #>> '{}') IS DISTINCT FROM (v_value #>> '{}') THEN
-        RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session query: a search word needs 3 to 200 meaningful characters, normalized';
+      -- Free words arrive normalized by the read API (search-query.ts), the landed rule of
+      -- sessions.session_directory_search_query (20261030020000, unchanged). A long word (3+
+      -- meaningful characters, at most 200) is a fixed point of it. A short word (1 or 2) is
+      -- refused there (NULL), so it is probed with 'xy' appended: w || 'xy' is a fixed point
+      -- exactly when w is normalized and has at least 1 meaningful character ('x' is a starter
+      -- that composes with nothing, so NFC, format removal and separator collapse act on w
+      -- alone), except that the probe hides a trailing space of w that btrim would remove,
+      -- hence the explicit check. The probe's 200 cap makes 198 code points the short-word
+      -- maximum (list-query.ts MAX_SHORT_WORD_CHARS).
+      IF v_key IN ('free', 'not_free') THEN
+        v_word := v_value #>> '{}';
+        IF sessions.session_directory_search_query(v_word) IS NOT DISTINCT FROM v_word THEN
+          v_anchor := v_anchor OR v_key = 'free';
+        ELSIF right(v_word, 1) <> ' '
+              AND sessions.session_directory_search_query(v_word || 'xy') IS NOT DISTINCT FROM v_word || 'xy' THEN
+          v_short := true;
+        ELSE
+          RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session query: a search word must be normalized, with at least 1 meaningful character (3 or more: at most 200 code points; 1 or 2: at most 198)';
+        END IF;
       END IF;
     END LOOP;
   END LOOP;
   IF v_total > 16 THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session query: at most 16 terms';
+  END IF;
+  -- A short word (positive or excluded) only narrows: the query needs a positive word of 3+
+  -- meaningful characters, the one the tenant trigram index can serve.
+  IF v_short AND NOT v_anchor THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session query: a short search word needs a positive search word of 3 or more meaningful characters';
   END IF;
 
   -- The list parameters, as list_session_directory_for validates them.
@@ -234,7 +259,10 @@ BEGIN
      OR (SELECT sum(c.n) FROM unnest(v_counts) AS c(n)) > 16 THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'session query: at most 16 terms';
   END IF;
-  -- Free words: the partial trigram index's predicate, then one ILIKE per word.
+  -- Free words: the partial trigram index's predicate, then one ILIKE per word. Short words
+  -- (1 or 2 meaningful characters) are in the same arrays; a trigram index cannot serve them,
+  -- so PostgreSQL drives the scan from a 3+ character word (session_directory_query_check
+  -- requires one positive) and filters the short ILIKEs on those rows, before the LIMIT.
   IF v_counts[1] > 0 THEN
     v := v || $f$ AND d.search_text <> ''$f$;
   END IF;

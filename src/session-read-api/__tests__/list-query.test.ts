@@ -42,11 +42,11 @@ describe("parseSessionQuery", () => {
     expect(terms('"fix the bug"').free).toEqual(["fix the bug"]);
     expect(terms('"say \\"hi\\" now"').free).toEqual(['say "hi" now']);
   });
-  test("-word excludes; a lone - is a (too short) free word", () => {
+  test("-word excludes; a lone - is a short free word with no anchor", () => {
     const t = terms("-flaky alpha");
     expect(t.notFree).toEqual(["flaky"]);
     expect(t.free).toEqual(["alpha"]);
-    expect(reason("-")).toBe("bad:a search word needs at least 3 characters");
+    expect(reason("-")).toBe("bad:a search needs at least one word of 3 or more characters that is not excluded");
   });
   test("fields: title, project, harness/source, agent, id (case-insensitive field names)", () => {
     const t = terms("TITLE:Login project:Web harness:codex Source:claude agent:Reviewer id:ABC-1 -title:wip -id:x");
@@ -116,11 +116,45 @@ describe("parseSessionQuery", () => {
     expect(reason("   \t ")).toBe("bad:q has no search terms");
     expect(reason(Array.from({ length: 16 }, (_, i) => `word${i}`).join(" "))).toBe("terms");
     expect(reason(Array.from({ length: 17 }, (_, i) => `word${i}`).join(" "))).toBe("bad:q accepts at most 16 terms");
-    expect(reason("ab")).toBe("bad:a search word needs at least 3 characters");
-    expect(reason('"a b"')).toBe("bad:a search word needs at least 3 characters");
+    expect(reason("ab")).toBe("bad:a search needs at least one word of 3 or more characters that is not excluded");
+    expect(reason('"a b"')).toBe("bad:a search needs at least one word of 3 or more characters that is not excluded");
     expect(reason("x".repeat(201))).toBe("bad:a q term must be 200 characters or fewer");
     expect(reason(`title:${"x".repeat(201)}`)).toBe("bad:a q term must be 200 characters or fewer");
     expect(reason(`title:${"x".repeat(200)}`)).toBe("terms");
+  });
+  test("short free words (1-2 meaningful characters) are predicates beside a 3+ positive anchor (#475 P1)", () => {
+    const t = terms("Kind live E2E QA A 20261109-clean-native-50172a");
+    expect(t.free).toEqual(["kind", "live", "e2e", "qa", "a", "20261109-clean-native-50172a"]);
+    expect(t.notFree).toEqual([]);
+    expect(terms("Fix a bug").free).toEqual(["fix", "a", "bug"]);
+    expect(terms("Fix UI bug").free).toEqual(["fix", "ui", "bug"]);
+    // Excluded short words keep exclusion semantics; the anchor is the positive word.
+    const ex = terms("foo -a");
+    expect(ex.free).toEqual(["foo"]);
+    expect(ex.notFree).toEqual(["a"]);
+    expect(terms("Fix bug -a").notFree).toEqual(["a"]);
+    // Normalized as search-query.ts does: format characters removed, NFC.
+    expect(terms("fix q\u200Ba").free).toEqual(["fix", "qa"]);
+    expect(terms("fix e\u0301").free).toEqual(["fix", "\u00E9"]);
+  });
+  test("without a positive 3+ anchor, short free words are 400", () => {
+    for (const q of ["UI", "ab", '"a b"', "-", "-ab", "ab -foo", "a b", "ui title:login", "-foo -ab"]) {
+      expect(reason(q), q).toBe("bad:a search needs at least one word of 3 or more characters that is not excluded");
+    }
+    // Two meaningful characters with combining marks are still short.
+    expect(reason("e\u0301e\u0301")).toBe("bad:a search needs at least one word of 3 or more characters that is not excluded");
+  });
+  test("a free word with no visible character is 400, never dropped", () => {
+    expect(reason("foo \u200B")).toBe("bad:a search word needs at least one visible character");
+    expect(reason('foo ""')).toBe("bad:a search word needs at least one visible character");
+    expect(reason("foo \u0301")).toBe("bad:a search word needs at least one visible character");
+  });
+  test("a short word holds at most 198 code points (the SQL probe's cap); a long word 200", () => {
+    const marks = "\u0301".repeat(197);
+    // x does not compose with U+0301, so NFC keeps every mark.
+    expect(reason(`foo x${marks}`)).toBe("terms");
+    expect(reason(`foo x${marks}\u0301`)).toBe("bad:a search word under 3 characters must be 198 code points or fewer");
+    expect(reason(`foo xyx${"\u0301".repeat(197)}`)).toBe("terms");
   });
   test("LIKE metacharacters are passed through as plain values", () => {
     expect(terms("100% under_score back\\slash").free).toEqual(["100%", "under_score", "back\\slash"]);
@@ -185,5 +219,14 @@ describe("queryFingerprint", () => {
     expect(queryFingerprint(terms("alpha"), { userIds: ["user-1"] })).not.toBe(base);
     expect(queryFingerprint(terms("alpha"), { agent: "lead" })).not.toBe(base);
     expect(queryFingerprint(terms("alpha"), { firstTsAfter: new Date(at("2026-10-01")) })).not.toBe(base);
+  });
+  test("a short free word is part of the fingerprint, positive and excluded apart", () => {
+    const base = queryFingerprint(terms("fix bug"), {});
+    const withA = queryFingerprint(terms("fix a bug"), {});
+    expect(withA).not.toBe(base);
+    expect(queryFingerprint(terms("fix bug -a"), {})).not.toBe(base);
+    expect(queryFingerprint(terms("fix bug -a"), {})).not.toBe(withA);
+    expect(queryFingerprint(terms("fix bug ui"), {})).not.toBe(withA);
+    expect(queryFingerprint(terms("A bug FIX"), {})).toBe(withA);
   });
 });

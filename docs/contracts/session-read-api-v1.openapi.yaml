@@ -482,9 +482,12 @@ components:
         Dashboard session query, self-host SERVICE only behind `READ_API_SESSION_QUERY=true`
         (default off; off, any non-empty `q` is 501 `param_q`, as before). At most 500 characters,
         16 terms, 200 characters per value; an empty `q` is no `q`. Terms are space separated
-        (double quotes group), AND-ed, and `-` negates one: a free word (at least 3 characters)
-        matches the session's search text (title, task title, agent name, project id, git repo and
-        branch, model, scrubbed short summary; never transcript content); `title:`, `project:`,
+        (double quotes group), AND-ed, and `-` negates one: a free word matches the session's
+        search text (title, task title, agent name, project id, git repo and branch, model,
+        scrubbed short summary; never transcript content). A free word of 1 or 2 characters
+        (`Fix a bug`, `QA`) is accepted, included or negated, when the query also has an included
+        free word of at least 3 characters; a query whose free words are all shorter (`UI`,
+        `"a b"`, `ab -foo`) is 400. `title:`, `project:`,
         `harness:`/`source:` (a harness name), `agent:` or `@name`, `id:` (session id substring),
         `is:active`/`is:inactive`, and the last-activity dates `updated:`/`after:`/`before:`
         (`2026-10-01`, `>=2026-10-01`, `2026-10-01..2026-10-11`, UTC; intersected with

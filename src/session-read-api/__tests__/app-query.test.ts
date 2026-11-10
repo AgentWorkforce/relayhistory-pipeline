@@ -7,6 +7,8 @@
 import { describe, expect, test } from "bun:test";
 import { AuthError, createReadApi, type ReadApiDeps, type VerifiedIdentity } from "../app.ts";
 import {
+  DIRECTORY_QUERY_ACTIVITY_SQL,
+  DIRECTORY_QUERY_SQL,
   decodeQueryCursor,
   encodeListCursor,
   encodeQueryCursor,
@@ -14,7 +16,9 @@ import {
   type DirectoryListRow,
   type DirectoryQueryActivityArgs,
   type DirectoryQueryArgs,
+  sqlDirectory,
 } from "../directory.ts";
+import type { TenantRunner } from "../liveness.ts";
 import { parseSessionQuery, queryFingerprint, type SessionQueryTerms } from "../list-query.ts";
 import { memoryLiveness } from "./support.ts";
 
@@ -199,7 +203,12 @@ describe("flag on: GET /v1/sessions?q=", () => {
     const get = api({ sessionQuery: true, directory });
     const cases: Array<[string, string]> = [
       ["   ", "q has no search terms"],
-      ["ab", "a search word needs at least 3 characters"],
+      ["ab", "a search needs at least one word of 3 or more characters that is not excluded"],
+      ["UI", "a search needs at least one word of 3 or more characters that is not excluded"],
+      ['"a b"', "a search needs at least one word of 3 or more characters that is not excluded"],
+      ["-", "a search needs at least one word of 3 or more characters that is not excluded"],
+      ["-ab", "a search needs at least one word of 3 or more characters that is not excluded"],
+      ["ab -foo", "a search needs at least one word of 3 or more characters that is not excluded"],
       [`title:${"t".repeat(201)}`, "a q term must be 200 characters or fewer"],
       [Array.from({ length: 17 }, (_, i) => `term${i}`).join(" "), "q accepts at most 16 terms"],
       ["is:active is:inactive", "choose either is:active or is:inactive"],
@@ -293,5 +302,60 @@ describe("flag on: GET /v1/sessions/activity?q=", () => {
     expect((await get("/v1/sessions/activity?workspace=ws-q&since=2026-10-01T00:00:00Z&until=2026-10-03T00:00:00Z&search=whatever")).status).toBe(200);
     expect((await get(activity(""))).status).toBe(200);
     expect(calls.map((c) => c.fn)).toEqual(["activity", "activity"]);
+  });
+});
+
+describe("flag on: short free words beside a 3+ anchor (#475 P1)", () => {
+  // The real sqlDirectory over a recording tenant runner: what the SQL functions would receive.
+  function recordingSql() {
+    const statements: Array<{ text: string; params: unknown[] }> = [];
+    const run: TenantRunner = async (_org, _ws, work) =>
+      work({
+        async query(text: string, params?: unknown[]) {
+          statements.push({ text, params: params ?? [] });
+          if (text.includes("to_regprocedure")) return { rows: [{ installed: true }] };
+          if (text === DIRECTORY_QUERY_SQL) return { rows: [row()] };
+          return { rows: [] };
+        },
+      } as never);
+    return { directory: sqlDirectory(run), statements };
+  }
+  const TITLE = "Kind live E2E QA A 20261109-clean-native-50172a";
+
+  for (const [q, free, notFree] of [
+    [TITLE, ["kind", "live", "e2e", "qa", "a", "20261109-clean-native-50172a"], null],
+    ["Fix a bug", ["fix", "a", "bug"], null],
+    ["Fix UI bug", ["fix", "ui", "bug"], null],
+    ["Fix bug -a", ["fix", "bug"], ["a"]],
+  ] as const) {
+    test(`list and activity serve ${JSON.stringify(q)} with the short words in the SQL term arrays`, async () => {
+      const { directory, statements } = recordingSql();
+      const get = api({ sessionQuery: true, directory });
+      const l = await get(list(q));
+      expect(l.status).toBe(200);
+      expect((await json(l)).sessions).toHaveLength(1);
+      const a = await get(activity(q));
+      expect(a.status).toBe(200);
+      const listCall = statements.find((s) => s.text === DIRECTORY_QUERY_SQL)!;
+      const activityCall = statements.find((s) => s.text === DIRECTORY_QUERY_ACTIVITY_SQL)!;
+      for (const call of [listCall, activityCall]) {
+        // $2 p_free, $3 p_not_free.
+        expect(call.params[1]).toEqual([...free]);
+        expect(call.params[2]).toEqual(notFree === null ? null : [...notFree]);
+      }
+    });
+  }
+
+  test("a short-only q never reaches SQL on either route", async () => {
+    const { directory, statements } = recordingSql();
+    const get = api({ sessionQuery: true, directory });
+    for (const q of ["QA A", "ab -foo"]) {
+      for (const path of [list(q), activity(q)]) {
+        const r = await get(path);
+        expect(r.status).toBe(400);
+        expect((await json(r)).error).toEqual({ code: "bad_request", message: "a search needs at least one word of 3 or more characters that is not excluded" });
+      }
+    }
+    expect(statements).toEqual([]);
   });
 });

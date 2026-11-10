@@ -291,6 +291,49 @@ describe("query_session_directory_for / query_session_directory_activity_for", (
     expect(await asReadApi(db, ["org-a", "ws-a"], () => activity(db, "2026-10-01T00:00:00Z", "2026-10-06T23:59:59Z", {}))).toEqual(plain.rows);
   }, 120_000);
 
+  test("short free words (1-2 meaningful characters) are AND / NOT predicates beside a 3+ positive anchor (#475 P1)", async () => {
+    const db = await database();
+    await seed(db, [
+      { id: "s1", last: "2026-10-05T12:00:00Z", title: "Fix a bug" },
+      { id: "s2", last: "2026-10-04T12:00:00Z", title: "Fix bug" },
+      { id: "s3", last: "2026-10-03T12:00:00Z", title: "Kind live E2E QA A 20261109-clean-native-50172a" },
+      { id: "s4", last: "2026-10-02T12:00:00Z", title: "Fix UI bug" },
+    ]);
+    const searchText = (await db.query<{ session_id: string; search_text: string }>(
+      "SELECT session_id, search_text FROM sessions.session_directory ORDER BY session_id")).rows;
+    expect(searchText.find((r) => r.session_id === "s2")!.search_text.toLowerCase()).not.toContain("a");
+    // As list-query.ts parses `Fix a bug`, `Fix bug -a`, `Fix UI bug` and the original title.
+    expect(await ids(db, { free: ["fix", "a", "bug"] })).toEqual(["s1"]);
+    expect(await ids(db, { free: ["fix", "bug"], not_free: ["a"] })).toEqual(["s2", "s4"]);
+    expect(await ids(db, { free: ["fix", "ui", "bug"] })).toEqual(["s4"]);
+    expect(await ids(db, { free: ["kind", "live", "e2e", "qa", "a", "20261109-clean-native-50172a"] })).toEqual(["s3"]);
+    // One positive anchor is enough; the short word may be the excluded one.
+    expect(await ids(db, { free: ["bug"], not_free: ["ui"] })).toEqual(["s1", "s2"]);
+    // Filtered before LIMIT: s1 (the newest row) is excluded; limit 1 returns s2 and the
+    // limit + 1 look-ahead row s4.
+    expect((await asReadApi(db, ["org-a", "ws-a"], () => query(db, { free: ["fix", "bug"], not_free: ["a"], limit: 1 }))).map((r) => r.session_id)).toEqual(["s2", "s4"]);
+    expect((await asReadApi(db, ["org-a", "ws-a"], () => query(db, { free: ["fix", "bug"], not_free: ["a", "ui"], limit: 1 }))).map((r) => r.session_id)).toEqual(["s2"]);
+    await asReadApi(db, ["org-a", "ws-a"], async () => {
+      expect(await activity(db, "2026-10-01T00:00:00Z", "2026-10-06T00:00:00Z", { free: ["fix", "a", "bug"] })).toEqual([
+        { day: new Date("2026-10-05T00:00:00Z"), harness: "codex", sessions: 1 },
+      ]);
+    });
+    // Refused (22023): short words with no positive anchor, a short word not normalized, a
+    // word with no meaningful character, a short word over the probe's 198 code points.
+    const refused: Q[] = [
+      { free: ["qa", "a"] }, { free: ["ab"], not_free: ["foo"] }, { not_free: ["ab"] }, { free: ["-"] },
+      { free: ["fix", " a"] }, { free: ["fix", "a "] }, { free: ["fix", "a  b"] }, { free: ["fix", "a\tb"] },
+      { free: ["fix", "q\u200Ba"] }, { free: ["fix", "e\u0301"] }, { free: ["fix", "\u0301"] },
+      { free: ["fix", " "] }, { free: ["fix", `x${"\u0301".repeat(198)}`] },
+    ];
+    for (const q of refused)
+      expect(await code(asReadApi(db, ["org-a", "ws-a"], () => query(db, q))), JSON.stringify(q).slice(0, 120)).toBe("22023");
+    expect(await code(asReadApi(db, ["org-a", "ws-a"], () => activity(db, "2026-10-01T00:00:00Z", "2026-10-02T00:00:00Z", { free: ["qa", "a"] })))).toBe("22023");
+    // Accepted at the boundaries: the NFC form, 198 code points, an internal space.
+    for (const q of [{ free: ["fix", "\u00E9"] }, { free: ["fix", `x${"\u0301".repeat(197)}`] }, { free: ["fix", "a b"] }] as Q[])
+      expect(await code(asReadApi(db, ["org-a", "ws-a"], () => query(db, q))), JSON.stringify(q).slice(0, 60)).toBeUndefined();
+  }, 120_000);
+
   test("22023 for invalid values, 0A000 for agent= before the catalog backfill", async () => {
     const db = await database();
     const bad: Q[] = [
@@ -395,5 +438,20 @@ describe("query_session_directory_for / query_session_directory_activity_for", (
     expect(plan).not.toContain('"Seq Scan"');
     const hits = (await db.query<Row>("EXECUTE q_shape('org-a', 'ws-a', sessions.session_directory_query_like(ARRAY['quokka ledger']))")).rows;
     expect(hits.length).toBe(40); // n % 1000 in (1, 2) never has n % 4 = 0: all in org-a/ws-a
+    // A short word beside the anchor: the trigram index still drives the scan (on the anchor);
+    // the short ILIKE filters those rows.
+    const where2 = (await db.query<{ w: string }>(
+      "SELECT sessions.session_directory_query_where(2,0,0,0,0,0,0,0,0,0,0,0,false,false,false,false,false,false,false,false,false,false) AS w")).rows[0]!.w;
+    await db.exec(`PREPARE q_shape2 (text, text, text[]) AS SELECT d.session_id FROM sessions.session_directory AS d
+      WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.deleted_at IS NULL${where2}
+      ORDER BY d.last_activity_at DESC, d.session_id DESC, d.harness DESC LIMIT 51`);
+    const plan2 = JSON.stringify((await db.query<Row>(
+      "EXPLAIN (FORMAT JSON) EXECUTE q_shape2('org-a', 'ws-a', sessions.session_directory_query_like(ARRAY['quokka ledger', '1']))")).rows);
+    expect(plan2).toContain("session_directory_tenant_search_trgm_idx");
+    expect(plan2).not.toContain('"Seq Scan"');
+    const hits2 = (await db.query<{ session_id: string }>("EXECUTE q_shape2('org-a', 'ws-a', sessions.session_directory_query_like(ARRAY['quokka ledger', '1']))")).rows;
+    // Titles 'quokka ledger <n>' with n % 1000 in (1, 2); every n holds a 1 except those like 2002.
+    expect(hits2.map((r) => r.session_id).sort()).toEqual(
+      Array.from({ length: 20 }, (_, k) => [k * 1000 + 1, k * 1000 + 2]).flat().filter((n) => String(n).includes("1")).map((n) => `s-${n}`).sort());
   }, 120_000);
 });

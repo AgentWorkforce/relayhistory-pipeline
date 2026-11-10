@@ -425,21 +425,35 @@ export type SearchQuery =
   | { ok: true; query: string; meaningfulChars: number }
   | { ok: false; reason: "too_short" | "too_long" };
 
-/** The normalized query, or why it is refused (the RPC raises 22023 for both). */
-export function normalizeSearchQuery(raw: string): SearchQuery {
-  const query = raw
+/**
+ * Steps 1-4 and the meaningful-character count of step 5, without the 3..200 bounds:
+ * the read API's short `q` words (src/session-read-api/list-query.ts) use the same
+ * normalization with their own bounds.
+ */
+export function normalizeSearchText(raw: string): {
+  text: string;
+  codePoints: number;
+  meaningfulChars: number;
+} {
+  const text = raw
     .normalize("NFC")
     .replace(FORMAT, "")
     .replace(SEPARATORS, " ")
     .replace(/^ +| +$/g, "")
     .normalize("NFC");
-  const points = Array.from(query);
+  const points = Array.from(text);
   const meaningfulChars = points.filter(
     (c) => c !== " " && !MARK.test(c),
   ).length;
+  return { text, codePoints: points.length, meaningfulChars };
+}
+
+/** The normalized query, or why it is refused (the RPC raises 22023 for both). */
+export function normalizeSearchQuery(raw: string): SearchQuery {
+  const { text: query, codePoints, meaningfulChars } = normalizeSearchText(raw);
   if (meaningfulChars < SEARCH_QUERY_MIN_CHARS)
     return { ok: false, reason: "too_short" };
-  if (points.length > SEARCH_QUERY_MAX_CHARS)
+  if (codePoints > SEARCH_QUERY_MAX_CHARS)
     return { ok: false, reason: "too_long" };
   return { ok: true, query, meaningfulChars };
 }

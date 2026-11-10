@@ -17,6 +17,10 @@
  * - A free or agent: value starting with `@` is an agent term (the `@`s dropped).
  * - harness/source, project and upload terms OR within their field; every other term ANDs.
  *   An excluded term that matches rejects the row.
+ * - A free word is normalized as src/hoopdb/search-query.ts normalizes search queries. One of
+ *   1 or 2 meaningful characters (`qa`, `a`) is a short word: allowed, positive or excluded, as
+ *   long as the query has a positive free word of at least 3 meaningful characters (the anchor
+ *   the tenant trigram index serves; the short words filter its rows in the same WHERE).
  * - Dates (UTC, exactly YYYY-MM-DD): after:D = [D+1, inf), before:D = (-inf, D), and for
  *   updated: A..B = [A, B+1) (`*` or empty = open; start < end), >=D, >D, <=D, <D, D.
  *
@@ -24,12 +28,20 @@
  * is `unsupported` (a 501 naming it); malformed input is `bad` (400).
  */
 import { createHash } from "node:crypto";
-import { normalizeSearchQuery } from "../hoopdb/search-query.ts";
+import { normalizeSearchText, SEARCH_QUERY_MAX_CHARS, SEARCH_QUERY_MIN_CHARS } from "../hoopdb/search-query.ts";
 
 /** At most this many terms in one q (the RPC's own cap). */
 export const MAX_QUERY_TERMS = 16;
 /** Each term value, in code points (the RPC's own cap). */
 export const MAX_QUERY_VALUE_CHARS = 200;
+/**
+ * A short free word (1 or 2 meaningful characters) holds at most this many code points after
+ * normalization: migration 046010 checks it with the landed normalizer
+ * sessions.session_directory_search_query(word || 'xy'), whose 200 cap includes the 2-char probe.
+ */
+export const MAX_SHORT_WORD_CHARS = SEARCH_QUERY_MAX_CHARS - 2;
+/** Any short free word (positive or excluded) needs one positive free word of 3+ characters. */
+export const NO_ANCHOR_REASON = "a search needs at least one word of 3 or more characters that is not excluded";
 
 const FIELDS = new Set(["title", "project", "harness", "source", "path", "id", "agent", "is", "upload", "updated", "after", "before"]);
 const DATE_FIELDS = new Set(["updated", "after", "before"]);
@@ -214,6 +226,8 @@ export function parseSessionQuery(q: string): ParsedSessionQuery {
     const list = excluded ? terms[`not${key[0]!.toUpperCase()}${key.slice(1)}` as keyof SessionQueryTerms] as string[] : terms[key];
     if (!list.includes(value)) list.push(value);
   };
+  let shortWords = false;
+  let anchor = false;
   for (const t of raw) {
     let field = t.field;
     let value = t.value.toLowerCase();
@@ -236,9 +250,16 @@ export function parseSessionQuery(q: string): ParsedSessionQuery {
     }
     if (Array.from(value).length > MAX_QUERY_VALUE_CHARS) return bad(`a q term must be ${MAX_QUERY_VALUE_CHARS} characters or fewer`);
     if (field === undefined) {
-      const n = normalizeSearchQuery(value);
-      if (!n.ok) return bad(n.reason === "too_short" ? "a search word needs at least 3 characters" : `a search word must be ${MAX_QUERY_VALUE_CHARS} characters or fewer`);
-      put("free", t.excluded, n.query);
+      const n = normalizeSearchText(value);
+      if (n.meaningfulChars === 0) return bad("a search word needs at least one visible character");
+      if (n.meaningfulChars >= SEARCH_QUERY_MIN_CHARS) {
+        if (n.codePoints > MAX_QUERY_VALUE_CHARS) return bad(`a search word must be ${MAX_QUERY_VALUE_CHARS} characters or fewer`);
+        if (!t.excluded) anchor = true;
+      } else {
+        if (n.codePoints > MAX_SHORT_WORD_CHARS) return bad(`a search word under 3 characters must be ${MAX_SHORT_WORD_CHARS} code points or fewer`);
+        shortWords = true;
+      }
+      put("free", t.excluded, n.text);
     } else if (field === "harness" || field === "source") {
       if (!HARNESS_NAME.test(value)) return bad(`${field}: must name a harness`);
       put("harness", t.excluded, value);
@@ -246,6 +267,7 @@ export function parseSessionQuery(q: string): ParsedSessionQuery {
       put(field as "title" | "project" | "agent" | "id", t.excluded, value);
     }
   }
+  if (shortWords && !anchor) return bad(NO_ANCHOR_REASON);
   if (start >= end) return bad("the q date terms do not overlap");
   if (start > -Infinity && start <= MAX_BOUND_MS) terms.lastTsAfter = new Date(start);
   if (start > MAX_BOUND_MS) return bad(DATE_HINT);
