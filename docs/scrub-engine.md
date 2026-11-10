@@ -260,8 +260,8 @@ module stays private to the engine closure.
 - A thrown glue error discards the input. A deliberate error (an `Error` or a code string)
   refuses that call (`engine_refused`). A trap (`WebAssembly.RuntimeError`, `RangeError`)
   poisons the instance (`engine_failed`). Malformed glue results are `engine_refused`.
-- `scrubRecords` keeps the TypeScript `chunk_not_utf8` refusal when the engine refuses
-  non-UTF-8 input. Lone surrogates are refused before the engine call
+- `scrubRecords` refuses invalid UTF-8 before any glue call (`chunk_not_utf8`).
+  Lone surrogates are refused before the engine call
   (`scrub_input_not_well_formed`).
 - The marker is `{ruleset, version, profile}` from the verified manifest (see "Persisted
   marker rule"). `sealRawChunk` is still refused (`seal_path_not_routed`).
@@ -280,13 +280,15 @@ entrypoint calls it yet. With `SCRUB_ENGINE=wasm-bindgen` the hosted Worker's
 
 Merging this PR is a default-off, unpinned scaffold only. It is NOT a security PASS, artifact pin, cutover, image, marker or adoption clearance. The successor that binds a real package must satisfy all of these first:
 
-1. **Reader-first.** A v10 writer may not start until every relevant reader accepts ruleset <= 10. The explicit reader policy below provides `READER_MAX_RULESET=10`; pin parsing must refuse a manifest rulesetVersion above it and below the supported floor. Roll the reader ceiling out first with wasm-bindgen still off, then the v10 writer/pin. Do not overload the TS `SCRUB_RULESET_VERSION` as the reader ceiling.
+1. **Reader-first.** A v10 writer may not start until every relevant reader accepts ruleset <= 10. Add a separate explicit `READER_MAX_RULESET=10`; pin parsing must refuse a manifest rulesetVersion above it and below the supported floor. Roll the reader ceiling out first with wasm-bindgen still off, then the v10 writer/pin. Do not overload the TS `SCRUB_RULESET_VERSION` as the reader ceiling. (Reader policy source implemented in #489; fleet rollout and relayscrubber-lead acceptance remain pending.)
 2. **Profile is crate-owned.** The schema-2 manifest must report a canonical profile field/string; the pipeline pins and compares it verbatim. The format derived in this PR (`relayscrubber/<ruleset>/<ver>/<policy>/<sourceSha>`) is a placeholder and must be replaced by the crate's value before any pin.
 3. **Stable tagged glue errors.** relayscrubber must expose stable error tags. Recognised domain/admission errors refuse one call; `WebAssembly.RuntimeError`, `RangeError`/OOM, or ANY unrecognised throw poisons the instance. The current Error-vs-trap heuristic is removed before pin.
-4. **Loader policy in the adapter.** Hashing `index.js` without executing it is package provenance only, never runtime security. The adapter imports the verified generated glue directly. Its byte admission is described below; the qualified Rust package must recheck the same limits. The registry package/archive checksum goes into the build receipt; component digests remain the runtime pins.
+4. **Loader policy in the adapter.** Hashing `index.js` without executing it is package provenance only, never runtime security. The adapter may import the verified generated glue directly but must implement the reviewed loader policy itself, including the 16 MiB UTF-8 preflight before the bindgen copy. The registry package/archive checksum goes into the build receipt; component digests remain the runtime pins. (Adapter-side preflight implemented in #489, pending relayscrubber-lead acceptance; qualified package/provenance requirements remain open.)
 5. **Workers.** CI/build must hash the exact wasm and glue source files against the pin before bundling, prove through the bundler metafile/module manifest that the CompiledWasm input is that exact path, and retain a durable bundle receipt mapping wasmSha/glueSha/sourceSha to the deployment bundle digest. Startup still verifies the instance manifest/profile. Mutated-wasm and swapped-module build tests must fail.
 
-Additional cutover requirements: the qualified Rust package must independently recheck the adapter's byte limits and pass real native/WASM limit-1 / limit / limit+1 multibyte tests; route and re-pin every `sealRawChunk` call site; no TS or raw fallback. Adapter tests with inert glue doubles do not qualify a Rust package.
+Additional cutover requirements: adapter-side `MAX_TEXT_BYTES` = 16 MiB UTF-8 for text and JSON before any WASM call; records 16 MiB each and 64 MiB aggregate; JS preflight plus Rust recheck; limit-1 / limit / limit+1 multibyte tests; copy or reject shared mutable record buffers before invocation; route and re-pin every `sealRawChunk` call site; no TS or raw fallback. (Adapter-side admission implemented in #489, pending relayscrubber-lead acceptance; Rust recheck/package boundary proofs and seal-path routing remain open.)
+
+Adapter tests with inert glue doubles do not qualify a Rust/WASM package.
 
 ### Adapter input admission
 
