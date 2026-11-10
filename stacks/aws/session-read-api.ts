@@ -16,7 +16,12 @@
  *
  * The function reads no bucket, key or queue: its only grant is the secret's
  * resource policy (GetSecretValue for the function's own role). The role
- * Alchemy creates gets nothing else.
+ * Alchemy creates gets nothing else. The one exception is opt-in: with
+ * `analysisBucket: true` (lane F1) the transcript bucket and key policies let
+ * this role GetObject/Decrypt the session-analysis result objects only
+ * (96bulls/<org>/v1/.../normalized/session-analysis-v2/*), and the function gets
+ * READ_API_ANALYSIS_BUCKET. It is enabled in the same reviewed plan phase as
+ * `sessionPipeline.analysisJobs` (transcript-store.ts sessionAnalysisJobPhase).
  */
 import * as AWS from "@alchemy.run/aws";
 import * as Effect from "effect/Effect";
@@ -41,6 +46,8 @@ export interface SessionReadApiInputs {
    * (`session-read-api-throttles-alarm`).
    */
   reservedConcurrency?: number | "none";
+  /** Lane F1: serve GET/POST /v1/sessions/:id/analysis from the transcript bucket. Default off. */
+  analysisBucket?: boolean;
 }
 
 export const SESSION_READ_API_RESOURCES = [
@@ -69,11 +76,13 @@ export function assertSessionReadApiInputs(p: unknown, refuse: (why: string) => 
     refuse("transcriptStore.sessionReadApi must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "completeSince" && k !== "origin" && k !== "reservedConcurrency") refuse(`transcriptStore.sessionReadApi.${k} is not a known setting`);
+    if (k !== "completeSince" && k !== "origin" && k !== "reservedConcurrency" && k !== "analysisBucket") refuse(`transcriptStore.sessionReadApi.${k} is not a known setting`);
   if (typeof v.completeSince !== "string" || (v.completeSince !== "epoch" && !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(v.completeSince)))
     refuse('transcriptStore.sessionReadApi.completeSince must be an ISO UTC timestamp or "epoch"');
   if (v.origin !== undefined && (typeof v.origin !== "string" || !ORIGIN.test(v.origin)))
     refuse("transcriptStore.sessionReadApi.origin must be this function's us-east-1 Function URL origin (no path)");
+  if (v.analysisBucket !== undefined && typeof v.analysisBucket !== "boolean")
+    refuse("transcriptStore.sessionReadApi.analysisBucket must be a boolean");
   if (v.reservedConcurrency !== undefined && v.reservedConcurrency !== "none" && !(Number.isInteger(v.reservedConcurrency) && (v.reservedConcurrency as number) >= 2 && (v.reservedConcurrency as number) <= 50))
     refuse('transcriptStore.sessionReadApi.reservedConcurrency must be an integer from 2 to 50, or "none" (only below the default account quota)');
 }
@@ -92,7 +101,25 @@ export function sessionReadApiSecretPolicy(i: { roleArn: string }) {
 export const RELAYAUTH_PROD_JWKS_URL = "https://api.relayauth.dev/.well-known/jwks.json";
 export const RELAYAUTH_PROD_ISSUER = "https://relayauth.dev";
 
-export function sessionReadApiEnv(i: { stage: string; names: SessionReadApiNames; p: SessionReadApiInputs }) {
+/** Lane F1: the result object root the read API may GetObject/Decrypt (session-pipeline.ts ANALYSIS_RESULT_OBJECT_GLOB). */
+export function readApiAnalysisBucketStatement(i: { bucketArn: string; roleArn: string; glob: string }) {
+  return { Sid: "SessionReadApiReadsAnalysisResults", Effect: "Allow" as const, Principal: { AWS: i.roleArn }, Action: ["s3:GetObject"], Resource: [`${i.bucketArn}/${i.glob}`] };
+}
+export function readApiAnalysisKeyStatement(i: { accountId: string; region: string; bucketName: string; roleArn: string; glob: string }) {
+  return {
+    Sid: "SessionReadApiDecryptsAnalysisResultsViaS3",
+    Effect: "Allow" as const,
+    Principal: { AWS: i.roleArn },
+    Action: ["kms:Decrypt"],
+    Resource: "*",
+    Condition: {
+      StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
+      StringLike: { "kms:EncryptionContext:aws:s3:arn": `arn:aws:s3:::${i.bucketName}/${i.glob}` },
+    },
+  };
+}
+
+export function sessionReadApiEnv(i: { stage: string; names: SessionReadApiNames; p: SessionReadApiInputs; analysisBucketName?: string }) {
   return {
     DEPLOYMENT: i.stage,
     DEPLOYMENT_ID: i.stage,
@@ -106,6 +133,8 @@ export function sessionReadApiEnv(i: { stage: string; names: SessionReadApiNames
     // resolve, so without this every token failed the JWKS fetch and Cloud saw only 401s.
     RELAYAUTH_JWKS_URL: RELAYAUTH_PROD_JWKS_URL,
     RELAYAUTH_ISSUER: RELAYAUTH_PROD_ISSUER,
+    // Lane F1: present only when analysisBucket is on, so existing deploys see no env change.
+    ...(i.p.analysisBucket && i.analysisBucketName ? { READ_API_ANALYSIS_BUCKET: i.analysisBucketName } : {}),
     NODE_OPTIONS: "--enable-source-maps",
   };
 }
@@ -121,7 +150,7 @@ export function sessionReadApiEnv(i: { stage: string; names: SessionReadApiNames
  * `lambda:InvokeFunction` to `*` only with `InvokedViaFunctionUrl`, so the
  * Invoke API stays closed. Explicit, buffered, and no CORS (no browser caller).
  */
-export function sessionReadApiFunctionProps(i: { stage: string; names: SessionReadApiNames; p: SessionReadApiInputs }) {
+export function sessionReadApiFunctionProps(i: { stage: string; names: SessionReadApiNames; p: SessionReadApiInputs; analysisBucketName?: string }) {
   return {
     functionName: i.names.function,
     main: "src/session-read-api/lambda.ts",
@@ -174,13 +203,15 @@ export function sessionReadApiAlarms(names: SessionReadApiNames) {
 export interface SessionReadApiStageInputs {
   stage: string;
   p: SessionReadApiInputs;
+  /** The transcript bucket, for READ_API_ANALYSIS_BUCKET when analysisBucket is on. */
+  analysisBucketName?: string;
   tags: (component: string) => Record<string, string>;
 }
 
 export const sessionReadApi = (i: SessionReadApiStageInputs) =>
   Effect.gen(function* () {
     const names = sessionReadApiNames(i.stage);
-    const fn = yield* AWS.Lambda.Function("session-read-api", sessionReadApiFunctionProps({ stage: i.stage, names, p: i.p }) as never);
+    const fn = yield* AWS.Lambda.Function("session-read-api", sessionReadApiFunctionProps({ stage: i.stage, names, p: i.p, ...(i.analysisBucketName ? { analysisBucketName: i.analysisBucketName } : {}) }) as never);
     const roleArn = (fn as unknown as { roleArn: string }).roleArn;
     // A container only: the lead sets the value from 1Password (runbook). Alchemy state never holds it.
     yield* AWS.SecretsManager.Secret("session-read-api-secret", {
@@ -192,6 +223,7 @@ export const sessionReadApi = (i: SessionReadApiStageInputs) =>
     } as never);
     for (const [id, props] of sessionReadApiAlarms(names)) yield* AWS.CloudWatch.Alarm(id, { ...props, tags: i.tags("session-read-api") } as never);
     return {
+      roleArn,
       functionName: names.function,
       functionUrl: (fn as unknown as { functionUrl: string | undefined }).functionUrl,
       secretName: names.secret,

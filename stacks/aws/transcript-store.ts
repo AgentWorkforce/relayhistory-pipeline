@@ -70,6 +70,8 @@ import {
   SESSION_READ_API_RESOURCES,
   assertSessionReadApiInputs,
   sessionReadApi,
+  readApiAnalysisBucketStatement,
+  readApiAnalysisKeyStatement,
   type SessionReadApiInputs,
 } from "./session-read-api.ts";
 
@@ -416,8 +418,8 @@ function sessionAnalysisJobPhase(operations:ReadonlyMap<string,string>,detailedP
  // the bucket and key may update in this phase only when the detailed plan names those Sids.
  const storeUpdates=["transcripts","transcripts-key"].filter(r=>operations.get(r)==="update");
  for(const r of storeUpdates){
-  const sid=r==="transcripts"?"SessionPipelineWritesAnalysisResults":"SessionPipelineEncryptsAnalysisResultsViaS3";
-  if(!detailedPlanText.includes(sid))return refuse(`analysis jobs: ${r} may update only to add ${sid}`);
+  const sids=r==="transcripts"?["SessionPipelineWritesAnalysisResults","SessionReadApiReadsAnalysisResults"]:["SessionPipelineEncryptsAnalysisResultsViaS3","SessionReadApiDecryptsAnalysisResultsViaS3"];
+  if(!sids.some(sid=>detailedPlanText.includes(sid)))return refuse(`analysis jobs: ${r} may update only to add ${sids.join(" or ")}`);
  }
  const allowed=new Set<string>([...SESSION_ANALYSIS_JOB_RESOURCES,...SESSION_PIPELINE_RESOURCES,...ROLE_GRANT_RESOURCES,...SESSION_READ_API_RESOURCES,...storeUpdates]);
  if([...operations].some(([r,a])=>a!=="noop"&&!allowed.has(r)))return refuse("analysis jobs require a separate reviewed phase");
@@ -1313,7 +1315,7 @@ export function trailLogBucketPolicy(i: { bucketArn: string; trailArn: string; a
  * The eraser and every other operator role have no use of it: deleting needs no key,
  * and nobody reads transcripts with the console.
  */
-export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; bufferedGcRoleArn?: string; analysisResults?: boolean }) {
+export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; bufferedGcRoleArn?: string; analysisResults?: boolean; readApiRoleArn?: string }) {
   if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId);
   const via = {
     StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
@@ -1328,6 +1330,7 @@ export function transcriptKeyPolicy(i: { accountId: string; region: string; buck
       { Sid: "ReaderDecryptsViaS3", Effect: "Allow" as const, Principal: { AWS: i.readerArn }, Action: ["kms:Decrypt"], Resource: "*", Condition: via },
       ...(i.pipelineRoleArn ? [pipelineKeyStatement({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.pipelineRoleArn })] : []),
       ...(i.pipelineRoleArn && i.analysisResults ? [pipelineAnalysisKeyStatement({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.pipelineRoleArn })] : []),
+      ...(i.readApiRoleArn ? [readApiAnalysisKeyStatement({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.readApiRoleArn, glob: ANALYSIS_RESULT_OBJECT_GLOB })] : []),
       ...(i.bufferedGcRoleArn ? bufferedGcKeyStatements({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.bufferedGcRoleArn }) : []),
     ],
   };
@@ -1554,6 +1557,14 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       : undefined;
     const pipelineRoleArn = pipelineFn ? ((pipelineFn as unknown as { roleArn: string }).roleArn) : undefined;
 
+    // Lane F1: with analysisBucket on, the read API (and so its role) comes before the key and the
+    // bucket, whose policies then grant that role GetObject/Decrypt on the analysis results only.
+    const readApiInputs = i.transcriptStore.sessionReadApi;
+    const readApiEarly = readApiInputs?.analysisBucket
+      ? yield* sessionReadApi({ stage: i.stage, p: readApiInputs, tags: i.tags, analysisBucketName: n.bucket })
+      : null;
+    const readApiRoleArn = readApiEarly ? (readApiEarly.roleArn as unknown as string) : undefined;
+
     const key = yield* AWS.KMS.Key("transcripts-key", {
       description: `96bulls ${i.stage}: transcript objects (SSE-KMS, per-object data keys)`,
       enableKeyRotation: true,
@@ -1568,6 +1579,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
         bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn,
         ...(pipelineRoleArn ? { pipelineRoleArn } : {}),
         ...(pipeline?.analysisJobs?.enabled ? { analysisResults: true } : {}),
+        ...(readApiRoleArn ? { readApiRoleArn } : {}),
       }) as never,
       // Also orders the key after the trail: the trail audits its use from the first call, and the
       // trail chain gives IAM time to propagate the new users KMS validates as principals.
@@ -1598,6 +1610,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       policy: [
         ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn, accountId: i.accountId, bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn, ...(pipelineRoleArn && pipeline?.analysisJobs?.enabled ? { analysisDeleterArn: pipelineRoleArn } : {}) }),
         ...(pipelineRoleArn ? pipelineBucketStatements({ bucketArn: n.bucketArn, roleArn: pipelineRoleArn, analysisResults: pipeline?.analysisJobs?.enabled === true }) : []),
+        ...(readApiRoleArn ? [readApiAnalysisBucketStatement({ bucketArn: n.bucketArn, roleArn: readApiRoleArn, glob: ANALYSIS_RESULT_OBJECT_GLOB })] : []),
       ] as never,
       lifecycleRules: transcriptLifecycleRules() as never,
       logging: { targetBucket: accessLogs.bucketName as unknown as string, targetPrefix: ACCESS_LOG_PREFIX, targetObjectKeyFormat: { PartitionedPrefix: { PartitionDateSource: "EventTime" } } as never },
@@ -1617,8 +1630,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
           })
         : null;
 
-    const readApiInputs = i.transcriptStore.sessionReadApi;
-    const readApi = readApiInputs ? yield* sessionReadApi({ stage: i.stage, p: readApiInputs, tags: i.tags }) : null;
+    const readApi = readApiEarly ?? (readApiInputs ? yield* sessionReadApi({ stage: i.stage, p: readApiInputs, tags: i.tags }) : null);
 
     yield* AWS.Budgets.Budget("budget", {
       budgetName: n.budget,
