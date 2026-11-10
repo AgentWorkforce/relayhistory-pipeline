@@ -1,3 +1,4 @@
+import type { GetObject } from "../../object-store/src/types.ts";
 import { expect, it } from "vitest";
 import { decompress } from "fzstd";
 import { canonicalHandle } from "../src/canonical.ts";
@@ -15,9 +16,29 @@ import type {
   CanonicalDeps,
   CanonicalPointer,
 } from "../../../src/session-read-api/canonical.ts";
-it.each([false, true])(
-  "reads canonical zstd records and legally large replay in workerd (large=%s)",
-  async (large) => {
+interface Scenario {
+  name: string;
+  large?: boolean;
+  manifestVersion: number;
+  chunkVersion?: number | string;
+  ceiling?: string;
+  status: number;
+}
+const scenarios: Scenario[] = [
+  { name: "legacy small", manifestVersion: 1, status: 200 },
+  { name: "legacy legally large replay", large: true, manifestVersion: 1, status: 200 },
+  { name: "future manifest refused by default", manifestVersion: 10, chunkVersion: 10, status: 503 },
+  { name: "future manifest with explicit reader capability", manifestVersion: 10, chunkVersion: 10, ceiling: "10", status: 200 },
+  { name: "mixed-version chunks refused by default", manifestVersion: 1, chunkVersion: 10, status: 503 },
+  { name: "mixed-version chunks with explicit reader capability", manifestVersion: 1, chunkVersion: 10, ceiling: "10", status: 200 },
+  { name: "future manifest requires chunk metadata", manifestVersion: 10, ceiling: "10", status: 503 },
+  { name: "chunk above configured ceiling", manifestVersion: 1, chunkVersion: 11, ceiling: "10", status: 503 },
+  { name: "chunk version must be canonical decimal", manifestVersion: 1, chunkVersion: "1e1", ceiling: "10", status: 503 },
+  { name: "invalid Worker capability binding refuses", manifestVersion: 1, ceiling: " 10", status: 503 },
+];
+it.each(scenarios)(
+  "canonical read in workerd: $name",
+  async ({ large = false, manifestVersion, chunkVersion, ceiling, status }) => {
     const at = "2026-11-01T10:00:00.000Z",
       location = {
         prefix: "96bulls/org_1",
@@ -89,7 +110,7 @@ it.each([false, true])(
         ],
         next_offset: raw.byteLength,
         chunks: [chunk],
-        scrub: { ruleset: "relayhistory-scrub", version: 1 },
+        scrub: { ruleset: "relayhistory-scrub", version: manifestVersion },
       },
       extensions: {
         "96bulls": { user_id: "user_1", canonical_session_id: "sess:1" },
@@ -109,9 +130,17 @@ it.each([false, true])(
     };
     const store = {
       get: async (key: unknown) => body(key),
-      getObject: async (key: unknown) => ({
+      getObject: async (key: unknown): Promise<GetObject> => ({
         body: body(key),
-        meta: { version: { eTag: "fixture" } },
+        meta: {
+          key: objectKey(String(key)),
+          size: objects.get(String(key))!.byteLength,
+          lastModified: new Date(at),
+          version: { eTag: "fixture" },
+          metadata: String(key).endsWith(".zst") && chunkVersion !== undefined
+            ? { "scrub-ruleset": "relayhistory-scrub", "scrub-version": String(chunkVersion) }
+            : {},
+        },
       }),
     } as unknown as ObjectStore;
     const pointer: CanonicalPointer = {
@@ -156,12 +185,20 @@ it.each([false, true])(
           (large ? "&view=replay" : ""),
         { headers: { authorization: "Bearer " + token } },
       ),
-      { CANONICAL_READ_ENABLED: "true" },
+      { CANONICAL_READ_ENABLED: "true", ...(ceiling === undefined ? {} : { READER_MAX_RULESET: ceiling }) },
       fetch,
       deps,
     );
-    expect(result.status).toBe(200);
-    expect(await result.json()).toMatchObject({
+    expect(result.status).toBe(status);
+    const payload = await result.json();
+    if (status !== 200) {
+      expect(payload).toMatchObject({ error: { code: "session_read_unavailable" } });
+      expect(result.headers.get("X-Session-Read-Reason")).toBe(ceiling === " 10" ? "canonical_unavailable" : "canonical_projection_incomplete");
+      expect(payload).not.toHaveProperty("rows");
+      expect(JSON.stringify(payload)).not.toContain("worker transcript");
+      return;
+    }
+    expect(payload).toMatchObject({
       sessionId: "sess:1",
       rows: [
         {
