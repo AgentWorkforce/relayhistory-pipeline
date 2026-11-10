@@ -24,6 +24,7 @@
  * are queued for the separate erasure job (`../neon-s3-erasure`), which alone
  * holds the eraser key.
  */
+import type { BoundRawChunkSealer } from "../../../packages/pipeline/src/lib/pipeline/engine-raw-chunks.ts";
 import { createHash } from "node:crypto";
 import {
   SCRUB_RULESET,
@@ -51,6 +52,8 @@ export const EXPORT_MARKER = "client.relayhistory_export";
 const SESSION_EXT = "96bulls";
 
 export interface ExportTarget {
+  /** Default-off scaffold dependency; default export stamps stay unchanged. */
+  rawChunkSealer?: BoundRawChunkSealer;
   store: ObjectStore;
   /** Deployment key root; objects land under `{keyRoot}/{org}/v1/...`. */
   keyRoot: string;
@@ -124,7 +127,8 @@ class MachineStream {
   truncated = 0;
   truncatedMaxChars = 0;
   /** `raw.scrub.version`: the lowest version applied to any listed chunk. */
-  scrubVersion = SCRUB_RULESET_VERSION;
+  scrubVersion: number;
+  readonly rawChunkSealer: BoundRawChunkSealer | undefined;
   userId: string | null = null;
 
   constructor(
@@ -132,6 +136,8 @@ class MachineStream {
     readonly unit: SessionUnit,
     readonly sourceMachineId: string,
   ) {
+    this.rawChunkSealer = target.rawChunkSealer;
+    this.scrubVersion = this.rawChunkSealer?.marker.version ?? SCRUB_RULESET_VERSION;
     const startDate = new Date(unit.firstMs).toISOString().slice(0, 10);
     this.loc = {
       prefix: orgPrefix(target.keyRoot, unit.orgId),
@@ -188,7 +194,7 @@ class MachineStream {
     const startOffset = this.#offset;
     const stored = (await this.existing())?.manifest;
     const prior =
-      stored?.raw.scrub?.ruleset === SCRUB_RULESET && stored.raw.scrub.version <= SCRUB_RULESET_VERSION
+      !this.rawChunkSealer && stored?.raw.scrub?.ruleset === SCRUB_RULESET && stored.raw.scrub.version <= SCRUB_RULESET_VERSION
         ? stored.raw.chunks[seq]
         : undefined;
     let entry: ChunkEntry;
@@ -203,7 +209,7 @@ class MachineStream {
       this.reused += 1;
       this.scrubVersion = Math.min(this.scrubVersion, stored!.raw.scrub!.version);
     } else {
-      const sealed = await sealRawChunk(this.target.store, {
+      const sealed = await (this.rawChunkSealer ?? sealRawChunk)(this.target.store, {
         location: this.loc,
         format: "ndjson",
         seq,
@@ -218,7 +224,7 @@ class MachineStream {
       // only past the bound (3 added rules that 1 and 2 lack), so a chunk kept
       // at 1 or 2 may hold a secret the current rules catch. Re-sending the
       // same source range does not rescrub it: the stored object is kept.
-      if (sealed.scrub.ruleset !== SCRUB_RULESET || sealed.scrub.version > SCRUB_RULESET_VERSION)
+      if (sealed.scrub.ruleset !== SCRUB_RULESET || sealed.scrub.version > (this.rawChunkSealer?.marker.version ?? SCRUB_RULESET_VERSION))
         throw Object.assign(new Error("a stored chunk was sealed under another scrub rule set"), {
           code: "chunk_scrub_mismatch",
         });

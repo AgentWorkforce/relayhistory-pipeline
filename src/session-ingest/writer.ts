@@ -36,6 +36,7 @@
  *
  * Nothing here logs or puts content in an error message.
  */
+import type { BoundRawChunkSealer } from "../../packages/pipeline/src/lib/pipeline/engine-raw-chunks.ts";
 import { createHash } from "node:crypto";
 import { LAYOUT_VERSION } from "@rhc-object-store";
 import { SCRUB_RULESET } from "@rhc/lib/pipeline/raw-chunks.ts";
@@ -82,6 +83,8 @@ export class IngestWriteError extends Error {
 }
 
 export interface WriteTarget {
+  /** Default-off scaffold dependency; no runtime environment routing. */
+  rawChunkSealer?: BoundRawChunkSealer;
   store: ObjectStore;
   keyRoot: string;
   now?: () => Date;
@@ -338,6 +341,7 @@ async function writeGroup(
   source: Uint8Array,
   attempts: { ambiguousManifestPut: boolean },
 ): Promise<{ manifest: ManifestWrite; chunkKey: string; sha256: string }> {
+  const rawSealer = target.rawChunkSealer ?? sealRawChunk;
   const now = target.now ?? (() => new Date());
   const prefix = `${target.keyRoot}/${batch.orgId}`;
   const base = {
@@ -369,7 +373,7 @@ async function writeGroup(
         sha256: prior.sha256,
         chunkKey: rawChunkKey(location, prior.seq, prior.start_offset, prior.sha256, "ndjson"),
       };
-    const sealed = await sealRawChunk(target.store, {
+    const sealed = await rawSealer(target.store, {
       location,
       format: "ndjson",
       seq: prev?.raw.chunks.length ?? 0,
