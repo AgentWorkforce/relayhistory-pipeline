@@ -211,6 +211,50 @@ during recovery.
 A hosted operator copy of this plan, with deployment-specific details, is kept
 privately. It is optional context and is not needed to follow this section.
 
+## Native self-host activation
+
+The Neon shadow procedure above remains the hosted procedure. Native installs
+use their verified canonical object-storage manifests and the normal consumer's
+complete-source projection instead. Do not invent a Neon fallback or mark only
+one workspace complete: `session_directory_catalog_rollout` is global.
+
+After the normal consumer has projected **every live logical session**, run
+`bun scripts/native-agent-catalog-activation.ts --plan` with
+`HOOPDB_DB_MODE=selfhosted`, an owner `HOOPDB_URL` using `sslmode=verify-full`,
+and the installation's normal CA trust. Supply credentials through the existing
+secret mechanism; never save them in a plan or command transcript. The command
+first runs the source image's checksum/role schema verifier. It refuses a role
+whose RLS visibility could hide another tenant, and limits the audit to 10,000
+directory rows; a larger install needs a separately reviewed bounded driver.
+
+The plan covers all tenants and harnesses, complete current event/catalog
+projection, live pointer coverage, agent companion membership and ordering,
+unknown users, machine pointers, and parent-edge liveness. Its report contains
+counts and a fingerprint, not names, content or credentials. A missing or unreadable
+legacy source must be repaired through the normal complete-source writer. It is
+not an exclusion, and cannot be waived by clearing a flag or deleting the row.
+An empty recorded agent array is legitimate for an unnamed session. It does not
+prove that Desktop's registered name was exported correctly.
+
+Before activation, retain canonical-read/reprojection receipts, schema and role
+proofs, queue/dead-letter health, pagination checks, and the intended registered
+agents' actual SDK-to-catalog evidence. Review the plan. With authorization for
+the real database write, run the same command with `--apply PLAN_FINGERPRINT`.
+It takes short bounded locks, blocks concurrent migration admission and reruns
+the complete audit before changing only the existing completion marker. A changed
+plan, stale projection or failed invariant refuses the write. It never repairs
+data, resets epochs, changes tombstones/fences, or turns on the newer Desktop
+relationship/model catalog (`catalog_read_version` / forget tracking).
+
+Then prove the actual authenticated `agent=` list filters, tenant isolation,
+pagination and Dashboard chips against the known sessions. `q=@name` alone is
+not this proof. The list's `agent=` parameter is an exact normalized name; a
+short prefix must not be reported as matching every longer agent name. Missing
+registered names require the SDK/export repair, not names inferred from text.
+If any acceptance fails, treat activation as incomplete and retain the evidence;
+do not claim success because the audit or marker write passed. Native recovery
+uses the same complete-source re-projection without restoring deletion history.
+
 ## Gaps, not in this migration
 
 - **`task_refs` / PR link and `kinds`.** Neither has a projection, so the list
