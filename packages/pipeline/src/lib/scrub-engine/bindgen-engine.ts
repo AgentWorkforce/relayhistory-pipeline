@@ -30,7 +30,7 @@
  */
 import { sha256Hex } from "../../../../object-store/src/crypto.js";
 import { SCRUB_RULESET_VERSION } from "../pipeline/raw-chunks.js";
-import { PipelineError } from "../pipeline/errors.js";
+import { preflightScrubRecords, preflightScrubText, refuseMalformedScrubInput } from "./bindgen-admission.js";
 import {
   ScrubEngineUnavailable,
   type BindgenArtifactName,
@@ -223,9 +223,6 @@ export type BindgenScrubEngine = ScrubEngine & {
 };
 
 const encoder = new TextEncoder();
-const strictDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-/** wasm-bindgen passes strings as UTF-8: a lone surrogate would be silently rewritten to U+FFFD. */
-const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
 
 /**
  * A trap (panic -> `unreachable`, OOM abort) or a stack/heap RangeError leaves the
@@ -237,19 +234,6 @@ function isTrap(error: unknown): boolean {
   if (RuntimeError && error instanceof RuntimeError) return true;
   if (error instanceof RangeError) return true;
   return !(error instanceof Error) && typeof error !== "string";
-}
-
-function isUtf8(bytes: Uint8Array): boolean {
-  try {
-    strictDecoder.decode(bytes);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function notWellFormed(): never {
-  throw new PipelineError("scrub_input_not_well_formed", "scrub input is not well-formed UTF-16", false);
 }
 
 /** Build the engine around a verified, initialised glue module. Not exported: only the two init paths call it. */
@@ -273,7 +257,7 @@ function makeEngine(glue: BindgenGlue, manifest: Readonly<BindgenManifest>): Bin
     }
   };
   const text = (fn: (s: string) => string, value: string): string => {
-    if (typeof value !== "string" || LONE_SURROGATE.test(value)) notWellFormed();
+    preflightScrubText(value);
     const out = invoke(() => fn(value));
     if (typeof out !== "string") throw new ScrubEngineUnavailable("engine_refused");
     return out;
@@ -309,10 +293,10 @@ function makeEngine(glue: BindgenGlue, manifest: Readonly<BindgenManifest>): Bin
       try {
         input = JSON.stringify(value);
       } catch {
-        return notWellFormed();
+        return refuseMalformedScrubInput();
       }
-      if (typeof input !== "string" || LONE_SURROGATE.test(input)) notWellFormed();
-      const envelope = parseEnvelope(invoke(() => glue.scrubJson(input as string)));
+      preflightScrubText(input);
+      const envelope = parseEnvelope(invoke(() => glue.scrubJson(input)));
       // Use the Rust-serialised jsonText, never `.value` (a JS view that may round large integers).
       if (typeof envelope.jsonText !== "string") throw new ScrubEngineUnavailable("engine_refused");
       try {
@@ -322,15 +306,8 @@ function makeEngine(glue: BindgenGlue, manifest: Readonly<BindgenManifest>): Bin
       }
     },
     scrubRecords: (source: Uint8Array): ScrubRecordsResult => {
-      let out: unknown;
-      try {
-        out = invoke(() => glue.scrubRecords(source));
-      } catch (error) {
-        // Same refusal, code and retryability as the TypeScript engine, decided only after the engine refused.
-        if (error instanceof ScrubEngineUnavailable && error.reason === "engine_refused" && !isUtf8(source))
-          throw new PipelineError("chunk_not_utf8", "raw chunk is not valid UTF-8", false);
-        throw error;
-      }
+      const bytes = preflightScrubRecords(source);
+      const out = invoke(() => glue.scrubRecords(bytes));
       const r = parseEnvelope(out);
       if (typeof r.text !== "string" || !Number.isSafeInteger(r.recordCount) || (r.recordCount as number) < 0)
         throw new ScrubEngineUnavailable("engine_refused");
