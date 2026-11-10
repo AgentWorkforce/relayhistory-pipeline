@@ -9,7 +9,9 @@ import { nativeAgentCatalogActivation } from "../src/hoopdb/native-agent-catalog
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 
 const [context, container] = process.argv.slice(2);
-if (!context || !container || process.argv.length !== 4) throw new Error("proof_usage_context_container");
+if (!context || !container || context.startsWith("-") || container.startsWith("-") || process.argv.length !== 4) {
+  throw new Error("proof_usage_context_container");
+}
 const docker = (...args: string[]) => execFileSync("docker", ["--context", context, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 const check: (ok: unknown, code: string) => asserts ok = (ok, code) => { if (!ok) throw new Error(code); };
 const inspected = JSON.parse(docker("inspect", container));
@@ -55,7 +57,7 @@ try {
     CREATE TABLE sessions.session_directory(org_id text,workspace_id text,harness text,session_id text,
       deleted_at timestamptz,event_projection_epoch bigint,last_activity_at timestamptz,event_projection_ready boolean,
       event_projected_at timestamptz,catalog_projected_at timestamptz,agent_names text[],PRIMARY KEY(org_id,workspace_id,harness,session_id));
-    CREATE TABLE sessions.session_index(org_id text,workspace_id text,harness text,session_id text,machine_id text,canonical_session_id text,deleted_at timestamptz);
+    CREATE TABLE sessions.session_index(org_id text,workspace_id text,harness text,session_id text,machine_id text,canonical_machine_id text,canonical_session_id text,deleted_at timestamptz);
     CREATE TABLE sessions.session_directory_agents(org_id text,workspace_id text,harness text,session_id text,agent_name_normalized text,last_activity_at timestamptz);
     CREATE TABLE sessions.session_directory_users(user_id text);
     CREATE TABLE sessions.session_directory_machines(org_id text,workspace_id text,harness text,session_id text,machine_id text);
@@ -63,9 +65,9 @@ try {
     CREATE TABLE sessions.session_directory_catalog_rollout(singleton boolean PRIMARY KEY,completed_at timestamptz,updated_at timestamptz);
     CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);
     INSERT INTO sessions.session_directory VALUES('org-test','ws-test','codex','s1',NULL,1,'2026-01-01',true,'2026-01-01','2026-01-01',ARRAY['reviewer']);
-    INSERT INTO sessions.session_index VALUES('org-test','ws-test','codex','s1','m1',NULL,NULL);
+    INSERT INTO sessions.session_index VALUES('org-test','ws-test','codex','s1','physical-m1','canonical-m1',NULL,NULL);
     INSERT INTO sessions.session_directory_agents VALUES('org-test','ws-test','codex','s1','reviewer','2026-01-01');
-    INSERT INTO sessions.session_directory_machines VALUES('org-test','ws-test','codex','s1','m1');
+    INSERT INTO sessions.session_directory_machines VALUES('org-test','ws-test','codex','s1','canonical-m1');
     INSERT INTO sessions.session_directory_catalog_rollout VALUES(true,NULL,NULL)`);
   await owner.query("INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker',$1,'pass')", [generation]);
   const plan = await nativeAgentCatalogActivation(transaction(owner), options);

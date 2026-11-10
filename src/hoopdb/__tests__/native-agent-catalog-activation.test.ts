@@ -32,12 +32,17 @@ beforeAll(async () => {
 }, 120_000);
 afterAll(async () => { await db.close(); });
 
-async function seed(id: string, workspace = "ws-a", complete = true) {
+async function seed(
+  id: string,
+  workspace = "ws-a",
+  complete = true,
+  { canonicalMachineId = null, userId = "u1" }: { canonicalMachineId?: string | null; userId?: string } = {},
+) {
   await db.query(`INSERT INTO sessions.session_index
-    (org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,
+    (org_id,workspace_id,harness,session_id,machine_id,canonical_machine_id,user_id,created_at,last_activity_at,
       storage_provider,bucket,manifest_key,raw_format,trace_id,revision)
-    VALUES('org-a',$1,'codex',$2,'m1','u1',now(),now(),'s3','bucket',$2,'jsonl',
-      '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c19',1)`, [workspace, id]);
+    VALUES('org-a',$1,'codex',$2,'m1',$3,$4,now(),now(),'s3','bucket',$2,'jsonl',
+      '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c19',1)`, [workspace, id, canonicalMachineId, userId]);
   const key = { orgId: "org-a", workspaceId: workspace, harness: "codex", sessionId: id };
   await projectSessionDirectory(db as never, key);
   if (complete) {
@@ -50,8 +55,11 @@ async function seed(id: string, workspace = "ws-a", complete = true) {
 }
 
 test("native audit covers every tenant, accepts the legacy writer, and plan writes nothing", async () => {
-  await seed("current");
+  await seed("current", "ws-a", true, { canonicalMachineId: "canonical-m1", userId: "Unknown" });
+  const machines = await db.query("SELECT machine_id FROM sessions.session_directory_machines WHERE session_id='current'");
+  expect(machines.rows).toEqual([{ machine_id: "canonical-m1" }]);
   const plan = await nativeAgentCatalogActivation(transact, opts);
+  expect(plan.counts).toMatchObject({ orphanMachines: 0, unknownUsers: 0 });
   expect(plan).toMatchObject({ scope: "all_native_tenants", rows: 1, eligible: true, activated: false });
   expect(plan.counts.liveRows).toBe(1);
   expect((await db.query<{ completed_at: unknown }>("SELECT completed_at FROM sessions.session_directory_catalog_rollout")).rows[0]!.completed_at).toBeNull();

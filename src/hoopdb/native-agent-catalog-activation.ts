@@ -46,7 +46,7 @@ export async function nativeAgentCatalogActivation(
     await tx.query("SET LOCAL lock_timeout='1s'");
     await tx.query("SET LOCAL TimeZone='UTC'");
     // Lock before taking the snapshot. Pointer/projector/tombstone/catalog writers
-    // cannot straddle the verification and marker update. Canonical uploads continue.
+    // cannot straddle the verification and marker update.
     if (apply) {
       // Serialize activations before shared data locks, avoiding a lock-upgrade
       // deadlock between two operators. The validation lock blocks pending-first
@@ -100,10 +100,11 @@ export async function nativeAgentCatalogActivation(
         LEFT JOIN sessions.session_directory d USING(org_id,workspace_id,harness,session_id)
         WHERE d.session_id IS NULL OR d.deleted_at IS NOT NULL OR NOT EXISTS(
           SELECT 1 FROM unnest(d.agent_names) x(name) WHERE lower(btrim(x.name))=a.agent_name_normalized)),
-      'unknownUsers',(SELECT count(*) FROM sessions.session_directory_users WHERE lower(btrim(user_id))='unknown'),
+      'unknownUsers',(SELECT count(*) FROM sessions.session_directory_users WHERE user_id='unknown'),
       'orphanMachines',(SELECT count(*) FROM sessions.session_directory_machines m
         WHERE NOT EXISTS(SELECT 1 FROM sessions.session_index p WHERE p.org_id=m.org_id
-          AND p.workspace_id=m.workspace_id AND p.harness=m.harness AND p.machine_id=m.machine_id
+          AND p.workspace_id=m.workspace_id AND p.harness=m.harness
+          AND coalesce(p.canonical_machine_id,p.machine_id)=m.machine_id
           AND coalesce(p.canonical_session_id,p.session_id)=m.session_id AND p.deleted_at IS NULL)),
       'orphanRelationships',(SELECT count(*) FROM sessions.session_directory_relationships r
         WHERE NOT EXISTS(SELECT 1 FROM sessions.session_directory d WHERE d.org_id=r.org_id
