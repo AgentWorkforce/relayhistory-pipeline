@@ -760,7 +760,10 @@ export function resourcePlanView(
   )
     refuse("binding_render_summary");
   const expected = new Set(
-      inventory.map((b) => "[session-ingest/" + b.sid + "] " + b.action),
+      inventory.map((b) =>
+        "[session-ingest/" + b.sid + "] " +
+          (b.action === "delete" ? "unbind" : b.action)
+      ),
     ),
     seen = new Set<string>();
   const lines = text.split("\n").filter((line) => {

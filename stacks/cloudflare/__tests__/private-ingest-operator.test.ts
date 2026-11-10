@@ -776,7 +776,7 @@ describe("operatorSafePlans: async admission follows the resolved mode; a deploy
     const changed = bindings.filter((b) => b.action !== "noop").length;
     const clauses = [...counts].map(([a, n]) => `${n} to ${a}`);
     const summary = `Plan: ${clauses.length ? clauses.join(", ") : "0 changes"}${changed ? `, ${changed} binding changes` : ""}`;
-    const lines = [summary, ...resources.map((r) => `[${r}] ${actions[r] ?? "noop"}`), ...bindings.map((b) => `[session-ingest/${b.sid}] ${b.action}`)];
+    const lines = [summary, ...resources.map((r) => `[${r}] ${actions[r] ?? "noop"}`), ...bindings.map((b) => `[session-ingest/${b.sid}] ${b.action === "delete" ? "unbind" : b.action}`)];
     const text = lines.join("\n") + "\n";
     return { planText: text, detailedText: lines.map((l) => (l.startsWith("[") ? `  ${l}` : l)).join("\n") + "\n" };
   };
@@ -807,7 +807,7 @@ describe("operatorSafePlans: async admission follows the resolved mode; a deploy
     // Alchemy emits this env-only Worker change as resource noop plus binding
     // update/delete rows. The verified adapter presents it to the original
     // stage guard as the in-place Worker update it represents.
-    expect(() => run(SEVEN, {}, [
+    const cleanupBindings = [
       queue("noop"),
       flag("noop", "drain"),
       {
@@ -819,7 +819,27 @@ describe("operatorSafePlans: async admission follows the resolved mode; a deploy
           text: `${overlap},${generation}`,
         },
       },
-    ])).not.toThrow();
+    ];
+    expect(() => run(SEVEN, {}, cleanupBindings)).not.toThrow();
+    const rendered = plans(SEVEN, {}, cleanupBindings);
+    expect(rendered.planText).toContain(
+      "[session-ingest/INGEST_ACCEPT_GENERATIONS] unbind",
+    );
+    const wrongVerb = {
+      planText: rendered.planText.replace(
+        "[session-ingest/INGEST_ACCEPT_GENERATIONS] unbind",
+        "[session-ingest/INGEST_ACCEPT_GENERATIONS] delete",
+      ),
+      detailedText: rendered.detailedText.replace(
+        "[session-ingest/INGEST_ACCEPT_GENERATIONS] unbind",
+        "[session-ingest/INGEST_ACCEPT_GENERATIONS] delete",
+      ),
+    };
+    expect(() => operatorSafePlans(
+      wrongVerb,
+      secrets,
+      cleanupBindings,
+    )).toThrow("binding_render_inventory");
   });
 
   test("a refused contract exposes actions only, never binding values", () => {
