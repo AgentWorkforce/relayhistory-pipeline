@@ -42,6 +42,11 @@
  *   INGEST_KEY_ROOT                  object key root, default "96bulls" (same as the Worker)
  *   INGEST_MAX_PER_USER / INGEST_MAX_PER_ORG   in-flight batch slots, defaults 4 / 32 (same as the Worker)
  *   RELAYHISTORY_INGEST_PG_POOL_MAX  pool size, 1..32, default 4
+ *   INGEST_CLAIM_LOCK_BUSY           unset/off (default) | on (any case, trimmed; the Worker's routingFlag, so any
+ *                                    other value is off, as on the Worker): a claim that loses its lock wait
+ *                                    (55P03/40P01) is a 429 delivery_busy with Retry-After 5-10 s instead of a 503
+ *                                    (deliver.ts ClaimLockBusy); 57014 and every other cause stay 503. HTTP only:
+ *                                    the async/drain admission consumer keeps its normal backoff (admission-consumer.ts)
  *
  *   SELFHOST_INGEST_ADMISSION        unset | "" | "sync" (default: today's synchronous path, unchanged) |
  *                                    "async" | "drain" (selfhost-admission.ts). Config only: no request
@@ -71,6 +76,8 @@ import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres
 import type pg from "pg";
 import { sessionEraseConfig, type SessionEraseConfig } from "./session-erase.ts";
 import { analyticsConfig, type AnalyticsConfig } from "../shared/analytics-config.ts";
+// Already in the self-host graph through deliver.ts; the same parser as the Worker's INGEST_CLAIM_LOCK_BUSY.
+import { routingFlag } from "./babysitter-retention.ts";
 
 export const SELFHOST_INGEST_FLAG = "RELAYHISTORY_SELFHOST_INGEST";
 export const SELFHOST_INGEST_PORT_VAR = "RELAYHISTORY_INGEST_PORT";
@@ -87,6 +94,7 @@ export const SELFHOST_INGEST_DEFAULT_PORT = 8081;
 export const SELFHOST_INGEST_ROLE = "bulls96_session_ingest";
 
 export const SELFHOST_INGEST_ADMISSION_VAR = "SELFHOST_INGEST_ADMISSION";
+export const SELFHOST_CLAIM_LOCK_BUSY_VAR = "INGEST_CLAIM_LOCK_BUSY";
 
 /** SELFHOST_INGEST_ADMISSION=async|drain; absent for sync (the default). */
 export interface SelfhostAdmissionSettings {
@@ -119,6 +127,8 @@ export interface SelfhostIngestSettings {
   admission?: SelfhostAdmissionSettings;
   /** ANALYTICS_* (src/shared/analytics-config.ts, self-host profile: noop or collector). Absent = noop. */
   analytics?: AnalyticsConfig;
+  /** INGEST_CLAIM_LOCK_BUSY=on: a claim lock-wait failure is a 429 with Retry-After. Absent (the default): 503. */
+  claimLockBusy?: true;
 }
 
 export type SelfhostIngestConfig = { enabled: false; port: number } | ({ enabled: true } & SelfhostIngestSettings);
@@ -256,6 +266,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u.test(keyRoot)) throw new Error("96bulls: INGEST_KEY_ROOT must be a single key segment");
   const admission = selfhostAdmissionSettings(env);
   const analytics = analyticsConfig(env, "selfhost");
+  const claimLockBusy = routingFlag(env[SELFHOST_CLAIM_LOCK_BUSY_VAR]);
   return {
     enabled: true,
     port: port(env),
@@ -272,5 +283,6 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     sessionErase,
     ...(admission ? { admission } : {}),
     ...(analytics.sink !== "noop" ? { analytics } : {}),
+    ...(claimLockBusy ? { claimLockBusy: true as const } : {}),
   };
 }
