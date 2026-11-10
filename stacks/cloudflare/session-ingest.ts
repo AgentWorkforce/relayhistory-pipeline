@@ -159,6 +159,13 @@ export interface SessionIngestInputs {
    * (no queue, no binding). Omit for off (the default; vars byte-identical to before).
    */
   syncAdmissionFrozenReceipt?: "on";
+  /**
+   * INGEST_CLAIM_LOCK_BUSY: a claim that loses its lock wait (SQLSTATE 55P03/40P01) answers 429
+   * delivery_busy with Retry-After 5-10 s instead of 503 (HTTP path only; the admission consumer keeps
+   * its normal backoff). Allowed in canonical and buffered acceptance alike. Present: the var only (no
+   * queue, no binding). Omit for off (the Worker default; no var rendered, vars byte-identical to before).
+   */
+  claimLockBusy?: "on";
 }
 
 /** The stack's async admission setting (the runtime var has the same values; absent there = "off"). */
@@ -188,7 +195,7 @@ const AUTHORITY_ENV_KEYS = [
   "INGEST_AUTHORITY_EXPECT_AUTH_EPOCH",
   "INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY",
 ] as const;
-const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt"];
+const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy"];
 
 function validAuthorityKeyRoot(value: unknown): value is string {
   if (typeof value !== "string" || !/^96bulls\/[A-Za-z0-9][A-Za-z0-9_/-]{0,151}$/.test(value) || value.endsWith("/")) return false;
@@ -289,6 +296,8 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
     refuse('sessionIngest.asyncAdmission must be "on", "drain" or "off" in buffered mode (omitted = "on"), and omitted or "off" outside buffered mode');
   if (v.syncAdmissionFrozenReceipt !== undefined && (v.syncAdmissionFrozenReceipt !== "on" || v.acceptanceMode !== "buffered" || v.custodySource !== "frozen-supabase"))
     refuse('sessionIngest.syncAdmissionFrozenReceipt must be "on", in buffered mode with custodySource frozen-supabase only (omit for off)');
+  if (v.claimLockBusy !== undefined && v.claimLockBusy !== "on")
+    refuse('sessionIngest.claimLockBusy must be "on" (omit for off)');
 }
 
 /** A producer binding to a queue this stack does not own (no state row: never created, changed or deleted here). */
@@ -321,6 +330,7 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     ...inboxAuthorityVars(p.authority, (why) => { throw new Error(why); }),
     ...(asyncAdmission !== "off" ? { INGEST_ASYNC_ADMISSION: asyncAdmission } : {}),
     ...(p.syncAdmissionFrozenReceipt === "on" ? { INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: "on" } : {}),
+    ...(p.claimLockBusy === "on" ? { INGEST_CLAIM_LOCK_BUSY: "on" } : {}),
   };
 }
 
