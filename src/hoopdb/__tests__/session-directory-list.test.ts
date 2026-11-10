@@ -895,7 +895,7 @@ describe("migration up/down/up", () => {
     const db = await database();
     await seed(db, FIXTURE);
     // Newer migrations depending on catalog columns must roll back first.
-    await db.exec(read("supabase/rollbacks/20261104030000_coordination_report_jobs.down.sql"));
+    await db.exec(read("supabase/rollbacks/20261105047000_coordination_report_jobs.down.sql"));
     await db.exec(read("supabase/rollbacks/20261105031000_desktop_catalog_forget_reproject.down.sql"));
     await db.exec(read("supabase/rollbacks/20261105023000_session_analysis_publications.down.sql"));
     await db.exec(read("supabase/rollbacks/20261105022000_session_desktop_catalog.down.sql"));
@@ -914,7 +914,7 @@ describe("migration up/down/up", () => {
     await db.exec(read("supabase/migrations/20261105022000_session_desktop_catalog.sql"));
     await db.exec(read("supabase/migrations/20261105023000_session_analysis_publications.sql"));
     await db.exec(read("supabase/migrations/20261105031000_desktop_catalog_forget_reproject.sql"));
-    await db.exec(read("supabase/migrations/20261104030000_coordination_report_jobs.sql"));
+    await db.exec(read("supabase/migrations/20261105047000_coordination_report_jobs.sql"));
     expect(ids(await list(db, {}))).toEqual(["s1", "s2", "s3", "s4"]);
   });
 });
