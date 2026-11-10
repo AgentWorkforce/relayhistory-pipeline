@@ -77,7 +77,13 @@ test("ensureSchema grants the read API role only the projection columns its comp
       CREATE POLICY t ON sessions.session_index FOR SELECT TO bulls96_read_api USING (org_id = current_setting('bulls96_read.org_id', true));
       CREATE POLICY t ON sessions.session_directory FOR SELECT TO bulls96_read_api USING (org_id = current_setting('bulls96_read.org_id', true));
       INSERT INTO sessions.session_index VALUES('org-a','ws-a','codex','s1',NULL,NULL);
-      INSERT INTO sessions.session_directory VALUES('org-a','ws-a','codex','s1',3,true);`);
+      INSERT INTO sessions.session_directory VALUES('org-a','ws-a','codex','s1',3,true);
+      CREATE SCHEMA search_index;
+      CREATE TABLE search_index.transcript_events(org_id text,workspace_id text,session_id text,content text);
+      ALTER TABLE search_index.transcript_events ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE search_index.transcript_events FORCE ROW LEVEL SECURITY;
+      CREATE POLICY tenant_only ON search_index.transcript_events USING (org_id=current_setting('bulls96_read.org_id',true) AND workspace_id=current_setting('bulls96_read.workspace_id',true));
+      INSERT INTO search_index.transcript_events VALUES('org-a','ws-a','s1','mine'),('org-b','ws-a','s1','other tenant');`);
     const reader: TenantRunner = (org, workspace, work) => db.transaction(async tx => {
       await tx.exec("SET LOCAL ROLE bulls96_read_api");
       await tx.query("SELECT set_config('bulls96_read.org_id',$1,true),set_config('bulls96_read.workspace_id',$2,true)", [org, workspace]);
@@ -93,8 +99,13 @@ test("ensureSchema grants the read API role only the projection columns its comp
         WHERE a.attrelid='search_index.projection_state'::regclass AND a.attnum>0 AND NOT a.attisdropped
           AND has_column_privilege('bulls96_read_api', a.attrelid, a.attnum, 'SELECT') ORDER BY 1`);
     expect(rows.map(r => r.col)).toEqual(["backend_id", "canonical_session_id", "complete", "coverage_from_ms", "org_id", "session_id", "source", "source_epoch", "workspace_id"]);
-    const writes = await db.query<{ w: boolean }>(`SELECT has_table_privilege('bulls96_read_api','search_index.projection_state','INSERT, UPDATE, DELETE, TRUNCATE') AS w`);
-    expect(writes.rows[0]!.w).toBe(false);
+    const writes = await db.query<{ w: boolean; e: boolean }>(`SELECT has_table_privilege('bulls96_read_api','search_index.projection_state','INSERT, UPDATE, DELETE, TRUNCATE') AS w,
+      has_table_privilege('bulls96_read_api','search_index.transcript_events','INSERT, UPDATE, DELETE, TRUNCATE') AS e`);
+    expect(writes.rows[0]).toEqual({ w: false, e: false });
+    // Events are readable as the read API, and only for the bound tenant (forced RLS still applies).
+    // Before the fix this failed with "permission denied for table transcript_events".
+    const events = await reader("org-a", "ws-a", tx => tx.query<{ content: string }>("SELECT content FROM search_index.transcript_events"));
+    expect(events.rows.map(r => r.content)).toEqual(["mine"]);
   } finally {
     await db.close();
   }

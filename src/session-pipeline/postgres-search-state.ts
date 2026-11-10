@@ -82,6 +82,12 @@ export function postgresSearchState(options: { reader?: TenantRunner; backendId:
           GRANT USAGE ON SCHEMA "${schema}" TO bulls96_read_api;
           GRANT SELECT (backend_id,org_id,workspace_id,source,session_id,canonical_session_id,source_epoch,coverage_from_ms,complete)
             ON ${table} TO bulls96_read_api;
+          -- The events/search reads (session-read-api queries.ts) read transcript_events rows. The index
+          -- schema is provisioned before this step (runBootstrap order) and carries forced tenant_only RLS,
+          -- so SELECT is still scoped to the transaction's bound org/workspace. Read-only.
+          IF to_regclass('"${schema}".transcript_events') IS NOT NULL THEN
+            GRANT SELECT ON "${schema}".transcript_events TO bulls96_read_api;
+          END IF;
         END IF;
       END $grant$`);
     },
