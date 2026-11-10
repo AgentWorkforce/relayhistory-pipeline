@@ -28,6 +28,7 @@
  * the pending table. Nothing here seeds state: rows come only from
  * reconciling real canonical events.
  */
+import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { createServer } from "node:http";
 import { unlinkSync, writeFileSync } from "node:fs";
 import { isTenantOnlyPolicy, type TenantPolicyRow } from "./postgres-search-state.ts";
@@ -1107,6 +1108,7 @@ export function refuseStartupOptions(url: string): void {
  */
 
 export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never> {
+  const maximum = readerMaxRuleset(env);
   const config = consumerServiceConfig(env);
   if (!config.enabled) {
     // Dormant but observable, like the read API: no database, no polling, a
@@ -1196,6 +1198,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     reader,
     store: raw.store,
     adapter: binding,
+    readerMaxRuleset: maximum,
     prefixFor: (orgId) => `${config.keyPrefix}/${orgId}`,
     ...outputFactsDeps(config),
   };

@@ -28,6 +28,7 @@
  * The initialised glue module is held only in this file's private state and the
  * engine's private fields; nothing exports it.
  */
+import { readerMaxRuleset, checkedReaderMaxRuleset } from "./reader-policy.js";
 import { sha256Hex } from "../../../../object-store/src/crypto.js";
 import { SCRUB_RULESET_VERSION } from "../pipeline/raw-chunks.js";
 import { PipelineError } from "../pipeline/errors.js";
@@ -112,7 +113,7 @@ export function bindgenProfile(m: Pick<BindgenManifest, "ruleset" | "rulesetVers
 }
 
 /** Validate the pin. Every placeholder or malformed value has its own named reason. */
-export function parseScrubBindgenPin(raw: unknown): ScrubBindgenPin {
+export function parseScrubBindgenPin(raw: unknown, maximum = readerMaxRuleset()): ScrubBindgenPin {
   const p = raw as Record<string, unknown> | null;
   if (!p || typeof p !== "object" || Array.isArray(p) || p.schema !== PIN_SCHEMA || p.package !== BINDGEN_PACKAGE)
     refuse("bindgen_pin_invalid");
@@ -126,7 +127,7 @@ export function parseScrubBindgenPin(raw: unknown): ScrubBindgenPin {
   const m = pin.manifest as Record<string, unknown> | null;
   if (!m || typeof m !== "object" || Array.isArray(m)) return refuse("bindgen_pin_invalid");
   if (m.schema !== BINDGEN_MANIFEST_SCHEMA) refuse("bindgen_unpinned_manifest_schema");
-  if (!isRealString(m.ruleset)) refuse("bindgen_unpinned_manifest_ruleset");
+  if (m.ruleset !== "relayhistory-scrub") refuse("bindgen_unpinned_manifest_ruleset");
   if (!isPositiveInt(m.rulesetVersion)) refuse("bindgen_unpinned_manifest_rulesetVersion");
   if (!isDigest(m.rulesetSourceSha256)) refuse("bindgen_unpinned_manifest_rulesetSourceSha256");
   if (!isRealString(m.crateVersion)) refuse("bindgen_unpinned_manifest_crateVersion");
@@ -134,8 +135,9 @@ export function parseScrubBindgenPin(raw: unknown): ScrubBindgenPin {
   if (!isRealString(m.policy) || !POLICIES.has(m.policy)) refuse("bindgen_unpinned_manifest_policy");
   if (!isRealString(m.redactionToken)) refuse("bindgen_unpinned_manifest_redactionToken");
   if (Object.values(m).some((v) => !isPrimitive(v))) refuse("bindgen_pin_invalid");
-  // Readers accept `version <= SCRUB_RULESET_VERSION` and the TS engine stamps it today: never go below it.
+  // Writer floor and reader capability are separate: increasing the latter never changes TS stamps.
   if ((m.rulesetVersion as number) < SCRUB_RULESET_VERSION) refuse("bindgen_ruleset_below_floor");
+  if ((m.rulesetVersion as number) > checkedReaderMaxRuleset(maximum)) refuse("bindgen_ruleset_above_reader_ceiling");
   const manifest = Object.freeze({ ...m }) as Readonly<BindgenManifest>;
   if (pin.scrub_profile !== bindgenProfile(manifest)) refuse("bindgen_pin_profile_inconsistent");
   return Object.freeze({
@@ -407,6 +409,7 @@ async function readVerified(pin: ScrubBindgenPin, read: ReadBindgenArtifact): Pr
 }
 
 export interface BindgenInitOptions {
+  readerMaxRuleset?: number;
   pin: unknown;
   readArtifact: ReadBindgenArtifact;
   importGlue?: ImportBindgenGlue;
@@ -442,7 +445,7 @@ async function initialise(pin: ScrubBindgenPin, options: BindgenInitOptions): Pr
  */
 export async function initBindgenScrubEngine(options: BindgenInitOptions): Promise<BindgenScrubEngine> {
   if (compiledInit) refuse("bindgen_path_conflict");
-  const pin = parseScrubBindgenPin(options.pin);
+  const pin = parseScrubBindgenPin(options.pin, options.readerMaxRuleset);
   const key = pinKey(pin);
   if (!nodeInit) {
     // Assigned synchronously, before any await, so a concurrent caller always sees it.
@@ -467,6 +470,7 @@ export async function initBindgenScrubEngine(options: BindgenInitOptions): Promi
 // ---------------------------------------------------------------- Workers compiled-module path
 
 export interface CompiledBindgenOptions {
+  readerMaxRuleset?: number;
   /** The statically imported glue namespace (its bytes are pinned and verified at build time). */
   glue: unknown;
   /** A statically imported `WebAssembly.Module` of the pinned `.wasm` (byte pin verified at build time). */
@@ -484,7 +488,7 @@ export interface CompiledBindgenOptions {
  */
 export function createCompiledBindgenEngine(options: CompiledBindgenOptions): BindgenScrubEngine {
   if (nodeInit) refuse("bindgen_path_conflict");
-  const pin = parseScrubBindgenPin(options.pin);
+  const pin = parseScrubBindgenPin(options.pin, options.readerMaxRuleset);
   const key = pinKey(pin);
   if (compiledInit) {
     if (compiledInit.key !== key || !compiledInit.engine) refuse("bindgen_init_conflict");

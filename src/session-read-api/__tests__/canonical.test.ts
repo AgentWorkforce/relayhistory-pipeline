@@ -899,3 +899,31 @@ async function replaceCanonicalChunks(chunkRecords: unknown[][]) {
   );
   pointer = { ...pointer, content_sha256: m.raw.content_sha256 };
 }
+
+
+test("reader ceiling refuses future/foreign markers before any chunk reads; explicit 10 reaches the same projection", async () => {
+  const path = objectKey(manifestKey(location));
+  const m = JSON.parse(await new Response(await deps.store.get(path)).text());
+  const originalGet = deps.store.getObject.bind(deps.store);
+  let chunkReads = 0;
+  deps.store.getObject = async (key, options) => { if (key !== path) chunkReads++; return originalGet(key, options); };
+  for (const scrub of [{ ruleset: "relayhistory-scrub", version: 10 }, { ruleset: "foreign", version: 1 }]) {
+    m.raw.scrub = scrub;
+    await deps.store.put(path, new TextEncoder().encode(JSON.stringify(m)));
+    await expect(canonicalSnapshot({ ...deps, readerMaxRuleset: 8 }, identity)).rejects.toMatchObject({ reason: "canonical_projection_incomplete" });
+    expect(chunkReads).toBe(0);
+  }
+  m.raw.scrub = { ruleset: "relayhistory-scrub", version: 10 };
+  await deps.store.put(path, new TextEncoder().encode(JSON.stringify(m)));
+  const chunk = m.raw.chunks[0];
+  const chunkKey = rawChunkKey(location, chunk.seq, chunk.start_offset, chunk.sha256, "ndjson");
+  const chunkBytes = new Uint8Array(await new Response((await originalGet(chunkKey)).body).arrayBuffer());
+  await deps.store.put(chunkKey, chunkBytes, { metadata: { "scrub-ruleset": "relayhistory-scrub", "scrub-version": "10" } });
+  const result = await canonicalSnapshot({ ...deps, readerMaxRuleset: 10 }, identity);
+  expect(result.rows).toHaveLength(2);
+  expect(chunkReads).toBeGreaterThan(0);
+  const response = await canonicalHandle(request(), { CANONICAL_READ_ENABLED: "true", READER_MAX_RULESET: "10" }, fetch, deps);
+  expect(response.status).toBe(200);
+  const refused = await canonicalHandle(request(), { CANONICAL_READ_ENABLED: "true", READER_MAX_RULESET: "8" }, fetch, deps);
+  expect(refused.status).toBe(503);
+});

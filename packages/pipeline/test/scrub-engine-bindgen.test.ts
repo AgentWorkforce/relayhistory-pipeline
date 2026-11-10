@@ -811,3 +811,32 @@ describe("wasm-bindgen: Workers compiled-module path (createCompiledBindgenEngin
     expect(s.reads).toEqual([]);
   });
 });
+
+
+describe("reader-first writer initialization gate", () => {
+  const future = { ...MANIFEST, rulesetVersion: 10 };
+  const futurePin = () => makePin({ scrub_profile: bindgenProfile(future) }, { rulesetVersion: 10 });
+  it("Node refuses above-ceiling pins before loading and accepts only after explicit reader configuration", async () => {
+    const s = setup({ pin: futurePin(), glue: { manifest: future } });
+    await expect(initScrubEngine(s.options)).rejects.toMatchObject({ reason: "bindgen_ruleset_above_reader_ceiling" });
+    expect(s.reads).toEqual([]);
+    const engine = await initScrubEngine({ ...s.options, env: { SCRUB_ENGINE: "wasm-bindgen", READER_MAX_RULESET: "10" } });
+    expect(engine.rulesetVersion).toBe(10);
+    expect(s.reads).toHaveLength(3);
+  });
+  it("compiled-module initialization applies the same ceiling before glue initialization", () => {
+    const glue = glueDouble({ manifest: future });
+    const ModuleCtor = WebAssembly.Module as unknown as new (bytes: Uint8Array) => WebAssembly.Module;
+    const options = { pin: futurePin(), glue: glue.glue, module: new ModuleCtor(new Uint8Array([0,97,115,109,1,0,0,0])) };
+    expect(() => createCompiledBindgenEngine(options)).toThrow(expect.objectContaining({ reason: "bindgen_ruleset_above_reader_ceiling" }));
+    expect(glue.inits).toEqual([]);
+    expect(createCompiledBindgenEngine({ ...options, readerMaxRuleset: 10 }).rulesetVersion).toBe(10);
+    expect(glue.inits).toHaveLength(1);
+  });
+});
+
+
+it("reader capability alone never selects or relabels the TS writer", async () => {
+  const engine = await initScrubEngine({ env: { SCRUB_ENGINE: "ts", READER_MAX_RULESET: "10" } });
+  expect(engine.kind).toBe("ts"); expect(engine.rulesetVersion).toBe(8);
+});

@@ -1,5 +1,6 @@
 /** Shared canonical S3 reader/projection. The live CH writer and read Worker
  * invoke this same implementation; neither maintains a shadow event mapping. */
+import { assertReaderScrubMarker, readerChunkBody } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { canonicalDirectoryValues } from "./canonical-directory-values.ts";
 import { createHash } from "node:crypto";
 import {
@@ -54,6 +55,7 @@ export interface SessionScope {
   sessionId: string;
 }
 interface SearchIndexDeps {
+  readerMaxRuleset?: number;
   reader: ManifestReader;
   store: ObjectStore;
   prefixFor: (orgId: string) => string;
@@ -99,9 +101,10 @@ export async function readManifestRecords(
   prefix: string,
   decompress: (stored: Uint8Array, maxOutputLength: number) => Uint8Array,
   maxRecords = Number.POSITIVE_INFINITY,
+  maximum?: number,
 ): Promise<RelayhistoryStreamRecord[]> {
   const rows: RelayhistoryStreamRecord[] = [];
-  for await (const row of streamManifestRecords(manifest, store, prefix, decompress, maxRecords))
+  for await (const row of streamManifestRecords(manifest, store, prefix, decompress, maxRecords, maximum))
     rows.push(row);
   return rows;
 }
@@ -113,7 +116,9 @@ export async function* streamManifestRecords(
   prefix: string,
   decompress: (stored: Uint8Array, maxOutputLength: number) => Uint8Array,
   maxRecords = Number.POSITIVE_INFINITY,
+  maximum?: number,
 ): AsyncGenerator<RelayhistoryStreamRecord> {
+  assertReaderScrubMarker(manifest.raw.scrub, maximum);
   if (manifest.raw.format !== "ndjson")
     throw new PipelineError(
       "raw_format_unsupported",
@@ -133,8 +138,9 @@ export async function* streamManifestRecords(
       );
     let stored: Uint8Array | null;
     try {
-      stored = await readCapped(await store.get(key), entry.stored_bytes);
+      stored = await readCapped(await readerChunkBody(await store.getObject(key), manifest.raw.scrub, maximum), entry.stored_bytes);
     } catch (error) {
+      if (error instanceof PipelineError) throw error;
       if ((error as { code?: unknown } | null)?.code === "not_found")
         throw new PipelineError(
           "chunk_missing",
@@ -432,6 +438,11 @@ export async function readCanonicalScope(
       reasons.push("canonical_session_mismatch");
       continue;
     }
+    try { assertReaderScrubMarker(manifest.raw.scrub, deps.readerMaxRuleset); }
+    catch (error) {
+      if (!(error instanceof PipelineError) || error.code !== "scrub_ruleset_unsupported") throw error;
+      complete = false; reasons.push(error.code); continue;
+    }
     readable.push(manifest);
     manifestKeysByBody.set(manifest, key);
   }
@@ -479,6 +490,7 @@ export async function readCanonicalScope(
         parseSessionKey(manifestKeysByBody.get(manifest)!)?.prefix ?? prefix,
         decompress,
         limits.maxScopeEvents - parsedRecords,
+        deps.readerMaxRuleset,
       );
       parsedRecords += records.length;
       parts.push({ manifest, records, userId: manifestUserId(manifest) });

@@ -17,6 +17,7 @@
  * The selection is read once per process (isolate); a later, different
  * selection throws rather than switching engines.
  */
+import { readerMaxRuleset } from "./reader-policy.js";
 import { sealRawChunk as sealRawChunkTs, type SealRawChunk, type SealedChunk } from "../pipeline/raw-chunks.js";
 import type { ObjectStore } from "../pipeline/object-layout.js";
 import pinJson from "../../../scrub-wasm-pin.json";
@@ -91,6 +92,7 @@ export const SCRUB_WASM_PATH = "../../../scrub-wasm/relayscrubber.wasm";
 
 interface ScrubEngineEnv {
   SCRUB_ENGINE?: string | undefined;
+  READER_MAX_RULESET?: string | undefined;
   /** wasm-bindgen only: absolute directory of the installed package (default: next to the pipeline package). */
   SCRUB_BINDGEN_DIR?: string | undefined;
 }
@@ -159,6 +161,7 @@ function processEnv(): ScrubEngineEnv | undefined {
  */
 export async function initScrubEngine(options: InitScrubEngineOptions = {}): Promise<ScrubEngine> {
   const env = options.env ?? processEnv();
+  readerMaxRuleset(env); // Validate before selecting even the unchanged TS engine.
   const kind = selectScrubEngine(env);
   if (kind === "ts") return tsScrubEngine;
   if (kind === "wasm-bindgen") return initBindgen(env, options.bindgen ?? {});
@@ -191,6 +194,7 @@ export async function initScrubEngine(options: InitScrubEngineOptions = {}): Pro
 async function initBindgen(env: ScrubEngineEnv | undefined, o: NonNullable<InitScrubEngineOptions["bindgen"]>): Promise<ScrubEngine> {
   try {
     const engine = await initBindgenScrubEngine({
+      readerMaxRuleset: readerMaxRuleset(env),
       pin: "pin" in o ? o.pin : SCRUB_BINDGEN_PIN,
       readArtifact: o.readArtifact ?? bindgenFileReader(env?.SCRUB_BINDGEN_DIR),
       importGlue: o.importGlue,

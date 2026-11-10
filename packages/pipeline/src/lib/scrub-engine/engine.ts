@@ -107,7 +107,8 @@ export type BindgenManifestField =
  * - bindgen_pin_paths_invalid: an artifact path in the pin is absent, absolute or escapes the package directory
  * - bindgen_unpinned_<field>: that pin field is a placeholder, empty, or malformed (digests: not 64 lowercase hex)
  * - bindgen_pin_profile_inconsistent: the pinned profile is not the one the pinned manifest derives
- * - bindgen_ruleset_below_floor: the pinned ruleset version is below the TypeScript one readers accept
+ * - bindgen_ruleset_below_floor: the pinned writer ruleset is below the supported writer floor
+ * - bindgen_ruleset_above_reader_ceiling: the pinned writer version exceeds the explicit reader capability
  * - bindgen_dir_invalid: SCRUB_BINDGEN_DIR is set but not an absolute path
  * - bindgen_artifact_missing_<artifact>: reading it failed or returned no bytes
  * - bindgen_sha256_mismatch_<artifact>: its snapshot does not hash to the pin
@@ -131,6 +132,7 @@ export type BindgenFailure =
   | `bindgen_unpinned_manifest_${BindgenManifestField}`
   | "bindgen_pin_profile_inconsistent"
   | "bindgen_ruleset_below_floor"
+  | "bindgen_ruleset_above_reader_ceiling"
   | "bindgen_dir_invalid"
   | `bindgen_artifact_missing_${BindgenArtifactName}`
   | `bindgen_sha256_mismatch_${BindgenArtifactName}`

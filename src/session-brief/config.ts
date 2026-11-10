@@ -28,12 +28,14 @@
  *
  * Values are read once per process; nothing here is logged.
  */
+import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import {
   assertDestinationUrl,
   destinationPolicy,
 } from "../shared/destination-url.ts";
 
 export interface BriefConfig {
+  readerMaxRuleset?: number;
   enabled: boolean;
   workspaceIds?: readonly string[];
   model: string;
@@ -78,9 +80,11 @@ export function briefWorkspaceIds(raw: string | undefined): readonly string[] | 
 }
 
 export function briefConfig(env: NodeJS.ProcessEnv = process.env): BriefConfig {
+  const maximum = readerMaxRuleset(env);
   const model = env.SESSION_BRIEF_MODEL?.trim();
   const workspaceIds = briefWorkspaceIds(env.SESSION_BRIEF_WORKSPACE_IDS);
   return {
+    readerMaxRuleset: maximum,
     enabled: env.SESSION_BRIEF_ENABLED === "true",
     ...(workspaceIds ? { workspaceIds } : {}),
     model: model && MODEL_PATTERN.test(model) ? model : "gpt-5.6-luna",

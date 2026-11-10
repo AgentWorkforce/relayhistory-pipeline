@@ -42,6 +42,8 @@ export interface AuthContext {
 }
 
 export interface Bindings {
+  /** Read capability only; does not change writer scrub stamps. */
+  READER_MAX_RULESET?: string;
   // RelayAuth JWT verification (auth/relayauth.ts), as upstream env.ts declares them.
   RELAYAUTH_JWKS_URL?: string;
   RELAYAUTH_ISSUER?: string;

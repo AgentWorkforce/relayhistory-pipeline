@@ -16,7 +16,7 @@ import {
   type SessionLocation,
   type StageMessage,
 } from "../../shared/vendor.ts";
-import { createCourierManifestRoutes } from "../manifests.ts";
+import { chunksAreServerSealed, createCourierManifestRoutes } from "../manifests.ts";
 
 const ORG = "org_test";
 const WORKSPACE = "ws_test";
@@ -839,4 +839,18 @@ describe("AlleyOop courier manifest routes", () => {
     );
     expect(wrong.status).toBe(403);
   });
+});
+
+
+test("manifest admission respects mixed-version chunk metadata without changing writer stamps", async () => {
+  const f = await fixture(); const manifest = await f.build(1);
+  const chunk = manifest.raw.chunks[0]!;
+  const { rawChunkKey, readAll } = await import("../../shared/vendor.ts");
+  const key = rawChunkKey(f.location, chunk.seq, chunk.start_offset, chunk.sha256, manifest.raw.format);
+  const object = await f.store.getObject(key); const bytes = await readAll(object.body);
+  const metadata = { ...object.meta.metadata }; delete metadata["content-sha256"];
+    await f.store.put(key, bytes, { metadata: { ...metadata, "scrub-version": "10" } });
+  const raw = { store: f.store, provider: "fs" as const, bucket: "raw" };
+  expect(await chunksAreServerSealed(raw, manifest, undefined, 8)).toBe(false);
+  expect(await chunksAreServerSealed(raw, manifest, undefined, 10)).toBe(true);
 });

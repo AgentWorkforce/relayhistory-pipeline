@@ -129,7 +129,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
     }
   };
   try {
-    const built = deps.canonicalInput ? await deps.canonicalInput(db, w, pointers) : await buildBriefInput(deps, w, pointers);
+    const built = deps.canonicalInput ? await deps.canonicalInput(db, w, pointers) : await buildBriefInput({ ...deps, readerMaxRuleset: config.readerMaxRuleset }, w, pointers);
     canonicalSessionId = built.canonicalSessionId;
     if (built.kind !== "ready") {
       await publish(built.sourceRevisions, { status: built.kind, error: built.error });

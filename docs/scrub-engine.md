@@ -280,7 +280,7 @@ entrypoint calls it yet. With `SCRUB_ENGINE=wasm-bindgen` the hosted Worker's
 
 Merging this PR is a default-off, unpinned scaffold only. It is NOT a security PASS, artifact pin, cutover, image, marker or adoption clearance. The successor that binds a real package must satisfy all of these first:
 
-1. **Reader-first.** A v10 writer may not start until every relevant reader accepts ruleset <= 10. Add a separate explicit `READER_MAX_RULESET=10`; pin parsing must refuse a manifest rulesetVersion above it and below the supported floor. Roll the reader ceiling out first with wasm-bindgen still off, then the v10 writer/pin. Do not overload the TS `SCRUB_RULESET_VERSION` as the reader ceiling.
+1. **Reader-first.** A v10 writer may not start until every relevant reader accepts ruleset <= 10. The explicit reader policy below provides `READER_MAX_RULESET=10`; pin parsing must refuse a manifest rulesetVersion above it and below the supported floor. Roll the reader ceiling out first with wasm-bindgen still off, then the v10 writer/pin. Do not overload the TS `SCRUB_RULESET_VERSION` as the reader ceiling.
 2. **Profile is crate-owned.** The schema-2 manifest must report a canonical profile field/string; the pipeline pins and compares it verbatim. The format derived in this PR (`relayscrubber/<ruleset>/<ver>/<policy>/<sourceSha>`) is a placeholder and must be replaced by the crate's value before any pin.
 3. **Stable tagged glue errors.** relayscrubber must expose stable error tags. Recognised domain/admission errors refuse one call; `WebAssembly.RuntimeError`, `RangeError`/OOM, or ANY unrecognised throw poisons the instance. The current Error-vs-trap heuristic is removed before pin.
 4. **Loader policy in the adapter.** Hashing `index.js` without executing it is package provenance only, never runtime security. The adapter may import the verified generated glue directly but must implement the reviewed loader policy itself, including the 16 MiB UTF-8 preflight before the bindgen copy. The registry package/archive checksum goes into the build receipt; component digests remain the runtime pins.
@@ -384,3 +384,14 @@ Under wasm, `sealRawChunk` is refused on every self-host path that seals raw chu
 `SCRUB_ENGINE=wasm` is not deployable for `session-ingest`, `session-read-api`, the consumers or
 `session-publication` until the raw-chunks re-pin follow-up lands. This is deliberate: refusing
 is the fail-closed outcome.
+
+
+### Explicit reader ruleset capability
+
+`READER_MAX_RULESET` selects a read capability independently of the TypeScript writer stamp. Unset preserves the ceiling of 8; exactly `"8"`, `"9"` or `"10"` is accepted. Empty, padded, signed, fractional and higher values refuse configuration. Raising the ceiling does not enable a Rust engine, qualify any package or change TypeScript scrub markers.
+
+Canonical record/transcript readers, export readers, the indexing consumer, brief input and manifest/chunk admission use this policy. Unknown families and versions outside 1 through the configured maximum refuse before record parsing. A manifest records the **lowest** chunk ruleset, so per-chunk metadata is also checked. Readers bind that metadata to the same GET response as the body and cancel refused bodies before consuming them. Historical metadata-free chunks at versions through 8 keep their existing read contract; newer manifest versions require per-chunk scrub metadata. A declared chunk version cannot fall below the manifest minimum.
+
+Node services validate the setting at startup and thread it into canonical reads; the canonical Worker validates its own binding rather than consulting a Node process environment. The wasm-bindgen pin parser refuses a writer above this ceiling before reading artifacts or initializing glue. Compiled-module callers must pass their verified reader ceiling explicitly when it exceeds the default. The raw ABI path remains unpinned and outside this first cutover.
+
+Operationally, deploy and verify every relevant reader with ceiling 10 **while the Rust engine remains off**, then qualify and enable the matching writer. Configuration in one process does not prove that a remote fleet has been upgraded. Existing artifact-page formats do not change. This source change does not satisfy the remaining package safety, provenance, error-tagging, Worker build-binding or persistence-routing gates.
