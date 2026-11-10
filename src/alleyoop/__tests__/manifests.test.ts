@@ -16,7 +16,7 @@ import {
   type SessionLocation,
   type StageMessage,
 } from "../../shared/vendor.ts";
-import { createCourierManifestRoutes } from "../manifests.ts";
+import { chunksAreServerSealed, createCourierManifestRoutes } from "../manifests.ts";
 
 const ORG = "org_test";
 const WORKSPACE = "ws_test";
@@ -839,4 +839,41 @@ describe("AlleyOop courier manifest routes", () => {
     );
     expect(wrong.status).toBe(403);
   });
+});
+
+
+test("manifest admission respects mixed-version chunk metadata without changing writer stamps", async () => {
+  const f = await fixture(); const manifest = await f.build(1);
+  const chunk = manifest.raw.chunks[0]!;
+  const { rawChunkKey, readAll } = await import("../../shared/vendor.ts");
+  const key = rawChunkKey(f.location, chunk.seq, chunk.start_offset, chunk.sha256, manifest.raw.format);
+  const object = await f.store.getObject(key); const bytes = await readAll(object.body);
+  const metadata = { ...object.meta.metadata }; delete metadata["content-sha256"];
+    await f.store.put(key, bytes, { metadata: { ...metadata, "scrub-version": "10" } });
+  const raw = { store: f.store, provider: "fs" as const, bucket: "raw" };
+  expect(await chunksAreServerSealed(raw, manifest, undefined, 8)).toBe(false);
+  expect(await chunksAreServerSealed(raw, manifest, undefined, 10)).toBe(true);
+});
+
+
+test("unset courier policy preserves main's empty-manifest and numeric metadata admission",async()=>{
+ const f=await fixture();const manifest=await f.build(1);const raw={store:f.store,provider:"fs" as const,bucket:"raw"};
+ for(const [marker, accepted] of [
+  [{ruleset:"relayhistory-scrub",version:9}, true],
+  [{ruleset:"foreign-family",version:8}, false],
+  [{ruleset:"relayhistory-scrub",version:0}, false],
+  [{ruleset:"relayhistory-scrub",version:-1}, false],
+ ] as const) {
+  const empty={...manifest,raw:{...manifest.raw,chunks:[],scrub:marker}};
+  expect(await chunksAreServerSealed(raw,empty,undefined)).toBe(accepted);
+  expect(await chunksAreServerSealed(raw,empty,undefined,8)).toBe(false);
+ }
+ const {rawChunkKey,readAll}=await import("../../shared/vendor.ts");const c=manifest.raw.chunks[0]!;
+ const key=rawChunkKey(f.location,c.seq,c.start_offset,c.sha256,manifest.raw.format);
+ const object=await f.store.getObject(key);const bytes=await readAll(object.body);const metadata={...object.meta.metadata};delete metadata["content-sha256"];
+ for(const version of ["08","8.0"]){
+  await f.store.put(key,bytes,{metadata:{...metadata,"scrub-version":version}});
+  expect(await chunksAreServerSealed(raw,manifest,undefined)).toBe(true);
+  expect(await chunksAreServerSealed(raw,manifest,undefined,8)).toBe(false);
+ }
 });

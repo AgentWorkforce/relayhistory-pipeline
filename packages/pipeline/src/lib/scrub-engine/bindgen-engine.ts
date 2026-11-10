@@ -13,7 +13,7 @@
  *      file is never read again, so there is no check-then-use gap);
  *   5. initialise it with the verified wasm snapshot as `module_or_path` (bytes, never a
  *      path or URL, so the glue never resolves or fetches anything);
- *   6. read `manifestJson()` and compare every field, and the derived profile, to the pin.
+ *   6. read `manifestJson()` and compare every field, and the crate-owned profile, to the pin.
  *
  * The loader (`index.js`) bytes are pinned and verified as package identity but never
  * evaluated: it imports `./generated/relayscrubber.js` relative to itself, which from a
@@ -28,9 +28,11 @@
  * The initialised glue module is held only in this file's private state and the
  * engine's private fields; nothing exports it.
  */
+import { ScrubberError, taggedScrubberRefusal } from "./scrubber-error.js";
+import { checkedReaderMaxRuleset, DEFAULT_READER_MAX_RULESET } from "./reader-policy.js";
 import { sha256Hex } from "../../../../object-store/src/crypto.js";
 import { SCRUB_RULESET_VERSION } from "../pipeline/raw-chunks.js";
-import { PipelineError } from "../pipeline/errors.js";
+import { preflightScrubRecords, preflightScrubText, refuseMalformedScrubInput } from "./bindgen-admission.js";
 import {
   ScrubEngineUnavailable,
   type BindgenArtifactName,
@@ -43,8 +45,9 @@ import {
 
 // ---------------------------------------------------------------- pin
 
-/** The only manifest schema this adapter understands (hard-coded on purpose; everything else is pinned). */
-export const BINDGEN_MANIFEST_SCHEMA = 2;
+/** Candidate manifest schema and ABI accepted by this adapter; every identity field is also pinned. */
+export const BINDGEN_MANIFEST_SCHEMA = 3;
+export const BINDGEN_ABI_VERSION = 2;
 export const BINDGEN_PACKAGE = "@agentworkforce/relayscrubber";
 const PIN_SCHEMA = 1;
 
@@ -57,11 +60,12 @@ export const BINDGEN_MANIFEST_FIELDS: readonly BindgenManifestField[] = [
   "abiVersion",
   "policy",
   "redactionToken",
+  "scrubProfile",
 ];
 const ARTIFACTS: readonly BindgenArtifactName[] = ["wasm", "glue", "loader"];
 const POLICIES = new Set(["secrets", "pii"]);
 
-/** The relayscrubber schema-2 manifest. A pin may list further primitive fields, which must then match exactly too. */
+/** The relayscrubber schema-3 manifest. A pin may list further primitive fields, which must then match exactly too. */
 export interface BindgenManifest {
   schema: number;
   ruleset: string;
@@ -71,6 +75,7 @@ export interface BindgenManifest {
   abiVersion: number;
   policy: string;
   redactionToken: string;
+  scrubProfile: string;
   [extra: string]: string | number | boolean | null;
 }
 
@@ -106,13 +111,13 @@ const isPackagePath = (v: unknown): v is string =>
   !/[\\:\0]/.test(v) &&
   v.split("/").every((seg) => seg !== "" && seg !== "." && seg !== "..");
 
-/** The profile stamped in markers: derived from the manifest the instance reports, never configured on its own. */
-export function bindgenProfile(m: Pick<BindgenManifest, "ruleset" | "rulesetVersion" | "policy" | "rulesetSourceSha256">): string {
-  return `relayscrubber/${m.ruleset}/${m.rulesetVersion}/${m.policy}/${m.rulesetSourceSha256}`;
+/** The crate owns the profile identifier; the instance and pin must agree verbatim. */
+export function bindgenProfile(m: Pick<BindgenManifest, "scrubProfile">): string {
+  return m.scrubProfile;
 }
 
 /** Validate the pin. Every placeholder or malformed value has its own named reason. */
-export function parseScrubBindgenPin(raw: unknown): ScrubBindgenPin {
+export function parseScrubBindgenPin(raw: unknown, maximum = DEFAULT_READER_MAX_RULESET): ScrubBindgenPin {
   const p = raw as Record<string, unknown> | null;
   if (!p || typeof p !== "object" || Array.isArray(p) || p.schema !== PIN_SCHEMA || p.package !== BINDGEN_PACKAGE)
     refuse("bindgen_pin_invalid");
@@ -126,16 +131,18 @@ export function parseScrubBindgenPin(raw: unknown): ScrubBindgenPin {
   const m = pin.manifest as Record<string, unknown> | null;
   if (!m || typeof m !== "object" || Array.isArray(m)) return refuse("bindgen_pin_invalid");
   if (m.schema !== BINDGEN_MANIFEST_SCHEMA) refuse("bindgen_unpinned_manifest_schema");
-  if (!isRealString(m.ruleset)) refuse("bindgen_unpinned_manifest_ruleset");
+  if (m.ruleset !== "relayhistory-scrub") refuse("bindgen_unpinned_manifest_ruleset");
   if (!isPositiveInt(m.rulesetVersion)) refuse("bindgen_unpinned_manifest_rulesetVersion");
   if (!isDigest(m.rulesetSourceSha256)) refuse("bindgen_unpinned_manifest_rulesetSourceSha256");
   if (!isRealString(m.crateVersion)) refuse("bindgen_unpinned_manifest_crateVersion");
-  if (!isPositiveInt(m.abiVersion)) refuse("bindgen_unpinned_manifest_abiVersion");
+  if (m.abiVersion !== BINDGEN_ABI_VERSION) refuse("bindgen_unpinned_manifest_abiVersion");
   if (!isRealString(m.policy) || !POLICIES.has(m.policy)) refuse("bindgen_unpinned_manifest_policy");
   if (!isRealString(m.redactionToken)) refuse("bindgen_unpinned_manifest_redactionToken");
+  if (!isRealString(m.scrubProfile)) refuse("bindgen_unpinned_manifest_scrubProfile");
   if (Object.values(m).some((v) => !isPrimitive(v))) refuse("bindgen_pin_invalid");
-  // Readers accept `version <= SCRUB_RULESET_VERSION` and the TS engine stamps it today: never go below it.
+  // Writer floor and reader capability are separate: increasing the latter never changes TS stamps.
   if ((m.rulesetVersion as number) < SCRUB_RULESET_VERSION) refuse("bindgen_ruleset_below_floor");
+  if ((m.rulesetVersion as number) > checkedReaderMaxRuleset(maximum)) refuse("bindgen_ruleset_above_reader_ceiling");
   const manifest = Object.freeze({ ...m }) as Readonly<BindgenManifest>;
   if (pin.scrub_profile !== bindgenProfile(manifest)) refuse("bindgen_pin_profile_inconsistent");
   return Object.freeze({
@@ -174,14 +181,14 @@ interface BindgenGlue {
   default(input: { module_or_path: unknown }): Promise<unknown>;
   initSync(input: { module: unknown }): unknown;
   manifestJson(): string;
-  scrubText(text: string): string;
-  scrubLong(text: string): string;
+  /** Bounded Rust entrypoint; unchecked compatibility exports are never used. */
+  scrubTextChecked(text: string): string;
   /** Returns JSON text `{value, jsonText, redactionCount}`; `jsonText` is the Rust-serialised result. */
   scrubJson(jsonText: string): string;
   /** Returns JSON text `{text, recordCount, redactionCount}`; throws on invalid input with no partial output. */
   scrubRecords(bytes: Uint8Array): string;
 }
-const SCRUB_FUNCTIONS = ["manifestJson", "scrubText", "scrubLong", "scrubJson", "scrubRecords"] as const;
+const SCRUB_FUNCTIONS = ["manifestJson", "scrubTextChecked", "scrubJson", "scrubRecords"] as const;
 
 function bindGlue(raw: unknown, entry: "default" | "initSync"): BindgenGlue {
   const g = raw as Record<string, unknown> | null;
@@ -216,41 +223,13 @@ function verifyManifest(glue: BindgenGlue, pin: ScrubBindgenPin): Readonly<Bindg
 
 export type BindgenScrubEngine = ScrubEngine & {
   readonly kind: "wasm-bindgen";
-  /** True once the instance trapped; it is never called again. */
+  /** True after an unrecognized failure; the instance is never called again. */
   readonly failed: boolean;
   /** The manifest the instance reported (equal to the pin). */
   readonly manifest: Readonly<BindgenManifest>;
 };
 
 const encoder = new TextEncoder();
-const strictDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-/** wasm-bindgen passes strings as UTF-8: a lone surrogate would be silently rewritten to U+FFFD. */
-const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
-
-/**
- * A trap (panic -> `unreachable`, OOM abort) or a stack/heap RangeError leaves the
- * instance's memory in an unknown state: poison it. A deliberate error (an `Error`
- * other than those, or a thrown code string) refuses only that call.
- */
-function isTrap(error: unknown): boolean {
-  const RuntimeError = (globalThis as unknown as { WebAssembly?: { RuntimeError?: abstract new (...args: never[]) => unknown } }).WebAssembly?.RuntimeError;
-  if (RuntimeError && error instanceof RuntimeError) return true;
-  if (error instanceof RangeError) return true;
-  return !(error instanceof Error) && typeof error !== "string";
-}
-
-function isUtf8(bytes: Uint8Array): boolean {
-  try {
-    strictDecoder.decode(bytes);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function notWellFormed(): never {
-  throw new PipelineError("scrub_input_not_well_formed", "scrub input is not well-formed UTF-16", false);
-}
 
 /** Build the engine around a verified, initialised glue module. Not exported: only the two init paths call it. */
 function makeEngine(glue: BindgenGlue, manifest: Readonly<BindgenManifest>): BindgenScrubEngine {
@@ -259,34 +238,37 @@ function makeEngine(glue: BindgenGlue, manifest: Readonly<BindgenManifest>): Bin
   const marker: ScrubMarker = Object.freeze({ ruleset: manifest.ruleset, version: manifest.rulesetVersion, profile });
   let failed = false;
 
-  /** Every call: refuse if poisoned; on any throw, discard the input and return nothing. */
+  const ensureUsable = () => {
+    if (failed) throw new ScrubberError("scrubber_instance_poisoned", "instance_poison");
+  };
+  const poison = (): never => {
+    failed = true;
+    throw new ScrubberError("scrubber_engine_failure", "instance_poison");
+  };
+  /** Unknown exceptions are never inferred to be deliberate from their JS class. */
   const invoke = <R>(call: () => R): R => {
-    if (failed) throw new ScrubEngineUnavailable("engine_failed");
-    try {
-      return call();
-    } catch (error) {
-      if (isTrap(error)) {
-        failed = true;
-        throw new ScrubEngineUnavailable("engine_failed");
-      }
-      throw new ScrubEngineUnavailable("engine_refused");
+    ensureUsable();
+    try { return call(); }
+    catch (error) {
+      const refusal = taggedScrubberRefusal(error);
+      if (refusal) throw refusal;
+      return poison();
     }
   };
   const text = (fn: (s: string) => string, value: string): string => {
-    if (typeof value !== "string" || LONE_SURROGATE.test(value)) notWellFormed();
+    ensureUsable();
+    preflightScrubText(value);
     const out = invoke(() => fn(value));
-    if (typeof out !== "string") throw new ScrubEngineUnavailable("engine_refused");
+    if (typeof out !== "string") return poison();
     return out;
   };
   const parseEnvelope = (out: unknown): Record<string, unknown> => {
-    if (typeof out !== "string") throw new ScrubEngineUnavailable("engine_refused");
+    if (typeof out !== "string") return poison();
     try {
       const v = JSON.parse(out) as unknown;
       if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, unknown>;
-    } catch {
-      // fall through
-    }
-    throw new ScrubEngineUnavailable("engine_refused");
+    } catch { /* No returned or thrown artifact text reaches diagnostics. */ }
+    return poison();
   };
 
   const engine: BindgenScrubEngine = {
@@ -298,9 +280,10 @@ function makeEngine(glue: BindgenGlue, manifest: Readonly<BindgenManifest>): Bin
     get failed() {
       return failed;
     },
-    scrubText: (value: string) => text((s) => glue.scrubText(s), value),
-    scrubLong: (value: string) => text((s) => glue.scrubLong(s), value),
+    scrubText: (value: string) => text((s) => glue.scrubTextChecked(s), value),
+    scrubLong: (value: string) => text((s) => glue.scrubTextChecked(s), value),
     scrubJson: <T>(value: T): T => {
+      ensureUsable();
       // `undefined` has no JSON text, so there is nothing the engine could scrub or the caller
       // could persist; it is the one value returned without an engine call (TS returns it too).
       // null, booleans and numbers DO go through the engine (no zero-change bypass).
@@ -309,32 +292,27 @@ function makeEngine(glue: BindgenGlue, manifest: Readonly<BindgenManifest>): Bin
       try {
         input = JSON.stringify(value);
       } catch {
-        return notWellFormed();
+        return refuseMalformedScrubInput();
       }
-      if (typeof input !== "string" || LONE_SURROGATE.test(input)) notWellFormed();
-      const envelope = parseEnvelope(invoke(() => glue.scrubJson(input as string)));
+      preflightScrubText(input);
+      const envelope = parseEnvelope(invoke(() => glue.scrubJson(input)));
       // Use the Rust-serialised jsonText, never `.value` (a JS view that may round large integers).
-      if (typeof envelope.jsonText !== "string") throw new ScrubEngineUnavailable("engine_refused");
+      if (typeof envelope.jsonText !== "string") return poison();
       try {
         return JSON.parse(envelope.jsonText) as T;
       } catch {
-        throw new ScrubEngineUnavailable("engine_refused");
+        return poison();
       }
     },
     scrubRecords: (source: Uint8Array): ScrubRecordsResult => {
-      let out: unknown;
-      try {
-        out = invoke(() => glue.scrubRecords(source));
-      } catch (error) {
-        // Same refusal, code and retryability as the TypeScript engine, decided only after the engine refused.
-        if (error instanceof ScrubEngineUnavailable && error.reason === "engine_refused" && !isUtf8(source))
-          throw new PipelineError("chunk_not_utf8", "raw chunk is not valid UTF-8", false);
-        throw error;
-      }
+      ensureUsable();
+      const bytes = preflightScrubRecords(source);
+      const out = invoke(() => glue.scrubRecords(bytes));
       const r = parseEnvelope(out);
       if (typeof r.text !== "string" || !Number.isSafeInteger(r.recordCount) || (r.recordCount as number) < 0)
-        throw new ScrubEngineUnavailable("engine_refused");
-      return { scrubbed: encoder.encode(r.text), records: r.recordCount as number, scrub: marker };
+        return poison();
+      try { return { scrubbed: encoder.encode(r.text), records: r.recordCount as number, scrub: marker }; }
+      catch { return poison(); }
     },
   };
   return Object.freeze(engine);
@@ -407,6 +385,7 @@ async function readVerified(pin: ScrubBindgenPin, read: ReadBindgenArtifact): Pr
 }
 
 export interface BindgenInitOptions {
+  readerMaxRuleset?: number;
   pin: unknown;
   readArtifact: ReadBindgenArtifact;
   importGlue?: ImportBindgenGlue;
@@ -442,7 +421,7 @@ async function initialise(pin: ScrubBindgenPin, options: BindgenInitOptions): Pr
  */
 export async function initBindgenScrubEngine(options: BindgenInitOptions): Promise<BindgenScrubEngine> {
   if (compiledInit) refuse("bindgen_path_conflict");
-  const pin = parseScrubBindgenPin(options.pin);
+  const pin = parseScrubBindgenPin(options.pin, options.readerMaxRuleset);
   const key = pinKey(pin);
   if (!nodeInit) {
     // Assigned synchronously, before any await, so a concurrent caller always sees it.
@@ -456,6 +435,7 @@ export async function initBindgenScrubEngine(options: BindgenInitOptions): Promi
   }
   if (nodeInit.key !== key) refuse("bindgen_init_conflict");
   const engine = await nodeInit.promise;
+  if (engine.failed) throw new ScrubberError("scrubber_instance_poisoned", "instance_poison");
   try {
     await readVerified(pin, options.readArtifact);
   } catch {
@@ -467,6 +447,7 @@ export async function initBindgenScrubEngine(options: BindgenInitOptions): Promi
 // ---------------------------------------------------------------- Workers compiled-module path
 
 export interface CompiledBindgenOptions {
+  readerMaxRuleset?: number;
   /** The statically imported glue namespace (its bytes are pinned and verified at build time). */
   glue: unknown;
   /** A statically imported `WebAssembly.Module` of the pinned `.wasm` (byte pin verified at build time). */
@@ -484,11 +465,12 @@ export interface CompiledBindgenOptions {
  */
 export function createCompiledBindgenEngine(options: CompiledBindgenOptions): BindgenScrubEngine {
   if (nodeInit) refuse("bindgen_path_conflict");
-  const pin = parseScrubBindgenPin(options.pin);
+  const pin = parseScrubBindgenPin(options.pin, options.readerMaxRuleset);
   const key = pinKey(pin);
   if (compiledInit) {
     if (compiledInit.key !== key || !compiledInit.engine) refuse("bindgen_init_conflict");
-    return compiledInit.engine!;
+    if (compiledInit.engine.failed) throw new ScrubberError("scrubber_instance_poisoned", "instance_poison");
+    return compiledInit.engine;
   }
   const Module = (globalThis as unknown as { WebAssembly?: { Module?: abstract new (...args: never[]) => unknown } }).WebAssembly?.Module;
   if (!Module || !(options.module instanceof Module)) refuse("bindgen_module_invalid");

@@ -308,3 +308,10 @@ describe("enabled", () => {
       ).rejects.toThrow("READ_API_COMPLETE_SINCE");
   });
 });
+
+
+test("invalid reader capability refuses service startup before app assembly", async () => {
+  let assembled = false;
+  await expect(startReadApiService({ READER_MAX_RULESET: "SYNTH_PRIVATE" }, { build: async () => { assembled = true; throw Error("not reached"); } })).rejects.toThrow("READER_MAX_RULESET must be an integer from 8 through 10");
+  expect(assembled).toBe(false);
+});

@@ -1,7 +1,7 @@
 /**
  * SCRUB_ENGINE=wasm-bindgen (bindgen-engine.ts, docs/scrub-engine.md "wasm-bindgen path").
  *
- * No relayscrubber artifact exists yet, so every test uses doubles: fake wasm / glue /
+ * No relayscrubber artifact is qualified or pinned here; these tests use doubles: fake wasm / glue /
  * loader bytes whose digests are pinned at run time, and a glue double whose scrub
  * functions wrap the TypeScript scrubber (a stand-in, not an oracle claim). One group
  * evaluates a fake glue SOURCE through the real `data:` import and the real file reader.
@@ -25,6 +25,8 @@ import {
   SCRUB_UNAVAILABLE_LOG_TEXT,
   ScrubEngineConfigError,
   ScrubEngineUnavailable,
+  ScrubberError,
+  SCRUBBER_CALL_REFUSAL_CODES,
   bindgenProfile,
   createCompiledBindgenEngine,
   initScrubEngine,
@@ -50,14 +52,15 @@ const LOADER = enc.encode("// test double: not the relayscrubber index.js\n");
 const BYTES = { wasm: WASM, glue: GLUE, loader: LOADER } as const;
 
 const MANIFEST = {
-  schema: 2,
+  schema: 3,
   ruleset: "relayhistory-scrub",
   rulesetVersion: SCRUB_RULESET_VERSION,
   rulesetSourceSha256: sha("test-double ruleset source"),
   crateVersion: "0.0.0-test-double",
-  abiVersion: 1,
+  abiVersion: 2,
   policy: "secrets",
   redactionToken: "[REDACTED]",
+  scrubProfile: "relayhistory-secrets-v8",
 };
 type Manifest = typeof MANIFEST;
 
@@ -83,6 +86,7 @@ interface GlueOptions {
   manifest?: Record<string, unknown> | string;
   /** "trap": WebAssembly.RuntimeError; "error": a deliberate Error code; "string": a thrown code string. */
   throwOn?: Partial<Record<Op, "trap" | "error" | "string">>;
+  fault?: Partial<Record<Op, unknown>>;
   initThrows?: boolean;
   omit?: string;
   /** Override scrubJson's envelope. */
@@ -93,6 +97,7 @@ function glueDouble(o: GlueOptions = {}) {
   const calls: { op: string; arg: unknown }[] = [];
   const inits: unknown[] = [];
   const fail = (op: Op) => {
+    if (Object.hasOwn(o.fault ?? {}, op)) throw o.fault![op];
     const kind = o.throwOn?.[op];
     if (kind === "trap") throw new WebAssembly.RuntimeError("unreachable");
     if (kind === "error") throw new Error("scrubber_invalid_input");
@@ -110,6 +115,12 @@ function glueDouble(o: GlueOptions = {}) {
       return {};
     },
     manifestJson: () => (typeof o.manifest === "string" ? o.manifest : JSON.stringify(o.manifest ?? MANIFEST)),
+    scrubTextChecked: (s: string) => {
+      calls.push({ op: "scrubTextChecked", arg: s });
+      fail("scrubText");
+      fail("scrubLong");
+      return tsScrubLong(s);
+    },
     scrubText: (s: string) => {
       calls.push({ op: "scrubText", arg: s });
       fail("scrubText");
@@ -193,10 +204,11 @@ async function expectRefused(reason: ScrubEngineFailure) {
     } catch (error) {
       thrown = error;
     }
-    expect(thrown, name).toBeInstanceOf(ScrubEngineUnavailable);
+    expect(thrown, name).toBeInstanceOf(reason === "engine_failed" ? ScrubberError : ScrubEngineUnavailable);
+    if (reason === "engine_failed") expect(thrown).toMatchObject({ code: "scrubber_instance_poisoned", disposition: "instance_poison" });
     expect((thrown as ScrubEngineUnavailable).reason, name).toBe(reason);
   }
-  await expect(seam.sealRawChunk({} as never, { source: enc.encode("x\n") } as never)).rejects.toBeInstanceOf(ScrubEngineUnavailable);
+  await expect(seam.sealRawChunk({} as never, { source: enc.encode("x\n") } as never)).rejects.toBeInstanceOf(reason === "engine_failed" ? ScrubberError : ScrubEngineUnavailable);
   expect(scrubEngineReady()).toBe(false);
   expect(seam.scrubTextForLog("token=abc")).toBe(SCRUB_UNAVAILABLE_LOG_TEXT);
   expect(isSafeIdentifier("0190a8f2-7c1e-7d3a-9b2f-1c2d3e4f5a6b")).toBe(false);
@@ -262,15 +274,15 @@ describe("wasm-bindgen: happy path with doubles", () => {
     expect(seam.scrubTextForLog("plain")).toBe("plain");
     expect(isSafeIdentifier("0190a8f2-7c1e-7d3a-9b2f-1c2d3e4f5a6b")).toBe(true);
     expect(s.calls.map((c) => c.op)).toEqual([
-      "scrubText",
-      "scrubLong",
+      "scrubTextChecked",
+      "scrubTextChecked",
       "scrubJson",
       "scrubJson",
       "scrubJson",
       "scrubJson",
       "scrubRecords",
-      "scrubText",
-      "scrubText",
+      "scrubTextChecked",
+      "scrubTextChecked",
     ]);
     expect(s.calls.filter((c) => c.op === "scrubJson").map((c) => c.arg)).toEqual(['{"a":"plain"}', "null", "true", "42"]);
   });
@@ -344,13 +356,14 @@ describe("wasm-bindgen: placeholder and malformed pins are refused by name", () 
   for (const field of BINDGEN_MANIFEST_FIELDS) {
     cases.push({
       name: `manifest.${field} placeholder`,
-      pin: () => makePin({}, { [field]: placeholderPin.manifest[field] === 2 ? 1 : placeholderPin.manifest[field] }),
+      pin: () => makePin({}, { [field]: field === "schema" ? 2 : placeholderPin.manifest[field] }),
       reason: `bindgen_unpinned_manifest_${field}`,
     });
     cases.push({ name: `manifest.${field} missing`, pin: () => makePin({}, { [field]: undefined }), reason: `bindgen_unpinned_manifest_${field}` });
   }
   cases.push({ name: "manifest.policy unknown", pin: () => makePin({}, { policy: "everything" }), reason: "bindgen_unpinned_manifest_policy" });
 
+  cases.push({ name: "unsupported ABI", pin: () => makePin({}, { abiVersion: 3 }), reason: "bindgen_unpinned_manifest_abiVersion" });
   for (const c of cases)
     it(`${c.name}: ${c.reason}, nothing read or evaluated`, async () => {
       const s = setup({ pin: c.pin() });
@@ -384,7 +397,8 @@ describe("wasm-bindgen: placeholder and malformed pins are refused by name", () 
       ["crateVersion", "bindgen_unpinned_manifest_abiVersion"],
       ["abiVersion", "bindgen_unpinned_manifest_policy"],
       ["policy", "bindgen_unpinned_manifest_redactionToken"],
-      ["redactionToken", null],
+      ["redactionToken", "bindgen_unpinned_manifest_scrubProfile"],
+      ["scrubProfile", null],
     ];
     for (const [field, next] of manifestSteps) {
       pin.manifest[field] = (MANIFEST as Record<string, unknown>)[field];
@@ -433,7 +447,7 @@ describe("wasm-bindgen: artifact verification before anything is evaluated", () 
     expect(((await initError(s.options)) as ScrubEngineUnavailable).reason).toBe("bindgen_glue_import_failed");
   });
 
-  for (const name of ["default", "manifestJson", "scrubText", "scrubLong", "scrubJson", "scrubRecords"]) {
+  for (const name of ["default", "manifestJson", "scrubTextChecked", "scrubJson", "scrubRecords"]) {
     it(`glue without ${name}: bindgen_export_missing`, async () => {
       const s = setup({ glue: { omit: name } });
       expect(((await initError(s.options)) as ScrubEngineUnavailable).reason).toBe("bindgen_export_missing");
@@ -454,14 +468,15 @@ describe("wasm-bindgen: artifact verification before anything is evaluated", () 
 
 describe("wasm-bindgen: the instance's manifest must equal the pin in every field", () => {
   const other: Record<string, unknown> = {
-    schema: 3,
+    schema: 4,
     ruleset: "relayhistory-scrub-other",
     rulesetVersion: SCRUB_RULESET_VERSION + 2,
     rulesetSourceSha256: sha("another source"),
     crateVersion: "0.0.1-test-double",
-    abiVersion: 2,
+    abiVersion: 1,
     policy: "pii",
     redactionToken: "[SCRUBBED]",
+    scrubProfile: "different-crate-profile",
   };
   for (const field of BINDGEN_MANIFEST_FIELDS) {
     it(`${field} differs: bindgen_manifest_mismatch_${field}`, async () => {
@@ -513,24 +528,14 @@ describe("wasm-bindgen: a glue error discards the input", () => {
 
   for (const [op, call] of sites) {
     for (const kind of ["error", "string"] as const)
-      it(`${op}: a deliberate ${kind} refuses that call (engine_refused), returns nothing, does not poison`, async () => {
+      it(`${op}: an untagged ${kind} poisons the instance and returns nothing`, async () => {
         const s = setup({ glue: { throwOn: { [op]: kind } } });
         await initScrubEngine(s.options);
-        let thrown: unknown;
-        let returned: unknown = "<none>";
-        try {
-          returned = call();
-        } catch (error) {
-          thrown = error;
-        }
-        expect(returned).toBe("<none>");
-        expect(thrown).toBeInstanceOf(ScrubEngineUnavailable);
-        expect((thrown as ScrubEngineUnavailable).reason).toBe("engine_refused");
-        expect(String((thrown as Error).message)).not.toContain("do-not-return-me");
-        // Not poisoned: another entry point still works.
-        const fine = op === "scrubText" ? seam.scrubLong("plain") : seam.scrubText("plain");
-        expect(fine).toBe("plain");
-        if (op === "scrubText" || op === "scrubLong") expect(seam.scrubTextForLog(SECRET_INPUT)).toBe(op === "scrubText" ? SCRUB_UNAVAILABLE_LOG_TEXT : tsScrubText(SECRET_INPUT));
+        expect(call).toThrow(expect.objectContaining({ code: "scrubber_engine_failure", disposition: "instance_poison" }));
+        const before = s.calls.length;
+        await expectRefused("engine_failed");
+        expect(s.calls.length).toBe(before);
+        expect(seam.scrubTextForLog(SECRET_INPUT)).toBe(SCRUB_UNAVAILABLE_LOG_TEXT);
       });
 
     it(`${op}: a trap (RuntimeError, e.g. panic or OOM) poisons the instance (engine_failed)`, async () => {
@@ -548,22 +553,24 @@ describe("wasm-bindgen: a glue error discards the input", () => {
     });
   }
 
-  it("scrubRecords: invalid UTF-8 the engine refuses keeps the TypeScript chunk_not_utf8 refusal", async () => {
+  it("scrubRecords: invalid UTF-8 is refused before the engine with chunk_not_utf8", async () => {
     const s = setup({ glue: { throwOn: { scrubRecords: "error" } } });
     await initScrubEngine(s.options);
     expect(() => seam.scrubRecords(new Uint8Array([0x7b, 0xff, 0x7d, 0x0a]))).toThrow(expect.objectContaining({ code: "chunk_not_utf8", retryable: false }));
-    expect(s.calls.map((c) => c.op)).toEqual(["scrubRecords"]);
+    expect(s.calls).toEqual([]);
   });
 
-  it("malformed glue results are refused, never passed through", async () => {
-    const s = setup({ glue: { jsonEnvelope: () => JSON.stringify({ value: { a: 1 } }) } });
-    await initScrubEngine(s.options);
-    expect(() => seam.scrubJson({ a: 1 })).toThrow(expect.objectContaining({ reason: "engine_refused" }));
-    (s.glue as { scrubText: unknown }).scrubText = () => undefined;
-    (s.glue as { scrubRecords: unknown }).scrubRecords = () => JSON.stringify({ text: "x", recordCount: -1 });
-    expect(() => seam.scrubText("x")).toThrow(expect.objectContaining({ reason: "engine_refused" }));
-    expect(() => seam.scrubRecords(enc.encode("{}\n"))).toThrow(expect.objectContaining({ reason: "engine_refused" }));
-  });
+  for (const op of ["scrubText", "scrubJson", "scrubRecords"] as const)
+    it(`${op}: malformed glue output poisons the instance`, async () => {
+      const s = setup();
+      const engine = await initScrubEngine(s.options);
+      s.glue[op === "scrubText" ? "scrubTextChecked" : op] = () => op === "scrubText" ? undefined : op === "scrubJson" ? '{"value":{"a":1}}' : '{"text":"x","recordCount":-1}';
+      const call = op === "scrubText" ? () => engine.scrubText("x") : op === "scrubJson" ? () => engine.scrubJson({a:1}) : () => engine.scrubRecords(enc.encode("{}\n"));
+      expect(call).toThrow(expect.objectContaining({ code: "scrubber_engine_failure", disposition: "instance_poison" }));
+      expect(() => engine.scrubJson(undefined)).toThrow(expect.objectContaining({ code: "scrubber_instance_poisoned" }));
+      expect(() => engine.scrubText("\uD800")).toThrow(expect.objectContaining({ code: "scrubber_instance_poisoned" }));
+      expect(scrubEngineReady()).toBe(false);
+    });
 
   it("refuses text that cannot cross wasm-bindgen's UTF-8 strings unchanged (lone surrogates)", async () => {
     const s = setup();
@@ -692,6 +699,7 @@ export function initSync() { throw new Error("not in this test"); }
 export function manifestJson() { if (!ready) throw new Error("not initialised"); return ${JSON.stringify(JSON.stringify(manifest))}; }
 export function scrubText(s) { return s.split("hunter2").join("[REDACTED]"); }
 export function scrubLong(s) { return scrubText(s); }
+export function scrubTextChecked(s) { return scrubText(s); }
 export function scrubJson(t) { const jsonText = scrubText(t); return JSON.stringify({ value: JSON.parse(jsonText), jsonText, redactionCount: 0 }); }
 export function scrubRecords(b) { const text = scrubText(new TextDecoder().decode(b)); return JSON.stringify({ text, recordCount: text.split("\\n").filter(Boolean).length, redactionCount: 0 }); }
 export function seenLength() { return seen ? seen.length : -1; }
@@ -755,7 +763,7 @@ describe("wasm-bindgen: Workers compiled-module path (createCompiledBindgenEngin
     expect(engine.kind).toBe("wasm-bindgen");
     expect(d.inits).toEqual([{ module }]);
     expect(engine.scrubText("plain")).toBe("plain");
-    expect(d.calls.map((c) => c.op)).toEqual(["scrubText"]);
+    expect(d.calls.map((c) => c.op)).toEqual(["scrubTextChecked"]);
     expect(engine.marker.profile).toBe(bindgenProfile(MANIFEST));
     // Same pin again: the same engine, no second initSync.
     expect(createCompiledBindgenEngine({ glue: d.glue, module, pin: makePin() })).toBe(engine);
@@ -811,3 +819,69 @@ describe("wasm-bindgen: Workers compiled-module path (createCompiledBindgenEngin
     expect(s.reads).toEqual([]);
   });
 });
+
+
+describe("reader-first writer initialization gate", () => {
+  const future = { ...MANIFEST, rulesetVersion: 10, scrubProfile: "relayhistory-secrets-v10" };
+  const futurePin = () => makePin({ scrub_profile: bindgenProfile(future) }, { rulesetVersion: 10, scrubProfile: future.scrubProfile });
+  it("Node refuses above-ceiling pins before loading and accepts only after explicit reader configuration", async () => {
+    const s = setup({ pin: futurePin(), glue: { manifest: future } });
+    await expect(initScrubEngine(s.options)).rejects.toMatchObject({ reason: "bindgen_ruleset_above_reader_ceiling" });
+    expect(s.reads).toEqual([]);
+    const engine = await initScrubEngine({ ...s.options, env: { SCRUB_ENGINE: "wasm-bindgen", READER_MAX_RULESET: "10" } });
+    expect(engine.rulesetVersion).toBe(10);
+    expect(s.reads).toHaveLength(3);
+  });
+  it("compiled-module initialization applies the same ceiling before glue initialization", () => {
+    const glue = glueDouble({ manifest: future });
+    const ModuleCtor = WebAssembly.Module as unknown as new (bytes: Uint8Array) => WebAssembly.Module;
+    const options = { pin: futurePin(), glue: glue.glue, module: new ModuleCtor(new Uint8Array([0,97,115,109,1,0,0,0])) };
+    expect(() => createCompiledBindgenEngine(options)).toThrow(expect.objectContaining({ reason: "bindgen_ruleset_above_reader_ceiling" }));
+    expect(glue.inits).toEqual([]);
+    expect(createCompiledBindgenEngine({ ...options, readerMaxRuleset: 10 }).rulesetVersion).toBe(10);
+    expect(glue.inits).toHaveLength(1);
+  });
+});
+
+
+it("reader capability alone never selects or relabels the TS writer", async () => {
+  const engine = await initScrubEngine({ env: { SCRUB_ENGINE: "ts", READER_MAX_RULESET: "10" } });
+  expect(engine.kind).toBe("ts"); expect(engine.rulesetVersion).toBe(8);
+});
+
+
+for (const path of ["node", "compiled"] as const) {
+  describe(`${path}: bounded Rust text export is mandatory`, () => {
+    const module = () => new (WebAssembly.Module as unknown as new (b: Uint8Array) => WebAssembly.Module)(
+      new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]),
+    );
+
+    it("text and long calls use checked Rust entrypoint, never compatibility exports", async () => {
+      const s = setup();
+      let uncheckedCalls = 0;
+      const unchecked = () => {
+        uncheckedCalls++;
+        throw new Error("unchecked compatibility route");
+      };
+      s.glue.scrubText = unchecked;
+      s.glue.scrubLong = unchecked;
+      const engine = path === "node"
+        ? await initScrubEngine(s.options)
+        : createCompiledBindgenEngine({ pin: makePin(), module: module(), glue: s.glue });
+      expect(engine.scrubText("plain")).toBe("plain");
+      expect(engine.scrubLong("plain")).toBe("plain");
+      expect(s.calls.map((c) => c.op)).toEqual(["scrubTextChecked", "scrubTextChecked"]);
+      expect(uncheckedCalls).toBe(0);
+    });
+
+    it("missing checked export refuses startup even when both compatibility exports exist", async () => {
+      const s = setup({ glue: { omit: "scrubTextChecked" } });
+      const start = () => path === "node"
+        ? initScrubEngine(s.options)
+        : createCompiledBindgenEngine({ pin: makePin(), module: module(), glue: s.glue });
+      await expect(Promise.resolve().then(start)).rejects.toMatchObject({ reason: "bindgen_export_missing" });
+      expect(s.calls).toEqual([]);
+      expect(s.inits).toEqual([]);
+    });
+  });
+}

@@ -20,6 +20,7 @@
  * cap (LOGIN_BODY_CAP_BYTES, 413 beyond it) before the app sees it; every
  * other request body is drained, never read.
  */
+import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { Hono } from "hono";
@@ -193,6 +194,7 @@ export async function startReadApiService(
   env: NodeJS.ProcessEnv = process.env,
   options: { host?: string; port?: number; build?: ReadAppBuilder } = {},
 ): Promise<ReadApiService> {
+  readerMaxRuleset(env);
   const config = readApiServiceConfig(env);
   const built = config.enabled ? await (options.build ?? selfhostReadApp)(config.secret, env) : null;
   const tokenRoutes = built !== null && readApiAuthMode(env) === "self_issued";

@@ -59,6 +59,7 @@ const BUFFERED_FINGERPRINT_PREFIX = "bf";
 export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
 
 export interface SearchIndexDeps {
+  readerMaxRuleset?: number;
   /** One Supabase transaction on one connection (for the advisory lock). */
   transact: Transact;
   reader: ManifestReader;

@@ -67,6 +67,7 @@
  * all unset in wrangler.jsonc; only the deploy workflow's owner_buffered=on render
  * (scripts/render-deploy-config.ts) adds them.
  */
+import { readerMaxRuleset } from "../../pipeline/src/lib/scrub-engine/reader-policy.ts";
 import pg from "pg";
 import { Decompress, decompress } from "fzstd";
 import { canonicalAnalysisHandle } from "./analysis-cache.ts";
@@ -476,6 +477,7 @@ export function bufferedSearchGate(env: Env, run: TenantRunner): BufferedSearchG
  */
 export function timingDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers>[0], fetcher: typeof fetch = (input, init) => fetch(input, init)): TimingDeps | undefined {
   if (!rawStoreFromEnv(env, fetcher)) return undefined;
+  const maximum = readerMaxRuleset(env);
   const pointers = sqlCanonicalPointers(run);
   return {
     state: pointers.state,
@@ -487,6 +489,7 @@ export function timingDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers
       const snapshot = await canonicalSnapshot(
         {
           ...raw,
+          readerMaxRuleset: maximum,
           prefix: env,
           pointers: pointers.pointers,
           decompress: (bytes, max) => {

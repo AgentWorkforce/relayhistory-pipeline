@@ -100,3 +100,10 @@ describe("relaycontrol introspection destination (RELAYHISTORY_ACCEPT_RELAYCONTR
     expect(relaycontrolConfigured({ ...full, RELAYCONTROL_INTROSPECT_SECRET: undefined })).toBe(false);
   });
 });
+
+
+test("malformed explicit reader policy refuses before database access", async () => {
+  Object.assign(process.env,{LOCKER_BUCKET:"raw",TENANT_ORG_ID:"org",RELAYAUTH_JWKS_URL:"https://auth.example.com/jwks",READER_MAX_RULESET:""});
+  delete process.env.HOOPDB_URL;
+  await expect(buildIngestApp()).rejects.toThrow("READER_MAX_RULESET must be an integer from 8 through 10");
+});

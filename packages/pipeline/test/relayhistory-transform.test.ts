@@ -520,14 +520,17 @@ describe("RelayHistory export transform", () => {
     const counted = (store: ObjectStore, bytes: number) => {
       let pulled = 0;
       const capped: ObjectStore = Object.create(store);
-      capped.get = async () =>
-        new ReadableStream<Uint8Array>({
+      capped.getObject = async (key) => {
+        const object = await store.getObject(key);
+        await object.body.cancel();
+        return { ...object, body: new ReadableStream<Uint8Array>({
           pull(controller) {
             pulled += 1024;
             if (pulled > bytes) controller.close();
             else controller.enqueue(new Uint8Array(1024));
           },
-        });
+        }) };
+      };
       return { capped, pulled: () => pulled };
     };
 
@@ -590,9 +593,9 @@ describe("RelayHistory export transform", () => {
       const f = await fixture();
       let reads = 0;
       const store: ObjectStore = Object.create(f.store);
-      store.get = async (...args) => {
+      store.getObject = async (...args) => {
         reads += 1;
-        return f.store.get(...args);
+        return f.store.getObject(...args);
       };
       const total = f.manifest.raw.chunks.reduce(
         (sum, chunk) => sum + chunk.bytes,
@@ -909,4 +912,32 @@ describe("RelayHistory export transform", () => {
       retryable: false,
     });
   });
+});
+
+
+it("export reads require explicit reader capability and future per-chunk metadata", async () => {
+  const f = await fixture();
+  const baseline = await readRelayhistoryExport(f.manifest, f.store);
+  f.manifest.raw.scrub = { ruleset: "relayhistory-scrub", version: 10 };
+  await expect(readRelayhistoryExport(f.manifest, f.store, undefined, { readerMaxRuleset: 8 })).rejects.toMatchObject({ code: "scrub_ruleset_unsupported" });
+  await expect(readRelayhistoryExport(f.manifest, f.store, undefined, { readerMaxRuleset: 10 })).rejects.toMatchObject({ code: "scrub_ruleset_unsupported" });
+  for (const chunk of f.manifest.raw.chunks) {
+    const key = rawChunkKey(loc, chunk.seq, chunk.start_offset, chunk.sha256, "ndjson");
+    const object = await f.store.getObject(key);
+    const bytes = await readAll(object.body);
+    const metadata = { ...object.meta.metadata }; delete metadata["content-sha256"];
+    await f.store.put(key, bytes, { metadata: { ...metadata, "scrub-ruleset": "relayhistory-scrub", "scrub-version": "10" } });
+  }
+  expect(await readRelayhistoryExport(f.manifest, f.store, undefined, { readerMaxRuleset: 10 })).toEqual(baseline);
+});
+
+
+it("unset export policy retains main's version-9 and foreign-family reads", async () => {
+  const f=await fixture();
+  const baseline=await readRelayhistoryExport(f.manifest,f.store);
+  for (const marker of [{ruleset:"relayhistory-scrub",version:9},{ruleset:"foreign-family",version:8}]) {
+    f.manifest.raw.scrub=marker;
+    expect(await readRelayhistoryExport(f.manifest,f.store)).toEqual(baseline);
+    await expect(readRelayhistoryExport(f.manifest,f.store,undefined,{readerMaxRuleset:8})).rejects.toMatchObject({code:"scrub_ruleset_unsupported"});
+  }
 });

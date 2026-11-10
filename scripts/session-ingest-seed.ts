@@ -4,6 +4,7 @@
  * Requires reviewed raw S3 GetObject/KMS decrypt, seeder SET ROLE, and (execute only)
  * readonly Neon SELECT on deletion/reset fences. No transcript rows are read from Neon.
  */
+import { readerMaxRuleset } from "../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -63,6 +64,7 @@ function readStore():{store:ObjectStore;bucket:string}{
  return {store,bucket};
 }
 export async function main(){
+ const maximum=readerMaxRuleset(process.env);
  process.umask(0o077);
  const org=process.argv[2],args=process.argv.slice(3),execute=args.includes("--execute");
  if(!org||!/^[A-Za-z0-9._-]{1,128}$/.test(org)||org.startsWith(".")||args.some(a=>a!=="--execute"&&!/^--max-scopes=[1-9][0-9]*$/.test(a)))fail("seed_usage");
@@ -119,6 +121,7 @@ export async function main(){
   }
   const result=await seedOrgFromS3(sql,{
     store,bucket,provider:"s3",reader:objectStoreManifestReader(store,{provider:"s3",bucket,maxBytes:64*1024*1024}),
+    readerMaxRuleset: maximum,
     prefixFor:org=>"96bulls/"+org,
     decompress:(stored,maxBytes)=>new Uint8Array(zstdDecompressSync(stored,{maxOutputLength:maxBytes})),
   },org,expected,{sourceHead:head,cacheDir,execute,concurrency,...(maxScopes===undefined?{}:{maxScopes}),

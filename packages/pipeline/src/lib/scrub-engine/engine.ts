@@ -89,7 +89,7 @@ export type ScrubEngineFailure =
 
 /** The three verified byte artifacts of the wasm-bindgen package. */
 export type BindgenArtifactName = "wasm" | "glue" | "loader";
-/** Every field of the relayscrubber schema-2 manifest. */
+/** Every field of the relayscrubber schema-3 manifest. */
 export type BindgenManifestField =
   | "schema"
   | "ruleset"
@@ -98,7 +98,8 @@ export type BindgenManifestField =
   | "crateVersion"
   | "abiVersion"
   | "policy"
-  | "redactionToken";
+  | "redactionToken"
+  | "scrubProfile";
 
 /**
  * Why SCRUB_ENGINE=wasm-bindgen is refused (docs/scrub-engine.md, "wasm-bindgen path").
@@ -106,8 +107,9 @@ export type BindgenManifestField =
  * - bindgen_pin_invalid: the pin file is not an object, or names another pin schema / package
  * - bindgen_pin_paths_invalid: an artifact path in the pin is absent, absolute or escapes the package directory
  * - bindgen_unpinned_<field>: that pin field is a placeholder, empty, or malformed (digests: not 64 lowercase hex)
- * - bindgen_pin_profile_inconsistent: the pinned profile is not the one the pinned manifest derives
- * - bindgen_ruleset_below_floor: the pinned ruleset version is below the TypeScript one readers accept
+ * - bindgen_pin_profile_inconsistent: the pinned profile is not the crate-owned profile in the pinned manifest
+ * - bindgen_ruleset_below_floor: the pinned writer ruleset is below the supported writer floor
+ * - bindgen_ruleset_above_reader_ceiling: the pinned writer version exceeds the explicit reader capability
  * - bindgen_dir_invalid: SCRUB_BINDGEN_DIR is set but not an absolute path
  * - bindgen_artifact_missing_<artifact>: reading it failed or returned no bytes
  * - bindgen_sha256_mismatch_<artifact>: its snapshot does not hash to the pin
@@ -117,7 +119,7 @@ export type BindgenManifestField =
  * - bindgen_manifest_invalid: manifestJson() threw or is not a JSON object
  * - bindgen_manifest_mismatch_<field>: the instance's manifest differs from the pin in that field
  * - bindgen_manifest_mismatch_extra_field: the instance's manifest has a field the pin does not
- * - bindgen_profile_mismatch: the profile derived from the instance's manifest is not the pinned one
+ * - bindgen_profile_mismatch: the crate-owned profile in the instance's manifest is not the pinned one
  * - bindgen_init_conflict: a second initialisation with other pins or other bytes
  * - bindgen_path_conflict: the Node loader path and the Workers compiled-module path in one process
  * - bindgen_module_invalid: the compiled path was given something other than a WebAssembly.Module
@@ -131,6 +133,7 @@ export type BindgenFailure =
   | `bindgen_unpinned_manifest_${BindgenManifestField}`
   | "bindgen_pin_profile_inconsistent"
   | "bindgen_ruleset_below_floor"
+  | "bindgen_ruleset_above_reader_ceiling"
   | "bindgen_dir_invalid"
   | `bindgen_artifact_missing_${BindgenArtifactName}`
   | `bindgen_sha256_mismatch_${BindgenArtifactName}`

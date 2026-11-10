@@ -508,6 +508,11 @@ const MIGRATION_ON = {
 };
 
 describe("buildIngestApp auth (production composition)", () => {
+  test("forwards explicit reader capability through real app bindings", async () => {
+    const { env } = await ingest({READER_MAX_RULESET:"10"});
+    expect(env.READER_MAX_RULESET).toBe("10");
+  });
+
   test("/readyz is 503 until the Worker role validation is PASS for this image's generation", async () => {
     const { app, env } = await ingest();
     // This file applies the migrations directly, so record the ledger the migrator

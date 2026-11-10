@@ -1,5 +1,6 @@
 /** Strict native transcript input for briefs. The public canonical record-stream
  * APIs stay ndjson-only. Nothing here relabels stored bytes or skips bad JSON. */
+import { assertReaderScrubMarker, readerChunkBody } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { createHash } from "node:crypto";
 import { chunkKeys, isManifestRest, parseSessionKey, type ManifestV1 } from "../../packages/object-store/src/index.ts";
 import { objectStoreManifestReader, prefixAllowed, readCapped } from "../../packages/pipeline/src/lib/pipeline/adapter.ts";
@@ -39,6 +40,7 @@ export async function canonicalTranscriptSnapshot(deps: CanonicalDeps, identity:
         at.workspaceId !== m.session.workspace_id || at.harness !== m.session.harness || at.sessionId !== m.session.session_id || at.machineId !== m.session.machine_id)
       refuse("manifest_mismatch");
     if (!m.raw.scrub) throw new CanonicalReadError("canonical_projection_incomplete", 503, ["manifest_unscrubbed"]);
+    assertReaderScrubMarker(m.raw.scrub, deps.readerMaxRuleset);
     if (m.extensions?.["client.relayhistory_export"] !== undefined) refuse("transcript_export_marker_refused");
     // Full metadata/hash-chain validation above is unchanged. The live source
     // stream excludes superseded rewrite/truncation epochs, using the manifest
@@ -70,7 +72,7 @@ export async function canonicalTranscriptSnapshot(deps: CanonicalDeps, identity:
     for (const { entry, key } of chunks) {
       signal?.throwIfAborted();
       if (entry.stored_bytes > CANONICAL_SCOPE_BYTES || (entry.stored_raw_bytes ?? entry.bytes) > CANONICAL_SCOPE_BYTES) refuse("transcript_chunk_too_large");
-      const stored = await readCapped(await deps.store.get(key), entry.stored_bytes);
+      const stored = await readCapped(await readerChunkBody(await deps.store.getObject(key), manifest.raw.scrub, deps.readerMaxRuleset), entry.stored_bytes);
       if (!stored || stored.byteLength !== entry.stored_bytes || hash(stored) !== entry.stored_sha256) refuse("transcript_chunk_digest_mismatch");
       let raw: Uint8Array;
       try { raw = deps.decompress(stored, entry.stored_raw_bytes ?? CANONICAL_SCOPE_BYTES); } catch { refuse("transcript_chunk_decompress_failed"); }

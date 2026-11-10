@@ -147,9 +147,11 @@ metadata `scrub-ruleset` / `scrub-version`, manifests and summary `scrub_version
     stamps that engine's `rulesetVersion` with the text the same engine scrubbed.
 - The TypeScript engine stamps exactly what main stamps: `relayhistory-scrub` / `8`. Its profile
   id is `relayhistory-scrub/typescript`, which is not persisted by any TS path.
-- Readers never re-scrub. `SCRUB_RULESET_VERSION` and the manifest min-version logic are unchanged.
-  Readers check `version <= SCRUB_RULESET_VERSION`. So a wasm cutover that declares a ruleset
-  above 8 needs a coordinated reader bump first. The pin refuses a ruleset below 8.
+- Readers never re-scrub. Unset reader policy retains the existing presence/quarantine
+  and courier admission checks. An explicit `READER_MAX_RULESET` enables the independent
+  family/version and per-chunk policy described below; it never changes TS writer stamps.
+  A wasm cutover above 8 still requires a coordinated reader-first rollout. The pin refuses
+  a writer ruleset below 8 or above its configured ceiling (default writer gate: 8).
 
 ## Cutover rule
 
@@ -219,15 +221,16 @@ every call site then refuses as described in "Fail-closed rules".
 | `package_version` | The exact published version |
 | `wasm_sha256`, `glue_sha256`, `loader_sha256` | Lowercase hex sha256 of each file |
 | `paths` | Package-relative paths of the three files (no absolute paths, no `..`) |
-| `scrub_profile` | Must equal `relayscrubber/<ruleset>/<rulesetVersion>/<policy>/<rulesetSourceSha256>` derived from `manifest` |
-| `manifest` | The full schema-2 `manifestJson()` the instance must report: `schema`, `ruleset`, `rulesetVersion`, `rulesetSourceSha256`, `crateVersion`, `abiVersion`, `policy` (`secrets`/`pii`), `redactionToken` |
+| `scrub_profile` | Must equal the crate-owned `manifest.scrubProfile` string verbatim |
+| `manifest` | The full schema-3 `manifestJson()` the instance must report: `schema`, `ruleset`, `rulesetVersion`, `rulesetSourceSha256`, `crateVersion`, `abiVersion`, `policy` (`secrets`/`pii`), `redactionToken`, `scrubProfile` |
 
 Every placeholder value (`UNPINNED`, empty, the all-zero digest, `0` versions) is refused
 with its own reason: `bindgen_unpinned_package_version`, `bindgen_unpinned_<wasm|glue|loader>_sha256`,
 `bindgen_unpinned_scrub_profile`, `bindgen_unpinned_manifest_<field>`. A manifest
 `rulesetVersion` below the TypeScript ruleset (8) is `bindgen_ruleset_below_floor`. Only
-`manifest.schema == 2` is fixed in code; the expected `abiVersion` and `rulesetVersion`
-come from the pin.
+`manifest.schema == 3` and `manifest.abiVersion == 2` are fixed in code. The
+expected fields, including `scrubProfile`, must all match the pin verbatim. The
+writer version must also fit the supported floor and independent reader ceiling.
 
 ### Load sequence (Node / Bun, `initScrubEngine`)
 
@@ -256,12 +259,14 @@ module stays private to the engine closure.
 
 - `scrubJson` sends `JSON.stringify(value)` and returns `JSON.parse(jsonText)` from the
   glue's envelope. It never uses the envelope's `value` view. `undefined` is returned
-  without an engine call, because it has no JSON text.
-- A thrown glue error discards the input. A deliberate error (an `Error` or a code string)
-  refuses that call (`engine_refused`). A trap (`WebAssembly.RuntimeError`, `RangeError`)
-  poisons the instance (`engine_failed`). Malformed glue results are `engine_refused`.
-- `scrubRecords` keeps the TypeScript `chunk_not_utf8` refusal when the engine refuses
-  non-UTF-8 input. Lone surrogates are refused before the engine call
+  without an engine call, because it has no JSON text; an already poisoned instance
+  still refuses it.
+- A thrown glue error discards the input. Only a recognized tagged call refusal
+  preserves the instance. Every unknown throw, trap, runtime/OOM error or malformed
+  result poisons it; see the candidate contract below. JS error classes alone never
+  establish that a refusal was deliberate.
+- `scrubRecords` refuses invalid UTF-8 before any glue call (`chunk_not_utf8`).
+  Lone surrogates are refused before the engine call
   (`scrub_input_not_well_formed`).
 - The marker is `{ruleset, version, profile}` from the verified manifest (see "Persisted
   marker rule"). `sealRawChunk` is still refused (`seal_path_not_routed`).
@@ -280,13 +285,60 @@ entrypoint calls it yet. With `SCRUB_ENGINE=wasm-bindgen` the hosted Worker's
 
 Merging this PR is a default-off, unpinned scaffold only. It is NOT a security PASS, artifact pin, cutover, image, marker or adoption clearance. The successor that binds a real package must satisfy all of these first:
 
-1. **Reader-first.** A v10 writer may not start until every relevant reader accepts ruleset <= 10. Add a separate explicit `READER_MAX_RULESET=10`; pin parsing must refuse a manifest rulesetVersion above it and below the supported floor. Roll the reader ceiling out first with wasm-bindgen still off, then the v10 writer/pin. Do not overload the TS `SCRUB_RULESET_VERSION` as the reader ceiling.
-2. **Profile is crate-owned.** The schema-2 manifest must report a canonical profile field/string; the pipeline pins and compares it verbatim. The format derived in this PR (`relayscrubber/<ruleset>/<ver>/<policy>/<sourceSha>`) is a placeholder and must be replaced by the crate's value before any pin.
-3. **Stable tagged glue errors.** relayscrubber must expose stable error tags. Recognised domain/admission errors refuse one call; `WebAssembly.RuntimeError`, `RangeError`/OOM, or ANY unrecognised throw poisons the instance. The current Error-vs-trap heuristic is removed before pin.
-4. **Loader policy in the adapter.** Hashing `index.js` without executing it is package provenance only, never runtime security. The adapter may import the verified generated glue directly but must implement the reviewed loader policy itself, including the 16 MiB UTF-8 preflight before the bindgen copy. The registry package/archive checksum goes into the build receipt; component digests remain the runtime pins.
+1. **Reader-first.** A v10 writer may not start until every relevant reader accepts ruleset <= 10. Add a separate explicit `READER_MAX_RULESET=10`; pin parsing must refuse a manifest rulesetVersion above it and below the supported floor. Roll the reader ceiling out first with wasm-bindgen still off, then the v10 writer/pin. Do not overload the TS `SCRUB_RULESET_VERSION` as the reader ceiling. (Reader policy source implemented in #489; fleet rollout and relayscrubber-lead acceptance remain pending.)
+2. **Profile is crate-owned.** The schema-2 manifest must report a canonical profile field/string; the pipeline pins and compares it verbatim. The format derived in this PR (`relayscrubber/<ruleset>/<ver>/<policy>/<sourceSha>`) is a placeholder and must be replaced by the crate's value before any pin. (Candidate schema-3 crate-owned profile comparison implemented in #489; exact-package acceptance remains pending.)
+3. **Stable tagged glue errors.** relayscrubber must expose stable error tags. Recognised domain/admission errors refuse one call; `WebAssembly.RuntimeError`, `RangeError`/OOM, or ANY unrecognised throw poisons the instance. The current Error-vs-trap heuristic is removed before pin. (Explicit refusal-tag recognition and sticky unknown-error poisoning implemented in #489; package/transport acceptance remains pending.)
+4. **Loader policy in the adapter.** Hashing `index.js` without executing it is package provenance only, never runtime security. The adapter may import the verified generated glue directly but must implement the reviewed loader policy itself, including the 16 MiB UTF-8 preflight before the bindgen copy. The registry package/archive checksum goes into the build receipt; component digests remain the runtime pins. (Adapter-side preflight implemented in #489, pending relayscrubber-lead acceptance; qualified package/provenance requirements remain open.)
 5. **Workers.** CI/build must hash the exact wasm and glue source files against the pin before bundling, prove through the bundler metafile/module manifest that the CompiledWasm input is that exact path, and retain a durable bundle receipt mapping wasmSha/glueSha/sourceSha to the deployment bundle digest. Startup still verifies the instance manifest/profile. Mutated-wasm and swapped-module build tests must fail.
 
-Additional cutover requirements: adapter-side `MAX_TEXT_BYTES` = 16 MiB UTF-8 for text and JSON before any WASM call; records 16 MiB each and 64 MiB aggregate; JS preflight plus Rust recheck; limit-1 / limit / limit+1 multibyte tests; copy or reject shared mutable record buffers before invocation; route and re-pin every `sealRawChunk` call site; no TS or raw fallback.
+Additional cutover requirements: adapter-side `MAX_TEXT_BYTES` = 16 MiB UTF-8 for text and JSON before any WASM call; records 16 MiB each and 64 MiB aggregate; JS preflight plus Rust recheck; limit-1 / limit / limit+1 multibyte tests; copy or reject shared mutable record buffers before invocation; route and re-pin every `sealRawChunk` call site; no TS or raw fallback. (Adapter-side admission implemented in #489, pending relayscrubber-lead acceptance; Rust recheck/package boundary proofs and seal-path routing remain open.)
+
+Adapter tests with inert glue doubles do not qualify a Rust/WASM package.
+
+### Adapter input admission
+
+`bindgen-admission.ts` runs before every text, long-text, serialized-JSON or record call into the glue, on both the Node loader and compiled-module paths:
+
+- Text and serialized JSON are limited to 16 MiB of UTF-8. Text is counted without first allocating an encoded copy. Lone UTF-16 surrogates are refused rather than replaced.
+- NDJSON is limited to 16 MiB per physical LF-delimited record and 64 MiB per stream. LF is excluded from the record size but included in the stream size; CR and whitespace count toward the record size. This is the intended Rust physical-byte contract before blank-line handling; adapter tests alone do not prove package conformance.
+- Shared record buffers are refused, including foreign-realm SharedArrayBuffers. Ordinary record buffers are copied into a private Uint8Array, so Buffer views cannot retain a mutable alias. UTF-8 is validated in bounded chunks; the original bytes are passed to Rust without decoding/re-encoding or JSON parsing.
+
+Invalid-input errors are content-free, nonretryable `ScrubberError`s (a `PipelineError` subclass) with `disposition: "call_refusal"`: `scrub_input_too_large`, `scrub_input_not_well_formed`, `scrub_input_shared_buffer`, or the existing `chunk_not_utf8`. A local copy/decoder allocation failure instead returns retryable `scrub_admission_unavailable`, so resource pressure does not classify valid data as permanently malformed. These errors return no partial output and do not call or poison the engine. The checked-in pin remains UNPINNED; this admission layer changes neither recognition rules nor any reader ceiling or scrub marker.
+
+The adapter requires the ABI-2 `scrubTextChecked` export for both text and long
+text after JS admission. That Rust entrypoint rechecks the byte limit before
+allocating scanner state. Missing it refuses startup even if the unchecked
+`scrubText`/`scrubLong` compatibility exports exist; there is no fallback to them.
+
+### Candidate crate contract (not artifact clearance)
+
+The candidate manifest reports schema `3`, ABI `2`, and a crate-owned
+`scrubProfile` such as `relayhistory-secrets-v10`. The adapter compares all nine
+required fields verbatim with the pin and takes its marker profile from the
+verified instance. It does not derive a substitute profile from the source hash.
+The historical ruling above is preserved; this candidate schema supersedes its
+schema-2 placeholder shape, pending security-owner acceptance.
+
+A recognized Rust/WASM refusal is a primitive JSON string with exactly `code` and
+`disposition: "call_refusal"`, plus an optional positive, one-based safe-integer
+`record`. Supported codes are `text_too_large`, `record_too_large`,
+`stream_too_large`, `json_too_deep`, `invalid_json`, `invalid_utf8`, and
+`serialization_error`. It becomes a content-free, nonretryable `ScrubberError`
+with those stable fields. It returns no output, and the next independent call may
+proceed. Extra fields, unknown codes/dispositions, invalid record numbers, wrapped
+Error messages and unrecognized thrown shapes are not trusted refusal tags.
+
+An unknown exception or malformed result produces `ScrubberError` with
+`code: "scrubber_engine_failure"` and `disposition: "instance_poison"`. Every
+later scrub call, including JSON `undefined`, and repeat initialization returns
+`scrubber_instance_poisoned` without entering the glue again. Foreign exception
+text never reaches the error message. Local preflight refusals remain separate
+from glue failures and do not poison an untouched instance; local admission
+allocation failures retain their retryable classification.
+
+These guards use inert glue tests on both loader paths. No source/WASM/package
+pin is qualified, no runtime is enabled, and the sealed-write routing and Worker
+bundle qualification requirements remain open.
 
 ## Import cycle (why `predicate-hook.ts`)
 
@@ -384,3 +436,31 @@ Under wasm, `sealRawChunk` is refused on every self-host path that seals raw chu
 `SCRUB_ENGINE=wasm` is not deployable for `session-ingest`, `session-read-api`, the consumers or
 `session-publication` until the raw-chunks re-pin follow-up lands. This is deliberate: refusing
 is the fail-closed outcome.
+
+
+### Explicit reader ruleset capability
+
+`READER_MAX_RULESET` selects a read capability independently of the TypeScript writer stamp. Unset preserves main's existing reads: existing marker-presence/quarantine checks remain, with no new family, ceiling, or per-chunk metadata checks. Explicitly setting exactly `"8"`, `"9"` or `"10"` enables the stricter policy. Empty, padded, signed, fractional and higher values refuse configuration. Raising the ceiling does not enable a Rust engine, qualify any package or change TypeScript scrub markers.
+
+Canonical record/transcript readers, export readers, the indexing consumer, brief input and manifest/chunk admission use this policy only when explicitly configured. Unknown families and versions outside 1 through the configured maximum refuse before record parsing. A manifest records the **lowest** chunk ruleset, so per-chunk metadata is also checked. Readers bind that metadata to the same GET response as the body and cancel refused bodies before consuming them. Historical metadata-free chunks at versions through 8 keep their existing read contract; newer manifest versions require per-chunk scrub metadata. A declared chunk version cannot fall below the manifest minimum.
+
+Node services validate the setting at startup and thread it into canonical reads. Alleyoop also forwards it through its real app bindings. Canonical and timing Worker routes validate their own bindings rather than consulting a Node process environment. Offline seed readers receive an explicit optional policy in their dependencies. An unset policy does not add a marker check to any of these paths. The wasm-bindgen pin parser retains a separate default writer ceiling of 8 and refuses a writer above its explicitly configured ceiling before reading artifacts or initializing glue. Compiled-module callers must pass their verified reader ceiling explicitly when it exceeds the default. The raw ABI path remains unpinned and outside this first cutover.
+
+Operationally, deploy and verify every relevant reader with ceiling 10 **while the Rust engine remains off**, then qualify and enable the matching writer. Before enabling a v10 writer/pin, explicitly set the ceiling on every Node process that initializes the scrub engine, including one-shot consumer/output-facts bootstrap, migration and eraser Jobs; a missing Job setting must continue to refuse the v10 pin. Configuration in one process does not prove that a remote fleet has been upgraded. Keep the reader ceiling at 10 on rollback while version-10 objects remain stored; reverting a writer does not downgrade existing objects. Existing artifact-page formats do not change. This source change does not satisfy the remaining package safety, provenance, error-tagging, Worker build-binding or persistence-routing gates.
+
+
+### Configuration failure runbook
+
+Leave `READER_MAX_RULESET` absent to preserve legacy reads. An explicit value
+opts into strict marker and chunk checks, including canonical decimal metadata;
+older metadata such as `"08"` or `"8.0"` is accepted by the legacy courier path
+but refused by the explicit policy. The courier always requires family
+`relayhistory-scrub` and a positive manifest version, including zero-chunk
+manifests, as main does. Explicit policy additionally checks the ceiling and
+canonical chunk metadata. Verify existing retained objects before opting in.
+
+Empty, malformed, padded, unsupported or number-typed Worker bindings are
+configuration errors. In ingest, engine initialization fails closed and
+`scrubEngineReady` stays false: sealing does not continue through TS or another
+engine. Correct or remove the malformed binding and restart through the normal
+operator process. Raising a reader ceiling never qualifies a package or a writer.
