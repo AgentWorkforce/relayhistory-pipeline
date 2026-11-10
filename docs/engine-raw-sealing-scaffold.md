@@ -1,0 +1,58 @@
+# Injected-engine raw sealing scaffold
+
+This is a default-off source scaffold. It does not install an artifact, select a
+Rust engine in production, or qualify an image. `SCRUB_ENGINE=wasm-bindgen` still
+refuses production raw sealing with `seal_path_not_routed`. Both artifact pins
+and every existing technical-foul manifest/digest/version table stay unchanged.
+A separate qualified cutover must add its own provenance entry for the new sealer
+and the exact artifact; it must not relabel the historical TypeScript manifest.
+
+`bindEngineRawSealer` captures a concrete healthy wasm-bindgen engine and an
+explicit `same-family-up-to-writer` retained-object policy. Callers install the
+returned dependency directly; no environment variable enables it. The engine's
+marker is copied and immutable. Source bytes and location are privately captured
+before the first await. The source digest and scrub invocation use the same
+snapshot. Each seal invokes that engine even for unchanged output and existing
+objects. Failed health checks, mismatched results, or unknown traps poison the
+binding. Typed call refusals remain typed; retryable allocation refusal remains
+retryable. Output may expand past the input per-record limit; the scaffold
+stages at most 64 MiB of output, refusing a larger output retryably without
+poisoning a healthy engine. This capacity bound needs cutover review. Nothing falls back to TypeScript or unscrubbed input.
+
+The new module compresses only successful scrub output with the existing exported
+raw-Zstd-frame transport encoder. These are valid Zstd frames containing scrubbed
+bytes, not a plaintext fallback. New objects are create-only and carry the bound
+family, version and `scrub-profile`. Profile metadata is informational until a
+separate manifest schema/pin review; default readers do not require it and there
+is no new manifest-wide profile for mixed histories.
+
+When create-only loses, one GET supplies the winning object's body and metadata.
+Its body is bounded, hashed and sized independently. It is never compared with
+the new engine's output or overwritten. Retained metadata must contain a valid
+raw digest/positive size and safe integer version, family `relayhistory-scrub`,
+and a version from 1 through the bound writer's version. Older version 8 objects
+without a profile remain version 8 with profile absent. Missing/malformed
+metadata, another family and a newer version refuse with distinct content-free
+errors. `READER_MAX_RULESET` never grants writer or retention permission.
+
+The four real ports accept an explicit bound-sealer dependency:
+
+- Pipeline HTTP chunk route: retryable scrub failure returns 503, not a data 400.
+- Inline writer: scrub failure propagates with its retryable classification;
+  no raw chunk or manifest is published. Its pre-existing session locator is
+  metadata-only and may already have been created before sealing.
+- Publication image: captures exact sealed bytes and options; durable
+  publication uses those bytes/options after its prepare/register protocol.
+- Migration export: its default TS stamps and prior-chunk reuse stay unchanged.
+  Explicit injection initializes the writer version from the bound marker,
+  bypasses the prior-manifest shortcut so retention goes through the sealer,
+  and checks returned versions against that bound writer. This audits the
+  prior `export-session.ts` lines 191–225 without increasing a reader ceiling.
+
+Validation exercises these actual ports, unchanged and changed output, poisoned
+instances, input mutation across awaits, selection conflicts, refusal without
+persistence, retained provenance, competing creates, acknowledgement loss, input
+limits, and byte-exact historical/default wrapper comparisons. It is source
+validation with distinguishable test engines. Workers compiled-WASM provenance,
+real artifact recall/precision/performance, image qualification, retained database
+rehearsal, and live end-to-end acceptance remain separate mandatory cutover work.

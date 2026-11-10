@@ -65,7 +65,8 @@ import {
   type ManifestV1,
   type RawFormat,
 } from "../lib/pipeline/object-layout.js";
-import { sealRawChunk } from "../lib/scrub-engine/index.js";
+import { sealRawChunk, ScrubberError, ScrubEngineUnavailable } from "../lib/scrub-engine/index.js";
+import type { BoundRawChunkSealer } from "../lib/pipeline/engine-raw-chunks.js";
 
 /** Stages a client may report about itself. Server stages cannot be forged. */
 const CLIENT_STAGES: readonly PipelineStage[] = [
@@ -88,6 +89,8 @@ const KEY_ATTRS = new Set(["destination", "chunk", "seq", "offset"]);
 const PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 export interface PipelineRouteDeps {
+  /** Scaffold dependency only; production never selects this through env. */
+  rawChunkSealer?: BoundRawChunkSealer;
   /** Authoritative manifest reads for the manifest POST; absent: validate the posted copy. */
   manifests?(env: Bindings): ManifestReader | undefined;
   /** Where scrubbed raw chunks are written; absent: the chunk route answers 503. */
@@ -780,7 +783,7 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
     }
     const traceId = c.req.header("X-Relay-Trace-Id");
     try {
-      const sealed = await sealRawChunk(raw.store, {
+      const sealed = await (deps.rawChunkSealer ?? sealRawChunk)(raw.store, {
         location,
         format,
         seq,
@@ -801,6 +804,8 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
         sealed.created ? 201 : 200,
       );
     } catch (cause) {
+      if ((cause instanceof ScrubberError && cause.retryable) || cause instanceof ScrubEngineUnavailable)
+        return error(c, 503, "scrub_unavailable", "Raw chunk sealing is temporarily unavailable");
       if (cause instanceof PipelineError && cause.code === "zstd_unavailable")
         return error(c, 503, "not_supported", cause.message);
       if (cause instanceof PipelineError)
