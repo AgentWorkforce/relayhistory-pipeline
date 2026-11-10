@@ -28,7 +28,6 @@ import {
   migrationChecksumAlias,
   migrationChecksumMatches,
   RUNTIME_APPLICATION_FUNCTIONS,
-  RUNTIME_APPLICATION_RLS_TABLES,
   sessionsFunctionAcl,
   sessionsFunctionAclPreview,
   pendingExecuteGrants,
@@ -583,7 +582,7 @@ describe("runtime role: required, existing, SELECT only", () => {
               AND (SELECT oid FROM pg_roles WHERE rolname = 'g6_rt') = ANY(p.polroles)`,
         )
       ).rows[0]?.n,
-    ).toBe(RUNTIME_APPLICATION_RLS_TABLES.length);
+    ).toBe(35); // 30 + lane F1's five analysis tables (20261105046000: jobs, requests, tickets, invocations, reservations)
     const role = (
       await db.query<Record<string, unknown>>(
         `SELECT rolsuper, rolbypassrls, rolcreaterole, rolcreatedb,
@@ -2387,7 +2386,6 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const CS = "upstream:20261105044080_ingest_claim_sessions.sql";
     const CR = "upstream:20261105044090_claim_sessions_reader.sql";
     const DG = "upstream:20261105045000_digest_narrative_cache.sql";
-    const CO = "upstream:20261105047000_coordination_report_jobs.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
@@ -2437,14 +2435,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // Coordination reports are the newest step and must roll back before the session-directory query lane.
-    expect(await names()).toContain(CO);
-    expect((await failure(rollback("20261105046010_session_directory_read_api_query.down.sql")))?.code).toBe("55000");
-    await rollback("20261105047000_coordination_report_jobs.down.sql");
-    expect(await names()).not.toContain(CO);
-    expect(await relation("sessions.coordination_report_jobs")).toBeNull();
-    // 20261105046010 (session directory read API query) is now the newest step: 046000's and 045040's downs refuse (55000)
-    // while it is applied, so it rolls back next with assertions (its down drops its five functions and its ledger row).
+    // 20261105046010 (session directory read API query) is the newest step: 046000's and 045040's downs refuse (55000)
+    // while it is applied, so it rolls back first with assertions (its down drops its five functions and its ledger row).
     const LQ = "upstream:20261105046010_session_directory_read_api_query.sql";
     expect(await names()).toContain(LQ);
     expect((await failure(rollback("20261105046000_analysis_jobs.down.sql")))?.code).toBe("55000");
@@ -2470,7 +2462,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'output\\_facts\\_%'")).rows[0]!.n).toBe(0);
     // Other lanes newer than 20261105045000 (045010 same-second feed, 045030 consumer project-text grant) roll back next, newest first: 045000's down
     // refuses (55000) while any of them is applied. (046010 and 046000 already rolled back above, so they are excluded here.)
-    const newerThanDigest = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > DG && s.name !== CO && s.name !== OF && s.name !== LQ && s.name !== "upstream:20261105046000_analysis_jobs.sql").reverse();
+    const newerThanDigest = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > DG && s.name !== OF && s.name !== LQ && s.name !== "upstream:20261105046000_analysis_jobs.sql").reverse();
     if (newerThanDigest.length)
       expect((await failure(rollback("20261105045000_digest_narrative_cache.down.sql")))?.code).toBe("55000");
     for (const { name } of newerThanDigest)

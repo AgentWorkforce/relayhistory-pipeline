@@ -82,7 +82,7 @@ import { composeSearchService, searchSecret, type SearchComposition } from "../s
 import type { PipelineRuntimeRegistry } from "@rhc/adapters/defaults.ts";
 import { dispatchRegisteredLambda, type PipelineLambdaEvent } from "./lambda-runtime.ts";
 import { writerTransactionSql } from "./transaction-sql.ts";
-import { briefConfig, modelKey, modelResponsesUrl } from "../session-brief/config.ts";
+import { briefConfig, modelKey } from "../session-brief/config.ts";
 import { createAnalysisTransport } from "../session-brief/engine/transport.ts";
 import {checkedAnalysisCursor,reconcileAnalysisPage} from "./analysis-reconcile.ts";
 import {analysisRefreshTick,enqueueAnalysisScope,type AnalysisRefreshDeps} from "./analysis-refresh.ts";
@@ -90,17 +90,12 @@ import {readonlyAnalysisPool,readonlyAnalysisSource} from "./analysis-snapshot.t
 import { briefTick } from "../session-brief/worker.ts";
 import { analysisConfig, analysisTick } from "../session-analysis/worker.ts";
 import { zstdDecompressSync } from "node:zlib";
-import { createHash } from "node:crypto";
 import { createS3Eraser } from "../migration/neon-s3-erasure/eraser.ts";
 import{derivedSchemaAssets}from "./derived-schema.ts";
 import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
 import {runSemanticCopyTick,semanticFailureReason} from "../search-features/semantic-copy-job.ts";
 import {semanticReadonlyPool,semanticFeatureReader,semanticMetadataPool} from "../search-features/semantic-copy-source-pool.ts";
 import {assertNoNeonEdge,neonExitProfile} from "../shared/neon-exit.ts";
-import { coordinationConfig, parseCoordinationInvocation } from "../coordination-report/config.ts";
-import { createReportDatabase } from "../coordination-report/database.ts";
-import { createCoordinationTransport, COORDINATION_PROMPT_VERSION, type CoordinationResponseMetadata } from "../coordination-report/transport.ts";
-import { runCoordinationReportJob } from "../coordination-report/worker.ts";
 
 interface PipelineSecret {
   hoopdb_url: string;
@@ -366,10 +361,6 @@ export interface Runtime {
   semanticCopy?: () => Promise<SemanticCopyStats>;
   /** INGEST_BUFFERED_ERASURE_DELETE=on only: the later-erasure lane over the feeder login's pool. */
   bufferedErasure?: BufferedErasureDeps;
-  report: null | {
-    database: ReturnType<typeof createReportDatabase>;
-    run(value: unknown): Promise<unknown>;
-  };
 }
 
 type SemanticCopyStats = Awaited<ReturnType<typeof runSemanticCopyTick>>;
@@ -489,34 +480,6 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
     transport: key ? createAnalysisTransport({ apiKey: () => key }) : null,
     config: briefConfig(),
   });
-  let reportConfig: ReturnType<typeof coordinationConfig> = null;
-  try { reportConfig = coordinationConfig(); }
-  catch { log.warn("coordination report configuration refused", { stage: "init", reason: "coordination_config_invalid" }); }
-  let report: Runtime["report"] = null;
-  if (reportConfig) {
-    const database = createReportDatabase(db, reportConfig.scope);
-    report = {
-      database,
-      async run(value) {
-        const invocation = parseCoordinationInvocation(value);
-        if (!key) throw new Error("coordination_model_unavailable");
-        const jobId = await database.enqueue({ scope: reportConfig.scope, window: invocation.window,
-          maxSessions: reportConfig.maxSessions, maxEvents: reportConfig.maxEvents }, invocation.idempotencyKey);
-        const responses: CoordinationResponseMetadata[] = [];
-        return runCoordinationReportJob({
-          database,
-          source: { trustedScope: reportConfig.scope, listSessions: database.listSessions, now: () => new Date().toISOString(),
-            canonical: { pointers: database.pointers, store, provider: "s3", bucket: env.bucket, prefix: bindings,
-              decompress: (bytes, maxOutputLength) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength })) } },
-          transport: createCoordinationTransport({ apiKey: () => key, model: reportConfig.model, responsesUrl: modelResponsesUrl(), timeoutMs: 30000,
-            onResponse: metadata => { if (responses.length < reportConfig.maxCalls) responses.push(metadata); } }),
-          providerProvenance: () => ({ configuredModel: reportConfig.model, promptVersion: COORDINATION_PROMPT_VERSION, responses }),
-          analysisOptions: { concurrency: reportConfig.concurrency, maxAttempts: 1, maxCalls: reportConfig.maxCalls,
-            timeoutMs: 30000, packetLimits: { maxPackets: reportConfig.maxPackets } },
-        }, jobId);
-      },
-    };
-  }
   // Session analysis (lane F1): the same secret-only model key; no key = no claim.
   const sessionAnalysis = analysisTick({
     config: analysisConfig(),
@@ -543,7 +506,7 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
   // Semantic copier fields are carried raw and validated only in semanticCopyDeps().
   const semanticSecret = env.semanticCopyEnabled ? { hoopdbUrl: secret.hoopdb_url, clickhouse: secret.clickhouse, sourceUrl: secret.analysis_source_readonly_url } : undefined;
   // Neon-exit: the readonly source URL is dropped here, so no later branch can build its pool.
-  return { env, deps, brief, sessionAnalysis, store, analysisSourceUrl: env.neonExit ? undefined : secret.analysis_source_readonly_url, semanticSecret, ...(bufferedErasure ? { bufferedErasure } : {}), report };
+  return { env, deps, brief, sessionAnalysis, store, analysisSourceUrl: env.neonExit ? undefined : secret.analysis_source_readonly_url, semanticSecret, ...(bufferedErasure ? { bufferedErasure } : {}) };
 }
 
 /**
@@ -745,34 +708,7 @@ export function semanticTickState(stats:{failed:number;eventComplete:boolean;bri
 
 
 
-async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Promise<Runtime>): Promise<BatchResponse | { ok: boolean; [key: string]: unknown }> {
-  if (event?.coordinationReport !== undefined || event?.coordinationReportRead !== undefined) {
-    // An IAM-authorized operator invokes this path; no request-supplied tenant authority.
-    if (process.env.COORDINATION_REPORT_ENABLED !== "true") return { ok: false, reason: "coordination_disabled" };
-    try {
-      if (event.Records || event.reconcile || event.brief || (event.coordinationReport !== undefined && event.coordinationReportRead !== undefined))
-        return { ok: false, reason: "coordination_request_invalid" };
-      const rt = await ready();
-      if (!rt.report) return { ok: false, reason: "coordination_disabled" };
-      if (event.coordinationReport !== undefined) return { ok: true, outcome: await rt.report.run(event.coordinationReport) };
-      const v = event.coordinationReportRead as Record<string, unknown> | null;
-      if (!v || typeof v !== "object" || Object.keys(v).sort().join(",") !== "format,jobId,offset" ||
-          typeof v.jobId !== "string" || !/^[0-9a-f-]{36}$/.test(v.jobId) ||
-          !["markdown", "json"].includes(String(v.format)) || !Number.isInteger(v.offset) || Number(v.offset) < 0 || Number(v.offset) > 16 * 1024 * 1024)
-        return { ok: false, reason: "coordination_request_invalid" };
-      const job = await rt.report.database.read(v.jobId);
-      if (!job) return { ok: false, reason: "coordination_not_found" };
-      const result = job.result as { markdown?: string } | null;
-      const serialized = result === null ? "" : v.format === "json" ? JSON.stringify(result) : result.markdown ?? "";
-      const offset = Number(v.offset), end = offset + 65536;
-      return { ok: true, jobId: job.id, status: job.status, errorCode: job.error_code,
-        artifactSha256: result === null ? null : createHash("sha256").update(serialized).digest("hex"),
-        content: serialized.slice(offset, end), nextOffset: end < serialized.length ? end : null };
-    } catch {
-      log.error("coordination report invocation failed", { stage: "init", reason: "coordination_failed" });
-      return { ok: false, reason: "coordination_failed" };
-    }
-  }
+async function dispatchLambdaEvent(event: PipelineLambdaEvent, ready: () => Promise<Runtime>): Promise<BatchResponse | { ok: boolean }> {
   if(event?.semanticCopy===true){
     // Default off before secret lookup, connection pools or source access.
     if(process.env.SESSION_SEMANTIC_COPY_ENABLED!=="1")return {ok:true};

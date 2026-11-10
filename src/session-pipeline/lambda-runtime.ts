@@ -7,13 +7,12 @@ import type { BatchResponse } from "./consumer.ts";
 export interface PipelineLambdaEvent {
   Records?: { messageId: string; body: string; eventSource?: string; attributes?: Record<string, string> }[];
   reconcile?: unknown; brief?: unknown; sessionAnalysis?: unknown; analysisCache?: unknown; analysisCacheReconcile?: unknown; semanticCopy?: unknown; bufferedSearchFeed?: unknown; bufferedErasureDelete?: unknown;
-  coordinationReport?: unknown; coordinationReportRead?: unknown;
   schedule?: string; analysisCursor?: unknown; cursor?: string; since?: string; link?: number;
 }
 export interface LambdaRuntimeBinding {
   handler(event: unknown): Promise<BatchResponse | void>;
 }
-export type PipelineInvoker = (event: PipelineLambdaEvent) => Promise<BatchResponse | { ok: boolean; [key: string]: unknown }>;
+export type PipelineInvoker = (event: PipelineLambdaEvent) => Promise<BatchResponse | { ok: boolean }>;
 const SCHEDULES = { reconcile: "reconcile", brief: "brief", "session-analysis": "sessionAnalysis", "analysis-cache": "analysisCache", "analysis-cache-reconcile": "analysisCacheReconcile", "semantic-copy": "semanticCopy", "buffered-search-feed": "bufferedSearchFeed", "buffered-erasure-delete": "bufferedErasureDelete" } as const;
 type Schedule = keyof typeof SCHEDULES;
 
@@ -24,7 +23,7 @@ function queueBody(item: Extract<WorkItem, { type: "manifest-landed" }>): string
   } }] });
 }
 
-export async function dispatchRegisteredLambda(adapter: PipelineRuntimeAdapter, event: PipelineLambdaEvent, invoke: PipelineInvoker): Promise<BatchResponse | { ok: boolean; [key: string]: unknown }> {
+export async function dispatchRegisteredLambda(adapter: PipelineRuntimeAdapter, event: PipelineLambdaEvent, invoke: PipelineInvoker): Promise<BatchResponse | { ok: boolean }> {
   const caps = adapter.capabilities();
   if (adapter.kind !== "lambda" || caps.kind !== "lambda" || caps.trigger !== "push" || !caps.partialBatchFailure || caps.scopeSerialization !== "advisory-lock") throw new Error("Lambda runtime composition incompatible");
   if (event.schedule !== undefined && (typeof event.schedule !== "string" || !Object.hasOwn(SCHEDULES, event.schedule))) throw new Error("Lambda invocation schedule invalid");
@@ -40,10 +39,8 @@ export async function dispatchRegisteredLambda(adapter: PipelineRuntimeAdapter, 
       const manifests = items.filter((item): item is Extract<WorkItem, { type: "manifest-landed" }> => item.type === "manifest-landed");
       if (manifests.length) {
         const answer = await invoke({ Records: manifests.map(item => ({ messageId: item.id, body: queueBody(item) })) });
-        const failures = "batchItemFailures" in answer ? answer.batchItemFailures : undefined;
-        if (!Array.isArray(failures) || failures.some((f: unknown) => !f || typeof f !== "object" || typeof (f as { itemIdentifier?: unknown }).itemIdentifier !== "string"))
-          throw new Error("pipeline batch response invalid");
-        const failed = new Set(failures.map(f => (f as { itemIdentifier: string }).itemIdentifier));
+        if (!("batchItemFailures" in answer)) throw new Error("pipeline batch response invalid");
+        const failed = new Set(answer.batchItemFailures.map(f => f.itemIdentifier));
         for (const item of manifests) results.set(item.id, failed.has(item.id) ? { status: "retry", delaySeconds: 0, code: "service_retry" } : { status: "done" });
       }
       for (const item of items) if (item.type === "schedule") {

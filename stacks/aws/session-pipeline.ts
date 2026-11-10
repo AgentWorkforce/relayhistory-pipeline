@@ -109,20 +109,6 @@ export interface SessionPipelineInputs {
   reconcileMinutes?: number;
   /** Session briefs (src/session-brief). Absent or `enabled: false`: off. */
   briefs?: SessionBriefInputs;
-  /** Operator-invoked workspace retrospective. No schedule is created. */
-  coordinationReports?: CoordinationReportInputs;
-}
-
-export interface CoordinationReportInputs {
-  enabled: boolean;
-  organizationId: string;
-  workspaceId: string;
-  model?: string;
-  maxSessions?: number;
-  maxEvents?: number;
-  maxPackets?: number;
-  maxCalls?: number;
-  concurrency?: number;
 }
 
 /**
@@ -225,7 +211,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "coordinationReports") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
@@ -304,21 +290,6 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     // src/session-brief/config.ts bounds SESSION_BRIEF_SWEEP_SECONDS to 0-86400 (0 = off).
     if (b.sweepSeconds !== undefined && !(Number.isInteger(b.sweepSeconds) && (b.sweepSeconds as number) >= 0 && (b.sweepSeconds as number) <= 86_400))
       refuse("transcriptStore.sessionPipeline.briefs.sweepSeconds must be an integer from 0 to 86400");
-  }
-  if (v.coordinationReports !== undefined) {
-    const c = v.coordinationReports as Record<string, unknown> | null;
-    if (!c || typeof c !== "object" || Array.isArray(c) || Object.getPrototypeOf(c) !== Object.prototype)
-      refuse("transcriptStore.sessionPipeline.coordinationReports must be a plain object");
-    const limits: Record<string, number> = { maxSessions: 1000, maxEvents: 10000, maxPackets: 24, maxCalls: 24, concurrency: 4 };
-    for (const k of Object.keys(c))
-      if (!["enabled", "organizationId", "workspaceId", "model", ...Object.keys(limits)].includes(k))
-        refuse(`transcriptStore.sessionPipeline.coordinationReports.${k} is not a known setting`);
-    if (typeof c.enabled !== "boolean") refuse("coordinationReports.enabled must be a boolean");
-    for (const k of ["organizationId", "workspaceId"])
-      if (typeof c[k] !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(c[k] as string)) refuse(`coordinationReports.${k} is invalid`);
-    if (c.model !== undefined && (typeof c.model !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(c.model))) refuse("coordinationReports.model is invalid");
-    for (const [k, max] of Object.entries(limits))
-      if (c[k] !== undefined && !(Number.isInteger(c[k]) && (c[k] as number) >= 1 && (c[k] as number) <= max)) refuse(`coordinationReports.${k} is outside its limit`);
   }
 }
 
@@ -516,15 +487,6 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     HOOPDB_POOL_MAX: "4",
     NODE_OPTIONS: "--enable-source-maps",
     SESSION_BRIEF_ENABLED: i.p.briefs?.enabled ? "true" : "false",
-    COORDINATION_REPORT_ENABLED: i.p.coordinationReports?.enabled ? "true" : "false",
-    ...(i.p.coordinationReports ? {
-      COORDINATION_REPORT_ORG_ID: i.p.coordinationReports.organizationId,
-      COORDINATION_REPORT_WORKSPACE_ID: i.p.coordinationReports.workspaceId,
-      ...(i.p.coordinationReports.model ? { COORDINATION_REPORT_MODEL: i.p.coordinationReports.model } : {}),
-      ...Object.fromEntries(Object.entries({ maxSessions: "MAX_SESSIONS", maxEvents: "MAX_EVENTS", maxPackets: "MAX_PACKETS", maxCalls: "MAX_CALLS", concurrency: "CONCURRENCY" })
-        .filter(([key]) => i.p.coordinationReports![key as keyof CoordinationReportInputs] !== undefined)
-        .map(([key, suffix]) => [`COORDINATION_REPORT_${suffix}`, String(i.p.coordinationReports![key as keyof CoordinationReportInputs])])),
-    } : {}),
     ...(i.p.briefs?.backgroundDailyBudget !== undefined ? { SESSION_BRIEF_BACKGROUND_DAILY_BUDGET: String(i.p.briefs.backgroundDailyBudget) } : {}),
     ...(i.p.briefs?.globalDailyCap !== undefined ? { SESSION_BRIEF_GLOBAL_DAILY_CAP: String(i.p.briefs.globalDailyCap) } : {}),
     ...(i.p.briefs?.sweepSeconds !== undefined ? { SESSION_BRIEF_SWEEP_SECONDS: String(i.p.briefs.sweepSeconds) } : {}),

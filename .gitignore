@@ -9,4 +9,3 @@ dist/
 node_modules
 vendor/relayhistory/target/
 supabase/.temp/
-.coordination-eval/
