@@ -178,6 +178,9 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.coordination_report_source_changed()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.digest_narrative_read(text,date,text,text)": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
@@ -225,7 +228,6 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
-    "sessions.coordination_report_source_changed()": ["<owner>:EXECUTE"],
     "sessions.ingest_acquire_slot(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"

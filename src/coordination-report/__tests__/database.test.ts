@@ -32,7 +32,7 @@ async function setup() {
   await p.exec(
     readFileSync(
       new URL(
-        "../../../supabase/migrations/20261104030000_coordination_report_jobs.sql",
+        "../../../supabase/migrations/20261105047000_coordination_report_jobs.sql",
         import.meta.url,
       ),
       "utf8",
@@ -226,8 +226,8 @@ test("ingestion uses shared fences without counter writes; publication uses matc
 
 test("report migration down removes every artifact and up reapplies", async () => {
   const { p } = await setup();
-  const down = readFileSync(new URL("../../../supabase/rollbacks/20261104030000_coordination_report_jobs.down.sql",import.meta.url),"utf8");
-  const up = readFileSync(new URL("../../../supabase/migrations/20261104030000_coordination_report_jobs.sql",import.meta.url),"utf8");
+  const down = readFileSync(new URL("../../../supabase/rollbacks/20261105047000_coordination_report_jobs.down.sql",import.meta.url),"utf8");
+  const up = readFileSync(new URL("../../../supabase/migrations/20261105047000_coordination_report_jobs.sql",import.meta.url),"utf8");
   await p.exec(down);
   expect((await p.query(`SELECT relname FROM pg_class WHERE relnamespace='sessions'::regnamespace AND relname LIKE 'coordination_report_%'`)).rows).toEqual([]);
   expect((await p.query(`SELECT proname FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname='coordination_report_source_changed'`)).rows).toEqual([]);
