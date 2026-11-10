@@ -123,6 +123,27 @@ describe("bindgen text admission before the glue", () => {
     }
   }
 
+  for (const unit of ["€", "😀"]) {
+    it(`text refuses a ${encoder.encode(unit).byteLength}-byte scalar straddling the byte limit`, () => {
+      const { engine, calls } = setup();
+      // The scalar starts at byte limit-1, so the limit falls inside it.
+      const text = "x".repeat(MAX_TEXT_BYTES - 1) + unit;
+      expect(encoder.encode(text).byteLength).toBe(MAX_TEXT_BYTES - 1 + encoder.encode(unit).byteLength);
+      expectAdmissionRefusal(() => engine.scrubText(text), calls);
+      expectAdmissionRefusal(() => engine.scrubLong(text), calls);
+      expect(engine.failed).toBe(false);
+    });
+
+    it(`JSON refuses a ${encoder.encode(unit).byteLength}-byte scalar straddling the serialized byte limit`, () => {
+      const { engine, calls } = setup();
+      // JSON's opening quote plus ASCII occupy limit-1 bytes before the scalar.
+      const value = "x".repeat(MAX_TEXT_BYTES - 2) + unit;
+      expect(encoder.encode(JSON.stringify(value)).byteLength).toBe(MAX_TEXT_BYTES + encoder.encode(unit).byteLength);
+      expectAdmissionRefusal(() => engine.scrubJson(value), calls);
+      expect(engine.failed).toBe(false);
+    });
+  }
+
   it("counts JSON escapes, not the source string's UTF-16 length", () => {
     const { engine, calls } = setup();
     expectAdmissionRefusal(() => engine.scrubJson({ note: "\0".repeat(Math.floor(MAX_TEXT_BYTES / 6)) }), calls);
@@ -150,6 +171,18 @@ describe("bindgen record admission before the glue", () => {
       const input = encoder.encode(jsonLineOfBytes(MAX_RECORD_BYTES + delta, "😀") + "\n");
       if (delta > 0) expectAdmissionRefusal(() => engine.scrubRecords(input), calls);
       else { engine.scrubRecords(input); expect(calls).toEqual(["records"]); }
+    });
+  }
+
+  for (const unit of ["€", "😀"]) {
+    it(`refuses a ${encoder.encode(unit).byteLength}-byte scalar straddling the physical record limit`, () => {
+      const { engine, calls } = setup();
+      const prefix = '{"x":"';
+      const line = prefix + "x".repeat(MAX_RECORD_BYTES - 1 - prefix.length) + unit + '"}';
+      const input = encoder.encode(line + "\n");
+      expect(input[MAX_RECORD_BYTES - 1]).toBe(encoder.encode(unit)[0]);
+      expectAdmissionRefusal(() => engine.scrubRecords(input), calls);
+      expect(engine.failed).toBe(false);
     });
   }
 
