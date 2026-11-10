@@ -3,11 +3,15 @@
  * relayhistory-cloud's brief job (runSessionAnalysisTick, kind 'brief') onto 96Bulls.
  *
  * Fed by session-indexed: the HoopDb indexer arms a debounced wakeup per logical session
- * (store.ts armWakeup). Each tick claims due wakeups and, per session:
+ * (store.ts armWakeup). In canonical mode (SESSION_BRIEF_CANONICAL_INPUT=true) there is no
+ * indexer fanout; the sweep and the parked-wakeup recoveries in briefTick arm instead.
+ * Each tick claims due wakeups and, per session:
  *   1. reads the live pointers; none left: done (deletion already removed the brief);
  *   2. applies relayhistory's limits: one attempt per session per 2 minutes (throttle,
  *      not counted), 30 per session per UTC day, and the org's daily pool of distinct
- *      sessions (rate_limited until the next UTC midnight; the previous brief stays);
+ *      sessions (rate_limited until the next UTC midnight; the previous brief stays;
+ *      in canonical mode a parked wakeup is re-armed earlier by new pointer revisions or
+ *      once admission is open again, see briefTick);
  *   3. builds the summary input from the scrubbed raw (input.ts); quarantined, empty and
  *      ineligible sessions are recorded without a model call;
  *   4. reuses the stored brief when the input fingerprint is unchanged (no model call);
@@ -35,6 +39,8 @@ import {
   livePointers,
   pruneAttempts,
   pruneStaleWakeups,
+  rearmAdmissibleParked,
+  rearmChangedParked,
   recordBrief,
   rescheduleWakeup,
   scrubBrief,
@@ -155,7 +161,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
       globalDailyCap: config.globalDailyCap,
     });
     if (!admission.admitted) {
-      await publish(built.sourceRevisions, {
+      const { written } = await publish(built.sourceRevisions, {
         status: "rate_limited",
         error:
           admission.reason === "capped"
@@ -164,7 +170,11 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
               ? "session_brief_global_capped"
               : "session_brief_rate_limited",
       });
-      await rescheduleWakeup(db, w, { nextUtcDay: true }, { refundAttempt: true });
+      // Canonical mode: a refusal dropped as stale (the pointers moved while the input was
+      // built) is not recorded, so no parked-wakeup recovery would match it; retry after the
+      // idle window instead of parking it until midnight. A recorded refusal parks as before.
+      await rescheduleWakeup(db, w, !written && deps.canonicalInput ? { seconds: config.idleSeconds } : { nextUtcDay: true },
+        { refundAttempt: true });
       return "rate_limited";
     }
     const transport = deps.transport;
@@ -234,10 +244,18 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
  * A `tick` for runWorker. Off unless SESSION_BRIEF_ENABLED=true; with no model configured
  * it prunes and sweeps but claims nothing, so wakeups wait (and expire after
  * SESSION_WAKE_MAX_AGE_HOURS) instead of spending their attempts.
+ *
+ * Housekeeping, at most once a minute: prune stale wakeups and old admission rows; in
+ * canonical mode (SESSION_BRIEF_CANONICAL_INPUT=true) then re-arm rate_limited-parked
+ * wakeups with new pointer revisions, then make due those that admit() would now admit.
+ * The sweep follows on its own interval; in canonical mode it also counts a rate_limited
+ * brief as unbriefed, so a parked wakeup pruned after SESSION_WAKE_MAX_AGE_HOURS is armed
+ * again. Outside canonical mode none of these recoveries runs.
  */
 export function briefTick(deps: Omit<BriefDeps, "db">) {
   let lastSweep = 0;
   let lastPrune = 0;
+  const canonical = deps.canonicalInput !== undefined;
   return async (db: HoopDb, now: Date): Promise<Record<BriefResult, number> | null> => {
     if (!deps.config.enabled) return null;
     const full: BriefDeps = { ...deps, db };
@@ -246,12 +264,24 @@ export function briefTick(deps: Omit<BriefDeps, "db">) {
       const pruned = await pruneStaleWakeups(db, deps.config.wakeMaxAgeHours, 5000, deps.config.workspaceIds);
       await pruneAttempts(db, deps.config.workspaceIds);
       if (pruned) log.info("stale session brief wakeups dropped", { stage: "session-brief", count: pruned });
+      // Canonical mode only (no indexer arms wakeups there): recover wakeups parked until
+      // the next UTC midnight by a rate_limited refusal (issue #494). Counts only are logged.
+      if (canonical) {
+        const { config } = deps;
+        const changed = await rearmChangedParked(db, 100, { idleSeconds: config.idleSeconds,
+          maxWaitSeconds: config.maxWaitSeconds, workspaceIds: config.workspaceIds });
+        if (changed) log.info("session brief parked wakeups re-armed", { stage: "session-brief", count: changed, reason: "new_input" });
+        const admissible = await rearmAdmissibleParked(db, config.batch, { sessionDailyCap: config.sessionDailyCap,
+          budget: config.backgroundDailyBudget, globalDailyCap: config.globalDailyCap,
+          throttleSeconds: config.throttleSeconds, workspaceIds: config.workspaceIds });
+        if (admissible) log.info("session brief parked wakeups re-armed", { stage: "session-brief", count: admissible, reason: "admission_open" });
+      }
     }
     if (deps.config.sweepSeconds > 0 && now.getTime() - lastSweep >= deps.config.sweepSeconds * 1000) {
       lastSweep = now.getTime();
-      const armed = await sweepUnbriefed(db, 100, { includeChanged: deps.canonicalInput !== undefined,
-        refreshCanonicalInput: deps.canonicalInput !== undefined, recoverJsonlInputFailures: deps.canonicalInput !== undefined,
-        workspaceIds: deps.config.workspaceIds });
+      const armed = await sweepUnbriefed(db, 100, { includeChanged: canonical,
+        refreshCanonicalInput: canonical, recoverJsonlInputFailures: canonical,
+        recoverRateLimited: canonical, workspaceIds: deps.config.workspaceIds });
       if (armed) log.info("session brief sweep armed", { stage: "session-brief", count: armed });
     }
     if (!deps.transport) return null;

@@ -23,6 +23,11 @@
  *                                   object source and also sweeps changed pointer revisions, so native
  *                                   ingest does not need the legacy indexer's brief fanout. Requires
  *                                   SESSION_BRIEF_ENABLED, LOCKER_BUCKET, org-prefix layout and a workspace list.
+ *                                   It also recovers wakeups parked until the next UTC midnight by a
+ *                                   rate_limited refusal: re-armed on new pointer revisions, made due
+ *                                   once admit() would admit them (a limit raised mid-day; the global
+ *                                   ceiling is checked first), and re-swept after the stale-wakeup prune.
+ *                                   The caps are unchanged and still enforced at claim.
  *   SESSION_BRIEF_WORKSPACE_IDS     optional comma-separated explicit workspace ids; required for native
  *                                   canonical input. Restricts sweep, claims and housekeeping.
  *

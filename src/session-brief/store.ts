@@ -145,6 +145,9 @@ export async function finishWakeup(
   );
 }
 
+/** The next UTC midnight: where a rate_limited refusal parks its wakeup (and how a parked one is recognised). */
+const NEXT_UTC_MIDNIGHT = `(date_trunc('day', now() AT TIME ZONE 'UTC') + interval '1 day') AT TIME ZONE 'UTC'`;
+
 /** Put a claimed wakeup back, due later (a retry backoff, a throttle or a budget reset). */
 export async function rescheduleWakeup(
   db: SqlExecutor,
@@ -155,7 +158,7 @@ export async function rescheduleWakeup(
   // $5 lease, $6 generation, $7 seconds (ignored for nextUtcDay), $8 error, $9 refund.
   const dueSql =
     "nextUtcDay" in due
-      ? `(date_trunc('day', now() AT TIME ZONE 'UTC') + interval '1 day') AT TIME ZONE 'UTC'`
+      ? NEXT_UTC_MIDNIGHT
       : `now() + make_interval(secs => $7::integer)`;
   await db.query(
     `UPDATE sessions.session_brief_wakeups AS w
@@ -607,13 +610,12 @@ async function projectBriefTitle(db: SqlExecutor, key: SessionDirectoryKey, titl
   );
 }
 
-/** Sweep: arm indexed sessions that have neither a brief nor a wakeup (backfill after enabling). */
-export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: { includeChanged?: boolean; refreshCanonicalInput?: boolean; recoverJsonlInputFailures?: boolean; workspaceIds?: readonly string[] } = {}): Promise<number> {
-  const { rows } = await db.query<{ n: number }>(
-    `WITH missing AS (
-       SELECT d.org_id, d.workspace_id, d.harness, physical.session_id
-         FROM sessions.session_directory AS d
-         CROSS JOIN LATERAL (
+/**
+ * The sweep's live physical session for a directory row `d`: the newest live pointer of
+ * the logical session. A deleted directory row or a session with no live pointer has none.
+ * Shared by the sweep and the parked-wakeup recoveries so they apply the same filters.
+ */
+const PHYSICAL_SESSION = `CROSS JOIN LATERAL (
            SELECT p.session_id
              FROM sessions.session_index AS p
             WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id
@@ -621,18 +623,149 @@ export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: { 
               AND (p.session_id = d.session_id
                    OR coalesce(p.canonical_session_id, p.session_id) = d.session_id)
             ORDER BY p.last_activity_at DESC, p.revision DESC, p.machine_id DESC LIMIT 1
-         ) AS physical
+         ) AS physical`;
+
+/** The live pointer revisions of a physical session (`alias` carries org/workspace/harness), as the brief's source_revisions. */
+const liveRevisions = (alias: string, sessionId: string) => `(
+                               SELECT jsonb_object_agg(p.machine_id, p.revision)
+                                 FROM sessions.session_index AS p
+                                WHERE p.org_id = ${alias}.org_id AND p.workspace_id = ${alias}.workspace_id
+                                  AND p.harness = ${alias}.harness AND p.session_id = ${sessionId}
+                                  AND p.deleted_at IS NULL AND p.manifest_key IS NOT NULL)`;
+
+/** True when wakeup `w` is the live physical session of a live directory row (the sweep's filters). */
+const LIVE_WAKEUP = `EXISTS (SELECT 1 FROM sessions.session_directory AS d
+           ${PHYSICAL_SESSION}
+          WHERE d.org_id = w.org_id AND d.workspace_id = w.workspace_id AND d.harness = w.harness
+            AND d.deleted_at IS NULL AND physical.session_id = w.session_id)`;
+
+/**
+ * A wakeup parked by a rate_limited refusal: not leased (an expired lease counts as
+ * free, as for claims and pruning), due exactly at the next UTC midnight (the
+ * rescheduleWakeup nextUtcDay expression, so a retry backoff or throttle delay never
+ * matches), and its session's brief is the rate_limited outcome of this wakeup's current
+ * evidence (recorded at or after evidence_at). The last clause keeps a refusal that could
+ * not be recorded (a stale input) from being re-armed again on every tick.
+ */
+const parkedRateLimited = (condition: string) => `(w.lease_expires_at IS NULL OR w.lease_expires_at < now())
+        AND w.due_at = ${NEXT_UTC_MIDNIGHT}
+        AND ($2::text[] IS NULL OR w.workspace_id = ANY($2::text[]))
+        AND ${LIVE_WAKEUP}
+        AND EXISTS (SELECT 1 FROM sessions.session_briefs AS b
+                     WHERE b.org_id = w.org_id AND b.workspace_id = w.workspace_id
+                       AND b.harness = w.harness AND b.session_id = w.session_id
+                       AND b.status = 'rate_limited' AND b.attempted_at >= w.evidence_at
+                       AND ${condition})`;
+
+/**
+ * Canonical mode (issue #494, F1): new pointer revisions for a session whose wakeup is
+ * parked until the next UTC midnight by a rate_limited refusal. Native ingest has no
+ * indexer armWakeup, and the sweep only inserts missing wakeups, so this applies
+ * armWakeup's on-conflict update to up to `limit` such wakeups whose live pointer
+ * revisions differ from the refused brief's source_revisions. admit() still gates the
+ * claim; a refusal records the new revisions, so the row is not re-armed again.
+ */
+export async function rearmChangedParked(
+  db: SqlExecutor,
+  limit: number,
+  opts: { idleSeconds: number; maxWaitSeconds: number; workspaceIds?: readonly string[] },
+): Promise<number> {
+  const { rows } = await db.query<{ n: number }>(
+    `WITH parked AS (
+       SELECT w.org_id, w.workspace_id, w.harness, w.session_id
+         FROM sessions.session_brief_wakeups AS w
+        WHERE w.due_at > now() + make_interval(secs => $3::integer)
+          AND ${parkedRateLimited(`b.source_revisions IS DISTINCT FROM ${liveRevisions("w", "w.session_id")}`)}
+        ORDER BY w.due_at, w.org_id, w.workspace_id, w.harness, w.session_id
+        LIMIT $1 FOR UPDATE OF w SKIP LOCKED),
+     rearmed AS (
+       UPDATE sessions.session_brief_wakeups AS w
+          SET evidence_at = now(),
+              due_at = LEAST(w.due_at, now() + make_interval(secs => $3::integer),
+                             w.pending_since + make_interval(secs => $4::integer)),
+              generation = w.generation + 1,
+              attempts = 0,
+              last_error = NULL
+         FROM parked
+        WHERE w.org_id = parked.org_id AND w.workspace_id = parked.workspace_id
+          AND w.harness = parked.harness AND w.session_id = parked.session_id
+        RETURNING 1)
+     SELECT count(*)::int AS n FROM rearmed`,
+    [limit, opts.workspaceIds ?? null, opts.idleSeconds, opts.maxWaitSeconds],
+  );
+  return rows[0]?.n ?? 0;
+}
+
+/**
+ * Canonical mode (issue #494, F3): make up to `limit` rate_limited-parked wakeups due now
+ * when admit() would admit them now (an admission limit raised mid-day, or the org or
+ * global count fell back under it). Same UTC-day expressions and order as admit(): the
+ * global ceiling first (at or over it, nothing is re-armed, and never more rows than the
+ * global headroom), then the per-session cap, then the org's distinct-session budget.
+ * Only due_at changes (no new evidence). A refusal is at least `throttleSeconds` old, so
+ * a refused row is not reconsidered every tick; admit() stays the gate at claim.
+ */
+export async function rearmAdmissibleParked(
+  db: SqlExecutor,
+  limit: number,
+  opts: { sessionDailyCap: number; budget: number; globalDailyCap: number; throttleSeconds: number; workspaceIds?: readonly string[] },
+): Promise<number> {
+  const { rows } = await db.query<{ n: number }>(
+    `WITH total AS (
+       SELECT coalesce(sum(attempts), 0)::bigint AS n FROM sessions.session_brief_attempts
+        WHERE day = (now() AT TIME ZONE 'UTC')::date),
+     parked AS (
+       SELECT w.org_id, w.workspace_id, w.harness, w.session_id
+         FROM sessions.session_brief_wakeups AS w
+        WHERE w.due_at > now()
+          AND ${parkedRateLimited(
+            `b.error IN ('session_brief_capped', 'session_brief_global_capped', 'session_brief_rate_limited')
+                       AND b.attempted_at <= now() - make_interval(secs => $6::integer)`,
+          )}
+          AND coalesce((SELECT a.attempts FROM sessions.session_brief_attempts AS a
+                         WHERE a.org_id = w.org_id AND a.day = (now() AT TIME ZONE 'UTC')::date
+                           AND a.workspace_id = w.workspace_id AND a.harness = w.harness
+                           AND a.session_id = w.session_id), 0) < $3::integer
+          AND (SELECT count(*) FROM sessions.session_brief_attempts AS a
+                WHERE a.org_id = w.org_id AND a.day = (now() AT TIME ZONE 'UTC')::date
+                  AND NOT (a.workspace_id = w.workspace_id AND a.harness = w.harness
+                           AND a.session_id = w.session_id)) < $4::integer
+        ORDER BY w.due_at, w.org_id, w.workspace_id, w.harness, w.session_id
+        LIMIT (SELECT greatest(least($1::bigint, $5::bigint - total.n), 0) FROM total)
+        FOR UPDATE OF w SKIP LOCKED),
+     rearmed AS (
+       UPDATE sessions.session_brief_wakeups AS w
+          SET due_at = now()
+         FROM parked
+        WHERE w.org_id = parked.org_id AND w.workspace_id = parked.workspace_id
+          AND w.harness = parked.harness AND w.session_id = parked.session_id
+        RETURNING 1)
+     SELECT count(*)::int AS n FROM rearmed`,
+    [limit, opts.workspaceIds ?? null, opts.sessionDailyCap, opts.budget, opts.globalDailyCap, opts.throttleSeconds],
+  );
+  return rows[0]?.n ?? 0;
+}
+
+/**
+ * Sweep: arm indexed sessions that have neither a brief nor a wakeup (backfill after
+ * enabling). `recoverRateLimited` (canonical mode) also arms a session whose brief is
+ * rate_limited and whose wakeup is gone (pruned), so it is retried; admit() still gates it.
+ */
+export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: { includeChanged?: boolean; refreshCanonicalInput?: boolean; recoverJsonlInputFailures?: boolean; recoverRateLimited?: boolean; workspaceIds?: readonly string[] } = {}): Promise<number> {
+  const { rows } = await db.query<{ n: number }>(
+    `WITH missing AS (
+       SELECT d.org_id, d.workspace_id, d.harness, physical.session_id
+         FROM sessions.session_directory AS d
+         ${PHYSICAL_SESSION}
         WHERE d.deleted_at IS NULL
           AND ($3::text[] IS NULL OR d.workspace_id=ANY($3::text[]))
           AND NOT EXISTS (SELECT 1 FROM sessions.session_briefs AS b
                            WHERE b.org_id = d.org_id AND b.workspace_id = d.workspace_id
                              AND b.harness = d.harness AND b.session_id = physical.session_id
-                             AND (NOT $2::boolean OR b.source_revisions IS NOT DISTINCT FROM (
-                               SELECT jsonb_object_agg(p.machine_id, p.revision)
-                                 FROM sessions.session_index AS p
-                                WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id
-                                  AND p.harness = d.harness AND p.session_id = physical.session_id
-                                  AND p.deleted_at IS NULL AND p.manifest_key IS NOT NULL))
+                             AND (NOT $2::boolean OR b.source_revisions IS NOT DISTINCT FROM ${liveRevisions("d", "physical.session_id")})
+                             -- Canonical mode: a rate_limited brief is not coverage. Its parked
+                             -- wakeup can be pruned after SESSION_WAKE_MAX_AGE_HOURS; re-arm it.
+                             AND NOT ($7::boolean AND b.status = 'rate_limited')
                              AND ($4::text IS NULL OR b.origin <> 'native' OR b.status <> 'ready'
                                   OR b.engine_version LIKE 'neon-backfill:%'
                                   OR (b.engine_version IS NOT DISTINCT FROM $4::text
@@ -659,7 +792,7 @@ export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: { 
      SELECT count(*)::int AS n FROM armed`,
     [limit, options.includeChanged === true, options.workspaceIds ?? null,
       options.refreshCanonicalInput === true ? SESSION_BRIEF_CANONICAL_ENGINE_VERSION : null,
-      SESSION_BRIEF_PROMPT_VERSION, options.recoverJsonlInputFailures === true],
+      SESSION_BRIEF_PROMPT_VERSION, options.recoverJsonlInputFailures === true, options.recoverRateLimited === true],
   );
   return rows[0]?.n ?? 0;
 }
