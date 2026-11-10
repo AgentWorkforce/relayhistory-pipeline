@@ -4,7 +4,7 @@
  * paths, object bodies or foreign error text. The allowlist is enforced here,
  * at the only place a service writes a log line.
  */
-import { scrubText } from "@rhc/lib/scrub.ts";
+import { scrubTextForLog as scrubText } from "@rhc/lib/scrub-engine/index.ts";
 
 /** The analytics sink's operator counters (never analytics events themselves). */
 const ANALYTICS_COUNTER_FIELDS = [

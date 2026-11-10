@@ -6,7 +6,7 @@ import {
  objectKey,parseManifest,parseSessionKey,rawChunkKey,computeContentSha256,publicationManifestKey,isObjectStoreError,
  META_CONTENT_SHA256,type ObjectStore,type PutOpts,type PutAck,type ManifestV1,type ObjectVersion,
 } from "../../packages/object-store/src/index.ts";
-import {sealRawChunk} from "../../packages/pipeline/src/lib/pipeline/raw-chunks.ts";
+import {sealRawChunk} from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import {readCapped,buildObjectLandedMessage} from "../../packages/pipeline/src/lib/pipeline/adapter.ts";
 import {canonicalManifestIdentity,manifestUserId} from "../shared/manifest-identity.ts";
 import {nextManifest,lineTimeMs,admittedIdentity,LIVE_OWNER,derivedUuidV7} from "./writer.ts";

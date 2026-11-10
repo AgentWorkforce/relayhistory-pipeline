@@ -78,7 +78,8 @@ import {
   parseRelayhistoryRecord,
   type RelayhistoryStreamRecord,
 } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
-import { isSecretKeyName, scrubJson, scrubText } from "../../packages/pipeline/src/lib/scrub.ts";
+import { isSecretKeyName } from "../../packages/pipeline/src/lib/scrub.ts";
+import { scrubJson, scrubText } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 
 export const OWNER_BUFFERED_FLAG = "RELAYHISTORY_READ_OWNER_BUFFERED";
 export const BUFFERED_HEADER = "X-Relayhistory-Buffered";

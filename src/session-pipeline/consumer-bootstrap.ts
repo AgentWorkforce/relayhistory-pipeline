@@ -22,6 +22,7 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { log } from "../shared/log.ts";
+import { initScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
 import { expectedSchema } from "../hoopdb/migrate.ts";
 import { postgresTlsOptions } from "../shared/postgres-tls.ts";
 import {
@@ -218,4 +219,8 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
   throw new Error("unreachable");
 }
 
-if (import.meta.main) await serve();
+// SCRUB_ENGINE (docs/scrub-engine.md): select, and for wasm verify the pinned engine, before serving.
+if (import.meta.main) {
+  await initScrubEngine();
+  await serve();
+}

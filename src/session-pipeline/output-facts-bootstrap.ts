@@ -38,6 +38,7 @@
  */
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { log, errorFields } from "../shared/log.ts";
+import { initScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
 import { expectedSchema } from "../hoopdb/migrate.ts";
 import { migrationChecksumMatches, resolveRenamedLedger } from "../hoopdb/migrate-guards.ts";
 import { postgresTlsOptions } from "../shared/postgres-tls.ts";
@@ -426,4 +427,8 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<numbe
   }
 }
 
-if (import.meta.main) process.exit(await serve());
+// SCRUB_ENGINE (docs/scrub-engine.md): select, and for wasm verify the pinned engine, before serving.
+if (import.meta.main) {
+  await initScrubEngine();
+  process.exit(await serve());
+}

@@ -11,7 +11,8 @@
  * the unit test checks every line against SOURCE.json's digests.
  */
 import { sessionImage } from "./session-image.ts";
-import { exceedsScrubBound, scrubNumber, scrubText } from "@rhc/lib/scrub.ts";
+import { exceedsScrubBound } from "@rhc/lib/scrub.ts";
+import { scrubNumber, scrubText } from "@rhc/lib/scrub-engine/index.ts";
 import {
   DELIVERY_KINDS,
   DELIVERY_MAPPING_VERSION,

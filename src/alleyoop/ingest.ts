@@ -41,6 +41,7 @@ import {
 } from "../shared/destination-url.ts";
 import { healthVerdict, type WorkerHealth } from "../shared/worker.ts";
 import { errorFields, log } from "../shared/log.ts";
+import { initScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
 import { initTelemetry, withSpan } from "../shared/telemetry.ts";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
 import { expectedSchema } from "../hoopdb/migrate.ts";
@@ -504,4 +505,8 @@ export async function serve() {
   process.on("SIGINT", stop);
 }
 
-if (import.meta.main) await serve();
+// SCRUB_ENGINE (docs/scrub-engine.md): select, and for wasm verify the pinned engine, before serving.
+if (import.meta.main) {
+  await initScrubEngine();
+  await serve();
+}

@@ -64,6 +64,7 @@ import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
 import { zstdDecompressSync } from "node:zlib";
 import { createS3Store, objectKey, type ObjectStore } from "../shared/vendor.ts";
 import { log } from "../shared/log.ts";
+import { ScrubEngineUnavailable, initScrubEngine, type LoadScrubWasmArtifact } from "@rhc/lib/scrub-engine/index.ts";
 import { dbClientErrorFields } from "./db-error-class.ts";
 import { assertNoNeonEdge, neonExitProfile, NeonExitRefusal } from "../shared/neon-exit.ts";
 import { createIngestApp } from "./app.ts";
@@ -88,6 +89,8 @@ interface QueueLike<T> {
 }
 
 export interface IngestWorkerEnv {
+  /** Unset / "ts" (default): the TypeScript scrubber. "wasm": the pinned relayscrubber module only (docs/scrub-engine.md). */
+  SCRUB_ENGINE?: string;
   HYPERDRIVE?: { connectionString: string };
   INGEST_FANOUT?: QueueLike<FanoutMessage>;
   /** S3-first async admission queue (producer + consumer: this Worker). Required with INGEST_ASYNC_ADMISSION on/drain. */
@@ -466,6 +469,29 @@ function logSettingsInvalid(error: unknown): void {
   log.error("session ingest settings invalid", { error_code: error instanceof NeonExitRefusal ? error.code : error instanceof AnalyticsConfigError ? `missing_${error.variable}` : "settings_invalid" });
 }
 
+/**
+ * The Worker's wasm loader. The pinned module is not bundled yet (docs/scrub-engine.md,
+ * "Worker bundling"): until it is, SCRUB_ENGINE=wasm refuses every request and message.
+ */
+const loadWorkerScrubWasm: LoadScrubWasmArtifact = async () => {
+  throw new ScrubEngineUnavailable("artifact_missing");
+};
+
+/**
+ * Select the scrub engine for this isolate (once) and, for wasm, verify it. Unset or "ts":
+ * no I/O, always true, so the hosted Worker behaves exactly as before. A failure is logged
+ * as a code and the caller refuses the work; nothing is scrubbed by another engine.
+ */
+async function scrubEngineReady(env: IngestWorkerEnv): Promise<boolean> {
+  try {
+    await initScrubEngine({ env, loadArtifact: loadWorkerScrubWasm });
+    return true;
+  } catch (error) {
+    log.error("session ingest scrub engine unavailable", { error_code: (error as { code?: string }).code ?? "scrub_engine_unavailable" });
+    return false;
+  }
+}
+
 const NOT_CONFIGURED = () =>
   Response.json({ error: { code: "not_configured", message: "the session ingest is not configured yet" }, correlationId: "" }, { status: 503, headers: { "retry-after": "60" } });
 
@@ -473,6 +499,7 @@ const zstd = (bytes: Uint8Array) => new Uint8Array(zstdDecompressSync(bytes));
 
 export default {
   async fetch(request: Request, env: IngestWorkerEnv, ctx: Ctx): Promise<Response> {
+    if (!(await scrubEngineReady(env))) return NOT_CONFIGURED();
     let settings: IngestSettings | null;
     let analyticsSelection: AnalyticsConfig;
     try {
@@ -516,6 +543,11 @@ export default {
    * minutes per attempt instead of walking to the DLQ in seconds.
    */
   async queue(batch: { queue?: string; messages: QueueMessage[] }, env: IngestWorkerEnv): Promise<void> {
+    if (!(await scrubEngineReady(env))) {
+      // As while not configured: wait five minutes per attempt, never scrub with another engine.
+      for (const message of batch.messages) message.retry({ delaySeconds: 300 });
+      return;
+    }
     const settings = await ingestSettings(env).catch((error: unknown) => { logSettingsInvalid(error); return null; });
     // Admission messages (INGEST_ADMISSION) are not canonical fanout: buffered mode admits them.
     const admission = batch.messages.filter((m) => (m.body as { kind?: unknown } | null)?.kind === "ingest-admission");

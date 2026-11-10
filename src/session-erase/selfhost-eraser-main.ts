@@ -24,6 +24,7 @@
  * See docs/operator-session-erase-selfhost-eraser.md.
  */
 import { readFileSync, statSync } from "node:fs";
+import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { isAbsolute } from "node:path";
 import { createS3Eraser, type PagedEraser, type S3EraserConfig } from "../migration/neon-s3-erasure/eraser.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
@@ -184,7 +185,9 @@ if (import.meta.main) {
     const path = requestPathFrom(process.argv.slice(2), process.env);
     return path ? readBounded(path, MAX_FILE) : readStdin();
   };
-  runSessionEraseBytes(process.env, request)
+  // SCRUB_ENGINE (docs/scrub-engine.md): every service selects (and for wasm verifies) at startup.
+  initScrubEngine()
+    .then(() => runSessionEraseBytes(process.env, request))
     .then((r) => {
       console.log(JSON.stringify(r));
       process.exit(exitCodeForResult(r));

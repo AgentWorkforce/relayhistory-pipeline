@@ -11,6 +11,7 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import pg from "pg";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { errorFields, log } from "../shared/log.ts";
+import { initScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
 import { createAcquisitionApp, type AcquisitionGroup } from "./app.ts";
 import { acquisitionConfig } from "./config.ts";
 import { assertInstallerLogin } from "./db-login.ts";
@@ -115,4 +116,8 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<void>
   process.on("SIGINT", stop);
 }
 
-if (import.meta.main) await serve();
+// SCRUB_ENGINE (docs/scrub-engine.md): select, and for wasm verify the pinned engine, before serving.
+if (import.meta.main) {
+  await initScrubEngine();
+  await serve();
+}
