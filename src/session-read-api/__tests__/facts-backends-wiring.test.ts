@@ -47,11 +47,16 @@ const build = (env: NodeJS.ProcessEnv) => readApiDepsFromSecret(ENV.RELAYHISTORY
 
 describe("self-host service facts backends", () => {
   test("postgres + ENABLED=1 wires both Postgres backends on the read pool, no ClickHouse", async () => {
-    const built = await build({ ...ENV, READ_API_OUTPUT_BACKEND: "postgres", READ_API_OUTPUT_ENABLED: "1", READ_API_DIGEST_BACKEND: "postgres", READ_API_DIGEST_ENABLED: "1" });
+    const built = await build({
+      ...ENV, READ_API_OUTPUT_BACKEND: "postgres", READ_API_OUTPUT_ENABLED: "1",
+      READ_API_DIGEST_BACKEND: "postgres", READ_API_DIGEST_ENABLED: "1",
+      READ_API_COORDINATION_OVERLAPS_BACKEND: "postgres", READ_API_COORDINATION_OVERLAPS_ENABLED: "true",
+    });
     try {
       expect(built.deps.ch).toBeUndefined();
       expect(built.deps.output?.backend?.kind).toBe("postgres");
       expect(built.deps.digest?.backend?.kind).toBe("postgres");
+      expect(built.deps.coordination?.backend?.kind).toBe("postgres");
       expect(built.deps.digest?.cache).toBeDefined();
       expect(built.deps.digest?.generator).toBeUndefined();
       // The readiness read goes to 045040's coverage reader in a READ ONLY tenant transaction.
@@ -89,7 +94,7 @@ describe("self-host service facts backends", () => {
   });
 
   test("an unknown value refuses startup, naming the flag and never echoing the value", async () => {
-    for (const name of ["READ_API_OUTPUT_BACKEND", "READ_API_DIGEST_BACKEND"])
+    for (const name of ["READ_API_OUTPUT_BACKEND", "READ_API_DIGEST_BACKEND", "READ_API_COORDINATION_OVERLAPS_BACKEND"])
       for (const value of ["Postgres", "pg", "clickhouse ", "neon"]) {
         const error = await build({ ...ENV, [name]: value }).then(() => null, (e: Error) => e);
         expect(error?.message).toContain(name);
@@ -100,8 +105,10 @@ describe("self-host service facts backends", () => {
   test("the hosted Lambda entry refuses postgres; clickhouse and unset pass", () => {
     expect(() => factsBackends({ READ_API_OUTPUT_BACKEND: "postgres" }, "lambda")).toThrow("served only by the self-host service");
     expect(() => factsBackends({ READ_API_DIGEST_BACKEND: "postgres" }, "lambda")).toThrow("served only by the self-host service");
-    expect(factsBackends({}, "lambda")).toEqual({ output: "clickhouse", digest: "clickhouse" });
-    expect(factsBackends({ READ_API_OUTPUT_BACKEND: "clickhouse" }, "lambda")).toEqual({ output: "clickhouse", digest: "clickhouse" });
-    expect(factsBackends({ READ_API_OUTPUT_BACKEND: "postgres", READ_API_DIGEST_BACKEND: "postgres" }, "service")).toEqual({ output: "postgres", digest: "postgres" });
+    expect(() => factsBackends({ READ_API_COORDINATION_OVERLAPS_BACKEND: "postgres" }, "lambda")).toThrow("served only by the self-host service");
+    expect(factsBackends({}, "lambda")).toEqual({ output: "clickhouse", digest: "clickhouse", coordination: "clickhouse" });
+    expect(factsBackends({ READ_API_OUTPUT_BACKEND: "clickhouse" }, "lambda")).toEqual({ output: "clickhouse", digest: "clickhouse", coordination: "clickhouse" });
+    expect(factsBackends({ READ_API_OUTPUT_BACKEND: "postgres", READ_API_DIGEST_BACKEND: "postgres", READ_API_COORDINATION_OVERLAPS_BACKEND: "postgres" }, "service"))
+      .toEqual({ output: "postgres", digest: "postgres", coordination: "postgres" });
   });
 });

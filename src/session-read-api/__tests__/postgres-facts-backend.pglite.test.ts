@@ -22,6 +22,8 @@ import { postgresOutputFactsStore } from "../../session-pipeline/output-facts-st
 import { OUTPUT_FIXTURE_SCOPE, outputFixture } from "../../session-pipeline/__tests__/output-facts-fixture.ts";
 import { FactsReadDeadline, isPostgresFactsSchemaMissing, postgresOutputBackend, type PostgresFactsDeps } from "../postgres/output-query.ts";
 import { postgresDigestBackend } from "../postgres/digest-query.ts";
+import { postgresCoordinationBackend } from "../postgres/coordination-query.ts";
+import { createReadApi } from "../app.ts";
 
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
@@ -152,6 +154,30 @@ describe("postgres output/digest backends over 045040", () => {
     expect(await postgresOutputBackend(deps(db)).readOutput({ orgId: ORG, workspaceIds: ["ws-other"] }, DAY)).toEqual(ZERO);
   }, 180_000);
 
+  test("the coordination endpoint reads 045040 through the read role and reports row-cap coverage", async () => {
+    const db = await database();
+    await writeFacts(db);
+    await watermark(db, "2026-11-01T00:00:00Z");
+    const coordination = postgresCoordinationBackend(deps(db));
+    const app = createReadApi({
+      verify: async () => ({ userId: "u", orgId: ORG, workspaceId: WS, scopes: ["rth:read"] }),
+      adapter: {} as never, liveness: noneErased, completeSinceMs: 0, directory,
+      directoryWorkspaces: new Set([WS]), coordination: { enabled: true, backend: coordination },
+    });
+    const response = await app.request(`/v1/coordination/overlaps?workspace=${WS}&since=${DAY.since.toISOString()}&until=${DAY.until.toISOString()}`, {
+      headers: { authorization: "Bearer good" },
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json() as any;
+    expect(body.contract).toBe("coordination-overlaps/1");
+    expect(body.coverage).toMatchObject({ status: "complete", sessionsConsidered: 1, sessionsTruncated: 0 });
+    expect(body.findings).toEqual([]);
+    const capped = await coordination.readFacts(directory, { orgId: ORG, workspaceId: WS, ...DAY, rowCap: 1 });
+    expect(capped.sessionsTruncated).toBe(1);
+    expect(capped.notes.join(" ")).toContain("row cap 1 reached");
+    expect((await coordination.readFacts(directory, { orgId: ORG, workspaceId: "ws-other", ...DAY })).lanes).toEqual([]);
+  }, 180_000);
+
   test("liveness: an erased session's facts are dropped before any aggregation", async () => {
     const db = await database();
     await writeFacts(db);
@@ -174,6 +200,8 @@ describe("postgres output/digest backends over 045040", () => {
     await expect(postgresOutputBackend(deps(db, { now: slow })).readOutput({ orgId: ORG, workspaceIds: [WS] }, DAY, { timeoutMs: 500 }))
       .rejects.toBeInstanceOf(FactsReadDeadline);
     await expect(postgresDigestBackend(deps(db, { now: slow })).buildDailyDigest(directory, { orgId: ORG, workspaceId: WS, ...DAY }, { timeoutMs: 500 }))
+      .rejects.toBeInstanceOf(FactsReadDeadline);
+    await expect(postgresCoordinationBackend(deps(db, { now: slow })).readFacts(directory, { orgId: ORG, workspaceId: WS, ...DAY }, { timeoutMs: 500 }))
       .rejects.toBeInstanceOf(FactsReadDeadline);
     await expect(postgresOutputBackend(deps(db, { now: slow })).windowReadiness(ORG, WS, DAY.since, DAY.until, { timeoutMs: 500 }))
       .rejects.toBeInstanceOf(FactsReadDeadline);

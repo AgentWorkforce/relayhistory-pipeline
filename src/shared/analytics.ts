@@ -75,6 +75,7 @@ export const READ_ROUTES: ReadonlySet<string> = new Set([
   "/v1/sessions/:sessionId/summary",
   "/v1/sessions/:sessionId/catalog",
   "/v1/digest/daily",
+  "/v1/coordination/overlaps",
   "/v1/delivery/records",
 ]);
 

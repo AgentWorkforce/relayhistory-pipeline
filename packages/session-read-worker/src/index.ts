@@ -23,6 +23,8 @@
  * READ_API_DIGEST_ENABLED ("1" only: GET /v1/digest/daily; its narrative needs migration
  * 20261105045000 and the DIGEST_NARRATIVE service binding, without which every miss is
  * `provider_not_configured`; default off = 501),
+ * READ_API_COORDINATION_OVERLAPS_ENABLED (exactly "true": GET /v1/coordination/overlaps from
+ * the existing ClickHouse facts; every other value = 404),
  * READ_API_BRIEF_TITLES_WORKSPACES (the brief-titles allowlist; unset = none), and
  * RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER (production
  * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve), and
@@ -86,7 +88,7 @@ import { sqlBriefTitles } from "../../../src/session-read-api/brief-titles.ts";
 import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/auth.ts";
 import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
 import { repeatableReadEnabled, sqlLiveness, TENANT_SETTINGS_SQL, tenantBeginSql, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
-import { parseCompleteSince } from "../../../src/session-read-api/config.ts";
+import { coordinationOverlapsEnabled, parseCompleteSince } from "../../../src/session-read-api/config.ts";
 import { AnalyticsConfigError, analyticsConfig, analyticsCounterFields, createAnalyticsSink, type AnalyticsConfig } from "../../../src/shared/analytics-config.ts";
 import {
   createBufferedSearchGate,
@@ -130,6 +132,8 @@ export interface Env extends CanonicalEnv {
   READ_API_OUTPUT_ENABLED?: string;
   /** "1": serve GET /v1/digest/daily; anything else = 501 digest_not_configured. */
   READ_API_DIGEST_ENABLED?: string;
+  /** Exactly "true": serve GET /v1/coordination/overlaps from ClickHouse facts. */
+  READ_API_COORDINATION_OVERLAPS_ENABLED?: string;
   /** The digest narrative Worker (wrangler.digest-narrative.jsonc), bound at activation only. */
   DIGEST_NARRATIVE?: Fetcher;
   /** Babysitter evidence reader (GET /v1/delivery/records for its kinds): only "on" enables; default off. */
@@ -438,6 +442,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     ...(env.READ_API_DIGEST_ENABLED?.trim() === "1"
       ? { digest: { cache: sqlNarrativeCache(tenant.run), ...(env.DIGEST_NARRATIVE ? { generator: serviceNarrativeGenerator(env.DIGEST_NARRATIVE) } : {}) } }
       : {}),
+    ...(coordinationOverlapsEnabled(env.READ_API_COORDINATION_OVERLAPS_ENABLED) ? { coordination: { enabled: true as const } } : {}),
     briefTitles: sqlBriefTitles(tenant.run),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
