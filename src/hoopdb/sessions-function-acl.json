@@ -178,6 +178,14 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.coordination_output_facts_for(text,timestamp with time zone,timestamp with time zone,text,integer)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.coordination_write_facts_for(text,timestamp with time zone,timestamp with time zone,text,integer)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.digest_narrative_read(text,date,text,text)": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"

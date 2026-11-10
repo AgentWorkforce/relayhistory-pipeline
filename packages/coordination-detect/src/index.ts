@@ -261,8 +261,9 @@ export const outcomeFacts: Detector<OutcomeFactsParams> = {
     const params = { migrationWindowMs, outcomeWindowMs, weakWriteWindowMs, hotPathLaneLimit };
     const rootByLane = roots(input.lanes);
     const suppressed = (a: LaneFacts, b: LaneFacts) => rootByLane.get(laneKey(a)) === rootByLane.get(laneKey(b));
-    const inWindow = (ts: string) => ts >= input.window.since && ts < input.window.until;
-    const writes = new Map(input.lanes.map((lane) => [laneKey(lane), lane.writes.filter((write) => inWindow(write.ts))]));
+    const alertInWindow = (ts: string) => ts >= input.window.since && ts < input.window.until;
+    // The backend supplies the bounded lookback. Facts after `until` must never affect a replay.
+    const writes = new Map(input.lanes.map((lane) => [laneKey(lane), lane.writes.filter((write) => write.ts < input.window.until)]));
     const candidates: OutcomeCandidate[] = [];
 
     // T1: the same normalized migration number or filename, in the same repository.
@@ -276,6 +277,7 @@ export const outcomeFacts: Detector<OutcomeFactsParams> = {
       if (laneKey(a.lane) === laneKey(b.lane) || a.repo !== b.repo || a.migration !== b.migration) continue;
       if (Date.parse(b.write.ts) - Date.parse(a.write.ts) > migrationWindowMs) continue;
       const ordered = orderedWrites(a.lane, a.write, b.lane, b.write);
+      if (!alertInWindow(ordered.secondWrite.ts)) continue;
       const isSuppressed = suppressed(a.lane, b.lane);
       candidates.push(outcomeFinding(input, "T1", "duplicate_work", ordered.first, ordered.second, {
         type: "migration", value: a.migration,
@@ -288,13 +290,13 @@ export const outcomeFacts: Detector<OutcomeFactsParams> = {
 
     // T2: one lane records a reverted outcome for an earlier commit attributed to another lane.
     for (const second of input.lanes) for (const outcome of second.outcomes) {
-      if (!outcome.reverted || !inWindow(outcome.ts)) continue;
+      if (!outcome.reverted || !alertInWindow(outcome.ts)) continue;
       const sha = canonicalSha(outcome.key);
       if (!sha) continue;
       for (const first of input.lanes) {
         if (laneKey(first) === laneKey(second)) continue;
         for (const commit of first.commits) {
-          if (!inWindow(commit.ts) || canonicalSha(commit.sha) !== sha || commit.ts > outcome.ts) continue;
+          if (canonicalSha(commit.sha) !== sha || commit.ts > outcome.ts) continue;
           if (Date.parse(outcome.ts) - Date.parse(commit.ts) > outcomeWindowMs) continue;
           const isSuppressed = suppressed(first, second);
           candidates.push(outcomeFinding(input, "T2", "superseded_work", first, second, {
@@ -309,38 +311,48 @@ export const outcomeFacts: Detector<OutcomeFactsParams> = {
     }
 
     // T3: a rare, non-generated path is written on two different branches within 48 hours.
-    const pathRoots = new Map<string, Set<string>>();
     const weakRows = input.lanes.flatMap((lane) => (writes.get(laneKey(lane)) ?? []).flatMap((write) => {
       const path = normalizedPath(write.path);
       const branch = canonicalBranch(write.branch);
       const scope = normalizedRepo(lane.repo) || (lane.projectId ? `project:${lane.projectId}` : "");
       if (!path || !branch || !scope || KNOWN_HOT_PATH.test(path)) return [];
       const group = JSON.stringify([scope, path]);
-      const rootsForPath = pathRoots.get(group) ?? new Set<string>();
-      rootsForPath.add(rootByLane.get(laneKey(lane))!);
-      pathRoots.set(group, rootsForPath);
       return [{ lane, write, path, branch, group }];
     })).sort((a, b) => textCompare(a.write.ts, b.write.ts) || textCompare(laneKey(a.lane), laneKey(b.lane)));
     const weakByGroup = new Map<string, typeof weakRows>();
     for (const row of weakRows) {
-      if ((pathRoots.get(row.group)?.size ?? 0) > hotPathLaneLimit) continue;
       const rows = weakByGroup.get(row.group) ?? [];
       rows.push(row);
       weakByGroup.set(row.group, rows);
     }
-    for (const rows of weakByGroup.values()) for (let i = 0; i < rows.length; i++) for (let j = i + 1; j < rows.length; j++) {
-      const a = rows[i]!, b = rows[j]!;
-      if (laneKey(a.lane) === laneKey(b.lane) || a.branch === b.branch) continue;
-      if (Date.parse(b.write.ts) - Date.parse(a.write.ts) > weakWriteWindowMs) continue;
-      const ordered = orderedWrites(a.lane, a.write, b.lane, b.write);
-      const isSuppressed = suppressed(a.lane, b.lane);
-      candidates.push(outcomeFinding(input, "T3", "concurrent_edit", ordered.first, ordered.second, {
-        type: "file", value: a.path,
-        firstTouchedAt: { [a.lane.sessionId]: a.write.ts, [b.lane.sessionId]: b.write.ts },
-      }, ordered.secondWrite.ts, [
-        { sessionId: ordered.first.sessionId, eventId: ordered.firstWrite.eventId, ts: ordered.firstWrite.ts, kind: ordered.firstWrite.kind },
-        { sessionId: ordered.second.sessionId, eventId: ordered.secondWrite.eventId, ts: ordered.secondWrite.ts, kind: ordered.secondWrite.kind },
-      ], `Two lanes on different branches wrote ${a.path} within ${weakWriteWindowMs / 3_600_000} hours.`, isSuppressed));
+    for (const rows of weakByGroup.values()) {
+      // Rarity is evaluated at alert time. A later writer cannot erase an earlier replay finding.
+      const rootsAt = new Map<string, number>();
+      const seenRoots = new Set<string>();
+      for (let i = 0; i < rows.length;) {
+        let j = i;
+        while (j < rows.length && rows[j]!.write.ts === rows[i]!.write.ts) {
+          seenRoots.add(rootByLane.get(laneKey(rows[j]!.lane))!);
+          j++;
+        }
+        rootsAt.set(rows[i]!.write.ts, seenRoots.size);
+        i = j;
+      }
+      for (let i = 0; i < rows.length; i++) for (let j = i + 1; j < rows.length; j++) {
+        const a = rows[i]!, b = rows[j]!;
+        if (laneKey(a.lane) === laneKey(b.lane) || a.branch === b.branch) continue;
+        if (Date.parse(b.write.ts) - Date.parse(a.write.ts) > weakWriteWindowMs) continue;
+        const ordered = orderedWrites(a.lane, a.write, b.lane, b.write);
+        if (!alertInWindow(ordered.secondWrite.ts) || (rootsAt.get(ordered.secondWrite.ts) ?? 0) > hotPathLaneLimit) continue;
+        const isSuppressed = suppressed(a.lane, b.lane);
+        candidates.push(outcomeFinding(input, "T3", "concurrent_edit", ordered.first, ordered.second, {
+          type: "file", value: a.path,
+          firstTouchedAt: { [a.lane.sessionId]: a.write.ts, [b.lane.sessionId]: b.write.ts },
+        }, ordered.secondWrite.ts, [
+          { sessionId: ordered.first.sessionId, eventId: ordered.firstWrite.eventId, ts: ordered.firstWrite.ts, kind: ordered.firstWrite.kind },
+          { sessionId: ordered.second.sessionId, eventId: ordered.secondWrite.eventId, ts: ordered.secondWrite.ts, kind: ordered.secondWrite.kind },
+        ], `Two lanes on different branches wrote ${a.path} within ${weakWriteWindowMs / 3_600_000} hours.`, isSuppressed));
+      }
     }
 
     // P6's alert budget is per unordered lane pair: retain the strongest tier, then earliest evidence.

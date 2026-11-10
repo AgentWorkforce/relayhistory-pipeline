@@ -58,6 +58,35 @@ describe("outcome-facts", () => {
     expect(narrow.evidence.map((event) => event.eventId)).toEqual(["a-10", "b-11"]);
   });
 
+  test("uses earlier lookback evidence but emits only alerts inside the response window", () => {
+    const lanes = [
+      lane("migration-a", { writes: [write("migration-a", "db/migrations/0042_a.sql", 8)] }),
+      lane("migration-b", { writes: [write("migration-b", "db/migrations/0042_b.sql", 10)] }),
+      lane("commit-a", { commits: [{ sha: "1234567abcdef", ts: t(8), eventId: "commit", reverted: null }] }),
+      lane("revert-b", { outcomes: [{ key: "1234567abcdef", ts: t(10), eventId: "outcome", reverted: true }] }),
+      lane("edit-a", { writes: [write("edit-a", "src/lookback.ts", 8)] }),
+      lane("edit-b", { writes: [write("edit-b", "src/lookback.ts", 10)] }),
+      lane("old-a", { writes: [write("old-a", "src/old.ts", 7)] }),
+      lane("old-b", { writes: [write("old-b", "src/old.ts", 9)] }),
+    ];
+    const result = outcomeFacts.detect(input(lanes, t(10), t(15)));
+    expect(result.findings.map((finding) => [finding.kind, finding.alertAt])).toEqual([
+      ["duplicate_work", t(10)], ["superseded_work", t(10)], ["concurrent_edit", t(10)],
+    ]);
+    expect(result.findings.some((finding) => finding.artifacts[0]!.value === "src/old.ts")).toBe(false);
+  });
+
+  test("later roots do not retroactively make an earlier path hot", () => {
+    const first = lane("first", { writes: [write("first", "src/rare.ts", 10)] });
+    const second = lane("second", { writes: [write("second", "src/rare.ts", 11)] });
+    const later = Array.from({ length: 8 }, (_, i) => lane(`later-${i}`, {
+      writes: [write(`later-${i}`, "src/rare.ts", 12 + i)],
+    }));
+    const finding = outcomeFacts.detect(input([first, second, ...later], t(9), t(24))).findings
+      .find((row) => row.lanes.some((value) => value.sessionId === "first"));
+    expect(finding?.alertAt).toBe(t(11));
+  });
+
   test("requires different branches and damps known and high-cardinality hot paths", () => {
     const sameBranch = [
       lane("same-a", { writes: [write("same-a", "src/a.ts", 0, "feat/shared")] }),
@@ -72,7 +101,10 @@ describe("outcome-facts", () => {
     const hot = Array.from({ length: 9 }, (_, i) => lane(`hot-${i}`, {
       writes: [write(`hot-${i}`, "src/hot.ts", i)],
     }));
-    expect(outcomeFacts.detect(input(hot)).findings).toEqual([]);
+    const findings = outcomeFacts.detect(input(hot)).findings;
+    expect(findings.length).toBeGreaterThan(0); // alerts emitted before the path became hot remain honest
+    expect(findings.every((finding) => finding.alertAt < t(8))).toBe(true);
+    expect(findings.some((finding) => finding.lanes.some((item) => item.sessionId === "hot-8"))).toBe(false);
   });
 
   test("keeps same-user independent lanes, reports unknown cost as null, and leaves the baseline selectable", () => {

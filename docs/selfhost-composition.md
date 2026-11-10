@@ -370,19 +370,27 @@ for workspaces in `READ_API_DIRECTORY_WORKSPACES` (unchanged allowlist).
 returns `404 {"error":"coordination_overlaps_disabled"}`. Self-hosted installs
 select the existing Postgres facts with
 `READ_API_COORDINATION_OVERLAPS_BACKEND=postgres`; this adds no worker, model,
-secret, or migration. Its default `outcome-facts` detector ranks duplicate
+or secret. It requires migration `20261105047000_coordination_fact_readers.sql`,
+which adds two filtered SECURITY DEFINER readers and two partial indexes over
+the existing facts tables. On a populated database, prebuild those exact
+indexes with `CREATE INDEX CONCURRENTLY` using the packet in
+`docs/coordination-overlap-detection.md`; the transactional migrator refuses a
+blocking build unless `HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=1` (or `true`) is set.
+Its default `outcome-facts` detector ranks duplicate
 migrations, cross-lane reverted commits, and rare different-branch shared
 writes using only those stored facts; the pure detector package retains
 `shared-write-60m` as a named comparison detector. With `postgres` the routes read the Postgres output facts on the read pool, as
-`bulls96_read_api`, through the migration `045040` readers only
-(`sessions.output_facts_events_for`, `_outputs_for`, `_coverage_for`), in one
+`bulls96_read_api`, through the migration `045040` readiness/usage readers and
+the `047000` sparse coordination readers, in one
 READ ONLY tenant transaction, with erased sessions dropped through the session
 liveness check before any aggregation. No ClickHouse block or client is needed.
 
 Serving from `postgres` needs, in order:
 
 1. migration `045040` applied (otherwise 501 `output_schema_missing` /
-   `digest_schema_missing`);
+   `digest_schema_missing`) and, for coordination overlaps, migration `047000`
+   applied (otherwise the overlap route returns 200 with unknown coverage and a
+   schema-unavailable note);
 2. `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` on the pipeline consumer, so new
    passes write facts;
 3. the output facts bootstrap (a later PR), which backfills the sessions

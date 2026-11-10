@@ -19,7 +19,12 @@ The pipeline ships one detector, `outcome-facts` v1. It is deterministic, cites 
 - **Planned fleets sink.** Sessions that share an orchestrating parent (the session directory's `parent_session_ids`) drop to the bottom of the list at low confidence.
 - **Communication is reported as `unknown`.** Production facts hold no evidence of agent-to-agent messages.
 - **Where it runs:** `GET /v1/coordination/overlaps` on the session read API (contract `coordination-overlaps/1`), computed on request from existing facts.
-  - It needs no new workload, secret, model or migration.
+  - It needs no new workload, secret or model. Self-host installs add migration
+    `20261105047000_coordination_fact_readers.sql`: two filtered SECURITY DEFINER readers and two
+    partial indexes, with no table, backfill or stored finding.
+  - On a populated facts table, the transactional migrator refuses a blocking index build. Operators
+    prebuild the exact packet below with `CREATE INDEX CONCURRENTLY`, then the migration adopts it;
+    `HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true` is the explicit non-production opt-in.
   - It is off unless `READ_API_COORDINATION_OVERLAPS_ENABLED=true`.
 - **Where it shows:** an Overlaps tab in the dashboard (`relay-webapp`). The tab hides itself when the endpoint is off.
 
@@ -76,7 +81,31 @@ What the results mean:
 - **Recall is low by design.** It counts only against known incidents, and the labeled set is small and biased toward PR-visible duplicates and toward this team's habits: one person running many agents, PR-per-change.
 - **It is retrospective.** Use it for reconcile or close-one follow-ups, as Relay Chief plans to, not to interrupt work in progress.
 - **Existing stored facts lack Codex code-mode edit paths** until they're reprojected. That's a separate job with separate approval.
-- **Large windows are sampled, not exhaustive.** Each request reads at most 10,000 event rows and 10,000 outcome rows through the existing readers, which return rows in hash order. A busy workspace exceeds that within days, so the response reports `coverage.status: "partial"` with a row-cap note, and missed duplicates are likely. Use short windows until a filtered reader exists (see next steps).
+- **Evidence streams are filtered and independently bounded.** Each request reads up to 10,000 rows
+  whose `files_touched` array is non-empty and up to 50,000 `commit`/`outcome` rows. It also reads at
+  most 10,000 unfiltered event rows only to price duplicate work. A capped evidence stream makes
+  coverage partial and can omit findings; a capped usage stream makes cost/tokens `null` rather than
+  undercounting them. `coverage.sessionsTruncated` is the contract's 0/1 truncation indicator, not a
+  count of sessions: `0` means no stream cap was observed and `1` means one or more streams hit a cap;
+  `coverage.notes` names each capped stream.
+- **The evidence read includes a seven-day lookback.** The response window is unchanged, and every
+  finding's `alertAt` must be inside it. Earlier evidence can anchor a T1/T2/T3 alert at the left edge;
+  later evidence never moves an alert backward or removes it through rarity damping. Readiness covers
+  the lookback too.
+
+### Coordination fact-reader index packet
+
+The migration records these byte-frozen definitions (the partial `WHERE` predicates are part of the
+contract):
+
+```sql
+CREATE INDEX session_event_facts_coordination_writes_idx ON sessions.session_event_facts USING btree (org_id, workspace_id, ts, row_id) WHERE (cardinality(files_touched) > 0);
+CREATE INDEX session_output_facts_coordination_outcomes_idx ON sessions.session_output_facts USING btree (org_id, workspace_id, ts, row_id) WHERE (fact_kind = ANY (ARRAY['commit'::text, 'outcome'::text]));
+```
+
+On a populated database, run the same statements out of band with `CREATE INDEX CONCURRENTLY` in place
+of `CREATE INDEX`, one statement per transaction. Verify that both indexes are valid and ready, then run
+the migration; it compares `pg_get_indexdef` byte-for-byte and adopts them without rebuilding.
 
 ## Showing a customer where Relay helps (the repeatable process)
 

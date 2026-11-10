@@ -10,6 +10,8 @@ import type { Liveness } from "./page.ts";
 import { keyOf } from "./page.ts";
 
 export const COORDINATION_FACTS_ROW_CAP = 10_000;
+export const COORDINATION_OUTPUT_ROW_CAP = 50_000;
+export const COORDINATION_EVIDENCE_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1_000;
 
 export interface CoordinationParams {
   orgId: string;
@@ -24,6 +26,12 @@ export interface CoordinationFacts {
   lanes: LaneFacts[];
   sessionsTruncated: number;
   notes: string[];
+}
+
+export interface CoordinationStreamCoverage {
+  evidence: { cap: number; truncated: boolean };
+  outputs: { cap: number; truncated: boolean };
+  usage: { cap: number; truncated: boolean };
 }
 
 export interface CoordinationBackend {
@@ -69,11 +77,13 @@ async function directoryRows(directory: Directory | undefined, p: CoordinationPa
 export async function normalizeCoordinationFacts(
   directory: Directory | undefined,
   p: CoordinationParams,
-  events: CoordinationEventRow[],
+  evidenceEvents: CoordinationEventRow[],
   outputs: CoordinationOutputRow[],
-  truncated: boolean,
+  usageEvents: CoordinationEventRow[],
+  coverage: CoordinationStreamCoverage,
 ): Promise<CoordinationFacts> {
-  const filtered = events.filter((event) => !p.projectId || event.project_id === p.projectId);
+  const filtered = evidenceEvents.filter((event) => !p.projectId || event.project_id === p.projectId);
+  const filteredUsage = usageEvents.filter((event) => !p.projectId || event.project_id === p.projectId);
   const groups = new Map<string, CoordinationEventRow[]>();
   const identities = new Map<string, { harness: string; sessionId: string }>();
   for (const event of filtered) {
@@ -103,20 +113,30 @@ export async function normalizeCoordinationFacts(
     rows.push(output);
     outputsByKey.set(k, rows);
   }
+  const usageByKey = new Map<string, CoordinationEventRow[]>();
+  if (!coverage.usage.truncated) for (const event of filteredUsage) {
+    const k = key(event.source, event.session_id);
+    if (!identities.has(k)) continue;
+    const rows = usageByKey.get(k) ?? [];
+    rows.push(event);
+    usageByKey.set(k, rows);
+  }
   const lanes: LaneFacts[] = [];
   for (const { k, harness, sessionId } of keys) {
     const rows = (groups.get(k) ?? []).sort((a, b) => compare(a.ts, b.ts) || compare(a.event_id, b.event_id));
     const out = (outputsByKey.get(k) ?? []).sort((a, b) => compare(a.ts, b.ts) || compare(a.row_id, b.row_id));
+    const usageRows = (usageByKey.get(k) ?? []).sort((a, b) => compare(a.ts, b.ts) || compare(a.event_id, b.event_id));
     const d = byDirectoryKey.get(k);
     const latest = <K extends "user_id" | "project_id" | "branch" | "task_ref_id" | "task_title">(field: K) => {
-      for (let i = rows.length - 1; i >= 0; i--) if (rows[i]![field] !== null) return rows[i]![field] as string;
+      const metadata = [...rows, ...usageRows].sort((a, b) => compare(a.ts, b.ts) || compare(a.event_id, b.event_id));
+      for (let i = metadata.length - 1; i >= 0; i--) if (metadata[i]![field] !== null) return metadata[i]![field] as string;
       return null;
     };
-    const factTimes = [...rows.map((r) => iso(r.ts)), ...out.map((r) => iso(r.ts))].sort(compare);
+    const factTimes = [...rows.map((r) => iso(r.ts)), ...out.map((r) => iso(r.ts)), ...usageRows.map((r) => iso(r.ts))].sort(compare);
     const lastAt = factTimes.at(-1)!;
     const parents = d?.parent_session_ids?.filter(Boolean) ?? [];
     const directoryLastAt = d ? iso(d.last_activity_at) : null;
-    const usage: LaneFacts["usage"] = rows.map((event) => ({
+    const usage: LaneFacts["usage"] = usageRows.map((event) => ({
       ts: iso(event.ts), eventId: event.event_id,
       tokens: number(event.input_tokens) + number(event.output_tokens) + number(event.reasoning_tokens),
       costUsdMicros: event.cost_usd_micros === null ? null : number(event.cost_usd_micros),
@@ -125,6 +145,8 @@ export async function normalizeCoordinationFacts(
     // through the lane's true last action. A null sentinel makes the detector say unknown.
     if (directoryLastAt && directoryLastAt > lastAt)
       usage.push({ ts: directoryLastAt, eventId: "coverage:directory-last-action", tokens: null, costUsdMicros: null });
+    if (coverage.usage.truncated)
+      usage.push({ ts: directoryLastAt && directoryLastAt > lastAt ? directoryLastAt : lastAt, eventId: "coverage:usage-truncated", tokens: null, costUsdMicros: null });
     lanes.push({
       sessionId,
       source: harness,
@@ -149,11 +171,14 @@ export async function normalizeCoordinationFacts(
     });
   }
   lanes.sort((a, b) => compare(a.source, b.source) || compare(a.sessionId, b.sessionId));
+  const truncated = coverage.evidence.truncated || coverage.outputs.truncated || coverage.usage.truncated;
   return {
     lanes,
     sessionsTruncated: truncated ? 1 : 0,
     notes: [
-      ...(truncated ? [`facts row cap ${p.rowCap ?? COORDINATION_FACTS_ROW_CAP} reached; at least one session may be omitted`] : []),
+      ...(coverage.evidence.truncated ? [`write evidence stream cap ${coverage.evidence.cap} reached; findings may be omitted`] : []),
+      ...(coverage.outputs.truncated ? [`commit/outcome stream cap ${coverage.outputs.cap} reached; findings may be omitted`] : []),
+      ...(coverage.usage.truncated ? [`usage stream cap ${coverage.usage.cap} reached; duplicate cost is unknown`] : []),
       ...(directoryResult.unavailable ? ["session directory unavailable; titles and parent relationships may be incomplete"] : []),
       "agent-to-agent communication evidence is unavailable in the facts store",
     ],
@@ -170,9 +195,27 @@ export function clickhouseCoordinationBackend(ch: ClickHouseClient, liveness: Li
     isSchemaMissing: output.isSchemaMissing,
     async readFacts(directory, p, opts = {}) {
       const cap = Math.max(1, Math.min(COORDINATION_FACTS_ROW_CAP, Math.trunc(p.rowCap ?? COORDINATION_FACTS_ROW_CAP)));
-      const params: QueryParams = { org: p.orgId, ws: p.workspaceId, since: chTime(p.since), until: chTime(p.until) };
+      const outputCap = Math.max(1, Math.min(COORDINATION_OUTPUT_ROW_CAP, Math.trunc(p.rowCap ?? COORDINATION_OUTPUT_ROW_CAP)));
+      const evidenceSince = new Date(p.since.getTime() - COORDINATION_EVIDENCE_LOOKBACK_MS);
+      const params: QueryParams = {
+        org: p.orgId, ws: p.workspaceId, since: chTime(p.since), evidenceSince: chTime(evidenceSince), until: chTime(p.until),
+      };
       const o = { params, timeoutMs: opts.timeoutMs ?? 3_000, ...(opts.settings ? { settings: opts.settings } : {}) };
-      const [eventRows, outputRows] = await Promise.all([
+      const [evidenceRows, outputRows, usageRows] = await Promise.all([
+        ch.select<CoordinationEventRow>(`SELECT toString(ts) AS ts, session_id, source, event_id, kind, project_id,
+            task_ref_id, task_title, user_id, branch, input_tokens, output_tokens, reasoning_tokens,
+            cost_usd_micros, files_touched, row_id
+          FROM ${EVENT_FACTS_TABLE} FINAL
+         WHERE org_id = {org:String} AND workspace_id = {ws:String}
+           AND ts >= toDateTime64({evidenceSince:String}, 6, 'UTC') AND ts < toDateTime64({until:String}, 6, 'UTC')
+           AND arrayExists(path -> coalesce(path, '') != '', files_touched)
+         ORDER BY row_id LIMIT ${cap + 1}`, o),
+        ch.select<CoordinationOutputRow>(`SELECT fact_kind, toString(ts) AS ts, scope_source, source, session_id, fact_key, origin, reverted, row_id
+          FROM ${OUTPUT_FACTS_TABLE} FINAL
+         WHERE org_id = {org:String} AND workspace_id = {ws:String}
+           AND ts >= toDateTime64({evidenceSince:String}, 6, 'UTC') AND ts < toDateTime64({until:String}, 6, 'UTC')
+           AND fact_kind IN ('commit', 'outcome')
+         ORDER BY row_id LIMIT ${outputCap + 1}`, o),
         ch.select<CoordinationEventRow>(`SELECT toString(ts) AS ts, session_id, source, event_id, kind, project_id,
             task_ref_id, task_title, user_id, branch, input_tokens, output_tokens, reasoning_tokens,
             cost_usd_micros, files_touched, row_id
@@ -180,23 +223,23 @@ export function clickhouseCoordinationBackend(ch: ClickHouseClient, liveness: Li
          WHERE org_id = {org:String} AND workspace_id = {ws:String}
            AND ts >= toDateTime64({since:String}, 6, 'UTC') AND ts < toDateTime64({until:String}, 6, 'UTC')
          ORDER BY row_id LIMIT ${cap + 1}`, o),
-        ch.select<CoordinationOutputRow>(`SELECT fact_kind, toString(ts) AS ts, scope_source, source, session_id, fact_key, origin, reverted, row_id
-          FROM ${OUTPUT_FACTS_TABLE} FINAL
-         WHERE org_id = {org:String} AND workspace_id = {ws:String}
-           AND ts >= toDateTime64({since:String}, 6, 'UTC') AND ts < toDateTime64({until:String}, 6, 'UTC')
-         ORDER BY row_id LIMIT ${cap + 1}`, o),
       ]);
-      const truncated = eventRows.length > cap || outputRows.length > cap;
-      const events = eventRows.slice(0, cap);
-      const outputs = outputRows.slice(0, cap);
+      const evidence = evidenceRows.slice(0, cap);
+      const outputs = outputRows.slice(0, outputCap);
+      const usage = usageRows.slice(0, cap);
       const candidates = [...new Map([
-        ...events.map((r) => [key(r.source, r.session_id), { source: r.source, sessionId: r.session_id }] as const),
+        ...evidence.map((r) => [key(r.source, r.session_id), { source: r.source, sessionId: r.session_id }] as const),
         ...outputs.map((r) => [key(r.scope_source, r.session_id), { source: r.scope_source, sessionId: r.session_id }] as const),
       ]).values()];
       const erased = new Set(await liveness.erased(p.orgId, p.workspaceId, candidates));
       return normalizeCoordinationFacts(directory, p,
-        events.filter((r) => !erased.has(keyOf({ source: r.source, sessionId: r.session_id }))),
-        outputs.filter((r) => !erased.has(keyOf({ source: r.scope_source, sessionId: r.session_id }))), truncated);
+        evidence.filter((r) => !erased.has(keyOf({ source: r.source, sessionId: r.session_id }))),
+        outputs.filter((r) => !erased.has(keyOf({ source: r.scope_source, sessionId: r.session_id }))),
+        usage.filter((r) => !erased.has(keyOf({ source: r.source, sessionId: r.session_id }))), {
+          evidence: { cap, truncated: evidenceRows.length > cap },
+          outputs: { cap: outputCap, truncated: outputRows.length > outputCap },
+          usage: { cap, truncated: usageRows.length > cap },
+        });
     },
   };
 }
