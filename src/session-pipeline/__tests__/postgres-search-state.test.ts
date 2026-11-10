@@ -102,6 +102,9 @@ test("ensureSchema grants the read API role only the projection columns its comp
     const writes = await db.query<{ w: boolean; e: boolean }>(`SELECT has_table_privilege('bulls96_read_api','search_index.projection_state','INSERT, UPDATE, DELETE, TRUNCATE') AS w,
       has_table_privilege('bulls96_read_api','search_index.transcript_events','INSERT, UPDATE, DELETE, TRUNCATE') AS e`);
     expect(writes.rows[0]).toEqual({ w: false, e: false });
+    const schemaPriv = await db.query<{ usage: boolean; create: boolean }>(
+      `SELECT has_schema_privilege('bulls96_read_api','search_index','USAGE') AS usage, has_schema_privilege('bulls96_read_api','search_index','CREATE') AS create`);
+    expect(schemaPriv.rows[0]).toEqual({ usage: true, create: false });
     // Events are readable as the read API, and only for the bound tenant (forced RLS still applies).
     // Before the fix this failed with "permission denied for table transcript_events".
     const events = await reader("org-a", "ws-a", tx => tx.query<{ content: string }>("SELECT content FROM search_index.transcript_events"));

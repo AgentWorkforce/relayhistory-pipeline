@@ -1,5 +1,7 @@
 /** Content-free portable index completeness. Explicit owner bootstrap only;
- * this helper issues no GRANT and is never initialized by a service implicitly.
+ * never initialized by a service implicitly. ensureSchema's only GRANTs are the
+ * read API role's read-only access (schema USAGE, the nine projection_state
+ * columns partials reads, and SELECT on transcript_events), issued when that role exists.
  * Readers compare the recorded metadata epoch with current pointer-derived
  * directory readiness, so a failed first pass or newer pointer cannot look
  * complete merely because an older pass once succeeded. */
