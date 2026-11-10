@@ -161,7 +161,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
       globalDailyCap: config.globalDailyCap,
     });
     if (!admission.admitted) {
-      await publish(built.sourceRevisions, {
+      const { written } = await publish(built.sourceRevisions, {
         status: "rate_limited",
         error:
           admission.reason === "capped"
@@ -170,7 +170,11 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
               ? "session_brief_global_capped"
               : "session_brief_rate_limited",
       });
-      await rescheduleWakeup(db, w, { nextUtcDay: true }, { refundAttempt: true });
+      // Canonical mode: a refusal dropped as stale (the pointers moved while the input was
+      // built) is not recorded, so no parked-wakeup recovery would match it; retry after the
+      // idle window instead of parking it until midnight. A recorded refusal parks as before.
+      await rescheduleWakeup(db, w, !written && deps.canonicalInput ? { seconds: config.idleSeconds } : { nextUtcDay: true },
+        { refundAttempt: true });
       return "rate_limited";
     }
     const transport = deps.transport;

@@ -25,15 +25,27 @@ const canonicalInput = async (_db: unknown, key: Key, pointers: Parameters<typeo
   canonicalSessionId: key.sessionId,
 });
 
+/** Seconds until the wakeup is due. */
+const dueIn = async (pg: PGlite, key: Key) => (await pg.query<{ left: number }>(
+  "SELECT extract(epoch FROM due_at - now())::float AS left FROM sessions.session_brief_wakeups WHERE workspace_id = $1 AND session_id = $2",
+  [key.workspaceId, key.sessionId])).rows[0]!.left;
+
 async function setup(keys: Key[] = [KEY]) {
   const pg = await database(); open.push(pg);
   const db = hoopDb(pg), model = new FakeModel();
   for (const key of keys) await pointer(pg, { key });
   let clock = Date.now();
+  /** Runs once inside the next claim's input build (after livePointers, before the refusal is saved). */
+  let duringInput: (() => Promise<unknown>) | undefined;
+  const input: typeof canonicalInput = async (db, key, pointers) => {
+    const hook = duringInput;duringInput = undefined;
+    if (hook) await hook();
+    return canonicalInput(db, key, pointers);
+  };
   /** One worker (one briefTick instance per config); each call is a minute later, so housekeeping runs every call. */
   const worker = (o: Partial<BriefConfig> = {}, canonical = true) => {
     const tick = briefTick({ reader: {} as never, store: {} as never, transport: model,
-      ...(canonical ? { canonicalInput } : {}),
+      ...(canonical ? { canonicalInput: input } : {}),
       config: testConfig({ sweepSeconds: 1, throttleSeconds: 0, idleSeconds: 0, sessionDailyCap: 3,
         workspaceIds: [...new Set(keys.map((k) => k.workspaceId))], ...o }) });
     return () => tick(db, new Date((clock += MINUTE)));
@@ -60,7 +72,9 @@ async function setup(keys: Key[] = [KEY]) {
       expect(await brief(key)).toMatchObject({ status: "rate_limited", error: "session_brief_capped" });
     }
   };
-  return { pg, db, model, worker, spent, wakeup, brief, attempts, park };
+  const left = (key: Key = KEY) => dueIn(pg, key);
+  return { pg, db, model, worker, spent, wakeup, brief, attempts, park, left,
+    during: (hook: () => Promise<unknown>) => { duringInput = hook; } };
 }
 
 test("baseline: a capped canonical session is parked until the next UTC midnight and stays parked", async () => {
@@ -213,4 +227,62 @@ test("canonical off: none of the recoveries runs (legacy behaviour unchanged)", 
   expect(await legacy()).toEqual({});
   expect(await s.wakeup()).toBeUndefined();expect(await legacy()).toEqual({});
   expect(await s.wakeup()).toBeUndefined();expect((await s.brief())!.status).toBe("rate_limited");
+});
+
+test("M1: a refusal dropped as stale after an F1 re-arm retries after the idle window, not at midnight", async () => {
+  const s = await setup();
+  await s.park();
+  await pointer(s.pg, { revision: 2 });
+  const tick = s.worker({ idleSeconds: 1 });
+  // F1 re-arms with the 1 s debounce; nothing is due yet.
+  expect(await tick()).toEqual({});expect(await s.left()).toBeLessThanOrEqual(1);
+  await Bun.sleep(1100);
+  // The claim reads revision 2; revision 3 lands while the input is built, so the refusal is stale.
+  s.during(() => pointer(s.pg, { revision: 3 }));
+  expect(await tick()).toEqual({ rate_limited: 1 });
+  expect((await s.brief())!.source_revisions).toEqual({ "m-1": 1 });
+  const retry = await s.wakeup();
+  expect(retry).toMatchObject({ midnight: false, attempts: 0, lease_id: null });
+  expect(await s.left()).toBeLessThanOrEqual(1);
+  await Bun.sleep(1100);
+  // Claimed again with revision 3: the refusal is recorded and parks to midnight; no repeat.
+  expect(await tick()).toEqual({ rate_limited: 1 });
+  expect((await s.brief())!.source_revisions).toEqual({ "m-1": 3 });
+  expect((await s.wakeup())!.midnight).toBe(true);
+  expect(await tick()).toEqual({});expect(s.model.requests).toHaveLength(0);expect(await s.attempts()).toBe(3);
+});
+
+test("L1: F3 never overrides the retry backoff of an admitted call that failed", async () => {
+  const s = await setup();
+  await s.park();
+  s.model.next.push(new Error("synthetic transient model failure"));
+  const tick = s.worker({ sessionDailyCap: 10 });
+  expect(await tick()).toEqual({ retrying: 1 });
+  expect(s.model.requests).toHaveLength(1);expect(await s.attempts()).toBe(4);
+  const backoff = await s.wakeup();
+  expect(backoff).toMatchObject({ midnight: false, last_error: "brief_processing_failed" });
+  expect(await s.left()).toBeGreaterThan(30);
+  for (let i = 0; i < 4; i++) expect(await tick()).toEqual({});
+  expect(await s.wakeup()).toEqual(backoff);expect(s.model.requests).toHaveLength(1);expect(await s.attempts()).toBe(4);
+});
+
+test("F3 waits out the throttle before reconsidering a refusal", async () => {
+  const s = await setup();
+  await s.park();
+  const parked = await s.wakeup();
+  const tick = s.worker({ sessionDailyCap: 5, throttleSeconds: 3 });
+  expect(await tick()).toEqual({});expect(await s.wakeup()).toEqual(parked);expect(s.model.requests).toHaveLength(0);
+  await Bun.sleep(3100);
+  expect(await tick()).toEqual({ generated: 1 });expect(s.model.requests).toHaveLength(1);
+});
+
+test("F3 follows the org budget: no session is made due while the org's distinct-session pool is full", async () => {
+  const s = await setup([KEY, K2]);
+  await s.park();
+  const parked = [await s.wakeup(KEY), await s.wakeup(K2)];
+  // Each session's "others" is 1 (the other one): a budget of 1 still refuses both.
+  const full = s.worker({ sessionDailyCap: 5, backgroundDailyBudget: 1 });
+  expect(await full()).toEqual({});expect(await full()).toEqual({});
+  expect([await s.wakeup(KEY), await s.wakeup(K2)]).toEqual(parked);expect(s.model.requests).toHaveLength(0);
+  expect(await s.worker({ sessionDailyCap: 5, backgroundDailyBudget: 2 })()).toEqual({ generated: 2 });
 });

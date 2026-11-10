@@ -145,6 +145,9 @@ export async function finishWakeup(
   );
 }
 
+/** The next UTC midnight: where a rate_limited refusal parks its wakeup (and how a parked one is recognised). */
+const NEXT_UTC_MIDNIGHT = `(date_trunc('day', now() AT TIME ZONE 'UTC') + interval '1 day') AT TIME ZONE 'UTC'`;
+
 /** Put a claimed wakeup back, due later (a retry backoff, a throttle or a budget reset). */
 export async function rescheduleWakeup(
   db: SqlExecutor,
@@ -155,7 +158,7 @@ export async function rescheduleWakeup(
   // $5 lease, $6 generation, $7 seconds (ignored for nextUtcDay), $8 error, $9 refund.
   const dueSql =
     "nextUtcDay" in due
-      ? `(date_trunc('day', now() AT TIME ZONE 'UTC') + interval '1 day') AT TIME ZONE 'UTC'`
+      ? NEXT_UTC_MIDNIGHT
       : `now() + make_interval(secs => $7::integer)`;
   await db.query(
     `UPDATE sessions.session_brief_wakeups AS w
@@ -638,12 +641,14 @@ const LIVE_WAKEUP = `EXISTS (SELECT 1 FROM sessions.session_directory AS d
 
 /**
  * A wakeup parked by a rate_limited refusal: not leased (an expired lease counts as
- * free, as for claims and pruning), due later, and its session's brief is the
- * rate_limited outcome of this wakeup's current evidence (recorded at or after
- * evidence_at). The last clause keeps a refusal that could not be recorded (a stale
- * input) from being re-armed again on every tick.
+ * free, as for claims and pruning), due exactly at the next UTC midnight (the
+ * rescheduleWakeup nextUtcDay expression, so a retry backoff or throttle delay never
+ * matches), and its session's brief is the rate_limited outcome of this wakeup's current
+ * evidence (recorded at or after evidence_at). The last clause keeps a refusal that could
+ * not be recorded (a stale input) from being re-armed again on every tick.
  */
 const parkedRateLimited = (condition: string) => `(w.lease_expires_at IS NULL OR w.lease_expires_at < now())
+        AND w.due_at = ${NEXT_UTC_MIDNIGHT}
         AND ($2::text[] IS NULL OR w.workspace_id = ANY($2::text[]))
         AND ${LIVE_WAKEUP}
         AND EXISTS (SELECT 1 FROM sessions.session_briefs AS b
