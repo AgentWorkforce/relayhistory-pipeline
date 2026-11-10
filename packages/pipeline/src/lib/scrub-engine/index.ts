@@ -5,6 +5,9 @@
  *
  * - `SCRUB_ENGINE` unset, "" or "ts": the TypeScript engine, byte-identical to
  *   calling scrub.ts / raw-chunks.ts directly (this is today's behaviour).
+ * - `SCRUB_ENGINE=wasm-bindgen`: the pinned relayscrubber wasm-bindgen package
+ *   (bindgen-engine.ts, scrub-bindgen-pin.json), with the same fail-closed rules.
+ *   This is the first-cutover path; the raw ABI v1 `wasm` path stays in place.
  * - `SCRUB_ENGINE=wasm`: the pinned relayscrubber artifact only. Until
  *   `initScrubEngine` has succeeded, and for good after the instance traps,
  *   every scrub call throws `ScrubEngineUnavailable`. There is no fallback to
@@ -17,6 +20,14 @@
 import { sealRawChunk as sealRawChunkTs, type SealRawChunk, type SealedChunk } from "../pipeline/raw-chunks.js";
 import type { ObjectStore } from "../pipeline/object-layout.js";
 import pinJson from "../../../scrub-wasm-pin.json";
+import bindgenPinJson from "../../../scrub-bindgen-pin.json";
+import {
+  bindgenFileReader,
+  initBindgenScrubEngine,
+  resetBindgenScrubEngineForTests,
+  type ImportBindgenGlue,
+  type ReadBindgenArtifact,
+} from "./bindgen-engine.js";
 import {
   ScrubEngineConfigError,
   ScrubEngineUnavailable,
@@ -44,6 +55,19 @@ export {
   type ScrubRecordsResult,
 } from "./engine.js";
 export {
+  BINDGEN_MANIFEST_FIELDS,
+  BINDGEN_MANIFEST_SCHEMA,
+  bindgenProfile,
+  createCompiledBindgenEngine,
+  parseScrubBindgenPin,
+  type BindgenManifest,
+  type BindgenScrubEngine,
+  type CompiledBindgenOptions,
+  type ImportBindgenGlue,
+  type ReadBindgenArtifact,
+  type ScrubBindgenPin,
+} from "./bindgen-engine.js";
+export {
   WasmScrubEngine,
   createWasmScrubEngine,
   parseScrubWasmPin,
@@ -53,10 +77,12 @@ export {
   type ScrubWasmPin,
 } from "./wasm-engine.js";
 
-export type ScrubEngineKind = "ts" | "wasm";
+export type ScrubEngineKind = "ts" | "wasm" | "wasm-bindgen";
 
 /** The pin checked in at packages/pipeline/scrub-wasm-pin.json. */
 export const SCRUB_WASM_PIN: unknown = pinJson;
+/** The pin checked in at packages/pipeline/scrub-bindgen-pin.json. */
+export const SCRUB_BINDGEN_PIN: unknown = bindgenPinJson;
 
 /** Where the self-host image / Node runtime expects the pinned artifact. */
 export const SCRUB_WASM_PATH = "../../../scrub-wasm/relayscrubber.wasm";
@@ -65,6 +91,8 @@ export const SCRUB_WASM_PATH = "../../../scrub-wasm/relayscrubber.wasm";
 
 interface ScrubEngineEnv {
   SCRUB_ENGINE?: string | undefined;
+  /** wasm-bindgen only: absolute directory of the installed package (default: next to the pipeline package). */
+  SCRUB_BINDGEN_DIR?: string | undefined;
 }
 
 let selected: ScrubEngineKind | undefined;
@@ -76,7 +104,8 @@ let pending: Promise<ScrubEngine> | undefined;
 export function parseScrubEngineKind(value: string | undefined): ScrubEngineKind {
   if (value === undefined || value === "" || value === "ts") return "ts";
   if (value === "wasm") return "wasm";
-  throw new ScrubEngineConfigError(`SCRUB_ENGINE must be unset, "ts" or "wasm"`);
+  if (value === "wasm-bindgen") return "wasm-bindgen";
+  throw new ScrubEngineConfigError(`SCRUB_ENGINE must be unset, "ts", "wasm" or "wasm-bindgen"`);
 }
 
 /**
@@ -109,6 +138,13 @@ export interface InitScrubEngineOptions {
   /** Tests only: a pin other than the checked-in one. */
   pin?: unknown;
   instantiate?: InstantiateScrubWasm;
+  /** SCRUB_ENGINE=wasm-bindgen only. The raw-ABI options above are never consulted for it. */
+  bindgen?: {
+    /** Tests only: a pin other than the checked-in one. */
+    pin?: unknown;
+    readArtifact?: ReadBindgenArtifact;
+    importGlue?: ImportBindgenGlue;
+  };
 }
 
 function processEnv(): ScrubEngineEnv | undefined {
@@ -122,8 +158,10 @@ function processEnv(): ScrubEngineEnv | undefined {
  * throws until a later init succeeds. With "ts" this does no I/O.
  */
 export async function initScrubEngine(options: InitScrubEngineOptions = {}): Promise<ScrubEngine> {
-  const kind = selectScrubEngine(options.env ?? processEnv());
+  const env = options.env ?? processEnv();
+  const kind = selectScrubEngine(env);
   if (kind === "ts") return tsScrubEngine;
+  if (kind === "wasm-bindgen") return initBindgen(env, options.bindgen ?? {});
   if (active) return active;
   pending ??= (async () => {
     try {
@@ -143,6 +181,30 @@ export async function initScrubEngine(options: InitScrubEngineOptions = {}): Pro
     }
   })();
   return pending;
+}
+
+/**
+ * wasm-bindgen: bindgen-engine.ts owns coalescing and double-init refusal (same pin:
+ * one shared initialisation; other pin or other bytes: bindgen_init_conflict), so
+ * every call goes through it. A conflicting later call does not disturb a verified engine.
+ */
+async function initBindgen(env: ScrubEngineEnv | undefined, o: NonNullable<InitScrubEngineOptions["bindgen"]>): Promise<ScrubEngine> {
+  try {
+    const engine = await initBindgenScrubEngine({
+      pin: "pin" in o ? o.pin : SCRUB_BINDGEN_PIN,
+      readArtifact: o.readArtifact ?? bindgenFileReader(env?.SCRUB_BINDGEN_DIR),
+      importGlue: o.importGlue,
+    });
+    active = engine;
+    // A repeat init after the instance trapped reports the trap instead of resolving.
+    if (engine.failed) throw new ScrubEngineUnavailable("engine_failed");
+    lastFailure = undefined;
+    return engine;
+  } catch (error) {
+    const unavailable = error instanceof ScrubEngineUnavailable ? error : new ScrubEngineUnavailable("bindgen_init_failed");
+    if (!active) lastFailure = unavailable.reason;
+    throw unavailable;
+  }
 }
 
 /**
@@ -175,6 +237,7 @@ export function resetScrubEngineForTests(): void {
   active = undefined;
   lastFailure = undefined;
   pending = undefined;
+  resetBindgenScrubEngineForTests();
 }
 
 export const scrubText = (value: string): string => activeScrubEngine().scrubText(value);

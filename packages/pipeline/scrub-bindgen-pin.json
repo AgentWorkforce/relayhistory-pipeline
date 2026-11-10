@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "package": "@agentworkforce/relayscrubber",
+  "package_version": "UNPINNED",
+  "wasm_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "glue_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "loader_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "paths": {
+    "wasm": "generated/relayscrubber_bg.wasm",
+    "glue": "generated/relayscrubber.js",
+    "loader": "index.js"
+  },
+  "scrub_profile": "UNPINNED",
+  "manifest": {
+    "schema": 2,
+    "ruleset": "UNPINNED",
+    "rulesetVersion": 0,
+    "rulesetSourceSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "crateVersion": "UNPINNED",
+    "abiVersion": 0,
+    "policy": "UNPINNED",
+    "redactionToken": "UNPINNED"
+  },
+  "placeholder": "PLACEHOLDER: no relayscrubber wasm-bindgen package has a security PASS yet. The bindgen loader refuses this pin (all-zero digests, UNPINNED strings, zero versions) until the cutover PR replaces every value with the reviewed package's. docs/scrub-engine.md, wasm-bindgen path"
+}

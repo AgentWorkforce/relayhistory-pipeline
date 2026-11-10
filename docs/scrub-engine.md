@@ -15,8 +15,10 @@ Code: `packages/pipeline/src/lib/scrub-engine/`
 | `index.ts` | `selectScrubEngine`, `initScrubEngine`, `activeScrubEngine`, the sync call-site accessors |
 | `predicate-hook.ts` | Late-bound `scrubText` for `trace.ts` `isSafeIdentifier` (import-cycle break, see below) |
 | `packages/pipeline/scrub-wasm-pin.json` | The pin |
+| `bindgen-engine.ts` | `SCRUB_ENGINE=wasm-bindgen`: pin parsing, verified glue import, manifest check, `createCompiledBindgenEngine` (see "wasm-bindgen path") |
+| `packages/pipeline/scrub-bindgen-pin.json` | The wasm-bindgen pin (placeholder) |
 
-Test: `packages/pipeline/test/scrub-engine-parity.test.ts`.
+Tests: `packages/pipeline/test/scrub-engine-parity.test.ts`, `packages/pipeline/test/scrub-engine-bindgen.test.ts`.
 
 ## Selection
 
@@ -25,7 +27,8 @@ Test: `packages/pipeline/test/scrub-engine-parity.test.ts`.
 | Value | Engine |
 |---|---|
 | unset, `""` or `ts` | TypeScript, byte-identical to main. No I/O, nothing to initialise. |
-| `wasm` | The pinned relayscrubber artifact only. |
+| `wasm` | The pinned relayscrubber artifact only (raw ABI v1). |
+| `wasm-bindgen` | The pinned `@agentworkforce/relayscrubber` wasm-bindgen package only. See "wasm-bindgen path". |
 | anything else | `ScrubEngineConfigError` (`scrub_engine_invalid`): startup fails. |
 
 The selection is made once. A second, conflicting selection in the same process throws.
@@ -193,6 +196,85 @@ metadata `scrub-ruleset` / `scrub-version`, manifests and summary `scrub_version
 - The Lambda handlers (read API, pipeline, bob-costas) do not call `initScrubEngine`. Under `ts`
   they resolve lazily, as before. Under `wasm` they would refuse with `not_initialised`, which is
   fail-closed. They are hosted-only and out of scope for the self-host cutover.
+
+## wasm-bindgen path (`SCRUB_ENGINE=wasm-bindgen`, default off, nothing bound)
+
+A third engine for the relayscrubber package as published by wasm-bindgen: generated
+`relayscrubber_bg.wasm`, the generated JS glue `relayscrubber.js`, and the package
+loader `index.js`. It is independent of the raw ABI v1 path. `wasm` and `wasm-bindgen`
+are mutually exclusive in one process (a conflicting selection throws), and a bindgen
+init never consults the raw-ABI loader. Raw ABI v1 stays in the tree, but the first
+cutover is not planned to use it.
+
+**Nothing is bound.** `packages/pipeline/scrub-bindgen-pin.json` is a placeholder: no
+package version, no digests, no manifest values. Selecting `wasm-bindgen` today makes
+`initScrubEngine` throw `ScrubEngineUnavailable(bindgen_unpinned_package_version)`, and
+every call site then refuses as described in "Fail-closed rules".
+
+### The pin
+
+| Field | Meaning |
+|---|---|
+| `schema` / `package` | `1` / `@agentworkforce/relayscrubber`, else `bindgen_pin_invalid` |
+| `package_version` | The exact published version |
+| `wasm_sha256`, `glue_sha256`, `loader_sha256` | Lowercase hex sha256 of each file |
+| `paths` | Package-relative paths of the three files (no absolute paths, no `..`) |
+| `scrub_profile` | Must equal `relayscrubber/<ruleset>/<rulesetVersion>/<policy>/<rulesetSourceSha256>` derived from `manifest` |
+| `manifest` | The full schema-2 `manifestJson()` the instance must report: `schema`, `ruleset`, `rulesetVersion`, `rulesetSourceSha256`, `crateVersion`, `abiVersion`, `policy` (`secrets`/`pii`), `redactionToken` |
+
+Every placeholder value (`UNPINNED`, empty, the all-zero digest, `0` versions) is refused
+with its own reason: `bindgen_unpinned_package_version`, `bindgen_unpinned_<wasm|glue|loader>_sha256`,
+`bindgen_unpinned_scrub_profile`, `bindgen_unpinned_manifest_<field>`. A manifest
+`rulesetVersion` below the TypeScript ruleset (8) is `bindgen_ruleset_below_floor`. Only
+`manifest.schema == 2` is fixed in code; the expected `abiVersion` and `rulesetVersion`
+come from the pin.
+
+### Load sequence (Node / Bun, `initScrubEngine`)
+
+1. Parse the pin. Nothing is read if it is refused.
+2. Read the wasm, glue and loader bytes (base: absolute `SCRUB_BINDGEN_DIR`, else
+   `packages/pipeline/scrub-bindgen/`), copy each into a private snapshot, and hash the
+   snapshot. Any mismatch is `bindgen_sha256_mismatch_<name>`; a missing or empty file is
+   `bindgen_artifact_missing_<name>`.
+3. Import the glue **from the verified snapshot** as a `data:text/javascript;base64` URL.
+   The glue file is never imported by path, so it cannot change between hash and
+   evaluation. The glue resolves nothing relative to itself (a relative import fails closed).
+4. The loader is hashed but not evaluated. Its relative import of the glue would either
+   fail from a `data:` URL or re-read the glue from disk after hashing.
+5. `await init({ module_or_path: <verified wasm snapshot> })`. It always gets bytes, never a
+   path or URL: there is no network fetch and no fallback of any kind.
+6. Compare `manifestJson()` with the pinned manifest, one field at a time
+   (`bindgen_manifest_mismatch_<field>`). A field missing from either side is
+   `bindgen_manifest_mismatch_extra_field`.
+
+Concurrent `initScrubEngine` calls share one initialisation (the promise is stored
+synchronously, before the first await). A failure is sticky. A later init with a different
+pin, or with the same pin but different bytes, throws `bindgen_init_conflict`. The glue
+module stays private to the engine closure.
+
+### Scrub behaviour
+
+- `scrubJson` sends `JSON.stringify(value)` and returns `JSON.parse(jsonText)` from the
+  glue's envelope. It never uses the envelope's `value` view. `undefined` is returned
+  without an engine call, because it has no JSON text.
+- A thrown glue error discards the input. A deliberate error (an `Error` or a code string)
+  refuses that call (`engine_refused`). A trap (`WebAssembly.RuntimeError`, `RangeError`)
+  poisons the instance (`engine_failed`). Malformed glue results are `engine_refused`.
+- `scrubRecords` keeps the TypeScript `chunk_not_utf8` refusal when the engine refuses
+  non-UTF-8 input. Lone surrogates are refused before the engine call
+  (`scrub_input_not_well_formed`).
+- The marker is `{ruleset, version, profile}` from the verified manifest (see "Persisted
+  marker rule"). `sealRawChunk` is still refused (`seal_path_not_routed`).
+
+### Workers (`createCompiledBindgenEngine`, not wired)
+
+Workers cannot compile bytes, so `createCompiledBindgenEngine({glue, module, pin})` takes the
+statically imported glue and a `CompiledWasm` `WebAssembly.Module`, calls
+`initSync({ module })`, and checks the manifest in the same way. It cannot hash the module, so
+the Worker build must guarantee that the bundled files are the pinned ones. It refuses with
+`bindgen_path_conflict` once the Node loader path has started (and vice versa). No Worker
+entrypoint calls it yet. With `SCRUB_ENGINE=wasm-bindgen` the hosted Worker's
+`initScrubEngine` refuses, so the Worker answers `503 not_configured` as it does for `wasm`.
 
 ## Import cycle (why `predicate-hook.ts`)
 
