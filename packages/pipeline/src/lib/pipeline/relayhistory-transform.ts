@@ -47,7 +47,7 @@ import type {
 } from "./stages.js";
 
 /** Bump with any change to the bytes projected from the same input: the object is create-only. */
-export const RELAYHISTORY_NORMALIZED_VERSION = 2;
+export const RELAYHISTORY_NORMALIZED_VERSION = 3;
 export const RELAYHISTORY_EXPORT_EXTENSION = "client.relayhistory_export";
 const MAX_RELAYHISTORY_CHUNK_BYTES = 16 * 1024 * 1024;
 /** Everything is held in memory to fold it, so a session past this is refused. */
