@@ -7,19 +7,21 @@ import {
   createCompiledBindgenEngine,
   resetBindgenScrubEngineForTests,
 } from "../src/lib/scrub-engine/bindgen-engine.js";
+import { ScrubberError } from "../src/lib/scrub-engine/scrubber-error.js";
 import { MAX_RECORD_BYTES, MAX_STREAM_BYTES, MAX_TEXT_BYTES } from "../src/lib/scrub-engine/bindgen-admission.js";
 
 const encoder = new TextEncoder();
 const ModuleCtor = WebAssembly.Module as unknown as new (bytes: Uint8Array) => WebAssembly.Module;
 const manifest = {
-  schema: 2,
+  schema: 3,
   ruleset: "relayhistory-scrub",
   rulesetVersion: 10,
   rulesetSourceSha256: "1".repeat(64),
   crateVersion: "0.0.0-test-double",
-  abiVersion: 1,
+  abiVersion: 2,
   policy: "secrets",
   redactionToken: "[REDACTED]",
+  scrubProfile: "relayhistory-secrets-v10",
 };
 const pin = {
   schema: 1,
@@ -69,7 +71,8 @@ function expectAdmissionRefusal(call: () => unknown, calls: string[], code = "sc
   let error: unknown;
   try { call(); returned = true; } catch (e) { error = e; }
   expect(returned).toBe(false);
-  expect(error).toMatchObject({ code, retryable: false });
+  expect(error).toBeInstanceOf(ScrubberError);
+  expect(error).toMatchObject({ code, disposition: "call_refusal", retryable: false });
   expect(String(error)).not.toContain("SYNTH_PRIVATE");
   expect(calls).toEqual([]);
 }

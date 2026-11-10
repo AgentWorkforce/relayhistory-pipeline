@@ -219,15 +219,16 @@ every call site then refuses as described in "Fail-closed rules".
 | `package_version` | The exact published version |
 | `wasm_sha256`, `glue_sha256`, `loader_sha256` | Lowercase hex sha256 of each file |
 | `paths` | Package-relative paths of the three files (no absolute paths, no `..`) |
-| `scrub_profile` | Must equal `relayscrubber/<ruleset>/<rulesetVersion>/<policy>/<rulesetSourceSha256>` derived from `manifest` |
-| `manifest` | The full schema-2 `manifestJson()` the instance must report: `schema`, `ruleset`, `rulesetVersion`, `rulesetSourceSha256`, `crateVersion`, `abiVersion`, `policy` (`secrets`/`pii`), `redactionToken` |
+| `scrub_profile` | Must equal the crate-owned `manifest.scrubProfile` string verbatim |
+| `manifest` | The full schema-3 `manifestJson()` the instance must report: `schema`, `ruleset`, `rulesetVersion`, `rulesetSourceSha256`, `crateVersion`, `abiVersion`, `policy` (`secrets`/`pii`), `redactionToken`, `scrubProfile` |
 
 Every placeholder value (`UNPINNED`, empty, the all-zero digest, `0` versions) is refused
 with its own reason: `bindgen_unpinned_package_version`, `bindgen_unpinned_<wasm|glue|loader>_sha256`,
 `bindgen_unpinned_scrub_profile`, `bindgen_unpinned_manifest_<field>`. A manifest
 `rulesetVersion` below the TypeScript ruleset (8) is `bindgen_ruleset_below_floor`. Only
-`manifest.schema == 2` is fixed in code; the expected `abiVersion` and `rulesetVersion`
-come from the pin.
+`manifest.schema == 3` and `manifest.abiVersion == 2` are fixed in code. The
+expected fields, including `scrubProfile`, must all match the pin verbatim. The
+writer version must also fit the supported floor and independent reader ceiling.
 
 ### Load sequence (Node / Bun, `initScrubEngine`)
 
@@ -256,10 +257,12 @@ module stays private to the engine closure.
 
 - `scrubJson` sends `JSON.stringify(value)` and returns `JSON.parse(jsonText)` from the
   glue's envelope. It never uses the envelope's `value` view. `undefined` is returned
-  without an engine call, because it has no JSON text.
-- A thrown glue error discards the input. A deliberate error (an `Error` or a code string)
-  refuses that call (`engine_refused`). A trap (`WebAssembly.RuntimeError`, `RangeError`)
-  poisons the instance (`engine_failed`). Malformed glue results are `engine_refused`.
+  without an engine call, because it has no JSON text; an already poisoned instance
+  still refuses it.
+- A thrown glue error discards the input. Only a recognized tagged call refusal
+  preserves the instance. Every unknown throw, trap, runtime/OOM error or malformed
+  result poisons it; see the candidate contract below. JS error classes alone never
+  establish that a refusal was deliberate.
 - `scrubRecords` refuses invalid UTF-8 before any glue call (`chunk_not_utf8`).
   Lone surrogates are refused before the engine call
   (`scrub_input_not_well_formed`).
@@ -281,8 +284,8 @@ entrypoint calls it yet. With `SCRUB_ENGINE=wasm-bindgen` the hosted Worker's
 Merging this PR is a default-off, unpinned scaffold only. It is NOT a security PASS, artifact pin, cutover, image, marker or adoption clearance. The successor that binds a real package must satisfy all of these first:
 
 1. **Reader-first.** A v10 writer may not start until every relevant reader accepts ruleset <= 10. Add a separate explicit `READER_MAX_RULESET=10`; pin parsing must refuse a manifest rulesetVersion above it and below the supported floor. Roll the reader ceiling out first with wasm-bindgen still off, then the v10 writer/pin. Do not overload the TS `SCRUB_RULESET_VERSION` as the reader ceiling. (Reader policy source implemented in #489; fleet rollout and relayscrubber-lead acceptance remain pending.)
-2. **Profile is crate-owned.** The schema-2 manifest must report a canonical profile field/string; the pipeline pins and compares it verbatim. The format derived in this PR (`relayscrubber/<ruleset>/<ver>/<policy>/<sourceSha>`) is a placeholder and must be replaced by the crate's value before any pin.
-3. **Stable tagged glue errors.** relayscrubber must expose stable error tags. Recognised domain/admission errors refuse one call; `WebAssembly.RuntimeError`, `RangeError`/OOM, or ANY unrecognised throw poisons the instance. The current Error-vs-trap heuristic is removed before pin.
+2. **Profile is crate-owned.** The schema-2 manifest must report a canonical profile field/string; the pipeline pins and compares it verbatim. The format derived in this PR (`relayscrubber/<ruleset>/<ver>/<policy>/<sourceSha>`) is a placeholder and must be replaced by the crate's value before any pin. (Candidate schema-3 crate-owned profile comparison implemented in #489; exact-package acceptance remains pending.)
+3. **Stable tagged glue errors.** relayscrubber must expose stable error tags. Recognised domain/admission errors refuse one call; `WebAssembly.RuntimeError`, `RangeError`/OOM, or ANY unrecognised throw poisons the instance. The current Error-vs-trap heuristic is removed before pin. (Explicit refusal-tag recognition and sticky unknown-error poisoning implemented in #489; package/transport acceptance remains pending.)
 4. **Loader policy in the adapter.** Hashing `index.js` without executing it is package provenance only, never runtime security. The adapter may import the verified generated glue directly but must implement the reviewed loader policy itself, including the 16 MiB UTF-8 preflight before the bindgen copy. The registry package/archive checksum goes into the build receipt; component digests remain the runtime pins. (Adapter-side preflight implemented in #489, pending relayscrubber-lead acceptance; qualified package/provenance requirements remain open.)
 5. **Workers.** CI/build must hash the exact wasm and glue source files against the pin before bundling, prove through the bundler metafile/module manifest that the CompiledWasm input is that exact path, and retain a durable bundle receipt mapping wasmSha/glueSha/sourceSha to the deployment bundle digest. Startup still verifies the instance manifest/profile. Mutated-wasm and swapped-module build tests must fail.
 
@@ -298,7 +301,37 @@ Adapter tests with inert glue doubles do not qualify a Rust/WASM package.
 - NDJSON is limited to 16 MiB per physical LF-delimited record and 64 MiB per stream. LF is excluded from the record size but included in the stream size; CR and whitespace count toward the record size, matching Rust's check before blank-line handling.
 - Shared record buffers are refused, including foreign-realm SharedArrayBuffers. Ordinary record buffers are copied into a private Uint8Array, so Buffer views cannot retain a mutable alias. UTF-8 is validated in bounded chunks; the original bytes are passed to Rust without decoding/re-encoding or JSON parsing.
 
-Invalid-input errors are content-free, nonretryable `PipelineError`s: `scrub_input_too_large`, `scrub_input_not_well_formed`, `scrub_input_shared_buffer`, or the existing `chunk_not_utf8`. A local copy/decoder allocation failure instead returns retryable `scrub_admission_unavailable`, so resource pressure does not classify valid data as permanently malformed. These errors return no partial output and do not call or poison the engine. The checked-in pin remains UNPINNED; this admission layer changes neither recognition rules nor any reader ceiling or scrub marker.
+Invalid-input errors are content-free, nonretryable `ScrubberError`s (a `PipelineError` subclass) with `disposition: "call_refusal"`: `scrub_input_too_large`, `scrub_input_not_well_formed`, `scrub_input_shared_buffer`, or the existing `chunk_not_utf8`. A local copy/decoder allocation failure instead returns retryable `scrub_admission_unavailable`, so resource pressure does not classify valid data as permanently malformed. These errors return no partial output and do not call or poison the engine. The checked-in pin remains UNPINNED; this admission layer changes neither recognition rules nor any reader ceiling or scrub marker.
+
+### Candidate crate contract (not artifact clearance)
+
+The candidate manifest reports schema `3`, ABI `2`, and a crate-owned
+`scrubProfile` such as `relayhistory-secrets-v10`. The adapter compares all nine
+required fields verbatim with the pin and takes its marker profile from the
+verified instance. It does not derive a substitute profile from the source hash.
+The historical ruling above is preserved; this candidate schema supersedes its
+schema-2 placeholder shape, pending security-owner acceptance.
+
+A recognized Rust/WASM refusal is a primitive JSON string with exactly `code` and
+`disposition: "call_refusal"`, plus an optional positive, one-based safe-integer
+`record`. Supported codes are `text_too_large`, `record_too_large`,
+`stream_too_large`, `json_too_deep`, `invalid_json`, `invalid_utf8`, and
+`serialization_error`. It becomes a content-free, nonretryable `ScrubberError`
+with those stable fields. It returns no output, and the next independent call may
+proceed. Extra fields, unknown codes/dispositions, invalid record numbers, wrapped
+Error messages and unrecognized thrown shapes are not trusted refusal tags.
+
+An unknown exception or malformed result produces `ScrubberError` with
+`code: "scrubber_engine_failure"` and `disposition: "instance_poison"`. Every
+later scrub call, including JSON `undefined`, and repeat initialization returns
+`scrubber_instance_poisoned` without entering the glue again. Foreign exception
+text never reaches the error message. Local preflight refusals remain separate
+from glue failures and do not poison an untouched instance; local admission
+allocation failures retain their retryable classification.
+
+These guards use inert glue tests on both loader paths. No source/WASM/package
+pin is qualified, no runtime is enabled, and the sealed-write routing and Worker
+bundle qualification requirements remain open.
 
 ## Import cycle (why `predicate-hook.ts`)
 

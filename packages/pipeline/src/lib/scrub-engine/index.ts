@@ -10,13 +10,15 @@
  *   This is the first-cutover path; the raw ABI v1 `wasm` path stays in place.
  * - `SCRUB_ENGINE=wasm`: the pinned relayscrubber artifact only. Until
  *   `initScrubEngine` has succeeded, and for good after the instance traps,
- *   every scrub call throws `ScrubEngineUnavailable`. There is no fallback to
+ *   every scrub call throws a typed, content-free error. There is no fallback to
  *   the TypeScript engine and no raw passthrough.
  * - Anything else: `ScrubEngineConfigError` at selection (startup fails).
  *
  * The selection is read once per process (isolate); a later, different
  * selection throws rather than switching engines.
  */
+import { ScrubberError } from "./scrubber-error.js";
+export { ScrubberError, SCRUBBER_CALL_REFUSAL_CODES, type ScrubberDisposition, type ScrubberErrorCode } from "./scrubber-error.js";
 import { readerMaxRuleset } from "./reader-policy.js";
 import { sealRawChunk as sealRawChunkTs, type SealRawChunk, type SealedChunk } from "../pipeline/raw-chunks.js";
 import type { ObjectStore } from "../pipeline/object-layout.js";
@@ -200,12 +202,12 @@ async function initBindgen(env: ScrubEngineEnv | undefined, o: NonNullable<InitS
       importGlue: o.importGlue,
     });
     active = engine;
-    // A repeat init after the instance trapped reports the trap instead of resolving.
-    if (engine.failed) throw new ScrubEngineUnavailable("engine_failed");
+    // A repeat init after an unknown failure refuses instead of resolving.
+    if (engine.failed) throw new ScrubberError("scrubber_instance_poisoned", "instance_poison");
     lastFailure = undefined;
     return engine;
   } catch (error) {
-    const unavailable = error instanceof ScrubEngineUnavailable ? error : new ScrubEngineUnavailable("bindgen_init_failed");
+    const unavailable = error instanceof ScrubEngineUnavailable || error instanceof ScrubberError ? error : new ScrubEngineUnavailable("bindgen_init_failed");
     if (!active) lastFailure = unavailable.reason;
     throw unavailable;
   }
@@ -221,7 +223,10 @@ export function activeScrubEngine(): ScrubEngine {
   if (selected === "ts") return tsScrubEngine;
   const engine = active as (ScrubEngine & { failed?: boolean }) | undefined;
   if (!engine) throw new ScrubEngineUnavailable(lastFailure ?? "not_initialised");
-  if (engine.failed) throw new ScrubEngineUnavailable("engine_failed");
+  if (engine.failed) {
+    if (engine.kind === "wasm-bindgen") throw new ScrubberError("scrubber_instance_poisoned", "instance_poison");
+    throw new ScrubEngineUnavailable("engine_failed");
+  }
   return engine;
 }
 

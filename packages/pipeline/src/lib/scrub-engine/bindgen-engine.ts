@@ -13,7 +13,7 @@
  *      file is never read again, so there is no check-then-use gap);
  *   5. initialise it with the verified wasm snapshot as `module_or_path` (bytes, never a
  *      path or URL, so the glue never resolves or fetches anything);
- *   6. read `manifestJson()` and compare every field, and the derived profile, to the pin.
+ *   6. read `manifestJson()` and compare every field, and the crate-owned profile, to the pin.
  *
  * The loader (`index.js`) bytes are pinned and verified as package identity but never
  * evaluated: it imports `./generated/relayscrubber.js` relative to itself, which from a
@@ -28,6 +28,7 @@
  * The initialised glue module is held only in this file's private state and the
  * engine's private fields; nothing exports it.
  */
+import { ScrubberError, taggedScrubberRefusal } from "./scrubber-error.js";
 import { readerMaxRuleset, checkedReaderMaxRuleset } from "./reader-policy.js";
 import { sha256Hex } from "../../../../object-store/src/crypto.js";
 import { SCRUB_RULESET_VERSION } from "../pipeline/raw-chunks.js";
@@ -44,8 +45,9 @@ import {
 
 // ---------------------------------------------------------------- pin
 
-/** The only manifest schema this adapter understands (hard-coded on purpose; everything else is pinned). */
-export const BINDGEN_MANIFEST_SCHEMA = 2;
+/** Candidate manifest schema and ABI accepted by this adapter; every identity field is also pinned. */
+export const BINDGEN_MANIFEST_SCHEMA = 3;
+export const BINDGEN_ABI_VERSION = 2;
 export const BINDGEN_PACKAGE = "@agentworkforce/relayscrubber";
 const PIN_SCHEMA = 1;
 
@@ -58,11 +60,12 @@ export const BINDGEN_MANIFEST_FIELDS: readonly BindgenManifestField[] = [
   "abiVersion",
   "policy",
   "redactionToken",
+  "scrubProfile",
 ];
 const ARTIFACTS: readonly BindgenArtifactName[] = ["wasm", "glue", "loader"];
 const POLICIES = new Set(["secrets", "pii"]);
 
-/** The relayscrubber schema-2 manifest. A pin may list further primitive fields, which must then match exactly too. */
+/** The relayscrubber schema-3 manifest. A pin may list further primitive fields, which must then match exactly too. */
 export interface BindgenManifest {
   schema: number;
   ruleset: string;
@@ -72,6 +75,7 @@ export interface BindgenManifest {
   abiVersion: number;
   policy: string;
   redactionToken: string;
+  scrubProfile: string;
   [extra: string]: string | number | boolean | null;
 }
 
@@ -107,9 +111,9 @@ const isPackagePath = (v: unknown): v is string =>
   !/[\\:\0]/.test(v) &&
   v.split("/").every((seg) => seg !== "" && seg !== "." && seg !== "..");
 
-/** The profile stamped in markers: derived from the manifest the instance reports, never configured on its own. */
-export function bindgenProfile(m: Pick<BindgenManifest, "ruleset" | "rulesetVersion" | "policy" | "rulesetSourceSha256">): string {
-  return `relayscrubber/${m.ruleset}/${m.rulesetVersion}/${m.policy}/${m.rulesetSourceSha256}`;
+/** The crate owns the profile identifier; the instance and pin must agree verbatim. */
+export function bindgenProfile(m: Pick<BindgenManifest, "scrubProfile">): string {
+  return m.scrubProfile;
 }
 
 /** Validate the pin. Every placeholder or malformed value has its own named reason. */
@@ -131,9 +135,10 @@ export function parseScrubBindgenPin(raw: unknown, maximum = readerMaxRuleset())
   if (!isPositiveInt(m.rulesetVersion)) refuse("bindgen_unpinned_manifest_rulesetVersion");
   if (!isDigest(m.rulesetSourceSha256)) refuse("bindgen_unpinned_manifest_rulesetSourceSha256");
   if (!isRealString(m.crateVersion)) refuse("bindgen_unpinned_manifest_crateVersion");
-  if (!isPositiveInt(m.abiVersion)) refuse("bindgen_unpinned_manifest_abiVersion");
+  if (m.abiVersion !== BINDGEN_ABI_VERSION) refuse("bindgen_unpinned_manifest_abiVersion");
   if (!isRealString(m.policy) || !POLICIES.has(m.policy)) refuse("bindgen_unpinned_manifest_policy");
   if (!isRealString(m.redactionToken)) refuse("bindgen_unpinned_manifest_redactionToken");
+  if (!isRealString(m.scrubProfile)) refuse("bindgen_unpinned_manifest_scrubProfile");
   if (Object.values(m).some((v) => !isPrimitive(v))) refuse("bindgen_pin_invalid");
   // Writer floor and reader capability are separate: increasing the latter never changes TS stamps.
   if ((m.rulesetVersion as number) < SCRUB_RULESET_VERSION) refuse("bindgen_ruleset_below_floor");
@@ -218,25 +223,13 @@ function verifyManifest(glue: BindgenGlue, pin: ScrubBindgenPin): Readonly<Bindg
 
 export type BindgenScrubEngine = ScrubEngine & {
   readonly kind: "wasm-bindgen";
-  /** True once the instance trapped; it is never called again. */
+  /** True after an unrecognized failure; the instance is never called again. */
   readonly failed: boolean;
   /** The manifest the instance reported (equal to the pin). */
   readonly manifest: Readonly<BindgenManifest>;
 };
 
 const encoder = new TextEncoder();
-
-/**
- * A trap (panic -> `unreachable`, OOM abort) or a stack/heap RangeError leaves the
- * instance's memory in an unknown state: poison it. A deliberate error (an `Error`
- * other than those, or a thrown code string) refuses only that call.
- */
-function isTrap(error: unknown): boolean {
-  const RuntimeError = (globalThis as unknown as { WebAssembly?: { RuntimeError?: abstract new (...args: never[]) => unknown } }).WebAssembly?.RuntimeError;
-  if (RuntimeError && error instanceof RuntimeError) return true;
-  if (error instanceof RangeError) return true;
-  return !(error instanceof Error) && typeof error !== "string";
-}
 
 /** Build the engine around a verified, initialised glue module. Not exported: only the two init paths call it. */
 function makeEngine(glue: BindgenGlue, manifest: Readonly<BindgenManifest>): BindgenScrubEngine {
@@ -245,34 +238,37 @@ function makeEngine(glue: BindgenGlue, manifest: Readonly<BindgenManifest>): Bin
   const marker: ScrubMarker = Object.freeze({ ruleset: manifest.ruleset, version: manifest.rulesetVersion, profile });
   let failed = false;
 
-  /** Every call: refuse if poisoned; on any throw, discard the input and return nothing. */
+  const ensureUsable = () => {
+    if (failed) throw new ScrubberError("scrubber_instance_poisoned", "instance_poison");
+  };
+  const poison = (): never => {
+    failed = true;
+    throw new ScrubberError("scrubber_engine_failure", "instance_poison");
+  };
+  /** Unknown exceptions are never inferred to be deliberate from their JS class. */
   const invoke = <R>(call: () => R): R => {
-    if (failed) throw new ScrubEngineUnavailable("engine_failed");
-    try {
-      return call();
-    } catch (error) {
-      if (isTrap(error)) {
-        failed = true;
-        throw new ScrubEngineUnavailable("engine_failed");
-      }
-      throw new ScrubEngineUnavailable("engine_refused");
+    ensureUsable();
+    try { return call(); }
+    catch (error) {
+      const refusal = taggedScrubberRefusal(error);
+      if (refusal) throw refusal;
+      return poison();
     }
   };
   const text = (fn: (s: string) => string, value: string): string => {
+    ensureUsable();
     preflightScrubText(value);
     const out = invoke(() => fn(value));
-    if (typeof out !== "string") throw new ScrubEngineUnavailable("engine_refused");
+    if (typeof out !== "string") return poison();
     return out;
   };
   const parseEnvelope = (out: unknown): Record<string, unknown> => {
-    if (typeof out !== "string") throw new ScrubEngineUnavailable("engine_refused");
+    if (typeof out !== "string") return poison();
     try {
       const v = JSON.parse(out) as unknown;
       if (v && typeof v === "object" && !Array.isArray(v)) return v as Record<string, unknown>;
-    } catch {
-      // fall through
-    }
-    throw new ScrubEngineUnavailable("engine_refused");
+    } catch { /* No returned or thrown artifact text reaches diagnostics. */ }
+    return poison();
   };
 
   const engine: BindgenScrubEngine = {
@@ -287,6 +283,7 @@ function makeEngine(glue: BindgenGlue, manifest: Readonly<BindgenManifest>): Bin
     scrubText: (value: string) => text((s) => glue.scrubText(s), value),
     scrubLong: (value: string) => text((s) => glue.scrubLong(s), value),
     scrubJson: <T>(value: T): T => {
+      ensureUsable();
       // `undefined` has no JSON text, so there is nothing the engine could scrub or the caller
       // could persist; it is the one value returned without an engine call (TS returns it too).
       // null, booleans and numbers DO go through the engine (no zero-change bypass).
@@ -300,20 +297,22 @@ function makeEngine(glue: BindgenGlue, manifest: Readonly<BindgenManifest>): Bin
       preflightScrubText(input);
       const envelope = parseEnvelope(invoke(() => glue.scrubJson(input)));
       // Use the Rust-serialised jsonText, never `.value` (a JS view that may round large integers).
-      if (typeof envelope.jsonText !== "string") throw new ScrubEngineUnavailable("engine_refused");
+      if (typeof envelope.jsonText !== "string") return poison();
       try {
         return JSON.parse(envelope.jsonText) as T;
       } catch {
-        throw new ScrubEngineUnavailable("engine_refused");
+        return poison();
       }
     },
     scrubRecords: (source: Uint8Array): ScrubRecordsResult => {
+      ensureUsable();
       const bytes = preflightScrubRecords(source);
       const out = invoke(() => glue.scrubRecords(bytes));
       const r = parseEnvelope(out);
       if (typeof r.text !== "string" || !Number.isSafeInteger(r.recordCount) || (r.recordCount as number) < 0)
-        throw new ScrubEngineUnavailable("engine_refused");
-      return { scrubbed: encoder.encode(r.text), records: r.recordCount as number, scrub: marker };
+        return poison();
+      try { return { scrubbed: encoder.encode(r.text), records: r.recordCount as number, scrub: marker }; }
+      catch { return poison(); }
     },
   };
   return Object.freeze(engine);
@@ -436,6 +435,7 @@ export async function initBindgenScrubEngine(options: BindgenInitOptions): Promi
   }
   if (nodeInit.key !== key) refuse("bindgen_init_conflict");
   const engine = await nodeInit.promise;
+  if (engine.failed) throw new ScrubberError("scrubber_instance_poisoned", "instance_poison");
   try {
     await readVerified(pin, options.readArtifact);
   } catch {
@@ -469,7 +469,8 @@ export function createCompiledBindgenEngine(options: CompiledBindgenOptions): Bi
   const key = pinKey(pin);
   if (compiledInit) {
     if (compiledInit.key !== key || !compiledInit.engine) refuse("bindgen_init_conflict");
-    return compiledInit.engine!;
+    if (compiledInit.engine.failed) throw new ScrubberError("scrubber_instance_poisoned", "instance_poison");
+    return compiledInit.engine;
   }
   const Module = (globalThis as unknown as { WebAssembly?: { Module?: abstract new (...args: never[]) => unknown } }).WebAssembly?.Module;
   if (!Module || !(options.module instanceof Module)) refuse("bindgen_module_invalid");

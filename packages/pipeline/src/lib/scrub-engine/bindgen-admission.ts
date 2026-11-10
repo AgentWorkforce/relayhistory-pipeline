@@ -1,5 +1,5 @@
 /** Byte admission only. Recognition and JSON parsing remain in the Rust engine. */
-import { PipelineError } from "../pipeline/errors.js";
+import { ScrubberError } from "./scrubber-error.js";
 
 export const MAX_TEXT_BYTES = 16 * 1024 * 1024;
 export const MAX_RECORD_BYTES = 16 * 1024 * 1024;
@@ -11,15 +11,15 @@ const readViewLength = Object.getOwnPropertyDescriptor(typedArrayPrototype, "byt
 const readArrayBufferLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength")!.get!;
 
 export function refuseMalformedScrubInput(): never {
-  throw new PipelineError("scrub_input_not_well_formed", "scrub input is not well-formed", false);
+  throw new ScrubberError("scrub_input_not_well_formed", "call_refusal");
 }
 
 function refuseSize(): never {
-  throw new PipelineError("scrub_input_too_large", "scrub input exceeds supported byte limits", false);
+  throw new ScrubberError("scrub_input_too_large", "call_refusal");
 }
 
 function refuseUnavailable(): never {
-  throw new PipelineError("scrub_admission_unavailable", "scrub input admission is unavailable", true);
+  throw new ScrubberError("scrub_admission_unavailable", "call_refusal", undefined, true);
 }
 
 /** Count UTF-8 without first allocating an encoded copy. Never replace lone surrogates. */
@@ -61,7 +61,7 @@ export function preflightScrubRecords(source: Uint8Array): Uint8Array {
   try {
     readArrayBufferLength.call(buffer);
   } catch {
-    throw new PipelineError("scrub_input_shared_buffer", "scrub input must not use shared memory", false);
+    throw new ScrubberError("scrub_input_shared_buffer", "call_refusal");
   }
   if (length > MAX_STREAM_BYTES) refuseSize();
   let bytes: Uint8Array;
@@ -88,7 +88,7 @@ export function preflightScrubRecords(source: Uint8Array): Uint8Array {
     decoder.decode();
   } catch (error) {
     if (error instanceof TypeError)
-      throw new PipelineError("chunk_not_utf8", "raw chunk is not valid UTF-8", false);
+      throw new ScrubberError("chunk_not_utf8", "call_refusal");
     return refuseUnavailable();
   }
   return bytes;
