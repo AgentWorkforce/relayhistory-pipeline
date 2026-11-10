@@ -26,6 +26,7 @@
 import { createHash } from "node:crypto";
 import { PipelineError, type ManifestReader, type ObjectStore } from "../shared/vendor.ts";
 import type { HoopDb } from "../shared/db.ts";
+import { captureSafely, type AnalyticsPort } from "../shared/analytics.ts";
 import { log } from "../shared/log.ts";
 import { MODEL_PATTERN, type BriefConfig } from "./config.ts";
 import { buildBriefInput } from "./input.ts";
@@ -252,7 +253,7 @@ export async function briefSession(deps: BriefDeps, w: ClaimedWakeup): Promise<B
  * brief as unbriefed, so a parked wakeup pruned after SESSION_WAKE_MAX_AGE_HOURS is armed
  * again. Outside canonical mode none of these recoveries runs.
  */
-export function briefTick(deps: Omit<BriefDeps, "db">) {
+export function briefTick(deps: Omit<BriefDeps, "db">, analytics?: AnalyticsPort) {
   let lastSweep = 0;
   let lastPrune = 0;
   const canonical = deps.canonicalInput !== undefined;
@@ -285,6 +286,7 @@ export function briefTick(deps: Omit<BriefDeps, "db">) {
       if (armed) log.info("session brief sweep armed", { stage: "session-brief", count: armed });
     }
     if (!deps.transport) return null;
+    const started = performance.now();
     const counts = {} as Record<BriefResult, number>;
     const claimed = await claimWakeups(db, deps.config.batch, deps.config.leaseSeconds, deps.config.workspaceIds);
     for (const w of claimed) {
@@ -292,13 +294,25 @@ export function briefTick(deps: Omit<BriefDeps, "db">) {
       counts[result] = (counts[result] ?? 0) + 1;
     }
     // Only allowlisted log fields (src/shared/log.ts): the per-outcome map is returned, not logged.
-    if (claimed.length)
+    if (claimed.length) {
+      captureSafely(analytics, {
+        kind: "session_brief.tick_completed",
+        claimed: claimed.length,
+        generated: counts.generated ?? 0,
+        reused: counts.reused ?? 0,
+        rateLimited: counts.rate_limited ?? 0,
+        throttled: counts.throttled ?? 0,
+        retrying: counts.retrying ?? 0,
+        failed: counts.failed ?? 0,
+        durationMs: performance.now() - started,
+      });
       log.info("session brief tick", {
         stage: "session-brief",
         claimed: claimed.length,
         failed: counts.failed ?? 0,
         skipped: (counts.throttled ?? 0) + (counts.rate_limited ?? 0),
       });
+    }
     return counts;
   };
 }
