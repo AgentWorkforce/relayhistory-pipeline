@@ -134,6 +134,7 @@ DECLARE
     'sessions.claim_session_brief_documents(uuid,integer)',
     'sessions.claim_session_large_read(uuid,integer)',
     'sessions.commit_search_feature_copy(text,text,uuid,bigint,text,jsonb,timestamp with time zone)',
+    'sessions.coordination_report_source_changed()',
     'sessions.digest_narrative_read(text,date,text,text)',
     'sessions.digest_narrative_upsert(text,text,date,text,text,text,text,text,timestamp with time zone)',
     'sessions.discover_session_large_reads()',
