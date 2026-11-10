@@ -106,8 +106,12 @@ const SCRUB_RULESETS: Record<number, string> = {
   // under a public selector key) runs to the container's end, and a name may start
   // after an encoded quote or a written-out escape sequence (%22password=,
   // \npassword=). Then the segmenter's records path scrubs a string under a public
-  // selector key as a container too (scrubLongContained), as scrubJson does.
-  9: "404c887b3ab5959808707f5e3e7052084638e5f80deff98be83ce03bc7e0bc65",
+  // selector key as a container too (scrubLongContained), as scrubJson does. Then the
+  // quoted key/value rule reports a prefix ending in the backslash run after a key's
+  // separator, and a value opened more than MAX_QUOTED_VALUE past its key, as
+  // unsplittable; reads encoded value openers; admits line breaks around the separator;
+  // and redacts an unquoted value opening with `[`.
+  9: "62d1843c88d832431bb0dd25790e90f07eb08aad0757ff539901424442e8326e",
 };
 
 const read = (rel: string) =>

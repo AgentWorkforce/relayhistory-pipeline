@@ -416,3 +416,24 @@ describe("rule set 8 vs 9 on the records path under a public selector", () => {
     expect(differ).toBeGreaterThan(RECORD_INPUTS / 20);
   }, 600_000);
 });
+
+describe("rule set 8 vs 9: a quoted key's value behind a long backslash run near the bound", () => {
+  // `scrub-ruleset-9-cuts.test.ts` holds the matrix; this is the end-to-end proof that rule
+  // set 8's segmenter cut in the separator's whitespace and stored the value keyless.
+  const run = "\\".repeat(9000);
+  const head = "lorem ipsum ".repeat(30000).slice(0, 260144) + " ";
+  const input = `${head}"password": ${run}"SECRET_ALPHA SECRET_BETA${run}" tail ${"z ".repeat(5000)}`;
+  const leaks = (out: string) => /SECRET_(ALPHA|BETA)/.test(out);
+
+  it("rule set 8's scrubRecords stores the value; rule set 9's does not", () => {
+    for (const record of [{ text: input }, { idempotency_key: input, after: "keep" }]) {
+      const line = JSON.stringify(record) + "\n";
+      expect(leaks(v8Records(line))).toBe(true);
+      const out = v9Records(line);
+      expect(leaks(out)).toBe(false);
+      expect(v9Records(out)).toBe(out);
+    }
+    expect(leaks(v8Records(input + "\n"))).toBe(true);
+    expect(leaks(v9Records(input + "\n"))).toBe(false);
+  });
+});

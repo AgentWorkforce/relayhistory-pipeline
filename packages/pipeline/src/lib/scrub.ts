@@ -74,7 +74,9 @@ export function isSecretKeyName(name: string): boolean {
 
 /**
  * A quoted key at any JSON escaping depth (`"k"`, `\"k\"`, `\\\"k\\\"`, `'k'`, `` `k` ``),
- * then `:`, `=` or `=>` with optional whitespace. The backslash run before the opening
+ * then `:`, `=` or `=>` with at most 16 spaces, tabs or line breaks on each side (rule set
+ * 9 admits line breaks: rule set 8 matched no key whose value was on the next line, so
+ * `"password":\n"…"` was stored). The backslash run before the opening
  * quote has any length (rule set 9; rule set 8 capped it at 16, so a key behind 17 or
  * more backslashes was not matched and its value was stored), and the same run must precede
  * the closing quote. The leading lookbehind starts a match only at the beginning of a
@@ -82,7 +84,7 @@ export function isSecretKeyName(name: string): boolean {
  * once); every other quantifier is bounded, so the scan stays linear.
  */
 const QUOTED_KEY =
-  /(?<!\\)(\\*)(["'`])([A-Za-z0-9_. -]{1,64})\1\2([ \t]{0,16}(?:=>|[:=])[ \t]{0,16})/g;
+  /(?<!\\)(\\*)(["'`])([A-Za-z0-9_. -]{1,64})\1\2([ \t\r\n]{0,16}(?:=>|[:=])[ \t\r\n]{0,16})/g;
 
 /**
  * How far the quoted key/value rule looks for a quoted value's matching closing quote,
@@ -100,6 +102,16 @@ export const MAX_QUOTED_VALUE = 4096;
  * a backslash or a delimiter (`,;{}[]`). Sticky, matched in place from the value's start.
  */
 const BARE_VALUE = /[^\s"'`,;{}[\]\\]*/y;
+
+/**
+ * Rule set 9: an unquoted value after a quoted key that opens with `[`: the bracket, then up
+ * to whitespace, a quote, a backslash or `,;{}` (brackets included). Sticky, as `BARE_VALUE`.
+ */
+const BRACKET_VALUE = /\[[^\s"'`,;{}\\]*/y;
+/** Percent-encoded quotes in a row (`%22`, `%2527`, `%u0060`), sticky: a bracket value's prefix. */
+const PERCENT_QUOTES = /(?:%(?:25)*(?:u00)?(?:22|27|60))*/iy;
+/** The marker, then only percent-encoded quotes (`[REDACTED]%22`): a redacted bracket value. */
+const REDACTED_THEN_PERCENT_QUOTES = /^\[REDACTED\](?:%(?:25)*(?:u00)?(?:22|27|60))*$/i;
 
 /** The run of non-whitespace from a position (rule set 6: the rest of a token glued to a private-key footer). */
 const GLUED_RUN = /\S*/y;
@@ -217,9 +229,17 @@ function redactQuotedSecretValues(
     if (!isSecretKeyName((m[3] as string).trim())) continue;
     // The value's opening quote, behind a backslash run of any length (rule set 9; rule
     // set 8 read at most 16 backslashes, so a value opener behind more was taken for an
-    // unquoted value and skipped, and the value was stored). Literal quotes only, as before.
+    // unquoted value and skipped, and the value was stored). Encoded openers below.
     let bs = 0;
     while (text[end + bs] === "\\") bs += 1;
+    // A prefix that ends after the separator or inside that backslash run may hide the
+    // value's opener past its end (rule set 9): recorded open, [key start, end of the
+    // text), so a segmenter cannot cut between the key and a value behind a backslash run
+    // too long for its context check to see past (8192 or more left the value keyless).
+    if (prefix && end + bs >= text.length) {
+      overCap?.push([m.index, text.length]);
+      continue;
+    }
     const quote = text[end + bs];
     let valueStart: number;
     let valueEnd: number;
@@ -233,8 +253,30 @@ function redactQuotedSecretValues(
     // A quoted value within the bound that holds a line break: its span is recorded
     // with `multiLine` (the segmenter must not cut inside it either).
     let lineValue = false;
-    if (isQuote(quote)) {
+    // The value's closing quote (its backslashes and the quote or encoded quote), when it has one.
+    let closeLength = 0;
+    // Rule set 9: an encoded opener (`\u0022`, `\x27` behind a backslash run, `%22`, `%2560`,
+    // `%u0022`, any case), read as the assignment rule reads one (`quotedAssignmentValue`):
+    // the value runs to the same form at the same depth within the bound, or, with none, to
+    // the end of the input. Rule set 8 took it for an unquoted value, kept unless generated.
+    // A percent-encoded quote before a bracket is left to the bracket value (below).
+    PERCENT_QUOTES.lastIndex = end;
+    const lead = (PERCENT_QUOTES.exec(text) as RegExpExecArray)[0].length;
+    const toBracket = bs === 0 && text[end + lead] === "[";
+    const encoded = isQuote(quote) || toBracket ? undefined : quotedAssignmentValue(text, end);
+    if (encoded) {
+      const [start, found, closeEnd] = encoded;
+      valueStart = start;
+      failClosed = found < 0;
+      valueEnd = failClosed ? text.length : found;
+      closeLength = failClosed ? 0 : closeEnd - found;
+      longValue = failClosed && (prefix || valueEnd - valueStart > MAX_QUOTED_VALUE);
+      for (let i = valueStart; !failClosed && !lineValue && i < valueEnd; i += 1) {
+        lineValue = isLineBreak(text[i]);
+      }
+    } else if (isQuote(quote)) {
       valueStart = end + bs + 1;
+      closeLength = bs + 1;
       // At escaping depth d the opening quote has 2^d - 1 backslashes, and a quote is
       // the closing one when its backslash run is that many modulo 2^(d+1): one more
       // backslash pair is an escaped backslash, an odd excess is an inner quote.
@@ -291,13 +333,25 @@ function redactQuotedSecretValues(
       // Rule set 6: the whole value, to its real end, before any decision. Rule set 5
       // classified only its first MAX_QUOTED_VALUE units, so 4096 digits then a tail
       // passed as a number (or a low-entropy prefix) and the tail was stored.
-      BARE_VALUE.lastIndex = end;
-      const bare = (BARE_VALUE.exec(text) as RegExpExecArray)[0];
+      const re = toBracket ? BRACKET_VALUE : BARE_VALUE;
+      re.lastIndex = toBracket ? end + lead : end;
+      const bare = (re.exec(text) as RegExpExecArray)[0];
       if (!bare) continue;
-      valueEnd = end + bare.length;
+      valueEnd = re.lastIndex;
       // Past the bound: redacted whole, whatever it holds (no literal, number or entropy test).
       overBound = bare.length >= MAX_QUOTED_VALUE;
-      if (!overBound && (NON_SECRET_BARE.test(bare) || !looksGenerated(bare))) continue;
+      if (toBracket) {
+        // Rule set 9: a value opening with `[` (rule set 8's value stopped at it, so
+        // `"password": [SECRET` was kept whatever followed) is redacted whatever it holds,
+        // except an empty one, a JSON literal or number in brackets (`[1]`, `[true]`), and
+        // the marker alone or followed only by percent-encoded quotes (a second pass).
+        // Percent-encoded quotes before the bracket (`%22[REDACTED]%22SECRET`) are part of
+        // the value, so the marker cannot be smuggled in behind them either.
+        const inner = bare.slice(1).replace(/\]$/, "");
+        const kept =
+          inner === "" || NON_SECRET_BARE.test(inner) || REDACTED_THEN_PERCENT_QUOTES.test(bare);
+        if (!overBound && kept) continue;
+      } else if (!overBound && (NON_SECRET_BARE.test(bare) || !looksGenerated(bare))) continue;
     }
     const value = longValue ? "" : text.slice(valueStart, valueEnd);
     // From the key start: a cut between key and value would leave the value with no key to
@@ -321,7 +375,14 @@ function redactQuotedSecretValues(
     ) {
       continue;
     }
-    if (!failSpan && (longValue || overBound || (multiLine && lineValue))) overCap?.push([m.index, valueEnd]);
+    // Rule set 9: with `multiLine`, so is a value whose opener is more than
+    // `MAX_QUOTED_VALUE` units past its key start (a long backslash run before it): a cut
+    // inside it, or in the separator's whitespace, would put the key out of the context
+    // check's view and leave the value keyless in the next segment.
+    const farOpener = multiLine && valueStart - m.index > MAX_QUOTED_VALUE;
+    if (!failSpan && (longValue || overBound || (multiLine && lineValue) || farOpener)) {
+      overCap?.push([m.index, valueEnd]);
+    }
     QUOTED_KEY.lastIndex = Math.max(QUOTED_KEY.lastIndex, valueEnd);
     if (!onlyOverCap) {
       out += text.slice(last, valueStart) + REDACTED;
@@ -348,8 +409,6 @@ function redactQuotedSecretValues(
     // (or the end), as the PEM rule's would.
     const toFooter = inside.at !== -1;
     if (!longValue && !overBound && !fromHeader && !toFooter) continue;
-    // The value's closing quote (its backslashes and the quote), when it has one.
-    const closeLength = isQuote(quote) ? bs + 1 : 0;
     const closeEnd = Math.min(text.length, valueEnd + closeLength);
     let redactEnd = valueEnd;
     // Whether the closing quote taken with a redaction to a footer is put back (below).
