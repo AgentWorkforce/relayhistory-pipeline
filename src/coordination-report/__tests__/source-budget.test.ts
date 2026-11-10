@@ -21,7 +21,14 @@ import {
 const encode = (s: string) => new TextEncoder().encode(s);
 const digest = (b: Uint8Array) => createHash("sha256").update(b).digest("hex");
 const at = "2026-11-01T10:00:00.000Z";
-async function fixture(count = 2, text?: string) {
+async function fixture(
+  count = 2,
+  text?: string,
+  options: {
+    payloadTruncated?: true | 1;
+    directConvergenceEvent?: boolean;
+  } = {},
+) {
   const objects = new Map<string, Uint8Array>(),
     pointers = new Map<string, CanonicalPointer>();
   const accesses: string[] = [];
@@ -34,21 +41,53 @@ async function fixture(count = 2, text?: string) {
       sessionId,
       startDate: "2026-11-01",
     };
-    const records = Array.from({ length: count }, (_, n) => n + 1).map((i) => ({
-      kind: "session_event",
-      origin_id: "origin",
-      record_id: `r${i}`,
-      revision: "1",
-      operation: "upsert",
-      received_at: at,
-      payload: {
-        ts_ms: Date.parse(at),
-        text: text ?? `message ${i}`,
-        role: i === 1 ? "user" : "assistant",
-        project_key: "github.com/team/project",
-        message_id: `msg-${i}`,
-      },
-    }));
+    const records = Array.from({ length: count }, (_, n) => n + 1).map((i) =>
+      options.directConvergenceEvent
+        ? {
+            kind: "convergence_event",
+            origin_id: "machine:machine",
+            record_id: `r${i}`,
+            revision: "1",
+            operation: "upsert",
+            received_at: at,
+            payload: {
+              org_id: "org",
+              workspace_id: "ws",
+              source: "claude",
+              session_id: sessionId,
+              machine_id: "machine",
+              user_id: "user",
+              event_id: `r${i}`,
+              kind: "session_event",
+              type: "assistant",
+              actor_role: "assistant",
+              ts: at,
+              ingested_at: at,
+              content: text ?? `message ${i}`,
+              ...(options.payloadTruncated === undefined
+                ? {}
+                : { payload_truncated: options.payloadTruncated }),
+            },
+          }
+        : {
+            kind: "session_event",
+            origin_id: "origin",
+            record_id: `r${i}`,
+            revision: "1",
+            operation: "upsert",
+            received_at: at,
+            payload: {
+              ts_ms: Date.parse(at),
+              text: text ?? `message ${i}`,
+              role: i === 1 ? "user" : "assistant",
+              project_key: "github.com/team/project",
+              message_id: `msg-${i}`,
+              ...(options.payloadTruncated === undefined
+                ? {}
+                : { payload_truncated: options.payloadTruncated }),
+            },
+          },
+    );
     const raw = encode(records.map((r) => JSON.stringify(r)).join("\n") + "\n"),
       stored = new Uint8Array(zstdCompressSync(raw)),
       sha = digest(raw);
@@ -164,6 +203,62 @@ async function fixture(count = 2, text?: string) {
   } as CanonicalDeps;
   return { canonical, accesses };
 }
+async function exportOne(canonical: CanonicalDeps) {
+  const scope = { organizationId: "org", workspaceId: "ws" };
+  return buildCanonicalReportExport(
+    {
+      canonical,
+      trustedScope: scope,
+      now: () => "2026-11-03T00:00:00.000Z",
+      listSessions: async () => ({
+        generation: "1",
+        complete: true,
+        sessions: [
+          {
+            orgId: "org",
+            workspaceId: "ws",
+            source: "claude",
+            sessionId: "s1",
+          },
+        ],
+      }),
+    },
+    {
+      scope,
+      window: {
+        since: "2026-11-01T00:00:00.000Z",
+        until: "2026-11-02T00:00:00.000Z",
+      },
+      maxSessions: 10,
+      maxEvents: 10,
+    },
+  );
+}
+test.each([true, 1] as const)(
+  "retained nested payload_truncated=%p marks a short projected event truncated",
+  async (payloadTruncated) => {
+    const { canonical } = await fixture(1, "short", { payloadTruncated });
+    const result = await exportOne(canonical);
+    expect(result.export.events).toHaveLength(1);
+    expect(result.export.events[0]!.truncated).toBe(true);
+  },
+);
+test("an absent payload_truncated flag leaves a short event untruncated", async () => {
+  const { canonical } = await fixture(1, "short");
+  const result = await exportOne(canonical);
+  expect(result.export.events[0]!.truncated).toBe(false);
+});
+test.each([true, 1] as const)(
+  "top-level payload_truncated=%p remains supported",
+  async (payloadTruncated) => {
+    const { canonical } = await fixture(1, "short", {
+      payloadTruncated,
+      directConvergenceEvent: true,
+    });
+    const result = await exportOne(canonical);
+    expect(result.export.events[0]!.truncated).toBe(true);
+  },
+);
 test("rejects event cap while processing first session before reading a second", async () => {
   const { canonical, accesses } = await fixture();
   const scope = { organizationId: "org", workspaceId: "ws" };
