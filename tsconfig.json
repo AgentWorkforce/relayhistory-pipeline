@@ -51,12 +51,14 @@
     "scripts/sync-sessions-function-boundary.ts",
     "scripts/sync-ingest-history-boundary.ts",
     "scripts/sessions-function-boundary",
-    "scripts/opensearch-proof"
+    "scripts/opensearch-proof",
+    "scripts/coordination-eval"
   ],
   "exclude": [
     "node_modules",
     "vendor",
     "packages",
-    "**/__tests__/**"
+    "**/__tests__/**",
+    "scripts/coordination-eval/*.test.ts"
   ]
 }

@@ -1,0 +1,2 @@
+{"type":"session_meta","source":"claude","session_id":"held-a","bounded_sample":false}
+{"type":"tool_call","timestamp":"2026-11-02T00:10:00.000Z","event_id":"held-a-write","tool_name":"MultiEdit","status":"success","args_json":"{\"file_path\":\"src/shared.ts\",\"edits\":[{\"old_string\":\"invented old\",\"new_string\":\"invented a\"}]}","content_truncated":false}

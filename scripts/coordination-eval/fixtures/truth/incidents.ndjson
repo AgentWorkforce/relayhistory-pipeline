@@ -1,0 +1,2 @@
+{"incident_id":"fixture-dev-incident","split":"dev","status":"scored","sessions":[{"source":"codex","session_id":"dev-a"},{"source":"codex","session_id":"dev-b"}]}
+{"incident_id":"fixture-heldout-incident","split":"heldout","status":"scored","sessions":[{"source":"claude","session_id":"held-a"},{"source":"claude","session_id":"held-b"}]}

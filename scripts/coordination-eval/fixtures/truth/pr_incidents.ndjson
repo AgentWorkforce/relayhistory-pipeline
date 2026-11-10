@@ -1,0 +1,2 @@
+{"id":"fixture-dev-incident","kind":"duplicate_migration","repo":"acme/widgets","side_a":{"prs":[101],"branches":["feat/dev-a"],"shas":[]},"side_b":{"prs":[102],"branches":["feat/dev-b"],"shas":[]},"harm_at":"2026-11-01T00:16:00.000Z","split":"dev","status":"scored"}
+{"id":"fixture-heldout-incident","kind":"concurrent_edit","repo":"acme/widgets","side_a":{"prs":[201],"branches":["feat/held-a"],"shas":[]},"side_b":{"prs":[202],"branches":["feat/held-b"],"shas":[]},"harm_at":"2026-11-02T00:21:00.000Z","split":"heldout","status":"scored"}
