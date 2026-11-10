@@ -37,6 +37,7 @@ function setup() {
   const calls: string[] = [];
   let received: Uint8Array | undefined;
   const engine = createCompiledBindgenEngine({
+    readerMaxRuleset: 10,
     pin,
     module: new ModuleCtor(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0])),
     glue: {
