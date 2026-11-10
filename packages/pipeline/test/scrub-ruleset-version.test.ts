@@ -94,8 +94,11 @@ const SCRUB_RULESETS: Record<number, string> = {
   // into their values and removes nested labelled credentials. Version 7 is frozen.
   8: "50c2e0c67395f488a308cbcfc7c945606374b3d67d37138e284849c6190c8214",
   // Version 9 consumes quoted assignment values to their matching close and
-  // accepts encoded separators (\u003d, \x3d, %3D, ...). Version 8 is frozen.
-  9: "9554ef5ecb3300b533503dd9555c7959303444d0b5b40a315c4fc12c1c47b25d",
+  // accepts encoded separators (\u003d, \x3d, %3D, ...) and encoded quote openers
+  // (%22, %2522, \u0022, \x22) at any backslash depth and double-encoded separators
+  // (%253D); a quoted value without a close within MAX_QUOTED_VALUE fails closed
+  // to the end of the input. Version 8 is frozen.
+  9: "f22bccfec7f327d58ca4a2cc003b1193a9dea4caac5fa9234e1e0f7a03d172e5",
 };
 
 const read = (rel: string) =>

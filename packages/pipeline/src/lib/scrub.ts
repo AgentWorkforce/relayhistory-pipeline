@@ -432,8 +432,10 @@ export function overCapQuotedValueSpans(
  * text (rule set 5). The quoted rule redacts each of these whole too, across its line
  * breaks, so a segmenter must not cut inside one either: the segment after the cut would
  * hold the value's later lines with no key before them. Rule set 9 adds the span [name
- * start, closing quote end) of every quoted secret assignment value holding whitespace
- * (`redactSecretAssignments` redacts it whole). Spans are sorted and disjoint.
+ * start, close end) of every quoted secret assignment value whose assignment holds
+ * whitespace, and [name start, end of text) of every one that fails closed (no matching
+ * close within the bound; `redactSecretAssignments` redacts each whole). Spans are sorted
+ * and disjoint.
  * `prefix: true` is as for `overCapQuotedValueSpans`: a value with no matching close in
  * the text is reported open to the end of the text (fail closed).
  */
@@ -443,8 +445,9 @@ export function unsplittableQuotedValueSpans(
 ): Array<[number, number]> {
   const spans: Array<[number, number]> = [];
   redactQuotedSecretValues(text, spans, options.prefix ?? false, false, true);
-  // Rule set 9: a quoted assignment value holding whitespace is redacted whole too.
-  redactSecretAssignments(text, spans, options.prefix ?? false);
+  // Rule set 9: quoted assignment values (closed and holding whitespace, or failing closed
+  // to the end of the text) are redacted whole too.
+  redactSecretAssignments(text, spans);
   spans.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
   const merged: Array<[number, number]> = [];
   for (const [start, end] of spans) {
@@ -569,63 +572,117 @@ type Rule = [RegExp, Replacement] | ((text: string) => string);
  * set 8).
  *
  * Rule set 9: the separator is a literal `=` or `:`, or one of them encoded as tool output
- * echoes it: a unicode or hex escape written out (`\u003d`, `\u003a`, `\x3d`, `\x3a`,
- * behind 1 to 16 backslashes, so at any JSON escaping depth up to 4) or percent-encoded
- * (`%3D`, `%3A`), hex digits in either case. Rule set 8 took only a literal one, so
- * `password\u003dVALUE` was stored whole.
+ * echoes it: a unicode or hex escape written out (`\u003d`, `\u003a`, `\x3d`, `\x3a`)
+ * behind a backslash run of any length (any JSON escaping depth), or percent-encoded
+ * (`%3D`, `%3A`) or double percent-encoded (`%253D`, `%253A`). Hex digits and the escape
+ * letters match in either case (`\U003D`, `\X3A`): not valid escapes, but over-matching
+ * only redacts more. Rule set 8 took only a literal one, so `password\u003dVALUE` was
+ * stored whole.
+ *
+ * Linear: `\\+` is followed by a literal (`u` or `x`), so a failed match gives back one
+ * backslash at a time and fails on the next character at once (O(run) per attempt), and
+ * only the one name ending right before a backslash run can reach it (a match starts at a
+ * word boundary and the name is a single word run), so each run is walked O(1) times.
  */
 const SECRET_ASSIGNMENT =
-  /\b(?!idempotency_key\s*(?:[:=]|\\{1,16}(?:u003[ad]|x3[ad])|%3[ad]))((?:[A-Za-z0-9]+_){0,8}(?:api[_-]?key|apikey|key|secret|token|password|passwd|passphrase|pwd|credentials?)\s*(?:[:=]|\\{1,16}(?:u003[ad]|x3[ad])|%3[ad]))\s*/gi;
+  /\b(?!idempotency_key\s*(?:[:=]|\\+(?:u003[ad]|x3[ad])|%(?:25)?3[ad]))((?:[A-Za-z0-9]+_){0,8}(?:api[_-]?key|apikey|key|secret|token|password|passwd|passphrase|pwd|credentials?)\s*(?:[:=]|\\+(?:u003[ad]|x3[ad])|%(?:25)?3[ad]))\s*/gi;
 
 /**
- * An unquoted assignment value, or a quoted one with no matching close within the bound:
- * an optional opening quote, then up to whitespace, a quote, `,` or `;` (rule set 8's
- * value, byte for byte). Sticky, matched in place from the value's start.
+ * An unquoted assignment value: an optional opening quote, then up to whitespace, a quote,
+ * `,` or `;` (rule set 8's value, byte for byte). Sticky, matched in place from the value's
+ * start. Never used for a value that opens with a quote (`quotedAssignmentValue`).
  */
 const ASSIGNMENT_VALUE = /["'`]?[^"'`\s,;]+/y;
 const isQuote = (c: string | undefined) => c === '"' || c === "'" || c === "`";
+/** `[REDACTED]` then only quotes and backslashes: a value that failed closed on an earlier pass. */
+const REDACTED_THEN_QUOTES = /^\[REDACTED\]["'`\\]*$/;
+
+/** An encoded quote after a backslash run: a unicode or hex escape of `"`, `'` or a backtick. */
+const ESCAPED_QUOTE = /(?:u00|x)(?:22|27|60)/iy;
+/** A percent-encoded quote: `%22`, `%27` or `%60`, or double-encoded (`%2522`, ...). */
+const PERCENT_QUOTE = /%(?:25)?(?:22|27|60)/y;
 
 /**
- * The quoted value of a secret assignment starting at `at`: an opening quote (`"`, `'` or
- * `` ` ``) behind 0 to 16 backslashes, then the value up to its matching closing quote,
- * found within `MAX_QUOTED_VALUE` units across whitespace and line breaks (literal or
- * escaped). The matching close is the test `redactQuotedSecretValues` uses: at escaping
- * depth d the opening quote has 2^d - 1 backslashes, and a quote closes when its backslash
- * run is that many modulo 2^(d+1) (an extra pair is an escaped backslash, an odd excess an
- * inner quote). Returns [value start, value end, end of the closing quote], or undefined
- * when there is no opening quote or no matching close within the bound. One forward walk of
- * at most `MAX_QUOTED_VALUE` + 1 units, so each start stays O(1) in the input's length.
+ * The quoted value of a secret assignment starting at `at`, or undefined when the value
+ * does not open with a quote. The opening quote is, behind a backslash run of any length:
+ * - a literal `"`, `'` or `` ` ``: it closes at the same quote whose backslash run is the
+ *   matching one, as in `redactQuotedSecretValues` (at escaping depth d the opening quote
+ *   has 2^d - 1 backslashes, and a quote closes when its run is that many modulo 2^(d+1):
+ *   an extra pair is an escaped backslash, an odd excess an inner quote; any other run
+ *   length closes only at exactly that run);
+ * - a unicode or hex escape of one (`\u0022`, `\x27`, …, behind at least one backslash):
+ *   it closes at the same escape (letter case aside) behind exactly the same run;
+ * - a percent-encoded one (`%22`, `%27`, `%60`) or a double percent-encoded one (`%2522`,
+ *   ...): it closes at the same characters.
+ * The stored bytes are never decoded or rewritten: the opener and close are kept as written.
+ *
+ * Returns [value start, value end, end of the close]. With no matching close whose start is
+ * within `MAX_QUOTED_VALUE` units of the value's start, the value end and close end are -1:
+ * the value fails closed, to the end of the input. One forward walk of at most
+ * `MAX_QUOTED_VALUE` + 1 units (each backslash run before a candidate close is counted once).
  */
 function quotedAssignmentValue(text: string, at: number): [number, number, number] | undefined {
   let bs = 0;
-  while (bs < 16 && text[at + bs] === "\\") bs += 1;
-  const quote = text[at + bs];
-  if (quote !== '"' && quote !== "'" && quote !== "`") return undefined;
-  const valueStart = at + bs + 1;
-  const period = (bs + 1) & bs ? 0 : 2 * (bs + 1);
+  while (text[at + bs] === "\\") bs += 1;
+  const open = at + bs;
+  const quote = text[open];
+  let valueStart: number;
+  /** The length of the close starting at `i`, or 0 when no close starts there. */
+  let closeAt: (i: number) => number;
+  /** The value's end for a close starting at `i` (before the close's backslash run). */
+  let backTo = bs;
+  if (isQuote(quote)) {
+    valueStart = open + 1;
+    const period = (bs + 1) & bs ? 0 : 2 * (bs + 1);
+    closeAt = (i) => {
+      if (text[i] !== quote) return 0;
+      const run = backslashesBefore(text, i);
+      const own = i - run >= valueStart ? run : i - valueStart;
+      return (period ? own % period === bs : own === bs) ? 1 : 0;
+    };
+  } else if (bs > 0 && ((ESCAPED_QUOTE.lastIndex = open), ESCAPED_QUOTE.test(text))) {
+    const form = text.slice(open, ESCAPED_QUOTE.lastIndex).toLowerCase();
+    valueStart = ESCAPED_QUOTE.lastIndex;
+    const lead = form.charCodeAt(0);
+    closeAt = (i) => {
+      if ((text.charCodeAt(i) | 0x20) !== lead || text.slice(i, i + form.length).toLowerCase() !== form) return 0;
+      const run = backslashesBefore(text, i);
+      const own = i - run >= valueStart ? run : i - valueStart;
+      return own === bs ? form.length : 0;
+    };
+  } else if (quote === "%" && ((PERCENT_QUOTE.lastIndex = open), PERCENT_QUOTE.test(text))) {
+    const form = text.slice(open, PERCENT_QUOTE.lastIndex);
+    valueStart = PERCENT_QUOTE.lastIndex;
+    backTo = 0;
+    closeAt = (i) => (text[i] === "%" && text.startsWith(form, i) ? form.length : 0);
+  } else {
+    return undefined;
+  }
   const limit = Math.min(text.length, valueStart + MAX_QUOTED_VALUE + 1);
   for (let i = valueStart; i < limit; i += 1) {
-    if (text[i] !== quote) continue;
-    const run = backslashesBefore(text, i);
-    const own = i - run >= valueStart ? run : i - valueStart;
-    if (period ? own % period === bs : own === bs) return [valueStart, i - bs, i + 1];
+    const length = closeAt(i);
+    if (length) return [valueStart, i - backTo, i + length];
   }
-  return undefined;
+  return [valueStart, -1, -1];
 }
 
 /**
  * Redact the value of every secret assignment (`SECRET_ASSIGNMENT`), keeping the name, the
  * separator as written (whitespace after it is dropped, as in rule set 8) and, for a quoted
- * value, both quotes: `password="[REDACTED]"`, `\"[REDACTED]\"` one level down.
+ * value, its opening quote and its close as written: `password="[REDACTED]"`,
+ * `\"[REDACTED]\"` one level down, `%22[REDACTED]%22`, `\u0022[REDACTED]\u0022`.
  *
- * Rule set 9: a quoted value is redacted whole, to its matching closing quote, through
- * whitespace and line breaks (`password="two words"`, `client_secret="a<LF>b"`), when that
- * close is within `MAX_QUOTED_VALUE` units; rule set 8 stopped at the first whitespace or
- * quote and stored the rest. An empty or already redacted quoted value is kept. With no
- * matching close within the bound, and for an unquoted value, the value is rule set 8's
- * (`ASSIGNMENT_VALUE`): an optional quote, then up to whitespace, a quote, `,` or `;`,
- * except that rule set 9 leaves out a backslash run directly before that quote (rule set 8
- * consumed it, breaking the enclosing escape: `\"password=v\"` became `\"password=[REDACTED]"`).
+ * Rule set 9: a value that opens with a quote (literal, unicode/hex-escaped or
+ * percent-encoded, behind any backslash run; see `quotedAssignmentValue`) is redacted
+ * whole, to its matching close, through whitespace and line breaks (`password="two words"`,
+ * `client_secret="a<LF>b"`); rule set 8 stopped at the first whitespace or quote and stored
+ * the rest. When there is no matching close within `MAX_QUOTED_VALUE` units, it fails
+ * closed: everything from the value's start to the end of the input is redacted (as the
+ * quoted key/value rule treats a value with no close), never a partial token. An empty or
+ * already redacted quoted value (or rest of the input) is kept. An unquoted value is rule
+ * set 8's (`ASSIGNMENT_VALUE`): up to whitespace, a quote, `,` or `;`, except that rule set
+ * 9 leaves out a backslash run directly before that quote (rule set 8 consumed it, breaking
+ * the enclosing escape: `\"password=v\"` became `\"password=[REDACTED]"`).
  *
  * Rule set 9 also matches at every position, not only after the previous value, and
  * redacts the union of all the values found. Rule set 8 resumed after each value, so an
@@ -634,15 +691,16 @@ function quotedAssignmentValue(text: string, at: number): [number, number, numbe
  * rule set 8 redacted is therefore redacted by rule set 9 too: overlapping values merge into
  * one `[REDACTED]`. A match starting inside an unquoted value already found is not measured
  * again (its unquoted value ends where that one does), so each unquoted value is walked
- * once, and each quoted one at most `MAX_QUOTED_VALUE` + 1 units.
+ * once, and each quoted one at most `MAX_QUOTED_VALUE` + 1 units; the first value that fails
+ * closed ends the scan (everything after it is redacted already).
  *
- * With `unsplittable`, also report [name start, closing quote end) of every quoted value
- * holding whitespace (a segmenter cut inside one would leave its tail keyless in the next
- * segment) and, with `prefix`, [name start, end of text) of every quoted opener whose
- * close the text ends before the scan bound could decide (fail closed, as
- * `overCapQuotedValueSpans`).
+ * With `unsplittable`, also report [name start, close end) of every quoted value whose
+ * assignment holds whitespace (a segmenter cut inside one would leave its tail keyless in
+ * the next segment), and [name start, end of text) of every value that fails closed (with
+ * or without a prefix: the text may end before a close the full input has; fail closed,
+ * as `overCapQuotedValueSpans`).
  */
-function redactSecretAssignments(text: string, unsplittable?: Array<[number, number]>, prefix = false): string {
+function redactSecretAssignments(text: string, unsplittable?: Array<[number, number]>): string {
   // [start, end, whether the span becomes `[REDACTED]` (else it is dropped: whitespace)].
   const spans: Array<[number, number, boolean]> = [];
   let unquotedEnd = 0;
@@ -653,19 +711,22 @@ function redactSecretAssignments(text: string, unsplittable?: Array<[number, num
     const at = m.index + m[0].length;
     const quoted = quotedAssignmentValue(text, at);
     if (quoted) {
-      const [valueStart, valueEnd, closeEnd] = quoted;
+      const [valueStart, found, closeEnd] = quoted;
+      const failClosed = found < 0;
+      const valueEnd = failClosed ? text.length : found;
+      if (unsplittable && (failClosed || /\s/.test(text.slice(m.index, closeEnd)))) {
+        unsplittable.push([m.index, failClosed ? text.length : closeEnd]);
+      }
       const value = text.slice(valueStart, valueEnd);
-      if (unsplittable && /\s/.test(value)) unsplittable.push([m.index, closeEnd]);
-      if (value !== "" && value !== REDACTED) {
+      // Kept: empty, already redacted, or (failing closed) already redacted and followed
+      // only by the closing quotes and backslashes of enclosing strings (`\"[REDACTED]"` in
+      // the escaped form of a stored value), so a second pass changes nothing.
+      if (value !== "" && value !== REDACTED && !(failClosed && REDACTED_THEN_QUOTES.test(value))) {
         if (at > nameEnd) spans.push([nameEnd, at, false]);
         spans.push([valueStart, valueEnd, true]);
       }
+      if (failClosed) break;
       continue;
-    }
-    if (unsplittable && prefix) {
-      let bs = 0;
-      while (bs < 16 && text[at + bs] === "\\") bs += 1;
-      if (isQuote(text[at + bs]) && at + bs + 1 + MAX_QUOTED_VALUE + 1 > text.length) unsplittable.push([m.index, text.length]);
     }
     if (at < unquotedEnd) continue;
     ASSIGNMENT_VALUE.lastIndex = at;
