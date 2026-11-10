@@ -73,6 +73,17 @@ export function postgresSearchState(options: { reader?: TenantRunner; backendId:
       // fails closed here. The writer binds the tenant GUCs per scope
       // instead (every search write runs inside a tenant transaction).
       if (rows.length !== 1) throw new Error("search state tenant policy mismatch");
+      // The read API's completeness check (partials) reads this table as bulls96_read_api, under the
+      // tenant_only policy above. This schema is created here at consumer start, after the role
+      // bootstrap has run, so the grant lives here. Without it every /events read is a 503
+      // ("permission denied for schema"). Only the columns partials reads; no writes.
+      await owner.query(`DO $grant$ BEGIN
+        IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bulls96_read_api') THEN
+          GRANT USAGE ON SCHEMA "${schema}" TO bulls96_read_api;
+          GRANT SELECT (backend_id,org_id,workspace_id,source,session_id,canonical_session_id,source_epoch,coverage_from_ms,complete)
+            ON ${table} TO bulls96_read_api;
+        END IF;
+      END $grant$`);
     },
     async fromMs() { return fromMs; },
     async record(tx, scope, value) {
