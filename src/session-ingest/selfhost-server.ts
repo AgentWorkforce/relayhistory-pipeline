@@ -59,6 +59,11 @@
  *          honour conditional writes (locker.ts assertConditionalWrites). /readyz follows the consumer.
  *   drain  the synchronous request path again, while the consumer keeps admitting the inbox.
  *
+ * INGEST_CLAIM_LOCK_BUSY (selfhost-config.ts; default off): =on makes a claim that loses its lock wait
+ * (55P03/40P01) a 429 delivery_busy with Retry-After 5-10 s instead of a 503 on the synchronous request path
+ * (sync and drain), exactly as the Worker; 57014 and every other cause stay 503. The async consumer gets the
+ * same deliver deps, and the hosted admitMessage keeps its normal backoff for it, so nothing changes there.
+ *
  * Auth runs in this wrapper BEFORE the request body is read: an unauthenticated
  * or unscoped caller never gets the edge to buffer MAX_DELIVERY_BYTES. The
  * verified identity reaches the app only through a WeakMap keyed by the exact
@@ -183,7 +188,7 @@ export interface SelfhostRuntimeOptions {
 }
 
 /** The ingest app over the given parts. Canonical acceptance, inline writes, no fan-out, no replica, no custody. */
-export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
+export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
   const sessionSelection = settings.sessionSelection === true;
   const verified = new WeakMap<Request, IngestIdentity>();
   const deliver: DeliverDeps = {
@@ -193,6 +198,8 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     // Slot TTL past any request this process serves, so a lost release frees itself (Worker: 90).
     slots: { maxPerUser: settings.maxPerUser, maxPerOrg: settings.maxPerOrg, ttlSeconds: 90 },
     // inlineMaxSessions unset: always inline, so `fanout` is never needed (see the header).
+    // INGEST_CLAIM_LOCK_BUSY=on (default off): the same deps in every admission mode, as the Worker's deliverDepsFor.
+    ...(settings.claimLockBusy ? { claimLockBusy: true as const } : {}),
   };
   const identify = (request: Request) => {
     const identity = verified.get(request);
