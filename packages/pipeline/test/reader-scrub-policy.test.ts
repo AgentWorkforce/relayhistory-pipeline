@@ -75,3 +75,13 @@ it("unset policy preserves legacy markers and never consults chunk metadata or a
     else process.env.READER_MAX_RULESET=saved;
   }
 });
+
+
+it("metadata-free legacy objects remain readable under explicit policy; future objects refuse by code",async()=>{
+ for(const version of [1,10]){
+  let cancelled=false;const body=new ReadableStream<Uint8Array>({cancel(){cancelled=true;}});
+  const object={meta:{},body};const read=readerChunkBody(object as never,{ruleset:"relayhistory-scrub",version},10);
+  if(version===1){expect(await read).toBe(body);expect(cancelled).toBe(false);await body.cancel();}
+  else{await expect(read).rejects.toMatchObject({code:"scrub_ruleset_unsupported",retryable:false});expect(cancelled).toBe(true);}
+ }
+});

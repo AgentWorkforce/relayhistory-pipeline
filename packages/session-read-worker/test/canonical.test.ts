@@ -26,6 +26,8 @@ interface Scenario {
   status: number;
 }
 const scenarios: Scenario[] = [
+  { name: "main-writer chunk8 retains legacy default", manifestVersion: 1, chunkVersion: "8", status: 200 },
+  { name: "main-writer chunk8 satisfies explicit8", manifestVersion: 1, chunkVersion: "8", ceiling: "8", status: 200 },
   { name: "legacy small", manifestVersion: 1, status: 200 },
   { name: "legacy legally large replay", large: true, manifestVersion: 1, status: 200 },
   { name: "future manifest retains legacy default", manifestVersion: 10, chunkVersion: 10, status: 200 },

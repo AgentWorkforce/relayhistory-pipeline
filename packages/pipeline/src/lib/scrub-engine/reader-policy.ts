@@ -57,7 +57,7 @@ export function assertReaderChunkMetadata(metadata: Record<string, string>, mark
 export async function readerChunkBody(object: GetObject, marker: unknown, maximum?: number): Promise<ReadableStream<Uint8Array>> {
   if (maximum === undefined) return object.body;
   try {
-    assertReaderChunkMetadata(object.meta.metadata, marker, maximum);
+    assertReaderChunkMetadata(object.meta.metadata ?? {}, marker, maximum);
     return object.body;
   } catch (error) {
     await object.body.cancel().catch(() => {});
