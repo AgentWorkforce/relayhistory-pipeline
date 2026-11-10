@@ -548,11 +548,11 @@ describe("wasm-bindgen: a glue error discards the input", () => {
     });
   }
 
-  it("scrubRecords: invalid UTF-8 the engine refuses keeps the TypeScript chunk_not_utf8 refusal", async () => {
+  it("scrubRecords: invalid UTF-8 is refused before the engine with chunk_not_utf8", async () => {
     const s = setup({ glue: { throwOn: { scrubRecords: "error" } } });
     await initScrubEngine(s.options);
     expect(() => seam.scrubRecords(new Uint8Array([0x7b, 0xff, 0x7d, 0x0a]))).toThrow(expect.objectContaining({ code: "chunk_not_utf8", retryable: false }));
-    expect(s.calls.map((c) => c.op)).toEqual(["scrubRecords"]);
+    expect(s.calls).toEqual([]);
   });
 
   it("malformed glue results are refused, never passed through", async () => {

@@ -283,10 +283,20 @@ Merging this PR is a default-off, unpinned scaffold only. It is NOT a security P
 1. **Reader-first.** A v10 writer may not start until every relevant reader accepts ruleset <= 10. The explicit reader policy below provides `READER_MAX_RULESET=10`; pin parsing must refuse a manifest rulesetVersion above it and below the supported floor. Roll the reader ceiling out first with wasm-bindgen still off, then the v10 writer/pin. Do not overload the TS `SCRUB_RULESET_VERSION` as the reader ceiling.
 2. **Profile is crate-owned.** The schema-2 manifest must report a canonical profile field/string; the pipeline pins and compares it verbatim. The format derived in this PR (`relayscrubber/<ruleset>/<ver>/<policy>/<sourceSha>`) is a placeholder and must be replaced by the crate's value before any pin.
 3. **Stable tagged glue errors.** relayscrubber must expose stable error tags. Recognised domain/admission errors refuse one call; `WebAssembly.RuntimeError`, `RangeError`/OOM, or ANY unrecognised throw poisons the instance. The current Error-vs-trap heuristic is removed before pin.
-4. **Loader policy in the adapter.** Hashing `index.js` without executing it is package provenance only, never runtime security. The adapter may import the verified generated glue directly but must implement the reviewed loader policy itself, including the 16 MiB UTF-8 preflight before the bindgen copy. The registry package/archive checksum goes into the build receipt; component digests remain the runtime pins.
+4. **Loader policy in the adapter.** Hashing `index.js` without executing it is package provenance only, never runtime security. The adapter imports the verified generated glue directly. Its byte admission is described below; the qualified Rust package must recheck the same limits. The registry package/archive checksum goes into the build receipt; component digests remain the runtime pins.
 5. **Workers.** CI/build must hash the exact wasm and glue source files against the pin before bundling, prove through the bundler metafile/module manifest that the CompiledWasm input is that exact path, and retain a durable bundle receipt mapping wasmSha/glueSha/sourceSha to the deployment bundle digest. Startup still verifies the instance manifest/profile. Mutated-wasm and swapped-module build tests must fail.
 
-Additional cutover requirements: adapter-side `MAX_TEXT_BYTES` = 16 MiB UTF-8 for text and JSON before any WASM call; records 16 MiB each and 64 MiB aggregate; JS preflight plus Rust recheck; limit-1 / limit / limit+1 multibyte tests; copy or reject shared mutable record buffers before invocation; route and re-pin every `sealRawChunk` call site; no TS or raw fallback.
+Additional cutover requirements: the qualified Rust package must independently recheck the adapter's byte limits and pass real native/WASM limit-1 / limit / limit+1 multibyte tests; route and re-pin every `sealRawChunk` call site; no TS or raw fallback. Adapter tests with inert glue doubles do not qualify a Rust package.
+
+### Adapter input admission
+
+`bindgen-admission.ts` runs before every text, long-text, serialized-JSON or record call into the glue, on both the Node loader and compiled-module paths:
+
+- Text and serialized JSON are limited to 16 MiB of UTF-8. Text is counted without first allocating an encoded copy. Lone UTF-16 surrogates are refused rather than replaced.
+- NDJSON is limited to 16 MiB per physical LF-delimited record and 64 MiB per stream. LF is excluded from the record size but included in the stream size; CR and whitespace count toward the record size, matching Rust's check before blank-line handling.
+- Shared record buffers are refused, including foreign-realm SharedArrayBuffers. Ordinary record buffers are copied into a private Uint8Array, so Buffer views cannot retain a mutable alias. UTF-8 is validated in bounded chunks; the original bytes are passed to Rust without decoding/re-encoding or JSON parsing.
+
+Invalid-input errors are content-free, nonretryable `PipelineError`s: `scrub_input_too_large`, `scrub_input_not_well_formed`, `scrub_input_shared_buffer`, or the existing `chunk_not_utf8`. A local copy/decoder allocation failure instead returns retryable `scrub_admission_unavailable`, so resource pressure does not classify valid data as permanently malformed. These errors return no partial output and do not call or poison the engine. The checked-in pin remains UNPINNED; this admission layer changes neither recognition rules nor any reader ceiling or scrub marker.
 
 ## Import cycle (why `predicate-hook.ts`)
 
