@@ -143,7 +143,11 @@ only as `outcome=delivery_busy` with `stage=claim` and `db_error_code` `40P01`. 
 `unavailable`, because it is observed before the conversion. 57014 (`ledger_timeout`) and every
 other cause stay 503. With the flag on, the 503 claim-path alert above no longer counts 55P03 or
 40P01. Watch `outcome=delivery_busy` with `stage=claim` (all claim lock waits), or the `lazy_claim`
-lock alert (55P03 only). Unset or `off`: unchanged.
+lock alert (55P03 only). Unset or `off`: unchanged. The Cloudflare stack renders the var from the
+stack input `sessionIngest.claimLockBusy: "on"` (canonical or buffered acceptance; omit for `off`,
+which renders no var). Operator note: if the deploy actor previously set `INGEST_CLAIM_LOCK_BUSY`
+out of band as a Worker version secret of the same name, it must remove that secret before the
+stack-rendered var applies, or the apply conflicts.
 
 No Workers analytics or Logpush observer is named in these runbooks, so the alert is not wired
 yet. It is to be wired by the release owner in the G3 window, using the fields `route`, `stage`,
