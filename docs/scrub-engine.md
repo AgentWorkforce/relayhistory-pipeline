@@ -305,6 +305,11 @@ Adapter tests with inert glue doubles do not qualify a Rust/WASM package.
 
 Invalid-input errors are content-free, nonretryable `ScrubberError`s (a `PipelineError` subclass) with `disposition: "call_refusal"`: `scrub_input_too_large`, `scrub_input_not_well_formed`, `scrub_input_shared_buffer`, or the existing `chunk_not_utf8`. A local copy/decoder allocation failure instead returns retryable `scrub_admission_unavailable`, so resource pressure does not classify valid data as permanently malformed. These errors return no partial output and do not call or poison the engine. The checked-in pin remains UNPINNED; this admission layer changes neither recognition rules nor any reader ceiling or scrub marker.
 
+The adapter requires the ABI-2 `scrubTextChecked` export for both text and long
+text after JS admission. That Rust entrypoint rechecks the byte limit before
+allocating scanner state. Missing it refuses startup even if the unchecked
+`scrubText`/`scrubLong` compatibility exports exist; there is no fallback to them.
+
 ### Candidate crate contract (not artifact clearance)
 
 The candidate manifest reports schema `3`, ABI `2`, and a crate-owned

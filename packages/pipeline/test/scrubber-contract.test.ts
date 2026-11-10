@@ -37,7 +37,7 @@ async function setup(path: Path, fault: unknown, selected: Op) {
   const glue = {
     default: async () => { inits++; }, initSync: () => { inits++; },
     manifestJson: () => JSON.stringify(manifest),
-    scrubText: () => { enter("scrubText"); return "safe"; },
+    scrubTextChecked: () => { enter(selected === "scrubLong" ? "scrubLong" : "scrubText"); return "safe"; },
     scrubLong: () => { enter("scrubLong"); return "safe"; },
     scrubJson: () => { enter("scrubJson"); return '{"jsonText":"null","redactionCount":0}'; },
     scrubRecords: () => { enter("scrubRecords"); return '{"text":"{}\\n","recordCount":1,"redactionCount":0}'; },

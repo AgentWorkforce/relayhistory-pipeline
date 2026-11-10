@@ -45,7 +45,7 @@ function setup() {
     glue: {
       initSync() {},
       manifestJson: () => JSON.stringify(manifest),
-      scrubText() { calls.push("text"); return "accepted"; },
+      scrubTextChecked() { calls.push("text"); return "accepted"; },
       scrubLong() { calls.push("long"); return "accepted"; },
       scrubJson() { calls.push("json"); return JSON.stringify({ jsonText: "null", value: null, redactionCount: 0 }); },
       scrubRecords(bytes: Uint8Array) {
@@ -106,7 +106,7 @@ describe("bindgen text admission before the glue", () => {
         } else {
           expect(engine.scrubText(text)).toBe("accepted");
           expect(engine.scrubLong(text)).toBe("accepted");
-          expect(calls).toEqual(["text", "long"]);
+          expect(calls).toEqual(["text", "text"]);
         }
       });
     }
@@ -139,7 +139,7 @@ describe("bindgen text admission before the glue", () => {
   it("does not bypass the glue for empty text or JSON scalars", () => {
     const { engine, calls } = setup();
     engine.scrubText(""); engine.scrubLong(""); engine.scrubJson(null); engine.scrubJson(true);
-    expect(calls).toEqual(["text", "long", "json", "json"]);
+    expect(calls).toEqual(["text", "text", "json", "json"]);
   });
 });
 

@@ -181,14 +181,14 @@ interface BindgenGlue {
   default(input: { module_or_path: unknown }): Promise<unknown>;
   initSync(input: { module: unknown }): unknown;
   manifestJson(): string;
-  scrubText(text: string): string;
-  scrubLong(text: string): string;
+  /** Bounded Rust entrypoint; unchecked compatibility exports are never used. */
+  scrubTextChecked(text: string): string;
   /** Returns JSON text `{value, jsonText, redactionCount}`; `jsonText` is the Rust-serialised result. */
   scrubJson(jsonText: string): string;
   /** Returns JSON text `{text, recordCount, redactionCount}`; throws on invalid input with no partial output. */
   scrubRecords(bytes: Uint8Array): string;
 }
-const SCRUB_FUNCTIONS = ["manifestJson", "scrubText", "scrubLong", "scrubJson", "scrubRecords"] as const;
+const SCRUB_FUNCTIONS = ["manifestJson", "scrubTextChecked", "scrubJson", "scrubRecords"] as const;
 
 function bindGlue(raw: unknown, entry: "default" | "initSync"): BindgenGlue {
   const g = raw as Record<string, unknown> | null;
@@ -280,8 +280,8 @@ function makeEngine(glue: BindgenGlue, manifest: Readonly<BindgenManifest>): Bin
     get failed() {
       return failed;
     },
-    scrubText: (value: string) => text((s) => glue.scrubText(s), value),
-    scrubLong: (value: string) => text((s) => glue.scrubLong(s), value),
+    scrubText: (value: string) => text((s) => glue.scrubTextChecked(s), value),
+    scrubLong: (value: string) => text((s) => glue.scrubTextChecked(s), value),
     scrubJson: <T>(value: T): T => {
       ensureUsable();
       // `undefined` has no JSON text, so there is nothing the engine could scrub or the caller
