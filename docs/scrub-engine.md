@@ -147,9 +147,11 @@ metadata `scrub-ruleset` / `scrub-version`, manifests and summary `scrub_version
     stamps that engine's `rulesetVersion` with the text the same engine scrubbed.
 - The TypeScript engine stamps exactly what main stamps: `relayhistory-scrub` / `8`. Its profile
   id is `relayhistory-scrub/typescript`, which is not persisted by any TS path.
-- Readers never re-scrub. `SCRUB_RULESET_VERSION` and the manifest min-version logic are unchanged.
-  Readers check `version <= SCRUB_RULESET_VERSION`. So a wasm cutover that declares a ruleset
-  above 8 needs a coordinated reader bump first. The pin refuses a ruleset below 8.
+- Readers never re-scrub. Unset reader policy retains the existing presence/quarantine
+  and courier admission checks. An explicit `READER_MAX_RULESET` enables the independent
+  family/version and per-chunk policy described below; it never changes TS writer stamps.
+  A wasm cutover above 8 still requires a coordinated reader-first rollout. The pin refuses
+  a writer ruleset below 8 or above its configured ceiling (default writer gate: 8).
 
 ## Cutover rule
 
