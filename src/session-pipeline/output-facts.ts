@@ -506,7 +506,7 @@ const schemaProbes = new WeakMap<ClickHouseClient, { at: number; ready: boolean;
  */
 export async function outputFactsSchema(ch: ClickHouseClient, now = Date.now()): Promise<{ ready: boolean; present: boolean }> {
   const cached = schemaProbes.get(ch);
-  if (cached && now - cached.at < 60_000) return cached;
+  if (cached && now - cached.at < 60_000) return { ready: cached.ready, present: cached.present };
   const rows = await ch.select<{ table: string; name: string }>(
     `SELECT table, name FROM system.columns WHERE database = currentDatabase() AND table IN {tables:Array(String)}`,
     { params: { tables: Object.keys(REQUIRED_COLUMNS) }, timeoutMs: 10_000 },
@@ -516,7 +516,7 @@ export async function outputFactsSchema(ch: ClickHouseClient, now = Date.now()):
   const ready = Object.entries(REQUIRED_COLUMNS).every(([t, cols]) => cols.every((c) => have.get(t)?.has(c)));
   const probe = { at: now, ready, present: have.has(EVENT_FACTS_TABLE) || have.has(OUTPUT_FACTS_TABLE) };
   schemaProbes.set(ch, probe);
-  return probe;
+  return { ready: probe.ready, present: probe.present };
 }
 /** Tests: forget a client's cached probe. */
 export function resetOutputFactsSchemaProbe(ch: ClickHouseClient): void {
