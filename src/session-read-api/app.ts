@@ -45,6 +45,9 @@ import { BriefSummaryError, briefSummaryResponse, type BriefSummary } from "./br
  *                                   READ_API_DIGEST_BACKEND) + the directory, narrative from the
  *                                   Supabase cache / narrative Worker (digest-narrative.ts), off
  *                                   unless READ_API_DIGEST_ENABLED=1 (deps.digest), same allowlist.
+ *   GET /v1/coordination/overlaps   deterministic overlap findings from those same facts, off
+ *                                   unless READ_API_COORDINATION_OVERLAPS_ENABLED=true, same
+ *                                   auth, workspace/project scope, readiness and allowlist.
  *   GET /v1/sessions/titles         cached brief titles of up to 100 `key=<source>:<sessionId>`
  *                                   keys, from Supabase session_briefs (brief-titles.ts). Its
  *                                   own allowlist, READ_API_BRIEF_TITLES_WORKSPACES (unset = none,
@@ -82,6 +85,8 @@ import { EvidenceRequestError, readBabysitterEvidence, type EvidenceDeps } from 
 import { MAX_TURN_HARNESSES, TurnsInputError, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
 import { clickhouseOutputBackend, type OutputBackend } from "./output-backend.ts";
 import { clickhouseDigestBackend, type DigestBackend } from "./digest-backend.ts";
+import { clickhouseCoordinationBackend, type CoordinationBackend } from "./coordination-backend.ts";
+import { detectCoordination } from "../../packages/coordination-detect/src/index.ts";
 import { READ_SETTINGS } from "./queries.ts";
 import { DigestInputError, resolveDayWindow } from "./day-window.ts";
 import { DIGEST_OMITTED_FIELDS, DigestDirectoryUnavailable, computeStatsHash } from "./digest-query.ts";
@@ -217,6 +222,8 @@ export interface ReadApiDeps {
    * `digest_not_configured`.
    */
   digest?: DigestNarrativeDeps & { backend?: DigestBackend };
+  /** READ_API_COORDINATION_OVERLAPS_ENABLED=true: on-request deterministic findings. */
+  coordination?: { enabled: boolean; backend?: CoordinationBackend };
   /** Service-only verified canonical object reads for exact sessions outside search retention. */
   canonicalEvents?: CanonicalEventsDeps;
   /** Babysitter evidence reader (babysitter-evidence.ts); absent = 501 `delivery_records_not_configured`. */
@@ -944,7 +951,7 @@ export function createReadApi(deps: ReadApiDeps) {
   });
 
   /** The P3 canary allowlist (READ_API_DIRECTORY_WORKSPACES), shared by the directory and timing routes. */
-  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "analysis" | "output" | "digest" | "catalog" | "login" | "summary"): void {
+  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "analysis" | "output" | "digest" | "coordination" | "catalog" | "login" | "summary"): void {
     const allowed = deps.directoryWorkspaces;
     if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported(`${route}_workspace_not_enabled`);
   }
@@ -1532,6 +1539,86 @@ export function createReadApi(deps: ReadApiDeps) {
       });
     } catch (error) {
       if (error instanceof DigestDirectoryUnavailable) return fail(c, unsupported("digest_directory_unavailable"));
+      if (error instanceof DirectoryError) return directoryFail(c, error);
+      return fail(c, error);
+    }
+  });
+
+  /**
+   * Deterministic coordination findings from the same facts and readiness authority as the
+   * digest. Incomplete facts are an honest 200 with partial/unknown coverage, never findings
+   * presented as exhaustive. No transcript body is read or returned.
+   */
+  app.get("/v1/coordination/overlaps", async (c) => {
+    if (deps.coordination?.enabled !== true)
+      return c.json({ error: "coordination_overlaps_disabled" }, 404);
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      requireCanary(identity, "coordination");
+      const now = Date.now();
+      const untilRaw = single(c, "until");
+      const sinceRaw = single(c, "since");
+      const untilMs = untilRaw === undefined ? now : parseTime(untilRaw, "until")!;
+      const sinceMs = sinceRaw === undefined ? untilMs - 7 * 24 * 60 * 60 * 1_000 : parseTime(sinceRaw, "since")!;
+      if (sinceMs >= untilMs) throw bad("since must be before until");
+      if (untilMs - sinceMs > 31 * 24 * 60 * 60 * 1_000) throw bad("window must not exceed 31 days");
+      const limitRaw = single(c, "limit");
+      const limit = limitRaw === undefined ? 50 : Number(limitRaw);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw bad("limit must be an integer from 1 to 200");
+      const projectId = single(c, "project")?.trim() || null;
+      const since = new Date(sinceMs), until = new Date(untilMs);
+      const backend = deps.coordination.backend ?? (deps.ch ? clickhouseCoordinationBackend(deps.ch, deps.liveness) : undefined);
+      if (!backend) throw new HttpError(503, "backend_unavailable", "read backend unavailable");
+      const opts = { settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 };
+      let readiness: Awaited<ReturnType<CoordinationBackend["windowReadiness"]>> = "ready";
+      let schemaMissing = false;
+      try {
+        readiness = await backend.windowReadiness(identity.orgId, identity.workspaceId, since, until, { ...opts, untilExclusive: true });
+      } catch (error) {
+        if (backend.isSchemaMissing(error)) schemaMissing = true;
+        else throw error;
+      }
+      let facts = { lanes: [], sessionsTruncated: 0, notes: [] } as Awaited<ReturnType<CoordinationBackend["readFacts"]>>;
+      if (!schemaMissing) {
+        try {
+          facts = await backend.readFacts(deps.directory, {
+            orgId: identity.orgId, workspaceId: identity.workspaceId, since, until, projectId,
+          }, opts);
+        } catch (error) {
+          if (backend.isSchemaMissing(error)) schemaMissing = true;
+          else throw error;
+        }
+      }
+      const notes = [
+        ...(schemaMissing ? ["coordination facts schema is unavailable"] : []),
+        ...(readiness === "ready" ? [] : [`facts readiness: ${readiness}`]),
+        ...facts.notes,
+      ];
+      const status = schemaMissing ? "unknown" as const
+        : readiness !== "ready" || facts.sessionsTruncated > 0 || facts.notes.some((n) => n.includes("directory unavailable")) ? "partial" as const
+        : "complete" as const;
+      const detected = detectCoordination({
+        workspaceId: identity.workspaceId,
+        window: { since: since.toISOString(), until: until.toISOString() },
+        lanes: facts.lanes,
+      }, { limit });
+      log({ route: c.req.routePath, reason: "coordination_overlaps_served", coverage: status, findings: detected.findings.length, correlation_id: c.get("correlationId") });
+      return c.json({
+        contract: "coordination-overlaps/1",
+        window: { since: since.toISOString(), until: until.toISOString() },
+        generatedAt: new Date().toISOString(),
+        detector: detected.detector,
+        coverage: {
+          status,
+          sessionsConsidered: facts.lanes.length,
+          sessionsTruncated: facts.sessionsTruncated,
+          notes: [...new Set(notes)],
+        },
+        summary: detected.summary,
+        findings: detected.findings,
+      });
+    } catch (error) {
       if (error instanceof DirectoryError) return directoryFail(c, error);
       return fail(c, error);
     }

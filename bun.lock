@@ -48,6 +48,10 @@
         "wrangler": "4.158.0",
       },
     },
+    "packages/coordination-detect": {
+      "name": "@96bulls/coordination-detect",
+      "version": "0.1.0",
+    },
     "packages/coordination-eval": {
       "name": "@96bulls/coordination-eval",
       "version": "0.2.0",
@@ -101,6 +105,8 @@
   },
   "packages": {
     "@96bulls/amp-transport-worker": ["@96bulls/amp-transport-worker@workspace:packages/amp-transport-worker"],
+
+    "@96bulls/coordination-detect": ["@96bulls/coordination-detect@workspace:packages/coordination-detect"],
 
     "@96bulls/coordination-eval": ["@96bulls/coordination-eval@workspace:packages/coordination-eval"],
 

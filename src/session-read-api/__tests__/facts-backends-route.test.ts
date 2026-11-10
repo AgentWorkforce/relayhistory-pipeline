@@ -14,7 +14,10 @@ import type { DigestBackend } from "../digest-backend.ts";
 import type { DailyDigest } from "../digest-query.ts";
 import { DigestDirectoryUnavailable } from "../digest-query.ts";
 import type { Directory } from "../directory.ts";
-import { parseFactsBackend, readApiRouteEnabled, READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND } from "../config.ts";
+import {
+  coordinationOverlapsEnabled, parseFactsBackend, readApiRouteEnabled,
+  READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND,
+} from "../config.ts";
 import { factsBackends } from "../lambda.ts";
 import { FactsReadDeadline } from "../postgres/output-query.ts";
 
@@ -179,7 +182,7 @@ describe("GET /v1/digest/daily over a backend", () => {
 
 describe("READ_API_OUTPUT_BACKEND / READ_API_DIGEST_BACKEND", () => {
   test("unset, empty or clickhouse = clickhouse; postgres = postgres", () => {
-    for (const name of [READ_API_OUTPUT_BACKEND, READ_API_DIGEST_BACKEND] as const) {
+    for (const name of [READ_API_OUTPUT_BACKEND, READ_API_DIGEST_BACKEND, READ_API_COORDINATION_OVERLAPS_BACKEND] as const) {
       expect(parseFactsBackend({}, name)).toBe("clickhouse");
       expect(parseFactsBackend({ [name]: "" }, name)).toBe("clickhouse");
       expect(parseFactsBackend({ [name]: "clickhouse" }, name)).toBe("clickhouse");
@@ -188,7 +191,7 @@ describe("READ_API_OUTPUT_BACKEND / READ_API_DIGEST_BACKEND", () => {
   });
   test("any other value throws naming the variable, never echoing the value", () => {
     for (const value of ["Postgres", " postgres", "pg", "neon", "1", "synthetic-value-x"]) {
-      for (const name of [READ_API_OUTPUT_BACKEND, READ_API_DIGEST_BACKEND] as const) {
+      for (const name of [READ_API_OUTPUT_BACKEND, READ_API_DIGEST_BACKEND, READ_API_COORDINATION_OVERLAPS_BACKEND] as const) {
         let error: Error | null = null;
         try { parseFactsBackend({ [name]: value }, name); } catch (e) { error = e as Error; }
         expect(error?.message).toStartWith(`session read api: ${name} must be`);
@@ -197,8 +200,9 @@ describe("READ_API_OUTPUT_BACKEND / READ_API_DIGEST_BACKEND", () => {
     }
   });
   test("factsBackends: postgres only on the service entry; the Lambda refuses it; bad values refuse both", () => {
-    expect(factsBackends({}, "lambda")).toEqual({ output: "clickhouse", digest: "clickhouse" });
-    expect(factsBackends({ READ_API_OUTPUT_BACKEND: "postgres", READ_API_DIGEST_BACKEND: "postgres" }, "service")).toEqual({ output: "postgres", digest: "postgres" });
+    expect(factsBackends({}, "lambda")).toEqual({ output: "clickhouse", digest: "clickhouse", coordination: "clickhouse" });
+    expect(factsBackends({ READ_API_OUTPUT_BACKEND: "postgres", READ_API_DIGEST_BACKEND: "postgres", READ_API_COORDINATION_OVERLAPS_BACKEND: "postgres" }, "service"))
+      .toEqual({ output: "postgres", digest: "postgres", coordination: "postgres" });
     expect(() => factsBackends({ READ_API_OUTPUT_BACKEND: "postgres" }, "lambda")).toThrow(/served only by the self-host service/);
     expect(() => factsBackends({ READ_API_DIGEST_BACKEND: "postgres" }, "lambda")).toThrow(/served only by the self-host service/);
     expect(() => factsBackends({ READ_API_DIGEST_BACKEND: "nope" }, "service")).toThrow(/READ_API_DIGEST_BACKEND must be/);
@@ -207,5 +211,9 @@ describe("READ_API_OUTPUT_BACKEND / READ_API_DIGEST_BACKEND", () => {
     expect(readApiRouteEnabled("1")).toBe(true);
     expect(readApiRouteEnabled(" 1 ")).toBe(true);
     for (const v of [undefined, "", "0", "true", "yes", "11"]) expect(readApiRouteEnabled(v)).toBe(false);
+  });
+  test("the coordination flag enables only the exact string true", () => {
+    expect(coordinationOverlapsEnabled("true")).toBe(true);
+    for (const value of [undefined, "", "1", " true ", "TRUE", true]) expect(coordinationOverlapsEnabled(value)).toBe(false);
   });
 });
