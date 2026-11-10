@@ -3,7 +3,7 @@ import { sharedWrite60m, type LaneFacts } from "../src/index.ts";
 
 const t = (minute: number) => new Date(Date.UTC(2026, 10, 1, 0, minute)).toISOString();
 const lane = (sessionId: string, minute: number, over: Partial<LaneFacts> = {}): LaneFacts => ({
-  sessionId, source: "codex", userId: "same-user", projectId: "p", branch: "main", taskRef: null,
+  sessionId, source: "codex", userId: "same-user", projectId: "p", repo: "acme/repo", branch: "main", taskRef: null,
   title: sessionId, parentSessionId: null, startedAt: t(minute), lastActionAt: t(minute + 10),
   writes: [{ path: "src/a.ts", ts: t(minute), eventId: `${sessionId}-write`, kind: "tool" }],
   commits: [], outcomes: [], usage: [{ ts: t(minute + 1), eventId: `${sessionId}-usage`, tokens: 10, costUsdMicros: 20 }],
