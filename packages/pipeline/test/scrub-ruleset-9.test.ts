@@ -42,9 +42,25 @@ describe("ruleset 9 assignment extents", () => {
     expect(JSON.stringify(v8Json({ idempotency_key: String.raw`password\u003dSECRET_ALPHA` }))).toContain("SECRET_ALPHA");
   });
 
+  it("redacts percent-encoded assignment separators without decoding the output", () => {
+    expect(v8("idempotency_key=password%3DSECRET_ALPHA")).toContain("SECRET_ALPHA");
+    for (const separator of ["%3d", "%3D", "%3a", "%3A"]) {
+      allPaths(`password${separator}SECRET_ALPHA`);
+      noTail(scrubText(`password${separator}SECRET_ALPHA`));
+    }
+  });
+
+  it("keeps prefixed and multiline credential tails inside the redaction", () => {
+    for (const value of [
+      'APIkey="SECRET_ALPHA SECRET_BETA"',
+      'auth_token="SECRET_ALPHA SECRET_BETA"',
+      'client_secret="SECRET_ALPHA\nSECRET_BETA"',
+    ]) allPaths(value);
+  });
+
   it("redacts terminated and EOI multiword values in every entry point", () => {
     for (const label of ["password", "token", "api_key", "client_secret", "credentials"]) {
-      for (const separator of ["=", ":", " : ", String.raw`\u003d`, String.raw`\u003D`, String.raw`\u003a`, String.raw`\u003A`, String.raw`\x3D`]) {
+      for (const separator of ["=", ":", " : ", String.raw`\u003d`, String.raw`\u003D`, String.raw`\u003a`, String.raw`\u003A`, String.raw`\x3D`, "%3d", "%3D", "%3a", "%3A"]) {
         for (const quote of ['"', "'", String.fromCharCode(96)]) {
           for (const close of [quote, ""]) {
             allPaths(`${label}${separator}${quote}SECRET_ALPHA SECRET_BETA${close}`);
@@ -62,7 +78,7 @@ describe("ruleset 9 assignment extents", () => {
 
   it("handles JSON escaping depths and encoded separators without decoding output", () => {
     for (const label of ["password", "token", "api_key", "client_secret", "credentials"]) {
-      for (const separator of ["=", String.raw`\u003d`, String.raw`\u003D`, String.raw`\u003a`, String.raw`\u003A`]) {
+      for (const separator of ["=", String.raw`\u003d`, String.raw`\u003D`, String.raw`\u003a`, String.raw`\u003A`, "%3d", "%3D", "%3a", "%3A"]) {
         let text = `idempotency_key=${label}${separator}"SECRET_ALPHA SECRET_BETA"`;
         for (let depth = 0; depth < 5; depth++) {
           for (const scrub of [scrubText, scrubLong]) {
@@ -90,7 +106,7 @@ describe("ruleset 9 assignment extents", () => {
   });
 
   it("does not keep a secret tail after an existing redaction marker", () => {
-    for (const separator of ["=", String.raw`\u003D`, String.raw`\u003A`]) {
+    for (const separator of ["=", String.raw`\u003D`, String.raw`\u003A`, "%3D", "%3A"]) {
       for (const quote of ['"', "'", String.fromCharCode(96)]) {
         allPaths(`password${separator}${quote}[REDACTED] SECRET_ALPHA SECRET_BETA${quote}`);
         allPaths(`password${separator}${quote}[REDACTED] SECRET_ALPHA SECRET_BETA`);

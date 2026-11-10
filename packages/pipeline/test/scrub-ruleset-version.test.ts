@@ -95,8 +95,9 @@ const SCRUB_RULESETS: Record<number, string> = {
   8: "50c2e0c67395f488a308cbcfc7c945606374b3d67d37138e284849c6190c8214",
   // Version 9 keeps whole assignment values and encoded separators fail-closed.
   // Updated before release on unmerged #478: preserve JSON quote escapes around
-  // existing redaction markers so wrapped records remain idempotent.
-  9: "ec2a84a2765cafe58ee7313186d3a1f5b914aa1b170a4e552eaafc30b2bee590",
+  // existing redaction markers so wrapped records remain idempotent, and match
+  // literal percent-encoded assignment separators without URL decoding.
+  9: "209c45ee1976808127fc4fb236ea2af84a78e5c0660cbb03d6e8b736a2047674",
 };
 
 const read = (rel: string) =>

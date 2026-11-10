@@ -141,8 +141,9 @@ function backslashesBefore(text: string, at: number): number {
 
 // Match encoded separators without decoding or rewriting the caller's text. A
 // backslash run covers JSON string escaping at every depth; each match consumes
-// its run once. Identifier prefixes remain bounded as in the assignment rule.
-const ASSIGNMENT_HEAD = /\b(idempotency_key|(?:[A-Za-z0-9]+_){0,8}(?:api[_-]?key|apikey|key|secret|token|password|passwd|passphrase|pwd|credentials?))(\\*["'\x60])?\s*(?:[:=]|\\+(?:u003[ad]|x3[ad]))\s*/gi;
+// its run once. Percent-encoded equals/colon are recognized literally too; no
+// URL decoding rewrites surrounding data. Identifier prefixes remain bounded.
+const ASSIGNMENT_HEAD = /\b(idempotency_key|(?:[A-Za-z0-9]+_){0,8}(?:api[_-]?key|apikey|key|secret|token|password|passwd|passphrase|pwd|credentials?))(\\*["'\x60])?\s*(?:[:=]|\\+(?:u003[ad]|x3[ad])|%3[ad])\s*/gi;
 const assignmentQuote = (c: string | undefined) => c === '"' || c === "'" || c === String.fromCharCode(96);
 
 /** A quoted value's real close at its opening JSON-escape depth, or EOI. */
@@ -224,7 +225,7 @@ function redactAssignmentValues(text: string, spans?: Array<[number, number]>): 
     const value = assignmentValue(text, at);
     // Ordinary bare assignments retain their existing token boundary. The
     // established generic rule handles them; encoded separators need this pass.
-    if (!nested && !value.quoted && !m[0].includes("\\")) continue;
+    if (!nested && !value.quoted && !/[\\%]/.test(m[0])) continue;
     let end = nested ? publicEnd : value.end;
     if (!nested && !value.quoted) {
       end = at;

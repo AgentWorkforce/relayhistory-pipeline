@@ -21,7 +21,7 @@ describe("v7/v8 to v9 assignment differential", () => {
     for (let i = 0; i < INPUTS; i++) {
       const a = `zqpriv${i.toString(36)}alphazq`, b = `zqpriv${i.toString(36)}betazq`;
       const label = pick(["password", "token", "api_key", "client_secret", "credentials"]);
-      const sep = pick(["=", ":", " : ", String.raw`\u003d`, String.raw`\u003a`]);
+      const sep = pick(["=", ":", " : ", String.raw`\u003d`, String.raw`\u003D`, String.raw`\u003a`, String.raw`\u003A`, String.raw`\x3d`, "%3d", "%3D", "%3a", "%3A"]);
       const quote = pick(['"', "'", String.fromCharCode(96)]);
       const closed = pick([quote, ""]);
       const shape = pick([0, 1, 2, 3, 4, 5]);
