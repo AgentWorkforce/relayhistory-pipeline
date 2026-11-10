@@ -275,17 +275,76 @@ const projectedUnder = (
   return files;
 };
 
+const execApplyPatchPayload = (patch: string) => ({
+  name: "exec",
+  args_json: JSON.stringify({
+    input: `const patch = ${JSON.stringify(patch)};\nawait tools.apply_patch(patch);`,
+  }),
+});
+
+const projectedFileOccurrences = (
+  source: string,
+  records: Array<{
+    id: string;
+    kind: string;
+    payload: Record<string, unknown>;
+  }>,
+) =>
+  byTable(
+    projectRelayhistorySession(
+      records.map(({ id, kind, payload }) =>
+        parseRelayhistoryRecord(
+          JSON.stringify(line(id, kind, { ts_ms: T, ...payload })),
+        ),
+      ),
+      context(source),
+    ).rows,
+    "convergence_events",
+  ).flatMap((event) => event.files_touched as string[]);
+
 describe("tool-call written paths", () => {
-  it("projects a direct apply_patch Add File envelope", () => {
+  it("does not duplicate a direct apply_patch tool call's file_edit path", () => {
+    const patch =
+      "*** Begin Patch\n*** Update File: src/direct.ts\n@@\n-old\n+new\n*** End Patch";
     expect(
-      projectedToolFiles({
-        name: "apply_patch",
-        args_json: JSON.stringify({
-          input:
-            "*** Begin Patch\n*** Add File: src/new.ts\n+export {};\n*** End Patch",
-        }),
-      }),
-    ).toEqual(["src/new.ts"]);
+      projectedFileOccurrences("codex", [
+        {
+          id: "tool",
+          kind: "tool_call",
+          payload: {
+            name: "apply_patch",
+            tool_use_id: "tool-1",
+            args_json: JSON.stringify({ input: patch }),
+          },
+        },
+        {
+          id: "edit",
+          kind: "file_edit",
+          payload: { file_path: "src/direct.ts", tool_use_id: "tool-1" },
+        },
+      ]),
+    ).toEqual(["src/direct.ts"]);
+  });
+
+  it("does not duplicate a Claude Edit tool call's file_edit path", () => {
+    expect(
+      projectedFileOccurrences("claude", [
+        {
+          id: "tool",
+          kind: "tool_call",
+          payload: {
+            name: "Edit",
+            tool_use_id: "tool-1",
+            args_json: JSON.stringify({ file_path: "src/claude.ts" }),
+          },
+        },
+        {
+          id: "edit",
+          kind: "file_edit",
+          payload: { file_path: "src/claude.ts", tool_use_id: "tool-1" },
+        },
+      ]),
+    ).toEqual(["src/claude.ts"]);
   });
 
   it("projects the static patch variable passed by a code-mode exec", () => {
@@ -303,10 +362,9 @@ describe("tool-call written paths", () => {
 
   it("keeps every written path from a multi-file patch", () => {
     expect(
-      projectedToolFiles({
-        name: "apply_patch",
-        args_json: JSON.stringify({
-          input: [
+      projectedToolFiles(
+        execApplyPatchPayload(
+          [
             "*** Begin Patch",
             "*** Update File: src/a.ts",
             "@@",
@@ -318,17 +376,16 @@ describe("tool-call written paths", () => {
             "+again",
             "*** End Patch",
           ].join("\n"),
-        }),
-      }),
+        ),
+      ),
     ).toEqual(["src/a.ts", "src/b.ts"]);
   });
 
   it("records both sides of a move", () => {
     expect(
-      projectedToolFiles({
-        name: "apply_patch",
-        args_json: JSON.stringify({
-          input: [
+      projectedToolFiles(
+        execApplyPatchPayload(
+          [
             "*** Begin Patch",
             "*** Update File: old/name.ts",
             "*** Move to: new/name.ts",
@@ -336,19 +393,18 @@ describe("tool-call written paths", () => {
             "+moved",
             "*** End Patch",
           ].join("\n"),
-        }),
-      }),
+        ),
+      ),
     ).toEqual(["old/name.ts", "new/name.ts"]);
   });
 
   it("records a deleted path", () => {
     expect(
-      projectedToolFiles({
-        name: "apply_patch",
-        args_json: JSON.stringify({
-          input: "*** Begin Patch\n*** Delete File: obsolete.ts\n*** End Patch",
-        }),
-      }),
+      projectedToolFiles(
+        execApplyPatchPayload(
+          "*** Begin Patch\n*** Delete File: obsolete.ts\n*** End Patch",
+        ),
+      ),
     ).toEqual(["obsolete.ts"]);
   });
 
@@ -367,17 +423,20 @@ describe("tool-call written paths", () => {
     ).toEqual(["src/multi.ts"]);
   });
 
-  it("projects another namespaced structured edit tool from file_path", () => {
+  it("does not derive paths for a structured tool captured as file_edit", () => {
     expect(
-      projectedToolFiles({
-        name: "functions.StrReplace",
-        args_json: JSON.stringify({
-          file_path: "/work/replace.ts",
-          old_str: "old",
-          new_str: "new",
-        }),
-      }),
-    ).toEqual(["/work/replace.ts"]);
+      projectedToolFiles(
+        {
+          name: "functions.StrReplace",
+          args_json: JSON.stringify({
+            file_path: "/work/replace.ts",
+            old_str: "old",
+            new_str: "new",
+          }),
+        },
+        "grok",
+      ),
+    ).toEqual([]);
   });
 
   it("does not treat an arbitrary tool with file_path as a write", () => {
@@ -391,20 +450,22 @@ describe("tool-call written paths", () => {
 
   it("rejects malformed structured file_path arguments", () => {
     expect(
-      projectedToolFiles({
-        name: "Write",
-        args_json: JSON.stringify({ file_path: ` ${"x".repeat(512)}` }),
-      }),
+      projectedToolFiles(
+        {
+          name: "MultiEdit",
+          args_json: JSON.stringify({ file_path: ` ${"x".repeat(512)}` }),
+        },
+        "claude",
+      ),
     ).toEqual([]);
   });
 
   it("ignores malformed envelopes and malformed or oversized paths", () => {
     const tooLong = "x".repeat(513);
     expect(
-      projectedToolFiles({
-        name: "apply_patch",
-        args_json: JSON.stringify({
-          input: [
+      projectedToolFiles(
+        execApplyPatchPayload(
+          [
             "prefix *** Begin Patch",
             "*** Update File: not-an-envelope.ts",
             "*** Begin Patch",
@@ -415,8 +476,8 @@ describe("tool-call written paths", () => {
             "*** Begin Patch",
             "*** Update File: missing-end.ts",
           ].join("\n"),
-        }),
-      }),
+        ),
+      ),
     ).toEqual([]);
   });
 
@@ -468,22 +529,20 @@ describe("tool-call written paths", () => {
       "*** Update File: src/last.ts",
       "*** End Patch",
     ].join("\n");
-    expect(
-      projectedUnder(100, {
-        name: "apply_patch",
-        args_json: JSON.stringify({ input }),
-      }),
-    ).toEqual(["src/last.ts"]);
+    expect(projectedUnder(100, execApplyPatchPayload(input))).toEqual([
+      "src/last.ts",
+    ]);
   });
 
   it("skips a 1 MiB plus one input under the hard time bound", () => {
-    const envelope =
-      "\n*** Begin Patch\n*** Add File: src/hidden.ts\n*** End Patch";
-    const input = `${"x".repeat(1024 * 1024 + 1 - envelope.length)}${envelope}`;
+    const suffix = `;await tools.apply_patch(${JSON.stringify(
+      "*** Begin Patch\n*** Add File: src/hidden.ts\n*** End Patch",
+    )});`;
+    const input = `${" ".repeat(1024 * 1024 + 1 - suffix.length)}${suffix}`;
     expect(input).toHaveLength(1024 * 1024 + 1);
     expect(
       projectedUnder(100, {
-        name: "apply_patch",
+        name: "exec",
         args_json: JSON.stringify({ input }),
       }),
     ).toEqual([]);
@@ -492,11 +551,9 @@ describe("tool-call written paths", () => {
   it("does not record paths for a failed tool call", () => {
     expect(
       projectedToolFiles({
-        name: "apply_patch",
-        args_json: JSON.stringify({
-          input:
-            "*** Begin Patch\n*** Update File: src/rejected.ts\n*** End Patch",
-        }),
+        ...execApplyPatchPayload(
+          "*** Begin Patch\n*** Update File: src/rejected.ts\n*** End Patch",
+        ),
         is_error: true,
       }),
     ).toEqual([]);

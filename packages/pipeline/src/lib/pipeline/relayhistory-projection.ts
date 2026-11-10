@@ -486,23 +486,6 @@ const PATCH_PATH_HEADERS = [
   "*** Delete File: ",
   "*** Move to: ",
 ] as const;
-const STRUCTURED_FILE_EDIT_TOOLS = new Set([
-  "applypatch",
-  "createfile",
-  "delete",
-  "deletefile",
-  "edit",
-  "editfile",
-  "editnotebook",
-  "multiedit",
-  "patch",
-  "searchreplace",
-  "strreplace",
-  "strreplaceeditor",
-  "write",
-  "writefile",
-]);
-
 function validWrittenPath(path: string): boolean {
   return (
     path.length > 0 &&
@@ -712,14 +695,13 @@ function patchPaths(inputs: readonly string[]): string[] {
   return paths;
 }
 
-function writtenPaths(name: string | null, args: unknown): string[] {
+function writtenPaths(
+  source: string,
+  name: string | null,
+  args: unknown,
+): string[] {
   if (!isObject(args)) return [];
-  if (name === "apply_patch") {
-    const input = typeof args.input === "string" ? args.input : args.patch;
-    return typeof input === "string" && input.length <= MAX_EDIT_INPUT_CHARS
-      ? patchPaths([input])
-      : [];
-  }
+  // Code-mode capture sees only the outer exec, not its nested apply_patch.
   if (
     name === "exec" &&
     typeof args.input === "string" &&
@@ -727,17 +709,19 @@ function writtenPaths(name: string | null, args: unknown): string[] {
   )
     return patchPaths(execApplyPatchInputs(args.input));
   const filePath = args.file_path;
+  // Claude capture emits file_edit for Edit/Write/NotebookEdit, but not MultiEdit.
   if (
+    source === "claude" &&
     name !== null &&
     typeof filePath === "string" &&
-    STRUCTURED_FILE_EDIT_TOOLS.has(normalizedToolName(name)) &&
+    normalizedToolName(name) === "multiedit" &&
     validWrittenPath(filePath)
   )
     return [filePath];
   return [];
 }
 
-function toolCall(payload: Json, toolUse: string | null) {
+function toolCall(payload: Json, toolUse: string | null, source: string) {
   const raw = text(payload, "is_error");
   const isError = ["1", "true"].includes(raw ?? "")
     ? true
@@ -765,7 +749,7 @@ function toolCall(payload: Json, toolUse: string | null) {
     call,
     status,
     writtenPaths:
-      isError === true ? [] : writtenPaths(text(payload, "name"), args),
+      isError === true ? [] : writtenPaths(source, text(payload, "name"), args),
   };
 }
 
@@ -780,7 +764,7 @@ function activityEvent(
   const ms = activityMs(p);
   const tool =
     kind === "tool_call"
-      ? toolCall(p, nullIfEmpty(text(p, "tool_use_id")))
+      ? toolCall(p, nullIfEmpty(text(p, "tool_use_id")), context.source)
       : null;
   const filePath =
     kind === "file_edit" ? nullIfEmpty(text(p, "file_path")) : null;
