@@ -62,7 +62,7 @@ test("portable completeness binds current metadata epoch, missing state, tenant,
   } finally { await db.close(); }
 }, 30_000);
 
-test("ensureSchema grants the read API role only the projection columns its completeness check reads", async () => {
+test("ensureSchema grants the read API role only the search privileges its reads require", async () => {
   const db = new PGlite();
   const tenant = { orgId: "org-a", workspaceId: "ws-a" };
   try {
@@ -82,7 +82,9 @@ test("ensureSchema grants the read API role only the projection columns its comp
       CREATE TABLE search_index.transcript_events(org_id text,workspace_id text,session_id text,content text);
       ALTER TABLE search_index.transcript_events ENABLE ROW LEVEL SECURITY;
       ALTER TABLE search_index.transcript_events FORCE ROW LEVEL SECURITY;
-      CREATE POLICY tenant_only ON search_index.transcript_events USING (org_id=current_setting('bulls96_read.org_id',true) AND workspace_id=current_setting('bulls96_read.workspace_id',true));
+      CREATE POLICY tenant_only ON search_index.transcript_events
+        USING (org_id=current_setting('bulls96_read.org_id',true) AND workspace_id=current_setting('bulls96_read.workspace_id',true))
+        WITH CHECK (org_id=current_setting('bulls96_read.org_id',true) AND workspace_id=current_setting('bulls96_read.workspace_id',true));
       INSERT INTO search_index.transcript_events VALUES('org-a','ws-a','s1','mine'),('org-b','ws-a','s1','other tenant');`);
     const reader: TenantRunner = (org, workspace, work) => db.transaction(async tx => {
       await tx.exec("SET LOCAL ROLE bulls96_read_api");
@@ -109,6 +111,13 @@ test("ensureSchema grants the read API role only the projection columns its comp
     // Before the fix this failed with "permission denied for table transcript_events".
     const events = await reader("org-a", "ws-a", tx => tx.query<{ content: string }>("SELECT content FROM search_index.transcript_events"));
     expect(events.rows.map(r => r.content)).toEqual(["mine"]);
+    // An independently invoked state bootstrap must not grant event reads merely because the table
+    // exists. It re-verifies the event table's forced tenant gate before every grant attempt.
+    await db.exec("REVOKE SELECT ON search_index.transcript_events FROM bulls96_read_api; ALTER TABLE search_index.transcript_events NO FORCE ROW LEVEL SECURITY");
+    await expect(state.ensureSchema(db)).rejects.toThrow("search state event tenant policy mismatch");
+    const unsafe = await db.query<{ readable: boolean }>(
+      "SELECT has_table_privilege('bulls96_read_api','search_index.transcript_events','SELECT') AS readable");
+    expect(unsafe.rows[0]?.readable).toBe(false);
   } finally {
     await db.close();
   }

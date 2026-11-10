@@ -75,23 +75,43 @@ export function postgresSearchState(options: { reader?: TenantRunner; backendId:
       // fails closed here. The writer binds the tenant GUCs per scope
       // instead (every search write runs inside a tenant transaction).
       if (rows.length !== 1) throw new Error("search state tenant policy mismatch");
-      // The read API's completeness check (partials) reads this table as bulls96_read_api, under the
-      // tenant_only policy above. This schema is created here at consumer start, after the role
-      // bootstrap has run, so the grant lives here. Without it every /events read is a 503
-      // ("permission denied for schema"). Only the columns partials reads; no writes.
-      await owner.query(`DO $grant$ BEGIN
-        IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bulls96_read_api') THEN
-          GRANT USAGE ON SCHEMA "${schema}" TO bulls96_read_api;
-          GRANT SELECT (backend_id,org_id,workspace_id,source,session_id,canonical_session_id,source_epoch,coverage_from_ms,complete)
-            ON ${table} TO bulls96_read_api;
-          -- The events/search reads (session-read-api queries.ts) read transcript_events rows. The index
-          -- schema is provisioned before this step (runBootstrap order) and carries forced tenant_only RLS,
-          -- so SELECT is still scoped to the transaction's bound org/workspace. Read-only.
-          IF to_regclass('"${schema}".transcript_events') IS NOT NULL THEN
-            GRANT SELECT ON "${schema}".transcript_events TO bulls96_read_api;
-          END IF;
-        END IF;
-      END $grant$`);
+      const readRole = await owner.query<{ present: boolean }>(
+        "SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bulls96_read_api') AS present",
+      );
+      if (readRole.rows[0]?.present) {
+        const eventTable = `"${schema}".transcript_events`;
+        const eventRelation = await owner.query<{ present: boolean; enabled: boolean | null; forced: boolean | null }>(
+          `SELECT to_regclass($1) IS NOT NULL AS present,
+                  c.relrowsecurity AS enabled,c.relforcerowsecurity AS forced
+             FROM (SELECT to_regclass($1) AS oid) r
+             LEFT JOIN pg_class c ON c.oid=r.oid`,
+          [eventTable],
+        );
+        if (eventRelation.rows[0]?.present) {
+          const eventPolicies = await owner.query<TenantPolicyRow>(
+            `SELECT polname AS name,polcmd::text AS command,
+              CASE WHEN polroles = '{0}' THEN '{0}'
+                   ELSE (SELECT string_agg(r.rolname, ',' ORDER BY r.rolname) FROM pg_roles r WHERE r.oid = ANY(polroles)) END AS roles,
+              polpermissive AS permissive,
+              pg_get_expr(polqual,polrelid) AS qual,pg_get_expr(polwithcheck,polrelid) AS check
+             FROM pg_policy WHERE polrelid=$1::regclass`,
+            [eventTable],
+          );
+          if (eventRelation.rows[0]?.enabled !== true || eventRelation.rows[0]?.forced !== true ||
+              eventPolicies.rows.length !== 1 || !isTenantOnlyPolicy(eventPolicies.rows[0]!))
+            throw new Error("search state event tenant policy mismatch");
+        }
+        // The read API's completeness check (partials) reads this table as bulls96_read_api, under the
+        // tenant_only policy above. This schema is created here at consumer start, after the role
+        // bootstrap has run, so the grant lives here. Without it every /events read is a 503
+        // ("permission denied for schema"). Only the columns partials reads; no writes. If the events
+        // table exists, its SELECT grant is issued only after its forced tenant_only policy verifies.
+        await owner.query(`GRANT USAGE ON SCHEMA "${schema}" TO bulls96_read_api`);
+        await owner.query(`GRANT SELECT (backend_id,org_id,workspace_id,source,session_id,canonical_session_id,source_epoch,coverage_from_ms,complete)
+          ON ${table} TO bulls96_read_api`);
+        if (eventRelation.rows[0]?.present)
+          await owner.query(`GRANT SELECT ON ${eventTable} TO bulls96_read_api`);
+      }
     },
     async fromMs() { return fromMs; },
     async record(tx, scope, value) {
