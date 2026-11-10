@@ -479,6 +479,7 @@ function requestIdentity(kind: string, payload: Json): string | null {
 
 const MAX_WRITTEN_PATHS = 64;
 const MAX_WRITTEN_PATH_CHARS = 512;
+const MAX_EDIT_INPUT_CHARS = 1024 * 1024;
 const PATCH_PATH_HEADERS = [
   "*** Add File: ",
   "*** Update File: ",
@@ -524,13 +525,13 @@ function jsString(
 ): { value: string; end: number } | null {
   const quote = source[start];
   if (quote !== '"' && quote !== "'" && quote !== "`") return null;
-  let value = "";
+  const value: string[] = [];
   for (let at = start + 1; at < source.length; at += 1) {
     const char = source[at]!;
-    if (char === quote) return { value, end: at + 1 };
+    if (char === quote) return { value: value.join(""), end: at + 1 };
     if (quote === "`" && char === "$" && source[at + 1] === "{") return null;
     if (char !== "\\") {
-      value += char;
+      value.push(char);
       continue;
     }
     at += 1;
@@ -546,7 +547,7 @@ function jsString(
       "0": "\0",
     };
     if (simple[escaped] !== undefined) {
-      value += simple[escaped];
+      value.push(simple[escaped]);
       continue;
     }
     if (escaped === "\n") continue;
@@ -557,27 +558,27 @@ function jsString(
     if (escaped === "x") {
       const digits = source.slice(at + 1, at + 3);
       if (!/^[0-9a-f]{2}$/i.test(digits)) return null;
-      value += String.fromCharCode(Number.parseInt(digits, 16));
+      value.push(String.fromCharCode(Number.parseInt(digits, 16)));
       at += 2;
       continue;
     }
     if (escaped === "u") {
-      const braced = /^\{([0-9a-f]{1,6})\}/i.exec(source.slice(at + 1));
+      const braced = /^\{([0-9a-f]{1,6})\}/i.exec(source.slice(at + 1, at + 9));
       if (braced) {
         const point = Number.parseInt(braced[1]!, 16);
         if (point > 0x10ffff) return null;
-        value += String.fromCodePoint(point);
+        value.push(String.fromCodePoint(point));
         at += braced[0].length;
         continue;
       }
       const digits = source.slice(at + 1, at + 5);
       if (!/^[0-9a-f]{4}$/i.test(digits)) return null;
-      value += String.fromCharCode(Number.parseInt(digits, 16));
+      value.push(String.fromCharCode(Number.parseInt(digits, 16)));
       at += 4;
       continue;
     }
     // JavaScript's identity escapes, including escaped quotes and backslashes.
-    value += escaped;
+    value.push(escaped);
   }
   return null;
 }
@@ -618,6 +619,7 @@ function execApplyPatchInputs(source: string): string[] {
       at = literal.end;
       continue;
     }
+    if (['"', "'", "`"].includes(source[at] ?? "")) return inputs;
     const token = identifier(source, at);
     if (!token) {
       at += 1;
@@ -635,6 +637,7 @@ function execApplyPatchInputs(source: string): string[] {
           at = value.end;
           continue;
         }
+        if (['"', "'", "`"].includes(source[valueAt] ?? "")) return inputs;
       }
     } else if (token.value === "tools") {
       let cursor = skipSpace(source, token.end);
@@ -650,6 +653,7 @@ function execApplyPatchInputs(source: string): string[] {
         const argument = jsString(source, argumentAt);
         if (argument) inputs.push(argument.value);
         else {
+          if (['"', "'", "`"].includes(source[argumentAt] ?? "")) return inputs;
           const name = identifier(source, argumentAt);
           const value = name ? variables.get(name.value) : undefined;
           if (value !== undefined) inputs.push(value);
@@ -661,50 +665,48 @@ function execApplyPatchInputs(source: string): string[] {
   return inputs;
 }
 
-function exactLine(input: string, marker: string, start: number): number {
-  let cursor = start;
-  for (;;) {
-    const at = input.indexOf(marker, cursor);
-    if (at < 0) return -1;
-    const end = at + marker.length;
-    if (
-      (at === 0 || input[at - 1] === "\n") &&
-      (end === input.length || input[end] === "\n")
-    )
-      return at;
-    cursor = end;
-  }
-}
-
 function patchPaths(inputs: readonly string[]): string[] {
   const paths: string[] = [];
   const seen = new Set<string>();
   for (const raw of inputs) {
-    const input = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    let cursor = 0;
-    while (paths.length < MAX_WRITTEN_PATHS) {
-      const begin = exactLine(input, "*** Begin Patch", cursor);
-      if (begin < 0) break;
-      const body = begin + "*** Begin Patch".length + 1;
-      const end = exactLine(input, "*** End Patch", body);
-      if (end < 0) break;
-      const nested = exactLine(input, "*** Begin Patch", body);
-      if (nested >= 0 && nested < end) {
-        cursor = nested;
+    if (raw.length > MAX_EDIT_INPUT_CHARS) continue;
+    let inside = false;
+    let pending: string[] = [];
+    let pendingSeen = new Set<string>();
+    for (const line of raw
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .split("\n")) {
+      if (line === "*** Begin Patch") {
+        inside = true;
+        pending = [];
+        pendingSeen = new Set<string>();
         continue;
       }
-      for (const line of input.slice(body, end).split("\n")) {
-        const header = PATCH_PATH_HEADERS.find((prefix) =>
-          line.startsWith(prefix),
-        );
-        if (!header) continue;
-        const path = line.slice(header.length);
-        if (!validWrittenPath(path) || seen.has(path)) continue;
-        seen.add(path);
-        paths.push(path);
-        if (paths.length === MAX_WRITTEN_PATHS) break;
+      if (line === "*** End Patch") {
+        if (inside) {
+          for (const path of pending) {
+            seen.add(path);
+            paths.push(path);
+          }
+          if (paths.length === MAX_WRITTEN_PATHS) return paths;
+        }
+        inside = false;
+        pending = [];
+        pendingSeen = new Set<string>();
+        continue;
       }
-      cursor = end + "*** End Patch".length;
+      if (!inside || pending.length + paths.length === MAX_WRITTEN_PATHS)
+        continue;
+      const header = PATCH_PATH_HEADERS.find((prefix) =>
+        line.startsWith(prefix),
+      );
+      if (!header) continue;
+      const path = line.slice(header.length);
+      if (!validWrittenPath(path) || seen.has(path) || pendingSeen.has(path))
+        continue;
+      pendingSeen.add(path);
+      pending.push(path);
     }
   }
   return paths;
@@ -714,9 +716,15 @@ function writtenPaths(name: string | null, args: unknown): string[] {
   if (!isObject(args)) return [];
   if (name === "apply_patch") {
     const input = typeof args.input === "string" ? args.input : args.patch;
-    return typeof input === "string" ? patchPaths([input]) : [];
+    return typeof input === "string" && input.length <= MAX_EDIT_INPUT_CHARS
+      ? patchPaths([input])
+      : [];
   }
-  if (name === "exec" && typeof args.input === "string")
+  if (
+    name === "exec" &&
+    typeof args.input === "string" &&
+    args.input.length <= MAX_EDIT_INPUT_CHARS
+  )
     return patchPaths(execApplyPatchInputs(args.input));
   const filePath = args.file_path;
   if (
@@ -756,7 +764,8 @@ function toolCall(payload: Json, toolUse: string | null) {
   return {
     call,
     status,
-    writtenPaths: writtenPaths(text(payload, "name"), args),
+    writtenPaths:
+      isError === true ? [] : writtenPaths(text(payload, "name"), args),
   };
 }
 

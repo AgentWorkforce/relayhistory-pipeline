@@ -265,6 +265,16 @@ const projectedToolFiles = (
   return event.files_touched;
 };
 
+const projectedUnder = (
+  milliseconds: number,
+  payload: Record<string, unknown>,
+) => {
+  const started = performance.now();
+  const files = projectedToolFiles(payload);
+  expect(performance.now() - started).toBeLessThan(milliseconds);
+  return files;
+};
+
 describe("tool-call written paths", () => {
   it("projects a direct apply_patch Add File envelope", () => {
     expect(
@@ -437,6 +447,57 @@ describe("tool-call written paths", () => {
         args_json: JSON.stringify({
           input: `await tools.exec_command({ cmd: "sed -i s/a/b/ src/a.ts; apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: src/fake.ts\n*** End Patch\nPATCH" });`,
         }),
+      }),
+    ).toEqual([]);
+  });
+
+  it("stops on an unterminated exec literal in linear time", () => {
+    const input = `"${'a\\"'.repeat(86_016)}`.slice(0, 258_048);
+    expect(input).toHaveLength(258_048);
+    expect(
+      projectedUnder(100, {
+        name: "exec",
+        args_json: JSON.stringify({ input }),
+      }),
+    ).toEqual([]);
+  });
+
+  it("scans 20,000 nested patch starts in linear time", () => {
+    const input = [
+      ...Array.from({ length: 20_000 }, () => "*** Begin Patch"),
+      "*** Update File: src/last.ts",
+      "*** End Patch",
+    ].join("\n");
+    expect(
+      projectedUnder(100, {
+        name: "apply_patch",
+        args_json: JSON.stringify({ input }),
+      }),
+    ).toEqual(["src/last.ts"]);
+  });
+
+  it("skips a 1 MiB plus one input under the hard time bound", () => {
+    const envelope =
+      "\n*** Begin Patch\n*** Add File: src/hidden.ts\n*** End Patch";
+    const input = `${"x".repeat(1024 * 1024 + 1 - envelope.length)}${envelope}`;
+    expect(input).toHaveLength(1024 * 1024 + 1);
+    expect(
+      projectedUnder(100, {
+        name: "apply_patch",
+        args_json: JSON.stringify({ input }),
+      }),
+    ).toEqual([]);
+  });
+
+  it("does not record paths for a failed tool call", () => {
+    expect(
+      projectedToolFiles({
+        name: "apply_patch",
+        args_json: JSON.stringify({
+          input:
+            "*** Begin Patch\n*** Update File: src/rejected.ts\n*** End Patch",
+        }),
+        is_error: true,
       }),
     ).toEqual([]);
   });
