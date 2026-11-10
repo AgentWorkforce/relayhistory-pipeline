@@ -40,8 +40,10 @@ export async function dispatchRegisteredLambda(adapter: PipelineRuntimeAdapter, 
       const manifests = items.filter((item): item is Extract<WorkItem, { type: "manifest-landed" }> => item.type === "manifest-landed");
       if (manifests.length) {
         const answer = await invoke({ Records: manifests.map(item => ({ messageId: item.id, body: queueBody(item) })) });
-        if (!("batchItemFailures" in answer)) throw new Error("pipeline batch response invalid");
-        const failed = new Set(answer.batchItemFailures.map(f => f.itemIdentifier));
+        const failures = "batchItemFailures" in answer ? answer.batchItemFailures : undefined;
+        if (!Array.isArray(failures) || failures.some((f: unknown) => !f || typeof f !== "object" || typeof (f as { itemIdentifier?: unknown }).itemIdentifier !== "string"))
+          throw new Error("pipeline batch response invalid");
+        const failed = new Set(failures.map(f => (f as { itemIdentifier: string }).itemIdentifier));
         for (const item of manifests) results.set(item.id, failed.has(item.id) ? { status: "retry", delaySeconds: 0, code: "service_retry" } : { status: "done" });
       }
       for (const item of items) if (item.type === "schedule") {
