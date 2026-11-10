@@ -14,14 +14,22 @@ marker is copied and immutable. Source bytes and location are privately captured
 before the first await. The source digest and scrub invocation use the same
 snapshot. Each seal invokes that engine even for unchanged output and existing
 objects. Failed health checks, mismatched results, or unknown traps poison the
-binding. Typed call refusals remain typed; retryable allocation refusal remains
+binding and mark a verified bound instance failed for every caller, including
+`activeScrubEngine()`. Empty output or zero records for non-empty input is an
+instance defect for admitted nonblank input and is never persisted. Empty or
+blank-only streams are refused at admission before invoking or poisoning the
+engine (the real Rust artifact legitimately emits zero records for those).
+Typed call refusals remain typed; retryable allocation refusal remains
 retryable. Output may expand past the input per-record limit; the scaffold
-stages at most 64 MiB of output, refusing a larger output retryably without
-poisoning a healthy engine. This capacity bound needs cutover review. Nothing falls back to TypeScript or unscrubbed input.
+stages at most 64 MiB of output. Larger output refuses with non-retryable
+`scrub_output_too_large` (HTTP 413) without poisoning a healthy engine. This
+capacity bound needs cutover review. Nothing falls back to TypeScript or
+unscrubbed input.
 
-The new module compresses only successful scrub output with the existing exported
+The new module frames only successful scrub output with the existing exported
 raw-Zstd-frame transport encoder. These are valid Zstd frames containing scrubbed
-bytes, not a plaintext fallback. New objects are create-only and carry the bound
+bytes in Raw blocks, without compression; this is not a plaintext fallback.
+New objects are create-only and carry the bound
 family, version and `scrub-profile`. Profile metadata is informational until a
 separate manifest schema/pin review; default readers do not require it and there
 is no new manifest-wide profile for mixed histories.
@@ -56,3 +64,16 @@ limits, and byte-exact historical/default wrapper comparisons. It is source
 validation with distinguishable test engines. Workers compiled-WASM provenance,
 real artifact recall/precision/performance, image qualification, retained database
 rehearsal, and live end-to-end acceptance remain separate mandatory cutover work.
+
+The HTTP route also returns 503 `scrub_unavailable` when a non-TS engine is
+selected but is uninitialised or no explicit sealer is routed; this is not an
+activation path. Deterministic output overflow is 413, while allocation refusal
+is retryable. Publication capture reserves roughly 400 bytes below its 16 MiB
+limit for framing; the injected sealer can therefore be refused at that capture
+bound before the raw sealer's 64 MiB capacity.
+
+Cutover decisions still outstanding: output records may expand beyond 16 MiB;
+structural test-engine injection does not prove every production port is bound
+to the exact verified instance; publication-job.ts does not yet route a sealer.
+The image context excludes packages/pipeline/test, including synthetic engine
+fixtures. No artifact pin or production selector changes in this follow-up.
