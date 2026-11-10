@@ -29,6 +29,7 @@ import { scrubJson as prefixJson, scrubText as prefixText } from "./fixtures/scr
 import { scrubJson as v5Json, scrubText as v5Text } from "./fixtures/scrub-ruleset-5.js";
 import { MAX_SCRUB_CHARS, scrubJson, scrubRecord, scrubText } from "../src/lib/scrub.js";
 import { scrubLong, scrubRecords } from "../src/lib/pipeline/raw-chunks.js";
+import { frozenScrubModule } from "./support/frozen-scrub-module.js";
 
 /** sha256 of fixtures/scrub-ruleset-6-prefix-f6a97053.ts (LF line endings). */
 const PREFIX_FIXTURE_SHA256 = "737d6d4678ebf94f74a99f1b85d9e1536a5c0ffacb752d2eff3ccd8bdf1392ff";
@@ -42,7 +43,7 @@ let prefixRecords: Records;
 
 beforeAll(async () => {
   vi.resetModules();
-  vi.doMock("../src/lib/scrub.js", () => import("./fixtures/scrub-ruleset-6-prefix-f6a97053.js"));
+  vi.doMock("../src/lib/scrub.js", async () => frozenScrubModule(await import("./fixtures/scrub-ruleset-6-prefix-f6a97053.js")));
   prefixRecords = (await import("../src/lib/pipeline/raw-chunks.js")).scrubRecords as Records;
   vi.doUnmock("../src/lib/scrub.js");
   vi.resetModules();

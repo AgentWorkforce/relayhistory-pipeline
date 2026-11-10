@@ -29,8 +29,11 @@
  *
  * Rule set 8 is frozen in `fixtures/scrub-ruleset-8.ts`: byte for byte
  * `git show 5a16e910:packages/pipeline/src/lib/scrub.ts`, pinned by its sha256 below. Rule
- * set 8's `scrubRecords` is the current raw-chunks.ts (its segmenter is unchanged in rule
- * set 9) loaded with `lib/scrub.ts` mocked to that fixture.
+ * set 8's `scrubRecords` is the current raw-chunks.ts loaded with `lib/scrub.ts` mocked to
+ * that fixture (`support/frozen-scrub-module.ts`). Rule set 9 changed the segmenter in one
+ * place only: a string under the public replay selector is scrubbed as a container. The
+ * mock's `isPublicSelectorKey` is always false, so against the fixture the segmenter takes
+ * rule set 8's path everywhere.
  */
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -38,6 +41,7 @@ import { fileURLToPath } from "node:url";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { scrubJson as v8Json, scrubText as v8 } from "./fixtures/scrub-ruleset-8.js";
 import { MAX_QUOTED_VALUE, scrubJson as v9Json, scrubText as v9 } from "../src/lib/scrub.js";
+import { frozenScrubModule } from "./support/frozen-scrub-module.js";
 
 const V8_FIXTURE_SHA256 = "fce75866a2dbf312f1865210fe343e1c372d216c3318dfacc27de6a3f8a82cc7";
 const INPUTS = Number(process.env.SCRUB_FUZZ_INPUTS ?? 2000);
@@ -53,7 +57,7 @@ const v9Records = (text: string) => dec.decode(v9RecordsRaw(enc.encode(text)).sc
 
 beforeAll(async () => {
   vi.resetModules();
-  vi.doMock("../src/lib/scrub.js", () => import("./fixtures/scrub-ruleset-8.js"));
+  vi.doMock("../src/lib/scrub.js", async () => frozenScrubModule(await import("./fixtures/scrub-ruleset-8.js")));
   v8RecordsRaw = (await import("../src/lib/pipeline/raw-chunks.js")).scrubRecords as Records;
   vi.doUnmock("../src/lib/scrub.js");
   vi.resetModules();
@@ -229,4 +233,186 @@ describe("rule set 8 vs 9 (differential fuzz)", () => {
     expect(leaked, first).toBe(0);
     expect(differ).toBeGreaterThan(0);
   }, 300_000);
+});
+
+/*
+ * Records structured path (rule set 9 changed the segmenter here): a string under the
+ * public replay selector, directly or below it, is a container on `scrubRecords` too. The
+ * rule set 8 harness above (raw-chunks.ts over the frozen source) stores the tail; rule set
+ * 9 never re-emits a token rule set 8 redacted, and drops every token after a nested
+ * credential inside such a container. NDJSON lines are scrubbed in batches of 500.
+ * SCRUB_RECORDS_FUZZ_INPUTS changes the count (default 200,000 records).
+ */
+const RECORD_INPUTS = Number(process.env.SCRUB_RECORDS_FUZZ_INPUTS ?? 200_000);
+
+describe("rule set 8 vs 9 on the records path under a public selector", () => {
+  it("rule set 8's scrubRecords stores the tail; rule set 9's does not", () => {
+    const B = "password=SECRET_ALPHA SECRET_BETA";
+    for (const value of [
+      { idempotency_key: B },
+      { before: "k", idempotency_key: B, after: "k" },
+      { idempotency_key: { a: B } },
+      { idempotency_key: [B, "x"] },
+      { task: { idempotency_key: B } },
+      { a: { b: { c: { idempotency_key: B } } } },
+      { IDEMPOTENCY_KEY: B },
+      { idempotency_key: "password=[REDACTED] SECRET_BETA" },
+    ]) {
+      const line = JSON.stringify(value);
+      expect(v8Records(`${line}\n`), line).toContain("SECRET_BETA");
+      const out = v9Records(`${line}\n`);
+      expect(out, line).not.toContain("SECRET_BETA");
+      expect(JSON.parse(out), line).toEqual(v9Json(value));
+    }
+    for (const dup of ['{"idempotency_key":"ok","idempotency_key":"password=A SECRET_BETA"}', '{"idempotency_key":"password=A SECRET_BETA","idempotency_key":"ok"}']) {
+      expect(v8Records(`${dup}\n`), dup).toContain("SECRET_BETA");
+      expect(v9Records(`${dup}\n`), dup).not.toContain("SECRET_BETA");
+    }
+    // Siblings and controls: byte-identical to rule set 8.
+    for (const line of ['{"idempotency_key":"public-replay-42","note":"password=A B"}', '{"IDEMPOTENCY_KEY":"public-replay-42"}', '{"idempotency_key":"[REDACTED]"}']) {
+      expect(v9Records(`${line}\n`), line).toBe(v8Records(`${line}\n`));
+    }
+  });
+
+  it(`never re-emits a token rule set 8 redacted, and drops tails in public containers (${RECORD_INPUTS} NDJSON records)`, () => {
+    // mulberry32: the shared LCG above loses precision in doubles and cycles after about
+    // 10k draws from this seed, which would repeat the same record shapes every ~100 lines.
+    let state = (SEED ^ 0x9e9e) >>> 0;
+    const rnd = (n: number) => {
+      state = (state + 0x6d2b79f5) >>> 0;
+      let t = state;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return Math.floor((((t ^ (t >>> 14)) >>> 0) / 0x100000000) * n);
+    };
+    const pick = <T,>(a: readonly T[]) => a[rnd(a.length)] as T;
+    const PUBLIC_KEYS = ["idempotency_key", "IDEMPOTENCY_KEY", "Idempotency_Key", " idempotency_key "];
+    const OTHER_KEYS = ["note", "content", "text", "idempotency_key_2", "name"];
+    const SECRET_KEYS = ["password", "token", "api_key"];
+    const CRED = ["password", "api_key", "auth_token", "client_secret", "DB_PASSWORD", "token", "pwd"];
+    const CSEPS = ["=", ":", " = ", ": ", "\t=", `${B}u003d`, `${B}x3A`, `${B}${B}u003D`, "%3D", "%3a", "%253D", "%25253a"];
+    // No quote forms: a tail after a credential in a value built only from these is inside
+    // no quoted string of its own, so it runs to the container's end.
+    const SAFE = [" ", "  ", "\n", "\r\n", "\t", ",", ";", "x=1", "%20", `${B}n`, "a b", "{", "}", "[", "]", "word", "Ab9"];
+    const WILD = [...SAFE, '"', "'", "`", `${B}"`, `${B}${B}${B}"`, "%22", "%2522", `${B}u0022`, B, "=", ":", "[REDACTED]"];
+    let n = 0;
+    const tok = (kind: string) => `SECRET_${kind}${n++}Z`;
+    const fill = (atoms: readonly string[], max: number) => {
+      let s = "";
+      for (let i = rnd(max); i > 0; i -= 1) s += rnd(4) === 0 ? ` ${tok("M")} ` : pick(atoms);
+      return s;
+    };
+    let tails: string[] = [];
+    /** A string value; under a public selector (not secret) its tail tokens must go. */
+    const str = (isPublic: boolean): string => {
+      const r = rnd(10);
+      if (r < 5) {
+        const q = pick(["", "", "", '"', "'"]);
+        const beta = tok("BETA");
+        const s = fill(SAFE, 4) + pick([" ", "\n", "\t", ",", ";", "{", "[", `${B}n`]) + pick(CRED) + pick(CSEPS) + q + tok("ALPHA") + fill(SAFE, 5) + beta + (q && rnd(2) ? q : "") + (q ? "" : fill(SAFE, 3));
+        if (isPublic) tails.push(beta);
+        return s;
+      }
+      if (r < 9) return fill(WILD, 6) + (rnd(2) ? pick(CRED) + pick(CSEPS) + pick(["", '"', "%22", `${B}"`]) + tok("ALPHA") : "") + fill(WILD, 6);
+      return pick(["public-replay-42", "[REDACTED]", "password=[REDACTED]", `password=[REDACTED] ${tok("BETA")}`]);
+    };
+    // JSON text is written directly (not built as objects), so duplicate keys survive.
+    const node = (depth: number, isPublic: boolean, isSecret: boolean): string => {
+      const r = rnd(10);
+      if (depth > 3 || r < 5) return r === 0 ? String(rnd(1000)) : r === 1 ? "null" : JSON.stringify(str(isPublic && !isSecret));
+      if (r < 7) return `[${Array.from({ length: 1 + rnd(3) }, () => node(depth + 1, isPublic, isSecret)).join(",")}]`;
+      return obj(depth + 1, isPublic, isSecret);
+    };
+    const obj = (depth: number, isPublic: boolean, isSecret: boolean): string => {
+      const parts: string[] = [];
+      for (let i = 1 + rnd(3); i > 0; i -= 1) {
+        const k = rnd(10);
+        const key = k < 5 ? pick(PUBLIC_KEYS) : k < 8 ? pick(OTHER_KEYS) : k < 9 ? "task" : pick(SECRET_KEYS);
+        const pub = isPublic || /^idempotency_key$/i.test(key.trim());
+        const sec = isSecret || SECRET_KEYS.includes(key);
+        parts.push(`${JSON.stringify(key)}:${node(depth, pub, sec)}`);
+      }
+      return `{${parts.join(",")}}`;
+    };
+    /** String values inside a public selector container and outside a secret one, in order (independent oracle). */
+    const publicValues = (line: string): string[] => {
+      const out: string[] = [];
+      const stack: Array<{ obj: boolean; inh: boolean; sec: boolean; pub: boolean; secKey: boolean; expectKey: boolean }> = [];
+      for (const [tok] of line.matchAll(/"(?:[^"\\]|\\.)*"|[{}[\]:,]|[^{}[\]:,"\s]+|\s+/g)) {
+        const top = stack[stack.length - 1];
+        if (tok === "{" || tok === "[") {
+          const inh = top ? top.pub : false, sec = top ? top.secKey : false;
+          stack.push({ obj: tok === "{", inh, sec, pub: inh, secKey: sec, expectKey: tok === "{" });
+        } else if (tok === "}" || tok === "]") stack.pop();
+        else if (tok === ":") top!.expectKey = false;
+        else if (tok === ",") top!.expectKey = top!.obj;
+        else if (tok.startsWith('"')) {
+          const value = JSON.parse(tok) as string;
+          if (top?.obj && top.expectKey) {
+            top.pub = top.inh || /^idempotency_key$/i.test(value.trim());
+            top.secKey = top.sec || SECRET_KEYS.includes(value);
+          } else if (top?.pub && !top.secKey) out.push(value);
+        }
+      }
+      return out;
+    };
+    expect(publicValues('{"a":{" Idempotency_Key ":["x",{"b":"y","password":"s"},3],"c":"z"},"idempotency_key":"w","n":"v","idempotency_key_2":"u"}')).toEqual(["x", "y", "w"]);
+    let leaked = 0, tailLeaks = 0, differ = 0, unstable = 0, unstableElsewhere = 0, tailsChecked = 0, publicChecked = 0;
+    let first = "";
+    const started = Date.now();
+    for (let done = 0; done < RECORD_INPUTS; ) {
+      const lines: string[] = [];
+      const lineTails: string[][] = [];
+      for (let b = 0; b < 500 && done < RECORD_INPUTS; b += 1, done += 1) {
+        tails = [];
+        lines.push(obj(0, false, false));
+        lineTails.push(tails);
+      }
+      const batch = lines;
+      const a = v8Records(`${batch.join("\n")}\n`).split("\n");
+      const b9 = v9Records(`${batch.join("\n")}\n`).split("\n");
+      for (let i = 0; i < batch.length; i += 1) {
+        const input = batch[i]!, x = a[i]!, y = b9[i]!;
+        if (x !== y) differ += 1;
+        const tokens = input.match(/SECRET_[A-Z]+\d+Z/g) ?? [];
+        const re = tokens.filter((t) => !x.includes(t) && y.includes(t));
+        if (re.length) {
+          leaked += 1;
+          if (!first) first = `re-emitted ${re.join(",")} in ${input.slice(0, 400)} -> ${y.slice(0, 400)}`;
+        }
+        for (const t of lineTails[i]!) {
+          tailsChecked += 1;
+          if (y.includes(t)) {
+            tailLeaks += 1;
+            if (!first) first = `tail ${t} kept in ${input.slice(0, 400)} -> ${y.slice(0, 400)}`;
+          }
+        }
+        expect(() => JSON.parse(y)).not.toThrow();
+      }
+      if (done % 10_000 === 0) {
+        // Second pass: every value inside a public container is byte-identical. Lines whose
+        // only change is in a non-public string (pre-existing rule 8 behaviour on encoded
+        // separators before a marker, identical at a63ccfac) are counted, not failed.
+        const again = v9Records(`${b9.join("\n")}`).split("\n");
+        for (let i = 0; i < batch.length; i += 1) {
+          const before = publicValues(b9[i]!), after = publicValues(again[i]!);
+          publicChecked += before.length;
+          if (again[i] === b9[i]) continue;
+          if (JSON.stringify(before) === JSON.stringify(after)) {
+            unstableElsewhere += 1;
+            continue;
+          }
+          unstable += 1;
+          if (!first) first = `unstable ${b9[i]!.slice(0, 400)} -> ${again[i]!.slice(0, 400)}`;
+        }
+      }
+    }
+    console.log(`scrub v8/v9 records public-selector fuzz: ${RECORD_INPUTS} records in ${Date.now() - started} ms, ${differ} differ from rule set 8, ${tailsChecked} tails checked (${tailLeaks} kept), ${leaked} re-emitting a token rule set 8 redacted, ${unstable} of ${publicChecked} public values unstable on a second pass (${unstableElsewhere} lines changed only outside public containers)`);
+    expect(leaked, first).toBe(0);
+    expect(tailLeaks, first).toBe(0);
+    expect(unstable, first).toBe(0);
+    expect(publicChecked).toBeGreaterThan(RECORD_INPUTS / 20);
+    expect(tailsChecked).toBeGreaterThan(RECORD_INPUTS / 2);
+    expect(differ).toBeGreaterThan(RECORD_INPUTS / 20);
+  }, 600_000);
 });

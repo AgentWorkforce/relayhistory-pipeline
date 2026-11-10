@@ -98,7 +98,16 @@ const SCRUB_RULESETS: Record<number, string> = {
   // (%22, %2522, \u0022, \x22) at any backslash depth and double-encoded separators
   // (%253D); a quoted value without a close within MAX_QUOTED_VALUE fails closed
   // to the end of the input. Version 8 is frozen.
-  9: "f22bccfec7f327d58ca4a2cc003b1193a9dea4caac5fa9234e1e0f7a03d172e5",
+  // Updated before release (version 9 has sealed no chunk: it is only on the unmerged
+  // ruleset 9 branch): the quoted key/value rule takes a backslash run of any length
+  // before the key's quotes and the value's opener (rule set 8 read at most 16), and
+  // separators and quote openers take any number of %25 layers and the %u00XX forms.
+  // Then: a credential assignment nested in a quoted container (or in a JSON string
+  // under a public selector key) runs to the container's end, and a name may start
+  // after an encoded quote or a written-out escape sequence (%22password=,
+  // \npassword=). Then the segmenter's records path scrubs a string under a public
+  // selector key as a container too (scrubLongContained), as scrubJson does.
+  9: "404c887b3ab5959808707f5e3e7052084638e5f80deff98be83ce03bc7e0bc65",
 };
 
 const read = (rel: string) =>

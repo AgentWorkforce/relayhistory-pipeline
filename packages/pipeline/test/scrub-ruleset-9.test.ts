@@ -2,9 +2,9 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { MAX_QUOTED_VALUE, MAX_SCRUB_CHARS, scrubJson, scrubText, unsplittableQuotedValueSpans } from "../src/lib/scrub.js";
+import { MAX_QUOTED_VALUE, MAX_SCRUB_CHARS, scrubJson, scrubRecord, scrubText, unsplittableQuotedValueSpans } from "../src/lib/scrub.js";
 import { scrubLong, scrubRecords, SCRUB_RULESET_VERSION } from "../src/lib/pipeline/raw-chunks.js";
-import { scrubText as v8 } from "./fixtures/scrub-ruleset-8.js";
+import { scrubJson as v8Json, scrubRecord as v8Record, scrubText as v8 } from "./fixtures/scrub-ruleset-8.js";
 
 // Synthetic values only. The packet writes the `\u003d`-style vectors with String.raw;
 // Bun's transpiler cooks `\u` escapes inside String.raw, so the literal backslash is
@@ -56,11 +56,14 @@ const noSecrets = (out: string) => {
 };
 
 describe("ruleset 9 closes nested credential tails and encoded separators", () => {
-  it("freezes v8 and proves each vector leaked there", () => {
+  // The v8 fixture and its own pin are frozen byte for byte. The combined pin joins it
+  // with the LIVE segmenter block of raw-chunks.ts, so it moves when the segmenter does
+  // (last: rule set 9's records path bounds public-selector containers).
+  it("freezes v8 (fixture pinned with the live segmenter) and proves each vector leaked there", () => {
     const fixture = read("./fixtures/scrub-ruleset-8.ts");
     expect(createHash("sha256").update(fixture).digest("hex")).toBe("fce75866a2dbf312f1865210fe343e1c372d216c3318dfacc27de6a3f8a82cc7");
     const segmenter = /\/\/ <scrub-segmenter>[\s\S]*?\/\/ <\/scrub-segmenter>/.exec(read("../src/lib/pipeline/raw-chunks.ts"))![0];
-    expect(createHash("sha256").update(`${fixture}\n${segmenter}`).digest("hex")).toBe("50c2e0c67395f488a308cbcfc7c945606374b3d67d37138e284849c6190c8214");
+    expect(createHash("sha256").update(`${fixture}\n${segmenter}`).digest("hex")).toBe("103baa49466eade9cff63d6ba4befaed6f578dc71287eb481f4a3c9b4d48f236");
     expect(SCRUB_RULESET_VERSION).toBe(9);
     for (const [name, full] of vectors) {
       const out = v8(full);
@@ -367,6 +370,227 @@ describe("ruleset 9 fails closed on quoted, over-bound, deep-escaped and encoded
       const safe = `${pad}${head}[REDACTED]`;
       expect(scrubLong(input) === safe, `${off}`).toBe(true);
       expect(parsedRecord({ text: input }).text === safe, `${off}`).toBe(true);
+    }
+  });
+});
+
+// Third round: a credential assignment nested inside a quoted container (a quoted string
+// opened after `=` or `:`, or a JSON string value under the public replay selector) runs
+// to the container's end, not to the first space (rule set 8's single token). A container
+// whose close is known keeps its structure and the fields after it; only an unclosed one
+// fails closed to the end of the input.
+const TAIL = "password=SECRET_ALPHA SECRET_BETA";
+const PREFIXED = `ordinary prefix ${TAIL}`;
+const leaks = (out: unknown) => /SECRET_(?:ALPHA|BETA)/.test(typeof out === "string" ? out : JSON.stringify(out));
+
+describe("ruleset 9 bounds a nested credential assignment by its container", () => {
+  it("the three reproductions: text, scrubJson({text}) and scrubJson({idempotency_key}) (v8 leaked each)", () => {
+    const text = `idempotency_key="${TAIL}"`;
+    const safe = 'idempotency_key="password=[REDACTED]"';
+    expect(scrubText(text)).toBe(safe);
+    expect(scrubLong(text)).toBe(safe);
+    expect(scrubJson({ text })).toEqual({ text: safe });
+    expect(parsedRecord({ text }).text).toBe(safe);
+    expect(v8(text)).toBe('idempotency_key="password=[REDACTED] SECRET_BETA"');
+    expect(scrubJson({ idempotency_key: TAIL })).toEqual({ idempotency_key: "password=[REDACTED]" });
+    expect(v8Json({ idempotency_key: TAIL })).toEqual({ idempotency_key: "password=[REDACTED] SECRET_BETA" });
+    // Through arrays, nested objects and scrubRecord's normalized fields.
+    expect(scrubJson({ a: [{ idempotency_key: [TAIL, { text: TAIL }] }] })).toEqual({
+      a: [{ idempotency_key: ["password=[REDACTED]", { text: "password=[REDACTED]" }] }],
+    });
+    expect(leaks(v8Json({ a: [{ idempotency_key: [TAIL, { text: TAIL }] }] }))).toBe(true);
+    expect(scrubRecord({ task: { idempotency_key: TAIL } })).toEqual({ task: { idempotency_key: "password=[REDACTED]" } });
+    expect(leaks(v8Record({ task: { idempotency_key: TAIL } }))).toBe(true);
+  });
+
+  it("redacts an ordinary prefix's credential tail to the string's end on every path", () => {
+    expect(scrubJson({ idempotency_key: PREFIXED })).toEqual({ idempotency_key: "ordinary prefix password=[REDACTED]" });
+    expect(scrubJson([PREFIXED, { text: PREFIXED }].map((v) => ({ idempotency_key: v })))).toEqual([
+      { idempotency_key: "ordinary prefix password=[REDACTED]" },
+      { idempotency_key: { text: "ordinary prefix password=[REDACTED]" } },
+    ]);
+    const text = `idempotency_key="${PREFIXED}"`;
+    const safe = 'idempotency_key="ordinary prefix password=[REDACTED]"';
+    for (const out of [scrubText(text), scrubLong(text), parsedRecord({ text }).text, (scrubJson({ text }) as { text: string }).text]) {
+      expect(out).toBe(safe);
+    }
+    expect(leaks(v8Json({ idempotency_key: PREFIXED }))).toBe(true);
+    expect(leaks(v8(text))).toBe(true);
+  });
+
+  it("stops at a known close and keeps peer fields; only an unclosed container fails closed", () => {
+    const cases: Array<[string, string]> = [
+      [`idempotency_key="${TAIL}" peer=keep`, 'idempotency_key="password=[REDACTED]" peer=keep'],
+      [`{"idempotency_key":"${TAIL}","peer":"keep"}`, '{"idempotency_key":"password=[REDACTED]","peer":"keep"}'],
+      [`{"idempotency_key": "${PREFIXED}", "peer": "keep"}`, '{"idempotency_key": "ordinary prefix password=[REDACTED]", "peer": "keep"}'],
+      [`idempotency_key='${TAIL}' peer=keep`, "idempotency_key='password=[REDACTED]' peer=keep"],
+      [`idempotency_key=\`${TAIL}\` peer=keep`, "idempotency_key=\`password=[REDACTED]\` peer=keep"],
+      [`idempotency_key%3D%22${TAIL}%22 peer=keep`, "idempotency_key%3D%22password=[REDACTED]%22 peer=keep"],
+      [`idempotency_key${BS}u003d${BS}u0022${TAIL}${BS}u0022 peer=keep`, `idempotency_key${BS}u003d${BS}u0022password=[REDACTED]${BS}u0022 peer=keep`],
+      [`idempotency_key="${TAIL}`, 'idempotency_key="password=[REDACTED]'],
+      [`idempotency_key="${TAIL} peer=lost`, 'idempotency_key="password=[REDACTED]'],
+    ];
+    for (const [input, safe] of cases) {
+      expect(scrubText(input), input).toBe(safe);
+      expect(scrubLong(input), input).toBe(safe);
+      expect(scrubJson({ text: input }), input).toEqual({ text: safe });
+      expect(parsedRecord({ text: input }).text, input).toBe(safe);
+      expect(recordsRaw({ text: input }), input).toBe(JSON.stringify({ text: safe }));
+      expect(scrubText(safe), input).toBe(safe);
+      expect(leaks(v8(input)), input).toBe(true);
+    }
+  });
+
+  it("covers each normalized task field through scrubRecord", () => {
+    for (const field of ["task", "taskRef", "taskTitle", "taskDescription", "taskStatus"]) {
+      const text = `idempotency_key="${TAIL}" tail`;
+      expect(scrubRecord({ [field]: text }), field).toEqual({ [field]: 'idempotency_key="password=[REDACTED]" tail' });
+      expect(scrubRecord({ [field]: { idempotency_key: PREFIXED } }), field).toEqual({
+        [field]: { idempotency_key: "ordinary prefix password=[REDACTED]" },
+      });
+      expect(leaks(v8Record({ [field]: text })), field).toBe(true);
+      expect(leaks(v8Record({ [field]: { idempotency_key: PREFIXED } })), field).toBe(true);
+    }
+  });
+
+  it("keeps rule set 8's single token outside a container", () => {
+    expect(scrubText(TAIL)).toBe("password=[REDACTED] SECRET_BETA");
+    expect(scrubJson({ text: TAIL })).toEqual({ text: "password=[REDACTED] SECRET_BETA" });
+    expect(scrubText(`idempotency_key=${TAIL}`)).toBe("idempotency_key=password=[REDACTED] SECRET_BETA");
+    // A closed quoted string before an assignment is not its container.
+    expect(scrubText(`a="b=" ${TAIL}`)).toBe('a="b=" password=[REDACTED] SECRET_BETA');
+  });
+
+  it("does not take an object key for a container; keys stay text (records == scrubJson)", () => {
+    const value = { "token=ordinary tail": "x", idempotency_key: "public-replay-42" };
+    const safe = { "token=[REDACTED] tail": "x", idempotency_key: "public-replay-42" };
+    expect(scrubJson(value)).toEqual(safe);
+    expect(parsedRecord(value)).toEqual(safe);
+    expect(recordsRaw(value)).toBe(JSON.stringify(scrubJson(value)));
+    for (const control of ['{"key":"public-value"}', '{"idempotency_key":"public-value","key":"public-value"}']) {
+      expect(scrubText(control)).toBe(control);
+      expect(parsedRecord({ text: control }).text).toBe(control);
+    }
+  });
+
+  it("does not detach a multiword tail across the segment bound", () => {
+    const pad = "ordinary ".repeat(Math.ceil(MAX_SCRUB_CHARS / 9) + 1);
+    for (const label of ["password", "token", "api_key", "client_secret", "credentials"]) {
+      for (const [shape, close] of [["direct", ""], ["direct", '"'], ["direct", '" peer=keep'], ["container", ""], ["container", '"'], ["container", '" peer=keep']]) {
+        const head = shape === "direct" ? `idempotency_key=${label}="` : `idempotency_key="${label}=`;
+        const input = `${pad}${head}SECRET_ALPHA SECRET_BETA${close}`;
+        const safe = `${pad}${head}[REDACTED]${close}`;
+        expect(scrubLong(input), `${label} ${shape} ${close}`).toBe(safe);
+        expect(parsedRecord({ text: input }).text, `${label} ${shape} ${close}`).toBe(safe);
+      }
+    }
+    const words = Array.from({ length: 45000 }, (_, i) => `w${i}`).join(" ");
+    for (const input of [`idempotency_key="password=${words} SECRET_BETA"`, `idempotency_key=password="${words} SECRET_BETA"`]) {
+      for (const run of [() => scrubLong(input), () => parsedRecord({ text: input }).text]) {
+        try {
+          expect(leaks(run())).toBe(false);
+        } catch (error) {
+          expect((error as { code?: string }).code).toMatch(/^chunk_(?:unsegmentable|string_too_long)$/);
+        }
+      }
+    }
+  });
+
+  it("removes the tail under a marker prefix, and a second pass is the identity", () => {
+    for (const [input, safe] of [
+      ['idempotency_key="password=[REDACTED] SECRET_BETA"', 'idempotency_key="password=[REDACTED]"'],
+      ['{"idempotency_key":"password=[REDACTED] SECRET_BETA","peer":"keep"}', '{"idempotency_key":"password=[REDACTED]","peer":"keep"}'],
+      ['idempotency_key="password=[REDACTED] SECRET_BETA', 'idempotency_key="password=[REDACTED]'],
+    ]) {
+      expect(scrubText(input)).toBe(safe);
+      expect(scrubText(safe)).toBe(safe);
+      expect(parsedRecord({ text: input }).text).toBe(safe);
+      expect(parsedRecord({ text: safe }).text).toBe(safe);
+    }
+    expect(scrubJson({ idempotency_key: "password=[REDACTED] SECRET_BETA" })).toEqual({ idempotency_key: "password=[REDACTED]" });
+    expect(scrubJson({ idempotency_key: "password=[REDACTED]" })).toEqual({ idempotency_key: "password=[REDACTED]" });
+  });
+
+  it("keeps the benign public replay controls byte-identical", () => {
+    for (const control of [
+      "idempotency_key=public-replay-42",
+      'IDEMPOTENCY_KEY : "public-replay-42"',
+      'idempotency_key="public-replay-42"',
+      '{"idempotency_key":"public-replay-42"}',
+      "idempotency_key=public-replay%3D42",
+    ]) {
+      expect(scrubText(control)).toBe(control);
+      expect(scrubLong(control)).toBe(control);
+      expect(scrubJson({ text: control })).toEqual({ text: control });
+      expect(parsedRecord({ text: control }).text).toBe(control);
+      expect(v8(control)).toBe(control);
+    }
+    expect(scrubJson({ idempotency_key: "public-replay-42" })).toEqual({ idempotency_key: "public-replay-42" });
+    expect(recordsRaw({ idempotency_key: "public-replay-42" })).toBe('{"idempotency_key":"public-replay-42"}');
+  });
+
+  it("holds at JSON escaping depths 0 to 3 through scrubText and scrubJson({text})", () => {
+    for (const [input, safe] of [
+      [`idempotency_key="${TAIL}" peer=keep`, 'idempotency_key="password=[REDACTED]" peer=keep'],
+      [`{"idempotency_key":"${PREFIXED}","peer":"keep"}`, '{"idempotency_key":"ordinary prefix password=[REDACTED]","peer":"keep"}'],
+    ]) {
+      let i = input, s = safe;
+      for (let depth = 0; depth <= 3; depth++) {
+        expect(scrubText(i), `depth ${depth}`).toBe(s);
+        expect(scrubJson({ text: i }), `depth ${depth}`).toEqual({ text: s });
+        expect(parsedRecord({ text: i }).text, `depth ${depth}`).toBe(s);
+        expect(leaks(v8(i)), `depth ${depth}`).toBe(true);
+        i = JSON.stringify(i);
+        s = JSON.stringify(s);
+      }
+    }
+  });
+
+  it("finds an assignment glued behind an encoded quote or an escape sequence (v8 kept it whole)", () => {
+    for (const [input, safe] of [
+      ["x=%22password=SECRET_ALPHA%22", "x=%22password=[REDACTED]%22"],
+      [`x=${BS}u0022password=SECRET_ALPHA${BS}u0022`, `x=${BS}u0022password=[REDACTED]${BS}u0022`],
+      [`x=${BS}x27token=SECRET_ALPHA${BS}x27`, `x=${BS}x27token=[REDACTED]${BS}x27`],
+      [`line${BS}npassword=SECRET_ALPHA`, `line${BS}npassword=[REDACTED]`],
+      [`idempotency_key=%2522${TAIL}%2522 peer=keep`, "idempotency_key=%2522password=[REDACTED]%2522 peer=keep"],
+    ]) {
+      expect(scrubText(input), input).toBe(safe);
+      expect(parsedRecord({ text: input }).text, input).toBe(safe);
+      expect(leaks(v8(input)), input).toBe(true);
+    }
+    // The public replay exemption still applies to a separated selector; a selector glued
+    // behind an encoded quote was already redacted by rule set 8's generic key rule (fail closed).
+    expect(scrubText("x=%22 idempotency_key=public-replay-42%22")).toBe("x=%22 idempotency_key=public-replay-42%22");
+    expect(scrubText("x=%22idempotency_key=public-replay-42%22")).toBe("x=%22idempotency_key=[REDACTED]%22");
+  });
+
+  it("stays linear on 64 KiB adversarial container inputs", () => {
+    const inputs = [
+      'a="'.repeat(21845),
+      'a=\\"'.repeat(16384),
+      `idempotency_key="${TAIL} `.repeat(1600),
+      '"k":"'.repeat(13107),
+      `a=${BS.repeat(65000)}"${TAIL}`,
+      'x="password=a b" '.repeat(3855),
+      "%22password=1".repeat(5041),
+      `${BS}npassword=1`.repeat(5461),
+      "1password=1password=".repeat(3276),
+      "1".repeat(65536),
+      "a1".repeat(32768),
+      "u0022".repeat(13107),
+      "x22a_".repeat(13107),
+      "u0022key".repeat(8192),
+      `${"%25".repeat(21000)}22password=1`,
+      `=${BS.repeat(65000)}u0022`,
+      Array.from({ length: 4096 }, (_, i) => `k=${BS.repeat(i % 31)}${['"', "'", "`"][i % 3]}password=x `).join(""),
+    ];
+    for (const input of inputs) {
+      const text = input.slice(0, 65536);
+      for (const run of [() => scrubText(text), () => scrubJson({ idempotency_key: text }), () => scrubLong(text)]) {
+        const started = performance.now();
+        expect(typeof run()).not.toBe("undefined");
+        expect(performance.now() - started, input.slice(0, 16)).toBeLessThan(2000);
+      }
     }
   });
 });

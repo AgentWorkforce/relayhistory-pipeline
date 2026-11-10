@@ -1,11 +1,11 @@
 {
   "schema": 1,
   "rulesetVersion": 9,
-  "rulesetSourceSha256": "f22bccfec7f327d58ca4a2cc003b1193a9dea4caac5fa9234e1e0f7a03d172e5",
+  "rulesetSourceSha256": "404c887b3ab5959808707f5e3e7052084638e5f80deff98be83ce03bc7e0bc65",
   "rulesetPath": "packages/pipeline/src/lib/scrub.ts",
   "segmenterPath": "packages/pipeline/src/lib/pipeline/raw-chunks.ts#scrub-segmenter",
-  "segmenterSha256": "26d0733aabe8a219a7b1833e71eaa5f0aa6dfbfe4999b4d7d9870d0b993f8a68",
-  "corpusSha256": "d4589b4d008ef9bc1fdfc385f4aa209aef8044c9e3cd5abc14114544faa6ca49",
+  "segmenterSha256": "eee0a2d912476a4c676697468feefb1568278e9e45cde93fe56e8e00e7d2a592",
+  "corpusSha256": "6ad06f7fba43a9e44c2b0a7034931dc497b74b69efb5804afc73cd35f1dbbf37",
   "corpusPath": "packages/pipeline/test/fixtures/scrub-secret-corpus.json",
   "redactionToken": "[REDACTED]",
   "maxScrubChars": 262144

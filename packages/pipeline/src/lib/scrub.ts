@@ -74,12 +74,15 @@ export function isSecretKeyName(name: string): boolean {
 
 /**
  * A quoted key at any JSON escaping depth (`"k"`, `\"k\"`, `\\\"k\\\"`, `'k'`, `` `k` ``),
- * then `:`, `=` or `=>` with optional whitespace. The leading lookbehind starts the
- * match at the beginning of a backslash run, and every quantifier is bounded, so each
- * start position is O(1) and the scan is linear.
+ * then `:`, `=` or `=>` with optional whitespace. The backslash run before the opening
+ * quote has any length (rule set 9; rule set 8 capped it at 16, so a key behind 17 or
+ * more backslashes was not matched and its value was stored), and the same run must precede
+ * the closing quote. The leading lookbehind starts a match only at the beginning of a
+ * backslash run, so each run is consumed by one start (backtracking it costs its length
+ * once); every other quantifier is bounded, so the scan stays linear.
  */
 const QUOTED_KEY =
-  /(?<!\\)(\\{0,16})(["'`])([A-Za-z0-9_. -]{1,64})\1\2([ \t]{0,16}(?:=>|[:=])[ \t]{0,16})/g;
+  /(?<!\\)(\\*)(["'`])([A-Za-z0-9_. -]{1,64})\1\2([ \t]{0,16}(?:=>|[:=])[ \t]{0,16})/g;
 
 /**
  * How far the quoted key/value rule looks for a quoted value's matching closing quote,
@@ -171,15 +174,26 @@ function backslashesBefore(text: string, at: number): number {
  * redacted whole, whatever it holds; a shorter one is kept when it is a JSON literal, a
  * number or not generated-looking.
  *
+ * Rule set 9: the backslash runs before the key's quotes and before the value's opening
+ * quote have any length (rule set 8 read at most 16, so a key or value opener behind 17
+ * or more backslashes, five JSON encodings deep and beyond, was not matched and the value
+ * was stored). A quoted value with no matching close runs to the end of the input, as
+ * before (fail closed; the opening quote is kept). A rest of the input that is
+ * `[REDACTED]` then only quotes and backslashes (such a value redacted on an earlier pass,
+ * in the escaped form of a stored value) is kept, so a second pass changes nothing.
+ *
  * Linear: one forward walk per value from its start finds the close, whether a line
  * break precedes it, and the bound together; the walk ends at the next quote of the
  * value's own kind (quote and backslash depth), which every later value of that kind opens
  * with, so the walks of one kind never overlap; past the bound the walk goes on to the
  * close or the end, and a value with no close runs to the end; the redaction consumes
- * what was walked. With `overCap`, the span [key start, value end) of
- * each over-long quoted value and of each generated unquoted value of `MAX_QUOTED_VALUE`
- * units or more is recorded; with `multiLine` too, so is that of each quoted value within
- * the bound that holds a line break (to its close, or the end of the input). With
+ * what was walked. A backslash run before a key or a value opener is read once per key
+ * match (the key pattern starts only at the beginning of a run). With `overCap`, the span
+ * [key start, value end) of each over-long quoted value and of each generated unquoted
+ * value of `MAX_QUOTED_VALUE` units or more is recorded; with `multiLine` too, so is that
+ * of each quoted value within the bound that holds a line break (to its close), and
+ * (rule set 9) [key start, end of text) of every quoted value with no matching close in
+ * the text, whatever it holds. With
  * `prefix` (the text is a prefix of a longer input; for spans only, the output is not
  * used), a quoted value with no matching close in the text may run on past it in the full
  * input, so it is recorded open, to the end of the text.
@@ -201,20 +215,25 @@ function redactQuotedSecretValues(
   for (let m = QUOTED_KEY.exec(text); m; m = QUOTED_KEY.exec(text)) {
     const end = m.index + m[0].length;
     if (!isSecretKeyName((m[3] as string).trim())) continue;
+    // The value's opening quote, behind a backslash run of any length (rule set 9; rule
+    // set 8 read at most 16 backslashes, so a value opener behind more was taken for an
+    // unquoted value and skipped, and the value was stored). Literal quotes only, as before.
     let bs = 0;
-    while (bs < 16 && text[end + bs] === "\\") bs += 1;
+    while (text[end + bs] === "\\") bs += 1;
     const quote = text[end + bs];
     let valueStart: number;
     let valueEnd: number;
     // Past the bound: redacted whole, never kept.
     let longValue = false;
+    // No matching close anywhere in the text: the value runs to the end of the input.
+    let failClosed = false;
     // A generated unquoted value of `MAX_QUOTED_VALUE` units or more: redacted as
     // before (to its end), and its span recorded for the segmenter.
     let overBound = false;
     // A quoted value within the bound that holds a line break: its span is recorded
     // with `multiLine` (the segmenter must not cut inside it either).
     let lineValue = false;
-    if (quote === '"' || quote === "'" || quote === "`") {
+    if (isQuote(quote)) {
       valueStart = end + bs + 1;
       // At escaping depth d the opening quote has 2^d - 1 backslashes, and a quote is
       // the closing one when its backslash run is that many modulo 2^(d+1): one more
@@ -253,11 +272,13 @@ function redactQuotedSecretValues(
         longValue = true;
         lineValue = false;
         valueEnd = restOfValue(i);
+        failClosed = valueEnd === text.length;
       } else {
         // Within the bound (rule set 5): the whole value, across lines, to its matching
         // close or, with none, to the end of the input. No line break ends it and there
         // is no whitespace fallback: a tail left after a break would have no key before it.
-        valueEnd = close === -1 ? text.length : close - bs;
+        failClosed = close === -1;
+        valueEnd = failClosed ? text.length : close - bs;
       }
     } else {
       // An unquoted value is taken only after a one-word key (no space: in
@@ -279,14 +300,28 @@ function redactQuotedSecretValues(
       if (!overBound && (NON_SECRET_BARE.test(bare) || !looksGenerated(bare))) continue;
     }
     const value = longValue ? "" : text.slice(valueStart, valueEnd);
+    // From the key start: a cut between key and value would leave the value with no key to
+    // match. Rule set 9: with `multiLine`, a value with no matching close (it runs to the
+    // end of the input) is recorded whatever it holds, [key start, end of the text), even
+    // when it is kept below, with or without a prefix, as the assignment rule records its own.
+    const failSpan = multiLine && failClosed;
+    if (failSpan) overCap?.push([m.index, text.length]);
     // A prefix may end right at an open value: still recorded (open), with nothing to redact.
     if (longValue && valueEnd <= valueStart) {
-      overCap?.push([m.index, valueEnd]);
+      if (!failSpan) overCap?.push([m.index, valueEnd]);
       continue;
     }
-    if (valueEnd <= valueStart || (!longValue && keepQuotedValue(value))) continue;
-    // From the key start: a cut between key and value would leave the value with no key to match.
-    if (longValue || overBound || (multiLine && lineValue)) overCap?.push([m.index, valueEnd]);
+    if (
+      valueEnd <= valueStart ||
+      (!longValue && keepQuotedValue(value)) ||
+      // Rule set 9: a value that ran to the end of the input on an earlier pass, seen again
+      // in the escaped form of a stored value (`\"[REDACTED]"` on the record path's literal
+      // re-scrub): kept, so a second pass changes nothing.
+      (failClosed && REDACTED_THEN_QUOTES.test(text.slice(valueStart)))
+    ) {
+      continue;
+    }
+    if (!failSpan && (longValue || overBound || (multiLine && lineValue))) overCap?.push([m.index, valueEnd]);
     QUOTED_KEY.lastIndex = Math.max(QUOTED_KEY.lastIndex, valueEnd);
     if (!onlyOverCap) {
       out += text.slice(last, valueStart) + REDACTED;
@@ -314,7 +349,7 @@ function redactQuotedSecretValues(
     const toFooter = inside.at !== -1;
     if (!longValue && !overBound && !fromHeader && !toFooter) continue;
     // The value's closing quote (its backslashes and the quote), when it has one.
-    const closeLength = quote === '"' || quote === "'" || quote === "`" ? bs + 1 : 0;
+    const closeLength = isQuote(quote) ? bs + 1 : 0;
     const closeEnd = Math.min(text.length, valueEnd + closeLength);
     let redactEnd = valueEnd;
     // Whether the closing quote taken with a redaction to a footer is put back (below).
@@ -407,9 +442,11 @@ function pairPrivateKeys(
  * `redactQuotedSecretValues` finds them. The rule redacts each whole, so a segmenter must
  * not cut inside one: the segment after the cut would hold the rest of the value with no
  * key before it. Whether a value is over the bound is decided by the first
- * `MAX_QUOTED_VALUE` + 150 units from its key's start (a key match is at most 132 units
- * and up to 16 backslashes and the quote follow it, then `MAX_QUOTED_VALUE` + 1 units of
- * value, across lines).
+ * `MAX_QUOTED_VALUE` + 150 units from its key's start when its key and opener carry at most
+ * 16 backslashes each (a key match is then at most 132 units and up to 16 backslashes and
+ * the quote follow it, then `MAX_QUOTED_VALUE` + 1 units of value, across lines); from
+ * rule set 9 the runs have any length, and the decision needs those runs' extra length
+ * too. A value over the bound fails closed: its span runs to the end of the text.
  *
  * With `prefix: true` the text is taken as a prefix of a longer input: a quoted value
  * the text ends inside before that decision (no matching close in what is seen) is
@@ -434,8 +471,10 @@ export function overCapQuotedValueSpans(
  * hold the value's later lines with no key before them. Rule set 9 adds the span [name
  * start, close end) of every quoted secret assignment value whose assignment holds
  * whitespace, and [name start, end of text) of every one that fails closed (no matching
- * close within the bound; `redactSecretAssignments` redacts each whole). Spans are sorted
- * and disjoint.
+ * close within the bound; `redactSecretAssignments` redacts each whole), and [key start,
+ * end of text) of every quoted key/value rule value that fails closed (no matching close
+ * within the bound, or none in the text), whether or not it is kept as already redacted.
+ * Spans are sorted and disjoint.
  * `prefix: true` is as for `overCapQuotedValueSpans`: a value with no matching close in
  * the text is reported open to the end of the text (fail closed).
  */
@@ -574,18 +613,31 @@ type Rule = [RegExp, Replacement] | ((text: string) => string);
  * Rule set 9: the separator is a literal `=` or `:`, or one of them encoded as tool output
  * echoes it: a unicode or hex escape written out (`\u003d`, `\u003a`, `\x3d`, `\x3a`)
  * behind a backslash run of any length (any JSON escaping depth), or percent-encoded
- * (`%3D`, `%3A`) or double percent-encoded (`%253D`, `%253A`). Hex digits and the escape
- * letters match in either case (`\U003D`, `\X3A`): not valid escapes, but over-matching
- * only redacts more. Rule set 8 took only a literal one, so `password\u003dVALUE` was
- * stored whole.
+ * (`%3D`, `%3A`) behind any number of `%25` layers (`%253D`, `%25253a`, ...; the
+ * layers are counted by the pattern, never decoded), or as a legacy percent-u escape
+ * (`%u003d`, `%u003A`, also behind `%25` layers). Hex digits and the escape letters match
+ * in either case (`\U003D`, `\X3A`, `%U003D`): not valid escapes, but over-matching only
+ * redacts more. Rule set 8 took only a literal one, so `password\u003dVALUE` was stored
+ * whole. The public-identifier exemption takes the same separators.
  *
  * Linear: `\\+` is followed by a literal (`u` or `x`), so a failed match gives back one
  * backslash at a time and fails on the next character at once (O(run) per attempt), and
  * only the one name ending right before a backslash run can reach it (a match starts at a
  * word boundary and the name is a single word run), so each run is walked O(1) times.
+ * `(?:25)*` is the same: each repetition is a fixed two-character literal followed by a
+ * literal that cannot start one (`3` or `u`), so a run of layers is walked O(1) times.
+ *
+ * The name may also start right after an encoded quote (`%22`, `%2522`, `%u0022`,
+ * `\u0022`, `\x27`, ... ending in `22`, `27` or `60`) or an escape sequence written out
+ * (`\n`, `\t`, ...), where `\b` does not hold: rule set 8 found no name in
+ * `%22password=` or `line\npassword=` and stored the value. Such a start lies inside a
+ * word run (`u0022u0022...`), so it is taken only when a bounded lookahead (prefix
+ * segments of at most 32 units) finds the name and its separator: each such start costs
+ * O(1) unless it matches, and a match ends at its separator. The lookbehind is fixed
+ * length; over-matching (`x22token=`) only redacts more.
  */
 const SECRET_ASSIGNMENT =
-  /\b(?!idempotency_key\s*(?:[:=]|\\+(?:u003[ad]|x3[ad])|%(?:25)?3[ad]))((?:[A-Za-z0-9]+_){0,8}(?:api[_-]?key|apikey|key|secret|token|password|passwd|passphrase|pwd|credentials?)\s*(?:[:=]|\\+(?:u003[ad]|x3[ad])|%(?:25)?3[ad]))\s*/gi;
+  /(?:\b|(?<=(?:[%5]|u00|x)(?:22|27|60)|\\[nrtbfv])(?=(?:[A-Za-z0-9]{1,32}_){0,8}(?:api[_-]?key|apikey|key|secret|token|password|passwd|passphrase|pwd|credentials?)\s*(?:[:=]|\\+(?:u003[ad]|x3[ad])|%(?:25)*(?:u00)?3[ad])))(?!idempotency_key\s*(?:[:=]|\\+(?:u003[ad]|x3[ad])|%(?:25)*(?:u00)?3[ad]))((?:[A-Za-z0-9]+_){0,8}(?:api[_-]?key|apikey|key|secret|token|password|passwd|passphrase|pwd|credentials?)\s*(?:[:=]|\\+(?:u003[ad]|x3[ad])|%(?:25)*(?:u00)?3[ad]))\s*/gi;
 
 /**
  * An unquoted assignment value: an optional opening quote, then up to whitespace, a quote,
@@ -599,8 +651,11 @@ const REDACTED_THEN_QUOTES = /^\[REDACTED\]["'`\\]*$/;
 
 /** An encoded quote after a backslash run: a unicode or hex escape of `"`, `'` or a backtick. */
 const ESCAPED_QUOTE = /(?:u00|x)(?:22|27|60)/iy;
-/** A percent-encoded quote: `%22`, `%27` or `%60`, or double-encoded (`%2522`, ...). */
-const PERCENT_QUOTE = /%(?:25)?(?:22|27|60)/y;
+/**
+ * A percent-encoded quote: `%22`, `%27` or `%60`, or a legacy percent-u escape of one
+ * (`%u0022`, `%U0027`, ...), behind any number of `%25` layers (`%2522`, `%252527`, ...).
+ */
+const PERCENT_QUOTE = /%(?:25)*(?:u00)?(?:22|27|60)/iy;
 
 /**
  * The quoted value of a secret assignment starting at `at`, or undefined when the value
@@ -612,8 +667,9 @@ const PERCENT_QUOTE = /%(?:25)?(?:22|27|60)/y;
  *   length closes only at exactly that run);
  * - a unicode or hex escape of one (`\u0022`, `\x27`, …, behind at least one backslash):
  *   it closes at the same escape (letter case aside) behind exactly the same run;
- * - a percent-encoded one (`%22`, `%27`, `%60`) or a double percent-encoded one (`%2522`,
- *   ...): it closes at the same characters.
+ * - a percent-encoded one (`%22`, `%27`, `%60`) or a legacy percent-u one (`%u0022`, ...),
+ *   behind any number of `%25` layers (`%2522`, `%25252227`, ...): it closes at the same
+ *   form (letter case aside), with the same number of layers (counted, never decoded).
  * The stored bytes are never decoded or rewritten: the opener and close are kept as written.
  *
  * Returns [value start, value end, end of the close]. With no matching close whose start is
@@ -621,7 +677,10 @@ const PERCENT_QUOTE = /%(?:25)?(?:22|27|60)/y;
  * the value fails closed, to the end of the input. One forward walk of at most
  * `MAX_QUOTED_VALUE` + 1 units (each backslash run before a candidate close is counted once).
  */
-function quotedAssignmentValue(text: string, at: number): [number, number, number] | undefined {
+function quotedAssignmentValue(
+  text: string,
+  at: number,
+): [number, number, number] | undefined {
   let bs = 0;
   while (text[at + bs] === "\\") bs += 1;
   const open = at + bs;
@@ -651,10 +710,20 @@ function quotedAssignmentValue(text: string, at: number): [number, number, numbe
       return own === bs ? form.length : 0;
     };
   } else if (quote === "%" && ((PERCENT_QUOTE.lastIndex = open), PERCENT_QUOTE.test(text))) {
-    const form = text.slice(open, PERCENT_QUOTE.lastIndex);
+    const form = text.slice(open, PERCENT_QUOTE.lastIndex).toLowerCase();
     valueStart = PERCENT_QUOTE.lastIndex;
     backTo = 0;
-    closeAt = (i) => (text[i] === "%" && text.startsWith(form, i) ? form.length : 0);
+    // `%` is the form's first character only, so a comparison from one `%` stops at the
+    // next `%` at the latest: the comparisons of one walk cover disjoint ranges (linear
+    // whatever the number of layers).
+    closeAt = (i) => {
+      if (text[i] !== "%") return 0;
+      for (let k = 1; k < form.length; k += 1) {
+        const c = text.charCodeAt(i + k);
+        if ((c >= 65 && c <= 90 ? c | 0x20 : c) !== form.charCodeAt(k)) return 0;
+      }
+      return form.length;
+    };
   } else {
     return undefined;
   }
@@ -664,6 +733,71 @@ function quotedAssignmentValue(text: string, at: number): [number, number, numbe
     if (length) return [valueStart, i - backTo, i + length];
   }
   return [valueStart, -1, -1];
+}
+
+/**
+ * A container opener's separator: `=` or `:`, or an encoded one as the assignment rule
+ * reads them (`\u003d`, `\x3a`, `%3D`, `%253a`, `%u003D`, ...), then at most 16 spaces
+ * or tabs. The quote after it (`quotedAssignmentValue`: literal, escaped or percent-encoded,
+ * behind a backslash run of any length) makes it a container (`key="…`, `"key": "…`,
+ * `key=\\"…` one JSON level down, `key%3D%22…`). An encoded separator's backslash run is
+ * matched from its start only, so each run is read once.
+ */
+const CONTAINER_OPEN = /(?:[:=]|(?<!\\)\\+(?:u003[ad]|x3[ad])|%(?:25)*(?:u00)?3[ad])[ \t]{0,16}/gi;
+
+/**
+ * The innermost container enclosing each position, asked for in increasing order: a
+ * function from a position to [close start, value end, opener's separator index], or
+ * undefined outside every container. A container closes at its opener's matching close
+ * (the same quote form behind the matching backslash run, as `quotedAssignmentValue`
+ * finds it, within `MAX_QUOTED_VALUE` units); with none, its close and value end are the
+ * end of the text (unclosed). A container inside another ends at that one's close at the
+ * latest, so an inner string left open ends where the enclosing string does
+ * (`"text":"k=\\"password=v w"` ends before the last quote), and a quote that closes the
+ * enclosing container is never taken for an opener. With `whole`, the text itself is the
+ * outermost container (a JSON string value), closed at the end of the text.
+ *
+ * Linear: every separator is found once, in order; its opener's backslash run is read
+ * once and its close searched for over at most `MAX_QUOTED_VALUE` + 1 units; each
+ * container is pushed and popped at most once.
+ */
+function containerTracker(
+  text: string,
+  whole: boolean,
+): (at: number) => [number, number, number] | undefined {
+  const stack: Array<[number, number, number]> = whole ? [[text.length, text.length, 0]] : [];
+  const separator = new RegExp(CONTAINER_OPEN.source, "gi");
+  // The next opener: [opener start (after its backslash run), close start, value end,
+  // separator index], or undefined when there is none left.
+  const advance = (): [number, number, number, number] | undefined => {
+    for (let m = separator.exec(text); m; m = separator.exec(text)) {
+      const after = m.index + m[0].length;
+      const quoted = quotedAssignmentValue(text, after);
+      if (!quoted) continue;
+      const [valueStart, found, closeEnd] = quoted;
+      let open = after;
+      while (text[open] === "\\") open += 1;
+      if (found < 0) return [open, text.length, text.length, m.index];
+      // The close is the opener's form again (same length), ending at closeEnd.
+      return [open, closeEnd - (valueStart - open), found, m.index];
+    }
+    return undefined;
+  };
+  let next = advance();
+  const popBefore = (at: number) => {
+    while (stack.length > 0 && stack[stack.length - 1]![0] < at) stack.pop();
+  };
+  return (at) => {
+    for (; next && next[0] < at; next = advance()) {
+      const [open, close, valueEnd, sep] = next;
+      popBefore(open);
+      const top = stack[stack.length - 1];
+      if (top && top[0] === open) continue;
+      stack.push(top && close > top[0] ? [top[0], top[1], sep] : [close, valueEnd, sep]);
+    }
+    popBefore(at);
+    return stack[stack.length - 1];
+  };
 }
 
 /**
@@ -700,10 +834,16 @@ function quotedAssignmentValue(text: string, at: number): [number, number, numbe
  * or without a prefix: the text may end before a close the full input has; fail closed,
  * as `overCapQuotedValueSpans`).
  */
-function redactSecretAssignments(text: string, unsplittable?: Array<[number, number]>): string {
+function redactSecretAssignments(
+  text: string,
+  unsplittable?: Array<[number, number]>,
+  whole = false,
+  reached?: [boolean],
+): string {
   // [start, end, whether the span becomes `[REDACTED]` (else it is dropped: whitespace)].
   const spans: Array<[number, number, boolean]> = [];
   let unquotedEnd = 0;
+  const enclosing = containerTracker(text, whole);
   SECRET_ASSIGNMENT.lastIndex = 0;
   for (let m = SECRET_ASSIGNMENT.exec(text); m; m = SECRET_ASSIGNMENT.exec(text)) {
     SECRET_ASSIGNMENT.lastIndex = m.index + 1;
@@ -725,7 +865,10 @@ function redactSecretAssignments(text: string, unsplittable?: Array<[number, num
         if (at > nameEnd) spans.push([nameEnd, at, false]);
         spans.push([valueStart, valueEnd, true]);
       }
-      if (failClosed) break;
+      if (failClosed) {
+        if (reached) reached[0] = true;
+        break;
+      }
       continue;
     }
     if (at < unquotedEnd) continue;
@@ -736,10 +879,36 @@ function redactSecretAssignments(text: string, unsplittable?: Array<[number, num
     // enclosing escaped string (`\"password=v\"` one level down), not to the value.
     if (isQuote(text[end])) while (end > at && text[end - 1] === "\\") end -= 1;
     const bodyStart = at + (isQuote(text[at]) ? 1 : 0);
-    // Nothing to redact, or a value already redacted (kept so a second pass is a no-op).
-    if (end <= bodyStart || text.slice(bodyStart, end) === REDACTED) continue;
+    // Rule set 9: inside a container (a quoted string opened after `=` or `:`, or the
+    // whole text with `whole`), the value runs to the container's end, or, when the
+    // container has no matching close, to the end of the input.
+    const container = enclosing(m.index);
+    const toEnd = container !== undefined && container[0] === text.length;
+    const open = toEnd && !whole;
+    if (container) {
+      // The quotes and backslashes right before the container's end close strings opened
+      // inside it that are not containers themselves (`"a":"\\"password=v w\\""`, a
+      // JSON-encoded string as a whole value): kept, as the unquoted value keeps them.
+      let containerEnd = container[1];
+      while (containerEnd > end && (isQuote(text[containerEnd - 1]) || text[containerEnd - 1] === "\\")) {
+        containerEnd -= 1;
+      }
+      end = containerEnd;
+    }
+    const body = text.slice(bodyStart, end);
+    // Nothing to redact, or a value already redacted (kept so a second pass is a no-op;
+    // running to the end of the input, it may be followed by the closing quotes of the
+    // strings around it, as in a record string's escaped literal).
+    if (end <= bodyStart || body === REDACTED || ((open || whole) && REDACTED_THEN_QUOTES.test(body))) continue;
+    if (container && unsplittable && !whole) {
+      unsplittable.push([container[2], open ? text.length : Math.max(container[0] + 1, end)]);
+    }
     spans.push([nameEnd, end, true]);
     unquotedEnd = end;
+    if (toEnd || end === text.length) {
+      if (reached) reached[0] = true;
+      break;
+    }
   }
   if (spans.length === 0) return text;
   spans.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
@@ -1151,13 +1320,45 @@ export function exceedsScrubBound(value: string): boolean {
  * rule. Callers that assemble text from parts should scrub the assembled text.
  */
 export function scrubText(value: string): string {
-  return SECRET_PATTERNS.reduce(
+  return applyRules(SECRET_PATTERNS, boundForScrub(value));
+}
+
+function applyRules(rules: Rule[], value: string): string {
+  return rules.reduce(
     (text, rule) =>
       typeof rule === "function"
         ? rule(text)
         : text.replace(rule[0], rule[1] as any),
-    boundForScrub(value),
+    value,
   );
+}
+
+/**
+ * `scrubText` for a string that is itself a container: the value of a public selector
+ * (`isPublicSelectorKey`) or anything below one, decoded from a record (rule set 9). The
+ * string's end is the container's end, so an unquoted secret assignment value in it that
+ * is not inside a quoted string of its own runs to the end of the string
+ * (`{"idempotency_key":"password=v w"}` stores `password=[REDACTED]`); in text the same
+ * value stops at whitespace (rule set 8) unless a quoted string encloses it.
+ */
+export function scrubContainedText(value: string): string {
+  return scrubContainedSegment(boundForScrub(value))[0];
+}
+
+/**
+ * `scrubContainedText` for a text within the bound, and whether a redaction runs to its end
+ * (an assignment value that reaches the container's end, or a quoted one failing closed):
+ * a caller scrubbing a longer string in segments drops every later segment then, as the
+ * redaction runs on to the end of the string.
+ */
+export function scrubContainedSegment(value: string): [string, boolean] {
+  const reached: [boolean] = [false];
+  const rules = SECRET_PATTERNS.map((rule) =>
+    rule === redactSecretAssignments
+      ? (text: string) => redactSecretAssignments(text, undefined, true, reached)
+      : rule,
+  );
+  return [applyRules(rules, value), reached[0]];
 }
 
 /**
@@ -1177,6 +1378,15 @@ export function redactsSecretKeyedValue(value: string): boolean {
 export const isSecretRecordKey = (key: string) => isSecretKeyName(key.trim());
 
 /**
+ * Whether a record key is the public replay selector the assignment rule exempts
+ * (`idempotency_key`, any letter case, the key as written, trimmed). Its value is public,
+ * so it is scrubbed as text, but as a container (`scrubContainedText`): a credential
+ * assignment nested in it is redacted to the end of the string, never leaving a tail
+ * stored under the public key (rule set 9).
+ */
+export const isPublicSelectorKey = (key: string) => /^idempotency_key$/i.test(key.trim());
+
+/**
  * Scrub every string value **and key** of a JSON value, and card numbers among its
  * numbers. Two keys that become identical after scrubbing are both kept: later ones get
  * a ` (2)`, ` (3)`… suffix, so no value is silently overwritten and no input is
@@ -1188,20 +1398,26 @@ export const isSecretRecordKey = (key: string) => isSecretKeyName(key.trim());
  * arrays and objects alike, at any depth, whatever the keys in between are named: a
  * composite value does not reset the secret context. The structure is kept (keys are
  * still scrubbed and suffixed as everywhere), as are numbers, booleans and null.
+ *
+ * Public selector context (rule set 9): a string under the public replay selector
+ * (`isPublicSelectorKey`), directly or anywhere below it, is scrubbed as a container
+ * (`scrubContainedText`): the string's end bounds a nested credential assignment's value.
+ * Secret context wins where both apply. Keys are scrubbed as text, never as containers.
  */
 export function scrubJson<T>(value: T): T {
-  return scrubJsonValue(value, false);
+  return scrubJsonValue(value, false, false);
 }
 
-function scrubJsonValue<T>(value: T, secretKeyed: boolean): T {
+function scrubJsonValue<T>(value: T, secretKeyed: boolean, publicKeyed: boolean): T {
   if (typeof value === "string") {
-    return (secretKeyed && redactsSecretKeyedValue(value) ? REDACTED : scrubText(value)) as T;
+    if (secretKeyed && redactsSecretKeyedValue(value)) return REDACTED as T;
+    return (publicKeyed ? scrubContainedText(value) : scrubText(value)) as T;
   }
   if (typeof value === "number") {
     return scrubNumber(value) as T;
   }
   if (Array.isArray(value)) {
-    return value.map((item) => scrubJsonValue(item, secretKeyed)) as T;
+    return value.map((item) => scrubJsonValue(item, secretKeyed, publicKeyed)) as T;
   }
   if (value && typeof value === "object") {
     const output: Record<string, unknown> = {};
@@ -1216,7 +1432,11 @@ function scrubJsonValue<T>(value: T, secretKeyed: boolean): T {
         name = `${base} (${n})`;
         nextSuffix.set(base, n + 1);
       }
-      output[name] = scrubJsonValue(item, secretKeyed || isSecretRecordKey(key));
+      output[name] = scrubJsonValue(
+        item,
+        secretKeyed || isSecretRecordKey(key),
+        publicKeyed || isPublicSelectorKey(key),
+      );
     }
     return output as T;
   }

@@ -49,11 +49,12 @@ import * as currentChunks from "../src/lib/pipeline/raw-chunks.js";
 import * as currentScrub from "../src/lib/scrub.js";
 import * as frozenScrub from "./fixtures/scrub-ruleset-5.js";
 import { scrubJson as v4Json, scrubText as v4Text } from "./fixtures/scrub-ruleset-4.js";
+import { frozenScrubModule } from "./support/frozen-scrub-module.js";
 
 // raw-chunks.ts with its scrub.js import bound to the frozen rule set 5 source (as in
 // scrub-v5-v6-fuzz.test.ts); the segmenter is unchanged between rule sets 5 and 6.
 vi.resetModules();
-vi.doMock("../src/lib/scrub.js", () => import("./fixtures/scrub-ruleset-5.js"));
+vi.doMock("../src/lib/scrub.js", async () => frozenScrubModule(await import("./fixtures/scrub-ruleset-5.js")));
 const frozenChunks = await import("../src/lib/pipeline/raw-chunks.js");
 vi.doUnmock("../src/lib/scrub.js");
 vi.resetModules();

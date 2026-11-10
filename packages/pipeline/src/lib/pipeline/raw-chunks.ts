@@ -21,8 +21,10 @@ import {
   MAX_SCRUB_CHARS,
   exceedsScrubBound,
   isCardNumber,
+  isPublicSelectorKey,
   isSecretRecordKey,
   redactsSecretKeyedValue,
+  scrubContainedSegment,
   scrubText,
   unsplittableQuotedValueSpans,
 } from "../scrub.js";
@@ -705,6 +707,32 @@ export function scrubLong(text: string): string {
   return out + scrubText(rest);
 }
 
+/**
+ * `scrubLong` for a string that is itself a container (a value under the public replay
+ * selector; see `scrubContainedText`): segments as `scrubLong`, each scrubbed as a
+ * container. Once a segment's redaction runs to its end (a nested credential assignment
+ * reaching the string's end, or a quoted value failing closed), the rest of the string is
+ * inside that redaction, so no later segment is stored.
+ */
+function scrubLongContained(text: string): string {
+  let out = "";
+  let rest = text;
+  while (exceedsScrubBound(rest)) {
+    const cut = longCut(rest);
+    if (!cut)
+      throw new PipelineError(
+        "chunk_string_too_long",
+        `raw chunk holds a line or string longer than the ${MAX_SCRUB_CHARS}-character scrub limit with no safe place to segment it`,
+        false,
+      );
+    const [scrubbed, reached] = scrubContainedSegment(rest.slice(0, cut));
+    out += scrubbed;
+    if (reached) return out;
+    rest = rest.slice(cut);
+  }
+  return out + scrubContainedSegment(rest)[0];
+}
+
 /** Whether `scrubLong` can take this text (it has safe cuts all the way). */
 export function canScrubLong(text: string): boolean {
   let rest = text;
@@ -743,6 +771,12 @@ interface Container {
   keys: ObjectKeys | null;
   secret: boolean;
   inherited: boolean;
+  /**
+   * As `secret`/`inherited`, for the public replay selector (`isPublicSelectorKey`, rule
+   * set 9): whether the value being read is (below) such a key's value.
+   */
+  public: boolean;
+  publicInherited: boolean;
 }
 
 /**
@@ -759,6 +793,12 @@ interface Container {
  * that names a secret (`isSecretRecordKey`, the decoded source key), directly or
  * anywhere below it, in arrays and objects alike, at any depth, is redacted whole
  * (`redactsSecretKeyedValue`) before it is scrubbed as a token on its own.
+ *
+ * Public selector context, as in `scrubJson` (rule set 9): a string value under the
+ * public replay selector (`isPublicSelectorKey`, the decoded source key), directly or
+ * anywhere below it, is scrubbed as a container (`scrubLongContained`), so a nested
+ * credential assignment runs to the string's end. Secret context wins where both apply.
+ * Keys are scrubbed as text, never as containers, and a later sibling key resets it.
  */
 function scrubRecordLine(line: string): string {
   // One entry per open container.
@@ -778,8 +818,15 @@ function scrubRecordLine(line: string): string {
       const scrubbed =
         !isKey && container?.secret && redactsSecretKeyedValue(value)
           ? REDACTED
-          : scrubStringToken(literal, value);
-      if (isKey) container!.secret = container!.inherited || isSecretRecordKey(value);
+          : scrubStringToken(
+              literal,
+              value,
+              !isKey && container?.public ? scrubLongContained : scrubBounded,
+            );
+      if (isKey) {
+        container!.secret = container!.inherited || isSecretRecordKey(value);
+        container!.public = container!.publicInherited || isPublicSelectorKey(value);
+      }
       let name = scrubbed;
       if (top?.expectKey) {
         const written = top.source.get(value);
@@ -810,6 +857,8 @@ function scrubRecordLine(line: string): string {
     } else {
       // A container below a secret key inherits that key's context (rule set 5).
       const inherited = container?.secret ?? false;
+      // And the public selector's context (rule set 9).
+      const publicInherited = container?.public ?? false;
       if (ch === "{")
         stack.push({
           keys: {
@@ -820,8 +869,11 @@ function scrubRecordLine(line: string): string {
           },
           secret: inherited,
           inherited,
+          public: publicInherited,
+          publicInherited,
         });
-      else if (ch === "[") stack.push({ keys: null, secret: inherited, inherited });
+      else if (ch === "[")
+        stack.push({ keys: null, secret: inherited, inherited, public: publicInherited, publicInherited });
       else if (ch === "}" || ch === "]") stack.pop();
       else if (ch === "," && top) top.expectKey = true;
       out += ch;

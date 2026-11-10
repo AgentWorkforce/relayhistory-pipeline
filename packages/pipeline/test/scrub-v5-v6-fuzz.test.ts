@@ -54,6 +54,7 @@ import {
 } from "./fixtures/scrub-ruleset-6.js";
 
 import { scrubText as v6PreFix } from "./fixtures/scrub-ruleset-6-prefix-f6a97053.js";
+import { frozenScrubModule } from "./support/frozen-scrub-module.js";
 
 /** sha256 of fixtures/scrub-ruleset-5.ts (LF line endings), rule set 5's scrub.ts at 62a7996d. */
 const V5_FIXTURE_SHA256 = "8fbf9136b61d8fae03f076f87e514f910bfcfc03841313f550f5bdcb861d4de1";
@@ -70,12 +71,12 @@ const v6Records = (text: string) => dec.decode(v6RecordsRaw(enc.encode(text)).sc
 
 beforeAll(async () => {
   vi.resetModules();
-  vi.doMock("../src/lib/scrub.js", () => import("./fixtures/scrub-ruleset-5.js"));
+  vi.doMock("../src/lib/scrub.js", async () => frozenScrubModule(await import("./fixtures/scrub-ruleset-5.js")));
   const mod = await import("../src/lib/pipeline/raw-chunks.js");
   v5RecordsRaw = mod.scrubRecords as Records;
   vi.doUnmock("../src/lib/scrub.js");
   vi.resetModules();
-  vi.doMock("../src/lib/scrub.js", () => import("./fixtures/scrub-ruleset-6.js"));
+  vi.doMock("../src/lib/scrub.js", async () => frozenScrubModule(await import("./fixtures/scrub-ruleset-6.js")));
   v6RecordsRaw = (await import("../src/lib/pipeline/raw-chunks.js")).scrubRecords as Records;
   vi.doUnmock("../src/lib/scrub.js");
   vi.resetModules();

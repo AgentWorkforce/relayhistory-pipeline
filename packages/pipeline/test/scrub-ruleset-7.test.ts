@@ -12,12 +12,15 @@ const replay = 'idempotency_key="public-replay-20261109-1"';
 const tool = `to="worker@machine" text="Hello Worker!" ${replay}`;
 
 describe("scrub ruleset 7 public replay selector", () => {
-  it("freezes shipped version 6 and advances the stored ruleset version", () => {
+  // The v6 fixture and its own pin are frozen byte for byte. The combined pin joins it
+  // with the LIVE segmenter block of raw-chunks.ts, so it moves when the segmenter does
+  // (last: rule set 9's records path bounds public-selector containers).
+  it("freezes shipped version 6 (fixture pinned with the live segmenter) and advances the stored ruleset version", () => {
     const source = readFileSync(fileURLToPath(new URL("./fixtures/scrub-ruleset-6.ts", import.meta.url).href), "utf8").replace(/\r\n/g, "\n");
     expect(createHash("sha256").update(source).digest("hex")).toBe("397f820a70a8ae83cfdfae9f4153de59b26fd41fb35ad7be25b38cb52ad2d526");
     const raw = readFileSync(fileURLToPath(new URL("../src/lib/pipeline/raw-chunks.ts", import.meta.url).href), "utf8").replace(/\r\n/g, "\n");
     const segmenter = /\/\/ <scrub-segmenter>[\s\S]*?\/\/ <\/scrub-segmenter>/.exec(raw)![0];
-    expect(createHash("sha256").update(`${source}\n${segmenter}`).digest("hex")).toBe("28edb23b9ff94299d530213a04026210eb848399475b740e026ecc85980b3a11");
+    expect(createHash("sha256").update(`${source}\n${segmenter}`).digest("hex")).toBe("0303254b79ba51059ceaeef42a339de90d493ff4ce1b4c88a9c811ab029423b6");
     expect(SCRUB_RULESET_VERSION).toBe(9);
     expect(v6(tool)).not.toBe(tool);
   });
