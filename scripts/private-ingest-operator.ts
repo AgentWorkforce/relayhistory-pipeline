@@ -733,12 +733,63 @@ export function assertOperatorSnapshot(
           name: "NEON_REPLICA",
           queue_name: input.sessionIngest.neonReplicaQueue,
         };
-      if (row.bindings.length !== Object.keys(expected).length)
+      const overlapDeletes = row.bindings.filter(
+        (binding: any) => binding.action === "delete",
+      );
+      if (
+        row.bindings.length !== Object.keys(expected).length + overlapDeletes.length ||
+        overlapDeletes.length > 1
+      )
         refuse("native_binding_inventory");
       const found = new Set<string>();
       for (const b of row.bindings) {
         const wanted = expected[b.sid],
           actual = b.data?.bindings;
+        if (b.action === "delete") {
+          const currentEnv = row.state?.props?.env,
+            proposedEnv = props.env,
+            oldExpected = currentEnv?.INGEST_EXPECT_GENERATION,
+            newExpected = proposedEnv?.INGEST_EXPECT_GENERATION,
+            oldAccepted = currentEnv?.INGEST_ACCEPT_GENERATIONS;
+          // The retained operator may remove exactly one binding, and only for
+          // the documented G -> H generation-window closure. Bind the deleted
+          // payload to the old resolved state and the new single generation;
+          // arbitrary binding deletion remains refused.
+          if (
+            b.sid !== "INGEST_ACCEPT_GENERATIONS" ||
+            row.action !== "update" ||
+            wanted !== undefined ||
+            input.sessionIngest.overlapGeneration !== undefined ||
+            input.sessionIngest.expectedGeneration !== newExpected ||
+            typeof oldExpected !== "string" ||
+            !/^[0-9a-f]{64}$/u.test(oldExpected) ||
+            typeof newExpected !== "string" ||
+            !/^[0-9a-f]{64}$/u.test(newExpected) ||
+            oldExpected === newExpected ||
+            oldAccepted !== `${oldExpected},${newExpected}` ||
+            proposedEnv?.INGEST_ACCEPT_GENERATIONS !== undefined ||
+            !Array.isArray(actual) ||
+            actual.length !== 1 ||
+            Object.entries(b.data).some(
+              ([k, v]) => k !== "bindings" && v !== undefined,
+            ) ||
+            inputsDigest(JSON.stringify({ value: actual[0] })) !==
+              inputsDigest(JSON.stringify({
+                value: {
+                  type: "plain_text",
+                  name: "INGEST_ACCEPT_GENERATIONS",
+                  text: oldAccepted,
+                },
+              }))
+          )
+            refuse("native_binding_target");
+          inventory.push({
+            sid: b.sid,
+            action: b.action,
+            target: actual[0],
+          });
+          continue;
+        }
         if (
           !wanted ||
           found.has(b.sid) ||
@@ -794,6 +845,8 @@ export function assertOperatorSnapshot(
             : wanted,
         });
       }
+      if (found.size !== Object.keys(expected).length)
+        refuse("native_binding_inventory");
     }
     if (
       ["session-ingest-fanout", "session-ingest-fanout-dlq"].includes(id) &&

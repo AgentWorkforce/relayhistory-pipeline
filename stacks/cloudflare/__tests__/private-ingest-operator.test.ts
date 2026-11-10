@@ -419,6 +419,91 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
       expect(queue.props.deliveryPaused).toBe(true);
       expect(queue.provider.version).toBe(1);
       expect(queue.downstream).toContain("session-ingest-fanout-consumer");
+
+      // The one permitted binding deletion is the exact G -> H overlap
+      // closure: old expected G + accepted G,H becomes expected H alone.
+      const oldExpected = "f".repeat(64),
+        newExpected = "e".repeat(64),
+        oldAccepted = `${oldExpected},${newExpected}`,
+        deletedOverlap = {
+          sid: "INGEST_ACCEPT_GENERATIONS",
+          action: "delete",
+          data: {
+            bindings: [{
+              type: "plain_text",
+              name: "INGEST_ACCEPT_GENERATIONS",
+              text: oldAccepted,
+            }],
+          },
+        },
+        cleanupWorker = {
+          ...worker,
+          action: "update",
+          state: {
+            status: "updated",
+            props: {
+              ...worker.props,
+              env: {
+                ...worker.props.env,
+                INGEST_EXPECT_GENERATION: oldExpected,
+                INGEST_ACCEPT_GENERATIONS: oldAccepted,
+              },
+            },
+          },
+          bindings: [...worker.bindings, deletedOverlap],
+        },
+        cleanupRows = {
+          ...native.native.resources,
+          "session-ingest": cleanupWorker,
+        },
+        cleanupSnapshot = {
+          ...native,
+          native: { ...native.native, resources: cleanupRows },
+        };
+      expect(assertOperatorSnapshot(cleanupSnapshot, input)).toHaveLength(
+        bindingCount + 1,
+      );
+      for (const invalid of [
+        { ...deletedOverlap, sid: "INGEST_CLAIM_LOCK_BUSY" },
+        { ...deletedOverlap, action: "update" },
+        { ...deletedOverlap, data: { bindings: [{
+          ...deletedOverlap.data.bindings[0], text: `${newExpected},${oldExpected}`,
+        }] } },
+        { ...deletedOverlap, data: { bindings: [{
+          ...deletedOverlap.data.bindings[0], name: "FOREIGN",
+        }] } },
+      ]) {
+        const rows = {
+          ...cleanupRows,
+          "session-ingest": {
+            ...cleanupWorker,
+            bindings: [...worker.bindings, invalid],
+          },
+        };
+        expect(() => assertOperatorSnapshot(
+          { ...native, native: { ...native.native, resources: rows } }, input,
+        )).toThrow();
+      }
+      const reversedState = {
+        ...cleanupWorker,
+        state: {
+          ...cleanupWorker.state,
+          props: {
+            ...cleanupWorker.state.props,
+            env: {
+              ...cleanupWorker.state.props.env,
+              INGEST_ACCEPT_GENERATIONS: `${newExpected},${oldExpected}`,
+            },
+          },
+        },
+      };
+      expect(() => assertOperatorSnapshot({
+        ...native,
+        native: {
+          ...native.native,
+          resources: { ...cleanupRows, "session-ingest": reversedState },
+        },
+      }, input)).toThrow("native_binding_target");
     }
     for (const change of ["binding", "target", "type", "action", "resource"]) {
       const rows = { ...native.native.resources },
@@ -714,6 +799,23 @@ describe("operatorSafePlans: async admission follows the resolved mode; a deploy
   test("drain at 100%, then the var-only flip to on (or omitted) is an update with the queue binding unchanged", () => {
     expect(() => run(SEVEN, { "session-ingest": "update" }, [queue("noop"), flag("update", "on")])).not.toThrow();
     expect(() => run(SEVEN, {}, [queue("noop"), flag("noop", "on")])).not.toThrow();
+  });
+
+  test("generation overlap cleanup renders one reviewed binding deletion", () => {
+    const generation = "e".repeat(64), overlap = "f".repeat(64);
+    expect(() => run(SEVEN, { "session-ingest": "update" }, [
+      queue("noop"),
+      flag("noop", "drain"),
+      {
+        sid: "INGEST_ACCEPT_GENERATIONS",
+        action: "delete",
+        target: {
+          type: "plain_text",
+          name: "INGEST_ACCEPT_GENERATIONS",
+          text: `${overlap},${generation}`,
+        },
+      },
+    ])).not.toThrow();
   });
 
   test("fresh rollout (nothing deployed) may be on directly", () => {
