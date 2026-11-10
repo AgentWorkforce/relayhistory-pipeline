@@ -151,6 +151,10 @@ function assignmentValue(text: string, at: number) {
   while (text[at + bs] === "\\") bs++;
   const quote = text[at + bs];
   if (!assignmentQuote(quote)) return { start: at, end: at, quoted: false };
+  // Support JSON quote depths through five escapes. Deeper or malformed
+  // backslash depths fail closed, rather than creating unbounded distinct
+  // quote scopes whose suffixes could be scanned repeatedly.
+  if (bs > 31) return { start: at, end: text.length, quoted: true };
   const start = at + bs + 1;
   const period = (bs + 1) & bs ? 0 : 2 * (bs + 1);
   for (let i = start; i < text.length; i++) {
@@ -173,18 +177,45 @@ function assignmentValue(text: string, at: number) {
 function redactAssignmentValues(text: string, spans?: Array<[number, number]>): string {
   const heads = new RegExp(ASSIGNMENT_HEAD.source, ASSIGNMENT_HEAD.flags);
   let out = "", last = 0, publicStart = -1, eligibleEnd = -1, publicEnd = -1;
+  // A public assignment may itself be inside a JSON/tool string. Cache each
+  // surrounding quote's real close once, so redacting its value preserves the
+  // enclosing record and repeated public heads do not rescan the same suffix.
+  let scopeAt = 0;
+  let scope: { start: number; end: number; after: number } | undefined;
+  const enclosing = (at: number) => {
+    while (scopeAt < at) {
+      if (scope) {
+        if (at <= scope.end) return scope;
+        scopeAt = scope.after;
+        scope = undefined;
+        continue;
+      }
+      let quoteAt = scopeAt;
+      while (text[quoteAt] === "\\") quoteAt++;
+      if (!assignmentQuote(text[quoteAt])) {
+        scopeAt = Math.max(scopeAt + 1, quoteAt);
+        continue;
+      }
+      const value = assignmentValue(text, scopeAt);
+      const bs = quoteAt - scopeAt;
+      scope = { start: value.start, end: value.end, after: Math.min(text.length, value.end + bs + 1) };
+      scopeAt = value.start;
+    }
+    return scope && at >= scope.start && at <= scope.end ? scope : undefined;
+  };
   for (let m = heads.exec(text); m; m = heads.exec(text)) {
     const at = heads.lastIndex;
     const nested = m.index >= publicStart && m.index < eligibleEnd && at <= publicEnd;
     if (m[1]!.toLowerCase() === "idempotency_key") {
       if (nested) continue;
       const value = assignmentValue(text, at);
+      const outer = enclosing(at);
       publicStart = at;
-      publicEnd = value.quoted ? value.end : text.length;
-      eligibleEnd = value.end;
+      publicEnd = Math.min(value.quoted ? value.end : text.length, outer?.end ?? text.length);
+      eligibleEnd = Math.min(value.end, publicEnd);
       if (!value.quoted) {
         eligibleEnd = at;
-        while (eligibleEnd < text.length && !/\s/.test(text[eligibleEnd]!) && !assignmentQuote(text[eligibleEnd])) eligibleEnd++;
+        while (eligibleEnd < publicEnd && !/\s/.test(text[eligibleEnd]!) && !assignmentQuote(text[eligibleEnd])) eligibleEnd++;
       }
       continue;
     }

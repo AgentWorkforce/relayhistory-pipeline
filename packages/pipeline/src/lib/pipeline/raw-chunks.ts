@@ -573,10 +573,11 @@ export function scrubStringToken(
   literal: string,
   value: string,
   scrub: (text: string) => string = scrubBounded,
+  literalScrub: (text: string) => string = scrub,
 ): string {
   const scrubbed = scrub(value);
   if (scrubbed !== value) return scrubbed;
-  return scrub(literal) === literal ? value : REDACTED;
+  return literalScrub(literal) === literal ? value : REDACTED;
 }
 
 const REDACTED = "[REDACTED]";
@@ -782,7 +783,7 @@ function scrubRecordLine(line: string): string {
           ? REDACTED
           : scrubStringToken(literal, value, !isKey && container?.replay
             ? (text) => scrubReplayValue(text, scrubBounded)
-            : scrubBounded);
+            : scrubBounded, scrubBounded);
       if (isKey) container!.secret = container!.inherited || isSecretRecordKey(value);
       if (isKey) container!.replay = container!.inheritedReplay || value.trim().toLowerCase() === "idempotency_key";
       let name = scrubbed;

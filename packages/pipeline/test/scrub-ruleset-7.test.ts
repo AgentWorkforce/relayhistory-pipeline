@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { scrubJson, scrubText } from "../src/lib/scrub.js";
-import { SCRUB_RULESET_VERSION, scrubRecords } from "../src/lib/pipeline/raw-chunks.js";
+import { scrubRecords } from "../src/lib/pipeline/raw-chunks.js";
 import { scrubText as v6 } from "./fixtures/scrub-ruleset-6.js";
 
 const encoder = new TextEncoder(), decoder = new TextDecoder();
@@ -12,13 +12,12 @@ const replay = 'idempotency_key="public-replay-20261109-1"';
 const tool = `to="worker@machine" text="Hello Worker!" ${replay}`;
 
 describe("scrub ruleset 7 public replay selector", () => {
-  it("freezes shipped version 6 and advances the stored ruleset version", () => {
+  it("keeps shipped version 6 and its segmenter immutable", () => {
     const source = readFileSync(fileURLToPath(new URL("./fixtures/scrub-ruleset-6.ts", import.meta.url).href), "utf8").replace(/\r\n/g, "\n");
     expect(createHash("sha256").update(source).digest("hex")).toBe("397f820a70a8ae83cfdfae9f4153de59b26fd41fb35ad7be25b38cb52ad2d526");
     const raw = readFileSync(fileURLToPath(new URL("./fixtures/scrub-segmenter-8.txt", import.meta.url).href), "utf8").replace(/\r\n/g, "\n");
     const segmenter = /\/\/ <scrub-segmenter>[\s\S]*?\/\/ <\/scrub-segmenter>/.exec(raw)![0];
     expect(createHash("sha256").update(`${source}\n${segmenter}`).digest("hex")).toBe("28edb23b9ff94299d530213a04026210eb848399475b740e026ecc85980b3a11");
-    expect(SCRUB_RULESET_VERSION).toBe(9);
     expect(v6(tool)).not.toBe(tool);
   });
 

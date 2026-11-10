@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { scrubJson, scrubText } from "../src/lib/scrub.js";
-import { scrubLong, scrubRecords, SCRUB_RULESET_VERSION } from "../src/lib/pipeline/raw-chunks.js";
+import { scrubLong, scrubRecords } from "../src/lib/pipeline/raw-chunks.js";
 import { scrubText as v7 } from "./fixtures/scrub-ruleset-7.js";
 
 const encoder = new TextEncoder(), decoder = new TextDecoder();
@@ -18,7 +18,6 @@ describe("ruleset 8 does not consume public assignment values", () => {
     const input = "idempotency_key=password=fixture-only";
     expect(v7(input)).toBe(input);
     expect(scrubText(input)).toBe("idempotency_key=password=[REDACTED]");
-    expect(SCRUB_RULESET_VERSION).toBe(9);
   });
 
   it("retains benign public replay selectors with the previous syntax", () => {

@@ -69,6 +69,14 @@ describe("ruleset 9 assignment extents", () => {
     }
   });
 
+  it("fails closed beyond the bounded quote escape depth", () => {
+    for (const depth of [32, 63, 64, 127]) {
+      const inner = 'password=' + "\\".repeat(depth) + '"SECRET_ALPHA SECRET_BETA';
+      allPaths(inner);
+      noTail(scrubText(inner));
+    }
+  });
+
   it("preserves public controls across all entry points and escaping depths", () => {
     for (const value of ["public-replay-42", '"public-replay-42"', "opaque=selector-42", "idempotency_key=".repeat(512) + "public-replay-42"]) {
       expect(scrubJson({ idempotency_key: value })).toEqual({ idempotency_key: value });
