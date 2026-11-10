@@ -94,7 +94,9 @@ const SCRUB_RULESETS: Record<number, string> = {
   // into their values and removes nested labelled credentials. Version 7 is frozen.
   8: "50c2e0c67395f488a308cbcfc7c945606374b3d67d37138e284849c6190c8214",
   // Version 9 keeps whole assignment values and encoded separators fail-closed.
-  9: "8de81e8c44301540c7d4eb826286de63e74299078b9b9c3e8afc082df7d09476",
+  // Updated before release on unmerged #478: preserve JSON quote escapes around
+  // existing redaction markers so wrapped records remain idempotent.
+  9: "ec2a84a2765cafe58ee7313186d3a1f5b914aa1b170a4e552eaafc30b2bee590",
 };
 
 const read = (rel: string) =>

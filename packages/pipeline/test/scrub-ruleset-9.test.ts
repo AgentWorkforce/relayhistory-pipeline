@@ -16,12 +16,18 @@ const noTail = (value: unknown) => {
 };
 const allPaths = (inner: string) => {
   const text = `idempotency_key=${inner}`;
-  noTail(scrubText(text));
-  noTail(scrubLong(text));
-  noTail(scrubJson({ idempotency_key: inner }));
-  noTail(scrubJson({ text }));
-  noTail(records({ idempotency_key: inner }));
-  noTail(records({ text }));
+  for (const scrub of [scrubText, scrubLong]) {
+    const clean = scrub(text);
+    noTail(clean);
+    expect(scrub(clean)).toBe(clean);
+  }
+  for (const input of [{ idempotency_key: inner }, { text }]) {
+    const json = scrubJson(input), record = records(input);
+    noTail(json);
+    noTail(record);
+    expect(scrubJson(json)).toEqual(json);
+    expect(records(record)).toEqual(record);
+  }
 };
 
 describe("ruleset 9 assignment extents", () => {
@@ -38,7 +44,7 @@ describe("ruleset 9 assignment extents", () => {
 
   it("redacts terminated and EOI multiword values in every entry point", () => {
     for (const label of ["password", "token", "api_key", "client_secret", "credentials"]) {
-      for (const separator of ["=", ":", " : ", String.raw`\u003d`, String.raw`\u003a`, String.raw`\x3D`]) {
+      for (const separator of ["=", ":", " : ", String.raw`\u003d`, String.raw`\u003D`, String.raw`\u003a`, String.raw`\u003A`, String.raw`\x3D`]) {
         for (const quote of ['"', "'", String.fromCharCode(96)]) {
           for (const close of [quote, ""]) {
             allPaths(`${label}${separator}${quote}SECRET_ALPHA SECRET_BETA${close}`);
@@ -56,13 +62,19 @@ describe("ruleset 9 assignment extents", () => {
 
   it("handles JSON escaping depths and encoded separators without decoding output", () => {
     for (const label of ["password", "token", "api_key", "client_secret", "credentials"]) {
-      for (const separator of ["=", String.raw`\u003d`, String.raw`\u003a`]) {
+      for (const separator of ["=", String.raw`\u003d`, String.raw`\u003D`, String.raw`\u003a`, String.raw`\u003A`]) {
         let text = `idempotency_key=${label}${separator}"SECRET_ALPHA SECRET_BETA"`;
         for (let depth = 0; depth < 5; depth++) {
-          noTail(scrubText(text));
-          noTail(scrubLong(text));
-          noTail(scrubJson({ text }));
-          noTail(records({ text }));
+          for (const scrub of [scrubText, scrubLong]) {
+            const clean = scrub(text);
+            noTail(clean);
+            expect(scrub(clean)).toBe(clean);
+          }
+          const json = scrubJson({ text }), record = records({ text });
+          noTail(json);
+          noTail(record);
+          expect(scrubJson(json)).toEqual(json);
+          expect(records(record)).toEqual(record);
           text = JSON.stringify(text);
         }
       }
@@ -74,6 +86,16 @@ describe("ruleset 9 assignment extents", () => {
       const inner = 'password=' + "\\".repeat(depth) + '"SECRET_ALPHA SECRET_BETA';
       allPaths(inner);
       noTail(scrubText(inner));
+    }
+  });
+
+  it("does not keep a secret tail after an existing redaction marker", () => {
+    for (const separator of ["=", String.raw`\u003D`, String.raw`\u003A`]) {
+      for (const quote of ['"', "'", String.fromCharCode(96)]) {
+        allPaths(`password${separator}${quote}[REDACTED] SECRET_ALPHA SECRET_BETA${quote}`);
+        allPaths(`password${separator}${quote}[REDACTED] SECRET_ALPHA SECRET_BETA`);
+      }
+      allPaths(`password${separator}[REDACTED] SECRET_ALPHA SECRET_BETA`);
     }
   });
 

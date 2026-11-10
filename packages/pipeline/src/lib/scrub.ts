@@ -232,6 +232,10 @@ function redactAssignmentValues(text: string, spans?: Array<[number, number]>): 
     }
     const start = nested ? at : value.start;
     if (end <= start) continue;
+    // Preserve an already-redacted value's surrounding JSON quote escapes.
+    // A nested public scope may include an inner close in this span; there is
+    // no credential left only when every other byte is a quote or backslash.
+    if (/^[\\"'`]*\[REDACTED\][\\"'`]*$/.test(text.slice(start, end))) continue;
     if (!nested && value.quoted && keepQuotedValue(text.slice(start, end))) continue;
     spans?.push([m.index, end]);
     out += text.slice(last, start) + REDACTED;
@@ -780,6 +784,11 @@ const SECRET_PATTERNS: Rule[] = [
       // body before it.
       const idx = match.search(/[:=]/);
       const separator = match[idx];
+      // A raw JSON string may put closing-quote escape backslashes after an
+      // existing marker. Keep those bytes: consuming them changes the literal
+      // on every record pass, making scrubStringToken redact the whole value.
+      // Only the complete marker plus escapes qualifies; a real tail does not.
+      if (/^\s*["'`]?\[REDACTED\]\\*$/.test(match.slice(idx + 1))) return match;
       return `${match.slice(0, idx)}${separator}${REDACTED}`;
     },
   ],
