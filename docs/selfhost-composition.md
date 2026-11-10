@@ -221,7 +221,10 @@ bootstrap's role shape.
 case, trimmed, enables it, and any other value is off) makes a claim that loses
 its lock wait (55P03/40P01) a 429 `delivery_busy` with `Retry-After` 5-10 s
 instead of a 503, as on the hosted Worker. 57014 and every other cause stay 503.
-The chart turns it on with extraEnv `{ name: INGEST_CLAIM_LOCK_BUSY, value: "on" }`.
+The chart turns it on with the managed value `ingestEdge.claimLockBusy: true`
+(AgentWorkforce/infra#187), which emits exactly one quoted
+`INGEST_CLAIM_LOCK_BUSY="on"` and omits the variable when false; the chart
+rejects `ingestEdge.extraEnv`.
 
 `SELFHOST_INGEST_ADMISSION=async` (default `sync`) moves the database off the
 upload request path: one create-only inbox PUT, then the hosted queued receipt,
