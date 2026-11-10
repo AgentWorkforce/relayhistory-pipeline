@@ -424,8 +424,22 @@ function workState(row: DirectoryListRow): WorkState {
   return status ? { status, updatedAt: iso(row.last_activity_at) } : null;
 }
 
-/** One directory row in the cloud-client `sessionSummary` shape (relayhistory's mapping). */
-export function sessionFromDirectoryRow(row: DirectoryListRow) {
+/** An explicitly negotiated self-host list extension; absent preserves cloud-client 0.2.0. */
+export interface DirectoryListMetadata {
+  includeAgentName?: "recorded";
+}
+
+/** Catalog names are a recorded set, not an ordering or a current/primary-agent claim. */
+function recordedAgentName(row: DirectoryListRow): string | undefined {
+  if (!row.catalog_projected_at || !Array.isArray(row.agent_names) || row.agent_names.length !== 1) return;
+  const [name] = row.agent_names;
+  if (typeof name !== "string" || name === "" || name !== name.trim() ||
+      Array.from(name).length > 200 || /[\u0000-\u001f\u007f]/u.test(name)) return;
+  return name;
+}
+
+/** One directory row in the cloud-client shape, with only explicitly negotiated metadata. */
+export function sessionFromDirectoryRow(row: DirectoryListRow, metadata: DirectoryListMetadata = {}) {
   const models = strings(row.models);
   const catalog = row.catalog_projected_at
     ? {
@@ -447,6 +461,7 @@ export function sessionFromDirectoryRow(row: DirectoryListRow) {
     : undefined;
   // sessionSummary bound (cloud-client 0.2.0 and later): title at most 90 characters.
   if (row.title !== null && row.title !== undefined && row.title.length > 90) throw new DirectoryError("parse");
+  const agentName = metadata.includeAgentName === "recorded" ? recordedAgentName(row) : undefined;
   return {
     title: row.title ?? null,
     // shortSummary is deliberately not sent: Cloud validates with the strict
@@ -475,13 +490,14 @@ export function sessionFromDirectoryRow(row: DirectoryListRow) {
     totalCacheCreate5mTokens: null,
     totalCacheCreate1hTokens: null,
     ...(catalog ? { catalog } : {}),
+    ...(agentName === undefined ? {} : { agentName }),
   };
 }
 
 export type DirectorySession = ReturnType<typeof sessionFromDirectoryRow>;
 
 /** One page: rows rechecked against the tenant, limit + 1 trimmed into a cursor (a `b96q1:` one for a q page). */
-export function directoryPage(rows: Array<DirectoryListRow & { cursor_ts?: string }>, tenant: { orgId: string; workspaceId: string }, limit: number, queryFingerprint?: string) {
+export function directoryPage(rows: Array<DirectoryListRow & { cursor_ts?: string }>, tenant: { orgId: string; workspaceId: string }, limit: number, queryFingerprint?: string, metadata: DirectoryListMetadata = {}) {
   if (rows.length > limit + 1) throw new DirectoryError("parse");
   for (const row of rows) if (row.org_id !== tenant.orgId || row.workspace_id !== tenant.workspaceId) throw new DirectoryError("tenant_mismatch");
   const hasMore = rows.length > limit;
@@ -494,7 +510,7 @@ export function directoryPage(rows: Array<DirectoryListRow & { cursor_ts?: strin
     const position = { lastActivityAt: ts, sessionId: last.session_id, harness: last.harness };
     nextCursor = queryFingerprint === undefined ? encodeListCursor(position) : encodeQueryCursor({ ...position, fingerprint: queryFingerprint });
   }
-  return { sessions: visible.map(sessionFromDirectoryRow), nextCursor };
+  return { sessions: visible.map((row) => sessionFromDirectoryRow(row, metadata)), nextCursor };
 }
 
 /** UTC dates (YYYY-MM-DD) from since through until, inclusive (relayhistory activityDates). */
