@@ -18,7 +18,7 @@ describe("ruleset 8 does not consume public assignment values", () => {
     const input = "idempotency_key=password=fixture-only";
     expect(v7(input)).toBe(input);
     expect(scrubText(input)).toBe("idempotency_key=password=[REDACTED]");
-    expect(SCRUB_RULESET_VERSION).toBe(8);
+    expect(SCRUB_RULESET_VERSION).toBe(9);
   });
 
   it("retains benign public replay selectors with the previous syntax", () => {

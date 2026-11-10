@@ -23,6 +23,7 @@ import {
   isCardNumber,
   isSecretRecordKey,
   redactsSecretKeyedValue,
+  scrubReplayValue,
   scrubText,
   unsplittableQuotedValueSpans,
 } from "../scrub.js";
@@ -124,7 +125,10 @@ export const SCRUB_RULESET = "relayhistory-scrub";
 // Version 7 kept the exact public idempotency_key assignment. Version 8 skips
 // matching that identifier instead of consuming its value, so nested labelled
 // credentials are still detected. The record/segment boundaries are unchanged.
-export const SCRUB_RULESET_VERSION = 8;
+// Version 9 redacts complete quoted/nested credential values and encoded
+// separators, carries public-property context after JSON decoding, and prevents
+// the segmenter from separating an assignment from its secret tail.
+export const SCRUB_RULESET_VERSION = 9;
 
 /** Object metadata the client's `put_raw_chunk` writes; read back on a lost create race. */
 export const META_RAW_SHA256 = "raw-sha256";
@@ -739,6 +743,8 @@ interface Container {
   keys: ObjectKeys | null;
   secret: boolean;
   inherited: boolean;
+  replay?: boolean;
+  inheritedReplay?: boolean;
 }
 
 /**
@@ -774,8 +780,11 @@ function scrubRecordLine(line: string): string {
       const scrubbed =
         !isKey && container?.secret && redactsSecretKeyedValue(value)
           ? REDACTED
-          : scrubStringToken(literal, value);
+          : scrubStringToken(literal, value, !isKey && container?.replay
+            ? (text) => scrubReplayValue(text, scrubBounded)
+            : scrubBounded);
       if (isKey) container!.secret = container!.inherited || isSecretRecordKey(value);
+      if (isKey) container!.replay = container!.inheritedReplay || value.trim().toLowerCase() === "idempotency_key";
       let name = scrubbed;
       if (top?.expectKey) {
         const written = top.source.get(value);
@@ -806,6 +815,7 @@ function scrubRecordLine(line: string): string {
     } else {
       // A container below a secret key inherits that key's context (rule set 5).
       const inherited = container?.secret ?? false;
+      const inheritedReplay = container?.replay ?? false;
       if (ch === "{")
         stack.push({
           keys: {
@@ -816,8 +826,10 @@ function scrubRecordLine(line: string): string {
           },
           secret: inherited,
           inherited,
+          replay: inheritedReplay,
+          inheritedReplay,
         });
-      else if (ch === "[") stack.push({ keys: null, secret: inherited, inherited });
+      else if (ch === "[") stack.push({ keys: null, secret: inherited, inherited, replay: inheritedReplay, inheritedReplay });
       else if (ch === "}" || ch === "]") stack.pop();
       else if (ch === "," && top) top.expectKey = true;
       out += ch;

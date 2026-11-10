@@ -139,6 +139,77 @@ function backslashesBefore(text: string, at: number): number {
   return n;
 }
 
+// Match encoded separators without decoding or rewriting the caller's text. A
+// backslash run covers JSON string escaping at every depth; each match consumes
+// its run once. Identifier prefixes remain bounded as in the assignment rule.
+const ASSIGNMENT_HEAD = /\b(idempotency_key|(?:[A-Za-z0-9]+_){0,8}(?:api[_-]?key|apikey|key|secret|token|password|passwd|passphrase|pwd|credentials?))(\\*["'\x60])?\s*(?:[:=]|\\+(?:u003[ad]|x3[ad]))\s*/gi;
+const assignmentQuote = (c: string | undefined) => c === '"' || c === "'" || c === String.fromCharCode(96);
+
+/** A quoted value's real close at its opening JSON-escape depth, or EOI. */
+function assignmentValue(text: string, at: number) {
+  let bs = 0;
+  while (text[at + bs] === "\\") bs++;
+  const quote = text[at + bs];
+  if (!assignmentQuote(quote)) return { start: at, end: at, quoted: false };
+  const start = at + bs + 1;
+  const period = (bs + 1) & bs ? 0 : 2 * (bs + 1);
+  for (let i = start; i < text.length; i++) {
+    if (text[i] !== quote) continue;
+    const run = Math.min(backslashesBefore(text, i), i - start);
+    if (period ? run % period === bs : run === bs)
+      return { start, end: i - bs, quoted: true };
+  }
+  return { start, end: text.length, quoted: true };
+}
+
+/**
+ * Rule set 9: assignment quotes delimit a WHOLE credential, including spaces
+ * and newlines. A credential nested in a public replay value consumes the
+ * remainder of that enclosing value (EOI when unquoted), never just its first
+ * word. An innocent replay selector is not consumed, so its value is still
+ * scanned. No recursion: nested public heads share the outer scope, avoiding
+ * repeated suffix walks. Spans keep the segmenter from detaching a secret tail.
+ */
+function redactAssignmentValues(text: string, spans?: Array<[number, number]>): string {
+  const heads = new RegExp(ASSIGNMENT_HEAD.source, ASSIGNMENT_HEAD.flags);
+  let out = "", last = 0, publicStart = -1, eligibleEnd = -1, publicEnd = -1;
+  for (let m = heads.exec(text); m; m = heads.exec(text)) {
+    const at = heads.lastIndex;
+    const nested = m.index >= publicStart && m.index < eligibleEnd && at <= publicEnd;
+    if (m[1]!.toLowerCase() === "idempotency_key") {
+      if (nested) continue;
+      const value = assignmentValue(text, at);
+      publicStart = at;
+      publicEnd = value.quoted ? value.end : text.length;
+      eligibleEnd = value.end;
+      if (!value.quoted) {
+        eligibleEnd = at;
+        while (eligibleEnd < text.length && !/\s/.test(text[eligibleEnd]!) && !assignmentQuote(text[eligibleEnd])) eligibleEnd++;
+      }
+      continue;
+    }
+    // Bare dictionary "key" is deliberately not a quoted secret key.
+    if (m[2] && !isSecretKeyName(m[1]!) && m[1]!.toLowerCase() !== "pwd") continue;
+    const value = assignmentValue(text, at);
+    // Ordinary bare assignments retain their existing token boundary. The
+    // established generic rule handles them; encoded separators need this pass.
+    if (!nested && !value.quoted && !m[0].includes("\\")) continue;
+    let end = nested ? publicEnd : value.end;
+    if (!nested && !value.quoted) {
+      end = at;
+      while (end < text.length && !/[\s,;"']/.test(text[end]!) && text.charCodeAt(end) !== 96) end++;
+    }
+    const start = nested ? at : value.start;
+    if (end <= start) continue;
+    if (!nested && value.quoted && keepQuotedValue(text.slice(start, end))) continue;
+    spans?.push([m.index, end]);
+    out += text.slice(last, start) + REDACTED;
+    last = end;
+    heads.lastIndex = end;
+  }
+  return out + text.slice(last);
+}
+
 /**
  * Redact the value of every quoted secret key, keeping the key, the separator and the
  * value's quotes: `"password": "x"`, `\"password\": \"x\"` (a JSON document inside a
@@ -441,7 +512,17 @@ export function unsplittableQuotedValueSpans(
 ): Array<[number, number]> {
   const spans: Array<[number, number]> = [];
   redactQuotedSecretValues(text, spans, options.prefix ?? false, false, true);
-  return spans;
+  redactAssignmentValues(text, spans);
+  // Both scanners report source offsets. Merge overlaps so callers can walk
+  // them monotonically even when a nested assignment lies in a quoted key.
+  spans.sort((a, b) => a[0] - b[0]);
+  const merged: Array<[number, number]> = [];
+  for (const span of spans) {
+    const previous = merged[merged.length - 1];
+    if (previous && span[0] <= previous[1]) previous[1] = Math.max(previous[1], span[1]);
+    else merged.push(span);
+  }
+  return merged;
 }
 
 /**
@@ -641,6 +722,7 @@ const SECRET_PATTERNS: Rule[] = [
   // `'token' => '…'`. The value is redacted, the key and quotes kept. See
   // `redactQuotedSecretValues`.
   redactQuotedSecretValues,
+  redactAssignmentValues,
   // `Authorization: Basic …` / `Token …` / `Bot …` and other non-Bearer schemes (Bearer is
   // its own rule above): the credential after the scheme, keeping the scheme.
   [
@@ -999,15 +1081,30 @@ export function scrubJson<T>(value: T): T {
   return scrubJsonValue(value, false);
 }
 
-function scrubJsonValue<T>(value: T, secretKeyed: boolean): T {
+/** Keep a public property value's enclosing string boundary after JSON decoding. */
+export function scrubReplayValue(value: string, scrub: (text: string) => string = scrubText): string {
+  const prefix = "idempotency_key=";
+  const clean = scrub(prefix + JSON.stringify(value));
+  if (!clean.startsWith(prefix)) return REDACTED;
+  try {
+    const parsed: unknown = JSON.parse(clean.slice(prefix.length));
+    return typeof parsed === "string" ? parsed : REDACTED;
+  } catch {
+    // Another rule may consume a JSON delimiter. Never fall back to raw text.
+    return REDACTED;
+  }
+}
+
+function scrubJsonValue<T>(value: T, secretKeyed: boolean, replayKeyed = false): T {
   if (typeof value === "string") {
-    return (secretKeyed && redactsSecretKeyedValue(value) ? REDACTED : scrubText(value)) as T;
+    if (secretKeyed && redactsSecretKeyedValue(value)) return REDACTED as T;
+    return (replayKeyed ? scrubReplayValue(value) : scrubText(value)) as T;
   }
   if (typeof value === "number") {
     return scrubNumber(value) as T;
   }
   if (Array.isArray(value)) {
-    return value.map((item) => scrubJsonValue(item, secretKeyed)) as T;
+    return value.map((item) => scrubJsonValue(item, secretKeyed, replayKeyed)) as T;
   }
   if (value && typeof value === "object") {
     const output: Record<string, unknown> = {};
@@ -1022,7 +1119,7 @@ function scrubJsonValue<T>(value: T, secretKeyed: boolean): T {
         name = `${base} (${n})`;
         nextSuffix.set(base, n + 1);
       }
-      output[name] = scrubJsonValue(item, secretKeyed || isSecretRecordKey(key));
+      output[name] = scrubJsonValue(item, secretKeyed || isSecretRecordKey(key), replayKeyed || key.trim().toLowerCase() === "idempotency_key");
     }
     return output as T;
   }

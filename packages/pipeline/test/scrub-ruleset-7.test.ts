@@ -15,10 +15,10 @@ describe("scrub ruleset 7 public replay selector", () => {
   it("freezes shipped version 6 and advances the stored ruleset version", () => {
     const source = readFileSync(fileURLToPath(new URL("./fixtures/scrub-ruleset-6.ts", import.meta.url).href), "utf8").replace(/\r\n/g, "\n");
     expect(createHash("sha256").update(source).digest("hex")).toBe("397f820a70a8ae83cfdfae9f4153de59b26fd41fb35ad7be25b38cb52ad2d526");
-    const raw = readFileSync(fileURLToPath(new URL("../src/lib/pipeline/raw-chunks.ts", import.meta.url).href), "utf8").replace(/\r\n/g, "\n");
+    const raw = readFileSync(fileURLToPath(new URL("./fixtures/scrub-segmenter-8.txt", import.meta.url).href), "utf8").replace(/\r\n/g, "\n");
     const segmenter = /\/\/ <scrub-segmenter>[\s\S]*?\/\/ <\/scrub-segmenter>/.exec(raw)![0];
     expect(createHash("sha256").update(`${source}\n${segmenter}`).digest("hex")).toBe("28edb23b9ff94299d530213a04026210eb848399475b740e026ecc85980b3a11");
-    expect(SCRUB_RULESET_VERSION).toBe(8);
+    expect(SCRUB_RULESET_VERSION).toBe(9);
     expect(v6(tool)).not.toBe(tool);
   });
 

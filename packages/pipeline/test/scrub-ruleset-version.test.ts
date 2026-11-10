@@ -93,6 +93,8 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Version 8 leaves public replay identifiers unmatched, so scanning continues
   // into their values and removes nested labelled credentials. Version 7 is frozen.
   8: "50c2e0c67395f488a308cbcfc7c945606374b3d67d37138e284849c6190c8214",
+  // Version 9 keeps whole assignment values and encoded separators fail-closed.
+  9: "ef3531621aa50a068163677d0c23c441cb13cc09d54f8b2b215d2c670bc8dda7",
 };
 
 const read = (rel: string) =>
