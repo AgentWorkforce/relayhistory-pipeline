@@ -251,12 +251,15 @@ const line = (
   ...overrides,
 });
 
-const projectedToolFiles = (payload: Record<string, unknown>) => {
+const projectedToolFiles = (
+  payload: Record<string, unknown>,
+  source = "codex",
+) => {
   const record = parseRelayhistoryRecord(
     JSON.stringify(line("tool", "tool_call", { ts_ms: T, ...payload })),
   );
   const event = byTable(
-    projectRelayhistorySession([record], context("codex")).rows,
+    projectRelayhistorySession([record], context(source)).rows,
     "convergence_events",
   )[0]!;
   return event.files_touched;
@@ -337,6 +340,52 @@ describe("tool-call written paths", () => {
         }),
       }),
     ).toEqual(["obsolete.ts"]);
+  });
+
+  it("projects Claude MultiEdit from its structured file_path", () => {
+    expect(
+      projectedToolFiles(
+        {
+          name: "MultiEdit",
+          args_json: JSON.stringify({
+            file_path: "src/multi.ts",
+            edits: [{ old_string: "old", new_string: "new" }],
+          }),
+        },
+        "claude",
+      ),
+    ).toEqual(["src/multi.ts"]);
+  });
+
+  it("projects another namespaced structured edit tool from file_path", () => {
+    expect(
+      projectedToolFiles({
+        name: "functions.StrReplace",
+        args_json: JSON.stringify({
+          file_path: "/work/replace.ts",
+          old_str: "old",
+          new_str: "new",
+        }),
+      }),
+    ).toEqual(["/work/replace.ts"]);
+  });
+
+  it("does not treat an arbitrary tool with file_path as a write", () => {
+    expect(
+      projectedToolFiles({
+        name: "Read",
+        args_json: JSON.stringify({ file_path: "src/read-only.ts" }),
+      }),
+    ).toEqual([]);
+  });
+
+  it("rejects malformed structured file_path arguments", () => {
+    expect(
+      projectedToolFiles({
+        name: "Write",
+        args_json: JSON.stringify({ file_path: ` ${"x".repeat(512)}` }),
+      }),
+    ).toEqual([]);
   });
 
   it("ignores malformed envelopes and malformed or oversized paths", () => {

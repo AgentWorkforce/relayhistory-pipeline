@@ -25,6 +25,7 @@ import {
 import { projectRelayhistorySession } from "../src/lib/pipeline/relayhistory-projection.js";
 import type { NormalizedOutput } from "../src/lib/pipeline/stages.js";
 import {
+  RELAYHISTORY_NORMALIZED_VERSION,
   RelayhistoryExportTransform,
   normalizeRelayhistoryRecords,
   parseRelayhistoryRecord,
@@ -460,7 +461,7 @@ describe("RelayHistory export transform", () => {
         const { f, output } = await run(location);
         const expected = normalizedKey(
           location,
-          2,
+          RELAYHISTORY_NORMALIZED_VERSION,
           `relayhistory-${f.manifest.raw.content_sha256}.ndjson`,
         );
         expect(output).toMatchObject({
@@ -548,7 +549,7 @@ describe("RelayHistory export transform", () => {
       const key = objectKey(
         normalizedKey(
           loc,
-          2,
+          RELAYHISTORY_NORMALIZED_VERSION,
           `relayhistory-${f.manifest.raw.content_sha256}.ndjson`,
         ),
       );
@@ -636,7 +637,7 @@ describe("RelayHistory export transform", () => {
       };
       const key = normalizedKey(
         loc,
-        2,
+        RELAYHISTORY_NORMALIZED_VERSION,
         `relayhistory-${f.manifest.raw.content_sha256}.ndjson`,
       );
       return { ...f, transform, pointer, key: objectKey(key) };
@@ -663,10 +664,12 @@ describe("RelayHistory export transform", () => {
         convergenceEventCount: eventLines(stored),
         unprojectedRecords: 0,
         revision: f.manifest.revision,
-        normalizedVersion: 2,
+        normalizedVersion: RELAYHISTORY_NORMALIZED_VERSION,
         contentSha256: f.manifest.raw.content_sha256,
       });
-      expect(output.outputKey).toContain("/normalized/v2/");
+      expect(output.outputKey).toContain(
+        `/normalized/v${RELAYHISTORY_NORMALIZED_VERSION}/`,
+      );
       expect(output.convergenceEventCount).toBe(3);
     });
 
@@ -753,7 +756,7 @@ describe("RelayHistory export transform", () => {
       });
       expect(await f.transform.normalize(f.pointer)).toMatchObject({
         outputKey: f.key,
-        normalizedVersion: 2,
+        normalizedVersion: RELAYHISTORY_NORMALIZED_VERSION,
         outputReused: false,
       });
       expect(

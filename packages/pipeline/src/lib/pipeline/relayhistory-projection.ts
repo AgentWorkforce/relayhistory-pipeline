@@ -485,6 +485,37 @@ const PATCH_PATH_HEADERS = [
   "*** Delete File: ",
   "*** Move to: ",
 ] as const;
+const STRUCTURED_FILE_EDIT_TOOLS = new Set([
+  "applypatch",
+  "createfile",
+  "delete",
+  "deletefile",
+  "edit",
+  "editfile",
+  "editnotebook",
+  "multiedit",
+  "patch",
+  "searchreplace",
+  "strreplace",
+  "strreplaceeditor",
+  "write",
+  "writefile",
+]);
+
+function validWrittenPath(path: string): boolean {
+  return (
+    path.length > 0 &&
+    path.length <= MAX_WRITTEN_PATH_CHARS &&
+    path.trim() === path &&
+    !/[\u0000-\u001f\u007f]/.test(path)
+  );
+}
+
+function normalizedToolName(name: string): string {
+  return (name.split(/[.:/]/).at(-1) ?? "")
+    .replaceAll(/[_-]/g, "")
+    .toLowerCase();
+}
 
 /** A static JavaScript string literal and the first byte after it. */
 function jsString(
@@ -668,14 +699,7 @@ function patchPaths(inputs: readonly string[]): string[] {
         );
         if (!header) continue;
         const path = line.slice(header.length);
-        if (
-          path.length === 0 ||
-          path.length > MAX_WRITTEN_PATH_CHARS ||
-          path.trim() !== path ||
-          /[\u0000-\u001f\u007f]/.test(path) ||
-          seen.has(path)
-        )
-          continue;
+        if (!validWrittenPath(path) || seen.has(path)) continue;
         seen.add(path);
         paths.push(path);
         if (paths.length === MAX_WRITTEN_PATHS) break;
@@ -694,6 +718,14 @@ function writtenPaths(name: string | null, args: unknown): string[] {
   }
   if (name === "exec" && typeof args.input === "string")
     return patchPaths(execApplyPatchInputs(args.input));
+  const filePath = args.file_path;
+  if (
+    name !== null &&
+    typeof filePath === "string" &&
+    STRUCTURED_FILE_EDIT_TOOLS.has(normalizedToolName(name)) &&
+    validWrittenPath(filePath)
+  )
+    return [filePath];
   return [];
 }
 
