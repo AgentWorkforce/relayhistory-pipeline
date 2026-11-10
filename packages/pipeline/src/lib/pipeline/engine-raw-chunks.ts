@@ -4,6 +4,7 @@
  */
 import { sha256Hex } from "../../../../object-store/src/crypto.js";
 import { preflightScrubRecords, MAX_STREAM_BYTES } from "../scrub-engine/bindgen-admission.js";
+import { poisonVerifiedBindgenEngine } from "../scrub-engine/bindgen-engine.js";
 import type { ScrubEngine, ScrubMarker } from "../scrub-engine/engine.js";
 import { ScrubberError } from "../scrub-engine/scrubber-error.js";
 import { PipelineError } from "./errors.js";
@@ -37,6 +38,7 @@ export function bindEngineRawSealer(
   let poisoned = false;
   const poison = (): never => {
     poisoned = true;
+    poisonVerifiedBindgenEngine(engine);
     throw new ScrubberError("scrubber_instance_poisoned", "instance_poison");
   };
   const healthy = () => {
@@ -52,6 +54,9 @@ export function bindEngineRawSealer(
     // Snapshot all caller-owned inputs before hashing yields to another task.
     const source = preflightScrubRecords(input.source);
     if (source.byteLength === 0) throw new PipelineError("chunk_empty", "raw chunk is empty", false);
+    // Rust legitimately returns zero records for a blank-only stream. Refuse
+    // that request at admission instead of poisoning a healthy shared engine.
+    if (!hasRecordContent(source)) throw new PipelineError("chunk_empty", "raw chunk has no records", false);
     const location = { ...input.location };
     const { seq, epoch, startOffset, format, traceId } = input;
     const sourceSha = await sha256Hex(source);
@@ -69,15 +74,17 @@ export function bindEngineRawSealer(
     }
     healthy();
     if (!result || !result.scrub || result.scrub.ruleset !== marker.ruleset || result.scrub.version !== marker.version ||
-        result.scrub.profile !== marker.profile || !Number.isSafeInteger(result.records) || result.records < 0)
+        result.scrub.profile !== marker.profile || !Number.isSafeInteger(result.records) || result.records <= 0)
       return poison();
     // Own the result before another await. Never compress input on scrub failure.
     let scrubbed: Uint8Array;
     try { scrubbed = snapshotOutput(result.scrubbed); }
     catch (cause) {
+      if (cause instanceof PipelineError && cause.code === "scrub_output_too_large") throw cause;
       if (cause instanceof ScrubberError && cause.retryable) throw cause;
       return poison();
     }
+    if (scrubbed.byteLength === 0) return poison();
     const stored = rawZstdFrame(scrubbed);
     const rawSha = await sha256Hex(scrubbed);
     const base = { seq, epoch, start_offset: startOffset, bytes: source.byteLength,
@@ -90,7 +97,8 @@ export function bindEngineRawSealer(
       const rawHash = meta["raw-sha256"], rawLength = meta["raw-bytes"], versionText = meta["scrub-version"];
       const rawBytes = Number(rawLength), version = Number(versionText);
       if (!rawHash || !/^[a-f0-9]{64}$/.test(rawHash) || rawLength === undefined ||
-          !Number.isSafeInteger(rawBytes) || rawBytes < 1 || !versionText ||
+          !/^[1-9][0-9]*$/.test(rawLength) || !Number.isSafeInteger(rawBytes) || rawBytes < 1 || !versionText ||
+          !/^[1-9][0-9]*$/.test(versionText) ||
           !Number.isSafeInteger(version) || version < 1 || !meta["scrub-ruleset"])
         throw new PipelineError("chunk_stored_unscrubbed", "stored chunk lacks valid scrub metadata", false);
       if (meta["scrub-ruleset"] !== marker.ruleset)
@@ -123,6 +131,18 @@ export function bindEngineRawSealer(
   return seal as BoundRawChunkSealer;
 }
 
+function hasRecordContent(source: Uint8Array): boolean {
+  try {
+    const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+    for (let i = 0; i < source.length; i += 65_536)
+      if (/\S/u.test(decoder.decode(source.subarray(i, i + 65_536), { stream: true }))) return true;
+    return /\S/u.test(decoder.decode());
+  } catch {
+    // UTF-8 was validated by preflight; inability to stage this check can retry.
+    throw new ScrubberError("scrub_admission_unavailable", "call_refusal", undefined, true);
+  }
+}
+
 /** Bound the collision read independently of untrusted stored metadata. */
 async function retainedBytes(body: ReadableStream<Uint8Array>): Promise<Uint8Array> {
   const reader = body.getReader(), chunks: Uint8Array[] = [];
@@ -146,7 +166,7 @@ async function retainedBytes(body: ReadableStream<Uint8Array>): Promise<Uint8Arr
 }
 
 /** Output expansion is not subject to the input's per-record cap. The staging
- * memory bound remains 64 MiB; exceeding it refuses retryably without poisoning
+ * memory bound remains 64 MiB; exceeding it refuses permanently without poisoning
  * a correctly functioning engine. Invalid output bytes are an engine defect.
  */
 function snapshotOutput(output: Uint8Array): Uint8Array {
@@ -156,7 +176,7 @@ function snapshotOutput(output: Uint8Array): Uint8Array {
   const length = Object.getOwnPropertyDescriptor(proto, "byteLength")!.get!.call(output);
   Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength")!.get!.call(buffer);
   if (length > MAX_STREAM_BYTES)
-    throw new ScrubberError("scrub_admission_unavailable", "call_refusal", undefined, true);
+    throw new PipelineError("scrub_output_too_large", "scrubbed chunk exceeds the sealing capacity", false);
   let bytes: Uint8Array;
   try { bytes = new Uint8Array(length); bytes.set(output); }
   catch { throw new ScrubberError("scrub_admission_unavailable", "call_refusal", undefined, true); }

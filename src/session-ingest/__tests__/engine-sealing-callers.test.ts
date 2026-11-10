@@ -2,10 +2,11 @@
 import { afterEach,expect,test } from 'bun:test';
 import { Hono } from 'hono';
 import { zstdDecompressSync } from 'node:zlib';
-import { fixtureSealer } from '../../../packages/pipeline/test/support/engine-sealer.ts';
+import { fixtureSealer,verifiedFixtureEngine } from '../../../packages/pipeline/test/support/engine-sealer.ts';
 import { createPipelineRoutes } from '../../../packages/pipeline/src/routes/pipeline.ts';
 import type { AppEnv } from '../../../packages/pipeline/src/env.ts';
 import { readAll,objectKey,type ObjectStore } from '../../../packages/object-store/src/index.ts';
+import { activeScrubEngine,sealRawChunk as wrapper,resetScrubEngineForTests,selectScrubEngine } from '../../../packages/pipeline/src/lib/scrub-engine/index.ts';
 import { ScrubberError } from '../../../packages/pipeline/src/lib/scrub-engine/scrubber-error.ts';
 import { writeGroups } from '../writer.ts';
 import { preparePublicationImage,writePublicationImage } from '../publication-image.ts';
@@ -14,7 +15,7 @@ import { exportUnit } from '../../migration/neon-s3-sync/export-session.ts';
 import { scratchStore } from './support.ts';
 const enc=new TextEncoder(),HEX='a'.repeat(64),OTHER='b'.repeat(64);
 const cleanup:(()=>void)[]=[];
-afterEach(()=>{for(const f of cleanup.splice(0))f();});
+afterEach(()=>{resetScrubEngineForTests();for(const f of cleanup.splice(0))f();});
 function scratch(){const s=scratchStore();cleanup.push(s.done);return s.store;}
 const line=JSON.stringify({kind:'session_event',origin_id:'origin-a',record_id:'native-r',revision:'1',operation:'upsert',received_at:'2026-11-04T01:00:00Z',payload:{text:'VISIBLE',ts_ms:1762218000000}});
 function publication(){
@@ -29,24 +30,25 @@ function publication(){
  return {ticket,head,decoded,target};
 }
 async function packed(s:ObjectStore,key:string){const o=await s.getObject(objectKey(key));return {text:new TextDecoder().decode(zstdDecompressSync(await readAll(o.body))),meta:o.meta.metadata};}
-for(const poisoned of [false,true])for(const caller of ['http','writer','publication','export'] as const)test(`${caller}: bound output/provenance or retryable poison, no fallback (${poisoned})`,async()=>{
- const s=scratch(),f=fixtureSealer();
+for(const mode of ['injected','poisoned','default'] as const)for(const caller of ['http','writer','publication','export'] as const)test(`${caller}: bound output/provenance or retryable poison, no fallback (${mode})`,async()=>{
+ const s=scratch(),f=fixtureSealer(),poisoned=mode==='poisoned',version=mode==='default'?8:10,sealer=mode==='default'?undefined:f.sealer;
+ if(mode==='default'){const previous=process.env.SCRUB_ENGINE;delete process.env.SCRUB_ENGINE;cleanup.push(()=>{if(previous===undefined)delete process.env.SCRUB_ENGINE;else process.env.SCRUB_ENGINE=previous;});selectScrubEngine({});}
  if(poisoned)f.engine.scrubRecords=()=>{f.state.failed=true;throw new ScrubberError('scrubber_instance_poisoned','instance_poison');};
  let result:Promise<unknown>;
  let key:string|undefined;
  if(caller==='http'){
   const app=new Hono<AppEnv>();app.use('*',async(c,next)=>{c.set('auth' as never,{orgId:'org-a',workspaceId:'ws-a',scopes:['rth:sync']} as never);c.set('correlationId','corr');await next();});
-  app.route('/v1',createPipelineRoutes({rawChunkSealer:f.sealer,rawStore:()=>({store:s,provider:'s3',bucket:'fixture'}),sink:()=>({record:async()=>{}}) as never,deadLetters:()=>({}) as never,send:async()=>{}}));
+  app.route('/v1',createPipelineRoutes({rawChunkSealer:sealer,rawStore:()=>({store:s,provider:'s3',bucket:'fixture'}),sink:()=>({record:async()=>{}}) as never,deadLetters:()=>({}) as never,send:async()=>{}}));
   const response=await app.request('/v1/pipeline/chunks?machine=m&harness=claude&session=s&date=2026-11-04&seq=0&epoch=0&offset=0&format=ndjson',{method:'POST',body:line+'\n'},{PIPELINE_ORG_ID:'org-a'});
   expect(response.status).toBe(poisoned?503:201);const body=await response.json() as any;
-  if(poisoned){expect((await s.list(objectKey('v1'))).items.length).toBe(0);return;}key=body.key;expect(body.scrub.profile).toBe('fixture-v10');
+  if(poisoned){expect((await s.list(objectKey('v1'))).items.length).toBe(0);return;}key=body.key;expect(body.scrub.profile).toBe(mode==='default'?undefined:'fixture-v10');
  }else{
-  if(caller==='writer')result=writeGroups({store:s,keyRoot:'96bulls',rawChunkSealer:f.sealer},{orgId:'org-a',workspaceId:'ws-a',userId:'user-a',originId:'origin-a',batchDigest:HEX},[{source:'claude',sessionId:'session:1',lines:[line]}],new Date('2026-11-04T01:00:00Z')).then(r=>{key=r.parts[0]!.chunkKey;expect(r.manifests[0]!.manifest.raw.scrub!.version).toBe(10);});
+  if(caller==='writer')result=writeGroups({store:s,keyRoot:'96bulls',rawChunkSealer:sealer},{orgId:'org-a',workspaceId:'ws-a',userId:'user-a',originId:'origin-a',batchDigest:HEX},[{source:'claude',sessionId:'session:1',lines:[line]}],new Date('2026-11-04T01:00:00Z')).then(r=>{key=r.parts[0]!.chunkKey;expect(r.manifests[0]!.manifest.raw.scrub!.version).toBe(version);});
   else if(caller==='publication'){
    const p=publication(),signal=new AbortController().signal;
-   result=preparePublicationImage(p.ticket,p.head,p.decoded,p.target,s,signal,undefined,f.sealer).then(async image=>{
-    expect(new TextDecoder().decode(zstdDecompressSync(image.newChunk.body))).toContain('SEALED');
-    expect(image.newChunk.options?.metadata?.['scrub-profile']).toBe('fixture-v10');
+   result=preparePublicationImage(p.ticket,p.head,p.decoded,p.target,s,signal,undefined,sealer).then(async image=>{
+    expect(new TextDecoder().decode(zstdDecompressSync(image.newChunk.body))).toContain(mode==='default'?'VISIBLE':'SEALED');
+    expect(image.newChunk.options?.metadata?.['scrub-profile']).toBe(mode==='default'?undefined:'fixture-v10');
     // Image construction captures bytes/options; no durable put precedes prepare/register.
     expect((await s.list(objectKey('96bulls'))).items.length).toBe(0);
     const order:string[]=[];const rpc={prepare:async()=>{order.push('prepare');},register:async()=>{order.push('register');}};
@@ -54,13 +56,27 @@ for(const poisoned of [false,true])for(const caller of ['http','writer','publica
    });
   }else{
    const before=process.env.S3X_OBLIGATIONS;process.env.S3X_OBLIGATIONS='off';
-   result=exportUnit({store:s,keyRoot:'96bulls',grantId:'test-grant',rawChunkSealer:f.sealer},{orgId:'org-a',workspaceId:'ws-a',source:'claude',sessionId:'session:1',firstMs:Date.parse('2026-11-04T01:00:00Z'),lastMs:Date.parse('2026-11-04T01:01:00Z'),machineIds:[],totals:{event_count:'1',models:[]}},{fenced:async()=>false,async *lines(){yield {machine:'machine',bytes:enc.encode(line+'\n'),userId:'user-a'};}}).then(async r=>{
+   result=exportUnit({store:s,keyRoot:'96bulls',grantId:'test-grant',rawChunkSealer:sealer},{orgId:'org-a',workspaceId:'ws-a',source:'claude',sessionId:'session:1',firstMs:Date.parse('2026-11-04T01:00:00Z'),lastMs:Date.parse('2026-11-04T01:01:00Z'),machineIds:[],totals:{event_count:'1',models:[]}},{fenced:async()=>false,async *lines(){yield {machine:'machine',bytes:enc.encode(line+'\n'),userId:'user-a'};}}).then(async r=>{
     expect(r.manifests[0]!.chunksSealed).toBe(1);const raw=r.manifests[0]!.referenced.find(k=>k.includes('/raw/'));expect(raw).toBeDefined();key=raw;
-    const m=JSON.parse(new TextDecoder().decode(await readAll(await s.get(objectKey(r.manifests[0]!.manifestKey)))));expect(m.raw.scrub.version).toBe(10);
+    const m=JSON.parse(new TextDecoder().decode(await readAll(await s.get(objectKey(r.manifests[0]!.manifestKey)))));expect(m.raw.scrub.version).toBe(version);
    }).finally(()=>{if(before===undefined)delete process.env.S3X_OBLIGATIONS;else process.env.S3X_OBLIGATIONS=before;});
   }
   if(poisoned){await expect(result!).rejects.toMatchObject({code:'scrubber_instance_poisoned',retryable:true});const remaining=(await s.list(objectKey('96bulls'))).items;expect(remaining.every(o=>o.key.includes('/live-sessions/'))).toBe(true);return;}
   await result!;
  }
- expect(f.state.calls).toBe(1);expect(key).toBeDefined();const o=await packed(s,key!);expect(o.text).toContain('SEALED');expect(o.text).not.toContain('VISIBLE');expect(o.meta['scrub-version']).toBe('10');expect(o.meta['scrub-profile']).toBe('fixture-v10');
+ expect(f.state.calls).toBe(mode==='default'?0:1);expect(key).toBeDefined();const o=await packed(s,key!);expect(o.text).toContain(mode==='default'?'VISIBLE':'SEALED');expect(o.text).not.toContain(mode==='default'?'SEALED':'VISIBLE');expect(o.meta['scrub-version']).toBe(String(version));expect(o.meta['scrub-profile']).toBe(mode==='default'?undefined:'fixture-v10');
+});
+
+for(const [engine,initialised] of [['wasm',false],['wasm-bindgen',false],['wasm-bindgen',true]] as const)test(`HTTP without routed sealer refuses unavailable for ${engine}/${initialised}`,async()=>{
+ resetScrubEngineForTests();const previous=process.env.SCRUB_ENGINE;process.env.SCRUB_ENGINE=engine;cleanup.push(()=>{if(previous===undefined)delete process.env.SCRUB_ENGINE;else process.env.SCRUB_ENGINE=previous;});
+ const s=scratch(),app=new Hono<AppEnv>();
+ if(initialised){const ready=await verifiedFixtureEngine(()=>({text:'{}\n',recordCount:1}));expect(activeScrubEngine()).toBe(ready);await expect(wrapper(s,{location:{prefix:'96bulls/o',workspaceId:'w',machineId:'m',harness:'h',sessionId:'s',startDate:'2026-11-10'},format:'ndjson',seq:0,epoch:0,startOffset:0,source:enc.encode('{}\n')})).rejects.toMatchObject({reason:'seal_path_not_routed'});}
+ app.use('*',async(c,next)=>{c.set('auth' as never,{orgId:'org-a',workspaceId:'ws-a',scopes:['rth:sync']} as never);await next();});
+ app.route('/v1',createPipelineRoutes({rawStore:()=>({store:s,provider:'s3',bucket:'fixture'}),sink:()=>({record:async()=>{}}) as never,deadLetters:()=>({}) as never,send:async()=>{}}));
+ const response=await app.request('/v1/pipeline/chunks?machine=m&harness=claude&session=s&date=2026-11-04&seq=0&epoch=0&offset=0&format=ndjson',{method:'POST',body:line+'\n'},{PIPELINE_ORG_ID:'org-a'});expect(response.status).toBe(503);expect((await s.list(objectKey('v1'))).items).toHaveLength(0);
+});
+test('HTTP deterministic scrub output overflow is413 with no raw persistence',async()=>{
+ const s=scratch(),app=new Hono<AppEnv>(),f=fixtureSealer();f.engine.scrubRecords=()=>({scrubbed:new Uint8Array(64*1024*1024+1),records:1,scrub:f.engine.marker});
+ app.use('*',async(c,next)=>{c.set('auth' as never,{orgId:'org-a',workspaceId:'ws-a',scopes:['rth:sync']} as never);await next();});app.route('/v1',createPipelineRoutes({rawChunkSealer:f.sealer,rawStore:()=>({store:s,provider:'s3',bucket:'fixture'}),sink:()=>({record:async()=>{}}) as never,deadLetters:()=>({}) as never,send:async()=>{}}));
+ const response=await app.request('/v1/pipeline/chunks?machine=m&harness=claude&session=s&date=2026-11-04&seq=0&epoch=0&offset=0&format=ndjson',{method:'POST',body:line+'\n'},{PIPELINE_ORG_ID:'org-a'});expect(response.status).toBe(413);expect((await s.list(objectKey('v1'))).items).toHaveLength(0);
 });

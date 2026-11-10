@@ -9,8 +9,8 @@ import { readAll, type ObjectStore } from '../src/lib/pipeline/object-layout.js'
 import { sealRawChunk as historical, type SealRawChunk } from '../src/lib/pipeline/raw-chunks.js';
 import { bindEngineRawSealer } from '../src/lib/pipeline/engine-raw-chunks.js';
 import { ScrubberError } from '../src/lib/scrub-engine/scrubber-error.js';
-import { resetScrubEngineForTests,sealRawChunk as wrapper,selectScrubEngine } from '../src/lib/scrub-engine/index.js';
-import { fixtureSealer } from './support/engine-sealer.js';
+import { activeScrubEngine,resetScrubEngineForTests,sealRawChunk as wrapper,selectScrubEngine } from '../src/lib/scrub-engine/index.js';
+import { fixtureSealer,verifiedFixtureEngine } from './support/engine-sealer.js';
 const enc=new TextEncoder();
 const dirs:string[]=[];
 afterEach(async()=>{resetScrubEngineForTests();await Promise.all(dirs.splice(0).map(d=>rm(d,{recursive:true,force:true})));});
@@ -43,10 +43,14 @@ test('result marker mismatch poisons binding and never persists',async()=>{
 for(const [name,source] of [['empty',new Uint8Array()],['malformed',new Uint8Array([255])],['shared',new Uint8Array(new SharedArrayBuffer(2))]] as const)test(`source ${name} refuses before engine or writes`,async()=>{
  const s=await store(),f=fixtureSealer();await expect(f.sealer(s,{...input(),source})).rejects.toBeDefined();expect(f.state.calls).toBe(0);expect((await s.list('96bulls' as never)).items).toHaveLength(0);
 });
+for(const text of ['\n',' \r\n','\u2003\n'])test(`blank-only stream is a call refusal, not shared-instance poison (${JSON.stringify(text)})`,async()=>{
+ const s=await store(),f=fixtureSealer();await expect(f.sealer(s,input(text))).rejects.toMatchObject({code:'chunk_empty',retryable:false});expect(f.state.calls).toBe(0);expect(f.engine.failed).toBe(false);await expect(f.sealer(s,input())).resolves.toMatchObject({created:true});
+});
 for(const [name,metadata,code] of [
  ['legacy8',{'scrub-version':'8'},null],['same10',{'scrub-version':'10','scrub-profile':'old-profile'},null],
  ['newer',{'scrub-version':'11'},'chunk_stored_newer'],['foreign',{'scrub-ruleset':'other'},'chunk_stored_foreign'],
  ['missing',null,'chunk_stored_unscrubbed'],['bad-hash',{'raw-sha256':'no'},'chunk_stored_unscrubbed'],['bad-size',{'raw-bytes':'NaN'},'chunk_stored_unscrubbed'],['bad-version',{'scrub-version':'0'},'chunk_stored_unscrubbed'],
+ ['exponent-version',{'scrub-version':'1e1'},'chunk_stored_unscrubbed'],['hex-version',{'scrub-version':'0xa'},'chunk_stored_unscrubbed'],['leading-zero-version',{'scrub-version':'010'},'chunk_stored_unscrubbed'],['exponent-size',{'raw-bytes':'1e1'},'chunk_stored_unscrubbed'],
 ] as const)test(`retained ${name} is described from same GET, never overwritten/relabelled`,async()=>{
  const s=await store(),f=fixtureSealer(),i=input(),out=await f.sealer(s,i),old=enc.encode('different compressed historical bytes');await s.delete(out.key as never);
  await s.put(out.key as never,old,{ifNoneMatch:true,metadata:metadata===null?{}:Object.assign({'raw-sha256':'a'.repeat(64),'raw-bytes':'7','scrub-ruleset':'relayhistory-scrub','scrub-version':'8'},metadata)});
@@ -89,8 +93,57 @@ test('typed poison is sticky even when an engine incorrectly leaves failed=false
 test('correct output expansion beyond the input record limit is preserved',async()=>{
  const s=await store(),f=fixtureSealer(()=> 'x'.repeat(16*1024*1024+1)+'\n');const out=await f.sealer(s,input());expect(out.entry.stored_raw_bytes).toBe(16*1024*1024+2);expect(f.state.failed).toBe(false);
 });
-test('output exceeding the staging bound refuses retryably and leaves a healthy engine reusable',async()=>{
+test('output exceeding the staging bound refuses permanently and leaves a healthy engine reusable',async()=>{
  const s=await store(),f=fixtureSealer();f.engine.scrubRecords=()=>({scrubbed:new Uint8Array(64*1024*1024+1),records:1,scrub:f.engine.marker});
- await expect(f.sealer(s,input())).rejects.toMatchObject({code:'scrub_admission_unavailable',retryable:true});
+ await expect(f.sealer(s,input())).rejects.toMatchObject({code:'scrub_output_too_large',retryable:false});
  f.engine.scrubRecords=()=>({scrubbed:enc.encode('x'),records:1,scrub:f.engine.marker});await expect(f.sealer(s,input())).resolves.toMatchObject({created:true});
+});
+
+for(const [text,recordCount] of [['',1],['x',0],['',0]] as const)test(`invalid empty result poisons the shared active instance (${text.length}/${recordCount})`,async()=>{
+ const s=await store(),engine=await verifiedFixtureEngine(()=>({text,recordCount}));
+ const first=bindEngineRawSealer(engine,{retained:'same-family-up-to-writer'}),other=bindEngineRawSealer(engine,{retained:'same-family-up-to-writer'});
+ expect(activeScrubEngine()).toBe(engine);
+ await expect(first(s,input())).rejects.toMatchObject({code:'scrubber_instance_poisoned'});
+ expect(engine.failed).toBe(true);expect(()=>activeScrubEngine()).toThrow(ScrubberError);expect(()=>engine.scrubText('later')).toThrow(ScrubberError);
+ await expect(other(s,input())).rejects.toMatchObject({code:'scrubber_instance_poisoned'});expect((await s.list('96bulls' as never)).items).toHaveLength(0);
+});
+
+/** Eight valid JSON records, all below the per-record limit. Their UTF-8
+ * payloads straddle the admission decoder's 65,536-byte read boundary. */
+function aggregateBytes(size:number,scalar:string):Uint8Array {
+ const bytes=new Uint8Array(size),prefix=enc.encode('{"text":"'),suffix=enc.encode('"}\n'),fill=enc.encode(scalar.repeat(32768));let offset=0;
+ for(let record=0;record<8;record++){
+  const length=Math.floor(size/8)+(record<size%8?1:0);bytes.set(prefix,offset);let at=offset+prefix.length;const end=offset+length-suffix.length;
+  while(end-at>=fill.length){bytes.set(fill,at);at+=fill.length;}
+  const whole=Math.floor((end-at)/enc.encode(scalar).length)*enc.encode(scalar).length;bytes.set(fill.subarray(0,whole),at);at+=whole;bytes.fill(0x61,at,end);bytes.set(suffix,end);offset+=length;
+ }
+ return bytes;
+}
+async function countingStore(){const s=await store();let puts=0;return {store:{...s,async put(key:any,body:any){puts++;return {key,version:{eTag:'fixture'},size:body.byteLength,contentSha256:await sha256Hex(body),created:true};}} as ObjectStore,puts:()=>puts};}
+const LIMIT=64*1024*1024;
+for(const scalar of ['é','😀'])for(const delta of [-1,0,1]){
+ test(`input aggregate ${scalar.length===1?2:4}-byte fill limit${delta>=0?'+':''}${delta}`,async()=>{
+  const s=await countingStore(),f=fixtureSealer(),bytes=aggregateBytes(LIMIT+delta,scalar);let calls=0;
+  f.engine.scrubRecords=source=>{calls++;return {scrubbed:source,records:8,scrub:f.engine.marker};};
+  expect(()=>new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes.subarray(0,65536))).toThrow();
+  if(delta>0){await expect(f.sealer(s.store,{...input(),source:bytes})).rejects.toMatchObject({code:'scrub_input_too_large',retryable:false});expect(calls).toBe(0);expect(s.puts()).toBe(0);}
+  else{await expect(f.sealer(s.store,{...input(),source:bytes})).resolves.toMatchObject({entry:{stored_raw_bytes:LIMIT+delta,records:8}});expect(calls).toBe(1);expect(s.puts()).toBe(1);}
+ },30_000);
+ test(`output aggregate ${scalar.length===1?2:4}-byte fill limit${delta>=0?'+':''}${delta}`,async()=>{
+  const s=await countingStore(),f=fixtureSealer(),bytes=aggregateBytes(LIMIT+delta,scalar);
+  f.engine.scrubRecords=()=>({scrubbed:bytes,records:8,scrub:f.engine.marker});
+  expect(()=>new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes.subarray(0,65536))).toThrow();
+  if(delta>0){await expect(f.sealer(s.store,input())).rejects.toMatchObject({code:'scrub_output_too_large',retryable:false});expect(s.puts()).toBe(0);}
+  else{await expect(f.sealer(s.store,input())).resolves.toMatchObject({entry:{stored_raw_bytes:LIMIT+delta}});expect(s.puts()).toBe(1);}
+  expect(f.engine.failed).toBe(false);
+ },30_000);
+}
+for(const scalar of ['é','😀'])for(const side of ['input','output'] as const)test(`${side} ending in a split ${scalar.length===1?2:4}-byte codepoint refuses at the aggregate limit`,async()=>{
+ const s=await countingStore(),f=fixtureSealer(),bytes=aggregateBytes(LIMIT,scalar),partial=enc.encode(scalar).subarray(0,enc.encode(scalar).length-1);bytes.set(partial,bytes.length-partial.length);
+ if(side==='output')f.engine.scrubRecords=()=>({scrubbed:bytes,records:8,scrub:f.engine.marker});
+ await expect(f.sealer(s.store,side==='input'?{...input(),source:bytes}:input())).rejects.toMatchObject(side==='input'?{code:'chunk_not_utf8',retryable:false}:{code:'scrubber_instance_poisoned',retryable:true});expect(s.puts()).toBe(0);
+},30_000);
+
+test('retained whitespace version from GET is not leniently parsed',async()=>{
+ const s=await store(),f=fixtureSealer(),i=input();await f.sealer(s,i);const changed={...s,async getObject(key:any){const o=await s.getObject(key);return {...o,meta:{...o.meta,metadata:{...o.meta.metadata,'scrub-version':' 10'}}};}};await expect(f.sealer(changed,i)).rejects.toMatchObject({code:'chunk_stored_unscrubbed'});
 });

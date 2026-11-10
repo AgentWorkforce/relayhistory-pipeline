@@ -804,6 +804,8 @@ export function createPipelineRoutes(deps: PipelineRouteDeps = defaultDeps) {
         sealed.created ? 201 : 200,
       );
     } catch (cause) {
+      if (cause instanceof PipelineError && cause.code === "scrub_output_too_large")
+        return error(c, 413, "too_large", "Scrubbed chunk exceeds the sealing capacity");
       if ((cause instanceof ScrubberError && cause.retryable) || cause instanceof ScrubEngineUnavailable)
         return error(c, 503, "scrub_unavailable", "Raw chunk sealing is temporarily unavailable");
       if (cause instanceof PipelineError && cause.code === "zstd_unavailable")

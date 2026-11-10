@@ -230,6 +230,14 @@ export type BindgenScrubEngine = ScrubEngine & {
 };
 
 const encoder = new TextEncoder();
+// Only verified instances can install a poison callback. The callback changes
+// the same private health state used by every scrub call and activeScrubEngine.
+const instancePoisoners = new WeakMap<ScrubEngine, () => void>();
+
+/** A trusted adapter found corrupt output after a verified engine returned. */
+export function poisonVerifiedBindgenEngine(engine: ScrubEngine): void {
+  instancePoisoners.get(engine)?.();
+}
 
 /** Build the engine around a verified, initialised glue module. Not exported: only the two init paths call it. */
 function makeEngine(glue: BindgenGlue, manifest: Readonly<BindgenManifest>): BindgenScrubEngine {
@@ -315,6 +323,7 @@ function makeEngine(glue: BindgenGlue, manifest: Readonly<BindgenManifest>): Bin
       catch { return poison(); }
     },
   };
+  instancePoisoners.set(engine, () => { failed = true; });
   return Object.freeze(engine);
 }
 
