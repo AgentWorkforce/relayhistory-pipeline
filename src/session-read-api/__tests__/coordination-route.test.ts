@@ -67,6 +67,19 @@ describe("GET /v1/coordination/overlaps", () => {
     expect((await get(`${base}&limit=1&limit=2`)).status).toBe(400);
   });
 
+  test("readiness covers the seven-day evidence lookback while the response window stays requested", async () => {
+    let checked: [string, string] | undefined;
+    const b = backend();
+    b.windowReadiness = async (_org, _workspace, since, until) => {
+      checked = [since.toISOString(), until.toISOString()];
+      return "ready";
+    };
+    const response = await injected(true, b).request(base, { headers: auth });
+    expect(response.status).toBe(200);
+    expect(checked).toEqual(["2026-10-29T00:00:00.000Z", "2026-11-06T00:00:00.000Z"]);
+    expect((await response.json() as any).window).toEqual({ since: "2026-11-05T00:00:00.000Z", until: "2026-11-06T00:00:00.000Z" });
+  });
+
   test("the ClickHouse backend serves synthetic facts and never crosses the token workspace", async () => {
     const event = (session_id: string, minute: number, files_touched = ["src/shared.ts"]) => ({
       ts: t(minute).replace("T", " ").replace("Z", ""), session_id, source: "codex", event_id: `${session_id}-e`, kind: "tool",
@@ -86,7 +99,10 @@ describe("GET /v1/coordination/overlaps", () => {
         calls.push({ sql, params: options?.params });
         if (sql.includes("output_facts_workspace_state")) return [{ complete_since: "2026-11-01 00:00:00.000000" }] as T[];
         if (sql.includes("output_facts_session_state") || sql.includes("FROM transcript_events FINAL")) return [{ n: 0 }] as T[];
-        if (sql.includes("FROM transcript_event_facts FINAL")) return [event("a", 0), event("b", 5), event("c", 1, []), event("d", 6, [])] as T[];
+        if (sql.includes("FROM transcript_event_facts FINAL") && sql.includes("arrayExists"))
+          return [event("a", 0), event("b", 5), event("c", 1, ["src/commit.ts"]), event("d", 6, ["src/revert.ts"])] as T[];
+        if (sql.includes("FROM transcript_event_facts FINAL"))
+          return [event("a", 0), event("b", 5), event("c", 1, []), event("d", 6, [])] as T[];
         if (sql.includes("FROM session_output_facts FINAL")) return [output("commit", "c", 2, 0), output("outcome", "d", 7, 1)] as T[];
         throw new Error(`unexpected query: ${sql}`);
       },
@@ -103,6 +119,11 @@ describe("GET /v1/coordination/overlaps", () => {
     expect(body.findings.map((finding: any) => finding.kind)).toEqual(["superseded_work", "concurrent_edit"]);
     expect(live.calls.erased.flat().map((candidate) => candidate.sessionId).sort()).toEqual(["a", "b", "c", "d"]);
     expect(calls.every((call) => !JSON.stringify(call.params).includes("other"))).toBe(true);
+    const evidenceCall = calls.find((call) => call.sql.includes("arrayExists"))!;
+    const outputCall = calls.find((call) => call.sql.includes("fact_kind IN"))!;
+    expect(evidenceCall.sql).toContain("LIMIT 10001");
+    expect(outputCall.sql).toContain("LIMIT 50001");
+    expect(evidenceCall.params).toMatchObject({ evidenceSince: "2026-10-29 00:00:00.000", since: "2026-11-05 00:00:00.000" });
     const before = calls.length;
     expect((await app.request(base.replace("workspace=ws", "workspace=other"), { headers: auth })).status).toBe(403);
     expect(calls).toHaveLength(before);
@@ -121,10 +142,30 @@ describe("GET /v1/coordination/overlaps", () => {
     }, {
       fact_kind: "commit", ts: t(2), scope_source: "codex", source: "codex",
       session_id: "output-only", fact_key: "def", origin: "commit_link", reverted: 0, row_id: "c-row",
-    }], false);
+    }], [], {
+      evidence: { cap: 10_000, truncated: false }, outputs: { cap: 50_000, truncated: false },
+      usage: { cap: 10_000, truncated: false },
+    });
     expect(normalized.lanes.find((lane) => lane.sessionId === "s")!.outcomes)
       .toEqual([{ key: "abc", ts: t(1), eventId: "o-row", reverted: true }]);
     expect(normalized.lanes.find((lane) => lane.sessionId === "output-only")!.commits)
       .toEqual([{ sha: "def", ts: t(2), eventId: "c-row", reverted: null }]);
+  });
+
+  test("a capped usage stream keeps findings but makes duplicate cost unknown", async () => {
+    const events = ["a", "b"].map((session_id, i) => ({
+      ts: t(i * 5), session_id, source: "codex", event_id: `${session_id}-e`, kind: "tool", project_id: "p",
+      task_ref_id: null, task_title: null, user_id: "u", branch: `feat/${session_id}`, input_tokens: 1,
+      output_tokens: 1, reasoning_tokens: 0, cost_usd_micros: 2, files_touched: ["src/shared.ts"], row_id: `${session_id}-row`,
+    }));
+    const normalized = await normalizeCoordinationFacts(undefined, {
+      orgId: "org", workspaceId: "ws", since: new Date(t(0)), until: new Date(t(60)),
+    }, events, [], events, {
+      evidence: { cap: 10_000, truncated: false }, outputs: { cap: 50_000, truncated: false },
+      usage: { cap: 1, truncated: true },
+    });
+    expect(normalized.sessionsTruncated).toBe(1);
+    expect(normalized.notes).toContain("usage stream cap 1 reached; duplicate cost is unknown");
+    expect(normalized.lanes.every((item) => item.usage.some((usage) => usage.tokens === null))).toBe(true);
   });
 });

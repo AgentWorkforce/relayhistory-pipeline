@@ -85,7 +85,7 @@ import { EvidenceRequestError, readBabysitterEvidence, type EvidenceDeps } from 
 import { MAX_TURN_HARNESSES, TurnsInputError, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
 import { clickhouseOutputBackend, type OutputBackend } from "./output-backend.ts";
 import { clickhouseDigestBackend, type DigestBackend } from "./digest-backend.ts";
-import { clickhouseCoordinationBackend, type CoordinationBackend } from "./coordination-backend.ts";
+import { COORDINATION_EVIDENCE_LOOKBACK_MS, clickhouseCoordinationBackend, type CoordinationBackend } from "./coordination-backend.ts";
 import { detectCoordination } from "../../packages/coordination-detect/src/index.ts";
 import { READ_SETTINGS } from "./queries.ts";
 import { DigestInputError, resolveDayWindow } from "./day-window.ts";
@@ -1574,7 +1574,8 @@ export function createReadApi(deps: ReadApiDeps) {
       let readiness: Awaited<ReturnType<CoordinationBackend["windowReadiness"]>> = "ready";
       let schemaMissing = false;
       try {
-        readiness = await backend.windowReadiness(identity.orgId, identity.workspaceId, since, until, { ...opts, untilExclusive: true });
+        const evidenceSince = new Date(since.getTime() - COORDINATION_EVIDENCE_LOOKBACK_MS);
+        readiness = await backend.windowReadiness(identity.orgId, identity.workspaceId, evidenceSince, until, { ...opts, untilExclusive: true });
       } catch (error) {
         if (backend.isSchemaMissing(error)) schemaMissing = true;
         else throw error;

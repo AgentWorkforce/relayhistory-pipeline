@@ -121,6 +121,8 @@ BEGIN
          'sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)',
          'sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)',
          'sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)',
+         'sessions.coordination_output_facts_for(text,timestamp with time zone,timestamp with time zone,text,integer)',
+         'sessions.coordination_write_facts_for(text,timestamp with time zone,timestamp with time zone,text,integer)',
          'sessions.digest_narrative_read(text,date,text,text)',
          'sessions.list_session_directory_for(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)',
          'sessions.output_facts_coverage_for(text,timestamp with time zone,timestamp with time zone)',

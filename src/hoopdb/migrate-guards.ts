@@ -1208,11 +1208,12 @@ async function adoptableIndex(
   const x = declared?.find((d) => d.name === name);
   if (!declared || !x) return false;
   const replaces = ADOPTABLE_INDEX_STEPS[step]?.replaces ?? [];
+  const creates = ADOPTABLE_INDEX_STEPS[step]?.creates ?? [];
   if (
     !inventory.every((o) =>
       o.kind === "index"
         ? declared.some((d) => d.name === o.name)
-        : o.kind === "function" && replaces.includes(o.name),
+        : o.kind === "function" && (replaces.includes(o.name) || creates.includes(o.name)),
     )
   )
     return false;
@@ -1467,11 +1468,12 @@ export async function sequencePreflight(
       applied = true; // can't look: fail closed, as if the step had run
     }
     // An index-only adoptable step's sentinel is its declared indexes: accepted only when every one
-    // is adoptable. A step that also replaces functions has a body sentinel, never overridden by
-    // index adoption; only its exactBodies (byte-identical to the file, declared attributes) set it aside.
+    // is adoptable. A step that creates or replaces functions has a function sentinel, never overridden
+    // by index adoption; only declared replacement exactBodies may set that sentinel aside.
     const declared = ADOPTABLE_INDEXES[names[i]!];
     const replacesFunctions = (ADOPTABLE_INDEX_STEPS[names[i]!]?.replaces.length ?? 0) > 0;
-    if (applied && declared?.length && !replacesFunctions) {
+    const createsFunctions = (ADOPTABLE_INDEX_STEPS[names[i]!]?.creates?.length ?? 0) > 0;
+    if (applied && declared?.length && !replacesFunctions && !createsFunctions) {
       const inventory = inventoryOf(sql[i]!);
       let all = true;
       for (const d of declared)
@@ -1570,7 +1572,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "d198f60237ff06fbbe5b7fb50d04a8943d444c5a095848d0d6843f97982e2342";
+  "4d90d1603510320c9ef1ce0900834d4e12382d74a4bdbf2655a213b6160fae30";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;
