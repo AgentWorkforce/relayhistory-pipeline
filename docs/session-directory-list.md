@@ -246,6 +246,16 @@ plan, stale projection or failed invariant refuses the write. It never repairs
 data, resets epochs, changes tombstones/fences, or turns on the newer Desktop
 relationship/model catalog (`catalog_read_version` / forget tracking).
 
+Before a real activation, qualify its lock behavior on an already running test
+PostgreSQL 17 container with
+`bun scripts/proof-native-agent-catalog-activation.ts CONTEXT CONTAINER`
+(through the local heavy-work queue where required). This creates and removes
+only a new isolated synthetic database. It proves writer/activation exclusion,
+pending-first migration exclusion, concurrent-operator serialization, ordinary
+reader continuity, and rollback after a lock timeout. It starts no container or
+VM and changes no existing role. This supplements the full-migration PGlite and
+tenant-bound RPC tests; it is not a live data or TLS qualification by itself.
+
 Then prove the actual authenticated `agent=` list filters, tenant isolation,
 pagination and Dashboard chips against the known sessions. `q=@name` alone is
 not this proof. The list's `agent=` parameter is an exact normalized name; a
