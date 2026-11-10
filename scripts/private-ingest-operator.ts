@@ -71,7 +71,10 @@ const isCommit = (s: unknown): s is string =>
 const object = (s: unknown): s is Record<string, any> =>
   s !== null && typeof s === "object" && !Array.isArray(s);
 export class OperatorRefusal extends Error {
-  constructor(readonly code: string) {
+  constructor(
+    readonly code: string,
+    readonly diagnostic?: OperatorPlanContractDiagnostic,
+  ) {
     super("private ingest operator refused: " + code);
   }
 }
@@ -98,6 +101,24 @@ export interface OperatorSource {
 export interface OperatorPlans {
   planText: string;
   detailedText: string;
+}
+export interface OperatorPlanContractDiagnostic {
+  reason: "summary_count" | "resource_inventory" | "forbidden_action" |
+    "summary_mismatch" | "view_mismatch" | "credential_pattern" |
+    "action_set" | "unknown";
+  compact: {
+    resourceClauses: Array<{ action: string; count: number }>;
+    bindingChanges: number | null;
+    zeroChanges: boolean;
+    resources: Array<{ id: string; action: string }>;
+  };
+  detailed: {
+    resourceClauses: Array<{ action: string; count: number }>;
+    bindingChanges: number | null;
+    zeroChanges: boolean;
+    resources: Array<{ id: string; action: string }>;
+  };
+  bindings: Array<{ sid: string; action: string }>;
 }
 export interface OperatorCapture {
   schema: 1;
@@ -197,6 +218,49 @@ export function assertOperatorInputs(
     refuse("account");
   return input as CloudflareStageInputs;
 }
+function operatorPlanContractDiagnostic(
+  error: unknown,
+  compact: string,
+  detailed: string,
+  bindings: BindingInventory,
+): OperatorPlanContractDiagnostic {
+  const shape = (text: string) => {
+    const summary = text.split(/\r?\n/u).find((line) => line.startsWith("Plan:")) ?? "";
+    return {
+      resourceClauses: [...summary.matchAll(/(\d+) to ([a-z-]+)/gu)]
+        .map((match) => ({ action: match[2]!, count: Number(match[1]) })),
+      bindingChanges: Number(
+        /(?:, )?(\d+) binding changes/u.exec(summary)?.[1] ?? NaN,
+      ),
+      zeroChanges: /^Plan:\s*(?:0 changes|no changes)(?:,|\s*$)/iu.test(summary),
+      resources: text.split(/\r?\n/u).flatMap((line) => {
+        const match = /^\s*\[([^\]]+)\]\s+(\S+)\s*$/u.exec(line);
+        return match ? [{ id: match[1]!, action: match[2]! }] : [];
+      }),
+    };
+  };
+  const message = error instanceof Error ? error.message : "";
+  let reason: OperatorPlanContractDiagnostic["reason"] = "unknown";
+  if (message.includes("expected exactly one Plan:")) reason = "summary_count";
+  else if (message.includes("unexpected resource") || message.includes("missing resource")) reason = "resource_inventory";
+  else if (message.includes("forbidden action")) reason = "forbidden_action";
+  else if (message.includes("summary does not match")) reason = "summary_mismatch";
+  else if (message.includes("compact and detailed")) reason = "view_mismatch";
+  else if (message.includes("credential value")) reason = "credential_pattern";
+  else if (message.includes("action set is neither")) reason = "action_set";
+  const normalize = (value: ReturnType<typeof shape>) => ({
+    ...value,
+    bindingChanges: Number.isFinite(value.bindingChanges)
+      ? value.bindingChanges
+      : null,
+  });
+  return {
+    reason,
+    compact: normalize(shape(compact)),
+    detailed: normalize(shape(detailed)),
+    bindings: bindings.map(({ sid, action }) => ({ sid, action })),
+  };
+}
 export function operatorSafePlans(
   plans: OperatorPlans,
   secrets: OperatorSecrets,
@@ -231,14 +295,19 @@ export function operatorSafePlans(
     )
       refuse("original_plan_contract");
     let phase: string;
+    const compact = resourcePlanView(result.planText, bindings),
+      detailed = resourcePlanView(result.detailedText, bindings);
     try {
       phase = assertSessionIngestPlanContract(
-        resourcePlanView(result.planText, bindings),
-        resourcePlanView(result.detailedText, bindings),
+        compact,
+        detailed,
         admission,
       );
-    } catch {
-      refuse("original_plan_contract");
+    } catch (error) {
+      throw new OperatorRefusal(
+        "original_plan_contract",
+        operatorPlanContractDiagnostic(error, compact, detailed, bindings),
+      );
     }
     // Design (h) step 3, binding level: a deployed Worker that GAINS the admission binding
     // in this apply must gain it with "drain" (then a var-only re-capture with "on"). The

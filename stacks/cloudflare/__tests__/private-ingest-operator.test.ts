@@ -17,6 +17,7 @@ import {
   operatorSafePlans,
   verifyOperatorCapture,
   EXECUTION_EXCEPTION,
+  OperatorRefusal,
   type OperatorSecrets,
 } from "../../../scripts/private-ingest-operator.ts";
 import { inputsDigest } from "../../aws/deploy-guard.ts";
@@ -819,6 +820,30 @@ describe("operatorSafePlans: async admission follows the resolved mode; a deploy
         },
       },
     ])).not.toThrow();
+  });
+
+  test("a refused contract exposes actions only, never binding values", () => {
+    let refusal: unknown;
+    try {
+      run(SEVEN, {
+        "session-ingest-fanout": "create",
+        "session-ingest": "update",
+      }, [queue("noop"), flag("noop", "drain")]);
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toBeInstanceOf(OperatorRefusal);
+    const diagnostic = (refusal as OperatorRefusal).diagnostic!;
+    expect(diagnostic.reason).toBe("action_set");
+    expect(diagnostic.compact.resources).toContainEqual({
+      id: "session-ingest",
+      action: "update",
+    });
+    expect(diagnostic.bindings).toEqual(expect.arrayContaining([
+      { sid: "INGEST_ADMISSION", action: "noop" },
+      { sid: "INGEST_ASYNC_ADMISSION", action: "noop" },
+    ]));
+    expect(JSON.stringify(diagnostic)).not.toContain("drain");
   });
 
   test("fresh rollout (nothing deployed) may be on directly", () => {
