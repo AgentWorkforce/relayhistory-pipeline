@@ -78,6 +78,25 @@ function abortable<T>(
   });
 }
 
+const truncationFlag = (value: unknown) => value === true || value === 1;
+
+/** Delivery-projected rows retain the source record under record.payload. Direct
+ * convergence rows and older callers may still expose the flag at row level. */
+function payloadTruncated(row: Record<string, unknown>): boolean {
+  const record = row.record;
+  const payload =
+    record && typeof record === "object" && !Array.isArray(record)
+      ? (record as Record<string, unknown>).payload
+      : undefined;
+  return (
+    truncationFlag(row.payload_truncated) ||
+    (payload !== null &&
+      typeof payload === "object" &&
+      !Array.isArray(payload) &&
+      truncationFlag((payload as Record<string, unknown>).payload_truncated))
+  );
+}
+
 /** One shared scan budget per report, charged before decoded bytes enter projection.
  * No object-store mutation, listing or presigned read capability is exposed. */
 export function boundedCanonicalReads(
@@ -359,10 +378,7 @@ export async function buildCanonicalReportExport(
         occurredAt,
         availableAt: null,
         text: roleLabel + (content.slice(0, excerpt) || `[${kind}]`),
-        truncated:
-          row.payload_truncated === true ||
-          row.payload_truncated === 1 ||
-          content.length > excerpt,
+        truncated: payloadTruncated(row) || content.length > excerpt,
         filesTouched: refs(row.files_touched),
       };
       charge(event);

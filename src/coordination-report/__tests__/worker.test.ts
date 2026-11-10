@@ -173,6 +173,40 @@ describe("leased coordination report worker", () => {
       mock.mockRestore();
     }
   });
+  test("upstream-truncated evidence keeps final report coverage partial", async () => {
+    const { deps, published } = setup();
+    const exported = structuredClone(sessions) as any;
+    exported.events[0].truncated = true;
+    const mock = spyOn(source, "buildCanonicalReportExport").mockResolvedValue({
+      export: exported,
+      sourceSnapshot: {
+        directoryGeneration: "1",
+        sessions: [],
+        relationships: [],
+      },
+    });
+    try {
+      deps.transport = async ({ packet }) => ({
+        packetId: packet.packetId,
+        assessmentSha256: packet.assessmentSha256,
+        workstreamId: packet.subject.workstreamId,
+        workstreamSummary: {
+          state: "unknown",
+          text: "Upstream evidence is incomplete.",
+          evidenceIds: [packet.evidence[0]!.id],
+        },
+        observationReviews: [],
+        candidateFindings: [],
+        missingContextRequests: [],
+      });
+      const outcome = await runCoordinationReportJob(deps, "j1");
+      expect(outcome.analysisStatus).toBe("partial");
+      expect(published[0].artifact.analysis.coverage.sampling.truncatedEvidence).toBeGreaterThan(0);
+      expect(published[0].artifact.assessment.coverage.status).toBe("partial");
+    } finally {
+      mock.mockRestore();
+    }
+  });
   test("publishes failed semantic analysis only as explicitly partial draft coverage", async () => {
     const { deps, published } = setup();
     const mock = spyOn(source, "buildCanonicalReportExport").mockResolvedValue({
