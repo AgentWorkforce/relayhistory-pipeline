@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
+import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { canonicalPointerGeneration } from "../session-read-api/canonical.ts";
-import { inTransaction, type HoopDb } from "../shared/db.ts";
+import type { HoopDb } from "../shared/db.ts";
 import type {
   CanonicalIdentity,
   CanonicalPointer,
@@ -21,6 +22,32 @@ export interface StoredReportJob {
   result: unknown | null;
   error_code: string | null;
 }
+
+/** Keep the report lane independent of shared/db's filesystem-backed verifier assets. */
+async function reportTransaction<T>(
+  db: Pick<HoopDb, "pool">,
+  work: (tx: SqlExecutor) => Promise<T>,
+): Promise<T> {
+  const client = await db.pool.connect();
+  try {
+    await client.query("BEGIN");
+    const tx: SqlExecutor = {
+      async query<R = Record<string, unknown>>(text: string, params?: unknown[]) {
+        const result = await client.query(text, params as unknown[]);
+        return { rows: result.rows as R[] };
+      },
+    };
+    const result = await work(tx);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 /** Tenant authority is supplied by trusted worker configuration, never request JSON. */
 export function createReportDatabase(
   db: HoopDb,
@@ -151,7 +178,7 @@ export function createReportDatabase(
       const serialized = JSON.stringify(result);
       if (!serialized || Buffer.byteLength(serialized) > 16 * 1024 * 1024)
         throw new Error("coordination_database_result_bound");
-      return inTransaction(db, async (tx) => {
+      return reportTransaction(db, async (tx) => {
         const deadline = Date.now() + 20000;
         await tx.query("SET LOCAL statement_timeout = '10s'");
         await tx.query("SET LOCAL lock_timeout = '5s'");

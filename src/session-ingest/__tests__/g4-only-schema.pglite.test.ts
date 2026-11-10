@@ -144,6 +144,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105046000_analysis_jobs.sql",
       // Two read-role-only SECURITY DEFINER list/activity query functions and three owner-only helpers; no ingest path touches them.
       "20261105046010_session_directory_read_api_query.sql",
+      // Coordination report jobs, request RPC and trigger only; the ingest path does not call them.
+      "20261105047000_coordination_report_jobs.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
