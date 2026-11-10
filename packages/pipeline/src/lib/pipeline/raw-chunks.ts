@@ -123,8 +123,12 @@ export const SCRUB_RULESET = "relayhistory-scrub";
  */
 // Version 7 kept the exact public idempotency_key assignment. Version 8 skips
 // matching that identifier instead of consuming its value, so nested labelled
-// credentials are still detected. The record/segment boundaries are unchanged.
-export const SCRUB_RULESET_VERSION = 8;
+// credentials are still detected. Version 9 redacts a quoted assignment value
+// whole, to its matching close across whitespace and line breaks, and takes
+// encoded separators (`\u003d`, `\x3d`, `%3D` and the `:` forms). The
+// segmenter code is unchanged; it keeps such a quoted value that holds
+// whitespace in one segment through `unsplittableQuotedValueSpans`.
+export const SCRUB_RULESET_VERSION = 9;
 
 /** Object metadata the client's `put_raw_chunk` writes; read back on a lost create race. */
 export const META_RAW_SHA256 = "raw-sha256";

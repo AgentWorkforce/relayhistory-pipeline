@@ -431,7 +431,9 @@ export function overCapQuotedValueSpans(
  * U+2028, U+2029, U+0085), through its matching close or, with none, to the end of the
  * text (rule set 5). The quoted rule redacts each of these whole too, across its line
  * breaks, so a segmenter must not cut inside one either: the segment after the cut would
- * hold the value's later lines with no key before them. Spans are sorted and disjoint.
+ * hold the value's later lines with no key before them. Rule set 9 adds the span [name
+ * start, closing quote end) of every quoted secret assignment value holding whitespace
+ * (`redactSecretAssignments` redacts it whole). Spans are sorted and disjoint.
  * `prefix: true` is as for `overCapQuotedValueSpans`: a value with no matching close in
  * the text is reported open to the end of the text (fail closed).
  */
@@ -441,7 +443,16 @@ export function unsplittableQuotedValueSpans(
 ): Array<[number, number]> {
   const spans: Array<[number, number]> = [];
   redactQuotedSecretValues(text, spans, options.prefix ?? false, false, true);
-  return spans;
+  // Rule set 9: a quoted assignment value holding whitespace is redacted whole too.
+  redactSecretAssignments(text, spans, options.prefix ?? false);
+  spans.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+  const merged: Array<[number, number]> = [];
+  for (const [start, end] of spans) {
+    const previous = merged[merged.length - 1];
+    if (previous && start < previous[1]) previous[1] = Math.max(previous[1], end);
+    else merged.push([start, end]);
+  }
+  return merged;
 }
 
 /**
@@ -541,6 +552,149 @@ function looksGenerated(token: string): boolean {
 }
 
 type Rule = [RegExp, Replacement] | ((text: string) => string);
+
+/**
+ * `<name>=<value>` / `<name>: <value>` secret assignments. The identifier may be prefixed
+ * (STRIPE_KEY, AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, DB_PASSWORD) — `(?:[A-Za-z0-9]+_){0,8}`
+ * absorbs the prefix segments so the trailing sensitive word still anchors. The leading `\b`
+ * + required underscore segments means a bare word like `monkey=…` is NOT matched.
+ *
+ * `(?:[A-Za-z0-9]+_){0,8}` is bounded, not `*`: an unbounded prefix class in front of a
+ * literal is the same quadratic shape fixed in the URL and email patterns. Eight
+ * underscore-separated segments is far past any real identifier (`AWS_SECRET_ACCESS_KEY`
+ * is three).
+ *
+ * Only the public identifier is skipped as a match, and scanning goes on into its value:
+ * consuming an exempt assignment would hide a nested `password=...` from this rule (rule
+ * set 8).
+ *
+ * Rule set 9: the separator is a literal `=` or `:`, or one of them encoded as tool output
+ * echoes it: a unicode or hex escape written out (`\u003d`, `\u003a`, `\x3d`, `\x3a`,
+ * behind 1 to 16 backslashes, so at any JSON escaping depth up to 4) or percent-encoded
+ * (`%3D`, `%3A`), hex digits in either case. Rule set 8 took only a literal one, so
+ * `password\u003dVALUE` was stored whole.
+ */
+const SECRET_ASSIGNMENT =
+  /\b(?!idempotency_key\s*(?:[:=]|\\{1,16}(?:u003[ad]|x3[ad])|%3[ad]))((?:[A-Za-z0-9]+_){0,8}(?:api[_-]?key|apikey|key|secret|token|password|passwd|passphrase|pwd|credentials?)\s*(?:[:=]|\\{1,16}(?:u003[ad]|x3[ad])|%3[ad]))\s*/gi;
+
+/**
+ * An unquoted assignment value, or a quoted one with no matching close within the bound:
+ * an optional opening quote, then up to whitespace, a quote, `,` or `;` (rule set 8's
+ * value, byte for byte). Sticky, matched in place from the value's start.
+ */
+const ASSIGNMENT_VALUE = /["'`]?[^"'`\s,;]+/y;
+const isQuote = (c: string | undefined) => c === '"' || c === "'" || c === "`";
+
+/**
+ * The quoted value of a secret assignment starting at `at`: an opening quote (`"`, `'` or
+ * `` ` ``) behind 0 to 16 backslashes, then the value up to its matching closing quote,
+ * found within `MAX_QUOTED_VALUE` units across whitespace and line breaks (literal or
+ * escaped). The matching close is the test `redactQuotedSecretValues` uses: at escaping
+ * depth d the opening quote has 2^d - 1 backslashes, and a quote closes when its backslash
+ * run is that many modulo 2^(d+1) (an extra pair is an escaped backslash, an odd excess an
+ * inner quote). Returns [value start, value end, end of the closing quote], or undefined
+ * when there is no opening quote or no matching close within the bound. One forward walk of
+ * at most `MAX_QUOTED_VALUE` + 1 units, so each start stays O(1) in the input's length.
+ */
+function quotedAssignmentValue(text: string, at: number): [number, number, number] | undefined {
+  let bs = 0;
+  while (bs < 16 && text[at + bs] === "\\") bs += 1;
+  const quote = text[at + bs];
+  if (quote !== '"' && quote !== "'" && quote !== "`") return undefined;
+  const valueStart = at + bs + 1;
+  const period = (bs + 1) & bs ? 0 : 2 * (bs + 1);
+  const limit = Math.min(text.length, valueStart + MAX_QUOTED_VALUE + 1);
+  for (let i = valueStart; i < limit; i += 1) {
+    if (text[i] !== quote) continue;
+    const run = backslashesBefore(text, i);
+    const own = i - run >= valueStart ? run : i - valueStart;
+    if (period ? own % period === bs : own === bs) return [valueStart, i - bs, i + 1];
+  }
+  return undefined;
+}
+
+/**
+ * Redact the value of every secret assignment (`SECRET_ASSIGNMENT`), keeping the name, the
+ * separator as written (whitespace after it is dropped, as in rule set 8) and, for a quoted
+ * value, both quotes: `password="[REDACTED]"`, `\"[REDACTED]\"` one level down.
+ *
+ * Rule set 9: a quoted value is redacted whole, to its matching closing quote, through
+ * whitespace and line breaks (`password="two words"`, `client_secret="a<LF>b"`), when that
+ * close is within `MAX_QUOTED_VALUE` units; rule set 8 stopped at the first whitespace or
+ * quote and stored the rest. An empty or already redacted quoted value is kept. With no
+ * matching close within the bound, and for an unquoted value, the value is rule set 8's
+ * (`ASSIGNMENT_VALUE`): an optional quote, then up to whitespace, a quote, `,` or `;`,
+ * except that rule set 9 leaves out a backslash run directly before that quote (rule set 8
+ * consumed it, breaking the enclosing escape: `\"password=v\"` became `\"password=[REDACTED]"`).
+ *
+ * Rule set 9 also matches at every position, not only after the previous value, and
+ * redacts the union of all the values found. Rule set 8 resumed after each value, so an
+ * assignment whose name a value had taken was stored (`password=x{password<TAB>=y` kept
+ * `y`), and so would one whose opening quote closed a quoted value before it. Every value
+ * rule set 8 redacted is therefore redacted by rule set 9 too: overlapping values merge into
+ * one `[REDACTED]`. A match starting inside an unquoted value already found is not measured
+ * again (its unquoted value ends where that one does), so each unquoted value is walked
+ * once, and each quoted one at most `MAX_QUOTED_VALUE` + 1 units.
+ *
+ * With `unsplittable`, also report [name start, closing quote end) of every quoted value
+ * holding whitespace (a segmenter cut inside one would leave its tail keyless in the next
+ * segment) and, with `prefix`, [name start, end of text) of every quoted opener whose
+ * close the text ends before the scan bound could decide (fail closed, as
+ * `overCapQuotedValueSpans`).
+ */
+function redactSecretAssignments(text: string, unsplittable?: Array<[number, number]>, prefix = false): string {
+  // [start, end, whether the span becomes `[REDACTED]` (else it is dropped: whitespace)].
+  const spans: Array<[number, number, boolean]> = [];
+  let unquotedEnd = 0;
+  SECRET_ASSIGNMENT.lastIndex = 0;
+  for (let m = SECRET_ASSIGNMENT.exec(text); m; m = SECRET_ASSIGNMENT.exec(text)) {
+    SECRET_ASSIGNMENT.lastIndex = m.index + 1;
+    const nameEnd = m.index + m[1].length;
+    const at = m.index + m[0].length;
+    const quoted = quotedAssignmentValue(text, at);
+    if (quoted) {
+      const [valueStart, valueEnd, closeEnd] = quoted;
+      const value = text.slice(valueStart, valueEnd);
+      if (unsplittable && /\s/.test(value)) unsplittable.push([m.index, closeEnd]);
+      if (value !== "" && value !== REDACTED) {
+        if (at > nameEnd) spans.push([nameEnd, at, false]);
+        spans.push([valueStart, valueEnd, true]);
+      }
+      continue;
+    }
+    if (unsplittable && prefix) {
+      let bs = 0;
+      while (bs < 16 && text[at + bs] === "\\") bs += 1;
+      if (isQuote(text[at + bs]) && at + bs + 1 + MAX_QUOTED_VALUE + 1 > text.length) unsplittable.push([m.index, text.length]);
+    }
+    if (at < unquotedEnd) continue;
+    ASSIGNMENT_VALUE.lastIndex = at;
+    const value = ASSIGNMENT_VALUE.exec(text);
+    let end = value ? at + value[0].length : at;
+    // Keep a backslash run that escapes the quote ending the value: it belongs to the
+    // enclosing escaped string (`\"password=v\"` one level down), not to the value.
+    if (isQuote(text[end])) while (end > at && text[end - 1] === "\\") end -= 1;
+    const bodyStart = at + (isQuote(text[at]) ? 1 : 0);
+    // Nothing to redact, or a value already redacted (kept so a second pass is a no-op).
+    if (end <= bodyStart || text.slice(bodyStart, end) === REDACTED) continue;
+    spans.push([nameEnd, end, true]);
+    unquotedEnd = end;
+  }
+  if (spans.length === 0) return text;
+  spans.sort((a, b) => a[0] - b[0] || b[1] - a[1]);
+  let out = "";
+  let last = 0;
+  for (let i = 0; i < spans.length; ) {
+    let [start, end, redact] = spans[i]!;
+    for (i += 1; i < spans.length && spans[i]![0] < end; i += 1) {
+      end = Math.max(end, spans[i]![1]);
+      redact ||= spans[i]![2];
+    }
+    out += text.slice(last, start) + (redact ? REDACTED : "");
+    last = end;
+  }
+  return out + text.slice(last);
+}
 
 const SECRET_PATTERNS: Rule[] = [
   // Rule set 5: over-bound quoted secret values, measured on the text before any rule
@@ -647,29 +801,8 @@ const SECRET_PATTERNS: Rule[] = [
     /(\bauthorization(?![A-Za-z0-9])[^A-Za-z0-9\r\n]{1,8}(?:Basic|Token|Bot|Digest|Negotiate|NTLM)\s+)[A-Za-z0-9._~+/=-]{8,}/gi,
     `$1${REDACTED}`,
   ],
-  // `<name>=<value>` / `<name>: <value>` secret assignments. The identifier may be prefixed
-  // (STRIPE_KEY, AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN, DB_PASSWORD) — `(?:[A-Za-z0-9]+_)*`
-  // absorbs the prefix segments so the trailing sensitive word still anchors. The leading `\b`
-  // + required underscore segments means a bare word like `monkey=…` is NOT matched.
-  [
-    // `(?:[A-Za-z0-9]+_){0,8}` is bounded, not `*`: an unbounded prefix class in front of a
-    // literal is the same quadratic shape fixed in the URL and email patterns. Eight
-    // underscore-separated segments is far past any real identifier
-    // (`AWS_SECRET_ACCESS_KEY` is three).
-    // Skip only the public identifier as a match, then keep scanning its value.
-    // Consuming an exempt assignment would hide a nested password=... from this rule.
-    /\b(?!idempotency_key\s*[:=])(?:[A-Za-z0-9]+_){0,8}(?:api[_-]?key|apikey|key|secret|token|password|passwd|passphrase|pwd|credentials?)\s*[:=]\s*["'`]?[^"'`\s,;]+/gi,
-    (match) => {
-      // Pick the separator POSITIONALLY (first `:` or `=`) — that is the real name/value
-      // delimiter, since the identifier name contains neither. Choosing by `includes("=")`
-      // mis-fires on a colon-assigned value whose body has `=` (base64 padding, common in
-      // AWS secret keys / k8s/YAML dumps): indexOf would land inside the value and leak the
-      // body before it.
-      const idx = match.search(/[:=]/);
-      const separator = match[idx];
-      return `${match.slice(0, idx)}${separator}${REDACTED}`;
-    },
-  ],
+  // `<name>=<value>` / `<name>: <value>` secret assignments: see `redactSecretAssignments`.
+  redactSecretAssignments,
   // Fallback: a generated-looking token (see `looksGenerated`) directly after a secret
   // name with only punctuation or a little whitespace between them, in shapes the
   // assignment rules do not parse: `--token <t>`, `password -> <t>`,

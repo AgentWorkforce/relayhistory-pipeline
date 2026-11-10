@@ -18,7 +18,7 @@ describe("scrub ruleset 7 public replay selector", () => {
     const raw = readFileSync(fileURLToPath(new URL("../src/lib/pipeline/raw-chunks.ts", import.meta.url).href), "utf8").replace(/\r\n/g, "\n");
     const segmenter = /\/\/ <scrub-segmenter>[\s\S]*?\/\/ <\/scrub-segmenter>/.exec(raw)![0];
     expect(createHash("sha256").update(`${source}\n${segmenter}`).digest("hex")).toBe("28edb23b9ff94299d530213a04026210eb848399475b740e026ecc85980b3a11");
-    expect(SCRUB_RULESET_VERSION).toBe(8);
+    expect(SCRUB_RULESET_VERSION).toBe(9);
     expect(v6(tool)).not.toBe(tool);
   });
 

@@ -77,7 +77,7 @@ scrubs when it seals a chunk. For a client that cannot, the server's
   key, with `raw-sha256`, `raw-bytes`, `scrub-ruleset` and `scrub-version`
   metadata;
 - the response is the chunk entry and the `raw.scrub` marker
-  (`relayhistory-scrub`, the current version: 2 from scrub rule set 2, 3 from rule set 3, 4 from rule set 4, 5 from rule set 5, 6 from rule set 6) for the client's manifest.
+  (`relayhistory-scrub`, the current version: 2 from scrub rule set 2, 3 from rule set 3, 4 from rule set 4, 5 from rule set 5, 6 from rule set 6, 7 from rule set 7, 8 from rule set 8, 9 from rule set 9; see `docs/scrub-public-idempotency-selectors.md` for 7 to 9) for the client's manifest.
   Rule set 4: a quoted secret value whose matching closing quote is not within
   the quoted rule's 4096-unit scan bound (`MAX_QUOTED_VALUE` in `lib/scrub.ts`,
   UTF-16 code units counted from the value's start across line breaks) is

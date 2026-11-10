@@ -1,7 +1,7 @@
 {
   "schema": 1,
-  "rulesetVersion": 8,
-  "rulesetSourceSha256": "50c2e0c67395f488a308cbcfc7c945606374b3d67d37138e284849c6190c8214",
+  "rulesetVersion": 9,
+  "rulesetSourceSha256": "9554ef5ecb3300b533503dd9555c7959303444d0b5b40a315c4fc12c1c47b25d",
   "rulesetPath": "packages/pipeline/src/lib/scrub.ts",
   "segmenterPath": "packages/pipeline/src/lib/pipeline/raw-chunks.ts#scrub-segmenter",
   "segmenterSha256": "26d0733aabe8a219a7b1833e71eaa5f0aa6dfbfe4999b4d7d9870d0b993f8a68",
