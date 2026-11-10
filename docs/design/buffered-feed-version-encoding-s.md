@@ -459,8 +459,19 @@ activation refusal (test 7) and the shared writer guard (RHC guard tests).
 
 In order. Each item must be recorded as met, with its evidence, before the next one is relied on.
 
-- [ ] 1. Operator counts-only read result: canonical count>0, countIf(version=0)=0, countIf(version<1e12)=0, buffered
+- [x] 1. Operator counts-only read result: canonical count>0, countIf(version=0)=0, countIf(version<1e12)=0, buffered
   count=0. Otherwise stop: separate reviewed remediation first (Q1).
+  - Pin record: counts-only ClickHouse read 2026-11-10 16:20Z by the qualified production actor
+    (brian-db-takeover-linuyc): canonical count 35658395, canonical min(version) 1793454538262,
+    countIf(version = 0) 0, countIf(version < 1e12) 0, buffered count 0 (max 0), origin columns PASS; read
+    window 2026-11-10T16:20:08.718Z to 16:20:12.614Z. Receipts: sanitized census receipt
+    clickhouse-ceiling-census-transfer.json sha256
+    d8418d37e2c90f0a69d88fd828986adf5569683e921543a138fe8bdb5ab66dad; raw actor receipt
+    root-clickhouse-feeder-ceiling-20261110T162012Z.json sha256
+    d1a171bd74da467f1459604525dca3e377b69b43db81fe03338f08071cc16444 (held by the actor, not copied).
+    Reported over Agent Relay by the actor (messages 245949774188331008 and 245950211726024704). The gate passes;
+    `BUFFERED_VERSION_CEILING` = 1793454538262 (exact minimum, no safety factor, B1) is pinned in this PR.
+    The pin arms nothing: both feed flags stay default off.
 - [ ] 2. RHC shared canonical-version guard PR merged, with the census/CI guard over every direct writer (R1;
   relayhistory-cloud-owner lane).
 - [ ] 3. Durable late-ack revisit/watermark strategy landed, with proof that an acknowledged stage cannot fall

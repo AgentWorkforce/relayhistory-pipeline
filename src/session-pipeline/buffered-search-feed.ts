@@ -198,15 +198,25 @@ const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/;
 
 /**
  * B1 ceiling of the buffered version band: every buffered version must be below it. It is the exact
- * positive canonical minimum `min(version)` of transcript_events (origin 'canonical'), no safety factor.
- * TODO(buffered-feed S, activation prerequisite 1): pin this from the operator's counts-only read
- * (canonical count, min(version), countIf(version = 0), countIf(version < 1e12); buffered count and
- * max(version); docs/design/buffered-feed-version-encoding-s.md sections 1 and 10), with the read's
- * date, in a later commit. Pin it only if that read proves canonical count > 0, no version-0 or
- * below-1e12 canonical row, and no buffered row. Until then it is unpinned and the S encoding refuses
- * (`buffered_version_ceiling_unpinned`), so the feed cannot be armed.
+ * positive canonical minimum `min(version)` of transcript_events (origin 'canonical'), no safety factor
+ * (docs/design/buffered-feed-version-encoding-s.md section 1, B1; activation prerequisite 1, section 10).
+ * Pin record: operator counts-only ClickHouse read, 2026-11-10 16:20Z, by the qualified production
+ * actor (brian-db-takeover-linuyc). Canonical count = 35658395, canonical min(version) = 1793454538262,
+ * canonical countIf(version = 0) = 0, canonical countIf(version < 1e12) = 0, buffered count = 0,
+ * origin columns PASS (buffered max(version) = 0; read window 2026-11-10T16:20:08.718Z to 16:20:12.614Z).
+ * Receipt: sanitized census receipt clickhouse-ceiling-census-transfer.json
+ * sha256 d8418d37e2c90f0a69d88fd828986adf5569683e921543a138fe8bdb5ab66dad; raw actor receipt
+ * root-clickhouse-feeder-ceiling-20261110T162012Z.json
+ * sha256 d1a171bd74da467f1459604525dca3e377b69b43db81fe03338f08071cc16444 (held by the actor, not copied).
+ * The read passes the activation gate (canonical count > 0, no version-0 or below-1e12 canonical row,
+ * no buffered row), so the ceiling is pinned to that minimum exactly.
+ * The pin alone arms nothing: INGEST_BUFFERED_SEARCH_FEED and INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION
+ * stay off by default, and the feed still refuses `version_encoding_not_armed` unless both are on (and
+ * `gate_not_declared` unless BUFFERED_SEARCH_FEED_GATE_DECLARED declares the read gate). The type stays
+ * `number | undefined` so every consumer keeps its unpinned refusal (`buffered_version_ceiling_unpinned`)
+ * should the pin ever be withdrawn; note an explicit `undefined` argument takes this pinned default.
  */
-export const BUFFERED_VERSION_CEILING: number | undefined = undefined;
+export const BUFFERED_VERSION_CEILING: number | undefined = 1793454538262;
 
 /** The exact createdAt the feed RPCs emit (to_char ... .US): six fractional digits, UTC. */
 const CREATED_AT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})\.\d{6}Z$/;

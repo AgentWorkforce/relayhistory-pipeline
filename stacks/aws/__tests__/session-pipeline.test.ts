@@ -412,10 +412,10 @@ describe("session pipeline: deploy plan contract", () => {
     const env=sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:armed});
     expect(env).toMatchObject({INGEST_BUFFERED_SEARCH_FEED:"on",BUFFERED_SEARCH_FEED_GATE_DECLARED:BUFFERED_SEARCH_GATE_CONTRACT});
     expect(bufferedFeedGateRefusal(env)).toBeNull();
-    // The stack does not set INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION, and BUFFERED_VERSION_CEILING is unpinned,
-    // so the feeder refuses this env fail closed (buffered-feed-version-encoding-s.md); with both, it accepts it.
+    // The stack does not set INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION, so the feeder refuses this env fail closed
+    // (buffered-feed-version-encoding-s.md); with it on, the pinned BUFFERED_VERSION_CEILING accepts it.
     expect(()=>bufferedFeedConfig(env)).toThrow(/version_encoding_not_armed/);
-    expect(()=>bufferedFeedConfig({...env,INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION:"on"})).toThrow(/buffered_version_ceiling_unpinned/);
+    expect(bufferedFeedConfig({...env,INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION:"on"}).enabled).toBe(true);
     expect(bufferedFeedConfig({...env,INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION:"on"},1_000_000_000_000).enabled).toBe(true);
     const refused=(v:unknown)=>{let why="";try{assertSessionPipelineInputs(v,(w:string)=>{throw new Error(w)})}catch(e){why=(e as Error).message}return why};
     expect(refused(armed)).toBe("");
@@ -466,9 +466,9 @@ describe("session pipeline: deploy plan contract", () => {
     for(const n of [180,3600])expect(refusedBy({bufferedSearchFeed:{enabled:false,settleSeconds:n}})).toBe("");
     for(const n of [100,179,3601,1.5,"300"])expect(refusedBy({bufferedSearchFeed:{enabled:false,settleSeconds:n}})).toMatch(/bufferedSearchFeed.settleSeconds must be an integer from 180 to 3600/);
     for(const v of ["yes","on",1,null])expect(refusedBy({bufferedSearchFeed:{enabled:false,secondVersion:v}})).toMatch(/bufferedSearchFeed.secondVersion must be a boolean/);
-    // The feeder accepts what the stack renders: armed with secondVersion, only the (pinned) ceiling remains.
+    // The feeder accepts what the stack renders: armed with secondVersion and the pinned ceiling.
     const env=envOf({...armed,bufferedSearchFeed:{...armed.bufferedSearchFeed,secondVersion:true,settleSeconds:600}});
-    expect(()=>bufferedFeedConfig(env)).toThrow(/buffered_version_ceiling_unpinned/);
+    expect(bufferedFeedConfig(env)).toMatchObject({enabled:true,secondVersion:true,settleMs:600_000});
     const c=bufferedFeedConfig(env,1_000_000_000_000);
     expect([c.enabled,c.secondVersion,c.settleMs]).toEqual([true,true,600_000]);
     for(const n of [180,3600])expect(bufferedFeedConfig(envOf({bufferedSearchFeed:{enabled:false,settleSeconds:n}})).settleMs).toBe(n*1000);
