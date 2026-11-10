@@ -834,6 +834,8 @@ describe("operatorSafePlans: async admission follows the resolved mode; a deploy
     }
     expect(refusal).toBeInstanceOf(OperatorRefusal);
     const diagnostic = (refusal as OperatorRefusal).diagnostic!;
+    expect(diagnostic.kind).toBe("plan_contract");
+    if (diagnostic.kind !== "plan_contract") throw new Error("wrong diagnostic kind");
     expect(diagnostic.reason).toBe("action_set");
     expect(diagnostic.compact.resources).toContainEqual({
       id: "session-ingest",
@@ -843,6 +845,41 @@ describe("operatorSafePlans: async admission follows the resolved mode; a deploy
       { sid: "INGEST_ADMISSION", action: "noop" },
       { sid: "INGEST_ASYNC_ADMISSION", action: "noop" },
     ]));
+    expect(JSON.stringify(diagnostic)).not.toContain("drain");
+  });
+
+  test("a binding-render refusal exposes identifiers/actions only", () => {
+    const inventory = [queue("noop"), flag("noop", "drain")],
+      rendered = plans(SEVEN, {}, inventory),
+      altered = {
+        planText: rendered.planText.replace(
+          "[session-ingest/INGEST_ADMISSION] noop",
+          "[session-ingest/FOREIGN] noop",
+        ),
+        detailedText: rendered.detailedText.replace(
+          "[session-ingest/INGEST_ADMISSION] noop",
+          "[session-ingest/FOREIGN] noop",
+        ),
+      };
+    let refusal: unknown;
+    try {
+      operatorSafePlans(altered, secrets, inventory);
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toBeInstanceOf(OperatorRefusal);
+    const diagnostic = (refusal as OperatorRefusal).diagnostic!;
+    expect(diagnostic.kind).toBe("binding_render");
+    if (diagnostic.kind !== "binding_render") throw new Error("wrong diagnostic kind");
+    expect(diagnostic.reason).toBe("binding_render_inventory");
+    expect(diagnostic.compact.renderedBindings).toContainEqual({
+      sid: "FOREIGN",
+      action: "noop",
+    });
+    expect(diagnostic.expectedBindings).toContainEqual({
+      sid: "INGEST_ADMISSION",
+      action: "noop",
+    });
     expect(JSON.stringify(diagnostic)).not.toContain("drain");
   });
 

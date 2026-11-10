@@ -73,7 +73,7 @@ const object = (s: unknown): s is Record<string, any> =>
 export class OperatorRefusal extends Error {
   constructor(
     readonly code: string,
-    readonly diagnostic?: OperatorPlanContractDiagnostic,
+    readonly diagnostic?: OperatorPlanDiagnostic,
   ) {
     super("private ingest operator refused: " + code);
   }
@@ -103,6 +103,7 @@ export interface OperatorPlans {
   detailedText: string;
 }
 export interface OperatorPlanContractDiagnostic {
+  kind: "plan_contract";
   reason: "summary_count" | "resource_inventory" | "forbidden_action" |
     "summary_mismatch" | "view_mismatch" | "credential_pattern" |
     "action_set" | "unknown";
@@ -120,6 +121,25 @@ export interface OperatorPlanContractDiagnostic {
   };
   bindings: Array<{ sid: string; action: string }>;
 }
+export interface OperatorBindingRenderDiagnostic {
+  kind: "binding_render";
+  reason: "binding_render_summary" | "binding_render_inventory";
+  compact: {
+    resourceClauses: Array<{ action: string; count: number }>;
+    bindingChanges: number | null;
+    renderedBindings: Array<{ sid: string; action: string }>;
+    unparsedBindingLines: number;
+  };
+  detailed: {
+    resourceClauses: Array<{ action: string; count: number }>;
+    bindingChanges: number | null;
+    renderedBindings: Array<{ sid: string; action: string }>;
+    unparsedBindingLines: number;
+  };
+  expectedBindings: Array<{ sid: string; action: string }>;
+}
+export type OperatorPlanDiagnostic = OperatorPlanContractDiagnostic |
+  OperatorBindingRenderDiagnostic;
 export interface OperatorCapture {
   schema: 1;
   kind: typeof OPERATOR_PROTOCOL;
@@ -255,10 +275,43 @@ function operatorPlanContractDiagnostic(
       : null,
   });
   return {
+    kind: "plan_contract",
     reason,
     compact: normalize(shape(compact)),
     detailed: normalize(shape(detailed)),
     bindings: bindings.map(({ sid, action }) => ({ sid, action })),
+  };
+}
+function operatorBindingRenderDiagnostic(
+  reason: "binding_render_summary" | "binding_render_inventory",
+  plans: OperatorPlans,
+  bindings: BindingInventory,
+): OperatorBindingRenderDiagnostic {
+  const shape = (text: string) => {
+    const summary = text.split(/\r?\n/u).find((line) => line.startsWith("Plan:")) ?? "";
+    const bindingLines = text.split(/\r?\n/u)
+      .filter((line) => /^\s*\[session-ingest\//u.test(line));
+    const renderedBindings = bindingLines.flatMap((line) => {
+      const match = /^\s*\[session-ingest\/([^\]]+)\]\s+(\S+)\s*$/u.exec(line);
+      return match ? [{ sid: match[1]!, action: match[2]! }] : [];
+    });
+    const bindingChanges = Number(
+      /(?:, )?(\d+) binding changes/u.exec(summary)?.[1] ?? NaN,
+    );
+    return {
+      resourceClauses: [...summary.matchAll(/(\d+) to ([a-z-]+)/gu)]
+        .map((match) => ({ action: match[2]!, count: Number(match[1]) })),
+      bindingChanges: Number.isFinite(bindingChanges) ? bindingChanges : null,
+      renderedBindings,
+      unparsedBindingLines: bindingLines.length - renderedBindings.length,
+    };
+  };
+  return {
+    kind: "binding_render",
+    reason,
+    compact: shape(plans.planText),
+    detailed: shape(plans.detailedText),
+    expectedBindings: bindings.map(({ sid, action }) => ({ sid, action })),
   };
 }
 export function operatorSafePlans(
@@ -294,9 +347,22 @@ export function operatorSafePlans(
       (admission !== "on" && admission !== "drain" && admission !== "off")
     )
       refuse("original_plan_contract");
-    let phase: string;
-    const compact = resourcePlanView(result.planText, bindings),
+    let phase: string, compact: string, detailed: string;
+    try {
+      compact = resourcePlanView(result.planText, bindings);
       detailed = resourcePlanView(result.detailedText, bindings);
+    } catch (error) {
+      if (
+        error instanceof OperatorRefusal &&
+        (error.code === "binding_render_summary" ||
+          error.code === "binding_render_inventory")
+      )
+        throw new OperatorRefusal(
+          error.code,
+          operatorBindingRenderDiagnostic(error.code, result, bindings),
+        );
+      throw error;
+    }
     try {
       phase = assertSessionIngestPlanContract(
         compact,
