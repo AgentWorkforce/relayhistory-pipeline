@@ -54,6 +54,11 @@ test("a canonical refusal logs its reason and projection reason codes (codes onl
     expect(JSON.stringify(logged[0])).not.toContain("manifest.json");
     expect(logged[1]).toMatchObject({ reason: "forbidden", retryable: false });
     expect(logged[1]).not.toHaveProperty("reason_codes");
+    let jsonlThrown: unknown;
+    try { canonicalInputRefusal(new CanonicalReadError("transcript_json_invalid", 501, ["bad/key"]), pointers, "canonical_jsonl_input_refused"); } catch (e) { jsonlThrown = e; }
+    expect(jsonlThrown).toMatchObject({ code: "canonical_jsonl_input_refused", retryable: false });
+    expect(JSON.parse(lines.at(-1)!)).toMatchObject({ error_code: "canonical_jsonl_input_refused", reason: "transcript_json_invalid", retryable: false });
+    expect(lines.at(-1)).not.toContain("bad/key");
     lines.length = 0;
     expect(canonicalInputRefusal(new CanonicalReadError("canonical_projection_incomplete", 503, ["manifest_unscrubbed"]), pointers))
       .toEqual({ kind: "quarantined", error: "session_quarantined", sourceRevisions: { "m-1": 1 } });

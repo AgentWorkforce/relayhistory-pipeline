@@ -608,7 +608,7 @@ async function projectBriefTitle(db: SqlExecutor, key: SessionDirectoryKey, titl
 }
 
 /** Sweep: arm indexed sessions that have neither a brief nor a wakeup (backfill after enabling). */
-export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: { includeChanged?: boolean; refreshCanonicalInput?: boolean; workspaceIds?: readonly string[] } = {}): Promise<number> {
+export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: { includeChanged?: boolean; refreshCanonicalInput?: boolean; recoverJsonlInputFailures?: boolean; workspaceIds?: readonly string[] } = {}): Promise<number> {
   const { rows } = await db.query<{ n: number }>(
     `WITH missing AS (
        SELECT d.org_id, d.workspace_id, d.harness, physical.session_id
@@ -636,7 +636,17 @@ export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: { 
                              AND ($4::text IS NULL OR b.origin <> 'native' OR b.status <> 'ready'
                                   OR b.engine_version LIKE 'neon-backfill:%'
                                   OR (b.engine_version IS NOT DISTINCT FROM $4::text
-                                      AND b.prompt_version IS NOT DISTINCT FROM $5::text)))
+                                      AND b.prompt_version IS NOT DISTINCT FROM $5::text))
+                             AND NOT ($6::boolean AND b.status = 'failed' AND b.error IS NOT DISTINCT FROM 'canonical_input_refused'
+                               AND EXISTS (SELECT 1 FROM sessions.session_index AS p
+                                 WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id
+                                   AND p.harness = d.harness AND p.session_id = physical.session_id
+                                   AND p.deleted_at IS NULL AND p.manifest_key IS NOT NULL)
+                               AND NOT EXISTS (SELECT 1 FROM sessions.session_index AS p
+                                 WHERE p.org_id = d.org_id AND p.workspace_id = d.workspace_id
+                                   AND p.harness = d.harness AND p.session_id = physical.session_id
+                                   AND p.deleted_at IS NULL
+                                   AND (p.raw_format IS DISTINCT FROM 'jsonl' OR p.manifest_key IS NULL))))
           AND NOT EXISTS (SELECT 1 FROM sessions.session_brief_wakeups AS w
                            WHERE w.org_id = d.org_id AND w.workspace_id = d.workspace_id
                              AND w.harness = d.harness AND w.session_id = physical.session_id)
@@ -649,7 +659,7 @@ export async function sweepUnbriefed(db: SqlExecutor, limit: number, options: { 
      SELECT count(*)::int AS n FROM armed`,
     [limit, options.includeChanged === true, options.workspaceIds ?? null,
       options.refreshCanonicalInput === true ? SESSION_BRIEF_CANONICAL_ENGINE_VERSION : null,
-      SESSION_BRIEF_PROMPT_VERSION],
+      SESSION_BRIEF_PROMPT_VERSION, options.recoverJsonlInputFailures === true],
   );
   return rows[0]?.n ?? 0;
 }
