@@ -14,8 +14,10 @@
  * The long-running reconciler (SERVICE=session-pipeline-consumer) never
  * holds owner credentials: it connects as the dedicated `search_consumer_runtime`
  * role created here (password set separately by the operator; shape enforced
- * by the verify step). The reader stays bulls96_read_api; this job issues no
- * reader grants and no borrowed membership.
+ * by the verify step). The reader stays bulls96_read_api; after both search
+ * tables pass their forced tenant-policy checks, this job grants that role only
+ * schema USAGE, table SELECT for transcript events, and the projection-state
+ * columns its completeness check reads. It grants no writes or membership.
  */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
