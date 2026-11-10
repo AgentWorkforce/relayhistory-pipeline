@@ -29,7 +29,7 @@
  * engine's private fields; nothing exports it.
  */
 import { ScrubberError, taggedScrubberRefusal } from "./scrubber-error.js";
-import { readerMaxRuleset, checkedReaderMaxRuleset } from "./reader-policy.js";
+import { checkedReaderMaxRuleset, DEFAULT_READER_MAX_RULESET } from "./reader-policy.js";
 import { sha256Hex } from "../../../../object-store/src/crypto.js";
 import { SCRUB_RULESET_VERSION } from "../pipeline/raw-chunks.js";
 import { preflightScrubRecords, preflightScrubText, refuseMalformedScrubInput } from "./bindgen-admission.js";
@@ -117,7 +117,7 @@ export function bindgenProfile(m: Pick<BindgenManifest, "scrubProfile">): string
 }
 
 /** Validate the pin. Every placeholder or malformed value has its own named reason. */
-export function parseScrubBindgenPin(raw: unknown, maximum = readerMaxRuleset()): ScrubBindgenPin {
+export function parseScrubBindgenPin(raw: unknown, maximum = DEFAULT_READER_MAX_RULESET): ScrubBindgenPin {
   const p = raw as Record<string, unknown> | null;
   if (!p || typeof p !== "object" || Array.isArray(p) || p.schema !== PIN_SCHEMA || p.package !== BINDGEN_PACKAGE)
     refuse("bindgen_pin_invalid");

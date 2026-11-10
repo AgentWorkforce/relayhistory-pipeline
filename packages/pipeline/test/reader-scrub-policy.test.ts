@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { assertReaderScrubMarker, parseReaderMaxRuleset, readerChunkBody } from "../src/lib/scrub-engine/reader-policy.js";
+import { assertReaderScrubMarker, parseReaderMaxRuleset, readerChunkBody, readerMaxRuleset } from "../src/lib/scrub-engine/reader-policy.js";
 import { bindgenProfile, parseScrubBindgenPin } from "../src/lib/scrub-engine/bindgen-engine.js";
 import { SCRUB_RULESET_VERSION } from "../src/lib/pipeline/raw-chunks.js";
 
 describe("reader ruleset capability independent of writer stamps", () => {
-  it("defaults to 8, explicitly admits 10, leaves the TS writer at 8", () => {
-    expect(parseReaderMaxRuleset(undefined)).toBe(8);
+  it("leaves legacy reads unchanged when unset, explicitly admits 10, leaves the TS writer at 8", () => {
+    expect(parseReaderMaxRuleset(undefined)).toBeUndefined();
     expect(parseReaderMaxRuleset("10")).toBe(10);
     expect(SCRUB_RULESET_VERSION).toBe(8);
     for (const version of [1, 7, 8, 9, 10])
@@ -52,4 +52,26 @@ it("future manifest versions require chunk metadata; legacy metadata-free reads 
   const legacy = object();
   expect(await readerChunkBody(legacy as never, { ruleset: "relayhistory-scrub", version: 1 }, 8)).toBe(legacy.body);
   await legacy.body.cancel();
+});
+
+
+it("unset policy preserves legacy markers and never consults chunk metadata or ambient process env", async () => {
+  const saved = process.env.READER_MAX_RULESET;
+  process.env.READER_MAX_RULESET = "8";
+  try {
+    expect(readerMaxRuleset({})).toBeUndefined();
+    for (const marker of [{ruleset:"relayhistory-scrub",version:9},{ruleset:"foreign-family",version:8}]) {
+      expect(() => assertReaderScrubMarker(marker)).not.toThrow();
+      let touched = false;
+      const body = new ReadableStream<Uint8Array>();
+      const object = {body, get meta() { touched=true; throw new Error("legacy GET has no metadata contract"); }};
+      expect(await readerChunkBody(object as never, marker)).toBe(body);
+      expect(touched).toBe(false);
+      await body.cancel();
+      expect(() => assertReaderScrubMarker(marker,8)).toThrow(expect.objectContaining({code:"scrub_ruleset_unsupported"}));
+    }
+  } finally {
+    if (saved===undefined) delete process.env.READER_MAX_RULESET;
+    else process.env.READER_MAX_RULESET=saved;
+  }
 });

@@ -433,10 +433,25 @@ is the fail-closed outcome.
 
 ### Explicit reader ruleset capability
 
-`READER_MAX_RULESET` selects a read capability independently of the TypeScript writer stamp. Unset preserves the ceiling of 8; exactly `"8"`, `"9"` or `"10"` is accepted. Empty, padded, signed, fractional and higher values refuse configuration. Raising the ceiling does not enable a Rust engine, qualify any package or change TypeScript scrub markers.
+`READER_MAX_RULESET` selects a read capability independently of the TypeScript writer stamp. Unset preserves main's existing reads: existing marker-presence/quarantine checks remain, with no new family, ceiling, or per-chunk metadata checks. Explicitly setting exactly `"8"`, `"9"` or `"10"` enables the stricter policy. Empty, padded, signed, fractional and higher values refuse configuration. Raising the ceiling does not enable a Rust engine, qualify any package or change TypeScript scrub markers.
 
-Canonical record/transcript readers, export readers, the indexing consumer, brief input and manifest/chunk admission use this policy. Unknown families and versions outside 1 through the configured maximum refuse before record parsing. A manifest records the **lowest** chunk ruleset, so per-chunk metadata is also checked. Readers bind that metadata to the same GET response as the body and cancel refused bodies before consuming them. Historical metadata-free chunks at versions through 8 keep their existing read contract; newer manifest versions require per-chunk scrub metadata. A declared chunk version cannot fall below the manifest minimum.
+Canonical record/transcript readers, export readers, the indexing consumer, brief input and manifest/chunk admission use this policy only when explicitly configured. Unknown families and versions outside 1 through the configured maximum refuse before record parsing. A manifest records the **lowest** chunk ruleset, so per-chunk metadata is also checked. Readers bind that metadata to the same GET response as the body and cancel refused bodies before consuming them. Historical metadata-free chunks at versions through 8 keep their existing read contract; newer manifest versions require per-chunk scrub metadata. A declared chunk version cannot fall below the manifest minimum.
 
-Node services validate the setting at startup and thread it into canonical reads; the canonical Worker validates its own binding rather than consulting a Node process environment. The wasm-bindgen pin parser refuses a writer above this ceiling before reading artifacts or initializing glue. Compiled-module callers must pass their verified reader ceiling explicitly when it exceeds the default. The raw ABI path remains unpinned and outside this first cutover.
+Node services validate the setting at startup and thread it into canonical reads. Alleyoop also forwards it through its real app bindings. Canonical and timing Worker routes validate their own bindings rather than consulting a Node process environment. Offline seed readers receive an explicit optional policy in their dependencies. An unset policy does not add a marker check to any of these paths. The wasm-bindgen pin parser retains a separate default writer ceiling of 8 and refuses a writer above its explicitly configured ceiling before reading artifacts or initializing glue. Compiled-module callers must pass their verified reader ceiling explicitly when it exceeds the default. The raw ABI path remains unpinned and outside this first cutover.
 
 Operationally, deploy and verify every relevant reader with ceiling 10 **while the Rust engine remains off**, then qualify and enable the matching writer. Configuration in one process does not prove that a remote fleet has been upgraded. Keep the reader ceiling at 10 on rollback while version-10 objects remain stored; reverting a writer does not downgrade existing objects. Existing artifact-page formats do not change. This source change does not satisfy the remaining package safety, provenance, error-tagging, Worker build-binding or persistence-routing gates.
+
+
+### Configuration failure runbook
+
+Leave `READER_MAX_RULESET` absent to preserve legacy reads. An explicit value
+opts into strict marker and chunk checks, including canonical decimal metadata;
+older metadata such as `"08"` or `"8.0"` is accepted by the legacy courier path
+but refused by the explicit policy. Explicit policy also checks zero-chunk
+manifest markers. Verify existing retained objects before opting in.
+
+Empty, malformed, padded, unsupported or number-typed Worker bindings are
+configuration errors. In ingest, engine initialization fails closed and
+`scrubEngineReady` stays false: sealing does not continue through TS or another
+engine. Correct or remove the malformed binding and restart through the normal
+operator process. Raising a reader ceiling never qualifies a package or a writer.

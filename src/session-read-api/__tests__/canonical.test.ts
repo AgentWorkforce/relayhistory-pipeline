@@ -927,3 +927,14 @@ test("reader ceiling refuses future/foreign markers before any chunk reads; expl
   const refused = await canonicalHandle(request(), { CANONICAL_READ_ENABLED: "true", READER_MAX_RULESET: "8" }, fetch, deps);
   expect(refused.status).toBe(503);
 });
+
+
+test("unset canonical record policy retains main's version-9 and foreign-family reads",async()=>{
+ const path=objectKey(manifestKey(location));const m=JSON.parse(await new Response(await deps.store.get(path)).text());
+ const baseline=await canonicalSnapshot(deps,identity);
+ for(const marker of [{ruleset:"relayhistory-scrub",version:9},{ruleset:"foreign-family",version:8}]){
+  m.raw.scrub=marker;await deps.store.put(path,new TextEncoder().encode(JSON.stringify(m)));
+  expect((await canonicalSnapshot(deps,identity)).rows).toEqual(baseline.rows);
+  await expect(canonicalSnapshot({...deps,readerMaxRuleset:8},identity)).rejects.toMatchObject({reason:"canonical_projection_incomplete"});
+ }
+});

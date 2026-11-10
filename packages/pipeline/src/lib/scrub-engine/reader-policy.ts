@@ -14,20 +14,21 @@ export function checkedReaderMaxRuleset(value: number): number {
   return value;
 }
 
-/** Exact decimal strings only; empty, signed, padded and future versions refuse. */
-export function parseReaderMaxRuleset(value: unknown): number {
-  if (value === undefined) return DEFAULT_READER_MAX_RULESET;
+/** Unset preserves legacy reads; an explicit exact decimal opts into the policy. */
+export function parseReaderMaxRuleset(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
   if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value)) invalidConfig();
   return checkedReaderMaxRuleset(Number(value));
 }
 
 /** Workers pass their bindings explicitly. Node services default to their process environment. */
-export function readerMaxRuleset(env?: { READER_MAX_RULESET?: unknown }): number {
+export function readerMaxRuleset(env?: { READER_MAX_RULESET?: unknown }): number | undefined {
   const source = env ?? (globalThis as { process?: { env?: { READER_MAX_RULESET?: string } } }).process?.env;
   return parseReaderMaxRuleset(source?.READER_MAX_RULESET);
 }
 
-export function assertReaderScrubMarker(marker: unknown, maximum = readerMaxRuleset()): void {
+export function assertReaderScrubMarker(marker: unknown, maximum?: number): void {
+  if (maximum === undefined) return; // Caller retains its existing presence/quarantine checks.
   checkedReaderMaxRuleset(maximum);
   const m = marker as { ruleset?: unknown; version?: unknown } | null;
   if (!m || typeof m !== "object" || Array.isArray(m) || m.ruleset !== "relayhistory-scrub" || typeof m.version !== "number" ||
@@ -36,7 +37,8 @@ export function assertReaderScrubMarker(marker: unknown, maximum = readerMaxRule
 }
 
 /** The manifest carries a minimum, so every declared per-chunk version must also fit. */
-export function assertReaderChunkMetadata(metadata: Record<string, string>, marker: unknown, maximum = readerMaxRuleset()): void {
+export function assertReaderChunkMetadata(metadata: Record<string, string>, marker: unknown, maximum?: number): void {
+  if (maximum === undefined) return;
   assertReaderScrubMarker(marker, maximum);
   const minimum = (marker as { version: number }).version;
   const version = metadata["scrub-version"];
@@ -52,7 +54,8 @@ export function assertReaderChunkMetadata(metadata: Record<string, string>, mark
 }
 
 /** Bind metadata to the same GET as the body; cancel a refused body before consuming it. */
-export async function readerChunkBody(object: GetObject, marker: unknown, maximum = readerMaxRuleset()): Promise<ReadableStream<Uint8Array>> {
+export async function readerChunkBody(object: GetObject, marker: unknown, maximum?: number): Promise<ReadableStream<Uint8Array>> {
+  if (maximum === undefined) return object.body;
   try {
     assertReaderChunkMetadata(object.meta.metadata, marker, maximum);
     return object.body;

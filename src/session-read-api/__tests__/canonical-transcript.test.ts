@@ -116,3 +116,13 @@ test("JSONL brief input enforces the reader ceiling before chunk hydration", asy
  const result=await canonicalTranscriptSnapshot({...f.deps,readerMaxRuleset:10},ID);
  expect(result?.records).toHaveLength(2);
 });
+
+
+test("unset JSONL policy retains main's version-9 and foreign-family transcript reads",async()=>{
+ const f=await fixture();const baseline=await canonicalTranscriptSnapshot(f.deps,ID);
+ for(const marker of [{ruleset:"relayhistory-scrub",version:9},{ruleset:"foreign-family",version:8}]){
+  f.manifest.raw.scrub=marker;await f.save();
+  expect((await canonicalTranscriptSnapshot(f.deps,ID))?.records).toEqual(baseline?.records);
+  await expect(canonicalTranscriptSnapshot({...f.deps,readerMaxRuleset:8},ID)).rejects.toMatchObject({code:"scrub_ruleset_unsupported"});
+ }
+});

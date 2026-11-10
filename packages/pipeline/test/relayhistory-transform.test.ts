@@ -930,3 +930,14 @@ it("export reads require explicit reader capability and future per-chunk metadat
   }
   expect(await readRelayhistoryExport(f.manifest, f.store, undefined, { readerMaxRuleset: 10 })).toEqual(baseline);
 });
+
+
+it("unset export policy retains main's version-9 and foreign-family reads", async () => {
+  const f=await fixture();
+  const baseline=await readRelayhistoryExport(f.manifest,f.store);
+  for (const marker of [{ruleset:"relayhistory-scrub",version:9},{ruleset:"foreign-family",version:8}]) {
+    f.manifest.raw.scrub=marker;
+    expect(await readRelayhistoryExport(f.manifest,f.store)).toEqual(baseline);
+    await expect(readRelayhistoryExport(f.manifest,f.store,undefined,{readerMaxRuleset:8})).rejects.toMatchObject({code:"scrub_ruleset_unsupported"});
+  }
+});
