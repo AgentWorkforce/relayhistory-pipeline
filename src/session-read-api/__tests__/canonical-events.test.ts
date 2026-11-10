@@ -121,3 +121,26 @@ test("canonical replay preserves the existing explicitly selected message-id enr
   expect((await enriched.json() as any).events.map((r: any) => [r.eventId, r.messageId])).toEqual([["original-1", "message-1"], ["original-2", "message-2"]]);
   expect(enrichments).toBe(1); expect(f.counts().queries).toBe(0);
 });
+
+test("a configured deadlineMs (READ_API_CANONICAL_DEADLINE_MS on the service) aborts the canonical read as 501 events_canonical_deadline", async () => {
+  const f = fixture();
+  let aborted = false;
+  // The source never settles (as turns.pglite's deadline case): only the configured deadline can end the read.
+  f.deps.canonicalEvents = { deadlineMs: 5, source: (_id, signal) => { signal.addEventListener("abort", () => { aborted = true; }); return new Promise(() => {}); } };
+  const started = Date.now();
+  const res = await f.get();
+  expect(res.status).toBe(501);
+  expect(JSON.stringify(await res.json())).toContain("events_canonical_deadline");
+  expect(aborted).toBe(true);
+  expect(Date.now() - started).toBeLessThan(2500); // the configured 5 ms, not the 3000 default
+});
+
+test("a source that rejects synchronously on abort still yields the deadline reason (501, not 503)", async () => {
+  const f = fixture();
+  let aborted = false;
+  f.deps.canonicalEvents = { deadlineMs: 5, source: (_id, signal) => new Promise((_, reject) => signal.addEventListener("abort", () => { aborted = true; reject(new Error("aborted")); })) };
+  const res = await f.get();
+  expect(res.status).toBe(501);
+  expect(JSON.stringify(await res.json())).toContain("events_canonical_deadline");
+  expect(aborted).toBe(true);
+});
