@@ -33,9 +33,12 @@ import {
   pgClass,
   searchRpcRequest,
 } from "../search-query.ts";
+import { runMigrations } from "../migrate.ts";
+import { replayDatabase } from "../../session-pipeline/__tests__/replay-fixture.ts";
 import type { HoopDb } from "../../shared/db.ts";
 import { hoopDbSessionIndex } from "../index.ts";
 import { projectSessionDirectory } from "../session-directory-projector.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
 import {
   SESSION_DIRECTORY_SEARCH_BOUNDARY,
   SESSION_DIRECTORY_SEARCH_RPC,
@@ -74,13 +77,19 @@ const BRIEFS_UP = read(`supabase/migrations/${BRIEFS}`);
 const BRIEFS_DOWN = read(
   `supabase/rollbacks/${BRIEFS.replace(/\.sql$/, ".down.sql")}`,
 );
-const EVENTS = "20261103010000_session_directory_event_metadata.sql";
+const BRIEF_STATE = "20261102020000_session_brief_state.sql";
+const BRIEF_STATE_UP = read(`supabase/migrations/${BRIEF_STATE}`);
+const BRIEF_STATE_DOWN = read(
+  `supabase/rollbacks/${BRIEF_STATE.replace(/\.sql$/, ".down.sql")}`,
+);
+const EVENTS = "20261104021000_session_directory_event_metadata.sql";
 const EVENTS_UP = read(`supabase/migrations/${EVENTS}`);
 const EVENTS_DOWN = read(`supabase/rollbacks/${EVENTS.replace(/\.sql$/, ".down.sql")}`);
-const REPORTS = "20261104030000_coordination_report_jobs.sql";
-const REPORTS_UP = read(`supabase/migrations/${REPORTS}`);
-const REPORTS_DOWN = read(`supabase/rollbacks/${REPORTS.replace(/\.sql$/, ".down.sql")}`);
 const WORKER = SESSION_DIRECTORY_SEARCH_RPC.workerRole;
+// Newer additive consumers of the event/list columns unwind in strict reverse
+// dependency order. Their explicit down files are part of the schema contract.
+const LATER_PHASES=readdirSync(join(root,"supabase/rollbacks")).filter(f=>f.endsWith(".down.sql")&&f>EVENTS.replace(/\.sql$/,".down.sql")).sort();
+
 const TOKEN_ISSUER = "https://issuer.test/session-directory";
 const RPC_SIGNATURE = "sessions.search_session_directory(text, text, text, text, text, boolean, text, text, text, text, text, timestamptz, timestamptz, text, timestamptz, text, text, text, integer)";
 
@@ -97,9 +106,7 @@ async function database(prelude = ""): Promise<PGlite> {
   const db = new PGlite({ extensions: { auto_explain, btree_gin, pg_trgm } });
   open.push(db);
   await db.exec(read("supabase/tests/supabase_shim.sql"));
-  await db.exec(read("supabase/bootstrap/session_directory_search_worker.sql"));
-  await db.exec(read("supabase/bootstrap/session_token_verifier.sql"));
-  await db.exec(read("supabase/bootstrap/session_ingest_roles.sql"));
+  for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
   if (prelude) await db.exec(prelude);
   for (const file of readdirSync(join(root, "supabase/migrations")).sort()) {
     await db.exec(read(`supabase/migrations/${file}`));
@@ -2298,12 +2305,20 @@ describe("short_summary end to end through the pipeline", () => {
 
 describe("short_summary rollback", () => {
   test("down removes every summary column, copy and the RPC, keeps the bootstrapped role at its spec, and up applies again", async () => {
-    const db = await database();
+    // Guarded downs require the real migrator ledger and validation marker.
+    const fixture = await replayDatabase();
+    const db = fixture.pg;
+    open.push(db);
+    const ledger = async () => (await db.query<{ name: string; sha256: string }>(
+      'SELECT name,sha256 FROM sessions.__96bulls_migrations ORDER BY name COLLATE "C"',
+    )).rows;
+    const beforeLedger = await ledger();
     await insertRow(db);
     await summarize(db, KEY, "pelican rollback check");
     // Reverse dependency order: event metadata also depends on G6 and the list/catalog phases.
-    await db.exec(REPORTS_DOWN);
+    for(const file of [...LATER_PHASES].reverse())await db.exec(read(`supabase/rollbacks/${file}`));
     await db.exec(EVENTS_DOWN);
+    await db.exec(BRIEF_STATE_DOWN);
     await db.exec(BRIEFS_DOWN);
     await db.exec(LIST_DOWN);
     await db.exec(EXPAND_DOWN);
@@ -2347,8 +2362,17 @@ describe("short_summary rollback", () => {
     await db.exec(EXPAND_UP);
     await db.exec(LIST_UP);
     await db.exec(BRIEFS_UP);
+    await db.exec(BRIEF_STATE_UP);
     await db.exec(EVENTS_UP);
-    await db.exec(REPORTS_UP);
+    // Older downs retain their ledger rows; replay only that legacy prefix.
+    // Recreating an unrecorded suffix first would correctly trip the migrator's
+    // dirty-schema guard. The migrator owns both SQL and ledger for that suffix.
+    const stillRecorded = new Set((await ledger()).map(({ name }) => name));
+    const legacyPhases = LATER_PHASES.filter(file => stillRecorded.has(`upstream:${file.replace(/\.down\.sql$/, ".sql")}`));
+    expect(legacyPhases).toEqual(LATER_PHASES.slice(0, legacyPhases.length));
+    for(const file of legacyPhases)await db.exec(read(`supabase/migrations/${file.replace(/\.down\.sql$/,".sql")}`));
+    await runMigrations(fixture.db, { profile: { mode: "local", shim: true, bootstrap: true, verify: true, runtimeRole: "postgres" } });
+    expect(await ledger()).toEqual(beforeLedger);
     await db.query(
       "INSERT INTO sessions.session_directory_search_token_policy (issuer, audience) VALUES ($1, $2)",
       [TOKEN_ISSUER, SESSION_DIRECTORY_SEARCH_RPC.audience],
@@ -2395,12 +2419,13 @@ describe("Worker role validation in two phases", () => {
     const error = await outcome(db, PHASE2);
     expect(error?.code).toBe("55000");
     expect(error?.message).toContain(PHASE2_PREFIX);
-    for (const sig of [
-      RPC_SIGNATURE,
-      "sessions.session_directory_pointers(text, text, text)",
-      "sessions.session_directory_readiness()",
-      "sessions.session_brief(text, text, text)",
-    ])
+    const manifest = JSON.parse(
+      read("src/hoopdb/sessions-function-acl.json"),
+    ) as { functions: Record<string, string[]> };
+    const workerSignatures = Object.entries(manifest.functions)
+      .filter(([, acl]) => acl.includes(`${WORKER}:EXECUTE`))
+      .map(([signature]) => signature);
+    for (const sig of workerSignatures)
       expect(error?.message).toContain(`approved RPC missing: ${sig}`);
     expect(error?.message).toContain("missing USAGE on schema sessions");
   });
@@ -2415,20 +2440,11 @@ describe("Worker role validation in two phases", () => {
         JOIN pg_roles r ON r.oid = a.grantee WHERE r.rolname = $1 ORDER BY 1`,
       [WORKER],
     );
-    const approved = await db.query<{ fn: string }>(
-      `SELECT unnest(ARRAY[
-         to_regprocedure($1)::text,
-         'sessions.session_directory_pointers(text,text,text)',
-         'sessions.session_directory_readiness()',
-         'sessions.list_session_directory(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)',
-         'sessions.session_directory_activity(text,timestamp with time zone,timestamp with time zone)',
-         'sessions.list_session_directory_events(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer,text)',
-         'sessions.session_directory_event_activity(text,timestamp with time zone,timestamp with time zone)',
-         'sessions.session_brief(text,text,text)']) AS fn ORDER BY 1`,
-      [RPC_SIGNATURE],
-    );
+    const manifest=JSON.parse(read("src/hoopdb/sessions-function-acl.json")) as {functions:Record<string,string[]>};
+    const signatures=Object.entries(manifest.functions).filter(([,acl])=>acl.includes(WORKER+":EXECUTE")).map(([signature])=>signature);
+    const approved=await db.query<{fn:string}>("SELECT to_regprocedure(sig)::text fn FROM unnest($1::text[]) sig ORDER BY 1",[signatures]);
     expect(fns.rows).toEqual(approved.rows);
-    expect(fns.rows).toHaveLength(8);
+    expect(fns.rows).toHaveLength(signatures.length);
   });
 
   test("phase 2 ignores PUBLIC-derived EXECUTE: only aclitems naming the role count", async () => {
@@ -2515,6 +2531,13 @@ describe("Worker role validation in two phases", () => {
         RETURNS integer LANGUAGE sql AS 'SELECT 1';
       GRANT EXECUTE ON FUNCTION sessions.session_directory_pointers(text, text) TO ${WORKER}`,
       "approved RPC redefined: sessions.session_directory_pointers(text,text)",
+    ],
+    [
+      "a redefined brief-document authority RPC",
+      `CREATE FUNCTION sessions.session_brief_document_authority(p_workspace_id text)
+        RETURNS integer LANGUAGE sql AS 'SELECT 1';
+      GRANT EXECUTE ON FUNCTION sessions.session_brief_document_authority(text) TO ${WORKER}`,
+      "approved RPC redefined: sessions.session_brief_document_authority(text)",
     ],
     [
       "a revoked approved grant",

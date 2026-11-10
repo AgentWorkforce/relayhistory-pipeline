@@ -25,9 +25,30 @@ export const MAX_DIRECTORY_RELATIONSHIPS = 500;
 export type DirectoryRelationship = {
   relationshipUid: string;
   childSessionId: string | null;
+  childModel?: string | null;
+  childAgentName?: string | null;
+  childAgentType?: string | null;
 };
 
+/** Why a derived catalog is not complete (metadata only; never a value from the source). */
+export type DirectoryCatalogIncompleteReason =
+  | "models_not_array"
+  | "models_non_string"
+  | "model_rejected"
+  | "models_over_limit"
+  | "relationship_uid_invalid"
+  | "relationship_metadata_invalid"
+  | "relationship_metadata_missing"
+  | "relationships_over_limit";
+
 export type DirectoryCatalog = {
+  metadataVersion?: 1;
+  modelsComplete?: boolean;
+  relationshipsComplete?: boolean;
+  /** Sorted, deduplicated reasons behind a false modelsComplete/relationshipsComplete. */
+  incompleteReasons?: DirectoryCatalogIncompleteReason[];
+  /** Recorded, already-scrubbed catalog metadata; never inferred from transcript text. */
+  recordedTitle?: string | null;
   agentNames: string[];
   models: string[];
   projectKey: string | null;
@@ -53,7 +74,11 @@ const codePoints = (value: string) => Array.from(value).length;
 function bounded(value: unknown, max: number): string | null {
   if (typeof value !== "string") return null;
   const text = value.trim();
-  if (text === "" || codePoints(text) > max || /[\u0000-\u001f\u007f]/.test(text))
+  if (
+    text === "" ||
+    codePoints(text) > max ||
+    /[\u0000-\u001f\u007f]/.test(text)
+  )
     return null;
   return text;
 }
@@ -86,6 +111,31 @@ function catalogProjectId(row: Record<string, unknown>): string | null {
   return null;
 }
 
+/** A denied or malformed metadata read is an error, never an old-schema fallback. */
+async function recordedTitleColumn(db: SqlExecutor): Promise<boolean> {
+  const { rows } = await db.query<{ supported: boolean }>(
+    "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass('sessions.session_directory') AND attname='recorded_catalog_title' AND NOT attisdropped) AS supported",
+  );
+  if (typeof rows[0]?.supported !== "boolean") throw new Error("directory_catalog_schema_unavailable");
+  return rows[0].supported;
+}
+
+/** Same native-brief then latest-live-pointer precedence as the directory projector.
+ * Parameters are fixed by the two statements below, never supplied by a request.
+ * The enclosing live CTE binds the physical source to this logical directory row.
+ */
+function recordedTitlePrioritySql(recorded: "$25" | "$18", physical: "$26" | "$20"): string {
+  return `coalesce((SELECT b.title FROM sessions.session_briefs b
+    WHERE b.org_id=d.org_id AND b.workspace_id=d.workspace_id AND b.harness=d.harness
+      AND b.session_id=${physical}::text AND b.title IS NOT NULL
+      AND b.engine_version NOT LIKE 'neon-backfill:%'),
+    (SELECT p.title FROM sessions.session_index p
+      WHERE p.org_id=d.org_id AND p.workspace_id=d.workspace_id AND p.harness=d.harness
+        AND p.session_id=${physical}::text AND p.deleted_at IS NULL
+      ORDER BY p.last_activity_at DESC,p.revision DESC,p.machine_id DESC LIMIT 1),
+    ${recorded}::text)`;
+}
+
 /** lower(btrim(x)) as PostgreSQL computes it for the agent companion table. */
 export function normalizeDirectoryAgent(name: string): string {
   return name.trim().toLowerCase();
@@ -107,6 +157,10 @@ export function directoryCatalogFromProjection(
   rows: readonly CatalogProjectionRow[],
 ): DirectoryCatalog {
   const catalog: DirectoryCatalog = {
+    metadataVersion: 1,
+    modelsComplete: true,
+    relationshipsComplete: true,
+    recordedTitle: null,
     agentNames: [],
     models: [],
     projectKey: null,
@@ -121,10 +175,40 @@ export function directoryCatalogFromProjection(
   };
   const agents = new Map<string, string>();
   const modelSet = new Set<string>();
-  const edges = new Map<string, string | null>();
+  const edges = new Map<string, DirectoryRelationship>();
+  const reasons = new Set<DirectoryCatalogIncompleteReason>();
+  const modelsIncomplete = (reason: DirectoryCatalogIncompleteReason) => {
+    catalog.modelsComplete = false;
+    reasons.add(reason);
+  };
+  const relationshipsIncomplete = (reason: DirectoryCatalogIncompleteReason) => {
+    catalog.relationshipsComplete = false;
+    reasons.add(reason);
+  };
   for (const { table, row } of rows) {
     if (table === "session_catalog") {
+      // Match the read DTO bound (UTF-16 length), not only PostgreSQL code points.
+      const title = bounded(row.title, 90);
+      if (title !== null && title.length <= 90 &&
+          !/[\u0000-\u001f\u007f]/.test(row.title as string))
+        catalog.recordedTitle = title;
+
       for (const model of models(row.models)) modelSet.add(model);
+      // A missing or unparseable models value (null), or any other non-array, is not a
+      // known-empty model list (#182 contextual review, finding 4).
+      if (!Array.isArray(row.models)) modelsIncomplete("models_not_array");
+      else if (row.models.some((value) => typeof value !== "string"))
+        modelsIncomplete("models_non_string");
+      if (
+        Array.isArray(row.models) &&
+        row.models.some(
+          (value) =>
+            typeof value === "string" &&
+            value !== "" &&
+            bounded(value, 200) !== value,
+        )
+      )
+        modelsIncomplete("model_rejected");
       catalog.projectKeyMethod =
         bounded(row.project_key_method, 64) ?? catalog.projectKeyMethod;
       catalog.projectKey = bounded(row.project_key, 512) ?? catalog.projectKey;
@@ -141,26 +225,56 @@ export function directoryCatalogFromProjection(
       if (name) agents.set(normalizeDirectoryAgent(name), name);
     } else if (table === "session_relationships") {
       const uid = bounded(row.relationship_uid, 255);
-      if (uid) edges.set(uid, bounded(row.child_session_id, 255));
+      if (!uid) {
+        relationshipsIncomplete("relationship_uid_invalid");
+        continue;
+      }
+      const edge: DirectoryRelationship = {
+        relationshipUid: uid,
+        childSessionId: bounded(row.child_session_id, 255),
+      };
+      for (const [raw, key] of [
+        ["child_model", "childModel"],
+        ["child_agent_name", "childAgentName"],
+        ["child_agent_type", "childAgentType"],
+      ] as const) {
+        if (Object.hasOwn(row, raw)) {
+          const value = row[raw];
+          if (value === null) edge[key] = null;
+          else if (
+            typeof value === "string" &&
+            Array.from(value).length <= 200 &&
+            !/[\u0000-\u001f\u007f]/u.test(value)
+          )
+            edge[key] = value;
+          else {
+            edge[key] = null;
+            relationshipsIncomplete("relationship_metadata_invalid");
+          }
+        } else relationshipsIncomplete("relationship_metadata_missing");
+      }
+      edges.set(uid, edge);
     }
   }
   if (
     catalog.projectKey !== null &&
-    (catalog.projectKeyMethod === "path" || looksLikeLocalPath(catalog.projectKey))
+    (catalog.projectKeyMethod === "path" ||
+      looksLikeLocalPath(catalog.projectKey))
   )
     catalog.projectKey = null;
   catalog.agentNames = [...agents.entries()]
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     .map(([, name]) => name)
     .slice(0, MAX_DIRECTORY_AGENTS);
+  if (modelSet.size > MAX_DIRECTORY_MODELS) modelsIncomplete("models_over_limit");
+  if (edges.size > MAX_DIRECTORY_RELATIONSHIPS)
+    relationshipsIncomplete("relationships_over_limit");
+  if (reasons.size) catalog.incompleteReasons = [...reasons].sort();
   catalog.models = [...modelSet].sort().slice(0, MAX_DIRECTORY_MODELS);
   catalog.relationships = [...edges.entries()]
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     .slice(0, MAX_DIRECTORY_RELATIONSHIPS)
-    .map(([relationshipUid, childSessionId]) => ({
-      relationshipUid,
-      childSessionId,
-    }));
+    .map(([, edge]) => edge);
   return catalog;
 }
 
@@ -180,17 +294,215 @@ export function directoryCatalogFromProjection(
  * them in step afterwards. An edge naming a child whose directory row is a tombstone is
  * not written, so a re-delivered parent cannot reintroduce an erased child's id. (A child
  * whose row was hard-deleted is indistinguishable from one not uploaded yet.)
+ *
+ * Writer epoch (adversarial review of #182, Low 3): the live row is written only while its
+ * `event_projection_epoch` still equals `options.expectedEpoch`, the epoch the caller's source
+ * read was fenced on. A stale writer writes nothing and returns `{ written: false,
+ * staleEpoch: true }`; it never overwrites a newer projection.
+ *
+ * Forget tracking (migration 20261105031000): every named child row is locked FOR SHARE in
+ * session-id order after the parent row, so a concurrent tombstone or restore of a child
+ * either committed before this statement read it, or waits for this transaction and then
+ * re-queues this parent. When an edge is dropped because its child is a tombstone the row
+ * records `catalog_forgotten_child_edges`, which keeps the parent on the watch list: restoring
+ * or purging a tombstone in its (org, workspace, harness) makes it pending reprojection again.
+ * Requires 20261105022000 and 20261105031000 applied.
  */
 export async function writeDirectoryCatalog(
   db: SqlExecutor,
   key: SessionDirectoryKey,
   input: DirectoryCatalog,
+  options: { expectedEpoch: string; sourceSessionId?: string },
+): Promise<{ written: boolean; staleEpoch?: true }> {
+  const expectedEpoch = options?.expectedEpoch;
+  if (typeof expectedEpoch !== "string" || !/^(0|[1-9][0-9]{0,18})$/.test(expectedEpoch))
+    throw new Error("directory_catalog_epoch_invalid");
+  // Re-derive through the same bounds, so a caller cannot bypass them.
+  const catalog = directoryCatalogFromProjection([
+    {
+      table: "session_catalog",
+      row: {
+        title: input.recordedTitle,
+        models: input.models,
+        project_key: input.projectKey,
+        project_key_method: input.projectKeyMethod,
+        project_id: input.projectId,
+        repo_url: input.gitRepo,
+        git_branch: input.gitBranch,
+        initial_commit: input.initialCommit,
+        originator: input.originator,
+        agent_version: input.agentVersion,
+      },
+    },
+    ...input.agentNames.map((agent_name) => ({
+      table: "session_catalog_agents",
+      row: { agent_name },
+    })),
+    ...input.relationships.map((edge) => ({
+      table: "session_relationships",
+      row: {
+        relationship_uid: edge.relationshipUid,
+        child_session_id: edge.childSessionId,
+        child_model: edge.childModel ?? null,
+        child_agent_name: edge.childAgentName ?? null,
+        child_agent_type: edge.childAgentType ?? null,
+      },
+    })),
+  ]);
+  const hasRecordedValue = catalog.recordedTitle !== null;
+  const hasRecordedTitle = await recordedTitleColumn(db);
+  if (hasRecordedValue && !hasRecordedTitle)
+    throw Object.assign(new Error("directory_recorded_title_not_migrated"), { code: "42703" });
+  const sourceSessionId = options?.sourceSessionId ?? key.sessionId;
+  if (hasRecordedTitle && bounded(sourceSessionId, 255) !== sourceSessionId)
+    throw new Error("directory_catalog_source_invalid");
+  const qualifiedTitle = `d.event_projection_ready AND d.event_projection_epoch=$24::bigint
+    AND EXISTS(SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id
+      AND p.workspace_id=d.workspace_id AND p.harness=d.harness
+      AND p.session_id=$26::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id
+      AND p.deleted_at IS NULL)`;
+  const displayTitle = hasRecordedTitle
+    ? `CASE WHEN ${qualifiedTitle} THEN ${recordedTitlePrioritySql("$25", "$26")} ELSE d.title END`
+    : "d.title";
+  const { rows } = await db.query<{ written: boolean; stale_epoch: boolean }>(
+    `WITH live AS MATERIALIZED (
+       SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.last_activity_at, d.event_projection_epoch
+         FROM sessions.session_directory AS d
+        WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
+          AND d.deleted_at IS NULL AND d.event_projection_epoch = $24::bigint
+          ${hasRecordedValue ? `AND d.event_projection_ready AND EXISTS (
+            SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id
+              AND p.workspace_id=d.workspace_id AND p.harness=d.harness
+              AND p.session_id=$26::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id
+              AND p.deleted_at IS NULL)` : ""}
+        FOR UPDATE
+     ), children AS MATERIALIZED (
+       SELECT c.session_id, c.deleted_at IS NOT NULL AS gone
+         FROM sessions.session_directory AS c, live AS l
+        WHERE c.org_id = l.org_id AND c.workspace_id = l.workspace_id AND c.harness = l.harness
+          AND c.session_id = ANY ($17::text[]) AND c.session_id <> l.session_id
+        ORDER BY c.session_id
+        FOR SHARE OF c
+     ), updated AS (
+       UPDATE sessions.session_directory AS d
+          SET ${hasRecordedTitle ? `recorded_catalog_title = CASE WHEN ${qualifiedTitle} THEN $25::text ELSE d.recorded_catalog_title END, title = ${displayTitle},` : ""}
+              agent_names = $5::text[], catalog_models = $6::text[],
+              project_key = $7, project_key_method = $8, initial_commit = $9,
+              originator = $10, agent_version = $11,
+              project_id = coalesce($12, d.project_id),
+              git_repo = coalesce($13, d.git_repo),
+              git_branch = coalesce($14, d.git_branch),
+              -- The scalar agent the search RPC filters on: keep one already projected,
+              -- else the first catalog agent, and rebuild the search document with it.
+              agent_name = coalesce(d.agent_name, ($5::text[])[1]),
+              agent_name_normalized = lower(btrim(coalesce(d.agent_name, ($5::text[])[1]))),
+              search_text = sessions.session_directory_search_text(
+                ${displayTitle}, d.task_title, coalesce(d.agent_name, ($5::text[])[1]),
+                coalesce($12, d.project_id), coalesce($13, d.git_repo),
+                coalesce($14, d.git_branch), d.model, d.short_summary),
+              catalog_projected_at = now(), catalog_read_projected_at = now(),
+              catalog_read_version=$21::smallint,catalog_read_epoch=l.event_projection_epoch,
+              catalog_models_complete=$22::boolean,catalog_relationships_complete=$23::boolean,
+              catalog_forgotten_child_edges = EXISTS (SELECT 1 FROM children AS k WHERE k.gone)
+         FROM live AS l
+        WHERE d.org_id = l.org_id AND d.workspace_id = l.workspace_id
+          AND d.harness = l.harness AND d.session_id = l.session_id
+       RETURNING d.org_id
+     ), drop_agents AS (
+       DELETE FROM sessions.session_directory_agents AS a
+        USING live AS l
+        WHERE a.org_id = l.org_id AND a.workspace_id = l.workspace_id
+          AND a.harness = l.harness AND a.session_id = l.session_id
+          AND NOT (a.agent_name_normalized = ANY ($15::text[]))
+     ), put_agents AS (
+       INSERT INTO sessions.session_directory_agents
+         (org_id, workspace_id, harness, session_id, agent_name, agent_name_normalized, last_activity_at)
+       SELECT l.org_id, l.workspace_id, l.harness, l.session_id, x.name, lower(btrim(x.name)), l.last_activity_at
+         FROM live AS l, unnest($5::text[]) AS x(name)
+       ON CONFLICT (org_id, workspace_id, harness, session_id, agent_name_normalized)
+       DO UPDATE SET agent_name = excluded.agent_name, last_activity_at = excluded.last_activity_at
+     ), edges AS (
+       SELECT l.org_id, l.workspace_id, l.harness, l.session_id, e.uid, e.child, e.model, e.name, e.agent_type
+         FROM live AS l, unnest($16::text[], $17::text[], $18::text[], $19::text[], $20::text[]) AS e(uid, child, model, name, agent_type)
+        WHERE e.child IS NULL OR NOT EXISTS (
+          SELECT 1 FROM children AS k WHERE k.session_id = e.child AND k.gone)
+     ), drop_edges AS (
+       DELETE FROM sessions.session_directory_relationships AS r
+        USING live AS l
+        WHERE r.org_id = l.org_id AND r.workspace_id = l.workspace_id
+          AND r.harness = l.harness AND r.parent_session_id = l.session_id
+          AND NOT (r.relationship_uid IN (SELECT e.uid FROM edges AS e))
+     ), put_edges AS (
+       INSERT INTO sessions.session_directory_relationships
+         (org_id, workspace_id, harness, parent_session_id, relationship_uid, child_session_id,child_model,child_agent_name,child_agent_type)
+       SELECT e.org_id, e.workspace_id, e.harness, e.session_id, e.uid, e.child,e.model,e.name,e.agent_type FROM edges AS e
+       ON CONFLICT (org_id, workspace_id, harness, parent_session_id, relationship_uid)
+       DO UPDATE SET child_session_id = excluded.child_session_id,child_model=excluded.child_model,
+         child_agent_name=excluded.child_agent_name,child_agent_type=excluded.child_agent_type
+     )
+     SELECT EXISTS (SELECT 1 FROM updated) AS written,
+            NOT EXISTS (SELECT 1 FROM live) AND EXISTS (
+              SELECT 1 FROM sessions.session_directory AS x
+               WHERE x.org_id = $1 AND x.workspace_id = $2 AND x.harness = $3 AND x.session_id = $4
+                 AND x.deleted_at IS NULL AND x.event_projection_epoch <> $24::bigint) AS stale_epoch`,
+    [
+      key.orgId,
+      key.workspaceId,
+      key.harness,
+      key.sessionId,
+      catalog.agentNames,
+      catalog.models,
+      catalog.projectKey,
+      catalog.projectKeyMethod,
+      catalog.initialCommit,
+      catalog.originator,
+      catalog.agentVersion,
+      catalog.projectId,
+      catalog.gitRepo,
+      catalog.gitBranch,
+      catalog.agentNames.map(normalizeDirectoryAgent),
+      catalog.relationships.map((edge) => edge.relationshipUid),
+      catalog.relationships.map((edge) => edge.childSessionId),
+      catalog.relationships.map((edge) => edge.childModel ?? null),
+      catalog.relationships.map((edge) => edge.childAgentName ?? null),
+      catalog.relationships.map((edge) => edge.childAgentType ?? null),
+      input.metadataVersion === 1 ? 1 : 0,
+      input.metadataVersion === 1 &&
+        input.modelsComplete === true &&
+        catalog.modelsComplete === true,
+      input.metadataVersion === 1 &&
+        input.relationshipsComplete === true &&
+        catalog.relationshipsComplete === true,
+      expectedEpoch,
+      ...(hasRecordedTitle ? [catalog.recordedTitle, sourceSessionId] : []),
+    ],
+  );
+  if (rows[0]?.stale_epoch === true) return { written: false, staleEpoch: true };
+  return { written: rows[0]?.written === true };
+}
+
+/**
+ * The pre-#182 catalog writer (0c12036, unchanged until a49219d^1), kept for the search
+ * stage while SESSION_DESKTOP_CATALOG_ENABLED is off. Same columns, values and query
+ * shape as before #182: agent names, models, project key and method, initial commit,
+ * originator, agent version, project id, repo, branch, the scalar agent and search text,
+ * catalog_projected_at, agent rows, and parent -> child edges (uid and child id only).
+ * It writes none of migration 20261105022000's columns (no child_* edge metadata, no
+ * catalog_read_*, no completeness flags). Values are re-derived through the same bounds
+ * as `writeDirectoryCatalog`; the extra fields the current derivation adds are ignored.
+ */
+export async function writeLegacyDirectoryCatalog(
+  db: SqlExecutor,
+  key: SessionDirectoryKey,
+  input: DirectoryCatalog,
+  options?: { expectedEpoch: string; sourceSessionId?: string },
 ): Promise<{ written: boolean }> {
   // Re-derive through the same bounds, so a caller cannot bypass them.
   const catalog = directoryCatalogFromProjection([
     {
       table: "session_catalog",
       row: {
+        title: input.recordedTitle,
         models: input.models,
         project_key: input.projectKey,
         project_key_method: input.projectKeyMethod,
@@ -214,16 +526,41 @@ export async function writeDirectoryCatalog(
       },
     })),
   ]);
+  const hasRecordedValue = catalog.recordedTitle !== null;
+  const hasRecordedTitle = await recordedTitleColumn(db);
+  if (hasRecordedValue && !hasRecordedTitle)
+    throw Object.assign(new Error("directory_recorded_title_not_migrated"), { code: "42703" });
+  const expectedEpoch = options?.expectedEpoch;
+  if (hasRecordedValue &&
+      (typeof expectedEpoch !== "string" || !/^(0|[1-9][0-9]{0,18})$/.test(expectedEpoch)))
+    throw new Error("directory_catalog_epoch_invalid");
+  const sourceSessionId = options?.sourceSessionId ?? key.sessionId;
+  if (hasRecordedTitle && bounded(sourceSessionId, 255) !== sourceSessionId)
+    throw new Error("directory_catalog_source_invalid");
+  const qualifiedTitle = `d.event_projection_ready AND d.event_projection_epoch=$19::bigint
+    AND EXISTS(SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id
+      AND p.workspace_id=d.workspace_id AND p.harness=d.harness
+      AND p.session_id=$20::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id
+      AND p.deleted_at IS NULL)`;
+  const displayTitle = hasRecordedTitle
+    ? `CASE WHEN ${qualifiedTitle} THEN ${recordedTitlePrioritySql("$18", "$20")} ELSE d.title END`
+    : "d.title";
   const { rows } = await db.query<{ written: boolean }>(
     `WITH live AS MATERIALIZED (
        SELECT d.org_id, d.workspace_id, d.harness, d.session_id, d.last_activity_at
          FROM sessions.session_directory AS d
         WHERE d.org_id = $1 AND d.workspace_id = $2 AND d.harness = $3 AND d.session_id = $4
           AND d.deleted_at IS NULL
+          ${hasRecordedValue ? `AND d.event_projection_ready AND d.event_projection_epoch = $19::bigint
+            AND EXISTS (SELECT 1 FROM sessions.session_index p WHERE p.org_id=d.org_id
+              AND p.workspace_id=d.workspace_id AND p.harness=d.harness
+              AND p.session_id=$20::text AND coalesce(p.canonical_session_id,p.session_id)=d.session_id
+              AND p.deleted_at IS NULL)` : ""}
         FOR UPDATE
      ), updated AS (
        UPDATE sessions.session_directory AS d
-          SET agent_names = $5::text[], catalog_models = $6::text[],
+          SET ${hasRecordedTitle ? `recorded_catalog_title = CASE WHEN ${qualifiedTitle} THEN $18::text ELSE d.recorded_catalog_title END, title = ${displayTitle},` : ""}
+              agent_names = $5::text[], catalog_models = $6::text[],
               project_key = $7, project_key_method = $8, initial_commit = $9,
               originator = $10, agent_version = $11,
               project_id = coalesce($12, d.project_id),
@@ -234,7 +571,7 @@ export async function writeDirectoryCatalog(
               agent_name = coalesce(d.agent_name, ($5::text[])[1]),
               agent_name_normalized = lower(btrim(coalesce(d.agent_name, ($5::text[])[1]))),
               search_text = sessions.session_directory_search_text(
-                d.title, d.task_title, coalesce(d.agent_name, ($5::text[])[1]),
+                ${displayTitle}, d.task_title, coalesce(d.agent_name, ($5::text[])[1]),
                 coalesce($12, d.project_id), coalesce($13, d.git_repo),
                 coalesce($14, d.git_branch), d.model, d.short_summary),
               catalog_projected_at = now()
@@ -294,7 +631,17 @@ export async function writeDirectoryCatalog(
       catalog.agentNames.map(normalizeDirectoryAgent),
       catalog.relationships.map((edge) => edge.relationshipUid),
       catalog.relationships.map((edge) => edge.childSessionId),
+      ...(hasRecordedTitle ? [catalog.recordedTitle, expectedEpoch ?? null, sourceSessionId] : []),
     ],
   );
   return { written: rows[0]?.written === true };
+}
+
+/**
+ * The catalog writer the search stage uses: the 20261105022000 desktop catalog writer only
+ * with SESSION_DESKTOP_CATALOG_ENABLED=1, otherwise the pre-#182 writer.
+ * SEARCH_INDEX_ENABLED alone never selects the desktop writer.
+ */
+export function directoryCatalogWriter(desktopCatalog: boolean): typeof writeDirectoryCatalog {
+  return desktopCatalog === true ? writeDirectoryCatalog : writeLegacyDirectoryCatalog;
 }

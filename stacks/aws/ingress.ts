@@ -65,7 +65,7 @@ export const ingressStage = (i: IngressInputs) =>
       scope: "REGIONAL",
       defaultAction: { Allow: {} },
       description: ingestWafIdentity(i.stage).description,
-      rules: ingestWafRules(expose.rateLimit) as never,
+      rules: ingestWafRules(expose.rateLimit, expose.ampTransportEnabled) as never,
       visibilityConfig: { SampledRequestsEnabled: true, CloudWatchMetricsEnabled: true, MetricName: ingestWafIdentity(i.stage).metricName },
       tags: i.tags,
     });

@@ -1,5 +1,6 @@
 /** Shared canonical S3 reader/projection. The live CH writer and read Worker
  * invoke this same implementation; neither maintains a shadow event mapping. */
+import { canonicalDirectoryValues } from "./canonical-directory-values.ts";
 import { createHash } from "node:crypto";
 import {
   CONVERGENCE_EVENT_KIND,
@@ -8,6 +9,7 @@ import {
 } from "../../packages/pipeline/src/lib/pipeline/relayhistory-projection.ts";
 import {
   normalizeRelayhistoryRecords,
+  isLegacyRelayhistoryRecord,
   parseRelayhistoryRecord,
   relayhistoryExportProvenance,
   type RelayhistoryStreamRecord,
@@ -16,6 +18,9 @@ import { PipelineError } from "../../packages/pipeline/src/lib/pipeline/errors.t
 import {
   chunkKeys,
   parseSessionKey,
+  isManifestRest,
+  isPublicationManifestRest,
+  parseUploadGenerationPrefix,
   type ManifestV1,
   type ObjectStore,
 } from "../../packages/object-store/src/index.ts";
@@ -42,7 +47,7 @@ import {
   canonicalManifestIdentity,
   manifestUserId as admittedManifestUserId,
 } from "../shared/manifest-identity.ts";
-interface SessionScope {
+export interface SessionScope {
   orgId: string;
   workspaceId: string;
   harness: string;
@@ -59,6 +64,13 @@ interface SearchIndexLimits {
   maxScopeEvents: number;
   maxRows: number;
   insertBatch: number;
+  /**
+   * Read-artifact projection only; legacy CH writer does not construct display values.
+   * "required" (artifact producer): a directory_display_* refusal makes the projection
+   * incomplete with that reason code. "optional" (live raw read): the display values are
+   * omitted and the code is reported in `displayOmitted`; the read itself still succeeds.
+   */
+  directoryValues?: "required" | "optional";
 }
 const MAX_CHUNK_BYTES = 16 * 1024 * 1024;
 const SEP = "\u001f";
@@ -88,13 +100,27 @@ export async function readManifestRecords(
   decompress: (stored: Uint8Array, maxOutputLength: number) => Uint8Array,
   maxRecords = Number.POSITIVE_INFINITY,
 ): Promise<RelayhistoryStreamRecord[]> {
+  const rows: RelayhistoryStreamRecord[] = [];
+  for await (const row of streamManifestRecords(manifest, store, prefix, decompress, maxRecords))
+    rows.push(row);
+  return rows;
+}
+
+/** Bounded chunk-by-chunk reader; proofs need not retain full session payloads. */
+export async function* streamManifestRecords(
+  manifest: ManifestV1,
+  store: ObjectStore,
+  prefix: string,
+  decompress: (stored: Uint8Array, maxOutputLength: number) => Uint8Array,
+  maxRecords = Number.POSITIVE_INFINITY,
+): AsyncGenerator<RelayhistoryStreamRecord> {
   if (manifest.raw.format !== "ndjson")
     throw new PipelineError(
       "raw_format_unsupported",
       "only ndjson raw is indexed",
       false,
     );
-  const records: RelayhistoryStreamRecord[] = [];
+  let records = 0;
   for (const { entry, key } of chunkKeys(manifest, { prefix })) {
     if (
       entry.stored_bytes > MAX_CHUNK_BYTES ||
@@ -162,16 +188,16 @@ export async function readManifestRecords(
     }
     for (const line of text.split("\n"))
       if (line) {
-        if (records.length >= maxRecords)
+        if (records >= maxRecords)
           throw new PipelineError(
             "scope_too_large",
             "actual canonical record count exceeds scope limit",
             false,
           );
-        records.push(parseRelayhistoryRecord(line));
+        records += 1;
+        yield parseRelayhistoryRecord(line);
       }
   }
-  return records;
 }
 
 type Json = Record<string, unknown>;
@@ -224,7 +250,109 @@ export function projectedToNeonRow(
   return { ...base, fingerprint };
 }
 
+/** The projection identity of one group of records: whose session, machine and user they are. */
+export interface EventProjectionIdentity {
+  sessionId: string;
+  machineId: string;
+  userId: string;
+}
+
+/** A projected event row's admitted owner (the canonical reader's multi-manifest map). */
+export type EventRowOwner = (
+  row: Json,
+) => { userId: string; sessionId: string } | undefined;
+
+/** The generic delivery projection uses role as type. Codex tool-use captures
+ * carry an explicit non-chat kind; restore it only with a same-origin, same
+ * physical-session/message-id tool-call witness from the verified record union.
+ * This changes classification only: content, identities, ordering and counts stay.
+ */
+function codexToolCaptures(records: readonly RelayhistoryStreamRecord[], scope: SessionScope) {
+  const calls = new Map<string, RelayhistoryStreamRecord | null>();
+  const key = (record: RelayhistoryStreamRecord): string | null => {
+    const p = record.payload;
+    return p && p.source === "codex" && typeof p.session_id === "string" && p.session_id.trim() &&
+      typeof p.message_id === "string" && p.message_id.trim()
+      ? JSON.stringify([record.origin_id, p.session_id, p.message_id]) : null;
+  };
+  if (scope.harness !== "codex") return new Map<string, string>();
+  for (const record of records) {
+    if (record.kind !== "tool_call") continue;
+    const k = key(record);
+    if (!k || typeof record.payload?.name !== "string" || !record.payload.name.trim()) continue;
+    calls.set(k, calls.has(k) ? null : record);
+  }
+  const captures = new Map<string, string>();
+  for (const record of records) {
+    if (record.kind !== "session_event" || record.payload?.kind !== "tool_use" || record.payload.role !== "assistant") continue;
+    const k = key(record), call = k ? calls.get(k) : null;
+    if (call) captures.set(JSON.stringify([deliveryMachine(scope.workspaceId, record.origin_id), record.record_id]), call.payload!.name as string);
+  }
+  return captures;
+}
+
+/**
+ * The one record-to-event projection both readers run (readCanonicalScope per manifest
+ * group, owner-buffered.ts per buffered origin): projectRelayhistorySession, then each
+ * `convergence_events` row with its owner restored and mapped to the index row shape.
+ * Pure. A projection failure is returned as `{ error }` (the canonical reader records the
+ * reason and continues; the buffered reader hides the session); a failure mapping a
+ * projected row throws, as it always has. Catalog rows are returned in projection order.
+ */
+export function projectEventRows(
+  records: RelayhistoryStreamRecord[],
+  scope: SessionScope,
+  identity: EventProjectionIdentity,
+  version: number,
+  owner?: EventRowOwner,
+):
+  | { error: unknown }
+  | {
+      catalogRows: CatalogProjectionRow[];
+      events: Array<{ row: Json; indexRow: IndexRow }>;
+    } {
+  let projected;
+  try {
+    projected = projectRelayhistorySession(records, {
+      workspaceId: scope.workspaceId,
+      source: scope.harness,
+      sessionId: identity.sessionId,
+      machineId: identity.machineId,
+      userId: identity.userId,
+    });
+  } catch (error) {
+    return { error };
+  }
+  const codexTools = codexToolCaptures(records, scope);
+  const catalogRows: CatalogProjectionRow[] = [];
+  const events: Array<{ row: Json; indexRow: IndexRow }> = [];
+  for (const { table, row } of projected.rows) {
+    if (table !== "convergence_events") {
+      catalogRows.push({ table, row });
+      continue;
+    }
+    const found = owner?.(row);
+    const toolName = row.kind === "session_event" && typeof row.delivery_record_id === "string"
+      ? codexTools.get(JSON.stringify([row.machine_id, row.delivery_record_id])) : undefined;
+    const canonicalRow = {
+      ...row,
+      ...(toolName ? { type: "tool_use", tool_name: toolName } : {}),
+      session_id: row.delivery_record_id
+        ? (found?.sessionId ?? row.session_id)
+        : row.session_id,
+      user_id: row.user_id ?? found?.userId ?? identity.userId,
+    };
+    const indexRow = toIndexRow(
+      projectedToNeonRow(canonicalRow, scope, identity.userId),
+      version,
+    );
+    events.push({ row: canonicalRow, indexRow });
+  }
+  return { catalogRows, events };
+}
+
 export interface ScopeRead {
+  records: RelayhistoryStreamRecord[];
   projectionRows: Array<{ table: string; row: Record<string, unknown> }>;
   rows: IndexRow[];
   manifests: number;
@@ -237,6 +365,8 @@ export interface ScopeRead {
   catalog: DirectoryCatalog;
   directorySessionId: string | null;
   events: DirectoryEvents | null;
+  /** directory_display_* code when optional display values were omitted. */
+  displayOmitted?: string | null;
   sources: DirectoryEventInput["sources"];
 }
 
@@ -274,7 +404,9 @@ export async function readCanonicalScope(
     const s = manifest.session;
     const at = parseSessionKey(key);
     if (
-      !at ||
+      !at || !isManifestRest(at.rest) ||
+      ((parseUploadGenerationPrefix(at.prefix)?.base ?? at.prefix ?? "") !== prefix) ||
+      (isPublicationManifestRest(at.rest) && !parseUploadGenerationPrefix(at.prefix)) ||
       s.workspace_id !== scope.workspaceId ||
       s.harness !== scope.harness ||
       s.session_id !== at.sessionId ||
@@ -335,6 +467,7 @@ export async function readCanonicalScope(
       events: null,
       sources: [],
       projectionRows: [],
+      records: [],
     };
 
   let parsedRecords = 0;
@@ -343,7 +476,7 @@ export async function readCanonicalScope(
       const records = await readManifestRecords(
         manifest,
         deps.store,
-        prefix,
+        parseSessionKey(manifestKeysByBody.get(manifest)!)?.prefix ?? prefix,
         decompress,
         limits.maxScopeEvents - parsedRecords,
       );
@@ -363,6 +496,7 @@ export async function readCanonicalScope(
           events: null,
           sources: [],
           projectionRows: [],
+          records: [],
         };
       if (error instanceof PipelineError && error.retryable) throw error;
       complete = false;
@@ -374,9 +508,11 @@ export async function readCanonicalScope(
 
   // Fold every copy together; a conflicting copy (same revision, different
   // bytes) falls back to folding each manifest on its own, without deletes.
+  let canonicalRecords: RelayhistoryStreamRecord[] = [];
   let groups: { records: RelayhistoryStreamRecord[]; part: Part }[];
   try {
     const all = normalizeRelayhistoryRecords(parts.flatMap((p) => p.records));
+    canonicalRecords = all;
     const owner = new Map<string, Part>();
     for (const part of parts)
       for (const r of part.records)
@@ -414,7 +550,11 @@ export async function readCanonicalScope(
   const ownerByEvent = new Map<string, { userId: string; sessionId: string }>();
   for (const part of parts)
     for (const record of part.records) {
-      if (record.kind === CONVERGENCE_EVENT_KIND) continue;
+      if (
+        record.kind === CONVERGENCE_EVENT_KIND ||
+        isLegacyRelayhistoryRecord(record)
+      )
+        continue;
       const identity = JSON.stringify([
         deliveryMachine(scope.workspaceId, record.origin_id),
         record.record_id,
@@ -433,43 +573,31 @@ export async function readCanonicalScope(
   const metadataByKey = new Map<string, Json>();
   const catalogRows: CatalogProjectionRow[] = [];
   for (const { records, part } of groups) {
-    let projected;
-    try {
-      projected = projectRelayhistorySession(records, {
-        workspaceId: scope.workspaceId,
-        source: scope.harness,
+    const projected = projectEventRows(
+      records,
+      scope,
+      {
         sessionId: canonicalManifestIdentity(part.manifest).sessionId,
         machineId: canonicalManifestIdentity(part.manifest).machineId,
         userId: part.userId,
-      });
-    } catch (error) {
+      },
+      version,
+      // Delivery projection is tenant-free; restore the record's admitted owner,
+      // not the uploader/first-manifest owner of a multi-machine logical scope.
+      (row) =>
+        ownerByEvent.get(JSON.stringify([row.machine_id, row.delivery_record_id])),
+    );
+    if ("error" in projected) {
       complete = false;
       reasons.push(
-        error instanceof PipelineError ? error.code : "projection_failed",
+        projected.error instanceof PipelineError
+          ? projected.error.code
+          : "projection_failed",
       );
       continue;
     }
-    for (const { table, row } of projected.rows) {
-      if (table !== "convergence_events") {
-        catalogRows.push({ table, row });
-        continue;
-      }
-      // Delivery projection is tenant-free; restore the record's admitted owner,
-      // not the uploader/first-manifest owner of a multi-machine logical scope.
-      const owner = ownerByEvent.get(
-        JSON.stringify([row.machine_id, row.delivery_record_id]),
-      );
-      const canonicalRow = {
-        ...row,
-        session_id: row.delivery_record_id
-          ? (owner?.sessionId ?? row.session_id)
-          : row.session_id,
-        user_id: row.user_id ?? owner?.userId ?? part.userId,
-      };
-      const indexRow = toIndexRow(
-        projectedToNeonRow(canonicalRow, scope, part.userId),
-        version,
-      );
+    catalogRows.push(...projected.catalogRows);
+    for (const { row: canonicalRow, indexRow } of projected.events) {
       const identity = keyOf({
         machineId: indexRow.machine_id,
         source: indexRow.source,
@@ -497,7 +625,25 @@ export async function readCanonicalScope(
     complete = false;
     reasons.push("directory_event_metadata_invalid");
   }
+  // Both locators were selected from metadataByKey. Fetch only those rows:
+  // display materialization never scans/copies the full transcript a second time.
+  let displayValues: ReturnType<typeof canonicalDirectoryValues> = [];
+  let displayOmitted: string | null = null;
+  if (limits.directoryValues && metadata) {
+    try {
+      displayValues = canonicalDirectoryValues({orgId:scope.orgId,workspaceId:scope.workspaceId},metadata,
+        [...new Set([metadata.openingEvent,metadata.projectEvent].flatMap(event=>event ? [keyOf({machineId:event.machine_id,source:event.source,kind:event.kind,eventId:event.event_id})] : []))]
+          .map(key=>metadataByKey.get(key)!));
+    } catch (error) {
+      const code = error instanceof Error && /^directory_display_[a-z_]+$/.test(error.message) ? error.message : null;
+      if (!code) throw error;
+      reasons.push(code);
+      if (limits.directoryValues === "required") complete = false;
+      else displayOmitted = code;
+    }
+  }
   return {
+    records: canonicalRecords,
     projectionRows: [
       ...catalogRows,
       ...[...metadataByKey.values()].map(
@@ -506,6 +652,7 @@ export async function readCanonicalScope(
           row,
         }),
       ),
+      ...displayValues,
     ],
     rows: [...byKey.values()],
     manifests: parts.length,
@@ -516,6 +663,7 @@ export async function readCanonicalScope(
     catalog: directoryCatalogFromProjection(catalogRows),
     directorySessionId: directoryIds.size === 1 ? [...directoryIds][0]! : null,
     events: metadata,
+    displayOmitted,
     sources: parts.map(({ manifest }) => ({
       manifestKey: manifestKeysByBody.get(manifest)!,
       revision: String(manifest.revision),

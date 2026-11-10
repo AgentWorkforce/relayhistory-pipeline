@@ -3,6 +3,7 @@
  * priority (erasure, changed, last 14 days newest first, then history newest
  * first), export them, and log progress as counts only.
  */
+import { withLegacySource, includeLegacyUnits, legacyActivityPage } from "./legacy-source.ts";
 import type { Queryable } from "../relayhistory-export.ts";
 import { erasableByExporter, exportUnit, type ExportTarget } from "./export-session.ts";
 import {
@@ -18,6 +19,7 @@ import {
 } from "./neon-reader.ts";
 import type { SyncState, WorkItem } from "./state.ts";
 import type { Throttle } from "./throttle.ts";
+import { manifestClaim, obligatedStore } from "./obligated-store.ts";
 
 export interface LockGuard {
   maxNonAdvisory: number;
@@ -27,6 +29,8 @@ export interface LockGuard {
 }
 
 export interface SyncConfig {
+  /** Explicit dormant opt-in; includes legacy evidence and completeness records. */
+  includeLegacySources?: boolean;
   recentMs: number;
   revSweepEveryMs: number;
   actSweepEveryMs: number;
@@ -124,8 +128,12 @@ export class Syncer {
       await this.throttle.take(rows, bytes);
       await this.guardLocks();
     };
-    this.source = sourceFor(db, this.hook);
-    this.lanes = [{ db, source: this.source }, ...extraDbs.map((d) => ({ db: d, source: sourceFor(d, this.hook) }))];
+    const makeSource = (d: Queryable) => {
+      const source = sourceFor(d, this.hook);
+      return this.cfg.includeLegacySources ? withLegacySource(d, source, this.hook) : source;
+    };
+    this.source = makeSource(db);
+    this.lanes = [{ db, source: this.source }, ...extraDbs.map((d) => ({ db: d, source: makeSource(d) }))];
   }
 
   /** Pause while Neon shows lock waiters beyond the guard (another backfill, a convoy). */
@@ -208,6 +216,20 @@ export class Syncer {
       if (rows.length === 0) break;
       cat = rows.at(-1)!;
     }
+    if (this.cfg.includeLegacySources) {
+      let legacy: Parameters<typeof legacyActivityPage>[1] = null;
+      for (;;) {
+        if (this.stopped()) break;
+        const rows = await legacyActivityPage(this.db, legacy);
+        await this.hook(Math.ceil(rows.length / 50), 0);
+        this.state.seeActivity(id, rows, true);
+        // Legacy updates do not universally bump session_revisions; force a reread.
+        this.state.forceChanged(rows);
+        n += rows.length;
+        if (!rows.length) break;
+        legacy = rows.at(-1)!;
+      }
+    }
     if (this.stopped()) return;
     this.state.setMeta("act_sweep_done", String(id));
     this.state.setMeta("act_sweep_at", String(this.throttle.now()));
@@ -238,15 +260,26 @@ export class Syncer {
     const touched = new Set<string>();
     const leased: string[] = [];
     const referenced = new Set<string>();
+    // Every PUT of this group as an unresolved-write invocation (obligated-store.ts); the acked versions.
+    const acked = new Map<string, string>();
+    // The lease generation of each prefix this group leased (the publication proof).
+    const gens: Record<string, string> = {};
+    // S3X_OBLIGATIONS off: today's behaviour (no invocation recording, no claims, no publication).
+    const ob = this.state.obligations;
+    const store = ob ? obligatedStore(this.target.store, this.state, LEASE_HOLDER, acked) : this.target.store;
     try {
       const keys: string[] = [];
       const truncations: { key: string; strings: number; maxChars: number }[] = [];
       const erase: { key: string; kind: "object" | "prefix"; org_id: string; reason: string }[] = [];
-      const units = await sessionUnits(lane.db, work.org_id, work.session_id);
+      const currentUnits = await sessionUnits(lane.db, work.org_id, work.session_id);
+      const units = this.cfg.includeLegacySources
+        ? await includeLegacyUnits(lane.db, work.org_id, work.session_id, currentUnits)
+        : currentUnits;
       await this.hook(units.length, 0);
       for (const unit of units) {
         const target = {
           ...this.target,
+          ...(ob ? { store } : {}),
           renew: (k: string) => this.state.renewLease(k.slice(0, -"manifest.json".length), LEASE_HOLDER),
         };
         const r = await exportUnit(target, unit, lane.source, {
@@ -257,11 +290,16 @@ export class Syncer {
             if (!this.state.acquireLease(prefix, LEASE_HOLDER))
               throw Object.assign(new Error("the erasure job holds this session"), { code: "prefix_busy" });
             leased.push(prefix);
+            const gen = ob ? this.state.leaseGen(prefix) : undefined;
+            if (gen) gens[prefix] = gen;
           },
           onKey: (k) => {
             touched.add(k);
             this.state.recordPendingKey(work.org_id, work.session_id, k);
           },
+          // Claim every object the manifest will reference BEFORE it is visible: this run's acked versions exactly,
+          // reused / unchanged ones at the key level. Refused (the group fails, no manifest) if any is reserved.
+          ...(ob ? { onPublish: manifestClaim(this.state, acked, LEASE_HOLDER, gens) } : {}),
         });
         if (r.fenced) this.counters.fenced += 1;
         for (const m of r.manifests) {
@@ -287,6 +325,9 @@ export class Syncer {
         if (await erasableByExporter(this.target, work.org_id, key, work.session_id))
           erase.push({ key: key.slice(0, -"manifest.json".length), kind: "prefix", org_id: work.org_id, reason: "stale_prefix" });
       }
+      // Publish (own) the versions this group references, under the eraser's reservation lock: refused,
+      // and the group failed, if the erasure job reserved any of them for deletion meanwhile.
+      if (ob) this.state.publishWrites([...acked].filter(([k]) => referenced.has(k) || keep.has(k)).map(([key, versionId]) => ({ key, versionId })), { holder: LEASE_HOLDER, gens });
       this.state.enqueueErasure(erase);
       // Under the lease: nothing this group now references, or writes under, stays queued.
       this.state.cancelErasures([...referenced, ...keys.map((k) => k.slice(0, -"manifest.json".length))]);

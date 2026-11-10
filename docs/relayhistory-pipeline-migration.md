@@ -65,7 +65,7 @@ The original S3-first order below is kept for reference only.
 ## Audit findings
 
 - **2026-10-30, migration-number collision on Neon `dev` (read-only
-  evidence):** the `dev` branch (`br-rough-bread-apkej62v`) has
+  evidence):** the `dev` branch (`<neon-dev-branch-id>`) has
   `0066_nested_exec_pr_evidence.sql` applied at 2026-10-30 07:08:29 UTC. It is
   not on relayhistory-cloud `main` or any fetched remote branch, so it came
   from an unpushed or deleted branch. The applier is unknown. It is left

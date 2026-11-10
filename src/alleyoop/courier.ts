@@ -44,6 +44,7 @@ import { mintToken } from "./auth.ts";
 import { feedOrigin, feedRanges, readFeedRecords } from "./feed-records.ts";
 import { hexTraceId, isUuidV7, spanId, uuidv7 } from "../shared/ids.ts";
 import { errorFields, log } from "../shared/log.ts";
+import { initScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
 import {
   flushTelemetry,
   initTelemetry,
@@ -1085,6 +1086,8 @@ async function authorizedFetch(
 
 if (import.meta.main) {
   process.env.OTEL_SERVICE_NAME ||= "alleyoop-courier";
+  // SCRUB_ENGINE (docs/scrub-engine.md): every service selects (and for wasm verifies) at startup.
+  await initScrubEngine();
   initTelemetry();
   const cfg = configFromEnv();
   const once = flag("COURIER_ONCE", false);

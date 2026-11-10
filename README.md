@@ -83,12 +83,6 @@ One `session_uuid` (UUIDv7, minted once on the client) and one pipeline
   `stacks/gcp/alchemy.gcp.run.ts` (`docs/gcp-stage.md`).
 - `stacks/local/topology.ts`: names, ports, images, tenant ids, as data.
 - `src/`: the services (Bun/TypeScript). One image, `SERVICE=` picks the entry (`docker/`).
-- `packages/coordination-eval`: the coordination evidence rubric, bounded analysis
-  engine and report renderer. `src/coordination-report` runs canonical workspace
-  retrospectives inside the pipeline and persists draft reports in HoopDb; see
-  the [runbook](runbooks/coordination-reports.md) and
-  [review workflow](packages/coordination-eval/README.md). Local pilot artifacts
-  stay in the gitignored `.coordination-eval/` directory.
 - `packages/pipeline`, `packages/object-store`: the pipeline framework and object-store adapters, moved from relayhistory-cloud #210 and #211 (byte-identical at the move, except where `MOVE_NOTES.md` records a later change, such as scrub rule set 2 in `raw-chunks.ts`; it also has the mapping and the few stand-ins). The services import them through `src/shared/vendor.ts`.
 - `vendor/relayhistory`: the `ai-hist` Rust CLI and transcript fixtures, for Concourse.
 - `docs/`, `runbooks/`, `versions.lock.json`.
@@ -133,11 +127,18 @@ bare-origin matches, and the RelayAuth URL is never used as an audience.
 | `AUTH_AUDIENCE` | courier (local key), ingest | `relayhistory` | string | `relayhistory` |
 | `RELAYAUTH_JWKS_URL` | ingest | `http://127.0.0.1:$INGEST_PORT/.well-known/jwks.json` (self-served local key) | transport rule when set | `http://relayauth.relayauth.svc:8787/.well-known/jwks.json` (flag) |
 | `RELAYHISTORY_ORIGIN` | ingest | unset (legacy shared audience accepted) | exact bare origin + transport rule | the origin couriers mint for, e.g. `http://<release>-alleyoop-ingest.<ns>.svc:8080` (flag) |
-| `RELAYAUTH_JWKS_URL`, `RELAYAUTH_ISSUER` | read API (Lambda) | `https://relayauth.dev/.well-known/jwks.json`, `https://relayauth.dev` (vendored defaults) | JWKS: transport rule when set | your RelayAuth JWKS and issuer |
+| `RELAYAUTH_JWKS_URL`, `RELAYAUTH_ISSUER` | read API (Lambda, session-read-api) | `https://relayauth.dev/.well-known/jwks.json`, `https://relayauth.dev` (vendored defaults) | JWKS: transport rule when set | your RelayAuth JWKS and issuer |
 | `READ_API_ORIGIN` | read API | unset (every request 401) | exact audience | the read API's own origin |
+| `RELAYHISTORY_SELFHOST_READ_API` | read API | unset (off: `POST /v1/cli/login` and `GET /v1/sessions/:id/catalog` are not registered) | `true`/`false`/empty only, else startup fails | `true` on a self-host whose relaycontrol proxies History reads; login also needs `RELAYHISTORY_ACCEPT_RELAYCONTROL_TOKENS=true` (docs/session-read-api-design.md §2a) |
 | `OPENAI_BASE_URL` | session-brief | `https://api.openai.com/v1` (calls `<base>/responses`) | transport rule (the request carries `OPENAI_API_KEY`) | an OpenAI-compatible gateway, e.g. `http://llm-gateway.ai.svc:4000/v1` (flag) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | all | unset: no export | not validated (no credential) | your collector, e.g. `http://otel-collector.observability.svc:4318` |
 | `LOCKER_ENDPOINT` | all | S3 for `LOCKER_REGION` | GCS mode: own stricter check (`src/shared/locker-selection.ts`) | MinIO Service or object store |
+| `RELAYHISTORY_SELFHOST_READ_API` | session-read-api | unset (dormant: `/healthz` only, every other route 503) | `true`/`false` only | `true` once `RELAYHISTORY_READ_API_SECRET` and the read API env above are set |
+| `RELAYHISTORY_READ_API_SECRET` | session-read-api | required when enabled | the Lambda secret's JSON shape (`parseReadApiSecret`); the `supabase_url` login must be `NOSUPERUSER NOBYPASSRLS` (checked at startup; tenant isolation is forced RLS) | from the secret store (1Password), never on disk |
+| `RELAYHISTORY_READ_API_PORT` | session-read-api | `8080` (parsed even when dormant) | TCP port 1-65535 | `8080` |
+| `SEARCH_INDEX_BACKEND` | session-read-api (enabled) | `postgres` (no ClickHouse, no Lambda env) | `postgres` or `clickhouse` (registry names; anything else, or a name with no implementation in this build, fails startup naming only the variable) | `postgres`; `clickhouse` keeps the hosted binding and needs the secret's `clickhouse` block |
+| `SEARCH_INDEX_POSTGRES_BACKEND_ID` | session-read-api (enabled, postgres) | required | `[a-zA-Z0-9._-]{1,128}` | the projection-state backend id your search writer records under; coverage is from `READ_API_COMPLETE_SINCE` |
+| `SESSION_POSTGRES_TLS_PROFILE` | session-read-api (enabled) | required explicitly (no implicit Supabase pin) | `supabase`, or `custom-ca` with `SESSION_POSTGRES_CA_FILE`/`SESSION_POSTGRES_CA_SHA256` (docs/portable-lambda-runtime.md) | `custom-ca` with your Postgres CA bundle |
 | `ALLOW_IN_CLUSTER_HTTP` | courier, ingest, read API, session-brief | `false` | `true`/`false` only | `true` on in-cluster pods that use `*.svc` URLs |
 
 Hosted values that are not runtime destinations of a self-host: the vendored
@@ -158,3 +159,7 @@ and refuses to run against an unexpected account or project. The local stage
 needs no cloud credentials. `.96bulls/` holds local
 secrets (mode 600) and is gitignored; `.alchemy/` holds state in plaintext and
 is gitignored.
+
+Amp provider commands reuse the ingest process host; see [persistent Amp transport](docs/amp-transport.md) for setup and the Cloud ownership boundary.
+
+Image release and verification: [services image release guide](docs/services-image-release.md).

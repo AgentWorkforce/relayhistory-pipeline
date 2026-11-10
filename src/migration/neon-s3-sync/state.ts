@@ -1,15 +1,28 @@
 /**
- * The exporter's local watermark: one SQLite file (ids, revisions, counts and
- * object keys; never content). Losing it is safe: a fresh run re-reads Neon,
- * finds every unchanged chunk and manifest already stored and writes nothing,
- * but it then re-reads everything, so keep it.
+ * The exporter's local watermark (ids, revisions, counts and object keys; never content).
+ *
+ * S3X_OBLIGATIONS OFF (default): one SQLite file at S3X_STATE, as before.
+ * S3X_OBLIGATIONS ON: S3X_STATE is a small pointer and the database is the fixed sibling
+ * `<S3X_STATE>.obligations.sqlite` (state-path.ts; fresh state only). It is NOT disposable: it
+ * holds the durable unresolved-write obligations (every exporter PUT recorded before it is sent),
+ * ownership claims, erasure reservations and the protected terminal / erased history
+ * (write-obligation.ts v3). Its genesis is always UNATTESTED: the erasure job never marks an
+ * exporter prefix or object erased on it, and no timer, PID or lock-file check settles an unknown PUT.
  *
  * - `groups`: every `(org, session)` the last sweeps saw, with its Neon
  *   revision and activity, and the sweep id that last saw it.
  * - `exported`: what this exporter last wrote for a group: the revision it
  *   read before reading the content, and the manifest keys it owns.
  */
+import { closeSync, openSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
+import { publishPointer, resolveStatePath } from "./state-path.ts";
+
+/** S3X_OBLIGATIONS: on for "on" / "true" (trimmed, case-insensitive); anything else (including unset) is OFF. */
+export function obligationsFlag(v: string | undefined): boolean {
+  const t = (v ?? "").trim().toLowerCase();
+  return t === "on" || t === "true";
+}
 
 export interface ExportedRow {
   org_id: string;
@@ -44,8 +57,32 @@ export interface Backlog {
 export class SyncState {
   readonly db: DatabaseSync;
 
-  constructor(path: string) {
-    this.db = new DatabaseSync(path);
+  /**
+   * S3X_OBLIGATIONS (default OFF): the durable unresolved-write obligation model (its schema, triggers and genesis on
+   * open, the exporter's invocation recording and claims, and the paged gated erasure job). Off creates, records and
+   * consults none of it (its schema statement is main's, digest-pinned); OFF still carries the unflagged safety changes
+   * (the strict paged eraser, the state-path refusals), so it is not main's behaviour in every respect. An explicit option overrides the environment.
+   */
+  readonly obligations: boolean;
+
+  constructor(path: string, opts: { obligations?: boolean; direct?: boolean; inMemoryForTests?: boolean } = {}) {
+    this.obligations = opts.obligations ?? obligationsFlag(process.env.S3X_OBLIGATIONS);
+    // M-C rev 2 (state-path.ts): OFF opens the configured path as before (refusing an obligations pointer); ON uses a
+    // FRESH state only: a pointer + sibling database, bootstrapped durably before the caller can proceed past
+    // construction (so before any S3 write/delete or database connection; the exporter's read-only S3 list + head
+    // preflight in main.ts may already have run).
+    let dbPath = path;
+    let pointer: { stateId: string } | null = null;
+    if (!opts.direct && !(opts.inMemoryForTests && path === ":memory:")) {
+      const r = resolveStatePath(path, this.obligations);
+      dbPath = r.db;
+      pointer = r.pointer;
+      if (r.bootstrap) pointer = { stateId: SyncState.#bootstrap(path, r.db) };
+      // IDENTITY BEFORE MUTATION: a pointer target is checked READ-ONLY (its meta.state_id) before any PRAGMA, schema
+      // or genesis write, so a malformed or foreign target stays byte-unchanged.
+      else if (pointer) SyncState.#checkIdentityReadOnly(dbPath, pointer.stateId);
+    }
+    this.db = new DatabaseSync(dbPath);
     // Shared by the exporter and the erasure job (two processes): WAL plus a busy wait.
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 10000;");
     this.db.exec(`
@@ -87,6 +124,149 @@ export class SyncState {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS groups_last ON groups (last_ms DESC);
     `);
+    // The strict paged eraser's resume checkpoints: unflagged (part of the eraser hardening, not the obligation protocol).
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS erase_checkpoints (
+        scope TEXT PRIMARY KEY, checkpoint TEXT NOT NULL, updated_at INTEGER NOT NULL);
+    `);
+    if (this.obligations) this.#openObligations();
+    else this.#refuseUsedObligationsWhenOff();
+    if (pointer && this.meta("obligations_state_id") !== pointer.stateId)
+      throw Object.assign(new Error("the obligations database does not carry the pointer's state_id"), { code: "obligations_state_conflict" });
+  }
+
+  /**
+   * Bootstrap a FRESH ON state: create the sibling exclusively (0600), commit the schema + a random state_id, checkpoint
+   * the WAL COMPLETELY and close the sole bootstrap connection (an fsync of the main file alone would not persist
+   * commits still in -wal), then fsync + publish the pointer (state-path.ts publishPointer). Any failure refuses
+   * in the constructor (before the caller can proceed past construction: no S3 write/delete or database connection yet,
+   * though the exporter's read-only S3 preflight may have run), with nothing adopted or guessed.
+   */
+  static #checkIdentityReadOnly(dbPath: string, stateId: string) {
+    let id: string | undefined;
+    try {
+      const ro = new DatabaseSync(dbPath, { readOnly: true });
+      try {
+        id = (ro.prepare("SELECT v FROM meta WHERE k = 'obligations_state_id'").get() as { v: string } | undefined)?.v;
+      } finally {
+        ro.close();
+      }
+    } catch {
+      id = undefined;
+    }
+    if (id !== stateId) throw Object.assign(new Error("the obligations database does not carry the pointer's state_id"), { code: "obligations_state_conflict" });
+  }
+
+  static #bootstrap(path: string, sibling: string): string {
+    closeSync(openSync(sibling, "wx", 0o600));
+    const stateId = crypto.randomUUID();
+    const st = new SyncState(sibling, { obligations: true, direct: true });
+    try {
+      st.setMeta("obligations_state_id", stateId);
+      const cp = st.db.prepare("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number; log: number; checkpointed: number };
+      if (cp.busy !== 0 || cp.log !== cp.checkpointed)
+        throw Object.assign(new Error("the bootstrap checkpoint did not complete"), { code: "obligations_bootstrap_failed" });
+    } finally {
+      st.close();
+    }
+    publishPointer(path, stateId);
+    return stateId;
+  }
+
+  /**
+   * Off / rollback must never silently drop tracked obligations: if this file's obligation state was ever USED
+   * (any invocation, claim or reservation mutation stamped, or rows present), refuse to open it with the flag off,
+   * instead of letting the legacy job delete without those protections.
+   */
+  #refuseUsedObligationsWhenOff() {
+    const has = (t: string) => !!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(t);
+    const rows = (t: string) => has(t) && !!this.db.prepare(`SELECT 1 FROM ${t} LIMIT 1`).get();
+    if (rows("write_touch") || rows("write_invocations") || rows("erase_reservations") || rows("write_published"))
+      throw Object.assign(new Error("this state file's obligation state is in use: S3X_OBLIGATIONS cannot be turned off for it"), { code: "obligations_state_in_use" });
+  }
+  /**
+   * The ENFORCED cross-process mode interlock for an OFF handle: the persisted "obligations used" marker is the
+   * never-deleted write_touch stamp an ON handle writes atomically (trigger) on its first use. Every OFF lease
+   * acquisition / renewal / queue mutation re-reads it INSIDE its own IMMEDIATE transaction, and the OFF erase path
+   * before every page, so a live OFF handle (opened before an ON handle recorded state, e.g. a rolling restart) can
+   * never act once obligations are in use. A no-op for an ON handle.
+   */
+  assertModeAllowed() {
+    if (!this.obligations) this.#refuseUsedObligationsWhenOff();
+  }
+  /** Off: run a single-statement effect inside an IMMEDIATE transaction behind the interlock; on: unchanged. */
+  #offGuarded<T>(fn: () => T): T {
+    if (this.obligations) return fn();
+    let out!: T;
+    this.#tx(() => {
+      this.#refuseUsedObligationsWhenOff();
+      out = fn();
+    });
+    return out;
+  }
+
+  /** The obligation schema, triggers, lease generation column and genesis (only with S3X_OBLIGATIONS on). */
+  #openObligations() {
+    this.db.exec(`
+      -- Unresolved-write obligations (shared write-obligation v3, write-obligation.ts), E3's own tables:
+      -- one row per exporter PUT invocation, recorded BEFORE it is sent; the versions the exporter
+      -- currently publishes (owns); and the versions the eraser reserved for deletion. The compare-and-set
+      -- token is the NON-REVERTING revision in write_touch (below), not a max over these removable rows.
+      CREATE TABLE IF NOT EXISTS write_invocations (id TEXT PRIMARY KEY, key TEXT NOT NULL, holder TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('dispatched', 'acked')), version_id TEXT, seq INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS write_invocations_key ON write_invocations (key);
+      CREATE TABLE IF NOT EXISTS write_published (key TEXT NOT NULL, version_id TEXT NOT NULL, seq INTEGER NOT NULL,
+        PRIMARY KEY (key, version_id));
+      CREATE TABLE IF NOT EXISTS erase_reservations (key TEXT NOT NULL, version_id TEXT NOT NULL, scope TEXT NOT NULL,
+        seq INTEGER NOT NULL, PRIMARY KEY (key, version_id));
+      -- PROTECTED terminal history, never deleted or reopened: every invocation's terminal outcome, and every
+      -- version the eraser proved erased (moved here when its reservation is cleared).
+      CREATE TABLE IF NOT EXISTS write_terminal (id TEXT PRIMARY KEY, key TEXT NOT NULL, version_id TEXT,
+        outcome TEXT NOT NULL CHECK (outcome IN ('erased', 'published', 'refused')), at INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS erased_versions (key TEXT NOT NULL, version_id TEXT NOT NULL, at INTEGER NOT NULL,
+        PRIMARY KEY (key, version_id));
+      -- NON-REVERTING obligation revision: every insert / update / delete on the three obligation tables (dispatch, ack,
+      -- refuse, publish, unpublish, reserve, retire, resolve, legacy import) bumps a monotonic clock and stamps the
+      -- affected key in write_touch, which is NEVER deleted. A prefix's revision is the newest stamp under it, so a
+      -- deletion can never make it revert (no ABA).
+      CREATE TABLE IF NOT EXISTS write_clock (id INTEGER PRIMARY KEY CHECK (id = 1), n INTEGER NOT NULL);
+      INSERT OR IGNORE INTO write_clock (id, n) VALUES (1, 0);
+      CREATE TABLE IF NOT EXISTS write_touch (key TEXT PRIMARY KEY, seq INTEGER NOT NULL);
+
+    `);
+    for (const t of ["write_invocations", "write_published", "erase_reservations"])
+      for (const [op, row] of [["INSERT", "NEW"], ["UPDATE", "NEW"], ["DELETE", "OLD"]] as const)
+        this.db.exec(`CREATE TRIGGER IF NOT EXISTS ${t}_touch_${op.toLowerCase()} AFTER ${op} ON ${t} BEGIN
+          UPDATE write_clock SET n = n + 1 WHERE id = 1;
+          INSERT INTO write_touch (key, seq) VALUES (${row}.key, (SELECT n FROM write_clock WHERE id = 1))
+            ON CONFLICT (key) DO UPDATE SET seq = excluded.seq;
+        END`);
+    // Lease generation: minted on every NEW acquisition (absent, or taken from another holder); a renew keeps it.
+    if (!(this.db.prepare("SELECT 1 FROM pragma_table_info('leases') WHERE name = 'gen'").get())) this.db.exec("ALTER TABLE leases ADD COLUMN gen TEXT");
+    // Obligation genesis (once per file, never reset), from EVIDENCE only, never a timer, a PID or a lock file:
+    // A file has no evidence that writes dispatched before it are terminal (a dead process, an absent lock or any
+    // wait proves nothing; the legacy exporter even cleared pending_keys on a failed group whose PUT timed out), so
+    // EVERY genesis is UNATTESTED and the erasure job never marks an exporter prefix or object erased on it. There is
+    // no unlock: a separately reviewed recovery contract (old effects proven terminal, or a genuinely never-used
+    // scope) is required first. ON only ever bootstraps a FRESH state (state-path.ts), so there is no legacy content
+    // to import here: an existing pre-obligation file is refused before this point.
+    if (!this.meta("obligations_genesis")) {
+      this.#tx(() => {
+        if (this.meta("obligations_genesis")) return;
+        this.setMeta("obligations_genesis", JSON.stringify({ at: Date.now(), attestedAt: null, basis: "none", imported: 0 }));
+      });
+    }
+  }
+
+  /** The obligation genesis: when this file began tracking exporter PUTs, and whether an operator attested it. */
+  obligationGenesis(): { at: number; attestedAt: null; basis?: string; imported?: number } {
+    // Any stored attestedAt (old, forged or otherwise) is IGNORED: there is no attestation policy, so it is always null.
+    const g = JSON.parse(this.meta("obligations_genesis") ?? '{"at":0}') as { at: number; basis?: string; imported?: number };
+    return { at: g.at, attestedAt: null, ...(g.basis !== undefined ? { basis: g.basis } : {}), ...(g.imported !== undefined ? { imported: g.imported } : {}) };
+  }
+  /** Erasures may be marked done only after the genesis is attested (fail closed on a lost / recreated file). */
+  obligationsAttested(): boolean {
+    return false; // always: no metadata, old or forged, ever unlocks completion
   }
 
   #tx(fn: () => void) {
@@ -202,7 +382,9 @@ export class SyncState {
   markFailed(org: string, session: string, code: string, keys: string[], revision: number, at = Date.now()) {
     const prior = this.exported(org, session);
     // Waiting for the other process's lease, or an interrupted run, is not the group's failure.
-    const transientWait = code === "prefix_busy" || code === "interrupted";
+    // publish_reserved (S3X_OBLIGATIONS on): the erasure job holds a reservation on something this group references; it
+    // is released or retired when that erasure run proves, so the group simply retries (never stuck_with_keys).
+    const transientWait = code === "prefix_busy" || code === "interrupted" || code === "publish_reserved";
     const attempts = (prior?.attempts ?? 0) + (transientWait ? 0 : 1);
     const nextTry = at + (transientWait ? 2 * 60 * 1000 : Math.min(4, 2 ** Math.max(0, attempts - 1)) * 60 * 60 * 1000);
     const all = JSON.stringify([...new Set([...(prior?.keys ?? []), ...keys])].sort());
@@ -246,27 +428,44 @@ export class SyncState {
         | { holder: string; at: number }
         | undefined;
       if (row && row.holder !== holder && now - Number(row.at) < ttlMs) return;
+      if (!this.obligations) {
+        this.#refuseUsedObligationsWhenOff();
+        this.db
+          .prepare("INSERT INTO leases (prefix, holder, at) VALUES (?, ?, ?) ON CONFLICT (prefix) DO UPDATE SET holder = excluded.holder, at = excluded.at")
+          .run(prefix, holder, now);
+        ok = true;
+        return;
+      }
+      // The same holder keeps its generation; a new acquisition (absent, or taken over) mints a fresh one.
       this.db
-        .prepare("INSERT INTO leases (prefix, holder, at) VALUES (?, ?, ?) ON CONFLICT (prefix) DO UPDATE SET holder = excluded.holder, at = excluded.at")
-        .run(prefix, holder, now);
+        .prepare(`INSERT INTO leases (prefix, holder, at, gen) VALUES (?, ?, ?, ?) ON CONFLICT (prefix) DO UPDATE SET at = excluded.at,
+          gen = CASE WHEN leases.holder = excluded.holder AND leases.gen IS NOT NULL THEN leases.gen ELSE excluded.gen END, holder = excluded.holder`)
+        .run(prefix, holder, now, crypto.randomUUID());
       ok = true;
     });
     return ok;
   }
 
+  /** The lease's current generation (minted at acquisition), or undefined when no one holds it. */
+  leaseGen(prefix: string): string | undefined {
+    if (!this.obligations) return undefined;
+    return (this.db.prepare("SELECT gen FROM leases WHERE prefix = ?").get(prefix) as { gen: string | null } | undefined)?.gen ?? undefined;
+  }
+
   /** Extend a lease this holder still has; false if it was taken over. */
   renewLease(prefix: string, holder: string, now = Date.now()): boolean {
-    return Number(this.db.prepare("UPDATE leases SET at = ? WHERE prefix = ? AND holder = ?").run(now, prefix, holder).changes) === 1;
+    return this.#offGuarded(() => Number(this.db.prepare("UPDATE leases SET at = ? WHERE prefix = ? AND holder = ?").run(now, prefix, holder).changes) === 1);
   }
 
   /** Leases of a holder kind other than `current` (a previous run of the same single process). */
   releaseStaleLeases(kind: string, current: string): number {
-    return Number(this.db.prepare("DELETE FROM leases WHERE holder LIKE ? AND holder <> ?").run(`${kind}%`, current).changes);
+    return this.#offGuarded(() => Number(this.db.prepare("DELETE FROM leases WHERE holder LIKE ? AND holder <> ?").run(`${kind}%`, current).changes));
   }
 
   releaseLeases(holder: string, prefixes: Iterable<string>) {
     const q = this.db.prepare("DELETE FROM leases WHERE prefix = ? AND holder = ?");
     this.#tx(() => {
+      if (!this.obligations) this.#refuseUsedObligationsWhenOff();
       for (const p of prefixes) q.run(p, holder);
     });
   }
@@ -275,6 +474,7 @@ export class SyncState {
   cancelErasures(keys: Iterable<string>) {
     const q = this.db.prepare("DELETE FROM erasures WHERE key = ?");
     this.#tx(() => {
+      if (!this.obligations) this.#refuseUsedObligationsWhenOff();
       for (const k of keys) q.run(k);
     });
   }
@@ -288,8 +488,24 @@ export class SyncState {
        ON CONFLICT (key) DO UPDATE SET next_try = 0,
          kind = CASE WHEN excluded.kind = 'prefix' THEN 'prefix' ELSE erasures.kind END`,
     );
+    // Queued for erasure: no longer owned (the eraser may then reserve its versions), scoped by the item's KIND: an
+    // object item unpublishes EXACTLY its key (never another key that merely starts with it); a prefix item, the
+    // keys under its "/"-terminated prefix.
+    if (!this.obligations) {
+      this.#tx(() => {
+        this.#refuseUsedObligationsWhenOff();
+        for (const i of items) q.run(i.key, i.kind, i.org_id, i.reason, at);
+      });
+      return;
+    }
+    const unpubKey = this.db.prepare("DELETE FROM write_published WHERE key = ?");
+    const unpubPrefix = this.db.prepare(`DELETE FROM write_published WHERE ${SyncState.#under}`);
     this.#tx(() => {
-      for (const i of items) q.run(i.key, i.kind, i.org_id, i.reason, at);
+      for (const i of items) {
+        q.run(i.key, i.kind, i.org_id, i.reason, at);
+        if (i.kind === "object") unpubKey.run(i.key);
+        else unpubPrefix.run(...SyncState.#u(i.key));
+      }
     });
   }
 
@@ -309,13 +525,343 @@ export class SyncState {
 
   erasureDone(key: string, enqueuedAt: number) {
     // Only if not re-queued meanwhile.
-    this.db.prepare("DELETE FROM erasures WHERE key = ? AND enqueued_at = ?").run(key, enqueuedAt);
+    this.#offGuarded(() => this.db.prepare("DELETE FROM erasures WHERE key = ? AND enqueued_at = ?").run(key, enqueuedAt));
+  }
+
+  /**
+   * The shared paged eraser's durable resume point (eraser.ts EraseCheckpoint), keyed by the job's scope digest
+   * (operation, authority, tenant/session or queued item identity). Progress only: a checkpoint is never proof of
+   * erasure; completion needs a fresh strict zero inventory (verifyErased).
+   */
+  eraseCheckpoint(scope: string): unknown | null {
+    const row = this.db.prepare("SELECT checkpoint FROM erase_checkpoints WHERE scope = ?").get(scope) as { checkpoint: string } | undefined;
+    return row ? JSON.parse(row.checkpoint) : null;
+  }
+  setEraseCheckpoint(scope: string, checkpoint: unknown, at = Date.now()) {
+    this.db.prepare("INSERT INTO erase_checkpoints(scope, checkpoint, updated_at) VALUES(?, ?, ?) ON CONFLICT(scope) DO UPDATE SET checkpoint = excluded.checkpoint, updated_at = excluded.updated_at")
+      .run(scope, JSON.stringify(checkpoint), at);
+  }
+  clearEraseCheckpoint(scope: string) {
+    this.db.prepare("DELETE FROM erase_checkpoints WHERE scope = ?").run(scope);
+  }
+
+  // ---------------------------------------------------------------- unresolved-write obligations (v3)
+
+  #seq(): number {
+    const n = Number(this.meta("write_seq") ?? 0) + 1;
+    this.setMeta("write_seq", String(n));
+    return n;
+  }
+  /**
+   * Prefix membership that can use the key index: a BINARY range (byte order of UTF-8 = code point order; SQLite's
+   * default collation, stated explicitly) [prefix, successor(prefix)), where successor increments the prefix's last
+   * code point, so every string starting with the prefix sorts inside it; plus an exact residual prefix test.
+   * Parameters: SyncState.#u(prefix).
+   */
+  static #under = "key COLLATE BINARY >= ? AND key COLLATE BINARY < ? AND substr(key, 1, length(?)) = ?";
+  static #u(prefix: string): [string, string | Uint8Array, string, string] {
+    // Range membership is for "/"-terminated directory / session prefixes only; an item KEY is matched exactly.
+    if (!prefix.endsWith("/")) throw Object.assign(new Error("a prefix range needs a /-terminated prefix"), { code: "prefix_shape" });
+    // The least string greater than every string starting with `p`: increment its last code point (dropping trailing
+    // U+10FFFF first). None (empty, or all U+10FFFF): a BLOB, which SQLite orders after every TEXT value.
+    const succ = (p: string): string | Uint8Array => {
+      const cps = [...p];
+      while (cps.length && cps[cps.length - 1]!.codePointAt(0) === 0x10ffff) cps.pop();
+      const last = cps.pop()?.codePointAt(0);
+      if (last === undefined) return new Uint8Array([0xff]);
+      const next = last + 1 >= 0xd800 && last + 1 <= 0xdfff ? 0xe000 : last + 1; // never a lone surrogate
+      return cps.join("") + String.fromCodePoint(next);
+    };
+    return [prefix, succ(prefix), prefix, prefix];
+  }
+
+  /** Writer: a NEW invocation id for one PUT at `key`, durable BEFORE the PUT is sent. */
+  dispatchWrite(key: string, holder: string): string {
+    const id = crypto.randomUUID();
+    this.#tx(() => {
+      this.db.prepare("INSERT INTO write_invocations (id, key, holder, outcome, version_id, seq) VALUES (?, ?, ?, 'dispatched', NULL, ?)").run(id, key, holder, this.#seq());
+    });
+    return id;
+  }
+  /** Writer: its OWN confirmed response, with the exact version id it created ("null" on an unversioned store). */
+  ackWrite(id: string, versionId: string) {
+    this.#tx(() => {
+      this.db.prepare("UPDATE write_invocations SET outcome = 'acked', version_id = ?, seq = ? WHERE id = ? AND outcome = 'dispatched'").run(versionId, this.#seq(), id);
+    });
+  }
+  /** Writer: a definite refusal of this very request (no write happened): terminal, so the row goes. */
+  refuseWrite(id: string) {
+    this.#tx(() => {
+      const r = this.db.prepare("INSERT OR IGNORE INTO write_terminal (id, key, version_id, outcome, at) SELECT id, key, NULL, 'refused', ? FROM write_invocations WHERE id = ? AND outcome = 'dispatched'").run(Date.now(), id);
+      if (Number(r.changes) === 1) this.db.prepare("DELETE FROM write_invocations WHERE id = ?").run(id);
+    });
+  }
+  /**
+   * Writer publish: the versions this group now references become owned, in ONE transaction under the lock the
+   * eraser's reserve takes, and only while the writer can prove it is still the writer:
+   *  - lease: every entry lies under one of `lease.prefixes`, each still held by `lease.holder` (an eraser that took
+   *    an expired lease, or finished and released it, makes a delayed writer's publish fail);
+   *  - an exact version must CONSUME its own still-live acked invocation (or already be owned exactly: idempotent);
+   *    once the eraser resolved that invocation (the version was seen gone), a late publish fails;
+   *  - a key-level claim ("*": reused / unchanged objects whose version id this run never saw) conflicts with ANY
+   *    reservation at the key; an exact one with that version's reservation.
+   * Any refusal records nothing (the group then fails; nothing is marked exported).
+   */
+  publishWrites(entries: { key: string; versionId: string }[], lease: { holder: string; gens: Readonly<Record<string, string>> }) {
+    this.#tx(() => {
+      const held = this.db.prepare("SELECT holder, gen FROM leases WHERE prefix = ?");
+      const erased = this.db.prepare("SELECT 1 FROM erased_versions WHERE key = ? AND version_id = ?");
+      const reserved = this.db.prepare("SELECT 1 FROM erase_reservations WHERE key = ? AND (version_id = ? OR ? = '*')");
+      const live = this.db.prepare("SELECT id FROM write_invocations WHERE key = ? AND outcome = 'acked' AND version_id = ? AND holder = ?");
+      const owned = this.db.prepare("SELECT 1 FROM write_published WHERE key = ? AND version_id = ?");
+      const refuse = (code: string, msg: string) => { throw Object.assign(new Error(msg), { code }); };
+      const consume: string[] = [];
+      for (const e of entries) {
+        const p = Object.keys(lease.gens).find((x) => e.key.startsWith(x));
+        const h = p ? (held.get(p) as { holder: string; gen: string | null } | undefined) : undefined;
+        // Holder AND generation: a lease that expired and was taken (even if re-acquired later) never validates.
+        if (!p || !h || h.holder !== lease.holder || h.gen === null || h.gen !== lease.gens[p]) refuse("publish_lease_lost", "the writer no longer holds this lease generation");
+        if (reserved.get(e.key, e.versionId, e.versionId)) refuse("publish_reserved", "a published version is reserved for erasure");
+        if (e.versionId === "*") continue;
+        if (erased.get(e.key, e.versionId)) refuse("publish_erased", "the version was erased");
+        const inv = live.get(e.key, e.versionId, lease.holder) as { id: string } | undefined;
+        if (inv) consume.push(inv.id);
+        else if (!owned.get(e.key, e.versionId)) refuse("publish_unresolved", "the version's own invocation is no longer live (it may have been erased)");
+      }
+      const seq = this.#seq();
+      const ins = this.db.prepare("INSERT INTO write_published (key, version_id, seq) VALUES (?, ?, ?) ON CONFLICT DO NOTHING");
+      for (const e of entries) ins.run(e.key, e.versionId, seq);
+      const term = this.db.prepare("INSERT OR IGNORE INTO write_terminal (id, key, version_id, outcome, at) SELECT id, key, version_id, 'published', ? FROM write_invocations WHERE id = ?");
+      const done = this.db.prepare("DELETE FROM write_invocations WHERE id = ?");
+      for (const id of consume) {
+        term.run(Date.now(), id);
+        done.run(id);
+      }
+    });
+  }
+  /** Ownership ends for everything under a "/"-terminated prefix (a prefix-kind erasure or a forgotten session). */
+  unpublishPrefix(prefix: string) {
+    this.db.prepare(`DELETE FROM write_published WHERE ${SyncState.#under}`).run(...SyncState.#u(prefix));
+  }
+  /** The prefix's compare-and-set revision: the newest seq of any invocation, publication or reservation under it. */
+  obligationRev(prefix: string): number {
+    // The newest never-deleted touch stamp under the prefix: monotonic across EVERY transition (non-reverting).
+    return Number((this.db.prepare(`SELECT coalesce(max(seq), 0) AS n FROM write_touch WHERE ${SyncState.#under}`).get(...SyncState.#u(prefix)) as { n: number }).n);
+  }
+  /** The eraser still holds `prefix`'s lease at the generation it acquired (checked inside page / completion txs). */
+  #leaseHeld(lease: { prefix: string; holder: string; gen: string } | undefined): boolean {
+    if (!lease) return true;
+    const h = this.db.prepare("SELECT holder, gen FROM leases WHERE prefix = ?").get(lease.prefix) as { holder: string; gen: string | null } | undefined;
+    return !!h && h.holder === lease.holder && h.gen === lease.gen;
+  }
+  /** The unresolved invocations under a prefix (dispatched, or acked whose version was not yet seen gone). */
+  unresolvedWrites(prefix: string): { id: string; key: string; outcome: "dispatched" | "acked"; versionId?: string }[] {
+    return (this.db.prepare(`SELECT id, key, outcome, version_id FROM write_invocations WHERE ${SyncState.#under} ORDER BY id`).all(...SyncState.#u(prefix)) as
+      { id: string; key: string; outcome: "dispatched" | "acked"; version_id: string | null }[]).map((r) => ({ id: r.id, key: r.key, outcome: r.outcome, ...(r.version_id ? { versionId: r.version_id } : {}) }));
+  }
+  /** EXPLAIN QUERY PLAN of the prefix predicate on `table` (tests: the key index must be used). */
+  prefixPlan(table: "write_invocations" | "write_published" | "erase_reservations", prefix: string): string {
+    return (this.db.prepare(`EXPLAIN QUERY PLAN SELECT max(seq) FROM ${table} WHERE ${SyncState.#under}`).all(...SyncState.#u(prefix)) as { detail: string }[]).map((r) => r.detail).join(" | ");
+  }
+  /** Prefix-level unresolved obligations (legacy imports: key ends in "/") that COVER `prefix` (an ancestor or itself). */
+  coveringWrites(prefix: string): { id: string; key: string; outcome: "dispatched" | "acked"; versionId?: string }[] {
+    return (this.db.prepare("SELECT id, key, outcome, version_id FROM write_invocations WHERE substr(key, -1) = '/' AND substr(?, 1, length(key)) = key").all(prefix) as
+      { id: string; key: string; outcome: "dispatched" | "acked"; version_id: string | null }[]).map((r) => ({ id: r.id, key: r.key, outcome: r.outcome, ...(r.version_id ? { versionId: r.version_id } : {}) }));
+  }
+  /** Versions the writer currently owns under a prefix. */
+  publishedUnder(prefix: string): { key: string; versionId: string }[] {
+    return (this.db.prepare(`SELECT key, version_id FROM write_published WHERE ${SyncState.#under}`).all(...SyncState.#u(prefix)) as { key: string; version_id: string }[]).map((r) => ({ key: r.key, versionId: r.version_id }));
+  }
+  /**
+   * Eraser reserve (compare-and-set on the prefix revision): atomically reserve EVERY version about to be
+   * deleted. Refused if the prefix changed since `rev` (a writer dispatched/acked/published there) or if any
+   * doomed version is owned now; after it succeeds, a publish of any reserved version is refused.
+   */
+  reserveErase(prefix: string, rev: number, scope: string, versions: { key: string; versionId: string }[]): { ok: true; rev: number } | { ok: false } {
+    let out: { ok: true; rev: number } | { ok: false } = { ok: false };
+    this.#tx(() => {
+      if (this.obligationRev(prefix) !== rev) return;
+      // Owned: that exact version, or the whole key (a key-level claim).
+      const owned = this.db.prepare("SELECT 1 FROM write_published WHERE key = ? AND (version_id = ? OR version_id = '*')");
+      for (const v of versions) {
+        if (!v.key.startsWith(prefix)) return;
+        if (owned.get(v.key, v.versionId)) return;
+      }
+      const seq = this.#seq();
+      const ins = this.db.prepare("INSERT INTO erase_reservations (key, version_id, scope, seq) VALUES (?, ?, ?, ?) ON CONFLICT (key, version_id) DO UPDATE SET scope = excluded.scope, seq = excluded.seq");
+      for (const v of versions) ins.run(v.key, v.versionId, scope, seq);
+      out = { ok: true, rev: this.obligationRev(prefix) };
+    });
+    return out;
+  }
+  /** Clear exactly these invocations (each on its own terminal evidence), compare-and-set on the prefix revision. */
+  resolveWrites(prefix: string, rev: number, ids: readonly string[]): { ok: true; rev: number } | { ok: false } {
+    let out: { ok: true; rev: number } | { ok: false } = { ok: false };
+    this.#tx(() => {
+      if (this.obligationRev(prefix) !== rev) return;
+      const term = this.db.prepare(`INSERT OR IGNORE INTO write_terminal (id, key, version_id, outcome, at) SELECT id, key, version_id, 'erased', ? FROM write_invocations WHERE id = ? AND ${SyncState.#under}`);
+      const del = this.db.prepare(`DELETE FROM write_invocations WHERE id = ? AND ${SyncState.#under}`);
+      for (const id of ids) {
+        term.run(Date.now(), id, ...SyncState.#u(prefix));
+        del.run(id, ...SyncState.#u(prefix));
+      }
+      out = { ok: true, rev: this.obligationRev(prefix) };
+    });
+    return out;
+  }
+  /** After a proven erasure: the prefix's reservations are no longer needed (its versions are gone). */
+  /**
+   * Retire, in ONE bounded page (at most `limit` rows, one IMMEDIATE transaction), the reservations made under
+   * `scope` at exactly `exactKey` (or under the "/"-terminated `prefix`) that a complete strict proof showed absent.
+   * Each moves to the protected erased history; everything else (other scopes' reservations, kept versions, siblings)
+   * is untouched. The filter is in SQL (index range on key); `absent` decides per row. Resumable: rows are visited in
+   * (key, version_id) order after the DURABLE cursor (`retire_cursor:<scope>`), so a crash resumes instead of
+   * rescanning; the cursor is cleared when the scan is complete.
+   */
+  retireReservationsPage(prefix: string, scope: string, exactKey: string | undefined, absent: (key: string, versionId: string) => boolean, limit = 1000,
+    maxSeq = Number.MAX_SAFE_INTEGER, proofId = "unbound", expectRev?: number, lease?: { prefix: string; holder: string; gen: string }): { retired: number; done: boolean; ok: boolean; rev: number } {
+    let out = { retired: 0, done: false, ok: false, rev: -1 };
+    this.#tx(() => {
+      if (!this.#leaseHeld(lease)) {
+        out = { retired: 0, done: false, ok: false, rev: this.obligationRev(prefix) };
+        return;
+      }
+      // Under the writer/retire lock (this IMMEDIATE transaction): the prefix revision must still be the one the caller
+      // proved against; a dispatch / publish / reservation that landed meanwhile refuses this page (nothing retired).
+      if (expectRev !== undefined && this.obligationRev(prefix) !== expectRev) {
+        out = { retired: 0, done: false, ok: false, rev: this.obligationRev(prefix) };
+        return;
+      }
+      const ck = `retire_cursor:${scope}`;
+      // The cursor is bound to the proof/workset it was taken under ({proof, pos}). A different proof (new reservations,
+      // a changed listing, another key or selection) DISCARDS it: retirement restarts from the start (idempotent),
+      // so a row that now sorts before an old cursor is never skipped.
+      const saved = JSON.parse(this.meta(ck) ?? "null") as { proof: string; pos: [string, string] } | null;
+      const cur = saved && saved.proof === proofId ? saved.pos : null;
+      const after = cur ? "AND (key > ? OR (key = ? AND version_id > ?))" : "";
+      const where = exactKey !== undefined ? "key = ?" : SyncState.#under;
+      // Bound to the PROOF's generation: only reservations at or below the high-water seq captured when the proof completed
+      // (a reservation added later was not covered by that proof and stays reserved).
+      const params: (string | number | Uint8Array)[] = [...(exactKey !== undefined ? [exactKey] : SyncState.#u(prefix)), scope, maxSeq, ...(cur ? [cur[0], cur[0], cur[1]] : []), limit];
+      const rows = this.db.prepare(`SELECT key, version_id FROM erase_reservations WHERE ${where} AND scope = ? AND seq <= ? ${after} ORDER BY key, version_id LIMIT ?`).all(...params) as { key: string; version_id: string }[];
+      const hist = this.db.prepare("INSERT OR IGNORE INTO erased_versions (key, version_id, at) VALUES (?, ?, ?)");
+      const del = this.db.prepare("DELETE FROM erase_reservations WHERE key = ? AND version_id = ?");
+      let retired = 0;
+      for (const r of rows) {
+        if (!absent(r.key, r.version_id)) continue;
+        hist.run(r.key, r.version_id, Date.now());
+        del.run(r.key, r.version_id);
+        retired += 1;
+      }
+      const done = rows.length < limit;
+      if (done) this.db.prepare("DELETE FROM meta WHERE k = ?").run(ck);
+      else this.setMeta(ck, JSON.stringify({ proof: proofId, pos: [rows[rows.length - 1]!.key, rows[rows.length - 1]!.version_id] }));
+      out = { retired, done, ok: true, rev: this.obligationRev(prefix) };
+    });
+    return out;
+  }
+  /**
+   * Read-only bounded page: how many of this scope's reservations (<= maxSeq, at exactKey or under prefix) the current
+   * proof says are absent but are still reserved. Used as the final assertion (must be 0) before any done claim.
+   */
+  eligibleRemainingPage(prefix: string, scope: string, exactKey: string | undefined, absent: (key: string, versionId: string) => boolean,
+    maxSeq: number, after: [string, string] | null, limit = 1000): { eligible: number; next: [string, string] | null } {
+    const where = exactKey !== undefined ? "key = ?" : SyncState.#under;
+    const cond = after ? "AND (key > ? OR (key = ? AND version_id > ?))" : "";
+    const params: (string | number | Uint8Array)[] = [...(exactKey !== undefined ? [exactKey] : SyncState.#u(prefix)), scope, maxSeq, ...(after ? [after[0], after[0], after[1]] : []), limit];
+    const rows = this.db.prepare(`SELECT key, version_id FROM erase_reservations WHERE ${where} AND scope = ? AND seq <= ? ${cond} ORDER BY key, version_id LIMIT ?`).all(...params) as { key: string; version_id: string }[];
+    let eligible = 0;
+    for (const r of rows) if (absent(r.key, r.version_id)) eligible += 1;
+    return { eligible, next: rows.length < limit ? null : [rows[rows.length - 1]!.key, rows[rows.length - 1]!.version_id] };
+  }
+  /**
+   * The terminal claim, atomically with its re-validation: the queue row is removed (erasure done) only if the prefix
+   * revision is still `expectRev` in the SAME transaction; otherwise nothing changes and the item stays queued.
+   */
+  completeErasure(key: string, enqueuedAt: number, prefix: string, expectRev: number, lease?: { prefix: string; holder: string; gen: string }): boolean {
+    let ok = false;
+    this.#tx(() => {
+      // The non-reverting revision AND the eraser's lease (holder + generation), in the same transaction as the removal.
+      if (this.obligationRev(prefix) !== expectRev || !this.#leaseHeld(lease)) return;
+      // ... and the exact queue identity (key + enqueue time) must still be there to be removed.
+      ok = Number(this.db.prepare("DELETE FROM erasures WHERE key = ? AND enqueued_at = ?").run(key, enqueuedAt).changes) === 1;
+    });
+    return ok;
+  }
+  /**
+   * One bounded page RELEASING (no history: they were not erased) this scope's reservations, at or below `maxSeq`, whose
+   * versions a complete strict proof still LISTS (present). The next run re-reserves what it deletes, so a writer is
+   * never wedged behind a reservation for a version nobody deleted.
+   */
+  releasePresentPage(prefix: string, scope: string, exactKey: string | undefined, present: (key: string, versionId: string) => boolean, maxSeq: number,
+    lease?: { prefix: string; holder: string; gen: string }, expectRev?: number, limit = 1000, proofId = "unbound"): { released: number; done: boolean; ok: boolean; rev: number } {
+    let out = { released: 0, done: false, ok: false, rev: -1 };
+    this.#tx(() => {
+      // Compare-and-set on the non-reverting revision + the eraser's lease, like every retirement page.
+      if (!this.#leaseHeld(lease) || (expectRev !== undefined && this.obligationRev(prefix) !== expectRev)) {
+        out = { released: 0, done: false, ok: false, rev: this.obligationRev(prefix) };
+        return;
+      }
+      // SQL-bounded SCAN (LIMIT on the rows read, not the releases), after a durable cursor bound to the proof workset.
+      const ck = `release_cursor:${scope}`;
+      const saved = JSON.parse(this.meta(ck) ?? "null") as { proof: string; pos: [string, string] } | null;
+      const cur = saved && saved.proof === proofId ? saved.pos : null;
+      const where = exactKey !== undefined ? "key = ?" : SyncState.#under;
+      const after = cur ? "AND (key > ? OR (key = ? AND version_id > ?))" : "";
+      const rows = this.db.prepare(`SELECT key, version_id FROM erase_reservations WHERE ${where} AND scope = ? AND seq <= ? ${after} ORDER BY key, version_id LIMIT ?`).all(
+        ...(exactKey !== undefined ? [exactKey] : SyncState.#u(prefix)), scope, maxSeq, ...(cur ? [cur[0], cur[0], cur[1]] : []), limit) as { key: string; version_id: string }[];
+      const del = this.db.prepare("DELETE FROM erase_reservations WHERE key = ? AND version_id = ?");
+      let released = 0;
+      for (const r of rows) {
+        if (!present(r.key, r.version_id)) continue;
+        del.run(r.key, r.version_id);
+        released += 1;
+      }
+      const done = rows.length < limit;
+      if (done) this.db.prepare("DELETE FROM meta WHERE k = ?").run(ck);
+      else this.setMeta(ck, JSON.stringify({ proof: proofId, pos: [rows[rows.length - 1]!.key, rows[rows.length - 1]!.version_id] }));
+      out = { released, done, ok: true, rev: this.obligationRev(prefix) };
+    });
+    return out;
+  }
+  /** Rows the most recent release page read (tests: the scan is bounded). */
+  releaseCursor(scope: string): [string, string] | null {
+    return (JSON.parse(this.meta(`release_cursor:${scope}`) ?? "null") as { pos: [string, string] } | null)?.pos ?? null;
+  }
+  /** Unbounded convenience over the paged retirement (tests): every page, in order. */
+  retireReservations(prefix: string, absent: (key: string, versionId: string) => boolean, scope?: string) {
+    const scopes = scope !== undefined ? [scope] : (this.db.prepare(`SELECT DISTINCT scope FROM erase_reservations WHERE ${SyncState.#under}`).all(...SyncState.#u(prefix)) as { scope: string }[]).map((r) => r.scope);
+    for (const sc of scopes) while (!this.retireReservationsPage(prefix, sc, undefined, absent, 1000, Number.MAX_SAFE_INTEGER, "convenience").done);
+  }
+  /** The reservations' high-water seq under a prefix (the generation a completed proof covers). */
+  reservationHighWater(prefix: string): number {
+    return Number((this.db.prepare(`SELECT coalesce(max(seq), 0) AS n FROM erase_reservations WHERE ${SyncState.#under}`).get(...SyncState.#u(prefix)) as { n: number }).n);
+  }
+  /** The durable retirement cursor of a scope (tests / audits). */
+  retireCursor(scope: string): [string, string] | null {
+    return (JSON.parse(this.meta(`retire_cursor:${scope}`) ?? "null") as { pos: [string, string] } | null)?.pos ?? null;
+  }
+  /** EXPLAIN QUERY PLAN of the exact-key retirement scan (tests: an index on key, no prefix range). */
+  retirePlan(key: string, scope: string): string {
+    return (this.db.prepare("EXPLAIN QUERY PLAN SELECT key, version_id FROM erase_reservations WHERE key = ? AND scope = ? ORDER BY key, version_id LIMIT 1000").all(key, scope) as { detail: string }[]).map((r) => r.detail).join(" | ");
+  }
+  /** Versions in the protected erased history at one key (tests / audits). */
+  erasedAt(key: string): string[] {
+    return (this.db.prepare("SELECT version_id FROM erased_versions WHERE key = ? ORDER BY version_id").all(key) as { version_id: string }[]).map((r) => r.version_id);
+  }
+  /** The reservations at one key (tests / audits). */
+  reservationsAt(key: string): string[] {
+    return (this.db.prepare("SELECT version_id FROM erase_reservations WHERE key = ? ORDER BY version_id").all(key) as { version_id: string }[]).map((r) => r.version_id);
+  }
+  /** The protected terminal history of one invocation (tests / audits). */
+  writeTerminal(id: string): { outcome: string; versionId: string | null } | undefined {
+    return (this.db.prepare("SELECT outcome, version_id AS versionId FROM write_terminal WHERE id = ?").get(id) as { outcome: string; versionId: string | null } | undefined) ?? undefined;
   }
 
   erasureFailed(key: string, code: string, at = Date.now()) {
-    this.db
+    this.#offGuarded(() => this.db
       .prepare("UPDATE erasures SET attempts = attempts + 1, error = ?, next_try = ? + min(3600000, 60000 * (1 << min(attempts, 6))) WHERE key = ?")
-      .run(code, at, key);
+      .run(code, at, key));
   }
 
   erasureBacklog(now = Date.now()): { queued: number; oldestAgeH: number | null; failing: number } {

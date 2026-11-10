@@ -3,10 +3,17 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import * as Cloudflare from "@alchemy.run/cloudflare";
 import {
+  ADMISSION_DLQ,
+  ADMISSION_QUEUE,
+  ADMISSION_RESOURCES,
   COMPATIBILITY_DATE,
   FANOUT_DLQ,
+  INBOX_AUTHORITY_MODE,
+  INBOX_CANDIDATE_KEY_ROOT,
   SESSION_INGEST_RESOURCES,
   SESSION_INGEST_WORKER,
+  admissionConsumerProps,
+  assertAdmissionConsumer,
   assertFanoutConsumer,
   assertNoSecretLiterals,
   assertPrivateWorker,
@@ -15,6 +22,8 @@ import {
   externalQueue,
   fanoutConsumerProps,
   secretsStoreSecret,
+  resolvedAsyncAdmission,
+  sessionIngestResources,
   sessionIngestVars,
   sessionIngestWorkerProps,
   type SessionIngestInputs,
@@ -27,6 +36,14 @@ const refuse = (why: string): never => {
 const hex = (c: string) => c.repeat(32);
 const KEY_ARN = "arn:aws:kms:us-east-1:941433935742:key/12345678-90ab-cdef-1234-567890abcdef";
 const inputs: SessionIngestInputs = { accountId: hex("a"), hyperdriveId: hex("b"), secretsStoreId: hex("c"), kmsKeyArn: KEY_ARN };
+const authority = {
+  mode: INBOX_AUTHORITY_MODE,
+  keyRoot: "96bulls/inbox-authority/v1",
+  expectedGeneration: "1".repeat(64),
+  expectedControlEpoch: "2".repeat(64),
+  expectedAuthEpoch: "3".repeat(64),
+  expectedSourceIdentitySha256: "4".repeat(64),
+} as const;
 const bindings = { HYPERDRIVE: Cloudflare.Hyperdrive.lookup("HYPERDRIVE", { hyperdriveId: hex("b") }), INGEST_FANOUT: { Type: "Cloudflare.Queues.Queue", queueName: "96bulls-session-ingest-fanout" } };
 const props = (p: SessionIngestInputs = inputs) => sessionIngestWorkerProps(p, bindings) as unknown as Record<string, unknown> & { env: Record<string, unknown> };
 const src = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8");
@@ -93,6 +110,20 @@ describe("session ingest worker: bindings and no credential in state", () => {
     });
   });
 
+  it("selects the inbox authority only with the exact all-or-nothing managed vars", () => {
+    expect(sessionIngestVars({ ...inputs, authority })).toEqual({
+      ...sessionIngestVars(inputs),
+      INGEST_AUTHORITY_MODE: "authority-v1",
+      INGEST_AUTHORITY_KEY_ROOT: "96bulls/inbox-authority/v1",
+      INGEST_AUTHORITY_EXPECT_GENERATION: "1".repeat(64),
+      INGEST_AUTHORITY_EXPECT_CONTROL_EPOCH: "2".repeat(64),
+      INGEST_AUTHORITY_EXPECT_AUTH_EPOCH: "3".repeat(64),
+      INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY: "4".repeat(64),
+    });
+    expect(Object.keys(sessionIngestVars(inputs)).filter((key) => key.startsWith("INGEST_AUTHORITY_"))).toEqual([]);
+    expect(() => assertNoSecretLiterals(props({ ...inputs, authority }).env, refuse)).not.toThrow();
+  });
+
   it("S3 credentials are Secrets Store bindings, never values", () => {
     const env = props().env;
     expect(env.S3_ACCESS_KEY_ID).toEqual(secretsStoreSecret(hex("c"), "96bulls-session-ingest-s3-access-key-id"));
@@ -110,6 +141,21 @@ describe("session ingest worker: bindings and no credential in state", () => {
       expect(() => assertNoSecretLiterals({ ...env, ...bad }, refuse)).toThrow();
     const { S3_ACCESS_KEY_ID: _, ...missing } = env;
     expect(() => assertNoSecretLiterals(missing, refuse)).toThrow(/missing/);
+    const selected = props({ ...inputs, authority }).env;
+    for (const key of [
+      "INGEST_AUTHORITY_MODE",
+      "INGEST_AUTHORITY_KEY_ROOT",
+      "INGEST_AUTHORITY_EXPECT_GENERATION",
+      "INGEST_AUTHORITY_EXPECT_CONTROL_EPOCH",
+      "INGEST_AUTHORITY_EXPECT_AUTH_EPOCH",
+      "INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY",
+    ]) {
+      const partial = { ...selected };
+      delete partial[key];
+      expect(() => assertNoSecretLiterals(partial, refuse)).toThrow(/missing/);
+    }
+    expect(() => assertNoSecretLiterals({ ...env, INGEST_AUTHORITY_STALE_BINDING: "x" }, refuse)).toThrow(/not a known/);
+    expect(() => assertNoSecretLiterals({ ...env, INGEST_AUTHORITY_MODE: "off" }, refuse)).toThrow(/missing/);
   });
 
   it("Hyperdrive is a lookup by id; the replica queue is bound only in queue mode, producer only", () => {
@@ -150,6 +196,7 @@ describe("session ingest worker: inputs", () => {
   it("accepts the documented shapes and refuses everything else", () => {
     assertSessionIngestInputs(inputs, refuse);
     assertSessionIngestInputs({ ...inputs, maxPerUser: 2, maxPerOrg: 8, inlineMaxSessions: 48, replicaMode: "queue", neonReplicaQueue: "relayhistory-neon-replica" }, refuse);
+    assertSessionIngestInputs({ ...inputs, authority }, refuse);
     for (const bad of [
       null,
       [],
@@ -165,7 +212,27 @@ describe("session ingest worker: inputs", () => {
       { ...inputs, replicaMode: "queue" },
       { ...inputs, neonReplicaQueue: "relayhistory-neon-replica" },
       { ...inputs, replicaMode: "queue", neonReplicaQueue: "some-other-queue" },
+      { ...inputs, authority: null },
+      { ...inputs, authority: { ...authority, extra: true } },
+      { ...inputs, authority: { ...authority, mode: "off" } },
+      { ...inputs, authority: { ...authority, expectedAuthEpoch: undefined } },
+      { ...inputs, authority: { ...authority, expectedGeneration: "A".repeat(64) } },
+      { ...inputs, authority: { ...authority, keyRoot: "other/inbox-authority/v1" } },
+      { ...inputs, authority: { ...authority, keyRoot: `${INBOX_CANDIDATE_KEY_ROOT}` } },
+      { ...inputs, authority: { ...authority, keyRoot: "96bulls/upload-inbox" } },
+      { ...inputs, authority: { ...authority, keyRoot: "96bulls//inbox-authority" } },
+      { ...inputs, authority: { ...authority, keyRoot: "96bulls/inbox-authority/../escape" } },
     ])
+      expect(() => assertSessionIngestInputs(bad, refuse)).toThrow();
+    expect(() => sessionIngestVars({ ...inputs, authority: { ...authority, expectedControlEpoch: "bad" } as never })).toThrow(/expectedControlEpoch/);
+  });
+
+  it("C3 privacyAuthority: supabase only with frozen-supabase custody in buffered mode, rendered as INGEST_PRIVACY_AUTHORITY", () => {
+    const frozen = { ...inputs, acceptanceMode: "buffered" as const, expectedGeneration: "f".repeat(64), inlineMaxSessions: 0, custodySource: "frozen-supabase" as const };
+    assertSessionIngestInputs({ ...frozen, privacyAuthority: "supabase" }, refuse);
+    expect(sessionIngestVars({ ...frozen, privacyAuthority: "supabase" })).toMatchObject({ INGEST_CUSTODY_SOURCE: "frozen-supabase", INGEST_PRIVACY_AUTHORITY: "supabase" });
+    expect(sessionIngestVars(frozen)).not.toHaveProperty("INGEST_PRIVACY_AUTHORITY");
+    for (const bad of [{ ...frozen, privacyAuthority: "neon" }, { ...frozen, custodySource: "shadow", privacyAuthority: "supabase" }, { ...inputs, privacyAuthority: "supabase" }])
       expect(() => assertSessionIngestInputs(bad, refuse)).toThrow();
   });
 
@@ -209,9 +276,298 @@ describe("session ingest worker: deploy plan contract", () => {
     expect(() => check(plan({ "session-ingest": "update" }).replace("Plan: 1 to update", "Plan: 2 to update"))).toThrow(/summary/);
   });
 
+  it("async admission: the three admission resources all-or-none, only when declared", () => {
+    const all = sessionIngestResources(true);
+    expect(all).toEqual([...SESSION_INGEST_RESOURCES, ...ADMISSION_RESOURCES]);
+    const allCreates = Object.fromEntries(all.map((r) => [r, "create"]));
+    const checkWith = (compact: string, mode: "on" | "drain" = "drain") => assertSessionIngestPlanContract(compact, compact.split("\n").map((l) => (l.startsWith("[") ? `  ${l}` : l)).join("\n"), mode);
+    expect(checkWith(plan(allCreates, all))).toBe("session ingest rollout");
+    // An existing stage adding admission: three creates; the Worker binding update is its own phase.
+    expect(checkWith(plan(Object.fromEntries(ADMISSION_RESOURCES.map((r) => [r, "create"])), all))).toBe("session ingest rollout");
+    expect(checkWith(plan({ "session-ingest": "update" }, all))).toBe("session ingest update");
+    expect(() => check(plan(allCreates, all))).toThrow(/unexpected resource session-ingest-admission/);
+    expect(() => checkWith(plan(allCreates, all.filter((r) => r !== "session-ingest-admission-consumer")))).toThrow(/missing resource session-ingest-admission-consumer/);
+    expect(() => checkWith(plan(creates))).toThrow(/missing resource session-ingest-admission/);
+    expect(() => checkWith(plan({ "session-ingest-admission": "delete" }, all))).toThrow(/forbidden action/);
+    // Adding admission to a deployed stage: the three creates + the Worker's in-place binding update.
+    const addition = { ...Object.fromEntries(ADMISSION_RESOURCES.map((r) => [r, "create"])), "session-ingest": "update" };
+    expect(checkWith(plan(addition, all))).toBe("async admission addition");
+    // Retention convergence on existing admission queues is an in-place update.
+    expect(checkWith(plan({ "session-ingest-admission": "update", "session-ingest-admission-dlq": "update" }, all))).toBe("session ingest update");
+    expect(() => checkWith(plan({ "session-ingest-admission": "update", "session-ingest-admission-consumer": "create" }, all))).toThrow(/neither a rollout/);
+    expect(() => check(plan({ "session-ingest": "update", "session-ingest-fanout-consumer": "create" }))).toThrow(/neither a rollout/);
+    for (const extra of [{ "session-ingest-fanout": "update" }, { "session-ingest-fanout-consumer": "update" }, { "session-ingest-admission-consumer": "update" }])
+      expect(() => checkWith(plan({ ...addition, ...extra }, all))).toThrow(/neither a rollout/);
+    expect(() => checkWith(plan({ "session-ingest-admission": "create", "session-ingest": "update" }, all))).toThrow(/neither a rollout/);
+  });
+
+  it("the admission resources follow the RESOLVED mode: on/drain need all three, off needs none", () => {
+    const all = sessionIngestResources(true);
+    const detailed = (compact: string) => compact.split("\n").map((l) => (l.startsWith("[") ? `  ${l}` : l)).join("\n");
+    const as = (compact: string, mode: "on" | "drain" | "off") => assertSessionIngestPlanContract(compact, detailed(compact), mode);
+    const allCreates = Object.fromEntries(all.map((r) => [r, "create"]));
+    for (const mode of ["on", "drain"] as const) {
+      expect(as(plan(allCreates, all), mode)).toBe("session ingest rollout");
+      expect(() => as(plan(creates), mode)).toThrow(/missing resource session-ingest-admission/);
+    }
+    // "off" (and the default) is exactly the four-resource contract.
+    expect(as(plan(creates), "off")).toBe("session ingest rollout");
+    expect(assertSessionIngestPlanContract(plan(creates), detailed(plan(creates)))).toBe("session ingest rollout");
+    expect(() => as(plan(allCreates, all), "off")).toThrow(/unexpected resource session-ingest-admission/);
+    expect(() => assertSessionIngestPlanContract(plan(creates), detailed(plan(creates)), "yes" as never)).toThrow(/unknown async admission mode/);
+    expect(() => assertSessionIngestPlanContract(plan(creates), detailed(plan(creates)), true as never)).toThrow(/unknown async admission mode/);
+  });
+
+  it("an already-deployed Worker gains admission with drain only; on is refused there, allowed on a fresh rollout", () => {
+    const all = sessionIngestResources(true);
+    const detailed = (compact: string) => compact.split("\n").map((l) => (l.startsWith("[") ? `  ${l}` : l)).join("\n");
+    const as = (compact: string, mode: "on" | "drain") => assertSessionIngestPlanContract(compact, detailed(compact), mode);
+    const addition = { ...Object.fromEntries(ADMISSION_RESOURCES.map((r) => [r, "create"])), "session-ingest": "update" };
+    // Addition phase: drain ok, on refused with the reason and the next step.
+    expect(as(plan(addition, all), "drain")).toBe("async admission addition");
+    expect(() => as(plan(addition, all), "on")).toThrow(/plan contract refused: async admission addition to a deployed Worker must be captured with asyncAdmission "drain" first; let drain reach 100% of Worker versions.*Nothing was changed/);
+    // Fresh rollout (nothing deployed): on directly.
+    expect(as(plan(Object.fromEntries(all.map((r) => [r, "create"])), all), "on")).toBe("session ingest rollout");
+    // After drain reached 100%: the var-only flip to on is an in-place update.
+    expect(as(plan({ "session-ingest": "update" }, all), "on")).toBe("session ingest update");
+    expect(as(plan({}, all), "on")).toBe("post-apply");
+  });
+
   it("refuses a detailed plan that shows a credential (a secret value in state)", () => {
     const ok = plan({ "session-ingest": "update" });
     for (const leak of ['  "type": "secret_text"', "  AKIAABCDEFGHIJKLMNOP", '  "x": "postgresql://bulls96_session_ingest:pw@pooler/postgres"', "  -----BEGIN RSA PRIVATE KEY-----"])
       expect(() => check(ok, `${ok}${leak}\n`)).toThrow(/credential/);
+  });
+});
+
+describe("session ingest: S3-first async admission (stack default on for buffered, off otherwise)", () => {
+  const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0 };
+  const off: SessionIngestInputs = { ...buffered, asyncAdmission: "off" };
+  const admissionQueue = { Type: "Cloudflare.Queues.Queue", queueName: ADMISSION_QUEUE };
+  const withQueue = { ...bindings, INGEST_ADMISSION: admissionQueue };
+  /** The props as rendered before async admission existed: the same render minus its two admission keys. */
+  const withoutAdmissionKeys = (p: { env: Record<string, unknown> }) => {
+    const { INGEST_ADMISSION: _q, INGEST_ASYNC_ADMISSION: _v, ...env } = p.env;
+    return { ...p, env };
+  };
+
+  it("resolves: explicit wins; omitted is on for buffered and off for canonical", () => {
+    expect(resolvedAsyncAdmission(buffered)).toBe("on");
+    for (const mode of ["on", "drain", "off"] as const) expect(resolvedAsyncAdmission({ ...buffered, asyncAdmission: mode })).toBe(mode);
+    expect(resolvedAsyncAdmission(inputs)).toBe("off");
+    expect(resolvedAsyncAdmission({ ...inputs, acceptanceMode: "canonical" })).toBe("off");
+    expect(resolvedAsyncAdmission({ ...inputs, asyncAdmission: "off" })).toBe("off");
+    expect(() => resolvedAsyncAdmission({ ...buffered, asyncAdmission: "yes" })).toThrow(/asyncAdmission/);
+  });
+
+  it("omitted on a buffered stage = on: the var, the INGEST_ADMISSION binding and the three resources", () => {
+    expect(() => assertSessionIngestInputs(buffered, refuse)).not.toThrow();
+    expect(sessionIngestVars(buffered).INGEST_ASYNC_ADMISSION).toBe("on");
+    const p = sessionIngestWorkerProps(buffered, withQueue) as unknown as { env: Record<string, unknown> };
+    expect(p.env.INGEST_ASYNC_ADMISSION).toBe("on");
+    expect(p.env.INGEST_ADMISSION).toBe(admissionQueue);
+    expect(JSON.stringify(p)).toBe(JSON.stringify(sessionIngestWorkerProps({ ...buffered, asyncAdmission: "on" }, withQueue)));
+    // The binding is required: an omitted-on buffered stage without the admission queue refuses.
+    expect(() => sessionIngestWorkerProps(buffered, bindings)).toThrow(/INGEST_ADMISSION/);
+    expect(sessionIngestResources(resolvedAsyncAdmission(buffered) !== "off")).toEqual([...SESSION_INGEST_RESOURCES, ...ADMISSION_RESOURCES]);
+  });
+
+  it("explicit off on a buffered stage: vars, props and the resource list are byte-identical to before", () => {
+    expect(() => assertSessionIngestInputs(off, refuse)).not.toThrow();
+    expect(Object.keys(sessionIngestVars(off))).not.toContain("INGEST_ASYNC_ADMISSION");
+    expect(Object.keys(props(off).env)).not.toContain("INGEST_ADMISSION");
+    // Byte-identical: the "off" render equals the "on" render with exactly its two admission keys removed
+    // (the pre-default omitted render), key order included.
+    const on = sessionIngestWorkerProps({ ...buffered, asyncAdmission: "on" }, withQueue) as unknown as { env: Record<string, unknown> };
+    expect(JSON.stringify(props(off))).toBe(JSON.stringify(withoutAdmissionKeys(on)));
+    const { INGEST_ASYNC_ADMISSION: _v, ...onVars } = sessionIngestVars({ ...buffered, asyncAdmission: "on" });
+    expect(JSON.stringify(sessionIngestVars(off))).toBe(JSON.stringify(onVars));
+    expect(() => sessionIngestWorkerProps(off, withQueue)).toThrow(/INGEST_ADMISSION/);
+    expect(sessionIngestResources(resolvedAsyncAdmission(off) !== "off")).toBe(SESSION_INGEST_RESOURCES);
+    expect(sessionIngestResources()).toBe(SESSION_INGEST_RESOURCES);
+    expect(sessionIngestResources(false)).toBe(SESSION_INGEST_RESOURCES);
+  });
+
+  it("canonical stage, omitted or off: nothing (no var, no binding, four resources), byte-identical", () => {
+    for (const p of [inputs, { ...inputs, acceptanceMode: "canonical" as const }, { ...inputs, asyncAdmission: "off" as const }]) {
+      expect(() => assertSessionIngestInputs(p, refuse)).not.toThrow();
+      expect(Object.keys(sessionIngestVars(p))).not.toContain("INGEST_ASYNC_ADMISSION");
+      expect(Object.keys(props(p).env)).not.toContain("INGEST_ADMISSION");
+      expect(sessionIngestResources(resolvedAsyncAdmission(p) !== "off")).toBe(SESSION_INGEST_RESOURCES);
+      expect(() => sessionIngestWorkerProps(p, withQueue)).toThrow(/INGEST_ADMISSION/);
+    }
+    expect(JSON.stringify(props({ ...inputs, asyncAdmission: "off" }))).toBe(JSON.stringify(props(inputs)));
+  });
+
+  it("is refused outside buffered acceptance (anything but off) and for any value but on/drain/off", () => {
+    for (const bad of [
+      { ...inputs, asyncAdmission: "on" },
+      { ...inputs, asyncAdmission: "drain" },
+      { ...inputs, acceptanceMode: "canonical", asyncAdmission: "on" },
+      { ...buffered, asyncAdmission: "yes" },
+      { ...buffered, asyncAdmission: "OFF" },
+      { ...buffered, asyncAdmission: true },
+      { ...buffered, asyncAdmission: null },
+    ])
+      expect(() => assertSessionIngestInputs(bad, refuse)).toThrow(
+        'sessionIngest.asyncAdmission must be "on", "drain" or "off" in buffered mode (omitted = "on"), and omitted or "off" outside buffered mode',
+      );
+    for (const mode of ["on", "drain", "off"] as const) expect(() => assertSessionIngestInputs({ ...buffered, asyncAdmission: mode }, refuse)).not.toThrow();
+  });
+
+  it("on/drain: the var and the INGEST_ADMISSION binding, and the binding only together with the input", () => {
+    for (const mode of ["on", "drain"] as const) {
+      const p = sessionIngestWorkerProps({ ...buffered, asyncAdmission: mode }, { ...bindings, INGEST_ADMISSION: admissionQueue }) as unknown as { env: Record<string, unknown> };
+      expect(p.env.INGEST_ASYNC_ADMISSION).toBe(mode);
+      expect(p.env.INGEST_ADMISSION).toBe(admissionQueue);
+      expect(p.env.INGEST_FANOUT).toBe(bindings.INGEST_FANOUT);
+      expect(() => assertNoSecretLiterals(p.env, refuse)).not.toThrow();
+    }
+    expect(() => sessionIngestWorkerProps({ ...buffered, asyncAdmission: "on" }, bindings)).toThrow(/INGEST_ADMISSION/);
+    expect(() => sessionIngestWorkerProps(off, { ...bindings, INGEST_ADMISSION: admissionQueue })).toThrow(/INGEST_ADMISSION/);
+  });
+
+  it("the consumer is this Worker, batch 1, 20 retries, concurrency 4, its own DLQ", () => {
+    const c = admissionConsumerProps("qid");
+    expect(c).toEqual({ queueId: "qid", scriptName: SESSION_INGEST_WORKER, deadLetterQueue: ADMISSION_DLQ, settings: { batchSize: 1, maxRetries: 20, maxConcurrency: 4 } });
+    expect(() => assertAdmissionConsumer(c, refuse)).not.toThrow();
+    expect(() => assertAdmissionConsumer({ ...c, deadLetterQueue: FANOUT_DLQ }, refuse)).toThrow(/dead-letter/);
+    expect(() => assertAdmissionConsumer({ ...c, scriptName: "other" }, refuse)).toThrow(/ingest Worker/);
+    expect(() => assertAdmissionConsumer({ ...c, settings: { ...c.settings, maxConcurrency: 64 } }, refuse)).toThrow(/settings/);
+    expect(() => assertAdmissionConsumer({ ...c, settings: { ...c.settings, maxWaitTimeMs: 1 } as never }, refuse)).toThrow(/settings/);
+  });
+
+  it("the stage declares the admission queues with no pause prop, the fanout queues unchanged", () => {
+    const s = src("../session-ingest.ts");
+    expect(s).toContain('Cloudflare.Queues.Queue("session-ingest-admission-dlq", { name: ADMISSION_DLQ } as never)');
+    expect(s).toContain('Cloudflare.Queues.Queue("session-ingest-admission", { name: ADMISSION_QUEUE } as never)');
+    expect(s).toContain('Cloudflare.Queues.Queue("session-ingest-fanout", { name: FANOUT_QUEUE, ...(p.acceptanceMode === "buffered" ? { deliveryPaused: true } : {}) } as never)');
+    expect(s).toContain("assertAdmissionConsumer(ac, refuse)");
+    expect([ADMISSION_QUEUE, ADMISSION_DLQ]).toEqual(["96bulls-session-ingest-admission", "96bulls-session-ingest-admission-dlq"]);
+  });
+});
+
+describe("session ingest: INGEST_SYNC_ADMISSION_FROZEN_RECEIPT (default off)", () => {
+  // Explicit asyncAdmission "off" (a buffered stage now defaults to "on"): this block isolates the frozen-receipt var.
+  const frozen: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, custodySource: "frozen-supabase", asyncAdmission: "off" };
+  const admissionQueue = { Type: "Cloudflare.Queues.Queue", queueName: ADMISSION_QUEUE };
+
+  it("absent: no var, and vars and props are byte-identical to a stack without the input", () => {
+    for (const p of [inputs, frozen, { ...frozen, asyncAdmission: "on" as const }]) {
+      const b = resolvedAsyncAdmission(p) !== "off" ? { ...bindings, INGEST_ADMISSION: admissionQueue } : bindings;
+      expect(Object.keys(sessionIngestVars(p))).not.toContain("INGEST_SYNC_ADMISSION_FROZEN_RECEIPT");
+      expect(JSON.stringify(sessionIngestWorkerProps(p, b))).toBe(JSON.stringify(sessionIngestWorkerProps({ ...p, syncAdmissionFrozenReceipt: undefined }, b)));
+    }
+    expect(JSON.stringify(sessionIngestVars(frozen))).toBe(JSON.stringify(sessionIngestVars({ ...frozen })));
+  });
+
+  it("on: exactly one more var, no new binding or resource", () => {
+    const on = { ...frozen, syncAdmissionFrozenReceipt: "on" as const };
+    expect(() => assertSessionIngestInputs(on, refuse)).not.toThrow();
+    expect(() => assertSessionIngestInputs({ ...on, asyncAdmission: "drain" }, refuse)).not.toThrow();
+    expect(sessionIngestVars(on)).toEqual({ ...sessionIngestVars(frozen), INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: "on" });
+    const p = props(on);
+    expect(p.env.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT).toBe("on");
+    expect(Object.keys(p.env).sort()).toEqual([...Object.keys(props(frozen).env), "INGEST_SYNC_ADMISSION_FROZEN_RECEIPT"].sort());
+    expect(p.env.INGEST_ADMISSION).toBeUndefined();
+    expect(() => assertNoSecretLiterals(p.env, refuse)).not.toThrow();
+    expect(() => assertPrivateWorker(p, refuse)).not.toThrow();
+    // Together with async admission: both vars, and only async admission's binding.
+    const both = sessionIngestWorkerProps({ ...on, asyncAdmission: "on" }, { ...bindings, INGEST_ADMISSION: admissionQueue }) as unknown as { env: Record<string, unknown> };
+    expect(both.env.INGEST_ASYNC_ADMISSION).toBe("on");
+    expect(both.env.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT).toBe("on");
+    expect(sessionIngestResources()).toBe(SESSION_INGEST_RESOURCES);
+    const env = { CLOUDFLARE_ACCOUNT_ID: hex("a") };
+    expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: on }, env)).not.toThrow();
+  });
+
+  it("is refused for any value but on, and outside buffered acceptance with frozen-supabase custody", () => {
+    const { custodySource: _c, ...bufferedNoCustody } = frozen;
+    for (const bad of [
+      { ...frozen, syncAdmissionFrozenReceipt: "yes" },
+      { ...frozen, syncAdmissionFrozenReceipt: "off" },
+      { ...frozen, syncAdmissionFrozenReceipt: true },
+      { ...frozen, syncAdmissionFrozenReceipt: "ON" },
+      { ...frozen, syncAdmissionFrozenReceipt: null },
+      { ...inputs, syncAdmissionFrozenReceipt: "on" },
+      { ...inputs, acceptanceMode: "canonical", syncAdmissionFrozenReceipt: "on" },
+      { ...bufferedNoCustody, syncAdmissionFrozenReceipt: "on" },
+      { ...frozen, custodySource: "shadow", syncAdmissionFrozenReceipt: "on" },
+    ])
+      expect(() => assertSessionIngestInputs(bad, refuse)).toThrow(
+        'sessionIngest.syncAdmissionFrozenReceipt must be "on", in buffered mode with custodySource frozen-supabase only (omit for off)',
+      );
+    const env = { CLOUDFLARE_ACCOUNT_ID: hex("a") };
+    expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: { ...inputs, syncAdmissionFrozenReceipt: "on" } }, env)).toThrow(/syncAdmissionFrozenReceipt.*Nothing was changed/);
+  });
+
+  it("a var-only change plans as an in-place update of the Worker", () => {
+    const lines = SESSION_INGEST_RESOURCES.map((r) => `  [${r}] ${r === "session-ingest" ? "update" : "noop"}`).join("\n");
+    const text = `Plan: 1 to update\n${lines}\n`;
+    expect(assertSessionIngestPlanContract(text, text)).toBe("session ingest update");
+  });
+});
+
+describe("session ingest: INGEST_CLAIM_LOCK_BUSY (default off)", () => {
+  // Explicit asyncAdmission "off" on the buffered shape: this block isolates the claim lock-busy var.
+  const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };
+  const canonical: SessionIngestInputs = { ...inputs, acceptanceMode: "canonical" };
+  const admissionQueue = { Type: "Cloudflare.Queues.Queue", queueName: ADMISSION_QUEUE };
+
+  it("omitted: no INGEST_CLAIM_LOCK_BUSY key at all, vars and props byte-identical to a stack without the input", () => {
+    for (const p of [inputs, canonical, buffered, { ...buffered, asyncAdmission: "on" as const }]) {
+      const b = resolvedAsyncAdmission(p) !== "off" ? { ...bindings, INGEST_ADMISSION: admissionQueue } : bindings;
+      expect(Object.hasOwn(sessionIngestVars(p), "INGEST_CLAIM_LOCK_BUSY")).toBe(false);
+      const env = (sessionIngestWorkerProps(p, b) as unknown as { env: Record<string, unknown> }).env;
+      expect(Object.hasOwn(env, "INGEST_CLAIM_LOCK_BUSY")).toBe(false);
+      expect(JSON.stringify(sessionIngestWorkerProps(p, b))).toBe(JSON.stringify(sessionIngestWorkerProps({ ...p, claimLockBusy: undefined }, b)));
+    }
+  });
+
+  it('"on": exactly one more var in canonical and buffered acceptance, no new binding or resource', () => {
+    const env = { CLOUDFLARE_ACCOUNT_ID: hex("a") };
+    for (const base of [inputs, canonical, buffered]) {
+      const on = { ...base, claimLockBusy: "on" as const };
+      expect(() => assertSessionIngestInputs(on, refuse)).not.toThrow();
+      expect(sessionIngestVars(on)).toEqual({ ...sessionIngestVars(base), INGEST_CLAIM_LOCK_BUSY: "on" });
+      const p = props(on);
+      expect(p.env.INGEST_CLAIM_LOCK_BUSY).toBe("on");
+      expect(Object.keys(p.env).sort()).toEqual([...Object.keys(props(base).env), "INGEST_CLAIM_LOCK_BUSY"].sort());
+      expect(p.env.INGEST_ADMISSION).toBeUndefined();
+      expect(() => assertNoSecretLiterals(p.env, refuse)).not.toThrow();
+      expect(() => assertPrivateWorker(p, refuse)).not.toThrow();
+      expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: on }, env)).not.toThrow();
+    }
+    // Together with async admission on and the frozen receipt: every var, only async admission's binding.
+    const all = { ...buffered, custodySource: "frozen-supabase" as const, syncAdmissionFrozenReceipt: "on" as const, asyncAdmission: "on" as const, claimLockBusy: "on" as const };
+    expect(() => assertSessionIngestInputs(all, refuse)).not.toThrow();
+    const both = sessionIngestWorkerProps(all, { ...bindings, INGEST_ADMISSION: admissionQueue }) as unknown as { env: Record<string, unknown> };
+    expect(both.env.INGEST_ASYNC_ADMISSION).toBe("on");
+    expect(both.env.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT).toBe("on");
+    expect(both.env.INGEST_CLAIM_LOCK_BUSY).toBe("on");
+    expect(sessionIngestResources()).toBe(SESSION_INGEST_RESOURCES);
+  });
+
+  it('is refused for any value but "on"', () => {
+    for (const base of [inputs, canonical, buffered])
+      for (const value of ["off", "ON", "On", true, 1, "", null, "yes"])
+        expect(() => assertSessionIngestInputs({ ...base, claimLockBusy: value }, refuse)).toThrow('sessionIngest.claimLockBusy must be "on" (omit for off)');
+    const env = { CLOUDFLARE_ACCOUNT_ID: hex("a") };
+    expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: { ...inputs, claimLockBusy: "off" } }, env)).toThrow(/claimLockBusy.*Nothing was changed/);
+  });
+
+  it("an unknown key next to it is still refused", () => {
+    expect(() => assertSessionIngestInputs({ ...inputs, claimLockBusy: "on", claimLockBusyRetryAfter: 5 }, refuse)).toThrow("sessionIngest.claimLockBusyRetryAfter is not a known setting");
+    expect(() => assertSessionIngestInputs({ ...inputs, INGEST_CLAIM_LOCK_BUSY: "on" }, refuse)).toThrow("sessionIngest.INGEST_CLAIM_LOCK_BUSY is not a known setting");
+  });
+
+  it("the var-only change (Worker updated in place, nothing else) plans as a session ingest update", () => {
+    // Same shape as the frozen-receipt var-only test above, for the canonical and the admission-on resource lists.
+    for (const withAdmission of [false, true]) {
+      const resources = sessionIngestResources(withAdmission);
+      const lines = resources.map((r) => `  [${r}] ${r === "session-ingest" ? "update" : "noop"}`).join("\n");
+      const text = `Plan: 1 to update\n${lines}\n`;
+      expect(assertSessionIngestPlanContract(text, text, withAdmission ? "on" : "off")).toBe("session ingest update");
+    }
   });
 });

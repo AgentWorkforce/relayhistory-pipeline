@@ -17,14 +17,12 @@
   },
   "scripts": {
     "build": "bun run --filter @relayhistory/object-store build",
-    "typecheck": "tsc --noEmit && bun run --filter @96bulls/pipeline typecheck && bun run --filter @relayhistory/object-store typecheck && bun run --filter @96bulls/session-read-worker typecheck && bun run --filter @96bulls/coordination-eval typecheck",
-    "test": "bun test && bun test ./stacks && bun run --filter @96bulls/pipeline test && bun run --filter @relayhistory/object-store test && bun run --filter @96bulls/coordination-eval test",
+    "typecheck": "tsc --noEmit && bun run --filter @96bulls/pipeline typecheck && bun run --filter @relayhistory/object-store typecheck && bun run --filter @96bulls/session-read-worker typecheck && bun run --filter @96bulls/coordination-detect typecheck",
+    "test": "bun test && bun test ./stacks && bun run --filter @96bulls/pipeline test && bun run --filter @relayhistory/object-store test && bun run --filter @96bulls/coordination-detect test",
     "up:local": "bun run bin/96bulls up local",
     "down:local": "bun run bin/96bulls down local",
     "smoke:local": "bun run bin/96bulls smoke local",
     "audit:search-indexes": "bun run src/hoopdb/search-index-audit.ts",
-    "coordination:report": "bun run packages/coordination-eval/src/cli.ts",
-    "coordination:export-local": "bun run packages/coordination-eval/src/local-cli.ts",
     "benchmark:relayhistory": "bun run src/migration/relayhistory-benchmark.ts",
     "proof:aws": "bun run src/proof/aws/cli.ts",
     "proof:aws:teardown": "bun run src/proof/aws/cli.ts teardown",
@@ -37,7 +35,8 @@
     "migration:sequence-fence": "bun run src/migration/relayhistory-sequence-fence.ts",
     "migration:verify": "bun run src/migration/relayhistory-verify.ts",
     "migration:neon-s3-sync": "bun run src/migration/neon-s3-sync/main.ts",
-    "migration:neon-s3-erasure": "bun run src/migration/neon-s3-erasure/main.ts"
+    "migration:neon-s3-erasure": "bun run src/migration/neon-s3-erasure/main.ts",
+    "e2e:selfhost": "bun run e2e/selfhost/run.ts"
   },
   "dependencies": {
     "@96bulls/pipeline": "workspace:*",
@@ -46,6 +45,7 @@
     "@alchemy.run/docker": "2.0.0-beta.84",
     "@alchemy.run/gcp": "2.0.0-beta.84",
     "@alchemy.run/kubernetes": "2.0.0-beta.84",
+    "@distilled.cloud/cloudflare": "1.0.0-rc.17",
     "@effect/platform-bun": "4.0.7",
     "@effect/platform-node": "4.0.7",
     "@opentelemetry/api": "1.10.0",
@@ -57,7 +57,8 @@
     "alchemy": "2.0.0-beta.84",
     "effect": "4.0.7",
     "hono": "4.12.26",
-    "pg": "8.23.1"
+    "pg": "8.23.1",
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@electric-sql/pglite": "0.5.3",

@@ -213,8 +213,11 @@ class MachineStream {
         traceId: this.traceId,
       });
       // A chunk already stored under an older version of the same rule set is
-      // kept (identical source; versions only differ past the bound, which the
-      // older one refused); the manifest records the lowest version.
+      // kept (keys are create-only; the source is identical), and the manifest
+      // records the lowest version. Versions differ on ordinary content, not
+      // only past the bound (3 added rules that 1 and 2 lack), so a chunk kept
+      // at 1 or 2 may hold a secret the current rules catch. Re-sending the
+      // same source range does not rescrub it: the stored object is kept.
       if (sealed.scrub.ruleset !== SCRUB_RULESET || sealed.scrub.version > SCRUB_RULESET_VERSION)
         throw Object.assign(new Error("a stored chunk was sealed under another scrub rule set"), {
           code: "chunk_scrub_mismatch",
@@ -455,6 +458,12 @@ export async function exportUnit(
     onLease?: (manifestKey: string) => void;
     /** After the ownership check: record the key before anything is written under it. */
     onKey?: (manifestKey: string) => void;
+    /**
+     * BEFORE the manifest becomes visible (before its PUT, or before it is left unchanged): claim ownership of EVERY
+     * object the manifest references (new and reused chunks, and the manifest key itself) under the erasure job's
+     * reservation lock. Throws (and the manifest is not written) if any of them is reserved for erasure.
+     */
+    onPublish?: (manifestKey: string, referenced: readonly string[]) => void;
   } = {},
 ): Promise<UnitResult> {
   if (await source.fenced(unit, opts.freshFence)) return { fenced: true, manifests: [], lines: 0 };
@@ -500,6 +509,8 @@ export async function exportUnit(
     await parseManifest(text, stream.key);
     const unchanged = prior !== null && comparable(prior) === comparable(manifest);
     stream.holdLease();
+    const base0 = stream.key.slice(0, -"manifest.json".length);
+    opts.onPublish?.(stream.key, [stream.key, ...manifest.raw.chunks.map((c) => `${base0}raw/${String(c.seq).padStart(10, "0")}-${c.start_offset}-${c.sha256_8}.ndjson.zst`)]);
     if (!unchanged)
       await target.store.put(objectKey(stream.key), new TextEncoder().encode(text), {
         ...(existing ? { ifMatch: existing.version } : { ifNoneMatch: true }),

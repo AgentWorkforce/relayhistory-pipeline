@@ -13,7 +13,8 @@
  *
  * Nothing here reads request bodies or session content.
  */
-import { scrubText } from "../scrub.js";
+// Late-bound through the scrub engine seam (predicate-hook.ts explains why not index.js).
+import { predicateScrubText } from "../scrub-engine/predicate-hook.js";
 
 /**
  * Span stages (`ingest`, `deliver.put`, `fetch`) are recorded by the client and
@@ -180,7 +181,7 @@ export function isSafeIdentifier(value: unknown): value is string {
     typeof value === "string" &&
     IDENTIFIER.test(value) &&
     !hasTokenShapedRun(value) &&
-    scrubText(value) === value
+    predicateScrubText(value) === value
   );
 }
 

@@ -66,6 +66,13 @@ class S3Transport implements Transport {
   readonly #fetch: typeof fetch;
 
   constructor(config: S3Config) {
+    // Both become part of the request host (`<bucket>.s3.<region>.amazonaws.com`): anything outside
+    // these characters (`@`, `/`, `:`, `?`, `#`, whitespace...) could redirect a SigV4-signed request
+    // to another host. Refused before any credential is read or any request is made.
+    if (!/^[a-z0-9][a-z0-9.-]{0,62}$/.test(config.bucket) || config.bucket.includes(".."))
+      throw new ObjectStoreError("invalid_argument", BACKEND, "bucket must be a lowercase S3 bucket name");
+    if (config.endpoint === undefined && !/^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/.test(config.region))
+      throw new ObjectStoreError("invalid_argument", BACKEND, "region must be lowercase letters, digits and dashes");
     this.#config = config;
     this.#credentials = cachedProvider(config.credentials);
     this.#fetch = config.fetch ?? ((...a) => fetch(...a));
@@ -93,6 +100,7 @@ class S3Transport implements Transport {
     url: URL,
     headers: Headers,
     body?: Uint8Array,
+    signal?: AbortSignal,
   ): Promise<Response> {
     await signRequest({
       method,
@@ -110,6 +118,7 @@ class S3Transport implements Transport {
         method,
         headers,
         ...(body ? { body: body as Uint8Array<ArrayBuffer> } : {}),
+        ...(signal ? { signal } : {}),
       },
       this.#fetch,
     );
@@ -121,6 +130,7 @@ class S3Transport implements Transport {
     mode: PutMode,
     metadata: Metadata,
     contentType: string,
+    signal?: AbortSignal,
   ): Promise<ObjectVersion> {
     const headers = new Headers({ "content-type": contentType });
     for (const [k, v] of Object.entries(metadata))
@@ -153,8 +163,13 @@ class S3Transport implements Transport {
       }
       headers.set("if-match", mode.version.eTag);
     }
-    const res = await this.#request(key, "PUT", this.#url(key), headers, body);
-    if (res.ok) return { eTag: res.headers.get("etag") ?? undefined };
+    const res = await this.#request(key, "PUT", this.#url(key), headers, body, signal);
+    if (res.ok) {
+      // A versioned bucket names the version this put created: callers that must clean up
+      // only their own write delete by exactly this id.
+      const versionId = res.headers.get("x-amz-version-id");
+      return { eTag: res.headers.get("etag") ?? undefined, ...(versionId && versionId !== "null" ? { version: versionId } : {}) };
+    }
     const text = await errorBody(res);
     // A failed `If-None-Match: *` is 412; a concurrent conditional write is 409.
     if (mode.kind === "create" && (res.status === 412 || res.status === 409)) {

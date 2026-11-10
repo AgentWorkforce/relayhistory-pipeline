@@ -1,9 +1,47 @@
 # Production transcript store (`aws-sessions-prod`)
 
 The S3 bucket that RelayHistory transcript content lands in, in the
-`sessions-prod` account (`941433935742`), region `us-east-1`. Code:
+`sessions-prod` account (`<account-id>`), region `us-east-1`. Code:
 `stacks/aws/transcript-store.ts`. Tests: `stacks/aws/__tests__/transcript-store.test.ts`
 and the `transcripts:` entries in `scripts/aws-hardening-mutations.ts`.
+
+## Preserve the separately managed buffered GC grant
+
+The transcript store owns the complete bucket and CMK policy documents. A manual
+resource-policy repair is insufficient continuity: a later Alchemy reconciliation,
+including a Lambda role-ARN cascade, replaces those documents with their declared
+contents. Before another production stack deployment, persist the exact existing
+GC role ARN as `transcriptStore.bufferedGcRoleArn` in the private
+`.96bulls/aws-sessions-prod/aws-inputs.json`. This is a nonsecret ARN, not a key or
+credential. The production validator and direct stage entry refuse a missing,
+wildcard, cross-account, user or assumed-role value. There is no default principal
+and no automatic grant-removal switch. Non-GC pure policy helpers keep their
+previous behavior when the optional GC argument is absent.
+
+`stacks/aws/buffered-gc-policy.ts` declares the reviewed resource-policy scope:
+GC may use the CMK only via this account's regional S3 service and buffered object
+context; bucket policy permits the identity-policy version-delete grant only on
+full buffered-stage keys. GC cannot plain-delete its barrier, delete elsewhere,
+access canonical objects, list canonical versions or use canonical cryptography.
+Explicit canonical denies are required because IAM `*` also matches `/` and a
+nested canonical family can be named `buffered-batches`. Existing eraser, writer,
+reader and pipeline statements remain in place. The GC Lambda and role remain
+owned by their separate CloudFormation stack; this input creates neither.
+
+The private input is part of the existing capture digest and approval binding.
+Capture and review a fresh plan after integrating the source and binding the ARN.
+The existing exact plan contract remains enforced: do not widen its role-cascade
+exception or edit plaintext Alchemy state to make a policy-adoption diff pass.
+If initial adoption produces more than the already allowed cascade, keep deployment
+held for a separately reviewed, exact policy-adoption phase. Check both declared
+policy documents and live readback before any broader deployment. A GC code-only
+update through its independent stack does not reconcile transcript-store policies.
+
+Offline coverage compares the GC statements with a sanitized approved policy
+fixture, preserves existing principals, exercises actual stage wiring with mocked
+providers, and tests nested canonical wildcard collisions. Mutation cases use
+`bun scripts/aws-hardening-mutations.ts --only "buffered GC continuity"`.
+This continuity change does not fix a SQL claim timeout or prove retention health.
 
 Sources: decision 0001 (production AWS is S3 only), the migration plan
 (`docs/relayhistory-supabase-migration-plan.md` on #90: S5, S6, P9, K-2, K-33,
@@ -18,11 +56,11 @@ recorded in the inputs' `approval` record where the stack checks it
 
 | Resource | Name | Settings |
 | --- | --- | --- |
-| S3 bucket | `96bulls-aws-sessions-prod-transcripts-941433935742` | Versioned. SSE-KMS with its own CMK, **S3 Bucket Key off**, SSE-C blocked. Block Public Access (all four). BucketOwnerEnforced. Object Lock **off**. Server access logs to the log bucket. Lifecycle: noncurrent versions expire after 1 day, expired delete markers removed, incomplete multipart uploads aborted after 1 day. |
+| S3 bucket | `96bulls-aws-sessions-prod-transcripts-<account-id>` | Versioned. SSE-KMS with its own CMK, **S3 Bucket Key off**, SSE-C blocked. Block Public Access (all four). BucketOwnerEnforced. Object Lock **off**. Server access logs to the log bucket. Lifecycle: noncurrent versions expire after 1 day, expired delete markers removed, incomplete multipart uploads aborted after 1 day. |
 | Bucket policy | (on the bucket) | Deny non-TLS; deny TLS < 1.2; deny `DeleteObject`/`DeleteObjectVersion` to everyone but the eraser; deny a PUT whose encryption header is anything but SSE-KMS naming this key (including `aws:kms` with no key id, which S3 would encrypt with the AWS managed `aws/s3` key). A PUT with no encryption header gets the bucket default. No Allow statements. |
 | KMS key + alias | `alias/96bulls-aws-sessions-prod-transcripts` | Rotation on, 30-day deletion window. Root administers but cannot use. Writer and srv-writer: `GenerateDataKey` + `Decrypt`; reader: `Decrypt`; all only via `s3.us-east-1.amazonaws.com`, from this account, for objects under `96bulls/` in this bucket (encryption context `aws:s3:arn`). |
-| S3 bucket | `96bulls-aws-sessions-prod-access-logs-941433935742` | Versioned, SSE-S3 (server access logs cannot be delivered to an SSE-KMS bucket), Block Public Access, owner-enforced, TLS only. Accepts logs only from the transcripts bucket. Logs expire after 90 days. |
-| CloudTrail | `96bulls-aws-sessions-prod-trail` | Multi-region, log file validation, own KMS key (`alias/96bulls-aws-sessions-prod-trail`) and versioned bucket (`96bulls-aws-sessions-prod-trail-941433935742`, 365-day retention). Management events plus **S3 data events for the transcripts bucket only**. Both bucket service grants require the exact trail `SourceArn` and `SourceAccount`. Trail-log decrypt/re-encrypt is absent unless `transcriptStore.auditPrincipalArn` names one IAM role in this account. |
+| S3 bucket | `96bulls-aws-sessions-prod-access-logs-<account-id>` | Versioned, SSE-S3 (server access logs cannot be delivered to an SSE-KMS bucket), Block Public Access, owner-enforced, TLS only. Accepts logs only from the transcripts bucket. Logs expire after 90 days. |
+| CloudTrail | `96bulls-aws-sessions-prod-trail` | Multi-region, log file validation, own KMS key (`alias/96bulls-aws-sessions-prod-trail`) and versioned bucket (`96bulls-aws-sessions-prod-trail-<account-id>`, 365-day retention). Management events plus **S3 data events for the transcripts bucket only**. Both bucket service grants require the exact trail `SourceArn` and `SourceAccount`. Trail-log decrypt/re-encrypt is absent unless `transcriptStore.auditPrincipalArn` names one IAM role in this account. |
 | IAM user | `/96bulls/96bulls-aws-sessions-prod-transcript-writer` | The RelayHistory Worker. `ListBucket`; `GetObject` on `96bulls/*/v1/*`; `PutObject` on `…/raw/*`, `…/manifest.json`, `…/summary/*`. Explicit deny on delete, old versions, bucket configuration. |
 | IAM user | `/96bulls/96bulls-aws-sessions-prod-transcript-srv-writer` | The relayhistory-api Worker's live writer. `GetObject`/`PutObject` only on `96bulls/*/v1/ws=*/m=srv_*`, `96bulls/*/live-sessions/*`, `96bulls/*/live-batches/*`. A PUT must send `x-amz-server-side-encryption: aws:kms` and a key id in this account and region; the bucket policy pins it to the transcripts key. `GenerateDataKey`/`Decrypt` via S3 on the key's alias. `ListBucket` on the bucket, as the writer has, so a missing key answers 404 (the Worker's create-only pointer, manifest and batch-marker reads need it; HEAD/GET carry no `s3:prefix`, so it cannot be prefix-scoped). No version listing, no delete, no old versions, no bucket configuration. Added after the first apply: the plan contract's `srv-writer addition` phase is exactly `transcript-srv-writer` create plus `transcripts-key` update. |
 | IAM user | `/96bulls/96bulls-aws-sessions-prod-transcript-reader` | The history indexer. `ListBucket`; `GetObject` on `96bulls/*/v1/*`. Explicit deny on put, delete, old versions. |
@@ -148,7 +186,7 @@ exist (the history indexer; the erasure job), each with its own approval.
 ## Prerequisites (each needs its own OK)
 
 1. **Alchemy state bucket.** The account has none. `plan --capture` requires
-   `alchemy-state-941433935742-us-east-1-an` to exist and be versioned (it
+   `alchemy-state-<account-id>-us-east-1-an` to exist and be versioned (it
    detects any write during the capture from the version listing). Alchemy
    creates and hardens it (versioning, encryption, Block Public Access,
    owner-enforced) on first use: run `bin/96bulls plan aws-sessions-prod` once
@@ -158,15 +196,15 @@ exist (the history indexer; the erasure job), each with its own approval.
    Alchemy has no resource for it). The account has none set today:
 
    ```sh
-   aws s3control put-public-access-block --account-id 941433935742 \
+   aws s3control put-public-access-block --account-id <account-id> \
      --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
    ```
 
 ## Apply
 
 ```sh
-export AWS_PROFILE=sessions-prod AWS_REGION=us-east-1 NINETY_SIX_BULLS_CONFIRM_ACCOUNT=941433935742
-aws sts get-caller-identity --query Account --output text          # 941433935742
+export AWS_PROFILE=sessions-prod AWS_REGION=us-east-1 NINETY_SIX_BULLS_CONFIRM_ACCOUNT=<account-id>
+aws sts get-caller-identity --query Account --output text          # <account-id>
 mkdir -p .96bulls/aws-sessions-prod
 cp stacks/aws/examples/aws-sessions-prod.inputs.example.json .96bulls/aws-sessions-prod/aws-inputs.json
 # fill the approval record (decision, date, quote verbatim); leave capture for after the capture
@@ -202,7 +240,7 @@ files, inputs) and refuses on any difference.
 ## Verify (read only)
 
 ```sh
-B=96bulls-aws-sessions-prod-transcripts-941433935742
+B=96bulls-aws-sessions-prod-transcripts-<account-id>
 aws s3api get-bucket-versioning --bucket $B                       # Enabled
 aws s3api get-bucket-encryption --bucket $B                       # aws:kms, the alias's key, BucketKeyEnabled false
 aws s3api get-public-access-block --bucket $B                     # all four true
@@ -221,7 +259,7 @@ aws cloudtrail get-trail-status --name 96bulls-aws-sessions-prod-trail       # I
 Least privilege, with the IAM policy simulator (no credentials needed):
 
 ```sh
-U=arn:aws:iam::941433935742:user/96bulls/96bulls-aws-sessions-prod-transcript-writer
+U=arn:aws:iam::<account-id>:user/96bulls/96bulls-aws-sessions-prod-transcript-writer
 O=arn:aws:s3:::$B/96bulls/org/v1/ws=w/m=m/h=h/d=2026/10/31/s=s
 aws s3api get-bucket-policy --bucket $B --query Policy --output text > bucket-policy.json
 for r in $O/raw/x $O/manifest.json $O/summary/short.json.enc $O/other arn:aws:s3:::$B/v1/x; do   # one resource per call:
@@ -288,7 +326,7 @@ aws iam create-access-key --user-name $U --output json \
       {id:"access_key_id",     type:"STRING",    label:"access-key-id",     value:.AccessKey.AccessKeyId},
       {id:"secret_access_key", type:"CONCEALED", label:"secret-access-key", value:.AccessKey.SecretAccessKey},
       {id:"iam_user",          type:"STRING",    label:"iam-user",          value:$u},
-      {id:"bucket",            type:"STRING",    label:"bucket",            value:"96bulls-aws-sessions-prod-transcripts-941433935742"},
+      {id:"bucket",            type:"STRING",    label:"bucket",            value:"96bulls-aws-sessions-prod-transcripts-<account-id>"},
       {id:"region",            type:"STRING",    label:"region",            value:"us-east-1"}]}' \
   | ssh kjg-lap "zsh -lc 'op item create --vault 96Bulls-prod - >/dev/null && op item get \"$T\" --vault 96Bulls-prod --format json | jq \"{id, title, fields: [.fields[] | {label, type}]}\"'"
 ```
@@ -305,7 +343,7 @@ The Worker (relayhistory-cloud, production environment) reads:
 | Setting | Value | Kind |
 | --- | --- | --- |
 | `PIPELINE_RAW_PROVIDER` | `s3` | var |
-| `PIPELINE_RAW_S3_BUCKET` | `96bulls-aws-sessions-prod-transcripts-941433935742` | var |
+| `PIPELINE_RAW_S3_BUCKET` | `96bulls-aws-sessions-prod-transcripts-<account-id>` | var |
 | `PIPELINE_RAW_S3_REGION` | `us-east-1` | var |
 | `PIPELINE_RAW_S3_SSE` | **unset**. The bucket default (this CMK) applies. `aws:kms` would send the header without a key id, which means the AWS managed `aws/s3` key, and the bucket policy refuses it with 403. | (none) |
 | `PIPELINE_KEY_PREFIX` | `96bulls` | var |
@@ -371,7 +409,7 @@ gated by A6 and K-2) writes into this bucket:
   writer's put/get grants and a key-policy statement of its own, added in a
   reviewed change when the exporter is ready. The Worker's key is never shared.
 - with the write guard: `--execute`, the expected bucket and account
-  (`941433935742`), and the key alias `alias/96bulls-aws-sessions-prod-transcripts`;
+  (`<account-id>`), and the key alias `alias/96bulls-aws-sessions-prod-transcripts`;
   without them it is a dry run;
 - to `96bulls/<org>/v1/...`, create-only (`If-None-Match: *`), idempotent by
   `raw.content_sha256`, newest sessions first;

@@ -37,6 +37,8 @@ import {
   pollPostgresStage,
   postgresDeadLetterStore,
   postgresPipelineQueue,
+  postgresStageConsumer,
+  type PostgresConsumerOptions,
   QUEUED_STAGES,
   replayDeadLetters,
   sessionIndexedHandler,
@@ -54,6 +56,8 @@ import {
   type StageQueueDeps,
   type TraceContext,
 } from "../src/lib/pipeline/index.js";
+import { createWorkerRuntime } from "../src/runtime/workers.js";
+import { SESSION_BOOTSTRAP_FILES } from "../../../src/hoopdb/session-bootstrap-chain.js";
 
 const SUPABASE = new URL("../../../supabase/", import.meta.url).href;
 const supabaseFile = (path: string) =>
@@ -346,24 +350,10 @@ let db: PGlite;
 beforeAll(async () => {
   db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   await db.exec(readFileSync(supabaseFile("tests/supabase_shim.sql"), "utf8"));
-  await db.exec(
-    readFileSync(
-      supabaseFile("bootstrap/session_directory_search_worker.sql"),
-      "utf8",
-    ),
-  );
-  await db.exec(
-    readFileSync(
-      supabaseFile("bootstrap/session_token_verifier.sql"),
-      "utf8",
-    ),
-  );
-  await db.exec(
-    readFileSync(
-      supabaseFile("bootstrap/session_ingest_roles.sql"),
-      "utf8",
-    ),
-  );
+  // Single-sourced bootstrap chain (session-bootstrap-chain.ts): the grant
+  // migration FAILs closed without the bare consumer grantee.
+  for (const f of SESSION_BOOTSTRAP_FILES)
+    await db.exec(readFileSync(supabaseFile(f.replace(/^supabase\//, '')), "utf8"));
   for (const file of readdirSync(supabaseFile("migrations/")).sort())
     await db.exec(readFileSync(supabaseFile(`migrations/${file}`), "utf8"));
   await db.exec("SET ROLE service_role");
@@ -404,6 +394,95 @@ describe("postgres backend", () => {
       handlers,
     };
   }
+
+  function stageRuntime(deps: StageQueueDeps, overrides: Partial<PostgresConsumerOptions> = {}) {
+    const consumer = postgresStageConsumer({ sql: db, stage: "session-indexed", deps, ...overrides });
+    return { consumer, binding: createWorkerRuntime({ source: consumer.source, batchSize: 3 }).bind(consumer.work) };
+  }
+
+  it("drains the started delivery on shutdown and recovers unstarted leases after restart", async () => {
+    const controller = new AbortController();
+    const calls: string[] = [];
+    await postgresPipelineQueue(db).sendBatch(["one", "two", "three"].map(key => message("session-indexed", key)));
+    const deps = postgresDeps({ "session-indexed": async body => { calls.push(body.workKey); controller.abort(); } });
+    const first = stageRuntime(deps);
+    await first.binding.tick(controller.signal);
+    expect(first.consumer.result()).toEqual({ claimed: 3, acked: 1, retried: 0, exhausted: 0 });
+    expect(calls).toEqual(["one"]);
+    expect((await jobs()).map(j => [j.work_key, j.attempts])).toEqual([["two", 0], ["three", 0]]);
+    const restarted = stageRuntime(postgresDeps({ "session-indexed": async body => { calls.push(body.workKey); } }));
+    expect(await restarted.binding.tick()).toBe(0);
+    await fastForward();
+    expect(await restarted.binding.tick()).toBe(2);
+    expect(calls).toEqual(["one", "two", "three"]);
+    expect(await jobs()).toEqual([]);
+  });
+
+  it("finishes a delivery when shutdown arrives during its start query", async () => {
+    const controller = new AbortController();
+    let handled = 0;
+    await postgresPipelineQueue(db).send(message("session-indexed", "started"));
+    const sql: SqlExecutor = { async query(text, params) {
+      const result = await db.query(text, params);
+      if (text.includes("SET dlq = dlq OR attempts")) controller.abort();
+      return result as never;
+    } };
+    const { binding } = stageRuntime(postgresDeps({ "session-indexed": async () => { handled++; } }), { sql });
+    await binding.tick(controller.signal);
+    expect(handled).toBe(1);
+    expect(await jobs()).toEqual([]);
+  });
+
+  it("does not start a leased delivery when shutdown arrives during claim", async () => {
+    const controller = new AbortController();
+    await postgresPipelineQueue(db).send(message("session-indexed", "claimed"));
+    let handled = 0;
+    const sql: SqlExecutor = { async query(text, params) {
+      const result = await db.query(text, params);
+      if (text.startsWith("WITH next AS")) controller.abort();
+      return result as never;
+    } };
+    const { binding } = stageRuntime(postgresDeps({ "session-indexed": async () => { handled++; } }), { sql });
+    await binding.tick(controller.signal);
+    expect(handled).toBe(0);
+    expect((await jobs()).map(j => [j.work_key, j.attempts])).toEqual([["claimed", 0]]);
+  });
+
+  it.each([false, true])("does not settle a new owner's lease when the original handler finishes late (retry=%s)", async retry => {
+    await postgresPipelineQueue(db).send(message("session-indexed", "late"));
+    const old = stageRuntime(postgresDeps({ "session-indexed": async () => {
+      await db.exec("UPDATE sessions.pipeline_jobs SET lease_id = gen_random_uuid()");
+      if (retry) throw new Error("transient failure after lease loss");
+    } }));
+    await old.binding.tick();
+    expect(old.consumer.result().acked).toBe(0);
+    expect(old.consumer.result().retried).toBe(0);
+    expect((await jobs()).map(j => [j.work_key, j.attempts])).toEqual([["late", 1]]);
+    await fastForward();
+    const next = stageRuntime(postgresDeps({ "session-indexed": async (_body, _recorder, attempt) => { expect(attempt).toBe(2); } }));
+    await next.binding.tick();
+    expect(await jobs()).toEqual([]);
+  });
+
+  it("recovers an unsettled delivery after an acknowledgment failure without spending waiting attempts", async () => {
+    await postgresPipelineQueue(db).sendBatch(["one", "two", "three"].map(key => message("session-indexed", key)));
+    const seen: string[] = [];
+    const deps = postgresDeps({ "session-indexed": async body => { seen.push(body.workKey); } });
+    let failAck = true;
+    const sql: SqlExecutor = { async query(text, params) {
+      if (text.startsWith("DELETE FROM") && failAck) { failAck = false; throw new Error("ack connection lost"); }
+      return await db.query(text, params) as never;
+    } };
+    const worker = stageRuntime(deps, { sql });
+    await expect(worker.binding.tick()).rejects.toThrow("ack connection lost");
+    expect(seen).toEqual(["one"]);
+    expect((await jobs()).map(j => [j.work_key, j.attempts])).toEqual([["one", 1], ["two", 0], ["three", 0]]);
+    await fastForward();
+    // The same persistent binding resumes after a transient database failure.
+    await worker.binding.tick();
+    expect(seen).toEqual(["one", "one", "two", "three"]);
+    expect(await jobs()).toEqual([]);
+  });
 
   it("carries a manifest from object-landed to the index", async () => {
     const queue = postgresPipelineQueue(db);
@@ -881,24 +960,10 @@ describe("20261025000600 on a database with rows under the old stage names", () 
       await old.exec(
         readFileSync(supabaseFile("tests/supabase_shim.sql"), "utf8"),
       );
-      await old.exec(
-        readFileSync(
-          supabaseFile("bootstrap/session_directory_search_worker.sql"),
-          "utf8",
-        ),
-      );
-      await old.exec(
-        readFileSync(
-          supabaseFile("bootstrap/session_token_verifier.sql"),
-          "utf8",
-        ),
-      );
-      await old.exec(
-        readFileSync(
-          supabaseFile("bootstrap/session_ingest_roles.sql"),
-          "utf8",
-        ),
-      );
+      // Single-sourced bootstrap chain: the grant migration FAILs closed
+      // without the bare consumer grantee.
+      for (const f of SESSION_BOOTSTRAP_FILES)
+        await old.exec(readFileSync(supabaseFile(f.replace(/^supabase\//, '')), "utf8"));
       const files = readdirSync(supabaseFile("migrations/")).sort();
       const queue = files.indexOf("20261025000600_pipeline_queue.sql");
       expect(queue).toBeGreaterThan(0);

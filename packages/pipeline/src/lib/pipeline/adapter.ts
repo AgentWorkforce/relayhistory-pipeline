@@ -33,6 +33,9 @@ import {
   objectKey,
   parseManifest,
   parseSessionKey,
+  isManifestRest,
+  isPublicationManifestRest,
+  parseUploadGenerationPrefix,
   pointerFields,
   type ManifestV1,
   type ObjectStore,
@@ -432,7 +435,7 @@ export function staticOrgResolver(orgId: string): OrgResolver {
 export const prefixOrgResolver: OrgResolver = {
   kind: "prefix",
   orgFor: async ({ prefix }) => {
-    const org = prefix?.split("/").filter(Boolean).pop();
+    const org = (parseUploadGenerationPrefix(prefix)?.base ?? prefix)?.split("/").filter(Boolean).pop();
     return org || null;
   },
 };
@@ -467,13 +470,21 @@ export function prefixAllowed(
   // `<org>` with no base) for the caller's org: not another base, no extra
   // segment, not a bare org when a base is configured.
   if (env.PIPELINE_ORG_FROM_PREFIX === "true")
-    return prefix === (base ? `${base}/${orgId}` : orgId);
-  return (prefix ?? "") === base;
+    return (parseUploadGenerationPrefix(prefix)?.base ?? prefix) === (base ? `${base}/${orgId}` : orgId);
+  return (parseUploadGenerationPrefix(prefix)?.base ?? prefix ?? "") === base;
 }
 
 export type BuildResult =
   | { status: "enqueue"; message: StageMessage<ObjectLandedPayload> }
-  | { status: "ignored"; reason: "not_a_session_key" | "not_a_manifest" };
+  | { status: "ignored"; reason: "not_a_session_key" | "not_a_manifest" | "retention_bucket" };
+
+/**
+ * The session ingest's Babysitter retention buckets (96BullSessions
+ * src/session-ingest/babysitter-retention.ts): `h=_babysitter` directories hold
+ * only evidence lines the projection never indexes, and are erased on expiry.
+ * They are not sessions, so neither a put nor a delete of their manifest is indexed.
+ */
+export const RETENTION_BUCKET_HARNESS = "_babysitter";
 
 /**
  * The object-landed message for a manifest. Throws a non-retryable
@@ -489,7 +500,8 @@ export function buildObjectLandedMessage(input: {
 }): BuildResult {
   const location = parseSessionKey(input.landed.key);
   if (!location) return { status: "ignored", reason: "not_a_session_key" };
-  if (location.rest !== "manifest.json")
+  if (location.harness === RETENTION_BUCKET_HARNESS) return { status: "ignored", reason: "retention_bucket" };
+  if (!isManifestRest(location.rest) || (isPublicationManifestRest(location.rest) && !parseUploadGenerationPrefix(location.prefix)))
     return { status: "ignored", reason: "not_a_manifest" };
   const manifest = input.manifest;
   if (!manifest)
@@ -572,7 +584,8 @@ export function buildObjectDeletedMessage(input: {
 }): BuildResult {
   const location = parseSessionKey(input.landed.key);
   if (!location) return { status: "ignored", reason: "not_a_session_key" };
-  if (location.rest !== "manifest.json")
+  if (location.harness === RETENTION_BUCKET_HARNESS) return { status: "ignored", reason: "retention_bucket" };
+  if (!isManifestRest(location.rest) || (isPublicationManifestRest(location.rest) && !parseUploadGenerationPrefix(location.prefix)))
     return { status: "ignored", reason: "not_a_manifest" };
   const at = input.landed.eventTime ?? (input.now ?? new Date()).toISOString();
   const payload: ObjectLandedPayload = {
@@ -664,7 +677,7 @@ export async function handleObjectEventQueue(
       continue;
     }
     const location = parseSessionKey(landed.key);
-    if (!location || location.rest !== "manifest.json") {
+    if (!location || location.harness === RETENTION_BUCKET_HARNESS || !isManifestRest(location.rest) || (isPublicationManifestRest(location.rest) && !parseUploadGenerationPrefix(location.prefix))) {
       message.ack();
       continue;
     }

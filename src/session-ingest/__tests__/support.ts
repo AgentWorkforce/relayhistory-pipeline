@@ -93,9 +93,9 @@ export class MemoryLedger implements Ledger {
       this.batches.set(key, { digest: input.batchDigest, receiptId: input.receiptId, state: "committed" });
       return { kind: "replay_fast", deleted, stale, resets: this.resets };
     }
-    if (found) return { kind: "resume", deleted, stale, resets: this.resets };
+    if (found) return { kind: "resume", claimToken: crypto.randomUUID(), deleted, stale, resets: this.resets };
     this.batches.set(key, { digest: input.batchDigest, receiptId: input.receiptId, state: "pending" });
-    return { kind: "claimed", deleted, stale, resets: this.resets };
+    return { kind: "claimed", claimToken: crypto.randomUUID(), deleted, stale, resets: this.resets };
   }
   async acquireSlot(r: SlotRequest): Promise<SlotResult> {
     const live = this.slots.get(r.tenant.userId) ?? new Set();

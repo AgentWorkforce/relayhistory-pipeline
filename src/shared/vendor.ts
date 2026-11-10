@@ -19,6 +19,7 @@ export {
 export {
   postgresPipelineQueue,
   pollPostgresStage,
+  postgresStageConsumer,
   type PipelineQueue,
   type PollResult,
   type SqlExecutor,
@@ -89,8 +90,9 @@ export {
   SCRUB_RULESET,
   SCRUB_RULESET_VERSION,
   canScrubLong,
-  sealRawChunk,
 } from "@rhc/lib/pipeline/raw-chunks.ts";
+// Scrub calls go through the engine seam (docs/scrub-engine.md).
+export { sealRawChunk } from "@rhc/lib/scrub-engine/index.ts";
 export {
   RELAYHISTORY_EXPORT_EXTENSION,
   RELAYHISTORY_NORMALIZED_VERSION,
@@ -107,7 +109,7 @@ export {
   projectRelayhistorySession,
   type ProjectionContext,
 } from "@rhc/lib/pipeline/relayhistory-projection.ts";
-export { scrubText, scrubJson } from "@rhc/lib/scrub.ts";
+export { scrubText, scrubJson } from "@rhc/lib/scrub-engine/index.ts";
 export type { Bindings, AppEnv } from "@rhc/env.ts";
 
 export {

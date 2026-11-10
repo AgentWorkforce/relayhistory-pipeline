@@ -12,6 +12,9 @@ import {
   LAYOUT_VERSION,
   RAW_FORMATS,
   parseSessionKey,
+  isManifestRest,
+  isPublicationManifestRest,
+  parseUploadGenerationPrefix,
   rawChunkKey,
   type SessionLocation,
 } from "./layout.js";
@@ -276,13 +279,17 @@ export interface ManifestPointerFields {
   normalizedStale: boolean;
 }
 
-/** Hash chain over the ordered chunk list (spec section `content_sha256`). */
-export async function computeContentSha256(
-  chunks: readonly Pick<
-    ChunkEntry,
-    "epoch" | "start_offset" | "bytes" | "sha256"
-  >[],
-): Promise<string> {
+type ChainLink = Pick<ChunkEntry, "epoch" | "start_offset" | "bytes" | "sha256">;
+
+/**
+ * The `content_sha256` hash chain, step by step: the k-th value yielded is the
+ * chain over `chunks[0..k]` (the empty chain, 32 zero bytes, is not yielded).
+ * The one implementation of the chain's byte layout; computeContentSha256 is
+ * its last value.
+ */
+export async function* contentSha256Chain(
+  chunks: readonly ChainLink[],
+): AsyncGenerator<string> {
   let h: Uint8Array = new Uint8Array(32);
   for (const c of chunks) {
     const buf = new Uint8Array(32 + 4 + 8 + 8 + 32);
@@ -293,8 +300,17 @@ export async function computeContentSha256(
     view.setBigUint64(44, BigInt(c.bytes));
     buf.set(fromHex(c.sha256), 52);
     h = await sha256(buf);
+    yield toHex(h);
   }
-  return toHex(h);
+}
+
+/** Hash chain over the ordered chunk list (spec section `content_sha256`). */
+export async function computeContentSha256(
+  chunks: readonly ChainLink[],
+): Promise<string> {
+  let digest = toHex(new Uint8Array(32));
+  for await (const step of contentSha256Chain(chunks)) digest = step;
+  return digest;
 }
 
 type Raw = ManifestV1["raw"];
@@ -522,7 +538,7 @@ export async function validateManifest(
 
   if (manifestKey !== undefined) {
     const loc = parseSessionKey(String(manifestKey));
-    if (!loc || loc.rest !== "manifest.json") {
+    if (!loc || !isManifestRest(loc.rest) || (isPublicationManifestRest(loc.rest) && !parseUploadGenerationPrefix(loc.prefix))) {
       issue("$key", `${manifestKey} is not a v1 manifest key`);
     } else {
       const pairs: [string, string, string][] = [

@@ -1,3 +1,5 @@
+import type {CurrentCustodyPacket,CurrentCustodyAck} from "./custody-protocol.ts";
+import {validatedCustodyAck} from "./custody-ack.ts";
 /**
  * `POST /v1/delivery/batches` without Neon: every accepted batch is in S3
  * before the response, and there is no fallback path.
@@ -28,10 +30,17 @@
  * relayhistory's jittered `Retry-After` (2-10 s), never from waiting on a
  * lock. A slot is taken only for a batch that has something to write, after
  * the claim; a refused batch stays `pending` and its retry resumes it.
+ * Exception, default off (INGEST_CLAIM_LOCK_BUSY=on, `DeliverDeps.claimLockBusy`):
+ * a claim whose single autocommit statement lost its lock wait (55P03/40P01,
+ * `ledger_lock_timeout`) is a 429 `ClaimLockBusy` with `Retry-After` 5-10 s instead
+ * of a 503. The statement rolled back, so nothing was written and the retry is the
+ * same idempotent claim; 57014 (`ledger_timeout`) and every other cause stay 503.
  */
 import type { Ledger, LedgerTenant, RevisionConflict, SlotRequest } from "./ledger.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
+import type { DbErrorDiagnosis } from "./db-error-class.ts";
 import {
+  DELIVERY_BUSY_RETRY_AFTER,
   DELIVERY_LIMITS,
   DeliveryBusyError,
   DeliveryError,
@@ -42,11 +51,16 @@ import {
 } from "./vendor/delivery/delivery-contracts.ts";
 import { prepareDelivery, type PreparedDelivery } from "./vendor/delivery/prepare.ts";
 import { batchMarkerKey, replicaMessage, sendReplica, stagedReplicaMessage, type ReplicaOutcome, type ReplicaSink } from "./replica.ts";
-import { IngestWriteError, assertTenantSegment, groupRecords, liveMachineId, writeBatchObjects, type WriteResult, type WriteTarget } from "./writer.ts";
-import { fanoutMessages, stageGroups, type FanoutMessage } from "./staging.ts";
+import { CAS_ATTEMPTS, GROUP_ATTEMPTS, IngestWriteError, assertTenantSegment, groupRecords, liveMachineId, writeBatchObjects, type WriteResult, type WriteTarget } from "./writer.ts";
+import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
+import { prepareBufferedStage, putBufferedStage, fanoutMessages, stageGroups, type FanoutMessage } from "./staging.ts";
+import { MAX_FETCH_REDIRECTS, babysitterStub, bucketBodies, bucketRefs, planBabysitterBuckets, planKey, worstCaseSubrequests, writeBucketObjects, type BucketRefs } from "./babysitter-retention.ts";
 
 export interface DeliverDeps {
+  /** Verified private source packet, bound to this request only. */
+  custody?:CurrentCustodyPacket;
   ledger: Ledger;
+  acceptanceMode?: IngestAcceptanceMode;
   target: WriteTarget;
   replica?: ReplicaSink;
   now?: () => Date;
@@ -62,11 +76,88 @@ export interface DeliverDeps {
   inlineMaxSessions?: number;
   /** Enqueue fan-out messages (INGEST_FANOUT). Required with `inlineMaxSessions`. */
   fanout?: (messages: FanoutMessage[]) => Promise<void>;
+  /**
+   * INGEST_BABYSITTER_RETENTION_ROUTING: write Babysitter upserts to retention buckets
+   * (babysitter-retention.ts), registered before the PUT; the record itself continues
+   * as a payload-free stub in its own session, in every acceptance mode (the SQL
+   * publication derives every group's session from its claim records, so groups keep
+   * owners). Requires the Neon replica off (its consumer rebuilds rows from lines).
+   */
+  babysitterRetention?: boolean;
+  /**
+   * The proven effective subrequest cap of this Worker (INGEST_SUBREQUEST_CAP). Routing is
+   * inactive without it: an unproven cap is never assumed. With it, a routed batch whose
+   * worst case (babysitter-retention.ts `worstCaseSubrequests`) exceeds it is refused
+   * before the claim with a typed 422.
+   */
+  subrequestCap?: number;
+  /** Redirects each S3 fetch may follow in the worst case (INGEST_SUBREQUEST_REDIRECTS; default 20, the fetch maximum). */
+  subrequestRedirects?: number;
+  /** The current compiled schema generation (INGEST_EXPECT_GENERATION); every evidence write is fenced on it. Routing is inactive without it. */
+  retentionGeneration?: string;
+  /**
+   * INGEST_STAGE_LATENCY_LOG=on: one `StageLatencyFields` line per deliver stage, successes and
+   * failures alike. Unset (the default): no line, no behaviour change.
+   */
+  stageLatency?: StageLatencyObserver;
+  /**
+   * INGEST_CLAIM_LOCK_BUSY=on: a claim-stage lock-wait failure (cause `ledger_lock_timeout`,
+   * SQLSTATE 55P03/40P01) is refused as a 429 `ClaimLockBusy` with `Retry-After` in
+   * CLAIM_LOCK_RETRY_AFTER instead of a 503, so a second concurrent claim for the same
+   * tenant backs off past the holder's statement_timeout instead of stacking behind it.
+   * Unset (the default): the 503 `IngestUnavailable`, unchanged.
+   */
+  claimLockBusy?: true;
+  /** Test seam for the ClaimLockBusy jitter: a value in [0, 1). Default Math.random. */
+  random?: () => number;
+  /**
+   * Async admission only (async-admission.ts): runs AFTER a `claimed`/`resume` claim and BEFORE
+   * any slot, S3 write or receipt, and throws to refuse. The consumer uses it for the
+   * upload-time privacy fence (a reset or re-enable that started after the upload refuses
+   * the batch). Never set on the request path. A replay / replay_fast claim never calls it:
+   * those admit nothing new.
+   */
+  admissionGate?: () => Promise<void>;
 }
 
-export type DeliverOutcome = "accepted" | "accepted_staged" | "replay" | "replay_fast" | "accepted_all_deleted";
+/** Whether this deployment routes Babysitter upserts to retention buckets (see `DeliverDeps.babysitterRetention`). */
+export function babysitterRoutingActive(deps: Pick<DeliverDeps, "babysitterRetention" | "replica" | "subrequestCap" | "retentionGeneration">): boolean {
+  return deps.babysitterRetention === true && (!deps.replica || deps.replica.mode === "off")
+    && Number.isSafeInteger(deps.subrequestCap) && deps.subrequestCap! > 0
+    && typeof deps.retentionGeneration === "string" && /^[0-9a-f]{64}$/.test(deps.retentionGeneration);
+}
+
+/**
+ * A routed batch that cannot fit the proven subrequest cap, refused BEFORE the claim
+ * (nothing written: no ledger row, no S3 object). A typed 422, not a 503: replaying the
+ * same immutable batch can never fit, and released Desktops (released-v2026.11.4-beta.1
+ * and later) isolate a 400/422-rejected batch locally into smaller deterministic child
+ * batches, which is the supported client reduction. The server never splits a batch and
+ * never changes an identity.
+ */
+export class DeliveryBudgetExceeded extends DeliveryError {
+  constructor() {
+    super("delivery_budget_exceeded", 422, "Delivery batch exceeds this destination's per-request budget; send it in smaller batches");
+  }
+}
+
+/** Refuses (DeliveryBudgetExceeded) a routed batch over the cap; a no-op when routing is inactive or nothing routes. */
+export function assertWithinBudget(deps: Pick<DeliverDeps, "babysitterRetention" | "replica" | "subrequestCap" | "subrequestRedirects" | "acceptanceMode" | "inlineMaxSessions" | "retentionGeneration">, records: PreparedDelivery["records"], receivedAt: Date): void {
+  if (!babysitterRoutingActive(deps)) return;
+  // Bucket PUTs: one per bucket holding an upsert line (tombstone-only buckets write no object).
+  const plan = planBabysitterBuckets(records, receivedAt.getTime());
+  const buckets = new Set(plan.routed.map((r) => planKey(plan.of(r)!))).size;
+  if (buckets === 0) return;
+  const sessions = groupRecords(records, receivedAt).groups.length;
+  const mode = deps.acceptanceMode === "buffered" ? "buffered" : deps.inlineMaxSessions !== undefined && sessions > deps.inlineMaxSessions ? "staged" : "inline";
+  const worst = worstCaseSubrequests({ buckets, sessions, mode, redirects: deps.subrequestRedirects ?? MAX_FETCH_REDIRECTS }, GROUP_ATTEMPTS, CAS_ATTEMPTS);
+  if (worst > deps.subrequestCap!) throw new DeliveryBudgetExceeded();
+}
+
+export type DeliverOutcome = "accepted" | "accepted_buffered" | "accepted_staged" | "replay" | "replay_fast" | "accepted_all_deleted";
 
 export interface DeliverResult {
+  custodyAck?:CurrentCustodyAck;
   receipt: DeliveryReceipt;
   outcome: DeliverOutcome;
   /** Ids, counts and codes only: what the request log line may carry. */
@@ -85,9 +176,37 @@ export interface DeliverResult {
 
 /** Code only: storage and ledger messages can quote keys. */
 export class IngestUnavailable extends DeliveryError {
-  constructor(readonly stage: string, readonly cause_code: string) {
+  /** `db`: set only for a ledger (database) cause; the closed diagnosis (class, safe code, basis). */
+  constructor(readonly stage: string, readonly cause_code: string, readonly db?: DbErrorDiagnosis) {
     super("delivery_unavailable", 503, "Durable delivery is temporarily unavailable");
   }
+}
+
+/**
+ * Retry-After for a claim lock-wait refusal, in seconds: inside the 429 contract
+ * (DELIVERY_BUSY_RETRY_AFTER, 2-10) but at least the role statement_timeout (5 s,
+ * supabase/bootstrap/session_ingest_role.sql), so the retry arrives after the holding
+ * claim has committed or been cancelled.
+ */
+export const CLAIM_LOCK_RETRY_AFTER = Object.freeze({ min: 5, max: DELIVERY_BUSY_RETRY_AFTER.max });
+
+/**
+ * A claim refused because its statement lost the lock wait to a concurrent claim for the
+ * same tenant (INGEST_CLAIM_LOCK_BUSY=on). A 429 `delivery_busy` (lock `ledger_claim`):
+ * the single autocommit statement rolled back, nothing was written. Keeps the stage, cause
+ * and database diagnosis of the 503 it replaces, for the route line and the lock alert.
+ */
+export class ClaimLockBusy extends DeliveryBusyError {
+  readonly stage = "claim";
+  constructor(readonly cause_code: string, readonly db: DbErrorDiagnosis | undefined, retryAfterSeconds: number) {
+    super("ledger_claim", retryAfterSeconds);
+  }
+}
+
+function claimLockRetryAfter(random: () => number): number {
+  const { min, max } = CLAIM_LOCK_RETRY_AFTER;
+  const r = random();
+  return min + Math.floor((Number.isFinite(r) && r >= 0 && r < 1 ? r : 0) * (max - min + 1));
 }
 
 function causeCode(error: unknown): string {
@@ -109,7 +228,7 @@ function revisionConflict(originId: string, conflicts: RevisionConflict[], count
   return new DeliveryError("delivery_conflict", 409, "Delivery record revision was reused with different content", items[0], items, count);
 }
 
-function batchIdConflict(prepared: PreparedDelivery, currentDigest: string): DeliveryError {
+export function batchIdConflict(prepared: PreparedDelivery, currentDigest: string): DeliveryError {
   return new DeliveryError("delivery_conflict", 409, "Delivery batch identity was reused with different content", {
     type: "batch_id",
     originId: prepared.originId,
@@ -119,32 +238,101 @@ function batchIdConflict(prepared: PreparedDelivery, currentDigest: string): Del
   });
 }
 
-async function stage<T>(name: string, work: () => Promise<T>): Promise<T> {
+/** One per-stage latency line (INGEST_STAGE_LATENCY_LOG=on; `DeliverDeps.stageLatency`): the deliver stage
+ * name, how it ended, its wall time and, for a ledger (database) failure, the SQLSTATE. Closed values
+ * only: no tenant data, no ids, no messages. Diagnostic only. */
+export interface StageLatencyFields {
+  route: "ingest.stage_latency";
+  stage: string;
+  /** ok | refused (a typed DeliveryError, e.g. 403 P0W01 or 409) | unavailable (the 503 IngestUnavailable). */
+  outcome: "ok" | "refused" | "unavailable";
+  duration_ms: number;
+  /** Present only for a database failure with a syntactically valid SQLSTATE (db-error-class.ts). */
+  sqlstate?: string;
+}
+export type StageLatencyObserver = (fields: StageLatencyFields) => void;
+
+const SQLSTATE_SHAPE = /^[0-9A-Z]{5}$/;
+
+/** The observer never changes the delivery: a throwing observer is ignored. */
+function observeStage(observe: StageLatencyObserver | undefined, fields: StageLatencyFields): void {
+  if (!observe) return;
+  try { observe(fields); } catch { /* diagnostic only */ }
+}
+
+async function runStage<T>(name: string, work: () => Promise<T>, observe?: StageLatencyObserver): Promise<T> {
+  const t0 = observe ? Date.now() : 0;
   try {
-    return await work();
+    const value = await work();
+    observeStage(observe, { route: "ingest.stage_latency", stage: name, outcome: "ok", duration_ms: Date.now() - t0 });
+    return value;
   } catch (error) {
-    if (error instanceof DeliveryError) throw error;
-    throw new IngestUnavailable(name, causeCode(error));
+    // IngestUnavailable is itself a DeliveryError (503): rethrown unchanged as before, but labelled unavailable.
+    const passthrough = error instanceof DeliveryError;
+    const db = error instanceof LedgerUnavailableError || error instanceof IngestUnavailable ? error.db : undefined;
+    const sqlstate = db && SQLSTATE_SHAPE.test(db.db_error_code) ? db.db_error_code : undefined;
+    const outcome = passthrough && !(error instanceof IngestUnavailable) ? "refused" : "unavailable";
+    observeStage(observe, { route: "ingest.stage_latency", stage: name, outcome, duration_ms: Date.now() - t0, ...(sqlstate ? { sqlstate } : {}) });
+    if (passthrough) throw error;
+    throw new IngestUnavailable(name, causeCode(error), db);
+  }
+}
+
+/** The stage wrapper bound to this delivery's observer (undefined, the default: no latency lines). */
+function stagesFor(deps: Pick<DeliverDeps, "stageLatency">) {
+  return <T>(name: string, work: () => Promise<T>): Promise<T> => runStage(name, work, deps.stageLatency);
+}
+
+/** The claim stage; with `claimLockBusy`, its lock-wait 503 becomes a 429 ClaimLockBusy (nothing else changes). */
+async function claimStage<T>(deps: Pick<DeliverDeps, "stageLatency" | "claimLockBusy" | "random">, work: () => Promise<T>): Promise<T> {
+  try {
+    return await runStage("claim", work, deps.stageLatency);
+  } catch (error) {
+    if (deps.claimLockBusy && error instanceof IngestUnavailable && error.stage === "claim" && error.cause_code === "ledger_lock_timeout")
+      throw new ClaimLockBusy(error.cause_code, error.db, claimLockRetryAfter(deps.random ?? Math.random));
+    throw error;
   }
 }
 
 export async function deliverBatch(deps: DeliverDeps, tenant: LedgerTenant, batch: HistoryExportBatch): Promise<DeliverResult> {
+  const started = Date.now();
+  // 403 delivery_account_mismatch, 413 delivery_too_large, exactly as relayhistory.
+  const prepared = await prepareDelivery({ orgId: tenant.orgId, workspaceId: tenant.workspaceId }, batch);
+  return deliverPreparedCore(deps, tenant, prepared, started, "prepare");
+}
+
+/**
+ * Lands an already-prepared relayhistory delivery through the same claim, fence,
+ * stale-record, buffered-write and receipt path as a live public batch.
+ *
+ * This is intentionally a narrow internal boundary. Callers must authenticate
+ * and validate the prepared object (including its original receipt and current
+ * source custody) before invoking it; the public route continues through
+ * `prepareDelivery` above.
+ */
+export async function deliverPrepared(deps: DeliverDeps, tenant: LedgerTenant, prepared: PreparedDelivery): Promise<DeliverResult> {
+  return deliverPreparedCore(deps, tenant, prepared, Date.now(), "precheck");
+}
+
+async function deliverPreparedCore(deps: DeliverDeps, tenant: LedgerTenant, prepared: PreparedDelivery, started: number, firstTiming: "prepare" | "precheck"): Promise<DeliverResult> {
+  const stage = stagesFor(deps);
   const now = deps.now ?? (() => new Date());
   const timing: Record<string, number> = {};
-  let t = Date.now();
+  let t = started;
   const mark = (name: string) => {
     timing[name] = Date.now() - t;
     t = Date.now();
   };
-  // 403 delivery_account_mismatch, 413 delivery_too_large, exactly as relayhistory.
-  const prepared = await prepareDelivery({ orgId: tenant.orgId, workspaceId: tenant.workspaceId }, batch);
   await stage("precheck", async () => assertTenantSegment(deps.target.keyRoot, tenant.orgId));
-  mark("prepare");
+  // Babysitter retention budget, before the claim: an over-budget routed batch writes nothing.
+  assertWithinBudget(deps, prepared.records, now());
+  mark(firstTiming);
 
   const sessions = [...new Map(prepared.records.filter((r) => r.session_id).map((r) => [pair(r.source, r.session_id), [r.source, r.session_id!] as [string, string]])).values()];
-  const claim = await stage("claim", () =>
+  const claim = await claimStage(deps, () =>
     deps.ledger.claim({
       tenant,
+      ...(deps.custody?{custody:deps.custody}:{}),
       originId: prepared.originId,
       batchId: prepared.batchId,
       batchDigest: prepared.batchDigest,
@@ -158,13 +346,14 @@ export async function deliverBatch(deps: DeliverDeps, tenant: LedgerTenant, batc
   if (claim.kind === "replay") {
     // Content-addressed: the same digest recomputes the same receipt. A mismatch is corruption, never a 200.
     if (claim.receiptId !== prepared.receipt.receiptId) throw new IngestUnavailable("replay", "receipt_mismatch");
-    return { receipt: withLimits(prepared), outcome: "replay", stats: { ...base, timing_ms: timing } };
+    return { custodyAck:claim.custodyAck,receipt: withLimits(prepared), outcome: "replay", stats: { ...base, timing_ms: timing } };
   }
   if (claim.kind === "batch_conflict") throw batchIdConflict(prepared, claim.currentDigest);
   if (claim.kind === "revision_conflict") throw revisionConflict(prepared.originId, claim.conflicts, claim.count);
   if (claim.kind === "replay_fast")
-    return { receipt: withLimits(prepared), outcome: "replay_fast", stats: { ...base, deleted_sessions: claim.deleted.length, stale: claim.stale.length, timing_ms: timing } };
+    return { custodyAck:claim.custodyAck,receipt: withLimits(prepared), outcome: "replay_fast", stats: { ...base, deleted_sessions: claim.deleted.length, stale: claim.stale.length, timing_ms: timing } };
 
+  if (deps.admissionGate) await stage("admission_gate", deps.admissionGate);
   // The deletion filter (records of sessions the user deleted from this origin are
   // acknowledged, not stored) and the replay fast path (records already stored at or
   // above their revision are acknowledged, not written again).
@@ -174,7 +363,7 @@ export async function deliverBatch(deps: DeliverDeps, tenant: LedgerTenant, batc
   prepared.records.forEach((r, i) => {
     if (!stale.has(i) && !(r.session_id && deleted.has(pair(r.source, r.session_id)))) keep.push(i);
   });
-  const work = () => writeAndCommit(deps, tenant, prepared, sessions, deleted, keep, claim.resets, { ...base, stale: stale.size }, timing, mark, now);
+  const work = () => writeAndCommit(deps, tenant, prepared, sessions, deleted, keep, claim.resets, claim.claimToken, { ...base, stale: stale.size }, timing, mark, now);
   if (!deps.slots) return work();
   const holder = (deps.requestId ?? (() => crypto.randomUUID()))();
   const slot = await stage("slot", () => deps.ledger.acquireSlot({ tenant, holder, ...deps.slots! }));
@@ -196,27 +385,77 @@ async function writeAndCommit(
   deleted: Set<string>,
   keep: number[],
   resets: number,
+  claimToken: string,
   base: Omit<DeliverResult["stats"], "timing_ms">,
   timing: Record<string, number>,
   mark: (name: string) => void,
   now: () => Date,
 ): Promise<DeliverResult> {
+  const stage = stagesFor(deps);
   const machineId = liveMachineId(tenant.workspaceId, prepared.originId, tenant.userId);
   let written: WriteResult | null = null;
   let staged = false;
   let replicaOutcome: ReplicaOutcome = "off";
   const receivedAt = now();
-  const grouped = keep.length > 0 ? groupRecords(keep.map((i) => prepared.records[i]!), receivedAt) : null;
+  const kept = keep.map((i) => prepared.records[i]!);
+  // Babysitter retention (babysitter-retention.ts), the same in every acceptance mode:
+  // register the buckets, write the full evidence to them, then let the record travel
+  // today's path as a payload-free stub in its OWN session. No mixed object (session
+  // chunk, staged batch, buffered stage, canonical generation) ever holds the payload.
+  const plan = babysitterRoutingActive(deps) ? planBabysitterBuckets(kept, receivedAt.getTime()) : null;
+  let refs: BucketRefs | null = null;
+  if (plan && plan.entries.length > 0) {
+    if (!deps.ledger.registerBabysitterRetention) throw new IngestUnavailable("babysitter_retention", "retention_not_configured");
+    // Registered BEFORE the bucket PUT, so no bucket exists without its row. SQL issues the refs,
+    // bound to this claim's fence/reset epochs and the current generation (40001/55000 otherwise).
+    // Register records each bucket object's write obligation (one dispatched invocation, this
+    // claim) BEFORE the PUT (write-obligation.ts), so a lost response is never "nothing written".
+    const bodies = bucketBodies(plan, receivedAt);
+    const registered = await stage("babysitter_retention", () =>
+      deps.ledger.registerBabysitterRetention!({ tenant, originId: prepared.originId, batchId: prepared.batchId, batchDigest: prepared.batchDigest,
+        claimToken, generation: deps.retentionGeneration!, resetEpoch: resets,
+        buckets: plan.requests, records: plan.entries }),
+    );
+    refs = await stage("babysitter_retention", async () => bucketRefs(plan, registered.objects));
+    mark("babysitter_retention");
+    // One create-only object per bucket (idempotent by batch digest): never collapsed. Each PUT
+    // runs under an enforced wall deadline; its definite outcome (acked with its own version id,
+    // or refused) is recorded on its invocation; an unknown one stays dispatched and fails the
+    // request (the client retries; the sweeper never treats it as nothing written).
+    if (plan.requests.length > 0) {
+      const wrote = await stage("babysitter_buckets", () =>
+        writeBucketObjects(deps.target, { orgId: tenant.orgId, workspaceId: tenant.workspaceId, userId: tenant.userId, originId: prepared.originId, batchDigest: prepared.batchDigest }, plan, refs!, bodies),
+      );
+      if (wrote.outcomes.length > 0 && deps.ledger.babysitterRetentionWritten)
+        await stage("babysitter_buckets", async () => { await deps.ledger.babysitterRetentionWritten!({ tenant, originId: prepared.originId, generation: deps.retentionGeneration!, claimToken, objects: wrote.outcomes }); });
+      if (wrote.unknown !== null) await stage("babysitter_buckets", async () => { throw wrote.unknown; });
+    }
+    mark("babysitter_buckets");
+  }
+  const records = plan && refs ? kept.map((r) => { const b = plan.of(r); return b ? babysitterStub(r, refs!.get(planKey(b))!) : r; }) : kept;
+  const grouped = keep.length > 0 ? groupRecords(records, receivedAt) : null;
+  if (deps.acceptanceMode === "buffered") {
+    if (!grouped || !deps.ledger.prepareBufferStage || !deps.ledger.commitBuffered || deps.replica?.mode && deps.replica.mode !== "off")
+      throw new IngestUnavailable("buffer", "buffer_not_configured");
+    const attempt = {tenant, originId:prepared.originId, batchId:prepared.batchId, batchDigest:prepared.batchDigest, claimToken};
+    const preparedStage = await stage("buffer_prepare", async () => prepareBufferedStage(deps.target.keyRoot,
+      {claim_token:claimToken,batch_digest:prepared.batchDigest,received_at:receivedAt.toISOString(),org_id:tenant.orgId,workspace_id:tenant.workspaceId,origin_id:prepared.originId,user_id:tenant.userId},
+      grouped.groups, grouped.index.map(indexes => indexes.map(i => keep[i]!))));
+    const intent = await stage("buffer_intent", () => deps.ledger.prepareBufferStage!({...attempt,...preparedStage.spec}));
+    mark("buffer_intent");
+    await stage("buffer_put", () => putBufferedStage(deps.target.store,preparedStage));
+    mark("buffer_put");
+    const ack=await stage("buffer_receipt", () => deps.ledger.commitBuffered!({...attempt,stageToken:intent.stageToken}));
+    let custodyAck:CurrentCustodyAck|undefined;
+    if(deps.custody){try{custodyAck=validatedCustodyAck(ack,deps.custody)}catch{throw new IngestUnavailable("buffer_receipt","custody_ack_missing")}}
+    mark("buffer_receipt");
+    return {custodyAck,receipt:withLimits(prepared),outcome:"accepted_buffered",stats:{...base,deleted_sessions:deleted.size,timing_ms:timing}};
+  }
   if (grouped && deps.inlineMaxSessions !== undefined && grouped.groups.length > deps.inlineMaxSessions) {
     // Too wide for this invocation: one staged object now, the sessions from the queue.
     if (!deps.fanout) throw new IngestUnavailable("staging", "fanout_not_configured");
-    const key = await stage("staging", () =>
-      stageGroups(
-        deps.target,
-        { batch_digest: prepared.batchDigest, received_at: receivedAt.toISOString(), org_id: tenant.orgId, workspace_id: tenant.workspaceId, origin_id: prepared.originId, user_id: tenant.userId },
-        grouped.groups,
-      ),
-    );
+    const header = { claim_token: claimToken, batch_digest: prepared.batchDigest, received_at: receivedAt.toISOString(), org_id: tenant.orgId, workspace_id: tenant.workspaceId, origin_id: prepared.originId, user_id: tenant.userId };
+    const key = await stage("staging", () => stageGroups(deps.target, header, grouped.groups));
     await stage("fanout", () => deps.fanout!(fanoutMessages(key, grouped.groups.length)));
     staged = true;
     mark("staging");
@@ -233,7 +472,7 @@ async function writeAndCommit(
         userId: tenant.userId,
         originId: prepared.originId,
         batchDigest: prepared.batchDigest,
-        records: keep.map((i) => prepared.records[i]!),
+        records,
       }),
     );
     mark("objects");
@@ -253,6 +492,7 @@ async function writeAndCommit(
       originId: prepared.originId,
       batchId: prepared.batchId,
       batchDigest: prepared.batchDigest,
+      claimToken,
       sessions: writtenSessions,
       machineId,
       // A staged batch's revisions become stored only when the fan-out has written them

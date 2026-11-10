@@ -1,0 +1,84 @@
+name: Copy reviewed Amp image
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "copy reviewed Amp image" after Khaliq approved the copy'
+        required: true
+      publication_run_id:
+        description: Successful reviewed image publication run
+        required: true
+      source_sha:
+        description: Approved exact native image source SHA
+        required: true
+      image_digest:
+        description: Approved signed OCI index digest
+        required: true
+      account_id:
+        description: Approved Cloudflare target account (not a credential)
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: amp-reviewed-image-copy
+  cancel-in-progress: false
+jobs:
+  copy:
+    if: ${{ github.ref == 'refs/heads/main' && github.actor == 'khaliqgant' && github.triggering_actor == 'khaliqgant' && inputs.confirm == 'copy reviewed Amp image' }}
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 25
+    environment: image-publish
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+    env:
+      CONFIRM: ${{ inputs.confirm }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      IMAGE_DIGEST: ${{ inputs.image_digest }}
+      PUBLISH_RUN_ID: ${{ inputs.publication_run_id }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ inputs.account_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Validate manual copy authority before downloading artifacts
+        run: |
+          node --input-type=module -e 'import { validateCopyRequest } from "./scripts/prepare-amp-image-copy.mjs"; validateCopyRequest(process.env)'
+          echo "ARTIFACT_DIR=$RUNNER_TEMP/approved-image" >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-receipt
+          path: ${{ env.ARTIFACT_DIR }}
+          run-id: ${{ inputs.publication_run_id }}
+          github-token: ${{ github.token }}
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
+      - name: Install standard OCI copy client
+        run: sudo apt-get update && sudo apt-get install --yes skopeo
+      - name: Verify both signatures, exact publication and current approved-source CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/prepare-amp-image-copy.mjs
+      - name: Copy the exact native image using a short-lived registry credential
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Minted for this copy; remove after the run. No long-lived CF API key.
+          CF_REGISTRY_TOKEN: ${{ secrets.AMP_CLOUDFLARE_REGISTRY_TOKEN }}
+        run: python3 scripts/copy-amp-image.py
+      - name: Recheck source CI and signed proof after destination verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/prepare-amp-image-copy.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amp-copy-receipt
+          path: ${{ env.ARTIFACT_DIR }}/amp-copy-receipt.json
+          if-no-files-found: error

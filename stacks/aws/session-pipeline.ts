@@ -11,6 +11,10 @@
  *       (a reconcile at its deadline invokes itself asynchronously with the listing cursor)
  *       EventBridge rule (every minute, ENABLED only with briefs.enabled) --> Lambda {"brief":true}
  *       (one session-brief tick: src/session-brief/worker.ts briefTick)
+ *       EventBridge rule (every minute, ENABLED only with bufferedSearchFeed.enabled) --> Lambda {"bufferedSearchFeed":true}
+ *       (one bounded buffered-stage feed run: src/session-pipeline/buffered-search-feed.ts)
+ *       EventBridge rule (every minute, ENABLED only with bufferedErasureDelete.enabled) --> Lambda {"bufferedErasureDelete":true}
+ *       (one bounded later-erasure delete pass over buffered rows: src/session-pipeline/buffered-erasure-delete.ts)
  *
  * The Lambda (src/session-pipeline/lambda.ts) runs the pipeline's own
  * object-landed + session-indexed handlers (Supabase `upsert_session_index`,
@@ -36,30 +40,75 @@ import * as AWS from "@alchemy.run/aws";
 import * as Effect from "effect/Effect";
 import { LAYOUT_VERSION } from "../../packages/object-store/src/layout.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
+import{derivedSchemaBuildPlugin}from "./derived-schema-build.ts";
 
 export interface SessionPipelineInputs {
   /** Turn the ClickHouse stage on (SEARCH_INDEX_ENABLED=1). Off: pointers only. */
   searchIndex?: boolean;
+  /** Default off; source identity must match the immutable CH copier binding. */
+  semanticCopy?: {enabled:boolean;sourceId:string};
+  /**
+   * Session analysis jobs (src/session-analysis, lane F1). Absent or `enabled: false`: the
+   * schedule is DISABLED and SESSION_ANALYSIS_ENABLED is "false". The model key comes only
+   * from the pipeline secret's `openai_api_key` (operator-loaded from 1Password).
+   */
+  analysisJobs?: {enabled:boolean};
+  /**
+   * Default off: the schedule stays DISABLED and neither feed variable is set. `enabled: true` must
+   * name the read gate's exact contract in `gateDeclared`, an operator's assertion that the read
+   * Worker already runs that gate, and needs `searchIndex: true`. The feeder's login is not wired
+   * here: it is read from the pipeline secret at run time, and without a valid one the feed stays off.
+   */
+  bufferedSearchFeed?: {
+    enabled: boolean;
+    gateDeclared?: string;
+    /** Stages per feed page (INGEST_BUFFERED_SEARCH_FEED_PAGE, 1-200). Absent: not set, so the feeder's default (50) applies. */
+    pageSize?: number;
+    /** Stages per second (INGEST_BUFFERED_SEARCH_FEED_RATE, 1-50). Absent: not set, so the feeder's default (5) applies. */
+    stagesPerSecond?: number;
+    /** Per-run time budget in ms (INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS, 5000-240000). Absent: not set, so the feeder's default (50000) applies. */
+    budgetMs?: number;
+    /**
+     * `true` sets INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION=on, the S version encoding the feeder requires
+     * before `enabled` can run (otherwise it refuses `version_encoding_not_armed`). Absent or `false`: not set,
+     * so the feeder's default (off) applies. Allowed independently of `enabled`: the feeder is its only reader,
+     * and with the feed off it only validates the literal (the erasure lane never reads it).
+     */
+    secondVersion?: boolean;
+    /** Settle window in seconds (INGEST_BUFFERED_SEARCH_FEED_SETTLE_S, 180-3600). Absent: not set, so the feeder's default (300) applies. */
+    settleSeconds?: number;
+  };
+  /**
+   * The buffered-row later-erasure delete lane (src/session-pipeline/buffered-erasure-delete.ts). Default off:
+   * its schedule stays DISABLED and INGEST_BUFFERED_ERASURE_DELETE is not set. `enabled: true` needs
+   * `bufferedSearchFeed.gateDeclared` (the runtime applies the feeder's ordering guard) and `searchIndex: true`
+   * (it deletes ClickHouse rows); it then also sets BUFFERED_SEARCH_FEED_GATE_DECLARED, even with the feed off.
+   * It uses the feeder's login from the pipeline secret; without a valid one it stays off.
+   */
+  bufferedErasureDelete?: {
+    enabled: boolean;
+    /** (claim, stage) pairs per ClickHouse page (INGEST_BUFFERED_ERASURE_PAGE, 1-200). Absent: the lane's default (25) applies. */
+    pageSize?: number;
+    /** Stage checks per second (INGEST_BUFFERED_ERASURE_RATE, 1-20). Absent: the lane's default (2) applies. */
+    stagesPerSecond?: number;
+    /** Per-run time budget in ms (INGEST_BUFFERED_ERASURE_BUDGET_MS, 5000-240000). Absent: the lane's default (40000) applies. */
+    budgetMs?: number;
+  };
+  /** Default off. `true` is refused until the reviewed normalized-prefix PutObject/KMS grant and publication migration exist. */
+  replayPages?: boolean;
+  /** Dormant full v1 analysis-cache worker; separate readonly source secret required. */
+  analysisCache?: boolean;
+  /**
+   * Default off. `true` is refused until the forget/reproject fix (migration 20261105031000)
+   * lands and is reviewed (docs/session-desktop-catalog.md); SESSION_DESKTOP_CATALOG_ENABLED stays "0".
+   */
+  desktopCatalog?: boolean;
   /** Lambda concurrency cap from the queue (2-10). Default 4. */
   maxConcurrency?: number;
   /** Reconcile cadence in minutes (15-120). Default 30; lookback is twice this. */
   reconcileMinutes?: number;
   /** Session briefs (src/session-brief). Absent or `enabled: false`: off. */
   briefs?: SessionBriefInputs;
-  /** Operator-invoked workspace retrospective. No schedule is created. */
-  coordinationReports?: CoordinationReportInputs;
-}
-
-export interface CoordinationReportInputs {
-  enabled: boolean;
-  organizationId: string;
-  workspaceId: string;
-  model?: string;
-  maxSessions?: number;
-  maxEvents?: number;
-  maxPackets?: number;
-  maxCalls?: number;
-  concurrency?: number;
 }
 
 /**
@@ -74,6 +123,13 @@ export interface SessionBriefInputs {
   backgroundDailyBudget?: number;
   /** Model attempts across all orgs per UTC day (SESSION_BRIEF_GLOBAL_DAILY_CAP). */
   globalDailyCap?: number;
+  /**
+   * How often the brief tick queues indexed sessions that have no brief at all
+   * (SESSION_BRIEF_SWEEP_SECONDS; store.ts sweepUnbriefed, 100 per sweep). Absent: not set,
+   * so the worker's default (0, off) applies. History that never receives new evidence is
+   * briefed only by this sweep; new evidence arms its own wakeup through indexing.
+   */
+  sweepSeconds?: number;
 }
 
 export const SESSION_PIPELINE_RESOURCES = [
@@ -96,8 +152,16 @@ export const SESSION_PIPELINE_RESOURCES = [
  * (transcript-store.ts expectedResources).
  */
 export const SESSION_BRIEF_RESOURCES = ["session-brief-schedule", "session-brief-permission"] as const;
+export const SESSION_SEMANTIC_COPY_RESOURCES=["session-semantic-copy-schedule","session-semantic-copy-permission"] as const;
+/** The analysis-job schedule (lane F1); its own reviewed phase, like the semantic copier. */
+export const SESSION_ANALYSIS_JOB_RESOURCES=["session-analysis-job-schedule","session-analysis-job-permission"] as const;
+export const SESSION_BUFFERED_SEARCH_FEED_RESOURCES = ["session-buffered-search-feed-schedule", "session-buffered-search-feed-permission"] as const;
+export const SESSION_BUFFERED_ERASURE_DELETE_RESOURCES = ["session-buffered-erasure-delete-schedule", "session-buffered-erasure-delete-permission"] as const;
+/** The read gate's contract id; a test pins it to BUFFERED_SEARCH_GATE_CONTRACT in the gate source. */
+export const BUFFERED_SEARCH_FEED_GATE_CONTRACT = "buffered-search-gate/v1";
 /** The brief tick runs this often. */
 export const BRIEF_SCHEDULE_MINUTES = 1;
+export const SESSION_ANALYSIS_CACHE_RESOURCES=["session-analysis-cache-schedule","session-analysis-cache-permission","session-analysis-reconcile-schedule","session-analysis-reconcile-permission"] as const;
 
 /** Function timeout; the queue's visibility timeout is six times this (AWS guidance for SQS sources). */
 export const FUNCTION_TIMEOUT_SECONDS = 300;
@@ -117,6 +181,10 @@ export interface SessionPipelineNames {
   secret: string;
   rule: string;
   briefRule: string;
+  semanticRule:string;
+  analysisJobRule:string;
+  bufferedSearchFeedRule: string;
+  bufferedErasureDeleteRule: string;
 }
 
 export function sessionPipelineNames(stage: string, accountId: string, region: string): SessionPipelineNames {
@@ -131,6 +199,10 @@ export function sessionPipelineNames(stage: string, accountId: string, region: s
     secret: `96bulls/${stage}/session-pipeline`,
     rule: n("session-reconcile"),
     briefRule: n("session-brief"),
+    semanticRule:n("session-semantic-copy"),
+    analysisJobRule:n("session-analysis-jobs"),
+    bufferedSearchFeedRule: n("session-buffered-search-feed"),
+    bufferedErasureDeleteRule: n("session-buffered-erasure-delete"),
   };
 }
 
@@ -139,39 +211,85 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "coordinationReports") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
+  if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
+  if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
+  // The pipeline role has only s3:ListBucket/GetObject: enabling the stage now would fail every replay put.
+  if (v.replayPages === true) refuse("transcriptStore.sessionPipeline.replayPages requires the reviewed normalized-prefix PutObject/KMS grant; not wired yet");
+  // Same gap for the analysis cache: publications are normalized-prefix S3 writes the role cannot make yet.
+  if (v.analysisCache === true) refuse("transcriptStore.sessionPipeline.analysisCache requires the reviewed normalized-prefix PutObject/KMS grant; not wired yet");
+  if (v.desktopCatalog !== undefined && typeof v.desktopCatalog !== "boolean") refuse("transcriptStore.sessionPipeline.desktopCatalog must be a boolean");
+  // SEARCH_INDEX_ENABLED=1 must never activate the desktop catalog writer; its own flag waits on 031000.
+  if (v.desktopCatalog === true) refuse("transcriptStore.sessionPipeline.desktopCatalog requires the forget/reproject fix (migration 20261105031000) and its review; not wired yet");
   if (v.maxConcurrency !== undefined && !(Number.isInteger(v.maxConcurrency) && (v.maxConcurrency as number) >= 2 && (v.maxConcurrency as number) <= 10))
     refuse("transcriptStore.sessionPipeline.maxConcurrency must be an integer from 2 to 10");
   if (v.reconcileMinutes !== undefined && !(Number.isInteger(v.reconcileMinutes) && (v.reconcileMinutes as number) >= 15 && (v.reconcileMinutes as number) <= 120))
     refuse("transcriptStore.sessionPipeline.reconcileMinutes must be an integer from 15 to 120");
+  if(v.analysisJobs!==undefined){const c=v.analysisJobs as Record<string,unknown>|null;
+    if(!c||typeof c!=="object"||Array.isArray(c)||Object.getPrototypeOf(c)!==Object.prototype||Object.keys(c).some(k=>k!=="enabled")||typeof c.enabled!=="boolean")refuse("transcriptStore.sessionPipeline.analysisJobs requires exactly { enabled: boolean }");}
+  if(v.semanticCopy!==undefined){const c=v.semanticCopy as Record<string,unknown>|null;
+    if(!c||typeof c!=="object"||Array.isArray(c)||Object.getPrototypeOf(c)!==Object.prototype||Object.keys(c).some(k=>k!=="enabled"&&k!=="sourceId")||typeof c.enabled!=="boolean"||typeof c.sourceId!=="string"||!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(c.sourceId))refuse("transcriptStore.sessionPipeline.semanticCopy requires enabled and an explicit sourceId");
+  }
+  if (v.bufferedSearchFeed !== undefined) {
+    const f = v.bufferedSearchFeed as Record<string, unknown> | null;
+    if (f === null || typeof f !== "object" || Array.isArray(f) || Object.getPrototypeOf(f) !== Object.prototype)
+      refuse("transcriptStore.sessionPipeline.bufferedSearchFeed must be a plain object");
+    for (const k of Object.keys(f))
+      if (k !== "enabled" && k !== "gateDeclared" && k !== "pageSize" && k !== "stagesPerSecond" && k !== "budgetMs" && k !== "secondVersion" && k !== "settleSeconds") refuse(`transcriptStore.sessionPipeline.bufferedSearchFeed.${k} is not a known setting`);
+    if (typeof f.enabled !== "boolean") refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.enabled must be a boolean");
+    if (f.gateDeclared !== undefined && f.gateDeclared !== BUFFERED_SEARCH_FEED_GATE_CONTRACT)
+      refuse(`transcriptStore.sessionPipeline.bufferedSearchFeed.gateDeclared must be exactly ${BUFFERED_SEARCH_FEED_GATE_CONTRACT}`);
+    if (f.enabled === true && f.gateDeclared !== BUFFERED_SEARCH_FEED_GATE_CONTRACT)
+      refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.enabled requires gateDeclared: deploy and verify the read gate first");
+    if (f.enabled === true && v.searchIndex !== true)
+      refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.enabled requires searchIndex: true");
+    // The same bounds as src/session-pipeline/buffered-search-feed.ts, so a value here is never refused at run time.
+    if (f.pageSize !== undefined && !(Number.isInteger(f.pageSize) && (f.pageSize as number) >= 1 && (f.pageSize as number) <= 200))
+      refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.pageSize must be an integer from 1 to 200");
+    if (f.stagesPerSecond !== undefined && !(Number.isInteger(f.stagesPerSecond) && (f.stagesPerSecond as number) >= 1 && (f.stagesPerSecond as number) <= 50))
+      refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.stagesPerSecond must be an integer from 1 to 50");
+    if (f.budgetMs !== undefined && !(Number.isInteger(f.budgetMs) && (f.budgetMs as number) >= 5_000 && (f.budgetMs as number) <= 240_000))
+      refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.budgetMs must be an integer from 5000 to 240000");
+    if (f.secondVersion !== undefined && typeof f.secondVersion !== "boolean") refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.secondVersion must be a boolean");
+    if (f.settleSeconds !== undefined && !(Number.isInteger(f.settleSeconds) && (f.settleSeconds as number) >= 180 && (f.settleSeconds as number) <= 3_600))
+      refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.settleSeconds must be an integer from 180 to 3600");
+  }
+  if (v.bufferedErasureDelete !== undefined) {
+    const e = v.bufferedErasureDelete as Record<string, unknown> | null;
+    if (e === null || typeof e !== "object" || Array.isArray(e) || Object.getPrototypeOf(e) !== Object.prototype)
+      refuse("transcriptStore.sessionPipeline.bufferedErasureDelete must be a plain object");
+    for (const k of Object.keys(e))
+      if (k !== "enabled" && k !== "pageSize" && k !== "stagesPerSecond" && k !== "budgetMs") refuse(`transcriptStore.sessionPipeline.bufferedErasureDelete.${k} is not a known setting`);
+    if (typeof e.enabled !== "boolean") refuse("transcriptStore.sessionPipeline.bufferedErasureDelete.enabled must be a boolean");
+    // The runtime applies the feeder's ordering guard (bufferedFeedGateRefusal) to this lane too.
+    if (e.enabled === true && (v.bufferedSearchFeed as { gateDeclared?: unknown } | undefined)?.gateDeclared !== BUFFERED_SEARCH_FEED_GATE_CONTRACT)
+      refuse("transcriptStore.sessionPipeline.bufferedErasureDelete.enabled requires bufferedSearchFeed.gateDeclared: deploy and verify the read gate first");
+    if (e.enabled === true && v.searchIndex !== true)
+      refuse("transcriptStore.sessionPipeline.bufferedErasureDelete.enabled requires searchIndex: true");
+    // The same bounds as src/session-pipeline/buffered-erasure-delete.ts, so a value here is never refused at run time.
+    if (e.pageSize !== undefined && !(Number.isInteger(e.pageSize) && (e.pageSize as number) >= 1 && (e.pageSize as number) <= 200))
+      refuse("transcriptStore.sessionPipeline.bufferedErasureDelete.pageSize must be an integer from 1 to 200");
+    if (e.stagesPerSecond !== undefined && !(Number.isInteger(e.stagesPerSecond) && (e.stagesPerSecond as number) >= 1 && (e.stagesPerSecond as number) <= 20))
+      refuse("transcriptStore.sessionPipeline.bufferedErasureDelete.stagesPerSecond must be an integer from 1 to 20");
+    if (e.budgetMs !== undefined && !(Number.isInteger(e.budgetMs) && (e.budgetMs as number) >= 5_000 && (e.budgetMs as number) <= 240_000))
+      refuse("transcriptStore.sessionPipeline.bufferedErasureDelete.budgetMs must be an integer from 5000 to 240000");
+  }
   if (v.briefs !== undefined) {
     const b = v.briefs as Record<string, unknown> | null;
     if (b === null || typeof b !== "object" || Array.isArray(b) || Object.getPrototypeOf(b) !== Object.prototype)
       refuse("transcriptStore.sessionPipeline.briefs must be a plain object");
     for (const k of Object.keys(b))
-      if (k !== "enabled" && k !== "backgroundDailyBudget" && k !== "globalDailyCap") refuse(`transcriptStore.sessionPipeline.briefs.${k} is not a known setting`);
+      if (k !== "enabled" && k !== "backgroundDailyBudget" && k !== "globalDailyCap" && k !== "sweepSeconds") refuse(`transcriptStore.sessionPipeline.briefs.${k} is not a known setting`);
     if (typeof b.enabled !== "boolean") refuse("transcriptStore.sessionPipeline.briefs.enabled must be a boolean");
     // The same bounds as src/session-brief/config.ts, so a value here is never silently clamped.
     if (b.backgroundDailyBudget !== undefined && !(Number.isInteger(b.backgroundDailyBudget) && (b.backgroundDailyBudget as number) >= 0 && (b.backgroundDailyBudget as number) <= 1_000_000))
       refuse("transcriptStore.sessionPipeline.briefs.backgroundDailyBudget must be an integer from 0 to 1000000");
     if (b.globalDailyCap !== undefined && !(Number.isInteger(b.globalDailyCap) && (b.globalDailyCap as number) >= 0 && (b.globalDailyCap as number) <= 10_000_000))
       refuse("transcriptStore.sessionPipeline.briefs.globalDailyCap must be an integer from 0 to 10000000");
-  }
-  if (v.coordinationReports !== undefined) {
-    const c = v.coordinationReports as Record<string, unknown> | null;
-    if (!c || typeof c !== "object" || Array.isArray(c) || Object.getPrototypeOf(c) !== Object.prototype)
-      refuse("transcriptStore.sessionPipeline.coordinationReports must be a plain object");
-    const limits: Record<string, number> = { maxSessions: 1000, maxEvents: 10000, maxPackets: 24, maxCalls: 24, concurrency: 4 };
-    for (const k of Object.keys(c))
-      if (!["enabled", "organizationId", "workspaceId", "model", ...Object.keys(limits)].includes(k))
-        refuse(`transcriptStore.sessionPipeline.coordinationReports.${k} is not a known setting`);
-    if (typeof c.enabled !== "boolean") refuse("coordinationReports.enabled must be a boolean");
-    for (const k of ["organizationId", "workspaceId"])
-      if (typeof c[k] !== "string" || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(c[k] as string)) refuse(`coordinationReports.${k} is invalid`);
-    if (c.model !== undefined && (typeof c.model !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(c.model))) refuse("coordinationReports.model is invalid");
-    for (const [k, max] of Object.entries(limits))
-      if (c[k] !== undefined && !(Number.isInteger(c[k]) && (c[k] as number) >= 1 && (c[k] as number) <= max)) refuse(`coordinationReports.${k} is outside its limit`);
+    // src/session-brief/config.ts bounds SESSION_BRIEF_SWEEP_SECONDS to 0-86400 (0 = off).
+    if (b.sweepSeconds !== undefined && !(Number.isInteger(b.sweepSeconds) && (b.sweepSeconds as number) >= 0 && (b.sweepSeconds as number) <= 86_400))
+      refuse("transcriptStore.sessionPipeline.briefs.sweepSeconds must be an integer from 0 to 86400");
   }
 }
 
@@ -190,9 +308,54 @@ export function pipelineKeyStatement(i: { accountId: string; region: string; buc
   };
 }
 
-/** Bucket-policy grants for the pipeline role: list keys, read session objects. Nothing else. */
-export function pipelineBucketStatements(i: { bucketArn: string; roleArn: string }) {
+/** The only object root the analysis worker writes (src/session-analysis/results.ts). */
+export const ANALYSIS_RESULT_OBJECT_GLOB = `${TENANT_KEY_BASE}/*/${LAYOUT_VERSION}/*/normalized/session-analysis-v2/*`;
+
+/**
+ * Lane F1, only with analysisJobs enabled: the pipeline role creates, verifies and erases
+ * analysis result objects (and their exact versions, the bucket is versioned), and only
+ * under normalized/session-analysis-v2/.
+ */
+export function pipelineAnalysisBucketStatements(i: { bucketArn: string; roleArn: string }) {
   return [
+    {
+      Sid: "SessionPipelineWritesAnalysisResults",
+      Effect: "Allow" as const,
+      Principal: { AWS: i.roleArn },
+      Action: ["s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion"],
+      Resource: [`${i.bucketArn}/${ANALYSIS_RESULT_OBJECT_GLOB}`],
+    },
+    {
+      // The sweeper's every-version erase lists the versions of exactly its result keys.
+      Sid: "SessionPipelineListsAnalysisResultVersions",
+      Effect: "Allow" as const,
+      Principal: { AWS: i.roleArn },
+      Action: ["s3:ListBucketVersions"],
+      Resource: [i.bucketArn],
+      Condition: { StringLike: { "s3:prefix": [ANALYSIS_RESULT_OBJECT_GLOB] } },
+    },
+  ];
+}
+
+/** Lane F1: SSE-KMS data keys for those objects only (encryption context = the object ARN). */
+export function pipelineAnalysisKeyStatement(i: { accountId: string; region: string; bucketName: string; roleArn: string }) {
+  return {
+    Sid: "SessionPipelineEncryptsAnalysisResultsViaS3",
+    Effect: "Allow" as const,
+    Principal: { AWS: i.roleArn },
+    Action: ["kms:GenerateDataKey", "kms:Encrypt"],
+    Resource: "*",
+    Condition: {
+      StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
+      StringLike: { "kms:EncryptionContext:aws:s3:arn": `arn:aws:s3:::${i.bucketName}/${ANALYSIS_RESULT_OBJECT_GLOB}` },
+    },
+  };
+}
+
+/** Bucket-policy grants for the pipeline role: list keys, read session objects (and, with analysis jobs, write their results). */
+export function pipelineBucketStatements(i: { bucketArn: string; roleArn: string; analysisResults?: boolean }) {
+  return [
+    ...(i.analysisResults ? pipelineAnalysisBucketStatements(i) : []),
     {
       Sid: "SessionPipelineLists",
       Effect: "Allow" as const,
@@ -299,22 +462,34 @@ export function sessionPipelineEnv(i: { stage: string; bucket: string; names: Se
     SESSION_PIPELINE_SECRET_ARN: i.names.secret,
     SESSION_PIPELINE_QUEUE_URL: i.names.queueUrl,
     SEARCH_INDEX_ENABLED: i.p.searchIndex ? "1" : "0",
+    SESSION_REPLAY_PAGES_ENABLED: i.p.replayPages ? "1" : "0",
+    SESSION_ANALYSIS_CACHE_ENABLED:i.p.analysisCache?"1":"0",
+    // Always "0" while desktopCatalog: true is refused; lifting that refusal is a reviewed PR.
+    SESSION_DESKTOP_CATALOG_ENABLED: "0",
+    SESSION_SEMANTIC_COPY_ENABLED:i.p.semanticCopy?.enabled?"1":"0",
+    SESSION_SEARCH_FEATURE_SOURCE_ID:i.p.semanticCopy?.sourceId??"",
+    SESSION_ANALYSIS_ENABLED:i.p.analysisJobs?.enabled?"true":"false",
+    // Only when armed, so a default deploy leaves the feed and the erasure lane at their source default of off.
+    ...(i.p.bufferedSearchFeed?.enabled === true ? { INGEST_BUFFERED_SEARCH_FEED: "on" } : {}),
+    // Both lanes apply the same ordering guard: declared once when either is armed.
+    ...(i.p.bufferedSearchFeed?.enabled === true || i.p.bufferedErasureDelete?.enabled === true ? { BUFFERED_SEARCH_FEED_GATE_DECLARED: i.p.bufferedSearchFeed?.gateDeclared ?? "" } : {}),
+    ...(i.p.bufferedSearchFeed?.pageSize !== undefined ? { INGEST_BUFFERED_SEARCH_FEED_PAGE: String(i.p.bufferedSearchFeed.pageSize) } : {}),
+    ...(i.p.bufferedSearchFeed?.stagesPerSecond !== undefined ? { INGEST_BUFFERED_SEARCH_FEED_RATE: String(i.p.bufferedSearchFeed.stagesPerSecond) } : {}),
+    ...(i.p.bufferedSearchFeed?.budgetMs !== undefined ? { INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS: String(i.p.bufferedSearchFeed.budgetMs) } : {}),
+    ...(i.p.bufferedSearchFeed?.secondVersion === true ? { INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION: "on" } : {}),
+    ...(i.p.bufferedSearchFeed?.settleSeconds !== undefined ? { INGEST_BUFFERED_SEARCH_FEED_SETTLE_S: String(i.p.bufferedSearchFeed.settleSeconds) } : {}),
+    ...(i.p.bufferedErasureDelete?.enabled === true ? { INGEST_BUFFERED_ERASURE_DELETE: "on" } : {}),
+    ...(i.p.bufferedErasureDelete?.pageSize !== undefined ? { INGEST_BUFFERED_ERASURE_PAGE: String(i.p.bufferedErasureDelete.pageSize) } : {}),
+    ...(i.p.bufferedErasureDelete?.stagesPerSecond !== undefined ? { INGEST_BUFFERED_ERASURE_RATE: String(i.p.bufferedErasureDelete.stagesPerSecond) } : {}),
+    ...(i.p.bufferedErasureDelete?.budgetMs !== undefined ? { INGEST_BUFFERED_ERASURE_BUDGET_MS: String(i.p.bufferedErasureDelete.budgetMs) } : {}),
     PIPELINE_FANOUT: "off",
     PIPELINE_RECONCILE_LOOKBACK_MINUTES: String(2 * (i.p.reconcileMinutes ?? 30)),
     HOOPDB_POOL_MAX: "4",
     NODE_OPTIONS: "--enable-source-maps",
     SESSION_BRIEF_ENABLED: i.p.briefs?.enabled ? "true" : "false",
-    COORDINATION_REPORT_ENABLED: i.p.coordinationReports?.enabled ? "true" : "false",
-    ...(i.p.coordinationReports ? {
-      COORDINATION_REPORT_ORG_ID: i.p.coordinationReports.organizationId,
-      COORDINATION_REPORT_WORKSPACE_ID: i.p.coordinationReports.workspaceId,
-      ...(i.p.coordinationReports.model ? { COORDINATION_REPORT_MODEL: i.p.coordinationReports.model } : {}),
-      ...Object.fromEntries(Object.entries({ maxSessions: "MAX_SESSIONS", maxEvents: "MAX_EVENTS", maxPackets: "MAX_PACKETS", maxCalls: "MAX_CALLS", concurrency: "CONCURRENCY" })
-        .filter(([key]) => i.p.coordinationReports![key as keyof CoordinationReportInputs] !== undefined)
-        .map(([key, suffix]) => [`COORDINATION_REPORT_${suffix}`, String(i.p.coordinationReports![key as keyof CoordinationReportInputs])])),
-    } : {}),
     ...(i.p.briefs?.backgroundDailyBudget !== undefined ? { SESSION_BRIEF_BACKGROUND_DAILY_BUDGET: String(i.p.briefs.backgroundDailyBudget) } : {}),
     ...(i.p.briefs?.globalDailyCap !== undefined ? { SESSION_BRIEF_GLOBAL_DAILY_CAP: String(i.p.briefs.globalDailyCap) } : {}),
+    ...(i.p.briefs?.sweepSeconds !== undefined ? { SESSION_BRIEF_SWEEP_SECONDS: String(i.p.briefs.sweepSeconds) } : {}),
   };
 }
 
@@ -349,7 +524,7 @@ export function sessionPipelineFunctionProps(i: SessionPipelineStageInputs & { b
     env: sessionPipelineEnv({ stage: i.stage, bucket: i.bucket, names, p: i.p }),
     logging: { retention: "30 days" },
     functionUrl: false as const,
-    build: { tsconfig: "tsconfig.json" },
+    build: { tsconfig: "tsconfig.json",plugins:[derivedSchemaBuildPlugin()] },
   };
 }
 
@@ -358,7 +533,7 @@ export function sessionPipelineFunctionProps(i: SessionPipelineStageInputs & { b
  * and brief rules, this account) and the function's own role (the reconcile chain),
  * all `lambda:InvokeFunction` only. Nothing public, no Function URL action.
  */
-export function sessionPipelinePermissions(i: { accountId: string; functionName: string; ruleArn: string; briefRuleArn: string; roleArn: string }) {
+export function sessionPipelinePermissions(i: { accountId: string; functionName: string; ruleArn: string; briefRuleArn: string; analysisRuleArn?:string; analysisReconcileRuleArn?:string; semanticRuleArn?:string; analysisJobRuleArn?:string; bufferedSearchFeedRuleArn?: string; bufferedErasureDeleteRuleArn?: string; roleArn: string }) {
   return [
     {
       id: "session-reconcile-permission",
@@ -390,6 +565,12 @@ export function sessionPipelinePermissions(i: { accountId: string; functionName:
         sourceAccount: i.accountId,
       },
     },
+    ...(i.analysisReconcileRuleArn?[{id:"session-analysis-reconcile-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.analysisReconcileRuleArn,sourceAccount:i.accountId}}]:[]),
+    ...(i.analysisRuleArn?[{id:"session-analysis-cache-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.analysisRuleArn,sourceAccount:i.accountId}}]:[]),
+    ...(i.semanticRuleArn?[{id:"session-semantic-copy-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.semanticRuleArn,sourceAccount:i.accountId}}]:[]),
+    ...(i.analysisJobRuleArn?[{id:"session-analysis-job-permission",props:{action:"lambda:InvokeFunction",functionName:i.functionName,principal:"events.amazonaws.com",sourceArn:i.analysisJobRuleArn,sourceAccount:i.accountId}}]:[]),
+    ...(i.bufferedSearchFeedRuleArn ? [{ id: "session-buffered-search-feed-permission", props: { action: "lambda:InvokeFunction", functionName: i.functionName, principal: "events.amazonaws.com", sourceArn: i.bufferedSearchFeedRuleArn, sourceAccount: i.accountId } }] : []),
+    ...(i.bufferedErasureDeleteRuleArn ? [{ id: "session-buffered-erasure-delete-permission", props: { action: "lambda:InvokeFunction", functionName: i.functionName, principal: "events.amazonaws.com", sourceArn: i.bufferedErasureDeleteRuleArn, sourceAccount: i.accountId } }] : []),
   ] as const;
 }
 
@@ -404,6 +585,48 @@ export function briefScheduleProps(i: { names: SessionPipelineNames; functionArn
     scheduleExpression: `rate(${BRIEF_SCHEDULE_MINUTES} minute)`,
     state: i.p.briefs?.enabled ? ("ENABLED" as const) : ("DISABLED" as const),
     targets: [{ Id: "session-pipeline", Arn: i.functionArn, Input: JSON.stringify({ brief: true }) }],
+    tags: i.tags,
+  };
+}
+
+/** Disabled by default; source definition alone does not enable a running rule. */
+export function analysisCacheScheduleProps(i:{names:SessionPipelineNames;functionArn:string;p:SessionPipelineInputs;tags:Record<string,string>}){
+ return {name:i.names.rule+"-analysis-cache",description:"96bulls bounded demand analysis-cache refresh",scheduleExpression:"rate(1 minute)",state:i.p.analysisCache?"ENABLED" as const:"DISABLED" as const,targets:[{Id:"session-pipeline",Arn:i.functionArn,Input:JSON.stringify({analysisCache:true})}],tags:i.tags};
+}
+
+export function analysisReconcileScheduleProps(i:{names:SessionPipelineNames;functionArn:string;p:SessionPipelineInputs;tags:Record<string,string>}){
+ return {name:i.names.rule+"-analysis-backfill",description:"96bulls bounded analysis-cache source discovery",scheduleExpression:"rate(30 minutes)",state:i.p.analysisCache?"ENABLED" as const:"DISABLED" as const,targets:[{Id:"session-pipeline",Arn:i.functionArn,Input:JSON.stringify({analysisCacheReconcile:true})}],tags:i.tags};
+}
+
+/** One bounded background feature tick; defaults disabled and carries no credentials. */
+export function semanticCopyScheduleProps(i:{names:SessionPipelineNames;functionArn:string;p:SessionPipelineInputs;tags:Record<string,string>}){
+ return {name:i.names.semanticRule,description:"96bulls verified global feature copy",scheduleExpression:"rate(1 minute)",state:i.p.semanticCopy?.enabled?("ENABLED" as const):("DISABLED" as const),targets:[{Id:"session-pipeline",Arn:i.functionArn,Input:JSON.stringify({semanticCopy:true})}],tags:i.tags};
+}
+
+/** One analysis-job tick a minute (lane F1); DISABLED unless `analysisJobs.enabled`. */
+export function analysisJobScheduleProps(i:{names:SessionPipelineNames;functionArn:string;p:SessionPipelineInputs;tags:Record<string,string>}){
+ return {name:i.names.analysisJobRule,description:"96bulls session analysis jobs (relayhistory engine port)",scheduleExpression:"rate(1 minute)",state:i.p.analysisJobs?.enabled?("ENABLED" as const):("DISABLED" as const),targets:[{Id:"session-pipeline",Arn:i.functionArn,Input:JSON.stringify({sessionAnalysis:true})}],tags:i.tags};
+}
+/** One bounded buffered-stage feed run per minute; DISABLED by default and carries no credentials. */
+export function bufferedSearchFeedScheduleProps(i: { names: SessionPipelineNames; functionArn: string; p: SessionPipelineInputs; tags: Record<string, string> }) {
+  return {
+    name: i.names.bufferedSearchFeedRule,
+    description: "96bulls bounded buffered-stage search feed",
+    scheduleExpression: "rate(1 minute)",
+    state: i.p.bufferedSearchFeed?.enabled === true ? ("ENABLED" as const) : ("DISABLED" as const),
+    targets: [{ Id: "session-pipeline", Arn: i.functionArn, Input: JSON.stringify({ bufferedSearchFeed: true }) }],
+    tags: i.tags,
+  };
+}
+
+/** One bounded buffered-row later-erasure delete pass per minute; DISABLED by default and carries no credentials. */
+export function bufferedErasureDeleteScheduleProps(i: { names: SessionPipelineNames; functionArn: string; p: SessionPipelineInputs; tags: Record<string, string> }) {
+  return {
+    name: i.names.bufferedErasureDeleteRule,
+    description: "96bulls bounded buffered-row later-erasure delete",
+    scheduleExpression: "rate(1 minute)",
+    state: i.p.bufferedErasureDelete?.enabled === true ? ("ENABLED" as const) : ("DISABLED" as const),
+    targets: [{ Id: "session-pipeline", Arn: i.functionArn, Input: JSON.stringify({ bufferedErasureDelete: true }) }],
     tags: i.tags,
   };
 }
@@ -465,11 +688,23 @@ export const sessionPipelineWiring = (
       tags: i.tags("session-pipeline"),
     } as never);
     const briefRule = yield* AWS.EventBridge.Rule("session-brief-schedule", briefScheduleProps({ names, functionArn: i.fn.functionArn as unknown as string, p: i.p, tags: i.tags("session-pipeline") }) as never);
+    const analysisRule=yield* AWS.EventBridge.Rule("session-analysis-cache-schedule",analysisCacheScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
+    const analysisReconcileRule=yield* AWS.EventBridge.Rule("session-analysis-reconcile-schedule",analysisReconcileScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
+    const semanticRule=yield* AWS.EventBridge.Rule("session-semantic-copy-schedule",semanticCopyScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
+    const analysisJobRule=yield* AWS.EventBridge.Rule("session-analysis-job-schedule",analysisJobScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
+    const bufferedSearchFeedRule = yield* AWS.EventBridge.Rule("session-buffered-search-feed-schedule", bufferedSearchFeedScheduleProps({ names, functionArn: i.fn.functionArn as unknown as string, p: i.p, tags: i.tags("session-pipeline") }) as never);
+    const bufferedErasureDeleteRule = yield* AWS.EventBridge.Rule("session-buffered-erasure-delete-schedule", bufferedErasureDeleteScheduleProps({ names, functionArn: i.fn.functionArn as unknown as string, p: i.p, tags: i.tags("session-pipeline") }) as never);
     for (const { id, props } of sessionPipelinePermissions({
       accountId: i.accountId,
       functionName: i.fn.functionName as unknown as string,
       ruleArn: (rule as unknown as { ruleArn: string }).ruleArn,
       briefRuleArn: (briefRule as unknown as { ruleArn: string }).ruleArn,
+      analysisRuleArn:(analysisRule as unknown as {ruleArn:string}).ruleArn,
+      analysisReconcileRuleArn:(analysisReconcileRule as unknown as {ruleArn:string}).ruleArn,
+      semanticRuleArn:(semanticRule as unknown as {ruleArn:string}).ruleArn,
+      analysisJobRuleArn:(analysisJobRule as unknown as {ruleArn:string}).ruleArn,
+      bufferedSearchFeedRuleArn: (bufferedSearchFeedRule as unknown as { ruleArn: string }).ruleArn,
+      bufferedErasureDeleteRuleArn: (bufferedErasureDeleteRule as unknown as { ruleArn: string }).ruleArn,
       roleArn,
     }))
       yield* AWS.Lambda.Permission(id, props as never);

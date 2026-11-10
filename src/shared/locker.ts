@@ -12,7 +12,7 @@
  * HMAC keys are refused. Production AWS S3 does not set LOCKER_PROVIDER.
  */
 import { readFile } from "node:fs/promises";
-import { createGcsStore, createS3Store, objectStoreManifestReader, type ManifestReader, type RawStore } from "./vendor.ts";
+import { createGcsStore, createS3Store, isObjectStoreError, objectKey, objectStoreManifestReader, readAll, type ManifestReader, type ObjectStore, type RawStore } from "./vendor.ts";
 import type { AwsCredentials } from "../../packages/object-store/src/sigv4.ts";
 import type { GcsToken } from "../../packages/object-store/src/gcs.ts";
 import { optional, required } from "./env.ts";
@@ -101,8 +101,20 @@ export async function gcsMetadataToken(env: NodeJS.ProcessEnv = process.env, fet
   return { accessToken: body.access_token, ...(expiresAt ? { expiresAt } : {}) };
 }
 
+/**
+ * Optional overrides for buildLockerStore; omitted, the store is exactly as before.
+ *   fetch        the object requests' fetch (e.g. one that carries a request's abort signal)
+ *   credentials  the S3 credentials (e.g. one process-wide cached provider shared by short-lived stores)
+ *   gcsToken     the GCS token source (likewise)
+ */
+export interface LockerStoreOptions {
+  fetch?: typeof fetch;
+  credentials?: AwsCredentials | (() => Promise<AwsCredentials>);
+  gcsToken?: () => Promise<GcsToken>;
+}
+
 /** Build the store described by env. Does not cache and does not read process.env unless env is omitted. */
-export function buildLockerStore(env: NodeJS.ProcessEnv = process.env): RawStore {
+export function buildLockerStore(env: NodeJS.ProcessEnv = process.env, options: LockerStoreOptions = {}): RawStore {
   assertLockerSelection(env);
   const provider = lockerProvider(env);
   const bucket = env.LOCKER_BUCKET;
@@ -114,7 +126,8 @@ export function buildLockerStore(env: NodeJS.ProcessEnv = process.env): RawStore
       store: createGcsStore({
         bucket,
         ...(env.LOCKER_ENDPOINT ? { baseUrl: env.LOCKER_ENDPOINT } : {}),
-        token: () => gcsMetadataToken(env),
+        token: options.gcsToken ?? (() => gcsMetadataToken(env)),
+        ...(options.fetch ? { fetch: options.fetch } : {}),
       }),
     };
   }
@@ -125,7 +138,8 @@ export function buildLockerStore(env: NodeJS.ProcessEnv = process.env): RawStore
       bucket,
       region: env.LOCKER_REGION || "us-east-1",
       ...(env.LOCKER_ENDPOINT ? { endpoint: env.LOCKER_ENDPOINT } : {}),
-      credentials: lockerCredentials(env),
+      credentials: options.credentials ?? lockerCredentials(env),
+      ...(options.fetch ? { fetch: options.fetch } : {}),
     }),
   };
 }
@@ -142,4 +156,57 @@ export function lockerStore(): RawStore {
 export function lockerManifestReader(): ManifestReader {
   const raw = lockerStore();
   return objectStoreManifestReader(raw.store, { provider: raw.provider, bucket: raw.bucket });
+}
+
+/**
+ * Conditional writes, proven against the live backend. Both adapters send them already: S3 / MinIO a
+ * create-only PUT with `If-None-Match: *` and a compare-and-swap with `If-Match: <etag>`; GCS
+ * `x-goog-if-generation-match: 0` and `x-goog-if-generation-match: <generation>`. A backend that silently
+ * ignores the header (an old MinIO, a proxy that strips it, an S3 look-alike) would turn a create into an
+ * overwrite, so a feature that depends on them (the self-host async admission inbox and its privacy
+ * journal) calls this once at startup and refuses to start when it throws.
+ *
+ * The probe writes one small object at `key` (create, refused re-create, CAS, refused stale CAS), checks
+ * the stored bytes, and deletes it best effort. Errors name the failed property and an error code only,
+ * never a key, a body or a credential.
+ */
+export class ConditionalWriteUnsupported extends Error {
+  constructor(readonly property: "create_only" | "compare_and_swap" | "probe_failed", detail: string) {
+    super(`96bulls: the Locker backend does not honour conditional writes (${property}: ${detail}); refusing to start`);
+    this.name = "ConditionalWriteUnsupported";
+  }
+}
+
+export async function assertConditionalWrites(store: ObjectStore, key: string): Promise<void> {
+  const k = objectKey(key);
+  const text = (v: string) => new TextEncoder().encode(JSON.stringify({ v: 1, kind: "conditional-write-probe", step: v }));
+  const codeOf = (error: unknown) => {
+    const c = (error as { code?: unknown })?.code;
+    return typeof c === "string" && /^[A-Za-z0-9_]{1,64}$/.test(c) ? c : "error";
+  };
+  const step = async <T>(name: string, work: () => Promise<T>): Promise<T> => {
+    try { return await work(); } catch (error) { throw new ConditionalWriteUnsupported("probe_failed", `${name} ${codeOf(error)}`); }
+  };
+  const refused = async (property: "create_only" | "compare_and_swap", expect: "already_exists" | "precondition_failed", work: () => Promise<unknown>) => {
+    try {
+      await work();
+    } catch (error) {
+      if (isObjectStoreError(error, expect)) return;
+      throw new ConditionalWriteUnsupported("probe_failed", `${property} ${codeOf(error)}`);
+    }
+    throw new ConditionalWriteUnsupported(property, "a conditional PUT that must be refused succeeded");
+  };
+  try {
+    const first = await step("create", () => store.put(k, text("a"), { ifNoneMatch: true, contentType: "application/json" }));
+    if (!first.created) throw new ConditionalWriteUnsupported("create_only", "the probe object already existed");
+    // A create over an existing object with other bytes must be refused (S3 412 / GCS 412).
+    await refused("create_only", "already_exists", () => store.put(k, text("b"), { ifNoneMatch: true, contentType: "application/json" }));
+    const swapped = await step("swap", () => store.put(k, text("c"), { ifMatch: first.version, contentType: "application/json" }));
+    // The first version is now stale: a CAS against it must be refused.
+    await refused("compare_and_swap", "precondition_failed", () => store.put(k, text("d"), { ifMatch: first.version, contentType: "application/json" }));
+    const stored = new TextDecoder().decode(await step("read", async () => readAll((await store.getObject(k)).body)));
+    if (stored !== new TextDecoder().decode(text("c")) || !swapped.created) throw new ConditionalWriteUnsupported("compare_and_swap", "the stored bytes are not the last accepted write");
+  } finally {
+    await store.delete(k).catch(() => {});
+  }
 }

@@ -65,7 +65,7 @@ import {
   type ManifestV1,
   type RawFormat,
 } from "../lib/pipeline/object-layout.js";
-import { sealRawChunk } from "../lib/pipeline/raw-chunks.js";
+import { sealRawChunk } from "../lib/scrub-engine/index.js";
 
 /** Stages a client may report about itself. Server stages cannot be forged. */
 const CLIENT_STAGES: readonly PipelineStage[] = [

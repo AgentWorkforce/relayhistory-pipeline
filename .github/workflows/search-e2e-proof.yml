@@ -21,7 +21,7 @@ permissions:
 jobs:
   e2e-proof-execution:
     name: e2e-proof execution, verdict in report
-    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -65,7 +65,7 @@ jobs:
           path: e2e-report.json
   diagnose:
     if: ${{ inputs.diagnose }}
-    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 120
     services:
       clickhouse:
@@ -106,7 +106,7 @@ jobs:
             variants-report.json
   compare:
     if: ${{ inputs.compare }}
-    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 120
     services:
       clickhouse:

@@ -182,7 +182,8 @@ Prefix lookup is served only by `sessions.search_session_directory`
 `AgentPrefixRequiresRpcError` (`directAgentPrefix`), raised before any SQL, and there is
 no direct prefix query. Under RLS the direct path could not bound a broad prefix: its
 bounds and LIKE recheck are estimated as independent, and PostgreSQL 15 and 17 chose a
-Seq Scan of the whole tenant (`docs/evidence/session-directory-plans.md`).
+Seq Scan of the whole tenant (local evidence from `scripts/session-directory-plan-evidence.ts`;
+not committed).
 
 In the RPC, a prefix needs at least three meaningful characters (`22023` otherwise).
 Before the page runs, the RPC counts the prefix's candidates, stopping after 5,001:
@@ -252,7 +253,7 @@ applies, and `session-directory-precedence.test.ts` pins:
   the pointer title returns on the next projection. With briefs off no row exists and
   this rule changes nothing.
 - **Short summary producers:** `writeShortSummary` never lets a non-brief producer
-  (Bob Costas's extractive summary) replace a `session-brief/*` summary; the brief
+  (Bob Costas's summary, extractive or model-written with `BOB_COSTAS_MODEL`) replace a `session-brief/*` summary; the brief
   replaces any summary not newer than it. Clearing (deletion, quarantine) still clears it.
 - **Deterministic ties:** latest `last_activity_at`, then highest `revision`, then
   highest `machine_id`.

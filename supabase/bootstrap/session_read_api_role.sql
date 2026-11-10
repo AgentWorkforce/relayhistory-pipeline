@@ -1,21 +1,37 @@
 -- The session read API's Supabase role (src/session-read-api/liveness.ts).
 --
--- The read API serves transcript reads from ClickHouse. It asks Supabase only
+-- The read API serves transcript reads from ClickHouse. It asks Supabase
 -- whether a session is erased (every pointer row tombstoned) and when it began
--- (the history floor). So this role may read six id/time columns of the pointer
--- table and nothing else: no content, no titles, no metadata, no other table,
--- no function, no writes.
+-- (the history floor), and, for session timing, where the session's canonical
+-- S3 objects are (session-timing-source.ts SESSION_POINTERS_SQL, the query of
+-- sessions.session_directory_pointers). So this role may read the id/time and
+-- object-pointer columns of the pointer table, plus the id and event-projection
+-- epoch columns of sessions.session_directory for the Postgres search backend's
+-- completeness check, and nothing else: no content, no titles, no metadata, no
+-- other table, no writes. Its function grants are made
+-- by migration 20261105034000 (EXECUTE on sessions.list_session_directory_for /
+-- session_directory_activity_for, the directory list and activity pinned to the
+-- same tenant settings), not here.
 --
 --   role      LOGIN NOINHERIT NOBYPASSRLS; no SUPERUSER, CREATEDB, CREATEROLE or
 --             REPLICATION; read-only transactions; statement_timeout 2s.
---   grants    USAGE on schema sessions; SELECT (org_id, workspace_id, harness,
---             session_id, created_at, deleted_at) on sessions.session_index.
+--   grants    USAGE on schema sessions; SELECT on sessions.session_index of
+--             (org_id, workspace_id, harness, session_id, created_at, deleted_at)
+--             and the pointer columns (canonical_session_id, machine_id,
+--             canonical_machine_id, user_id, storage_provider, bucket,
+--             manifest_key, content_sha256, raw_format, revision).
+--             Narrowing back is a REVOKE of the pointer columns; re-running an
+--             older copy of this file does not remove them.
 --   RLS       session_index already has RLS on. The policy below admits only rows
 --             of the org and workspace that the current transaction bound with
 --             set_config('bulls96_read.org_id' / 'bulls96_read.workspace_id', ..., true)
 --             (TENANT_SETTINGS_SQL). A setting never set on the connection is NULL;
 --             after a transaction-local set_config ends it reads as '' on that pooled
 --             connection. Neither matches a row: org_id and workspace_id are never NULL or ''.
+--
+-- The bare role is created NOLOGIN before migrate by session_read_api_roles.sql (the
+-- migration's grant needs it); this file then makes it LOGIN. The CREATE below remains
+-- for a database whose migrate predates that bootstrap.
 --
 -- Idempotent. Run as `postgres` (Supabase) after the HoopDb migrations; set the
 -- password separately (never in this file), then verify:
@@ -41,8 +57,22 @@ ALTER ROLE bulls96_read_api SET statement_timeout = '2s';
 ALTER ROLE bulls96_read_api SET default_transaction_read_only = on;
 
 GRANT USAGE ON SCHEMA sessions TO bulls96_read_api;
-GRANT SELECT (org_id, workspace_id, harness, session_id, created_at, deleted_at)
+GRANT SELECT (org_id, workspace_id, harness, session_id, created_at, deleted_at,
+              canonical_session_id, machine_id, canonical_machine_id, user_id,
+              storage_provider, bucket, manifest_key, content_sha256, raw_format, revision)
   ON sessions.session_index TO bulls96_read_api;
+
+-- The Postgres search backend's completeness check (postgres-search-state.ts partials) compares the
+-- search projection's epoch with the directory's. Ids and epoch columns only, tenant-bound below; no
+-- title, summary, metadata or other content column. Everything else about the directory stays behind
+-- the two definer functions.
+GRANT SELECT (org_id, workspace_id, harness, session_id, event_projection_ready, event_projection_epoch)
+  ON sessions.session_directory TO bulls96_read_api;
+
+DROP POLICY IF EXISTS session_directory_read_api ON sessions.session_directory;
+CREATE POLICY session_directory_read_api ON sessions.session_directory
+  AS PERMISSIVE FOR SELECT TO bulls96_read_api
+  USING (org_id = current_setting('bulls96_read.org_id', true) AND workspace_id = current_setting('bulls96_read.workspace_id', true));
 
 DROP POLICY IF EXISTS session_index_read_api ON sessions.session_index;
 CREATE POLICY session_index_read_api ON sessions.session_index

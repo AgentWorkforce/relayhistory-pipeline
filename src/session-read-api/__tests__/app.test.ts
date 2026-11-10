@@ -104,8 +104,9 @@ describe("the 501 fallback contract", () => {
     ["/v1/events?workspace=ws-a&q=x&order=asc", "search_ascending"],
     ["/v1/events?workspace=ws-a&q=x&limit=101", "search_limit"],
     ["/v1/events?workspace=ws-a&q=x&cursor=events-v2:abc", "foreign_cursor"],
-    ["/v1/sessions?workspace=ws-a", "route"],
-    ["/v1/sessions/s-1/timing?workspace=ws-a&source=codex", "route"],
+    // P3b: registered directory routes; off the canary allowlist (none here) they fall back.
+    ["/v1/sessions?workspace=ws-a", "directory_workspace_not_enabled"],
+    ["/v1/sessions/s-1/timing?workspace=ws-a&source=codex", "timing_workspace_not_enabled"],
   ])("%s → 501 %s", async (path, reason) => {
     const { get } = api();
     const r = await get(path);
@@ -150,7 +151,7 @@ describe("history floor and erasure", () => {
 
   test("a search cursor page that reaches the floor ends cleanly with a relayhistory continuation, never a 501", async () => {
     const cand = { ts_ms: Date.parse("2026-09-02T00:00:00Z"), session_id: "s-1", source: "codex", machine_id: "m-1", kind: "message", event_id: "e-9" };
-    const newest = [{ ...cand, org_id: "org-a", workspace_id: "ws-a", type: "assistant", user_id: "u-1", actor_name: "", actor_role: "", subagent_id: "", project_id: "", task_title: "", task_ref: "", tags: [], files_touched: [], tool_name: "", tool_status: "", content: "needle", in_budget: 1 }];
+    const newest = [{ ...cand, org_id: "org-a", workspace_id: "ws-a", type: "assistant", user_id: "u-1", actor_name: "", actor_role: "", subagent_id: "", project_id: "", task_title: "", task_ref: "", tags: [], files_touched: [], tool_name: "", tool_status: "", content: "needle", in_budget: 1, origin: "canonical", origin_claim_token: "" }];
     const { ch, eventQueries } = stubCh({ candidates: [cand], newest });
     const { get, logs } = api({ ch, completeSinceMs: floor });
     const cursor = encodeCursor({ tsMs: Date.parse("2026-09-03T00:00:00Z"), sessionId: "s-1", source: "codex", machineId: "m-1", kind: "message", eventId: "e-10" });

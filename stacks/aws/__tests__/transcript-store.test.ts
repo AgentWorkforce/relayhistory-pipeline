@@ -2,14 +2,26 @@ import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { formatDeclaredPropertyYaml } from "alchemy/Cli/PropertyDiff";
+import * as Effect from "effect/Effect";
 import { manifestKey, rawChunkKey, type SessionLocation } from "../../../packages/object-store/src/layout.ts";
 import { NON_DESTROYABLE } from "../deploy-guard.ts";
 import { isProductionLike, trailKeyPolicy } from "../hardening.ts";
 import { validateAwsInputs, type AwsInputs } from "../inputs.ts";
 import { TENANT_KEY_BASE } from "../tenants.ts";
+import { SESSION_READ_API_RESOURCES } from "../session-read-api.ts";
+import {
+  SESSION_ANALYSIS_CACHE_RESOURCES,
+  SESSION_BRIEF_RESOURCES,
+  SESSION_PIPELINE_RESOURCES,
+  SESSION_SEMANTIC_COPY_RESOURCES,
+  SESSION_BUFFERED_SEARCH_FEED_RESOURCES,
+  SESSION_BUFFERED_ERASURE_DELETE_RESOURCES,
+} from "../session-pipeline.ts";
 import {
   ABORT_INCOMPLETE_UPLOAD_DAYS,
   ERASURE_SLA_HOURS,
+  INBOX_CANDIDATE_KEY_ROOT,
   accessLogBucketPolicy,
   accessLogLifecycleRules,
   assertTranscriptStorePlanContract,
@@ -19,7 +31,9 @@ import {
   transcriptLifecycleRules,
   transcriptNames,
   transcriptReaderPolicy,
+  srvWriterObjects,
   transcriptSrvWriterPolicy,
+  transcriptStoreStage,
   transcriptTrailSelectors,
   transcriptWriterPolicy,
   trailLogBucketPolicy,
@@ -31,6 +45,7 @@ const ACCOUNT = "941433935742";
 const REGION = "us-east-1";
 const n = transcriptNames(STAGE, ACCOUNT);
 const KEY = `arn:aws:kms:${REGION}:${ACCOUNT}:key/1111`;
+const AUTHORITY_ROOT = "96bulls/inbox-authority/v1";
 const writerArn = userArn(ACCOUNT, n.userPath, n.writer);
 const readerArn = userArn(ACCOUNT, n.userPath, n.reader);
 const eraserArn = userArn(ACCOUNT, n.userPath, n.eraser);
@@ -333,6 +348,45 @@ describe("transcript store: srv-writer (relayhistory-api live writer) is least p
     expect([...new Set(allowedActions(p))].sort()).toEqual(["kms:Decrypt", "kms:GenerateDataKey", "s3:GetObject", "s3:ListBucket", "s3:PutObject"]);
   });
 
+  it("keeps inbox authority grants dormant by default and scopes an enabled grant to exactly the reviewed roots", () => {
+    const enabled = transcriptSrvWriterPolicy({
+      bucketArn: n.bucketArn,
+      accountId: ACCOUNT,
+      region: REGION,
+      keyAlias: n.keyAlias,
+      inboxAuthorityKeyRoot: AUTHORITY_ROOT,
+    }) as { Statement: Stmt[] };
+    const enabledObjects = [
+      ...objects,
+      `${n.bucketArn}/${AUTHORITY_ROOT}/*`,
+      `${n.bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`,
+    ];
+    expect(srvWriterObjects(n.bucketArn)).toEqual(objects);
+    expect(srvWriterObjects(n.bucketArn, AUTHORITY_ROOT)).toEqual(enabledObjects);
+    expect(src).toContain("inboxAuthorityKeyRoot: i.transcriptStore.inboxAuthorityKeyRoot");
+    expect(res(enabled.Statement.find((statement) => statement.Sid === "ReadLiveObjects")!)).toEqual(enabledObjects);
+    expect(res(enabled.Statement.find((statement) => statement.Sid === "WriteLiveObjectsSseKmsOnly")!)).toEqual(enabledObjects);
+    expect([...new Set(allowedActions(enabled))].sort()).toEqual(["kms:Decrypt", "kms:GenerateDataKey", "s3:GetObject", "s3:ListBucket", "s3:PutObject"]);
+
+    for (const root of [AUTHORITY_ROOT, INBOX_CANDIDATE_KEY_ROOT]) {
+      const key = obj(`${root}/tenant/head.json`);
+      expect(decide(enabled, "s3:GetObject", key)).toBe("allow");
+      expect(decide(enabled, "s3:PutObject", key)).toBe("allow");
+    }
+    for (const key of [
+      obj("96bulls/inbox-authority-other/v1/head.json"),
+      obj(`${AUTHORITY_ROOT}-other/head.json`),
+      obj("96bulls/upload-inbox/v10/candidate"),
+      obj("96bulls/upload-inbox/v1-sibling/candidate"),
+      obj("outside/inbox-authority/v1/head.json"),
+    ]) {
+      expect(decide(enabled, "s3:GetObject", key)).toBe("implicit-deny");
+      expect(decide(enabled, "s3:PutObject", key)).toBe("implicit-deny");
+    }
+    for (const bad of ["96bulls", "96bulls/", "96bulls//authority", "96bulls/../authority", INBOX_CANDIDATE_KEY_ROOT, "96bulls/upload-inbox"])
+      expect(() => srvWriterObjects(n.bucketArn, bad)).toThrow(/inboxAuthorityKeyRoot/);
+  });
+
   it("reaches the Worker's srv_ manifests and raw chunks and the live prefixes, nothing else", () => {
     for (const k of [SRV_MANIFEST, SRV_RAW, LIVE_SESSION, LIVE_BATCH])
       for (const a of ["s3:PutObject", "s3:GetObject"]) expect(decide(p, a, k)).toBe("allow");
@@ -391,11 +445,11 @@ describe("transcript store: deploy plan contract", () => {
     "transcripts-key", "transcripts-key-alias",
   ];
   const h = (text: string) => createHash("sha256").update(text).digest("hex");
-  const plan = (actions: Record<string, string>, summary?: string) => {
+  const plan = (actions: Record<string, string>, summary?: string, extraResources: readonly string[] = []) => {
     const counts = new Map<string, number>();
     for (const action of Object.values(actions)) counts.set(action, (counts.get(action) ?? 0) + 1);
     const inferred = counts.size ? `Plan: ${[...counts].map(([action, count]) => `${count} to ${action}`).join(", ")}` : "Plan: 0 changes";
-    return `${summary ?? inferred}\n${resources.map((r) => `[${r}] ${actions[r] ?? "noop"}`).join("\n")}\n`;
+    return `${summary ?? inferred}\n${[...resources, ...extraResources].map((r) => `[${r}] ${actions[r] ?? "noop"}`).join("\n")}\n`;
   };
   const detailed = (compact: string) => compact.split("\n").map((line) => line.startsWith("[") ? `  ${line}` : line).join("\n");
   const provenance = (compact: string, full = detailed(compact), patch: Record<string, unknown> = {}) => JSON.stringify({
@@ -435,6 +489,38 @@ describe("transcript store: deploy plan contract", () => {
   ].join("\n");
   const withKeyDiff = (compact: string, diff: string) =>
     detailed(compact).replace("  [transcripts-key] update", `  [transcripts-key] update\n${diff}`);
+  type PolicyStatementFixture = { Sid: string; Effect: string; Action: string[]; Resource: string[]; Condition?: Record<string, unknown> };
+  type PolicyFixture = { Version: string; Statement: PolicyStatementFixture[] };
+  const inboxPolicy = (authorityRoot?: string) => transcriptSrvWriterPolicy({
+    bucketArn: n.bucketArn,
+    accountId: ACCOUNT,
+    region: REGION,
+    keyAlias: n.keyAlias,
+    inboxAuthorityKeyRoot: authorityRoot,
+  }) as unknown as PolicyFixture;
+  const policyStatement = (policy: PolicyFixture, sid: string) => policy.Statement.find((statement) => statement.Sid === sid)!;
+  const withNativeInboxPolicyDiff = (
+    compact: string,
+    authorityRoot = AUTHORITY_ROOT,
+    mutate?: (oldPolicy: PolicyFixture, newPolicy: PolicyFixture) => void,
+  ) => {
+    const oldPolicy = structuredClone(inboxPolicy());
+    const newPolicy = structuredClone(inboxPolicy(authorityRoot));
+    // The real helper deliberately reuses one Resource array for read/write;
+    // detach fixture arrays so one causal mutation cannot change two statements.
+    for (const policy of [oldPolicy, newPolicy])
+      policy.Statement = policy.Statement.map((statement) => ({
+        ...statement,
+        Action: [...statement.Action],
+        Resource: [...statement.Resource],
+        ...(statement.Condition ? { Condition: structuredClone(statement.Condition) } : {}),
+      }));
+    mutate?.(oldPolicy, newPolicy);
+    const document = formatDeclaredPropertyYaml({ policy: oldPolicy }, { policy: newPolicy }, "update");
+    if (!document) throw new Error("native inbox policy fixture unexpectedly has no diff");
+    const rendered = document.lines.map((line) => `  ${line}`).join("\n");
+    return detailed(compact).replace("  [transcript-srv-writer] update", `  [transcript-srv-writer] update\n${rendered}`);
+  };
   const LIVE = ["AccountAdministersKey", "WriterEncryptsAndReadsViaS3", "ReaderDecryptsViaS3"];
   const PLANNED = ["AccountAdministersKey", "WriterEncryptsAndReadsViaS3", "SrvWriterEncryptsAndReadsViaS3", "ReaderDecryptsViaS3"];
 
@@ -455,12 +541,124 @@ describe("transcript store: deploy plan contract", () => {
       expect(() => check(compact, full, provenance(compact, full))).toThrow(why);
     }
     expect(() => check(compact)).toThrow(/must add exactly one/);
-    for (const resource of resources.filter((r) => r !== "transcripts-key"))
+    for (const resource of resources.filter((r) => r !== "transcripts-key" && r !== "transcript-srv-writer"))
       expect(() => check(plan({ [resource]: "update" }))).toThrow(/action set does not match/);
     for (const actions of [
       { "transcripts-key": "update", "transcript-srv-writer": "update" },
       { "transcripts-key": "update", transcripts: "update" },
     ]) expect(() => check(plan(actions))).toThrow(/action set does not match/);
+  });
+
+  it("accepts only the exact dormant-to-enabled srv-writer inbox policy expansion", () => {
+    const compact = plan({ "transcript-srv-writer": "update" });
+    const full = withNativeInboxPolicyDiff(compact);
+    expect(check(compact, full, provenance(compact, full))).toBe("srv-writer inbox policy update");
+    const additions = [
+      `${n.bucketArn}/${AUTHORITY_ROOT}/*`,
+      `${n.bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`,
+      `${n.bucketArn}/${AUTHORITY_ROOT}/*`,
+      `${n.bucketArn}/${INBOX_CANDIDATE_KEY_ROOT}/*`,
+    ];
+    for (const bad of [
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (_old, next) => {
+        policyStatement(next, "WriteLiveObjectsSseKmsOnly").Resource.splice(-2);
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (_old, next) => {
+        const resources = policyStatement(next, "WriteLiveObjectsSseKmsOnly").Resource;
+        resources[resources.length - 2] = `${n.bucketArn}/96bulls/other-authority/v1/*`;
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (_old, next) => {
+        for (const sid of ["ReadLiveObjects", "WriteLiveObjectsSseKmsOnly"]) {
+          const resources = policyStatement(next, sid).Resource;
+          resources[resources.length - 2] = `${n.bucketArn}/96bulls/upload-inbox/*`;
+        }
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (_old, next) => {
+        policyStatement(next, "ReadLiveObjects").Action.push("s3:DeleteObject");
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (_old, next) => {
+        policyStatement(next, "WriteLiveObjectsSseKmsOnly").Resource.splice(-2);
+        policyStatement(next, "ReadLiveObjects").Resource.push(...additions.slice(2));
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (_old, next) => {
+        policyStatement(next, "ReadLiveObjects").Resource.splice(-2);
+        policyStatement(next, "WriteLiveObjectsSseKmsOnly").Resource.splice(-2);
+        policyStatement(next, "UseTranscriptKeyViaS3").Resource.push(...additions);
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (old, next) => {
+        policyStatement(old, "ReadLiveObjects").Action = ["kms:Decrypt"];
+        policyStatement(next, "ReadLiveObjects").Action = ["kms:Decrypt"];
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (_old, next) => {
+        policyStatement(next, "ReadLiveObjects").Resource.splice(-2);
+        policyStatement(next, "WriteLiveObjectsSseKmsOnly").Resource.splice(-2);
+        policyStatement(next, "ReadLiveObjects").Condition = { StringEquals: { Injected: additions.slice(0, 2) } };
+        policyStatement(next, "WriteLiveObjectsSseKmsOnly").Condition = { Injected: additions.slice(2) };
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (old, next) => {
+        policyStatement(old, "WriteLiveObjectsSseKmsOnly").Sid = "ReadLiveObjects";
+        policyStatement(next, "WriteLiveObjectsSseKmsOnly").Sid = "ReadLiveObjects";
+      }),
+      withNativeInboxPolicyDiff(compact, AUTHORITY_ROOT, (old, next) => {
+        policyStatement(old, "ReadLiveObjects").Condition = { StringEquals: { Sid: "WriteLiveObjectsSseKmsOnly" } };
+        policyStatement(next, "ReadLiveObjects").Condition = { StringEquals: { Sid: "WriteLiveObjectsSseKmsOnly" } };
+      }),
+    ])
+      expect(() => check(compact, bad, provenance(compact, bad))).toThrow(/srv-writer inbox policy update/);
+  });
+
+  it("reaches the srv-writer inbox phase when every deployed pipeline resource is present as noop", () => {
+    const compact = plan({ "transcript-srv-writer": "update" }, undefined, SESSION_PIPELINE_RESOURCES);
+    const full = withNativeInboxPolicyDiff(compact);
+    expect(check(compact, full, provenance(compact, full))).toBe("srv-writer inbox policy update");
+
+    const mixed = plan({
+      "transcript-srv-writer": "update",
+      [SESSION_PIPELINE_RESOURCES[0]]: "update",
+    }, undefined, SESSION_PIPELINE_RESOURCES);
+    const mixedFull = withNativeInboxPolicyDiff(mixed);
+    expect(() => check(mixed, mixedFull, provenance(mixed, mixedFull))).toThrow(/session pipeline rollout, update or post-apply phase/);
+  });
+
+  it("reaches the srv-writer inbox phase when deployed read-api and schedule resources are also noop", () => {
+    const deployedContext = [
+      ...SESSION_PIPELINE_RESOURCES,
+      ...SESSION_READ_API_RESOURCES,
+      ...SESSION_BRIEF_RESOURCES,
+      ...SESSION_ANALYSIS_CACHE_RESOURCES,
+      ...SESSION_SEMANTIC_COPY_RESOURCES,
+      ...SESSION_BUFFERED_SEARCH_FEED_RESOURCES,
+      ...SESSION_BUFFERED_ERASURE_DELETE_RESOURCES,
+    ];
+    const compact = plan({ "transcript-srv-writer": "update" }, undefined, deployedContext);
+    const full = withNativeInboxPolicyDiff(compact);
+    expect(check(compact, full, provenance(compact, full))).toBe("srv-writer inbox policy update");
+
+    for (const changedResource of [
+      SESSION_READ_API_RESOURCES[0],
+      SESSION_BRIEF_RESOURCES[0],
+      SESSION_ANALYSIS_CACHE_RESOURCES[0],
+      SESSION_SEMANTIC_COPY_RESOURCES[0],
+      SESSION_BUFFERED_SEARCH_FEED_RESOURCES[0],
+      SESSION_BUFFERED_ERASURE_DELETE_RESOURCES[0],
+    ]) {
+      const mixed = plan({ "transcript-srv-writer": "update", [changedResource]: "update" }, undefined, deployedContext);
+      const mixedFull = withNativeInboxPolicyDiff(mixed);
+      expect(() => check(mixed, mixedFull, provenance(mixed, mixedFull))).toThrow(/session read api|session brief|session analysis cache|semantic copy|buffered search feed|buffered erasure delete/);
+    }
+  });
+
+  it("does not reopen transcript-only legacy phases that the original pipeline dispatch refuses", () => {
+    const legacyPhases = [
+      Object.fromEntries(resources.map((resource) => [resource, "create"])),
+      { transcripts: "create", "transcripts-key": "create", "transcripts-key-alias": "create" },
+      { "trail-key": "update", "trail-logs": "update" },
+      { "transcript-srv-writer": "create", "transcripts-key": "update" },
+    ];
+    for (const actions of legacyPhases) {
+      const compact = plan(actions, undefined, SESSION_PIPELINE_RESOURCES);
+      expect(() => check(compact)).toThrow(/session pipeline rollout, update or post-apply phase/);
+    }
   });
 
   // Alchemy persisted the failed update: the plan shows no property change, the state holds the pending props.
@@ -559,6 +757,7 @@ describe("transcript store: inputs", () => {
   const filled = (patch: (i: AwsInputs & Record<string, unknown>) => void = () => {}) => {
     const i = structuredClone(example) as AwsInputs & Record<string, unknown>;
     delete i.$comment;
+    i.transcriptStore!.bufferedGcRoleArn = `arn:aws:iam::${ACCOUNT}:role/test-buffered-gc`;
     i.approval = { ...i.approval!, decision: "approved", date: "2026-10-31", quote: "let's start the production s3 work now", capture: { provenanceSha256: "a".repeat(64), planSha256: "b".repeat(64), inputsSha256: "c".repeat(64), sourceCommit: "d".repeat(40) } };
     patch(i);
     return i;
@@ -566,7 +765,38 @@ describe("transcript store: inputs", () => {
 
   it("validates once filled; the committed example still refuses its placeholders", () => {
     expect(() => validateAwsInputs(STAGE, filled())).not.toThrow();
+    expect(() => validateAwsInputs(STAGE, filled((i) => { i.transcriptStore!.inboxAuthorityKeyRoot = AUTHORITY_ROOT; }))).not.toThrow();
     expect(() => validateAwsInputs(STAGE, example)).toThrow(/placeholder values/);
+  });
+
+  it("keeps the inbox grant default-off and refuses broad, overlapping or malformed authority roots", () => {
+    expect((filled().transcriptStore as Record<string, unknown>).inboxAuthorityKeyRoot).toBeUndefined();
+    for (const root of [
+      "96bulls",
+      "96bulls/",
+      "96bulls//authority",
+      "96bulls/../authority",
+      "outside/inbox-authority/v1",
+      INBOX_CANDIDATE_KEY_ROOT,
+      "96bulls/upload-inbox",
+      "96bulls/upload-inbox/v1/nested",
+    ])
+      expect(() => validateAwsInputs(STAGE, filled((i) => { i.transcriptStore!.inboxAuthorityKeyRoot = root; }))).toThrow(/inboxAuthorityKeyRoot/);
+  });
+
+  it("refuses an invalid authority root before a direct stage caller can request a provider", async () => {
+    await expect(Effect.runPromise(transcriptStoreStage({
+      stage: STAGE,
+      accountId: ACCOUNT,
+      region: REGION,
+      budgetUsd: 1,
+      budgetEmail: "test@example.invalid",
+      transcriptStore: {
+        bufferedGcRoleArn: `arn:aws:iam::${ACCOUNT}:role/test-buffered-gc`,
+        inboxAuthorityKeyRoot: INBOX_CANDIDATE_KEY_ROOT,
+      },
+      tags: () => ({}),
+    }))).rejects.toThrow(/inboxAuthorityKeyRoot/);
   });
 
   it("requires the exact production target, commercial partition, and a plain transcriptStore object", () => {

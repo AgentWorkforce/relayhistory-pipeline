@@ -3,9 +3,16 @@ Copyright 2025-2026 Agent Workforce Incorporated
 
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
+First-party source provenance:
+
+- Portions originally developed in AgentWorkforce/relayhistory-cloud, including
+  vendored migrations and ported delivery, authentication and raw-chunk modules,
+  are distributed under this product's Apache License, Version 2.0. Their SOURCE,
+  SOURCE.json and MOVE_NOTES records retain the original source revisions.
+
 Third-party material in this repository:
 
 - vendor/relayhistory is a Git submodule of https://github.com/AgentWorkforce/relayhistory,
-  licensed under the MIT License.
+  licensed under the MIT License. Copyright (c) 2026 Khaliq Gant.
 - certs/supabase-prod-ca-2021.crt is the public Supabase root CA certificate,
   redistributed unmodified so the services can verify TLS to Supabase Postgres.

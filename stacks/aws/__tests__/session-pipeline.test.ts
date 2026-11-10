@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import * as AWS from "@alchemy.run/aws";
 import { fileURLToPath } from "node:url";
 import type { AwsInputs } from "../inputs.ts";
@@ -8,6 +8,19 @@ import {
   DELIVERY_DELAY_SECONDS,
   FUNCTION_TIMEOUT_SECONDS,
   SESSION_BRIEF_RESOURCES,
+  SESSION_ANALYSIS_CACHE_RESOURCES,
+  SESSION_ANALYSIS_JOB_RESOURCES,
+  analysisCacheScheduleProps,
+  analysisJobScheduleProps,
+  analysisReconcileScheduleProps,
+  SESSION_SEMANTIC_COPY_RESOURCES,
+  semanticCopyScheduleProps,
+  SESSION_BUFFERED_SEARCH_FEED_RESOURCES,
+  BUFFERED_SEARCH_FEED_GATE_CONTRACT,
+  bufferedSearchFeedScheduleProps,
+  SESSION_BUFFERED_ERASURE_DELETE_RESOURCES,
+  bufferedErasureDeleteScheduleProps,
+  assertSessionPipelineInputs,
   SESSION_PIPELINE_RESOURCES,
   VISIBILITY_TIMEOUT_SECONDS,
   briefScheduleProps,
@@ -20,8 +33,11 @@ import {
   sessionPipelinePermissions,
   sessionQueuePolicy,
   sessionSecretPolicy,
+  type SessionPipelineInputs,
 } from "../session-pipeline.ts";
 import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, transcriptBucketPolicy, transcriptKeyPolicy, transcriptNames } from "../transcript-store.ts";
+import { bufferedFeedConfig, bufferedFeedGateRefusal, BUFFERED_SEARCH_GATE_CONTRACT } from "../../../src/session-pipeline/buffered-search-feed.ts";
+import { bufferedErasureConfig } from "../../../src/session-pipeline/buffered-erasure-delete.ts";
 
 const STAGE = "aws-sessions-prod";
 const ACCOUNT = "941433935742";
@@ -30,6 +46,7 @@ const ROLE = `arn:aws:iam::${ACCOUNT}:role/session-pipeline-role`;
 const t = transcriptNames(STAGE, ACCOUNT);
 const p = sessionPipelineNames(STAGE, ACCOUNT, REGION);
 const example = JSON.parse(readFileSync(fileURLToPath(new URL("../examples/aws-sessions-prod.inputs.example.json", import.meta.url)), "utf8")) as AwsInputs;
+example.transcriptStore!.bufferedGcRoleArn = `arn:aws:iam::${ACCOUNT}:role/test-buffered-gc`;
 
 describe("session pipeline: grants", () => {
   it("the role may only decrypt via S3, for objects under 96bulls/ in this bucket", () => {
@@ -99,11 +116,24 @@ describe("session pipeline: wiring", () => {
       PIPELINE_ORG_FROM_PREFIX: "true",
       SESSION_PIPELINE_SECRET_ARN: "96bulls/aws-sessions-prod/session-pipeline",
       SEARCH_INDEX_ENABLED: "0",
+      SESSION_REPLAY_PAGES_ENABLED: "0",
+      SESSION_ANALYSIS_CACHE_ENABLED: "0",
+      SESSION_ANALYSIS_ENABLED: "false",
+      SESSION_DESKTOP_CATALOG_ENABLED: "0",
       PIPELINE_FANOUT: "off",
       PIPELINE_RECONCILE_LOOKBACK_MINUTES: "60",
     });
     for (const value of Object.values(env)) expect(value).not.toMatch(/postgres(ql)?:\/\/|password|clickhouse\.cloud/i);
     expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { searchIndex: true } }).SEARCH_INDEX_ENABLED).toBe("1");
+    expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { replayPages: true } }).SESSION_REPLAY_PAGES_ENABLED).toBe("1");
+    expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { analysisJobs: { enabled: true } } }).SESSION_ANALYSIS_ENABLED).toBe("true");
+  });
+
+  it("the stack never switches on the large-read handoff or worker", () => {
+    for (const p0 of [{}, { searchIndex: true, replayPages: true }]) {
+      const env = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: p0 });
+      expect(Object.keys(env).filter((k) => k.startsWith("SESSION_LARGE_READ_"))).toEqual([]);
+    }
   });
 
   it("briefs start off: SESSION_BRIEF_ENABLED=false and the schedule DISABLED; enabled sets both, and the caps only when given", () => {
@@ -113,6 +143,9 @@ describe("session pipeline: wiring", () => {
     expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { briefs: { enabled: false, globalDailyCap: 5 } } }).SESSION_BRIEF_ENABLED).toBe("false");
     const on = sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { briefs: { enabled: true, backgroundDailyBudget: 1000, globalDailyCap: 2000 } } });
     expect(on).toMatchObject({ SESSION_BRIEF_ENABLED: "true", SESSION_BRIEF_BACKGROUND_DAILY_BUDGET: "1000", SESSION_BRIEF_GLOBAL_DAILY_CAP: "2000" });
+    // The sweep is emitted only when set; absent keeps the worker default (0, off).
+    expect(Object.keys(on)).not.toContain("SESSION_BRIEF_SWEEP_SECONDS");
+    expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: { briefs: { enabled: true, sweepSeconds: 300 } } }).SESSION_BRIEF_SWEEP_SECONDS).toBe("300");
     // The model key is never in env: it is read from the pipeline secret.
     expect(Object.keys(on)).not.toContain("OPENAI_API_KEY");
 
@@ -180,7 +213,7 @@ describe("session pipeline: not reachable from the internet", () => {
       'aws/session-pipeline.ts: Function("session-pipeline", sessionPipelineFunctionProps(i) as never);',
       "aws/session-pipeline.ts: Permission(id, props as never);",
       // The read API has a Function URL by design (application auth); its props are pinned in session-read-api.test.ts.
-      'aws/session-read-api.ts: Function("session-read-api", sessionReadApiFunctionProps({ stage: i.stage, names, p: i.p }) as never);',
+      'aws/session-read-api.ts: Function("session-read-api", sessionReadApiFunctionProps({ stage: i.stage, names, p: i.p, ...(i.analysisBucketName ? { analysisBucketName: i.analysisBucketName } : {}) }) as never);',
     ]);
   });
 });
@@ -190,11 +223,74 @@ describe("session pipeline: inputs", () => {
     ({ ...example, transcriptStore: { ...example.transcriptStore, sessionPipeline } }) as unknown as AwsInputs & Record<string, unknown>;
   const validate = (i: AwsInputs & Record<string, unknown>) => assertTranscriptStoreInputs(STAGE, i);
   it("accepts the documented settings and refuses anything else", () => {
-    expect(() => validate(withPipeline({ searchIndex: true, maxConcurrency: 4, reconcileMinutes: 30 }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ searchIndex: true, replayPages: false, maxConcurrency: 4, reconcileMinutes: 30 }))).not.toThrow(/sessionPipeline/);
     expect(() => validate(withPipeline({ queue: "x" }))).toThrow(/sessionPipeline.queue is not a known setting/);
     expect(() => validate(withPipeline({ maxConcurrency: 50 }))).toThrow(/maxConcurrency/);
     expect(() => validate(withPipeline({ reconcileMinutes: 1 }))).toThrow(/reconcileMinutes/);
     expect(() => validate(withPipeline([]))).toThrow(/plain object/);
+  });
+
+  it("replayPages: true is refused until the normalized-prefix write grant exists; false/absent keep working", () => {
+    expect(() => validate(withPipeline({ replayPages: true }))).toThrow(
+      "replayPages requires the reviewed normalized-prefix PutObject/KMS grant; not wired yet",
+    );
+    expect(() => validate(withPipeline({ replayPages: false }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({}))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ replayPages: "true" }))).toThrow(/replayPages must be a boolean/);
+  });
+
+  it("analysisCache: true is refused until the normalized-prefix write grant exists; false/absent keep working and the env stays 0", () => {
+    expect(() => validate(withPipeline({ analysisCache: true }))).toThrow(
+      "transcriptStore.sessionPipeline.analysisCache requires the reviewed normalized-prefix PutObject/KMS grant; not wired yet",
+    );
+    expect(() => validate(withPipeline({ analysisCache: false }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({}))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ analysisCache: "true" }))).toThrow(/analysisCache must be a boolean/);
+    for (const pipeline of [{}, { analysisCache: false }])
+      expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: pipeline }).SESSION_ANALYSIS_CACHE_ENABLED).toBe("0");
+  });
+
+  it("desktopCatalog: true is refused until migration 20261105031000 and its review; false/absent keep working", () => {
+    expect(() => validate(withPipeline({ desktopCatalog: true }))).toThrow(
+      "desktopCatalog requires the forget/reproject fix (migration 20261105031000) and its review; not wired yet",
+    );
+    expect(() => validate(withPipeline({ searchIndex: true, desktopCatalog: true }))).toThrow(/desktopCatalog requires the forget\/reproject fix/);
+    expect(() => validate(withPipeline({ desktopCatalog: false }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ searchIndex: true, desktopCatalog: false }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({}))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ desktopCatalog: "true" }))).toThrow(/desktopCatalog must be a boolean/);
+    expect(() => validate(withPipeline({ desktopCatalog: 1 }))).toThrow(/desktopCatalog must be a boolean/);
+  });
+
+  it("desktop catalog env: SESSION_DESKTOP_CATALOG_ENABLED is \"0\" by default and in every deployed or example env; searchIndex never turns it on", () => {
+    const names = sessionPipelineNames(STAGE, ACCOUNT, REGION);
+    for (const sp of [{}, { searchIndex: true }, { searchIndex: true, desktopCatalog: false }, { searchIndex: true, replayPages: false, maxConcurrency: 4, reconcileMinutes: 30, briefs: { enabled: true } }])
+      expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names, p: sp }).SESSION_DESKTOP_CATALOG_ENABLED).toBe("0");
+    // Every stage input present in the tree (local captures, which are not committed, and the
+    // committed examples) that carries a session pipeline. docs/plans may be absent.
+    const root = fileURLToPath(new URL("../../../", import.meta.url));
+    const plansDir = `${root}docs/plans`;
+    const planFiles = existsSync(plansDir) ? readdirSync(plansDir).map((f) => `${plansDir}/${f}`) : [];
+    const files = [
+      ...planFiles.filter((f) => f.endsWith(".inputs.sanitized.json")),
+      ...readdirSync(`${root}stacks/aws/examples`).filter((f) => f.endsWith(".json")).map((f) => `${root}stacks/aws/examples/${f}`),
+    ];
+    let checked = 0;
+    for (const file of files) {
+      const inputs = JSON.parse(readFileSync(file, "utf8")) as { transcriptStore?: { sessionPipeline?: Record<string, unknown> } };
+      const sp = inputs.transcriptStore?.sessionPipeline;
+      if (sp === undefined) continue;
+      checked++;
+      expect(sp.desktopCatalog).not.toBe(true);
+      for (const deployed of [sp, { ...sp, searchIndex: true }])
+        expect(sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names, p: deployed as SessionPipelineInputs }).SESSION_DESKTOP_CATALOG_ENABLED).toBe("0");
+    }
+    // No committed stage input carries a sessionPipeline today (captures are local; the examples
+    // have none), so `checked` may be 0; the defaults above still cover the env.
+    expect(checked).toBeLessThanOrEqual(files.length);
+    // No file present (captures and examples) sets the switch to "1".
+    const plans = [...planFiles, ...files.filter((f) => !planFiles.includes(f))].map((f) => readFileSync(f, "utf8"));
+    for (const text of plans) expect(text).not.toMatch(/SESSION_DESKTOP_CATALOG_ENABLED["']?\s*[:=]\s*["']?1/);
   });
 
   it("briefs: enabled is a required boolean, the caps are bounded integers, nothing else", () => {
@@ -206,6 +302,11 @@ describe("session pipeline: inputs", () => {
     expect(() => validate(withPipeline({ briefs: { enabled: true, openai_api_key: "sk-x" } }))).toThrow(/briefs.openai_api_key is not a known setting/);
     expect(() => validate(withPipeline({ briefs: { enabled: true, globalDailyCap: -1 } }))).toThrow(/globalDailyCap/);
     expect(() => validate(withPipeline({ briefs: { enabled: true, backgroundDailyBudget: 1.5 } }))).toThrow(/backgroundDailyBudget/);
+    expect(() => validate(withPipeline({ briefs: { enabled: true, sweepSeconds: 300 } }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ briefs: { enabled: true, sweepSeconds: 0 } }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ briefs: { enabled: true, sweepSeconds: 86_401 } }))).toThrow(/sweepSeconds/);
+    expect(() => validate(withPipeline({ briefs: { enabled: true, sweepSeconds: 2.5 } }))).toThrow(/sweepSeconds/);
+    expect(() => validate(withPipeline({ briefs: { enabled: true, sweepSeconds: "60" } }))).toThrow(/sweepSeconds/);
     expect(() => validate(withPipeline({ briefs: [] }))).toThrow(/briefs must be a plain object/);
     expect(() => validate(withPipeline({ briefs: null }))).toThrow(/briefs must be a plain object/);
   });
@@ -262,6 +363,194 @@ describe("session pipeline: deploy plan contract", () => {
     // A pipeline-free plan keeps the original contract.
     expect(check(plan({}, store))).toBe("post-apply");
     expect(() => check(plan({ transcripts: "update" }, store))).toThrow(/initial, recovery/);
+  });
+
+  const withAnalysis=[...all,...SESSION_ANALYSIS_CACHE_RESOURCES];
+  it("analysis schedule is dormant and its invoke permission is bound to the exact rule/account",()=>{const input={names:p,functionArn:"arn:lambda",p:{},tags:{}};expect(analysisCacheScheduleProps(input)).toMatchObject({state:"DISABLED",scheduleExpression:"rate(1 minute)",targets:[{Input:JSON.stringify({analysisCache:true})}]});expect(analysisCacheScheduleProps({...input,p:{analysisCache:true}}).state).toBe("ENABLED");expect(analysisReconcileScheduleProps(input)).toMatchObject({state:"DISABLED",scheduleExpression:"rate(30 minutes)",targets:[{Input:JSON.stringify({analysisCacheReconcile:true})}]});const grants=sessionPipelinePermissions({accountId:ACCOUNT,functionName:p.function,ruleArn:`arn:aws:events:${REGION}:${ACCOUNT}:rule/${p.rule}`,briefRuleArn:"brief",analysisRuleArn:"exact-analysis-rule",roleArn:ROLE});expect(grants.at(-1)!.props).toEqual({action:"lambda:InvokeFunction",functionName:p.function,principal:"events.amazonaws.com",sourceArn:"exact-analysis-rule",sourceAccount:ACCOUNT});const both=sessionPipelinePermissions({accountId:ACCOUNT,functionName:p.function,ruleArn:`arn:aws:events:${REGION}:${ACCOUNT}:rule/${p.rule}`,briefRuleArn:"brief",analysisRuleArn:"exact-analysis-rule",analysisReconcileRuleArn:"exact-reconcile-rule",roleArn:ROLE});for(const [id,sourceArn] of [["session-analysis-cache-permission","exact-analysis-rule"],["session-analysis-reconcile-permission","exact-reconcile-rule"]])expect(both.find(g=>g.id===id)!.props).toEqual({action:"lambda:InvokeFunction",functionName:p.function,principal:"events.amazonaws.com",sourceArn,sourceAccount:ACCOUNT})});
+  it("analysis phase requires both resources and refuses permission widening, mixed schedules and unrelated writes",()=>{const creates=Object.fromEntries(SESSION_ANALYSIS_CACHE_RESOURCES.map(r=>[r,"create"]));expect(check(plan(creates,withAnalysis))).toBe("session analysis cache rollout");expect(check(plan({"session-analysis-cache-schedule":"update"},withAnalysis))).toBe("session analysis cache update");for(const permission of ["session-analysis-cache-permission","session-analysis-reconcile-permission"])expect(()=>check(plan({[permission]:"update"},withAnalysis))).toThrow(/unsafe action combination/);expect(()=>check(plan(creates,[...all,"session-analysis-cache-schedule"]))).toThrow(/missing resource session-analysis-cache-permission/);expect(()=>check(plan({...creates,trail:"update"},withAnalysis))).toThrow(/must be noop or a session pipeline update/);expect(()=>check(plan({...creates,"session-brief-schedule":"update"},[...withAnalysis,...SESSION_BRIEF_RESOURCES]))).toThrow(/separate reviewed phases/);for(const action of ["delete","replace"])expect(()=>check(plan({"session-analysis-cache-schedule":action},withAnalysis))).toThrow(/forbidden action/)});
+  it("analysis phases refuse unproven role and read-api cascades",()=>{const creates=Object.fromEntries(SESSION_ANALYSIS_CACHE_RESOURCES.map(r=>[r,"create"]));expect(()=>check(plan({...creates,"session-pipeline":"update",transcripts:"update"},withAnalysis))).toThrow(/transcripts updates without the role-ARN cascade/);const withApi=[...withAnalysis,"session-read-api","session-read-api-secret","session-read-api-errors-alarm","session-read-api-throttles-alarm"];expect(()=>check(plan({...creates,"session-read-api":"update"},withApi))).toThrow(/session-read-api may update only with no declared property changes/);expect(()=>check(plan({...creates,"session-read-api-errors-alarm":"update"},withApi))).toThrow(/read api may not change/)});
+  const withJobs=[...all,...SESSION_ANALYSIS_JOB_RESOURCES];
+  it("analysis job schedule is dormant and its invoke permission is bound to the exact rule/account",()=>{const input={names:p,functionArn:"arn:lambda",p:{},tags:{}};expect(analysisJobScheduleProps(input)).toMatchObject({state:"DISABLED",scheduleExpression:"rate(1 minute)",targets:[{Input:JSON.stringify({sessionAnalysis:true})}]});expect(analysisJobScheduleProps({...input,p:{analysisJobs:{enabled:true}}}).state).toBe("ENABLED");const grants=sessionPipelinePermissions({accountId:ACCOUNT,functionName:p.function,ruleArn:`arn:aws:events:${REGION}:${ACCOUNT}:rule/${p.rule}`,briefRuleArn:"brief",analysisJobRuleArn:"exact-job-rule",roleArn:ROLE});expect(grants.find(g=>g.id==="session-analysis-job-permission")!.props).toEqual({action:"lambda:InvokeFunction",functionName:p.function,principal:"events.amazonaws.com",sourceArn:"exact-job-rule",sourceAccount:ACCOUNT})});
+  it("analysis job phase requires both resources and refuses permission widening, mixed schedules and unrelated writes",()=>{const creates=Object.fromEntries(SESSION_ANALYSIS_JOB_RESOURCES.map(r=>[r,"create"]));expect(check(plan(creates,withJobs))).toBe("session analysis jobs rollout");expect(check(plan({"session-analysis-job-schedule":"update"},withJobs))).toBe("session analysis jobs update");expect(()=>check(plan({"session-analysis-job-permission":"update"},withJobs))).toThrow(/unsafe action combination/);expect(()=>check(plan(creates,[...all,"session-analysis-job-schedule"]))).toThrow(/missing resource session-analysis-job-permission/);expect(()=>check(plan({...creates,"session-events-dlq":"create"},withJobs))).toThrow(/must be noop or session pipeline update/);expect(()=>check(plan({...creates,"session-brief-schedule":"update"},[...withJobs,...SESSION_BRIEF_RESOURCES]))).toThrow(/separate reviewed phase/);for(const action of ["delete","replace"])expect(()=>check(plan({"session-analysis-job-schedule":action},withJobs))).toThrow(/forbidden action/)});
+  it("analysis job phases refuse unproven role and read-api cascades",()=>{const creates=Object.fromEntries(SESSION_ANALYSIS_JOB_RESOURCES.map(r=>[r,"create"]));expect(()=>check(plan({...creates,"session-pipeline":"update","session-events":"update"},withJobs))).toThrow(/session-events updates without the role-ARN cascade/);const withApi=[...withJobs,"session-read-api","session-read-api-secret","session-read-api-errors-alarm","session-read-api-throttles-alarm"];expect(()=>check(plan({...creates,"session-read-api":"update"},withApi))).toThrow(/session-read-api may update only with no declared property changes/);expect(()=>check(plan({...creates,"session-read-api-errors-alarm":"update"},withApi))).toThrow(/read api may not change/)});
+  const withBufferedFeed = [...all, ...SESSION_BUFFERED_SEARCH_FEED_RESOURCES];
+  const armed = { searchIndex: true, bufferedSearchFeed: { enabled: true, gateDeclared: BUFFERED_SEARCH_FEED_GATE_CONTRACT } };
+  it("buffered feed defaults disabled and sets no feed variable",()=>{
+    expect(bufferedSearchFeedScheduleProps({names:p,functionArn:"fn",p:{},tags:{}})).toMatchObject({state:"DISABLED",scheduleExpression:"rate(1 minute)",targets:[{Input:JSON.stringify({bufferedSearchFeed:true})}]});
+    const env=sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:{}});
+    expect(env.INGEST_BUFFERED_SEARCH_FEED).toBeUndefined();
+    expect(env.BUFFERED_SEARCH_FEED_GATE_DECLARED).toBeUndefined();
+    expect(bufferedFeedConfig(env).enabled).toBe(false);
+    const off={bufferedSearchFeed:{enabled:false}};
+    expect(bufferedSearchFeedScheduleProps({names:p,functionArn:"fn",p:off,tags:{}}).state).toBe("DISABLED");
+    expect(sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:off}).INGEST_BUFFERED_SEARCH_FEED).toBeUndefined();
+  });
+  it("buffered feed page/rate/budget knobs are passed through only when configured, within the feeder's bounds",()=>{
+    const knobs={pageSize:100,stagesPerSecond:10,budgetMs:60000};
+    const env=sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:{searchIndex:true,bufferedSearchFeed:{enabled:false,...knobs}}});
+    expect(env).toMatchObject({INGEST_BUFFERED_SEARCH_FEED_PAGE:"100",INGEST_BUFFERED_SEARCH_FEED_RATE:"10",INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS:"60000"});
+    expect(env.INGEST_BUFFERED_SEARCH_FEED).toBeUndefined();
+    const refused=(v:unknown)=>{let why="";try{assertSessionPipelineInputs(v,(w:string)=>{throw new Error(w)})}catch(e){why=(e as Error).message}return why};
+    expect(refused({searchIndex:true,bufferedSearchFeed:{enabled:false,...knobs}})).toBe("");
+    expect(refused({bufferedSearchFeed:{enabled:false,pageSize:0}})).toMatch(/pageSize must be an integer from 1 to 200/);
+    expect(refused({bufferedSearchFeed:{enabled:false,pageSize:201}})).toMatch(/pageSize/);
+    expect(refused({bufferedSearchFeed:{enabled:false,stagesPerSecond:51}})).toMatch(/stagesPerSecond must be an integer from 1 to 50/);
+    expect(refused({bufferedSearchFeed:{enabled:false,budgetMs:4999}})).toMatch(/budgetMs must be an integer from 5000 to 240000/);
+    expect(refused({bufferedSearchFeed:{enabled:false,budgetMs:1.5}})).toMatch(/budgetMs/);
+  });
+  it("buffered feed knobs are absent when not configured, so the feeder defaults apply",()=>{
+    for(const cfg of [{},{searchIndex:true,bufferedSearchFeed:{enabled:true,gateDeclared:BUFFERED_SEARCH_FEED_GATE_CONTRACT}}]){
+      const env=sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:cfg});
+      for(const k of ["INGEST_BUFFERED_SEARCH_FEED_PAGE","INGEST_BUFFERED_SEARCH_FEED_RATE","INGEST_BUFFERED_SEARCH_FEED_BUDGET_MS"])expect(Object.hasOwn(env,k)).toBe(false);
+    }
+    const c=bufferedFeedConfig(sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:{}}));
+    expect([c.pageSize,c.stagesPerSecond,c.budgetMs]).toEqual([50,5,50000]);
+  });
+  it("buffered feed arms only with the gate's exact contract; the feeder then still needs the S version encoding",()=>{
+    expect(BUFFERED_SEARCH_FEED_GATE_CONTRACT).toBe(BUFFERED_SEARCH_GATE_CONTRACT);
+    expect(bufferedSearchFeedScheduleProps({names:p,functionArn:"fn",p:armed,tags:{}}).state).toBe("ENABLED");
+    const env=sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:armed});
+    expect(env).toMatchObject({INGEST_BUFFERED_SEARCH_FEED:"on",BUFFERED_SEARCH_FEED_GATE_DECLARED:BUFFERED_SEARCH_GATE_CONTRACT});
+    expect(bufferedFeedGateRefusal(env)).toBeNull();
+    // The stack does not set INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION, and BUFFERED_VERSION_CEILING is unpinned,
+    // so the feeder refuses this env fail closed (buffered-feed-version-encoding-s.md); with both, it accepts it.
+    expect(()=>bufferedFeedConfig(env)).toThrow(/version_encoding_not_armed/);
+    expect(()=>bufferedFeedConfig({...env,INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION:"on"})).toThrow(/buffered_version_ceiling_unpinned/);
+    expect(bufferedFeedConfig({...env,INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION:"on"},1_000_000_000_000).enabled).toBe(true);
+    const refused=(v:unknown)=>{let why="";try{assertSessionPipelineInputs(v,(w:string)=>{throw new Error(w)})}catch(e){why=(e as Error).message}return why};
+    expect(refused(armed)).toBe("");
+    expect(refused({searchIndex:true,bufferedSearchFeed:{enabled:false}})).toBe("");
+    expect(refused({searchIndex:true,bufferedSearchFeed:{enabled:true}})).toMatch(/requires gateDeclared/);
+    expect(refused({searchIndex:true,bufferedSearchFeed:{enabled:true,gateDeclared:"buffered-search-gate/v2"}})).toMatch(/must be exactly/);
+    expect(refused({bufferedSearchFeed:armed.bufferedSearchFeed})).toMatch(/requires searchIndex/);
+    expect(refused({searchIndex:true,bufferedSearchFeed:{enabled:"on"}})).toMatch(/must be a boolean/);
+    expect(refused({searchIndex:true,bufferedSearchFeed:{enabled:false,extra:1}})).toMatch(/not a known setting/);
+    expect(JSON.stringify(bufferedSearchFeedScheduleProps({names:p,functionArn:"fn",p:armed,tags:{}}))).not.toMatch(/database_url|ca_pem|password/);
+    const permission=sessionPipelinePermissions({accountId:ACCOUNT,functionName:p.function,ruleArn:"old",briefRuleArn:"brief",bufferedSearchFeedRuleArn:"exact-feed-rule",roleArn:ROLE}).at(-1)!;
+    expect(permission.id).toBe("session-buffered-search-feed-permission");
+    expect(permission.props).toEqual({action:"lambda:InvokeFunction",functionName:p.function,principal:"events.amazonaws.com",sourceArn:"exact-feed-rule",sourceAccount:ACCOUNT});
+  });
+  it("buffered feed phase keeps permission create-only and refuses mixed schedules and unrelated changes",()=>{
+    const creates=Object.fromEntries(SESSION_BUFFERED_SEARCH_FEED_RESOURCES.map(r=>[r,"create"]));
+    expect(check(plan(creates,withBufferedFeed))).toBe("session buffered search feed rollout");
+    expect(check(plan({"session-buffered-search-feed-schedule":"update"},withBufferedFeed))).toBe("session buffered search feed update");
+    expect(()=>check(plan({"session-buffered-search-feed-permission":"update"},withBufferedFeed))).toThrow(/unsafe action combination/);
+    expect(()=>check(plan(creates,[...all,"session-buffered-search-feed-schedule"]))).toThrow(/missing resource session-buffered-search-feed-permission/);
+    for(const action of ["delete","replace"])expect(()=>check(plan({"session-buffered-search-feed-schedule":action},withBufferedFeed))).toThrow(/forbidden action/);
+    expect(()=>check(plan({...creates,trail:"update"},withBufferedFeed))).toThrow(/separate reviewed phase/);
+    expect(()=>check(plan({...creates,"session-semantic-copy-schedule":"update"},[...withBufferedFeed,...SESSION_SEMANTIC_COPY_RESOURCES]))).toThrow(/separate reviewed phase/);
+    expect(()=>check(plan({...creates,"session-pipeline":"update",transcripts:"update"},withBufferedFeed))).toThrow(/without the role-ARN cascade/);
+  });
+  const NEW_FEED_KEYS = ["INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION", "INGEST_BUFFERED_SEARCH_FEED_SETTLE_S", "INGEST_BUFFERED_ERASURE_DELETE", "INGEST_BUFFERED_ERASURE_PAGE", "INGEST_BUFFERED_ERASURE_RATE", "INGEST_BUFFERED_ERASURE_BUDGET_MS"];
+  const refusedBy=(v:unknown)=>{let why="";try{assertSessionPipelineInputs(v,(w:string)=>{throw new Error(w)})}catch(e){why=(e as Error).message}return why};
+  const envOf=(cfg:SessionPipelineInputs)=>sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:cfg});
+  it("buffered second-version, settle and erasure defaults set no new variable and keep the erasure schedule DISABLED",()=>{
+    for(const cfg of [{},{searchIndex:true},armed,{searchIndex:true,bufferedSearchFeed:{enabled:false}},{searchIndex:true,bufferedSearchFeed:{enabled:false,secondVersion:false}},{searchIndex:true,bufferedErasureDelete:{enabled:false}}] as SessionPipelineInputs[]){
+      const env=envOf(cfg);
+      for(const k of NEW_FEED_KEYS)expect(Object.hasOwn(env,k)).toBe(false);
+      expect(bufferedErasureDeleteScheduleProps({names:p,functionArn:"fn",p:cfg,tags:{}}).state).toBe("DISABLED");
+    }
+    // The default env is unchanged: no feed or gate key at all.
+    const env=envOf({});
+    expect(Object.keys(env).filter(k=>k.includes("BUFFERED"))).toEqual([]);
+    expect(bufferedErasureConfig(env).enabled).toBe(false);
+    expect(bufferedErasureDeleteScheduleProps({names:p,functionArn:"fn",p:{},tags:{}})).toEqual({name:p.bufferedErasureDeleteRule,description:"96bulls bounded buffered-row later-erasure delete",scheduleExpression:"rate(1 minute)",state:"DISABLED",targets:[{Id:"session-pipeline",Arn:"fn",Input:JSON.stringify({bufferedErasureDelete:true})}],tags:{}});
+    expect(p.bufferedErasureDeleteRule).toBe("96bulls-aws-sessions-prod-session-buffered-erasure-delete");
+    // An armed feed keeps its exact env shape and key order.
+    expect(Object.keys(envOf(armed)).filter(k=>k.includes("BUFFERED"))).toEqual(["INGEST_BUFFERED_SEARCH_FEED","BUFFERED_SEARCH_FEED_GATE_DECLARED"]);
+  });
+  it("buffered feed secondVersion and settleSeconds pass through only when set, within the feeder's bounds",()=>{
+    expect(envOf({bufferedSearchFeed:{enabled:false,secondVersion:true}}).INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION).toBe("on");
+    expect(envOf({bufferedSearchFeed:{enabled:false,settleSeconds:300}}).INGEST_BUFFERED_SEARCH_FEED_SETTLE_S).toBe("300");
+    expect(refusedBy({bufferedSearchFeed:{enabled:false,secondVersion:true,settleSeconds:300}})).toBe("");
+    for(const n of [180,3600])expect(refusedBy({bufferedSearchFeed:{enabled:false,settleSeconds:n}})).toBe("");
+    for(const n of [100,179,3601,1.5,"300"])expect(refusedBy({bufferedSearchFeed:{enabled:false,settleSeconds:n}})).toMatch(/bufferedSearchFeed.settleSeconds must be an integer from 180 to 3600/);
+    for(const v of ["yes","on",1,null])expect(refusedBy({bufferedSearchFeed:{enabled:false,secondVersion:v}})).toMatch(/bufferedSearchFeed.secondVersion must be a boolean/);
+    // The feeder accepts what the stack renders: armed with secondVersion, only the (pinned) ceiling remains.
+    const env=envOf({...armed,bufferedSearchFeed:{...armed.bufferedSearchFeed,secondVersion:true,settleSeconds:600}});
+    expect(()=>bufferedFeedConfig(env)).toThrow(/buffered_version_ceiling_unpinned/);
+    const c=bufferedFeedConfig(env,1_000_000_000_000);
+    expect([c.enabled,c.secondVersion,c.settleMs]).toEqual([true,true,600_000]);
+    for(const n of [180,3600])expect(bufferedFeedConfig(envOf({bufferedSearchFeed:{enabled:false,settleSeconds:n}})).settleMs).toBe(n*1000);
+  });
+  it("buffered erasure delete arms only with the gate declaration and searchIndex; knobs are bounded like the lane's",()=>{
+    const gate={enabled:false,gateDeclared:BUFFERED_SEARCH_FEED_GATE_CONTRACT};
+    const erasure={searchIndex:true,bufferedSearchFeed:gate,bufferedErasureDelete:{enabled:true}};
+    expect(refusedBy(erasure)).toBe("");
+    expect(refusedBy({searchIndex:true,bufferedErasureDelete:{enabled:true}})).toMatch(/bufferedErasureDelete.enabled requires bufferedSearchFeed.gateDeclared/);
+    expect(refusedBy({searchIndex:true,bufferedSearchFeed:{enabled:false},bufferedErasureDelete:{enabled:true}})).toMatch(/requires bufferedSearchFeed.gateDeclared/);
+    expect(refusedBy({searchIndex:true,bufferedSearchFeed:{enabled:false,gateDeclared:"buffered-search-gate/v2"},bufferedErasureDelete:{enabled:true}})).toMatch(/must be exactly/);
+    expect(refusedBy({bufferedSearchFeed:gate,bufferedErasureDelete:{enabled:true}})).toMatch(/bufferedErasureDelete.enabled requires searchIndex: true/);
+    expect(refusedBy({searchIndex:false,bufferedSearchFeed:gate,bufferedErasureDelete:{enabled:true}})).toMatch(/requires searchIndex/);
+    expect(refusedBy({bufferedErasureDelete:{enabled:false}})).toBe("");
+    expect(refusedBy({bufferedErasureDelete:{enabled:"on"}})).toMatch(/bufferedErasureDelete.enabled must be a boolean/);
+    expect(refusedBy({bufferedErasureDelete:{}})).toMatch(/bufferedErasureDelete.enabled must be a boolean/);
+    expect(refusedBy({bufferedErasureDelete:[]})).toMatch(/bufferedErasureDelete must be a plain object/);
+    expect(refusedBy({bufferedErasureDelete:null})).toMatch(/bufferedErasureDelete must be a plain object/);
+    expect(refusedBy({bufferedErasureDelete:{enabled:false,extra:1}})).toMatch(/bufferedErasureDelete.extra is not a known setting/);
+    expect(refusedBy({bufferedErasureDelete:{enabled:false,pageSize:1,stagesPerSecond:1,budgetMs:5000}})).toBe("");
+    expect(refusedBy({bufferedErasureDelete:{enabled:false,pageSize:200,stagesPerSecond:20,budgetMs:240000}})).toBe("");
+    for(const n of [0,201,1.5])expect(refusedBy({bufferedErasureDelete:{enabled:false,pageSize:n}})).toMatch(/bufferedErasureDelete.pageSize must be an integer from 1 to 200/);
+    for(const n of [0,21,1.5])expect(refusedBy({bufferedErasureDelete:{enabled:false,stagesPerSecond:n}})).toMatch(/bufferedErasureDelete.stagesPerSecond must be an integer from 1 to 20/);
+    for(const n of [4999,240001,5000.5])expect(refusedBy({bufferedErasureDelete:{enabled:false,budgetMs:n}})).toMatch(/bufferedErasureDelete.budgetMs must be an integer from 5000 to 240000/);
+    // Armed: the lane's flag and the gate declaration (once), the schedule ENABLED; the feed itself stays off.
+    const env=envOf(erasure);
+    expect(env).toMatchObject({INGEST_BUFFERED_ERASURE_DELETE:"on",BUFFERED_SEARCH_FEED_GATE_DECLARED:BUFFERED_SEARCH_GATE_CONTRACT});
+    expect(Object.hasOwn(env,"INGEST_BUFFERED_SEARCH_FEED")).toBe(false);
+    expect(bufferedFeedGateRefusal(env)).toBeNull();
+    expect(bufferedErasureConfig(env)).toEqual({enabled:true,pageSize:25,stagesPerSecond:2,budgetMs:40000});
+    expect(bufferedFeedConfig(env).enabled).toBe(false);
+    expect(bufferedErasureDeleteScheduleProps({names:p,functionArn:"fn",p:erasure,tags:{}}).state).toBe("ENABLED");
+    expect(bufferedSearchFeedScheduleProps({names:p,functionArn:"fn",p:erasure,tags:{}}).state).toBe("DISABLED");
+    const both=envOf({...erasure,bufferedSearchFeed:{...gate,enabled:true}});
+    expect(Object.keys(both).filter(k=>k==="BUFFERED_SEARCH_FEED_GATE_DECLARED")).toHaveLength(1);
+    expect(both).toMatchObject({INGEST_BUFFERED_SEARCH_FEED:"on",INGEST_BUFFERED_ERASURE_DELETE:"on",BUFFERED_SEARCH_FEED_GATE_DECLARED:BUFFERED_SEARCH_GATE_CONTRACT});
+    // Knobs pass through only when set, and the lane accepts them at the edges.
+    for(const [knobs,want] of [[{pageSize:1,stagesPerSecond:1,budgetMs:5000},{pageSize:1,stagesPerSecond:1,budgetMs:5000}],[{pageSize:200,stagesPerSecond:20,budgetMs:240000},{pageSize:200,stagesPerSecond:20,budgetMs:240000}]] as const){
+      const e=envOf({...erasure,bufferedErasureDelete:{enabled:true,...knobs}});
+      expect(e).toMatchObject({INGEST_BUFFERED_ERASURE_PAGE:String(knobs.pageSize),INGEST_BUFFERED_ERASURE_RATE:String(knobs.stagesPerSecond),INGEST_BUFFERED_ERASURE_BUDGET_MS:String(knobs.budgetMs)});
+      expect(bufferedErasureConfig(e)).toEqual({enabled:true,...want});
+    }
+    for(const k of ["INGEST_BUFFERED_ERASURE_PAGE","INGEST_BUFFERED_ERASURE_RATE","INGEST_BUFFERED_ERASURE_BUDGET_MS"])expect(Object.hasOwn(env,k)).toBe(false);
+    expect(JSON.stringify(bufferedErasureDeleteScheduleProps({names:p,functionArn:"fn",p:erasure,tags:{}}))).not.toMatch(/database_url|ca_pem|password/);
+    const permission=sessionPipelinePermissions({accountId:ACCOUNT,functionName:p.function,ruleArn:"old",briefRuleArn:"brief",bufferedSearchFeedRuleArn:"exact-feed-rule",bufferedErasureDeleteRuleArn:"exact-erasure-rule",roleArn:ROLE}).at(-1)!;
+    expect(permission.id).toBe("session-buffered-erasure-delete-permission");
+    expect(permission.props).toEqual({action:"lambda:InvokeFunction",functionName:p.function,principal:"events.amazonaws.com",sourceArn:"exact-erasure-rule",sourceAccount:ACCOUNT});
+  });
+  const withBufferedErasure=[...all,...SESSION_BUFFERED_ERASURE_DELETE_RESOURCES];
+  it("buffered erasure phase keeps permission create-only and refuses mixed schedules and unrelated changes",()=>{
+    const creates=Object.fromEntries(SESSION_BUFFERED_ERASURE_DELETE_RESOURCES.map(r=>[r,"create"]));
+    expect(check(plan(creates,withBufferedErasure))).toBe("session buffered erasure delete rollout");
+    expect(check(plan({"session-buffered-erasure-delete-schedule":"update"},withBufferedErasure))).toBe("session buffered erasure delete update");
+    expect(()=>check(plan({"session-buffered-erasure-delete-permission":"update"},withBufferedErasure))).toThrow(/unsafe action combination/);
+    expect(()=>check(plan(creates,[...all,"session-buffered-erasure-delete-schedule"]))).toThrow(/missing resource session-buffered-erasure-delete-permission/);
+    for(const action of ["delete","replace"])expect(()=>check(plan({"session-buffered-erasure-delete-schedule":action},withBufferedErasure))).toThrow(/forbidden action/);
+    expect(()=>check(plan({...creates,trail:"update"},withBufferedErasure))).toThrow(/separate reviewed phase/);
+    expect(()=>check(plan({...creates,"session-buffered-search-feed-schedule":"update"},[...withBufferedErasure,...SESSION_BUFFERED_SEARCH_FEED_RESOURCES]))).toThrow(/separate reviewed phase/);
+    expect(()=>check(plan({...creates,"session-pipeline":"update",transcripts:"update"},withBufferedErasure))).toThrow(/without the role-ARN cascade/);
+    const withApi=[...withBufferedErasure,"session-read-api","session-read-api-secret","session-read-api-errors-alarm","session-read-api-throttles-alarm"];
+    expect(()=>check(plan({...creates,"session-read-api":"update"},withApi))).toThrow(/only with no declared property changes/);
+  });
+  const withSemantic=[...all,...SESSION_SEMANTIC_COPY_RESOURCES];
+  it("semantic copier defaults disabled with exact rule/account invoke permission",()=>{
+    expect(semanticCopyScheduleProps({names:p,functionArn:"fn",p:{},tags:{}})).toMatchObject({state:"DISABLED",scheduleExpression:"rate(1 minute)",targets:[{Input:JSON.stringify({semanticCopy:true})}]});
+    expect(sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:{}})).toMatchObject({SESSION_SEMANTIC_COPY_ENABLED:"0",SESSION_SEARCH_FEATURE_SOURCE_ID:""});
+    const enabled={semanticCopy:{enabled:true,sourceId:"reviewed-source"}};
+    expect(semanticCopyScheduleProps({names:p,functionArn:"fn",p:enabled,tags:{}}).state).toBe("ENABLED");
+    const permission=sessionPipelinePermissions({accountId:ACCOUNT,functionName:p.function,ruleArn:"old",briefRuleArn:"brief",semanticRuleArn:"exact-semantic-rule",roleArn:ROLE}).at(-1)!;
+    expect(permission.props).toEqual({action:"lambda:InvokeFunction",functionName:p.function,principal:"events.amazonaws.com",sourceArn:"exact-semantic-rule",sourceAccount:ACCOUNT});
+  });
+  it("semantic phase keeps permission create-only and refuses mixed schedules, unrelated changes and unproven cascades",()=>{
+    const creates=Object.fromEntries(SESSION_SEMANTIC_COPY_RESOURCES.map(r=>[r,"create"]));expect(check(plan(creates,withSemantic))).toBe("session semantic copy rollout");
+    expect(check(plan({"session-semantic-copy-schedule":"update"},withSemantic))).toBe("session semantic copy update");
+    expect(()=>check(plan({"session-semantic-copy-permission":"update"},withSemantic))).toThrow(/unsafe action combination/);
+    expect(()=>check(plan(creates,[...all,"session-semantic-copy-schedule"]))).toThrow(/missing resource session-semantic-copy-permission/);
+    for(const action of ["delete","replace"])expect(()=>check(plan({"session-semantic-copy-schedule":action},withSemantic))).toThrow(/forbidden action/);
+    expect(()=>check(plan({...creates,trail:"update"},withSemantic))).toThrow(/separate reviewed phase/);
+    expect(()=>check(plan({...creates,"session-brief-schedule":"update"},[...withSemantic,...SESSION_BRIEF_RESOURCES]))).toThrow(/separate reviewed phase/);
+    expect(()=>check(plan({...creates,"session-pipeline":"update",transcripts:"update"},withSemantic))).toThrow(/without the role-ARN cascade/);
+    const withApi=[...withSemantic,"session-read-api","session-read-api-secret","session-read-api-errors-alarm","session-read-api-throttles-alarm"];
+    expect(()=>check(plan({...creates,"session-read-api":"update"},withApi))).toThrow(/only with no declared property changes/);
   });
 
   const withBrief = [...all, ...SESSION_BRIEF_RESOURCES];

@@ -6,13 +6,15 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { gzipSync, zstdCompressSync, zstdDecompressSync } from "node:zlib";
-import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
+import { objectKey, readAll, type ManifestV1, type ObjectStore } from "../../shared/vendor.ts";
 import { MAX_SCRUB_CHARS } from "@rhc/lib/scrub.ts";
 import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SIGNATURE_HEADER, SYNC_SCOPE } from "../app.ts";
 import { deliverBatch, IngestUnavailable } from "../deliver.ts";
+import { canonicalSnapshot, type CanonicalPointer } from "../../session-read-api/canonical.ts";
 import { MAX_REPLICA_MESSAGE_BYTES, type NeonReplicaMessage, type ReplicaSink } from "../replica.ts";
 import { DeliveryError, MAX_DELIVERY_BYTES } from "../vendor/delivery/delivery-contracts.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
+import { RECOVERY_CONTENT_TYPE, RECOVERY_PROTOCOL } from "../recovery-protocol.ts";
 import { LIVE_OWNER, NO_SESSION_HARNESS, liveMachineId } from "../writer.ts";
 import { MemoryLedger, SIGNING_KEY, TENANT, batch, record, scratchStore, signedHeaders } from "./support.ts";
 
@@ -50,7 +52,111 @@ async function chunks(store: ObjectStore): Promise<string[]> {
   return Promise.all(keys.map((k) => readText(store, k)));
 }
 
+async function onlyManifest(store: ObjectStore): Promise<{ key: string; manifest: ManifestV1 }> {
+  const manifests = (await listAll(store, "96bulls/org-a/v1")).filter((key) => key.endsWith("manifest.json"));
+  expect(manifests).toHaveLength(1);
+  const key = manifests[0]!;
+  return { key, manifest: JSON.parse(await readText(store, key)) as ManifestV1 };
+}
+
+function identityExtension(manifest: ManifestV1): Record<string, unknown> {
+  return manifest.extensions?.["96bulls"] as Record<string, unknown>;
+}
+
+async function putManifest(store: ObjectStore, key: string, manifest: ManifestV1): Promise<void> {
+  await store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(manifest)), { contentType: "application/json" });
+}
+
+async function canonicalFromWrittenManifest(store: ObjectStore, key: string, manifest: ManifestV1, sessionId: string) {
+  const pointer: CanonicalPointer = {
+    org_id: TENANT.orgId,
+    workspace_id: TENANT.workspaceId,
+    harness: "claude",
+    session_id: sessionId,
+    machine_id: manifest.session.machine_id,
+    user_id: TENANT.userId,
+    storage_provider: "s3",
+    bucket: "test-bucket",
+    manifest_key: key,
+    content_sha256: manifest.raw.content_sha256,
+    raw_format: "ndjson",
+    revision: manifest.revision,
+    deleted_at: null,
+  };
+  return canonicalSnapshot(
+    {
+      store,
+      provider: "s3",
+      bucket: "test-bucket",
+      prefix: { PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true" },
+      pointers: async () => [pointer],
+      decompress: (bytes) => new Uint8Array(zstdDecompressSync(bytes)),
+    },
+    { orgId: TENANT.orgId, workspaceId: TENANT.workspaceId, source: "claude", sessionId },
+  );
+}
+
 describe("deliverBatch", () => {
+  test("binds the authenticated user to a fresh manifest and canonical pointer read", async () => {
+    const { store, deps } = setup();
+    await deliverBatch(deps, TENANT, await batch([record({ record_id: "identity-user" })]));
+    const { key, manifest } = await onlyManifest(store);
+
+    expect(identityExtension(manifest).user_id).toBe(TENANT.userId);
+    const snapshot = await canonicalFromWrittenManifest(store, key, manifest, "sess-1");
+    expect(snapshot.rows).toHaveLength(1);
+    expect(snapshot.rows[0]).toMatchObject({ row: { user_id: TENANT.userId, session_id: "sess-1" } });
+  });
+
+  test("round-trips a layout-encoded session id through the canonical pointer boundary", async () => {
+    const { store, deps } = setup();
+    await deliverBatch(deps, TENANT, await batch([record({ record_id: "identity-session", session_id: "sess:1" })]));
+    const { key, manifest } = await onlyManifest(store);
+
+    expect(manifest.session.session_id).toBe("sess_1");
+    expect(identityExtension(manifest).canonical_session_id).toBe("sess:1");
+    const snapshot = await canonicalFromWrittenManifest(store, key, manifest, "sess:1");
+    expect(snapshot.rows).toHaveLength(1);
+    expect(snapshot.rows[0]).toMatchObject({ row: { user_id: TENANT.userId, session_id: "sess:1" } });
+  });
+
+  test("preserves existing 96bulls metadata when appending another batch", async () => {
+    const { store, deps } = setup();
+    await deliverBatch(deps, TENANT, await batch([record({ record_id: "identity-first" })]));
+    const first = await onlyManifest(store);
+    first.manifest.extensions!["96bulls"] = { ...identityExtension(first.manifest), admitted_marker: { version: 7 } };
+    await putManifest(store, first.key, first.manifest);
+
+    await deliverBatch(deps, TENANT, await batch([record({ record_id: "identity-second" })], { batch_id: "identity-batch-2" }));
+    const updated = (await onlyManifest(store)).manifest;
+    expect(identityExtension(updated)).toMatchObject({
+      user_id: TENANT.userId,
+      canonical_session_id: "sess-1",
+      admitted_marker: { version: 7 },
+    });
+    expect(updated.raw.chunks).toHaveLength(2);
+  });
+
+  for (const [field, conflicting] of [["user_id", "another-user"], ["canonical_session_id", "another-session"]] as const) {
+    test(`refuses an existing manifest with conflicting ${field}`, async () => {
+      const { store, deps } = setup();
+      await deliverBatch(deps, TENANT, await batch([record({ record_id: `identity-${field}-first` })]));
+      const first = await onlyManifest(store);
+      first.manifest.extensions!["96bulls"] = { ...identityExtension(first.manifest), [field]: conflicting };
+      await putManifest(store, first.key, first.manifest);
+      const before = await chunks(store);
+
+      const error = await deliverBatch(
+        deps,
+        TENANT,
+        await batch([record({ record_id: `identity-${field}-second` })], { batch_id: `identity-${field}-batch-2` }),
+      ).catch((caught) => caught);
+      expect(error).toBeInstanceOf(IngestUnavailable);
+      expect(error).toMatchObject({ stage: "objects", cause_code: "manifest_identity_mismatch" });
+      expect(await chunks(store)).toEqual(before);
+    });
+  }
+
   test("lands the batch in the m=srv_ layout with relayhistory's receipt", async () => {
     const { store, ledger, deps } = setup();
     const b = await batch([record({ record_id: "e1" }), record({ record_id: "e2", revision: 3 })]);
@@ -438,7 +544,7 @@ describe("staging: a batch wider than one Worker invocation", () => {
     const now = new Date("2026-11-02T00:00:00Z");
     const { groups } = groupRecords(prepared.records, now);
     const target = { store, keyRoot: "96bulls", sleep: noSleep };
-    const key = await stageGroups(target, { batch_digest: prepared.batchDigest, received_at: now.toISOString(), org_id: "org-a", workspace_id: "ws-a", origin_id: "origin-1", user_id: "user-1" }, groups);
+    const key = await stageGroups(target, { claim_token:crypto.randomUUID(),batch_digest: prepared.batchDigest, received_at: now.toISOString(), org_id: "org-a", workspace_id: "ws-a", origin_id: "origin-1", user_id: "user-1" }, groups);
     for (const m of fanoutMessages(key, groups.length)) await fanout(target, m, (x) => new Uint8Array(zstdDecompressSync(x)));
     const manifests = (await listAll(store, "96bulls/org-a/v1")).filter((k) => k.endsWith("manifest.json"));
     expect(manifests).toHaveLength(2);
@@ -509,6 +615,33 @@ describe("the binding identity is signed (review Medium)", () => {
     expect([res.status, ((await res.json()) as { error: { code: string } }).error.code]).toEqual([401, "not_configured"]);
     void SIGNATURE_HEADER;
   });
+
+  test("archive recovery requires the HMAC over its exact private body and buffered mode", async () => {
+    const { deps, ledger } = setup();
+    const raw = await batch([record({ record_id: "signed-recovery" })], { batch_id: "signed-recovery" });
+    const prepared = await prepareDelivery(TENANT, raw);
+    const sourceDigest = "d".repeat(64);
+    const custody = {
+      sourceDigest,
+      witness: {
+        version: 1 as const, issuer: "relayhistory-cloud" as const, sourceIdentitySha256: "c".repeat(64), controlEpoch: "e".repeat(64), privacyBaselineSha256: "a".repeat(64),
+        tenant: TENANT, originId: prepared.originId, batchId: prepared.batchId, batchDigest: prepared.batchDigest, sourceControlVersion: "0", pending: false, pendingControl: null,
+        privacyVersion: "0", originalRecordCount: raw.records.length, candidateCount: prepared.records.length,
+        records: prepared.records.map((r, preparedOrd) => ({ preparedOrd, processingRank: preparedOrd, candidateDigest: r.digest, recordId: r.record_id, revision: String(r.revision), revisionId: r.revision_id, candidateFenced: false, currentFenced: false, current: null })),
+        privacy: { complete: true as const, deletions: [], resets: [] },
+      },
+    };
+    ledger.prepareBufferStage = async () => ({ stageToken: crypto.randomUUID(), expiresAt: new Date(Date.now() + 60_000).toISOString() });
+    ledger.commitBuffered = async () => ({ version: 1, sourceDigest, sourceControlVersion: "0", privacySealed: true });
+    const body = JSON.stringify({ protocol: RECOVERY_PROTOCOL, prepared, custody });
+    const path = "/v1/delivery/recovery";
+    const headers = { "content-type": RECOVERY_CONTENT_TYPE, ...signedHeaders(identity, "POST", path, enc(body)) };
+    const buffered = createIngestApp({ deliver: { ...deps, acceptanceMode: "buffered" }, log: () => {}, signingKey: SIGNING_KEY });
+    expect((await buffered.fetch(new Request(`https://x${path}`, { method: "POST", body, headers }))).status).toBe(200);
+    expect((await buffered.fetch(new Request(`https://x${path}`, { method: "POST", body: body + " ", headers }))).status).toBe(401);
+    const canonical = createIngestApp({ deliver: deps, log: () => {}, signingKey: SIGNING_KEY });
+    expect((await canonical.fetch(new Request(`https://x${path}`, { method: "POST", body, headers }))).status).toBe(503);
+  });
 });
 
 describe("deletion fences written by relayhistory (review High 2 / Medium: fences had no writer)", () => {
@@ -521,11 +654,17 @@ describe("deletion fences written by relayhistory (review High 2 / Medium: fence
     const res = await a.fetch(new Request(`https://x${path}`, { method: "POST", body, headers: signedHeaders(identity, "POST", path, enc(body)) }));
     return { res, ledger };
   }
-  test("selection: relayhistory's body and answer; the ledger gets this user's sessions", async () => {
+  test.each([false, true])("selection: optional expected user %s preserves the body and authenticated ledger tenant", async (withUser) => {
     const account_id = (await batch([])).account_id;
-    const { res, ledger } = await post("/v1/delivery/sessions/selection", { account_id, origin_id: "origin-1", sessions: [{ source: "claude", session_id: "s1" }], enabled: false });
+    const { res, ledger } = await post("/v1/delivery/sessions/selection", { account_id, ...(withUser ? { expected_user_id: identity.userId } : {}), origin_id: "origin-1", sessions: [{ source: "claude", session_id: "s1" }], enabled: false });
     expect([res.status, await res.json()]).toEqual([200, { updated: true }]);
     expect(ledger.selections).toEqual([{ tenant: TENANT, originId: "origin-1", sessions: [["claude", "s1"]], enabled: false }]);
+  });
+  test.each(["another-user", null, "", 7, "user-1\u0000", "x".repeat(513)])("selection: invalid expected user %j never changes consent", async (expected_user_id) => {
+    const { res, ledger } = await post("/v1/delivery/sessions/selection", { account_id: (await batch([])).account_id, expected_user_id, origin_id: "origin-1", sessions: [{ source: "claude", session_id: "s1" }], enabled: false });
+    expect(res.status).toBe(expected_user_id === "another-user" ? 403 : 400);
+    expect(ledger.selections).toEqual([]);
+    expect(ledger.deleted.size).toBe(0);
   });
   test("selection: another tenant's account id is 403, a malformed body 400, nothing written", async () => {
     const wrong = await post("/v1/delivery/sessions/selection", { account_id: "relayhistory:other", origin_id: "o", sessions: [{ source: "claude", session_id: "s1" }], enabled: false });
@@ -533,6 +672,22 @@ describe("deletion fences written by relayhistory (review High 2 / Medium: fence
     expect(wrong.ledger.selections).toEqual([]);
     const bad = await post("/v1/delivery/sessions/selection", { account_id: (await batch([])).account_id, origin_id: "o", sessions: [], enabled: false });
     expect(bad.res.status).toBe(400);
+    const unknown = await post("/v1/delivery/sessions/selection", { account_id: (await batch([])).account_id, expected_user_id: identity.userId, origin_id: "o", sessions: [{ source: "claude", session_id: "s1" }], enabled: false, unexpected: true });
+    expect(unknown.res.status).toBe(400);
+    expect(unknown.ledger.selections).toEqual([]);
+  });
+  test.each(["relayhistory", "frozen-supabase"] as const)("selection: expected user is checked before ordered control or custody on %s", async (custodySource) => {
+    const { deps, ledger } = setup();
+    let witnessCalls = 0, controlCalls = 0;
+    ledger.frozenWitness = async () => { witnessCalls++; throw new Error("must not read custody"); };
+    ledger.applyOrderedControl = async () => { controlCalls++; throw new Error("must not apply control"); };
+    const a = createIngestApp({ deliver: deps, log: () => {}, signingKey: SIGNING_KEY, custodySource });
+    const controlIdentity = { ...identity, control: { epoch: "e".repeat(64), version: "1", digest: "d".repeat(64), kind: "selection" } };
+    const path = "/v1/delivery/sessions/selection";
+    const body = JSON.stringify({ account_id: (await batch([])).account_id, expected_user_id: "another-user", origin_id: "origin-1", sessions: [{ source: "claude", session_id: "s1" }], enabled: false });
+    const res = await a.fetch(new Request(`https://x${path}`, { method: "POST", body, headers: signedHeaders(controlIdentity, "POST", path, enc(body)) }));
+    expect(res.status).toBe(403);
+    expect([witnessCalls, controlCalls, ledger.selections.length, ledger.deleted.size]).toEqual([0, 0, 0, 0]);
   });
   test("reset: needs the typed confirmation, answers relayhistory's shape", async () => {
     const account_id = (await batch([])).account_id;

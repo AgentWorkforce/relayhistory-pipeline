@@ -1,0 +1,24 @@
+{
+  "kind": "independent_static_delta_review",
+  "verdict": "PASS",
+  "reviewer": "codex-relay-desktop-find-prior",
+  "at": "2026-11-07T23:08:29.471679+00:00",
+  "exactFinalSqlSha256": "2486bf707ef7b415d73313375a7f381f68179144d0ef51491a6c23a8a13ea1da",
+  "comparedAgainstSha256": "653631a3fe5fada39df2ca74ebee35c7236bfe2240be51818d515422edde98fa",
+  "deltaVerified": [
+    "current_database filter in activity queries",
+    "distinct waiter count separate from blocking edge count",
+    "waiting query age accurately named",
+    "relation lock query explicitly context only"
+  ],
+  "staticExecutionSafety": "READ ONLY transaction; catalog/stat functions only; local bounded timeouts; ROLLBACK; no PID/query text/tenant value output; no reset or writes",
+  "inheritedRuntimePrecondition": "Root existing qualified read-only owner route with pg_read_all_stats visibility; no new grant or access change implied",
+  "samplesReviewed": "5 bounded read-only snapshots per lead; no query execution by reviewer",
+  "remainingDiagnosticLimits": [
+    "same-database all-role context must be filtered for ingest interpretation",
+    "relation-null transactionid waits cannot identify a table from relation counts",
+    "query age is not measured lock wait duration",
+    "global clock/per-user fence bottlenecks remain hypotheses until observations"
+  ],
+  "sqlExecutedByReviewer": false
+}

@@ -13,11 +13,8 @@
  * No summary text is ever put in a log line, an error message or telemetry.
  */
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
-import {
-  SCRUB_RULESET,
-  SCRUB_RULESET_VERSION,
-  scrubText,
-} from "../shared/vendor.ts";
+import { SCRUB_RULESET, SCRUB_RULESET_VERSION } from "../shared/vendor.ts";
+import { ScrubEngineUnavailable, activeScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
 import { meaningfulChars } from "./search-query.ts";
 
 /** Hard bound, in Unicode code points (PostgreSQL `char_length`). */
@@ -65,11 +62,14 @@ const codePoints = (value: string) => Array.from(value).length;
 
 /**
  * Scrub and bound one summary. `scrub` is the shared scrubber; it is a parameter
- * only so tests can prove a failing scrub is refused.
+ * only so tests can prove a failing scrub is refused. Without it the active scrub
+ * engine scrubs, and `scrubVersion` is that engine instance's own ruleset version
+ * (docs/scrub-engine.md, "Marker rule"); with the TypeScript engine that is
+ * SCRUB_RULESET_VERSION, as before.
  */
 export function scrubShortSummary(
   summary: string,
-  scrub: (value: string) => string = scrubText,
+  scrub?: (value: string) => string,
 ): ScrubbedShortSummary {
   const trimmed = summary.trim();
   // Blank-looking text (only Unicode spaces, format characters or combining marks)
@@ -80,6 +80,14 @@ export function scrubShortSummary(
   if (codePoints(trimmed) > SHORT_SUMMARY_MAX_CHARS)
     throw new ShortSummaryRejected("over_length");
   let text: string;
+  let scrubVersion = SCRUB_RULESET_VERSION;
+  if (!scrub) {
+    // Outside the try: an unavailable engine (ScrubEngineUnavailable, retryable) is
+    // not a refusal of this summary and must not clear the stored one.
+    const engine = activeScrubEngine();
+    scrub = (value) => engine.scrubText(value);
+    scrubVersion = engine.rulesetVersion;
+  }
   try {
     text = scrub(trimmed);
     if (typeof text !== "string")
@@ -88,6 +96,8 @@ export function scrubShortSummary(
     if (scrub(text) !== text) throw new ShortSummaryRejected("scrub_unstable");
   } catch (error) {
     if (error instanceof ShortSummaryRejected) throw error;
+    // The engine failed, not this summary: retryable, nothing is refused or cleared.
+    if (error instanceof ScrubEngineUnavailable) throw error;
     throw new ShortSummaryRejected("scrub_failed");
   }
   text = text.trim();
@@ -97,7 +107,7 @@ export function scrubShortSummary(
   return {
     text,
     scrubRuleset: SCRUB_RULESET,
-    scrubVersion: SCRUB_RULESET_VERSION,
+    scrubVersion,
   };
 }
 
@@ -114,7 +124,7 @@ export const BRIEF_SUMMARY_SOURCE_PREFIX = "session-brief/";
 export async function writeShortSummary(
   db: SqlExecutor,
   input: ShortSummaryInput,
-  scrub: (value: string) => string = scrubText,
+  scrub?: (value: string) => string,
 ): Promise<{ written: boolean; scrubVersion: number }> {
   let scrubbed: ScrubbedShortSummary;
   try {

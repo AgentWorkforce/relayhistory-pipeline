@@ -60,13 +60,14 @@ import {
 } from "../../shared/vendor.ts";
 import { sqlPipelineEventSink } from "../../hoopdb/sink.ts";
 import { buildIngestApp } from "../ingest.ts";
-import { expectedMigrationNames, generation } from "../../hoopdb/migrate.ts";
+import { expectedMigrationNames, expectedSchema, generation } from "../../hoopdb/migrate.ts";
 import { mintToken } from "../auth.ts";
 import { runCourierOnce, type CourierConfig } from "../courier.ts";
 import { mintTenantToken } from "../../proof/aws/ingest.ts";
 import { DatabaseSync } from "node:sqlite";
 import { writeFile } from "node:fs/promises";
 import { indexerReconcileRoot } from "../../hoopdb/reconcile-root.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
 import {
   objectKey,
   prefixAllowed,
@@ -226,24 +227,10 @@ beforeAll(async () => {
   await db.exec(
     await readFile(join(ROOT_DIR, "supabase/tests/supabase_shim.sql"), "utf8"),
   );
-  await db.exec(
-    await readFile(
-      join(ROOT_DIR, "supabase/bootstrap/session_directory_search_worker.sql"),
-      "utf8",
-    ),
-  );
-  await db.exec(
-    await readFile(
-      join(ROOT_DIR, "supabase/bootstrap/session_token_verifier.sql"),
-      "utf8",
-    ),
-  );
-  await db.exec(
-    await readFile(
-      join(ROOT_DIR, "supabase/bootstrap/session_ingest_roles.sql"),
-      "utf8",
-    ),
-  );
+  // Single-sourced bootstrap chain: the grant migration FAILs closed
+  // without the bare consumer grantee.
+  for (const f of SESSION_BOOTSTRAP_FILES)
+    await db.exec(await readFile(join(ROOT_DIR, f), "utf8"));
   for (const dir of ["supabase/migrations", "src/hoopdb/migrations"])
     for (const file of (await readdir(join(ROOT_DIR, dir)))
       .filter((f) => f.endsWith(".sql"))
@@ -253,7 +240,7 @@ beforeAll(async () => {
     String(input) === JWKS_URL
       ? Response.json(JWKS)
       : realFetch(input, init)) as typeof fetch;
-});
+}, 120_000);
 afterAll(async () => {
   globalThis.fetch = realFetch;
   await db?.close();
@@ -524,13 +511,15 @@ describe("buildIngestApp auth (production composition)", () => {
   test("/readyz is 503 until the Worker role validation is PASS for this image's generation", async () => {
     const { app, env } = await ingest();
     // This file applies the migrations directly, so record the ledger the migrator
-    // would have written: the schema gate passes and only the marker is under test.
+    // would have written. The fixture records each file's sha256 so the schema gate
+    // (now checksum-aware) passes and only the marker is under test.
     await db.exec(`CREATE TABLE sessions.__96bulls_migrations (
       name text PRIMARY KEY, sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`);
+    const { shas } = await expectedSchema();
     for (const name of await expectedMigrationNames())
       await db.query(
-        "INSERT INTO sessions.__96bulls_migrations (name, sha256) VALUES ($1, 'x')",
-        [name],
+        "INSERT INTO sessions.__96bulls_migrations (name, sha256) VALUES ($1, $2)",
+        [name, shas[name] ?? "x"],
       );
     const ready = async () => {
       const r = await app.request("/readyz", {}, env);

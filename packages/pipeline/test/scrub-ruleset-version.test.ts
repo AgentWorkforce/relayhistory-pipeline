@@ -20,6 +20,79 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Updated before release (K-1, K-2: key-block segmentation fixes). Version 2 had
   // sealed no chunk: it was only ever on the unmerged #108 branch, and images build from main.
   2: "417d545e6b79b1100e206e7a6add66f24819868b2606e9ca2c45c09be9644ee2",
+  // Quoted secret keys at any JSON escaping depth, Cloudflare scannable tokens and
+  // more provider prefixes, non-Bearer Authorization, and the entropy fallback next
+  // to a secret name (2026-11-02 Cloudflare-token-in-transcript finding).
+  // Updated before release (#162 adversarial review: the segmenter's CUT_CONTEXT_CHARS
+  // widened from 4096 to 8192, past the quoted rule's reach). Version 3 has sealed no
+  // chunk: it is only on the unmerged #162 branch.
+  // Then the entropy fallback stopped firing after a `/`, `.` or `-` (paths, members,
+  // branch names), and an unquoted value after a quoted key is taken only after a
+  // one-word key and only when it looks generated (code and quoted prose are kept).
+  // Then the literal-prefix rules stopped starting after a `-` inside a longer token
+  // (they cut SendGrid and other full-shape keys and leaked their start; a glued
+  // `word-sk-…` is taken later, whole), and the SendGrid rule moved ahead of them.
+  // Then the glued-prefix pass tries the relay_ rule first (its body may hold a `.`), so
+  // `build-relay_…-sk-….tail` is no longer split at the `.` by the `sk-` rule.
+  3: "e7607073a3afca3db6b015945f0b5fab256202f355b740f515987ec162bf3076",
+  // A quoted secret value past the quoted rule's 4096-unit scan bound is redacted whole
+  // (to its matching closing quote or the end of input; no line break ends it), not cut at
+  // the bound with the rest stored; a generated unquoted value after a quoted key likewise.
+  // The segmenter never cuts between such a value's key and its end (longCut, safeCut, and
+  // a run open in one keeps its next record or key line). Values within the bound scrub
+  // byte-identically to version 3.
+  // Updated before release (N1 delta review: longCut finds those values past the segment
+  // bound too, so a key just below the bound is protected; the unquoted over-bound value
+  // gets a span. N2: the line-confined narrowing is withdrawn, over-bound values run across
+  // line breaks. N3: the bound caps the value's total length to its matching close across
+  // lines, not its key line's, and a run or cut window ending inside an undecided secret
+  // value fails closed). Version 4 has sealed no chunk: it is only on this unmerged branch.
+  4: "429200e870dea6b5602f6ffa6b7a577cf2016b27aa9d99e6a3e61b55e5ec612c",
+  // An over-cap quoted secret value is classified and redacted on the original text, by a
+  // pre-pass ahead of every other rule (version 4 measured it after the token rules had
+  // shrunk it under the bound and stored its later lines). The record path keeps key
+  // context: a non-empty string under a secret key is redacted at any depth, through
+  // arrays, in scrubJson/scrubRecord and the record-line tokenizer. From version 5 the
+  // segmenter markers also enclose scrubRecordLine, so the digest covers the record path.
+  // Output with no secret-keyed record value, no over-cap quoted value and no quoted
+  // secret value left unclosed or open across a line break is byte-identical to version 4.
+  // Updated before release (repeated source keys: scrubRecordLine writes a key the source
+  // repeats under its first written name, never another key's). Version 5 shipped and has
+  // sealed stored objects: it is immutable (frozen as fixtures/scrub-ruleset-5.ts). The next
+  // ruleset edit must again freeze the current version and bump.
+  // Updated before release (PASS gate blockers 1 and 2: multi-line or unclosed quoted
+  // secret values within the bound are redacted whole and never cut inside; secret context
+  // runs through composite values, objects as well as arrays).
+  // Updated before release (exact-head review of ff5fc268: a value starting `op://` is kept
+  // only when the whole value is a strict one-line reference, OP_REFERENCE; one holding an
+  // escaped line separator, a backslash, a quote, a tab or a double space is redacted whole).
+  // Updated before release (exact-head review of 0f9b2416: an op:// reference has exactly three
+  // or four segments; two, or five or more, are redacted whole).
+  // Main carried interim in-place re-pins 595fecdf… and 848c490b… of rule set 5 that were never
+  // deployed; the chained-PEM fix from #362 is part of rule set 6.
+  5: "ed8d5c35bfddbcdbe03416c03e08b3d0a0bbcf7c276bc08fe12f14d8756ee933",
+  // Version 6: an unquoted value after a quoted secret key is classified whole (version 5
+  // classified its first MAX_QUOTED_VALUE units, so 4096 digits then a tail were kept) and
+  // one of MAX_QUOTED_VALUE units or more is redacted whole; the over-cap first pass keeps
+  // private-key header/footer pairs intact, so a header before a quoted secret value holding
+  // its footer is redacted through the value's close, not to the end of the input. The
+  // segmenter is unchanged. Output with neither shape is byte-identical to version 5
+  // (test/scrub-v5-v6-fuzz.test.ts).
+  // Updated before release (forward merge of main with #354, which had edited version 5 in
+  // place and re-pinned it to 595fecdf…; 5 stays the shipped ed8d5c35…): a header in a
+  // quoted secret value whose footer is inside a later quoted value no longer leaves the
+  // rest of that later value keyless (the close is not put back when a quote lies between).
+  // Updated before release (review of f6a97053, defect 4): with no quote between, a footer
+  // inside a later unquoted credential (`token=…`, `Bearer …`, `?access_token=…`) no longer
+  // leaves the rest of that credential, glued to the footer, without its label; the run is
+  // redacted with the footer, or to the end of the input when it holds a quote.
+  6: "28edb23b9ff94299d530213a04026210eb848399475b740e026ecc85980b3a11",
+  // Version 7: only the exact public idempotency_key assignment is exempt.
+  // Version 6 is immutable in fixtures/scrub-ruleset-6.ts.
+  7: "887dd7184c757f5840b6a363fec8e9ea93819a5b917659985b56bc32a33f2fd8",
+  // Version 8 leaves public replay identifiers unmatched, so scanning continues
+  // into their values and removes nested labelled credentials. Version 7 is frozen.
+  8: "50c2e0c67395f488a308cbcfc7c945606374b3d67d37138e284849c6190c8214",
 };
 
 const read = (rel: string) =>

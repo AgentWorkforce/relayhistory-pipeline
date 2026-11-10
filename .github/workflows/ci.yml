@@ -5,10 +5,51 @@ on:
     branches: [main]
 permissions:
   contents: read
+concurrency:
+  # One live run per pull request: a new push cancels the previous head's run.
+  # Pushes to main (and any non-PR event) are grouped by sha and never cancelled.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   checks:
-    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 20
+    # Preserve the existing required check name: neither parallel job may be
+    # skipped, canceled or failing when this gate goes green.
+    needs: [unit-tests, aws-hardening-mutations, selfhost-e2e]
+    if: ${{ always() }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - name: Require unit and mutation checks
+        env:
+          UNIT_RESULT: ${{ needs.unit-tests.result }}
+          MUTATION_RESULT: ${{ needs.aws-hardening-mutations.result }}
+          E2E_RESULT: ${{ needs.selfhost-e2e.result }}
+        run: |
+          test "$UNIT_RESULT" = "success"
+          test "$MUTATION_RESULT" = "success"
+          test "$E2E_RESULT" = "success"
+  selfhost-e2e:
+    # The self-contained end-to-end acceptance test (docs/local-stack.md): no
+    # Control, RelayAuth or other AgentWorkforce service; synthetic data only.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install (root + workspaces)
+        run: bun install --frozen-lockfile
+      - name: End-to-end acceptance test
+        run: bun run e2e:selfhost
+  unit-tests:
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    # The serial PGlite suite outgrew 40 minutes on GitHub-hosted runners.
+    # Preserve every test and the 30-second per-test limit below.
+    timeout-minutes: 90
     # A real ClickHouse for the session read API's query tests
     # (src/session-read-api/__tests__/page.clickhouse.test.ts), the version the
     # search proofs pin. Test-only credentials; no production data.
@@ -52,10 +93,6 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Typecheck packages/pipeline
         run: bun run --filter @96bulls/pipeline typecheck
-      - name: Typecheck coordination evaluator
-        run: bun run --filter @96bulls/coordination-eval typecheck
-      - name: Test coordination evaluator
-        run: bun run --filter @96bulls/coordination-eval test
       - name: Test packages/pipeline (vitest, in-process PGlite; no real database)
         run: bun run --filter @96bulls/pipeline test
       - name: Build packages/object-store
@@ -65,11 +102,19 @@ jobs:
       - name: Typecheck the stack (src, stacks, alchemy.run.ts)
         run: bunx tsc --noEmit -p tsconfig.json
       - name: Unit tests (stack)
-        run: bun test
+        run: bun test --timeout 30000
+      # The ingest Worker on a database migrated only to the G4 set (through 043800; none of the post-G4 migrations, 043850 onward).
+      # g4-only-schema.pglite.test.ts already ran above (it pins its own cutoff); these are the existing
+      # default-flag ingest suites re-run with the test-only cutoff (src/session-ingest/__tests__/pglite-schema.ts).
+      - name: Unit tests (ingest on the G4-only migration set)
+        env:
+          HOOPDB_MIGRATE_UNTIL: 20261105043800_lazy_ack_clock_no_key_update.sql
+        run: |
+          for suite in ledger turns ordered-controls custody-baseline lazy-custody frozen-custody first-ack-seats; do
+            bun test --timeout 30000 "src/session-ingest/__tests__/${suite}.pglite.test.ts"
+          done
       - name: Unit tests (IaC values, stacks/)
-        run: bun test ./stacks
-      - name: AWS hardening mutation check (each reverted control must turn a test red)
-        run: bun scripts/aws-hardening-mutations.ts
+        run: bun test --timeout 30000 ./stacks
       - name: Guard - no Helm hooks in any chart or manifest in this repo
         run: |
           # The annotation key is assembled so this file never matches its own guard; .github is excluded as well.
@@ -78,6 +123,69 @@ jobs:
       - name: Guard - nothing secret-like committed
         run: |
           ! git ls-files | grep -E '(^|/)(\.env|inputs\.json|.*\.pem)$' || (echo "secret-like file tracked"; exit 1)
+      - name: Guard - no production deployment identifiers in engine source (src, packages, scripts)
+        run: bun scripts/check-engine-identifiers.ts
+  # Keep every mutation, but give the long unit suite and mutation suite their
+  # own budgets. Running both serially exceeded the old 40-minute limit.
+  aws-hardening-mutations:
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    # Several mutations exercise the real ClickHouse read API tests.
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.8.34.13
+        env:
+          CLICKHOUSE_PASSWORD: ci-only
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --password ci-only -q 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      READ_API_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+      READ_API_TEST_CLICKHOUSE_PASSWORD: ci-only
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record the commit under test
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "commit under test: $actual (expected $EXPECTED)" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$actual" = "$EXPECTED"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install (root + workspaces)
+        run: bun install --frozen-lockfile
+      - name: Build packages/object-store
+        run: bun run --filter @relayhistory/object-store build
+      - name: AWS hardening mutation check (each reverted control must turn a test red)
+        run: bun scripts/aws-hardening-mutations.ts
+      - name: Verify mutations restored their source files
+        run: git diff --exit-code
+  # Build only: no registry login, publish, deploy, or provider credentials.
+  amp-transport-image:
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Build the pinned CLI into the service image
+        run: docker build --file docker/services.Dockerfile --tag amp-transport-ci .
+      - name: Verify process isolation in the Linux image without network access
+        run: docker run --rm --network none --entrypoint bun amp-transport-ci test src/amp
   # The session read Worker (packages/session-read-worker), in workerd.
   session-read-worker:
     uses: ./.github/workflows/session-read-worker-checks.yml

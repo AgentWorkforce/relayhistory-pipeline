@@ -1,6 +1,12 @@
 /** HoopDb access: a pg Pool that satisfies the vendored SqlExecutor, plus readiness gates. */
 import { readFileSync } from "node:fs";
-import { RUNTIME_APPLICATION_FUNCTIONS } from "../hoopdb/migrate-guards.ts";
+import {
+  CONSUMER_RUNTIME_FUNCTIONS,
+  CONSUMER_RUNTIME_FUNCTIONS_ROLE,
+  migrationChecksumMatches,
+  resolveRenamedLedger,
+  RUNTIME_APPLICATION_FUNCTIONS,
+} from "../hoopdb/migrate-guards.ts";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
@@ -88,8 +94,13 @@ export const ROLE_VALIDATION_NAME = "session_directory_search_worker";
 export interface ExpectedSchema {
   names: string[];
   generation: string;
+  /**
+   * Each schema step's file sha256 by name (expectedSchema()). Readiness uses it only
+   * for resolveRenamedLedger; absent, no renamed row is adopted.
+   */
+  shas?: Record<string, string>;
   /** Exact database mode bound into the role verifier; absent/invalid never enables compatibility exceptions. */
-  dbMode?: "local" | "selfhosted" | "cloudsql" | "supabase";
+  dbMode?: "local" | "selfhosted" | "cloudsql" | "supabase" | "rds";
 }
 
 export type SchemaVerdict =
@@ -110,10 +121,13 @@ const ROLE_VERIFY_SQL = readFileSync(ROLE_VERIFY_SQL_PATH, "utf8");
 // The auth token verifier's phase 2 (supabase/bootstrap/session_token_verifier_verify.sql):
 // the same contract for session_token_verifier — run by the migrator's verify step, the
 // external mark_pass wrapper, and this live gate. Read-only.
-const TOKEN_VERIFIER_VERIFY_SQL = readFileSync(
-  fileURLToPath(new URL("../../supabase/bootstrap/session_token_verifier_verify.sql", import.meta.url)),
-  "utf8",
-);
+export const INGEST_SEED_VERIFY_SQL_PATH=fileURLToPath(new URL("../../supabase/bootstrap/session_ingest_seeder_verify.sql",import.meta.url));
+export const TOKEN_VERIFIER_VERIFY_SQL_PATH=fileURLToPath(new URL("../../supabase/bootstrap/session_token_verifier_verify.sql",import.meta.url));
+export const INGEST_ROLE_VERIFY_SQL_PATH=fileURLToPath(new URL("../../supabase/bootstrap/session_ingest_verify.sql",import.meta.url));
+const INGEST_SEED_VERIFY_SQL=readFileSync(INGEST_SEED_VERIFY_SQL_PATH,"utf8");
+const TOKEN_VERIFIER_VERIFY_SQL=readFileSync(TOKEN_VERIFIER_VERIFY_SQL_PATH,"utf8");
+const INGEST_ROLE_VERIFY_SQL=readFileSync(INGEST_ROLE_VERIFY_SQL_PATH,"utf8");
+export interface SchemaVerifierSql {searchWorker:string;tokenVerifier:string;ingestSeeder:string;ingest:string}
 
 /**
  * Live sessions-function boundary, read-only, part of every readiness check: no sessions
@@ -122,11 +136,14 @@ const TOKEN_VERIFIER_VERIFY_SQL = readFileSync(
  * PUBLIC EXECUTE on every migrate, but a function created in sessions after a migrate,
  * outside the migrator, is PUBLIC-executable by PostgreSQL's built-in default until the
  * next migrate; this check turns readiness (and worker claiming) off at the next probe
- * instead (55000).
+ * instead (55000). The self-host consumer writers (CONSUMER_RUNTIME_FUNCTIONS) are accepted
+ * only when current_user is the consumer login (CONSUMER_RUNTIME_FUNCTIONS_ROLE); the PUBLIC and
+ * missing-ACL checks still apply to them for every role.
  */
-const RUNTIME_FUNCTION_REGPROCEDURES = RUNTIME_APPLICATION_FUNCTIONS.map(
-  (fn) => `'${fn.replaceAll("'", "''")}'::regprocedure`,
-).join(", ");
+const regprocedures = (fns: readonly string[]) =>
+  fns.map((fn) => `'${fn.replaceAll("'", "''")}'::regprocedure`).join(", ");
+const RUNTIME_FUNCTION_REGPROCEDURES = regprocedures(RUNTIME_APPLICATION_FUNCTIONS);
+const CONSUMER_FUNCTION_REGPROCEDURES = regprocedures(CONSUMER_RUNTIME_FUNCTIONS);
 
 export const SESSIONS_FUNCTION_GATE_SQL = `DO $sessions_fn_gate$
 DECLARE v text;
@@ -139,7 +156,9 @@ BEGIN
           OR (has_function_privilege(current_user, p.oid, 'EXECUTE')
               AND p.proowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
               AND NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
-              AND p.oid <> ALL (ARRAY[${RUNTIME_FUNCTION_REGPROCEDURES}]::oid[])));
+              AND p.oid <> ALL (ARRAY[${RUNTIME_FUNCTION_REGPROCEDURES}]::oid[])
+              AND NOT (current_user = '${CONSUMER_RUNTIME_FUNCTIONS_ROLE}'
+                       AND p.oid = ANY (ARRAY[${CONSUMER_FUNCTION_REGPROCEDURES}]::oid[]))));
   IF v IS NOT NULL THEN
     RAISE EXCEPTION USING ERRCODE = '55000',
       MESSAGE = 'live gate: sessions functions executable by PUBLIC or the runtime role: ' || v;
@@ -200,8 +219,21 @@ export async function schemaVerdict(
       await tx.query(`SET LOCAL statement_timeout = ${timeoutMs}`);
       await tx.query("SELECT set_config('hoopdb.db_mode', $1, true)", [expected.dbMode ?? "unspecified"]);
       stage = "ledger";
+      // The physical ledger goes through the migrator's own rename-alias verdict
+      // (resolveRenamedLedger, in memory, never a write): exact original-name rows count
+      // as their release names; any alias state the migrator refuses (collision, wrong
+      // sha, missing repair, original or any other unaccepted sha under the release
+      // name) leaves it missing, as does any row whose sha the migrator would refuse.
+      const physical = new Map(
+        (await tx.query<{ name: string; sha256: string }>("SELECT name, sha256 FROM sessions.__96bulls_migrations")).rows
+          .map((r) => [r.name, r.sha256]),
+      );
+      const shas = expected.shas ?? {};
+      const { effective } = resolveRenamedLedger(physical, (n) => (Object.hasOwn(shas, n) ? shas[n] : undefined));
+      // A recorded row counts only with a checksum the migrator would accept for the
+      // planned file (its migration_changed guard), alias-adopted or not.
       const have = new Set(
-        (await tx.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((r) => r.name),
+        [...effective].filter(([n, sha]) => !Object.hasOwn(shas, n) || migrationChecksumMatches(n, sha, shas[n]!)).map(([n]) => n),
       );
       // The role shim, bootstrap and verify steps are not schema; the marker covers verify.
       const missing = expected.names.filter((n) => !isPrerequisiteStep(n) && !have.has(n));
@@ -215,6 +247,8 @@ export async function schemaVerdict(
       stage = "verify";
       await tx.query(ROLE_VERIFY_SQL);
       await tx.query(TOKEN_VERIFIER_VERIFY_SQL);
+      await tx.query(INGEST_SEED_VERIFY_SQL);
+      await tx.query(INGEST_ROLE_VERIFY_SQL);
       await tx.query(SESSIONS_FUNCTION_GATE_SQL);
       if (opts.afterVerify) await opts.afterVerify(); // test seam: a concurrent flip lands here
       stage = "final";
