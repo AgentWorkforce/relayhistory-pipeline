@@ -103,6 +103,7 @@ import {
   type Directory,
   type DirectoryListArgs,
   type DirectoryListRow,
+  type DirectoryListMetadata,
 } from "./directory.ts";
 import { droppedTotal, type BufferedSearchGate } from "./buffered-search-gate.ts";
 import { parseSessionQuery, queryFingerprint, type SessionQueryTerms } from "./list-query.ts";
@@ -988,7 +989,7 @@ export function createReadApi(deps: ReadApiDeps) {
   async function bufferedListPage(
     c: Context, identity: VerifiedIdentity, ob: OwnerBufferedDeps,
     canonicalRows: Array<DirectoryListRow & { cursor_ts?: string }>,
-    q: { limit: number; sources: string[]; notSources: string[]; bounds: Record<"lastTsAfter" | "lastTsBefore" | "firstTsAfter" | "firstTsBefore", Date | undefined> },
+    q: { limit: number; sources: string[]; notSources: string[]; bounds: Record<"lastTsAfter" | "lastTsBefore" | "firstTsAfter" | "firstTsBefore", Date | undefined>; metadata: DirectoryListMetadata },
   ) {
     directoryPage(canonicalRows, identity, q.limit); // tenant and shape checks, as the canonical-only page
     const canonical = canonicalRows.map((r) => {
@@ -1042,7 +1043,7 @@ export function createReadApi(deps: ReadApiDeps) {
     if (fenced) c.header(BUFFERED_HEADER, "fenced");
     if (bufferedItems.length) c.header(BUFFERED_IDS_HEADER, bufferedIdsHeader(bufferedItems));
     return {
-      sessions: merged.items.map((i) => (i.kind === "canonical" ? sessionFromDirectoryRow(i.row) : bufferedSessionSummary(i.row, identity.userId))),
+      sessions: merged.items.map((i) => (i.kind === "canonical" ? sessionFromDirectoryRow(i.row, q.metadata) : bufferedSessionSummary(i.row, identity.userId))),
       nextCursor,
     };
   }
@@ -1082,6 +1083,10 @@ export function createReadApi(deps: ReadApiDeps) {
       attestWorkspace(c, identity);
       // A workspace off the canary allowlist always falls back, whatever it asked.
       const directory = directoryFor(identity);
+      const includeAgentName = single(c, "includeAgentName");
+      if (includeAgentName !== undefined && includeAgentName !== "recorded") throw bad("includeAgentName must be recorded");
+      if (includeAgentName !== undefined && !deps.selfhost) throw unsupported("param_includeAgentName");
+      const metadata: DirectoryListMetadata = includeAgentName === "recorded" ? { includeAgentName } : {};
       const queryOn = deps.sessionQuery === true;
       for (const p of LIST_UNSUPPORTED_PARAMS) if (!(queryOn && (p === "q" || p === "search")) && c.req.queries(p)?.length) throw unsupported(`param_${p}`);
       const terms = queryOn ? sessionQueryTerms(c, "list") : undefined;
@@ -1136,7 +1141,7 @@ export function createReadApi(deps: ReadApiDeps) {
         if (qCursor) args.cursor = { lastActivityAt: qCursor.lastActivityAt, sessionId: qCursor.sessionId, harness: qCursor.harness };
         const rows = await directory.query(identity.orgId, identity.workspaceId, { ...args, terms });
         if (rows === null) throw unsupported("directory_not_migrated");
-        const page = directoryPage(rows, identity, limit, fingerprint);
+        const page = directoryPage(rows, identity, limit, fingerprint, metadata);
         return c.json({ sessions: page.sessions, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
       }
       // With q on, a `b96q1:` cursor belongs to a q read only.
@@ -1150,10 +1155,10 @@ export function createReadApi(deps: ReadApiDeps) {
       const rows = await directory.list(identity.orgId, identity.workspaceId, args);
       if (rows === null) throw unsupported("directory_not_migrated");
       if (withBuffered) {
-        const union = await bufferedListPage(c, identity, ob, rows, { limit, sources, notSources, bounds });
+        const union = await bufferedListPage(c, identity, ob, rows, { limit, sources, notSources, bounds, metadata });
         return c.json({ sessions: union.sessions, nextCursor: union.nextCursor, correlationId: c.get("correlationId") });
       }
-      const page = directoryPage(rows, identity, limit);
+      const page = directoryPage(rows, identity, limit, undefined, metadata);
       return c.json({ sessions: page.sessions, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
     } catch (error) {
       return directoryFail(c, error);
