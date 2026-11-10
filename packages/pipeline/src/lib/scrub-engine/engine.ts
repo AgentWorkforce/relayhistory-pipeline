@@ -40,7 +40,7 @@ export interface ScrubRecordsResult {
 
 /** Exactly what the pipeline calls; nothing else crosses the seam. */
 export interface ScrubEngine {
-  readonly kind: "ts" | "wasm";
+  readonly kind: "ts" | "wasm" | "wasm-bindgen";
   /** Ruleset version this engine instance stamps (reported by the engine itself). */
   readonly rulesetVersion: number;
   /** Scrub profile this engine instance stamps (reported by the engine itself). */
@@ -69,6 +69,7 @@ export interface ScrubEngine {
  * - engine_failed: the instance trapped during a call; it is never used again
  * - engine_refused: the instance returned an unexpected status for one call
  * - seal_path_not_routed: `sealRawChunk` can only run the TypeScript engine (it lives in pinned raw-chunks.ts)
+ * - bindgen_*: SCRUB_ENGINE=wasm-bindgen (bindgen-engine.ts); see `BindgenFailure`
  */
 export type ScrubEngineFailure =
   | "unpinned"
@@ -83,7 +84,66 @@ export type ScrubEngineFailure =
   | "not_initialised"
   | "engine_failed"
   | "engine_refused"
-  | "seal_path_not_routed";
+  | "seal_path_not_routed"
+  | BindgenFailure;
+
+/** The three verified byte artifacts of the wasm-bindgen package. */
+export type BindgenArtifactName = "wasm" | "glue" | "loader";
+/** Every field of the relayscrubber schema-2 manifest. */
+export type BindgenManifestField =
+  | "schema"
+  | "ruleset"
+  | "rulesetVersion"
+  | "rulesetSourceSha256"
+  | "crateVersion"
+  | "abiVersion"
+  | "policy"
+  | "redactionToken";
+
+/**
+ * Why SCRUB_ENGINE=wasm-bindgen is refused (docs/scrub-engine.md, "wasm-bindgen path").
+ *
+ * - bindgen_pin_invalid: the pin file is not an object, or names another pin schema / package
+ * - bindgen_pin_paths_invalid: an artifact path in the pin is absent, absolute or escapes the package directory
+ * - bindgen_unpinned_<field>: that pin field is a placeholder, empty, or malformed (digests: not 64 lowercase hex)
+ * - bindgen_pin_profile_inconsistent: the pinned profile is not the one the pinned manifest derives
+ * - bindgen_ruleset_below_floor: the pinned ruleset version is below the TypeScript one readers accept
+ * - bindgen_dir_invalid: SCRUB_BINDGEN_DIR is set but not an absolute path
+ * - bindgen_artifact_missing_<artifact>: reading it failed or returned no bytes
+ * - bindgen_sha256_mismatch_<artifact>: its snapshot does not hash to the pin
+ * - bindgen_glue_import_failed: evaluating the verified glue bytes failed
+ * - bindgen_export_missing: the glue lacks a required function
+ * - bindgen_init_failed: initialising the glue with the verified wasm failed
+ * - bindgen_manifest_invalid: manifestJson() threw or is not a JSON object
+ * - bindgen_manifest_mismatch_<field>: the instance's manifest differs from the pin in that field
+ * - bindgen_manifest_mismatch_extra_field: the instance's manifest has a field the pin does not
+ * - bindgen_profile_mismatch: the profile derived from the instance's manifest is not the pinned one
+ * - bindgen_init_conflict: a second initialisation with other pins or other bytes
+ * - bindgen_path_conflict: the Node loader path and the Workers compiled-module path in one process
+ * - bindgen_module_invalid: the compiled path was given something other than a WebAssembly.Module
+ */
+export type BindgenFailure =
+  | "bindgen_pin_invalid"
+  | "bindgen_pin_paths_invalid"
+  | "bindgen_unpinned_package_version"
+  | "bindgen_unpinned_scrub_profile"
+  | `bindgen_unpinned_${BindgenArtifactName}_sha256`
+  | `bindgen_unpinned_manifest_${BindgenManifestField}`
+  | "bindgen_pin_profile_inconsistent"
+  | "bindgen_ruleset_below_floor"
+  | "bindgen_dir_invalid"
+  | `bindgen_artifact_missing_${BindgenArtifactName}`
+  | `bindgen_sha256_mismatch_${BindgenArtifactName}`
+  | "bindgen_glue_import_failed"
+  | "bindgen_export_missing"
+  | "bindgen_init_failed"
+  | "bindgen_manifest_invalid"
+  | `bindgen_manifest_mismatch_${BindgenManifestField}`
+  | "bindgen_manifest_mismatch_extra_field"
+  | "bindgen_profile_mismatch"
+  | "bindgen_init_conflict"
+  | "bindgen_path_conflict"
+  | "bindgen_module_invalid";
 
 /** Scrubbing is refused: nothing is returned, nothing passes through unscrubbed. Retryable: no input is lost. */
 export class ScrubEngineUnavailable extends PipelineError {
@@ -93,7 +153,7 @@ export class ScrubEngineUnavailable extends PipelineError {
   }
 }
 
-/** SCRUB_ENGINE holds a value other than unset, "", "ts" or "wasm", or a second selection disagrees. Startup fails. */
+/** SCRUB_ENGINE holds a value other than unset, "", "ts", "wasm" or "wasm-bindgen", or a second selection disagrees. Startup fails. */
 export class ScrubEngineConfigError extends PipelineError {
   constructor(message: string) {
     super("scrub_engine_invalid", message, false);
