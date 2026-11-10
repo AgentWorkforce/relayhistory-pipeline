@@ -34,7 +34,7 @@ configuration/permissions or deploying requires explicit approval for that rollo
 No production settings are enabled by this change.
 
 1. Apply the repository's normal reviewed migration sequence, including
-   `20261104030000_coordination_report_jobs.sql`, and its runtime ACL/readiness
+   `20261105047000_coordination_report_jobs.sql`, and its runtime ACL/readiness
    validation. Do not run the new SQL alone as a substitute for the migrator.
 2. Configure `transcriptStore.sessionPipeline.coordinationReports` in the approved
    stack inputs. `enabled`, `organizationId` and `workspaceId` are required;
@@ -54,7 +54,7 @@ Runtime switches map to `COORDINATION_REPORT_ENABLED`, `COORDINATION_REPORT_ORG_
 Absent or disabled configuration performs no report work.
 
 Rollback: disable report execution, then use
-`supabase/rollbacks/20261104030000_coordination_report_jobs.down.sql` before
+`supabase/rollbacks/20261105047000_coordination_report_jobs.down.sql` before
 rolling back event-directory metadata or older session migrations. The down
 migration deletes stored report artifacts and jobs. Applying it to a real
 database is destructive and requires separate explicit rollback approval; it is
