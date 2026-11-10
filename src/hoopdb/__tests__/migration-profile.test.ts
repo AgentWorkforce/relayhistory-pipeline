@@ -2435,7 +2435,16 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // Lane F1 (046000) is the newest: 040000 and 039000 refuse while it is applied; it rolls back first, with assertions.
+    // 20261105046010 (session directory read API query) is the newest step: 046000's and 045040's downs refuse (55000)
+    // while it is applied, so it rolls back first with assertions (its down drops its five functions and its ledger row).
+    const LQ = "upstream:20261105046010_session_directory_read_api_query.sql";
+    expect(await names()).toContain(LQ);
+    expect((await failure(rollback("20261105046000_analysis_jobs.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105045040_selfhost_output_facts.down.sql")))?.code).toBe("55000");
+    await rollback("20261105046010_session_directory_read_api_query.down.sql");
+    expect(await names()).not.toContain(LQ);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND (proname LIKE 'query\\_session\\_directory\\_%' OR proname LIKE 'session\\_directory\\_query\\_%')")).rows[0]!.n).toBe(0);
+    // Lane F1 (046000) is then the newest: 040000 and 039000 refuse while it is applied; it rolls back next, with assertions.
     // (045040, 045030 and 045010 roll back next newest-first with assertions, then 045000, then 044090/044100 via the successor helper below.)
     expect((await failure(rollback("20261105040000_ingest_lazy_source_tables.down.sql")))?.code).toBe("55000");
     await rollback("20261105046000_analysis_jobs.down.sql");
@@ -2452,8 +2461,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       expect(await relation(`sessions.${t}`)).toBeNull();
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'output\\_facts\\_%'")).rows[0]!.n).toBe(0);
     // Other lanes newer than 20261105045000 (045010 same-second feed, 045030 consumer project-text grant) roll back next, newest first: 045000's down
-    // refuses (55000) while any of them is applied. (046000 already rolled back above, so it is excluded here.)
-    const newerThanDigest = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > DG && s.name !== OF && s.name !== "upstream:20261105046000_analysis_jobs.sql").reverse();
+    // refuses (55000) while any of them is applied. (046010 and 046000 already rolled back above, so they are excluded here.)
+    const newerThanDigest = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > DG && s.name !== OF && s.name !== LQ && s.name !== "upstream:20261105046000_analysis_jobs.sql").reverse();
     if (newerThanDigest.length)
       expect((await failure(rollback("20261105045000_digest_narrative_cache.down.sql")))?.code).toBe("55000");
     for (const { name } of newerThanDigest)
@@ -3033,7 +3042,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
   test("grant rollback revokes with the role present, is a no-op with the role absent, and refuses without the ledger", async () => {
     const down = readFileSync(join(root, "supabase/rollbacks/20261105043900_session_consumer_function_grants.down.sql"), "utf8");
     // Newer than 043900, so the grants' down refuses until they are rolled back,
-    // newest first: every upstream step after 044020 (rollbackLaterThan044020: 046000, 045040, 045030, 045010, 045000, 044100, 044090, 044080, 044070, 044050, 044040, 044030),
+    // newest first: every upstream step after 044020 (rollbackLaterThan044020: 046010, 046000, 045040, 045030, 045010, 045000, 044100, 044090, 044080, 044070, 044050, 044040, 044030),
     // then 044020 (claim-bootstrap indexes), 044010 (erase lock), 044000 (tokens), 043910 (erase).
     const orgIndexesDown = readFileSync(join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql"), "utf8");
     const lockDown = readFileSync(join(root, "supabase/rollbacks/20261105044010_selfhost_erase_lock_fences.down.sql"), "utf8");
@@ -4446,7 +4455,7 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
     expect(ledgered.function_acl_missing_refused).toEqual([`${PT}: search_consumer_runtime:EXECUTE`]);
     expect((await failure(runMigrations(client(db), { profile })))?.code).toBe("function_acl_drift");
     // The previous-release shape: 045030 not yet ledgered, so no later upstream step is either
-    // (the sequence guard refuses a gap): roll every later step (045040 output facts, ...) back
+    // (the sequence guard refuses a gap): roll every later step (046010 list query, 045040 output facts, ...) back
     // first, newest first, through its own down. 045030's GRANT then re-adds the grant, so the
     // preview reports it pending-added (the release plan stays green).
     const later = (await db.query<{ name: string }>(
@@ -4754,7 +4763,7 @@ test("044100 real prefix upgrade/fresh/noop/rollback/up preserves pointers and e
     VALUES('org-title','ws-title','codex','session-title','machine-title','user-title',now(),now(),'fs','bucket','manifest/title',
     decode(repeat('ab',32),'hex'),'jsonl','019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18',1,'Pointer retained')`);
   const preserved=async()=>expect((await db.query<{title:string}>("SELECT title FROM sessions.session_index WHERE session_id='session-title'")).rows).toEqual([{title:"Pointer retained"}]);
-  // Newer lanes (045000 digest, 045010 same-second, 045030 consumer grant, 045040 output facts, 046000 analysis jobs) also apply on a full upgrade;
+  // Newer lanes (045000 digest, 045010 same-second, 045030 consumer grant, 045040 output facts, 046000 analysis jobs, 046010 list query) also apply on a full upgrade;
   // expect exactly the pending steps, which is 1 where 044100 is newest.
   expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(full.length - previous.steps.length);
   expect((await db.query<{applied:boolean}>(MIGRATION_SENTINELS[name]!.sql)).rows[0]!.applied).toBe(true);await preserved();
@@ -4767,7 +4776,7 @@ test("044100 real prefix upgrade/fresh/noop/rollback/up preserves pointers and e
   const ledgerBefore=await ledgerHash();
   expect((await runMigrations(client(db),{profile:SUPA_ET,steps:full})).applied).toBe(0);
   expect(await ledgerHash()).toBe(ledgerBefore);await preserved();
-  // Lanes newer than 044100 (046000 analysis jobs, 045040 output facts, 045030 consumer grant, 045010 same-second, 045000 digest here) roll back newest first:
+  // Lanes newer than 044100 (046010 list query, 046000 analysis jobs, 045040 output facts, 045030 consumer grant, 045010 same-second, 045000 digest here) roll back newest first:
   // the 044100 down script refuses while a later migration is applied.
   for (const later of [...previous.later].reverse())
     await db.exec(readFileSync(join(root,"supabase/rollbacks",`${later.slice("upstream:".length).replace(/\.sql$/,"")}.down.sql`),"utf8"));

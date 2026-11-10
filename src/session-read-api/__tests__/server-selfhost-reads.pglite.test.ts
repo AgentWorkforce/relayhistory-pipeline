@@ -709,6 +709,50 @@ describe("startup and wiring rules", () => {
     expect(((await healed.json()) as { coverage: { eventCount: number } }).coverage.eventCount).toBe(3);
   });
 
+  test("READ_API_SESSION_QUERY on the service: q over the real directory SQL; unset keeps 501 param_q", async () => {
+    const token = "sh_at_synthetic-query";
+    answers.set(token, (_b, res) => json(res, 200, active({ token_id: "tokid_query" })));
+    // Two synthetic directory rows of org_1/ws_1 (no other test lists the directory).
+    for (const [id, title, last] of [["sess_q1", "Quokka ledger migration", "2026-10-05T12:00:00Z"], ["sess_q2", "Unrelated cleanup", "2026-10-04T12:00:00Z"]] as const) {
+      await supa.query(
+        `INSERT INTO sessions.session_directory (org_id, workspace_id, harness, session_id, created_at, last_activity_at, title, agent_names, state, search_text)
+         VALUES ('org_1', 'ws_1', 'codex', $1, $2::timestamptz, $2::timestamptz, $3::text, ARRAY['Ada'], 'active',
+                 sessions.session_directory_search_text($3::text, NULL, 'Ada', NULL, NULL, NULL, NULL, NULL))`,
+        [id, last, title],
+      );
+    }
+    const list = (q: string) => `/v1/sessions?workspace=ws_1&q=${encodeURIComponent(q)}`;
+    const activity = (q: string) => `/v1/sessions/activity?workspace=ws_1&since=2026-10-01T00:00:00Z&until=2026-10-07T00:00:00Z&q=${encodeURIComponent(q)}`;
+    for (const flag of [undefined, ""]) {
+      const off = await start(baseEnv(flag === undefined ? {} : { READ_API_SESSION_QUERY: flag }));
+      for (const path of [list("quokka"), activity("quokka")]) {
+        const r = await off(path, token);
+        expect([path, r.status]).toEqual([path, 501]);
+        expect(await code(r)).toMatchObject({ code: "unsupported_by_backend", reason: "param_q" });
+      }
+      for (const s of running.splice(0)) await s.close();
+    }
+    await expect(startReadApiService(baseEnv({ READ_API_SESSION_QUERY: "1" }), { host: "127.0.0.1", port: 0 })).rejects.toThrow("READ_API_SESSION_QUERY");
+
+    const get = await start(baseEnv({ READ_API_SESSION_QUERY: "true" }));
+    const hit = await get(list("quokka harness:codex @ada"), token);
+    expect([hit.status, hit.status === 200 ? null : await hit.text()]).toEqual([200, null]);
+    const page = (await hit.json()) as { sessions: Array<{ sessionId: string; title: string }>; nextCursor: string | null };
+    expect(page.sessions.map((s) => [s.sessionId, s.title])).toEqual([["sess_q1", "Quokka ledger migration"]]);
+    expect(page.nextCursor).toBeNull();
+    const miss = await get(list("platypus"), token);
+    expect(miss.status).toBe(200);
+    expect(((await miss.json()) as { sessions: unknown[] }).sessions).toEqual([]);
+    const negated = await get(list("-quokka is:active"), token);
+    expect(((await negated.json()) as { sessions: Array<{ sessionId: string }> }).sessions.map((s) => s.sessionId)).toEqual(["sess_q2"]);
+    const days = await get(activity("quokka"), token);
+    expect(days.status).toBe(200);
+    const d = (await days.json()) as { days: Array<{ date: string; total: number }> };
+    expect(d.days.filter((x) => x.total > 0)).toEqual([expect.objectContaining({ date: "2026-10-05", total: 1 })]);
+    expect((await code(await get(list("path:/repo"), token)))?.reason).toBe("q_filter_path");
+    expect((await get(list("ab"), token)).status).toBe(400);
+  });
+
   test("readApiVerifier relaycontrol_only never calls the RelayAuth verifier", async () => {
     const calls: string[] = [];
     const verify = (async (t: string) => {

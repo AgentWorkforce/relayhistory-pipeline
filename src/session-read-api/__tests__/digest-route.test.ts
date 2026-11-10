@@ -21,7 +21,7 @@ const unreachable: ClickHouseClient = {
   async insert() { throw new Error("no insert"); },
   async select() { throw new Error("not reached"); },
 };
-const directory: Directory = { list: async () => [], activity: async () => [] };
+const directory: Directory = { list: async () => [], activity: async () => [], query: async () => [], queryActivity: async () => [] };
 
 function api(ch: ClickHouseClient, over: { digest?: DigestNarrativeDeps | false; workspaces?: ReadonlySet<string> | "*" } = {}) {
   const app = createReadApi({

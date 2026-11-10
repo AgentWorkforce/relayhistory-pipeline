@@ -139,9 +139,11 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105045030_session_consumer_project_text_grant.sql",
       // Self-host output facts tables and their writer/read functions only; no ingest path touches them.
       "20261105045040_selfhost_output_facts.sql",
-      // Lane F1 (this branch): analysis jobs/requests/tickets/invocations/reservations tables,
+      // Lane F1: analysis jobs/requests/tickets/invocations/reservations tables,
       // the purge functions and their grant helper, the admit scope function and the request entry point.
       "20261105046000_analysis_jobs.sql",
+      // Two read-role-only SECURITY DEFINER list/activity query functions and three owner-only helpers; no ingest path touches them.
+      "20261105046010_session_directory_read_api_query.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

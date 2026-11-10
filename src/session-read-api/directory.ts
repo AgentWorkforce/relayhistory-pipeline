@@ -1,6 +1,12 @@
 /**
  * The session LIST and activity from the Supabase logical-session directory, for
- * `GET /v1/sessions` (no `q`) and `GET /v1/sessions/activity` (no `q`).
+ * `GET /v1/sessions` and `GET /v1/sessions/activity`. Without `q`: list_session_directory_for /
+ * session_directory_activity_for. With `q` (READ_API_SESSION_QUERY=true only; list-query.ts
+ * parses it): query_session_directory_for / query_session_directory_activity_for
+ * (supabase/migrations/20261105046010_session_directory_read_api_query.sql), whose free words
+ * match the directory's search_text (title, task title, agent name, project id, git repo and
+ * branch, model, scrubbed short summary; never transcript content). A q page's cursor is
+ * `b96q1:` and carries the query's fingerprint.
  *
  * Calls sessions.list_session_directory_for / session_directory_activity_for
  * (supabase/migrations/20261105034000_session_directory_read_api.sql) as the
@@ -19,6 +25,7 @@
  * its first to its last activity), as relayhistory's LIST_BACKEND=supabase does.
  */
 import type { TenantRunner } from "./liveness.ts";
+import type { SessionQueryTerms } from "./list-query.ts";
 
 /** One list_session_directory_for row (its RETURNS TABLE). pg returns timestamptz as Date. */
 export interface DirectoryListRow {
@@ -89,7 +96,15 @@ export interface DirectoryCursor {
 export interface Directory {
   list(orgId: string, workspaceId: string, args: DirectoryListArgs): Promise<DirectoryListRow[] | null>;
   activity(orgId: string, workspaceId: string, since: Date, until: Date): Promise<DirectoryActivityRow[] | null>;
+  /** The list filtered by a parsed `q` (sessionKeys is not accepted here). */
+  query(orgId: string, workspaceId: string, args: DirectoryQueryArgs): Promise<DirectoryListRow[] | null>;
+  /** The SPAN activity of the sessions a parsed `q` and the list filters select. */
+  queryActivity(orgId: string, workspaceId: string, since: Date, until: Date, args: DirectoryQueryActivityArgs): Promise<DirectoryActivityRow[] | null>;
 }
+
+/** A q list read: the list filters plus the parsed terms (their dates already intersected into lastTs*). */
+export type DirectoryQueryArgs = Omit<DirectoryListArgs, "sessionKeys"> & { terms: SessionQueryTerms };
+export type DirectoryQueryActivityArgs = Omit<DirectoryQueryArgs, "cursor" | "limit">;
 
 /** Postgres refused for a reason the caller can name (0A000, 22023), never quoting values. */
 export class DirectoryError extends Error {
@@ -124,6 +139,33 @@ export const DIRECTORY_LIST_SQL = `SELECT org_id, workspace_id, harness, session
 export const DIRECTORY_ACTIVITY_SQL = `SELECT to_char(day, 'YYYY-MM-DD') AS day, harness, sessions
   FROM sessions.session_directory_activity_for($1, $2, $3)`;
 
+export const QUERY_FOR_SIGNATURE =
+  "sessions.query_session_directory_for(text, text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], boolean, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz, timestamptz, text, text, integer)";
+export const QUERY_ACTIVITY_FOR_SIGNATURE =
+  "sessions.query_session_directory_activity_for(text, timestamptz, timestamptz, text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], text[], boolean, text[], text[], text, text[], text, timestamptz, timestamptz, timestamptz, timestamptz)";
+
+const QUERY_TERM_ARGS = `p_free => $2, p_not_free => $3, p_title => $4, p_not_title => $5,
+    p_project => $6, p_not_project => $7, p_harness => $8, p_not_harness => $9,
+    p_agent_terms => $10, p_not_agent_terms => $11, p_id => $12, p_not_id => $13, p_active => $14,
+    p_sources => $15, p_not_sources => $16, p_project_contains => $17, p_user_ids => $18, p_agent => $19,
+    p_last_ts_after => $20, p_last_ts_before => $21, p_first_ts_after => $22, p_first_ts_before => $23`;
+
+export const DIRECTORY_QUERY_SQL = `SELECT org_id, workspace_id, harness, session_id,
+       created_at, last_activity_at,
+       to_char(last_activity_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_ts,
+       title, task_title, agent_names, project_id, project_key, project_key_method, git_repo, git_branch,
+       initial_commit, originator, agent_version, models, state, event_count, input_tokens, output_tokens,
+       cost_usd_micros, machine_ids, user_ids, parent_session_ids, child_session_count, short_summary,
+       short_summary_generated_at, catalog_projected_at, projected_at
+  FROM sessions.query_session_directory_for(
+    p_workspace_id => $1, ${QUERY_TERM_ARGS},
+    p_cursor_last_activity_at => $24, p_cursor_session_id => $25, p_cursor_harness => $26, p_limit => $27)`;
+
+export const DIRECTORY_QUERY_ACTIVITY_SQL = `SELECT to_char(day, 'YYYY-MM-DD') AS day, harness, sessions
+  FROM sessions.query_session_directory_activity_for(
+    p_workspace_id => $1, ${QUERY_TERM_ARGS},
+    p_since => $24, p_until => $25)`;
+
 export const DIRECTORY_INSTALLED_SQL = `SELECT to_regprocedure($1) IS NOT NULL AS installed`;
 
 function mapPgError(error: unknown): never {
@@ -135,9 +177,51 @@ function mapPgError(error: unknown): never {
   throw error;
 }
 
+const isoOrNull = (d: Date | undefined) => (d ? d.toISOString() : null);
+const listOrNull = (v: string[] | undefined) => (v?.length ? v : null);
+
+/** $2..$23 of DIRECTORY_QUERY_SQL / DIRECTORY_QUERY_ACTIVITY_SQL. */
+function queryParams(a: DirectoryQueryActivityArgs): unknown[] {
+  const t = a.terms;
+  return [
+    listOrNull(t.free), listOrNull(t.notFree), listOrNull(t.title), listOrNull(t.notTitle),
+    listOrNull(t.project), listOrNull(t.notProject), listOrNull(t.harness), listOrNull(t.notHarness),
+    listOrNull(t.agent), listOrNull(t.notAgent), listOrNull(t.id), listOrNull(t.notId), t.active ?? null,
+    listOrNull(a.sources), listOrNull(a.notSources), a.projectContains ?? null, listOrNull(a.userIds), a.agent ?? null,
+    isoOrNull(a.lastTsAfter), isoOrNull(a.lastTsBefore), isoOrNull(a.firstTsAfter), isoOrNull(a.firstTsBefore),
+  ];
+}
+
 /** The directory over the read API's tenant runner: one READ ONLY transaction per call. */
 export function sqlDirectory(run: TenantRunner): Directory {
   return {
+    async query(orgId, workspaceId, a) {
+      return run(orgId, workspaceId, async (q) => {
+        const installed = await q.query<{ installed: boolean }>(DIRECTORY_INSTALLED_SQL, [QUERY_FOR_SIGNATURE]);
+        if (!installed.rows[0]?.installed) return null;
+        const r = await q
+          .query<DirectoryListRow>(DIRECTORY_QUERY_SQL, [
+            workspaceId,
+            ...queryParams(a),
+            a.cursor?.lastActivityAt ?? null,
+            a.cursor?.sessionId ?? null,
+            a.cursor?.harness ?? null,
+            a.limit,
+          ])
+          .catch(mapPgError);
+        return r.rows;
+      });
+    },
+    async queryActivity(orgId, workspaceId, since, until, a) {
+      return run(orgId, workspaceId, async (q) => {
+        const installed = await q.query<{ installed: boolean }>(DIRECTORY_INSTALLED_SQL, [QUERY_ACTIVITY_FOR_SIGNATURE]);
+        if (!installed.rows[0]?.installed) return null;
+        const r = await q
+          .query<DirectoryActivityRow>(DIRECTORY_QUERY_ACTIVITY_SQL, [workspaceId, ...queryParams(a), since.toISOString(), until.toISOString()])
+          .catch(mapPgError);
+        return r.rows;
+      });
+    },
     async list(orgId, workspaceId, a) {
       return run(orgId, workspaceId, async (q) => {
         const installed = await q.query<{ installed: boolean }>(DIRECTORY_INSTALLED_SQL, [LIST_FOR_SIGNATURE]);
@@ -273,6 +357,36 @@ export function decodeListCursor(raw: string | undefined): DirectoryCursor | und
   return "invalid";
 }
 
+/**
+ * q list cursors (READ_API_SESSION_QUERY): `b96q1:` + `[lastActivityAt, sessionId, harness,
+ * fingerprint]`, the fingerprint being list-query.ts queryFingerprint of the query that made the
+ * page. The route honours one only for the same query.
+ */
+export const QUERY_CURSOR_PREFIX = "b96q1:";
+const FINGERPRINT = /^[0-9a-f]{32}$/u;
+export interface DirectoryQueryCursor extends DirectoryCursor {
+  fingerprint: string;
+}
+
+export function encodeQueryCursor(c: DirectoryQueryCursor): string {
+  return QUERY_CURSOR_PREFIX + btoa(JSON.stringify([c.lastActivityAt, c.sessionId, c.harness, c.fingerprint])).replace(/\+/gu, "-").replace(/\//gu, "_").replace(/=+$/u, "");
+}
+
+/** undefined: no cursor; "foreign": not a `b96q1:` cursor; "invalid": ours but malformed. */
+export function decodeQueryCursor(raw: string | undefined): DirectoryQueryCursor | undefined | "foreign" | "invalid" {
+  if (raw === undefined || raw === "") return undefined;
+  if (!raw.startsWith(QUERY_CURSOR_PREFIX)) return "foreign";
+  try {
+    const b64 = raw.slice(QUERY_CURSOR_PREFIX.length).replace(/-/gu, "+").replace(/_/gu, "/");
+    const v = JSON.parse(atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4)));
+    if (Array.isArray(v) && v.length === 4 && validCanonical(v) && typeof v[3] === "string" && FINGERPRINT.test(v[3]))
+      return { lastActivityAt: v[0], sessionId: v[1], harness: v[2], fingerprint: v[3] };
+  } catch {
+    // fall through
+  }
+  return "invalid";
+}
+
 /** relayhistory lib/recall.ts MAX_SESSION_SUMMARY_CHARS and condenseTurn. */
 export const MAX_SESSION_SUMMARY_CHARS = 240;
 export function condenseTurn(content: string): string | null {
@@ -366,8 +480,8 @@ export function sessionFromDirectoryRow(row: DirectoryListRow) {
 
 export type DirectorySession = ReturnType<typeof sessionFromDirectoryRow>;
 
-/** One page: rows rechecked against the tenant, limit + 1 trimmed into a cursor. */
-export function directoryPage(rows: Array<DirectoryListRow & { cursor_ts?: string }>, tenant: { orgId: string; workspaceId: string }, limit: number) {
+/** One page: rows rechecked against the tenant, limit + 1 trimmed into a cursor (a `b96q1:` one for a q page). */
+export function directoryPage(rows: Array<DirectoryListRow & { cursor_ts?: string }>, tenant: { orgId: string; workspaceId: string }, limit: number, queryFingerprint?: string) {
   if (rows.length > limit + 1) throw new DirectoryError("parse");
   for (const row of rows) if (row.org_id !== tenant.orgId || row.workspace_id !== tenant.workspaceId) throw new DirectoryError("tenant_mismatch");
   const hasMore = rows.length > limit;
@@ -377,7 +491,8 @@ export function directoryPage(rows: Array<DirectoryListRow & { cursor_ts?: strin
   if (hasMore && last) {
     const ts = last.cursor_ts;
     if (typeof ts !== "string" || !CURSOR_TS.test(ts)) throw new DirectoryError("parse");
-    nextCursor = encodeListCursor({ lastActivityAt: ts, sessionId: last.session_id, harness: last.harness });
+    const position = { lastActivityAt: ts, sessionId: last.session_id, harness: last.harness };
+    nextCursor = queryFingerprint === undefined ? encodeListCursor(position) : encodeQueryCursor({ ...position, fingerprint: queryFingerprint });
   }
   return { sessions: visible.map(sessionFromDirectoryRow), nextCursor };
 }

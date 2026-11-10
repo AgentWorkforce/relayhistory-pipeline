@@ -418,6 +418,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105033000_canonical_project_events.sql` | table sessions.canonical_project_events |
 | `upstream:20261105045000_digest_narrative_cache.sql` | table sessions.daily_digest_narratives |
 | `upstream:20261105045040_selfhost_output_facts.sql` | table sessions.session_output_facts |
+| `upstream:20261105046010_session_directory_read_api_query.sql` | function sessions.query_session_directory_for |
 | `upstream:20261105035000_semantic_copy_state.sql` | table sessions.search_feature_copy_state |
 | `upstream:20261105036000_canonical_consumer_lease.sql`        | table sessions.canonical_feature_consumer_lease |
 | `upstream:20261105037000_session_directory_document_pool.sql` | function sessions.canonical_feature_document_finish |

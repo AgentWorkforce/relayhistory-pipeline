@@ -82,7 +82,7 @@ const noneErased: Liveness = { erased: async () => new Set() } as unknown as Liv
 const erasing = (...keys: Array<{ source: string; sessionId: string }>): Liveness =>
   ({ erased: async () => new Set(keys.map(keyOf)) }) as unknown as Liveness;
 const deps = (db: PGlite, over: Partial<PostgresFactsDeps> = {}): PostgresFactsDeps => ({ run: runner(db), liveness: noneErased, ...over });
-const directory: Directory = { list: async () => [], activity: async () => [] };
+const directory: Directory = { list: async () => [], activity: async () => [], query: async () => [], queryActivity: async () => [] };
 
 const consumer = <T>(db: PGlite, work: (store: ReturnType<typeof postgresOutputFactsStore>) => Promise<T>) =>
   as(db, "search_consumer_runtime", "BEGIN", null, () => work(postgresOutputFactsStore(db as unknown as SqlExecutor)));
