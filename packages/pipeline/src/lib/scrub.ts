@@ -656,7 +656,9 @@ const SECRET_PATTERNS: Rule[] = [
     // literal is the same quadratic shape fixed in the URL and email patterns. Eight
     // underscore-separated segments is far past any real identifier
     // (`AWS_SECRET_ACCESS_KEY` is three).
-    /\b(?:[A-Za-z0-9]+_){0,8}(?:api[_-]?key|apikey|key|secret|token|password|passwd|passphrase|pwd|credentials?)\s*[:=]\s*["'`]?[^"'`\s,;]+/gi,
+    // Skip only the public identifier as a match, then keep scanning its value.
+    // Consuming an exempt assignment would hide a nested password=... from this rule.
+    /\b(?!idempotency_key\s*[:=])(?:[A-Za-z0-9]+_){0,8}(?:api[_-]?key|apikey|key|secret|token|password|passwd|passphrase|pwd|credentials?)\s*[:=]\s*["'`]?[^"'`\s,;]+/gi,
     (match) => {
       // Pick the separator POSITIONALLY (first `:` or `=`) — that is the real name/value
       // delimiter, since the identifier name contains neither. Choosing by `includes("=")`
@@ -664,10 +666,6 @@ const SECRET_PATTERNS: Rule[] = [
       // AWS secret keys / k8s/YAML dumps): indexOf would land inside the value and leak the
       // body before it.
       const idx = match.search(/[:=]/);
-      // An idempotency key selects a public replay receipt, not authentication.
-      // Keep only this exact identifier. Credential-shaped values still pass
-      // through every independent provider/token/quoted-secret detector.
-      if (match.slice(0, idx).trim().toLowerCase() === "idempotency_key") return match;
       const separator = match[idx];
       return `${match.slice(0, idx)}${separator}${REDACTED}`;
     },

@@ -90,6 +90,9 @@ const SCRUB_RULESETS: Record<number, string> = {
   // Version 7: only the exact public idempotency_key assignment is exempt.
   // Version 6 is immutable in fixtures/scrub-ruleset-6.ts.
   7: "887dd7184c757f5840b6a363fec8e9ea93819a5b917659985b56bc32a33f2fd8",
+  // Version 8 leaves public replay identifiers unmatched, so scanning continues
+  // into their values and removes nested labelled credentials. Version 7 is frozen.
+  8: "50c2e0c67395f488a308cbcfc7c945606374b3d67d37138e284849c6190c8214",
 };
 
 const read = (rel: string) =>
