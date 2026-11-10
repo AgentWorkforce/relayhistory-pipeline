@@ -17,8 +17,8 @@
   },
   "scripts": {
     "build": "bun run --filter @relayhistory/object-store build",
-    "typecheck": "tsc --noEmit && bun run --filter @96bulls/pipeline typecheck && bun run --filter @relayhistory/object-store typecheck && bun run --filter @96bulls/session-read-worker typecheck",
-    "test": "bun test && bun test ./stacks && bun run --filter @96bulls/pipeline test && bun run --filter @relayhistory/object-store test",
+    "typecheck": "tsc --noEmit && bun run --filter @96bulls/pipeline typecheck && bun run --filter @relayhistory/object-store typecheck && bun run --filter @96bulls/session-read-worker typecheck && bun run --filter @96bulls/coordination-detect typecheck",
+    "test": "bun test && bun test ./stacks && bun run --filter @96bulls/pipeline test && bun run --filter @relayhistory/object-store test && bun run --filter @96bulls/coordination-detect test",
     "up:local": "bun run bin/96bulls up local",
     "down:local": "bun run bin/96bulls down local",
     "smoke:local": "bun run bin/96bulls smoke local",

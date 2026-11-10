@@ -43,6 +43,8 @@ const CLAIM_BOOTSTRAP_ORG_INDEXES_STEP =
   "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
 const BUFFERED_STAGES_SESSION_FIRST_STEP =
   "upstream:20261105044040_buffered_stages_session_first.sql";
+const COORDINATION_FACT_READERS_STEP =
+  "upstream:20261105047000_coordination_fact_readers.sql";
 const orgIndex = (table: string, columns: string): AdoptableIndex => ({
   name: `${table}_org_id_idx`,
   table: `sessions.${table}`,
@@ -83,6 +85,18 @@ export const ADOPTABLE_INDEXES: Readonly<Record<string, readonly AdoptableIndex[
       def: "CREATE INDEX ingest_claim_attempts_records_gin_idx ON sessions.ingest_claim_attempts USING gin (records jsonb_path_ops)",
     },
   ],
+  [COORDINATION_FACT_READERS_STEP]: [
+    {
+      name: "session_event_facts_coordination_writes_idx",
+      table: "sessions.session_event_facts",
+      def: "CREATE INDEX session_event_facts_coordination_writes_idx ON sessions.session_event_facts USING btree (org_id, workspace_id, ts, row_id) WHERE (cardinality(files_touched) > 0)",
+    },
+    {
+      name: "session_output_facts_coordination_outcomes_idx",
+      table: "sessions.session_output_facts",
+      def: "CREATE INDEX session_output_facts_coordination_outcomes_idx ON sessions.session_output_facts USING btree (org_id, workspace_id, ts, row_id) WHERE (fact_kind = ANY (ARRAY['commit'::text, 'outcome'::text]))",
+    },
+  ],
 };
 
 /** How an ADOPTABLE_INDEXES step is prebuilt, and what else its CREATE inventory names. */
@@ -96,6 +110,8 @@ export interface AdoptableIndexStep {
    * A step that replaces anything never has its sentinel overridden by index adoptability.
    */
   replaces: readonly string[];
+  /** New functions the same step creates. They may be absent while its indexes are prebuilt. */
+  creates?: readonly string[];
   /**
    * Exact-body adoption, for replaced functions only. When the body sentinel fires, the step is still
    * treated as not applied (so it runs normally and writes its ledger row) if, and only if, EVERY entry
@@ -141,6 +157,11 @@ export const ADOPTABLE_INDEX_STEPS: Readonly<Record<string, AdoptableIndexStep>>
         config: "search_path=pg_catalog, sessions, pg_temp",
       },
     ],
+  },
+  [COORDINATION_FACT_READERS_STEP]: {
+    packet: "coordination fact-reader index packet docs/coordination-overlap-detection.md",
+    replaces: [],
+    creates: ["sessions.coordination_write_facts_for", "sessions.coordination_output_facts_for"],
   },
 };
 
@@ -341,6 +362,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105045000_digest_narrative_cache.sql": { evidence: "table sessions.daily_digest_narratives", sql: relation("sessions.daily_digest_narratives") },
   "upstream:20261105045040_selfhost_output_facts.sql": { evidence: "table sessions.session_output_facts", sql: relation("sessions.session_output_facts") },
   "upstream:20261105046010_session_directory_read_api_query.sql": { evidence: "function sessions.query_session_directory_for", sql: fn("sessions", "query_session_directory_for") },
+  [COORDINATION_FACT_READERS_STEP]: {
+    evidence: "functions sessions.coordination_write_facts_for and sessions.coordination_output_facts_for",
+    sql: "SELECT to_regprocedure('sessions.coordination_write_facts_for(text,timestamptz,timestamptz,text,integer)') IS NOT NULL AND to_regprocedure('sessions.coordination_output_facts_for(text,timestamptz,timestamptz,text,integer)') IS NOT NULL AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),
