@@ -32,6 +32,16 @@
  * reset baseline and backend PID are proven before work, then owner identity
  * is checked around every enumerator or writer query.
  *
+ * Census source (step-6 edge 5). `--census-source neon` is the default and
+ * keeps every byte above unchanged. `--census-source frozen-supabase` reads the
+ * source side from the sealed frozen Supabase copy on its own fenced read-only
+ * owner session instead of Neon. Its stdin is exactly
+ *   {"supabaseUrl":"...","tenant":{...}}   (bulk: {"supabaseUrl":"..."})
+ * A neonUrl key refuses with census_source_conflict; the census refuses with
+ * frozen_source_unsealed or privacy_authority_not_active before reading the
+ * target, and with frozen_source_changed_during_census if the copy moves.
+ * Frozen-mode receipts carry "censusSource":"frozen-supabase" as their last field.
+ *
  * Output is one aggregate JSON receipt. Single-tenant output contains a tenant
  * hash; bulk output contains counts only. Neither contains org/workspace/user
  * identifiers or database URLs. A write still requires the operator to have
@@ -42,11 +52,13 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import pg from "pg";
 import {
+  PARITY_CENSUS_SOURCES,
   ParityCensusRefusal,
   readParityCensus,
   validParityTenant,
   writeCurrentParityProof,
   type ParityCensusReceipt,
+  type ParityCensusSource,
   type ParityTenant,
 } from "../src/migration/owner-buffered-parity.ts";
 import {
@@ -95,6 +107,7 @@ export class OwnerBufferedOperatorRefusal extends Error {
 interface OperatorBaseArgs {
   expectedSourceSha: string;
   expectedTargetGeneration: string;
+  censusSource: ParityCensusSource;
 }
 
 export interface SingleOperatorArgs extends OperatorBaseArgs {
@@ -112,7 +125,9 @@ export function parseOperatorArgs(argv: readonly string[]): OperatorArgs {
   const [mode, ...rest] = argv;
   if (mode !== "census" && mode !== "write" && mode !== "bulk")
     throw new OwnerBufferedOperatorRefusal("usage");
-  const allowed = new Set(["--expect-source-sha", "--expect-target-generation", "--confirm-write", "--batch-size"]);
+  const allowed = new Set([
+    "--expect-source-sha", "--expect-target-generation", "--confirm-write", "--batch-size", "--census-source",
+  ]);
   const values = new Map<string, string>();
   for (let i = 0; i < rest.length; i += 2) {
     const key = rest[i];
@@ -134,9 +149,35 @@ export function parseOperatorArgs(argv: readonly string[]): OperatorArgs {
   const batchSize = batchText === undefined ? DEFAULT_BULK_BATCH_SIZE : Number(batchText);
   if (!Number.isSafeInteger(batchSize) || batchSize < 1 || batchSize > MAX_BULK_BATCH_SIZE)
     throw new OwnerBufferedOperatorRefusal("usage");
+  const sourceText = values.get("--census-source") ?? "neon";
+  if (!(PARITY_CENSUS_SOURCES as readonly string[]).includes(sourceText))
+    throw new OwnerBufferedOperatorRefusal("census_source_invalid");
+  const censusSource = sourceText as ParityCensusSource;
   return mode === "bulk"
-    ? { mode, expectedSourceSha, expectedTargetGeneration, batchSize }
-    : { mode, expectedSourceSha, expectedTargetGeneration };
+    ? { mode, expectedSourceSha, expectedTargetGeneration, censusSource, batchSize }
+    : { mode, expectedSourceSha, expectedTargetGeneration, censusSource };
+}
+
+/**
+ * Stdin key contract per census source. Neon mode is unchanged (exact keys).
+ * Frozen mode reads with no hard-required keys so a stray neonUrl is refused
+ * as a source conflict instead of an unknown key; validateCensusSourceInput
+ * then enforces the exact frozen shape.
+ */
+export function operatorCredentialKeys(args: OperatorArgs): { required: string[]; allowed: string[] } {
+  if (args.censusSource === "neon") {
+    const keys = args.mode === "bulk" ? ["neonUrl", "supabaseUrl"] : ["neonUrl", "supabaseUrl", "tenant"];
+    return { required: keys, allowed: keys };
+  }
+  return { required: [], allowed: args.mode === "bulk" ? ["supabaseUrl", "neonUrl"] : ["supabaseUrl", "tenant", "neonUrl"] };
+}
+
+export function validateCensusSourceInput(args: OperatorArgs, input: Record<string, unknown>): void {
+  if (args.censusSource === "neon") return;
+  if (input.neonUrl !== undefined) throw new OwnerBufferedOperatorRefusal("census_source_conflict");
+  const required = args.mode === "bulk" ? ["supabaseUrl"] : ["supabaseUrl", "tenant"];
+  for (const key of required)
+    if (input[key] === undefined) throw new CredentialRefusal(`credentials_missing_key.${key}`);
 }
 
 function parseTenant(value: unknown): ParityTenant {
@@ -333,6 +374,7 @@ export async function runBulkParity(
   expectedTargetGeneration: string,
   batchSize: number,
   dependencies: BulkParityDependencies = {},
+  censusSource: ParityCensusSource = "neon",
 ): Promise<BulkParityCounts> {
   if (!HEX64.test(expectedTargetGeneration) || !Number.isSafeInteger(batchSize) ||
       batchSize < 1 || batchSize > MAX_BULK_BATCH_SIZE)
@@ -363,7 +405,7 @@ export async function runBulkParity(
             counts.tenantRefused++;
           } else {
             try {
-              const g1 = await readCensus(neon, targetOwner, tenant);
+              const g1 = await readCensus(neon, targetOwner, tenant, censusSource);
               if (!g1.equal || !g1.proof) {
                 await requireBulkGeneration(targetOwner, expectedTargetGeneration, counts);
                 counts.g1Mismatch++;
@@ -371,7 +413,7 @@ export async function runBulkParity(
                 if (!generationMatches(g1, expectedTargetGeneration))
                   throw new BulkParityFatal("bulk_target_generation_mismatch", counts);
                 counts.g1Equal++;
-                const result = await writeProof(neon, targetOwner, tenant, expectedTargetGeneration);
+                const result = await writeProof(neon, targetOwner, tenant, expectedTargetGeneration, censusSource);
                 if (!generationMatches(result.census, expectedTargetGeneration))
                   throw new BulkParityFatal("target_generation_postcondition_failed", counts);
                 if (result.outcome === "insert") counts.inserted++;
@@ -424,95 +466,110 @@ async function main(): Promise<number> {
     return 64;
   }
   const clients: pg.Client[] = [];
+  // Neon-mode receipts are byte-for-byte the pre-edge-5 shape; frozen mode appends its source.
+  const emit = (fields: Record<string, unknown>): void =>
+    output(args.censusSource === "neon" ? fields : { ...fields, censusSource: args.censusSource });
   try {
     refuseCredentialEnv();
     verifyCheckout(args.expectedSourceSha);
-    const input = await readStdinCredentials(
-      args.mode === "bulk" ? ["neonUrl", "supabaseUrl"] : ["neonUrl", "supabaseUrl", "tenant"],
-    );
+    const keys = operatorCredentialKeys(args);
+    const input = await readStdinCredentials(keys.required, keys.allowed);
+    validateCensusSourceInput(args, input);
     const tenant = args.mode === "bulk" ? null : parseTenant(input.tenant);
-    // Validate both complete URL identities and TLS policies before opening either connection.
-    const neonUrl = sessionAffinityUrl(input.neonUrl, "neonUrl", "neon");
+    // Validate every complete URL identity and TLS policy before opening any connection.
+    const neonUrl = args.censusSource === "neon" ? sessionAffinityUrl(input.neonUrl, "neonUrl", "neon") : null;
     const supabaseUrl = sessionAffinityUrl(input.supabaseUrl, "supabaseUrl", "supabase");
-    pinnedPgConfig(neonUrl, "neonUrl", "neon");
+    if (neonUrl !== null) pinnedPgConfig(neonUrl, "neonUrl", "neon");
     pinnedPgConfig(supabaseUrl, "supabaseUrl", "supabase");
 
-    const neon = await connectNeon(neonUrl);
-    clients.push(neon);
-    await requireReadOnly(neon, "neonUrl");
-    if (args.mode === "bulk") {
-      const enumerator = client(
-        supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-bulk-target-enumerator",
-      );
-      const targetOwner = client(
-        supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-bulk-target-owner",
-      );
-      // Await inside this try so owner-route failures are sanitized and Neon stays open until cleanup.
-      return await withBulkParityOwnerSessions(enumerator, targetOwner, async (fencedEnumerator, fencedTargetOwner) => {
-        try {
-          const counts = await runBulkParity(
-            neon, fencedEnumerator, fencedTargetOwner, args.expectedTargetGeneration, args.batchSize,
-          );
-          const status = bulkCompletionStatus(counts);
-          output({ status, mode: "bulk", sourceSha: args.expectedSourceSha,
-            targetGeneration: args.expectedTargetGeneration, counts });
-          return status === "complete" ? 0 : 3;
-        } catch (error) {
-          if (error instanceof BulkParityFatal) {
-            output({ status: "refused", mode: "bulk", code: error.code,
-              sourceSha: args.expectedSourceSha, targetGeneration: args.expectedTargetGeneration, counts: error.counts });
-            return 1;
+    const runWithSource = async (neon: Queryable): Promise<number> => {
+      if (args.mode === "bulk") {
+        const enumerator = client(
+          supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-bulk-target-enumerator",
+        );
+        const targetOwner = client(
+          supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-bulk-target-owner",
+        );
+        // Await inside this try so owner-route failures are sanitized and Neon stays open until cleanup.
+        return await withBulkParityOwnerSessions(enumerator, targetOwner, async (fencedEnumerator, fencedTargetOwner) => {
+          try {
+            const counts = await runBulkParity(
+              neon, fencedEnumerator, fencedTargetOwner, args.expectedTargetGeneration, args.batchSize, {}, args.censusSource,
+            );
+            const status = bulkCompletionStatus(counts);
+            emit({ status, mode: "bulk", sourceSha: args.expectedSourceSha,
+              targetGeneration: args.expectedTargetGeneration, counts });
+            return status === "complete" ? 0 : 3;
+          } catch (error) {
+            if (error instanceof BulkParityFatal) {
+              emit({ status: "refused", mode: "bulk", code: error.code,
+                sourceSha: args.expectedSourceSha, targetGeneration: args.expectedTargetGeneration, counts: error.counts });
+              return 1;
+            }
+            throw error;
           }
-          throw error;
-        }
-      });
-    }
-
-    const target = client(
-      supabaseUrl,
-      "supabaseUrl",
-      "supabase",
-      args.mode === "census" ? "owner-buffered-g1-target-readonly" : "owner-buffered-g2-target-owner",
-    );
-    return await withParityOwnerSession(target, args.mode === "census", async (fencedTarget) => {
-      const g1 = await readParityCensus(neon, fencedTarget, tenant!);
-      if (!g1.equal || !g1.proof) {
-        output({ status: "mismatch", mode: args.mode, sourceSha: args.expectedSourceSha, census: publicCensusReceipt(g1) });
-        return 3;
+        });
       }
-      if (!generationMatches(g1, args.expectedTargetGeneration)) {
-        output({
-          status: "refused",
-          code: "target_generation_mismatch",
+
+      const target = client(
+        supabaseUrl,
+        "supabaseUrl",
+        "supabase",
+        args.mode === "census" ? "owner-buffered-g1-target-readonly" : "owner-buffered-g2-target-owner",
+      );
+      return await withParityOwnerSession(target, args.mode === "census", async (fencedTarget) => {
+        const g1 = await readParityCensus(neon, fencedTarget, tenant!, args.censusSource);
+        if (!g1.equal || !g1.proof) {
+          emit({ status: "mismatch", mode: args.mode, sourceSha: args.expectedSourceSha, census: publicCensusReceipt(g1) });
+          return 3;
+        }
+        if (!generationMatches(g1, args.expectedTargetGeneration)) {
+          emit({
+            status: "refused",
+            code: "target_generation_mismatch",
+            mode: args.mode,
+            sourceSha: args.expectedSourceSha,
+            census: publicCensusReceipt(g1),
+          });
+          return 1;
+        }
+        if (args.mode === "census") {
+          emit({ status: "equal", mode: args.mode, sourceSha: args.expectedSourceSha, census: publicCensusReceipt(g1) });
+          return 0;
+        }
+
+        // G2 performs its own fresh census and source recheck in the write transaction.
+        const result = await writeCurrentParityProof(
+          neon, fencedTarget, tenant!, args.expectedTargetGeneration, args.censusSource,
+        );
+        if (!generationMatches(result.census, args.expectedTargetGeneration))
+          throw new OwnerBufferedOperatorRefusal("target_generation_postcondition_failed");
+        emit({
+          status: result.outcome === "unchanged" ? "unchanged" : "written",
           mode: args.mode,
           sourceSha: args.expectedSourceSha,
-          census: publicCensusReceipt(g1),
+          outcome: result.outcome,
+          writtenAt: result.writtenAt,
+          census: publicCensusReceipt(result.census),
         });
-        return 1;
-      }
-      if (args.mode === "census") {
-        output({ status: "equal", mode: args.mode, sourceSha: args.expectedSourceSha, census: publicCensusReceipt(g1) });
         return 0;
-      }
-
-      // G2 performs its own fresh census and source recheck in the write transaction.
-      const result = await writeCurrentParityProof(neon, fencedTarget, tenant!, args.expectedTargetGeneration);
-      if (!generationMatches(result.census, args.expectedTargetGeneration))
-        throw new OwnerBufferedOperatorRefusal("target_generation_postcondition_failed");
-      output({
-        status: result.outcome === "unchanged" ? "unchanged" : "written",
-        mode: args.mode,
-        sourceSha: args.expectedSourceSha,
-        outcome: result.outcome,
-        writtenAt: result.writtenAt,
-        census: publicCensusReceipt(result.census),
       });
-      return 0;
-    });
+    };
+
+    if (neonUrl !== null) {
+      const neon = await connectNeon(neonUrl);
+      clients.push(neon);
+      await requireReadOnly(neon, "neonUrl");
+      return await runWithSource(neon);
+    }
+    // Frozen source: the copy's tables are owner-only, so read them through their own
+    // canonical fenced owner session, pinned read-only, separate from the target session.
+    const frozenSource = client(supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-frozen-source-readonly");
+    return await withParityOwnerSession(frozenSource, true, runWithSource);
   } catch (error) {
     const code = error instanceof OwnerBufferedOperatorRefusal || error instanceof ParityCensusRefusal ||
       error instanceof CredentialRefusal ? error.code : "operator_failed";
-    output({ status: "refused", code: /^[A-Za-z0-9_.:,-]{1,160}$/u.test(code) ? code : "operator_failed" });
+    emit({ status: "refused", code: /^[A-Za-z0-9_.:,-]{1,160}$/u.test(code) ? code : "operator_failed" });
     return 1;
   } finally {
     for (const client of clients.reverse()) await client.end().catch(() => undefined);

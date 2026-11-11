@@ -38,6 +38,16 @@ in the preserved tooling below are outside it.
 | Auth token lookup | `rth_at_` / `rth_st_` tokens | Not ported: the upstream Neon lookup stays upstream | None | Gap: the token lookup is not in this repo |
 | Deploy layer (`stacks/cloudflare`) | `replicaMode=queue` in the stack | Unchanged: the stack can still bind `NEON_REPLICA`. The Worker then refuses at startup under the profile, so the binding is never used | None | Gap: a deploy-side refusal is a follow-up |
 
+## Operator tooling with a non-Neon source (step-6 edges)
+
+Operator tools that read Neon but can be pointed at the sealed frozen Supabase
+copy instead. They are not gated by `SESSIONS_NEON_EXIT` (they are not service
+runtime); the operator picks the source explicitly, and the default stays Neon.
+
+| Consumer | Route / flag | Frozen-source behaviour | Test that proves it | Gap |
+| --- | --- | --- | --- | --- |
+| Owner-buffered parity census, G1/G2/bulk (`scripts/owner-buffered-parity-operator.ts`, `src/migration/owner-buffered-parity.ts`), edge 5 | `--census-source neon\|frozen-supabase` (default `neon`; any other value refuses `census_source_invalid`, exit 64). Frozen stdin is exactly `{"supabaseUrl":"...","tenant":{...}}` (bulk: `{"supabaseUrl":"..."}`) | Neon mode is byte-identical to before. Frozen mode reads `FROZEN_OWNER_BUFFERED_CENSUS_SQL` (`ingest_source_control_heads`, `ingest_frozen_source_deletions`, `ingest_frozen_source_resets`, epoch and baseline from the completeness seal) on its own fenced read-only owner session, with the same digest expressions and `COLLATE "C"` order as the Neon census. Refusals: `census_source_conflict` (a `neonUrl` key), `credentials_missing_key.supabaseUrl`, `frozen_source_unsealed` (no seal, or a seal not bound to the live `ingest_lazy_policy`), `privacy_authority_not_active` (`ingest_privacy_authority` absent, `fenced`, or active at another epoch), `frozen_source_changed_during_census` (snapshot A differs from snapshot B) | `src/migration/__tests__/owner-buffered-parity-frozen.pglite.test.ts` (Neon and frozen rows and receipts byte-identical; every refusal; target mismatch still reported), `owner-buffered-parity-operator-census-source.test.ts` (CLI default byte-identical, input refusals, no URL in output) | No production census run is authorized by this change; any run needs its own approval. See `runbooks/owner-buffered-parity-census.md` |
+
 ## Preserved tooling (out of scope)
 
 These read or write Neon on purpose for the migration and are not gated by the
