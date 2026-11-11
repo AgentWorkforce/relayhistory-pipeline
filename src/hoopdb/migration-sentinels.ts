@@ -423,6 +423,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.read_api_tokens",
     sql: relation("sessions.read_api_tokens"),
   },
+  "upstream:20261105050030_buffered_exact_session_stages.sql": {
+    evidence: "new exact-session stage RPC (050030)",
+    sql: fn("sessions", "buffered_session_stages_for_target"),
+  },
   "upstream:20261105046000_analysis_jobs.sql": { evidence: "table sessions.session_analysis_jobs_v2", sql: relation("sessions.session_analysis_jobs_v2") },
   // Adoptable step: an unledgered "applied" here is accepted when every declared index is adoptable.
   [CLAIM_BOOTSTRAP_ORG_INDEXES_STEP]: {

@@ -230,6 +230,23 @@ describe("entry and configuration", () => {
     }
   });
 
+  test("050030 exact-session flag selects only the stages RPC, with default off", async () => {
+    const seen: string[] = [];
+    const run = (async (_org: string, _ws: string, work: any) => work({ query: async (sql: string) => { seen.push(sql); return { rows: [] }; } })) as never;
+    const keys = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", INGEST_S3_BUCKET: "ingest-bucket-example", PIPELINE_RAW_S3_ACCESS_KEY_ID: "k", PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "s" };
+    const head = { cutoverEpoch: "1".repeat(64), privacyBaselineSha256: "4".repeat(64), head: null } as never;
+    const scope = { orgId: "org-a", workspaceId: "ws-a", userId: "u-1" };
+    for (const flag of [undefined, "off", "true", "ON", " on ", "on"]) {
+      const deps = ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_EXACT_SESSION: flag } as Env, run)!;
+      seen.length = 0;
+      await deps.reads.stages(scope, head, "droid", "fixture-session");
+      expect(seen.at(-1)).toContain(flag === "on" ? "sessions.buffered_session_stages_for_target(" : "sessions.buffered_session_stages_for(");
+      seen.length = 0;
+      await deps.reads.list(scope, head, { limit: 1 });
+      expect(seen.at(-1)).toContain("sessions.buffered_sessions_for(");
+    }
+  });
+
   test("READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: unset keeps 2000; 2000..6000 is passed to the buffered RPCs; a bad value is a 503", async () => {
     const seen: string[] = [];
     const run = (async (_org: string, _ws: string, work: (q: { query(sql: string, params?: unknown[]): Promise<{ rows: unknown[] }> }) => Promise<unknown>) =>

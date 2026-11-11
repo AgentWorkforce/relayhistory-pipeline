@@ -79,6 +79,10 @@
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
     ],
+    "sessions.buffered_session_stages_for_target(text,text,text,text,text,text,text,text,boolean,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"

@@ -222,3 +222,26 @@ describe("committed production profile (DEPLOY_TARGET=production)", () => {
     expect(() => parseCommittedProfile(JSON.stringify({ owner_buffered: "maybe", owner_buffered_workspaces: "*", owner_buffered_events: "on", owner_buffered_statement_timeout_ms: "6000" }))).toThrow(/on or off/);
   });
 });
+
+
+describe("050030 exact-session deployment selection", () => {
+  test("preserve and production profile keep the live selection; neither silently enables it", async () => {
+    for (const mode of ["preserve", "profile"]) {
+      for (const enabled of [false, true]) {
+        const live = version({ ...values, ...(enabled ? { READ_API_OWNER_BUFFERED_EXACT_SESSION: "on" } : {}) });
+        const base = { ...env, DEPLOY_TARGET: "production", OWNER_BUFFERED: mode, OWNER_BUFFERED_EXACT_SESSION: "off" };
+        const resolved = await resolveProfile(base, template, get(live));
+        expect(resolved.OWNER_BUFFERED_EXACT_SESSION).toBe(enabled ? "on" : "off");
+        const rendered = ts.parseConfigFileTextToJson("config.jsonc", renderDeployConfig(template, profileInputs({ ...base, ...resolved }))).config;
+        expect(rendered.vars.READ_API_OWNER_BUFFERED_EXACT_SESSION).toBe(enabled ? "on" : undefined);
+        await expect(resolveProfile({ ...base, OWNER_BUFFERED_EXACT_SESSION: "on" }, template, get(live))).rejects.toThrow(/feature overrides/);
+      }
+    }
+  });
+  test("explicit on selects the new RPC without changing the committed profile", async () => {
+    const base = { ...env, DEPLOY_TARGET: "production", OWNER_BUFFERED: "on", OWNER_BUFFERED_EXACT_SESSION: "on", OWNER_BUFFERED_S3_BUCKET: values.INGEST_S3_BUCKET, OWNER_BUFFERED_S3_REGION: values.INGEST_S3_REGION };
+    const resolved = await resolveProfile(base, template, get());
+    const rendered = ts.parseConfigFileTextToJson("config.jsonc", renderDeployConfig(template, profileInputs({ ...base, ...resolved }))).config;
+    expect(rendered.vars.READ_API_OWNER_BUFFERED_EXACT_SESSION).toBe("on");
+  });
+});
