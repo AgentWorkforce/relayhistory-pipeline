@@ -24,9 +24,10 @@ const manifest = {
   scrubProfile: "relayhistory-secrets-v10",
 };
 const pin = {
-  schema: 1,
+  schema: 2,
   package: "@agentworkforce/relayscrubber",
   package_version: manifest.crateVersion,
+  release: { source: "github-release", repository: "AgentWorkforce/relayscrubber", tag: "v0.0.0-test", tarball: "test.tgz", tarball_sha256: "e".repeat(64), sha256sums: { "artifact.json": "f".repeat(64) } },
   wasm_sha256: "2".repeat(64),
   glue_sha256: "3".repeat(64),
   loader_sha256: "4".repeat(64),

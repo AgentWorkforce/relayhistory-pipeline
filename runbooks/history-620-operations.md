@@ -149,6 +149,37 @@ which renders no var). Operator note: if the deploy actor previously set `INGEST
 out of band as a Worker version secret of the same name, it must remove that secret before the
 stack-rendered var applies, or the apply conflicts.
 
+Claim statement-timeout busy (default off, independent of `INGEST_CLAIM_LOCK_BUSY`): with
+`INGEST_CLAIM_TIMEOUT_BUSY=on` (parsed like `INGEST_CLAIM_LOCK_BUSY`: only `on`, any case, trimmed)
+a claim whose statement hit the role `statement_timeout` or was cancelled (`error_code`
+`ledger_timeout` with SQLSTATE 57014 by code only, i.e. `db_error_code` `57014` and `db_error_basis`
+`code`; name-only client timeouts such as a driver/pool `TimeoutError` also log `ledger_timeout` but
+stay 503) answers the same 429 `delivery_busy` with `Retry-After` 5-10 s instead of the 503.
+Proven: production claim-stage 503s are dominated by 57014 at about 5 s; the role runs
+`statement_timeout` 5 s and `lock_timeout` 2 s (`supabase/bootstrap/session_ingest_role.sql`); the
+claim is one autocommit statement (`src/session-ingest/ledger-sql.ts`, `call`). Hypothesis, pending
+operator `pg_stat_activity` / lock / plan evidence: because `lock_timeout` applies to each lock
+acquisition separately, a claim queued behind several same-user claims on the per-user fence row
+waits several times (each under 2 s) and reaches the 5 s `statement_timeout` first. This is
+unproven: a reviewer's controlled PG15 probe (4-8 concurrent callers on one `FOR UPDATE` row,
+`statement_timeout` 5 s, `lock_timeout` 2 s) produced shallow successes plus deep 55P03s and no
+57014. The flag does not depend on the cause: a 57014 (timeout or `pg_cancel_backend`) rolls back
+the single autocommit claim statement just like 55P03, so nothing was written and the retry is the
+same idempotent claim;
+57P01/57P02 (terminate, shutdown) and 08xxx are other codes and stay 503. Only `stage=claim`
+converts: 57014 at `buffer_intent`, `buffer_receipt`, `slot`, `commit` and every other stage stays
+503. The route line keeps `error_code` `ledger_timeout` and `db_error_code` `57014` with `outcome`
+`delivery_busy`, so it stays separable from the 55P03 lock wait (`ledger_lock_timeout`); the
+`ingest.lock_alert` `lazy_claim` line still fires for 57014 (buffered mode); the admission consumer
+is unchanged (normal admission backoff). Caveat: a claim that is slow without contention also
+yields 57014 and would retry as 429 instead of 503; watch `outcome=delivery_busy` with
+`error_code=ledger_timeout` per tenant. Unset or `off`: unchanged. The Cloudflare stack renders
+the var only from the stack input `sessionIngest.claimTimeoutBusy: "on"` (canonical or buffered
+acceptance; omit for `off`, which renders no var; any other value is refused). The hosted Worker
+sees the flag only when the stack sets that input; without it the flag is inert in hosted prod. The
+same out-of-band Worker version secret note as for `INGEST_CLAIM_LOCK_BUSY` applies. Not read by
+the self-host server (follow-up).
+
 No Workers analytics or Logpush observer is named in these runbooks, so the alert is not wired
 yet. It is to be wired by the release owner in the G3 window, using the fields `route`, `stage`,
 `sqlstate`, `outcome` and `db_error_code`. A sustained `lazy_claim` 55P03 with a single origin

@@ -42,7 +42,7 @@ import {
 import { healthVerdict, type WorkerHealth } from "../shared/worker.ts";
 import { errorFields, log } from "../shared/log.ts";
 import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
-import { initScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
+import { initScrubEngine, routedRawChunkSealerDeps } from "@rhc/lib/scrub-engine/index.ts";
 import { initTelemetry, withSpan } from "../shared/telemetry.ts";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
 import { expectedSchema } from "../hoopdb/migrate.ts";
@@ -318,6 +318,8 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
     migrationLedger: () => migrationLedger,
     // The courier route verifies a v2 (backfill) commit against the stored base.
     migrationBackfill: true,
+    // SCRUB_ENGINE=wasm-bindgen: the sealer bound to the verified instance; otherwise {} (unchanged).
+    ...routedRawChunkSealerDeps(),
   });
   const readiness = postgresReadinessStore(db);
   // Activation starts at the first start with a window set, used or not.

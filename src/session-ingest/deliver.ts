@@ -35,6 +35,12 @@ import {validatedCustodyAck} from "./custody-ack.ts";
  * `ledger_lock_timeout`) is a 429 `ClaimLockBusy` with `Retry-After` 5-10 s instead
  * of a 503. The statement rolled back, so nothing was written and the retry is the
  * same idempotent claim; 57014 (`ledger_timeout`) and every other cause stay 503.
+ * Second exception, default off and independent (INGEST_CLAIM_TIMEOUT_BUSY=on,
+ * `DeliverDeps.claimTimeoutBusy`): a claim whose statement hit statement_timeout or was
+ * cancelled (`ledger_timeout` with SQLSTATE 57014 by code only; name-only client timeouts
+ * stay 503) is the same 429 `ClaimLockBusy`. It is the same rolled back single statement.
+ * Hypothesis, pending operator pg_stat_activity/lock/plan evidence: several sub-2 s lock
+ * waits on the per-user fence row add up to the 5 s statement_timeout.
  */
 import type { Ledger, LedgerTenant, RevisionConflict, SlotRequest } from "./ledger.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
@@ -108,6 +114,13 @@ export interface DeliverDeps {
    * Unset (the default): the 503 `IngestUnavailable`, unchanged.
    */
   claimLockBusy?: true;
+  /**
+   * INGEST_CLAIM_TIMEOUT_BUSY=on: a claim-stage statement timeout / cancel (cause `ledger_timeout`,
+   * SQLSTATE 57014 by code only; name-only client timeouts stay 503) is refused as the same 429 `ClaimLockBusy` (Retry-After in CLAIM_LOCK_RETRY_AFTER).
+   * Independent of `claimLockBusy`; the route line keeps `error_code: ledger_timeout` /
+   * `db_error_code: 57014`, so the two causes stay separable. Unset (the default): the 503, unchanged.
+   */
+  claimTimeoutBusy?: true;
   /** Test seam for the ClaimLockBusy jitter: a value in [0, 1). Default Math.random. */
   random?: () => number;
   /**
@@ -283,12 +296,21 @@ function stagesFor(deps: Pick<DeliverDeps, "stageLatency">) {
   return <T>(name: string, work: () => Promise<T>): Promise<T> => runStage(name, work, deps.stageLatency);
 }
 
-/** The claim stage; with `claimLockBusy`, its lock-wait 503 becomes a 429 ClaimLockBusy (nothing else changes). */
-async function claimStage<T>(deps: Pick<DeliverDeps, "stageLatency" | "claimLockBusy" | "random">, work: () => Promise<T>): Promise<T> {
+/** SQLSTATE 57014 by code only: `ledger_timeout` is also derived from a code-less error whose name
+ * matches /timeout/i (a client/pool TimeoutError); those, and a 57014 seen only in a message, stay 503. */
+function isClaimStatementTimeout(error: IngestUnavailable): boolean {
+  return error.cause_code === "ledger_timeout" && error.db !== undefined &&
+    error.db.db_error_code === "57014" && error.db.db_error_basis === "code";
+}
+
+/** The claim stage; with `claimLockBusy` its lock-wait 503, and with `claimTimeoutBusy` its statement-timeout
+ * 503, becomes a 429 ClaimLockBusy (nothing else changes). */
+async function claimStage<T>(deps: Pick<DeliverDeps, "stageLatency" | "claimLockBusy" | "claimTimeoutBusy" | "random">, work: () => Promise<T>): Promise<T> {
   try {
     return await runStage("claim", work, deps.stageLatency);
   } catch (error) {
-    if (deps.claimLockBusy && error instanceof IngestUnavailable && error.stage === "claim" && error.cause_code === "ledger_lock_timeout")
+    if (error instanceof IngestUnavailable && error.stage === "claim" &&
+      ((deps.claimLockBusy && error.cause_code === "ledger_lock_timeout") || (deps.claimTimeoutBusy && isClaimStatementTimeout(error))))
       throw new ClaimLockBusy(error.cause_code, error.db, claimLockRetryAfter(deps.random ?? Math.random));
     throw error;
   }

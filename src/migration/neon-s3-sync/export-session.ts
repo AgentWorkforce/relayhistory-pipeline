@@ -52,7 +52,7 @@ export const EXPORT_MARKER = "client.relayhistory_export";
 const SESSION_EXT = "96bulls";
 
 export interface ExportTarget {
-  /** Default-off scaffold dependency; default export stamps stay unchanged. */
+  /** Set by routedRawChunkSealerDeps() under SCRUB_ENGINE=wasm-bindgen; absent → seam sealRawChunk (TS by default; refuses non-TS engines). */
   rawChunkSealer?: BoundRawChunkSealer;
   store: ObjectStore;
   /** Deployment key root; objects land under `{keyRoot}/{org}/v1/...`. */
