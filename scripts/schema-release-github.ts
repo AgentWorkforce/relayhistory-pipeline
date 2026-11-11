@@ -6,6 +6,66 @@ import {
 } from "../src/hoopdb/schema-release-contract.ts";
 type Obj = Record<string, any>;
 type Get = (path: string) => Promise<any>;
+/** Required push workflows on main and the job names each latest run must contain. */
+const REQUIRED_PUSH_RUNS = [
+  ["ci.yml", ["checks", "session-read-worker / worker"]],
+  [
+    "pg-proof.yml",
+    ["real PostgreSQL 15", "real PostgreSQL 16", "real PostgreSQL 17"],
+  ],
+] as const;
+/**
+ * For each required workflow, the latest push run on main with head_sha === sha
+ * must be completed/success, and every job of that run attempt completed/success
+ * with head_sha === sha, the required job names included. Refuses codes.runs or
+ * codes.jobs.
+ */
+async function requireGreenPushRuns(
+  get: Get,
+  base: string,
+  sha: string,
+  codes: { runs: string; jobs: string },
+) {
+  for (const [workflow, names] of REQUIRED_PUSH_RUNS) {
+    const listing = await get(
+      base +
+        `/actions/workflows/${workflow}/runs?event=push&head_sha=${sha}&per_page=100`,
+    );
+    const runs = (listing.workflow_runs ?? [])
+      .filter(
+        (r: Obj) =>
+          r.head_sha === sha && r.head_branch === "main" && r.event === "push",
+      )
+      .sort((a: Obj, b: Obj) => b.id - a.id);
+    const latest = runs[0];
+    if (
+      !latest ||
+      latest.status !== "completed" ||
+      latest.conclusion !== "success"
+    )
+      refuse(codes.runs);
+    const jobs = await get(
+      base +
+        "/actions/runs/" +
+        latest.id +
+        "/attempts/" +
+        latest.run_attempt +
+        "/jobs?per_page=100",
+    );
+    if (
+      jobs.total_count !== jobs.jobs?.length ||
+      !jobs.jobs.length ||
+      jobs.jobs.some(
+        (j: Obj) =>
+          j.status !== "completed" ||
+          j.conclusion !== "success" ||
+          j.head_sha !== sha,
+      ) ||
+      names.some((n) => !jobs.jobs.some((j: Obj) => j.name === n))
+    )
+      refuse(codes.jobs);
+  }
+}
 export async function githubReleaseGate(
   env: Record<string, string | undefined>,
   get: Get,
@@ -73,53 +133,18 @@ export async function githubReleaseGate(
     branches.branch_policies[0].type !== "branch"
   )
     refuse("release_environment_branch");
-  for (const [workflow, names] of [
-    ["ci.yml", ["checks", "session-read-worker / worker"]],
-    [
-      "pg-proof.yml",
-      ["real PostgreSQL 15", "real PostgreSQL 16", "real PostgreSQL 17"],
-    ],
-  ] as const) {
-    const listing = await get(
-      base +
-        `/actions/workflows/${workflow}/runs?event=push&head_sha=${input.sha}&per_page=100`,
-    );
-    const runs = (listing.workflow_runs ?? [])
-      .filter(
-        (r: Obj) =>
-          r.head_sha === input.sha &&
-          r.head_branch === "main" &&
-          r.event === "push",
-      )
-      .sort((a: Obj, b: Obj) => b.id - a.id);
-    const latest = runs[0];
-    if (
-      !latest ||
-      latest.status !== "completed" ||
-      latest.conclusion !== "success"
-    )
-      refuse("release_ci");
-    const jobs = await get(
-      base +
-        "/actions/runs/" +
-        latest.id +
-        "/attempts/" +
-        latest.run_attempt +
-        "/jobs?per_page=100",
-    );
-    if (
-      jobs.total_count !== jobs.jobs?.length ||
-      !jobs.jobs.length ||
-      jobs.jobs.some(
-        (j: Obj) =>
-          j.status !== "completed" ||
-          j.conclusion !== "success" ||
-          j.head_sha !== input.sha,
-      ) ||
-      names.some((n) => !jobs.jobs.some((j: Obj) => j.name === n))
-    )
-      refuse("release_ci_jobs");
-  }
+  await requireGreenPushRuns(get, base, input.sha, {
+    runs: "release_ci",
+    jobs: "release_ci_jobs",
+  });
+  // The runtime image is published at target_sha, so its own push CI and
+  // pg-proof runs on main must be green too (first-parent history alone does
+  // not prove that a historical main commit passed its checks).
+  if (input.targetSha !== input.sha)
+    await requireGreenPushRuns(get, base, input.targetSha, {
+      runs: "release_target_ci",
+      jobs: "release_target_ci_jobs",
+    });
   if (input.mode === "apply") {
     const plan = await get(base + "/actions/runs/" + input.planRun);
     if (

@@ -38,6 +38,15 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.ingest_history_scope_capture(jsonb)',
  'sessions.ingest_history_scope_install(jsonb)',
  'sessions.ingest_operator_erase_receipt(text,text,text,text)',
+ 'sessions.ingest_operator_runtime_authorize(text,text,text,text,uuid)',
+ 'sessions.ingest_operator_runtime_begin(text,text,text,text,text,text,text,text,text,text)',
+ 'sessions.ingest_operator_runtime_next(uuid)',
+ 'sessions.ingest_operator_runtime_purge(text,text,text,text,uuid)',
+ 'sessions.ingest_operator_runtime_release(text,text,text,text,uuid)',
+ 'sessions.ingest_operator_runtime_step(text,text,text,text,uuid,text,text,bigint,text)',
+ 'sessions.ingest_operator_runtime_write_begin(jsonb)',
+ 'sessions.ingest_operator_runtime_write_failed(text,text,uuid)',
+ 'sessions.ingest_operator_runtime_write_finish(text,text,uuid)',
  'sessions.ingest_prepare_buffer_stage(jsonb)',
  'sessions.ingest_privacy_authority_begin(jsonb)',
  'sessions.ingest_privacy_authority_complete(jsonb)',
@@ -81,6 +90,10 @@ BEGIN
  v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE to_regprocedure(fn) IS NOT NULL OR fn NOT LIKE 'sessions.ingest\_operator\_erase\_%');
  -- Allowed, not required: the upload consent entry points (before 20261105057010 is applied).
  v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE to_regprocedure(fn) IS NOT NULL OR fn NOT LIKE 'sessions.upload\_consent\_%');
+ -- Runtime RPCs are required once their table is installed, and absent on a validated prefix release.
+ IF to_regclass('sessions.session_erasure_writes') IS NULL THEN
+  v_allowed:=array(SELECT fn FROM unnest(v_allowed) fn WHERE fn NOT LIKE 'sessions.ingest\_operator\_runtime\_%');
+ END IF;
  SELECT array_agg(to_regprocedure(fn)::oid) INTO v_oids FROM unnest(v_allowed) fn;
  IF cardinality(v_oids)<>cardinality(v_allowed) OR array_position(v_oids,NULL) IS NOT NULL
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='session ingest RPC missing';END IF;

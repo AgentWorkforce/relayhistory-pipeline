@@ -456,12 +456,14 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105045030_session_consumer_project_text_grant.sql` | search_consumer_runtime EXECUTE on `sessions.session_directory_project_text(text,text,text)` (slot 045030; grant only; the partial expression index `session_directory_tenant_project_text_trgm_idx` evaluates it as the writing role, so without it consumer directory writes carrying a project id, project key or repository fail `42501`; needs the bare consumer role first, absent fails closed `55000`) |
 | `upstream:20261105046000_analysis_jobs.sql` | table `sessions.session_analysis_jobs_v2` |
 | `upstream:20261105050000_operator_session_erase.sql` | table sessions.session_erasure_receipts (operator per-session erase) |
+| `upstream:20261105050020_operator_session_erase_runtime.sql` | table sessions.session_erasure_writes (durable in-flight writes, default-off runtime RPCs) |
 | `upstream:20261105050010_operator_session_erase_fence_check.sql` | trigger ingest_erase_fence_index_guard on sessions.session_index; claim/commit call ingest_erase_fence_extend |
 | `upstream:20261105057000_session_directory_users_aggregate.sql` | function sessions.session_directory_users_for |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
 | `96bulls:0003_fanout_ledger.sql`                               | ALTER-only: column sessions.session_index_ext.fanout_revision                                                           |
+| `96bulls:0005_operator_session_erase_guards.sql` | table sessions.session_erasure_optional_guards |
 | `96bulls:0004_summary_pointers.sql`                            | DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)                                          |
 
 **Buffered search feed role (`20261105043870`).** `buffered_search_feed_runtime` is created

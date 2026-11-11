@@ -231,6 +231,15 @@ GRANT EXECUTE ON FUNCTION sessions.upsert_session_index(jsonb) TO search_consume
 GRANT EXECUTE ON FUNCTION sessions.session_index_batch(jsonb) TO search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.session_publication_is_managed(text, text, text, text, text) TO search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.session_publication_lock(jsonb) TO search_consumer_runtime;
+-- A recreated writer loses migration-time grants. Reconcile this narrow capability on
+-- every bootstrap too; older schema prefixes remain supported while enforcement is off.
+DO $operator_erase$ BEGIN
+ IF to_regprocedure('sessions.ingest_operator_runtime_upsert(jsonb,text,text)') IS NOT NULL THEN
+  REVOKE ALL ON FUNCTION sessions.ingest_operator_runtime_upsert(jsonb,text,text) FROM search_consumer_runtime;
+  GRANT EXECUTE ON FUNCTION sessions.ingest_operator_runtime_upsert(jsonb,text,text) TO search_consumer_runtime;
+ END IF;
+END $operator_erase$;
+
 
 -- Repo catalog the pointer upsert maintains through these invoker helpers
 -- (upsert_session_index calls them as the writer, so they need EXECUTE plus

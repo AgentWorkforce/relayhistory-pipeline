@@ -284,7 +284,8 @@ describe("verifier on", () => {
   });
 
   test("through the real ingest app (mountIngestEdge): limits answered for a verified rth_at_", async () => {
-    const pg = await fakeServer(() => rows(row(["rth:sync"])));
+    // The real app runs on the wall clock, not the frozen T0, so the row's expiry must too.
+    const pg = await fakeServer(() => rows(row(["rth:sync"], { access_token_expires_at: new Date(Date.now() + 3_600_000).toISOString() })));
     const rc = await relaycontrol();
     const edge = mountIngestEdge(env(rc.url, pg.url), DEPS)!;
     const res = await edge.fetch(new Request(`${ORIGIN}/v1/delivery/limits`, { headers: { authorization: `Bearer ${TOKEN}` } }));
