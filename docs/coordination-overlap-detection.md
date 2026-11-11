@@ -25,8 +25,8 @@ The pipeline ships one detector, `outcome-facts` v1. It is deterministic, cites 
   - On a populated facts table, the transactional migrator refuses a blocking index build. Operators
     prebuild the exact packet below with `CREATE INDEX CONCURRENTLY`, then the migration adopts it;
     `HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true` is the explicit non-production opt-in.
-  - It is off unless `READ_API_COORDINATION_OVERLAPS_ENABLED=true`.
-- **Where it shows:** an Overlaps tab in the dashboard (`relay-webapp`). The tab hides itself when the endpoint is off.
+  - It is served only when `READ_API_COORDINATION_OVERLAPS_ENABLED=true`. The hosted read API ships with it on (Khaliq, 2026-11-10), and so does the self-hosted Helm chart. The dashboard's Overlaps view is a separate setting that is off by default, so the endpoint runs without the tab appearing until it is turned on.
+- **Where it shows:** an Overlaps tab in the dashboard (`relay-webapp`). It appears only when the dashboard's Overlaps setting is on (off by default) and the endpoint answers; when the endpoint is off the tab also stays hidden.
 
 Two things are deliberately not shipped:
 
