@@ -477,3 +477,11 @@ test("an oversized alias set refuses before audit or fence writes",async()=>{
  expect((await d.db.query("SELECT 1 FROM sessions.session_erasure_fences")).rows).toEqual([]);
  expect((await d.db.query("SELECT 1 FROM sessions.session_erasure_receipts")).rows).toEqual([]);
 });
+
+test("a canonical identity reused as another session's physical alias refuses before writes",async()=>{
+ const d=await database();await pointer(d,"user-a","physical-alias","m-a","logical-root");
+ await pointer(d,"user-b","logical-root","m-b","different-root");
+ await expect(erase(d,"chain",[ORG,WS,SRC,"physical-alias"])).rejects.toMatchObject({code:"RH013"});
+ expect((await d.db.query("SELECT 1 FROM sessions.session_erasure_fences")).rows).toEqual([]);
+ expect((await d.db.query("SELECT 1 FROM sessions.session_index WHERE deleted_at IS NULL")).rows).toHaveLength(2);
+});

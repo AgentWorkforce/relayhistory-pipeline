@@ -43,6 +43,9 @@ describe.skipIf(!url)("operator fence serializes all pointer statements",()=>{
    await eraser.query("BEGIN;SET LOCAL ROLE bulls96_session_ingest");await erase("old-snapshot");
    const stale=insert("old-snapshot");const outcome=stale.then(()=>"unsafe",e=>(e as {code:string}).code);
    await blocked(wp,ep);await eraser.query("COMMIT");expect(await outcome).toBe("40001");await writer.query("ROLLBACK");
+   // The eraser must also reject an old snapshot before it can miss newly committed aliases.
+   await eraser.query("BEGIN ISOLATION LEVEL REPEATABLE READ;SET LOCAL ROLE bulls96_session_ingest;SELECT 1");
+   await expect(erase("stale-eraser")).rejects.toMatchObject({code:"40001"});await eraser.query("ROLLBACK");
    expect((await pool.query("SELECT 1 FROM sessions.session_index WHERE deleted_at IS NULL")).rows).toEqual([]);
   }finally{for(const c of held){await c.query("ROLLBACK").catch(()=>{});c.release();}await pool.end();await admin.query(`DROP DATABASE ${name}`);await admin.end();}
  },120_000);

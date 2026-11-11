@@ -15,7 +15,8 @@ claim/commit hot-path fence lookup. Erases should be rare and their SQL transact
 A non-MVCC sequence epoch records that an erase crossed the writer boundary. Once an
 erase has occurred, a higher-isolation pointer writer fails with 40001 and must retry
 under READ COMMITTED; it cannot use a repeatable-read snapshot that predates the fence.
-The dedicated consumer already uses READ COMMITTED. The sequence is owner-only and has
+The eraser itself also requires READ COMMITTED before any write, so an old erase
+snapshot cannot miss newly committed aliases. The dedicated consumer already uses READ COMMITTED. The sequence is owner-only and has
 no content. No erasure means the epoch remains uncalled and existing isolation behavior
 is retained. A used fence cannot be rolled back to remove enforcement.
 

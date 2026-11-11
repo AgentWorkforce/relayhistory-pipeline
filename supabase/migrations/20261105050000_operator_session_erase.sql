@@ -203,8 +203,12 @@ BEGIN
    CROSS JOIN LATERAL(VALUES(s.session_id),(s.canonical_session_id)) AS n(id) WHERE n.id IS NOT NULL
  ) SELECT array_agg(id ORDER BY id COLLATE "C") INTO v_ids FROM(SELECT id FROM related LIMIT 257) AS bounded;
  IF cardinality(v_ids)>256 THEN RAISE EXCEPTION USING ERRCODE='RH010',MESSAGE='operator erase: alias cap exceeded before fencing';END IF;
- IF EXISTS(SELECT 1 FROM sessions.session_index WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_source
-  AND session_id=ANY(v_ids) GROUP BY session_id HAVING count(DISTINCT coalesce(canonical_session_id,session_id))>1) THEN
+ IF EXISTS(SELECT 1 FROM (
+  SELECT session_id AS id,coalesce(canonical_session_id,session_id) AS logical_id FROM sessions.session_index
+   WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_source AND session_id=ANY(v_ids)
+  UNION SELECT canonical_session_id,canonical_session_id FROM sessions.session_index
+   WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_source AND canonical_session_id=ANY(v_ids)
+ ) AS identities GROUP BY id HAVING count(DISTINCT logical_id)>1) THEN
   RAISE EXCEPTION USING ERRCODE='RH013',MESSAGE='operator erase: ambiguous physical alias';END IF;
  RETURN v_ids;
 END $ids$;
@@ -334,6 +338,8 @@ DECLARE v_org text;v_ws text;v_source text;v_session text;v_request text;v_actor
  r sessions.session_erasure_receipts%ROWTYPE;v_ids text[];v_code text;
 BEGIN
  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='operator erase: read-committed transaction required';END IF;
  v_org:=sessions.ingest_identifier(to_jsonb(p_org),false);
  v_ws:=sessions.ingest_identifier(to_jsonb(p_ws),true);
  v_source:=sessions.ingest_identifier(to_jsonb(p_source),false);
