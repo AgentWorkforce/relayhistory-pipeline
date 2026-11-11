@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
 import ts from "typescript";
-import { apiRoot, checkPreservedVersion, preservedProfile, profileInputs, resolveProfile, workflowEnvironment } from "./resolve-deploy-profile.ts";
+import { apiRoot, checkPreservedVersion, parseCommittedProfile, preservedProfile, profileInputs, resolveProfile, workflowEnvironment } from "./resolve-deploy-profile.ts";
 import { renderDeployConfig } from "./render-deploy-config.ts";
 
 const template = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
@@ -16,7 +16,7 @@ const values = {
 const control = { name: "HISTORY_CONTROL_HEAD", type: "service", service: "relayhistory-api", entrypoint: "SessionReadPrivacyControls" };
 const version = (v: Record<string, string> = values, binding = control) => ({ id, resources: { bindings: [
   ...Object.entries(v).map(([name, text]) => ({ name, type: "plain_text", text })),
-  ...(binding ? [binding] : []),
+  ...(binding ? [{ ...binding }] : []),
   { name: "PIPELINE_RAW_S3_SECRET_ACCESS_KEY", type: "secret_text", text: "MUST_NOT_BE_COPIED" },
 ] } });
 const get = (v: unknown = version()) => async (path: string) => path === "/deployments"
@@ -60,7 +60,7 @@ describe("preserve the deployed Reader profile", () => {
   });
   test("explicit off disables without fetching live metadata", async () => {
     const resolved = await resolveProfile({ ...env, OWNER_BUFFERED: "off", DIRECTORY_WORKSPACES_INPUT: "off" }, template, async () => { throw Error("must not call"); });
-    expect(resolved).toEqual({ OWNER_BUFFERED: "off", DIRECTORY_WORKSPACES: "" });
+    expect(resolved).toEqual({ OWNER_BUFFERED: "off", OWNER_BUFFERED_WORKSPACES: "", OWNER_BUFFERED_EVENTS: "off", OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "off", DIRECTORY_WORKSPACES: "" });
   });
   test("explicit buffered on/off cannot erase the directory just because its environment variable is unset", async () => {
     const off = await resolveProfile({ ...env, OWNER_BUFFERED: "off" }, template, get());
@@ -83,8 +83,17 @@ describe("preserve the deployed Reader profile", () => {
   test("default deploy refuses dropping an unrelated service or Hyperdrive binding", async () => {
     const digest = version(); digest.resources.bindings.push({ ...control, name: "DIGEST_NARRATIVE", service: "fixture-digest" });
     await expect(resolveProfile(env, template, get(digest))).rejects.toThrow(/drop live service binding/);
-    const drive = version(); Object.assign(drive.resources.bindings[0]!, { name: "OTHER_DATABASE", type: "hyperdrive", id: "cccccccccccccccccccccccccccccccc" });
-    await expect(resolveProfile(env, template, get(drive))).rejects.toThrow();
+    // Push a new binding: overwriting bindings[0] would remove the owner-buffered flag and refuse earlier.
+    const withBinding = (extra: Record<string, string>) => { const v = version(); (v.resources.bindings as Array<Record<string, string>>).push(extra); return v; };
+    await expect(resolveProfile(env, template, get(withBinding({ name: "OTHER_DATABASE", type: "hyperdrive", id: "cccccccccccccccccccccccccccccccc" })))).rejects.toThrow(/drop live Hyperdrive binding OTHER_DATABASE/);
+    await expect(resolveProfile(env, template, get(withBinding({ name: "SUPABASE", type: "hyperdrive", id: "cccccccccccccccccccccccccccccccc" })))).rejects.toThrow(/drop live Hyperdrive binding SUPABASE/);
+    // Control: the rendered Hyperdrive binding with the deploy id is not a change.
+    await expect(resolveProfile(env, template, get(withBinding({ name: "SUPABASE", type: "hyperdrive", id: env.HYPERDRIVE_ID })))).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+  });
+  test("default deploy refuses an unknown live binding type and a secret shadowed by a rendered variable", async () => {
+    const withBinding = (extra: Record<string, string>) => { const v = version(); (v.resources.bindings as Array<Record<string, string>>).push(extra); return v; };
+    await expect(resolveProfile(env, template, get(withBinding({ name: "FIXTURE_QUEUE", type: "queue" })))).rejects.toThrow(/cannot compare live binding FIXTURE_QUEUE/);
+    await expect(resolveProfile(env, template, get(withBinding({ name: "CLICKHOUSE_DATABASE", type: "secret_text" })))).rejects.toThrow(/replacing secret binding CLICKHOUSE_DATABASE/);
   });
   test("default deploy accepts unchanged unrelated variables and checks the real CLI overrides", async () => {
     const base = ts.parseConfigFileTextToJson("base.jsonc", template).config;
@@ -128,9 +137,88 @@ describe("preserve the deployed Reader profile", () => {
   });
   test("the workflow resolves before render and checks S3 secrets for the effective profile", () => {
     const workflow = readFileSync(new URL("../../../.github/workflows/deploy-session-read-worker.yml", import.meta.url), "utf8");
-    expect(workflow).toContain('default: "preserve"');
+    expect(workflow).toContain('default: "profile"');
+    expect(workflow).toMatch(/^ {6}DEPLOY_TARGET: production$/m);
     expect(workflow.indexOf("run: bun run scripts/resolve-deploy-profile.ts")).toBeLessThan(workflow.indexOf("run: |\n          grep -q"));
     expect(workflow).toContain("if: steps.resolve-profile.outputs.owner_buffered == 'on'");
     expect(workflow).toContain("OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: ${{ inputs.owner_buffered_statement_timeout_ms }}");
+  });
+});
+
+describe("committed production profile (DEPLOY_TARGET=production)", () => {
+  const prod = { ...env, OWNER_BUFFERED: "profile", DEPLOY_TARGET: "production", OWNER_BUFFERED_EVENTS: "profile", OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "profile" };
+  const committed = parseCommittedProfile(readFileSync(new URL("../deploy/production-profile.json", import.meta.url), "utf8"));
+  const render = (resolved: Record<string, string>, base: Record<string, string> = prod) => ts.parseConfigFileTextToJson("config.jsonc", renderDeployConfig(template, profileInputs({ ...base, ...resolved }))).config;
+  const withoutTimeout = Object.fromEntries(Object.entries(values).filter(([name]) => name !== "READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS"));
+
+  test("the committed file is exactly the known production profile, with no workspace id", () => {
+    expect(committed).toEqual({ OWNER_BUFFERED: "on", OWNER_BUFFERED_WORKSPACES: "*", OWNER_BUFFERED_EVENTS: "on", OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "6000" });
+  });
+  test("a default dispatch (workflow defaults, no inputs) renders the committed profile", async () => {
+    for (const base of [prod, { ...env, OWNER_BUFFERED: "", DEPLOY_TARGET: "production" }]) {
+      const resolved = await resolveProfile(base, template, get());
+      expect(resolved).toMatchObject({ OWNER_BUFFERED: "on", OWNER_BUFFERED_WORKSPACES: "*", OWNER_BUFFERED_EVENTS: "on", OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "6000", DIRECTORY_WORKSPACES: "*", PRESERVED_READER_VERSION: id });
+      expect(render(resolved, base).vars).toMatchObject({ ...values, READ_API_DIRECTORY_WORKSPACES: "" });
+      // The render step must never see the "profile" token.
+      expect(workflowEnvironment(resolved)).not.toContain("profile");
+    }
+  });
+  test("the restore case: live equal to the profile minus the timeout deploys with 6000", async () => {
+    const resolved = await resolveProfile(prod, template, get(version(withoutTimeout)));
+    expect(resolved.OWNER_BUFFERED_STATEMENT_TIMEOUT_MS).toBe("6000");
+    expect(render(resolved).vars.READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS).toBe("6000");
+    // #511's preserve would carry the loss forward; that remains the explicit opt-out.
+    expect((await resolveProfile({ ...prod, OWNER_BUFFERED: "preserve" }, template, get(version(withoutTimeout)))).OWNER_BUFFERED_STATEMENT_TIMEOUT_MS).toBe("off");
+  });
+  test("settings the profile does not own (search gate, index verify, S3) are preserved from live", async () => {
+    const resolved = await resolveProfile(prod, template, get(version({ ...values, READ_API_BUFFERED_SEARCH_GATE: "on", READ_API_OWNER_BUFFERED_INDEX_VERIFY: "on" })));
+    expect(resolved).toMatchObject({ BUFFERED_SEARCH_GATE: "on", OWNER_BUFFERED_INDEX_VERIFY: "on", OWNER_BUFFERED_S3_BUCKET: values.INGEST_S3_BUCKET });
+  });
+  test("live having more than the profile refuses (collateral drop or change)", async () => {
+    await expect(resolveProfile(prod, template, get(), { ...committed, OWNER_BUFFERED_EVENTS: "off" })).rejects.toThrow(/would change or drop the live owner_buffered_events/);
+    await expect(resolveProfile(prod, template, get(), { ...committed, OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "off" })).rejects.toThrow(/owner_buffered_statement_timeout_ms/);
+    await expect(resolveProfile(prod, template, get(version({ ...values, READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "5000" })))).rejects.toThrow(/change or drop/);
+    await expect(resolveProfile(prod, template, get(version({ ...values, READ_API_OWNER_BUFFERED_WORKSPACES: "fixture-workspace", READ_API_DIRECTORY_WORKSPACES: "fixture-workspace" })))).rejects.toThrow(/change or drop/);
+    await expect(resolveProfile(prod, template, get(), { OWNER_BUFFERED: "off", OWNER_BUFFERED_WORKSPACES: "", OWNER_BUFFERED_EVENTS: "off", OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "off" })).rejects.toThrow(/drop live owner-buffered/);
+    // The unmanaged-setting guard still applies in profile mode.
+    await expect(resolveProfile(prod, template, get(version({ ...values, READ_API_OUTPUT_ENABLED: "enabled-fixture" })))).rejects.toThrow(/change or drop live setting/);
+  });
+  test("a default dispatch never turns owner-buffered reads on from off", async () => {
+    const live = { id, resources: { bindings: [{ name: "READ_API_DIRECTORY_WORKSPACES", type: "plain_text", text: "*" }] } };
+    await expect(resolveProfile(prod, template, get(live))).rejects.toThrow(/does not turn them on/);
+  });
+  test("profile mode refuses child overrides and directory drift instead of half-applying them", async () => {
+    for (const [key, value] of [["OWNER_BUFFERED_EVENTS", "off"], ["OWNER_BUFFERED_STATEMENT_TIMEOUT_MS", "5000"], ["OWNER_BUFFERED_PHASE_LOG", "on"], ["OWNER_BUFFERED_WORKSPACES", "*"]]) {
+      await expect(resolveProfile({ ...prod, [key!]: value! }, template, get())).rejects.toThrow(/profile cannot/);
+    }
+    await expect(resolveProfile({ ...prod, DIRECTORY_WORKSPACES: "fixture-workspace" }, template, get())).rejects.toThrow(/differs from live/);
+  });
+  test("explicit inputs override the profile; unset children under explicit on fall back to it", async () => {
+    const on = { ...prod, OWNER_BUFFERED: "on", OWNER_BUFFERED_WORKSPACES: "", OWNER_BUFFERED_S3_BUCKET: values.INGEST_S3_BUCKET, OWNER_BUFFERED_S3_REGION: values.INGEST_S3_REGION };
+    expect(await resolveProfile(on, template, get())).toMatchObject({ OWNER_BUFFERED_WORKSPACES: "*", OWNER_BUFFERED_EVENTS: "on", OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "6000" });
+    const overridden = await resolveProfile({ ...on, OWNER_BUFFERED_EVENTS: "off", OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "4000" }, template, get());
+    expect(overridden).toMatchObject({ OWNER_BUFFERED_EVENTS: "off", OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "4000" });
+    expect(render(overridden, on).vars.READ_API_OWNER_BUFFERED_EVENTS).toBeUndefined();
+    expect((await resolveProfile({ ...on, OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "off" }, template, get())).OWNER_BUFFERED_STATEMENT_TIMEOUT_MS).toBe("off");
+    // Explicit off ignores the profile entirely.
+    expect(await resolveProfile({ ...prod, OWNER_BUFFERED: "off", DIRECTORY_WORKSPACES_INPUT: "off" }, template, async () => { throw Error("must not call"); }))
+      .toEqual({ OWNER_BUFFERED: "off", OWNER_BUFFERED_WORKSPACES: "", OWNER_BUFFERED_EVENTS: "off", OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "off", DIRECTORY_WORKSPACES: "" });
+  });
+  test("a non-production target ignores the profile: profile means preserve, explicit on renders only its inputs", async () => {
+    for (const target of [undefined, "dev", "Production"]) {
+      const other = { ...prod, DEPLOY_TARGET: target };
+      const resolved = await resolveProfile(other, template, get(version(withoutTimeout)), committed);
+      expect(resolved.OWNER_BUFFERED_STATEMENT_TIMEOUT_MS).toBe("off");
+      const on = await resolveProfile({ ...other, OWNER_BUFFERED: "on", OWNER_BUFFERED_WORKSPACES: "*", OWNER_BUFFERED_S3_BUCKET: values.INGEST_S3_BUCKET, OWNER_BUFFERED_S3_REGION: values.INGEST_S3_REGION }, template, get(), committed);
+      expect(on).toMatchObject({ OWNER_BUFFERED_EVENTS: "off", OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "off" });
+      await expect(resolveProfile({ ...other, OWNER_BUFFERED: "on" }, template, get(), committed)).rejects.toThrow(/needs owner_buffered_workspaces/);
+    }
+  });
+  test("a malformed committed profile refuses, including a workspace id in the repo", () => {
+    expect(() => parseCommittedProfile("not json")).toThrow(/valid JSON/);
+    expect(() => parseCommittedProfile(JSON.stringify({ owner_buffered: "on" }))).toThrow(/exactly/);
+    expect(() => parseCommittedProfile(JSON.stringify({ owner_buffered: "on", owner_buffered_workspaces: "fixture-workspace", owner_buffered_events: "on", owner_buffered_statement_timeout_ms: "6000" }))).toThrow(/no workspace ids/);
+    expect(() => parseCommittedProfile(JSON.stringify({ owner_buffered: "on", owner_buffered_workspaces: "*", owner_buffered_events: "on", owner_buffered_statement_timeout_ms: "6000", owner_buffered_phase_log: "on" }))).toThrow(/exactly/);
+    expect(() => parseCommittedProfile(JSON.stringify({ owner_buffered: "maybe", owner_buffered_workspaces: "*", owner_buffered_events: "on", owner_buffered_statement_timeout_ms: "6000" }))).toThrow(/on or off/);
   });
 });
