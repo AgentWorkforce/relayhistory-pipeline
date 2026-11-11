@@ -4,9 +4,9 @@
 import { appendFileSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
-import { CONTROL_HEAD_BINDING, parseCanaryWorkspaces, renderDeployConfig, type RenderInputs } from "./render-deploy-config.ts";
+import { CONTROL_HEAD_BINDING, parseCanaryWorkspaces, renderDeployConfig, RenderError, type RenderInputs } from "./render-deploy-config.ts";
 
-type Binding = { name?: unknown; type?: unknown; text?: unknown; service?: unknown; entrypoint?: unknown; environment?: unknown };
+type Binding = { name?: unknown; type?: unknown; text?: unknown; service?: unknown; entrypoint?: unknown; environment?: unknown; id?: unknown };
 type Version = { id?: unknown; resources?: { bindings?: Binding[] } };
 type Environment = Record<string, string | undefined>;
 
@@ -34,7 +34,59 @@ function activeVersion(d: unknown): string {
 }
 
 function need(ok: unknown, message: string): asserts ok {
-  if (!ok) throw new Error(message);
+  if (!ok) throw new ProfileError(message);
+}
+class ProfileError extends Error {}
+
+function directoryValue(value: string): string {
+  if (value && value !== "*") parseCanaryWorkspaces(value);
+  return value;
+}
+
+async function readLive(get: (path: string) => Promise<unknown>): Promise<{ id: string; version: Version }> {
+  const id = activeVersion(await get("/deployments"));
+  const version = await get(`/versions/${id}`) as Version;
+  need(version.id === id, "Live version identity mismatch");
+  return { id, version };
+}
+
+/** Omitted input/variable means preserve; only an explicit 'off' input clears the list. */
+function requestedDirectory(env: Environment): string | undefined {
+  const input = env.DIRECTORY_WORKSPACES_INPUT?.trim();
+  if (input) return directoryValue(input === "off" ? "" : input);
+  return env.DIRECTORY_WORKSPACES?.trim() ? directoryValue(env.DIRECTORY_WORKSPACES.trim()) : undefined;
+}
+
+function liveDirectory(version: Version): string {
+  const matches = version.resources?.bindings?.filter(b => b.name === "READ_API_DIRECTORY_WORKSPACES");
+  need(matches?.length === 1 && matches[0]?.type === "plain_text" && typeof matches[0].text === "string", "Live directory setting is missing or ambiguous; provide an explicit directory input");
+  return directoryValue(matches[0].text);
+}
+
+/** Refuse collateral changes instead of guessing how to preserve an unrelated binding. */
+export function unchangedOtherSettings(version: Version, template: string, env: Environment): void {
+  const rendered = ts.parseConfigFileTextToJson("rendered.jsonc", renderDeployConfig(template, profileInputs(env)));
+  need(!rendered.error, "Cannot compare rendered Reader settings");
+  const config = rendered.config;
+  const vars = { ...config.vars, READ_API_ORIGIN: env.ORIGIN ?? config.vars.READ_API_ORIGIN, READ_API_COMPLETE_SINCE: env.COMPLETE_SINCE ?? config.vars.READ_API_COMPLETE_SINCE };
+  for (const [key, name] of [["BRIEF_TITLES_WORKSPACES", "READ_API_BRIEF_TITLES_WORKSPACES"], ["TIMING_ASSUME_NO_TURNS", "READ_API_TIMING_ASSUME_NO_TURNS"]] as const) {
+    if (env[key]) vars[name] = env[key];
+  }
+  const managed = new Set<string>([...Object.values(VARIABLES), ...Object.values(FLAGS).map(([name]) => name)]);
+  for (const b of version.resources?.bindings ?? []) {
+    need(typeof b.name === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(b.name), "Invalid live binding name");
+    const name = b.name;
+    if (managed.has(name) || name === CONTROL_HEAD_BINDING.binding) continue;
+    if (b.type === "secret_text") {
+      need(!(name in vars), `Preserve refuses replacing secret binding ${name} with a plain variable`);
+    } else if (b.type === "plain_text") {
+      need(vars[name] === b.text, `Preserve would change or drop live setting ${name}; review the explicit deployment configuration`);
+    } else if (b.type === "hyperdrive") {
+      need(config.hyperdrive?.some((v: { binding?: string; id?: string }) => v.binding === name && v.id === b.id), `Preserve would change or drop live Hyperdrive binding ${name}`);
+    } else if (b.type === "service") {
+      need(config.services?.some((v: { binding?: string; service?: string; entrypoint?: string; environment?: string }) => v.binding === name && v.service === b.service && v.entrypoint === b.entrypoint && (v.environment ?? "production") === (b.environment ?? "production")), `Preserve would change or drop live service binding ${name}`);
+    } else throw new ProfileError(`Preserve cannot compare live binding ${name}; explicit deployment review required`);
+  }
 }
 
 export function preservedProfile(version: Version): Record<string, string> {
@@ -58,8 +110,7 @@ export function preservedProfile(version: Version): Record<string, string> {
   }
   for (const [key, name] of Object.entries(VARIABLES)) env[key] = text(name);
   for (const k of ["OWNER_BUFFERED_STAGE_CONCURRENCY", "OWNER_BUFFERED_STATEMENT_TIMEOUT_MS"]) env[k] ||= "off";
-  const directory = env.DIRECTORY_WORKSPACES!;
-  if (directory && directory !== "*") parseCanaryWorkspaces(directory);
+  directoryValue(env.DIRECTORY_WORKSPACES!);
   const control = bindings.find((b) => b.name === CONTROL_HEAD_BINDING.binding);
   if (env.OWNER_BUFFERED === "on" || env.BUFFERED_SEARCH_GATE === "on") {
     need(control?.type === "service" && control.service === CONTROL_HEAD_BINDING.service && control.entrypoint === CONTROL_HEAD_BINDING.entrypoint && (control.environment === undefined || control.environment === "production"), "Live control-head binding does not match the pinned privacy authority");
@@ -91,11 +142,18 @@ export async function resolveProfile(env: Environment, template: string, get: (p
       need(!env[key] || env[key] === "off", "preserve cannot be combined with feature overrides; explicitly choose on/off");
     }
     need(!env.OWNER_BUFFERED_WORKSPACES, "preserve cannot change the workspace allowlist");
-    const id = activeVersion(await get("/deployments"));
-    const version = await get(`/versions/${id}`) as Version;
-    need(version.id === id, "Live version identity mismatch");
+    const { id, version } = await readLive(get);
     resolved = { ...preservedProfile(version), PRESERVED_READER_VERSION: id };
-  } else resolved = { OWNER_BUFFERED: mode };
+    const requested = requestedDirectory(env);
+    need(requested === undefined || requested === resolved.DIRECTORY_WORKSPACES, "Directory input/environment differs from live; choose explicit owner_buffered=on/off to change the directory list");
+    unchangedOtherSettings(version, template, { ...env, ...resolved });
+  } else {
+    const directory = requestedDirectory(env);
+    if (directory === undefined) {
+      const { id, version } = await readLive(get);
+      resolved = { OWNER_BUFFERED: mode, DIRECTORY_WORKSPACES: liveDirectory(version), PRESERVED_READER_VERSION: id };
+    } else resolved = { OWNER_BUFFERED: mode, DIRECTORY_WORKSPACES: directory };
+  }
   // Use the same validation as the real render: no weaker second interpretation of privacy flags.
   renderDeployConfig(template, profileInputs({ ...env, ...resolved }));
   return resolved;
@@ -149,8 +207,9 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
       appendFileSync(process.env.GITHUB_OUTPUT, `owner_buffered=${resolved.OWNER_BUFFERED}\n`);
       console.log(`Reader profile validated: owner-buffered ${resolved.OWNER_BUFFERED}; no provider writes`);
     }
-  } catch {
-    console.error("::error::Reader profile could not be preserved/validated. No deploy; review the explicit configuration.");
+  } catch (error) {
+    const reason = error instanceof ProfileError || error instanceof RenderError ? error.message : "Live profile could not be read or parsed";
+    console.error(`::error::Reader profile refused: ${reason}. No deploy.`);
     process.exitCode = 1;
   }
 }

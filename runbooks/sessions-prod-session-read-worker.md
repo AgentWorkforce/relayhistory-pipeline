@@ -252,6 +252,21 @@ set `owner_buffered_statement_timeout_ms` to an integer from 2000 through 6000.
 `owner_buffered_statement_timeout_ms=off` keeps the runtime's default timeout. Changing feature settings remains an
 operator-approved production action; this source change does not enable history.
 
+The explicit on/off modes use the supplied child inputs; they do not inherit
+event/concurrency/index/search flags. Review those inputs as a complete profile.
+The `directory_workspaces` input takes precedence over
+`SESSION_READ_DIRECTORY_WORKSPACES`. Use workspace ids or `*`, or explicitly
+`off` to clear it. If neither input nor variable is set, even an explicit
+buffered on/off change preserves the live directory list. In preserve mode,
+a differing nonempty variable or input is refused instead of silently ignored;
+choose explicit on/off to make a reviewed configuration change.
+
+Default deploys also compare all other live plain settings and nonsecret
+bindings with the rendered config and actual CLI overrides. If a setting or
+service/Hyperdrive binding would change or disappear, the deploy is refused.
+This guard does not copy unknown bindings or secrets into a new profile.
+
+
 Previously a no-input code deploy omitted active owner-buffered/event flags
 and the control binding. A subsequent read returned an empty 200, so a successful
 health check did not prove session visibility. Restoring an intended profile must be followed by a

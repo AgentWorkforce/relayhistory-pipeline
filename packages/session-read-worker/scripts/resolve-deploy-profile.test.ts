@@ -59,8 +59,37 @@ describe("preserve the deployed Reader profile", () => {
     expect(ts.parseConfigFileTextToJson("config.jsonc", renderDeployConfig(template, profileInputs({ ...env, ...resolved }))).config.services).toBeUndefined();
   });
   test("explicit off disables without fetching live metadata", async () => {
-    const resolved = await resolveProfile({ ...env, OWNER_BUFFERED: "off" }, template, async () => { throw Error("must not call"); });
-    expect(resolved).toEqual({ OWNER_BUFFERED: "off" });
+    const resolved = await resolveProfile({ ...env, OWNER_BUFFERED: "off", DIRECTORY_WORKSPACES_INPUT: "off" }, template, async () => { throw Error("must not call"); });
+    expect(resolved).toEqual({ OWNER_BUFFERED: "off", DIRECTORY_WORKSPACES: "" });
+  });
+  test("explicit buffered on/off cannot erase the directory just because its environment variable is unset", async () => {
+    const off = await resolveProfile({ ...env, OWNER_BUFFERED: "off" }, template, get());
+    expect(off.DIRECTORY_WORKSPACES).toBe("*");
+    const on = await resolveProfile({ ...env, OWNER_BUFFERED: "on", OWNER_BUFFERED_WORKSPACES: "*", OWNER_BUFFERED_S3_BUCKET: values.INGEST_S3_BUCKET, OWNER_BUFFERED_S3_REGION: values.INGEST_S3_REGION }, template, get());
+    expect(on.DIRECTORY_WORKSPACES).toBe("*");
+    expect(on.PRESERVED_READER_VERSION).toBe(id);
+  });
+  test("preserve refuses directory drift instead of silently ignoring operator intent", async () => {
+    await expect(resolveProfile({ ...env, DIRECTORY_WORKSPACES: "fixture-workspace" }, template, get())).rejects.toThrow(/differs from live/);
+    await expect(resolveProfile({ ...env, DIRECTORY_WORKSPACES_INPUT: "off" }, template, get())).rejects.toThrow(/differs from live/);
+  });
+  test("an explicit configuration change can narrow the directory and owner lists", async () => {
+    const narrowed = await resolveProfile({ ...env, OWNER_BUFFERED: "on", DIRECTORY_WORKSPACES_INPUT: "fixture-workspace", OWNER_BUFFERED_WORKSPACES: "fixture-workspace", OWNER_BUFFERED_S3_BUCKET: values.INGEST_S3_BUCKET, OWNER_BUFFERED_S3_REGION: values.INGEST_S3_REGION }, template, async () => { throw Error("must not call"); });
+    expect(narrowed.DIRECTORY_WORKSPACES).toBe("fixture-workspace");
+  });
+  test.each(["READ_API_REPEATABLE_READ", "READ_API_OUTPUT_ENABLED", "READ_API_DIGEST_ENABLED", "RELAYCONTROL_ORIGIN"])("default deploy refuses dropping unrelated live setting %s", async name => {
+    await expect(resolveProfile(env, template, get(version({ ...values, [name]: "enabled-fixture" })))).rejects.toThrow(/change or drop live setting/);
+  });
+  test("default deploy refuses dropping an unrelated service or Hyperdrive binding", async () => {
+    const digest = version(); digest.resources.bindings.push({ ...control, name: "DIGEST_NARRATIVE", service: "fixture-digest" });
+    await expect(resolveProfile(env, template, get(digest))).rejects.toThrow(/drop live service binding/);
+    const drive = version(); Object.assign(drive.resources.bindings[0]!, { name: "OTHER_DATABASE", type: "hyperdrive", id: "cccccccccccccccccccccccccccccccc" });
+    await expect(resolveProfile(env, template, get(drive))).rejects.toThrow();
+  });
+  test("default deploy accepts unchanged unrelated variables and checks the real CLI overrides", async () => {
+    const base = ts.parseConfigFileTextToJson("base.jsonc", template).config;
+    await expect(resolveProfile(env, template, get(version({ ...values, CLICKHOUSE_DATABASE: base.vars.CLICKHOUSE_DATABASE })))).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+    await expect(resolveProfile({ ...env, BRIEF_TITLES_WORKSPACES: "fixture-workspace" }, template, get(version({ ...values, READ_API_BRIEF_TITLES_WORKSPACES: "fixture-workspace" })))).resolves.toHaveProperty("OWNER_BUFFERED", "on");
   });
   test.each(["OWNER_BUFFERED_EVENTS", "OWNER_BUFFERED_PHASE_LOG", "OWNER_BUFFERED_INDEX_VERIFY", "BUFFERED_SEARCH_GATE", "OWNER_BUFFERED_WORKSPACES"])("preserve refuses a conflicting %s override", async key => {
     await expect(resolveProfile({ ...env, [key]: "on" }, template, get())).rejects.toThrow(/preserve/);

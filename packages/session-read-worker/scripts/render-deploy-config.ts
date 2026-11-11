@@ -1,7 +1,8 @@
 /**
  * Renders wrangler.deploy.jsonc for .github/workflows/deploy-session-read-worker.yml.
  *
- * owner_buffered=off (the default, and every dispatch without inputs): exactly the old
+ * The workflow first resolves its preserve/default mode to explicit inputs here.
+ * owner_buffered=off (this low-level renderer's default): exactly the old
  * `sed` substitution of the Hyperdrive placeholder, byte for byte. No service binding, no
  * owner-buffered var: the deployed Worker is the one deployed before this script existed.
  *
@@ -66,7 +67,8 @@
  *   OWNER_BUFFERED_S3_BUCKET, OWNER_BUFFERED_S3_REGION, DIRECTORY_WORKSPACES,
  *   BUFFERED_SEARCH_GATE (off|on; empty = off), OWNER_BUFFERED_EVENTS (off|on; empty = off),
  *   OWNER_BUFFERED_STAGE_CONCURRENCY (off|2..32; empty = off), OWNER_BUFFERED_PHASE_LOG (off|on; empty = off),
- *   OWNER_BUFFERED_INDEX_VERIFY (off|on; empty = off).
+ *   OWNER_BUFFERED_INDEX_VERIFY (off|on; empty = off),
+ *   OWNER_BUFFERED_STATEMENT_TIMEOUT_MS (off|2000..6000; empty = off).
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";

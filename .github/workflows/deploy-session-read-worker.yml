@@ -13,6 +13,7 @@ name: deploy session-read-worker
 # Environment secret: CLOUDFLARE_API_TOKEN (Workers Scripts:Edit, Hyperdrive:Read).
 #
 # Owner-buffered reads (Option C, src/session-read-api/owner-buffered.ts): preserve on redeploy.
+# Child inputs below apply when owner_buffered is explicitly on/off.
 # A dispatch without inputs preserves the current live buffered-read profile and directory
 # allowlist. An explicit owner_buffered=off disables it. Preservation reads metadata only
 # and refuses unavailable, split or inconsistent live configuration. owner_buffered=on renders
@@ -75,6 +76,10 @@ on:
         description: 'Canary workspace ids, comma-separated, or exactly "*" for all workspaces (only if SESSION_READ_DIRECTORY_WORKSPACES is "*"); required when on'
         type: string
         default: ""
+      directory_workspaces:
+        description: 'Directory ids or "*"; "off" explicitly disables. Empty uses the environment variable when set, otherwise preserves live. Changes require explicit owner_buffered=on/off.'
+        type: string
+        default: ""
       owner_buffered_events:
         description: Owner-buffered session events (GET /v1/sessions/:id/events with source); valid only with owner_buffered=on. off = exactly the owner_buffered render
         type: choice
@@ -130,6 +135,7 @@ jobs:
       ORIGIN: ${{ vars.SESSION_READ_ORIGIN }}
       COMPLETE_SINCE: ${{ vars.SESSION_READ_COMPLETE_SINCE }}
       DIRECTORY_WORKSPACES: ${{ vars.SESSION_READ_DIRECTORY_WORKSPACES }}
+      DIRECTORY_WORKSPACES_INPUT: ${{ inputs.directory_workspaces }}
       BRIEF_TITLES_WORKSPACES: ${{ vars.SESSION_READ_BRIEF_TITLES_WORKSPACES }}
       TIMING_ASSUME_NO_TURNS: ${{ vars.SESSION_READ_TIMING_ASSUME_NO_TURNS }}
       # Owner-buffered (default off); inputs reach the shell only through env.
