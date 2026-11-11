@@ -6,13 +6,15 @@
 -- read). Three places check sessions.session_erasure_fences:
 --  * sessions.ingest_claim_batch_mode, after the batch-id answers (receipt, replay, 409) and before step (b);
 --  * sessions.ingest_commit_batch and sessions.ingest_commit_buffered_batch, before ingest_attempt_fenced;
---  * a BEFORE INSERT OR UPDATE trigger on sessions.session_index (upsert_session_index and every other
---    writer): a live pointer row for a fenced id (session_id or canonical_session_id) is skipped.
+--  * BEFORE INSERT OR UPDATE row guards on session_index and session_directory: a live row for
+--    a fenced physical or canonical id is skipped, including delayed directory projection.
 --
 -- The check (lead ruling, hot path of the claim timeouts): a plain read of the fence primary key
 -- (org_id, workspace_id, source, session_id), all four columns, one probe per distinct pair of the
--- batch, no FOR UPDATE/SHARE and no lock beyond those the caller already holds. Nothing else runs
--- unless a fence matches.
+-- batch, without locking the fence rows. The separate common writer gate below runs before USER
+-- and pointer/directory row locks: the user-fence path gains one fixed shared advisory acquisition,
+-- including claims/commits/ACKs. Ordinary writers share it; erase owns it exclusively. The probe's
+-- selection extension runs only if a permanent fence matches.
 --
 -- On a match, a pair this user and origin have not already deselected is deselected now with
 -- sessions.ingest_apply_selection (enabled:false), the same write sessions.ingest_set_session_uploads
@@ -23,7 +25,8 @@
 -- control path, which cannot be driven from here: the call is refused with RH012 (not retryable).
 -- 050000 refuses to erase in such an org, so this only happens if the org became ordered after an erase.
 --
--- Function bodies are 20261105043850's, byte for byte, plus one PERFORM each; owners and ACLs are kept.
+-- Claim/commit bodies are 043850's plus one fence PERFORM each. Publication scope and buffer GC
+-- preserve their predecessor bodies plus GLOBAL-before-USER acquisition. Owners and ACLs are kept.
 
 CREATE FUNCTION sessions.ingest_erase_fence_extend(p_org text,p_ws text,p_user text,p_origin text,p_pairs jsonb)
 RETURNS integer

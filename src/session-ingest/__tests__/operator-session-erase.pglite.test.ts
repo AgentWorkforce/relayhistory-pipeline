@@ -487,3 +487,15 @@ test("a canonical identity reused as another session's physical alias refuses be
  expect((await d.db.query("SELECT 1 FROM sessions.session_erasure_fences")).rows).toEqual([]);
  expect((await d.db.query("SELECT 1 FROM sessions.session_index WHERE deleted_at IS NULL")).rows).toHaveLength(2);
 });
+
+test("the common gate is enabled before every owner/index/directory statement lock",async()=>{
+ const d=await database();
+ expect((await d.db.query(`SELECT c.relname AS relation,g.tgtype::integer AS events,g.tgenabled AS enabled
+  FROM pg_trigger g JOIN pg_class c ON c.oid=g.tgrelid
+  WHERE NOT g.tgisinternal AND g.tgfoid='sessions.ingest_erase_fence_index_lock()'::regprocedure
+  ORDER BY c.relname`)).rows).toEqual([
+  {relation:"ingest_fence_owners",events:22,enabled:"O"},
+  {relation:"session_directory",events:30,enabled:"O"},
+  {relation:"session_index",events:30,enabled:"O"},
+ ]);
+});

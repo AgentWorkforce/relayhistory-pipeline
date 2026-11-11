@@ -97,7 +97,7 @@ test("lazy_records fails closed (40001) outside READ COMMITTED; the same claim s
   expect((await f.run("SELECT sessions.ingest_claim_buffered_batch($1::jsonb) AS r", [payload]) as any).rows[0].r.kind).toBeDefined();
 });
 
-test("lock footprint: a 500-record claim holds exactly ONE advisory lock, the (org, ws, origin) key split as pg_advisory_xact_lock(bigint)", async () => {
+test("lock footprint: a 500-record claim holds exactly one origin lock and one fixed shared erase gate", async () => {
   const f = await fixture();
   let payload: unknown;
   const ids = Array.from({ length: 500 }, (_, i) => `fp-${i}`);
@@ -117,8 +117,11 @@ test("lock footprint: a 500-record claim holds exactly ONE advisory lock, the (o
     expect((await f.db.query(locks)).rows).toEqual([]);
     expect(((await f.db.query<{ r: any }>("SELECT sessions.ingest_claim_buffered_batch($1::jsonb) AS r", [payload])).rows[0]!.r).kind).toBe("claimed");
     const held = (await f.db.query(locks)).rows;
-    expect(held.length).toBeLessThanOrEqual(1); // upper bound: never one per record
-    expect(held).toEqual([{ ...want, objsubid: 1, mode: "ExclusiveLock", granted: true }]);
+    expect(held).toHaveLength(2); // constant per transaction, never per record
+    expect(held).toEqual(expect.arrayContaining([
+      { ...want, objsubid: 1, mode: "ExclusiveLock", granted: true },
+      { classid:"961996",objid:"50000",objsubid:2,mode:"ShareLock",granted:true },
+    ]));
   } finally { await f.db.exec("ROLLBACK"); }
 });
 
