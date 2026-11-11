@@ -91,6 +91,11 @@ export function ownerBufferedEnabled(raw: string | undefined): boolean {
   return value === "1" || value === "true";
 }
 
+/** Selects the exact-session RPC added by 047010; default off. Unknown values stay off. */
+export function ownerBufferedExactSessionEnabled(raw: string | undefined): boolean {
+  return raw === "on";
+}
+
 export const OWNER_BUFFERED_EVENTS_FLAG = "READ_API_OWNER_BUFFERED_EVENTS";
 
 /** READ_API_OWNER_BUFFERED_EVENTS holds a value other than unset, empty or "on". Names the field, never the value. */
@@ -851,6 +856,9 @@ export const BUFFERED_STAGES_SQL =
   `SELECT batch_id, stage_key, stage_sha256, stage_bytes, group_indexes, group_ordinals, kept_ordinals, reset_epoch, accepted_at, admission_epoch, admission_version::text AS admission_version ` +
   `FROM sessions.buffered_session_stages_for(p_workspace => $1, ${HEAD_ARGS}, p_source => $9, p_session_id => $10)`;
 
+/** Same scope/head/source/session arguments; only the closed RPC name changes. */
+export const BUFFERED_TARGET_STAGES_SQL = BUFFERED_STAGES_SQL.replace("sessions.buffered_session_stages_for(", "sessions.buffered_session_stages_for_target(");
+
 export function statementTimeoutSql(ms: number = BUFFERED_STATEMENT_TIMEOUT_MS): string {
   if (!Number.isSafeInteger(ms) || ms < 1 || ms > 30_000) throw new Error("buffered statement timeout out of range");
   return `SET LOCAL statement_timeout = ${ms}`;
@@ -924,7 +932,7 @@ function stageRow(raw: Record<string, unknown>): BufferedStageRow {
  * (which binds bulls96_read.org_id / workspace_id): a per-transaction statement_timeout, the
  * user binding, then the RPC with the observed head. No row lock, no write.
  */
-export function sqlOwnerBufferedReads(run: TenantRunner, options: { statementTimeoutMs?: number } = {}): OwnerBufferedReads {
+export function sqlOwnerBufferedReads(run: TenantRunner, options: { statementTimeoutMs?: number; exactSession?: boolean } = {}): OwnerBufferedReads {
   const timeout = statementTimeoutSql(options.statementTimeoutMs ?? BUFFERED_STATEMENT_TIMEOUT_MS);
   const call = async (scope: BufferedScope, sql: string, params: unknown[]) => {
     try {
@@ -950,7 +958,7 @@ export function sqlOwnerBufferedReads(run: TenantRunner, options: { statementTim
       return rows.map((r) => sessionRow(r, scope));
     },
     async stages(scope, authority, source, sessionId) {
-      const rows = await call(scope, BUFFERED_STAGES_SQL, [scope.workspaceId, ...head(authority), source, sessionId]);
+      const rows = await call(scope, options.exactSession === true ? BUFFERED_TARGET_STAGES_SQL : BUFFERED_STAGES_SQL, [scope.workspaceId, ...head(authority), source, sessionId]);
       return rows.map(stageRow);
     },
   };

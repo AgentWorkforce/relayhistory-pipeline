@@ -25,6 +25,7 @@ const VARIABLES = {
   OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: "READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS",
 } as const;
 const FLAGS = {
+  OWNER_BUFFERED_EXACT_SESSION: ["READ_API_OWNER_BUFFERED_EXACT_SESSION", ["on"]],
   OWNER_BUFFERED: ["RELAYHISTORY_READ_OWNER_BUFFERED", ["true", "1"]],
   OWNER_BUFFERED_EVENTS: ["READ_API_OWNER_BUFFERED_EVENTS", ["on"]],
   OWNER_BUFFERED_PHASE_LOG: ["READ_API_OWNER_BUFFERED_PHASE_LOG", ["1"]],
@@ -52,7 +53,7 @@ const PROFILE_FILE_KEYS: Record<string, keyof CommittedProfile> = {
 };
 const PROFILE_CHILDREN = ["OWNER_BUFFERED_WORKSPACES", "OWNER_BUFFERED_EVENTS", "OWNER_BUFFERED_STATEMENT_TIMEOUT_MS"] as const;
 /** Not in the committed profile: profile mode preserves these from live exactly as preserve mode does. */
-const LIVE_ONLY_CHILDREN = ["OWNER_BUFFERED_STAGE_CONCURRENCY", "OWNER_BUFFERED_PHASE_LOG", "OWNER_BUFFERED_INDEX_VERIFY", "BUFFERED_SEARCH_GATE"] as const;
+const LIVE_ONLY_CHILDREN = ["OWNER_BUFFERED_EXACT_SESSION", "OWNER_BUFFERED_STAGE_CONCURRENCY", "OWNER_BUFFERED_PHASE_LOG", "OWNER_BUFFERED_INDEX_VERIFY", "BUFFERED_SEARCH_GATE"] as const;
 const PROFILE_FILE = new URL("../deploy/production-profile.json", import.meta.url);
 
 /** Strict: exactly the four keys; workspaces only "*" (never a workspace id in the repo). Values are re-validated by the render. */
@@ -174,7 +175,7 @@ export function profileInputs(env: Environment): RenderInputs {
     hyperdriveId: env.HYPERDRIVE_ID ?? "", ownerBuffered: env.OWNER_BUFFERED,
     ownerBufferedWorkspaces: env.OWNER_BUFFERED_WORKSPACES, directoryWorkspaces: env.DIRECTORY_WORKSPACES,
     s3Bucket: env.OWNER_BUFFERED_S3_BUCKET, s3Region: env.OWNER_BUFFERED_S3_REGION,
-    ownerBufferedEvents: env.OWNER_BUFFERED_EVENTS, bufferedSearchGate: env.BUFFERED_SEARCH_GATE,
+    ownerBufferedEvents: env.OWNER_BUFFERED_EVENTS, ownerBufferedExactSession: env.OWNER_BUFFERED_EXACT_SESSION, bufferedSearchGate: env.BUFFERED_SEARCH_GATE,
     ownerBufferedStageConcurrency: env.OWNER_BUFFERED_STAGE_CONCURRENCY,
     ownerBufferedPhaseLog: env.OWNER_BUFFERED_PHASE_LOG, ownerBufferedIndexVerify: env.OWNER_BUFFERED_INDEX_VERIFY,
     ownerBufferedStatementTimeoutMs: env.OWNER_BUFFERED_STATEMENT_TIMEOUT_MS,
