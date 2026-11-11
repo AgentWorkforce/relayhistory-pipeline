@@ -8,7 +8,10 @@
 import { createHash } from "node:crypto";
 import { RELEASE_TARGET_STEP } from "../../src/hoopdb/schema-release-contract.ts";
 
-/** The failure injections, each proven by its exact refusal (or, late-step, by a clean rerun). */
+/**
+ * The failure injections, each proven by its exact refusal (or, late-step and
+ * missing-bootstrap, by the refusal and then a clean rerun).
+ */
 export const INJECTIONS = [
   "none",
   "ledger-gap",
@@ -16,6 +19,7 @@ export const INJECTIONS = [
   "late-step",
   "wrong-generation",
   "stale-plan",
+  "missing-bootstrap",
 ] as const;
 export type Injection = (typeof INJECTIONS)[number];
 
@@ -26,6 +30,9 @@ export const INJECTION_REFUSAL: Record<Exclude<Injection, "none">, string> = {
   "late-step": "rehearsal_injected_late_step",
   "wrong-generation": "release_target_generation_changed",
   "stale-plan": "release_ledger_changed",
+  // R2-bootstrap skipped: the first step granting to a role only the release tree's
+  // bootstrap chain creates (046000 -> bulls96_analysis_admit) fails undefined_object.
+  "missing-bootstrap": "42704",
 };
 
 /**
@@ -471,4 +478,137 @@ export function resultRecord(
 export function errorCode(error: unknown): string {
   const code = (error as { code?: unknown } | null)?.code;
   return typeof code === "string" && /^[a-zA-Z0-9_]{1,64}$/.test(code) ? code : "rehearsal_failed";
+}
+
+// ---- R2-bootstrap: the release tree's bootstrap chain applied before the apply.
+
+/**
+ * The roles the release tree's bootstrap chain may newly create over the landing chain's
+ * (046000's admission principal). Any other new role refuses.
+ */
+export const BOOTSTRAP_NEW_ROLES = ["bulls96_analysis_admit"] as const;
+/** pg_roles columns the stage snapshots: the name and the attribute flags, never a password or config. */
+export const ROLE_COLUMNS = [
+  "rolname",
+  "rolsuper",
+  "rolinherit",
+  "rolcreaterole",
+  "rolcreatedb",
+  "rolcanlogin",
+  "rolreplication",
+  "rolbypassrls",
+  "rolconnlimit",
+] as const;
+export interface RoleRow {
+  rolname: string;
+  rolsuper: boolean;
+  rolinherit: boolean;
+  rolcreaterole: boolean;
+  rolcreatedb: boolean;
+  rolcanlogin: boolean;
+  rolreplication: boolean;
+  rolbypassrls: boolean;
+  rolconnlimit: number;
+}
+/** One pg_auth_members edge touching a checked role; inherit/set are null before PostgreSQL 16. */
+export interface RoleEdge {
+  member: string;
+  role: string;
+  admin_option: boolean;
+  inherit_option: boolean | null;
+  set_option: boolean | null;
+}
+export interface BootstrapFileEvidence {
+  file: string;
+  release_sha256: string;
+  landing_sha256: string | null;
+  changed: boolean;
+}
+/** The flags a bootstrap-created role must have, all false: NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION. */
+const BARE_FALSE = ["rolsuper", "rolinherit", "rolcreaterole", "rolcreatedb", "rolcanlogin", "rolreplication", "rolbypassrls"] as const;
+
+/**
+ * The chain files R2-bootstrap applies: the release sha's bytes (git objects), each with
+ * its digest against the landing commit's. Release bytes missing refuses
+ * `rehearsal_bootstrap_bytes_missing`; a file absent at landing has landing_sha256 null.
+ */
+export function bootstrapFiles(files: readonly { file: string; release: string | undefined; landing: string | undefined }[]): {
+  files: BootstrapFileEvidence[];
+  texts: string[];
+} {
+  const out: BootstrapFileEvidence[] = [];
+  const texts: string[] = [];
+  for (const f of files) {
+    if (f.release === undefined) rehearsalRefuse("rehearsal_bootstrap_bytes_missing", { file: f.file });
+    const release_sha256 = sha256Utf8(f.release);
+    const landing_sha256 = f.landing === undefined ? null : sha256Utf8(f.landing);
+    out.push({ file: f.file, release_sha256, landing_sha256, changed: release_sha256 !== landing_sha256 });
+    texts.push(f.release);
+  }
+  return { files: out, texts };
+}
+
+const attrs = (r: RoleRow) => Object.fromEntries(ROLE_COLUMNS.filter((c) => c !== "rolname").map((c) => [c, r[c]]));
+const byName = (rows: readonly RoleRow[]) => new Map(rows.map((r) => [r.rolname, r]));
+
+/**
+ * R2-bootstrap's verdict and evidence from the pg_roles snapshots before and after the
+ * chain ran and the pg_auth_members edges touching `expected`. Refuses, in order:
+ * `rehearsal_bootstrap_unexpected_role` (a new role not in `expected`, or any new role
+ * while every chain file is unchanged from landing), `rehearsal_bootstrap_side_effect`
+ * (a role removed, a pre-existing role's attributes changed, or the row count not
+ * before + created), `rehearsal_bootstrap_role_contract` (an expected role present after
+ * that is not bare NOLOGIN, or has any inbound or outbound membership). Evidence: role
+ * names, attribute flags and edges only.
+ */
+export function bootstrapRefreshEvidence(x: {
+  files: readonly BootstrapFileEvidence[];
+  before: readonly RoleRow[];
+  after: readonly RoleRow[];
+  edges: readonly RoleEdge[];
+  applied: number;
+  expected?: readonly string[];
+}) {
+  const expected = x.expected ?? BOOTSTRAP_NEW_ROLES;
+  const before = byName(x.before);
+  const after = byName(x.after);
+  const sort = (a: string[]) => a.sort((p, q) => (p < q ? -1 : p > q ? 1 : 0));
+  const created = sort([...after.keys()].filter((n) => !before.has(n)));
+  const unexpected = created.filter((n) => !expected.includes(n));
+  if (unexpected.length) rehearsalRefuse("rehearsal_bootstrap_unexpected_role", { roles_created: created, unexpected });
+  if (created.length && !x.files.some((f) => f.changed))
+    rehearsalRefuse("rehearsal_bootstrap_unexpected_role", { roles_created: created, reason: "chain_unchanged" });
+  const removed = sort([...before.keys()].filter((n) => !after.has(n)));
+  const altered = sort(
+    [...before.keys()].filter((n) => after.has(n) && JSON.stringify(attrs(before.get(n)!)) !== JSON.stringify(attrs(after.get(n)!))),
+  );
+  if (removed.length || altered.length || x.after.length !== x.before.length + created.length)
+    rehearsalRefuse("rehearsal_bootstrap_side_effect", {
+      removed,
+      altered,
+      count_before: x.before.length,
+      count_after: x.after.length,
+    });
+  const roles = expected.map((name) => {
+    const r = after.get(name);
+    if (!r) return { name, present: false };
+    const edges = x.edges.filter((e) => e.member === name || e.role === name);
+    const seen = {
+      name,
+      present: true,
+      preexisting: before.has(name),
+      attributes: attrs(r),
+      members_in: edges.filter((e) => e.role === name),
+      member_of: edges.filter((e) => e.member === name),
+    };
+    if (BARE_FALSE.some((c) => r[c] !== false) || edges.length) rehearsalRefuse("rehearsal_bootstrap_role_contract", seen);
+    return seen;
+  });
+  return {
+    files: x.files.map((f) => ({ ...f })),
+    roles_created: created,
+    applied: x.applied,
+    roles,
+    role_count: { before: x.before.length, after: x.after.length },
+  };
 }

@@ -47,12 +47,48 @@ migrator lock, so it is listed in execution order below.
 | R7-pre | (clean runs where the baseline already has the 044030 overlap) synthetic lazy policy, seat and completeness at A; old and `{B,A}` Workers admit; the owner opens the A to B overlap. Otherwise SKIP. |
 | R1 plan | `inspectRelease` (READ ONLY; refuses `function_acl_drift`, `ledger_gap`, ...), `migrationTargetSplit` equal to an independently computed window, the target anchor at `generation`, `validateReleasePlan` on the plan built exactly as production builds it. |
 | R2 boundary | The planned boundary is safe and is still the previous body (prosrc not exact). |
+| R2-bootstrap | The release tree's bootstrap chain (`SESSION_BOOTSTRAP_FILES`, the release sha's bytes) applied before the apply; only `bulls96_analysis_admit` may appear, bare, with no memberships; no other role changes (see "R2-bootstrap" below). SKIP in the `missing-bootstrap` row. |
 | R4 apply | Production apply order (anchor helpers `targetAnchor`/`sameAnchor` imported from `scripts/schema-release-database.ts`): manifest anchor, inspection, ledger digest, boundary digest, pending window, generation, manifest, then `runMigrations` with `beforeWrite` re-anchoring and refreshing the boundary under the migrator lock, then the production read-backs and `verifyReleaseBoundary`. |
 | R3 boundary | The refreshed event-trigger body is the pinned body (`SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256`). |
 | R5 read-back | Ledger = seed plus the approved window exactly; target ledgered; no later same-lane or held step ledgered; marker PASS at `generation`. |
 | R6 ingest | `sessionIngestVars` with placeholder ids: during the overlap `INGEST_ACCEPT_GENERATIONS` is `A,B`; after it only `INGEST_EXPECT_GENERATION=B`. Evidence carries only those two keys. |
 | R7 fence | Old and `{B,A}` admit; `rebindIngestGeneration` rebinds and closes the overlap; old is refused `ledger_sqlstate_55000`; next and `{B,A}` admit. SKIP without R7-pre. |
 | R8 read | Only when 047010 is in the applied window and R7 passed: 17 mixed claims through the real ingest app, 170 groups, 6939 records; backfill and reader enabled; the target session's exact-stage read equals frozen 044090 with 17 stages and 177 kept ordinals, every `group_indexes = {0}`. Otherwise SKIP with the reason. |
+
+### R2-bootstrap: the operator's pre-apply chain refresh
+
+R0 applies the bootstrap chain at the baseline landing commit's bytes, which is what
+production ran then. A release step may grant to a role that only the RELEASE tree's
+chain creates: 046000 grants `sessions.analysis_request_v1` to `bulls96_analysis_admit`,
+which `supabase/bootstrap/session_read_api_roles.sql` provisions (bare NOLOGIN) only since
+05008dc6. The migrator never creates roles, so without the refresh the apply fails at
+046000 with SQLSTATE `42704` (undefined_object) after the earlier pending steps commit.
+
+In production that refresh is a gated, idempotent CI stage of the guarded release
+workflow with its own typed authorization (it reads back first, skips when the role
+already exists exactly, and the plan shows it). That stage is a separate change; until it
+exists such an apply fails closed with `42704`
+(`runbooks/guarded-session-schema-release.md`). R2-bootstrap models that CI stage.
+
+It runs after R2 and before R4. For each `SESSION_BOOTSTRAP_FILES` file it reads the
+release sha's bytes from the Git object database (never the working tree;
+`rehearsal_bootstrap_bytes_missing` when absent), snapshots `pg_roles` (names and
+attribute flags only), applies every file as the owner exactly as R0 does (owner
+SUPERUSER only for the chain, `hoopdb.db_mode` unset), snapshots again and reads the
+`pg_auth_members` edges of the new role. It refuses:
+
+- `rehearsal_bootstrap_unexpected_role`: a new role other than `bulls96_analysis_admit`,
+  or any new role while every file is byte-identical to the landing chain;
+- `rehearsal_bootstrap_side_effect`: a role removed, a pre-existing role's flags
+  changed, or the `pg_roles` row count not before plus created;
+- `rehearsal_bootstrap_role_contract`: `bulls96_analysis_admit` (new or pre-existing) not
+  exactly NOLOGIN NOINHERIT NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION,
+  or with any inbound member or outbound membership.
+
+Evidence: `files` (`file`, `release_sha256`, `landing_sha256`, `changed`),
+`roles_created` (sorted names), `applied`, `roles` (for `bulls96_analysis_admit`:
+`present`, `preexisting`, its attribute flags, `members_in`, `member_of`) and
+`role_count`. Never a password, setting or URL.
 
 ### R0 seeds with the landing migrator
 
@@ -97,6 +133,7 @@ A future row that holds such a step needs a separate change before it can rehear
 | Boundary drift | as the release | as the release | `boundary-drift` | `R4-boundary-drift` PASS: a PUBLIC EXECUTE default appears after the plan; apply refuses `function_boundary_unproven`; ledger unchanged. |
 | Late step | as the release | as the release | `late-step` | `R4-late-step` PASS: the target step fails after every earlier pending step is ledgered; marker pending at `generation`; then `R1-rerun`, R4, R3, R5 PASS (the rerun completes). |
 | Wrong generation | as the release | as the release | `wrong-generation` | `R4-wrong-generation` PASS: a flipped target generation fails `validateReleasePlan` (`release_plan_artifact`) and `runMigrations` refuses `release_target_generation_changed` before any write; ledger, marker and boundary unchanged. |
+| Missing bootstrap | as the release (window contains 046000) | as the release | `missing-bootstrap` | `R2-bootstrap` SKIP; `R4-missing-bootstrap` PASS: the apply refuses `42704` at the first step granting to a role only the release chain creates, the target is not ledgered; then `R2-bootstrap-rerun`, `R1-rerun`, R4, R3, R5 PASS. Refuses `rehearsal_injection_unavailable` when the chain is unchanged from landing or the role already exists. |
 | Stale plan | as the release | as the release | `stale-plan` | `R4-stale-plan` PASS: the ledger changes after the plan; production `runMigrations` (given the plan's stale ledger digest, as `releaseDatabase` passes it) refuses `release_ledger_changed` under the migrator lock before `beforeWrite`, and the release script order replayed by the driver refuses it too; nothing else written. |
 
 Run every row on all three majors (the dispatch matrix). Attach the `summary.json`

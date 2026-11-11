@@ -26,6 +26,13 @@
  *                commit found on the release sha's first-parent history at the dispatched
  *                generation, validateReleasePlan on the plan exactly as production builds it
  *   R2 boundary  the planned boundary is safe and still the previous body (prosrc not exact)
+ *   R2-bootstrap the operator's pre-apply chain refresh: every SESSION_BOOTSTRAP_FILES file
+ *                at the RELEASE sha's bytes (git objects) applied as the owner exactly as
+ *                R0 applies the landing bytes (idempotent; creates bare NOLOGIN roles a
+ *                release step grants to, e.g. bulls96_analysis_admit for 046000). Evidence:
+ *                per-file release/landing sha256 and changed flag, the sorted names of the
+ *                roles created (only BOOTSTRAP_NEW_ROLES may appear, bare, no memberships),
+ *                their flags and edges; no other role appears, disappears or changes
  *   R4 apply     the production apply order (anchor, inspection, ledger, boundary, window,
  *                generation, manifest, runMigrations with beforeWrite, read-backs)
  *   R3 boundary  the boundary refreshed under the migrator lock is the pinned body (runs
@@ -36,9 +43,11 @@
  *   R7 fence     old/next/both Workers around the owner rebind (needs the overlap, 044030)
  *   R8 read      the 047010 mixed-claim shape 17/170/6939/177 on real PostgreSQL
  * Injections (REHEARSAL_INJECT) prove each refusal: ledger-gap, boundary-drift, late-step,
- * wrong-generation, stale-plan. Every stage writes rehearsal-out/<stage>.json; the first
- * FAIL stops the run. REHEARSAL_EXPECT_REFUSAL (`<stage>:<code>`) marks a known-negative
- * row: the run then passes only if exactly that stage FAILs with exactly that code.
+ * wrong-generation, stale-plan, missing-bootstrap (R2-bootstrap skipped: the apply refuses
+ * 42704, then R2-bootstrap-rerun and R1-rerun complete the release as late-step does).
+ * Every stage writes rehearsal-out/<stage>.json; the first FAIL stops the run.
+ * REHEARSAL_EXPECT_REFUSAL (`<stage>:<code>`) marks a known-negative row: the run then
+ * passes only if exactly that stage FAILs with exactly that code.
  * The driver prints only `stage status code` lines and the verdict; the release
  * checkout's own modules (migrate.ts) also log their progress lines to stdout. The job
  * has no secrets, and evidence is screened (resultRecord) before it is written.
@@ -50,6 +59,9 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  BOOTSTRAP_NEW_ROLES,
+  bootstrapFiles,
+  bootstrapRefreshEvidence,
   disposableEnvRefusal,
   errorCode,
   expectedWindow,
@@ -73,6 +85,8 @@ import {
   seedStepBytes,
   validateInputs,
   type RehearsalInputs,
+  type RoleEdge,
+  type RoleRow,
   type Runner,
   type StageResult,
   type StageStatus,
@@ -703,6 +717,47 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
     return { safe: true, prosrcExact: false };
   });
 
+  // ---- R2-bootstrap: the release tree's bootstrap chain, before the apply (the
+  // production prerequisite: a release step may grant to a role only the release chain
+  // creates, and the migrator never creates roles). R0 applied the landing bytes; this is
+  // the release sha's, from git objects, applied the way R0 applies them.
+  const roleSnapshot = async () =>
+    (await admin.query("SELECT rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb, rolcanlogin, rolreplication, rolbypassrls, rolconnlimit FROM pg_roles ORDER BY rolname"))
+      .rows as RoleRow[];
+  const roleEdges = async (names: readonly string[]) =>
+    (
+      await admin.query(
+        `SELECT m.rolname AS member, r.rolname AS role, a.admin_option, ${Number(pgMajor) >= 16 ? "a.inherit_option, a.set_option" : "NULL::boolean AS inherit_option, NULL::boolean AS set_option"} FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member JOIN pg_roles r ON r.oid = a.roleid WHERE m.rolname = ANY($1::text[]) OR r.rolname = ANY($1::text[]) ORDER BY 1, 2`,
+        [[...names]],
+      )
+    ).rows as RoleEdge[];
+  const releaseBootstrap = () => {
+    const landing = landingCommit(sha, baseline);
+    return bootstrapFiles(
+      (SESSION_BOOTSTRAP_FILES as readonly string[]).map((file) => ({ file, release: gitText(sha, file), landing: gitText(landing, file) })),
+    );
+  };
+  const refreshBootstrap = async () => {
+    const { files, texts } = releaseBootstrap();
+    const before = await roleSnapshot();
+    // As R0: the owner (SUPERUSER only for the chain, then NOSUPERUSER again) on the admin
+    // session, hoopdb.db_mode unset, each file's psql meta lines dropped.
+    let applied = 0;
+    await admin.query(`ALTER ROLE ${P.owner} SUPERUSER; SET ROLE ${P.owner}`);
+    try {
+      for (const text of texts) {
+        await admin.query(psql(text));
+        applied++;
+      }
+    } finally {
+      await admin.query(`RESET ROLE; ALTER ROLE ${P.owner} NOSUPERUSER`);
+    }
+    const after = await roleSnapshot();
+    return bootstrapRefreshEvidence({ files, before, after, edges: await roleEdges(BOOTSTRAP_NEW_ROLES), applied });
+  };
+  if (inject === "missing-bootstrap") await emit("R2-bootstrap", "SKIP", { reason: "injection_missing_bootstrap" });
+  else await stage("R2-bootstrap", refreshBootstrap);
+
   // ---- R4: the production apply, in production order (schema-release-database.ts releaseDatabase).
   const apply = async (p: typeof planned, client: { query: (...a: any[]) => Promise<any> }, overrides: { targetGeneration?: string } = {}) => {
     const approved = p.approved;
@@ -822,6 +877,34 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
   }
 
   let applied!: Awaited<ReturnType<typeof apply>>;
+  if (inject === "missing-bootstrap") {
+    await stage("R4-missing-bootstrap", async () => {
+      // Only meaningful when the release chain differs from the landing chain and a role
+      // it would create is absent; otherwise there is nothing to prove.
+      const { files } = releaseBootstrap();
+      const names = new Set((await roleSnapshot()).map((r) => r.rolname));
+      if (!files.some((f) => f.changed) || BOOTSTRAP_NEW_ROLES.every((n) => names.has(n)))
+        rehearsalRefuse("rehearsal_injection_unavailable", { inject });
+      const r = await expectRefusal(INJECTION_REFUSAL["missing-bootstrap"], () => apply(planned, owner));
+      const ledger = await schemaLedger();
+      if (ledger.has(target)) rehearsalRefuse("rehearsal_missing_bootstrap_target_ledgered");
+      const m = await marker();
+      return {
+        ...r,
+        changedFiles: files.filter((f) => f.changed).map((f) => f.file),
+        pendingLedgered: firstPending.filter((n) => ledger.has(n)).length,
+        targetLedgered: false,
+        marker: m?.status ?? null,
+      };
+    });
+    // The operator's fix, then a fresh plan over the (possibly partially applied) database
+    // completes the release, as after late-step.
+    await stage("R2-bootstrap-rerun", refreshBootstrap);
+    await stage("R1-rerun", async () => {
+      planned = await makePlan();
+      return { expectedPending: planned.approved.expectedPending, targetGeneration: planned.approved.targetGeneration };
+    });
+  }
   if (inject === "late-step") {
     await stage("R4-late-step", async () => {
       const targetSql = await readFile((stepByName.get(target) as { path: string }).path, "utf8");

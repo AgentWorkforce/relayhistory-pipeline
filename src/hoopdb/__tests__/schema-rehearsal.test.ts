@@ -13,6 +13,9 @@ import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  BOOTSTRAP_NEW_ROLES,
+  bootstrapFiles,
+  bootstrapRefreshEvidence,
   checkLandingSeed,
   CONNECTION_ENV,
   disposableEnvRefusal,
@@ -37,6 +40,8 @@ import {
   seedSet,
   seedStepBytes,
   validateInputs,
+  type RoleEdge,
+  type RoleRow,
   type Runner,
 } from "../../../scripts/pg-proof/schema-rehearsal-core.ts";
 import { landingCommit } from "../../../scripts/pg-proof/schema-rehearsal.ts";
@@ -475,6 +480,116 @@ describe("small helpers", () => {
   });
 });
 
+describe("R2-bootstrap (the release tree's bootstrap chain before the apply)", () => {
+  const h = (t: string) => createHash("sha256").update(t).digest("hex");
+  const bare = (rolname: string, over: Partial<RoleRow> = {}): RoleRow => ({
+    rolname,
+    rolsuper: false,
+    rolinherit: false,
+    rolcreaterole: false,
+    rolcreatedb: false,
+    rolcanlogin: false,
+    rolreplication: false,
+    rolbypassrls: false,
+    rolconnlimit: -1,
+    ...over,
+  });
+  const BEFORE = [bare("bulls96_read_api"), bare("postgres", { rolcanlogin: true, rolcreaterole: true, rolinherit: true }), bare("supabase_admin", { rolsuper: true })];
+  const ADMIT = BOOTSTRAP_NEW_ROLES[0];
+  const changed = bootstrapFiles([
+    { file: "b/a.sql", release: "a", landing: "a" },
+    { file: "b/r.sql", release: "r2", landing: "r1" },
+  ]).files;
+  const same = bootstrapFiles([{ file: "b/a.sql", release: "a", landing: "a" }]).files;
+
+  test("bootstrapFiles: release bytes and digests, changed flags, landing absent is null, release missing refuses", () => {
+    const f = bootstrapFiles([
+      { file: "b/a.sql", release: "a", landing: "a" },
+      { file: "b/r.sql", release: "r2", landing: "r1" },
+      { file: "b/n.sql", release: "n", landing: undefined },
+    ]);
+    expect(f.texts).toEqual(["a", "r2", "n"]);
+    expect(f.files).toEqual([
+      { file: "b/a.sql", release_sha256: h("a"), landing_sha256: h("a"), changed: false },
+      { file: "b/r.sql", release_sha256: h("r2"), landing_sha256: h("r1"), changed: true },
+      { file: "b/n.sql", release_sha256: h("n"), landing_sha256: null, changed: true },
+    ]);
+    expect(code(() => bootstrapFiles([{ file: "b/x.sql", release: undefined, landing: "x" }]))).toBe("rehearsal_bootstrap_bytes_missing");
+  });
+  test("a changed chain creating the admission role: sorted names, flags, no edges, nothing else", () => {
+    const e = bootstrapRefreshEvidence({ files: changed, before: BEFORE, after: [...BEFORE, bare(ADMIT)], edges: [], applied: 2 });
+    expect(e.roles_created).toEqual([ADMIT]);
+    expect(e.applied).toBe(2);
+    expect(e.files.map((f) => f.changed)).toEqual([false, true]);
+    expect(e.role_count).toEqual({ before: 3, after: 4 });
+    const { rolname: _name, ...flags } = bare(ADMIT);
+    expect(e.roles).toEqual([{ name: ADMIT, present: true, preexisting: false, attributes: flags, members_in: [], member_of: [] }]);
+    expect(JSON.stringify(e)).not.toMatch(/passw|rolconfig|rolvaliduntil/i);
+    // roles_created is sorted whatever the snapshot order.
+    const two = bootstrapRefreshEvidence({
+      files: changed,
+      before: BEFORE,
+      after: [bare("zz_new"), ...BEFORE, bare("aa_new")],
+      edges: [],
+      applied: 1,
+      expected: ["zz_new", "aa_new"],
+    });
+    expect(two.roles_created).toEqual(["aa_new", "zz_new"]);
+  });
+  test("pre-existing exact role: preexisting true, nothing created; absent role is reported, not refused", () => {
+    const e = bootstrapRefreshEvidence({ files: same, before: [...BEFORE, bare(ADMIT)], after: [...BEFORE, bare(ADMIT)], edges: [], applied: 1 });
+    expect(e.roles_created).toEqual([]);
+    expect(e.roles[0]).toMatchObject({ name: ADMIT, present: true, preexisting: true });
+    const none = bootstrapRefreshEvidence({ files: same, before: BEFORE, after: BEFORE, edges: [], applied: 1 });
+    expect(none.roles).toEqual([{ name: ADMIT, present: false }]);
+  });
+  test("unexpected role: any other new role, or any new role from an unchanged chain", () => {
+    expect(code(() => bootstrapRefreshEvidence({ files: changed, before: BEFORE, after: [...BEFORE, bare(ADMIT), bare("other")], edges: [], applied: 2 }))).toBe(
+      "rehearsal_bootstrap_unexpected_role",
+    );
+    expect(code(() => bootstrapRefreshEvidence({ files: same, before: BEFORE, after: [...BEFORE, bare(ADMIT)], edges: [], applied: 1 }))).toBe(
+      "rehearsal_bootstrap_unexpected_role",
+    );
+  });
+  test("side effect: a role removed, a pre-existing role altered, or a row count mismatch", () => {
+    const base = { files: changed, edges: [] as RoleEdge[], applied: 2 };
+    expect(code(() => bootstrapRefreshEvidence({ ...base, before: BEFORE, after: [BEFORE[0]!, BEFORE[2]!, bare(ADMIT)] }))).toBe(
+      "rehearsal_bootstrap_side_effect",
+    );
+    expect(
+      code(() => bootstrapRefreshEvidence({ ...base, before: BEFORE, after: [BEFORE[0]!, { ...BEFORE[1]!, rolsuper: true }, BEFORE[2]!, bare(ADMIT)] })),
+    ).toBe("rehearsal_bootstrap_side_effect");
+    expect(code(() => bootstrapRefreshEvidence({ ...base, before: BEFORE, after: [...BEFORE, bare(ADMIT), bare(ADMIT)] }))).toBe(
+      "rehearsal_bootstrap_side_effect",
+    );
+  });
+  test("role contract: any elevated flag, LOGIN, or any inbound or outbound edge refuses (also when pre-existing)", () => {
+    for (const flag of ["rolsuper", "rolinherit", "rolcreaterole", "rolcreatedb", "rolcanlogin", "rolreplication", "rolbypassrls"] as const)
+      expect(
+        code(() => bootstrapRefreshEvidence({ files: changed, before: BEFORE, after: [...BEFORE, bare(ADMIT, { [flag]: true })], edges: [], applied: 2 })),
+      ).toBe("rehearsal_bootstrap_role_contract");
+    const edge = (member: string, role: string): RoleEdge => ({ member, role, admin_option: true, inherit_option: false, set_option: false });
+    for (const e of [edge("postgres", ADMIT), edge(ADMIT, "bulls96_read_api")])
+      expect(code(() => bootstrapRefreshEvidence({ files: changed, before: BEFORE, after: [...BEFORE, bare(ADMIT)], edges: [e], applied: 2 }))).toBe(
+        "rehearsal_bootstrap_role_contract",
+      );
+    expect(
+      code(() => bootstrapRefreshEvidence({ files: same, before: [...BEFORE, bare(ADMIT, { rolcanlogin: true })], after: [...BEFORE, bare(ADMIT, { rolcanlogin: true })], edges: [], applied: 1 })),
+    ).toBe("rehearsal_bootstrap_role_contract");
+    // Edges between other roles are not the checked role's.
+    expect(
+      bootstrapRefreshEvidence({ files: changed, before: BEFORE, after: [...BEFORE, bare(ADMIT)], edges: [edge("postgres", "bulls96_read_api")], applied: 2 }).roles[0],
+    ).toMatchObject({ members_in: [], member_of: [] });
+  });
+  test("missing-bootstrap expects 42704 and the R2-bootstrap evidence passes the evidence screen", () => {
+    expect(INJECTION_REFUSAL["missing-bootstrap"]).toBe("42704");
+    const e = bootstrapRefreshEvidence({ files: changed, before: BEFORE, after: [...BEFORE, bare(ADMIT)], edges: [], applied: 2 });
+    expect(resultRecord("R2-bootstrap", "PASS", e).status).toBe("PASS");
+    expect(resultRecord("R2-bootstrap-rerun", "PASS", e).status).toBe("PASS");
+    expect(resultRecord("R4-missing-bootstrap", "PASS", {}).stage).toBe("R4-missing-bootstrap");
+  });
+});
+
 describe("drift against production and the rehearsal files", () => {
   test("the rehearsal replays the production apply's refusals in the same order", () => {
     const found = [...read("scripts/schema-release-database.ts").matchAll(/refuse\("([a-z_]+)"\)/g)].map((m) => m[1]);
@@ -518,7 +633,11 @@ describe("drift against production and the rehearsal files", () => {
     expect(wf).toMatch(/fetch-depth: 0/);
     for (const m of wf.matchAll(/timeout-minutes: (\d+)/g)) expect(Number(m[1])).toBeLessThanOrEqual(60);
     expect([...wf.matchAll(/timeout-minutes:/g)].length).toBeGreaterThanOrEqual(2);
-    for (const f of ["ledger-gap", "boundary-drift", "late-step", "wrong-generation", "stale-plan"]) expect(wf).toContain(f);
+    for (const f of ["ledger-gap", "boundary-drift", "late-step", "wrong-generation", "stale-plan", "missing-bootstrap"]) expect(wf).toContain(f);
+    // The dispatch choice list is exactly the driver's injections, in order.
+    const options = /^ {6}inject_failure:\n(?: {8}.*\n)*? {8}options:\n((?: {10}- .*\n)+)/m.exec(wf);
+    expect(options).not.toBeNull();
+    expect(options![1]!.trim().split("\n").map((l) => l.trim().slice(2))).toEqual([...INJECTIONS]);
     // Known-negative rows reach the driver through env only; the tooling checkout carries
     // the contract module the core imports and lives outside .96bulls/.
     expect(wf).toMatch(/^ {6}expect_refusal:\n/m);

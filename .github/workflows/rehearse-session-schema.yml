@@ -34,6 +34,7 @@ on:
           - late-step
           - wrong-generation
           - stale-plan
+          - missing-bootstrap
       expect_refusal:
         description: "Known-negative row: <stage>:<code> the run must FAIL with (e.g. R1:rehearsal_target_anchor_missing); empty = must pass"
         required: false
