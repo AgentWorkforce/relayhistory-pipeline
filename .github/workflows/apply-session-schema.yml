@@ -15,6 +15,18 @@ on:
         description: Exact migration --generation from this SHA (64 lowercase hex)
         type: string
         required: true
+      target:
+        description: "Last schema step this release may apply, exactly as ledgered (e.g. upstream:20261105047000_coordination_fact_readers.sql); pending steps after it are held and never applied"
+        type: string
+        required: true
+      target_sha:
+        description: "Full 40-hex commit, sha itself or on sha's first-parent main history with green push CI, whose tree ends at target (same prefix steps, its own verifiers); images for this release are built there"
+        type: string
+        required: true
+      target_generation:
+        description: "Apply only - targetGeneration from the plan's plan.json (64 lowercase hex): --generation at target_sha, the generation this apply marks PASS; equals generation when nothing is held"
+        type: string
+        default: ""
       boundary:
         description: Catalog-proven global control; apply refreshes the reviewed event trigger
         type: choice
@@ -25,7 +37,7 @@ on:
         type: string
         default: ""
       approval:
-        description: "Apply only: APPLY pyamkrhoyszgzirqqffq <sha> <generation> PLAN <plan_run>"
+        description: "Apply only: APPLY pyamkrhoyszgzirqqffq <sha> <generation> TARGET <target> <target_sha> <target_generation> MANIFEST <manifest_digest> PLAN <plan_run>"
         type: string
         default: ""
 permissions:
@@ -40,6 +52,9 @@ env:
   RELEASE_SHA: ${{ inputs.sha }}
   RELEASE_GENERATION: ${{ inputs.generation }}
   RELEASE_BOUNDARY: ${{ inputs.boundary }}
+  RELEASE_TARGET: ${{ inputs.target }}
+  RELEASE_TARGET_SHA: ${{ inputs.target_sha }}
+  RELEASE_TARGET_GENERATION: ${{ inputs.target_generation }}
   RELEASE_PLAN_RUN: ${{ inputs.plan_run }}
   RELEASE_APPROVAL: ${{ inputs.approval }}
 jobs:
@@ -76,9 +91,12 @@ jobs:
     environment:
       name: ${{ needs.prerequisite-gate.outputs.environment }}
     steps:
+      # Full history: target_sha and its tree are read from the local object database
+      # only; the database step itself never runs network git.
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - uses: oven-sh/setup-bun@v2
         with:
