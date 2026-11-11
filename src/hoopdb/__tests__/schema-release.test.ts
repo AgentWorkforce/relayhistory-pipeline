@@ -7,13 +7,18 @@ import {
 } from "../schema-release-contract.ts";
 import { githubReleaseGate } from "../../../scripts/schema-release-github.ts";
 import { validateReleasePlan } from "../../../scripts/schema-release-database.ts";
+import {
+  refreshReleaseBoundary,
+  releaseBoundaryDigest,
+  requireSafeReleaseBoundary,
+} from "../schema-release-boundary.ts";
 const sha = "a".repeat(40),
   generation = "b".repeat(64);
 const base = {
   RELEASE_MODE: "plan",
   RELEASE_SHA: sha,
   RELEASE_GENERATION: generation,
-  RELEASE_BOUNDARY: "event-trigger",
+  RELEASE_BOUNDARY: "global-default-revoke",
   GITHUB_REPOSITORY: P.repository,
   GITHUB_EVENT_NAME: "workflow_dispatch",
   GITHUB_REF: "refs/heads/main",
@@ -26,7 +31,7 @@ test("strict pooler/project/owner pins and URL options cannot weaken TLS", () =>
   expect(releaseConnection(url).host).toBe(P.host);
   for (const bad of [
     url.replace(P.project, "foreign"),
-    url.replace(P.owner, "postgres"),
+    url.replace(P.owner, "foreign_owner"),
     url.replace(P.host, "evil.example"),
     url.replace(":5432/", ":6543/"),
     url.replace("/postgres?", "/other?"),
@@ -279,18 +284,49 @@ test("apply rejects foreign, stale, replayed or failed prior plan and artifact b
     Object.assign(f.plan, values);
     await expect(githubReleaseGate(env, get(f), true)).rejects.toThrow();
   }
-  const input = { sha, generation, boundary: "event-trigger", planRun: "90" };
+  const input = {
+    sha,
+    generation,
+    boundary: "global-default-revoke",
+    planRun: "90",
+  };
+  const existingBoundary = {
+    present: true,
+    event: "ddl_command_end",
+    tags_exact: true,
+    enabled_ok: true,
+    owner: P.owner,
+    owner_is_migration_owner: true,
+    function_is_reviewed: true,
+    function_owner: P.owner,
+    function_owner_is_migration_owner: true,
+    schema_owner_is_migration_owner: true,
+    prosrc_sha256: "d".repeat(64),
+    proconfig_exact: true,
+    security_definer: false,
+    volatility: "v",
+    language: "plpgsql",
+    returns: "event_trigger",
+    function_acl: ["<owner>:EXECUTE"],
+    function_public_execute: false,
+    runtime_role_setting_matches: true,
+    schema_private: true,
+  };
   const plan = {
     version: 1,
     project: P.project,
     sha,
     generation,
-    boundary: "event-trigger",
+    boundary: "global-default-revoke",
     runId: "90",
     ledgerSha256: "c".repeat(64),
     inventory: [{}],
+    existingBoundary,
   };
-  expect(validateReleasePlan(plan, input)).toBe("c".repeat(64));
+  expect(validateReleasePlan(plan, input)).toEqual({
+    ledgerSha256: "c".repeat(64),
+    existingBoundary,
+  });
   for (const field of [
     "project",
     "sha",
@@ -302,6 +338,12 @@ test("apply rejects foreign, stale, replayed or failed prior plan and artifact b
     expect(() =>
       validateReleasePlan({ ...plan, [field]: "wrong" }, input),
     ).toThrow();
+  expect(() =>
+    validateReleasePlan(
+      { ...plan, existingBoundary: { ...existingBoundary, enabled_ok: false } },
+      input,
+    ),
+  ).toThrow("release_boundary_identity");
 });
 test("workflow keeps credentials step-scoped and refuses implicit environment creation", () => {
   const w = readFileSync(
@@ -320,6 +362,58 @@ test("workflow keeps credentials step-scoped and refuses implicit environment cr
   );
   expect(w).toContain("cancel-in-progress: false");
   expect(w).toContain("persist-credentials: false");
+  expect(w).toContain("options: [global-default-revoke]");
+});
+test("release boundary plan binding accepts only the exact safe trigger shape", () => {
+  const boundary = {
+    present: true,
+    event: "ddl_command_end",
+    tags_exact: true,
+    enabled_ok: true,
+    owner: P.owner,
+    owner_is_migration_owner: true,
+    function_is_reviewed: true,
+    function_owner: P.owner,
+    function_owner_is_migration_owner: true,
+    schema_owner_is_migration_owner: true,
+    prosrc_sha256: "a".repeat(64),
+    proconfig_exact: true,
+    security_definer: false,
+    volatility: "v",
+    language: "plpgsql",
+    returns: "event_trigger",
+    function_acl: ["<owner>:EXECUTE"],
+    function_public_execute: false,
+    runtime_role_setting_matches: true,
+    schema_private: true,
+  };
+  expect(requireSafeReleaseBoundary(boundary)).toBe(boundary);
+  expect(releaseBoundaryDigest(boundary)).toMatch(/^[0-9a-f]{64}$/);
+  for (const unsafe of [
+    { enabled_ok: false },
+    { function_public_execute: true },
+    { function_acl: ["<owner>:EXECUTE", "foreign:EXECUTE"] },
+    { schema_private: false },
+    { prosrc_sha256: "not-a-digest" },
+  ])
+    expect(() =>
+      requireSafeReleaseBoundary({ ...boundary, ...unsafe }),
+    ).toThrow("release_boundary_identity");
+});
+test("release boundary refresh refuses injected SQL before any database call", async () => {
+  let calls = 0;
+  await expect(
+    refreshReleaseBoundary(
+      { query: async () => (calls++, { rows: [] }) } as any,
+      {},
+      {
+        sql: "SELECT 1",
+        sha256: "a".repeat(64),
+        prosrcSha256: "b".repeat(64),
+      },
+    ),
+  ).rejects.toThrow("release_boundary_wrapper");
+  expect(calls).toBe(0);
 });
 test("workflow gates on the exact repository id and downloads the plan from this repository", () => {
   const w = readFileSync(
@@ -390,6 +484,39 @@ test("operator inspection starts READ ONLY and rolls back on wrong owner without
   expect(
     statements.some((s) => /CREATE|ALTER|GRANT|INSERT|UPDATE|DELETE/.test(s)),
   ).toBe(false);
+});
+test("operator inspection accepts only the observed exact postgres owner shape", async () => {
+  const { inspectRelease } = await import("../schema-release-inspect.ts");
+  const statements: string[] = [];
+  const client = {
+    query: async (sql: string) => {
+      statements.push(sql);
+      if (sql.includes("current_user AS me"))
+        return {
+          rows: [
+            {
+              me: P.owner,
+              session: P.owner,
+              db: P.database,
+              rolcanlogin: true,
+              rolsuper: false,
+              rolcreaterole: true,
+              rolcreatedb: true,
+              rolbypassrls: true,
+              rolreplication: true,
+              schema_owner: P.owner,
+            },
+          ],
+        };
+      if (sql.includes("pg_advisory_xact_lock")) throw new Error("after_identity");
+      return { rows: [] };
+    },
+  };
+  await expect(
+    inspectRelease(client as any, "global-default-revoke"),
+  ).rejects.toThrow("after_identity");
+  expect(statements.at(-1)).toBe("ROLLBACK");
+  expect(statements.some((s) => s.includes("pg_advisory_xact_lock"))).toBe(true);
 });
 test("operator plan refuses apply mode before reading a secret or connecting", () => {
   const r = Bun.spawnSync(
