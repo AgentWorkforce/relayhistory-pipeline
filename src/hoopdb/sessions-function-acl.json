@@ -757,6 +757,62 @@
     "sessions.ingest_operator_erase_settle(text,text,text,text)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_operator_runtime_authorize(text,text,text,text,uuid)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_begin(text,text,text,text,text,text,text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_catalog()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_erased(text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_ids(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_location_valid(text,text,text,text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_metadata_guard()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_next(uuid)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_purge(text,text,text,text,uuid)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_release(text,text,text,text,uuid)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_step(text,text,text,text,uuid,text,text,bigint,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_upsert(jsonb,text,text)": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_write_begin(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_write_failed(text,text,uuid)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_write_finish(text,text,uuid)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
     "sessions.ingest_prepare_buffer_stage(jsonb)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"

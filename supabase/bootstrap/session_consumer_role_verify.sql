@@ -206,6 +206,7 @@ BEGIN
         ('sessions.search_consumer_progress', 'SELECT'), ('sessions.search_consumer_progress', 'INSERT'),
         ('sessions.search_consumer_progress', 'UPDATE'),
         ('sessions.upsert_session_index(jsonb)', 'EXECUTE'),
+        ('sessions.ingest_operator_runtime_upsert(jsonb,text,text)', 'EXECUTE'),
         ('sessions.session_index_batch(jsonb)', 'EXECUTE'),
         ('sessions.session_publication_is_managed(text,text,text,text,text)', 'EXECUTE'),
         ('sessions.session_publication_lock(jsonb)', 'EXECUTE'),
@@ -271,6 +272,7 @@ BEGIN
     SELECT p.oid::regprocedure::text FROM pg_proc p
     WHERE p.pronamespace = to_regnamespace('sessions')
       AND p.proname IN ('session_index_batch', 'session_publication_is_managed', 'session_publication_lock', 'upsert_session_index',
+        'ingest_operator_runtime_upsert',
         'applied_repo_evidence', 'canonical_remote', 'clean_root_commit', 'lock_repo_catalog', 'resolve_repo', 'session_directory_search_text',
         'repo_live', 'legacy_remote', 'session_directory_project_text')
       AND NOT has_function_privilege(v_role, p.oid, 'EXECUTE')
@@ -282,6 +284,7 @@ BEGIN
       AND NOT (p.proname IN ('session_publication_is_managed', 'session_publication_lock')
         OR (p.pronamespace = to_regnamespace('sessions')
             AND p.oid::regprocedure::text IN (
+              'sessions.ingest_operator_runtime_upsert(jsonb,text,text)',
               'sessions.output_facts_state(text,text,text,text[],text)',
               'sessions.output_facts_reconcile(text,text,text,text[],text,jsonb,jsonb,boolean,bigint)',
               'sessions.output_facts_record_state(text,text,text,text[],text,boolean,timestamp with time zone,timestamp with time zone,bigint,timestamp with time zone)',
