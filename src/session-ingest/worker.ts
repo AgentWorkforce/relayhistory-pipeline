@@ -36,6 +36,12 @@
  *                              (55P03/40P01) is a 429 delivery_busy with Retry-After 5-10 s instead of a
  *                              503 (deliver.ts ClaimLockBusy); 57014 and every other cause stay 503
  *                              (HTTP only: the admission consumer keeps its normal backoff)
+ *   INGEST_CLAIM_TIMEOUT_BUSY  unset/off (default) | on (any case): a claim whose statement timed out or was
+ *                              cancelled (ledger_timeout, SQLSTATE 57014 by code only; name-only client
+ *                              timeouts stay 503) is the same 429 delivery_busy with Retry-After 5-10 s
+ *                              instead of a 503; independent of INGEST_CLAIM_LOCK_BUSY; every other
+ *                              stage and cause stays 503 (HTTP only, as above). The Cloudflare stack
+ *                              renders it only from sessionIngest.claimTimeoutBusy: "on"
  *   INGEST_ASYNC_ADMISSION     unset/off (default) | on | drain: S3-first async admission
  *                              (async-admission.ts, docs/design/s3-first-async-ingest.md); on/drain need
  *                              buffered acceptance and the INGEST_ADMISSION queue (producer + consumer).
@@ -132,6 +138,7 @@ export interface IngestWorkerEnv {
   /** "on" (any case): per-stage latency lines (deliver.ts StageLatencyFields). Default off. */
   INGEST_STAGE_LATENCY_LOG?: string;
   INGEST_CLAIM_LOCK_BUSY?: string;
+  INGEST_CLAIM_TIMEOUT_BUSY?: string;
   /** Operator per-session erase route (session-erase.ts): exactly "1" enables; unset, "" or "0" is off (default). */
   SESSION_ERASE_API_ENABLED?: string;
   /** Secrets Store: the bearer Control sends on /internal/v1/session-erase/* (min 32 chars). Read only when enabled. */
@@ -206,6 +213,8 @@ export interface IngestSettings {
   stageLatencyLog?: true;
   /** INGEST_CLAIM_LOCK_BUSY=on: a claim lock-wait failure is a 429 with Retry-After. Absent (the default): 503. */
   claimLockBusy?: true;
+  /** INGEST_CLAIM_TIMEOUT_BUSY=on: a claim statement timeout (SQLSTATE 57014 by code only) is a 429 with Retry-After. Absent (the default): 503. */
+  claimTimeoutBusy?: true;
   /** INGEST_ASYNC_ADMISSION: absent = off (the default). */
   asyncAdmission?: Exclude<AsyncAdmissionMode, "off">;
   /** INGEST_SYNC_ADMISSION_FROZEN_RECEIPT=on. Absent (the default): off. */
@@ -284,6 +293,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(/^[0-9a-f]{64}$/.test(env.INGEST_EXPECT_GENERATION ?? "") ? { retentionGeneration: env.INGEST_EXPECT_GENERATION! } : {}),
     ...(routingFlag(env.INGEST_STAGE_LATENCY_LOG) ? { stageLatencyLog: true as const } : {}),
     ...(routingFlag(env.INGEST_CLAIM_LOCK_BUSY) ? { claimLockBusy: true as const } : {}),
+    ...(routingFlag(env.INGEST_CLAIM_TIMEOUT_BUSY) ? { claimTimeoutBusy: true as const } : {}),
     ...(asyncMode !== "off" ? { asyncAdmission: asyncMode } : {}),
     ...(syncFrozenReceipt === "on" ? { syncAdmissionFrozenReceipt: true as const } : {}),
     ...(sessionErase ? { sessionErase } : {}),
@@ -356,6 +366,7 @@ export function deliverDepsFor(settings: IngestSettings, run: Run, target: Write
     // Default off: per-stage latency lines through the same allowlisted logger as the route line.
     ...(settings.stageLatencyLog ? { stageLatency: (fields: StageLatencyFields) => log.info("session ingest", { ...fields }) } : {}),
     ...(settings.claimLockBusy ? { claimLockBusy: true as const } : {}),
+    ...(settings.claimTimeoutBusy ? { claimTimeoutBusy: true as const } : {}),
   };
 }
 
