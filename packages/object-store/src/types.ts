@@ -28,6 +28,10 @@ export interface ObjectMeta {
   version: ObjectVersion;
   /** User metadata. Populated by `head`; empty in `list` results. */
   metadata: Metadata;
+  /** S3 `x-amz-server-side-encryption` (e.g. `aws:kms`), from `head`/`getObject`; set only when the store sends it. */
+  serverSideEncryption?: string;
+  /** S3 `x-amz-server-side-encryption-aws-kms-key-id`, from `head`/`getObject`; set only when the store sends it. */
+  sseKmsKeyId?: string;
 }
 
 export interface Page<T> {

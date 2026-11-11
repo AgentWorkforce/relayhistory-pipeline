@@ -48,6 +48,7 @@ export const UPLOAD_CONTENT_ENCODING = "zstd";
 /** The closed refusal-code set of an upload, in check order. A refused status carries exactly one of these. */
 export const UPLOAD_REFUSAL_CODES = [
   "upload_key_invalid", //            the key does not parse under the upload-inbox grammar
+  "upload_unencrypted", //            HISTORY_UPLOAD_INBOX_SSE=aws:kms and the object was stored without SSE-KMS
   "upload_witness_invalid", //        witness missing, malformed, not exact-keys, or its MAC does not verify
   "upload_witness_expired", //        witness `exp` is at or before the consumer's clock
   "upload_tenant_mismatch", //        key (org, ws, uh) differs from the witness (org, ws, hash(user))
@@ -268,10 +269,13 @@ interface UploadCredentialsCommon {
   contract: typeof UPLOAD_CONTRACT;
   bucket: string;
   region: string;
-  /** null: the provider's default endpoint for `region` (hosted AWS). Self-host: its S3-compatible endpoint URL. */
+  /**
+   * null: the provider's default endpoint for `region` (hosted AWS). Self-host: its S3-compatible endpoint, an
+   * http(s) `scheme://host[:port]` with an optional path prefix and no trailing slash; sts then addresses
+   * objects path-style as `<endpoint>/<bucket>/<key>` (presigned urls are PUT as-is).
+   */
   endpoint: string | null;
   keyPrefix: string;
-  kmsKeyId: string;
   witness: string;
   witnessSeq: number;
   maxObjectBytes: typeof MAX_DELIVERY_BYTES;
@@ -279,10 +283,14 @@ interface UploadCredentialsCommon {
 }
 export interface UploadStsCredentials extends UploadCredentialsCommon {
   kind: "sts";
+  /** Always a key id: the desktop sends SSE-KMS headers with it. */
+  kmsKeyId: string;
   credentials: { accessKeyId: string; secretAccessKey: string; sessionToken: string; expiresAt: string };
 }
 export interface UploadPresignedCredentials extends UploadCredentialsCommon {
   kind: "presigned";
+  /** null: the store has no KMS (an S3-compatible self-host store); the desktop sends NO SSE headers. */
+  kmsKeyId: string | null;
   /** `key` is relative to keyPrefix; keyPrefix + key is a full object key. */
   urls: { key: string; url: string; expiresAt: string }[];
 }
@@ -314,7 +322,22 @@ function urlOk(v: unknown, max: number): v is string {
     return (u.protocol === "https:" || u.protocol === "http:") && u.username === "" && u.password === "" && u.hash === "";
   } catch { return false; }
 }
-const endpointOk = (v: unknown) => v === null || (urlOk(v, 2048) && new URL(v).search === "" && new URL(v).pathname === "/");
+/** One or more non-empty path segments, no trailing slash, nothing a URL parser would rewrite. */
+const ENDPOINT_PATH = /^(\/[A-Za-z0-9._~!$&'()*+,;=:@%-]+)+$/;
+/**
+ * null, or an http(s) `scheme://host[:port]` with an optional path prefix: no userinfo, query or fragment (not even
+ * an empty `?` or `#`), no trailing slash after a prefix, no dot segments. A bare origin (normalised path `/`, with
+ * or without the written slash) is accepted.
+ */
+function endpointOk(v: unknown): boolean {
+  if (v === null) return true;
+  if (!urlOk(v, 2048) || /[?#\\]/.test(v) || /\/(\.|%2e){1,2}(\/|$)/i.test(v.slice(v.indexOf("//") + 2))) return false;
+  const { search, pathname } = new URL(v);
+  if (search !== "") return false;
+  return pathname === "/" || (ENDPOINT_PATH.test(pathname) && v.endsWith(pathname));
+}
+/** kmsKeyId is always present: a printable key id, or null for `presigned` only (no SSE headers at all). */
+const kmsKeyIdOk = (v: unknown, kind: "sts" | "presigned") => (v === null ? kind === "presigned" : printable(v, 2048));
 
 /**
  * Exact-keys validator for a credentials response, or null. Beyond shapes it checks what the desktop can check
@@ -329,7 +352,7 @@ export function parseUploadCredentialsResponse(v: unknown): UploadCredentialsRes
   const witness = readUploadWitnessUnverified(v.witness);
   const refreshAfter = rfc3339UtcMs(v.refreshAfter);
   if (typeof v.bucket !== "string" || !BUCKET.test(v.bucket) || typeof v.region !== "string" || !REGION.test(v.region) || !endpointOk(v.endpoint) ||
-      !prefix || !printable(v.kmsKeyId, 2048) || !witness || !seqOk(v.witnessSeq) || v.maxObjectBytes !== MAX_DELIVERY_BYTES || refreshAfter === null) return null;
+      !prefix || !kmsKeyIdOk(v.kmsKeyId, v.kind as "sts" | "presigned") || !witness || !seqOk(v.witnessSeq) || v.maxObjectBytes !== MAX_DELIVERY_BYTES || refreshAfter === null) return null;
   if (witness.seq !== v.witnessSeq || witness.org !== prefix.orgId || witness.ws !== prefix.workspaceId || userSegment(witness.ws, witness.user) !== prefix.userSegment) return null;
   if (v.kind === "sts") {
     const c = v.credentials;

@@ -40,6 +40,7 @@ import * as AWS from "@alchemy.run/aws";
 import * as Effect from "effect/Effect";
 import { LAYOUT_VERSION } from "../../packages/object-store/src/layout.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
+import { uploadInboxQueueConfiguration } from "./upload-inbox.ts";
 import{derivedSchemaBuildPlugin}from "./derived-schema-build.ts";
 
 export interface SessionPipelineInputs {
@@ -436,9 +437,11 @@ export function sessionSecretPolicy(i: { roleArn: string }) {
 /**
  * The bucket's notification configuration: every manifest put or delete under
  * `96bulls/` to the queue. Chunks are never notified (the suffix filter), so
- * the queue carries one message per manifest write.
+ * the queue carries one message per manifest write. With `uploadQueueArn`
+ * (historyUploadDirectInfra on), the second rule `96bulls-upload-inbox` sends
+ * finished desktop uploads to the upload-admission queue; one Put owns both Ids.
  */
-export function bucketNotificationConfiguration(queueArn: string) {
+export function bucketNotificationConfiguration(queueArn: string, uploadQueueArn?: string) {
   return {
     QueueConfigurations: [
       {
@@ -447,6 +450,7 @@ export function bucketNotificationConfiguration(queueArn: string) {
         Events: ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"],
         Filter: { Key: { FilterRules: [{ Name: "prefix", Value: `${TENANT_KEY_BASE}/` }, { Name: "suffix", Value: "/manifest.json" }] } },
       },
+      ...(uploadQueueArn ? [uploadInboxQueueConfiguration(uploadQueueArn)] : []),
     ],
   };
 }
@@ -639,7 +643,7 @@ export const sessionPipelineFunction = (i: SessionPipelineStageInputs & { bucket
 
 /** Step 2, after the bucket: queues, secret, mapping, schedule, alarms. */
 export const sessionPipelineWiring = (
-  i: SessionPipelineStageInputs & { bucketArn: string; fn: { functionName: unknown; functionArn: unknown; roleArn: unknown } },
+  i: SessionPipelineStageInputs & { bucketArn: string; fn: { functionName: unknown; functionArn: unknown; roleArn: unknown }; uploadQueueArn?: string },
 ) =>
   Effect.gen(function* () {
     const names = sessionPipelineNames(i.stage, i.accountId, i.region);
@@ -753,6 +757,6 @@ export const sessionPipelineWiring = (
       secretName: names.secret,
       secretArn: (secret as unknown as { secretArn: string }).secretArn,
       mappingUuid: (mapping as unknown as { uuid: string }).uuid,
-      notification: bucketNotificationConfiguration(names.queueArn),
+      notification: bucketNotificationConfiguration(names.queueArn, i.uploadQueueArn),
     };
   });

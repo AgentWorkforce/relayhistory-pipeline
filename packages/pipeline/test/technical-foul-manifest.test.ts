@@ -71,11 +71,11 @@ describe("technical-foul-cutover.json (new entry; TS history untouched)", () => 
     );
   });
 
-  it("records the exact alpha.5 pin values", () => {
+  it("records the exact alpha.6 pin values", () => {
     expect(cutover.engine).toBe("wasm-bindgen");
-    expect(cutover.packageVersion).toBe("0.5.0-alpha.5");
+    expect(cutover.packageVersion).toBe("0.5.0-alpha.6");
     expect(cutover.pinDigests).toEqual({
-      wasm: "91cf23177f1d9fa42484f4ce76b54bdd468177852b9e8b259af0b72ad5823f4d",
+      wasm: "f1d393b22ce47d4cb4ca762107a7f66e8b2747f6de60c193e8b07646db28e5fd",
       glue: "55dd6fc6a44ed35f846655ab08bf3161ffe105123cbe11d3e529923d6bdeae5b",
       loader: "ff139ab391a958475b455ef483e7119d66215d172647223965dc35348f912490",
     });
@@ -83,11 +83,11 @@ describe("technical-foul-cutover.json (new entry; TS history untouched)", () => 
     expect(cutover.crateManifest.rulesetVersion).toBe(10);
     expect(cutover.scrubProfile).toBe("relayhistory-secrets-v10");
     expect(cutover.artifactJsonSha256).toBe(
-      "4ba0f5210995e8db20ba361235ed43ceb777309ac946567885a8805f286f0010",
+      "43a896799549358ed0abb5fd6fab9395ca9455bd591e2f166a4e46b34c759b93",
     );
     expect(cutover.toolchain).toEqual({ rust: "1.88.0", wasmBindgen: "0.2.104" });
     expect(cutover.release).toEqual(pin.release);
-    expect(cutover.release.tarball_sha256).toBe("bc4101df467ba520e16b8b8d766c63a9017631a6551a369ee100b34e47de441b");
+    expect(cutover.release.tarball_sha256).toBe("374b72f5d21ecaae558273bb350103c2d111cdbbb1eaf803615c221449066cc6");
     expect(cutover.release.sha256sums["artifact.json"]).toBe(cutover.artifactJsonSha256);
   });
 
