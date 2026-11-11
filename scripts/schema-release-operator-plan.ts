@@ -3,7 +3,7 @@
  * are unavailable. There is deliberately no migration/apply branch or fallback.
  */
 import { execFileSync } from "node:child_process";
-import { generation } from "../src/hoopdb/migrate.ts";
+import { generation, migrationTargetSplit } from "../src/hoopdb/migrate.ts";
 import {
   releaseInputs,
   SCHEMA_RELEASE as P,
@@ -30,6 +30,8 @@ export async function operatorPlan() {
   try {
     await client.connect();
     const report = await inspectRelease(client, input.boundary);
+    // The same target gate the CI plan records: held steps are never applied.
+    const split = migrationTargetSplit(report.inventory, input.target);
     console.log(
       JSON.stringify(
         {
@@ -39,6 +41,8 @@ export async function operatorPlan() {
           project: P.project,
           sha: input.sha,
           boundary: input.boundary,
+          target: input.target,
+          ...split,
           ...report,
         },
         null,

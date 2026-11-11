@@ -421,6 +421,47 @@ export interface RunOptions {
   expectedLedgerSha256?: string;
   /** External release gates rechecked under the migrator lock, before any write. */
   beforeWrite?: () => Promise<void>;
+  /**
+   * Release target: the last schema step this run may apply. Pending steps after it
+   * are held (never applied, never ledgered); see migrationTargetSplit.
+   */
+  target?: string;
+  /** Release plan binding: the exact pending steps up to the target (requires target). */
+  expectedPending?: string[];
+}
+
+/**
+ * The release target gate, shared by the release plan, the operator plan and the
+ * migrator (under its lock). Splits the schema steps, in migrator order (the upstream
+ * lane, then the 96bulls lane), at the target: expectedPending = the pending steps up
+ * to and including it, held = the pending steps after it. Fails closed when the tree
+ * has no such step (release_target_unknown), when the target is already applied
+ * (release_target_not_pending), or when a step of the target's own lane after it is
+ * already applied, i.e. the target is below that lane's ledgered tail
+ * (release_target_passed). Each lane is its own contiguous prefix (sequencePreflight,
+ * ledger_gap, unchanged), so applied steps of the later lane are already done and
+ * untouched.
+ */
+export function migrationTargetSplit(
+  steps: { name: string; pending: boolean }[],
+  target: string,
+): { expectedPending: string[]; held: string[] } {
+  const schema = steps.filter(
+    (s) => s.name.startsWith("upstream:") || s.name.startsWith("96bulls:"),
+  );
+  const at = schema.findIndex((s) => s.name === target);
+  if (at < 0)
+    throw profileError("release_target_unknown", "the release target is not a schema step of this tree");
+  if (!schema[at]!.pending)
+    throw profileError("release_target_not_pending", "the release target is already applied");
+  const lane = (name: string) => name.slice(0, name.indexOf(":") + 1);
+  const after = schema.slice(at + 1);
+  if (after.some((s) => !s.pending && lane(s.name) === lane(target)))
+    throw profileError("release_target_passed", "a step after the release target is already applied");
+  return {
+    expectedPending: schema.slice(0, at + 1).filter((s) => s.pending).map((s) => s.name),
+    held: after.filter((s) => s.pending).map((s) => s.name),
+  };
 }
 
 /** Shared read-only preflight: release planning and apply enforce the same guards. */
@@ -559,9 +600,10 @@ export async function inspectMigrations(client: MigrationClient, profile: Migrat
 export async function runMigrations(
   client: MigrationClient,
   opts: RunOptions = {},
-): Promise<{ applied: number; skipped: number }> {
+): Promise<{ applied: number; skipped: number; held: string[] }> {
   let applied = 0;
   let skipped = 0;
+  let held = new Set<string>();
   const profile = opts.profile ?? migrationProfile();
   // One migrator at a time; every marker transition happens while this lock is held.
   await client.query("SELECT pg_advisory_lock(961996, 1)");
@@ -575,6 +617,23 @@ export async function runMigrations(
     if (opts.expectedLedgerSha256 !== undefined &&
         ledgerSha256 !== opts.expectedLedgerSha256)
       throw profileError("release_ledger_changed", "database ledger changed since the approved read-only plan");
+    // Release target gate, still read-only and under the lock: the pending set is exactly
+    // the approved one, and steps after the target are held (skipped below).
+    if (opts.target !== undefined || opts.expectedPending !== undefined) {
+      if (opts.target === undefined)
+        throw profileError("release_target_required", "expectedPending requires a release target");
+      const split = migrationTargetSplit(
+        schema.map((s) => ({ name: s.name, pending: !ledger.has(s.name) })),
+        opts.target,
+      );
+      if (
+        opts.expectedPending !== undefined &&
+        (opts.expectedPending.length !== split.expectedPending.length ||
+          opts.expectedPending.some((n, i) => n !== split.expectedPending[i]))
+      )
+        throw profileError("release_target_pending_changed", "pending steps up to the release target differ from the approved plan");
+      held = new Set(split.held);
+    }
     if (opts.beforeWrite) await opts.beforeWrite();
     await client.query("CREATE SCHEMA IF NOT EXISTS sessions");
     await client.query(`CREATE TABLE IF NOT EXISTS ${MIGRATION_LEDGER} (
@@ -655,6 +714,10 @@ export async function runMigrations(
       -1,
     );
     for (const [stepIndex, step] of steps.entries()) {
+      // Held steps (after the release target) are never applied. Phase 2 validates and
+      // marks PASS only the complete tree (generation(), the exact ACL manifest), so with
+      // any step held it does not run and the marker stays 'pending' (see below).
+      if (held.size && (held.has(step.name) || step.name.startsWith("verify:"))) continue;
       const sql = await readFile(step.path, "utf8");
       // The role checks (phase 1 bootstrap, phase 2 verify) run on every migrate, each in
       // its own transaction, and are never recorded in the ledger.
@@ -744,7 +807,12 @@ export async function runMigrations(
       applied += 1;
       log.info("migration applied", { reason: step.name });
     }
-    if (!postChecked) {
+    if (held.size) {
+      log.warn("release target reached; steps held, role validation left pending", {
+        reason: gen,
+        count: held.size,
+      });
+    } else if (!postChecked) {
       // In-process verifier off: the same hardening and runtime check, in one transaction.
       await client.query("BEGIN");
       try {
@@ -756,7 +824,7 @@ export async function runMigrations(
         throw err;
       }
     }
-    if (!steps.some((s) => s.name.startsWith("verify:")))
+    if (!held.size && !steps.some((s) => s.name.startsWith("verify:")))
       log.info(
         "role validation left pending: in-process verifier disabled; an external verifier must pass it",
         { reason: gen },
@@ -767,7 +835,7 @@ export async function runMigrations(
       .catch(() => undefined);
   }
   log.info("hoopdb migrations complete", { count: applied, skipped });
-  return { applied, skipped };
+  return { applied, skipped, held: [...held] };
 }
 
 const RUNTIME_TABLES = {

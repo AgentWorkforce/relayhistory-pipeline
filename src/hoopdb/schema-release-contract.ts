@@ -14,6 +14,9 @@ export const SCHEMA_RELEASE = {
   dispatcher: { login: "khaliqgant", id: 1724137 },
   workflow: ".github/workflows/apply-session-schema.yml",
 } as const;
+/** One schema step name exactly as the migrator ledgers it (migrate.ts schemaSteps). */
+export const RELEASE_TARGET_STEP =
+  /^(?:upstream:[0-9]{14}|96bulls:[0-9]{4})_[a-z0-9_]+\.sql$/;
 export function refuse(code: string): never {
   throw Object.assign(new Error(code), { code });
 }
@@ -25,6 +28,8 @@ export function releaseInputs(
     RELEASE_SHA: sha,
     RELEASE_GENERATION: generation,
     RELEASE_BOUNDARY: boundary,
+    // Required in both modes: the last schema step this release may apply.
+    RELEASE_TARGET: target,
     RELEASE_PLAN_RUN: planRun = "",
     RELEASE_APPROVAL: approval = "",
   } = env;
@@ -32,14 +37,15 @@ export function releaseInputs(
     (mode !== "plan" && mode !== "apply") ||
     !/^[0-9a-f]{40}$/.test(sha ?? "") ||
     !/^[0-9a-f]{64}$/.test(generation ?? "") ||
-    boundary !== "global-default-revoke"
+    boundary !== "global-default-revoke" ||
+    !RELEASE_TARGET_STEP.test(target ?? "")
   )
     refuse("release_inputs");
   if (
     mode === "apply" &&
     (!/^[1-9][0-9]*$/.test(planRun) ||
       approval !==
-        `APPLY ${SCHEMA_RELEASE.project} ${sha} ${generation} PLAN ${planRun}`)
+        `APPLY ${SCHEMA_RELEASE.project} ${sha} ${generation} TARGET ${target} PLAN ${planRun}`)
   )
     refuse("release_typed_approval");
   if (mode === "plan" && (planRun || approval)) refuse("release_plan_inputs");
@@ -48,6 +54,7 @@ export function releaseInputs(
     sha: sha!,
     generation: generation!,
     boundary,
+    target: target!,
     planRun,
   } as const;
 }

@@ -7,18 +7,21 @@ import {
 } from "../schema-release-contract.ts";
 import { githubReleaseGate } from "../../../scripts/schema-release-github.ts";
 import { validateReleasePlan } from "../../../scripts/schema-release-database.ts";
+import { migrationTargetSplit } from "../migrate.ts";
 import {
   refreshReleaseBoundary,
   releaseBoundaryDigest,
   requireSafeReleaseBoundary,
 } from "../schema-release-boundary.ts";
 const sha = "a".repeat(40),
-  generation = "b".repeat(64);
+  generation = "b".repeat(64),
+  target = "upstream:20261105047000_coordination_fact_readers.sql";
 const base = {
   RELEASE_MODE: "plan",
   RELEASE_SHA: sha,
   RELEASE_GENERATION: generation,
   RELEASE_BOUNDARY: "global-default-revoke",
+  RELEASE_TARGET: target,
   GITHUB_REPOSITORY: P.repository,
   GITHUB_EVENT_NAME: "workflow_dispatch",
   GITHUB_REF: "refs/heads/main",
@@ -49,7 +52,7 @@ test("typed approval binds source, generation, project and prior plan", () => {
     ...base,
     RELEASE_MODE: "apply",
     RELEASE_PLAN_RUN: "90",
-    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} PLAN 90`,
+    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} PLAN 90`,
   };
   expect(releaseInputs(apply).mode).toBe("apply");
   for (const [k, v] of Object.entries({
@@ -301,7 +304,7 @@ test("apply rejects foreign, stale, replayed or failed prior plan and artifact b
     ...base,
     RELEASE_MODE: "apply",
     RELEASE_PLAN_RUN: "90",
-    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} PLAN 90`,
+    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} PLAN 90`,
   };
   expect((await githubReleaseGate(env, get(api()), true)).mode).toBe("apply");
   for (const values of [
@@ -319,6 +322,7 @@ test("apply rejects foreign, stale, replayed or failed prior plan and artifact b
     sha,
     generation,
     boundary: "global-default-revoke",
+    target,
     planRun: "90",
   };
   const existingBoundary = {
@@ -353,11 +357,31 @@ test("apply rejects foreign, stale, replayed or failed prior plan and artifact b
     ledgerSha256: "c".repeat(64),
     inventory: [{}],
     existingBoundary,
+    target,
+    expectedPending: ["upstream:20261105046010_session_directory_read_api_query.sql", target],
+    held: ["upstream:20261105050000_operator_session_erase.sql"],
   };
   expect(validateReleasePlan(plan, input)).toEqual({
     ledgerSha256: "c".repeat(64),
     existingBoundary,
+    expectedPending: plan.expectedPending,
+    held: plan.held,
   });
+  for (const bad of [
+    { target: "upstream:20261105046010_session_directory_read_api_query.sql" },
+    { target: undefined },
+    { expectedPending: undefined },
+    { expectedPending: [] },
+    { expectedPending: [target, "upstream:20261105046010_session_directory_read_api_query.sql"] },
+    { expectedPending: ["shim:supabase_roles", target] },
+    { expectedPending: [target, 1] },
+    { held: undefined },
+    { held: "upstream:20261105050000_operator_session_erase.sql" },
+    { held: ["verify:session_ingest"] },
+  ])
+    expect(() => validateReleasePlan({ ...plan, ...bad }, input)).toThrow(
+      "release_plan_artifact",
+    );
   for (const field of [
     "project",
     "sha",
@@ -559,7 +583,7 @@ test("operator plan refuses apply mode before reading a secret or connecting", (
         ...base,
         RELEASE_MODE: "apply",
         RELEASE_PLAN_RUN: "90",
-        RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} PLAN 90`,
+        RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} PLAN 90`,
         SUPABASE_MIGRATION_OWNER_URL: "",
       },
       stdout: "pipe",
@@ -573,4 +597,147 @@ test("operator plan refuses apply mode before reading a secret or connecting", (
     code: "operator_plan_only",
   });
   expect(new TextDecoder().decode(r.stderr)).toBe("");
+});
+test("target is required, exact and bound into the typed approval", () => {
+  for (const t of [
+    undefined,
+    "",
+    "20261105047000",
+    "upstream:20261105047000_coordination_fact_readers",
+    "upstream:../20261105047000_x.sql",
+    "verify:session_ingest",
+    "96bulls:12345_x.sql",
+    target + " ",
+  ])
+    expect(() => releaseInputs({ ...base, RELEASE_TARGET: t })).toThrow(
+      "release_inputs",
+    );
+  expect(releaseInputs(base).target).toBe(target);
+  expect(
+    releaseInputs({ ...base, RELEASE_TARGET: "96bulls:0004_x.sql" }).target,
+  ).toBe("96bulls:0004_x.sql");
+  const apply = {
+    ...base,
+    RELEASE_MODE: "apply",
+    RELEASE_PLAN_RUN: "90",
+    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} PLAN 90`,
+  };
+  expect(releaseInputs(apply).target).toBe(target);
+  const other = "upstream:20261105046010_session_directory_read_api_query.sql";
+  for (const approval of [
+    `APPLY ${P.project} ${sha} ${generation} PLAN 90`,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${other} PLAN 90`,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} PLAN 90 `,
+  ])
+    expect(() =>
+      releaseInputs({ ...apply, RELEASE_APPROVAL: approval }),
+    ).toThrow("release_typed_approval");
+  // Approval for one target never covers a dispatch with another.
+  expect(() => releaseInputs({ ...apply, RELEASE_TARGET: other })).toThrow(
+    "release_typed_approval",
+  );
+});
+test("the GitHub gate refuses a missing or unapproved target before any API read", async () => {
+  const noApi = async () => {
+    throw new Error("api_read");
+  };
+  const apply = {
+    ...base,
+    RELEASE_MODE: "apply",
+    RELEASE_PLAN_RUN: "90",
+    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} PLAN 90`,
+  };
+  for (const [env, code] of [
+    [{ ...base, RELEASE_TARGET: undefined }, "release_inputs"],
+    [{ ...base, RELEASE_TARGET: "upstream:x.sql" }, "release_inputs"],
+    [
+      { ...apply, RELEASE_TARGET: "upstream:20261105046010_x.sql" },
+      "release_typed_approval",
+    ],
+  ] as const)
+    await expect(githubReleaseGate(env, noApi, true)).rejects.toMatchObject({
+      code,
+    });
+});
+test("target split: exact pending prefix, held tail; unknown, applied and passed targets refuse", () => {
+  const u = (v: string) => `upstream:2026110504${v}_s.sql`;
+  const inv = (ledgered: string[]) =>
+    [
+      "shim:supabase_roles",
+      u("5000"),
+      u("6000"),
+      u("7000"),
+      u("7010"),
+      u("8000"),
+      "96bulls:0001_a.sql",
+      "96bulls:0002_b.sql",
+      "verify:session_ingest",
+    ].map((name) => ({ name, pending: !ledgered.includes(name) }));
+  const tail = [u("5000"), "96bulls:0001_a.sql", "96bulls:0002_b.sql"];
+  expect(migrationTargetSplit(inv(tail), u("7010"))).toEqual({
+    expectedPending: [u("6000"), u("7000"), u("7010")],
+    held: [u("8000")],
+  });
+  // Target at the tree's tail: nothing held.
+  expect(migrationTargetSplit(inv(tail), u("8000"))).toEqual({
+    expectedPending: [u("6000"), u("7000"), u("7010"), u("8000")],
+    held: [],
+  });
+  // An unledgered later lane is held too.
+  expect(migrationTargetSplit(inv([u("5000")]), u("6000"))).toEqual({
+    expectedPending: [u("6000")],
+    held: [u("7000"), u("7010"), u("8000"), "96bulls:0001_a.sql", "96bulls:0002_b.sql"],
+  });
+  const code = (f: () => unknown) => {
+    try {
+      f();
+    } catch (e) {
+      return (e as { code?: string }).code;
+    }
+    return "no_refusal";
+  };
+  expect(code(() => migrationTargetSplit(inv(tail), u("9000")))).toBe("release_target_unknown");
+  expect(code(() => migrationTargetSplit(inv(tail), "verify:session_ingest"))).toBe("release_target_unknown");
+  expect(code(() => migrationTargetSplit(inv(tail), u("5000")))).toBe("release_target_not_pending");
+  // Below the database tail of its own lane.
+  expect(code(() => migrationTargetSplit(inv([...tail, u("7000")]), u("6000")))).toBe("release_target_passed");
+  expect(
+    code(() =>
+      migrationTargetSplit(inv([u("5000"), "96bulls:0002_b.sql"]), "96bulls:0001_a.sql"),
+    ),
+  ).toBe("release_target_passed");
+});
+test("workflow carries the required target through env and into the approval text only", () => {
+  const w = readFileSync(
+    new URL("../../../.github/workflows/apply-session-schema.yml", import.meta.url),
+    "utf8",
+  );
+  expect(w).toMatch(/\n      target:\n        description: "[^"\n]+"\n        type: string\n        required: true\n/);
+  expect(w).toContain("  RELEASE_TARGET: ${{ inputs.target }}\n");
+  expect(w).toContain("<generation> TARGET <target> PLAN <plan_run>");
+  // Only the env block interpolates the input; no run: script does.
+  expect(w.match(/inputs\.target/g)).toHaveLength(1);
+});
+test("operator plan renders the target split and refuses a missing target before connecting", () => {
+  const src = readFileSync(
+    new URL("../../../scripts/schema-release-operator-plan.ts", import.meta.url),
+    "utf8",
+  );
+  expect(src).toContain("migrationTargetSplit(report.inventory, input.target)");
+  expect(src).toMatch(/target: input\.target,\n\s+\.\.\.split,/);
+  const r = Bun.spawnSync(
+    [process.execPath, "scripts/schema-release-operator-plan.ts"],
+    {
+      cwd: new URL("../../../", import.meta.url).pathname,
+      env: { ...process.env, ...base, RELEASE_TARGET: "", SUPABASE_MIGRATION_OWNER_URL: "" },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  expect(r.exitCode).toBe(1);
+  expect(JSON.parse(new TextDecoder().decode(r.stdout))).toEqual({
+    version: 1,
+    status: "refused",
+    code: "release_inputs",
+  });
 });

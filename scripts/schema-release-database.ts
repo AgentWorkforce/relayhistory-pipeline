@@ -1,7 +1,12 @@
 /** Only the protected workflow's single secret-scoped step invokes this entry point. */
 import { execFileSync } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { generation, runMigrations } from "../src/hoopdb/migrate.ts";
+import {
+  generation,
+  MIGRATION_LEDGER,
+  migrationTargetSplit,
+  runMigrations,
+} from "../src/hoopdb/migrate.ts";
 import {
   ROLE_VALIDATION_NAME,
   ROLE_VALIDATION_TABLE,
@@ -23,9 +28,24 @@ import {
   requireSafeReleaseBoundary,
   verifyReleaseBoundary,
 } from "../src/hoopdb/schema-release-boundary.ts";
+const stepNames = (value: unknown): value is string[] =>
+  Array.isArray(value) &&
+  value.every(
+    (n) =>
+      typeof n === "string" &&
+      (n.startsWith("upstream:") || n.startsWith("96bulls:")),
+  );
+const sameNames = (a: string[], b: string[]) =>
+  a.length === b.length && a.every((n, i) => n === b[i]);
 export function validateReleasePlan(
   plan: any,
-  input: { sha: string; generation: string; boundary: string; planRun: string },
+  input: {
+    sha: string;
+    generation: string;
+    boundary: string;
+    target: string;
+    planRun: string;
+  },
 ) {
   if (
     plan?.version !== 1 ||
@@ -33,6 +53,11 @@ export function validateReleasePlan(
     plan.sha !== input.sha ||
     plan.generation !== input.generation ||
     plan.boundary !== input.boundary ||
+    plan.target !== input.target ||
+    !stepNames(plan.expectedPending) ||
+    !plan.expectedPending.length ||
+    plan.expectedPending.at(-1) !== input.target ||
+    !stepNames(plan.held) ||
     String(plan.runId) !== input.planRun ||
     !/^[0-9a-f]{64}$/.test(plan.ledgerSha256 ?? "") ||
     !Array.isArray(plan.inventory) ||
@@ -43,6 +68,8 @@ export function validateReleasePlan(
   return {
     ledgerSha256: plan.ledgerSha256 as string,
     existingBoundary: plan.existingBoundary,
+    expectedPending: plan.expectedPending as string[],
+    held: plan.held as string[],
   };
 }
 export async function releaseDatabase() {
@@ -68,6 +95,8 @@ export async function releaseDatabase() {
   try {
     await client.connect();
     const inspection = await inspectRelease(client, input.boundary);
+    // The target gate (read-only): refuses an unknown, applied or passed target.
+    const split = migrationTargetSplit(inspection.inventory, input.target);
     if (input.mode === "plan") {
       await mkdir("release-plan", { recursive: true });
       await writeFile(
@@ -78,6 +107,8 @@ export async function releaseDatabase() {
             project: P.project,
             sha: input.sha,
             boundary: input.boundary,
+            target: input.target,
+            ...split,
             runId: process.env.GITHUB_RUN_ID,
             ...inspection,
           },
@@ -86,6 +117,8 @@ export async function releaseDatabase() {
         ) + "\n",
         { mode: 0o600 },
       );
+      if (split.held.length)
+        console.log("release_target_held " + split.held.length);
       console.log("release_readonly_plan_complete");
       return;
     }
@@ -96,23 +129,52 @@ export async function releaseDatabase() {
       releaseBoundaryDigest(approvedPlan!.existingBoundary)
     )
       refuse("release_boundary_changed");
-    await runMigrations(client, {
+    // Plan and apply must see exactly the same pending/held split; the migrator
+    // rechecks the pending list under its lock before any write.
+    if (
+      !sameNames(split.expectedPending, approvedPlan!.expectedPending) ||
+      !sameNames(split.held, approvedPlan!.held)
+    )
+      refuse("release_target_pending_changed");
+    const result = await runMigrations(client, {
       profile,
       expectedLedgerSha256: approvedPlan!.ledgerSha256,
+      target: input.target,
+      expectedPending: approvedPlan!.expectedPending,
       beforeWrite: async () => {
         await githubReleaseGate(process.env, get, true);
         await refreshReleaseBoundary(client, approvedPlan!.existingBoundary);
       },
     });
+    if (!sameNames(result.held, approvedPlan!.held))
+      refuse("release_target_readback");
+    // Read back: every approved step is ledgered and no held step is.
+    const ledgered = new Set(
+      (
+        await client.query<{ name: string }>(
+          `SELECT name FROM ${MIGRATION_LEDGER} WHERE name = ANY($1::text[])`,
+          [[...approvedPlan!.expectedPending, ...approvedPlan!.held]],
+        )
+      ).rows.map((r) => r.name),
+    );
+    if (
+      approvedPlan!.expectedPending.some((n) => !ledgered.has(n)) ||
+      approvedPlan!.held.some((n) => ledgered.has(n))
+    )
+      refuse("release_target_readback");
     const marker = (
       await client.query(
         `SELECT generation,status FROM ${ROLE_VALIDATION_TABLE} WHERE name=$1`,
         [ROLE_VALIDATION_NAME],
       )
     ).rows[0];
-    if (marker?.status !== "pass" || marker.generation !== input.generation)
+    // With steps held, phase 2 does not run: the full-tree generation stays 'pending'.
+    const status = approvedPlan!.held.length ? "pending" : "pass";
+    if (marker?.status !== status || marker.generation !== input.generation)
       refuse("release_marker");
     await verifyReleaseBoundary(client);
+    if (approvedPlan!.held.length)
+      console.log("release_target_held " + approvedPlan!.held.length);
     console.log("release_apply_verified");
   } finally {
     await client.end().catch(() => {});
