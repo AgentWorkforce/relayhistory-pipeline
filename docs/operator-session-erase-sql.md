@@ -6,7 +6,7 @@ Their mutators are owner-only helpers from creation; the ingest login gets only 
 read. 050020 grants admission/lease-gated runtime calls and cannot be bypassed through
 legacy helper grants.
 
-Every session_index or session_directory INSERT or UPDATE takes a shared advisory gate in a BEFORE STATEMENT
+Every session_index or session_directory INSERT, UPDATE or DELETE takes a shared advisory gate in a BEFORE STATEMENT
 trigger, before row/conflict locks. Erase owns the same gate exclusively before resolving
 aliases, fencing owners or tombstoning pointers. Concurrent pointer writers remain
 concurrent with each other; operator erase serializes against pointer statements globally.
@@ -48,8 +48,21 @@ reuse would let an old erase job delete the new session's objects. This layout l
 requires a separate identity/layout migration to remove safely.
 
 The gate is database-wide, with no network I/O inside its transaction. Existing
-self-host statement/lock timeouts bound contention. An erase racing another privacy
-control may be aborted by PostgreSQL deadlock detection and must retry. The sequence
+self-host statement/lock timeouts bound contention. The sequence
 epoch is nontransactional: an attempted erase can require READ COMMITTED thereafter
 even if its SQL transaction rolls back. SQL-lane tombstones retain metadata at rest;
 the runtime purge removes the rows before it reports completion.
+
+The global gate precedes user-fence locks and pointer/directory statements. A BEFORE STATEMENT
+trigger on ingest_fence_owners covers ingest_lock_fences (whose first operation is
+INSERT ... ON CONFLICT) and direct first-owner seeders. Thus selection, reset, claim,
+commit, self-host erase and publication retirement all share the gate before taking
+a user fence. This necessarily adds one shared advisory acquisition to the existing
+user-fence path; the permanent-fence lookup itself remains a plain primary-key read.
+Concurrent ordinary writers still share the gate. Operator erase is the exclusive user.
+
+The direct NOWAIT owner-lock sweep found publication scope, pointer guards and buffer
+GC. Publication scope and buffer GC now acquire GLOBAL first; pointer guards run under
+the session_index statement gate (including DELETE) already and retain their nonblocking NOWAIT checks. Replacements preserve role, owner and ACL,
+and rollback restores their exact preceding bodies. Actual PostgreSQL tests drive the
+publication retirement trigger through both selection and reset in both lock orders.

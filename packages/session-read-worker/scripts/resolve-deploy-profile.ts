@@ -1,4 +1,10 @@
-/** Preserve the live buffered-read profile unless the operator explicitly chooses on/off.
+/** Resolve the Reader deploy profile before render. Precedence, highest first:
+ *   1. explicit inputs (owner_buffered=on/off and its child inputs);
+ *   2. the committed production profile, deploy/production-profile.json (DEPLOY_TARGET=production
+ *      only; owner_buffered=profile, the default, or an empty child input under explicit on);
+ *   3. the live Worker version (owner_buffered=preserve, and every setting the profile does not own).
+ * Profile mode is guarded: it may fill a live setting that is unset (the restore case) but refuses
+ * to change or drop one that is set, and never turns owner-buffered reads on from off.
  * Only nonsecret, validated settings cross into GITHUB_ENV. No provider mutation.
  */
 import { appendFileSync, readFileSync } from "node:fs";
@@ -37,6 +43,50 @@ function need(ok: unknown, message: string): asserts ok {
   if (!ok) throw new ProfileError(message);
 }
 class ProfileError extends Error {}
+
+/** The four settings deploy/production-profile.json owns, as resolver/render env keys. */
+export type CommittedProfile = { OWNER_BUFFERED: string; OWNER_BUFFERED_WORKSPACES: string; OWNER_BUFFERED_EVENTS: string; OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: string };
+const PROFILE_FILE_KEYS: Record<string, keyof CommittedProfile> = {
+  owner_buffered: "OWNER_BUFFERED", owner_buffered_workspaces: "OWNER_BUFFERED_WORKSPACES",
+  owner_buffered_events: "OWNER_BUFFERED_EVENTS", owner_buffered_statement_timeout_ms: "OWNER_BUFFERED_STATEMENT_TIMEOUT_MS",
+};
+const PROFILE_CHILDREN = ["OWNER_BUFFERED_WORKSPACES", "OWNER_BUFFERED_EVENTS", "OWNER_BUFFERED_STATEMENT_TIMEOUT_MS"] as const;
+/** Not in the committed profile: profile mode preserves these from live exactly as preserve mode does. */
+const LIVE_ONLY_CHILDREN = ["OWNER_BUFFERED_STAGE_CONCURRENCY", "OWNER_BUFFERED_PHASE_LOG", "OWNER_BUFFERED_INDEX_VERIFY", "BUFFERED_SEARCH_GATE"] as const;
+const PROFILE_FILE = new URL("../deploy/production-profile.json", import.meta.url);
+
+/** Strict: exactly the four keys; workspaces only "*" (never a workspace id in the repo). Values are re-validated by the render. */
+export function parseCommittedProfile(raw: string): CommittedProfile {
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { throw new ProfileError("Committed production profile is not valid JSON"); }
+  need(value !== null && typeof value === "object" && !Array.isArray(value), "Committed production profile must be a JSON object");
+  const entries = Object.entries(value);
+  need(entries.length === 4 && entries.every(([k, v]) => Object.hasOwn(PROFILE_FILE_KEYS, k) && typeof v === "string"), "Committed production profile must set exactly owner_buffered, owner_buffered_workspaces, owner_buffered_events and owner_buffered_statement_timeout_ms as strings");
+  const p = Object.fromEntries(entries.map(([k, v]) => [PROFILE_FILE_KEYS[k], (v as string).trim()])) as CommittedProfile;
+  need(["on", "off"].includes(p.OWNER_BUFFERED) && ["on", "off"].includes(p.OWNER_BUFFERED_EVENTS), "Committed production profile flags must be on or off");
+  need(p.OWNER_BUFFERED_STATEMENT_TIMEOUT_MS === "off" || /^[1-9][0-9]*$/.test(p.OWNER_BUFFERED_STATEMENT_TIMEOUT_MS), "Committed production profile timeout must be off or an integer");
+  need(p.OWNER_BUFFERED === "on" ? p.OWNER_BUFFERED_WORKSPACES === "*" : p.OWNER_BUFFERED_WORKSPACES === "" && p.OWNER_BUFFERED_EVENTS === "off" && p.OWNER_BUFFERED_STATEMENT_TIMEOUT_MS === "off", 'Committed production profile workspaces must be "*" when on (no workspace ids in the repo) and every child off when off');
+  return p;
+}
+
+function productionProfile(): CommittedProfile {
+  let raw: string;
+  try { raw = readFileSync(PROFILE_FILE, "utf8"); } catch { throw new ProfileError("Cannot read the committed production profile"); }
+  return parseCommittedProfile(raw);
+}
+
+/** The guard for profile mode: fill an unset live setting (e.g. the lost statement timeout), never change or drop a set one. */
+function committedOverLive(live: Record<string, string>, profile: CommittedProfile): Record<string, string> {
+  need(!(profile.OWNER_BUFFERED === "on" && live.OWNER_BUFFERED !== "on"), "Live owner-buffered reads are off and a default dispatch does not turn them on; choose explicit owner_buffered=on (or preserve)");
+  need(!(profile.OWNER_BUFFERED === "off" && live.OWNER_BUFFERED === "on"), "The committed production profile would drop live owner-buffered reads; choose explicit owner_buffered=off (or preserve)");
+  const out: Record<string, string> = { OWNER_BUFFERED: profile.OWNER_BUFFERED };
+  for (const key of PROFILE_CHILDREN) {
+    const was = live[key] ?? "";
+    need(was === "" || was === "off" || was === profile[key], `The committed production profile would change or drop the live ${key.toLowerCase()} setting; update deploy/production-profile.json or choose explicit owner_buffered=on/off`);
+    out[key] = profile[key];
+  }
+  return out;
+}
 
 function directoryValue(value: string): string {
   if (value && value !== "*") parseCanaryWorkspaces(value);
@@ -131,28 +181,40 @@ export function profileInputs(env: Environment): RenderInputs {
   };
 }
 
-/** Injected GET for offline tests; production URL/account/script are fixed. */
-export async function resolveProfile(env: Environment, template: string, get: (path: string) => Promise<unknown>): Promise<Record<string, string>> {
-  const mode = env.OWNER_BUFFERED?.trim() || "preserve";
-  need(["preserve", "on", "off"].includes(mode), "owner_buffered must be preserve, on or off");
+/** Injected GET (and profile) for offline tests; production URL/account/script are fixed. */
+export async function resolveProfile(env: Environment, template: string, get: (path: string) => Promise<unknown>, committed?: CommittedProfile): Promise<Record<string, string>> {
+  const requested = env.OWNER_BUFFERED?.trim() || "profile";
+  need(["profile", "preserve", "on", "off"].includes(requested), "owner_buffered must be profile, preserve, on or off");
+  // An empty or "profile" child input defers to the committed profile; below it is simply unset.
+  const explicit: Environment = { ...env };
+  for (const key of PROFILE_CHILDREN) if (!env[key]?.trim() || env[key]!.trim() === "profile") explicit[key] = "";
+  // Only the production deploy target has a committed profile; elsewhere "profile" means preserve.
+  const profile = env.DEPLOY_TARGET === "production" ? committed ?? productionProfile() : undefined;
+  const mode = requested === "profile" && !profile ? "preserve" : requested;
   let resolved: Record<string, string>;
-  if (mode === "preserve") {
+  if (mode === "preserve" || mode === "profile") {
     // Child inputs would otherwise be silently ignored. Require explicit on/off to change them.
-    for (const key of ["OWNER_BUFFERED_EVENTS", "OWNER_BUFFERED_STAGE_CONCURRENCY", "OWNER_BUFFERED_PHASE_LOG", "OWNER_BUFFERED_INDEX_VERIFY", "BUFFERED_SEARCH_GATE", "OWNER_BUFFERED_STATEMENT_TIMEOUT_MS"]) {
-      need(!env[key] || env[key] === "off", "preserve cannot be combined with feature overrides; explicitly choose on/off");
+    for (const key of LIVE_ONLY_CHILDREN) need(!explicit[key] || explicit[key] === "off", `${mode} cannot be combined with feature overrides; explicitly choose on/off`);
+    for (const key of ["OWNER_BUFFERED_EVENTS", "OWNER_BUFFERED_STATEMENT_TIMEOUT_MS"]) {
+      // In preserve, "off" was the old unset default; in profile mode it would override the committed value.
+      need(!explicit[key] || (mode === "preserve" && explicit[key] === "off"), `${mode} cannot be combined with feature overrides; explicitly choose on/off`);
     }
-    need(!env.OWNER_BUFFERED_WORKSPACES, "preserve cannot change the workspace allowlist");
+    need(!explicit.OWNER_BUFFERED_WORKSPACES, `${mode} cannot change the workspace allowlist`);
     const { id, version } = await readLive(get);
-    resolved = { ...preservedProfile(version), PRESERVED_READER_VERSION: id };
-    const requested = requestedDirectory(env);
-    need(requested === undefined || requested === resolved.DIRECTORY_WORKSPACES, "Directory input/environment differs from live; choose explicit owner_buffered=on/off to change the directory list");
+    const live = preservedProfile(version);
+    resolved = { ...live, ...(mode === "profile" ? committedOverLive(live, profile!) : {}), PRESERVED_READER_VERSION: id };
+    const directory = requestedDirectory(env);
+    need(directory === undefined || directory === resolved.DIRECTORY_WORKSPACES, "Directory input/environment differs from live; choose explicit owner_buffered=on/off to change the directory list");
     unchangedOtherSettings(version, template, { ...env, ...resolved });
   } else {
+    // Explicit mode renders the inputs; on production an unset child falls back to the committed profile.
+    const children: Record<string, string> = {};
+    for (const key of PROFILE_CHILDREN) children[key] = explicit[key] || (mode === "on" && profile ? profile[key] : key === "OWNER_BUFFERED_WORKSPACES" ? "" : "off");
     const directory = requestedDirectory(env);
     if (directory === undefined) {
       const { id, version } = await readLive(get);
-      resolved = { OWNER_BUFFERED: mode, DIRECTORY_WORKSPACES: liveDirectory(version), PRESERVED_READER_VERSION: id };
-    } else resolved = { OWNER_BUFFERED: mode, DIRECTORY_WORKSPACES: directory };
+      resolved = { OWNER_BUFFERED: mode, ...children, DIRECTORY_WORKSPACES: liveDirectory(version), PRESERVED_READER_VERSION: id };
+    } else resolved = { OWNER_BUFFERED: mode, ...children, DIRECTORY_WORKSPACES: directory };
   }
   // Use the same validation as the real render: no weaker second interpretation of privacy flags.
   renderDeployConfig(template, profileInputs({ ...env, ...resolved }));
