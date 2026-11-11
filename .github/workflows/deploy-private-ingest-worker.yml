@@ -1,0 +1,169 @@
+name: deploy private-ingest worker
+run-name: private-ingest ${{ inputs.mode }} ${{ inputs.sha }}
+
+# Production deploys are CI-only. The desired profile lives in
+# config/cloudflare/private-ingest-production.json; workflow inputs cannot alter it. A deploy
+# consumes a successful plan artifact from this exact main SHA, re-plans against live Alchemy
+# state, refuses drift/collateral binding changes, applies once, then verifies the current
+# deployment's sole 100% Worker version and its complete INGEST_* profile.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [plan, deploy]
+        default: plan
+        required: true
+      sha:
+        description: Exact current main commit (40 lowercase hex)
+        type: string
+        required: true
+      plan_run:
+        description: Deploy only - successful plan run ID from this SHA (within 24 hours)
+        type: string
+        default: ""
+      confirmation:
+        description: 'Deploy only: DEPLOY 96bulls-session-ingest <sha> PLAN <plan_run>'
+        type: string
+        default: ""
+
+permissions:
+  actions: read
+  contents: read
+  deployments: read
+
+concurrency:
+  group: private-ingest-production
+  cancel-in-progress: false
+
+env:
+  PRIVATE_INGEST_RELEASE_MODE: ${{ inputs.mode }}
+  PRIVATE_INGEST_RELEASE_SHA: ${{ inputs.sha }}
+  PRIVATE_INGEST_RELEASE_PLAN_RUN: ${{ inputs.plan_run }}
+  PRIVATE_INGEST_RELEASE_CONFIRMATION: ${{ inputs.confirmation }}
+
+jobs:
+  # Deliberately outside the environment: a typo must not auto-create an unprotected environment.
+  prerequisite-gate:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      environment: ${{ steps.environment.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without production credentials
+        run: bun install --frozen-lockfile
+      - name: Verify exact main, green CI, protected environment and prior plan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/private-ingest-release-github.ts
+      - id: environment
+        run: echo 'name=private-ingest-production' >> "$GITHUB_OUTPUT"
+
+  operator:
+    needs: prerequisite-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: ${{ needs.prerequisite-gate.outputs.environment }}
+    env:
+      CI: "true"
+      CLOUDFLARE_ACCOUNT_ID: f7232cb80f6fab86a95426302af243e4
+      PRIVATE_INGEST_STATE_URL: ${{ vars.PRIVATE_INGEST_STATE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install without production credentials
+        run: bun install --frozen-lockfile
+      - name: Verify actual environment approval and release context
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/private-ingest-release-github.ts --approved
+      - name: Check environment configuration
+        env:
+          HAS_CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN != '' && 'yes' || '' }}
+          HAS_STATE_TOKEN: ${{ secrets.PRIVATE_INGEST_STATE_TOKEN != '' && 'yes' || '' }}
+        run: |
+          test "$HAS_CF_TOKEN" = yes || { echo '::error::CLOUDFLARE_API_TOKEN is not configured'; exit 1; }
+          test "$HAS_STATE_TOKEN" = yes || { echo '::error::PRIVATE_INGEST_STATE_TOKEN is not configured'; exit 1; }
+          case "$PRIVATE_INGEST_STATE_URL" in
+            https://alchemy-state-store-96bulls.*.workers.dev) ;;
+            *) echo '::error::PRIVATE_INGEST_STATE_URL is not the pinned HTTPS state Worker'; exit 1 ;;
+          esac
+      - name: Materialize and validate the tracked production profile
+        id: profile
+        run: bun scripts/private-ingest-ci.ts stage
+      - name: Capture the read-only live plan
+        if: inputs.mode == 'plan'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRIVATE_INGEST_STATE_TOKEN: ${{ secrets.PRIVATE_INGEST_STATE_TOKEN }}
+        run: >-
+          bun scripts/private-ingest-operator.ts plan
+          --expected-sha "$GITHUB_SHA"
+          --inputs-sha256 "${{ steps.profile.outputs.inputs_sha256 }}"
+      - name: Publish the nonsecret retained plan
+        if: inputs.mode == 'plan'
+        uses: actions/upload-artifact@v4
+        with:
+          name: private-ingest-plan
+          path: |
+            docs/plans/cf-sessions-prod.plan.txt
+            docs/plans/cf-sessions-prod.plan.detailed.txt
+            docs/plans/cf-sessions-prod.inputs.sanitized.json
+            docs/plans/cf-sessions-prod.provenance.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Download the exact prior plan
+        if: inputs.mode == 'deploy'
+        uses: actions/download-artifact@v4
+        with:
+          name: private-ingest-plan
+          path: docs/plans
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.plan_run }}
+          github-token: ${{ github.token }}
+      - name: Bind Khaliq's authorization to the retained capture
+        if: inputs.mode == 'deploy'
+        id: approval
+        run: bun scripts/private-ingest-ci.ts approve
+      - name: Re-plan, refuse drift, and deploy the retained plan once
+        if: inputs.mode == 'deploy'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRIVATE_INGEST_STATE_TOKEN: ${{ secrets.PRIVATE_INGEST_STATE_TOKEN }}
+          PRIVATE_INGEST_GITHUB_GATE: approved
+        run: >-
+          bun scripts/private-ingest-operator.ts deploy
+          --expected-sha "$GITHUB_SHA"
+          --inputs-sha256 "${{ steps.profile.outputs.inputs_sha256 }}"
+          --provenance-sha256 "${{ steps.approval.outputs.provenance_sha256 }}"
+      - name: Verify the current 100% version and exact ingest profile
+        if: inputs.mode == 'deploy'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: bun scripts/private-ingest-ci.ts readback
+      - name: Publish the nonsecret deploy readback
+        if: inputs.mode == 'deploy'
+        uses: actions/upload-artifact@v4
+        with:
+          name: private-ingest-readback
+          path: release-receipt/private-ingest-readback.json
+          if-no-files-found: error
+          retention-days: 30

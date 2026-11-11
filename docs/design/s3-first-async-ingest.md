@@ -430,6 +430,10 @@ Rollback:
 ## Deploy inputs (for the Worker deploy actor)
 
 - **Source:** the merge SHA of this change on `main`, with PR #367 merged.
+- **Production execution:** CI only, through `.github/workflows/deploy-private-ingest-worker.yml`.
+  The desired profile is committed at `config/cloudflare/private-ingest-production.json`; a plan
+  run and a separate capture-bound deploy run from the same exact green `main` SHA are required.
+  Local Wrangler/Alchemy deploys are not a production path.
 - **Stack input:** `sessionIngest.asyncAdmission` = `"on"` | `"drain"` | `"off"`. Buffered stage:
   omitted means `"on"` (the three admission resources, the binding and the var); `"off"` renders
   exactly the pre-admission stage (no queue, DLQ, consumer, binding or var). Canonical stage: omit

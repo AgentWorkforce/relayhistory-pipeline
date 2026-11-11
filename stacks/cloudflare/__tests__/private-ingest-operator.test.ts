@@ -113,10 +113,14 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
     CI: process.env.CI,
     CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID,
     CLOUDFLARE_API_TOKEN: process.env.CLOUDFLARE_API_TOKEN,
+    GITHUB_ACTIONS: process.env.GITHUB_ACTIONS,
+    PRIVATE_INGEST_GITHUB_GATE: process.env.PRIVATE_INGEST_GITHUB_GATE,
   };
   process.env.CI = "true";
   process.env.CLOUDFLARE_ACCOUNT_ID = secrets.accountId;
   process.env.CLOUDFLARE_API_TOKEN = secrets.apiToken;
+  process.env.GITHUB_ACTIONS = "true";
+  process.env.PRIVATE_INGEST_GITHUB_GATE = "approved";
   const fetcher: typeof fetch = async (input, init) => {
     const u = new URL(String(input)),
       method = init?.method ?? "GET";
@@ -711,6 +715,43 @@ test("retained deploy rejects a missing actual capture before any transport", as
     }),
   ).rejects.toMatchObject({ code: "retained_deploy_approval_required" });
   expect(called).toBe(0);
+});
+
+test("even an imported retained deploy refuses outside the guarded GitHub Actions lane", async () => {
+  let called = 0;
+  const before = {
+    CI: process.env.CI,
+    CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID,
+    CLOUDFLARE_API_TOKEN: process.env.CLOUDFLARE_API_TOKEN,
+    GITHUB_ACTIONS: process.env.GITHUB_ACTIONS,
+    PRIVATE_INGEST_GITHUB_GATE: process.env.PRIVATE_INGEST_GITHUB_GATE,
+  };
+  process.env.CI = "true";
+  process.env.CLOUDFLARE_ACCOUNT_ID = secrets.accountId;
+  process.env.CLOUDFLARE_API_TOKEN = secrets.apiToken;
+  delete process.env.GITHUB_ACTIONS;
+  delete process.env.PRIVATE_INGEST_GITHUB_GATE;
+  try {
+    await expect(retainedOperatorPlan(secrets, "deploy", input, () => {}, {
+      directory: "unused",
+      emptyEnvPath: "unused",
+      fetcher: async () => { called++; throw Error("network must not run"); },
+      reviewed: {
+        options: { mode: "deploy", sourceSha: source.commit, inputsSha256: "a".repeat(64) },
+        source,
+        inputText: JSON.stringify(input),
+        provenanceText: "{}",
+        tools,
+        recheckSource: () => {},
+      },
+    })).rejects.toMatchObject({ code: "github_actions_deploy_required" });
+    expect(called).toBe(0);
+  } finally {
+    for (const [key, value] of Object.entries(before)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test("deployment transport refuses public URLs, foreign queue/state writes and control-store upgrades before network", async () => {

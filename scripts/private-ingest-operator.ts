@@ -1,5 +1,5 @@
 /** Source-only operator adapter. No operation happens on import.
- * Real execution requires a separately reviewed operator exception; no CI bypass.
+ * Real execution requires the guarded GitHub Actions production workflow.
  */
 import { createHash } from "node:crypto";
 import { hostname } from "node:os";
@@ -60,9 +60,13 @@ import {
   SIGNING_KEY_SECRET,
 } from "../stacks/cloudflare/session-ingest.ts";
 import { sanitizePlan, captureFiles } from "../src/cli/plan-provenance.ts";
+import {
+  privateIngestGithubGate,
+  privateIngestGithubGet,
+} from "./private-ingest-release-github.ts";
 export const OPERATOR_PROTOCOL = "private-ingest-operator-v1";
 export const STATE_SCRIPT = "alchemy-state-store-96bulls";
-export const EXECUTION_EXCEPTION = "ssh-sf-frame-retained-plan";
+export const EXECUTION_EXCEPTION = "github-actions-retained-plan";
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const isHash = (s: unknown): s is string =>
   typeof s === "string" && /^[0-9a-f]{64}$/u.test(s);
@@ -1096,6 +1100,12 @@ export async function retainedOperatorPlan(
   )
     refuse("retained_deploy_approval_required");
   if (
+    mode === "deploy" &&
+    (process.env.GITHUB_ACTIONS !== "true" ||
+      process.env.PRIVATE_INGEST_GITHUB_GATE !== "approved")
+  )
+    refuse("github_actions_deploy_required");
+  if (
     process.env.CI !== "true" ||
     process.env.CLOUDFLARE_ACCOUNT_ID !== secrets.accountId ||
     process.env.CLOUDFLARE_API_TOKEN !== secrets.apiToken
@@ -1294,6 +1304,14 @@ const PREFIX = "docs/plans/" + SESSION_INGEST_STAGE;
 export async function operatorMain(argv = process.argv.slice(2)) {
   const options = parseOptions(argv);
   if (process.env.CI !== "true") refuse("ci_state_safety_required");
+  if (
+    options.mode === "deploy" &&
+    (process.env.GITHUB_ACTIONS !== "true" ||
+      process.env.PRIVATE_INGEST_GITHUB_GATE !== "approved")
+  )
+    refuse("github_actions_deploy_required");
+  if (options.mode === "deploy")
+    await privateIngestGithubGate(process.env, privateIngestGithubGet(), true);
   const git = (args: string[]) => {
     const result = spawnSync("git", args, {
       encoding: "utf8",

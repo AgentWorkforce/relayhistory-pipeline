@@ -1,0 +1,17 @@
+{
+  "sessionIngest": {
+    "acceptanceMode": "buffered",
+    "accountId": "f7232cb80f6fab86a95426302af243e4",
+    "expectedGeneration": "7db65adb97f034a7b4cc2c85c87da2ebadf969f6bb74096f33ae00ad83e500a4",
+    "hyperdriveId": "0fcc0265e96f43a39976b5aa4263f4a6",
+    "secretsStoreId": "59e0dcc52f0a4bd7863730548299fb2f",
+    "kmsKeyArn": "arn:aws:kms:us-east-1:941433935742:key/c74376a5-f6ff-4ef0-9a26-543c940094ba",
+    "maxPerUser": 4,
+    "maxPerOrg": 32,
+    "inlineMaxSessions": 0,
+    "replicaMode": "off",
+    "claimLockBusy": "on",
+    "custodySource": "frozen-supabase",
+    "asyncAdmission": "drain"
+  }
+}
