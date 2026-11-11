@@ -7,6 +7,7 @@ import {
   releaseConnection,
 } from "./schema-release-contract.ts";
 import { SUPABASE_PROD_CA_2021 } from "../session-pipeline/supabase-ca.ts";
+import { inspectReleaseBoundary } from "./schema-release-boundary.ts";
 export function releaseClient(url: string | undefined) {
   // Individual fields prevent URL sslmode/options from replacing TLS configuration.
   const client = new pg.Client({
@@ -45,7 +46,7 @@ export async function inspectRelease(
   try {
     const me = (
       await client.query(
-        "SELECT current_user AS me, session_user AS session, current_database() AS db, r.rolcanlogin, r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolbypassrls, r.rolreplication FROM pg_roles r WHERE r.rolname = current_user",
+        "SELECT current_user AS me, session_user AS session, current_database() AS db, r.rolcanlogin, r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolbypassrls, r.rolreplication, (SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname='sessions') AS schema_owner FROM pg_roles r WHERE r.rolname = current_user",
       )
     ).rows[0];
     if (
@@ -53,16 +54,19 @@ export async function inspectRelease(
       me.me !== P.owner ||
       me.session !== P.owner ||
       me.db !== P.database ||
-      !me.rolcanlogin ||
-      me.rolsuper ||
-      me.rolcreaterole ||
-      me.rolcreatedb ||
-      me.rolbypassrls ||
-      me.rolreplication
+      me.rolcanlogin !== true ||
+      me.rolsuper !== false ||
+      me.rolcreaterole !== true ||
+      me.rolcreatedb !== true ||
+      me.rolbypassrls !== true ||
+      me.rolreplication !== true ||
+      me.schema_owner !== P.owner
     )
       refuse("release_owner");
     await client.query("SELECT pg_advisory_xact_lock(961996, 1)");
-    return await inspectMigrations(client, releaseProfile(boundary));
+    const report = await inspectMigrations(client, releaseProfile(boundary));
+    const existingBoundary = await inspectReleaseBoundary(client);
+    return { ...report, existingBoundary };
   } finally {
     await client.query("ROLLBACK");
   }

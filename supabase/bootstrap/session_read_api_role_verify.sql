@@ -139,6 +139,7 @@ BEGIN
          'sessions.session_brief_summary_for(text,text,text)',
          'sessions.session_brief_titles_for(text,text[],text[])',
          'sessions.session_directory_activity_for(text,timestamp with time zone,timestamp with time zone)',
+         'sessions.session_directory_users_for(text,timestamp with time zone,timestamp with time zone,integer)',
          'sessions.session_summary_activity_for(text,timestamp with time zone,timestamp with time zone)')
   LOOP
     v_problems := array_append(v_problems, (format('EXECUTE on security definer %s', v_row.fn))::text);

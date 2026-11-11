@@ -16,9 +16,9 @@ on:
         type: string
         required: true
       boundary:
-        description: Existing catalog-proven control; never installed by this workflow
+        description: Catalog-proven global control; apply refreshes the reviewed event trigger
         type: choice
-        options: [event-trigger, global-default-revoke]
+        options: [global-default-revoke]
         required: true
       plan_run:
         description: Apply only - successful plan run ID from this SHA (within 24 hours)
@@ -97,7 +97,7 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.plan_run }}
           github-token: ${{ github.token }}
-      - name: Read-only plan or approved apply (only step with database secret)
+      - name: Read-only plan or approved boundary-refresh and apply (only step with database secret)
         env:
           GITHUB_TOKEN: ${{ github.token }}
           SUPABASE_MIGRATION_OWNER_URL: ${{ secrets.SUPABASE_MIGRATION_OWNER_URL }}

@@ -140,8 +140,8 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
    // prove the enforced consumer upsert cannot register a new canonical alias after the fence.
    await db.query(`INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,content_sha256,raw_format,trace_id)
     VALUES($1,$2,'claude','sess_1',$3,$4,now()-interval '1 hour',now(),'s3',$5,$6,decode(repeat('ab',32),'hex'),'jsonl',$7)`, [TENANT.orgId, TENANT.workspaceId, machine, TENANT.userId, bucket, manifestKey, crypto.randomUUID()]);
-   await db.query(`INSERT INTO sessions.session_directory(org_id,workspace_id,harness,session_id,created_at,last_activity_at,title,event_count,projected_at)
-    VALUES($1,$2,'claude','sess_1',now(),now(),'private title',1,now())`, [TENANT.orgId, TENANT.workspaceId]);
+   await db.query(`INSERT INTO sessions.session_directory(org_id,workspace_id,harness,session_id,created_at,last_activity_at,title,event_count,projected_at,user_ids)
+    VALUES($1,$2,'claude','sess_1',now(),now(),'private title',1,now(),ARRAY[$3]::text[])`, [TENANT.orgId, TENANT.workspaceId, TENANT.userId]);
    await db.query(`INSERT INTO sessions.session_briefs(org_id,workspace_id,harness,session_id,status,revision,title,description,model,generated_at,brief_revision,brief_source_revisions,brief_fingerprint,scrub_ruleset,scrub_version,prompt_version,engine_version)
     VALUES($1,$2,'claude','sess_1','ready',1,'private title','private summary','fixture-model',now(),1,'{}'::jsonb,repeat('a',64),'relayhistory-scrub',2,'session-summary-v2','fixture')`, [TENANT.orgId, TENANT.workspaceId]);
    await db.query("UPDATE sessions.session_briefs SET brief_source_revisions=(SELECT jsonb_object_agg(machine_id,revision) FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2) WHERE org_id=$1 AND workspace_id=$2", [TENANT.orgId,TENANT.workspaceId]);
@@ -157,6 +157,8 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
    const summaryDay = (await db.query<{ day: string }>("SELECT (generated_at AT TIME ZONE 'UTC')::date::text AS day FROM sessions.session_briefs WHERE org_id=$1 AND workspace_id=$2 AND session_id='sess_1'",[TENANT.orgId,TENANT.workspaceId])).rows[0]!.day;
    const summaryActivity = `/v1/sessions/summaries/activity?workspace=${TENANT.workspaceId}&since=${summaryDay}T00:00:00.000Z&until=${summaryDay}T23:59:59.999Z`;
    expect(await (await read(summaryActivity)).json()).toMatchObject({days:[{date:summaryDay,total:1}]});
+   const sessionUsers = `/v1/sessions/users?workspace=${TENANT.workspaceId}&lastTsAfter=${summaryDay}T00:00:00.000Z&lastTsBefore=${summaryDay}T23:59:59.999Z`;
+   expect(await (await read(sessionUsers)).json()).toMatchObject({users:[{userId:TENANT.userId,sessions:1}],truncated:false});
    const beforeEvents = await read(events); expect({ status: beforeEvents.status, body: await beforeEvents.text() }).toMatchObject({ status: 200 });
    expect(await (await read(summary)).json()).toMatchObject({ summary: { status: "ready", summary: "private summary" } });
    expect((await read(`/v1/sessions?workspace=${TENANT.workspaceId}`)).status).toBe(200);
@@ -179,6 +181,7 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
    expect((await read(events)).status).toBe(404);
    // The aggregate added by #521 also hides the brief immediately, before byte cleanup.
    expect(await (await read(summaryActivity)).json()).toMatchObject({days:[{date:summaryDay,total:0}]});
+   expect(await (await read(sessionUsers)).json()).toMatchObject({users:[],truncated:false});
    worker = sessionEraseWorker({ ledger, identity, bytes: {
     stagesAbsent: (key, authorize) => stagedObjectsAbsent(eraser, root, key, authorize),
     erase: (k, authorize) => eraseDiscoveredSessionBytes(eraser, k, { keyRoot: root, bucket: bucket!, authorize, log: () => {} }),
@@ -205,6 +208,7 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
    for (const p of [events, summary, `/v1/sessions/sess_1/metadata?workspace=${TENANT.workspaceId}&source=claude`, `/v1/sessions/sess_1/turns?workspace=${TENANT.workspaceId}&source=claude`]) expect((await read(p)).status).toBe(404);
    expect(await (await read(`/v1/sessions?workspace=${TENANT.workspaceId}`)).json()).toMatchObject({ sessions: [] });
    expect(await (await read(summaryActivity)).json()).toMatchObject({days:[{date:summaryDay,total:0}]});
+   expect(await (await read(sessionUsers)).json()).toMatchObject({users:[],truncated:false});
    expect(await (await read(`/v1/events?workspace=${TENANT.workspaceId}&q=eraseflowneedle&limit=50`)).text()).not.toContain("eraseflowneedle");
    for (const k of [rawKey, manifestKey]) await expect(store.get(objectKey(k))).rejects.toMatchObject({ code: "not_found" });
    expect(new TextDecoder().decode(await readAll(await store.get(objectKey(neighbour))))).toBe("neighbor control");
@@ -219,6 +223,7 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
    expect((await upload("layout-collision","alias-origin","sess:1")).status).toBe(409);
    expect((await ledger.receipt(key))?.status).toBe("completed");
    expect(await (await read(summaryActivity)).json()).toMatchObject({days:[{date:summaryDay,total:0}]});
+   expect(await (await read(sessionUsers)).json()).toMatchObject({users:[],truncated:false});
    const inventory = await eraser.verifyErased(manifestKey.slice(0, manifestKey.lastIndexOf("/") + 1), { authorize: async () => {} });
    expect(inventory.status).toBe("erased");
    expect((await db.query("SELECT 1 FROM sessions.session_index WHERE session_id='sess_1'")).rows).toEqual([]);

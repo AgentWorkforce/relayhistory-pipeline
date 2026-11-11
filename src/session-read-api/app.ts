@@ -31,6 +31,7 @@ import { BriefSummaryError, briefSummaryResponse, summaryActivityDays, type Brie
  *   GET /v1/sessions/activity       sessions per UTC day without `q` (span semantics)
  *   GET /v1/sessions/summaries/activity  ready native summaries per UTC day (counts only;
  *                                   brief-summary.ts, migration 20261105056000)
+ *   GET /v1/sessions/users          per-user session counts (one aggregate, migration 20261105057000)
  * Both answer 501 `directory_workspace_not_enabled` unless the token's workspace is on
  * READ_API_DIRECTORY_WORKSPACES (the canary allowlist; unset = none), and 501
  * `directory_not_migrated` until migration 20261105034000 is applied. Never Neon.
@@ -95,6 +96,7 @@ import { DIGEST_OMITTED_FIELDS, DigestDirectoryUnavailable, computeStatsHash } f
 import { resolveDigestNarrative, type DigestNarrativeDeps } from "./digest-narrative.ts";
 import {
   DIRECTORY_LIST_MAX_LIMIT,
+  DIRECTORY_USERS_MAX,
   DirectoryError,
   activityDates,
   activityDays,
@@ -106,6 +108,7 @@ import {
   LIST_CURSOR_PREFIX,
   QUERY_CURSOR_PREFIX,
   sessionFromDirectoryRow,
+  sessionUsersPage,
   type BufferedListCursor,
   type DirectoryCursor,
   type Directory,
@@ -337,6 +340,8 @@ const MAX_LIST_ID_LENGTH = 255;
 const MAX_AGENT_LENGTH = 200;
 const HARNESS_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 /** Session-list parameters the directory cannot answer: event or text questions. */
+/** The only parameters GET /v1/sessions/users reads; any other is not silently ignored (501). */
+const SESSION_USERS_PARAMS: ReadonlySet<string> = new Set(["workspace", "lastTsAfter", "lastTsBefore"]);
 const LIST_UNSUPPORTED_PARAMS = ["q", "search", "project", "noProject", "kind", "taskRef", "noTaskRef", "tag", "since", "until"];
 
 /** relayhistory lib/recall.ts limits. */
@@ -1261,6 +1266,43 @@ export function createReadApi(deps: ReadApiDeps) {
         return c.json({ error: { code: "backend_unavailable", message: "read backend unavailable" }, correlationId: c.get("correlationId") }, 503);
       }
       return fail(c, error);
+    }
+  });
+
+  /**
+   * GET /v1/sessions/users?workspace=&lastTsAfter=&lastTsBefore=: per-user session counts for
+   * the owner-only Usage "People" table, one bounded aggregate instead of paging the list.
+   * Counts the directory sessions GET /v1/sessions lists for the same lastTsAfter/lastTsBefore
+   * (last activity >= after and < before; erased sessions never), once per user id of each
+   * session, with the latest activity and up to 3 project ids. At most DIRECTORY_USERS_MAX
+   * users, sessions desc then user id; `truncated` when there were more. Both bounds are
+   * required and span at most MAX_SESSION_ACTIVITY_DAYS UTC days, as /v1/sessions/activity.
+   * Owner-buffered (unpublished) sessions are not in the directory and are not counted.
+   * 501 `directory_not_migrated` until migration 20261105057000 is applied, and
+   * `directory_users_not_supported` on a backend without the aggregate.
+   */
+  app.get("/v1/sessions/users", async (c) => {
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      const directory = directoryFor(identity);
+      for (const name of Object.keys(c.req.queries()))
+        if (!SESSION_USERS_PARAMS.has(name)) throw unsupported(`param_${name}`);
+      const rawAfter = single(c, "lastTsAfter");
+      const rawBefore = single(c, "lastTsBefore");
+      if (!rawAfter || !rawBefore) throw bad("lastTsAfter and lastTsBefore are required");
+      const after = new Date(parseTime(rawAfter, "lastTsAfter")!);
+      const before = new Date(parseTime(rawBefore, "lastTsBefore")!);
+      if (after > before) throw bad("an *After bound must not be later than its *Before bound");
+      const days = Math.round((Date.UTC(before.getUTCFullYear(), before.getUTCMonth(), before.getUTCDate()) - Date.UTC(after.getUTCFullYear(), after.getUTCMonth(), after.getUTCDate())) / 86_400_000) + 1;
+      if (days > MAX_SESSION_ACTIVITY_DAYS) throw bad(`lastTsAfter and lastTsBefore may span at most ${MAX_SESSION_ACTIVITY_DAYS} UTC days`);
+      if (!directory.users) throw unsupported("directory_users_not_supported");
+      const rows = await directory.users(identity.orgId, identity.workspaceId, after, before, DIRECTORY_USERS_MAX);
+      if (rows === null) throw unsupported("directory_not_migrated");
+      const page = sessionUsersPage(rows, DIRECTORY_USERS_MAX);
+      return c.json({ lastTsAfter: after.toISOString(), lastTsBefore: before.toISOString(), users: page.users, truncated: page.truncated });
+    } catch (error) {
+      return directoryFail(c, error);
     }
   });
 
