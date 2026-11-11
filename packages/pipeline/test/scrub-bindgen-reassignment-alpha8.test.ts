@@ -108,7 +108,7 @@ describe("alpha.8 bare-reassignment repair through the pipeline's bound wasm", (
     let seq = 0;
     for (const [input, expected, secret] of REDACTED) {
       const out = await sealer!(store, chunk(`${JSON.stringify({ type: "user", text: input })}\n`, seq++));
-      const object = await store.getObject(out.key);
+      const object = await store.getObject(out.key as Parameters<ObjectStore["getObject"]>[0]);
       const stored = new TextDecoder().decode(zstdDecompressSync(await readAll(object.body)));
       expect(JSON.parse(stored.trim()).text, input).toBe(expected);
       expect(stored).not.toContain(secret);
