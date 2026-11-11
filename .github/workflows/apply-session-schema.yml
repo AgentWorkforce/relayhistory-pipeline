@@ -15,11 +15,6 @@ on:
         description: Exact migration --generation from this SHA (64 lowercase hex)
         type: string
         required: true
-      boundary:
-        description: Catalog-proven global control; apply refreshes the reviewed event trigger
-        type: choice
-        options: [global-default-revoke]
-        required: true
       target:
         description: "Last schema step this release may apply, exactly as ledgered (e.g. upstream:20261105047000_coordination_fact_readers.sql); pending steps after it are held and never applied"
         type: string
@@ -32,6 +27,11 @@ on:
         description: "Apply only - targetGeneration from the plan's plan.json (64 lowercase hex): --generation at target_sha, the generation this apply marks PASS; equals generation when nothing is held"
         type: string
         default: ""
+      boundary:
+        description: Catalog-proven global control; apply refreshes the reviewed event trigger
+        type: choice
+        options: [global-default-revoke]
+        required: true
       plan_run:
         description: Apply only - successful plan run ID from this SHA (within 24 hours)
         type: string
