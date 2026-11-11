@@ -341,7 +341,9 @@ export async function checkUploadConsent(
       // Report never refuses: with the store unreadable (e.g. the migration not yet applied) it logs and
       // accepts. hold-only / enforce, or an operator cap, fail closed (the caller answers 503, no ACK).
       if (enforcement !== "report") throw error;
-      log({ route: UPLOAD_CONSENT_METRIC, error_code: "upload_consent_store_unavailable", state: "reported", stage: `${options.route ?? "upload"}:${options.phase}`, org_id: tenant.orgId, workspace_id: tenant.workspaceId, outcome: enforcement });
+      // The store's closed code only (e.g. ledger_sqlstate_42883 when the migration is missing), never a message.
+      const code = (error as { code?: unknown })?.code;
+      log({ route: UPLOAD_CONSENT_METRIC, error_code: "upload_consent_store_unavailable", ...(typeof code === "string" && /^[a-z0-9_]{1,64}$/.test(code) ? { db_error_code: code } : {}), state: "reported", stage: `${options.route ?? "upload"}:${options.phase}`, org_id: tenant.orgId, workspace_id: tenant.workspaceId, outcome: enforcement });
       return null;
     }
     decision = decideUploadConsent(snapshot, records, options);

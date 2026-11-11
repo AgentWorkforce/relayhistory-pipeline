@@ -32,7 +32,10 @@ normal reviewed deploy. Self-host sets the same env var on the pipeline image.
    `supabase/rollbacks/20261105057010_upload_consent.down.sql`.
 2. **Report mode.** Set `sessionIngest.uploadConsent: "report"` and deploy. Report never refuses an upload:
    it logs `route=upload_consent_refused state=reported` with the outcome class and counts. If the consent
-   store is unreadable, it logs `error_code=upload_consent_store_unavailable` and accepts. Expect
+   store is unreadable, it logs `error_code=upload_consent_store_unavailable` (with the store's `db_error_code`)
+   and accepts. One exception: on self-host with `RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS=enforce` and an
+   operator `sharing_mode` of `selected`/`new`, the operator's cap is enforced even in report mode, and fails
+   closed (503) when the store is unreadable. Expect
    `reason=no_policy` for every principal, which sizes the cohort. A selection disable, though, answers
    503 when it cannot record the principal-wide deny. The Desktop retries, and the fence write is
    idempotent, so a "Don't upload" is never silently lost. That is why the migration comes first.

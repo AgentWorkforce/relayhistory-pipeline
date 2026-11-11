@@ -633,6 +633,14 @@ describe("session ingest: INGEST_UPLOAD_CONSENT (default off)", () => {
   const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };
   const canonical: SessionIngestInputs = { ...inputs, acceptanceMode: "canonical" };
 
+  it("omitted: the var set is exactly main's (pinned), with no INGEST_UPLOAD_CONSENT", () => {
+    // Pinned from origin/main before this input existed, so the comparison is not the PR against itself.
+    const base = ["INGEST_INLINE_MAX_SESSIONS", "INGEST_KEY_ROOT", "INGEST_KMS_KEY_ARN", "INGEST_MAX_PER_ORG", "INGEST_MAX_PER_USER", "INGEST_REPLICA_MODE", "INGEST_S3_BUCKET", "INGEST_S3_REGION"];
+    expect(Object.keys(sessionIngestVars(inputs)).sort()).toEqual(base);
+    expect(Object.keys(sessionIngestVars(canonical)).sort()).toEqual(base);
+    expect(Object.keys(sessionIngestVars(buffered)).sort()).toEqual(["INGEST_ACCEPTANCE_MODE", "INGEST_EXPECT_GENERATION", ...base].sort());
+  });
+
   it("omitted: no INGEST_UPLOAD_CONSENT key at all, vars and props byte-identical to a stack without the input", () => {
     for (const p of [inputs, canonical, buffered]) {
       expect(Object.hasOwn(sessionIngestVars(p), "INGEST_UPLOAD_CONSENT")).toBe(false);
