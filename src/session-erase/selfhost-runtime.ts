@@ -49,6 +49,26 @@ function searchTarget(raw: string) {
   } catch { throw Error("96bulls: operator erase search database configuration invalid"); }
 }
 
+/** Managed Postgres records a CREATEROLE owner's admin-only creator edge.
+ * It may manage credentials, but cannot SET ROLE or inherit eraser grants. */
+export async function assertEraseSearchIdentity(db: Pick<pg.Pool, "query">): Promise<void> {
+  const { rows } = await db.query(`SELECT current_user=session_user AND current_user=$1
+    AND EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=pg_backend_pid() AND usename=session_user) AND NOT r.rolsuper
+    AND NOT r.rolbypassrls AND NOT r.rolcreaterole AND NOT r.rolcreatedb AND NOT r.rolreplication AND NOT r.rolinherit
+    AND NOT EXISTS(SELECT 1 FROM pg_auth_members WHERE member=r.oid) AS safe FROM pg_roles r WHERE r.rolname=current_user`, [SEARCH_ROLE]);
+  if (rows.length !== 1 || rows[0].safe !== true) throw Error("96bulls: operator erase search login refused");
+  const version = await db.query(`SELECT current_setting('server_version_num')::int AS v`);
+  const incoming = await db.query((version.rows[0]?.v ?? 0) >= 160000
+    ? `SELECT a.admin_option AS admin, a.inherit_option AS inherit, a.set_option AS set,
+        a.member=(SELECT nspowner FROM pg_namespace WHERE nspname='search_index') AS owner
+        FROM pg_auth_members a WHERE a.roleid=current_user::regrole`
+    : `SELECT a.admin_option AS admin, false AS inherit, false AS set,
+        a.member=(SELECT nspowner FROM pg_namespace WHERE nspname='search_index') AS owner
+        FROM pg_auth_members a WHERE a.roleid=current_user::regrole`);
+  if (incoming.rows.some(row => row.admin !== true || row.inherit !== false || row.set !== false || row.owner !== true))
+    throw Error("96bulls: operator erase search login refused");
+}
+
 /** A separate delete-only search login; the ingest login gains no search table access. */
 async function postgresSearch(env: NodeJS.ProcessEnv, metadata: pg.PoolConfig): Promise<{ port: EraseSearchPort; close(): Promise<void> }> {
   if (!env.SESSION_ERASE_SEARCH_POSTGRES_URL) throw Error("96bulls: SESSION_ERASE_SEARCH_POSTGRES_URL required for operator erase");
@@ -60,11 +80,7 @@ async function postgresSearch(env: NodeJS.ProcessEnv, metadata: pg.PoolConfig): 
     connectionTimeoutMillis: 2_000, idleTimeoutMillis: 60_000 });
   pool.on("error", () => {});
   try {
-    const { rows } = await pool.query(`SELECT current_user=session_user AND current_user=$1
-      AND EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=pg_backend_pid() AND usename=session_user) AND NOT r.rolsuper
-      AND NOT r.rolbypassrls AND NOT r.rolcreaterole AND NOT r.rolcreatedb AND NOT r.rolreplication AND NOT r.rolinherit
-      AND NOT EXISTS(SELECT 1 FROM pg_auth_members WHERE member=r.oid OR roleid=r.oid) AS safe FROM pg_roles r WHERE r.rolname=current_user`, [SEARCH_ROLE]);
-    if (rows.length !== 1 || rows[0].safe !== true) throw Error("96bulls: operator erase search login refused");
+    await assertEraseSearchIdentity(pool);
     const acl = await pool.query(`SELECT
       NOT has_table_privilege(current_user,'search_index.transcript_events','SELECT,INSERT,UPDATE,TRUNCATE,REFERENCES,TRIGGER')
       AND NOT has_table_privilege(current_user,'search_index.projection_state','SELECT,INSERT,UPDATE,TRUNCATE,REFERENCES,TRIGGER')
