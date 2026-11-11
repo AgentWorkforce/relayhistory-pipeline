@@ -429,7 +429,7 @@ jobs:
             await s3("PUT", "?versioning", `<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>`);
           '
           log=frontier-plan-pg${{ matrix.pg }}.log
-          bun test src/session-ingest/__tests__/frontier-plan.postgres.test.ts 2>&1 | tee "$log"
+          bun test src/session-ingest/__tests__/frontier-plan.postgres.test.ts src/session-erase/__tests__/selfhost-eraser.minio.test.ts 2>&1 | tee "$log"
           grep -Eq '^ *[1-9][0-9]* pass$' "$log"
           if grep -Eq '^ *[1-9][0-9]* skip$' "$log"; then echo "tests were skipped"; exit 1; fi
           grep -E '^ *[0-9]+ (pass|fail)$' "$log" | tr -s ' ' | paste -sd, | sed "s/^/frontier-plan PostgreSQL ${{ matrix.pg }}:/" >> "$GITHUB_STEP_SUMMARY"

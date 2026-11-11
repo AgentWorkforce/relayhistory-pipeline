@@ -137,6 +137,36 @@ export interface EraseTarget {
   prefix: string;
   /** Exact-key mode: only this key under `prefix`. */
   exactKey?: string;
+  /** Internally constructed scope filter; never accepted from an operator request. */
+  match?: RegExp;
+}
+
+const escapePattern = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const matchesTarget = (t: EraseTarget, k: string) => k.startsWith(t.prefix)
+  && (t.exactKey !== undefined ? k === t.exactKey : k.length > t.prefix.length && (!t.match || t.match.test(k)));
+
+/**
+ * Find every date and machine, including objects whose pointer was never indexed.
+ * A scope scan selects only exact layout segments. It also covers publication generations;
+ * unrelated sessions in the same listing are never destructive authority.
+ * The caller must first fence uploads and drain its write obligations.
+ */
+export function planDiscoveryTargets(key: SessionEraseKey, opts: Pick<SessionEraseBytesOptions, "keyRoot">): EraseTarget[] {
+  if (!KEY_ROOT.test(opts.keyRoot)) refuse("key_root_invalid");
+  for (const id of [key.orgId, key.workspaceId, key.source, key.sessionId]) {
+    // The legacy layout encoder is lossy. Refuse ambiguous ids instead of deleting a neighbour's bytes.
+    if (typeof id !== "string" || !SEGMENT.test(id) || id.startsWith(".") || layoutComponent(id) !== id)
+      refuse("discovery_key_ambiguous");
+  }
+  const org = `${opts.keyRoot}/${key.orgId}`;
+  const ws = escapePattern(key.workspaceId), h = escapePattern(key.source), s = escapePattern(key.sessionId);
+  const machine = "[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}";
+  const transcript = `v1/ws=${ws}/m=${machine}/h=${h}/d=\\d{4}/\\d{2}/\\d{2}/s=${s}/.+`;
+  return [
+    { kind: "transcript", prefix: `${org}/v1/ws=${key.workspaceId}/`, match: new RegExp(`^${escapePattern(org)}/${transcript}$`) },
+    { kind: "transcript", prefix: `${org}/upload-generations/`, match: new RegExp(`^${escapePattern(org)}/upload-generations/g=[0-9a-f-]{36}/${transcript}$`) },
+    { kind: "pointer", prefix: `${org}/live-sessions/v1/ws=${key.workspaceId}/`, match: new RegExp(`^${escapePattern(org)}/live-sessions/v1/ws=${ws}/m=${machine}/h=${h}/s=${s}\\.json$`) },
+  ];
 }
 
 const KEY_ROOT = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
@@ -247,7 +277,7 @@ function isPublicationGenerationManifest(mk: string, org: string, ws: string, m:
 export function assertAllowed(targets: readonly EraseTarget[], keys: readonly string[]): void {
   for (const k of keys) {
     const ok = typeof k === "string" && !k.split("/").some((x) => x === "." || x === "..")
-      && targets.some((t) => (t.exactKey !== undefined ? k === t.exactKey : k.startsWith(t.prefix) && k.length > t.prefix.length));
+      && targets.some((t) => matchesTarget(t, k));
     if (!ok) refuse("key_outside_allowed_prefixes");
   }
 }
@@ -283,6 +313,15 @@ async function pool<T>(items: readonly T[], width: number, fn: (item: T, stopped
 /** Erase (or, dry run, count) one session's bytes, then verify by listing again. */
 export async function eraseSessionBytes(eraser: PagedEraser, req: SessionEraseBytesRequest, opts: SessionEraseBytesOptions): Promise<SessionEraseBytesResult> {
   const targets = planTargets(req, opts);
+  return executeTargets(eraser, req.key, targets, opts);
+}
+
+/** Automatic self-host path: no supplied locations, staged keys or user-built prefixes. */
+export async function eraseDiscoveredSessionBytes(eraser: PagedEraser, key: SessionEraseKey, opts: SessionEraseBytesOptions): Promise<SessionEraseBytesResult> {
+  return executeTargets(eraser, key, planDiscoveryTargets(key, opts), opts);
+}
+
+async function executeTargets(eraser: PagedEraser, key: SessionEraseKey, targets: EraseTarget[], opts: SessionEraseBytesOptions): Promise<SessionEraseBytesResult> {
   const dryRun = opts.dryRun === true;
   const width = opts.concurrency ?? DEFAULT_CONCURRENCY;
   const maxRuns = opts.maxRunsPerTarget ?? DEFAULT_MAX_RUNS_PER_TARGET;
@@ -310,6 +349,7 @@ export async function eraseSessionBytes(eraser: PagedEraser, req: SessionEraseBy
       : () => true;
     const select = dryRun
       ? (v: ListedVersion) => {
+          if (!matchesTarget(t, v.key)) return false;
           assertAllowed(targets, [v.key]);
           const id = JSON.stringify([v.key, v.versionId]);
           if ((t.exactKey === undefined || v.key === t.exactKey) && !seen.has(id)) {
@@ -318,12 +358,12 @@ export async function eraseSessionBytes(eraser: PagedEraser, req: SessionEraseBy
           }
           return false;
         }
-      : keep;
+      : (v: ListedVersion) => matchesTarget(t, v.key) && keep(v);
     let checkpoint: EraseCheckpoint | null = null;
     for (let r = 0; r < maxRuns; r++) {
       if (stopped()) return; // a sibling lane failed: the pool rethrows its error
       const res = await eraser.eraseStep(t.prefix, {
-        scope: scopeOf(req.key, t), checkpoint, select, authorize, now,
+        scope: scopeOf(key, t), checkpoint, select, authorize, now,
         ...(t.exactKey !== undefined ? { exactKey: t.exactKey } : {}),
         beforeDelete: async (doomed) => {
           assertAllowed(targets, doomed.map((v) => v.key));
@@ -353,6 +393,23 @@ export async function eraseSessionBytes(eraser: PagedEraser, req: SessionEraseBy
   let remaining = 0, pendingBudget = 0;
   if (!dryRun) {
     await pool(targets, width, async (t) => {
+      if (t.match) {
+        // A workspace may exceed verifyErased's single-invocation budget. Compose the same strict
+        // paged primitive into a fresh, read-only full pass; never infer zero from a partial listing.
+        let checkpoint: EraseCheckpoint | null = null;
+        let found = 0;
+        for (let r = 0; r < maxRuns; r++) {
+          const proof = await eraser.eraseStep(t.prefix, {
+            scope: `${scopeOf(key, t)}:verify`, checkpoint, authorize, now,
+            select: (v) => { if (matchesTarget(t, v.key)) found++; return false; },
+          });
+          if (found > 0) { remaining += found; return; }
+          if (proof.status === "traversed") return;
+          checkpoint = proof.checkpoint;
+        }
+        pendingBudget++;
+        return;
+      }
       const proof = await eraser.verifyErased(t.prefix, { authorize, now, ...(t.exactKey !== undefined ? { exactKey: t.exactKey } : {}) });
       if (proof.status === "pending") {
         if (proof.reason === "budget") pendingBudget++;
