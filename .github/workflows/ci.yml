@@ -126,7 +126,7 @@ jobs:
       - name: Guard - no production deployment identifiers in engine source (src, packages, scripts)
         run: bun scripts/check-engine-identifiers.ts
       # Vendored relayscrubber bytes vs scrub-bindgen-pin.json and the release's artifact.json
-      # (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.4"). Fails on any mismatch.
+      # (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.5"). Fails on any mismatch.
       - name: Scrub bindgen receipt (vendored relayscrubber vs pin and artifact.json)
         run: bun scripts/scrub-bindgen-receipt.ts --out scrub-bindgen-receipt.json
       - name: Upload the scrub bindgen receipt
