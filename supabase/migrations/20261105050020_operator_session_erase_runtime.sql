@@ -348,4 +348,3 @@ GRANT EXECUTE ON FUNCTION sessions.ingest_operator_runtime_write_begin(jsonb),se
  sessions.ingest_operator_runtime_purge(text,text,text,text,uuid),sessions.ingest_operator_runtime_step(text,text,text,text,uuid,text,text,bigint,text) TO bulls96_session_ingest;
 GRANT EXECUTE ON FUNCTION sessions.ingest_operator_runtime_upsert(jsonb,text,text) TO search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.ingest_operator_runtime_erased(text,text,text,text) TO bulls96_read_api;
-
