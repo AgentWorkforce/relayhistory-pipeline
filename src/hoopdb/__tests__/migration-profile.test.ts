@@ -2481,6 +2481,13 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     // Remaining additive successors between 047000 and 050000 roll back before the previous tail.
     const newest = (await plan(SUPA_A)).filter((step) => step.name.startsWith("upstream:") && step.name > CQ && step.name < OE).reverse();
     if (newest.length) expect((await failure(rollback("20261105047000_coordination_fact_readers.down.sql")))?.code).toBe("55000");
+    // The exact-session reader's down (047010) refuses while the paged 047020 successor, which
+    // requires it, is still applied; the newest-first walk rolls 047020 back before 047010.
+    const PAGED = "upstream:20261105047020_buffered_session_stages_paged.sql";
+    const READER = "upstream:20261105047010_buffered_exact_session_stages.sql";
+    expect(newest.findIndex((step) => step.name === PAGED)).toBeGreaterThanOrEqual(0);
+    expect(newest.findIndex((step) => step.name === PAGED)).toBeLessThan(newest.findIndex((step) => step.name === READER));
+    expect((await failure(rollback("20261105047010_buffered_exact_session_stages.down.sql")))?.code).toBe("55000");
     for (const step of newest) await rollback(`${step.name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`);
     expect((await names()).filter((name) => newest.some((step) => step.name === name))).toEqual([]);
     // 20261105047000 (coordination fact readers) is the newest step: lower downs refuse until its
