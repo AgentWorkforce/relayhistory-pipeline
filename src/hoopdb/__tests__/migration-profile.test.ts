@@ -2392,13 +2392,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const CQ = "upstream:20261105047000_coordination_fact_readers.sql";
     const SA = "upstream:20261105056000_session_summary_activity.sql";
     const DU = "upstream:20261105057000_session_directory_users_aggregate.sql";
+    const UC = "upstream:20261105057010_upload_consent.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2441,10 +2442,20 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105057000 (per-user session aggregate) is the newest: 056000's down refuses (55000) while it is
-    // applied, and its own checksum-pinned down drops the reader and its ledger row.
+    // 20261105057010 (upload consent) is the newest step: 057000's and 056000's downs refuse (55000) until its
+    // checksum-pinned rollback removes its two entry points, four tables and ledger row.
     expect((await failure(rollback("20261105056000_session_summary_activity.down.sql")))?.code).toBe("55000");
+    expect((await failure(rollback("20261105057000_session_directory_users_aggregate.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(SA);
+    expect(await names()).toContain(DU);
+    expect(await relation("sessions.upload_consent_holds")).toBe("sessions.upload_consent_holds");
+    await rollback("20261105057010_upload_consent.down.sql");
+    expect(await names()).not.toContain(UC);
+    for (const t of ["policies", "sessions", "origins", "holds"]) expect(await relation("sessions.upload_consent_" + t)).toBeNull();
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE oid IN (to_regprocedure('sessions.upload_consent_snapshot_v1(text,text,text,text,jsonb,bigint)'),to_regprocedure('sessions.upload_consent_apply_v1(text,text,text,jsonb,boolean,bigint)'))")).rows[0]!.n).toBe(0);
+    // Its ledger row is gone, so running it again refuses.
+    expect((await failure(rollback("20261105057010_upload_consent.down.sql")))?.code).toBe("55000");
+    // Then 20261105057000 (per-user session aggregate): its checksum-pinned down drops the reader and its ledger row.
     await rollback("20261105057000_session_directory_users_aggregate.down.sql");
     expect(await names()).not.toContain(DU);
     expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.session_directory_users_for(text,timestamptz,timestamptz,integer)')::text AS p")).rows[0]!.p).toBeNull();
@@ -2523,7 +2534,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'output\\_facts\\_%'")).rows[0]!.n).toBe(0);
     // Other lanes newer than 20261105045000 (045010 same-second feed, 045030 consumer project-text grant) roll back next, newest first: 045000's down
     // refuses (55000) while any of them is applied. (046010 and 046000 already rolled back above, so they are excluded here.)
-    const newerThanDigest = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > DG && s.name < CQ && s.name !== OE && s.name !== EF && s.name !== ER && s.name !== SA && s.name !== DU && s.name !== OF && s.name !== LQ && s.name !== CQ && s.name !== "upstream:20261105046000_analysis_jobs.sql").reverse();
+    const newerThanDigest = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > DG && s.name < CQ && s.name !== OE && s.name !== EF && s.name !== ER && s.name !== SA && s.name !== DU && s.name !== UC && s.name !== OF && s.name !== LQ && s.name !== CQ && s.name !== "upstream:20261105046000_analysis_jobs.sql").reverse();
     if (newerThanDigest.length)
       expect((await failure(rollback("20261105045000_digest_narrative_cache.down.sql")))?.code).toBe("55000");
     for (const { name } of newerThanDigest)

@@ -343,7 +343,7 @@ describe("self-host node:http wrapper", () => {
     const verified: (string | undefined)[] = [];
     const runtime = {
       ...base,
-      verify: async (authorization: string | undefined) => { verified.push(authorization); return { userId: "u", orgId: "o" } as never; },
+      verify: async (authorization: string | undefined) => { verified.push(authorization); return { userId: "u", orgId: "o", scopes: ["rth:sync"] } as never; },
       app: { fetch: (req: Request) => { seen.push(req.headers.get("authorization")); return Response.json({ ok: true }); } },
     };
     const server = selfhostIngestHttpServer(runtime);

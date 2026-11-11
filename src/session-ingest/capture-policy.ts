@@ -87,3 +87,18 @@ export function uploadPolicyError(violation: UploadViolation, revision: number):
     ? new DeliveryError(CAPTURE_POLICY_SESSION_PREDATES, 422, "Your organization's capture policy shares only sessions started after it was set")
     : new DeliveryError(CAPTURE_POLICY_STALE, 409, `Uploads need capture policy revision ${revision}; read the policy again and retry`);
 }
+
+/**
+ * The operator's sharing mode as a cap for the upload consent check (upload-consent.ts), when uploads are
+ * enforced AND INGEST_UPLOAD_CONSENT is on (the caller derives it only then, so with consent off capture
+ * enforce behaves as before). "selected" and "new" narrow; "all" or no key leaves the person's own choice. Without this, an
+ * enforced "selected" or "new" policy checked only the revision and a known start, and stored the rest.
+ */
+export function operatorSharingCap(subject: CapturePolicySubject, mode: CapturePolicyUploadsMode): import("./upload-consent.ts").OperatorSharingCap | undefined {
+  if (mode !== "enforce") return undefined;
+  const policy = subject.capturePolicy;
+  const sharing = policy?.settings.sharing_mode;
+  if (sharing === "selected") return { mode: "selected" };
+  if (sharing === "new") return { mode: "new", ...(policy!.sharingModeSinceMs !== undefined ? { sinceMs: policy!.sharingModeSinceMs } : {}) };
+  return undefined;
+}

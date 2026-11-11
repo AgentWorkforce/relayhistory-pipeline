@@ -68,6 +68,8 @@
  * Until the S3 key, the KMS key ARN and Hyperdrive are present, every request
  * is 503 `not_configured` and nothing is written.
  */
+import { uploadConsentEnforcement, type UploadConsentEnforcement } from "./upload-consent.ts";
+import { sqlUploadConsentStore } from "./upload-consent-sql.ts";
 import pg from "pg";
 import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
 import { zstdDecompressSync } from "node:zlib";
@@ -110,6 +112,8 @@ export interface IngestWorkerEnv {
   INGEST_ASYNC_ADMISSION?: string;
   /** off (default) | on (async-admission.ts syncAdmissionFrozenReceiptMode). */
   INGEST_SYNC_ADMISSION_FROZEN_RECEIPT?: string;
+  /** INGEST_UPLOAD_CONSENT: off (default) | report | hold-only | enforce (upload-consent.ts). */
+  INGEST_UPLOAD_CONSENT?: string;
   /** off (default) | allowlist | on (upload-admission.ts): the ?uploadKey= admission status only. */
   HISTORY_UPLOAD_DIRECT?: string;
   /** HISTORY_UPLOAD_DIRECT=allowlist: comma-separated org:<id> / ws:<id>. */
@@ -232,6 +236,8 @@ export interface IngestSettings {
   uploadDirect?: UploadDirectConfig;
   /** SESSION_ERASE_API_ENABLED=1 (session-erase.ts). Absent (the default): the route answers 501. */
   sessionErase?: SessionEraseConfig;
+  /** INGEST_UPLOAD_CONSENT report|hold-only|enforce. Absent (the default): off. An invalid value refuses startup. */
+  uploadConsent?: Exclude<UploadConsentEnforcement, "off">;
 }
 
 /** The settings, or null while any required one is missing (every request is then 503 not_configured). */
@@ -266,6 +272,8 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   // Async admission without its queue would refuse every opted-in batch: not configured.
   if (asyncMode !== "off" && !env.INGEST_ADMISSION) return null;
   const syncFrozenReceipt = syncAdmissionFrozenReceiptMode(env.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT);
+  // A privacy control: an invalid value is a loud configuration error (every request 503), never off.
+  const uploadConsent = uploadConsentEnforcement(env.INGEST_UPLOAD_CONSENT);
   // Default off; the secrets are read and validated only when the flag is exactly "1". Isolated: the
   // secrets are runtime-mutable Secrets Store values, so an invalid flag or secret must never fail delivery
   // or the queue consumer. The erase route alone fails closed (503 unavailable); the log carries a code only.
@@ -317,6 +325,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(syncFrozenReceipt === "on" ? { syncAdmissionFrozenReceipt: true as const } : {}),
     ...(sessionErase ? { sessionErase } : {}),
     ...(uploadDirect.mode !== "off" ? { uploadDirect } : {}),
+    ...(uploadConsent !== "off" ? { uploadConsent } : {}),
   };
 }
 
@@ -447,6 +456,7 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: R
     ...(settings.syncAdmissionFrozenReceipt ? { syncAdmissionFrozenReceipt: "on" as const } : {}),
     ...(settings.sessionErase ? { sessionErase: settings.sessionErase } : {}),
     ...(settings.uploadDirect ? { uploadDirect: settings.uploadDirect } : {}),
+    ...(settings.uploadConsent ? { uploadConsent: { enforcement: settings.uploadConsent, store: sqlUploadConsentStore(run) } } : {}),
   });
 }
 
@@ -475,7 +485,8 @@ export async function admitQueueBatch(messages: QueueMessage[], env: IngestWorke
     const deliver = deliverDepsFor(settings, db.run, target);
     for (const message of messages) {
       const started = Date.now();
-      const r = await admitMessage({ mode: settings.asyncAdmission ?? "off", deliver, custodySource: custody.custodySource, decompress: zstd }, message.body, message.attempts ?? 1)
+      const r = await admitMessage({ mode: settings.asyncAdmission ?? "off", deliver, custodySource: custody.custodySource, decompress: zstd,
+        ...(settings.uploadConsent ? { uploadConsent: { enforcement: settings.uploadConsent, store: sqlUploadConsentStore(db.run) }, log: (fields: Record<string, unknown>) => log.warn("session ingest admission", fields) } : {}) }, message.body, message.attempts ?? 1)
         .catch((error: unknown): AdmissionAction => ({ action: "retry", delaySeconds: 300, code: "admission_failed", error }));
       if (r.action === "ack") {
         log.info("session ingest admission", { route: "ingest.admission", outcome: r.outcome, error_code: r.code, duration_ms: Date.now() - started, ...(r.lagMs !== undefined ? { offset: r.lagMs } : {}), attempt: message.attempts ?? 1 });

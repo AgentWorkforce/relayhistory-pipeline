@@ -157,6 +157,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105056000_session_summary_activity.sql",
       // One read-role-only SECURITY DEFINER per-user session aggregate; no ingest path touches it.
       "20261105057000_session_directory_users_aggregate.sql",
+      // Server-owned upload consent: four new owner-only tables and two ingest-role entry points; no G4 function names them.
+      "20261105057010_upload_consent.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

@@ -10,6 +10,7 @@
  * pending, generation mismatch, slot busy, S3) and for a malformed message or inbox (which
  * then walks to the DLQ for an operator, never silently dropped).
  */
+import { checkUploadConsent, UploadConsentRequired, type UploadConsentConfig } from "./upload-consent.ts";
 import type { DeliverDeps } from "./deliver.ts";
 import { ClaimLockBusy, deliverPrepared, IngestUnavailable } from "./deliver.ts";
 import { LedgerUnavailableError, type FrozenWitnessInput, type LedgerTenant } from "./ledger.ts";
@@ -34,6 +35,14 @@ export interface AdmissionConsumerDeps {
   custodySource: "relayhistory" | "shadow" | "frozen-supabase";
   decompress: (bytes: Uint8Array) => Uint8Array;
   nowMs?: () => number;
+  /**
+   * INGEST_UPLOAD_CONSENT (upload-consent.ts): re-checked here, after the claim and before any write, at
+   * the CURRENT policy. A narrowing that landed after the upload was queued (or after a direct upload
+   * was presigned) still refuses it. A refusal is a retry, never a terminal outcome: the inbox keeps the
+   * bytes, and once the person confirms, a redrive admits them.
+   */
+  uploadConsent?: UploadConsentConfig;
+  log?: (fields: Record<string, unknown>) => void;
 }
 
 export type AdmissionAction =
@@ -58,6 +67,8 @@ function classify(error: unknown, attempts: number): AdmissionAction | { termina
   // 429 for the HTTP client only: the queue keeps the IngestUnavailable backoff, code and stage, so the
   // flags change nothing on this path.
   if (error instanceof ClaimLockBusy) return { action: "retry", delaySeconds: backoffSeconds(attempts), code: error.cause_code, stage: error.stage, error };
+  // Held for consent: wait (long), never a terminal refusal; the inbox keeps the bytes for a redrive.
+  if (error instanceof UploadConsentRequired) return { action: "retry", delaySeconds: 300, code: error.code, stage: "consent", error };
   if (error instanceof DeliveryBusyError) return { action: "retry", delaySeconds: error.retryAfterSeconds, code: error.code, error };
   if (error instanceof IngestUnavailable) return { action: "retry", delaySeconds: backoffSeconds(attempts), code: error.cause_code, stage: error.stage, error };
   // 403 (another user's record), 409 (batch id / revision conflict, privacy superseded), 413/422 (budget), 400: the same answer forever.
@@ -89,7 +100,7 @@ export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, a
     return { action: "retry", delaySeconds: 300, code: "admission_invalid" };
   }
   if (!decoded) return { action: "ack", outcome: "already_terminal", code: "tombstoned" };
-  const { tenant, prepared, receivedAtMs, journalSeq } = decoded;
+  const { tenant, prepared, receivedAtMs, journalSeq, consentCap } = decoded;
   const now = (deps.nowMs ?? Date.now)();
   const lagMs = Math.max(0, now - receivedAtMs);
   const dir = receiptDir(keyRoot, tenant, prepared.originId, prepared.receipt.receiptId);
@@ -123,6 +134,9 @@ export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, a
       ...deps.deliver,
       ...(custody ? { custody } : {}),
       admissionGate: () => assertNoLaterPrivacyControl(store, keyRoot, tenant, journalSeq, (deps.nowMs ?? Date.now)()),
+      ...((deps.uploadConsent && deps.uploadConsent.enforcement !== "off") || consentCap
+        ? { consentGate: async (dropped: ReadonlySet<string>, phase: "admit" | "commit") => { await checkUploadConsent(deps.uploadConsent, tenant, prepared.originId, prepared.records, { dropped, phase, route: "admission.consumer", ...(consentCap ? { operator: consentCap } : {}) }, deps.log); } }
+        : {}),
     }, tenant, prepared);
     return finish("admitted", result.outcome);
   } catch (error) {
