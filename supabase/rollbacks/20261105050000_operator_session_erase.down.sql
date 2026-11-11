@@ -8,7 +8,7 @@ DO $rollback_guard$ DECLARE v_later boolean;v_sha text; BEGIN
   IF v_later THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator session erase: a later migration is applied; roll it back first';END IF;
  ELSE RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator session erase: migration ledger required';END IF;
  EXECUTE 'SELECT sha256 FROM sessions.__96bulls_migrations WHERE name=''upstream:20261105050000_operator_session_erase.sql''' INTO v_sha;
- IF v_sha IS DISTINCT FROM '1c10e50ba40191379fcebedf43d6b50d5519176a94783dbdc540f42f97845981' THEN
+ IF v_sha IS DISTINCT FROM 'c2c6242d60401406f3326838a84eaf4bb44870471441deeff38d0d9a7096755a' THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator session erase: own applied checksum required';END IF;
  IF EXISTS(SELECT 1 FROM sessions.session_erasure_receipts) OR EXISTS(SELECT 1 FROM sessions.session_erasure_fences) THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator session erase: erase receipts or fences exist; refusing to drop them';

@@ -38,8 +38,6 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.ingest_history_scope_capture(jsonb)',
  'sessions.ingest_history_scope_install(jsonb)',
  'sessions.ingest_operator_erase_receipt(text,text,text,text)',
- 'sessions.ingest_operator_erase_record_step(text,text,text,text,text,text,bigint,text)',
- 'sessions.ingest_operator_erase_session(text,text,text,text,text,text,text)',
  'sessions.ingest_operator_runtime_authorize(text,text,text,text,uuid)',
  'sessions.ingest_operator_runtime_begin(text,text,text,text,text,text,text,text,text,text)',
  'sessions.ingest_operator_runtime_next(uuid)',

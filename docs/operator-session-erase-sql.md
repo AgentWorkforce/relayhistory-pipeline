@@ -2,7 +2,9 @@
 
 Source-only, default-off operator implementation. Applying migrations or enabling any
 runtime still needs Khaliq's explicit approval. 050000/050010 are not a public route;
-050020 later retires their direct mutator grants in favor of lease-gated runtime calls.
+Their mutators are owner-only helpers from creation; the ingest login gets only receipt
+read. 050020 grants admission/lease-gated runtime calls and cannot be bypassed through
+legacy helper grants.
 
 Every session_index INSERT or UPDATE takes a shared advisory gate in a BEFORE STATEMENT
 trigger, before row/conflict locks. Erase owns the same gate exclusively before resolving
@@ -15,7 +17,8 @@ claim/commit hot-path fence lookup. Erases should be rare and their SQL transact
 A non-MVCC sequence epoch records that an erase crossed the writer boundary. Once an
 erase has occurred, a higher-isolation pointer writer fails with 40001 and must retry
 under READ COMMITTED; it cannot use a repeatable-read snapshot that predates the fence.
-The dedicated consumer already uses READ COMMITTED. The sequence is owner-only and has
+The eraser itself also requires READ COMMITTED before any write, so an old erase
+snapshot cannot miss newly committed aliases. The dedicated consumer already uses READ COMMITTED. The sequence is owner-only and has
 no content. No erasure means the epoch remains uncalled and existing isolation behavior
 is retained. A used fence cannot be rolled back to remove enforcement.
 
