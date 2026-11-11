@@ -131,3 +131,15 @@ export function sqlLiveness(run: TenantRunner): Liveness {
     },
   };
 }
+
+/** Default-off operator read gate, separately scoped from ordinary legacy liveness. */
+export function sqlOperatorErased(run: TenantRunner) {
+  return async (key: { orgId: string; workspaceId: string; source: string; sessionId: string }): Promise<boolean> => {
+    try {
+      const { rows } = await run(key.orgId, key.workspaceId, q => q.query<{ erased: boolean }>(
+        "SELECT sessions.ingest_operator_runtime_erased($1,$2,$3,$4) erased", [key.orgId, key.workspaceId, key.source, key.sessionId]));
+      if (rows.length !== 1 || typeof rows[0]?.erased !== "boolean") throw Error("operator_fence_unavailable");
+      return rows[0].erased;
+    } catch { throw Error("operator_fence_unavailable"); }
+  };
+}

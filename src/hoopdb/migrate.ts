@@ -23,6 +23,7 @@ import {
   runtimeRoleViolations,
   sequencePreflight,
   adoptableIndexBuildPreflight,
+  createdSessionsFunctions,
   sessionsFunctionAclDrift,
   sessionsFunctionAclPreview,
   type FunctionBoundaryMode,
@@ -440,6 +441,36 @@ export async function schemaStepDigests(held: readonly string[] = []): Promise<[
     throw profileError("release_target_unknown", "a held step is not a schema step of this tree");
   const h = new Set(held);
   return [...(await stepSha256s(schema.filter((s) => !h.has(s.name))))];
+}
+
+/**
+ * The release-target scope readiness takes for a prefix image (ExpectedSchema.held):
+ * each held step with the sessions function signatures it creates that no prefix
+ * (non-held) step of this tree creates, so a function an applied step owns stays
+ * required. Refuses a held name that is not a schema step of this tree
+ * (release_target_unknown) and, given the bound manifest's steps, any prefix that is
+ * not exactly the manifest's names and digests (release_target_manifest_changed).
+ */
+export async function heldScope(
+  held: readonly string[],
+  manifestSteps?: readonly (readonly [string, string])[],
+): Promise<{ name: string; creates: string[] }[]> {
+  const prefix = await schemaStepDigests(held);
+  if (manifestSteps && JSON.stringify(prefix) !== JSON.stringify(manifestSteps.map(([n, d]) => [n, d])))
+    throw profileError("release_target_manifest_changed", "the held steps do not leave exactly the approved prefix");
+  const schema = await schemaSteps();
+  const h = new Set(held);
+  const prefixCreates = createdSessionsFunctions(
+    await Promise.all(schema.filter((s) => !h.has(s.name)).map((s) => readFile(s.path, "utf8"))),
+  );
+  const out: { name: string; creates: string[] }[] = [];
+  for (const st of schema)
+    if (h.has(st.name))
+      out.push({
+        name: st.name,
+        creates: [...createdSessionsFunctions([await readFile(st.path, "utf8")])].filter((fn) => !prefixCreates.has(fn)).sort(),
+      });
+  return out;
 }
 
 /** What readiness requires of HoopDb for this image (see schemaVerdict). */
