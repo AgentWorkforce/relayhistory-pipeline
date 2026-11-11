@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
- * Negative reachability report for the relayscrubber 0.5.0-alpha.4 cutover
- * (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.4").
+ * Negative reachability report for the relayscrubber 0.5.0-alpha.5 cutover
+ * (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.5").
  *
  * Runs src/session-ingest/__tests__/scrub-cutover-reachability.test.ts (one file, no
  * other tests), which drives the ingest writer, publication image, routes/pipeline

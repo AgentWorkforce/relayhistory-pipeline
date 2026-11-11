@@ -1,5 +1,5 @@
 /**
- * Fault matrix for the pinned relayscrubber 0.5.0-alpha.4 engine, with faults injected
+ * Fault matrix for the pinned relayscrubber 0.5.0-alpha.5 engine, with faults injected
  * through a wrapper around the REAL verified glue (never by editing vendored bytes):
  *
  * - The crate's explicit JSON-string call-refusal tag refuses ONE call; the instance
