@@ -7,6 +7,8 @@
  * .github/workflows/rehearse-session-schema.yml against disposable PostgreSQL.
  */
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -25,8 +27,11 @@ import {
   sameNameOid,
   seedOrder,
   seedSet,
+  seedStepBytes,
   validateInputs,
 } from "../../../scripts/pg-proof/schema-rehearsal-core.ts";
+import { manifestGeneration, RELEASE_TREE } from "../migrate.ts";
+import { treeSchemaSteps } from "../release-target.ts";
 import { SCHEMA_RELEASE } from "../schema-release-contract.ts";
 
 const ROOT = join(import.meta.dir, "../../..");
@@ -112,6 +117,84 @@ describe("seedSet", () => {
     expect(s([u("5000"), u("5030"), o("0002")])).toBe("rehearsal_seed_noncontiguous");
     expect(s([u("5000"), u("5030"), "upstream:20200101000000_gone.sql"])).toBe("rehearsal_seed_noncontiguous");
     expect(s([u("5000"), u("5030"), o("0001")], u("5030"), o("0001"))).toBe("rehearsal_target_not_after_baseline");
+  });
+});
+
+describe("seedStepBytes (R0 bytes come from the baseline landing commit)", () => {
+  const sha = (t: string) => createHash("sha256").update(t).digest("hex");
+  const rel = (n: string) => `m/${n.slice(n.indexOf(":") + 1)}`;
+  const VER = [{ name: "verify:v", path: "b/v_verify.sql" }];
+  const landingFiles: Record<string, string> = { [rel(u("5000"))]: "a;", [rel(u("5030"))]: "b;", "b/v_verify.sql": "old verify;" };
+  const releaseFiles: Record<string, string> = { ...landingFiles, "b/v_verify.sql": "new verify;" };
+  const input = (over: Partial<Parameters<typeof seedStepBytes>[0]> = {}) => ({
+    seed: [u("5000"), u("5030")],
+    verifiers: VER,
+    stepRel: rel,
+    landing: (p: string) => landingFiles[p],
+    release: (p: string) => releaseFiles[p],
+    landingDigests: [u("5000"), u("5030")].map((n) => [n, sha(landingFiles[rel(n)]!)] as [string, string]),
+    ...over,
+  });
+  test("seed steps and verifiers carry the landing bytes, not the release tree's", () => {
+    const r = seedStepBytes(input());
+    expect(r.seed.map((f) => [f.name, f.rel, f.sha256])).toEqual([
+      [u("5000"), rel(u("5000")), sha("a;")],
+      [u("5030"), rel(u("5030")), sha("b;")],
+    ]);
+    expect(r.verify).toEqual([{ name: "verify:v", rel: "b/v_verify.sql", text: "old verify;", sha256: sha("old verify;") }]);
+  });
+  test("refuses drift, missing bytes and a seed that is not the landing tree", () => {
+    // A landed migration whose release-tree bytes differ (landed migrations are frozen).
+    const drifted = { ...releaseFiles, [rel(u("5030"))]: "b; -- edited" };
+    expect(code(() => seedStepBytes(input({ release: (p) => drifted[p] })))).toBe("rehearsal_seed_bytes_drift");
+    expect(code(() => seedStepBytes(input({ release: (p) => (p === rel(u("5000")) ? undefined : releaseFiles[p]) })))).toBe(
+      "rehearsal_seed_bytes_drift",
+    );
+    // Bytes read that are not the landing tree digest.
+    expect(code(() => seedStepBytes(input({ landingDigests: [[u("5000"), sha("a;")], [u("5030"), sha("x")]] })))).toBe(
+      "rehearsal_seed_bytes_drift",
+    );
+    expect(code(() => seedStepBytes(input({ landing: (p) => (p === "b/v_verify.sql" ? undefined : landingFiles[p]) })))).toBe(
+      "rehearsal_seed_bytes_missing",
+    );
+    expect(code(() => seedStepBytes(input({ landingDigests: [[u("5000"), sha("a;")]] })))).toBe("rehearsal_seed_step");
+    expect(code(() => seedStepBytes(input({ seed: [u("5030"), u("5000")] })))).toBe("rehearsal_seed_step");
+  });
+
+  // The smoke row's baseline (045030), landed by 55511978. Needs full history (the
+  // rehearsal workflow checks out with fetch-depth 0); skipped in a shallow checkout.
+  const LANDING = "55511978bf1b1cd03f6338c4082a1d2558c8401b";
+  const git = (args: string[]) => spawnSync("git", args, { cwd: ROOT, maxBuffer: 256 * 1024 * 1024 });
+  const haveLanding = git(["cat-file", "-e", `${LANDING}^{commit}`]).status === 0;
+  const at = (c: string) => (p: string) => {
+    const r = git(["cat-file", "blob", `${c}:${p}`]);
+    return r.status === 0 ? r.stdout.toString("utf8") : undefined;
+  };
+  test.skipIf(!haveLanding)("baseline 045030: R0's steps are 55511978's bytes, generation 7db65adb", () => {
+    const landingSteps = treeSchemaSteps(ROOT, LANDING);
+    const seed = landingSteps.map(([n]) => n);
+    expect(seed.filter((n) => n.startsWith("upstream:")).at(-1)).toBe(BASE);
+    const lanes = new Map(RELEASE_TREE.lanes.map((l) => [l.prefix, l.dir]));
+    const stepRel = (n: string) => `${lanes.get(n.slice(0, n.indexOf(":") + 1))}/${n.slice(n.indexOf(":") + 1)}`;
+    const r = seedStepBytes({
+      seed,
+      verifiers: RELEASE_TREE.verifiers,
+      stepRel,
+      landing: at(LANDING),
+      release: at("HEAD"),
+      landingDigests: landingSteps,
+    });
+    for (const f of [...r.seed, ...r.verify]) expect(f.sha256).toBe(sha(at(LANDING)(f.rel)!));
+    // At least one verifier R0 runs differs from the release working tree's file.
+    const differs = r.verify.filter((f) => f.sha256 !== sha(read(f.rel))).map((f) => f.name);
+    expect(differs.length).toBeGreaterThan(0);
+    expect(differs).toContain("verify:session_ingest");
+    // The seed generation is production's canonical generation at the baseline.
+    const gen = manifestGeneration({
+      steps: r.seed.map((f) => [f.name, f.sha256]),
+      verifiers: r.verify.map((f) => [f.name, f.sha256]),
+    });
+    expect(gen.slice(0, 8)).toBe("7db65adb");
   });
 });
 

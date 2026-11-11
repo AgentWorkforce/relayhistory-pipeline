@@ -11,7 +11,10 @@
  *   R0 seed      the database the release starts from: exactly the schema steps of the
  *                commit that landed the baseline, applied by runMigrations with a release
  *                target binding, marker PASS at that commit's generation, and the
- *                previous release's event-trigger body (a stale reviewed wrapper)
+ *                previous release's event-trigger body (a stale reviewed wrapper). Every
+ *                file R0 applies (shim, bootstrap chain, boundary, seed steps, verifiers)
+ *                is that landing commit's bytes from the Git object database; R1 onward
+ *                use the release checkout
  *   R1 plan      inspectRelease (READ ONLY; refuses function_acl_drift, ledger_gap, ...),
  *                migrationTargetSplit checked against an independent window, the target
  *                commit found on the release sha's first-parent history at the dispatched
@@ -36,10 +39,10 @@
  */
 import pg from "pg";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   disposableEnvRefusal,
   errorCode,
@@ -56,8 +59,10 @@ import {
   sameNameOid,
   seedOrder,
   seedSet,
+  seedStepBytes,
   validateInputs,
   type RehearsalInputs,
+  type SeedFile,
   type StageResult,
   type StageStatus,
 } from "./schema-rehearsal-core.ts";
@@ -142,6 +147,28 @@ function laneTree(sha: string): Map<string, string> {
   }
   return m;
 }
+/**
+ * A path's utf8 text at a commit, from the Git object database (never the working tree);
+ * undefined unless the path is a regular file there.
+ */
+export function gitText(sha: string, rel: string): string | undefined {
+  const run = (args: string[]) =>
+    spawnSync("git", args, { cwd: ROOT, maxBuffer: 256 * 1024 * 1024, env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" } });
+  const ls = run(["ls-tree", "-z", "--full-tree", sha, "--", rel]);
+  if (ls.status !== 0) rehearsalRefuse("rehearsal_git", { command: "ls-tree" });
+  const ents = ls.stdout.toString("utf8").split("\0").filter(Boolean);
+  if (ents.length !== 1) return undefined;
+  const [meta, path] = ents[0]!.split("\t");
+  const [mode, type, oid] = meta!.split(" ");
+  if (path !== rel || type !== "blob" || (mode !== "100644" && mode !== "100755")) return undefined;
+  const blob = run(["cat-file", "blob", oid!]);
+  if (blob.status !== 0) rehearsalRefuse("rehearsal_git", { command: "cat-file" });
+  // The same decoding the migrator applies (readFile(path, "utf8")).
+  return blob.stdout.toString("utf8");
+}
+const SHIM_SQL = "supabase/tests/supabase_shim.sql";
+const BOUNDARY_SQL = "supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql";
+const BOOTSTRAP_CHAIN = "src/hoopdb/session-bootstrap-chain.ts";
 const stepPath = (name: string) => `${LANE_DIRS[laneOf(name)]}/${name.slice(laneOf(name).length)}`;
 /**
  * The first-parent commit of the release sha that added a step's file (the oldest such).
@@ -363,51 +390,93 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
   let seed!: ReturnType<typeof seedSet>;
   let A = "";
   await stage("R0", async () => {
-    await admin.query(
-      `CREATE ROLE ${P.owner} LOGIN CREATEROLE CREATEDB BYPASSRLS REPLICATION; ALTER ROLE ${P.owner} SUPERUSER; GRANT CREATE ON DATABASE ${P.database} TO ${P.owner}; SET ROLE ${P.owner}; CREATE SCHEMA sessions; GRANT CREATE ON SCHEMA public TO ${P.owner}; REVOKE TEMPORARY ON DATABASE ${P.database} FROM PUBLIC; ALTER DEFAULT PRIVILEGES FOR ROLE ${P.owner} REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;`,
-    );
-    await admin.query(psql(await read("supabase/tests/supabase_shim.sql")));
-    for (const f of SESSION_BOOTSTRAP_FILES) await admin.query(psql(await read(f)));
-    await admin.query(
-      `DO $$BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='${P.runtime}') THEN CREATE ROLE ${P.runtime} LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION; END IF; END $$`,
-    );
-    await admin.query("CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin;");
-    await admin.query(
-      psql(await read("supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql")).replaceAll(":'runtime_role'", `'${P.runtime}'`),
-    );
-    await admin.query(
-      `RESET ROLE; ALTER ROLE ${P.owner} NOSUPERUSER; ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`,
-    );
-    await owner.connect();
-    await ownerOps.connect();
+    // The landing commit's bytes first, before anything is written: R0 applies exactly
+    // what the migrator at the baseline landing commit would (shim, bootstrap chain,
+    // boundary, seed steps, verifiers), never the release checkout's files.
     const landing = landingCommit(sha, baseline);
-    const landed = (RT.treeSchemaSteps(ROOT, landing) as [string, string][]).map(([n]) => n);
-    seed = seedSet({ landing: landed, tree, baseline, target });
+    const landingSteps = RT.treeSchemaSteps(ROOT, landing) as [string, string][];
+    seed = seedSet({ landing: landingSteps.map(([n]) => n), tree, baseline, target });
+    const bytes = seedStepBytes({
+      seed: seed.seed,
+      verifiers: M.RELEASE_TREE.verifiers,
+      stepRel: stepPath,
+      landing: (rel) => gitText(landing, rel),
+      release: (rel) => gitText(sha, rel),
+      landingDigests: landingSteps,
+    });
+    // The bootstrap list is the release's module; it must be the landing commit's list.
+    const chain = gitText(landing, BOOTSTRAP_CHAIN);
+    if (chain === undefined || chain !== gitText(sha, BOOTSTRAP_CHAIN)) rehearsalRefuse("rehearsal_seed_bootstrap_chain");
+    const landingFile = (rel: string) => gitText(landing, rel) ?? rehearsalRefuse("rehearsal_seed_bytes_missing", { file: rel });
+    const shimSql = landingFile(SHIM_SQL);
+    const bootstrapSql = (SESSION_BOOTSTRAP_FILES as readonly string[]).map(landingFile);
+    const boundarySql = landingFile(BOUNDARY_SQL);
     const steps = await M.plan(profile);
-    const byName = new Map(steps.map((s: { name: string }) => [s.name, s]));
-    const ordered = [
-      ...seedOrder(seed.seed, seed.unseeded).map((n) => byName.get(n) ?? rehearsalRefuse("rehearsal_seed_step", { step: n })),
-      ...steps.filter((s: { name: string }) => s.name.startsWith("verify:")),
-    ];
+    const verifyNames = steps.filter((s: { name: string }) => s.name.startsWith("verify:")).map((s: { name: string }) => s.name);
+    if (!sameNames(verifyNames, bytes.verify.map((f) => f.name))) rehearsalRefuse("rehearsal_seed_step", { against: "verifiers" });
     const anchor = RT.releaseTargetBinding({
       repo: ROOT,
       releaseSha: sha,
       targetSha: landing,
       target: seed.lastSeed,
-      prefix: await M.schemaStepDigests(seed.unseeded),
+      prefix: bytes.seed.map((f) => [f.name, f.sha256]),
     });
+    // The verifiers that run are the ones generation A hashes.
+    const bound = anchor.verifiers as { name: string; sha256: string }[];
+    if (bound.length !== bytes.verify.length || bound.some((v, i) => v.name !== bytes.verify[i]!.name || v.sha256 !== bytes.verify[i]!.sha256))
+      rehearsalRefuse("rehearsal_seed_bytes_drift", { against: "landing_verifiers" });
     A = anchor.targetGeneration;
     if (A === B) rehearsalRefuse("rehearsal_seed_generation_is_target");
-    await M.runMigrations(owner, {
-      profile,
-      steps: ordered,
-      target: seed.lastSeed,
-      expectedPending: seed.seed,
-      targetGeneration: A,
-      targetBinding: { targetSha: landing, manifestDigest: anchor.manifestDigest, verifiers: anchor.verifiers },
-    });
+    // Materialized under the runner's temp dir: every read migrate.ts makes of a seed or
+    // verifier step (manifest digests, guards, apply, ledger sha256) sees these bytes.
+    // Held (unseeded) steps are absent at the landing commit: release paths, never applied.
+    const dir = mkdtempSync(join(process.env.RUNNER_TEMP || tmpdir(), "rehearsal-r0-"));
+    try {
+      const put = (f: SeedFile) => {
+        const path = join(dir, f.rel);
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, f.text, { encoding: "utf8", mode: 0o400 });
+        return { name: f.name, path };
+      };
+      const seedSteps = new Map(bytes.seed.map((f) => [f.name, put(f)]));
+      const byName = new Map(steps.map((s: { name: string }) => [s.name, s]));
+      const ordered = [
+        ...seedOrder(seed.seed, seed.unseeded).map(
+          (n) => seedSteps.get(n) ?? byName.get(n) ?? rehearsalRefuse("rehearsal_seed_step", { step: n }),
+        ),
+        ...bytes.verify.map(put),
+      ];
+      await admin.query(
+        `CREATE ROLE ${P.owner} LOGIN CREATEROLE CREATEDB BYPASSRLS REPLICATION; ALTER ROLE ${P.owner} SUPERUSER; GRANT CREATE ON DATABASE ${P.database} TO ${P.owner}; SET ROLE ${P.owner}; CREATE SCHEMA sessions; GRANT CREATE ON SCHEMA public TO ${P.owner}; REVOKE TEMPORARY ON DATABASE ${P.database} FROM PUBLIC; ALTER DEFAULT PRIVILEGES FOR ROLE ${P.owner} REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;`,
+      );
+      await admin.query(psql(shimSql));
+      for (const text of bootstrapSql) await admin.query(psql(text));
+      await admin.query(
+        `DO $$BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='${P.runtime}') THEN CREATE ROLE ${P.runtime} LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION; END IF; END $$`,
+      );
+      await admin.query("CREATE EXTENSION IF NOT EXISTS pg_trgm; CREATE EXTENSION IF NOT EXISTS btree_gin;");
+      await admin.query(
+        psql(boundarySql).replaceAll(":'runtime_role'", `'${P.runtime}'`),
+      );
+      await admin.query(
+        `RESET ROLE; ALTER ROLE ${P.owner} NOSUPERUSER; ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`,
+      );
+      await owner.connect();
+      await ownerOps.connect();
+      await M.runMigrations(owner, {
+        profile,
+        steps: ordered,
+        target: seed.lastSeed,
+        expectedPending: seed.seed,
+        targetGeneration: A,
+        targetBinding: { targetSha: landing, manifestDigest: anchor.manifestDigest, verifiers: anchor.verifiers },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
     const ledger = await schemaLedger();
     if (!sameNames([...ledger.keys()].sort(), [...seed.seed].sort())) rehearsalRefuse("rehearsal_seed_ledger");
+    if (bytes.seed.some((f) => ledger.get(f.name) !== f.sha256)) rehearsalRefuse("rehearsal_seed_ledger", { against: "landing_tree" });
     const m = await marker();
     if (m?.status !== "pass" || m.generation !== A) rehearsalRefuse("rehearsal_seed_marker");
     // The previous release's event-trigger body: the reviewed wrapper with a different source.

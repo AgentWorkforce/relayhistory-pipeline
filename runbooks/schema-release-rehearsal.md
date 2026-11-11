@@ -43,7 +43,7 @@ migrator lock, so it is listed in execution order below.
 
 | Stage | Proves |
 | --- | --- |
-| R0 seed | Owner, runtime and Supabase shim roles, bootstrap chain, function boundary; the baseline landing commit's schema steps applied by `runMigrations` with a release target binding; marker PASS at that commit's generation (A); the previous release's event-trigger body installed (stale wrapper). |
+| R0 seed | Owner, runtime and Supabase shim roles, bootstrap chain, function boundary; the baseline landing commit's schema steps applied by `runMigrations` with a release target binding; marker PASS at that commit's generation (A); the previous release's event-trigger body installed (stale wrapper). R0's bytes (shim, bootstrap chain, boundary, seed steps and the 7 verifiers) come from the baseline landing commit's tree in the Git object database, each seed step's sha256 checked against that tree and the release tree (`rehearsal_seed_bytes_drift`); R1 onward use the release sha's checkout. |
 | R7-pre | (clean runs where the baseline already has the 044030 overlap) synthetic lazy policy, seat and completeness at A; old and `{B,A}` Workers admit; the owner opens the A to B overlap. Otherwise SKIP. |
 | R1 plan | `inspectRelease` (READ ONLY; refuses `function_acl_drift`, `ledger_gap`, ...), `migrationTargetSplit` equal to an independently computed window, the target anchor at `generation`, `validateReleasePlan` on the plan built exactly as production builds it. |
 | R2 boundary | The planned boundary is safe and is still the previous body (prosrc not exact). |

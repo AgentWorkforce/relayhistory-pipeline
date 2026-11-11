@@ -4,6 +4,7 @@
  * tested in src/hoopdb/__tests__/schema-rehearsal.test.ts. The rehearsal is prerequisite
  * proof only and authorizes nothing (runbooks/schema-release-rehearsal.md).
  */
+import { createHash } from "node:crypto";
 import { RELEASE_TARGET_STEP } from "../../src/hoopdb/schema-release-contract.ts";
 
 /** The failure injections, each proven by its exact refusal (or, late-step, by a clean rerun). */
@@ -186,6 +187,55 @@ export function seedSet(input: {
  */
 export function seedOrder(seed: readonly string[], unseeded: readonly string[]): string[] {
   return [...seed, ...unseeded];
+}
+
+/** sha256 of a file's utf8 text, as migrate.ts sha256Text and release-target.ts digest it. */
+const sha256Utf8 = (text: string) => createHash("sha256").update(text).digest("hex");
+
+/** One file R0 applies: its repository path, the exact text and that text's sha256. */
+export interface SeedFile {
+  name: string;
+  rel: string;
+  text: string;
+  sha256: string;
+}
+
+/**
+ * R0's bytes: every seed schema step and every phase 2 verifier exactly as the baseline
+ * landing commit's tree has them (read from the Git object database, never the release
+ * checkout's working tree), so the seeded database is what the migrator at the landing
+ * commit would have produced. `landing`/`release` return a path's utf8 text at the
+ * landing commit / release sha (undefined when the path is absent); `landingDigests` is
+ * the landing commit's [name, sha256] schema steps (release-target.ts treeSchemaSteps).
+ * Refuses: the seed is not exactly the landing tree's steps (rehearsal_seed_step); a seed
+ * or verifier path absent at the landing commit (rehearsal_seed_bytes_missing); a seed
+ * step whose bytes differ from the landing tree digest or from the release tree's bytes
+ * (landed migrations are frozen) (rehearsal_seed_bytes_drift).
+ */
+export function seedStepBytes(x: {
+  seed: readonly string[];
+  verifiers: readonly { name: string; path: string }[];
+  stepRel: (name: string) => string;
+  landing: (rel: string) => string | undefined;
+  release: (rel: string) => string | undefined;
+  landingDigests: readonly (readonly [string, string])[];
+}): { seed: SeedFile[]; verify: SeedFile[] } {
+  if (x.landingDigests.length !== x.seed.length || x.landingDigests.some(([n], i) => n !== x.seed[i]))
+    rehearsalRefuse("rehearsal_seed_step", { against: "landing_tree" });
+  const file = (name: string, rel: string): SeedFile => {
+    const text = x.landing(rel);
+    if (text === undefined) rehearsalRefuse("rehearsal_seed_bytes_missing", { step: name });
+    return { name, rel, text, sha256: sha256Utf8(text) };
+  };
+  const seed = x.seed.map((name, i) => {
+    const f = file(name, x.stepRel(name));
+    if (f.sha256 !== x.landingDigests[i]![1]) rehearsalRefuse("rehearsal_seed_bytes_drift", { step: name, against: "landing_tree" });
+    const rel = x.release(f.rel);
+    if (rel === undefined || sha256Utf8(rel) !== f.sha256)
+      rehearsalRefuse("rehearsal_seed_bytes_drift", { step: name, against: "release_tree" });
+    return f;
+  });
+  return { seed, verify: x.verifiers.map((v) => file(v.name, v.path)) };
 }
 
 /**
