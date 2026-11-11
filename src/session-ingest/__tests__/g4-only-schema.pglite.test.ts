@@ -151,6 +151,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // Its fence check also replaces publication scope / buffer GC for lock order and guards live writer tables.
       "20261105050010_operator_session_erase_fence_check.sql",
       "20261105050020_operator_session_erase_runtime.sql",
+      // One read-role-only SECURITY DEFINER summary activity counter; no ingest path touches it.
+      "20261105056000_session_summary_activity.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

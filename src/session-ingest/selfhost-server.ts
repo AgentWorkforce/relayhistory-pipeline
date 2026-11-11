@@ -197,7 +197,7 @@ export interface SelfhostRuntimeOptions {
 }
 
 /** The ingest app over the given parts. Canonical acceptance, inline writes, no fan-out, no replica, no custody. */
-export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
+export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect" | "capturePolicyUploads">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
   const sessionSelection = settings.sessionSelection === true;
   const verified = new WeakMap<Request, IngestIdentity>();
   const deliver: DeliverDeps = {
@@ -223,6 +223,8 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     ...(parts.sessionEraseService ? { sessionEraseService: parts.sessionEraseService } : {}) };
   // ANALYTICS_SINK=collector: the same port in every admission mode.
   const analytics = parts.analytics ? { analytics: parts.analytics } : {};
+  // RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS (capture-policy.ts): the same check in every admission mode.
+  const capturePolicyUploads = { capturePolicyUploads: settings.capturePolicyUploads ?? "report" as const };
   const routes: Readonly<Record<string, "GET" | "POST">> = sessionSelection || settings.heartbeatAccept === true
     ? Object.freeze({
       ...SELFHOST_INGEST_ROUTES,
@@ -233,7 +235,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   const admission = settings.admission;
   if (!admission) {
     // SELFHOST_INGEST_ADMISSION=sync (the default): exactly the app this file always built.
-    const app = withSelfhostCapabilities(createIngestApp({ identify, deliver, log: (fields) => log.info("session ingest", fields), ...sessionErase, ...analytics }));
+    const app = withSelfhostCapabilities(createIngestApp({ identify, deliver, log: (fields) => log.info("session ingest", fields), ...sessionErase, ...analytics, ...capturePolicyUploads }));
     return { app, routes, verify: parts.verify, bind: (request, identity) => void verified.set(request, identity), ready: parts.ready, close: parts.close, admissionMode: "sync" };
   }
   const mode = admission.mode === "async" ? "on" as const : "drain" as const;
@@ -266,6 +268,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     ...(upload ? { uploadDirect: upload.config } : {}),
     ...sessionErase,
     ...analytics,
+    ...capturePolicyUploads,
   }));
   if (options.startConsumer !== false) consumer.start();
   return {

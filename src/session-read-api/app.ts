@@ -1,4 +1,4 @@
-import { BriefSummaryError, briefSummaryResponse, type BriefSummary } from "./brief-summary.ts";
+import { BriefSummaryError, briefSummaryResponse, summaryActivityDays, type BriefSummary } from "./brief-summary.ts";
 /**
  * The session read API: an API-compatible subset of relayhistory's /v1 read
  * contract (packages/relayhistory/src/routes/recall.ts), served from ClickHouse
@@ -29,6 +29,8 @@ import { BriefSummaryError, briefSummaryResponse, type BriefSummary } from "./br
  * Directory routes (P3b, docs in src/session-read-api/directory.ts):
  *   GET /v1/sessions                session list without `q`, from the Supabase directory
  *   GET /v1/sessions/activity       sessions per UTC day without `q` (span semantics)
+ *   GET /v1/sessions/summaries/activity  ready native summaries per UTC day (counts only;
+ *                                   brief-summary.ts, migration 20261105056000)
  * Both answer 501 `directory_workspace_not_enabled` unless the token's workspace is on
  * READ_API_DIRECTORY_WORKSPACES (the canary allowlist; unset = none), and 501
  * `directory_not_migrated` until migration 20261105034000 is applied. Never Neon.
@@ -94,6 +96,7 @@ import { resolveDigestNarrative, type DigestNarrativeDeps } from "./digest-narra
 import {
   DIRECTORY_LIST_MAX_LIMIT,
   DirectoryError,
+  activityDates,
   activityDays,
   decodeCompositeListCursor,
   decodeListCursor,
@@ -1191,21 +1194,27 @@ export function createReadApi(deps: ReadApiDeps) {
     }
   });
 
+  /** since/until of the activity routes: both required, ordered, at most MAX_SESSION_ACTIVITY_DAYS UTC days. */
+  function activityWindow(c: Context): { since: Date; until: Date } {
+    const rawSince = single(c, "since");
+    const rawUntil = single(c, "until");
+    if (!rawSince || !rawUntil) throw bad("since and until are required");
+    const sinceMs = parseTime(rawSince, "since")!;
+    const untilMs = parseTime(rawUntil, "until")!;
+    if (untilMs < sinceMs) throw bad("until must not be earlier than since");
+    const since = new Date(sinceMs);
+    const until = new Date(untilMs);
+    const days = Math.round((Date.UTC(until.getUTCFullYear(), until.getUTCMonth(), until.getUTCDate()) - Date.UTC(since.getUTCFullYear(), since.getUTCMonth(), since.getUTCDate())) / 86_400_000) + 1;
+    if (days > MAX_SESSION_ACTIVITY_DAYS) throw bad(`since and until may span at most ${MAX_SESSION_ACTIVITY_DAYS} UTC days`);
+    return { since, until };
+  }
+
   app.get("/v1/sessions/activity", async (c) => {
     try {
       const identity = c.get("identity");
       attestWorkspace(c, identity);
       const directory = directoryFor(identity);
-      const rawSince = single(c, "since");
-      const rawUntil = single(c, "until");
-      if (!rawSince || !rawUntil) throw bad("since and until are required");
-      const sinceMs = parseTime(rawSince, "since")!;
-      const untilMs = parseTime(rawUntil, "until")!;
-      if (untilMs < sinceMs) throw bad("until must not be earlier than since");
-      const since = new Date(sinceMs);
-      const until = new Date(untilMs);
-      const days = Math.round((Date.UTC(until.getUTCFullYear(), until.getUTCMonth(), until.getUTCDate()) - Date.UTC(since.getUTCFullYear(), since.getUTCMonth(), since.getUTCDate())) / 86_400_000) + 1;
-      if (days > MAX_SESSION_ACTIVITY_DAYS) throw bad(`since and until may span at most ${MAX_SESSION_ACTIVITY_DAYS} UTC days`);
+      const { since, until } = activityWindow(c);
       if (deps.sessionQuery === true) {
         const terms = sessionQueryTerms(c, "activity");
         if (terms) {
@@ -1225,6 +1234,33 @@ export function createReadApi(deps: ReadApiDeps) {
       return c.json({ since: since.toISOString(), until: until.toISOString(), days: activityDays(rows, since, until), correlationId: c.get("correlationId") });
     } catch (error) {
       return directoryFail(c, error);
+    }
+  });
+
+  /**
+   * GET /v1/sessions/summaries/activity: ready native session summaries per UTC day, from the
+   * same source GET /v1/sessions/:id/summary reads (sessions.session_briefs through
+   * session_summary_activity_for, 056000). Same workspace attestation, canary and since/until
+   * rules as /v1/sessions/activity. Counts only. 501 where the summary read is not
+   * configured (directory/self-host entries) or 056000 is not applied.
+   */
+  app.get("/v1/sessions/summaries/activity", async (c) => {
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      requireCanary(identity, "summary");
+      for (const name of Object.keys(c.req.query())) if (!["workspace", "since", "until"].includes(name)) throw unsupported(`param_${name}`);
+      const { since, until } = activityWindow(c);
+      if (!deps.briefSummary?.activity) throw unsupported("summary_not_configured");
+      const rows = await deps.briefSummary.activity(identity.orgId, identity.workspaceId, since, until);
+      if (rows === null) throw unsupported("summary_activity_not_migrated");
+      return c.json({ since: since.toISOString(), until: until.toISOString(), days: summaryActivityDays(rows, activityDates(since, until)) });
+    } catch (error) {
+      if (error instanceof BriefSummaryError) {
+        if (error.reason === "invalid_argument") return fail(c, bad("invalid since/until"));
+        return c.json({ error: { code: "backend_unavailable", message: "read backend unavailable" }, correlationId: c.get("correlationId") }, 503);
+      }
+      return fail(c, error);
     }
   });
 

@@ -154,6 +154,9 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
    const read = (path: string) => readApi.request(path, { headers: { authorization: "Bearer fixture" } });
    const events = `/v1/sessions/sess_1/events?workspace=${TENANT.workspaceId}&source=claude`;
    const summary = `/v1/sessions/sess_1/summary?workspace=${TENANT.workspaceId}&source=claude&kind=short`;
+   const summaryDay = (await db.query<{ day: string }>("SELECT (generated_at AT TIME ZONE 'UTC')::date::text AS day FROM sessions.session_briefs WHERE org_id=$1 AND workspace_id=$2 AND session_id='sess_1'",[TENANT.orgId,TENANT.workspaceId])).rows[0]!.day;
+   const summaryActivity = `/v1/sessions/summaries/activity?workspace=${TENANT.workspaceId}&since=${summaryDay}T00:00:00.000Z&until=${summaryDay}T23:59:59.999Z`;
+   expect(await (await read(summaryActivity)).json()).toMatchObject({days:[{date:summaryDay,total:1}]});
    const beforeEvents = await read(events); expect({ status: beforeEvents.status, body: await beforeEvents.text() }).toMatchObject({ status: 200 });
    expect(await (await read(summary)).json()).toMatchObject({ summary: { status: "ready", summary: "private summary" } });
    expect((await read(`/v1/sessions?workspace=${TENANT.workspaceId}`)).status).toBe(200);
@@ -174,6 +177,8 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
    }
    expect((await eraseRequest()).status).toBe(202);
    expect((await read(events)).status).toBe(404);
+   // The aggregate added by #521 also hides the brief immediately, before byte cleanup.
+   expect(await (await read(summaryActivity)).json()).toMatchObject({days:[{date:summaryDay,total:0}]});
    worker = sessionEraseWorker({ ledger, identity, bytes: {
     stagesAbsent: (key, authorize) => stagedObjectsAbsent(eraser, root, key, authorize),
     erase: (k, authorize) => eraseDiscoveredSessionBytes(eraser, k, { keyRoot: root, bucket: bucket!, authorize, log: () => {} }),
@@ -199,6 +204,7 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
    expect([receiptResponse.status, receipt.status, receipt.bytesErased, receipt.uploadsFenced]).toEqual([200, "completed", true, true]);
    for (const p of [events, summary, `/v1/sessions/sess_1/metadata?workspace=${TENANT.workspaceId}&source=claude`, `/v1/sessions/sess_1/turns?workspace=${TENANT.workspaceId}&source=claude`]) expect((await read(p)).status).toBe(404);
    expect(await (await read(`/v1/sessions?workspace=${TENANT.workspaceId}`)).json()).toMatchObject({ sessions: [] });
+   expect(await (await read(summaryActivity)).json()).toMatchObject({days:[{date:summaryDay,total:0}]});
    expect(await (await read(`/v1/events?workspace=${TENANT.workspaceId}&q=eraseflowneedle&limit=50`)).text()).not.toContain("eraseflowneedle");
    for (const k of [rawKey, manifestKey]) await expect(store.get(objectKey(k))).rejects.toMatchObject({ code: "not_found" });
    expect(new TextDecoder().decode(await readAll(await store.get(objectKey(neighbour))))).toBe("neighbor control");
@@ -212,6 +218,7 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
    // before object I/O, even though claim's logical key differs.
    expect((await upload("layout-collision","alias-origin","sess:1")).status).toBe(409);
    expect((await ledger.receipt(key))?.status).toBe("completed");
+   expect(await (await read(summaryActivity)).json()).toMatchObject({days:[{date:summaryDay,total:0}]});
    const inventory = await eraser.verifyErased(manifestKey.slice(0, manifestKey.lastIndexOf("/") + 1), { authorize: async () => {} });
    expect(inventory.status).toBe("erased");
    expect((await db.query("SELECT 1 FROM sessions.session_index WHERE session_id='sess_1'")).rows).toEqual([]);

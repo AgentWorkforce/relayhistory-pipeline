@@ -1477,6 +1477,10 @@
     "sessions.session_replay_sources_changed()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_summary_activity_for(text,timestamp with time zone,timestamp with time zone)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.set_session_brief_documents_live(boolean)": [
       "<owner>:EXECUTE"
     ],
