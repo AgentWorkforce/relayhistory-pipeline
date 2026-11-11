@@ -37,7 +37,11 @@ export const PRIVATE_INGEST_RELEASE = {
   },
 } as const;
 
-export type PrivateIngestReleasePhase = "step-1-custody" | "step-2-frozen-receipt" | "step-4-async-on";
+export type PrivateIngestReleasePhase =
+  | "baseline-drain"
+  | "step-1-custody"
+  | "step-2-frozen-receipt"
+  | "step-4-async-on";
 
 export function privateIngestRefuse(code: string): never {
   throw Object.assign(new Error(code), { code });
@@ -78,7 +82,8 @@ export function privateIngestReleasePhase(input: CloudflareStageInputs): Private
   const profile = input.sessionIngest as unknown as Record<string, unknown>;
   for (const [key, value] of Object.entries(COMMON_PROFILE))
     if (profile[key] !== value) privateIngestRefuse("private_ingest_profile_common");
-  if (!KMS_ARN.test(String(profile.kmsKeyArn ?? "")) || profile.custodySource !== "frozen-supabase")
+  if (!KMS_ARN.test(String(profile.kmsKeyArn ?? "")) ||
+      (profile.custodySource !== undefined && profile.custodySource !== "frozen-supabase"))
     privateIngestRefuse("private_ingest_profile_target");
   const allowed = new Set([
     ...Object.keys(COMMON_PROFILE),
@@ -91,6 +96,8 @@ export function privateIngestReleasePhase(input: CloudflareStageInputs): Private
     privateIngestRefuse("private_ingest_profile_extra");
   const asyncAdmission = profile.asyncAdmission,
     frozenReceipt = profile.syncAdmissionFrozenReceipt;
+  if (profile.custodySource === undefined && asyncAdmission === "drain" && frozenReceipt === undefined)
+    return "baseline-drain";
   if (asyncAdmission === "drain" && frozenReceipt === undefined)
     return "step-1-custody";
   if (asyncAdmission === "drain" && frozenReceipt === "on")
@@ -120,12 +127,13 @@ export type CloudflareWorkerVersion = {
   id?: unknown;
   number?: unknown;
   created_on?: unknown;
-  metadata?: {
-    compatibility_date?: unknown;
-    compatibility_flags?: unknown;
-    main_module?: unknown;
+  resources?: {
+    bindings?: CloudflareVersionBinding[];
+    script_runtime?: {
+      compatibility_date?: unknown;
+      compatibility_flags?: unknown;
+    };
   };
-  resources?: { bindings?: CloudflareVersionBinding[] };
 };
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -172,7 +180,7 @@ export interface PrivateIngestReadback {
 
 export interface PrivateIngestTransitionReadback {
   status: "PRIVATE_INGEST_LIVE_TRANSITION_PASS";
-  from: "baseline-drain" | PrivateIngestReleasePhase;
+  from: PrivateIngestReleasePhase;
   to: PrivateIngestReleasePhase;
   deploymentId: string;
   versionId: string;
@@ -218,13 +226,12 @@ function privateIngestVersionEvidence(
       store_id: input.sessionIngest.secretsStoreId,
       secret_name: secretName,
     });
-  if (version.metadata?.compatibility_date !== undefined && version.metadata.compatibility_date !== COMPATIBILITY_DATE)
+  const runtime = version.resources.script_runtime;
+  if (runtime?.compatibility_date !== COMPATIBILITY_DATE)
     privateIngestRefuse("private_ingest_live_compatibility_date");
-  if (version.metadata?.compatibility_flags !== undefined) {
-    const flags = version.metadata.compatibility_flags;
-    if (!Array.isArray(flags) || COMPATIBILITY_FLAGS.some((flag) => !flags.includes(flag)))
-      privateIngestRefuse("private_ingest_live_compatibility_flags");
-  }
+  const flags = runtime?.compatibility_flags;
+  if (!Array.isArray(flags) || COMPATIBILITY_FLAGS.some((flag) => !flags.includes(flag)))
+    privateIngestRefuse("private_ingest_live_compatibility_flags");
   const profileSha256 = createHash("sha256").update(JSON.stringify(input.sessionIngest)).digest("hex");
   return { bindingCount: bindings.length, profileSha256 };
 }
@@ -252,15 +259,13 @@ export function privateIngestProfileForPhase(
   const sessionIngest: SessionIngestInputs = {
     ...COMMON_PROFILE,
     kmsKeyArn,
-    custodySource: "frozen-supabase",
+    ...(phase === "baseline-drain" ? {} : { custodySource: "frozen-supabase" as const }),
     asyncAdmission: phase === "step-4-async-on" ? "on" : "drain",
-    ...(phase === "step-1-custody" ? {} : { syncAdmissionFrozenReceipt: "on" as const }),
+    ...(phase === "baseline-drain" || phase === "step-1-custody"
+      ? {}
+      : { syncAdmissionFrozenReceipt: "on" as const }),
   };
   return { sessionIngest };
-}
-
-function privateIngestBaselineProfile(kmsKeyArn: string): CloudflareStageInputs {
-  return { sessionIngest: { ...COMMON_PROFILE, kmsKeyArn, asyncAdmission: "drain" } };
 }
 
 /** A forward step must be observed independently on the live 100% version; rollbacks unwind one step. */
@@ -271,7 +276,7 @@ export function privateIngestTransitionReadback(
 ): PrivateIngestTransitionReadback {
   const to = privateIngestReleasePhase(input), kmsKeyArn = input.sessionIngest.kmsKeyArn;
   const candidates = [
-    ["baseline-drain", privateIngestBaselineProfile(kmsKeyArn)],
+    ["baseline-drain", privateIngestProfileForPhase("baseline-drain", kmsKeyArn)],
     ["step-1-custody", privateIngestProfileForPhase("step-1-custody", kmsKeyArn)],
     ["step-2-frozen-receipt", privateIngestProfileForPhase("step-2-frozen-receipt", kmsKeyArn)],
     ["step-4-async-on", privateIngestProfileForPhase("step-4-async-on", kmsKeyArn)],
@@ -283,6 +288,7 @@ export function privateIngestTransitionReadback(
   if (matches.length !== 1) privateIngestRefuse("private_ingest_live_phase");
   const from = matches[0]![0];
   const allowed: Record<PrivateIngestReleasePhase, readonly PrivateIngestTransitionReadback["from"][]> = {
+    "baseline-drain": ["baseline-drain", "step-1-custody"],
     "step-1-custody": ["baseline-drain", "step-1-custody", "step-2-frozen-receipt"],
     "step-2-frozen-receipt": ["step-1-custody", "step-2-frozen-receipt", "step-4-async-on"],
     "step-4-async-on": ["step-2-frozen-receipt", "step-4-async-on"],

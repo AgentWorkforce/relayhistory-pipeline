@@ -16,15 +16,15 @@ import { privateIngestGithubGate } from "../../../scripts/private-ingest-release
 const sha = "a".repeat(40), planRun = "90";
 const kmsKeyArn = "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-0000-000000000000";
 
-test("tracked production config is exact step 1; only the three authorized phases are representable", () => {
+test("tracked production config is exact step 1; only the rollout phases and baseline rollback are representable", () => {
   const tracked = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
   const expected = privateIngestProfileForPhase("step-1-custody", kmsKeyArn);
   const { kmsKeyArn: _target, ...expectedTracked } = expected.sessionIngest;
   expect(tracked).toEqual({ sessionIngest: expectedTracked });
-  for (const phase of ["step-1-custody", "step-2-frozen-receipt", "step-4-async-on"] as const)
+  for (const phase of ["baseline-drain", "step-1-custody", "step-2-frozen-receipt", "step-4-async-on"] as const)
     expect(privateIngestReleasePhase(privateIngestProfileForPhase(phase, kmsKeyArn))).toBe(phase);
   for (const bad of [
-    { ...tracked, sessionIngest: { ...tracked.sessionIngest, custodySource: undefined } },
+    { ...tracked, sessionIngest: { ...tracked.sessionIngest, custodySource: "foreign" } },
     { ...tracked, sessionIngest: { ...tracked.sessionIngest, asyncAdmission: "off" } },
     { ...tracked, sessionIngest: { ...tracked.sessionIngest, claimTimeoutBusy: "on" } },
     { ...tracked, sessionIngest: { ...tracked.sessionIngest, expectedGeneration: "f".repeat(64) } },
@@ -50,7 +50,7 @@ test("typed release confirmation binds mode, main SHA and prior plan", () => {
   })) expect(() => privateIngestReleaseInputs({ ...deploy, [key]: value })).toThrow();
 });
 
-function readbackFixture(phase: "step-1-custody" | "step-2-frozen-receipt" | "step-4-async-on") {
+function readbackFixture(phase: "baseline-drain" | "step-1-custody" | "step-2-frozen-receipt" | "step-4-async-on") {
   const input = privateIngestProfileForPhase(phase, kmsKeyArn), vars = sessionIngestVars(input.sessionIngest);
   const bindings: any[] = Object.entries(vars).map(([name, text]) => ({ name, type: "plain_text", text }));
   bindings.push(
@@ -65,8 +65,13 @@ function readbackFixture(phase: "step-1-custody" | "step-2-frozen-receipt" | "st
   const active = { deploymentId: "1".repeat(8) + "-1111-1111-1111-111111111111", versionId: "2".repeat(8) + "-2222-2222-2222-222222222222", createdOn: "2026-11-11T00:00:00Z" };
   const version: CloudflareWorkerVersion = {
     id: active.versionId,
-    metadata: { compatibility_date: "2026-10-01", compatibility_flags: ["nodejs_compat", "new_module_registry"] },
-    resources: { bindings },
+    resources: {
+      bindings,
+      script_runtime: {
+        compatibility_date: "2026-10-01",
+        compatibility_flags: ["nodejs_compat", "new_module_registry"],
+      },
+    },
   };
   return { input, active, version };
 }
@@ -94,6 +99,9 @@ test("post-deploy readback requires one 100% version and every targeted binding"
     (v: CloudflareWorkerVersion) => { v.resources!.bindings!.push({ name: "INGEST_FOREIGN", type: "plain_text", text: "on" }); },
     (v: CloudflareWorkerVersion) => { v.resources!.bindings = v.resources!.bindings!.filter((b) => b.name !== "INGEST_ADMISSION"); },
     (v: CloudflareWorkerVersion) => { v.resources!.bindings!.find((b) => b.name === "HYPERDRIVE")!.id = "f".repeat(32); },
+    (v: CloudflareWorkerVersion) => { delete v.resources!.script_runtime; },
+    (v: CloudflareWorkerVersion) => { v.resources!.script_runtime!.compatibility_date = "2026-09-01"; },
+    (v: CloudflareWorkerVersion) => { v.resources!.script_runtime!.compatibility_flags = []; },
   ]) {
     const copy = structuredClone(fixture.version);
     mutate(copy);
@@ -111,6 +119,17 @@ test("live transition gate requires an independently deployed step 2 before step
     baseline.active,
     baseline.version,
   )).toMatchObject({ from: "baseline-drain", to: "step-1-custody" });
+  expect(privateIngestTransitionReadback(
+    privateIngestProfileForPhase("baseline-drain", kmsKeyArn),
+    baseline.active,
+    baseline.version,
+  )).toMatchObject({ from: "baseline-drain", to: "baseline-drain" });
+  const currentStep1ForRollback = readbackFixture("step-1-custody");
+  expect(privateIngestTransitionReadback(
+    privateIngestProfileForPhase("baseline-drain", kmsKeyArn),
+    currentStep1ForRollback.active,
+    currentStep1ForRollback.version,
+  )).toMatchObject({ from: "step-1-custody", to: "baseline-drain" });
   const currentStep1 = readbackFixture("step-1-custody");
   expect(privateIngestTransitionReadback(
     privateIngestProfileForPhase("step-2-frozen-receipt", kmsKeyArn),

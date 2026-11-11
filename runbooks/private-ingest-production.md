@@ -9,7 +9,10 @@ retained-plan operator locally against production.
 The complete nonsecret feature profile is
 `config/cloudflare/private-ingest-production.json`; the protected environment supplies the KMS
 target. Workflow inputs cannot override either source. The release contract recognizes only these
-ordered profiles:
+ordered rollout profiles, plus the baseline rollback target:
+
+0. `baseline-drain` (rollback only): no frozen custody source or synchronous receipt bridge;
+   async admission remains `drain`.
 
 1. `step-1-custody`: `custodySource=frozen-supabase`, async admission remains `drain`, the
    synchronous frozen-receipt bridge is absent.
@@ -83,8 +86,8 @@ readback is retained as `private-ingest-readback` for 30 days.
 
 ## Rollback
 
-- Step 1 or 2: revert the tracked profile by a normal commit, then plan and deploy through the
-  same workflow. Never rewrite `main`.
+- Step 1: revert the tracked profile to `baseline-drain` by a normal commit, then plan and deploy
+  through the same workflow. Step 2 rolls back to `step-1-custody`. Never rewrite `main`.
 - Step 4: first turn the relayhistory per-org opt-in off. Change the tracked ingest profile from
   `on` back to `drain`, then plan and deploy through CI. Do not go directly `on -> off` while
   messages may be in flight. Wait for the admission queue and DLQ to empty before a later `off`
