@@ -45,6 +45,13 @@ const BUFFERED_STAGES_SESSION_FIRST_STEP =
   "upstream:20261105044040_buffered_stages_session_first.sql";
 const COORDINATION_FACT_READERS_STEP =
   "upstream:20261105047000_coordination_fact_readers.sql";
+const OPERATOR_USER_ERASE_INDEXES_STEP =
+  "upstream:20261105058000_operator_user_erase_indexes.sql";
+const fkIndex = (name: string, table: string, column: string): AdoptableIndex => ({
+  name,
+  table: `sessions.${table}`,
+  def: `CREATE INDEX ${name} ON sessions.${table} USING btree (${column})`,
+});
 const orgIndex = (table: string, columns: string): AdoptableIndex => ({
   name: `${table}_org_id_idx`,
   table: `sessions.${table}`,
@@ -96,6 +103,15 @@ export const ADOPTABLE_INDEXES: Readonly<Record<string, readonly AdoptableIndex[
       table: "sessions.session_output_facts",
       def: "CREATE INDEX session_output_facts_coordination_outcomes_idx ON sessions.session_output_facts USING btree (org_id, workspace_id, ts, row_id) WHERE (fact_kind = ANY (ARRAY['commit'::text, 'outcome'::text]))",
     },
+  ],
+  // Operator per-user erase foreign-key support indexes, 20261105058000 (packet:
+  // docs/packets/operator-user-erase-index-packet.md), in the step's build order.
+  [OPERATOR_USER_ERASE_INDEXES_STEP]: [
+    fkIndex("ingest_receipt_ord_seats_key_sha256_idx", "ingest_receipt_ord_seats", "key_sha256"),
+    fkIndex("ingest_receipt_record_heads_winner_key_sha256_idx", "ingest_receipt_record_heads", "winner_key_sha256"),
+    fkIndex("ingest_lazy_native_slots_current_seat_key_idx", "ingest_lazy_native_slots", "current_seat_key"),
+    fkIndex("ingest_lazy_ack_decisions_native_key_sha256_idx", "ingest_lazy_ack_decisions", "native_key_sha256"),
+    fkIndex("ingest_lazy_ack_decisions_seat_key_sha256_idx", "ingest_lazy_ack_decisions", "seat_key_sha256"),
   ],
 };
 
@@ -162,6 +178,10 @@ export const ADOPTABLE_INDEX_STEPS: Readonly<Record<string, AdoptableIndexStep>>
     packet: "coordination fact-reader index packet docs/coordination-overlap-detection.md",
     replaces: [],
     creates: ["sessions.coordination_write_facts_for", "sessions.coordination_output_facts_for"],
+  },
+  [OPERATOR_USER_ERASE_INDEXES_STEP]: {
+    packet: "operator user erase index packet docs/packets/operator-user-erase-index-packet.md",
+    replaces: [],
   },
 };
 
@@ -367,6 +387,12 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     sql: "SELECT to_regprocedure('sessions.coordination_write_facts_for(text,timestamptz,timestamptz,text,integer)') IS NOT NULL AND to_regprocedure('sessions.coordination_output_facts_for(text,timestamptz,timestamptz,text,integer)') IS NOT NULL AS applied",
   },
   "upstream:20261105056000_session_summary_activity.sql": { evidence: "function sessions.session_summary_activity_for", sql: "SELECT to_regprocedure('sessions.session_summary_activity_for(text,timestamptz,timestamptz)') IS NOT NULL AS applied" },
+  // Adoptable step: an unledgered "applied" here is accepted when every declared index is adoptable.
+  [OPERATOR_USER_ERASE_INDEXES_STEP]: {
+    evidence: "the five operator-user-erase foreign-key support indexes, exact definition, valid and ready",
+    sql: adoptableIndexesSentinel(OPERATOR_USER_ERASE_INDEXES_STEP),
+  },
+  "upstream:20261105058010_operator_user_erase.sql": { evidence: "table sessions.operator_user_erasures (operator per-user erase)", sql: relation("sessions.operator_user_erasures") },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),
