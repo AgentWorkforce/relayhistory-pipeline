@@ -4,6 +4,8 @@ import {validatedCustodyAck} from "./custody-ack.ts";
 import {CURRENT_CUSTODY_CONTENT_TYPE,CURRENT_CUSTODY_ACK_HEADER,PRIVATE_CUSTODY_BYTES,type CurrentCustodyPacket} from "./custody-protocol.ts";
 import {orderedControl,orderedControlResult,type OrderedControl} from "./control-protocol.ts";
 import { registerSessionEraseRoutes, SESSION_ERASE_DISABLED, type SessionEraseConfig } from "./session-erase.ts";
+import { checkUploadConsent, CONSENT_SCOPE, UploadConsentRequired, validateConsentWrite, type ConsentWrite, type UploadConsentConfig } from "./upload-consent.ts";
+import { operatorSharingCap } from "./capture-policy.ts";
 import { assertUserDeleteAllowed, CAPTURE_POLICY_REVISION_HEADER, uploadPolicyError, uploadPolicyViolation, type CapturePolicySubject, type CapturePolicyUploadsMode } from "./capture-policy.ts";
 /**
  * The 96Bulls session ingest: relayhistory's delivery write contract
@@ -66,6 +68,7 @@ export type ContentEncoding = "zstd" | "gzip";
 
 /** relayhistory-cloud's read scope; only the onboarding status reads accept it here. */
 export const READ_SCOPE = "rth:read";
+export const UPLOAD_CONSENT_PATH = "/v1/upload-consent";
 const READ_PATHS = new Set(["/v1/onboarding/connection", "/v1/onboarding/receipt"]);
 export const IDENTITY_HEADER = "x-relay-ingest-identity";
 export const SIGNATURE_HEADER = "x-relay-ingest-signature";
@@ -148,6 +151,12 @@ export interface IngestAppDeps {
    * caller's capture policy and accepts it; enforce refuses it. Only identities carrying a policy (self-host) are checked.
    */
   capturePolicyUploads?: CapturePolicyUploadsMode;
+  /**
+   * INGEST_UPLOAD_CONSENT (upload-consent.ts, docs/upload-consent.md). Absent or enforcement "off": nothing
+   * is read. Otherwise every batch is checked against the verified principal's server-owned sharing choice
+   * before any enqueue, claim or write, again after the claim, and once more before the receipt commit.
+   */
+  uploadConsent?: UploadConsentConfig;
   /**
    * P1 custody source (INGEST_CUSTODY_SOURCE). "relayhistory" (default): only the signed Neon witness
    * relayhistory sends. "shadow": additionally build the Supabase frozen-source witness and log
@@ -339,6 +348,8 @@ function failure(c: Context<Env>, error: unknown) {
   const safe = error instanceof DeliveryError ? error : new DeliveryError("delivery_unavailable", 503, "Durable delivery is temporarily unavailable");
   // A busy refusal is retryable and wrote nothing durable; tell the client when (relayhistory's header).
   if (safe instanceof DeliveryBusyError) c.header("Retry-After", String(safe.retryAfterSeconds));
+  // Held for consent: a long wait, and the 503 keeps every released Desktop's batch on disk for the retry.
+  if (safe instanceof UploadConsentRequired) c.header("Retry-After", String(safe.retryAfterSeconds));
   // Acquisition refusal (design §5.6): the refused sessions sit beside `error`, not inside it.
   if (safe instanceof AcquisitionRefusedError)
     return c.json({ ...errorBody(c, safe.code, safe.message), refused: safe.refused.map((r) => ({ source: r.source, sessionId: r.sessionId, code: r.code })) }, 409);
@@ -409,6 +420,47 @@ export function parseSelection(body: unknown): { account_id: string; expected_us
     if (!identifier((x as Record<string, unknown>).source) || !identifier((x as Record<string, unknown>).session_id)) invalid("Invalid session identity");
   }
   return b as never;
+}
+
+/** POST /v1/upload-consent body. Known keys only (each optional); at most 2048 sessions per list. */
+export function parseConsentWrite(body: unknown): ConsentWrite {
+  if (!isObject(body)) invalid("Expected upload consent");
+  const b = body as Record<string, unknown>;
+  const allowed = new Set(["mode", "allow", "deny", "confirm_origins", "release_hold", "expected_revision"]);
+  if (Object.keys(b).some((k) => !allowed.has(k))) invalid("Unexpected or missing field");
+  const sessions = (v: unknown): { source: string; sessionId: string }[] | undefined => {
+    if (v === undefined) return undefined;
+    if (!Array.isArray(v) || v.length > 2048) invalid("Invalid upload consent sessions");
+    return (v as unknown[]).map((x) => {
+      if (!isObject(x)) invalid("Invalid upload consent session");
+      const r = x as Record<string, unknown>;
+      exactKeys(r, ["source", "session_id"]);
+      if (!identifier(r.source) || !identifier(r.session_id)) invalid("Invalid upload consent session");
+      return { source: r.source as string, sessionId: r.session_id as string };
+    });
+  };
+  const write: ConsentWrite = {};
+  if (b.mode !== undefined) {
+    if (b.mode !== "selected" && b.mode !== "new" && b.mode !== "all") invalid("Invalid upload consent mode");
+    write.mode = b.mode as ConsentWrite["mode"];
+  }
+  const allow = sessions(b.allow), deny = sessions(b.deny);
+  if (allow) write.allow = allow;
+  if (deny) write.deny = deny;
+  if (b.confirm_origins !== undefined) {
+    if (!Array.isArray(b.confirm_origins) || b.confirm_origins.length > 64 || !b.confirm_origins.every(identifier)) invalid("Invalid upload consent origins");
+    write.confirmOrigins = b.confirm_origins as string[];
+  }
+  if (b.release_hold !== undefined) {
+    if (typeof b.release_hold !== "boolean") invalid("Invalid upload consent hold release");
+    if (b.release_hold) write.releaseHold = true;
+  }
+  if (b.expected_revision !== undefined) {
+    if (!Number.isSafeInteger(b.expected_revision) || (b.expected_revision as number) < 0) invalid("Invalid upload consent revision");
+    write.expectedRevision = b.expected_revision as number;
+  }
+  validateConsentWrite(write);
+  return write;
 }
 
 export function parseReset(body: unknown): { account_id: string; request_id: string } {
@@ -545,7 +597,15 @@ export function createIngestApp(deps: IngestAppDeps) {
       return c.json(errorBody(c, "invalid_token", "invalid or expired token"), 401);
     }
     // The onboarding status reads are the only rth:read routes here; everything else needs rth:sync.
-    const scope = c.req.method === "GET" && READ_PATHS.has(new URL(c.req.url).pathname) ? READ_SCOPE : SYNC_SCOPE;
+    const pathname = new URL(c.req.url).pathname;
+    // The consent route takes a sync token (narrowing only) or a consent token (upload-consent.ts).
+    // Hono's decoded path, the one routing matches (an encoded `/v1/upload-%63onsent` is this route too).
+    if (c.req.path === UPLOAD_CONSENT_PATH) {
+      if (!c.get("identity").scopes.some((s) => s === SYNC_SCOPE || s === CONSENT_SCOPE)) return c.json(errorBody(c, "forbidden", `missing required scope: ${SYNC_SCOPE}`), 403);
+      await next();
+      return;
+    }
+    const scope = c.req.method === "GET" && READ_PATHS.has(pathname) ? READ_SCOPE : SYNC_SCOPE;
     if (!c.get("identity").scopes.includes(scope)) return c.json(errorBody(c, "forbidden", `missing required scope: ${scope}`), 403);
     await next();
   });
@@ -626,6 +686,11 @@ export function createIngestApp(deps: IngestAppDeps) {
         if (capturePolicyUploads === "enforce") throw uploadPolicyError(violation, identity.capturePolicy!.revision);
       }
       const tenant = { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
+      // Upload consent (upload-consent.ts): before any enqueue, claim or write. Explicit denies wait for the
+      // post-claim check, which knows which sessions the deletion fence will drop anyway.
+      // The operator's enforced sharing mode caps the person's choice (capture-policy.ts operatorSharingCap).
+      const operator = operatorSharingCap(identity, capturePolicyUploads);
+      await checkUploadConsent(deps.uploadConsent, tenant, batch.origin_id, batch.records, { deferDenied: true, phase: "precheck", route, ...(operator ? { operator } : {}) }, (f) => emit({ ...fields, ...f }));
       // Async admission: no Supabase call. Only for a caller whose SIGNED identity accepts the queued ACK,
       // with a pre-body journal witness, and never for a relayhistory-built custody envelope (whose ACK
       // header must come from the claim).
@@ -665,7 +730,10 @@ export function createIngestApp(deps: IngestAppDeps) {
       else if (c.get("custody")) await shadow(route, c.get("custody")!, () => batchWitnessInput(tenant, batch));
       const custody=c.get("custody");
       if(custody&&custody.witness.originalRecordCount!==batch.records.length)throw new IngestUnavailable("fence","custody_record_count");
-      const result = await deliverBatch({...deps.deliver,...(custody?{custody}:{})}, { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId }, batch);
+      const consentGate = (deps.uploadConsent && deps.uploadConsent.enforcement !== "off") || operator
+        ? async (dropped: ReadonlySet<string>, phase: "admit" | "commit") => { await checkUploadConsent(deps.uploadConsent, tenant, batch.origin_id, batch.records, { dropped, phase, route, ...(operator ? { operator } : {}) }, (f) => emit({ ...fields, ...f })); }
+        : undefined;
+      const result = await deliverBatch({...deps.deliver,...(custody?{custody}:{}),...(consentGate?{consentGate}:{})}, { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId }, batch);
       emit({ ...fields, outcome: result.outcome, count: result.stats.records, manifests: result.stats.manifests_written, deleted: result.stats.deleted_sessions, state: result.stats.replica, duration_ms: Date.now() - started, bytes_raw: read.bytes });
       completed({ outcome: result.outcome }, result.stats.records);
       custodyHeader(c,result.custodyAck);
@@ -708,7 +776,12 @@ export function createIngestApp(deps: IngestAppDeps) {
       const tenant = { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
       const { prepared, custody } = await decodeRecoveryEnvelope(c.get("body"), tenant);
       c.set("custody", custody);
-      const result = await deliverPrepared({ ...deps.deliver, custody }, tenant, prepared);
+      // Replaying an archive re-publishes it: the same consent check as a live batch.
+      await checkUploadConsent(deps.uploadConsent, tenant, prepared.originId, prepared.records, { deferDenied: true, phase: "precheck", route: "delivery.recovery" }, (f) => emit({ ...fields, ...f }));
+      const consentGate = deps.uploadConsent && deps.uploadConsent.enforcement !== "off"
+        ? async (dropped: ReadonlySet<string>, phase: "admit" | "commit") => { await checkUploadConsent(deps.uploadConsent, tenant, prepared.originId, prepared.records, { dropped, phase, route: "delivery.recovery" }, (f) => emit({ ...fields, ...f })); }
+        : undefined;
+      const result = await deliverPrepared({ ...deps.deliver, custody, ...(consentGate ? { consentGate } : {}) }, tenant, prepared);
       emit({ ...fields, outcome: result.outcome, count: result.stats.records, manifests: result.stats.manifests_written, deleted: result.stats.deleted_sessions, state: result.stats.replica, duration_ms: Date.now() - started, bytes_raw: c.get("body").byteLength });
       custodyHeader(c, result.custodyAck);
       return c.json({ ...result.receipt, limits: { ...result.receipt.limits, contentEncodings: contentEncodings() } });
@@ -724,6 +797,24 @@ export function createIngestApp(deps: IngestAppDeps) {
   // Deletion fences (relayhistory's selection and reset, written here right after Neon's own, by
   // relayhistory-cloud #265). Same bodies and answers as relayhistory (lib/delivery.ts
   // setSessionUploads / resetUploadedSessions); tenancy only from the signed identity.
+  // Upload consent writes (upload-consent.ts). Tenancy only from the signed identity. A sync token may
+  // only narrow; widening needs the consent scope, which only a person's confirmed action mints.
+  app.post(UPLOAD_CONSENT_PATH, async (c) => {
+    const identity = c.get("identity");
+    try {
+      if (!deps.uploadConsent || deps.uploadConsent.enforcement === "off") throw new IngestUnavailable("consent", "upload_consent_off");
+      const write = parseConsentWrite(await jsonOf(c));
+      const trusted = identity.scopes.includes(CONSENT_SCOPE);
+      const tenant = { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
+      const { revision } = await deps.uploadConsent.store.apply(tenant, write, { trusted, nowMs: (deps.uploadConsent.nowMs ?? Date.now)() });
+      emit({ route: "upload_consent.write", outcome: "applied", org_id: identity.orgId, state: trusted ? "trusted" : "narrowing", revision });
+      return c.json({ revision });
+    } catch (error) {
+      emit({ route: "upload_consent.write", outcome: error instanceof DeliveryError ? error.code : "upload_consent_unavailable", org_id: identity.orgId });
+      return failure(c, error instanceof DeliveryError ? error : new IngestUnavailable("consent", "upload_consent_store"));
+    }
+  });
+
   app.post("/v1/delivery/sessions/selection", async (c) => {
     const identity = c.get("identity");
     try {
@@ -754,6 +845,10 @@ export function createIngestApp(deps: IngestAppDeps) {
         const result=await journal(async()=>orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({...selection,control:{...control,kind:"selection"},...(custody?{custody}:{})}),control),(r)=>r.control.outcome);
         controlAck=result.control;custodyHeader(c,result.custodyAck);
       }else await journal(()=>deps.deliver.ledger.setSessionUploads(selection),()=>"applied");
+      // A "Don't upload" is also the principal's explicit deny (every origin, every mode, kept when the mode
+      // becomes "all"). Narrowing only. A re-enable never broadens consent: that needs a confirmed write.
+      if (!input.enabled && deps.uploadConsent && deps.uploadConsent.enforcement !== "off")
+        await deps.uploadConsent.store.apply(selection.tenant, { deny: input.sessions.map((x) => ({ source: x.source, sessionId: x.session_id })) }, { trusted: false, nowMs: (deps.uploadConsent.nowMs ?? Date.now)() });
       emit({ route: "delivery.sessions.selection", outcome: controlAck?"control_"+controlAck.outcome:input.enabled ? "enabled" : "disabled", org_id: identity.orgId, count: input.sessions.length });
       return c.json({ updated: true,...(controlAck?{control:controlAck}:{}) });
     } catch (error) {

@@ -73,6 +73,7 @@
  * included, which is stripped) can assert identity. Bodies, tokens and header
  * values are never logged.
  */
+import { sqlUploadConsentStore } from "./upload-consent-sql.ts";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { Readable } from "node:stream";
@@ -82,7 +83,7 @@ import { initScrubEngine, routedRawChunkSealerDeps, scrubEngineReady } from "@rh
 import { assertConditionalWrites, buildLockerStore } from "../shared/locker.ts";
 import type { ObjectStore } from "../shared/vendor.ts";
 import { AuthError } from "../session-read-api/app.ts";
-import { createIngestApp, IDENTITY_HEADER, SIGNATURE_HEADER, type IngestIdentity } from "./app.ts";
+import { createIngestApp, IDENTITY_HEADER, SIGNATURE_HEADER, UPLOAD_CONSENT_PATH, type IngestIdentity } from "./app.ts";
 import { ADMISSION_ACCEPT_VALUE, INBOX_NAMESPACE, type AdmissionMessage } from "./async-admission.ts";
 import { promoteUpload } from "./upload-admission.ts";
 import type { DeliverDeps } from "./deliver.ts";
@@ -192,7 +193,7 @@ export interface SelfhostRuntimeOptions {
 }
 
 /** The ingest app over the given parts. Canonical acceptance, inline writes, no fan-out, no replica, no custody. */
-export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect" | "capturePolicyUploads">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
+export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect" | "capturePolicyUploads" | "uploadConsent">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
   const sessionSelection = settings.sessionSelection === true;
   const verified = new WeakMap<Request, IngestIdentity>();
   const deliver: DeliverDeps = {
@@ -218,17 +219,23 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   const analytics = parts.analytics ? { analytics: parts.analytics } : {};
   // RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS (capture-policy.ts): the same check in every admission mode.
   const capturePolicyUploads = { capturePolicyUploads: settings.capturePolicyUploads ?? "report" as const };
-  const routes: Readonly<Record<string, "GET" | "POST">> = sessionSelection || settings.heartbeatAccept === true
+  // INGEST_UPLOAD_CONSENT (upload-consent.ts): the same check on the request path and in the consumer.
+  const uploadConsentConfig = settings.uploadConsent && settings.uploadConsent !== "off"
+    ? { enforcement: settings.uploadConsent, store: sqlUploadConsentStore(parts.run), ...(options.nowMs ? { nowMs: options.nowMs } : {}) }
+    : undefined;
+  const uploadConsent = uploadConsentConfig ? { uploadConsent: uploadConsentConfig } : {};
+  const routes: Readonly<Record<string, "GET" | "POST">> = sessionSelection || settings.heartbeatAccept === true || uploadConsentConfig
     ? Object.freeze({
       ...SELFHOST_INGEST_ROUTES,
       ...(sessionSelection ? { [SELFHOST_SESSION_SELECTION_PATH]: "POST" as const } : {}),
       ...(settings.heartbeatAccept === true ? { [SELFHOST_HEARTBEAT_PATH]: "POST" as const } : {}),
+      ...(uploadConsentConfig ? { [UPLOAD_CONSENT_PATH]: "POST" as const } : {}),
     })
     : SELFHOST_INGEST_ROUTES;
   const admission = settings.admission;
   if (!admission) {
     // SELFHOST_INGEST_ADMISSION=sync (the default): exactly the app this file always built.
-    const app = withSelfhostCapabilities(createIngestApp({ identify, deliver, log: (fields) => log.info("session ingest", fields), ...sessionErase, ...analytics, ...capturePolicyUploads }));
+    const app = withSelfhostCapabilities(createIngestApp({ identify, deliver, log: (fields) => log.info("session ingest", fields), ...sessionErase, ...analytics, ...capturePolicyUploads, ...uploadConsent }));
     return { app, routes, verify: parts.verify, bind: (request, identity) => void verified.set(request, identity), ready: parts.ready, close: parts.close, admissionMode: "sync" };
   }
   const mode = admission.mode === "async" ? "on" as const : "drain" as const;
@@ -244,6 +251,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   const consumer: SelfhostAdmissionConsumer = selfhostAdmissionConsumer({
     mode, deliver, concurrency: admission.concurrency, scanIntervalMs: admission.scanIntervalMs, maxAttempts: admission.maxAttempts,
     ...(options.nowMs ? { nowMs: options.nowMs } : {}), ...(options.log ? { log: options.log } : {}), ...(uploadInbox ? { uploadInbox } : {}),
+    ...uploadConsent,
   });
   options.onConsumer?.(consumer);
   const app = withSelfhostCapabilities(createIngestApp({
@@ -262,6 +270,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     ...sessionErase,
     ...analytics,
     ...capturePolicyUploads,
+    ...uploadConsent,
   }));
   if (options.startConsumer !== false) consumer.start();
   return {

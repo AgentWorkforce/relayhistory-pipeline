@@ -92,6 +92,7 @@
  * INGEST_CUSTODY_SOURCE other than relayhistory/unset, INGEST_PRIVACY_AUTHORITY other than neon/unset,
  * INGEST_SIGNING_KEY (the relayhistory HMAC is never accepted here).
  */
+import { UPLOAD_CONSENT_VAR, uploadConsentEnforcement, type UploadConsentEnforcement } from "./upload-consent.ts";
 import type { CapturePolicyUploadsMode } from "./capture-policy.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { normalizedAudience } from "@rhc/auth/relaycontrol.ts";
@@ -145,6 +146,8 @@ export interface SelfhostIngestSettings {
   heartbeatAccept: boolean;
   /** RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: the capture policy upload check (capture-policy.ts). Default report. */
   capturePolicyUploads: CapturePolicyUploadsMode;
+  /** INGEST_UPLOAD_CONSENT (upload-consent.ts): off (default) | report | hold-only | enforce. */
+  uploadConsent: UploadConsentEnforcement;
   /** RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS: positive introspection cache, ms. 0 (default) = none. */
   introspectPositiveTtlMs: number;
   /** SESSION_ERASE_API_ENABLED (session-erase.ts). Default: disabled, the route answers 501. */
@@ -301,6 +304,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   const sessionSelection = selfhostSessionSelectionEnabled(env);
   const heartbeatAccept = selfhostHeartbeatAcceptEnabled(env);
   const capturePolicyUploads = selfhostCapturePolicyUploads(env);
+  const uploadConsent = uploadConsentEnforcement(env[UPLOAD_CONSENT_VAR]);
   const introspectPositiveTtlMs = selfhostIntrospectPositiveTtlMs(env);
   const sessionErase = sessionEraseConfig(env);
   const policy = destinationPolicy(env);
@@ -336,6 +340,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     sessionSelection,
     heartbeatAccept,
     capturePolicyUploads,
+    uploadConsent,
     introspectPositiveTtlMs,
     sessionErase,
     ...(admission ? { admission } : {}),

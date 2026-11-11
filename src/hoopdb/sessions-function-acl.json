@@ -1443,6 +1443,14 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.upload_consent_apply_v1(text,text,text,jsonb,boolean,bigint)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.upload_consent_snapshot_v1(text,text,text,text,jsonb,bigint)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
     "sessions.upsert_machine(text,text,text,text,text,text,timestamp with time zone)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"

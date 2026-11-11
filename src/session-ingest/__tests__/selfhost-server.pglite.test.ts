@@ -6,6 +6,8 @@
  * the role's grants; PGlite has no real login, so startup admission, which refuses
  * SET ROLE, is tested over real-login rows below), and the store is a scratch fs store.
  */
+import { sqlUploadConsentStore } from "../upload-consent-sql.ts";
+import { UPLOAD_CONSENT_REQUIRED } from "../upload-consent.ts";
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -144,7 +146,7 @@ async function start(rc: { url: string }, over: NodeJS.ProcessEnv = {}) {
   const service: SelfhostIngestService = await startSelfhostIngestService(env(rc.url, over), { host: "127.0.0.1", port: 0, build });
   cleanups.push(() => service.close());
   const url = (path: string) => `http://127.0.0.1:${service.port}${path}`;
-  return { service, url, store: fs.store, db };
+  return { service, url, store: fs.store, db, run };
 }
 
 const deliveryBody = async (id = "e1", over: Parameters<typeof batch>[1] = {}) =>
@@ -419,15 +421,27 @@ describe("capture policy upload check (RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLO
     expect((await chunkKeys(store)).length).toBeGreaterThan(0);
   });
 
-  test("enforce: under sharing_mode new, a session older than the policy is 422; a newer one is accepted", async () => {
+  test("enforce: under sharing_mode new, a session older than the policy is 422; a newer one needs the person's confirmed choice", async () => {
     const rc = await relaycontrol(() => policy({ sharing_mode: "new" }, { sharing_mode_since: SINCE }));
-    const { url } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce" });
-    const refused = await post(url("/v1/delivery/batches"), await oldSession("s1"), { [HEADER]: "7" });
-    expect([refused.status, await code(refused)]).toEqual([422, "capture_policy_session_predates_policy"]);
     const fresh = JSON.stringify({ protocolVersion: 1, batch: await batch([
       record({ record_id: "s2", kind: "session", payload: { first_activity_ms: Date.parse(SINCE) + 60_000 } }),
     ], { batch_id: "batch-s2" }) });
-    expect((await post(url("/v1/delivery/batches"), fresh, { [HEADER]: "7" })).status).toBe(200);
+    // Without the consent store (INGEST_UPLOAD_CONSENT off) nothing proves the person's choice: held, not stored
+    // (upload-consent.ts; the root-selected-consent reproduction stored this before).
+    {
+      const { url, store } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce" });
+      const refused = await post(url("/v1/delivery/batches"), await oldSession("s1"), { [HEADER]: "7" });
+      expect([refused.status, await code(refused)]).toEqual([422, "capture_policy_session_predates_policy"]);
+      const held = await post(url("/v1/delivery/batches"), fresh, { [HEADER]: "7" });
+      expect([held.status, await code(held)]).toEqual([503, UPLOAD_CONSENT_REQUIRED]);
+      expect(await chunkKeys(store)).toEqual([]);
+    }
+    // With the consent store and the person's confirmed choice for this installation: accepted.
+    {
+      const { url, run } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce", INGEST_UPLOAD_CONSENT: "enforce" });
+      await sqlUploadConsentStore(run).apply(TENANT, { mode: "all", confirmOrigins: ["origin-1"] }, { trusted: true, nowMs: Date.parse(SINCE) });
+      expect((await post(url("/v1/delivery/batches"), fresh, { [HEADER]: "7" })).status).toBe(200);
+    }
   });
 
   test("enforce: a policy that sets no key, or no policy at all (older relaycontrol), needs no header", async () => {
