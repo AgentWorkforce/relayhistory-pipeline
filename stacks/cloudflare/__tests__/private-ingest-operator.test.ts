@@ -18,6 +18,7 @@ import {
   verifyOperatorCapture,
   EXECUTION_EXCEPTION,
   OperatorRefusal,
+  operatorExecutionHost,
   type OperatorSecrets,
 } from "../../../scripts/private-ingest-operator.ts";
 import { inputsDigest } from "../../aws/deploy-guard.ts";
@@ -28,6 +29,12 @@ const secrets: OperatorSecrets = {
   stateUrl: "https://alchemy-state-store-96bulls.fixture.workers.dev",
   stateToken: "synthetic-state-token-not-authorized",
 };
+
+test("separate GitHub-hosted plan and deploy runners share one capture host identity", () => {
+  expect(operatorExecutionHost({ GITHUB_ACTIONS: "true" }, "runner-a")).toBe("github-actions");
+  expect(operatorExecutionHost({ GITHUB_ACTIONS: "true" }, "runner-b")).toBe("github-actions");
+  expect(operatorExecutionHost({}, "operator-host")).toBe("operator-host");
+});
 const baseInput = {
   sessionIngest: {
     accountId: secrets.accountId,

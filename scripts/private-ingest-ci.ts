@@ -10,6 +10,7 @@ import {
   privateIngestActiveVersion,
   privateIngestRefuse,
   privateIngestReleasePhase,
+  privateIngestTransitionReadback,
   privateIngestVersionReadback,
   type CloudflareWorkerVersion,
 } from "../src/session-ingest/private-ingest-release.ts";
@@ -18,11 +19,17 @@ const SOURCE = resolve("config/cloudflare/private-ingest-production.json");
 const RUNTIME = resolve(".96bulls/cf-sessions-prod/cloudflare-inputs.json");
 const PREFIX = resolve("docs/plans/cf-sessions-prod");
 const RECEIPT = resolve("release-receipt/private-ingest-readback.json");
+const PREFLIGHT = resolve("release-receipt/private-ingest-preflight.json");
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
 function trackedInput(): { text: string; input: CloudflareStageInputs } {
-  const text = readFileSync(SOURCE, "utf8"), input = JSON.parse(text) as CloudflareStageInputs;
-  if (input.approval !== undefined) privateIngestRefuse("private_ingest_tracked_approval");
+  const tracked = JSON.parse(readFileSync(SOURCE, "utf8")) as CloudflareStageInputs;
+  if (tracked.approval !== undefined) privateIngestRefuse("private_ingest_tracked_approval");
+  if (Object.hasOwn(tracked.sessionIngest as object, "kmsKeyArn"))
+    privateIngestRefuse("private_ingest_tracked_target");
+  const kmsKeyArn = process.env.PRIVATE_INGEST_KMS_KEY_ARN ?? "";
+  const input = { ...tracked, sessionIngest: { ...tracked.sessionIngest, kmsKeyArn } };
+  const text = JSON.stringify(input, null, 2) + "\n";
   assertCloudflareStage("cf-sessions-prod", "plan", input, {
     CLOUDFLARE_ACCOUNT_ID: P.accountId,
   });
@@ -66,7 +73,9 @@ export function approvePrivateIngestCapture() {
     approval: {
       decision: "approved",
       by: P.approval.by,
-      date: P.approval.date,
+      // The exact Khaliq-only GitHub environment approval was rechecked in this job. Record that
+      // fresh deploy approval date; the source contract separately retains his rollout quote/date.
+      date: new Date().toISOString().slice(0, 10),
       quote: P.approval.quote,
       execution: EXECUTION_EXCEPTION,
       capture: {
@@ -119,11 +128,28 @@ export async function readBackPrivateIngest() {
   return receipt;
 }
 
+export async function preflightPrivateIngest() {
+  const { input } = trackedInput(), active = privateIngestActiveVersion(await cloudflareGet("/deployments"));
+  const version = await cloudflareGet(`/versions/${active.versionId}`) as CloudflareWorkerVersion;
+  const receipt = {
+    ...privateIngestTransitionReadback(input, active, version),
+    at: new Date().toISOString(),
+    sourceCommit: process.env.GITHUB_SHA ?? null,
+    providerWrites: 0,
+    credentialsPersisted: false,
+  };
+  mkdirSync(dirname(PREFLIGHT), { recursive: true });
+  writeFileSync(PREFLIGHT, JSON.stringify(receipt, null, 2) + "\n", { mode: 0o600 });
+  console.log(JSON.stringify(receipt));
+  return receipt;
+}
+
 if (import.meta.main) {
   const command = process.argv[2];
   Promise.resolve(
     command === "stage" ? stagePrivateIngestInput()
       : command === "approve" ? approvePrivateIngestCapture()
+      : command === "preflight" ? preflightPrivateIngest()
       : command === "readback" ? readBackPrivateIngest()
       : privateIngestRefuse("private_ingest_ci_command"),
   ).catch((error) => {

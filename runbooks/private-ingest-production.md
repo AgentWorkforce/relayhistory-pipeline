@@ -6,9 +6,10 @@ retained-plan operator locally against production.
 
 ## Authority and desired state
 
-The complete nonsecret desired profile is
-`config/cloudflare/private-ingest-production.json`. Workflow inputs cannot override it. The
-release contract recognizes only these ordered profiles:
+The complete nonsecret feature profile is
+`config/cloudflare/private-ingest-production.json`; the protected environment supplies the KMS
+target. Workflow inputs cannot override either source. The release contract recognizes only these
+ordered profiles:
 
 1. `step-1-custody`: `custodySource=frozen-supabase`, async admission remains `drain`, the
    synchronous frozen-receipt bridge is absent.
@@ -32,6 +33,7 @@ Create `private-ingest-production` with:
 - exactly one required user reviewer: `khaliqgant` (GitHub user ID `1724137`);
 - environment variable `PRIVATE_INGEST_STATE_URL`, the HTTPS
   `alchemy-state-store-96bulls.<account-subdomain>.workers.dev` origin;
+- environment variable `PRIVATE_INGEST_KMS_KEY_ARN`, the production transcripts key ARN;
 - environment secret `PRIVATE_INGEST_STATE_TOKEN`;
 - environment secret `CLOUDFLARE_API_TOKEN`, scoped to the production account and only the
   Worker/Queue/Hyperdrive/Secrets Store reads and writes used by this stack.
@@ -41,6 +43,12 @@ plan/deploy/readback steps after dependency installation and environment approva
 Wrangler OAuth credential into GitHub Actions.
 
 The prerequisite job refuses a missing, unprotected, or non-main environment before entering it.
+The KMS target stays in the protected environment rather than engine source.
+
+The source contract retains Khaliq's direct rollout quote and date. Every deploy also requires his
+fresh GitHub environment approval; the capture records that approval's current UTC date, so the
+retained-plan freshness check applies to the actual deploy authorization rather than expiring the
+workflow itself. A missing or stale approval is a safety stop, not a reason to bypass the workflow.
 
 ## Plan
 

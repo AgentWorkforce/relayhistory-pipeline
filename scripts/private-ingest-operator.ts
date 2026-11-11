@@ -67,6 +67,10 @@ import {
 export const OPERATOR_PROTOCOL = "private-ingest-operator-v1";
 export const STATE_SCRIPT = "alchemy-state-store-96bulls";
 export const EXECUTION_EXCEPTION = "github-actions-retained-plan";
+export const operatorExecutionHost = (
+  env: Record<string, string | undefined> = process.env,
+  actual = hostname(),
+) => env.GITHUB_ACTIONS === "true" ? "github-actions" : actual;
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const isHash = (s: unknown): s is string =>
   typeof s === "string" && /^[0-9a-f]{64}$/u.test(s);
@@ -1332,7 +1336,9 @@ export async function operatorMain(argv = process.argv.slice(2)) {
         ].filter(Boolean),
       ),
     ],
-    host: hostname(),
+    // A retained plan and its deploy are separate GitHub-hosted jobs. Their ephemeral hostnames
+    // differ, while the exact commit/input/plan/state/tool bindings remain stable and authoritative.
+    host: operatorExecutionHost(),
   });
   const source = sourceNow();
   assertOperatorSource(options, source);

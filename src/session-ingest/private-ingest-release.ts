@@ -32,7 +32,7 @@ export const PRIVATE_INGEST_RELEASE = {
   worker: SESSION_INGEST_WORKER,
   approval: {
     by: "Khaliq Gant",
-    date: "2026-11-11",
+    directDate: "2026-11-11",
     quote: "authorized to do step 1,2,4",
   },
 } as const;
@@ -64,22 +64,26 @@ const COMMON_PROFILE = {
   expectedGeneration: "7db65adb97f034a7b4cc2c85c87da2ebadf969f6bb74096f33ae00ad83e500a4",
   hyperdriveId: "0fcc0265e96f43a39976b5aa4263f4a6",
   secretsStoreId: "59e0dcc52f0a4bd7863730548299fb2f",
-  kmsKeyArn: "arn:aws:kms:us-east-1:941433935742:key/c74376a5-f6ff-4ef0-9a26-543c940094ba",
   maxPerUser: 4,
   maxPerOrg: 32,
   inlineMaxSessions: 0,
   replicaMode: "off",
   claimLockBusy: "on",
-  custodySource: "frozen-supabase",
 } as const;
+
+const KMS_ARN = /^arn:aws:kms:us-east-1:[0-9]{12}:key\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 /** Exact tracked production profile. A newly added stack option is off until this contract reviews it. */
 export function privateIngestReleasePhase(input: CloudflareStageInputs): PrivateIngestReleasePhase {
   const profile = input.sessionIngest as unknown as Record<string, unknown>;
   for (const [key, value] of Object.entries(COMMON_PROFILE))
     if (profile[key] !== value) privateIngestRefuse("private_ingest_profile_common");
+  if (!KMS_ARN.test(String(profile.kmsKeyArn ?? "")) || profile.custodySource !== "frozen-supabase")
+    privateIngestRefuse("private_ingest_profile_target");
   const allowed = new Set([
     ...Object.keys(COMMON_PROFILE),
+    "kmsKeyArn",
+    "custodySource",
     "asyncAdmission",
     "syncAdmissionFrozenReceipt",
   ]);
@@ -166,16 +170,23 @@ export interface PrivateIngestReadback {
   profileSha256: string;
 }
 
+export interface PrivateIngestTransitionReadback {
+  status: "PRIVATE_INGEST_LIVE_TRANSITION_PASS";
+  from: "baseline-drain" | PrivateIngestReleasePhase;
+  to: PrivateIngestReleasePhase;
+  deploymentId: string;
+  versionId: string;
+}
+
 /**
  * Verify the deployed version against the tracked profile. The provider may include module bindings;
  * those are allowed, but every INGEST_* variable and every runtime binding is exact and unique.
  */
-export function privateIngestVersionReadback(
+function privateIngestVersionEvidence(
   input: CloudflareStageInputs,
   active: ReturnType<typeof privateIngestActiveVersion>,
   version: CloudflareWorkerVersion,
-): PrivateIngestReadback {
-  const phase = privateIngestReleasePhase(input);
+): Pick<PrivateIngestReadback, "bindingCount" | "profileSha256"> {
   if (version.id !== active.versionId || !Array.isArray(version.resources?.bindings))
     privateIngestRefuse("private_ingest_live_version_identity");
   const bindings = version.resources.bindings;
@@ -215,22 +226,67 @@ export function privateIngestVersionReadback(
       privateIngestRefuse("private_ingest_live_compatibility_flags");
   }
   const profileSha256 = createHash("sha256").update(JSON.stringify(input.sessionIngest)).digest("hex");
+  return { bindingCount: bindings.length, profileSha256 };
+}
+
+export function privateIngestVersionReadback(
+  input: CloudflareStageInputs,
+  active: ReturnType<typeof privateIngestActiveVersion>,
+  version: CloudflareWorkerVersion,
+): PrivateIngestReadback {
+  const phase = privateIngestReleasePhase(input);
   return {
     status: "PRIVATE_INGEST_LIVE_READBACK_PASS",
     phase,
     deploymentId: active.deploymentId,
     versionId: active.versionId,
     createdOn: active.createdOn,
-    bindingCount: bindings.length,
-    profileSha256,
+    ...privateIngestVersionEvidence(input, active, version),
   };
 }
 
-export function privateIngestProfileForPhase(phase: PrivateIngestReleasePhase): CloudflareStageInputs {
+export function privateIngestProfileForPhase(
+  phase: PrivateIngestReleasePhase,
+  kmsKeyArn: string,
+): CloudflareStageInputs {
   const sessionIngest: SessionIngestInputs = {
     ...COMMON_PROFILE,
+    kmsKeyArn,
+    custodySource: "frozen-supabase",
     asyncAdmission: phase === "step-4-async-on" ? "on" : "drain",
     ...(phase === "step-1-custody" ? {} : { syncAdmissionFrozenReceipt: "on" as const }),
   };
   return { sessionIngest };
+}
+
+function privateIngestBaselineProfile(kmsKeyArn: string): CloudflareStageInputs {
+  return { sessionIngest: { ...COMMON_PROFILE, kmsKeyArn, asyncAdmission: "drain" } };
+}
+
+/** A forward step must be observed independently on the live 100% version; rollbacks unwind one step. */
+export function privateIngestTransitionReadback(
+  input: CloudflareStageInputs,
+  active: ReturnType<typeof privateIngestActiveVersion>,
+  version: CloudflareWorkerVersion,
+): PrivateIngestTransitionReadback {
+  const to = privateIngestReleasePhase(input), kmsKeyArn = input.sessionIngest.kmsKeyArn;
+  const candidates = [
+    ["baseline-drain", privateIngestBaselineProfile(kmsKeyArn)],
+    ["step-1-custody", privateIngestProfileForPhase("step-1-custody", kmsKeyArn)],
+    ["step-2-frozen-receipt", privateIngestProfileForPhase("step-2-frozen-receipt", kmsKeyArn)],
+    ["step-4-async-on", privateIngestProfileForPhase("step-4-async-on", kmsKeyArn)],
+  ] as const;
+  const matches = candidates.filter(([, candidate]) => {
+    try { privateIngestVersionEvidence(candidate, active, version); return true; }
+    catch { return false; }
+  });
+  if (matches.length !== 1) privateIngestRefuse("private_ingest_live_phase");
+  const from = matches[0]![0];
+  const allowed: Record<PrivateIngestReleasePhase, readonly PrivateIngestTransitionReadback["from"][]> = {
+    "step-1-custody": ["baseline-drain", "step-1-custody", "step-2-frozen-receipt"],
+    "step-2-frozen-receipt": ["step-1-custody", "step-2-frozen-receipt", "step-4-async-on"],
+    "step-4-async-on": ["step-2-frozen-receipt", "step-4-async-on"],
+  };
+  if (!allowed[to].includes(from)) privateIngestRefuse("private_ingest_live_transition");
+  return { status: "PRIVATE_INGEST_LIVE_TRANSITION_PASS", from, to, deploymentId: active.deploymentId, versionId: active.versionId };
 }

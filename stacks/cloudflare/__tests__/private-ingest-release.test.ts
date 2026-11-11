@@ -7,18 +7,22 @@ import {
   privateIngestProfileForPhase,
   privateIngestReleaseInputs,
   privateIngestReleasePhase,
+  privateIngestTransitionReadback,
   privateIngestVersionReadback,
   type CloudflareWorkerVersion,
 } from "../../../src/session-ingest/private-ingest-release.ts";
 import { privateIngestGithubGate } from "../../../scripts/private-ingest-release-github.ts";
 
 const sha = "a".repeat(40), planRun = "90";
+const kmsKeyArn = "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-0000-000000000000";
 
 test("tracked production config is exact step 1; only the three authorized phases are representable", () => {
   const tracked = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
-  expect(tracked).toEqual(privateIngestProfileForPhase("step-1-custody"));
+  const expected = privateIngestProfileForPhase("step-1-custody", kmsKeyArn);
+  const { kmsKeyArn: _target, ...expectedTracked } = expected.sessionIngest;
+  expect(tracked).toEqual({ sessionIngest: expectedTracked });
   for (const phase of ["step-1-custody", "step-2-frozen-receipt", "step-4-async-on"] as const)
-    expect(privateIngestReleasePhase(privateIngestProfileForPhase(phase))).toBe(phase);
+    expect(privateIngestReleasePhase(privateIngestProfileForPhase(phase, kmsKeyArn))).toBe(phase);
   for (const bad of [
     { ...tracked, sessionIngest: { ...tracked.sessionIngest, custodySource: undefined } },
     { ...tracked, sessionIngest: { ...tracked.sessionIngest, asyncAdmission: "off" } },
@@ -47,7 +51,7 @@ test("typed release confirmation binds mode, main SHA and prior plan", () => {
 });
 
 function readbackFixture(phase: "step-1-custody" | "step-2-frozen-receipt" | "step-4-async-on") {
-  const input = privateIngestProfileForPhase(phase), vars = sessionIngestVars(input.sessionIngest);
+  const input = privateIngestProfileForPhase(phase, kmsKeyArn), vars = sessionIngestVars(input.sessionIngest);
   const bindings: any[] = Object.entries(vars).map(([name, text]) => ({ name, type: "plain_text", text }));
   bindings.push(
     { name: "HYPERDRIVE", type: "hyperdrive", id: input.sessionIngest.hyperdriveId },
@@ -95,6 +99,35 @@ test("post-deploy readback requires one 100% version and every targeted binding"
     mutate(copy);
     expect(() => privateIngestVersionReadback(fixture.input, selected, copy)).toThrow();
   }
+});
+
+test("live transition gate requires an independently deployed step 2 before step 4", () => {
+  const baseline = readbackFixture("step-1-custody");
+  baseline.version.resources!.bindings = baseline.version.resources!.bindings!.filter(
+    (binding) => binding.name !== "INGEST_CUSTODY_SOURCE",
+  );
+  expect(privateIngestTransitionReadback(
+    privateIngestProfileForPhase("step-1-custody", kmsKeyArn),
+    baseline.active,
+    baseline.version,
+  )).toMatchObject({ from: "baseline-drain", to: "step-1-custody" });
+  const currentStep1 = readbackFixture("step-1-custody");
+  expect(privateIngestTransitionReadback(
+    privateIngestProfileForPhase("step-2-frozen-receipt", kmsKeyArn),
+    currentStep1.active,
+    currentStep1.version,
+  )).toMatchObject({ from: "step-1-custody", to: "step-2-frozen-receipt" });
+  expect(() => privateIngestTransitionReadback(
+    privateIngestProfileForPhase("step-4-async-on", kmsKeyArn),
+    currentStep1.active,
+    currentStep1.version,
+  )).toThrow("private_ingest_live_transition");
+  const currentStep2 = readbackFixture("step-2-frozen-receipt");
+  expect(privateIngestTransitionReadback(
+    privateIngestProfileForPhase("step-4-async-on", kmsKeyArn),
+    currentStep2.active,
+    currentStep2.version,
+  )).toMatchObject({ from: "step-2-frozen-receipt", to: "step-4-async-on" });
 });
 
 function githubFixture() {
