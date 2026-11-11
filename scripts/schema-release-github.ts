@@ -33,6 +33,13 @@ export async function githubReleaseGate(
     run.run_attempt !== 1
   )
     refuse("release_run");
+  const trustedDispatcher =
+    run.actor?.type === "User" &&
+    run.actor?.login === P.dispatcher.login &&
+    run.actor?.id === P.dispatcher.id &&
+    run.triggering_actor?.type === "User" &&
+    run.triggering_actor?.login === P.dispatcher.login &&
+    run.triggering_actor?.id === P.dispatcher.id;
   const environment = await get(base + "/environments/" + P.environment);
   const reviewers =
     (environment.protection_rules ?? [])
@@ -44,7 +51,7 @@ export async function githubReleaseGate(
   if (
     environment.name !== P.environment ||
     !Number.isSafeInteger(environment.id) ||
-    !reviewers.length ||
+    (!reviewers.length && !trustedDispatcher) ||
     environment.deployment_branch_policy?.protected_branches !== false ||
     environment.deployment_branch_policy?.custom_branch_policies !== true
   )
@@ -127,30 +134,35 @@ export async function githubReleaseGate(
       refuse("release_plan_run");
   }
   if (approved) {
-    const history = await get(
-      base + "/actions/runs/" + env.GITHUB_RUN_ID + "/approvals",
-    );
-    if (
-      !Array.isArray(history) ||
-      !history.some(
-        (a: Obj) =>
-          a.state === "approved" &&
-          a.user?.type === "User" &&
-          reviewers.includes(a.user.id) &&
-          a.environments?.some(
-            (e: Obj) => e.id === environment.id && e.name === P.environment,
-          ),
+    // Private repositories on plans without environment reviewers cannot
+    // create that protection rule. In that case the initial, non-rerunnable
+    // workflow dispatch itself must be made by the pinned human account.
+    if (reviewers.length) {
+      const history = await get(
+        base + "/actions/runs/" + env.GITHUB_RUN_ID + "/approvals",
+      );
+      if (
+        !Array.isArray(history) ||
+        !history.some(
+          (a: Obj) =>
+            a.state === "approved" &&
+            a.user?.type === "User" &&
+            reviewers.includes(a.user.id) &&
+            a.environments?.some(
+              (e: Obj) => e.id === environment.id && e.name === P.environment,
+            ),
+        )
       )
-    )
-      refuse("release_human_approval");
-    if (
-      history.some(
-        (a: Obj) =>
-          a.state === "rejected" &&
-          a.environments?.some((e: Obj) => e.id === environment.id),
+        refuse("release_human_approval");
+      if (
+        history.some(
+          (a: Obj) =>
+            a.state === "rejected" &&
+            a.environments?.some((e: Obj) => e.id === environment.id),
+        )
       )
-    )
-      refuse("release_human_rejected");
+        refuse("release_human_rejected");
+    } else if (!trustedDispatcher) refuse("release_human_dispatch");
   }
   return input;
 }

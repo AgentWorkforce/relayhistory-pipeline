@@ -169,6 +169,28 @@ function get(f: Fixture) {
 test("real main, both exact-head workflows/jobs and actual named human approval required", async () => {
   expect((await githubReleaseGate(base, get(api()), true)).sha).toBe(sha);
 });
+test("pinned human dispatch is the fail-closed fallback when the plan has no environment reviewers", async () => {
+  const f = api();
+  f.env.protection_rules = [];
+  f.run.actor = { type: "User", ...P.dispatcher };
+  f.run.triggering_actor = { type: "User", ...P.dispatcher };
+  expect((await githubReleaseGate(base, get(f), true)).sha).toBe(sha);
+  for (const mutate of [
+    (x: Fixture) => (x.run.actor.id = P.dispatcher.id + 1),
+    (x: Fixture) => (x.run.actor.login = "foreign"),
+    (x: Fixture) => (x.run.actor.type = "Bot"),
+    (x: Fixture) => (x.run.triggering_actor.id = P.dispatcher.id + 1),
+    (x: Fixture) => (x.run.triggering_actor.login = "foreign"),
+    (x: Fixture) => (x.run.triggering_actor.type = "Bot"),
+  ]) {
+    const refused = api();
+    refused.env.protection_rules = [];
+    refused.run.actor = { type: "User", ...P.dispatcher };
+    refused.run.triggering_actor = { type: "User", ...P.dispatcher };
+    mutate(refused);
+    await expect(githubReleaseGate(base, get(refused), true)).rejects.toThrow();
+  }
+});
 const mutations: Array<[string, (f: Fixture) => void]> = [
   ["main moved", (f) => (f.ref.object.sha = "e".repeat(40))],
   ["wrong workflow", (f) => (f.run.path = ".github/workflows/untrusted.yml")],
