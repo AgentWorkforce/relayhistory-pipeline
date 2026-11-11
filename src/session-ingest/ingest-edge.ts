@@ -17,8 +17,9 @@
  *      a bounded timeout, no retry and no cache (positive and negative TTL 0; only concurrent identical
  *      calls share one in-flight request). Caching is a later step and gets its own default-off flag.
  *        no / malformed Authorization            401 missing_authorization
- *        an opaque relayhistory token (`rth_*`)  401 unsupported_token, never sent anywhere (the
- *                                                Supabase auth_session_verify bridge is a later step)
+ *        an opaque relayhistory token (`rth_*`)  401 unsupported_token, never sent anywhere; except,
+ *                                                with INGEST_EDGE_RTH_VERIFIER=supabase (default off),
+ *                                                an `rth_at_` bearer goes to rth-verifier.ts instead
  *        any other non-`sh_at_` bearer           401 invalid_token
  *        inactive, wrong audience/principal      401 invalid_token (reason to the log only)
  *        expired                                 401 token_expired
@@ -43,6 +44,8 @@
  *   RELAYCONTROL_INTROSPECT_URL     relay-control's introspection base URL (destination policy: https,
  *                                   loopback, or an in-cluster Service name with ALLOW_IN_CLUSTER_HTTP=true)
  *   RELAYCONTROL_INTROSPECT_SECRET  the introspection service credential (injected, never on disk)
+ *   INGEST_EDGE_RTH_VERIFIER        default off; "supabase" adds the `rth_at_` verifier and its own
+ *                                   INGEST_EDGE_RTH_VERIFIER_* settings (rth-verifier.ts)
  * Bodies, tokens and header values are never logged.
  */
 import {
@@ -55,6 +58,7 @@ import { assertDestinationUrl, destinationPolicy } from "../shared/destination-u
 import { log } from "../shared/log.ts";
 import { AuthError } from "../session-read-api/app.ts";
 import { createIngestApp, encodeIdentity, IDENTITY_HEADER, type IngestAppDeps, type IngestIdentity } from "./app.ts";
+import { createRthVerifier, RTH_ACCESS_TOKEN_PREFIX, rthVerifierConfig, type RthVerifierOptions, type RthVerifierSettings } from "./rth-verifier.ts";
 import { bearerOf, relaycontrolIngestIdentity } from "./selfhost-auth.ts";
 
 export const INGEST_EDGE_FLAG = "INGEST_EDGE_ENABLED";
@@ -75,7 +79,10 @@ export const INGEST_EDGE_ROUTES: Readonly<Record<string, "GET" | "POST">> = Obje
   "/v1/delivery/limits": "GET",
 });
 
-/** The opaque relayhistory token classes (rth_at_, rth_rt_, rth_st_): refused, never verified here. */
+/**
+ * The opaque relayhistory token classes (rth_at_, rth_rt_, rth_st_): refused and never sent anywhere,
+ * except `rth_at_` when the default-off INGEST_EDGE_RTH_VERIFIER is on (rth-verifier.ts).
+ */
 export const RELAYHISTORY_TOKEN_PREFIX = "rth_";
 export const UNSUPPORTED_TOKEN_CODE = "unsupported_token";
 
@@ -93,6 +100,8 @@ export interface IngestEdgeSettings {
   origin: string;
   introspectUrl: string;
   introspectSecret: string;
+  /** Present only with INGEST_EDGE_RTH_VERIFIER=supabase (rth-verifier.ts); absent = step 6 behaviour. */
+  rthVerifier?: RthVerifierSettings;
 }
 
 export type IngestEdgeConfig = { enabled: false } | ({ enabled: true } & IngestEdgeSettings);
@@ -124,7 +133,11 @@ export function ingestEdgeConfig(env: NodeJS.ProcessEnv = process.env): IngestEd
     throw new Error(`96bulls: ${INGEST_EDGE_INTROSPECT_URL_VAR} must be an absolute http(s) URL without credentials, query or fragment`);
   }
   const introspectSecret = need(env, INGEST_EDGE_INTROSPECT_SECRET_VAR);
-  return { enabled: true, origin, introspectUrl, introspectSecret };
+  // Read only with the edge on; off (the default), no INGEST_EDGE_RTH_VERIFIER* variable is read.
+  const rth = rthVerifierConfig(env);
+  if (!rth.enabled) return { enabled: true, origin, introspectUrl, introspectSecret };
+  const { enabled: _on, ...rthVerifier } = rth;
+  return { enabled: true, origin, introspectUrl, introspectSecret, rthVerifier };
 }
 
 export interface IngestEdgeOptions {
@@ -134,6 +147,8 @@ export interface IngestEdgeOptions {
   timeoutMs?: number;
   /** Test seam: [0, 1) for the Retry-After jitter. */
   random?: () => number;
+  /** Test seams for the `rth_at_` verifier (used only when settings.rthVerifier is present). */
+  rthVerifier?: RthVerifierOptions;
 }
 
 const introspectionLog: RelaycontrolLog = (level, message, fields) =>
@@ -160,8 +175,10 @@ export function edgeIdentify(settings: IngestEdgeSettings, env: NodeJS.ProcessEn
     ...(options.fetch ? { fetch: options.fetch } : {}),
   });
   const introspected = relaycontrolIngestIdentity({ origin: settings.origin, introspectUrl: settings.introspectUrl, introspectSecret: settings.introspectSecret }, introspector);
+  const rthVerify = settings.rthVerifier ? createRthVerifier(settings.rthVerifier, env, options.rthVerifier) : null;
   return async (authorization) => {
     const bearer = bearerOf(authorization);
+    if (rthVerify && bearer?.startsWith(RTH_ACCESS_TOKEN_PREFIX)) return rthVerify(bearer);
     if (bearer?.startsWith(RELAYHISTORY_TOKEN_PREFIX))
       throw new AuthError(401, UNSUPPORTED_TOKEN_CODE, "opaque relayhistory tokens are not supported by this deployment");
     const identity = await introspected(authorization);
