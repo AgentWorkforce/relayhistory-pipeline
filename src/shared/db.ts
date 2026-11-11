@@ -101,6 +101,14 @@ export interface ExpectedSchema {
   shas?: Record<string, string>;
   /** Exact database mode bound into the role verifier; absent/invalid never enables compatibility exceptions. */
   dbMode?: "local" | "selfhosted" | "cloudsql" | "supabase" | "rds";
+  /**
+   * Release-target prefix scope (heldScope() in src/hoopdb/migrate.ts; absent for a
+   * full-tree image, which stays strict): the held suffix steps, never in `names`, each
+   * with the sessions function signatures that step alone creates. The live function
+   * gate tolerates an allowlisted signature being ABSENT only when it is listed here
+   * exactly (same name and argument types) for a held step the ledger does not have.
+   */
+  held?: readonly { name: string; creates: readonly string[] }[];
 }
 
 export type SchemaVerdict =
@@ -140,12 +148,31 @@ export interface SchemaVerifierSql {searchWorker:string;tokenVerifier:string;ing
  * only when current_user is the consumer login (CONSUMER_RUNTIME_FUNCTIONS_ROLE); the PUBLIC and
  * missing-ACL checks still apply to them for every role.
  */
-const regprocedures = (fns: readonly string[]) =>
-  fns.map((fn) => `'${fn.replaceAll("'", "''")}'::regprocedure`).join(", ");
-const RUNTIME_FUNCTION_REGPROCEDURES = regprocedures(RUNTIME_APPLICATION_FUNCTIONS);
-const CONSUMER_FUNCTION_REGPROCEDURES = regprocedures(CONSUMER_RUNTIME_FUNCTIONS);
+// An allowlisted signature is cast with ::regprocedure, which raises 42883 when it does
+// not exist (typo, wrong overload, function missing from the applied schema). Only a
+// signature in `absentOk` (created by a held release-target step that is not ledgered,
+// see ExpectedSchema.held) uses to_regprocedure, and its NULL is removed from the array.
+// With no such signature the text is the plain strict ARRAY[...]::oid[] form.
+const regprocedures = (fns: readonly string[], absentOk: ReadonlySet<string>) => {
+  const lit = (fn: string) => `'${fn.replaceAll("'", "''")}'`;
+  if (!fns.some((fn) => absentOk.has(fn))) return `ARRAY[${fns.map((fn) => `${lit(fn)}::regprocedure`).join(", ")}]::oid[]`;
+  return `array_remove(ARRAY[${fns
+    .map((fn) => (absentOk.has(fn) ? `to_regprocedure(${lit(fn)})::oid` : `${lit(fn)}::regprocedure::oid`))
+    .join(", ")}]::oid[], NULL)`;
+};
 
-export const SESSIONS_FUNCTION_GATE_SQL = `DO $sessions_fn_gate$
+/**
+ * The live gate SQL; `absentOk` is empty except for a release-target prefix image.
+ * `allow` is the allowlists (tests pass altered copies; production never does).
+ */
+export function sessionsFunctionGateSql(
+  absentOk: ReadonlySet<string> = new Set(),
+  allow: { runtime: readonly string[]; consumer: readonly string[] } = {
+    runtime: RUNTIME_APPLICATION_FUNCTIONS,
+    consumer: CONSUMER_RUNTIME_FUNCTIONS,
+  },
+): string {
+  return `DO $sessions_fn_gate$
 DECLARE v text;
 BEGIN
   SELECT string_agg(p.oid::regprocedure::text, ', ' ORDER BY 1) INTO v
@@ -156,15 +183,17 @@ BEGIN
           OR (has_function_privilege(current_user, p.oid, 'EXECUTE')
               AND p.proowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
               AND NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
-              AND p.oid <> ALL (ARRAY[${RUNTIME_FUNCTION_REGPROCEDURES}]::oid[])
+              AND p.oid <> ALL (${regprocedures(allow.runtime, absentOk)})
               AND NOT (current_user = '${CONSUMER_RUNTIME_FUNCTIONS_ROLE}'
-                       AND p.oid = ANY (ARRAY[${CONSUMER_FUNCTION_REGPROCEDURES}]::oid[]))));
+                       AND p.oid = ANY (${regprocedures(allow.consumer, absentOk)}))));
   IF v IS NOT NULL THEN
     RAISE EXCEPTION USING ERRCODE = '55000',
       MESSAGE = 'live gate: sessions functions executable by PUBLIC or the runtime role: ' || v;
   END IF;
 END
 $sessions_fn_gate$`;
+}
+export const SESSIONS_FUNCTION_GATE_SQL = sessionsFunctionGateSql();
 
 /** Runs `work` in one transaction on one connection (inTransaction, or a test double). */
 export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
@@ -242,6 +271,13 @@ export async function schemaVerdict(
         const m = (await tx.query<{ generation: string; status: string }>(MARKER_SQL, [ROLE_VALIDATION_NAME])).rows[0];
         return m?.status === "pass" && m.generation === expected.generation;
       };
+      // Release-target scope: a held step is never one of this image's steps (and is one
+      // of the tree's, when shas are known), and only the functions of held steps the
+      // ledger does not have may be absent.
+      const held = expected.held ?? [];
+      if (held.some((h) => expected.names.includes(h.name) || (expected.shas && !Object.hasOwn(expected.shas, h.name))))
+        return { ok: false, reason: "role_validation_failed", error_code: "release_target_held_mismatch" };
+      const absentOk = new Set(held.filter((h) => !effective.has(h.name)).flatMap((h) => h.creates));
       stage = "marker";
       if (!(await passed())) return { ok: false, reason: "validation_pending" };
       stage = "verify";
@@ -249,7 +285,7 @@ export async function schemaVerdict(
       await tx.query(TOKEN_VERIFIER_VERIFY_SQL);
       await tx.query(INGEST_SEED_VERIFY_SQL);
       await tx.query(INGEST_ROLE_VERIFY_SQL);
-      await tx.query(SESSIONS_FUNCTION_GATE_SQL);
+      await tx.query(absentOk.size ? sessionsFunctionGateSql(absentOk) : SESSIONS_FUNCTION_GATE_SQL);
       if (opts.afterVerify) await opts.afterVerify(); // test seam: a concurrent flip lands here
       stage = "final";
       if (!(await passed())) return { ok: false, reason: "validation_pending" };
