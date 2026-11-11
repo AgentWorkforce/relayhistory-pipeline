@@ -1,0 +1,6 @@
+{
+  "owner_buffered": "on",
+  "owner_buffered_workspaces": "*",
+  "owner_buffered_events": "on",
+  "owner_buffered_statement_timeout_ms": "6000"
+}
