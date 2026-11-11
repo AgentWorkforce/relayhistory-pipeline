@@ -485,7 +485,7 @@ const runTarget = (db: PGlite, s: { split: { expectedPending: string[] }; bindin
   });
 const heldProcs = (db: PGlite) =>
   db.query<{ n: number }>(
-    "SELECT count(*)::int n FROM pg_proc WHERE proname LIKE 'ingest_operator_erase%' OR proname LIKE 'ingest_erase_fence%' OR proname = 'session_summary_activity_for'",
+    "SELECT count(*)::int n FROM pg_proc WHERE proname LIKE 'ingest_operator_erase%' OR proname LIKE 'ingest_erase_fence%' OR proname IN ('session_summary_activity_for', 'session_directory_users_for')",
   ).then((r) => r.rows[0]!.n);
 
 test("real tree, target 047000: the target generation is target_sha's own (independently recomputed), not this tree's with or without the held steps", async () => {
@@ -493,6 +493,10 @@ test("real tree, target 047000: the target generation is target_sha's own (indep
   const split = migrationTargetSplit(names.map((name) => ({ name, pending: !name.startsWith("96bulls:") && names.indexOf(name) >= names.indexOf(TARGET) })), TARGET);
   expect(split.held).toContain(ERASE);
   expect(split.held).toContain(ERASE_FENCE);
+  // Every upstream step after the target (as of this tree: 050000, 050010, 056000, 057000).
+  expect(split.held).toEqual(names.filter((n) => n.startsWith("upstream:") && n > TARGET));
+  expect(split.held).toContain("upstream:20261105056000_session_summary_activity.sql");
+  expect(split.held).toContain("upstream:20261105057000_session_directory_users_aggregate.sql");
   expect(split.held.every((n) => n.startsWith("upstream:") && n > TARGET)).toBe(true);
   const { anchor: a, independent } = await snapshotBinding(split.held);
   // Non-circular: the snapshot's verifier files differ from this tree's, and the expected
@@ -600,7 +604,7 @@ test("real tree: the prefix-scoped ACL check excuses only absent functions a hel
   // Unscoped, the full manifest names every held function as missing.
   const unscoped = await sessionsFunctionAclDrift(c, "history_rt");
   expect(unscoped.length).toBeGreaterThan(0);
-  expect(unscoped.every((d) => /^sessions\.(ingest_operator_erase_|ingest_erase_fence_|session_summary_activity_for)\w*\(.*\): missing/.test(d))).toBe(true);
+  expect(unscoped.every((d) => /^sessions\.(ingest_operator_erase_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for)\w*\(.*\): missing/.test(d))).toBe(true);
   // A function a held step only replaces (it exists) is still compared exactly.
   await s.db.exec("GRANT EXECUTE ON FUNCTION sessions.ingest_commit_batch(jsonb) TO PUBLIC");
   expect((await sessionsFunctionAclDrift(c, "history_rt", heldSql)).join(";")).toContain("sessions.ingest_commit_batch(jsonb)");
