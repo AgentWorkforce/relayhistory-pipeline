@@ -41,17 +41,21 @@ export async function githubReleaseGate(
     run.triggering_actor?.login === P.dispatcher.login &&
     run.triggering_actor?.id === P.dispatcher.id;
   const environment = await get(base + "/environments/" + P.environment);
+  if (!Array.isArray(environment.protection_rules))
+    refuse("release_environment");
+  const reviewerRule = environment.protection_rules.find(
+    (r: Obj) => r.type === "required_reviewers",
+  );
   const reviewers =
-    (environment.protection_rules ?? [])
-      .find((r: Obj) => r.type === "required_reviewers")
-      ?.reviewers?.filter(
+    reviewerRule?.reviewers
+      ?.filter(
         (r: Obj) => r.type === "User" && r.reviewer?.type === "User",
       )
       .map((r: Obj) => r.reviewer.id) ?? [];
   if (
     environment.name !== P.environment ||
     !Number.isSafeInteger(environment.id) ||
-    (!reviewers.length && !trustedDispatcher) ||
+    (reviewerRule ? !reviewers.length : !trustedDispatcher) ||
     environment.deployment_branch_policy?.protected_branches !== false ||
     environment.deployment_branch_policy?.custom_branch_policies !== true
   )
@@ -135,9 +139,9 @@ export async function githubReleaseGate(
   }
   if (approved) {
     // Private repositories on plans without environment reviewers cannot
-    // create that protection rule. In that case the initial, non-rerunnable
-    // workflow dispatch itself must be made by the pinned human account.
-    if (reviewers.length) {
+    // create that protection rule. In that case the first-attempt workflow
+    // dispatch itself must be made by the pinned account; reruns are refused.
+    if (reviewerRule) {
       const history = await get(
         base + "/actions/runs/" + env.GITHUB_RUN_ID + "/approvals",
       );
