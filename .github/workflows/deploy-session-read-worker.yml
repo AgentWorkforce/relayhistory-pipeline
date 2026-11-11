@@ -22,7 +22,7 @@ name: deploy session-read-worker
 #      an explicit owner_buffered=on;
 #   3. the live Worker version: owner_buffered=preserve (the opt-out from the committed profile),
 #      and, in profile mode, everything the profile does not own (S3 bucket/region, stage
-#      concurrency, phase log, index verify, search gate) and the directory allowlist.
+#      concurrency, phase log, index verify, exact-session RPC, search gate) and the directory allowlist.
 # Profile mode reads live metadata only and is guarded: it may fill a live setting that is unset
 # (e.g. the statement timeout a deploy lost) but refuses to change or drop one that is set, refuses
 # to turn owner-buffered reads on when live has them off, refuses child overrides (use explicit
@@ -94,6 +94,11 @@ on:
         description: 'Directory ids or "*"; "off" explicitly disables. Empty uses the environment variable when set, otherwise preserves live. Changes require explicit owner_buffered=on/off.'
         type: string
         default: ""
+      owner_buffered_exact_session:
+        description: 047010 RPC; on requires applied migration and explicit owner_buffered=on; off preserves live in profile/preserve, otherwise disables
+        type: choice
+        options: ["off", "on"]
+        default: "off"
       owner_buffered_events:
         description: Owner-buffered session events (GET /v1/sessions/:id/events with source); valid only with owner_buffered=on. profile = committed value; off = exactly the owner_buffered render
         type: choice
@@ -161,6 +166,7 @@ jobs:
       OWNER_BUFFERED_S3_REGION: ${{ vars.SESSION_READ_INGEST_S3_REGION }}
       # Owner-buffered session events (default off); the render refuses on without owner_buffered=on.
       OWNER_BUFFERED_EVENTS: ${{ inputs.owner_buffered_events }}
+      OWNER_BUFFERED_EXACT_SESSION: ${{ inputs.owner_buffered_exact_session }}
       OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: ${{ inputs.owner_buffered_statement_timeout_ms }}
       # Owner-buffered events latency (default off); the render refuses either without owner_buffered_events=on.
       OWNER_BUFFERED_STAGE_CONCURRENCY: ${{ inputs.owner_buffered_stage_concurrency }}

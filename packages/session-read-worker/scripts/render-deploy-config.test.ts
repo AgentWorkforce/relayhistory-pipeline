@@ -414,3 +414,22 @@ describe("deploy workflow wiring", () => {
     expect(WORKFLOW).not.toContain("--var \"READ_API_OWNER_BUFFERED_INDEX_VERIFY");
   });
 });
+
+
+describe("047010 exact-session RPC render", () => {
+  test("default/off leaves the render byte-identical; on adds only its flag", () => {
+    const baseline = renderDeployConfig(TEMPLATE, ON);
+    for (const value of [undefined, "", "off"]) expect(renderDeployConfig(TEMPLATE, { ...ON, ownerBufferedExactSession: value })).toBe(baseline);
+    const config = parse(renderDeployConfig(TEMPLATE, { ...ON, ownerBufferedExactSession: "on" }));
+    const before = parse(baseline);
+    expect(config).toEqual({ ...before, vars: { ...before.vars, READ_API_OWNER_BUFFERED_EXACT_SESSION: "on" } });
+  });
+  test("requires owner-buffered on and refuses unknown values or predeclared flags", () => {
+    expect(() => renderDeployConfig(TEMPLATE, { hyperdriveId: HD, ownerBufferedExactSession: "on" })).toThrow(/needs owner_buffered=on/);
+    for (const value of ["true", "1", "ON"]) expect(() => renderDeployConfig(TEMPLATE, { ...ON, ownerBufferedExactSession: value })).toThrow(/exact_session/);
+    const declared = TEMPLATE.replace('"vars": {', '"vars": { "READ_API_OWNER_BUFFERED_EXACT_SESSION": "on",');
+    expect(() => renderDeployConfig(declared, ON)).toThrow();
+    expect(WORKFLOW).toContain('OWNER_BUFFERED_EXACT_SESSION: ${{ inputs.owner_buffered_exact_session }}');
+    expect(WORKFLOW).toMatch(/owner_buffered_exact_session:[\s\S]*?default: "off"/);
+  });
+});
