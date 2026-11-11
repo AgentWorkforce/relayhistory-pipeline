@@ -138,7 +138,7 @@ function githubFixture() {
     ref: { object: { sha } }, run,
     environment: {
       id: 7, name: P.environment,
-      protection_rules: [],
+      protection_rules: [{ type: "branch_policy" }],
       deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
     },
     branches: { total_count: 1, branch_policies: [{ name: "main", type: "branch" }] },
@@ -183,7 +183,7 @@ test("GitHub gate requires exact main, green CI, exact Khaliq dispatch identity,
   const changes: Array<(f: ReturnType<typeof githubFixture>) => void> = [
     (f) => { f.ref.object.sha = "b".repeat(40); },
     (f) => { f.ci.workflow_runs[0]!.conclusion = "failure"; },
-    (f) => { f.environment.protection_rules = [{ type: "required_reviewers" }]; },
+    (f) => { f.environment.protection_rules.push({ type: "required_reviewers" }); },
     (f) => { f.run.actor.id = 42; },
     (f) => { f.run.triggering_actor.id = 42; },
     (f) => { f.artifacts.artifacts = []; f.artifacts.total_count = 0; },

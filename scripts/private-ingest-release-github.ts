@@ -30,8 +30,10 @@ export async function privateIngestGithubGate(
       run.triggering_actor?.id !== P.releaseActorGithubUserId || run.triggering_actor?.type !== "User")
     privateIngestRefuse("private_ingest_release_run");
   const environment = await get(base + "/environments/" + P.environment);
+  const protectionRules = environment.protection_rules ?? [];
   if (environment.name !== P.environment || !Number.isSafeInteger(environment.id) ||
-      !Array.isArray(environment.protection_rules) || environment.protection_rules.length !== 0 ||
+      !Array.isArray(protectionRules) || protectionRules.length !== 1 ||
+      protectionRules[0]?.type !== "branch_policy" ||
       environment.deployment_branch_policy?.protected_branches !== false ||
       environment.deployment_branch_policy?.custom_branch_policies !== true)
     privateIngestRefuse("private_ingest_release_environment");
