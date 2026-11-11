@@ -55,6 +55,20 @@ BEGIN
 END
 $extend$;
 
+-- Acquired before row locks, including UPDATE/ON CONFLICT, so erasure cannot miss an
+-- uncommitted writer or deadlock by waiting on a row whose trigger waits on erase.
+CREATE FUNCTION sessions.ingest_erase_fence_index_lock() RETURNS trigger
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $index_lock$
+BEGIN
+ PERFORM pg_advisory_xact_lock_shared(961996,50000);
+ IF current_setting('transaction_isolation')<>'read committed' AND
+   (SELECT is_called FROM sessions.session_erasure_writer_epoch) THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='operator erase: pointer writer requires a fresh read-committed snapshot';END IF;
+ RETURN NULL;
+END $index_lock$;
+CREATE TRIGGER ingest_erase_fence_index_lock BEFORE INSERT OR UPDATE ON sessions.session_index
+ FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_erase_fence_index_lock();
+
 -- Any writer of sessions.session_index: a live row for a fenced id is skipped (RETURN NULL), as the
 -- publication pointer guard skips a guarded write. A tombstone (deleted_at set) always passes.
 -- SECURITY DEFINER: the writer (search_consumer_runtime, the ingest role) cannot read the fences.
@@ -76,12 +90,12 @@ CREATE TRIGGER ingest_erase_fence_index_guard BEFORE INSERT OR UPDATE ON session
  FOR EACH ROW EXECUTE FUNCTION sessions.ingest_erase_fence_index_guard();
 
 REVOKE ALL ON FUNCTION sessions.ingest_erase_fence_extend(text,text,text,text,jsonb),
-  sessions.ingest_erase_fence_index_guard()
+  sessions.ingest_erase_fence_index_guard(),sessions.ingest_erase_fence_index_lock()
   FROM PUBLIC,anon,authenticated,service_role;
 DO $revoke_consumer$ BEGIN
  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='search_consumer_runtime') THEN
   REVOKE ALL ON FUNCTION sessions.ingest_erase_fence_extend(text,text,text,text,jsonb),
-   sessions.ingest_erase_fence_index_guard() FROM search_consumer_runtime;
+   sessions.ingest_erase_fence_index_guard(),sessions.ingest_erase_fence_index_lock() FROM search_consumer_runtime;
  END IF;
 END $revoke_consumer$;
 

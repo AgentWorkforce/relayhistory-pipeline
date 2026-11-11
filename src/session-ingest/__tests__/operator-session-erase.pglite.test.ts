@@ -443,3 +443,37 @@ describe("050010 fence check in claim, commit and upsert_session_index", () => {
     }
   });
 });
+
+test("lossy aliases refuse before receipts/fences; cross-source and cross-org pointers survive", async () => {
+ const d=await database();
+ await pointer(d,"user-a","a_b","m-a","a:b");
+ await pointer(d,"user-b","a_b","m-b","a/b");
+ await expect(erase(d,"collision",[ORG,WS,SRC,"a:b"])).rejects.toMatchObject({code:"RH013"});
+ expect((await d.db.query("SELECT 1 FROM sessions.session_erasure_fences")).rows).toEqual([]);
+ expect((await d.db.query("SELECT 1 FROM sessions.session_erasure_receipts")).rows).toEqual([]);
+ expect((await d.db.query("SELECT 1 FROM sessions.session_index WHERE deleted_at IS NULL")).rows).toHaveLength(2);
+});
+
+test("erase preserves another source and organization with identical session ids", async () => {
+ const d=await database();await pointer(d,"user",SID,"m");
+ await d.db.exec(`INSERT INTO sessions.session_index SELECT (jsonb_populate_record(NULL::sessions.session_index,to_jsonb(s)||'{"org_id":"foreign-org"}'::jsonb)).* FROM sessions.session_index s;
+ INSERT INTO sessions.session_index SELECT (jsonb_populate_record(NULL::sessions.session_index,to_jsonb(s)||'{"harness":"codex"}'::jsonb)).* FROM sessions.session_index s WHERE org_id='org-a';`);
+ await erase(d);
+ expect((await d.db.query("SELECT org_id,harness FROM sessions.session_index WHERE deleted_at IS NULL ORDER BY org_id,harness")).rows)
+ .toEqual([{org_id:"foreign-org",harness:"claude"},{org_id:"org-a",harness:"codex"}]);
+});
+
+test("artifact assertions cannot claim unreadable while physical directory content is live", async () => {
+ const d=await database();await pointer(d,"user",SID,"m");await erase(d);
+ await directory(d,SID);
+ for(const artifact of Object.keys((await receipt(d))!.artifacts)) await d.run("SELECT sessions.ingest_operator_erase_record_step($1,$2,$3,$4,$5,'done',0,NULL)",[...KEY,artifact]);
+ expect(await receipt(d)).toMatchObject({unreadable:false,status:"in_progress"});
+});
+
+test("an oversized alias set refuses before audit or fence writes",async()=>{
+ const d=await database();await pointer(d,"user",SID,"machine");
+ await d.db.exec(`INSERT INTO sessions.session_index SELECT(jsonb_populate_record(NULL::sessions.session_index,to_jsonb(s)||jsonb_build_object('session_id','alias-'||n,'canonical_session_id','s-1'))).* FROM sessions.session_index s CROSS JOIN generate_series(1,257) n`);
+ await expect(erase(d)).rejects.toMatchObject({code:"RH010"});
+ expect((await d.db.query("SELECT 1 FROM sessions.session_erasure_fences")).rows).toEqual([]);
+ expect((await d.db.query("SELECT 1 FROM sessions.session_erasure_receipts")).rows).toEqual([]);
+});

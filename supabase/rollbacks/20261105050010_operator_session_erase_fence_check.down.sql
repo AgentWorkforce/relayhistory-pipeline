@@ -9,7 +9,7 @@ DO $rollback_guard$ DECLARE v_later boolean;v_sha text; BEGIN
  EXECUTE 'SELECT EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE ''upstream:%'' AND name COLLATE "C">''upstream:20261105050010_operator_session_erase_fence_check.sql'')' INTO v_later;
  IF v_later THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator erase fence check: a later migration is applied; roll it back first';END IF;
  EXECUTE 'SELECT sha256 FROM sessions.__96bulls_migrations WHERE name=''upstream:20261105050010_operator_session_erase_fence_check.sql''' INTO v_sha;
- IF v_sha IS DISTINCT FROM '02ca77c1c4fe3b0765a8116d669fd17e414f5299e89078cacd6e9defa0318f00'
+ IF v_sha IS DISTINCT FROM 'fd0be5dbe0443870a4ef786cd686b665e77c5998837698af2bd3350796c21927'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator erase fence check: own applied checksum required';END IF;
  IF EXISTS(SELECT 1 FROM sessions.session_erasure_fences) THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator erase fence check: erase fences exist; refusing to remove enforcement';END IF;
@@ -423,6 +423,8 @@ BEGIN
 END
 $commit$;
 DROP TRIGGER ingest_erase_fence_index_guard ON sessions.session_index;
+DROP TRIGGER ingest_erase_fence_index_lock ON sessions.session_index;
 DROP FUNCTION sessions.ingest_erase_fence_index_guard(),
+ sessions.ingest_erase_fence_index_lock(),
  sessions.ingest_erase_fence_extend(text,text,text,text,jsonb);
 DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105050010_operator_session_erase_fence_check.sql';
