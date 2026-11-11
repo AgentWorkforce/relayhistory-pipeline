@@ -91,7 +91,7 @@ before and after I/O; collection list/search endpoints return successful empty c
 
 CI runs src/session-erase/__tests__/operator-flow.minio.test.ts with the existing
 FRONTIER_TEST_S3_* disposable loopback fixture. It applies actual upstream and HoopDb
-migrations, uploads through real delivery, reads native directory/search/summary routes,
+migrations, uploads through real delivery, reads native directory/search/summary routes and summary/user aggregates,
 erases all stores, verifies the completed receipt, checks 404 exact reads and missing raw
 objects, preserves a neighboring object and suppresses same/new-origin re-upload.
 Source projections are seeded as the consumer would; separate real PostgreSQL tests

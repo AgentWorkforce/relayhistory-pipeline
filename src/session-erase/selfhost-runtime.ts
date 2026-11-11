@@ -69,6 +69,24 @@ export async function assertEraseSearchIdentity(db: Pick<pg.Pool, "query">): Pro
     throw Error("96bulls: operator erase search login refused");
 }
 
+/** A delete-only credential must not be able to replace or drop its search schema. */
+export async function assertEraseSearchPrivileges(db: Pick<pg.Pool, "query">): Promise<void> {
+  const acl = await db.query(`SELECT
+      NOT has_schema_privilege(current_user,'search_index','CREATE')
+      AND NOT has_table_privilege(current_user,'search_index.transcript_events','SELECT,INSERT,UPDATE,TRUNCATE,REFERENCES,TRIGGER')
+      AND NOT has_table_privilege(current_user,'search_index.projection_state','SELECT,INSERT,UPDATE,TRUNCATE,REFERENCES,TRIGGER')
+      AND has_table_privilege(current_user,'search_index.transcript_events','DELETE')
+      AND has_table_privilege(current_user,'search_index.projection_state','DELETE')
+      AND NOT EXISTS(SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE n.nspname='search_index' AND c.relname IN('transcript_events','projection_state') AND a.attnum>0 AND NOT a.attisdropped
+        AND(has_column_privilege(current_user,c.oid,a.attnum,'INSERT,UPDATE') OR(
+          has_column_privilege(current_user,c.oid,a.attnum,'SELECT') AND a.attname NOT IN('org_id','workspace_id','source','session_id','canonical_session_id'))))
+      AND(SELECT count(*)=2 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE n.nspname='search_index' AND c.relname IN('transcript_events','projection_state') AND c.relrowsecurity AND c.relforcerowsecurity)
+      AS safe`);
+  if (acl.rows[0]?.safe !== true) throw Error("96bulls: operator erase search privileges refused");
+}
+
 /** A separate delete-only search login; the ingest login gains no search table access. */
 async function postgresSearch(env: NodeJS.ProcessEnv, metadata: pg.PoolConfig): Promise<{ port: EraseSearchPort; close(): Promise<void> }> {
   if (!env.SESSION_ERASE_SEARCH_POSTGRES_URL) throw Error("96bulls: SESSION_ERASE_SEARCH_POSTGRES_URL required for operator erase");
@@ -81,19 +99,7 @@ async function postgresSearch(env: NodeJS.ProcessEnv, metadata: pg.PoolConfig): 
   pool.on("error", () => {});
   try {
     await assertEraseSearchIdentity(pool);
-    const acl = await pool.query(`SELECT
-      NOT has_table_privilege(current_user,'search_index.transcript_events','SELECT,INSERT,UPDATE,TRUNCATE,REFERENCES,TRIGGER')
-      AND NOT has_table_privilege(current_user,'search_index.projection_state','SELECT,INSERT,UPDATE,TRUNCATE,REFERENCES,TRIGGER')
-      AND has_table_privilege(current_user,'search_index.transcript_events','DELETE')
-      AND has_table_privilege(current_user,'search_index.projection_state','DELETE')
-      AND NOT EXISTS(SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace
-        WHERE n.nspname='search_index' AND c.relname IN('transcript_events','projection_state') AND a.attnum>0 AND NOT a.attisdropped
-        AND(has_column_privilege(current_user,c.oid,a.attnum,'INSERT,UPDATE') OR(
-          has_column_privilege(current_user,c.oid,a.attnum,'SELECT') AND a.attname NOT IN('org_id','workspace_id','source','session_id','canonical_session_id'))))
-      AND(SELECT count(*)=2 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
-        WHERE n.nspname='search_index' AND c.relname IN('transcript_events','projection_state') AND c.relrowsecurity AND c.relforcerowsecurity)
-      AS safe`);
-    if (acl.rows[0]?.safe !== true) throw Error("96bulls: operator erase search privileges refused");
+    await assertEraseSearchPrivileges(pool);
     const tenant = async <T>(orgId: string, workspaceId: string, work: (client: any) => Promise<T>): Promise<T> => {
       const client = await pool.connect();
       try {
