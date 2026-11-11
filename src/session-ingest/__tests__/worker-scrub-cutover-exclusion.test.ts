@@ -4,6 +4,12 @@
  * ingest Worker keeps the TS engine (scrub version 8), bundles no relayscrubber package,
  * never wires `createCompiledBindgenEngine`, and refuses SCRUB_ENGINE=wasm-bindgen
  * outright (503 not_configured), so no Worker can claim scrub version 10.
+ *
+ * The checked-in bindgen pin (ruleset 10, relayhistory-secrets-v10, the alpha.4 wasm digest)
+ * is read from disk only by the Node / Bun wasm-bindgen initialisation (scrub-engine/index.ts
+ * `loadScrubBindgenPin`), never statically imported, so the Worker bundle carries none of it.
+ * In workerd that disk read fails too (`bindgen_pin_unreadable`); under `bun test` the pin file
+ * is readable, so these tests reach the Worker's artifact reader, which refuses.
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
@@ -14,6 +20,10 @@ import { activeScrubEngine, resetScrubEngineForTests, scrubEngineReady } from ".
 import { SCRUB_RULESET_VERSION } from "../../../packages/pipeline/src/lib/pipeline/raw-chunks.ts";
 
 const ROOT = join(import.meta.dir, "../../..");
+const PIN = JSON.parse(readFileSync(join(ROOT, "packages/pipeline/scrub-bindgen-pin.json"), "utf8")) as {
+  wasm_sha256: string; glue_sha256: string; loader_sha256: string;
+  release: { tarball_sha256: string }; manifest: { rulesetSourceSha256: string };
+};
 const NODE = new Set(builtinModules.flatMap((m) => [m, `node:${m}`]));
 const TRIPLE = { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen", READER_MAX_RULESET: "10" };
 const ctx = { waitUntil() {}, passThroughOnException() {} };
@@ -24,7 +34,7 @@ describe("hosted ingest Worker refuses the cutover engine", () => {
     ["the full env triple", TRIPLE],
     ["SCRUB_ENGINE=wasm-bindgen alone (reader ceiling 8)", { SCRUB_ENGINE: "wasm-bindgen" }],
   ] as const)
-    test(`${name}: 503 not_configured, engine unavailable, nothing read from disk`, async () => {
+    test(`${name}: 503 not_configured, engine unavailable, the Worker's artifact reader refuses (no vendored byte read)`, async () => {
       resetScrubEngineForTests();
       const response = await worker.fetch(new Request("https://ingest.example/v1/delivery/batches", { method: "POST", body: "{}" }), env as never, ctx as never);
       expect(response.status).toBe(503);
@@ -58,9 +68,12 @@ describe("Worker bundles and configs never carry the cutover", () => {
     expect(result.success).toBe(true);
     expect(result.outputs.map((o) => o.path).filter((p) => p.endsWith(".wasm"))).toEqual([]);
     const code = await result.outputs[0]!.text();
-    expect(code).not.toMatch(/__wbg_init|__wbg_get_imports|relayscrubber_bg\.wasm"\s*,\s*import\.meta\.url/);
-    // The writer ceiling the Worker can claim stays the TS ruleset version.
-    expect(code).not.toMatch(/SCRUB_RULESET_VERSION\s*=\s*10\b/);
+    expect(code).not.toMatch(/__wbg_init|__wbg_get_imports|relayscrubber_bg\.wasm['"]\s*,\s*import\.meta\.url/);
+    // No ruleset-10 identity from the bindgen pin or the vendored artifact.json is bundled.
+    expect(code).not.toContain("relayhistory-secrets-v10");
+    expect(code).not.toMatch(/["']?rulesetVersion["']?\s*:\s*10\b/);
+    for (const digest of [PIN.wasm_sha256, PIN.glue_sha256, PIN.loader_sha256, PIN.release.tarball_sha256, PIN.manifest.rulesetSourceSha256])
+      expect(`${digest.slice(0, 16)}: ${code.includes(digest.slice(0, 16))}`).toBe(`${digest.slice(0, 16)}: false`);
   }, 60_000);
 
   test("no Worker entrypoint wires createCompiledBindgenEngine or imports the vendored package", () => {

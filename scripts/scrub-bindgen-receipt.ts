@@ -7,17 +7,29 @@
  * recomputes the sha256 of every vendored file, and compares them to
  * packages/pipeline/scrub-bindgen-pin.json AND the release's own generated/artifact.json:
  * pin digests (wasm, glue, loader), artifact.json file lists, no unlisted files,
- * manifest verbatim, package version = crateVersion, scrub_profile = scrubProfile.
+ * manifest verbatim, package version = crateVersion, scrub_profile = scrubProfile,
+ * pin release.sha256sums["artifact.json"] = the vendored artifact.json digest.
  *
- * Usage: bun scripts/scrub-bindgen-receipt.ts [--out <path>]   (default: scrub-bindgen-receipt.json)
- * Writes the receipt (ok:false with the mismatches when anything differs), prints it,
- * and exits 1 on any mismatch.
+ * Usage: bun scripts/scrub-bindgen-receipt.ts [--out <path>] [--tarball <path>]
+ *   --out      receipt path (default: scrub-bindgen-receipt.json)
+ *   --tarball  the release tarball named by pin.release. When given, the receipt's `release`
+ *              block is the provenance verification (packages/pipeline/src/lib/
+ *              scrub-bindgen-provenance.ts): tarball sha256 = pin, package/package.json
+ *              name+version = pin, every vendored file byte-equal to its package/ entry,
+ *              no extra entries. The tarball is read in memory as data, never executed.
+ *              Without it (CI: no network, no tarball) the block is
+ *              `{ ...pin.release, verified: false, reason: "tarball not supplied" }` and
+ *              does not by itself fail the receipt.
+ * Writes the receipt (ok:false with the mismatches when anything differs, including a
+ * supplied tarball that fails verification: release.verified:false with its mismatches),
+ * prints it, and exits 1 on any mismatch.
  */
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { verifyReleaseTarball } from "../packages/pipeline/src/lib/scrub-bindgen-provenance";
 
 const ROOT = resolve(import.meta.dir, "..");
 const PIN_FILE = join(ROOT, "packages/pipeline/scrub-bindgen-pin.json");
@@ -25,7 +37,24 @@ const DIR = join(ROOT, "packages/pipeline/scrub-bindgen");
 const args = process.argv.slice(2);
 const at = args.indexOf("--out");
 const out = resolve(at >= 0 && args[at + 1] ? args[at + 1]! : "scrub-bindgen-receipt.json");
+const tat = args.indexOf("--tarball");
+if (tat >= 0 && !args[tat + 1]) {
+  console.error("--tarball needs a path");
+  process.exit(2);
+}
+const tarballPath = tat >= 0 ? resolve(args[tat + 1]!) : undefined;
+if (tarballPath && !isFile(tarballPath)) {
+  console.error(`--tarball ${tarballPath} is not a readable file`);
+  process.exit(2);
+}
 
+function isFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
 const sha = (b: Uint8Array) => createHash("sha256").update(b).digest("hex");
 const mismatches: string[] = [];
 const check = (ok: boolean, what: string) => { if (!ok) mismatches.push(what); };
@@ -59,7 +88,25 @@ for (const rel of present) check(allowed.has(rel), `unlisted vendored file ${rel
 check(isDeepStrictEqual(pin.manifest, artifact.manifest), "pin manifest != artifact.json manifest");
 check(pin.package_version === artifact.manifest?.crateVersion, `package_version ${pin.package_version} != crateVersion ${artifact.manifest?.crateVersion}`);
 check(pin.scrub_profile === artifact.manifest?.scrubProfile, `scrub_profile ${pin.scrub_profile} != scrubProfile ${artifact.manifest?.scrubProfile}`);
+check(
+  typeof pin.release === "object" && pin.release !== null && pin.release.sha256sums?.["artifact.json"] === sha(artifactBytes),
+  `pin release.sha256sums["artifact.json"] ${pin.release?.sha256sums?.["artifact.json"]} != vendored artifact.json ${sha(artifactBytes)}`,
+);
 check(!("placeholder" in pin) && !Object.keys(pin).some((k) => /placeholder/i.test(k)), "pin still carries a placeholder marker");
+
+// Release provenance (optional: needs the tarball, which CI does not have).
+let release: Record<string, unknown> = { ...pin.release, verified: false, reason: "tarball not supplied" };
+if (tarballPath) {
+  const result = verifyReleaseTarball({ tarball: readFileSync(tarballPath), pin, vendoredDir: DIR });
+  for (const m of result.mismatches) mismatches.push(`release: ${m}`);
+  release = {
+    ...pin.release,
+    verified: result.ok,
+    ...(result.ok ? {} : { reason: "tarball verification failed", mismatches: result.mismatches }),
+    tarballSuppliedSha256: result.tarballSha256,
+    entries: result.entries,
+  };
+}
 
 const git = (...a: string[]) => spawnSync("git", a, { cwd: ROOT, encoding: "utf8" }).stdout.trim() || null;
 const receipt = {
@@ -73,6 +120,7 @@ const receipt = {
   package: pin.package,
   packageVersion: pin.package_version,
   pinFile: { path: relative(ROOT, PIN_FILE), sha256: sha(pinBytes) },
+  release,
   pinDigests: { wasm: pin.wasm_sha256, glue: pin.glue_sha256, loader: pin.loader_sha256 },
   scrubProfile: pin.scrub_profile,
   crateManifest: artifact.manifest,

@@ -32,7 +32,6 @@ import { sealRawChunk as sealRawChunkTs, type SealRawChunk, type SealedChunk } f
 import type { ObjectStore } from "../pipeline/object-layout.js";
 import { bindEngineRawSealer, type BoundRawChunkSealer } from "../pipeline/engine-raw-chunks.js";
 import pinJson from "../../../scrub-wasm-pin.json";
-import bindgenPinJson from "../../../scrub-bindgen-pin.json";
 import {
   bindgenFileReader,
   initBindgenScrubEngine,
@@ -93,8 +92,45 @@ export type ScrubEngineKind = "ts" | "wasm" | "wasm-bindgen";
 
 /** The pin checked in at packages/pipeline/scrub-wasm-pin.json. */
 export const SCRUB_WASM_PIN: unknown = pinJson;
-/** The pin checked in at packages/pipeline/scrub-bindgen-pin.json. */
-export const SCRUB_BINDGEN_PIN: unknown = bindgenPinJson;
+/**
+ * Where the checked-in wasm-bindgen pin (packages/pipeline/scrub-bindgen-pin.json) lives,
+ * relative to this file. It is deliberately NOT a static import: the hosted ingest Worker
+ * bundles this module, and Workers are excluded from the cutover, so the Worker bundle must
+ * not carry the pin's ruleset-10 identity. Only the Node / Bun wasm-bindgen initialisation
+ * reads it (`loadScrubBindgenPin`).
+ */
+export const SCRUB_BINDGEN_PIN_PATH = "../../../scrub-bindgen-pin.json";
+
+let checkedInBindgenPin: Promise<unknown> | undefined;
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object") {
+    for (const v of Object.values(value)) deepFreeze(v);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+/**
+ * The checked-in wasm-bindgen pin, read from disk on first use (Node / Bun only) and
+ * cached as one frozen object. A read or parse failure refuses with
+ * `bindgen_pin_unreadable` and is not cached; the pin is validated by bindgen-engine.ts.
+ */
+export function loadScrubBindgenPin(): Promise<unknown> {
+  checkedInBindgenPin ??= (async () => {
+    try {
+      const { readFile } = await import("node:fs/promises");
+      const { fileURLToPath } = await import("node:url");
+      // Resolved only here: a Worker bundle may have no usable import.meta.url.
+      const text = await readFile(fileURLToPath(new URL(SCRUB_BINDGEN_PIN_PATH, import.meta.url).href), "utf8");
+      return deepFreeze(JSON.parse(text) as unknown);
+    } catch {
+      checkedInBindgenPin = undefined;
+      throw new ScrubEngineUnavailable("bindgen_pin_unreadable");
+    }
+  })();
+  return checkedInBindgenPin;
+}
 
 /** Where the self-host image / Node runtime expects the pinned artifact. */
 export const SCRUB_WASM_PATH = "../../../scrub-wasm/relayscrubber.wasm";
@@ -240,7 +276,8 @@ export async function initScrubEngine(options: InitScrubEngineOptions = {}): Pro
  */
 async function initBindgen(env: ScrubEngineEnv | undefined, o: NonNullable<InitScrubEngineOptions["bindgen"]>): Promise<ScrubEngine> {
   try {
-    const pin = "pin" in o ? o.pin : SCRUB_BINDGEN_PIN;
+    const checkedIn = await loadScrubBindgenPin();
+    const pin = "pin" in o ? o.pin : checkedIn;
     const engine = await initBindgenScrubEngine({
       readerMaxRuleset: readerMaxRuleset(env),
       pin,
@@ -249,7 +286,7 @@ async function initBindgen(env: ScrubEngineEnv | undefined, o: NonNullable<InitS
     });
     active = engine;
     // The bytes were hashed against `pin`; equal to the checked-in pin means the exact pinned package.
-    activePinExact = pin === SCRUB_BINDGEN_PIN || JSON.stringify(pin) === JSON.stringify(SCRUB_BINDGEN_PIN);
+    activePinExact = pin === checkedIn || JSON.stringify(pin) === JSON.stringify(checkedIn);
     // A repeat init after an unknown failure refuses instead of resolving.
     if (engine.failed) throw new ScrubberError("scrubber_instance_poisoned", "instance_poison");
     lastFailure = undefined;

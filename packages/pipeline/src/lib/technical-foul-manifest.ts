@@ -109,6 +109,15 @@ export interface TechnicalFoulCutoverManifest {
   packageVersion: string;
   pinPath: string;
   pinFileSha256: string;
+  /** The GitHub release the vendored bytes were published as (pin `release` block, verbatim). */
+  release: {
+    source: string;
+    repository: string;
+    tag: string;
+    tarball: string;
+    tarball_sha256: string;
+    sha256sums: Record<string, string>;
+  };
   pinDigests: { wasm: string; glue: string; loader: string };
   scrubProfile: string;
   crateManifest: Record<string, unknown>;
@@ -152,6 +161,9 @@ export function computeCutoverManifest(): TechnicalFoulCutoverManifest {
       throw new Error(`vendored ${rel} sha256 ${vendoredFiles[rel]} != pin ${want}`);
     }
   }
+  if (pin.release?.sha256sums?.["artifact.json"] !== vendoredFiles["generated/artifact.json"]) {
+    throw new Error("scrub-bindgen-pin.json release.sha256sums artifact.json differs from the vendored artifact.json");
+  }
   if (JSON.stringify(pin.manifest) !== JSON.stringify(artifact.manifest)) {
     throw new Error("scrub-bindgen-pin.json manifest differs from vendored artifact.json manifest");
   }
@@ -167,6 +179,7 @@ export function computeCutoverManifest(): TechnicalFoulCutoverManifest {
     packageVersion: pin.package_version,
     pinPath: PIN_PATH,
     pinFileSha256: sha256Bytes(PIN_PATH),
+    release: pin.release,
     pinDigests: { wasm: pin.wasm_sha256, glue: pin.glue_sha256, loader: pin.loader_sha256 },
     scrubProfile: pin.scrub_profile,
     crateManifest: pin.manifest,

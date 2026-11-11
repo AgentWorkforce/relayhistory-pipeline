@@ -39,6 +39,14 @@ const EXPECTED = {
   glue_sha256: "55dd6fc6a44ed35f846655ab08bf3161ffe105123cbe11d3e529923d6bdeae5b",
   loader_sha256: "ff139ab391a958475b455ef483e7119d66215d172647223965dc35348f912490",
   artifact_json_sha256: "cf43f67ad3033cca73d8a36a67a707f258a51517e1c13fa1dc1df8f66f49a9ed",
+  release: {
+    source: "github-release",
+    repository: "AgentWorkforce/relayscrubber",
+    tag: "v0.5.0-alpha.4",
+    tarball: "agentworkforce-relayscrubber-0.5.0-alpha.4.tgz",
+    tarball_sha256: "c0665dc5668bdefd5636656c3a7358273be09a4b8d1e086b99641943e3569641",
+    sha256sums: { "artifact.json": "cf43f67ad3033cca73d8a36a67a707f258a51517e1c13fa1dc1df8f66f49a9ed" },
+  },
   manifest: {
     schema: 3,
     ruleset: "relayhistory-scrub",
@@ -66,13 +74,17 @@ async function initError(options: Parameters<typeof initScrubEngine>[0]): Promis
 describe("alpha.4 pin and vendored bytes", () => {
   it("the checked-in pin holds exactly the reviewed alpha.4 values, with no placeholder marker", () => {
     expect(PIN.package_version).toBe(EXPECTED.package_version);
+    expect(PIN.schema).toBe(2);
+    expect(PIN.release).toStrictEqual(EXPECTED.release);
+    // The release's SHA256SUMS line for artifact.json is the vendored artifact.json.
+    expect(PIN.release.sha256sums["artifact.json"]).toBe(EXPECTED.artifact_json_sha256);
     expect(PIN.wasm_sha256).toBe(EXPECTED.wasm_sha256);
     expect(PIN.glue_sha256).toBe(EXPECTED.glue_sha256);
     expect(PIN.loader_sha256).toBe(EXPECTED.loader_sha256);
     expect(PIN.scrub_profile).toBe("relayhistory-secrets-v10");
     expect(PIN.manifest).toStrictEqual(EXPECTED.manifest);
     expect(Object.keys(PIN).sort()).toEqual(
-      ["glue_sha256", "loader_sha256", "manifest", "package", "package_version", "paths", "schema", "scrub_profile", "wasm_sha256"],
+      ["glue_sha256", "loader_sha256", "manifest", "package", "package_version", "paths", "release", "schema", "scrub_profile", "wasm_sha256"],
     );
     expect(JSON.stringify(PIN)).not.toMatch(/UNPINNED|PLACEHOLDER|0{64}/i);
   });

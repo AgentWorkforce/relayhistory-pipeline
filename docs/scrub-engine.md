@@ -319,13 +319,13 @@ entrypoint calls it. With `SCRUB_ENGINE=wasm-bindgen` the hosted Worker's
 
 (Historical record from the scaffold PR; the status of each item for the alpha.4 cutover is in "Cutover: pinned relayscrubber 0.5.0-alpha.4".) Merging this PR is a default-off, unpinned scaffold only. It is NOT a security PASS, artifact pin, cutover, image, marker or adoption clearance. The successor that binds a real package must satisfy all of these first:
 
-1. **Reader-first.** A v10 writer may not start until every relevant reader accepts ruleset <= 10. Add a separate explicit `READER_MAX_RULESET=10`; pin parsing must refuse a manifest rulesetVersion above it and below the supported floor. Roll the reader ceiling out first with wasm-bindgen still off, then the v10 writer/pin. Do not overload the TS `SCRUB_RULESET_VERSION` as the reader ceiling. (Reader policy source implemented in #489; fleet rollout and relayscrubber-lead acceptance remain pending.)
-2. **Profile is crate-owned.** The schema-2 manifest must report a canonical profile field/string; the pipeline pins and compares it verbatim. The format derived in this PR (`relayscrubber/<ruleset>/<ver>/<policy>/<sourceSha>`) is a placeholder and must be replaced by the crate's value before any pin. (Candidate schema-3 crate-owned profile comparison implemented in #489; exact-package acceptance remains pending.)
-3. **Stable tagged glue errors.** relayscrubber must expose stable error tags. Recognised domain/admission errors refuse one call; `WebAssembly.RuntimeError`, `RangeError`/OOM, or ANY unrecognised throw poisons the instance. The current Error-vs-trap heuristic is removed before pin. (Explicit refusal-tag recognition and sticky unknown-error poisoning implemented in #489; package/transport acceptance remains pending.)
-4. **Loader policy in the adapter.** Hashing `index.js` without executing it is package provenance only, never runtime security. The adapter may import the verified generated glue directly but must implement the reviewed loader policy itself, including the 16 MiB UTF-8 preflight before the bindgen copy. The registry package/archive checksum goes into the build receipt; component digests remain the runtime pins. (Adapter-side preflight implemented in #489, pending relayscrubber-lead acceptance; qualified package/provenance requirements remain open.)
+1. **Reader-first.** A v10 writer may not start until every relevant reader accepts ruleset <= 10. Add a separate explicit `READER_MAX_RULESET=10`; pin parsing must refuse a manifest rulesetVersion above it and below the supported floor. Roll the reader ceiling out first with wasm-bindgen still off, then the v10 writer/pin. Do not overload the TS `SCRUB_RULESET_VERSION` as the reader ceiling. (Reader policy implemented in #489. The alpha.4 pin is version 10 and refuses without `READER_MAX_RULESET=10`; see "Cutover" and "Reader-first rollout". Fleet rollout of the ceiling is an operational step, not a source change.)
+2. **Profile is crate-owned.** The schema-2 manifest must report a canonical profile field/string; the pipeline pins and compares it verbatim. The format derived in this PR (`relayscrubber/<ruleset>/<ver>/<policy>/<sourceSha>`) is a placeholder and must be replaced by the crate's value before any pin. (Schema-3 crate-owned profile comparison implemented in #489; the alpha.4 pin compares `relayhistory-secrets-v10` verbatim, see "Cutover".)
+3. **Stable tagged glue errors.** relayscrubber must expose stable error tags. Recognised domain/admission errors refuse one call; `WebAssembly.RuntimeError`, `RangeError`/OOM, or ANY unrecognised throw poisons the instance. The current Error-vs-trap heuristic is removed before pin. (Refusal-tag recognition and sticky unknown-error poisoning implemented in #489; the fault matrix runs against the real alpha.4 module in `packages/pipeline/test/scrub-bindgen-faults.test.ts`.)
+4. **Loader policy in the adapter.** Hashing `index.js` without executing it is package provenance only, never runtime security. The adapter may import the verified generated glue directly but must implement the reviewed loader policy itself, including the 16 MiB UTF-8 preflight before the bindgen copy. The registry package/archive checksum goes into the build receipt; component digests remain the runtime pins. (Adapter-side preflight implemented in #489. Release provenance is implemented for alpha.4: the pin's `release` block records the GitHub release tarball sha256, every receipt emits it, and the `--tarball` check proves the vendored bytes equal the tarball's; see "Cutover" / "Provenance checks".)
 5. **Workers.** CI/build must hash the exact wasm and glue source files against the pin before bundling, prove through the bundler metafile/module manifest that the CompiledWasm input is that exact path, and retain a durable bundle receipt mapping wasmSha/glueSha/sourceSha to the deployment bundle digest. Startup still verifies the instance manifest/profile. Mutated-wasm and swapped-module build tests must fail.
 
-Additional cutover requirements: adapter-side `MAX_TEXT_BYTES` = 16 MiB UTF-8 for text and JSON before any WASM call; records 16 MiB each and 64 MiB aggregate; JS preflight plus Rust recheck; limit-1 / limit / limit+1 multibyte tests; copy or reject shared mutable record buffers before invocation; route and re-pin every `sealRawChunk` call site; no TS or raw fallback. (Adapter-side admission implemented in #489, pending relayscrubber-lead acceptance; Rust recheck/package boundary proofs and seal-path routing remain open.)
+Additional cutover requirements: adapter-side `MAX_TEXT_BYTES` = 16 MiB UTF-8 for text and JSON before any WASM call; records 16 MiB each and 64 MiB aggregate; JS preflight plus Rust recheck; limit-1 / limit / limit+1 multibyte tests; copy or reject shared mutable record buffers before invocation; route and re-pin every `sealRawChunk` call site; no TS or raw fallback. (Adapter-side admission implemented in #489. The Rust recheck and limit-1 / limit / limit+1 boundary tests run against the real alpha.4 module in `packages/pipeline/test/scrub-bindgen-limits.test.ts`. Seal-path routing is implemented, see "Cutover" / "Routing"; unwired call sites refuse with `seal_path_not_routed`. Workers remain excluded.)
 
 Adapter tests with inert glue doubles do not qualify a Rust/WASM package.
 
@@ -397,12 +397,33 @@ toolchain Rust 1.88.0, wasm-bindgen 0.2.104) and the `.d.ts` files are vendored 
 `packages/pipeline/scrub-bindgen/.gitattributes` (`* -text`) keeps git from normalising the bytes.
 The vendored directory reaches the services image through `COPY packages packages`.
 
+The pin (schema 2) also carries a `release` block: `source` `github-release`, `repository`
+`AgentWorkforce/relayscrubber`, `tag` `v0.5.0-alpha.4`, `tarball`
+`agentworkforce-relayscrubber-0.5.0-alpha.4.tgz`, `tarball_sha256`
+`c0665dc5668bdefd5636656c3a7358273be09a4b8d1e086b99641943e3569641`, and `sha256sums`
+(`artifact.json` = the vendored digest above). `parseScrubBindgenPin` refuses a pin without a
+well-formed block (`bindgen_unpinned_release`). The pin is read from disk on first use by
+`loadScrubBindgenPin()` (failure `bindgen_pin_unreadable`), never imported as JSON, so its
+digests and version-10 profile stay out of any bundle that imports the seam.
+
 Provenance checks:
 - `packages/pipeline/test/scrub-bindgen-pin-alpha4.test.ts` recomputes every vendored digest against
   the pin and `artifact.json`; mutated bytes and swapped modules fail closed.
 - `scripts/scrub-bindgen-receipt.ts` writes a receipt (pin digests, package version, crate manifest,
-  toolchain, timestamp, git HEAD) and exits non-zero on any mismatch. CI runs it in the `unit-tests`
-  job and uploads `scrub-bindgen-receipt.json` as an artifact.
+  toolchain, the pin's `release` block, timestamp, git HEAD) and exits non-zero on any mismatch. CI
+  runs it in the `unit-tests` job WITHOUT `--tarball` (no network in CI) and uploads
+  `scrub-bindgen-receipt.json` as an artifact; that receipt's `release` has `verified: false`,
+  `reason: "tarball not supplied"` by design. It still checks that `release.sha256sums["artifact.json"]`
+  equals the vendored `artifact.json`.
+- `--tarball <path>` (on the receipt, or standalone `bun scripts/scrub-bindgen-provenance.ts --tarball <path>`)
+  is the reproducible provenance step, run at pin time with the release tarball downloaded separately
+  and recorded in the PR. It checks the tarball sha256 against `release.tarball_sha256`, the
+  `package/package.json` name and version against the pin, that every vendored file (except the
+  repo-local `.gitattributes`) is byte-equal to its `package/` entry, and that the archive holds no
+  other file. The archive is parsed in memory as data (links, devices, `..`/absolute paths, duplicates
+  and bad checksums are refused); nothing is extracted or executed. Any mismatch gives `verified: false`
+  with `mismatches`, and exit 1 (2 for a usage error such as a missing file). Tests:
+  `packages/pipeline/test/scrub-bindgen-provenance.test.ts` (synthetic tarballs).
 - `packages/pipeline/technical-foul-cutover.json` is a NEW technical-foul entry (pin digests, vendored
   file digests, the bindgen sealer sources, and a reference to the unchanged TS entry including the
   `raw-chunks.ts` digest). `technical-foul.json` (ruleset 8) is immutable history and is not
@@ -433,11 +454,23 @@ instance. `routedRawChunkSealerDeps()` spreads it into each production construct
 | `src/migration/neon-s3-sync/export-session.ts` | `src/migration/neon-s3-sync/main.ts` `Syncer` target (initialises the engine first under `wasm-bindgen`) |
 | `packages/pipeline/src/routes/pipeline.ts` | `src/alleyoop/ingest.ts` `createPipelineRoutes` |
 
+Callers that reach the seam with no bound sealer are **unwired, refuses under the triple**
+(`seal_path_not_routed`, zero TS sealer calls, nothing stored):
+
+| Unwired call site | Why |
+|---|---|
+| `src/session-ingest/publication-canary.ts` `publishBufferedStage` (no `rawChunkSealer`) | canary tooling, TS only |
+| `packages/pipeline/src/routes/pipeline.ts` default `pipelineRoutes` / `pipelineOpsRoutes` / `defaultDeps`, mounted by `packages/pipeline/src/app.ts` | standalone pipeline app, not the self-host ingest |
+| `src/session-ingest/worker.ts` `deliverDepsFor` and its write targets | Workers excluded (below) |
+
 The seam's `sealRawChunk` keeps refusing non-TS engines (`seal_path_not_routed`), so any call site
 that is not wired refuses instead of falling back. There is no TS or raw fallback on the selected path.
-`src/session-ingest/__tests__/scrub-cutover-reachability.test.ts` drives all four paths end to end and
-proves zero TS scrub/sealer calls under the triple, with a positive control under the default.
-`scripts/scrub-cutover-reachability.ts` runs it and writes a JSON report.
+`src/session-ingest/__tests__/scrub-cutover-reachability.test.ts` drives all four wired paths end to end
+and proves zero TS scrub/sealer calls under the triple, with a positive control under the default. It
+also drives the three unwired callers under the triple and asserts each refuses with
+`seal_path_not_routed` and stores nothing, and a source scan fails if any `?? sealRawChunk` fallback or
+`DeliverDeps` / `PipelineRouteDeps` / publication-deps / write-target constructor is not classified as
+wired or unwired. `scripts/scrub-cutover-reachability.ts` runs it and writes a JSON report.
 
 ### What refuses when
 
@@ -447,6 +480,8 @@ proves zero TS scrub/sealer calls under the triple, with a positive control unde
 | A vendored file missing / empty | `bindgen_artifact_missing_<wasm|glue|loader>` |
 | A vendored file's bytes differ from the pin | `bindgen_sha256_mismatch_<name>` |
 | Relative `SCRUB_BINDGEN_DIR` | `bindgen_dir_invalid` |
+| Pin file unreadable / not JSON | `bindgen_pin_unreadable` |
+| Pin without a well-formed `release` block | `bindgen_unpinned_release` |
 | Instance manifest differs from the pin | `bindgen_manifest_mismatch_<field>` / `bindgen_profile_mismatch` |
 | `SCRUB_ENGINE_REQUIRED=wasm-bindgen` and the instance was verified against another pin | `bindgen_pin_not_exact` |
 | `SCRUB_ENGINE_REQUIRED=wasm-bindgen` and `SCRUB_ENGINE` is anything else | `engine_selection_required` (latched) |
@@ -455,8 +490,13 @@ proves zero TS scrub/sealer calls under the triple, with a positive control unde
 | Blank-only input (Rust `White_Space`, incl. U+0085) | refused at admission, engine not called, not poisoned |
 | Unwired call site | `seal_path_not_routed` |
 
-In every case `scrubEngineReady()` is false, the self-host ingest answers `503 scrub_unavailable`
-/ `/readyz` not ready, the Node services exit non-zero at startup, and nothing is stored.
+For the startup and configuration rows (reader ceiling, artifact, digest, directory, pin,
+manifest/profile, exact-pin and selection rows), `initScrubEngine` refuses, `scrubEngineReady()` is
+false, the Node services exit non-zero at startup, and nothing is stored. The per-call rows do not
+stop the process: a tagged refusal or blank input refuses that one call (the request fails, nothing
+is stored for it, the instance stays ready); poisoning after startup makes every later call refuse
+and turns readiness false (`503 scrub_unavailable` / `/readyz` not ready); an unwired call site
+refuses that call or request with `seal_path_not_routed`. No row falls back to TS or raw.
 
 ### Workers excluded
 

@@ -86,6 +86,9 @@ describe("technical-foul-cutover.json (new entry; TS history untouched)", () => 
       "cf43f67ad3033cca73d8a36a67a707f258a51517e1c13fa1dc1df8f66f49a9ed",
     );
     expect(cutover.toolchain).toEqual({ rust: "1.88.0", wasmBindgen: "0.2.104" });
+    expect(cutover.release).toEqual(pin.release);
+    expect(cutover.release.tarball_sha256).toBe("c0665dc5668bdefd5636656c3a7358273be09a4b8d1e086b99641943e3569641");
+    expect(cutover.release.sha256sums["artifact.json"]).toBe(cutover.artifactJsonSha256);
   });
 
   it("keeps the sealed raw-chunks.ts digest equal to the committed base", () => {

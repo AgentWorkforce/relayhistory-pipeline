@@ -83,7 +83,7 @@ export class IngestWriteError extends Error {
 }
 
 export interface WriteTarget {
-  /** Default-off scaffold dependency; no runtime environment routing. */
+  /** Set by routedRawChunkSealerDeps() under SCRUB_ENGINE=wasm-bindgen; absent → seam sealRawChunk (TS by default; refuses non-TS engines). */
   rawChunkSealer?: BoundRawChunkSealer;
   store: ObjectStore;
   keyRoot: string;

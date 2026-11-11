@@ -18,7 +18,7 @@ import { createPipelineRoutes } from "../src/routes/pipeline.js";
 import { tsScrubEngine } from "../src/lib/scrub-engine/engine.js";
 import { bindgenFileReader } from "../src/lib/scrub-engine/bindgen-engine.js";
 import {
-  SCRUB_BINDGEN_PIN,
+  loadScrubBindgenPin,
   activeScrubEngine,
   initScrubEngine,
   resetScrubEngineForTests,
@@ -153,8 +153,9 @@ describe("not ready under SCRUB_ENGINE_REQUIRED=wasm-bindgen: ingress refuses", 
 
   it("a pin that verifies the same bytes but is not the checked-in pin: bindgen_pin_not_exact", async () => {
     const pin = reorderedPin();
-    expect(pin).toStrictEqual(SCRUB_BINDGEN_PIN); // same content...
-    expect(JSON.stringify(pin)).not.toBe(JSON.stringify(SCRUB_BINDGEN_PIN)); // ...not the exact checked-in pin
+    const checkedIn = await loadScrubBindgenPin();
+    expect(pin).toStrictEqual(checkedIn); // same content...
+    expect(JSON.stringify(pin)).not.toBe(JSON.stringify(checkedIn)); // ...not the exact checked-in pin
     await initScrubEngine({ env: TRIPLE, bindgen: { pin } });
     await expectRefusing("bindgen_pin_not_exact");
   });

@@ -16,7 +16,8 @@ const manifest = {
 const bytes = enc.encode("inert test artifact, not relayscrubber");
 const digest = createHash("sha256").update(bytes).digest("hex");
 const pin = {
-  schema: 1, package: "@agentworkforce/relayscrubber", package_version: "0.0.0-test-double",
+  schema: 2, package: "@agentworkforce/relayscrubber", package_version: "0.0.0-test-double",
+  release: { source: "github-release", repository: "AgentWorkforce/relayscrubber", tag: "v0.0.0-test", tarball: "test.tgz", tarball_sha256: "e".repeat(64), sha256sums: { "artifact.json": "f".repeat(64) } },
   wasm_sha256: digest, glue_sha256: digest, loader_sha256: digest,
   paths: { wasm: "test.wasm", glue: "test.js", loader: "index.js" },
   scrub_profile: manifest.scrubProfile, manifest,

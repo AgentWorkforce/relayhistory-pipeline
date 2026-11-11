@@ -42,7 +42,7 @@ import pinFile from "../scrub-bindgen-pin.json";
 
 /** The placeholder pin checked in before the alpha.4 cutover (kept here as a refusal fixture). */
 const PLACEHOLDER_PIN = Object.freeze({
-  schema: 1,
+  schema: 2,
   package: "@agentworkforce/relayscrubber",
   package_version: "UNPINNED",
   wasm_sha256: "0".repeat(64),
@@ -91,9 +91,10 @@ type Manifest = typeof MANIFEST;
 function makePin(over: Record<string, unknown> = {}, manifestOver: Record<string, unknown> = {}) {
   const manifest = { ...MANIFEST, ...manifestOver };
   return {
-    schema: 1,
+    schema: 2,
     package: "@agentworkforce/relayscrubber",
     package_version: "0.0.0-test-double",
+    release: { source: "github-release", repository: "AgentWorkforce/relayscrubber", tag: "v0.0.0-test", tarball: "test.tgz", tarball_sha256: "e".repeat(64), sha256sums: { "artifact.json": "f".repeat(64) } },
     wasm_sha256: sha(WASM),
     glue_sha256: sha(GLUE),
     loader_sha256: sha(LOADER),
@@ -359,7 +360,8 @@ describe("wasm-bindgen: placeholder and malformed pins are refused by name", () 
   const placeholderPin = PLACEHOLDER_PIN as unknown as { manifest: Record<string, unknown> } & Record<string, unknown>;
   const cases: { name: string; pin: () => unknown; reason: ScrubEngineFailure }[] = [
     { name: "not an object", pin: () => null, reason: "bindgen_pin_invalid" },
-    { name: "another pin schema", pin: () => makePin({ schema: 2 }), reason: "bindgen_pin_invalid" },
+    { name: "pin schema 1 (no release provenance)", pin: () => makePin({ schema: 1 }), reason: "bindgen_pin_invalid" },
+    { name: "another pin schema", pin: () => makePin({ schema: 3 }), reason: "bindgen_pin_invalid" },
     { name: "another package", pin: () => makePin({ package: "other" }), reason: "bindgen_pin_invalid" },
     { name: "package_version placeholder", pin: () => makePin({ package_version: placeholderPin.package_version }), reason: "bindgen_unpinned_package_version" },
     { name: "package_version empty", pin: () => makePin({ package_version: "" }), reason: "bindgen_unpinned_package_version" },
@@ -389,6 +391,27 @@ describe("wasm-bindgen: placeholder and malformed pins are refused by name", () 
   }
   cases.push({ name: "manifest.policy unknown", pin: () => makePin({}, { policy: "everything" }), reason: "bindgen_unpinned_manifest_policy" });
 
+  const release = () => makePin().release as Record<string, unknown>;
+  const releaseCases: [string, unknown][] = [
+    ["release missing", undefined],
+    ["release not an object", "github-release"],
+    ["release an array", []],
+    ["release unknown source", { ...release(), source: "npm" }],
+    ["release extra key", { ...release(), integrity: "sha512-x" }],
+    ["release key missing (tag)", { ...release(), tag: undefined }],
+    ["release repository empty", { ...release(), repository: "" }],
+    ["release repository without owner", { ...release(), repository: "relayscrubber" }],
+    ["release tag placeholder", { ...release(), tag: "UNPINNED" }],
+    ["release tarball with a directory", { ...release(), tarball: "dist/x.tgz" }],
+    ["release tarball_sha256 not 64 hex", { ...release(), tarball_sha256: "ab".repeat(31) }],
+    ["release tarball_sha256 uppercase", { ...release(), tarball_sha256: "E".repeat(64) }],
+    ["release tarball_sha256 all zero", { ...release(), tarball_sha256: ZERO }],
+    ["release sha256sums empty", { ...release(), sha256sums: {} }],
+    ["release sha256sums digest malformed", { ...release(), sha256sums: { "artifact.json": "x" } }],
+    ["release sha256sums name with a directory", { ...release(), sha256sums: { "generated/artifact.json": "f".repeat(64) } }],
+  ];
+  for (const [name, value] of releaseCases)
+    cases.push({ name, pin: () => makePin(value === undefined ? { release: undefined } : { release: value }), reason: "bindgen_unpinned_release" });
   cases.push({ name: "unsupported ABI", pin: () => makePin({}, { abiVersion: 3 }), reason: "bindgen_unpinned_manifest_abiVersion" });
   for (const c of cases)
     it(`${c.name}: ${c.reason}, nothing read or evaluated`, async () => {
@@ -405,7 +428,8 @@ describe("wasm-bindgen: placeholder and malformed pins are refused by name", () 
     // Walk the historical placeholder towards a real pin: each step exposes the next named refusal.
     const real = makePin();
     const steps: [string, ScrubEngineFailure][] = [
-      ["package_version", "bindgen_unpinned_wasm_sha256"],
+      ["package_version", "bindgen_unpinned_release"],
+      ["release", "bindgen_unpinned_wasm_sha256"],
       ["wasm_sha256", "bindgen_unpinned_glue_sha256"],
       ["glue_sha256", "bindgen_unpinned_loader_sha256"],
       ["loader_sha256", "bindgen_unpinned_scrub_profile"],

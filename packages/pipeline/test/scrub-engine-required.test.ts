@@ -115,7 +115,7 @@ describe("SCRUB_ENGINE_REQUIRED matching SCRUB_ENGINE", () => {
   it("required=wasm-bindgen with a verified test-double pin (not the checked-in pin) is NOT ready: bindgen_pin_not_exact", async () => {
     const bytes = { wasm: enc.encode("synthetic wasm"), glue: enc.encode("synthetic glue"), loader: enc.encode("synthetic loader") };
     const manifest = { schema: 3, ruleset: "relayhistory-scrub", rulesetVersion: 10, rulesetSourceSha256: "a".repeat(64), crateVersion: "0.0.0-test", abiVersion: 2, policy: "secrets", redactionToken: "[REDACTED]", scrubProfile: "fixture-v10" };
-    const pin = { schema: 1, package: "@agentworkforce/relayscrubber", package_version: manifest.crateVersion, wasm_sha256: sha(bytes.wasm), glue_sha256: sha(bytes.glue), loader_sha256: sha(bytes.loader), paths: { wasm: "t.wasm", glue: "t.js", loader: "index.js" }, scrub_profile: bindgenProfile(manifest), manifest };
+    const pin = { schema: 2, package: "@agentworkforce/relayscrubber", package_version: manifest.crateVersion, release: { source: "github-release", repository: "AgentWorkforce/relayscrubber", tag: "v0.0.0-test", tarball: "test.tgz", tarball_sha256: "e".repeat(64), sha256sums: { "artifact.json": "f".repeat(64) } }, wasm_sha256: sha(bytes.wasm), glue_sha256: sha(bytes.glue), loader_sha256: sha(bytes.loader), paths: { wasm: "t.wasm", glue: "t.js", loader: "index.js" }, scrub_profile: bindgenProfile(manifest), manifest };
     const engine = await initScrubEngine({
       env: { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen", READER_MAX_RULESET: "10" },
       bindgen: { pin, readArtifact: async (name) => bytes[name], importGlue: async () => ({ default: async () => ({}), manifestJson: () => JSON.stringify(manifest), scrubTextChecked: (s: string) => s, scrubJson: (s: string) => JSON.stringify({ jsonText: s }), scrubRecords: () => JSON.stringify({ text: "x\n", recordCount: 1 }) }) },
@@ -180,7 +180,7 @@ describe("SCRUB_ENGINE_REQUIRED=wasm-bindgen does not bypass the bindgen refusal
   it("a pin whose artifact digest does not match the bytes: sha256 refusal, never TypeScript", async () => {
     const bytes = { wasm: enc.encode("w"), glue: enc.encode("g"), loader: enc.encode("l") };
     const manifest = { schema: 3, ruleset: "relayhistory-scrub", rulesetVersion: 8, rulesetSourceSha256: "a".repeat(64), crateVersion: "0.0.0-test", abiVersion: 2, policy: "secrets", redactionToken: "[REDACTED]", scrubProfile: "fixture-v8" };
-    const pin = { schema: 1, package: "@agentworkforce/relayscrubber", package_version: manifest.crateVersion, wasm_sha256: "b".repeat(64), glue_sha256: sha(bytes.glue), loader_sha256: sha(bytes.loader), paths: { wasm: "t.wasm", glue: "t.js", loader: "index.js" }, scrub_profile: bindgenProfile(manifest), manifest };
+    const pin = { schema: 2, package: "@agentworkforce/relayscrubber", package_version: manifest.crateVersion, release: { source: "github-release", repository: "AgentWorkforce/relayscrubber", tag: "v0.0.0-test", tarball: "test.tgz", tarball_sha256: "e".repeat(64), sha256sums: { "artifact.json": "f".repeat(64) } }, wasm_sha256: "b".repeat(64), glue_sha256: sha(bytes.glue), loader_sha256: sha(bytes.loader), paths: { wasm: "t.wasm", glue: "t.js", loader: "index.js" }, scrub_profile: bindgenProfile(manifest), manifest };
     let imported = false;
     const error = await initScrubEngine({
       env: { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen" },
