@@ -23,8 +23,8 @@
 export const ANALYTICS_ENVELOPE_VERSION = 1;
 
 /** Producer components (proposed wire ids; registration pending owner review in the producer registry). */
-export type AnalyticsComponent = "session-ingest" | "session-read-api" | "session-pipeline-consumer";
-export const ANALYTICS_COMPONENTS: readonly AnalyticsComponent[] = ["session-ingest", "session-read-api", "session-pipeline-consumer"];
+export type AnalyticsComponent = "session-ingest" | "session-read-api" | "session-pipeline-consumer" | "session-brief";
+export const ANALYTICS_COMPONENTS: readonly AnalyticsComponent[] = ["session-ingest", "session-read-api", "session-pipeline-consumer", "session-brief"];
 
 /** Closed latency buckets: a duration is never exported as a raw number. */
 export type LatencyBucket = "lt_100ms" | "lt_250ms" | "lt_500ms" | "lt_1s" | "lt_2500ms" | "lt_5s" | "lt_30s" | "ge_30s";
@@ -97,7 +97,7 @@ export function readOutcome(status: number): ReadOutcome {
  * The typed domain events. `traceId` is the request's correlation id; `orgId` and
  * `workspaceId` are the VERIFIED identity's (never a request field). Workspace events
  * use the "workspace in a tenant model" scope: both ids are required, or the event is
- * not exported. The index tick is installation-only: it carries neither.
+ * not exported. Worker ticks are installation-only and carry neither.
  */
 export type AnalyticsEvent =
   | {
@@ -128,6 +128,17 @@ export type AnalyticsEvent =
       tombstoned: number;
       complete: boolean;
       durationMs: number;
+    }
+  | {
+      kind: "session_brief.tick_completed";
+      claimed: number;
+      generated: number;
+      reused: number;
+      rateLimited: number;
+      throttled: number;
+      retrying: number;
+      failed: number;
+      durationMs: number;
     };
 
 export type AnalyticsEventKind = AnalyticsEvent["kind"];
@@ -137,6 +148,7 @@ export const EVENT_SCOPE: Readonly<Record<AnalyticsEventKind, "workspace" | "ins
   "session_ingest.batch_completed": "workspace",
   "session_read.request_completed": "workspace",
   "session_pipeline.index_tick_completed": "installation",
+  "session_brief.tick_completed": "installation",
 };
 
 /** Which component may emit which kind; a sink bound to one component refuses the others. */
@@ -144,6 +156,7 @@ export const EVENT_COMPONENT: Readonly<Record<AnalyticsEventKind, AnalyticsCompo
   "session_ingest.batch_completed": "session-ingest",
   "session_read.request_completed": "session-read-api",
   "session_pipeline.index_tick_completed": "session-pipeline-consumer",
+  "session_brief.tick_completed": "session-brief",
 };
 
 /** Property values: closed strings, clamped integers, booleans. */
@@ -265,6 +278,17 @@ function projectProperties(event: AnalyticsEvent, kind: AnalyticsEventKind): Rec
         stale: count(e.stale),
         tombstoned: count(e.tombstoned),
         complete: e.complete === true,
+        latency_bucket: latencyBucket(e.durationMs),
+      };
+    case "session_brief.tick_completed":
+      return {
+        claimed: count(e.claimed),
+        generated: count(e.generated),
+        reused: count(e.reused),
+        rate_limited: count(e.rateLimited),
+        throttled: count(e.throttled),
+        retrying: count(e.retrying),
+        failed: count(e.failed),
         latency_bucket: latencyBucket(e.durationMs),
       };
   }

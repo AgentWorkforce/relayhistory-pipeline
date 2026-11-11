@@ -6,12 +6,20 @@
 import { lockerManifestReader, lockerStore } from "../shared/locker.ts";
 import { runWorker } from "../shared/worker.ts";
 import { log } from "../shared/log.ts";
+import { analyticsConfig, analyticsCounterFields, createAnalyticsSink } from "../shared/analytics-config.ts";
 import { briefConfig, modelFetch, modelKey, modelResponsesUrl } from "./config.ts";
 import { createAnalysisTransport } from "./engine/transport.ts";
 import { briefTick } from "./worker.ts";
 import { canonicalBriefInputFromEnv } from "./canonical-input.ts";
+import { briefCollectorFetch } from "./analytics-transport.ts";
 
 const config = briefConfig();
+const analyticsSettings = analyticsConfig(process.env, "selfhost");
+const fetchCollector = briefCollectorFetch(analyticsSettings);
+const analytics = createAnalyticsSink(analyticsSettings, "session-brief", "service", {
+  ...(fetchCollector ? { fetch: fetchCollector } : {}),
+  report: (counters) => log.warn("analytics export degraded", analyticsCounterFields(analytics.destination, counters)),
+});
 const canonicalInput = canonicalBriefInputFromEnv();
 const key = modelKey();
 // OPENAI_BASE_URL is validated even with no key, so a bad value fails at startup.
@@ -30,7 +38,7 @@ const tick = briefTick({
   transport,
   config,
   ...(canonicalInput ? { canonicalInput } : {}),
-});
+}, analytics);
 await runWorker({
   service: "session-brief",
   stages: [],
@@ -38,4 +46,5 @@ await runWorker({
   tick: async (db, now) => {
     await tick(db, now);
   },
+  onShutdown: () => analytics.shutdown(),
 });

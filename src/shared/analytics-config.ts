@@ -9,7 +9,7 @@
  *   ANALYTICS_DEPLOYMENT_ID   collector/posthog: the opaque installation identity on every envelope
  *                             (required; [A-Za-z0-9][A-Za-z0-9._:-]{0,127}; never derived or defaulted).
  *
- * Self-host (the Node services: session-ingest, session-read-api, session-pipeline-consumer) accepts
+ * Self-host (session-ingest, session-read-api, session-pipeline-consumer and session-brief) accepts
  * noop or collector only:
  *   ANALYTICS_COLLECTOR_URL   the collector's full POST URL, path included and ending in /v1/events (the
  *                             adapter never appends it): https, loopback http, or an in-cluster Service

@@ -5,6 +5,7 @@
  */
 import { afterEach, describe, expect, setDefaultTimeout, spyOn, test } from "bun:test";
 import type { PGlite } from "@electric-sql/pglite";
+import type { AnalyticsEvent, AnalyticsPort } from "../../shared/analytics.ts";
 import type { ManifestV1, ObjectStore } from "../../shared/vendor.ts";
 import { hoopDbSessionIndex } from "../../hoopdb/index.ts";
 import { projectSessionDirectory } from "../../hoopdb/session-directory-projector.ts";
@@ -65,7 +66,7 @@ interface Setup {
   upload: (lines: unknown[], opts?: { revision?: number; machine?: string; scrubbed?: boolean }) => Promise<void>;
 }
 
-async function setup(opts: { transport?: boolean } = {}): Promise<Setup> {
+async function setup(opts: { transport?: boolean; analytics?: AnalyticsPort } = {}): Promise<Setup> {
   const pg = await database();
   open.push(pg);
   const store = tempStore();
@@ -85,7 +86,7 @@ async function setup(opts: { transport?: boolean } = {}): Promise<Setup> {
       store,
       transport: opts.transport === false ? null : model,
       config: testConfig(overrides),
-    })(hoopDb(pg), new Date());
+    }, opts.analytics)(hoopDb(pg), new Date());
   return { pg, store, manifests, model, tick, upload };
 }
 
@@ -437,7 +438,11 @@ describe("limits and failures", () => {
   });
 
   test("the global daily cap counts every org's attempts and refuses until the next UTC day", async () => {
-    const s = await setup();
+    const events: AnalyticsEvent[] = [];
+    const s = await setup({ analytics: { capture(event) {
+      events.push(event);
+      throw new Error("analytics unavailable");
+    } } });
     await s.pg.query(
       `INSERT INTO sessions.session_brief_attempts (org_id, workspace_id, harness, session_id, day, attempts)
        VALUES ('org-elsewhere', 'ws-z', 'codex', 'z-1', (now() AT TIME ZONE 'UTC')::date, 3)`,
@@ -445,12 +450,22 @@ describe("limits and failures", () => {
     await s.upload([user("fix the build")]);
     await dueNow(s.pg);
     expect(await s.tick({ globalDailyCap: 3 })).toEqual({ rate_limited: 1 });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      kind: "session_brief.tick_completed", claimed: 1, rateLimited: 1, generated: 0,
+    });
     expect(s.model.requests).toHaveLength(0);
     expect(await brief(s.pg)).toMatchObject({ status: "rate_limited", error: "session_brief_global_capped" });
     // Under the ceiling, the same session is briefed.
     await dueNow(s.pg);
     expect(await s.tick({ globalDailyCap: 4, throttleSeconds: 0 })).not.toHaveProperty("rate_limited");
     expect(s.model.requests).toHaveLength(1);
+    expect(events).toHaveLength(2);
+    expect(events[1]).toMatchObject({
+      kind: "session_brief.tick_completed", claimed: 1, rateLimited: 0, generated: 1,
+    });
+    expect(await s.tick()).toEqual({});
+    expect(events).toHaveLength(2);
   });
 
   test("the env default is a 20,000-attempt global ceiling, and 0 refuses every call", () => {
