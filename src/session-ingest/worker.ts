@@ -511,8 +511,8 @@ const loadWorkerScrubWasm: LoadScrubWasmArtifact = async () => {
 
 /**
  * The Worker's wasm-bindgen artifact reader. Cloudflare Workers are excluded from the
- * relayscrubber 0.5.0-alpha.6 cutover (docs/scrub-engine.md, "Cutover: pinned
- * relayscrubber 0.5.0-alpha.6"): no package is bundled and `createCompiledBindgenEngine`
+ * relayscrubber 0.5.0-alpha.8 cutover (docs/scrub-engine.md, "Cutover: pinned
+ * relayscrubber 0.5.0-alpha.8"): no package is bundled and `createCompiledBindgenEngine`
  * stays unwired, so SCRUB_ENGINE=wasm-bindgen refuses here explicitly instead of
  * depending on what the runtime's filesystem happens to hold.
  */
