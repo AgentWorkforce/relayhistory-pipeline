@@ -207,6 +207,15 @@ the original sketch below in four ways:
   session-ingest upload path only; another user's copy is untouched, an origin
   first used after the erase is not fenced, and a session not yet indexed has
   no pointer to tombstone.
+- Capture policy (relay-control `docs/capture-policy.md`): relaycontrol
+  introspection (v1.5) answers the organization's capture policy and the
+  caller's live role with every verified bearer; the edge keeps no copy
+  (`src/session-ingest/capture-policy.ts`). With `user_retroactive_delete:
+  false`, a member's own delete (selection `enabled:false`; reset, where served)
+  is refused 403 `policy_forbids_user_delete` before any fence is written.
+  Organization owners and admins still delete, and the operator session erase
+  below is unaffected. A relaycontrol that predates v1.5 sends no policy, and
+  deletes stay as before.
 - Operator session erase: `/internal/v1/session-erase/...`
   (`docs/operator-session-erase-contract.md`) is reachable only from inside the
   cluster, for relay-control. The wrapper forwards GET and POST (other methods: 405) to the app without
