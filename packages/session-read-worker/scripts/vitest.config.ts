@@ -3,6 +3,6 @@ import { defineConfig } from "vitest/config";
 export default defineConfig({
   test: {
     environment: "node",
-    include: ["scripts/check-hyperdrive-config.test.ts", "scripts/render-deploy-config.test.ts"],
+    include: ["scripts/check-hyperdrive-config.test.ts", "scripts/render-deploy-config.test.ts", "scripts/resolve-deploy-profile.test.ts"],
   },
 });

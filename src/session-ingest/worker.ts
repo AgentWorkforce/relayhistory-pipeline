@@ -49,6 +49,9 @@
  *                              there); the runtime default stays off on purpose, so a Worker version or
  *                              self-host deployment without the var never starts admitting asynchronously
  *                              (no flip on a gradual version split, no queue it was not given).
+ *   HISTORY_UPLOAD_DIRECT      unset/off (default) | allowlist | on (upload-admission.ts): serves only
+ *                              GET /v1/delivery/admission?uploadKey=; allowlist reads
+ *                              HISTORY_UPLOAD_DIRECT_ALLOWLIST (org:<id> / ws:<id>). An invalid value is off (logged)
  *   INGEST_SYNC_ADMISSION_FROZEN_RECEIPT  unset/off (default) | on: under frozen-supabase custody, a queued-v1
  *                              caller on the synchronous path reads the frozen legacy receipt before any claim
  *                              (app.ts acceptBatch, as the admission consumer does)
@@ -81,6 +84,7 @@ import { fanout, type FanoutMessage } from "./staging.ts";
 import type { StageLatencyFields } from "./deliver.ts";
 import type { WriteTarget } from "./writer.ts";
 import { routingFlag } from "./babysitter-retention.ts";
+import { UPLOAD_DIRECT_ALLOWLIST_VAR, UPLOAD_DIRECT_FLAG, UPLOAD_DIRECT_OFF, uploadDirectConfig, type UploadDirectConfig } from "./upload-admission.ts";
 import { asyncAdmissionMode, syncAdmissionFrozenReceiptMode, type AdmissionMessage, type AsyncAdmissionMode } from "./async-admission.ts";
 import { admitMessage, type AdmissionAction } from "./admission-consumer.ts";
 import { lockAlertFields } from "./app.ts";
@@ -106,6 +110,10 @@ export interface IngestWorkerEnv {
   INGEST_ASYNC_ADMISSION?: string;
   /** off (default) | on (async-admission.ts syncAdmissionFrozenReceiptMode). */
   INGEST_SYNC_ADMISSION_FROZEN_RECEIPT?: string;
+  /** off (default) | allowlist | on (upload-admission.ts): the ?uploadKey= admission status only. */
+  HISTORY_UPLOAD_DIRECT?: string;
+  /** HISTORY_UPLOAD_DIRECT=allowlist: comma-separated org:<id> / ws:<id>. */
+  HISTORY_UPLOAD_DIRECT_ALLOWLIST?: string;
   NEON_REPLICA?: QueueLike<NeonReplicaMessage>;
   /** Secrets Store bindings (a plain string in tests). */
   S3_ACCESS_KEY_ID?: SecretBinding | string;
@@ -220,6 +228,8 @@ export interface IngestSettings {
   asyncAdmission?: Exclude<AsyncAdmissionMode, "off">;
   /** INGEST_SYNC_ADMISSION_FROZEN_RECEIPT=on. Absent (the default): off. */
   syncAdmissionFrozenReceipt?: true;
+  /** HISTORY_UPLOAD_DIRECT allowlist|on. Absent (the default, or an invalid value, logged): off. */
+  uploadDirect?: UploadDirectConfig;
   /** SESSION_ERASE_API_ENABLED=1 (session-erase.ts). Absent (the default): the route answers 501. */
   sessionErase?: SessionEraseConfig;
 }
@@ -272,6 +282,14 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     log.error("session ingest settings invalid", { error_code: "session_erase_config_invalid" });
     sessionErase = SESSION_ERASE_CONFIG_INVALID;
   }
+  // HISTORY_UPLOAD_DIRECT (default off): only the ?uploadKey= status read; promotion is the upload-admission
+  // Lambda's. Isolated like the erase config: an invalid value is off (logged by code), never a delivery failure.
+  let uploadDirect: UploadDirectConfig = UPLOAD_DIRECT_OFF;
+  try {
+    uploadDirect = uploadDirectConfig({ [UPLOAD_DIRECT_FLAG]: env.HISTORY_UPLOAD_DIRECT, [UPLOAD_DIRECT_ALLOWLIST_VAR]: env.HISTORY_UPLOAD_DIRECT_ALLOWLIST });
+  } catch {
+    log.error("session ingest settings invalid", { error_code: "history_upload_direct_invalid" });
+  }
   return {
     bucket,
     region: env.INGEST_S3_REGION ?? "us-east-1",
@@ -298,6 +316,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(asyncMode !== "off" ? { asyncAdmission: asyncMode } : {}),
     ...(syncFrozenReceipt === "on" ? { syncAdmissionFrozenReceipt: true as const } : {}),
     ...(sessionErase ? { sessionErase } : {}),
+    ...(uploadDirect.mode !== "off" ? { uploadDirect } : {}),
   };
 }
 
@@ -427,6 +446,7 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: R
       : {}),
     ...(settings.syncAdmissionFrozenReceipt ? { syncAdmissionFrozenReceipt: "on" as const } : {}),
     ...(settings.sessionErase ? { sessionErase: settings.sessionErase } : {}),
+    ...(settings.uploadDirect ? { uploadDirect: settings.uploadDirect } : {}),
   });
 }
 

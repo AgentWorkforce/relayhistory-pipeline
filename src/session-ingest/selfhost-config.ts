@@ -59,6 +59,19 @@
  *   SELFHOST_ADMISSION_SCAN_MS       the inbox ListBucket scan interval, 1000..600000, default 15000
  *   SELFHOST_ADMISSION_MAX_ATTEMPTS  attempts before an inbox object is dead-lettered, 1..100, default 20
  *
+ *   HISTORY_UPLOAD_DIRECT            unset | "" | "off" (default) | "allowlist" | "on" (upload-admission.ts,
+ *                                    relay-upload-inbox-v1): the in-process scan of <keyRoot>/.upload-inbox/
+ *                                    promotes desktop-written objects into the admission inbox, and
+ *                                    GET /v1/delivery/admission?uploadKey= answers. Needs async or drain
+ *                                    admission and an INGEST_KEY_ROOT of the contract's form ([a-z0-9][a-z0-9-]{0,62})
+ *   With allowlist only:
+ *   HISTORY_UPLOAD_DIRECT_ALLOWLIST  comma-separated org:<orgId> / ws:<workspaceId>, at least one
+ *   With allowlist or on only:
+ *   UPLOAD_WITNESS_KEY               the witness MAC key (32 bytes, unpadded base64url; Secret-injected). Never
+ *                                    defaulted; missing or malformed leaves every upload pending (retried), never refused
+ *   SELFHOST_UPLOAD_SCAN_BATCH       upload objects promoted per scan, 1..100, default 16 (the scan reuses
+ *                                    SELFHOST_ADMISSION_SCAN_MS)
+ *
  *   ANALYTICS_SINK                   unset | "" | "noop" (default: no analytics) | "collector"; "posthog" and any
  *                                    ANALYTICS_POSTHOG_* value refuse startup (src/shared/analytics-config.ts).
  *                                    collector needs ANALYTICS_DEPLOYMENT_ID, ANALYTICS_COLLECTOR_URL (the full
@@ -78,6 +91,7 @@ import { sessionEraseConfig, type SessionEraseConfig } from "./session-erase.ts"
 import { analyticsConfig, type AnalyticsConfig } from "../shared/analytics-config.ts";
 // Already in the self-host graph through deliver.ts; the same parser as the Worker's INGEST_CLAIM_LOCK_BUSY.
 import { routingFlag } from "./babysitter-retention.ts";
+import { UPLOAD_DIRECT_FLAG, UPLOAD_WITNESS_KEY_VAR, uploadDirectConfig, type UploadDirectConfig } from "./upload-admission.ts";
 
 export const SELFHOST_INGEST_FLAG = "RELAYHISTORY_SELFHOST_INGEST";
 export const SELFHOST_INGEST_PORT_VAR = "RELAYHISTORY_INGEST_PORT";
@@ -125,10 +139,28 @@ export interface SelfhostIngestSettings {
   sessionErase: SessionEraseConfig;
   /** Present only for SELFHOST_INGEST_ADMISSION=async|drain. */
   admission?: SelfhostAdmissionSettings;
+  /** HISTORY_UPLOAD_DIRECT allowlist|on (upload-admission.ts). Absent: off, nothing reads the upload prefix. */
+  uploadDirect?: SelfhostUploadDirectSettings;
   /** ANALYTICS_* (src/shared/analytics-config.ts, self-host profile: noop or collector). Absent = noop. */
   analytics?: AnalyticsConfig;
   /** INGEST_CLAIM_LOCK_BUSY=on: a claim lock-wait failure is a 429 with Retry-After. Absent (the default): 503. */
   claimLockBusy?: true;
+}
+
+/** HISTORY_UPLOAD_DIRECT=allowlist|on. `witnessKey` is passed through raw: promoteUpload treats missing or malformed as retry. */
+export interface SelfhostUploadDirectSettings {
+  config: UploadDirectConfig;
+  witnessKey: string | undefined;
+  scanBatch: number;
+}
+
+/** HISTORY_UPLOAD_DIRECT: absent when off. On needs async/drain admission and a contract-form key root. */
+export function selfhostUploadDirectSettings(env: NodeJS.ProcessEnv, keyRoot: string, admission: SelfhostAdmissionSettings | undefined): SelfhostUploadDirectSettings | undefined {
+  const config = uploadDirectConfig(env);
+  if (config.mode === "off") return undefined;
+  if (!admission) throw new Error(`96bulls: ${UPLOAD_DIRECT_FLAG} needs ${SELFHOST_INGEST_ADMISSION_VAR}=async or drain`);
+  if (!/^[a-z0-9][a-z0-9-]{0,62}$/u.test(keyRoot)) throw new Error(`96bulls: ${UPLOAD_DIRECT_FLAG} needs INGEST_KEY_ROOT of the form [a-z0-9][a-z0-9-]{0,62}`);
+  return { config, witnessKey: env[UPLOAD_WITNESS_KEY_VAR], scanBatch: bounded(env, "SELFHOST_UPLOAD_SCAN_BATCH", 16, 1, 100) };
 }
 
 export type SelfhostIngestConfig = { enabled: false; port: number } | ({ enabled: true } & SelfhostIngestSettings);
@@ -265,6 +297,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   const keyRoot = env.INGEST_KEY_ROOT?.trim() || "96bulls";
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u.test(keyRoot)) throw new Error("96bulls: INGEST_KEY_ROOT must be a single key segment");
   const admission = selfhostAdmissionSettings(env);
+  const uploadDirect = selfhostUploadDirectSettings(env, keyRoot, admission);
   const analytics = analyticsConfig(env, "selfhost");
   const claimLockBusy = routingFlag(env[SELFHOST_CLAIM_LOCK_BUSY_VAR]);
   return {
@@ -282,6 +315,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     introspectPositiveTtlMs,
     sessionErase,
     ...(admission ? { admission } : {}),
+    ...(uploadDirect ? { uploadDirect } : {}),
     ...(analytics.sink !== "noop" ? { analytics } : {}),
     ...(claimLockBusy ? { claimLockBusy: true as const } : {}),
   };
