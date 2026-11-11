@@ -2,7 +2,7 @@
  * SCRUB_ENGINE_REQUIRED (default off): refuses a selection whose SCRUB_ENGINE kind
  * differs from the required one, permanently for the process, and never falls back to
  * TypeScript. It never selects or initialises anything itself, so a wasm-bindgen
- * requirement with the checked-in alpha.4 pin at the default reader ceiling still refuses
+ * requirement with the checked-in alpha.5 pin at the default reader ceiling still refuses
  * through the bindgen refusals, and under it only the exact checked-in pin is ready.
  * Module state (`selected`, the sticky refusal) is reset per case by resetScrubEngineForTests,
  * as in scrub-engine-bindgen.test.ts; process.env is saved and restored around each case.
@@ -167,7 +167,7 @@ describe("SCRUB_ENGINE_REQUIRED refuses another selection", () => {
 });
 
 describe("SCRUB_ENGINE_REQUIRED=wasm-bindgen does not bypass the bindgen refusals", () => {
-  it("checked-in alpha.4 pin without READER_MAX_RULESET=10: the reader-ceiling refusal stands, never TypeScript", async () => {
+  it("checked-in alpha.5 pin without READER_MAX_RULESET=10: the reader-ceiling refusal stands, never TypeScript", async () => {
     const env = { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen" };
     const error = await initScrubEngine({ env }).then(() => null, (e: unknown) => e);
     expect(error).toBeInstanceOf(ScrubEngineUnavailable);
