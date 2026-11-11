@@ -24,7 +24,7 @@ import type { SESSION_BOOTSTRAP_FILES } from "./session-bootstrap-chain.ts";
  * inbound:  "none"        PG16+: only the Supabase creator edge (member postgres,
  *                         grantor superuser supabase_admin, ADMIN, no INHERIT, no SET)
  *                         and only in supabase db mode; before PG16 no member at all
- *                         (bulls96_read_api's block in session_read_api_roles.sql);
+ *                         (each of the three blocks in session_read_api_roles.sql);
  *           "worker"      "none" plus an authenticator member that is NOINHERIT, without
  *                         ADMIN and (PG16+) without INHERIT (session_directory_search_worker.sql);
  *           "verifier"    "none" plus an authenticator member without ADMIN; PG16+ no
@@ -87,10 +87,13 @@ export const SESSION_BOOTSTRAP_ROLES: {
   "supabase/bootstrap/session_read_api_roles.sql": {
     // Production already has it LOGIN (session_read_api_role.sql); no member.
     bulls96_read_api: bare("allowed", "none"),
-    // Lane F1 (20261105046000); its block checks flags and member-of only.
-    bulls96_analysis_admit: bare("allowed", "unchecked"),
-    // Lane F4 (20261105045000); its block checks flags and member-of only.
-    bulls96_digest_narrative: bare("allowed", "unchecked"),
+    // Lane F1 (20261105046000). Since #546 its DO block (session_read_api_roles.sql:130-146)
+    // applies bulls96_read_api's strict inbound predicate (:71-87): PG16+ only the
+    // Supabase creator edge, in supabase db mode; before PG16 no member at all.
+    bulls96_analysis_admit: bare("allowed", "none"),
+    // Lane F4 (20261105045000). Its DO block (session_read_api_roles.sql:188-204) applies
+    // the same strict inbound predicate since #546.
+    bulls96_digest_narrative: bare("allowed", "none"),
   },
   "supabase/bootstrap/session_consumer_roles.sql": {
     search_consumer_runtime: {

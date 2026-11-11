@@ -692,7 +692,7 @@ test("contract (d): an extra or missing role in the release map or the anchor re
     bootstrapTargetChain({ target: T047, targetSha: TSHA, steps: STEPS, files: files(), contract, map: map as typeof SESSION_BOOTSTRAP_ROLES });
   expect(code(pre(extra))).toBe("release_bootstrap_contract_drift");
   // Anchor map or manifest missing a required role (same SQL).
-  const narrative = '    bulls96_digest_narrative: bare("allowed", "unchecked"),\n';
+  const narrative = '    bulls96_digest_narrative: bare("allowed", "none"),\n';
   expect(code(() => bootstrapContractSource(anchorContract(rolesText([narrative, ""]))))).toBe("release_bootstrap_contract_drift");
   expect(
     code(() => bootstrapContractSource(anchorContract(ROLES_MODULE_TEXT, consumersText(SESSION_BOOTSTRAP_CONSUMERS.filter(([r]) => r !== admit))))),
@@ -751,4 +751,39 @@ test("contract (e): a contract swapped under the lock refuses before BEGIN with 
   expect(ok.evidence[0]).toMatchObject({ contract_source: "anchor", contract_digest: anchorPlan.contract_digest });
   expect(JSON.stringify(ok.evidence)).not.toContain("worker-2s");
   expect(JSON.stringify(ok.evidence)).not.toContain("claimed-60s");
+});
+
+// P1 (#547 head 6234cd65): the admission roles bind bulls96_read_api's strict inbound
+// predicate (session_read_api_roles.sql since #546). An unexpected inbound member on a
+// present admission role refuses the plan, and refuses the stage under the lock inside
+// the transaction before any chain SQL, with nothing committed and no evidence written.
+test("admission roles: an unexpected inbound member refuses plan and stage with zero mutation; the creator edge is exact", async () => {
+  const narrative = "bulls96_digest_narrative";
+  for (const [name, other] of [[admit, narrative], [narrative, admit]] as const) {
+    const bad: BootstrapEdge = { ...creatorEdge(name), member: "authenticator", admin_option: false, set_option: true };
+    // Plan: refused (the planner reads the catalog read-only; nothing is sent to change it).
+    expect(code(() => plan(files(), state([], { edges: [bad] })))).toBe("release_bootstrap_role_drift");
+    expect(code(() => plan(files(), state([other], { edges: [creatorEdge(other), bad] })))).toBe("release_bootstrap_role_drift");
+    // Stage: the plan saw `other` absent and `name` exact; the member appeared before the lock.
+    const planned = plan(files(), state([other]));
+    expect(planned.will_create).toEqual([other]);
+    const r = await run({ before: state([other], { edges: [bad] }) }, { planned });
+    expect(r.code).toBe("release_bootstrap_role_drift");
+    expect(control(r.log)).toEqual(refused);
+    expectNoMutation(r);
+    expect(r.log.some((q) => /\b(CREATE|GRANT|ALTER)\b/i.test(q))).toBe(false);
+
+    // Positive: PG16 Supabase creator edge on `name` is exact; only `other` is created.
+    const exact = state([other], { edges: [creatorEdge(name)] });
+    const p = plan(files(), exact);
+    expect(p.roles.find((x) => x.name === name)).toMatchObject({ present: true, exact: true, will_create: false });
+    expect(p.will_create).toEqual([other]);
+    const ok = await run(
+      { before: exact, after: state([], { edges: [creatorEdge(name), creatorEdge(other)] }) },
+      { planned: p },
+    );
+    expect(ok.code).toBeUndefined();
+    expect(ok.result).toBe("verified");
+    expect(ok.evidence[0]).toMatchObject({ ran: [readApiFile], created: [other] });
+  }
 });

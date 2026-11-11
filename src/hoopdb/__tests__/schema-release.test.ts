@@ -1539,7 +1539,8 @@ test("bootstrap exactness: inbound, outbound and flags follow the bulls96_read_a
   expect(roleContractProblems("bulls96_read_api", readApi, creator, false)).toEqual(["member postgres"]);
   expect(bsSection({ files: bsFiles(), state: creator, supabaseMode: true }).required).toBe(false);
   expect(drift(creator, false)).toBe("release_bootstrap_role_drift");
-  // Outbound membership refuses for every chain role, even an inbound-unchecked one.
+  // Outbound membership refuses for every chain role, even an inbound-unchecked one
+  // (bulls96_session_ingest).
   for (const name of ["bulls96_read_api", admit, "bulls96_session_ingest"])
     expect(drift(bsState([], { edges: [{ ...creatorEdge("pg_read_all_data"), member: name }] }))).toBe(
       "release_bootstrap_role_drift",
@@ -1583,6 +1584,46 @@ test("bootstrap exactness: inbound, outbound and flags follow the bulls96_read_a
   sixty.settings = [...sixty.settings, { role: consumer, global: true, kind: "statement_timeout=60s" }];
   expect(roleContractProblems(consumer, cc, login(sixty), true)).toEqual([]);
   expect(roleContractProblems(consumer, cc, sixty, true)).toEqual(["settings"]);
+});
+
+// P1 (#547 head 6234cd65): since #546 the bulls96_analysis_admit and bulls96_digest_narrative
+// blocks of session_read_api_roles.sql apply bulls96_read_api's strict inbound predicate, so
+// a present admission role carrying any member but the exact Supabase PG16+ creator edge is
+// drift. With the old "unchecked" contract the plan marked it exact and apply would grant
+// privileged functions to an assumable role.
+test("bootstrap exactness: the admission roles bind bulls96_read_api's strict inbound predicate", () => {
+  const narrative = "bulls96_digest_narrative";
+  for (const name of [admit, narrative]) {
+    const contract = SESSION_BOOTSTRAP_ROLES[readApiFile][name];
+    expect(contract).toEqual({ login: "allowed", inbound: "none", settings: "unchecked" });
+    // Positive: the single permitted PG16+ Supabase creator edge is exact, nothing to create.
+    const creator = bsState([], { edges: [creatorEdge(name)] });
+    expect(roleContractProblems(name, contract, creator, true)).toEqual([]);
+    const ok = bsSection({ state: creator, log: quiet });
+    expect(ok.roles.find((r) => r.name === name)).toMatchObject({ required: true, present: true, exact: true, will_create: false });
+    expect(ok.required).toBe(false);
+    expect(ok.will_create).toEqual([]);
+    // Negatives: any other inbound member refuses the plan, naming only the role on stderr.
+    const unexpected: BootstrapState[] = [
+      bsState([], { edges: [creatorEdge(name, { member: "authenticator", admin_option: false, set_option: true })] }),
+      bsState([], { edges: [creatorEdge(name, { member: "authenticator", member_inherit: false, admin_option: false })] }),
+      bsState([], { edges: [creatorEdge(name), creatorEdge(name, { member: "anon", admin_option: false, set_option: true })] }),
+      bsState([], { edges: [creatorEdge(name, { grantor: "postgres", grantor_super: false })] }),
+      bsState([], { edges: [creatorEdge(name, { set_option: true })] }),
+      bsState([], { edges: [creatorEdge(name, { inherit_option: true })] }),
+      // PG15: no inherit/set columns to prove a creator edge, so any member refuses.
+      bsState([], { serverVersionNum: 150008, edges: [creatorEdge(name, { inherit_option: null, set_option: null })] }),
+    ];
+    for (const state of unexpected) {
+      expect(roleContractProblems(name, contract, state, true).length).toBeGreaterThan(0);
+      const lines: string[] = [];
+      expect(bsCode(() => bsSection({ state, log: (l) => lines.push(l) }))).toBe("release_bootstrap_role_drift");
+      expect(lines).toEqual([`release_bootstrap_role_drift ${name}`]);
+    }
+    // The creator edge itself is accepted only in supabase db mode.
+    expect(roleContractProblems(name, contract, creator, false)).toEqual(["member postgres"]);
+    expect(bsCode(() => bsSection({ state: creator, supabaseMode: false, log: quiet }))).toBe("release_bootstrap_role_drift");
+  }
 });
 
 test("bootstrap plan_changed: files, chain_digest, required or will_create drift refuses", () => {
