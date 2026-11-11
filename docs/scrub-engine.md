@@ -34,6 +34,28 @@ Tests: `packages/pipeline/test/scrub-engine-parity.test.ts`, `packages/pipeline/
 The selection is made once. A second, conflicting selection in the same process throws.
 `""` is treated as unset because Compose and Helm emit it for an unset variable.
 
+### Required engine (`SCRUB_ENGINE_REQUIRED`, default off)
+
+`SCRUB_ENGINE_REQUIRED` is an operator assertion about `SCRUB_ENGINE`. It never selects an
+engine and never changes the default.
+
+| `SCRUB_ENGINE_REQUIRED` | Effect |
+|---|---|
+| unset or `""` | No check. Behaviour is byte-identical to main, including lazy TS selection. |
+| `ts`, `wasm` or `wasm-bindgen` | The resolved `SCRUB_ENGINE` kind (and any selection already made in the process) must equal it. |
+| anything else | `ScrubEngineConfigError` at selection; this does not latch. |
+
+A mismatch throws `ScrubEngineConfigError` with `reason: "engine_selection_required"`, sets
+`lastFailure` to `engine_selection_required` and **latches**: every later
+`selectScrubEngine` / `initScrubEngine` / `activeScrubEngine` call in that process refuses the
+same way, so `scrubText`, `scrubRecords`, `activeScrubMarker` and sealing refuse,
+`scrubEngineReady()` is false (ingest `/readyz` stays not-ready), `scrubTextForLog` returns
+`[scrub-unavailable]` and `isSafeIdentifier` is false. Nothing falls back to TypeScript. A
+matching requirement adds nothing: with `wasm-bindgen` the existing pin and artifact refusals
+(for example `bindgen_unpinned_package_version` with today's placeholder pin, or
+`bindgen_sha256_mismatch_wasm`) still apply unchanged, before any glue import. Only
+`resetScrubEngineForTests()` clears the latch. Deploy bindings for this variable are not added.
+
 Every self-host `SERVICE=` entry point calls `await initScrubEngine()` before it serves or
 runs its job (`src/shared/worker.ts` `runWorker` covers the indexer, referee, bob-costas and
 session-brief). With `wasm` this verifies the pin and the module. On failure the process exits
@@ -447,6 +469,41 @@ Canonical record/transcript readers, export readers, the indexing consumer, brie
 Node services validate the setting at startup and thread it into canonical reads. Alleyoop also forwards it through its real app bindings. Canonical and timing Worker routes validate their own bindings rather than consulting a Node process environment. Offline seed readers receive an explicit optional policy in their dependencies. An unset policy does not add a marker check to any of these paths. The wasm-bindgen pin parser retains a separate default writer ceiling of 8 and refuses a writer above its explicitly configured ceiling before reading artifacts or initializing glue. Compiled-module callers must pass their verified reader ceiling explicitly when it exceeds the default. The raw ABI path remains unpinned and outside this first cutover.
 
 Operationally, deploy and verify every relevant reader with ceiling 10 **while the Rust engine remains off**, then qualify and enable the matching writer. Before enabling a v10 writer/pin, explicitly set the ceiling on every Node process that initializes the scrub engine, including one-shot consumer/output-facts bootstrap, migration and eraser Jobs; a missing Job setting must continue to refuse the v10 pin. Configuration in one process does not prove that a remote fleet has been upgraded. Keep the reader ceiling at 10 on rollback while version-10 objects remain stored; reverting a writer does not downgrade existing objects. Existing artifact-page formats do not change. This source change does not satisfy the remaining package safety, provenance, error-tagging, Worker build-binding or persistence-routing gates.
+
+
+### Reader-first rollout: entrypoints honouring READER_MAX_RULESET
+
+Audit of every Node/Bun reader of a committed manifest's `raw.scrub` marker or of committed raw
+chunk bodies (2026-11-11). Each passes `readerMaxRuleset(env)` / `readerMaxRuleset(process.env)`
+(or a value derived from it); unset yields `undefined`, which keeps legacy reads on every row.
+"Byte-only" paths copy, delete, rehash or HEAD objects without interpreting scrubbed content and
+need no ceiling. Writer reuse is governed by the sealer policy; `READER_MAX_RULESET` never grants
+writer permission. Cloudflare Worker routes validate their own bindings and are out of scope here.
+
+| Entrypoint / reader (file:line) | Reader path | Before | After |
+|---|---|---|---|
+| `src/session-read-api/service-canonical.ts:160,190` | canonical transcript / records (`canonical-transcript.ts:43,75`, `canonical.ts:255`) | wired | unchanged |
+| `src/session-read-api/server.ts:197` | self-host read server startup validation | wired | unchanged |
+| `src/session-brief/config.ts:88` (`worker.ts:139`, Lambda `briefConfig()`) | brief input via `readRelayhistoryExport` | wired | unchanged |
+| `src/session-pipeline/consumer-service.ts:1111,1201` | consumer `search` → `indexSearchScope` | wired | unchanged |
+| `src/alleyoop/manifests.ts:653,679,1014`, `ingest.ts:166` | `chunksAreServerSealed` | wired (`c.env`) | unchanged |
+| `scripts/session-ingest-seed.ts:67,124` → `seed-proof.ts:144` | seed index `streamManifestRecords` | wired | unchanged |
+| `src/session-pipeline/lambda.ts` `lambdaEnv` → `deps.search` | Lambda search stage → `readCanonicalScope` | **omitted** | `env.readerMaxRuleset` |
+| `src/session-pipeline/lambda.ts` `deps.replay` | Lambda replay stage → `produceCanonicalReplay` | **omitted** (no field) | `env.readerMaxRuleset` |
+| `src/session-pipeline/lambda.ts` `analysisTick({canonical})` | session analysis → `canonicalProducerSnapshot` | **omitted** | `env.readerMaxRuleset` |
+| `src/session-pipeline/replay-publication.ts` `ReplayProducerDeps` | `canonicalProducerSnapshot` (also `consumer.ts` replay) | **no field** | field added and forwarded |
+| `src/session-pipeline/large-read-main.ts` `largeReadRuntime` | large-read Job `search` + `replay` | **omitted** | `readerMaxRuleset(env)` |
+| `src/bob-costas/main.ts` → `handler.ts` `buildOutcome` | summary reader (marker + chunk GET) | **no check** (presence only) | marker + `readerChunkBody` when set |
+| `scripts/capture-canonical-frontier.ts` | operator frontier capture → `SeedProofIndex` | **omitted** | `readerMaxRuleset(process.env)` |
+| `scripts/proof-canonical-publication.ts`, `proof-ingest-s3-seed.ts`, `proof-canonical-index-capacity.ts`, `proof-directory-display.ts`, `proof-canonical-replay-pages.ts`, `proof-publication-canary.ts`, `opensearch-proof/e2e.ts` | proof readers (`readCanonicalScope`, `streamManifestRecords`, `readManifestRecords`, `indexSearchScope`, `produceCanonicalReplay`) | **omitted** | `readerMaxRuleset(process.env)` |
+| `src/session-ingest/writer.ts`, `publication-image.ts`, `migration/neon-s3-sync/export-session.ts`, `raw-chunks.ts`/`engine-raw-chunks.ts` collision re-reads | writer reuse / byte copy with hash check | n/a (writer / byte-only) | unchanged |
+| `parked.ts`, `neon-s3-erasure`, `session-erase`, `claim-records-archive.ts`, `buffered-gc.ts`, `redaction-barrier.ts`, `locker/init.ts` | delete / archive / HEAD | n/a (byte-only) | unchanged |
+| `adapter.ts` manifest reader, `hoopdb/*` catalog jobs, `alleyoop/courier.ts` | marker presence or carry-forward, no content read | n/a | unchanged |
+| `src/smoke/e2e.ts` | smoke harness leak check over its own fixture | n/a (test harness) | unchanged |
+
+`RelayhistoryExportTransform` has no production constructor; any future one must pass the
+ceiling. Before enabling a v10 writer, set `READER_MAX_RULESET` on each process above, including
+the pipeline Lambda, the large-read Job and bob-costas.
 
 
 ### Configuration failure runbook

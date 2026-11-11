@@ -131,12 +131,30 @@ export function bindEngineRawSealer(
   return seal as BoundRawChunkSealer;
 }
 
-function hasRecordContent(source: Uint8Array): boolean {
+/** Anything outside Rust's `char::is_whitespace` set (Unicode White_Space),
+ * which `str::trim()` in the crate's `scrub_records` uses to decide blank input.
+ * Written out explicitly: JS `\s` differs (it includes U+FEFF and excludes U+0085).
+ * U+FEFF, U+200B, U+180E and other format characters are content here.
+ */
+const RUST_NON_WHITESPACE =
+  /[^\u0009-\u000D\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]/u;
+
+/** True when `text` is empty or consists only of Rust/Unicode White_Space. */
+export function isRustWhitespaceOnly(text: string): boolean {
+  return !RUST_NON_WHITESPACE.test(text);
+}
+
+/** Whether a UTF-8 record stream contains anything the Rust engine would not
+ * trim away as blank. Decodes in 64 KiB pieces with a streaming decoder, so a
+ * code point split across a piece boundary is judged whole; `ignoreBOM: true`
+ * keeps a leading U+FEFF as content, as Rust does. Shared with the sealer.
+ */
+export function hasRecordContent(source: Uint8Array): boolean {
   try {
     const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
     for (let i = 0; i < source.length; i += 65_536)
-      if (/\S/u.test(decoder.decode(source.subarray(i, i + 65_536), { stream: true }))) return true;
-    return /\S/u.test(decoder.decode());
+      if (!isRustWhitespaceOnly(decoder.decode(source.subarray(i, i + 65_536), { stream: true }))) return true;
+    return !isRustWhitespaceOnly(decoder.decode());
   } catch {
     // UTF-8 was validated by preflight; inability to stage this check can retry.
     throw new ScrubberError("scrub_admission_unavailable", "call_refusal", undefined, true);

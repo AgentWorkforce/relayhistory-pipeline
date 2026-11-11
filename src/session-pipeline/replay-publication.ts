@@ -19,6 +19,8 @@ export interface ReplayProducerDeps {
   db: SqlExecutor; store: ObjectStore; provider: string; bucket: string;
   prefix: { PIPELINE_ORG_FROM_PREFIX?: string; PIPELINE_KEY_PREFIX?: string };
   decompress?: (bytes: Uint8Array, maxBytes: number) => Uint8Array;
+  /** READER_MAX_RULESET, forwarded to the canonical raw read; undefined keeps legacy reads. */
+  readerMaxRuleset?: number;
 }
 /**
  * A replay-stage throw that retrying the same message cannot fix.
@@ -98,6 +100,7 @@ export async function produceCanonicalReplay(scope: SessionScope, deps: ReplayPr
   };
   const snapshot = await canonicalProducerSnapshot({
     store: deps.store, provider: deps.provider, bucket: deps.bucket, prefix: deps.prefix,
+    readerMaxRuleset: deps.readerMaxRuleset,
     pointers: current,
     decompress: deps.decompress ?? ((bytes,maxBytes) => new Uint8Array(zlib.zstdDecompressSync(bytes,{maxOutputLength:maxBytes}))),
   }, identity, deps.profile);

@@ -27,6 +27,7 @@ import {
 import type { HoopDb } from "../shared/db.ts";
 import { ctxOf } from "../shared/enrich.ts";
 import { log } from "../shared/log.ts";
+import { assertReaderScrubMarker, readerChunkBody } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { canonicalManifestIdentity } from "../shared/manifest-identity.ts";
 import { digestRecords, type Summarizer } from "./summarizer.ts";
 import {
@@ -56,6 +57,8 @@ export interface BobCostasDeps {
   now?: () => Date;
   /** The session_directory short_summary projection; defaults to the SQL writer on `db`. */
   directory?: ShortSummaryDirectory;
+  /** READER_MAX_RULESET; undefined (default) keeps the legacy presence-only scrub check. */
+  readerMaxRuleset?: number;
 }
 
 /** Where Bob Costas publishes the bounded, scrubbed short summary for search (G6). */
@@ -154,6 +157,8 @@ async function buildOutcome(
   const none = { tokensIn: 0, tokensOut: 0, records: 0 };
   // Scrub quarantine: an unscrubbed session is never read.
   if (!m.raw.scrub) return { status: "quarantined", ...none };
+  // A set maximum refuses a ruleset newer than this reader supports before any chunk GET.
+  assertReaderScrubMarker(m.raw.scrub, deps.readerMaxRuleset);
   if (m.raw.format === "sqlite-rows") return { status: "unsupported", ...none };
   const s = m.session;
   const loc = sessionLocation(m, manifestKey);
@@ -168,7 +173,10 @@ async function buildOutcome(
     );
     let stored: Uint8Array;
     try {
-      stored = await readAll(await deps.store.get(key));
+      // Unset maximum: the unchanged body-only GET. Set: one GET binds the chunk's scrub metadata to its body.
+      stored = await readAll(deps.readerMaxRuleset === undefined
+        ? await deps.store.get(key)
+        : await readerChunkBody(await deps.store.getObject(key), m.raw.scrub, deps.readerMaxRuleset));
     } catch (err) {
       if ((err as { code?: string }).code === "not_found")
         throw new PipelineError(

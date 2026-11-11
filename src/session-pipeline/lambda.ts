@@ -90,6 +90,7 @@ import {readonlyAnalysisPool,readonlyAnalysisSource} from "./analysis-snapshot.t
 import { briefTick } from "../session-brief/worker.ts";
 import { analysisConfig, analysisTick } from "../session-analysis/worker.ts";
 import { zstdDecompressSync } from "node:zlib";
+import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { createS3Eraser } from "../migration/neon-s3-erasure/eraser.ts";
 import{derivedSchemaAssets}from "./derived-schema.ts";
 import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
@@ -146,6 +147,8 @@ export interface LambdaEnv {
   bufferedSearchFeed?: BufferedFeedConfig;
   /** INGEST_BUFFERED_ERASURE_*: absent or `enabled: false` (default) builds nothing. */
   bufferedErasureDelete?: BufferedErasureConfig;
+  /** READER_MAX_RULESET: absent (default) keeps legacy sealed reads; set, every raw reader built here enforces it. */
+  readerMaxRuleset?: number;
 }
 
 /**
@@ -194,6 +197,8 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
   // The fact tables are ClickHouse DDL: a portable search backend has nowhere to put them.
   if (env.SEARCH_INDEX_OUTPUT_FACTS === "1" && selected.search !== "clickhouse")
     throw new Error("session pipeline: SEARCH_INDEX_OUTPUT_FACTS=1 needs the clickhouse search backend");
+  // Unset is undefined (legacy reads, no field); a malformed value refuses init, as briefConfig() already does.
+  const maximum = readerMaxRuleset(env);
   return {
     searchBackend: selected.search,
     adapterEnv: Object.freeze(Object.fromEntries(Object.entries(env).filter(([key]) => key.startsWith("SEARCH_INDEX_") || ["PIPELINE_RUNTIME", "AWS_REGION", "READ_API_COMPLETE_SINCE"].includes(key)))),
@@ -217,6 +222,7 @@ export function lambdaEnv(env: NodeJS.ProcessEnv = process.env, composition?: Se
     fanout,
     reconcileLookbackMinutes: Number(env.PIPELINE_RECONCILE_LOOKBACK_MINUTES ?? "30") || 30,
     dbPoolMax: Number(env.HOOPDB_POOL_MAX ?? "4") || 4,
+    ...(maximum === undefined ? {} : { readerMaxRuleset: maximum }),
   };
 }
 
@@ -433,6 +439,7 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       store,
       ...(binding ? { adapter: binding } : { ch: createClickHouseClient(secret.clickhouse!) }),
       prefixFor: (orgId) => `${env.keyPrefix}/${orgId}`,
+      readerMaxRuleset: env.readerMaxRuleset,
       // Raised to the replay producer's source bound only when that stage is on.
       limits: searchIndexLimits(env.replayPagesEnabled),
       // Default off and separate from SEARCH_INDEX_ENABLED: off keeps the pre-#182 catalog
@@ -469,7 +476,7 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
   if (env.replayPagesEnabled) {
     // This stage needs scoped Put/Get on normalized read artifacts in addition to raw reads.
     // Wiring code does not grant that permission or enable this default-off flag.
-    deps.replay = { db, store, provider: "s3", bucket: env.bucket, prefix: bindings };
+    deps.replay = { db, store, provider: "s3", bucket: env.bucket, prefix: bindings, readerMaxRuleset: env.readerMaxRuleset };
   }
   if(env.largeScopeHandoffEnabled&&(env.searchEnabled||env.replayPagesEnabled))deps.large={route:scope=>routeLargeRead(db,scope),jobState:scope=>largeReadJobState(db,scope)};
   // The key comes from the secret only; "-disabled" or blank means no model, as in config.ts.
@@ -490,6 +497,7 @@ export function runtimeFromSecret(env: LambdaEnv, secretText: string, schemaGene
       provider: "s3",
       bucket: env.bucket,
       prefix: bindings,
+      readerMaxRuleset: env.readerMaxRuleset,
       decompress: (bytes, maxBytes) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: maxBytes })),
     },
     transport: key ? createAnalysisTransport({ apiKey: () => key }) : null,

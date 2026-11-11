@@ -14,6 +14,14 @@
  *   the TypeScript engine and no raw passthrough.
  * - Anything else: `ScrubEngineConfigError` at selection (startup fails).
  *
+ * `SCRUB_ENGINE_REQUIRED` (default off): unset or "" imposes nothing (today's
+ * behaviour). Set to exactly "ts", "wasm" or "wasm-bindgen", it refuses any
+ * selection whose SCRUB_ENGINE kind differs (unset SCRUB_ENGINE is "ts") with
+ * `ScrubEngineConfigError` reason `engine_selection_required`, and that refusal
+ * is sticky for the process: every later selection and scrub call refuses too,
+ * so a deployment that requires the wasm path never silently runs TypeScript.
+ * It only refuses; it never selects or initialises anything.
+ *
  * The selection is read once per process (isolate); a later, different
  * selection throws rather than switching engines.
  */
@@ -94,6 +102,12 @@ export const SCRUB_WASM_PATH = "../../../scrub-wasm/relayscrubber.wasm";
 
 interface ScrubEngineEnv {
   SCRUB_ENGINE?: string | undefined;
+  /**
+   * Default off. Unset or "": no requirement. "ts" | "wasm" | "wasm-bindgen": selection
+   * refuses (ScrubEngineConfigError, reason "engine_selection_required") unless the
+   * SCRUB_ENGINE kind (unset = "ts") is exactly this one. Anything else is a config error.
+   */
+  SCRUB_ENGINE_REQUIRED?: string | undefined;
   READER_MAX_RULESET?: string | undefined;
   /** wasm-bindgen only: absolute directory of the installed package (default: next to the pipeline package). */
   SCRUB_BINDGEN_DIR?: string | undefined;
@@ -103,6 +117,8 @@ let selected: ScrubEngineKind | undefined;
 let active: ScrubEngine | undefined;
 let lastFailure: ScrubEngineFailure | undefined;
 let pending: Promise<ScrubEngine> | undefined;
+/** Sticky for the process: a refused SCRUB_ENGINE_REQUIRED selection is never followed by a TS fallback. */
+let requiredRefused = false;
 
 /** Parse SCRUB_ENGINE. Exact and case-sensitive; "" counts as unset. */
 export function parseScrubEngineKind(value: string | undefined): ScrubEngineKind {
@@ -112,12 +128,34 @@ export function parseScrubEngineKind(value: string | undefined): ScrubEngineKind
   throw new ScrubEngineConfigError(`SCRUB_ENGINE must be unset, "ts", "wasm" or "wasm-bindgen"`);
 }
 
+/** Parse SCRUB_ENGINE_REQUIRED. Exact and case-sensitive; unset or "" = no requirement. */
+export function parseScrubEngineRequired(value: string | undefined): ScrubEngineKind | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (value === "ts" || value === "wasm" || value === "wasm-bindgen") return value;
+  throw new ScrubEngineConfigError(`SCRUB_ENGINE_REQUIRED must be unset, "", "ts", "wasm" or "wasm-bindgen"`);
+}
+
+function refuseRequiredSelection(): never {
+  requiredRefused = true;
+  lastFailure = "engine_selection_required";
+  throw new ScrubEngineConfigError(
+    "SCRUB_ENGINE does not select the engine SCRUB_ENGINE_REQUIRED requires (engine_selection_required)",
+    "engine_selection_required",
+  );
+}
+
 /**
  * Select the engine for this process from `env.SCRUB_ENGINE`. Idempotent for the
- * same value; a different value after the first selection throws.
+ * same value; a different value after the first selection throws. With
+ * `env.SCRUB_ENGINE_REQUIRED` set, a selection (new or already made) of another
+ * kind refuses, permanently for this process.
  */
 export function selectScrubEngine(env: ScrubEngineEnv | undefined): ScrubEngineKind {
+  if (requiredRefused) refuseRequiredSelection();
+  const required = parseScrubEngineRequired(env?.SCRUB_ENGINE_REQUIRED);
   const kind = parseScrubEngineKind(env?.SCRUB_ENGINE);
+  if (required !== undefined && (kind !== required || (selected !== undefined && selected !== required)))
+    refuseRequiredSelection();
   if (selected !== undefined && selected !== kind)
     throw new ScrubEngineConfigError(`SCRUB_ENGINE was already selected as "${selected}"`);
   if (selected === undefined) {
@@ -157,7 +195,8 @@ function processEnv(): ScrubEngineEnv | undefined {
 
 /**
  * Select and, for wasm, verify and instantiate the pinned engine. Call before
- * serving. Throws ScrubEngineConfigError (bad SCRUB_ENGINE) or
+ * serving. Throws ScrubEngineConfigError (bad SCRUB_ENGINE / SCRUB_ENGINE_REQUIRED,
+ * or a selection SCRUB_ENGINE_REQUIRED refuses) or
  * ScrubEngineUnavailable (wasm init failed); after a failure every scrub call
  * throws until a later init succeeds. With "ts" this does no I/O.
  */
@@ -219,6 +258,7 @@ async function initBindgen(env: ScrubEngineEnv | undefined, o: NonNullable<InitS
  * wasm selected and not initialised (or failed) it throws ScrubEngineUnavailable.
  */
 export function activeScrubEngine(): ScrubEngine {
+  if (requiredRefused) refuseRequiredSelection();
   if (selected === undefined) selectScrubEngine(processEnv());
   if (selected === "ts") return tsScrubEngine;
   const engine = active as (ScrubEngine & { failed?: boolean }) | undefined;
@@ -246,6 +286,7 @@ export function resetScrubEngineForTests(): void {
   active = undefined;
   lastFailure = undefined;
   pending = undefined;
+  requiredRefused = false;
   resetBindgenScrubEngineForTests();
 }
 

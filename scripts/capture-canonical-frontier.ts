@@ -11,6 +11,7 @@ import { captureLegacyFrontierSource, composeCanonicalFrontierCapture, reconcile
 import { captureSeedScopeExportEvidence, createS3FrontierVersioningReader, type SeedScopeExportEvidence } from "../src/session-ingest/frontier-plan-source.ts";
 import { evaluateCanonicalFrontier, frontierCanonicalJson, frontierSha256 } from "../src/session-ingest/frontier-plan.ts";
 import type { SeedSql } from "../src/session-ingest/seed.ts";
+import { readerMaxRuleset } from "../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 
 const PROTOCOL = "canonical-frontier-readonly-capture-runner-v1";
 const MAX_CONFIG = 1024 * 1024;
@@ -152,6 +153,7 @@ try {
   const store = readOnlyObjectStore(createS3Store({ endpoint: input.sourceObjects.endpoint, bucket: input.sourceObjects.bucket, region: input.sourceObjects.region,
     credentials: { accessKeyId: input.sourceObjects.accessKeyId, secretAccessKey: input.sourceObjects.secretAccessKey } }));
   const reader = objectStoreManifestReader(store, { provider: "s3", bucket: input.sourceObjects.bucket });
+  const maximum = readerMaxRuleset(process.env); // unset: legacy reads
   const versioning = createS3FrontierVersioningReader({ endpoint: input.sourceObjects.endpoint, region: input.sourceObjects.region,
     ...(input.sourceObjects.endpoint ? { allowFixtureEndpoint: true } : {}), credentials: { accessKeyId: input.sourceObjects.accessKeyId, secretAccessKey: input.sourceObjects.secretAccessKey } });
   const requests: Array<{ origin: (typeof sourceOpening.origins)[number]; group: { source: string; sessionId: string }; cachePath: string }> = [];
@@ -165,7 +167,7 @@ try {
   }
   const captureExports = async (): Promise<SeedScopeExportEvidence[]> => {
     const captured: SeedScopeExportEvidence[] = [];
-    for (const request of requests) captured.push(await captureSeedScopeExportEvidence(seedSql, { store, reader, bucket: input.sourceObjects.bucket, provider: "s3",
+    for (const request of requests) captured.push(await captureSeedScopeExportEvidence(seedSql, { store, reader, readerMaxRuleset: maximum, bucket: input.sourceObjects.bucket, provider: "s3",
         prefixFor: org => `${input.sourceObjects.keyRoot}/${org}`, decompress: (bytes, max) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: max })) }, versioning,
       { tenant: request.origin.tenant, generation: input.target.schemaGeneration, sourceHead: request.origin.opening.sourceHead!, source: request.group.source, sessionId: request.group.sessionId,
         keyRoot: `${input.sourceObjects.keyRoot}/${input.scope.orgId}`, cachePath: request.cachePath,

@@ -20,6 +20,7 @@ import { runPublicationCanary, publicationCanaryPlanDigest, type PublicationCana
 import { openPublicationCanaryOutcomeFile } from "../src/session-ingest/publication-canary-outcomes.ts";
 import { FRONTIER_PLAN_PROTOCOL, frontierSha256, type CanonicalFrontierRow, type FrontierReadiness } from "../src/session-ingest/frontier-plan.ts";
 import { produceCanonicalReplay } from "../src/session-pipeline/replay-publication.ts";
+import { readerMaxRuleset } from "../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { canonicalArtifactPage } from "../src/session-read-api/canonical-artifact-reader.ts";
 import { readCanonicalHistoryPage, type CanonicalHistoryAdapterConfig } from "../src/session-read-api/canonical-history-adapter.ts";
 import { deliveryAccount } from "../src/session-ingest/vendor/delivery/prepare.ts";
@@ -207,7 +208,7 @@ try {
   await check("pointer -> directory projector -> replay CAS -> artifact reader -> History adapter", async () => {
     const projected = await projectSessionDirectory({ query: (text: string, args?: unknown[]) => owner.query(text, args) } as never, scope);
     yes(projected.projected, "directory_not_projected");
-    const replay = await produceCanonicalReplay(scope, { db: { query: (text: string, args?: unknown[]) => owner.query(text, args) }, store, provider: "s3", bucket, prefix: { PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true" } });
+    const replay = await produceCanonicalReplay(scope, { readerMaxRuleset: readerMaxRuleset(process.env), db: { query: (text: string, args?: unknown[]) => owner.query(text, args) }, store, provider: "s3", bucket, prefix: { PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true" } });
     yes(replay.published && replay.publication, "replay_not_published");
     const identity = replay.publication.identity;
     const pageDeps = {

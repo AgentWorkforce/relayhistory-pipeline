@@ -19,6 +19,10 @@ binding and mark a verified bound instance failed for every caller, including
 instance defect for admitted nonblank input and is never persisted. Empty or
 blank-only streams are refused at admission before invoking or poisoning the
 engine (the real Rust artifact legitimately emits zero records for those).
+"Blank" is exactly Rust `str::trim` / Unicode `White_Space` (`isRustWhitespaceOnly`
+in `engine-raw-chunks.ts`): U+0085 counts as blank, U+FEFF does not, unlike JS `\s`.
+The stream is decoded in 64 KiB pieces with a streaming fatal decoder, so a character
+split across pieces is judged whole; invalid UTF-8 is never judged blank.
 Typed call refusals remain typed; retryable allocation refusal remains
 retryable. Output may expand past the input per-record limit; the scaffold
 stages at most 64 MiB of output. Larger output refuses with non-retryable
