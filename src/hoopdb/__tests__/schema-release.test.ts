@@ -169,6 +169,59 @@ function get(f: Fixture) {
 test("real main, both exact-head workflows/jobs and actual named human approval required", async () => {
   expect((await githubReleaseGate(base, get(api()), true)).sha).toBe(sha);
 });
+test("pinned human dispatch is the fail-closed fallback when the plan has no environment reviewers", async () => {
+  const f = api();
+  f.env.protection_rules = [];
+  f.run.actor = { type: "User", ...P.dispatcher };
+  f.run.triggering_actor = { type: "User", ...P.dispatcher };
+  expect((await githubReleaseGate(base, get(f), true)).sha).toBe(sha);
+  for (const mutate of [
+    (x: Fixture) => (x.run.actor.id = P.dispatcher.id + 1),
+    (x: Fixture) => (x.run.actor.login = "foreign"),
+    (x: Fixture) => (x.run.actor.type = "Bot"),
+    (x: Fixture) => (x.run.triggering_actor.id = P.dispatcher.id + 1),
+    (x: Fixture) => (x.run.triggering_actor.login = "foreign"),
+    (x: Fixture) => (x.run.triggering_actor.type = "Bot"),
+  ]) {
+    const refused = api();
+    refused.env.protection_rules = [];
+    refused.run.actor = { type: "User", ...P.dispatcher };
+    refused.run.triggering_actor = { type: "User", ...P.dispatcher };
+    mutate(refused);
+    await expect(githubReleaseGate(base, get(refused), true)).rejects.toThrow();
+  }
+});
+test("a reviewer rule never falls back to dispatcher identity", async () => {
+  const noApproval = api();
+  noApproval.run.actor = { type: "User", ...P.dispatcher };
+  noApproval.run.triggering_actor = { type: "User", ...P.dispatcher };
+  noApproval.approvals = [];
+  await expect(
+    githubReleaseGate(base, get(noApproval), true),
+  ).rejects.toThrow("release_human_approval");
+
+  const teamOnly = api();
+  teamOnly.run.actor = { type: "User", ...P.dispatcher };
+  teamOnly.run.triggering_actor = { type: "User", ...P.dispatcher };
+  teamOnly.env.protection_rules[0]!.reviewers = [
+    { type: "Team", reviewer: { type: "Team", id: 99 } },
+  ];
+  await expect(
+    githubReleaseGate(base, get(teamOnly), true),
+  ).rejects.toThrow("release_environment");
+});
+test("missing protection metadata and GitHub API failure refuse closed", async () => {
+  const missing = api();
+  delete (missing.env as any).protection_rules;
+  await expect(githubReleaseGate(base, get(missing), true)).rejects.toThrow(
+    "release_environment",
+  );
+  await expect(
+    githubReleaseGate(base, async () => {
+      throw new Error("synthetic API failure");
+    }, true),
+  ).rejects.toThrow("synthetic API failure");
+});
 const mutations: Array<[string, (f: Fixture) => void]> = [
   ["main moved", (f) => (f.ref.object.sha = "e".repeat(40))],
   ["wrong workflow", (f) => (f.run.path = ".github/workflows/untrusted.yml")],
