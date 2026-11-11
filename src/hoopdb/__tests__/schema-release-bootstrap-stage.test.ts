@@ -692,7 +692,7 @@ test("contract (d): an extra or missing role in the release map or the anchor re
     bootstrapTargetChain({ target: T047, targetSha: TSHA, steps: STEPS, files: files(), contract, map: map as typeof SESSION_BOOTSTRAP_ROLES });
   expect(code(pre(extra))).toBe("release_bootstrap_contract_drift");
   // Anchor map or manifest missing a required role (same SQL).
-  const narrative = '    bulls96_digest_narrative: bare("allowed", "unchecked"),\n';
+  const narrative = '    bulls96_digest_narrative: bare("allowed", "none"),\n';
   expect(code(() => bootstrapContractSource(anchorContract(rolesText([narrative, ""]))))).toBe("release_bootstrap_contract_drift");
   expect(
     code(() => bootstrapContractSource(anchorContract(ROLES_MODULE_TEXT, consumersText(SESSION_BOOTSTRAP_CONSUMERS.filter(([r]) => r !== admit))))),

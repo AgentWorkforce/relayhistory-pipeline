@@ -1512,33 +1512,43 @@ test("bootstrap plan section shape: files, roles, required, will_create, next", 
   ).toBe("release_bootstrap_chain");
 });
 
-test("bootstrap exactness: inbound, outbound and flags follow the bulls96_read_api block", () => {
-  const readApi = SESSION_BOOTSTRAP_ROLES[readApiFile].bulls96_read_api;
+test("bootstrap exactness: inbound, outbound and flags follow every session_read_api_roles block", () => {
+  const strictInboundRoles = ["bulls96_read_api", admit, "bulls96_digest_narrative"] as const;
   const drift = (state: BootstrapState, supabaseMode = true) =>
     bsCode(() => bsSection({ files: bsFiles(), state, supabaseMode, log: quiet }));
   // PG15: any inbound member refuses (no inherit/set columns to prove a creator edge).
-  const pg15 = bsState([], {
-    serverVersionNum: 150008,
-    edges: [creatorEdge("bulls96_read_api", { inherit_option: null, set_option: null })],
-  });
-  expect(roleContractProblems("bulls96_read_api", readApi, pg15, true)).toEqual(["member postgres"]);
-  expect(drift(pg15)).toBe("release_bootstrap_role_drift");
-  // PG16+: a non-creator edge refuses.
-  for (const edge of [
-    creatorEdge("bulls96_read_api", { member: "authenticator" }),
-    creatorEdge("bulls96_read_api", { grantor: "postgres", grantor_super: false }),
-    creatorEdge("bulls96_read_api", { grantor_super: false }),
-    creatorEdge("bulls96_read_api", { admin_option: false }),
-    creatorEdge("bulls96_read_api", { inherit_option: true }),
-    creatorEdge("bulls96_read_api", { set_option: true }),
-  ])
-    expect(drift(bsState([], { edges: [edge] }))).toBe("release_bootstrap_role_drift");
-  // The creator edge is accepted only in supabase db mode.
+  for (const name of strictInboundRoles) {
+    const pg15 = bsState([], {
+      serverVersionNum: 150008,
+      edges: [creatorEdge(name, { inherit_option: null, set_option: null })],
+    });
+    expect(roleContractProblems(name, SESSION_BOOTSTRAP_ROLES[readApiFile][name], pg15, true)).toEqual([
+      "member postgres",
+    ]);
+    expect(drift(pg15)).toBe("release_bootstrap_role_drift");
+  }
+  // PG16+: every non-creator edge refuses for each block; the exact creator edge is
+  // accepted only in Supabase mode. This pins #546's admission-role predicate into
+  // the bootstrap-stage contract so a present assumable role can never be skipped.
+  for (const name of strictInboundRoles) {
+    const contract = SESSION_BOOTSTRAP_ROLES[readApiFile][name];
+    expect(contract.inbound).toBe("none");
+    for (const edge of [
+      creatorEdge(name, { member: "authenticator" }),
+      creatorEdge(name, { grantor: "postgres", grantor_super: false }),
+      creatorEdge(name, { grantor_super: false }),
+      creatorEdge(name, { admin_option: false }),
+      creatorEdge(name, { inherit_option: true }),
+      creatorEdge(name, { set_option: true }),
+    ])
+      expect(drift(bsState([], { edges: [edge] }))).toBe("release_bootstrap_role_drift");
+    const creator = bsState([], { edges: [creatorEdge(name)] });
+    expect(roleContractProblems(name, contract, creator, true)).toEqual([]);
+    expect(roleContractProblems(name, contract, creator, false)).toEqual(["member postgres"]);
+    expect(bsSection({ files: bsFiles(), state: creator, supabaseMode: true }).required).toBe(false);
+    expect(drift(creator, false)).toBe("release_bootstrap_role_drift");
+  }
   const creator = bsState([], { edges: [creatorEdge("bulls96_read_api")] });
-  expect(roleContractProblems("bulls96_read_api", readApi, creator, true)).toEqual([]);
-  expect(roleContractProblems("bulls96_read_api", readApi, creator, false)).toEqual(["member postgres"]);
-  expect(bsSection({ files: bsFiles(), state: creator, supabaseMode: true }).required).toBe(false);
-  expect(drift(creator, false)).toBe("release_bootstrap_role_drift");
   // Outbound membership refuses for every chain role, even an inbound-unchecked one.
   for (const name of ["bulls96_read_api", admit, "bulls96_session_ingest"])
     expect(drift(bsState([], { edges: [{ ...creatorEdge("pg_read_all_data"), member: name }] }))).toBe(
@@ -1565,7 +1575,14 @@ test("bootstrap exactness: inbound, outbound and flags follow the bulls96_read_a
     expect(lines).toEqual([`release_bootstrap_role_drift ${name}`]);
   }
   // A LOGIN-capable role (prod's bulls96_read_api) stays exact.
-  expect(roleContractProblems("bulls96_read_api", readApi, bsState(), true)).toEqual([]);
+  expect(
+    roleContractProblems(
+      "bulls96_read_api",
+      SESSION_BOOTSTRAP_ROLES[readApiFile].bulls96_read_api,
+      bsState(),
+      true,
+    ),
+  ).toEqual([]);
   // Worker: exactly one global statement_timeout=2s; authenticator only NOINHERIT, no admin.
   const worker = "session_directory_search_worker";
   const wc = SESSION_BOOTSTRAP_ROLES["supabase/bootstrap/session_directory_search_worker.sql"][worker];

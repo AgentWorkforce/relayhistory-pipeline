@@ -57,7 +57,8 @@ test("contracts: only non-bare roles declare login, inbound members or settings"
   expect(all.bulls96_read_api.inbound).toBe("none");
   expect(all.bulls96_acquisition_installer.inbound).toBe("none");
   expect(all.buffered_search_feed_runtime.inbound).toBe("none");
-  expect(all.bulls96_analysis_admit).toEqual({ login: "allowed", inbound: "unchecked", settings: "unchecked" });
+  expect(all.bulls96_analysis_admit).toEqual({ login: "allowed", inbound: "none", settings: "unchecked" });
+  expect(all.bulls96_digest_narrative).toEqual({ login: "allowed", inbound: "none", settings: "unchecked" });
   expect(all.search_consumer_runtime).toEqual({ login: "claimed-60s", inbound: "consumer", settings: "consumer" });
 });
 

@@ -87,10 +87,9 @@ export const SESSION_BOOTSTRAP_ROLES: {
   "supabase/bootstrap/session_read_api_roles.sql": {
     // Production already has it LOGIN (session_read_api_role.sql); no member.
     bulls96_read_api: bare("allowed", "none"),
-    // Lane F1 (20261105046000); its block checks flags and member-of only.
-    bulls96_analysis_admit: bare("allowed", "unchecked"),
-    // Lane F4 (20261105045000); its block checks flags and member-of only.
-    bulls96_digest_narrative: bare("allowed", "unchecked"),
+    // Lanes F1/F4: #546 applies the same strict inbound predicate to all three blocks.
+    bulls96_analysis_admit: bare("allowed", "none"),
+    bulls96_digest_narrative: bare("allowed", "none"),
   },
   "supabase/bootstrap/session_consumer_roles.sql": {
     search_consumer_runtime: {
