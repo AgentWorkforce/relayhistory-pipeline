@@ -243,8 +243,12 @@ To keep that one window as short as possible:
    under concurrent synthetic uploads (§4). The approved owner-apply can instead open it under its own lock
    through `generationOverlapIntegration` (`src/hoopdb/ingest-generation-overlap.ts`). That fixed entry is a
    separate reviewed change, and the stock CLI is not modified here.
-3. **Apply.** Use the normal owner-apply. Marker `(H, pending)` → `(H, pass)`. Uploads continue at G
-   throughout.
+3. **Apply.** Use the normal owner-apply. Marker `(H, pending)` → `(H, pass)`. With the stock CI path
+   (`admitDuringApply` off, pinned by `src/hoopdb/ingest-generation-overlap-operator.ts`) uploads at G are
+   refused from the pending write until the marker is PASS at H: a 503 with `Retry-After`, as long as the
+   apply. The window closes the PASS → rebind → Worker-deploy gap, not the apply interval. Uploads continue
+   at G throughout the apply only with `--admit-during-apply`, which is a separately reviewed follow-up
+   (§4 full-union rehearsal first).
 4. **Other runtime replacements.** GC and publisher, as today. The GC at G is also admitted during the
    window (same role). The publisher and history stay on exact PASS and pause, as today.
 5. **Rebind.** `ingest-generation-rebind.ts --from G --to H --execute` moves the policy and admissions and
