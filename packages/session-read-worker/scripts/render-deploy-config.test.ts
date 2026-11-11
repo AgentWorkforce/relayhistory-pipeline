@@ -385,12 +385,13 @@ describe("deploy config render, owner_buffered_index_verify", () => {
 });
 
 describe("deploy workflow wiring", () => {
-  test("dispatch preserves the live profile by default; child overrides remain off and none", () => {
-    expect(WORKFLOW).toMatch(/owner_buffered:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["preserve", "on", "off"\]\n\s+default: "preserve"/);
+  test("dispatch renders the committed production profile by default; other child overrides remain off and none", () => {
+    expect(WORKFLOW).toMatch(/owner_buffered:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["profile", "preserve", "on", "off"\]\n\s+default: "profile"/);
     expect(WORKFLOW).toMatch(/owner_buffered_workspaces:\n\s+description:[^\n]*\n\s+type: string\n\s+default: ""/);
     expect(WORKFLOW).toMatch(/buffered_search_gate:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
     expect(WORKFLOW).toContain("BUFFERED_SEARCH_GATE: ${{ inputs.buffered_search_gate }}");
-    expect(WORKFLOW).toMatch(/owner_buffered_events:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+    expect(WORKFLOW).toMatch(/owner_buffered_events:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["profile", "off", "on"\]\n\s+default: "profile"/);
+    expect(WORKFLOW).toMatch(/owner_buffered_statement_timeout_ms:\n\s+description:[^\n]*\n\s+type: string\n\s+default: "profile"/);
     expect(WORKFLOW).toContain("OWNER_BUFFERED_EVENTS: ${{ inputs.owner_buffered_events }}");
     expect(WORKFLOW).toMatch(/owner_buffered_stage_concurrency:\n\s+description:[^\n]*\n\s+type: string\n\s+default: "off"/);
     expect(WORKFLOW).toContain("OWNER_BUFFERED_STAGE_CONCURRENCY: ${{ inputs.owner_buffered_stage_concurrency }}");

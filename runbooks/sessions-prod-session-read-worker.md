@@ -38,7 +38,7 @@ The same `b96e1:` cursors are issued and accepted. A cursor that the Lambda issu
 | `READ_API_BRIEF_TITLES_WORKSPACES` | GitHub env var `SESSION_READ_BRIEF_TITLES_WORKSPACES` | the F2 brief-titles allowlist (`GET /v1/sessions/titles`, docs/brief-titles.md); separate from the P3 canary; unset = 501 `brief_titles_workspace_not_enabled`, `*` = all |
 | `PIPELINE_RAW_S3_BUCKET`, `_REGION`, `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` (+ optional `_ENDPOINT`, `_SSE`), `PIPELINE_KEY_PREFIX`, `PIPELINE_ORG_FROM_PREFIX` | Worker secrets / vars | session timing's canonical S3 read: a GetObject-only key on the raw bucket, the same key layout the session-pipeline Lambda writes. Unset = timing answers 501 `timing_not_configured` |
 | `READ_API_TIMING_ASSUME_NO_TURNS` | GitHub env var `SESSION_READ_TIMING_ASSUME_NO_TURNS` | `true` only for canary workspaces a read-only count showed have no Neon `conversation_turns` (see "Session timing" below); unset = such sessions answer 501 `timing_turns_unknown` |
-| `RELAYHISTORY_READ_OWNER_BUFFERED`, `READ_API_OWNER_BUFFERED_WORKSPACES`, `INGEST_S3_BUCKET`, `INGEST_S3_REGION`, binding `HISTORY_CONTROL_HEAD` | rendered only by a `owner_buffered=on` dispatch (`scripts/render-deploy-config.ts`); bucket/region from GitHub env vars `SESSION_READ_INGEST_S3_BUCKET` / `SESSION_READ_INGEST_S3_REGION`; allowlist from the `owner_buffered_workspaces` input | Option C owner-buffered reads, default off. On adds the service binding to `relayhistory-api` entrypoint `SessionReadPrivacyControls` (pinned, not an input), the flag `true`, and the canary allowlist (explicit ids, each also on `SESSION_READ_DIRECTORY_WORKSPACES`; or exactly `*`, see "Owner-buffered all-workspaces mode" below). S3 reads use the `PIPELINE_RAW_S3_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` Worker secrets (the on deploy refuses unless both exist); GetObject + kms:Decrypt on `buffered-batches/` is a separate IAM grant. Flag on without the binding = every request 503. Any later dispatch without inputs deploys it off again. Prerequisites (PR A migration, IAM grant, relayhistory-cloud exporting the entrypoint) are separate approvals |
+| `RELAYHISTORY_READ_OWNER_BUFFERED`, `READ_API_OWNER_BUFFERED_WORKSPACES`, `INGEST_S3_BUCKET`, `INGEST_S3_REGION`, binding `HISTORY_CONTROL_HEAD` | rendered only by a `owner_buffered=on` dispatch (`scripts/render-deploy-config.ts`); bucket/region from GitHub env vars `SESSION_READ_INGEST_S3_BUCKET` / `SESSION_READ_INGEST_S3_REGION`; allowlist from the `owner_buffered_workspaces` input | Option C owner-buffered reads, default off. On adds the service binding to `relayhistory-api` entrypoint `SessionReadPrivacyControls` (pinned, not an input), the flag `true`, and the canary allowlist (explicit ids, each also on `SESSION_READ_DIRECTORY_WORKSPACES`; or exactly `*`, see "Owner-buffered all-workspaces mode" below). S3 reads use the `PIPELINE_RAW_S3_ACCESS_KEY_ID` / `_SECRET_ACCESS_KEY` Worker secrets (the on deploy refuses unless both exist); GetObject + kms:Decrypt on `buffered-batches/` is a separate IAM grant. Flag on without the binding = every request 503. A dispatch without inputs renders the committed production profile (on, `*`; see "Committed production profile" below); turning it off is an explicit `owner_buffered=off`. Prerequisites (PR A migration, IAM grant, relayhistory-cloud exporting the entrypoint) are separate approvals |
 | `READ_API_OWNER_BUFFERED_EVENTS` | rendered only by a `owner_buffered_events=on` dispatch together with `owner_buffered=on` (`scripts/render-deploy-config.ts`) | Owner-buffered session events (see "Owner-buffered events"); unset = off; any value other than `on` = 503 `backend_unavailable` |
 | `READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY` | rendered only by an `owner_buffered_stage_concurrency=<2..32>` dispatch together with `owner_buffered_events=on` (`scripts/render-deploy-config.ts`) | Bounded-concurrency S3 stage fetches for the owner-buffered events read (see "Owner-buffered events latency flags"); unset, empty, `0` or `1` = the serial loop; `2`..`32` = at most N in flight; any other value = 503 `backend_unavailable` |
 | `READ_API_OWNER_BUFFERED_PHASE_LOG` | rendered only by an `owner_buffered_phase_log=on` dispatch together with `owner_buffered_events=on` (`scripts/render-deploy-config.ts`) | Per-phase times on the events request log line (see "Owner-buffered events latency flags"); exactly `1` enables, anything else is off |
@@ -73,15 +73,15 @@ An explicit canary list validates exactly as before.
 
 Tests: `src/session-read-api/__tests__/owner-buffered.routes.test.ts` ("all-workspaces mode does not bypass the per-user privacy gate").
 
-To turn it off, dispatch again without inputs. Prerequisites and approvals are the same as for a canary: the PR A migration, the S3/KMS grant, the binding and the deploy itself each need Khaliq's explicit OK.
+To turn it off, dispatch with `owner_buffered=off` (a no-input dispatch renders the committed profile, which has it on). Prerequisites and approvals are the same as for a canary: the PR A migration, the S3/KMS grant, the binding and the deploy itself each need Khaliq's explicit OK.
 
 ## Owner-buffered events
 
-Default off; nothing changes unless a dispatch asks for it. Dispatch *deploy session-read-worker* with `owner_buffered=on` and `owner_buffered_events=on`. The render then also sets `READ_API_OWNER_BUFFERED_EVENTS=on`; `GET /v1/sessions/:id/events?source=...` then serves the caller's own buffered events for a session with no canonical pointer (header `X-Relayhistory-Buffered: 1`). The render refuses `owner_buffered_events=on` without `owner_buffered=on`, any value other than `off`/`on`, and a `wrangler.jsonc` that already sets the var. `off` (or no input) renders byte-identically to a deploy without the input. A Worker holding any other value answers every request 503 `backend_unavailable`.
+On in the committed production profile: a default production dispatch (`owner_buffered=profile`) renders it on, and `owner_buffered=preserve` keeps the live value. Off for any other deploy target. To set it explicitly, dispatch *deploy session-read-worker* with `owner_buffered=on` and `owner_buffered_events=on` (or `off`). The render then also sets `READ_API_OWNER_BUFFERED_EVENTS=on`; `GET /v1/sessions/:id/events?source=...` then serves the caller's own buffered events for a session with no canonical pointer (header `X-Relayhistory-Buffered: 1`). The render refuses `owner_buffered_events=on` without `owner_buffered=on`, any value other than `off`/`on`, and a `wrangler.jsonc` that already sets the var. `off` (or no input) renders byte-identically to a deploy without the input. A Worker holding any other value answers every request 503 `backend_unavailable`.
 
 Clients paging across the backend transition (canonical pointers appearing for a session first served from the buffer, or the reverse) get 409 `cursor_backend_transition` and must restart without a cursor (docs/session-read-api-design.md, "Owner-buffered events").
 
-Turning it on is a production deploy: dispatch is Khaliq's call. To turn it off, dispatch again without the input.
+Changing it is a production deploy: dispatch is Khaliq's call. It is on in the committed production profile; to turn it off, dispatch `owner_buffered=on` with `owner_buffered_events=off`.
 
 ### Owner-buffered events latency flags
 
@@ -237,9 +237,36 @@ SELECT id, source, turn_index, role, ts FROM sessions.conversation_turns
 - **Bad Worker version:** `bunx wrangler rollback --name bulls96-session-read-api` restores the previous version.
 
 
+## Committed production profile (default dispatch reproduces prod)
+
+Deploys go through CI only; nothing is deployed from a laptop. A dispatch with
+no inputs renders `packages/session-read-worker/deploy/production-profile.json`:
+`owner_buffered=on`, `owner_buffered_workspaces=*`, `owner_buffered_events=on`,
+`owner_buffered_statement_timeout_ms=6000`. The directory allowlist still comes
+from the `SESSION_READ_DIRECTORY_WORKSPACES` environment variable (no workspace
+id in the repo); if it is empty, the live list is kept. The workflow sets
+`DEPLOY_TARGET=production`; without it, `profile` behaves as `preserve`.
+
+Precedence, highest first:
+
+| Source | When |
+| --- | --- |
+| Explicit input | `owner_buffered=on`/`off` with its child inputs. Under `on`, a child left at `profile`/empty takes the committed value |
+| Committed profile | `owner_buffered=profile` (the default) |
+| Live Worker | `owner_buffered=preserve` (opt out of the profile), plus, in profile mode, everything the profile does not own: S3 bucket/region, stage concurrency, phase log, index verify, search gate |
+
+Profile mode reads live metadata first and is guarded. It may fill a setting
+that live has unset, for example a statement timeout lost by an earlier deploy.
+It refuses to change or drop a setting that live has set (live timeout 5000,
+live events on with the profile saying off), to turn owner-buffered reads on
+when live has them off, and to combine with child overrides. It also keeps
+every preserve-mode refusal below. To change prod: change the committed profile
+in a reviewed PR, then make the first deploy an explicit `owner_buffered=on`
+dispatch with the new values. After that, no-input dispatches match again.
+
 ## Preserve the live buffered-read profile on code deploys
 
-`owner_buffered` now defaults to `preserve`. Before rendering, the workflow reads
+`owner_buffered=preserve` copies live instead of the committed profile. Before rendering, the workflow reads
 the single active Worker version and carries forward its buffered-read settings,
 workspace allowlists, S3 bucket/region, statement timeout and pinned privacy-service
 binding. It copies no secret values. An unavailable, split or inconsistent live
@@ -253,7 +280,8 @@ set `owner_buffered_statement_timeout_ms` to an integer from 2000 through 6000.
 operator-approved production action; this source change does not enable history.
 
 The explicit on/off modes use the supplied child inputs; they do not inherit
-event/concurrency/index/search flags. Review those inputs as a complete profile.
+concurrency/index/search flags from live. Under explicit `on`, workspaces, events
+and timeout left at `profile`/empty take the committed values. Review those inputs as a complete profile.
 The `directory_workspaces` input takes precedence over
 `SESSION_READ_DIRECTORY_WORKSPACES`. Use workspace ids or `*`, or explicitly
 `off` to clear it. If neither input nor variable is set, even an explicit

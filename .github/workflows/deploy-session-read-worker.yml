@@ -12,11 +12,25 @@ name: deploy session-read-worker
 #   SESSION_READ_TIMING_ASSUME_NO_TURNS  optional "true" (runbook, "Session timing")
 # Environment secret: CLOUDFLARE_API_TOKEN (Workers Scripts:Edit, Hyperdrive:Read).
 #
-# Owner-buffered reads (Option C, src/session-read-api/owner-buffered.ts): preserve on redeploy.
-# Child inputs below apply when owner_buffered is explicitly on/off.
-# A dispatch without inputs preserves the current live buffered-read profile and directory
-# allowlist. An explicit owner_buffered=off disables it. Preservation reads metadata only
-# and refuses unavailable, split or inconsistent live configuration. owner_buffered=on renders
+# Owner-buffered reads (Option C, src/session-read-api/owner-buffered.ts): a default dispatch
+# reproduces prod. Precedence, highest first (scripts/resolve-deploy-profile.ts):
+#   1. explicit inputs: owner_buffered=on/off and the child inputs given with it;
+#   2. the committed production profile, packages/session-read-worker/deploy/production-profile.json
+#      (owner_buffered=on, owner_buffered_workspaces="*", owner_buffered_events=on,
+#      owner_buffered_statement_timeout_ms=6000), used only because DEPLOY_TARGET=production below:
+#      by owner_buffered=profile (the default), and for a child input left at "profile"/empty under
+#      an explicit owner_buffered=on;
+#   3. the live Worker version: owner_buffered=preserve (the opt-out from the committed profile),
+#      and, in profile mode, everything the profile does not own (S3 bucket/region, stage
+#      concurrency, phase log, index verify, search gate) and the directory allowlist.
+# Profile mode reads live metadata only and is guarded: it may fill a live setting that is unset
+# (e.g. the statement timeout a deploy lost) but refuses to change or drop one that is set, refuses
+# to turn owner-buffered reads on when live has them off, refuses child overrides (use explicit
+# on/off), and, like preserve, refuses unavailable, split or inconsistent live configuration, a
+# directory variable/input that differs from live, and any collateral change to an unmanaged
+# live setting or binding. Changing the committed profile is a reviewed PR; the first deploy that
+# changes a live value is an explicit owner_buffered=on dispatch. owner_buffered=off disables it.
+# owner_buffered=on renders
 # (scripts/render-deploy-config.ts) the HISTORY_CONTROL_HEAD service binding to
 # relayhistory-api's named entrypoint SessionReadPrivacyControls (pinned in the script),
 # RELAYHISTORY_READ_OWNER_BUFFERED=true, READ_API_OWNER_BUFFERED_WORKSPACES from the
@@ -29,13 +43,13 @@ name: deploy session-read-worker
 #   SESSION_READ_INGEST_S3_REGION  its region (INGEST_S3_REGION)
 # The S3 credentials are the Worker's PIPELINE_RAW_S3_ACCESS_KEY_ID / _SECRET_ACCESS_KEY
 # secrets (wrangler secret put; GetObject + kms:Decrypt on buffered-batches/ is a separate
-# IAM grant); an on deploy refuses to run unless both exist. Default dispatches preserve it.
+# IAM grant); an on deploy refuses to run unless both exist. Default dispatches keep it on.
 #
 # owner_buffered_events=on (valid only with owner_buffered=on; the render refuses it otherwise)
 # adds READ_API_OWNER_BUFFERED_EVENTS=on: owner-buffered session events on
 # GET /v1/sessions/:sessionId/events with `source`. off (or no input) renders exactly the
-# owner_buffered render without it. Turning it on is a production change: dispatch is Khaliq's
-# call. Default dispatches preserve the live setting.
+# owner_buffered render without it; "profile" (the default) takes the committed value. Changing it
+# is a production change: dispatch is Khaliq's call. Default dispatches render the committed value.
 #
 # owner_buffered_stage_concurrency=2..32 and owner_buffered_phase_log=on (valid only with
 # owner_buffered_events=on; the render refuses them otherwise) add
@@ -53,8 +67,8 @@ name: deploy session-read-worker
 # without changes preserves the live setting.
 #
 # Buffered search gate (src/session-read-api/buffered-search-gate.ts, PR #338), default off.
-# buffered_search_gate=off (or no input) changes nothing: the render is byte-identical to the one
-# before this input existed. buffered_search_gate=on renders READ_API_BUFFERED_SEARCH_GATE=on and
+# buffered_search_gate=off (or no input) changes nothing: under owner_buffered=profile or preserve the
+# live gate is kept as it is, and under explicit on/off no gate is rendered. buffered_search_gate=on renders READ_API_BUFFERED_SEARCH_GATE=on and
 # the same pinned HISTORY_CONTROL_HEAD binding (once, also when owner_buffered=on); it needs no
 # workspace list and no S3, and refuses any other value. The gate drops every buffered-origin
 # search hit it cannot prove visible, so it must be deployed BEFORE the buffered search feeder
@@ -68,12 +82,12 @@ on:
   workflow_dispatch:
     inputs:
       owner_buffered:
-        description: Preserve the live read profile by default; on/off explicitly changes it
+        description: 'profile (default) = committed production profile, guarded against live; preserve = copy live; on/off explicitly changes it'
         type: choice
-        options: ["preserve", "on", "off"]
-        default: "preserve"
+        options: ["profile", "preserve", "on", "off"]
+        default: "profile"
       owner_buffered_workspaces:
-        description: 'Canary workspace ids, comma-separated, or exactly "*" for all workspaces (only if SESSION_READ_DIRECTORY_WORKSPACES is "*"); required when on'
+        description: 'Canary workspace ids, comma-separated, or exactly "*" for all workspaces (only if SESSION_READ_DIRECTORY_WORKSPACES is "*"); empty = committed profile with explicit on'
         type: string
         default: ""
       directory_workspaces:
@@ -81,14 +95,14 @@ on:
         type: string
         default: ""
       owner_buffered_events:
-        description: Owner-buffered session events (GET /v1/sessions/:id/events with source); valid only with owner_buffered=on. off = exactly the owner_buffered render
+        description: Owner-buffered session events (GET /v1/sessions/:id/events with source); valid only with owner_buffered=on. profile = committed value; off = exactly the owner_buffered render
         type: choice
-        options: ["off", "on"]
-        default: "off"
+        options: ["profile", "off", "on"]
+        default: "profile"
       owner_buffered_statement_timeout_ms:
-        description: Explicit on deploy only; off keeps runtime default, or integer 2000..6000 ms
+        description: profile = committed value; with explicit on, off keeps runtime default, or integer 2000..6000 ms
         type: string
-        default: "off"
+        default: "profile"
       owner_buffered_stage_concurrency:
         description: 'Owner-buffered events: S3 stage GetObjects in flight, "off" or an integer 2..32; valid only with owner_buffered_events=on. off = the serial fetch'
         type: string
@@ -104,7 +118,7 @@ on:
         options: ["off", "on"]
         default: "off"
       buffered_search_gate:
-        description: Per-hit privacy gate for buffered search hits (#338); needs no other input. off = exactly the default deploy
+        description: Per-hit privacy gate for buffered search hits (#338); needs no other input. off = keep the live gate (profile/preserve) or render none (explicit on/off)
         type: choice
         options: ["off", "on"]
         default: "off"
@@ -127,6 +141,8 @@ jobs:
     timeout-minutes: 10
     environment: session-read-worker
     env:
+      # This workflow deploys only production; the committed production profile applies only here.
+      DEPLOY_TARGET: production
       CLOUDFLARE_ACCOUNT_ID: f7232cb80f6fab86a95426302af243e4
       # CLOUDFLARE_API_TOKEN is given only to the steps that call Cloudflare,
       # never to install (dependency scripts) or the input checks.
@@ -138,7 +154,7 @@ jobs:
       DIRECTORY_WORKSPACES_INPUT: ${{ inputs.directory_workspaces }}
       BRIEF_TITLES_WORKSPACES: ${{ vars.SESSION_READ_BRIEF_TITLES_WORKSPACES }}
       TIMING_ASSUME_NO_TURNS: ${{ vars.SESSION_READ_TIMING_ASSUME_NO_TURNS }}
-      # Owner-buffered (default off); inputs reach the shell only through env.
+      # Owner-buffered (default: committed production profile); inputs reach the shell only through env.
       OWNER_BUFFERED: ${{ inputs.owner_buffered }}
       OWNER_BUFFERED_WORKSPACES: ${{ inputs.owner_buffered_workspaces }}
       OWNER_BUFFERED_S3_BUCKET: ${{ vars.SESSION_READ_INGEST_S3_BUCKET }}
@@ -170,7 +186,7 @@ jobs:
       - name: Install (root + workspaces)
         working-directory: .
         run: bun install --frozen-lockfile
-      - name: Resolve the live read profile (read-only; explicit on/off overrides preservation)
+      - name: Resolve the read profile (explicit inputs > committed production profile > live; read-only)
         id: resolve-profile
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
