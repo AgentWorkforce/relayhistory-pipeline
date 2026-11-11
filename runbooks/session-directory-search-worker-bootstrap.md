@@ -456,6 +456,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105050000_operator_session_erase.sql` | table sessions.session_erasure_receipts (operator per-session erase) |
 | `upstream:20261105050020_operator_session_erase_runtime.sql` | table sessions.session_erasure_writes (durable in-flight writes, default-off runtime RPCs) |
 | `upstream:20261105050010_operator_session_erase_fence_check.sql` | trigger ingest_erase_fence_index_guard on sessions.session_index; claim/commit call ingest_erase_fence_extend |
+| `upstream:20261105057000_session_directory_users_aggregate.sql` | function sessions.session_directory_users_for |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |

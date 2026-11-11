@@ -446,6 +446,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "trigger ingest_erase_fence_index_guard on sessions.session_index; claim/commit call ingest_erase_fence_extend",
     sql: "SELECT to_regprocedure('sessions.ingest_erase_fence_extend(text,text,text,text,jsonb)') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('sessions.session_index') AND tgname='ingest_erase_fence_index_guard') AS applied",
   },
+  "upstream:20261105057000_session_directory_users_aggregate.sql": {
+    evidence: "function sessions.session_directory_users_for",
+    sql: "SELECT to_regprocedure('sessions.session_directory_users_for(text,timestamptz,timestamptz,integer)') IS NOT NULL AS applied",
+  },
 };
 
 /** The ALTER-only and replacement steps the CREATE inventory alone can't see. */
