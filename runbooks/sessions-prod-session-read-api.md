@@ -96,9 +96,9 @@ Each guarantee below has a mutation in `scripts/aws-hardening-mutations.ts` (`--
 
 ## Session analysis (lane F1, migration 20261105046000)
 
-Default off. Every step below needs Khaliq's explicit OK, and none of it is run by this repository.
+Default off. Every step below needs Khaliq's explicit OK. Only the role creation in step 1 is run by this repository, by the CI bootstrap stage.
 
-1. **Admission principal.** `bulls96_analysis_admit` is created NOLOGIN before migrate by `supabase/bootstrap/session_read_api_roles.sql`, and the migration grants it EXECUTE on `sessions.analysis_request_v1` only. After migrate, as `postgres`:
+1. **Admission principal.** `bulls96_analysis_admit` must exist before migrate, because the migration grants it EXECUTE on `sessions.analysis_request_v1` only (a missing role fails with 42704). The **CI bootstrap stage** of the guarded session schema release creates it NOLOGIN from `supabase/bootstrap/session_read_api_roles.sql` (see "Bootstrap stage" in runbooks/guarded-session-schema-release.md). Do not run that file by hand; the release apply refuses with release_bootstrap_required while the role is absent. After migrate, as `postgres`:
    ```sh
    psql -v ON_ERROR_STOP=1 -X -d <HoopDb> -f supabase/bootstrap/session_analysis_admit_role.sql
    psql -X -d <HoopDb> -c '\password bulls96_analysis_admit'   # password from 1Password, never on disk

@@ -145,7 +145,8 @@ export async function githubReleaseGate(
       runs: "release_target_ci",
       jobs: "release_target_ci_jobs",
     });
-  if (input.mode === "apply") {
+  // Apply and bootstrap both consume a successful same-sha plan run under 24h old.
+  if (input.mode !== "plan") {
     const plan = await get(base + "/actions/runs/" + input.planRun);
     if (
       String(plan.id) === env.GITHUB_RUN_ID ||

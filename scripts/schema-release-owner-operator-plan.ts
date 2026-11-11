@@ -5,6 +5,7 @@ import { generation, inspectMigrations, migrationProfile } from "../src/hoopdb/m
 import { functionBoundaryEvidence } from "../src/hoopdb/migrate-guards.ts";
 import { SUPABASE_PROD_CA_2021 } from "../src/session-pipeline/supabase-ca.ts";
 import { parseCliLogin as parseSupabaseCliLogin } from "../src/shared/supabase-cli-login.ts";
+import { bootstrapSection, readBootstrapState, releaseBootstrapFiles, type BootstrapState } from "../src/hoopdb/schema-release-bootstrap.ts";
 const PROJECT = "pyamkrhoyszgzirqqffq";
 const CLI = "/home/khaliqgant/.local/bin/supabase";
 function refuse(code: string): never { throw Object.assign(new Error(code), { code }); }
@@ -15,6 +16,10 @@ export function ownerPlanInputs(env: NodeJS.ProcessEnv, argv: string[]) {
   const sha = env.OPERATOR_SOURCE_SHA, digest = env.OPERATOR_GENERATION;
   if (!sha || !/^[0-9a-f]{40}$/u.test(sha) || !digest || !/^[0-9a-f]{64}$/u.test(digest)) refuse("operator_source_pin");
   return { sha, digest };
+}
+/** The bootstrap section of this source sha (release = target = source), supabase db mode. */
+export function ownerPlanBootstrap(files: Parameters<typeof bootstrapSection>[0]["files"], state: BootstrapState) {
+  return bootstrapSection({ files, state, supabaseMode: true });
 }
 interface OwnerPlanClient {
   connect(): Promise<void>;
@@ -54,7 +59,8 @@ export async function operatorOwnerPlan() {
     const profile = migrationProfile({ HOOPDB_DB_MODE: "supabase", HOOPDB_SUPABASE_SHIM: "false", HOOPDB_ROLE_BOOTSTRAP: "false", HOOPDB_ROLE_VERIFY: "true", HOOPDB_RUNTIME_ROLE: "bulls96_runtime", HOOPDB_RUNTIME_ROLE_LOGIN: "true", HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke" });
     const report = await inspectMigrations(client, profile);
     const trigger = await functionBoundaryEvidence(client, "event-trigger", "supabase", "bulls96_runtime");
-    console.log(JSON.stringify({ version: 1, status: "planned_readonly_not_apply_approval", at: new Date().toISOString(), project: PROJECT, sourceSha: input.sha, boundary: "global-default-revoke", existingEventTriggerMatchesSource: trigger.satisfied, ...report }));
+    const bootstrap = ownerPlanBootstrap(releaseBootstrapFiles(process.cwd(), input.sha, input.sha), await readBootstrapState(client));
+    console.log(JSON.stringify({ version: 1, status: "planned_readonly_not_apply_approval", at: new Date().toISOString(), project: PROJECT, sourceSha: input.sha, boundary: "global-default-revoke", existingEventTriggerMatchesSource: trigger.satisfied, ...report, bootstrap }));
   });
 }
 if (import.meta.main) operatorOwnerPlan().catch(error => { const code = typeof error?.code === "string" && /^[A-Za-z0-9_]{1,64}$/u.test(error.code) ? error.code : "operator_plan_failed"; console.log(JSON.stringify({ status: "refused", code })); process.exitCode = 1; });
