@@ -222,6 +222,12 @@ the original sketch below in four ways:
   `sharing_mode: new`) a `session` record whose `first_activity_ms` is before
   the policy's `sharing_mode_since`, is logged with
   `metric: capture_policy_upload_violation`.
+  An All-only policy, optionally accompanied by `user_retroactive_delete`, does
+  not require a revision header: it places no restriction on upload content,
+  and older clients omit that header. Additional upload settings (including
+  an oops window) still require the current revision. Delete authorization is
+  unchanged. This compatibility rule is not a Selected allowlist or proof of
+  per-user upload consent.
   `RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS=report` (default) accepts it;
   `enforce` refuses it 409 `capture_policy_stale` (Desktop retries and sends
   the new revision after its next policy read) or 422

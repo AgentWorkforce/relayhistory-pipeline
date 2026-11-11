@@ -11,6 +11,7 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { zstdDecompressSync } from "node:zlib";
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
@@ -428,6 +429,54 @@ describe("capture policy upload check (RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLO
       record({ record_id: "s2", kind: "session", payload: { first_activity_ms: Date.parse(SINCE) + 60_000 } }),
     ], { batch_id: "batch-s2" }) });
     expect((await post(url("/v1/delivery/batches"), fresh, { [HEADER]: "7" })).status).toBe(200);
+  });
+
+  test("enforce: a legacy All client stores its payload without a policy revision header", async () => {
+    const rc = await relaycontrol(() => policy({ sharing_mode: "all", user_retroactive_delete: false }));
+    const { url, store, db } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce" });
+    const marker = "synthetic legacy All upload compatibility marker";
+    const input = await batch([record({ record_id: "legacy-all-event", payload: { text: marker, ts_ms: Date.parse(SINCE) - 60_000 } })], { batch_id: "legacy-all-batch" });
+    const response = await post(url("/v1/delivery/batches"), JSON.stringify({ protocolVersion: 1, batch: input }));
+    expect(response.status).toBe(200);
+    expect((await response.json() as { acceptedRevisionIds: string[] }).acceptedRevisionIds).toHaveLength(1);
+    const keys = await chunkKeys(store);
+    expect(keys.some(key => key.endsWith("manifest.json"))).toBe(true);
+    let payloadFound = false;
+    for (const key of keys.filter(key => key.endsWith(".zst"))) {
+      const object = await store.getObject(objectKey(key));
+      const bytes = new Uint8Array(await new Response(object.body).arrayBuffer());
+      payloadFound ||= new TextDecoder().decode(zstdDecompressSync(bytes)).includes(marker);
+    }
+    expect(payloadFound).toBe(true);
+    expect((await db.query("SELECT state FROM sessions.ingest_batches WHERE batch_id='legacy-all-batch'")).rows).toEqual([{ state: "committed" }]);
+    expect((await db.query("SELECT record_id FROM sessions.ingest_record_revisions WHERE record_id='legacy-all-event'")).rows).toEqual([{ record_id: "legacy-all-event" }]);
+  });
+
+  test("enforce: legacy All uploads cannot lift an existing session exclusion", async () => {
+    const rc = await relaycontrol(() => policy({ sharing_mode: "all", user_retroactive_delete: false }));
+    const { url, store, db } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce" });
+    await db.exec("SET ROLE bulls96_session_ingest");
+    try {
+      await db.query("SELECT sessions.ingest_set_session_uploads($1::jsonb)", [JSON.stringify({
+        tenant: TENANT, originId: "origin-1", sessions: [["claude", "sess-1"]], enabled: false,
+      })]);
+    } finally {
+      await db.exec("RESET ROLE");
+    }
+    const response = await post(url("/v1/delivery/batches"), await deliveryBody("excluded-legacy-all"));
+    // Existing exclusion acknowledgments suppress content; this does not grant consent.
+    expect(response.status).toBe(200);
+    expect(await chunkKeys(store)).toEqual([]);
+    expect((await db.query("SELECT record_id FROM sessions.ingest_record_revisions")).rows).toEqual([]);
+  });
+
+  test("enforce: All with an upload window still refuses a legacy header before storage", async () => {
+    const rc = await relaycontrol(() => policy({ sharing_mode: "all", oops_window_seconds: 60 }));
+    const { url, store, db } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce" });
+    const response = await post(url("/v1/delivery/batches"), await deliveryBody("legacy-window"));
+    expect([response.status, await code(response)]).toEqual([409, "capture_policy_stale"]);
+    expect(await chunkKeys(store)).toEqual([]);
+    expect((await db.query("SELECT state FROM sessions.ingest_batches")).rows).toEqual([]);
   });
 
   test("enforce: a policy that sets no key, or no policy at all (older relaycontrol), needs no header", async () => {
