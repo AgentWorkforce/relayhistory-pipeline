@@ -54,6 +54,36 @@ export function parseHistoryUploadDirectInfra(value: string | undefined): boolea
   throw new Error(`96bulls: HISTORY_UPLOAD_DIRECT_INFRA must be "on" or "off" (or unset), got ${JSON.stringify(value)}. Nothing was created.`);
 }
 
+/**
+ * The consumer's server-side-encryption requirement on hosted (decision 0004): always exactly
+ * aws:kms, so an inbox object without SSE-KMS is refused (`upload_unencrypted`). The consumer
+ * reads it from HISTORY_UPLOAD_INBOX_SSE (src/session-ingest/upload-admission.ts
+ * UPLOAD_INBOX_SSE_VAR). Self-host keeps its own default ("none", e.g. MinIO without KMS;
+ * selfhost-config.ts); this hosted requirement never applies there.
+ */
+export const UPLOAD_INBOX_SSE_ENV = "HISTORY_UPLOAD_INBOX_SSE";
+export const HOSTED_UPLOAD_INBOX_SSE = "aws:kms";
+
+/**
+ * `transcriptStore.uploadInboxSse`. Whenever present it must be exactly "aws:kms": none, "", null
+ * or any other value refuses (hosted never runs the consumer without the SSE-KMS check). With
+ * `required` (historyUploadDirectInfra on) it must also be present.
+ */
+export function assertHostedUploadInboxSse(value: unknown, required: boolean, refuse: (why: string) => never): asserts value is typeof HOSTED_UPLOAD_INBOX_SSE | undefined {
+  if (value === undefined) {
+    if (required) refuse(`transcriptStore.uploadInboxSse is required and must be exactly "${HOSTED_UPLOAD_INBOX_SSE}" (hosted runs the consumer with ${UPLOAD_INBOX_SSE_ENV}=${HOSTED_UPLOAD_INBOX_SSE})`);
+    return;
+  }
+  if (value !== HOSTED_UPLOAD_INBOX_SSE)
+    refuse(`transcriptStore.uploadInboxSse must be exactly "${HOSTED_UPLOAD_INBOX_SSE}" on hosted, got ${typeof value === "string" ? JSON.stringify(value) : typeof value}; "none", "" and unset are for self-host only`);
+}
+
+/** The upload-admission consumer's environment on hosted; the consumer Lambda (a separate change) must use it. */
+export function uploadAdmissionEnvironment(sse: typeof HOSTED_UPLOAD_INBOX_SSE) {
+  if (sse !== HOSTED_UPLOAD_INBOX_SSE) throw new Error(`96bulls: ${UPLOAD_INBOX_SSE_ENV} must be "${HOSTED_UPLOAD_INBOX_SSE}" on hosted. Nothing was created.`);
+  return { [UPLOAD_INBOX_SSE_ENV]: sse } as const;
+}
+
 const ROLE_ARN_RE = /^arn:aws:iam::\d{12}:role\/[A-Za-z0-9_+=,.@/-]+$/;
 /** relay-control's role: any account (control may live elsewhere), a named role, partition aws. */
 export function assertUploadControlRoleArn(value: unknown, refuse: (why: string) => never): asserts value is string | undefined {

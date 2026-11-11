@@ -8,6 +8,7 @@ export const SCHEMA_RELEASE = {
   database: "postgres",
   owner: "relayhistory_owner",
   runtime: "bulls96_runtime",
+  dispatcher: { login: "khaliqgant", id: 1724137 },
   workflow: ".github/workflows/apply-session-schema.yml",
 } as const;
 export function refuse(code: string): never {

@@ -36,6 +36,14 @@
  * material is never logged, cached in clear or echoed: the cache key is
  * sha256(token), and logs carry `token_id` only.
  *
+ * Capture policy (v1.5, relay-control docs/capture-policy.md): an active
+ * answer may carry `role` (the live organization role) and `capture_policy`
+ * ({version: 1, revision, settings}, the organization's served policy). Both
+ * are optional, so an older relaycontrol that sends neither still verifies
+ * (the caller then has no policy to enforce). When present they must have
+ * the contract shape, or the answer is malformed (503): a policy is never
+ * guessed. They reach the AuthContext as `role` and `capturePolicy`.
+ *
  * Machine verification (v1.1, AlleyOop courier surface only): the caller's
  * claimed machine id (the request's X-Machine-Id) is forwarded as `machine`,
  * a claim for relaycontrol to verify, never identity. It must match
@@ -68,6 +76,40 @@ const DEFAULT_TIMEOUT_MS = 5_000;
 const DEFAULT_POSITIVE_TTL_MS = 60_000;
 const DEFAULT_NEGATIVE_TTL_MS = 5_000;
 const DEFAULT_MAX_ENTRIES = 1_000;
+
+/**
+ * The organization's capture policy as relaycontrol serves it (introspection
+ * v1.5). Only keys present in `settings` are enforced.
+ */
+export interface RelaycontrolCapturePolicy {
+  revision: number;
+  settings: Readonly<Record<string, unknown>>;
+  /** When `sharing_mode` last became `new` (epoch ms); only while it is `new`. */
+  sharingModeSinceMs?: number;
+}
+
+/**
+ * `capture_policy` from an introspection answer: undefined when absent (an
+ * older relaycontrol), null when present but not the contract shape.
+ */
+export function parseCapturePolicy(value: unknown): RelaycontrolCapturePolicy | undefined | null {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const { version, revision, settings } = value as Record<string, unknown>;
+  if (version !== 1 || typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1) return null;
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) return null;
+  const since = (value as Record<string, unknown>).sharing_mode_since;
+  let sharingModeSinceMs: number | undefined;
+  if (since !== undefined) {
+    sharingModeSinceMs = typeof since === "string" && since.length <= 64 ? Date.parse(since) : Number.NaN;
+    if (!Number.isFinite(sharingModeSinceMs)) return null;
+  }
+  return {
+    revision,
+    settings: Object.freeze({ ...(settings as Record<string, unknown>) }),
+    ...(sharingModeSinceMs !== undefined ? { sharingModeSinceMs } : {}),
+  };
+}
 
 export function isRelaycontrolToken(token: string): boolean {
   return token.startsWith(RELAYCONTROL_TOKEN_PREFIX);
@@ -263,6 +305,8 @@ function cloneAuth(auth: AuthContext): AuthContext {
     ...(auth.analyticsIdentity
       ? { analyticsIdentity: { ...auth.analyticsIdentity } }
       : {}),
+    // Frozen at parse time, so shared safely.
+    ...(auth.capturePolicy ? { capturePolicy: { ...auth.capturePolicy } } : {}),
   };
 }
 
@@ -393,9 +437,12 @@ export function createRelaycontrolIntrospector(
       typeof body.iat !== "number" ||
       !Number.isFinite(body.iat) ||
       !(body.machine_id === null || body.machine_id === undefined || typeof body.machine_id === "string") ||
-      !(body.email === undefined || body.email === null || typeof body.email === "string")
+      !(body.email === undefined || body.email === null || typeof body.email === "string") ||
+      !(body.role === undefined || (typeof body.role === "string" && body.role.length > 0 && body.role.length <= 32))
     )
       throw new RelaycontrolUnavailableError("malformed_response");
+    const capturePolicy = parseCapturePolicy(body.capture_policy);
+    if (capturePolicy === null) throw new RelaycontrolUnavailableError("malformed_response");
     // Only desktop users; an "agent" (or any new or absent) principal is refused.
     if (body.principal_type !== RELAYCONTROL_PRINCIPAL_TYPE)
       return {
@@ -462,6 +509,8 @@ export function createRelaycontrolIntrospector(
         ...(machineId !== undefined ? { meta: { machineId } } : {}),
       },
       historyOrigin: request.aud,
+      ...(body.role !== undefined ? { role: body.role as string } : {}),
+      ...(capturePolicy ? { capturePolicy } : {}),
     };
     const analytics: AnalyticsIdentity | undefined = analyticsIdentity({
       version: 2,
