@@ -54,8 +54,9 @@ function witnessInput(tenant: LedgerTenant, p: PreparedDelivery): FrozenWitnessI
 function classify(error: unknown, attempts: number): AdmissionAction | { terminal: string } {
   // A reset / re-enable is in flight for this user: wait for it (never admit across it).
   if (error instanceof IngestUnavailable && error.cause_code === new PrivacyControlPending().code) return { action: "retry", delaySeconds: 15, code: "privacy_control_pending", stage: error.stage, error };
-  // INGEST_CLAIM_LOCK_BUSY turns a claim lock wait into a 429 for the HTTP client only: the queue keeps
-  // the IngestUnavailable backoff, code and stage, so the flag changes nothing on this path.
+  // INGEST_CLAIM_LOCK_BUSY / INGEST_CLAIM_TIMEOUT_BUSY turn a claim lock wait / statement timeout into a
+  // 429 for the HTTP client only: the queue keeps the IngestUnavailable backoff, code and stage, so the
+  // flags change nothing on this path.
   if (error instanceof ClaimLockBusy) return { action: "retry", delaySeconds: backoffSeconds(attempts), code: error.cause_code, stage: error.stage, error };
   if (error instanceof DeliveryBusyError) return { action: "retry", delaySeconds: error.retryAfterSeconds, code: error.code, error };
   if (error instanceof IngestUnavailable) return { action: "retry", delaySeconds: backoffSeconds(attempts), code: error.cause_code, stage: error.stage, error };
