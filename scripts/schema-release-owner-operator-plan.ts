@@ -5,7 +5,7 @@ import { generation, inspectMigrations, migrationProfile, schemaStepDigests } fr
 import { functionBoundaryEvidence } from "../src/hoopdb/migrate-guards.ts";
 import { SUPABASE_PROD_CA_2021 } from "../src/session-pipeline/supabase-ca.ts";
 import { parseCliLogin as parseSupabaseCliLogin } from "../src/shared/supabase-cli-login.ts";
-import { bootstrapSection, readBootstrapState, releaseBootstrapFiles, type BootstrapState } from "../src/hoopdb/schema-release-bootstrap.ts";
+import { bootstrapSection, readBootstrapState, releaseBootstrapContract, releaseBootstrapFiles, type BootstrapAnchorContract, type BootstrapState } from "../src/hoopdb/schema-release-bootstrap.ts";
 const PROJECT = "pyamkrhoyszgzirqqffq";
 const CLI = "/home/khaliqgant/.local/bin/supabase";
 function refuse(code: string): never { throw Object.assign(new Error(code), { code }); }
@@ -22,10 +22,10 @@ export function ownerPlanInputs(env: NodeJS.ProcessEnv, argv: string[]) {
  * source tree's last schema step, so every role first consumed in the tree is
  * required), supabase db mode.
  */
-export function ownerPlanBootstrap(sha: string, steps: readonly string[], files: Parameters<typeof bootstrapSection>[0]["files"], state: BootstrapState) {
+export function ownerPlanBootstrap(sha: string, steps: readonly string[], files: Parameters<typeof bootstrapSection>[0]["files"], state: BootstrapState, contract: BootstrapAnchorContract) {
   const target = steps[steps.length - 1];
   if (target === undefined) refuse("operator_source_pin");
-  return bootstrapSection({ target, targetSha: sha, steps, files, state, supabaseMode: true });
+  return bootstrapSection({ target, targetSha: sha, steps, files, contract, state, supabaseMode: true });
 }
 interface OwnerPlanClient {
   connect(): Promise<void>;
@@ -66,7 +66,7 @@ export async function operatorOwnerPlan() {
     const report = await inspectMigrations(client, profile);
     const trigger = await functionBoundaryEvidence(client, "event-trigger", "supabase", "bulls96_runtime");
     const steps = (await schemaStepDigests([])).map(([name]) => name);
-    const bootstrap = ownerPlanBootstrap(input.sha, steps, releaseBootstrapFiles(process.cwd(), input.sha, input.sha), await readBootstrapState(client));
+    const bootstrap = ownerPlanBootstrap(input.sha, steps, releaseBootstrapFiles(process.cwd(), input.sha, input.sha), await readBootstrapState(client), releaseBootstrapContract(process.cwd(), input.sha));
     console.log(JSON.stringify({ version: 1, status: "planned_readonly_not_apply_approval", at: new Date().toISOString(), project: PROJECT, sourceSha: input.sha, boundary: "global-default-revoke", existingEventTriggerMatchesSource: trigger.satisfied, ...report, bootstrap }));
   });
 }

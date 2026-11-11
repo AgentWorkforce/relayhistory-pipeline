@@ -11,17 +11,21 @@ import {
   BOOTSTRAP_LOCK,
   BOOTSTRAP_UNLOCK,
   bootstrapChainRoles,
+  bootstrapContractCoverage,
+  bootstrapContractDigests,
+  bootstrapContractSource,
   bootstrapSection,
   bootstrapTargetChain,
   requireBootstrapRoles,
   requireBootstrapTargetChain,
   runBootstrapStage,
   stripPsqlMeta,
+  type BootstrapAnchorContract,
   type BootstrapEdge,
   type BootstrapSection,
   type BootstrapState,
 } from "../schema-release-bootstrap.ts";
-import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
+import { SESSION_BOOTSTRAP_FILES, SESSION_BOOTSTRAP_ROLES } from "../session-bootstrap-chain.ts";
 import { SESSION_BOOTSTRAP_CONSUMERS } from "../session-bootstrap-consumers.ts";
 
 const repo = new URL("../../../", import.meta.url);
@@ -97,6 +101,19 @@ const readApiFile = "supabase/bootstrap/session_read_api_roles.sql";
 const BEFORE = state([admit]);
 const AFTER = state([], { edges: [creatorEdge(admit)] });
 
+/** The anchor's contract modules: the HEAD module bytes (source "anchor"); null: an absent consumers module. */
+const CHAIN_MODULE_TEXT = realBytes("src/hoopdb/session-bootstrap-chain.ts").toString("utf8");
+const CONSUMERS_MODULE_TEXT = realBytes("src/hoopdb/session-bootstrap-consumers.ts").toString("utf8");
+const anchorContract = (chainModule = CHAIN_MODULE_TEXT, consumersModule: string | null = CONSUMERS_MODULE_TEXT): BootstrapAnchorContract => ({
+  chainModule,
+  consumersModule: consumersModule ?? undefined,
+});
+/** A legacy anchor (Release A shape): no SESSION_BOOTSTRAP_ROLES section, no consumers module. */
+const LEGACY: BootstrapAnchorContract = {
+  chainModule: "export const SESSION_BOOTSTRAP_FILES = [] as const; // legacy anchor\n",
+  consumersModule: undefined,
+};
+
 const chainSql = (sql: string) => /CREATE\s+ROLE|\bALTER\s|\bGRANT\s|\bDO\b/i.test(sql);
 interface Script {
   before?: BootstrapState;
@@ -151,8 +168,8 @@ const control = (log: string[]) =>
   log.filter((q) => ["BEGIN", "ROLLBACK", "COMMIT", BOOTSTRAP_LOCK, BOOTSTRAP_UNLOCK, "<end>"].includes(q) || chainSql(q))
     .map((q) => (chainSql(q) ? "<chain>" : q));
 
-const plan = (f = files(), st = BEFORE, target = T047, steps = STEPS) =>
-  bootstrapSection({ target, targetSha: TSHA, steps, files: f, state: st, supabaseMode: true, log: () => {} });
+const plan = (f = files(), st = BEFORE, target = T047, steps = STEPS, contract = anchorContract()) =>
+  bootstrapSection({ target, targetSha: TSHA, steps, files: f, contract, state: st, supabaseMode: true, log: () => {} });
 async function run(
   s: Script,
   o: {
@@ -162,7 +179,9 @@ async function run(
     target?: string;
     targetSha?: string;
     approvalChain?: string;
-    underLock?: () => Promise<{ files: ReturnType<typeof files>; steps: string[] }>;
+    /** The anchor contract modules the default underLock returns (default: HEAD's). */
+    contract?: BootstrapAnchorContract;
+    underLock?: () => Promise<{ files: ReturnType<typeof files>; steps: string[]; contract: BootstrapAnchorContract }>;
   } = {},
 ) {
   const planned = o.planned ?? plan();
@@ -181,7 +200,9 @@ async function run(
       planned,
       approvalChain: o.approvalChain ?? planned.chain_digest,
       supabaseMode: true,
-      underLock: o.underLock ?? (async () => ({ files: o.files ?? files(), steps: o.steps ?? STEPS })),
+      underLock:
+        o.underLock ??
+        (async () => ({ files: o.files ?? files(), steps: o.steps ?? STEPS, contract: o.contract ?? anchorContract() })),
       writeEvidence: async (e) => {
         evidence.push(e);
       },
@@ -373,7 +394,7 @@ test("negative: a role above the target is not required, not created and not dri
 test("negative: an unmapped, duplicate or conflicting manifest entry refuses (no client reached)", () => {
   const base = [...SESSION_BOOTSTRAP_CONSUMERS];
   const section = (consumers: (readonly [string, string])[]) => () =>
-    bootstrapSection({ target: T047, targetSha: TSHA, steps: STEPS, files: files(), state: BEFORE, supabaseMode: true, consumers, log: () => {} });
+    bootstrapSection({ target: T047, targetSha: TSHA, steps: STEPS, files: files(), contract: LEGACY, state: BEFORE, supabaseMode: true, consumers, log: () => {} });
   expect(code(section(base.slice(1)))).toBe("release_bootstrap_manifest");
   expect(code(section([...base, base[3]]))).toBe("release_bootstrap_manifest");
   expect(code(section([...base, [base[3][0], "20261105047000_coordination_fact_readers.sql"]]))).toBe("release_bootstrap_manifest");
@@ -441,7 +462,7 @@ test("negative: release bytes that differ from the anchor's for a running file r
 test("negative: target or manifest drift before connecting refuses (pure git-side binding)", () => {
   const planned = plan();
   const chain = (target = T047, targetSha = TSHA, steps = STEPS, f = files()) =>
-    bootstrapTargetChain({ target, targetSha, steps, files: f });
+    bootstrapTargetChain({ target, targetSha, steps, files: f, contract: anchorContract() });
   expect(requireBootstrapTargetChain(chain(), planned, planned.chain_digest)).toBe(planned.chain_digest);
   // Another target, another target sha, an approval CHAIN that does not match.
   expect(code(() => requireBootstrapTargetChain(chain(T_MID), planned, planned.chain_digest))).toBe("release_bootstrap_plan_changed");
@@ -528,4 +549,204 @@ test("positive: an early target creates only its required absent role and runs o
   expect(r.evidence[0]).toMatchObject({ ran: [verifierFile], created: [verifier] });
   expect(r.log.filter(chainSql)).toEqual([stripPsqlMeta(realBytes(verifierFile).toString("utf8"))]);
   expect(workerFile).toBe(SESSION_BOOTSTRAP_FILES[0]);
+});
+
+// ---- Contract binding (review finding P2-1; DB owner ruling on the contract digest) ----
+
+/** The HEAD chain module text with `from` replaced by `to` (exactly once). */
+const chainText = (...edits: [string, string][]) =>
+  edits.reduce((t, [from, to]) => {
+    expect(t.split(from).length).toBe(2);
+    return t.replace(from, to);
+  }, CHAIN_MODULE_TEXT);
+const consumersText = (pairs: readonly (readonly [string, string])[]) =>
+  "export const SESSION_BOOTSTRAP_CONSUMERS: readonly (readonly [role: string, firstConsumer: string])[] = [\n" +
+  pairs.map(([r, f]) => `  [${JSON.stringify(r)}, ${JSON.stringify(f)}],\n`).join("") +
+  "];\n";
+const READ_API_LINE = 'bulls96_read_api: bare("allowed", "none"),';
+/** Same SQL chain, different contract semantics: bulls96_read_api's inbound edge set. */
+const SEMANTIC_DRIFT = chainText([READ_API_LINE, 'bulls96_read_api: bare("allowed", "unchecked"),']);
+
+test("contract: CHAIN folds the composite contract digest; a contract or manifest change with identical SQL changes CHAIN", () => {
+  const d = bootstrapContractDigests();
+  expect(d.contract_digest).toBe(
+    new Bun.CryptoHasher("sha256")
+      .update(`bootstrap-contract-v1\nmap ${d.contract_map_digest}\nmanifest ${d.contract_manifest_digest}\n`)
+      .digest("hex"),
+  );
+  const planned = plan();
+  expect(planned.contract_source).toBe("anchor");
+  expect({ m: planned.contract_map_digest, n: planned.contract_manifest_digest, c: planned.contract_digest }).toEqual({
+    m: d.contract_map_digest,
+    n: d.contract_manifest_digest,
+    c: d.contract_digest,
+  });
+  // Legacy anchor: the release's contract, the same digests and CHAIN (CHAIN binds the
+  // contract content; the source is bound by the plan comparison, contract (e)).
+  const legacy = plan(files(), BEFORE, T047, STEPS, LEGACY);
+  expect(legacy.contract_source).toBe("release");
+  expect(legacy.contract_digest).toBe(d.contract_digest);
+  expect(legacy.chain_digest).toBe(planned.chain_digest);
+  // (a) One contract field changed (same SQL bytes): the map digest and CHAIN change.
+  const map = structuredClone(SESSION_BOOTSTRAP_ROLES) as Record<string, Record<string, { login: string; inbound: string; settings: string }>>;
+  map[readApiFile].bulls96_read_api.inbound = "unchecked";
+  const sec = (o: { map?: typeof SESSION_BOOTSTRAP_ROLES; consumers?: (readonly [string, string])[] }) =>
+    bootstrapSection({ target: T047, targetSha: TSHA, steps: STEPS, files: files(), contract: LEGACY, state: BEFORE, supabaseMode: true, log: () => {}, ...o });
+  const mapped = sec({ map: map as unknown as typeof SESSION_BOOTSTRAP_ROLES });
+  expect(mapped.contract_map_digest).not.toBe(legacy.contract_map_digest);
+  expect(mapped.contract_manifest_digest).toBe(legacy.contract_manifest_digest);
+  expect(mapped.chain_digest).not.toBe(legacy.chain_digest);
+  // (b) One manifest pair moved (still at or below the target): the manifest digest and CHAIN change.
+  const consumers = SESSION_BOOTSTRAP_CONSUMERS.map(([r, f]): [string, string] =>
+    r === admit ? [r, "20261105047000_coordination_fact_readers.sql"] : [r, f],
+  );
+  const moved = sec({ consumers });
+  expect(moved.contract_manifest_digest).not.toBe(legacy.contract_manifest_digest);
+  expect(moved.contract_map_digest).toBe(legacy.contract_map_digest);
+  expect(moved.chain_digest).not.toBe(legacy.chain_digest);
+  // The plan exposes digests only, never contract contents.
+  const exposed = JSON.stringify([planned.contract_source, planned.contract_map_digest, planned.contract_manifest_digest, planned.contract_digest]);
+  expect(exposed).not.toContain("worker-2s");
+});
+
+test("contract (a): partial anchor modules refuse release_bootstrap_contract_drift before connecting and under the lock", async () => {
+  const partial: [string, BootstrapAnchorContract][] = [
+    ["map without consumers module", anchorContract(CHAIN_MODULE_TEXT, null)],
+    ["consumers module without map", { chainModule: LEGACY.chainModule, consumersModule: CONSUMERS_MODULE_TEXT }],
+    ["map that does not parse", anchorContract(chainText([READ_API_LINE, "bulls96_read_api: bare(`allowed`, `none`),"]))],
+    ["consumers that do not parse", anchorContract(CHAIN_MODULE_TEXT, CONSUMERS_MODULE_TEXT.replace("];", "].map((x) => x);"))],
+    ["bare redefined", anchorContract(chainText(['settings: "unchecked" })', 'settings: "worker-2s" })']))],
+    ["prototype key", anchorContract(chainText([READ_API_LINE, READ_API_LINE + ' __proto__: bare("allowed", "none"),']))],
+  ];
+  for (const [name, contract] of partial) {
+    expect({ name, pure: code(() => bootstrapContractSource(contract)) }).toEqual({ name, pure: "release_bootstrap_contract_drift" });
+    expect({ name, plan: code(() => plan(files(), BEFORE, T047, STEPS, contract)) }).toEqual({ name, plan: "release_bootstrap_contract_drift" });
+    const r = await run({}, { contract });
+    expect({ name, code: r.code, log: r.log }).toEqual({ name, code: "release_bootstrap_contract_drift", log: underLockRefused });
+    expectNoMutation(r);
+  }
+});
+
+test("contract (b): semantic drift with an identical SQL chain refuses before connecting and under the lock", async () => {
+  const drifted: [string, BootstrapAnchorContract][] = [
+    ["map value", anchorContract(SEMANTIC_DRIFT)],
+    [
+      "manifest pair",
+      anchorContract(
+        CHAIN_MODULE_TEXT,
+        consumersText(SESSION_BOOTSTRAP_CONSUMERS.map(([r, f]) => (r === admit ? [r, "20261105047000_coordination_fact_readers.sql"] : [r, f]))),
+      ),
+    ],
+  ];
+  for (const [name, contract] of drifted) {
+    // Same anchor SQL bytes (files()) in every case.
+    expect({ name, pre: code(() => bootstrapTargetChain({ target: T047, targetSha: TSHA, steps: STEPS, files: files(), contract })) }).toEqual({
+      name,
+      pre: "release_bootstrap_contract_drift",
+    });
+    const r = await run({}, { contract });
+    expect({ name, code: r.code, log: r.log }).toEqual({ name, code: "release_bootstrap_contract_drift", log: underLockRefused });
+    expectNoMutation(r);
+  }
+});
+
+test("contract (c): key order, role order, file order, pair order and bare vs explicit are equal (anchor, same CHAIN)", async () => {
+  const workerFields = 'login: "never",\n      inbound: "worker",\n      settings: "worker-2s",';
+  const ingestPair = '    bulls96_privacy_eraser: bare("allowed", "unchecked"),\n    bulls96_babysitter_retention: bare("allowed", "unchecked"),\n';
+  const workerBlock = CHAIN_MODULE_TEXT.slice(
+    CHAIN_MODULE_TEXT.indexOf('  "supabase/bootstrap/session_directory_search_worker.sql": {'),
+    CHAIN_MODULE_TEXT.indexOf('  "supabase/bootstrap/session_token_verifier.sql": {'),
+  );
+  // The worker file's block moves last (file order), then the field/role/bare edits.
+  const end = CHAIN_MODULE_TEXT.lastIndexOf("\n};");
+  const moved = CHAIN_MODULE_TEXT.slice(0, end + 1) + workerBlock + CHAIN_MODULE_TEXT.slice(end + 1);
+  const reordered = [
+    [workerFields, 'settings: "worker-2s", inbound: "worker", login: "never"'],
+    [ingestPair, '    bulls96_babysitter_retention: bare("allowed", "unchecked"),\n    bulls96_privacy_eraser: bare("allowed", "unchecked"),\n'],
+    [READ_API_LINE, '/* explicit */ bulls96_read_api: { inbound: "none", settings: "unchecked", login: "allowed", },'],
+  ].reduce((t, [from, to]) => {
+    expect(t.split(from).length).toBe(2);
+    return t.replace(from, to);
+  }, moved.replace(workerBlock, ""));
+  const key = (f: string) => reordered.indexOf(`  "supabase/bootstrap/${f}.sql": {`);
+  expect(key("session_directory_search_worker")).toBeGreaterThan(key("session_consumer_roles"));
+  expect(reordered).not.toBe(CHAIN_MODULE_TEXT);
+  const contract = anchorContract(reordered, consumersText([...SESSION_BOOTSTRAP_CONSUMERS].reverse()));
+  expect(bootstrapContractSource(contract)).toBe("anchor");
+  const p = plan(files(), BEFORE, T047, STEPS, contract);
+  expect(p.chain_digest).toBe(plan().chain_digest);
+  expect(p.contract_digest).toBe(bootstrapContractDigests().contract_digest);
+  // Under the lock the reordered anchor matches a plan made from the HEAD module text.
+  const r = await run({}, { contract });
+  expect(r.code).toBeUndefined();
+  expect(r.result).toBe("verified");
+});
+
+test("contract (d): an extra or missing role in the release map or the anchor refuses; legacy coverage is proved", async () => {
+  // Release map with a role the anchor's map (and chain) does not have.
+  const extra = structuredClone(SESSION_BOOTSTRAP_ROLES) as Record<string, Record<string, unknown>>;
+  extra[readApiFile].bulls96_extra = { login: "allowed", inbound: "none", settings: "unchecked" };
+  const pre = (map: unknown, contract = anchorContract()) => () =>
+    bootstrapTargetChain({ target: T047, targetSha: TSHA, steps: STEPS, files: files(), contract, map: map as typeof SESSION_BOOTSTRAP_ROLES });
+  expect(code(pre(extra))).toBe("release_bootstrap_contract_drift");
+  // Anchor map or manifest missing a required role (same SQL).
+  const narrative = '    bulls96_digest_narrative: bare("allowed", "unchecked"),\n';
+  expect(code(() => bootstrapContractSource(anchorContract(chainText([narrative, ""]))))).toBe("release_bootstrap_contract_drift");
+  expect(
+    code(() => bootstrapContractSource(anchorContract(CHAIN_MODULE_TEXT, consumersText(SESSION_BOOTSTRAP_CONSUMERS.filter(([r]) => r !== admit))))),
+  ).toBe("release_bootstrap_contract_drift");
+  const r = await run({}, { contract: anchorContract(chainText([narrative, ""])) });
+  expect(r.code).toBe("release_bootstrap_contract_drift");
+  expect(r.log).toEqual(underLockRefused);
+  expectNoMutation(r);
+  // Legacy fallback: the release map with an extra role refuses (it has no manifest entry:
+  // release_bootstrap_manifest refuses before the coverage proof).
+  expect(code(pre(extra, LEGACY))).toBe("release_bootstrap_manifest");
+  // The coverage proof itself (the backstop under the per-file checks).
+  const scopes = SESSION_BOOTSTRAP_FILES.map((file) => ({ file, scope: "run" as const }));
+  const required = [...chainNames].sort();
+  const cover = (o: Partial<Parameters<typeof bootstrapContractCoverage>[0]>) => () =>
+    bootstrapContractCoverage({ target: T047, files: files(), scopes, required_roles: required, map: SESSION_BOOTSTRAP_ROLES, ...o });
+  expect(code(cover({}))).toBe("no refusal");
+  const unmapped = structuredClone(SESSION_BOOTSTRAP_ROLES) as Record<string, Record<string, unknown>>;
+  delete unmapped[readApiFile].bulls96_digest_narrative;
+  expect(code(cover({ map: unmapped as typeof SESSION_BOOTSTRAP_ROLES }))).toBe("release_bootstrap_contract_drift");
+  expect(code(cover({ consumers: SESSION_BOOTSTRAP_CONSUMERS.filter(([r]) => r !== admit) }))).toBe("release_bootstrap_contract_drift");
+  expect(code(cover({ required_roles: [...required, "bulls96_extra"] }))).toBe("release_bootstrap_contract_drift");
+  expect(code(cover({ target: T_MID }))).toBe("release_bootstrap_contract_drift");
+  expect(code(cover({ scopes: scopes.map((s) => (s.file === readApiFile ? { ...s, scope: "excluded" as const } : s)) }))).toBe(
+    "release_bootstrap_contract_drift",
+  );
+  // Legacy positive: grandfathered release contract, coverage proved, the stage verifies.
+  const legacy = plan(files(), BEFORE, T047, STEPS, LEGACY);
+  const ok = await run({}, { planned: legacy, contract: LEGACY });
+  expect(ok.result).toBe("verified");
+  expect(ok.evidence[0]).toMatchObject({ contract_source: "release", contract_digest: bootstrapContractDigests().contract_digest });
+});
+
+test("contract (e): a contract swapped under the lock refuses before BEGIN with zero mutation", async () => {
+  const anchorPlan = plan();
+  const legacyPlan = plan(files(), BEFORE, T047, STEPS, LEGACY);
+  const cases: [string, BootstrapSection, BootstrapAnchorContract, string][] = [
+    ["anchor plan, drifted anchor under the lock", anchorPlan, anchorContract(SEMANTIC_DRIFT), "release_bootstrap_contract_drift"],
+    ["anchor plan, partial anchor under the lock", anchorPlan, anchorContract(CHAIN_MODULE_TEXT, null), "release_bootstrap_contract_drift"],
+    ["anchor plan, legacy anchor under the lock", anchorPlan, LEGACY, "release_bootstrap_plan_changed"],
+    ["legacy plan, anchor modules under the lock", legacyPlan, anchorContract(), "release_bootstrap_plan_changed"],
+  ];
+  for (const [name, planned, contract, want] of cases) {
+    const r = await run({}, { planned, contract });
+    expect({ name, code: r.code, log: r.log }).toEqual({ name, code: want, log: underLockRefused });
+    expectNoMutation(r);
+  }
+  // A plan whose contract digest was tampered with (or made from another map) no longer matches.
+  for (const k of ["contract_map_digest", "contract_manifest_digest", "contract_digest"] as const) {
+    const r = await run({}, { planned: { ...anchorPlan, [k]: "0".repeat(64) } });
+    expect({ k, code: r.code, log: r.log }).toEqual({ k, code: "release_bootstrap_plan_changed", log: underLockRefused });
+    expectNoMutation(r);
+  }
+  // Success evidence records the source and digests, never the contract contents.
+  const ok = await run({});
+  expect(ok.evidence[0]).toMatchObject({ contract_source: "anchor", contract_digest: anchorPlan.contract_digest });
+  expect(JSON.stringify(ok.evidence)).not.toContain("worker-2s");
+  expect(JSON.stringify(ok.evidence)).not.toContain("claimed-60s");
 });

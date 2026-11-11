@@ -50,7 +50,9 @@ describe("owner operator plan bootstrap section (pure, no network)", () => {
   const files = SESSION_BOOTSTRAP_FILES.map(file => { const b = readFileSync(new URL(file, repo)); return { file, release: b, target: b }; });
   const steps = readdirSync(new URL("supabase/migrations/", repo)).filter(f => f.endsWith(".sql")).sort().map(f => `upstream:${f}`);
   const sha = "a".repeat(40);
-  const plan = (st: BootstrapState) => ownerPlanBootstrap(sha, steps, files, st);
+  // The source sha's contract modules (HEAD's): contract_source "anchor".
+  const contract = { chainModule: readFileSync(new URL("src/hoopdb/session-bootstrap-chain.ts", repo)), consumersModule: readFileSync(new URL("src/hoopdb/session-bootstrap-consumers.ts", repo)) };
+  const plan = (st: BootstrapState) => ownerPlanBootstrap(sha, steps, files, st, contract);
   const creator = (r: string, o: object = {}) => ({ role: r, member: "postgres", member_inherit: true, grantor: "supabase_admin", grantor_super: true, admin_option: true, inherit_option: false, set_option: false, ...o });
   const code = (f: () => unknown) => { try { f(); } catch (e) { return (e as { code?: string }).code; } return "none"; };
   const err = console.error;
@@ -58,6 +60,7 @@ describe("owner operator plan bootstrap section (pure, no network)", () => {
     const s = plan(state(["bulls96_analysis_admit"]));
     expect(s).toMatchObject({ required: true, will_create: ["bulls96_analysis_admit"], next: "bootstrap stage required before apply" });
     expect(s.chain_digest).toBe(bootstrapChainDigest(s));
+    expect(s.contract_source).toBe("anchor");
     // Target = the source tree's last step, target_sha = the source sha: every chain role required.
     expect(s.target).toBe(steps[steps.length - 1]);
     expect(s.target_sha).toBe(sha);
@@ -67,7 +70,7 @@ describe("owner operator plan bootstrap section (pure, no network)", () => {
     expect(bootstrapApproval({ project: "<project>", sha: "a".repeat(40), target: "t", targetSha: "a".repeat(40), chainDigest: s.chain_digest, willCreate: s.will_create, planRun: "7" })).toBe(`BOOTSTRAP <project> ${"a".repeat(40)} TARGET t ${"a".repeat(40)} CHAIN ${s.chain_digest} ROLES bulls96_analysis_admit PLAN 7`);
   });
   test("an empty source tree (no target step) refuses operator_source_pin", () => {
-    expect(code(() => ownerPlanBootstrap(sha, [], files, state([])))).toBe("operator_source_pin");
+    expect(code(() => ownerPlanBootstrap(sha, [], files, state([]), contract))).toBe("operator_source_pin");
   });
   test("every role exact: skip (required false, ROLES none)", () => {
     const s = plan(state([]));
@@ -86,7 +89,7 @@ describe("owner operator plan bootstrap section (pure, no network)", () => {
   test("owner plan reads the section inside its READ ONLY transaction, release = target = source sha", () => {
     const src = readFileSync(new URL("../../../scripts/schema-release-owner-operator-plan.ts", import.meta.url), "utf8");
     expect(src).toContain("const steps = (await schemaStepDigests([])).map(([name]) => name);");
-    expect(src).toContain("ownerPlanBootstrap(input.sha, steps, releaseBootstrapFiles(process.cwd(), input.sha, input.sha), await readBootstrapState(client))");
+    expect(src).toContain("ownerPlanBootstrap(input.sha, steps, releaseBootstrapFiles(process.cwd(), input.sha, input.sha), await readBootstrapState(client), releaseBootstrapContract(process.cwd(), input.sha))");
     expect(src.indexOf("pg_advisory_xact_lock(961996,1)")).toBeLessThan(src.indexOf("await readBootstrapState(client)"));
     expect(src).toContain("...report, bootstrap }");
   });

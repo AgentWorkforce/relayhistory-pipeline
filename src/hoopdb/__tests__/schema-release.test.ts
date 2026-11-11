@@ -20,6 +20,7 @@ import { createHash } from "node:crypto";
 import {
   bootstrapApproval,
   bootstrapChainDigest,
+  bootstrapContractDigest,
   bootstrapChainRoles,
   bootstrapFilesToRun,
   bootstrapReadbackVerdict,
@@ -1264,6 +1265,11 @@ const bsFiles = (
     release: file in release ? release[file] : bsBytes(file),
     target: file in anchor ? anchor[file] : bsBytes(file),
   }));
+/** The anchor's contract modules: HEAD's (contract_source "anchor"). */
+const bsContract = {
+  chainModule: bsBytes("src/hoopdb/session-bootstrap-chain.ts"),
+  consumersModule: bsBytes("src/hoopdb/session-bootstrap-consumers.ts"),
+};
 /** The anchor's ordered schema steps: the HEAD upstream migrations (fixture). */
 const bsSteps = readdirSync(new URL("supabase/migrations/", bsRepo))
   .filter((f) => f.endsWith(".sql"))
@@ -1281,6 +1287,7 @@ const bsSection = (x: {
     targetSha,
     steps: bsSteps,
     files: x.files ?? bsFiles(),
+    contract: bsContract,
     state: x.state ?? bsState(),
     supabaseMode: x.supabaseMode ?? true,
     log: x.log,
@@ -1297,16 +1304,17 @@ const quiet = () => {};
 const admit = "bulls96_analysis_admit";
 const readApiFile = "supabase/bootstrap/session_read_api_roles.sql";
 
-test("bootstrap chain_digest: sha256 over target, target_sha, the required set and the run files' anchor digests", () => {
+test("bootstrap chain_digest: sha256 over target, target_sha, the required set, the contract digest and the run files' anchor digests", () => {
   const files = SESSION_BOOTSTRAP_FILES.map((file, i) => ({
     file,
     sha256_target: String(i).repeat(64),
     scope: (i === 2 ? "excluded" : "run") as "run" | "excluded",
   }));
-  const x = { target, target_sha: targetSha, required_roles: ["b_role", "a_role"], files };
+  const contract_digest = "c".repeat(64);
+  const x = { target, target_sha: targetSha, required_roles: ["b_role", "a_role"], contract_digest, files };
   const expected = createHash("sha256")
     .update(
-      `target ${target}\ntarget_sha ${targetSha}\nrequired a_role,b_role\n` +
+      `target ${target}\ntarget_sha ${targetSha}\nrequired a_role,b_role\ncontract ${contract_digest}\n` +
         files
           .filter((f) => f.scope === "run")
           .map((f) => `${f.file}\n${f.sha256_target}\n`)
@@ -1318,13 +1326,15 @@ test("bootstrap chain_digest: sha256 over target, target_sha, the required set a
   expect(bootstrapChainDigest({ ...x, required_roles: ["a_role"] })).not.toBe(expected);
   expect(bootstrapChainDigest({ ...x, target_sha: "7".repeat(40) })).not.toBe(expected);
   expect(bootstrapChainDigest({ ...x, target: "upstream:20261105046000_analysis_jobs.sql" })).not.toBe(expected);
+  expect(bootstrapChainDigest({ ...x, contract_digest: "d".repeat(64) })).not.toBe(expected);
   // An excluded file's digest is not part of CHAIN.
   expect(bootstrapChainDigest({ ...x, files: files.map((f, i) => (i === 2 ? { ...f, sha256_target: null } : f)) })).toBe(expected);
   expect(
-    createHash("sha256").update(`target ${target}\ntarget_sha ${targetSha}\nrequired none\n`).digest("hex"),
+    createHash("sha256").update(`target ${target}\ntarget_sha ${targetSha}\nrequired none\ncontract ${contract_digest}\n`).digest("hex"),
   ).toBe(bootstrapChainDigest({ ...x, required_roles: [], files: [] }));
   const section = bsSection({});
   expect(section.chain_digest).toBe(bootstrapChainDigest(section));
+  expect(section.contract_digest).toBe(bootstrapContractDigest());
   // The anchor's bytes bind CHAIN; the release sha's bytes only set `differs`.
   expect(bsSection({ files: bsFiles({}, { [readApiFile]: bsBytes(readApiFile) + "\n-- other\n" }) }).chain_digest).not.toBe(
     section.chain_digest,
@@ -1400,6 +1410,10 @@ test("bootstrap plan section shape: files, roles, required, will_create, next", 
     "release_drift",
     "required",
     "will_create",
+    "contract_source",
+    "contract_map_digest",
+    "contract_manifest_digest",
+    "contract_digest",
     "chain_digest",
     "next",
   ]);
@@ -1458,6 +1472,11 @@ test("bootstrap plan section shape: files, roles, required, will_create, next", 
     (v: any) => (v.roles[0].required = false),
     (v: any) => (v.roles[0].first_consumer = "20261105047000_coordination_fact_readers.sql"),
     (v: any) => (v.roles[0].exact = true, v.roles[0].present = false),
+    (v: any) => (v.contract_source = "plan"),
+    (v: any) => delete v.contract_source,
+    (v: any) => (v.contract_map_digest = "0".repeat(64)),
+    (v: any) => (v.contract_manifest_digest = "0".repeat(64)),
+    (v: any) => (v.contract_digest = "0".repeat(64)),
   ]) {
     const v = JSON.parse(JSON.stringify(needed));
     tamper(v);
@@ -1773,7 +1792,7 @@ test("chain files never end or split the stage transaction", () => {
 test("bootstrap pre-connect: the anchor-bound chain equals the plan's and the approval's CHAIN", () => {
   const planned = bsSection({ files: bsFiles(), state: bsState([admit]), supabaseMode: true });
   const chain = (x: { files?: ReturnType<typeof bsFiles>; target?: string; targetSha?: string; steps?: string[] } = {}) =>
-    bootstrapTargetChain({ target: x.target ?? target, targetSha: x.targetSha ?? targetSha, steps: x.steps ?? bsSteps, files: x.files ?? bsFiles() });
+    bootstrapTargetChain({ target: x.target ?? target, targetSha: x.targetSha ?? targetSha, steps: x.steps ?? bsSteps, files: x.files ?? bsFiles(), contract: bsContract });
   expect(chain().chain_digest).toBe(planned.chain_digest);
   expect(requireBootstrapTargetChain(chain(), planned, planned.chain_digest)).toBe(planned.chain_digest);
   // Changed anchor bytes, another target or target_sha, or an approval/plan CHAIN that is not the live digest.
@@ -1820,7 +1839,8 @@ test("bootstrap entry point: every pre-connect check before the connection, the 
     "const anchor = await targetAnchor(input, release.held);",
     "refuse(\"release_target_manifest_changed\");",
     "releaseBootstrapFiles(process.cwd(), input.sha, input.targetSha);",
-    "bootstrapTargetChain({ target: input.target, targetSha: input.targetSha, steps: anchorSteps(anchor), files }),",
+    "const contract = releaseBootstrapContract(process.cwd(), input.targetSha);",
+    "bootstrapTargetChain({ target: input.target, targetSha: input.targetSha, steps: anchorSteps(anchor), files, contract }),",
     "input.chainDigest,\n  );",
     "refuse(\"release_bootstrap_db_mode\");",
     "releaseClient(process.env.SUPABASE_MIGRATION_OWNER_URL);",
@@ -1831,6 +1851,7 @@ test("bootstrap entry point: every pre-connect check before the connection, the 
     "await githubReleaseGate(process.env, get, true);",
     "const fresh = await targetAnchor(input, release.held);",
     "steps: anchorSteps(fresh),",
+    "contract: releaseBootstrapContract(process.cwd(), input.targetSha),",
   ].map((s) => entry.indexOf(s));
   expect(order.every((i) => i > 0)).toBe(true);
   expect([...order].sort((a, b) => a - b)).toEqual(order);
@@ -1866,7 +1887,7 @@ test("workflow offers the bootstrap mode in the same protected job with one secr
     "BOOTSTRAP <project> <sha> TARGET <target> <target_sha> CHAIN <chain_digest> ROLES <sorted comma-joined will_create, or none> PLAN <plan_run>",
   );
   expect(parsed.on.workflow_dispatch.inputs.approval.description).toContain(
-    "chain_digest from the plan binds target, target_sha, the target-required roles and the anchor bytes of the run files",
+    "chain_digest from the plan binds target, target_sha, the target-required roles, the bootstrap contract digest and the anchor bytes of the run files",
   );
 });
 

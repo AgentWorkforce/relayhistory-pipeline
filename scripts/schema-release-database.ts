@@ -36,6 +36,7 @@ import {
   BOOTSTRAP_REQUIRED_NOTE,
   bootstrapRequiredRoles,
   bootstrapTargetChain,
+  releaseBootstrapContract,
   releaseBootstrapFiles,
   requireBootstrapRoles,
   requireBootstrapTargetChain,
@@ -219,10 +220,12 @@ async function writeBootstrapEvidence(evidence: unknown) {
  * and steps: required set, run/excluded/mixed files, CHAIN) and compared with the plan
  * and the approval's CHAIN (release_bootstrap_plan_changed); a mixed file or a
  * release-vs-anchor difference refuses (release_bootstrap_chain_mixed,
- * release_bootstrap_release_drift). Then connect, prove the release owner and hand the
- * client to runBootstrapStage (src/hoopdb/schema-release-bootstrap.ts): under the
- * migrator's session advisory lock, the GitHub gate, the anchor and the git inputs once
- * more (compared before BEGIN), then ONE transaction that recomputes the section from
+ * release_bootstrap_release_drift), and so do partial, unparsable or canonically
+ * different anchor contract modules (release_bootstrap_contract_drift). Then connect,
+ * prove the release owner and hand the client to runBootstrapStage
+ * (src/hoopdb/schema-release-bootstrap.ts): under the migrator's session advisory lock,
+ * the GitHub gate, the anchor and the git inputs once more (compared before BEGIN),
+ * then ONE transaction that recomputes the section from
  * the live catalog, runs the anchor's chain files provisioning absent required roles,
  * reads back and COMMITs only on an exact match (else ROLLBACK).
  */
@@ -237,8 +240,9 @@ async function releaseBootstrap(
   const anchor = await targetAnchor(input, release.held);
   if (!sameAnchor(anchor, release)) refuse("release_target_manifest_changed");
   const files = releaseBootstrapFiles(process.cwd(), input.sha, input.targetSha);
+  const contract = releaseBootstrapContract(process.cwd(), input.targetSha);
   requireBootstrapTargetChain(
-    bootstrapTargetChain({ target: input.target, targetSha: input.targetSha, steps: anchorSteps(anchor), files }),
+    bootstrapTargetChain({ target: input.target, targetSha: input.targetSha, steps: anchorSteps(anchor), files, contract }),
     planned,
     input.chainDigest,
   );
@@ -269,6 +273,7 @@ async function releaseBootstrap(
       return {
         files: releaseBootstrapFiles(process.cwd(), input.sha, input.targetSha),
         steps: anchorSteps(fresh),
+        contract: releaseBootstrapContract(process.cwd(), input.targetSha),
       };
     },
     writeEvidence: writeBootstrapEvidence,
@@ -356,10 +361,21 @@ export async function releaseDatabase() {
       console.log(
         "release_bootstrap_plan chain " +
           bootstrap.chain_digest +
+          " contract " +
+          bootstrap.contract_digest +
           " roles " +
           (bootstrap.will_create.join(",") || "none") +
           " required " +
           (bootstrap.required_roles.join(",") || "none"),
+      );
+      // Source and component digests only, never contract contents.
+      console.log(
+        "release_bootstrap_contract source " +
+          bootstrap.contract_source +
+          " map " +
+          bootstrap.contract_map_digest +
+          " manifest " +
+          bootstrap.contract_manifest_digest,
       );
       if (bootstrap.excluded.length)
         console.log("release_bootstrap_excluded " + bootstrap.excluded.join(","));

@@ -11,6 +11,7 @@ import { inspectReleaseBoundary } from "./schema-release-boundary.ts";
 import {
   bootstrapSection,
   readBootstrapState,
+  releaseBootstrapContract,
   releaseBootstrapFiles,
 } from "./schema-release-bootstrap.ts";
 export function releaseClient(url: string | undefined) {
@@ -102,6 +103,7 @@ export async function inspectBootstrap(
       targetSha: input.targetSha,
       steps: input.steps,
       files: releaseBootstrapFiles(repo, input.sha, input.targetSha),
+      contract: releaseBootstrapContract(repo, input.targetSha),
       state: await readBootstrapState(client),
       supabaseMode: releaseProfile("global-default-revoke").mode === "supabase",
     });

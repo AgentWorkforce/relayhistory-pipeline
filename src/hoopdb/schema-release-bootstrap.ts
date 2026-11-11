@@ -10,6 +10,11 @@
  * tree, and only the roles whose first consumer (session-bootstrap-consumers.ts) sorts
  * at or before the target are required, created or checked. The release sha's bytes
  * are only compared (`differs`); a non-excluded file that differs refuses the stage.
+ * The role contract map and the role-to-first-consumer manifest are the release sha's
+ * reviewed modules; their domain-separated canonical digest is folded into CHAIN, and
+ * when the anchor carries both modules they must be canonically equal (else
+ * release_bootstrap_contract_drift). Only an anchor carrying neither (a legacy anchor)
+ * falls back to the release's modules (contract_source "release").
  *
  * Evidence carries role names, attribute flags, validity, membership edges and a
  * settings kind token only: never a password, rolconfig value, URL or host name. A
@@ -141,6 +146,17 @@ export interface BootstrapSection {
   /** The stage has work: a required role is absent. */
   required: boolean;
   will_create: string[];
+  /**
+   * "anchor": target_sha carries both contract modules and they are canonically equal to
+   * the release sha's; "release": a legacy anchor carrying neither (grandfathered).
+   */
+  contract_source: BootstrapContractSource;
+  /** sha256 of the canonical contract map serialisation (bootstrapContractDigests). */
+  contract_map_digest: string;
+  /** sha256 of the canonical manifest serialisation. */
+  contract_manifest_digest: string;
+  /** The domain-separated composite of both, folded into CHAIN. */
+  contract_digest: string;
   chain_digest: string;
   next: "bootstrap stage required before apply" | "apply";
 }
@@ -161,26 +177,297 @@ export function bootstrapChainRoles(
 
 /**
  * The CHAIN digest: sha256 over `target <step>\ntarget_sha <sha>\nrequired <the sorted
- * required roles comma-joined, or none>\n` followed by `<file>\n<sha256_target>\n` for
- * each file that will run (scope "run"), in chain order, from the anchor's bytes. The
- * required set is folded in here rather than given its own approval field, so the typed
- * approval changes whenever the target, target_sha, the anchor bytes of a running file or
- * the required set changes.
+ * required roles comma-joined, or none>\ncontract <contract_digest>\n` followed by
+ * `<file>\n<sha256_target>\n` for each file that will run (scope "run"), in chain order,
+ * from the anchor's bytes. The required set and the contract digest (the role contract
+ * map and the manifest, bootstrapContractDigests) are folded in here rather than given
+ * their own approval fields, so the typed approval changes whenever the target,
+ * target_sha, the anchor bytes of a running file, the required set, a role contract or a
+ * manifest entry changes.
  */
 export function bootstrapChainDigest(x: {
   target: string;
   target_sha: string;
   required_roles: readonly string[];
+  contract_digest: string;
   files: readonly Pick<BootstrapFile, "file" | "sha256_target" | "scope">[];
 }) {
   const required = x.required_roles.length ? codeSort([...x.required_roles]).join(",") : "none";
   return sha256(
-    `target ${x.target}\ntarget_sha ${x.target_sha}\nrequired ${required}\n` +
+    `target ${x.target}\ntarget_sha ${x.target_sha}\nrequired ${required}\ncontract ${x.contract_digest}\n` +
       x.files
         .filter((f) => f.scope === "run")
         .map((f) => `${f.file}\n${f.sha256_target}\n`)
         .join(""),
   );
+}
+
+export type BootstrapContractSource = "anchor" | "release";
+type ContractMap = Readonly<Record<string, Readonly<Record<string, BootstrapRoleContract>>>>;
+type ContractPairs = readonly (readonly [string, string])[];
+const CONTRACT_LOGIN = ["never", "allowed", "claimed-60s"] as const;
+const CONTRACT_INBOUND = ["none", "worker", "verifier", "consumer", "unchecked"] as const;
+const CONTRACT_SETTINGS = ["unchecked", "worker-2s", "consumer"] as const;
+
+/**
+ * The contract digests, domain-separated and canonical (independent of object key order,
+ * file order, role order and manifest order):
+ *   map       sha256("bootstrap-contract-map-v1\n" + one JSON line
+ *             [file, role, login, inbound, settings] per role, lines sorted)
+ *   manifest  sha256("bootstrap-contract-manifest-v1\n" + one JSON line [role, first
+ *             consumer] per pair, lines sorted; a duplicate pair stays a line)
+ *   composite sha256("bootstrap-contract-v1\nmap <map>\nmanifest <manifest>\n"), the
+ *             `contract` line of CHAIN.
+ * The contract fields are read in the fixed order login, inbound, settings.
+ */
+export function bootstrapContractDigests(
+  map: ContractMap = SESSION_BOOTSTRAP_ROLES,
+  consumers: ContractPairs = SESSION_BOOTSTRAP_CONSUMERS,
+) {
+  const mapLines = codeSort(
+    Object.entries(map).flatMap(([file, roles]) =>
+      Object.entries(roles).map(([role, c]) =>
+        JSON.stringify([file, role, String(c.login), String(c.inbound), String(c.settings)]),
+      ),
+    ),
+  );
+  const manifestLines = codeSort(consumers.map((p) => JSON.stringify([String(p[0]), String(p[1])])));
+  const contract_map_digest = sha256(
+    "bootstrap-contract-map-v1\n" + mapLines.map((l) => l + "\n").join(""),
+  );
+  const contract_manifest_digest = sha256(
+    "bootstrap-contract-manifest-v1\n" + manifestLines.map((l) => l + "\n").join(""),
+  );
+  return {
+    contract_map_digest,
+    contract_manifest_digest,
+    contract_digest: sha256(
+      `bootstrap-contract-v1\nmap ${contract_map_digest}\nmanifest ${contract_manifest_digest}\n`,
+    ),
+  };
+}
+/** The composite contract digest folded into CHAIN (bootstrapContractDigests). */
+export function bootstrapContractDigest(map?: ContractMap, consumers?: ContractPairs) {
+  return bootstrapContractDigests(map, consumers).contract_digest;
+}
+
+/**
+ * The anchor's (target_sha) contract modules as read from the Git object database:
+ * src/hoopdb/session-bootstrap-chain.ts (always present at an anchor; its
+ * SESSION_BOOTSTRAP_ROLES section may be absent) and
+ * src/hoopdb/session-bootstrap-consumers.ts (undefined: absent).
+ */
+export interface BootstrapAnchorContract {
+  chainModule: Buffer | string | undefined;
+  consumersModule: Buffer | string | undefined;
+}
+
+type Tok = { t: "s" | "id" | "p"; v: string };
+const contractUnparsable = (): never => refuse("release_bootstrap_contract_drift");
+/**
+ * A minimal tokenizer for one literal value in a TypeScript module, from `start`:
+ * `//` and `/* *\/` comments skipped, "..." / '...' strings without backslashes or line
+ * breaks, identifiers and the punctuation { } [ ] ( ) : , ; only. Anything else (a
+ * template literal, an operator, a spread, an escape) refuses
+ * release_bootstrap_contract_drift: an anchor contract is never evaluated, only read.
+ */
+function contractTokens(text: string, start: number) {
+  let i = start;
+  return (): Tok | undefined => {
+    for (;;) {
+      while (i < text.length && /\s/.test(text[i])) i++;
+      if (text.startsWith("//", i)) {
+        const eol = text.indexOf("\n", i);
+        i = eol < 0 ? text.length : eol;
+      } else if (text.startsWith("/*", i)) {
+        const end = text.indexOf("*/", i + 2);
+        if (end < 0) contractUnparsable();
+        i = end + 2;
+      } else break;
+    }
+    if (i >= text.length) return undefined;
+    const c = text[i];
+    if (c === '"' || c === "'") {
+      let j = i + 1;
+      while (j < text.length && text[j] !== c) {
+        if (text[j] === "\\" || text[j] === "\n") contractUnparsable();
+        j++;
+      }
+      if (j >= text.length) contractUnparsable();
+      const v = text.slice(i + 1, j);
+      i = j + 1;
+      return { t: "s", v };
+    }
+    const id = /[A-Za-z_][A-Za-z0-9_]*/y;
+    id.lastIndex = i;
+    const m = id.exec(text);
+    if (m) {
+      i += m[0].length;
+      return { t: "id", v: m[0] };
+    }
+    if ("{}[]():,;".includes(c)) {
+      i++;
+      return { t: "p", v: c };
+    }
+    return contractUnparsable();
+  };
+}
+/** The index just past the `=` and `open` of the single `export const <name>` declaration. */
+function contractValueStart(text: string, name: string, open: "{" | "[") {
+  const decl = new RegExp(`export const ${name}\\b`, "g");
+  const hits = [...text.matchAll(decl)];
+  if (hits.length !== 1) contractUnparsable();
+  const eq = new RegExp(`=\\s*\\${open}`, "g");
+  eq.lastIndex = hits[0].index! + hits[0][0].length;
+  const m = eq.exec(text);
+  if (!m) contractUnparsable();
+  return m!.index + m![0].length;
+}
+const BARE_HELPER =
+  'const bare = ( login: BootstrapRoleContract["login"], inbound: BootstrapRoleContract["inbound"], ): BootstrapRoleContract => ({ login, inbound, settings: "unchecked" });';
+const oneOf = <T extends string>(v: string, allowed: readonly T[]): T =>
+  (allowed as readonly string[]).includes(v) ? (v as T) : contractUnparsable();
+
+/**
+ * The SESSION_BOOTSTRAP_ROLES map a session-bootstrap-chain.ts text declares, parsed as
+ * data (never evaluated): undefined when the text never names SESSION_BOOTSTRAP_ROLES (a
+ * legacy anchor). Accepted: an object literal of file-path keys, each an object literal
+ * of role keys whose values are `{ login, inbound, settings }` object literals (keys in
+ * any order, each exactly once) or `bare("<login>", "<inbound>")` calls, the latter only
+ * when the text defines bare exactly as this release does (settings "unchecked").
+ * Anything else, a duplicate key or an unknown value refuses
+ * release_bootstrap_contract_drift.
+ */
+export function chainModuleContract(text: string): ContractMap | undefined {
+  if (!/\bSESSION_BOOTSTRAP_ROLES\b/.test(text)) return undefined;
+  const next = contractTokens(text, contractValueStart(text, "SESSION_BOOTSTRAP_ROLES", "{"));
+  const want = (v: string) => {
+    const k = next();
+    if (!k || k.t !== "p" || k.v !== v) contractUnparsable();
+  };
+  const bareOk =
+    (text.match(/\bbare\b\s*=/g) ?? []).length === 1 &&
+    !/\bfunction\s+bare\b/.test(text) &&
+    text.replace(/\s+/g, " ").includes(BARE_HELPER);
+  /** Object literal entries after its `{`: key, then value(parsed by `value`). */
+  const entries = <V>(value: (first: Tok) => V) => {
+    const out = new Map<string, V>();
+    for (;;) {
+      const k = next();
+      if (!k) return contractUnparsable();
+      if (k.t === "p" && k.v === "}") return out;
+      if (k.t === "p" || out.has(k.v)) contractUnparsable();
+      want(":");
+      const first = next();
+      if (!first) contractUnparsable();
+      out.set(k.v, value(first!));
+      const sep = next();
+      if (sep?.t === "p" && sep.v === "}") return out;
+      if (!(sep?.t === "p" && sep.v === ",")) contractUnparsable();
+    }
+  };
+  const str = () => {
+    const s = next();
+    return s && s.t === "s" ? s.v : contractUnparsable();
+  };
+  const contract = (first: Tok): BootstrapRoleContract => {
+    if (first.t === "id" && first.v === "bare") {
+      if (!bareOk) contractUnparsable();
+      want("(");
+      const login = oneOf(str(), CONTRACT_LOGIN);
+      want(",");
+      const inbound = oneOf(str(), CONTRACT_INBOUND);
+      const close = next();
+      if (close?.t === "p" && close.v === ",") want(")");
+      else if (!(close?.t === "p" && close.v === ")")) contractUnparsable();
+      return { login, inbound, settings: "unchecked" };
+    }
+    if (!(first.t === "p" && first.v === "{")) contractUnparsable();
+    const f = entries((v) => (v.t === "s" ? v.v : contractUnparsable()));
+    if (f.size !== 3 || !f.has("login") || !f.has("inbound") || !f.has("settings")) contractUnparsable();
+    return {
+      login: oneOf(f.get("login")!, CONTRACT_LOGIN),
+      inbound: oneOf(f.get("inbound")!, CONTRACT_INBOUND),
+      settings: oneOf(f.get("settings")!, CONTRACT_SETTINGS),
+    };
+  };
+  const files = entries((first) => {
+    if (!(first.t === "p" && first.v === "{")) contractUnparsable();
+    return entries(contract);
+  });
+  want(";");
+  const map: Record<string, Record<string, BootstrapRoleContract>> = {};
+  for (const [file, roles] of files) {
+    if (!/^supabase\/bootstrap\/[a-z0-9_]+\.sql$/.test(file)) contractUnparsable();
+    map[file] = {};
+    for (const [role, c] of roles) {
+      if (!ROLE_NAME.test(role) || role === "__proto__") contractUnparsable();
+      map[file][role] = c;
+    }
+  }
+  return map;
+}
+
+/**
+ * The SESSION_BOOTSTRAP_CONSUMERS pairs a session-bootstrap-consumers.ts text declares,
+ * parsed as data (never evaluated): an array literal of two-string array literals.
+ * Anything else refuses release_bootstrap_contract_drift.
+ */
+export function consumersModuleContract(text: string): [string, string][] {
+  const next = contractTokens(text, contractValueStart(text, "SESSION_BOOTSTRAP_CONSUMERS", "["));
+  const is = (k: Tok | undefined, v: string) => k?.t === "p" && k.v === v;
+  const out: [string, string][] = [];
+  for (;;) {
+    const open = next();
+    if (is(open, "]")) break;
+    if (!is(open, "[")) contractUnparsable();
+    const role = next();
+    if (!is(next(), ",")) contractUnparsable();
+    const file = next();
+    let close = next();
+    if (is(close, ",")) close = next();
+    if (role?.t !== "s" || file?.t !== "s" || !is(close, "]")) contractUnparsable();
+    out.push([role!.v, file!.v]);
+    const sep = next();
+    if (is(sep, "]")) break;
+    if (!is(sep, ",")) contractUnparsable();
+  }
+  if (!is(next(), ";")) contractUnparsable();
+  return out;
+}
+
+/**
+ * Where the role contract and the manifest come from, refusing
+ * release_bootstrap_contract_drift (never falling back) when target_sha carries exactly
+ * one of the two contract modules (the SESSION_BOOTSTRAP_ROLES section of
+ * session-bootstrap-chain.ts, session-bootstrap-consumers.ts), when either present module
+ * does not parse, or when the anchor's map or manifest differs canonically from the
+ * release's (`map` / `consumers`: key order, file order and pair order are not
+ * differences; any value is). Both present and equal: "anchor" (authoritative; the
+ * release matches it). Both absent (a legacy anchor such as Release A's): "release",
+ * grandfathered: the release's reviewed modules, bound by the composite digest in CHAIN,
+ * with coverage proved by bootstrapTargetChain.
+ */
+export function bootstrapContractSource(
+  anchor: BootstrapAnchorContract,
+  map: ContractMap = SESSION_BOOTSTRAP_ROLES,
+  consumers: ContractPairs = SESSION_BOOTSTRAP_CONSUMERS,
+): BootstrapContractSource {
+  const text = (b: Buffer | string | undefined) =>
+    b === undefined ? undefined : Buffer.from(b).toString("utf8");
+  const anchorMap = chainModuleContract(text(anchor.chainModule) ?? "");
+  const consumersText = text(anchor.consumersModule);
+  if (anchorMap === undefined && consumersText === undefined) return "release";
+  if (anchorMap === undefined || consumersText === undefined)
+    refuse("release_bootstrap_contract_drift");
+  const anchorDigests = bootstrapContractDigests(anchorMap, consumersModuleContract(consumersText!));
+  const release = bootstrapContractDigests(map, consumers);
+  if (
+    anchorDigests.contract_map_digest !== release.contract_map_digest ||
+    anchorDigests.contract_manifest_digest !== release.contract_manifest_digest
+  )
+    refuse("release_bootstrap_contract_drift");
+  return "anchor";
 }
 
 /** The one typed BOOTSTRAP approval string (approval roles: sorted, comma-joined, or none). */
@@ -540,7 +827,18 @@ export interface BootstrapChainInput {
 }
 export type BootstrapTargetChain = Pick<
   BootstrapSection,
-  "target" | "target_sha" | "files" | "required_roles" | "excluded" | "mixed" | "release_drift" | "chain_digest"
+  | "target"
+  | "target_sha"
+  | "files"
+  | "required_roles"
+  | "excluded"
+  | "mixed"
+  | "release_drift"
+  | "contract_source"
+  | "contract_map_digest"
+  | "contract_manifest_digest"
+  | "contract_digest"
+  | "chain_digest"
 >;
 
 /**
@@ -553,12 +851,19 @@ export type BootstrapTargetChain = Pick<
  * (all of its roles required), excluded (none), mixed (both). The release sha's bytes
  * only set `differs`; release_drift lists the non-excluded files that differ. Refusing
  * mixed and drifting files is the stage's job (requireRunnableChain); a plan reports them.
+ *
+ * The contract: bootstrapContractSource over the anchor's contract modules (refuses
+ * release_bootstrap_contract_drift for partial, unparsable or canonically different
+ * anchor modules), then the coverage proof (bootstrapContractCoverage), then the
+ * contract digests, whose composite CHAIN folds in.
  */
 export function bootstrapTargetChain(x: {
   target: string;
   targetSha: string;
   steps: readonly string[];
   files: readonly BootstrapChainInput[];
+  /** The anchor's contract modules (releaseBootstrapContract). */
+  contract: BootstrapAnchorContract;
   consumers?: readonly (readonly [string, string])[];
   map?: typeof SESSION_BOOTSTRAP_ROLES;
 }): BootstrapTargetChain {
@@ -570,6 +875,7 @@ export function bootstrapTargetChain(x: {
   if (!/^[0-9a-f]{40}$/.test(x.targetSha)) refuse("release_bootstrap_chain");
   const map: Readonly<Record<string, Readonly<Record<string, BootstrapRoleContract>>>> =
     x.map ?? SESSION_BOOTSTRAP_ROLES;
+  const contract_source = bootstrapContractSource(x.contract, map, x.consumers ?? SESSION_BOOTSTRAP_CONSUMERS);
   const required_roles = bootstrapRequiredRoles(x);
   const req = new Set(required_roles);
   const files: BootstrapFile[] = x.files.map((f) => {
@@ -592,6 +898,7 @@ export function bootstrapTargetChain(x: {
     }
     return { file: f.file, sha256_target, sha256_release, differs: sha256_release !== sha256_target, scope };
   });
+  bootstrapContractCoverage({ target: x.target, files: x.files, scopes: files, required_roles, map, consumers: x.consumers });
   const named = (p: (f: BootstrapFile) => boolean) => files.filter(p).map((f) => f.file);
   const chain = {
     target: x.target,
@@ -601,8 +908,52 @@ export function bootstrapTargetChain(x: {
     excluded: named((f) => f.scope === "excluded"),
     mixed: named((f) => f.scope === "mixed"),
     release_drift: named((f) => f.scope !== "excluded" && f.differs),
+    contract_source,
+    ...bootstrapContractDigests(map, x.consumers ?? SESSION_BOOTSTRAP_CONSUMERS),
   };
   return { ...chain, chain_digest: bootstrapChainDigest(chain) };
+}
+
+/**
+ * The contract coverage proof (every contract source; the legacy fallback depends on
+ * it): every role literal of every anchor chain file that is not excluded has a contract
+ * entry for that file and a manifest entry; every required role is provisioned by a
+ * non-excluded anchor file of its own contract file (no extra required role); and every
+ * required role's first consumer sorts at or before the target. Refuses
+ * release_bootstrap_contract_drift. bootstrapTargetChain's per-file checks
+ * (release_bootstrap_chain, release_bootstrap_bytes_missing) and bootstrapConsumers
+ * (release_bootstrap_manifest) refuse most violations first; this is the explicit proof.
+ */
+export function bootstrapContractCoverage(x: {
+  target: string;
+  files: readonly BootstrapChainInput[];
+  scopes: readonly Pick<BootstrapFile, "file" | "scope">[];
+  required_roles: readonly string[];
+  map: ContractMap;
+  consumers?: ContractPairs;
+}) {
+  const manifest = new Map(x.consumers ?? SESSION_BOOTSTRAP_CONSUMERS);
+  const provisionedBy = new Map<string, string>();
+  for (const f of x.files) {
+    const scope = x.scopes.find((s) => s.file === f.file)?.scope;
+    if (f.target === undefined || scope === undefined || scope === "excluded") continue;
+    for (const role of chainFileRoles(Buffer.from(f.target).toString("utf8"))) {
+      if (!x.map[f.file] || !Object.hasOwn(x.map[f.file], role) || !manifest.has(role))
+        refuse("release_bootstrap_contract_drift");
+      provisionedBy.set(role, f.file);
+    }
+  }
+  for (const role of x.required_roles) {
+    const file = provisionedBy.get(role);
+    const consumer = manifest.get(role);
+    if (
+      file === undefined ||
+      !Object.hasOwn(x.map[file], role) ||
+      consumer === undefined ||
+      compareSteps(consumerStep(consumer), x.target) > 0
+    )
+      refuse("release_bootstrap_contract_drift");
+  }
 }
 
 /**
@@ -632,6 +983,10 @@ const CHAIN_KEYS = [
   "excluded",
   "mixed",
   "release_drift",
+  "contract_source",
+  "contract_map_digest",
+  "contract_manifest_digest",
+  "contract_digest",
   "chain_digest",
 ] as const;
 const chainView = (s: Pick<BootstrapSection, (typeof CHAIN_KEYS)[number]>) =>
@@ -640,7 +995,8 @@ const chainView = (s: Pick<BootstrapSection, (typeof CHAIN_KEYS)[number]>) =>
 /**
  * The git-side binding, recomputed (before connecting, and again under the lock before
  * BEGIN): the target chain must equal the plan artifact's (target, target_sha, files,
- * required set, excluded/mixed/drift lists, CHAIN digest) and its digest the typed
+ * required set, excluded/mixed/drift lists, contract source and digests, CHAIN digest)
+ * and its digest the typed
  * approval's CHAIN, else release_bootstrap_plan_changed; then requireRunnableChain.
  */
 export function requireBootstrapTargetChain(
@@ -668,6 +1024,7 @@ export function bootstrapSection(x: {
   targetSha: string;
   steps: readonly string[];
   files: readonly BootstrapChainInput[];
+  contract: BootstrapAnchorContract;
   state: BootstrapState;
   supabaseMode: boolean;
   consumers?: readonly (readonly [string, string])[];
@@ -710,6 +1067,10 @@ export function bootstrapSection(x: {
     release_drift: chain.release_drift,
     required: willCreate.length > 0,
     will_create: willCreate,
+    contract_source: chain.contract_source,
+    contract_map_digest: chain.contract_map_digest,
+    contract_manifest_digest: chain.contract_manifest_digest,
+    contract_digest: chain.contract_digest,
     chain_digest: chain.chain_digest,
     next: willCreate.length ? BOOTSTRAP_REQUIRED_NOTE : "apply",
   };
@@ -726,7 +1087,8 @@ const sameList = (a: unknown, b: readonly string[]) => JSON.stringify(a) === JSO
 /**
  * The plan artifact's bootstrap section, shape-checked and self-consistent (required
  * set recomputed from its target and the static manifest, lists from the file scopes,
- * CHAIN recomputed); refuses release_plan_artifact.
+ * contract digests recomputed from this release's modules, CHAIN recomputed); refuses
+ * release_plan_artifact.
  */
 export function validateBootstrapSection(value: any): BootstrapSection {
   const shaOrNull = (v: unknown) => v === null || (typeof v === "string" && hex64.test(v));
@@ -741,6 +1103,7 @@ export function validateBootstrapSection(value: any): BootstrapSection {
   }
   const files: any[] = Array.isArray(value?.files) ? value.files : [];
   const named = (scope: string) => files.filter((f) => f?.scope === scope).map((f) => f.file);
+  const contract = bootstrapContractDigests();
   const ok =
     value &&
     value.db_mode === "supabase" &&
@@ -770,6 +1133,10 @@ export function validateBootstrapSection(value: any): BootstrapSection {
     value.will_create.every((n: unknown) => typeof n === "string" && ROLE_NAME.test(n)) &&
     typeof value.required === "boolean" &&
     value.required === value.will_create.length > 0 &&
+    (value.contract_source === "anchor" || value.contract_source === "release") &&
+    value.contract_map_digest === contract.contract_map_digest &&
+    value.contract_manifest_digest === contract.contract_manifest_digest &&
+    value.contract_digest === contract.contract_digest &&
     hex64.test(value.chain_digest ?? "") &&
     bootstrapChainDigest(value) === value.chain_digest &&
     value.next === (value.required ? BOOTSTRAP_REQUIRED_NOTE : "apply");
@@ -800,7 +1167,8 @@ export function validateBootstrapSection(value: any): BootstrapSection {
 
 /**
  * Refuses release_bootstrap_plan_changed when the target chain (target, target_sha,
- * files, required set, excluded/mixed/drift lists, CHAIN) or required/will_create differ.
+ * files, required set, excluded/mixed/drift lists, contract source and digests, CHAIN)
+ * or required/will_create differ.
  */
 export function requireSameBootstrapPlan(
   planned: Pick<BootstrapSection, (typeof CHAIN_KEYS)[number] | "required" | "will_create">,
@@ -930,6 +1298,20 @@ export function bootstrapReadbackVerdict(x: {
 }
 
 const CHAIN_MODULE = "src/hoopdb/session-bootstrap-chain.ts";
+const CONSUMERS_MODULE = "src/hoopdb/session-bootstrap-consumers.ts";
+/** One blob from the Git object database (never the working tree); undefined: absent. */
+function gitBlob(repo: string, sha: string, file: string) {
+  try {
+    return execFileSync("git", ["cat-file", "blob", `${sha}:${file}`], {
+      cwd: repo,
+      env: { PATH: process.env.PATH },
+      stdio: ["ignore", "pipe", "ignore"],
+      maxBuffer: 4 * 1024 * 1024,
+    });
+  } catch {
+    return undefined;
+  }
+}
 /**
  * The SESSION_BOOTSTRAP_FILES list a session-bootstrap-chain.ts text declares: the
  * quoted supabase/bootstrap paths of its literal array, `//` comment lines ignored;
@@ -958,18 +1340,7 @@ export function releaseBootstrapFiles(
   releaseSha: string,
   targetSha: string,
 ): BootstrapChainInput[] {
-  const blob = (sha: string, file: string) => {
-    try {
-      return execFileSync("git", ["cat-file", "blob", `${sha}:${file}`], {
-        cwd: repo,
-        env: { PATH: process.env.PATH },
-        stdio: ["ignore", "pipe", "ignore"],
-        maxBuffer: 4 * 1024 * 1024,
-      });
-    } catch {
-      return undefined;
-    }
-  };
+  const blob = (sha: string, file: string) => gitBlob(repo, sha, file);
   const module = blob(targetSha, CHAIN_MODULE);
   const listed = module === undefined ? undefined : chainModuleFiles(module.toString("utf8"));
   if (!listed || new Set(listed).size !== listed.length) refuse("release_bootstrap_chain");
@@ -985,6 +1356,21 @@ export function releaseBootstrapFiles(
     release: blob(releaseSha, file),
     target: anchorFiles.has(file) ? blob(targetSha, file) : undefined,
   }));
+}
+
+/**
+ * The anchor's (target_sha) contract modules from the Git object database, read like
+ * releaseBootstrapFiles (git cat-file argv, no shell, env limited to PATH). The release
+ * side is this checkout's imported modules (the release sha). target_sha must be 40 hex
+ * and its session-bootstrap-chain.ts must exist (else release_bootstrap_chain); a
+ * consumers module that cannot be read reads as absent, which bootstrapContractSource
+ * refuses unless the chain module also carries no SESSION_BOOTSTRAP_ROLES section.
+ */
+export function releaseBootstrapContract(repo: string, targetSha: string): BootstrapAnchorContract {
+  if (!/^[0-9a-f]{40}$/.test(targetSha)) refuse("release_bootstrap_chain");
+  const chainModule = gitBlob(repo, targetSha, CHAIN_MODULE);
+  if (chainModule === undefined) refuse("release_bootstrap_chain");
+  return { chainModule, consumersModule: gitBlob(repo, targetSha, CONSUMERS_MODULE) };
 }
 
 interface Queryable {
@@ -1061,7 +1447,12 @@ export async function runBootstrapStage(x: {
   /** The typed approval's CHAIN field. */
   approvalChain: string;
   supabaseMode: boolean;
-  underLock: () => Promise<{ files: readonly BootstrapChainInput[]; steps: readonly string[] }>;
+  underLock: () => Promise<{
+    files: readonly BootstrapChainInput[];
+    steps: readonly string[];
+    /** The anchor's contract modules, re-read under the lock (releaseBootstrapContract). */
+    contract: BootstrapAnchorContract;
+  }>;
   writeEvidence: (evidence: Record<string, unknown>) => Promise<void>;
   /** Non-secret evidence header (version, shas, plan run, run id). */
   header: Record<string, unknown>;
@@ -1073,10 +1464,11 @@ export async function runBootstrapStage(x: {
   try {
     await client.query(BOOTSTRAP_LOCK);
     locked = true;
-    const { files, steps } = await x.underLock();
-    // Under the lock, before BEGIN: git inputs vs the plan and the approval.
+    const { files, steps, contract } = await x.underLock();
+    // Under the lock, before BEGIN: git inputs (chain bytes, steps, contract modules) vs
+    // the plan and the approval; contract drift refuses here too.
     requireBootstrapTargetChain(
-      bootstrapTargetChain({ target: x.target, targetSha: x.targetSha, steps, files }),
+      bootstrapTargetChain({ target: x.target, targetSha: x.targetSha, steps, files, contract }),
       x.planned,
       x.approvalChain,
     );
@@ -1093,6 +1485,7 @@ export async function runBootstrapStage(x: {
         targetSha: x.targetSha,
         steps,
         files,
+        contract,
         state: before,
         supabaseMode: x.supabaseMode,
       });
@@ -1102,6 +1495,10 @@ export async function runBootstrapStage(x: {
         target: live.target,
         target_sha: live.target_sha,
         chain_digest: live.chain_digest,
+        contract_source: live.contract_source,
+        contract_map_digest: live.contract_map_digest,
+        contract_manifest_digest: live.contract_manifest_digest,
+        contract_digest: live.contract_digest,
         required_roles: live.required_roles,
         excluded: live.excluded,
         files: live.files,

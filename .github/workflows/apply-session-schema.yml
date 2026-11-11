@@ -37,7 +37,7 @@ on:
         type: string
         default: ""
       approval:
-        description: "Apply: APPLY pyamkrhoyszgzirqqffq <sha> <generation> TARGET <target> <target_sha> <target_generation> MANIFEST <manifest_digest> PLAN <plan_run>. Bootstrap: BOOTSTRAP <project> <sha> TARGET <target> <target_sha> CHAIN <chain_digest> ROLES <sorted comma-joined will_create, or none> PLAN <plan_run> (chain_digest from the plan binds target, target_sha, the target-required roles and the anchor bytes of the run files)"
+        description: "Apply: APPLY pyamkrhoyszgzirqqffq <sha> <generation> TARGET <target> <target_sha> <target_generation> MANIFEST <manifest_digest> PLAN <plan_run>. Bootstrap: BOOTSTRAP <project> <sha> TARGET <target> <target_sha> CHAIN <chain_digest> ROLES <sorted comma-joined will_create, or none> PLAN <plan_run> (chain_digest from the plan binds target, target_sha, the target-required roles, the bootstrap contract digest and the anchor bytes of the run files)"
         type: string
         default: ""
 permissions:
