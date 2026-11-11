@@ -435,6 +435,14 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "replacement: buffered_sessions_for and buffered_session_stages_for count duplicate ordinals with a window (044040, session-first detail)",
     sql: "SELECT count(*)=2 AS applied FROM pg_proc WHERE oid IN(to_regprocedure('sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)'),to_regprocedure('sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)')) AND prosecdef AND prosrc LIKE '%count(*) OVER (PARTITION BY rc.stage_token, rc.ord)%'",
   },
+  "upstream:20261105050000_operator_session_erase.sql": {
+    evidence: "table sessions.session_erasure_receipts (operator per-session erase)",
+    sql: relation("sessions.session_erasure_receipts"),
+  },
+  "upstream:20261105050010_operator_session_erase_fence_check.sql": {
+    evidence: "trigger ingest_erase_fence_index_guard on sessions.session_index; claim/commit call ingest_erase_fence_extend",
+    sql: "SELECT to_regprocedure('sessions.ingest_erase_fence_extend(text,text,text,text,jsonb)') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('sessions.session_index') AND tgname='ingest_erase_fence_index_guard') AS applied",
+  },
 };
 
 /** The ALTER-only and replacement steps the CREATE inventory alone can't see. */

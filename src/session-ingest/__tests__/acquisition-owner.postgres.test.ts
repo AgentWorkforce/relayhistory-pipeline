@@ -29,6 +29,9 @@ const GEN="a".repeat(64);
 const root=join(import.meta.dir,"../../..");
 const MIGRATION="20261105043850_ingest_acquisition_owner.sql";
 const read=(p:string)=>readFileSync(join(root,p),"utf8").split("\n").filter(l=>!l.startsWith("\\")).join("\n");
+// The "no migration" baseline omits 043850 and every later migration built on it: one that names a 043850 function
+// (050010 re-replaces claim/commit with 043850's bodies, which call ingest_acquisition_hooks_live) cannot apply alone.
+const ON_ACQUISITION=readdirSync(join(root,"supabase/migrations")).sort().filter(f=>f>MIGRATION&&/\bsessions\.ingest_acquisition_/.test(read("supabase/migrations/"+f)));
 const US="\x1f";
 const sha=(s:string|Buffer)=>createHash("sha256").update(s).digest("hex");
 const G=(c:string)=>"rhg_"+c.repeat(64/c.length);
@@ -85,7 +88,7 @@ async function database(prefix:string,withAcquisition=true):Promise<Db>{
  await pool.query(read("supabase/tests/supabase_shim.sql"));await pool.query("CREATE EXTENSION pg_trgm;CREATE EXTENSION btree_gin");
  // Single-sourced bootstrap chain: the grant migration FAILs closed without the bare consumer grantee.
  for(const f of SESSION_BOOTSTRAP_FILES)await pool.query(read(f));
- for(const f of readdirSync(join(root,"supabase/migrations")).sort())if(withAcquisition||f!==MIGRATION)await pool.query(read("supabase/migrations/"+f));
+ for(const f of readdirSync(join(root,"supabase/migrations")).sort())if(withAcquisition||(f!==MIGRATION&&!ON_ACQUISITION.includes(f)))await pool.query(read("supabase/migrations/"+f));
  for(const f of readdirSync(join(root,"src/hoopdb/migrations")).sort())await pool.query(read("src/hoopdb/migrations/"+f));
  return d;
 }
@@ -651,6 +654,8 @@ describe.skipIf(!url)("flag off, and flag on with unenrolled sources, are byte-i
     tables[t]=(await f.pool.query(`SELECT coalesce(jsonb_agg(to_jsonb(x)-'acquisition'-'acquisition_epoch' ORDER BY (to_jsonb(x)-'acquisition'-'acquisition_epoch')::text),'[]') j FROM sessions.${t} x`)).rows[0].j;
    return normalize({calls:f.calls,tables});
   };
+  // Drift alarm: a new migration built on 043850 is reviewed here before the baseline silently drops it.
+  expect(ON_ACQUISITION).toEqual(["20261105050010_operator_session_erase_fence_check.sql"]);
   const withMigration=await workload(await ingest("acq_identity_a",true));
   const armed=await ingest("acq_identity_c",true);await armed.pool.query("SELECT sessions.ingest_acquisition_set_hooks(true)");
   const withFlag=await workload(armed);
