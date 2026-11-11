@@ -116,7 +116,7 @@ export function validateReleasePlan(
 }
 /**
  * The target anchor from the local Git object database only (no fetch): target_sha
- * must be an ancestor of the release sha whose tree's schema steps equal this
+ * must be the release sha or on its first-parent (main) history, and its tree's schema steps equal this
  * checkout's steps without `held`, by name and sha256 (release-target.ts).
  */
 async function targetAnchor(input: { sha: string; target: string; targetSha: string }, held: string[]) {
@@ -149,7 +149,7 @@ export async function releaseDatabase() {
     (await generation()) !== input.generation
   )
     refuse("release_checkout_generation");
-  // target_sha: a local commit, an ancestor of the release sha (no network git).
+  // target_sha: a local commit, the release sha or on its first-parent chain (no network git).
   requireTargetCommit(process.cwd(), input.sha, input.targetSha);
   const profile = releaseProfile(input.boundary);
   const approvedPlan =

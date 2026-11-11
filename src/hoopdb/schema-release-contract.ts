@@ -30,9 +30,10 @@ export function releaseInputs(
     RELEASE_BOUNDARY: boundary,
     // Required in both modes: the last schema step this release may apply.
     RELEASE_TARGET: target,
-    // Required with the target, both modes: the full 40-hex commit (an ancestor of the
-    // release sha) whose tree ends at the target; the release is anchored to it
-    // (src/hoopdb/release-target.ts).
+    // Required with the target, both modes: the full 40-hex commit (the release sha or
+    // on its first-parent main history, with green push CI of its own) whose tree ends
+    // at the target; the release is anchored to it (src/hoopdb/release-target.ts,
+    // scripts/schema-release-github.ts).
     RELEASE_TARGET_SHA: targetSha,
     // Apply only: the target generation the plan recorded, the generation of
     // target_sha's tree (what --generation prints there); the only generation an

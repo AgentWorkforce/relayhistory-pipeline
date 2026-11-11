@@ -20,7 +20,7 @@ on:
         type: string
         required: true
       target_sha:
-        description: "Full 40-hex commit, an ancestor of sha, whose tree ends at target (same prefix steps, its own verifiers); images for this release are built there"
+        description: "Full 40-hex commit, sha itself or on sha's first-parent main history with green push CI, whose tree ends at target (same prefix steps, its own verifiers); images for this release are built there"
         type: string
         required: true
       target_generation:

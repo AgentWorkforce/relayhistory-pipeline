@@ -21,7 +21,8 @@ import {
 const sha = "a".repeat(40),
   generation = "b".repeat(64),
   target = "upstream:20261105047000_coordination_fact_readers.sql",
-  // target_sha: the full commit (an ancestor of sha) whose tree ends at the target.
+  // target_sha: the full commit (sha itself or on sha's first-parent main history) whose
+  // tree ends at the target; its own push CI and pg-proof runs must be green.
   targetSha = "9".repeat(40),
   // The plan's targetGeneration (target_sha's own generation); differs from generation
   // when held.
@@ -204,6 +205,51 @@ function api() {
         conclusion: "success",
       })),
     },
+    // target_sha's own push runs on main (ids 20/21), checked when it differs from sha.
+    tci: {
+      workflow_runs: [
+        {
+          id: 20,
+          head_sha: targetSha,
+          head_branch: "main",
+          event: "push",
+          status: "completed",
+          conclusion: "success",
+          run_attempt: 1,
+        },
+      ],
+    },
+    tpg: {
+      workflow_runs: [
+        {
+          id: 21,
+          head_sha: targetSha,
+          head_branch: "main",
+          event: "push",
+          status: "completed",
+          conclusion: "success",
+          run_attempt: 1,
+        },
+      ],
+    },
+    jobs20: {
+      total_count: 2,
+      jobs: ["checks", "session-read-worker / worker"].map((name) => ({
+        name,
+        head_sha: targetSha,
+        status: "completed",
+        conclusion: "success",
+      })),
+    },
+    jobs21: {
+      total_count: 3,
+      jobs: [15, 16, 17].map((v) => ({
+        name: "real PostgreSQL " + v,
+        head_sha: targetSha,
+        status: "completed",
+        conclusion: "success",
+      })),
+    },
     plan: {
       ...run,
       id: 90,
@@ -222,10 +268,13 @@ function get(f: Fixture) {
     if (path.endsWith("/environments/" + P.environment)) return f.env;
     if (path.includes("deployment-branch-policies")) return f.branches;
     if (path.endsWith("/approvals")) return f.approvals;
-    if (path.includes("/workflows/ci.yml/")) return f.ci;
-    if (path.includes("/workflows/pg-proof.yml/")) return f.pg;
+    const target = path.includes(`head_sha=${targetSha}&`);
+    if (path.includes("/workflows/ci.yml/")) return target ? f.tci : f.ci;
+    if (path.includes("/workflows/pg-proof.yml/")) return target ? f.tpg : f.pg;
     if (path.includes("/runs/10/")) return f.jobs10;
     if (path.includes("/runs/11/")) return f.jobs11;
+    if (path.includes("/runs/20/")) return f.jobs20;
+    if (path.includes("/runs/21/")) return f.jobs21;
     throw new Error("unexpected " + path);
   };
 }
@@ -353,6 +402,81 @@ test("release gate pins the renamed repository and reads only its API", async ()
     await expect(
       githubReleaseGate({ ...base, GITHUB_REPOSITORY: name }, get(api()), true),
     ).rejects.toThrow("release_context");
+});
+const targetCiMutations: [string, (f: Fixture) => void, string][] = [
+  ["target ci missing", (f) => (f.tci.workflow_runs = []), "release_target_ci"],
+  ["target pg-proof missing", (f) => (f.tpg.workflow_runs = []), "release_target_ci"],
+  ["target ci running", (f) => (f.tci.workflow_runs[0]!.status = "in_progress"), "release_target_ci"],
+  ["target pg-proof failed", (f) => (f.tpg.workflow_runs[0]!.conclusion = "failure"), "release_target_ci"],
+  // A run listed for another commit or off main or not a push does not count.
+  ["target run of another sha", (f) => (f.tci.workflow_runs[0]!.head_sha = sha), "release_target_ci"],
+  ["target run off main", (f) => (f.tpg.workflow_runs[0]!.head_branch = "feature"), "release_target_ci"],
+  // The latest run decides: an older green run does not mask a newer failed one.
+  [
+    "target latest run failed",
+    (f) => f.tci.workflow_runs.push({ ...f.tci.workflow_runs[0]!, id: 30, conclusion: "failure" }),
+    "release_target_ci",
+  ],
+  ["target job failed", (f) => (f.jobs20.jobs[0]!.conclusion = "failure"), "release_target_ci_jobs"],
+  ["target job not completed", (f) => (f.jobs21.jobs[2]!.status = "in_progress"), "release_target_ci_jobs"],
+  ["target job of another sha", (f) => (f.jobs21.jobs[0]!.head_sha = sha), "release_target_ci_jobs"],
+  [
+    "target required job missing",
+    (f) => {
+      f.jobs20.jobs.pop();
+      f.jobs20.total_count--;
+    },
+    "release_target_ci_jobs",
+  ],
+  ["target jobs truncated", (f) => (f.jobs21.total_count = 101), "release_target_ci_jobs"],
+];
+for (const [label, mutate, expected] of targetCiMutations)
+  test(label + " refuses with " + expected + " in plan and apply", async () => {
+    const apply = {
+      ...base,
+      RELEASE_MODE: "apply",
+      RELEASE_PLAN_RUN: "90",
+      RELEASE_TARGET_GENERATION: targetGeneration,
+      RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${targetGeneration} MANIFEST ${manifestDigest} PLAN 90`,
+    };
+    for (const env of [base, apply]) {
+      const f = api();
+      mutate(f);
+      await expect(githubReleaseGate(env, get(f), true)).rejects.toMatchObject({ code: expected });
+    }
+  });
+test("target_sha's own push CI and pg-proof runs are read and must be green when it differs from sha", async () => {
+  const paths: string[] = [];
+  const inner = get(api());
+  expect((await githubReleaseGate(base, async (p) => (paths.push(p), inner(p)), true)).targetSha).toBe(targetSha);
+  for (const wf of ["ci.yml", "pg-proof.yml"]) {
+    expect(paths).toContain(`/repos/${P.repository}/actions/workflows/${wf}/runs?event=push&head_sha=${sha}&per_page=100`);
+    expect(paths).toContain(`/repos/${P.repository}/actions/workflows/${wf}/runs?event=push&head_sha=${targetSha}&per_page=100`);
+  }
+  expect(paths.some((p) => p.includes("/actions/runs/20/attempts/1/jobs"))).toBe(true);
+  expect(paths.some((p) => p.includes("/actions/runs/21/attempts/1/jobs"))).toBe(true);
+  // The release sha's check still runs first and keeps its own codes.
+  const f = api();
+  f.ci.workflow_runs = [];
+  f.tci.workflow_runs = [];
+  await expect(githubReleaseGate(base, get(f), true)).rejects.toMatchObject({ code: "release_ci" });
+  const g = api();
+  g.jobs11.jobs[0]!.conclusion = "failure";
+  await expect(githubReleaseGate(base, get(g), true)).rejects.toMatchObject({ code: "release_ci_jobs" });
+});
+test("target_sha === sha: no extra GitHub calls for the target", async () => {
+  const paths: string[] = [];
+  const f = api();
+  // Any read of the target fixtures would refuse.
+  f.tci.workflow_runs = [];
+  f.tpg.workflow_runs = [];
+  const inner = get(f);
+  const same = { ...base, RELEASE_TARGET_SHA: sha };
+  expect((await githubReleaseGate(same, async (p) => (paths.push(p), inner(p)), true)).targetSha).toBe(sha);
+  expect(paths.filter((p) => p.includes(`head_sha=${targetSha}`))).toEqual([]);
+  expect(paths.filter((p) => p.includes("/runs/20/") || p.includes("/runs/21/"))).toEqual([]);
+  // Exactly one listing per required workflow (the release sha's).
+  expect(paths.filter((p) => p.includes("/actions/workflows/")).length).toBe(2);
 });
 test("apply rejects foreign, stale, replayed or failed prior plan and artifact bindings", async () => {
   const env = {

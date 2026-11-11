@@ -34,7 +34,7 @@ export async function operatorPlan() {
     (await generation()) !== input.generation
   )
     refuse("release_checkout_generation");
-  // target_sha: a local commit, an ancestor of the release sha (no network git).
+  // target_sha: a local commit, the release sha or on its first-parent chain (no network git).
   requireTargetCommit(process.cwd(), input.sha, input.targetSha);
   const client = releaseClient(process.env.SUPABASE_MIGRATION_OWNER_URL);
   try {

@@ -1,6 +1,6 @@
 // Release target anchoring: binds a held-step release to a real commit (target_sha)
 // whose tree ends at the target. Read-only, from the local Git object database only
-// (cat-file, rev-parse, merge-base, ls-tree): never a fetch, never a lazy fetch, never
+// (cat-file, rev-parse, rev-list, ls-tree): never a fetch, never a lazy fetch, never
 // a network protocol. A shallow clone or a missing object refuses (fail closed).
 import { spawnSync } from "node:child_process";
 import {
@@ -44,9 +44,14 @@ function gitText(repo: string, args: string[], code: string, message: string): s
 }
 
 /**
- * target_sha is a full 40-hex commit present in the local object database and an
- * ancestor of (or equal to) the release sha. Refuses release_target_sha_invalid,
- * release_target_sha_unknown or release_target_sha_not_ancestor.
+ * target_sha is a full 40-hex commit present in the local object database that is the
+ * release sha itself or on the release sha's first-parent (main) history. A commit
+ * reachable only through a merged side parent is refused even when its schema and
+ * verifier bytes match: images are published at target_sha, and only first-parent main
+ * commits carry the release's CI provenance. Checks in order: format, object existence,
+ * resolve-to-self, first-parent membership. Refuses release_target_sha_invalid,
+ * release_target_sha_unknown (including any git error while reading the chain) or
+ * release_target_sha_not_ancestor (not on the first-parent chain).
  */
 export function requireTargetCommit(repo: string, releaseSha: string, targetSha: string): void {
   if (!FULL_COMMIT_SHA.test(targetSha))
@@ -61,11 +66,14 @@ export function requireTargetCommit(repo: string, releaseSha: string, targetSha:
     if (resolved.status !== 0 || resolved.stdout.toString("utf8").trim() !== sha)
       refuse("release_target_sha_unknown", "a release commit does not resolve to itself");
   }
-  const anc = git(repo, ["merge-base", "--is-ancestor", targetSha, releaseSha]);
-  if (anc.status === 1)
-    refuse("release_target_sha_not_ancestor", "target_sha is not an ancestor of the release sha");
-  if (anc.status !== 0)
-    refuse("release_target_sha_unknown", "target_sha ancestry could not be read from the local object database");
+  if (targetSha === releaseSha) return;
+  // The release sha's first-parent chain, newest first, one full id per line. Exact
+  // full-id match only; any git error (a missing parent object included) refuses.
+  const chain = git(repo, ["rev-list", "--first-parent", releaseSha, "--"]);
+  if (chain.status !== 0)
+    refuse("release_target_sha_unknown", "the release sha's first-parent history could not be read from the local object database");
+  if (!chain.stdout.toString("utf8").split("\n").includes(targetSha))
+    refuse("release_target_sha_not_ancestor", "target_sha is not on the release sha's first-parent chain");
 }
 
 interface TreeEntry {
@@ -135,8 +143,8 @@ export interface ReleaseTargetAnchor extends ReleaseTargetBinding {
 /**
  * Binds a release target to target_sha. requireTargetCommit; then target_sha's tree
  * must contain the target with no step of the target's own lane after it
- * (release_target_tail), and its schema steps must equal `prefix` (the release tree's
- * steps without the held ones, [name, sha256] in migrator order) exactly, by name and
+ * (release_target_tail; applied other-lane steps may follow, bound by the manifest),
+ * and its schema steps must equal `prefix` (the release tree's steps without the held ones, [name, sha256] in migrator order) exactly, by name and
  * digest (release_target_tree_mismatch); its 7 verifier files must exist. Returns the
  * manifest, its canonical digest, the target generation (what --generation prints on a
  * checkout of target_sha) and the verifier SQL the migrator runs after its own.
@@ -151,6 +159,12 @@ export function releaseTargetBinding(input: {
   requireTargetCommit(input.repo, input.releaseSha, input.targetSha);
   const steps = treeSchemaSteps(input.repo, input.targetSha);
   const at = steps.findIndex(([n]) => n === input.target);
+  // Per-lane tail: no step of the target's own lane may follow the target in
+  // target_sha's tree. Already-applied steps of the other lane may follow (an upstream
+  // target with 96bulls steps after it): they are in the manifest and the prefix
+  // comparison below binds them by name and sha256. Every held step (either lane, i.e.
+  // every pending step after the target) is absent from the prefix, so it must be
+  // absent from target_sha's tree too (release_target_tree_mismatch otherwise).
   const lane = (n: string) => n.slice(0, n.indexOf(":") + 1);
   if (at < 0 || steps.slice(at + 1).some(([n]) => lane(n) === lane(input.target)))
     refuse("release_target_tail", "target_sha's tree does not end its lane at the release target");

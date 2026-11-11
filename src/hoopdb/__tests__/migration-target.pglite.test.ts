@@ -4,7 +4,8 @@
  * steps is anchored to a real commit (target_sha) whose tree ends at the target, read
  * from the Git object database (release-target.ts) of temporary repositories built here.
  * Phase 2 runs this tree's verifiers, then target_sha's, and marks PASS for target_sha's
- * generation only after both sets pass, never for the full-tree one. A non-ancestor,
+ * generation only after both sets pass, never for the full-tree one. A target_sha off the
+ * release sha's first-parent chain (a non-ancestor or a merged side commit), an
  * abbreviated or unknown target_sha, a tree that does not end at the target or differs
  * from the prefix, a missing verifier, a manifest that drifted between plan and apply
  * or under the lock, a pending set or target generation other than the approved one,
@@ -36,7 +37,7 @@ import {
   type MigrationProfile,
   type ReleaseTargetBinding,
 } from "../migrate.ts";
-import { releaseTargetBinding, requireTargetCommit, type ReleaseTargetAnchor } from "../release-target.ts";
+import { releaseTargetBinding, requireTargetCommit, treeSchemaSteps, treeVerifiers, type ReleaseTargetAnchor } from "../release-target.ts";
 import { sessionsFunctionAclDrift } from "../migrate-guards.ts";
 import { schemaVerdict, type ExpectedSchema, type Transact } from "../../shared/db.ts";
 
@@ -211,7 +212,7 @@ test("steps after the target are held: never applied or ledgered; both verifier 
   expect(await marker(db)).toEqual([{ generation: gen, status: "pass" }]);
 });
 
-test("target_sha: abbreviated, unknown, missing from a shallow clone, non-ancestor, not ending at the target, differing steps or a missing verifier refuse", () => {
+test("target_sha: abbreviated, unknown, missing from a shallow clone, not on the first-parent chain, not ending at the target, differing steps or a missing verifier refuse", () => {
   const held = [u("3"), u("4")];
   expect(code(() => anchor(A.slice(0, 12), u("2"), held))).toBe("release_target_sha_invalid");
   expect(code(() => anchor(A.toUpperCase(), u("2"), held))).toBe("release_target_sha_invalid");
@@ -225,7 +226,7 @@ test("target_sha: abbreviated, unknown, missing from a shallow clone, non-ancest
   execFileSync("git", ["clone", "-q", "--depth", "1", "--branch", "main", `file://${fx.repo}`, shallow]);
   expect(code(() => requireTargetCommit(shallow, R, A))).toBe("release_target_sha_unknown");
   expect(code(() => anchor(A, u("2"), held, steps, shallow))).toBe("release_target_sha_unknown");
-  // C ends at u2 as well but is not an ancestor of the release commit R.
+  // C ends at u2 as well but is not an ancestor of the release commit R at all.
   expect(code(() => requireTargetCommit(fx.repo, R, C))).toBe("release_target_sha_not_ancestor");
   expect(code(() => anchor(C, u("2"), held))).toBe("release_target_sha_not_ancestor");
   // Tail mismatch: B's tree has u3 after u2; A's tree has no u3.
@@ -244,7 +245,83 @@ test("target_sha: abbreviated, unknown, missing from a shallow clone, non-ancest
   const G2 = g.commit({ [fileOf(u("3"))]: contentOf(u("3")) });
   expect(code(() => anchor(G, u("2"), held, steps, g.repo, G2))).toBe("release_target_verifier_missing");
   // The release commit itself is a valid target only when its tree ends at the target.
+  expect(requireTargetCommit(fx.repo, R, R)).toBeUndefined();
   expect(anchor(R, u("4"), []).targetSha).toBe(R);
+});
+
+test("target_sha: a side commit merged into the release (an ancestor via a second parent) with identical schema and verifier bytes is refused; its first-parent twin is accepted", () => {
+  // main: P (u1, u2; verifiers "tp") -> Q (+u3) -> M (merge of S, first parent Q) -> R2 (+u4).
+  // side: S on P changes only non-schema application bytes, so its schema steps and 7
+  // verifier files equal P's exactly. S is an ancestor of R2, but only via M's second
+  // parent: it does not carry the release's main/CI provenance.
+  const m = newRepo();
+  const tpFiles = verifierFiles("tp");
+  const P = m.commit({ [fileOf(u("1"))]: contentOf(u("1")), [fileOf(u("2"))]: contentOf(u("2")), "app.ts": "main\n", ...tpFiles }, "P");
+  const Q = m.commit({ [fileOf(u("3"))]: contentOf(u("3")) }, "Q");
+  git(m.repo, "checkout", "-q", "-b", "side", P);
+  const S = m.commit({ "app.ts": "side branch application bytes\n" }, "S");
+  git(m.repo, "checkout", "-q", "main");
+  git(m.repo, "merge", "-q", "--no-ff", "-m", "M", S);
+  const M = git(m.repo, "rev-parse", "HEAD");
+  const R2 = m.commit({ [fileOf(u("4"))]: contentOf(u("4")) }, "R2");
+  // Premises: S is an ancestor of R2 (merge-base agrees), M's second parent is S, and S's
+  // schema steps and verifier bytes equal P's (the manifest alone cannot tell them apart).
+  expect(git(m.repo, "rev-parse", `${M}^2`)).toBe(S);
+  expect(git(m.repo, "rev-parse", `${M}^1`)).toBe(Q);
+  git(m.repo, "merge-base", "--is-ancestor", S, R2);
+  expect(treeSchemaSteps(m.repo, S)).toEqual(treeSchemaSteps(m.repo, P));
+  expect(treeVerifiers(m.repo, S)).toEqual(treeVerifiers(m.repo, P));
+  expect(git(m.repo, "rev-parse", `${S}^{tree}`)).not.toBe(git(m.repo, "rev-parse", `${P}^{tree}`));
+  const held = [u("3"), u("4")];
+  // Refused: S is not on R2's first-parent chain.
+  expect(code(() => requireTargetCommit(m.repo, R2, S))).toBe("release_target_sha_not_ancestor");
+  expect(code(() => anchor(S, u("2"), held, steps, m.repo, R2))).toBe("release_target_sha_not_ancestor");
+  let message = "";
+  try {
+    requireTargetCommit(m.repo, R2, S);
+  } catch (e) {
+    message = (e as Error).message;
+  }
+  expect(message).toContain("first-parent chain");
+  // Accepted: P (same schema and verifier bytes) is on the first-parent chain, as are Q,
+  // the merge commit M itself and the release commit R2.
+  const p = anchor(P, u("2"), held, steps, m.repo, R2);
+  expect(p.targetSha).toBe(P);
+  expect(p.manifest.steps).toEqual(treeSchemaSteps(m.repo, S));
+  for (const ok of [P, Q, M, R2]) expect(requireTargetCommit(m.repo, R2, ok)).toBeUndefined();
+  // S as its own release sha: S itself and P (S's first parent) are accepted.
+  expect(requireTargetCommit(m.repo, S, S)).toBeUndefined();
+  expect(requireTargetCommit(m.repo, S, P)).toBeUndefined();
+  // A later main commit is not on an earlier release's chain.
+  expect(code(() => requireTargetCommit(m.repo, Q, R2))).toBe("release_target_sha_not_ancestor");
+});
+
+test("per-lane tail: an upstream target is accepted with 96bulls lane steps after it in the same tree; a later upstream step refuses", () => {
+  // Already-applied steps of the other lane may follow the target: they are part of the
+  // manifest (the prefix comparison binds them). Only the target's own lane must end at
+  // the target; held steps (either lane) are absent from the prefix and so from the tree.
+  const OURS_DIR = RELEASE_TREE.lanes[1].dir;
+  const ours = "96bulls:0001_lane_two.sql";
+  const oursSql = "CREATE TABLE sessions.lane_two (x int);";
+  const l = newRepo();
+  const X = l.commit({
+    [fileOf(u("1"))]: contentOf(u("1")), [fileOf(u("2"))]: contentOf(u("2")),
+    [`${OURS_DIR}/0001_lane_two.sql`]: oursSql, ...verifierFiles("tx"),
+  }, "X");
+  const Y = l.commit({ [fileOf(u("3"))]: contentOf(u("3")) }, "Y");
+  const R3 = l.commit({ [fileOf(u("4"))]: contentOf(u("4")) }, "R3");
+  const prefix = [...fixturePrefix([u("3"), u("4")]), [ours, sha256(oursSql)] as [string, string]];
+  const bind = (targetSha: string) =>
+    releaseTargetBinding({ repo: l.repo, releaseSha: R3, targetSha, target: u("2"), prefix });
+  // Accepted: the 96bulls step follows the upstream target in X's tree and in the manifest.
+  const x = bind(X);
+  expect(x.manifest.steps.map(([n]) => n)).toEqual([u("1"), u("2"), ours]);
+  expect(x.manifest.steps.at(-1)![0]).toBe(ours);
+  // Refused: Y has a later upstream (same-lane) step u3 after the target.
+  expect(code(() => bind(Y))).toBe("release_target_tail");
+  // Refused: the 96bulls step bound by the manifest differs (drifted other-lane bytes).
+  const drifted = prefix.map(([n, d]) => [n, n === ours ? sha256("other") : d] as [string, string]);
+  expect(code(() => releaseTargetBinding({ repo: l.repo, releaseSha: R3, targetSha: X, target: u("2"), prefix: drifted }))).toBe("release_target_tree_mismatch");
 });
 
 test("held steps need the binding; a wrong generation, a drifted or replayed binding, or no in-process verifiers refuse before any write", async () => {
