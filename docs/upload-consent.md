@@ -68,6 +68,10 @@ A mixed batch therefore never persists denied content and never advances a recei
 | `admission-consumer.ts` | at admission, at the current policy. Covers async admission and direct uploads (promotion hands off to it). A refusal is a retry; the inbox keeps the bytes for a redrive. |
 | `/v1/delivery/recovery` | the same pre-check and gate (an archive replay re-publishes) |
 
+Known trade-off: a selection re-enable (`enabled:true`) never removes the principal's deny, because a sync
+token cannot broaden. A client that re-enables and re-sends that session is held until an `rth:consent`
+write (the Cloud consent UI / relay-control follow-up) allows it.
+
 Known trade-off: a principal-level deny for a session that ANOTHER origin uploads without its own
 deletion fence refuses that origin's whole batch (hourly retries) until the person resolves it. That
 is privacy-safe, but it can stall that installation's queue. The client follow-up should mirror denies
@@ -79,6 +83,22 @@ indexed or readable.
 
 A replay or replay_fast claim admits nothing new and is not re-checked. A store failure answers 503:
 hold, never admit.
+
+## Operator capture policy cap
+
+With `INGEST_UPLOAD_CONSENT` on (any mode but `off`) and `RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS=enforce`,
+the operator's `sharing_mode` (`selected`, or `new` with its `sharing_mode_since`) caps the person's choice.
+The stricter mode wins, and under `new` the later boundary wins. The cap is enforced even in consent
+`report` mode, because the operator asked for enforcement. With `INGEST_UPLOAD_CONSENT` off (the default),
+capture enforce behaves exactly as before: it checks the revision and refuses a known start before the
+boundary. That older behaviour is the gap the reproduction showed, so it closes only when consent is on.
+
+The cap is applied on the request path (`acceptBatch`, before enqueue). It is not re-derived in the async
+consumer or for direct uploads, which carry no capture policy:
+
+- For direct uploads, relay-control applies the capture policy when it mints the upload credentials.
+- An operator policy change that lands after a batch was queued is not re-checked. The person's own policy
+  is re-checked.
 
 ## Operator signal
 

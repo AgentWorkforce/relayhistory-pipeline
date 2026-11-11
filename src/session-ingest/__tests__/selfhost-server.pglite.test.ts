@@ -421,27 +421,28 @@ describe("capture policy upload check (RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLO
     expect((await chunkKeys(store)).length).toBeGreaterThan(0);
   });
 
-  test("enforce: under sharing_mode new, a session older than the policy is 422; a newer one needs the person's confirmed choice", async () => {
+  test("enforce: under sharing_mode new, a session older than the policy is 422; a newer one is accepted", async () => {
+    const rc = await relaycontrol(() => policy({ sharing_mode: "new" }, { sharing_mode_since: SINCE }));
+    const { url } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce" });
+    const refused = await post(url("/v1/delivery/batches"), await oldSession("s1"), { [HEADER]: "7" });
+    expect([refused.status, await code(refused)]).toEqual([422, "capture_policy_session_predates_policy"]);
+    const fresh = JSON.stringify({ protocolVersion: 1, batch: await batch([
+      record({ record_id: "s2", kind: "session", payload: { first_activity_ms: Date.parse(SINCE) + 60_000 } }),
+    ], { batch_id: "batch-s2" }) });
+    expect((await post(url("/v1/delivery/batches"), fresh, { [HEADER]: "7" })).status).toBe(200);
+  });
+
+  test("enforce + INGEST_UPLOAD_CONSENT: under sharing_mode new, a newer session also needs the person's confirmed choice", async () => {
     const rc = await relaycontrol(() => policy({ sharing_mode: "new" }, { sharing_mode_since: SINCE }));
     const fresh = JSON.stringify({ protocolVersion: 1, batch: await batch([
       record({ record_id: "s2", kind: "session", payload: { first_activity_ms: Date.parse(SINCE) + 60_000 } }),
     ], { batch_id: "batch-s2" }) });
-    // Without the consent store (INGEST_UPLOAD_CONSENT off) nothing proves the person's choice: held, not stored
-    // (upload-consent.ts; the root-selected-consent reproduction stored this before).
-    {
-      const { url, store } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce" });
-      const refused = await post(url("/v1/delivery/batches"), await oldSession("s1"), { [HEADER]: "7" });
-      expect([refused.status, await code(refused)]).toEqual([422, "capture_policy_session_predates_policy"]);
-      const held = await post(url("/v1/delivery/batches"), fresh, { [HEADER]: "7" });
-      expect([held.status, await code(held)]).toEqual([503, UPLOAD_CONSENT_REQUIRED]);
-      expect(await chunkKeys(store)).toEqual([]);
-    }
-    // With the consent store and the person's confirmed choice for this installation: accepted.
-    {
-      const { url, run } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce", INGEST_UPLOAD_CONSENT: "enforce" });
-      await sqlUploadConsentStore(run).apply(TENANT, { mode: "all", confirmOrigins: ["origin-1"] }, { trusted: true, nowMs: Date.parse(SINCE) });
-      expect((await post(url("/v1/delivery/batches"), fresh, { [HEADER]: "7" })).status).toBe(200);
-    }
+    const { url, store, run } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce", INGEST_UPLOAD_CONSENT: "enforce" });
+    const held = await post(url("/v1/delivery/batches"), fresh, { [HEADER]: "7" });
+    expect([held.status, await code(held)]).toEqual([503, UPLOAD_CONSENT_REQUIRED]);
+    expect(await chunkKeys(store)).toEqual([]);
+    await sqlUploadConsentStore(run).apply(TENANT, { mode: "all", confirmOrigins: ["origin-1"] }, { trusted: true, nowMs: Date.parse(SINCE) });
+    expect((await post(url("/v1/delivery/batches"), fresh, { [HEADER]: "7" })).status).toBe(200);
   });
 
   test("enforce: a policy that sets no key, or no policy at all (older relaycontrol), needs no header", async () => {

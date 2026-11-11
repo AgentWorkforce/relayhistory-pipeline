@@ -689,7 +689,8 @@ export function createIngestApp(deps: IngestAppDeps) {
       // Upload consent (upload-consent.ts): before any enqueue, claim or write. Explicit denies wait for the
       // post-claim check, which knows which sessions the deletion fence will drop anyway.
       // The operator's enforced sharing mode caps the person's choice (capture-policy.ts operatorSharingCap).
-      const operator = operatorSharingCap(identity, capturePolicyUploads);
+      // Only with INGEST_UPLOAD_CONSENT on: with it off (the default) capture enforce behaves exactly as on main.
+      const operator = deps.uploadConsent && deps.uploadConsent.enforcement !== "off" ? operatorSharingCap(identity, capturePolicyUploads) : undefined;
       await checkUploadConsent(deps.uploadConsent, tenant, batch.origin_id, batch.records, { deferDenied: true, phase: "precheck", route, ...(operator ? { operator } : {}) }, (f) => emit({ ...fields, ...f }));
       // Async admission: no Supabase call. Only for a caller whose SIGNED identity accepts the queued ACK,
       // with a pre-body journal witness, and never for a relayhistory-built custody envelope (whose ACK

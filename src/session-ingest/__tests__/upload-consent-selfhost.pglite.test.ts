@@ -204,9 +204,11 @@ const nothingStored = (stored: Awaited<ReturnType<typeof persistedSynthetic>>) =
 
 describe("upload consent: the baseline reproduction now stores nothing", () => {
   for (const mode of ["selected", "new"] as const) {
-    test(`capture policy enforce, sharing_mode ${mode}, no consent store: held, zero stored`, async () => {
+    // INGEST_UPLOAD_CONSENT is the opt-in (default off: capture enforce behaves exactly as on main). Even in
+    // report mode, the operator's ENFORCED sharing mode caps the person's choice and is enforced.
+    test(`capture policy enforce, sharing_mode ${mode}, consent report, no confirmed choice: held, zero stored`, async () => {
       const rc = await relaycontrol(() => policy(mode));
-      const { url, store, db } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce" });
+      const { url, store, db } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce", INGEST_UPLOAD_CONSENT: "report" });
       const u = await syntheticUpload(mode, Date.parse(SINCE) + (mode === "new" ? 60_000 : -60_000));
       const response = await post(url("/v1/delivery/batches"), u.body, { [HEADER]: "7" });
       expect(response.status).toBe(503);

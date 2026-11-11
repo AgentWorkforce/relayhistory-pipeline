@@ -27,7 +27,8 @@ import {
   batchSessions, consentRefuses, decideUploadConsent, sessionKey, uploadConsentEnforcement, writeBroadens,
   type ConsentSnapshot, type UploadConsentEnforcement, type UploadConsentStore,
 } from "../upload-consent.ts";
-import { MemoryLedger, TENANT, batch, record, scratchStore } from "./support.ts";
+import { MemoryLedger, SIGNING_KEY, TENANT, batch, record, scratchStore, signedHeaders } from "./support.ts";
+import { RECOVERY_CONTENT_TYPE, RECOVERY_PROTOCOL } from "../recovery-protocol.ts";
 
 const cleanups: (() => void)[] = [];
 afterEach(() => cleanups.splice(0).forEach((f) => f()));
@@ -396,5 +397,52 @@ describe("decoded paths", () => {
       body: JSON.stringify({ protocolVersion: 1, batch: await batch([sess("a")]) }) });
     expect(res.status).toBe(503);
     expect(h.ledger.claims).toHaveLength(0);
+  });
+});
+
+describe("archive recovery (/v1/delivery/recovery)", () => {
+  // The claim-timeout-busy.test.ts recovery harness: one signed buffered-mode archive replay.
+  async function recover(consent: MemoryConsentStore) {
+    const s = store();
+    const ledger = new MemoryLedger();
+    const raw = await batch([record({ record_id: "recovered", session_id: "archived" })], { batch_id: "recovered" });
+    const prepared = await prepareDelivery(TENANT, raw);
+    const sourceDigest = "d".repeat(64);
+    const custody = {
+      sourceDigest,
+      witness: {
+        version: 1 as const, issuer: "relayhistory-cloud" as const, sourceIdentitySha256: "c".repeat(64), controlEpoch: "e".repeat(64), privacyBaselineSha256: "a".repeat(64),
+        tenant: TENANT, originId: prepared.originId, batchId: prepared.batchId, batchDigest: prepared.batchDigest, sourceControlVersion: "0", pending: false, pendingControl: null,
+        privacyVersion: "0", originalRecordCount: raw.records.length, candidateCount: prepared.records.length,
+        records: prepared.records.map((r, preparedOrd) => ({ preparedOrd, processingRank: preparedOrd, candidateDigest: r.digest, recordId: r.record_id, revision: String(r.revision), revisionId: r.revision_id, candidateFenced: false, currentFenced: false, current: null })),
+        privacy: { complete: true as const, deletions: [], resets: [] },
+      },
+    };
+    ledger.prepareBufferStage = async () => ({ stageToken: crypto.randomUUID(), expiresAt: new Date(Date.now() + 60_000).toISOString() });
+    ledger.commitBuffered = async () => ({ version: 1, sourceDigest, sourceControlVersion: "0", privacySealed: true });
+    const app = createIngestApp({
+      deliver: { ledger, target: { store: s, keyRoot: "96bulls", sleep: async () => {} }, acceptanceMode: "buffered" } as never,
+      log: () => {}, signingKey: SIGNING_KEY,
+      uploadConsent: { enforcement: "enforce", store: consent, nowMs: () => T0 },
+    });
+    const body = JSON.stringify({ protocol: RECOVERY_PROTOCOL, prepared, custody });
+    const path = "/v1/delivery/recovery";
+    const res = await app.fetch(new Request(`https://x${path}`, { method: "POST", body, headers: { "content-type": RECOVERY_CONTENT_TYPE, ...signedHeaders({ ...TENANT, scopes: [SYNC_SCOPE] }, "POST", path, new TextEncoder().encode(body)) } }));
+    return { res, ledger };
+  }
+
+  test("an archive replay re-publishes: held without a confirmed choice, nothing claimed", async () => {
+    const { res, ledger } = await recover(new MemoryConsentStore());
+    expect(res.status).toBe(503);
+    expect(await errorCode(res)).toBe(UPLOAD_CONSENT_REQUIRED);
+    expect(ledger.claims).toHaveLength(0);
+  });
+
+  test("with the person's confirmed choice, the same replay is admitted", async () => {
+    const consent = new MemoryConsentStore();
+    await consent.apply(TENANT, { mode: "all", confirmOrigins: ["origin-1"] }, { trusted: true, nowMs: T0 });
+    const { res, ledger } = await recover(consent);
+    expect(res.status).toBe(200);
+    expect(ledger.claims).toHaveLength(1);
   });
 });
