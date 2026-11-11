@@ -350,12 +350,14 @@ describe("migrator: HOOPDB_RDS_LAYOUT=separate-database", () => {
 });
 
 describe("role counts (v1)", () => {
-  test("19 roles, 11 LOGIN: analysis admit + digest narrative worker logins; babysitter retention still deferred", () => {
-    expect(SPEC.length).toBe(19);
+  test("20 roles, 11 LOGIN: operator erase search stays NOLOGIN until separately provisioned", () => {
+    expect(SPEC.length).toBe(20);
     expect(LOGINS.length).toBe(11);
     expect(LOGINS).toContain("bulls96_analysis_admit");
     expect(LOGINS).toContain("bulls96_digest_narrative");
     expect(LOGINS).not.toContain("bulls96_babysitter_retention");
+    expect(SPEC.find(r=>r.name==="bulls96_session_erase_search")).toMatchObject({login:false});
+    expect(LOGINS).not.toContain("bulls96_session_erase_search");
   });
 });
 

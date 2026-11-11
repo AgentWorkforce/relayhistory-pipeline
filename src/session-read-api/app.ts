@@ -185,6 +185,8 @@ export class AuthError extends Error {
 }
 
 export interface ReadApiDeps {
+  /** Self-host SESSION_ERASE_FENCE_ENFORCED=1 only; pre/post IO gate for exact session routes. */
+  operatorErased?: (key: { orgId: string; workspaceId: string; source: string; sessionId: string }) => Promise<boolean>;
   verify: Verifier;
   ch?: ClickHouseClient;
   adapter?: SearchServiceBinding;
@@ -638,6 +640,23 @@ export function createReadApi(deps: ReadApiDeps) {
   };
 
   const pageDeps = () => ({ ch: deps.ch, adapter: deps.adapter, completeSinceMs: deps.completeSinceMs, liveness: deps.liveness, timeoutMs: deps.timeoutMs, bufferedGate: deps.bufferedSearchGate });
+
+  if (deps.operatorErased) app.use("/v1/sessions/:sessionId/*", async (c, next) => {
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      const sources = c.req.queries("source") ?? [];
+      const source = sources[0], sessionId = c.req.param("sessionId");
+      // Let each route retain its validation errors for malformed/ambiguous keys.
+      if (sources.length !== 1 || !source || !HARNESS_NAME.test(source) || !sessionId || sessionId.length > MAX_ID_CHARS) return next();
+      const key = { orgId: identity.orgId, workspaceId: identity.workspaceId, source, sessionId };
+      const notFound = () => fail(c, new HttpError(404, "not_found", "Session not found"));
+      if (await deps.operatorErased!(key)) return notFound();
+      await next();
+      // A fence that committed during object/model IO wins before any successful payload leaves.
+      if (c.res.status >= 200 && c.res.status < 300 && await deps.operatorErased!(key)) c.res = notFound();
+    } catch (error) { return fail(c, error instanceof HttpError ? error : new HttpError(503, "backend_unavailable", "read backend unavailable")); }
+  });
 
   /** Gate telemetry: two integer counts only (checked, and the per-reason drops summed), never ids or content. */
   async function gatedPage(c: Context, input: EventQuery) {

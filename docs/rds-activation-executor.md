@@ -92,14 +92,14 @@ to, GRANT or DROP any HoopDb role, and `hoop` cannot CREATE ROLE.
 ## Role set (generated, never hand-maintained)
 
 The driver builds the role spec at runtime from these files, all of which are part of
-the artifact identity. At v1 it holds 17 roles, of which 9 are LOGIN (`hoop`,
-`sessions_pipeline_runtime` and 7 service logins). `bulls96_babysitter_retention` is
-deferred to NOLOGIN (below), and 7 more roles are NOLOGIN by design.
+the artifact identity. At v1 it holds 20 roles, of which 11 are LOGIN (`hoop`,
+`sessions_pipeline_runtime` and 9 service logins). `bulls96_babysitter_retention` is
+deferred to NOLOGIN (below), and 8 more roles are NOLOGIN in the catalog.
 
 - `rds_migration_roles.sql`: the fixed NOLOGIN inventory.
 - `session_consumer_roles.sql`: the bare consumer role.
 - `session_directory_search_worker.sql` and every operator `*_role.sql` (except the
-  legacy runtime-role files): LOGIN and every `ALTER ROLE ... SET k = v`.
+  legacy runtime-role files): role declarations, explicitly armed LOGINs and every `ALTER ROLE ... SET k = v`.
 
 A unit test fails when any bootstrap file creates or alters, by name, a role that the
 spec does not cover. A second unit test fails when a file that arms LOGIN or sets a role
@@ -112,6 +112,20 @@ settings. The landed (frozen) migration `20261105042000_babysitter_evidence_rete
 refuses a role that can already log in when it first applies. Nobody can arm LOGIN
 later on this layout, so that login is unavailable until a reviewed path exists. A unit
 test pins the exception to the migration text.
+
+The optional operator search eraser, `bulls96_session_erase_search`, is one of those
+NOLOGIN roles. `session_erase_search_role.sql` contributes it and its timeout settings
+to the generated catalog, so ordinary activation does not request a password or arm
+its LOGIN. The byte eraser needs a separate dedicated LOGIN with DELETE and key-column
+SELECT only under forced tenant RLS; it must not reuse ingest/search writer credentials.
+
+The current search-role grant bootstrap requires a direct superuser. An ordinary RDS
+master is not that identity, so it needs a reviewed managed-RDS provisioning path before
+AA enables operator byte erasure. Infra's current `scripts/selfhost/rds-setup.sh` pre/post
+lists do not include this optional role; its owner has been notified. This document and
+the catalog pin do not authorize creating roles, setting credentials or applying grants
+to a real database. Deployment/role activation still requires Khaliq's explicit approval.
+
 
 ## Inputs
 

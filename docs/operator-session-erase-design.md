@@ -1,9 +1,17 @@
-# Operator session-erase front door (design, HELD)
+# Operator session-erase: historical per-user reset proposal
+
+Per-session hard-delete implementation was ordered by Khaliq on 2026-11-11, relayed by
+infra-chief. Its current contract and implementation are [operator-session-erase-contract.md](operator-session-erase-contract.md)
+and [operator-session-erase-runtime.md](operator-session-erase-runtime.md). That implementation
+hold is lifted. Deployment, migrations, IAM, credentials and flag activation remain separately gated.
+
+The remaining document is the earlier per-user reset proposal. It is historical design,
+not the implemented per-session API or a claim that bulk user hard-delete has shipped.
 
 ## 1. Status and gates
 
-- **HELD. Source-only design. Default-off.** Requested by layered-control (relay 245052487018340352) as a draft; Khaliq
-  has NOT ordered it. Control acts only if Khaliq orders it after PR #338. Nothing here is approved to deploy, and
+- **Historical per-user reset design. Default-off, not implemented here.** Requested by layered-control
+  (relay 245052487018340352) as a draft. The later order enables per-session implementation above. Nothing here is approved to deploy, and
   **there is no canary until the full privacy gate exists.**
 - **Flag:** `OPERATOR_SESSION_ERASE_ENABLED`. It is unset by default, and only the literal `"1"` turns it on (the
   repo's pattern for new behaviour, e.g. `SESSION_DESKTOP_CATALOG_ENABLED` in `src/session-pipeline/lambda.ts`

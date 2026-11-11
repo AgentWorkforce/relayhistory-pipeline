@@ -64,6 +64,8 @@ import { prepareBufferedStage, putBufferedStage, fanoutMessages, stageGroups, ty
 import { MAX_FETCH_REDIRECTS, babysitterStub, bucketBodies, bucketRefs, planBabysitterBuckets, planKey, worstCaseSubrequests, writeBucketObjects, type BucketRefs } from "./babysitter-retention.ts";
 
 export interface DeliverDeps {
+  /** Default-off self-host operator fence: persist an obligation around actual object writes. */
+  withSessionWrites?: import("../session-erase/runtime.ts").SessionWriteGuard;
   /** Verified private source packet, bound to this request only. */
   custody?:CurrentCustodyPacket;
   ledger: Ledger;
@@ -402,7 +404,10 @@ async function deliverPreparedCore(deps: DeliverDeps, tenant: LedgerTenant, prep
   prepared.records.forEach((r, i) => {
     if (!stale.has(i) && !(r.session_id && deleted.has(pair(r.source, r.session_id)))) keep.push(i);
   });
-  const work = () => writeAndCommit(deps, tenant, prepared, sessions, deleted, keep, claim.resets, claim.claimToken, { ...base, stale: stale.size }, timing, mark, now);
+  const write = () => writeAndCommit(deps, tenant, prepared, sessions, deleted, keep, claim.resets, claim.claimToken, { ...base, stale: stale.size }, timing, mark, now);
+  const work = () => deps.withSessionWrites && keep.length
+    ? deps.withSessionWrites(tenant, groupRecords(keep.map(i => prepared.records[i]!), now()).groups.map(g => [g.source, g.sessionId] as [string, string]), write)
+    : write();
   if (!deps.slots) return work();
   const holder = (deps.requestId ?? (() => crypto.randomUUID()))();
   const slot = await stage("slot", () => deps.ledger.acquireSlot({ tenant, holder, ...deps.slots! }));
