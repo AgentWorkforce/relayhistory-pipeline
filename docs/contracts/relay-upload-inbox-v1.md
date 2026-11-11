@@ -89,13 +89,18 @@ mac     = HMAC-SHA256(key, "relay-upload-witness-v1\n" + payloadB64url)
 
 ## 4. Credentials (`POST /api/v1/workspaces/{ws}/relayhistory/upload-credentials`, relay-control)
 
-**Request:** `{"originId": "<segment>", "kind": "sts" | "presigned", "keys"?: ["<key relative to keyPrefix>", …]}`. `keys` is used for `presigned` only.
+**Request:** `{"originId": "<segment>", "kind": "sts" | "presigned", "keys"?: [{"key": "<key relative to keyPrefix>", "sha256": "<base64>"}, …]}`. `keys` is used for `presigned` only, at most 64 entries per request. Each `sha256` is the standard padded base64 of the raw sha256 of the stored zstd bytes (`uploadChecksumSha256`), the same digest `d=` in the key is cut from. relay-control signs `x-amz-checksum-sha256: <sha256>` and `content-encoding: zstd` into each presigned URL, so a PUT whose bytes do not match the key cannot succeed.
 
-**Answers:**
+**Answers** (error bodies are `{ error: <code> }`):
 
 - **200:** one of the two bodies below.
-- **404:** the feature is off for this caller (`HISTORY_UPLOAD_DIRECT`). The desktop falls back to the HTTP POST path.
-- **403:** authentication or authorization refusal.
+- **401 `unauthorized`:** missing, expired or non-`sh_at_` token, or no live `rth:sync`. The desktop treats it like 403: stop and re-authenticate.
+- **403 `forbidden`** (browser-cookie caller) and **403 `handoff_not_exchanged`** (the desktop sign-in handoff was not exchanged): stop.
+- **404 `history_upload_direct_off`:** the feature is off for this caller (`HISTORY_UPLOAD_DIRECT`). Its only meaning: the desktop falls back to the HTTP POST path.
+- **429 `rate_limited`** with `Retry-After`: retry after the delay.
+- **503 `upload_credentials_unavailable`** and **503 `privacy_journal_unavailable`:** fall back to the ingest edge for this batch.
+
+JSON object key order is not part of the contract.
 
 ```
 STS:       {"contract":"relay-upload-inbox-v1","kind":"sts","bucket","region","endpoint":null,"keyPrefix","kmsKeyId",
@@ -111,7 +116,7 @@ presigned: {"contract":"relay-upload-inbox-v1","kind":"presigned","bucket","regi
 - **`maxObjectBytes`** equals `MAX_DELIVERY_BYTES`.
 - **`keyPrefix`** parses as a §1 prefix.
 - **The witness matches the prefix.** Its payload, read unverified, has the `keyPrefix` tenant: the same org and ws, and `userSegment(ws, user)` equal to `u=`. Its `seq` equals `witnessSeq`.
-- **Presigned urls:** 1 to 100 entries with distinct keys. Each `key` is relative to `keyPrefix`, and `keyPrefix + key` parses as a §1 key with `w<witnessSeq>`. Each `url` is an absolute http(s) URL with no userinfo and no fragment.
+- **Presigned urls:** 1 to 64 entries with distinct keys (`UPLOAD_MAX_PRESIGNED_URLS`). Each `key` is relative to `keyPrefix`, and `keyPrefix + key` parses as a §1 key with `w<witnessSeq>`. Each `url` is an absolute http(s) URL with no userinfo and no fragment.
 - **`endpoint`** is `null` (the provider's default endpoint for `region`, which is what hosted always sends) or an http(s) origin URL with path `/`, for a self-host S3-compatible store.
 - **`bucket`** follows S3 bucket naming. **`region`** is `[a-z0-9-]{1,64}`. **`kmsKeyId`** is a non-empty printable string.
 

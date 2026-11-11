@@ -40,7 +40,7 @@ export const UPLOAD_WITNESS_MAX_BYTES = 1024;
 export const UPLOAD_WITNESS_KEY_BYTES = 32;
 /** Stored (zstd) bytes, before decoding; after decoding the usual delivery limits apply. */
 export const UPLOAD_MAX_OBJECT_BYTES = MAX_DELIVERY_BYTES;
-export const UPLOAD_MAX_PRESIGNED_URLS = 100;
+export const UPLOAD_MAX_PRESIGNED_URLS = 64;
 export const UPLOAD_WITNESS_METADATA_HEADER = "x-amz-meta-relay-witness";
 export const UPLOAD_CONTENT_TYPE = "application/json";
 export const UPLOAD_CONTENT_ENCODING = "zstd";

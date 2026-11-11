@@ -326,7 +326,7 @@ describe("credentials and admission status validators", () => {
     expect(parseUploadCredentialsResponse({ ...v.credentials.sts, kind: "presigned" })).toBeNull();
     const url = v.credentials.presigned.urls[0];
     for (const urls of [[], [url, url], [{ ...url, extra: 1 }], [{ key: url.key, url: url.url }], [{ ...url, key: url.key.replace(`-w${SEQ}`, `-w${SEQ + 1}`) }],
-      [{ ...url, key: v.objectKey }], [{ ...url, url: "not a url" }], Array.from({ length: 101 }, (_, i) => ({ ...url, key: url.key.replace("o=", `o=x${i}`) }))])
+      [{ ...url, key: v.objectKey }], [{ ...url, url: "not a url" }], Array.from({ length: 65 }, (_, i) => ({ ...url, key: url.key.replace("o=", `o=x${i}`) }))])
       expect(parseUploadCredentialsResponse({ ...v.credentials.presigned, urls })).toBeNull();
   });
 
