@@ -46,6 +46,7 @@ import { assertSandboxAlchemyCredentials } from "./sandbox-credentials.ts";
 import { spawnSync } from "node:child_process";
 import { Project as SupabaseProject, SupabaseProvider } from "../supabase/project.ts";
 import { assertTranscriptStorePlanContract, TRANSCRIPT_STAGE, transcriptStoreStage } from "./transcript-store.ts";
+import { parseHistoryUploadDirectInfra } from "./upload-inbox.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const REPO = "AgentWorkforce/sessions-pipeline";
@@ -217,6 +218,8 @@ export default Alchemy.Stack(
         budgetUsd: inputs.budgetUsd,
         budgetEmail: inputs.budgetEmail,
         transcriptStore: inputs.transcriptStore!,
+        // Default off (upload-inbox.ts): only HISTORY_UPLOAD_DIRECT_INFRA=on adds the input at all.
+        ...(parseHistoryUploadDirectInfra(process.env.HISTORY_UPLOAD_DIRECT_INFRA) ? { historyUploadDirectInfra: true } : {}),
         tags: (component) => tags(stage, component),
       });
       return { stage, accountId: inputs.accountId, region: inputs.region, transcriptStore: store };

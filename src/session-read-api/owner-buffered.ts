@@ -91,7 +91,7 @@ export function ownerBufferedEnabled(raw: string | undefined): boolean {
   return value === "1" || value === "true";
 }
 
-/** Selects the exact-session RPC added by 050030; default off. Unknown values stay off. */
+/** Selects the exact-session RPC added by 047010; default off. Unknown values stay off. */
 export function ownerBufferedExactSessionEnabled(raw: string | undefined): boolean {
   return raw === "on";
 }

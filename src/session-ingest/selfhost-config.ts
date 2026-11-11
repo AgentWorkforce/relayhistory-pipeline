@@ -71,6 +71,10 @@
  *                                    defaulted; missing or malformed leaves every upload pending (retried), never refused
  *   SELFHOST_UPLOAD_SCAN_BATCH       upload objects promoted per scan, 1..100, default 16 (the scan reuses
  *                                    SELFHOST_ADMISSION_SCAN_MS)
+ *   HISTORY_UPLOAD_INBOX_SSE         unset | "" | "none" (default: no requirement, e.g. MinIO without KMS) | "aws:kms":
+ *                                    refuse (upload_unencrypted, terminal, before the witness check) an upload object
+ *                                    whose own HEAD/GET lacks x-amz-server-side-encryption: aws:kms. Any other value
+ *                                    refuses startup, even with HISTORY_UPLOAD_DIRECT off
  *
  *   ANALYTICS_SINK                   unset | "" | "noop" (default: no analytics) | "collector"; "posthog" and any
  *                                    ANALYTICS_POSTHOG_* value refuse startup (src/shared/analytics-config.ts).

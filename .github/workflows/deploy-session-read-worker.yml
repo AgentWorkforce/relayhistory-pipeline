@@ -95,7 +95,7 @@ on:
         type: string
         default: ""
       owner_buffered_exact_session:
-        description: 050030 RPC; on requires applied migration and explicit owner_buffered=on; off preserves live in profile/preserve, otherwise disables
+        description: 047010 RPC; on requires applied migration and explicit owner_buffered=on; off preserves live in profile/preserve, otherwise disables
         type: choice
         options: ["off", "on"]
         default: "off"

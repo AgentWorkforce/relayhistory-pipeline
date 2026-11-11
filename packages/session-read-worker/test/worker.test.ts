@@ -230,7 +230,7 @@ describe("entry and configuration", () => {
     }
   });
 
-  test("050030 exact-session flag selects only the stages RPC, with default off", async () => {
+  test("047010 exact-session flag selects only the stages RPC, with default off", async () => {
     const seen: string[] = [];
     const run = (async (_org: string, _ws: string, work: any) => work({ query: async (sql: string) => { seen.push(sql); return { rows: [] }; } })) as never;
     const keys = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", INGEST_S3_BUCKET: "ingest-bucket-example", PIPELINE_RAW_S3_ACCESS_KEY_ID: "k", PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "s" };

@@ -224,7 +224,7 @@ describe("committed production profile (DEPLOY_TARGET=production)", () => {
 });
 
 
-describe("050030 exact-session deployment selection", () => {
+describe("047010 exact-session deployment selection", () => {
   test("preserve and production profile keep the live selection; neither silently enables it", async () => {
     for (const mode of ["preserve", "profile"]) {
       for (const enabled of [false, true]) {

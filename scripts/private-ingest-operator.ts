@@ -1,5 +1,5 @@
 /** Source-only operator adapter. No operation happens on import.
- * Real execution requires a separately reviewed operator exception; no CI bypass.
+ * Real execution requires the guarded GitHub Actions production workflow.
  */
 import { createHash } from "node:crypto";
 import { hostname } from "node:os";
@@ -60,9 +60,17 @@ import {
   SIGNING_KEY_SECRET,
 } from "../stacks/cloudflare/session-ingest.ts";
 import { sanitizePlan, captureFiles } from "../src/cli/plan-provenance.ts";
+import {
+  privateIngestGithubGate,
+  privateIngestGithubGet,
+} from "./private-ingest-release-github.ts";
 export const OPERATOR_PROTOCOL = "private-ingest-operator-v1";
 export const STATE_SCRIPT = "alchemy-state-store-96bulls";
-export const EXECUTION_EXCEPTION = "ssh-sf-frame-retained-plan";
+export const EXECUTION_EXCEPTION = "github-actions-retained-plan";
+export const operatorExecutionHost = (
+  env: Record<string, string | undefined> = process.env,
+  actual = hostname(),
+) => env.GITHUB_ACTIONS === "true" ? "github-actions" : actual;
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const isHash = (s: unknown): s is string =>
   typeof s === "string" && /^[0-9a-f]{64}$/u.test(s);
@@ -912,37 +920,47 @@ export function assertOperatorSnapshot(
             oldExpected = currentEnv?.INGEST_EXPECT_GENERATION,
             newExpected = proposedEnv?.INGEST_EXPECT_GENERATION,
             oldAccepted = currentEnv?.INGEST_ACCEPT_GENERATIONS;
-          // The retained operator may remove exactly one binding, and only for
-          // the documented G -> H generation-window closure. Bind the deleted
-          // payload to the old resolved state and the new single generation;
-          // arbitrary binding deletion remains refused.
-          if (
-            b.sid !== "INGEST_ACCEPT_GENERATIONS" ||
-            row.action !== "update" ||
-            wanted !== undefined ||
-            input.sessionIngest.overlapGeneration !== undefined ||
-            input.sessionIngest.expectedGeneration !== newExpected ||
-            typeof oldExpected !== "string" ||
-            !/^[0-9a-f]{64}$/u.test(oldExpected) ||
-            typeof newExpected !== "string" ||
-            !/^[0-9a-f]{64}$/u.test(newExpected) ||
-            oldExpected === newExpected ||
-            oldAccepted !== `${oldExpected},${newExpected}` ||
-            proposedEnv?.INGEST_ACCEPT_GENERATIONS !== undefined ||
-            !Array.isArray(actual) ||
-            actual.length !== 1 ||
-            Object.entries(b.data).some(
-              ([k, v]) => k !== "bindings" && v !== undefined,
-            ) ||
-            inputsDigest(JSON.stringify({ value: actual[0] })) !==
-              inputsDigest(JSON.stringify({
-                value: {
-                  type: "plain_text",
-                  name: "INGEST_ACCEPT_GENERATIONS",
-                  text: oldAccepted,
-                },
-              }))
-          )
+          if (row.action !== "update" || wanted !== undefined ||
+              !Array.isArray(actual) || actual.length !== 1 ||
+              Object.entries(b.data).some(([k, v]) => k !== "bindings" && v !== undefined))
+            refuse("native_binding_target");
+          let deletedValue: unknown;
+          if (b.sid === "INGEST_ACCEPT_GENERATIONS") {
+            // Documented G -> H generation-window closure.
+            if (input.sessionIngest.overlapGeneration !== undefined ||
+                input.sessionIngest.expectedGeneration !== newExpected ||
+                typeof oldExpected !== "string" || !/^[0-9a-f]{64}$/u.test(oldExpected) ||
+                typeof newExpected !== "string" || !/^[0-9a-f]{64}$/u.test(newExpected) ||
+                oldExpected === newExpected || oldAccepted !== `${oldExpected},${newExpected}` ||
+                proposedEnv?.INGEST_ACCEPT_GENERATIONS !== undefined)
+              refuse("native_binding_target");
+            deletedValue = oldAccepted;
+          } else if (b.sid === "INGEST_CUSTODY_SOURCE") {
+            // CI rollout rollback: step 1 -> baseline only.
+            if (input.sessionIngest.custodySource !== undefined ||
+                input.sessionIngest.syncAdmissionFrozenReceipt !== undefined ||
+                currentEnv?.INGEST_CUSTODY_SOURCE !== "frozen-supabase" ||
+                currentEnv?.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT !== undefined ||
+                proposedEnv?.INGEST_CUSTODY_SOURCE !== undefined)
+              refuse("native_binding_target");
+            deletedValue = "frozen-supabase";
+          } else if (b.sid === "INGEST_SYNC_ADMISSION_FROZEN_RECEIPT") {
+            // CI rollout rollback: step 2 -> step 1 only.
+            if (input.sessionIngest.syncAdmissionFrozenReceipt !== undefined ||
+                input.sessionIngest.custodySource !== "frozen-supabase" ||
+                currentEnv?.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT !== "on" ||
+                currentEnv?.INGEST_CUSTODY_SOURCE !== "frozen-supabase" ||
+                proposedEnv?.INGEST_CUSTODY_SOURCE !== "frozen-supabase" ||
+                proposedEnv?.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT !== undefined)
+              refuse("native_binding_target");
+            deletedValue = "on";
+          } else {
+            refuse("native_binding_target");
+          }
+          if (inputsDigest(JSON.stringify({ value: actual[0] })) !==
+              inputsDigest(JSON.stringify({ value: {
+                type: "plain_text", name: b.sid, text: deletedValue,
+              } })))
             refuse("native_binding_target");
           inventory.push({
             sid: b.sid,
@@ -1095,6 +1113,12 @@ export async function retainedOperatorPlan(
     (!runtime.reviewed || typeof runtime.reviewed.recheckSource !== "function")
   )
     refuse("retained_deploy_approval_required");
+  if (
+    mode === "deploy" &&
+    (process.env.GITHUB_ACTIONS !== "true" ||
+      process.env.PRIVATE_INGEST_GITHUB_GATE !== "approved")
+  )
+    refuse("github_actions_deploy_required");
   if (
     process.env.CI !== "true" ||
     process.env.CLOUDFLARE_ACCOUNT_ID !== secrets.accountId ||
@@ -1294,6 +1318,14 @@ const PREFIX = "docs/plans/" + SESSION_INGEST_STAGE;
 export async function operatorMain(argv = process.argv.slice(2)) {
   const options = parseOptions(argv);
   if (process.env.CI !== "true") refuse("ci_state_safety_required");
+  if (
+    options.mode === "deploy" &&
+    (process.env.GITHUB_ACTIONS !== "true" ||
+      process.env.PRIVATE_INGEST_GITHUB_GATE !== "approved")
+  )
+    refuse("github_actions_deploy_required");
+  if (options.mode === "deploy")
+    await privateIngestGithubGate(process.env, privateIngestGithubGet(), true);
   const git = (args: string[]) => {
     const result = spawnSync("git", args, {
       encoding: "utf8",
@@ -1314,7 +1346,9 @@ export async function operatorMain(argv = process.argv.slice(2)) {
         ].filter(Boolean),
       ),
     ],
-    host: hostname(),
+    // A retained plan and its deploy are separate GitHub-hosted jobs. Their ephemeral hostnames
+    // differ, while the exact commit/input/plan/state/tool bindings remain stable and authoritative.
+    host: operatorExecutionHost(),
   });
   const source = sourceNow();
   assertOperatorSource(options, source);

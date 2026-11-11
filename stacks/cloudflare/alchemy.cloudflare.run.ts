@@ -7,9 +7,10 @@
  *   bunx alchemy deploy --config stacks/cloudflare/alchemy.cloudflare.run.ts --stage cf-sessions-prod   (needs a bound approval)
  *   destroy             refused (a production stage)
  *
- * Nothing runs without `.96bulls/cf-sessions-prod/cloudflare-inputs.json`
- * (written by hand, never committed; no stage config in this repo turns the
- * ingest on). A deploy also needs the reviewed capture
+ * Nothing runs without `.96bulls/cf-sessions-prod/cloudflare-inputs.json`.
+ * Production materializes that ignored file from the exact tracked profile at
+ * `config/cloudflare/private-ingest-production.json` inside the guarded GitHub Actions workflow;
+ * local production deploys are forbidden. A deploy also needs the reviewed capture
  * docs/plans/cf-sessions-prod.{plan.txt,plan.detailed.txt,provenance.json},
  * Khaliq's approval bound to it, and a plan that passes the ingest plan contract.
  *

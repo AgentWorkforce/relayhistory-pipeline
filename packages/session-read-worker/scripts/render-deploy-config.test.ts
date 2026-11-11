@@ -416,7 +416,7 @@ describe("deploy workflow wiring", () => {
 });
 
 
-describe("050030 exact-session RPC render", () => {
+describe("047010 exact-session RPC render", () => {
   test("default/off leaves the render byte-identical; on adds only its flag", () => {
     const baseline = renderDeployConfig(TEMPLATE, ON);
     for (const value of [undefined, "", "off"]) expect(renderDeployConfig(TEMPLATE, { ...ON, ownerBufferedExactSession: value })).toBe(baseline);

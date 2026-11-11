@@ -194,7 +194,7 @@ export interface Env extends CanonicalEnv {
    * is on and the workspace is on both allowlists.
    */
   READ_API_OWNER_BUFFERED_INDEX_VERIFY?: string;
-  /** 050030 exact-session RPC: exactly "on" opts in; every other value uses the frozen RPC. */
+  /** 047010 exact-session RPC: exactly "on" opts in; every other value uses the frozen RPC. */
   READ_API_OWNER_BUFFERED_EXACT_SESSION?: string;
   /** The owner-buffered canary allowlist (parseDirectoryWorkspaces syntax); unset/empty = none. */
   READ_API_OWNER_BUFFERED_WORKSPACES?: string;

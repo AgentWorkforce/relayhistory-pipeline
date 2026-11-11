@@ -1,7 +1,7 @@
 
 import {test,expect} from "bun:test";
 import {fixture} from "./exact-session-stages.fixture.ts";
-test("050030: whole-stage malformed/mixed groups and privacy match the frozen exact 044090 function",async()=>{
+test("047010: whole-stage malformed/mixed groups and privacy match the frozen exact 044090 function",async()=>{
  const f=await fixture();
  await f.deliver([["droid","fixture-target",["a","b"]],["droid","fixture-other",["c","d"]],["codex","fixture-target",["e","f"]]]);
  await f.enableAll();await f.prove();
@@ -40,16 +40,16 @@ test("050030: whole-stage malformed/mixed groups and privacy match the frozen ex
 
 import {readFileSync} from "node:fs";
 import {BUFFERED_STAGES_SQL,BUFFERED_TARGET_STAGES_SQL,ownerBufferedExactSessionEnabled,sqlOwnerBufferedReads} from "../../session-read-api/owner-buffered.ts";
-test("050030 changes only the target-group prefilter in a new RPC",()=>{
+test("047010 changes only the target-group prefilter in a new RPC",()=>{
  const old=readFileSync("supabase/migrations/20261105044090_claim_sessions_reader.sql","utf8").match(/CREATE OR REPLACE FUNCTION sessions\.buffered_session_stages_for\([\s\S]*?END\n\$buffered_stages\$;/)![0];
- const candidate=readFileSync("supabase/migrations/20261105050030_buffered_exact_session_stages.sql","utf8").match(/CREATE FUNCTION sessions\.buffered_session_stages_for_target\([\s\S]*?END\n\$buffered_stages\$;/)![0];
+ const candidate=readFileSync("supabase/migrations/20261105047010_buffered_exact_session_stages.sql","utf8").match(/CREATE FUNCTION sessions\.buffered_session_stages_for_target\([\s\S]*?END\n\$buffered_stages\$;/)![0];
  const restored=candidate.replace("CREATE FUNCTION sessions.buffered_session_stages_for_target(","CREATE OR REPLACE FUNCTION sessions.buffered_session_stages_for(")
   .replace(/  \), target_groups AS MATERIALIZED \([\s\S]*?\n  \), judged AS \(/,"  ), judged AS (")
   .replace("      JOIN target_groups AS tg ON tg.stage_token = gr.stage_token AND tg.group_index = gr.group_index\n","");
  expect(restored).toBe(old);
  expect(BUFFERED_TARGET_STAGES_SQL.replace("_for_target(","_for(")).toBe(BUFFERED_STAGES_SQL);
 });
-test("050030 runtime opt-in is exact and default-off; source/session arguments remain bound",async()=>{
+test("047010 runtime opt-in is exact and default-off; source/session arguments remain bound",async()=>{
  for(const flag of [undefined,"","off","true","1","ON"," on "])expect(ownerBufferedExactSessionEnabled(flag)).toBe(false);
  expect(ownerBufferedExactSessionEnabled("on")).toBe(true);
  for(const exactSession of [undefined,false,true]){
@@ -64,14 +64,14 @@ test("050030 runtime opt-in is exact and default-off; source/session arguments r
 });
 
 
-test("050030 requires the frozen owned reader and grants only the read role", async () => {
+test("047010 requires the frozen owned reader and grants only the read role", async () => {
  const f=await fixture();
  const signature="sessions.buffered_session_stages_for_target(text,text,text,text,text,text,text,text,boolean,text)";
  const attrs=(await f.db.query(`SELECT p.prosecdef,p.provolatile,p.proconfig,l.lanname,
   (SELECT array_agg(r.rolname ORDER BY r.rolname) FROM aclexplode(p.proacl) a JOIN pg_roles r ON r.oid=a.grantee WHERE a.grantee<>p.proowner) AS grantees
   FROM pg_proc p JOIN pg_language l ON l.oid=p.prolang WHERE p.oid=$1::regprocedure`,[signature])).rows;
  expect(attrs).toEqual([{prosecdef:true,provolatile:"s",proconfig:["search_path=pg_catalog, sessions, pg_temp"],lanname:"plpgsql",grantees:["bulls96_read_api"]}]);
- const migration=readFileSync("supabase/migrations/20261105050030_buffered_exact_session_stages.sql","utf8");
+ const migration=readFileSync("supabase/migrations/20261105047010_buffered_exact_session_stages.sql","utf8");
  await expect(f.db.exec(migration)).rejects.toMatchObject({code:"55000"});
  await f.db.exec("DROP FUNCTION "+signature);
  await f.db.exec("ALTER FUNCTION sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text) VOLATILE");
@@ -80,12 +80,12 @@ test("050030 requires the frozen owned reader and grants only the read role", as
 });
 
 
-test("050030 down requires its ledger, exact checksum/body and no later migration", async () => {
+test("047010 down requires its ledger, exact checksum/body and no later migration", async () => {
  const f=await fixture();
- const down=readFileSync("supabase/rollbacks/20261105050030_buffered_exact_session_stages.down.sql","utf8");
- const migration=readFileSync("supabase/migrations/20261105050030_buffered_exact_session_stages.sql","utf8");
+ const down=readFileSync("supabase/rollbacks/20261105047010_buffered_exact_session_stages.down.sql","utf8");
+ const migration=readFileSync("supabase/migrations/20261105047010_buffered_exact_session_stages.sql","utf8");
  const sha=new Bun.CryptoHasher("sha256").update(migration).digest("hex");
- const own="upstream:20261105050030_buffered_exact_session_stages.sql";
+ const own="upstream:20261105047010_buffered_exact_session_stages.sql";
  const signature="sessions.buffered_session_stages_for_target(text,text,text,text,text,text,text,text,boolean,text)";
  const refuse=async()=>{await expect(f.db.exec(down)).rejects.toMatchObject({code:"55000"});await f.db.exec("ROLLBACK");};
  await refuse();
@@ -103,7 +103,7 @@ test("050030 down requires its ledger, exact checksum/body and no later migratio
  expect((await f.db.query("SELECT prosrc FROM pg_proc WHERE oid='sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)'::regprocedure")).rows).toEqual(before);
 });
 
-test("050030 mixed-claim regression: 17 claims / 170 groups / 6939 records, 177 target ordinals", async () => {
+test("047010 mixed-claim regression: 17 claims / 170 groups / 6939 records, 177 target ordinals", async () => {
  const f=await fixture();
  let unrelatedGroup=0;
  for(let batch=0;batch<17;batch++){

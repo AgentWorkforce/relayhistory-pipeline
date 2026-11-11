@@ -1,4 +1,4 @@
--- SLOT 050030: exact-session buffered detail, default off in the Worker.
+-- SLOT 047010: exact-session buffered detail, default off in the Worker.
 -- A NEW RPC, frozen from 044090; the old RPC and all landed migrations remain unchanged.
 -- The only v2 query change is target_groups before judged: unrelated groups in the matching
 -- claim's batch avoid per-ordinal privacy work. Whole-stage bad_stage/duplicate checks and

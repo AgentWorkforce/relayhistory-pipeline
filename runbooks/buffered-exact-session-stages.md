@@ -1,4 +1,4 @@
-# Exact-session buffered stage lookup (050030)
+# Exact-session buffered stage lookup (047010)
 
 `get_shared_session` supplies a source and session ID. When canonical pointers are absent,
 its owner-buffered detail path locates visible stage objects in Postgres and reads their
@@ -6,7 +6,7 @@ content from S3. This is separate from transcript search in ClickHouse.
 
 The 044090 detail function starts from the session-scoped claim index, but evaluates
 per-record privacy predicates for every session group in each matching mixed-session
-batch. Migration `20261105050030_buffered_exact_session_stages.sql` adds
+batch. Migration `20261105047010_buffered_exact_session_stages.sql` adds
 `sessions.buffered_session_stages_for_target` with the same signature and output. It
 resolves whole groups to the requested source/session before the per-record checks.
 Stage-wide malformed/duplicate-ordinal validation still covers unrelated groups.
@@ -65,8 +65,13 @@ is a bounded before/after plan and one actual normal read after an approved acti
 Code integration does not activate the path. Migration and production flag changes
 require the production operator's explicit authorization.
 
-1. Land predecessors 050000/050010 (#506) and 050020 (#514) before this assigned 050030
-   slot. In event-trigger boundary mode, refresh the reviewed
+1. Slot 047010 follows the merged 047000 step and precedes the held erase migrations
+   050000/050010/050020. It has no source-order dependency on that erase stack. A
+   production apply reaching 047010 also applies the already-landed pending prefix:
+   045000, 045010, 045030, 045040, 046000, 046010 and 047000. The DB actor must verify
+   the CI plan contains exactly that reviewed pending prefix plus 047010, with no held
+   erase step; an unexpected plan stops the apply. This source re-slot does not itself
+   authorize that production prefix. In event-trigger boundary mode, refresh the reviewed
    `supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql` bootstrap and
    embedded manifest from the same image before migrate; its pinned body changes with
    the new RPC, and a stale installed boundary refuses validation. Follow the existing
@@ -88,7 +93,7 @@ require the production operator's explicit authorization.
 Inverse: an explicit deploy with `owner_buffered=on` and
 `owner_buffered_exact_session=off` selects the existing function without changing data
 or removing the new RPC. A separately authorized canonical rollback can use the generated
-`supabase/rollbacks/20261105050030_buffered_exact_session_stages.down.sql` only after
+`supabase/rollbacks/20261105047010_buffered_exact_session_stages.down.sql` only after
 disabling the flag; it requires the exact ledger checksum/body/owner and no later migration.
 Default `profile`/`preserve` deploys preserve the live selection;
 their `off` input is the historical unset convention, not an explicit reversal. To

@@ -113,7 +113,7 @@ export interface RenderInputs {
   bufferedSearchGate?: string;
   /** The owner_buffered_events workflow_dispatch input; "" (no input) = off; on needs owner_buffered=on. */
   ownerBufferedEvents?: string;
-  /** Opt in to the 050030 exact-session RPC; requires owner-buffered reads. */
+  /** Opt in to the 047010 exact-session RPC; requires owner-buffered reads. */
   ownerBufferedExactSession?: string;
   /** The owner_buffered_stage_concurrency workflow_dispatch input; "" or "off" = off, else 2..32; needs owner_buffered_events=on. */
   ownerBufferedStageConcurrency?: string;

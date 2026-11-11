@@ -38,6 +38,23 @@
  * All objects are still protected by one shared CMK. Per-workspace CMKs are not used:
  * see "Why one CMK" in the runbook.
  *
+ * Direct-to-S3 desktop upload (decision 0004; stacks/aws/upload-inbox.ts), default OFF:
+ *
+ *   historyUploadDirectInfra   stage input, from env HISTORY_UPLOAD_DIRECT_INFRA ("on" | "off" | unset;
+ *                              anything else refuses). Off (the default): nothing below is declared and
+ *                              every resource and policy renders byte-identical to the stack without it
+ *                              (stacks/aws/__tests__/upload-inbox-infra.test.ts). On: needs
+ *                              `transcriptStore.uploadControlRoleArn` (relay-control's role, the only
+ *                              principal the desktop-upload role trusts) and `transcriptStore.sessionPipeline`
+ *                              (the notification writer puts both queue rules in one configuration).
+ *                              Declares the desktop-upload role (create-only SSE-KMS PutObject under
+ *                              `96bulls/.upload-inbox/*`), the upload-admission consumer role, the
+ *                              upload-admission queue + DLQ + alarms, their key-policy grants, and the
+ *                              inbox wall (bucket-policy Deny `s3:*` on the inbox for everyone but the two
+ *                              roles and the eraser; identity Deny on the writer, reader and srv-writer).
+ *                              The plan contract has no upload-inbox phase yet, so an "on" plan is
+ *                              refused until a reviewed rollout phase lands.
+ *
  * Pure functions, unit-tested in stacks/aws/__tests__/transcript-store.test.ts;
  * `transcriptStoreStage` declares the resources.
  */
@@ -49,6 +66,24 @@ import { KMS_ADMIN_ACTIONS, denyInsecureTransport, trailKeyPolicy } from "./hard
 import { alchemyStatePrefix } from "./preflight.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
 import { assertBufferedGcRoleArn, bufferedGcBucketStatements, bufferedGcKeyStatements } from "./buffered-gc-policy.ts";
+import {
+  UPLOAD_ADMISSION_DLQ_RETENTION,
+  UPLOAD_ADMISSION_MAX_RECEIVE_COUNT,
+  UPLOAD_ADMISSION_QUEUE_RETENTION,
+  UPLOAD_ADMISSION_VISIBILITY_TIMEOUT_SECONDS,
+  assertUploadControlRoleArn,
+  denyUploadInboxStatement,
+  desktopUploadPolicy,
+  desktopUploadTrustPolicy,
+  uploadAdmissionDlqPolicy,
+  uploadAdmissionPolicy,
+  uploadAdmissionQueuePolicy,
+  uploadAdmissionTrustPolicy,
+  uploadInboxBucketStatements,
+  uploadInboxKeyStatements,
+  uploadInboxNames,
+  uploadInboxObjects,
+} from "./upload-inbox.ts";
 import {
   SESSION_BRIEF_RESOURCES,
   SESSION_ANALYSIS_CACHE_RESOURCES,
@@ -104,6 +139,11 @@ export interface TranscriptStoreInputs {
   auditPrincipalArn?: string;
   /** Default-off immutable inbox authority root. Omit to preserve the existing srv-writer policy exactly. */
   inboxAuthorityKeyRoot?: string;
+  /**
+   * relay-control's IAM role (any account): the only principal the desktop-upload role trusts.
+   * Read only when the stage's `historyUploadDirectInfra` is on; inert otherwise.
+   */
+  uploadControlRoleArn?: string;
   /**
    * The session pipeline (session-pipeline.ts): S3 manifest events -> SQS -> Lambda -> Supabase
    * pointer + ClickHouse index. Omit for the store alone.
@@ -211,9 +251,10 @@ export function assertTranscriptStoreInputs(
   if (inputs.region !== TRANSCRIPT_REGION) refuse(`transcript content must stay in ${TRANSCRIPT_REGION} (migration plan, regional boundaries), got ${inputs.region}`);
   if (inputs.partition !== TRANSCRIPT_PARTITION) refuse(`partition must be exactly ${TRANSCRIPT_PARTITION}, got ${JSON.stringify(inputs.partition)}`);
   for (const k of Object.keys(store))
-    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn") refuse(`transcriptStore.${k} is not a known setting`);
+    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "uploadControlRoleArn" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn") refuse(`transcriptStore.${k} is not a known setting`);
   assertBufferedGcRoleArn(store.bufferedGcRoleArn, inputs.accountId);
   assertInboxAuthorityKeyRoot(store.inboxAuthorityKeyRoot, refuse);
+  assertUploadControlRoleArn(store.uploadControlRoleArn, refuse);
   if (store.sessionPipeline !== undefined) assertSessionPipelineInputs(store.sessionPipeline, refuse);
   if (store.sessionReadApi !== undefined) assertSessionReadApiInputs(store.sessionReadApi, refuse);
   if (store.managementEvents !== undefined && typeof store.managementEvents !== "boolean") refuse("transcriptStore.managementEvents must be a boolean");
@@ -1198,11 +1239,14 @@ export function trailLifecycleRules() {
  * including `aws:kms` without a key id (S3 would use `aws/s3`). SSE-C is blocked
  * separately by the encryption configuration.
  */
-export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string; accountId?: string; bufferedGcRoleArn?: string; analysisDeleterArn?: string }) {
+export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string; accountId?: string; bufferedGcRoleArn?: string; analysisDeleterArn?: string; uploadInbox?: { uploadRoleArn: string; consumerRoleArn: string } }) {
   if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId ?? "");
   // The eraser+GC principal list is shared by the analysis-on and analysis-off variants of
   // the eraser-only deny below: a single control point, covered by the hardening mutations.
   const eraserAndGcPrincipals = i.bufferedGcRoleArn ? [i.eraserArn, i.bufferedGcRoleArn] : i.eraserArn;
+  // historyUploadDirectInfra on: the upload inbox leaves the eraser-only deny and gets its own
+  // (uploadInboxBucketStatements: eraser or consumer). Off: the deny below is unchanged.
+  const inboxCarveOut = i.uploadInbox ? [uploadInboxObjects(i.bucketArn)] : [];
   return [
     ...denyInsecureTransport(i.bucketArn),
     {
@@ -1222,17 +1266,26 @@ export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; e
           Effect: "Deny" as const,
           Principal: "*",
           Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
-          NotResource: [`${i.bucketArn}/${ANALYSIS_RESULT_OBJECT_GLOB}`],
+          NotResource: [`${i.bucketArn}/${ANALYSIS_RESULT_OBJECT_GLOB}`, ...inboxCarveOut],
           Condition: { ArnNotEquals: { "aws:PrincipalArn": eraserAndGcPrincipals } },
         }
-      : {
-          Sid: "OnlyTheEraserDeletes",
-          Effect: "Deny" as const,
-          Principal: "*",
-          Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
-          Resource: [`${i.bucketArn}/*`],
-          Condition: { ArnNotEquals: { "aws:PrincipalArn": eraserAndGcPrincipals } },
-        },
+      : i.uploadInbox
+        ? {
+            Sid: "OnlyTheEraserDeletes",
+            Effect: "Deny" as const,
+            Principal: "*",
+            Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+            NotResource: inboxCarveOut,
+            Condition: { ArnNotEquals: { "aws:PrincipalArn": eraserAndGcPrincipals } },
+          }
+        : {
+            Sid: "OnlyTheEraserDeletes",
+            Effect: "Deny" as const,
+            Principal: "*",
+            Action: ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+            Resource: [`${i.bucketArn}/*`],
+            Condition: { ArnNotEquals: { "aws:PrincipalArn": eraserAndGcPrincipals } },
+          },
     ...(i.analysisDeleterArn
       ? [{
           Sid: "OnlyTheEraserOrAnalysisWorkerDeletesAnalysisResults",
@@ -1264,6 +1317,7 @@ export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; e
       Condition: { Null: { "s3:x-amz-server-side-encryption": "false" }, StringNotEqualsIfExists: { "s3:x-amz-server-side-encryption-aws-kms-key-id": i.keyArn } },
     },
     ...(i.bufferedGcRoleArn ? bufferedGcBucketStatements({ accountId: i.accountId!, bucketArn: i.bucketArn, roleArn: i.bufferedGcRoleArn }) : []),
+    ...(i.uploadInbox ? uploadInboxBucketStatements({ bucketArn: i.bucketArn, eraserArn: i.eraserArn, ...i.uploadInbox }) : []),
   ];
 }
 
@@ -1315,7 +1369,7 @@ export function trailLogBucketPolicy(i: { bucketArn: string; trailArn: string; a
  * The eraser and every other operator role have no use of it: deleting needs no key,
  * and nobody reads transcripts with the console.
  */
-export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; bufferedGcRoleArn?: string; analysisResults?: boolean; readApiRoleArn?: string }) {
+export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; bufferedGcRoleArn?: string; analysisResults?: boolean; readApiRoleArn?: string; uploadInbox?: { uploadRoleArn: string; consumerRoleArn: string } }) {
   if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId);
   const via = {
     StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
@@ -1332,6 +1386,7 @@ export function transcriptKeyPolicy(i: { accountId: string; region: string; buck
       ...(i.pipelineRoleArn && i.analysisResults ? [pipelineAnalysisKeyStatement({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.pipelineRoleArn })] : []),
       ...(i.readApiRoleArn ? [readApiAnalysisKeyStatement({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.readApiRoleArn, glob: ANALYSIS_RESULT_OBJECT_GLOB })] : []),
       ...(i.bufferedGcRoleArn ? bufferedGcKeyStatements({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.bufferedGcRoleArn }) : []),
+      ...(i.uploadInbox ? uploadInboxKeyStatements({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, ...i.uploadInbox }) : []),
     ],
   };
 }
@@ -1353,7 +1408,7 @@ const noDeleteNoHistory = (bucketArn: string, extra: string[] = []) => ({
 });
 
 /** The RelayHistory Worker: read session objects; write raw chunks, manifests and encrypted summaries. */
-export function transcriptWriterPolicy(bucketArn: string) {
+export function transcriptWriterPolicy(bucketArn: string, o: { denyUploadInbox?: boolean } = {}) {
   return {
     Version: "2012-10-17" as const,
     Statement: [
@@ -1366,6 +1421,7 @@ export function transcriptWriterPolicy(bucketArn: string) {
         Resource: [sessionObjects(bucketArn, "/raw/*"), sessionObjects(bucketArn, "/manifest.json"), sessionObjects(bucketArn, "/summary/*")],
       },
       noDeleteNoHistory(bucketArn),
+      ...(o.denyUploadInbox ? [denyUploadInboxStatement(bucketArn)] : []),
     ],
   };
 }
@@ -1381,7 +1437,7 @@ export function transcriptWriterPolicy(bucketArn: string) {
  * to S3 in this region. ListBucket on the bucket (missing keys must 404, see
  * below); no delete, no old versions, no bucket changes.
  */
-export function transcriptSrvWriterPolicy(i: { bucketArn: string; accountId: string; region: string; keyAlias: string; inboxAuthorityKeyRoot?: string }) {
+export function transcriptSrvWriterPolicy(i: { bucketArn: string; accountId: string; region: string; keyAlias: string; inboxAuthorityKeyRoot?: string; denyUploadInbox?: boolean }) {
   const objects = srvWriterObjects(i.bucketArn, i.inboxAuthorityKeyRoot);
   return {
     Version: "2012-10-17" as const,
@@ -1415,18 +1471,20 @@ export function transcriptSrvWriterPolicy(i: { bucketArn: string; accountId: str
       // object reads stay limited to the srv_ and live prefixes above.
       listBucket(i.bucketArn),
       noDeleteNoHistory(i.bucketArn),
+      ...(i.denyUploadInbox ? [denyUploadInboxStatement(i.bucketArn)] : []),
     ],
   };
 }
 
 /** The history indexer: list and read session objects, nothing else. */
-export function transcriptReaderPolicy(bucketArn: string) {
+export function transcriptReaderPolicy(bucketArn: string, o: { denyUploadInbox?: boolean } = {}) {
   return {
     Version: "2012-10-17" as const,
     Statement: [
       listBucket(bucketArn),
       { Sid: "ReadSessionObjects", Effect: "Allow" as const, Action: ["s3:GetObject"], Resource: [sessionObjects(bucketArn, "")] },
       noDeleteNoHistory(bucketArn, ["s3:PutObject"]),
+      ...(o.denyUploadInbox ? [denyUploadInboxStatement(bucketArn)] : []),
     ],
   };
 }
@@ -1481,6 +1539,8 @@ export interface TranscriptStageInputs {
   budgetUsd: number;
   budgetEmail: string;
   transcriptStore: TranscriptStoreInputs;
+  /** Default off. HISTORY_UPLOAD_DIRECT_INFRA=on: the direct-to-S3 upload inbox (see the header). */
+  historyUploadDirectInfra?: boolean;
   tags: (component: string) => Record<string, string>;
 }
 
@@ -1491,8 +1551,19 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
     if (i.stage === TRANSCRIPT_STAGE || i.transcriptStore.bufferedGcRoleArn !== undefined)
       assertBufferedGcRoleArn(i.transcriptStore.bufferedGcRoleArn, i.accountId);
     assertInboxAuthorityKeyRoot(i.transcriptStore.inboxAuthorityKeyRoot, (why) => { throw new Error(why); });
+    const uploadDirect = i.historyUploadDirectInfra === true;
+    if (i.historyUploadDirectInfra !== undefined && typeof i.historyUploadDirectInfra !== "boolean")
+      throw new Error("96bulls: historyUploadDirectInfra must be a boolean. Nothing was created.");
+    if (uploadDirect) {
+      const refuse = (why: string): never => { throw new Error(`96bulls: ${i.stage} historyUploadDirectInfra is on: ${why}. Nothing was created.`); };
+      assertUploadControlRoleArn(i.transcriptStore.uploadControlRoleArn, refuse);
+      if (i.transcriptStore.uploadControlRoleArn === undefined) refuse("transcriptStore.uploadControlRoleArn is required (the only principal the desktop-upload role trusts)");
+      if (i.transcriptStore.sessionPipeline === undefined) refuse("transcriptStore.sessionPipeline is required (one notification configuration carries both queue rules)");
+    }
     const n = transcriptNames(i.stage, i.accountId);
     const eraserArn = userArn(i.accountId, n.userPath, n.eraser);
+    const u = uploadInboxNames(i.stage, i.accountId, i.region);
+    const wall = uploadDirect ? { denyUploadInbox: true } : {};
     const user = (id: string, userName: string, purpose: string, policy: object) =>
       AWS.IAM.User(id, {
         userName,
@@ -1502,8 +1573,8 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       });
 
     // Principals first: the key policy names them, and KMS refuses a principal that does not exist (yet).
-    const writer = yield* user("transcript-writer", n.writer, "relayhistory-worker-writes-transcripts", transcriptWriterPolicy(n.bucketArn));
-    const reader = yield* user("transcript-reader", n.reader, "history-indexer-reads-transcripts", transcriptReaderPolicy(n.bucketArn));
+    const writer = yield* user("transcript-writer", n.writer, "relayhistory-worker-writes-transcripts", transcriptWriterPolicy(n.bucketArn, wall));
+    const reader = yield* user("transcript-reader", n.reader, "history-indexer-reads-transcripts", transcriptReaderPolicy(n.bucketArn, wall));
     const eraser = yield* user("transcript-eraser", n.eraser, "erasure-job-deletes-versions", transcriptEraserPolicy(n.bucketArn));
     const srvWriter = yield* user(
       "transcript-srv-writer",
@@ -1515,8 +1586,52 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
         region: i.region,
         keyAlias: n.keyAlias,
         inboxAuthorityKeyRoot: i.transcriptStore.inboxAuthorityKeyRoot,
+        ...wall,
       }),
     );
+
+    // historyUploadDirectInfra: the two inbox roles, before the key and bucket whose policies name them.
+    const role = (id: string, roleName: string, purpose: string, trust: object, policy: object) =>
+      AWS.IAM.Role(id, {
+        roleName,
+        path: u.rolePath,
+        assumeRolePolicyDocument: trust as never,
+        inlinePolicies: { "upload-inbox": policy as never },
+        tags: { ...i.tags("iam"), "96bulls:purpose": purpose },
+      } as never);
+    const uploadRole = uploadDirect
+      ? yield* role(
+          "desktop-upload-role",
+          u.uploadRole,
+          "relay-control-vends-desktop-upload-credentials",
+          desktopUploadTrustPolicy({ controlRoleArn: i.transcriptStore.uploadControlRoleArn! }),
+          desktopUploadPolicy({ bucketArn: n.bucketArn, accountId: i.accountId, region: i.region, keyAlias: n.keyAlias }),
+        )
+      : undefined;
+    const consumerRole = uploadDirect
+      ? yield* role(
+          "upload-admission-role",
+          u.consumerRole,
+          "upload-admission-lambda-promotes-uploads",
+          uploadAdmissionTrustPolicy(),
+          uploadAdmissionPolicy({
+            bucketArn: n.bucketArn,
+            accountId: i.accountId,
+            region: i.region,
+            keyAlias: n.keyAlias,
+            queueArn: u.queueArn,
+            functionName: u.function,
+            promotionObjects: srvWriterObjects(n.bucketArn, i.transcriptStore.inboxAuthorityKeyRoot),
+          }),
+        )
+      : undefined;
+    const uploadInboxRoles =
+      uploadRole && consumerRole
+        ? {
+            uploadRoleArn: (uploadRole as unknown as { roleArn: string }).roleArn,
+            consumerRoleArn: (consumerRole as unknown as { roleArn: string }).roleArn,
+          }
+        : undefined;
 
     // CloudTrail into its own bucket and key, as in the baseline (hardening.ts trailKeyPolicy).
     const trailKey = yield* AWS.KMS.Key("trail-key", {
@@ -1580,6 +1695,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
         ...(pipelineRoleArn ? { pipelineRoleArn } : {}),
         ...(pipeline?.analysisJobs?.enabled ? { analysisResults: true } : {}),
         ...(readApiRoleArn ? { readApiRoleArn } : {}),
+        ...(uploadInboxRoles ? { uploadInbox: uploadInboxRoles } : {}),
       }) as never,
       // Also orders the key after the trail: the trail audits its use from the first call, and the
       // trail chain gives IAM time to propagate the new users KMS validates as principals.
@@ -1608,7 +1724,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       publicAccessBlock: PUBLIC_ACCESS_BLOCK,
       objectOwnership: "BucketOwnerEnforced",
       policy: [
-        ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn, accountId: i.accountId, bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn, ...(pipelineRoleArn && pipeline?.analysisJobs?.enabled ? { analysisDeleterArn: pipelineRoleArn } : {}) }),
+        ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn, accountId: i.accountId, bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn, ...(pipelineRoleArn && pipeline?.analysisJobs?.enabled ? { analysisDeleterArn: pipelineRoleArn } : {}), ...(uploadInboxRoles ? { uploadInbox: uploadInboxRoles } : {}) }),
         ...(pipelineRoleArn ? pipelineBucketStatements({ bucketArn: n.bucketArn, roleArn: pipelineRoleArn, analysisResults: pipeline?.analysisJobs?.enabled === true }) : []),
         ...(readApiRoleArn ? [readApiAnalysisBucketStatement({ bucketArn: n.bucketArn, roleArn: readApiRoleArn, glob: ANALYSIS_RESULT_OBJECT_GLOB })] : []),
       ] as never,
@@ -1616,6 +1732,62 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       logging: { targetBucket: accessLogs.bucketName as unknown as string, targetPrefix: ACCESS_LOG_PREFIX, targetObjectKeyFormat: { PartitionedPrefix: { PartitionDateSource: "EventTime" } } as never },
       tags: i.tags("transcripts"),
     });
+
+    // historyUploadDirectInfra: S3 (this bucket only) -> upload-admission queue -> the consumer
+    // Lambda (a separate change). Same shape as the session-events queue (session-pipeline.ts).
+    let uploadInbox: { queueUrl: string; queueArn: unknown; dlqArn: unknown; uploadRoleArn: string; consumerRoleArn: string } | undefined;
+    if (uploadInboxRoles) {
+      const uploadDlq = yield* AWS.SQS.Queue("upload-admission-dlq", {
+        queueName: u.dlq,
+        messageRetentionPeriod: UPLOAD_ADMISSION_DLQ_RETENTION,
+        sqsManagedSseEnabled: true,
+        policy: uploadAdmissionDlqPolicy({ dlqArn: u.dlqArn }),
+        tags: i.tags("upload-inbox"),
+      } as never);
+      const uploadQueue = yield* AWS.SQS.Queue("upload-admission-events", {
+        queueName: u.queue,
+        visibilityTimeout: `${UPLOAD_ADMISSION_VISIBILITY_TIMEOUT_SECONDS} seconds`,
+        messageRetentionPeriod: UPLOAD_ADMISSION_QUEUE_RETENTION,
+        receiveMessageWaitTime: "20 seconds",
+        sqsManagedSseEnabled: true,
+        redrivePolicy: { deadLetterTargetArn: uploadDlq.queueArn as unknown as string, maxReceiveCount: UPLOAD_ADMISSION_MAX_RECEIVE_COUNT },
+        policy: uploadAdmissionQueuePolicy({ queueArn: u.queueArn, bucketArn: n.bucketArn, accountId: i.accountId, consumerRoleArn: uploadInboxRoles.consumerRoleArn }),
+        tags: i.tags("upload-inbox"),
+      } as never);
+      const alarm = (id: string, props: Record<string, unknown>) =>
+        AWS.CloudWatch.Alarm(id, { ActionsEnabled: false, TreatMissingData: "notBreaching", ...props, tags: i.tags("upload-inbox") } as never);
+      yield* alarm("upload-admission-dlq-alarm", {
+        name: `${u.dlq}-not-empty`,
+        AlarmDescription: "Desktop uploads exhausted their admission retries: unscrubbed-at-rest bytes wait in the upload inbox.",
+        Namespace: "AWS/SQS",
+        MetricName: "ApproximateNumberOfMessagesVisible",
+        Dimensions: [{ Name: "QueueName", Value: u.dlq }],
+        Statistic: "Maximum",
+        Period: 300,
+        EvaluationPeriods: 1,
+        Threshold: 0,
+        ComparisonOperator: "GreaterThanThreshold",
+      });
+      yield* alarm("upload-admission-age-alarm", {
+        name: `${u.queue}-backlog-age`,
+        AlarmDescription: "Oldest upload-admission event is older than 15 minutes: the consumer is behind or failing.",
+        Namespace: "AWS/SQS",
+        MetricName: "ApproximateAgeOfOldestMessage",
+        Dimensions: [{ Name: "QueueName", Value: u.queue }],
+        Statistic: "Maximum",
+        Period: 300,
+        EvaluationPeriods: 3,
+        Threshold: 900,
+        ComparisonOperator: "GreaterThanThreshold",
+      });
+      uploadInbox = {
+        queueUrl: u.queueUrl,
+        queueArn: uploadQueue.queueArn,
+        dlqArn: uploadDlq.queueArn,
+        uploadRoleArn: uploadInboxRoles.uploadRoleArn,
+        consumerRoleArn: uploadInboxRoles.consumerRoleArn,
+      };
+    }
 
     const sessionPipeline =
       pipeline && pipelineFn
@@ -1627,6 +1799,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
             tags: i.tags,
             bucketArn: n.bucketArn,
             fn: pipelineFn as unknown as { functionName: unknown; functionArn: unknown; roleArn: unknown },
+            ...(uploadInbox ? { uploadQueueArn: u.queueArn } : {}),
           })
         : null;
 
@@ -1656,5 +1829,6 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       srvWriterUser: srvWriter.userName,
       sessionPipeline,
       sessionReadApi: readApi,
+      ...(uploadInbox ? { uploadInbox } : {}),
     };
   });

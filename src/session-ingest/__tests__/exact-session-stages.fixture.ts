@@ -1,5 +1,5 @@
 /**
- * Isolated fixture for 050030 equivalence. Synthetic data and PGlite only.
+ * Isolated fixture for 047010 equivalence. Synthetic data and PGlite only.
  * 20261105044090 claim-sessions reader v2 (PR 2, default off): sessions.buffered_sessions_for and
  * sessions.buffered_session_stages_for read sessions.ingest_claim_sessions (044080) while the policy gate
  * (read_enabled AND write_enabled AND backfill_complete_at) is on, and must return exactly 044040's rows,

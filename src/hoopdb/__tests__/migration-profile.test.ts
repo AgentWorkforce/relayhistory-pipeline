@@ -2436,7 +2436,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // Additive successors (050030 and later assigned lanes) roll back before the previous tail.
+    // Additive successors (047010 and later assigned lanes) roll back before the previous tail.
     const newest = (await plan(SUPA_A)).filter((step) => step.name.startsWith("upstream:") && step.name > CQ).reverse();
     if (newest.length) expect((await failure(rollback("20261105047000_coordination_fact_readers.down.sql")))?.code).toBe("55000");
     for (const step of newest) await rollback(`${step.name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`);

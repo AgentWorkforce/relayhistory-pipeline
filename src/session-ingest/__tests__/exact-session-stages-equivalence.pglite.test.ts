@@ -1,4 +1,4 @@
-/** Exact 044090 detail reference vs the installed 050030 RPC across privacy transitions. */
+/** Exact 044090 detail reference vs the installed 047010 RPC across privacy transitions. */
 import {test,expect} from "bun:test";
 import {fixture} from "./exact-session-stages.fixture.ts";
 import {TENANT} from "./support.ts";
