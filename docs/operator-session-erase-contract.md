@@ -214,8 +214,10 @@ treats it as a **502** from ingest and keeps polling. The same applies to `compl
 - A `failed` receipt is retryable: the next POST starts a new attempt under the same receipt.
 - The fence transaction locks every owning user's fence in user-id order, before the ownership read.
 - **Owner cap.** The number of owning users per session is unbounded. Above a fixed cap, the POST answers
-  503 `too_many_owners` with `Retry-After`, and nothing is fenced. The cap is set in lane B and raised only
-  by a reviewed change.
+  503 `too_many_owners` with `Retry-After`. A failed receipt and durable session fence remain,
+  so future uploads stay refused; unreadability/completion is not claimed. The cap is 64 and
+  is raised only by a reviewed change. An ambiguous or oversized alias closure instead refuses
+  before any receipt/fence write.
 - Completion is asynchronous. S3 and ClickHouse deletes are eventually consistent, and staged objects sit
   outside the session prefix and wait for the staged window, so **a 202 can last up to about 48 h**.
   Control polls GET; ingest never pushes.
@@ -240,7 +242,9 @@ with `/`, and never deletes by a prefix built from a raw decoded id. This keeps 
 Flags, each default off:
 
 - `SESSION_ERASE_API_ENABLED`: the route (exactly `1`).
-- `SESSION_ERASE_FENCE_ENFORCED`: claim, commit and index consult the session fence.
+- `SESSION_ERASE_FENCE_ENFORCED`: self-host write obligations, atomic canonical index admission and
+  permanent read gates. SQL claim/commit/index checks are installed by M2, inert with no fences,
+  and remain enforced for existing erasures regardless of the API/byte flags.
 - `SESSION_ERASE_BYTES_ENABLED`: byte deletion steps, hosted and self-host.
 
 Self-host API or bytes activation also requires fence enforcement; enforcement refuses async/drain
