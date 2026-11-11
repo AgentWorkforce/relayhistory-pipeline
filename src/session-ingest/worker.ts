@@ -37,9 +37,11 @@
  *                              503 (deliver.ts ClaimLockBusy); 57014 and every other cause stay 503
  *                              (HTTP only: the admission consumer keeps its normal backoff)
  *   INGEST_CLAIM_TIMEOUT_BUSY  unset/off (default) | on (any case): a claim whose statement timed out or was
- *                              cancelled (57014, ledger_timeout) is the same 429 delivery_busy with
- *                              Retry-After 5-10 s instead of a 503; independent of INGEST_CLAIM_LOCK_BUSY;
- *                              every other stage and cause stays 503 (HTTP only, as above)
+ *                              cancelled (ledger_timeout, SQLSTATE 57014 by code only; name-only client
+ *                              timeouts stay 503) is the same 429 delivery_busy with Retry-After 5-10 s
+ *                              instead of a 503; independent of INGEST_CLAIM_LOCK_BUSY; every other
+ *                              stage and cause stays 503 (HTTP only, as above). The Cloudflare stack
+ *                              renders it only from sessionIngest.claimTimeoutBusy: "on"
  *   INGEST_ASYNC_ADMISSION     unset/off (default) | on | drain: S3-first async admission
  *                              (async-admission.ts, docs/design/s3-first-async-ingest.md); on/drain need
  *                              buffered acceptance and the INGEST_ADMISSION queue (producer + consumer).
@@ -211,7 +213,7 @@ export interface IngestSettings {
   stageLatencyLog?: true;
   /** INGEST_CLAIM_LOCK_BUSY=on: a claim lock-wait failure is a 429 with Retry-After. Absent (the default): 503. */
   claimLockBusy?: true;
-  /** INGEST_CLAIM_TIMEOUT_BUSY=on: a claim statement timeout (57014) is a 429 with Retry-After. Absent (the default): 503. */
+  /** INGEST_CLAIM_TIMEOUT_BUSY=on: a claim statement timeout (SQLSTATE 57014 by code only) is a 429 with Retry-After. Absent (the default): 503. */
   claimTimeoutBusy?: true;
   /** INGEST_ASYNC_ADMISSION: absent = off (the default). */
   asyncAdmission?: Exclude<AsyncAdmissionMode, "off">;

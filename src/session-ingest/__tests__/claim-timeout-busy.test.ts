@@ -10,8 +10,9 @@ import { backoffSeconds } from "../admission-consumer.ts";
 import { enqueueAdmission } from "../async-admission.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { CLAIM_LOCK_RETRY_AFTER, ClaimLockBusy, deliverBatch, IngestUnavailable } from "../deliver.ts";
-import { dbErrorDiagnosis } from "../db-error-class.ts";
-import { sqlLedger } from "../ledger-sql.ts";
+import { dbErrorDiagnosis, dbErrorDiagnosisFrom, dbErrorSnapshot } from "../db-error-class.ts";
+import { LedgerUnavailableError } from "../ledger.ts";
+import { ledgerErrorCodeFrom, sqlLedger } from "../ledger-sql.ts";
 import { RECOVERY_CONTENT_TYPE, RECOVERY_PROTOCOL } from "../recovery-protocol.ts";
 import { DeliveryBusyError } from "../vendor/delivery/delivery-contracts.ts";
 import { logLine } from "../../shared/log.ts";
@@ -30,12 +31,14 @@ async function ledgerError(code: string): Promise<unknown> {
   throw new Error("expected the ledger to throw");
 }
 
-/** One POST /v1/delivery/batches through the real SQL ledger whose every statement fails with `sqlstate`. */
-async function post(sqlstate: string, flags: Flags) {
+/** One POST /v1/delivery/batches through the real SQL ledger whose every statement fails with `sqlstate`
+ * (or, given a function, with the driver error it builds). */
+async function post(sqlstate: string | (() => unknown), flags: Flags) {
   const s = scratchStore();
   cleanups.push(s.done);
   const sql: string[] = [];
-  const ledger = sqlLedger(async (text: string) => { sql.push(text); throw Object.assign(new Error(`canceling statement due to statement timeout ${TENANT.orgId}`), { code: sqlstate }); });
+  const fail = typeof sqlstate === "function" ? sqlstate : () => Object.assign(new Error(`canceling statement due to statement timeout ${TENANT.orgId}`), { code: sqlstate });
+  const ledger = sqlLedger(async (text: string) => { sql.push(text); throw fail(); });
   const logged: Record<string, unknown>[] = [];
   const app = createIngestApp({
     deliver: { ledger, target: { store: s.store, keyRoot: "96bulls", sleep: async () => {} }, ...flags } as never,
@@ -191,6 +194,69 @@ describe("claim statement-timeout busy (INGEST_CLAIM_TIMEOUT_BUSY)", () => {
     expect(err).toBeInstanceOf(IngestUnavailable);
     expect(err).not.toBeInstanceOf(DeliveryBusyError);
     expect((err as IngestUnavailable).stage).toBe("buffer_receipt");
+  });
+
+  test("boundary: the real helpers map a name-only TimeoutError to ledger_timeout too, but only a coded 57014 carries code/basis", () => {
+    const nameOnly = dbErrorSnapshot(Object.assign(new Error("request aborted"), { name: "TimeoutError" }));
+    expect(ledgerErrorCodeFrom(nameOnly)).toBe("ledger_timeout");
+    expect(dbErrorDiagnosisFrom(nameOnly)).toEqual({ db_error_class: "unknown", db_error_code: "db_error", db_error_basis: "none" });
+    const coded = dbErrorSnapshot(Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }));
+    expect(ledgerErrorCodeFrom(coded)).toBe("ledger_timeout");
+    expect(dbErrorDiagnosisFrom(coded)).toEqual({ db_error_class: "timeout", db_error_code: "57014", db_error_basis: "code" });
+    // A non-SQLSTATE, non-errno reviewed code on a TimeoutError: ledger_timeout with basis "code" but not 57014.
+    const tls = dbErrorSnapshot(Object.assign(new Error("x"), { name: "TimeoutError", code: "ERR_TLS_HANDSHAKE_TIMEOUT" }));
+    expect(ledgerErrorCodeFrom(tls)).toBe("ledger_timeout");
+    expect(dbErrorDiagnosisFrom(tls)).toEqual({ db_error_class: "tls", db_error_code: "ERR_TLS_HANDSHAKE_TIMEOUT", db_error_basis: "code" });
+  });
+
+  test("on: a name-only client TimeoutError at the claim (ledger_timeout, db_error_code db_error, basis none) stays 503", async () => {
+    for (const flags of [ON, { ...ON, claimLockBusy: true as const }]) {
+      const r = await post(() => Object.assign(new Error("request aborted"), { name: "TimeoutError" }), flags);
+      expect(r.status).toBe(503);
+      expect(r.retryAfter).toBeNull();
+      expect(r.json.error.code).toBe("delivery_unavailable");
+      expect(r.route).toMatchObject({ outcome: "delivery_unavailable", stage: "claim", error_code: "ledger_timeout", db_error_code: "db_error" });
+      expect(r.sql.length).toBe(1);
+    }
+    // A name-only timeout whose message says "timed out" classifies by message; still not a coded 57014.
+    const msg = await post(() => Object.assign(new Error("query timed out"), { name: "TimeoutError" }), ON);
+    expect(msg.status).toBe(503);
+    expect(msg.route).toMatchObject({ outcome: "delivery_unavailable", stage: "claim", error_code: "ledger_timeout", db_error_code: "db_error" });
+    // A client TLS handshake TimeoutError: ledger_timeout with a code-basis diagnosis, but not 57014.
+    const tls = await post(() => Object.assign(new Error("x"), { name: "TimeoutError", code: "ERR_TLS_HANDSHAKE_TIMEOUT" }), ON);
+    expect(tls.status).toBe(503);
+    expect(tls.retryAfter).toBeNull();
+    expect(tls.route).toMatchObject({ outcome: "delivery_unavailable", stage: "claim", error_code: "ledger_timeout", db_error_code: "ERR_TLS_HANDSHAKE_TIMEOUT" });
+  });
+
+  test("on: a claim-stage ledger_timeout without a db diagnosis, or with 57014 by message only, stays 503", async () => {
+    const s = scratchStore();
+    cleanups.push(s.done);
+    const target = { store: s.store, keyRoot: "96bulls", sleep: async () => {} };
+    const byMessage = Object.freeze({ db_error_class: "timeout" as const, db_error_code: "57014", db_error_basis: "message" as const });
+    const cases: [string, unknown][] = [
+      ["db undefined", new LedgerUnavailableError("ledger_timeout")],
+      ["57014 basis message", new LedgerUnavailableError("ledger_timeout", byMessage)],
+      ["name-only via real helpers", new LedgerUnavailableError(
+        ledgerErrorCodeFrom(dbErrorSnapshot({ name: "TimeoutError" })), dbErrorDiagnosisFrom(dbErrorSnapshot({ name: "TimeoutError" })))],
+    ];
+    for (const [label, thrown] of cases) {
+      const ledger = new MemoryLedger();
+      ledger.claim = async () => { throw thrown; };
+      const err = await deliverBatch({ ledger, target, ...ON, claimLockBusy: true } as never, TENANT, await batch([record({ record_id: `n-${label}` })])).then(() => null, (e: unknown) => e);
+      expect(err, label).toBeInstanceOf(IngestUnavailable);
+      expect(err, label).not.toBeInstanceOf(DeliveryBusyError);
+      expect((err as IngestUnavailable).stage, label).toBe("claim");
+      expect((err as IngestUnavailable).cause_code, label).toBe("ledger_timeout");
+    }
+    // Positive control on the same path: the real 57014 diagnosis (code basis) converts.
+    const ledger = new MemoryLedger();
+    const real = await ledgerError("57014");
+    expect((real as LedgerUnavailableError).db).toEqual({ db_error_class: "timeout", db_error_code: "57014", db_error_basis: "code" });
+    ledger.claim = async () => { throw real; };
+    const busy = await deliverBatch({ ledger, target, ...ON } as never, TENANT, await batch([record({ record_id: "p57" })])).then(() => null, (e: unknown) => e);
+    expect(busy).toBeInstanceOf(ClaimLockBusy);
+    expect((busy as ClaimLockBusy).cause_code).toBe("ledger_timeout");
   });
 
   test("worker flag: INGEST_CLAIM_TIMEOUT_BUSY=on (any case) reaches the deliver deps; unset/off/garbage and INGEST_CLAIM_LOCK_BUSY alone leave it off", async () => {
