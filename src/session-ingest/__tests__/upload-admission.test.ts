@@ -134,6 +134,54 @@ describe("promoteUpload: the contract vectors", () => {
   });
 });
 
+/** The store as an SSE-reporting S3 would answer: `serverSideEncryption` on head/getObject meta (undefined: absent). */
+function withSse(store: ObjectStore, sse: string | undefined): ObjectStore {
+  const add = <M extends object>(meta: M): M => (sse === undefined ? meta : { ...meta, serverSideEncryption: sse });
+  return {
+    ...store,
+    head: async (k) => { const m = await store.head(k); return m && add(m); },
+    getObject: async (k, r) => { const o = await store.getObject(k, r); return { ...o, meta: add(o.meta) }; },
+  };
+}
+
+describe("promoteUpload: HISTORY_UPLOAD_INBOX_SSE (§6 upload_unencrypted)", () => {
+  const KMS: UploadDirectConfig = uploadDirectConfig({ HISTORY_UPLOAD_DIRECT: "on", HISTORY_UPLOAD_INBOX_SSE: "aws:kms" });
+
+  test("knob off (the default): an object stored without SSE is admitted as before", async () => {
+    const { store } = counted();
+    const { key } = await upload(store);
+    expect(ON.inboxSse).toBe("none");
+    const { d, sent } = deps(store);
+    expect(await promoteUpload(key, d)).toEqual({ action: "ack", outcome: "handed_off" });
+    expect(sent).toHaveLength(1);
+  });
+
+  for (const [name, sse] of [["no SSE header", undefined], ["AES256, not aws:kms", "AES256"]] as const) {
+    test(`aws:kms and ${name}: refused upload_unencrypted before the witness check, recorded, removed`, async () => {
+      const { store: inner } = counted();
+      // A witness that would itself be refused proves the SSE check runs first.
+      const { key } = await upload(inner, { witness: null });
+      const store = withSse(inner, sse);
+      const { d, sent } = deps(store, { config: KMS });
+      expect(await promoteUpload(key, d)).toEqual({ action: "ack", outcome: "refused", code: "upload_unencrypted" });
+      expect(sent).toEqual([]);
+      expect(await exists(store, key)).toBe(false);
+      expect(await statusOf(store, key)).toEqual({ v: 1, kind: "upload-admission-status", state: "refused", code: "upload_unencrypted", receivedAtMs: T0, decidedAtMs: T0 });
+      // Redelivery acks from the recorded refusal.
+      await upload(inner, { witness: null });
+      expect(await promoteUpload(key, d)).toEqual({ action: "ack", outcome: "already_promoted", code: "upload_unencrypted" });
+    });
+  }
+
+  test("aws:kms with x-amz-server-side-encryption: aws:kms: proceeds to the hand-off", async () => {
+    const { store: inner } = counted();
+    const { key } = await upload(inner);
+    const { d, sent } = deps(withSse(inner, "aws:kms"), { config: KMS });
+    expect(await promoteUpload(key, d)).toEqual({ action: "ack", outcome: "handed_off" });
+    expect(sent).toHaveLength(1);
+  });
+});
+
 describe("promoteUpload: retryable conditions are never refusals", () => {
   test("flag off: nothing is read, nothing written", async () => {
     const { store, reads } = counted();
@@ -558,6 +606,23 @@ describe("HISTORY_UPLOAD_DIRECT parsing", () => {
     expect([a.mode, [...a.orgs], [...a.workspaces]]).toEqual(["allowlist", ["org-a"], ["ws-z"]]);
   });
 
+  test("HISTORY_UPLOAD_INBOX_SSE: none by default; exact aws:kms; anything else refuses startup naming only the variable", () => {
+    expect(UPLOAD_DIRECT_OFF.inboxSse).toBe("none");
+    for (const v of [undefined, "", "none"]) for (const mode of [undefined, "on"]) expect(uploadDirectConfig({ HISTORY_UPLOAD_DIRECT: mode, HISTORY_UPLOAD_INBOX_SSE: v }).inboxSse).toBe("none");
+    expect(uploadDirectConfig({ HISTORY_UPLOAD_DIRECT: "on", HISTORY_UPLOAD_INBOX_SSE: "aws:kms" }).inboxSse).toBe("aws:kms");
+    expect(uploadDirectConfig({ HISTORY_UPLOAD_DIRECT: "allowlist", HISTORY_UPLOAD_DIRECT_ALLOWLIST: "org:org-a", HISTORY_UPLOAD_INBOX_SSE: "aws:kms" }).inboxSse).toBe("aws:kms");
+    const off = uploadDirectConfig({ HISTORY_UPLOAD_INBOX_SSE: "aws:kms" });
+    expect([off.mode, off.inboxSse]).toEqual(["off", "aws:kms"]);
+    expect(UPLOAD_DIRECT_OFF.inboxSse).toBe("none");
+    for (const v of ["AES256", "aws:kms:dsse", "AWS:KMS", " aws:kms", "kms", "off", "true"]) {
+      for (const mode of [undefined, "on"]) {
+        let message = "";
+        try { uploadDirectConfig({ HISTORY_UPLOAD_DIRECT: mode, HISTORY_UPLOAD_INBOX_SSE: v }); } catch (e) { message = (e as Error).message; }
+        expect(message).toBe("96bulls: HISTORY_UPLOAD_INBOX_SSE must be none or aws:kms");
+      }
+    }
+  });
+
   test("Worker: default off; on reaches the app; an invalid value is logged and treated as off", async () => {
     const { ingestSettings } = await import("../worker.ts");
     const full = { HYPERDRIVE: { connectionString: "postgres://x" }, INGEST_FANOUT: {} as never, S3_ACCESS_KEY_ID: "k", S3_SECRET_ACCESS_KEY: "s", INGEST_SIGNING_KEY: "sign", INGEST_S3_BUCKET: "b", INGEST_KMS_KEY_ARN: "arn" };
@@ -584,6 +649,9 @@ describe("HISTORY_UPLOAD_DIRECT parsing", () => {
     expect(selfhostUploadDirectSettings({ HISTORY_UPLOAD_DIRECT: "on", SELFHOST_UPLOAD_SCAN_BATCH: "100" }, ROOT, admission)!.scanBatch).toBe(100);
     for (const n of ["0", "101", "x"]) expect(() => selfhostUploadDirectSettings({ HISTORY_UPLOAD_DIRECT: "on", SELFHOST_UPLOAD_SCAN_BATCH: n }, ROOT, admission)).toThrow();
     expect(() => selfhostUploadDirectSettings({ HISTORY_UPLOAD_DIRECT: "on" }, "Bad_Root", admission)).toThrow();
+    expect(on.config.inboxSse).toBe("none");
+    expect(selfhostUploadDirectSettings({ HISTORY_UPLOAD_DIRECT: "on", HISTORY_UPLOAD_INBOX_SSE: "aws:kms" }, ROOT, admission)!.config.inboxSse).toBe("aws:kms");
+    expect(() => selfhostUploadDirectSettings({ HISTORY_UPLOAD_INBOX_SSE: "AES256" }, ROOT, admission)).toThrow("HISTORY_UPLOAD_INBOX_SSE must be none or aws:kms");
   });
 });
 

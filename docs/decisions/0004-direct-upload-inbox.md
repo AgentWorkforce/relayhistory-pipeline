@@ -192,3 +192,40 @@ asynchronously through the admission path it already has. RelayHistory Cloud
 - The STS session TTL.
 - Pod Identity for the self-host consumer.
 - The self-host Helm values.
+
+## Addendum 2026-11-11: S3-compatible self-host stores
+
+Self-host stores such as MinIO have no STS and often no KMS. The
+`relay-upload-inbox-v1` contract keeps its id, and three amendments let such
+a store use the presigned path:
+
+1. **`kmsKeyId` is `string | null` and always present.** `null` is allowed
+   only with `kind: "presigned"`, and it means the desktop signs and sends no
+   SSE headers. `kind: "sts"` still needs a non-empty printable key id of at
+   most 2048 characters.
+2. **`endpoint` may carry a path prefix.** It is `null`, or an http(s)
+   `scheme://host[:port]` with an optional path prefix, with no trailing slash
+   after the prefix and no query, fragment or userinfo, at most 2048
+   characters. relay-control emits it normalised, without a trailing slash. A
+   non-null endpoint means path-style addressing for `sts`.
+3. **501 `unsupported_by_backend`.** A backend without STS answers a
+   `kind: "sts"` request with 501, and the desktop retries with
+   `kind: "presigned"`. The 404 `history_upload_direct_off` meaning is
+   unchanged.
+
+The existing vectors are byte-identical. One new vector,
+`credentials.presignedSelfhost`, covers a presigned body with a path-prefixed
+endpoint and `kmsKeyId: null`.
+
+**Consumer.** A new setting, `HISTORY_UPLOAD_INBOX_SSE`, is default-off. Unset,
+`""` or `none` requires nothing. `aws:kms` refuses an object whose own HEAD/GET
+metadata lacks `x-amz-server-side-encryption: aws:kms`, with the new terminal
+refusal code `upload_unencrypted`, before the witness check. Any other value is
+a startup error. `ObjectMeta` gains the optional `serverSideEncryption` and
+`sseKmsKeyId` fields, which the S3 store fills only when the headers are
+present.
+
+**Hosted is unchanged.** Hosted bodies still carry a key id and
+`endpoint: null`. Hosted SSE-KMS stays enforced by the bucket policy and the
+PUT headers. Turning the consumer check on anywhere is a configuration change
+under the same explicit-OK rule as the other settings above.
