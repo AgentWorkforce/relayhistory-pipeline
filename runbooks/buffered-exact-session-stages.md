@@ -156,7 +156,13 @@ function exactly as before, and the deploy render refuses `on` without
 When the flag is on, every stage read is a fresh complete traversal from cursor NULL with
 a new snapshot. This covers the first read, the not-found refresh and the recheck. The
 Worker:
-- asks for 2 claims per page (`BUFFERED_PAGED_STAGES_PAGE_CLAIMS`);
+- asks for 2 claims per page (`BUFFERED_PAGED_STAGES_PAGE_CLAIMS`). Ingest admits at most
+  500 records per claim (`MAX_DELIVERY_RECORDS`; the claim SQL refuses more), so a Worker page
+  holds at most 2 x 500 = 1,000 records. The SQL accepts `p_page_claims` up to 4 (2,000
+  records), but the Worker never asks for more than 2. A unit test pins
+  `BUFFERED_PAGED_STAGES_PAGE_CLAIMS x MAX_DELIVERY_RECORDS = 1,000`, so a change to either
+  value fails the test. This bound covers paged traversals only. It does not cover the gate-off
+  047010 fallback (see below);
 - concatenates `stages` across pages;
 - uses the existing single-RPC statement budget for the whole traversal, setting each
   page's `statement_timeout` to whatever remains of it.
@@ -194,7 +200,14 @@ explicit authorization.
    047010. The migration refuses unless the exact owned 047010 reader function is present and
    no paged function exists.
 2. Verify the new function's manifest entry, read-role ACL and migration sentinel.
-3. Deploy with explicit `owner_buffered=on`, `owner_buffered_exact_session=on` and
+3. Immediately before enabling the flag, take a fresh read-only readback of
+   `sessions.ingest_claim_sessions_policy`. It must show `write_enabled`, `read_enabled` and
+   backfill complete (`backfill_complete_at IS NOT NULL`) all true, so the claim-sessions v2
+   writer, reader and backfill are all ready. Do not reuse an older proof. If any of them is
+   false, do not enable the flag. With the v2 gate off, the first page returns the 047010
+   fallback in one unpaged envelope. The 1,000 records/page bound does NOT apply to that
+   fallback: it returns every stage of the session in one call.
+4. Deploy with explicit `owner_buffered=on`, `owner_buffered_exact_session=on` and
    `owner_buffered_stages_paged=on`. This renders `READ_API_OWNER_BUFFERED_STAGES_PAGED=on`.
    `profile`/`preserve` deploys keep the live value and refuse an explicit `on`.
 

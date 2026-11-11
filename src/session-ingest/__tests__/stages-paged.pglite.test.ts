@@ -10,6 +10,7 @@ import {test,expect} from "bun:test";
 import {readFileSync,readdirSync} from "node:fs";
 import {fixture} from "./exact-session-stages.fixture.ts";
 import {TENANT} from "./support.ts";
+import {MAX_DELIVERY_RECORDS} from "../vendor/delivery/delivery-contracts.ts";
 
 const epoch="1".repeat(64),baseline="a".repeat(64);
 const HP=[epoch,null,null,null,null,false,baseline];
@@ -65,8 +66,8 @@ async function wide(f:F){
  await f.enableAll();await f.prove();
 }
 /** n claims whose every record belongs to the target session. */
-async function allTarget(f:F,n:number,session="fixture-all-target",tag="r"){
- for(let batch=0;batch<n;batch++)await f.deliver([["droid",session,Array.from({length:3},(_,i)=>`${session}-${tag}-${batch}-${i}`)]]);
+async function allTarget(f:F,n:number,session="fixture-all-target",tag="r",records=3){
+ for(let batch=0;batch<n;batch++)await f.deliver([["droid",session,Array.from({length:records},(_,i)=>`${session}-${tag}-${batch}-${i}`)]]);
 }
 
 test("047020 (a): 17 claims / 170 groups / 6939 records, p=2 -> 9 pages equal to 047010 and 044090",async()=>{
@@ -129,6 +130,27 @@ test("047020 (b)+(d): all-target claims, per-page expansion bounded by p_page_cl
   await f.db.query("UPDATE sessions.ingest_claim_attempts SET records=$1::jsonb WHERE claim_token=$2",[JSON.stringify(claims[k].records),claims[k].claim_token]);
  }
  console.log(JSON.stringify({qualification:"synthetic PGlite; counter = poison-claim sentinel + per-page stage counts (each all-target claim yields exactly one stage)",pageSizes:sizes}));
+});
+
+test("047020 (h): all-target 17 claims x 412 records (7004): every record once, in order; <=2 claims / <=1,000 records per page",async()=>{
+ const f=await fixture();await allTarget(f,17,"fixture-all-target","r",412);await f.enableAll();await f.prove();
+ const claims=(await f.db.query("SELECT jsonb_array_length(records)::int n FROM sessions.ingest_claim_attempts")).rows as any[];
+ expect(claims).toHaveLength(17);
+ expect(claims.every(c=>c.n===412&&c.n<=MAX_DELIVERY_RECORDS)).toBe(true);
+ const unpaged=await f.stages("sessions.buffered_session_stages_for_target","droid","fixture-all-target");
+ expect(unpaged).toEqual(await f.stages("ref044090.stages","droid","fixture-all-target"));
+ expect(unpaged).toHaveLength(17);
+ const {pages,rows}=await traverse(f,"fixture-all-target",2);
+ expect(pages.map(p=>p.has_more)).toEqual([...Array(8).fill(true),false]);
+ expect(pages.map(p=>p.stages.length)).toEqual([2,2,2,2,2,2,2,2,1]);
+ expect(pages.at(-1)!.cursor).toBeNull();
+ for(const p of pages)expect(p.stages.reduce((n:number,st:any)=>n+st.kept_ordinals.length,0)).toBeLessThanOrEqual(2*MAX_DELIVERY_RECORDS);
+ expect(rows).toEqual(unpaged);
+ expect(new Set(rows.map(r=>r.stage_key)).size).toBe(17);
+ const seen=rows.flatMap(r=>r.kept_ordinals.map((o:number)=>`${r.batch_id}:${o}`));
+ expect(seen).toHaveLength(17*412);
+ expect(new Set(seen).size).toBe(17*412);
+ for(const r of rows)expect(r.kept_ordinals).toEqual([...r.kept_ordinals].sort((a:number,b:number)=>a-b));
 });
 
 test("047020 (c): fully privacy-filtered pages still advance the cursor",async()=>{

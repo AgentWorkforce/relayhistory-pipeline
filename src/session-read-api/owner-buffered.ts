@@ -877,7 +877,13 @@ export const BUFFERED_TARGET_STAGES_SQL = BUFFERED_STAGES_SQL.replace("sessions.
 export const BUFFERED_PAGED_STAGES_SQL =
   `SELECT stages, cursor, has_more, snapshot_at ` +
   `FROM sessions.buffered_session_stages_for_target_paged(p_workspace => $1, ${HEAD_ARGS}, p_source => $9, p_session_id => $10, p_cursor => $11::jsonb, p_page_claims => $12::integer)`;
-/** Claims expanded per paged call (the SQL clamps to 1..4). */
+/**
+ * Claims expanded per paged call (the SQL clamps to 1..4). Ingest admits at most
+ * MAX_DELIVERY_RECORDS (500) records per claim (vendor/delivery/delivery-contracts.ts; the claim
+ * SQL refuses jsonb_array_length(records) > 500), so one Worker page holds at most
+ * 2 x 500 = 1,000 records. owner-buffered-stages-paged.test.ts pins this product. The bound does
+ * not apply to the gate-off 047010 fallback, which answers in one unpaged envelope.
+ */
 export const BUFFERED_PAGED_STAGES_PAGE_CLAIMS = 2;
 /** Hard cap on pages per traversal; one more page than this fails closed (rpc_error). */
 export const BUFFERED_PAGED_STAGES_MAX_PAGES = 64;
@@ -978,7 +984,8 @@ export function sqlOwnerBufferedReads(
   const timeout = statementTimeoutSql(timeoutMs);
   const mode = bufferedStagesMode(options);
   const maxPages = options.maxPages ?? BUFFERED_PAGED_STAGES_MAX_PAGES;
-  const now = options.now ?? Date.now;
+  // Monotonic: the traversal budget is an elapsed time, never a wall-clock timestamp.
+  const now = options.now ?? (() => performance.now());
   const call = async (scope: BufferedScope, sql: string, params: unknown[], timeoutSql: string = timeout) => {
     try {
       return await run(scope.orgId, scope.workspaceId, async (q) => {

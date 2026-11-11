@@ -20,6 +20,7 @@ import {
   type BufferedStageRow,
 } from "../owner-buffered.ts";
 import { E1, SCOPE, SESSION, authority } from "./owner-buffered-support.ts";
+import { MAX_DELIVERY_RECORDS } from "../../session-ingest/vendor/delivery/delivery-contracts.ts";
 
 const SNAP = "2026-11-05T12:30:00.000Z";
 function stage(n: number): BufferedStageRow {
@@ -84,6 +85,13 @@ describe("READ_API_OWNER_BUFFERED_STAGES_PAGED flag and the single SQL switch", 
     expect(BUFFERED_PAGED_STAGES_SQL.match(/=> \$/g)!.length).toBe(12);
     expect(BUFFERED_PAGED_STAGES_PAGE_CLAIMS).toBe(2);
     expect(BUFFERED_PAGED_STAGES_MAX_PAGES).toBe(64);
+  });
+  test("page bound: 2 claims x the ingest 500-records-per-claim invariant = 1,000 records per Worker page", () => {
+    // A change to either constant must revisit the documented bound (runbook "Paged stages (047020)").
+    expect(MAX_DELIVERY_RECORDS).toBe(500);
+    expect(BUFFERED_PAGED_STAGES_PAGE_CLAIMS).toBeGreaterThanOrEqual(1);
+    expect(BUFFERED_PAGED_STAGES_PAGE_CLAIMS).toBeLessThanOrEqual(4);
+    expect(BUFFERED_PAGED_STAGES_PAGE_CLAIMS * MAX_DELIVERY_RECORDS).toBe(1_000);
   });
   test("flag off (or paged without exact-session): the paged SQL is never sent", async () => {
     for (const [opts, want] of [[{}, BUFFERED_STAGES_SQL], [{ stagesPaged: true }, BUFFERED_STAGES_SQL], [{ exactSession: true }, BUFFERED_TARGET_STAGES_SQL], [{ exactSession: true, stagesPaged: false }, BUFFERED_TARGET_STAGES_SQL]] as const) {
@@ -205,6 +213,18 @@ describe("paged traversal fails closed, never a partial set", () => {
     const exhausted = runner([step(2000, pages[0]!), step(0, pages[1]!)]);
     expect(await reason(paged(exhausted.run, { statementTimeoutMs: 2000, now }).stages(SCOPE, authority("7"), "claude", SESSION))).toBe("rpc_timeout");
     expect(exhausted.rpc).toHaveLength(1);
+  });
+  test("the default traversal clock is monotonic: a wall-clock jump does not expire the budget", async () => {
+    const wall = Date.now;
+    let jump = 0;
+    Date.now = () => wall() + (jump += 3_600_000);
+    try {
+      const { run, rpc } = runner(pagesOf(5));
+      expect(await paged(run, { statementTimeoutMs: 2000 }).stages(SCOPE, authority("7"), "claude", SESSION)).toHaveLength(5);
+      expect(rpc).toHaveLength(3);
+    } finally {
+      Date.now = wall;
+    }
   });
   test("abort before or during a page is request_aborted; no further page is read", async () => {
     const before = new AbortController();
