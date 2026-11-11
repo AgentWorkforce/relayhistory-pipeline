@@ -35,15 +35,10 @@ import {
 import {
   BOOTSTRAP_REQUIRED_NOTE,
   bootstrapChainRoles,
-  bootstrapFilesToRun,
-  bootstrapReadbackVerdict,
-  bootstrapSection,
-  readBootstrapState,
   releaseBootstrapFiles,
   requireBootstrapRoles,
-  requireSameBootstrapPlan,
-  requireTransactionSafeChainSql,
-  stripPsqlMeta,
+  requireReleaseChainDigest,
+  runBootstrapStage,
   validateBootstrapSection,
 } from "../src/hoopdb/schema-release-bootstrap.ts";
 import { githubGet, githubReleaseGate } from "./schema-release-github.ts";
@@ -205,11 +200,14 @@ async function writeBootstrapEvidence(evidence: unknown) {
   );
 }
 /**
- * The bootstrap stage: under the migrator's session advisory lock, recompute the plan's
- * bootstrap section; refuse if it changed; skip when nothing is absent; otherwise run,
- * in ONE transaction with hoopdb.db_mode=supabase bound, each chain file (release-sha
- * bytes, psql meta lines stripped) that provisions an absent role, read back and COMMIT
- * only on an exact match (else ROLLBACK, release_bootstrap_readback).
+ * The bootstrap stage. Before connecting: the plan artifact bound to the typed approval,
+ * the anchor, and the release-sha chain bytes digested and compared with the plan's
+ * chain_digest and the approval's CHAIN (release_bootstrap_plan_changed). Then connect,
+ * prove the release owner and hand the client to runBootstrapStage
+ * (src/hoopdb/schema-release-bootstrap.ts): under the migrator's session advisory lock,
+ * the GitHub gate and anchor once more, then ONE transaction that recomputes the
+ * section, runs the chain files provisioning absent roles, reads back and COMMITs only
+ * on an exact match (else ROLLBACK, release_bootstrap_readback).
  */
 async function releaseBootstrap(
   get: ReturnType<typeof githubGet>,
@@ -222,89 +220,38 @@ async function releaseBootstrap(
   if (!sameAnchor(await targetAnchor(input, release.held), release))
     refuse("release_target_manifest_changed");
   const files = releaseBootstrapFiles(process.cwd(), input.sha, input.targetSha);
+  requireReleaseChainDigest(files, planned, input.chainDigest);
   const supabaseMode = releaseProfile(input.boundary).mode === "supabase";
   if (!supabaseMode) refuse("release_bootstrap_db_mode");
   const client = releaseClient(process.env.SUPABASE_MIGRATION_OWNER_URL);
-  let locked = false;
   try {
     await client.connect();
     await requireReleaseOwner(client);
-    await client.query("SELECT pg_advisory_lock(961996, 1)");
-    locked = true;
-    // Under the lock: the GitHub gate and the anchor once more, before any write.
-    await githubReleaseGate(process.env, get, true);
-    if (!sameAnchor(await targetAnchor(input, release.held), release))
-      refuse("release_target_manifest_changed");
-    await client.query("BEGIN");
-    let committed = false;
-    try {
-      await client.query(
-        "SELECT set_config('hoopdb.db_mode', $1, true), set_config('hoopdb.allow_blocking_index_build', $2, true)",
-        ["supabase", "off"],
-      );
-      const before = await readBootstrapState(client);
-      const live = bootstrapSection({ files, state: before, supabaseMode });
-      requireSameBootstrapPlan(planned, live);
-      if (!live.required) {
-        await client.query("ROLLBACK");
-        committed = true;
-        await writeBootstrapEvidence({
-          version: 1,
-          sha: input.sha,
-          targetSha: input.targetSha,
-          planRun: input.planRun,
-          runId: process.env.GITHUB_RUN_ID,
-          chain_digest: live.chain_digest,
-          files: live.files,
-          skipped: true,
-          created: [],
-          roles: live.roles,
-        });
-        console.log("release_bootstrap_skipped");
-        return;
-      }
-      const run = bootstrapFilesToRun(live);
-      const sql = run.map((file) => {
-        const bytes = files.find((f) => f.file === file)?.release;
-        if (bytes === undefined) refuse("release_bootstrap_bytes_missing");
-        return requireTransactionSafeChainSql(stripPsqlMeta(bytes.toString("utf8")));
-      });
-      const xid = async () =>
-        String((await client.query("SELECT txid_current()::text AS x")).rows[0]?.x ?? "");
-      const xidBefore = await xid();
-      for (const text of sql) await client.query(text);
-      // Still the same transaction: no file ended or split it (else refuse, roll back).
-      if (!xidBefore || (await xid()) !== xidBefore) refuse("release_bootstrap_readback");
-      const after = await readBootstrapState(client);
-      const evidence = bootstrapReadbackVerdict({
-        before,
-        after,
-        approved: live.will_create,
-        supabaseMode,
-      });
-      await client.query("COMMIT");
-      committed = true;
-      await writeBootstrapEvidence({
-        version: 1,
-        sha: input.sha,
-        targetSha: input.targetSha,
-        planRun: input.planRun,
-        runId: process.env.GITHUB_RUN_ID,
-        chain_digest: live.chain_digest,
-        files: live.files,
-        ran: run,
-        ...evidence,
-      });
-      console.log("release_bootstrap_created " + evidence.created.length);
-      console.log("release_bootstrap_verified");
-    } finally {
-      if (!committed) await client.query("ROLLBACK").catch(() => {});
-    }
-  } finally {
-    if (locked)
-      await client.query("SELECT pg_advisory_unlock(961996, 1)").catch(() => {});
+  } catch (error) {
     await client.end().catch(() => {});
+    throw error;
   }
+  // runBootstrapStage always ends the client.
+  await runBootstrapStage({
+    client,
+    files,
+    planned,
+    supabaseMode,
+    underLock: async () => {
+      // Under the lock: the GitHub gate and the anchor once more, before any write.
+      await githubReleaseGate(process.env, get, true);
+      if (!sameAnchor(await targetAnchor(input, release.held), release))
+        refuse("release_target_manifest_changed");
+    },
+    writeEvidence: writeBootstrapEvidence,
+    header: {
+      version: 1,
+      sha: input.sha,
+      targetSha: input.targetSha,
+      planRun: input.planRun,
+      runId: process.env.GITHUB_RUN_ID,
+    },
+  });
 }
 export async function releaseDatabase() {
   const get = githubGet();

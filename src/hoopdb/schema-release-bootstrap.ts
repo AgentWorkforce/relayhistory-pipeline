@@ -1,11 +1,14 @@
 /**
  * The guarded production release's bootstrap-role stage: the plan section, its typed
- * approval, the exactness predicate for each chain role, plan-vs-stage drift and the
- * in-transaction readback verdict. Everything here except readBootstrapState and
- * releaseBootstrapFiles is pure; the database job only feeds it catalog rows.
+ * approval, the exactness predicate for each chain role, plan-vs-stage drift, the
+ * in-transaction readback verdict and the stage itself (runBootstrapStage) over an
+ * already connected client. Everything here except readBootstrapState,
+ * releaseBootstrapFiles and runBootstrapStage is pure; the database job only feeds it
+ * catalog rows.
  *
- * Evidence carries role names, attribute flags, membership edges and a settings kind
- * token only: never a password, rolconfig value, URL or host name.
+ * Evidence carries role names, attribute flags, validity, membership edges and a
+ * settings kind token only: never a password, rolconfig value, URL or host name. A
+ * setting row's sha256 digest is compared in memory and never written to evidence.
  */
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -16,7 +19,10 @@ import {
 } from "./session-bootstrap-chain.ts";
 import { SCHEMA_RELEASE as P, refuse } from "./schema-release-contract.ts";
 
-/** pg_roles columns the stage reads: the name and the attribute flags only. */
+/**
+ * pg_roles columns the stage reads: the name, the attribute flags and the password
+ * validity (as text; never rolpassword).
+ */
 export const BOOTSTRAP_ROLE_COLUMNS = [
   "rolname",
   "rolsuper",
@@ -27,6 +33,7 @@ export const BOOTSTRAP_ROLE_COLUMNS = [
   "rolreplication",
   "rolbypassrls",
   "rolconnlimit",
+  "rolvaliduntil",
 ] as const;
 export interface BootstrapRoleRow {
   rolname: string;
@@ -38,8 +45,13 @@ export interface BootstrapRoleRow {
   rolreplication: boolean;
   rolbypassrls: boolean;
   rolconnlimit: number;
+  /** rolvaliduntil::text, null when unset. */
+  rolvaliduntil: string | null;
 }
-/** One pg_auth_members row touching a chain role; inherit/set are null before PG16. */
+/**
+ * One pg_auth_members row of the cluster; inherit/set are null before PG16. A grantor
+ * OID without a role (possible before PG16) reads as `oid <n>`, never a superuser.
+ */
 export interface BootstrapEdge {
   role: string;
   member: string;
@@ -50,17 +62,26 @@ export interface BootstrapEdge {
   inherit_option: boolean | null;
   set_option: boolean | null;
 }
-/** One pg_db_role_setting row of a chain role, as a kind token (never the value). */
+/**
+ * One pg_db_role_setting row of the cluster, as a kind token (never the value). role is
+ * "" for a database-wide row (setrole 0); database is the setdatabase OID as text ("0":
+ * role-wide). digest is sha256 over setconfig::text, computed by the server, used only
+ * for the before/after comparison and never written to evidence.
+ */
 export interface BootstrapSetting {
   role: string;
   global: boolean;
   kind: "statement_timeout=2s" | "statement_timeout=60s" | "other";
+  database: string;
+  digest: string;
 }
 export interface BootstrapState {
   serverVersionNum: number;
-  /** Every role of the cluster (names and flags), for the side-effect diff. */
+  /** Every role of the cluster (names, flags, validity), for the side-effect diff. */
   roles: BootstrapRoleRow[];
+  /** Every membership edge of the cluster. */
   edges: BootstrapEdge[];
+  /** Every pg_db_role_setting row of the cluster. */
   settings: BootstrapSetting[];
 }
 export interface BootstrapFile {
@@ -134,18 +155,107 @@ export function stripPsqlMeta(text: string) {
     .join("\n");
 }
 
+const IDENT_START = /[A-Za-z_\u0080-￿]/;
+const IDENT_CONT = /[A-Za-z0-9_$\u0080-￿]/;
+const DOLLAR_TAG = /\$(?:[A-Za-z_\u0080-￿][A-Za-z0-9_\u0080-￿]*)?\$/y;
+
+/**
+ * The top level of a SQL script: every `-- ...` and (nested) `/* ... *\/` comment,
+ * '...' / E'...' string, "..." identifier and $tag$ ... $tag$ body replaced by one
+ * space, as PostgreSQL's lexer delimits them (standard_conforming_strings on; an
+ * identifier may contain `$`, so `x$$` opens no body). Refuses
+ * release_bootstrap_chain_unsafe for an unterminated comment, quote or body.
+ */
+export function chainSqlTopLevel(text: string): string {
+  const unsafe = () => refuse("release_bootstrap_chain_unsafe");
+  const n = text.length;
+  const quoted = (start: number, q: string, backslash: boolean) => {
+    let j = start + 1;
+    for (;;) {
+      if (j >= n) unsafe();
+      const c = text[j];
+      if (backslash && c === "\\") j += 2;
+      else if (c === q) {
+        if (text[j + 1] !== q) return j + 1;
+        j += 2;
+      } else j++;
+    }
+  };
+  let out = "";
+  let i = 0;
+  while (i < n) {
+    const c = text[i];
+    if (c === "-" && text[i + 1] === "-") {
+      const eol = text.indexOf("\n", i);
+      i = eol < 0 ? n : eol;
+      out += " ";
+    } else if (c === "/" && text[i + 1] === "*") {
+      let depth = 1;
+      i += 2;
+      while (depth) {
+        if (i >= n) unsafe();
+        if (text[i] === "/" && text[i + 1] === "*") (depth++, (i += 2));
+        else if (text[i] === "*" && text[i + 1] === "/") (depth--, (i += 2));
+        else i++;
+      }
+      out += " ";
+    } else if (c === "'" || c === '"') {
+      i = quoted(i, c, false);
+      out += " ";
+    } else if (c === "$") {
+      DOLLAR_TAG.lastIndex = i;
+      const tag = DOLLAR_TAG.exec(text)?.[0];
+      if (tag === undefined) {
+        out += c;
+        i++;
+        continue;
+      }
+      const close = text.indexOf(tag, i + tag.length);
+      if (close < 0) unsafe();
+      i = close + tag.length;
+      out += " ";
+    } else if (IDENT_START.test(c)) {
+      let j = i + 1;
+      while (j < n && IDENT_CONT.test(text[j])) j++;
+      const word = text.slice(i, j);
+      if ((word === "E" || word === "e") && text[j] === "'") {
+        i = quoted(j, "'", true);
+        out += " ";
+      } else {
+        out += word;
+        i = j;
+      }
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
+
 /**
  * A chain file runs inside the stage's single transaction, so it must not end or split
- * it: refuse transaction control (COMMIT, ROLLBACK, ABORT, SAVEPOINT, START/PREPARE
- * TRANSACTION, a top-level BEGIN;) with release_bootstrap_chain_unsafe. A bare END; is
- * indistinguishable from a plpgsql block end here; the stage's txid continuity check
- * catches that case.
+ * it; else release_bootstrap_chain_unsafe. Anywhere in the text, comments and bodies
+ * included (strict on purpose: these never belong in a chain file, even as a comment
+ * word): COMMIT, ROLLBACK, ABORT, SAVEPOINT, START/PREPARE TRANSACTION, BEGIN [WORK |
+ * TRANSACTION];. At the top level (chainSqlTopLevel: comments, strings, identifiers and
+ * dollar bodies removed) additionally RELEASE, and any statement starting with BEGIN or
+ * END (so `END;`, `end ;`, `END WORK;`, `END TRANSACTION;`), while a plpgsql `END`
+ * inside a DO body stays allowed. A SQL-standard `BEGIN ATOMIC ... END;` function body
+ * at the top level is refused too (no chain file uses one). The stage's txid
+ * continuity check remains as defence in depth.
  */
 export function requireTransactionSafeChainSql(text: string) {
   if (
     /\b(COMMIT|ROLLBACK|ABORT|SAVEPOINT|START\s+TRANSACTION|PREPARE\s+TRANSACTION)\b|\bBEGIN\s*(WORK|TRANSACTION)?\s*;/i.test(
       text,
     )
+  )
+    refuse("release_bootstrap_chain_unsafe");
+  const top = chainSqlTopLevel(text);
+  if (
+    /\b(COMMIT|ROLLBACK|ABORT|SAVEPOINT|RELEASE|START\s+TRANSACTION|PREPARE\s+TRANSACTION)\b/i.test(top) ||
+    top.split(";").some((statement) => /^\s*(BEGIN|END)\b/i.test(statement))
   )
     refuse("release_bootstrap_chain_unsafe");
   return text;
@@ -255,9 +365,9 @@ export function roleContractProblems(
 
 /**
  * Why a role this stage just created is not the bare shape its file creates (empty:
- * exact): NOLOGIN and every flag false, rolconnlimit -1, member of none; before PG16 no
- * member, PG16+ at most the one Supabase creator edge, in supabase db mode only; no
- * setting except the worker's exact statement_timeout=2s.
+ * exact): NOLOGIN and every flag false, rolconnlimit -1, no VALID UNTIL, member of none;
+ * before PG16 no member, PG16+ at most the one Supabase creator edge, in supabase db
+ * mode only; no setting except the worker's exact statement_timeout=2s.
  */
 export function freshRoleProblems(
   name: string,
@@ -271,6 +381,7 @@ export function freshRoleProblems(
     state,
     supabaseMode,
   );
+  if (state.roles.find((x) => x.rolname === name)?.rolvaliduntil != null) out.push("rolvaliduntil");
   const inbound = state.edges.filter((e) => e.role === name);
   if (inbound.length > 1) out.push("members");
   const settings = state.settings.filter((s) => s.role === name);
@@ -410,15 +521,24 @@ export function requireBootstrapRoles(
 
 const flags = (r: BootstrapRoleRow) =>
   JSON.stringify(BOOTSTRAP_ROLE_COLUMNS.map((c) => r[c]));
-const edgeKey = (e: BootstrapEdge) => JSON.stringify([e.role, e.member, e.grantor, e.admin_option, e.inherit_option, e.set_option]);
-const settingKey = (s: BootstrapSetting) => JSON.stringify([s.role, s.global, s.kind]);
+const edgeKey = (e: BootstrapEdge) =>
+  JSON.stringify([e.role, e.member, e.grantor, e.grantor_super, e.admin_option, e.inherit_option, e.set_option]);
+const settingKey = (s: BootstrapSetting) =>
+  JSON.stringify([s.role, s.database, s.global, s.kind, s.digest]);
+/** Multiset equality of two key lists. */
+const sameKeys = (a: string[], b: string[]) =>
+  JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
 
 /**
- * The in-transaction readback verdict: exactly the approved roles appeared, each the
- * fresh bare shape; no other role added, removed or altered (names and flags of the
- * whole cluster); the edges and settings of every pre-existing chain role unchanged;
- * every chain role present and matching its contract. Anything else refuses
- * release_bootstrap_readback (the caller rolls back). Returns the evidence.
+ * The in-transaction readback verdict over the whole cluster: exactly the approved roles
+ * appeared, each the fresh bare shape; no other role added or removed and no role's
+ * flags, connection limit or validity altered; every pg_auth_members edge (role, member,
+ * grantor, admin/inherit/set options) and every pg_db_role_setting row unchanged except
+ * those a created role may gain (PG16+ in supabase db mode at most its Supabase creator
+ * edge; the worker its one statement_timeout=2s row, checked by freshRoleProblems); every
+ * chain role present and matching its contract. Anything else refuses
+ * release_bootstrap_readback (the caller rolls back). Returns the evidence. Privileges
+ * on objects are out of scope: no chain file grants any.
  */
 export function bootstrapReadbackVerdict(x: {
   before: BootstrapState;
@@ -437,18 +557,21 @@ export function bootstrapReadbackVerdict(x: {
   );
   const approved = codeSort([...x.approved]);
   const createdSet = new Set(created);
-  const keep = (e: BootstrapEdge) => !createdSet.has(e.role) && !createdSet.has(e.member);
-  const edgesBefore = x.before.edges.filter(keep).map(edgeKey).sort();
-  const edgesAfter = x.after.edges.filter(keep).map(edgeKey).sort();
-  const setBefore = x.before.settings.filter((s) => !createdSet.has(s.role)).map(settingKey).sort();
-  const setAfter = x.after.settings.filter((s) => !createdSet.has(s.role)).map(settingKey).sort();
+  const pg16 = x.after.serverVersionNum >= 160000;
+  // The one edge a created role may gain: its Supabase creator edge (PG16+, supabase
+  // db mode); freshRoleProblems refuses more than one inbound edge per created role.
+  const permittedEdge = (e: BootstrapEdge) =>
+    createdSet.has(e.role) && pg16 && x.supabaseMode && isSupabaseCreatorEdge(e);
+  const edgesAfter = x.after.edges.filter((e) => !permittedEdge(e)).map(edgeKey);
+  // Settings a created role gained are checked against its contract by freshRoleProblems.
+  const setAfter = x.after.settings.filter((s) => !createdSet.has(s.role)).map(settingKey);
   const problems: string[] = [];
   if (JSON.stringify(created) !== JSON.stringify(approved)) problems.push("created");
   if (removed.length) problems.push("removed");
   if (altered.length) problems.push("altered");
   if (x.after.roles.length !== x.before.roles.length + created.length) problems.push("count");
-  if (JSON.stringify(edgesBefore) !== JSON.stringify(edgesAfter)) problems.push("edges");
-  if (JSON.stringify(setBefore) !== JSON.stringify(setAfter)) problems.push("settings");
+  if (!sameKeys(x.before.edges.map(edgeKey), edgesAfter)) problems.push("edges");
+  if (!sameKeys(x.before.settings.map(settingKey), setAfter)) problems.push("settings");
   if (x.after.serverVersionNum !== x.before.serverVersionNum) problems.push("server");
   for (const { name, contract } of chain) {
     const p = createdSet.has(name)
@@ -511,9 +634,15 @@ export function releaseBootstrapFiles(repo: string, releaseSha: string, targetSh
 interface Queryable {
   query(sql: string, params?: unknown[]): Promise<{ rows: any[] }>;
 }
-/** Catalog rows only (names, flags, edges, setting kinds); never passwords or rolconfig. */
+const roleSelect = BOOTSTRAP_ROLE_COLUMNS.map((c) =>
+  c === "rolvaliduntil" ? "rolvaliduntil::text AS rolvaliduntil" : c,
+).join(", ");
+/**
+ * Catalog rows of the whole cluster (role names, flags and validity, every membership
+ * edge, every per-database role setting as a kind token plus a server-side digest);
+ * never rolpassword or a rolconfig/setconfig value.
+ */
 export async function readBootstrapState(client: Queryable): Promise<BootstrapState> {
-  const names = bootstrapChainRoles().map((r) => r.name);
   const serverVersionNum = Number(
     (await client.query("SELECT current_setting('server_version_num')::int AS v")).rows[0]?.v,
   );
@@ -521,35 +650,164 @@ export async function readBootstrapState(client: Queryable): Promise<BootstrapSt
     refuse("release_bootstrap_server");
   const pg16 = serverVersionNum >= 160000;
   const roles = (
-    await client.query(
-      `SELECT ${BOOTSTRAP_ROLE_COLUMNS.join(", ")} FROM pg_roles ORDER BY rolname`,
-    )
+    await client.query(`SELECT ${roleSelect} FROM pg_roles ORDER BY rolname`)
   ).rows as BootstrapRoleRow[];
   const edges = (
     await client.query(
       `SELECT r.rolname AS role, m.rolname AS member, m.rolinherit AS member_inherit,
-              g.rolname AS grantor, g.rolsuper AS grantor_super, a.admin_option,
+              COALESCE(g.rolname, 'oid ' || a.grantor::text) AS grantor,
+              COALESCE(g.rolsuper, false) AS grantor_super, a.admin_option,
               ${pg16 ? "a.inherit_option, a.set_option" : "NULL::boolean AS inherit_option, NULL::boolean AS set_option"}
          FROM pg_auth_members a
          JOIN pg_roles r ON r.oid = a.roleid
          JOIN pg_roles m ON m.oid = a.member
-         JOIN pg_roles g ON g.oid = a.grantor
-        WHERE r.rolname = ANY($1::text[]) OR m.rolname = ANY($1::text[])
+         LEFT JOIN pg_roles g ON g.oid = a.grantor
         ORDER BY 1, 2, 4`,
-      [names],
     )
   ).rows as BootstrapEdge[];
   const settings = (
     await client.query(
-      `SELECT r.rolname AS role, s.setdatabase = 0 AS global,
+      `SELECT COALESCE(r.rolname, '') AS role, s.setdatabase::text AS database,
+              s.setdatabase = 0 AS global,
               CASE WHEN s.setconfig = ARRAY['statement_timeout=2s']::text[] THEN 'statement_timeout=2s'
                    WHEN s.setconfig = ARRAY['statement_timeout=60s']::text[] THEN 'statement_timeout=60s'
-                   ELSE 'other' END AS kind
-         FROM pg_db_role_setting s JOIN pg_roles r ON r.oid = s.setrole
-        WHERE r.rolname = ANY($1::text[])
-        ORDER BY 1, 2, 3`,
-      [names],
+                   ELSE 'other' END AS kind,
+              encode(sha256(convert_to(COALESCE(s.setconfig::text, ''), 'UTF8')), 'hex') AS digest
+         FROM pg_db_role_setting s LEFT JOIN pg_roles r ON r.oid = s.setrole
+        ORDER BY 1, 2, 4, 5`,
     )
   ).rows as BootstrapSetting[];
   return { serverVersionNum, roles, edges, settings };
+}
+
+/**
+ * The chain digest of the release-sha bytes alone (no catalog): refuses
+ * release_bootstrap_chain for a wrong file list and release_bootstrap_bytes_missing for
+ * an absent file.
+ */
+export function releaseChainDigest(
+  files: readonly { file: string; release: Buffer | string | undefined }[],
+) {
+  if (
+    files.length !== SESSION_BOOTSTRAP_FILES.length ||
+    files.some((f, i) => f.file !== SESSION_BOOTSTRAP_FILES[i])
+  )
+    refuse("release_bootstrap_chain");
+  return bootstrapChainDigest(
+    files.map((f) => {
+      if (f.release === undefined) refuse("release_bootstrap_bytes_missing");
+      return { file: f.file, sha256_release: sha256(f.release) };
+    }),
+  );
+}
+
+/**
+ * Before connecting: the release-sha chain bytes digest to the plan artifact's
+ * chain_digest and to the typed approval's CHAIN; else release_bootstrap_plan_changed.
+ * The stage recomputes the whole section under the lock as well.
+ */
+export function requireReleaseChainDigest(
+  files: readonly { file: string; release: Buffer | string | undefined }[],
+  planned: Pick<BootstrapSection, "chain_digest">,
+  approvalChain: string,
+) {
+  const digest = releaseChainDigest(files);
+  if (digest !== planned.chain_digest || digest !== approvalChain)
+    refuse("release_bootstrap_plan_changed");
+  return digest;
+}
+
+export const BOOTSTRAP_LOCK = "SELECT pg_advisory_lock(961996, 1)";
+export const BOOTSTRAP_UNLOCK = "SELECT pg_advisory_unlock(961996, 1)";
+
+/**
+ * The bootstrap stage over an already connected client, which it always ends. Under the
+ * migrator's session advisory lock: underLock (the caller's GitHub gate and anchor
+ * recheck), then ONE transaction with hoopdb.db_mode=supabase bound: recompute the plan's
+ * bootstrap section and refuse release_bootstrap_plan_changed on any difference; skip
+ * (ROLLBACK, skipped evidence) when nothing is absent; otherwise run each chain file
+ * provisioning an absent role (release-sha bytes, psql meta lines stripped, transaction
+ * safe), require the same txid, read back and COMMIT only on an exact verdict. Every
+ * refusal or error rolls back, unlocks and ends the client, then propagates.
+ */
+export async function runBootstrapStage(x: {
+  client: Queryable & { end(): Promise<void> };
+  files: readonly { file: string; release: Buffer | string | undefined; target: Buffer | string | undefined }[];
+  planned: BootstrapSection;
+  supabaseMode: boolean;
+  underLock: () => Promise<void>;
+  writeEvidence: (evidence: Record<string, unknown>) => Promise<void>;
+  /** Non-secret evidence header (version, shas, plan run, run id). */
+  header: Record<string, unknown>;
+  log?: (line: string) => void;
+}): Promise<"skipped" | "verified"> {
+  const { client } = x;
+  const log = x.log ?? console.log;
+  let locked = false;
+  try {
+    await client.query(BOOTSTRAP_LOCK);
+    locked = true;
+    await x.underLock();
+    await client.query("BEGIN");
+    let ended = false;
+    try {
+      await client.query(
+        "SELECT set_config('hoopdb.db_mode', $1, true), set_config('hoopdb.allow_blocking_index_build', $2, true)",
+        ["supabase", "off"],
+      );
+      const before = await readBootstrapState(client);
+      const live = bootstrapSection({ files: x.files, state: before, supabaseMode: x.supabaseMode });
+      requireSameBootstrapPlan(x.planned, live);
+      if (!live.required) {
+        await client.query("ROLLBACK");
+        ended = true;
+        await x.writeEvidence({
+          ...x.header,
+          chain_digest: live.chain_digest,
+          files: live.files,
+          skipped: true,
+          created: [],
+          roles: live.roles,
+        });
+        log("release_bootstrap_skipped");
+        return "skipped";
+      }
+      const run = bootstrapFilesToRun(live);
+      const sql = run.map((file) => {
+        const bytes = x.files.find((f) => f.file === file)?.release;
+        if (bytes === undefined) refuse("release_bootstrap_bytes_missing");
+        return requireTransactionSafeChainSql(stripPsqlMeta(Buffer.from(bytes).toString("utf8")));
+      });
+      const xid = async () =>
+        String((await client.query("SELECT txid_current()::text AS x")).rows[0]?.x ?? "");
+      const xidBefore = await xid();
+      for (const text of sql) await client.query(text);
+      // Still the same transaction: no file ended or split it (else refuse, roll back).
+      if (!xidBefore || (await xid()) !== xidBefore) refuse("release_bootstrap_readback");
+      const after = await readBootstrapState(client);
+      const evidence = bootstrapReadbackVerdict({
+        before,
+        after,
+        approved: live.will_create,
+        supabaseMode: x.supabaseMode,
+      });
+      await client.query("COMMIT");
+      ended = true;
+      await x.writeEvidence({
+        ...x.header,
+        chain_digest: live.chain_digest,
+        files: live.files,
+        ran: run,
+        ...evidence,
+      });
+      log("release_bootstrap_created " + evidence.created.length);
+      log("release_bootstrap_verified");
+      return "verified";
+    } finally {
+      if (!ended) await client.query("ROLLBACK").catch(() => {});
+    }
+  } finally {
+    if (locked) await client.query(BOOTSTRAP_UNLOCK).catch(() => {});
+    await client.end().catch(() => {});
+  }
 }

@@ -24,7 +24,10 @@ import {
   bootstrapFilesToRun,
   bootstrapReadbackVerdict,
   bootstrapSection,
+  chainSqlTopLevel,
+  releaseChainDigest,
   requireBootstrapRoles,
+  requireReleaseChainDigest,
   requireSameBootstrapPlan,
   requireTransactionSafeChainSql,
   roleContractProblems,
@@ -1207,6 +1210,7 @@ const bsRole = (rolname: string, o: Record<string, unknown> = {}) => ({
   rolreplication: false,
   rolbypassrls: false,
   rolconnlimit: -1,
+  rolvaliduntil: null,
   ...o,
 });
 const creatorEdge = (role: string, o: Partial<BootstrapEdge> = {}): BootstrapEdge => ({
@@ -1221,6 +1225,13 @@ const creatorEdge = (role: string, o: Partial<BootstrapEdge> = {}): BootstrapEdg
   ...o,
 });
 const chainNames = bootstrapChainRoles().map((r) => r.name);
+const workerSetting = {
+  role: "session_directory_search_worker",
+  global: true,
+  kind: "statement_timeout=2s" as const,
+  database: "0",
+  digest: "d".repeat(64),
+};
 /** A PG16 Supabase cluster where every chain role exists exactly, minus `absent`. */
 function bsState(absent: string[] = [], o: Partial<BootstrapState> = {}): BootstrapState {
   return {
@@ -1236,7 +1247,7 @@ function bsState(absent: string[] = [], o: Partial<BootstrapState> = {}): Bootst
     edges: [],
     settings: absent.includes("session_directory_search_worker")
       ? []
-      : [{ role: "session_directory_search_worker", global: true, kind: "statement_timeout=2s" }],
+      : [workerSetting],
     ...o,
   };
 }
@@ -1539,6 +1550,65 @@ test("bootstrap readback: exactly the approved roles appear; extra, missing or a
   expect(refuseOn(created({ settings: [] }))).toBe("release_bootstrap_readback");
 });
 
+test("bootstrap readback covers every role's validity, every membership edge and every setting row", () => {
+  // A cluster with unrelated edges and settings that the stage must leave untouched.
+  const otherEdge: BootstrapEdge = { role: "pg_read_all_data", member: "authenticator", member_inherit: false, grantor: "supabase_admin", grantor_super: true, admin_option: false, inherit_option: true, set_option: true };
+  const dbWide = { role: "", global: false, kind: "other" as const, database: "5", digest: "a".repeat(64) };
+  const authSetting = { role: "authenticator", global: true, kind: "other" as const, database: "0", digest: "b".repeat(64) };
+  const cluster = (o: Partial<BootstrapState> = {}, absent: string[] = []) =>
+    bsState(absent, { edges: [otherEdge], settings: [workerSetting, dbWide, authSetting], ...o });
+  const before = cluster({}, [admit]);
+  const after = (o: Partial<BootstrapState> = {}) =>
+    cluster({ edges: [otherEdge, creatorEdge(admit)], ...o });
+  const verdict = (a: BootstrapState, supabaseMode = true) =>
+    bsCode(() => {
+      const err = console.error;
+      console.error = quiet;
+      try {
+        bootstrapReadbackVerdict({ before, after: a, approved: [admit], supabaseMode });
+      } finally {
+        console.error = err;
+      }
+    });
+  expect(verdict(after())).toBe("no-refusal");
+  const ev = bootstrapReadbackVerdict({ before, after: after(), approved: [admit], supabaseMode: true });
+  // Setting digests are compared only; never written to evidence.
+  expect(JSON.stringify(ev)).not.toContain("a".repeat(64));
+  expect(JSON.stringify(ev)).not.toContain("b".repeat(64));
+  expect(JSON.stringify(ev)).not.toContain("d".repeat(64));
+  // Any non-chain edge added, removed or with a changed grantor/option refuses.
+  for (const edges of [
+    [creatorEdge(admit)],
+    [otherEdge, creatorEdge(admit), { ...otherEdge, member: "postgres" }],
+    [{ ...otherEdge, admin_option: true }, creatorEdge(admit)],
+    [{ ...otherEdge, inherit_option: false }, creatorEdge(admit)],
+    [{ ...otherEdge, set_option: false }, creatorEdge(admit)],
+    [{ ...otherEdge, grantor: "postgres", grantor_super: false }, creatorEdge(admit)],
+    // A created role gaining an edge other than its creator edge, or as a member.
+    [otherEdge, creatorEdge(admit), creatorEdge(admit, { member: "authenticator", admin_option: false })],
+    [otherEdge, creatorEdge(admit), { ...otherEdge, member: admit }],
+  ])
+    expect(verdict(after({ edges }))).toBe("release_bootstrap_readback");
+  // The creator edge is permitted only in supabase db mode on PG16+.
+  expect(verdict(after(), false)).toBe("release_bootstrap_readback");
+  // Any setting row changed, added or removed, database-wide rows included.
+  for (const settings of [
+    [workerSetting, authSetting],
+    [workerSetting, dbWide, { ...authSetting, digest: "c".repeat(64) }],
+    [workerSetting, dbWide, { ...authSetting, database: "5", global: false }],
+    [workerSetting, dbWide, authSetting, { ...dbWide, database: "6" }],
+    [workerSetting, dbWide, authSetting, { ...authSetting, role: "postgres" }],
+    [workerSetting, dbWide, authSetting, { ...authSetting, role: admit }],
+  ])
+    expect(verdict(after({ settings }))).toBe("release_bootstrap_readback");
+  // Any role's validity changed, or a created role with VALID UNTIL.
+  for (const name of ["authenticator", "bulls96_read_api", admit]) {
+    const a = after();
+    a.roles = a.roles.map((r) => (r.rolname === name ? { ...r, rolvaliduntil: "2030-01-01 00:00:00+00" } : r));
+    expect(verdict(a)).toBe("release_bootstrap_readback");
+  }
+});
+
 test("apply guard lists absent chain roles; psql meta lines are stripped", () => {
   const lines: string[] = [];
   expect(bsCode(() => requireBootstrapRoles(bsState([admit, "bulls96_digest_narrative"]), (l) => lines.push(l)))).toBe(
@@ -1550,13 +1620,73 @@ test("apply guard lists absent chain roles; psql meta lines are stripped", () =>
 });
 
 test("chain files never end or split the stage transaction", () => {
+  // Every current chain file passes, as the stage sends it (psql meta lines stripped).
+  expect(SESSION_BOOTSTRAP_FILES.length).toBe(5);
   for (const f of SESSION_BOOTSTRAP_FILES) {
     const text = stripPsqlMeta(readFileSync(new URL("../../../" + f, import.meta.url), "utf8"));
     expect(requireTransactionSafeChainSql(text)).toBe(text);
+    // Its top level is only DO statements: every body and comment is stripped.
+    expect(chainSqlTopLevel(text).split(";").map((t) => t.trim()).filter(Boolean).every((t) => t === "DO")).toBe(true);
   }
   expect(requireTransactionSafeChainSql("DO $x$ BEGIN\n  NULL;\nEND $x$;")).toContain("NULL");
-  for (const bad of ["COMMIT;", "rollback;", "BEGIN;", "begin transaction;", "SAVEPOINT a;", "START TRANSACTION;", "ABORT;", "PREPARE TRANSACTION 'x';"])
-    expect(bsCode(() => requireTransactionSafeChainSql("DO $x$ BEGIN NULL; END $x$;\n" + bad))).toBe("release_bootstrap_chain_unsafe");
+  // (c) a DO body whose plpgsql ends with END, newline, then the closing tag passes.
+  for (const ok of [
+    "DO $$\nBEGIN\n  NULL;\nEND\n$$;",
+    "DO $bootstrap$\nDECLARE v int;\nBEGIN\n  IF true THEN NULL; END IF;\nEND\n$bootstrap$;\n",
+    "DO $a$ BEGIN NULL; END $a$;\nDO $b$ BEGIN NULL; END $b$;",
+    // END/BEGIN only inside quotes, identifiers or comments at the top level.
+    "SELECT 'END;';\nSELECT 1 AS \"end\";\n-- END;\n/* END; /* nested */ END; */ SELECT 2;",
+    "SELECT E'it\\'s END;';",
+    "SELECT CASE WHEN true THEN 1 END;",
+  ])
+    expect(requireTransactionSafeChainSql(ok)).toBe(ok);
+  const unsafe = (sql: string) => bsCode(() => requireTransactionSafeChainSql(sql));
+  for (const bad of ["COMMIT;", "rollback;", "BEGIN;", "begin transaction;", "SAVEPOINT a;", "START TRANSACTION;", "ABORT;", "PREPARE TRANSACTION 'x';", "RELEASE a;", "release savepoint a;"])
+    expect(unsafe("DO $x$ BEGIN NULL; END $x$;\n" + bad)).toBe("release_bootstrap_chain_unsafe");
+  // (a) a DO block followed by a top-level END; (COMMIT's synonym), then more statements.
+  expect(unsafe("DO $x$ BEGIN NULL; END $x$;\nEND;\nCREATE ROLE rogue_role;")).toBe("release_bootstrap_chain_unsafe");
+  // (b) every spelling of END as a statement.
+  for (const end of ["end ;", "END WORK;", "END TRANSACTION;", "End\n;", "END", "  end work ;", "BEGIN WORK", "begin isolation level serializable;"])
+    expect(unsafe("DO $$ BEGIN NULL; END $$;\n" + end)).toBe("release_bootstrap_chain_unsafe");
+  // (d) strict on purpose: COMMIT/ROLLBACK/... are refused even as a comment word
+  // inside a dollar body, as before; the chain files never contain them.
+  expect(unsafe("DO $x$\nBEGIN\n  -- never COMMIT here\n  NULL;\nEND\n$x$;")).toBe("release_bootstrap_chain_unsafe");
+  expect(unsafe("DO $x$ BEGIN RAISE NOTICE 'rollback'; END $x$;")).toBe("release_bootstrap_chain_unsafe");
+  // Lexer evasions: a quote, identifier or E-string that would hide a top-level END.
+  for (const evade of [
+    "SELECT 1 AS foo$$;\nEND;\nSELECT $$;",
+    "SELECT 'it''s $$';\nEND;",
+    "SELECT E'\\'';\nEND;",
+    "SELECT \"a\"\"b\";\nEND;",
+    "/* /* */ */ END;",
+    "DO $x$ BEGIN NULL; END $x$ ; END ; DO $y$ BEGIN NULL; END $y$;",
+  ])
+    expect(unsafe(evade)).toBe("release_bootstrap_chain_unsafe");
+  // Unterminated comment, quote, identifier or body refuses (fail closed).
+  for (const open of ["DO $x$ BEGIN NULL; END;", "SELECT 'x;", "SELECT \"x;", "/* x", "SELECT E'x\\';"])
+    expect(unsafe(open)).toBe("release_bootstrap_chain_unsafe");
+  // A positional parameter is not a dollar tag.
+  expect(chainSqlTopLevel("SELECT $1, $2;")).toBe("SELECT $1, $2;");
+});
+
+test("bootstrap pre-connect: the release-sha chain digest equals the plan's and the approval's CHAIN", () => {
+  const planned = bootstrapSection({ files: bsFiles(), state: bsState([admit]), supabaseMode: true });
+  expect(releaseChainDigest(bsFiles())).toBe(planned.chain_digest);
+  expect(requireReleaseChainDigest(bsFiles(), planned, planned.chain_digest)).toBe(planned.chain_digest);
+  // A changed release byte, or an approval/plan CHAIN that is not the live digest.
+  expect(bsCode(() => requireReleaseChainDigest(bsFiles({ [readApiFile]: "-- moved\n" }), planned, planned.chain_digest))).toBe(
+    "release_bootstrap_plan_changed",
+  );
+  expect(bsCode(() => requireReleaseChainDigest(bsFiles(), planned, "0".repeat(64)))).toBe("release_bootstrap_plan_changed");
+  expect(bsCode(() => requireReleaseChainDigest(bsFiles(), { chain_digest: "0".repeat(64) }, planned.chain_digest))).toBe(
+    "release_bootstrap_plan_changed",
+  );
+  // Target-sha bytes are informational only: they never change the digest.
+  const files = bsFiles();
+  files[0].target = "-- other target bytes\n";
+  expect(releaseChainDigest(files)).toBe(planned.chain_digest);
+  expect(bsCode(() => releaseChainDigest(bsFiles({ [readApiFile]: undefined })))).toBe("release_bootstrap_bytes_missing");
+  expect(bsCode(() => releaseChainDigest(bsFiles().reverse()))).toBe("release_bootstrap_chain");
 });
 
 test("bootstrap mode binds the plan artifact's section into the typed approval", () => {
@@ -1566,31 +1696,26 @@ test("bootstrap mode binds the plan artifact's section into the typed approval",
   expect(bsCode(() => validateBootstrapPlan({ bootstrap: section }, input))).toBe("release_plan_artifact");
 });
 
-test("bootstrap stage source: session lock, db_mode bound, one transaction, COMMIT only after the verdict", () => {
+test("bootstrap entry point: every pre-connect check before the connection, the stage owns the transaction", () => {
   const src = readFileSync(new URL("../../../scripts/schema-release-database.ts", import.meta.url), "utf8");
-  const stage = src.slice(src.indexOf("async function releaseBootstrap("), src.indexOf("export async function releaseDatabase("));
+  const entry = src.slice(src.indexOf("async function releaseBootstrap("), src.indexOf("export async function releaseDatabase("));
   const order = [
     "validateBootstrapPlan(",
+    "refuse(\"release_target_manifest_changed\");",
+    "releaseBootstrapFiles(process.cwd(), input.sha, input.targetSha);",
+    "requireReleaseChainDigest(files, planned, input.chainDigest);",
+    "refuse(\"release_bootstrap_db_mode\");",
+    "releaseClient(process.env.SUPABASE_MIGRATION_OWNER_URL);",
+    "await client.connect();",
     "await requireReleaseOwner(client);",
-    'await client.query("SELECT pg_advisory_lock(961996, 1)");',
+    "await runBootstrapStage({",
     "await githubReleaseGate(process.env, get, true);",
-    'await client.query("BEGIN");',
-    "set_config('hoopdb.db_mode', $1, true)",
-    "const before = await readBootstrapState(client);",
-    "requireSameBootstrapPlan(planned, live);",
-    "requireTransactionSafeChainSql(stripPsqlMeta(bytes.toString(\"utf8\")))",
-    "const xidBefore = await xid();",
-    "for (const text of sql) await client.query(text);",
-    'if (!xidBefore || (await xid()) !== xidBefore) refuse("release_bootstrap_readback");',
-    "const after = await readBootstrapState(client);",
-    "bootstrapReadbackVerdict({",
-    'await client.query("COMMIT");',
-  ].map((s) => stage.indexOf(s));
+  ].map((s) => entry.indexOf(s));
   expect(order.every((i) => i > 0)).toBe(true);
   expect([...order].sort((a, b) => a - b)).toEqual(order);
-  expect(stage.match(/"COMMIT"/g)).toHaveLength(1);
-  expect(stage).toContain('if (!committed) await client.query("ROLLBACK")');
-  expect(stage).toContain('pg_advisory_unlock(961996, 1)');
+  // The entry point itself issues no transaction control or chain SQL; the stage
+  // (driven with a fake client in schema-release-bootstrap-stage.test.ts) does.
+  expect(entry).not.toMatch(/"(BEGIN|COMMIT|ROLLBACK)"|pg_advisory|client\.query/);
   expect(src).toContain('if (input.mode === "bootstrap") return releaseBootstrap(get, input);');
   // Apply: the live absent-role guard runs inside beforeWrite under the migrator lock.
   expect(src).toMatch(/beforeWrite: async \(\) => \{[\s\S]*?await requireBootstrapRolesLive\(client\);[\s\S]*?refreshReleaseBoundary/);
