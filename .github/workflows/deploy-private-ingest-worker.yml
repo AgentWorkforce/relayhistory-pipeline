@@ -92,7 +92,8 @@ jobs:
           node-version: 24
       - name: Install without production credentials
         run: bun install --frozen-lockfile
-      - name: Verify actual environment approval and release context
+      - name: Verify Khaliq's exact dispatch identity and release context
+        id: release-context
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: bun scripts/private-ingest-release-github.ts --approved
@@ -151,6 +152,8 @@ jobs:
       - name: Bind Khaliq's authorization to the retained capture
         if: inputs.mode == 'deploy'
         id: approval
+        env:
+          PRIVATE_INGEST_AUTHORIZATION_DATE: ${{ steps.release-context.outputs.authorization_date }}
         run: bun scripts/private-ingest-ci.ts approve
       - name: Re-plan, refuse drift, and deploy the retained plan once
         if: inputs.mode == 'deploy'

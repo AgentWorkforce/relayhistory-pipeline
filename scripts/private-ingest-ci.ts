@@ -75,9 +75,14 @@ export function approvePrivateIngestCapture() {
     approval: {
       decision: "approved",
       by: P.approval.by,
-      // The exact Khaliq-only GitHub environment approval was rechecked in this job. Record that
-      // fresh deploy approval date; the source contract separately retains his rollout quote/date.
-      date: new Date().toISOString().slice(0, 10),
+      // The GitHub gate proved both dispatch identities are Khaliq's exact user. Bind that run's
+      // creation date; the source contract separately retains his rollout quote/date.
+      date: (() => {
+        const value = process.env.PRIVATE_INGEST_AUTHORIZATION_DATE ?? "";
+        if (!/^20[0-9]{2}-[0-9]{2}-[0-9]{2}$/u.test(value))
+          privateIngestRefuse("private_ingest_authorization_date");
+        return value;
+      })(),
       quote: P.approval.quote,
       execution: EXECUTION_EXCEPTION,
       capture: {

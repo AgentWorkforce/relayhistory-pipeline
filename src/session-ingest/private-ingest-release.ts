@@ -25,7 +25,7 @@ import type { CloudflareStageInputs } from "../../stacks/cloudflare/alchemy.clou
 export const PRIVATE_INGEST_RELEASE = {
   repository: "AgentWorkforce/relayhistory-pipeline",
   repositoryId: "1437714333",
-  approverGithubUserId: 1724137,
+  releaseActorGithubUserId: 1724137,
   environment: "private-ingest-production",
   workflow: ".github/workflows/deploy-private-ingest-worker.yml",
   accountId: "f7232cb80f6fab86a95426302af243e4",

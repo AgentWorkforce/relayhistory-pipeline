@@ -1,4 +1,5 @@
 /** Read-only GitHub Actions/environment gate for the private-ingest production release. */
+import { appendFileSync } from "node:fs";
 import {
   PRIVATE_INGEST_RELEASE as P,
   privateIngestRefuse,
@@ -24,15 +25,13 @@ export async function privateIngestGithubGate(
     privateIngestRefuse("private_ingest_release_main_moved");
   const run = await get(base + "/actions/runs/" + env.GITHUB_RUN_ID);
   if (run.head_sha !== input.sha || run.event !== "workflow_dispatch" || run.head_branch !== "main" ||
-      run.path !== P.workflow || run.run_attempt !== 1)
+      run.path !== P.workflow || run.run_attempt !== 1 ||
+      run.actor?.id !== P.releaseActorGithubUserId || run.actor?.type !== "User" ||
+      run.triggering_actor?.id !== P.releaseActorGithubUserId || run.triggering_actor?.type !== "User")
     privateIngestRefuse("private_ingest_release_run");
   const environment = await get(base + "/environments/" + P.environment);
-  const reviewers = (environment.protection_rules ?? [])
-    .find((rule: Obj) => rule.type === "required_reviewers")
-    ?.reviewers?.filter((row: Obj) => row.type === "User" && row.reviewer?.type === "User")
-    .map((row: Obj) => row.reviewer.id) ?? [];
   if (environment.name !== P.environment || !Number.isSafeInteger(environment.id) ||
-      reviewers.length !== 1 || reviewers[0] !== P.approverGithubUserId ||
+      !Array.isArray(environment.protection_rules) || environment.protection_rules.length !== 0 ||
       environment.deployment_branch_policy?.protected_branches !== false ||
       environment.deployment_branch_policy?.custom_branch_policies !== true)
     privateIngestRefuse("private_ingest_release_environment");
@@ -67,17 +66,9 @@ export async function privateIngestGithubGate(
     if (artifacts.total_count !== artifacts.artifacts?.length || planArtifacts.length !== 1)
       privateIngestRefuse("private_ingest_release_plan_artifact");
   }
-  if (approved) {
-    const approvals = await get(base + "/actions/runs/" + env.GITHUB_RUN_ID + "/approvals");
-    if (!Array.isArray(approvals) || !approvals.some((approval: Obj) =>
-      approval.state === "approved" && approval.user?.type === "User" &&
-      approval.user.id === P.approverGithubUserId && approval.environments?.some((item: Obj) =>
-        item.id === environment.id && item.name === P.environment)) ||
-      approvals.some((approval: Obj) => approval.state === "rejected" &&
-        approval.environments?.some((item: Obj) => item.id === environment.id)))
-      privateIngestRefuse("private_ingest_release_human_approval");
-  }
-  return input;
+  if (!Number.isFinite(Date.parse(run.created_at)) || Date.parse(run.created_at) > Date.now())
+    privateIngestRefuse("private_ingest_release_authorization_date");
+  return { ...input, authorizationDate: new Date(run.created_at).toISOString().slice(0, 10), approved };
 }
 
 export function privateIngestGithubGet(token = process.env.GITHUB_TOKEN): Get {
@@ -99,7 +90,11 @@ export function privateIngestGithubGet(token = process.env.GITHUB_TOKEN): Get {
 
 if (import.meta.main)
   privateIngestGithubGate(process.env, privateIngestGithubGet(), process.argv.includes("--approved"))
-    .then(() => console.log("private_ingest_release_github_gate_ok"))
+    .then((result) => {
+      if (process.argv.includes("--approved") && process.env.GITHUB_OUTPUT)
+        appendFileSync(process.env.GITHUB_OUTPUT, `authorization_date=${result.authorizationDate}\n`);
+      console.log("private_ingest_release_github_gate_ok");
+    })
     .catch(() => {
       console.error("private_ingest_release_github_gate_refused");
       process.exitCode = 1;

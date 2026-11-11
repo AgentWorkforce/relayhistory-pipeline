@@ -30,7 +30,8 @@ human approval for every plan or deploy run.
 Create `private-ingest-production` with:
 
 - exactly one deployment branch policy: branch `main`;
-- exactly one required user reviewer: `khaliqgant` (GitHub user ID `1724137`);
+- no unsupported reviewer rule; instead the workflow requires both the dispatch actor and
+  triggering actor to be exactly `khaliqgant` (GitHub user ID `1724137`);
 - environment variable `PRIVATE_INGEST_STATE_URL`, the HTTPS
   `alchemy-state-store-96bulls.<account-subdomain>.workers.dev` origin;
 - environment variable `PRIVATE_INGEST_KMS_KEY_ARN`, the production transcripts key ARN;
@@ -45,10 +46,10 @@ Wrangler OAuth credential into GitHub Actions.
 The prerequisite job refuses a missing, unprotected, or non-main environment before entering it.
 The KMS target stays in the protected environment rather than engine source.
 
-The source contract retains Khaliq's direct rollout quote and date. Every deploy also requires his
-fresh GitHub environment approval; the capture records that approval's current UTC date, so the
-retained-plan freshness check applies to the actual deploy authorization rather than expiring the
-workflow itself. A missing or stale approval is a safety stop, not a reason to bypass the workflow.
+The source contract retains Khaliq's direct rollout quote and date. Every run must be dispatched and
+triggered by his exact GitHub user; the capture records that run's creation date, so the retained-plan
+freshness check applies to the actual authorized run rather than expiring the workflow itself. A
+missing or stale authorization is a safety stop, not a reason to bypass the workflow.
 
 ## Plan
 

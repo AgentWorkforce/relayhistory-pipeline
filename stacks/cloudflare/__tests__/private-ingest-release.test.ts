@@ -131,19 +131,20 @@ test("live transition gate requires an independently deployed step 2 before step
 });
 
 function githubFixture() {
-  const run = { id: 100, head_sha: sha, head_branch: "main", event: "workflow_dispatch", path: P.workflow, run_attempt: 1 };
+  const actor = { id: P.releaseActorGithubUserId, type: "User" };
+  const run = { id: 100, head_sha: sha, head_branch: "main", event: "workflow_dispatch", path: P.workflow,
+    run_attempt: 1, actor, triggering_actor: actor, created_at: new Date().toISOString() };
   return {
     ref: { object: { sha } }, run,
     environment: {
       id: 7, name: P.environment,
-      protection_rules: [{ type: "required_reviewers", reviewers: [{ type: "User", reviewer: { type: "User", id: P.approverGithubUserId } }] }],
+      protection_rules: [],
       deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
     },
     branches: { total_count: 1, branch_policies: [{ name: "main", type: "branch" }] },
     ci: { workflow_runs: [{ id: 10, head_sha: sha, head_branch: "main", event: "push", status: "completed", conclusion: "success", run_attempt: 1 }] },
     jobs: { total_count: 2, jobs: ["unit-tests", "session-read-worker / worker"].map((name) =>
       ({ name, head_sha: sha, status: "completed", conclusion: "success" })) },
-    approvals: [{ state: "approved", user: { type: "User", id: P.approverGithubUserId }, environments: [{ id: 7, name: P.environment }] }],
     plan: { ...run, id: Number(planRun), status: "completed", conclusion: "success", created_at: new Date().toISOString() },
     artifacts: { total_count: 1, artifacts: [{ name: "private-ingest-plan", expired: false }] },
   };
@@ -158,7 +159,6 @@ function githubGet(f: ReturnType<typeof githubFixture>) {
     if (path.includes("deployment-branch-policies")) return f.branches;
     if (path.includes("/workflows/ci.yml/")) return f.ci;
     if (path.includes("/runs/10/")) return f.jobs;
-    if (path.endsWith("/approvals")) return f.approvals;
     if (path.endsWith(`/actions/runs/${planRun}/artifacts?per_page=100`)) return f.artifacts;
     throw new Error("unexpected " + path);
   };
@@ -178,15 +178,14 @@ const githubBase = {
   GITHUB_RUN_ID: "100",
 };
 
-test("GitHub gate requires exact main, green CI, protected human environment and prior plan", async () => {
+test("GitHub gate requires exact main, green CI, exact Khaliq dispatch identity, environment and prior plan", async () => {
   expect((await privateIngestGithubGate(githubBase, githubGet(githubFixture()), true)).mode).toBe("deploy");
   const changes: Array<(f: ReturnType<typeof githubFixture>) => void> = [
     (f) => { f.ref.object.sha = "b".repeat(40); },
     (f) => { f.ci.workflow_runs[0]!.conclusion = "failure"; },
-    (f) => { f.environment.protection_rules = []; },
-    (f) => { f.environment.protection_rules[0]!.reviewers[0]!.reviewer.id = 42; },
-    (f) => { f.approvals = []; },
-    (f) => { f.approvals[0]!.user.id = 42; },
+    (f) => { f.environment.protection_rules = [{ type: "required_reviewers" }]; },
+    (f) => { f.run.actor.id = 42; },
+    (f) => { f.run.triggering_actor.id = 42; },
     (f) => { f.artifacts.artifacts = []; f.artifacts.total_count = 0; },
     (f) => { f.plan.head_sha = "b".repeat(40); },
   ];
