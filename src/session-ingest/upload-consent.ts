@@ -334,7 +334,16 @@ export async function checkUploadConsent(
     decision = { outcome: "consent_store_required", refuse: named.size > 0, revision: null, mode: options.operator!.mode, sessions: named.size, refusedSessions: named.size };
   } else {
     const named = [...batchSessions(records).values()];
-    const snapshot = await config.store.snapshot(tenant, originId, named, (config.nowMs ?? Date.now)());
+    let snapshot: ConsentSnapshot;
+    try {
+      snapshot = await config.store.snapshot(tenant, originId, named, (config.nowMs ?? Date.now)());
+    } catch (error) {
+      // Report never refuses: with the store unreadable (e.g. the migration not yet applied) it logs and
+      // accepts. hold-only / enforce, or an operator cap, fail closed (the caller answers 503, no ACK).
+      if (enforcement !== "report") throw error;
+      log({ route: UPLOAD_CONSENT_METRIC, error_code: "upload_consent_store_unavailable", state: "reported", stage: `${options.route ?? "upload"}:${options.phase}`, org_id: tenant.orgId, workspace_id: tenant.workspaceId, outcome: enforcement });
+      return null;
+    }
     decision = decideUploadConsent(snapshot, records, options);
   }
   if (!decision.refuse) return decision;

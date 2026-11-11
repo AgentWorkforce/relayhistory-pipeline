@@ -559,3 +559,26 @@ describe("recordSelectionDeny (replay/stale path)", () => {
   });
 });
 
+
+describe("report mode never refuses, even with the consent store unreadable", () => {
+  const broken: UploadConsentStore = { snapshot: async () => { throw new Error("relation does not exist"); }, apply: async () => { throw new Error("relation does not exist"); } };
+  test("report: an upload is accepted and the store outage is logged (e.g. before migration 057010 is applied)", async () => {
+    const h = harness({ enforcement: "report", consent: broken });
+    expect((await h.post(await batch([sess("a")]))).status).toBe(200);
+    expect(h.ledger.commits).toHaveLength(1);
+    expect(h.lines.find((l) => l.error_code === "upload_consent_store_unavailable")).toMatchObject({ state: "reported", org_id: TENANT.orgId });
+  });
+  test("report: a selection disable still succeeds (the fence applied; only the consent record is missing)", async () => {
+    const h = harness({ enforcement: "report", consent: broken });
+    const res = await h.app.request("/v1/delivery/sessions/selection", { method: "POST", headers: { "content-type": "application/json", ...h.as({}) },
+      body: JSON.stringify({ account_id: await deliveryAccount(TENANT), origin_id: "origin-1", sessions: [{ source: "claude", session_id: "x" }], enabled: false }) });
+    expect(res.status).toBe(200);
+  });
+  test("hold-only and enforce still fail closed on a store outage", async () => {
+    for (const enforcement of ["hold-only", "enforce"] as const) {
+      const h = harness({ enforcement, consent: broken });
+      expect((await h.post(await batch([sess("a")]))).status).toBe(503);
+      expect(h.ledger.claims).toHaveLength(0);
+    }
+  });
+});

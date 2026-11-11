@@ -627,3 +627,40 @@ describe("session ingest: INGEST_CLAIM_TIMEOUT_BUSY (default off)", () => {
     expect(() => assertSessionIngestInputs({ ...inputs, INGEST_CLAIM_TIMEOUT_BUSY: "on" }, refuse)).toThrow("sessionIngest.INGEST_CLAIM_TIMEOUT_BUSY is not a known setting");
   });
 });
+
+describe("session ingest: INGEST_UPLOAD_CONSENT (default off)", () => {
+  // Same shape as the INGEST_CLAIM_TIMEOUT_BUSY block: a var-only flag, no binding or resource.
+  const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };
+  const canonical: SessionIngestInputs = { ...inputs, acceptanceMode: "canonical" };
+
+  it("omitted: no INGEST_UPLOAD_CONSENT key at all, vars and props byte-identical to a stack without the input", () => {
+    for (const p of [inputs, canonical, buffered]) {
+      expect(Object.hasOwn(sessionIngestVars(p), "INGEST_UPLOAD_CONSENT")).toBe(false);
+      expect(JSON.stringify(sessionIngestWorkerProps(p, bindings))).toBe(JSON.stringify(sessionIngestWorkerProps({ ...p, uploadConsent: undefined }, bindings)));
+    }
+  });
+
+  it("report / hold-only / enforce: exactly one more var, no new binding or resource", () => {
+    const env = { CLOUDFLARE_ACCOUNT_ID: hex("a") };
+    for (const mode of ["report", "hold-only", "enforce"] as const)
+      for (const base of [inputs, canonical, buffered]) {
+        const on = { ...base, uploadConsent: mode };
+        expect(() => assertSessionIngestInputs(on, refuse)).not.toThrow();
+        expect(sessionIngestVars(on)).toEqual({ ...sessionIngestVars(base), INGEST_UPLOAD_CONSENT: mode });
+        const p = props(on);
+        expect(p.env.INGEST_UPLOAD_CONSENT).toBe(mode);
+        expect(Object.keys(p.env).sort()).toEqual([...Object.keys(props(base).env), "INGEST_UPLOAD_CONSENT"].sort());
+        expect(() => assertNoSecretLiterals(p.env, refuse)).not.toThrow();
+        expect(() => assertPrivateWorker(p, refuse)).not.toThrow();
+        expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: on }, env)).not.toThrow();
+      }
+    expect(sessionIngestResources()).toBe(SESSION_INGEST_RESOURCES);
+  });
+
+  it("is refused for any other value (off is spelled by omitting it)", () => {
+    for (const value of ["off", "on", "Report", "true", true, 1, "", null])
+      expect(() => assertSessionIngestInputs({ ...inputs, uploadConsent: value }, refuse)).toThrow('sessionIngest.uploadConsent must be "report", "hold-only" or "enforce" (omit for off)');
+    const env = { CLOUDFLARE_ACCOUNT_ID: hex("a") };
+    expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: { ...inputs, uploadConsent: "on" } }, env)).toThrow(/uploadConsent.*Nothing was changed/);
+  });
+});

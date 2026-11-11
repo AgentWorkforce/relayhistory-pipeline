@@ -21,14 +21,22 @@ authenticated ingress until the person confirms a choice:
 - Evidence is metadata only: counts, times and hashes. Nobody opens, samples or greps transcript
   content to guess what a person chose.
 
-## 0. Preconditions (one-time, each needs Khaliq's OK)
+## 0. Preconditions and order (Khaliq approved on 2026-11-11: steps 1 and 2 now; 3a on evidence; 3b after self-service confirm exists)
 
-1. Migration `20261105057010_upload_consent.sql` applied by the migrator (`runbooks/guarded-session-schema-release.md`).
-   Rollback: `supabase/rollbacks/20261105057010_upload_consent.down.sql`.
-2. The ingest build with this change deployed with `INGEST_UPLOAD_CONSENT` **unset (off)**. Nothing changes.
-3. Optional dry run: set `INGEST_UPLOAD_CONSENT=report`. This accepts everything and logs
-   `route=upload_consent_refused, state=reported`. Expect `reason=no_policy` for every principal,
-   because nobody has a policy yet. Use it to size the volume only.
+The hosted ingest reads `INGEST_UPLOAD_CONSENT` from the Cloudflare stack input `sessionIngest.uploadConsent`
+(`"report" | "hold-only" | "enforce"`; omit for off). Changing it is a stack plan and apply through the
+normal reviewed deploy. Self-host sets the same env var on the pipeline image.
+
+1. **Report mode (safe before the migration).** Set `sessionIngest.uploadConsent: "report"` and deploy. Report
+   never refuses: it logs `route=upload_consent_refused state=reported` with the outcome class and counts.
+   If the consent store is unreadable (the migration not applied yet), it logs
+   `error_code=upload_consent_store_unavailable` and still accepts. Expect `reason=no_policy` for every
+   principal, which sizes the cohort.
+2. **Migration `20261105057010_upload_consent.sql`**, through the guarded session schema release
+   (`runbooks/guarded-session-schema-release.md`) in the registry's release order. Rollback:
+   `supabase/rollbacks/20261105057010_upload_consent.down.sql`. It is required before `hold-only` or `enforce`:
+   both fail closed (503) when the store is unreadable.
+3. Containment (below) only after step 2.
 
 ## 1. Identify the cohort (metadata only)
 
@@ -100,8 +108,8 @@ Inserting holds has no effect while the flag is off.
 
 ## 3. LIVE: turn on enforcement for holds only
 
-- Hosted ingest Worker: `INGEST_UPLOAD_CONSENT=hold-only`. This is a deploy-time variable, so it goes
-  through the normal reviewed deploy with Khaliq's OK.
+- Hosted ingest Worker: stack input `sessionIngest.uploadConsent: "hold-only"`, through the normal
+  reviewed deploy with Khaliq's OK.
 - Self-host: `INGEST_UPLOAD_CONSENT=hold-only` in the pipeline image's environment. Self-host operators
   pull it with the release.
 - An invalid value refuses startup (fail-closed and loud), never "off".

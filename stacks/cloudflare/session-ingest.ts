@@ -174,6 +174,14 @@ export interface SessionIngestInputs {
    * only (no queue, no binding). Omit for off (the Worker default; no var rendered, vars byte-identical to before).
    */
   claimTimeoutBusy?: "on";
+  /**
+   * INGEST_UPLOAD_CONSENT (src/session-ingest/upload-consent.ts, docs/upload-consent.md): server-owned upload
+   * consent. "report" logs what would be held and never refuses (also when the consent store is unreadable);
+   * "hold-only" refuses principals under a containment hold; "enforce" refuses every upload without a
+   * confirmed choice. Needs migration 20261105057010 applied first for anything but report. Omit for off
+   * (no var rendered, vars byte-identical to before).
+   */
+  uploadConsent?: "report" | "hold-only" | "enforce";
 }
 
 /** The stack's async admission setting (the runtime var has the same values; absent there = "off"). */
@@ -203,7 +211,7 @@ const AUTHORITY_ENV_KEYS = [
   "INGEST_AUTHORITY_EXPECT_AUTH_EPOCH",
   "INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY",
 ] as const;
-const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy"];
+const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "uploadConsent"];
 
 function validAuthorityKeyRoot(value: unknown): value is string {
   if (typeof value !== "string" || !/^96bulls\/[A-Za-z0-9][A-Za-z0-9_/-]{0,151}$/.test(value) || value.endsWith("/")) return false;
@@ -308,6 +316,8 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
     refuse('sessionIngest.claimLockBusy must be "on" (omit for off)');
   if (v.claimTimeoutBusy !== undefined && v.claimTimeoutBusy !== "on")
     refuse('sessionIngest.claimTimeoutBusy must be "on" (omit for off)');
+  if (v.uploadConsent !== undefined && v.uploadConsent !== "report" && v.uploadConsent !== "hold-only" && v.uploadConsent !== "enforce")
+    refuse('sessionIngest.uploadConsent must be "report", "hold-only" or "enforce" (omit for off)');
 }
 
 /** A producer binding to a queue this stack does not own (no state row: never created, changed or deleted here). */
@@ -342,6 +352,7 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     ...(p.syncAdmissionFrozenReceipt === "on" ? { INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: "on" } : {}),
     ...(p.claimLockBusy === "on" ? { INGEST_CLAIM_LOCK_BUSY: "on" } : {}),
     ...(p.claimTimeoutBusy === "on" ? { INGEST_CLAIM_TIMEOUT_BUSY: "on" } : {}),
+    ...(p.uploadConsent ? { INGEST_UPLOAD_CONSENT: p.uploadConsent } : {}),
   };
 }
 

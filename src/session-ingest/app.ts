@@ -882,9 +882,16 @@ export function createIngestApp(deps: IngestAppDeps) {
       // A replay or a stale one may follow an attempt whose consent write failed (or a newer control that
       // landed first), but must never overwrite an allow the person confirmed since: it denies only sessions
       // with no decision yet (revision-checked).
-      if (!input.enabled && deps.uploadConsent && deps.uploadConsent.enforcement !== "off")
-        await recordSelectionDeny(deps.uploadConsent, selection.tenant, input.origin_id,
-          input.sessions.map((x) => ({ source: x.source, sessionId: x.session_id })), controlAck !== undefined && controlAck.outcome !== "applied");
+      if (!input.enabled && deps.uploadConsent && deps.uploadConsent.enforcement !== "off") {
+        try {
+          await recordSelectionDeny(deps.uploadConsent, selection.tenant, input.origin_id,
+            input.sessions.map((x) => ({ source: x.source, sessionId: x.session_id })), controlAck !== undefined && controlAck.outcome !== "applied");
+        } catch (error) {
+          // Report never refuses: the deletion fence already applied; only the consent record is missing.
+          if (deps.uploadConsent.enforcement !== "report") throw error;
+          emit({ route: "upload_consent_refused", error_code: "upload_consent_store_unavailable", state: "reported", stage: "delivery.sessions.selection", org_id: identity.orgId });
+        }
+      }
       emit({ route: "delivery.sessions.selection", outcome: controlAck?"control_"+controlAck.outcome:input.enabled ? "enabled" : "disabled", org_id: identity.orgId, count: input.sessions.length });
       return c.json({ updated: true,...(controlAck?{control:controlAck}:{}) });
     } catch (error) {
