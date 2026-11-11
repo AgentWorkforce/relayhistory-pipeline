@@ -56,8 +56,11 @@
     // "1" serves GET /v1/digest/daily (lane F4). Its narrative also needs the
     // DIGEST_NARRATIVE service binding (wrangler.digest-narrative.jsonc), added at activation.
     "READ_API_DIGEST_ENABLED": "",
-    // Exactly "true" serves GET /v1/coordination/overlaps. Empty is an explicit 404.
-    "READ_API_COORDINATION_OVERLAPS_ENABLED": "",
+    // Exactly "true" serves GET /v1/coordination/overlaps; any other value is an explicit 404.
+    // On for the hosted read API (Khaliq, 2026-11-10: the detector runs; the dashboard's
+    // Overlaps view is a separate, default-off dashboard setting). Read-only, workspace-scoped,
+    // computed on request from existing ClickHouse facts; no migration on this backend.
+    "READ_API_COORDINATION_OVERLAPS_ENABLED": "true",
     // The brief-titles allowlist (F2, GET /v1/sessions/titles). Empty = every workspace gets
     // 501 brief_titles_workspace_not_enabled; "*" = all; else comma-separated workspace ids.
     // The deploy workflow sets it from vars.SESSION_READ_BRIEF_TITLES_WORKSPACES (unset = empty).
