@@ -218,9 +218,11 @@ treats it as a **502** from ingest and keeps polling. The same applies to `compl
   so future uploads stay refused; unreadability/completion is not claimed. The cap is 64 and
   is raised only by a reviewed change. An ambiguous or oversized alias closure instead refuses
   before any receipt/fence write.
-- Completion is asynchronous. S3 and ClickHouse deletes are eventually consistent, and staged objects sit
-  outside the session prefix and wait for the staged window, so **a 202 can last up to about 48 h**.
-  Control polls GET; ingest never pushes.
+- Completion is asynchronous. Control polls GET; ingest never pushes. Ambiguous or crashed writer
+  obligations have no age-based expiry, so there is no fixed completion deadline. The initial synchronous
+  runtime returns a distinct retryable `staged_objects_require_drain` failure on its first mixed-stage scan;
+  it does not leave that receipt in an endless pending loop or delete another session's staged payload.
+  Repeat DELETE after the separately approved upstream drain or stopped-writer recovery (runtime runbook).
 - Membership is never touched, and ingest never calls Control.
 
 ## 8. Plan
@@ -231,7 +233,7 @@ Lanes (supersede the six-PR split in the research plan):
 | --- | --- | --- |
 | **A** | this contract and the 501 stub route (this PR) | `SESSION_ERASE_API_ENABLED` |
 | **B** | SQL. **M1, slot 050000:** `session_erasure_receipts`, `session_erasure_events`, `session_erasure_fences`, and `ingest_operator_erase_session` (owner-only internal helper), plus the receipt read function for ingest. **M2, slot 050010:** the session-fence check in claim, commit and index | `SESSION_ERASE_FENCE_ENFORCED` (M2) |
-| **C** | **self-host S3 byte eraser:** deletes the per-session prefix and the staged objects outside it, verifies the delete (lists every version), reports counts | `SESSION_ERASE_BYTES_ENABLED` |
+| **C** | **self-host S3 byte eraser:** deletes every per-session version and marker, verifies absence and reports counts; mixed staged namespaces require their own drain protocol | `SESSION_ERASE_BYTES_ENABLED` |
 | **D** | orchestrator and per-store steps (search, buffered rows, staged objects, transcript bytes, analysis, large-read, verification of trigger-driven stores) | `SESSION_ERASE_BYTES_ENABLED` |
 
 **Prefix safety (lanes C and D).** A decoded id may contain `/` or be `..`-shaped. Byte deletion derives
@@ -256,12 +258,13 @@ are already live, so the stack default is not dormancy.
 
 ## 9. Risks
 
-- **M2 is on the hot upload path.** A regression blocks every upload. It ships behind
-  `SESSION_ERASE_FENCE_ENFORCED` with function-boundary lane tests.
-- **Self-host byte erasure.** There was no self-host byte eraser; it is now in v1 scope as lane C. Until
-  it ships, a self-host receipt cannot reach `completed`; it stays `in_progress` with `unreadable: true`.
-- **Completion is async** (up to about 48 h). Control must present `unreadable` and `completed` as
-  different states.
+- **M2 is on the hot upload path.** A regression can block uploads. Installed SQL fences and the
+  constant shared writer gate persist independently of app flags. `SESSION_ERASE_FENCE_ENFORCED`
+  binds the additional app/consumer/read guards; function-boundary and native concurrency tests cover both.
+- **Self-host byte erasure.** The versioned S3 worker is implemented behind its default-off flag.
+  Only configured, authorized activation can produce a completed self-host receipt after absence proofs.
+- **Completion is async.** A stopped-writer proof or upstream drain can require operator intervention.
+  Control must present `unreadable`, `failed` and `completed` as different states.
 - **Owner count is unbounded.** Capped with a retryable 503 (section 7).
 - **Configuration error blast radius.** The hosted secrets are Secrets Store values another team can
   rotate without a deploy, so an invalid flag value or secret is isolated: the Worker logs
