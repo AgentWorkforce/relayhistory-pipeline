@@ -9,7 +9,7 @@ import { FakeS3Versions } from "../../migration/__tests__/fake-s3-versions.ts";
 import { STAGED_ERASE_AFTER_MS } from "../../migration/neon-s3-erasure/job.ts";
 import { liveMachineId } from "../../session-ingest/writer.ts";
 import { stagedKey } from "../../session-ingest/staging.ts";
-import { assertAllowed, eraseSessionBytes, planTargets, STAGED_MIN_AGE_MS, SessionEraseRefused, type SessionEraseBytesRequest } from "../selfhost-eraser.ts";
+import { assertAllowed, eraseDiscoveredSessionBytes, eraseSessionBytes, planDiscoveryTargets, planTargets, STAGED_MIN_AGE_MS, SessionEraseRefused, type SessionEraseBytesRequest } from "../selfhost-eraser.ts";
 import { exitCodeForError, exitCodeForResult, requestPathFrom, runSessionEraseBytes, sessionEraseBytesEnabled } from "../selfhost-eraser-main.ts";
 
 const ROOT = "96bulls", ORG = "org-a", WS = "ws-1", SRC = "claude-code", SID = "sess:one/a";
@@ -65,6 +65,70 @@ function marker(s: FakeS3Versions, key: string, at: number) {
 }
 const opts = (extra: Record<string, unknown> = {}) => ({ keyRoot: ROOT, bucket: "b", now: () => NOW, log: () => {}, ...extra });
 const survivors = (s: FakeS3Versions) => NEIGHBOURS.every((k) => s.keys.has(k));
+
+describe("automatic byte discovery", () => {
+  const key = { orgId: ORG, workspaceId: WS, source: SRC, sessionId: "session-1" };
+  const dir = (machine: string, date: string, sid = key.sessionId, ws = WS, src = SRC) =>
+    `${ROOT}/${ORG}/v1/ws=${ws}/m=${machine}/h=${src}/d=${date}/s=${sid}/`;
+  const pointer = `${ROOT}/${ORG}/live-sessions/v1/ws=${WS}/m=unindexed/h=${SRC}/s=${key.sessionId}.json`;
+  const generation = `${ROOT}/${ORG}/upload-generations/g=01234567-1234-4234-8234-0123456789ab/v1/ws=${WS}/m=unindexed/h=${SRC}/d=2026/11/01/s=${key.sessionId}/publications/p/manifest.json`;
+
+  test("discovers unindexed machines, old dates and publication generations; exact neighbours survive", async () => {
+    const s = new FakeS3Versions(); s.pageSize = 2;
+    const doomed = [dir("unindexed", "2025/01/01") + "raw/one", dir(M, "2026/11/02") + "manifest.json", generation, pointer];
+    const kept = [dir(M, "2026/11/02", "session-10") + "manifest.json", dir(M, "2026/11/02", key.sessionId, "ws-2") + "manifest.json",
+      dir(M, "2026/11/02", key.sessionId, "other-source") + "manifest.json", pointer.replace("session-1.json", "session-10.json"),
+      generation.replace("ws=ws-1", "ws=ws-2"), `${ROOT}/org-b/v1/ws=${WS}/m=${M}/h=${SRC}/d=2026/11/01/s=session-1/manifest.json`];
+    for (const k of [...doomed, ...kept]) { s.put(k, OLD); s.put(k, OLD + 1); marker(s, k, OLD + 2); }
+    const r = await eraseDiscoveredSessionBytes(s.eraser(), key, opts());
+    expect(r).toMatchObject({ verified: true, transcriptObjects: 3, pointerObjects: 1, versionsDeleted: 12 });
+    for (const k of doomed) expect(s.count(k)).toBe(0);
+    for (const k of kept) expect(s.count(k)).toBe(3);
+    expect(s.deletes.findIndex((d) => d.startsWith(pointer))).toBeGreaterThan(s.deletes.findIndex((d) => d.startsWith(generation)));
+    expect((await eraseDiscoveredSessionBytes(s.eraser(), key, opts())).versionsDeleted).toBe(0);
+  });
+
+  test("dry run counts only matching scopes and never claims verification", async () => {
+    const s = new FakeS3Versions();
+    s.put(dir(M, "2026/11/01") + "manifest.json", OLD);
+    s.put(dir(M, "2026/11/01", "session-10") + "manifest.json", OLD);
+    const r = await eraseDiscoveredSessionBytes(s.eraser(), key, opts({ dryRun: true }));
+    expect(r).toMatchObject({ verified: false, transcriptObjects: 1, versionsDeleted: 1 });
+    expect(s.deletes).toEqual([]);
+  });
+
+  test("a late write found by the fresh verification pass prevents completion", async () => {
+    const s = new FakeS3Versions(); const base = s.eraser();
+    const raw = dir(M, "2026/11/01") + "raw/late";
+    let inserted = false;
+    const r = await eraseDiscoveredSessionBytes({ ...base, async eraseStep(prefix, options) {
+      if (!inserted && options.scope.endsWith(":verify")) { inserted = true; s.put(raw, NOW); }
+      return base.eraseStep(prefix, options);
+    } }, key, opts());
+    expect(r.verified).toBe(false);
+    expect(s.count(raw)).toBe(1);
+  });
+
+  test("a partial workspace scan cannot verify zero, even when it has not yet reached the session", async () => {
+    const s = new FakeS3Versions(); s.pageSize = 1;
+    for (let i = 0; i < 105; i++) s.put(dir("aaa", "2026/11/01", `other-${String(i).padStart(3, "0")}`) + "manifest.json", OLD);
+    const raw = dir("zzz", "2026/11/01") + "manifest.json"; s.put(raw, OLD);
+    const r = await eraseDiscoveredSessionBytes(s.eraser(), key, opts({ maxRunsPerTarget: 1 }));
+    expect(r).toMatchObject({ verified: false, incompleteTargets: 1, deferredPointerTargets: 1 });
+    expect(s.count(raw)).toBe(1);
+    expect((await eraseDiscoveredSessionBytes(s.eraser(), key, opts({ maxRunsPerTarget: 3 }))).verified).toBe(true);
+  });
+
+  test("lossy or dot-shaped identifiers are refused before listing; discovery guards reject sibling deletes", async () => {
+    const s = new FakeS3Versions();
+    for (const id of ["a:b", "a/b", "../neighbour", ".hidden"])
+      await expect(eraseDiscoveredSessionBytes(s.eraser(), { ...key, sessionId: id }, opts())).rejects.toMatchObject({ code: "discovery_key_ambiguous" });
+    const targets = planDiscoveryTargets(key, opts());
+    expect(() => assertAllowed(targets, [dir(M, "2026/11/01", "session-10") + "manifest.json"])).toThrow();
+    expect(() => assertAllowed(targets, [dir(M, "2026/11/01") + "../other"])).toThrow();
+    expect(s.deletes).toEqual([]);
+  });
+});
 
 describe("self-host session byte eraser", () => {
   test("deletes every version and delete marker of every transcript dir, the live pointer and the staged objects, then verifies", async () => {

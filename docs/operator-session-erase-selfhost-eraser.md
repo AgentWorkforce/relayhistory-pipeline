@@ -11,6 +11,23 @@ fences) is lane B.
   `docs/selfhost-composition.md`)
 - Tests: `src/session-erase/__tests__/selfhost-eraser.test.ts`
 
+The automatic orchestrator can use `eraseDiscoveredSessionBytes(eraser, key, options)`.
+This scans strict version inventories for all machines and dates in the requested
+workspace and the organization's upload generations, selecting only that exact
+source and session. It finds uploads whose manifest event has not been indexed,
+old date directories and publication generations without reading transcript
+objects. The S3 role still needs only version listing and version deletion.
+
+The caller must commit the session fence and drain outstanding writes first.
+Discovery refuses identifiers changed by the legacy, lossy layout encoder
+(`discovery_key_ambiguous`); it must never erase a neighbour that maps to the same
+directory. An incomplete discovery or verification scan remains pending. Large
+inventories use bounded continuations of the shared strict paged primitive,
+including a fresh pass with deletion disabled to prove zero matching versions.
+The existing location-based CLI remains available with its original scope and
+staged-object age rules. Neither library entry enables itself; the automatic
+caller must enforce `SESSION_ERASE_BYTES_ENABLED=1`.
+
 Default off. `SESSION_ERASE_BYTES_ENABLED` must be exactly `1`. Unset, empty or
 `0` returns `{"enabled":false}` before any config, credential or request is
 read and before the store is touched. Any other value (including `true`) fails
