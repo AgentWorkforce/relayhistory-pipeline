@@ -209,7 +209,7 @@ describe("desktop-upload role", () => {
     const trust = desktopUploadTrustPolicy({ controlRoleArn }).Statement;
     expect(trust).toHaveLength(1);
     expect(trust[0]!.Principal).toEqual({ AWS: controlRoleArn });
-    expect([...trust[0]!.Action].sort()).toEqual(["sts:AssumeRole", "sts:SetSourceIdentity"]);
+    expect([...trust[0]!.Action].sort()).toEqual(["sts:AssumeRole", "sts:SetSourceIdentity", "sts:TagSession"]);
     expect(trust[0]!.Condition).toEqual({ Null: { "sts:SourceIdentity": "false" } });
   });
 

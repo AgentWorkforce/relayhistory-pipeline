@@ -96,7 +96,11 @@ export function uploadInboxNames(stage: string, accountId: string, region: strin
 export const uploadInboxObjects = (bucketArn: string) => `${bucketArn}/${UPLOAD_INBOX_PREFIX}*`;
 const keyArnPattern = (region: string, accountId: string) => `arn:aws:kms:${region}:${accountId}:key/*`;
 
-/** Only relay-control's role, and only while stamping a source identity on the session. */
+/**
+ * Only relay-control's role, and only while stamping a source identity on the session.
+ * sts:TagSession is required because EKS Pod Identity supplies transitive session tags,
+ * which must be accepted when relay-control chains into this role.
+ */
 export function desktopUploadTrustPolicy(i: { controlRoleArn: string }) {
   return {
     Version: "2012-10-17" as const,
@@ -105,7 +109,7 @@ export function desktopUploadTrustPolicy(i: { controlRoleArn: string }) {
         Sid: "RelayControlAssumesWithSourceIdentity",
         Effect: "Allow" as const,
         Principal: { AWS: i.controlRoleArn },
-        Action: ["sts:AssumeRole", "sts:SetSourceIdentity"],
+        Action: ["sts:AssumeRole", "sts:SetSourceIdentity", "sts:TagSession"],
         Condition: { Null: { "sts:SourceIdentity": "false" } },
       },
     ],
