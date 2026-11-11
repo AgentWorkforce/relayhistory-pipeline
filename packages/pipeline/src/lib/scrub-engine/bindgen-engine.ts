@@ -5,7 +5,8 @@
  *
  * Node / Bun load sequence (`initBindgenScrubEngine`), every step fail-closed with a
  * named `ScrubEngineUnavailable` reason:
- *   1. parse the pin; every placeholder, empty or malformed value is refused;
+ *   1. parse the pin; every placeholder, empty or malformed value is refused, and the
+ *      release provenance block (GitHub release tarball sha256) must be present;
  *   2. read the wasm, glue and loader bytes and copy each into a private snapshot;
  *   3. SHA-256 every snapshot and compare it to the pin, before anything is evaluated
  *      or instantiated;
@@ -49,7 +50,11 @@ import {
 export const BINDGEN_MANIFEST_SCHEMA = 3;
 export const BINDGEN_ABI_VERSION = 2;
 export const BINDGEN_PACKAGE = "@agentworkforce/relayscrubber";
-const PIN_SCHEMA = 1;
+/** Pin schema 2 adds the required `release` provenance block (schema 1 pins are refused). */
+const PIN_SCHEMA = 2;
+/** The only release source a pin may name today. */
+const RELEASE_SOURCES = new Set(["github-release"]);
+const RELEASE_KEYS = ["source", "repository", "tag", "tarball", "tarball_sha256", "sha256sums"] as const;
 
 export const BINDGEN_MANIFEST_FIELDS: readonly BindgenManifestField[] = [
   "schema",
@@ -81,9 +86,26 @@ export interface BindgenManifest {
 
 export type BindgenArtifactPaths = Readonly<Record<BindgenArtifactName, string>>;
 
+/**
+ * Where the vendored package was published, recorded at pin time. The tarball digest is
+ * the release asset's sha256 (as listed in the release's SHA256SUMS); `sha256sums` holds
+ * the other SHA256SUMS lines the pin relies on (e.g. `artifact.json`).
+ * `scripts/scrub-bindgen-provenance.ts --tarball <path>` proves the vendored bytes are
+ * exactly that tarball's `package/` entries; the runtime never reads the tarball.
+ */
+export interface ScrubBindgenRelease {
+  source: "github-release";
+  repository: string;
+  tag: string;
+  tarball: string;
+  tarball_sha256: string;
+  sha256sums: Readonly<Record<string, string>>;
+}
+
 /** `packages/pipeline/scrub-bindgen-pin.json`, validated. */
 export interface ScrubBindgenPin {
   package_version: string;
+  release: Readonly<ScrubBindgenRelease>;
   wasm_sha256: string;
   glue_sha256: string;
   loader_sha256: string;
@@ -102,6 +124,9 @@ function refuse(reason: ScrubEngineFailure): never {
 const isRealString = (v: unknown): v is string => typeof v === "string" && v.trim() !== "" && !PLACEHOLDER.test(v);
 const isDigest = (v: unknown): v is string => typeof v === "string" && HEX64.test(v) && !ZERO64.test(v);
 const isPositiveInt = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) > 0;
+/** One file name, no directory part. */
+const isBaseName = (v: unknown): v is string => isRealString(v) && !/[\\/:\0]/.test(v) && v !== "." && v !== "..";
+const isRepository = (v: unknown): v is string => isRealString(v) && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(v);
 const isPrimitive = (v: unknown) => v === null || ["string", "number", "boolean"].includes(typeof v);
 /** Relative, inside the package directory, no drive/scheme, no backslashes. */
 const isPackagePath = (v: unknown): v is string =>
@@ -116,6 +141,28 @@ export function bindgenProfile(m: Pick<BindgenManifest, "scrubProfile">): string
   return m.scrubProfile;
 }
 
+/** The pin's `release` block: exact keys, a known source, real names, 64-hex digests. */
+export function parseScrubBindgenRelease(raw: unknown): Readonly<ScrubBindgenRelease> {
+  const r = raw as Record<string, unknown> | null;
+  if (!r || typeof r !== "object" || Array.isArray(r)) return refuse("bindgen_unpinned_release");
+  const keys = Object.keys(r).sort();
+  if (keys.join(",") !== [...RELEASE_KEYS].sort().join(",")) refuse("bindgen_unpinned_release");
+  if (typeof r.source !== "string" || !RELEASE_SOURCES.has(r.source)) refuse("bindgen_unpinned_release");
+  if (!isRepository(r.repository) || !isRealString(r.tag) || !isBaseName(r.tarball)) refuse("bindgen_unpinned_release");
+  if (!isDigest(r.tarball_sha256)) refuse("bindgen_unpinned_release");
+  const sums = r.sha256sums as Record<string, unknown> | null;
+  if (!sums || typeof sums !== "object" || Array.isArray(sums) || Object.keys(sums).length === 0) return refuse("bindgen_unpinned_release");
+  for (const [name, digest] of Object.entries(sums)) if (!isBaseName(name) || !isDigest(digest)) refuse("bindgen_unpinned_release");
+  return Object.freeze({
+    source: "github-release",
+    repository: r.repository as string,
+    tag: r.tag as string,
+    tarball: r.tarball as string,
+    tarball_sha256: r.tarball_sha256 as string,
+    sha256sums: Object.freeze({ ...(sums as Record<string, string>) }),
+  });
+}
+
 /** Validate the pin. Every placeholder or malformed value has its own named reason. */
 export function parseScrubBindgenPin(raw: unknown, maximum = DEFAULT_READER_MAX_RULESET): ScrubBindgenPin {
   const p = raw as Record<string, unknown> | null;
@@ -123,6 +170,7 @@ export function parseScrubBindgenPin(raw: unknown, maximum = DEFAULT_READER_MAX_
     refuse("bindgen_pin_invalid");
   const pin = p as Record<string, unknown>;
   if (!isRealString(pin.package_version)) refuse("bindgen_unpinned_package_version");
+  const release = parseScrubBindgenRelease(pin.release);
   for (const name of ARTIFACTS) if (!isDigest(pin[`${name}_sha256`])) refuse(`bindgen_unpinned_${name}_sha256`);
   const paths = pin.paths as Record<string, unknown> | null;
   if (!paths || typeof paths !== "object" || ARTIFACTS.some((name) => !isPackagePath(paths[name])))
@@ -147,6 +195,7 @@ export function parseScrubBindgenPin(raw: unknown, maximum = DEFAULT_READER_MAX_
   if (pin.scrub_profile !== bindgenProfile(manifest)) refuse("bindgen_pin_profile_inconsistent");
   return Object.freeze({
     package_version: pin.package_version as string,
+    release,
     wasm_sha256: pin.wasm_sha256 as string,
     glue_sha256: pin.glue_sha256 as string,
     loader_sha256: pin.loader_sha256 as string,
@@ -161,8 +210,13 @@ function pinKey(pin: ScrubBindgenPin): string {
   const manifest = Object.keys(pin.manifest)
     .sort()
     .map((k) => [k, pin.manifest[k]]);
+  const sums = Object.keys(pin.release.sha256sums)
+    .sort()
+    .map((k) => [k, pin.release.sha256sums[k]]);
+  const { source, repository, tag, tarball, tarball_sha256 } = pin.release;
   return JSON.stringify([
     pin.package_version,
+    [source, repository, tag, tarball, tarball_sha256, sums],
     pin.wasm_sha256,
     pin.glue_sha256,
     pin.loader_sha256,

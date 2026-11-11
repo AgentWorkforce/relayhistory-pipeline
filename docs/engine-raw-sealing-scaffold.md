@@ -1,11 +1,18 @@
 # Injected-engine raw sealing scaffold
 
-This is a default-off source scaffold. It does not install an artifact, select a
-Rust engine in production, or qualify an image. `SCRUB_ENGINE=wasm-bindgen` still
-refuses production raw sealing with `seal_path_not_routed`. Both artifact pins
-and every existing technical-foul manifest/digest/version table stay unchanged.
-A separate qualified cutover must add its own provenance entry for the new sealer
-and the exact artifact; it must not relabel the historical TypeScript manifest.
+Status (cutover, pinned to relayscrubber `0.5.0-alpha.5`; first routed with `0.5.0-alpha.4`): the sealer is now routed in production, opt-in only.
+Under `SCRUB_ENGINE=wasm-bindgen` + `SCRUB_ENGINE_REQUIRED=wasm-bindgen` +
+`READER_MAX_RULESET=10`, `routedRawChunkSealer()` in `scrub-engine/index.ts` binds
+this sealer to the verified relayscrubber `0.5.0-alpha.5` instance and the four
+production constructors inject it (see docs/scrub-engine.md, "Cutover: pinned
+relayscrubber 0.5.0-alpha.5"). The seam's own `sealRawChunk` still refuses non-TS
+engines with `seal_path_not_routed`, so an unwired call site refuses. With the
+default (unset/`ts`) nothing here is reached. The cutover's provenance is the new
+`packages/pipeline/technical-foul-cutover.json` entry; the historical TypeScript
+manifest (`technical-foul.json`) and `raw-chunks.ts` are unchanged. It does not
+qualify an image; image qualification and live acceptance remain separate.
+
+The original scaffold description follows.
 
 `bindEngineRawSealer` captures a concrete healthy wasm-bindgen engine and an
 explicit `same-family-up-to-writer` retained-object policy. Callers install the
@@ -76,8 +83,10 @@ is retryable. Publication capture reserves roughly 400 bytes below its 16 MiB
 limit for framing; the injected sealer can therefore be refused at that capture
 bound before the raw sealer's 64 MiB capacity.
 
-Cutover decisions still outstanding: output records may expand beyond 16 MiB;
-structural test-engine injection does not prove every production port is bound
-to the exact verified instance; publication-job.ts does not yet route a sealer.
-The image context excludes packages/pipeline/test, including synthetic engine
-fixtures. No artifact pin or production selector changes in this follow-up.
+Cutover decisions: output records may expand beyond 16 MiB (still the 64 MiB
+staging bound above; open). Production binding to the exact verified instance is
+now proven by `src/session-ingest/__tests__/scrub-cutover-reachability.test.ts`
+(real wasm, all four ports, zero TS calls). `publication-job.ts` now forwards
+`deps.rawChunkSealer`. The image context excludes packages/pipeline/test,
+including synthetic engine fixtures; the vendored package under
+`packages/pipeline/scrub-bindgen/` is included.

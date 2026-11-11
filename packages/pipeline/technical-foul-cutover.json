@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "entry": "cutover-relayscrubber-0.5.0-alpha.5",
+  "engine": "wasm-bindgen",
+  "envTriple": {
+    "SCRUB_ENGINE": "wasm-bindgen",
+    "SCRUB_ENGINE_REQUIRED": "wasm-bindgen",
+    "READER_MAX_RULESET": "10"
+  },
+  "package": "@agentworkforce/relayscrubber",
+  "packageVersion": "0.5.0-alpha.5",
+  "pinPath": "packages/pipeline/scrub-bindgen-pin.json",
+  "pinFileSha256": "000883bf1f4c5c06f8c5c1b670f83a0c33d4a3380d91be046faa80acb6dbbbc4",
+  "release": {
+    "source": "github-release",
+    "repository": "AgentWorkforce/relayscrubber",
+    "tag": "v0.5.0-alpha.5",
+    "tarball": "agentworkforce-relayscrubber-0.5.0-alpha.5.tgz",
+    "tarball_sha256": "bc4101df467ba520e16b8b8d766c63a9017631a6551a369ee100b34e47de441b",
+    "sha256sums": {
+      "artifact.json": "4ba0f5210995e8db20ba361235ed43ceb777309ac946567885a8805f286f0010"
+    }
+  },
+  "pinDigests": {
+    "wasm": "91cf23177f1d9fa42484f4ce76b54bdd468177852b9e8b259af0b72ad5823f4d",
+    "glue": "55dd6fc6a44ed35f846655ab08bf3161ffe105123cbe11d3e529923d6bdeae5b",
+    "loader": "ff139ab391a958475b455ef483e7119d66215d172647223965dc35348f912490"
+  },
+  "scrubProfile": "relayhistory-secrets-v10",
+  "crateManifest": {
+    "schema": 3,
+    "ruleset": "relayhistory-scrub",
+    "rulesetVersion": 10,
+    "rulesetSourceSha256": "bd7d6620626ef40b4c319fa6260bb42ddb20035301ad974332a13453835563f5",
+    "crateVersion": "0.5.0-alpha.5",
+    "abiVersion": 2,
+    "policy": "secrets",
+    "redactionToken": "[REDACTED]",
+    "scrubProfile": "relayhistory-secrets-v10"
+  },
+  "toolchain": {
+    "rust": "1.88.0",
+    "wasmBindgen": "0.2.104"
+  },
+  "artifactJsonSha256": "4ba0f5210995e8db20ba361235ed43ceb777309ac946567885a8805f286f0010",
+  "vendoredFiles": {
+    "index.js": "ff139ab391a958475b455ef483e7119d66215d172647223965dc35348f912490",
+    "index.d.ts": "c94dd2a4f8596f4f7f8c27a51d0b9bfa7b8594615cf2576a22beb5a697db1980",
+    "generated/relayscrubber.js": "55dd6fc6a44ed35f846655ab08bf3161ffe105123cbe11d3e529923d6bdeae5b",
+    "generated/relayscrubber.d.ts": "2c20949933851d1c100f690b0fd35338040616951404a0a1ed8d98c664304441",
+    "generated/relayscrubber_bg.wasm": "91cf23177f1d9fa42484f4ce76b54bdd468177852b9e8b259af0b72ad5823f4d",
+    "generated/relayscrubber_bg.wasm.d.ts": "27183d892b07da18aebd7cf06362ccb64b10019f84ecec926f070687903e84b1",
+    "generated/artifact.json": "4ba0f5210995e8db20ba361235ed43ceb777309ac946567885a8805f286f0010"
+  },
+  "sealerSources": {
+    "packages/pipeline/src/lib/pipeline/engine-raw-chunks.ts": "20a069f28960b06c2e2094f143b7638f2d1160d8dc0624e3d071269298220c2a",
+    "packages/pipeline/src/lib/scrub-engine/bindgen-engine.ts": "6a4d19ac3558c266158e5b033f4ae4c50cbd313e3513ce088f51391ca53a43de",
+    "packages/pipeline/src/lib/scrub-engine/bindgen-admission.ts": "ecf1fa15513369f37bcd8ee899cfd9bc487d98a7bb1b33ee5bb5717c379a3422",
+    "packages/pipeline/src/lib/scrub-engine/index.ts": "a387f01d49451e8d2752ce0c16997755813395770fa0f1da27051e7b870218aa"
+  },
+  "tsReference": {
+    "manifestPath": "packages/pipeline/technical-foul.json",
+    "manifestSha256": "19a23f3a538678deef5d8b4ddfca4ed4dd3697ec589349227dfad1b6502b6d93",
+    "rulesetVersion": 8,
+    "rulesetSourceSha256": "50c2e0c67395f488a308cbcfc7c945606374b3d67d37138e284849c6190c8214",
+    "rawChunksPath": "packages/pipeline/src/lib/pipeline/raw-chunks.ts",
+    "rawChunksSha256": "69986b6bd88b1b7aa8997cff07452ed3ea21ad97ddaa807638d8ce599baf656d"
+  }
+}

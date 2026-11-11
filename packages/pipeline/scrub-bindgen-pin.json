@@ -1,26 +1,35 @@
 {
-  "schema": 1,
+  "schema": 2,
   "package": "@agentworkforce/relayscrubber",
-  "package_version": "UNPINNED",
-  "wasm_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-  "glue_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
-  "loader_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "package_version": "0.5.0-alpha.5",
+  "release": {
+    "source": "github-release",
+    "repository": "AgentWorkforce/relayscrubber",
+    "tag": "v0.5.0-alpha.5",
+    "tarball": "agentworkforce-relayscrubber-0.5.0-alpha.5.tgz",
+    "tarball_sha256": "bc4101df467ba520e16b8b8d766c63a9017631a6551a369ee100b34e47de441b",
+    "sha256sums": {
+      "artifact.json": "4ba0f5210995e8db20ba361235ed43ceb777309ac946567885a8805f286f0010"
+    }
+  },
+  "wasm_sha256": "91cf23177f1d9fa42484f4ce76b54bdd468177852b9e8b259af0b72ad5823f4d",
+  "glue_sha256": "55dd6fc6a44ed35f846655ab08bf3161ffe105123cbe11d3e529923d6bdeae5b",
+  "loader_sha256": "ff139ab391a958475b455ef483e7119d66215d172647223965dc35348f912490",
   "paths": {
     "wasm": "generated/relayscrubber_bg.wasm",
     "glue": "generated/relayscrubber.js",
     "loader": "index.js"
   },
-  "scrub_profile": "UNPINNED",
+  "scrub_profile": "relayhistory-secrets-v10",
   "manifest": {
     "schema": 3,
-    "ruleset": "UNPINNED",
-    "rulesetVersion": 0,
-    "rulesetSourceSha256": "0000000000000000000000000000000000000000000000000000000000000000",
-    "crateVersion": "UNPINNED",
-    "abiVersion": 0,
-    "policy": "UNPINNED",
-    "redactionToken": "UNPINNED",
-    "scrubProfile": "UNPINNED"
-  },
-  "placeholder": "PLACEHOLDER: no relayscrubber wasm-bindgen package has a security PASS yet. The bindgen loader refuses this pin (all-zero digests, UNPINNED strings, zero versions) until the cutover PR replaces every value with the reviewed package's. docs/scrub-engine.md, wasm-bindgen path"
+    "ruleset": "relayhistory-scrub",
+    "rulesetVersion": 10,
+    "rulesetSourceSha256": "bd7d6620626ef40b4c319fa6260bb42ddb20035301ad974332a13453835563f5",
+    "crateVersion": "0.5.0-alpha.5",
+    "abiVersion": 2,
+    "policy": "secrets",
+    "redactionToken": "[REDACTED]",
+    "scrubProfile": "relayhistory-secrets-v10"
+  }
 }

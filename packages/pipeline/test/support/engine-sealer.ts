@@ -17,7 +17,7 @@ export async function verifiedFixtureEngine(records: () => {text:string;recordCo
  const enc=new TextEncoder(),bytes={wasm:enc.encode('synthetic wasm'),glue:enc.encode('synthetic glue'),loader:enc.encode('synthetic loader')};
  const sha=(b:Uint8Array)=>createHash('sha256').update(b).digest('hex');
  const manifest={schema:3,ruleset:'relayhistory-scrub',rulesetVersion:10,rulesetSourceSha256:'a'.repeat(64),crateVersion:'0.0.0-test',abiVersion:2,policy:'secrets',redactionToken:'[REDACTED]',scrubProfile:'fixture-v10'};
- const pin={schema:1,package:'@agentworkforce/relayscrubber',package_version:manifest.crateVersion,wasm_sha256:sha(bytes.wasm),glue_sha256:sha(bytes.glue),loader_sha256:sha(bytes.loader),paths:{wasm:'test.wasm',glue:'test.js',loader:'index.js'},scrub_profile:manifest.scrubProfile,manifest};
+ const pin={schema:2,package:'@agentworkforce/relayscrubber',package_version:manifest.crateVersion,release:{source:'github-release',repository:'AgentWorkforce/relayscrubber',tag:'v0.0.0-test',tarball:'test.tgz',tarball_sha256:'e'.repeat(64),sha256sums:{'artifact.json':'f'.repeat(64)}},wasm_sha256:sha(bytes.wasm),glue_sha256:sha(bytes.glue),loader_sha256:sha(bytes.loader),paths:{wasm:'test.wasm',glue:'test.js',loader:'index.js'},scrub_profile:manifest.scrubProfile,manifest};
  const engine=await initScrubEngine({env:{SCRUB_ENGINE:'wasm-bindgen',READER_MAX_RULESET:'10'},bindgen:{pin,readArtifact:async name=>bytes[name],importGlue:async()=>({default:async()=>({}),manifestJson:()=>JSON.stringify(manifest),scrubTextChecked:(s:string)=>s,scrubJson:(s:string)=>JSON.stringify({jsonText:s}),scrubRecords:()=>JSON.stringify(records())})}});
  return engine as ScrubEngine&{readonly failed:boolean};
 }

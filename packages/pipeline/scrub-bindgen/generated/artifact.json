@@ -1,0 +1,26 @@
+{
+  "schema": 1,
+  "toolchain": "1.88.0",
+  "wasmBindgen": "0.2.104",
+  "manifest": {
+    "schema": 3,
+    "ruleset": "relayhistory-scrub",
+    "rulesetVersion": 10,
+    "rulesetSourceSha256": "bd7d6620626ef40b4c319fa6260bb42ddb20035301ad974332a13453835563f5",
+    "crateVersion": "0.5.0-alpha.5",
+    "abiVersion": 2,
+    "policy": "secrets",
+    "redactionToken": "[REDACTED]",
+    "scrubProfile": "relayhistory-secrets-v10"
+  },
+  "files": {
+    "relayscrubber_bg.wasm": "91cf23177f1d9fa42484f4ce76b54bdd468177852b9e8b259af0b72ad5823f4d",
+    "relayscrubber.js": "55dd6fc6a44ed35f846655ab08bf3161ffe105123cbe11d3e529923d6bdeae5b",
+    "relayscrubber.d.ts": "2c20949933851d1c100f690b0fd35338040616951404a0a1ed8d98c664304441",
+    "relayscrubber_bg.wasm.d.ts": "27183d892b07da18aebd7cf06362ccb64b10019f84ecec926f070687903e84b1"
+  },
+  "adapterFiles": {
+    "index.js": "ff139ab391a958475b455ef483e7119d66215d172647223965dc35348f912490",
+    "index.d.ts": "c94dd2a4f8596f4f7f8c27a51d0b9bfa7b8594615cf2576a22beb5a697db1980"
+  }
+}

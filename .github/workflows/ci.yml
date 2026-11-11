@@ -125,6 +125,17 @@ jobs:
           ! git ls-files | grep -E '(^|/)(\.env|inputs\.json|.*\.pem)$' || (echo "secret-like file tracked"; exit 1)
       - name: Guard - no production deployment identifiers in engine source (src, packages, scripts)
         run: bun scripts/check-engine-identifiers.ts
+      # Vendored relayscrubber bytes vs scrub-bindgen-pin.json and the release's artifact.json
+      # (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.5"). Fails on any mismatch.
+      - name: Scrub bindgen receipt (vendored relayscrubber vs pin and artifact.json)
+        run: bun scripts/scrub-bindgen-receipt.ts --out scrub-bindgen-receipt.json
+      - name: Upload the scrub bindgen receipt
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scrub-bindgen-receipt
+          path: scrub-bindgen-receipt.json
+          if-no-files-found: error
   # Keep every mutation, but give the long unit suite and mutation suite their
   # own budgets. Running both serially exceeded the old 40-minute limit.
   aws-hardening-mutations:
