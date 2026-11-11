@@ -430,6 +430,11 @@ digests and version-10 profile stay out of any bundle that imports the seam.
 Provenance checks:
 - `packages/pipeline/test/scrub-bindgen-pin-alpha8.test.ts` recomputes every vendored digest against
   the pin and `artifact.json`; mutated bytes and swapped modules fail closed.
+- `packages/pipeline/test/scrub-bindgen-reassignment-alpha8.test.ts` drives the real vendored wasm
+  through the pipeline's own binding (seam `scrubText` / `scrubLong` / `scrubJson` and the routed
+  raw-chunk sealer) and asserts that bare sensitive reassignments (`password = API_TOKEN;`,
+  `clientSecret = getSecret(input);`, `export API_KEY = cfg.apiKey;`) are redacted, while declarations
+  and non-sensitive assignments stay byte-identical. alpha.6 returned those three inputs unchanged.
 - `scripts/scrub-bindgen-receipt.ts` writes a receipt (pin digests, package version, crate manifest,
   toolchain, the pin's `release` block, timestamp, git HEAD) and exits non-zero on any mismatch. CI
   runs it in the `unit-tests` job WITHOUT `--tarball` (no network in CI) and uploads
