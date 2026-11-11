@@ -35,6 +35,7 @@
  * enforced by capture-policy.ts). No `control` (ordered-control) field is ever
  * produced here.
  */
+import { CONSENT_SCOPE } from "./upload-consent.ts";
 import {
   createRelaycontrolIntrospector,
   isRelaycontrolToken,
@@ -90,7 +91,8 @@ export function bearerOf(header: string | null | undefined): string | null {
 
 /**
  * Verify one request's bearer. Throws AuthError (401 / 403 / 503) to refuse;
- * on success the identity carries `rth:sync`.
+ * on success the identity carries `rth:sync` or `rth:consent` (callers gate every route but the
+ * upload-consent write on `rth:sync`).
  */
 export function relaycontrolIngestIdentity(config: SelfhostAuthConfig, introspector: RelaycontrolIntrospector) {
   return async (authorization: string | null | undefined): Promise<IngestIdentity> => {
@@ -112,7 +114,9 @@ export function relaycontrolIngestIdentity(config: SelfhostAuthConfig, introspec
     if (auth.historyOrigin !== config.origin || auth.migration) throw new AuthError(401, "invalid_token", "invalid or expired token");
     if (!auth.userId || !auth.orgId || !auth.workspaceId) throw new AuthError(401, "invalid_token", "invalid or expired token");
     const scopes = [...auth.scopes];
-    if (!scopes.includes(SYNC_SCOPE)) throw new AuthError(403, "forbidden", `missing required scope: ${SYNC_SCOPE}`);
+    // rth:sync, or rth:consent alone (a person's confirmed upload-consent write, upload-consent.ts, which
+    // relaycontrol mints without rth:sync). Callers serving any other route must still require rth:sync.
+    if (!scopes.includes(SYNC_SCOPE) && !scopes.includes(CONSENT_SCOPE)) throw new AuthError(403, "forbidden", `missing required scope: ${SYNC_SCOPE}`);
     // The capture policy and role (introspection v1.5) only when relaycontrol sent them (capture-policy.ts).
     return {
       userId: auth.userId, orgId: auth.orgId, workspaceId: auth.workspaceId, scopes,

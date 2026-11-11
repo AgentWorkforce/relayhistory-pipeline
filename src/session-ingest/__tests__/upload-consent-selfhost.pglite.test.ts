@@ -266,4 +266,13 @@ describe("upload consent: the baseline reproduction now stores nothing", () => {
     // ... and the confirmed choice now admits an upload from that installation.
     expect((await post(url("/v1/delivery/batches"), await deliveryBody("after-confirm"), { authorization: "Bearer sh_at_desktop-token-2" })).status).toBe(200);
   });
+
+  test("self-host: a consent-only token (no rth:sync) reaches the consent write and nothing else", async () => {
+    const rc = await relaycontrol(() => active(["rth:consent"], { role: "member" }));
+    const { url } = await start(rc, { INGEST_UPLOAD_CONSENT: "enforce" });
+    expect((await post(url("/v1/upload-consent"), JSON.stringify({ mode: "all", confirm_origins: ["origin-1"] }))).status).toBe(200);
+    const batches = await post(url("/v1/delivery/batches"), await deliveryBody("consent-only"));
+    expect([batches.status, await code(batches)]).toEqual([403, "forbidden"]);
+  });
 });
+

@@ -83,7 +83,7 @@ import { initScrubEngine, routedRawChunkSealerDeps, scrubEngineReady } from "@rh
 import { assertConditionalWrites, buildLockerStore } from "../shared/locker.ts";
 import type { ObjectStore } from "../shared/vendor.ts";
 import { AuthError } from "../session-read-api/app.ts";
-import { createIngestApp, IDENTITY_HEADER, SIGNATURE_HEADER, UPLOAD_CONSENT_PATH, type IngestIdentity } from "./app.ts";
+import { createIngestApp, IDENTITY_HEADER, SIGNATURE_HEADER, SYNC_SCOPE, UPLOAD_CONSENT_PATH, type IngestIdentity } from "./app.ts";
 import { ADMISSION_ACCEPT_VALUE, INBOX_NAMESPACE, type AdmissionMessage } from "./async-admission.ts";
 import { promoteUpload } from "./upload-admission.ts";
 import type { DeliverDeps } from "./deliver.ts";
@@ -589,6 +589,12 @@ export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null):
             ...(e.status === 503 ? { "retry-after": "1" } : {}),
             ...(e.status === 401 ? { "www-authenticate": "Bearer" } : {}),
           });
+        }
+
+        // A consent-only token (rth:consent, no rth:sync) may reach the upload-consent write and nothing else.
+        if (identity && path !== UPLOAD_CONSENT_PATH && !identity.scopes.includes(SYNC_SCOPE)) {
+          await drainSmallBody(req);
+          return sendJson(req, res, 403, envelope("forbidden", `missing required scope: ${SYNC_SCOPE}`, correlationId), { "x-correlation-id": correlationId });
         }
 
         // RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT=true (only then is the path in the route table): authenticated

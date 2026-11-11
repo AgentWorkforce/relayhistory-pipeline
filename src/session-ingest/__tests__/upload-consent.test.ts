@@ -17,13 +17,13 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { zstdDecompressSync } from "node:zlib";
 import { objectKey } from "../../shared/vendor.ts";
 import { ALLOWED_LOG_FIELDS } from "../../shared/log.ts";
-import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, parseConsentWrite, SYNC_SCOPE, UPLOAD_CONSENT_PATH } from "../app.ts";
+import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, parseConsentWrite, recordSelectionDeny, SYNC_SCOPE, UPLOAD_CONSENT_PATH } from "../app.ts";
 import { admitMessage } from "../admission-consumer.ts";
 import { ADMISSION_ACCEPT_VALUE, enqueueAdmission, type AdmissionMessage } from "../async-admission.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { deliveryAccount } from "../vendor/delivery/prepare.ts";
 import {
-  CONSENT_SCOPE, MemoryConsentStore, UPLOAD_CONSENT_METRIC, UPLOAD_CONSENT_REQUIRED, UPLOAD_CONSENT_RETRY_AFTER_SECONDS,
+  CONSENT_SCOPE, ConsentWriteRefused, MemoryConsentStore, UPLOAD_CONSENT_METRIC, UPLOAD_CONSENT_REQUIRED, UPLOAD_CONSENT_RETRY_AFTER_SECONDS,
   batchSessions, consentRefuses, decideUploadConsent, sessionKey, uploadConsentEnforcement, writeBroadens,
   type ConsentSnapshot, type UploadConsentEnforcement, type UploadConsentStore,
 } from "../upload-consent.ts";
@@ -465,9 +465,9 @@ describe("selection disables vs a confirmed allow (ordered controls)", () => {
     return consent.decisions.get(JSON.stringify([TENANT.orgId, TENANT.workspaceId, TENANT.userId]))!;
   }
 
-  test("a stale disable records nothing: the newer confirmed allow stands", async () => {
+  test("a stale disable never overwrites the newer confirmed allow, but records the deny for undecided sessions", async () => {
     const d = await disable("stale");
-    expect([d.get(sessionKey("claude", "kept")), d.get(sessionKey("claude", "other"))]).toEqual(["allow", undefined]);
+    expect([d.get(sessionKey("claude", "kept")), d.get(sessionKey("claude", "other"))]).toEqual(["allow", "deny"]);
   });
 
   test("a replayed disable never overwrites an allow, but still records the deny the first attempt may have missed", async () => {
@@ -483,7 +483,7 @@ describe("selection disables vs a confirmed allow (ordered controls)", () => {
 
 describe("the operator cap rides the admission inbox", () => {
   const T1 = T0 + 5000;
-  test("the request path writes the cap; the consumer enforces it even after the person's own policy loosens", async () => {
+  test("the request path writes the cap; the consumer enforces it even after the person's allow is withdrawn", async () => {
     const s = store();
     const consent = new MemoryConsentStore();
     await consent.apply(TENANT, { mode: "all", confirmOrigins: ["origin-1"], allow: [{ source: "claude", sessionId: "a" }] }, { trusted: true, nowMs: T0 });
@@ -524,3 +524,38 @@ describe("the operator cap rides the admission inbox", () => {
     expect((await decodeInbox("96bulls", key, zstd(encodeInbox(TENANT, prepared, T0, 0, { mode: "new", sinceMs: 5 }))))?.consentCap).toEqual({ mode: "new", sinceMs: 5 });
   });
 });
+
+describe("recordSelectionDeny (replay/stale path)", () => {
+  const sessions = [{ source: "claude", sessionId: "a" }, { source: "claude", sessionId: "b" }];
+  test("an allow that lands between the read and the write wins: CAS loss, re-read, the allowed session is skipped", async () => {
+    const inner = new MemoryConsentStore();
+    await inner.apply(TENANT, { mode: "all", confirmOrigins: ["origin-1"] }, { trusted: true, nowMs: T0 });
+    let raced = false;
+    const racing: UploadConsentStore = {
+      snapshot: inner.snapshot.bind(inner),
+      apply: async (t, w, o) => {
+        if (!raced && w.deny) { raced = true; await inner.apply(TENANT, { allow: [{ source: "claude", sessionId: "a" }] }, { trusted: true, nowMs: T0 + 1 }); }
+        return inner.apply(t, w, o);
+      },
+    };
+    await recordSelectionDeny({ enforcement: "enforce", store: racing, nowMs: () => T0 + 2 }, TENANT, "origin-1", sessions, true);
+    const d = inner.decisions.get(JSON.stringify([TENANT.orgId, TENANT.workspaceId, TENANT.userId]))!;
+    expect([d.get(sessionKey("claude", "a")), d.get(sessionKey("claude", "b"))]).toEqual(["allow", "deny"]);
+  });
+
+  test("an existing deny is left as is (no revision bump); three CAS losses in a row answer 503", async () => {
+    const inner = new MemoryConsentStore();
+    await inner.apply(TENANT, { mode: "all", deny: [{ source: "claude", sessionId: "a" }, { source: "claude", sessionId: "b" }] }, { trusted: true, nowMs: T0 });
+    const before = inner.policies.get(JSON.stringify([TENANT.orgId, TENANT.workspaceId, TENANT.userId]))!.revision;
+    await recordSelectionDeny({ enforcement: "enforce", store: inner, nowMs: () => T0 }, TENANT, "origin-1", sessions, true);
+    expect(inner.policies.get(JSON.stringify([TENANT.orgId, TENANT.workspaceId, TENANT.userId]))!.revision).toBe(before);
+    let applies = 0;
+    const contended: UploadConsentStore = {
+      snapshot: async () => ({ held: false, policy: { mode: "all", revision: 1, newSessionBoundaryMs: null }, originConfirmed: true, sessions: new Map() }),
+      apply: async () => { applies++; throw new ConsentWriteRefused("upload_consent_revision", 409, "changed"); },
+    };
+    await expect(recordSelectionDeny({ enforcement: "enforce", store: contended }, TENANT, "origin-1", sessions, true)).rejects.toMatchObject({ status: 503 });
+    expect(applies).toBe(3);
+  });
+});
+

@@ -425,9 +425,10 @@ export function parseSelection(body: unknown): { account_id: string; expected_us
 }
 
 /**
- * The principal deny a selection disable records (upload-consent.ts). `unlessAllowed`: skip sessions the
- * person has explicitly allowed, with an optimistic revision check so an allow landing between the read
- * and the write is never overwritten.
+ * The principal deny a selection disable records (upload-consent.ts). `unlessAllowed`: deny only sessions
+ * with no decision yet (never over a confirmed allow; an existing deny is left as is), with an optimistic
+ * revision check so an allow landing between the read and the write is never overwritten. Three CAS
+ * losses in a row: 503 (the client retries the selection).
  */
 export async function recordSelectionDeny(config: UploadConsentConfig, tenant: { orgId: string; workspaceId: string; userId: string },
   originId: string, sessions: { source: string; sessionId: string }[], unlessAllowed: boolean): Promise<void> {
@@ -438,7 +439,8 @@ export async function recordSelectionDeny(config: UploadConsentConfig, tenant: {
   }
   for (let attempt = 0; attempt < 3; attempt++) {
     const snapshot = await config.store.snapshot(tenant, originId, sessions, nowMs());
-    const deny = sessions.filter((s) => snapshot.sessions.get(sessionKey(s.source, s.sessionId))?.decision !== "allow");
+    // Undecided sessions only: never over an allow, and an existing deny needs no new revision.
+    const deny = sessions.filter((s) => snapshot.sessions.get(sessionKey(s.source, s.sessionId))?.decision === undefined);
     if (deny.length === 0) return;
     try {
       await config.store.apply(tenant, { deny, expectedRevision: snapshot.policy?.revision ?? 0 }, { trusted: false, nowMs: nowMs() });
@@ -876,12 +878,13 @@ export function createIngestApp(deps: IngestAppDeps) {
       }else await journal(()=>deps.deliver.ledger.setSessionUploads(selection),()=>"applied");
       // A "Don't upload" is also the principal's explicit deny (every origin, every mode, kept when the mode
       // becomes "all"). Narrowing only. A re-enable never broadens consent: that needs a confirmed write.
-      // Ordered controls: an applied disable is the newest intent (deny). A stale one was superseded
-      // (nothing). A replay may follow a first attempt whose consent write failed, but must never overwrite
-      // an allow the person confirmed since, so it denies only sessions with no allow (revision-checked).
-      if (!input.enabled && deps.uploadConsent && deps.uploadConsent.enforcement !== "off" && controlAck?.outcome !== "stale")
+      // Ordered controls: an applied disable is the newest intent, so it denies (also over an earlier allow).
+      // A replay or a stale one may follow an attempt whose consent write failed (or a newer control that
+      // landed first), but must never overwrite an allow the person confirmed since: it denies only sessions
+      // with no decision yet (revision-checked).
+      if (!input.enabled && deps.uploadConsent && deps.uploadConsent.enforcement !== "off")
         await recordSelectionDeny(deps.uploadConsent, selection.tenant, input.origin_id,
-          input.sessions.map((x) => ({ source: x.source, sessionId: x.session_id })), controlAck?.outcome === "replay");
+          input.sessions.map((x) => ({ source: x.source, sessionId: x.session_id })), controlAck !== undefined && controlAck.outcome !== "applied");
       emit({ route: "delivery.sessions.selection", outcome: controlAck?"control_"+controlAck.outcome:input.enabled ? "enabled" : "disabled", org_id: identity.orgId, count: input.sessions.length });
       return c.json({ updated: true,...(controlAck?{control:controlAck}:{}) });
     } catch (error) {

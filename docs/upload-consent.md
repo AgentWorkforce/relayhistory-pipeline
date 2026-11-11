@@ -68,6 +68,11 @@ A mixed batch therefore never persists denied content and never advances a recei
 | `admission-consumer.ts` | at admission, at the current policy. Covers async admission and direct uploads (promotion hands off to it). A refusal is a retry; the inbox keeps the bytes for a redrive. |
 | `/v1/delivery/recovery` | the same pre-check and gate (an archive replay re-publishes) |
 
+A selection disable also records the principal's deny. The ordered-control outcome decides how:
+`applied` denies, as the newest intent, even over an earlier allow. `replay` and `stale` deny only
+sessions with no decision yet, so they never overwrite an allow the person confirmed since. The write is
+revision-checked: after three CAS losses the request answers 503.
+
 Known trade-off: a selection re-enable (`enabled:true`) never removes the principal's deny, because a sync
 token cannot broaden. A client that re-enables and re-sends that session is held until an `rth:consent`
 write (the Cloud consent UI / relay-control follow-up) allows it.
@@ -93,12 +98,12 @@ The stricter mode wins, and under `new` the later boundary wins. The cap is enfo
 capture enforce behaves exactly as before: it checks the revision and refuses a known start before the
 boundary. That older behaviour is the gap the reproduction showed, so it closes only when consent is on.
 
-The cap is applied on the request path (`acceptBatch`, before enqueue). It is not re-derived in the async
-consumer or for direct uploads, which carry no capture policy:
-
-- For direct uploads, relay-control applies the capture policy when it mints the upload credentials.
-- An operator policy change that lands after a batch was queued is not re-checked. The person's own policy
-  is re-checked.
+The cap is derived on the request path from the verified identity. For queued (async) admission it is
+recorded in the admission inbox header (`consentCap`, strictly validated on decode), and the consumer
+enforces it at admission. It is not available for direct uploads (`HISTORY_UPLOAD_DIRECT`), whose
+promotion carries no capture policy; relay-control applies the capture policy when it mints the upload
+credentials. An operator policy change that lands after a batch was queued is not re-checked (the cap is
+the one in force at upload); the person's own policy is re-checked.
 
 ## Operator signal
 
