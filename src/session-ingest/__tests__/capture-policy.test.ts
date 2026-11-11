@@ -78,6 +78,7 @@ describe("uploadPolicyViolation", () => {
     expect(uploadPolicyViolation(s, "04", batch())).toBe("missing");
     expect(uploadPolicyViolation(s, "-4", batch())).toBe("missing");
     expect(uploadPolicyViolation(s, "3", batch())).toBe("stale");
+    expect(uploadPolicyViolation(s, "0", batch())).toBe("stale");
     expect(uploadPolicyViolation(s, "4", batch())).toBeNull();
     expect(uploadPolicyViolation(s, " 5 ", batch())).toBeNull();
   });

@@ -67,7 +67,8 @@ export function uploadPolicyViolation(subject: CapturePolicySubject, header: str
   const policy = subject.capturePolicy;
   if (!policy || Object.keys(policy.settings).length === 0) return null;
   const raw = (header ?? "").trim();
-  if (!/^[1-9][0-9]{0,9}$/.test(raw)) return "missing";
+  // A revision is a non-negative integer; 0 is one (always older than a set policy's).
+  if (!/^(?:0|[1-9][0-9]{0,9})$/.test(raw)) return "missing";
   if (Number(raw) < policy.revision) return "stale";
   const since = policy.sharingModeSinceMs;
   if (policy.settings.sharing_mode === "new" && since !== undefined) {
