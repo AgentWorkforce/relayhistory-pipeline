@@ -75,7 +75,7 @@ export function computeManifest(): TechnicalFoulManifest {
 export const serializeManifest = (m: TechnicalFoulManifest) => `${JSON.stringify(m, null, 2)}\n`;
 
 /*
- * Cutover entry (relayscrubber 0.5.0-alpha.5 via wasm-bindgen). This is a NEW,
+ * Cutover entry (relayscrubber 0.5.0-alpha.6 via wasm-bindgen). This is a NEW,
  * separate manifest: technical-foul.json above is immutable TS history and is
  * never relabelled. The cutover manifest binds the pin, the vendored bytes the
  * pin names, the bindgen sealer sources, and a reference to the TS entry it
@@ -102,7 +102,7 @@ const sha256Bytes = (repoRel: string) =>
 
 export interface TechnicalFoulCutoverManifest {
   schema: 1;
-  entry: "cutover-relayscrubber-0.5.0-alpha.5";
+  entry: "cutover-relayscrubber-0.5.0-alpha.6";
   engine: "wasm-bindgen";
   envTriple: { SCRUB_ENGINE: "wasm-bindgen"; SCRUB_ENGINE_REQUIRED: "wasm-bindgen"; READER_MAX_RULESET: "10" };
   package: string;
@@ -172,7 +172,7 @@ export function computeCutoverManifest(): TechnicalFoulCutoverManifest {
   const ts = computeManifest();
   return {
     schema: 1,
-    entry: "cutover-relayscrubber-0.5.0-alpha.5",
+    entry: "cutover-relayscrubber-0.5.0-alpha.6",
     engine: "wasm-bindgen",
     envTriple: { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen", READER_MAX_RULESET: "10" },
     package: pin.package,

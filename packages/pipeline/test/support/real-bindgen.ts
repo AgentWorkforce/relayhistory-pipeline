@@ -1,5 +1,5 @@
 /**
- * Test support for the REAL vendored relayscrubber 0.5.0-alpha.5 package
+ * Test support for the REAL vendored relayscrubber 0.5.0-alpha.6 package
  * (packages/pipeline/scrub-bindgen/, pinned by scrub-bindgen-pin.json).
  *
  * - `faultGlue` wraps the real, verified glue module: every export delegates to it

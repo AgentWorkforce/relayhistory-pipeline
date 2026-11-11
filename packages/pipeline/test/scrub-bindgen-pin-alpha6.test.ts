@@ -1,6 +1,6 @@
 /**
- * The pinned relayscrubber 0.5.0-alpha.5 cutover package (docs/scrub-engine.md,
- * "Cutover: pinned relayscrubber 0.5.0-alpha.5").
+ * The pinned relayscrubber 0.5.0-alpha.6 cutover package (docs/scrub-engine.md,
+ * "Cutover: pinned relayscrubber 0.5.0-alpha.6").
  *
  * - Every vendored file under packages/pipeline/scrub-bindgen/ hashes to the pin AND
  *   to the release's own artifact.json (byte-for-byte vendoring).
@@ -34,25 +34,25 @@ afterEach(() => {
 });
 
 const EXPECTED = {
-  package_version: "0.5.0-alpha.5",
-  wasm_sha256: "91cf23177f1d9fa42484f4ce76b54bdd468177852b9e8b259af0b72ad5823f4d",
+  package_version: "0.5.0-alpha.6",
+  wasm_sha256: "f1d393b22ce47d4cb4ca762107a7f66e8b2747f6de60c193e8b07646db28e5fd",
   glue_sha256: "55dd6fc6a44ed35f846655ab08bf3161ffe105123cbe11d3e529923d6bdeae5b",
   loader_sha256: "ff139ab391a958475b455ef483e7119d66215d172647223965dc35348f912490",
-  artifact_json_sha256: "4ba0f5210995e8db20ba361235ed43ceb777309ac946567885a8805f286f0010",
+  artifact_json_sha256: "43a896799549358ed0abb5fd6fab9395ca9455bd591e2f166a4e46b34c759b93",
   release: {
     source: "github-release",
     repository: "AgentWorkforce/relayscrubber",
-    tag: "v0.5.0-alpha.5",
-    tarball: "agentworkforce-relayscrubber-0.5.0-alpha.5.tgz",
-    tarball_sha256: "bc4101df467ba520e16b8b8d766c63a9017631a6551a369ee100b34e47de441b",
-    sha256sums: { "artifact.json": "4ba0f5210995e8db20ba361235ed43ceb777309ac946567885a8805f286f0010" },
+    tag: "v0.5.0-alpha.6",
+    tarball: "agentworkforce-relayscrubber-0.5.0-alpha.6.tgz",
+    tarball_sha256: "374b72f5d21ecaae558273bb350103c2d111cdbbb1eaf803615c221449066cc6",
+    sha256sums: { "artifact.json": "43a896799549358ed0abb5fd6fab9395ca9455bd591e2f166a4e46b34c759b93" },
   },
   manifest: {
     schema: 3,
     ruleset: "relayhistory-scrub",
     rulesetVersion: 10,
-    rulesetSourceSha256: "bd7d6620626ef40b4c319fa6260bb42ddb20035301ad974332a13453835563f5",
-    crateVersion: "0.5.0-alpha.5",
+    rulesetSourceSha256: "aea569aaeca8a53190194eb10cb751195d3d21c27cd0fee2aeef78f81db3d814",
+    crateVersion: "0.5.0-alpha.6",
     abiVersion: 2,
     policy: "secrets",
     redactionToken: "[REDACTED]",
@@ -71,8 +71,8 @@ async function initError(options: Parameters<typeof initScrubEngine>[0]): Promis
   throw new Error("expected init to fail");
 }
 
-describe("alpha.5 pin and vendored bytes", () => {
-  it("the checked-in pin holds exactly the reviewed alpha.5 values, with no placeholder marker", () => {
+describe("alpha.6 pin and vendored bytes", () => {
+  it("the checked-in pin holds exactly the reviewed alpha.6 values, with no placeholder marker", () => {
     expect(PIN.package_version).toBe(EXPECTED.package_version);
     expect(PIN.schema).toBe(2);
     expect(PIN.release).toStrictEqual(EXPECTED.release);

@@ -337,10 +337,10 @@ describe("wasm-bindgen: happy path with doubles", () => {
 // ---------------------------------------------------------------- pins
 
 describe("wasm-bindgen: placeholder and malformed pins are refused by name", () => {
-  it("the historical placeholder pin is refused; the checked-in alpha.5 pin is refused at the default reader ceiling", () => {
+  it("the historical placeholder pin is refused; the checked-in alpha.6 pin is refused at the default reader ceiling", () => {
     expect(() => parseScrubBindgenPin(PLACEHOLDER_PIN)).toThrow(expect.objectContaining({ reason: "bindgen_unpinned_package_version" }));
     expect(() => parseScrubBindgenPin(pinFile)).toThrow(expect.objectContaining({ reason: "bindgen_ruleset_above_reader_ceiling" }));
-    expect(parseScrubBindgenPin(pinFile, 10).package_version).toBe("0.5.0-alpha.5");
+    expect(parseScrubBindgenPin(pinFile, 10).package_version).toBe("0.5.0-alpha.6");
   });
 
   it("SCRUB_ENGINE=wasm-bindgen with the checked-in pin and default reader is unavailable, and every call site refuses", async () => {
@@ -826,7 +826,7 @@ describe("wasm-bindgen: Workers compiled-module path (createCompiledBindgenEngin
     );
   });
 
-  it("refuses the placeholder pin, and the checked-in alpha.5 pin at the default reader ceiling", () => {
+  it("refuses the placeholder pin, and the checked-in alpha.6 pin at the default reader ceiling", () => {
     expect(() => createCompiledBindgenEngine({ glue: glueDouble().glue, module: emptyModule(), pin: PLACEHOLDER_PIN })).toThrow(
       expect.objectContaining({ reason: "bindgen_unpinned_package_version" }),
     );
