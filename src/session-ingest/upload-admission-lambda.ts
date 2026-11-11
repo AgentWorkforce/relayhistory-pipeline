@@ -1,0 +1,88 @@
+/**
+ * Upload-admission Lambda entry (relay-upload-inbox-v1, decision 0004): an SQS batch of S3
+ * ObjectCreated notifications for `<keyRoot>/.upload-inbox/`, answered with `batchItemFailures`
+ * (ReportBatchItemFailures). Default off: with HISTORY_UPLOAD_DIRECT off every record is reported as a
+ * failure without reading storage, so a mis-armed queue only redrives into its DLQ.
+ *
+ * Per record: a malformed SQS body or S3 notification, a key that is not this key root's upload key, and
+ * every `retry` from promoteUpload are failures (the queue re-drives them; maxReceiveCount routes them to the
+ * DLQ). An `ack` (handed off, refused with a recorded §6 code, already promoted, gone) is a success. An
+ * s3:TestEvent body acks. A record without a messageId is reported with an empty itemIdentifier, which
+ * Lambda treats as a failure of the whole batch (never a silent ack). Logs carry codes and counts only, never a key, body, witness or tenant id.
+ *
+ * Like buffered-gc-lambda.ts, the handler never accepts factories or credentials from its invocation
+ * payload. The hosted runtime (S3 store, Worker-parity budget deps, the admission-queue send) is built by
+ * `UploadAdmissionRuntimeFactory`; this module ships no hosted factory and no stack resource (stacks/aws
+ * owns the function, queue, notification and IAM), so the default handler with the flag on fails every
+ * record with `runtime_unavailable` until one is wired.
+ */
+import { promoteUpload, uploadDirectConfig, UPLOAD_WITNESS_KEY_VAR, type PromoteResult, type PromoteUploadDeps, type UploadDirectConfig } from "./upload-admission.ts";
+
+export interface SqsRecordLike { messageId?: unknown; body?: unknown }
+export interface UploadAdmissionBatchResponse { batchItemFailures: { itemIdentifier: string }[] }
+/** Builds the promotion deps once per cold start (store, deliver budget deps, enqueue). */
+export type UploadAdmissionRuntimeFactory = (env: NodeJS.ProcessEnv, config: UploadDirectConfig) => Promise<Omit<PromoteUploadDeps, "config" | "witnessKey">>;
+
+/** S3 notification keys are URL-encoded with `+` for space. Null: not a notification record this handler serves. */
+export function notificationKeys(body: unknown): string[] | null {
+  let v: unknown;
+  try { v = typeof body === "string" ? JSON.parse(body) : null; } catch { return null; }
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  const o = v as Record<string, unknown>;
+  if (o.Event === "s3:TestEvent") return [];
+  if (!Array.isArray(o.Records) || o.Records.length === 0) return null;
+  const keys: string[] = [];
+  for (const r of o.Records) {
+    const k = (r as { s3?: { object?: { key?: unknown } } } | null)?.s3?.object?.key;
+    if (typeof r !== "object" || r === null || typeof (r as { eventName?: unknown }).eventName !== "string" || !(r as { eventName: string }).eventName.startsWith("ObjectCreated:") || typeof k !== "string") return null;
+    try { keys.push(decodeURIComponent(k.replace(/\+/g, " "))); } catch { return null; }
+  }
+  return keys;
+}
+
+type Log = (line: Record<string, unknown>) => void;
+const defaultLog: Log = (line) => console.log(JSON.stringify({ route: "upload.admission", ...line }));
+
+export function createUploadAdmissionHandler(runtime: UploadAdmissionRuntimeFactory | undefined, log: Log = defaultLog) {
+  let deps: Promise<Omit<PromoteUploadDeps, "config" | "witnessKey">> | undefined;
+  return async function handler(event: unknown, _context?: unknown): Promise<UploadAdmissionBatchResponse> {
+    const records: SqsRecordLike[] = Array.isArray((event as { Records?: unknown } | null)?.Records) ? (event as { Records: SqsRecordLike[] }).Records : [];
+    const ids = records.map((r) => (typeof r?.messageId === "string" ? r.messageId : ""));
+    const failAll = (code: string) => {
+      log({ outcome: code, records: records.length });
+      return { batchItemFailures: ids.map((itemIdentifier) => ({ itemIdentifier })) };
+    };
+    let config: UploadDirectConfig;
+    try { config = uploadDirectConfig(process.env); } catch { return failAll("history_upload_direct_invalid"); }
+    if (config.mode === "off") return failAll("history_upload_direct_off");
+    if (!runtime) return failAll("runtime_unavailable");
+    let base: Omit<PromoteUploadDeps, "config" | "witnessKey">;
+    try {
+      base = await (deps ??= runtime(process.env, config));
+    } catch {
+      deps = undefined;
+      return failAll("runtime_unavailable");
+    }
+    const promote: PromoteUploadDeps = { ...base, config, witnessKey: process.env[UPLOAD_WITNESS_KEY_VAR] };
+    const failures: { itemIdentifier: string }[] = [];
+    const counts: Record<string, number> = {};
+    for (let i = 0; i < records.length; i++) {
+      const id = ids[i]!;
+      const keys = notificationKeys(records[i]?.body);
+      let failed = !id || keys === null;
+      if (keys === null) counts.malformed_record = (counts.malformed_record ?? 0) + 1;
+      for (const key of failed ? [] : keys!) {
+        const result: PromoteResult = await promoteUpload(key, promote).catch((error) => ({ action: "retry", code: "promote_failed", error }) as const);
+        const label = result.action === "ack" ? (result.code ?? result.outcome) : result.code;
+        counts[label] = (counts[label] ?? 0) + 1;
+        if (result.action !== "ack") failed = true;
+      }
+      if (failed) failures.push({ itemIdentifier: id });
+    }
+    log({ outcome: "batch", records: records.length, failures: failures.length, ...counts });
+    return { batchItemFailures: failures };
+  };
+}
+
+/** The deployed entry: no runtime factory ships with this module (see the header). */
+export const handler = createUploadAdmissionHandler(undefined);
