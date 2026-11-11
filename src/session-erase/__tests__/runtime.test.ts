@@ -21,6 +21,8 @@ test("activation is explicit and sync-only; typos and partial activation fail st
  for (const env of [{ SESSION_ERASE_BYTES_ENABLED: "1" }, { SESSION_ERASE_FENCE_ENFORCED: "true" }])
   expect(() => eraseRuntimeSettings(env, { enabled: false })).toThrow();
  expect(() => eraseRuntimeSettings({}, { enabled: true })).toThrow();
+ for (const mode of ["on","allowlist"])
+  expect(() => eraseRuntimeSettings({SESSION_ERASE_FENCE_ENFORCED:"1",HISTORY_UPLOAD_DIRECT:mode},{enabled:true})).toThrow(/desktop uploads/);
  expect(() => eraseRuntimeSettings({ SESSION_ERASE_FENCE_ENFORCED: "1" }, { enabled: true }, {})).toThrow(/synchronous/);
 });
 test("an ambiguous writer failure retains its durable obligation; fence denial never invokes object I/O", async () => {

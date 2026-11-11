@@ -26,6 +26,7 @@ import { createPostgresSearchIndex } from "../../../packages/pipeline/src/search
 import { syntheticDoc } from "../../../packages/pipeline/src/search-index/conformance.ts";
 import { postgresSearchState } from "../../session-pipeline/postgres-search-state.ts";
 import { sessionEraseWorker, sqlEraseLedger, sqlSessionWriteGuard } from "../runtime.ts";
+import { stagedObjectsAbsent } from "../selfhost-runtime.ts";
 import { eraseDiscoveredSessionBytes } from "../selfhost-eraser.ts";
 
 const endpoint = process.env.FRONTIER_TEST_S3_ENDPOINT;
@@ -48,6 +49,12 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
   const storeConfig = { endpoint: endpoint!, bucket: bucket!, region: "us-east-1", credentials: { accessKeyId: accessKeyId!, secretAccessKey: secretAccessKey! } };
   const store = createS3Store(storeConfig);
   const eraser = createS3Eraser(storeConfig);
+  // Pending desktop uploads must block completion even before canonical admission sees them.
+  const pendingUpload = `${root}/.upload-inbox/pending`;
+  await store.put(objectKey(pendingUpload), new TextEncoder().encode("fixture staged payload"));
+  expect(await stagedObjectsAbsent(eraser,root,TEST_TENANT,async()=>{})).toBe(false);
+  await eraser.eraseStep(`${root}/.upload-inbox/`,{scope:root,authorize:async()=>{}});
+  expect(await stagedObjectsAbsent(eraser,root,TEST_TENANT,async()=>{})).toBe(true);
   const lines: Record<string, unknown>[] = [];
   let worker: ReturnType<typeof sessionEraseWorker> | undefined;
   let control: any, controlTenant: any, bridge: ReturnType<typeof createServer> | undefined;
@@ -164,7 +171,7 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
    expect((await eraseRequest()).status).toBe(202);
    expect((await read(events)).status).toBe(404);
    worker = sessionEraseWorker({ ledger, identity, bytes: {
-    stagesAbsent: async () => true, // this fixture runs only synchronous delivery, with no stage writer
+    stagesAbsent: (key, authorize) => stagedObjectsAbsent(eraser, root, key, authorize),
     erase: (k, authorize) => eraseDiscoveredSessionBytes(eraser, k, { keyRoot: root, bucket: bucket!, authorize, log: () => {} }),
    }, search: { erase: (k, sessionIds) => eraseIndex.eraseScope({ ...k, sessionIds }) }, searchLock: async (_w, action) => action(), log: l => lines.push(l) });
    expect(await worker.scan()).toBe(true);

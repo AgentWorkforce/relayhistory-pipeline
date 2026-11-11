@@ -14,7 +14,7 @@ The usual ledger checks, sentinels, generated ACL and guarded rollback apply. A 
 runtime cannot be rolled back: durable write obligations and receipts must survive.
 
 The supported initial runtime is synchronous canonical self-host ingest with versioned
-S3/Locker and Postgres or OpenSearch search. Ordered, lazy, buffered, history-managed,
+S3/Locker and Postgres or OpenSearch search. Direct desktop upload (`HISTORY_UPLOAD_DIRECT`), ordered, lazy, buffered, history-managed,
 independently published analysis, active large reads and live brief-document pipelines
 are refused before fencing until their writer-drain protocols exist. Source collisions
 in older source-free analysis tables and ambiguous/lossy object identifiers also refuse.
@@ -77,7 +77,7 @@ lease and purge RPCs. Startup refuses a smaller pool.
 The object eraser checks current pointers, historical dates, unindexed machines, upload
 generations, every version and delete marker. IDs that cannot map unambiguously to their
 stored layout are refused; a neighbor with a shared string prefix is never an erase target.
-Mixed live-batch, buffered-batch and async inbox prefixes are independently checked for
+Mixed live-batch, buffered-batch, async inbox and direct-upload inbox prefixes are independently checked for
 absence. Unknown sessions receive permanent fences and a verified zero-count receipt.
 
 Search deletion holds the same metadata advisory locks as the pipeline consumer and
@@ -110,3 +110,7 @@ A later canonical ID that encodes to an erased physical object prefix is permane
 refused with HTTP 409 `operator_session_erased` before object I/O. The object layout
 cannot safely distinguish these identities. Reusing that prefix could let an old
 worker delete the new session. This reservation persists with the erase fence.
+
+Direct desktop upload must remain off on all writers; existing desktop upload grants
+and outstanding witnesses require a separately approved revoke/drain protocol before
+switching a previously direct-upload deployment to this initial erase runtime.

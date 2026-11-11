@@ -114,6 +114,17 @@ async function searchPort(env: NodeJS.ProcessEnv, metadata: pg.PoolConfig) {
     close: async () => {} };
 }
 
+/** Mixed staged payloads cannot be attributed to one session without their own drain protocol. */
+export async function stagedObjectsAbsent(eraser: Pick<ReturnType<typeof createS3Eraser>, "verifyErased">,
+ keyRoot: string, key: Pick<EraseWork,"orgId"|"workspaceId">, authorize: () => Promise<void>): Promise<boolean> {
+ for (const prefix of [`${keyRoot}/${key.orgId}/live-batches/v1/ws=${key.workspaceId}/`,
+   `${keyRoot}/${key.orgId}/buffered-batches/`, `${keyRoot}/${INBOX_NAMESPACE}/`, `${keyRoot}/.upload-inbox/`]) {
+  const proof = await eraser.verifyErased(prefix, { authorize });
+  if (proof.status !== "erased") return false;
+ }
+ return true;
+}
+
 export async function buildSelfhostEraseRuntime(input: {
   env: NodeJS.ProcessEnv; keyRoot: string; api: SessionEraseConfig; enforced?: true; bytesEnabled?: true;
   run: SqlRun; pool: pg.Pool; metadata: pg.PoolConfig; log?: (fields: Record<string, unknown>) => void;
@@ -145,14 +156,7 @@ export async function buildSelfhostEraseRuntime(input: {
     bytes: {
       erase: (key, authorize) => eraseDiscoveredSessionBytes(eraser, key, { keyRoot: config.keyRoot, bucket: config.bucket, concurrency: config.concurrency,
         authorize, log: input.log }),
-      async stagesAbsent(key, authorize) {
-        for (const prefix of [`${config.keyRoot}/${key.orgId}/live-batches/v1/ws=${key.workspaceId}/`,
-          `${config.keyRoot}/${key.orgId}/buffered-batches/`, `${config.keyRoot}/${INBOX_NAMESPACE}/`]) {
-          const proof = await eraser.verifyErased(prefix, { authorize });
-          if (proof.status !== "erased") return false;
-        }
-        return true;
-      },
+      stagesAbsent: (key, authorize) => stagedObjectsAbsent(eraser, config.keyRoot, key, authorize),
     },
     async searchLock(work, action) {
       const client = await input.pool.connect();
