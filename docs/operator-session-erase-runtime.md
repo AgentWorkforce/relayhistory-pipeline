@@ -105,3 +105,8 @@ pipeline-only proof remains self-contained. No real database or store is used by
 
 Per-user bulk hard-delete is not included. It requires a stable all-session inventory
 across users/origins and bounded durable expansion into these per-session receipts.
+
+A later canonical ID that encodes to an erased physical object prefix is permanently
+refused with HTTP 409 `operator_session_erased` before object I/O. The object layout
+cannot safely distinguish these identities. Reusing that prefix could let an old
+worker delete the new session. This reservation persists with the erase fence.

@@ -185,7 +185,7 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
    expect(lines.findLast(l => l.route === "delivery.batches")).toMatchObject({ deleted: 1, manifests: 0 });
    // A new canonical spelling that encodes to the erased physical ID must fail
    // before object I/O, even though claim's logical key differs.
-   expect((await upload("layout-collision","alias-origin","sess:1")).status).toBe(503);
+   expect((await upload("layout-collision","alias-origin","sess:1")).status).toBe(409);
    expect((await ledger.receipt(key))?.status).toBe("completed");
    const inventory = await eraser.verifyErased(manifestKey.slice(0, manifestKey.lastIndexOf("/") + 1), { authorize: async () => {} });
    expect(inventory.status).toBe("erased");

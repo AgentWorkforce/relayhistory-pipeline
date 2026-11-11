@@ -3,7 +3,7 @@ import { layoutComponent } from "../shared/layout-component.ts";
 import type { SqlRun } from "../session-ingest/ledger-sql.ts";
 import type { SessionEraseRequest, SessionEraseService } from "../session-ingest/session-erase.ts";
 import { dbErrorSnapshot } from "../session-ingest/db-error-class.ts";
-import { IngestUnavailable } from "../session-ingest/deliver.ts";
+import { DeliveryError } from "../session-ingest/vendor/delivery/delivery-contracts.ts";
 import { erasureReceipt, SessionEraseServiceError, type ArtifactKey, type EraseKey, type ErasureReceipt } from "./receipt.ts";
 import type { SessionEraseBytesResult } from "./selfhost-eraser.ts";
 
@@ -51,7 +51,7 @@ export function sqlSessionWriteGuard(run: SqlRun): SessionWriteGuard {
       pairs.set(JSON.stringify(pair),pair);
     }
     const allowed = await call(run, fn.writeBegin, [JSON.stringify({ orgId: tenant.orgId, workspaceId: tenant.workspaceId, writerId, sessions, physicalSessions: [...pairs.values()] })]);
-    if (allowed !== true) throw new IngestUnavailable("objects", "operator_session_erased");
+    if (allowed !== true) throw new DeliveryError("operator_session_erased", 409, "The session object namespace is permanently reserved by an operator erase");
     const result = await work();
     await call(run, fn.writeFinish, [tenant.orgId, tenant.workspaceId, writerId]);
     return result;

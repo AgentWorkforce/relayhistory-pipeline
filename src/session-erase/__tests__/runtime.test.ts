@@ -69,3 +69,10 @@ test("write guard passes canonical and encoded physical identities to the same b
  expect(pairs).toMatchObject({sessions:[["claude","a:b"]],physicalSessions:[["claude","a_b"]]});
  expect(pairs).not.toHaveProperty("userId");
 });
+
+test("a fenced physical namespace refuses permanently before any object work",async()=>{
+ let writes=0;
+ const guard=sqlSessionWriteGuard(async()=>({rows:[{result:false}]}));
+ await expect(guard(key,[["claude","a:b"]],async()=>{writes++;})).rejects.toMatchObject({code:"operator_session_erased",status:409});
+ expect(writes).toBe(0);
+});
