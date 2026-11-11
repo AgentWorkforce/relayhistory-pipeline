@@ -5,7 +5,7 @@ on:
     inputs:
       mode:
         type: choice
-        options: [plan, apply]
+        options: [plan, bootstrap, apply]
         required: true
       sha:
         description: Exact current main commit (40 lowercase hex)
@@ -24,7 +24,7 @@ on:
         type: string
         required: true
       target_generation:
-        description: "Apply only - targetGeneration from the plan's plan.json (64 lowercase hex): --generation at target_sha, the generation this apply marks PASS; equals generation when nothing is held"
+        description: "Bootstrap and apply - targetGeneration from the plan's plan.json (64 lowercase hex): --generation at target_sha, the generation this apply marks PASS; equals generation when nothing is held"
         type: string
         default: ""
       boundary:
@@ -33,11 +33,11 @@ on:
         options: [global-default-revoke]
         required: true
       plan_run:
-        description: Apply only - successful plan run ID from this SHA (within 24 hours)
+        description: Bootstrap and apply - successful plan run ID from this SHA (within 24 hours)
         type: string
         default: ""
       approval:
-        description: "Apply only: APPLY pyamkrhoyszgzirqqffq <sha> <generation> TARGET <target> <target_sha> <target_generation> MANIFEST <manifest_digest> PLAN <plan_run>"
+        description: "Apply: APPLY pyamkrhoyszgzirqqffq <sha> <generation> TARGET <target> <target_sha> <target_generation> MANIFEST <manifest_digest> PLAN <plan_run>. Bootstrap: BOOTSTRAP <project> <sha> TARGET <target> <target_sha> CHAIN <chain_digest> ROLES <sorted comma-joined will_create, or none> PLAN <plan_run> (chain_digest from the plan binds target, target_sha, the target-required roles, the bootstrap contract digest and the anchor bytes of the run files)"
         type: string
         default: ""
 permissions:
@@ -107,7 +107,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: bun scripts/schema-release-github.ts --approved
       - name: Download the prior plan, with exact workflow/run provenance already checked
-        if: inputs.mode == 'apply'
+        if: inputs.mode != 'plan'
         uses: actions/download-artifact@v4
         with:
           name: schema-release-plan
@@ -115,7 +115,8 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.plan_run }}
           github-token: ${{ github.token }}
-      - name: Read-only plan or approved boundary-refresh and apply (only step with database secret)
+      # One secret-scoped step for every mode; the entry point dispatches on RELEASE_MODE.
+      - name: Read-only plan, approved bootstrap-role stage, or approved boundary-refresh and apply (only step with database secret)
         env:
           GITHUB_TOKEN: ${{ github.token }}
           SUPABASE_MIGRATION_OWNER_URL: ${{ secrets.SUPABASE_MIGRATION_OWNER_URL }}
@@ -128,3 +129,15 @@ jobs:
           path: release-plan/plan.json
           if-no-files-found: error
           retention-days: 1
+      - name: Publish non-secret bootstrap evidence
+        if: inputs.mode == 'bootstrap' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema-release-bootstrap
+          path: release-bootstrap/evidence.json
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Summary
+        if: always()
+        run: |
+          printf '### guarded session schema release\n\nmode: `%s`\nsha: `%s`\n' "$RELEASE_MODE" "$RELEASE_SHA" >> "$GITHUB_STEP_SUMMARY"

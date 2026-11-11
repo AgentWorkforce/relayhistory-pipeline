@@ -18,6 +18,7 @@ import {
   refuse,
 } from "../src/hoopdb/schema-release-contract.ts";
 import {
+  inspectBootstrap,
   inspectRelease,
   releaseClient,
   releaseErrorCode,
@@ -54,6 +55,11 @@ export async function operatorPlan() {
     const targetGeneration = anchor.targetGeneration;
     if (!split.held.length && targetGeneration !== input.generation)
       refuse("release_target_generation_changed");
+    // The same bootstrap section the CI plan records (READ ONLY; refuses role drift).
+    const bootstrap = await inspectBootstrap(client, {
+      ...input,
+      steps: anchor.manifest.steps.map(([name]) => name),
+    });
     console.log(
       JSON.stringify(
         {
@@ -70,6 +76,7 @@ export async function operatorPlan() {
           manifestDigest: anchor.manifestDigest,
           targetManifest: anchor.manifest,
           ...report,
+          bootstrap,
         },
         null,
         2,

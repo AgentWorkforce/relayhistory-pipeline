@@ -58,6 +58,20 @@ export const PRODUCTION_APPLY_REFUSALS = [
   "release_marker",
 ] as const;
 
+/**
+ * The bootstrap stage's refusal codes, in the order scripts/schema-release-database.ts
+ * raises them through refuse(...) inside validateBootstrapPlan and releaseBootstrap.
+ * The rehearsal driver does NOT replay the bootstrap stage: it rehearses the apply only.
+ * This list is a drift pin, so a new or reordered bootstrap refusal fails the unit test
+ * first; a bootstrap-stage rehearsal is a separate future change.
+ */
+export const PRODUCTION_BOOTSTRAP_REFUSALS = [
+  "release_bootstrap_approval",
+  "release_target_manifest_changed",
+  "release_bootstrap_db_mode",
+  "release_target_manifest_changed",
+] as const;
+
 export class RehearsalRefusal extends Error {
   constructor(
     readonly code: string,

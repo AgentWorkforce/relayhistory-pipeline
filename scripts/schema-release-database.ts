@@ -25,11 +25,24 @@ import {
   refuse,
 } from "../src/hoopdb/schema-release-contract.ts";
 import {
+  inspectBootstrap,
   inspectRelease,
   releaseClient,
   releaseProfile,
   releaseErrorCode,
+  requireReleaseOwner,
 } from "../src/hoopdb/schema-release-inspect.ts";
+import {
+  BOOTSTRAP_REQUIRED_NOTE,
+  bootstrapRequiredRoles,
+  bootstrapTargetChain,
+  releaseBootstrapContract,
+  releaseBootstrapFiles,
+  requireBootstrapRoles,
+  requireBootstrapTargetChain,
+  runBootstrapStage,
+  validateBootstrapSection,
+} from "../src/hoopdb/schema-release-bootstrap.ts";
 import { githubGet, githubReleaseGate } from "./schema-release-github.ts";
 import {
   refreshReleaseBoundary,
@@ -128,6 +141,8 @@ export async function targetAnchor(input: { sha: string; target: string; targetS
     prefix: await schemaStepDigests(held),
   });
 }
+/** The anchor's ordered schema step names (target_sha's tree, migrator order). */
+const anchorSteps = (a: ReleaseTargetAnchor) => a.manifest.steps.map(([name]) => name);
 export function sameAnchor(
   a: ReleaseTargetAnchor,
   b: { targetSha: string; targetGeneration: string; manifestDigest: string },
@@ -137,6 +152,139 @@ export function sameAnchor(
     a.targetGeneration === b.targetGeneration &&
     a.manifestDigest === b.manifestDigest
   );
+}
+type ReleaseInput = Awaited<ReturnType<typeof githubReleaseGate>>;
+/**
+ * Bootstrap mode's pre-connection check of the plan artifact: the release plan as apply
+ * validates it (its own manifest digest), its bootstrap section's shape, and the typed
+ * approval's TARGET, target_sha, CHAIN and ROLES equal to that section
+ * (release_bootstrap_approval).
+ */
+export function validateBootstrapPlan(
+  plan: any,
+  input: {
+    sha: string;
+    generation: string;
+    boundary: string;
+    target: string;
+    targetSha: string;
+    targetGeneration: string;
+    planRun: string;
+    chainDigest: string;
+    bootstrapRoles: readonly string[];
+  },
+) {
+  const release = validateReleasePlan(plan, {
+    ...input,
+    manifestDigest: typeof plan?.manifestDigest === "string" ? plan.manifestDigest : "",
+  });
+  const section = validateBootstrapSection(plan?.bootstrap);
+  if (
+    input.target !== section.target ||
+    input.targetSha !== section.target_sha ||
+    input.chainDigest !== section.chain_digest ||
+    input.bootstrapRoles.join(",") !== section.will_create.join(",")
+  )
+    refuse("release_bootstrap_approval");
+  return { release, section };
+}
+/**
+ * The apply guard over the live catalog: every role the bound target requires
+ * (bootstrapRequiredRoles over the anchor's steps) exists; else
+ * release_bootstrap_required, the absent names on stderr. Roles first consumed above
+ * the target are not required.
+ */
+async function requireBootstrapRolesLive(
+  client: { query(sql: string, params?: unknown[]): Promise<{ rows: any[] }> },
+  target: string,
+  anchor: ReleaseTargetAnchor,
+) {
+  const required = bootstrapRequiredRoles({ target, steps: anchorSteps(anchor) });
+  const { rows } = await client.query(
+    "SELECT rolname FROM pg_roles WHERE rolname = ANY($1::text[])",
+    [required],
+  );
+  requireBootstrapRoles({ roles: rows }, required);
+}
+async function writeBootstrapEvidence(evidence: unknown) {
+  await mkdir("release-bootstrap", { recursive: true });
+  await writeFile(
+    "release-bootstrap/evidence.json",
+    JSON.stringify(evidence, null, 2) + "\n",
+    { mode: 0o600 },
+  );
+}
+/**
+ * The bootstrap stage. Before connecting: the plan artifact bound to the typed approval,
+ * the anchor, and the target-bound chain recomputed from git (the anchor's chain bytes
+ * and steps: required set, run/excluded/mixed files, CHAIN) and compared with the plan
+ * and the approval's CHAIN (release_bootstrap_plan_changed); a mixed file or a
+ * release-vs-anchor difference refuses (release_bootstrap_chain_mixed,
+ * release_bootstrap_release_drift), and so do partial, unparsable or canonically
+ * different anchor contract modules (release_bootstrap_contract_drift). Then connect,
+ * prove the release owner and hand the client to runBootstrapStage
+ * (src/hoopdb/schema-release-bootstrap.ts): under the migrator's session advisory lock,
+ * the GitHub gate, the anchor and the git inputs once more (compared before BEGIN),
+ * then ONE transaction that recomputes the section from
+ * the live catalog, runs the anchor's chain files provisioning absent required roles,
+ * reads back and COMMITs only on an exact match (else ROLLBACK).
+ */
+async function releaseBootstrap(
+  get: ReturnType<typeof githubGet>,
+  input: ReleaseInput,
+) {
+  const { release, section: planned } = validateBootstrapPlan(
+    JSON.parse(await readFile("release-plan/plan.json", "utf8")),
+    input,
+  );
+  const anchor = await targetAnchor(input, release.held);
+  if (!sameAnchor(anchor, release)) refuse("release_target_manifest_changed");
+  const files = releaseBootstrapFiles(process.cwd(), input.sha, input.targetSha);
+  const contract = releaseBootstrapContract(process.cwd(), input.targetSha);
+  requireBootstrapTargetChain(
+    bootstrapTargetChain({ target: input.target, targetSha: input.targetSha, steps: anchorSteps(anchor), files, contract }),
+    planned,
+    input.chainDigest,
+  );
+  const supabaseMode = releaseProfile(input.boundary).mode === "supabase";
+  if (!supabaseMode) refuse("release_bootstrap_db_mode");
+  const client = releaseClient(process.env.SUPABASE_MIGRATION_OWNER_URL);
+  try {
+    await client.connect();
+    await requireReleaseOwner(client);
+  } catch (error) {
+    await client.end().catch(() => {});
+    throw error;
+  }
+  // runBootstrapStage always ends the client.
+  await runBootstrapStage({
+    client,
+    target: input.target,
+    targetSha: input.targetSha,
+    planned,
+    approvalChain: input.chainDigest,
+    supabaseMode,
+    underLock: async () => {
+      // Under the lock: the GitHub gate, the anchor and the git inputs once more,
+      // compared with the plan and the approval before BEGIN.
+      await githubReleaseGate(process.env, get, true);
+      const fresh = await targetAnchor(input, release.held);
+      if (!sameAnchor(fresh, release)) refuse("release_target_manifest_changed");
+      return {
+        files: releaseBootstrapFiles(process.cwd(), input.sha, input.targetSha),
+        steps: anchorSteps(fresh),
+        contract: releaseBootstrapContract(process.cwd(), input.targetSha),
+      };
+    },
+    writeEvidence: writeBootstrapEvidence,
+    header: {
+      version: 1,
+      sha: input.sha,
+      targetSha: input.targetSha,
+      planRun: input.planRun,
+      runId: process.env.GITHUB_RUN_ID,
+    },
+  });
 }
 export async function releaseDatabase() {
   const get = githubGet();
@@ -151,6 +299,7 @@ export async function releaseDatabase() {
     refuse("release_checkout_generation");
   // target_sha: a local commit, the release sha or on its first-parent chain (no network git).
   requireTargetCommit(process.cwd(), input.sha, input.targetSha);
+  if (input.mode === "bootstrap") return releaseBootstrap(get, input);
   const profile = releaseProfile(input.boundary);
   const approvedPlan =
     input.mode === "apply"
@@ -180,6 +329,8 @@ export async function releaseDatabase() {
     if (!split.held.length && targetGeneration !== input.generation)
       refuse("release_target_generation_changed");
     if (input.mode === "plan") {
+      // The bootstrap section: its own READ ONLY transaction under the same xact lock.
+      const bootstrap = await inspectBootstrap(client, { ...input, steps: anchorSteps(anchor) });
       await mkdir("release-plan", { recursive: true });
       await writeFile(
         "release-plan/plan.json",
@@ -197,6 +348,7 @@ export async function releaseDatabase() {
             targetManifest: anchor.manifest,
             runId: process.env.GITHUB_RUN_ID,
             ...inspection,
+            bootstrap,
           },
           null,
           2,
@@ -205,6 +357,34 @@ export async function releaseDatabase() {
       );
       if (split.held.length)
         console.log("release_target_held " + split.held.length);
+      // Names and digests only: never the project ref.
+      console.log(
+        "release_bootstrap_plan chain " +
+          bootstrap.chain_digest +
+          " contract " +
+          bootstrap.contract_digest +
+          " roles " +
+          (bootstrap.will_create.join(",") || "none") +
+          " required " +
+          (bootstrap.required_roles.join(",") || "none"),
+      );
+      // Source and component digests only, never contract contents.
+      console.log(
+        "release_bootstrap_contract source " +
+          bootstrap.contract_source +
+          " map " +
+          bootstrap.contract_map_digest +
+          " manifest " +
+          bootstrap.contract_manifest_digest,
+      );
+      if (bootstrap.excluded.length)
+        console.log("release_bootstrap_excluded " + bootstrap.excluded.join(","));
+      // Reported only here; the bootstrap stage refuses either.
+      if (bootstrap.mixed.length)
+        console.log("release_bootstrap_chain_mixed " + bootstrap.mixed.join(","));
+      if (bootstrap.release_drift.length)
+        console.log("release_bootstrap_release_drift " + bootstrap.release_drift.join(","));
+      if (bootstrap.required) console.log(BOOTSTRAP_REQUIRED_NOTE);
       console.log("release_readonly_plan_complete");
       return;
     }
@@ -225,6 +405,9 @@ export async function releaseDatabase() {
     if (targetGeneration !== approvedPlan!.targetGeneration)
       refuse("release_target_generation_changed");
     if (!sameAnchor(anchor, approvedPlan!)) refuse("release_target_manifest_changed");
+    // Fail fast before the migrator when a target-required chain role is absent;
+    // beforeWrite rechecks from the anchor recomputed under the lock.
+    await requireBootstrapRolesLive(client, input.target, anchor);
     const result = await runMigrations(client, {
       profile,
       expectedLedgerSha256: approvedPlan!.ledgerSha256,
@@ -241,8 +424,12 @@ export async function releaseDatabase() {
       beforeWrite: async () => {
         await githubReleaseGate(process.env, get, true);
         // Under the migrator lock: the anchor once more, before any write.
-        if (!sameAnchor(await targetAnchor(input, approvedPlan!.held), approvedPlan!))
-          refuse("release_target_manifest_changed");
+        const fresh = await targetAnchor(input, approvedPlan!.held);
+        if (!sameAnchor(fresh, approvedPlan!)) refuse("release_target_manifest_changed");
+        // Under the migrator lock: every target-required bootstrap-chain role exists
+        // (the CI bootstrap stage provisions them); else release_bootstrap_required,
+        // names on stderr.
+        await requireBootstrapRolesLive(client, input.target, fresh);
         await refreshReleaseBoundary(client, approvedPlan!.existingBoundary);
       },
     });

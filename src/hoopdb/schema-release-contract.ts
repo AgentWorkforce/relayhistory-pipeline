@@ -35,7 +35,7 @@ export function releaseInputs(
     // at the target; the release is anchored to it (src/hoopdb/release-target.ts,
     // scripts/schema-release-github.ts).
     RELEASE_TARGET_SHA: targetSha,
-    // Apply only: the target generation the plan recorded, the generation of
+    // Apply and bootstrap: the target generation the plan recorded, the generation of
     // target_sha's tree (what --generation prints there); the only generation an
     // apply may mark PASS. Equal to RELEASE_GENERATION when nothing is held.
     RELEASE_TARGET_GENERATION: targetGeneration = "",
@@ -43,7 +43,7 @@ export function releaseInputs(
     RELEASE_APPROVAL: approval = "",
   } = env;
   if (
-    (mode !== "plan" && mode !== "apply") ||
+    (mode !== "plan" && mode !== "bootstrap" && mode !== "apply") ||
     !/^[0-9a-f]{40}$/.test(sha ?? "") ||
     !/^[0-9a-f]{64}$/.test(generation ?? "") ||
     boundary !== "global-default-revoke" ||
@@ -67,6 +67,31 @@ export function releaseInputs(
     refuse("release_typed_approval");
   if (mode === "plan" && (planRun || approval || targetGeneration))
     refuse("release_plan_inputs");
+  // Bootstrap only: the plan's chain digest and the sorted absent roles it will create
+  // are carried only inside the typed approval; the whole string must equal the
+  // canonical form exactly (src/hoopdb/schema-release-bootstrap.ts bootstrapApproval).
+  // The project ref is matched here and never printed.
+  let chainDigest = "";
+  let bootstrapRoles: string[] = [];
+  if (mode === "bootstrap") {
+    const m =
+      / CHAIN ([0-9a-f]{64}) ROLES (none|[a-z_][a-z0-9_]{0,62}(?:,[a-z_][a-z0-9_]{0,62})*) PLAN /.exec(
+        approval,
+      );
+    chainDigest = m?.[1] ?? "";
+    bootstrapRoles = m && m[2] !== "none" ? m[2].split(",") : [];
+    const sorted = [...bootstrapRoles].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    if (
+      !/^[1-9][0-9]*$/.test(planRun) ||
+      !/^[0-9a-f]{64}$/.test(targetGeneration) ||
+      !m ||
+      new Set(bootstrapRoles).size !== bootstrapRoles.length ||
+      sorted.join(",") !== bootstrapRoles.join(",") ||
+      approval !==
+        `BOOTSTRAP ${SCHEMA_RELEASE.project} ${sha} TARGET ${target} ${targetSha} CHAIN ${chainDigest} ROLES ${m[2]} PLAN ${planRun}`
+    )
+      refuse("release_bootstrap_approval");
+  }
   return {
     mode,
     sha: sha!,
@@ -77,6 +102,8 @@ export function releaseInputs(
     targetGeneration,
     manifestDigest,
     planRun,
+    chainDigest,
+    bootstrapRoles,
   } as const;
 }
 export function releaseConnection(value: string | undefined) {
