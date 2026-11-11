@@ -936,14 +936,14 @@ export function assertOperatorSnapshot(
               refuse("native_binding_target");
             deletedValue = oldAccepted;
           } else if (b.sid === "INGEST_CUSTODY_SOURCE") {
-            // CI rollout rollback: step 1 -> baseline only.
+            // CI custody rollback: shadow or frozen step 1 -> baseline only.
             if (input.sessionIngest.custodySource !== undefined ||
                 input.sessionIngest.syncAdmissionFrozenReceipt !== undefined ||
-                currentEnv?.INGEST_CUSTODY_SOURCE !== "frozen-supabase" ||
+                (currentEnv?.INGEST_CUSTODY_SOURCE !== "shadow" && currentEnv?.INGEST_CUSTODY_SOURCE !== "frozen-supabase") ||
                 currentEnv?.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT !== undefined ||
                 proposedEnv?.INGEST_CUSTODY_SOURCE !== undefined)
               refuse("native_binding_target");
-            deletedValue = "frozen-supabase";
+            deletedValue = currentEnv.INGEST_CUSTODY_SOURCE;
           } else if (b.sid === "INGEST_SYNC_ADMISSION_FROZEN_RECEIPT") {
             // CI rollout rollback: step 2 -> step 1 only.
             if (input.sessionIngest.syncAdmissionFrozenReceipt !== undefined ||

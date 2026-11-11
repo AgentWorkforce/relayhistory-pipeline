@@ -9,10 +9,13 @@ retained-plan operator locally against production.
 The complete nonsecret feature profile is
 `config/cloudflare/private-ingest-production.json`; the protected environment supplies the KMS
 target. Workflow inputs cannot override either source. The release contract recognizes only these
-ordered rollout profiles, plus the baseline rollback target:
+rollout profiles, a custody shadow preparation profile, and the baseline rollback target:
 
 0. `baseline-drain` (rollback only): no frozen custody source or synchronous receipt bridge;
    async admission remains `drain`.
+   `step-0-shadow`: `custodySource=shadow`, async admission remains `drain`, and the
+   synchronous frozen-receipt bridge is absent. This makes the P1 runbook's shadow evidence
+   possible through the same CI gates. Capture it only after the custody copy/seal is qualified.
 
 1. `step-1-custody`: `custodySource=frozen-supabase`, async admission remains `drain`, the
    synchronous frozen-receipt bridge is absent.
@@ -24,9 +27,18 @@ Each transition is a reviewed commit to the tracked profile followed by its own 
 Do not combine steps. Step 4 is followed by one relayhistory-cloud per-org canary; widening is a
 separate decision owned by relayhistory-cloud.
 
-Khaliq's production authorization is bound into the deploy capture by
-`src/session-ingest/private-ingest-release.ts`. The GitHub environment still requires a real
-human approval for every plan or deploy run.
+Adding shadow support does not change the tracked production profile or dispatch a deployment.
+For the P1 flow, change that profile to `custodySource=shadow` in its own reviewed commit, plan
+and deploy, then retain genuine `custody.shadow` match evidence on batches and controls before
+the separate frozen profile commit. A mode readback alone is not a parity receipt. Existing
+baseline-to-frozen transitions remain representable for already-qualified releases; that gate
+does not waive P1 copy/seal/mirror/shadow readiness. Shadow cannot enable the receipt bridge or
+async admission, and cannot skip directly to/from the advanced phases.
+
+Khaliq's recorded production authorization is bound into the deploy capture by
+`src/session-ingest/private-ingest-release.ts`; every run must remain inside its authorized
+scope. The workflow requires his exact authenticated dispatch and triggering identity plus
+the protected environment gates below. It does not configure a separate reviewer-approval rule.
 
 ## One-time GitHub environment
 
@@ -43,7 +55,7 @@ Create `private-ingest-production` with:
   Worker/Queue/Hyperdrive/Secrets Store reads and writes used by this stack.
 
 Secrets stay in the GitHub environment and the system of record. They are exposed only to the
-plan/deploy/readback steps after dependency installation and environment approval. Do not copy a
+plan/deploy/readback steps after dependency installation and environment gates. Do not copy a
 Wrangler OAuth credential into GitHub Actions.
 
 The prerequisite job refuses a missing, unprotected, or non-main environment before entering it.
@@ -78,7 +90,7 @@ Dispatch the same workflow from the same still-current SHA with:
 - `plan_run=<successful plan run id>`
 - `confirmation=DEPLOY 96bulls-session-ingest <sha> PLAN <plan_run>`
 
-After environment approval, the run downloads the exact artifact, binds the recorded production
+After those gates, the run downloads the exact artifact, binds the recorded production
 authorization to its hashes, regenerates the live plan, refuses any drift, and applies once. It
 then requires the current deployment to have exactly one Worker version at 100% and checks every expected `INGEST_*`
 value plus Hyperdrive, both Queue bindings, and the three Secrets Store bindings. The sanitized
@@ -88,6 +100,9 @@ readback is retained as `private-ingest-readback` for 30 days.
 
 - Step 1: revert the tracked profile to `baseline-drain` by a normal commit, then plan and deploy
   through the same workflow. Step 2 rolls back to `step-1-custody`. Never rewrite `main`.
+- Shadow may return to baseline through the same CI path; step 1 may return to shadow for
+  diagnosis. Refuse a custody-binding deletion from an unknown mode or with a receipt bridge
+  still enabled. RHC privacy/auth authority boundaries still apply independently.
 - Step 4: first turn the relayhistory per-org opt-in off. Change the tracked ingest profile from
   `on` back to `drain`, then plan and deploy through CI. Do not go directly `on -> off` while
   messages may be in flight. Wait for the admission queue and DLQ to empty before a later `off`
