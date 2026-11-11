@@ -40,6 +40,7 @@ import { log } from "../shared/log.ts";
 import { initScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
 import { optional } from "../shared/env.ts";
 import { SESSION_BOOTSTRAP_FILES } from "./session-bootstrap-chain.ts";
+import { markHeldScope, type HeldScope } from "./held-scope.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 // The relayhistory-cloud sessions migrations, moved into this repo by #1/#6 (provenance: supabase/README.md).
@@ -450,11 +451,13 @@ export async function schemaStepDigests(held: readonly string[] = []): Promise<[
  * required. Refuses a held name that is not a schema step of this tree
  * (release_target_unknown) and, given the bound manifest's steps, any prefix that is
  * not exactly the manifest's names and digests (release_target_manifest_changed).
+ * The result is deep-frozen and registered (held-scope.ts); schemaVerdict accepts no
+ * other held value.
  */
 export async function heldScope(
   held: readonly string[],
   manifestSteps?: readonly (readonly [string, string])[],
-): Promise<{ name: string; creates: string[] }[]> {
+): Promise<HeldScope> {
   const prefix = await schemaStepDigests(held);
   if (manifestSteps && JSON.stringify(prefix) !== JSON.stringify(manifestSteps.map(([n, d]) => [n, d])))
     throw profileError("release_target_manifest_changed", "the held steps do not leave exactly the approved prefix");
@@ -470,7 +473,7 @@ export async function heldScope(
         name: st.name,
         creates: [...createdSessionsFunctions([await readFile(st.path, "utf8")])].filter((fn) => !prefixCreates.has(fn)).sort(),
       });
-  return out;
+  return markHeldScope(out);
 }
 
 /** What readiness requires of HoopDb for this image (see schemaVerdict). */
