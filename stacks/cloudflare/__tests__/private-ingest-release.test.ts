@@ -205,4 +205,7 @@ test("workflow is CI-only and binds production credentials only after install", 
   expect(workflow.indexOf("Install without production credentials")).toBeLessThan(workflow.indexOf("CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}"));
   expect(workflow).not.toContain("wrangler deploy");
   expect(workflow).not.toContain("ssh ");
+  expect(readFileSync("scripts/private-ingest-ci.ts", "utf8")).toContain(
+    'resolve(".96bulls/private-ingest-release/preflight.json")',
+  );
 });

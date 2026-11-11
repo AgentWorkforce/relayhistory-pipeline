@@ -19,7 +19,9 @@ const SOURCE = resolve("config/cloudflare/private-ingest-production.json");
 const RUNTIME = resolve(".96bulls/cf-sessions-prod/cloudflare-inputs.json");
 const PREFIX = resolve("docs/plans/cf-sessions-prod");
 const RECEIPT = resolve("release-receipt/private-ingest-readback.json");
-const PREFLIGHT = resolve("release-receipt/private-ingest-preflight.json");
+// Preflight runs before the retained operator's clean-source gate. Keep its diagnostic receipt in
+// the already-ignored, mode-0600 runtime tree so it cannot make the checkout dirty.
+const PREFLIGHT = resolve(".96bulls/private-ingest-release/preflight.json");
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
 
 function trackedInput(): { text: string; input: CloudflareStageInputs } {
