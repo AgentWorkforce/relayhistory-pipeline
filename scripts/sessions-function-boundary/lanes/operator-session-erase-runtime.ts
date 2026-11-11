@@ -39,6 +39,7 @@ export const operatorSessionEraseRuntime: LaneManifest = {
     "sessions.ingest_operator_runtime_metadata_guard()": { secdef: true, grants: [] },
     "sessions.ingest_operator_runtime_write_begin(jsonb)": GRANTED,
     "sessions.ingest_operator_runtime_write_finish(text,text,uuid)": GRANTED,
+    "sessions.ingest_operator_runtime_write_failed(text,text,uuid)": GRANTED,
     "sessions.ingest_operator_runtime_begin(text,text,text,text,text,text,text,text,text,text)": GRANTED,
     "sessions.ingest_operator_runtime_next(uuid)": GRANTED,
     "sessions.ingest_operator_runtime_authorize(text,text,text,text,uuid)": GRANTED,

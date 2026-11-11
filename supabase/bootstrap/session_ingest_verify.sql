@@ -45,6 +45,7 @@ DECLARE r pg_roles%ROWTYPE; m record;v record;v_mode text:=coalesce(current_sett
  'sessions.ingest_operator_runtime_release(text,text,text,text,uuid)',
  'sessions.ingest_operator_runtime_step(text,text,text,text,uuid,text,text,bigint,text)',
  'sessions.ingest_operator_runtime_write_begin(jsonb)',
+ 'sessions.ingest_operator_runtime_write_failed(text,text,uuid)',
  'sessions.ingest_operator_runtime_write_finish(text,text,uuid)',
  'sessions.ingest_prepare_buffer_stage(jsonb)',
  'sessions.ingest_privacy_authority_begin(jsonb)',

@@ -179,3 +179,34 @@ describe("operator runtime SQL", () => {
     await d.db.exec("ROLLBACK;RESET ROLE");
   });
 });
+
+test("ambiguous and crashed writes remain blockers until tested owner-only stopped-writer recovery",async()=>{
+ const d=await database();await d.pointer();
+ const writer=crypto.randomUUID(),neighbor=crypto.randomUUID();
+ const register=(id:string,sessions:string[])=>d.rpc("ingest_operator_runtime_write_begin",[JSON.stringify({orgId:key[0],workspaceId:key[1],writerId:id,
+  sessions:sessions.map(s=>[key[2],s]),physicalSessions:sessions.map(s=>[key[2],s])})]);
+ await register(writer,[key[3],"same-batch-other-session"]);await register(neighbor,["unrelated-session"]);
+ await d.rpc("ingest_operator_runtime_write_failed",[key[0],key[1],writer]);
+ expect((await d.db.query("SELECT 1 FROM sessions.session_erasure_writes WHERE writer_id=$1 AND failed_at IS NOT NULL",[writer])).rows).toHaveLength(2);
+ await d.begin();const lease=crypto.randomUUID();await d.rpc("ingest_operator_runtime_next",[lease]);
+ expect(await d.rpc("ingest_operator_runtime_authorize",[...key,lease])).toBe(false);
+ await d.db.exec("UPDATE sessions.session_erasure_writes SET started_at='2000-01-01',failed_at='2000-01-01' WHERE failed_at IS NOT NULL");
+ expect(await d.rpc("ingest_operator_runtime_authorize",[...key,lease])).toBe(false);
+ const recovery=readFileSync(join(REPO_ROOT,"supabase/operations/operator_session_erase_recover_writer.sql"),"utf8");
+ const recover=(ws:string,stopped:boolean)=>d.db.query(recovery,[key[0],ws,writer,stopped]);
+ expect((await recover(key[1],false)).rows).toEqual([{recovered:0,audit_events:0}]);
+ expect((await recover("other-workspace",true)).rows).toEqual([{recovered:0,audit_events:0}]);
+ await d.db.exec("SET ROLE bulls96_session_ingest");
+ expect(await code(recover(key[1],true))).toBe("42501");await d.db.exec("RESET ROLE");
+ // Fixture owner now attests the entire writer is stopped and its writes reconciled.
+ expect((await recover(key[1],true)).rows).toEqual([{recovered:2,audit_events:1}]);
+ expect(await d.rpc("ingest_operator_runtime_authorize",[...key,lease])).toBe(true);
+ expect((await recover(key[1],true)).rows).toEqual([{recovered:0,audit_events:0}]);
+ expect((await d.db.query("SELECT state,error_code FROM sessions.session_erasure_events WHERE state='writer_recovered'")).rows)
+  .toEqual([{state:"writer_recovered",error_code:"writer_stopped_verified"}]);
+ expect((await d.db.query("SELECT writer_id FROM sessions.session_erasure_writes")).rows).toEqual([{writer_id:neighbor}]);
+ const success=crypto.randomUUID();await register(success,["successful-session"]);
+ await d.rpc("ingest_operator_runtime_write_finish",[key[0],key[1],success]);
+ await d.rpc("ingest_operator_runtime_write_failed",[key[0],key[1],success]);
+ expect((await d.db.query("SELECT 1 FROM sessions.session_erasure_writes WHERE writer_id=$1",[success])).rows).toEqual([]);
+});

@@ -4,9 +4,10 @@
 -- disappear merely because a clock elapsed. Operator recovery must establish that writer is stopped.
 CREATE TABLE sessions.session_erasure_writes (
  org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
- writer_id uuid NOT NULL,started_at timestamptz NOT NULL DEFAULT clock_timestamp(),finished_at timestamptz,
+ writer_id uuid NOT NULL,started_at timestamptz NOT NULL DEFAULT clock_timestamp(),finished_at timestamptz,failed_at timestamptz,
  PRIMARY KEY(org_id,workspace_id,source,session_id,writer_id)
 );
+CREATE INDEX session_erasure_writes_writer_idx ON sessions.session_erasure_writes(org_id,workspace_id,writer_id);
 CREATE TABLE sessions.session_erasure_scopes (
  org_id text NOT NULL,workspace_id text NOT NULL,source text NOT NULL,session_id text NOT NULL,
  target_session_id text NOT NULL,
@@ -63,9 +64,19 @@ CREATE FUNCTION sessions.ingest_operator_runtime_write_finish(p_org text,p_ws te
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $write_finish$
 BEGIN
  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
- UPDATE sessions.session_erasure_writes SET finished_at=coalesce(finished_at,clock_timestamp())
- WHERE org_id=p_org AND workspace_id=p_ws AND writer_id=p_writer;
+ -- Only confirmed object writes and ledger commit call finish. Completed obligations
+ -- carry no independent audit requirement; remove them rather than retaining every upload.
+ DELETE FROM sessions.session_erasure_writes WHERE org_id=p_org AND workspace_id=p_ws AND writer_id=p_writer;
 END $write_finish$;
+
+CREATE FUNCTION sessions.ingest_operator_runtime_write_failed(p_org text,p_ws text,p_writer uuid) RETURNS void
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $write_failed$
+BEGIN
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ -- An exception is ambiguous: record it, but never make the obligation disappear.
+ UPDATE sessions.session_erasure_writes SET failed_at=coalesce(failed_at,clock_timestamp())
+ WHERE org_id=p_org AND workspace_id=p_ws AND writer_id=p_writer AND finished_at IS NULL;
+END $write_failed$;
 
 CREATE FUNCTION sessions.ingest_operator_runtime_location_valid(p_root text,p_org text,p_ws text,p_source text,p_session text,p_machine text,p_manifest text) RETURNS boolean
 LANGUAGE plpgsql IMMUTABLE SET search_path=pg_catalog,pg_temp AS $location$
@@ -336,13 +347,13 @@ END $guards$;
 REVOKE ALL ON FUNCTION sessions.ingest_operator_runtime_ids(text,text,text,text),sessions.ingest_operator_runtime_catalog(),
  sessions.ingest_operator_runtime_location_valid(text,text,text,text,text,text,text),
  sessions.ingest_operator_runtime_metadata_guard(),sessions.ingest_operator_runtime_write_begin(jsonb),
- sessions.ingest_operator_runtime_write_finish(text,text,uuid),sessions.ingest_operator_runtime_begin(text,text,text,text,text,text,text,text,text,text),
+ sessions.ingest_operator_runtime_write_finish(text,text,uuid),sessions.ingest_operator_runtime_write_failed(text,text,uuid),sessions.ingest_operator_runtime_begin(text,text,text,text,text,text,text,text,text,text),
  sessions.ingest_operator_runtime_next(uuid),sessions.ingest_operator_runtime_authorize(text,text,text,text,uuid),
  sessions.ingest_operator_runtime_release(text,text,text,text,uuid),sessions.ingest_operator_runtime_purge(text,text,text,text,uuid),
  sessions.ingest_operator_runtime_step(text,text,text,text,uuid,text,text,bigint,text),sessions.ingest_operator_runtime_upsert(jsonb,text,text),
  sessions.ingest_operator_runtime_erased(text,text,text,text)
  FROM PUBLIC,anon,authenticated,service_role;
-GRANT EXECUTE ON FUNCTION sessions.ingest_operator_runtime_write_begin(jsonb),sessions.ingest_operator_runtime_write_finish(text,text,uuid),
+GRANT EXECUTE ON FUNCTION sessions.ingest_operator_runtime_write_begin(jsonb),sessions.ingest_operator_runtime_write_finish(text,text,uuid),sessions.ingest_operator_runtime_write_failed(text,text,uuid),
  sessions.ingest_operator_runtime_begin(text,text,text,text,text,text,text,text,text,text),sessions.ingest_operator_runtime_next(uuid),
  sessions.ingest_operator_runtime_authorize(text,text,text,text,uuid),sessions.ingest_operator_runtime_release(text,text,text,text,uuid),
  sessions.ingest_operator_runtime_purge(text,text,text,text,uuid),sessions.ingest_operator_runtime_step(text,text,text,text,uuid,text,text,bigint,text) TO bulls96_session_ingest;
