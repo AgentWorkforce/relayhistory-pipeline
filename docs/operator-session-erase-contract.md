@@ -228,7 +228,7 @@ Lanes (supersede the six-PR split in the research plan):
 | Lane | Content | Flag |
 | --- | --- | --- |
 | **A** | this contract and the 501 stub route (this PR) | `SESSION_ERASE_API_ENABLED` |
-| **B** | SQL. **M1, slot 050000:** `session_erasure_receipts`, `session_erasure_events`, `session_erasure_fences`, and `ingest_operator_erase_session` (granted to the ingest role only), plus the GET read function. **M2, slot 050010:** the session-fence check in claim, commit and index | `SESSION_ERASE_FENCE_ENFORCED` (M2) |
+| **B** | SQL. **M1, slot 050000:** `session_erasure_receipts`, `session_erasure_events`, `session_erasure_fences`, and `ingest_operator_erase_session` (owner-only internal helper), plus the receipt read function for ingest. **M2, slot 050010:** the session-fence check in claim, commit and index | `SESSION_ERASE_FENCE_ENFORCED` (M2) |
 | **C** | **self-host S3 byte eraser:** deletes the per-session prefix and the staged objects outside it, verifies the delete (lists every version), reports counts | `SESSION_ERASE_BYTES_ENABLED` |
 | **D** | orchestrator and per-store steps (search, buffered rows, staged objects, transcript bytes, analysis, large-read, verification of trigger-driven stores) | `SESSION_ERASE_BYTES_ENABLED` |
 

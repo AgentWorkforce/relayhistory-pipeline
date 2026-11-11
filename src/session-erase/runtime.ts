@@ -1,4 +1,5 @@
 /** Runtime ports for the default-off self-host operator erase. Provider messages never leave here. */
+import { layoutComponent } from "../shared/layout-component.ts";
 import type { SqlRun } from "../session-ingest/ledger-sql.ts";
 import type { SessionEraseRequest, SessionEraseService } from "../session-ingest/session-erase.ts";
 import { dbErrorSnapshot } from "../session-ingest/db-error-class.ts";
@@ -42,7 +43,14 @@ export function sqlSessionWriteGuard(run: SqlRun): SessionWriteGuard {
   return async (tenant, sessions, work) => {
     if (sessions.length === 0) return work();
     const writerId = crypto.randomUUID();
-    const allowed = await call(run, fn.writeBegin, [JSON.stringify({ orgId: tenant.orgId, workspaceId: tenant.workspaceId, writerId, sessions })]);
+    // Writer groups name the canonical logical identity; the object layout is lossy.
+    // Fence and retain obligations for both before any path can be written.
+    const pairs = new Map<string, readonly [string,string]>();
+    for(const [source,session] of sessions) {
+      const pair = [layoutComponent(source),layoutComponent(session)] as const;
+      pairs.set(JSON.stringify(pair),pair);
+    }
+    const allowed = await call(run, fn.writeBegin, [JSON.stringify({ orgId: tenant.orgId, workspaceId: tenant.workspaceId, writerId, sessions, physicalSessions: [...pairs.values()] })]);
     if (allowed !== true) throw new IngestUnavailable("objects", "operator_session_erased");
     const result = await work();
     await call(run, fn.writeFinish, [tenant.orgId, tenant.workspaceId, writerId]);

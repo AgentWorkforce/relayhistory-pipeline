@@ -61,3 +61,11 @@ test("search failure preserves pending metadata; verified success holds search l
  expect(success.calls.slice(0, 5)).toEqual(["bytes", "transcriptObjects:done", "lock", "search", "purge"]);
  expect(success.calls.at(-2)).toBe("historyDerivedObjects:not_applicable");
 });
+
+test("write guard passes canonical and encoded physical identities to the same barrier",async()=>{
+ let pairs:unknown;
+ const guard=sqlSessionWriteGuard(async(text,values)=>{if(text.includes("write_begin"))pairs=JSON.parse(values[0] as string);return {rows:[{result:true}]};});
+ await guard({orgId:"o",workspaceId:"w",userId:"not-an-rpc-field"} as any,[["claude","a:b"]],async()=>{});
+ expect(pairs).toMatchObject({sessions:[["claude","a:b"]],physicalSessions:[["claude","a_b"]]});
+ expect(pairs).not.toHaveProperty("userId");
+});

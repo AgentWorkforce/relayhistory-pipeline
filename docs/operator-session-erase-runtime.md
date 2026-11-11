@@ -7,7 +7,8 @@ applications, credentials, IAM and flag activation still need his separate expli
 
 Migration 050020 follows 050000/050010. It is inert until its narrow entry points are
 called. The ingest role gets no direct runtime-table or search-table privileges.
-A separate read-only, tenant-bound RPC exposes the permanent fence to the read API;
+Legacy erase/step helpers are owner-only from creation; the ingest login mutates
+state only through admission/lease-gated runtime RPCs. A separate read-only, tenant-bound RPC exposes the permanent fence to the read API;
 the consumer-only upsert installs canonical identity atomically with the fence check.
 The usual ledger checks, sentinels, generated ACL and guarded rollback apply. A used
 runtime cannot be rolled back: durable write obligations and receipts must survive.
@@ -37,10 +38,11 @@ other sessions' narratives. That pipeline needs its own generation-aware drain p
 Operational queue IDs, permanent fences and content-free audit receipts remain;
 transcript payloads and object addresses are not retained there.
 
+
 Causal coverage includes both actual PostgreSQL lock orders, durable writers, expired
 leases, source/bucket/layout refusals, alias registration, role/tenant isolation,
 physical purge, late metadata suppression, output-fact scope and digest isolation.
-Runtime composition and the end-to-end object-store proof ship in the following lane.
+The composition below drives these primitives; the end-to-end proof covers its completed receipt and read behavior.
 
 ## Automatic self-host composition
 

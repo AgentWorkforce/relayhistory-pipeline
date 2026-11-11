@@ -59,7 +59,8 @@ async function postgresSearch(env: NodeJS.ProcessEnv, metadata: pg.PoolConfig): 
     connectionTimeoutMillis: 2_000, idleTimeoutMillis: 60_000 });
   pool.on("error", () => {});
   try {
-    const { rows } = await pool.query(`SELECT current_user=session_user AND current_user=$1 AND NOT r.rolsuper
+    const { rows } = await pool.query(`SELECT current_user=session_user AND current_user=$1
+      AND EXISTS(SELECT 1 FROM pg_stat_activity WHERE pid=pg_backend_pid() AND usename=session_user) AND NOT r.rolsuper
       AND NOT r.rolbypassrls AND NOT r.rolcreaterole AND NOT r.rolcreatedb AND NOT r.rolreplication AND NOT r.rolinherit
       AND NOT EXISTS(SELECT 1 FROM pg_auth_members WHERE member=r.oid OR roleid=r.oid) AS safe FROM pg_roles r WHERE r.rolname=current_user`, [SEARCH_ROLE]);
     if (rows.length !== 1 || rows[0].safe !== true) throw Error("96bulls: operator erase search login refused");

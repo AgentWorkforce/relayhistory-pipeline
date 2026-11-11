@@ -76,7 +76,7 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
     TENANT = { ...TEST_TENANT, orgId: controlTenant.organizationId, workspaceId: controlTenant.workspaceId };
     membersBefore = (await control.database.query("SELECT 1 FROM organization_memberships WHERE organization_id=$1",[TENANT.orgId])).rows.length;
    }
-   const key = { orgId: TENANT.orgId, workspaceId: TENANT.workspaceId, source: "claude", sessionId: "sess-1" };
+   const key = { orgId: TENANT.orgId, workspaceId: TENANT.workspaceId, source: "claude", sessionId: "sess_1" };
    const erasePath = `/internal/v1/session-erase/organizations/${key.orgId}/workspaces/${key.workspaceId}/sources/${key.source}/sessions/${key.sessionId}`;
    const controlPath = `/api/v1/organizations/${key.orgId}/sessions/${key.sessionId}`;
    const controlQuery = `?workspaceId=${key.workspaceId}&source=${key.source}`;
@@ -119,8 +119,8 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
     log: l => lines.push(l),
    });
    pipelineApp = app;
-   const upload = async (id: string, origin = "origin-1") => app.request("/v1/delivery/batches", { method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ protocolVersion: 1, batch: await batch([record({ record_id: id, origin_id: origin })], { origin_id: origin, batch_id: id, account_id: await deliveryAccount(TENANT) }) }) });
+   const upload = async (id: string, origin = "origin-1", session = key.sessionId) => app.request("/v1/delivery/batches", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ protocolVersion: 1, batch: await batch([record({ record_id: id, origin_id: origin, session_id: session })], { origin_id: origin, batch_id: id, account_id: await deliveryAccount(TENANT) }) }) });
    const response = await upload("before");
    expect({ status: response.status, body: await response.json(), lines }).toMatchObject({ status: 200 });
    const listed = await store.list(objectKey(`${root}/${key.orgId}`));
@@ -132,11 +132,11 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
    // Project the canonical pointer and derived fixtures as the consumer would. Separate SQL tests
    // prove the enforced consumer upsert cannot register a new canonical alias after the fence.
    await db.query(`INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,content_sha256,raw_format,trace_id)
-    VALUES($1,$2,'claude','sess-1',$3,$4,now()-interval '1 hour',now(),'s3',$5,$6,decode(repeat('ab',32),'hex'),'jsonl',$7)`, [TENANT.orgId, TENANT.workspaceId, machine, TENANT.userId, bucket, manifestKey, crypto.randomUUID()]);
+    VALUES($1,$2,'claude','sess_1',$3,$4,now()-interval '1 hour',now(),'s3',$5,$6,decode(repeat('ab',32),'hex'),'jsonl',$7)`, [TENANT.orgId, TENANT.workspaceId, machine, TENANT.userId, bucket, manifestKey, crypto.randomUUID()]);
    await db.query(`INSERT INTO sessions.session_directory(org_id,workspace_id,harness,session_id,created_at,last_activity_at,title,event_count,projected_at)
-    VALUES($1,$2,'claude','sess-1',now(),now(),'private title',1,now())`, [TENANT.orgId, TENANT.workspaceId]);
+    VALUES($1,$2,'claude','sess_1',now(),now(),'private title',1,now())`, [TENANT.orgId, TENANT.workspaceId]);
    await db.query(`INSERT INTO sessions.session_briefs(org_id,workspace_id,harness,session_id,status,revision,title,description,model,generated_at,brief_revision,brief_source_revisions,brief_fingerprint,scrub_ruleset,scrub_version,prompt_version,engine_version)
-    VALUES($1,$2,'claude','sess-1','ready',1,'private title','private summary','fixture-model',now(),1,'{}'::jsonb,repeat('a',64),'relayhistory-scrub',2,'session-summary-v2','fixture')`, [TENANT.orgId, TENANT.workspaceId]);
+    VALUES($1,$2,'claude','sess_1','ready',1,'private title','private summary','fixture-model',now(),1,'{}'::jsonb,repeat('a',64),'relayhistory-scrub',2,'session-summary-v2','fixture')`, [TENANT.orgId, TENANT.workspaceId]);
    await db.query("UPDATE sessions.session_briefs SET brief_source_revisions=(SELECT jsonb_object_agg(machine_id,revision) FROM sessions.session_index WHERE org_id=$1 AND workspace_id=$2) WHERE org_id=$1 AND workspace_id=$2", [TENANT.orgId,TENANT.workspaceId]);
    await index.upsert([syntheticDoc({ ...key, eventId: "e-1", tsMs: Date.now() - 1000, content: "eraseflowneedle", machineId: machine })]);
    await db.query("UPDATE sessions.session_directory SET event_projection_ready=true,event_projection_version=1,event_projected_at=now(),event_projection_sources=jsonb_build_object('fixture',1) WHERE org_id=$1 AND workspace_id=$2", [key.orgId,key.workspaceId]);
@@ -145,14 +145,14 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
    const readApi = createReadApi({ verify: async () => ({ ...TENANT, scopes: ["rth:read"] }), adapter: { index: readIndex, state }, liveness: sqlLiveness(reader), operatorErased: sqlOperatorErased(reader),
     directory: sqlDirectory(reader), directoryWorkspaces: "*", briefSummary: sqlBriefSummary(reader), completeSinceMs: 0 });
    const read = (path: string) => readApi.request(path, { headers: { authorization: "Bearer fixture" } });
-   const events = `/v1/sessions/sess-1/events?workspace=${TENANT.workspaceId}&source=claude`;
-   const summary = `/v1/sessions/sess-1/summary?workspace=${TENANT.workspaceId}&source=claude&kind=short`;
+   const events = `/v1/sessions/sess_1/events?workspace=${TENANT.workspaceId}&source=claude`;
+   const summary = `/v1/sessions/sess_1/summary?workspace=${TENANT.workspaceId}&source=claude&kind=short`;
    const beforeEvents = await read(events); expect({ status: beforeEvents.status, body: await beforeEvents.text() }).toMatchObject({ status: 200 });
    expect(await (await read(summary)).json()).toMatchObject({ summary: { status: "ready", summary: "private summary" } });
    expect((await read(`/v1/sessions?workspace=${TENANT.workspaceId}`)).status).toBe(200);
    expect(await (await read(`/v1/events?workspace=${TENANT.workspaceId}&q=eraseflowneedle&limit=50`)).text()).toContain("eraseflowneedle");
    expect((await readAll(await store.get(objectKey(rawKey)))).byteLength).toBeGreaterThan(0);
-   const neighbour = rawKey.replace("s=sess-1/", "s=other-session/");
+   const neighbour = rawKey.replace("s=sess_1/", "s=other-session/");
    await store.put(objectKey(neighbour), new TextEncoder().encode("neighbor control"));
    const directEraseRequest = () => app.request(erasePath, { method: "POST", headers: { authorization: `Bearer ${secret}`, "content-type": "application/json" }, body: JSON.stringify({ requestId: "control-request", actor: { kind: "user", id: "operator" } }) });
    const eraseRequest = async () => {
@@ -172,7 +172,7 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
    const receiptResponse = controlReceipt ? Response.json(controlReceipt.body,{status:controlReceipt.status}) : await app.request(erasePath, { headers: { authorization: `Bearer ${secret}` } });
    const receipt = await receiptResponse.json() as any;
    expect([receiptResponse.status, receipt.status, receipt.bytesErased, receipt.uploadsFenced]).toEqual([200, "completed", true, true]);
-   for (const p of [events, summary, `/v1/sessions/sess-1/metadata?workspace=${TENANT.workspaceId}&source=claude`, `/v1/sessions/sess-1/turns?workspace=${TENANT.workspaceId}&source=claude`]) expect((await read(p)).status).toBe(404);
+   for (const p of [events, summary, `/v1/sessions/sess_1/metadata?workspace=${TENANT.workspaceId}&source=claude`, `/v1/sessions/sess_1/turns?workspace=${TENANT.workspaceId}&source=claude`]) expect((await read(p)).status).toBe(404);
    expect(await (await read(`/v1/sessions?workspace=${TENANT.workspaceId}`)).json()).toMatchObject({ sessions: [] });
    expect(await (await read(`/v1/events?workspace=${TENANT.workspaceId}&q=eraseflowneedle&limit=50`)).text()).not.toContain("eraseflowneedle");
    for (const k of [rawKey, manifestKey]) await expect(store.get(objectKey(k))).rejects.toMatchObject({ code: "not_found" });
@@ -183,10 +183,13 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
    expect(lines.findLast(l => l.route === "delivery.batches")).toMatchObject({ deleted: 1, manifests: 0 });
    expect((await upload("new-origin", "new-origin")).status).toBe(200);
    expect(lines.findLast(l => l.route === "delivery.batches")).toMatchObject({ deleted: 1, manifests: 0 });
+   // A new canonical spelling that encodes to the erased physical ID must fail
+   // before object I/O, even though claim's logical key differs.
+   expect((await upload("layout-collision","alias-origin","sess:1")).status).toBe(503);
    expect((await ledger.receipt(key))?.status).toBe("completed");
    const inventory = await eraser.verifyErased(manifestKey.slice(0, manifestKey.lastIndexOf("/") + 1), { authorize: async () => {} });
    expect(inventory.status).toBe("erased");
-   expect((await db.query("SELECT 1 FROM sessions.session_index WHERE session_id='sess-1'")).rows).toEqual([]);
+   expect((await db.query("SELECT 1 FROM sessions.session_index WHERE session_id='sess_1'")).rows).toEqual([]);
    expect((await db.query("SELECT 1 FROM search_index.transcript_events")).rows).toEqual([]);
    expect(JSON.stringify(lines)).not.toContain("private summary");
    expect(JSON.stringify(lines)).not.toContain(secret);
