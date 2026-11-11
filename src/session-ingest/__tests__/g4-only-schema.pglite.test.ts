@@ -148,12 +148,12 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105047000_coordination_fact_readers.sql",
       // Operator per-session erase: new tables and entry points; no ingest path calls them.
       "20261105050000_operator_session_erase.sql",
-      // Its fence check: re-replaces three 043850 functions (already listed below) and adds a session_index trigger.
+      // Its fence check also replaces publication scope / buffer GC for lock order and guards live writer tables.
       "20261105050010_operator_session_erase_fence_check.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
-    expect(OBJECTS.replacedFunctions).toEqual(["buffered_session_stages_for", "buffered_sessions_for", "ingest_babysitter_retention_register", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_lazy_guard", "ingest_prepare_buffer_stage", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_publish", "ingest_publication_retire_fence", "ingest_require_generation"]);
+    expect(OBJECTS.replacedFunctions).toEqual(["buffered_session_stages_for", "buffered_sessions_for", "ingest_babysitter_retention_register", "ingest_buffer_gc_claim", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_lazy_guard", "ingest_prepare_buffer_stage", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_publish", "ingest_publication_retire_fence", "ingest_publication_scope", "ingest_require_generation"]);
   });
 
   test("no new table, function or column exists; the replaced RPCs exist in their prior form; no G4 body names a post-G4 object", async () => {
