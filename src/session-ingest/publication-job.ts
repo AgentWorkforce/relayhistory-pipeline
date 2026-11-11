@@ -7,10 +7,13 @@ import {boundedPublicationStore} from "./publication-store.ts";
 import {readBufferedStage,BUFFER_STAGE_MAX_BYTES} from "./staging.ts";
 import {preparePublicationImage,writePublicationImage} from "./publication-image.ts";
 import type {PublicationRpc,PublicationTarget,PublicationTicket} from "./publication-protocol.ts";
+import type {BoundRawChunkSealer} from "../../packages/pipeline/src/lib/pipeline/engine-raw-chunks.ts";
 export interface PublicationJobDeps {
  rpc:PublicationRpc;target:PublicationTarget;
  /** Must inject this signal into every underlying request, including body IO. */
  store(signal:AbortSignal):ObjectStore;
+ /** SCRUB_ENGINE=wasm-bindgen: the sealer bound to the verified instance (routedRawChunkSealerDeps). */
+ rawChunkSealer?:BoundRawChunkSealer;
 }
 export interface PublicationJobOptions {
  enabled?:boolean;signal?:AbortSignal;maxJobMs?:number;heartbeatMs?:number;candidateLimit?:number;
@@ -38,7 +41,7 @@ export async function publishBufferedStage(deps:PublicationJobDeps,stageToken:st
   // Retain one image/new raw body at a time, even when historical input is GiB.
   for(const head of active.heads){
    signal.throwIfAborted();
-   const image=await preparePublicationImage(active,head,decoded!,deps.target,store,signal);
+   const image=await preparePublicationImage(active,head,decoded!,deps.target,store,signal,undefined,deps.rawChunkSealer);
    const message=await writePublicationImage(active,image,deps.rpc,store,signal,deps.target);
    if(message!==null)messages.push(message);
   }

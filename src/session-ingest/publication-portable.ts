@@ -46,6 +46,7 @@ import{publicationTargetKind}from'./publication-target.ts';
 import{ingestLoginIdentity}from'./ingest-login.ts';
 import{publicationRpc}from'./publication-rpc.ts';
 import{canonicalPublicationTick}from'./publication-job.ts';
+import{routedRawChunkSealerDeps}from'../../packages/pipeline/src/lib/scrub-engine/index.ts';
 import{publicationGcLedger,collectPublicationObject}from'./publication-gc.ts';
 import type{PublicationTarget}from'./publication-protocol.ts';
 const no=(code:string):never=>{throw Object.assign(Error('publication_'+code),{code:'publication_'+code});};
@@ -150,7 +151,7 @@ export async function runPortablePublicationRuntime(env:NodeJS.ProcessEnv,mode:'
   const target:PublicationTarget={bucket:config.bucket,region:config.region,keyRoot:config.keyRoot,generation:config.generation};
   const raw=scopedPublicationStore((overrides.store??createS3Store)({bucket:config.bucket,region:config.region,endpoint:config.endpoint,credentials:secrets.credentials,
    ...(config.sse?{serverSideEncryption:config.sse}:{}),fetch:fetcher}));
-  if(mode==='publish')return await canonicalPublicationTick({target,rpc:publicationRpc(sql,target),store:()=>raw},{enabled:true,signal,maxJobMs:config.budgetMs,candidateLimit:config.candidateLimit});
+  if(mode==='publish')return await canonicalPublicationTick({target,rpc:publicationRpc(sql,target),store:()=>raw,...routedRawChunkSealerDeps()},{enabled:true,signal,maxJobMs:config.budgetMs,candidateLimit:config.candidateLimit});
   const eraser=(overrides.eraser??createS3Eraser)({bucket:config.bucket,region:config.region,endpoint:config.endpoint,credentials:secrets.credentials,fetch:fetcher});
   const ledger=publicationGcLedger(sql,target),tickets=await ledger.claim(config.gcLimit,signal);let finished=0;
   for(const ticket of tickets){signal.throwIfAborted();if(!publicationGenerationKey(ticket.key))no('eraser_scope');

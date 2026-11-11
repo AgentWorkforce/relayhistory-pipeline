@@ -27,7 +27,7 @@ describe("reader ruleset capability independent of writer stamps", () => {
 
   function pin(version: number) {
     const manifest = { schema: 3, ruleset: "relayhistory-scrub", rulesetVersion: version, rulesetSourceSha256: "1".repeat(64), crateVersion: "0.0.0-inert-test", abiVersion: 2, policy: "secrets", redactionToken: "[REDACTED]", scrubProfile: `relayhistory-secrets-v${version}` };
-    return { schema: 1, package: "@agentworkforce/relayscrubber", package_version: manifest.crateVersion, wasm_sha256: "2".repeat(64), glue_sha256: "3".repeat(64), loader_sha256: "4".repeat(64), paths: { wasm: "generated/test.wasm", glue: "generated/test.js", loader: "index.js" }, manifest, scrub_profile: bindgenProfile(manifest) };
+    return { schema: 2, package: "@agentworkforce/relayscrubber", package_version: manifest.crateVersion, release: { source: "github-release", repository: "AgentWorkforce/relayscrubber", tag: "v0.0.0-test", tarball: "test.tgz", tarball_sha256: "e".repeat(64), sha256sums: { "artifact.json": "f".repeat(64) } }, wasm_sha256: "2".repeat(64), glue_sha256: "3".repeat(64), loader_sha256: "4".repeat(64), paths: { wasm: "generated/test.wasm", glue: "generated/test.js", loader: "index.js" }, manifest, scrub_profile: bindgenProfile(manifest) };
   }
   it("rejects writer pins above the reader ceiling before any artifact/glue loads", () => {
     expect(() => parseScrubBindgenPin(pin(10), 8)).toThrow(expect.objectContaining({ reason: "bindgen_ruleset_above_reader_ceiling" }));

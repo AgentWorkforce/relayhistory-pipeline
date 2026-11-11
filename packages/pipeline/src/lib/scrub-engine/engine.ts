@@ -107,6 +107,10 @@ export type BindgenManifestField =
  * Why SCRUB_ENGINE=wasm-bindgen is refused (docs/scrub-engine.md, "wasm-bindgen path").
  *
  * - bindgen_pin_invalid: the pin file is not an object, or names another pin schema / package
+ * - bindgen_pin_unreadable: the checked-in pin file could not be read or parsed (Node loader;
+ *   a Worker has no such file, which is one reason Workers refuse wasm-bindgen)
+ * - bindgen_unpinned_release: the pin's `release` provenance block is absent, has other keys,
+ *   an unknown source, an empty repository/tag/tarball name, or a digest that is not 64 lowercase hex
  * - bindgen_pin_paths_invalid: an artifact path in the pin is absent, absolute or escapes the package directory
  * - bindgen_unpinned_<field>: that pin field is a placeholder, empty, or malformed (digests: not 64 lowercase hex)
  * - bindgen_pin_profile_inconsistent: the pinned profile is not the crate-owned profile in the pinned manifest
@@ -125,9 +129,13 @@ export type BindgenManifestField =
  * - bindgen_init_conflict: a second initialisation with other pins or other bytes
  * - bindgen_path_conflict: the Node loader path and the Workers compiled-module path in one process
  * - bindgen_module_invalid: the compiled path was given something other than a WebAssembly.Module
+ * - bindgen_pin_not_exact: SCRUB_ENGINE_REQUIRED=wasm-bindgen, but the loaded instance was verified
+ *   against a pin other than the checked-in packages/pipeline/scrub-bindgen-pin.json
  */
 export type BindgenFailure =
   | "bindgen_pin_invalid"
+  | "bindgen_pin_unreadable"
+  | "bindgen_unpinned_release"
   | "bindgen_pin_paths_invalid"
   | "bindgen_unpinned_package_version"
   | "bindgen_unpinned_scrub_profile"
@@ -148,7 +156,8 @@ export type BindgenFailure =
   | "bindgen_profile_mismatch"
   | "bindgen_init_conflict"
   | "bindgen_path_conflict"
-  | "bindgen_module_invalid";
+  | "bindgen_module_invalid"
+  | "bindgen_pin_not_exact";
 
 /** Scrubbing is refused: nothing is returned, nothing passes through unscrubbed. Retryable: no input is lost. */
 export class ScrubEngineUnavailable extends PipelineError {
