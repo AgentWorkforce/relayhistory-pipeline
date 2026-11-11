@@ -1,6 +1,7 @@
 /** Force both transaction orders against an owned disposable PostgreSQL database. */
 import { describe, expect, test } from "bun:test";
 import pg from "pg";
+import { projectSessionDirectory } from "../../hoopdb/session-directory-projector.ts";
 import { readFileSync,readdirSync } from "node:fs";
 import { join } from "node:path";
 import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts";
@@ -38,6 +39,15 @@ describe.skipIf(!url)("operator fence serializes all pointer statements",()=>{
    await insert("update-first");await writer.query("BEGIN");await writer.query("UPDATE sessions.session_index SET user_id='late-user' WHERE session_id='update-first'");
    await eraser.query("BEGIN");const updating=erase("update-first");await blocked(ep,wp);await writer.query("COMMIT");await updating;await eraser.query("COMMIT");
    expect((await writer.query("UPDATE sessions.session_index SET deleted_at=NULL WHERE session_id='update-first' RETURNING session_id")).rows).toEqual([]);
+   // The actual projector can start with a stale statement snapshot while erase holds the gate.
+   await insert("directory-race");
+   const directoryKey={orgId:"org",workspaceId:"ws",harness:"claude",sessionId:"directory-race"};
+   await projectSessionDirectory(writer,directoryKey);
+   await eraser.query("BEGIN");await erase("directory-race");
+   const projecting=projectSessionDirectory(writer,directoryKey);
+   await blocked(wp,ep);await eraser.query("COMMIT");await projecting;
+   expect((await pool.query("SELECT 1 FROM sessions.session_directory WHERE session_id='directory-race' AND deleted_at IS NULL")).rows).toEqual([]);
+   expect((await writer.query("UPDATE sessions.session_directory SET deleted_at=NULL,title='late private text' WHERE session_id='directory-race' RETURNING session_id")).rows).toEqual([]);
    // Higher isolation cannot keep a stale snapshot and insert behind a committed erase.
    await writer.query("BEGIN ISOLATION LEVEL REPEATABLE READ;SELECT count(*) FROM sessions.session_erasure_fences");
    await eraser.query("BEGIN");await erase("old-snapshot");

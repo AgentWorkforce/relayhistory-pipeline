@@ -9,6 +9,7 @@ import { assertDestinationUrl, destinationPolicy } from "../shared/destination-u
 import type { SqlRun } from "../session-ingest/ledger-sql.ts";
 import type { SessionEraseConfig } from "../session-ingest/session-erase.ts";
 import { INBOX_NAMESPACE } from "../session-ingest/async-admission.ts";
+import { INBOX_UPLOAD_NAMESPACE } from "../session-ingest/upload-inbox-contract.ts";
 import { eraseDiscoveredSessionBytes } from "./selfhost-eraser.ts";
 import { sessionEraseConfig as bytesConfig, sessionEraseCredentials } from "./selfhost-eraser-main.ts";
 import { sessionEraseWorker, sqlEraseLedger, sqlSessionWriteGuard, type EraseSearchPort, type EraseStoreIdentity, type EraseWork } from "./runtime.ts";
@@ -118,7 +119,7 @@ async function searchPort(env: NodeJS.ProcessEnv, metadata: pg.PoolConfig) {
 export async function stagedObjectsAbsent(eraser: Pick<ReturnType<typeof createS3Eraser>, "verifyErased">,
  keyRoot: string, key: Pick<EraseWork,"orgId"|"workspaceId">, authorize: () => Promise<void>): Promise<boolean> {
  for (const prefix of [`${keyRoot}/${key.orgId}/live-batches/v1/ws=${key.workspaceId}/`,
-   `${keyRoot}/${key.orgId}/buffered-batches/`, `${keyRoot}/${INBOX_NAMESPACE}/`, `${keyRoot}/.upload-inbox/`]) {
+   `${keyRoot}/${key.orgId}/buffered-batches/`, `${keyRoot}/${INBOX_NAMESPACE}/`, `${keyRoot}/${INBOX_UPLOAD_NAMESPACE}/`]) {
   const proof = await eraser.verifyErased(prefix, { authorize });
   if (proof.status !== "erased") return false;
  }

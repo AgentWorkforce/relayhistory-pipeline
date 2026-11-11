@@ -55,6 +55,8 @@ async function rollback(ctx: LaneContext): Promise<Record<string, string>> {
     "  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator erase fence check: erase fences exist; refusing to remove enforcement';END IF;",
     "END $rollback_guard$;",
     ...bodies,
+    "DROP TRIGGER ingest_erase_fence_directory_guard ON sessions.session_directory;",
+    "DROP TRIGGER ingest_erase_fence_directory_lock ON sessions.session_directory;",
     "DROP TRIGGER ingest_erase_fence_index_guard ON sessions.session_index;",
     "DROP TRIGGER ingest_erase_fence_index_lock ON sessions.session_index;",
     "DROP FUNCTION " + [...ctx.defined].filter((s) => !HOOKS.some(([h]) => h === s)).reverse().join(",\n ") + ";",
