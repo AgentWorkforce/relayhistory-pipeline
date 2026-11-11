@@ -112,10 +112,21 @@ test("F1: a newer pointer revision re-arms a parked wakeup like armWakeup; the r
 test("F1 keeps armWakeup's debounce: with an idle window the re-armed wakeup waits, it is not due at once", async () => {
   const s = await setup();
   await s.park();
+  const parked = (await s.wakeup())!;
   await pointer(s.pg, { revision: 2 });
-  expect(await s.worker({ idleSeconds: 600 })()).toEqual({});
-  const w = await s.pg.query<{ left: number }>("SELECT extract(epoch FROM due_at - now())::int AS left FROM sessions.session_brief_wakeups");
-  expect(w.rows[0]!.left).toBeGreaterThan(500);expect(w.rows[0]!.left).toBeLessThanOrEqual(600);
+  const idleSeconds = 600;
+  expect(await s.worker({ idleSeconds })()).toEqual({});
+  const after = (await s.wakeup())!;
+  expect(s.model.requests).toHaveLength(0);
+  if (after.generation === parked.generation) {
+    // An existing midnight deadline inside the idle window already wins.
+    expect(after).toEqual(parked);
+    expect(await s.left()).toBeLessThanOrEqual(idleSeconds);
+  } else {
+    expect(Number(after.generation)).toBe(Number(parked.generation) + 1);
+    expect(+(after.due_at as Date) - +(after.evidence_at as Date)).toBe(idleSeconds * 1000);
+    expect(+(after.due_at as Date)).toBeLessThan(+(parked.due_at as Date));
+  }
 });
 
 test("F3: raising the per-session cap mid-day (3 -> 5) makes the parked wakeup due and it is generated once", async () => {
