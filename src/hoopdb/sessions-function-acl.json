@@ -801,6 +801,10 @@
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"
     ],
+    "sessions.ingest_operator_runtime_write_failed(text,text,uuid)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
     "sessions.ingest_operator_runtime_write_finish(text,text,uuid)": [
       "<owner>:EXECUTE",
       "bulls96_session_ingest:EXECUTE"

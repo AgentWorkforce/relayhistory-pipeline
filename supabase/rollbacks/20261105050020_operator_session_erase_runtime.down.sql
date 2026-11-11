@@ -6,7 +6,7 @@ DO $guard$ DECLARE v_sha text;t record;BEGIN
  LOCK TABLE sessions.__96bulls_migrations IN SHARE ROW EXCLUSIVE MODE;
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105050020_operator_session_erase_runtime.sql') THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator runtime: later migration applied';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105050020_operator_session_erase_runtime.sql' FOR UPDATE;
- IF v_sha IS DISTINCT FROM 'a50550276b6a23ee104db97ef74ed66555802f19e185b2284366ca7e0cafc157' THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator runtime: own applied checksum required';END IF;
+ IF v_sha IS DISTINCT FROM '02e79e329c25f80dfafdb137639f87ef3e623925ff21d266d4d93e2355ea492f' THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator runtime: own applied checksum required';END IF;
  IF EXISTS(SELECT 1 FROM sessions.session_erasure_writes) OR EXISTS(SELECT 1 FROM sessions.session_erasure_runs) OR EXISTS(SELECT 1 FROM sessions.session_erasure_scopes) THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator runtime: used erase or write state exists';END IF;
  FOR t IN SELECT c.relname FROM pg_trigger g JOIN pg_class c ON c.oid=g.tgrelid WHERE g.tgfoid='sessions.ingest_operator_runtime_metadata_guard()'::regprocedure LOOP
   EXECUTE format('DROP TRIGGER operator_erase_metadata_guard ON sessions.%I',t.relname);END LOOP;
@@ -23,6 +23,7 @@ DROP FUNCTION sessions.ingest_operator_runtime_metadata_guard(),
  sessions.ingest_operator_runtime_next(uuid),
  sessions.ingest_operator_runtime_begin(text,text,text,text,text,text,text,text,text,text),
  sessions.ingest_operator_runtime_location_valid(text,text,text,text,text,text,text),
+ sessions.ingest_operator_runtime_write_failed(text,text,uuid),
  sessions.ingest_operator_runtime_write_finish(text,text,uuid),
  sessions.ingest_operator_runtime_write_begin(jsonb),
  sessions.ingest_operator_runtime_ids(text,text,text,text);
