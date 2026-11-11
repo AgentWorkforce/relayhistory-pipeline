@@ -98,7 +98,7 @@ Each guarantee below has a mutation in `scripts/aws-hardening-mutations.ts` (`--
 
 Default off. Every step below needs Khaliq's explicit OK, and none of it is run by this repository.
 
-1. **Admission principal.** `bulls96_analysis_admit` is created NOLOGIN before migrate by `supabase/bootstrap/session_read_api_roles.sql`, and the migration grants it EXECUTE on `sessions.analysis_request_v1` only. After migrate, as `postgres`:
+1. **Admission principal.** `bulls96_analysis_admit` is created NOLOGIN before migrate by `supabase/bootstrap/session_read_api_roles.sql`, and the migration grants it EXECUTE on `sessions.analysis_request_v1` only. That bootstrap refuses with 55000 `bootstrap bulls96_analysis_admit: the role has an unexpected member` (and the same for `bulls96_digest_narrative`) when any role other than the Supabase PG16+ creator edge is a member, exactly as for `bulls96_read_api`; nothing is changed, so revoke the membership by hand and rerun. After migrate, as `postgres`:
    ```sh
    psql -v ON_ERROR_STOP=1 -X -d <HoopDb> -f supabase/bootstrap/session_analysis_admit_role.sql
    psql -X -d <HoopDb> -c '\password bulls96_analysis_admit'   # password from 1Password, never on disk
