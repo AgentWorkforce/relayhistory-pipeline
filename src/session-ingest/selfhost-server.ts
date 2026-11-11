@@ -81,7 +81,8 @@ import { assertConditionalWrites, buildLockerStore } from "../shared/locker.ts";
 import type { ObjectStore } from "../shared/vendor.ts";
 import { AuthError } from "../session-read-api/app.ts";
 import { createIngestApp, IDENTITY_HEADER, SIGNATURE_HEADER, type IngestIdentity } from "./app.ts";
-import { ADMISSION_ACCEPT_VALUE, INBOX_NAMESPACE } from "./async-admission.ts";
+import { ADMISSION_ACCEPT_VALUE, INBOX_NAMESPACE, type AdmissionMessage } from "./async-admission.ts";
+import { promoteUpload } from "./upload-admission.ts";
 import type { DeliverDeps } from "./deliver.ts";
 import { selfhostAdmissionConsumer, type SelfhostAdmissionConsumer, type SelfhostAdmissionOptions, type SelfhostAdmissionStatus } from "./selfhost-admission.ts";
 import { sqlLedger } from "./ledger-sql.ts";
@@ -189,7 +190,7 @@ export interface SelfhostRuntimeOptions {
 }
 
 /** The ingest app over the given parts. Canonical acceptance, inline writes, no fan-out, no replica, no custody. */
-export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
+export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
   const sessionSelection = settings.sessionSelection === true;
   const verified = new WeakMap<Request, IngestIdentity>();
   const deliver: DeliverDeps = {
@@ -226,26 +227,33 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     return { app, routes, verify: parts.verify, bind: (request, identity) => void verified.set(request, identity), ready: parts.ready, close: parts.close, admissionMode: "sync" };
   }
   const mode = admission.mode === "async" ? "on" as const : "drain" as const;
+  const inboxRoot = `${settings.keyRoot}/${INBOX_NAMESPACE}/`;
+  // No queue: the inbox PUT is the record, and the consumer's scan is the authority. This only lets the
+  // consumer start on a fresh upload without waiting for the next scan; it never throws.
+  const notify = async (message: AdmissionMessage) => { if (message.key.startsWith(inboxRoot)) consumer.notify(message.key); };
+  // HISTORY_UPLOAD_DIRECT allowlist|on (selfhost-config.ts): the consumer's scan also promotes the upload inbox.
+  const upload = settings.uploadDirect;
+  const uploadInbox = upload
+    ? { batchSize: upload.scanBatch, promote: (key: string) => promoteUpload(key, { config: upload.config, deliver, witnessKey: upload.witnessKey, enqueue: notify, ...(options.nowMs ? { nowMs: options.nowMs } : {}) }) }
+    : undefined;
   const consumer: SelfhostAdmissionConsumer = selfhostAdmissionConsumer({
     mode, deliver, concurrency: admission.concurrency, scanIntervalMs: admission.scanIntervalMs, maxAttempts: admission.maxAttempts,
-    ...(options.nowMs ? { nowMs: options.nowMs } : {}), ...(options.log ? { log: options.log } : {}),
+    ...(options.nowMs ? { nowMs: options.nowMs } : {}), ...(options.log ? { log: options.log } : {}), ...(uploadInbox ? { uploadInbox } : {}),
   });
   options.onConsumer?.(consumer);
-  const inboxRoot = `${settings.keyRoot}/${INBOX_NAMESPACE}/`;
   const app = withSelfhostCapabilities(createIngestApp({
     identify,
     deliver,
     log: (fields) => log.info("session ingest", fields),
     asyncAdmission: {
       mode,
-      // No queue: the inbox PUT is the record, and the consumer's scan is the authority. This only lets the
-      // consumer start on a fresh upload without waiting for the next scan; it never throws.
-      enqueue: async (message) => { if (message.key.startsWith(inboxRoot)) consumer.notify(message.key); },
+      enqueue: notify,
       ...(options.nowMs ? { nowMs: options.nowMs } : {}),
       // The #392 erase ledger answers a re-enable with its own 400 before any SQL; let it, rather than the
       // journal's 503 (a disable needs no journal: the consumer's claim filters the session).
       selfhost: { identityOf: (request) => verified.get(request), reEnableRefusedByLedger: sessionSelection },
     },
+    ...(upload ? { uploadDirect: upload.config } : {}),
     ...sessionErase,
     ...analytics,
   }));

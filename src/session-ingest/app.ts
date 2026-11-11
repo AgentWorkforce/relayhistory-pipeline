@@ -40,8 +40,9 @@ import { Hono, type Context } from "hono";
 import { log } from "../shared/log.ts";
 import { captureSafely, ingestOutcome, type AnalyticsPort } from "../shared/analytics.ts";
 import { AuthError, type VerifiedIdentity } from "../session-read-api/app.ts";
-import { assertWithinBudget, batchIdConflict, ClaimLockBusy, deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
-import { assertTenantSegment } from "./writer.ts";
+import { batchIdConflict, ClaimLockBusy, deliverBatch, deliverPrepared, IngestUnavailable, type DeliverDeps } from "./deliver.ts";
+import { prepareForAdmission } from "./admission-core.ts";
+import { UPLOAD_DIRECT_OFF, uploadAdmissionStatus, type UploadDirectConfig } from "./upload-admission.ts";
 import { ADMISSION_ACCEPT_VALUE, ADMISSION_HEADER, ADMISSION_LEGACY_REPLAY, ADMISSION_QUEUED, abortPrivacyControl, admissionStatus, beginPrivacyControl, enqueueAdmission, settlePrivacyControl, witnessPrivacyJournal, type AdmissionMessage, type AsyncAdmissionMode, type SyncAdmissionFrozenReceiptMode } from "./async-admission.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
 import type { DbErrorDiagnosis } from "./db-error-class.ts";
@@ -168,6 +169,13 @@ export interface IngestAppDeps {
    * pre-forward read for such a caller.
    */
   syncAdmissionFrozenReceipt?: SyncAdmissionFrozenReceiptMode;
+  /**
+   * HISTORY_UPLOAD_DIRECT (upload-admission.ts, relay-upload-inbox-v1). Absent or mode "off": nothing
+   * changes. Otherwise GET /v1/delivery/admission?uploadKey= answers the upload's §5 status for the
+   * verified identity; a tenant the allowlist excludes gets 404 upload_unknown. Promotion itself runs in
+   * the upload-admission Lambda (hosted) or the self-host scan, never in this app.
+   */
+  uploadDirect?: UploadDirectConfig;
   /**
    * Operator per-session erase (session-erase.ts, docs/operator-session-erase-contract.md). Absent: the
    * disabled config, so /internal/v1/session-erase/* answers 501 not_implemented and reads nothing.
@@ -406,6 +414,7 @@ export function createIngestApp(deps: IngestAppDeps) {
   const custodyMode = deps.custodySource ?? "relayhistory";
   const asyncMode: AsyncAdmissionMode = deps.asyncAdmission?.mode ?? "off";
   const selfhostAdmission = deps.asyncAdmission?.selfhost;
+  const uploadDirect = deps.uploadDirect ?? UPLOAD_DIRECT_OFF;
   if (asyncMode !== "off" && deps.deliver.acceptanceMode !== "buffered" && !selfhostAdmission) throw new Error("session ingest: async admission requires buffered acceptance");
   const nowMs = deps.asyncAdmission?.nowMs ?? Date.now;
   const syncFrozenReceipt = deps.syncAdmissionFrozenReceipt === "on";
@@ -604,9 +613,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       // header must come from the claim).
       const witness = c.get("journalWitness");
       if (asyncMode === "on" && witness && identity.admission === ADMISSION_ACCEPT_VALUE && !c.get("custody")) {
-        const prepared = await prepareDelivery({ orgId: tenant.orgId, workspaceId: tenant.workspaceId }, batch);
-        try { assertTenantSegment(deps.deliver.target.keyRoot, tenant.orgId); } catch { throw new IngestUnavailable("precheck", "tenant_not_a_segment"); }
-        assertWithinBudget(deps.deliver, prepared.records, new Date(receivedAtMs));
+        const prepared = await prepareForAdmission(deps.deliver, tenant, batch, receivedAtMs);
         try {
           await enqueueAdmission({ store: deps.deliver.target.store, keyRoot: deps.deliver.target.keyRoot, enqueue: deps.asyncAdmission!.enqueue }, tenant, prepared, receivedAtMs, witness.seq);
         } catch (error) {
@@ -868,6 +875,16 @@ export function createIngestApp(deps: IngestAppDeps) {
   // Async admission status (S3 only): admitted | refused (with its code) | pending.
   app.get("/v1/delivery/admission", async (c) => {
     const identity = c.get("identity");
+    // HISTORY_UPLOAD_DIRECT (upload-admission.ts): `?uploadKey=` answers relay-upload-inbox-v1 §5. Flag off:
+    // the query is ignored and the originId + receiptId form below answers, unchanged.
+    const uploadKey = c.req.query("uploadKey");
+    if (uploadKey !== undefined && uploadDirect.mode !== "off") {
+      const answer = await uploadAdmissionStatus(deps.deliver.target, uploadDirect, { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId }, uploadKey);
+      if (answer.retryAfterSeconds !== undefined) c.header("Retry-After", String(answer.retryAfterSeconds));
+      if (answer.ok) return c.json(answer.body);
+      emit({ route: "delivery.admission.upload", outcome: answer.code, org_id: identity.orgId });
+      return c.json(errorBody(c, answer.code, answer.message), answer.status);
+    }
     try {
       const originId = c.req.query("originId") ?? "", receiptId = c.req.query("receiptId") ?? "";
       if (!identifier(originId) || !/^rhr_[0-9a-f]{64}$/.test(receiptId)) invalid("Invalid admission query");
