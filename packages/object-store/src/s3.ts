@@ -214,6 +214,7 @@ class S3Transport implements Transport {
         res.headers.get("x-amz-version-id"),
       ),
       metadata: metadataFromHeaders(res.headers, "x-amz-meta-"),
+      ...sseFromHeaders(res.headers),
     };
   }
 
@@ -233,6 +234,7 @@ class S3Transport implements Transport {
           res.headers.get("x-amz-version-id"),
         ),
         metadata: metadataFromHeaders(res.headers, "x-amz-meta-"),
+        ...sseFromHeaders(res.headers),
       },
       body: res.body,
     };
@@ -272,6 +274,18 @@ class S3Transport implements Transport {
       expiresSeconds: ttlSeconds,
     });
   }
+}
+
+/** The object's server-side encryption, as the store reports it; each field only when its header is present. */
+function sseFromHeaders(
+  headers: Headers,
+): Pick<ObjectMeta, "serverSideEncryption" | "sseKmsKeyId"> {
+  const sse = headers.get("x-amz-server-side-encryption");
+  const kmsKeyId = headers.get("x-amz-server-side-encryption-aws-kms-key-id");
+  return {
+    ...(sse !== null ? { serverSideEncryption: sse } : {}),
+    ...(kmsKeyId !== null ? { sseKmsKeyId: kmsKeyId } : {}),
+  };
 }
 
 function versionOf(eTag: string | null, version: string | null): ObjectVersion {

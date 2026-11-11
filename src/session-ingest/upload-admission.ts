@@ -10,7 +10,7 @@
  * seq, writes, and records the outcome. A refusal before the hand-off is recorded here.
  *
  *   key -> keyRoot -> flag scope -> witness key (config) -> status (idempotency) -> object GET
- *   -> witness (MAC, exp) -> binding (tenant, seq) -> journal (seq not ahead) -> bytes (size, d=)
+ *   -> SSE (HISTORY_UPLOAD_INBOX_SSE, default off) -> witness (MAC, exp) -> binding (tenant, seq) -> journal (seq not ahead) -> bytes (size, d=)
  *   -> zstd -> JSON + parseDeliveryRequest -> account -> origin (+ b=) -> prepareForAdmission
  *   -> status "handed_off" -> enqueueAdmission -> delete the upload object
  *
@@ -60,14 +60,32 @@ export const UPLOAD_DIRECT_ALLOWLIST_VAR = "HISTORY_UPLOAD_DIRECT_ALLOWLIST";
 /** The shared witness MAC key (32 bytes, unpadded base64url). No default, ever. */
 export const UPLOAD_WITNESS_KEY_VAR = "UPLOAD_WITNESS_KEY";
 
+/**
+ * What the consumer requires of an upload object's server-side encryption: unset, "" or "none" (the default)
+ * requires nothing (an S3-compatible store without KMS, e.g. MinIO); "aws:kms" refuses (upload_unencrypted)
+ * any object whose own HEAD/GET response lacks `x-amz-server-side-encryption: aws:kms`.
+ */
+export const UPLOAD_INBOX_SSE_VAR = "HISTORY_UPLOAD_INBOX_SSE";
+
 export type UploadDirectMode = "off" | "allowlist" | "on";
+export type UploadInboxSse = "none" | "aws:kms";
 export interface UploadDirectConfig {
   mode: UploadDirectMode;
   /** allowlist only: the admitted orgs and workspaces (a tenant matches when either matches). */
   orgs: ReadonlySet<string>;
   workspaces: ReadonlySet<string>;
+  /** HISTORY_UPLOAD_INBOX_SSE. */
+  inboxSse: UploadInboxSse;
 }
-export const UPLOAD_DIRECT_OFF: UploadDirectConfig = Object.freeze({ mode: "off", orgs: new Set<string>(), workspaces: new Set<string>() });
+export const UPLOAD_DIRECT_OFF: UploadDirectConfig = Object.freeze({ mode: "off", orgs: new Set<string>(), workspaces: new Set<string>(), inboxSse: "none" });
+
+/** Unset, "" or "none": "none". Exactly "aws:kms" otherwise; anything else throws, naming the variable only. */
+function uploadInboxSse(env: Record<string, string | undefined>): UploadInboxSse {
+  const raw = env[UPLOAD_INBOX_SSE_VAR];
+  if (raw === undefined || raw === "" || raw === "none") return "none";
+  if (raw === "aws:kms") return "aws:kms";
+  throw new Error(`96bulls: ${UPLOAD_INBOX_SSE_VAR} must be none or aws:kms`);
+}
 
 const SEGMENT = /^(?!\.)[A-Za-z0-9._-]{1,128}$/;
 
@@ -76,9 +94,10 @@ const SEGMENT = /^(?!\.)[A-Za-z0-9._-]{1,128}$/;
  * either). allowlist needs at least one valid entry. Errors name the variable, never the value.
  */
 export function uploadDirectConfig(env: Record<string, string | undefined>): UploadDirectConfig {
+  const inboxSse = uploadInboxSse(env);
   const raw = env[UPLOAD_DIRECT_FLAG];
-  if (raw === undefined || raw === "" || raw === "off") return UPLOAD_DIRECT_OFF;
-  if (raw === "on") return { mode: "on", orgs: new Set(), workspaces: new Set() };
+  if (raw === undefined || raw === "" || raw === "off") return inboxSse === "none" ? UPLOAD_DIRECT_OFF : Object.freeze({ ...UPLOAD_DIRECT_OFF, inboxSse });
+  if (raw === "on") return { mode: "on", orgs: new Set(), workspaces: new Set(), inboxSse };
   if (raw !== "allowlist") throw new Error(`96bulls: ${UPLOAD_DIRECT_FLAG} must be off, allowlist or on`);
   const orgs = new Set<string>(), workspaces = new Set<string>();
   for (const entry of (env[UPLOAD_DIRECT_ALLOWLIST_VAR] ?? "").split(",").map((e) => e.trim()).filter(Boolean)) {
@@ -87,7 +106,7 @@ export function uploadDirectConfig(env: Record<string, string | undefined>): Upl
     (m[1] === "org" ? orgs : workspaces).add(m[2]!);
   }
   if (orgs.size + workspaces.size === 0) throw new Error(`96bulls: ${UPLOAD_DIRECT_FLAG}=allowlist needs ${UPLOAD_DIRECT_ALLOWLIST_VAR}`);
-  return { mode: "allowlist", orgs, workspaces };
+  return { mode: "allowlist", orgs, workspaces, inboxSse };
 }
 
 export function uploadDirectAllows(config: UploadDirectConfig, tenant: { orgId: string; workspaceId: string }): boolean {
@@ -293,6 +312,9 @@ export async function promoteUpload(key: string, deps: PromoteUploadDeps): Promi
     }
     return removeUpload({ action: "ack", outcome: "refused", code });
   };
+
+  // SSE (§6 upload_unencrypted, HISTORY_UPLOAD_INBOX_SSE): from the same response, before the witness.
+  if (deps.config.inboxSse === "aws:kms" && object.meta.serverSideEncryption !== "aws:kms") return refuse("upload_unencrypted");
 
   // Witness (§3): from the object's own metadata, the same response as the body.
   const witness = verifyUploadWitness(witnessKey, object.meta.metadata?.["relay-witness"], Math.floor(now / 1000));

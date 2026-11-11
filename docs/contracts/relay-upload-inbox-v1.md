@@ -59,8 +59,8 @@ hex     = lowercase
 | `Content-Type`                           | `application/json`                                                                                            |
 | `Content-Encoding`                       | `zstd`                                                                                                        |
 | `x-amz-checksum-sha256`                  | base64 (standard, padded) of the raw sha256 of the stored bytes (`uploadChecksumSha256`; vector `object.checksumSha256Header`) |
-| `x-amz-server-side-encryption`           | `aws:kms`                                                                                                     |
-| `x-amz-server-side-encryption-aws-kms-key-id` | the credentials response's `kmsKeyId`                                                                    |
+| `x-amz-server-side-encryption`           | `aws:kms`; omitted when `kmsKeyId` is `null` (§4)                                                             |
+| `x-amz-server-side-encryption-aws-kms-key-id` | the credentials response's `kmsKeyId`; omitted when it is `null` (§4)                                    |
 | `x-amz-meta-relay-witness`               | the witness token, verbatim                                                                                   |
 
 - **Responses:** the desktop treats **200 or 412** as "Queued" and then polls §5. Any other answer leaves the batch in the desktop's queue for a retry. That retry uses the same key while the witness is unchanged.
@@ -98,27 +98,29 @@ mac     = HMAC-SHA256(key, "relay-upload-witness-v1\n" + payloadB64url)
 - **403 `forbidden`** (browser-cookie caller) and **403 `handoff_not_exchanged`** (the desktop sign-in handoff was not exchanged): stop.
 - **404 `history_upload_direct_off`:** the feature is off for this caller (`HISTORY_UPLOAD_DIRECT`). Its only meaning: the desktop falls back to the HTTP POST path.
 - **429 `rate_limited`** with `Retry-After`: retry after the delay.
+- **501 `unsupported_by_backend`:** the backend has no STS (an S3-compatible self-host store). The desktop retries the same request with `"kind": "presigned"`.
 - **503 `upload_credentials_unavailable`** and **503 `privacy_journal_unavailable`:** fall back to the ingest edge for this batch.
 
 JSON object key order is not part of the contract.
 
 ```
-STS:       {"contract":"relay-upload-inbox-v1","kind":"sts","bucket","region","endpoint":null,"keyPrefix","kmsKeyId",
+STS:       {"contract":"relay-upload-inbox-v1","kind":"sts","bucket","region","endpoint":null|"<url>","keyPrefix","kmsKeyId":"<id>",
             "credentials":{"accessKeyId","secretAccessKey","sessionToken","expiresAt"},
             "witness","witnessSeq","maxObjectBytes":2097152,"refreshAfter"}
-presigned: {"contract":"relay-upload-inbox-v1","kind":"presigned","bucket","region","endpoint":null,"keyPrefix","kmsKeyId",
+presigned: {"contract":"relay-upload-inbox-v1","kind":"presigned","bucket","region","endpoint":null|"<url>","keyPrefix","kmsKeyId":"<id>"|null,
             "maxObjectBytes":2097152,"refreshAfter","witness","witnessSeq","urls":[{"key","url","expiresAt"}]}
 ```
 
-`parseUploadCredentialsResponse(value)` validates these bodies, with exact keys at every level, and returns the typed body or null. The vectors `credentials.sts` and `credentials.presigned` pass it. It checks the following:
+`parseUploadCredentialsResponse(value)` validates these bodies, with exact keys at every level, and returns the typed body or null. The vectors `credentials.sts`, `credentials.presigned` and `credentials.presignedSelfhost` (an S3-compatible self-host store: a path-prefixed `endpoint` and `kmsKeyId: null`) pass it. It checks the following:
 
 - **Timestamps:** `expiresAt`, `refreshAfter` and each url's `expiresAt` are RFC 3339 UTC strings ending in `Z` and naming a real instant. `refreshAfter` is not later than the earliest expiry in the body.
 - **`maxObjectBytes`** equals `MAX_DELIVERY_BYTES`.
 - **`keyPrefix`** parses as a §1 prefix.
 - **The witness matches the prefix.** Its payload, read unverified, has the `keyPrefix` tenant: the same org and ws, and `userSegment(ws, user)` equal to `u=`. Its `seq` equals `witnessSeq`.
 - **Presigned urls:** 1 to 64 entries with distinct keys (`UPLOAD_MAX_PRESIGNED_URLS`). Each `key` is relative to `keyPrefix`, and `keyPrefix + key` parses as a §1 key with `w<witnessSeq>`. Each `url` is an absolute http(s) URL with no userinfo and no fragment.
-- **`endpoint`** is `null` (the provider's default endpoint for `region`, which is what hosted always sends) or an http(s) origin URL with path `/`, for a self-host S3-compatible store.
-- **`bucket`** follows S3 bucket naming. **`region`** is `[a-z0-9-]{1,64}`. **`kmsKeyId`** is a non-empty printable string.
+- **`endpoint`** is `null` (the provider's default endpoint for `region`, which is what hosted always sends) or, for a self-host S3-compatible store, an http(s) URL `scheme://host[:port]` with an optional path prefix (`https://objects.example.test:9000/relayhistory`), at most 2048 characters. No userinfo, no query, no fragment (not even an empty `?` or `#`), no dot segments, and no trailing slash after a path prefix: `…/a/b` is accepted, `…/a/b/` is refused. A bare origin, with or without its `/`, is accepted. relay-control emits it normalised, without a trailing slash. A non-null `endpoint` means path-style addressing for `sts`: the object URL is `<endpoint>/<bucket>/<key>`. Presigned urls are PUT as-is. There is no separate path-style field.
+- **`bucket`** follows S3 bucket naming. **`region`** is `[a-z0-9-]{1,64}`.
+- **`kmsKeyId`** is always present. It is a non-empty printable string of at most 2048 characters, or `null` with `kind: "presigned"` only. `null` means the store has no KMS: the desktop signs and sends **no** SSE headers (neither `x-amz-server-side-encryption` nor `x-amz-server-side-encryption-aws-kms-key-id`). An `sts` body with `kmsKeyId: null` is refused. Hosted always sends a key id and `endpoint: null`.
 
 Credentials are secrets in transit. They are never logged or persisted beyond the desktop's in-memory use.
 
@@ -160,6 +162,7 @@ The consumer applies these checks in this order. The first failure is the upload
 | code | check / meaning |
 | --- | --- |
 | `upload_key_invalid` | the key does not parse under §1 (`parseUploadKey`) |
+| `upload_unencrypted` | the store requires SSE-KMS (`HISTORY_UPLOAD_INBOX_SSE=aws:kms`) and the object was stored without it: its own HEAD/GET response does not carry `x-amz-server-side-encryption: aws:kms`. With the setting unset, `""` or `none` (the default) nothing is required |
 | `upload_witness_invalid` | `x-amz-meta-relay-witness` missing or malformed, not the exact payload form, or the MAC does not verify |
 | `upload_witness_expired` | witness `exp` is at or before the consumer's clock |
 | `upload_tenant_mismatch` | key (org, ws, uh) differs from the witness (org, ws, `userSegment(ws, user)`) (`bindUploadToWitness`) |
@@ -191,5 +194,6 @@ The `parseDeliveryRequest` codes come from the vendored `prepare.ts` (`:47`, `:2
 
 ## 7. What this contract does not change
 
-- **No existing code changes:** this pipeline's routes, the async-admission inbox, the consumer's key-prefix check (`admission-consumer.ts:73`), the IAM grants and the bucket notifications are unchanged.
+- **Unchanged:** this pipeline's routes, the async-admission inbox, the consumer's key-prefix check (`admission-consumer.ts:73`), the IAM grants and the bucket notifications are unchanged.
+- **The 2026-11-11 self-host amendment** (decision 0004 addendum) adds `kmsKeyId: null` for `presigned`, path-prefixed endpoints, the 501 answer and the default-off `upload_unencrypted` check. Hosted bodies (a key id, `endpoint: null`) and their handling are unchanged.
 - **Wiring later:** the consumer that admits upload-inbox objects, the status route's `uploadKey` form, and every AWS resource arrive in later PRs. Each AWS action needs its own approval (decision 0004).
