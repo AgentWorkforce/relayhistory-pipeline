@@ -158,9 +158,17 @@ async function outcome(s: Started, receiptId: string) {
 
 /**
  * Ledger evidence: one batch row (committed, this receipt), one revision row, no outbox row, `commits`
- * commit calls; store evidence: one manifest naming one chunk, and `rawObjects` raw chunk objects.
+ * commit calls; store evidence: one manifest naming one chunk, that chunk's raw object present and
+ * readable at its content-addressed key, and between `rawObjects.min` and `rawObjects.max` raw chunk
+ * objects in total. A single sealing attempt leaves exactly one. Two attempts that both reach the writer
+ * leave one or two, depending on the interleaving: the raw key is
+ * `raw/{seq}-{offset}-{sha256(source)[0:8]}` and each attempt's source lines carry its own wall-clock
+ * `received_at` (millisecond resolution), so two seals in different milliseconds write two keys (the
+ * manifest CAS loser's chunk stays unreferenced), while two seals in the same millisecond write the same
+ * key (create-only put: the second keeps the stored object), and a writer that reads the winner's manifest
+ * before sealing replays without sealing. Never more than one object per attempt.
  */
-async function exactlyOne(s: Started, receiptId: string, commits = 1, rawObjects = 1) {
+async function exactlyOne(s: Started, receiptId: string, commits = 1, rawObjects: { min: number; max: number } = { min: 1, max: 1 }) {
   const rows = (await s.db.query("SELECT batch_id, receipt_id, state FROM sessions.ingest_batches")).rows;
   expect(rows).toEqual([{ batch_id: "b-replay", receipt_id: receiptId, state: "committed" }]);
   expect(await s.count("sessions.ingest_record_revisions")).toBe(1);
@@ -170,10 +178,19 @@ async function exactlyOne(s: Started, receiptId: string, commits = 1, rawObjects
   const tenant = (await keys(s.store, "96bulls/org-a")).map((k) => k.key).sort();
   const manifests = tenant.filter((k) => k.endsWith("/manifest.json"));
   expect(manifests).toHaveLength(1);
-  const manifest = JSON.parse(await new Response((await s.store.getObject(objectKey(manifests[0]!))).body).text()) as { raw: { chunk_count: number; chunks: unknown[] } };
+  const manifest = JSON.parse(await new Response((await s.store.getObject(objectKey(manifests[0]!))).body).text()) as {
+    raw: { chunk_count: number; chunks: { seq: number; start_offset: number; sha256_8: string; stored_bytes: number }[] };
+  };
   expect(manifest.raw.chunk_count).toBe(1);
   expect(manifest.raw.chunks).toHaveLength(1);
-  expect(tenant.filter((k) => k.includes("/raw/"))).toHaveLength(rawObjects);
+  // The chunk the manifest references is stored (in every interleaving) and readable in full.
+  const chunk = manifest.raw.chunks[0]!;
+  const referenced = `${dirname(manifests[0]!)}/raw/${String(chunk.seq).padStart(10, "0")}-${chunk.start_offset}-${chunk.sha256_8}.ndjson.zst`;
+  const raw = tenant.filter((k) => k.includes("/raw/"));
+  expect(raw).toContain(referenced);
+  expect((await new Response((await s.store.getObject(objectKey(referenced))).body).arrayBuffer()).byteLength).toBe(chunk.stored_bytes);
+  expect(raw.length).toBeGreaterThanOrEqual(rawObjects.min);
+  expect(raw.length).toBeLessThanOrEqual(rawObjects.max);
 }
 
 describe("replay idempotency across the HTTP (edge, async) and upload (promoteUpload) paths", () => {
@@ -239,12 +256,14 @@ describe("replay idempotency across the HTTP (edge, async) and upload (promoteUp
     // Both claims ran before either commit: the second claim of the still-pending batch is the ledger's
     // `resume` (same digest, new claim token), not a replay, so both attempts commit and both record
     // `accepted`. ingest_commit_batch is idempotent, so the rows stay exactly one and the manifest names one
-    // chunk; the losing writer's raw chunk object stays in the store unreferenced (one orphan object).
+    // chunk. The raw object count is interleaving-dependent (see exactlyOne): two when the attempts seal in
+    // different milliseconds (the CAS loser's chunk stays unreferenced, one orphan), one when they seal in
+    // the same millisecond or the second reads the winner's manifest first.
     expect(after.admitted).toMatchObject({ state: "admitted", code: "accepted" });
     const claims = s.texts.filter((t) => t.includes("ingest_claim_batch")).length;
     expect(claims).toBe(2);
     expect(await status(s, key)).toMatchObject({ ok: true, body: { state: "admitted", receiptId: http.receiptId } });
-    await exactlyOne(s, http.receiptId, 2, 2);
+    await exactlyOne(s, http.receiptId, 2, { min: 1, max: 2 });
   });
 
   test("control: two pending HTTP attempts of the same batch behave identically (path-independent)", async () => {
@@ -257,6 +276,6 @@ describe("replay idempotency across the HTTP (edge, async) and upload (promoteUp
     expect(after.attemptsInDir).toBe(2);
     expect(after.admitted).toMatchObject({ state: "admitted", code: "accepted" });
     expect(s.texts.filter((t) => t.includes("ingest_claim_batch")).length).toBe(2);
-    await exactlyOne(s, a.receiptId, 2, 2);
+    await exactlyOne(s, a.receiptId, 2, { min: 1, max: 2 }); // same interleaving-dependent 1 or 2 raw objects
   });
 });
