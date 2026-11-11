@@ -7,6 +7,7 @@ import {
   resolveRenamedLedger,
   RUNTIME_APPLICATION_FUNCTIONS,
 } from "../hoopdb/migrate-guards.ts";
+import { isHeldScope } from "../hoopdb/held-scope.ts";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
@@ -107,6 +108,8 @@ export interface ExpectedSchema {
    * with the sessions function signatures that step alone creates. The live function
    * gate tolerates an allowlisted signature being ABSENT only when it is listed here
    * exactly (same name and argument types) for a held step the ledger does not have.
+   * Only a heldScope() result is accepted (see src/hoopdb/held-scope.ts): any other
+   * value, including a copy or a hand-built map, is refused release_target_held_untrusted.
    */
   held?: readonly { name: string; creates: readonly string[] }[];
 }
@@ -241,6 +244,12 @@ export async function schemaVerdict(
 ): Promise<SchemaVerdict> {
   type Stage = "config" | "ledger" | "marker" | "verify" | "final";
   let stage = "config" as Stage; // widened: it is advanced inside the transaction callback
+  // `creates` is trusted only from heldScope(), which derives it from the tree's SQL
+  // bytes; anything else could excuse a prefix-owned function. Refused before any SQL.
+  if (expected.held !== undefined && !isHeldScope(expected.held)) {
+    log.warn("live role validation gate closed", { error_code: "release_target_held_untrusted", reason: stage });
+    return { ok: false, reason: "role_validation_failed", error_code: "release_target_held_untrusted" };
+  }
   try {
     const timeoutMs = gateTimeoutMs();
     return await transact(async (tx): Promise<SchemaVerdict> => {
