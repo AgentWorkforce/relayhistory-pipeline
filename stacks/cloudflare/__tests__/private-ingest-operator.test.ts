@@ -72,25 +72,26 @@ const tools = {
     nativeBindingsSha256: "f".repeat(64),
   };
 const digest = (v: string) => createHash("sha256").update(v).digest("hex");
-async function actualPlanProof(declared: "canonical" | "buffered" | "admission" | "admission-default" | "admission-drain" | "frozen-receipt") {
+async function actualPlanProof(declared: "canonical" | "buffered" | "admission" | "admission-default" | "admission-drain" | "custody" | "frozen-receipt") {
   // "admission": buffered + asyncAdmission "on" (the three admission resources and two more bindings).
   // "admission-default": buffered with asyncAdmission OMITTED, which resolves to "on" (same as "admission").
   // "admission-drain": buffered + asyncAdmission "drain" (same resources, the var says drain).
   // "buffered": buffered + explicit asyncAdmission "off": the four resources, byte-identical to before.
-  // "frozen-receipt": buffered + frozen-supabase custody + syncAdmissionFrozenReceipt, asyncAdmission "off" (two more vars, no resource).
+  // "custody" / "frozen-receipt": buffered + frozen custody, optionally the receipt; asyncAdmission "off".
   const mode = declared === "canonical" ? "canonical" : "buffered";
   const admission = declared === "admission" || declared === "admission-default" || declared === "admission-drain";
   const admissionVar = declared === "admission-drain" ? "drain" : "on";
-  const frozenReceipt = declared === "frozen-receipt";
-  const bindingCount = admission || frozenReceipt ? 17 : mode === "buffered" ? 15 : 13;
+  const frozenReceipt = declared === "frozen-receipt", custody = declared === "custody" || frozenReceipt;
+  const bindingCount = admission || frozenReceipt ? 17 : custody ? 16 : mode === "buffered" ? 15 : 13;
   const input = {
     ...baseInput,
     sessionIngest: {
       ...baseInput.sessionIngest,
       ...(declared === "admission" ? { asyncAdmission: "on" as const } : {}),
       ...(declared === "admission-drain" ? { asyncAdmission: "drain" as const } : {}),
-      ...(declared === "buffered" || frozenReceipt ? { asyncAdmission: "off" as const } : {}),
-      ...(frozenReceipt ? { custodySource: "frozen-supabase" as const, syncAdmissionFrozenReceipt: "on" as const } : {}),
+      ...(declared === "buffered" || custody ? { asyncAdmission: "off" as const } : {}),
+      ...(custody ? { custodySource: "frozen-supabase" as const } : {}),
+      ...(frozenReceipt ? { syncAdmissionFrozenReceipt: "on" as const } : {}),
       ...(mode === "buffered"
         ? {
             acceptanceMode: "buffered" as const,
@@ -408,6 +409,62 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
           { ...b, data: { bindings: [{ ...b.data.bindings[0], text: "off" }] } }) } } } }, input)).toThrow("native_binding_target");
       const { syncAdmissionFrozenReceipt: _s, ...withoutFlag } = input.sessionIngest as any;
       expect(() => assertOperatorSnapshot(native, { ...input, sessionIngest: withoutFlag })).toThrow("native_binding_inventory");
+      const receiptBinding = worker.bindings.find((b: any) =>
+        b.sid === "INGEST_SYNC_ADMISSION_FROZEN_RECEIPT");
+      const { INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: _receipt, ...receiptRollbackEnv } = worker.props.env;
+      const receiptRollbackWorker = {
+        ...worker,
+        action: "update",
+        props: { ...worker.props, env: receiptRollbackEnv },
+        state: { status: "updated", props: worker.props },
+        bindings: worker.bindings.map((b: any) => b === receiptBinding
+          ? { ...b, action: "delete" }
+          : b),
+      };
+      expect(assertOperatorSnapshot({ ...native, native: { ...native.native, resources: {
+        ...rowsOf, "session-ingest": receiptRollbackWorker,
+      } } }, { ...input, sessionIngest: withoutFlag })).toHaveLength(bindingCount);
+      expect(() => assertOperatorSnapshot({ ...native, native: { ...native.native, resources: {
+        ...rowsOf,
+        "session-ingest": {
+          ...receiptRollbackWorker,
+          state: { ...receiptRollbackWorker.state, props: {
+            ...receiptRollbackWorker.state.props,
+            env: { ...receiptRollbackWorker.state.props.env, INGEST_CUSTODY_SOURCE: "shadow" },
+          } },
+        },
+      } } }, { ...input, sessionIngest: withoutFlag })).toThrow("native_binding_target");
+    }
+    if (custody && !frozenReceipt) {
+      const rowsOf = native.native.resources, worker = rowsOf["session-ingest"];
+      const custodyBinding = worker.bindings.find((b: any) => b.sid === "INGEST_CUSTODY_SOURCE");
+      const { INGEST_CUSTODY_SOURCE: _custody, ...custodyRollbackEnv } = worker.props.env;
+      const { custodySource: _source, ...withoutCustody } = input.sessionIngest as any;
+      const custodyRollbackWorker = {
+        ...worker,
+        action: "update",
+        props: { ...worker.props, env: custodyRollbackEnv },
+        state: { status: "updated", props: worker.props },
+        bindings: worker.bindings.map((b: any) => b === custodyBinding
+          ? { ...b, action: "delete" }
+          : b),
+      };
+      expect(assertOperatorSnapshot({ ...native, native: { ...native.native, resources: {
+        ...rowsOf, "session-ingest": custodyRollbackWorker,
+      } } }, { ...input, sessionIngest: withoutCustody })).toHaveLength(bindingCount);
+      expect(() => assertOperatorSnapshot({ ...native, native: { ...native.native, resources: {
+        ...rowsOf,
+        "session-ingest": {
+          ...custodyRollbackWorker,
+          state: { ...custodyRollbackWorker.state, props: {
+            ...custodyRollbackWorker.state.props,
+            env: {
+              ...custodyRollbackWorker.state.props.env,
+              INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: "on",
+            },
+          } },
+        },
+      } } }, { ...input, sessionIngest: withoutCustody })).toThrow("native_binding_target");
     }
     if (mode === "buffered") {
       const worker = native.native.resources["session-ingest"];
@@ -566,7 +623,7 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
     await rm(dir, { recursive: true, force: true });
   }
 }
-test.each(["canonical", "buffered", "admission", "admission-default", "admission-drain", "frozen-receipt"] as const)(
+test.each(["canonical", "buffered", "admission", "admission-default", "admission-drain", "custody", "frozen-receipt"] as const)(
   "actual original four-resource declaration %s uses authenticated HTTP state and retained plan",
   actualPlanProof,
 );

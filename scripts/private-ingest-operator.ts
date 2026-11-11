@@ -920,37 +920,47 @@ export function assertOperatorSnapshot(
             oldExpected = currentEnv?.INGEST_EXPECT_GENERATION,
             newExpected = proposedEnv?.INGEST_EXPECT_GENERATION,
             oldAccepted = currentEnv?.INGEST_ACCEPT_GENERATIONS;
-          // The retained operator may remove exactly one binding, and only for
-          // the documented G -> H generation-window closure. Bind the deleted
-          // payload to the old resolved state and the new single generation;
-          // arbitrary binding deletion remains refused.
-          if (
-            b.sid !== "INGEST_ACCEPT_GENERATIONS" ||
-            row.action !== "update" ||
-            wanted !== undefined ||
-            input.sessionIngest.overlapGeneration !== undefined ||
-            input.sessionIngest.expectedGeneration !== newExpected ||
-            typeof oldExpected !== "string" ||
-            !/^[0-9a-f]{64}$/u.test(oldExpected) ||
-            typeof newExpected !== "string" ||
-            !/^[0-9a-f]{64}$/u.test(newExpected) ||
-            oldExpected === newExpected ||
-            oldAccepted !== `${oldExpected},${newExpected}` ||
-            proposedEnv?.INGEST_ACCEPT_GENERATIONS !== undefined ||
-            !Array.isArray(actual) ||
-            actual.length !== 1 ||
-            Object.entries(b.data).some(
-              ([k, v]) => k !== "bindings" && v !== undefined,
-            ) ||
-            inputsDigest(JSON.stringify({ value: actual[0] })) !==
-              inputsDigest(JSON.stringify({
-                value: {
-                  type: "plain_text",
-                  name: "INGEST_ACCEPT_GENERATIONS",
-                  text: oldAccepted,
-                },
-              }))
-          )
+          if (row.action !== "update" || wanted !== undefined ||
+              !Array.isArray(actual) || actual.length !== 1 ||
+              Object.entries(b.data).some(([k, v]) => k !== "bindings" && v !== undefined))
+            refuse("native_binding_target");
+          let deletedValue: unknown;
+          if (b.sid === "INGEST_ACCEPT_GENERATIONS") {
+            // Documented G -> H generation-window closure.
+            if (input.sessionIngest.overlapGeneration !== undefined ||
+                input.sessionIngest.expectedGeneration !== newExpected ||
+                typeof oldExpected !== "string" || !/^[0-9a-f]{64}$/u.test(oldExpected) ||
+                typeof newExpected !== "string" || !/^[0-9a-f]{64}$/u.test(newExpected) ||
+                oldExpected === newExpected || oldAccepted !== `${oldExpected},${newExpected}` ||
+                proposedEnv?.INGEST_ACCEPT_GENERATIONS !== undefined)
+              refuse("native_binding_target");
+            deletedValue = oldAccepted;
+          } else if (b.sid === "INGEST_CUSTODY_SOURCE") {
+            // CI rollout rollback: step 1 -> baseline only.
+            if (input.sessionIngest.custodySource !== undefined ||
+                input.sessionIngest.syncAdmissionFrozenReceipt !== undefined ||
+                currentEnv?.INGEST_CUSTODY_SOURCE !== "frozen-supabase" ||
+                currentEnv?.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT !== undefined ||
+                proposedEnv?.INGEST_CUSTODY_SOURCE !== undefined)
+              refuse("native_binding_target");
+            deletedValue = "frozen-supabase";
+          } else if (b.sid === "INGEST_SYNC_ADMISSION_FROZEN_RECEIPT") {
+            // CI rollout rollback: step 2 -> step 1 only.
+            if (input.sessionIngest.syncAdmissionFrozenReceipt !== undefined ||
+                input.sessionIngest.custodySource !== "frozen-supabase" ||
+                currentEnv?.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT !== "on" ||
+                currentEnv?.INGEST_CUSTODY_SOURCE !== "frozen-supabase" ||
+                proposedEnv?.INGEST_CUSTODY_SOURCE !== "frozen-supabase" ||
+                proposedEnv?.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT !== undefined)
+              refuse("native_binding_target");
+            deletedValue = "on";
+          } else {
+            refuse("native_binding_target");
+          }
+          if (inputsDigest(JSON.stringify({ value: actual[0] })) !==
+              inputsDigest(JSON.stringify({ value: {
+                type: "plain_text", name: b.sid, text: deletedValue,
+              } })))
             refuse("native_binding_target");
           inventory.push({
             sid: b.sid,
