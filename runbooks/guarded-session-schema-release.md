@@ -20,12 +20,49 @@ Separately provision/review the private ingest Worker, ingestion Hyperdrive/logi
 
 1. Merge the reviewed release route and required schema source onto main through the authorized integration process. Wait for the **current main SHA's push** ci and pg-proof workflows to complete successfully. Every job must succeed, including checks, session-read-worker / worker, and real PostgreSQL 15/16/17. Failed, skipped, incomplete, missing, truncated or different-SHA evidence refuses.
 2. Compute the migration generation from that exact checkout: `bun src/hoopdb/migrate.ts --generation`. The workflow recomputes it before requesting protected approval and before connecting.
-3. Dispatch **guarded session schema release** on main with mode=plan, exact sha, exact generation, and boundary=global-default-revoke. That is the workflow's only boundary option and the only value the release contract accepts; it is not a choice between boundaries. Any other value, event-trigger included, refuses with release_inputs before any GitHub API call or database connection. Leave plan_run and approval empty. Approve the protected environment job (with no reviewer rule, the pinned account must have made the dispatch itself).
-4. Download **schema-release-plan** from the successful plan run. Review project, source SHA, generation, boundary, ledger digest, each migration name/SHA/pending bit, the exact ACL preview, and existingBoundary (the existing event trigger's identity evidence and its current function-body digest, prosrc_sha256). The database work runs in REPEATABLE READ READ ONLY: the pinned owner identity check, then the existing advisory lock and shared migration preflight, then the boundary inspection. The plan refuses unless the global-default-revoke control is catalog-proven (release_boundary_control) and the existing event trigger already has the exact safe identity (release_boundary_identity); only its function body may still be the preceding release's. No bootstrap, migration, grant, boundary or marker SQL runs. The artifact contains names, hashes, role names, flags and ACL evidence only, no credential or source content.
-5. After reviewing that concrete plan, dispatch mode=apply on the **same still-current main SHA** within 24 hours, supplying the plan run ID and exactly:
-   `APPLY <supabase-project> <sha> <generation> PLAN <plan_run>`.
-   Approve this new protected environment job (with no reviewer rule, the pinned account must make this dispatch itself). The prior plan must be a successful first-attempt manual run of this same workflow/SHA created within the last 24 hours; its immutable artifact must bind project/SHA/generation/boundary/run and carry a safe existingBoundary. The typed string alone never authorizes an unreviewed or foreign plan.
-6. Apply repeats the read-only inspection (owner identity, global control, event-trigger identity) and refuses if the ledger digest (release_ledger_changed) or the existingBoundary digest (release_boundary_changed) differs from the plan. It then calls the existing runMigrations with Supabase mode, shim=false, bootstrap=false, verify=true, function boundary global-default-revoke and bulls96_runtime LOGIN=true. That takes the migrator's session advisory lock, repeats its normal authority/role/sequence preflight and compares the current ledger digest to the plan **under that lock**. Immediately before the first write it rechecks live GitHub source/CI/human authority and then performs the CI boundary refresh described below. The existing phase-2 role verifiers and exact ACL guards must all finish before the existing PASS marker. A final SELECT requires that PASS marker for the exact approved generation, and the exact event-trigger boundary is verified once more after PASS.
+3. Dispatch **guarded session schema release** on main with mode=plan, exact sha, exact generation, boundary=global-default-revoke, the required **target** and the required **target_sha**. global-default-revoke is the workflow's only boundary option and the only value the release contract accepts; it is not a choice between boundaries. Any other value, event-trigger included, refuses with release_inputs before any GitHub API call or database connection. **target** is the last schema step this release may apply, exactly as ledgered (for example `upstream:20261105047000_coordination_fact_readers.sql`). **target_sha** is the full 40-hex commit the release is anchored to. It must be sha itself or on sha's first-parent (main) history; a commit reachable only through a merged side branch is refused, because the runtime image is published at target_sha and only first-parent main commits carry the release's CI provenance. When target_sha differs from sha, target_sha's own **push** ci and pg-proof workflows on main must also be green exactly as in step 1 (latest run completed and successful; every job, including checks, session-read-worker / worker and real PostgreSQL 15/16/17, completed and successful at target_sha), checked at plan and again under the lock. Its tree must contain the target with no later step of the target's own lane (release_target_tail). Already-applied steps of the other lane may follow the target (for example 96bulls lane steps after an upstream target): they are part of the manifest and bound by name and sha256 like every other step. Every held step (any pending step after the target, in either lane) must be absent from target_sha's tree: the tree must hold exactly the release tree's schema steps without the held ones (same names, same file sha256, nothing else; release_target_tree_mismatch). For example 113dc6576d014ede149c0f1cdc484c5e980dd4e4 is on the first-parent history of later main and its upstream tail is 20261105047000. When nothing will be held, use target_sha = sha. **Images for a prefix release are published at target_sha**: its `--generation` is the only generation the release may mark PASS. Leave target_generation, plan_run and approval empty. Approve the protected environment job (with no reviewer rule, the pinned account must have made the dispatch itself). The database job checks out full history (fetch-depth: 0) and reads target_sha only from the local Git object database (no fetch). These refuse:
+   - an abbreviated or unknown target_sha, or one that is not sha and not on sha's first-parent history, including a side commit merged into sha's history (release_target_sha, release_target_sha_unknown, release_target_sha_not_ancestor);
+   - a target_sha other than sha whose own push ci or pg-proof run on main is missing, incomplete or failed (release_target_ci), or whose jobs are failed, incomplete, missing, truncated or tested another SHA (release_target_ci_jobs);
+   - a target_sha tree with a later step of the target's own lane after the target (release_target_tail);
+   - a target_sha tree whose steps differ from the release prefix (release_target_tree_mismatch);
+   - a target_sha tree that lacks a phase 2 verifier file (release_target_verifier_missing).
+4. Download **schema-release-plan** from the successful plan run. Review:
+   - project, source SHA, generation, boundary, ledger digest;
+   - each migration name/SHA/pending bit and the exact ACL preview;
+   - existingBoundary: the existing event trigger's identity evidence and its current function-body digest, prosrc_sha256;
+   - **target**;
+   - **expectedPending**: the pending steps up to and including the target, the only steps the apply may run;
+   - **held**: the pending steps after the target, never applied by this release;
+   - **targetSha**;
+   - **targetManifest**: the target commit's schema steps as [name, sha256] and its 7 phase 2 verifier digests;
+   - **manifestDigest**: the one canonical digest of that manifest (src/hoopdb/migrate.ts releaseManifestDigest);
+   - **targetGeneration**: the generation algorithm over the target commit's own steps and verifier files, i.e. exactly what `bun src/hoopdb/migrate.ts --generation` prints on a checkout of target_sha. It equals generation when held is empty (the plan refuses otherwise), and it is the only generation this release may mark PASS.
+
+   The database work runs in REPEATABLE READ READ ONLY: the pinned owner identity check, then the existing advisory lock and shared migration preflight, then the boundary inspection. The plan refuses unless the global-default-revoke control is catalog-proven (release_boundary_control) and the existing event trigger already has the exact safe identity (release_boundary_identity); only its function body may still be the preceding release's. The plan also refuses an unknown target (release_target_unknown), an already applied target (release_target_not_pending) and a target below its lane's ledgered tail (release_target_passed); ledger_gap is unchanged. No bootstrap, migration, grant, boundary or marker SQL runs. The artifact contains names, hashes, role names, flags and ACL evidence only, no credential or source content.
+5. After reviewing that concrete plan, dispatch mode=apply on the **same still-current main SHA** within 24 hours. Supply the same target and target_sha, the plan run ID, target_generation copied from the plan's **targetGeneration**, and exactly:
+   `APPLY <supabase-project> <sha> <generation> TARGET <target> <target_sha> <target_generation> MANIFEST <manifest_digest> PLAN <plan_run>`
+   with manifest_digest copied from the plan's **manifestDigest**.
+   Approve this new protected environment job (with no reviewer rule, the pinned account must make this dispatch itself). The prior plan must be a successful first-attempt manual run of this same workflow/SHA created within the last 24 hours. Its immutable artifact must bind project/SHA/generation/boundary/target/targetSha/targetGeneration/manifestDigest/run and carry a safe existingBoundary, and its manifest must recompute to manifestDigest and targetGeneration (release_plan_artifact). The typed string alone never authorizes an unreviewed or foreign plan.
+6. Apply works in this order:
+   1. **Before connecting**, it recomputes the target_sha anchor from the local object database and refuses any difference from the plan (release_target_manifest_changed). The anchor covers ancestry, tree equality with this checkout's prefix, verifier files, manifest, manifestDigest and targetGeneration.
+   2. It repeats the read-only inspection (owner identity, global control, event-trigger identity). It refuses if the ledger digest (release_ledger_changed) or the existingBoundary digest (release_boundary_changed) differs from the plan, if the live expectedPending and held lists differ from the plan's (release_target_pending_changed), or if the anchor recomputed there differs (release_target_generation_changed, release_target_manifest_changed).
+   3. It then calls the existing runMigrations with Supabase mode, shim=false, bootstrap=false, verify=true, function boundary global-default-revoke, bulls96_runtime LOGIN=true and the approved target binding. That takes the migrator's session advisory lock and repeats its normal authority/role/sequence preflight.
+   4. **Under that lock and before any write**, the migrator does four things:
+      - compares the current ledger digest to the plan;
+      - recomputes the pending/held split and refuses the same way;
+      - recomputes the manifest from the on-disk prefix files plus the target commit's verifier digests, and refuses a digest other than the approved one (release_target_manifest_changed);
+      - refuses held steps that come without that binding (release_target_binding_required).
+   5. **Immediately before the first write**, it rechecks live GitHub source/CI/human authority, recomputes the target_sha anchor once more, and then performs the CI boundary refresh described below.
+   6. The pending marker is written for targetGeneration and the steps up to the target apply. Held steps are never applied or ledgered.
+   7. Phase 2 runs on that prefix. First come this release tree's role verifiers, hardening and exact ACL guards. The ACL manifest is scoped to the prefix: a manifest function is excused only when it does not exist and a held step creates it, and every existing function, including ones a held step replaces, must still match exactly. Then come the target commit's own 7 verifiers, read from the object database with their digests checked.
+   8. Only after both verifier sets pass is the existing PASS marker written, for targetGeneration, never for the full-tree generation. Any failure leaves the marker pending for targetGeneration.
+   9. A final SELECT requires PASS for the exact approved targetGeneration (release_marker). The apply also reads back that every expectedPending step is ledgered and no held step is (release_target_readback), and the exact event-trigger boundary is verified once more after PASS. It prints `release_target_held <n>`.
+
+   **Images after a prefix release:**
+   - An image built at target_sha (whose `--generation` is targetGeneration) is then ready, and its 043700 owner-buffered parity check matches.
+   - An image of the full tree stays schema_pending until a later release applies the held steps. That release's PASS moves to its own generation, and the target image then reports validation_pending.
+
+   **A prefix the verifiers cannot validate fails closed.** An example is a target that holds steps whose objects a verifier requires, such as the 96bulls lane on an empty database. Phase 2 rolls back, the marker stays pending for targetGeneration, and the release needs a later target.
 
 ### Function boundary: required control and CI refresh
 
@@ -64,12 +101,15 @@ not replace the human gate with a typed string or admin bypass.
 
 For a reviewed SSH session, scripts/schema-release-operator-plan.ts is a separate
 PLAN-ONLY entry. Set RELEASE_MODE=plan, RELEASE_SHA to its exact immutable reviewed
-checkout, RELEASE_GENERATION to that checkout's generation, and
+checkout, RELEASE_GENERATION to that checkout's generation,
 RELEASE_BOUNDARY=global-default-revoke (the only accepted value; event-trigger or
-anything else refuses with release_inputs before connecting). Supply the postgres
-owner URL as SUPABASE_MIGRATION_OWNER_URL only in the
-process environment using the approved credential system; leave RELEASE_PLAN_RUN
-and RELEASE_APPROVAL unset. Invoke:
+anything else refuses with release_inputs before connecting), RELEASE_TARGET to the
+target step and RELEASE_TARGET_SHA to the full target commit (the checkout must hold
+full history; the JSON includes target, expectedPending, held, targetSha,
+targetManifest, manifestDigest and targetGeneration, the generation an apply of that
+split marks PASS). Supply the postgres owner URL as SUPABASE_MIGRATION_OWNER_URL only
+in the process environment using the approved credential system; leave
+RELEASE_TARGET_GENERATION, RELEASE_PLAN_RUN and RELEASE_APPROVAL unset. Invoke:
   bun scripts/schema-release-operator-plan.ts
 
 It enforces the same input contract, connection/postgres owner pins and REPEATABLE
