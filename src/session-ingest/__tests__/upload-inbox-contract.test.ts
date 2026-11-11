@@ -76,6 +76,12 @@ async function buildVectors() {
     maxObjectBytes: MAX_DELIVERY_BYTES, refreshAfter: "2026-11-11T00:10:00Z", witness, witnessSeq: SEQ,
     urls: [{ key: relativeKey, url: "https://s3.example.invalid/example-upload-bucket/placeholder?X-Amz-Signature=synthetic", expiresAt: "2026-11-11T00:15:00Z" }],
   };
+  // An S3-compatible self-host store without KMS or STS: a path-prefixed endpoint, no SSE headers (kmsKeyId null).
+  const credentialsPresignedSelfhost = {
+    contract: UPLOAD_CONTRACT, kind: "presigned", bucket: "example-upload-bucket", region: "us-east-1", endpoint: "https://objects.example.test:9000/relayhistory", keyPrefix, kmsKeyId: null,
+    maxObjectBytes: MAX_DELIVERY_BYTES, refreshAfter: "2026-11-11T00:10:00Z", witness, witnessSeq: SEQ,
+    urls: [{ key: relativeKey, url: "https://objects.example.test:9000/relayhistory/example-upload-bucket/placeholder?X-Amz-Signature=synthetic", expiresAt: "2026-11-11T00:15:00Z" }],
+  };
   const receiptId = "rhr_" + "0".repeat(64);
   const statuses = {
     pending: { contract: UPLOAD_CONTRACT, uploadKey: objectKey, state: "pending", receivedAtMs: 1_762_819_200_000, retryAfterSeconds: 15 },
@@ -111,7 +117,8 @@ async function buildVectors() {
     objectKey,
     parsedKey: parsed,
     witness: { testOnlyKey: TEST_KEY_TEXT, payload: PAYLOAD, payloadJson: JSON.stringify(PAYLOAD), macInput: `${UPLOAD_WITNESS_DOMAIN}${b64urlJson(PAYLOAD)}`, token: witness, verifiedAtSeconds: NOW },
-    credentials: { sts: credentialsSts, presigned: credentialsPresigned },
+    // presignedSelfhost first: the existing entries stay byte-identical (the amendment only adds lines).
+    credentials: { presignedSelfhost: credentialsPresignedSelfhost, sts: credentialsSts, presigned: credentialsPresigned },
     admissionStatus: statuses,
     refusals,
   };
@@ -155,8 +162,8 @@ describe("constants and enums", () => {
     expect([...UPLOAD_REFUSAL_CODES].sort()).toEqual([
       "admission_failed", "admission_invalid", "delivery_account_mismatch", "delivery_budget_exceeded", "delivery_privacy_superseded", "delivery_too_large",
       "invalid_delivery", "tenant_not_a_segment", "unsupported_encoding", "unsupported_evidence", "unsupported_mapping", "unsupported_protocol", "unsupported_schema",
-      "upload_digest_mismatch", "upload_key_invalid", "upload_origin_mismatch", "upload_tenant_mismatch", "upload_witness_expired", "upload_witness_invalid",
-      "upload_witness_seq_mismatch",
+      "upload_digest_mismatch", "upload_key_invalid", "upload_origin_mismatch", "upload_tenant_mismatch", "upload_unencrypted", "upload_witness_expired",
+      "upload_witness_invalid", "upload_witness_seq_mismatch",
     ]);
   });
 
@@ -302,13 +309,50 @@ describe("credentials and admission status validators", () => {
     const v = vectors();
     expect(parseUploadCredentialsResponse(v.credentials.sts)).toEqual(v.credentials.sts);
     expect(parseUploadCredentialsResponse(v.credentials.presigned)).toEqual(v.credentials.presigned);
+    expect(parseUploadCredentialsResponse(v.credentials.presignedSelfhost)).toEqual(v.credentials.presignedSelfhost);
     for (const s of Object.values(v.admissionStatus)) expect(parseUploadAdmissionStatus(s)).toEqual(s as object);
     expect(parseUploadCredentialsResponse({ ...v.credentials.sts, endpoint: "https://objects.example.invalid/" })).not.toBeNull();
   });
 
+  test("self-host amendment: kmsKeyId null for presigned only, endpoint with an optional path prefix", () => {
+    const v = vectors();
+    const { sts, presigned, presignedSelfhost } = v.credentials;
+    expect(presignedSelfhost.kmsKeyId).toBeNull();
+    expect(presignedSelfhost.endpoint).toBe("https://objects.example.test:9000/relayhistory");
+    // kmsKeyId: null only with presigned; never absent; never empty.
+    expect(parseUploadCredentialsResponse({ ...presigned, kmsKeyId: null })).not.toBeNull();
+    expect(parseUploadCredentialsResponse({ ...sts, kmsKeyId: null })).toBeNull();
+    const { urls: _u, ...selfhostAsSts } = presignedSelfhost;
+    expect(parseUploadCredentialsResponse({ ...selfhostAsSts, kind: "sts", credentials: sts.credentials, refreshAfter: sts.refreshAfter })).toBeNull();
+    expect(parseUploadCredentialsResponse({ ...selfhostAsSts, kind: "sts", credentials: sts.credentials, refreshAfter: sts.refreshAfter, kmsKeyId: "kms-key-placeholder" })).not.toBeNull();
+    for (const base of [sts, presigned, presignedSelfhost]) {
+      const { kmsKeyId: _, ...absent } = base;
+      expect(parseUploadCredentialsResponse(absent)).toBeNull();
+      expect(parseUploadCredentialsResponse({ ...base, kmsKeyId: "" })).toBeNull();
+      expect(parseUploadCredentialsResponse({ ...base, kmsKeyId: "x".repeat(2049) })).toBeNull();
+      expect(parseUploadCredentialsResponse({ ...base, kmsKeyId: 1 })).toBeNull();
+      expect(parseUploadCredentialsResponse({ ...base, kmsKeyId: "kms key" })).toBeNull();
+    }
+    expect(parseUploadCredentialsResponse({ ...presignedSelfhost, kmsKeyId: "kms-key-placeholder" })).not.toBeNull();
+    // endpoint: accepted forms (sts and presigned alike).
+    for (const base of [sts, presigned, presignedSelfhost]) {
+      for (const endpoint of [null, "https://objects.example.test", "https://objects.example.test/", "http://objects.example.test:9000", "https://objects.example.test:9000/",
+        "https://objects.example.test:9000/relayhistory", "https://objects.example.test/a/b", "http://10.0.0.1:9000/a-b_c.d~e", "https://objects.example.test/" + "a".repeat(2000)])
+        expect(`${endpoint}:${parseUploadCredentialsResponse({ ...base, endpoint }) !== null}`).toBe(`${endpoint}:true`);
+      // endpoint: refused forms.
+      for (const endpoint of ["https://objects.example.test/a/b/", "https://objects.example.test/relayhistory/", "https://objects.example.test//",
+        "https://objects.example.test/a//b", "https://objects.example.test/?", "https://objects.example.test/a?x=1", "https://objects.example.test?x=1",
+        "https://objects.example.test/#", "https://objects.example.test/a#f", "https://objects.example.test#f", "https://user@objects.example.test/a",
+        "https://user:pw@objects.example.test", "https://objects.example.test/a/../b", "https://objects.example.test/a/./b", "https://objects.example.test/%2e%2e/b",
+        "https://objects.example.test/.", "https://objects.example.test/a/..", "https://objects.example.test\\a", "https://objects.example.test/a b", "ftp://objects.example.test/a",
+        "objects.example.test/a", "/relayhistory", "", "https://objects.example.test/" + "a".repeat(2030), 42, undefined])
+        expect(`${endpoint}:${parseUploadCredentialsResponse({ ...base, endpoint }) !== null}`).toBe(`${endpoint}:false`);
+    }
+  });
+
   test("refuse an extra or a missing key, and inconsistent fields", () => {
     const v = vectors();
-    for (const base of [v.credentials.sts, v.credentials.presigned]) {
+    for (const base of [v.credentials.sts, v.credentials.presigned, v.credentials.presignedSelfhost]) {
       expect(parseUploadCredentialsResponse({ ...base, extra: 1 })).toBeNull();
       for (const k of Object.keys(base)) {
         const { [k]: _, ...missing } = base;

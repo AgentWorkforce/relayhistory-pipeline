@@ -211,6 +211,37 @@ describe("S3 server-side encryption", () => {
   });
 });
 
+describe("S3 head/getObject: server-side encryption in ObjectMeta", () => {
+  it("reports the SSE headers when present and omits the fields when absent", async () => {
+    const { createS3Store } = await import("../src/s3.js");
+    let sse = true;
+    const fetchImpl = (async () => {
+      const headers: Record<string, string> = { etag: '"e"', "content-length": "1" };
+      if (sse) {
+        headers["x-amz-server-side-encryption"] = "aws:kms";
+        headers["x-amz-server-side-encryption-aws-kms-key-id"] = "arn:aws:kms:us-east-1:000000000000:key/example";
+      }
+      return new Response(new Uint8Array([1]), { status: 200, headers });
+    }) as typeof fetch;
+    const s = createS3Store({ bucket: "b", region: "us-east-1", endpoint: "http://localhost:1", credentials: { accessKeyId: "k", secretAccessKey: "s" }, fetch: fetchImpl });
+    const head = await s.head(objectKey("a/b.json"));
+    const got = await s.getObject(objectKey("a/b.json"));
+    await got.body.cancel();
+    for (const meta of [head!, got.meta]) {
+      expect(meta.serverSideEncryption).toBe("aws:kms");
+      expect(meta.sseKmsKeyId).toBe("arn:aws:kms:us-east-1:000000000000:key/example");
+    }
+    sse = false;
+    const plainHead = await s.head(objectKey("a/b.json"));
+    const plainGet = await s.getObject(objectKey("a/b.json"));
+    await plainGet.body.cancel();
+    for (const meta of [plainHead!, plainGet.meta]) {
+      expect("serverSideEncryption" in meta).toBe(false);
+      expect("sseKmsKeyId" in meta).toBe(false);
+    }
+  });
+});
+
 describe("S3 put: abort signal and the created version id", () => {
   it("passes the caller's signal to the request and returns x-amz-version-id", async () => {
     const { createS3Store } = await import("../src/s3.js");

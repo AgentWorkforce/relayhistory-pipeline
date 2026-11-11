@@ -58,6 +58,26 @@
     "verifiedAtSeconds": 1762819200
   },
   "credentials": {
+    "presignedSelfhost": {
+      "contract": "relay-upload-inbox-v1",
+      "kind": "presigned",
+      "bucket": "example-upload-bucket",
+      "region": "us-east-1",
+      "endpoint": "https://objects.example.test:9000/relayhistory",
+      "keyPrefix": "96bulls/.upload-inbox/org-synthetic/v1/ws=ws-synthetic/u=5a3b60a76d453cbeead919bae088d3b5/",
+      "kmsKeyId": null,
+      "maxObjectBytes": 2097152,
+      "refreshAfter": "2026-11-11T00:10:00Z",
+      "witness": "v1.eyJ2IjoxLCJvcmciOiJvcmctc3ludGhldGljIiwid3MiOiJ3cy1zeW50aGV0aWMiLCJ1c2VyIjoidXNlci1zeW50aGV0aWMtYSIsInNlcSI6NywiZXhwIjoxNzk0MzU1MjAwfQ.Q8WhA5OtmmCFKH3UPe85UnVBjjo_SQgGfDv-nDrRSO8",
+      "witnessSeq": 7,
+      "urls": [
+        {
+          "key": "o=origin-synthetic/b=f671c6d71e203808d157b293a8f29b25/d=36d61817e86f05e696d3b4af66dbb3ff-w7.json.zst",
+          "url": "https://objects.example.test:9000/relayhistory/example-upload-bucket/placeholder?X-Amz-Signature=synthetic",
+          "expiresAt": "2026-11-11T00:15:00Z"
+        }
+      ]
+    },
     "sts": {
       "contract": "relay-upload-inbox-v1",
       "kind": "sts",
