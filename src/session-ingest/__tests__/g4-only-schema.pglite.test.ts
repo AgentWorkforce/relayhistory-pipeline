@@ -154,6 +154,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105050010_operator_session_erase_fence_check.sql",
       // One read-role-only SECURITY DEFINER summary activity counter; no ingest path touches it.
       "20261105056000_session_summary_activity.sql",
+      // One read-role-only SECURITY DEFINER per-user session aggregate; no ingest path touches it.
+      "20261105057000_session_directory_users_aggregate.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

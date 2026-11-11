@@ -17,6 +17,12 @@ import {
   releaseErrorCode,
 } from "../src/hoopdb/schema-release-inspect.ts";
 import { githubGet, githubReleaseGate } from "./schema-release-github.ts";
+import {
+  refreshReleaseBoundary,
+  releaseBoundaryDigest,
+  requireSafeReleaseBoundary,
+  verifyReleaseBoundary,
+} from "../src/hoopdb/schema-release-boundary.ts";
 export function validateReleasePlan(
   plan: any,
   input: { sha: string; generation: string; boundary: string; planRun: string },
@@ -33,7 +39,11 @@ export function validateReleasePlan(
     !plan.inventory.length
   )
     refuse("release_plan_artifact");
-  return plan.ledgerSha256 as string;
+  requireSafeReleaseBoundary(plan.existingBoundary);
+  return {
+    ledgerSha256: plan.ledgerSha256 as string,
+    existingBoundary: plan.existingBoundary,
+  };
 }
 export async function releaseDatabase() {
   const get = githubGet();
@@ -47,7 +57,7 @@ export async function releaseDatabase() {
   )
     refuse("release_checkout_generation");
   const profile = releaseProfile(input.boundary);
-  const plannedLedger =
+  const approvedPlan =
     input.mode === "apply"
       ? validateReleasePlan(
           JSON.parse(await readFile("release-plan/plan.json", "utf8")),
@@ -79,13 +89,20 @@ export async function releaseDatabase() {
       console.log("release_readonly_plan_complete");
       return;
     }
-    if (inspection.ledgerSha256 !== plannedLedger)
+    if (inspection.ledgerSha256 !== approvedPlan!.ledgerSha256)
       refuse("release_ledger_changed");
+    if (
+      releaseBoundaryDigest(inspection.existingBoundary) !==
+      releaseBoundaryDigest(approvedPlan!.existingBoundary)
+    )
+      refuse("release_boundary_changed");
     await runMigrations(client, {
       profile,
-      expectedLedgerSha256: plannedLedger,
-      beforeWrite: () =>
-        githubReleaseGate(process.env, get, true).then(() => {}),
+      expectedLedgerSha256: approvedPlan!.ledgerSha256,
+      beforeWrite: async () => {
+        await githubReleaseGate(process.env, get, true);
+        await refreshReleaseBoundary(client, approvedPlan!.existingBoundary);
+      },
     });
     const marker = (
       await client.query(
@@ -95,6 +112,7 @@ export async function releaseDatabase() {
     ).rows[0];
     if (marker?.status !== "pass" || marker.generation !== input.generation)
       refuse("release_marker");
+    await verifyReleaseBoundary(client);
     console.log("release_apply_verified");
   } finally {
     await client.end().catch(() => {});

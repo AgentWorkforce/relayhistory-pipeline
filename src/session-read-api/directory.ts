@@ -68,6 +68,14 @@ export interface DirectoryActivityRow {
   sessions: number | string;
 }
 
+/** One session_directory_users_for row (GET /v1/sessions/users). */
+export interface DirectoryUserRow {
+  user_id: string;
+  sessions: number | string;
+  last_session_at: Date | string;
+  top_projects: unknown;
+}
+
 export interface DirectoryListArgs {
   sources?: string[];
   notSources?: string[];
@@ -100,6 +108,11 @@ export interface Directory {
   query(orgId: string, workspaceId: string, args: DirectoryQueryArgs): Promise<DirectoryListRow[] | null>;
   /** The SPAN activity of the sessions a parsed `q` and the list filters select. */
   queryActivity(orgId: string, workspaceId: string, since: Date, until: Date, args: DirectoryQueryActivityArgs): Promise<DirectoryActivityRow[] | null>;
+  /**
+   * Per-user session counts over [lastTsAfter, lastTsBefore) (the list's bounds), at most
+   * limit + 1 rows ordered by sessions desc, user id. Absent: this backend cannot answer.
+   */
+  users?(orgId: string, workspaceId: string, lastTsAfter: Date, lastTsBefore: Date, limit: number): Promise<DirectoryUserRow[] | null>;
 }
 
 /** A q list read: the list filters plus the parsed terms (their dates already intersected into lastTs*). */
@@ -165,6 +178,12 @@ export const DIRECTORY_QUERY_ACTIVITY_SQL = `SELECT to_char(day, 'YYYY-MM-DD') A
   FROM sessions.query_session_directory_activity_for(
     p_workspace_id => $1, ${QUERY_TERM_ARGS},
     p_since => $24, p_until => $25)`;
+
+export const USERS_FOR_SIGNATURE = "sessions.session_directory_users_for(text, timestamptz, timestamptz, integer)";
+/** The most users GET /v1/sessions/users returns (the function's p_limit 1..1000). */
+export const DIRECTORY_USERS_MAX = 1000;
+export const DIRECTORY_USERS_SQL = `SELECT user_id, sessions, last_session_at, top_projects
+  FROM sessions.session_directory_users_for($1, $2, $3, $4)`;
 
 export const DIRECTORY_INSTALLED_SQL = `SELECT to_regprocedure($1) IS NOT NULL AS installed`;
 
@@ -246,6 +265,16 @@ export function sqlDirectory(run: TenantRunner): Directory {
             a.sessionKeys?.length ? a.sessionKeys.map((k) => k.harness) : null,
             a.sessionKeys?.length ? a.sessionKeys.map((k) => k.sessionId) : null,
           ])
+          .catch(mapPgError);
+        return r.rows;
+      });
+    },
+    async users(orgId, workspaceId, lastTsAfter, lastTsBefore, limit) {
+      return run(orgId, workspaceId, async (q) => {
+        const installed = await q.query<{ installed: boolean }>(DIRECTORY_INSTALLED_SQL, [USERS_FOR_SIGNATURE]);
+        if (!installed.rows[0]?.installed) return null;
+        const r = await q
+          .query<DirectoryUserRow>(DIRECTORY_USERS_SQL, [workspaceId, lastTsAfter.toISOString(), lastTsBefore.toISOString(), limit])
           .catch(mapPgError);
         return r.rows;
       });
@@ -541,4 +570,43 @@ export function activityDays(rows: DirectoryActivityRow[], since: Date, until: D
     entry.total += sessions;
   }
   return [...byDate.values()];
+}
+
+export interface SessionUserAggregate {
+  userId: string;
+  sessions: number;
+  lastSessionAt: string;
+  topProjects: Array<{ name: string; sessions: number }>;
+}
+
+const count = (v: unknown): number => {
+  const n = typeof v === "string" && /^\d+$/u.test(v) ? Number(v) : v;
+  if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0) throw new DirectoryError("parse");
+  return n;
+};
+
+/**
+ * session_directory_users_for rows -> GET /v1/sessions/users users (at most `limit`, with
+ * `truncated` when the function returned limit + 1). Only the user id, counts, the latest
+ * activity and project names leave; a row outside that shape is a parse error.
+ */
+export function sessionUsersPage(rows: DirectoryUserRow[], limit: number): { users: SessionUserAggregate[]; truncated: boolean } {
+  if (rows.length > limit + 1) throw new DirectoryError("parse");
+  const users = rows.slice(0, limit).map((row): SessionUserAggregate => {
+    if (typeof row.user_id !== "string" || row.user_id === "") throw new DirectoryError("parse");
+    const last = row.last_session_at instanceof Date ? row.last_session_at : new Date(String(row.last_session_at));
+    if (Number.isNaN(last.getTime())) throw new DirectoryError("parse");
+    let raw = row.top_projects;
+    if (typeof raw === "string") {
+      try { raw = JSON.parse(raw); } catch { throw new DirectoryError("parse"); }
+    }
+    if (!Array.isArray(raw) || raw.length > 3) throw new DirectoryError("parse");
+    const topProjects = raw.map((p: unknown) => {
+      const { name, sessions } = (p ?? {}) as { name?: unknown; sessions?: unknown };
+      if (typeof name !== "string" || name === "") throw new DirectoryError("parse");
+      return { name, sessions: count(sessions) };
+    });
+    return { userId: row.user_id, sessions: count(row.sessions), lastSessionAt: last.toISOString(), topProjects };
+  });
+  return { users, truncated: rows.length > limit };
 }
