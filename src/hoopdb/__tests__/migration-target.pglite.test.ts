@@ -28,6 +28,7 @@ import {
   expectedSchema,
   generation,
   generationOfSteps,
+  heldScope,
   migrationTargetSplit,
   plan,
   RELEASE_TREE,
@@ -39,7 +40,8 @@ import {
 } from "../migrate.ts";
 import { releaseTargetBinding, requireTargetCommit, treeSchemaSteps, treeVerifiers, type ReleaseTargetAnchor } from "../release-target.ts";
 import { sessionsFunctionAclDrift } from "../migrate-guards.ts";
-import { schemaVerdict, type ExpectedSchema, type Transact } from "../../shared/db.ts";
+import { CONSUMER_RUNTIME_FUNCTIONS, RUNTIME_APPLICATION_FUNCTIONS } from "../migrate-guards.ts";
+import { schemaVerdict, sessionsFunctionGateSql, type ExpectedSchema, type Transact } from "../../shared/db.ts";
 
 setDefaultTimeout(120_000);
 const LOCAL: MigrationProfile = { mode: "local", shim: false, bootstrap: false, verify: true, runtimeRole: "postgres" };
@@ -481,6 +483,9 @@ const SELFHOSTED: MigrationProfile = { mode: "selfhosted", shim: true, bootstrap
 const TARGET = "upstream:20261105047000_coordination_fact_readers.sql";
 const ERASE = "upstream:20261105050000_operator_session_erase.sql";
 const ERASE_FENCE = "upstream:20261105050010_operator_session_erase_fence_check.sql";
+const ERASE_RUNTIME = "upstream:20261105050020_operator_session_erase_runtime.sql";
+/** A consumer-gate allowlist entry only the held 050020 creates (#530). */
+const RUNTIME_UPSERT = "sessions.ingest_operator_runtime_upsert(jsonb,text,text)";
 const transact = (db: PGlite): Transact => (work) => db.transaction((tx) => work(tx as never)) as never;
 const realDb = async () => {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
@@ -562,7 +567,7 @@ const runTarget = (db: PGlite, s: { split: { expectedPending: string[] }; bindin
   });
 const heldProcs = (db: PGlite) =>
   db.query<{ n: number }>(
-    "SELECT count(*)::int n FROM pg_proc WHERE proname LIKE 'ingest_operator_erase%' OR proname LIKE 'ingest_erase_fence%' OR proname IN ('session_summary_activity_for', 'session_directory_users_for')",
+    "SELECT count(*)::int n FROM pg_proc WHERE proname LIKE 'ingest_operator_erase%' OR proname LIKE 'ingest_operator_runtime%' OR proname LIKE 'ingest_erase_fence%' OR proname IN ('buffered_session_stages_for_target', 'session_summary_activity_for', 'session_directory_users_for')",
   ).then((r) => r.rows[0]!.n);
 
 test("real tree, target 047000: the target generation is target_sha's own (independently recomputed), not this tree's with or without the held steps", async () => {
@@ -570,8 +575,10 @@ test("real tree, target 047000: the target generation is target_sha's own (indep
   const split = migrationTargetSplit(names.map((name) => ({ name, pending: !name.startsWith("96bulls:") && names.indexOf(name) >= names.indexOf(TARGET) })), TARGET);
   expect(split.held).toContain(ERASE);
   expect(split.held).toContain(ERASE_FENCE);
-  // Every upstream step after the target (as of this tree: 050000, 050010, 056000, 057000).
+  // Every upstream step after the target (as of this tree: 047010, 050000, 050010, 050020, 056000, 057000).
   expect(split.held).toEqual(names.filter((n) => n.startsWith("upstream:") && n > TARGET));
+  expect(split.held).toContain("upstream:20261105047010_buffered_exact_session_stages.sql");
+  expect(split.held).toContain(ERASE_RUNTIME);
   expect(split.held).toContain("upstream:20261105056000_session_summary_activity.sql");
   expect(split.held).toContain("upstream:20261105057000_session_directory_users_aggregate.sql");
   expect(split.held.every((n) => n.startsWith("upstream:") && n > TARGET)).toBe(true);
@@ -592,9 +599,15 @@ test("real tree, target 047000: the target generation is target_sha's own (indep
 test("real tree (1)-(3): steps held, readiness is OK for the target image, schema_pending for the full image, G2 parity binds target_sha's generation", async () => {
   const s = await prefixDatabase();
   const full: ExpectedSchema = { ...(await expectedSchema()), dbMode: "selfhosted" };
-  const prefix: ExpectedSchema = { ...full, names: full.names.filter((n) => !s.split.held.includes(n)), generation: s.independent };
+  // The target image's readiness scope: the held suffix, bound to the approved prefix manifest.
+  const prefix: ExpectedSchema = {
+    ...full, names: full.names.filter((n) => !s.split.held.includes(n)), generation: s.independent,
+    held: await heldScope(s.split.held, s.binding.manifest.steps),
+  };
   expect(s.split.held).toContain(ERASE);
   expect(s.split.held).toContain(ERASE_FENCE);
+  expect(s.split.held).toContain(ERASE_RUNTIME);
+  expect(prefix.held!.find((h) => h.name === ERASE_RUNTIME)!.creates).toContain(RUNTIME_UPSERT);
   expect(s.targetGeneration).toBe(s.independent);
   expect(s.targetGeneration).not.toBe(full.generation);
   // Before the run: fenced (TARGET pending).
@@ -607,6 +620,10 @@ test("real tree (1)-(3): steps held, readiness is OK for the target image, schem
   //     at target_sha (its own --generation, recomputed independently) is ready.
   expect(await marker(s.db)).toEqual([{ generation: s.independent, status: "pass" }]);
   expect(await verdict(s.db, prefix)).toEqual({ ok: true });
+  // Without the held scope the live function gate is strict: the consumer allowlist names
+  // 050020's (held, absent) writer, and its ::regprocedure cast raises 42883.
+  const { held: _held, ...unscoped } = prefix;
+  expect(await verdict(s.db, unscoped)).toEqual({ ok: false, reason: "role_validation_failed", error_code: "42883" });
   // (2) the full-tree image stays fenced: its held steps are not in the ledger.
   expect(await verdict(s.db, full)).toEqual({ ok: false, reason: "schema_pending", count: s.split.held.length });
   // ... and never matches the target PASS even if its names were present.
@@ -681,7 +698,9 @@ test("real tree: the prefix-scoped ACL check excuses only absent functions a hel
   // Unscoped, the full manifest names every held function as missing.
   const unscoped = await sessionsFunctionAclDrift(c, "history_rt");
   expect(unscoped.length).toBeGreaterThan(0);
-  expect(unscoped.every((d) => /^sessions\.(ingest_operator_erase_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for)\w*\(.*\): missing/.test(d))).toBe(true);
+  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for)\w*\(.*\): missing/.test(d))).toBe(true);
+  expect(unscoped.some((d) => d.startsWith("sessions.ingest_operator_runtime_upsert(jsonb,text,text): missing"))).toBe(true);
+  expect(unscoped.some((d) => d.startsWith("sessions.buffered_session_stages_for_target("))).toBe(true);
   // A function a held step only replaces (it exists) is still compared exactly.
   await s.db.exec("GRANT EXECUTE ON FUNCTION sessions.ingest_commit_batch(jsonb) TO PUBLIC");
   expect((await sessionsFunctionAclDrift(c, "history_rt", heldSql)).join(";")).toContain("sessions.ingest_commit_batch(jsonb)");
@@ -690,4 +709,52 @@ test("real tree: the prefix-scoped ACL check excuses only absent functions a hel
   // A held step's function that already exists (created early) is compared exactly too.
   await s.db.exec("CREATE FUNCTION sessions.ingest_erase_fence_index_lock() RETURNS void LANGUAGE sql AS 'SELECT'; GRANT EXECUTE ON FUNCTION sessions.ingest_erase_fence_index_lock() TO history_rt");
   expect((await sessionsFunctionAclDrift(c, "history_rt", heldSql)).join(";")).toContain("sessions.ingest_erase_fence_index_lock()");
+});
+
+test("real tree: the live gate excuses only absent signatures a held, unledgered step creates", async () => {
+  const s = await prefixDatabase();
+  await runTarget(s.db, s);
+  const full: ExpectedSchema = { ...(await expectedSchema()), dbMode: "selfhosted" };
+  const held = await heldScope(s.split.held, s.binding.manifest.steps);
+  const prefix: ExpectedSchema = { ...full, names: full.names.filter((n) => !s.split.held.includes(n)), generation: s.independent, held };
+  expect(await verdict(s.db, prefix)).toEqual({ ok: true });
+  const absentOk = new Set(held.flatMap((h) => h.creates));
+  const gate = async (consumer: readonly string[]) => {
+    await s.db.exec("SET ROLE history_rt");
+    try {
+      return await failure(s.db.exec(sessionsFunctionGateSql(absentOk, { runtime: RUNTIME_APPLICATION_FUNCTIONS, consumer })));
+    } finally {
+      await s.db.exec("RESET ROLE");
+    }
+  };
+  expect(await gate(CONSUMER_RUNTIME_FUNCTIONS)).toBeNull();
+  // A typo in an allowlist entry is never excused.
+  expect(await gate([...CONSUMER_RUNTIME_FUNCTIONS, "sessions.ingest_operator_runtime_upsrt(jsonb,text,text)"])).toBe("42883");
+  // Nor a wrong overload of a held step's function (right name, other argument types).
+  expect(await gate([...CONSUMER_RUNTIME_FUNCTIONS, "sessions.ingest_operator_runtime_upsert(jsonb,text)"])).toBe("42883");
+  // A held entry the ledger has excuses nothing (the function must then exist).
+  const ledgered = prefix.names.filter((n) => n.startsWith("upstream:")).at(-1)!;
+  const stale: ExpectedSchema = {
+    ...prefix, names: prefix.names.filter((n) => n !== ledgered),
+    held: [{ name: ledgered, creates: [RUNTIME_UPSERT] }],
+  };
+  expect(await verdict(s.db, stale)).toEqual({ ok: false, reason: "role_validation_failed", error_code: "42883" });
+  // A held name that is also one of the image's steps is a mismatch, refused.
+  expect(await verdict(s.db, { ...prefix, held: [...held, { name: ledgered, creates: [] }] }))
+    .toEqual({ ok: false, reason: "role_validation_failed", error_code: "release_target_held_mismatch" });
+  // ... as is a held name that is not a step of this tree.
+  expect(await verdict(s.db, { ...prefix, held: [...held, { name: "upstream:20990101000000_not_in_tree.sql", creates: [] }] }))
+    .toEqual({ ok: false, reason: "role_validation_failed", error_code: "release_target_held_mismatch" });
+  // Held list vs the bound manifest: one step fewer, or a manifest that is not the prefix, refuses.
+  expect(await failure(heldScope(s.split.held.slice(1), s.binding.manifest.steps))).toBe("release_target_manifest_changed");
+  expect(await failure(heldScope(s.split.held, s.binding.manifest.steps.slice(0, -1)))).toBe("release_target_manifest_changed");
+  expect(await failure(heldScope(s.split.held, s.binding.manifest.steps.map(([n], i) => [n, i ? "0".repeat(64) : "f".repeat(64)] as [string, string]))))
+    .toBe("release_target_manifest_changed");
+  expect(await failure(heldScope([...s.split.held, "upstream:20990101000000_not_in_tree.sql"]))).toBe("release_target_unknown");
+  // A function an applied prefix step owns is never excused, even when a held step also
+  // (re)creates it: missing from the applied prefix, the gate raises 42883.
+  const prefixOwned = "sessions.output_facts_state(text,text,text,text[],text)";
+  expect(held.flatMap((h) => h.creates)).not.toContain(prefixOwned);
+  await s.db.exec(`DROP FUNCTION ${prefixOwned}`);
+  expect(await verdict(s.db, prefix)).toEqual({ ok: false, reason: "role_validation_failed", error_code: "42883" });
 });
