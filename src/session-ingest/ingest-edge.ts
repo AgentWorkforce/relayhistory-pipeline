@@ -57,7 +57,7 @@ import {
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { log } from "../shared/log.ts";
 import { AuthError } from "../session-read-api/app.ts";
-import { createIngestApp, encodeIdentity, IDENTITY_HEADER, type IngestAppDeps, type IngestIdentity } from "./app.ts";
+import { createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC_SCOPE, type IngestAppDeps, type IngestIdentity } from "./app.ts";
 import { createRthVerifier, RTH_ACCESS_TOKEN_PREFIX, rthVerifierConfig, type RthVerifierOptions, type RthVerifierSettings } from "./rth-verifier.ts";
 import { bearerOf, relaycontrolIngestIdentity } from "./selfhost-auth.ts";
 
@@ -182,6 +182,8 @@ export function edgeIdentify(settings: IngestEdgeSettings, env: NodeJS.ProcessEn
     if (bearer?.startsWith(RELAYHISTORY_TOKEN_PREFIX))
       throw new AuthError(401, UNSUPPORTED_TOKEN_CODE, "opaque relayhistory tokens are not supported by this deployment");
     const identity = await introspected(authorization);
+    // The edge serves no upload-consent route: every route it serves needs rth:sync.
+    if (!identity.scopes.includes(SYNC_SCOPE)) throw new AuthError(403, "forbidden", `missing required scope: ${SYNC_SCOPE}`);
     return { userId: identity.userId, orgId: identity.orgId, workspaceId: identity.workspaceId, scopes: [...identity.scopes] };
   };
 }

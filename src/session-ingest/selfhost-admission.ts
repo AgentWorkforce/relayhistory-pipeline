@@ -34,6 +34,7 @@
  * Logs: one `ingest.admission` line per attempt (the hosted fields), one `ingest.admission_consumer`
  * line per scan (backlog, oldest age, dead letters, in flight). Never a key, body, token or header value.
  */
+import type { UploadConsentConfig } from "./upload-consent.ts";
 import { zstdDecompressSync } from "node:zlib";
 import { log as sharedLog } from "../shared/log.ts";
 import { objectKey, type ObjectStore } from "../shared/vendor.ts";
@@ -78,6 +79,8 @@ export interface SelfhostAdmissionOptions {
   log?: Logger;
   /** HISTORY_UPLOAD_DIRECT allowlist|on: promote up to `batchSize` upload-inbox objects per scan. Absent: never listed. */
   uploadInbox?: { promote: (key: string) => Promise<PromoteResult>; batchSize: number };
+  /** INGEST_UPLOAD_CONSENT (upload-consent.ts): re-checked at admission, at the current policy. */
+  uploadConsent?: UploadConsentConfig;
 }
 
 export interface SelfhostAdmissionStatus {
@@ -225,7 +228,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
   async function admitOne(key: string, entry: Entry): Promise<void> {
     entry.attempts += 1;
     const t0 = Date.now();
-    const r: AdmissionAction = await admitMessage({ mode: opts.mode, deliver: opts.deliver, custodySource: "relayhistory", decompress, nowMs: now }, { v: 1, kind: "ingest-admission", key }, entry.attempts)
+    const r: AdmissionAction = await admitMessage({ mode: opts.mode, deliver: opts.deliver, custodySource: "relayhistory", decompress, nowMs: now, ...(opts.uploadConsent ? { uploadConsent: opts.uploadConsent, log: (fields: Record<string, unknown>) => logger.warn("session ingest admission", fields) } : {}) }, { v: 1, kind: "ingest-admission", key }, entry.attempts)
       .catch((error: unknown): AdmissionAction => ({ action: "retry", delaySeconds: 300, code: "admission_failed", error }));
     if (r.action === "ack") {
       logger.info("session ingest admission", { route: "ingest.admission", outcome: r.outcome, error_code: r.code, duration_ms: Date.now() - t0, ...(r.lagMs !== undefined ? { offset: r.lagMs } : {}), attempt: entry.attempts });

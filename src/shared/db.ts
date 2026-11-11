@@ -7,6 +7,7 @@ import {
   resolveRenamedLedger,
   RUNTIME_APPLICATION_FUNCTIONS,
 } from "../hoopdb/migrate-guards.ts";
+import { isHeldScope } from "../hoopdb/held-scope.ts";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
@@ -101,6 +102,16 @@ export interface ExpectedSchema {
   shas?: Record<string, string>;
   /** Exact database mode bound into the role verifier; absent/invalid never enables compatibility exceptions. */
   dbMode?: "local" | "selfhosted" | "cloudsql" | "supabase" | "rds";
+  /**
+   * Release-target prefix scope (heldScope() in src/hoopdb/migrate.ts; absent for a
+   * full-tree image, which stays strict): the held suffix steps, never in `names`, each
+   * with the sessions function signatures that step alone creates. The live function
+   * gate tolerates an allowlisted signature being ABSENT only when it is listed here
+   * exactly (same name and argument types) for a held step the ledger does not have.
+   * Only a heldScope() result is accepted (see src/hoopdb/held-scope.ts): any other
+   * value, including a copy or a hand-built map, is refused release_target_held_untrusted.
+   */
+  held?: readonly { name: string; creates: readonly string[] }[];
 }
 
 export type SchemaVerdict =
@@ -140,12 +151,31 @@ export interface SchemaVerifierSql {searchWorker:string;tokenVerifier:string;ing
  * only when current_user is the consumer login (CONSUMER_RUNTIME_FUNCTIONS_ROLE); the PUBLIC and
  * missing-ACL checks still apply to them for every role.
  */
-const regprocedures = (fns: readonly string[]) =>
-  fns.map((fn) => `'${fn.replaceAll("'", "''")}'::regprocedure`).join(", ");
-const RUNTIME_FUNCTION_REGPROCEDURES = regprocedures(RUNTIME_APPLICATION_FUNCTIONS);
-const CONSUMER_FUNCTION_REGPROCEDURES = regprocedures(CONSUMER_RUNTIME_FUNCTIONS);
+// An allowlisted signature is cast with ::regprocedure, which raises 42883 when it does
+// not exist (typo, wrong overload, function missing from the applied schema). Only a
+// signature in `absentOk` (created by a held release-target step that is not ledgered,
+// see ExpectedSchema.held) uses to_regprocedure, and its NULL is removed from the array.
+// With no such signature the text is the plain strict ARRAY[...]::oid[] form.
+const regprocedures = (fns: readonly string[], absentOk: ReadonlySet<string>) => {
+  const lit = (fn: string) => `'${fn.replaceAll("'", "''")}'`;
+  if (!fns.some((fn) => absentOk.has(fn))) return `ARRAY[${fns.map((fn) => `${lit(fn)}::regprocedure`).join(", ")}]::oid[]`;
+  return `array_remove(ARRAY[${fns
+    .map((fn) => (absentOk.has(fn) ? `to_regprocedure(${lit(fn)})::oid` : `${lit(fn)}::regprocedure::oid`))
+    .join(", ")}]::oid[], NULL)`;
+};
 
-export const SESSIONS_FUNCTION_GATE_SQL = `DO $sessions_fn_gate$
+/**
+ * The live gate SQL; `absentOk` is empty except for a release-target prefix image.
+ * `allow` is the allowlists (tests pass altered copies; production never does).
+ */
+export function sessionsFunctionGateSql(
+  absentOk: ReadonlySet<string> = new Set(),
+  allow: { runtime: readonly string[]; consumer: readonly string[] } = {
+    runtime: RUNTIME_APPLICATION_FUNCTIONS,
+    consumer: CONSUMER_RUNTIME_FUNCTIONS,
+  },
+): string {
+  return `DO $sessions_fn_gate$
 DECLARE v text;
 BEGIN
   SELECT string_agg(p.oid::regprocedure::text, ', ' ORDER BY 1) INTO v
@@ -156,15 +186,17 @@ BEGIN
           OR (has_function_privilege(current_user, p.oid, 'EXECUTE')
               AND p.proowner <> (SELECT oid FROM pg_roles WHERE rolname = current_user)
               AND NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)
-              AND p.oid <> ALL (ARRAY[${RUNTIME_FUNCTION_REGPROCEDURES}]::oid[])
+              AND p.oid <> ALL (${regprocedures(allow.runtime, absentOk)})
               AND NOT (current_user = '${CONSUMER_RUNTIME_FUNCTIONS_ROLE}'
-                       AND p.oid = ANY (ARRAY[${CONSUMER_FUNCTION_REGPROCEDURES}]::oid[]))));
+                       AND p.oid = ANY (${regprocedures(allow.consumer, absentOk)}))));
   IF v IS NOT NULL THEN
     RAISE EXCEPTION USING ERRCODE = '55000',
       MESSAGE = 'live gate: sessions functions executable by PUBLIC or the runtime role: ' || v;
   END IF;
 END
 $sessions_fn_gate$`;
+}
+export const SESSIONS_FUNCTION_GATE_SQL = sessionsFunctionGateSql();
 
 /** Runs `work` in one transaction on one connection (inTransaction, or a test double). */
 export type Transact = <T>(work: (tx: SqlExecutor) => Promise<T>) => Promise<T>;
@@ -212,12 +244,26 @@ export async function schemaVerdict(
 ): Promise<SchemaVerdict> {
   type Stage = "config" | "ledger" | "marker" | "verify" | "final";
   let stage = "config" as Stage; // widened: it is advanced inside the transaction callback
+  // Every input is read from `expected` exactly once, here, before any guard or await:
+  // the caller's object is mutable, and a re-read after a SQL await could see a value
+  // (e.g. an unregistered `held`) the checks below never validated. Only these locals
+  // are used afterwards; `names` and `shas` are copied, `held` is deep-frozen.
+  const held = expected.held;
+  const names = [...expected.names];
+  const shas = expected.shas === undefined ? undefined : { ...expected.shas };
+  const { generation, dbMode } = expected;
+  // `creates` is trusted only from heldScope(), which derives it from the tree's SQL
+  // bytes; anything else could excuse a prefix-owned function. Refused before any SQL.
+  if (held !== undefined && !isHeldScope(held)) {
+    log.warn("live role validation gate closed", { error_code: "release_target_held_untrusted", reason: stage });
+    return { ok: false, reason: "role_validation_failed", error_code: "release_target_held_untrusted" };
+  }
   try {
     const timeoutMs = gateTimeoutMs();
     return await transact(async (tx): Promise<SchemaVerdict> => {
       await tx.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY");
       await tx.query(`SET LOCAL statement_timeout = ${timeoutMs}`);
-      await tx.query("SELECT set_config('hoopdb.db_mode', $1, true)", [expected.dbMode ?? "unspecified"]);
+      await tx.query("SELECT set_config('hoopdb.db_mode', $1, true)", [dbMode ?? "unspecified"]);
       stage = "ledger";
       // The physical ledger goes through the migrator's own rename-alias verdict
       // (resolveRenamedLedger, in memory, never a write): exact original-name rows count
@@ -228,20 +274,27 @@ export async function schemaVerdict(
         (await tx.query<{ name: string; sha256: string }>("SELECT name, sha256 FROM sessions.__96bulls_migrations")).rows
           .map((r) => [r.name, r.sha256]),
       );
-      const shas = expected.shas ?? {};
-      const { effective } = resolveRenamedLedger(physical, (n) => (Object.hasOwn(shas, n) ? shas[n] : undefined));
+      const digests = shas ?? {};
+      const { effective } = resolveRenamedLedger(physical, (n) => (Object.hasOwn(digests, n) ? digests[n] : undefined));
       // A recorded row counts only with a checksum the migrator would accept for the
       // planned file (its migration_changed guard), alias-adopted or not.
       const have = new Set(
-        [...effective].filter(([n, sha]) => !Object.hasOwn(shas, n) || migrationChecksumMatches(n, sha, shas[n]!)).map(([n]) => n),
+        [...effective].filter(([n, sha]) => !Object.hasOwn(digests, n) || migrationChecksumMatches(n, sha, digests[n]!)).map(([n]) => n),
       );
       // The role shim, bootstrap and verify steps are not schema; the marker covers verify.
-      const missing = expected.names.filter((n) => !isPrerequisiteStep(n) && !have.has(n));
+      const missing = names.filter((n) => !isPrerequisiteStep(n) && !have.has(n));
       if (missing.length) return { ok: false, reason: "schema_pending", count: missing.length };
       const passed = async () => {
         const m = (await tx.query<{ generation: string; status: string }>(MARKER_SQL, [ROLE_VALIDATION_NAME])).rows[0];
-        return m?.status === "pass" && m.generation === expected.generation;
+        return m?.status === "pass" && m.generation === generation;
       };
+      // Release-target scope: a held step is never one of this image's steps (and is one
+      // of the tree's, when shas are known), and only the functions of held steps the
+      // ledger does not have may be absent.
+      const scope = held ?? [];
+      if (scope.some((h) => names.includes(h.name) || (shas && !Object.hasOwn(shas, h.name))))
+        return { ok: false, reason: "role_validation_failed", error_code: "release_target_held_mismatch" };
+      const absentOk = new Set(scope.filter((h) => !effective.has(h.name)).flatMap((h) => h.creates));
       stage = "marker";
       if (!(await passed())) return { ok: false, reason: "validation_pending" };
       stage = "verify";
@@ -249,7 +302,7 @@ export async function schemaVerdict(
       await tx.query(TOKEN_VERIFIER_VERIFY_SQL);
       await tx.query(INGEST_SEED_VERIFY_SQL);
       await tx.query(INGEST_ROLE_VERIFY_SQL);
-      await tx.query(SESSIONS_FUNCTION_GATE_SQL);
+      await tx.query(absentOk.size ? sessionsFunctionGateSql(absentOk) : SESSIONS_FUNCTION_GATE_SQL);
       if (opts.afterVerify) await opts.afterVerify(); // test seam: a concurrent flip lands here
       stage = "final";
       if (!(await passed())) return { ok: false, reason: "validation_pending" };
@@ -258,7 +311,7 @@ export async function schemaVerdict(
   } catch (err) {
     const error_code = (err as { code?: string }).code ?? "role_gate_error";
     if (error_code === "42P01" && stage === "ledger")
-      return { ok: false, reason: "schema_pending", count: expected.names.filter((n) => !isPrerequisiteStep(n)).length };
+      return { ok: false, reason: "schema_pending", count: names.filter((n) => !isPrerequisiteStep(n)).length };
     if (error_code === "42P01" && (stage === "marker" || stage === "final")) return { ok: false, reason: "validation_pending" };
     log.warn("live role validation gate closed", { error_code, reason: stage });
     return { ok: false, reason: "role_validation_failed", error_code };

@@ -683,6 +683,40 @@ if (
 for (const file of SESSION_BOOTSTRAP_FILES)
   if (!psql("postgres", ["-f", join(ROOT, file)]).ok)
     throw new Error(`role bootstrap failed: ${file}`);
+// session_read_api_roles.sql applies the read_api inbound-membership predicate to the two
+// admission roles too: on every major (PG15 refuses any member; PG16+ outside
+// hoopdb.db_mode=supabase tolerates none) an inbound member refuses 55000, nothing changed.
+await check(
+  "admission-role bootstrap refuses an inbound member of bulls96_analysis_admit / bulls96_digest_narrative (55000), nothing changed; clean rerun passes",
+  async () => {
+    const file = join(ROOT, "supabase/bootstrap/session_read_api_roles.sql");
+    const seen: Record<string, unknown> = {};
+    let ok = true;
+    await sql("postgres", "CREATE ROLE g6_admit_member LOGIN NOINHERIT");
+    try {
+      for (const role of ["bulls96_analysis_admit", "bulls96_digest_narrative"]) {
+        await sql("postgres", `GRANT ${role} TO g6_admit_member`);
+        const r = psql("postgres", ["-f", file]);
+        const edges = (
+          await sql(
+            "postgres",
+            `SELECT count(*)::int AS n FROM pg_auth_members WHERE roleid = '${role}'::regrole`,
+          )
+        ).rows[0].n;
+        await sql("postgres", `REVOKE ${role} FROM g6_admit_member`);
+        const refused =
+          !r.ok &&
+          r.out.includes(`bootstrap ${role}: the role has an unexpected member`);
+        seen[role] = { refused, edge_kept: edges === 1 };
+        ok &&= refused && edges === 1;
+      }
+    } finally {
+      await sql("postgres", "DROP ROLE IF EXISTS g6_admit_member");
+    }
+    const clean = psql("postgres", ["-f", file]).ok;
+    return [ok && clean, fmt({ ...seen, clean_rerun: clean })];
+  },
+);
 
 await fresh("g6_boot");
 await check(

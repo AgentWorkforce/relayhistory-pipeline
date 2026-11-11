@@ -126,6 +126,7 @@ BEGIN
          'sessions.coordination_output_facts_for(text,timestamp with time zone,timestamp with time zone,text,integer)',
          'sessions.coordination_write_facts_for(text,timestamp with time zone,timestamp with time zone,text,integer)',
          'sessions.digest_narrative_read(text,date,text,text)',
+         'sessions.ingest_operator_runtime_erased(text,text,text,text)',
          'sessions.list_session_directory_for(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)',
          'sessions.output_facts_coverage_for(text,timestamp with time zone,timestamp with time zone)',
          'sessions.output_facts_events_for(text,timestamp with time zone,timestamp with time zone,text,integer)',

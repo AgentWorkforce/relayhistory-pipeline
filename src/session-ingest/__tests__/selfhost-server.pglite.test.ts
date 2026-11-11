@@ -6,6 +6,8 @@
  * the role's grants; PGlite has no real login, so startup admission, which refuses
  * SET ROLE, is tested over real-login rows below), and the store is a scratch fs store.
  */
+import { sqlUploadConsentStore } from "../upload-consent-sql.ts";
+import { UPLOAD_CONSENT_REQUIRED } from "../upload-consent.ts";
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -144,7 +146,7 @@ async function start(rc: { url: string }, over: NodeJS.ProcessEnv = {}) {
   const service: SelfhostIngestService = await startSelfhostIngestService(env(rc.url, over), { host: "127.0.0.1", port: 0, build });
   cleanups.push(() => service.close());
   const url = (path: string) => `http://127.0.0.1:${service.port}${path}`;
-  return { service, url, store: fs.store, db };
+  return { service, url, store: fs.store, db, run };
 }
 
 const deliveryBody = async (id = "e1", over: Parameters<typeof batch>[1] = {}) =>
@@ -349,6 +351,13 @@ describe("onboarding heartbeat (RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT=true)", (
     await expect(start(rc, { RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT: "1" })).rejects.toThrow("RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT");
   });
 
+  test("on: a consent-only token (rth:consent, no rth:sync) is 403 on the heartbeat (the wrapper's own check)", async () => {
+    const rc = await relaycontrol(() => active(["rth:consent"]));
+    const { url } = await start(rc, on);
+    const res = await post(url(HEARTBEAT), progress);
+    expect([res.status, await code(res)]).toEqual([403, "forbidden"]);
+  });
+
   test("on: an authenticated heartbeat is 204 with no body, introspected, nothing written", async () => {
     const rc = await relaycontrol(() => active(["rth:sync"]));
     const { url, store } = await start(rc, on);
@@ -427,6 +436,19 @@ describe("capture policy upload check (RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLO
     const fresh = JSON.stringify({ protocolVersion: 1, batch: await batch([
       record({ record_id: "s2", kind: "session", payload: { first_activity_ms: Date.parse(SINCE) + 60_000 } }),
     ], { batch_id: "batch-s2" }) });
+    expect((await post(url("/v1/delivery/batches"), fresh, { [HEADER]: "7" })).status).toBe(200);
+  });
+
+  test("enforce + INGEST_UPLOAD_CONSENT: under sharing_mode new, a newer session also needs the person's confirmed choice", async () => {
+    const rc = await relaycontrol(() => policy({ sharing_mode: "new" }, { sharing_mode_since: SINCE }));
+    const fresh = JSON.stringify({ protocolVersion: 1, batch: await batch([
+      record({ record_id: "s2", kind: "session", payload: { first_activity_ms: Date.parse(SINCE) + 60_000 } }),
+    ], { batch_id: "batch-s2" }) });
+    const { url, store, run } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce", INGEST_UPLOAD_CONSENT: "enforce" });
+    const held = await post(url("/v1/delivery/batches"), fresh, { [HEADER]: "7" });
+    expect([held.status, await code(held)]).toEqual([503, UPLOAD_CONSENT_REQUIRED]);
+    expect(await chunkKeys(store)).toEqual([]);
+    await sqlUploadConsentStore(run).apply(TENANT, { mode: "all", confirmOrigins: ["origin-1"] }, { trusted: true, nowMs: Date.parse(SINCE) });
     expect((await post(url("/v1/delivery/batches"), fresh, { [HEADER]: "7" })).status).toBe(200);
   });
 

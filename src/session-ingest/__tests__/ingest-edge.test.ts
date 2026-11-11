@@ -239,6 +239,14 @@ describe("refusals", () => {
     expect(rec.seen.length).toBe(0);
   });
 
+  test("rth:consent alone: 403 forbidden (the edge serves no upload-consent route)", async () => {
+    const { rec, edge } = await edgeFor(() => active(["rth:consent"]));
+    const res = await edge.fetch(req("/v1/delivery/limits"));
+    expect(res.status).toBe(403);
+    expect((await json(res)).error?.code).toBe("forbidden");
+    expect(rec.seen.length).toBe(0);
+  });
+
   test("unreachable, timeout, 5xx and a refused service secret: 503 relaycontrol_unavailable, jittered Retry-After, never 401, no retry", async () => {
     const cases: [string, (body: Record<string, unknown>) => Answer][] = [
       ["5xx", () => ({ status: 502, body: { error: "bad gateway" } })],

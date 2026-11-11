@@ -30,6 +30,7 @@ import { readApiQuery } from "./read-api-query.ts";
 import { coordinationFactReaders } from "./coordination-fact-readers.ts";
 import { summaryActivity } from "./summary-activity.ts";
 import { sessionDirectoryUsers } from "./session-directory-users.ts";
+import { uploadConsent } from "./upload-consent.ts";
 import { semanticCopy } from "./semantic-copy.ts";
 import { analysisJobs } from "./analysis-jobs.ts";
 import { ingestBookkeepingCleanup } from "./ingest-bookkeeping-cleanup.ts";
@@ -38,6 +39,7 @@ import { bufferedStagesSessionFirst } from "./buffered-stages-session-first.ts";
 import { bufferedSearchGateRetiredWitness } from "./buffered-search-gate-retired-witness.ts";
 import { selfhostSessionSelectionErase } from "./selfhost-session-selection-erase.ts";
 import { selfhostEraseLockFences } from "./selfhost-erase-lock-fences.ts";
+import { operatorSessionEraseRuntime } from "./operator-session-erase-runtime.ts";
 import { operatorSessionErase } from "./operator-session-erase.ts";
 import { operatorSessionEraseFenceCheck } from "./operator-session-erase-fence-check.ts";
 
@@ -47,4 +49,4 @@ import { ingestClaimSessions } from "./ingest-claim-sessions.ts";
 import { ingestClaimSessionsReader } from "./ingest-claim-sessions-reader.ts";
 
 /** Every lane the unified generator composes. Order does not affect the output. */
-export const LANES: readonly LaneManifest[] = [bufferedStagesPaged, bufferedExactSession, briefSummary, briefDocuments, ingestHistory, readApi, readApiTokens, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention, briefTitles, lazyClaimClockNarrowing, ownerBufferedRead, lazyAckClockNoKeyUpdate, acquisitionOwner, bufferedSearchGate, bufferedSearchFeed, ingestBookkeepingCleanup, bufferedSearchGateRetiredWitness, selfhostSessionSelectionErase, selfhostEraseLockFences, ingestGenerationOverlap, bufferedStagesSessionFirst, selfhostEraseShortSummaryProvenance, selfhostEraseSearchTextRebuild, ingestClaimSessions, ingestClaimSessionsReader, digestNarratives, bufferedSearchFeedSameSecond, consumerProjectTextGrant, selfhostOutputFacts, analysisJobs, readApiQuery, coordinationFactReaders, operatorSessionErase, operatorSessionEraseFenceCheck, summaryActivity, sessionDirectoryUsers];
+export const LANES: readonly LaneManifest[] = [bufferedStagesPaged, bufferedExactSession, briefSummary, briefDocuments, ingestHistory, readApi, readApiTokens, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention, briefTitles, lazyClaimClockNarrowing, ownerBufferedRead, lazyAckClockNoKeyUpdate, acquisitionOwner, bufferedSearchGate, bufferedSearchFeed, ingestBookkeepingCleanup, bufferedSearchGateRetiredWitness, selfhostSessionSelectionErase, selfhostEraseLockFences, ingestGenerationOverlap, bufferedStagesSessionFirst, selfhostEraseShortSummaryProvenance, selfhostEraseSearchTextRebuild, ingestClaimSessions, ingestClaimSessionsReader, digestNarratives, bufferedSearchFeedSameSecond, consumerProjectTextGrant, selfhostOutputFacts, analysisJobs, readApiQuery, coordinationFactReaders, operatorSessionErase, operatorSessionEraseFenceCheck, operatorSessionEraseRuntime, summaryActivity, sessionDirectoryUsers, uploadConsent];

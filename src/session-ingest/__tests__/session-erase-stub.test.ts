@@ -254,7 +254,8 @@ describe("configuration", () => {
     };
     const off = selfhostIngestConfig(env);
     expect(off.enabled && off.sessionErase).toEqual({ enabled: false, reason: "flag_off" });
-    const on = selfhostIngestConfig({ ...env, SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: SECRET });
+    expect(() => selfhostIngestConfig({ ...env, SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: SECRET })).toThrow(/SESSION_ERASE_FENCE_ENFORCED/);
+    const on = selfhostIngestConfig({ ...env, SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: SECRET, SESSION_ERASE_FENCE_ENFORCED: "1" });
     expect(on.enabled && on.sessionErase.enabled).toBe(true);
     expect(() => selfhostIngestConfig({ ...env, SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: "short" })).toThrow(/at least 32/);
   });
@@ -342,7 +343,7 @@ describe("self-host node:http wrapper", () => {
     const verified: (string | undefined)[] = [];
     const runtime = {
       ...base,
-      verify: async (authorization: string | undefined) => { verified.push(authorization); return { userId: "u", orgId: "o" } as never; },
+      verify: async (authorization: string | undefined) => { verified.push(authorization); return { userId: "u", orgId: "o", scopes: ["rth:sync"] } as never; },
       app: { fetch: (req: Request) => { seen.push(req.headers.get("authorization")); return Response.json({ ok: true }); } },
     };
     const server = selfhostIngestHttpServer(runtime);
