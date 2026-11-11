@@ -1338,6 +1338,10 @@
     "sessions.session_directory_tombstone_clears_summary()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_directory_users_for(text,timestamp with time zone,timestamp with time zone,integer)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.session_directory_worker_scope(text)": [
       "<owner>:EXECUTE"
     ],
