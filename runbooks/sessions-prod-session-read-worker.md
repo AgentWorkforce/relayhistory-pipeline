@@ -235,3 +235,40 @@ SELECT id, source, turn_index, role, ts FROM sessions.conversation_turns
 - **Fastest:** set the route back to `shadow` or `off` in Cloud. This needs no Worker change.
 - **Back to the Lambda,** while it still exists: set `SESSIONS_READ_96BULLS_URL` back to the Lambda's Function URL. Cursors are compatible both ways.
 - **Bad Worker version:** `bunx wrangler rollback --name bulls96-session-read-api` restores the previous version.
+
+
+## Preserve the live buffered-read profile on code deploys
+
+`owner_buffered` now defaults to `preserve`. Before rendering, the workflow reads
+the single active Worker version and carries forward its buffered-read settings,
+workspace allowlists, S3 bucket/region, statement timeout and pinned privacy-service
+binding. It copies no secret values. An unavailable, split or inconsistent live
+configuration stops the deploy instead of guessing that the feature is off. The
+S3-secret check follows the resolved mode, including a preserved `on` mode.
+
+To change the configuration, explicitly select `owner_buffered=on` or `off`.
+With `on`, provide the workspace and child-feature inputs as before; optionally
+set `owner_buffered_statement_timeout_ms` to an integer from 2000 through 6000.
+`owner_buffered_statement_timeout_ms=off` keeps the runtime's default timeout. Changing feature settings remains an
+operator-approved production action; this source change does not enable history.
+
+The explicit on/off modes use the supplied child inputs; they do not inherit
+event/concurrency/index/search flags. Review those inputs as a complete profile.
+The `directory_workspaces` input takes precedence over
+`SESSION_READ_DIRECTORY_WORKSPACES`. Use workspace ids or `*`, or explicitly
+`off` to clear it. If neither input nor variable is set, even an explicit
+buffered on/off change preserves the live directory list. In preserve mode,
+a differing nonempty variable or input is refused instead of silently ignored;
+choose explicit on/off to make a reviewed configuration change.
+
+Default deploys also compare all other live plain settings and nonsecret
+bindings with the rendered config and actual CLI overrides. If a setting or
+service/Hyperdrive binding would change or disappear, the deploy is refused.
+This guard does not copy unknown bindings or secrets into a new profile.
+
+
+Previously a no-input code deploy omitted active owner-buffered/event flags
+and the control binding. A subsequent read returned an empty 200, so a successful
+health check did not prove session visibility. Restoring an intended profile must be followed by a
+normal authenticated read of known native message identities. Do not claim a
+Factory history PASS from a durable upload cursor or a health response.
