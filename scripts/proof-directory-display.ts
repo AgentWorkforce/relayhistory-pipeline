@@ -3,6 +3,7 @@ import {mkdir,readdir,writeFile} from "node:fs/promises";
 import {join,resolve} from "node:path";
 import {replayDatabase,exportReplayFixture,createFsStore,REPLAY_FIXTURE_IDENTITY as identity} from "../src/session-pipeline/__tests__/replay-fixture.ts";
 import {produceCanonicalReplay} from "../src/session-pipeline/replay-publication.ts";
+import {readerMaxRuleset} from "../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import {objectKey,readAll} from "../packages/object-store/src/index.ts";
 const output=resolve(process.argv[2]??"");
 if(!process.argv[2])throw Error("output required");
@@ -12,7 +13,7 @@ try{
  const content="\u00a0\uFEFF \n\t".repeat(2000)+"Faithful opening 😀 "+"word ".repeat(500000),project="/private/原文/project";
  const direct={kind:"convergence_event",origin_id:"machine:machine:0",record_id:"original-display",revision:"1",accepted_seq:"9000",operation:"upsert" as const,received_at:"2026-11-01T10:00:00Z",payload:{source:identity.source,session_id:identity.sessionId,machine_id:"machine:0",user_id:"user_replay",event_id:"original-display",kind:"history",ts:"2020-01-01T00:00:00.123456Z",ingested_at:"2026-11-01T10:00:00.000000Z",content,project_id:project,record:{}}};
  await exportReplayFixture(store,x.db,1001,2,[direct]);
- const result=await produceCanonicalReplay({orgId:identity.orgId,workspaceId:identity.workspaceId,harness:identity.source,sessionId:identity.sessionId},{db:x.db,store,provider:"s3",bucket:"replay-fixture",prefix:{PIPELINE_KEY_PREFIX:"96bulls",PIPELINE_ORG_FROM_PREFIX:"true"}});
+ const result=await produceCanonicalReplay({orgId:identity.orgId,workspaceId:identity.workspaceId,harness:identity.source,sessionId:identity.sessionId},{readerMaxRuleset:readerMaxRuleset(process.env),db:x.db,store,provider:"s3",bucket:"replay-fixture",prefix:{PIPELINE_KEY_PREFIX:"96bulls",PIPELINE_ORG_FROM_PREFIX:"true"}});
  if(!result.published)throw Error("publication failed");
  const load=async(ref:any)=>JSON.parse(new TextDecoder().decode(await readAll(await store.get(objectKey(ref.key)))));
  const index=await load(result.publication!.index),ref=index.tables.session_directory_event_values.raw.root;

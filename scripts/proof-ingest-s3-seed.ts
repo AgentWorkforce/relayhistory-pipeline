@@ -14,6 +14,7 @@ import {objectKey,type ObjectStore} from "../src/shared/vendor.ts";
 import {objectStoreManifestReader} from "../packages/pipeline/src/lib/pipeline/adapter.ts";
 import {normalizeRelayhistoryRecords} from "../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 import {readManifestRecords} from "../src/session-read-api/canonical-projection.ts";
+import {readerMaxRuleset} from "../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import {runMigrations,generation} from "../src/hoopdb/migrate.ts";
 import {seedOrgFromS3} from "../src/session-ingest/seed-s3.ts";
 import {SeedProofIndex} from "../src/session-ingest/seed-proof.ts";
@@ -106,7 +107,7 @@ try{
    [tenant.orgId,tenant.workspaceId,session,m.manifest.session.machine_id,tenant.userId,m.key,m.manifest.raw.content_sha256,rawBytes,m.manifest.raw.chunks.length,m.manifest.revision,m.manifest.trace_id]);
   await insert();
   await seedFences(source,seed,tenant.orgId,[{workspace_id:tenant.workspaceId,user_id:tenant.userId}]);
-  const deps={store,bucket:"fixture",provider:"s3",reader:objectStoreManifestReader(store,{provider:"s3",bucket:"fixture"}),
+  const deps={readerMaxRuleset:readerMaxRuleset(process.env),store,bucket:"fixture",provider:"s3",reader:objectStoreManifestReader(store,{provider:"s3",bucket:"fixture"}),
    prefixFor:(org:string)=>"96bulls/"+org,decompress:(raw:Uint8Array,max:number)=>new Uint8Array(zstdDecompressSync(raw,{maxOutputLength:max}))};
   const args={org_id:tenant.orgId,workspace_id:tenant.workspaceId,source:"claude",session_id:session,generation:proof.generation};
   const capture=async()=>{
@@ -130,7 +131,7 @@ try{
   const result=await deliverBatch({ledger,target:{store:f.store,keyRoot:"96bulls",sleep:async()=>{}}},f.tenant,incoming);
   assert(result.outcome==="replay_fast","expected_replay_fast");
   assert(result.receipt.acceptedRevisionIds[0]==="actual-regenerated-client-id","receipt_id_preserved");
-  const rows=normalizeRelayhistoryRecords(await readManifestRecords(f.m.manifest,f.store,"96bulls/"+f.tenant.orgId,f.deps.decompress));
+  const rows=normalizeRelayhistoryRecords(await readManifestRecords(f.m.manifest,f.store,"96bulls/"+f.tenant.orgId,f.deps.decompress,Number.POSITIVE_INFINITY,f.deps.readerMaxRuleset));
   assert(rows[0]!.payload?.text==="original durable","stored_winner_preserved");
   const stored=(await owner.query("SELECT revision_id,digest,seed_proof_sha256 FROM sessions.ingest_record_revisions WHERE org_id=$1",[f.tenant.orgId])).rows[0];
   assert(stored.revision_id===null&&stored.digest===null&&stored.seed_proof_sha256,"no_invented_original");

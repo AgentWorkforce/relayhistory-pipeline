@@ -400,3 +400,78 @@ describe("Bob Costas under org-derived key prefixes (PIPELINE_ORG_FROM_PREFIX)",
     ).toEqual({ status: "skipped", reason: "summary_current" });
   }, 30_000);
 });
+
+describe("Bob Costas honours READER_MAX_RULESET only when it is set", () => {
+  const sealed = (version: number) => ({
+    ...manifest(true, [{ seq: 0, start_offset: 0, sha256_8: "abcdef12" }]),
+    raw: { ...manifest(true, [{ seq: 0, start_offset: 0, sha256_8: "abcdef12" }]).raw, scrub: { ruleset: "relayhistory-scrub", version } },
+  });
+  async function run(m: unknown, readerMaxRuleset: number | undefined, chunkMetadata?: Record<string, string>) {
+    const { pg, db } = await setup();
+    const fs = createFsStore({ root: mkdtempSync(join(tmpdir(), "bch-")) });
+    const line = JSON.stringify({ type: "user", message: { role: "user", content: "PLANTED-PROMPT fix the build" } });
+    await fs.put(rawChunkKey(loc, 0, 0, "abcdef12", "jsonl"), zstdCompressSync(Buffer.from(line + "\n")), chunkMetadata ? { metadata: chunkMetadata } : {});
+    const reads = { get: 0, getObject: 0 };
+    const store = new Proxy(fs, {
+      get(target, key) {
+        if (key === "get" || key === "getObject") reads[key]++;
+        const value = Reflect.get(target, key);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const keyring = await masterKeyring(parseMasterKeys(`k1:${"a".repeat(64)}`));
+    const handler = bobCostasHandler("short", {
+      db,
+      reader: { provider: "fs", read: async () => ({ manifest: m }) } as never,
+      store,
+      summarizer: extractiveSummarizer,
+      directory: noDirectory,
+      keyring,
+      ...(readerMaxRuleset === undefined ? {} : { readerMaxRuleset }),
+    });
+    const outcome = handler(message, recorder);
+    const rows = async () => (await pg.query<Record<string, unknown>>(`SELECT status FROM sessions.session_summaries`)).rows;
+    return { outcome, rows, reads };
+  }
+
+  it("unset: a marker newer than the default maximum is still read (legacy presence-only check)", async () => {
+    const r = await run(sealed(9), undefined);
+    await r.outcome;
+    expect(await r.rows()).toEqual([{ status: "ready" }]);
+    expect(r.reads).toEqual({ get: 1, getObject: 0 });
+  }, 30_000);
+
+  it("set: a manifest marker above the maximum is refused before any chunk GET", async () => {
+    const r = await run(sealed(9), 8);
+    await expect(r.outcome).rejects.toMatchObject({ code: "scrub_ruleset_unsupported", retryable: false });
+    expect(r.reads).toEqual({ get: 0, getObject: 0 });
+    expect(await r.rows()).toEqual([]);
+  }, 30_000);
+
+  it("set: a foreign ruleset name is refused", async () => {
+    const r = await run(manifest(true, [{ seq: 0, start_offset: 0, sha256_8: "abcdef12" }]), 10);
+    await expect(r.outcome).rejects.toMatchObject({ code: "scrub_ruleset_unsupported" });
+    expect(r.reads).toEqual({ get: 0, getObject: 0 });
+  }, 30_000);
+
+  it("set: a chunk whose own metadata exceeds the maximum is refused on the same GET", async () => {
+    const r = await run(sealed(9), 9, { "scrub-ruleset": "relayhistory-scrub", "scrub-version": "10" });
+    await expect(r.outcome).rejects.toMatchObject({ code: "scrub_ruleset_unsupported" });
+    expect(r.reads).toEqual({ get: 0, getObject: 1 });
+    expect(await r.rows()).toEqual([]);
+  }, 30_000);
+
+  it("set: supported marker and chunk metadata are read through one getObject", async () => {
+    const r = await run(sealed(9), 10, { "scrub-ruleset": "relayhistory-scrub", "scrub-version": "9" });
+    await r.outcome;
+    expect(await r.rows()).toEqual([{ status: "ready" }]);
+    expect(r.reads).toEqual({ get: 0, getObject: 1 });
+  }, 30_000);
+
+  it("set: a historical v8 chunk without per-chunk metadata keeps its read contract", async () => {
+    const r = await run(sealed(8), 8);
+    await r.outcome;
+    expect(await r.rows()).toEqual([{ status: "ready" }]);
+    expect(r.reads).toEqual({ get: 0, getObject: 1 });
+  }, 30_000);
+});

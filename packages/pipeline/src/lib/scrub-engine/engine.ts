@@ -69,6 +69,7 @@ export interface ScrubEngine {
  * - engine_failed: the instance trapped during a call; it is never used again
  * - engine_refused: the instance returned an unexpected status for one call
  * - seal_path_not_routed: `sealRawChunk` can only run the TypeScript engine (it lives in pinned raw-chunks.ts)
+ * - engine_selection_required: SCRUB_ENGINE_REQUIRED names another engine than the one SCRUB_ENGINE selects
  * - bindgen_*: SCRUB_ENGINE=wasm-bindgen (bindgen-engine.ts); see `BindgenFailure`
  */
 export type ScrubEngineFailure =
@@ -85,6 +86,7 @@ export type ScrubEngineFailure =
   | "engine_failed"
   | "engine_refused"
   | "seal_path_not_routed"
+  | "engine_selection_required"
   | BindgenFailure;
 
 /** The three verified byte artifacts of the wasm-bindgen package. */
@@ -156,9 +158,13 @@ export class ScrubEngineUnavailable extends PipelineError {
   }
 }
 
-/** SCRUB_ENGINE holds a value other than unset, "", "ts", "wasm" or "wasm-bindgen", or a second selection disagrees. Startup fails. */
+/**
+ * SCRUB_ENGINE (or SCRUB_ENGINE_REQUIRED) holds a value other than unset, "", "ts", "wasm" or
+ * "wasm-bindgen", a second selection disagrees, or SCRUB_ENGINE_REQUIRED names another engine
+ * than the selected one (`reason: "engine_selection_required"`). Startup fails.
+ */
 export class ScrubEngineConfigError extends PipelineError {
-  constructor(message: string) {
+  constructor(message: string, readonly reason?: "engine_selection_required") {
     super("scrub_engine_invalid", message, false);
     this.name = "ScrubEngineConfigError";
   }

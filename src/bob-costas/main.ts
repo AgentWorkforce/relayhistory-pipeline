@@ -5,6 +5,7 @@ import { summarizerFromEnv } from "./model-summarizer.ts";
 import { log } from "../shared/log.ts";
 import { keyringFromEnv } from "../shared/keyring.ts";
 import { summarySweep } from "./sweep.ts";
+import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 
 const raw = lockerStore();
 // BOB_COSTAS_MODEL / OPENAI_BASE_URL are validated here, so a bad value fails at startup.
@@ -12,6 +13,8 @@ const summarizer = summarizerFromEnv();
 log.info("bob costas summariser", { stage: "summary", model_id: summarizer.id });
 // Summaries are stored encrypted in the Locker; refuse to start without a keyring.
 const keyring = await keyringFromEnv();
+// Unset keeps legacy reads; a malformed value fails at startup.
+const maximum = readerMaxRuleset(process.env);
 await runWorker({
   service: "bob-costas",
   stages: ["summary-short", "summary-long"],
@@ -28,6 +31,7 @@ await runWorker({
       store: raw.store,
       summarizer,
       keyring,
+      readerMaxRuleset: maximum,
     };
     return {
       "summary-short": bobCostasHandler("short", deps),

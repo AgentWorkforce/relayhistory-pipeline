@@ -19,6 +19,7 @@ import{writeBatchObjects}from'../src/session-ingest/writer.ts';
 import{createFsStore}from'../packages/object-store/src/fs.ts';
 import{indexPointer,droppedFanout}from'../src/session-pipeline/pointer.ts';
 import{readCanonicalScope}from'../src/session-read-api/canonical-projection.ts';
+import{readerMaxRuleset}from'../packages/pipeline/src/lib/scrub-engine/reader-policy.ts';
 import{zstdDecompressSync}from'node:zlib';
 import{deliveryAccount,prepareDelivery}from'../src/session-ingest/vendor/delivery/prepare.ts';
 import{DELIVERY_MAPPING_VERSION,type HistoryExportBatch}from'../src/session-ingest/vendor/delivery/delivery-contracts.ts';
@@ -125,7 +126,7 @@ try{
   const scope={orgId:f.tenant.orgId,workspaceId:f.tenant.workspaceId,harness:'claude',sessionId:'session-'+id};
   const fold=async()=>{
    const keys=(await owner.query('SELECT manifest_key FROM sessions.session_index WHERE org_id=$1 AND deleted_at IS NULL',[f.tenant.orgId])).rows.map(p=>p.manifest_key);
-   return readCanonicalScope(scope,keys,{reader,store,prefixFor:()=> '96bulls/'+f.tenant.orgId,decompress:(bytes,maxOutputLength)=>new Uint8Array(zstdDecompressSync(bytes,{maxOutputLength}))},{maxScopeBytes:16777216,maxScopeEvents:100,maxRows:100,insertBatch:50},1,scope.sessionId);
+   return readCanonicalScope(scope,keys,{readerMaxRuleset:readerMaxRuleset(process.env),reader,store,prefixFor:()=> '96bulls/'+f.tenant.orgId,decompress:(bytes,maxOutputLength)=>new Uint8Array(zstdDecompressSync(bytes,{maxOutputLength}))},{maxScopeBytes:16777216,maxScopeEvents:100,maxRows:100,insertBatch:50},1,scope.sessionId);
   };
   const before=await fold();assert(before.complete&&!before.partial,'mixed_scope_complete');
   const contents=before.projectionRows.filter(r=>r.table==='convergence_events').map(r=>r.row.content);

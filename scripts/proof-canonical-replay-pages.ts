@@ -5,6 +5,7 @@ import {execFileSync} from 'node:child_process';
 import {replayDatabase,exportReplayFixture,createFsStore,REPLAY_FIXTURE_IDENTITY as identity} from '../src/session-pipeline/__tests__/replay-fixture.ts';
 import {objectKey,readAll} from '../packages/object-store/src/index.ts';
 import {produceCanonicalReplay} from '../src/session-pipeline/replay-publication.ts';
+import {readerMaxRuleset} from '../packages/pipeline/src/lib/scrub-engine/reader-policy.ts';
 const args=process.argv.slice(2),outAt=args.indexOf('--out'),eventsAt=args.indexOf('--events');
 if(outAt<0||!args[outAt+1])throw Error('proof requires --out <new-empty-local-directory>');
 const output=resolve(args[outAt+1]!),count=eventsAt<0?300001:Number(args[eventsAt+1]);
@@ -17,7 +18,7 @@ try{
  const coverage={kind:'legacy_scope',origin_id:'legacy:scope',record_id:'legacy:scope:coverage',revision:'1',operation:'upsert' as const,received_at:'2026-11-01T10:00:00Z',payload:{org_id:identity.orgId,workspace_id:identity.workspaceId,source:identity.source,session_id:identity.sessionId,version:1,tables:['conversation_turns','session_links','session_outcomes']}};
  const source=await exportReplayFixture(store,x.db,count,2,[coverage]);
  console.log(JSON.stringify({phase:'source_exported',events:count,rawBytes:source.manifests.reduce((n,m)=>n+m.rawBytes,0),manifests:source.manifests.length}));
- const result=await produceCanonicalReplay({orgId:identity.orgId,workspaceId:identity.workspaceId,harness:identity.source,sessionId:identity.sessionId},{db:x.db,store,provider:'s3',bucket:'replay-fixture',prefix:{PIPELINE_KEY_PREFIX:'96bulls',PIPELINE_ORG_FROM_PREFIX:'true'}});
+ const result=await produceCanonicalReplay({orgId:identity.orgId,workspaceId:identity.workspaceId,harness:identity.source,sessionId:identity.sessionId},{readerMaxRuleset:readerMaxRuleset(process.env),db:x.db,store,provider:'s3',bucket:'replay-fixture',prefix:{PIPELINE_KEY_PREFIX:'96bulls',PIPELINE_ORG_FROM_PREFIX:'true'}});
  if(!result.published||result.rows!==count)throw Error('actual producer did not publish all source events');
  await x.pg.exec("INSERT INTO sessions.session_directory_search_token_policy(issuer,audience) VALUES('https://replay.invalid','replay-test')");
  const now=Math.floor(Date.now()/1000);await x.pg.exec('BEGIN; SET LOCAL ROLE session_directory_search_worker');
