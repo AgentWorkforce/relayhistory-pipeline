@@ -2,6 +2,8 @@
 *.log
 .96bulls/
 .alchemy/
+# Rehearsal tooling checkout (.github/workflows/rehearse-session-schema.yml).
+.rehearsal-tooling/
 .env
 .env.*
 dist/

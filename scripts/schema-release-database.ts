@@ -132,7 +132,7 @@ export function validateReleasePlan(
  * must be the release sha or on its first-parent (main) history, and its tree's schema steps equal this
  * checkout's steps without `held`, by name and sha256 (release-target.ts).
  */
-async function targetAnchor(input: { sha: string; target: string; targetSha: string }, held: string[]) {
+export async function targetAnchor(input: { sha: string; target: string; targetSha: string }, held: string[]) {
   return releaseTargetBinding({
     repo: process.cwd(),
     releaseSha: input.sha,
@@ -143,7 +143,7 @@ async function targetAnchor(input: { sha: string; target: string; targetSha: str
 }
 /** The anchor's ordered schema step names (target_sha's tree, migrator order). */
 const anchorSteps = (a: ReleaseTargetAnchor) => a.manifest.steps.map(([name]) => name);
-function sameAnchor(
+export function sameAnchor(
   a: ReleaseTargetAnchor,
   b: { targetSha: string; targetGeneration: string; manifestDigest: string },
 ) {

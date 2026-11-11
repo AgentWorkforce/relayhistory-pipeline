@@ -16,6 +16,8 @@ Review the exact migration inventory on the eventual merged main SHA. The base u
 
 Separately provision/review the private ingest Worker, ingestion Hyperdrive/login, signing/forwarding bindings and token secrets, namespace permissions and operator-controlled canary. The 03:46 UTC inventory reported no ingest Worker, only the old read-role Hyperdrive, and no RHC forwarding bindings. These are upload-release dependencies owned by the operator, not actions performed by this workflow. Full CH/read backfill is a separate lane.
 
+- Release-tree bootstrap chain before an apply that needs it: when the apply's prefix contains a step that depends on a role created by the bootstrap chain (046000 grants to bulls96_analysis_admit, provisioned by supabase/bootstrap/session_read_api_roles.sql), the release tree's bootstrap chain (SESSION_BOOTSTRAP_FILES order) must be applied first by a gated, idempotent CI stage of this same reviewed workflow with its own typed authorization: it reads back first, skips when the role already exists exactly, and the plan shows it. That stage is a separate change. Until it exists, an apply whose prefix depends on such a role fails closed with SQLSTATE 42704 at that step (earlier pending steps stay committed, marker pending). runbooks/schema-release-rehearsal.md (R2-bootstrap) rehearses it.
+
 ## Plan, review, then apply
 
 1. Merge the reviewed release route and required schema source onto main through the authorized integration process. Wait for the **current main SHA's push** ci and pg-proof workflows to complete successfully. Every job must succeed, including checks, session-read-worker / worker, and real PostgreSQL 15/16/17. Failed, skipped, incomplete, missing, truncated or different-SHA evidence refuses.
