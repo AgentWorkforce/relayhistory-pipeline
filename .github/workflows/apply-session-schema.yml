@@ -20,7 +20,7 @@ on:
         type: string
         required: true
       target_sha:
-        description: "Full 40-hex commit, sha itself or on sha's first-parent main history with green push CI, whose tree ends at target (same prefix steps, its own verifiers); images for this release are built there"
+        description: "Full 40-hex commit: sha itself (nothing held), or the tip of the protected release/schema-<slot> anchor branch for target (linear off main through lower anchors only, allowlisted release-identical diff, green push CI on that branch), whose tree ends at target (same prefix steps, its own verifiers); images for this release are built there"
         type: string
         required: true
       target_generation:
@@ -92,7 +92,10 @@ jobs:
       name: ${{ needs.prerequisite-gate.outputs.environment }}
     steps:
       # Full history: target_sha and its tree are read from the local object database
-      # only; the database step itself never runs network git.
+      # only; the database step itself never runs network git. fetch-depth 0 also brings
+      # every branch in as refs/remotes/origin/*, so refs/heads/release/schema-<slot>
+      # (the anchor for a held-step target) is local as refs/remotes/origin/release/schema-<slot>
+      # for the plan, bootstrap and apply steps (release_anchor_ref_missing otherwise).
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
