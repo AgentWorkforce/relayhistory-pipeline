@@ -3,6 +3,7 @@
  */
 import { appendFileSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { CONTROL_HEAD_BINDING, parseCanaryWorkspaces, renderDeployConfig, type RenderInputs } from "./render-deploy-config.ts";
 
 type Binding = { name?: unknown; type?: unknown; text?: unknown; service?: unknown; entrypoint?: unknown; environment?: unknown };
@@ -106,9 +107,26 @@ export async function checkPreservedVersion(env: Environment, get: (path: string
   need(activeVersion(await get("/deployments")) === env.PRESERVED_READER_VERSION, "Live Reader changed after preservation; rerun instead of overwriting its profile");
 }
 
+export function workflowEnvironment(resolved: Record<string, string>): string {
+  const allowed = new Set([...Object.keys(VARIABLES), ...Object.keys(FLAGS), "PRESERVED_READER_VERSION"]);
+  return Object.entries(resolved).map(([key, value]) => {
+    need(allowed.has(key) && !/[\r\n\u0000]/.test(value), "Unsafe workflow environment value");
+    return `${key}=${value}\n`;
+  }).join("");
+}
+
+export function apiRoot(template: string, expectedAccount: string | undefined): string {
+  const config = ts.parseConfigFileTextToJson("wrangler.jsonc", template);
+  const { account_id: account, name } = config.config ?? {};
+  need(!config.error && typeof account === "string" && /^[0-9a-f]{32}$/.test(account) && account === expectedAccount, "Worker template and deploy account differ");
+  need(typeof name === "string" && /^[a-z0-9-]{1,63}$/.test(name), "Invalid Worker script name");
+  return `https://api.cloudflare.com/client/v4/accounts/${account}/workers/scripts/${name}`;
+}
+
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   try {
-    const root = "https://api.cloudflare.com/client/v4/accounts/f7232cb80f6fab86a95426302af243e4/workers/scripts/bulls96-session-read-api";
+    const template = readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8");
+    const root = apiRoot(template, process.env.CLOUDFLARE_ACCOUNT_ID);
     const get = async (path: string) => {
       const token = process.env.CLOUDFLARE_API_TOKEN;
       need(token, "Cloudflare token required for live configuration read");
@@ -125,12 +143,9 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
       console.log("Live Reader profile guard checked; no provider writes");
     } else {
       need(process.argv.length === 2, "Unsupported profile command");
-      const resolved = await resolveProfile(process.env, readFileSync(new URL("../wrangler.jsonc", import.meta.url), "utf8"), get);
+      const resolved = await resolveProfile(process.env, template, get);
       need(process.env.GITHUB_ENV && process.env.GITHUB_OUTPUT, "GitHub output files required");
-      for (const [key, value] of Object.entries(resolved)) {
-        need(/^[A-Z_]+$/.test(key) && !/[\r\n\u0000]/.test(value), "Unsafe workflow environment value");
-        appendFileSync(process.env.GITHUB_ENV, `${key}=${value}\n`);
-      }
+      appendFileSync(process.env.GITHUB_ENV, workflowEnvironment(resolved));
       appendFileSync(process.env.GITHUB_OUTPUT, `owner_buffered=${resolved.OWNER_BUFFERED}\n`);
       console.log(`Reader profile validated: owner-buffered ${resolved.OWNER_BUFFERED}; no provider writes`);
     }

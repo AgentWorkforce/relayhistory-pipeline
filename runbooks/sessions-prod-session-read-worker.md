@@ -252,10 +252,8 @@ set `owner_buffered_statement_timeout_ms` to an integer from 2000 through 6000.
 `owner_buffered_statement_timeout_ms=off` keeps the runtime's default timeout. Changing feature settings remains an
 operator-approved production action; this source change does not enable history.
 
-On 2026-11-11, run 42946743205 deployed source `37f73b14` with the old default
-`off` inputs. The actual serving version `7d801289-2443-4978-a3da-b5f07d0a9f1e`
-omitted the previously active owner-buffered/event flags and control binding.
-The historical read returned an empty 200, so a successful health check did not
-prove session visibility. Restoring an intended profile must be followed by a
+Previously a no-input code deploy omitted active owner-buffered/event flags
+and the control binding. A subsequent read returned an empty 200, so a successful
+health check did not prove session visibility. Restoring an intended profile must be followed by a
 normal authenticated read of known native message identities. Do not claim a
 Factory history PASS from a durable upload cursor or a health response.
