@@ -4,6 +4,7 @@ import {validatedCustodyAck} from "./custody-ack.ts";
 import {CURRENT_CUSTODY_CONTENT_TYPE,CURRENT_CUSTODY_ACK_HEADER,PRIVATE_CUSTODY_BYTES,type CurrentCustodyPacket} from "./custody-protocol.ts";
 import {orderedControl,orderedControlResult,type OrderedControl} from "./control-protocol.ts";
 import { registerSessionEraseRoutes, SESSION_ERASE_DISABLED, type SessionEraseConfig, type SessionEraseService } from "./session-erase.ts";
+import { assertUserDeleteAllowed, type CapturePolicySubject } from "./capture-policy.ts";
 /**
  * The 96Bulls session ingest: relayhistory's delivery write contract
  * (relayhistory-cloud packages/relayhistory/src/routes/delivery.ts), served
@@ -53,8 +54,12 @@ import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protoc
 import { parseTurnBatch } from "./turns.ts";
 import { heartbeatProgress, ProgressError, readConnection, readSessionReceipt, recordHeartbeat, type Run as OnboardingRun } from "../history-db/onboarding.ts";
 
-/** `admission`: relayhistory's SIGNED opt-in to the queued ACK (async-admission.ts); absent: synchronous. */
-export type IngestIdentity=VerifiedIdentity & {control?:OrderedControl;admission?:typeof ADMISSION_ACCEPT_VALUE};
+/**
+ * `admission`: relayhistory's SIGNED opt-in to the queued ACK (async-admission.ts); absent: synchronous.
+ * `role` and `capturePolicy`: self-host only, from relaycontrol introspection (selfhost-auth.ts); the hosted
+ * signed identity never carries them (capture-policy.ts).
+ */
+export type IngestIdentity=VerifiedIdentity & {control?:OrderedControl;admission?:typeof ADMISSION_ACCEPT_VALUE} & CapturePolicySubject;
 
 export const SYNC_SCOPE = "rth:sync";
 export type ContentEncoding = "zstd" | "gzip";
@@ -716,6 +721,8 @@ export function createIngestApp(deps: IngestAppDeps) {
       await requireDeliveryAccount(identity, input.account_id);
       if (input.expected_user_id !== undefined && input.expected_user_id !== identity.userId)
         throw new DeliveryError("delivery_user_mismatch", 403, "Upload selection does not match authenticated user");
+      // A disable is the caller deleting their own uploaded session: the capture policy may withdraw it.
+      if (!input.enabled) assertUserDeleteAllowed(identity);
       const selection={
         tenant: { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId },
         originId: input.origin_id,
@@ -749,6 +756,8 @@ export function createIngestApp(deps: IngestAppDeps) {
     try {
       const input = parseReset(await jsonOf(c));
       await requireDeliveryAccount(identity, input.account_id);
+      // A reset deletes every session the caller uploaded: the capture policy may withdraw it.
+      assertUserDeleteAllowed(identity);
       const tenant={ orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
       let deleted:number,controlAck;
       const journal = <T>(run: () => Promise<T>, outcomeOf: (r: T) => "applied" | "replay" | "stale") =>

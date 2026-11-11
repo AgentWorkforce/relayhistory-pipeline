@@ -21,6 +21,8 @@
  *                              per-session erase (enabled:false; enabled:true answers 400 unsupported_by_backend). The app.ts handler is
  *                              unchanged; the ledger's setSessionUploads fences and tombstones every origin of the caller's session in one transaction
  *                              (migration 043910). 404 afterwards means unreadable, not bytes gone.
+ *                              Under a capture policy with user_retroactive_delete:false (relaycontrol introspection v1.5),
+ *                              a member's erase is 403 policy_forbids_user_delete; owners and admins still erase (capture-policy.ts).
  *   POST|GET /internal/v1/session-erase/...  operator per-session erase (session-erase.ts). Forwarded to the app
  *                              WITHOUT relaycontrol introspection: the app checks its own bearer
  *                              (SESSION_ERASE_API_SECRET). Default off: 501 not_implemented. Internal only;

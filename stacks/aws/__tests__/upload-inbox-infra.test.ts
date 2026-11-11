@@ -10,9 +10,10 @@ import {
 } from "../transcript-store.ts";
 import {
   UPLOAD_ADMISSION_FUNCTION_TIMEOUT_SECONDS, UPLOAD_ADMISSION_VISIBILITY_TIMEOUT_SECONDS, UPLOAD_INBOX_NOTIFICATION_ID,
-  UPLOAD_INBOX_PREFIX, UPLOAD_INBOX_RESOURCES, desktopUploadPolicy, desktopUploadTrustPolicy, parseHistoryUploadDirectInfra,
-  uploadAdmissionPolicy, uploadAdmissionQueuePolicy, uploadInboxNames,
+  UPLOAD_INBOX_PREFIX, UPLOAD_INBOX_RESOURCES, UPLOAD_INBOX_SSE_ENV, desktopUploadPolicy, desktopUploadTrustPolicy, parseHistoryUploadDirectInfra,
+  uploadAdmissionEnvironment, uploadAdmissionPolicy, uploadAdmissionQueuePolicy, uploadInboxNames,
 } from "../upload-inbox.ts";
+import { UPLOAD_INBOX_SSE_VAR, uploadDirectConfig } from "../../../src/session-ingest/upload-admission.ts";
 
 // Synthetic identifiers only.
 const accountId = "111111111111", region = "us-east-1", stage = "aws-synthetic";
@@ -81,6 +82,29 @@ describe("HISTORY_UPLOAD_DIRECT_INFRA", () => {
   });
 });
 
+describe("transcriptStore.uploadInboxSse input (hosted HISTORY_UPLOAD_INBOX_SSE)", () => {
+  const prod = (extra: Record<string, unknown>) => ({ accountId: TRANSCRIPT_ACCOUNT_ID, region: TRANSCRIPT_REGION, partition: "aws",
+    transcriptStore: { bufferedGcRoleArn: `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/synthetic-buffered-gc`, ...extra } as never });
+  it("is a known setting that accepts exactly aws:kms (or absent) and refuses anything else", () => {
+    expect(() => assertTranscriptStoreInputs(TRANSCRIPT_STAGE, prod({}))).not.toThrow();
+    expect(() => assertTranscriptStoreInputs(TRANSCRIPT_STAGE, prod({ uploadInboxSse: "aws:kms" }))).not.toThrow();
+    for (const bad of ["none", "", "AES256", "aws:kms ", null, true, 7])
+      expect(() => assertTranscriptStoreInputs(TRANSCRIPT_STAGE, prod({ uploadInboxSse: bad }))).toThrow(/uploadInboxSse must be exactly "aws:kms" on hosted.*Nothing was created\./);
+  });
+
+  it("the consumer environment is HISTORY_UPLOAD_INBOX_SSE=aws:kms, which the consumer parses as aws:kms", () => {
+    expect(UPLOAD_INBOX_SSE_ENV).toBe(UPLOAD_INBOX_SSE_VAR);
+    const env = uploadAdmissionEnvironment("aws:kms");
+    expect(env).toEqual({ HISTORY_UPLOAD_INBOX_SSE: "aws:kms" });
+    expect(uploadDirectConfig({ HISTORY_UPLOAD_DIRECT: "on", ...env }).inboxSse).toBe("aws:kms");
+    for (const bad of ["none", "", undefined]) expect(() => uploadAdmissionEnvironment(bad as never)).toThrow(/must be "aws:kms" on hosted/);
+  });
+
+  it("self-host keeps its none default (the hosted requirement does not reach selfhost config)", () => {
+    for (const v of [undefined, "", "none"]) expect(uploadDirectConfig({ HISTORY_UPLOAD_DIRECT: "on", HISTORY_UPLOAD_INBOX_SSE: v }).inboxSse).toBe("none");
+  });
+});
+
 describe("transcriptStore.uploadControlRoleArn input", () => {
   const prod = (extra: Record<string, unknown>) => ({ accountId: TRANSCRIPT_ACCOUNT_ID, region: TRANSCRIPT_REGION, partition: "aws",
     transcriptStore: { bufferedGcRoleArn: `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/synthetic-buffered-gc`, ...extra } as never });
@@ -118,20 +142,22 @@ describe("flag off renders the stack byte-identical", () => {
         absent:await render({...base,transcriptStore:store}),
         explicitFalse:await render({...base,historyUploadDirectInfra:false,transcriptStore:store}),
         controlOnly:await render({...base,transcriptStore:{...store,uploadControlRoleArn:'${controlRoleArn}'}}),
+        sseOnly:await render({...base,transcriptStore:{...store,uploadControlRoleArn:'${controlRoleArn}',uploadInboxSse:'aws:kms'}}),
       };
-      if(store.sessionPipeline) res[k].on=await render({...base,historyUploadDirectInfra:true,transcriptStore:{...store,uploadControlRoleArn:'${controlRoleArn}'}});
+      if(store.sessionPipeline) res[k].on=await render({...base,historyUploadDirectInfra:true,transcriptStore:{...store,uploadControlRoleArn:'${controlRoleArn}',uploadInboxSse:'aws:kms'}});
     }
     console.log(JSON.stringify(res));`;
   const result = spawnSync(process.execPath, ["--eval", script], { encoding: "utf8", env: { PATH: process.env.PATH }, timeout: 120_000 });
   if (result.status !== 0) throw new Error(result.stderr);
-  const renders = JSON.parse(result.stdout) as Record<string, { absent: string; explicitFalse: string; controlOnly: string; on?: string }>;
+  const renders = JSON.parse(result.stdout) as Record<string, { absent: string; explicitFalse: string; controlOnly: string; sseOnly: string; on?: string }>;
   const uploadSids = ["DenyUploadInbox", "UploadInboxOnlyItsRoles", "UploadInboxOnlyEraserOrConsumerDeletes", "DesktopUploadEncryptsInboxViaS3", "UploadAdmissionEncryptsAndReadsViaS3"];
 
   for (const scenario of ["store", "full", "noAnalysis"]) {
-    it(`${scenario}: off, explicit false and an inert control-role input are identical`, () => {
+    it(`${scenario}: off, explicit false and inert control-role / uploadInboxSse inputs are identical`, () => {
       const r = renders[scenario]!;
       expect(r.explicitFalse).toBe(r.absent);
       expect(r.controlOnly).toBe(r.absent);
+      expect(r.sseOnly).toBe(r.absent);
     });
     it(`${scenario}: off declares no upload resource, Sid, queue rule or output`, () => {
       const off = renders[scenario]!.absent;
@@ -153,7 +179,7 @@ describe("flag off renders the stack byte-identical", () => {
       expect(added.sort()).toEqual([...UPLOAD_INBOX_RESOURCES].sort());
       expect(on.ret.sessionPipeline.notification.QueueConfigurations.map((q: any) => q.Id)).toEqual(["96bulls-session-pipeline-manifests", UPLOAD_INBOX_NOTIFICATION_ID]);
       expect(on.ret.sessionPipeline.notification).toEqual(bucketNotificationConfiguration(sessionPipelineNames(stage, accountId, region).queueArn, u.queueArn));
-      expect(on.ret.uploadInbox).toEqual({ queueUrl: u.queueUrl, queueArn: u.queueArn, dlqArn: u.dlqArn, uploadRoleArn: u.uploadRoleArn, consumerRoleArn: u.consumerRoleArn });
+      expect(on.ret.uploadInbox).toEqual({ queueUrl: u.queueUrl, queueArn: u.queueArn, dlqArn: u.dlqArn, uploadRoleArn: u.uploadRoleArn, consumerRoleArn: u.consumerRoleArn, consumerEnvironment: { HISTORY_UPLOAD_INBOX_SSE: "aws:kms" } });
       const byName = (n: string) => on.resources.find((r: any) => r.name === n).props;
       // Principals before the key: both roles are declared before transcripts-key.
       const order = on.resources.map((r: any) => r.name);
@@ -181,9 +207,50 @@ describe("flag off renders the stack byte-identical", () => {
     const noControl = refuse("scenarios.full");
     expect(noControl.status).not.toBe(0);
     expect(noControl.stderr).toContain("uploadControlRoleArn is required");
-    const noPipeline = refuse(`{...scenarios.store,uploadControlRoleArn:'${controlRoleArn}'}`);
+    const noPipeline = refuse(`{...scenarios.store,uploadControlRoleArn:'${controlRoleArn}',uploadInboxSse:'aws:kms'}`);
     expect(noPipeline.status).not.toBe(0);
     expect(noPipeline.stderr).toContain("sessionPipeline is required");
+  });
+
+  // Hosted HISTORY_UPLOAD_INBOX_SSE: required, exactly aws:kms. Each case reports how many resources were
+  // declared before the refusal (must be 0) and the refusal message.
+  const attempt = (infra: boolean, sse: string | undefined) => {
+    const store = `{...scenarios.full,uploadControlRoleArn:'${controlRoleArn}'${sse === undefined ? "" : `,uploadInboxSse:${JSON.stringify(sse)}`}}`;
+    const r = spawnSync(process.execPath, ["--eval", script.replace(/const res=\{\};[\s\S]*$/, `try{await E.runPromise(transcriptStoreStage({...base,historyUploadDirectInfra:${infra},transcriptStore:${store}}));console.log(JSON.stringify({ok:true,declared:seen.length}));}catch(e){console.log(JSON.stringify({ok:false,declared:seen.length,message:String(e?.message??e)}));}`)], { encoding: "utf8", env: { PATH: process.env.PATH }, timeout: 60_000 });
+    if (r.status !== 0) throw new Error(r.stderr);
+    return JSON.parse(r.stdout.trim().split("\n").at(-1)!) as { ok: boolean; declared: number; message?: string };
+  };
+
+  it("on + uploadInboxSse aws:kms passes", () => {
+    const r = attempt(true, "aws:kms");
+    expect(r.ok).toBe(true);
+    expect(r.declared).toBeGreaterThan(0);
+  });
+
+  it("on + uploadInboxSse unset refuses before declaring anything (required, never defaulted)", () => {
+    const r = attempt(true, undefined);
+    expect(r).toMatchObject({ ok: false, declared: 0 });
+    expect(r.message).toContain(`${stage} historyUploadDirectInfra is on: transcriptStore.uploadInboxSse is required and must be exactly "aws:kms"`);
+    expect(r.message).toContain("Nothing was created.");
+  });
+
+  it("on + none, empty or any other value refuses before declaring anything", () => {
+    for (const bad of ["none", "", "AES256", "aws:kms ", "AWS:KMS", "aws:kms:dsse"]) {
+      const r = attempt(true, bad);
+      expect(r).toMatchObject({ ok: false, declared: 0 });
+      expect(r.message).toContain(`transcriptStore.uploadInboxSse must be exactly "aws:kms" on hosted, got ${JSON.stringify(bad)}`);
+      expect(r.message).toContain("Nothing was created.");
+    }
+  });
+
+  it("off: unset is untouched; aws:kms is inert; none/other still refuse (a hosted input never names them)", () => {
+    expect(attempt(false, undefined).ok).toBe(true);
+    expect(attempt(false, "aws:kms").ok).toBe(true);
+    for (const bad of ["none", "", "AES256"]) {
+      const r = attempt(false, bad);
+      expect(r).toMatchObject({ ok: false, declared: 0 });
+      expect(r.message).toContain("transcriptStore.uploadInboxSse must be exactly \"aws:kms\" on hosted");
+    }
   });
 });
 
