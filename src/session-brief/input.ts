@@ -18,6 +18,7 @@
  * Nothing here logs or returns transcript text except to the caller that builds the
  * model input.
  */
+import { assertReaderScrubMarker, readerChunkBody } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { zstdDecompressSync } from "node:zlib";
 import {
   PipelineError,
@@ -218,6 +219,7 @@ async function transcriptEvents(
   manifestKey: string,
   store: ObjectStore,
   budget: { bytes: number },
+  maximum?: number,
 ): Promise<Omit<NormalizedEvent, "id">[]> {
   const loc = location(manifest, manifestKey);
   const events: Omit<NormalizedEvent, "id">[] = [];
@@ -229,7 +231,7 @@ async function transcriptEvents(
     const key = rawChunkKey(loc, chunk.seq, chunk.start_offset, chunk.sha256_8, manifest.raw.format);
     let stored: Uint8Array;
     try {
-      stored = await readAll(await store.get(key));
+      stored = await readAll(await readerChunkBody(await store.getObject(key), manifest.raw.scrub, maximum));
     } catch (err) {
       if ((err as { code?: string }).code === "not_found")
         throw new PipelineError("chunk_missing", "a listed chunk is not in object storage", true);
@@ -271,11 +273,13 @@ async function recordEvents(
   manifestKey: string,
   store: ObjectStore,
   budget: { bytes: number },
+  maximum?: number,
 ): Promise<Omit<NormalizedEvent, "id">[]> {
   const loc = location(manifest, manifestKey);
   const remaining = MAX_BRIEF_SESSION_BYTES - budget.bytes;
   const records = await readRelayhistoryExport(manifest, store, undefined, {
     maxSessionBytes: remaining,
+    readerMaxRuleset: maximum,
     ...(loc.prefix ? { prefix: loc.prefix } : {}),
   });
   budget.bytes += manifest.raw.chunks.reduce(
@@ -303,7 +307,7 @@ async function recordEvents(
  * manifest that is not scrubbed quarantines the whole session (nothing is read from it).
  */
 export async function buildBriefInput(
-  deps: { reader: ManifestReader; store: ObjectStore },
+  deps: { reader: ManifestReader; store: ObjectStore; readerMaxRuleset?: number },
   key: { harness: string; sessionId: string },
   pointers: readonly BriefPointer[],
 ): Promise<BriefInput> {
@@ -317,6 +321,7 @@ export async function buildBriefInput(
       throw new PipelineError("manifest_missing", "a live pointer's manifest is missing", true);
     if (!read.manifest.raw.scrub)
       return { kind: "quarantined", error: "session_quarantined", sourceRevisions };
+    assertReaderScrubMarker(read.manifest.raw.scrub, deps.readerMaxRuleset);
     manifests.push({ manifest: read.manifest, manifestKey: p.manifestKey });
   }
   if (!SESSION_SUMMARY_SOURCES.includes(key.harness))
@@ -328,8 +333,8 @@ export async function buildBriefInput(
       return { kind: "ineligible", error: "session_format_unsupported", sourceRevisions };
     collected.push(
       ...(carriesRecords(manifest)
-        ? await recordEvents(manifest, manifestKey, deps.store, budget)
-        : await transcriptEvents(manifest, manifestKey, deps.store, budget)),
+        ? await recordEvents(manifest, manifestKey, deps.store, budget, deps.readerMaxRuleset)
+        : await transcriptEvents(manifest, manifestKey, deps.store, budget, deps.readerMaxRuleset)),
     );
   }
   return briefInputFromEvents(key, sourceRevisions, collected);

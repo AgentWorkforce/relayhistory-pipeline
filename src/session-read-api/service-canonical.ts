@@ -72,6 +72,7 @@
  * required: PIPELINE_ORG_FROM_PREFIX must be exactly "true" whenever
  * LOCKER_BUCKET is set, and the reader always runs with it on.
  */
+import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { zstdDecompressSync } from "node:zlib";
 import { cachedProvider } from "../../packages/object-store/src/core.ts";
 import { CANONICAL_SCOPE_BYTES, CANONICAL_SCOPE_EVENTS, canonicalSnapshot, type CanonicalIdentity, type CanonicalDeps } from "./canonical.ts";
@@ -156,6 +157,7 @@ export async function serviceCanonicalDeps(
   run: TenantRunner,
   fetcher: typeof fetch = (input, init) => fetch(input, init),
 ): Promise<ServiceCanonicalDeps | undefined> {
+  const maximum = readerMaxRuleset(env);
   if (!env.LOCKER_BUCKET?.trim()) return undefined;
   if (env.PIPELINE_ORG_FROM_PREFIX !== "true")
     throw new Error("session read api: LOCKER_BUCKET needs PIPELINE_ORG_FROM_PREFIX=true (the org-prefix layout binds each object to its org)");
@@ -185,7 +187,7 @@ export async function serviceCanonicalDeps(
     // Every object read of this request is aborted at the route's deadline.
     const bounded: typeof fetch = (input, init) => fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal });
     const raw = buildLockerStore(env, { fetch: bounded, ...(credentials ? { credentials } : {}), ...(gcsToken ? { gcsToken } : {}) });
-    return { store: raw.store, provider: raw.provider, bucket: raw.bucket, prefix, pointers: pointers.pointers, decompress, ...(pinLaggingPointer ? { pinLaggingPointer } : {}) };
+    return { readerMaxRuleset: maximum, store: raw.store, provider: raw.provider, bucket: raw.bucket, prefix, pointers: pointers.pointers, decompress, ...(pinLaggingPointer ? { pinLaggingPointer } : {}) };
   }
   async function source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows & { generation: string; exists: boolean }> {
     const snapshot = await canonicalSnapshot(deps(signal), identity, scope);

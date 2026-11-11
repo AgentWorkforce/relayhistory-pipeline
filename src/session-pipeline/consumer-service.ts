@@ -28,10 +28,12 @@
  * the pending table. Nothing here seeds state: rows come only from
  * reconciling real canonical events.
  */
+import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { createServer } from "node:http";
 import { unlinkSync, writeFileSync } from "node:fs";
 import { isTenantOnlyPolicy, type TenantPolicyRow } from "./postgres-search-state.ts";
 import { log } from "../shared/log.ts";
+import { initScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
 import { captureSafely } from "../shared/analytics.ts";
 import { ANALYTICS_OFF, analyticsCounterFields, createAnalyticsSink } from "../shared/analytics-config.ts";
 import { integer } from "../shared/env.ts";
@@ -1106,6 +1108,7 @@ export function refuseStartupOptions(url: string): void {
  */
 
 export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never> {
+  const maximum = readerMaxRuleset(env);
   const config = consumerServiceConfig(env);
   if (!config.enabled) {
     // Dormant but observable, like the read API: no database, no polling, a
@@ -1195,6 +1198,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     reader,
     store: raw.store,
     adapter: binding,
+    readerMaxRuleset: maximum,
     prefixFor: (orgId) => `${config.keyPrefix}/${orgId}`,
     ...outputFactsDeps(config),
   };
@@ -1411,4 +1415,8 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
   process.exit(exitCode);
 }
 
-if (import.meta.main) await serve();
+// SCRUB_ENGINE (docs/scrub-engine.md): select, and for wasm verify the pinned engine, before serving.
+if (import.meta.main) {
+  await initScrubEngine();
+  await serve();
+}

@@ -37,7 +37,7 @@ import { sha256Hex } from "../../packages/object-store/src/crypto.ts";
 import { createOpenSearchCapableSearchIndexRegistry } from "../../packages/pipeline/src/adapters/defaults.ts";
 import { syntheticDoc } from "../../packages/pipeline/src/search-index/conformance.ts";
 import { matchesQuery, positionOf } from "../../packages/pipeline/src/search-index/contracts.ts";
-import { scrubRecords } from "../../packages/pipeline/src/lib/pipeline/raw-chunks.ts";
+import { scrubRecords } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import type { SqlExecutor } from "../../packages/pipeline/src/lib/pipeline/queue.ts";
 import { PLANTED_CONTENT_MARKER, PLANTED_SECRETS } from "../../src/concourse/seed.ts";
 import { composeSearchService } from "../../src/shared/search-composition.ts";
@@ -54,6 +54,7 @@ import {
 import type { SessionScope } from "../../src/session-pipeline/pointer.ts";
 import type { SearchProjectionState } from "../../src/session-pipeline/search-adapter.ts";
 import { indexSearchScope } from "../../src/session-pipeline/search-index.ts";
+import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 
 const URL_ = process.env.SEARCH_INDEX_OPENSEARCH_TEST_URL?.trim();
 const DIALECT = process.env.SEARCH_INDEX_OPENSEARCH_TEST_DIALECT?.trim() || "opensearch";
@@ -233,7 +234,7 @@ try {
 
   // 2. index
   const meta = fakeMetadata(() => keys);
-  const deps = { transact: meta.transact, reader, store, adapter: binding, prefixFor: (org: string) => `96bulls/${org}`, now: () => NOW };
+  const deps = { readerMaxRuleset: readerMaxRuleset(process.env), transact: meta.transact, reader, store, adapter: binding, prefixFor: (org: string) => `96bulls/${org}`, now: () => NOW };
   const indexed = await indexSearchScope(scope, deps);
   check("index: indexSearchScope completes and inserts both events", indexed.complete === true && indexed.inserted === 2, JSON.stringify(indexed));
 

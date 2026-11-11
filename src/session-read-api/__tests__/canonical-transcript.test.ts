@@ -29,7 +29,7 @@ async function fixture(raw=new TextEncoder().encode(messages.map(x=>JSON.stringi
  const save=()=>store.put(objectKey(path),new TextEncoder().encode(JSON.stringify(manifest)));
  await save();
  const pointer:CanonicalPointer={org_id:"org-a",workspace_id:"ws-a",harness:"claude",session_id:session,machine_id:"m-1",user_id:"u-1",storage_provider:"s3",bucket:"bucket",manifest_key:path,revision:1,content_sha256:manifest.raw.content_sha256,raw_format:"jsonl",deleted_at:null};
- const watched=new Proxy(store,{get(target,prop){const v=Reflect.get(target,prop);if(prop==='get')return (...args:Parameters<typeof store.get>)=>{reads++;return target.get(...args)};return typeof v==='function'?v.bind(target):v}});
+ const watched=new Proxy(store,{get(target,prop){const v=Reflect.get(target,prop);if(prop==='getObject')return (...args:Parameters<typeof store.getObject>)=>{if(String(args[0]).endsWith('.zst'))reads++;return target.getObject(...args)};return typeof v==='function'?v.bind(target):v}});
  const deps:CanonicalDeps={store:watched,provider:"s3",bucket:"bucket",prefix:{PIPELINE_ORG_FROM_PREFIX:"true"},pointers:async()=>[pointer],decompress:(b,max)=>new Uint8Array(zstdDecompressSync(b,{maxOutputLength:max}))};
  return {store,manifest,pointer,deps,path,save,reads:()=>reads};
 }
@@ -103,4 +103,26 @@ test("truncation to an empty live epoch does not resurrect old messages",async()
 test("budget and declared counts describe live chunks while the full historical chain is validated",async()=>{
  const old=new TextEncoder().encode(JSON.stringify({...messages[0],message:{role:'user',content:'OLD'.repeat(6*1024*1024)}})+'\n');const f=await fixture(old,undefined,1);await nextEpoch(f,new TextEncoder().encode(JSON.stringify(messages[1])+'\n'),'rewritten',1);const s=await canonicalTranscriptSnapshot(f.deps,ID);expect(s?.records).toHaveLength(1);expect(f.reads()).toBe(1);
  const tampered=await fixture();await nextEpoch(tampered,new TextEncoder().encode(JSON.stringify(messages[1])+'\n'),'rewritten',1);tampered.manifest.raw.chunks[0]!.sha256='f'.repeat(64);tampered.manifest.raw.chunks[0]!.sha256_8='f'.repeat(8);await tampered.save();await expect(canonicalTranscriptSnapshot(tampered.deps,ID)).rejects.toBeInstanceOf(Error);expect(tampered.reads()).toBe(0);
+});
+
+
+test("JSONL brief input enforces the reader ceiling before chunk hydration", async () => {
+ const f=await fixture(); f.manifest.raw.scrub={ruleset:"relayhistory-scrub",version:10}; await f.save();
+ await expect(canonicalTranscriptSnapshot({...f.deps,readerMaxRuleset:8},ID)).rejects.toMatchObject({code:"scrub_ruleset_unsupported",retryable:false});
+ expect(f.reads()).toBe(0);
+ const c=f.manifest.raw.chunks[0]!; const chunkKey=rawChunkKey(LOC,c.seq,c.start_offset,c.sha256,"jsonl");
+ const body=new Uint8Array(await new Response(await f.store.get(chunkKey)).arrayBuffer());
+ await f.store.put(chunkKey,body,{metadata:{"scrub-ruleset":"relayhistory-scrub","scrub-version":"10"}});
+ const result=await canonicalTranscriptSnapshot({...f.deps,readerMaxRuleset:10},ID);
+ expect(result?.records).toHaveLength(2);
+});
+
+
+test("unset JSONL policy retains main's version-9 and foreign-family transcript reads",async()=>{
+ const f=await fixture();const baseline=await canonicalTranscriptSnapshot(f.deps,ID);
+ for(const marker of [{ruleset:"relayhistory-scrub",version:9},{ruleset:"foreign-family",version:8}]){
+  f.manifest.raw.scrub=marker;await f.save();
+  expect((await canonicalTranscriptSnapshot(f.deps,ID))?.records).toEqual(baseline?.records);
+  await expect(canonicalTranscriptSnapshot({...f.deps,readerMaxRuleset:8},ID)).rejects.toMatchObject({code:"scrub_ruleset_unsupported"});
+ }
 });

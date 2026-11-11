@@ -25,16 +25,24 @@
  * operator redrives at once by deleting the marker. The inbox bytes are NEVER expired or deleted by this
  * file: only a terminal outcome retires them (tombstone), exactly as hosted.
  *
+ * Upload inbox (HISTORY_UPLOAD_DIRECT allowlist|on only, `uploadInbox`): after the admission pass, the same
+ * scan lists `<keyRoot>/.upload-inbox/` and runs promoteUpload (upload-admission.ts) on at most `batchSize`
+ * due objects, one at a time, with per-object backoff (backoffSeconds) after a retry. A hand-off writes an
+ * admission-inbox object and notifies this consumer, which admits it like any other. Off: the prefix is
+ * never listed.
+ *
  * Logs: one `ingest.admission` line per attempt (the hosted fields), one `ingest.admission_consumer`
  * line per scan (backlog, oldest age, dead letters, in flight). Never a key, body, token or header value.
  */
+import type { UploadConsentConfig } from "./upload-consent.ts";
 import { zstdDecompressSync } from "node:zlib";
 import { log as sharedLog } from "../shared/log.ts";
 import { objectKey, type ObjectStore } from "../shared/vendor.ts";
-import { admitMessage, type AdmissionAction } from "./admission-consumer.ts";
+import { admitMessage, backoffSeconds, type AdmissionAction } from "./admission-consumer.ts";
 import { INBOX_NAMESPACE, pendingAdmissions } from "./async-admission.ts";
 import { lockAlertFields } from "./app.ts";
 import type { DeliverDeps } from "./deliver.ts";
+import { uploadInboxRoot, type PromoteResult } from "./upload-admission.ts";
 
 export const DEAD_LETTER_NAMESPACE = ".admission-dlq";
 export const DEAD_LETTER_RETENTION_MS = 14 * 24 * 3600 * 1000;
@@ -69,6 +77,10 @@ export interface SelfhostAdmissionOptions {
   maxAttempts: number;
   nowMs?: () => number;
   log?: Logger;
+  /** HISTORY_UPLOAD_DIRECT allowlist|on: promote up to `batchSize` upload-inbox objects per scan. Absent: never listed. */
+  uploadInbox?: { promote: (key: string) => Promise<PromoteResult>; batchSize: number };
+  /** INGEST_UPLOAD_CONSENT (upload-consent.ts): re-checked at admission, at the current policy. */
+  uploadConsent?: UploadConsentConfig;
 }
 
 export interface SelfhostAdmissionStatus {
@@ -115,6 +127,46 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
   let interval: ReturnType<typeof setInterval> | undefined;
   let wake: ReturnType<typeof setTimeout> | undefined;
   const staleAfterMs = Math.max(3 * opts.scanIntervalMs, 60_000);
+  /** Upload keys that returned `retry` (or `invalid`): attempts and the earliest next attempt. */
+  const uploadBackoff = new Map<string, { attempts: number; notBefore: number }>();
+
+  async function promoteUploads(at: number): Promise<void> {
+    const upload = opts.uploadInbox;
+    if (!upload) return;
+    const t0 = Date.now();
+    const counts: Record<string, number> = {};
+    const seen = new Set<string>();
+    let promoted = 0, cursor: string | undefined;
+    const root = uploadInboxRoot(keyRoot);
+    try {
+      do {
+        // objectKey refuses a trailing slash: list the bare prefix and keep only slash-bounded keys
+        // (as pendingAdmissions does), so a sibling `.upload-inbox-x/` is never promoted.
+        const page = await store.list(objectKey(root.slice(0, -1)), cursor);
+        for (const item of page.items) {
+          const key = String(item.key);
+          if (!key.startsWith(root)) continue;
+          seen.add(key);
+          const back = uploadBackoff.get(key);
+          if (promoted >= upload.batchSize || (back && back.notBefore > at)) continue;
+          promoted++;
+          const r = await upload.promote(key).catch((error: unknown): PromoteResult => ({ action: "retry", code: "promote_failed", error }));
+          const label = r.action === "ack" ? (r.code ?? r.outcome) : r.code;
+          counts[label] = (counts[label] ?? 0) + 1;
+          if (r.action === "ack") { uploadBackoff.delete(key); continue; }
+          const attempts = (back?.attempts ?? 0) + 1;
+          // invalid: not an upload key of this root; it is never promoted, so wait the longest.
+          uploadBackoff.set(key, { attempts, notBefore: now() + (r.action === "invalid" ? 300 : backoffSeconds(attempts)) * 1000 });
+        }
+        cursor = page.nextCursor;
+      } while (cursor && !stopped);
+      for (const key of uploadBackoff.keys()) if (!seen.has(key)) uploadBackoff.delete(key);
+      if (promoted > 0) logger.info("session ingest upload admission", { route: "ingest.upload_admission", outcome: "ok", promoted, waiting: uploadBackoff.size, duration_ms: Date.now() - t0, ...counts });
+    } catch (error) {
+      const code = (error as { code?: unknown })?.code;
+      logger.warn("session ingest upload admission", { route: "ingest.upload_admission", outcome: "scan_failed", error_code: typeof code === "string" && /^[A-Za-z0-9_]{1,64}$/.test(code) ? code : "scan_failed", duration_ms: Date.now() - t0 });
+    }
+  }
 
   async function listDeadLetters(at: number): Promise<Map<string, number>> {
     const out = new Map<string, number>();
@@ -155,6 +207,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       const code = (error as { code?: unknown })?.code;
       logger.warn("session ingest admission consumer", { route: "ingest.admission_consumer", outcome: "scan_failed", error_code: typeof code === "string" && /^[A-Za-z0-9_]{1,64}$/.test(code) ? code : "scan_failed", duration_ms: Date.now() - t0 });
     }
+    await promoteUploads(scanAt);
   }
 
   function scan(): Promise<void> {
@@ -175,7 +228,7 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
   async function admitOne(key: string, entry: Entry): Promise<void> {
     entry.attempts += 1;
     const t0 = Date.now();
-    const r: AdmissionAction = await admitMessage({ mode: opts.mode, deliver: opts.deliver, custodySource: "relayhistory", decompress, nowMs: now }, { v: 1, kind: "ingest-admission", key }, entry.attempts)
+    const r: AdmissionAction = await admitMessage({ mode: opts.mode, deliver: opts.deliver, custodySource: "relayhistory", decompress, nowMs: now, ...(opts.uploadConsent ? { uploadConsent: opts.uploadConsent, log: (fields: Record<string, unknown>) => logger.warn("session ingest admission", fields) } : {}) }, { v: 1, kind: "ingest-admission", key }, entry.attempts)
       .catch((error: unknown): AdmissionAction => ({ action: "retry", delaySeconds: 300, code: "admission_failed", error }));
     if (r.action === "ack") {
       logger.info("session ingest admission", { route: "ingest.admission", outcome: r.outcome, error_code: r.code, duration_ms: Date.now() - t0, ...(r.lagMs !== undefined ? { offset: r.lagMs } : {}), attempt: entry.attempts });

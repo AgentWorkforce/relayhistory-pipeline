@@ -17,6 +17,8 @@ import {
   operatorSafePlans,
   verifyOperatorCapture,
   EXECUTION_EXCEPTION,
+  OperatorRefusal,
+  operatorExecutionHost,
   type OperatorSecrets,
 } from "../../../scripts/private-ingest-operator.ts";
 import { inputsDigest } from "../../aws/deploy-guard.ts";
@@ -27,6 +29,12 @@ const secrets: OperatorSecrets = {
   stateUrl: "https://alchemy-state-store-96bulls.fixture.workers.dev",
   stateToken: "synthetic-state-token-not-authorized",
 };
+
+test("separate GitHub-hosted plan and deploy runners share one capture host identity", () => {
+  expect(operatorExecutionHost({ GITHUB_ACTIONS: "true" }, "runner-a")).toBe("github-actions");
+  expect(operatorExecutionHost({ GITHUB_ACTIONS: "true" }, "runner-b")).toBe("github-actions");
+  expect(operatorExecutionHost({}, "operator-host")).toBe("operator-host");
+});
 const baseInput = {
   sessionIngest: {
     accountId: secrets.accountId,
@@ -64,25 +72,26 @@ const tools = {
     nativeBindingsSha256: "f".repeat(64),
   };
 const digest = (v: string) => createHash("sha256").update(v).digest("hex");
-async function actualPlanProof(declared: "canonical" | "buffered" | "admission" | "admission-default" | "admission-drain" | "frozen-receipt") {
+async function actualPlanProof(declared: "canonical" | "buffered" | "admission" | "admission-default" | "admission-drain" | "custody" | "frozen-receipt") {
   // "admission": buffered + asyncAdmission "on" (the three admission resources and two more bindings).
   // "admission-default": buffered with asyncAdmission OMITTED, which resolves to "on" (same as "admission").
   // "admission-drain": buffered + asyncAdmission "drain" (same resources, the var says drain).
   // "buffered": buffered + explicit asyncAdmission "off": the four resources, byte-identical to before.
-  // "frozen-receipt": buffered + frozen-supabase custody + syncAdmissionFrozenReceipt, asyncAdmission "off" (two more vars, no resource).
+  // "custody" / "frozen-receipt": buffered + frozen custody, optionally the receipt; asyncAdmission "off".
   const mode = declared === "canonical" ? "canonical" : "buffered";
   const admission = declared === "admission" || declared === "admission-default" || declared === "admission-drain";
   const admissionVar = declared === "admission-drain" ? "drain" : "on";
-  const frozenReceipt = declared === "frozen-receipt";
-  const bindingCount = admission || frozenReceipt ? 17 : mode === "buffered" ? 15 : 13;
+  const frozenReceipt = declared === "frozen-receipt", custody = declared === "custody" || frozenReceipt;
+  const bindingCount = admission || frozenReceipt ? 17 : custody ? 16 : mode === "buffered" ? 15 : 13;
   const input = {
     ...baseInput,
     sessionIngest: {
       ...baseInput.sessionIngest,
       ...(declared === "admission" ? { asyncAdmission: "on" as const } : {}),
       ...(declared === "admission-drain" ? { asyncAdmission: "drain" as const } : {}),
-      ...(declared === "buffered" || frozenReceipt ? { asyncAdmission: "off" as const } : {}),
-      ...(frozenReceipt ? { custodySource: "frozen-supabase" as const, syncAdmissionFrozenReceipt: "on" as const } : {}),
+      ...(declared === "buffered" || custody ? { asyncAdmission: "off" as const } : {}),
+      ...(custody ? { custodySource: "frozen-supabase" as const } : {}),
+      ...(frozenReceipt ? { syncAdmissionFrozenReceipt: "on" as const } : {}),
       ...(mode === "buffered"
         ? {
             acceptanceMode: "buffered" as const,
@@ -112,10 +121,14 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
     CI: process.env.CI,
     CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID,
     CLOUDFLARE_API_TOKEN: process.env.CLOUDFLARE_API_TOKEN,
+    GITHUB_ACTIONS: process.env.GITHUB_ACTIONS,
+    PRIVATE_INGEST_GITHUB_GATE: process.env.PRIVATE_INGEST_GITHUB_GATE,
   };
   process.env.CI = "true";
   process.env.CLOUDFLARE_ACCOUNT_ID = secrets.accountId;
   process.env.CLOUDFLARE_API_TOKEN = secrets.apiToken;
+  process.env.GITHUB_ACTIONS = "true";
+  process.env.PRIVATE_INGEST_GITHUB_GATE = "approved";
   const fetcher: typeof fetch = async (input, init) => {
     const u = new URL(String(input)),
       method = init?.method ?? "GET";
@@ -396,6 +409,62 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
           { ...b, data: { bindings: [{ ...b.data.bindings[0], text: "off" }] } }) } } } }, input)).toThrow("native_binding_target");
       const { syncAdmissionFrozenReceipt: _s, ...withoutFlag } = input.sessionIngest as any;
       expect(() => assertOperatorSnapshot(native, { ...input, sessionIngest: withoutFlag })).toThrow("native_binding_inventory");
+      const receiptBinding = worker.bindings.find((b: any) =>
+        b.sid === "INGEST_SYNC_ADMISSION_FROZEN_RECEIPT");
+      const { INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: _receipt, ...receiptRollbackEnv } = worker.props.env;
+      const receiptRollbackWorker = {
+        ...worker,
+        action: "update",
+        props: { ...worker.props, env: receiptRollbackEnv },
+        state: { status: "updated", props: worker.props },
+        bindings: worker.bindings.map((b: any) => b === receiptBinding
+          ? { ...b, action: "delete" }
+          : b),
+      };
+      expect(assertOperatorSnapshot({ ...native, native: { ...native.native, resources: {
+        ...rowsOf, "session-ingest": receiptRollbackWorker,
+      } } }, { ...input, sessionIngest: withoutFlag })).toHaveLength(bindingCount);
+      expect(() => assertOperatorSnapshot({ ...native, native: { ...native.native, resources: {
+        ...rowsOf,
+        "session-ingest": {
+          ...receiptRollbackWorker,
+          state: { ...receiptRollbackWorker.state, props: {
+            ...receiptRollbackWorker.state.props,
+            env: { ...receiptRollbackWorker.state.props.env, INGEST_CUSTODY_SOURCE: "shadow" },
+          } },
+        },
+      } } }, { ...input, sessionIngest: withoutFlag })).toThrow("native_binding_target");
+    }
+    if (custody && !frozenReceipt) {
+      const rowsOf = native.native.resources, worker = rowsOf["session-ingest"];
+      const custodyBinding = worker.bindings.find((b: any) => b.sid === "INGEST_CUSTODY_SOURCE");
+      const { INGEST_CUSTODY_SOURCE: _custody, ...custodyRollbackEnv } = worker.props.env;
+      const { custodySource: _source, ...withoutCustody } = input.sessionIngest as any;
+      const custodyRollbackWorker = {
+        ...worker,
+        action: "update",
+        props: { ...worker.props, env: custodyRollbackEnv },
+        state: { status: "updated", props: worker.props },
+        bindings: worker.bindings.map((b: any) => b === custodyBinding
+          ? { ...b, action: "delete" }
+          : b),
+      };
+      expect(assertOperatorSnapshot({ ...native, native: { ...native.native, resources: {
+        ...rowsOf, "session-ingest": custodyRollbackWorker,
+      } } }, { ...input, sessionIngest: withoutCustody })).toHaveLength(bindingCount);
+      expect(() => assertOperatorSnapshot({ ...native, native: { ...native.native, resources: {
+        ...rowsOf,
+        "session-ingest": {
+          ...custodyRollbackWorker,
+          state: { ...custodyRollbackWorker.state, props: {
+            ...custodyRollbackWorker.state.props,
+            env: {
+              ...custodyRollbackWorker.state.props.env,
+              INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: "on",
+            },
+          } },
+        },
+      } } }, { ...input, sessionIngest: withoutCustody })).toThrow("native_binding_target");
     }
     if (mode === "buffered") {
       const worker = native.native.resources["session-ingest"];
@@ -419,6 +488,91 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
       expect(queue.props.deliveryPaused).toBe(true);
       expect(queue.provider.version).toBe(1);
       expect(queue.downstream).toContain("session-ingest-fanout-consumer");
+
+      // The one permitted binding deletion is the exact G -> H overlap
+      // closure: old expected G + accepted G,H becomes expected H alone.
+      const oldExpected = "f".repeat(64),
+        newExpected = "e".repeat(64),
+        oldAccepted = `${oldExpected},${newExpected}`,
+        deletedOverlap = {
+          sid: "INGEST_ACCEPT_GENERATIONS",
+          action: "delete",
+          data: {
+            bindings: [{
+              type: "plain_text",
+              name: "INGEST_ACCEPT_GENERATIONS",
+              text: oldAccepted,
+            }],
+          },
+        },
+        cleanupWorker = {
+          ...worker,
+          action: "update",
+          state: {
+            status: "updated",
+            props: {
+              ...worker.props,
+              env: {
+                ...worker.props.env,
+                INGEST_EXPECT_GENERATION: oldExpected,
+                INGEST_ACCEPT_GENERATIONS: oldAccepted,
+              },
+            },
+          },
+          bindings: [...worker.bindings, deletedOverlap],
+        },
+        cleanupRows = {
+          ...native.native.resources,
+          "session-ingest": cleanupWorker,
+        },
+        cleanupSnapshot = {
+          ...native,
+          native: { ...native.native, resources: cleanupRows },
+        };
+      expect(assertOperatorSnapshot(cleanupSnapshot, input)).toHaveLength(
+        bindingCount + 1,
+      );
+      for (const invalid of [
+        { ...deletedOverlap, sid: "INGEST_CLAIM_LOCK_BUSY" },
+        { ...deletedOverlap, action: "update" },
+        { ...deletedOverlap, data: { bindings: [{
+          ...deletedOverlap.data.bindings[0], text: `${newExpected},${oldExpected}`,
+        }] } },
+        { ...deletedOverlap, data: { bindings: [{
+          ...deletedOverlap.data.bindings[0], name: "FOREIGN",
+        }] } },
+      ]) {
+        const rows = {
+          ...cleanupRows,
+          "session-ingest": {
+            ...cleanupWorker,
+            bindings: [...worker.bindings, invalid],
+          },
+        };
+        expect(() => assertOperatorSnapshot(
+          { ...native, native: { ...native.native, resources: rows } }, input,
+        )).toThrow();
+      }
+      const reversedState = {
+        ...cleanupWorker,
+        state: {
+          ...cleanupWorker.state,
+          props: {
+            ...cleanupWorker.state.props,
+            env: {
+              ...cleanupWorker.state.props.env,
+              INGEST_ACCEPT_GENERATIONS: `${newExpected},${oldExpected}`,
+            },
+          },
+        },
+      };
+      expect(() => assertOperatorSnapshot({
+        ...native,
+        native: {
+          ...native.native,
+          resources: { ...cleanupRows, "session-ingest": reversedState },
+        },
+      }, input)).toThrow("native_binding_target");
     }
     for (const change of ["binding", "target", "type", "action", "resource"]) {
       const rows = { ...native.native.resources },
@@ -469,7 +623,7 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
     await rm(dir, { recursive: true, force: true });
   }
 }
-test.each(["canonical", "buffered", "admission", "admission-default", "admission-drain", "frozen-receipt"] as const)(
+test.each(["canonical", "buffered", "admission", "admission-default", "admission-drain", "custody", "frozen-receipt"] as const)(
   "actual original four-resource declaration %s uses authenticated HTTP state and retained plan",
   actualPlanProof,
 );
@@ -627,6 +781,43 @@ test("retained deploy rejects a missing actual capture before any transport", as
   expect(called).toBe(0);
 });
 
+test("even an imported retained deploy refuses outside the guarded GitHub Actions lane", async () => {
+  let called = 0;
+  const before = {
+    CI: process.env.CI,
+    CLOUDFLARE_ACCOUNT_ID: process.env.CLOUDFLARE_ACCOUNT_ID,
+    CLOUDFLARE_API_TOKEN: process.env.CLOUDFLARE_API_TOKEN,
+    GITHUB_ACTIONS: process.env.GITHUB_ACTIONS,
+    PRIVATE_INGEST_GITHUB_GATE: process.env.PRIVATE_INGEST_GITHUB_GATE,
+  };
+  process.env.CI = "true";
+  process.env.CLOUDFLARE_ACCOUNT_ID = secrets.accountId;
+  process.env.CLOUDFLARE_API_TOKEN = secrets.apiToken;
+  delete process.env.GITHUB_ACTIONS;
+  delete process.env.PRIVATE_INGEST_GITHUB_GATE;
+  try {
+    await expect(retainedOperatorPlan(secrets, "deploy", input, () => {}, {
+      directory: "unused",
+      emptyEnvPath: "unused",
+      fetcher: async () => { called++; throw Error("network must not run"); },
+      reviewed: {
+        options: { mode: "deploy", sourceSha: source.commit, inputsSha256: "a".repeat(64) },
+        source,
+        inputText: JSON.stringify(input),
+        provenanceText: "{}",
+        tools,
+        recheckSource: () => {},
+      },
+    })).rejects.toMatchObject({ code: "github_actions_deploy_required" });
+    expect(called).toBe(0);
+  } finally {
+    for (const [key, value] of Object.entries(before)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
 test("deployment transport refuses public URLs, foreign queue/state writes and control-store upgrades before network", async () => {
   let count = 0;
   const base: typeof fetch = async () => {
@@ -690,7 +881,7 @@ describe("operatorSafePlans: async admission follows the resolved mode; a deploy
     const changed = bindings.filter((b) => b.action !== "noop").length;
     const clauses = [...counts].map(([a, n]) => `${n} to ${a}`);
     const summary = `Plan: ${clauses.length ? clauses.join(", ") : "0 changes"}${changed ? `, ${changed} binding changes` : ""}`;
-    const lines = [summary, ...resources.map((r) => `[${r}] ${actions[r] ?? "noop"}`), ...bindings.map((b) => `[session-ingest/${b.sid}] ${b.action}`)];
+    const lines = [summary, ...resources.map((r) => `[${r}] ${actions[r] ?? "noop"}`), ...bindings.map((b) => `[session-ingest/${b.sid}] ${b.action === "delete" ? "unbind" : b.action}`)];
     const text = lines.join("\n") + "\n";
     return { planText: text, detailedText: lines.map((l) => (l.startsWith("[") ? `  ${l}` : l)).join("\n") + "\n" };
   };
@@ -714,6 +905,107 @@ describe("operatorSafePlans: async admission follows the resolved mode; a deploy
   test("drain at 100%, then the var-only flip to on (or omitted) is an update with the queue binding unchanged", () => {
     expect(() => run(SEVEN, { "session-ingest": "update" }, [queue("noop"), flag("update", "on")])).not.toThrow();
     expect(() => run(SEVEN, {}, [queue("noop"), flag("noop", "on")])).not.toThrow();
+  });
+
+  test("generation overlap cleanup renders one reviewed binding deletion", () => {
+    const generation = "e".repeat(64), overlap = "f".repeat(64);
+    // Alchemy emits this env-only Worker change as resource noop plus binding
+    // update/delete rows. The verified adapter presents it to the original
+    // stage guard as the in-place Worker update it represents.
+    const cleanupBindings = [
+      queue("noop"),
+      flag("noop", "drain"),
+      {
+        sid: "INGEST_ACCEPT_GENERATIONS",
+        action: "delete",
+        target: {
+          type: "plain_text",
+          name: "INGEST_ACCEPT_GENERATIONS",
+          text: `${overlap},${generation}`,
+        },
+      },
+    ];
+    expect(() => run(SEVEN, {}, cleanupBindings)).not.toThrow();
+    const rendered = plans(SEVEN, {}, cleanupBindings);
+    expect(rendered.planText).toContain(
+      "[session-ingest/INGEST_ACCEPT_GENERATIONS] unbind",
+    );
+    const wrongVerb = {
+      planText: rendered.planText.replace(
+        "[session-ingest/INGEST_ACCEPT_GENERATIONS] unbind",
+        "[session-ingest/INGEST_ACCEPT_GENERATIONS] delete",
+      ),
+      detailedText: rendered.detailedText.replace(
+        "[session-ingest/INGEST_ACCEPT_GENERATIONS] unbind",
+        "[session-ingest/INGEST_ACCEPT_GENERATIONS] delete",
+      ),
+    };
+    expect(() => operatorSafePlans(
+      wrongVerb,
+      secrets,
+      cleanupBindings,
+    )).toThrow("binding_render_inventory");
+  });
+
+  test("a refused contract exposes actions only, never binding values", () => {
+    let refusal: unknown;
+    try {
+      run(SEVEN, {
+        "session-ingest-fanout": "create",
+        "session-ingest": "update",
+      }, [queue("noop"), flag("noop", "drain")]);
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toBeInstanceOf(OperatorRefusal);
+    const diagnostic = (refusal as OperatorRefusal).diagnostic!;
+    expect(diagnostic.kind).toBe("plan_contract");
+    if (diagnostic.kind !== "plan_contract") throw new Error("wrong diagnostic kind");
+    expect(diagnostic.reason).toBe("action_set");
+    expect(diagnostic.compact.resources).toContainEqual({
+      id: "session-ingest",
+      action: "update",
+    });
+    expect(diagnostic.bindings).toEqual(expect.arrayContaining([
+      { sid: "INGEST_ADMISSION", action: "noop" },
+      { sid: "INGEST_ASYNC_ADMISSION", action: "noop" },
+    ]));
+    expect(JSON.stringify(diagnostic)).not.toContain("drain");
+  });
+
+  test("a binding-render refusal exposes identifiers/actions only", () => {
+    const inventory = [queue("noop"), flag("noop", "drain")],
+      rendered = plans(SEVEN, {}, inventory),
+      altered = {
+        planText: rendered.planText.replace(
+          "[session-ingest/INGEST_ADMISSION] noop",
+          "[session-ingest/FOREIGN] noop",
+        ),
+        detailedText: rendered.detailedText.replace(
+          "[session-ingest/INGEST_ADMISSION] noop",
+          "[session-ingest/FOREIGN] noop",
+        ),
+      };
+    let refusal: unknown;
+    try {
+      operatorSafePlans(altered, secrets, inventory);
+    } catch (error) {
+      refusal = error;
+    }
+    expect(refusal).toBeInstanceOf(OperatorRefusal);
+    const diagnostic = (refusal as OperatorRefusal).diagnostic!;
+    expect(diagnostic.kind).toBe("binding_render");
+    if (diagnostic.kind !== "binding_render") throw new Error("wrong diagnostic kind");
+    expect(diagnostic.reason).toBe("binding_render_inventory");
+    expect(diagnostic.compact.renderedBindings).toContainEqual({
+      sid: "FOREIGN",
+      action: "noop",
+    });
+    expect(diagnostic.expectedBindings).toContainEqual({
+      sid: "INGEST_ADMISSION",
+      action: "noop",
+    });
+    expect(JSON.stringify(diagnostic)).not.toContain("drain");
   });
 
   test("fresh rollout (nothing deployed) may be on directly", () => {

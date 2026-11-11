@@ -6,6 +6,66 @@ import {
 } from "../src/hoopdb/schema-release-contract.ts";
 type Obj = Record<string, any>;
 type Get = (path: string) => Promise<any>;
+/** Required push workflows on main and the job names each latest run must contain. */
+const REQUIRED_PUSH_RUNS = [
+  ["ci.yml", ["checks", "session-read-worker / worker"]],
+  [
+    "pg-proof.yml",
+    ["real PostgreSQL 15", "real PostgreSQL 16", "real PostgreSQL 17"],
+  ],
+] as const;
+/**
+ * For each required workflow, the latest push run on main with head_sha === sha
+ * must be completed/success, and every job of that run attempt completed/success
+ * with head_sha === sha, the required job names included. Refuses codes.runs or
+ * codes.jobs.
+ */
+async function requireGreenPushRuns(
+  get: Get,
+  base: string,
+  sha: string,
+  codes: { runs: string; jobs: string },
+) {
+  for (const [workflow, names] of REQUIRED_PUSH_RUNS) {
+    const listing = await get(
+      base +
+        `/actions/workflows/${workflow}/runs?event=push&head_sha=${sha}&per_page=100`,
+    );
+    const runs = (listing.workflow_runs ?? [])
+      .filter(
+        (r: Obj) =>
+          r.head_sha === sha && r.head_branch === "main" && r.event === "push",
+      )
+      .sort((a: Obj, b: Obj) => b.id - a.id);
+    const latest = runs[0];
+    if (
+      !latest ||
+      latest.status !== "completed" ||
+      latest.conclusion !== "success"
+    )
+      refuse(codes.runs);
+    const jobs = await get(
+      base +
+        "/actions/runs/" +
+        latest.id +
+        "/attempts/" +
+        latest.run_attempt +
+        "/jobs?per_page=100",
+    );
+    if (
+      jobs.total_count !== jobs.jobs?.length ||
+      !jobs.jobs.length ||
+      jobs.jobs.some(
+        (j: Obj) =>
+          j.status !== "completed" ||
+          j.conclusion !== "success" ||
+          j.head_sha !== sha,
+      ) ||
+      names.some((n) => !jobs.jobs.some((j: Obj) => j.name === n))
+    )
+      refuse(codes.jobs);
+  }
+}
 export async function githubReleaseGate(
   env: Record<string, string | undefined>,
   get: Get,
@@ -33,18 +93,29 @@ export async function githubReleaseGate(
     run.run_attempt !== 1
   )
     refuse("release_run");
+  const trustedDispatcher =
+    run.actor?.type === "User" &&
+    run.actor?.login === P.dispatcher.login &&
+    run.actor?.id === P.dispatcher.id &&
+    run.triggering_actor?.type === "User" &&
+    run.triggering_actor?.login === P.dispatcher.login &&
+    run.triggering_actor?.id === P.dispatcher.id;
   const environment = await get(base + "/environments/" + P.environment);
+  if (!Array.isArray(environment.protection_rules))
+    refuse("release_environment");
+  const reviewerRule = environment.protection_rules.find(
+    (r: Obj) => r.type === "required_reviewers",
+  );
   const reviewers =
-    (environment.protection_rules ?? [])
-      .find((r: Obj) => r.type === "required_reviewers")
-      ?.reviewers?.filter(
+    reviewerRule?.reviewers
+      ?.filter(
         (r: Obj) => r.type === "User" && r.reviewer?.type === "User",
       )
       .map((r: Obj) => r.reviewer.id) ?? [];
   if (
     environment.name !== P.environment ||
     !Number.isSafeInteger(environment.id) ||
-    !reviewers.length ||
+    (reviewerRule ? !reviewers.length : !trustedDispatcher) ||
     environment.deployment_branch_policy?.protected_branches !== false ||
     environment.deployment_branch_policy?.custom_branch_policies !== true
   )
@@ -62,54 +133,20 @@ export async function githubReleaseGate(
     branches.branch_policies[0].type !== "branch"
   )
     refuse("release_environment_branch");
-  for (const [workflow, names] of [
-    ["ci.yml", ["checks", "session-read-worker / worker"]],
-    [
-      "pg-proof.yml",
-      ["real PostgreSQL 15", "real PostgreSQL 16", "real PostgreSQL 17"],
-    ],
-  ] as const) {
-    const listing = await get(
-      base +
-        `/actions/workflows/${workflow}/runs?event=push&head_sha=${input.sha}&per_page=100`,
-    );
-    const runs = (listing.workflow_runs ?? [])
-      .filter(
-        (r: Obj) =>
-          r.head_sha === input.sha &&
-          r.head_branch === "main" &&
-          r.event === "push",
-      )
-      .sort((a: Obj, b: Obj) => b.id - a.id);
-    const latest = runs[0];
-    if (
-      !latest ||
-      latest.status !== "completed" ||
-      latest.conclusion !== "success"
-    )
-      refuse("release_ci");
-    const jobs = await get(
-      base +
-        "/actions/runs/" +
-        latest.id +
-        "/attempts/" +
-        latest.run_attempt +
-        "/jobs?per_page=100",
-    );
-    if (
-      jobs.total_count !== jobs.jobs?.length ||
-      !jobs.jobs.length ||
-      jobs.jobs.some(
-        (j: Obj) =>
-          j.status !== "completed" ||
-          j.conclusion !== "success" ||
-          j.head_sha !== input.sha,
-      ) ||
-      names.some((n) => !jobs.jobs.some((j: Obj) => j.name === n))
-    )
-      refuse("release_ci_jobs");
-  }
-  if (input.mode === "apply") {
+  await requireGreenPushRuns(get, base, input.sha, {
+    runs: "release_ci",
+    jobs: "release_ci_jobs",
+  });
+  // The runtime image is published at target_sha, so its own push CI and
+  // pg-proof runs on main must be green too (first-parent history alone does
+  // not prove that a historical main commit passed its checks).
+  if (input.targetSha !== input.sha)
+    await requireGreenPushRuns(get, base, input.targetSha, {
+      runs: "release_target_ci",
+      jobs: "release_target_ci_jobs",
+    });
+  // Apply and bootstrap both consume a successful same-sha plan run under 24h old.
+  if (input.mode !== "plan") {
     const plan = await get(base + "/actions/runs/" + input.planRun);
     if (
       String(plan.id) === env.GITHUB_RUN_ID ||
@@ -127,30 +164,35 @@ export async function githubReleaseGate(
       refuse("release_plan_run");
   }
   if (approved) {
-    const history = await get(
-      base + "/actions/runs/" + env.GITHUB_RUN_ID + "/approvals",
-    );
-    if (
-      !Array.isArray(history) ||
-      !history.some(
-        (a: Obj) =>
-          a.state === "approved" &&
-          a.user?.type === "User" &&
-          reviewers.includes(a.user.id) &&
-          a.environments?.some(
-            (e: Obj) => e.id === environment.id && e.name === P.environment,
-          ),
+    // Private repositories on plans without environment reviewers cannot
+    // create that protection rule. In that case the first-attempt workflow
+    // dispatch itself must be made by the pinned account; reruns are refused.
+    if (reviewerRule) {
+      const history = await get(
+        base + "/actions/runs/" + env.GITHUB_RUN_ID + "/approvals",
+      );
+      if (
+        !Array.isArray(history) ||
+        !history.some(
+          (a: Obj) =>
+            a.state === "approved" &&
+            a.user?.type === "User" &&
+            reviewers.includes(a.user.id) &&
+            a.environments?.some(
+              (e: Obj) => e.id === environment.id && e.name === P.environment,
+            ),
+        )
       )
-    )
-      refuse("release_human_approval");
-    if (
-      history.some(
-        (a: Obj) =>
-          a.state === "rejected" &&
-          a.environments?.some((e: Obj) => e.id === environment.id),
+        refuse("release_human_approval");
+      if (
+        history.some(
+          (a: Obj) =>
+            a.state === "rejected" &&
+            a.environments?.some((e: Obj) => e.id === environment.id),
+        )
       )
-    )
-      refuse("release_human_rejected");
+        refuse("release_human_rejected");
+    } else if (!trustedDispatcher) refuse("release_human_dispatch");
   }
   return input;
 }

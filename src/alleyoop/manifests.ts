@@ -1,3 +1,5 @@
+import { PipelineError } from "../../packages/pipeline/src/lib/pipeline/errors.ts";
+import { assertReaderScrubMarker, assertReaderChunkMetadata, readerMaxRuleset, DEFAULT_READER_MAX_RULESET } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { createMiddleware } from "hono/factory";
 import {
@@ -52,7 +54,6 @@ import {
   type PipelineStage,
   type RawStore,
   type StageMessage,
-  SCRUB_RULESET_VERSION,
 } from "../shared/vendor.ts";
 import { enrichMessage } from "../shared/enrich.ts";
 import { errorFields, log } from "../shared/log.ts";
@@ -643,10 +644,17 @@ export async function chunksAreServerSealed(
   raw: RawStore,
   manifest: ManifestV1,
   prefix: string | undefined,
+  maximum?: number,
 ): Promise<boolean> {
   const scrub = manifest.raw.scrub;
+  // Keep main's courier guard even when the optional strict policy is absent.
   if (!scrub || scrub.ruleset !== "relayhistory-scrub" || scrub.version < 1)
     return false;
+  try { assertReaderScrubMarker(scrub, maximum); }
+  catch (error) {
+    if (error instanceof PipelineError && error.code === "scrub_ruleset_unsupported") return false;
+    throw error;
+  }
   const location = {
     ...(prefix ? { prefix } : {}),
     workspaceId: manifest.session.workspace_id,
@@ -668,6 +676,11 @@ export async function chunksAreServerSealed(
         );
         const meta = await raw.store.head(key);
         if (!meta) return false;
+        try { assertReaderChunkMetadata(meta.metadata, scrub, maximum); }
+        catch (error) {
+          if (error instanceof PipelineError && error.code === "scrub_ruleset_unsupported") return false;
+          throw error;
+        }
         return (
           meta.size === chunk.stored_bytes &&
           meta.metadata["content-sha256"] === chunk.stored_sha256 &&
@@ -679,7 +692,8 @@ export async function chunksAreServerSealed(
           // bump lists older and newer chunks: each must be at least the
           // manifest's version and no newer than this server's.
           Number(meta.metadata["scrub-version"]) >= scrub.version &&
-          Number(meta.metadata["scrub-version"]) <= SCRUB_RULESET_VERSION &&
+          Number.isSafeInteger(Number(meta.metadata["scrub-version"])) &&
+          Number(meta.metadata["scrub-version"]) <= (maximum ?? DEFAULT_READER_MAX_RULESET) &&
           meta.metadata["trace-id"] === manifest.trace_id
         );
       }),
@@ -997,7 +1011,7 @@ export function createCourierManifestRoutes(deps: ManifestRoutesDeps) {
         "manifest is too large",
       );
     try {
-      if (!(await chunksAreServerSealed(deps.raw, manifest, location.prefix)))
+      if (!(await chunksAreServerSealed(deps.raw, manifest, location.prefix, readerMaxRuleset(c.env))))
         return responseError(
           c,
           409,

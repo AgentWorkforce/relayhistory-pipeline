@@ -120,8 +120,12 @@ BEGIN
          'sessions.babysitter_evidence_page_for(text,jsonb)',
          'sessions.buffered_search_gate_for(text,text,text,text,text,text,text,text,boolean,text,jsonb)',
          'sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)',
+         'sessions.buffered_session_stages_for_target(text,text,text,text,text,text,text,text,boolean,text)',
          'sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)',
+         'sessions.coordination_output_facts_for(text,timestamp with time zone,timestamp with time zone,text,integer)',
+         'sessions.coordination_write_facts_for(text,timestamp with time zone,timestamp with time zone,text,integer)',
          'sessions.digest_narrative_read(text,date,text,text)',
+         'sessions.ingest_operator_runtime_erased(text,text,text,text)',
          'sessions.list_session_directory_for(text,text[],text[],text,text[],text,timestamp with time zone,timestamp with time zone,timestamp with time zone,timestamp with time zone,text[],text[],timestamp with time zone,text,text,integer)',
          'sessions.output_facts_coverage_for(text,timestamp with time zone,timestamp with time zone)',
          'sessions.output_facts_events_for(text,timestamp with time zone,timestamp with time zone,text,integer)',
@@ -135,7 +139,9 @@ BEGIN
          'sessions.read_api_token_verify(text,timestamp with time zone)',
          'sessions.session_brief_summary_for(text,text,text)',
          'sessions.session_brief_titles_for(text,text[],text[])',
-         'sessions.session_directory_activity_for(text,timestamp with time zone,timestamp with time zone)')
+         'sessions.session_directory_activity_for(text,timestamp with time zone,timestamp with time zone)',
+         'sessions.session_directory_users_for(text,timestamp with time zone,timestamp with time zone,integer)',
+         'sessions.session_summary_activity_for(text,timestamp with time zone,timestamp with time zone)')
   LOOP
     v_problems := array_append(v_problems, (format('EXECUTE on security definer %s', v_row.fn))::text);
   END LOOP;

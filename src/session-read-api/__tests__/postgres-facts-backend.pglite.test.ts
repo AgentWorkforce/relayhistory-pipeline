@@ -1,6 +1,6 @@
 /**
  * The Postgres Output / digest backends (READ_API_OUTPUT_BACKEND / READ_API_DIGEST_BACKEND =
- * postgres) on PGlite with every migration through 20261105045040: facts written by the
+ * postgres) on PGlite with every migration through 20261105047000: facts written by the
  * consumer store from the shared fixture, read back as bulls96_read_api through the 045040
  * readers only, inside a READ ONLY tenant transaction (the read pool's poolTenantRunner shape).
  * Covers each readiness code in order, the Output and digest values (the ClickHouse-verified
@@ -22,11 +22,13 @@ import { postgresOutputFactsStore } from "../../session-pipeline/output-facts-st
 import { OUTPUT_FIXTURE_SCOPE, outputFixture } from "../../session-pipeline/__tests__/output-facts-fixture.ts";
 import { FactsReadDeadline, isPostgresFactsSchemaMissing, postgresOutputBackend, type PostgresFactsDeps } from "../postgres/output-query.ts";
 import { postgresDigestBackend } from "../postgres/digest-query.ts";
+import { postgresCoordinationBackend } from "../postgres/coordination-query.ts";
+import { createReadApi } from "../app.ts";
 
 const root = join(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(join(root, path), "utf8");
 const sqlFile = (path: string) => read(path).split("\n").filter((l) => !l.startsWith("\\")).join("\n");
-const MIGRATION = "supabase/migrations/20261105045040_selfhost_output_facts.sql";
+const MIGRATION = "supabase/migrations/20261105047000_coordination_fact_readers.sql";
 const TABLES = ["session_event_facts", "session_output_facts", "output_facts_session_state", "output_facts_workspace_state"];
 const SCOPE = OUTPUT_FIXTURE_SCOPE;
 const ORG = SCOPE.orgId, WS = SCOPE.workspaceId;
@@ -100,7 +102,7 @@ const watermark = (db: PGlite, since: string) =>
   db.query(`INSERT INTO sessions.output_facts_workspace_state (org_id, workspace_id, complete_since, marked_by) VALUES ($1, $2, $3, 'test')
             ON CONFLICT (org_id, workspace_id) DO UPDATE SET complete_since = excluded.complete_since`, [ORG, WS, since]);
 
-describe("postgres output/digest backends over 045040", () => {
+describe("postgres output/digest/coordination backends over 045040 and 047000", () => {
   test("readiness codes in the ClickHouse order, for both backends and both window kinds", async () => {
     const db = await database();
     const out = postgresOutputBackend(deps(db));
@@ -152,6 +154,59 @@ describe("postgres output/digest backends over 045040", () => {
     expect(await postgresOutputBackend(deps(db)).readOutput({ orgId: ORG, workspaceIds: ["ws-other"] }, DAY)).toEqual(ZERO);
   }, 180_000);
 
+  test("the coordination endpoint reads filtered 047000 evidence through the read role and reports stream coverage", async () => {
+    const db = await database();
+    await writeFacts(db);
+    await watermark(db, "2026-11-01T00:00:00Z");
+    const coordination = postgresCoordinationBackend(deps(db));
+    const app = createReadApi({
+      verify: async () => ({ userId: "u", orgId: ORG, workspaceId: WS, scopes: ["rth:read"] }),
+      adapter: {} as never, liveness: noneErased, completeSinceMs: 0, directory,
+      directoryWorkspaces: new Set([WS]), coordination: { enabled: true, backend: coordination },
+    });
+    const response = await app.request(`/v1/coordination/overlaps?workspace=${WS}&since=${DAY.since.toISOString()}&until=${DAY.until.toISOString()}`, {
+      headers: { authorization: "Bearer good" },
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json() as any;
+    expect(body.contract).toBe("coordination-overlaps/1");
+    expect(body.coverage).toMatchObject({ status: "partial", sessionsConsidered: 1, sessionsTruncated: 0 });
+    expect(body.coverage.notes.join(" ")).toContain("session directory unavailable");
+    expect(body.findings).toEqual([]);
+
+    // The Postgres reader normalizes the same T3 facts as the ClickHouse route fixture:
+    // two roots, one project/path, distinct branches, and nearby timestamps.
+    await db.query(`INSERT INTO sessions.session_event_facts
+      (org_id, workspace_id, ts, session_id, source, machine_id, kind, event_id,
+       project_id, task_ref_id, task_ref_empty, task_ref_json, task_title, user_id, branch,
+       model, provider, input_tokens, output_tokens, reasoning_tokens, cache_read_tokens,
+       cache_create_tokens, cache_create_5m_tokens, cache_create_1h_tokens, cost_usd_micros,
+       files_touched, retention_days, row_id, fingerprint, source_version)
+      VALUES
+      ($1, $2, '2026-11-05T01:00:00Z', 'coord-a', 'codex', 'm-a', 'tool', 'coord-a-event',
+       'coord-project', NULL, 0, '{}', NULL, 'u', 'feat/a', NULL, NULL, 0, 0, 0, 0, 0,
+       NULL, NULL, 0, ARRAY['src/parity.ts'], 0, repeat('a', 64), repeat('c', 64), 1),
+      ($1, $2, '2026-11-05T01:05:00Z', 'coord-b', 'codex', 'm-b', 'tool', 'coord-b-event',
+       'coord-project', NULL, 0, '{}', NULL, 'u', 'feat/b', NULL, NULL, 0, 0, 0, 0, 0,
+       NULL, NULL, 0, ARRAY['src/parity.ts'], 0, repeat('b', 64), repeat('d', 64), 1)`, [ORG, WS]);
+    const parity = await app.request(`/v1/coordination/overlaps?workspace=${WS}&project=coord-project&since=${DAY.since.toISOString()}&until=${DAY.until.toISOString()}`, {
+      headers: { authorization: "Bearer good" },
+    });
+    expect(parity.status).toBe(200);
+    const parityBody = await parity.json() as any;
+    expect(parityBody.coverage.status).toBe("partial"); // synthetic rows deliberately have no state rows
+    expect(parityBody.detector).toMatchObject({ name: "outcome-facts", version: "1" });
+    expect(parityBody.findings).toHaveLength(1);
+    expect(parityBody.findings[0]).toMatchObject({ kind: "concurrent_edit", confidence: "low", alertAt: "2026-11-05T01:05:00.000Z" });
+    expect(parityBody.findings[0].artifacts[0]).toMatchObject({ type: "file", value: "src/parity.ts" });
+
+    const capped = await coordination.readFacts(directory, { orgId: ORG, workspaceId: WS, ...DAY, rowCap: 1 });
+    expect(capped.sessionsTruncated).toBe(1);
+    expect(capped.notes).toContain("write evidence stream cap 1 reached; findings may be omitted");
+    expect(capped.notes).toContain("usage stream cap 1 reached; duplicate cost is unknown");
+    expect((await coordination.readFacts(directory, { orgId: ORG, workspaceId: "ws-other", ...DAY })).lanes).toEqual([]);
+  }, 180_000);
+
   test("liveness: an erased session's facts are dropped before any aggregation", async () => {
     const db = await database();
     await writeFacts(db);
@@ -175,11 +230,13 @@ describe("postgres output/digest backends over 045040", () => {
       .rejects.toBeInstanceOf(FactsReadDeadline);
     await expect(postgresDigestBackend(deps(db, { now: slow })).buildDailyDigest(directory, { orgId: ORG, workspaceId: WS, ...DAY }, { timeoutMs: 500 }))
       .rejects.toBeInstanceOf(FactsReadDeadline);
+    await expect(postgresCoordinationBackend(deps(db, { now: slow })).readFacts(directory, { orgId: ORG, workspaceId: WS, ...DAY }, { timeoutMs: 500 }))
+      .rejects.toBeInstanceOf(FactsReadDeadline);
     await expect(postgresOutputBackend(deps(db, { now: slow })).windowReadiness(ORG, WS, DAY.since, DAY.until, { timeoutMs: 500 }))
       .rejects.toBeInstanceOf(FactsReadDeadline);
   }, 180_000);
 
-  test("the read role executes the readers and cannot touch the tables; a missing reader is schema-missing", async () => {
+  test("the read role executes tenant-scoped filtered readers and cannot touch the tables; a missing reader is schema-missing", async () => {
     const db = await database();
     await writeFacts(db);
     const tenant: [string, string] = [ORG, WS];
@@ -194,8 +251,24 @@ describe("postgres output/digest backends over 045040", () => {
     expect(await code(as(db, "bulls96_read_api", "BEGIN", tenant, () => postgresOutputFactsStore(db as unknown as SqlExecutor).erase(SCOPE)))).toBe("42501");
     expect(await postgresOutputBackend(deps(db)).readOutput({ orgId: ORG, workspaceIds: [WS] }, DAY)).toEqual(OUTPUT);
 
-    await db.exec("DROP FUNCTION sessions.output_facts_coverage_for");
-    const err = await postgresOutputBackend(deps(db)).windowReadiness(ORG, WS, DAY.since, DAY.until).then(() => null, (e: unknown) => e);
+    const writes = await as(db, "bulls96_read_api", "BEGIN READ ONLY", tenant, () => db.query<{ files_touched: string[] }>(
+      "SELECT files_touched FROM sessions.coordination_write_facts_for($1,$2,$3,NULL,10000)",
+      [WS, "2026-10-29T00:00:00Z", DAY.until.toISOString()],
+    ));
+    expect(writes.rows.length).toBeGreaterThan(0);
+    expect(writes.rows.every((row) => row.files_touched.length > 0)).toBe(true);
+    const outputs = await as(db, "bulls96_read_api", "BEGIN READ ONLY", tenant, () => db.query<{ fact_kind: string }>(
+      "SELECT fact_kind FROM sessions.coordination_output_facts_for($1,$2,$3,NULL,10000)",
+      [WS, "2026-10-29T00:00:00Z", DAY.until.toISOString()],
+    ));
+    expect(outputs.rows.every((row) => row.fact_kind === "commit" || row.fact_kind === "outcome")).toBe(true);
+    expect(await code(as(db, "bulls96_read_api", "BEGIN READ ONLY", tenant, () => db.query(
+      "SELECT 1 FROM sessions.coordination_write_facts_for($1,$2,$3,NULL,10000)",
+      ["ws-other", "2026-10-29T00:00:00Z", DAY.until.toISOString()],
+    )))).toBe("42501");
+
+    await db.exec("DROP FUNCTION sessions.coordination_write_facts_for");
+    const err = await postgresCoordinationBackend(deps(db)).readFacts(directory, { orgId: ORG, workspaceId: WS, ...DAY }).then(() => null, (e: unknown) => e);
     expect((err as { code?: string }).code).toBe("42883");
     expect(postgresOutputBackend(deps(db)).isSchemaMissing(err)).toBe(true);
     expect(isPostgresFactsSchemaMissing({ code: "42501" })).toBe(false);

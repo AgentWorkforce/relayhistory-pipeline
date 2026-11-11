@@ -41,6 +41,8 @@ import {
 } from "../shared/destination-url.ts";
 import { healthVerdict, type WorkerHealth } from "../shared/worker.ts";
 import { errorFields, log } from "../shared/log.ts";
+import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
+import { initScrubEngine, routedRawChunkSealerDeps } from "@rhc/lib/scrub-engine/index.ts";
 import { initTelemetry, withSpan } from "../shared/telemetry.ts";
 import { sqlPipelineEventSink } from "../hoopdb/sink.ts";
 import { expectedSchema } from "../hoopdb/migrate.ts";
@@ -161,6 +163,7 @@ export function relaycontrolConfigured(env: NodeJS.ProcessEnv = process.env) {
 
 export async function buildIngestApp(overrides: IngestOverrides = {}) {
   assertIngestDestinations();
+  readerMaxRuleset(process.env); // Reject malformed explicit policy before any database access.
   const port = integer("INGEST_PORT", 8080);
   const jwks = process.env.JWKS_JSON
     ? (JSON.parse(process.env.JWKS_JSON) as Record<string, unknown>)
@@ -168,6 +171,8 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
       ? jwksFromPrivateKey(process.env.JWT_PRIVATE_KEY_PEM, required("JWT_KID"))
       : undefined;
   const env = vendorBindings({
+    ...(process.env.READER_MAX_RULESET !== undefined
+      ? { READER_MAX_RULESET: process.env.READER_MAX_RULESET } : {}),
     // Explicit opt-in only (dev/tests); never defaulted on.
     ...(process.env.ALLOW_INTERIM_RELAYAUTH_BEARER === "true"
       ? { ALLOW_INTERIM_RELAYAUTH_BEARER: "true" }
@@ -313,6 +318,8 @@ export async function buildIngestApp(overrides: IngestOverrides = {}) {
     migrationLedger: () => migrationLedger,
     // The courier route verifies a v2 (backfill) commit against the stored base.
     migrationBackfill: true,
+    // SCRUB_ENGINE=wasm-bindgen: the sealer bound to the verified instance; otherwise {} (unchanged).
+    ...routedRawChunkSealerDeps(),
   });
   const readiness = postgresReadinessStore(db);
   // Activation starts at the first start with a window set, used or not.
@@ -504,4 +511,8 @@ export async function serve() {
   process.on("SIGINT", stop);
 }
 
-if (import.meta.main) await serve();
+// SCRUB_ENGINE (docs/scrub-engine.md): select, and for wasm verify the pinned engine, before serving.
+if (import.meta.main) {
+  await initScrubEngine();
+  await serve();
+}

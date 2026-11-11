@@ -23,6 +23,8 @@
  * READ_API_DIGEST_ENABLED ("1" only: GET /v1/digest/daily; its narrative needs migration
  * 20261105045000 and the DIGEST_NARRATIVE service binding, without which every miss is
  * `provider_not_configured`; default off = 501),
+ * READ_API_COORDINATION_OVERLAPS_ENABLED (exactly "true": GET /v1/coordination/overlaps from
+ * the existing ClickHouse facts; every other value = 404),
  * READ_API_BRIEF_TITLES_WORKSPACES (the brief-titles allowlist; unset = none), and
  * RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER (production
  * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve), and
@@ -65,6 +67,7 @@
  * all unset in wrangler.jsonc; only the deploy workflow's owner_buffered=on render
  * (scripts/render-deploy-config.ts) adds them.
  */
+import { readerMaxRuleset } from "../../pipeline/src/lib/scrub-engine/reader-policy.ts";
 import pg from "pg";
 import { Decompress, decompress } from "fzstd";
 import { canonicalAnalysisHandle } from "./analysis-cache.ts";
@@ -86,7 +89,7 @@ import { sqlBriefTitles } from "../../../src/session-read-api/brief-titles.ts";
 import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/auth.ts";
 import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
 import { repeatableReadEnabled, sqlLiveness, TENANT_SETTINGS_SQL, tenantBeginSql, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
-import { parseCompleteSince } from "../../../src/session-read-api/config.ts";
+import { coordinationOverlapsEnabled, parseCompleteSince } from "../../../src/session-read-api/config.ts";
 import { AnalyticsConfigError, analyticsConfig, analyticsCounterFields, createAnalyticsSink, type AnalyticsConfig } from "../../../src/shared/analytics-config.ts";
 import {
   createBufferedSearchGate,
@@ -101,6 +104,7 @@ import {
   BufferedIndexVerifier,
   boundedStreamDecompress,
   ownerBufferedEnabled,
+  ownerBufferedExactSessionEnabled,
   ownerBufferedEventsEnabled,
   ownerBufferedIndexVerifyEnabled,
   ownerBufferedPhaseLogEnabled,
@@ -130,6 +134,8 @@ export interface Env extends CanonicalEnv {
   READ_API_OUTPUT_ENABLED?: string;
   /** "1": serve GET /v1/digest/daily; anything else = 501 digest_not_configured. */
   READ_API_DIGEST_ENABLED?: string;
+  /** Exactly "true": serve GET /v1/coordination/overlaps from ClickHouse facts. */
+  READ_API_COORDINATION_OVERLAPS_ENABLED?: string;
   /** The digest narrative Worker (wrangler.digest-narrative.jsonc), bound at activation only. */
   DIGEST_NARRATIVE?: Fetcher;
   /** Babysitter evidence reader (GET /v1/delivery/records for its kinds): only "on" enables; default off. */
@@ -188,6 +194,8 @@ export interface Env extends CanonicalEnv {
    * is on and the workspace is on both allowlists.
    */
   READ_API_OWNER_BUFFERED_INDEX_VERIFY?: string;
+  /** 047010 exact-session RPC: exactly "on" opts in; every other value uses the frozen RPC. */
+  READ_API_OWNER_BUFFERED_EXACT_SESSION?: string;
   /** The owner-buffered canary allowlist (parseDirectoryWorkspaces syntax); unset/empty = none. */
   READ_API_OWNER_BUFFERED_WORKSPACES?: string;
   /** The ingest bucket holding buffered-batches/ stage objects (owner-buffered reads only). */
@@ -438,6 +446,7 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
     ...(env.READ_API_DIGEST_ENABLED?.trim() === "1"
       ? { digest: { cache: sqlNarrativeCache(tenant.run), ...(env.DIGEST_NARRATIVE ? { generator: serviceNarrativeGenerator(env.DIGEST_NARRATIVE) } : {}) } }
       : {}),
+    ...(coordinationOverlapsEnabled(env.READ_API_COORDINATION_OVERLAPS_ENABLED) ? { coordination: { enabled: true as const } } : {}),
     briefTitles: sqlBriefTitles(tenant.run),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
@@ -471,6 +480,7 @@ export function bufferedSearchGate(env: Env, run: TenantRunner): BufferedSearchG
  */
 export function timingDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers>[0], fetcher: typeof fetch = (input, init) => fetch(input, init)): TimingDeps | undefined {
   if (!rawStoreFromEnv(env, fetcher)) return undefined;
+  const maximum = readerMaxRuleset(env);
   const pointers = sqlCanonicalPointers(run);
   return {
     state: pointers.state,
@@ -482,6 +492,7 @@ export function timingDeps(env: Env, run: Parameters<typeof sqlCanonicalPointers
       const snapshot = await canonicalSnapshot(
         {
           ...raw,
+          readerMaxRuleset: maximum,
           prefix: env,
           pointers: pointers.pointers,
           decompress: (bytes, max) => {
@@ -552,7 +563,7 @@ export function ownerBufferedDeps(
   return {
     enabled: true,
     workspaces: parseDirectoryWorkspaces(env.READ_API_OWNER_BUFFERED_WORKSPACES),
-    reads: sqlOwnerBufferedReads(run, { statementTimeoutMs: ownerBufferedStatementTimeoutFlag(env) }),
+    reads: sqlOwnerBufferedReads(run, { statementTimeoutMs: ownerBufferedStatementTimeoutFlag(env), exactSession: ownerBufferedExactSessionEnabled(env.READ_API_OWNER_BUFFERED_EXACT_SESSION) }),
     gate: serviceBindingControlHead(env.HISTORY_CONTROL_HEAD),
     store: createS3Store({ bucket, region: env.INGEST_S3_REGION?.trim() || "us-east-1", credentials: { accessKeyId, secretAccessKey }, fetch: fetcher }),
     decompress: boundedStreamDecompress(Decompress) /* stops at the bound; fzstd's one-shot form with a fixed buffer silently truncates */,

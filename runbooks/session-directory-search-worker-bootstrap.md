@@ -419,6 +419,9 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105045000_digest_narrative_cache.sql` | table sessions.daily_digest_narratives |
 | `upstream:20261105045040_selfhost_output_facts.sql` | table sessions.session_output_facts |
 | `upstream:20261105046010_session_directory_read_api_query.sql` | function sessions.query_session_directory_for |
+| `upstream:20261105047000_coordination_fact_readers.sql` | functions sessions.coordination_write_facts_for and sessions.coordination_output_facts_for |
+| `upstream:20261105056000_session_summary_activity.sql` | function sessions.session_summary_activity_for |
+| `upstream:20261105057010_upload_consent.sql` | function sessions.upload_consent_apply_v1 and table sessions.upload_consent_holds (server-owned upload consent; EXECUTE to bulls96_session_ingest only) |
 | `upstream:20261105035000_semantic_copy_state.sql` | table sessions.search_feature_copy_state |
 | `upstream:20261105036000_canonical_consumer_lease.sql`        | table sessions.canonical_feature_consumer_lease |
 | `upstream:20261105037000_session_directory_document_pool.sql` | function sessions.canonical_feature_document_finish |
@@ -447,14 +450,20 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105044070_selfhost_erase_search_text_rebuild.sql` | replacement: ingest_selfhost_set_session_uploads and ingest_publication_retire_fence rebuild search_text without the summary when they clear it |
 | `upstream:20261105044080_ingest_claim_sessions.sql` | table sessions.ingest_claim_sessions (slot 044080; owner-only side table, policy row and writer trigger, inert until the operator enables write_enabled) |
 | `upstream:20261105044090_claim_sessions_reader.sql` | column sessions.ingest_claim_sessions_policy.read_enabled (slot 044090; default false; buffered_sessions_for / buffered_session_stages_for read the side table only while read_enabled, write_enabled and backfill completion all hold; owner-only commit-time accepted_at refresh trigger on ingest_batches) |
+| `upstream:20261105047010_buffered_exact_session_stages.sql` | function sessions.buffered_session_stages_for_target (slot 047010; new default-off exact-session detail RPC; frozen 044090 remains callable) |
 | `upstream:20261105044100_session_brief_summary_read.sql` | tenant-scoped `sessions.session_brief_summary_for(text,text,text)` read RPC with EXECUTE only for `bulls96_read_api`; bounded recorded-title column and owner-only invoker invalidation trigger; no new table grants or changes to G4 ingest functions |
 | `upstream:20261105045010_buffered_search_feed_same_second.sql` | replacement: buffered_search_feed_stage returns the `sameSecond` sibling counts (slot 045010; same signature, SECURITY DEFINER and ACL; must be applied before `INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION=on`, else the feeder refuses every stage `sql_same_second_unavailable`) |
 | `upstream:20261105045030_session_consumer_project_text_grant.sql` | search_consumer_runtime EXECUTE on `sessions.session_directory_project_text(text,text,text)` (slot 045030; grant only; the partial expression index `session_directory_tenant_project_text_trgm_idx` evaluates it as the writing role, so without it consumer directory writes carrying a project id, project key or repository fail `42501`; needs the bare consumer role first, absent fails closed `55000`) |
 | `upstream:20261105046000_analysis_jobs.sql` | table `sessions.session_analysis_jobs_v2` |
+| `upstream:20261105050000_operator_session_erase.sql` | table sessions.session_erasure_receipts (operator per-session erase) |
+| `upstream:20261105050020_operator_session_erase_runtime.sql` | table sessions.session_erasure_writes (durable in-flight writes, default-off runtime RPCs) |
+| `upstream:20261105050010_operator_session_erase_fence_check.sql` | trigger ingest_erase_fence_index_guard on sessions.session_index; claim/commit call ingest_erase_fence_extend |
+| `upstream:20261105057000_session_directory_users_aggregate.sql` | function sessions.session_directory_users_for |
 | `upstream:20261104060000_ingest_canonical_publication.sql` | table `sessions.ingest_publication_heads` |
 | `96bulls:0001_96bulls_observability.sql`                       | column sessions.pipeline_jobs.traceparent                                                                               |
 | `96bulls:0002_session_ext_and_summaries.sql`                   | table sessions.session_index_ext                                                                                        |
 | `96bulls:0003_fanout_ledger.sql`                               | ALTER-only: column sessions.session_index_ext.fanout_revision                                                           |
+| `96bulls:0005_operator_session_erase_guards.sql` | table sessions.session_erasure_optional_guards |
 | `96bulls:0004_summary_pointers.sql`                            | DELETE + ALTER: column sessions.session_summaries.object_key (summary dropped)                                          |
 
 **Buffered search feed role (`20261105043870`).** `buffered_search_feed_runtime` is created

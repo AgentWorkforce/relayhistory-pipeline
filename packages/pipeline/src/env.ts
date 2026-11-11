@@ -39,9 +39,15 @@ export interface AuthContext {
    * set only for a RelayAuth migration assertion (relayauth#110).
    */
   migration?: import("./lib/pipeline/migration-assertions.js").MigrationAssertionClaims;
+  /** Relaycontrol tokens only (introspection v1.5): the live organization role. */
+  role?: string;
+  /** Relaycontrol tokens only (introspection v1.5): the organization's capture policy. */
+  capturePolicy?: import("./auth/relaycontrol.js").RelaycontrolCapturePolicy;
 }
 
 export interface Bindings {
+  /** Read capability only; does not change writer scrub stamps. */
+  READER_MAX_RULESET?: string;
   // RelayAuth JWT verification (auth/relayauth.ts), as upstream env.ts declares them.
   RELAYAUTH_JWKS_URL?: string;
   RELAYAUTH_ISSUER?: string;

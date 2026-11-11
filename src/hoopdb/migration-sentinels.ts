@@ -43,6 +43,8 @@ const CLAIM_BOOTSTRAP_ORG_INDEXES_STEP =
   "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
 const BUFFERED_STAGES_SESSION_FIRST_STEP =
   "upstream:20261105044040_buffered_stages_session_first.sql";
+const COORDINATION_FACT_READERS_STEP =
+  "upstream:20261105047000_coordination_fact_readers.sql";
 const orgIndex = (table: string, columns: string): AdoptableIndex => ({
   name: `${table}_org_id_idx`,
   table: `sessions.${table}`,
@@ -83,6 +85,18 @@ export const ADOPTABLE_INDEXES: Readonly<Record<string, readonly AdoptableIndex[
       def: "CREATE INDEX ingest_claim_attempts_records_gin_idx ON sessions.ingest_claim_attempts USING gin (records jsonb_path_ops)",
     },
   ],
+  [COORDINATION_FACT_READERS_STEP]: [
+    {
+      name: "session_event_facts_coordination_writes_idx",
+      table: "sessions.session_event_facts",
+      def: "CREATE INDEX session_event_facts_coordination_writes_idx ON sessions.session_event_facts USING btree (org_id, workspace_id, ts, row_id) WHERE (cardinality(files_touched) > 0)",
+    },
+    {
+      name: "session_output_facts_coordination_outcomes_idx",
+      table: "sessions.session_output_facts",
+      def: "CREATE INDEX session_output_facts_coordination_outcomes_idx ON sessions.session_output_facts USING btree (org_id, workspace_id, ts, row_id) WHERE (fact_kind = ANY (ARRAY['commit'::text, 'outcome'::text]))",
+    },
+  ],
 };
 
 /** How an ADOPTABLE_INDEXES step is prebuilt, and what else its CREATE inventory names. */
@@ -96,6 +110,8 @@ export interface AdoptableIndexStep {
    * A step that replaces anything never has its sentinel overridden by index adoptability.
    */
   replaces: readonly string[];
+  /** New functions the same step creates. They may be absent while its indexes are prebuilt. */
+  creates?: readonly string[];
   /**
    * Exact-body adoption, for replaced functions only. When the body sentinel fires, the step is still
    * treated as not applied (so it runs normally and writes its ledger row) if, and only if, EVERY entry
@@ -142,6 +158,11 @@ export const ADOPTABLE_INDEX_STEPS: Readonly<Record<string, AdoptableIndexStep>>
       },
     ],
   },
+  [COORDINATION_FACT_READERS_STEP]: {
+    packet: "coordination fact-reader index packet docs/coordination-overlap-detection.md",
+    replaces: [],
+    creates: ["sessions.coordination_write_facts_for", "sessions.coordination_output_facts_for"],
+  },
 };
 
 /**
@@ -179,6 +200,8 @@ const adoptableIndexesSentinel = (step: string) =>
       AND (c.relname, i.indrelid, pg_get_indexdef(i.indexrelid)) IN (${ADOPTABLE_INDEXES[step]!.map((x) => `('${x.name}', to_regclass('${x.table}'), '${x.def}')`).join(", ")})`;
 
 export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
+  "96bulls:0005_operator_session_erase_guards.sql": { evidence: "table sessions.session_erasure_optional_guards", sql: relation("sessions.session_erasure_optional_guards") },
+  "upstream:20261105050020_operator_session_erase_runtime.sql": { evidence: "table sessions.session_erasure_writes", sql: relation("sessions.session_erasure_writes") },
   "upstream:20261105041000_ingest_privacy_authority.sql": {
     evidence: "table sessions.ingest_privacy_authority + lazy-current adoption uses the EXACT source-table list (no prefix)",
     sql: "SELECT to_regclass('sessions.ingest_privacy_authority') IS NOT NULL AND (SELECT count(*)=2 FROM pg_proc WHERE oid IN(to_regprocedure('sessions.ingest_lazy_user(jsonb,text,jsonb)'),to_regprocedure('sessions.ingest_lazy_begin(jsonb,text)')) AND position('NOT IN(''ingest_frozen_source_records''' in prosrc)>0 AND position('''ingest_frozen_source_owned_sessions'')' in prosrc)>0 AND position('NOT LIKE ''ingest' in prosrc)=0) AS applied",
@@ -341,6 +364,15 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105045000_digest_narrative_cache.sql": { evidence: "table sessions.daily_digest_narratives", sql: relation("sessions.daily_digest_narratives") },
   "upstream:20261105045040_selfhost_output_facts.sql": { evidence: "table sessions.session_output_facts", sql: relation("sessions.session_output_facts") },
   "upstream:20261105046010_session_directory_read_api_query.sql": { evidence: "function sessions.query_session_directory_for", sql: fn("sessions", "query_session_directory_for") },
+  [COORDINATION_FACT_READERS_STEP]: {
+    evidence: "functions sessions.coordination_write_facts_for and sessions.coordination_output_facts_for",
+    sql: "SELECT to_regprocedure('sessions.coordination_write_facts_for(text,timestamptz,timestamptz,text,integer)') IS NOT NULL AND to_regprocedure('sessions.coordination_output_facts_for(text,timestamptz,timestamptz,text,integer)') IS NOT NULL AS applied",
+  },
+  "upstream:20261105056000_session_summary_activity.sql": { evidence: "function sessions.session_summary_activity_for", sql: "SELECT to_regprocedure('sessions.session_summary_activity_for(text,timestamptz,timestamptz)') IS NOT NULL AS applied" },
+  "upstream:20261105057010_upload_consent.sql": {
+    evidence: "function sessions.upload_consent_apply_v1 and table sessions.upload_consent_holds",
+    sql: "SELECT to_regprocedure('sessions.upload_consent_apply_v1(text,text,text,jsonb,boolean,bigint)') IS NOT NULL AND to_regclass('sessions.upload_consent_holds') IS NOT NULL AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),
@@ -398,6 +430,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.read_api_tokens",
     sql: relation("sessions.read_api_tokens"),
   },
+  "upstream:20261105047010_buffered_exact_session_stages.sql": {
+    evidence: "new exact-session stage RPC (047010)",
+    sql: fn("sessions", "buffered_session_stages_for_target"),
+  },
   "upstream:20261105046000_analysis_jobs.sql": { evidence: "table sessions.session_analysis_jobs_v2", sql: relation("sessions.session_analysis_jobs_v2") },
   // Adoptable step: an unledgered "applied" here is accepted when every declared index is adoptable.
   [CLAIM_BOOTSTRAP_ORG_INDEXES_STEP]: {
@@ -409,6 +445,18 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   [BUFFERED_STAGES_SESSION_FIRST_STEP]: {
     evidence: "replacement: buffered_sessions_for and buffered_session_stages_for count duplicate ordinals with a window (044040, session-first detail)",
     sql: "SELECT count(*)=2 AS applied FROM pg_proc WHERE oid IN(to_regprocedure('sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)'),to_regprocedure('sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)')) AND prosecdef AND prosrc LIKE '%count(*) OVER (PARTITION BY rc.stage_token, rc.ord)%'",
+  },
+  "upstream:20261105050000_operator_session_erase.sql": {
+    evidence: "table sessions.session_erasure_receipts (operator per-session erase)",
+    sql: relation("sessions.session_erasure_receipts"),
+  },
+  "upstream:20261105050010_operator_session_erase_fence_check.sql": {
+    evidence: "trigger ingest_erase_fence_index_guard on sessions.session_index; claim/commit call ingest_erase_fence_extend",
+    sql: "SELECT to_regprocedure('sessions.ingest_erase_fence_extend(text,text,text,text,jsonb)') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid=to_regclass('sessions.session_index') AND tgname='ingest_erase_fence_index_guard') AS applied",
+  },
+  "upstream:20261105057000_session_directory_users_aggregate.sql": {
+    evidence: "function sessions.session_directory_users_for",
+    sql: "SELECT to_regprocedure('sessions.session_directory_users_for(text,timestamptz,timestamptz,integer)') IS NOT NULL AS applied",
   },
 };
 

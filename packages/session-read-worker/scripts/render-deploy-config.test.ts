@@ -385,12 +385,13 @@ describe("deploy config render, owner_buffered_index_verify", () => {
 });
 
 describe("deploy workflow wiring", () => {
-  test("dispatch inputs default to off and none", () => {
-    expect(WORKFLOW).toMatch(/owner_buffered:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+  test("dispatch renders the committed production profile by default; other child overrides remain off and none", () => {
+    expect(WORKFLOW).toMatch(/owner_buffered:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["profile", "preserve", "on", "off"\]\n\s+default: "profile"/);
     expect(WORKFLOW).toMatch(/owner_buffered_workspaces:\n\s+description:[^\n]*\n\s+type: string\n\s+default: ""/);
     expect(WORKFLOW).toMatch(/buffered_search_gate:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
     expect(WORKFLOW).toContain("BUFFERED_SEARCH_GATE: ${{ inputs.buffered_search_gate }}");
-    expect(WORKFLOW).toMatch(/owner_buffered_events:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+    expect(WORKFLOW).toMatch(/owner_buffered_events:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["profile", "off", "on"\]\n\s+default: "profile"/);
+    expect(WORKFLOW).toMatch(/owner_buffered_statement_timeout_ms:\n\s+description:[^\n]*\n\s+type: string\n\s+default: "profile"/);
     expect(WORKFLOW).toContain("OWNER_BUFFERED_EVENTS: ${{ inputs.owner_buffered_events }}");
     expect(WORKFLOW).toMatch(/owner_buffered_stage_concurrency:\n\s+description:[^\n]*\n\s+type: string\n\s+default: "off"/);
     expect(WORKFLOW).toContain("OWNER_BUFFERED_STAGE_CONCURRENCY: ${{ inputs.owner_buffered_stage_concurrency }}");
@@ -411,5 +412,24 @@ describe("deploy workflow wiring", () => {
     expect(WORKFLOW).not.toContain("--var \"READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY");
     expect(WORKFLOW).not.toContain("--var \"READ_API_OWNER_BUFFERED_PHASE_LOG");
     expect(WORKFLOW).not.toContain("--var \"READ_API_OWNER_BUFFERED_INDEX_VERIFY");
+  });
+});
+
+
+describe("047010 exact-session RPC render", () => {
+  test("default/off leaves the render byte-identical; on adds only its flag", () => {
+    const baseline = renderDeployConfig(TEMPLATE, ON);
+    for (const value of [undefined, "", "off"]) expect(renderDeployConfig(TEMPLATE, { ...ON, ownerBufferedExactSession: value })).toBe(baseline);
+    const config = parse(renderDeployConfig(TEMPLATE, { ...ON, ownerBufferedExactSession: "on" }));
+    const before = parse(baseline);
+    expect(config).toEqual({ ...before, vars: { ...before.vars, READ_API_OWNER_BUFFERED_EXACT_SESSION: "on" } });
+  });
+  test("requires owner-buffered on and refuses unknown values or predeclared flags", () => {
+    expect(() => renderDeployConfig(TEMPLATE, { hyperdriveId: HD, ownerBufferedExactSession: "on" })).toThrow(/needs owner_buffered=on/);
+    for (const value of ["true", "1", "ON"]) expect(() => renderDeployConfig(TEMPLATE, { ...ON, ownerBufferedExactSession: value })).toThrow(/exact_session/);
+    const declared = TEMPLATE.replace('"vars": {', '"vars": { "READ_API_OWNER_BUFFERED_EXACT_SESSION": "on",');
+    expect(() => renderDeployConfig(declared, ON)).toThrow();
+    expect(WORKFLOW).toContain('OWNER_BUFFERED_EXACT_SESSION: ${{ inputs.owner_buffered_exact_session }}');
+    expect(WORKFLOW).toMatch(/owner_buffered_exact_session:[\s\S]*?default: "off"/);
   });
 });

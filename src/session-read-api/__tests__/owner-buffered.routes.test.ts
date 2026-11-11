@@ -48,6 +48,7 @@ function dirRow(over: Partial<DirectoryListRow> & { cursor_ts?: string } = {}): 
 }
 
 interface Harness {
+  selfhost?: boolean;
   enabled?: boolean;
   gate?: ControlHeadGate;
   reads?: OwnerBufferedReads;
@@ -143,6 +144,7 @@ function api(h: Harness = {}) {
     directoryWorkspaces: "workspaces" in h ? h.workspaces : new Set(["ws-a"]),
     turns,
     ownerBuffered,
+    ...(h.selfhost ? { selfhost: {} } : {}),
   });
   const get = (path: string, signal?: AbortSignal) =>
     signal ? app.request(new Request(`http://localhost${path}`, { headers: { authorization: "Bearer good" }, signal })) : app.request(path, { headers: { authorization: "Bearer good" } });
@@ -167,6 +169,21 @@ const strictSummary = (s: Record<string, unknown>) =>
 
 const L = "/v1/sessions?workspace=ws-a";
 describe("GET /v1/sessions with owner buffered rows", () => {
+  test("negotiated recorded name is canonical-only; buffered and default rows stay unchanged", async () => {
+    const { get } = api({
+      selfhost: true,
+      rows: [dirRow({ agent_names: ["Recorded-Agent"], catalog_projected_at: "2026-11-01T00:00:00Z" })],
+      reads: scriptedReads({ list: [bufferedRow()] }).reads,
+    });
+    const response = await get(`${L}&includeAgentName=recorded`);
+    expect(response.status).toBe(200);
+    const extended = (await json(response)).sessions;
+    expect(extended.find((row: any) => row.source === "codex").agentName).toBe("Recorded-Agent");
+    expect(extended.find((row: any) => row.source === "claude")).not.toHaveProperty("agentName");
+    const defaults = (await json(await get(L))).sessions;
+    for (const row of defaults) expect(row).not.toHaveProperty("agentName");
+  });
+
   test("union newest-first; buffered row is a strict sessionSummary; ids header; body keys unchanged", async () => {
     const gate = scriptedGate(authority("7"));
     const { get } = api({ gate, reads: scriptedReads({ list: [bufferedRow()] }).reads });

@@ -230,3 +230,28 @@ describe("HoopDb session index", () => {
     ]);
   });
 });
+
+test("operator fence denial ends enforced indexing before identity repair, projections or fanout", async () => {
+  const previous = process.env.SESSION_ERASE_FENCE_ENFORCED;
+  process.env.SESSION_ERASE_FENCE_ENFORCED = "1";
+  const calls: string[] = [];
+  let sent = 0;
+  try {
+    const db = { async query(text: string) {
+      calls.push(text);
+      return { rows: text.includes("ingest_operator_runtime_upsert") ? [{ applied: false, revision: "0", fenced: true }] : [] };
+    } } as unknown as HoopDb;
+    const manifest = scrubbedManifest();
+    const index = hoopDbSessionIndex({ db, reader: { provider: "s3", bucket: "locker", read: async () => ({ manifest, etag: "etag" }) },
+      queue: { backend: "memory", send: async () => { sent++; }, sendBatch: async () => { sent++; } }, current: () => undefined });
+    const result = await index.upsertRawPointer({ traceId, workspaceId: "ws-test", machineId: "machine-test", harness: "codex", sessionId: "session-test", manifestKey, provider: "s3", bucket: "locker" },
+      { traceId, orgId: "org-test", workspaceId: "ws-test", machineId: "machine-test", harness: "codex", sessionId: "session-test" });
+    expect(result).toMatchObject({ status: "skipped", reason: "operator_erased" });
+    expect(calls.some(text => text.includes("ingest_operator_runtime_upsert"))).toBe(true);
+    expect(calls.some(text => /INSERT INTO|UPDATE sessions/.test(text))).toBe(false);
+    expect(sent).toBe(0);
+  } finally {
+    if (previous === undefined) delete process.env.SESSION_ERASE_FENCE_ENFORCED;
+    else process.env.SESSION_ERASE_FENCE_ENFORCED = previous;
+  }
+});

@@ -1,0 +1,10 @@
+{
+  "schema": 1,
+  "crate": "relayscrubber",
+  "crate_version": "UNPINNED",
+  "ruleset_version": 0,
+  "scrub_profile": "UNPINNED",
+  "wasm_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "abi_version": 1,
+  "placeholder": "PLACEHOLDER: no relayscrubber wasm release is pinned yet. The loader refuses this pin (all-zero wasm_sha256, UNPINNED crate_version/scrub_profile) until the cutover PR replaces every value with the released artifact's. docs/scrub-engine.md"
+}

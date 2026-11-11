@@ -571,3 +571,59 @@ describe("session ingest: INGEST_CLAIM_LOCK_BUSY (default off)", () => {
     }
   });
 });
+
+describe("session ingest: INGEST_CLAIM_TIMEOUT_BUSY (default off)", () => {
+  // Same shape as the INGEST_CLAIM_LOCK_BUSY block above; the two inputs are independent.
+  const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };
+  const canonical: SessionIngestInputs = { ...inputs, acceptanceMode: "canonical" };
+  const admissionQueue = { Type: "Cloudflare.Queues.Queue", queueName: ADMISSION_QUEUE };
+
+  it("omitted: no INGEST_CLAIM_TIMEOUT_BUSY key at all, vars and props byte-identical to a stack without the input", () => {
+    for (const p of [inputs, canonical, buffered, { ...buffered, asyncAdmission: "on" as const }, { ...canonical, claimLockBusy: "on" as const }]) {
+      const b = resolvedAsyncAdmission(p) !== "off" ? { ...bindings, INGEST_ADMISSION: admissionQueue } : bindings;
+      expect(Object.hasOwn(sessionIngestVars(p), "INGEST_CLAIM_TIMEOUT_BUSY")).toBe(false);
+      const env = (sessionIngestWorkerProps(p, b) as unknown as { env: Record<string, unknown> }).env;
+      expect(Object.hasOwn(env, "INGEST_CLAIM_TIMEOUT_BUSY")).toBe(false);
+      expect(JSON.stringify(sessionIngestWorkerProps(p, b))).toBe(JSON.stringify(sessionIngestWorkerProps({ ...p, claimTimeoutBusy: undefined }, b)));
+    }
+  });
+
+  it('"on": exactly one more var in canonical and buffered acceptance, no new binding or resource, independent of claimLockBusy', () => {
+    const env = { CLOUDFLARE_ACCOUNT_ID: hex("a") };
+    for (const base of [inputs, canonical, buffered]) {
+      const on = { ...base, claimTimeoutBusy: "on" as const };
+      expect(() => assertSessionIngestInputs(on, refuse)).not.toThrow();
+      expect(sessionIngestVars(on)).toEqual({ ...sessionIngestVars(base), INGEST_CLAIM_TIMEOUT_BUSY: "on" });
+      expect(Object.hasOwn(sessionIngestVars(on), "INGEST_CLAIM_LOCK_BUSY")).toBe(false);
+      const p = props(on);
+      expect(p.env.INGEST_CLAIM_TIMEOUT_BUSY).toBe("on");
+      expect(Object.keys(p.env).sort()).toEqual([...Object.keys(props(base).env), "INGEST_CLAIM_TIMEOUT_BUSY"].sort());
+      expect(p.env.INGEST_ADMISSION).toBeUndefined();
+      expect(() => assertNoSecretLiterals(p.env, refuse)).not.toThrow();
+      expect(() => assertPrivateWorker(p, refuse)).not.toThrow();
+      expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: on }, env)).not.toThrow();
+    }
+    // Together with every other var-only flag: each var once, only async admission's binding.
+    const all = { ...buffered, custodySource: "frozen-supabase" as const, syncAdmissionFrozenReceipt: "on" as const, asyncAdmission: "on" as const, claimLockBusy: "on" as const, claimTimeoutBusy: "on" as const };
+    expect(() => assertSessionIngestInputs(all, refuse)).not.toThrow();
+    const both = sessionIngestWorkerProps(all, { ...bindings, INGEST_ADMISSION: admissionQueue }) as unknown as { env: Record<string, unknown> };
+    expect(both.env.INGEST_ASYNC_ADMISSION).toBe("on");
+    expect(both.env.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT).toBe("on");
+    expect(both.env.INGEST_CLAIM_LOCK_BUSY).toBe("on");
+    expect(both.env.INGEST_CLAIM_TIMEOUT_BUSY).toBe("on");
+    expect(sessionIngestResources()).toBe(SESSION_INGEST_RESOURCES);
+  });
+
+  it('is refused for any value but "on"', () => {
+    for (const base of [inputs, canonical, buffered])
+      for (const value of ["off", "ON", "On", true, 1, "", null, "yes"])
+        expect(() => assertSessionIngestInputs({ ...base, claimTimeoutBusy: value }, refuse)).toThrow('sessionIngest.claimTimeoutBusy must be "on" (omit for off)');
+    const env = { CLOUDFLARE_ACCOUNT_ID: hex("a") };
+    expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: { ...inputs, claimTimeoutBusy: "off" } }, env)).toThrow(/claimTimeoutBusy.*Nothing was changed/);
+  });
+
+  it("an unknown key next to it is still refused", () => {
+    expect(() => assertSessionIngestInputs({ ...inputs, claimTimeoutBusy: "on", claimTimeoutBusyRetryAfter: 5 }, refuse)).toThrow("sessionIngest.claimTimeoutBusyRetryAfter is not a known setting");
+    expect(() => assertSessionIngestInputs({ ...inputs, INGEST_CLAIM_TIMEOUT_BUSY: "on" }, refuse)).toThrow("sessionIngest.INGEST_CLAIM_TIMEOUT_BUSY is not a known setting");
+  });
+});

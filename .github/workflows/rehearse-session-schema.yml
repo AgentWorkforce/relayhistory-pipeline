@@ -1,0 +1,203 @@
+# Schema release rehearsal on disposable PostgreSQL 15/16/17 services.
+# Prerequisite proof only and authorizes nothing: no secrets, no environment, no
+# production database; see runbooks/schema-release-rehearsal.md.
+name: Rehearse session schema
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Release commit (40-hex) to rehearse
+        required: true
+        type: string
+      baseline:
+        description: Last step the production ledger holds (lane-prefixed step name)
+        required: true
+        type: string
+      target:
+        description: RELEASE_TARGET_STEP the release applies through
+        required: true
+        type: string
+      generation:
+        description: Target generation (64-hex) the apply must mark PASS
+        required: true
+        type: string
+      inject_failure:
+        description: Refusal to prove instead of a clean apply
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - ledger-gap
+          - boundary-drift
+          - late-step
+          - wrong-generation
+          - stale-plan
+          - missing-bootstrap
+      expect_refusal:
+        description: "Known-negative row: <stage>:<code> the run must FAIL with (e.g. R1:rehearsal_target_anchor_missing); empty = must pass"
+        required: false
+        default: ""
+        type: string
+  pull_request:
+    paths:
+      - .github/workflows/rehearse-session-schema.yml
+      - scripts/pg-proof/schema-rehearsal.ts
+      - scripts/pg-proof/schema-rehearsal-core.ts
+      - src/hoopdb/**
+      - supabase/migrations/**
+      - supabase/bootstrap/**
+      - scripts/schema-release-*.ts
+
+permissions:
+  contents: read
+
+concurrency:
+  # As pg-proof.yml: one live run per pull request (a new push cancels the previous
+  # head's smoke). Every dispatch is its own group and is never cancelled: several
+  # matrix rows for one sha (clean, each injection, known negatives) may be queued.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  rehearse:
+    if: github.event_name == 'workflow_dispatch'
+    name: rehearse (PostgreSQL ${{ matrix.pg }}, ${{ inputs.inject_failure }})
+    # GitHub-hosted on purpose (not vars.CI_LINUX_RUNNER as in pg-proof.yml): the driver
+    # refuses unless RUNNER_ENVIRONMENT=github-hosted, so the database it mutates is
+    # this job's own fresh service container, never a persistent runner's.
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["15", "16", "17"]
+    services:
+      postgres:
+        image: postgres:${{ matrix.pg }}
+        env:
+          POSTGRES_USER: supabase_admin
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U supabase_admin"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      REHEARSAL_SHA: ${{ inputs.sha }}
+      REHEARSAL_BASELINE: ${{ inputs.baseline }}
+      REHEARSAL_TARGET: ${{ inputs.target }}
+      REHEARSAL_GENERATION: ${{ inputs.generation }}
+      REHEARSAL_INJECT: ${{ inputs.inject_failure }}
+      REHEARSAL_EXPECT_REFUSAL: ${{ inputs.expect_refusal }}
+      REHEARSAL_PG_MAJOR: ${{ matrix.pg }}
+      REHEARSAL_DISPOSABLE_PG: "1"
+    steps:
+      - name: Validate release sha
+        run: |
+          [[ "$REHEARSAL_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "sha must be 40 lowercase hex"; exit 1; }
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      # The driver at the dispatching ref, inside the workspace (gitignored) so that `pg`
+      # resolves from the release checkout's node_modules. Non-cone: the driver's own
+      # files plus the import-free contract module the core imports statically.
+      - name: Rehearsal tooling at the dispatching ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .rehearsal-tooling
+          sparse-checkout: |
+            /scripts/pg-proof/
+            /src/hoopdb/schema-release-contract.ts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Rehearse
+        timeout-minutes: 45
+        run: bun .rehearsal-tooling/scripts/pg-proof/schema-rehearsal.ts
+      - name: Check summary
+        if: always()
+        run: jq -e '.passed == true' rehearsal-out/summary.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rehearsal-pg${{ matrix.pg }}-${{ inputs.inject_failure }}
+          path: rehearsal-out/
+          if-no-files-found: error
+
+  smoke:
+    if: github.event_name == 'pull_request'
+    name: rehearse smoke (PostgreSQL 17)
+    # GitHub-hosted on purpose, see the rehearse job. The PR head is the release tree
+    # under rehearsal (REHEARSAL_SHA, the working directory). The driver and the contract
+    # module come from the merge ref, as the rehearse job takes them from the dispatching
+    # ref: branches cut before the driver existed are still rehearsed, and the driver
+    # under test is the one that would merge.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: supabase_admin
+          POSTGRES_DB: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U supabase_admin"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      REHEARSAL_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      REHEARSAL_BASELINE: upstream:20261105045030_session_consumer_project_text_grant.sql
+      REHEARSAL_TARGET: upstream:20261105047000_coordination_fact_readers.sql
+      REHEARSAL_GENERATION: 52a3f2f05d3dfa2342d3828c6b14eeeb61f1e47e5b97cddffb91dd0cfee04c0f
+      REHEARSAL_INJECT: none
+      REHEARSAL_PG_MAJOR: "17"
+      REHEARSAL_DISPOSABLE_PG: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      # github.sha is the merge commit of the head into the base, so it carries the base's
+      # driver. Same gitignored path and sparse set as the rehearse job.
+      - name: Rehearsal tooling at the merge ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .rehearsal-tooling
+          sparse-checkout: |
+            /scripts/pg-proof/
+            /src/hoopdb/schema-release-contract.ts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Rehearse
+        timeout-minutes: 30
+        run: bun .rehearsal-tooling/scripts/pg-proof/schema-rehearsal.ts
+      - name: Check summary
+        if: always()
+        run: jq -e '.passed == true' rehearsal-out/summary.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rehearsal-smoke-pg17
+          path: rehearsal-out/
+          if-no-files-found: error

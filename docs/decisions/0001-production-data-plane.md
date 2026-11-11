@@ -1,6 +1,7 @@
 # 0001: Production data plane is Supabase plus S3
 
 **Status:** locked (Khaliq, 2026-10-30)
+**Superseded in part by:** 0004 (upload inbox: STS roles, SQS, consumer Lambda)
 **Supersedes:** the open "HoopDb (RDS Postgres 17 + pgvector, or Supabase)"
 choice in `docs/aws-stage.md`, for hosted production only.
 

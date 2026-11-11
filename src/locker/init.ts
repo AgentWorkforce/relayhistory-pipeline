@@ -8,6 +8,7 @@ import { createHash, createHmac } from "node:crypto";
 import { lockerEnv } from "../shared/env.ts";
 import { lockerCredentials } from "../shared/locker.ts";
 import { errorFields, log } from "../shared/log.ts";
+import { initScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
 
 const sha256 = (s: string | Uint8Array) => createHash("sha256").update(s).digest("hex");
 const hmac = (k: Buffer | string, s: string) => createHmac("sha256", k).update(s).digest();
@@ -84,7 +85,9 @@ export async function ensureBucket(timeoutMs = 120_000): Promise<void> {
 
 if (import.meta.main) {
   process.env.OTEL_SERVICE_NAME ||= "locker-init";
-  ensureBucket()
+  // SCRUB_ENGINE (docs/scrub-engine.md): every service selects (and for wasm verifies) at startup.
+  initScrubEngine()
+    .then(() => ensureBucket())
     .then(() => process.exit(0))
     .catch((err) => {
       log.error("locker init failed", errorFields(err));

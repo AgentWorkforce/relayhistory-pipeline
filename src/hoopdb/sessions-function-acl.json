@@ -79,6 +79,10 @@
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
     ],
+    "sessions.buffered_session_stages_for_target(text,text,text,text,text,text,text,text,boolean,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
@@ -177,6 +181,14 @@
     "sessions.commit_search_feature_copy(text,text,uuid,bigint,text,jsonb,timestamp with time zone)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
+    ],
+    "sessions.coordination_output_facts_for(text,timestamp with time zone,timestamp with time zone,text,integer)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.coordination_write_facts_for(text,timestamp with time zone,timestamp with time zone,text,integer)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
     ],
     "sessions.digest_narrative_read(text,date,text,text)": [
       "<owner>:EXECUTE",
@@ -467,6 +479,15 @@
     "sessions.ingest_digest(jsonb)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_erase_fence_extend(text,text,text,text,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_erase_fence_index_guard()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_erase_fence_index_lock()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_exact_keys(jsonb,text[])": [
       "<owner>:EXECUTE"
     ],
@@ -692,6 +713,105 @@
     ],
     "sessions.ingest_lock_fences(text,text,text)": [
       "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_append_only()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_artifact_keys()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_artifacts_valid(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_failure_valid(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_fence(text,text,text,text,text[])": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_ids(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_ordered(text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_owners(text,text,text,text[])": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_pending(jsonb,text[])": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_receipt(text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_record_step(text,text,text,text,text,text,bigint,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_render(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_session(text,text,text,text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_settle(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_authorize(text,text,text,text,uuid)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_begin(text,text,text,text,text,text,text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_catalog()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_erased(text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_ids(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_location_valid(text,text,text,text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_metadata_guard()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_next(uuid)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_purge(text,text,text,text,uuid)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_release(text,text,text,text,uuid)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_step(text,text,text,text,uuid,text,text,bigint,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_upsert(jsonb,text,text)": [
+      "<owner>:EXECUTE",
+      "search_consumer_runtime:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_write_begin(jsonb)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_write_failed(text,text,uuid)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_runtime_write_finish(text,text,uuid)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
     ],
     "sessions.ingest_prepare_buffer_stage(jsonb)": [
       "<owner>:EXECUTE",
@@ -1278,6 +1398,10 @@
     "sessions.session_directory_tombstone_clears_summary()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_directory_users_for(text,timestamp with time zone,timestamp with time zone,integer)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.session_directory_worker_scope(text)": [
       "<owner>:EXECUTE"
     ],
@@ -1361,6 +1485,10 @@
     "sessions.session_replay_sources_changed()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_summary_activity_for(text,timestamp with time zone,timestamp with time zone)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.set_session_brief_documents_live(boolean)": [
       "<owner>:EXECUTE"
     ],
@@ -1374,6 +1502,14 @@
     "sessions.set_session_state_for_publication(text,text,text,text,text,text,bigint,text,timestamp with time zone,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
+    ],
+    "sessions.upload_consent_apply_v1(text,text,text,jsonb,boolean,bigint)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.upload_consent_snapshot_v1(text,text,text,text,jsonb,bigint)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
     ],
     "sessions.upsert_machine(text,text,text,text,text,text,timestamp with time zone)": [
       "<owner>:EXECUTE",

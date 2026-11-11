@@ -5,7 +5,7 @@ on:
     inputs:
       mode:
         type: choice
-        options: [plan, apply]
+        options: [plan, bootstrap, apply]
         required: true
       sha:
         description: Exact current main commit (40 lowercase hex)
@@ -15,17 +15,29 @@ on:
         description: Exact migration --generation from this SHA (64 lowercase hex)
         type: string
         required: true
+      target:
+        description: "Last schema step this release may apply, exactly as ledgered (e.g. upstream:20261105047000_coordination_fact_readers.sql); pending steps after it are held and never applied"
+        type: string
+        required: true
+      target_sha:
+        description: "Full 40-hex commit, sha itself or on sha's first-parent main history with green push CI, whose tree ends at target (same prefix steps, its own verifiers); images for this release are built there"
+        type: string
+        required: true
+      target_generation:
+        description: "Bootstrap and apply - targetGeneration from the plan's plan.json (64 lowercase hex): --generation at target_sha, the generation this apply marks PASS; equals generation when nothing is held"
+        type: string
+        default: ""
       boundary:
-        description: Existing catalog-proven control; never installed by this workflow
+        description: Catalog-proven global control; apply refreshes the reviewed event trigger
         type: choice
-        options: [event-trigger, global-default-revoke]
+        options: [global-default-revoke]
         required: true
       plan_run:
-        description: Apply only - successful plan run ID from this SHA (within 24 hours)
+        description: Bootstrap and apply - successful plan run ID from this SHA (within 24 hours)
         type: string
         default: ""
       approval:
-        description: "Apply only: APPLY pyamkrhoyszgzirqqffq <sha> <generation> PLAN <plan_run>"
+        description: "Apply: APPLY pyamkrhoyszgzirqqffq <sha> <generation> TARGET <target> <target_sha> <target_generation> MANIFEST <manifest_digest> PLAN <plan_run>. Bootstrap: BOOTSTRAP <project> <sha> TARGET <target> <target_sha> CHAIN <chain_digest> ROLES <sorted comma-joined will_create, or none> PLAN <plan_run> (chain_digest from the plan binds target, target_sha, the target-required roles, the bootstrap contract digest and the anchor bytes of the run files)"
         type: string
         default: ""
 permissions:
@@ -40,6 +52,9 @@ env:
   RELEASE_SHA: ${{ inputs.sha }}
   RELEASE_GENERATION: ${{ inputs.generation }}
   RELEASE_BOUNDARY: ${{ inputs.boundary }}
+  RELEASE_TARGET: ${{ inputs.target }}
+  RELEASE_TARGET_SHA: ${{ inputs.target_sha }}
+  RELEASE_TARGET_GENERATION: ${{ inputs.target_generation }}
   RELEASE_PLAN_RUN: ${{ inputs.plan_run }}
   RELEASE_APPROVAL: ${{ inputs.approval }}
 jobs:
@@ -76,9 +91,12 @@ jobs:
     environment:
       name: ${{ needs.prerequisite-gate.outputs.environment }}
     steps:
+      # Full history: target_sha and its tree are read from the local object database
+      # only; the database step itself never runs network git.
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - uses: oven-sh/setup-bun@v2
         with:
@@ -89,7 +107,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: bun scripts/schema-release-github.ts --approved
       - name: Download the prior plan, with exact workflow/run provenance already checked
-        if: inputs.mode == 'apply'
+        if: inputs.mode != 'plan'
         uses: actions/download-artifact@v4
         with:
           name: schema-release-plan
@@ -97,7 +115,8 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.plan_run }}
           github-token: ${{ github.token }}
-      - name: Read-only plan or approved apply (only step with database secret)
+      # One secret-scoped step for every mode; the entry point dispatches on RELEASE_MODE.
+      - name: Read-only plan, approved bootstrap-role stage, or approved boundary-refresh and apply (only step with database secret)
         env:
           GITHUB_TOKEN: ${{ github.token }}
           SUPABASE_MIGRATION_OWNER_URL: ${{ secrets.SUPABASE_MIGRATION_OWNER_URL }}
@@ -110,3 +129,15 @@ jobs:
           path: release-plan/plan.json
           if-no-files-found: error
           retention-days: 1
+      - name: Publish non-secret bootstrap evidence
+        if: inputs.mode == 'bootstrap' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: schema-release-bootstrap
+          path: release-bootstrap/evidence.json
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Summary
+        if: always()
+        run: |
+          printf '### guarded session schema release\n\nmode: `%s`\nsha: `%s`\n' "$RELEASE_MODE" "$RELEASE_SHA" >> "$GITHUB_STEP_SUMMARY"

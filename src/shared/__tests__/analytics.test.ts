@@ -98,6 +98,23 @@ describe("envelope projector", () => {
     expect(p.properties).toEqual({ collected: 3, failed: 1, requeued: 0, stale: 2, tombstoned: 0, complete: true, latency_bucket: "lt_2500ms" });
   });
 
+  test("brief analytics project only installation counts and a latency bucket", () => {
+    const event = {
+      kind: "session_brief.tick_completed", claimed: 9, generated: 1, reused: 2, rateLimited: 2,
+      throttled: 1, retrying: 1, failed: 1, durationMs: 600,
+      orgId: "PLANTED-ORG", workspaceId: "PLANTED-WORKSPACE", sessionId: "PLANTED-SESSION",
+      summary: "PLANTED-SUMMARY", error: "PLANTED-ERROR",
+    } as const;
+    const projected = projectEvent(event, { component: "session-brief", deploymentId: "d" }, fixedClock);
+    if (typeof projected === "string") throw new Error(projected);
+    expect(JSON.stringify(projected)).not.toContain("PLANTED");
+    expect(projected.properties).toEqual({
+      claimed: 9, generated: 1, reused: 2, rate_limited: 2, throttled: 1,
+      retrying: 1, failed: 1, latency_bucket: "lt_1s",
+    });
+    expect(projectEvent(event, READER, fixedClock)).toBe("wrong_component");
+  });
+
   test("component is bound by the producer; an unknown kind or another component's kind is refused", () => {
     expect(projectEvent(readEvent(), INGEST)).toBe("wrong_component");
     expect(projectEvent({ kind: "session_read.anything" } as never, READER)).toBe("unknown_kind");

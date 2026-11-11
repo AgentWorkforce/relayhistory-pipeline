@@ -207,6 +207,28 @@ the original sketch below in four ways:
   session-ingest upload path only; another user's copy is untouched, an origin
   first used after the erase is not fenced, and a session not yet indexed has
   no pointer to tombstone.
+- Capture policy (relay-control `docs/capture-policy.md`): relaycontrol
+  introspection (v1.5) answers the organization's capture policy and the
+  caller's live role with every verified bearer; the edge keeps no copy
+  (`src/session-ingest/capture-policy.ts`). With `user_retroactive_delete:
+  false`, a member's own delete (selection `enabled:false`; reset, where served)
+  is refused 403 `policy_forbids_user_delete` before any fence is written.
+  Organization owners and admins still delete, and the operator session erase
+  below is unaffected. A relaycontrol that predates v1.5 sends no policy, and
+  deletes stay as before.
+  Uploads (`/v1/delivery/batches`, `/v1/turns/batches`): Agent Relay Desktop
+  names the policy revision it applies in `X-Agent-Relay-Capture-Policy-Revision`.
+  When the policy sets any key, a missing or older revision, or (under
+  `sharing_mode: new`) a `session` record whose `first_activity_ms` is before
+  the policy's `sharing_mode_since`, is logged with
+  `metric: capture_policy_upload_violation`.
+  `RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS=report` (default) accepts it;
+  `enforce` refuses it 409 `capture_policy_stale` (Desktop retries and sends
+  the new revision after its next policy read) or 422
+  `capture_policy_session_predates_policy`. Roll out in report, watch the log
+  for violations from current Desktops, then switch to enforce. Direct-to-S3
+  uploads are gated at Control's credentials route
+  (`SELFHOST_CAPTURE_POLICY_UPLOADS`), not here.
 - Operator session erase: `/internal/v1/session-erase/...`
   (`docs/operator-session-erase-contract.md`) is reachable only from inside the
   cluster, for relay-control. The wrapper forwards GET and POST (other methods: 405) to the app without
@@ -216,6 +238,15 @@ the original sketch below in four ways:
 
 At startup it admits only a real login of `bulls96_session_ingest` with the
 bootstrap's role shape.
+
+`INGEST_CLAIM_LOCK_BUSY` (default off; parsed as on the Worker: only `on`, any
+case, trimmed, enables it, and any other value is off) makes a claim that loses
+its lock wait (55P03/40P01) a 429 `delivery_busy` with `Retry-After` 5-10 s
+instead of a 503, as on the hosted Worker. 57014 and every other cause stay 503.
+The chart turns it on with the managed value `ingestEdge.claimLockBusy: true`
+(AgentWorkforce/infra#187), which emits exactly one quoted
+`INGEST_CLAIM_LOCK_BUSY="on"` and omits the variable when false; the chart
+rejects `ingestEdge.extraEnv`.
 
 `SELFHOST_INGEST_ADMISSION=async` (default `sync`) moves the database off the
 upload request path: one create-only inbox PUT, then the hosted queued receipt,
@@ -300,9 +331,9 @@ off; anything else, `true` included, fails startup).
 
 | SERVICE | Flag | Required when enabled | Secret material (from the secret store, never on disk) |
 | --- | --- | --- | --- |
-| `session-read-api` | `RELAYHISTORY_SELFHOST_READ_API` | `READ_API_ORIGIN`, `READ_API_COMPLETE_SINCE` (ISO or `epoch`), `READ_API_DIRECTORY_WORKSPACES` (canary allowlist; login answers 501 for an unlisted workspace), `SEARCH_INDEX_BACKEND` (`postgres`), `SEARCH_INDEX_POSTGRES_BACKEND_ID`, `SESSION_POSTGRES_TLS_PROFILE`, the relaycontrol trio in section 2, optional `ALLOW_IN_CLUSTER_HTTP`, `RELAYHISTORY_READ_API_PORT`, `READ_API_CANONICAL_PIN_LAGGING_POINTER` (recommended `true` with `SELFHOST_INGEST_ADMISSION=async`; default off; any value other than `true` is off, see `docs/selfhost-async-admission.md`), `READ_API_SESSION_QUERY` (exactly `true` enables the Dashboard session query `q` on the list and activity routes over the directory, migration 046010; default off, off is unchanged 501 `param_q`; `""`/`false` are off, any other value fails startup; `path:`, `upload:` and `is:on-relay` stay explicit 501s, see `docs/local-stack.md`), `READ_API_CANONICAL_SCOPE_BYTES` / `READ_API_CANONICAL_SCOPE_EVENTS` (canonical snapshot budget; defaults 32 MiB / 100000 (raise bytes only with the pod memory limit), bytes accepted 16 MiB..2 GiB, events up to 4000000; out of range fails startup, see `docs/local-stack.md`), `READ_API_CANONICAL_DEADLINE_MS` (canonical read deadline in ms; default 3000, accepted 3000..60000; out of range fails startup) | `RELAYHISTORY_READ_API_SECRET` (JSON `{supabase_url}`; no `clickhouse` with `postgres`), `RELAYCONTROL_INTROSPECT_SECRET` |
+| `session-read-api` | `RELAYHISTORY_SELFHOST_READ_API` | `READ_API_ORIGIN`, `READ_API_COMPLETE_SINCE` (ISO or `epoch`), `READ_API_DIRECTORY_WORKSPACES` (canary allowlist; login answers 501 for an unlisted workspace), `SEARCH_INDEX_BACKEND` (`postgres`), `SEARCH_INDEX_POSTGRES_BACKEND_ID`, `SESSION_POSTGRES_TLS_PROFILE`, `READ_API_COORDINATION_OVERLAPS_ENABLED` (exactly `true`) with `READ_API_COORDINATION_OVERLAPS_BACKEND=postgres`, the relaycontrol trio in section 2, optional `ALLOW_IN_CLUSTER_HTTP`, `RELAYHISTORY_READ_API_PORT`, `READ_API_CANONICAL_PIN_LAGGING_POINTER` (recommended `true` with `SELFHOST_INGEST_ADMISSION=async`; default off; any value other than `true` is off, see `docs/selfhost-async-admission.md`), `READ_API_SESSION_QUERY` (exactly `true` enables the Dashboard session query `q` on the list and activity routes over the directory, migration 046010; default off, off is unchanged 501 `param_q`; `""`/`false` are off, any other value fails startup; `path:`, `upload:` and `is:on-relay` stay explicit 501s, see `docs/local-stack.md`), `READ_API_CANONICAL_SCOPE_BYTES` / `READ_API_CANONICAL_SCOPE_EVENTS` (canonical snapshot budget; defaults 32 MiB / 100000 (raise bytes only with the pod memory limit), bytes accepted 16 MiB..2 GiB, events up to 4000000; out of range fails startup, see `docs/local-stack.md`), `READ_API_CANONICAL_DEADLINE_MS` (canonical read deadline in ms; default 3000, accepted 3000..60000; out of range fails startup) | `RELAYHISTORY_READ_API_SECRET` (JSON `{supabase_url}`; no `clickhouse` with `postgres`), `RELAYCONTROL_INTROSPECT_SECRET` |
 | `session-publication` | `INGEST_PUBLISH_ENABLED` | `INGEST_PUBLISH_{BUCKET,EXPECT_GENERATION,AWS_ACCOUNT_ID,SUPABASE_PROJECT_REF,INSTANCE_ID,SECRET_ARN,KMS_KEY_ARN,INSTANCE_PROFILE_ARN,ROLE_NAME}`, `AWS_REGION=us-east-1`, `HOOPDB_DB_MODE=supabase`, optional `INGEST_PUBLISH_BUDGET_MS`, `INGEST_PUBLISH_BATCH_LIMIT`, `WORKER_HEALTH_PORT` | none in env: IMDSv2 plus Secrets Manager (see the caveat in section 1) |
-| `session-ingest` | `RELAYHISTORY_SELFHOST_INGEST` | `RELAYHISTORY_INGEST_ORIGIN`, `RELAYCONTROL_INTROSPECT_URL`, `RELAYHISTORY_INGEST_DATABASE_URL`, `SESSION_POSTGRES_TLS_PROFILE`, `LOCKER_BUCKET` (+ Locker endpoint/region or Pod Identity/GCS), optional `RELAYHISTORY_INGEST_PORT`, `INGEST_KEY_ROOT`, `INGEST_MAX_PER_USER`, `INGEST_MAX_PER_ORG`, `RELAYHISTORY_INGEST_PG_POOL_MAX`, `ALLOW_IN_CLUSTER_HTTP`, `SELFHOST_INGEST_ADMISSION` (`sync` default, `async`, `drain`) with `SELFHOST_ADMISSION_CONCURRENCY` / `_SCAN_MS` / `_MAX_ATTEMPTS`, `SESSION_ERASE_API_ENABLED` (`1`; default off), `RELAYHISTORY_SELFHOST_SESSION_SELECTION`, `RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT` (both `true`; default off), `RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS` (positive introspection cache in ms, `0`-`60000`; default `0` = off; revocation lag = the TTL) | `RELAYCONTROL_INTROSPECT_SECRET`, `RELAYHISTORY_INGEST_DATABASE_URL` (password), Locker keys, `SESSION_ERASE_API_SECRET` (+ `_PREVIOUS` during a rotation; at least 32 characters; only read when the erase flag is on) |
+| `session-ingest` | `RELAYHISTORY_SELFHOST_INGEST` | `RELAYHISTORY_INGEST_ORIGIN`, `RELAYCONTROL_INTROSPECT_URL`, `RELAYHISTORY_INGEST_DATABASE_URL`, `SESSION_POSTGRES_TLS_PROFILE`, `LOCKER_BUCKET` (+ Locker endpoint/region or Pod Identity/GCS), optional `RELAYHISTORY_INGEST_PORT`, `INGEST_KEY_ROOT`, `INGEST_MAX_PER_USER`, `INGEST_MAX_PER_ORG`, `RELAYHISTORY_INGEST_PG_POOL_MAX`, `ALLOW_IN_CLUSTER_HTTP`, `SELFHOST_INGEST_ADMISSION` (`sync` default, `async`, `drain`) with `SELFHOST_ADMISSION_CONCURRENCY` / `_SCAN_MS` / `_MAX_ATTEMPTS`, `SESSION_ERASE_API_ENABLED` (`1`; default off), `RELAYHISTORY_SELFHOST_SESSION_SELECTION`, `RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT` (both `true`; default off), `RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS` (`report` default, `enforce`; the capture policy upload check, section 2), `RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS` (positive introspection cache in ms, `0`-`60000`; default `0` = off; revocation lag = the TTL), `INGEST_CLAIM_LOCK_BUSY` (`on`; default off; a claim lock wait is a 429 with Retry-After 5-10 s, section 3) | `RELAYCONTROL_INTROSPECT_SECRET`, `RELAYHISTORY_INGEST_DATABASE_URL` (password), Locker keys, `SESSION_ERASE_API_SECRET` (+ `_PREVIOUS` during a rotation; at least 32 characters; only read when the erase flag is on) |
 | `session-erase-bytes` (Job) | `SESSION_ERASE_BYTES_ENABLED` (exactly `1`; see below) | `SESSION_ERASE_S3_BUCKET`, `SESSION_ERASE_S3_REGION`, `SESSION_ERASE_REQUEST_FILE`, optional `SESSION_ERASE_S3_ENDPOINT` (bare origin; https, loopback, or a Service name with `ALLOW_IN_CLUSTER_HTTP`), `SESSION_ERASE_KEY_ROOT` (default `96bulls`, must equal `INGEST_KEY_ROOT`), `SESSION_ERASE_DRY_RUN` (`1` = list and count only), `SESSION_ERASE_CONCURRENCY` (1..16, default 4) | `SESSION_ERASE_S3_ACCESS_KEY_ID[_FILE]`, `SESSION_ERASE_S3_SECRET_ACCESS_KEY[_FILE]`: a separate eraser key (ListBucketVersions + DeleteObjectVersion on the key root), not the ingest writer's key |
 | workers | per service (`docs/local-stack.md`) | `HOOPDB_URL`, `WORKER_HEALTH_PORT` | `HOOPDB_URL` password |
 
@@ -343,8 +374,10 @@ when it runs as `search_consumer_runtime` (`CONSUMER_RUNTIME_FUNCTIONS` in
 `src/hoopdb/migrate-guards.ts`); any other role that can execute them, or
 PUBLIC, still closes the gate.
 
-`READ_API_OUTPUT_BACKEND` and `READ_API_DIGEST_BACKEND` (`session-read-api`)
-select where `GET /v1/sessions/output` and `GET /v1/digest/daily` read from:
+`READ_API_OUTPUT_BACKEND`, `READ_API_DIGEST_BACKEND`, and
+`READ_API_COORDINATION_OVERLAPS_BACKEND` (`session-read-api`)
+select where `GET /v1/sessions/output`, `GET /v1/digest/daily`, and
+`GET /v1/coordination/overlaps` read from:
 unset, empty or `clickhouse` (the default; the routes stay exactly as before,
 which on the service means not configured, since it has no ClickHouse) or
 `postgres`. Any other value fails startup, naming the flag and never echoing
@@ -353,17 +386,33 @@ Lambda refuses it at startup, and the hosted read Worker does not read these
 flags. Each route is still served only with its own `READ_API_OUTPUT_ENABLED`
 / `READ_API_DIGEST_ENABLED` set to exactly `1` (unchanged semantics: anything
 else answers 501 `output_not_configured` / `digest_not_configured`), and only
-for workspaces in `READ_API_DIRECTORY_WORKSPACES` (unchanged allowlist). With
-`postgres` the route reads the Postgres output facts on the read pool, as
-`bulls96_read_api`, through the migration `045040` readers only
-(`sessions.output_facts_events_for`, `_outputs_for`, `_coverage_for`), in one
+for workspaces in `READ_API_DIRECTORY_WORKSPACES` (unchanged allowlist).
+`GET /v1/coordination/overlaps` is separately exposed only when
+`READ_API_COORDINATION_OVERLAPS_ENABLED` is exactly `true`; every other value
+returns `404 {"error":"coordination_overlaps_disabled"}`. Self-hosted installs
+select the existing Postgres facts with
+`READ_API_COORDINATION_OVERLAPS_BACKEND=postgres`; this adds no worker, model,
+or secret. It requires migration `20261105047000_coordination_fact_readers.sql`,
+which adds two filtered SECURITY DEFINER readers and two partial indexes over
+the existing facts tables. On a populated database, prebuild those exact
+indexes with `CREATE INDEX CONCURRENTLY` using the packet in
+`docs/coordination-overlap-detection.md`; the transactional migrator refuses a
+blocking build unless `HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=1` (or `true`) is set.
+Its default `outcome-facts` detector ranks duplicate
+migrations, cross-lane reverted commits, and rare different-branch shared
+writes using only those stored facts; the pure detector package retains
+`shared-write-60m` as a named comparison detector. With `postgres` the routes read the Postgres output facts on the read pool, as
+`bulls96_read_api`, through the migration `045040` readiness/usage readers and
+the `047000` sparse coordination readers, in one
 READ ONLY tenant transaction, with erased sessions dropped through the session
 liveness check before any aggregation. No ClickHouse block or client is needed.
 
 Serving from `postgres` needs, in order:
 
 1. migration `045040` applied (otherwise 501 `output_schema_missing` /
-   `digest_schema_missing`);
+   `digest_schema_missing`) and, for coordination overlaps, migration `047000`
+   applied (otherwise the overlap route returns 200 with unknown coverage and a
+   schema-unavailable note);
 2. `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` on the pipeline consumer, so new
    passes write facts;
 3. the output facts bootstrap (a later PR), which backfills the sessions
@@ -528,6 +577,15 @@ missing briefs and changed canonical revisions without the legacy indexer.
 `SESSION_BRIEF_BATCH`, `SESSION_BRIEF_GLOBAL_DAILY_CAP` and
 `SESSION_BRIEF_SESSION_DAILY_CAP` bound work and spend. Keep one worker for
 initial qualification; do not enable the legacy indexer to produce wakeups.
+
+A session refused as `rate_limited` waits for the next UTC midnight, but in
+this mode the worker re-checks parked sessions once a minute. It re-arms a
+parked wakeup when the session gets new canonical revisions. It also makes a
+parked wakeup due as soon as the admission checks would pass, for example after
+a cap is raised mid-day; the global daily cap is checked first. The sweep treats
+a `rate_limited` brief as unbriefed, so a session whose parked wakeup expired
+after `SESSION_WAKE_MAX_AGE_HOURS` is found again. None of this changes a cap
+or a default, and claim still enforces every limit.
 
 Apply the complete migration plan, including
 `20261105044100_session_brief_summary_read.sql`, before starting services with

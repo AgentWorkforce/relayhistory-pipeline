@@ -477,7 +477,251 @@ function requestIdentity(kind: string, payload: Json): string | null {
   return span ? `request-span:${span}` : `record-id:${recordId}`;
 }
 
-function toolCall(payload: Json, toolUse: string | null) {
+const MAX_WRITTEN_PATHS = 64;
+const MAX_WRITTEN_PATH_CHARS = 512;
+const MAX_EDIT_INPUT_CHARS = 1024 * 1024;
+const PATCH_PATH_HEADERS = [
+  "*** Add File: ",
+  "*** Update File: ",
+  "*** Delete File: ",
+  "*** Move to: ",
+] as const;
+function validWrittenPath(path: string): boolean {
+  return (
+    path.length > 0 &&
+    path.length <= MAX_WRITTEN_PATH_CHARS &&
+    path.trim() === path &&
+    !/[\u0000-\u001f\u007f]/.test(path)
+  );
+}
+
+function normalizedToolName(name: string): string {
+  return (name.split(/[.:/]/).at(-1) ?? "")
+    .replaceAll(/[_-]/g, "")
+    .toLowerCase();
+}
+
+/** A static JavaScript string literal and the first byte after it. */
+function jsString(
+  source: string,
+  start: number,
+): { value: string; end: number } | null {
+  const quote = source[start];
+  if (quote !== '"' && quote !== "'" && quote !== "`") return null;
+  const value: string[] = [];
+  for (let at = start + 1; at < source.length; at += 1) {
+    const char = source[at]!;
+    if (char === quote) return { value: value.join(""), end: at + 1 };
+    if (quote === "`" && char === "$" && source[at + 1] === "{") return null;
+    if (char !== "\\") {
+      value.push(char);
+      continue;
+    }
+    at += 1;
+    if (at >= source.length) return null;
+    const escaped = source[at]!;
+    const simple: Record<string, string> = {
+      b: "\b",
+      f: "\f",
+      n: "\n",
+      r: "\r",
+      t: "\t",
+      v: "\v",
+      "0": "\0",
+    };
+    if (simple[escaped] !== undefined) {
+      value.push(simple[escaped]);
+      continue;
+    }
+    if (escaped === "\n") continue;
+    if (escaped === "\r") {
+      if (source[at + 1] === "\n") at += 1;
+      continue;
+    }
+    if (escaped === "x") {
+      const digits = source.slice(at + 1, at + 3);
+      if (!/^[0-9a-f]{2}$/i.test(digits)) return null;
+      value.push(String.fromCharCode(Number.parseInt(digits, 16)));
+      at += 2;
+      continue;
+    }
+    if (escaped === "u") {
+      const braced = /^\{([0-9a-f]{1,6})\}/i.exec(source.slice(at + 1, at + 9));
+      if (braced) {
+        const point = Number.parseInt(braced[1]!, 16);
+        if (point > 0x10ffff) return null;
+        value.push(String.fromCodePoint(point));
+        at += braced[0].length;
+        continue;
+      }
+      const digits = source.slice(at + 1, at + 5);
+      if (!/^[0-9a-f]{4}$/i.test(digits)) return null;
+      value.push(String.fromCharCode(Number.parseInt(digits, 16)));
+      at += 4;
+      continue;
+    }
+    // JavaScript's identity escapes, including escaped quotes and backslashes.
+    value.push(escaped);
+  }
+  return null;
+}
+
+const identifierStart = (char: string | undefined) =>
+  char !== undefined && /[A-Za-z_$]/.test(char);
+const identifierPart = (char: string | undefined) =>
+  char !== undefined && /[A-Za-z0-9_$]/.test(char);
+const skipSpace = (source: string, start: number) => {
+  let at = start;
+  while (/\s/.test(source[at] ?? "")) at += 1;
+  return at;
+};
+function identifier(source: string, start: number) {
+  if (!identifierStart(source[start])) return null;
+  let end = start + 1;
+  while (identifierPart(source[end])) end += 1;
+  return { value: source.slice(start, end), end };
+}
+
+/** Static patch strings passed to code-mode's `tools.apply_patch`. */
+function execApplyPatchInputs(source: string): string[] {
+  const variables = new Map<string, string>();
+  const inputs: string[] = [];
+  for (let at = 0; at < source.length;) {
+    if (source.startsWith("//", at)) {
+      const end = source.indexOf("\n", at + 2);
+      at = end < 0 ? source.length : end + 1;
+      continue;
+    }
+    if (source.startsWith("/*", at)) {
+      const end = source.indexOf("*/", at + 2);
+      at = end < 0 ? source.length : end + 2;
+      continue;
+    }
+    const literal = jsString(source, at);
+    if (literal) {
+      at = literal.end;
+      continue;
+    }
+    if (['"', "'", "`"].includes(source[at] ?? "")) return inputs;
+    const token = identifier(source, at);
+    if (!token) {
+      at += 1;
+      continue;
+    }
+    if (["const", "let", "var"].includes(token.value)) {
+      const nameAt = skipSpace(source, token.end);
+      const name = identifier(source, nameAt);
+      const equals = name ? skipSpace(source, name.end) : nameAt;
+      const valueAt = skipSpace(source, equals + 1);
+      if (name && source[equals] === "=") {
+        const value = jsString(source, valueAt);
+        if (value) {
+          variables.set(name.value, value.value);
+          at = value.end;
+          continue;
+        }
+        if (['"', "'", "`"].includes(source[valueAt] ?? "")) return inputs;
+      }
+    } else if (token.value === "tools") {
+      let cursor = skipSpace(source, token.end);
+      if (source[cursor] === ".") cursor = skipSpace(source, cursor + 1);
+      else {
+        at = token.end;
+        continue;
+      }
+      const method = identifier(source, cursor);
+      cursor = method ? skipSpace(source, method.end) : cursor;
+      if (method?.value === "apply_patch" && source[cursor] === "(") {
+        const argumentAt = skipSpace(source, cursor + 1);
+        const argument = jsString(source, argumentAt);
+        if (argument) inputs.push(argument.value);
+        else {
+          if (['"', "'", "`"].includes(source[argumentAt] ?? "")) return inputs;
+          const name = identifier(source, argumentAt);
+          const value = name ? variables.get(name.value) : undefined;
+          if (value !== undefined) inputs.push(value);
+        }
+      }
+    }
+    at = token.end;
+  }
+  return inputs;
+}
+
+function patchPaths(inputs: readonly string[]): string[] {
+  const paths: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of inputs) {
+    if (raw.length > MAX_EDIT_INPUT_CHARS) continue;
+    let inside = false;
+    let pending: string[] = [];
+    let pendingSeen = new Set<string>();
+    for (const line of raw
+      .replace(/\r\n/g, "\n")
+      .replace(/\r/g, "\n")
+      .split("\n")) {
+      if (line === "*** Begin Patch") {
+        inside = true;
+        pending = [];
+        pendingSeen = new Set<string>();
+        continue;
+      }
+      if (line === "*** End Patch") {
+        if (inside) {
+          for (const path of pending) {
+            seen.add(path);
+            paths.push(path);
+          }
+          if (paths.length === MAX_WRITTEN_PATHS) return paths;
+        }
+        inside = false;
+        pending = [];
+        pendingSeen = new Set<string>();
+        continue;
+      }
+      if (!inside || pending.length + paths.length === MAX_WRITTEN_PATHS)
+        continue;
+      const header = PATCH_PATH_HEADERS.find((prefix) =>
+        line.startsWith(prefix),
+      );
+      if (!header) continue;
+      const path = line.slice(header.length);
+      if (!validWrittenPath(path) || seen.has(path) || pendingSeen.has(path))
+        continue;
+      pendingSeen.add(path);
+      pending.push(path);
+    }
+  }
+  return paths;
+}
+
+function writtenPaths(
+  source: string,
+  name: string | null,
+  args: unknown,
+): string[] {
+  if (!isObject(args)) return [];
+  // Code-mode capture sees only the outer exec, not its nested apply_patch.
+  if (
+    name === "exec" &&
+    typeof args.input === "string" &&
+    args.input.length <= MAX_EDIT_INPUT_CHARS
+  )
+    return patchPaths(execApplyPatchInputs(args.input));
+  const filePath = args.file_path;
+  // Claude capture emits file_edit for Edit/Write/NotebookEdit, but not MultiEdit.
+  if (
+    source === "claude" &&
+    name !== null &&
+    typeof filePath === "string" &&
+    normalizedToolName(name) === "multiedit" &&
+    validWrittenPath(filePath)
+  )
+    return [filePath];
+  return [];
+}
+
+function toolCall(payload: Json, toolUse: string | null, source: string) {
   const raw = text(payload, "is_error");
   const isError = ["1", "true"].includes(raw ?? "")
     ? true
@@ -501,7 +745,12 @@ function toolCall(payload: Json, toolUse: string | null) {
       status,
     }).filter(([, value]) => value !== null),
   );
-  return { call, status };
+  return {
+    call,
+    status,
+    writtenPaths:
+      isError === true ? [] : writtenPaths(source, text(payload, "name"), args),
+  };
 }
 
 function activityEvent(
@@ -515,7 +764,7 @@ function activityEvent(
   const ms = activityMs(p);
   const tool =
     kind === "tool_call"
-      ? toolCall(p, nullIfEmpty(text(p, "tool_use_id")))
+      ? toolCall(p, nullIfEmpty(text(p, "tool_use_id")), context.source)
       : null;
   const filePath =
     kind === "file_edit" ? nullIfEmpty(text(p, "file_path")) : null;
@@ -560,7 +809,7 @@ function activityEvent(
     tool_calls: tool ? [tool.call] : [],
     retries: 0,
     duration_ms: null,
-    files_touched: filePath ? [filePath] : [],
+    files_touched: filePath ? [filePath] : (tool?.writtenPaths ?? []),
     code_churn: {},
     delivery_record_id: record.record_id,
     request_key: requestIdentity(kind, p),

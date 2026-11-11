@@ -20,10 +20,12 @@
  * cap (LOGIN_BODY_CAP_BYTES, 413 beyond it) before the app sees it; every
  * other request body is drained, never read.
  */
+import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { Hono } from "hono";
 import { errorFields, log } from "../shared/log.ts";
+import { initScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
 import { createPostgresSearchComposition, type SearchComposition } from "../shared/search-composition.ts";
 import { createOpenSearchSearchComposition } from "../shared/opensearch-composition.ts";
 import { parseCompleteSince } from "./config.ts";
@@ -192,6 +194,7 @@ export async function startReadApiService(
   env: NodeJS.ProcessEnv = process.env,
   options: { host?: string; port?: number; build?: ReadAppBuilder } = {},
 ): Promise<ReadApiService> {
+  readerMaxRuleset(env);
   const config = readApiServiceConfig(env);
   const built = config.enabled ? await (options.build ?? selfhostReadApp)(config.secret, env) : null;
   const tokenRoutes = built !== null && readApiAuthMode(env) === "self_issued";
@@ -241,4 +244,8 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<void>
   process.on("SIGINT", stop);
 }
 
-if (import.meta.main) await serve();
+// SCRUB_ENGINE (docs/scrub-engine.md): select, and for wasm verify the pinned engine, before serving.
+if (import.meta.main) {
+  await initScrubEngine();
+  await serve();
+}

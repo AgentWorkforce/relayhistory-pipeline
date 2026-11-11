@@ -21,6 +21,11 @@
  *                                    clamped). How long an admitted token is reused per process before it is
  *                                    introspected again, also capped at the token's exp: the revocation lag.
  *                                    Recommended 30000-60000 when Control load matters (selfhost-auth.ts).
+ *   RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS
+ *                                    unset | "" | "report" (default) | exactly "enforce"; anything else is a startup
+ *                                    error. The capture policy upload check (capture-policy.ts): report logs an upload
+ *                                    made under a missing or older policy revision (or a session older than a
+ *                                    `sharing_mode: new` policy) and accepts it; enforce refuses it.
  *   SESSION_ERASE_API_ENABLED        operator per-session erase route (session-erase.ts): exactly "1" enables;
  *                                    unset, "" or "0" is off; anything else is a startup error. With it,
  *                                    SESSION_ERASE_API_SECRET (+ _PREVIOUS during a rotation; Secret-injected, min
@@ -42,6 +47,11 @@
  *   INGEST_KEY_ROOT                  object key root, default "96bulls" (same as the Worker)
  *   INGEST_MAX_PER_USER / INGEST_MAX_PER_ORG   in-flight batch slots, defaults 4 / 32 (same as the Worker)
  *   RELAYHISTORY_INGEST_PG_POOL_MAX  pool size, 1..32, default 4
+ *   INGEST_CLAIM_LOCK_BUSY           unset/off (default) | on (any case, trimmed; the Worker's routingFlag, so any
+ *                                    other value is off, as on the Worker): a claim that loses its lock wait
+ *                                    (55P03/40P01) is a 429 delivery_busy with Retry-After 5-10 s instead of a 503
+ *                                    (deliver.ts ClaimLockBusy); 57014 and every other cause stay 503. HTTP only:
+ *                                    the async/drain admission consumer keeps its normal backoff (admission-consumer.ts)
  *
  *   SELFHOST_INGEST_ADMISSION        unset | "" | "sync" (default: today's synchronous path, unchanged) |
  *                                    "async" | "drain" (selfhost-admission.ts). Config only: no request
@@ -54,6 +64,23 @@
  *   SELFHOST_ADMISSION_SCAN_MS       the inbox ListBucket scan interval, 1000..600000, default 15000
  *   SELFHOST_ADMISSION_MAX_ATTEMPTS  attempts before an inbox object is dead-lettered, 1..100, default 20
  *
+ *   HISTORY_UPLOAD_DIRECT            unset | "" | "off" (default) | "allowlist" | "on" (upload-admission.ts,
+ *                                    relay-upload-inbox-v1): the in-process scan of <keyRoot>/.upload-inbox/
+ *                                    promotes desktop-written objects into the admission inbox, and
+ *                                    GET /v1/delivery/admission?uploadKey= answers. Needs async or drain
+ *                                    admission and an INGEST_KEY_ROOT of the contract's form ([a-z0-9][a-z0-9-]{0,62})
+ *   With allowlist only:
+ *   HISTORY_UPLOAD_DIRECT_ALLOWLIST  comma-separated org:<orgId> / ws:<workspaceId>, at least one
+ *   With allowlist or on only:
+ *   UPLOAD_WITNESS_KEY               the witness MAC key (32 bytes, unpadded base64url; Secret-injected). Never
+ *                                    defaulted; missing or malformed leaves every upload pending (retried), never refused
+ *   SELFHOST_UPLOAD_SCAN_BATCH       upload objects promoted per scan, 1..100, default 16 (the scan reuses
+ *                                    SELFHOST_ADMISSION_SCAN_MS)
+ *   HISTORY_UPLOAD_INBOX_SSE         unset | "" | "none" (default: no requirement, e.g. MinIO without KMS) | "aws:kms":
+ *                                    refuse (upload_unencrypted, terminal, before the witness check) an upload object
+ *                                    whose own HEAD/GET lacks x-amz-server-side-encryption: aws:kms. Any other value
+ *                                    refuses startup, even with HISTORY_UPLOAD_DIRECT off
+ *
  *   ANALYTICS_SINK                   unset | "" | "noop" (default: no analytics) | "collector"; "posthog" and any
  *                                    ANALYTICS_POSTHOG_* value refuse startup (src/shared/analytics-config.ts).
  *                                    collector needs ANALYTICS_DEPLOYMENT_ID, ANALYTICS_COLLECTOR_URL (the full
@@ -65,12 +92,18 @@
  * INGEST_CUSTODY_SOURCE other than relayhistory/unset, INGEST_PRIVACY_AUTHORITY other than neon/unset,
  * INGEST_SIGNING_KEY (the relayhistory HMAC is never accepted here).
  */
+import { UPLOAD_CONSENT_VAR, uploadConsentEnforcement, type UploadConsentEnforcement } from "./upload-consent.ts";
+import type { CapturePolicyUploadsMode } from "./capture-policy.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { normalizedAudience } from "@rhc/auth/relaycontrol.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import type pg from "pg";
 import { sessionEraseConfig, type SessionEraseConfig } from "./session-erase.ts";
 import { analyticsConfig, type AnalyticsConfig } from "../shared/analytics-config.ts";
+// Already in the self-host graph through deliver.ts; the same parser as the Worker's INGEST_CLAIM_LOCK_BUSY.
+import { routingFlag } from "./babysitter-retention.ts";
+import { eraseRuntimeSettings } from "../session-erase/flags.ts";
+import { UPLOAD_DIRECT_FLAG, UPLOAD_WITNESS_KEY_VAR, uploadDirectConfig, type UploadDirectConfig } from "./upload-admission.ts";
 
 export const SELFHOST_INGEST_FLAG = "RELAYHISTORY_SELFHOST_INGEST";
 export const SELFHOST_INGEST_PORT_VAR = "RELAYHISTORY_INGEST_PORT";
@@ -87,6 +120,7 @@ export const SELFHOST_INGEST_DEFAULT_PORT = 8081;
 export const SELFHOST_INGEST_ROLE = "bulls96_session_ingest";
 
 export const SELFHOST_INGEST_ADMISSION_VAR = "SELFHOST_INGEST_ADMISSION";
+export const SELFHOST_CLAIM_LOCK_BUSY_VAR = "INGEST_CLAIM_LOCK_BUSY";
 
 /** SELFHOST_INGEST_ADMISSION=async|drain; absent for sync (the default). */
 export interface SelfhostAdmissionSettings {
@@ -111,14 +145,40 @@ export interface SelfhostIngestSettings {
   sessionSelection: boolean;
   /** RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT: answer the Desktop's onboarding heartbeat 204 (discarded). Default off. */
   heartbeatAccept: boolean;
+  /** RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: the capture policy upload check (capture-policy.ts). Default report. */
+  capturePolicyUploads: CapturePolicyUploadsMode;
+  /** INGEST_UPLOAD_CONSENT (upload-consent.ts): off (default) | report | hold-only | enforce. */
+  uploadConsent: UploadConsentEnforcement;
   /** RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS: positive introspection cache, ms. 0 (default) = none. */
   introspectPositiveTtlMs: number;
   /** SESSION_ERASE_API_ENABLED (session-erase.ts). Default: disabled, the route answers 501. */
   sessionErase: SessionEraseConfig;
+  eraseFenceEnforced?: true;
+  eraseBytesEnabled?: true;
   /** Present only for SELFHOST_INGEST_ADMISSION=async|drain. */
   admission?: SelfhostAdmissionSettings;
+  /** HISTORY_UPLOAD_DIRECT allowlist|on (upload-admission.ts). Absent: off, nothing reads the upload prefix. */
+  uploadDirect?: SelfhostUploadDirectSettings;
   /** ANALYTICS_* (src/shared/analytics-config.ts, self-host profile: noop or collector). Absent = noop. */
   analytics?: AnalyticsConfig;
+  /** INGEST_CLAIM_LOCK_BUSY=on: a claim lock-wait failure is a 429 with Retry-After. Absent (the default): 503. */
+  claimLockBusy?: true;
+}
+
+/** HISTORY_UPLOAD_DIRECT=allowlist|on. `witnessKey` is passed through raw: promoteUpload treats missing or malformed as retry. */
+export interface SelfhostUploadDirectSettings {
+  config: UploadDirectConfig;
+  witnessKey: string | undefined;
+  scanBatch: number;
+}
+
+/** HISTORY_UPLOAD_DIRECT: absent when off. On needs async/drain admission and a contract-form key root. */
+export function selfhostUploadDirectSettings(env: NodeJS.ProcessEnv, keyRoot: string, admission: SelfhostAdmissionSettings | undefined): SelfhostUploadDirectSettings | undefined {
+  const config = uploadDirectConfig(env);
+  if (config.mode === "off") return undefined;
+  if (!admission) throw new Error(`96bulls: ${UPLOAD_DIRECT_FLAG} needs ${SELFHOST_INGEST_ADMISSION_VAR}=async or drain`);
+  if (!/^[a-z0-9][a-z0-9-]{0,62}$/u.test(keyRoot)) throw new Error(`96bulls: ${UPLOAD_DIRECT_FLAG} needs INGEST_KEY_ROOT of the form [a-z0-9][a-z0-9-]{0,62}`);
+  return { config, witnessKey: env[UPLOAD_WITNESS_KEY_VAR], scanBatch: bounded(env, "SELFHOST_UPLOAD_SCAN_BATCH", 16, 1, 100) };
 }
 
 export type SelfhostIngestConfig = { enabled: false; port: number } | ({ enabled: true } & SelfhostIngestSettings);
@@ -137,6 +197,16 @@ export function selfhostSessionSelectionEnabled(env: NodeJS.ProcessEnv = process
   if (raw === undefined || raw === "" || raw === "false") return false;
   if (raw === "true") return true;
   throw new Error(`96bulls: ${SELFHOST_SESSION_SELECTION_FLAG} must be true or false`);
+}
+
+export const SELFHOST_CAPTURE_POLICY_UPLOADS_VAR = "RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS";
+
+/** Unset, empty or "report" is report (the default); "enforce" enforces; anything else throws. */
+export function selfhostCapturePolicyUploads(env: NodeJS.ProcessEnv = process.env): CapturePolicyUploadsMode {
+  const raw = env[SELFHOST_CAPTURE_POLICY_UPLOADS_VAR];
+  if (raw === undefined || raw === "" || raw === "report") return "report";
+  if (raw === "enforce") return "enforce";
+  throw new Error(`96bulls: ${SELFHOST_CAPTURE_POLICY_UPLOADS_VAR} must be report or enforce`);
 }
 
 /** Exactly "true" enables; unset, empty or "false" is off; anything else throws (a typo never silently means either). */
@@ -236,6 +306,8 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   if (!selfhostIngestEnabled(env)) return { enabled: false, port: port(env) };
   const sessionSelection = selfhostSessionSelectionEnabled(env);
   const heartbeatAccept = selfhostHeartbeatAcceptEnabled(env);
+  const capturePolicyUploads = selfhostCapturePolicyUploads(env);
+  const uploadConsent = uploadConsentEnforcement(env[UPLOAD_CONSENT_VAR]);
   const introspectPositiveTtlMs = selfhostIntrospectPositiveTtlMs(env);
   const sessionErase = sessionEraseConfig(env);
   const policy = destinationPolicy(env);
@@ -255,7 +327,10 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   const keyRoot = env.INGEST_KEY_ROOT?.trim() || "96bulls";
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u.test(keyRoot)) throw new Error("96bulls: INGEST_KEY_ROOT must be a single key segment");
   const admission = selfhostAdmissionSettings(env);
+  const eraseRuntime = eraseRuntimeSettings(env, sessionErase, admission);
+  const uploadDirect = selfhostUploadDirectSettings(env, keyRoot, admission);
   const analytics = analyticsConfig(env, "selfhost");
+  const claimLockBusy = routingFlag(env[SELFHOST_CLAIM_LOCK_BUSY_VAR]);
   return {
     enabled: true,
     port: port(env),
@@ -268,9 +343,14 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     maxPerOrg: bounded(env, "INGEST_MAX_PER_ORG", 32, 1, 1000),
     sessionSelection,
     heartbeatAccept,
+    capturePolicyUploads,
+    uploadConsent,
     introspectPositiveTtlMs,
     sessionErase,
+    ...eraseRuntime,
     ...(admission ? { admission } : {}),
+    ...(uploadDirect ? { uploadDirect } : {}),
     ...(analytics.sink !== "noop" ? { analytics } : {}),
+    ...(claimLockBusy ? { claimLockBusy: true as const } : {}),
   };
 }

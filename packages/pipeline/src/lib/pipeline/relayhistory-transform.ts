@@ -9,6 +9,7 @@
  * (`relayhistory-projection.ts`). The resulting object is content-addressed by
  * the raw manifest digest; a later manifest cannot overwrite an earlier result.
  */
+import { assertReaderScrubMarker, readerChunkBody } from "../scrub-engine/reader-policy.js";
 import { sha256Hex } from "../../../../object-store/src/crypto.js";
 import {
   isObjectStoreError,
@@ -47,7 +48,7 @@ import type {
 } from "./stages.js";
 
 /** Bump with any change to the bytes projected from the same input: the object is create-only. */
-export const RELAYHISTORY_NORMALIZED_VERSION = 2;
+export const RELAYHISTORY_NORMALIZED_VERSION = 3;
 export const RELAYHISTORY_EXPORT_EXTENSION = "client.relayhistory_export";
 const MAX_RELAYHISTORY_CHUNK_BYTES = 16 * 1024 * 1024;
 /** Everything is held in memory to fold it, so a session past this is refused. */
@@ -438,7 +439,7 @@ export async function readRelayhistoryExport(
   manifest: ManifestV1,
   store: ObjectStore,
   decompress?: ZstdDecompress,
-  options: { maxSessionBytes?: number; prefix?: string } = {},
+  options: { maxSessionBytes?: number; prefix?: string; readerMaxRuleset?: number } = {},
 ): Promise<RelayhistoryStreamRecord[]> {
   const maxSessionBytes =
     options.maxSessionBytes ?? MAX_RELAYHISTORY_SESSION_BYTES;
@@ -448,6 +449,7 @@ export async function readRelayhistoryExport(
       "relayhistory_export_quarantined",
       "RelayHistory export is not scrubbed",
     );
+  assertReaderScrubMarker(manifest.raw.scrub, options.readerMaxRuleset);
   if (manifest.raw.format !== "ndjson")
     fail("relayhistory_export_format", "RelayHistory export must use ndjson");
   const declared = manifest.raw.chunks.reduce(
@@ -490,7 +492,7 @@ export async function readRelayhistoryExport(
     );
     let stored: Uint8Array | null;
     try {
-      stored = await readCapped(await store.get(key), chunk.stored_bytes);
+      stored = await readCapped(await readerChunkBody(await store.getObject(key), manifest.raw.scrub, options.readerMaxRuleset), chunk.stored_bytes);
     } catch (error) {
       if ((error as { code?: unknown } | null)?.code === "not_found")
         throw new PipelineError(
@@ -679,6 +681,7 @@ export class RelayhistoryExportTransform implements SessionTransform {
       store: ObjectStore;
       decompress?: ZstdDecompress;
       maxSessionBytes?: number;
+      readerMaxRuleset?: number;
     },
   ) {}
 
@@ -709,6 +712,7 @@ export class RelayhistoryExportTransform implements SessionTransform {
         ...(this.deps.maxSessionBytes !== undefined
           ? { maxSessionBytes: this.deps.maxSessionBytes }
           : {}),
+        readerMaxRuleset: this.deps.readerMaxRuleset,
         ...(prefix ? { prefix } : {}),
       },
     );

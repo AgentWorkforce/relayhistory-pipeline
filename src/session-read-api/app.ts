@@ -1,4 +1,4 @@
-import { BriefSummaryError, briefSummaryResponse, type BriefSummary } from "./brief-summary.ts";
+import { BriefSummaryError, briefSummaryResponse, summaryActivityDays, type BriefSummary } from "./brief-summary.ts";
 /**
  * The session read API: an API-compatible subset of relayhistory's /v1 read
  * contract (packages/relayhistory/src/routes/recall.ts), served from ClickHouse
@@ -29,6 +29,9 @@ import { BriefSummaryError, briefSummaryResponse, type BriefSummary } from "./br
  * Directory routes (P3b, docs in src/session-read-api/directory.ts):
  *   GET /v1/sessions                session list without `q`, from the Supabase directory
  *   GET /v1/sessions/activity       sessions per UTC day without `q` (span semantics)
+ *   GET /v1/sessions/summaries/activity  ready native summaries per UTC day (counts only;
+ *                                   brief-summary.ts, migration 20261105056000)
+ *   GET /v1/sessions/users          per-user session counts (one aggregate, migration 20261105057000)
  * Both answer 501 `directory_workspace_not_enabled` unless the token's workspace is on
  * READ_API_DIRECTORY_WORKSPACES (the canary allowlist; unset = none), and 501
  * `directory_not_migrated` until migration 20261105034000 is applied. Never Neon.
@@ -45,6 +48,9 @@ import { BriefSummaryError, briefSummaryResponse, type BriefSummary } from "./br
  *                                   READ_API_DIGEST_BACKEND) + the directory, narrative from the
  *                                   Supabase cache / narrative Worker (digest-narrative.ts), off
  *                                   unless READ_API_DIGEST_ENABLED=1 (deps.digest), same allowlist.
+ *   GET /v1/coordination/overlaps   deterministic overlap findings from those same facts, off
+ *                                   unless READ_API_COORDINATION_OVERLAPS_ENABLED=true, same
+ *                                   auth, workspace/project scope, readiness and allowlist.
  *   GET /v1/sessions/titles         cached brief titles of up to 100 `key=<source>:<sessionId>`
  *                                   keys, from Supabase session_briefs (brief-titles.ts). Its
  *                                   own allowlist, READ_API_BRIEF_TITLES_WORKSPACES (unset = none,
@@ -82,13 +88,17 @@ import { EvidenceRequestError, readBabysitterEvidence, type EvidenceDeps } from 
 import { MAX_TURN_HARNESSES, TurnsInputError, metadataResponse, turnRows, turnsResponse, type HarnessState } from "./session-turns-source.ts";
 import { clickhouseOutputBackend, type OutputBackend } from "./output-backend.ts";
 import { clickhouseDigestBackend, type DigestBackend } from "./digest-backend.ts";
+import { COORDINATION_EVIDENCE_LOOKBACK_MS, clickhouseCoordinationBackend, type CoordinationBackend } from "./coordination-backend.ts";
+import { detectCoordination } from "../../packages/coordination-detect/src/index.ts";
 import { READ_SETTINGS } from "./queries.ts";
 import { DigestInputError, resolveDayWindow } from "./day-window.ts";
 import { DIGEST_OMITTED_FIELDS, DigestDirectoryUnavailable, computeStatsHash } from "./digest-query.ts";
 import { resolveDigestNarrative, type DigestNarrativeDeps } from "./digest-narrative.ts";
 import {
   DIRECTORY_LIST_MAX_LIMIT,
+  DIRECTORY_USERS_MAX,
   DirectoryError,
+  activityDates,
   activityDays,
   decodeCompositeListCursor,
   decodeListCursor,
@@ -98,11 +108,13 @@ import {
   LIST_CURSOR_PREFIX,
   QUERY_CURSOR_PREFIX,
   sessionFromDirectoryRow,
+  sessionUsersPage,
   type BufferedListCursor,
   type DirectoryCursor,
   type Directory,
   type DirectoryListArgs,
   type DirectoryListRow,
+  type DirectoryListMetadata,
 } from "./directory.ts";
 import { droppedTotal, type BufferedSearchGate } from "./buffered-search-gate.ts";
 import { parseSessionQuery, queryFingerprint, type SessionQueryTerms } from "./list-query.ts";
@@ -173,6 +185,8 @@ export class AuthError extends Error {
 }
 
 export interface ReadApiDeps {
+  /** Self-host SESSION_ERASE_FENCE_ENFORCED=1 only; pre/post IO gate for exact session routes. */
+  operatorErased?: (key: { orgId: string; workspaceId: string; source: string; sessionId: string }) => Promise<boolean>;
   verify: Verifier;
   ch?: ClickHouseClient;
   adapter?: SearchServiceBinding;
@@ -216,6 +230,8 @@ export interface ReadApiDeps {
    * `digest_not_configured`.
    */
   digest?: DigestNarrativeDeps & { backend?: DigestBackend };
+  /** READ_API_COORDINATION_OVERLAPS_ENABLED=true: on-request deterministic findings. */
+  coordination?: { enabled: boolean; backend?: CoordinationBackend };
   /** Service-only verified canonical object reads for exact sessions outside search retention. */
   canonicalEvents?: CanonicalEventsDeps;
   /** Babysitter evidence reader (babysitter-evidence.ts); absent = 501 `delivery_records_not_configured`. */
@@ -324,6 +340,8 @@ const MAX_LIST_ID_LENGTH = 255;
 const MAX_AGENT_LENGTH = 200;
 const HARNESS_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 /** Session-list parameters the directory cannot answer: event or text questions. */
+/** The only parameters GET /v1/sessions/users reads; any other is not silently ignored (501). */
+const SESSION_USERS_PARAMS: ReadonlySet<string> = new Set(["workspace", "lastTsAfter", "lastTsBefore"]);
 const LIST_UNSUPPORTED_PARAMS = ["q", "search", "project", "noProject", "kind", "taskRef", "noTaskRef", "tag", "since", "until"];
 
 /** relayhistory lib/recall.ts limits. */
@@ -622,6 +640,23 @@ export function createReadApi(deps: ReadApiDeps) {
   };
 
   const pageDeps = () => ({ ch: deps.ch, adapter: deps.adapter, completeSinceMs: deps.completeSinceMs, liveness: deps.liveness, timeoutMs: deps.timeoutMs, bufferedGate: deps.bufferedSearchGate });
+
+  if (deps.operatorErased) app.use("/v1/sessions/:sessionId/*", async (c, next) => {
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      const sources = c.req.queries("source") ?? [];
+      const source = sources[0], sessionId = c.req.param("sessionId");
+      // Let each route retain its validation errors for malformed/ambiguous keys.
+      if (sources.length !== 1 || !source || !HARNESS_NAME.test(source) || !sessionId || sessionId.length > MAX_ID_CHARS) return next();
+      const key = { orgId: identity.orgId, workspaceId: identity.workspaceId, source, sessionId };
+      const notFound = () => fail(c, new HttpError(404, "not_found", "Session not found"));
+      if (await deps.operatorErased!(key)) return notFound();
+      await next();
+      // A fence that committed during object/model IO wins before any successful payload leaves.
+      if (c.res.status >= 200 && c.res.status < 300 && await deps.operatorErased!(key)) c.res = notFound();
+    } catch (error) { return fail(c, error instanceof HttpError ? error : new HttpError(503, "backend_unavailable", "read backend unavailable")); }
+  });
 
   /** Gate telemetry: two integer counts only (checked, and the per-reason drops summed), never ids or content. */
   async function gatedPage(c: Context, input: EventQuery) {
@@ -943,7 +978,7 @@ export function createReadApi(deps: ReadApiDeps) {
   });
 
   /** The P3 canary allowlist (READ_API_DIRECTORY_WORKSPACES), shared by the directory and timing routes. */
-  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "analysis" | "output" | "digest" | "catalog" | "login" | "summary"): void {
+  function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "analysis" | "output" | "digest" | "coordination" | "catalog" | "login" | "summary"): void {
     const allowed = deps.directoryWorkspaces;
     if (!allowed || (allowed !== "*" && !allowed.has(identity.workspaceId))) throw unsupported(`${route}_workspace_not_enabled`);
   }
@@ -988,7 +1023,7 @@ export function createReadApi(deps: ReadApiDeps) {
   async function bufferedListPage(
     c: Context, identity: VerifiedIdentity, ob: OwnerBufferedDeps,
     canonicalRows: Array<DirectoryListRow & { cursor_ts?: string }>,
-    q: { limit: number; sources: string[]; notSources: string[]; bounds: Record<"lastTsAfter" | "lastTsBefore" | "firstTsAfter" | "firstTsBefore", Date | undefined> },
+    q: { limit: number; sources: string[]; notSources: string[]; bounds: Record<"lastTsAfter" | "lastTsBefore" | "firstTsAfter" | "firstTsBefore", Date | undefined>; metadata: DirectoryListMetadata },
   ) {
     directoryPage(canonicalRows, identity, q.limit); // tenant and shape checks, as the canonical-only page
     const canonical = canonicalRows.map((r) => {
@@ -1042,7 +1077,7 @@ export function createReadApi(deps: ReadApiDeps) {
     if (fenced) c.header(BUFFERED_HEADER, "fenced");
     if (bufferedItems.length) c.header(BUFFERED_IDS_HEADER, bufferedIdsHeader(bufferedItems));
     return {
-      sessions: merged.items.map((i) => (i.kind === "canonical" ? sessionFromDirectoryRow(i.row) : bufferedSessionSummary(i.row, identity.userId))),
+      sessions: merged.items.map((i) => (i.kind === "canonical" ? sessionFromDirectoryRow(i.row, q.metadata) : bufferedSessionSummary(i.row, identity.userId))),
       nextCursor,
     };
   }
@@ -1082,6 +1117,10 @@ export function createReadApi(deps: ReadApiDeps) {
       attestWorkspace(c, identity);
       // A workspace off the canary allowlist always falls back, whatever it asked.
       const directory = directoryFor(identity);
+      const includeAgentName = single(c, "includeAgentName");
+      if (includeAgentName !== undefined && includeAgentName !== "recorded") throw bad("includeAgentName must be recorded");
+      if (includeAgentName !== undefined && !deps.selfhost) throw unsupported("param_includeAgentName");
+      const metadata: DirectoryListMetadata = includeAgentName === "recorded" ? { includeAgentName } : {};
       const queryOn = deps.sessionQuery === true;
       for (const p of LIST_UNSUPPORTED_PARAMS) if (!(queryOn && (p === "q" || p === "search")) && c.req.queries(p)?.length) throw unsupported(`param_${p}`);
       const terms = queryOn ? sessionQueryTerms(c, "list") : undefined;
@@ -1136,7 +1175,7 @@ export function createReadApi(deps: ReadApiDeps) {
         if (qCursor) args.cursor = { lastActivityAt: qCursor.lastActivityAt, sessionId: qCursor.sessionId, harness: qCursor.harness };
         const rows = await directory.query(identity.orgId, identity.workspaceId, { ...args, terms });
         if (rows === null) throw unsupported("directory_not_migrated");
-        const page = directoryPage(rows, identity, limit, fingerprint);
+        const page = directoryPage(rows, identity, limit, fingerprint, metadata);
         return c.json({ sessions: page.sessions, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
       }
       // With q on, a `b96q1:` cursor belongs to a q read only.
@@ -1150,31 +1189,37 @@ export function createReadApi(deps: ReadApiDeps) {
       const rows = await directory.list(identity.orgId, identity.workspaceId, args);
       if (rows === null) throw unsupported("directory_not_migrated");
       if (withBuffered) {
-        const union = await bufferedListPage(c, identity, ob, rows, { limit, sources, notSources, bounds });
+        const union = await bufferedListPage(c, identity, ob, rows, { limit, sources, notSources, bounds, metadata });
         return c.json({ sessions: union.sessions, nextCursor: union.nextCursor, correlationId: c.get("correlationId") });
       }
-      const page = directoryPage(rows, identity, limit);
+      const page = directoryPage(rows, identity, limit, undefined, metadata);
       return c.json({ sessions: page.sessions, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
     } catch (error) {
       return directoryFail(c, error);
     }
   });
 
+  /** since/until of the activity routes: both required, ordered, at most MAX_SESSION_ACTIVITY_DAYS UTC days. */
+  function activityWindow(c: Context): { since: Date; until: Date } {
+    const rawSince = single(c, "since");
+    const rawUntil = single(c, "until");
+    if (!rawSince || !rawUntil) throw bad("since and until are required");
+    const sinceMs = parseTime(rawSince, "since")!;
+    const untilMs = parseTime(rawUntil, "until")!;
+    if (untilMs < sinceMs) throw bad("until must not be earlier than since");
+    const since = new Date(sinceMs);
+    const until = new Date(untilMs);
+    const days = Math.round((Date.UTC(until.getUTCFullYear(), until.getUTCMonth(), until.getUTCDate()) - Date.UTC(since.getUTCFullYear(), since.getUTCMonth(), since.getUTCDate())) / 86_400_000) + 1;
+    if (days > MAX_SESSION_ACTIVITY_DAYS) throw bad(`since and until may span at most ${MAX_SESSION_ACTIVITY_DAYS} UTC days`);
+    return { since, until };
+  }
+
   app.get("/v1/sessions/activity", async (c) => {
     try {
       const identity = c.get("identity");
       attestWorkspace(c, identity);
       const directory = directoryFor(identity);
-      const rawSince = single(c, "since");
-      const rawUntil = single(c, "until");
-      if (!rawSince || !rawUntil) throw bad("since and until are required");
-      const sinceMs = parseTime(rawSince, "since")!;
-      const untilMs = parseTime(rawUntil, "until")!;
-      if (untilMs < sinceMs) throw bad("until must not be earlier than since");
-      const since = new Date(sinceMs);
-      const until = new Date(untilMs);
-      const days = Math.round((Date.UTC(until.getUTCFullYear(), until.getUTCMonth(), until.getUTCDate()) - Date.UTC(since.getUTCFullYear(), since.getUTCMonth(), since.getUTCDate())) / 86_400_000) + 1;
-      if (days > MAX_SESSION_ACTIVITY_DAYS) throw bad(`since and until may span at most ${MAX_SESSION_ACTIVITY_DAYS} UTC days`);
+      const { since, until } = activityWindow(c);
       if (deps.sessionQuery === true) {
         const terms = sessionQueryTerms(c, "activity");
         if (terms) {
@@ -1192,6 +1237,70 @@ export function createReadApi(deps: ReadApiDeps) {
       const rows = await directory.activity(identity.orgId, identity.workspaceId, since, until);
       if (rows === null) throw unsupported("directory_not_migrated");
       return c.json({ since: since.toISOString(), until: until.toISOString(), days: activityDays(rows, since, until), correlationId: c.get("correlationId") });
+    } catch (error) {
+      return directoryFail(c, error);
+    }
+  });
+
+  /**
+   * GET /v1/sessions/summaries/activity: ready native session summaries per UTC day, from the
+   * same source GET /v1/sessions/:id/summary reads (sessions.session_briefs through
+   * session_summary_activity_for, 056000). Same workspace attestation, canary and since/until
+   * rules as /v1/sessions/activity. Counts only. 501 where the summary read is not
+   * configured (directory/self-host entries) or 056000 is not applied.
+   */
+  app.get("/v1/sessions/summaries/activity", async (c) => {
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      requireCanary(identity, "summary");
+      for (const name of Object.keys(c.req.query())) if (!["workspace", "since", "until"].includes(name)) throw unsupported(`param_${name}`);
+      const { since, until } = activityWindow(c);
+      if (!deps.briefSummary?.activity) throw unsupported("summary_not_configured");
+      const rows = await deps.briefSummary.activity(identity.orgId, identity.workspaceId, since, until);
+      if (rows === null) throw unsupported("summary_activity_not_migrated");
+      return c.json({ since: since.toISOString(), until: until.toISOString(), days: summaryActivityDays(rows, activityDates(since, until)) });
+    } catch (error) {
+      if (error instanceof BriefSummaryError) {
+        if (error.reason === "invalid_argument") return fail(c, bad("invalid since/until"));
+        return c.json({ error: { code: "backend_unavailable", message: "read backend unavailable" }, correlationId: c.get("correlationId") }, 503);
+      }
+      return fail(c, error);
+    }
+  });
+
+  /**
+   * GET /v1/sessions/users?workspace=&lastTsAfter=&lastTsBefore=: per-user session counts for
+   * the owner-only Usage "People" table, one bounded aggregate instead of paging the list.
+   * Counts the directory sessions GET /v1/sessions lists for the same lastTsAfter/lastTsBefore
+   * (last activity >= after and < before; erased sessions never), once per user id of each
+   * session, with the latest activity and up to 3 project ids. At most DIRECTORY_USERS_MAX
+   * users, sessions desc then user id; `truncated` when there were more. Both bounds are
+   * required and span at most MAX_SESSION_ACTIVITY_DAYS UTC days, as /v1/sessions/activity.
+   * Owner-buffered (unpublished) sessions are not in the directory and are not counted.
+   * 501 `directory_not_migrated` until migration 20261105057000 is applied, and
+   * `directory_users_not_supported` on a backend without the aggregate.
+   */
+  app.get("/v1/sessions/users", async (c) => {
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      const directory = directoryFor(identity);
+      for (const name of Object.keys(c.req.queries()))
+        if (!SESSION_USERS_PARAMS.has(name)) throw unsupported(`param_${name}`);
+      const rawAfter = single(c, "lastTsAfter");
+      const rawBefore = single(c, "lastTsBefore");
+      if (!rawAfter || !rawBefore) throw bad("lastTsAfter and lastTsBefore are required");
+      const after = new Date(parseTime(rawAfter, "lastTsAfter")!);
+      const before = new Date(parseTime(rawBefore, "lastTsBefore")!);
+      if (after > before) throw bad("an *After bound must not be later than its *Before bound");
+      const days = Math.round((Date.UTC(before.getUTCFullYear(), before.getUTCMonth(), before.getUTCDate()) - Date.UTC(after.getUTCFullYear(), after.getUTCMonth(), after.getUTCDate())) / 86_400_000) + 1;
+      if (days > MAX_SESSION_ACTIVITY_DAYS) throw bad(`lastTsAfter and lastTsBefore may span at most ${MAX_SESSION_ACTIVITY_DAYS} UTC days`);
+      if (!directory.users) throw unsupported("directory_users_not_supported");
+      const rows = await directory.users(identity.orgId, identity.workspaceId, after, before, DIRECTORY_USERS_MAX);
+      if (rows === null) throw unsupported("directory_not_migrated");
+      const page = sessionUsersPage(rows, DIRECTORY_USERS_MAX);
+      return c.json({ lastTsAfter: after.toISOString(), lastTsBefore: before.toISOString(), users: page.users, truncated: page.truncated });
     } catch (error) {
       return directoryFail(c, error);
     }
@@ -1527,6 +1636,87 @@ export function createReadApi(deps: ReadApiDeps) {
       });
     } catch (error) {
       if (error instanceof DigestDirectoryUnavailable) return fail(c, unsupported("digest_directory_unavailable"));
+      if (error instanceof DirectoryError) return directoryFail(c, error);
+      return fail(c, error);
+    }
+  });
+
+  /**
+   * Deterministic coordination findings from the same facts and readiness authority as the
+   * digest. Incomplete facts are an honest 200 with partial/unknown coverage, never findings
+   * presented as exhaustive. No transcript body is read or returned.
+   */
+  app.get("/v1/coordination/overlaps", async (c) => {
+    if (deps.coordination?.enabled !== true)
+      return c.json({ error: "coordination_overlaps_disabled" }, 404);
+    try {
+      const identity = c.get("identity");
+      attestWorkspace(c, identity);
+      requireCanary(identity, "coordination");
+      const now = Date.now();
+      const untilRaw = single(c, "until");
+      const sinceRaw = single(c, "since");
+      const untilMs = untilRaw === undefined ? now : parseTime(untilRaw, "until")!;
+      const sinceMs = sinceRaw === undefined ? untilMs - 7 * 24 * 60 * 60 * 1_000 : parseTime(sinceRaw, "since")!;
+      if (sinceMs >= untilMs) throw bad("since must be before until");
+      if (untilMs - sinceMs > 31 * 24 * 60 * 60 * 1_000) throw bad("window must not exceed 31 days");
+      const limitRaw = single(c, "limit");
+      const limit = limitRaw === undefined ? 50 : Number(limitRaw);
+      if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw bad("limit must be an integer from 1 to 200");
+      const projectId = single(c, "project")?.trim() || null;
+      const since = new Date(sinceMs), until = new Date(untilMs);
+      const backend = deps.coordination.backend ?? (deps.ch ? clickhouseCoordinationBackend(deps.ch, deps.liveness) : undefined);
+      if (!backend) throw new HttpError(503, "backend_unavailable", "read backend unavailable");
+      const opts = { settings: { ...READ_SETTINGS }, timeoutMs: deps.timeoutMs ?? 3_000 };
+      let readiness: Awaited<ReturnType<CoordinationBackend["windowReadiness"]>> = "ready";
+      let schemaMissing = false;
+      try {
+        const evidenceSince = new Date(since.getTime() - COORDINATION_EVIDENCE_LOOKBACK_MS);
+        readiness = await backend.windowReadiness(identity.orgId, identity.workspaceId, evidenceSince, until, { ...opts, untilExclusive: true });
+      } catch (error) {
+        if (backend.isSchemaMissing(error)) schemaMissing = true;
+        else throw error;
+      }
+      let facts = { lanes: [], sessionsTruncated: 0, notes: [] } as Awaited<ReturnType<CoordinationBackend["readFacts"]>>;
+      if (!schemaMissing) {
+        try {
+          facts = await backend.readFacts(deps.directory, {
+            orgId: identity.orgId, workspaceId: identity.workspaceId, since, until, projectId,
+          }, opts);
+        } catch (error) {
+          if (backend.isSchemaMissing(error)) schemaMissing = true;
+          else throw error;
+        }
+      }
+      const notes = [
+        ...(schemaMissing ? ["coordination facts schema is unavailable"] : []),
+        ...(readiness === "ready" ? [] : [`facts readiness: ${readiness}`]),
+        ...facts.notes,
+      ];
+      const status = schemaMissing ? "unknown" as const
+        : readiness !== "ready" || facts.sessionsTruncated > 0 || facts.notes.some((n) => n.includes("directory unavailable")) ? "partial" as const
+        : "complete" as const;
+      const detected = detectCoordination({
+        workspaceId: identity.workspaceId,
+        window: { since: since.toISOString(), until: until.toISOString() },
+        lanes: facts.lanes,
+      }, { limit });
+      log({ route: c.req.routePath, reason: "coordination_overlaps_served", coverage: status, findings: detected.findings.length, correlation_id: c.get("correlationId") });
+      return c.json({
+        contract: "coordination-overlaps/1",
+        window: { since: since.toISOString(), until: until.toISOString() },
+        generatedAt: new Date().toISOString(),
+        detector: detected.detector,
+        coverage: {
+          status,
+          sessionsConsidered: facts.lanes.length,
+          sessionsTruncated: facts.sessionsTruncated,
+          notes: [...new Set(notes)],
+        },
+        summary: detected.summary,
+        findings: detected.findings,
+      });
+    } catch (error) {
       if (error instanceof DirectoryError) return directoryFail(c, error);
       return fail(c, error);
     }

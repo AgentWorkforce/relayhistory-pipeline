@@ -4,8 +4,18 @@ import { fileURLToPath } from "node:url";
 const script = fileURLToPath(new URL("../../../scripts/backfill-ingest-claim-sessions.ts", import.meta.url));
 async function refused(args: string[], stdin = "{}") {
   const child = Bun.spawn([process.execPath, script, ...args], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-  child.stdin.write(stdin);
-  child.stdin.end();
+  // The CLI refuses before reading stdin, so it may already have exited; EPIPE on write/end is the expected outcome.
+  const ignoreEpipe = (error: unknown) => {
+    if ((error as { code?: unknown }).code !== "EPIPE") throw error;
+  };
+  try {
+    const written = child.stdin.write(stdin) as unknown;
+    if (written instanceof Promise) await written.catch(ignoreEpipe);
+    const ended = child.stdin.end() as unknown;
+    if (ended instanceof Promise) await ended.catch(ignoreEpipe);
+  } catch (error) {
+    ignoreEpipe(error);
+  }
   const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
   expect(code).toBe(1);
   expect(stderr).toBe("");

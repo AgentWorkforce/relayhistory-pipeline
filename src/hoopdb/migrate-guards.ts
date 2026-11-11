@@ -406,6 +406,7 @@ export const RUNTIME_APPLICATION_FUNCTIONS = [
  */
 export const CONSUMER_RUNTIME_FUNCTIONS_ROLE = "search_consumer_runtime";
 export const CONSUMER_RUNTIME_FUNCTIONS = [
+  "sessions.ingest_operator_runtime_upsert(jsonb,text,text)",
   "sessions.output_facts_erase(text,text,text,text[])",
   "sessions.output_facts_reconcile(text,text,text,text[],text,jsonb,jsonb,boolean,bigint)",
   "sessions.output_facts_record_state(text,text,text,text[],text,boolean,timestamp with time zone,timestamp with time zone,bigint,timestamp with time zone)",
@@ -1208,11 +1209,12 @@ async function adoptableIndex(
   const x = declared?.find((d) => d.name === name);
   if (!declared || !x) return false;
   const replaces = ADOPTABLE_INDEX_STEPS[step]?.replaces ?? [];
+  const creates = ADOPTABLE_INDEX_STEPS[step]?.creates ?? [];
   if (
     !inventory.every((o) =>
       o.kind === "index"
         ? declared.some((d) => d.name === o.name)
-        : o.kind === "function" && replaces.includes(o.name),
+        : o.kind === "function" && (replaces.includes(o.name) || creates.includes(o.name)),
     )
   )
     return false;
@@ -1467,11 +1469,12 @@ export async function sequencePreflight(
       applied = true; // can't look: fail closed, as if the step had run
     }
     // An index-only adoptable step's sentinel is its declared indexes: accepted only when every one
-    // is adoptable. A step that also replaces functions has a body sentinel, never overridden by
-    // index adoption; only its exactBodies (byte-identical to the file, declared attributes) set it aside.
+    // is adoptable. A step that creates or replaces functions has a function sentinel, never overridden
+    // by index adoption; only declared replacement exactBodies may set that sentinel aside.
     const declared = ADOPTABLE_INDEXES[names[i]!];
     const replacesFunctions = (ADOPTABLE_INDEX_STEPS[names[i]!]?.replaces.length ?? 0) > 0;
-    if (applied && declared?.length && !replacesFunctions) {
+    const createsFunctions = (ADOPTABLE_INDEX_STEPS[names[i]!]?.creates?.length ?? 0) > 0;
+    if (applied && declared?.length && !replacesFunctions && !createsFunctions) {
       const inventory = inventoryOf(sql[i]!);
       let all = true;
       for (const d of declared)
@@ -1570,7 +1573,7 @@ export const SESSIONS_FUNCTION_EVENT_TRIGGER_TAGS: readonly string[] =
  * `__RUNTIME_ROLE__`: exactly the reviewed body in the bootstrap file.
  */
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROSRC_SHA256 =
-  "d198f60237ff06fbbe5b7fb50d04a8943d444c5a095848d0d6843f97982e2342";
+  "b4f83cad0e082d366f24923708d44307f5ce3aeb5d2c3ad3a7480ae67aafceb4";
 export const SESSIONS_FUNCTION_EVENT_TRIGGER_PROCONFIG: readonly string[] =
   Object.freeze(["search_path=pg_catalog, pg_temp"]);
 const RUNTIME_LITERAL = /v_runtime text := '([a-z_][a-z0-9_]{0,62})';/g;
@@ -2069,22 +2072,34 @@ export async function sessionsFunctionAclManifest(): Promise<
  * transaction, after the runtime application ACL is installed): every sessions
  * function's ACL must equal the manifest, plus `<runtime role>:EXECUTE` on
  * RUNTIME_APPLICATION_FUNCTIONS. Returns the differences (empty when exact).
+ * `heldSql` (release target with held steps): the manifest is scoped to the prefix
+ * by dropping only the entries a held step creates and the catalog does not have yet.
  */
 export async function sessionsFunctionAclDrift(
   client: GuardClient,
   runtimeRole: string,
+  heldSql: readonly string[] = [],
 ): Promise<string[]> {
   const manifest = await sessionsFunctionAclManifest();
   const runtimeFunctions = runtimeApplicationAclCatalog().functions;
-  const expected: Record<string, string[]> = Object.fromEntries(
-    Object.entries(manifest).map(([fn, entries]) => [
-      fn,
-      runtimeFunctions.includes(fn)
-        ? [...entries, `${runtimeRole}:EXECUTE`]
-        : entries,
-    ]),
-  );
   const actual = await sessionsFunctionAcl(client);
+  // Release-target prefix scope (heldSql = the SQL of the held steps, empty for a full
+  // tree): a manifest function is not expected only when it is ABSENT from the catalog
+  // and a held step creates it (createdSessionsFunctions). Every function that exists
+  // must still equal the full-tree manifest exactly, and any absent function no held
+  // step creates is still missing, so the scope can only drop entries the held steps
+  // will add; a held step that changes an existing function's ACL fails closed here.
+  const heldCreates = createdSessionsFunctions(heldSql);
+  const expected: Record<string, string[]> = Object.fromEntries(
+    Object.entries(manifest)
+      .filter(([fn]) => !(heldCreates.has(fn) && actual[fn] === undefined))
+      .map(([fn, entries]) => [
+        fn,
+        runtimeFunctions.includes(fn)
+          ? [...entries, `${runtimeRole}:EXECUTE`]
+          : entries,
+      ]),
+  );
   const norm = (xs: string[] | undefined) => JSON.stringify([...(xs ?? [])].sort());
   const drift: string[] = [];
   for (const fn of new Set([...Object.keys(expected), ...Object.keys(actual)]))
@@ -2155,6 +2170,37 @@ function normalizeGrantTarget(raw: string): string | null {
   if (!m || m[1] !== "sessions") return null;
   const args = m[3]!.trim() ? splitTopLevel(m[3]!).map(normalizeSignatureArg) : [];
   return `${m[1]}.${m[2]}(${args.join(",")})`;
+}
+
+/**
+ * The manifest keys ("sessions.fn(type,...)") of the sessions functions the given SQL
+ * creates with a literal `CREATE [OR REPLACE] FUNCTION sessions.fn(args)`. Argument
+ * lists are matched with balanced parentheses and normalized like pendingExecuteGrants;
+ * an argument list it cannot normalize (DEFAULT, OUT, dynamic SQL) yields a key that
+ * matches no manifest entry, so the caller under-credits: the safe direction.
+ */
+export function createdSessionsFunctions(sql: readonly string[]): Set<string> {
+  const created = new Set<string>();
+  const head = /\bcreate\s+(?:or\s+replace\s+)?function\s+("?[a-z_][a-z0-9_]*"?\s*\.\s*"?[a-z_][a-z0-9_]*"?)\s*\(/g;
+  for (const text0 of sql) {
+    const text = text0
+      .replace(/\/\*[\s\S]*?\*\//g, " ")
+      .replace(/--[^\n]*/g, " ")
+      .toLowerCase();
+    for (const m of text.matchAll(head)) {
+      const open = m.index! + m[0].length;
+      let depth = 1;
+      let i = open;
+      for (; i < text.length && depth > 0; i++) {
+        if (text[i] === "(") depth++;
+        else if (text[i] === ")") depth--;
+      }
+      if (depth !== 0) continue;
+      const fn = normalizeGrantTarget(`${m[1]!.replace(/\s+/g, "")}(${text.slice(open, i - 1)})`);
+      if (fn) created.add(fn);
+    }
+  }
+  return created;
 }
 
 /**

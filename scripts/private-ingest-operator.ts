@@ -1,5 +1,5 @@
 /** Source-only operator adapter. No operation happens on import.
- * Real execution requires a separately reviewed operator exception; no CI bypass.
+ * Real execution requires the guarded GitHub Actions production workflow.
  */
 import { createHash } from "node:crypto";
 import { hostname } from "node:os";
@@ -60,9 +60,17 @@ import {
   SIGNING_KEY_SECRET,
 } from "../stacks/cloudflare/session-ingest.ts";
 import { sanitizePlan, captureFiles } from "../src/cli/plan-provenance.ts";
+import {
+  privateIngestGithubGate,
+  privateIngestGithubGet,
+} from "./private-ingest-release-github.ts";
 export const OPERATOR_PROTOCOL = "private-ingest-operator-v1";
 export const STATE_SCRIPT = "alchemy-state-store-96bulls";
-export const EXECUTION_EXCEPTION = "ssh-sf-frame-retained-plan";
+export const EXECUTION_EXCEPTION = "github-actions-retained-plan";
+export const operatorExecutionHost = (
+  env: Record<string, string | undefined> = process.env,
+  actual = hostname(),
+) => env.GITHUB_ACTIONS === "true" ? "github-actions" : actual;
 const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 const isHash = (s: unknown): s is string =>
   typeof s === "string" && /^[0-9a-f]{64}$/u.test(s);
@@ -71,7 +79,10 @@ const isCommit = (s: unknown): s is string =>
 const object = (s: unknown): s is Record<string, any> =>
   s !== null && typeof s === "object" && !Array.isArray(s);
 export class OperatorRefusal extends Error {
-  constructor(readonly code: string) {
+  constructor(
+    readonly code: string,
+    readonly diagnostic?: OperatorPlanDiagnostic,
+  ) {
     super("private ingest operator refused: " + code);
   }
 }
@@ -99,6 +110,44 @@ export interface OperatorPlans {
   planText: string;
   detailedText: string;
 }
+export interface OperatorPlanContractDiagnostic {
+  kind: "plan_contract";
+  reason: "summary_count" | "resource_inventory" | "forbidden_action" |
+    "summary_mismatch" | "view_mismatch" | "credential_pattern" |
+    "action_set" | "unknown";
+  compact: {
+    resourceClauses: Array<{ action: string; count: number }>;
+    bindingChanges: number | null;
+    zeroChanges: boolean;
+    resources: Array<{ id: string; action: string }>;
+  };
+  detailed: {
+    resourceClauses: Array<{ action: string; count: number }>;
+    bindingChanges: number | null;
+    zeroChanges: boolean;
+    resources: Array<{ id: string; action: string }>;
+  };
+  bindings: Array<{ sid: string; action: string }>;
+}
+export interface OperatorBindingRenderDiagnostic {
+  kind: "binding_render";
+  reason: "binding_render_summary" | "binding_render_inventory";
+  compact: {
+    resourceClauses: Array<{ action: string; count: number }>;
+    bindingChanges: number | null;
+    renderedBindings: Array<{ sid: string; action: string }>;
+    unparsedBindingLines: number;
+  };
+  detailed: {
+    resourceClauses: Array<{ action: string; count: number }>;
+    bindingChanges: number | null;
+    renderedBindings: Array<{ sid: string; action: string }>;
+    unparsedBindingLines: number;
+  };
+  expectedBindings: Array<{ sid: string; action: string }>;
+}
+export type OperatorPlanDiagnostic = OperatorPlanContractDiagnostic |
+  OperatorBindingRenderDiagnostic;
 export interface OperatorCapture {
   schema: 1;
   kind: typeof OPERATOR_PROTOCOL;
@@ -197,6 +246,82 @@ export function assertOperatorInputs(
     refuse("account");
   return input as CloudflareStageInputs;
 }
+function operatorPlanContractDiagnostic(
+  error: unknown,
+  compact: string,
+  detailed: string,
+  bindings: BindingInventory,
+): OperatorPlanContractDiagnostic {
+  const shape = (text: string) => {
+    const summary = text.split(/\r?\n/u).find((line) => line.startsWith("Plan:")) ?? "";
+    return {
+      resourceClauses: [...summary.matchAll(/(\d+) to ([a-z-]+)/gu)]
+        .map((match) => ({ action: match[2]!, count: Number(match[1]) })),
+      bindingChanges: Number(
+        /(?:, )?(\d+) binding changes/u.exec(summary)?.[1] ?? NaN,
+      ),
+      zeroChanges: /^Plan:\s*(?:0 changes|no changes)(?:,|\s*$)/iu.test(summary),
+      resources: text.split(/\r?\n/u).flatMap((line) => {
+        const match = /^\s*\[([^\]]+)\]\s+(\S+)\s*$/u.exec(line);
+        return match ? [{ id: match[1]!, action: match[2]! }] : [];
+      }),
+    };
+  };
+  const message = error instanceof Error ? error.message : "";
+  let reason: OperatorPlanContractDiagnostic["reason"] = "unknown";
+  if (message.includes("expected exactly one Plan:")) reason = "summary_count";
+  else if (message.includes("unexpected resource") || message.includes("missing resource")) reason = "resource_inventory";
+  else if (message.includes("forbidden action")) reason = "forbidden_action";
+  else if (message.includes("summary does not match")) reason = "summary_mismatch";
+  else if (message.includes("compact and detailed")) reason = "view_mismatch";
+  else if (message.includes("credential value")) reason = "credential_pattern";
+  else if (message.includes("action set is neither")) reason = "action_set";
+  const normalize = (value: ReturnType<typeof shape>) => ({
+    ...value,
+    bindingChanges: Number.isFinite(value.bindingChanges)
+      ? value.bindingChanges
+      : null,
+  });
+  return {
+    kind: "plan_contract",
+    reason,
+    compact: normalize(shape(compact)),
+    detailed: normalize(shape(detailed)),
+    bindings: bindings.map(({ sid, action }) => ({ sid, action })),
+  };
+}
+function operatorBindingRenderDiagnostic(
+  reason: "binding_render_summary" | "binding_render_inventory",
+  plans: OperatorPlans,
+  bindings: BindingInventory,
+): OperatorBindingRenderDiagnostic {
+  const shape = (text: string) => {
+    const summary = text.split(/\r?\n/u).find((line) => line.startsWith("Plan:")) ?? "";
+    const bindingLines = text.split(/\r?\n/u)
+      .filter((line) => /^\s*\[session-ingest\//u.test(line));
+    const renderedBindings = bindingLines.flatMap((line) => {
+      const match = /^\s*\[session-ingest\/([^\]]+)\]\s+(\S+)\s*$/u.exec(line);
+      return match ? [{ sid: match[1]!, action: match[2]! }] : [];
+    });
+    const bindingChanges = Number(
+      /(?:, )?(\d+) binding changes/u.exec(summary)?.[1] ?? NaN,
+    );
+    return {
+      resourceClauses: [...summary.matchAll(/(\d+) to ([a-z-]+)/gu)]
+        .map((match) => ({ action: match[2]!, count: Number(match[1]) })),
+      bindingChanges: Number.isFinite(bindingChanges) ? bindingChanges : null,
+      renderedBindings,
+      unparsedBindingLines: bindingLines.length - renderedBindings.length,
+    };
+  };
+  return {
+    kind: "binding_render",
+    reason,
+    compact: shape(plans.planText),
+    detailed: shape(plans.detailedText),
+    expectedBindings: bindings.map(({ sid, action }) => ({ sid, action })),
+  };
+}
 export function operatorSafePlans(
   plans: OperatorPlans,
   secrets: OperatorSecrets,
@@ -230,15 +355,33 @@ export function operatorSafePlans(
       (admission !== "on" && admission !== "drain" && admission !== "off")
     )
       refuse("original_plan_contract");
-    let phase: string;
+    let phase: string, compact: string, detailed: string;
+    try {
+      compact = resourcePlanView(result.planText, bindings);
+      detailed = resourcePlanView(result.detailedText, bindings);
+    } catch (error) {
+      if (
+        error instanceof OperatorRefusal &&
+        (error.code === "binding_render_summary" ||
+          error.code === "binding_render_inventory")
+      )
+        throw new OperatorRefusal(
+          error.code,
+          operatorBindingRenderDiagnostic(error.code, result, bindings),
+        );
+      throw error;
+    }
     try {
       phase = assertSessionIngestPlanContract(
-        resourcePlanView(result.planText, bindings),
-        resourcePlanView(result.detailedText, bindings),
+        compact,
+        detailed,
         admission,
       );
-    } catch {
-      refuse("original_plan_contract");
+    } catch (error) {
+      throw new OperatorRefusal(
+        "original_plan_contract",
+        operatorPlanContractDiagnostic(error, compact, detailed, bindings),
+      );
     }
     // Design (h) step 3, binding level: a deployed Worker that GAINS the admission binding
     // in this apply must gain it with "drain" (then a var-only re-capture with "on"). The
@@ -625,7 +768,10 @@ export function resourcePlanView(
   )
     refuse("binding_render_summary");
   const expected = new Set(
-      inventory.map((b) => "[session-ingest/" + b.sid + "] " + b.action),
+      inventory.map((b) =>
+        "[session-ingest/" + b.sid + "] " +
+          (b.action === "delete" ? "unbind" : b.action)
+      ),
     ),
     seen = new Set<string>();
   const lines = text.split("\n").filter((line) => {
@@ -636,6 +782,29 @@ export function resourcePlanView(
     return false;
   });
   if (seen.size !== expected.size) refuse("binding_render_inventory");
+  // Alchemy models a Worker env-only change as binding actions while the
+  // Worker resource row remains noop. After the exact native binding inventory
+  // above is verified, present that one binding-only Worker change to the
+  // original resource contract as an in-place update. Never normalize a plan
+  // that already changes any resource.
+  const resourceRows = lines.flatMap((line, index) => {
+    const match = /^\s*\[([^\]]+)\]\s+(\S+)\s*$/u.exec(line);
+    return match ? [{ index, id: match[1]!, action: match[2]! }] : [];
+  });
+  if (
+    bindingCount > 0 &&
+    resourceRows.every(({ action }) => action === "noop")
+  ) {
+    const worker = resourceRows.filter(({ id }) => id === "session-ingest");
+    if (worker.length !== 1) refuse("binding_render_inventory");
+    lines[worker[0]!.index] = lines[worker[0]!.index]!.replace(
+      /(\[session-ingest\]\s+)noop(\s*)$/u,
+      "$1update$2",
+    );
+    const summaryIndex = lines.findIndex((line) => line.startsWith("Plan:"));
+    if (summaryIndex < 0) refuse("binding_render_summary");
+    lines[summaryIndex] = "Plan: 1 to update";
+  }
   return lines.join("\n");
 }
 export function assertOperatorSnapshot(
@@ -733,12 +902,73 @@ export function assertOperatorSnapshot(
           name: "NEON_REPLICA",
           queue_name: input.sessionIngest.neonReplicaQueue,
         };
-      if (row.bindings.length !== Object.keys(expected).length)
+      const overlapDeletes = row.bindings.filter(
+        (binding: any) => binding.action === "delete",
+      );
+      if (
+        row.bindings.length !== Object.keys(expected).length + overlapDeletes.length ||
+        overlapDeletes.length > 1
+      )
         refuse("native_binding_inventory");
       const found = new Set<string>();
       for (const b of row.bindings) {
         const wanted = expected[b.sid],
           actual = b.data?.bindings;
+        if (b.action === "delete") {
+          const currentEnv = row.state?.props?.env,
+            proposedEnv = props.env,
+            oldExpected = currentEnv?.INGEST_EXPECT_GENERATION,
+            newExpected = proposedEnv?.INGEST_EXPECT_GENERATION,
+            oldAccepted = currentEnv?.INGEST_ACCEPT_GENERATIONS;
+          if (row.action !== "update" || wanted !== undefined ||
+              !Array.isArray(actual) || actual.length !== 1 ||
+              Object.entries(b.data).some(([k, v]) => k !== "bindings" && v !== undefined))
+            refuse("native_binding_target");
+          let deletedValue: unknown;
+          if (b.sid === "INGEST_ACCEPT_GENERATIONS") {
+            // Documented G -> H generation-window closure.
+            if (input.sessionIngest.overlapGeneration !== undefined ||
+                input.sessionIngest.expectedGeneration !== newExpected ||
+                typeof oldExpected !== "string" || !/^[0-9a-f]{64}$/u.test(oldExpected) ||
+                typeof newExpected !== "string" || !/^[0-9a-f]{64}$/u.test(newExpected) ||
+                oldExpected === newExpected || oldAccepted !== `${oldExpected},${newExpected}` ||
+                proposedEnv?.INGEST_ACCEPT_GENERATIONS !== undefined)
+              refuse("native_binding_target");
+            deletedValue = oldAccepted;
+          } else if (b.sid === "INGEST_CUSTODY_SOURCE") {
+            // CI rollout rollback: step 1 -> baseline only.
+            if (input.sessionIngest.custodySource !== undefined ||
+                input.sessionIngest.syncAdmissionFrozenReceipt !== undefined ||
+                currentEnv?.INGEST_CUSTODY_SOURCE !== "frozen-supabase" ||
+                currentEnv?.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT !== undefined ||
+                proposedEnv?.INGEST_CUSTODY_SOURCE !== undefined)
+              refuse("native_binding_target");
+            deletedValue = "frozen-supabase";
+          } else if (b.sid === "INGEST_SYNC_ADMISSION_FROZEN_RECEIPT") {
+            // CI rollout rollback: step 2 -> step 1 only.
+            if (input.sessionIngest.syncAdmissionFrozenReceipt !== undefined ||
+                input.sessionIngest.custodySource !== "frozen-supabase" ||
+                currentEnv?.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT !== "on" ||
+                currentEnv?.INGEST_CUSTODY_SOURCE !== "frozen-supabase" ||
+                proposedEnv?.INGEST_CUSTODY_SOURCE !== "frozen-supabase" ||
+                proposedEnv?.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT !== undefined)
+              refuse("native_binding_target");
+            deletedValue = "on";
+          } else {
+            refuse("native_binding_target");
+          }
+          if (inputsDigest(JSON.stringify({ value: actual[0] })) !==
+              inputsDigest(JSON.stringify({ value: {
+                type: "plain_text", name: b.sid, text: deletedValue,
+              } })))
+            refuse("native_binding_target");
+          inventory.push({
+            sid: b.sid,
+            action: b.action,
+            target: actual[0],
+          });
+          continue;
+        }
         if (
           !wanted ||
           found.has(b.sid) ||
@@ -794,6 +1024,8 @@ export function assertOperatorSnapshot(
             : wanted,
         });
       }
+      if (found.size !== Object.keys(expected).length)
+        refuse("native_binding_inventory");
     }
     if (
       ["session-ingest-fanout", "session-ingest-fanout-dlq"].includes(id) &&
@@ -881,6 +1113,12 @@ export async function retainedOperatorPlan(
     (!runtime.reviewed || typeof runtime.reviewed.recheckSource !== "function")
   )
     refuse("retained_deploy_approval_required");
+  if (
+    mode === "deploy" &&
+    (process.env.GITHUB_ACTIONS !== "true" ||
+      process.env.PRIVATE_INGEST_GITHUB_GATE !== "approved")
+  )
+    refuse("github_actions_deploy_required");
   if (
     process.env.CI !== "true" ||
     process.env.CLOUDFLARE_ACCOUNT_ID !== secrets.accountId ||
@@ -1080,6 +1318,14 @@ const PREFIX = "docs/plans/" + SESSION_INGEST_STAGE;
 export async function operatorMain(argv = process.argv.slice(2)) {
   const options = parseOptions(argv);
   if (process.env.CI !== "true") refuse("ci_state_safety_required");
+  if (
+    options.mode === "deploy" &&
+    (process.env.GITHUB_ACTIONS !== "true" ||
+      process.env.PRIVATE_INGEST_GITHUB_GATE !== "approved")
+  )
+    refuse("github_actions_deploy_required");
+  if (options.mode === "deploy")
+    await privateIngestGithubGate(process.env, privateIngestGithubGet(), true);
   const git = (args: string[]) => {
     const result = spawnSync("git", args, {
       encoding: "utf8",
@@ -1100,7 +1346,9 @@ export async function operatorMain(argv = process.argv.slice(2)) {
         ].filter(Boolean),
       ),
     ],
-    host: hostname(),
+    // A retained plan and its deploy are separate GitHub-hosted jobs. Their ephemeral hostnames
+    // differ, while the exact commit/input/plan/state/tool bindings remain stable and authoritative.
+    host: operatorExecutionHost(),
   });
   const source = sourceNow();
   assertOperatorSource(options, source);

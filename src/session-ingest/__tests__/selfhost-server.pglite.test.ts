@@ -6,6 +6,8 @@
  * the role's grants; PGlite has no real login, so startup admission, which refuses
  * SET ROLE, is tested over real-login rows below), and the store is a scratch fs store.
  */
+import { sqlUploadConsentStore } from "../upload-consent-sql.ts";
+import { UPLOAD_CONSENT_REQUIRED } from "../upload-consent.ts";
 import { afterEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -144,7 +146,7 @@ async function start(rc: { url: string }, over: NodeJS.ProcessEnv = {}) {
   const service: SelfhostIngestService = await startSelfhostIngestService(env(rc.url, over), { host: "127.0.0.1", port: 0, build });
   cleanups.push(() => service.close());
   const url = (path: string) => `http://127.0.0.1:${service.port}${path}`;
-  return { service, url, store: fs.store, db };
+  return { service, url, store: fs.store, db, run };
 }
 
 const deliveryBody = async (id = "e1", over: Parameters<typeof batch>[1] = {}) =>
@@ -349,6 +351,13 @@ describe("onboarding heartbeat (RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT=true)", (
     await expect(start(rc, { RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT: "1" })).rejects.toThrow("RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT");
   });
 
+  test("on: a consent-only token (rth:consent, no rth:sync) is 403 on the heartbeat (the wrapper's own check)", async () => {
+    const rc = await relaycontrol(() => active(["rth:consent"]));
+    const { url } = await start(rc, on);
+    const res = await post(url(HEARTBEAT), progress);
+    expect([res.status, await code(res)]).toEqual([403, "forbidden"]);
+  });
+
   test("on: an authenticated heartbeat is 204 with no body, introspected, nothing written", async () => {
     const rc = await relaycontrol(() => active(["rth:sync"]));
     const { url, store } = await start(rc, on);
@@ -387,6 +396,74 @@ describe("onboarding heartbeat (RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT=true)", (
       expect(res.status).toBe(204);
       expect(res.headers.get("connection")).toBe("close");
     }
+  });
+});
+
+describe("capture policy upload check (RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS)", () => {
+  const HEADER = "x-agent-relay-capture-policy-revision";
+  const SINCE = "2026-11-01T00:00:00.000Z";
+  const policy = (settings: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    active(["rth:sync"], { role: "member", capture_policy: { version: 1, revision: 7, settings, ...extra } });
+  const oldSession = async (id: string) => JSON.stringify({ protocolVersion: 1, batch: await batch([
+    record({ record_id: id, kind: "session", payload: { first_activity_ms: Date.parse(SINCE) - 60_000 } }),
+  ], { batch_id: `batch-${id}` }) });
+
+  test("report (default): a missing or older revision, or an older session, is logged and accepted", async () => {
+    const rc = await relaycontrol(() => policy({ sharing_mode: "new" }, { sharing_mode_since: SINCE }));
+    const { url } = await start(rc);
+    expect((await post(url("/v1/delivery/batches"), await deliveryBody("e1"))).status).toBe(200);
+    expect((await post(url("/v1/delivery/batches"), await deliveryBody("e2", { batch_id: "batch-2" }), { [HEADER]: "6" })).status).toBe(200);
+    expect((await post(url("/v1/delivery/batches"), await oldSession("s1"), { [HEADER]: "7" })).status).toBe(200);
+  });
+
+  test("enforce: 409 capture_policy_stale for a missing or older revision; the current one is accepted", async () => {
+    const rc = await relaycontrol(() => policy({ upload_control: "operator" }));
+    const { url, store } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce" });
+    for (const revision of [undefined, "6", "seven"]) {
+      const res = await post(url("/v1/delivery/batches"), await deliveryBody(), revision ? { [HEADER]: revision } : {});
+      expect([revision, res.status, await code(res)]).toEqual([revision, 409, "capture_policy_stale"]);
+    }
+    expect(await chunkKeys(store)).toEqual([]);
+    expect((await post(url("/v1/delivery/batches"), await deliveryBody(), { [HEADER]: "7" })).status).toBe(200);
+    expect((await chunkKeys(store)).length).toBeGreaterThan(0);
+  });
+
+  test("enforce: under sharing_mode new, a session older than the policy is 422; a newer one is accepted", async () => {
+    const rc = await relaycontrol(() => policy({ sharing_mode: "new" }, { sharing_mode_since: SINCE }));
+    const { url } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce" });
+    const refused = await post(url("/v1/delivery/batches"), await oldSession("s1"), { [HEADER]: "7" });
+    expect([refused.status, await code(refused)]).toEqual([422, "capture_policy_session_predates_policy"]);
+    const fresh = JSON.stringify({ protocolVersion: 1, batch: await batch([
+      record({ record_id: "s2", kind: "session", payload: { first_activity_ms: Date.parse(SINCE) + 60_000 } }),
+    ], { batch_id: "batch-s2" }) });
+    expect((await post(url("/v1/delivery/batches"), fresh, { [HEADER]: "7" })).status).toBe(200);
+  });
+
+  test("enforce + INGEST_UPLOAD_CONSENT: under sharing_mode new, a newer session also needs the person's confirmed choice", async () => {
+    const rc = await relaycontrol(() => policy({ sharing_mode: "new" }, { sharing_mode_since: SINCE }));
+    const fresh = JSON.stringify({ protocolVersion: 1, batch: await batch([
+      record({ record_id: "s2", kind: "session", payload: { first_activity_ms: Date.parse(SINCE) + 60_000 } }),
+    ], { batch_id: "batch-s2" }) });
+    const { url, store, run } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce", INGEST_UPLOAD_CONSENT: "enforce" });
+    const held = await post(url("/v1/delivery/batches"), fresh, { [HEADER]: "7" });
+    expect([held.status, await code(held)]).toEqual([503, UPLOAD_CONSENT_REQUIRED]);
+    expect(await chunkKeys(store)).toEqual([]);
+    await sqlUploadConsentStore(run).apply(TENANT, { mode: "all", confirmOrigins: ["origin-1"] }, { trusted: true, nowMs: Date.parse(SINCE) });
+    expect((await post(url("/v1/delivery/batches"), fresh, { [HEADER]: "7" })).status).toBe(200);
+  });
+
+  test("enforce: a policy that sets no key, or no policy at all (older relaycontrol), needs no header", async () => {
+    let answer = policy({});
+    const rc = await relaycontrol(() => answer);
+    const { url } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce" });
+    expect((await post(url("/v1/delivery/batches"), await deliveryBody("e1"))).status).toBe(200);
+    answer = active(["rth:sync"]);
+    expect((await post(url("/v1/delivery/batches"), await deliveryBody("e2", { batch_id: "batch-2" }))).status).toBe(200);
+  });
+
+  test("an unexpected value refuses startup", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    await expect(start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "on" })).rejects.toThrow("RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS");
   });
 });
 
@@ -657,6 +734,41 @@ describe("per-session erase (RELAYHISTORY_SELFHOST_SESSION_SELECTION=true)", () 
     const retry = await post(url("/v1/delivery/batches"), await deliveryBody());
     expect([retry.status, ((await retry.json()) as { receiptId: string }).receiptId]).toEqual([200, receipt]);
     expect(await chunkKeys(store)).toEqual(keys);
+    expect((await row(db, "sess-1", machine)).deleted_at).not.toBeNull();
+  });
+
+  test("capture policy user_retroactive_delete:false refuses a member's own delete 403; owners and admins still delete", async () => {
+    const policy = (settings: Record<string, unknown>) => ({ version: 1, revision: 3, settings });
+    let answer = active(["rth:sync"], { role: "member", capture_policy: policy({ user_retroactive_delete: false }) });
+    const rc = await relaycontrol(() => answer);
+    const { url, db } = await start(rc, on);
+    await pointer(db, "sess-1", machine);
+    const refused = await post(url(SELECTION), await selection());
+    expect([refused.status, await code(refused)]).toEqual([403, "policy_forbids_user_delete"]);
+    expect((await row(db, "sess-1", machine)).deleted_at).toBeNull();
+    expect((await db.query("SELECT 1 FROM sessions.upload_deletions WHERE session_id = 'sess-1'")).rows).toHaveLength(0);
+    // The policy is read live from each introspection: the key absent leaves the member's delete.
+    answer = active(["rth:sync"], { role: "member", capture_policy: policy({ sharing_mode: "all" }) });
+    await pointer(db, "sess-unset", machine);
+    expect((await post(url(SELECTION), await selection({ sessions: [{ source: "claude", session_id: "sess-unset" }] }))).status).toBe(200);
+    expect((await row(db, "sess-unset", machine)).deleted_at).not.toBeNull();
+    for (const role of ["owner", "admin"]) {
+      answer = active(["rth:sync"], { role, capture_policy: policy({ user_retroactive_delete: false }) });
+      await pointer(db, `sess-${role}`, machine);
+      const res = await post(url(SELECTION), await selection({ sessions: [{ source: "claude", session_id: `sess-${role}` }] }));
+      expect([role, res.status]).toEqual([role, 200]);
+      expect((await row(db, `sess-${role}`, machine)).deleted_at).not.toBeNull();
+    }
+    answer = active(["rth:sync"], { role: "member", capture_policy: policy({ user_retroactive_delete: true }) });
+    expect((await post(url(SELECTION), await selection())).status).toBe(200);
+    expect((await row(db, "sess-1", machine)).deleted_at).not.toBeNull();
+  });
+
+  test("no capture policy in the introspection answer (an older relaycontrol): a member's delete works as before", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    const { url, db } = await start(rc, on);
+    await pointer(db, "sess-1", machine);
+    expect((await post(url(SELECTION), await selection())).status).toBe(200);
     expect((await row(db, "sess-1", machine)).deleted_at).not.toBeNull();
   });
 

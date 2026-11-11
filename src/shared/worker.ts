@@ -31,6 +31,7 @@ import { ctxOf, enrichMessage } from "./enrich.ts";
 import { vendorBindings, integer } from "./env.ts";
 import { liveDataPathVerdict, workloadReadyLive } from "./data-path.ts";
 import { errorFields, log } from "./log.ts";
+import { initScrubEngine } from "@rhc/lib/scrub-engine/index.ts";
 import { initTelemetry, shutdownTelemetry, withSpan } from "./telemetry.ts";
 import { createServer } from "node:http";
 import { setTimeout as idleDelay } from "node:timers/promises";
@@ -338,6 +339,9 @@ export async function runWorker(opts: WorkerOptions): Promise<never> {
   // Fail closed on a mis-set adapter selection (docs/search-and-runtime-adapters.md).
   // Unset (every current install) resolves to postgres + workers: no change.
   validateAdapterEnv(process.env, workerAdapterEntry(opts));
+  // SCRUB_ENGINE (docs/scrub-engine.md): select, and for wasm verify the pinned engine, before
+  // the health server starts; a failure exits the worker, so it never reports ready.
+  await initScrubEngine();
   process.env.OTEL_SERVICE_NAME ||= opts.service;
   initTelemetry(opts.service);
   const health: WorkerHealth = {

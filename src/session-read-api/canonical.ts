@@ -69,6 +69,7 @@ export function canonicalReasonCodeFields(codes: readonly unknown[] | undefined)
   return kept.length > 0 ? { reason_codes: kept.join(",").slice(0, 256) } : {};
 }
 export interface CanonicalDeps {
+  readerMaxRuleset?: number;
   pointers(identity: CanonicalIdentity): Promise<CanonicalPointer[]>;
   store: ObjectStore;
   provider: string;
@@ -251,6 +252,7 @@ async function snapshotWithLimits(
     [...byKey.keys()],
     {
       store: deps.store,
+      readerMaxRuleset: deps.readerMaxRuleset,
       prefixFor: () =>
         deps.prefix.PIPELINE_ORG_FROM_PREFIX === "true"
           ? [deps.prefix.PIPELINE_KEY_PREFIX, identity.orgId]

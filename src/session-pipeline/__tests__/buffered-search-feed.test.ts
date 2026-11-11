@@ -43,7 +43,7 @@ import {
 } from "../buffered-search-feed.ts";
 
 const NOW = Date.parse("2026-11-07T12:00:00.000Z");
-/** Synthetic B1 ceiling for tests only (the production BUFFERED_VERSION_CEILING is unpinned). */
+/** Synthetic B1 ceiling for tests only, independent of the pinned production BUFFERED_VERSION_CEILING. */
 const TEST_CEILING = 1_000_000_000_000;
 const SECOND = { INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION: "on" } as const;
 const RECEIVED = new Date("2026-11-07T11:30:00.000Z");
@@ -497,9 +497,10 @@ describe("buffered-stage search feed", () => {
     const base = { AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "bucket", PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true", SESSION_PIPELINE_SECRET_ARN: "arn", SESSION_PIPELINE_QUEUE_URL: "https://sqs" };
     expect(lambdaEnv(base).bufferedSearchFeed).toMatchObject({ enabled: false });
     const gate = { BUFFERED_SEARCH_FEED_GATE_DECLARED: BUFFERED_SEARCH_GATE_CONTRACT };
-    // The S version encoding must be armed, and BUFFERED_VERSION_CEILING is unpinned: refused either way.
+    // The S version encoding must be armed: without INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION=on it is refused.
     expect(lambdaEnv({ ...base, ...gate, INGEST_BUFFERED_SEARCH_FEED: "on" }).bufferedSearchFeed).toBeUndefined();
-    expect(lambdaEnv({ ...base, ...gate, INGEST_BUFFERED_SEARCH_FEED: "on", ...SECOND }).bufferedSearchFeed).toBeUndefined();
+    // With it on, the pinned production BUFFERED_VERSION_CEILING accepts.
+    expect(lambdaEnv({ ...base, ...gate, INGEST_BUFFERED_SEARCH_FEED: "on", ...SECOND }).bufferedSearchFeed).toMatchObject({ enabled: true, secondVersion: true });
     expect(bufferedFeedConfig({ ...base, ...gate, INGEST_BUFFERED_SEARCH_FEED: "on", ...SECOND }, TEST_CEILING)).toMatchObject({ enabled: true, secondVersion: true });
     // The old read-flag declaration alone no longer arms it; only the contract id does.
     expect(lambdaEnv({ ...base, READ_API_BUFFERED_SEARCH_GATE: "on", INGEST_BUFFERED_SEARCH_FEED: "on" }).bufferedSearchFeed).toBeUndefined();
@@ -515,9 +516,9 @@ describe("buffered-stage search feed", () => {
       SEARCH_INDEX_ENABLED: "1", INGEST_BUFFERED_SEARCH_FEED: "on", BUFFERED_SEARCH_FEED_GATE_DECLARED: BUFFERED_SEARCH_GATE_CONTRACT, ...SECOND };
     const clickhouse = { url: "https://ch.synthetic.invalid", user: "u", password: "p", database: "d" };
     const feedUrl = `postgresql://${BUFFERED_SEARCH_FEED_RUNTIME_ROLE}:pw-test-only@db.synthetic.invalid:5432/history`;
-    // The production ceiling is unpinned, so the config is built here with a synthetic one.
-    const feed = (extra: Record<string, unknown>, env: Record<string, string> = base, pinned = true) =>
-      runtimeFromSecret({ ...lambdaEnv(env), bufferedSearchFeed: (() => { try { return bufferedFeedConfig(env, pinned ? TEST_CEILING : undefined); } catch { return undefined; } })() },
+    // The config is built here with a synthetic ceiling, independent of the production pin.
+    const feed = (extra: Record<string, unknown>, env: Record<string, string> = base) =>
+      runtimeFromSecret({ ...lambdaEnv(env), bufferedSearchFeed: (() => { try { return bufferedFeedConfig(env, TEST_CEILING); } catch { return undefined; } })() },
         JSON.stringify({ hoopdb_url: "postgresql://synthetic.invalid/fixture", clickhouse, ...extra }), "fixture-generation").deps.bufferedFeed;
     const armed = (extra: Record<string, unknown>, env: Record<string, string> = base) => feed(extra, env) !== undefined;
     // Flag on, gate declared, ClickHouse present, but no feeder login: the feed stays off (never the shared pool).
@@ -532,9 +533,11 @@ describe("buffered-stage search feed", () => {
     expect(armed({ buffered_search_feed_database_url: feedUrl, buffered_search_feed_database_ca_pem: SUPABASE_PROD_CA_2021 })).toBe(true);
     // Armed means the S encoding: the refusal ledger is wired.
     expect(feed({ buffered_search_feed_database_url: feedUrl, buffered_search_feed_database_ca_pem: SUPABASE_PROD_CA_2021 })?.secondVersion?.ledger).toBeDefined();
-    // The ceiling unpinned (production today): nothing is built.
-    expect(feed({ buffered_search_feed_database_url: feedUrl, buffered_search_feed_database_ca_pem: SUPABASE_PROD_CA_2021 }, base, false)).toBeUndefined();
-    expect(runtimeFromSecret(lambdaEnv(base), JSON.stringify({ hoopdb_url: "postgresql://synthetic.invalid/fixture", clickhouse, buffered_search_feed_database_url: feedUrl, buffered_search_feed_database_ca_pem: SUPABASE_PROD_CA_2021 }), "fixture-generation").deps.bufferedFeed).toBeUndefined();
+    // The production path (lambdaEnv, pinned BUFFERED_VERSION_CEILING): built only with every flag and valid login fields.
+    const prod = (env: Record<string, string>) => runtimeFromSecret(lambdaEnv(env), JSON.stringify({ hoopdb_url: "postgresql://synthetic.invalid/fixture", clickhouse, buffered_search_feed_database_url: feedUrl, buffered_search_feed_database_ca_pem: SUPABASE_PROD_CA_2021 }), "fixture-generation").deps.bufferedFeed;
+    expect(prod(base)?.secondVersion?.ledger).toBeDefined();
+    const { INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION: _sv, ...legacy } = base;
+    expect(prod(legacy)).toBeUndefined();
     // Flag off: valid fields still build nothing.
     const { INGEST_BUFFERED_SEARCH_FEED: _, ...off } = base;
     expect(armed({ buffered_search_feed_database_url: feedUrl, buffered_search_feed_database_ca_pem: SUPABASE_PROD_CA_2021 }, off)).toBe(false);
@@ -623,18 +626,23 @@ describe("buffered-stage search feed", () => {
       process.env.BUFFERED_SEARCH_FEED_GATE_DECLARED = "buffered-search-gate/v0";
       expect(await handler({ bufferedSearchFeed: true })).toEqual({ ok: false });
       expect(loaded).toBe(0);
-      // Declared, but the version encoding not armed (version_encoding_not_armed), then armed with the
-      // ceiling unpinned (buffered_version_ceiling_unpinned): still refused before any runtime load.
+      // Declared, but the version encoding not armed (version_encoding_not_armed): still refused before
+      // any runtime load, whatever the ceiling.
       process.env.BUFFERED_SEARCH_FEED_GATE_DECLARED = BUFFERED_SEARCH_GATE_CONTRACT;
       delete process.env.INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION;
       expect(await handler({ bufferedSearchFeed: true })).toEqual({ ok: false });
-      process.env.INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION = "on";
+      process.env.INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION = "off";
       expect(await handler({ bufferedSearchFeed: true })).toEqual({ ok: false });
       expect(loaded).toBe(0);
+      // Both flags on with the pinned ceiling: the guards pass and only then is the runtime loaded (here it
+      // fails synthetically, so the run is still not ok).
+      process.env.INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION = "on";
+      expect(await handler({ bufferedSearchFeed: true })).toEqual({ ok: false });
+      expect(loaded).toBe(1);
       // The feed's own flag off: nothing at all, whatever is declared.
       process.env.INGEST_BUFFERED_SEARCH_FEED = "off";
       expect(await handler({ bufferedSearchFeed: true })).toEqual({ ok: true });
-      expect(loaded).toBe(0);
+      expect(loaded).toBe(1);
     } finally {
       keys.forEach((k, i) => { if (saved[i] === undefined) delete process.env[k]; else process.env[k] = saved[i]; });
     }
@@ -759,7 +767,7 @@ describe("buffered feed version (S): created_at seconds with same-second refusal
   const cand = (n: number, createdAt: string, over: Partial<StageCandidate> = {}): StageCandidate =>
     ({ stageToken: tok(n), createdAt, tenant, originId: ORIGIN, batchId: "batch-1", ...over });
 
-  test("encoder: exact grammar, real calendar instants only, floor seconds, B1 band, unpinned ceiling refuses", () => {
+  test("encoder: exact grammar, real calendar instants only, floor seconds, B1 band, pinned production ceiling", () => {
     expect(createdAtSeconds("2026-11-07T11:30:00.000000Z")).toBe(Date.UTC(2026, 10, 7, 11, 30, 0) / 1000);
     expect(createdAtSeconds("2026-11-07T11:30:00.999999Z")).toBe(Date.UTC(2026, 10, 7, 11, 30, 0) / 1000);
     expect(createdAtSeconds("2024-02-29T23:59:59.000001Z")).toBe(Date.UTC(2024, 1, 29, 23, 59, 59) / 1000);
@@ -774,22 +782,33 @@ describe("buffered feed version (S): created_at seconds with same-second refusal
     expect(() => encodeBufferedVersion("2026-11-07T11:30:00.000Z", TEST_CEILING)).toThrow(expect.objectContaining({ code: "stage_created_at_invalid" }));
     expect(() => encodeBufferedVersion("1970-01-01T00:00:00.000000Z", TEST_CEILING)).toThrow(expect.objectContaining({ code: "buffered_version_out_of_band" }));
     expect(() => encodeBufferedVersion("2026-11-07T11:30:00.000000Z", 1_000)).toThrow(expect.objectContaining({ code: "buffered_version_out_of_band" }));
-    // The production ceiling is not pinned in this change (operator counts-only read first): refuse.
-    expect(BUFFERED_VERSION_CEILING).toBeUndefined();
-    expect(() => encodeBufferedVersion("2026-11-07T11:30:00.000000Z")).toThrow(expect.objectContaining({ code: "buffered_version_ceiling_unpinned" }));
+    // The production ceiling is pinned to the operator read's exact canonical min(version) (2026-11-10 16:20Z).
+    expect(BUFFERED_VERSION_CEILING).toBe(1793454538262);
+    expect(Number.isSafeInteger(BUFFERED_VERSION_CEILING)).toBe(true);
+    expect(BUFFERED_VERSION_CEILING!).toBeGreaterThan(1e12);
+    expect(encodeBufferedVersion("2026-11-07T11:30:00.000000Z")).toBe(Date.UTC(2026, 10, 7, 11, 30, 0) / 1000);
+    const current = encodeBufferedVersion("2026-11-10T16:20:00.000000Z", 1793454538262);
+    expect(current).toBeGreaterThan(0);
+    expect(current).toBeLessThan(1793454538262);
+    // An explicit `undefined` argument takes the parameter default, which is now the pin, so it does not refuse:
+    // `buffered_version_ceiling_unpinned` is unreachable through these APIs while the constant is pinned.
+    expect(encodeBufferedVersion("2026-11-07T11:30:00.000000Z", undefined)).toBe(Date.UTC(2026, 10, 7, 11, 30, 0) / 1000);
   });
 
-  test("config and guard: the second-version flag is literal off/on; on with the legacy encoding or an unpinned ceiling refuses", () => {
+  test("config and guard: the second-version flag is literal off/on; on with the legacy encoding refuses, pinned ceiling accepts", () => {
     const declared = { BUFFERED_SEARCH_FEED_GATE_DECLARED: BUFFERED_SEARCH_GATE_CONTRACT, INGEST_BUFFERED_SEARCH_FEED: "on" };
     expect(bufferedFeedConfig({}).secondVersion).toBe(false);
     expect(bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION: "on" }).secondVersion).toBe(true);
     for (const v of ["1", "true", "ON", ""]) expect(() => bufferedFeedConfig({ INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION: v })).toThrow(expect.objectContaining({ code: "config_second_version_invalid" }));
     expect(bufferedFeedVersionRefusal({})).toBe("version_encoding_not_armed");
     expect(bufferedFeedVersionRefusal({ INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION: "off" }, TEST_CEILING)).toBe("version_encoding_not_armed");
-    expect(bufferedFeedVersionRefusal(SECOND)).toBe("buffered_version_ceiling_unpinned");
+    expect(bufferedFeedVersionRefusal(SECOND)).toBeNull();
+    expect(bufferedFeedVersionRefusal(SECOND, undefined)).toBeNull(); // explicit undefined takes the pinned default
+    expect(bufferedFeedVersionRefusal({ INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION: "off" })).toBe("version_encoding_not_armed");
     expect(bufferedFeedVersionRefusal(SECOND, TEST_CEILING)).toBeNull();
     expect(() => bufferedFeedConfig(declared, TEST_CEILING)).toThrow(expect.objectContaining({ code: "version_encoding_not_armed" }));
-    expect(() => bufferedFeedConfig({ ...declared, ...SECOND })).toThrow(expect.objectContaining({ code: "buffered_version_ceiling_unpinned" }));
+    expect(() => bufferedFeedConfig(declared)).toThrow(expect.objectContaining({ code: "version_encoding_not_armed" }));
+    expect(bufferedFeedConfig({ ...declared, ...SECOND })).toMatchObject({ enabled: true, secondVersion: true });
     expect(bufferedFeedConfig({ ...declared, ...SECOND }, TEST_CEILING)).toMatchObject({ enabled: true, secondVersion: true });
   });
 

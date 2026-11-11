@@ -1,12 +1,13 @@
 /** Bounded immutable image construction. Reuses the writer's manifest/chunk codec
  * and the reader's admitted source identity; it does not implement another fold.
  */
+import type { BoundRawChunkSealer } from "../../packages/pipeline/src/lib/pipeline/engine-raw-chunks.ts";
 import {createHash} from "node:crypto";
 import {
  objectKey,parseManifest,parseSessionKey,rawChunkKey,computeContentSha256,publicationManifestKey,isObjectStoreError,
  META_CONTENT_SHA256,type ObjectStore,type PutOpts,type PutAck,type ManifestV1,type ObjectVersion,
 } from "../../packages/object-store/src/index.ts";
-import {sealRawChunk} from "../../packages/pipeline/src/lib/pipeline/raw-chunks.ts";
+import {sealRawChunk} from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import {readCapped,buildObjectLandedMessage} from "../../packages/pipeline/src/lib/pipeline/adapter.ts";
 import {canonicalManifestIdentity,manifestUserId} from "../shared/manifest-identity.ts";
 import {nextManifest,lineTimeMs,admittedIdentity,LIVE_OWNER,derivedUuidV7} from "./writer.ts";
@@ -85,7 +86,9 @@ async function readPrevious(ticket:PublicationTicket,head:PublicationHead,target
 export async function preparePublicationImage(
  ticket:PublicationTicket,head:PublicationHead,decoded:DecodedBufferedStage,target:PublicationTarget,store:ObjectStore,signal:AbortSignal,
  now:()=>Date=()=>new Date(),
+ rawChunkSealer?:BoundRawChunkSealer,
 ):Promise<PreparedPublicationImage>{
+ const rawSealer=rawChunkSealer??sealRawChunk;
  signal.throwIfAborted();
  const header=decoded.header,group=decoded.groups[head.groupIndex],ordinals=decoded.spec.groupOrdinals[head.groupIndex];
  if(header.org_id!==ticket.tenant.orgId||header.workspace_id!==ticket.tenant.workspaceId||header.user_id!==ticket.tenant.userId||
@@ -111,7 +114,7 @@ export async function preparePublicationImage(
  }} satisfies ObjectStore;
  const source=enc.encode(lines.join("\n")+"\n");
  if(source.byteLength>MAX_CHUNK)throw refused("publication_new_chunk_limit");
- const sealed=await sealRawChunk(capture,{location,format:"ndjson",seq:prev?.raw.chunks.length??0,epoch:prev?.raw.epoch??0,startOffset:prev?.raw.next_offset??0,source,traceId});
+ const sealed=await rawSealer(capture,{location,format:"ndjson",seq:prev?.raw.chunks.length??0,epoch:prev?.raw.epoch??0,startOffset:prev?.raw.next_offset??0,source,traceId});
  if(!captured)throw refused("publication_chunk_codec_missing");
  const packed=captured as {key:string;body:Uint8Array;options?:PutOpts};
  const chunks=[...(prev?.raw.chunks??[]),sealed.entry];

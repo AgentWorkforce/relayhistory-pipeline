@@ -36,7 +36,9 @@ import { sqlBriefSummary } from "./brief-summary.ts";
  * see readApiIntrospectPositiveTtlMs). READ_API_SESSION_QUERY (exactly "true" serves
  * `q` on GET /v1/sessions and /v1/sessions/activity from the directory's query functions,
  * migration 20261105046010; unset/""/"false" off = 501 `param_q` as before; anything else
- * fails startup, see sessionQueryEnabled).
+ * fails startup, see sessionQueryEnabled). READ_API_COORDINATION_OVERLAPS_ENABLED (exactly
+ * "true") exposes GET /v1/coordination/overlaps; READ_API_COORDINATION_OVERLAPS_BACKEND selects
+ * clickhouse (default) or postgres (self-host service only).
  *
  * Owner-only buffered reads (RELAYHISTORY_READ_OWNER_BUFFERED, owner-buffered.ts) are
  * Worker-only: they need the HISTORY_CONTROL_HEAD service binding. This entry never wires
@@ -62,13 +64,19 @@ import {
 } from "./auth.ts";
 import { parseSelfhostLoginSync, parseSelfhostReadApi } from "./selfhost.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
-import { parseCompleteSince, parseFactsBackend, readApiRouteEnabled, READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND } from "./config.ts";
-import { poolTenantRunner, sqlLiveness, type SqlQuery } from "./liveness.ts";
+import {
+  coordinationOverlapsEnabled, parseCompleteSince, parseFactsBackend, readApiRouteEnabled,
+  READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_COORDINATION_OVERLAPS_ENABLED,
+  READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND,
+} from "./config.ts";
+import { poolTenantRunner, sqlLiveness, sqlOperatorErased, type SqlQuery } from "./liveness.ts";
+import { ERASE_FENCE_FLAG, eraseRuntimeFlag } from "../session-erase/flags.ts";
 import { createS3Store } from "../shared/vendor.ts";
 import { sqlAnalysisSource } from "./analysis-source.ts";
 import { sqlNarrativeCache, type DigestNarrativeDeps } from "./digest-narrative.ts";
 import { postgresOutputBackend } from "./postgres/output-query.ts";
 import { postgresDigestBackend } from "./postgres/digest-query.ts";
+import { postgresCoordinationBackend } from "./postgres/coordination-query.ts";
 import { ANALYTICS_OFF, ANALYTICS_SINK_VAR, analyticsConfig, analyticsCounterFields, createAnalyticsSink } from "../shared/analytics-config.ts";
 import { serviceCanonicalDeps } from "./service-canonical.ts";
 import { digestEnabled, digestNarrativeModel, selfhostNarrativeFromEnv } from "./digest-narrative-selfhost.ts";
@@ -503,17 +511,19 @@ async function buildApp(env: NodeJS.ProcessEnv = process.env, composition?: Sear
 }
 
 /**
- * READ_API_OUTPUT_BACKEND / READ_API_DIGEST_BACKEND (config.ts parseFactsBackend): which facts
- * store serves Output and the digest. Unset = "clickhouse", today's behaviour. "postgres" (the
+ * READ_API_OUTPUT_BACKEND / READ_API_DIGEST_BACKEND / READ_API_COORDINATION_OVERLAPS_BACKEND
+ * (config.ts parseFactsBackend): which facts store serves these read routes. Unset = "clickhouse",
+ * today's behaviour. "postgres" (the
  * self-host Postgres facts, migration 045040) is served only by the self-host service: the hosted
  * Lambda refuses it rather than ignore it. Any other value refuses to start.
  */
 export function factsBackends(env: NodeJS.ProcessEnv, entry: ReadAppEntry) {
   const output = parseFactsBackend(env, READ_API_OUTPUT_BACKEND);
   const digest = parseFactsBackend(env, READ_API_DIGEST_BACKEND);
-  if (entry !== "service" && (output === "postgres" || digest === "postgres"))
-    throw new Error("session read api: READ_API_OUTPUT_BACKEND/READ_API_DIGEST_BACKEND=postgres is served only by the self-host service");
-  return { output, digest };
+  const coordination = parseFactsBackend(env, READ_API_COORDINATION_OVERLAPS_BACKEND);
+  if (entry !== "service" && (output === "postgres" || digest === "postgres" || coordination === "postgres"))
+    throw new Error("session read api: a facts backend set to postgres is served only by the self-host service");
+  return { output, digest, coordination };
 }
 
 /** The read API's dependencies except its verifier: the read-role pool, the
@@ -528,6 +538,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const sessionQuery = sessionQueryEnabled(env);
   const loginSync = parseSelfhostLoginSync(env);
   const facts = factsBackends(env, entry);
+  const coordinationEnabled = coordinationOverlapsEnabled(env[READ_API_COORDINATION_OVERLAPS_ENABLED]);
   // The self-host service never inherits the hosted Supabase pin by omission.
   if (entry === "service" && !env.SESSION_POSTGRES_TLS_PROFILE)
     throw new Error("session read api: the self-host service needs SESSION_POSTGRES_TLS_PROFILE set explicitly");
@@ -600,6 +611,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   // their 501 `*_not_configured` there).
   const canonical = entry === "service" ? await serviceCanonicalDeps(env, poolTenantRunner(pool as never)) : undefined;
   const liveness = sqlLiveness(poolTenantRunner(pool as never));
+  const operatorErased = entry === "service" && eraseRuntimeFlag(env, ERASE_FENCE_FLAG)
+    ? sqlOperatorErased(poolTenantRunner(pool as never)) : undefined;
   // The self-host service only, READ_API_DIGEST_ENABLED=1 (digest-narrative-selfhost.ts): the
   // narrative cache on this read pool and, with a model, key and READ_API_DIGEST_NARRATIVE_DB_URL,
   // in-process generation through a separate writer pool. Also returned beside `deps`; it serves
@@ -616,9 +629,16 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   // defensive only (a miss is then 200 `provider_not_configured`).
   const digestDeps = facts.digest === "postgres" && readApiRouteEnabled(env.READ_API_DIGEST_ENABLED)
     ? { digest: { ...(narrative?.deps ?? { cache: sqlNarrativeCache(poolTenantRunner(pool as never)) }), backend: postgresDigestBackend(factsDeps) } } : {};
+  const coordinationDeps = coordinationEnabled
+    ? { coordination: {
+        enabled: true as const,
+        ...(facts.coordination === "postgres" ? { backend: postgresCoordinationBackend(factsDeps) } : {}),
+      } }
+    : {};
   const deps: Omit<ReadApiDeps, "verify"> = {
     ...(adapter ? { adapter } : { ch: createClickHouseClient(secret.clickhouse!) }),
     liveness,
+    ...(operatorErased ? { operatorErased } : {}),
     directory: sqlDirectory(poolTenantRunner(pool as never)),
     directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
     ...(analysis ? { analysis } : {}),
@@ -631,6 +651,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...(sessionQuery ? { sessionQuery: true } : {}),
     ...outputDeps,
     ...digestDeps,
+    ...coordinationDeps,
     ...(authConfig.selfIssued ? { selfIssued: { ...authConfig.selfIssued, store: sqlTokenStore(pool as never) } } : {}),
     ...(corsAllowedOrigins?.size ? { corsAllowedOrigins } : {}),
     ...(selfhostReadApi ? { selfhost: { ...(authConfig.mode === "self_issued" ? {} : { login: relaycontrolLogin(authConfig) }), ...(canonical ? { catalog: canonical.catalog } : {}), ...(loginSync ? { syncServed: true as const } : {}) } } : {}),

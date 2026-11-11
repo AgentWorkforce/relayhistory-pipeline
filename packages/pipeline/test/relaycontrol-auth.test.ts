@@ -137,6 +137,13 @@ describe("flag on", () => {
     expect(jwksCalls()).toHaveLength(0);
   });
 
+  it("passes rth:consent (a person's confirmed upload-consent write) and still drops every unlisted scope", async () => {
+    introspect = () => Response.json(active({ scopes: ["rth:sync", "rth:consent", "rth:admin", "cli:auth"] }));
+    const response = await app()(TOKEN);
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as { scopes: string[] }).scopes).toEqual(["rth:sync", "rth:consent"]);
+  });
+
   it("sends the configured secret, the token, aud and workspace, with redirect manual (never error, which workerd rejects) and a timeout signal", async () => {
     await app()(TOKEN);
     const [[url, init]] = introspectCalls() as [[string, RequestInit]];
@@ -506,6 +513,35 @@ describe("the introspector directly", () => {
     expect(bodies[1]).toEqual({ token: TOKEN, aud: ORIGIN, workspace: "ws_resp", machine: "mach-1" });
     // A workspace that was sent must come back exactly.
     await expect(introspector.verifyRelaycontrolToken(TOKEN, { aud: ORIGIN, workspace: WORKSPACE })).rejects.toBeInstanceOf(RelaycontrolRejectedError);
+  });
+
+  it("carries role and capture_policy (v1.5) when sent, and verifies without them (older relaycontrol)", async () => {
+    let extra: Record<string, unknown> = {};
+    const { introspector } = make(() => Response.json(active({ iat: at(0), exp: at(3600), ...extra })));
+    const bare = await introspector.verifyRelaycontrolToken(TOKEN, req);
+    expect("role" in bare).toBe(false);
+    expect("capturePolicy" in bare).toBe(false);
+    extra = { role: "member", capture_policy: { version: 1, revision: 4, settings: { user_retroactive_delete: false } } };
+    const withPolicy = await introspector.verifyRelaycontrolToken("sh_at_synthetic-token-value-0002", req);
+    expect(withPolicy.role).toBe("member");
+    expect(withPolicy.capturePolicy).toEqual({ revision: 4, settings: { user_retroactive_delete: false } });
+    extra = { capture_policy: { version: 1, revision: 5, settings: { sharing_mode: "new" }, sharing_mode_since: "2026-11-01T00:00:00.000Z" } };
+    const sharingNew = await introspector.verifyRelaycontrolToken("sh_at_synthetic-token-value-0003", req);
+    expect(sharingNew.capturePolicy).toEqual({ revision: 5, settings: { sharing_mode: "new" }, sharingModeSinceMs: Date.parse("2026-11-01T00:00:00.000Z") });
+  });
+
+  it("fails closed (503) on a role or capture_policy that is present but not the contract shape", async () => {
+    for (const extra of [
+      { role: 7 }, { role: "" },
+      { capture_policy: null }, { capture_policy: [] }, { capture_policy: { version: 2, revision: 1, settings: {} } },
+      { capture_policy: { version: 1, revision: 0, settings: {} } }, { capture_policy: { version: 1, revision: 1.5, settings: {} } },
+      { capture_policy: { version: 1, revision: 2, settings: [] } }, { capture_policy: { version: 1, revision: 2 } },
+      { capture_policy: { version: 1, revision: 2, settings: {}, sharing_mode_since: "yesterday" } },
+      { capture_policy: { version: 1, revision: 2, settings: {}, sharing_mode_since: 1700000000000 } },
+    ]) {
+      const { introspector } = make(() => Response.json(active({ iat: at(0), exp: at(3600), ...extra })));
+      await expect(introspector.verifyRelaycontrolToken(TOKEN, req)).rejects.toBeInstanceOf(RelaycontrolUnavailableError);
+    }
   });
 
   it("sets the machine claim only from a verified machine_id equal to the claimed one", async () => {

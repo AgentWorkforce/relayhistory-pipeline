@@ -34,6 +34,7 @@ import {
   searchRpcRequest,
 } from "../search-query.ts";
 import { runMigrations } from "../migrate.ts";
+import { ScrubberError } from "@rhc/lib/scrub-engine/index.ts";
 import { replayDatabase } from "../../session-pipeline/__tests__/replay-fixture.ts";
 import type { HoopDb } from "../../shared/db.ts";
 import { hoopDbSessionIndex } from "../index.ts";
@@ -447,6 +448,29 @@ describe("short_summary writer", () => {
     );
     expect(older.written).toBe(false);
     expect((await row(db))?.short_summary).toBe("newer");
+  });
+
+  test("retryable scrubber failures preserve the older summary and its search result", async () => {
+    const db = await database();
+    await insertRow(db);
+    await summarize(db, KEY, "Saved heron migration notes");
+    const before = await row(db);
+    const tenant = claims("org-a", ["ws-a"]);
+    for (const failure of [
+      new ScrubberError("scrubber_engine_failure", "instance_poison"),
+      new ScrubberError("scrubber_instance_poisoned", "instance_poison"),
+      new ScrubberError("scrub_admission_unavailable", "call_refusal", undefined, true),
+    ]) {
+      await expect(writeShortSummary(db, {
+        ...KEY, summary: "New producer summary", source: "bob-costas/v1",
+        generatedAt: new Date(AT.getTime() + 1000),
+      }, () => { throw failure; })).rejects.toBe(failure);
+      const stored = await row(db);
+      expect(stored?.short_summary).toBe(before?.short_summary);
+      expect(stored?.short_summary_generated_at).toEqual(before?.short_summary_generated_at);
+      expect(stored?.search_text).toBe(before?.search_text);
+      expect(await search(db, tenant, "ws-a", "heron")).toHaveLength(1);
+    }
   });
 
   test("a rejected newer summary clears the older one; a rejected older one leaves a newer one", async () => {

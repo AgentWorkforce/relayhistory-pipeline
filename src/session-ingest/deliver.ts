@@ -1,4 +1,5 @@
 import type {CurrentCustodyPacket,CurrentCustodyAck} from "./custody-protocol.ts";
+import { sessionKey } from "./upload-consent.ts";
 import {validatedCustodyAck} from "./custody-ack.ts";
 /**
  * `POST /v1/delivery/batches` without Neon: every accepted batch is in S3
@@ -35,6 +36,12 @@ import {validatedCustodyAck} from "./custody-ack.ts";
  * `ledger_lock_timeout`) is a 429 `ClaimLockBusy` with `Retry-After` 5-10 s instead
  * of a 503. The statement rolled back, so nothing was written and the retry is the
  * same idempotent claim; 57014 (`ledger_timeout`) and every other cause stay 503.
+ * Second exception, default off and independent (INGEST_CLAIM_TIMEOUT_BUSY=on,
+ * `DeliverDeps.claimTimeoutBusy`): a claim whose statement hit statement_timeout or was
+ * cancelled (`ledger_timeout` with SQLSTATE 57014 by code only; name-only client timeouts
+ * stay 503) is the same 429 `ClaimLockBusy`. It is the same rolled back single statement.
+ * Hypothesis, pending operator pg_stat_activity/lock/plan evidence: several sub-2 s lock
+ * waits on the per-user fence row add up to the 5 s statement_timeout.
  */
 import type { Ledger, LedgerTenant, RevisionConflict, SlotRequest } from "./ledger.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
@@ -57,6 +64,8 @@ import { prepareBufferedStage, putBufferedStage, fanoutMessages, stageGroups, ty
 import { MAX_FETCH_REDIRECTS, babysitterStub, bucketBodies, bucketRefs, planBabysitterBuckets, planKey, worstCaseSubrequests, writeBucketObjects, type BucketRefs } from "./babysitter-retention.ts";
 
 export interface DeliverDeps {
+  /** Default-off self-host operator fence: persist an obligation around actual object writes. */
+  withSessionWrites?: import("../session-erase/runtime.ts").SessionWriteGuard;
   /** Verified private source packet, bound to this request only. */
   custody?:CurrentCustodyPacket;
   ledger: Ledger;
@@ -108,6 +117,13 @@ export interface DeliverDeps {
    * Unset (the default): the 503 `IngestUnavailable`, unchanged.
    */
   claimLockBusy?: true;
+  /**
+   * INGEST_CLAIM_TIMEOUT_BUSY=on: a claim-stage statement timeout / cancel (cause `ledger_timeout`,
+   * SQLSTATE 57014 by code only; name-only client timeouts stay 503) is refused as the same 429 `ClaimLockBusy` (Retry-After in CLAIM_LOCK_RETRY_AFTER).
+   * Independent of `claimLockBusy`; the route line keeps `error_code: ledger_timeout` /
+   * `db_error_code: 57014`, so the two causes stay separable. Unset (the default): the 503, unchanged.
+   */
+  claimTimeoutBusy?: true;
   /** Test seam for the ClaimLockBusy jitter: a value in [0, 1). Default Math.random. */
   random?: () => number;
   /**
@@ -118,6 +134,15 @@ export interface DeliverDeps {
    * those admit nothing new.
    */
   admissionGate?: () => Promise<void>;
+  /**
+   * Upload consent (upload-consent.ts): runs on the request path AND in the async consumer, AFTER a
+   * `claimed`/`resume` claim and BEFORE any slot or S3 write, then once more right before the receipt
+   * commit, so a narrowing that lands while the batch is in flight still refuses it before it is visible.
+   * `dropped` names the sessions the claim's deletion fence acknowledges without storing (as
+   * `upload-consent.ts` `sessionKey`s). Throws `UploadConsentRequired` to refuse. A replay / replay_fast
+   * claim never calls it: those admit nothing new.
+   */
+  consentGate?: (dropped: ReadonlySet<string>, phase: "admit" | "commit") => Promise<void>;
 }
 
 /** Whether this deployment routes Babysitter upserts to retention buckets (see `DeliverDeps.babysitterRetention`). */
@@ -278,17 +303,31 @@ async function runStage<T>(name: string, work: () => Promise<T>, observe?: Stage
   }
 }
 
+/** The consent gate as its own stage: a store failure is a 503 (no ACK), never an admit. */
+function consentStage(deps: Pick<DeliverDeps, "stageLatency" | "consentGate">, dropped: ReadonlySet<string>, phase: "admit" | "commit"): Promise<void> {
+  return runStage(phase === "admit" ? "consent_gate" : "consent_commit", () => deps.consentGate!(dropped, phase), deps.stageLatency);
+}
+
 /** The stage wrapper bound to this delivery's observer (undefined, the default: no latency lines). */
 function stagesFor(deps: Pick<DeliverDeps, "stageLatency">) {
   return <T>(name: string, work: () => Promise<T>): Promise<T> => runStage(name, work, deps.stageLatency);
 }
 
-/** The claim stage; with `claimLockBusy`, its lock-wait 503 becomes a 429 ClaimLockBusy (nothing else changes). */
-async function claimStage<T>(deps: Pick<DeliverDeps, "stageLatency" | "claimLockBusy" | "random">, work: () => Promise<T>): Promise<T> {
+/** SQLSTATE 57014 by code only: `ledger_timeout` is also derived from a code-less error whose name
+ * matches /timeout/i (a client/pool TimeoutError); those, and a 57014 seen only in a message, stay 503. */
+function isClaimStatementTimeout(error: IngestUnavailable): boolean {
+  return error.cause_code === "ledger_timeout" && error.db !== undefined &&
+    error.db.db_error_code === "57014" && error.db.db_error_basis === "code";
+}
+
+/** The claim stage; with `claimLockBusy` its lock-wait 503, and with `claimTimeoutBusy` its statement-timeout
+ * 503, becomes a 429 ClaimLockBusy (nothing else changes). */
+async function claimStage<T>(deps: Pick<DeliverDeps, "stageLatency" | "claimLockBusy" | "claimTimeoutBusy" | "random">, work: () => Promise<T>): Promise<T> {
   try {
     return await runStage("claim", work, deps.stageLatency);
   } catch (error) {
-    if (deps.claimLockBusy && error instanceof IngestUnavailable && error.stage === "claim" && error.cause_code === "ledger_lock_timeout")
+    if (error instanceof IngestUnavailable && error.stage === "claim" &&
+      ((deps.claimLockBusy && error.cause_code === "ledger_lock_timeout") || (deps.claimTimeoutBusy && isClaimStatementTimeout(error))))
       throw new ClaimLockBusy(error.cause_code, error.db, claimLockRetryAfter(deps.random ?? Math.random));
     throw error;
   }
@@ -354,6 +393,8 @@ async function deliverPreparedCore(deps: DeliverDeps, tenant: LedgerTenant, prep
     return { custodyAck:claim.custodyAck,receipt: withLimits(prepared), outcome: "replay_fast", stats: { ...base, deleted_sessions: claim.deleted.length, stale: claim.stale.length, timing_ms: timing } };
 
   if (deps.admissionGate) await stage("admission_gate", deps.admissionGate);
+  const dropped: ReadonlySet<string> = new Set(claim.deleted.map(([s, id]) => sessionKey(s, id)));
+  if (deps.consentGate) await consentStage(deps, dropped, "admit");
   // The deletion filter (records of sessions the user deleted from this origin are
   // acknowledged, not stored) and the replay fast path (records already stored at or
   // above their revision are acknowledged, not written again).
@@ -363,7 +404,10 @@ async function deliverPreparedCore(deps: DeliverDeps, tenant: LedgerTenant, prep
   prepared.records.forEach((r, i) => {
     if (!stale.has(i) && !(r.session_id && deleted.has(pair(r.source, r.session_id)))) keep.push(i);
   });
-  const work = () => writeAndCommit(deps, tenant, prepared, sessions, deleted, keep, claim.resets, claim.claimToken, { ...base, stale: stale.size }, timing, mark, now);
+  const write = () => writeAndCommit(deps, tenant, prepared, sessions, deleted, keep, claim.resets, claim.claimToken, { ...base, stale: stale.size }, timing, mark, now);
+  const work = () => deps.withSessionWrites && keep.length
+    ? deps.withSessionWrites(tenant, groupRecords(keep.map(i => prepared.records[i]!), now()).groups.map(g => [g.source, g.sessionId] as [string, string]), write)
+    : write();
   if (!deps.slots) return work();
   const holder = (deps.requestId ?? (() => crypto.randomUUID()))();
   const slot = await stage("slot", () => deps.ledger.acquireSlot({ tenant, holder, ...deps.slots! }));
@@ -445,6 +489,7 @@ async function writeAndCommit(
     mark("buffer_intent");
     await stage("buffer_put", () => putBufferedStage(deps.target.store,preparedStage));
     mark("buffer_put");
+    if (deps.consentGate) await consentStage(deps, new Set(deleted), "commit");
     const ack=await stage("buffer_receipt", () => deps.ledger.commitBuffered!({...attempt,stageToken:intent.stageToken}));
     let custodyAck:CurrentCustodyAck|undefined;
     if(deps.custody){try{custodyAck=validatedCustodyAck(ack,deps.custody)}catch{throw new IngestUnavailable("buffer_receipt","custody_ack_missing")}}
@@ -486,6 +531,7 @@ async function writeAndCommit(
   }
 
   const writtenSessions = sessions.filter(([s, id]) => !deleted.has(pair(s, id)));
+  if (deps.consentGate) await consentStage(deps, new Set(deleted), "commit");
   const committed = await stage("commit", () =>
     deps.ledger.commit({
       tenant,

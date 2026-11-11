@@ -1,3 +1,4 @@
+import { readerMaxRuleset } from "../../pipeline/src/lib/scrub-engine/reader-policy.ts";
 import {
   canonicalArtifactPage,
   type ArtifactReadDeps,
@@ -28,6 +29,7 @@ export type CanonicalEnv = Pick<
   | "PIPELINE_ORG_FROM_PREFIX"
   | "PIPELINE_KEY_PREFIX"
 > & {
+  READER_MAX_RULESET?: string;
   CANONICAL_READ_ENABLED?: string;
   CANONICAL_READ_MODE?: "raw" | "pages" | string;
   CANONICAL_SUPABASE_URL?: string;
@@ -225,6 +227,7 @@ export async function canonicalHandle(
   let timer: ReturnType<typeof setTimeout> | undefined;
   const controller = new AbortController();
   try {
+    const maximum = readerMaxRuleset(env);
     if (env.CANONICAL_READ_ENABLED !== "true")
       throw new CanonicalReadError("not_configured");
     const url = new URL(request.url),
@@ -374,6 +377,7 @@ export async function canonicalHandle(
       if (!raw) throw new CanonicalReadError("not_configured");
       deps = {
         ...raw,
+        readerMaxRuleset: maximum,
         prefix: env,
         pointers: canonicalPointerReader(env, bearer, signal, boundedFetch),
         decompress: (bytes, max) => {
@@ -384,6 +388,7 @@ export async function canonicalHandle(
         },
       };
     }
+    deps = { ...deps, readerMaxRuleset: maximum };
     const snapshot = await Promise.race([
       // Display values only for the table that returns them; every other table reads as before.
       canonicalSnapshot(deps, identity, { directoryValues: table === "session_directory_event_values" }),

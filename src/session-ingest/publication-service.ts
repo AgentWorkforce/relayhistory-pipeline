@@ -32,6 +32,7 @@ import type { AddressInfo } from "node:net";
 import { publicationEnabled } from "./publication-runtime.ts";
 import { publicationConfigForTarget } from "./publication-portable.ts";
 import { publicationMain } from "./publication-main.ts";
+import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 
 export const PUBLICATION_HEALTH_PORT_VAR = "WORKER_HEALTH_PORT";
 /** publication-main's idle wait between empty cycles. */
@@ -151,8 +152,9 @@ export async function publicationService(
   }
 }
 
+// SCRUB_ENGINE (docs/scrub-engine.md): select, and for wasm verify the pinned engine, before serving.
 if (import.meta.main)
-  publicationService().catch((error) => {
+  initScrubEngine().then(() => publicationService()).catch((error) => {
     const raw = error?.code;
     const code = typeof raw === "string" && /^[A-Za-z0-9_]{1,64}$/.test(raw) ? raw : "publication_failed";
     console.error(JSON.stringify({ kind: "canonical-publication", service: "session-publication", healthy: false, code }));

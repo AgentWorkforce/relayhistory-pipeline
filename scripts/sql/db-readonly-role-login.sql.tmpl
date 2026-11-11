@@ -1,0 +1,41 @@
+-- sessions_readonly_stats, step 2 of 2: LOGIN, run by hand by the operator (manual psql template).
+--
+-- OWNER GATE. Turning LOGIN on for a production role is Khaliq's own separate go, in his own words,
+-- after step 1 (scripts/sql/db-readonly-role.sql). Pattern: supabase/bootstrap/session_read_api_role.sql
+-- (phase 2) and supabase/bootstrap/buffered_search_feed_runtime_role.sql (LOGIN after an explicit OK).
+--
+-- This file is the operator's manual template; no workflow or script runs it. The password lives in
+-- 1Password only: it is never committed, never written to disk, and never passed on a command line.
+-- The psql variable login_verifier holds a SCRAM-SHA-256 verifier computed on the operator machine
+-- (SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>), never the plaintext password, so a
+-- server statement log of this ALTER ROLE does not disclose a usable password.
+--
+--   psql --single-transaction -v ON_ERROR_STOP=1 -v login_verifier="$VERIFIER" -f <this file>
+--
+-- Afterwards the owner sets the production-db-readonly environment secret DB_READONLY_URL by hand from
+-- the 1Password item (see runbooks/sessions-prod-db-readonly-checks.md, step 2).
+--
+-- Rollback: scripts/sql/db-readonly-role-nologin.sql.
+
+DO $check$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.rolname = 'sessions_readonly_stats'
+                  AND NOT (r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls)) THEN
+    RAISE EXCEPTION USING ERRCODE = '42704', MESSAGE = 'sessions_readonly_stats: run step 1 (db-readonly-role.sql) first';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_db_role_setting s JOIN pg_catalog.pg_roles r ON r.oid = s.setrole
+                  WHERE r.rolname = 'sessions_readonly_stats' AND s.setdatabase = 0
+                    AND 'default_transaction_read_only=on' = ANY (s.setconfig)) THEN
+    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'sessions_readonly_stats: read-only default missing';
+  END IF;
+  -- Stats-only: refuse LOGIN while the role can read any sessions table or column.
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'sessions' AND c.relkind IN ('r', 'p', 'v', 'm', 'f')
+                AND (pg_catalog.has_table_privilege('sessions_readonly_stats', c.oid, 'SELECT')
+                     OR pg_catalog.has_any_column_privilege('sessions_readonly_stats', c.oid, 'SELECT'))) THEN
+    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'sessions_readonly_stats: table privilege present';
+  END IF;
+END
+$check$;
+
+ALTER ROLE sessions_readonly_stats WITH LOGIN PASSWORD :'login_verifier';

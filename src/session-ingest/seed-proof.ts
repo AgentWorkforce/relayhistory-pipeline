@@ -34,6 +34,7 @@ export interface SeedEvidence extends RelayhistoryRevisionSeat {
 }
 export interface ProofDeps {
   store: ObjectStore; reader: ManifestReader; bucket: string; provider: string;
+  readerMaxRuleset?: number;
   prefixFor(orgId: string): string;
   decompress(stored: Uint8Array, maxBytes: number): Uint8Array;
 }
@@ -140,7 +141,7 @@ export class SeedProofIndex {
       if (owner!==pointer.user_id && !legacyOwner) fail("seed_manifest_owner");
       let count=0,unseeded=0;
       this.db.exec("BEGIN"); transaction=true;
-      for await (const record of streamManifestRecords(manifest,deps.store,deps.prefixFor(pointer.org_id),deps.decompress)) {
+      for await (const record of streamManifestRecords(manifest,deps.store,deps.prefixFor(pointer.org_id),deps.decompress,Number.POSITIVE_INFINITY,deps.readerMaxRuleset)) {
         if (budget && Date.now() > budget.deadlineAtMs) fail("seed_proof_deadline");
         if (budget && ++budget.records > budget.maxRecords) fail("seed_proof_bound");
         if (legacyOwner && liveMachineId(pointer.workspace_id,record.origin_id,pointer.user_id)!==manifest.session.machine_id)

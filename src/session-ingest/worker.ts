@@ -36,6 +36,12 @@
  *                              (55P03/40P01) is a 429 delivery_busy with Retry-After 5-10 s instead of a
  *                              503 (deliver.ts ClaimLockBusy); 57014 and every other cause stay 503
  *                              (HTTP only: the admission consumer keeps its normal backoff)
+ *   INGEST_CLAIM_TIMEOUT_BUSY  unset/off (default) | on (any case): a claim whose statement timed out or was
+ *                              cancelled (ledger_timeout, SQLSTATE 57014 by code only; name-only client
+ *                              timeouts stay 503) is the same 429 delivery_busy with Retry-After 5-10 s
+ *                              instead of a 503; independent of INGEST_CLAIM_LOCK_BUSY; every other
+ *                              stage and cause stays 503 (HTTP only, as above). The Cloudflare stack
+ *                              renders it only from sessionIngest.claimTimeoutBusy: "on"
  *   INGEST_ASYNC_ADMISSION     unset/off (default) | on | drain: S3-first async admission
  *                              (async-admission.ts, docs/design/s3-first-async-ingest.md); on/drain need
  *                              buffered acceptance and the INGEST_ADMISSION queue (producer + consumer).
@@ -43,6 +49,9 @@
  *                              there); the runtime default stays off on purpose, so a Worker version or
  *                              self-host deployment without the var never starts admitting asynchronously
  *                              (no flip on a gradual version split, no queue it was not given).
+ *   HISTORY_UPLOAD_DIRECT      unset/off (default) | allowlist | on (upload-admission.ts): serves only
+ *                              GET /v1/delivery/admission?uploadKey=; allowlist reads
+ *                              HISTORY_UPLOAD_DIRECT_ALLOWLIST (org:<id> / ws:<id>). An invalid value is off (logged)
  *   INGEST_SYNC_ADMISSION_FROZEN_RECEIPT  unset/off (default) | on: under frozen-supabase custody, a queued-v1
  *                              caller on the synchronous path reads the frozen legacy receipt before any claim
  *                              (app.ts acceptBatch, as the admission consumer does)
@@ -59,11 +68,15 @@
  * Until the S3 key, the KMS key ARN and Hyperdrive are present, every request
  * is 503 `not_configured` and nothing is written.
  */
+import { uploadConsentEnforcement, type UploadConsentEnforcement } from "./upload-consent.ts";
+import { sqlUploadConsentStore } from "./upload-consent-sql.ts";
 import pg from "pg";
 import type { IngestAcceptanceMode } from "./buffered-protocol.ts";
 import { zstdDecompressSync } from "node:zlib";
 import { createS3Store, objectKey, type ObjectStore } from "../shared/vendor.ts";
 import { log } from "../shared/log.ts";
+import { ScrubEngineUnavailable, initScrubEngine, type LoadScrubWasmArtifact } from "@rhc/lib/scrub-engine/index.ts";
+import type { ReadBindgenArtifact } from "@rhc/lib/scrub-engine/bindgen-engine.ts";
 import { dbClientErrorFields } from "./db-error-class.ts";
 import { assertNoNeonEdge, neonExitProfile, NeonExitRefusal } from "../shared/neon-exit.ts";
 import { createIngestApp } from "./app.ts";
@@ -73,6 +86,7 @@ import { fanout, type FanoutMessage } from "./staging.ts";
 import type { StageLatencyFields } from "./deliver.ts";
 import type { WriteTarget } from "./writer.ts";
 import { routingFlag } from "./babysitter-retention.ts";
+import { UPLOAD_DIRECT_ALLOWLIST_VAR, UPLOAD_DIRECT_FLAG, UPLOAD_DIRECT_OFF, uploadDirectConfig, type UploadDirectConfig } from "./upload-admission.ts";
 import { asyncAdmissionMode, syncAdmissionFrozenReceiptMode, type AdmissionMessage, type AsyncAdmissionMode } from "./async-admission.ts";
 import { admitMessage, type AdmissionAction } from "./admission-consumer.ts";
 import { lockAlertFields } from "./app.ts";
@@ -88,6 +102,8 @@ interface QueueLike<T> {
 }
 
 export interface IngestWorkerEnv {
+  /** Unset / "ts" (default): the TypeScript scrubber. "wasm": the pinned relayscrubber module only (docs/scrub-engine.md). */
+  SCRUB_ENGINE?: string;
   HYPERDRIVE?: { connectionString: string };
   INGEST_FANOUT?: QueueLike<FanoutMessage>;
   /** S3-first async admission queue (producer + consumer: this Worker). Required with INGEST_ASYNC_ADMISSION on/drain. */
@@ -96,6 +112,12 @@ export interface IngestWorkerEnv {
   INGEST_ASYNC_ADMISSION?: string;
   /** off (default) | on (async-admission.ts syncAdmissionFrozenReceiptMode). */
   INGEST_SYNC_ADMISSION_FROZEN_RECEIPT?: string;
+  /** INGEST_UPLOAD_CONSENT: off (default) | report | hold-only | enforce (upload-consent.ts). */
+  INGEST_UPLOAD_CONSENT?: string;
+  /** off (default) | allowlist | on (upload-admission.ts): the ?uploadKey= admission status only. */
+  HISTORY_UPLOAD_DIRECT?: string;
+  /** HISTORY_UPLOAD_DIRECT=allowlist: comma-separated org:<id> / ws:<id>. */
+  HISTORY_UPLOAD_DIRECT_ALLOWLIST?: string;
   NEON_REPLICA?: QueueLike<NeonReplicaMessage>;
   /** Secrets Store bindings (a plain string in tests). */
   S3_ACCESS_KEY_ID?: SecretBinding | string;
@@ -129,6 +151,7 @@ export interface IngestWorkerEnv {
   /** "on" (any case): per-stage latency lines (deliver.ts StageLatencyFields). Default off. */
   INGEST_STAGE_LATENCY_LOG?: string;
   INGEST_CLAIM_LOCK_BUSY?: string;
+  INGEST_CLAIM_TIMEOUT_BUSY?: string;
   /** Operator per-session erase route (session-erase.ts): exactly "1" enables; unset, "" or "0" is off (default). */
   SESSION_ERASE_API_ENABLED?: string;
   /** Secrets Store: the bearer Control sends on /internal/v1/session-erase/* (min 32 chars). Read only when enabled. */
@@ -203,12 +226,18 @@ export interface IngestSettings {
   stageLatencyLog?: true;
   /** INGEST_CLAIM_LOCK_BUSY=on: a claim lock-wait failure is a 429 with Retry-After. Absent (the default): 503. */
   claimLockBusy?: true;
+  /** INGEST_CLAIM_TIMEOUT_BUSY=on: a claim statement timeout (SQLSTATE 57014 by code only) is a 429 with Retry-After. Absent (the default): 503. */
+  claimTimeoutBusy?: true;
   /** INGEST_ASYNC_ADMISSION: absent = off (the default). */
   asyncAdmission?: Exclude<AsyncAdmissionMode, "off">;
   /** INGEST_SYNC_ADMISSION_FROZEN_RECEIPT=on. Absent (the default): off. */
   syncAdmissionFrozenReceipt?: true;
+  /** HISTORY_UPLOAD_DIRECT allowlist|on. Absent (the default, or an invalid value, logged): off. */
+  uploadDirect?: UploadDirectConfig;
   /** SESSION_ERASE_API_ENABLED=1 (session-erase.ts). Absent (the default): the route answers 501. */
   sessionErase?: SessionEraseConfig;
+  /** INGEST_UPLOAD_CONSENT report|hold-only|enforce. Absent (the default): off. An invalid value refuses startup. */
+  uploadConsent?: Exclude<UploadConsentEnforcement, "off">;
 }
 
 /** The settings, or null while any required one is missing (every request is then 503 not_configured). */
@@ -243,6 +272,8 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   // Async admission without its queue would refuse every opted-in batch: not configured.
   if (asyncMode !== "off" && !env.INGEST_ADMISSION) return null;
   const syncFrozenReceipt = syncAdmissionFrozenReceiptMode(env.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT);
+  // A privacy control: an invalid value is a loud configuration error (every request 503), never off.
+  const uploadConsent = uploadConsentEnforcement(env.INGEST_UPLOAD_CONSENT);
   // Default off; the secrets are read and validated only when the flag is exactly "1". Isolated: the
   // secrets are runtime-mutable Secrets Store values, so an invalid flag or secret must never fail delivery
   // or the queue consumer. The erase route alone fails closed (503 unavailable); the log carries a code only.
@@ -258,6 +289,14 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   } catch {
     log.error("session ingest settings invalid", { error_code: "session_erase_config_invalid" });
     sessionErase = SESSION_ERASE_CONFIG_INVALID;
+  }
+  // HISTORY_UPLOAD_DIRECT (default off): only the ?uploadKey= status read; promotion is the upload-admission
+  // Lambda's. Isolated like the erase config: an invalid value is off (logged by code), never a delivery failure.
+  let uploadDirect: UploadDirectConfig = UPLOAD_DIRECT_OFF;
+  try {
+    uploadDirect = uploadDirectConfig({ [UPLOAD_DIRECT_FLAG]: env.HISTORY_UPLOAD_DIRECT, [UPLOAD_DIRECT_ALLOWLIST_VAR]: env.HISTORY_UPLOAD_DIRECT_ALLOWLIST });
+  } catch {
+    log.error("session ingest settings invalid", { error_code: "history_upload_direct_invalid" });
   }
   return {
     bucket,
@@ -281,9 +320,12 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(/^[0-9a-f]{64}$/.test(env.INGEST_EXPECT_GENERATION ?? "") ? { retentionGeneration: env.INGEST_EXPECT_GENERATION! } : {}),
     ...(routingFlag(env.INGEST_STAGE_LATENCY_LOG) ? { stageLatencyLog: true as const } : {}),
     ...(routingFlag(env.INGEST_CLAIM_LOCK_BUSY) ? { claimLockBusy: true as const } : {}),
+    ...(routingFlag(env.INGEST_CLAIM_TIMEOUT_BUSY) ? { claimTimeoutBusy: true as const } : {}),
     ...(asyncMode !== "off" ? { asyncAdmission: asyncMode } : {}),
     ...(syncFrozenReceipt === "on" ? { syncAdmissionFrozenReceipt: true as const } : {}),
     ...(sessionErase ? { sessionErase } : {}),
+    ...(uploadDirect.mode !== "off" ? { uploadDirect } : {}),
+    ...(uploadConsent !== "off" ? { uploadConsent } : {}),
   };
 }
 
@@ -353,6 +395,7 @@ export function deliverDepsFor(settings: IngestSettings, run: Run, target: Write
     // Default off: per-stage latency lines through the same allowlisted logger as the route line.
     ...(settings.stageLatencyLog ? { stageLatency: (fields: StageLatencyFields) => log.info("session ingest", { ...fields }) } : {}),
     ...(settings.claimLockBusy ? { claimLockBusy: true as const } : {}),
+    ...(settings.claimTimeoutBusy ? { claimTimeoutBusy: true as const } : {}),
   };
 }
 
@@ -412,6 +455,8 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: R
       : {}),
     ...(settings.syncAdmissionFrozenReceipt ? { syncAdmissionFrozenReceipt: "on" as const } : {}),
     ...(settings.sessionErase ? { sessionErase: settings.sessionErase } : {}),
+    ...(settings.uploadDirect ? { uploadDirect: settings.uploadDirect } : {}),
+    ...(settings.uploadConsent ? { uploadConsent: { enforcement: settings.uploadConsent, store: sqlUploadConsentStore(run) } } : {}),
   });
 }
 
@@ -440,7 +485,8 @@ export async function admitQueueBatch(messages: QueueMessage[], env: IngestWorke
     const deliver = deliverDepsFor(settings, db.run, target);
     for (const message of messages) {
       const started = Date.now();
-      const r = await admitMessage({ mode: settings.asyncAdmission ?? "off", deliver, custodySource: custody.custodySource, decompress: zstd }, message.body, message.attempts ?? 1)
+      const r = await admitMessage({ mode: settings.asyncAdmission ?? "off", deliver, custodySource: custody.custodySource, decompress: zstd,
+        ...(settings.uploadConsent ? { uploadConsent: { enforcement: settings.uploadConsent, store: sqlUploadConsentStore(db.run) }, log: (fields: Record<string, unknown>) => log.warn("session ingest admission", fields) } : {}) }, message.body, message.attempts ?? 1)
         .catch((error: unknown): AdmissionAction => ({ action: "retry", delaySeconds: 300, code: "admission_failed", error }));
       if (r.action === "ack") {
         log.info("session ingest admission", { route: "ingest.admission", outcome: r.outcome, error_code: r.code, duration_ms: Date.now() - started, ...(r.lagMs !== undefined ? { offset: r.lagMs } : {}), attempt: message.attempts ?? 1 });
@@ -466,6 +512,40 @@ function logSettingsInvalid(error: unknown): void {
   log.error("session ingest settings invalid", { error_code: error instanceof NeonExitRefusal ? error.code : error instanceof AnalyticsConfigError ? `missing_${error.variable}` : "settings_invalid" });
 }
 
+/**
+ * The Worker's wasm loader. The pinned module is not bundled yet (docs/scrub-engine.md,
+ * "Worker bundling"): until it is, SCRUB_ENGINE=wasm refuses every request and message.
+ */
+const loadWorkerScrubWasm: LoadScrubWasmArtifact = async () => {
+  throw new ScrubEngineUnavailable("artifact_missing");
+};
+
+/**
+ * The Worker's wasm-bindgen artifact reader. Cloudflare Workers are excluded from the
+ * relayscrubber 0.5.0-alpha.6 cutover (docs/scrub-engine.md, "Cutover: pinned
+ * relayscrubber 0.5.0-alpha.6"): no package is bundled and `createCompiledBindgenEngine`
+ * stays unwired, so SCRUB_ENGINE=wasm-bindgen refuses here explicitly instead of
+ * depending on what the runtime's filesystem happens to hold.
+ */
+const readWorkerBindgenArtifact: ReadBindgenArtifact = async () => {
+  throw new ScrubEngineUnavailable("artifact_missing");
+};
+
+/**
+ * Select the scrub engine for this isolate (once) and, for wasm, verify it. Unset or "ts":
+ * no I/O, always true, so the hosted Worker behaves exactly as before. A failure is logged
+ * as a code and the caller refuses the work; nothing is scrubbed by another engine.
+ */
+async function scrubEngineReady(env: IngestWorkerEnv): Promise<boolean> {
+  try {
+    await initScrubEngine({ env, loadArtifact: loadWorkerScrubWasm, bindgen: { readArtifact: readWorkerBindgenArtifact } });
+    return true;
+  } catch (error) {
+    log.error("session ingest scrub engine unavailable", { error_code: (error as { code?: string }).code ?? "scrub_engine_unavailable" });
+    return false;
+  }
+}
+
 const NOT_CONFIGURED = () =>
   Response.json({ error: { code: "not_configured", message: "the session ingest is not configured yet" }, correlationId: "" }, { status: 503, headers: { "retry-after": "60" } });
 
@@ -473,6 +553,7 @@ const zstd = (bytes: Uint8Array) => new Uint8Array(zstdDecompressSync(bytes));
 
 export default {
   async fetch(request: Request, env: IngestWorkerEnv, ctx: Ctx): Promise<Response> {
+    if (!(await scrubEngineReady(env))) return NOT_CONFIGURED();
     let settings: IngestSettings | null;
     let analyticsSelection: AnalyticsConfig;
     try {
@@ -516,6 +597,11 @@ export default {
    * minutes per attempt instead of walking to the DLQ in seconds.
    */
   async queue(batch: { queue?: string; messages: QueueMessage[] }, env: IngestWorkerEnv): Promise<void> {
+    if (!(await scrubEngineReady(env))) {
+      // As while not configured: wait five minutes per attempt, never scrub with another engine.
+      for (const message of batch.messages) message.retry({ delaySeconds: 300 });
+      return;
+    }
     const settings = await ingestSettings(env).catch((error: unknown) => { logSettingsInvalid(error); return null; });
     // Admission messages (INGEST_ADMISSION) are not canonical fanout: buffered mode admits them.
     const admission = batch.messages.filter((m) => (m.body as { kind?: unknown } | null)?.kind === "ingest-admission");
