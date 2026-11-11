@@ -229,3 +229,21 @@ present.
 `endpoint: null`. Hosted SSE-KMS stays enforced by the bucket policy and the
 PUT headers. Turning the consumer check on anywhere is a configuration change
 under the same explicit-OK rule as the other settings above.
+
+**Hosted requires `aws:kms` (2026-11-11).** The self-host default above stays
+`none`. Hosted does not use it: with `HISTORY_UPLOAD_DIRECT_INFRA=on` the
+transcript stage requires `transcriptStore.uploadInboxSse: "aws:kms"` in the
+stage inputs and returns the consumer environment
+`HISTORY_UPLOAD_INBOX_SSE=aws:kms` as `uploadInbox.consumerEnvironment`. Unset,
+`""`, `none` or any other value refuses before anything is declared
+(`stacks/aws/upload-inbox.ts`, `assertHostedUploadInboxSse`). With the flag
+off the input is inert, but a value other than `aws:kms` still refuses.
+
+**`sts:TagSession` before EKS role-chained activation.** relay-control reaches
+the desktop-upload role by role chaining from its EKS Pod Identity session, and
+Pod Identity supplies transitive session tags. The chained `AssumeRole`
+therefore needs `sts:TagSession` in two places: the desktop-upload role's trust
+policy (`desktopUploadTrustPolicy`, commit 809453d1) and the issuer's own
+identity policy (relay-control's role, which this repo does not declare),
+next to `sts:AssumeRole` and `sts:SetSourceIdentity` on the desktop-upload role.
+Both must be in place before the role-chained path is activated.

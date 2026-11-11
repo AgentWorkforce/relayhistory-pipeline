@@ -21,6 +21,11 @@
  *                                    clamped). How long an admitted token is reused per process before it is
  *                                    introspected again, also capped at the token's exp: the revocation lag.
  *                                    Recommended 30000-60000 when Control load matters (selfhost-auth.ts).
+ *   RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS
+ *                                    unset | "" | "report" (default) | exactly "enforce"; anything else is a startup
+ *                                    error. The capture policy upload check (capture-policy.ts): report logs an upload
+ *                                    made under a missing or older policy revision (or a session older than a
+ *                                    `sharing_mode: new` policy) and accepts it; enforce refuses it.
  *   SESSION_ERASE_API_ENABLED        operator per-session erase route (session-erase.ts): exactly "1" enables;
  *                                    unset, "" or "0" is off; anything else is a startup error. With it,
  *                                    SESSION_ERASE_API_SECRET (+ _PREVIOUS during a rotation; Secret-injected, min
@@ -87,6 +92,7 @@
  * INGEST_CUSTODY_SOURCE other than relayhistory/unset, INGEST_PRIVACY_AUTHORITY other than neon/unset,
  * INGEST_SIGNING_KEY (the relayhistory HMAC is never accepted here).
  */
+import type { CapturePolicyUploadsMode } from "./capture-policy.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { normalizedAudience } from "@rhc/auth/relaycontrol.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
@@ -137,6 +143,8 @@ export interface SelfhostIngestSettings {
   sessionSelection: boolean;
   /** RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT: answer the Desktop's onboarding heartbeat 204 (discarded). Default off. */
   heartbeatAccept: boolean;
+  /** RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: the capture policy upload check (capture-policy.ts). Default report. */
+  capturePolicyUploads: CapturePolicyUploadsMode;
   /** RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS: positive introspection cache, ms. 0 (default) = none. */
   introspectPositiveTtlMs: number;
   /** SESSION_ERASE_API_ENABLED (session-erase.ts). Default: disabled, the route answers 501. */
@@ -183,6 +191,16 @@ export function selfhostSessionSelectionEnabled(env: NodeJS.ProcessEnv = process
   if (raw === undefined || raw === "" || raw === "false") return false;
   if (raw === "true") return true;
   throw new Error(`96bulls: ${SELFHOST_SESSION_SELECTION_FLAG} must be true or false`);
+}
+
+export const SELFHOST_CAPTURE_POLICY_UPLOADS_VAR = "RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS";
+
+/** Unset, empty or "report" is report (the default); "enforce" enforces; anything else throws. */
+export function selfhostCapturePolicyUploads(env: NodeJS.ProcessEnv = process.env): CapturePolicyUploadsMode {
+  const raw = env[SELFHOST_CAPTURE_POLICY_UPLOADS_VAR];
+  if (raw === undefined || raw === "" || raw === "report") return "report";
+  if (raw === "enforce") return "enforce";
+  throw new Error(`96bulls: ${SELFHOST_CAPTURE_POLICY_UPLOADS_VAR} must be report or enforce`);
 }
 
 /** Exactly "true" enables; unset, empty or "false" is off; anything else throws (a typo never silently means either). */
@@ -282,6 +300,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   if (!selfhostIngestEnabled(env)) return { enabled: false, port: port(env) };
   const sessionSelection = selfhostSessionSelectionEnabled(env);
   const heartbeatAccept = selfhostHeartbeatAcceptEnabled(env);
+  const capturePolicyUploads = selfhostCapturePolicyUploads(env);
   const introspectPositiveTtlMs = selfhostIntrospectPositiveTtlMs(env);
   const sessionErase = sessionEraseConfig(env);
   const policy = destinationPolicy(env);
@@ -316,6 +335,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     maxPerOrg: bounded(env, "INGEST_MAX_PER_ORG", 32, 1, 1000),
     sessionSelection,
     heartbeatAccept,
+    capturePolicyUploads,
     introspectPositiveTtlMs,
     sessionErase,
     ...(admission ? { admission } : {}),

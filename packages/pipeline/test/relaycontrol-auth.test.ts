@@ -508,6 +508,35 @@ describe("the introspector directly", () => {
     await expect(introspector.verifyRelaycontrolToken(TOKEN, { aud: ORIGIN, workspace: WORKSPACE })).rejects.toBeInstanceOf(RelaycontrolRejectedError);
   });
 
+  it("carries role and capture_policy (v1.5) when sent, and verifies without them (older relaycontrol)", async () => {
+    let extra: Record<string, unknown> = {};
+    const { introspector } = make(() => Response.json(active({ iat: at(0), exp: at(3600), ...extra })));
+    const bare = await introspector.verifyRelaycontrolToken(TOKEN, req);
+    expect("role" in bare).toBe(false);
+    expect("capturePolicy" in bare).toBe(false);
+    extra = { role: "member", capture_policy: { version: 1, revision: 4, settings: { user_retroactive_delete: false } } };
+    const withPolicy = await introspector.verifyRelaycontrolToken("sh_at_synthetic-token-value-0002", req);
+    expect(withPolicy.role).toBe("member");
+    expect(withPolicy.capturePolicy).toEqual({ revision: 4, settings: { user_retroactive_delete: false } });
+    extra = { capture_policy: { version: 1, revision: 5, settings: { sharing_mode: "new" }, sharing_mode_since: "2026-11-01T00:00:00.000Z" } };
+    const sharingNew = await introspector.verifyRelaycontrolToken("sh_at_synthetic-token-value-0003", req);
+    expect(sharingNew.capturePolicy).toEqual({ revision: 5, settings: { sharing_mode: "new" }, sharingModeSinceMs: Date.parse("2026-11-01T00:00:00.000Z") });
+  });
+
+  it("fails closed (503) on a role or capture_policy that is present but not the contract shape", async () => {
+    for (const extra of [
+      { role: 7 }, { role: "" },
+      { capture_policy: null }, { capture_policy: [] }, { capture_policy: { version: 2, revision: 1, settings: {} } },
+      { capture_policy: { version: 1, revision: 0, settings: {} } }, { capture_policy: { version: 1, revision: 1.5, settings: {} } },
+      { capture_policy: { version: 1, revision: 2, settings: [] } }, { capture_policy: { version: 1, revision: 2 } },
+      { capture_policy: { version: 1, revision: 2, settings: {}, sharing_mode_since: "yesterday" } },
+      { capture_policy: { version: 1, revision: 2, settings: {}, sharing_mode_since: 1700000000000 } },
+    ]) {
+      const { introspector } = make(() => Response.json(active({ iat: at(0), exp: at(3600), ...extra })));
+      await expect(introspector.verifyRelaycontrolToken(TOKEN, req)).rejects.toBeInstanceOf(RelaycontrolUnavailableError);
+    }
+  });
+
   it("sets the machine claim only from a verified machine_id equal to the claimed one", async () => {
     let machineId: unknown = "mach-1";
     const { introspector } = make(() => Response.json(active({ machine_id: machineId, iat: at(0), exp: at(3600) })), { positiveTtlMs: 0, negativeTtlMs: 0 });

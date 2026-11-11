@@ -2389,13 +2389,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const CR = "upstream:20261105044090_claim_sessions_reader.sql";
     const DG = "upstream:20261105045000_digest_narrative_cache.sql";
     const CQ = "upstream:20261105047000_coordination_fact_readers.sql";
+    const SA = "upstream:20261105056000_session_summary_activity.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, SA]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2438,7 +2439,13 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105050010 (erase fence check) is the newest: 050000's down refuses (55000) while it is applied,
+    // 20261105056000 (summary activity) is the newest step: 050010's down refuses until its
+    // checksum-pinned rollback removes its reader and ledger row.
+    expect((await failure(rollback("20261105050010_operator_session_erase_fence_check.down.sql")))?.code).toBe("55000");
+    await rollback("20261105056000_session_summary_activity.down.sql");
+    expect(await names()).not.toContain(SA);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE oid = to_regprocedure('sessions.session_summary_activity_for(text,timestamptz,timestamptz)')")).rows[0]!.n).toBe(0);
+    // 20261105050010 (erase fence check) is then the newest: 050000's down refuses (55000) while it is applied,
     // and its own down restores 043850's claim/commit bodies and drops the session_index trigger.
     const claimSrc = async () => (await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.ingest_claim_batch_mode(jsonb,text)'::regprocedure")).rows[0]!.s;
     const indexGuard = async () => (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname='ingest_erase_fence_index_guard'")).rows[0]!.n;
@@ -2498,7 +2505,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'output\\_facts\\_%'")).rows[0]!.n).toBe(0);
     // Other lanes newer than 20261105045000 (045010 same-second feed, 045030 consumer project-text grant) roll back next, newest first: 045000's down
     // refuses (55000) while any of them is applied. (046010 and 046000 already rolled back above, so they are excluded here.)
-    const newerThanDigest = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > DG && s.name !== OE && s.name !== EF && s.name !== OF && s.name !== LQ && s.name !== CQ && s.name !== "upstream:20261105046000_analysis_jobs.sql").reverse();
+    const newerThanDigest = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > DG && s.name !== OE && s.name !== EF && s.name !== SA && s.name !== OF && s.name !== LQ && s.name !== CQ && s.name !== "upstream:20261105046000_analysis_jobs.sql").reverse();
     if (newerThanDigest.length)
       expect((await failure(rollback("20261105045000_digest_narrative_cache.down.sql")))?.code).toBe("55000");
     for (const { name } of newerThanDigest)

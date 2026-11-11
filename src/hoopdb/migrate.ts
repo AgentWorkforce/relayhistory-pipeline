@@ -9,7 +9,7 @@
  */
 import { createHash } from "node:crypto";
 import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   functionBoundaryEvidence,
@@ -82,6 +82,11 @@ interface Step {
   name: string;
   path: string;
   sentinel?: { evidence: string; sql: string };
+  /**
+   * Inline SQL instead of the file at path: only the release target's phase 2
+   * verifiers, read from the Git object database at the bound target commit.
+   */
+  sql?: string;
 }
 /**
  * The database-mode contract. The migrator never infers the target from a hostname:
@@ -320,25 +325,38 @@ export async function plan(profile: MigrationProfile): Promise<Step[]> {
         }))
       : []),
     ...(await schemaSteps()),
-    ...(profile.verify
-      ? [
-          {
-            name: "verify:session_directory_search_worker",
-            path: WORKER_VERIFY,
-          },
-          {
-            name: "verify:session_token_verifier",
-            path: TOKEN_VERIFIER_VERIFY,
-          },
-          {name:"verify:session_ingest_seeder",path:INGEST_SEED_VERIFY},
-          {name:"verify:session_ingest",path:INGEST_ROLE_VERIFY},
-          {name:"verify:canonical_project_events",path:PROJECT_EVENTS_VERIFY},
-          {name:"verify:acquisition_installer",path:ACQUISITION_INSTALLER_VERIFY},
-          {name:"verify:buffered_search_feed_runtime",path:BUFFERED_SEARCH_FEED_RUNTIME_VERIFY},
-        ]
-      : []),
+    ...(profile.verify ? PHASE2_VERIFY.map((v) => ({ ...v })) : []),
   ];
 }
+
+/**
+ * The fixed phase 2 verifier set, in run order (verify:buffered_search_feed_runtime
+ * last). The one list plan() runs and generation() hashes; a release target reads the
+ * same repository paths from its bound commit (src/hoopdb/release-target.ts).
+ */
+const PHASE2_VERIFY: readonly Step[] = [
+  { name: "verify:session_directory_search_worker", path: WORKER_VERIFY },
+  { name: "verify:session_token_verifier", path: TOKEN_VERIFIER_VERIFY },
+  { name: "verify:session_ingest_seeder", path: INGEST_SEED_VERIFY },
+  { name: "verify:session_ingest", path: INGEST_ROLE_VERIFY },
+  { name: "verify:canonical_project_events", path: PROJECT_EVENTS_VERIFY },
+  { name: "verify:acquisition_installer", path: ACQUISITION_INSTALLER_VERIFY },
+  { name: "verify:buffered_search_feed_runtime", path: BUFFERED_SEARCH_FEED_RUNTIME_VERIFY },
+];
+
+/**
+ * The repository layout generation() reads, as repository-relative paths: the schema
+ * lanes in migrator order (schemaSteps: each lane's *.sql sorted, upstream first) and
+ * the phase 2 verifier files. A release target reads exactly these paths from the Git
+ * object database at its bound commit.
+ */
+export const RELEASE_TREE = {
+  lanes: [
+    { prefix: "upstream:", dir: relative(ROOT, UPSTREAM_MIGRATIONS) },
+    { prefix: "96bulls:", dir: relative(ROOT, OURS) },
+  ],
+  verifiers: PHASE2_VERIFY.map((v) => ({ name: v.name, path: relative(ROOT, v.path) })),
+} as const;
 
 /** Names the services wait for: the schema steps, independent of the migrator's profile. */
 export async function expectedMigrationNames(): Promise<string[]> {
@@ -351,48 +369,77 @@ export async function expectedMigrationNames(): Promise<string[]> {
  * shim/bootstrap/verify flags, so the migrator, an external verifier and every reader
  * compute the same value for the same image.
  *
- * `held` (release target, see migrationTargetSplit): the TARGET generation, the same
- * algorithm over the schema steps without the held ones. Removing entries from the
- * ordered list is exactly what a source tree without those migration files computes as
- * its full generation, so an image built from that prefix tree (or a Worker bound to
- * it) and the migrator agree byte for byte. With nothing held it is the full
- * generation. A held name that is not a schema step of this tree refuses.
+ * A release target that holds steps does NOT use this tree's value: it binds the
+ * generation of a real commit whose tree ends at the target (target_sha), computed by
+ * manifestGeneration over that commit's own schema steps and its own verifier files,
+ * i.e. what `--generation` prints on a checkout of target_sha (see release-target.ts).
  */
-export async function generation(held: readonly string[] = []): Promise<string> {
+export async function generation(): Promise<string> {
+  return generationOfSteps(await schemaSteps());
+}
+
+/**
+ * generation() over an explicit ordered schema-step list (name and file path) plus
+ * the fixed phase 2 verifier list of this tree. generation() is this over schemaSteps().
+ */
+export async function generationOfSteps(
+  schema: readonly { name: string; path: string }[],
+): Promise<string> {
+  const parts: [string, string][] = [];
+  for (const s of [...schema, ...PHASE2_VERIFY])
+    parts.push([s.name, sha256Text(await readFile(s.path, "utf8"))]);
+  return generationOfDigests(parts);
+}
+
+/** sha256 of a file's text exactly as generation() digests it (read as utf8). */
+export function sha256Text(text: string): string {
+  return createHash("sha256").update(text).digest("hex");
+}
+
+/** The generation algorithm over ordered [name, sha256] pairs (steps, then verifiers). */
+export function generationOfDigests(parts: readonly (readonly [string, string])[]): string {
+  return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+}
+
+/**
+ * A release target's manifest: the exact schema steps through the target (the prefix,
+ * in migrator order) and the phase 2 verifier digests, both as they are in the tree of
+ * the bound target commit, which must equal the on-disk prefix step for step.
+ */
+export interface ReleaseManifest {
+  targetSha: string;
+  target: string;
+  steps: [string, string][];
+  verifiers: [string, string][];
+}
+
+/**
+ * The one canonical manifest digest: sha256 over a fixed-order JSON array (a version
+ * tag, targetSha, target, steps, verifiers). Bound into plan.json and the typed approval
+ * and recomputed by the apply job and by the migrator under its lock.
+ */
+export function releaseManifestDigest(m: ReleaseManifest): string {
+  return createHash("sha256")
+    .update(JSON.stringify(["96bulls-release-manifest-v1", m.targetSha, m.target, m.steps, m.verifiers]))
+    .digest("hex");
+}
+
+/** The generation an image built at the manifest's target commit computes (--generation there). */
+export function manifestGeneration(m: Pick<ReleaseManifest, "steps" | "verifiers">): string {
+  return generationOfDigests([...m.steps, ...m.verifiers]);
+}
+
+/**
+ * The on-disk prefix: [name, file sha256] of this tree's schema steps without `held`,
+ * in migrator order. A held name that is not a schema step of this tree refuses.
+ */
+export async function schemaStepDigests(held: readonly string[] = []): Promise<[string, string][]> {
   const schema = await schemaSteps();
   const names = new Set(schema.map((s) => s.name));
   if (held.some((n) => !names.has(n)))
     throw profileError("release_target_unknown", "a held step is not a schema step of this tree");
   const h = new Set(held);
-  return generationOfSteps(schema.filter((s) => !h.has(s.name)));
-}
-
-/**
- * generation() over an explicit ordered schema-step list (name and file path) plus
- * the fixed phase 2 verifier list. generation() is this over schemaSteps().
- */
-export async function generationOfSteps(
-  schema: readonly { name: string; path: string }[],
-): Promise<string> {
-  const steps: { name: string; path: string }[] = [
-    ...schema,
-    { name: "verify:session_directory_search_worker", path: WORKER_VERIFY },
-    { name: "verify:session_token_verifier", path: TOKEN_VERIFIER_VERIFY },
-    {name:"verify:session_ingest_seeder",path:INGEST_SEED_VERIFY},
-    {name:"verify:session_ingest",path:INGEST_ROLE_VERIFY},
-    {name:"verify:canonical_project_events",path:PROJECT_EVENTS_VERIFY},
-    {name:"verify:acquisition_installer",path:ACQUISITION_INSTALLER_VERIFY},
-    {name:"verify:buffered_search_feed_runtime",path:BUFFERED_SEARCH_FEED_RUNTIME_VERIFY},
-  ];
-  const parts: string[][] = [];
-  for (const s of steps)
-    parts.push([
-      s.name,
-      createHash("sha256")
-        .update(await readFile(s.path, "utf8"))
-        .digest("hex"),
-    ]);
-  return createHash("sha256").update(JSON.stringify(parts)).digest("hex");
+  return [...(await stepSha256s(schema.filter((s) => !h.has(s.name))))];
 }
 
 /** What readiness requires of HoopDb for this image (see schemaVerdict). */
@@ -443,10 +490,26 @@ export interface RunOptions {
   /** Release plan binding: the exact pending steps up to the target (requires target). */
   expectedPending?: string[];
   /**
-   * Release plan binding: the target (prefix) generation this run marks PASS, i.e.
-   * generation(held) (requires target). Refused before any write when it differs.
+   * Release plan binding: the target generation this run marks PASS, i.e. the
+   * generation of the bound target commit (manifestGeneration; generation() when
+   * nothing is held). Requires target. Refused before any write when it differs.
    */
   targetGeneration?: string;
+  /**
+   * Release target anchor (requires target; required whenever steps are held): the
+   * target commit, the approved manifest digest, and that commit's phase 2 verifier
+   * SQL (RELEASE_TREE.verifiers order) with their sha256, read from the Git object
+   * database by src/hoopdb/release-target.ts. Under the lock the migrator recomputes
+   * the manifest from the on-disk prefix plus these digests and refuses on any
+   * difference; phase 2 then runs this tree's verifiers and these, in that order.
+   */
+  targetBinding?: ReleaseTargetBinding;
+}
+
+export interface ReleaseTargetBinding {
+  targetSha: string;
+  manifestDigest: string;
+  verifiers: { name: string; sql: string; sha256: string }[];
 }
 
 /**
@@ -612,9 +675,11 @@ export async function inspectMigrations(client: MigrationClient, profile: Migrat
  *      ('pending', <generation>): from here every reader is non-ready;
  *   2. only a successful phase 2, in the same transaction, sets it to 'pass' for the
  *      generation it validated. With a release target that holds steps, that is the
- *      target (prefix) generation (generation(held)), never the full-tree one: the
- *      image of the prefix tree reads it as ready, an image of the full tree stays
- *      schema_pending until a later run applies the held steps;
+ *      generation of the bound target commit (targetBinding: the prefix steps plus that
+ *      commit's own verifiers), never the full-tree one, and only after both this
+ *      tree's verifiers and the target commit's have passed: an image built at the
+ *      target commit reads it as ready, an image of the full tree stays schema_pending
+ *      until a later run applies the held steps;
  *   3. any failure, crash or a disabled verifier (HOOPDB_ROLE_VERIFY=false) leaves
  *      it 'pending'. With the verifier disabled only an external verifier
  *      (supabase/bootstrap/session_directory_search_worker_mark_pass.sql) can pass it.
@@ -644,10 +709,11 @@ export async function runMigrations(
     if (
       opts.target !== undefined ||
       opts.expectedPending !== undefined ||
-      opts.targetGeneration !== undefined
+      opts.targetGeneration !== undefined ||
+      opts.targetBinding !== undefined
     ) {
       if (opts.target === undefined)
-        throw profileError("release_target_required", "expectedPending and targetGeneration require a release target");
+        throw profileError("release_target_required", "expectedPending, targetGeneration and targetBinding require a release target");
       const split = migrationTargetSplit(
         schema.map((s) => ({ name: s.name, pending: !ledger.has(s.name) })),
         opts.target,
@@ -660,15 +726,50 @@ export async function runMigrations(
         throw profileError("release_target_pending_changed", "pending steps up to the release target differ from the approved plan");
       held = new Set(split.held);
     }
-    // The generation this run validates and marks PASS. Nothing held: the full tree,
-    // generation() (unchanged). Steps held: the same algorithm over the schema steps of
-    // this plan without the held ones (generationOfSteps), the generation of the tree
-    // that ends at the target; for the real plan this is generation(held).
-    const gen = held.size
-      ? await generationOfSteps(schema.filter((s) => !held.has(s.name)))
-      : await generation();
+    // The generation this run validates and marks PASS. No target binding: generation()
+    // of this tree (unchanged). With a binding (required whenever steps are held): the
+    // generation of the bound target commit, recomputed here, under the lock, from the
+    // on-disk prefix (this plan's schema steps without the held ones) plus the target
+    // commit's verifier digests; the manifest digest must equal the approved one, so a
+    // prefix file changed on disk since the plan refuses before any write.
+    const binding = opts.targetBinding;
+    if (held.size && !binding)
+      throw profileError("release_target_binding_required", "steps are held: the run needs the approved target commit binding");
+    let targetVerify: Step[] = [];
+    let gen: string;
+    if (binding) {
+      if (!steps.some((s) => s.name.startsWith("verify:")))
+        throw profileError("release_target_verify_required", "a release target binding needs the in-process phase 2 verifiers");
+      const names = RELEASE_TREE.verifiers.map((v) => v.name);
+      if (
+        binding.verifiers.length !== names.length ||
+        binding.verifiers.some(
+          (v, i) => v.name !== names[i] || typeof v.sql !== "string" || sha256Text(v.sql) !== v.sha256,
+        )
+      )
+        throw profileError("release_target_manifest_changed", "the target commit's verifiers differ from their approved digests");
+      const manifest: ReleaseManifest = {
+        targetSha: binding.targetSha,
+        target: opts.target!,
+        steps: [...(await stepSha256s(schema.filter((s) => !held.has(s.name))))],
+        verifiers: binding.verifiers.map((v) => [v.name, v.sha256]),
+      };
+      if (releaseManifestDigest(manifest) !== binding.manifestDigest)
+        throw profileError("release_target_manifest_changed", "the prefix or target verifiers differ from the approved manifest");
+      gen = manifestGeneration(manifest);
+      // Nothing held: the target commit must compute this tree's own generation.
+      if (!held.size && gen !== (await generation()))
+        throw profileError("release_target_generation_changed", "nothing is held but the target commit's generation is not this tree's");
+      targetVerify = binding.verifiers.map((v) => ({
+        name: `verify:target:${v.name.slice("verify:".length)}`,
+        path: `${binding.targetSha}:${RELEASE_TREE.verifiers.find((r) => r.name === v.name)!.path}`,
+        sql: v.sql,
+      }));
+    } else gen = await generation();
     if (opts.targetGeneration !== undefined && opts.targetGeneration !== gen)
       throw profileError("release_target_generation_changed", "the target generation differs from the approved plan");
+    // Phase 2 order: this tree's verifiers (in plan order), then the target commit's.
+    const runSteps = [...steps, ...targetVerify];
     if (opts.beforeWrite) await opts.beforeWrite();
     await client.query("CREATE SCHEMA IF NOT EXISTS sessions");
     await client.query(`CREATE TABLE IF NOT EXISTS ${MIGRATION_LEDGER} (
@@ -748,17 +849,18 @@ export async function runMigrations(
     // The validation marker flips to 'pass' once, after every phase-2 verifier
     // has passed: only the last verify step does the UPDATE, so an earlier
     // failure can never leave a half-checked generation marked pass.
-    const lastVerifyIndex = steps.reduce(
+    const lastVerifyIndex = runSteps.reduce(
       (acc, s, i) => (s.name.startsWith("verify:") ? i : acc),
       -1,
     );
-    for (const [stepIndex, step] of steps.entries()) {
+    for (const [stepIndex, step] of runSteps.entries()) {
       // Held steps (after the release target) are never applied or ledgered. Phase 2
-      // still runs, against the prefix: the same fail-closed verifiers and hardening, with
-      // the ACL manifest scoped to the prefix (heldSql), and PASS for the target
-      // generation only (gen above).
+      // still runs, against the prefix: this tree's fail-closed verifiers and hardening,
+      // with the ACL manifest scoped to the prefix (heldSql), then the target commit's
+      // verifiers (verify:target:*); PASS, for the target generation only (gen above),
+      // is written by the last of them.
       if (held.has(step.name)) continue;
-      const sql = await readFile(step.path, "utf8");
+      const sql = step.sql ?? (await readFile(step.path, "utf8"));
       // The role checks (phase 1 bootstrap, phase 2 verify) run on every migrate, each in
       // its own transaction, and are never recorded in the ledger.
       if (

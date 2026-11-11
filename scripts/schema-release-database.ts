@@ -3,10 +3,19 @@ import { execFileSync } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import {
   generation,
+  manifestGeneration,
   MIGRATION_LEDGER,
   migrationTargetSplit,
+  releaseManifestDigest,
   runMigrations,
+  schemaStepDigests,
 } from "../src/hoopdb/migrate.ts";
+import {
+  parseReleaseManifest,
+  releaseTargetBinding,
+  requireTargetCommit,
+  type ReleaseTargetAnchor,
+} from "../src/hoopdb/release-target.ts";
 import {
   ROLE_VALIDATION_NAME,
   ROLE_VALIDATION_TABLE,
@@ -44,10 +53,34 @@ export function validateReleasePlan(
     generation: string;
     boundary: string;
     target: string;
+    targetSha: string;
     targetGeneration: string;
+    manifestDigest: string;
     planRun: string;
   },
 ) {
+  // The target commit's manifest: its exact schema steps (the prefix) and verifier
+  // digests. Its canonical digest is bound into the typed approval, and the target
+  // generation must be the generation those entries compute.
+  const manifest = parseReleaseManifest(plan?.targetManifest);
+  const manifestNames = new Set(manifest?.steps.map(([n]) => n) ?? []);
+  if (
+    !manifest ||
+    manifest.targetSha !== input.targetSha ||
+    manifest.target !== input.target ||
+    plan.targetSha !== input.targetSha ||
+    plan.manifestDigest !== input.manifestDigest ||
+    !/^[0-9a-f]{64}$/.test(plan.manifestDigest ?? "") ||
+    releaseManifestDigest(manifest) !== plan.manifestDigest ||
+    manifestGeneration(manifest) !== plan.targetGeneration ||
+    manifest.steps.at(-1)?.[0] === undefined ||
+    !manifestNames.has(input.target) ||
+    !stepNames(plan.expectedPending) ||
+    !stepNames(plan.held) ||
+    plan.expectedPending.some((n: string) => !manifestNames.has(n)) ||
+    plan.held.some((n: string) => manifestNames.has(n))
+  )
+    refuse("release_plan_artifact");
   if (
     plan?.version !== 1 ||
     plan.project !== P.project ||
@@ -59,8 +92,8 @@ export function validateReleasePlan(
     !plan.expectedPending.length ||
     plan.expectedPending.at(-1) !== input.target ||
     !stepNames(plan.held) ||
-    // The target (prefix) generation, generation(held), bound into the approval: equal
-    // to the full generation exactly when nothing is held.
+    // The target generation (the target commit's), bound into the approval: equal to
+    // the full generation exactly when nothing is held.
     !/^[0-9a-f]{64}$/.test(plan.targetGeneration ?? "") ||
     plan.targetGeneration !== input.targetGeneration ||
     (plan.held.length === 0) !== (plan.targetGeneration === input.generation) ||
@@ -77,7 +110,33 @@ export function validateReleasePlan(
     expectedPending: plan.expectedPending as string[],
     held: plan.held as string[],
     targetGeneration: plan.targetGeneration as string,
+    targetSha: plan.targetSha as string,
+    manifestDigest: plan.manifestDigest as string,
   };
+}
+/**
+ * The target anchor from the local Git object database only (no fetch): target_sha
+ * must be an ancestor of the release sha whose tree's schema steps equal this
+ * checkout's steps without `held`, by name and sha256 (release-target.ts).
+ */
+async function targetAnchor(input: { sha: string; target: string; targetSha: string }, held: string[]) {
+  return releaseTargetBinding({
+    repo: process.cwd(),
+    releaseSha: input.sha,
+    targetSha: input.targetSha,
+    target: input.target,
+    prefix: await schemaStepDigests(held),
+  });
+}
+function sameAnchor(
+  a: ReleaseTargetAnchor,
+  b: { targetSha: string; targetGeneration: string; manifestDigest: string },
+) {
+  return (
+    a.targetSha === b.targetSha &&
+    a.targetGeneration === b.targetGeneration &&
+    a.manifestDigest === b.manifestDigest
+  );
 }
 export async function releaseDatabase() {
   const get = githubGet();
@@ -90,6 +149,8 @@ export async function releaseDatabase() {
     (await generation()) !== input.generation
   )
     refuse("release_checkout_generation");
+  // target_sha: a local commit, an ancestor of the release sha (no network git).
+  requireTargetCommit(process.cwd(), input.sha, input.targetSha);
   const profile = releaseProfile(input.boundary);
   const approvedPlan =
     input.mode === "apply"
@@ -98,15 +159,26 @@ export async function releaseDatabase() {
           input,
         )
       : undefined;
+  // Apply, before connecting: the approved anchor recomputed from the object database
+  // and this checkout (plan-vs-apply drift refuses before any connection).
+  if (
+    approvedPlan &&
+    !sameAnchor(await targetAnchor(input, approvedPlan.held), approvedPlan)
+  )
+    refuse("release_target_manifest_changed");
   const client = releaseClient(process.env.SUPABASE_MIGRATION_OWNER_URL);
   try {
     await client.connect();
     const inspection = await inspectRelease(client, input.boundary);
     // The target gate (read-only): refuses an unknown, applied or passed target.
     const split = migrationTargetSplit(inspection.inventory, input.target);
-    // The generation this release marks PASS: the tree ending at the target (the full
-    // generation when nothing is held). Refuses a held name outside this tree.
-    const targetGeneration = await generation(split.held);
+    // The generation this release marks PASS: that of target_sha, whose tree must end at
+    // the target with exactly this checkout's prefix (the full generation when nothing
+    // is held). Refuses a held name outside this tree.
+    const anchor = await targetAnchor(input, split.held);
+    const targetGeneration = anchor.targetGeneration;
+    if (!split.held.length && targetGeneration !== input.generation)
+      refuse("release_target_generation_changed");
     if (input.mode === "plan") {
       await mkdir("release-plan", { recursive: true });
       await writeFile(
@@ -119,7 +191,10 @@ export async function releaseDatabase() {
             boundary: input.boundary,
             target: input.target,
             ...split,
+            targetSha: anchor.targetSha,
             targetGeneration,
+            manifestDigest: anchor.manifestDigest,
+            targetManifest: anchor.manifest,
             runId: process.env.GITHUB_RUN_ID,
             ...inspection,
           },
@@ -149,14 +224,25 @@ export async function releaseDatabase() {
       refuse("release_target_pending_changed");
     if (targetGeneration !== approvedPlan!.targetGeneration)
       refuse("release_target_generation_changed");
+    if (!sameAnchor(anchor, approvedPlan!)) refuse("release_target_manifest_changed");
     const result = await runMigrations(client, {
       profile,
       expectedLedgerSha256: approvedPlan!.ledgerSha256,
       target: input.target,
       expectedPending: approvedPlan!.expectedPending,
       targetGeneration: approvedPlan!.targetGeneration,
+      // The target commit's verifiers, read from the object database, with their
+      // digests; the migrator recomputes the manifest under its lock.
+      targetBinding: {
+        targetSha: approvedPlan!.targetSha,
+        manifestDigest: approvedPlan!.manifestDigest,
+        verifiers: anchor.verifiers,
+      },
       beforeWrite: async () => {
         await githubReleaseGate(process.env, get, true);
+        // Under the migrator lock: the anchor once more, before any write.
+        if (!sameAnchor(await targetAnchor(input, approvedPlan!.held), approvedPlan!))
+          refuse("release_target_manifest_changed");
         await refreshReleaseBoundary(client, approvedPlan!.existingBoundary);
       },
     });

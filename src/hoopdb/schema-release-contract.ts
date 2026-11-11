@@ -30,9 +30,13 @@ export function releaseInputs(
     RELEASE_BOUNDARY: boundary,
     // Required in both modes: the last schema step this release may apply.
     RELEASE_TARGET: target,
-    // Apply only: the target (prefix) generation the plan recorded, generation(held);
-    // the only generation an apply with held steps may mark PASS. Equal to
-    // RELEASE_GENERATION when nothing is held.
+    // Required with the target, both modes: the full 40-hex commit (an ancestor of the
+    // release sha) whose tree ends at the target; the release is anchored to it
+    // (src/hoopdb/release-target.ts).
+    RELEASE_TARGET_SHA: targetSha,
+    // Apply only: the target generation the plan recorded, the generation of
+    // target_sha's tree (what --generation prints there); the only generation an
+    // apply may mark PASS. Equal to RELEASE_GENERATION when nothing is held.
     RELEASE_TARGET_GENERATION: targetGeneration = "",
     RELEASE_PLAN_RUN: planRun = "",
     RELEASE_APPROVAL: approval = "",
@@ -45,12 +49,19 @@ export function releaseInputs(
     !RELEASE_TARGET_STEP.test(target ?? "")
   )
     refuse("release_inputs");
+  // target is always set, so target_sha is always required; never abbreviated.
+  if (!/^[0-9a-f]{40}$/.test(targetSha ?? "")) refuse("release_target_sha");
+  // The plan's manifest digest is carried only inside the typed approval; the whole
+  // string must then equal the canonical form exactly.
+  const manifestDigest =
+    mode === "apply" ? (/ MANIFEST ([0-9a-f]{64}) PLAN /.exec(approval)?.[1] ?? "") : "";
   if (
     mode === "apply" &&
     (!/^[1-9][0-9]*$/.test(planRun) ||
       !/^[0-9a-f]{64}$/.test(targetGeneration) ||
+      !manifestDigest ||
       approval !==
-        `APPLY ${SCHEMA_RELEASE.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} PLAN ${planRun}`)
+        `APPLY ${SCHEMA_RELEASE.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${targetGeneration} MANIFEST ${manifestDigest} PLAN ${planRun}`)
   )
     refuse("release_typed_approval");
   if (mode === "plan" && (planRun || approval || targetGeneration))
@@ -61,7 +72,9 @@ export function releaseInputs(
     generation: generation!,
     boundary,
     target: target!,
+    targetSha: targetSha!,
     targetGeneration,
+    manifestDigest,
     planRun,
   } as const;
 }

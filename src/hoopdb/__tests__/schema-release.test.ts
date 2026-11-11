@@ -7,7 +7,12 @@ import {
 } from "../schema-release-contract.ts";
 import { githubReleaseGate } from "../../../scripts/schema-release-github.ts";
 import { validateReleasePlan } from "../../../scripts/schema-release-database.ts";
-import { migrationTargetSplit } from "../migrate.ts";
+import {
+  manifestGeneration,
+  migrationTargetSplit,
+  RELEASE_TREE,
+  releaseManifestDigest,
+} from "../migrate.ts";
 import {
   refreshReleaseBoundary,
   releaseBoundaryDigest,
@@ -16,14 +21,20 @@ import {
 const sha = "a".repeat(40),
   generation = "b".repeat(64),
   target = "upstream:20261105047000_coordination_fact_readers.sql",
-  // The plan's targetGeneration (generation(held)); differs from generation when held.
-  targetGeneration = "f".repeat(64);
+  // target_sha: the full commit (an ancestor of sha) whose tree ends at the target.
+  targetSha = "9".repeat(40),
+  // The plan's targetGeneration (target_sha's own generation); differs from generation
+  // when held.
+  targetGeneration = "f".repeat(64),
+  // The plan's canonical manifest digest, carried only inside the typed approval.
+  manifestDigest = "8".repeat(64);
 const base = {
   RELEASE_MODE: "plan",
   RELEASE_SHA: sha,
   RELEASE_GENERATION: generation,
   RELEASE_BOUNDARY: "global-default-revoke",
   RELEASE_TARGET: target,
+  RELEASE_TARGET_SHA: targetSha,
   GITHUB_REPOSITORY: P.repository,
   GITHUB_EVENT_NAME: "workflow_dispatch",
   GITHUB_REF: "refs/heads/main",
@@ -55,7 +66,7 @@ test("typed approval binds source, generation, project and prior plan", () => {
     RELEASE_MODE: "apply",
     RELEASE_PLAN_RUN: "90",
     RELEASE_TARGET_GENERATION: targetGeneration,
-    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} PLAN 90`,
+    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${targetGeneration} MANIFEST ${manifestDigest} PLAN 90`,
   };
   expect(releaseInputs(apply).mode).toBe("apply");
   for (const [k, v] of Object.entries({
@@ -63,6 +74,7 @@ test("typed approval binds source, generation, project and prior plan", () => {
     RELEASE_GENERATION: "d".repeat(64),
     RELEASE_PLAN_RUN: "91",
     RELEASE_TARGET_GENERATION: "e".repeat(64),
+    RELEASE_TARGET_SHA: "7".repeat(40),
     RELEASE_APPROVAL: "yes",
     RELEASE_BOUNDARY: "none",
   }))
@@ -309,7 +321,7 @@ test("apply rejects foreign, stale, replayed or failed prior plan and artifact b
     RELEASE_MODE: "apply",
     RELEASE_PLAN_RUN: "90",
     RELEASE_TARGET_GENERATION: targetGeneration,
-    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} PLAN 90`,
+    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${targetGeneration} MANIFEST ${manifestDigest} PLAN 90`,
   };
   expect((await githubReleaseGate(env, get(api()), true)).mode).toBe("apply");
   for (const values of [
@@ -323,12 +335,26 @@ test("apply rejects foreign, stale, replayed or failed prior plan and artifact b
     Object.assign(f.plan, values);
     await expect(githubReleaseGate(env, get(f), true)).rejects.toThrow();
   }
+  // The target commit's manifest (release-target.ts shape): its schema steps through the
+  // target and its 7 verifier digests; the plan's targetGeneration and manifestDigest are
+  // computed from it with the one canonical definition.
+  const prior = "upstream:20261105046010_session_directory_read_api_query.sql";
+  const targetManifest = {
+    targetSha,
+    target,
+    steps: [[prior, "1".repeat(64)], [target, "2".repeat(64)]] as [string, string][],
+    verifiers: RELEASE_TREE.verifiers.map((v, i) => [v.name, String(i + 3).repeat(64)]) as [string, string][],
+  };
+  const planGeneration = manifestGeneration(targetManifest);
+  const planDigest = releaseManifestDigest(targetManifest);
   const input = {
     sha,
     generation,
     boundary: "global-default-revoke",
     target,
-    targetGeneration,
+    targetSha,
+    targetGeneration: planGeneration,
+    manifestDigest: planDigest,
     planRun: "90",
   };
   const existingBoundary = {
@@ -364,39 +390,80 @@ test("apply rejects foreign, stale, replayed or failed prior plan and artifact b
     inventory: [{}],
     existingBoundary,
     target,
-    expectedPending: ["upstream:20261105046010_session_directory_read_api_query.sql", target],
+    expectedPending: [prior, target],
     held: ["upstream:20261105050000_operator_session_erase.sql"],
-    targetGeneration,
+    targetSha,
+    targetGeneration: planGeneration,
+    manifestDigest: planDigest,
+    targetManifest,
   };
   expect(validateReleasePlan(plan, input)).toEqual({
     ledgerSha256: "c".repeat(64),
     existingBoundary,
     expectedPending: plan.expectedPending,
     held: plan.held,
-    targetGeneration,
+    targetGeneration: planGeneration,
+    targetSha,
+    manifestDigest: planDigest,
   });
   // Nothing held: the target generation is the full generation, and nothing else.
-  const tail = { ...plan, held: [], targetGeneration: generation };
-  expect(validateReleasePlan(tail, { ...input, targetGeneration: generation }).targetGeneration).toBe(generation);
+  const fullMatch = { ...plan, held: [], generation: planGeneration };
+  expect(validateReleasePlan(fullMatch, { ...input, generation: planGeneration }).targetGeneration).toBe(planGeneration);
   for (const [p2, tg] of [
-    [{ ...plan, held: [] }, targetGeneration],
-    [{ ...plan, targetGeneration: generation }, generation],
-    [{ ...plan, targetGeneration: undefined }, targetGeneration],
+    [{ ...plan, held: [] }, planGeneration],
+    [{ ...plan, generation: planGeneration }, planGeneration],
+    [{ ...plan, targetGeneration: undefined }, planGeneration],
     [{ ...plan, targetGeneration: undefined }, ""],
-    [{ ...plan, targetGeneration: targetGeneration.toUpperCase() }, targetGeneration.toUpperCase()],
+    [{ ...plan, targetGeneration: planGeneration.toUpperCase() }, planGeneration.toUpperCase()],
     [{ ...plan, targetGeneration: "f".repeat(63) }, "f".repeat(63)],
+    // A generation that is not the manifest's, even when the input agrees.
+    [{ ...plan, targetGeneration: targetGeneration }, targetGeneration],
     [plan, "e".repeat(64)],
     [plan, ""],
   ] as const)
     expect(() => validateReleasePlan(p2, { ...input, targetGeneration: tg })).toThrow(
       "release_plan_artifact",
     );
+  // Manifest binding: the plan's manifest, its digest and target_sha must agree with
+  // each other and with the approval (plan-vs-apply drift of any piece refuses).
+  const otherVerifiers = targetManifest.verifiers.map(([n], i) => [n, i === 4 ? "e".repeat(64) : targetManifest.verifiers[i]![1]] as [string, string]);
+  const resealed = (m: typeof targetManifest) => ({
+    ...plan,
+    targetManifest: m,
+    manifestDigest: releaseManifestDigest(m),
+    targetGeneration: manifestGeneration(m),
+  });
+  for (const [p2, in2] of [
+    [{ ...plan, targetManifest: undefined }, input],
+    [{ ...plan, targetManifest: { ...targetManifest, extra: 1 } }, input],
+    [{ ...plan, targetManifest: { ...targetManifest, verifiers: targetManifest.verifiers.slice(1) } }, input],
+    [{ ...plan, targetManifest: { ...targetManifest, verifiers: [...targetManifest.verifiers].reverse() } }, input],
+    [{ ...plan, targetManifest: { ...targetManifest, steps: [[prior, "1".repeat(63)], [target, "2".repeat(64)]] } }, input],
+    [{ ...plan, targetManifest: { ...targetManifest, targetSha: targetSha.slice(0, 12) } }, input],
+    // The manifest changed after the digest was computed (verifier or step drift).
+    [{ ...plan, targetManifest: { ...targetManifest, verifiers: otherVerifiers } }, input],
+    [{ ...plan, targetManifest: { ...targetManifest, steps: [[target, "2".repeat(64)]] } }, input],
+    // Re-sealed with a consistent digest/generation, but not what was approved.
+    [resealed({ ...targetManifest, verifiers: otherVerifiers }), input],
+    // The approval's digest or target_sha differs from the plan's.
+    [plan, { ...input, manifestDigest: "e".repeat(64) }],
+    [plan, { ...input, targetSha: "7".repeat(40) }],
+    [{ ...plan, targetSha: "7".repeat(40) }, input],
+    [{ ...plan, manifestDigest: "e".repeat(64) }, { ...input, manifestDigest: "e".repeat(64) }],
+    // A manifest for another target, or for another target commit, re-sealed.
+    [resealed({ ...targetManifest, target: prior, steps: [[prior, "1".repeat(64)]] }), input],
+    [resealed({ ...targetManifest, targetSha: "7".repeat(40) }), input],
+    // A held step inside the manifest, or a pending step outside it.
+    [{ ...plan, held: [prior] }, input],
+    [{ ...plan, expectedPending: ["upstream:20261105045040_selfhost_output_facts.sql", target] }, input],
+  ] as const)
+    expect(() => validateReleasePlan(p2, in2)).toThrow("release_plan_artifact");
   for (const bad of [
     { target: "upstream:20261105046010_session_directory_read_api_query.sql" },
     { target: undefined },
     { expectedPending: undefined },
     { expectedPending: [] },
-    { expectedPending: [target, "upstream:20261105046010_session_directory_read_api_query.sql"] },
+    { expectedPending: [target, prior] },
     { expectedPending: ["shim:supabase_roles", target] },
     { expectedPending: [target, 1] },
     { held: undefined },
@@ -414,6 +481,9 @@ test("apply rejects foreign, stale, replayed or failed prior plan and artifact b
     "runId",
     "ledgerSha256",
     "targetGeneration",
+    "targetSha",
+    "manifestDigest",
+    "targetManifest",
   ])
     expect(() =>
       validateReleasePlan({ ...plan, [field]: "wrong" }, input),
@@ -609,7 +679,7 @@ test("operator plan refuses apply mode before reading a secret or connecting", (
         RELEASE_MODE: "apply",
         RELEASE_PLAN_RUN: "90",
         RELEASE_TARGET_GENERATION: targetGeneration,
-        RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} PLAN 90`,
+        RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${targetGeneration} MANIFEST ${manifestDigest} PLAN 90`,
         SUPABASE_MIGRATION_OWNER_URL: "",
       },
       stdout: "pipe",
@@ -647,18 +717,30 @@ test("target is required, exact and bound into the typed approval", () => {
     RELEASE_MODE: "apply",
     RELEASE_PLAN_RUN: "90",
     RELEASE_TARGET_GENERATION: targetGeneration,
-    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} PLAN 90`,
+    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${targetGeneration} MANIFEST ${manifestDigest} PLAN 90`,
   };
   expect(releaseInputs(apply).target).toBe(target);
   const other = "upstream:20261105046010_session_directory_read_api_query.sql";
   for (const approval of [
     `APPLY ${P.project} ${sha} ${generation} PLAN 90`,
-    `APPLY ${P.project} ${sha} ${generation} TARGET ${other} ${targetGeneration} PLAN 90`,
-    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} PLAN 90 `,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${other} ${targetSha} ${targetGeneration} MANIFEST ${manifestDigest} PLAN 90`,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${targetGeneration} MANIFEST ${manifestDigest} PLAN 90 `,
     // The pre-targetGeneration format, and the full generation in its place.
     `APPLY ${P.project} ${sha} ${generation} TARGET ${target} PLAN 90`,
-    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${generation} PLAN 90`,
-    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${"e".repeat(64)} PLAN 90`,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${generation} MANIFEST ${manifestDigest} PLAN 90`,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${"e".repeat(64)} MANIFEST ${manifestDigest} PLAN 90`,
+    // The pre-anchoring format (no target_sha, no manifest), each piece missing, out
+    // of order, abbreviated or malformed.
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} PLAN 90`,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${targetGeneration} PLAN 90`,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} MANIFEST ${manifestDigest} PLAN 90`,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} ${targetSha} MANIFEST ${manifestDigest} PLAN 90`,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha.slice(0, 12)} ${targetGeneration} MANIFEST ${manifestDigest} PLAN 90`,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${"7".repeat(40)} ${targetGeneration} MANIFEST ${manifestDigest} PLAN 90`,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${targetGeneration} MANIFEST ${manifestDigest.slice(1)} PLAN 90`,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${targetGeneration} MANIFEST ${"ab".repeat(32).toUpperCase()} PLAN 90`,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${targetGeneration} MANIFEST  PLAN 90`,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${targetGeneration} PLAN 90 MANIFEST ${manifestDigest}`,
   ])
     expect(() =>
       releaseInputs({ ...apply, RELEASE_APPROVAL: approval }),
@@ -668,13 +750,29 @@ test("target is required, exact and bound into the typed approval", () => {
     "release_typed_approval",
   );
 });
+test("target_sha is required in both modes, a full 40-hex lowercase commit id, and bound into the typed approval", () => {
+  expect(releaseInputs(base).targetSha).toBe(targetSha);
+  const apply = {
+    ...base,
+    RELEASE_MODE: "apply",
+    RELEASE_PLAN_RUN: "90",
+    RELEASE_TARGET_GENERATION: targetGeneration,
+    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${targetGeneration} MANIFEST ${manifestDigest} PLAN 90`,
+  };
+  expect(releaseInputs(apply)).toMatchObject({ targetSha, manifestDigest });
+  for (const ts of [undefined, "", targetSha.slice(0, 12), targetSha.slice(0, 39), targetSha + "0", "A".repeat(40), "HEAD", "main", `${targetSha} `, `-${targetSha.slice(1)}`])
+    for (const env of [base, apply])
+      expect(() => releaseInputs({ ...env, RELEASE_TARGET_SHA: ts })).toThrow("release_target_sha");
+  // Approved for one target commit, dispatched with another.
+  expect(() => releaseInputs({ ...apply, RELEASE_TARGET_SHA: "7".repeat(40) })).toThrow("release_typed_approval");
+});
 test("target generation is apply-only, exact 64 hex and bound into the typed approval", () => {
   const apply = {
     ...base,
     RELEASE_MODE: "apply",
     RELEASE_PLAN_RUN: "90",
     RELEASE_TARGET_GENERATION: targetGeneration,
-    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} PLAN 90`,
+    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${targetGeneration} MANIFEST ${manifestDigest} PLAN 90`,
   };
   expect(releaseInputs(apply).targetGeneration).toBe(targetGeneration);
   // Nothing held: the plan records targetGeneration = generation.
@@ -682,7 +780,7 @@ test("target generation is apply-only, exact 64 hex and bound into the typed app
     releaseInputs({
       ...apply,
       RELEASE_TARGET_GENERATION: generation,
-      RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${generation} PLAN 90`,
+      RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${generation} MANIFEST ${manifestDigest} PLAN 90`,
     }).targetGeneration,
   ).toBe(generation);
   // Approved for one target generation, dispatched with another (or none / malformed).
@@ -696,7 +794,7 @@ test("target generation is apply-only, exact 64 hex and bound into the typed app
       releaseInputs({
         ...apply,
         RELEASE_TARGET_GENERATION: tg,
-        RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${tg} PLAN 90`,
+        RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${tg} MANIFEST ${manifestDigest} PLAN 90`,
       }),
     ).toThrow("release_typed_approval");
   // Plan mode refuses it (it is a plan output, never a plan input).
@@ -714,7 +812,7 @@ test("the GitHub gate refuses a missing or unapproved target before any API read
     RELEASE_MODE: "apply",
     RELEASE_PLAN_RUN: "90",
     RELEASE_TARGET_GENERATION: targetGeneration,
-    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} PLAN 90`,
+    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetSha} ${targetGeneration} MANIFEST ${manifestDigest} PLAN 90`,
   };
   for (const [env, code] of [
     [{ ...base, RELEASE_TARGET: undefined }, "release_inputs"],
@@ -783,12 +881,19 @@ test("workflow carries the required target through env and into the approval tex
   );
   expect(w).toMatch(/\n      target:\n        description: "[^"\n]+"\n        type: string\n        required: true\n/);
   expect(w).toContain("  RELEASE_TARGET: ${{ inputs.target }}\n");
-  expect(w).toContain("<generation> TARGET <target> <target_generation> PLAN <plan_run>");
+  expect(w).toContain(
+    "<generation> TARGET <target> <target_sha> <target_generation> MANIFEST <manifest_digest> PLAN <plan_run>",
+  );
+  expect(w).toMatch(/\n      target_sha:\n        description: "[^"\n]+"\n        type: string\n        required: true\n/);
+  expect(w).toContain("  RELEASE_TARGET_SHA: ${{ inputs.target_sha }}\n");
+  // The database job needs full history: target_sha is read from the local object DB.
+  expect(w).toMatch(/ref: \$\{\{ github\.sha \}\}\n\s+fetch-depth: 0\n/);
   expect(w).toMatch(/\n      target_generation:\n        description: "[^"\n]+"\n        type: string\n        default: ""\n/);
   expect(w).toContain("  RELEASE_TARGET_GENERATION: ${{ inputs.target_generation }}\n");
   // Only the env block interpolates the inputs; no run: script does.
   expect(w.match(/inputs\.target\b/g)).toHaveLength(1);
   expect(w.match(/inputs\.target_generation\b/g)).toHaveLength(1);
+  expect(w.match(/inputs\.target_sha\b/g)).toHaveLength(1);
 });
 test("operator plan renders the target split and refuses a missing target before connecting", () => {
   const src = readFileSync(
@@ -796,8 +901,11 @@ test("operator plan renders the target split and refuses a missing target before
     "utf8",
   );
   expect(src).toContain("migrationTargetSplit(report.inventory, input.target)");
-  expect(src).toMatch(/target: input\.target,\n\s+\.\.\.split,\n\s+targetGeneration,/);
-  expect(src).toContain("const targetGeneration = await generation(split.held);");
+  expect(src).toMatch(
+    /target: input\.target,\n\s+\.\.\.split,\n\s+targetSha: anchor\.targetSha,\n\s+targetGeneration,\n\s+manifestDigest: anchor\.manifestDigest,\n\s+targetManifest: anchor\.manifest,/,
+  );
+  expect(src).toContain("const anchor = releaseTargetBinding({");
+  expect(src).toContain("prefix: await schemaStepDigests(split.held),");
   const r = Bun.spawnSync(
     [process.execPath, "scripts/schema-release-operator-plan.ts"],
     {
@@ -819,9 +927,20 @@ test("release apply binds the plan's target generation into the migrator and the
     new URL("../../../scripts/schema-release-database.ts", import.meta.url),
     "utf8",
   );
-  // Plan records generation(held); apply recomputes it from the live split and refuses drift.
-  expect(src).toContain("const targetGeneration = await generation(split.held);");
-  expect(src).toMatch(/\.\.\.split,\n\s+targetGeneration,\n\s+runId/);
+  // Plan records target_sha's anchor; apply recomputes it before connecting, from the
+  // live split, and once more under the migrator lock, and refuses any drift.
+  expect(src).toContain("const anchor = await targetAnchor(input, split.held);");
+  expect(src).toMatch(
+    /\.\.\.split,\n\s+targetSha: anchor\.targetSha,\n\s+targetGeneration,\n\s+manifestDigest: anchor\.manifestDigest,\n\s+targetManifest: anchor\.manifest,\n\s+runId/,
+  );
+  expect(src).toMatch(/approvedPlan &&\n\s+!sameAnchor\(await targetAnchor\(input, approvedPlan\.held\), approvedPlan\)\n\s+\)\n\s+refuse\("release_target_manifest_changed"\);/);
+  expect(src).toContain('if (!sameAnchor(anchor, approvedPlan!)) refuse("release_target_manifest_changed");');
+  expect(src).toMatch(
+    /beforeWrite: async \(\) => \{\n\s+await githubReleaseGate\(process\.env, get, true\);\n(\s+\/\/[^\n]*\n)*\s+if \(!sameAnchor\(await targetAnchor\(input, approvedPlan!\.held\), approvedPlan!\)\)\n\s+refuse\("release_target_manifest_changed"\);/,
+  );
+  expect(src).toMatch(
+    /targetBinding: \{\n(\s+\/\/[^\n]*\n)*\s+targetSha: approvedPlan!\.targetSha,\n\s+manifestDigest: approvedPlan!\.manifestDigest,\n\s+verifiers: anchor\.verifiers,/,
+  );
   expect(src).toMatch(/if \(targetGeneration !== approvedPlan!\.targetGeneration\)\n\s+refuse\("release_target_generation_changed"\);/);
   expect(src).toContain("targetGeneration: approvedPlan!.targetGeneration,");
   // PASS for exactly the target generation, never a 'pending' acceptance.
