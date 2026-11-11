@@ -6,7 +6,7 @@ Their mutators are owner-only helpers from creation; the ingest login gets only 
 read. 050020 grants admission/lease-gated runtime calls and cannot be bypassed through
 legacy helper grants.
 
-Every session_index INSERT or UPDATE takes a shared advisory gate in a BEFORE STATEMENT
+Every session_index or session_directory INSERT or UPDATE takes a shared advisory gate in a BEFORE STATEMENT
 trigger, before row/conflict locks. Erase owns the same gate exclusively before resolving
 aliases, fencing owners or tombstoning pointers. Concurrent pointer writers remain
 concurrent with each other; operator erase serializes against pointer statements globally.
@@ -39,3 +39,17 @@ Proofs include lossy alias rejection, cross-source/org preservation, false unrea
 refusal, and an actual PostgreSQL forced writer-first/erase-first race. The race observes
 pg_blocking_pids, exercises INSERT and direct UPDATE, and starts a repeatable-read writer
 snapshot before erase to prove the stale-snapshot refusal. CI repeats it on PG15/16/17.
+
+Directory statements use the same shared gate and permanent row guard. A projector
+whose statement snapshot predates erase cannot restore a tombstone after waiting.
+The physical object namespace is permanently reserved by an erase: a later canonical
+ID that encodes to the same physical prefix is refused before object I/O. Allowing
+reuse would let an old erase job delete the new session's objects. This layout limit
+requires a separate identity/layout migration to remove safely.
+
+The gate is database-wide, with no network I/O inside its transaction. Existing
+self-host statement/lock timeouts bound contention. An erase racing another privacy
+control may be aborted by PostgreSQL deadlock detection and must retry. The sequence
+epoch is nontransactional: an attempted erase can require READ COMMITTED thereafter
+even if its SQL transaction rolls back. SQL-lane tombstones retain metadata at rest;
+the runtime purge removes the rows before it reports completion.

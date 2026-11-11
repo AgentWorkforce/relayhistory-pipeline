@@ -69,7 +69,10 @@ END $index_lock$;
 CREATE TRIGGER ingest_erase_fence_index_lock BEFORE INSERT OR UPDATE ON sessions.session_index
  FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_erase_fence_index_lock();
 
--- Any writer of sessions.session_index: a live row for a fenced id is skipped (RETURN NULL), as the
+CREATE TRIGGER ingest_erase_fence_directory_lock BEFORE INSERT OR UPDATE ON sessions.session_directory
+ FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_erase_fence_index_lock();
+
+-- Any writer of sessions.session_index or session_directory: a live row for a fenced id is skipped (RETURN NULL), as the
 -- publication pointer guard skips a guarded write. A tombstone (deleted_at set) always passes.
 -- SECURITY DEFINER: the writer (search_consumer_runtime, the ingest role) cannot read the fences.
 CREATE FUNCTION sessions.ingest_erase_fence_index_guard() RETURNS trigger
@@ -78,8 +81,8 @@ BEGIN
  IF NEW.deleted_at IS NULL AND (
    EXISTS(SELECT 1 FROM sessions.session_erasure_fences AS f WHERE f.org_id=NEW.org_id AND f.workspace_id=NEW.workspace_id
      AND f.source=NEW.harness AND f.session_id=NEW.session_id)
-   OR (NEW.canonical_session_id IS NOT NULL AND EXISTS(SELECT 1 FROM sessions.session_erasure_fences AS f
-     WHERE f.org_id=NEW.org_id AND f.workspace_id=NEW.workspace_id AND f.source=NEW.harness AND f.session_id=NEW.canonical_session_id))) THEN
+   OR ((to_jsonb(NEW)->>'canonical_session_id') IS NOT NULL AND EXISTS(SELECT 1 FROM sessions.session_erasure_fences AS f
+     WHERE f.org_id=NEW.org_id AND f.workspace_id=NEW.workspace_id AND f.source=NEW.harness AND f.session_id=(to_jsonb(NEW)->>'canonical_session_id')))) THEN
   RETURN NULL;
  END IF;
  RETURN NEW;
@@ -87,6 +90,9 @@ END
 $index_guard$;
 
 CREATE TRIGGER ingest_erase_fence_index_guard BEFORE INSERT OR UPDATE ON sessions.session_index
+ FOR EACH ROW EXECUTE FUNCTION sessions.ingest_erase_fence_index_guard();
+
+CREATE TRIGGER ingest_erase_fence_directory_guard BEFORE INSERT OR UPDATE ON sessions.session_directory
  FOR EACH ROW EXECUTE FUNCTION sessions.ingest_erase_fence_index_guard();
 
 REVOKE ALL ON FUNCTION sessions.ingest_erase_fence_extend(text,text,text,text,jsonb),

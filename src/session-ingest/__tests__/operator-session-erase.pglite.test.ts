@@ -464,7 +464,10 @@ test("erase preserves another source and organization with identical session ids
 
 test("artifact assertions cannot claim unreadable while physical directory content is live", async () => {
  const d=await database();await pointer(d,"user",SID,"m");await erase(d);
+ // Simulate corruption by the fixture owner; ordinary late directory writes are now fenced.
+ await d.db.exec("ALTER TABLE sessions.session_directory DISABLE TRIGGER ingest_erase_fence_directory_guard");
  await directory(d,SID);
+ await d.db.exec("ALTER TABLE sessions.session_directory ENABLE TRIGGER ingest_erase_fence_directory_guard");
  for(const artifact of Object.keys((await receipt(d))!.artifacts)) await d.db.query("SELECT sessions.ingest_operator_erase_record_step($1,$2,$3,$4,$5,'done',0,NULL)",[...KEY,artifact]);
  expect(await receipt(d)).toMatchObject({unreadable:false,status:"in_progress"});
 });
