@@ -21,7 +21,7 @@ const params = (key: EraseKey) => [key.orgId, key.workspaceId, key.source, key.s
 const fn = {
   begin: "ingest_operator_runtime_begin", read: "ingest_operator_erase_receipt", next: "ingest_operator_runtime_next",
   authorize: "ingest_operator_runtime_authorize", release: "ingest_operator_runtime_release", purge: "ingest_operator_runtime_purge",
-  step: "ingest_operator_runtime_step", writeBegin: "ingest_operator_runtime_write_begin", writeFinish: "ingest_operator_runtime_write_finish",
+  step: "ingest_operator_runtime_step", writeBegin: "ingest_operator_runtime_write_begin", writeFinish: "ingest_operator_runtime_write_finish", writeFailed: "ingest_operator_runtime_write_failed",
 } as const;
 async function call(run: SqlRun, name: typeof fn[keyof typeof fn], values: unknown[]): Promise<unknown> {
   try {
@@ -52,9 +52,16 @@ export function sqlSessionWriteGuard(run: SqlRun): SessionWriteGuard {
     }
     const allowed = await call(run, fn.writeBegin, [JSON.stringify({ orgId: tenant.orgId, workspaceId: tenant.workspaceId, writerId, sessions, physicalSessions: [...pairs.values()] })]);
     if (allowed !== true) throw new DeliveryError("operator_session_erased", 409, "The session object namespace is permanently reserved by an operator erase");
-    const result = await work();
-    await call(run, fn.writeFinish, [tenant.orgId, tenant.workspaceId, writerId]);
-    return result;
+    try {
+      const result = await work();
+      await call(run, fn.writeFinish, [tenant.orgId, tenant.workspaceId, writerId]);
+      return result;
+    } catch (error) {
+      // An exception cannot prove storage work stopped. Persist failure, retain the
+      // obligation and preserve the original error even if failure recording is unavailable.
+      await call(run, fn.writeFailed, [tenant.orgId, tenant.workspaceId, writerId]).catch(() => {});
+      throw error;
+    }
   };
 }
 
@@ -122,7 +129,7 @@ export function sessionEraseWorker(options: EraseWorkerOptions) {
       if (work.bucket !== identity.bucket || work.keyRoot !== identity.keyRoot || work.storeRef !== identity.storeRef)
         throw new SessionEraseServiceError("unsupported_storage");
       if (!await options.bytes.stagesAbsent(work, authorize)) {
-        await ledger.step(work, lease, "stagedObjects", "pending", 0);
+        await ledger.step(work, lease, "stagedObjects", "failed_retryable", 0, "staged_objects_require_drain");
         return true;
       }
       let objects = 0;

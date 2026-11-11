@@ -49,8 +49,9 @@ The composition below drives these primitives; the end-to-end proof covers its c
 The self-host ingest service binds the authenticated route to the durable SQL ledger.
 With byte deletion enabled it scans the durable queue on startup and every second;
 restarts resume outstanding receipts. A failed provider step returns a static retryable
-failure receipt. Repeat Control DELETE to retry; GET only observes. A live writer or
-mixed staged payload keeps the receipt pending. The worker never substitutes a timeout
+failure receipt. Repeat Control DELETE to retry; GET only observes. A live writer keeps the receipt pending. Mixed staged payloads produce a bounded
+`stagedObjects` failure with code `staged_objects_require_drain` on the first scan;
+failed receipts are not polled again until a repeat DELETE. The worker never substitutes a timeout
 for proof that a writer stopped, or a delete request for proof that all versions are gone.
 
 All settings remain unset by default. Any deployment or activation below needs Khaliq's
@@ -114,3 +115,43 @@ worker delete the new session. This reservation persists with the erase fence.
 Direct desktop upload must remain off on all writers; existing desktop upload grants
 and outstanding witnesses require a separately approved revoke/drain protocol before
 switching a previously direct-upload deployment to this initial erase runtime.
+
+## Failed writes and operator recovery
+
+Confirmed writes remove their obligations after all object work and ledger commit
+succeed, so successful traffic does not accumulate rows. Exceptions persist `failed_at`
+without releasing the obligation; even a lost-response write can still reach storage.
+A crash can leave `failed_at` unset. Neither age nor a failure timestamp proves stopped.
+The index `(org_id, workspace_id, writer_id)` supports exact writer recovery.
+
+An operator can inspect outstanding work as the migration owner, scoped to the tenant:
+
+```sql
+SELECT writer_id, min(started_at) AS started_at, max(failed_at) AS failed_at, count(*) AS session_keys
+FROM sessions.session_erasure_writes
+WHERE org_id = $1 AND workspace_id = $2
+GROUP BY writer_id ORDER BY min(started_at) LIMIT 100;
+```
+
+The executable parameterized statement is
+`supabase/operations/operator_session_erase_recover_writer.sql`. Bind organization,
+workspace, writer UUID and a boolean attesting that EVERY process for this writer
+has stopped, all in-flight storage requests settled and its writes were reconciled.
+The entire batch shares one writer UUID, so this proof covers every session in it.
+Only then pass true for the fourth parameter. False/NULL releases nothing; another
+tenant is untouched. Service roles cannot execute the statement because they lack
+direct table privileges. Applying it to a real database still needs Khaliq's explicit OK.
+
+Recovery removes only that writer's obligations and appends `writer_recovered` /
+`writer_stopped_verified` audit events to affected erasure receipts. Repeating the
+statement is harmless. It does not assert byte absence: the normal worker must still
+verify/delete every object and search document before completing a receipt. Failed
+or crashed obligations intentionally remain until this reconciliation; they are never
+silently garbage-collected. SQL and privilege tests execute this exact statement.
+
+Mixed staged namespaces contain payloads for multiple sessions. A leftover version or
+delete marker therefore refuses completion instead of being deleted for one session.
+The refusal is terminal for that attempt, not an endless in-progress loop. Drain the
+upstream namespace under its separately approved protocol, then repeat Control DELETE.
+The versioned MinIO proof covers an old upload payload plus a delete marker, explicit
+failure/status, no byte deletion, no repeated scan, and successful retry after fixture drain.

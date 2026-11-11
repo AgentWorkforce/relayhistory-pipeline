@@ -136,7 +136,7 @@ export async function buildSelfhostEraseRuntime(input: {
   }
   const { env, run } = input;
   const required = ["ingest_operator_runtime_begin(text,text,text,text,text,text,text,text,text,text)", "ingest_operator_runtime_write_begin(jsonb)",
-    "ingest_operator_runtime_write_finish(text,text,uuid)", "ingest_operator_runtime_next(uuid)", "ingest_operator_runtime_authorize(text,text,text,text,uuid)",
+    "ingest_operator_runtime_write_finish(text,text,uuid)", "ingest_operator_runtime_write_failed(text,text,uuid)", "ingest_operator_runtime_next(uuid)", "ingest_operator_runtime_authorize(text,text,text,text,uuid)",
     "ingest_operator_runtime_release(text,text,text,text,uuid)", "ingest_operator_erase_receipt(text,text,text,text)",
     "ingest_operator_runtime_purge(text,text,text,text,uuid)", "ingest_operator_runtime_step(text,text,text,text,uuid,text,text,bigint,text)"];
   const ready = await run("SELECT bool_and(to_regprocedure(fn) IS NOT NULL AND has_function_privilege(current_user,to_regprocedure(fn),'EXECUTE')) ready FROM unnest($1::text[]) fn", [required.map(fn => `sessions.${fn}`)]);

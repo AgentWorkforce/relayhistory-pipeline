@@ -167,13 +167,31 @@ describe.skipIf(!enabled)("operator hard-delete end to end", () => {
     const result = await control.api(controlPath+controlQuery,{ method:"DELETE",token:controlTenant.ownerToken });
     return Response.json(result.body,{status:result.status});
    };
-   if (control) expect((await control.api(controlPath+controlQuery,{method:"DELETE",token:controlTenant.memberToken})).status).toBe(403);
+   if (control) {
+    expect((await control.api(controlPath+controlQuery,{method:"DELETE",token:controlTenant.memberToken})).status).toBe(403);
+    expect((await db.query("SELECT 1 FROM sessions.session_erasure_receipts")).rows).toEqual([]);
+    expect((await db.query("SELECT 1 FROM sessions.session_erasure_fences")).rows).toEqual([]);
+   }
    expect((await eraseRequest()).status).toBe(202);
    expect((await read(events)).status).toBe(404);
    worker = sessionEraseWorker({ ledger, identity, bytes: {
     stagesAbsent: (key, authorize) => stagedObjectsAbsent(eraser, root, key, authorize),
     erase: (k, authorize) => eraseDiscoveredSessionBytes(eraser, k, { keyRoot: root, bucket: bucket!, authorize, log: () => {} }),
    }, search: { erase: (k, sessionIds) => eraseIndex.eraseScope({ ...k, sessionIds }) }, searchLock: async (_w, action) => action(), log: l => lines.push(l) });
+   // A deleted current upload still has old payload versions + a delete marker.
+   // One scan must surface a distinct refusal rather than retry forever or erase mixed data.
+   await store.put(objectKey(pendingUpload),new TextEncoder().encode("mixed staged fixture"));
+   await store.delete(objectKey(pendingUpload));
+   expect(await worker.scan()).toBe(true);
+   expect(await ledger.receipt(key)).toMatchObject({status:"failed",bytesErased:false,
+    failure:{step:"stagedObjects",code:"staged_objects_require_drain",retryable:true}});
+   if(control) expect((await control.api(controlPath+"/erasure"+controlQuery,{token:controlTenant.ownerToken})).body)
+    .toMatchObject({status:"failed",failure:{code:"staged_objects_require_drain"}});
+   expect((await readAll(await store.get(objectKey(rawKey)))).byteLength).toBeGreaterThan(0);
+   expect(await worker.scan()).toBe(false);
+   // Controlled fixture only: a separately authorized operator drain is required in a real store.
+   await eraser.eraseStep(`${root}/.upload-inbox/`,{scope:root,authorize:async()=>{}});
+   expect((await eraseRequest()).status).toBe(202);
    expect(await worker.scan()).toBe(true);
    const controlReceipt = control ? await control.api(controlPath+"/erasure"+controlQuery,{token:controlTenant.ownerToken}) : null;
    const receiptResponse = controlReceipt ? Response.json(controlReceipt.body,{status:controlReceipt.status}) : await app.request(erasePath, { headers: { authorization: `Bearer ${secret}` } });

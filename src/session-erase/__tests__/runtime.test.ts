@@ -29,10 +29,11 @@ test("an ambiguous writer failure retains its durable obligation; fence denial n
  const calls: string[] = [];
  const guard = sqlSessionWriteGuard(async text => { calls.push(text); return { rows: [{ result: true }] }; });
  await expect(guard(key, [["claude", "s"]], async () => { throw Error("lost object-store response"); })).rejects.toThrow();
- expect(calls).toHaveLength(1);
+ expect(calls).toHaveLength(2);
+ expect(calls[1]).toContain("write_failed");
  expect(calls[0]).toContain("write_begin");
  await guard(key, [["claude", "s"]], async () => 42);
- expect(calls).toHaveLength(3); expect(calls[2]).toContain("write_finish");
+ expect(calls).toHaveLength(4); expect(calls[3]).toContain("write_finish");
  const denied = sqlSessionWriteGuard(async () => ({ rows: [{ result: false }] }));
  let writes = 0;
  await expect(denied(key, [["claude", "s"]], async () => writes++)).rejects.toThrow();
@@ -77,4 +78,15 @@ test("a fenced physical namespace refuses permanently before any object work",as
  const guard=sqlSessionWriteGuard(async()=>({rows:[{result:false}]}));
  await expect(guard(key,[["claude","a:b"]],async()=>{writes++;})).rejects.toMatchObject({code:"operator_session_erased",status:409});
  expect(writes).toBe(0);
+});
+
+test("a mixed staging inventory produces a distinct bounded refusal before any external delete",async()=>{
+ const f=fixture({stages:false});await f.worker.scan();
+ expect(f.calls).toContain("stagedObjects:failed_retryable");expect(f.calls).not.toContain("bytes");
+});
+test("failure recording cannot release an ambiguous writer or mask its original error",async()=>{
+ const calls:string[]=[],original=Error("lost response");
+ const guard=sqlSessionWriteGuard(async text=>{calls.push(text);if(text.includes("write_failed"))throw Error("private database detail");return{rows:[{result:true}]};});
+ await expect(guard(key,[["claude","s"]],async()=>{throw original;})).rejects.toBe(original);
+ expect(calls).toHaveLength(2);expect(calls.some(c=>c.includes("write_finish"))).toBe(false);
 });
