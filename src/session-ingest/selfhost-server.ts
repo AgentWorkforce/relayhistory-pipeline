@@ -593,6 +593,7 @@ export function selfhostIngestHttpServer(runtime: SelfhostIngestRuntime | null):
 
         // A consent-only token (rth:consent, no rth:sync) may reach the upload-consent write and nothing else.
         if (identity && path !== UPLOAD_CONSENT_PATH && !(identity.scopes ?? []).includes(SYNC_SCOPE)) {
+          log.info("session ingest", { route: "ingest.auth", outcome: "forbidden", status: 403, correlation_id: correlationId });
           await drainSmallBody(req);
           return sendJson(req, res, 403, envelope("forbidden", `missing required scope: ${SYNC_SCOPE}`, correlationId), { "x-correlation-id": correlationId });
         }

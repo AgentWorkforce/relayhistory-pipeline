@@ -351,6 +351,13 @@ describe("onboarding heartbeat (RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT=true)", (
     await expect(start(rc, { RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT: "1" })).rejects.toThrow("RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT");
   });
 
+  test("on: a consent-only token (rth:consent, no rth:sync) is 403 on the heartbeat (the wrapper's own check)", async () => {
+    const rc = await relaycontrol(() => active(["rth:consent"]));
+    const { url } = await start(rc, on);
+    const res = await post(url(HEARTBEAT), progress);
+    expect([res.status, await code(res)]).toEqual([403, "forbidden"]);
+  });
+
   test("on: an authenticated heartbeat is 204 with no body, introspected, nothing written", async () => {
     const rc = await relaycontrol(() => active(["rth:sync"]));
     const { url, store } = await start(rc, on);

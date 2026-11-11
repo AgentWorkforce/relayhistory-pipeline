@@ -166,6 +166,15 @@ describe("positive introspection cache: TTL 30000", () => {
     expect(rc.calls.length).toBe(2);
   });
 
+  test("rth:consent alone is admitted (the upload-consent write); neither scope is 403", async () => {
+    at(T0);
+    let scopes = ["rth:consent"];
+    const rc = relaycontrol(() => granted(scopes));
+    expect(((await edge(rc, 0)(bearer())) as { scopes: string[] }).scopes).toEqual(["rth:consent"]);
+    scopes = ["rth:read"];
+    expect(await refusal(edge(rc, 0)(bearer()))).toEqual([403, "forbidden"]);
+  });
+
   test("a refusal is cached at most 5 s: refused, then granted 6 s later is accepted", async () => {
     at(T0);
     let ok = false;

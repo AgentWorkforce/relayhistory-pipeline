@@ -25,7 +25,10 @@
  *   not `sh_at_`, rejected, wrong audience  401 invalid_token (reason to the log only)
  *   expired                                 401 token_expired
  *   no org or workspace                     401 invalid_token
- *   granted scopes lack rth:sync            403 forbidden
+ *   granted scopes lack rth:sync AND rth:consent
+ *                                           403 forbidden
+ *   rth:consent only (no rth:sync)          admitted here; the self-host server answers 403 forbidden on
+ *                                           every path but the upload-consent write (selfhost-server.ts)
  *   relaycontrol unreachable / 5xx / 401 to our secret / malformed answer
  *                                           503 relaycontrol_unavailable (retryable; never a 401 that
  *                                           would tell the Desktop to discard a good token)
