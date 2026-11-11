@@ -1,0 +1,6 @@
+{
+  "INGEST_ACCEPTANCE_MODE": "buffered",
+  "INGEST_ASYNC_ADMISSION": "drain",
+  "INGEST_CLAIM_LOCK_BUSY": "on",
+  "INGEST_CLAIM_TIMEOUT_BUSY": "off"
+}
