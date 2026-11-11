@@ -56,6 +56,7 @@ async function rollback(ctx: LaneContext): Promise<Record<string, string>> {
     "END $rollback_guard$;",
     ...bodies,
     "DROP TRIGGER ingest_erase_fence_index_guard ON sessions.session_index;",
+    "DROP TRIGGER ingest_erase_fence_index_lock ON sessions.session_index;",
     "DROP FUNCTION " + [...ctx.defined].filter((s) => !HOOKS.some(([h]) => h === s)).reverse().join(",\n ") + ";",
     "DELETE FROM sessions.__96bulls_migrations WHERE name='" + NAME + "';",
   ].join("\n") + "\n" };
@@ -69,6 +70,7 @@ export const operatorSessionEraseFenceCheck: LaneManifest = {
   grantSources: [],
   functions: {
     "sessions.ingest_erase_fence_extend(text,text,text,text,jsonb)": { secdef: false, grants: [] },
+    "sessions.ingest_erase_fence_index_lock()": { secdef: true, grants: [] },
     "sessions.ingest_erase_fence_index_guard()": { secdef: true, grants: [] },
   },
   replaces: Object.fromEntries(HOOKS.map(([sig, , , secdef]) => [sig, { secdef, original: ORIGINAL }])),

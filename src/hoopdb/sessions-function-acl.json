@@ -481,6 +481,9 @@
     "sessions.ingest_erase_fence_index_guard()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_erase_fence_index_lock()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_exact_keys(jsonb,text[])": [
       "<owner>:EXECUTE"
     ],
@@ -722,6 +725,9 @@
     "sessions.ingest_operator_erase_fence(text,text,text,text,text[])": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_operator_erase_ids(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_operator_erase_ordered(text)": [
       "<owner>:EXECUTE"
     ],
@@ -736,15 +742,13 @@
       "bulls96_session_ingest:EXECUTE"
     ],
     "sessions.ingest_operator_erase_record_step(text,text,text,text,text,text,bigint,text)": [
-      "<owner>:EXECUTE",
-      "bulls96_session_ingest:EXECUTE"
+      "<owner>:EXECUTE"
     ],
     "sessions.ingest_operator_erase_render(text,text,text,text)": [
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_operator_erase_session(text,text,text,text,text,text,text)": [
-      "<owner>:EXECUTE",
-      "bulls96_session_ingest:EXECUTE"
+      "<owner>:EXECUTE"
     ],
     "sessions.ingest_operator_erase_settle(text,text,text,text)": [
       "<owner>:EXECUTE"

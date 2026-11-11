@@ -1,7 +1,7 @@
 /**
  * Readiness and admission under SCRUB_ENGINE_REQUIRED=wasm-bindgen with the pinned
- * relayscrubber 0.5.0-alpha.4 (docs/scrub-engine.md, "Cutover: pinned relayscrubber
- * 0.5.0-alpha.4"): ready ONLY for the verified instance loaded from the exact
+ * relayscrubber 0.5.0-alpha.5 (docs/scrub-engine.md, "Cutover: pinned relayscrubber
+ * 0.5.0-alpha.5"): ready ONLY for the verified instance loaded from the exact
  * checked-in pin. Missing/invalid pin, digest mismatch, missing artifacts, reader
  * ceiling refusal, a non-exact pin, poison, or no init at all: not ready, the routed
  * sealer refuses (so a production constructor fails at startup), the unrouted seam

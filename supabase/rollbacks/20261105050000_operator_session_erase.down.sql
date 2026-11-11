@@ -8,19 +8,21 @@ DO $rollback_guard$ DECLARE v_later boolean;v_sha text; BEGIN
   IF v_later THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator session erase: a later migration is applied; roll it back first';END IF;
  ELSE RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator session erase: migration ledger required';END IF;
  EXECUTE 'SELECT sha256 FROM sessions.__96bulls_migrations WHERE name=''upstream:20261105050000_operator_session_erase.sql''' INTO v_sha;
- IF v_sha IS DISTINCT FROM '3e947c2c3e0367d394a80254eb3b298cf64851718b4bda37f09eb3ea9b287e1b' THEN
+ IF v_sha IS DISTINCT FROM 'c2c6242d60401406f3326838a84eaf4bb44870471441deeff38d0d9a7096755a' THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator session erase: own applied checksum required';END IF;
  IF EXISTS(SELECT 1 FROM sessions.session_erasure_receipts) OR EXISTS(SELECT 1 FROM sessions.session_erasure_fences) THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator session erase: erase receipts or fences exist; refusing to drop them';
  END IF;
 END $rollback_guard$;
 DROP TABLE sessions.session_erasure_events, sessions.session_erasure_receipts, sessions.session_erasure_fences;
+DROP SEQUENCE sessions.session_erasure_writer_epoch;
 DROP FUNCTION sessions.ingest_operator_erase_record_step(text,text,text,text,text,text,bigint,text),
  sessions.ingest_operator_erase_receipt(text,text,text,text),
  sessions.ingest_operator_erase_session(text,text,text,text,text,text,text),
  sessions.ingest_operator_erase_fence(text,text,text,text,text[]),
  sessions.ingest_operator_erase_owners(text,text,text,text[]),
  sessions.ingest_operator_erase_settle(text,text,text,text),
+ sessions.ingest_operator_erase_ids(text,text,text,text),
  sessions.ingest_operator_erase_render(text,text,text,text),
  sessions.ingest_operator_erase_ordered(text),
  sessions.ingest_operator_erase_append_only(),

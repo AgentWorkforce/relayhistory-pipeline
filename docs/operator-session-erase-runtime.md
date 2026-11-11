@@ -31,12 +31,11 @@ Leased workers must reauthorize before external effects and every receipt update
 Metadata purge verifies absence and records counts atomically. Aliases remain in
 content-free erase scope records after pointers are physically deleted. Relationships,
 extensions, summaries, briefs, publications, facts, ownership and revision rows are
-removed. Output facts use scope_source, not their event's source. A mixed daily digest
-cannot be selectively redacted, so the workspace cache is evicted. Cache writes in a
-workspace with an operator fence are disabled until a future generation-aware cache
-protocol can prove that a late generator did not read erased content. Other workspaces
-remain unaffected. Operational queue IDs, permanent fences and content-free audit
-receipts remain; transcript payloads and object addresses are not retained there.
+removed. Output facts use scope_source, not their event's source. Mixed digest cache
+rows and an enabled independent digest writer refuse erase before fencing, preserving
+other sessions' narratives. That pipeline needs its own generation-aware drain protocol.
+Operational queue IDs, permanent fences and content-free audit receipts remain;
+transcript payloads and object addresses are not retained there.
 
 Causal coverage includes both actual PostgreSQL lock orders, durable writers, expired
 leases, source/bucket/layout refusals, alias registration, role/tenant isolation,

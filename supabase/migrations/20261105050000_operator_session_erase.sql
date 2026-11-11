@@ -24,7 +24,9 @@
 -- each one with sessions.ingest_operator_erase_record_step. A receipt is `completed` only when the
 -- session is unreadable, every byte artifact is recorded, and no artifact is pending (table CHECKs).
 --
--- Refusals, before any write:
+-- Refusals:
+--  * RH013: ambiguous physical alias, before any write;
+--  * RH010: more than 256 aliases, before any write (no receipt/fence).
 --  * RH011 (not retryable): the org is lazy, buffered or ordered (sessions.ingest_set_session_uploads
 --    would route a selection to the ordered control path, which an operator erase cannot drive yet);
 --  * RH010 (retryable): more than 64 owners, or owners still appearing after three lock rounds. The
@@ -33,6 +35,10 @@
 -- Legacy storage is out of scope (`legacyScope` is always 'excluded'). Receipts and events hold ids
 -- and counts only, never content. Receipts, events and fences are never deleted (trigger-enforced).
 
+-- Non-MVCC epoch lets a stale repeatable-read writer detect that an erase has ever
+-- crossed its snapshot. Sequence reads observe is_called independently of MVCC snapshots.
+CREATE SEQUENCE sessions.session_erasure_writer_epoch;
+REVOKE ALL ON SEQUENCE sessions.session_erasure_writer_epoch FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest;
 CREATE TABLE sessions.session_erasure_fences (
   org_id text NOT NULL,
   workspace_id text NOT NULL,
@@ -183,15 +189,44 @@ $render$;
 -- Derives unreadable / bytesErased / completed from the artifacts of a locked, non-failed receipt.
 -- unreadable: uploads fenced and no pointer or directory row pending. bytesErased: no byte artifact
 -- (every key but pointerRows, directoryRows and ledgerRows) pending. completed: both, nothing pending.
+-- Alias closure is bounded and rejects a physical layout id naming distinct logical sessions.
+-- The caller holds the pointer statement gate before using this result for an erase.
+CREATE FUNCTION sessions.ingest_operator_erase_ids(p_org text,p_ws text,p_source text,p_session text) RETURNS text[]
+LANGUAGE plpgsql STABLE SET search_path=pg_catalog,pg_temp AS $ids$
+DECLARE v_ids text[];
+BEGIN
+ WITH RECURSIVE related(id) AS (
+  SELECT p_session UNION
+  SELECT n.id FROM related AS rel JOIN sessions.session_index AS s
+   ON s.org_id=p_org AND s.workspace_id=p_ws AND s.harness=p_source
+    AND(s.session_id=rel.id OR s.canonical_session_id=rel.id)
+   CROSS JOIN LATERAL(VALUES(s.session_id),(s.canonical_session_id)) AS n(id) WHERE n.id IS NOT NULL
+ ) SELECT array_agg(id ORDER BY id COLLATE "C") INTO v_ids FROM(SELECT id FROM related LIMIT 257) AS bounded;
+ IF cardinality(v_ids)>256 THEN RAISE EXCEPTION USING ERRCODE='RH010',MESSAGE='operator erase: alias cap exceeded before fencing';END IF;
+ IF EXISTS(SELECT 1 FROM (
+  SELECT session_id AS id,coalesce(canonical_session_id,session_id) AS logical_id FROM sessions.session_index
+   WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_source AND session_id=ANY(v_ids)
+  UNION SELECT canonical_session_id,canonical_session_id FROM sessions.session_index
+   WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_source AND canonical_session_id=ANY(v_ids)
+ ) AS identities GROUP BY id HAVING count(DISTINCT logical_id)>1) THEN
+  RAISE EXCEPTION USING ERRCODE='RH013',MESSAGE='operator erase: ambiguous physical alias';END IF;
+ RETURN v_ids;
+END $ids$;
+
 CREATE FUNCTION sessions.ingest_operator_erase_settle(p_org text,p_ws text,p_source text,p_session text) RETURNS void
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $settle$
-DECLARE r sessions.session_erasure_receipts%ROWTYPE;v_unreadable boolean;v_bytes boolean;
+DECLARE r sessions.session_erasure_receipts%ROWTYPE;v_unreadable boolean;v_bytes boolean;v_ids text[];
  c_read CONSTANT text[]:=ARRAY['pointerRows','directoryRows'];
 BEGIN
  SELECT * INTO STRICT r FROM sessions.session_erasure_receipts
   WHERE org_id=p_org AND workspace_id=p_ws AND source=p_source AND session_id=p_session;
  IF r.status<>'in_progress' THEN RETURN;END IF;
- v_unreadable:=r.uploads_fenced AND NOT sessions.ingest_operator_erase_pending(r.artifacts,c_read);
+ v_ids:=sessions.ingest_operator_erase_ids(p_org,p_ws,p_source,p_session);
+ v_unreadable:=r.uploads_fenced AND NOT sessions.ingest_operator_erase_pending(r.artifacts,c_read)
+  AND NOT EXISTS(SELECT 1 FROM sessions.session_index WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_source
+   AND(session_id=ANY(v_ids) OR canonical_session_id=ANY(v_ids)) AND deleted_at IS NULL)
+  AND NOT EXISTS(SELECT 1 FROM sessions.session_directory WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_source
+   AND session_id=ANY(v_ids) AND deleted_at IS NULL);
  v_bytes:=NOT sessions.ingest_operator_erase_pending(r.artifacts,
   ARRAY(SELECT k FROM unnest(sessions.ingest_operator_erase_artifact_keys()) AS k WHERE k NOT IN('pointerRows','directoryRows','ledgerRows')));
  UPDATE sessions.session_erasure_receipts SET
@@ -261,9 +296,9 @@ BEGIN
     UNION SELECT c_turn_origin) AS u
    ORDER BY u.origin_id COLLATE "C"
   LOOP
-   v_ledger:=v_ledger+(sessions.ingest_set_session_uploads(jsonb_build_object(
-     'tenant',jsonb_build_object('orgId',p_org,'workspaceId',p_ws,'userId',v_user),
-     'originId',v_origin,'sessions',v_pairs,'enabled',false))->>'updated')::bigint;
+   -- Same owner-only selection primitive as the public ingest entry point, after
+   -- this helper's complete tenant validation, ordered-mode refusal and owner locks.
+   v_ledger:=v_ledger+sessions.ingest_apply_selection(p_org,p_ws,v_user,v_origin,v_pairs,false);
   END LOOP;
  END LOOP;
  -- Every copy's pointer row: the marker revision keeps upsert_session_index from undeleting it.
@@ -301,9 +336,9 @@ CREATE FUNCTION sessions.ingest_operator_erase_session(p_org text,p_ws text,p_so
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $operator_erase$
 DECLARE v_org text;v_ws text;v_source text;v_session text;v_request text;v_actor text;
  r sessions.session_erasure_receipts%ROWTYPE;v_ids text[];v_code text;
- c_max_aliases CONSTANT integer:=256;
 BEGIN
- PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='operator erase: read-committed transaction required';END IF;
  v_org:=sessions.ingest_identifier(to_jsonb(p_org),false);
  v_ws:=sessions.ingest_identifier(to_jsonb(p_ws),true);
  v_source:=sessions.ingest_identifier(to_jsonb(p_source),false);
@@ -316,6 +351,11 @@ BEGIN
    AND (x.org_id,x.workspace_id,x.source,x.session_id) IS DISTINCT FROM (v_org,v_ws,v_source,v_session)) THEN
   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='operator erase: request id belongs to another session';END IF;
 
+ -- Global statement gate: writers share it before row locks; an erase owns it exclusively.
+ -- This covers direct UPDATE and INSERT/ON CONFLICT as well as the composed consumer.
+ PERFORM pg_advisory_xact_lock(961996,50000);
+ -- Reject lossy alias collisions and oversized closure before receipt/fence writes.
+ v_ids:=sessions.ingest_operator_erase_ids(v_org,v_ws,v_source,v_session);
  -- A repeat (any request id) answers from the existing receipt; only a failed one is retried.
  SELECT * INTO r FROM sessions.session_erasure_receipts
   WHERE org_id=v_org AND workspace_id=v_ws AND source=v_source AND session_id=v_session FOR UPDATE;
@@ -351,19 +391,10 @@ BEGIN
  SELECT * INTO STRICT r FROM sessions.session_erasure_receipts
   WHERE org_id=v_org AND workspace_id=v_ws AND source=v_source AND session_id=v_session;
 
- -- Resolve either direction: an operator can name an alias as well as the canonical id.
- -- UNION terminates cycles; LIMIT bounds even a malformed alias graph before any fence is written.
- WITH RECURSIVE related(id) AS (
-  SELECT v_session
-  UNION
-  SELECT n.id FROM related AS rel JOIN sessions.session_index AS s
-   ON s.org_id=v_org AND s.workspace_id=v_ws AND s.harness=v_source
-    AND (s.session_id=rel.id OR s.canonical_session_id=rel.id)
-   CROSS JOIN LATERAL (VALUES(s.session_id),(s.canonical_session_id)) AS n(id) WHERE n.id IS NOT NULL
- ) SELECT array_agg(id) INTO v_ids FROM (SELECT id FROM related LIMIT c_max_aliases+1) AS bounded;
- IF cardinality(v_ids)>c_max_aliases THEN
-  RAISE EXCEPTION USING ERRCODE='RH010',MESSAGE='operator erase: alias cap exceeded';END IF;
+ -- Resolve aliases before writing any fence.
+ v_ids:=sessions.ingest_operator_erase_ids(v_org,v_ws,v_source,v_session);
  -- First, and outside the block below: kept even when owner fencing fails.
+ PERFORM nextval('sessions.session_erasure_writer_epoch'::regclass);
  INSERT INTO sessions.session_erasure_fences(org_id,workspace_id,source,session_id)
  SELECT v_org,v_ws,v_source,i FROM unnest(v_ids) AS i ON CONFLICT DO NOTHING;
 
@@ -403,7 +434,6 @@ CREATE FUNCTION sessions.ingest_operator_erase_record_step(p_org text,p_ws text,
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $operator_step$
 DECLARE v_org text;v_ws text;v_source text;v_session text;r sessions.session_erasure_receipts%ROWTYPE;v_failed boolean;
 BEGIN
- PERFORM sessions.ingest_require_role('bulls96_session_ingest');
  v_org:=sessions.ingest_identifier(to_jsonb(p_org),false);
  v_ws:=sessions.ingest_identifier(to_jsonb(p_ws),true);
  v_source:=sessions.ingest_identifier(to_jsonb(p_source),false);
@@ -450,6 +480,7 @@ REVOKE ALL ON FUNCTION sessions.ingest_operator_erase_artifact_keys(),
   sessions.ingest_operator_erase_append_only(),
   sessions.ingest_operator_erase_ordered(text),
   sessions.ingest_operator_erase_render(text,text,text,text),
+  sessions.ingest_operator_erase_ids(text,text,text,text),
   sessions.ingest_operator_erase_settle(text,text,text,text),
   sessions.ingest_operator_erase_owners(text,text,text,text[]),
   sessions.ingest_operator_erase_fence(text,text,text,text,text[]),
@@ -457,7 +488,6 @@ REVOKE ALL ON FUNCTION sessions.ingest_operator_erase_artifact_keys(),
   sessions.ingest_operator_erase_receipt(text,text,text,text),
   sessions.ingest_operator_erase_record_step(text,text,text,text,text,text,bigint,text)
   FROM PUBLIC,anon,authenticated,service_role;
-GRANT EXECUTE ON FUNCTION sessions.ingest_operator_erase_session(text,text,text,text,text,text,text),
-  sessions.ingest_operator_erase_receipt(text,text,text,text),
-  sessions.ingest_operator_erase_record_step(text,text,text,text,text,text,bigint,text)
-  TO bulls96_session_ingest;
+-- Mutators are internal owner-only helpers. The later runtime grants the authenticated,
+-- admission/lease-gated wrappers; the ingest login can only read receipts directly here.
+GRANT EXECUTE ON FUNCTION sessions.ingest_operator_erase_receipt(text,text,text,text) TO bulls96_session_ingest;
