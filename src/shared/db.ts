@@ -244,9 +244,17 @@ export async function schemaVerdict(
 ): Promise<SchemaVerdict> {
   type Stage = "config" | "ledger" | "marker" | "verify" | "final";
   let stage = "config" as Stage; // widened: it is advanced inside the transaction callback
+  // Every input is read from `expected` exactly once, here, before any guard or await:
+  // the caller's object is mutable, and a re-read after a SQL await could see a value
+  // (e.g. an unregistered `held`) the checks below never validated. Only these locals
+  // are used afterwards; `names` and `shas` are copied, `held` is deep-frozen.
+  const held = expected.held;
+  const names = [...expected.names];
+  const shas = expected.shas === undefined ? undefined : { ...expected.shas };
+  const { generation, dbMode } = expected;
   // `creates` is trusted only from heldScope(), which derives it from the tree's SQL
   // bytes; anything else could excuse a prefix-owned function. Refused before any SQL.
-  if (expected.held !== undefined && !isHeldScope(expected.held)) {
+  if (held !== undefined && !isHeldScope(held)) {
     log.warn("live role validation gate closed", { error_code: "release_target_held_untrusted", reason: stage });
     return { ok: false, reason: "role_validation_failed", error_code: "release_target_held_untrusted" };
   }
@@ -255,7 +263,7 @@ export async function schemaVerdict(
     return await transact(async (tx): Promise<SchemaVerdict> => {
       await tx.query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED, READ ONLY");
       await tx.query(`SET LOCAL statement_timeout = ${timeoutMs}`);
-      await tx.query("SELECT set_config('hoopdb.db_mode', $1, true)", [expected.dbMode ?? "unspecified"]);
+      await tx.query("SELECT set_config('hoopdb.db_mode', $1, true)", [dbMode ?? "unspecified"]);
       stage = "ledger";
       // The physical ledger goes through the migrator's own rename-alias verdict
       // (resolveRenamedLedger, in memory, never a write): exact original-name rows count
@@ -266,27 +274,27 @@ export async function schemaVerdict(
         (await tx.query<{ name: string; sha256: string }>("SELECT name, sha256 FROM sessions.__96bulls_migrations")).rows
           .map((r) => [r.name, r.sha256]),
       );
-      const shas = expected.shas ?? {};
-      const { effective } = resolveRenamedLedger(physical, (n) => (Object.hasOwn(shas, n) ? shas[n] : undefined));
+      const digests = shas ?? {};
+      const { effective } = resolveRenamedLedger(physical, (n) => (Object.hasOwn(digests, n) ? digests[n] : undefined));
       // A recorded row counts only with a checksum the migrator would accept for the
       // planned file (its migration_changed guard), alias-adopted or not.
       const have = new Set(
-        [...effective].filter(([n, sha]) => !Object.hasOwn(shas, n) || migrationChecksumMatches(n, sha, shas[n]!)).map(([n]) => n),
+        [...effective].filter(([n, sha]) => !Object.hasOwn(digests, n) || migrationChecksumMatches(n, sha, digests[n]!)).map(([n]) => n),
       );
       // The role shim, bootstrap and verify steps are not schema; the marker covers verify.
-      const missing = expected.names.filter((n) => !isPrerequisiteStep(n) && !have.has(n));
+      const missing = names.filter((n) => !isPrerequisiteStep(n) && !have.has(n));
       if (missing.length) return { ok: false, reason: "schema_pending", count: missing.length };
       const passed = async () => {
         const m = (await tx.query<{ generation: string; status: string }>(MARKER_SQL, [ROLE_VALIDATION_NAME])).rows[0];
-        return m?.status === "pass" && m.generation === expected.generation;
+        return m?.status === "pass" && m.generation === generation;
       };
       // Release-target scope: a held step is never one of this image's steps (and is one
       // of the tree's, when shas are known), and only the functions of held steps the
       // ledger does not have may be absent.
-      const held = expected.held ?? [];
-      if (held.some((h) => expected.names.includes(h.name) || (expected.shas && !Object.hasOwn(expected.shas, h.name))))
+      const scope = held ?? [];
+      if (scope.some((h) => names.includes(h.name) || (shas && !Object.hasOwn(shas, h.name))))
         return { ok: false, reason: "role_validation_failed", error_code: "release_target_held_mismatch" };
-      const absentOk = new Set(held.filter((h) => !effective.has(h.name)).flatMap((h) => h.creates));
+      const absentOk = new Set(scope.filter((h) => !effective.has(h.name)).flatMap((h) => h.creates));
       stage = "marker";
       if (!(await passed())) return { ok: false, reason: "validation_pending" };
       stage = "verify";
@@ -303,7 +311,7 @@ export async function schemaVerdict(
   } catch (err) {
     const error_code = (err as { code?: string }).code ?? "role_gate_error";
     if (error_code === "42P01" && stage === "ledger")
-      return { ok: false, reason: "schema_pending", count: expected.names.filter((n) => !isPrerequisiteStep(n)).length };
+      return { ok: false, reason: "schema_pending", count: names.filter((n) => !isPrerequisiteStep(n)).length };
     if (error_code === "42P01" && (stage === "marker" || stage === "final")) return { ok: false, reason: "validation_pending" };
     log.warn("live role validation gate closed", { error_code, reason: stage });
     return { ok: false, reason: "role_validation_failed", error_code };

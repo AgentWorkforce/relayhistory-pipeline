@@ -802,3 +802,71 @@ test("real tree: schemaVerdict trusts only a heldScope() map; forged, copied or 
   const { held: _held, ...unscoped } = prefix;
   expect(await verdict(s.db, unscoped)).toEqual({ ok: false, reason: "role_validation_failed", error_code: "42883" });
 });
+
+test("real tree: schemaVerdict reads `expected` once; a property swapped after the first SQL await changes nothing", async () => {
+  const s = await prefixDatabase();
+  await runTarget(s.db, s);
+  const full: ExpectedSchema = { ...(await expectedSchema()), dbMode: "selfhosted" };
+  const held = await heldScope(s.split.held, s.binding.manifest.steps);
+  const prefix: ExpectedSchema = { ...full, names: full.names.filter((n) => !s.split.held.includes(n)), generation: s.independent, held };
+  // The caller's object is mutated in place once the FIRST awaited statement has
+  // returned, i.e. after the provenance check and before any read of the swapped value
+  // that a post-await re-read would see.
+  const swapped = async (swap: (e: ExpectedSchema) => void) => {
+    const expected: ExpectedSchema = { ...prefix, names: [...prefix.names], shas: { ...prefix.shas } };
+    let statements = 0;
+    const racing: Transact = (work) =>
+      transact(s.db)((tx) =>
+        work({
+          ...tx,
+          query: (async (text: string, params?: unknown[]) => {
+            const r = await tx.query(text, params as never);
+            if (++statements === 1) swap(expected);
+            return r;
+          }) as typeof tx.query,
+        }),
+      );
+    await s.db.exec("SET ROLE history_rt");
+    try {
+      return await schemaVerdict(expected, racing);
+    } finally {
+      await s.db.exec("RESET ROLE");
+      expect(statements).toBeGreaterThan(1);
+    }
+  };
+  expect(await verdict(s.db, prefix)).toEqual({ ok: true });
+  // Swapped to undefined: the captured legit scope still applies, ok:true (a re-read
+  // would make the gate strict, 42883, for the absent held functions).
+  expect(await swapped((e) => { e.held = undefined; })).toEqual({ ok: true });
+  // Swapped to a different registered scope (one held name is also an image step, a
+  // re-read would be release_target_held_mismatch): the captured scope applies, ok:true.
+  const ledgered = prefix.names.filter((n) => n.startsWith("upstream:")).at(-1)!;
+  const other = await heldScope([...s.split.held, ledgered]);
+  expect(await verdict(s.db, { ...prefix, held: other }))
+    .toEqual({ ok: false, reason: "role_validation_failed", error_code: "release_target_held_mismatch" });
+  expect(await swapped((e) => { e.held = other; })).toEqual({ ok: true });
+  // The other gate inputs are captured the same way: a swapped generation (re-read:
+  // validation_pending), names (re-read: schema_pending), shas without a held step
+  // (re-read: release_target_held_mismatch) or dbMode change nothing.
+  expect(await swapped((e) => { e.generation = full.generation; })).toEqual({ ok: true });
+  expect(await swapped((e) => { e.names = full.names; })).toEqual({ ok: true });
+  expect(await swapped((e) => { e.names.push(s.split.held[0]!); })).toEqual({ ok: true });
+  const { [s.split.held[0]!]: _dropped, ...shas } = prefix.shas!;
+  expect(await swapped((e) => { e.shas = shas; })).toEqual({ ok: true });
+  expect(await swapped((e) => { delete e.shas![s.split.held[0]!]; })).toEqual({ ok: true });
+  expect(await swapped((e) => { e.dbMode = "supabase"; })).toEqual({ ok: true });
+  // The reviewer's probe: the prefix-owned function dropped, the legit scope is strict
+  // (42883). Swapping `held` to an unregistered copy that appends that signature to the
+  // held 047010 entry's creates still yields the captured scope's 42883, never ok:true.
+  const prefixOwned = "sessions.output_facts_state(text,text,text,text[],text)";
+  await s.db.exec(`DROP FUNCTION ${prefixOwned}`);
+  const strict = { ok: false, reason: "role_validation_failed", error_code: "42883" };
+  expect(await verdict(s.db, prefix)).toEqual(strict);
+  const stages = "upstream:20261105047010_buffered_exact_session_stages.sql";
+  const forged = held.map((h) => ({ name: h.name, creates: h.name === stages ? [...h.creates, prefixOwned] : [...h.creates] }));
+  expect(forged.flatMap((h) => h.creates)).toContain(prefixOwned);
+  expect(await swapped((e) => { e.held = forged; })).toEqual(strict);
+  // Undefined and the other registered scope: the captured scope, still 42883.
+  expect(await swapped((e) => { e.held = undefined; })).toEqual(strict);
+  expect(await swapped((e) => { e.held = other; })).toEqual(strict);
+});
