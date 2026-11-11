@@ -32,6 +32,7 @@ import {
   materializeLanding,
   parseExpect,
   PRODUCTION_APPLY_REFUSALS,
+  PRODUCTION_BOOTSTRAP_REFUSALS,
   redactOutput,
   rehearsalPassed,
   resultRecord,
@@ -591,9 +592,37 @@ describe("R2-bootstrap (the release tree's bootstrap chain before the apply)", (
 });
 
 describe("drift against production and the rehearsal files", () => {
+  // The bootstrap stage's functions (not rehearsed; pinned by PRODUCTION_BOOTSTRAP_REFUSALS).
+  // Each body runs from its declaration line to the next top-level function declaration.
+  const BOOTSTRAP_FUNCTIONS = [/^(export )?function validateBootstrapPlan\(/, /^(export )?async function releaseBootstrap\(/];
+  const TOP_LEVEL_FUNCTION = /^(export )?(async )?function /;
+  const refusals = (lines: string[]) =>
+    [...lines.join("\n").matchAll(/refuse\("([a-z_]+)"\)/g)].map((m) => m[1]);
+  const splitRefusals = () => {
+    const lines = read("scripts/schema-release-database.ts").split("\n");
+    const inBootstrap = new Array<boolean>(lines.length).fill(false);
+    const starts = BOOTSTRAP_FUNCTIONS.map((re) => lines.findIndex((l) => re.test(l)));
+    for (const start of starts) {
+      if (start < 0) continue;
+      let end = lines.findIndex((l, i) => i > start && TOP_LEVEL_FUNCTION.test(l));
+      if (end < 0) end = lines.length;
+      for (let i = start; i < end; i++) inBootstrap[i] = true;
+    }
+    return {
+      starts,
+      bootstrap: refusals(lines.filter((_, i) => inBootstrap[i])),
+      apply: refusals(lines.filter((_, i) => !inBootstrap[i])),
+    };
+  };
+  test("the bootstrap stage's functions are found in the production apply file", () => {
+    const { starts } = splitRefusals();
+    for (const start of starts) expect(start).toBeGreaterThanOrEqual(0);
+  });
   test("the rehearsal replays the production apply's refusals in the same order", () => {
-    const found = [...read("scripts/schema-release-database.ts").matchAll(/refuse\("([a-z_]+)"\)/g)].map((m) => m[1]);
-    expect(found).toEqual([...PRODUCTION_APPLY_REFUSALS]);
+    expect(splitRefusals().apply).toEqual([...PRODUCTION_APPLY_REFUSALS]);
+  });
+  test("the bootstrap stage's refusals (not rehearsed) are pinned in order", () => {
+    expect(splitRefusals().bootstrap).toEqual([...PRODUCTION_BOOTSTRAP_REFUSALS]);
   });
   const FILES = [
     ".github/workflows/rehearse-session-schema.yml",
