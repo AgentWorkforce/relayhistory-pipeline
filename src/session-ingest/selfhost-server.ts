@@ -92,6 +92,9 @@ import type { SqlRun } from "./ledger-sql.ts";
 import { relaycontrolIngestIdentity, selfhostIntrospector } from "./selfhost-auth.ts";
 import { SELFHOST_INGEST_ROLE, selfhostIngestConfig, type SelfhostIngestSettings } from "./selfhost-config.ts";
 import { isSessionErasePath } from "./session-erase.ts";
+import type { SessionEraseService } from "./session-erase.ts";
+import { buildSelfhostEraseRuntime } from "../session-erase/selfhost-runtime.ts";
+import type { SessionWriteGuard } from "../session-erase/runtime.ts";
 import type { AnalyticsPort } from "../shared/analytics.ts";
 import { ANALYTICS_OFF, analyticsCounterFields, createAnalyticsSink } from "../shared/analytics-config.ts";
 
@@ -180,6 +183,8 @@ export interface RuntimeParts {
   close: () => Promise<void>;
   /** ANALYTICS_SINK=collector: the batch-completed events' port (closed by `close`). Absent: none. */
   analytics?: AnalyticsPort;
+  withSessionWrites?: SessionWriteGuard;
+  sessionEraseService?: SessionEraseService;
 }
 
 /** Test seams for the async consumer; production passes none. */
@@ -197,6 +202,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   const verified = new WeakMap<Request, IngestIdentity>();
   const deliver: DeliverDeps = {
     ledger: sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection }),
+    ...(parts.withSessionWrites ? { withSessionWrites: parts.withSessionWrites } : {}),
     acceptanceMode: "canonical",
     // SCRUB_ENGINE=wasm-bindgen: the sealer bound to the verified instance; otherwise {} (unchanged).
     target: { store: parts.store, keyRoot: settings.keyRoot, ...routedRawChunkSealerDeps() },
@@ -213,7 +219,8 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     return identity;
   };
   // SESSION_ERASE_API_ENABLED (session-erase.ts): the same operator route in every admission mode.
-  const sessionErase = settings.sessionErase ? { sessionErase: settings.sessionErase } : {};
+  const sessionErase = { ...(settings.sessionErase ? { sessionErase: settings.sessionErase } : {}),
+    ...(parts.sessionEraseService ? { sessionEraseService: parts.sessionEraseService } : {}) };
   // ANALYTICS_SINK=collector: the same port in every admission mode.
   const analytics = parts.analytics ? { analytics: parts.analytics } : {};
   // RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS (capture-policy.ts): the same check in every admission mode.
@@ -451,6 +458,8 @@ export const productionRuntime: RuntimeBuilder = async (settings, env) => {
   });
   pool.on("error", (err) => log.error("session ingest pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
   const run: SqlRun = async (text, params) => (await pool.query(text, params as unknown[])) as unknown as { rows: Record<string, unknown>[] };
+  let operator: Awaited<ReturnType<typeof buildSelfhostEraseRuntime>>;
+  let startupAnalytics: ReturnType<typeof createAnalyticsSink> | undefined;
   try {
     await assertIngestRole(run, { supabase: env.SESSION_POSTGRES_TLS_PROFILE === "supabase" });
     const store = buildLockerStore(env).store as unknown as ObjectStore;
@@ -461,7 +470,11 @@ export const productionRuntime: RuntimeBuilder = async (settings, env) => {
     const analytics = createAnalyticsSink(settings.analytics ?? ANALYTICS_OFF, "session-ingest", "service", {
       report: (counters) => log.warn("analytics export degraded", analyticsCounterFields(analytics.destination, counters)),
     });
-    return selfhostIngestRuntime(settings, {
+    startupAnalytics = analytics;
+    operator = await buildSelfhostEraseRuntime({ env, keyRoot: settings.keyRoot, api: settings.sessionErase,
+      enforced: settings.eraseFenceEnforced, bytesEnabled: settings.eraseBytesEnabled, run, pool, metadata: settings.pool,
+      log: fields => log.info("session erase", fields) });
+    const runtime = selfhostIngestRuntime(settings, {
       run,
       store,
       verify,
@@ -474,10 +487,15 @@ export const productionRuntime: RuntimeBuilder = async (settings, env) => {
         }
       },
       // Shutdown flush first (bounded by SERVICE_LIMITS.shutdownMs, inside serve()'s 10 s exit), then the pool.
-      close: async () => { await analytics.shutdown(); await pool.end(); },
+      close: async () => { await operator?.close(); await analytics.shutdown(); await pool.end(); },
       ...(analytics.destination !== "noop" ? { analytics } : {}),
+      ...(operator ? { withSessionWrites: operator.withSessionWrites, sessionEraseService: operator.service } : {}),
     });
+    operator?.start();
+    return runtime;
   } catch (error) {
+    await operator?.close().catch(() => {});
+    await startupAnalytics?.shutdown().catch(() => {});
     await pool.end().catch(() => {});
     throw error;
   }

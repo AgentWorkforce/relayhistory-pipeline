@@ -101,6 +101,7 @@ import { sessionEraseConfig, type SessionEraseConfig } from "./session-erase.ts"
 import { analyticsConfig, type AnalyticsConfig } from "../shared/analytics-config.ts";
 // Already in the self-host graph through deliver.ts; the same parser as the Worker's INGEST_CLAIM_LOCK_BUSY.
 import { routingFlag } from "./babysitter-retention.ts";
+import { eraseRuntimeSettings } from "../session-erase/flags.ts";
 import { UPLOAD_DIRECT_FLAG, UPLOAD_WITNESS_KEY_VAR, uploadDirectConfig, type UploadDirectConfig } from "./upload-admission.ts";
 
 export const SELFHOST_INGEST_FLAG = "RELAYHISTORY_SELFHOST_INGEST";
@@ -149,6 +150,8 @@ export interface SelfhostIngestSettings {
   introspectPositiveTtlMs: number;
   /** SESSION_ERASE_API_ENABLED (session-erase.ts). Default: disabled, the route answers 501. */
   sessionErase: SessionEraseConfig;
+  eraseFenceEnforced?: true;
+  eraseBytesEnabled?: true;
   /** Present only for SELFHOST_INGEST_ADMISSION=async|drain. */
   admission?: SelfhostAdmissionSettings;
   /** HISTORY_UPLOAD_DIRECT allowlist|on (upload-admission.ts). Absent: off, nothing reads the upload prefix. */
@@ -320,6 +323,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   const keyRoot = env.INGEST_KEY_ROOT?.trim() || "96bulls";
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u.test(keyRoot)) throw new Error("96bulls: INGEST_KEY_ROOT must be a single key segment");
   const admission = selfhostAdmissionSettings(env);
+  const eraseRuntime = eraseRuntimeSettings(env, sessionErase, admission);
   const uploadDirect = selfhostUploadDirectSettings(env, keyRoot, admission);
   const analytics = analyticsConfig(env, "selfhost");
   const claimLockBusy = routingFlag(env[SELFHOST_CLAIM_LOCK_BUSY_VAR]);
@@ -338,6 +342,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     capturePolicyUploads,
     introspectPositiveTtlMs,
     sessionErase,
+    ...eraseRuntime,
     ...(admission ? { admission } : {}),
     ...(uploadDirect ? { uploadDirect } : {}),
     ...(analytics.sink !== "noop" ? { analytics } : {}),
