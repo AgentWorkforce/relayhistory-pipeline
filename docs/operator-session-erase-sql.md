@@ -2,7 +2,9 @@
 
 Source-only, default-off operator implementation. Applying migrations or enabling any
 runtime still needs Khaliq's explicit approval. 050000/050010 are not a public route;
-050020 later retires their direct mutator grants in favor of lease-gated runtime calls.
+Their mutators are owner-only helpers from creation; the ingest login gets only receipt
+read. 050020 grants admission/lease-gated runtime calls and cannot be bypassed through
+legacy helper grants.
 
 Every session_index INSERT or UPDATE takes a shared advisory gate in a BEFORE STATEMENT
 trigger, before row/conflict locks. Erase owns the same gate exclusively before resolving

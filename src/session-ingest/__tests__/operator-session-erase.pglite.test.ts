@@ -95,11 +95,11 @@ type Receipt = { status: string; requestId: string; unreadable: boolean; bytesEr
   artifacts: Record<string, { count: number; state: string }>; failure: { step: string; code: string; retryable: boolean } | null;
   legacyScope: string; actor: { kind: string; id: string }; completedAt: string | null };
 const erase = async (d: Db, request = "req-1", key: readonly string[] = KEY, actor: [string, string] = ["user", "operator-1"]) =>
-  (await d.run("SELECT sessions.ingest_operator_erase_session($1,$2,$3,$4,$5,$6,$7) AS r", [...key, request, ...actor])).rows[0]!.r as Receipt;
+  (await d.db.query("SELECT sessions.ingest_operator_erase_session($1,$2,$3,$4,$5,$6,$7) AS r", [...key, request, ...actor])).rows[0]!.r as Receipt;
 const receipt = async (d: Db, key: readonly string[] = KEY) =>
   (await d.run("SELECT sessions.ingest_operator_erase_receipt($1,$2,$3,$4) AS r", [...key])).rows[0]!.r as Receipt | null;
 const step = async (d: Db, s: string, state: string, count: number | null, code: string | null = null, key: readonly string[] = KEY) =>
-  (await d.run("SELECT sessions.ingest_operator_erase_record_step($1,$2,$3,$4,$5,$6,$7,$8) AS r", [...key, s, state, count, code])).rows[0]!.r as Receipt;
+  (await d.db.query("SELECT sessions.ingest_operator_erase_record_step($1,$2,$3,$4,$5,$6,$7,$8) AS r", [...key, s, state, count, code])).rows[0]!.r as Receipt;
 const BYTE_KEYS = ["transcriptObjects", "stagedObjects", "bufferedBatches", "bufferedRows", "catalogRows", "largeReadJobs", "searchDocuments",
   "briefDocuments", "summaries", "briefs", "replayPublications", "analysisPublications", "historyDerivedObjects"];
 const rows = async <T>(d: Db, q: string, p: unknown[] = []) => (await d.db.query<T>(q, p)).rows;
@@ -123,7 +123,7 @@ describe("050000 operator per-session erase", () => {
     const owners = (await rows<{ o: string[] }>(d, "SELECT sessions.ingest_operator_erase_owners($1,$2,$3,ARRAY[$4,'s-alias']) o", [...KEY]))[0]!.o;
     expect(owners).toEqual(["U-a", "u-b", "u-c", "u-d"]);
     const body = (await rows<{ s: string }>(d, "SELECT prosrc s FROM pg_proc WHERE oid='sessions.ingest_operator_erase_fence(text,text,text,text,text[])'::regprocedure"))[0]!.s;
-    expect(body.indexOf("ingest_lock_fences")).toBeLessThan(body.indexOf("ingest_set_session_uploads"));
+    expect(body.indexOf("ingest_lock_fences")).toBeLessThan(body.indexOf("ingest_apply_selection"));
 
     // Retirement triggers can temporarily skip directory writes; the erase itself must clear search text.
     await d.db.query("UPDATE sessions.session_directory SET search_text='a summary' WHERE session_id=$1", [SID]);
@@ -313,7 +313,7 @@ describe("050000 operator per-session erase", () => {
       expect([q, await code(d.db.query(q))]).toEqual([q, "55000"]);
   });
 
-  test("grants: the ingest role executes the three entry points; PUBLIC, service_role and others cannot; tables are closed", async () => {
+  test("grants: only receipt read is public to ingest; mutators are owner-only and tables are closed", async () => {
     const d = await database();
     const sigs = ["sessions.ingest_operator_erase_session(text,text,text,text,text,text,text)", "sessions.ingest_operator_erase_receipt(text,text,text,text)",
       "sessions.ingest_operator_erase_record_step(text,text,text,text,text,text,bigint,text)"];
@@ -321,13 +321,12 @@ describe("050000 operator per-session erase", () => {
       const g = (await rows<{ i: boolean; p: boolean; sr: boolean; a: boolean; d: boolean; sp: string[] }>(d, `SELECT has_function_privilege('bulls96_session_ingest',$1,'EXECUTE') i,
         has_function_privilege('anon',$1,'EXECUTE') p,has_function_privilege('service_role',$1,'EXECUTE') sr,has_function_privilege('authenticated',$1,'EXECUTE') a,
         prosecdef d,proconfig sp FROM pg_proc WHERE oid=$1::regprocedure`, [s]))[0]!;
-      expect([s, g]).toEqual([s, { i: true, p: false, sr: false, a: false, d: true, sp: ["search_path=pg_catalog, pg_temp"] }]);
+      expect([s, g]).toEqual([s, { i: s.includes("_receipt(") , p: false, sr: false, a: false, d: true, sp: ["search_path=pg_catalog, pg_temp"] }]);
       expect(await rows(d, "SELECT 1 FROM pg_proc p, aclexplode(p.proacl) a WHERE p.oid=$1::regprocedure AND a.grantee=0", [s])).toEqual([]);
     }
     const helpers = await rows<{ f: string }>(d, `SELECT p.oid::regprocedure::text f FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
       WHERE n.nspname='sessions' AND p.proname LIKE 'ingest\\_operator\\_erase\\_%' AND has_function_privilege('bulls96_session_ingest',p.oid,'EXECUTE') ORDER BY 1`);
-    expect(helpers.map((h) => h.f).sort()).toEqual(sigs.map((s) => s.replace(/\(.*/, "")).sort().map((n) => helpers.find((h) => h.f.startsWith(n + "("))!.f));
-    expect(helpers).toHaveLength(3);
+    expect(helpers.map(h=>h.f)).toEqual(["sessions.ingest_operator_erase_receipt(text,text,text,text)"]);
     for (const t of ["session_erasure_receipts", "session_erasure_events", "session_erasure_fences"])
       for (const role of ["bulls96_session_ingest", "anon", "authenticated", "service_role", "search_consumer_runtime"])
         expect([t, role, (await rows<{ x: boolean }>(d, `SELECT has_table_privilege($1,$2,'SELECT,INSERT,UPDATE,DELETE') x`, [role, `sessions.${t}`]))[0]!.x]).toEqual([t, role, false]);
@@ -466,7 +465,7 @@ test("erase preserves another source and organization with identical session ids
 test("artifact assertions cannot claim unreadable while physical directory content is live", async () => {
  const d=await database();await pointer(d,"user",SID,"m");await erase(d);
  await directory(d,SID);
- for(const artifact of Object.keys((await receipt(d))!.artifacts)) await d.run("SELECT sessions.ingest_operator_erase_record_step($1,$2,$3,$4,$5,'done',0,NULL)",[...KEY,artifact]);
+ for(const artifact of Object.keys((await receipt(d))!.artifacts)) await d.db.query("SELECT sessions.ingest_operator_erase_record_step($1,$2,$3,$4,$5,'done',0,NULL)",[...KEY,artifact]);
  expect(await receipt(d)).toMatchObject({unreadable:false,status:"in_progress"});
 });
 

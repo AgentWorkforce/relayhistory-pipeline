@@ -26,25 +26,25 @@ describe.skipIf(!url)("operator fence serializes all pointer statements",()=>{
     VALUES('org','ws','claude',$1,'machine','user',now(),now(),'s3','bucket',$1,decode(repeat('ab',32),'hex'),'jsonl','019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18') RETURNING session_id`,[sid]);
    const erase=(sid:string)=>eraser.query("SELECT sessions.ingest_operator_erase_session('org','ws','claude',$1,$2,'user','operator') r",[sid,crypto.randomUUID()]);
    // Writer already owns a row lock; the erase waits on the BEFORE STATEMENT shared gate.
-   await writer.query("BEGIN");await insert("writer-first");await eraser.query("BEGIN;SET LOCAL ROLE bulls96_session_ingest");
+   await writer.query("BEGIN");await insert("writer-first");await eraser.query("BEGIN");
    const pending=erase("writer-first");await blocked(ep,wp);await writer.query("COMMIT");
    expect((await pending).rows[0].r).toMatchObject({unreadable:true,artifacts:{pointerRows:{state:"done"}}});await eraser.query("COMMIT");
    expect((await pool.query("SELECT 1 FROM sessions.session_index WHERE deleted_at IS NULL")).rows).toEqual([]);
    // The writer statement starts before the erase commits; its guard must see the post-wait fence.
-   await eraser.query("BEGIN;SET LOCAL ROLE bulls96_session_ingest");await erase("erase-first");
+   await eraser.query("BEGIN");await erase("erase-first");
    await writer.query("BEGIN");const later=insert("erase-first");await blocked(wp,ep);await eraser.query("COMMIT");
    expect((await later).rows).toEqual([]);await writer.query("COMMIT");
    // A direct UPDATE also takes the gate before its row locks and cannot revive a tombstone.
    await insert("update-first");await writer.query("BEGIN");await writer.query("UPDATE sessions.session_index SET user_id='late-user' WHERE session_id='update-first'");
-   await eraser.query("BEGIN;SET LOCAL ROLE bulls96_session_ingest");const updating=erase("update-first");await blocked(ep,wp);await writer.query("COMMIT");await updating;await eraser.query("COMMIT");
+   await eraser.query("BEGIN");const updating=erase("update-first");await blocked(ep,wp);await writer.query("COMMIT");await updating;await eraser.query("COMMIT");
    expect((await writer.query("UPDATE sessions.session_index SET deleted_at=NULL WHERE session_id='update-first' RETURNING session_id")).rows).toEqual([]);
    // Higher isolation cannot keep a stale snapshot and insert behind a committed erase.
    await writer.query("BEGIN ISOLATION LEVEL REPEATABLE READ;SELECT count(*) FROM sessions.session_erasure_fences");
-   await eraser.query("BEGIN;SET LOCAL ROLE bulls96_session_ingest");await erase("old-snapshot");
+   await eraser.query("BEGIN");await erase("old-snapshot");
    const stale=insert("old-snapshot");const outcome=stale.then(()=>"unsafe",e=>(e as {code:string}).code);
    await blocked(wp,ep);await eraser.query("COMMIT");expect(await outcome).toBe("40001");await writer.query("ROLLBACK");
    // The eraser must also reject an old snapshot before it can miss newly committed aliases.
-   await eraser.query("BEGIN ISOLATION LEVEL REPEATABLE READ;SET LOCAL ROLE bulls96_session_ingest;SELECT 1");
+   await eraser.query("BEGIN ISOLATION LEVEL REPEATABLE READ;SELECT 1");
    await expect(erase("stale-eraser")).rejects.toMatchObject({code:"40001"});await eraser.query("ROLLBACK");
    expect((await pool.query("SELECT 1 FROM sessions.session_index WHERE deleted_at IS NULL")).rows).toEqual([]);
   }finally{for(const c of held){await c.query("ROLLBACK").catch(()=>{});c.release();}await pool.end();await admin.query(`DROP DATABASE ${name}`);await admin.end();}

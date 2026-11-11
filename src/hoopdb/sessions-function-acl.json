@@ -742,15 +742,13 @@
       "bulls96_session_ingest:EXECUTE"
     ],
     "sessions.ingest_operator_erase_record_step(text,text,text,text,text,text,bigint,text)": [
-      "<owner>:EXECUTE",
-      "bulls96_session_ingest:EXECUTE"
+      "<owner>:EXECUTE"
     ],
     "sessions.ingest_operator_erase_render(text,text,text,text)": [
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_operator_erase_session(text,text,text,text,text,text,text)": [
-      "<owner>:EXECUTE",
-      "bulls96_session_ingest:EXECUTE"
+      "<owner>:EXECUTE"
     ],
     "sessions.ingest_operator_erase_settle(text,text,text,text)": [
       "<owner>:EXECUTE"

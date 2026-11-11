@@ -296,9 +296,9 @@ BEGIN
     UNION SELECT c_turn_origin) AS u
    ORDER BY u.origin_id COLLATE "C"
   LOOP
-   v_ledger:=v_ledger+(sessions.ingest_set_session_uploads(jsonb_build_object(
-     'tenant',jsonb_build_object('orgId',p_org,'workspaceId',p_ws,'userId',v_user),
-     'originId',v_origin,'sessions',v_pairs,'enabled',false))->>'updated')::bigint;
+   -- Same owner-only selection primitive as the public ingest entry point, after
+   -- this helper's complete tenant validation, ordered-mode refusal and owner locks.
+   v_ledger:=v_ledger+sessions.ingest_apply_selection(p_org,p_ws,v_user,v_origin,v_pairs,false);
   END LOOP;
  END LOOP;
  -- Every copy's pointer row: the marker revision keeps upsert_session_index from undeleting it.
@@ -337,7 +337,6 @@ LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS
 DECLARE v_org text;v_ws text;v_source text;v_session text;v_request text;v_actor text;
  r sessions.session_erasure_receipts%ROWTYPE;v_ids text[];v_code text;
 BEGIN
- PERFORM sessions.ingest_require_role('bulls96_session_ingest');
  IF current_setting('transaction_isolation')<>'read committed' THEN
   RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='operator erase: read-committed transaction required';END IF;
  v_org:=sessions.ingest_identifier(to_jsonb(p_org),false);
@@ -435,7 +434,6 @@ CREATE FUNCTION sessions.ingest_operator_erase_record_step(p_org text,p_ws text,
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $operator_step$
 DECLARE v_org text;v_ws text;v_source text;v_session text;r sessions.session_erasure_receipts%ROWTYPE;v_failed boolean;
 BEGIN
- PERFORM sessions.ingest_require_role('bulls96_session_ingest');
  v_org:=sessions.ingest_identifier(to_jsonb(p_org),false);
  v_ws:=sessions.ingest_identifier(to_jsonb(p_ws),true);
  v_source:=sessions.ingest_identifier(to_jsonb(p_source),false);
@@ -490,7 +488,6 @@ REVOKE ALL ON FUNCTION sessions.ingest_operator_erase_artifact_keys(),
   sessions.ingest_operator_erase_receipt(text,text,text,text),
   sessions.ingest_operator_erase_record_step(text,text,text,text,text,text,bigint,text)
   FROM PUBLIC,anon,authenticated,service_role;
-GRANT EXECUTE ON FUNCTION sessions.ingest_operator_erase_session(text,text,text,text,text,text,text),
-  sessions.ingest_operator_erase_receipt(text,text,text,text),
-  sessions.ingest_operator_erase_record_step(text,text,text,text,text,text,bigint,text)
-  TO bulls96_session_ingest;
+-- Mutators are internal owner-only helpers. The later runtime grants the authenticated,
+-- admission/lease-gated wrappers; the ingest login can only read receipts directly here.
+GRANT EXECUTE ON FUNCTION sessions.ingest_operator_erase_receipt(text,text,text,text) TO bulls96_session_ingest;
