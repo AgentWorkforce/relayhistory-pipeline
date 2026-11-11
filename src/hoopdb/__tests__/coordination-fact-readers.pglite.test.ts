@@ -103,6 +103,15 @@ describe("20261105047000 coordination fact readers", () => {
     expect(DOWN).toContain(createHash("sha256").update(SQL).digest("hex"));
     const db = await before047000();
     await runMigrations(client(db), { profile: LOCAL });
+    // This slot is no longer necessarily newest. Its down must refuse a later ledgered
+    // migration; remove successors through their own guarded downs before testing this one.
+    const later = (await plan(LOCAL)).filter(step => step.name.startsWith("upstream:") && step.name > STEP).reverse();
+    if (later.length) {
+      expect((await failure(db.exec(DOWN)))?.code).toBe("55000");
+      await db.exec("ROLLBACK");
+    }
+    for (const step of later)
+      await db.exec(readFileSync(join(root, "supabase/rollbacks", step.name.slice("upstream:".length).replace(/\.sql$/, ".down.sql")), "utf8"));
     await db.exec(DOWN);
     expect((await indexRows(db)).rows).toEqual([]);
     expect((await db.query<{ n: number }>(

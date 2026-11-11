@@ -2374,6 +2374,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const CG = "upstream:20261105043900_session_consumer_function_grants.sql";
     const SE = "upstream:20261105043910_selfhost_session_selection_erase.sql";
     const SL = "upstream:20261105044010_selfhost_erase_lock_fences.sql";
+    const OE = "upstream:20261105050000_operator_session_erase.sql";
+    const EF = "upstream:20261105050010_operator_session_erase_fence_check.sql";
     const BK = "upstream:20261105043880_ingest_bookkeeping_cleanup.sql";
     const V = "upstream:20261105044030_ingest_generation_overlap.sql";
     const GR = "upstream:20261105043890_buffered_search_gate_retired_witness.sql";
@@ -2393,7 +2395,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2436,8 +2438,33 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // Additive successors (047010 and later assigned lanes) roll back before the previous tail.
-    const newest = (await plan(SUPA_A)).filter((step) => step.name.startsWith("upstream:") && step.name > CQ).reverse();
+    // 20261105050010 (erase fence check) is the newest: 050000's down refuses (55000) while it is applied,
+    // and its own down restores 043850's claim/commit bodies and drops the session_index trigger.
+    const claimSrc = async () => (await db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid='sessions.ingest_claim_batch_mode(jsonb,text)'::regprocedure")).rows[0]!.s;
+    const indexGuard = async () => (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname='ingest_erase_fence_index_guard'")).rows[0]!.n;
+    expect(await claimSrc()).toContain("ingest_erase_fence_extend");
+    expect(await indexGuard()).toBe(1);
+    expect((await failure(rollback("20261105050000_operator_session_erase.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(OE);
+    await rollback("20261105050010_operator_session_erase_fence_check.down.sql");
+    expect(await names()).not.toContain(EF);
+    expect(await claimSrc()).not.toContain("ingest_erase_fence_extend");
+    expect(await indexGuard()).toBe(0);
+    expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_erase_fence_extend(text,text,text,text,jsonb)')::text AS p")).rows[0]!.p).toBeNull();
+    // Its ledger row is gone, so running it again refuses.
+    expect((await failure(rollback("20261105050010_operator_session_erase_fence_check.down.sql")))?.code).toBe("55000");
+    // 20261105050000 (operator per-session erase) is then the newest: 044010's down refuses (55000) while it is
+    // applied, and its own down drops the erase tables and functions.
+    expect(await relation("sessions.session_erasure_receipts")).toBe("sessions.session_erasure_receipts");
+    expect((await failure(rollback("20261105044010_selfhost_erase_lock_fences.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(SL);
+    await rollback("20261105050000_operator_session_erase.down.sql");
+    expect(await names()).not.toContain(OE);
+    expect(await relation("sessions.session_erasure_receipts")).toBeNull();
+    expect(await relation("sessions.session_erasure_fences")).toBeNull();
+    expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_operator_erase_session(text,text,text,text,text,text,text)')::text AS p")).rows[0]!.p).toBeNull();
+    // Remaining additive successors between 047000 and 050000 roll back before the previous tail.
+    const newest = (await plan(SUPA_A)).filter((step) => step.name.startsWith("upstream:") && step.name > CQ && step.name < OE).reverse();
     if (newest.length) expect((await failure(rollback("20261105047000_coordination_fact_readers.down.sql")))?.code).toBe("55000");
     for (const step of newest) await rollback(`${step.name.slice("upstream:".length).replace(/\.sql$/, "")}.down.sql`);
     expect((await names()).filter((name) => newest.some((step) => step.name === name))).toEqual([]);
@@ -2476,7 +2503,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'output\\_facts\\_%'")).rows[0]!.n).toBe(0);
     // Other lanes newer than 20261105045000 (045010 same-second feed, 045030 consumer project-text grant) roll back next, newest first: 045000's down
     // refuses (55000) while any of them is applied. (046010 and 046000 already rolled back above, so they are excluded here.)
-    const newerThanDigest = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > DG && s.name < CQ && s.name !== OF && s.name !== LQ && s.name !== CQ && s.name !== "upstream:20261105046000_analysis_jobs.sql").reverse();
+    const newerThanDigest = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > DG && s.name < CQ && s.name !== OE && s.name !== EF && s.name !== OF && s.name !== LQ && s.name !== CQ && s.name !== "upstream:20261105046000_analysis_jobs.sql").reverse();
     if (newerThanDigest.length)
       expect((await failure(rollback("20261105045000_digest_narrative_cache.down.sql")))?.code).toBe("55000");
     for (const { name } of newerThanDigest)

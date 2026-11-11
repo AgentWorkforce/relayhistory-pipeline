@@ -65,13 +65,19 @@ is a bounded before/after plan and one actual normal read after an approved acti
 Code integration does not activate the path. Migration and production flag changes
 require the production operator's explicit authorization.
 
-1. Slot 047010 follows the merged 047000 step and precedes the held erase migrations
-   050000/050010/050020. It has no source-order dependency on that erase stack. A
-   production apply reaching 047010 also applies the already-landed pending prefix:
-   045000, 045010, 045030, 045040, 046000, 046010 and 047000. The DB actor must verify
-   the CI plan contains exactly that reviewed pending prefix plus 047010, with no held
-   erase step; an unexpected plan stops the apply. This source re-slot does not itself
-   authorize that production prefix. In event-trigger boundary mode, refresh the reviewed
+1. Slot 047010 follows merged 047000 and precedes the erase migrations
+   050000/050010/050020. Keep this append-only order across all environments; do not
+   insert a new file below any already-applied step. First rehearse the canonical plan,
+   boundary refresh, apply and rollback against a qualified isolated dev target using
+   synthetic data. This source PR is not dev/prod resource or apply authorization.
+   Before production, obtain a fresh read-only ledger plan rather than assuming an old
+   receipt still names the live tail. Catch up only the actually pending members of the
+   separately reviewed landed range 045000–047000; then plan 047010 as a separate step.
+   Require the reviewed pending inventory and no unapproved later erase migrations.
+   The current all-pending release workflow must not be assumed to provide a cutoff:
+   if it cannot express that bounded plan from the pinned source, stop for reviewed
+   canonical workflow support. Renumbering alone does not limit an apply.
+   In event-trigger boundary mode, refresh the reviewed
    `supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql` bootstrap and
    embedded manifest from the same image before migrate; its pinned body changes with
    the new RPC, and a stale installed boundary refuses validation. Follow the existing
@@ -82,10 +88,20 @@ require the production operator's explicit authorization.
 2. Verify the new function's manifest, read-role ACL and migration sentinel. Keep the
    existing claim-session reader policy and backfill requirements satisfied; when that
    gate is off, the target RPC intentionally uses the frozen fallback.
+   Each schema apply changes the PASS generation: pair it with the existing coordinated
+   ingest expected-generation rebind and fresh ingest health/readback before the next
+   step. Obtain fresh current-generation G2 parity for the trial; a pre-apply G2 row no
+   longer qualifies. Use the established operator generation-window procedure and its
+   rollback plan, rather than changing the generation guard or reusing old proof.
 3. Deploy the reviewed Worker with explicit `owner_buffered=on` and
    `owner_buffered_exact_session=on`, preserving the other reviewed settings. This
    renders `READ_API_OWNER_BUFFERED_EXACT_SESSION=on`. Only the exact string `on`
    selects the new RPC; absent/other runtime values select the existing function.
+   Build the render from a fresh live configuration readback and require the exact-session
+   flag to be its sole configuration difference, including all allowlists, bindings,
+   origins, events, timeout, phase/concurrency and index flags. Explicit owner-buffered
+   mode does not inherit every live-only child automatically: copy their reviewed values
+   explicitly and refuse any collateral diff. Apply the same guard when reversing the flag.
 4. Bind one existing normal read to the actual new Reader version/config, retain its
    result and request correlation, and compare returned content/identity plus native
    status and backend trace. A source test or HTTP 200 alone is not feature success.
