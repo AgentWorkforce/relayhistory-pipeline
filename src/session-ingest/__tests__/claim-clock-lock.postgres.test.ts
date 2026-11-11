@@ -3,7 +3,7 @@
  * 20261105043500_lazy_claim_clock_narrowing. Claims read the singleton seat clock under KEY SHARE and serialize
  * per (org, workspace, origin) on ONE transaction advisory lock, so a claim of another origin no longer queues
  * behind it; same-origin claims serialize and a same-key loser takes the P0W01 ownership path, never 23505/40001.
- * F1/F2 bound the advisory footprint (one lock per claim, never one per record: 53200 safety).
+ * F1/F2 bound the advisory footprint (one origin lock plus one shared erase gate per claim, never per record: 53200 safety).
  * C1/C2 (20261105043800_lazy_ack_clock_no_key_update): a staged ACK holds the clock FOR NO KEY UPDATE, so another
  * user's claim (KEY SHARE) no longer queues behind it, while FOR SHARE / FOR UPDATE holders still exclude the ACK.
  * D1 (043800): the staged ACK takes the same origin advisory lock as the claim before any slot (fence -> clock ->
@@ -144,6 +144,14 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
   const advisory = async (pids: number[]) => (await pool.query(
     "SELECT pid,classid::text::bigint::text classid,objid::text::bigint::text objid,objsubid,mode,granted FROM pg_locks WHERE locktype='advisory' AND pid=ANY($1::int[]) ORDER BY pid,classid,objid",
     [pids])).rows as { pid: number; classid: string; objid: string; objsubid: number; mode: string; granted: boolean }[];
+  const eraseGate = (pid: number) => ({pid,classid:"961996",objid:"50000",objsubid:2,mode:"ShareLock",granted:true});
+  // Preserve the exact origin-lock proof while explicitly accounting for the one shared
+  // 050010 writer gate. No unexpected, exclusive or waiting gate is filtered away.
+  const expectAdvisory = async (pid: number, origins: Record<string,unknown>[]) => {
+    const locks = await advisory([pid]);
+    expect(locks).toHaveLength(origins.length + 1);
+    expect(locks).toEqual(expect.arrayContaining([...origins,eraseGate(pid)]));
+  };
   const ids500 = (label: string) => Array.from({ length: 500 }, (_, i) => `${label}-${serial}-${i}`);
   const prosrc = async (sig: string) => (await pool.query("SELECT prosrc FROM pg_proc WHERE oid=$1::regprocedure", [sig])).rows[0].prosrc as string;
   /** Fails AT the restore (not in a later test) if a reinstall left an older staged-ACK body in place. */
@@ -275,15 +283,13 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     expect([await slots(k[0]!), await slots(k[1]!), await slots(k[2]!)]).toEqual([[{ current_owner: x.userId }], [{ current_owner: x.userId }], [{ current_owner: y.userId }]]);
   }, 60000);
 
-  test("F1: a 500-record claim holds exactly ONE advisory lock (the origin key); another origin never waits on it, the same origin does", async () => {
+  test("F1: a 500-record claim holds one origin lock plus one shared erase gate; another origin never waits on it, the same origin does", async () => {
     const x = tenant("f1x"), y = tenant("f1y"), z = tenant("f1z"), origin = `f1-o-${serial}`;
     await warm(x, y, z);
     const hx = await hold(CLAIM, await capture("ingest_claim_buffered_batch", x, `f1x-${serial}`, ids500("f1x"), { origin }));
     expect(await hx.done).toMatchObject({ ok: true });
     const want = await originLock(origin);
-    const locks = await advisory([hx.pid]);
-    expect(locks.length).toBeLessThanOrEqual(1); // upper bound: the origin lock only (the fence is a row lock)
-    expect(locks).toEqual([{ pid: hx.pid, classid: want.classid, objid: want.objid, objsubid: 1, mode: "ExclusiveLock", granted: true }]);
+    await expectAdvisory(hx.pid,[{ pid: hx.pid, classid: want.classid, objid: want.objid, objsubid: 1, mode: "ExclusiveLock", granted: true }]);
     const hy = await hold(CLAIM, await capture("ingest_claim_buffered_batch", y, `f1y-${serial}`, [`f1-y-${serial}`], { origin: `f1-other-${serial}` }));
     expect(await settled(hy.done, 2000)).toBe(true);
     expect(await hy.done).toMatchObject({ ok: true });
@@ -295,7 +301,7 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     await finish(hz, "COMMIT"); await finish(hy, "COMMIT");
   }, 120000);
 
-  test("F2: K simultaneously held 500-record claims never raise 53200; total advisory locks <= K (causal when K*500 exceeds the measured lock capacity)", async () => {
+  test("F2: K simultaneously held 500-record claims never raise 53200; total advisory locks <= 2*K (causal when K*500 exceeds the measured lock capacity)", async () => {
     const show = async (n: string) => Number((await pool.query("SHOW " + n)).rows[0][n]);
     const names = ["max_locks_per_transaction", "max_connections", "max_prepared_transactions", "autovacuum_max_workers", "max_worker_processes", "max_wal_senders", "superuser_reserved_connections"];
     const cfg: Record<string, number> = {};
@@ -329,15 +335,20 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
     expect(k).toBeLessThanOrEqual(maxHeld);
     const ts = Array.from({ length: k }, (_, i) => tenant(`f2-${i}`));
     await warm(...ts);
-    const payloads: string[] = [];
-    for (const [i, t] of ts.entries()) payloads.push(await capture("ingest_claim_buffered_batch", t, `f2-${i}-${serial}`, ids500(`f2-${i}`), { origin: `f2-o${i}-${serial}` }));
+    const payloads: string[] = [], origins=ts.map((_,i)=>`f2-o${i}-${serial}`);
+    for (const [i, t] of ts.entries()) payloads.push(await capture("ingest_claim_buffered_batch", t, `f2-${i}-${serial}`, ids500(`f2-${i}`), { origin: origins[i]! }));
     const hs = await Promise.all(payloads.map((p) => hold(CLAIM, p)));
     const results = await Promise.all(hs.map((h) => h.done));
     // All K claims hold their transactions (and locks) open here, simultaneously.
     const locks = await advisory(hs.map((h) => h.pid));
     expect(results.map((r) => (r.ok ? "ok" : r.code))).toEqual(Array(k).fill("ok"));
-    expect(locks.length).toBeLessThanOrEqual(k);
-    expect(new Set(locks.map((l) => l.pid)).size).toBe(locks.length);
+    expect(locks.length).toBeLessThanOrEqual(2*k);
+    expect(new Set(locks.map((l) => l.pid)).size).toBe(k);
+    if(constrained) expect(2*k).toBeLessThan(capacity);
+    for(const [i,h] of hs.entries()){
+      const want=await originLock(origins[i]!);
+      await expectAdvisory(h.pid,[{pid:h.pid,classid:want.classid,objid:want.objid,objsubid:1,mode:"ExclusiveLock",granted:true}]);
+    }
     for (const h of hs) await finish(h, "ROLLBACK");
   }, 300000);
 
@@ -440,7 +451,7 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
         const hAck = await hold(COMMIT, pAck);
         await waitBlockedBy(hAck.pid, pidA); // the ACK is at slot A (its first rank) and already holds the origin lock
         const want = await originLock(origin);
-        expect(await advisory([hAck.pid])).toEqual([{ pid: hAck.pid, classid: want.classid, objid: want.objid, objsubid: 1, mode: "ExclusiveLock", granted: true }]);
+        await expectAdvisory(hAck.pid,[{ pid: hAck.pid, classid: want.classid, objid: want.objid, objsubid: 1, mode: "ExclusiveLock", granted: true }]);
         const hClaim = await hold(CLAIM, pClaim);
         await waitAdvisory(hClaim.pid);
         // Directly blocked by the ACK on the origin lock only; never by B's holder.
@@ -502,12 +513,12 @@ describe.skipIf(!url)("043500 lazy claim seat-clock narrowing (owned PostgreSQL)
       const [pidA, pidB] = [await pidOf(bA), await pidOf(bB)];
       const hAck = await hold(COMMIT, pAck, fast);
       await waitBlockedBy(hAck.pid, pidA); // the ACK is at slot A (its first rank)
-      expect(await advisory([hAck.pid])).toEqual([]); // e79: no origin lock
+      await expectAdvisory(hAck.pid,[]); // e79: no origin lock; shared erase gate is compatible
       const hClaim = await hold(CLAIM, pClaim, fast);
       await waitBlockedBy(hClaim.pid, pidB); // passed the clock and the free origin lock; queued on B first
       expect((await pool.query("SELECT pg_blocking_pids($1::int) AS p", [hClaim.pid])).rows[0].p).toEqual([pidB]);
       const want = await originLock(origin);
-      expect(await advisory([hClaim.pid])).toEqual([{ pid: hClaim.pid, classid: want.classid, objid: want.objid, objsubid: 1, mode: "ExclusiveLock", granted: true }]);
+      await expectAdvisory(hClaim.pid,[{ pid: hClaim.pid, classid: want.classid, objid: want.objid, objsubid: 1, mode: "ExclusiveLock", granted: true }]);
       blockers.shift(); await release(bA); // release A: the ACK takes A, then queues on B behind the claim
       await waitBlockedBy(hAck.pid, hClaim.pid);
       await waitBlockedBy(hAck.pid, pidB);

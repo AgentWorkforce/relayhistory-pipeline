@@ -475,6 +475,15 @@
     "sessions.ingest_digest(jsonb)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.ingest_erase_fence_extend(text,text,text,text,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_erase_fence_index_guard()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_erase_fence_index_lock()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.ingest_exact_keys(jsonb,text[])": [
       "<owner>:EXECUTE"
     ],
@@ -699,6 +708,49 @@
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_lock_fences(text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_append_only()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_artifact_keys()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_artifacts_valid(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_failure_valid(jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_fence(text,text,text,text,text[])": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_ids(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_ordered(text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_owners(text,text,text,text[])": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_pending(jsonb,text[])": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_receipt(text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_record_step(text,text,text,text,text,text,bigint,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_render(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_session(text,text,text,text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.ingest_operator_erase_settle(text,text,text,text)": [
       "<owner>:EXECUTE"
     ],
     "sessions.ingest_prepare_buffer_stage(jsonb)": [
