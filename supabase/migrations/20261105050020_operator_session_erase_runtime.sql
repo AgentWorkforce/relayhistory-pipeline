@@ -28,33 +28,34 @@ REVOKE ALL ON sessions.session_erasure_writes,sessions.session_erasure_scopes,se
 
 CREATE FUNCTION sessions.ingest_operator_runtime_ids(p_org text,p_ws text,p_source text,p_session text) RETURNS text[]
 LANGUAGE sql STABLE SET search_path=pg_catalog,pg_temp AS $ids$
- WITH RECURSIVE related(id) AS (
-  SELECT p_session UNION
-  SELECT n.id FROM related AS rel JOIN sessions.session_index AS s
-   ON s.org_id=p_org AND s.workspace_id=p_ws AND s.harness=p_source
-    AND (s.session_id=rel.id OR s.canonical_session_id=rel.id)
-   CROSS JOIN LATERAL(VALUES(s.session_id),(s.canonical_session_id)) AS n(id) WHERE n.id IS NOT NULL
- ) SELECT array_agg(id ORDER BY id COLLATE "C") FROM(SELECT id FROM related LIMIT 257) AS bounded
+ SELECT sessions.ingest_operator_erase_ids(p_org,p_ws,p_source,p_session)
 $ids$;
 
 CREATE FUNCTION sessions.ingest_operator_runtime_write_begin(p jsonb) RETURNS boolean
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $write_begin$
-DECLARE v_org text;v_ws text;v_writer uuid;v_pair record;
+DECLARE v_org text;v_ws text;v_writer uuid;v_pair record;v_pairs jsonb;
 BEGIN
  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
- PERFORM sessions.ingest_exact_keys(p,ARRAY['orgId','workspaceId','writerId','sessions']);
+ PERFORM pg_advisory_xact_lock_shared(961996,50000);
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['orgId','workspaceId','writerId','sessions','physicalSessions']);
  v_org:=sessions.ingest_identifier(p->'orgId',false);v_ws:=sessions.ingest_identifier(p->'workspaceId',true);
  v_writer:=(p->>'writerId')::uuid;
  IF v_writer IS NULL THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='operator write: writer required';END IF;
+ PERFORM sessions.ingest_session_pairs(p->'sessions');
+ PERFORM sessions.ingest_session_pairs(p->'physicalSessions');
+ IF jsonb_array_length(p->'sessions')=0 OR jsonb_array_length(p->'physicalSessions')=0 THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='operator write: canonical and physical identities required';END IF;
+ SELECT jsonb_agg(pair) INTO v_pairs FROM(SELECT value AS pair FROM jsonb_array_elements(p->'sessions')
+  UNION SELECT value FROM jsonb_array_elements(p->'physicalSessions')) AS pairs;
  -- Serialize registration with erase, in the same order in every process. These locks last only
  -- for this short transaction; the persistent obligation, not a held connection, covers S3 I/O.
- FOR v_pair IN SELECT source,session_id FROM sessions.ingest_session_pairs(p->'sessions') ORDER BY source COLLATE "C",session_id COLLATE "C" LOOP
+ FOR v_pair IN SELECT source,session_id FROM sessions.ingest_session_pairs(v_pairs) ORDER BY source COLLATE "C",session_id COLLATE "C" LOOP
   PERFORM pg_advisory_xact_lock(hashtextextended(concat_ws(chr(31),'96bulls:operator-write',v_org,v_ws,v_pair.source,v_pair.session_id),0));
  END LOOP;
- IF EXISTS(SELECT 1 FROM sessions.ingest_session_pairs(p->'sessions') AS x JOIN sessions.session_erasure_fences AS f
+ IF EXISTS(SELECT 1 FROM sessions.ingest_session_pairs(v_pairs) AS x JOIN sessions.session_erasure_fences AS f
   ON f.org_id=v_org AND f.workspace_id=v_ws AND f.source=x.source AND f.session_id=x.session_id) THEN RETURN false;END IF;
  INSERT INTO sessions.session_erasure_writes(org_id,workspace_id,source,session_id,writer_id)
- SELECT v_org,v_ws,x.source,x.session_id,v_writer FROM sessions.ingest_session_pairs(p->'sessions') AS x;
+ SELECT v_org,v_ws,x.source,x.session_id,v_writer FROM sessions.ingest_session_pairs(v_pairs) AS x;
  RETURN true;
 END $write_begin$;
 
@@ -87,6 +88,7 @@ LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS
 DECLARE v_ids text[];v_id text;v_receipt jsonb;
 BEGIN
  PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ PERFORM pg_advisory_xact_lock(961996,50000);
  -- Resume before consulting metadata already deleted by a prior attempt.
  v_receipt:=sessions.ingest_operator_erase_receipt(p_org,p_ws,p_source,p_session);
  IF v_receipt IS NOT NULL AND v_receipt->>'status'<>'failed' THEN RETURN v_receipt;END IF;
@@ -120,6 +122,8 @@ BEGIN
  OR EXISTS(SELECT 1 FROM sessions.session_analysis_result_tickets WHERE org_id=p_org AND workspace_id=p_ws AND session_id=ANY(v_ids))
  OR EXISTS(SELECT 1 FROM sessions.session_large_read_jobs WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_source AND session_id=ANY(v_ids) AND state='running')
  OR EXISTS(SELECT 1 FROM sessions.session_analysis_wakeups WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_source AND session_id=ANY(v_ids) AND lease_nonce IS NOT NULL)
+ OR EXISTS(SELECT 1 FROM sessions.daily_digest_narratives WHERE org_id=p_org AND workspace_id=p_ws)
+ OR EXISTS(SELECT 1 FROM pg_roles WHERE rolname='bulls96_digest_narrative' AND rolcanlogin)
  OR EXISTS(SELECT 1 FROM sessions.session_brief_document_control WHERE live) THEN
   RAISE EXCEPTION USING ERRCODE='RH013',MESSAGE='operator erase: independent artifact writer requires a drain protocol';END IF;
  v_receipt:=sessions.ingest_operator_erase_session(p_org,p_ws,p_source,p_session,p_request,p_actor_kind,p_actor_id);
@@ -201,6 +205,7 @@ LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS
 DECLARE v_row jsonb;v_org text;v_ws text;v_source text;v_session text;v_id text;v_result record;
 BEGIN
  PERFORM sessions.ingest_require_role('search_consumer_runtime');
+ PERFORM pg_advisory_xact_lock_shared(961996,50000);
  IF jsonb_typeof(p_rows) IS DISTINCT FROM 'array' OR jsonb_array_length(p_rows)<>1 THEN
   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='operator pointer: one row required';END IF;
  v_row:=p_rows->0;v_org:=sessions.ingest_identifier(v_row->'org_id',false);v_ws:=sessions.ingest_identifier(v_row->'workspace_id',true);
@@ -259,6 +264,8 @@ BEGIN
  WHERE org_id=p_org AND workspace_id=p_ws AND source=p_source AND session_id=p_session;
  DELETE FROM sessions.session_directory_relationships WHERE org_id=p_org AND workspace_id=p_ws AND harness=p_source
   AND(parent_session_id=ANY(v_ids) OR child_session_id=ANY(v_ids));
+ GET DIAGNOSTICS v_count=ROW_COUNT;
+ v_counts:=jsonb_build_object('directoryRows',v_count);
  IF to_regclass('search_index.projection_state') IS NOT NULL THEN
   PERFORM set_config('bulls96_read.org_id',p_org,true),set_config('bulls96_read.workspace_id',p_ws,true);
   DELETE FROM search_index.projection_state WHERE org_id=p_org AND workspace_id=p_ws AND source=p_source
@@ -267,12 +274,6 @@ BEGIN
    AND(session_id=ANY(v_ids) OR canonical_session_id=ANY(v_ids))) THEN
    RAISE EXCEPTION USING ERRCODE='RH015',MESSAGE='operator erase: search state remains';END IF;
  END IF;
- -- A digest mixes summaries from several sessions and cannot be selectively redacted. Evict
- -- this workspace cache; another workspace is never affected. The guard below prevents a
- -- previously started narrative writer from restoring text from before the fence.
- DELETE FROM sessions.daily_digest_narratives WHERE org_id=p_org AND workspace_id=p_ws;
- GET DIAGNOSTICS v_count=ROW_COUNT;
- v_counts:=jsonb_build_object('summaries',v_count);
  -- Derived publications can be re-queued by pointer/directory deletion triggers. Two passes
  -- remove those generated rows too; the final independent counts must be zero.
  FOR v_pass IN 1..2 LOOP
@@ -309,13 +310,10 @@ CREATE FUNCTION sessions.ingest_operator_runtime_metadata_guard() RETURNS trigge
 LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $metadata_guard$
 DECLARE v_row jsonb:=to_jsonb(NEW);
 BEGIN
- IF TG_TABLE_NAME='daily_digest_narratives' THEN
-  IF EXISTS(SELECT 1 FROM sessions.session_erasure_fences WHERE org_id=v_row->>'org_id' AND workspace_id=v_row->>'workspace_id') THEN RETURN NULL;END IF;
-  RETURN NEW;
- END IF;
  IF EXISTS(SELECT 1 FROM sessions.session_erasure_fences AS f
   WHERE f.org_id=v_row->>'org_id' AND f.workspace_id=v_row->>'workspace_id'
-   AND f.source=coalesce(v_row->>'harness',v_row->>'scope_source',v_row->>'source') AND f.session_id=v_row->>'session_id') THEN
+   AND f.source=coalesce(v_row->>'harness',v_row->>'scope_source',v_row->>'source') AND(f.session_id=v_row->>'session_id' OR (TG_TABLE_NAME='session_directory_relationships'
+    AND f.session_id IN(v_row->>'parent_session_id',v_row->>'child_session_id')))) THEN
   -- Let the initial fence tombstone an existing directory row. Subsequent writes, including
   -- dead-row inserts after physical purge, are refused.
   IF TG_TABLE_NAME='session_directory' AND TG_OP='UPDATE'
@@ -325,10 +323,10 @@ BEGIN
  RETURN NEW;
 END $metadata_guard$;
 DO $guards$ DECLARE t text; BEGIN
- FOREACH t IN ARRAY ARRAY['session_directory','session_directory_agents','session_directory_event_times','session_desktop_catalog_reproject',
+ FOREACH t IN ARRAY ARRAY['session_directory','session_directory_users','session_directory_machines','session_directory_relationships','session_directory_agents','session_directory_event_times','session_desktop_catalog_reproject',
   'session_large_read_jobs','session_index_ext','session_verdicts','session_summaries','session_briefs','session_brief_wakeups','session_brief_attempts',
   'session_brief_document_outbox','session_replay_publications','session_analysis_publications','session_analysis_wakeups',
-  'session_event_facts','session_output_facts','output_facts_session_state','session_analysis_jobs_v2','daily_digest_narratives'] LOOP
+  'session_event_facts','session_output_facts','output_facts_session_state','session_analysis_jobs_v2'] LOOP
   IF to_regclass('sessions.'||t) IS NOT NULL THEN
    EXECUTE format('CREATE TRIGGER operator_erase_metadata_guard BEFORE INSERT OR UPDATE ON sessions.%I FOR EACH ROW EXECUTE FUNCTION sessions.ingest_operator_runtime_metadata_guard()',t);
   END IF;
@@ -350,3 +348,4 @@ GRANT EXECUTE ON FUNCTION sessions.ingest_operator_runtime_write_begin(jsonb),se
  sessions.ingest_operator_runtime_purge(text,text,text,text,uuid),sessions.ingest_operator_runtime_step(text,text,text,text,uuid,text,text,bigint,text) TO bulls96_session_ingest;
 GRANT EXECUTE ON FUNCTION sessions.ingest_operator_runtime_upsert(jsonb,text,text) TO search_consumer_runtime;
 GRANT EXECUTE ON FUNCTION sessions.ingest_operator_runtime_erased(text,text,text,text) TO bulls96_read_api;
+

@@ -43,7 +43,7 @@ describe.skipIf(!url)("operator erase write barrier on real PostgreSQL", () => {
       const pid = async (c: pg.PoolClient) => (await c.query<{ p: number }>("SELECT pg_backend_pid() p")).rows[0]!.p;
       const writerId = crypto.randomUUID();
       const write = (c: pg.PoolClient, session: string) => c.query<{ r: boolean }>("SELECT sessions.ingest_operator_runtime_write_begin($1::jsonb) r", [
-        JSON.stringify({ orgId: "org", workspaceId: "ws", writerId, sessions: [["claude", session]] }),
+        JSON.stringify({ orgId: "org", workspaceId: "ws", writerId, sessions: [["claude", session]], physicalSessions: [["claude",session]] }),
       ]);
       const erase = (c: pg.PoolClient, session: string) => c.query<{ r: { uploadsFenced: boolean } }>(
         "SELECT sessions.ingest_operator_runtime_begin('org','ws','claude',$1,$2,'user','operator','bucket','96bulls',$3) r",

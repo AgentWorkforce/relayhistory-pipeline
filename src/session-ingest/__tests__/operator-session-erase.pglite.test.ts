@@ -32,7 +32,7 @@ type Db = { db: PGlite; run: SqlRun; as: (role: string) => SqlRun };
 async function database(): Promise<Db> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
-  await applySupabaseSchema(db, { until: null });
+  await applySupabaseSchema(db, { until: "20261105050010_operator_session_erase_fence_check.sql" });
   await db.exec(sql("supabase/bootstrap/session_ingest_role.sql"));
   let chain: Promise<unknown> = Promise.resolve();
   const as = (role: string): SqlRun => (text, params) => {
