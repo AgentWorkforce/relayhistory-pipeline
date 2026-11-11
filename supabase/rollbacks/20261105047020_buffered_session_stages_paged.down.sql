@@ -7,7 +7,7 @@ DO $rollback_guard$ BEGIN
  IF to_regclass('sessions.__96bulls_migrations') IS NULL THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='paged session stages: migration ledger required'; END IF;
  LOCK TABLE sessions.__96bulls_migrations IN SHARE ROW EXCLUSIVE MODE;
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105047020_buffered_session_stages_paged.sql')
-    OR NOT EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name='upstream:20261105047020_buffered_session_stages_paged.sql' AND sha256='968a8ac964c19fde042e7f3e4c39f1d84da14336a14b0adeea166b044c762934')
+    OR NOT EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name='upstream:20261105047020_buffered_session_stages_paged.sql' AND sha256='ee7bb51830e1b772c0c81ed5b7052f8e453f52403afe5cbf6af86c637428316b')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='paged session stages: own checksum and no later applied migration required';END IF;
  IF NOT EXISTS(SELECT 1 FROM pg_proc p JOIN pg_roles r ON r.oid=p.proowner WHERE p.oid=to_regprocedure('sessions.buffered_session_stages_for_target_paged(text,text,text,text,text,text,text,text,boolean,text,jsonb,integer)')
    AND r.rolname=current_user AND p.prosecdef AND p.provolatile='s' AND p.proconfig=ARRAY['search_path=pg_catalog, sessions, pg_temp']
@@ -16,5 +16,5 @@ DO $rollback_guard$ BEGIN
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='paged session stages: exact owned paged body required';END IF;
 END $rollback_guard$;
 DROP FUNCTION sessions.buffered_session_stages_for_target_paged(text,text,text,text,text,text,text,text,boolean,text,jsonb,integer);
-DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105047020_buffered_session_stages_paged.sql' AND sha256='968a8ac964c19fde042e7f3e4c39f1d84da14336a14b0adeea166b044c762934';
+DELETE FROM sessions.__96bulls_migrations WHERE name='upstream:20261105047020_buffered_session_stages_paged.sql' AND sha256='ee7bb51830e1b772c0c81ed5b7052f8e453f52403afe5cbf6af86c637428316b';
 COMMIT;

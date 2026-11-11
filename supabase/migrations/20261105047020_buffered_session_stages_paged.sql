@@ -39,7 +39,7 @@ CREATE FUNCTION sessions.buffered_session_stages_for_target_paged(
   p_workspace text, p_source text, p_session_id text,
   p_cutover_epoch text, p_head_epoch text, p_head_version text, p_head_digest text, p_head_kind text,
   p_head_pending boolean, p_privacy_baseline_sha256 text,
-  p_cursor jsonb DEFAULT NULL, p_page_claims integer DEFAULT 2
+  p_cursor jsonb, p_page_claims integer
 )
 RETURNS TABLE(stages jsonb, cursor jsonb, has_more boolean, snapshot_at timestamptz)
 LANGUAGE plpgsql STABLE SECURITY DEFINER

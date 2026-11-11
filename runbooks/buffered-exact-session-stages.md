@@ -121,7 +121,9 @@ still depends on it.
 
 Migration `20261105047020_buffered_session_stages_paged.sql` adds
 `sessions.buffered_session_stages_for_target_paged`: the 047010 arguments plus
-`p_cursor jsonb DEFAULT NULL` and `p_page_claims integer DEFAULT 2`. It returns exactly one
+`p_cursor jsonb` and `p_page_claims integer`, with no DEFAULT clauses (the release-target
+held-function check fails closed on them), so every caller passes all 12 arguments; a NULL
+`p_cursor` starts at the first page and a NULL `p_page_claims` is treated as 2. It returns exactly one
 envelope row per call: `stages` (a jsonb array of the rows
 `buffered_session_stages_for_target` returns, same column names as keys and the same
 order), `cursor` (NULL when exhausted), `has_more` and `snapshot_at`. 044090 and 047010
