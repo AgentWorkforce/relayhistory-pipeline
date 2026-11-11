@@ -8,7 +8,6 @@ import {
 } from "../../packages/object-store/src/index.ts";
 import {sealRawChunk} from "../../packages/pipeline/src/lib/pipeline/raw-chunks.ts";
 import {readCapped,buildObjectLandedMessage} from "../../packages/pipeline/src/lib/pipeline/adapter.ts";
-import type {ObjectStoreProvider} from "../../packages/pipeline/src/lib/pipeline/stages.ts";
 import {canonicalManifestIdentity,manifestUserId} from "../shared/manifest-identity.ts";
 import {nextManifest,lineTimeMs,admittedIdentity,LIVE_OWNER,derivedUuidV7} from "./writer.ts";
 import {acceptedReceiptSeat,injectReceiptSeat}from "./publication-seats.ts";
@@ -77,7 +76,7 @@ async function readPrevious(ticket:PublicationTicket,head:PublicationHead,target
    throw refused("publication_previous_snapshot_mismatch");
  }else{
   const base=head.basePointer!;
-  if(at.prefix!==target.keyRoot+"/"+ticket.tenant.orgId||base.storage_provider!==store.backend||base.bucket!==target.bucket||
+  if(at.prefix!==target.keyRoot+"/"+ticket.tenant.orgId||base.storage_provider!=="s3"||base.bucket!==target.bucket||
    manifest.raw.content_sha256!==rawDigest(base.content_sha256)||String(manifest.revision)!==String(base.revision)||base.deleted_at!==null)
    throw refused("publication_legacy_base_mismatch");
  }
@@ -132,7 +131,7 @@ export async function preparePublicationImage(
  if(body.byteLength>MAX_MANIFEST)throw refused("publication_manifest_limit");
  const row={org_id:ticket.tenant.orgId,workspace_id:ticket.tenant.workspaceId,harness:head.physicalSource,session_id:head.physicalSession,machine_id:head.machineId,
   user_id:ticket.tenant.userId,created_at:startedAt,last_activity_at:manifest.session.ended_at??manifest.raw.updated_at,event_count:chunks.reduce((n,c)=>n+(c.records??0),0),
-  storage_provider:store.backend,bucket:target.bucket,manifest_key:key,content_sha256:"\\x"+manifest.raw.content_sha256,raw_bytes:manifest.raw.raw_bytes,chunk_count:chunks.length,
+  storage_provider:"s3",bucket:target.bucket,manifest_key:key,content_sha256:"\\x"+manifest.raw.content_sha256,raw_bytes:manifest.raw.raw_bytes,chunk_count:chunks.length,
   raw_format:"ndjson",format_version:1,normalized_version:null,scrubbed:true,manifest_etag:null,revision:manifest.revision,trace_id:traceId,deleted_at:null};
  const baseCopies:PreparedPublicationImage["baseCopies"]=[];
  if(previous&&!head.previousKey){
@@ -169,7 +168,7 @@ export async function writePublicationImage(
  await putPublicationObject(store,image.newChunk.spec,image.newChunk.body,signal,image.newChunk.options);
  const ack=await putPublicationObject(store,{key:image.spec.manifestKey,sha256:image.spec.manifestSha256,bytes:image.body.byteLength},image.body,signal,{contentType:"application/json"});
  if(image.head.source==="_none"&&image.head.sessionId==="_origin")return null;
- const built=buildObjectLandedMessage({landed:{key:image.spec.manifestKey,provider:store.backend as ObjectStoreProvider,bucket:target.bucket,size:image.body.byteLength,...(ack.version.eTag?{etag:ack.version.eTag}:{}),...(ack.version.version?{version:ack.version.version}:{})},
+ const built=buildObjectLandedMessage({landed:{key:image.spec.manifestKey,provider:"s3",bucket:target.bucket,size:image.body.byteLength,...(ack.version.eTag?{etag:ack.version.eTag}:{}),...(ack.version.version?{version:ack.version.version}:{})},
   orgId:ticket.tenant.orgId,manifest:image.manifest});
  if(built.status!=="enqueue")throw refused("publication_notification_invalid");
  return built.message;
