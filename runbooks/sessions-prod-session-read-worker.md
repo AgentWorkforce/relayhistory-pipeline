@@ -235,3 +235,27 @@ SELECT id, source, turn_index, role, ts FROM sessions.conversation_turns
 - **Fastest:** set the route back to `shadow` or `off` in Cloud. This needs no Worker change.
 - **Back to the Lambda,** while it still exists: set `SESSIONS_READ_96BULLS_URL` back to the Lambda's Function URL. Cursors are compatible both ways.
 - **Bad Worker version:** `bunx wrangler rollback --name bulls96-session-read-api` restores the previous version.
+
+
+## Preserve the live buffered-read profile on code deploys
+
+`owner_buffered` now defaults to `preserve`. Before rendering, the workflow reads
+the single active Worker version and carries forward its buffered-read settings,
+workspace allowlists, S3 bucket/region, statement timeout and pinned privacy-service
+binding. It copies no secret values. An unavailable, split or inconsistent live
+configuration stops the deploy instead of guessing that the feature is off. The
+S3-secret check follows the resolved mode, including a preserved `on` mode.
+
+To change the configuration, explicitly select `owner_buffered=on` or `off`.
+With `on`, provide the workspace and child-feature inputs as before; optionally
+set `owner_buffered_statement_timeout_ms` to an integer from 2000 through 6000.
+`owner_buffered_statement_timeout_ms=off` keeps the runtime's default timeout. Changing feature settings remains an
+operator-approved production action; this source change does not enable history.
+
+On 2026-11-11, run 42946743205 deployed source `37f73b14` with the old default
+`off` inputs. The actual serving version `7d801289-2443-4978-a3da-b5f07d0a9f1e`
+omitted the previously active owner-buffered/event flags and control binding.
+The historical read returned an empty 200, so a successful health check did not
+prove session visibility. Restoring an intended profile must be followed by a
+normal authenticated read of known native message identities. Do not claim a
+Factory history PASS from a durable upload cursor or a health response.

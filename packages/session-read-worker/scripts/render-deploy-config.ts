@@ -88,12 +88,13 @@ export const BUFFERED_SEARCH_GATE_VAR = "READ_API_BUFFERED_SEARCH_GATE";
 export const OWNER_BUFFERED_EVENTS_VAR = "READ_API_OWNER_BUFFERED_EVENTS";
 /** The owner-buffered events read's stage concurrency (index.ts Env; ownerBufferedStageConcurrency accepts 2..32). */
 export const OWNER_BUFFERED_STAGE_CONCURRENCY_VAR = "READ_API_OWNER_BUFFERED_STAGE_CONCURRENCY";
+export const OWNER_BUFFERED_STATEMENT_TIMEOUT_VAR = "READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS";
 /** The owner-buffered events read's per-phase log fields (index.ts Env; ownerBufferedPhaseLogEnabled accepts only "1"). */
 export const OWNER_BUFFERED_PHASE_LOG_VAR = "READ_API_OWNER_BUFFERED_PHASE_LOG";
 /** The owner-buffered out-of-band index check (index.ts Env; ownerBufferedIndexVerifyEnabled accepts only "on"). */
 export const OWNER_BUFFERED_INDEX_VERIFY_VAR = "READ_API_OWNER_BUFFERED_INDEX_VERIFY";
 /** Vars only this render adds; a template declaring any of them is refused in every mode. */
-const RENDER_ONLY_VARS = [OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR] as const;
+const RENDER_ONLY_VARS = [OWNER_BUFFERED_STATEMENT_TIMEOUT_VAR, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR] as const;
 
 export interface RenderInputs {
   hyperdriveId: string;
@@ -114,6 +115,8 @@ export interface RenderInputs {
   ownerBufferedPhaseLog?: string;
   /** The owner_buffered_index_verify workflow_dispatch input; "" (no input) = off; on needs owner_buffered=on. */
   ownerBufferedIndexVerify?: string;
+  /** "off"/unset keeps the runtime default; otherwise its accepted 2000..6000 ms bound. */
+  ownerBufferedStatementTimeoutMs?: string;
 }
 
 export class RenderError extends Error {
@@ -180,6 +183,9 @@ export function renderDeployConfig(template: string, inputs: RenderInputs): stri
   if (gateMode !== "off" && gateMode !== "on") throw new RenderError('buffered_search_gate must be "off" or "on"');
   const gate = gateMode === "on";
   const mode = (inputs.ownerBuffered ?? "").trim() || "off";
+  const timeout = (inputs.ownerBufferedStatementTimeoutMs ?? "").trim() || "off";
+  if (timeout !== "off" && (!/^[1-9][0-9]*$/.test(timeout) || Number(timeout) < 2000 || Number(timeout) > 6000)) throw new RenderError("owner_buffered_statement_timeout_ms must be off or an integer 2000..6000");
+  if (timeout !== "off" && mode !== "on") throw new RenderError("owner_buffered_statement_timeout_ms needs owner_buffered=on");
   const eventsMode = (inputs.ownerBufferedEvents ?? "").trim() || "off";
   if (eventsMode !== "off" && eventsMode !== "on") throw new RenderError('owner_buffered_events must be "off" or "on"');
   const events = eventsMode === "on";
@@ -227,6 +233,7 @@ export function renderDeployConfig(template: string, inputs: RenderInputs): stri
   const config = parseRendered(template, inputs.hyperdriveId);
   const vars = config.vars ?? {};
   leaveUnset(vars, ["RELAYHISTORY_READ_OWNER_BUFFERED", "READ_API_OWNER_BUFFERED_WORKSPACES", "INGEST_S3_BUCKET", "INGEST_S3_REGION"]);
+  leaveUnset(vars, [OWNER_BUFFERED_STATEMENT_TIMEOUT_VAR]);
   if (gate) leaveUnset(vars, [BUFFERED_SEARCH_GATE_VAR]);
   if (events) leaveUnset(vars, [OWNER_BUFFERED_EVENTS_VAR]);
   if (concurrency !== undefined) leaveUnset(vars, [OWNER_BUFFERED_STAGE_CONCURRENCY_VAR]);
@@ -241,6 +248,7 @@ export function renderDeployConfig(template: string, inputs: RenderInputs): stri
       READ_API_OWNER_BUFFERED_WORKSPACES: workspaces.join(","),
       INGEST_S3_BUCKET: bucket,
       INGEST_S3_REGION: region,
+      ...(timeout !== "off" ? { [OWNER_BUFFERED_STATEMENT_TIMEOUT_VAR]: timeout } : {}),
       // One binding serves both readers; the gate adds only its flag.
       ...(gate ? { [BUFFERED_SEARCH_GATE_VAR]: "on" } : {}),
       ...(events ? { [OWNER_BUFFERED_EVENTS_VAR]: "on" } : {}),
@@ -267,6 +275,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
       ownerBufferedStageConcurrency: process.env.OWNER_BUFFERED_STAGE_CONCURRENCY,
       ownerBufferedPhaseLog: process.env.OWNER_BUFFERED_PHASE_LOG,
       ownerBufferedIndexVerify: process.env.OWNER_BUFFERED_INDEX_VERIFY,
+      ownerBufferedStatementTimeoutMs: process.env.OWNER_BUFFERED_STATEMENT_TIMEOUT_MS,
     });
     writeFileSync(here("../wrangler.deploy.jsonc"), out);
     const on = ((process.env.OWNER_BUFFERED ?? "").trim() || "off") === "on";
