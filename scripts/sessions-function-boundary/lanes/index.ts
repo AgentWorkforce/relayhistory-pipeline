@@ -26,6 +26,7 @@ import { readApi } from "./read-api.ts";
 import { readApiTokens } from "./read-api-tokens.ts";
 import { readApiQuery } from "./read-api-query.ts";
 import { coordinationFactReaders } from "./coordination-fact-readers.ts";
+import { summaryActivity } from "./summary-activity.ts";
 import { semanticCopy } from "./semantic-copy.ts";
 import { analysisJobs } from "./analysis-jobs.ts";
 import { ingestBookkeepingCleanup } from "./ingest-bookkeeping-cleanup.ts";
@@ -43,4 +44,4 @@ import { ingestClaimSessions } from "./ingest-claim-sessions.ts";
 import { ingestClaimSessionsReader } from "./ingest-claim-sessions-reader.ts";
 
 /** Every lane the unified generator composes. Order does not affect the output. */
-export const LANES: readonly LaneManifest[] = [briefSummary, briefDocuments, ingestHistory, readApi, readApiTokens, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention, briefTitles, lazyClaimClockNarrowing, ownerBufferedRead, lazyAckClockNoKeyUpdate, acquisitionOwner, bufferedSearchGate, bufferedSearchFeed, ingestBookkeepingCleanup, bufferedSearchGateRetiredWitness, selfhostSessionSelectionErase, selfhostEraseLockFences, ingestGenerationOverlap, bufferedStagesSessionFirst, selfhostEraseShortSummaryProvenance, selfhostEraseSearchTextRebuild, ingestClaimSessions, ingestClaimSessionsReader, digestNarratives, bufferedSearchFeedSameSecond, consumerProjectTextGrant, selfhostOutputFacts, analysisJobs, readApiQuery, coordinationFactReaders, operatorSessionErase, operatorSessionEraseFenceCheck];
+export const LANES: readonly LaneManifest[] = [briefSummary, briefDocuments, ingestHistory, readApi, readApiTokens, canonicalProjectEvents, canonicalFeatureConsumer, sessionDirectoryDocumentPool, desktopCatalog, semanticCopy, claimRecordsRetirement, bufferedGcSingleCandidate, lazySourceTables, privacyAuthority, babysitterRetention, briefTitles, lazyClaimClockNarrowing, ownerBufferedRead, lazyAckClockNoKeyUpdate, acquisitionOwner, bufferedSearchGate, bufferedSearchFeed, ingestBookkeepingCleanup, bufferedSearchGateRetiredWitness, selfhostSessionSelectionErase, selfhostEraseLockFences, ingestGenerationOverlap, bufferedStagesSessionFirst, selfhostEraseShortSummaryProvenance, selfhostEraseSearchTextRebuild, ingestClaimSessions, ingestClaimSessionsReader, digestNarratives, bufferedSearchFeedSameSecond, consumerProjectTextGrant, selfhostOutputFacts, analysisJobs, readApiQuery, coordinationFactReaders, operatorSessionErase, operatorSessionEraseFenceCheck, summaryActivity];

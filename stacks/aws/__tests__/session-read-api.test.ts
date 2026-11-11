@@ -222,6 +222,7 @@ describe("session read api: Function URL (public by design, application auth)", 
       "/v1/sessions/:sessionId/turns",
       "/v1/sessions/activity",
       "/v1/sessions/output",
+      "/v1/sessions/summaries/activity",
       "/v1/sessions/titles",
     ]);
     expect(src).toContain('app.use("/v1/*", async (c, next) => {');
