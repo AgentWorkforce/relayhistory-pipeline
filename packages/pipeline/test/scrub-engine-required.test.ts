@@ -45,6 +45,12 @@ afterEach(() => {
 const isRequiredRefusal = (e: unknown) =>
   e instanceof ScrubEngineConfigError && e.reason === "engine_selection_required" && e.code === "scrub_engine_invalid" && e.retryable === false;
 
+/** Bun does not support `rejects.toSatisfy`; capture the rejection reason explicitly. */
+async function captureRejection(p: Promise<unknown>): Promise<unknown> {
+  try { await p; } catch (error) { return error; }
+  throw new Error("expected promise to reject");
+}
+
 /** Every seam entry point refuses; logging and predicates never see the input; nothing is TypeScript. */
 async function expectRequiredRefusalEverywhere() {
   for (const [name, call] of [
@@ -57,7 +63,7 @@ async function expectRequiredRefusalEverywhere() {
     try { call(); } catch (error) { thrown = error; }
     expect(isRequiredRefusal(thrown), name).toBe(true);
   }
-  await expect(sealRawChunk({} as never, { source: enc.encode("x\n") } as never)).rejects.toSatisfy(isRequiredRefusal);
+  expect(isRequiredRefusal(await captureRejection(sealRawChunk({} as never, { source: enc.encode("x\n") } as never)))).toBe(true);
   expect(scrubEngineReady()).toBe(false);
   expect(scrubTextForLog("token=abc")).toBe(SCRUB_UNAVAILABLE_LOG_TEXT);
   expect(isSafeIdentifier("0190a8f2-7c1e-7d3a-9b2f-1c2d3e4f5a6b")).toBe(false);
@@ -73,7 +79,7 @@ describe("parseScrubEngineRequired", () => {
   });
 
   it("an invalid value fails selection even when SCRUB_ENGINE is fine, and does not latch a requirement refusal", async () => {
-    await expect(initScrubEngine({ env: { SCRUB_ENGINE_REQUIRED: "WASM-BINDGEN" } })).rejects.toBeInstanceOf(ScrubEngineConfigError);
+    expect(await captureRejection(initScrubEngine({ env: { SCRUB_ENGINE_REQUIRED: "WASM-BINDGEN" } }))).toBeInstanceOf(ScrubEngineConfigError);
     expect(() => selectScrubEngine({ SCRUB_ENGINE: "ts", SCRUB_ENGINE_REQUIRED: "yes" })).toThrow(
       expect.objectContaining({ code: "scrub_engine_invalid", reason: undefined }),
     );
@@ -127,7 +133,7 @@ describe("SCRUB_ENGINE_REQUIRED refuses another selection", () => {
   ];
   for (const [engine, required] of mismatches)
     it(`SCRUB_ENGINE=${JSON.stringify(engine)} SCRUB_ENGINE_REQUIRED=${required}: initScrubEngine refuses and nothing runs`, async () => {
-      await expect(initScrubEngine({ env: { SCRUB_ENGINE: engine, SCRUB_ENGINE_REQUIRED: required } })).rejects.toSatisfy(isRequiredRefusal);
+      expect(isRequiredRefusal(await captureRejection(initScrubEngine({ env: { SCRUB_ENGINE: engine, SCRUB_ENGINE_REQUIRED: required } })))).toBe(true);
       await expectRequiredRefusalEverywhere();
     });
 
@@ -143,16 +149,16 @@ describe("SCRUB_ENGINE_REQUIRED refuses another selection", () => {
   });
 
   it("the refusal is sticky: a later explicit TS selection, or an env without the knob, never returns TypeScript", async () => {
-    await expect(initScrubEngine({ env: { SCRUB_ENGINE_REQUIRED: "wasm-bindgen" } })).rejects.toSatisfy(isRequiredRefusal);
+    expect(isRequiredRefusal(await captureRejection(initScrubEngine({ env: { SCRUB_ENGINE_REQUIRED: "wasm-bindgen" } })))).toBe(true);
     expect(() => selectScrubEngine({ SCRUB_ENGINE: "ts" })).toThrow(ScrubEngineConfigError);
     expect(() => selectScrubEngine({})).toThrow(ScrubEngineConfigError);
-    await expect(initScrubEngine({ env: {} })).rejects.toSatisfy(isRequiredRefusal);
+    expect(isRequiredRefusal(await captureRejection(initScrubEngine({ env: {} })))).toBe(true);
     await expectRequiredRefusalEverywhere();
   });
 
   it("an engine already selected as TypeScript is refused once a requirement for another kind arrives", async () => {
     expect(activeScrubEngine()).toBe(tsScrubEngine);
-    await expect(initScrubEngine({ env: { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen" } })).rejects.toSatisfy(isRequiredRefusal);
+    expect(isRequiredRefusal(await captureRejection(initScrubEngine({ env: { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen" } })))).toBe(true);
     await expectRequiredRefusalEverywhere();
   });
 });
