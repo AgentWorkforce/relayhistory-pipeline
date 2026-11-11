@@ -6,7 +6,7 @@
  * that a full staged delivery still allocates a seat through the narrowed lock. Since the reviewer P1 the ACK also takes
  * the claim's bounded origin advisory lock after the clock and before any slot (fence -> clock -> origin -> slot); the
  * reversed-two-slot schedule is proven on real PostgreSQL (D1 in claim-clock-lock.postgres.test.ts), this file pins the
- * body order and that a staged commit holds exactly that one advisory lock.
+ * body order and that a staged commit holds that origin lock plus the fixed shared erase gate.
  */
 import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
 import { deliverBatch } from "../deliver.ts";
@@ -89,7 +89,7 @@ test("043800 orders the staged ACK fence -> clock -> origin advisory lock -> sta
   expect(claim).toContain("PERFORM pg_advisory_xact_lock(hashtextextended(jsonb_build_array('96bulls:lazy-native-origin-v1',v_org,v_ws,v_origin)::text,0));");
 });
 
-test("a staged commit holds exactly ONE advisory lock, the claim's (org, ws, origin) key", async () => {
+test("a staged commit holds the origin lock plus exactly one shared erase gate", async () => {
   const f = await fixture();
   const raw = await batch(["ack-o1", "ack-o2"].map((rid) => record({ record_id: rid, revision: 2, session_id: rid + "-s" })), { batch_id: "ack-o", account_id: await deliveryAccount(TENANT) });
   const p = await prepareDelivery(TENANT, raw);
@@ -114,6 +114,11 @@ test("a staged commit holds exactly ONE advisory lock, the claim's (org, ws, ori
   try {
     expect((await f.db.query(locks)).rows).toEqual([]);
     expect(((await f.db.query<{ r: any }>("SELECT sessions.ingest_commit_buffered_batch($1::jsonb) AS r", [payload])).rows[0]!.r).kind).toBe("committed");
-    expect((await f.db.query(locks)).rows).toEqual([{ ...want, objsubid: 1, mode: "ExclusiveLock", granted: true }]);
+    const held=(await f.db.query(locks)).rows;
+    expect(held).toHaveLength(2);
+    expect(held).toEqual(expect.arrayContaining([
+      { ...want, objsubid: 1, mode: "ExclusiveLock", granted: true },
+      {classid:"961996",objid:"50000",objsubid:2,mode:"ShareLock",granted:true},
+    ]));
   } finally { await f.db.exec("ROLLBACK"); }
 });
