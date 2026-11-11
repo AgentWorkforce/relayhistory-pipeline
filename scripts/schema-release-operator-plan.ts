@@ -56,7 +56,10 @@ export async function operatorPlan() {
     if (!split.held.length && targetGeneration !== input.generation)
       refuse("release_target_generation_changed");
     // The same bootstrap section the CI plan records (READ ONLY; refuses role drift).
-    const bootstrap = await inspectBootstrap(client, input);
+    const bootstrap = await inspectBootstrap(client, {
+      ...input,
+      steps: anchor.manifest.steps.map(([name]) => name),
+    });
     console.log(
       JSON.stringify(
         {

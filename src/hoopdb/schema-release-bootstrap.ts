@@ -4,7 +4,12 @@
  * in-transaction readback verdict and the stage itself (runBootstrapStage) over an
  * already connected client. Everything here except readBootstrapState,
  * releaseBootstrapFiles and runBootstrapStage is pure; the database job only feeds it
- * catalog rows.
+ * catalog rows and git bytes.
+ *
+ * Target-bound: the chain bytes and file list come from the bound anchor (target_sha)
+ * tree, and only the roles whose first consumer (session-bootstrap-consumers.ts) sorts
+ * at or before the target are required, created or checked. The release sha's bytes
+ * are only compared (`differs`); a non-excluded file that differs refuses the stage.
  *
  * Evidence carries role names, attribute flags, validity, membership edges and a
  * settings kind token only: never a password, rolconfig value, URL or host name. A
@@ -17,7 +22,13 @@ import {
   SESSION_BOOTSTRAP_ROLES,
   type BootstrapRoleContract,
 } from "./session-bootstrap-chain.ts";
-import { SCHEMA_RELEASE as P, refuse } from "./schema-release-contract.ts";
+import {
+  SESSION_BOOTSTRAP_CONSUMERS,
+  chainFileRoles,
+  consumerStep,
+} from "./session-bootstrap-consumers.ts";
+import { RELEASE_TREE } from "./migrate.ts";
+import { SCHEMA_RELEASE as P, RELEASE_TARGET_STEP, refuse } from "./schema-release-contract.ts";
 
 /**
  * pg_roles columns the stage reads: the name, the attribute flags and the password
@@ -84,23 +95,50 @@ export interface BootstrapState {
   /** Every pg_db_role_setting row of the cluster. */
   settings: BootstrapSetting[];
 }
+/**
+ * One chain file of the bound anchor (target_sha) tree. sha256_target digests the
+ * anchor's bytes (the bytes the stage runs; null only when the anchor has no such file
+ * and none of its roles is required); sha256_release digests the release sha's bytes
+ * (null: absent), compared only to report `differs`. scope: "run" (every role the
+ * anchor file provisions is target-required: it runs whole), "excluded" (none is: it
+ * never runs and is named in evidence), "mixed" (required and above-target roles in one
+ * file: the stage refuses release_bootstrap_chain_mixed; DO blocks are never parsed,
+ * split or partially run).
+ */
 export interface BootstrapFile {
   file: string;
-  sha256_release: string;
   sha256_target: string | null;
+  sha256_release: string | null;
   differs: boolean;
+  scope: "run" | "excluded" | "mixed";
 }
 export interface BootstrapRole {
   name: string;
   file: string;
+  /** The role's first consumer (SESSION_BOOTSTRAP_CONSUMERS), a supabase/migrations file name. */
+  first_consumer: string;
+  /** First consumer at or before the bound target. */
+  required: boolean;
   present: boolean;
+  /** Present and matching its contract (informational for a role that is not required). */
   exact: boolean;
   will_create: boolean;
 }
 export interface BootstrapSection {
   db_mode: "supabase";
+  target: string;
+  target_sha: string;
   files: BootstrapFile[];
   roles: BootstrapRole[];
+  /** The target-required roles, sorted. */
+  required_roles: string[];
+  /** Files excluded from the run (every role above the target), by name. */
+  excluded: string[];
+  /** Files mixing required and above-target roles (the stage refuses), by name. */
+  mixed: string[];
+  /** Non-excluded files whose release-sha bytes differ from the anchor's (the stage refuses). */
+  release_drift: string[];
+  /** The stage has work: a required role is absent. */
   required: boolean;
   will_create: string[];
   chain_digest: string;
@@ -121,11 +159,28 @@ export function bootstrapChainRoles(
   );
 }
 
-/** sha256 over the ordered `file\n<sha256_release>\n` lines of the whole chain. */
-export function bootstrapChainDigest(
-  files: readonly Pick<BootstrapFile, "file" | "sha256_release">[],
-) {
-  return sha256(files.map((f) => `${f.file}\n${f.sha256_release}\n`).join(""));
+/**
+ * The CHAIN digest: sha256 over `target <step>\ntarget_sha <sha>\nrequired <the sorted
+ * required roles comma-joined, or none>\n` followed by `<file>\n<sha256_target>\n` for
+ * each file that will run (scope "run"), in chain order, from the anchor's bytes. The
+ * required set is folded in here rather than given its own approval field, so the typed
+ * approval changes whenever the target, target_sha, the anchor bytes of a running file or
+ * the required set changes.
+ */
+export function bootstrapChainDigest(x: {
+  target: string;
+  target_sha: string;
+  required_roles: readonly string[];
+  files: readonly Pick<BootstrapFile, "file" | "sha256_target" | "scope">[];
+}) {
+  const required = x.required_roles.length ? codeSort([...x.required_roles]).join(",") : "none";
+  return sha256(
+    `target ${x.target}\ntarget_sha ${x.target_sha}\nrequired ${required}\n` +
+      x.files
+        .filter((f) => f.scope === "run")
+        .map((f) => `${f.file}\n${f.sha256_target}\n`)
+        .join(""),
+  );
 }
 
 /** The one typed BOOTSTRAP approval string (approval roles: sorted, comma-joined, or none). */
@@ -394,36 +449,249 @@ export function freshRoleProblems(
   return [...new Set(out)];
 }
 
+const FIRST_CONSUMER = /^[0-9]{14}_[a-z0-9_]+\.sql$/;
+const laneOf = (step: string) => {
+  const i = RELEASE_TREE.lanes.findIndex((l) => step.startsWith(l.prefix));
+  if (i < 0 || !RELEASE_TARGET_STEP.test(step)) refuse("release_bootstrap_manifest");
+  return i;
+};
 /**
- * The plan's bootstrap section from release-sha bytes (and target-sha digests, info
- * only) and a catalog state. Refuses release_bootstrap_bytes_missing when a chain file
- * is absent from the release tree and release_bootstrap_role_drift when a present
- * chain role does not match its contract (the drifted names go to stderr).
+ * Migrator order of two schema step names, as release-target.ts / schemaSteps order
+ * them: lane first (RELEASE_TREE.lanes: every upstream step before every 96bulls step),
+ * then the name within the lane (upstream names sort by their 14-digit prefix). Refuses
+ * release_bootstrap_manifest for a name that is not a schema step.
  */
-export function bootstrapSection(x: {
-  files: readonly { file: string; release: Buffer | string | undefined; target: Buffer | string | undefined }[];
-  state: BootstrapState;
-  supabaseMode: boolean;
+export function compareSteps(a: string, b: string) {
+  const d = laneOf(a) - laneOf(b);
+  return d !== 0 ? d : a < b ? -1 : a > b ? 1 : 0;
+}
+
+/**
+ * The static role-to-first-consumer manifest, validated: refuses
+ * release_bootstrap_manifest for a malformed entry, a duplicate or conflicting role, a
+ * role that is not a chain role, or a chain role it does not map.
+ */
+export function bootstrapConsumers(
+  consumers: readonly (readonly [string, string])[] = SESSION_BOOTSTRAP_CONSUMERS,
+  map: typeof SESSION_BOOTSTRAP_ROLES = SESSION_BOOTSTRAP_ROLES,
+): Map<string, string> {
+  const chain = new Set(bootstrapChainRoles(map).map((r) => r.name));
+  const out = new Map<string, string>();
+  for (const entry of consumers) {
+    const [role, file] = Array.isArray(entry) ? entry : [];
+    if (
+      !Array.isArray(entry) ||
+      entry.length !== 2 ||
+      typeof role !== "string" ||
+      typeof file !== "string" ||
+      !FIRST_CONSUMER.test(file) ||
+      !chain.has(role) ||
+      out.has(role)
+    )
+      refuse("release_bootstrap_manifest");
+    out.set(role, file);
+  }
+  if (out.size !== chain.size) refuse("release_bootstrap_manifest");
+  return out;
+}
+
+/**
+ * The roles a bound target requires, sorted: those whose first consumer sorts at or
+ * before the target (compareSteps). Pure on the target and the static manifest, so the
+ * plan artifact's required_roles can be recomputed from its target alone.
+ */
+export function targetRequiredRoles(
+  target: string,
+  consumers?: readonly (readonly [string, string])[],
+  map?: typeof SESSION_BOOTSTRAP_ROLES,
+) {
+  const m = bootstrapConsumers(consumers, map);
+  laneOf(target);
+  return codeSort(
+    [...m].filter(([, file]) => compareSteps(consumerStep(file), target) <= 0).map(([role]) => role),
+  );
+}
+
+/**
+ * targetRequiredRoles bound to the anchor: the target must be one of the anchor's
+ * ordered schema steps and every required role's first consumer must be an anchor step
+ * at or before it; else release_bootstrap_manifest.
+ */
+export function bootstrapRequiredRoles(x: {
+  target: string;
+  steps: readonly string[];
+  consumers?: readonly (readonly [string, string])[];
   map?: typeof SESSION_BOOTSTRAP_ROLES;
-  log?: (line: string) => void;
-}): BootstrapSection {
+}) {
+  const at = x.steps.indexOf(x.target);
+  if (at < 0) refuse("release_bootstrap_manifest");
+  const upTo = new Set(x.steps.slice(0, at + 1));
+  const m = bootstrapConsumers(x.consumers, x.map);
+  const required = targetRequiredRoles(x.target, x.consumers, x.map);
+  if (required.some((r) => !upTo.has(consumerStep(m.get(r)!)))) refuse("release_bootstrap_manifest");
+  return required;
+}
+
+/** One chain file's bytes at the anchor (target) and at the release sha; undefined: absent. */
+export interface BootstrapChainInput {
+  file: string;
+  release: Buffer | string | undefined;
+  target: Buffer | string | undefined;
+}
+export type BootstrapTargetChain = Pick<
+  BootstrapSection,
+  "target" | "target_sha" | "files" | "required_roles" | "excluded" | "mixed" | "release_drift" | "chain_digest"
+>;
+
+/**
+ * The target-bound chain, from git alone (no catalog). Files in SESSION_BOOTSTRAP_FILES
+ * order (else release_bootstrap_chain). For each file the roles its ANCHOR bytes
+ * provision (chainFileRoles: literal names only, DO blocks never parsed) must be roles
+ * SESSION_BOOTSTRAP_ROLES declares for that file and must include each of its
+ * target-required roles (else release_bootstrap_chain); an anchor file absent while one
+ * of its roles is required refuses release_bootstrap_bytes_missing. Scope per file: run
+ * (all of its roles required), excluded (none), mixed (both). The release sha's bytes
+ * only set `differs`; release_drift lists the non-excluded files that differ. Refusing
+ * mixed and drifting files is the stage's job (requireRunnableChain); a plan reports them.
+ */
+export function bootstrapTargetChain(x: {
+  target: string;
+  targetSha: string;
+  steps: readonly string[];
+  files: readonly BootstrapChainInput[];
+  consumers?: readonly (readonly [string, string])[];
+  map?: typeof SESSION_BOOTSTRAP_ROLES;
+}): BootstrapTargetChain {
   if (
     x.files.length !== SESSION_BOOTSTRAP_FILES.length ||
     x.files.some((f, i) => f.file !== SESSION_BOOTSTRAP_FILES[i])
   )
     refuse("release_bootstrap_chain");
+  if (!/^[0-9a-f]{40}$/.test(x.targetSha)) refuse("release_bootstrap_chain");
+  const map: Readonly<Record<string, Readonly<Record<string, BootstrapRoleContract>>>> =
+    x.map ?? SESSION_BOOTSTRAP_ROLES;
+  const required_roles = bootstrapRequiredRoles(x);
+  const req = new Set(required_roles);
   const files: BootstrapFile[] = x.files.map((f) => {
-    if (f.release === undefined) refuse("release_bootstrap_bytes_missing");
-    const sha256_release = sha256(f.release);
-    const sha256_target = f.target === undefined ? null : sha256(f.target);
-    return { file: f.file, sha256_release, sha256_target, differs: sha256_target !== sha256_release };
+    const declared = new Set(Object.keys(map[f.file]));
+    const sha256_release = f.release === undefined ? null : sha256(f.release);
+    let sha256_target: string | null = null;
+    let scope: BootstrapFile["scope"] = "excluded";
+    if (f.target === undefined) {
+      if ([...declared].some((r) => req.has(r))) refuse("release_bootstrap_bytes_missing");
+    } else {
+      sha256_target = sha256(f.target);
+      const provisioned = chainFileRoles(Buffer.from(f.target).toString("utf8"));
+      if (
+        [...provisioned].some((r) => !declared.has(r)) ||
+        [...declared].some((r) => req.has(r) && !provisioned.has(r))
+      )
+        refuse("release_bootstrap_chain");
+      const n = [...provisioned].filter((r) => req.has(r)).length;
+      scope = n === 0 ? "excluded" : n === provisioned.size ? "run" : "mixed";
+    }
+    return { file: f.file, sha256_target, sha256_release, differs: sha256_release !== sha256_target, scope };
   });
+  const named = (p: (f: BootstrapFile) => boolean) => files.filter(p).map((f) => f.file);
+  const chain = {
+    target: x.target,
+    target_sha: x.targetSha,
+    files,
+    required_roles,
+    excluded: named((f) => f.scope === "excluded"),
+    mixed: named((f) => f.scope === "mixed"),
+    release_drift: named((f) => f.scope !== "excluded" && f.differs),
+  };
+  return { ...chain, chain_digest: bootstrapChainDigest(chain) };
+}
+
+/**
+ * The stage runs only a clean chain: refuses release_bootstrap_chain_mixed when a file
+ * mixes required and above-target roles, then release_bootstrap_release_drift when the
+ * release sha's bytes of a non-excluded file differ from the anchor's (names on stderr).
+ */
+export function requireRunnableChain(
+  chain: Pick<BootstrapSection, "mixed" | "release_drift">,
+  log: (line: string) => void = console.error,
+) {
+  if (chain.mixed.length) {
+    log("release_bootstrap_chain_mixed " + chain.mixed.join(","));
+    refuse("release_bootstrap_chain_mixed");
+  }
+  if (chain.release_drift.length) {
+    log("release_bootstrap_release_drift " + chain.release_drift.join(","));
+    refuse("release_bootstrap_release_drift");
+  }
+}
+
+const CHAIN_KEYS = [
+  "target",
+  "target_sha",
+  "files",
+  "required_roles",
+  "excluded",
+  "mixed",
+  "release_drift",
+  "chain_digest",
+] as const;
+const chainView = (s: Pick<BootstrapSection, (typeof CHAIN_KEYS)[number]>) =>
+  JSON.stringify(CHAIN_KEYS.map((k) => s[k]));
+
+/**
+ * The git-side binding, recomputed (before connecting, and again under the lock before
+ * BEGIN): the target chain must equal the plan artifact's (target, target_sha, files,
+ * required set, excluded/mixed/drift lists, CHAIN digest) and its digest the typed
+ * approval's CHAIN, else release_bootstrap_plan_changed; then requireRunnableChain.
+ */
+export function requireBootstrapTargetChain(
+  chain: BootstrapTargetChain,
+  planned: Pick<BootstrapSection, (typeof CHAIN_KEYS)[number]>,
+  approvalChain: string,
+  log?: (line: string) => void,
+) {
+  if (chainView(chain) !== chainView(planned) || chain.chain_digest !== approvalChain)
+    refuse("release_bootstrap_plan_changed");
+  requireRunnableChain(chain, log);
+  return chain.chain_digest;
+}
+
+/**
+ * The plan's bootstrap section: the target-bound chain (bootstrapTargetChain, from the
+ * anchor's bytes) plus a catalog state. A role is will_create when it is required and
+ * absent. Refuses release_bootstrap_role_drift when a present REQUIRED role does not
+ * match its contract (names on stderr); a role above the target is reported (present,
+ * exact) and never required, created or refused. Mixed and drifting files are reported,
+ * not refused (the stage refuses them).
+ */
+export function bootstrapSection(x: {
+  target: string;
+  targetSha: string;
+  steps: readonly string[];
+  files: readonly BootstrapChainInput[];
+  state: BootstrapState;
+  supabaseMode: boolean;
+  consumers?: readonly (readonly [string, string])[];
+  map?: typeof SESSION_BOOTSTRAP_ROLES;
+  log?: (line: string) => void;
+}): BootstrapSection {
+  const chain = bootstrapTargetChain(x);
+  const consumers = bootstrapConsumers(x.consumers, x.map);
+  const req = new Set(chain.required_roles);
   const drift: string[] = [];
   const roles: BootstrapRole[] = bootstrapChainRoles(x.map).map(({ name, file, contract }) => {
+    const required = req.has(name);
     const present = x.state.roles.some((r) => r.rolname === name);
     const problems = present ? roleContractProblems(name, contract, x.state, x.supabaseMode) : [];
-    if (problems.length) drift.push(name);
-    return { name, file, present, exact: present && !problems.length, will_create: !present };
+    if (required && problems.length) drift.push(name);
+    return {
+      name,
+      file,
+      first_consumer: consumers.get(name)!,
+      required,
+      present,
+      exact: present && !problems.length,
+      will_create: required && !present,
+    };
   });
   if (drift.length) {
     (x.log ?? console.error)("release_bootstrap_role_drift " + codeSort(drift).join(","));
@@ -432,35 +700,70 @@ export function bootstrapSection(x: {
   const willCreate = codeSort(roles.filter((r) => r.will_create).map((r) => r.name));
   return {
     db_mode: "supabase",
-    files,
+    target: chain.target,
+    target_sha: chain.target_sha,
+    files: chain.files,
     roles,
+    required_roles: chain.required_roles,
+    excluded: chain.excluded,
+    mixed: chain.mixed,
+    release_drift: chain.release_drift,
     required: willCreate.length > 0,
     will_create: willCreate,
-    chain_digest: bootstrapChainDigest(files),
+    chain_digest: chain.chain_digest,
     next: willCreate.length ? BOOTSTRAP_REQUIRED_NOTE : "apply",
   };
 }
 
-/** The chain files this stage runs: those provisioning an absent (will_create) role. */
-export function bootstrapFilesToRun(section: Pick<BootstrapSection, "roles">) {
+/** The chain files this stage runs: run-scope files provisioning an absent (will_create) role. */
+export function bootstrapFilesToRun(section: Pick<BootstrapSection, "roles" | "files">) {
   const files = new Set(section.roles.filter((r) => r.will_create).map((r) => r.file));
-  return SESSION_BOOTSTRAP_FILES.filter((f) => files.has(f));
+  return section.files.filter((f) => f.scope === "run" && files.has(f.file)).map((f) => f.file);
 }
 
 const hex64 = /^[0-9a-f]{64}$/;
-/** The plan artifact's bootstrap section, shape-checked; refuses release_plan_artifact. */
+const sameList = (a: unknown, b: readonly string[]) => JSON.stringify(a) === JSON.stringify(b);
+/**
+ * The plan artifact's bootstrap section, shape-checked and self-consistent (required
+ * set recomputed from its target and the static manifest, lists from the file scopes,
+ * CHAIN recomputed); refuses release_plan_artifact.
+ */
 export function validateBootstrapSection(value: any): BootstrapSection {
+  const shaOrNull = (v: unknown) => v === null || (typeof v === "string" && hex64.test(v));
+  let requiredRoles: string[] | undefined;
+  try {
+    requiredRoles =
+      typeof value?.target === "string" && RELEASE_TARGET_STEP.test(value.target)
+        ? targetRequiredRoles(value.target)
+        : undefined;
+  } catch {
+    requiredRoles = undefined;
+  }
+  const files: any[] = Array.isArray(value?.files) ? value.files : [];
+  const named = (scope: string) => files.filter((f) => f?.scope === scope).map((f) => f.file);
   const ok =
     value &&
     value.db_mode === "supabase" &&
+    requiredRoles !== undefined &&
+    typeof value.target_sha === "string" &&
+    /^[0-9a-f]{40}$/.test(value.target_sha) &&
     Array.isArray(value.files) &&
-    value.files.length === SESSION_BOOTSTRAP_FILES.length &&
-    value.files.every(
+    files.length === SESSION_BOOTSTRAP_FILES.length &&
+    files.every(
       (f: any, i: number) =>
         f?.file === SESSION_BOOTSTRAP_FILES[i] &&
-        hex64.test(f.sha256_release ?? "") &&
-        (f.sha256_target === null || hex64.test(f.sha256_target ?? "")) &&
-        f.differs === (f.sha256_target !== f.sha256_release),
+        shaOrNull(f.sha256_target) &&
+        shaOrNull(f.sha256_release) &&
+        f.differs === (f.sha256_target !== f.sha256_release) &&
+        (f.scope === "run" || f.scope === "excluded" || f.scope === "mixed") &&
+        (f.scope === "excluded" || f.sha256_target !== null),
+    ) &&
+    sameList(value.required_roles, requiredRoles) &&
+    sameList(value.excluded, named("excluded")) &&
+    sameList(value.mixed, named("mixed")) &&
+    sameList(
+      value.release_drift,
+      files.filter((f) => f.scope !== "excluded" && f.differs).map((f) => f.file),
     ) &&
     Array.isArray(value.roles) &&
     Array.isArray(value.will_create) &&
@@ -468,9 +771,11 @@ export function validateBootstrapSection(value: any): BootstrapSection {
     typeof value.required === "boolean" &&
     value.required === value.will_create.length > 0 &&
     hex64.test(value.chain_digest ?? "") &&
-    bootstrapChainDigest(value.files) === value.chain_digest &&
+    bootstrapChainDigest(value) === value.chain_digest &&
     value.next === (value.required ? BOOTSTRAP_REQUIRED_NOTE : "apply");
   const chain = bootstrapChainRoles();
+  const consumers = new Map(SESSION_BOOTSTRAP_CONSUMERS);
+  const req = new Set(requiredRoles ?? []);
   if (
     !ok ||
     value.roles.length !== chain.length ||
@@ -478,9 +783,13 @@ export function validateBootstrapSection(value: any): BootstrapSection {
       (r: any, i: number) =>
         r?.name !== chain[i].name ||
         r.file !== chain[i].file ||
+        r.first_consumer !== consumers.get(chain[i].name) ||
+        r.required !== req.has(chain[i].name) ||
         typeof r.present !== "boolean" ||
-        r.exact !== r.present ||
-        r.will_create !== !r.present,
+        typeof r.exact !== "boolean" ||
+        (r.exact && !r.present) ||
+        (r.required && r.exact !== r.present) ||
+        r.will_create !== (r.required && !r.present),
     ) ||
     JSON.stringify(codeSort(value.roles.filter((r: any) => r.will_create).map((r: any) => r.name))) !==
       JSON.stringify(value.will_create)
@@ -489,14 +798,16 @@ export function validateBootstrapSection(value: any): BootstrapSection {
   return value as BootstrapSection;
 }
 
-/** Refuses release_bootstrap_plan_changed when files/chain_digest/required/will_create differ. */
+/**
+ * Refuses release_bootstrap_plan_changed when the target chain (target, target_sha,
+ * files, required set, excluded/mixed/drift lists, CHAIN) or required/will_create differ.
+ */
 export function requireSameBootstrapPlan(
-  planned: Pick<BootstrapSection, "files" | "chain_digest" | "required" | "will_create">,
-  live: Pick<BootstrapSection, "files" | "chain_digest" | "required" | "will_create">,
+  planned: Pick<BootstrapSection, (typeof CHAIN_KEYS)[number] | "required" | "will_create">,
+  live: Pick<BootstrapSection, (typeof CHAIN_KEYS)[number] | "required" | "will_create">,
 ) {
   if (
-    JSON.stringify(planned.files) !== JSON.stringify(live.files) ||
-    planned.chain_digest !== live.chain_digest ||
+    chainView(planned) !== chainView(live) ||
     planned.required !== live.required ||
     JSON.stringify(planned.will_create) !== JSON.stringify(live.will_create)
   )
@@ -504,15 +815,17 @@ export function requireSameBootstrapPlan(
 }
 
 /**
- * Apply guard: refuses release_bootstrap_required, listing the absent chain role names
- * on stderr, when any chain role is absent from the catalog.
+ * Apply guard: refuses release_bootstrap_required, listing the absent names on stderr,
+ * when a TARGET-REQUIRED chain role (bootstrapRequiredRoles for the bound target) is
+ * absent from the catalog. A role first consumed above the target is not checked.
  */
 export function requireBootstrapRoles(
   state: { roles: readonly { rolname: string }[] },
+  required: readonly string[],
   log: (line: string) => void = console.error,
 ) {
   const names = new Set(state.roles.map((r) => r.rolname));
-  const absent = codeSort(bootstrapChainRoles().map((r) => r.name).filter((n) => !names.has(n)));
+  const absent = codeSort(required.filter((n) => !names.has(n)));
   if (absent.length) {
     log("release_bootstrap_required " + absent.join(","));
     refuse("release_bootstrap_required");
@@ -536,7 +849,7 @@ const sameKeys = (a: string[], b: string[]) =>
  * grantor, admin/inherit/set options) and every pg_db_role_setting row unchanged except
  * those a created role may gain (PG16+ in supabase db mode at most its Supabase creator
  * edge; the worker its one statement_timeout=2s row, checked by freshRoleProblems); every
- * chain role present and matching its contract. Anything else refuses
+ * target-required chain role present and matching its contract. Anything else refuses
  * release_bootstrap_readback (the caller rolls back). Returns the evidence. Privileges
  * on objects are out of scope: no chain file grants any.
  */
@@ -544,10 +857,13 @@ export function bootstrapReadbackVerdict(x: {
   before: BootstrapState;
   after: BootstrapState;
   approved: readonly string[];
+  /** The target-required roles whose contracts are checked (default: every chain role). */
+  required?: readonly string[];
   supabaseMode: boolean;
   map?: typeof SESSION_BOOTSTRAP_ROLES;
 }) {
   const chain = bootstrapChainRoles(x.map);
+  const checked = new Set(x.required ?? chain.map((r) => r.name));
   const before = new Map(x.before.roles.map((r) => [r.rolname, r]));
   const after = new Map(x.after.roles.map((r) => [r.rolname, r]));
   const created = codeSort([...after.keys()].filter((n) => !before.has(n)));
@@ -574,6 +890,9 @@ export function bootstrapReadbackVerdict(x: {
   if (!sameKeys(x.before.settings.map(settingKey), setAfter)) problems.push("settings");
   if (x.after.serverVersionNum !== x.before.serverVersionNum) problems.push("server");
   for (const { name, contract } of chain) {
+    // A role above the target is not checked against its contract; the cluster-wide
+    // diff above still refuses any change to it.
+    if (!checked.has(name) && !createdSet.has(name)) continue;
     const p = createdSet.has(name)
       ? freshRoleProblems(name, contract, x.after, x.supabaseMode)
       : roleContractProblems(name, contract, x.after, x.supabaseMode);
@@ -610,8 +929,35 @@ export function bootstrapReadbackVerdict(x: {
   return evidence;
 }
 
-/** Each chain file's bytes at a commit, from the Git object database (never the working tree). */
-export function releaseBootstrapFiles(repo: string, releaseSha: string, targetSha: string) {
+const CHAIN_MODULE = "src/hoopdb/session-bootstrap-chain.ts";
+/**
+ * The SESSION_BOOTSTRAP_FILES list a session-bootstrap-chain.ts text declares: the
+ * quoted supabase/bootstrap paths of its literal array, `//` comment lines ignored;
+ * undefined when the text has no such list.
+ */
+export function chainModuleFiles(text: string): string[] | undefined {
+  const m = /export const SESSION_BOOTSTRAP_FILES = \[([\s\S]*?)\] as const;/.exec(text);
+  if (!m) return undefined;
+  const body = m[1]
+    .split("\n")
+    .filter((l) => !/^\s*\/\//.test(l))
+    .join("\n");
+  return [...body.matchAll(/"(supabase\/bootstrap\/[a-z0-9_]+\.sql)"/g)].map((x) => x[1]);
+}
+
+/**
+ * Each chain file's bytes at the anchor (target_sha: the bytes the stage runs) and at the
+ * release sha (compared only to report `differs`), from the Git object database (never
+ * the working tree; env limited to PATH). The anchor's own chain list
+ * (session-bootstrap-chain.ts at target_sha) must be this checkout's list or an ordered
+ * subsequence of it (an older anchor that predates a later file), else
+ * release_bootstrap_chain; a file the anchor does not list reads as absent at the anchor.
+ */
+export function releaseBootstrapFiles(
+  repo: string,
+  releaseSha: string,
+  targetSha: string,
+): BootstrapChainInput[] {
   const blob = (sha: string, file: string) => {
     try {
       return execFileSync("git", ["cat-file", "blob", `${sha}:${file}`], {
@@ -624,10 +970,20 @@ export function releaseBootstrapFiles(repo: string, releaseSha: string, targetSh
       return undefined;
     }
   };
+  const module = blob(targetSha, CHAIN_MODULE);
+  const listed = module === undefined ? undefined : chainModuleFiles(module.toString("utf8"));
+  if (!listed || new Set(listed).size !== listed.length) refuse("release_bootstrap_chain");
+  let at = 0;
+  for (const file of listed) {
+    const i = SESSION_BOOTSTRAP_FILES.indexOf(file as (typeof SESSION_BOOTSTRAP_FILES)[number], at);
+    if (i < 0) refuse("release_bootstrap_chain");
+    at = i + 1;
+  }
+  const anchorFiles = new Set(listed);
   return SESSION_BOOTSTRAP_FILES.map((file) => ({
     file,
     release: blob(releaseSha, file),
-    target: blob(targetSha, file),
+    target: anchorFiles.has(file) ? blob(targetSha, file) : undefined,
   }));
 }
 
@@ -680,62 +1036,32 @@ export async function readBootstrapState(client: Queryable): Promise<BootstrapSt
   return { serverVersionNum, roles, edges, settings };
 }
 
-/**
- * The chain digest of the release-sha bytes alone (no catalog): refuses
- * release_bootstrap_chain for a wrong file list and release_bootstrap_bytes_missing for
- * an absent file.
- */
-export function releaseChainDigest(
-  files: readonly { file: string; release: Buffer | string | undefined }[],
-) {
-  if (
-    files.length !== SESSION_BOOTSTRAP_FILES.length ||
-    files.some((f, i) => f.file !== SESSION_BOOTSTRAP_FILES[i])
-  )
-    refuse("release_bootstrap_chain");
-  return bootstrapChainDigest(
-    files.map((f) => {
-      if (f.release === undefined) refuse("release_bootstrap_bytes_missing");
-      return { file: f.file, sha256_release: sha256(f.release) };
-    }),
-  );
-}
-
-/**
- * Before connecting: the release-sha chain bytes digest to the plan artifact's
- * chain_digest and to the typed approval's CHAIN; else release_bootstrap_plan_changed.
- * The stage recomputes the whole section under the lock as well.
- */
-export function requireReleaseChainDigest(
-  files: readonly { file: string; release: Buffer | string | undefined }[],
-  planned: Pick<BootstrapSection, "chain_digest">,
-  approvalChain: string,
-) {
-  const digest = releaseChainDigest(files);
-  if (digest !== planned.chain_digest || digest !== approvalChain)
-    refuse("release_bootstrap_plan_changed");
-  return digest;
-}
-
 export const BOOTSTRAP_LOCK = "SELECT pg_advisory_lock(961996, 1)";
 export const BOOTSTRAP_UNLOCK = "SELECT pg_advisory_unlock(961996, 1)";
 
 /**
  * The bootstrap stage over an already connected client, which it always ends. Under the
  * migrator's session advisory lock: underLock (the caller's GitHub gate and anchor
- * recheck), then ONE transaction with hoopdb.db_mode=supabase bound: recompute the plan's
- * bootstrap section and refuse release_bootstrap_plan_changed on any difference; skip
- * (ROLLBACK, skipped evidence) when nothing is absent; otherwise run each chain file
- * provisioning an absent role (release-sha bytes, psql meta lines stripped, transaction
+ * recheck) returns the git inputs re-read under the lock (chain bytes at the anchor and
+ * the release sha, the anchor's ordered step names); the target chain is recomputed and
+ * compared with the plan and the approval's CHAIN, and mixed or release-drifting files
+ * refuse, all before BEGIN. Then ONE transaction with hoopdb.db_mode=supabase bound:
+ * recompute the whole section from the live catalog and refuse
+ * release_bootstrap_plan_changed on any difference; skip (ROLLBACK, skipped evidence)
+ * when no required role is absent; otherwise run each run-scope chain file provisioning
+ * an absent required role (the ANCHOR's bytes, psql meta lines stripped, transaction
  * safe), require the same txid, read back and COMMIT only on an exact verdict. Every
- * refusal or error rolls back, unlocks and ends the client, then propagates.
+ * refusal or error rolls back (when begun), unlocks and ends the client, then propagates.
  */
 export async function runBootstrapStage(x: {
   client: Queryable & { end(): Promise<void> };
-  files: readonly { file: string; release: Buffer | string | undefined; target: Buffer | string | undefined }[];
+  target: string;
+  targetSha: string;
   planned: BootstrapSection;
+  /** The typed approval's CHAIN field. */
+  approvalChain: string;
   supabaseMode: boolean;
-  underLock: () => Promise<void>;
+  underLock: () => Promise<{ files: readonly BootstrapChainInput[]; steps: readonly string[] }>;
   writeEvidence: (evidence: Record<string, unknown>) => Promise<void>;
   /** Non-secret evidence header (version, shas, plan run, run id). */
   header: Record<string, unknown>;
@@ -747,7 +1073,13 @@ export async function runBootstrapStage(x: {
   try {
     await client.query(BOOTSTRAP_LOCK);
     locked = true;
-    await x.underLock();
+    const { files, steps } = await x.underLock();
+    // Under the lock, before BEGIN: git inputs vs the plan and the approval.
+    requireBootstrapTargetChain(
+      bootstrapTargetChain({ target: x.target, targetSha: x.targetSha, steps, files }),
+      x.planned,
+      x.approvalChain,
+    );
     await client.query("BEGIN");
     let ended = false;
     try {
@@ -756,25 +1088,34 @@ export async function runBootstrapStage(x: {
         ["supabase", "off"],
       );
       const before = await readBootstrapState(client);
-      const live = bootstrapSection({ files: x.files, state: before, supabaseMode: x.supabaseMode });
+      const live = bootstrapSection({
+        target: x.target,
+        targetSha: x.targetSha,
+        steps,
+        files,
+        state: before,
+        supabaseMode: x.supabaseMode,
+      });
       requireSameBootstrapPlan(x.planned, live);
+      requireRunnableChain(live);
+      const scope = {
+        target: live.target,
+        target_sha: live.target_sha,
+        chain_digest: live.chain_digest,
+        required_roles: live.required_roles,
+        excluded: live.excluded,
+        files: live.files,
+      };
       if (!live.required) {
         await client.query("ROLLBACK");
         ended = true;
-        await x.writeEvidence({
-          ...x.header,
-          chain_digest: live.chain_digest,
-          files: live.files,
-          skipped: true,
-          created: [],
-          roles: live.roles,
-        });
+        await x.writeEvidence({ ...x.header, ...scope, skipped: true, created: [], roles: live.roles });
         log("release_bootstrap_skipped");
         return "skipped";
       }
       const run = bootstrapFilesToRun(live);
       const sql = run.map((file) => {
-        const bytes = x.files.find((f) => f.file === file)?.release;
+        const bytes = files.find((f) => f.file === file)?.target;
         if (bytes === undefined) refuse("release_bootstrap_bytes_missing");
         return requireTransactionSafeChainSql(stripPsqlMeta(Buffer.from(bytes).toString("utf8")));
       });
@@ -789,17 +1130,12 @@ export async function runBootstrapStage(x: {
         before,
         after,
         approved: live.will_create,
+        required: live.required_roles,
         supabaseMode: x.supabaseMode,
       });
       await client.query("COMMIT");
       ended = true;
-      await x.writeEvidence({
-        ...x.header,
-        chain_digest: live.chain_digest,
-        files: live.files,
-        ran: run,
-        ...evidence,
-      });
+      await x.writeEvidence({ ...x.header, ...scope, ran: run, ...evidence });
       log("release_bootstrap_created " + evidence.created.length);
       log("release_bootstrap_verified");
       return "verified";

@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import {
   releaseInputs,
   releaseConnection,
@@ -24,11 +24,12 @@ import {
   bootstrapFilesToRun,
   bootstrapReadbackVerdict,
   bootstrapSection,
+  bootstrapTargetChain,
   chainSqlTopLevel,
-  releaseChainDigest,
   requireBootstrapRoles,
-  requireReleaseChainDigest,
+  requireBootstrapTargetChain,
   requireSameBootstrapPlan,
+  targetRequiredRoles,
   requireTransactionSafeChainSql,
   roleContractProblems,
   stripPsqlMeta,
@@ -596,7 +597,7 @@ test("apply rejects foreign, stale, replayed or failed prior plan and artifact b
   // Bootstrap mode consumes the same plan run: the release plan as apply validates it,
   // plus its bootstrap section bound to the typed approval's CHAIN and ROLES.
   {
-    const section = bootstrapSection({ files: bsFiles(), state: bsState([admit]), supabaseMode: true });
+    const section = bsSection({ files: bsFiles(), state: bsState([admit]), supabaseMode: true });
     const bInput = { sha, generation, boundary: "global-default-revoke", target, targetSha, targetGeneration: planGeneration, planRun: "90", chainDigest: section.chain_digest, bootstrapRoles: [admit] };
     const withSection = JSON.parse(JSON.stringify({ ...plan, bootstrap: section }));
     expect(validateBootstrapPlan(withSection, bInput).section).toEqual(section);
@@ -1163,7 +1164,7 @@ test("release apply binds the plan's target generation into the migrator and the
   expect(src).toMatch(/approvedPlan &&\n\s+!sameAnchor\(await targetAnchor\(input, approvedPlan\.held\), approvedPlan\)\n\s+\)\n\s+refuse\("release_target_manifest_changed"\);/);
   expect(src).toContain('if (!sameAnchor(anchor, approvedPlan!)) refuse("release_target_manifest_changed");');
   expect(src).toMatch(
-    /beforeWrite: async \(\) => \{\n\s+await githubReleaseGate\(process\.env, get, true\);\n(\s+\/\/[^\n]*\n)*\s+if \(!sameAnchor\(await targetAnchor\(input, approvedPlan!\.held\), approvedPlan!\)\)\n\s+refuse\("release_target_manifest_changed"\);/,
+    /beforeWrite: async \(\) => \{\n\s+await githubReleaseGate\(process\.env, get, true\);\n(\s+\/\/[^\n]*\n)*\s+const fresh = await targetAnchor\(input, approvedPlan!\.held\);\n\s+if \(!sameAnchor\(fresh, approvedPlan!\)\) refuse\("release_target_manifest_changed"\);/,
   );
   expect(src).toMatch(
     /targetBinding: \{\n(\s+\/\/[^\n]*\n)*\s+targetSha: approvedPlan!\.targetSha,\n\s+manifestDigest: approvedPlan!\.manifestDigest,\n\s+verifiers: anchor\.verifiers,/,
@@ -1251,12 +1252,39 @@ function bsState(absent: string[] = [], o: Partial<BootstrapState> = {}): Bootst
     ...o,
   };
 }
-const bsFiles = (o: Record<string, string | undefined> = {}) =>
+const bsRepo = new URL("../../../", import.meta.url);
+const bsBytes = (file: string) => readFileSync(new URL(file, bsRepo), "utf8");
+/** HEAD chain bytes as both the anchor's (target) and the release sha's; overrides per side. */
+const bsFiles = (
+  release: Record<string, string | undefined> = {},
+  anchor: Record<string, string | undefined> = {},
+) =>
   SESSION_BOOTSTRAP_FILES.map((file) => ({
     file,
-    release: file in o ? o[file] : `-- release bytes of ${file}\n`,
-    target: `-- release bytes of ${file}\n`,
+    release: file in release ? release[file] : bsBytes(file),
+    target: file in anchor ? anchor[file] : bsBytes(file),
   }));
+/** The anchor's ordered schema steps: the HEAD upstream migrations (fixture). */
+const bsSteps = readdirSync(new URL("supabase/migrations/", bsRepo))
+  .filter((f) => f.endsWith(".sql"))
+  .sort()
+  .map((f) => `upstream:${f}`);
+const bsSection = (x: {
+  files?: ReturnType<typeof bsFiles>;
+  state?: BootstrapState;
+  supabaseMode?: boolean;
+  log?: (line: string) => void;
+  target?: string;
+}) =>
+  bootstrapSection({
+    target: x.target ?? target,
+    targetSha,
+    steps: bsSteps,
+    files: x.files ?? bsFiles(),
+    state: x.state ?? bsState(),
+    supabaseMode: x.supabaseMode ?? true,
+    log: x.log,
+  });
 const bsCode = (f: () => unknown) => {
   try {
     f();
@@ -1269,24 +1297,41 @@ const quiet = () => {};
 const admit = "bulls96_analysis_admit";
 const readApiFile = "supabase/bootstrap/session_read_api_roles.sql";
 
-test("bootstrap chain_digest is sha256 over the ordered file/sha256_release lines", () => {
+test("bootstrap chain_digest: sha256 over target, target_sha, the required set and the run files' anchor digests", () => {
   const files = SESSION_BOOTSTRAP_FILES.map((file, i) => ({
     file,
-    sha256_release: String(i).repeat(64),
+    sha256_target: String(i).repeat(64),
+    scope: (i === 2 ? "excluded" : "run") as "run" | "excluded",
   }));
+  const x = { target, target_sha: targetSha, required_roles: ["b_role", "a_role"], files };
   const expected = createHash("sha256")
-    .update(files.map((f) => `${f.file}\n${f.sha256_release}\n`).join(""))
+    .update(
+      `target ${target}\ntarget_sha ${targetSha}\nrequired a_role,b_role\n` +
+        files
+          .filter((f) => f.scope === "run")
+          .map((f) => `${f.file}\n${f.sha256_target}\n`)
+          .join(""),
+    )
     .digest("hex");
-  expect(bootstrapChainDigest(files)).toBe(expected);
-  expect(bootstrapChainDigest([...files].reverse())).not.toBe(expected);
-  const section = bootstrapSection({ files: bsFiles(), state: bsState(), supabaseMode: true });
-  expect(section.chain_digest).toBe(bootstrapChainDigest(section.files));
-  const changed = bootstrapSection({
-    files: bsFiles({ [readApiFile]: "-- other bytes\n" }),
-    state: bsState(),
-    supabaseMode: true,
-  });
-  expect(changed.chain_digest).not.toBe(section.chain_digest);
+  expect(bootstrapChainDigest(x)).toBe(expected);
+  expect(bootstrapChainDigest({ ...x, files: [...files].reverse() })).not.toBe(expected);
+  expect(bootstrapChainDigest({ ...x, required_roles: ["a_role"] })).not.toBe(expected);
+  expect(bootstrapChainDigest({ ...x, target_sha: "7".repeat(40) })).not.toBe(expected);
+  expect(bootstrapChainDigest({ ...x, target: "upstream:20261105046000_analysis_jobs.sql" })).not.toBe(expected);
+  // An excluded file's digest is not part of CHAIN.
+  expect(bootstrapChainDigest({ ...x, files: files.map((f, i) => (i === 2 ? { ...f, sha256_target: null } : f)) })).toBe(expected);
+  expect(
+    createHash("sha256").update(`target ${target}\ntarget_sha ${targetSha}\nrequired none\n`).digest("hex"),
+  ).toBe(bootstrapChainDigest({ ...x, required_roles: [], files: [] }));
+  const section = bsSection({});
+  expect(section.chain_digest).toBe(bootstrapChainDigest(section));
+  // The anchor's bytes bind CHAIN; the release sha's bytes only set `differs`.
+  expect(bsSection({ files: bsFiles({}, { [readApiFile]: bsBytes(readApiFile) + "\n-- other\n" }) }).chain_digest).not.toBe(
+    section.chain_digest,
+  );
+  const drift = bsSection({ files: bsFiles({ [readApiFile]: "-- other bytes\n" }) });
+  expect(drift.chain_digest).toBe(section.chain_digest);
+  expect(drift.release_drift).toEqual([readApiFile]);
 });
 
 test("bootstrap typed approval: exact canonical string, sorted roles or none", () => {
@@ -1342,27 +1387,48 @@ test("bootstrap typed approval: exact canonical string, sorted roles or none", (
 });
 
 test("bootstrap plan section shape: files, roles, required, will_create, next", () => {
-  const present = bootstrapSection({ files: bsFiles(), state: bsState(), supabaseMode: true });
-  expect(Object.keys(present)).toEqual(["db_mode", "files", "roles", "required", "will_create", "chain_digest", "next"]);
+  const present = bsSection({ files: bsFiles(), state: bsState(), supabaseMode: true });
+  expect(Object.keys(present)).toEqual([
+    "db_mode",
+    "target",
+    "target_sha",
+    "files",
+    "roles",
+    "required_roles",
+    "excluded",
+    "mixed",
+    "release_drift",
+    "required",
+    "will_create",
+    "chain_digest",
+    "next",
+  ]);
+  expect(present.target).toBe(target);
+  expect(present.target_sha).toBe(targetSha);
+  expect(present.required_roles).toEqual([...chainNames].sort());
+  expect([present.excluded, present.mixed, present.release_drift]).toEqual([[], [], []]);
   expect(present.db_mode).toBe("supabase");
   expect(present.required).toBe(false);
   expect(present.will_create).toEqual([]);
   expect(present.next).toBe("apply");
   expect(present.files.map((f) => f.file)).toEqual([...SESSION_BOOTSTRAP_FILES]);
-  expect(Object.keys(present.files[0])).toEqual(["file", "sha256_release", "sha256_target", "differs"]);
+  expect(Object.keys(present.files[0])).toEqual(["file", "sha256_target", "sha256_release", "differs", "scope"]);
+  expect(present.files.every((f) => f.scope === "run")).toBe(true);
   expect(present.files.every((f) => !f.differs)).toBe(true);
   expect(present.roles.map((r) => r.name)).toEqual(chainNames);
-  expect(Object.keys(present.roles[0])).toEqual(["name", "file", "present", "exact", "will_create"]);
+  expect(Object.keys(present.roles[0])).toEqual(["name", "file", "first_consumer", "required", "present", "exact", "will_create"]);
   expect(present.roles.every((r) => r.present && r.exact && !r.will_create)).toBe(true);
   expect(validateBootstrapSection(JSON.parse(JSON.stringify(present)))).toEqual(present);
 
-  const needed = bootstrapSection({ files: bsFiles(), state: bsState([admit]), supabaseMode: true });
+  const needed = bsSection({ files: bsFiles(), state: bsState([admit]), supabaseMode: true });
   expect(needed.required).toBe(true);
   expect(needed.will_create).toEqual([admit]);
   expect(needed.next).toBe("bootstrap stage required before apply");
   expect(needed.roles.find((r) => r.name === admit)).toEqual({
     name: admit,
     file: readApiFile,
+    first_consumer: "20261105046000_analysis_jobs.sql",
+    required: true,
     present: false,
     exact: false,
     will_create: true,
@@ -1381,6 +1447,17 @@ test("bootstrap plan section shape: files, roles, required, will_create, next", 
     (v: any) => (v.files[0].differs = true),
     (v: any) => v.files.pop(),
     (v: any) => (v.will_create = [admit, "x_role"]),
+    (v: any) => (v.target = "upstream:20261105046000_analysis_jobs.sql"),
+    (v: any) => (v.target = "nope"),
+    (v: any) => (v.target_sha = "A".repeat(40)),
+    (v: any) => (v.required_roles = v.required_roles.slice(1)),
+    (v: any) => (v.excluded = [readApiFile]),
+    (v: any) => (v.files[3].scope = "excluded"),
+    (v: any) => (v.mixed = [readApiFile]),
+    (v: any) => (v.release_drift = [readApiFile]),
+    (v: any) => (v.roles[0].required = false),
+    (v: any) => (v.roles[0].first_consumer = "20261105047000_coordination_fact_readers.sql"),
+    (v: any) => (v.roles[0].exact = true, v.roles[0].present = false),
   ]) {
     const v = JSON.parse(JSON.stringify(needed));
     tamper(v);
@@ -1388,22 +1465,37 @@ test("bootstrap plan section shape: files, roles, required, will_create, next", 
   }
   expect(bsCode(() => validateBootstrapSection(undefined))).toBe("release_plan_artifact");
 
-  // target-sha digests are informational: a differing or absent target file is reported.
-  const files = bsFiles();
-  files[1].target = "-- target differs\n";
-  (files[2] as any).target = undefined;
-  const info = bootstrapSection({ files, state: bsState(), supabaseMode: true });
+  // A lower target: required set recomputed from the target alone, excluded/mixed lists self-consistent.
+  const low = bsSection({ target: "upstream:20261105033000_canonical_project_events.sql" });
+  expect(validateBootstrapSection(JSON.parse(JSON.stringify(low)))).toEqual(low);
+  expect(low.required_roles).toEqual(targetRequiredRoles(low.target));
+  expect(low.excluded).toEqual([readApiFile, "supabase/bootstrap/session_consumer_roles.sql"]);
+  expect(low.mixed).toEqual(["supabase/bootstrap/session_ingest_roles.sql"]);
+
+  // Release-sha digests are informational: a differing or absent release file is reported.
+  const info = bsSection({ files: bsFiles({ [SESSION_BOOTSTRAP_FILES[1]]: "-- release differs\n", [SESSION_BOOTSTRAP_FILES[2]]: undefined }) });
   expect(info.files[1].differs).toBe(true);
-  expect(info.files[2]).toMatchObject({ sha256_target: null, differs: true });
+  expect(info.files[2]).toMatchObject({ sha256_release: null, differs: true });
   expect(info.files[0].differs).toBe(false);
-  expect(bsCode(() => bootstrapSection({ files: bsFiles({ [readApiFile]: undefined }), state: bsState(), supabaseMode: true }))).toBe("release_bootstrap_bytes_missing");
-  expect(bsCode(() => bootstrapSection({ files: bsFiles().reverse(), state: bsState(), supabaseMode: true }))).toBe("release_bootstrap_chain");
+  expect(info.release_drift).toEqual([SESSION_BOOTSTRAP_FILES[1], SESSION_BOOTSTRAP_FILES[2]]);
+  expect(info.chain_digest).toBe(present.chain_digest);
+  expect(validateBootstrapSection(JSON.parse(JSON.stringify(info)))).toEqual(info);
+  // Anchor bytes absent for a required file; files out of chain order; an anchor file
+  // provisioning an undeclared role, or missing a required declared one.
+  expect(bsCode(() => bsSection({ files: bsFiles({}, { [readApiFile]: undefined }) }))).toBe("release_bootstrap_bytes_missing");
+  expect(bsCode(() => bsSection({ files: bsFiles().reverse() }))).toBe("release_bootstrap_chain");
+  expect(bsCode(() => bsSection({ files: bsFiles({}, { [readApiFile]: bsBytes(readApiFile) + "\nCREATE ROLE rogue_role;\n" }) }))).toBe(
+    "release_bootstrap_chain",
+  );
+  expect(
+    bsCode(() => bsSection({ files: bsFiles({}, { [readApiFile]: bsBytes(readApiFile).replaceAll("bulls96_analysis_admit", "bulls96_other_role") }) })),
+  ).toBe("release_bootstrap_chain");
 });
 
 test("bootstrap exactness: inbound, outbound and flags follow the bulls96_read_api block", () => {
   const readApi = SESSION_BOOTSTRAP_ROLES[readApiFile].bulls96_read_api;
   const drift = (state: BootstrapState, supabaseMode = true) =>
-    bsCode(() => bootstrapSection({ files: bsFiles(), state, supabaseMode, log: quiet }));
+    bsCode(() => bsSection({ files: bsFiles(), state, supabaseMode, log: quiet }));
   // PG15: any inbound member refuses (no inherit/set columns to prove a creator edge).
   const pg15 = bsState([], {
     serverVersionNum: 150008,
@@ -1425,7 +1517,7 @@ test("bootstrap exactness: inbound, outbound and flags follow the bulls96_read_a
   const creator = bsState([], { edges: [creatorEdge("bulls96_read_api")] });
   expect(roleContractProblems("bulls96_read_api", readApi, creator, true)).toEqual([]);
   expect(roleContractProblems("bulls96_read_api", readApi, creator, false)).toEqual(["member postgres"]);
-  expect(bootstrapSection({ files: bsFiles(), state: creator, supabaseMode: true }).required).toBe(false);
+  expect(bsSection({ files: bsFiles(), state: creator, supabaseMode: true }).required).toBe(false);
   expect(drift(creator, false)).toBe("release_bootstrap_role_drift");
   // Outbound membership refuses for every chain role, even an inbound-unchecked one.
   for (const name of ["bulls96_read_api", admit, "bulls96_session_ingest"])
@@ -1447,7 +1539,7 @@ test("bootstrap exactness: inbound, outbound and flags follow the bulls96_read_a
     const state = bsState();
     state.roles = state.roles.map((r) => (r.rolname === name ? { ...r, ...flags } : r));
     const lines: string[] = [];
-    expect(bsCode(() => bootstrapSection({ files: bsFiles(), state, supabaseMode: true, log: (l) => lines.push(l) }))).toBe(
+    expect(bsCode(() => bsSection({ files: bsFiles(), state, supabaseMode: true, log: (l) => lines.push(l) }))).toBe(
       "release_bootstrap_role_drift",
     );
     expect(lines).toEqual([`release_bootstrap_role_drift ${name}`]);
@@ -1474,14 +1566,17 @@ test("bootstrap exactness: inbound, outbound and flags follow the bulls96_read_a
 });
 
 test("bootstrap plan_changed: files, chain_digest, required or will_create drift refuses", () => {
-  const planned = bootstrapSection({ files: bsFiles(), state: bsState([admit]), supabaseMode: true });
+  const planned = bsSection({ files: bsFiles(), state: bsState([admit]), supabaseMode: true });
   expect(() => requireSameBootstrapPlan(planned, structuredClone(planned))).not.toThrow();
-  const other = bootstrapSection({ files: bsFiles({ [readApiFile]: "-- moved\n" }), state: bsState([admit]), supabaseMode: true });
+  const other = bsSection({ files: bsFiles({}, { [readApiFile]: bsBytes(readApiFile) + "\n-- moved\n" }), state: bsState([admit]), supabaseMode: true });
   expect(bsCode(() => requireSameBootstrapPlan(planned, other))).toBe("release_bootstrap_plan_changed");
-  const created = bootstrapSection({ files: bsFiles(), state: bsState(), supabaseMode: true });
+  const created = bsSection({ files: bsFiles(), state: bsState(), supabaseMode: true });
   expect(bsCode(() => requireSameBootstrapPlan(planned, created))).toBe("release_bootstrap_plan_changed");
-  const two = bootstrapSection({ files: bsFiles(), state: bsState([admit, "bulls96_digest_narrative"]), supabaseMode: true });
+  const two = bsSection({ files: bsFiles(), state: bsState([admit, "bulls96_digest_narrative"]), supabaseMode: true });
   expect(bsCode(() => requireSameBootstrapPlan(planned, two))).toBe("release_bootstrap_plan_changed");
+  expect(bsCode(() => requireSameBootstrapPlan(planned, { ...planned, required_roles: [] }))).toBe("release_bootstrap_plan_changed");
+  expect(bsCode(() => requireSameBootstrapPlan(planned, { ...planned, target_sha: "7".repeat(40) }))).toBe("release_bootstrap_plan_changed");
+  expect(bsCode(() => requireSameBootstrapPlan(planned, { ...planned, excluded: [readApiFile] }))).toBe("release_bootstrap_plan_changed");
   for (const k of ["chain_digest", "required"] as const)
     expect(bsCode(() => requireSameBootstrapPlan(planned, { ...planned, [k]: k === "required" ? false : "0".repeat(64) }))).toBe(
       "release_bootstrap_plan_changed",
@@ -1609,13 +1704,19 @@ test("bootstrap readback covers every role's validity, every membership edge and
   }
 });
 
-test("apply guard lists absent chain roles; psql meta lines are stripped", () => {
+test("apply guard lists absent target-required chain roles only; psql meta lines are stripped", () => {
   const lines: string[] = [];
-  expect(bsCode(() => requireBootstrapRoles(bsState([admit, "bulls96_digest_narrative"]), (l) => lines.push(l)))).toBe(
+  const all = targetRequiredRoles(target);
+  expect(bsCode(() => requireBootstrapRoles(bsState([admit, "bulls96_digest_narrative"]), all, (l) => lines.push(l)))).toBe(
     "release_bootstrap_required",
   );
   expect(lines).toEqual([`release_bootstrap_required ${admit},bulls96_digest_narrative`]);
-  expect(() => requireBootstrapRoles(bsState(), quiet)).not.toThrow();
+  expect(() => requireBootstrapRoles(bsState(), all, quiet)).not.toThrow();
+  // A role first consumed above the target is not required by the guard.
+  const mid = targetRequiredRoles("upstream:20261105045040_selfhost_output_facts.sql");
+  expect(mid).not.toContain(admit);
+  expect(() => requireBootstrapRoles(bsState([admit]), mid, quiet)).not.toThrow();
+  expect(bsCode(() => requireBootstrapRoles(bsState(["bulls96_digest_narrative"]), mid, quiet))).toBe("release_bootstrap_required");
   expect(stripPsqlMeta("\\set ON_ERROR_STOP on\nDO $x$ BEGIN END $x$;\n\\echo hi\n")).toBe("DO $x$ BEGIN END $x$;\n");
 });
 
@@ -1669,28 +1770,43 @@ test("chain files never end or split the stage transaction", () => {
   expect(chainSqlTopLevel("SELECT $1, $2;")).toBe("SELECT $1, $2;");
 });
 
-test("bootstrap pre-connect: the release-sha chain digest equals the plan's and the approval's CHAIN", () => {
-  const planned = bootstrapSection({ files: bsFiles(), state: bsState([admit]), supabaseMode: true });
-  expect(releaseChainDigest(bsFiles())).toBe(planned.chain_digest);
-  expect(requireReleaseChainDigest(bsFiles(), planned, planned.chain_digest)).toBe(planned.chain_digest);
-  // A changed release byte, or an approval/plan CHAIN that is not the live digest.
-  expect(bsCode(() => requireReleaseChainDigest(bsFiles({ [readApiFile]: "-- moved\n" }), planned, planned.chain_digest))).toBe(
+test("bootstrap pre-connect: the anchor-bound chain equals the plan's and the approval's CHAIN", () => {
+  const planned = bsSection({ files: bsFiles(), state: bsState([admit]), supabaseMode: true });
+  const chain = (x: { files?: ReturnType<typeof bsFiles>; target?: string; targetSha?: string; steps?: string[] } = {}) =>
+    bootstrapTargetChain({ target: x.target ?? target, targetSha: x.targetSha ?? targetSha, steps: x.steps ?? bsSteps, files: x.files ?? bsFiles() });
+  expect(chain().chain_digest).toBe(planned.chain_digest);
+  expect(requireBootstrapTargetChain(chain(), planned, planned.chain_digest)).toBe(planned.chain_digest);
+  // Changed anchor bytes, another target or target_sha, or an approval/plan CHAIN that is not the live digest.
+  for (const live of [
+    chain({ files: bsFiles({}, { [readApiFile]: bsBytes(readApiFile) + "\n-- moved\n" }) }),
+    chain({ target: "upstream:20261105046000_analysis_jobs.sql" }),
+    chain({ targetSha: "7".repeat(40) }),
+  ])
+    expect(bsCode(() => requireBootstrapTargetChain(live, planned, planned.chain_digest))).toBe("release_bootstrap_plan_changed");
+  expect(bsCode(() => requireBootstrapTargetChain(chain(), planned, "0".repeat(64)))).toBe("release_bootstrap_plan_changed");
+  expect(bsCode(() => requireBootstrapTargetChain(chain(), { ...planned, chain_digest: "0".repeat(64) }, planned.chain_digest))).toBe(
     "release_bootstrap_plan_changed",
   );
-  expect(bsCode(() => requireReleaseChainDigest(bsFiles(), planned, "0".repeat(64)))).toBe("release_bootstrap_plan_changed");
-  expect(bsCode(() => requireReleaseChainDigest(bsFiles(), { chain_digest: "0".repeat(64) }, planned.chain_digest))).toBe(
-    "release_bootstrap_plan_changed",
+  // Release-sha bytes never change the digest; a differing running file refuses as drift.
+  const driftFiles = bsFiles({ [readApiFile]: "-- release edit\n" });
+  const drift = chain({ files: driftFiles });
+  expect(drift.chain_digest).toBe(planned.chain_digest);
+  const driftPlan = bsSection({ files: driftFiles, state: bsState([admit]) });
+  const lines: string[] = [];
+  expect(bsCode(() => requireBootstrapTargetChain(drift, driftPlan, planned.chain_digest, (l) => lines.push(l)))).toBe(
+    "release_bootstrap_release_drift",
   );
-  // Target-sha bytes are informational only: they never change the digest.
-  const files = bsFiles();
-  files[0].target = "-- other target bytes\n";
-  expect(releaseChainDigest(files)).toBe(planned.chain_digest);
-  expect(bsCode(() => releaseChainDigest(bsFiles({ [readApiFile]: undefined })))).toBe("release_bootstrap_bytes_missing");
-  expect(bsCode(() => releaseChainDigest(bsFiles().reverse()))).toBe("release_bootstrap_chain");
+  expect(lines).toEqual([`release_bootstrap_release_drift ${readApiFile}`]);
+  expect(bsCode(() => chain({ files: bsFiles({}, { [readApiFile]: undefined }) }))).toBe("release_bootstrap_bytes_missing");
+  expect(bsCode(() => chain({ files: bsFiles().reverse() }))).toBe("release_bootstrap_chain");
+  expect(bsCode(() => chain({ targetSha: "zz" }))).toBe("release_bootstrap_chain");
+  // The target or a required first consumer missing from the anchor's steps.
+  expect(bsCode(() => chain({ steps: bsSteps.filter((s) => s !== target) }))).toBe("release_bootstrap_manifest");
+  expect(bsCode(() => chain({ steps: bsSteps.filter((s) => !s.includes("20261030020000_")) }))).toBe("release_bootstrap_manifest");
 });
 
 test("bootstrap mode binds the plan artifact's section into the typed approval", () => {
-  const section = bootstrapSection({ files: bsFiles(), state: bsState([admit]), supabaseMode: true });
+  const section = bsSection({ files: bsFiles(), state: bsState([admit]), supabaseMode: true });
   const input = { sha, generation, boundary: "global-default-revoke", target, targetSha, targetGeneration, planRun: "90", chainDigest: section.chain_digest, bootstrapRoles: [admit] };
   // validateReleasePlan's own refusals come first for a malformed plan.
   expect(bsCode(() => validateBootstrapPlan({ bootstrap: section }, input))).toBe("release_plan_artifact");
@@ -1701,15 +1817,20 @@ test("bootstrap entry point: every pre-connect check before the connection, the 
   const entry = src.slice(src.indexOf("async function releaseBootstrap("), src.indexOf("export async function releaseDatabase("));
   const order = [
     "validateBootstrapPlan(",
+    "const anchor = await targetAnchor(input, release.held);",
     "refuse(\"release_target_manifest_changed\");",
     "releaseBootstrapFiles(process.cwd(), input.sha, input.targetSha);",
-    "requireReleaseChainDigest(files, planned, input.chainDigest);",
+    "bootstrapTargetChain({ target: input.target, targetSha: input.targetSha, steps: anchorSteps(anchor), files }),",
+    "input.chainDigest,\n  );",
     "refuse(\"release_bootstrap_db_mode\");",
     "releaseClient(process.env.SUPABASE_MIGRATION_OWNER_URL);",
     "await client.connect();",
     "await requireReleaseOwner(client);",
     "await runBootstrapStage({",
+    "approvalChain: input.chainDigest,",
     "await githubReleaseGate(process.env, get, true);",
+    "const fresh = await targetAnchor(input, release.held);",
+    "steps: anchorSteps(fresh),",
   ].map((s) => entry.indexOf(s));
   expect(order.every((i) => i > 0)).toBe(true);
   expect([...order].sort((a, b) => a - b)).toEqual(order);
@@ -1718,7 +1839,7 @@ test("bootstrap entry point: every pre-connect check before the connection, the 
   expect(entry).not.toMatch(/"(BEGIN|COMMIT|ROLLBACK)"|pg_advisory|client\.query/);
   expect(src).toContain('if (input.mode === "bootstrap") return releaseBootstrap(get, input);');
   // Apply: the live absent-role guard runs inside beforeWrite under the migrator lock.
-  expect(src).toMatch(/beforeWrite: async \(\) => \{[\s\S]*?await requireBootstrapRolesLive\(client\);[\s\S]*?refreshReleaseBoundary/);
+  expect(src).toMatch(/beforeWrite: async \(\) => \{[\s\S]*?const fresh = await targetAnchor\(input, approvedPlan!\.held\);[\s\S]*?await requireBootstrapRolesLive\(client, input\.target, fresh\);[\s\S]*?refreshReleaseBoundary/);
   expect(src).toContain("bootstrap,\n          },");
   expect(src).toContain("if (bootstrap.required) console.log(BOOTSTRAP_REQUIRED_NOTE);");
 });
@@ -1743,6 +1864,9 @@ test("workflow offers the bootstrap mode in the same protected job with one secr
   expect(summary.run).not.toContain("${{");
   expect(parsed.on.workflow_dispatch.inputs.approval.description).toContain(
     "BOOTSTRAP <project> <sha> TARGET <target> <target_sha> CHAIN <chain_digest> ROLES <sorted comma-joined will_create, or none> PLAN <plan_run>",
+  );
+  expect(parsed.on.workflow_dispatch.inputs.approval.description).toContain(
+    "chain_digest from the plan binds target, target_sha, the target-required roles and the anchor bytes of the run files",
   );
 });
 

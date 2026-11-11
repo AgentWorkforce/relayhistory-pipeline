@@ -4,6 +4,7 @@ import {
   SESSION_BOOTSTRAP_FILES,
   SESSION_BOOTSTRAP_ROLES,
 } from "../session-bootstrap-chain.ts";
+import { chainFileRoles } from "../session-bootstrap-consumers.ts";
 
 const root = new URL("../../../", import.meta.url);
 const sql = (file: string) =>
@@ -11,17 +12,8 @@ const sql = (file: string) =>
     .split("\n")
     .filter((l) => !/^\s*--/.test(l))
     .join("\n");
-/** Every role name a chain file can provision: literal CREATE ROLE names, v_name/v_role
- * literals and the FOREACH ARRAY list. */
-function provisioned(text: string) {
-  const names = new Set<string>();
-  for (const m of text.matchAll(/CREATE ROLE\s+([a-z_][a-z0-9_]*)/g))
-    if (m[1] !== "IF") names.add(m[1]);
-  for (const m of text.matchAll(/\bv_(?:name|role)\s+text\s*:=\s*'([^']+)'/g)) names.add(m[1]);
-  for (const m of text.matchAll(/FOREACH\s+v_(?:name|role)\s+IN\s+ARRAY\s+ARRAY\[([^\]]*)\]/g))
-    for (const n of m[1].matchAll(/'([^']+)'/g)) names.add(n[1]);
-  return names;
-}
+/** The extractor the bootstrap stage applies to the anchor's bytes (one source). */
+const provisioned = chainFileRoles;
 
 test("SESSION_BOOTSTRAP_ROLES covers exactly the chain files, in chain order", () => {
   expect(Object.keys(SESSION_BOOTSTRAP_ROLES)).toEqual([...SESSION_BOOTSTRAP_FILES]);

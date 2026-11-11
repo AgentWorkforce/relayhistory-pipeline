@@ -1,7 +1,7 @@
 /** PLAN ONLY through the operator's existing Supabase CLI passwordless session. */
 import { execFileSync } from "node:child_process";
 import pg from "pg";
-import { generation, inspectMigrations, migrationProfile } from "../src/hoopdb/migrate.ts";
+import { generation, inspectMigrations, migrationProfile, schemaStepDigests } from "../src/hoopdb/migrate.ts";
 import { functionBoundaryEvidence } from "../src/hoopdb/migrate-guards.ts";
 import { SUPABASE_PROD_CA_2021 } from "../src/session-pipeline/supabase-ca.ts";
 import { parseCliLogin as parseSupabaseCliLogin } from "../src/shared/supabase-cli-login.ts";
@@ -17,9 +17,15 @@ export function ownerPlanInputs(env: NodeJS.ProcessEnv, argv: string[]) {
   if (!sha || !/^[0-9a-f]{40}$/u.test(sha) || !digest || !/^[0-9a-f]{64}$/u.test(digest)) refuse("operator_source_pin");
   return { sha, digest };
 }
-/** The bootstrap section of this source sha (release = target = source), supabase db mode. */
-export function ownerPlanBootstrap(files: Parameters<typeof bootstrapSection>[0]["files"], state: BootstrapState) {
-  return bootstrapSection({ files, state, supabaseMode: true });
+/**
+ * The bootstrap section of this source sha (release = anchor = source; target = the
+ * source tree's last schema step, so every role first consumed in the tree is
+ * required), supabase db mode.
+ */
+export function ownerPlanBootstrap(sha: string, steps: readonly string[], files: Parameters<typeof bootstrapSection>[0]["files"], state: BootstrapState) {
+  const target = steps[steps.length - 1];
+  if (target === undefined) refuse("operator_source_pin");
+  return bootstrapSection({ target, targetSha: sha, steps, files, state, supabaseMode: true });
 }
 interface OwnerPlanClient {
   connect(): Promise<void>;
@@ -59,7 +65,8 @@ export async function operatorOwnerPlan() {
     const profile = migrationProfile({ HOOPDB_DB_MODE: "supabase", HOOPDB_SUPABASE_SHIM: "false", HOOPDB_ROLE_BOOTSTRAP: "false", HOOPDB_ROLE_VERIFY: "true", HOOPDB_RUNTIME_ROLE: "bulls96_runtime", HOOPDB_RUNTIME_ROLE_LOGIN: "true", HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke" });
     const report = await inspectMigrations(client, profile);
     const trigger = await functionBoundaryEvidence(client, "event-trigger", "supabase", "bulls96_runtime");
-    const bootstrap = ownerPlanBootstrap(releaseBootstrapFiles(process.cwd(), input.sha, input.sha), await readBootstrapState(client));
+    const steps = (await schemaStepDigests([])).map(([name]) => name);
+    const bootstrap = ownerPlanBootstrap(input.sha, steps, releaseBootstrapFiles(process.cwd(), input.sha, input.sha), await readBootstrapState(client));
     console.log(JSON.stringify({ version: 1, status: "planned_readonly_not_apply_approval", at: new Date().toISOString(), project: PROJECT, sourceSha: input.sha, boundary: "global-default-revoke", existingEventTriggerMatchesSource: trigger.satisfied, ...report, bootstrap }));
   });
 }

@@ -81,14 +81,16 @@ export async function inspectRelease(
   }
 }
 /**
- * The plan's bootstrap section (READ ONLY, under the migrator's xact lock): chain file
- * digests at the release sha (and target sha, informational) from the object database,
+ * The plan's bootstrap section (READ ONLY, under the migrator's xact lock), target-bound:
+ * chain file bytes at the anchor (target_sha; the release sha's only compared) from the
+ * object database, the required set for the target over the anchor's ordered `steps`,
  * each chain role's presence and exactness in supabase db mode. Refuses
- * release_bootstrap_role_drift when a present chain role does not match its contract.
+ * release_bootstrap_role_drift when a present required role does not match its
+ * contract; mixed and release-drifting files are reported (the stage refuses them).
  */
 export async function inspectBootstrap(
   client: pg.Client,
-  input: { sha: string; targetSha: string },
+  input: { sha: string; target: string; targetSha: string; steps: readonly string[] },
   repo: string = process.cwd(),
 ) {
   await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
@@ -96,6 +98,9 @@ export async function inspectBootstrap(
     await requireReleaseOwner(client);
     await client.query("SELECT pg_advisory_xact_lock(961996, 1)");
     return bootstrapSection({
+      target: input.target,
+      targetSha: input.targetSha,
+      steps: input.steps,
       files: releaseBootstrapFiles(repo, input.sha, input.targetSha),
       state: await readBootstrapState(client),
       supabaseMode: releaseProfile("global-default-revoke").mode === "supabase",
