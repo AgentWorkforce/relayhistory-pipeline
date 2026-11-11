@@ -678,7 +678,7 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
     }
   }, 120_000);
 
-  test("writer executes exactly the thirteen composed-path functions, nothing else in sessions", async () => {
+  test("writer executes exactly the reviewed composed-path functions, nothing else in sessions", async () => {
     // The closed call-graph of the production tick (pointer upsert through
     // the publication-authority retry, directory projection, repo catalog).
     // Reachability, precisely: eight fail 42501 in the composed e2e below
@@ -691,6 +691,8 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
     // the partial expression index session_directory_tenant_project_text_trgm_idx
     // evaluates it as the writing role on every directory write that
     // carries a project id, project key or repository (proved below).
+    // The optional operator wrapper is a narrow definer capability (050020), used only
+    // with fence enforcement. Bootstrap must restore it even after role recreation.
     // The static closure in the merge notes proves no other sessions
     // function is reachable.
     const fns = await wpool.query<{ fn: string }>(
@@ -703,6 +705,7 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
       "sessions.applied_repo_evidence(jsonb,jsonb)",
       "sessions.canonical_remote(text)",
       "sessions.clean_root_commit(text)",
+      "sessions.ingest_operator_runtime_upsert(jsonb,text,text)",
       "sessions.legacy_remote(text)",
       "sessions.lock_repo_catalog(text)",
       "sessions.repo_live(text,uuid)",
@@ -716,7 +719,7 @@ describe.skipIf(!writerUrl)("self-host writer surface as the role on real Postgr
     ]);
   }, 120_000);
 
-  test("function ACL drift is zero: the thirteen consumer grants are manifest-authorized", async () => {
+  test("function ACL drift is zero: consumer grants are manifest-authorized", async () => {
     // B2 receipt: the twelve 043900 EXECUTE grants plus 045030's project-text grant now sit inside the migrator's
     // function-ACL manifest (installed by the grant migration on every
     // migrate), so the boundary preview for the role that holds them must
