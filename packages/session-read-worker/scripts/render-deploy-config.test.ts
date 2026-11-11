@@ -385,8 +385,8 @@ describe("deploy config render, owner_buffered_index_verify", () => {
 });
 
 describe("deploy workflow wiring", () => {
-  test("dispatch inputs default to off and none", () => {
-    expect(WORKFLOW).toMatch(/owner_buffered:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+  test("dispatch preserves the live profile by default; child overrides remain off and none", () => {
+    expect(WORKFLOW).toMatch(/owner_buffered:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["preserve", "on", "off"\]\n\s+default: "preserve"/);
     expect(WORKFLOW).toMatch(/owner_buffered_workspaces:\n\s+description:[^\n]*\n\s+type: string\n\s+default: ""/);
     expect(WORKFLOW).toMatch(/buffered_search_gate:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
     expect(WORKFLOW).toContain("BUFFERED_SEARCH_GATE: ${{ inputs.buffered_search_gate }}");
