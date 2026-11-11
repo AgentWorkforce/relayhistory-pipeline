@@ -100,7 +100,7 @@ export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, a
     return { action: "retry", delaySeconds: 300, code: "admission_invalid" };
   }
   if (!decoded) return { action: "ack", outcome: "already_terminal", code: "tombstoned" };
-  const { tenant, prepared, receivedAtMs, journalSeq } = decoded;
+  const { tenant, prepared, receivedAtMs, journalSeq, consentCap } = decoded;
   const now = (deps.nowMs ?? Date.now)();
   const lagMs = Math.max(0, now - receivedAtMs);
   const dir = receiptDir(keyRoot, tenant, prepared.originId, prepared.receipt.receiptId);
@@ -134,8 +134,8 @@ export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, a
       ...deps.deliver,
       ...(custody ? { custody } : {}),
       admissionGate: () => assertNoLaterPrivacyControl(store, keyRoot, tenant, journalSeq, (deps.nowMs ?? Date.now)()),
-      ...(deps.uploadConsent && deps.uploadConsent.enforcement !== "off"
-        ? { consentGate: async (dropped: ReadonlySet<string>, phase: "admit" | "commit") => { await checkUploadConsent(deps.uploadConsent, tenant, prepared.originId, prepared.records, { dropped, phase, route: "admission.consumer" }, deps.log); } }
+      ...((deps.uploadConsent && deps.uploadConsent.enforcement !== "off") || consentCap
+        ? { consentGate: async (dropped: ReadonlySet<string>, phase: "admit" | "commit") => { await checkUploadConsent(deps.uploadConsent, tenant, prepared.originId, prepared.records, { dropped, phase, route: "admission.consumer", ...(consentCap ? { operator: consentCap } : {}) }, deps.log); } }
         : {}),
     }, tenant, prepared);
     return finish("admitted", result.outcome);

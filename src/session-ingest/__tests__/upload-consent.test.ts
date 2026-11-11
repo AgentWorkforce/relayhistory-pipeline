@@ -446,3 +446,81 @@ describe("archive recovery (/v1/delivery/recovery)", () => {
     expect(ledger.claims).toHaveLength(1);
   });
 });
+
+describe("selection disables vs a confirmed allow (ordered controls)", () => {
+  const control = { epoch: "e".repeat(64), version: "5", digest: "d".repeat(64), kind: "selection" as const };
+  async function disable(outcome: "applied" | "replay" | "stale") {
+    const consent = new MemoryConsentStore();
+    await consent.apply(TENANT, { mode: "all", confirmOrigins: ["origin-1"], allow: [{ source: "claude", sessionId: "kept" }] }, { trusted: true, nowMs: T0 });
+    const ledger = new MemoryLedger() as MemoryLedger & { applyOrderedControl?: unknown };
+    ledger.applyOrderedControl = async () => ({ control: { ...control, outcome }, updated: 1 });
+    const app = createIngestApp({
+      identify: () => ({ ...TENANT, scopes: [SYNC_SCOPE], control }) as never, log: () => {},
+      deliver: { ledger, target: { store: store(), keyRoot: "96bulls", sleep: async () => {} } } as never,
+      uploadConsent: { enforcement: "enforce", store: consent, nowMs: () => T0 + 1 },
+    });
+    const res = await app.request("/v1/delivery/sessions/selection", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ account_id: await deliveryAccount(TENANT), origin_id: "origin-1", sessions: [{ source: "claude", session_id: "kept" }, { source: "claude", session_id: "other" }], enabled: false }) });
+    expect(res.status).toBe(200);
+    return consent.decisions.get(JSON.stringify([TENANT.orgId, TENANT.workspaceId, TENANT.userId]))!;
+  }
+
+  test("a stale disable records nothing: the newer confirmed allow stands", async () => {
+    const d = await disable("stale");
+    expect([d.get(sessionKey("claude", "kept")), d.get(sessionKey("claude", "other"))]).toEqual(["allow", undefined]);
+  });
+
+  test("a replayed disable never overwrites an allow, but still records the deny the first attempt may have missed", async () => {
+    const d = await disable("replay");
+    expect([d.get(sessionKey("claude", "kept")), d.get(sessionKey("claude", "other"))]).toEqual(["allow", "deny"]);
+  });
+
+  test("an applied disable is the newest intent: it denies, even over an earlier allow", async () => {
+    const d = await disable("applied");
+    expect([d.get(sessionKey("claude", "kept")), d.get(sessionKey("claude", "other"))]).toEqual(["deny", "deny"]);
+  });
+});
+
+describe("the operator cap rides the admission inbox", () => {
+  const T1 = T0 + 5000;
+  test("the request path writes the cap; the consumer enforces it even after the person's own policy loosens", async () => {
+    const s = store();
+    const consent = new MemoryConsentStore();
+    await consent.apply(TENANT, { mode: "all", confirmOrigins: ["origin-1"], allow: [{ source: "claude", sessionId: "a" }] }, { trusted: true, nowMs: T0 });
+    const sent: AdmissionMessage[] = [];
+    const app = createIngestApp({
+      identify: () => ({ ...TENANT, scopes: [SYNC_SCOPE], admission: ADMISSION_ACCEPT_VALUE, role: "member", capturePolicy: { revision: 7, settings: { sharing_mode: "selected" } } }) as never,
+      log: () => {}, capturePolicyUploads: "enforce",
+      deliver: { ledger: new MemoryLedger(), acceptanceMode: "buffered", target: { store: s, keyRoot: "96bulls" } } as never,
+      asyncAdmission: { mode: "on", enqueue: async (m) => void sent.push(m), nowMs: () => T0, selfhost: { identityOf: () => ({ ...TENANT, scopes: [SYNC_SCOPE], admission: ADMISSION_ACCEPT_VALUE }) as never } },
+      uploadConsent: { enforcement: "enforce", store: consent, nowMs: () => T0 },
+    });
+    const res = await app.request("/v1/delivery/batches", { method: "POST", headers: { "content-type": "application/json", "x-agent-relay-capture-policy-revision": "7" },
+      body: JSON.stringify({ protocolVersion: 1, batch: await batch([sess("a")]) }) });
+    expect(res.status).toBe(200);
+    expect(sent).toHaveLength(1);
+    const { decodeInbox } = await import("../async-admission.ts");
+    const { readAll } = await import("../../shared/vendor.ts");
+    const decoded = await decodeInbox("96bulls", sent[0]!.key, zstd(await readAll((await s.getObject(objectKey(sent[0]!.key))).body)));
+    expect(decoded?.consentCap).toEqual({ mode: "selected" });
+    // The person's allow is withdrawn after the upload was queued (policy stays "all"): uncapped, "all"
+    // would admit it; the operator's "selected" cap still refuses it.
+    consent.decisions.get(JSON.stringify([TENANT.orgId, TENANT.workspaceId, TENANT.userId]))!.delete(sessionKey("claude", "a"));
+    const ledger = new MemoryLedger();
+    const r = await admitMessage({ mode: "on", deliver: { ledger, target: { store: s, keyRoot: "96bulls" } } as never, custodySource: "relayhistory",
+      decompress: zstd, nowMs: () => T1, uploadConsent: { enforcement: "enforce", store: consent, nowMs: () => T1 } }, sent[0]!, 1);
+    expect(r).toMatchObject({ action: "retry", code: UPLOAD_CONSENT_REQUIRED });
+    expect(ledger.commits).toHaveLength(0);
+  });
+
+  test("a malformed stored cap is a malformed inbox object, never ignored", async () => {
+    const { encodeInbox, decodeInbox, inboxKey } = await import("../async-admission.ts");
+    const prepared = await prepareDelivery(TENANT, await batch([sess("a")]));
+    const key = inboxKey("96bulls", TENANT, prepared.originId, prepared.receipt.receiptId, T0, "0123456789abcdef");
+    for (const cap of [{ mode: "all" }, { mode: "selected", extra: 1 }, { mode: "new", sinceMs: -1 }]) {
+      const raw = zstd(encodeInbox(TENANT, prepared, T0, 0, cap as never));
+      await expect(decodeInbox("96bulls", key, raw)).rejects.toThrow();
+    }
+    expect((await decodeInbox("96bulls", key, zstd(encodeInbox(TENANT, prepared, T0, 0, { mode: "new", sinceMs: 5 }))))?.consentCap).toEqual({ mode: "new", sinceMs: 5 });
+  });
+});

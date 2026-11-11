@@ -252,4 +252,18 @@ describe("upload consent: the baseline reproduction now stores nothing", () => {
     expect(await chunkKeys(store)).toHaveLength(0);
     expect((await db.query("SELECT state FROM sessions.ingest_batches")).rows).toHaveLength(0);
   });
+
+  test("self-host introspection: rth:consent reaches the trusted consent write; a sync-only token cannot widen", async () => {
+    let scopes = ["rth:sync"];
+    const rc = await relaycontrol(() => active(scopes, { role: "member" }));
+    const { url } = await start(rc, { INGEST_UPLOAD_CONSENT: "enforce" });
+    const write = (body: unknown) => post(url("/v1/upload-consent"), JSON.stringify(body));
+    const untrusted = await write({ mode: "all", confirm_origins: ["origin-1"] });
+    expect([untrusted.status, await code(untrusted)]).toEqual([403, "upload_consent_untrusted"]);
+    scopes = ["rth:sync", "rth:consent"];
+    const trusted = await post(url("/v1/upload-consent"), JSON.stringify({ mode: "all", confirm_origins: ["origin-1"] }), { authorization: "Bearer sh_at_desktop-token-2" });
+    expect(trusted.status).toBe(200);
+    // ... and the confirmed choice now admits an upload from that installation.
+    expect((await post(url("/v1/delivery/batches"), await deliveryBody("after-confirm"), { authorization: "Bearer sh_at_desktop-token-2" })).status).toBe(200);
+  });
 });

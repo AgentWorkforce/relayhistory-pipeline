@@ -4,7 +4,7 @@ import {validatedCustodyAck} from "./custody-ack.ts";
 import {CURRENT_CUSTODY_CONTENT_TYPE,CURRENT_CUSTODY_ACK_HEADER,PRIVATE_CUSTODY_BYTES,type CurrentCustodyPacket} from "./custody-protocol.ts";
 import {orderedControl,orderedControlResult,type OrderedControl} from "./control-protocol.ts";
 import { registerSessionEraseRoutes, SESSION_ERASE_DISABLED, type SessionEraseConfig, type SessionEraseService } from "./session-erase.ts";
-import { checkUploadConsent, CONSENT_SCOPE, UploadConsentRequired, validateConsentWrite, type ConsentWrite, type UploadConsentConfig } from "./upload-consent.ts";
+import { checkUploadConsent, CONSENT_SCOPE, ConsentWriteRefused, sessionKey, UploadConsentRequired, validateConsentWrite, type ConsentWrite, type UploadConsentConfig } from "./upload-consent.ts";
 import { operatorSharingCap } from "./capture-policy.ts";
 import { assertUserDeleteAllowed, CAPTURE_POLICY_REVISION_HEADER, uploadPolicyError, uploadPolicyViolation, type CapturePolicySubject, type CapturePolicyUploadsMode } from "./capture-policy.ts";
 /**
@@ -424,6 +424,32 @@ export function parseSelection(body: unknown): { account_id: string; expected_us
   return b as never;
 }
 
+/**
+ * The principal deny a selection disable records (upload-consent.ts). `unlessAllowed`: skip sessions the
+ * person has explicitly allowed, with an optimistic revision check so an allow landing between the read
+ * and the write is never overwritten.
+ */
+export async function recordSelectionDeny(config: UploadConsentConfig, tenant: { orgId: string; workspaceId: string; userId: string },
+  originId: string, sessions: { source: string; sessionId: string }[], unlessAllowed: boolean): Promise<void> {
+  const nowMs = () => (config.nowMs ?? Date.now)();
+  if (!unlessAllowed) {
+    await config.store.apply(tenant, { deny: sessions }, { trusted: false, nowMs: nowMs() });
+    return;
+  }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const snapshot = await config.store.snapshot(tenant, originId, sessions, nowMs());
+    const deny = sessions.filter((s) => snapshot.sessions.get(sessionKey(s.source, s.sessionId))?.decision !== "allow");
+    if (deny.length === 0) return;
+    try {
+      await config.store.apply(tenant, { deny, expectedRevision: snapshot.policy?.revision ?? 0 }, { trusted: false, nowMs: nowMs() });
+      return;
+    } catch (error) {
+      if (!(error instanceof ConsentWriteRefused && error.code === "upload_consent_revision")) throw error;
+    }
+  }
+  throw new IngestUnavailable("consent", "upload_consent_contended");
+}
+
 /** POST /v1/upload-consent body. Known keys only (each optional); at most 2048 sessions per list. */
 export function parseConsentWrite(body: unknown): ConsentWrite {
   if (!isObject(body)) invalid("Expected upload consent");
@@ -701,7 +727,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       if (asyncMode === "on" && witness && identity.admission === ADMISSION_ACCEPT_VALUE && !c.get("custody")) {
         const prepared = await prepareForAdmission(deps.deliver, tenant, batch, receivedAtMs);
         try {
-          await enqueueAdmission({ store: deps.deliver.target.store, keyRoot: deps.deliver.target.keyRoot, enqueue: deps.asyncAdmission!.enqueue }, tenant, prepared, receivedAtMs, witness.seq);
+          await enqueueAdmission({ store: deps.deliver.target.store, keyRoot: deps.deliver.target.keyRoot, enqueue: deps.asyncAdmission!.enqueue }, tenant, prepared, receivedAtMs, witness.seq, operator);
         } catch (error) {
           if (error instanceof DeliveryError) throw error;
           throw new IngestUnavailable("admission_enqueue", "admission_enqueue_failed");
@@ -850,8 +876,12 @@ export function createIngestApp(deps: IngestAppDeps) {
       }else await journal(()=>deps.deliver.ledger.setSessionUploads(selection),()=>"applied");
       // A "Don't upload" is also the principal's explicit deny (every origin, every mode, kept when the mode
       // becomes "all"). Narrowing only. A re-enable never broadens consent: that needs a confirmed write.
-      if (!input.enabled && deps.uploadConsent && deps.uploadConsent.enforcement !== "off")
-        await deps.uploadConsent.store.apply(selection.tenant, { deny: input.sessions.map((x) => ({ source: x.source, sessionId: x.session_id })) }, { trusted: false, nowMs: (deps.uploadConsent.nowMs ?? Date.now)() });
+      // Ordered controls: an applied disable is the newest intent (deny). A stale one was superseded
+      // (nothing). A replay may follow a first attempt whose consent write failed, but must never overwrite
+      // an allow the person confirmed since, so it denies only sessions with no allow (revision-checked).
+      if (!input.enabled && deps.uploadConsent && deps.uploadConsent.enforcement !== "off" && controlAck?.outcome !== "stale")
+        await recordSelectionDeny(deps.uploadConsent, selection.tenant, input.origin_id,
+          input.sessions.map((x) => ({ source: x.source, sessionId: x.session_id })), controlAck?.outcome === "replay");
       emit({ route: "delivery.sessions.selection", outcome: controlAck?"control_"+controlAck.outcome:input.enabled ? "enabled" : "disabled", org_id: identity.orgId, count: input.sessions.length });
       return c.json({ updated: true,...(controlAck?{control:controlAck}:{}) });
     } catch (error) {
