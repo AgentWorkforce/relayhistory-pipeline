@@ -390,6 +390,61 @@ describe("onboarding heartbeat (RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT=true)", (
   });
 });
 
+describe("capture policy upload check (RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS)", () => {
+  const HEADER = "x-agent-relay-capture-policy-revision";
+  const SINCE = "2026-11-01T00:00:00.000Z";
+  const policy = (settings: Record<string, unknown>, extra: Record<string, unknown> = {}) =>
+    active(["rth:sync"], { role: "member", capture_policy: { version: 1, revision: 7, settings, ...extra } });
+  const oldSession = async (id: string) => JSON.stringify({ protocolVersion: 1, batch: await batch([
+    record({ record_id: id, kind: "session", payload: { first_activity_ms: Date.parse(SINCE) - 60_000 } }),
+  ], { batch_id: `batch-${id}` }) });
+
+  test("report (default): a missing or older revision, or an older session, is logged and accepted", async () => {
+    const rc = await relaycontrol(() => policy({ sharing_mode: "new" }, { sharing_mode_since: SINCE }));
+    const { url } = await start(rc);
+    expect((await post(url("/v1/delivery/batches"), await deliveryBody("e1"))).status).toBe(200);
+    expect((await post(url("/v1/delivery/batches"), await deliveryBody("e2", { batch_id: "batch-2" }), { [HEADER]: "6" })).status).toBe(200);
+    expect((await post(url("/v1/delivery/batches"), await oldSession("s1"), { [HEADER]: "7" })).status).toBe(200);
+  });
+
+  test("enforce: 409 capture_policy_stale for a missing or older revision; the current one is accepted", async () => {
+    const rc = await relaycontrol(() => policy({ upload_control: "operator" }));
+    const { url, store } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce" });
+    for (const revision of [undefined, "6", "seven"]) {
+      const res = await post(url("/v1/delivery/batches"), await deliveryBody(), revision ? { [HEADER]: revision } : {});
+      expect([revision, res.status, await code(res)]).toEqual([revision, 409, "capture_policy_stale"]);
+    }
+    expect(await chunkKeys(store)).toEqual([]);
+    expect((await post(url("/v1/delivery/batches"), await deliveryBody(), { [HEADER]: "7" })).status).toBe(200);
+    expect((await chunkKeys(store)).length).toBeGreaterThan(0);
+  });
+
+  test("enforce: under sharing_mode new, a session older than the policy is 422; a newer one is accepted", async () => {
+    const rc = await relaycontrol(() => policy({ sharing_mode: "new" }, { sharing_mode_since: SINCE }));
+    const { url } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce" });
+    const refused = await post(url("/v1/delivery/batches"), await oldSession("s1"), { [HEADER]: "7" });
+    expect([refused.status, await code(refused)]).toEqual([422, "capture_policy_session_predates_policy"]);
+    const fresh = JSON.stringify({ protocolVersion: 1, batch: await batch([
+      record({ record_id: "s2", kind: "session", payload: { first_activity_ms: Date.parse(SINCE) + 60_000 } }),
+    ], { batch_id: "batch-s2" }) });
+    expect((await post(url("/v1/delivery/batches"), fresh, { [HEADER]: "7" })).status).toBe(200);
+  });
+
+  test("enforce: a policy that sets no key, or no policy at all (older relaycontrol), needs no header", async () => {
+    let answer = policy({});
+    const rc = await relaycontrol(() => answer);
+    const { url } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce" });
+    expect((await post(url("/v1/delivery/batches"), await deliveryBody("e1"))).status).toBe(200);
+    answer = active(["rth:sync"]);
+    expect((await post(url("/v1/delivery/batches"), await deliveryBody("e2", { batch_id: "batch-2" }))).status).toBe(200);
+  });
+
+  test("an unexpected value refuses startup", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"]));
+    await expect(start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "on" })).rejects.toThrow("RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS");
+  });
+});
+
 describe("per-session erase (RELAYHISTORY_SELFHOST_SESSION_SELECTION=true)", () => {
   const ORIGIN_ID = "origin-1";
   const SELECTION = "/v1/delivery/sessions/selection";

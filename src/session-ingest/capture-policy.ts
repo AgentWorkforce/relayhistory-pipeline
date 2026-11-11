@@ -11,9 +11,20 @@
  * `policy_forbids_user_delete`. Organization owners and admins still delete,
  * and the operator hard delete (session-erase.ts) never passes through here.
  * No policy on the identity (an older relaycontrol) leaves deletes as before.
+ *
+ * Uploads (POST /v1/delivery/batches and /v1/turns/batches): Agent Relay
+ * Desktop names the policy revision it applies in
+ * X-Agent-Relay-Capture-Policy-Revision. When the policy sets any key, a
+ * missing or older revision is a violation, and so is (under `sharing_mode:
+ * new`) a session record whose first activity is before `sharing_mode_since`.
+ * RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS=report (default) logs it
+ * (`capture_policy_upload_violation`) and accepts; `enforce` refuses: 409
+ * `capture_policy_stale` (Desktop retries; its next policy read sends the
+ * current revision) or 422 `capture_policy_session_predates_policy` (the
+ * batch is set aside). Only identities that carry a policy are checked.
  */
 import type { RelaycontrolCapturePolicy } from "@rhc/auth/relaycontrol.ts";
-import { DeliveryError } from "./vendor/delivery/delivery-contracts.ts";
+import { DeliveryError, type HistoryExportBatch } from "./vendor/delivery/delivery-contracts.ts";
 
 export const USER_RETROACTIVE_DELETE = "user_retroactive_delete";
 export const POLICY_FORBIDS_USER_DELETE = "policy_forbids_user_delete";
@@ -38,4 +49,40 @@ export function userDeleteForbidden(subject: CapturePolicySubject): boolean {
 export function assertUserDeleteAllowed(subject: CapturePolicySubject): void {
   if (userDeleteForbidden(subject))
     throw new DeliveryError(POLICY_FORBIDS_USER_DELETE, 403, "Your organization's capture policy does not allow deleting uploaded sessions");
+}
+
+export const CAPTURE_POLICY_REVISION_HEADER = "x-agent-relay-capture-policy-revision";
+export const CAPTURE_POLICY_STALE = "capture_policy_stale";
+export const CAPTURE_POLICY_SESSION_PREDATES = "capture_policy_session_predates_policy";
+export type CapturePolicyUploadsMode = "report" | "enforce";
+
+export type UploadViolation = "missing" | "stale" | "session_predates";
+
+/**
+ * The first way this upload breaks the caller's capture policy, or null. A
+ * policy that sets no key needs no revision; records are read only under
+ * `sharing_mode: new` with a known start (`session` records' `first_activity_ms`).
+ */
+export function uploadPolicyViolation(subject: CapturePolicySubject, header: string | undefined, batch: Pick<HistoryExportBatch, "records">): UploadViolation | null {
+  const policy = subject.capturePolicy;
+  if (!policy || Object.keys(policy.settings).length === 0) return null;
+  const raw = (header ?? "").trim();
+  if (!/^[1-9][0-9]{0,9}$/.test(raw)) return "missing";
+  if (Number(raw) < policy.revision) return "stale";
+  const since = policy.sharingModeSinceMs;
+  if (policy.settings.sharing_mode === "new" && since !== undefined) {
+    for (const record of batch.records) {
+      if (record.kind !== "session" || record.operation !== "upsert" || !record.payload) continue;
+      const started = record.payload.first_activity_ms;
+      if (typeof started === "number" && Number.isFinite(started) && started < since) return "session_predates";
+    }
+  }
+  return null;
+}
+
+/** Enforce mode's refusal for a violation. */
+export function uploadPolicyError(violation: UploadViolation, revision: number): DeliveryError {
+  return violation === "session_predates"
+    ? new DeliveryError(CAPTURE_POLICY_SESSION_PREDATES, 422, "Your organization's capture policy shares only sessions started after it was set")
+    : new DeliveryError(CAPTURE_POLICY_STALE, 409, `Uploads need capture policy revision ${revision}; read the policy again and retry`);
 }

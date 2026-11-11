@@ -84,6 +84,8 @@ const DEFAULT_MAX_ENTRIES = 1_000;
 export interface RelaycontrolCapturePolicy {
   revision: number;
   settings: Readonly<Record<string, unknown>>;
+  /** When `sharing_mode` last became `new` (epoch ms); only while it is `new`. */
+  sharingModeSinceMs?: number;
 }
 
 /**
@@ -96,7 +98,17 @@ export function parseCapturePolicy(value: unknown): RelaycontrolCapturePolicy | 
   const { version, revision, settings } = value as Record<string, unknown>;
   if (version !== 1 || typeof revision !== "number" || !Number.isSafeInteger(revision) || revision < 1) return null;
   if (!settings || typeof settings !== "object" || Array.isArray(settings)) return null;
-  return { revision, settings: Object.freeze({ ...(settings as Record<string, unknown>) }) };
+  const since = (value as Record<string, unknown>).sharing_mode_since;
+  let sharingModeSinceMs: number | undefined;
+  if (since !== undefined) {
+    sharingModeSinceMs = typeof since === "string" && since.length <= 64 ? Date.parse(since) : Number.NaN;
+    if (!Number.isFinite(sharingModeSinceMs)) return null;
+  }
+  return {
+    revision,
+    settings: Object.freeze({ ...(settings as Record<string, unknown>) }),
+    ...(sharingModeSinceMs !== undefined ? { sharingModeSinceMs } : {}),
+  };
 }
 
 export function isRelaycontrolToken(token: string): boolean {

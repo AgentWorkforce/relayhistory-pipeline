@@ -4,7 +4,7 @@ import {validatedCustodyAck} from "./custody-ack.ts";
 import {CURRENT_CUSTODY_CONTENT_TYPE,CURRENT_CUSTODY_ACK_HEADER,PRIVATE_CUSTODY_BYTES,type CurrentCustodyPacket} from "./custody-protocol.ts";
 import {orderedControl,orderedControlResult,type OrderedControl} from "./control-protocol.ts";
 import { registerSessionEraseRoutes, SESSION_ERASE_DISABLED, type SessionEraseConfig } from "./session-erase.ts";
-import { assertUserDeleteAllowed, type CapturePolicySubject } from "./capture-policy.ts";
+import { assertUserDeleteAllowed, CAPTURE_POLICY_REVISION_HEADER, uploadPolicyError, uploadPolicyViolation, type CapturePolicySubject, type CapturePolicyUploadsMode } from "./capture-policy.ts";
 /**
  * The 96Bulls session ingest: relayhistory's delivery write contract
  * (relayhistory-cloud packages/relayhistory/src/routes/delivery.ts), served
@@ -143,6 +143,11 @@ export interface IngestAppDeps {
    * the verified org/workspace). Absent = none. A sink can never change or fail the answer.
    */
   analytics?: AnalyticsPort;
+  /**
+   * RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS (capture-policy.ts): report (default) logs an upload that breaks the
+   * caller's capture policy and accepts it; enforce refuses it. Only identities carrying a policy (self-host) are checked.
+   */
+  capturePolicyUploads?: CapturePolicyUploadsMode;
   /**
    * P1 custody source (INGEST_CUSTODY_SOURCE). "relayhistory" (default): only the signed Neon witness
    * relayhistory sends. "shadow": additionally build the Supabase frozen-source witness and log
@@ -418,6 +423,7 @@ export function createIngestApp(deps: IngestAppDeps) {
   const app = new Hono<Env>();
   const emit = deps.log ?? ((fields) => log.info("session ingest", fields));
   const custodyMode = deps.custodySource ?? "relayhistory";
+  const capturePolicyUploads: CapturePolicyUploadsMode = deps.capturePolicyUploads ?? "report";
   const asyncMode: AsyncAdmissionMode = deps.asyncAdmission?.mode ?? "off";
   const selfhostAdmission = deps.asyncAdmission?.selfhost;
   const uploadDirect = deps.uploadDirect ?? UPLOAD_DIRECT_OFF;
@@ -613,6 +619,12 @@ export function createIngestApp(deps: IngestAppDeps) {
     });
     try {
       const batch = parse(await jsonOf(c, read), identity);
+      // Capture policy (capture-policy.ts): self-host identities carry the org's policy. Report logs, enforce refuses.
+      const violation = uploadPolicyViolation(identity, c.req.header(CAPTURE_POLICY_REVISION_HEADER), batch);
+      if (violation) {
+        emit({ ...fields, metric: "capture_policy_upload_violation", outcome: violation, mode: capturePolicyUploads, revision: identity.capturePolicy!.revision });
+        if (capturePolicyUploads === "enforce") throw uploadPolicyError(violation, identity.capturePolicy!.revision);
+      }
       const tenant = { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };
       // Async admission: no Supabase call. Only for a caller whose SIGNED identity accepts the queued ACK,
       // with a pre-body journal witness, and never for a relayhistory-built custody envelope (whose ACK
