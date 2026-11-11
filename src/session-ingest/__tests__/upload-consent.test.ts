@@ -568,11 +568,17 @@ describe("report mode never refuses, even with the consent store unreadable", ()
     expect(h.ledger.commits).toHaveLength(1);
     expect(h.lines.find((l) => l.error_code === "upload_consent_store_unavailable")).toMatchObject({ state: "reported", org_id: TENANT.orgId });
   });
-  test("report: a selection disable still succeeds (the fence applied; only the consent record is missing)", async () => {
+  test("report: a selection disable whose deny cannot be recorded is a retryable 503, never a silent success", async () => {
     const h = harness({ enforcement: "report", consent: broken });
-    const res = await h.app.request("/v1/delivery/sessions/selection", { method: "POST", headers: { "content-type": "application/json", ...h.as({}) },
-      body: JSON.stringify({ account_id: await deliveryAccount(TENANT), origin_id: "origin-1", sessions: [{ source: "claude", session_id: "x" }], enabled: false }) });
-    expect(res.status).toBe(200);
+    const body = JSON.stringify({ account_id: await deliveryAccount(TENANT), origin_id: "origin-1", sessions: [{ source: "claude", session_id: "x" }], enabled: false });
+    const res = await h.app.request("/v1/delivery/sessions/selection", { method: "POST", headers: { "content-type": "application/json", ...h.as({}) }, body });
+    expect(res.status).toBe(503);
+    // The fence applied and is idempotent: the Desktop's retry, once the store answers, records the deny.
+    expect(h.ledger.deleted.has(sessionKey("claude", "x"))).toBe(true);
+    const good = new MemoryConsentStore();
+    const retry = harness({ enforcement: "report", consent: good, ledger: h.ledger });
+    expect((await retry.app.request("/v1/delivery/sessions/selection", { method: "POST", headers: { "content-type": "application/json", ...retry.as({}) }, body })).status).toBe(200);
+    expect(good.decisions.get(JSON.stringify([TENANT.orgId, TENANT.workspaceId, TENANT.userId]))?.get(sessionKey("claude", "x"))).toBe("deny");
   });
   test("hold-only and enforce still fail closed on a store outage", async () => {
     for (const enforcement of ["hold-only", "enforce"] as const) {

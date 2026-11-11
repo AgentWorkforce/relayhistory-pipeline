@@ -27,15 +27,15 @@ The hosted ingest reads `INGEST_UPLOAD_CONSENT` from the Cloudflare stack input 
 (`"report" | "hold-only" | "enforce"`; omit for off). Changing it is a stack plan and apply through the
 normal reviewed deploy. Self-host sets the same env var on the pipeline image.
 
-1. **Report mode (safe before the migration).** Set `sessionIngest.uploadConsent: "report"` and deploy. Report
-   never refuses: it logs `route=upload_consent_refused state=reported` with the outcome class and counts.
-   If the consent store is unreadable (the migration not applied yet), it logs
-   `error_code=upload_consent_store_unavailable` and still accepts. Expect `reason=no_policy` for every
-   principal, which sizes the cohort.
-2. **Migration `20261105057010_upload_consent.sql`**, through the guarded session schema release
+1. **Migration `20261105057010_upload_consent.sql`** first, through the guarded session schema release
    (`runbooks/guarded-session-schema-release.md`) in the registry's release order. Rollback:
-   `supabase/rollbacks/20261105057010_upload_consent.down.sql`. It is required before `hold-only` or `enforce`:
-   both fail closed (503) when the store is unreadable.
+   `supabase/rollbacks/20261105057010_upload_consent.down.sql`.
+2. **Report mode.** Set `sessionIngest.uploadConsent: "report"` and deploy. Report never refuses an upload:
+   it logs `route=upload_consent_refused state=reported` with the outcome class and counts. If the consent
+   store is unreadable, it logs `error_code=upload_consent_store_unavailable` and accepts. Expect
+   `reason=no_policy` for every principal, which sizes the cohort. A selection disable, though, answers
+   503 when it cannot record the principal-wide deny. The Desktop retries, and the fence write is
+   idempotent, so a "Don't upload" is never silently lost. That is why the migration comes first.
 3. Containment (below) only after step 2.
 
 ## 1. Identify the cohort (metadata only)

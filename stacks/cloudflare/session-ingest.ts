@@ -176,9 +176,10 @@ export interface SessionIngestInputs {
   claimTimeoutBusy?: "on";
   /**
    * INGEST_UPLOAD_CONSENT (src/session-ingest/upload-consent.ts, docs/upload-consent.md): server-owned upload
-   * consent. "report" logs what would be held and never refuses (also when the consent store is unreadable);
+   * consent. "report" logs what would be held and never refuses an upload (also when the consent store is
+   * unreadable; a selection disable still 503s until its deny can be recorded, so apply the migration first);
    * "hold-only" refuses principals under a containment hold; "enforce" refuses every upload without a
-   * confirmed choice. Needs migration 20261105057010 applied first for anything but report. Omit for off
+   * confirmed choice. Apply migration 20261105057010 first (report still never refuses an upload, but a selection disable 503s until its deny can be recorded). Omit for off
    * (no var rendered, vars byte-identical to before).
    */
   uploadConsent?: "report" | "hold-only" | "enforce";
