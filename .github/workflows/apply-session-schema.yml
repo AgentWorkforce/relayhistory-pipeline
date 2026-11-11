@@ -24,12 +24,16 @@ on:
         description: "Last schema step this release may apply, exactly as ledgered (e.g. upstream:20261105047000_coordination_fact_readers.sql); pending steps after it are held and never applied"
         type: string
         required: true
+      target_generation:
+        description: "Apply only - targetGeneration from the plan's plan.json (64 lowercase hex): the prefix generation this apply marks PASS; equals generation when nothing is held"
+        type: string
+        default: ""
       plan_run:
         description: Apply only - successful plan run ID from this SHA (within 24 hours)
         type: string
         default: ""
       approval:
-        description: "Apply only: APPLY pyamkrhoyszgzirqqffq <sha> <generation> TARGET <target> PLAN <plan_run>"
+        description: "Apply only: APPLY pyamkrhoyszgzirqqffq <sha> <generation> TARGET <target> <target_generation> PLAN <plan_run>"
         type: string
         default: ""
 permissions:
@@ -45,6 +49,7 @@ env:
   RELEASE_GENERATION: ${{ inputs.generation }}
   RELEASE_BOUNDARY: ${{ inputs.boundary }}
   RELEASE_TARGET: ${{ inputs.target }}
+  RELEASE_TARGET_GENERATION: ${{ inputs.target_generation }}
   RELEASE_PLAN_RUN: ${{ inputs.plan_run }}
   RELEASE_APPROVAL: ${{ inputs.approval }}
 jobs:

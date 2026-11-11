@@ -30,6 +30,10 @@ export function releaseInputs(
     RELEASE_BOUNDARY: boundary,
     // Required in both modes: the last schema step this release may apply.
     RELEASE_TARGET: target,
+    // Apply only: the target (prefix) generation the plan recorded, generation(held);
+    // the only generation an apply with held steps may mark PASS. Equal to
+    // RELEASE_GENERATION when nothing is held.
+    RELEASE_TARGET_GENERATION: targetGeneration = "",
     RELEASE_PLAN_RUN: planRun = "",
     RELEASE_APPROVAL: approval = "",
   } = env;
@@ -44,17 +48,20 @@ export function releaseInputs(
   if (
     mode === "apply" &&
     (!/^[1-9][0-9]*$/.test(planRun) ||
+      !/^[0-9a-f]{64}$/.test(targetGeneration) ||
       approval !==
-        `APPLY ${SCHEMA_RELEASE.project} ${sha} ${generation} TARGET ${target} PLAN ${planRun}`)
+        `APPLY ${SCHEMA_RELEASE.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} PLAN ${planRun}`)
   )
     refuse("release_typed_approval");
-  if (mode === "plan" && (planRun || approval)) refuse("release_plan_inputs");
+  if (mode === "plan" && (planRun || approval || targetGeneration))
+    refuse("release_plan_inputs");
   return {
     mode,
     sha: sha!,
     generation: generation!,
     boundary,
     target: target!,
+    targetGeneration,
     planRun,
   } as const;
 }

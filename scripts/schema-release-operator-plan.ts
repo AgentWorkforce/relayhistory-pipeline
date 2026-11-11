@@ -32,6 +32,8 @@ export async function operatorPlan() {
     const report = await inspectRelease(client, input.boundary);
     // The same target gate the CI plan records: held steps are never applied.
     const split = migrationTargetSplit(report.inventory, input.target);
+    // The generation an apply of this plan marks PASS (the full one when nothing is held).
+    const targetGeneration = await generation(split.held);
     console.log(
       JSON.stringify(
         {
@@ -43,6 +45,7 @@ export async function operatorPlan() {
           boundary: input.boundary,
           target: input.target,
           ...split,
+          targetGeneration,
           ...report,
         },
         null,

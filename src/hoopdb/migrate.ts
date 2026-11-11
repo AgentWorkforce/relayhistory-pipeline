@@ -350,18 +350,32 @@ export async function expectedMigrationNames(): Promise<string[]> {
  * plus every phase 2 verifier (verify:buffered_search_feed_runtime last), which define the approved grants. Independent of the
  * shim/bootstrap/verify flags, so the migrator, an external verifier and every reader
  * compute the same value for the same image.
+ *
+ * `held` (release target, see migrationTargetSplit): the TARGET generation, the same
+ * algorithm over the schema steps without the held ones. Removing entries from the
+ * ordered list is exactly what a source tree without those migration files computes as
+ * its full generation, so an image built from that prefix tree (or a Worker bound to
+ * it) and the migrator agree byte for byte. With nothing held it is the full
+ * generation. A held name that is not a schema step of this tree refuses.
  */
-export async function generation(): Promise<string> {
-  const upstream = (await readdir(UPSTREAM_MIGRATIONS))
-    .filter((f) => f.endsWith(".sql"))
-    .sort();
-  const ours = (await readdir(OURS)).filter((f) => f.endsWith(".sql")).sort();
-  const steps: Step[] = [
-    ...upstream.map((f) => ({
-      name: `upstream:${f}`,
-      path: join(UPSTREAM_MIGRATIONS, f),
-    })),
-    ...ours.map((f) => ({ name: `96bulls:${f}`, path: join(OURS, f) })),
+export async function generation(held: readonly string[] = []): Promise<string> {
+  const schema = await schemaSteps();
+  const names = new Set(schema.map((s) => s.name));
+  if (held.some((n) => !names.has(n)))
+    throw profileError("release_target_unknown", "a held step is not a schema step of this tree");
+  const h = new Set(held);
+  return generationOfSteps(schema.filter((s) => !h.has(s.name)));
+}
+
+/**
+ * generation() over an explicit ordered schema-step list (name and file path) plus
+ * the fixed phase 2 verifier list. generation() is this over schemaSteps().
+ */
+export async function generationOfSteps(
+  schema: readonly { name: string; path: string }[],
+): Promise<string> {
+  const steps: { name: string; path: string }[] = [
+    ...schema,
     { name: "verify:session_directory_search_worker", path: WORKER_VERIFY },
     { name: "verify:session_token_verifier", path: TOKEN_VERIFIER_VERIFY },
     {name:"verify:session_ingest_seeder",path:INGEST_SEED_VERIFY},
@@ -428,6 +442,11 @@ export interface RunOptions {
   target?: string;
   /** Release plan binding: the exact pending steps up to the target (requires target). */
   expectedPending?: string[];
+  /**
+   * Release plan binding: the target (prefix) generation this run marks PASS, i.e.
+   * generation(held) (requires target). Refused before any write when it differs.
+   */
+  targetGeneration?: string;
 }
 
 /**
@@ -592,7 +611,10 @@ export async function inspectMigrations(client: MigrationClient, profile: Migrat
  *   1. under the advisory lock, before any step runs, the row is set to
  *      ('pending', <generation>): from here every reader is non-ready;
  *   2. only a successful phase 2, in the same transaction, sets it to 'pass' for the
- *      generation it validated;
+ *      generation it validated. With a release target that holds steps, that is the
+ *      target (prefix) generation (generation(held)), never the full-tree one: the
+ *      image of the prefix tree reads it as ready, an image of the full tree stays
+ *      schema_pending until a later run applies the held steps;
  *   3. any failure, crash or a disabled verifier (HOOPDB_ROLE_VERIFY=false) leaves
  *      it 'pending'. With the verifier disabled only an external verifier
  *      (supabase/bootstrap/session_directory_search_worker_mark_pass.sql) can pass it.
@@ -619,9 +641,13 @@ export async function runMigrations(
       throw profileError("release_ledger_changed", "database ledger changed since the approved read-only plan");
     // Release target gate, still read-only and under the lock: the pending set is exactly
     // the approved one, and steps after the target are held (skipped below).
-    if (opts.target !== undefined || opts.expectedPending !== undefined) {
+    if (
+      opts.target !== undefined ||
+      opts.expectedPending !== undefined ||
+      opts.targetGeneration !== undefined
+    ) {
       if (opts.target === undefined)
-        throw profileError("release_target_required", "expectedPending requires a release target");
+        throw profileError("release_target_required", "expectedPending and targetGeneration require a release target");
       const split = migrationTargetSplit(
         schema.map((s) => ({ name: s.name, pending: !ledger.has(s.name) })),
         opts.target,
@@ -634,6 +660,15 @@ export async function runMigrations(
         throw profileError("release_target_pending_changed", "pending steps up to the release target differ from the approved plan");
       held = new Set(split.held);
     }
+    // The generation this run validates and marks PASS. Nothing held: the full tree,
+    // generation() (unchanged). Steps held: the same algorithm over the schema steps of
+    // this plan without the held ones (generationOfSteps), the generation of the tree
+    // that ends at the target; for the real plan this is generation(held).
+    const gen = held.size
+      ? await generationOfSteps(schema.filter((s) => !held.has(s.name)))
+      : await generation();
+    if (opts.targetGeneration !== undefined && opts.targetGeneration !== gen)
+      throw profileError("release_target_generation_changed", "the target generation differs from the approved plan");
     if (opts.beforeWrite) await opts.beforeWrite();
     await client.query("CREATE SCHEMA IF NOT EXISTS sessions");
     await client.query(`CREATE TABLE IF NOT EXISTS ${MIGRATION_LEDGER} (
@@ -657,7 +692,6 @@ export async function runMigrations(
       );
       await client.query(grant.rows[0]!.sql);
     }
-    const gen = await generation();
     // Pending first: committed before any migration can become visible.
     await client.query(MARKER_PENDING_SQL, [ROLE_VALIDATION_NAME, gen]);
     log.info("role validation pending", { reason: gen });
@@ -668,6 +702,11 @@ export async function runMigrations(
     // EXECUTE on every sessions function (idempotent; triggers still fire, PostgreSQL
     // does not check EXECUTE on a trigger function at fire time), then check the runtime
     // role against the full schema. Any failure rolls all of it back.
+    // Held steps' SQL: the exact ACL manifest is the full tree's, so the drift check
+    // skips only the manifest functions a held step creates and that do not exist yet
+    // (sessionsFunctionAclDrift); every existing function is still compared exactly.
+    const heldSql: string[] = [];
+    for (const st of schema) if (held.has(st.name)) heldSql.push(await readFile(st.path, "utf8"));
     const hardenAndCheck = async () => {
       await client.query(
         "REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC",
@@ -692,7 +731,7 @@ export async function runMigrations(
       // Local (Docker dev) mode is unchanged: no check.
       const drift =
         profile.mode !== "local"
-          ? await sessionsFunctionAclDrift(client, profile.runtimeRole)
+          ? await sessionsFunctionAclDrift(client, profile.runtimeRole, heldSql)
           : [];
       if (drift.length)
         throw profileError(
@@ -714,10 +753,11 @@ export async function runMigrations(
       -1,
     );
     for (const [stepIndex, step] of steps.entries()) {
-      // Held steps (after the release target) are never applied. Phase 2 validates and
-      // marks PASS only the complete tree (generation(), the exact ACL manifest), so with
-      // any step held it does not run and the marker stays 'pending' (see below).
-      if (held.size && (held.has(step.name) || step.name.startsWith("verify:"))) continue;
+      // Held steps (after the release target) are never applied or ledgered. Phase 2
+      // still runs, against the prefix: the same fail-closed verifiers and hardening, with
+      // the ACL manifest scoped to the prefix (heldSql), and PASS for the target
+      // generation only (gen above).
+      if (held.has(step.name)) continue;
       const sql = await readFile(step.path, "utf8");
       // The role checks (phase 1 bootstrap, phase 2 verify) run on every migrate, each in
       // its own transaction, and are never recorded in the ledger.
@@ -807,12 +847,12 @@ export async function runMigrations(
       applied += 1;
       log.info("migration applied", { reason: step.name });
     }
-    if (held.size) {
-      log.warn("release target reached; steps held, role validation left pending", {
+    if (held.size)
+      log.warn("release target reached; steps held, validation bound to the target generation", {
         reason: gen,
         count: held.size,
       });
-    } else if (!postChecked) {
+    if (!postChecked) {
       // In-process verifier off: the same hardening and runtime check, in one transaction.
       await client.query("BEGIN");
       try {
@@ -824,7 +864,7 @@ export async function runMigrations(
         throw err;
       }
     }
-    if (!held.size && !steps.some((s) => s.name.startsWith("verify:")))
+    if (!steps.some((s) => s.name.startsWith("verify:")))
       log.info(
         "role validation left pending: in-process verifier disabled; an external verifier must pass it",
         { reason: gen },

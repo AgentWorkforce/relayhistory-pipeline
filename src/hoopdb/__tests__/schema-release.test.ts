@@ -15,7 +15,9 @@ import {
 } from "../schema-release-boundary.ts";
 const sha = "a".repeat(40),
   generation = "b".repeat(64),
-  target = "upstream:20261105047000_coordination_fact_readers.sql";
+  target = "upstream:20261105047000_coordination_fact_readers.sql",
+  // The plan's targetGeneration (generation(held)); differs from generation when held.
+  targetGeneration = "f".repeat(64);
 const base = {
   RELEASE_MODE: "plan",
   RELEASE_SHA: sha,
@@ -52,13 +54,15 @@ test("typed approval binds source, generation, project and prior plan", () => {
     ...base,
     RELEASE_MODE: "apply",
     RELEASE_PLAN_RUN: "90",
-    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} PLAN 90`,
+    RELEASE_TARGET_GENERATION: targetGeneration,
+    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} PLAN 90`,
   };
   expect(releaseInputs(apply).mode).toBe("apply");
   for (const [k, v] of Object.entries({
     RELEASE_SHA: "c".repeat(40),
     RELEASE_GENERATION: "d".repeat(64),
     RELEASE_PLAN_RUN: "91",
+    RELEASE_TARGET_GENERATION: "e".repeat(64),
     RELEASE_APPROVAL: "yes",
     RELEASE_BOUNDARY: "none",
   }))
@@ -304,7 +308,8 @@ test("apply rejects foreign, stale, replayed or failed prior plan and artifact b
     ...base,
     RELEASE_MODE: "apply",
     RELEASE_PLAN_RUN: "90",
-    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} PLAN 90`,
+    RELEASE_TARGET_GENERATION: targetGeneration,
+    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} PLAN 90`,
   };
   expect((await githubReleaseGate(env, get(api()), true)).mode).toBe("apply");
   for (const values of [
@@ -323,6 +328,7 @@ test("apply rejects foreign, stale, replayed or failed prior plan and artifact b
     generation,
     boundary: "global-default-revoke",
     target,
+    targetGeneration,
     planRun: "90",
   };
   const existingBoundary = {
@@ -360,13 +366,31 @@ test("apply rejects foreign, stale, replayed or failed prior plan and artifact b
     target,
     expectedPending: ["upstream:20261105046010_session_directory_read_api_query.sql", target],
     held: ["upstream:20261105050000_operator_session_erase.sql"],
+    targetGeneration,
   };
   expect(validateReleasePlan(plan, input)).toEqual({
     ledgerSha256: "c".repeat(64),
     existingBoundary,
     expectedPending: plan.expectedPending,
     held: plan.held,
+    targetGeneration,
   });
+  // Nothing held: the target generation is the full generation, and nothing else.
+  const tail = { ...plan, held: [], targetGeneration: generation };
+  expect(validateReleasePlan(tail, { ...input, targetGeneration: generation }).targetGeneration).toBe(generation);
+  for (const [p2, tg] of [
+    [{ ...plan, held: [] }, targetGeneration],
+    [{ ...plan, targetGeneration: generation }, generation],
+    [{ ...plan, targetGeneration: undefined }, targetGeneration],
+    [{ ...plan, targetGeneration: undefined }, ""],
+    [{ ...plan, targetGeneration: targetGeneration.toUpperCase() }, targetGeneration.toUpperCase()],
+    [{ ...plan, targetGeneration: "f".repeat(63) }, "f".repeat(63)],
+    [plan, "e".repeat(64)],
+    [plan, ""],
+  ] as const)
+    expect(() => validateReleasePlan(p2, { ...input, targetGeneration: tg })).toThrow(
+      "release_plan_artifact",
+    );
   for (const bad of [
     { target: "upstream:20261105046010_session_directory_read_api_query.sql" },
     { target: undefined },
@@ -389,6 +413,7 @@ test("apply rejects foreign, stale, replayed or failed prior plan and artifact b
     "boundary",
     "runId",
     "ledgerSha256",
+    "targetGeneration",
   ])
     expect(() =>
       validateReleasePlan({ ...plan, [field]: "wrong" }, input),
@@ -583,7 +608,8 @@ test("operator plan refuses apply mode before reading a secret or connecting", (
         ...base,
         RELEASE_MODE: "apply",
         RELEASE_PLAN_RUN: "90",
-        RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} PLAN 90`,
+        RELEASE_TARGET_GENERATION: targetGeneration,
+        RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} PLAN 90`,
         SUPABASE_MIGRATION_OWNER_URL: "",
       },
       stdout: "pipe",
@@ -620,14 +646,19 @@ test("target is required, exact and bound into the typed approval", () => {
     ...base,
     RELEASE_MODE: "apply",
     RELEASE_PLAN_RUN: "90",
-    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} PLAN 90`,
+    RELEASE_TARGET_GENERATION: targetGeneration,
+    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} PLAN 90`,
   };
   expect(releaseInputs(apply).target).toBe(target);
   const other = "upstream:20261105046010_session_directory_read_api_query.sql";
   for (const approval of [
     `APPLY ${P.project} ${sha} ${generation} PLAN 90`,
-    `APPLY ${P.project} ${sha} ${generation} TARGET ${other} PLAN 90`,
-    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} PLAN 90 `,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${other} ${targetGeneration} PLAN 90`,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} PLAN 90 `,
+    // The pre-targetGeneration format, and the full generation in its place.
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} PLAN 90`,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${generation} PLAN 90`,
+    `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${"e".repeat(64)} PLAN 90`,
   ])
     expect(() =>
       releaseInputs({ ...apply, RELEASE_APPROVAL: approval }),
@@ -637,6 +668,43 @@ test("target is required, exact and bound into the typed approval", () => {
     "release_typed_approval",
   );
 });
+test("target generation is apply-only, exact 64 hex and bound into the typed approval", () => {
+  const apply = {
+    ...base,
+    RELEASE_MODE: "apply",
+    RELEASE_PLAN_RUN: "90",
+    RELEASE_TARGET_GENERATION: targetGeneration,
+    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} PLAN 90`,
+  };
+  expect(releaseInputs(apply).targetGeneration).toBe(targetGeneration);
+  // Nothing held: the plan records targetGeneration = generation.
+  expect(
+    releaseInputs({
+      ...apply,
+      RELEASE_TARGET_GENERATION: generation,
+      RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${generation} PLAN 90`,
+    }).targetGeneration,
+  ).toBe(generation);
+  // Approved for one target generation, dispatched with another (or none / malformed).
+  for (const tg of [undefined, "", "e".repeat(64), generation, targetGeneration.toUpperCase(), "f".repeat(63), targetGeneration + " "]) {
+    const env = { ...apply, RELEASE_TARGET_GENERATION: tg };
+    expect(() => releaseInputs(env)).toThrow("release_typed_approval");
+  }
+  // A malformed value never validates even with a matching approval string.
+  for (const tg of ["F".repeat(64), "f".repeat(65), "g".repeat(64)])
+    expect(() =>
+      releaseInputs({
+        ...apply,
+        RELEASE_TARGET_GENERATION: tg,
+        RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${tg} PLAN 90`,
+      }),
+    ).toThrow("release_typed_approval");
+  // Plan mode refuses it (it is a plan output, never a plan input).
+  expect(() => releaseInputs({ ...base, RELEASE_TARGET_GENERATION: targetGeneration })).toThrow(
+    "release_plan_inputs",
+  );
+  expect(releaseInputs(base).targetGeneration).toBe("");
+});
 test("the GitHub gate refuses a missing or unapproved target before any API read", async () => {
   const noApi = async () => {
     throw new Error("api_read");
@@ -645,7 +713,8 @@ test("the GitHub gate refuses a missing or unapproved target before any API read
     ...base,
     RELEASE_MODE: "apply",
     RELEASE_PLAN_RUN: "90",
-    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} PLAN 90`,
+    RELEASE_TARGET_GENERATION: targetGeneration,
+    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} TARGET ${target} ${targetGeneration} PLAN 90`,
   };
   for (const [env, code] of [
     [{ ...base, RELEASE_TARGET: undefined }, "release_inputs"],
@@ -714,9 +783,12 @@ test("workflow carries the required target through env and into the approval tex
   );
   expect(w).toMatch(/\n      target:\n        description: "[^"\n]+"\n        type: string\n        required: true\n/);
   expect(w).toContain("  RELEASE_TARGET: ${{ inputs.target }}\n");
-  expect(w).toContain("<generation> TARGET <target> PLAN <plan_run>");
-  // Only the env block interpolates the input; no run: script does.
-  expect(w.match(/inputs\.target/g)).toHaveLength(1);
+  expect(w).toContain("<generation> TARGET <target> <target_generation> PLAN <plan_run>");
+  expect(w).toMatch(/\n      target_generation:\n        description: "[^"\n]+"\n        type: string\n        default: ""\n/);
+  expect(w).toContain("  RELEASE_TARGET_GENERATION: ${{ inputs.target_generation }}\n");
+  // Only the env block interpolates the inputs; no run: script does.
+  expect(w.match(/inputs\.target\b/g)).toHaveLength(1);
+  expect(w.match(/inputs\.target_generation\b/g)).toHaveLength(1);
 });
 test("operator plan renders the target split and refuses a missing target before connecting", () => {
   const src = readFileSync(
@@ -724,7 +796,8 @@ test("operator plan renders the target split and refuses a missing target before
     "utf8",
   );
   expect(src).toContain("migrationTargetSplit(report.inventory, input.target)");
-  expect(src).toMatch(/target: input\.target,\n\s+\.\.\.split,/);
+  expect(src).toMatch(/target: input\.target,\n\s+\.\.\.split,\n\s+targetGeneration,/);
+  expect(src).toContain("const targetGeneration = await generation(split.held);");
   const r = Bun.spawnSync(
     [process.execPath, "scripts/schema-release-operator-plan.ts"],
     {
@@ -740,4 +813,18 @@ test("operator plan renders the target split and refuses a missing target before
     status: "refused",
     code: "release_inputs",
   });
+});
+test("release apply binds the plan's target generation into the migrator and the PASS readback", () => {
+  const src = readFileSync(
+    new URL("../../../scripts/schema-release-database.ts", import.meta.url),
+    "utf8",
+  );
+  // Plan records generation(held); apply recomputes it from the live split and refuses drift.
+  expect(src).toContain("const targetGeneration = await generation(split.held);");
+  expect(src).toMatch(/\.\.\.split,\n\s+targetGeneration,\n\s+runId/);
+  expect(src).toMatch(/if \(targetGeneration !== approvedPlan!\.targetGeneration\)\n\s+refuse\("release_target_generation_changed"\);/);
+  expect(src).toContain("targetGeneration: approvedPlan!.targetGeneration,");
+  // PASS for exactly the target generation, never a 'pending' acceptance.
+  expect(src).toMatch(/marker\?\.status !== "pass" \|\|\n\s+marker\.generation !== approvedPlan!\.targetGeneration/);
+  expect(src).not.toContain('"pending"');
 });

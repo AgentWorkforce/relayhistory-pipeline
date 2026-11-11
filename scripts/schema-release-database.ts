@@ -44,6 +44,7 @@ export function validateReleasePlan(
     generation: string;
     boundary: string;
     target: string;
+    targetGeneration: string;
     planRun: string;
   },
 ) {
@@ -58,6 +59,11 @@ export function validateReleasePlan(
     !plan.expectedPending.length ||
     plan.expectedPending.at(-1) !== input.target ||
     !stepNames(plan.held) ||
+    // The target (prefix) generation, generation(held), bound into the approval: equal
+    // to the full generation exactly when nothing is held.
+    !/^[0-9a-f]{64}$/.test(plan.targetGeneration ?? "") ||
+    plan.targetGeneration !== input.targetGeneration ||
+    (plan.held.length === 0) !== (plan.targetGeneration === input.generation) ||
     String(plan.runId) !== input.planRun ||
     !/^[0-9a-f]{64}$/.test(plan.ledgerSha256 ?? "") ||
     !Array.isArray(plan.inventory) ||
@@ -70,6 +76,7 @@ export function validateReleasePlan(
     existingBoundary: plan.existingBoundary,
     expectedPending: plan.expectedPending as string[],
     held: plan.held as string[],
+    targetGeneration: plan.targetGeneration as string,
   };
 }
 export async function releaseDatabase() {
@@ -97,6 +104,9 @@ export async function releaseDatabase() {
     const inspection = await inspectRelease(client, input.boundary);
     // The target gate (read-only): refuses an unknown, applied or passed target.
     const split = migrationTargetSplit(inspection.inventory, input.target);
+    // The generation this release marks PASS: the tree ending at the target (the full
+    // generation when nothing is held). Refuses a held name outside this tree.
+    const targetGeneration = await generation(split.held);
     if (input.mode === "plan") {
       await mkdir("release-plan", { recursive: true });
       await writeFile(
@@ -109,6 +119,7 @@ export async function releaseDatabase() {
             boundary: input.boundary,
             target: input.target,
             ...split,
+            targetGeneration,
             runId: process.env.GITHUB_RUN_ID,
             ...inspection,
           },
@@ -136,11 +147,14 @@ export async function releaseDatabase() {
       !sameNames(split.held, approvedPlan!.held)
     )
       refuse("release_target_pending_changed");
+    if (targetGeneration !== approvedPlan!.targetGeneration)
+      refuse("release_target_generation_changed");
     const result = await runMigrations(client, {
       profile,
       expectedLedgerSha256: approvedPlan!.ledgerSha256,
       target: input.target,
       expectedPending: approvedPlan!.expectedPending,
+      targetGeneration: approvedPlan!.targetGeneration,
       beforeWrite: async () => {
         await githubReleaseGate(process.env, get, true);
         await refreshReleaseBoundary(client, approvedPlan!.existingBoundary);
@@ -168,9 +182,12 @@ export async function releaseDatabase() {
         [ROLE_VALIDATION_NAME],
       )
     ).rows[0];
-    // With steps held, phase 2 does not run: the full-tree generation stays 'pending'.
-    const status = approvedPlan!.held.length ? "pending" : "pass";
-    if (marker?.status !== status || marker.generation !== input.generation)
+    // Phase 2 ran on the applied tree and passed exactly the target generation (the
+    // full generation when nothing is held); never the full one while steps are held.
+    if (
+      marker?.status !== "pass" ||
+      marker.generation !== approvedPlan!.targetGeneration
+    )
       refuse("release_marker");
     await verifyReleaseBoundary(client);
     if (approvedPlan!.held.length)
