@@ -1,6 +1,7 @@
 /**
  * Pure helpers for the schema release rehearsal (scripts/pg-proof/schema-rehearsal.ts and
- * .github/workflows/rehearse-session-schema.yml). No I/O, no database, no environment: unit
+ * .github/workflows/rehearse-session-schema.yml). No database, no environment, no direct
+ * I/O (the landing-migrator steps run commands only through an injected Runner): unit
  * tested in src/hoopdb/__tests__/schema-rehearsal.test.ts. The rehearsal is prerequisite
  * proof only and authorizes nothing (runbooks/schema-release-rehearsal.md).
  */
@@ -181,18 +182,10 @@ export function seedSet(input: {
   return { seed, unseeded, lastSeed: seed.at(-1)! };
 }
 
-/**
- * R0 step order: the seed first, then everything else, each in tree order. The last seed
- * step is R0's target, so every unseeded step is held (never applied, never ledgered).
- */
-export function seedOrder(seed: readonly string[], unseeded: readonly string[]): string[] {
-  return [...seed, ...unseeded];
-}
-
 /** sha256 of a file's utf8 text, as migrate.ts sha256Text and release-target.ts digest it. */
 const sha256Utf8 = (text: string) => createHash("sha256").update(text).digest("hex");
 
-/** One file R0 applies: its repository path, the exact text and that text's sha256. */
+/** One seed step R0's ledger must hold: its repository path, the exact text and that text's sha256. */
 export interface SeedFile {
   name: string;
   rel: string;
@@ -201,41 +194,202 @@ export interface SeedFile {
 }
 
 /**
- * R0's bytes: every seed schema step and every phase 2 verifier exactly as the baseline
- * landing commit's tree has them (read from the Git object database, never the release
- * checkout's working tree), so the seeded database is what the migrator at the landing
- * commit would have produced. `landing`/`release` return a path's utf8 text at the
- * landing commit / release sha (undefined when the path is absent); `landingDigests` is
- * the landing commit's [name, sha256] schema steps (release-target.ts treeSchemaSteps).
+ * The seed steps' bytes exactly as the baseline landing commit's tree has them (read from
+ * the Git object database, never the release checkout's working tree). The landing
+ * commit's own migrator applies them (landingMigrator); these digests are what its ledger
+ * must then hold, and landed migrations are frozen, so they must also be the release
+ * tree's bytes. `landing`/`release` return a path's utf8 text at the landing commit /
+ * release sha (undefined when the path is absent); `landingDigests` is the landing
+ * commit's [name, sha256] schema steps (release-target.ts treeSchemaSteps).
  * Refuses: the seed is not exactly the landing tree's steps (rehearsal_seed_step); a seed
- * or verifier path absent at the landing commit (rehearsal_seed_bytes_missing); a seed
- * step whose bytes differ from the landing tree digest or from the release tree's bytes
- * (landed migrations are frozen) (rehearsal_seed_bytes_drift).
+ * path absent at the landing commit (rehearsal_seed_bytes_missing); a seed step whose
+ * bytes differ from the landing tree digest or from the release tree's bytes
+ * (rehearsal_seed_bytes_drift).
  */
 export function seedStepBytes(x: {
   seed: readonly string[];
-  verifiers: readonly { name: string; path: string }[];
   stepRel: (name: string) => string;
   landing: (rel: string) => string | undefined;
   release: (rel: string) => string | undefined;
   landingDigests: readonly (readonly [string, string])[];
-}): { seed: SeedFile[]; verify: SeedFile[] } {
+}): SeedFile[] {
   if (x.landingDigests.length !== x.seed.length || x.landingDigests.some(([n], i) => n !== x.seed[i]))
     rehearsalRefuse("rehearsal_seed_step", { against: "landing_tree" });
-  const file = (name: string, rel: string): SeedFile => {
+  return x.seed.map((name, i) => {
+    const rel = x.stepRel(name);
     const text = x.landing(rel);
     if (text === undefined) rehearsalRefuse("rehearsal_seed_bytes_missing", { step: name });
-    return { name, rel, text, sha256: sha256Utf8(text) };
-  };
-  const seed = x.seed.map((name, i) => {
-    const f = file(name, x.stepRel(name));
-    if (f.sha256 !== x.landingDigests[i]![1]) rehearsalRefuse("rehearsal_seed_bytes_drift", { step: name, against: "landing_tree" });
-    const rel = x.release(f.rel);
-    if (rel === undefined || sha256Utf8(rel) !== f.sha256)
+    const sha256 = sha256Utf8(text);
+    if (sha256 !== x.landingDigests[i]![1]) rehearsalRefuse("rehearsal_seed_bytes_drift", { step: name, against: "landing_tree" });
+    const released = x.release(rel);
+    if (released === undefined || sha256Utf8(released) !== sha256)
       rehearsalRefuse("rehearsal_seed_bytes_drift", { step: name, against: "release_tree" });
-    return f;
+    return { name, rel, text, sha256 };
   });
-  return { seed, verify: x.verifiers.map((v) => file(v.name, v.path)) };
+}
+
+/**
+ * The landing commit's tree must end the baseline's lane AT the baseline: its migrator
+ * applies every step of its tree, so a step after the baseline there (a commit that
+ * landed the baseline together with a later step) would be seeded too. Checked before
+ * anything is materialized or written (rehearsal_landing_tree_above_baseline).
+ */
+export function landingTreeAtBaseline(landing: readonly string[], baseline: string): void {
+  const above = landing.filter((n) => laneOf(n) === laneOf(baseline) && n > baseline);
+  if (above.length) rehearsalRefuse("rehearsal_landing_tree_above_baseline", { above });
+}
+
+/** A child process's outcome (spawnSync with utf8 output). */
+export interface RunResult {
+  status: number | null;
+  signal?: string | null;
+  stdout: string;
+  stderr: string;
+}
+/** Runs one command; injected so the landing-migrator steps are unit tested offline. */
+export type Runner = (
+  cmd: string,
+  args: readonly string[],
+  opts: { cwd: string; env: Record<string, string>; timeoutMs: number },
+) => RunResult;
+
+/**
+ * The migrator profile of the production supabase apply of the landing commit's era
+ * (the same values as schema-release-inspect.ts releaseProfile("global-default-revoke");
+ * a unit test holds them equal). HOOPDB_RUNTIME_ROLE and HOOPDB_URL are added by
+ * landingMigratorEnv. Variable names only ever reach evidence, never the values.
+ */
+export const LANDING_MIGRATOR_PROFILE = {
+  HOOPDB_DB_MODE: "supabase",
+  HOOPDB_SUPABASE_SHIM: "false",
+  HOOPDB_ROLE_BOOTSTRAP: "false",
+  HOOPDB_ROLE_VERIFY: "true",
+  HOOPDB_RUNTIME_ROLE_LOGIN: "true",
+  HOOPDB_FUNCTION_BOUNDARY_MODE: "global-default-revoke",
+} as const;
+
+/**
+ * The whole environment of the landing migrator subprocess: PATH and HOME (bun, its
+ * install cache), the profile, the runtime role and the owner URL. Nothing is inherited,
+ * so no PG* / DATABASE_URL / SUPABASE_* variable can redirect it.
+ */
+export function landingMigratorEnv(base: { PATH?: string; HOME?: string }, runtimeRole: string, url: string): Record<string, string> {
+  return {
+    PATH: base.PATH ?? "",
+    HOME: base.HOME ?? "",
+    ...LANDING_MIGRATOR_PROFILE,
+    HOOPDB_RUNTIME_ROLE: runtimeRole,
+    HOOPDB_URL: url,
+  };
+}
+
+const FULL_SHA = /^[0-9a-f]{40}$/;
+/** The landing tree's migrator entry point, relative to the materialized tree. */
+export const LANDING_MIGRATOR = "src/hoopdb/migrate.ts";
+
+/**
+ * Materializes the landing commit's tree from the Git object database into the empty
+ * directory `dir` (git archive of the full commit id piped through a tar file next to
+ * it; never the working tree, never a branch name), installs its own frozen lockfile
+ * with `bun`, then makes its schema, bootstrap and source trees read-only. Refuses
+ * rehearsal_landing_missing (not a full commit id), rehearsal_landing_materialize
+ * (archive, extract, no migrator, read-only) or rehearsal_landing_install.
+ */
+export function materializeLanding(x: {
+  repo: string;
+  landing: string;
+  dir: string;
+  bun: string;
+  run: Runner;
+  exists: (path: string) => boolean;
+  base: { PATH?: string; HOME?: string };
+}): void {
+  if (!FULL_SHA.test(x.landing)) rehearsalRefuse("rehearsal_landing_missing", { landing: "not_a_commit_id" });
+  const env = { PATH: x.base.PATH ?? "", HOME: x.base.HOME ?? "" };
+  const tar = `${x.dir}.tar`;
+  const step = (name: string, cmd: string, args: string[], cwd: string, timeoutMs: number, code = "rehearsal_landing_materialize") => {
+    const r = x.run(cmd, args, { cwd, env, timeoutMs });
+    if (r.status !== 0) rehearsalRefuse(code, { step: name, exit: r.status, signal: r.signal ?? null });
+  };
+  step("archive", "git", ["archive", "--format=tar", "-o", tar, x.landing], x.repo, 300_000);
+  step("extract", "tar", ["-xf", tar, "-C", x.dir], x.dir, 300_000);
+  step("archive_cleanup", "rm", ["-f", tar], x.dir, 60_000);
+  if (!x.exists(`${x.dir}/${LANDING_MIGRATOR}`) || !x.exists(`${x.dir}/bun.lock`))
+    rehearsalRefuse("rehearsal_landing_materialize", { step: "migrator" });
+  step("install", x.bun, ["install", "--frozen-lockfile"], x.dir, 600_000, "rehearsal_landing_install");
+  step("readonly", "chmod", ["-R", "a-w", "src", "supabase", "package.json", "bun.lock", "tsconfig.json"], x.dir, 60_000);
+}
+
+/**
+ * Redacts a child's output before it reaches the summary: anything URL-shaped and
+ * anything the evidence screen refuses, keeping the last `maxLines` lines.
+ */
+export function redactOutput(text: string, maxLines = 80): string {
+  const global = new RegExp(SECRETISH.source, "gi");
+  return text
+    .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, "[redacted-url]")
+    .replace(global, "[redacted]")
+    .split("\n")
+    .slice(-maxLines)
+    .join("\n");
+}
+
+/**
+ * The landing migrator's own `--generation` (what its readiness marker names). It must
+ * be exactly the generation the release code computes over the landing steps and
+ * verifiers (releaseTargetBinding at the landing commit): rehearsal_landing_generation
+ * when the CLI fails or prints anything else, rehearsal_landing_generation_mismatch
+ * when it differs.
+ */
+export function landingGeneration(x: { dir: string; bun: string; run: Runner; env: Record<string, string>; expected: string }): string {
+  const r = x.run(x.bun, [`${x.dir}/${LANDING_MIGRATOR}`, "--generation"], { cwd: x.dir, env: x.env, timeoutMs: 120_000 });
+  const g = r.stdout.trim();
+  if (r.status !== 0 || !/^[0-9a-f]{64}$/.test(g)) rehearsalRefuse("rehearsal_landing_generation", { exit: r.status });
+  if (g !== x.expected) rehearsalRefuse("rehearsal_landing_generation_mismatch", { landing: g.slice(0, 8), release: x.expected.slice(0, 8) });
+  return g;
+}
+
+/**
+ * Runs the landing commit's own migrator once (`bun <dir>/src/hoopdb/migrate.ts`, no
+ * arguments: every step of ITS tree, ITS verifiers, ITS readiness marker). The redacted
+ * output always goes to `record`; a non-zero exit or a signal refuses
+ * rehearsal_landing_migrator_failed.
+ */
+export function runLandingMigrator(x: {
+  dir: string;
+  bun: string;
+  run: Runner;
+  env: Record<string, string>;
+  timeoutMs: number;
+  record: (log: { exit: number | null; signal: string | null; stdout: string; stderr: string }) => void;
+}): void {
+  const r = x.run(x.bun, [`${x.dir}/${LANDING_MIGRATOR}`], { cwd: x.dir, env: x.env, timeoutMs: x.timeoutMs });
+  x.record({ exit: r.status, signal: r.signal ?? null, stdout: redactOutput(r.stdout), stderr: redactOutput(r.stderr) });
+  if (r.status !== 0) rehearsalRefuse("rehearsal_landing_migrator_failed", { exit: r.status, signal: r.signal ?? null });
+}
+
+/**
+ * After the landing migrator: the schema ledger is exactly the landing tree's steps
+ * (rehearsal_seed_ledger) with the landing tree's digests (rehearsal_seed_ledger_digest),
+ * and the readiness marker is 'pass' at A (rehearsal_seed_marker).
+ */
+export function checkLandingSeed(x: {
+  landingDigests: readonly (readonly [string, string])[];
+  ledger: ReadonlyMap<string, string>;
+  marker: { generation: string; status: string } | undefined;
+  generation: string;
+}): void {
+  const want = [...x.landingDigests.map(([n]) => n)].sort();
+  const got = [...x.ledger.keys()].sort();
+  if (want.length !== got.length || want.some((n, i) => n !== got[i]))
+    rehearsalRefuse("rehearsal_seed_ledger", {
+      missing: want.filter((n) => !x.ledger.has(n)).length,
+      extra: got.filter((n) => !want.includes(n)).length,
+    });
+  const drift = x.landingDigests.filter(([n, d]) => x.ledger.get(n) !== d).map(([n]) => n);
+  if (drift.length) rehearsalRefuse("rehearsal_seed_ledger_digest", { steps: drift });
+  if (x.marker?.status !== "pass" || x.marker.generation !== x.generation)
+    rehearsalRefuse("rehearsal_seed_marker", { status: x.marker?.status ?? null });
 }
 
 /**

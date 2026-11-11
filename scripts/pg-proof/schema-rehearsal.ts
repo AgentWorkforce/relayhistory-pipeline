@@ -8,13 +8,19 @@
  *
  * It replays the production release (scripts/schema-release-database.ts) with the
  * release checkout's own modules, imported from the working directory (the release sha):
- *   R0 seed      the database the release starts from: exactly the schema steps of the
- *                commit that landed the baseline, applied by runMigrations with a release
- *                target binding, marker PASS at that commit's generation, and the
- *                previous release's event-trigger body (a stale reviewed wrapper). Every
- *                file R0 applies (shim, bootstrap chain, boundary, seed steps, verifiers)
- *                is that landing commit's bytes from the Git object database; R1 onward
- *                use the release checkout
+ *   R0 seed      the database the release starts from: the commit that landed the
+ *                baseline (first-parent, its tree ending at the baseline) is materialized
+ *                from the Git object database (git archive, frozen bun install, read-only)
+ *                and ITS OWN migrator (src/hoopdb/migrate.ts) runs as a subprocess with the
+ *                production supabase profile and the owner URL, exactly as production ran
+ *                it then. The release migrator cannot seed it: its hardenAndCheck grants on
+ *                relations created by steps after the baseline (42P01). Operator setup
+ *                (roles, shim, bootstrap chain, boundary) uses the landing bytes too. The
+ *                release code then checks the ledger is exactly the landing steps and
+ *                digests (equal to the release tree's), the marker is PASS at A, and A
+ *                equals the landing --generation; then installs the previous release's
+ *                event-trigger body (a stale reviewed wrapper). R1 onward use the release
+ *                checkout
  *   R1 plan      inspectRelease (READ ONLY; refuses function_acl_drift, ledger_gap, ...),
  *                migrationTargetSplit checked against an independent window, the target
  *                commit found on the release sha's first-parent history at the dispatched
@@ -39,30 +45,35 @@
  */
 import pg from "pg";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import {
   disposableEnvRefusal,
   errorCode,
   expectedWindow,
   flipHex,
+  checkLandingSeed,
   INJECTION_REFUSAL,
+  landingGeneration,
+  landingMigratorEnv,
+  landingTreeAtBaseline,
   laneOf,
   legacyForecast,
+  materializeLanding,
   MAX_POSTMASTER_AGE_SECONDS,
   RehearsalRefusal,
   rehearsalPassed,
   rehearsalRefuse,
   resultRecord,
+  runLandingMigrator,
   sameNameOid,
-  seedOrder,
   seedSet,
   seedStepBytes,
   validateInputs,
   type RehearsalInputs,
-  type SeedFile,
+  type Runner,
   type StageResult,
   type StageStatus,
 } from "./schema-rehearsal-core.ts";
@@ -84,6 +95,8 @@ const results: StageResult[] = [];
 class Stop extends Error {}
 /** The stage the run is in (or about to start): a refusal outside stage() is recorded against it. */
 let current = "R0";
+/** R0's landing migrator run (exit, signal, redacted output tails), for summary.json. */
+let landingLog: { exit: number | null; signal: string | null; stdout: string; stderr: string } | null = null;
 
 async function emit(stage: string, status: StageStatus, evidence: Record<string, unknown> = {}, code?: string) {
   let r: StageResult;
@@ -122,9 +135,9 @@ async function expectRefusal(expected: string, fn: () => Promise<unknown> | unkn
   return { refused: got };
 }
 
-function git(args: string[]): string {
+function git(args: string[], repo = ROOT): string {
   const r = spawnSync("git", args, {
-    cwd: ROOT,
+    cwd: repo,
     encoding: "utf8",
     maxBuffer: 256 * 1024 * 1024,
     env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
@@ -132,6 +145,18 @@ function git(args: string[]): string {
   if (r.status !== 0) rehearsalRefuse("rehearsal_git", { command: args[0] });
   return r.stdout;
 }
+/** The Runner the landing-migrator steps use: one child, its own env only, bounded. */
+const runCommand: Runner = (cmd, args, opts) => {
+  const r = spawnSync(cmd, [...args], {
+    cwd: opts.cwd,
+    env: opts.env,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: opts.timeoutMs,
+    killSignal: "SIGKILL",
+  });
+  return { status: r.error ? null : r.status, signal: r.signal, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+};
 /** name -> blob oid of both lanes' *.sql at a commit, lane order, each lane sorted. */
 function laneTree(sha: string): Map<string, string> {
   const m = new Map<string, string>();
@@ -175,18 +200,11 @@ const stepPath = (name: string) => `${LANE_DIRS[laneOf(name)]}/${name.slice(lane
  * --diff-merges=first-parent turns on patch output (git 2.43), so --no-patch is required
  * and only full commit ids are kept.
  */
-export function landingCommit(sha: string, name: string): string {
-  const out = git([
-    "log",
-    "--first-parent",
-    "--diff-merges=first-parent",
-    "--no-patch",
-    "--diff-filter=A",
-    "--format=%H",
-    sha,
-    "--",
-    stepPath(name),
-  ]);
+export function landingCommit(sha: string, name: string, repo = ROOT): string {
+  const out = git(
+    ["log", "--first-parent", "--diff-merges=first-parent", "--no-patch", "--diff-filter=A", "--format=%H", sha, "--", stepPath(name)],
+    repo,
+  );
   const c = out
     .split("\n")
     .filter((l) => /^[0-9a-f]{40}$/.test(l))
@@ -266,6 +284,8 @@ async function main() {
         generation: inputs?.generation ?? null,
         inject: inputs?.inject ?? null,
         expect_refusal: inputs?.expect ? `${inputs.expect.stage}:${inputs.expect.code}` : null,
+        seed_generation: results.find((r) => r.stage === "R0")?.evidence.seedGeneration ?? null,
+        landing_migrator: landingLog,
         stages: results.map((r) => ({ stage: r.stage, status: r.status, ...(r.code ? { code: r.code } : {}) })),
         passed,
       },
@@ -390,62 +410,51 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
   let seed!: ReturnType<typeof seedSet>;
   let A = "";
   await stage("R0", async () => {
-    // The landing commit's bytes first, before anything is written: R0 applies exactly
-    // what the migrator at the baseline landing commit would (shim, bootstrap chain,
-    // boundary, seed steps, verifiers), never the release checkout's files.
+    // Everything is checked before anything is written: the landing commit, its tree
+    // (ending the baseline lane at the baseline), its seed bytes against the release tree,
+    // its generation A by the release code, then its own migrator materialized and
+    // installed, and that migrator's `--generation` equal to A.
     const landing = landingCommit(sha, baseline);
     const landingSteps = RT.treeSchemaSteps(ROOT, landing) as [string, string][];
+    landingTreeAtBaseline(landingSteps.map(([n]) => n), baseline);
     seed = seedSet({ landing: landingSteps.map(([n]) => n), tree, baseline, target });
-    const bytes = seedStepBytes({
+    const seedFiles = seedStepBytes({
       seed: seed.seed,
-      verifiers: M.RELEASE_TREE.verifiers,
       stepRel: stepPath,
       landing: (rel) => gitText(landing, rel),
       release: (rel) => gitText(sha, rel),
       landingDigests: landingSteps,
     });
-    // The bootstrap list is the release's module; it must be the landing commit's list.
+    // The operator's setup (roles, shim, bootstrap chain, boundary) uses the landing
+    // commit's bytes; the bootstrap list is the release's module and must be the landing
+    // commit's list.
     const chain = gitText(landing, BOOTSTRAP_CHAIN);
     if (chain === undefined || chain !== gitText(sha, BOOTSTRAP_CHAIN)) rehearsalRefuse("rehearsal_seed_bootstrap_chain");
     const landingFile = (rel: string) => gitText(landing, rel) ?? rehearsalRefuse("rehearsal_seed_bytes_missing", { file: rel });
     const shimSql = landingFile(SHIM_SQL);
     const bootstrapSql = (SESSION_BOOTSTRAP_FILES as readonly string[]).map(landingFile);
     const boundarySql = landingFile(BOUNDARY_SQL);
-    const steps = await M.plan(profile);
-    const verifyNames = steps.filter((s: { name: string }) => s.name.startsWith("verify:")).map((s: { name: string }) => s.name);
-    if (!sameNames(verifyNames, bytes.verify.map((f) => f.name))) rehearsalRefuse("rehearsal_seed_step", { against: "verifiers" });
+    // Generation A by the release code: the landing steps and the landing verifiers.
     const anchor = RT.releaseTargetBinding({
       repo: ROOT,
       releaseSha: sha,
       targetSha: landing,
       target: seed.lastSeed,
-      prefix: bytes.seed.map((f) => [f.name, f.sha256]),
+      prefix: seedFiles.map((f) => [f.name, f.sha256]),
     });
-    // The verifiers that run are the ones generation A hashes.
-    const bound = anchor.verifiers as { name: string; sha256: string }[];
-    if (bound.length !== bytes.verify.length || bound.some((v, i) => v.name !== bytes.verify[i]!.name || v.sha256 !== bytes.verify[i]!.sha256))
-      rehearsalRefuse("rehearsal_seed_bytes_drift", { against: "landing_verifiers" });
     A = anchor.targetGeneration;
     if (A === B) rehearsalRefuse("rehearsal_seed_generation_is_target");
-    // Materialized under the runner's temp dir: every read migrate.ts makes of a seed or
-    // verifier step (manifest digests, guards, apply, ledger sha256) sees these bytes.
-    // Held (unseeded) steps are absent at the landing commit: release paths, never applied.
-    const dir = mkdtempSync(join(process.env.RUNNER_TEMP || tmpdir(), "rehearsal-r0-"));
+    // The owner URL the landing migrator connects with (the job's loopback service only).
+    if (P.owner !== "postgres" || P.database !== "postgres") rehearsalRefuse("rehearsal_owner_contract");
+    const ownerUrl = "postgres://postgres@127.0.0.1:5432/postgres";
+    const base = { PATH: process.env.PATH, HOME: process.env.HOME };
+    const bun = process.execPath;
+    const tmp = process.env.RUNNER_TEMP || tmpdir();
+    mkdirSync(tmp, { recursive: true, mode: 0o700 });
+    const dir = mkdtempSync(join(tmp, "rehearsal-landing-"));
     try {
-      const put = (f: SeedFile) => {
-        const path = join(dir, f.rel);
-        mkdirSync(dirname(path), { recursive: true });
-        writeFileSync(path, f.text, { encoding: "utf8", mode: 0o400 });
-        return { name: f.name, path };
-      };
-      const seedSteps = new Map(bytes.seed.map((f) => [f.name, put(f)]));
-      const byName = new Map(steps.map((s: { name: string }) => [s.name, s]));
-      const ordered = [
-        ...seedOrder(seed.seed, seed.unseeded).map(
-          (n) => seedSteps.get(n) ?? byName.get(n) ?? rehearsalRefuse("rehearsal_seed_step", { step: n }),
-        ),
-        ...bytes.verify.map(put),
-      ];
+      materializeLanding({ repo: ROOT, landing, dir, bun, run: runCommand, exists: existsSync, base });
+      landingGeneration({ dir, bun, run: runCommand, env: { PATH: base.PATH ?? "", HOME: base.HOME ?? "" }, expected: A });
       await admin.query(
         `CREATE ROLE ${P.owner} LOGIN CREATEROLE CREATEDB BYPASSRLS REPLICATION; ALTER ROLE ${P.owner} SUPERUSER; GRANT CREATE ON DATABASE ${P.database} TO ${P.owner}; SET ROLE ${P.owner}; CREATE SCHEMA sessions; GRANT CREATE ON SCHEMA public TO ${P.owner}; REVOKE TEMPORARY ON DATABASE ${P.database} FROM PUBLIC; ALTER DEFAULT PRIVILEGES FOR ROLE ${P.owner} REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;`,
       );
@@ -461,30 +470,40 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
       await admin.query(
         `RESET ROLE; ALTER ROLE ${P.owner} NOSUPERUSER; ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`,
       );
-      await owner.connect();
-      await ownerOps.connect();
-      await M.runMigrations(owner, {
-        profile,
-        steps: ordered,
-        target: seed.lastSeed,
-        expectedPending: seed.seed,
-        targetGeneration: A,
-        targetBinding: { targetSha: landing, manifestDigest: anchor.manifestDigest, verifiers: anchor.verifiers },
+      // The landing commit's own migrator applies every step of its tree, runs its
+      // verifiers and writes its readiness marker, as the production apply of that era did.
+      runLandingMigrator({
+        dir,
+        bun,
+        run: runCommand,
+        env: landingMigratorEnv(base, P.runtime, ownerUrl),
+        timeoutMs: 900_000,
+        record: (log) => {
+          landingLog = log;
+        },
       });
     } finally {
+      spawnSync("chmod", ["-R", "u+w", dir], { stdio: "ignore" });
       rmSync(dir, { recursive: true, force: true });
+      rmSync(`${dir}.tar`, { force: true });
     }
-    const ledger = await schemaLedger();
-    if (!sameNames([...ledger.keys()].sort(), [...seed.seed].sort())) rehearsalRefuse("rehearsal_seed_ledger");
-    if (bytes.seed.some((f) => ledger.get(f.name) !== f.sha256)) rehearsalRefuse("rehearsal_seed_ledger", { against: "landing_tree" });
-    const m = await marker();
-    if (m?.status !== "pass" || m.generation !== A) rehearsalRefuse("rehearsal_seed_marker");
+    checkLandingSeed({ landingDigests: landingSteps, ledger: await schemaLedger(), marker: await marker(), generation: A });
+    await owner.connect();
+    await ownerOps.connect();
     // The previous release's event-trigger body: the reviewed wrapper with a different source.
     const wrapper = await O.wrapperSource();
     const delimiter = "$owner_apply_boundary$;";
     if (!wrapper.sql.includes(delimiter)) rehearsalRefuse("rehearsal_wrapper_delimiter");
     await owner.query(wrapper.sql.replace(delimiter, "\n-- fixture stale source\n" + delimiter));
-    return { landingSha: landing, seedGeneration: A, seeded: seed.seed.length, unseeded: seed.unseeded.length, lastSeed: seed.lastSeed };
+    return {
+      landingSha: landing,
+      seedGeneration: A,
+      landingMigrator: "landing_tree",
+      landingMigratorEnv: Object.keys(landingMigratorEnv(base, P.runtime, ownerUrl)).sort(),
+      seeded: seed.seed.length,
+      unseeded: seed.unseeded.length,
+      lastSeed: seed.lastSeed,
+    };
   });
 
   // ---- Ingest fixtures (R7): the real Worker ledger and deliver path as bulls96_session_ingest.

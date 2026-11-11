@@ -9,9 +9,11 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  checkLandingSeed,
   CONNECTION_ENV,
   disposableEnvRefusal,
   expectedWindow,
@@ -19,20 +21,29 @@ import {
   flipHex,
   INJECTION_REFUSAL,
   INJECTIONS,
+  LANDING_MIGRATOR_PROFILE,
+  landingGeneration,
+  landingMigratorEnv,
+  landingTreeAtBaseline,
   legacyForecast,
+  materializeLanding,
   parseExpect,
   PRODUCTION_APPLY_REFUSALS,
+  redactOutput,
   rehearsalPassed,
   resultRecord,
+  runLandingMigrator,
   sameNameOid,
-  seedOrder,
   seedSet,
   seedStepBytes,
   validateInputs,
+  type Runner,
 } from "../../../scripts/pg-proof/schema-rehearsal-core.ts";
-import { manifestGeneration, RELEASE_TREE } from "../migrate.ts";
-import { treeSchemaSteps } from "../release-target.ts";
+import { landingCommit } from "../../../scripts/pg-proof/schema-rehearsal.ts";
+import { manifestGeneration, migrationProfile, RELEASE_TREE } from "../migrate.ts";
+import { treeSchemaSteps, treeVerifiers } from "../release-target.ts";
 import { SCHEMA_RELEASE } from "../schema-release-contract.ts";
+import { releaseProfile } from "../schema-release-inspect.ts";
 
 const ROOT = join(import.meta.dir, "../../..");
 const read = (p: string) => readFileSync(join(ROOT, p), "utf8");
@@ -105,7 +116,6 @@ describe("seedSet", () => {
     expect(r.seed).toEqual([u("5000"), u("5030"), o("0001")]);
     expect(r.unseeded).toEqual([u("6000"), u("7000"), o("0002"), o("0003")]);
     expect(r.lastSeed).toBe(o("0001"));
-    expect(seedOrder(r.seed, r.unseeded)).toEqual([...r.seed, ...r.unseeded]);
   });
   test("refusals: unknown baseline/target, baseline not the landing tail, gaps, target already seeded", () => {
     const s = (landing: string[], baseline = u("5030"), target = u("7000")) =>
@@ -120,28 +130,24 @@ describe("seedSet", () => {
   });
 });
 
-describe("seedStepBytes (R0 bytes come from the baseline landing commit)", () => {
+describe("seedStepBytes (the seed's bytes are the baseline landing commit's)", () => {
   const sha = (t: string) => createHash("sha256").update(t).digest("hex");
   const rel = (n: string) => `m/${n.slice(n.indexOf(":") + 1)}`;
-  const VER = [{ name: "verify:v", path: "b/v_verify.sql" }];
-  const landingFiles: Record<string, string> = { [rel(u("5000"))]: "a;", [rel(u("5030"))]: "b;", "b/v_verify.sql": "old verify;" };
-  const releaseFiles: Record<string, string> = { ...landingFiles, "b/v_verify.sql": "new verify;" };
+  const landingFiles: Record<string, string> = { [rel(u("5000"))]: "a;", [rel(u("5030"))]: "b;" };
+  const releaseFiles: Record<string, string> = { ...landingFiles };
   const input = (over: Partial<Parameters<typeof seedStepBytes>[0]> = {}) => ({
     seed: [u("5000"), u("5030")],
-    verifiers: VER,
     stepRel: rel,
     landing: (p: string) => landingFiles[p],
     release: (p: string) => releaseFiles[p],
     landingDigests: [u("5000"), u("5030")].map((n) => [n, sha(landingFiles[rel(n)]!)] as [string, string]),
     ...over,
   });
-  test("seed steps and verifiers carry the landing bytes, not the release tree's", () => {
-    const r = seedStepBytes(input());
-    expect(r.seed.map((f) => [f.name, f.rel, f.sha256])).toEqual([
+  test("each seed step carries the landing tree's bytes and digest", () => {
+    expect(seedStepBytes(input()).map((f) => [f.name, f.rel, f.sha256])).toEqual([
       [u("5000"), rel(u("5000")), sha("a;")],
       [u("5030"), rel(u("5030")), sha("b;")],
     ]);
-    expect(r.verify).toEqual([{ name: "verify:v", rel: "b/v_verify.sql", text: "old verify;", sha256: sha("old verify;") }]);
   });
   test("refuses drift, missing bytes and a seed that is not the landing tree", () => {
     // A landed migration whose release-tree bytes differ (landed migrations are frozen).
@@ -154,7 +160,7 @@ describe("seedStepBytes (R0 bytes come from the baseline landing commit)", () =>
     expect(code(() => seedStepBytes(input({ landingDigests: [[u("5000"), sha("a;")], [u("5030"), sha("x")]] })))).toBe(
       "rehearsal_seed_bytes_drift",
     );
-    expect(code(() => seedStepBytes(input({ landing: (p) => (p === "b/v_verify.sql" ? undefined : landingFiles[p]) })))).toBe(
+    expect(code(() => seedStepBytes(input({ landing: (p) => (p === rel(u("5030")) ? undefined : landingFiles[p]) })))).toBe(
       "rehearsal_seed_bytes_missing",
     );
     expect(code(() => seedStepBytes(input({ landingDigests: [[u("5000"), sha("a;")]] })))).toBe("rehearsal_seed_step");
@@ -170,31 +176,218 @@ describe("seedStepBytes (R0 bytes come from the baseline landing commit)", () =>
     const r = git(["cat-file", "blob", `${c}:${p}`]);
     return r.status === 0 ? r.stdout.toString("utf8") : undefined;
   };
-  test.skipIf(!haveLanding)("baseline 045030: R0's steps are 55511978's bytes, generation 7db65adb", () => {
+  test.skipIf(!haveLanding)("baseline 045030: 55511978's tree ends at it, its bytes are the release's, generation 7db65adb", () => {
+    expect(landingCommit("HEAD", BASE, ROOT)).toBe(LANDING);
     const landingSteps = treeSchemaSteps(ROOT, LANDING);
     const seed = landingSteps.map(([n]) => n);
     expect(seed.filter((n) => n.startsWith("upstream:")).at(-1)).toBe(BASE);
+    expect(code(() => landingTreeAtBaseline(seed, BASE))).toBeNull();
     const lanes = new Map(RELEASE_TREE.lanes.map((l) => [l.prefix, l.dir]));
     const stepRel = (n: string) => `${lanes.get(n.slice(0, n.indexOf(":") + 1))}/${n.slice(n.indexOf(":") + 1)}`;
-    const r = seedStepBytes({
-      seed,
-      verifiers: RELEASE_TREE.verifiers,
-      stepRel,
-      landing: at(LANDING),
-      release: at("HEAD"),
-      landingDigests: landingSteps,
-    });
-    for (const f of [...r.seed, ...r.verify]) expect(f.sha256).toBe(sha(at(LANDING)(f.rel)!));
-    // At least one verifier R0 runs differs from the release working tree's file.
-    const differs = r.verify.filter((f) => f.sha256 !== sha(read(f.rel))).map((f) => f.name);
-    expect(differs.length).toBeGreaterThan(0);
+    const files = seedStepBytes({ seed, stepRel, landing: at(LANDING), release: at("HEAD"), landingDigests: landingSteps });
+    for (const f of files) expect(f.sha256).toBe(sha(at(LANDING)(f.rel)!));
+    // The landing migrator's verifiers are not all the release working tree's: one
+    // reason R0 runs the landing commit's own migrator.
+    const verifiers = treeVerifiers(ROOT, LANDING);
+    const differs = verifiers.filter((v, i) => v.sha256 !== sha(read(RELEASE_TREE.verifiers[i]!.path))).map((v) => v.name);
     expect(differs).toContain("verify:session_ingest");
+    // The release catalog lists relations 046000 creates; the landing commit's does not
+    // (the 42P01 the release migrator raises on the baseline database).
+    expect(read("src/hoopdb/migrate-guards.ts")).toContain("sessions.session_analysis_jobs_v2");
+    expect(at(LANDING)("src/hoopdb/migrate-guards.ts")).not.toContain("sessions.session_analysis_jobs_v2");
     // The seed generation is production's canonical generation at the baseline.
     const gen = manifestGeneration({
-      steps: r.seed.map((f) => [f.name, f.sha256]),
-      verifiers: r.verify.map((f) => [f.name, f.sha256]),
+      steps: files.map((f) => [f.name, f.sha256]),
+      verifiers: verifiers.map((v) => [v.name, v.sha256]),
     });
     expect(gen.slice(0, 8)).toBe("7db65adb");
+  });
+});
+
+describe("R0 landing migrator (offline: fixture repo and injected runner)", () => {
+  const BASE_ENV = { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" };
+  const real: Runner = (cmd, args, opts) => {
+    const r = spawnSync(cmd, [...args], { cwd: opts.cwd, env: opts.env, encoding: "utf8", timeout: opts.timeoutMs });
+    return { status: r.error ? null : r.status, signal: r.signal, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+  };
+  const ok = (stdout = ""): ReturnType<Runner> => ({ status: 0, signal: null, stdout, stderr: "" });
+  const scratch = () => mkdtempSync(join(tmpdir(), "rehearsal-test-"));
+  const cleanup = (d: string) => {
+    spawnSync("chmod", ["-R", "u+w", d]);
+    rmSync(d, { recursive: true, force: true });
+  };
+  /** A two-commit repo: the first adds 045000 (and a migrator), the second 045030. */
+  const fixture = (withMigrator = true) => {
+    const repo = scratch();
+    const g = (...args: string[]) => {
+      const r = spawnSync("git", args, {
+        cwd: repo,
+        encoding: "utf8",
+        env: { ...BASE_ENV, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" },
+      });
+      if (r.status !== 0) throw new Error(r.stderr);
+      return r.stdout.trim();
+    };
+    const put = (p: string, text: string) => {
+      mkdirSync(join(repo, p, ".."), { recursive: true });
+      writeFileSync(join(repo, p), text);
+    };
+    g("init", "-q", "-b", "main");
+    put("supabase/migrations/20261105045000_a.sql", "select 1;");
+    put("supabase/bootstrap/b.sql", "select 2;");
+    put("bun.lock", "{}");
+    put("package.json", "{}");
+    put("tsconfig.json", "{}");
+    if (withMigrator) put("src/hoopdb/migrate.ts", "export {};");
+    g("add", "-A");
+    g("commit", "-q", "-m", "one");
+    const first = g("rev-parse", "HEAD");
+    put("supabase/migrations/20261105045030_b.sql", "select 3;");
+    g("add", "-A");
+    g("commit", "-q", "-m", "two");
+    return { repo, first, second: g("rev-parse", "HEAD") };
+  };
+
+  test("landingCommit: the first-parent commit that added the step, or rehearsal_landing_missing", () => {
+    const f = fixture();
+    try {
+      expect(landingCommit(f.second, "upstream:20261105045030_b.sql", f.repo)).toBe(f.second);
+      expect(landingCommit(f.second, "upstream:20261105045000_a.sql", f.repo)).toBe(f.first);
+      expect(code(() => landingCommit(f.second, "upstream:20261105046000_never.sql", f.repo))).toBe("rehearsal_landing_missing");
+      expect(code(() => landingCommit(f.first, "upstream:20261105045030_b.sql", f.repo))).toBe("rehearsal_landing_missing");
+    } finally {
+      cleanup(f.repo);
+    }
+  });
+
+  test("landingTreeAtBaseline: a landing tree with a later step in the baseline lane refuses", () => {
+    expect(code(() => landingTreeAtBaseline([u("5000"), u("5030"), o("0001")], u("5030")))).toBeNull();
+    expect(code(() => landingTreeAtBaseline([u("5000"), u("5030"), u("6000"), o("0001")], u("5030")))).toBe(
+      "rehearsal_landing_tree_above_baseline",
+    );
+  });
+
+  test("materializeLanding: git object database tree, frozen install, read-only; each failure its own code", () => {
+    const f = fixture();
+    const calls: string[][] = [];
+    const bunOk: Runner = (cmd, args, opts) => {
+      calls.push([cmd, ...args]);
+      return cmd === "bun-stub" ? ok() : real(cmd, args, opts);
+    };
+    const dirs: string[] = [];
+    const fresh = () => {
+      const d = scratch();
+      dirs.push(d);
+      return d;
+    };
+    const m = (over: Partial<Parameters<typeof materializeLanding>[0]>) =>
+      materializeLanding({ repo: f.repo, landing: f.first, dir: fresh(), bun: "bun-stub", run: bunOk, exists: existsSync, base: BASE_ENV, ...over });
+    try {
+      const dir = fresh();
+      // The working tree is dirty with a file the landing commit never had: not materialized.
+      writeFileSync(join(f.repo, "supabase/migrations/20261105099999_worktree.sql"), "select 9;");
+      m({ dir });
+      expect(existsSync(join(dir, "supabase/migrations/20261105045000_a.sql"))).toBe(true);
+      expect(existsSync(join(dir, "supabase/migrations/20261105045030_b.sql"))).toBe(false);
+      expect(existsSync(join(dir, "supabase/migrations/20261105099999_worktree.sql"))).toBe(false);
+      expect(existsSync(`${dir}.tar`)).toBe(false);
+      expect(calls).toContainEqual(["bun-stub", "install", "--frozen-lockfile"]);
+      expect(calls.find((c) => c[0] === "git")).toEqual(["git", "archive", "--format=tar", "-o", `${dir}.tar`, f.first]);
+      if (process.getuid?.() !== 0)
+        expect(code(() => accessSync(join(dir, "supabase/migrations/20261105045000_a.sql"), constants.W_OK))).not.toBeNull();
+      // Refusals: not a full commit id; unknown commit; no migrator in the tree; install fails.
+      expect(code(() => m({ landing: "main" }))).toBe("rehearsal_landing_missing");
+      expect(code(() => m({ landing: "f".repeat(40) }))).toBe("rehearsal_landing_materialize");
+      expect(code(() => m({ exists: () => false }))).toBe("rehearsal_landing_materialize");
+      const bunFails: Runner = (cmd, args, opts) => (cmd === "bun-stub" ? { status: 1, signal: null, stdout: "", stderr: "lockfile" } : real(cmd, args, opts));
+      expect(code(() => m({ run: bunFails }))).toBe("rehearsal_landing_install");
+    } finally {
+      for (const d of dirs) cleanup(d);
+      cleanup(f.repo);
+    }
+    const g = fixture(false);
+    const d = scratch();
+    try {
+      expect(code(() => materializeLanding({ repo: g.repo, landing: g.first, dir: d, bun: "bun-stub", run: bunOk, exists: existsSync, base: BASE_ENV }))).toBe(
+        "rehearsal_landing_materialize",
+      );
+    } finally {
+      cleanup(d);
+      cleanup(g.repo);
+    }
+  });
+
+  test("landingGeneration: the landing CLI's --generation must be the release code's A", () => {
+    const A = "7".repeat(64);
+    const gen = (r: ReturnType<Runner>, expected = A) => code(() => landingGeneration({ dir: "/x", bun: "bun", run: () => r, env: BASE_ENV, expected }));
+    expect(gen(ok(A + "\n"))).toBeNull();
+    expect(gen(ok("6".repeat(64) + "\n"))).toBe("rehearsal_landing_generation_mismatch");
+    expect(gen(ok("not a generation"))).toBe("rehearsal_landing_generation");
+    expect(gen({ status: 1, signal: null, stdout: A, stderr: "" })).toBe("rehearsal_landing_generation");
+    let argv: readonly string[] = [];
+    landingGeneration({ dir: "/x", bun: "bun", run: (_c, a) => ((argv = a), ok(A)), env: BASE_ENV, expected: A });
+    expect(argv).toEqual(["/x/src/hoopdb/migrate.ts", "--generation"]);
+  });
+
+  test("runLandingMigrator: non-zero exit refuses; output is recorded redacted either way", () => {
+    const logs: { exit: number | null; stdout: string; stderr: string }[] = [];
+    const url = ["postgres", "//postgres@127.0.0.1:5432/postgres"].join(":");
+    const run =
+      (status: number | null, signal: string | null = null): Runner =>
+      () => ({ status, signal, stdout: `applied ${url}\n`, stderr: "error_code 42P01 host aws-0.x." + "pool" + "er.example\n" });
+    const go = (r: Runner) =>
+      code(() => runLandingMigrator({ dir: "/x", bun: "bun", run: r, env: BASE_ENV, timeoutMs: 1000, record: (l) => logs.push(l) }));
+    expect(go(run(0))).toBeNull();
+    expect(go(run(1))).toBe("rehearsal_landing_migrator_failed");
+    expect(go(run(null, "SIGKILL"))).toBe("rehearsal_landing_migrator_failed");
+    expect(logs.map((l) => l.exit)).toEqual([0, 1, null]);
+    for (const l of logs) {
+      expect(l.stdout).not.toContain("127.0.0.1");
+      expect(l.stdout).toContain("[redacted-url]");
+      expect(l.stderr).toContain("42P01");
+      expect(l.stderr).not.toMatch(/pool[e]r/i);
+    }
+    expect(redactOutput(Array.from({ length: 200 }, (_, i) => `l${i}`).join("\n")).split("\n")).toHaveLength(80);
+  });
+
+  test("checkLandingSeed: ledger = landing names and digests, marker pass at A", () => {
+    const A = "7".repeat(64);
+    const landingDigests: [string, string][] = [
+      [u("5000"), "1".repeat(64)],
+      [u("5030"), "2".repeat(64)],
+    ];
+    const ledger = new Map(landingDigests);
+    const pass = { generation: A, status: "pass" };
+    const chk = (over: Partial<Parameters<typeof checkLandingSeed>[0]>) =>
+      code(() => checkLandingSeed({ landingDigests, ledger, marker: pass, generation: A, ...over }));
+    expect(chk({})).toBeNull();
+    expect(chk({ ledger: new Map([...landingDigests, [u("6000"), "3".repeat(64)]]) })).toBe("rehearsal_seed_ledger");
+    expect(chk({ ledger: new Map(landingDigests.slice(0, 1)) })).toBe("rehearsal_seed_ledger");
+    expect(chk({ ledger: new Map([landingDigests[0]!, [u("5030"), "9".repeat(64)]]) })).toBe("rehearsal_seed_ledger_digest");
+    expect(chk({ marker: undefined })).toBe("rehearsal_seed_marker");
+    expect(chk({ marker: { generation: A, status: "pending" } })).toBe("rehearsal_seed_marker");
+    expect(chk({ marker: { generation: "6".repeat(64), status: "pass" } })).toBe("rehearsal_seed_marker");
+  });
+
+  test("the landing migrator's env is exactly the production supabase profile, nothing inherited", () => {
+    const env = landingMigratorEnv({ PATH: "/bin", HOME: "/h" }, SCHEMA_RELEASE.runtime, "u");
+    expect(Object.keys(env).sort()).toEqual(
+      [
+        "HOME",
+        "HOOPDB_DB_MODE",
+        "HOOPDB_FUNCTION_BOUNDARY_MODE",
+        "HOOPDB_ROLE_BOOTSTRAP",
+        "HOOPDB_ROLE_VERIFY",
+        "HOOPDB_RUNTIME_ROLE",
+        "HOOPDB_RUNTIME_ROLE_LOGIN",
+        "HOOPDB_SUPABASE_SHIM",
+        "HOOPDB_URL",
+        "PATH",
+      ].sort(),
+    );
+    expect(migrationProfile({ ...LANDING_MIGRATOR_PROFILE, HOOPDB_RUNTIME_ROLE: SCHEMA_RELEASE.runtime })).toEqual(
+      releaseProfile("global-default-revoke"),
+    );
   });
 });
 
