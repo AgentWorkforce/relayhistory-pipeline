@@ -254,7 +254,8 @@ describe("configuration", () => {
     };
     const off = selfhostIngestConfig(env);
     expect(off.enabled && off.sessionErase).toEqual({ enabled: false, reason: "flag_off" });
-    const on = selfhostIngestConfig({ ...env, SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: SECRET });
+    expect(() => selfhostIngestConfig({ ...env, SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: SECRET })).toThrow(/SESSION_ERASE_FENCE_ENFORCED/);
+    const on = selfhostIngestConfig({ ...env, SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: SECRET, SESSION_ERASE_FENCE_ENFORCED: "1" });
     expect(on.enabled && on.sessionErase.enabled).toBe(true);
     expect(() => selfhostIngestConfig({ ...env, SESSION_ERASE_API_ENABLED: "1", SESSION_ERASE_API_SECRET: "short" })).toThrow(/at least 32/);
   });

@@ -1,9 +1,11 @@
 # Operator per-session erase: Control-to-ingest contract
 
-Status: **contract, default off.** PR 1 (lane A) ships this document and a stub route that always answers
-501. Nothing is erased until lanes B-D land, and each of their default-off flags is turned on with
-Khaliq's explicit OK. Applying migrations, deploying and provisioning the secret also each need his OK
-(AGENTS.md).
+Status: **implemented for synchronous canonical self-host, default off.** Khaliq ordered
+per-session hard-delete implementation on 2026-11-11 (via infra-chief). The automatic
+runtime, activation prerequisites, supported scope and explicit refusals are documented
+in [operator-session-erase-runtime.md](operator-session-erase-runtime.md). Production
+migration application, deployment, credentials, IAM and every flag activation still
+need his separate explicit OK (AGENTS.md). Hosted/unbound runtimes retain the 501 stub.
 
 This is the internal contract between **relay-control** ("Control") and **session-ingest** ("ingest") for
 the hard delete of one session. It is a sibling of `docs/operator-session-erase-design.md` (the per-user
@@ -75,7 +77,7 @@ so a dormant feature cannot take ingest down.
 | --- | --- | --- |
 | off (default) | any | **501**, nothing read, no auth |
 | on | unset | **501**, nothing read, no auth |
-| on | set | auth, then validation, then (PR 1) **501** |
+| on | set | auth and validation, then the self-host service; unbound/hosted stays **501** |
 | invalid value, or on with an invalid secret (hosted Worker only) | any | **503** `unavailable` with `Retry-After`, nothing read, no auth |
 
 The exact 501 body, in every 501 case above:
@@ -116,8 +118,8 @@ streamed above it):
 | 404 | the path is not the route's shape | `not_found` |
 | 405 | any other method (`Allow: GET, POST`) | `method_not_allowed` |
 | 413 | POST body above 8 KiB | `body_too_large` |
-| 501 | flag off, secret unset, or (PR 1) not implemented yet | `not_implemented` |
-| 503 | erase config invalid on the hosted Worker (section 2), a store is unavailable, or the owner cap is exceeded (section 7); `Retry-After` set | `unavailable` / `too_many_owners` |
+| 501 | flag off, secret unset, or hosted/unbound runtime | `not_implemented` |
+| 503 | erase config invalid on the hosted Worker (section 2), a store is unavailable, or the owner cap is exceeded (section 7); `Retry-After` set | `unavailable` / `too_many_owners` / `unsupported_storage` |
 
 - Every response from the erase route itself is flat: `{"error": "<code>", "feature": "session_erase"}`,
   including 404 `erasure_not_found` (agreed with the relay-control owner). The correlation id is in the
@@ -159,8 +161,9 @@ Ids and counts only. No transcript content, title, summary, path or secret. At m
 - `orgId`, `workspaceId`, `source` and `sessionId` echo the requested erase key exactly (the decoded path
   values), including the requested `workspaceId` and `source`.
 - `status`: `in_progress | completed | failed`.
-- `unreadable` / `unreadableAt`: the session is fenced and hidden in every store. Set as soon as the
-  fence transaction commits.
+- `unreadable` / `unreadableAt`: the session is permanently fenced and its exact authenticated
+  read routes return 404. Set when the fence transaction commits; physical object and search
+  cleanup continues asynchronously. Direct object access requires its existing credentials until verified deletion.
 - `bytesErased` / `bytesErasedAt`: every store's delete has been **verified** (not merely issued).
 - **`status: "completed"` if and only if `unreadable` and `bytesErased` are both true**, and then
   `completedAt` is set. Otherwise the status is `in_progress` (or `failed`).
@@ -171,6 +174,9 @@ Ids and counts only. No transcript content, title, summary, path or secret. At m
   `failure.step` and `failure.code` each match `^[A-Za-z][A-Za-z0-9_.-]{0,63}$`.
 
 `artifacts` has exactly these keys. Each value is `{ "count": <integer >= 0>, "state": "done" | "pending" | "not_applicable" }`.
+Counts preserve recorded evidence across retries; external-store counts are conservative observed
+counts, not an exact billing inventory after an ambiguous provider response. Completion is determined
+by fresh absence verification, never by a count alone.
 
 | Key | Store |
 | --- | --- |
@@ -236,6 +242,10 @@ Flags, each default off:
 - `SESSION_ERASE_API_ENABLED`: the route (exactly `1`).
 - `SESSION_ERASE_FENCE_ENFORCED`: claim, commit and index consult the session fence.
 - `SESSION_ERASE_BYTES_ENABLED`: byte deletion steps, hosted and self-host.
+
+Self-host API or bytes activation also requires fence enforcement; enforcement refuses async/drain
+admission. Deploy fence-aware ingest, consumers and readers consistently before API activation.
+SQL fence enforcement remains permanent for recorded erasures even if API/byte flags are disabled.
 
 Every new behaviour needs its own default-off flag: some stack defaults (for example the search index)
 are already live, so the stack default is not dormancy.

@@ -3,7 +3,7 @@ import {decodeCustodyEnvelope} from "./custody-wire.ts";
 import {validatedCustodyAck} from "./custody-ack.ts";
 import {CURRENT_CUSTODY_CONTENT_TYPE,CURRENT_CUSTODY_ACK_HEADER,PRIVATE_CUSTODY_BYTES,type CurrentCustodyPacket} from "./custody-protocol.ts";
 import {orderedControl,orderedControlResult,type OrderedControl} from "./control-protocol.ts";
-import { registerSessionEraseRoutes, SESSION_ERASE_DISABLED, type SessionEraseConfig } from "./session-erase.ts";
+import { registerSessionEraseRoutes, SESSION_ERASE_DISABLED, type SessionEraseConfig, type SessionEraseService } from "./session-erase.ts";
 /**
  * The 96Bulls session ingest: relayhistory's delivery write contract
  * (relayhistory-cloud packages/relayhistory/src/routes/delivery.ts), served
@@ -173,6 +173,8 @@ export interface IngestAppDeps {
    * disabled config, so /internal/v1/session-erase/* answers 501 not_implemented and reads nothing.
    */
   sessionErase?: SessionEraseConfig;
+  /** Self-host only: hosted has no reviewed ingress and keeps the validated 501 stub. */
+  sessionEraseService?: SessionEraseService;
 }
 
 /**
@@ -480,7 +482,7 @@ export function createIngestApp(deps: IngestAppDeps) {
   app.get("/healthz", (c) => c.json({ ok: true }));
 
   // Outside /v1, so neither the identity middleware below nor the /v1/* fallback sees it.
-  registerSessionEraseRoutes(app, deps.sessionErase ?? SESSION_ERASE_DISABLED, emit);
+  registerSessionEraseRoutes(app, deps.sessionErase ?? SESSION_ERASE_DISABLED, emit, deps.sessionEraseService);
 
   // Identity for /v1, relayhistory's codes: 401 missing_authorization / invalid_token, 403 forbidden.
   const identify = deps.identify ?? signedBindingIdentity(deps.signingKey);

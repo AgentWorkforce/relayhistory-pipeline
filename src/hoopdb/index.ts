@@ -24,6 +24,7 @@ import { propagatePointerTombstone } from "./session-directory-summary.ts";
 import { projectSessionDirectory } from "./session-directory-projector.ts";
 import { briefConfig } from "../session-brief/config.ts";
 import { armWakeup } from "../session-brief/store.ts";
+import { ERASE_FENCE_FLAG, eraseRuntimeFlag } from "../session-erase/flags.ts";
 import {
   canonicalManifestIdentity,
   manifestUserId,
@@ -53,6 +54,7 @@ export interface IndexDeps {
 const ROW_IDENTITY=(p:{org_id:string;workspace_id:string;harness:string;session_id:string;machine_id:string})=>JSON.stringify([p.org_id,p.workspace_id,p.harness,p.session_id,p.machine_id]);
 export function hoopDbSessionIndex(deps: IndexDeps): SessionPointerIndex {return sessionIndex(deps,false);}
 function sessionIndex(deps:IndexDeps,authorized:boolean):SessionPointerIndex{
+  const operatorErase = eraseRuntimeFlag(process.env, ERASE_FENCE_FLAG);
   const fromEnv = briefConfig();
   const brief =
     deps.brief !== undefined ? deps.brief : fromEnv.enabled ? fromEnv : null;
@@ -192,10 +194,13 @@ function sessionIndex(deps:IndexDeps,authorized:boolean):SessionPointerIndex{
       const { rows } = await deps.db.query<{
         applied: boolean;
         revision: string;
+        fenced?: boolean;
       }>(
-        "SELECT applied, revision FROM sessions.upsert_session_index($1::jsonb)",
-        [JSON.stringify([row])],
+        operatorErase ? "SELECT applied,revision,fenced FROM sessions.ingest_operator_runtime_upsert($1::jsonb,$2,$3)"
+          : "SELECT applied, revision FROM sessions.upsert_session_index($1::jsonb)",
+        operatorErase ? [JSON.stringify([row]), canonical.sessionId, canonical.machineId] : [JSON.stringify([row])],
       );
+      if (rows[0]?.fenced === true) return { status: "skipped", reason: "operator_erased" };
       const applied = rows[0]?.applied ?? false;
       // The customer-level id. Minted client-side; if an older client sent no
       // uuid we derive one here ONCE (reusing the stored one on later revisions) and say so.

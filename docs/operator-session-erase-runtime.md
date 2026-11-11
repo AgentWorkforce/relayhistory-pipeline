@@ -42,3 +42,65 @@ Causal coverage includes both actual PostgreSQL lock orders, durable writers, ex
 leases, source/bucket/layout refusals, alias registration, role/tenant isolation,
 physical purge, late metadata suppression, output-fact scope and digest isolation.
 Runtime composition and the end-to-end object-store proof ship in the following lane.
+
+## Automatic self-host composition
+
+The self-host ingest service binds the authenticated route to the durable SQL ledger.
+With byte deletion enabled it scans the durable queue on startup and every second;
+restarts resume outstanding receipts. A failed provider step returns a static retryable
+failure receipt. Repeat Control DELETE to retry; GET only observes. A live writer or
+mixed staged payload keeps the receipt pending. The worker never substitutes a timeout
+for proof that a writer stopped, or a delete request for proof that all versions are gone.
+
+All settings remain unset by default. Any deployment or activation below needs Khaliq's
+separate approval; these are configuration requirements, not instructions to execute now.
+
+| Setting | Requirement |
+| --- | --- |
+| SESSION_ERASE_FENCE_ENFORCED=1 | Consistent on every ingest, pipeline consumer and service read API replica before enabling the operator API. Ingest refuses async or drain admission. |
+| SESSION_ERASE_API_ENABLED=1 | Requires enforcement and a dedicated SESSION_ERASE_API_SECRET (32+ non-whitespace characters). Control uses its existing sessionErasureApi URL/secret settings; internal ingress stays private. |
+| SESSION_ERASE_BYTES_ENABLED=1 | Automatic versioned byte and search deletion. API can remain off while enforcing existing fences. |
+| SESSION_ERASE_S3_BUCKET / REGION / ENDPOINT / KEY_ROOT | Must exactly match LOCKER_BUCKET / REGION / ENDPOINT and INGEST_KEY_ROOT. Root defaults to 96bulls. Only S3-compatible versioned storage is supported. |
+| SESSION_ERASE_S3_ACCESS_KEY_ID / SECRET_ACCESS_KEY | Dedicated eraser credentials injected from the secret system. Existing ListBucketVersions + DeleteObjectVersion permissions; no transcript GET/PUT. Writer credentials are never a fallback. |
+| SESSION_ERASE_SEARCH_POSTGRES_URL | Dedicated bulls96_session_erase_search login on the same host, port and database as ingest metadata. Explicit atomic source bootstrap supabase/bootstrap/session_erase_search_role.sql requires a direct superuser operator and grants DELETE plus key-column SELECT only under forced tenant RLS. LOGIN/password provisioning is separate. |
+| SEARCH_INDEX_BACKEND=opensearch | Uses existing SEARCH_INDEX_OPENSEARCH_URL and INDEX_PREFIX plus dedicated SESSION_ERASE_OPENSEARCH_USERNAME/PASSWORD. The existing synchronous adapter deletes and verifies tenant/source/session documents. Basic-auth self-host OpenSearch is supported; no writer credential fallback. |
+
+Search backend and index prefix must stay consistent across consumers/readers/eraser;
+changing backend requires draining and erasing the old projection as a separate approved
+operation. Database identity is pinned in the Postgres composition, and object-store
+and search-target identity is persisted with the job so changed storage, backend or index
+prefix cannot falsely complete an old job. Automatic deletion requires an ingest pool
+of at least two connections: one holds the consumer search lock while another runs
+lease and purge RPCs. Startup refuses a smaller pool.
+
+The object eraser checks current pointers, historical dates, unindexed machines, upload
+generations, every version and delete marker. IDs that cannot map unambiguously to their
+stored layout are refused; a neighbor with a shared string prefix is never an erase target.
+Mixed live-batch, buffered-batch and async inbox prefixes are independently checked for
+absence. Unknown sessions receive permanent fences and a verified zero-count receipt.
+
+Search deletion holds the same metadata advisory locks as the pipeline consumer and
+verifies the external projection before metadata purge. The optional Postgres search role
+has no transcript-content SELECT, INSERT or UPDATE. Postgres projection state is purged
+in the same scoped cleanup. Exact session read routes check the permanent fence both
+before and after I/O; collection list/search endpoints return successful empty collections.
+
+## Proof
+
+CI runs src/session-erase/__tests__/operator-flow.minio.test.ts with the existing
+FRONTIER_TEST_S3_* disposable loopback fixture. It applies actual upstream and HoopDb
+migrations, uploads through real delivery, reads native directory/search/summary routes,
+erases all stores, verifies the completed receipt, checks 404 exact reads and missing raw
+objects, preserves a neighboring object and suppresses same/new-origin re-upload.
+Source projections are seeded as the consumer would; separate real PostgreSQL tests
+prove consumer identity registration and both writer/fence lock orders.
+
+For the optional actual Control HTTP proof, set OPERATOR_ERASE_CONTROL_CHECKOUT to an
+installed relay-control source checkout when running that same test. The test imports
+its existing PGlite/HTTP harness, creates only synthetic data, checks member refusal,
+owner DELETE -> pipeline -> complete GET /erasure, exactly one completion audit and
+unchanged memberships. This cross-repo proof passed locally at Control b503eaa; CI's
+pipeline-only proof remains self-contained. No real database or store is used by either.
+
+Per-user bulk hard-delete is not included. It requires a stable all-session inventory
+across users/origins and bounded durable expansion into these per-session receipts.
