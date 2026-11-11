@@ -64,6 +64,44 @@ test("typed approval binds source, generation, project and prior plan", () => {
     releaseInputs({ ...base, RELEASE_APPROVAL: "anything" }),
   ).toThrow();
 });
+// The operator never chooses a function boundary: global-default-revoke is the
+// required pre-refresh control and CI refreshes/verifies the event trigger itself.
+const refusedBoundaries = [
+  "event-trigger",
+  "EVENT-TRIGGER",
+  "event_trigger",
+  "Global-Default-Revoke",
+  " global-default-revoke",
+  "global-default-revoke ",
+  "global-default-revoke,event-trigger",
+  "global-default-revoke\nevent-trigger",
+  "none",
+  "",
+  undefined,
+];
+test("release contract refuses every boundary but global-default-revoke in plan and apply before any GitHub or database work", async () => {
+  const apply = {
+    ...base,
+    RELEASE_MODE: "apply",
+    RELEASE_PLAN_RUN: "90",
+    RELEASE_APPROVAL: `APPLY ${P.project} ${sha} ${generation} PLAN 90`,
+  };
+  for (const env of [base, apply]) {
+    expect(releaseInputs(env).boundary).toBe("global-default-revoke");
+    for (const RELEASE_BOUNDARY of refusedBoundaries) {
+      const input = { ...env, RELEASE_BOUNDARY };
+      expect(() => releaseInputs(input)).toThrow("release_inputs");
+      let calls = 0;
+      const counting = async (path: string) => (calls++, get(api())(path));
+      // Both workflow jobs and the database step enter through this gate first.
+      for (const approved of [false, true])
+        await expect(
+          githubReleaseGate(input, counting, approved),
+        ).rejects.toMatchObject({ code: "release_inputs" });
+      expect(calls).toBe(0);
+    }
+  }
+});
 function api() {
   const run = {
     id: 100,
@@ -393,7 +431,34 @@ test("workflow keeps credentials step-scoped and refuses implicit environment cr
   );
   expect(w).toContain("cancel-in-progress: false");
   expect(w).toContain("persist-credentials: false");
-  expect(w).toContain("options: [global-default-revoke]");
+  // The dispatch surface offers exactly one boundary and no event-trigger choice.
+  const inputs = w.slice(w.indexOf("    inputs:\n"), w.indexOf("\npermissions:"));
+  const boundary = inputs.slice(
+    inputs.indexOf("      boundary:\n"),
+    inputs.indexOf("      plan_run:\n"),
+  );
+  expect(boundary).toBe(
+    [
+      "      boundary:",
+      "        description: Catalog-proven global control; apply refreshes the reviewed event trigger",
+      "        type: choice",
+      "        options: [global-default-revoke]",
+      "        required: true",
+      "",
+    ].join("\n"),
+  );
+  expect(inputs).not.toContain("event-trigger");
+  expect(w.match(/options: \[/g)).toEqual(["options: [", "options: ["]);
+  expect(w).not.toContain("event-trigger");
+  const parsed = Bun.YAML.parse(w) as any;
+  expect(parsed.on.workflow_dispatch.inputs.boundary).toEqual({
+    description:
+      "Catalog-proven global control; apply refreshes the reviewed event trigger",
+    type: "choice",
+    options: ["global-default-revoke"],
+    required: true,
+  });
+  expect(parsed.env.RELEASE_BOUNDARY).toBe("${{ inputs.boundary }}");
 });
 test("release boundary plan binding accepts only the exact safe trigger shape", () => {
   const boundary = {
@@ -571,6 +636,30 @@ test("operator plan refuses apply mode before reading a secret or connecting", (
     version: 1,
     status: "refused",
     code: "operator_plan_only",
+  });
+  expect(new TextDecoder().decode(r.stderr)).toBe("");
+});
+test("operator plan refuses an event-trigger boundary as release_inputs before reading a secret or connecting", () => {
+  const r = Bun.spawnSync(
+    [process.execPath, "scripts/schema-release-operator-plan.ts"],
+    {
+      cwd: new URL("../../../", import.meta.url).pathname,
+      env: {
+        ...process.env,
+        ...base,
+        RELEASE_BOUNDARY: "event-trigger",
+        // Never a connectable URL here: a regression must not reach the network.
+        SUPABASE_MIGRATION_OWNER_URL: "",
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    },
+  );
+  expect(r.exitCode).toBe(1);
+  expect(JSON.parse(new TextDecoder().decode(r.stdout))).toEqual({
+    version: 1,
+    status: "refused",
+    code: "release_inputs",
   });
   expect(new TextDecoder().decode(r.stderr)).toBe("");
 });
