@@ -1,0 +1,103 @@
+name: ingest generation overlap window
+run-name: ingest overlap ${{ inputs.mode }} ${{ inputs.sha }}
+
+# CI-only operator for the DB half of a reviewed generation overlap (migration 20261105044030;
+# runbooks/private-ingest-production.md "Generation overlap"). The G -> H pair is the reviewed
+# PRIVATE_INGEST_OVERLAP constant in src/session-ingest/private-ingest-release.ts, never an input;
+# while it is null every mode refuses. Nothing runs unless dispatched.
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [readback, open, close]
+        default: readback
+        required: true
+      sha:
+        description: Exact current main commit (40 lowercase hex)
+        type: string
+        required: true
+      ttl_seconds:
+        description: Open only - window TTL in seconds (60 to 14400); empty otherwise
+        type: string
+        default: ""
+      confirmation:
+        description: 'Open: OPEN-OVERLAP <G> <H> TTL <ttl_seconds> SHA <sha>. Close: CLOSE-OVERLAP <G> <H> SHA <sha>. Readback: empty'
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  actions: read
+  deployments: read
+
+# Serialized with the guarded schema release: the window is opened before, and closed or rebound
+# after, an owner-apply on the same database.
+concurrency:
+  group: guarded-session-schema-production
+  cancel-in-progress: false
+
+env:
+  OVERLAP_MODE: ${{ inputs.mode }}
+  OVERLAP_SHA: ${{ inputs.sha }}
+  OVERLAP_TTL_SECONDS: ${{ inputs.ttl_seconds }}
+  OVERLAP_CONFIRMATION: ${{ inputs.confirmation }}
+
+jobs:
+  # No environment here: a typo/missing environment must not auto-create an unprotected one.
+  prerequisite-gate:
+    if: github.repository_id == '1437714333' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without database credentials
+        run: bun install --frozen-lockfile
+      - name: Verify reviewed pair, typed confirmation, exact main, dispatch identity and green CI
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          bun scripts/ingest-generation-overlap-github.ts
+          echo "environment=session-schema-production" >> "$GITHUB_OUTPUT"
+
+  database:
+    needs: prerequisite-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: ${{ needs.prerequisite-gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without database credentials
+        run: bun install --frozen-lockfile
+      - name: Recheck live gates and any recorded environment approval
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/ingest-generation-overlap-github.ts --approved
+      - name: Open, read back or close the reviewed window (only step with the database secret)
+        env:
+          SUPABASE_MIGRATION_OWNER_URL: ${{ secrets.SUPABASE_MIGRATION_OWNER_URL }}
+        run: bun scripts/ingest-generation-overlap-ci.ts
+      - name: Publish the nonsecret window receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingest-generation-overlap
+          path: release-receipt/ingest-generation-overlap.json
+          if-no-files-found: ignore
+          retention-days: 30

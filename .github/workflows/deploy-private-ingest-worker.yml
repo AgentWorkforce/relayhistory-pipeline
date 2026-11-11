@@ -24,7 +24,7 @@ on:
         type: string
         default: ""
       confirmation:
-        description: 'Deploy only: DEPLOY 96bulls-session-ingest <sha> PLAN <plan_run>'
+        description: 'Deploy only: DEPLOY 96bulls-session-ingest <sha> PLAN <plan_run>, plus " OVERLAP <H>" only when the tracked profile declares overlapGeneration'
         type: string
         default: ""
 

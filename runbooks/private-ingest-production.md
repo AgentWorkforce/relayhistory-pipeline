@@ -84,6 +84,50 @@ then requires the current deployment to have exactly one Worker version at 100% 
 value plus Hyperdrive, both Queue bindings, and the three Secrets Store bindings. The sanitized
 readback is retained as `private-ingest-readback` for 30 days.
 
+## Generation overlap (G -> G+H -> H)
+
+Dormant by default: `PRIVATE_INGEST_OVERLAP` in `src/session-ingest/private-ingest-release.ts` is
+`null`, so a tracked `overlapGeneration` and a live `INGEST_ACCEPT_GENERATIONS` both refuse. The
+protocol is `docs/design/zero-503-schema-windows.md` section 3.2. Every step is a reviewed commit
+plus CI; nobody issues SQL by hand.
+
+1. **Review the pair.** By a normal commit, set `PRIVATE_INGEST_OVERLAP = { from: G, to: H }` while
+   `expectedGeneration` is still G. Add `"overlapGeneration": "<H>"` to the tracked profile's
+   `sessionIngest`. The rollout phase stays the same; the planner names it `<phase>-overlap`.
+2. **Worker to G+H.** Plan, then deploy as above. The confirmation is the usual
+   `DEPLOY 96bulls-session-ingest <sha> PLAN <plan_run>` followed by ` OVERLAP <H>`. The readback
+   requires `INGEST_ACCEPT_GENERATIONS=G,H`, and the transition gate allows only G -> G+H.
+3. **Open the DB window.** Run this immediately before the schema apply. Dispatch
+   **ingest generation overlap window** with:
+   - `mode=open`
+   - `sha=<exact main SHA>`
+   - `ttl_seconds` from 60 to 14400; cover the apply, the runtime replacements and the rebind
+   - `confirmation=OPEN-OVERLAP <G> <H> TTL <ttl_seconds> SHA <sha>`
+
+   It uses the `session-schema-production` environment and its owner secret. It refuses unless all of
+   these hold:
+   - readiness is PASS at G
+   - the custody policy is at G
+   - the reviewed contract is still at G
+   - no foreign unexpired window is open
+
+   `admitDuringApply` is always off. `mode=readback` (empty TTL and confirmation) is read-only and
+   reports `none`, `open` or `expired`.
+4. **Apply, then rebind.** Use the normal schema release and the rebind. The rebind closes the
+   window in its own transaction. `mode=readback` should then report `none`.
+5. **Worker to H.** By a normal commit, set `expectedGeneration` to H in both the source constant and
+   the tracked profile. Remove `overlapGeneration` from the profile and keep the pair. Plan and
+   deploy with the plain confirmation. The gate allows only G+H -> H.
+6. **Dormant again.** Once the live Worker reads back exactly H, set `PRIVATE_INGEST_OVERLAP`
+   back to `null` by a normal commit.
+
+While the live Worker is at G+H the rollout phase is frozen: a profile that changes the
+phase and the generation set together, or the phase alone, refuses with
+`private_ingest_live_transition`. Finish or roll back the overlap first. H -> G+H, G -> H and
+H -> G are always refused. A live accept set the tracked profile does not declare refuses with
+`private_ingest_live_undeclared_overlap`. A live state that matches no permitted phase refuses with
+`private_ingest_live_phase`.
+
 ## Rollback
 
 - Step 1: revert the tracked profile to `baseline-drain` by a normal commit, then plan and deploy
@@ -92,5 +136,16 @@ readback is retained as `private-ingest-readback` for 30 days.
   `on` back to `drain`, then plan and deploy through CI. Do not go directly `on -> off` while
   messages may be in flight. Wait for the admission queue and DLQ to empty before a later `off`
   change.
+- Generation overlap, before the rebind (G+H -> G): dispatch **ingest generation overlap window** with
+  `mode=close` and `confirmation=CLOSE-OVERLAP <G> <H> SHA <sha>` (it is idempotent if nothing is open).
+  Then remove `overlapGeneration` from the tracked profile by a normal commit and keep the pair. Plan
+  and deploy; the gate allows G+H -> G. Then set `PRIVATE_INGEST_OVERLAP` back to `null`. Close the
+  window first only if the marker is still at G. If the apply already moved the marker to H, do not
+  roll the generation back: finish the rebind and go forward to H. After the rebind, G is retired, and
+  the database refuses both a G Worker and a reopened window. An expired window admits nothing and
+  fails closed, which brings back today's outage, never a widening.
+- The deploy refuses `private_ingest_live_phase` or `private_ingest_live_transition` whenever the live
+  Worker is not in a state from which the tracked profile is a permitted move. Fix the profile; never
+  bypass the readback.
 
 No local deploy is an emergency rollback path.

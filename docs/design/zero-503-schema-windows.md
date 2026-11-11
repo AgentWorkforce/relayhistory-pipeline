@@ -252,6 +252,14 @@ To keep that one window as short as possible:
    admitted.
 6. **Worker cleanup.** Deploy with `expectedGeneration = H` and no overlap.
 
+**Production CI path.** For the production private-ingest Worker, steps 1 and 6 use the reviewed
+`PRIVATE_INGEST_OVERLAP` pair in `src/session-ingest/private-ingest-release.ts`, the tracked
+`overlapGeneration` and the private-ingest deploy workflow. Step 2, plus a read-only readback and an owner
+close, use `.github/workflows/ingest-generation-overlap.yml`, which calls
+`src/hoopdb/ingest-generation-overlap-operator.ts`. The pair is never a dispatch input, and
+`admitDuringApply` is always off on that path. Sequence and rollback (G+H -> G):
+`runbooks/private-ingest-production.md`, "Generation overlap".
+
 If the window expires before step 5, the fence fails closed: today's outage, never a widening. Choose a TTL
 that covers steps 3–5. The maximum is 4 h.
 

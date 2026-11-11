@@ -61,6 +61,10 @@ import {
 } from "../stacks/cloudflare/session-ingest.ts";
 import { sanitizePlan, captureFiles } from "../src/cli/plan-provenance.ts";
 import {
+  PRIVATE_INGEST_GENERATION_CONTRACT,
+  type PrivateIngestGenerationContract,
+} from "../src/session-ingest/private-ingest-release.ts";
+import {
   privateIngestGithubGate,
   privateIngestGithubGet,
 } from "./private-ingest-release-github.ts";
@@ -807,6 +811,32 @@ export function resourcePlanView(
   }
   return lines.join("\n");
 }
+/**
+ * The only two plans that may unbind INGEST_ACCEPT_GENERATIONS, both with no overlap in the tracked
+ * profile and no accept set proposed:
+ * - closure G+H -> H (unchanged): live expected G with accepted "G,H", proposed expected H;
+ * - rollback G+H -> G (runbooks/private-ingest-production.md): only under a reviewed
+ *   PRIVATE_INGEST_OVERLAP {from: G, to: H} still bound at G, live expected G with accepted exactly
+ *   "G,H", and proposed expected G. Dormant (null) keeps today's closure-only rule.
+ */
+export function acceptGenerationsDeletionAllowed(
+  sessionIngest: CloudflareStageInputs["sessionIngest"],
+  currentEnv: Record<string, unknown> | undefined,
+  proposedEnv: Record<string, unknown> | undefined,
+  contract: PrivateIngestGenerationContract = PRIVATE_INGEST_GENERATION_CONTRACT,
+): boolean {
+  const oldExpected = currentEnv?.INGEST_EXPECT_GENERATION,
+    newExpected = proposedEnv?.INGEST_EXPECT_GENERATION,
+    oldAccepted = currentEnv?.INGEST_ACCEPT_GENERATIONS;
+  const hex = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{64}$/u.test(v);
+  if (sessionIngest.overlapGeneration !== undefined || sessionIngest.expectedGeneration !== newExpected ||
+      !hex(oldExpected) || !hex(newExpected) || proposedEnv?.INGEST_ACCEPT_GENERATIONS !== undefined)
+    return false;
+  if (oldExpected !== newExpected) return oldAccepted === `${oldExpected},${newExpected}`;
+  const pair = contract.overlap;
+  return pair !== null && contract.generation === pair.from && pair.from === oldExpected &&
+    hex(pair.to) && pair.to !== pair.from && oldAccepted === `${pair.from},${pair.to}`;
+}
 export function assertOperatorSnapshot(
   snapshot: any,
   input: CloudflareStageInputs,
@@ -917,8 +947,6 @@ export function assertOperatorSnapshot(
         if (b.action === "delete") {
           const currentEnv = row.state?.props?.env,
             proposedEnv = props.env,
-            oldExpected = currentEnv?.INGEST_EXPECT_GENERATION,
-            newExpected = proposedEnv?.INGEST_EXPECT_GENERATION,
             oldAccepted = currentEnv?.INGEST_ACCEPT_GENERATIONS;
           if (row.action !== "update" || wanted !== undefined ||
               !Array.isArray(actual) || actual.length !== 1 ||
@@ -926,13 +954,8 @@ export function assertOperatorSnapshot(
             refuse("native_binding_target");
           let deletedValue: unknown;
           if (b.sid === "INGEST_ACCEPT_GENERATIONS") {
-            // Documented G -> H generation-window closure.
-            if (input.sessionIngest.overlapGeneration !== undefined ||
-                input.sessionIngest.expectedGeneration !== newExpected ||
-                typeof oldExpected !== "string" || !/^[0-9a-f]{64}$/u.test(oldExpected) ||
-                typeof newExpected !== "string" || !/^[0-9a-f]{64}$/u.test(newExpected) ||
-                oldExpected === newExpected || oldAccepted !== `${oldExpected},${newExpected}` ||
-                proposedEnv?.INGEST_ACCEPT_GENERATIONS !== undefined)
+            // Documented G -> H generation-window closure, or the reviewed G+H -> G rollback.
+            if (!acceptGenerationsDeletionAllowed(input.sessionIngest, currentEnv, proposedEnv))
               refuse("native_binding_target");
             deletedValue = oldAccepted;
           } else if (b.sid === "INGEST_CUSTODY_SOURCE") {
