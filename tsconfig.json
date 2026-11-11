@@ -37,6 +37,7 @@
     "scripts/proof-ingest-s3-seed.ts",
     "scripts/sync-ingest-seed-boundary.ts",
     "scripts/schema-release-*.ts",
+    "scripts/pg-proof/schema-rehearsal*.ts",
     "scripts/proof-buffered-gc-runtime.ts",
     "scripts/native-agent-catalog-activation.ts",
     "scripts/proof-native-agent-catalog-activation.ts",
