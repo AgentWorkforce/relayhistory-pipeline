@@ -9,7 +9,7 @@ DO $rollback_guard$ DECLARE v_later boolean;v_sha text; BEGIN
  EXECUTE 'SELECT EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE ''upstream:%'' AND name COLLATE "C">''upstream:20261105050010_operator_session_erase_fence_check.sql'')' INTO v_later;
  IF v_later THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator erase fence check: a later migration is applied; roll it back first';END IF;
  EXECUTE 'SELECT sha256 FROM sessions.__96bulls_migrations WHERE name=''upstream:20261105050010_operator_session_erase_fence_check.sql''' INTO v_sha;
- IF v_sha IS DISTINCT FROM '4e334c1f5ee31327a3214a00818ee293c6f8389a3e2715477e18086ad2314b67'
+ IF v_sha IS DISTINCT FROM '1809d6be0961f9b3db0c89f8204d7058299b778d4a96445809d8bc01561f4196'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator erase fence check: own applied checksum required';END IF;
  IF EXISTS(SELECT 1 FROM sessions.session_erasure_fences) THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator erase fence check: erase fences exist; refusing to remove enforcement';END IF;
