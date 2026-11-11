@@ -31,7 +31,9 @@
  *                                           would tell the Desktop to discard a good token)
  *
  * Identity is only what relaycontrol answers (org, workspace, sub, allowlisted
- * scopes). No `control` (ordered-control) field is ever produced here.
+ * scopes, and when sent the live role and the organization's capture policy,
+ * enforced by capture-policy.ts). No `control` (ordered-control) field is ever
+ * produced here.
  */
 import {
   createRelaycontrolIntrospector,
@@ -111,6 +113,11 @@ export function relaycontrolIngestIdentity(config: SelfhostAuthConfig, introspec
     if (!auth.userId || !auth.orgId || !auth.workspaceId) throw new AuthError(401, "invalid_token", "invalid or expired token");
     const scopes = [...auth.scopes];
     if (!scopes.includes(SYNC_SCOPE)) throw new AuthError(403, "forbidden", `missing required scope: ${SYNC_SCOPE}`);
-    return { userId: auth.userId, orgId: auth.orgId, workspaceId: auth.workspaceId, scopes };
+    // The capture policy and role (introspection v1.5) only when relaycontrol sent them (capture-policy.ts).
+    return {
+      userId: auth.userId, orgId: auth.orgId, workspaceId: auth.workspaceId, scopes,
+      ...(auth.role !== undefined ? { role: auth.role } : {}),
+      ...(auth.capturePolicy ? { capturePolicy: auth.capturePolicy } : {}),
+    };
   };
 }

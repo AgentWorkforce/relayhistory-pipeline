@@ -46,7 +46,11 @@
  *                              (stacks/aws/__tests__/upload-inbox-infra.test.ts). On: needs
  *                              `transcriptStore.uploadControlRoleArn` (relay-control's role, the only
  *                              principal the desktop-upload role trusts) and `transcriptStore.sessionPipeline`
- *                              (the notification writer puts both queue rules in one configuration).
+ *                              (the notification writer puts both queue rules in one configuration),
+ *                              and `transcriptStore.uploadInboxSse: "aws:kms"` (exactly; the consumer
+ *                              runs with HISTORY_UPLOAD_INBOX_SSE=aws:kms, returned as
+ *                              `uploadInbox.consumerEnvironment`; "none", "" or unset refuse here and are
+ *                              for self-host only).
  *                              Declares the desktop-upload role (create-only SSE-KMS PutObject under
  *                              `96bulls/.upload-inbox/*`), the upload-admission consumer role, the
  *                              upload-admission queue + DLQ + alarms, their key-policy grants, and the
@@ -71,11 +75,13 @@ import {
   UPLOAD_ADMISSION_MAX_RECEIVE_COUNT,
   UPLOAD_ADMISSION_QUEUE_RETENTION,
   UPLOAD_ADMISSION_VISIBILITY_TIMEOUT_SECONDS,
+  assertHostedUploadInboxSse,
   assertUploadControlRoleArn,
   denyUploadInboxStatement,
   desktopUploadPolicy,
   desktopUploadTrustPolicy,
   uploadAdmissionDlqPolicy,
+  uploadAdmissionEnvironment,
   uploadAdmissionPolicy,
   uploadAdmissionQueuePolicy,
   uploadAdmissionTrustPolicy,
@@ -144,6 +150,12 @@ export interface TranscriptStoreInputs {
    * Read only when the stage's `historyUploadDirectInfra` is on; inert otherwise.
    */
   uploadControlRoleArn?: string;
+  /**
+   * The upload-admission consumer's SSE requirement (HISTORY_UPLOAD_INBOX_SSE). Hosted only ever
+   * accepts exactly "aws:kms"; any other value refuses. Required when `historyUploadDirectInfra`
+   * is on; inert otherwise.
+   */
+  uploadInboxSse?: "aws:kms";
   /**
    * The session pipeline (session-pipeline.ts): S3 manifest events -> SQS -> Lambda -> Supabase
    * pointer + ClickHouse index. Omit for the store alone.
@@ -251,10 +263,11 @@ export function assertTranscriptStoreInputs(
   if (inputs.region !== TRANSCRIPT_REGION) refuse(`transcript content must stay in ${TRANSCRIPT_REGION} (migration plan, regional boundaries), got ${inputs.region}`);
   if (inputs.partition !== TRANSCRIPT_PARTITION) refuse(`partition must be exactly ${TRANSCRIPT_PARTITION}, got ${JSON.stringify(inputs.partition)}`);
   for (const k of Object.keys(store))
-    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "uploadControlRoleArn" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn") refuse(`transcriptStore.${k} is not a known setting`);
+    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "uploadControlRoleArn" && k !== "uploadInboxSse" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn") refuse(`transcriptStore.${k} is not a known setting`);
   assertBufferedGcRoleArn(store.bufferedGcRoleArn, inputs.accountId);
   assertInboxAuthorityKeyRoot(store.inboxAuthorityKeyRoot, refuse);
   assertUploadControlRoleArn(store.uploadControlRoleArn, refuse);
+  assertHostedUploadInboxSse(store.uploadInboxSse, false, refuse);
   if (store.sessionPipeline !== undefined) assertSessionPipelineInputs(store.sessionPipeline, refuse);
   if (store.sessionReadApi !== undefined) assertSessionReadApiInputs(store.sessionReadApi, refuse);
   if (store.managementEvents !== undefined && typeof store.managementEvents !== "boolean") refuse("transcriptStore.managementEvents must be a boolean");
@@ -1559,6 +1572,10 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       assertUploadControlRoleArn(i.transcriptStore.uploadControlRoleArn, refuse);
       if (i.transcriptStore.uploadControlRoleArn === undefined) refuse("transcriptStore.uploadControlRoleArn is required (the only principal the desktop-upload role trusts)");
       if (i.transcriptStore.sessionPipeline === undefined) refuse("transcriptStore.sessionPipeline is required (one notification configuration carries both queue rules)");
+      assertHostedUploadInboxSse(i.transcriptStore.uploadInboxSse, true, refuse);
+    } else if (i.transcriptStore.uploadInboxSse !== undefined) {
+      // Inert while off, but a hosted input never names anything but aws:kms.
+      assertHostedUploadInboxSse(i.transcriptStore.uploadInboxSse, false, (why) => { throw new Error(`96bulls: ${i.stage}: ${why}. Nothing was created.`); });
     }
     const n = transcriptNames(i.stage, i.accountId);
     const eraserArn = userArn(i.accountId, n.userPath, n.eraser);
@@ -1735,7 +1752,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
 
     // historyUploadDirectInfra: S3 (this bucket only) -> upload-admission queue -> the consumer
     // Lambda (a separate change). Same shape as the session-events queue (session-pipeline.ts).
-    let uploadInbox: { queueUrl: string; queueArn: unknown; dlqArn: unknown; uploadRoleArn: string; consumerRoleArn: string } | undefined;
+    let uploadInbox: { queueUrl: string; queueArn: unknown; dlqArn: unknown; uploadRoleArn: string; consumerRoleArn: string; consumerEnvironment: ReturnType<typeof uploadAdmissionEnvironment> } | undefined;
     if (uploadInboxRoles) {
       const uploadDlq = yield* AWS.SQS.Queue("upload-admission-dlq", {
         queueName: u.dlq,
@@ -1786,6 +1803,8 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
         dlqArn: uploadDlq.queueArn,
         uploadRoleArn: uploadInboxRoles.uploadRoleArn,
         consumerRoleArn: uploadInboxRoles.consumerRoleArn,
+        // The consumer Lambda (a separate change) takes its environment from here: HISTORY_UPLOAD_INBOX_SSE=aws:kms.
+        consumerEnvironment: uploadAdmissionEnvironment(i.transcriptStore.uploadInboxSse!),
       };
     }
 
