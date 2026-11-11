@@ -26,7 +26,7 @@ test("strict pooler/project/owner pins and URL options cannot weaken TLS", () =>
   expect(releaseConnection(url).host).toBe(P.host);
   for (const bad of [
     url.replace(P.project, "foreign"),
-    url.replace(P.owner, "postgres"),
+    url.replace(P.owner, "foreign_owner"),
     url.replace(P.host, "evil.example"),
     url.replace(":5432/", ":6543/"),
     url.replace("/postgres?", "/other?"),
@@ -403,8 +403,8 @@ test("operator inspection starts READ ONLY and rolls back on wrong owner without
         return {
           rows: [
             {
-              me: "postgres",
-              session: "postgres",
+              me: "foreign_owner",
+              session: "foreign_owner",
               db: "postgres",
               rolcanlogin: true,
             },
@@ -421,6 +421,83 @@ test("operator inspection starts READ ONLY and rolls back on wrong owner without
   expect(
     statements.some((s) => /CREATE|ALTER|GRANT|INSERT|UPDATE|DELETE/.test(s)),
   ).toBe(false);
+});
+test("operator inspection accepts only the observed exact postgres owner shape", async () => {
+  const { inspectRelease } = await import("../schema-release-inspect.ts");
+  const statements: string[] = [];
+  const client = {
+    query: async (sql: string) => {
+      statements.push(sql);
+      if (sql.includes("current_user AS me"))
+        return {
+          rows: [
+            {
+              me: P.owner,
+              session: P.owner,
+              db: P.database,
+              rolcanlogin: true,
+              rolsuper: false,
+              rolcreaterole: true,
+              rolcreatedb: true,
+              rolbypassrls: true,
+              rolreplication: true,
+              schema_owner: P.owner,
+            },
+          ],
+        };
+      if (sql.includes("pg_advisory_xact_lock")) throw new Error("after_identity");
+      return { rows: [] };
+    },
+  };
+  await expect(
+    inspectRelease(client as any, "global-default-revoke"),
+  ).rejects.toThrow("after_identity");
+  expect(statements.at(-1)).toBe("ROLLBACK");
+  expect(statements.some((s) => s.includes("pg_advisory_xact_lock"))).toBe(true);
+});
+test("operator inspection refuses every owner-identity attribute drift before locking", async () => {
+  const { inspectRelease } = await import("../schema-release-inspect.ts");
+  const exact = {
+    me: P.owner,
+    session: P.owner,
+    db: P.database,
+    rolcanlogin: true,
+    rolsuper: false,
+    rolcreaterole: true,
+    rolcreatedb: true,
+    rolbypassrls: true,
+    rolreplication: true,
+    schema_owner: P.owner,
+  };
+  for (const drift of [
+    { me: "foreign_owner" },
+    { session: "foreign_owner" },
+    { db: "foreign_db" },
+    { rolcanlogin: false },
+    { rolsuper: true },
+    { rolcreaterole: false },
+    { rolcreatedb: false },
+    { rolbypassrls: false },
+    { rolreplication: false },
+    { schema_owner: "foreign_owner" },
+  ]) {
+    const statements: string[] = [];
+    const client = {
+      query: async (sql: string) => {
+        statements.push(sql);
+        if (sql.includes("current_user AS me"))
+          return { rows: [{ ...exact, ...drift }] };
+        return { rows: [] };
+      },
+    };
+    await expect(
+      inspectRelease(client as any, "global-default-revoke"),
+    ).rejects.toThrow("release_owner");
+    expect(statements.at(-1)).toBe("ROLLBACK");
+    expect(statements.some((s) => s.includes("pg_advisory_xact_lock"))).toBe(
+      false,
+    );
+  }
 });
 test("operator plan refuses apply mode before reading a secret or connecting", () => {
   const r = Bun.spawnSync(

@@ -6,7 +6,10 @@ export const SCHEMA_RELEASE = {
   host: "aws-0-us-east-1.pooler.supabase.com",
   port: 5432,
   database: "postgres",
-  owner: "relayhistory_owner",
+  // Supabase's privileged project owner is the proven production migration
+  // authority. The workflow pins its exact non-superuser attribute shape and
+  // never grants or creates a role to make an inspection pass.
+  owner: "postgres",
   runtime: "bulls96_runtime",
   dispatcher: { login: "khaliqgant", id: 1724137 },
   workflow: ".github/workflows/apply-session-schema.yml",

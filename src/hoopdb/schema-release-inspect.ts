@@ -45,7 +45,7 @@ export async function inspectRelease(
   try {
     const me = (
       await client.query(
-        "SELECT current_user AS me, session_user AS session, current_database() AS db, r.rolcanlogin, r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolbypassrls, r.rolreplication FROM pg_roles r WHERE r.rolname = current_user",
+        "SELECT current_user AS me, session_user AS session, current_database() AS db, r.rolcanlogin, r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolbypassrls, r.rolreplication, (SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname='sessions') AS schema_owner FROM pg_roles r WHERE r.rolname = current_user",
       )
     ).rows[0];
     if (
@@ -53,12 +53,13 @@ export async function inspectRelease(
       me.me !== P.owner ||
       me.session !== P.owner ||
       me.db !== P.database ||
-      !me.rolcanlogin ||
-      me.rolsuper ||
-      me.rolcreaterole ||
-      me.rolcreatedb ||
-      me.rolbypassrls ||
-      me.rolreplication
+      me.rolcanlogin !== true ||
+      me.rolsuper !== false ||
+      me.rolcreaterole !== true ||
+      me.rolcreatedb !== true ||
+      me.rolbypassrls !== true ||
+      me.rolreplication !== true ||
+      me.schema_owner !== P.owner
     )
       refuse("release_owner");
     await client.query("SELECT pg_advisory_xact_lock(961996, 1)");
