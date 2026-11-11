@@ -51,7 +51,7 @@ describe("owner operator plan bootstrap section (pure, no network)", () => {
   const steps = readdirSync(new URL("supabase/migrations/", repo)).filter(f => f.endsWith(".sql")).sort().map(f => `upstream:${f}`);
   const sha = "a".repeat(40);
   // The source sha's contract modules (HEAD's): contract_source "anchor".
-  const contract = { chainModule: readFileSync(new URL("src/hoopdb/session-bootstrap-chain.ts", repo)), consumersModule: readFileSync(new URL("src/hoopdb/session-bootstrap-consumers.ts", repo)) };
+  const contract = { rolesModule: readFileSync(new URL("src/hoopdb/session-bootstrap-roles.ts", repo)), consumersModule: readFileSync(new URL("src/hoopdb/session-bootstrap-consumers.ts", repo)) };
   const plan = (st: BootstrapState) => ownerPlanBootstrap(sha, steps, files, st, contract);
   const creator = (r: string, o: object = {}) => ({ role: r, member: "postgres", member_inherit: true, grantor: "supabase_admin", grantor_super: true, admin_option: true, inherit_option: false, set_option: false, ...o });
   const code = (f: () => unknown) => { try { f(); } catch (e) { return (e as { code?: string }).code; } return "none"; };

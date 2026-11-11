@@ -1,9 +1,7 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import {
-  SESSION_BOOTSTRAP_FILES,
-  SESSION_BOOTSTRAP_ROLES,
-} from "../session-bootstrap-chain.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
+import { SESSION_BOOTSTRAP_ROLES } from "../session-bootstrap-roles.ts";
 import { chainFileRoles } from "../session-bootstrap-consumers.ts";
 
 const root = new URL("../../../", import.meta.url);
@@ -61,4 +59,16 @@ test("contracts: only non-bare roles declare login, inbound members or settings"
   expect(all.buffered_search_feed_runtime.inbound).toBe("none");
   expect(all.bulls96_analysis_admit).toEqual({ login: "allowed", inbound: "unchecked", settings: "unchecked" });
   expect(all.search_consumer_runtime).toEqual({ login: "claimed-60s", inbound: "consumer", settings: "consumer" });
+});
+
+// The PR schema rehearsal (scripts/pg-proof/schema-rehearsal.ts) pins the WHOLE text of
+// the chain module at the release sha to the landing commit's bytes (refusing
+// rehearsal_seed_bootstrap_chain otherwise). So the role contract map lives in
+// session-bootstrap-roles.ts, and the chain module must change only when the chain file
+// list does. If the driver's pinned path ever moves, this test must move with it.
+test("the rehearsal-pinned chain module carries no role contract map", () => {
+  const chainModule = "src/hoopdb/session-bootstrap-chain.ts";
+  expect(readFileSync(new URL(chainModule, root), "utf8")).not.toMatch(/\bSESSION_BOOTSTRAP_ROLES\b/);
+  const driver = readFileSync(new URL("scripts/pg-proof/schema-rehearsal.ts", root), "utf8");
+  expect(driver).toContain(`const BOOTSTRAP_CHAIN = "${chainModule}";`);
 });

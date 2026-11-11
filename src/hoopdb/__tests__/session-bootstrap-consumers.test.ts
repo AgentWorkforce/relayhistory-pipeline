@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
-import { SESSION_BOOTSTRAP_FILES, SESSION_BOOTSTRAP_ROLES } from "../session-bootstrap-chain.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
+import { SESSION_BOOTSTRAP_ROLES } from "../session-bootstrap-roles.ts";
 import { SESSION_BOOTSTRAP_CONSUMERS, chainFileRoles, consumerStep } from "../session-bootstrap-consumers.ts";
 import {
   bootstrapChainRoles,

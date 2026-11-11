@@ -25,7 +25,8 @@ import {
   type BootstrapSection,
   type BootstrapState,
 } from "../schema-release-bootstrap.ts";
-import { SESSION_BOOTSTRAP_FILES, SESSION_BOOTSTRAP_ROLES } from "../session-bootstrap-chain.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
+import { SESSION_BOOTSTRAP_ROLES } from "../session-bootstrap-roles.ts";
 import { SESSION_BOOTSTRAP_CONSUMERS } from "../session-bootstrap-consumers.ts";
 
 const repo = new URL("../../../", import.meta.url);
@@ -102,15 +103,15 @@ const BEFORE = state([admit]);
 const AFTER = state([], { edges: [creatorEdge(admit)] });
 
 /** The anchor's contract modules: the HEAD module bytes (source "anchor"); null: an absent consumers module. */
-const CHAIN_MODULE_TEXT = realBytes("src/hoopdb/session-bootstrap-chain.ts").toString("utf8");
+const ROLES_MODULE_TEXT = realBytes("src/hoopdb/session-bootstrap-roles.ts").toString("utf8");
 const CONSUMERS_MODULE_TEXT = realBytes("src/hoopdb/session-bootstrap-consumers.ts").toString("utf8");
-const anchorContract = (chainModule = CHAIN_MODULE_TEXT, consumersModule: string | null = CONSUMERS_MODULE_TEXT): BootstrapAnchorContract => ({
-  chainModule,
+const anchorContract = (rolesModule = ROLES_MODULE_TEXT, consumersModule: string | null = CONSUMERS_MODULE_TEXT): BootstrapAnchorContract => ({
+  rolesModule,
   consumersModule: consumersModule ?? undefined,
 });
-/** A legacy anchor (Release A shape): no SESSION_BOOTSTRAP_ROLES section, no consumers module. */
+/** A legacy anchor (Release A shape): neither a roles module nor a consumers module. */
 const LEGACY: BootstrapAnchorContract = {
-  chainModule: "export const SESSION_BOOTSTRAP_FILES = [] as const; // legacy anchor\n",
+  rolesModule: undefined,
   consumersModule: undefined,
 };
 
@@ -553,19 +554,19 @@ test("positive: an early target creates only its required absent role and runs o
 
 // ---- Contract binding (review finding P2-1; DB owner ruling on the contract digest) ----
 
-/** The HEAD chain module text with `from` replaced by `to` (exactly once). */
-const chainText = (...edits: [string, string][]) =>
+/** The HEAD roles module text with `from` replaced by `to` (exactly once). */
+const rolesText = (...edits: [string, string][]) =>
   edits.reduce((t, [from, to]) => {
     expect(t.split(from).length).toBe(2);
     return t.replace(from, to);
-  }, CHAIN_MODULE_TEXT);
+  }, ROLES_MODULE_TEXT);
 const consumersText = (pairs: readonly (readonly [string, string])[]) =>
   "export const SESSION_BOOTSTRAP_CONSUMERS: readonly (readonly [role: string, firstConsumer: string])[] = [\n" +
   pairs.map(([r, f]) => `  [${JSON.stringify(r)}, ${JSON.stringify(f)}],\n`).join("") +
   "];\n";
 const READ_API_LINE = 'bulls96_read_api: bare("allowed", "none"),';
 /** Same SQL chain, different contract semantics: bulls96_read_api's inbound edge set. */
-const SEMANTIC_DRIFT = chainText([READ_API_LINE, 'bulls96_read_api: bare("allowed", "unchecked"),']);
+const SEMANTIC_DRIFT = rolesText([READ_API_LINE, 'bulls96_read_api: bare("allowed", "unchecked"),']);
 
 test("contract: CHAIN folds the composite contract digest; a contract or manifest change with identical SQL changes CHAIN", () => {
   const d = bootstrapContractDigests();
@@ -611,12 +612,13 @@ test("contract: CHAIN folds the composite contract digest; a contract or manifes
 
 test("contract (a): partial anchor modules refuse release_bootstrap_contract_drift before connecting and under the lock", async () => {
   const partial: [string, BootstrapAnchorContract][] = [
-    ["map without consumers module", anchorContract(CHAIN_MODULE_TEXT, null)],
-    ["consumers module without map", { chainModule: LEGACY.chainModule, consumersModule: CONSUMERS_MODULE_TEXT }],
-    ["map that does not parse", anchorContract(chainText([READ_API_LINE, "bulls96_read_api: bare(`allowed`, `none`),"]))],
-    ["consumers that do not parse", anchorContract(CHAIN_MODULE_TEXT, CONSUMERS_MODULE_TEXT.replace("];", "].map((x) => x);"))],
-    ["bare redefined", anchorContract(chainText(['settings: "unchecked" })', 'settings: "worker-2s" })']))],
-    ["prototype key", anchorContract(chainText([READ_API_LINE, READ_API_LINE + ' __proto__: bare("allowed", "none"),']))],
+    ["roles module without consumers module", anchorContract(ROLES_MODULE_TEXT, null)],
+    ["consumers module without roles module", { rolesModule: undefined, consumersModule: CONSUMERS_MODULE_TEXT }],
+    ["roles module without its SESSION_BOOTSTRAP_ROLES declaration", anchorContract(rolesText(["export const SESSION_BOOTSTRAP_ROLES:", "export const SESSION_BOOTSTRAP_ROLE_MAP:"]))],
+    ["map that does not parse", anchorContract(rolesText([READ_API_LINE, "bulls96_read_api: bare(`allowed`, `none`),"]))],
+    ["consumers that do not parse", anchorContract(ROLES_MODULE_TEXT, CONSUMERS_MODULE_TEXT.replace("];", "].map((x) => x);"))],
+    ["bare redefined", anchorContract(rolesText(['settings: "unchecked" })', 'settings: "worker-2s" })']))],
+    ["prototype key", anchorContract(rolesText([READ_API_LINE, READ_API_LINE + ' __proto__: bare("allowed", "none"),']))],
   ];
   for (const [name, contract] of partial) {
     expect({ name, pure: code(() => bootstrapContractSource(contract)) }).toEqual({ name, pure: "release_bootstrap_contract_drift" });
@@ -633,7 +635,7 @@ test("contract (b): semantic drift with an identical SQL chain refuses before co
     [
       "manifest pair",
       anchorContract(
-        CHAIN_MODULE_TEXT,
+        ROLES_MODULE_TEXT,
         consumersText(SESSION_BOOTSTRAP_CONSUMERS.map(([r, f]) => (r === admit ? [r, "20261105047000_coordination_fact_readers.sql"] : [r, f]))),
       ),
     ],
@@ -653,13 +655,13 @@ test("contract (b): semantic drift with an identical SQL chain refuses before co
 test("contract (c): key order, role order, file order, pair order and bare vs explicit are equal (anchor, same CHAIN)", async () => {
   const workerFields = 'login: "never",\n      inbound: "worker",\n      settings: "worker-2s",';
   const ingestPair = '    bulls96_privacy_eraser: bare("allowed", "unchecked"),\n    bulls96_babysitter_retention: bare("allowed", "unchecked"),\n';
-  const workerBlock = CHAIN_MODULE_TEXT.slice(
-    CHAIN_MODULE_TEXT.indexOf('  "supabase/bootstrap/session_directory_search_worker.sql": {'),
-    CHAIN_MODULE_TEXT.indexOf('  "supabase/bootstrap/session_token_verifier.sql": {'),
+  const workerBlock = ROLES_MODULE_TEXT.slice(
+    ROLES_MODULE_TEXT.indexOf('  "supabase/bootstrap/session_directory_search_worker.sql": {'),
+    ROLES_MODULE_TEXT.indexOf('  "supabase/bootstrap/session_token_verifier.sql": {'),
   );
   // The worker file's block moves last (file order), then the field/role/bare edits.
-  const end = CHAIN_MODULE_TEXT.lastIndexOf("\n};");
-  const moved = CHAIN_MODULE_TEXT.slice(0, end + 1) + workerBlock + CHAIN_MODULE_TEXT.slice(end + 1);
+  const end = ROLES_MODULE_TEXT.lastIndexOf("\n};");
+  const moved = ROLES_MODULE_TEXT.slice(0, end + 1) + workerBlock + ROLES_MODULE_TEXT.slice(end + 1);
   const reordered = [
     [workerFields, 'settings: "worker-2s", inbound: "worker", login: "never"'],
     [ingestPair, '    bulls96_babysitter_retention: bare("allowed", "unchecked"),\n    bulls96_privacy_eraser: bare("allowed", "unchecked"),\n'],
@@ -670,7 +672,7 @@ test("contract (c): key order, role order, file order, pair order and bare vs ex
   }, moved.replace(workerBlock, ""));
   const key = (f: string) => reordered.indexOf(`  "supabase/bootstrap/${f}.sql": {`);
   expect(key("session_directory_search_worker")).toBeGreaterThan(key("session_consumer_roles"));
-  expect(reordered).not.toBe(CHAIN_MODULE_TEXT);
+  expect(reordered).not.toBe(ROLES_MODULE_TEXT);
   const contract = anchorContract(reordered, consumersText([...SESSION_BOOTSTRAP_CONSUMERS].reverse()));
   expect(bootstrapContractSource(contract)).toBe("anchor");
   const p = plan(files(), BEFORE, T047, STEPS, contract);
@@ -691,11 +693,11 @@ test("contract (d): an extra or missing role in the release map or the anchor re
   expect(code(pre(extra))).toBe("release_bootstrap_contract_drift");
   // Anchor map or manifest missing a required role (same SQL).
   const narrative = '    bulls96_digest_narrative: bare("allowed", "unchecked"),\n';
-  expect(code(() => bootstrapContractSource(anchorContract(chainText([narrative, ""]))))).toBe("release_bootstrap_contract_drift");
+  expect(code(() => bootstrapContractSource(anchorContract(rolesText([narrative, ""]))))).toBe("release_bootstrap_contract_drift");
   expect(
-    code(() => bootstrapContractSource(anchorContract(CHAIN_MODULE_TEXT, consumersText(SESSION_BOOTSTRAP_CONSUMERS.filter(([r]) => r !== admit))))),
+    code(() => bootstrapContractSource(anchorContract(ROLES_MODULE_TEXT, consumersText(SESSION_BOOTSTRAP_CONSUMERS.filter(([r]) => r !== admit))))),
   ).toBe("release_bootstrap_contract_drift");
-  const r = await run({}, { contract: anchorContract(chainText([narrative, ""])) });
+  const r = await run({}, { contract: anchorContract(rolesText([narrative, ""])) });
   expect(r.code).toBe("release_bootstrap_contract_drift");
   expect(r.log).toEqual(underLockRefused);
   expectNoMutation(r);
@@ -729,7 +731,7 @@ test("contract (e): a contract swapped under the lock refuses before BEGIN with 
   const legacyPlan = plan(files(), BEFORE, T047, STEPS, LEGACY);
   const cases: [string, BootstrapSection, BootstrapAnchorContract, string][] = [
     ["anchor plan, drifted anchor under the lock", anchorPlan, anchorContract(SEMANTIC_DRIFT), "release_bootstrap_contract_drift"],
-    ["anchor plan, partial anchor under the lock", anchorPlan, anchorContract(CHAIN_MODULE_TEXT, null), "release_bootstrap_contract_drift"],
+    ["anchor plan, partial anchor under the lock", anchorPlan, anchorContract(ROLES_MODULE_TEXT, null), "release_bootstrap_contract_drift"],
     ["anchor plan, legacy anchor under the lock", anchorPlan, LEGACY, "release_bootstrap_plan_changed"],
     ["legacy plan, anchor modules under the lock", legacyPlan, anchorContract(), "release_bootstrap_plan_changed"],
   ];

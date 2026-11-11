@@ -1,7 +1,7 @@
 /**
- * Reviewed, static manifest: each bootstrap chain role (SESSION_BOOTSTRAP_ROLES) and its
- * FIRST consumer, the first supabase/migrations file, in name order, whose text contains
- * the role name as a whole word. A target-bound release requires (and its bootstrap
+ * Reviewed, static manifest: each bootstrap chain role (SESSION_BOOTSTRAP_ROLES in
+ * session-bootstrap-roles.ts) and its FIRST consumer, the first supabase/migrations
+ * file, in name order, whose text contains the role name as a whole word. A target-bound release requires (and its bootstrap
  * stage provisions) only the roles whose first consumer is at or before the bound
  * target; a role first consumed above the target is not required.
  *

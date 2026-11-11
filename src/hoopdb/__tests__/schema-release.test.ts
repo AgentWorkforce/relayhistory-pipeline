@@ -38,7 +38,8 @@ import {
   type BootstrapEdge,
   type BootstrapState,
 } from "../schema-release-bootstrap.ts";
-import { SESSION_BOOTSTRAP_FILES, SESSION_BOOTSTRAP_ROLES } from "../session-bootstrap-chain.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
+import { SESSION_BOOTSTRAP_ROLES } from "../session-bootstrap-roles.ts";
 import {
   refreshReleaseBoundary,
   releaseBoundaryDigest,
@@ -1267,7 +1268,7 @@ const bsFiles = (
   }));
 /** The anchor's contract modules: HEAD's (contract_source "anchor"). */
 const bsContract = {
-  chainModule: bsBytes("src/hoopdb/session-bootstrap-chain.ts"),
+  rolesModule: bsBytes("src/hoopdb/session-bootstrap-roles.ts"),
   consumersModule: bsBytes("src/hoopdb/session-bootstrap-consumers.ts"),
 };
 /** The anchor's ordered schema steps: the HEAD upstream migrations (fixture). */

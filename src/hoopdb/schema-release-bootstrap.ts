@@ -10,8 +10,8 @@
  * tree, and only the roles whose first consumer (session-bootstrap-consumers.ts) sorts
  * at or before the target are required, created or checked. The release sha's bytes
  * are only compared (`differs`); a non-excluded file that differs refuses the stage.
- * The role contract map and the role-to-first-consumer manifest are the release sha's
- * reviewed modules; their domain-separated canonical digest is folded into CHAIN, and
+ * The role contract map (session-bootstrap-roles.ts) and the role-to-first-consumer
+ * manifest (session-bootstrap-consumers.ts) are the release sha's reviewed modules; their domain-separated canonical digest is folded into CHAIN, and
  * when the anchor carries both modules they must be canonically equal (else
  * release_bootstrap_contract_drift). Only an anchor carrying neither (a legacy anchor)
  * falls back to the release's modules (contract_source "release").
@@ -22,11 +22,8 @@
  */
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import {
-  SESSION_BOOTSTRAP_FILES,
-  SESSION_BOOTSTRAP_ROLES,
-  type BootstrapRoleContract,
-} from "./session-bootstrap-chain.ts";
+import { SESSION_BOOTSTRAP_FILES } from "./session-bootstrap-chain.ts";
+import { SESSION_BOOTSTRAP_ROLES, type BootstrapRoleContract } from "./session-bootstrap-roles.ts";
 import {
   SESSION_BOOTSTRAP_CONSUMERS,
   chainFileRoles,
@@ -253,12 +250,12 @@ export function bootstrapContractDigest(map?: ContractMap, consumers?: ContractP
 
 /**
  * The anchor's (target_sha) contract modules as read from the Git object database:
- * src/hoopdb/session-bootstrap-chain.ts (always present at an anchor; its
- * SESSION_BOOTSTRAP_ROLES section may be absent) and
- * src/hoopdb/session-bootstrap-consumers.ts (undefined: absent).
+ * src/hoopdb/session-bootstrap-roles.ts and src/hoopdb/session-bootstrap-consumers.ts
+ * (each undefined: absent). The map is never read from session-bootstrap-chain.ts,
+ * whose whole text the PR schema rehearsal pins to the landing commit's bytes.
  */
 export interface BootstrapAnchorContract {
-  chainModule: Buffer | string | undefined;
+  rolesModule: Buffer | string | undefined;
   consumersModule: Buffer | string | undefined;
 }
 
@@ -329,17 +326,17 @@ const oneOf = <T extends string>(v: string, allowed: readonly T[]): T =>
   (allowed as readonly string[]).includes(v) ? (v as T) : contractUnparsable();
 
 /**
- * The SESSION_BOOTSTRAP_ROLES map a session-bootstrap-chain.ts text declares, parsed as
- * data (never evaluated): undefined when the text never names SESSION_BOOTSTRAP_ROLES (a
- * legacy anchor). Accepted: an object literal of file-path keys, each an object literal
+ * The SESSION_BOOTSTRAP_ROLES map a session-bootstrap-roles.ts text declares, parsed as
+ * data (never evaluated). A text without exactly one `export const
+ * SESSION_BOOTSTRAP_ROLES` declaration refuses (the module's presence, not its
+ * contents, decides a legacy anchor). Accepted: an object literal of file-path keys, each an object literal
  * of role keys whose values are `{ login, inbound, settings }` object literals (keys in
  * any order, each exactly once) or `bare("<login>", "<inbound>")` calls, the latter only
  * when the text defines bare exactly as this release does (settings "unchecked").
  * Anything else, a duplicate key or an unknown value refuses
  * release_bootstrap_contract_drift.
  */
-export function chainModuleContract(text: string): ContractMap | undefined {
-  if (!/\bSESSION_BOOTSTRAP_ROLES\b/.test(text)) return undefined;
+export function rolesModuleContract(text: string): ContractMap {
   const next = contractTokens(text, contractValueStart(text, "SESSION_BOOTSTRAP_ROLES", "{"));
   const want = (v: string) => {
     const k = next();
@@ -439,8 +436,8 @@ export function consumersModuleContract(text: string): [string, string][] {
 /**
  * Where the role contract and the manifest come from, refusing
  * release_bootstrap_contract_drift (never falling back) when target_sha carries exactly
- * one of the two contract modules (the SESSION_BOOTSTRAP_ROLES section of
- * session-bootstrap-chain.ts, session-bootstrap-consumers.ts), when either present module
+ * one of the two contract modules (session-bootstrap-roles.ts,
+ * session-bootstrap-consumers.ts), when either present module
  * does not parse, or when the anchor's map or manifest differs canonically from the
  * release's (`map` / `consumers`: key order, file order and pair order are not
  * differences; any value is). Both present and equal: "anchor" (authoritative; the
@@ -455,12 +452,15 @@ export function bootstrapContractSource(
 ): BootstrapContractSource {
   const text = (b: Buffer | string | undefined) =>
     b === undefined ? undefined : Buffer.from(b).toString("utf8");
-  const anchorMap = chainModuleContract(text(anchor.chainModule) ?? "");
+  const rolesText = text(anchor.rolesModule);
   const consumersText = text(anchor.consumersModule);
-  if (anchorMap === undefined && consumersText === undefined) return "release";
-  if (anchorMap === undefined || consumersText === undefined)
+  if (rolesText === undefined && consumersText === undefined) return "release";
+  if (rolesText === undefined || consumersText === undefined)
     refuse("release_bootstrap_contract_drift");
-  const anchorDigests = bootstrapContractDigests(anchorMap, consumersModuleContract(consumersText!));
+  const anchorDigests = bootstrapContractDigests(
+    rolesModuleContract(rolesText!),
+    consumersModuleContract(consumersText!),
+  );
   const release = bootstrapContractDigests(map, consumers);
   if (
     anchorDigests.contract_map_digest !== release.contract_map_digest ||
@@ -1298,6 +1298,7 @@ export function bootstrapReadbackVerdict(x: {
 }
 
 const CHAIN_MODULE = "src/hoopdb/session-bootstrap-chain.ts";
+const ROLES_MODULE = "src/hoopdb/session-bootstrap-roles.ts";
 const CONSUMERS_MODULE = "src/hoopdb/session-bootstrap-consumers.ts";
 /** One blob from the Git object database (never the working tree); undefined: absent. */
 function gitBlob(repo: string, sha: string, file: string) {
@@ -1362,15 +1363,17 @@ export function releaseBootstrapFiles(
  * The anchor's (target_sha) contract modules from the Git object database, read like
  * releaseBootstrapFiles (git cat-file argv, no shell, env limited to PATH). The release
  * side is this checkout's imported modules (the release sha). target_sha must be 40 hex
- * and its session-bootstrap-chain.ts must exist (else release_bootstrap_chain); a
- * consumers module that cannot be read reads as absent, which bootstrapContractSource
- * refuses unless the chain module also carries no SESSION_BOOTSTRAP_ROLES section.
+ * and its session-bootstrap-chain.ts (the SESSION_BOOTSTRAP_FILES list) must exist (else
+ * release_bootstrap_chain). A roles or consumers module that cannot be read reads as
+ * absent, which bootstrapContractSource refuses unless the other is absent too.
  */
 export function releaseBootstrapContract(repo: string, targetSha: string): BootstrapAnchorContract {
   if (!/^[0-9a-f]{40}$/.test(targetSha)) refuse("release_bootstrap_chain");
-  const chainModule = gitBlob(repo, targetSha, CHAIN_MODULE);
-  if (chainModule === undefined) refuse("release_bootstrap_chain");
-  return { chainModule, consumersModule: gitBlob(repo, targetSha, CONSUMERS_MODULE) };
+  if (gitBlob(repo, targetSha, CHAIN_MODULE) === undefined) refuse("release_bootstrap_chain");
+  return {
+    rolesModule: gitBlob(repo, targetSha, ROLES_MODULE),
+    consumersModule: gitBlob(repo, targetSha, CONSUMERS_MODULE),
+  };
 }
 
 interface Queryable {
