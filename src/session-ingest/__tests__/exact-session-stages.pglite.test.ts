@@ -103,16 +103,22 @@ test("050030 down requires its ledger, exact checksum/body and no later migratio
  expect((await f.db.query("SELECT prosrc FROM pg_proc WHERE oid='sessions.buffered_session_stages_for(text,text,text,text,text,text,text,text,boolean,text)'::regprocedure")).rows).toEqual(before);
 });
 
-test("050030 mixed-claim regression: 17 claims / 6939 records return only the requested groups", async () => {
+test("050030 mixed-claim regression: 17 claims / 170 groups / 6939 records, 177 target ordinals", async () => {
  const f=await fixture();
+ let unrelatedGroup=0;
  for(let batch=0;batch<17;batch++){
-  const groups:Array<[string,string,string[]]>=[["droid","fixture-wide-target",[`${batch}-target-a`,`${batch}-target-b`]]];
-  for(let session=0;session<81;session++)groups.push(["droid",`fixture-wide-other-${session}`,Array.from({length:5},(_,record)=>`${batch}-${session}-${record}`)]);
-  groups.push(["codex","fixture-wide-extra",Array.from({length:batch===16?4:1},(_,i)=>`${batch}-extra-${i}`)]);
+  // Synthetic values, matching aggregate incident shape only: 16*10+17 target records.
+  const groups:Array<[string,string,string[]]>=[["droid","fixture-wide-target",Array.from({length:batch===16?17:10},(_,i)=>`${batch}-target-${i}`)]];
+  // 153 unrelated groups: 30*45+123*44 records = 6762.
+  for(let session=0;session<9;session++){
+   const count=unrelatedGroup++<30?45:44;
+   groups.push([session%2?"codex":"droid",`fixture-wide-other-${session}`,Array.from({length:count},(_,record)=>`${batch}-${session}-${record}`)]);
+  }
   await f.deliver(groups);
  }
  await f.enableAll();await f.prove();
  expect((await f.db.query("SELECT count(*)::int claims,sum(jsonb_array_length(records))::int records FROM sessions.ingest_claim_attempts")).rows).toEqual([{claims:17,records:6939}]);
+ expect((await f.db.query("SELECT sum(jsonb_array_length(group_ordinals))::int groups FROM sessions.ingest_stage_intents")).rows).toEqual([{groups:170}]);
  const start=performance.now();
  const before=await f.stages("ref044090.stages","droid","fixture-wide-target");
  const frozenMs=performance.now()-start;
@@ -121,7 +127,7 @@ test("050030 mixed-claim regression: 17 claims / 6939 records return only the re
  const targetMs=performance.now()-next;
  expect(after).toEqual(before);
  expect(after).toHaveLength(17);
- expect(after.reduce((n,r)=>n+r.kept_ordinals.length,0)).toBe(34);
+ expect(after.reduce((n,r)=>n+r.kept_ordinals.length,0)).toBe(177);
  expect(after.every(r=>r.group_indexes.length===1&&r.group_indexes[0]===0)).toBe(true);
- console.log(JSON.stringify({qualification:"synthetic PGlite full-function, timing diagnostic only; no latency assertion",claims:17,expandedRecords:6939,targetRecords:34,frozenMs,targetMs}));
+ console.log(JSON.stringify({qualification:"synthetic PGlite full-function, timing diagnostic only; no latency assertion or target-heavy work bound",claims:17,groups:170,expandedRecords:6939,targetRecords:177,frozenMs,targetMs}));
 });

@@ -13,6 +13,18 @@ Stage-wide malformed/duplicate-ordinal validation still covers unrelated groups.
 Scope, G2, head, generation, admission, deletion, reset, epoch, keep, native ownership
 and ACK checks are retained. The gate-off fallback is unchanged.
 
+This removes unrelated-group privacy work only; it does not cap the number of
+requested-session records checked in one RPC. The separate default-off paged follow-up
+(050050) owns that target-heavy work bound. An independent synthetic PGlite check with
+all 6,939 records in the target session returned the correct 17 rows / 6,939 ordinals
+in about 10.1 seconds. The mixed-batch regression asserts correctness/equivalence and
+counts only, with no timing budget assertion or production latency guarantee.
+
+For corrupt jsonb, query-plan evaluation can differ between error and empty output:
+`target_groups` evaluates record/group resolution before judging, while unrelated epoch
+entries may no longer be evaluated. Both paths fail closed; this change does not promise
+identical error codes for every corrupt input or make malformed data visible.
+
 The existing function remains callable. There are no new indexes or data writes in
 this migration, and list/search behavior is unchanged.
 
@@ -34,15 +46,16 @@ changes, ACK changes, resets, missing/duplicate/malformed records and groups. A 
 reverse-normalization test proves that the new group filter and join are the only body
 changes. Migration preflight and read-role-only function ACLs are checked separately.
 
-A disposable local PostgreSQL 15.17 query-core experiment used four batches with 50
-sessions and five records per session (250 records per batch). Results were identical:
+A disposable local PostgreSQL 15.17 query-core experiment used 17 mixed-session
+claims with 170 groups, 6,939 records and 177 target ordinals across 17 target groups,
+matching the incident aggregate shape with synthetic values. Results were identical:
 
 | Plan mode | Frozen warm p50 / p95 | Narrowed warm p50 / p95 |
 | --- | --- | --- |
-| Default | 79 / 101 ms | 18 / 31 ms |
-| Forced generic | 72 / 103 ms | 12 / 17 ms |
+| Default | 288 / 312 ms | 41 / 46 ms |
+| Forced generic | 289 / 308 ms | 40 / 52 ms |
 
-Each series used one cold and eleven warm calls. These are synthetic SQL-core timings;
+Each series used one cold and five warm calls. These are synthetic SQL-core timings;
 they exclude the entry scope/G2 call, network, S3 and UI. They do not establish the
 production slow request's plan or guarantee its latency. The production discriminator
 is a bounded before/after plan and one actual normal read after an approved activation.
@@ -53,7 +66,12 @@ Code integration does not activate the path. Migration and production flag chang
 require the production operator's explicit authorization.
 
 1. Land predecessors 050000/050010 (#506) and 050020 (#514) before this assigned 050030
-   slot, then apply through the canonical migrator. Do not rewrite the landed 044090
+   slot. In event-trigger boundary mode, refresh the reviewed
+   `supabase/bootstrap/hoopdb_sessions_function_boundary_supabase.sql` bootstrap and
+   embedded manifest from the same image before migrate; its pinned body changes with
+   the new RPC, and a stale installed boundary refuses validation. Follow the existing
+   [function-boundary operator procedure](session-directory-search-worker-bootstrap.md#function-boundary).
+   Then apply through the canonical migrator. Do not rewrite the landed 044090
    file or replace its function out of band. The new migration refuses an unexpected
    old function body, owner or attributes, and refuses a pre-existing target function.
 2. Verify the new function's manifest, read-role ACL and migration sentinel. Keep the
