@@ -76,7 +76,7 @@ import type { AddressInfo } from "node:net";
 import { Readable } from "node:stream";
 import pg from "pg";
 import { errorFields, log } from "../shared/log.ts";
-import { initScrubEngine, scrubEngineReady } from "@rhc/lib/scrub-engine/index.ts";
+import { initScrubEngine, routedRawChunkSealerDeps, scrubEngineReady } from "@rhc/lib/scrub-engine/index.ts";
 import { assertConditionalWrites, buildLockerStore } from "../shared/locker.ts";
 import type { ObjectStore } from "../shared/vendor.ts";
 import { AuthError } from "../session-read-api/app.ts";
@@ -195,7 +195,8 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   const deliver: DeliverDeps = {
     ledger: sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection }),
     acceptanceMode: "canonical",
-    target: { store: parts.store, keyRoot: settings.keyRoot },
+    // SCRUB_ENGINE=wasm-bindgen: the sealer bound to the verified instance; otherwise {} (unchanged).
+    target: { store: parts.store, keyRoot: settings.keyRoot, ...routedRawChunkSealerDeps() },
     // Slot TTL past any request this process serves, so a lost release frees itself (Worker: 90).
     slots: { maxPerUser: settings.maxPerUser, maxPerOrg: settings.maxPerOrg, ttlSeconds: 90 },
     // inlineMaxSessions unset: always inline, so `fanout` is never needed (see the header).

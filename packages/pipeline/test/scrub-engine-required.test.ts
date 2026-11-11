@@ -2,7 +2,8 @@
  * SCRUB_ENGINE_REQUIRED (default off): refuses a selection whose SCRUB_ENGINE kind
  * differs from the required one, permanently for the process, and never falls back to
  * TypeScript. It never selects or initialises anything itself, so a wasm-bindgen
- * requirement with the placeholder pin still refuses through the bindgen refusals.
+ * requirement with the checked-in alpha.4 pin at the default reader ceiling still refuses
+ * through the bindgen refusals, and under it only the exact checked-in pin is ready.
  * Module state (`selected`, the sticky refusal) is reset per case by resetScrubEngineForTests,
  * as in scrub-engine-bindgen.test.ts; process.env is saved and restored around each case.
  */
@@ -111,7 +112,7 @@ describe("SCRUB_ENGINE_REQUIRED matching SCRUB_ENGINE", () => {
     }
   });
 
-  it("required=wasm-bindgen with a verified (test-double) bindgen engine is ready", async () => {
+  it("required=wasm-bindgen with a verified test-double pin (not the checked-in pin) is NOT ready: bindgen_pin_not_exact", async () => {
     const bytes = { wasm: enc.encode("synthetic wasm"), glue: enc.encode("synthetic glue"), loader: enc.encode("synthetic loader") };
     const manifest = { schema: 3, ruleset: "relayhistory-scrub", rulesetVersion: 10, rulesetSourceSha256: "a".repeat(64), crateVersion: "0.0.0-test", abiVersion: 2, policy: "secrets", redactionToken: "[REDACTED]", scrubProfile: "fixture-v10" };
     const pin = { schema: 1, package: "@agentworkforce/relayscrubber", package_version: manifest.crateVersion, wasm_sha256: sha(bytes.wasm), glue_sha256: sha(bytes.glue), loader_sha256: sha(bytes.loader), paths: { wasm: "t.wasm", glue: "t.js", loader: "index.js" }, scrub_profile: bindgenProfile(manifest), manifest };
@@ -120,8 +121,10 @@ describe("SCRUB_ENGINE_REQUIRED matching SCRUB_ENGINE", () => {
       bindgen: { pin, readArtifact: async (name) => bytes[name], importGlue: async () => ({ default: async () => ({}), manifestJson: () => JSON.stringify(manifest), scrubTextChecked: (s: string) => s, scrubJson: (s: string) => JSON.stringify({ jsonText: s }), scrubRecords: () => JSON.stringify({ text: "x\n", recordCount: 1 }) }) },
     });
     expect(engine.kind).toBe("wasm-bindgen");
-    expect(activeScrubEngine()).toBe(engine);
-    expect(scrubEngineReady()).toBe(true);
+    expect(() => activeScrubEngine()).toThrow(expect.objectContaining({ reason: "bindgen_pin_not_exact" }));
+    expect(scrubEngineReady()).toBe(false);
+    expect(scrubTextForLog("token=abc")).toBe(SCRUB_UNAVAILABLE_LOG_TEXT);
+    // The positive case (exact checked-in pin, real vendored bytes) is in scrub-bindgen-readiness.test.ts.
   });
 });
 
@@ -164,12 +167,12 @@ describe("SCRUB_ENGINE_REQUIRED refuses another selection", () => {
 });
 
 describe("SCRUB_ENGINE_REQUIRED=wasm-bindgen does not bypass the bindgen refusals", () => {
-  it("checked-in placeholder pin: the bindgen refusal stands, never TypeScript", async () => {
+  it("checked-in alpha.4 pin without READER_MAX_RULESET=10: the reader-ceiling refusal stands, never TypeScript", async () => {
     const env = { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen" };
     const error = await initScrubEngine({ env }).then(() => null, (e: unknown) => e);
     expect(error).toBeInstanceOf(ScrubEngineUnavailable);
-    expect((error as ScrubEngineUnavailable).reason).toBe("bindgen_unpinned_package_version");
-    expect(() => activeScrubEngine()).toThrow(expect.objectContaining({ reason: "bindgen_unpinned_package_version" }));
+    expect((error as ScrubEngineUnavailable).reason).toBe("bindgen_ruleset_above_reader_ceiling");
+    expect(() => activeScrubEngine()).toThrow(expect.objectContaining({ reason: "bindgen_ruleset_above_reader_ceiling" }));
     expect(scrubEngineReady()).toBe(false);
     expect(scrubTextForLog("token=abc")).toBe(SCRUB_UNAVAILABLE_LOG_TEXT);
   });

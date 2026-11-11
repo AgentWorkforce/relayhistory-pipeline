@@ -40,6 +40,30 @@ import {
 import { importGlueFromVerifiedBytes, initBindgenScrubEngine } from "../src/lib/scrub-engine/bindgen-engine.js";
 import pinFile from "../scrub-bindgen-pin.json";
 
+/** The placeholder pin checked in before the alpha.4 cutover (kept here as a refusal fixture). */
+const PLACEHOLDER_PIN = Object.freeze({
+  schema: 1,
+  package: "@agentworkforce/relayscrubber",
+  package_version: "UNPINNED",
+  wasm_sha256: "0".repeat(64),
+  glue_sha256: "0".repeat(64),
+  loader_sha256: "0".repeat(64),
+  paths: { wasm: "generated/relayscrubber_bg.wasm", glue: "generated/relayscrubber.js", loader: "index.js" },
+  scrub_profile: "UNPINNED",
+  manifest: {
+    schema: 3,
+    ruleset: "UNPINNED",
+    rulesetVersion: 0,
+    rulesetSourceSha256: "0".repeat(64),
+    crateVersion: "UNPINNED",
+    abiVersion: 0,
+    policy: "UNPINNED",
+    redactionToken: "UNPINNED",
+    scrubProfile: "UNPINNED",
+  },
+  placeholder: "PLACEHOLDER",
+});
+
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 const sha = (b: Uint8Array | string) => createHash("sha256").update(b).digest("hex");
@@ -312,16 +336,18 @@ describe("wasm-bindgen: happy path with doubles", () => {
 // ---------------------------------------------------------------- pins
 
 describe("wasm-bindgen: placeholder and malformed pins are refused by name", () => {
-  it("the checked-in pin is the placeholder", () => {
-    expect(() => parseScrubBindgenPin(pinFile)).toThrow(expect.objectContaining({ reason: "bindgen_unpinned_package_version" }));
+  it("the historical placeholder pin is refused; the checked-in alpha.4 pin is refused at the default reader ceiling", () => {
+    expect(() => parseScrubBindgenPin(PLACEHOLDER_PIN)).toThrow(expect.objectContaining({ reason: "bindgen_unpinned_package_version" }));
+    expect(() => parseScrubBindgenPin(pinFile)).toThrow(expect.objectContaining({ reason: "bindgen_ruleset_above_reader_ceiling" }));
+    expect(parseScrubBindgenPin(pinFile, 10).package_version).toBe("0.5.0-alpha.4");
   });
 
   it("SCRUB_ENGINE=wasm-bindgen with the checked-in pin and default reader is unavailable, and every call site refuses", async () => {
     const error = await initError({ env: { SCRUB_ENGINE: "wasm-bindgen" } });
     expect(error).toBeInstanceOf(ScrubEngineUnavailable);
-    expect((error as ScrubEngineUnavailable).reason).toBe("bindgen_unpinned_package_version");
-    expect((error as Error).message).toBe("the scrub engine is unavailable (bindgen_unpinned_package_version)");
-    await expectRefused("bindgen_unpinned_package_version");
+    expect((error as ScrubEngineUnavailable).reason).toBe("bindgen_ruleset_above_reader_ceiling");
+    expect((error as Error).message).toBe("the scrub engine is unavailable (bindgen_ruleset_above_reader_ceiling)");
+    await expectRefused("bindgen_ruleset_above_reader_ceiling");
   });
 
   it("selected but never initialised: not_initialised everywhere", async () => {
@@ -330,7 +356,7 @@ describe("wasm-bindgen: placeholder and malformed pins are refused by name", () 
   });
 
   const ZERO = "0".repeat(64);
-  const placeholderPin = pinFile as unknown as { manifest: Record<string, unknown> } & Record<string, unknown>;
+  const placeholderPin = PLACEHOLDER_PIN as unknown as { manifest: Record<string, unknown> } & Record<string, unknown>;
   const cases: { name: string; pin: () => unknown; reason: ScrubEngineFailure }[] = [
     { name: "not an object", pin: () => null, reason: "bindgen_pin_invalid" },
     { name: "another pin schema", pin: () => makePin({ schema: 2 }), reason: "bindgen_pin_invalid" },
@@ -376,7 +402,7 @@ describe("wasm-bindgen: placeholder and malformed pins are refused by name", () 
     });
 
   it("the placeholder pin is refused for every one of its fields when fixed one at a time", () => {
-    // Walk the checked-in placeholder towards a real pin: each step exposes the next named refusal.
+    // Walk the historical placeholder towards a real pin: each step exposes the next named refusal.
     const real = makePin();
     const steps: [string, ScrubEngineFailure][] = [
       ["package_version", "bindgen_unpinned_wasm_sha256"],
@@ -385,7 +411,7 @@ describe("wasm-bindgen: placeholder and malformed pins are refused by name", () 
       ["loader_sha256", "bindgen_unpinned_scrub_profile"],
       ["scrub_profile", "bindgen_unpinned_manifest_ruleset"],
     ];
-    const pin = structuredClone(pinFile) as Record<string, unknown> & { manifest: Record<string, unknown> };
+    const pin = structuredClone(PLACEHOLDER_PIN) as Record<string, unknown> & { manifest: Record<string, unknown> };
     for (const [field, next] of steps) {
       pin[field] = (real as Record<string, unknown>)[field];
       expect(() => parseScrubBindgenPin(pin), field).toThrow(expect.objectContaining({ reason: next }));
@@ -776,9 +802,12 @@ describe("wasm-bindgen: Workers compiled-module path (createCompiledBindgenEngin
     );
   });
 
-  it("refuses the placeholder pin", () => {
-    expect(() => createCompiledBindgenEngine({ glue: glueDouble().glue, module: emptyModule(), pin: pinFile })).toThrow(
+  it("refuses the placeholder pin, and the checked-in alpha.4 pin at the default reader ceiling", () => {
+    expect(() => createCompiledBindgenEngine({ glue: glueDouble().glue, module: emptyModule(), pin: PLACEHOLDER_PIN })).toThrow(
       expect.objectContaining({ reason: "bindgen_unpinned_package_version" }),
+    );
+    expect(() => createCompiledBindgenEngine({ glue: glueDouble().glue, module: emptyModule(), pin: pinFile })).toThrow(
+      expect.objectContaining({ reason: "bindgen_ruleset_above_reader_ceiling" }),
     );
   });
 

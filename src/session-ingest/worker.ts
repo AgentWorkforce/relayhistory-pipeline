@@ -65,6 +65,7 @@ import { zstdDecompressSync } from "node:zlib";
 import { createS3Store, objectKey, type ObjectStore } from "../shared/vendor.ts";
 import { log } from "../shared/log.ts";
 import { ScrubEngineUnavailable, initScrubEngine, type LoadScrubWasmArtifact } from "@rhc/lib/scrub-engine/index.ts";
+import type { ReadBindgenArtifact } from "@rhc/lib/scrub-engine/bindgen-engine.ts";
 import { dbClientErrorFields } from "./db-error-class.ts";
 import { assertNoNeonEdge, neonExitProfile, NeonExitRefusal } from "../shared/neon-exit.ts";
 import { createIngestApp } from "./app.ts";
@@ -478,13 +479,24 @@ const loadWorkerScrubWasm: LoadScrubWasmArtifact = async () => {
 };
 
 /**
+ * The Worker's wasm-bindgen artifact reader. Cloudflare Workers are excluded from the
+ * relayscrubber 0.5.0-alpha.4 cutover (docs/scrub-engine.md, "Cutover: pinned
+ * relayscrubber 0.5.0-alpha.4"): no package is bundled and `createCompiledBindgenEngine`
+ * stays unwired, so SCRUB_ENGINE=wasm-bindgen refuses here explicitly instead of
+ * depending on what the runtime's filesystem happens to hold.
+ */
+const readWorkerBindgenArtifact: ReadBindgenArtifact = async () => {
+  throw new ScrubEngineUnavailable("artifact_missing");
+};
+
+/**
  * Select the scrub engine for this isolate (once) and, for wasm, verify it. Unset or "ts":
  * no I/O, always true, so the hosted Worker behaves exactly as before. A failure is logged
  * as a code and the caller refuses the work; nothing is scrubbed by another engine.
  */
 async function scrubEngineReady(env: IngestWorkerEnv): Promise<boolean> {
   try {
-    await initScrubEngine({ env, loadArtifact: loadWorkerScrubWasm });
+    await initScrubEngine({ env, loadArtifact: loadWorkerScrubWasm, bindgen: { readArtifact: readWorkerBindgenArtifact } });
     return true;
   } catch (error) {
     log.error("session ingest scrub engine unavailable", { error_code: (error as { code?: string }).code ?? "scrub_engine_unavailable" });

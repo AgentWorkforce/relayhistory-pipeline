@@ -1,6 +1,8 @@
-/** Default-off scaffold. No environment selector or production pin routes here.
- * The historical TS sealer remains frozen. A qualified cutover must separately
- * pin this module and the artifact before installing this explicit dependency.
+/** Injected-engine raw sealer. Default off: only SCRUB_ENGINE=wasm-bindgen routes
+ * here, through routedRawChunkSealer() in scrub-engine/index.ts, which binds this to
+ * the verified pinned relayscrubber 0.5.0-alpha.4 instance (docs/scrub-engine.md,
+ * "Cutover"). This module, the pin and the vendored bytes are digested in the
+ * separate technical-foul-cutover.json entry. The historical TS sealer stays frozen.
  */
 import { sha256Hex } from "../../../../object-store/src/crypto.js";
 import { preflightScrubRecords, MAX_STREAM_BYTES } from "../scrub-engine/bindgen-admission.js";
@@ -25,8 +27,10 @@ export interface BoundRawChunkSealer {
 }
 
 /** Capture the concrete verified instance before any await, including its health.
- * Tests may inject a distinguishable engine; production still refuses non-TS
- * sealRawChunk in scrub-engine/index.ts until a separate qualified cutover.
+ * Production obtains this only via routedRawChunkSealer() (scrub-engine/index.ts);
+ * the seam's sealRawChunk still refuses non-TS engines with seal_path_not_routed,
+ * so an unwired call site refuses instead of falling back. Tests may inject a
+ * distinguishable engine.
  */
 export function bindEngineRawSealer(
   engine: ScrubEngine & { readonly failed: boolean },

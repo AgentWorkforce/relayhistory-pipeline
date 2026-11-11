@@ -32,6 +32,7 @@ import { basename, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
 import { createS3Store, objectKey, ObjectStoreError, type ObjectStore } from "../../shared/vendor.ts";
+import { initScrubEngine, routedRawChunkSealerDeps } from "../../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import type { Queryable } from "../relayhistory-export.ts";
 import { writeOnly } from "./export-session.ts";
 import { sessionReadOnly } from "./neon-reader.ts";
@@ -209,6 +210,10 @@ export function stateForRun(execute: boolean, statePath: string, scratchDir = `$
 }
 
 export async function main() {
+  // SCRUB_ENGINE=wasm-bindgen (docs/scrub-engine.md, "Cutover"): verify the pinned engine before the
+  // state lock or any connection, so export sealing runs on the bound sealer. Any other value: no
+  // call, exactly as before (the seam selects lazily on the first seal and refuses non-TS there).
+  if (process.env.SCRUB_ENGINE === "wasm-bindgen") await initScrubEngine();
   const execute = flag("execute");
   const urlFile = env("NEON_URL_FILE");
   const url = urlFile ? readFileSync(urlFile, "utf8").trim() : env("NEON_URL");
@@ -274,6 +279,7 @@ export async function main() {
         store,
         keyRoot: env("S3X_KEY_ROOT", "96bulls")!,
         grantId: env("S3X_GRANT_ID", "neon-s3-sync")!,
+        ...routedRawChunkSealerDeps(),
       },
       throttle,
       log,

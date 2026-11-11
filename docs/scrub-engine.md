@@ -3,7 +3,10 @@
 Status: seam only. The default engine is the TypeScript scrubber
 (`packages/pipeline/src/lib/scrub.ts`, ruleset `relayhistory-scrub` version 8, plus
 `scrubRecords`/`scrubLong`/`sealRawChunk` in `packages/pipeline/src/lib/pipeline/raw-chunks.ts`).
-No `.wasm` artifact is checked in, and the checked-in pin is a placeholder that refuses to load.
+The raw-ABI pin (`scrub-wasm-pin.json`) is still a placeholder that refuses to load. The
+wasm-bindgen pin is the exact relayscrubber `0.5.0-alpha.4` package, vendored byte-for-byte under
+`packages/pipeline/scrub-bindgen/`, and is used only under the opt-in env triple described in
+"Cutover: pinned relayscrubber 0.5.0-alpha.4". With `SCRUB_ENGINE` unset, `""` or `ts` nothing changes.
 
 Code: `packages/pipeline/src/lib/scrub-engine/`
 
@@ -16,7 +19,9 @@ Code: `packages/pipeline/src/lib/scrub-engine/`
 | `predicate-hook.ts` | Late-bound `scrubText` for `trace.ts` `isSafeIdentifier` (import-cycle break, see below) |
 | `packages/pipeline/scrub-wasm-pin.json` | The pin |
 | `bindgen-engine.ts` | `SCRUB_ENGINE=wasm-bindgen`: pin parsing, verified glue import, manifest check, `createCompiledBindgenEngine` (see "wasm-bindgen path") |
-| `packages/pipeline/scrub-bindgen-pin.json` | The wasm-bindgen pin (placeholder) |
+| `packages/pipeline/scrub-bindgen-pin.json` | The wasm-bindgen pin (relayscrubber `0.5.0-alpha.4`) |
+| `packages/pipeline/scrub-bindgen/` | The vendored package bytes the pin names (data; `.gitattributes` `-text`) |
+| `packages/pipeline/technical-foul-cutover.json` | The cutover provenance entry (separate from `technical-foul.json`) |
 
 Tests: `packages/pipeline/test/scrub-engine-parity.test.ts`, `packages/pipeline/test/scrub-engine-bindgen.test.ts`.
 
@@ -52,8 +57,10 @@ same way, so `scrubText`, `scrubRecords`, `activeScrubMarker` and sealing refuse
 `scrubEngineReady()` is false (ingest `/readyz` stays not-ready), `scrubTextForLog` returns
 `[scrub-unavailable]` and `isSafeIdentifier` is false. Nothing falls back to TypeScript. A
 matching requirement adds nothing: with `wasm-bindgen` the existing pin and artifact refusals
-(for example `bindgen_unpinned_package_version` with today's placeholder pin, or
-`bindgen_sha256_mismatch_wasm`) still apply unchanged, before any glue import. Only
+(for example `bindgen_ruleset_above_reader_ceiling` without `READER_MAX_RULESET=10`, or
+`bindgen_sha256_mismatch_wasm`) still apply unchanged, before any glue import. In addition, with
+`SCRUB_ENGINE_REQUIRED=wasm-bindgen` the active instance must have been verified against the
+checked-in pin exactly (`bindgen_pin_not_exact` otherwise; a reordered or edited pin object is not exact). Only
 `resetScrubEngineForTests()` clears the latch. Deploy bindings for this variable are not added.
 
 Every self-host `SERVICE=` entry point calls `await initScrubEngine()` before it serves or
@@ -187,6 +194,8 @@ metadata `scrub-ruleset` / `scrub-version`, manifests and summary `scrub_version
    raw-chunks under `ts`, and refuses under `wasm` (`seal_path_not_routed`), because raw-chunks
    scrubs internally and its bytes are pinned. The follow-up re-pins `raw-chunks.ts` so that
    `sealRawChunk` takes the engine as a parameter. It needs a technical-foul re-pin with review.
+   (Done differently for the alpha.4 cutover: `raw-chunks.ts` stays sealed and unchanged, and the
+   bound sealer in `engine-raw-chunks.ts` is injected per call site; see "Cutover: pinned relayscrubber 0.5.0-alpha.4".)
 
 ## Worker bundling (findings, nothing shipped)
 
@@ -221,7 +230,7 @@ metadata `scrub-ruleset` / `scrub-version`, manifests and summary `scrub_version
   they resolve lazily, as before. Under `wasm` they would refuse with `not_initialised`, which is
   fail-closed. They are hosted-only and out of scope for the self-host cutover.
 
-## wasm-bindgen path (`SCRUB_ENGINE=wasm-bindgen`, default off, nothing bound)
+## wasm-bindgen path (`SCRUB_ENGINE=wasm-bindgen`, default off)
 
 A third engine for the relayscrubber package as published by wasm-bindgen: generated
 `relayscrubber_bg.wasm`, the generated JS glue `relayscrubber.js`, and the package
@@ -230,10 +239,11 @@ are mutually exclusive in one process (a conflicting selection throws), and a bi
 init never consults the raw-ABI loader. Raw ABI v1 stays in the tree, but the first
 cutover is not planned to use it.
 
-**Nothing is bound.** `packages/pipeline/scrub-bindgen-pin.json` is a placeholder: no
-package version, no digests, no manifest values. Selecting `wasm-bindgen` today makes
-`initScrubEngine` throw `ScrubEngineUnavailable(bindgen_unpinned_package_version)`, and
-every call site then refuses as described in "Fail-closed rules".
+`packages/pipeline/scrub-bindgen-pin.json` pins relayscrubber `0.5.0-alpha.4` (see "Cutover:
+pinned relayscrubber 0.5.0-alpha.4" for the values, the env triple and what refuses when).
+Selecting `wasm-bindgen` without `READER_MAX_RULESET=10` makes `initScrubEngine` throw
+`ScrubEngineUnavailable(bindgen_ruleset_above_reader_ceiling)`, and every call site then
+refuses as described in "Fail-closed rules".
 
 ### The pin
 
@@ -291,21 +301,23 @@ module stays private to the engine closure.
   Lone surrogates are refused before the engine call
   (`scrub_input_not_well_formed`).
 - The marker is `{ruleset, version, profile}` from the verified manifest (see "Persisted
-  marker rule"). `sealRawChunk` is still refused (`seal_path_not_routed`).
+  marker rule"). The seam's `sealRawChunk` is still refused (`seal_path_not_routed`); raw sealing
+  goes only through the bound sealer from `routedRawChunkSealer()` (see "Cutover").
 
-### Workers (`createCompiledBindgenEngine`, not wired)
+### Workers (`createCompiledBindgenEngine`, not wired, excluded from the cutover)
 
 Workers cannot compile bytes, so `createCompiledBindgenEngine({glue, module, pin})` takes the
 statically imported glue and a `CompiledWasm` `WebAssembly.Module`, calls
 `initSync({ module })`, and checks the manifest in the same way. It cannot hash the module, so
 the Worker build must guarantee that the bundled files are the pinned ones. It refuses with
 `bindgen_path_conflict` once the Node loader path has started (and vice versa). No Worker
-entrypoint calls it yet. With `SCRUB_ENGINE=wasm-bindgen` the hosted Worker's
-`initScrubEngine` refuses, so the Worker answers `503 not_configured` as it does for `wasm`.
+entrypoint calls it. With `SCRUB_ENGINE=wasm-bindgen` the hosted Worker's
+`initScrubEngine` refuses (explicitly, via `readWorkerBindgenArtifact` in
+`src/session-ingest/worker.ts`), so the Worker answers `503 not_configured` as it does for `wasm`.
 
 ### Blockers before a real pin (relayscrubber-lead 245870894909468672)
 
-Merging this PR is a default-off, unpinned scaffold only. It is NOT a security PASS, artifact pin, cutover, image, marker or adoption clearance. The successor that binds a real package must satisfy all of these first:
+(Historical record from the scaffold PR; the status of each item for the alpha.4 cutover is in "Cutover: pinned relayscrubber 0.5.0-alpha.4".) Merging this PR is a default-off, unpinned scaffold only. It is NOT a security PASS, artifact pin, cutover, image, marker or adoption clearance. The successor that binds a real package must satisfy all of these first:
 
 1. **Reader-first.** A v10 writer may not start until every relevant reader accepts ruleset <= 10. Add a separate explicit `READER_MAX_RULESET=10`; pin parsing must refuse a manifest rulesetVersion above it and below the supported floor. Roll the reader ceiling out first with wasm-bindgen still off, then the v10 writer/pin. Do not overload the TS `SCRUB_RULESET_VERSION` as the reader ceiling. (Reader policy source implemented in #489; fleet rollout and relayscrubber-lead acceptance remain pending.)
 2. **Profile is crate-owned.** The schema-2 manifest must report a canonical profile field/string; the pipeline pins and compares it verbatim. The format derived in this PR (`relayscrubber/<ruleset>/<ver>/<policy>/<sourceSha>`) is a placeholder and must be replaced by the crate's value before any pin. (Candidate schema-3 crate-owned profile comparison implemented in #489; exact-package acceptance remains pending.)
@@ -325,7 +337,7 @@ Adapter tests with inert glue doubles do not qualify a Rust/WASM package.
 - NDJSON is limited to 16 MiB per physical LF-delimited record and 64 MiB per stream. LF is excluded from the record size but included in the stream size; CR and whitespace count toward the record size. This is the intended Rust physical-byte contract before blank-line handling; adapter tests alone do not prove package conformance.
 - Shared record buffers are refused, including foreign-realm SharedArrayBuffers. Ordinary record buffers are copied into a private Uint8Array, so Buffer views cannot retain a mutable alias. UTF-8 is validated in bounded chunks; the original bytes are passed to Rust without decoding/re-encoding or JSON parsing.
 
-Invalid-input errors are content-free, nonretryable `ScrubberError`s (a `PipelineError` subclass) with `disposition: "call_refusal"`: `scrub_input_too_large`, `scrub_input_not_well_formed`, `scrub_input_shared_buffer`, or the existing `chunk_not_utf8`. A local copy/decoder allocation failure instead returns retryable `scrub_admission_unavailable`, so resource pressure does not classify valid data as permanently malformed. These errors return no partial output and do not call or poison the engine. The checked-in pin remains UNPINNED; this admission layer changes neither recognition rules nor any reader ceiling or scrub marker.
+Invalid-input errors are content-free, nonretryable `ScrubberError`s (a `PipelineError` subclass) with `disposition: "call_refusal"`: `scrub_input_too_large`, `scrub_input_not_well_formed`, `scrub_input_shared_buffer`, or the existing `chunk_not_utf8`. A local copy/decoder allocation failure instead returns retryable `scrub_admission_unavailable`, so resource pressure does not classify valid data as permanently malformed. These errors return no partial output and do not call or poison the engine. This admission layer changes neither recognition rules nor any reader ceiling or scrub marker. The limits are exercised against the real alpha.4 module at limit-1 / limit / limit+1 with multibyte boundaries in `packages/pipeline/test/scrub-bindgen-limits.test.ts`.
 
 The adapter requires the ABI-2 `scrubTextChecked` export for both text and long
 text after JS admission. That Rust entrypoint rechecks the byte limit before
@@ -358,9 +370,109 @@ text never reaches the error message. Local preflight refusals remain separate
 from glue failures and do not poison an untouched instance; local admission
 allocation failures retain their retryable classification.
 
-These guards use inert glue tests on both loader paths. No source/WASM/package
-pin is qualified, no runtime is enabled, and the sealed-write routing and Worker
-bundle qualification requirements remain open.
+These guards use inert glue tests on both loader paths, and the fault matrix is
+repeated against the real alpha.4 module through an injecting wrapper (never by
+editing vendored bytes) in `packages/pipeline/test/scrub-bindgen-faults.test.ts`.
+Worker bundle qualification remains open (Workers are excluded from the cutover).
+
+## Cutover: pinned relayscrubber 0.5.0-alpha.4
+
+Opt-in only. With `SCRUB_ENGINE` unset, `""` or `ts` every path is byte-identical to before:
+the TS engine, the TS `sealRawChunk`, ruleset `relayhistory-scrub` version 8, and
+`routedRawChunkSealerDeps()` returns `{}` so every constructor's object is unchanged.
+
+### Pin (`packages/pipeline/scrub-bindgen-pin.json`)
+
+| Field | Value |
+|---|---|
+| `package` / `package_version` | `@agentworkforce/relayscrubber` / `0.5.0-alpha.4` |
+| `wasm_sha256` (`generated/relayscrubber_bg.wasm`) | `bd181f94e2d03d7a5381a31488aa5ffbc991e4d41132c7f8f08095031608b5da` |
+| `glue_sha256` (`generated/relayscrubber.js`) | `55dd6fc6a44ed35f846655ab08bf3161ffe105123cbe11d3e529923d6bdeae5b` |
+| `loader_sha256` (`index.js`, hashed, never evaluated) | `ff139ab391a958475b455ef483e7119d66215d172647223965dc35348f912490` |
+| `scrub_profile` | `relayhistory-secrets-v10` |
+| `manifest` | schema 3, `relayhistory-scrub`, rulesetVersion 10, rulesetSourceSha256 `959b6e2894600ec66381ae56cb9bc144d2814d0f27662ca1453e89491c41ceeb`, crateVersion `0.5.0-alpha.4`, abiVersion 2, policy `secrets`, redactionToken `[REDACTED]`, scrubProfile `relayhistory-secrets-v10` |
+
+The release's `generated/artifact.json` (sha256 `cf43f67ad3033cca73d8a36a67a707f258a51517e1c13fa1dc1df8f66f49a9ed`,
+toolchain Rust 1.88.0, wasm-bindgen 0.2.104) and the `.d.ts` files are vendored for provenance.
+`packages/pipeline/scrub-bindgen/.gitattributes` (`* -text`) keeps git from normalising the bytes.
+The vendored directory reaches the services image through `COPY packages packages`.
+
+Provenance checks:
+- `packages/pipeline/test/scrub-bindgen-pin-alpha4.test.ts` recomputes every vendored digest against
+  the pin and `artifact.json`; mutated bytes and swapped modules fail closed.
+- `scripts/scrub-bindgen-receipt.ts` writes a receipt (pin digests, package version, crate manifest,
+  toolchain, timestamp, git HEAD) and exits non-zero on any mismatch. CI runs it in the `unit-tests`
+  job and uploads `scrub-bindgen-receipt.json` as an artifact.
+- `packages/pipeline/technical-foul-cutover.json` is a NEW technical-foul entry (pin digests, vendored
+  file digests, the bindgen sealer sources, and a reference to the unchanged TS entry including the
+  `raw-chunks.ts` digest). `technical-foul.json` (ruleset 8) is immutable history and is not
+  relabelled. `bun run technical-foul:check` verifies both files.
+
+### Env triple (AA self-host services image)
+
+```
+SCRUB_ENGINE=wasm-bindgen
+SCRUB_ENGINE_REQUIRED=wasm-bindgen
+READER_MAX_RULESET=10
+```
+
+No other binding is needed. `READER_MAX_RULESET=10` must already be live on every reader
+(reader-first, see "Reader-first rollout") before any process runs the triple.
+
+### Routing
+
+Under the triple, `routedRawChunkSealer()` (`scrub-engine/index.ts`) returns a sealer bound with
+`bindEngineRawSealer` to the exact verified instance `initScrubEngine` installed, cached per
+instance. `routedRawChunkSealerDeps()` spreads it into each production constructor after
+`initScrubEngine` has resolved:
+
+| Call site | Production constructor |
+|---|---|
+| `src/session-ingest/writer.ts` (`target.rawChunkSealer`) | `src/session-ingest/selfhost-server.ts` `selfhostIngestRuntime` (`DeliverDeps.target`) |
+| `src/session-ingest/publication-image.ts` | `publication-runtime.ts` / `publication-portable.ts` `canonicalPublicationTick` deps, forwarded by `publication-job.ts` |
+| `src/migration/neon-s3-sync/export-session.ts` | `src/migration/neon-s3-sync/main.ts` `Syncer` target (initialises the engine first under `wasm-bindgen`) |
+| `packages/pipeline/src/routes/pipeline.ts` | `src/alleyoop/ingest.ts` `createPipelineRoutes` |
+
+The seam's `sealRawChunk` keeps refusing non-TS engines (`seal_path_not_routed`), so any call site
+that is not wired refuses instead of falling back. There is no TS or raw fallback on the selected path.
+`src/session-ingest/__tests__/scrub-cutover-reachability.test.ts` drives all four paths end to end and
+proves zero TS scrub/sealer calls under the triple, with a positive control under the default.
+`scripts/scrub-cutover-reachability.ts` runs it and writes a JSON report.
+
+### What refuses when
+
+| Condition | Result |
+|---|---|
+| `SCRUB_ENGINE=wasm-bindgen`, `READER_MAX_RULESET` unset, `8` or `9` | `bindgen_ruleset_above_reader_ceiling`, before any artifact read |
+| A vendored file missing / empty | `bindgen_artifact_missing_<wasm|glue|loader>` |
+| A vendored file's bytes differ from the pin | `bindgen_sha256_mismatch_<name>` |
+| Relative `SCRUB_BINDGEN_DIR` | `bindgen_dir_invalid` |
+| Instance manifest differs from the pin | `bindgen_manifest_mismatch_<field>` / `bindgen_profile_mismatch` |
+| `SCRUB_ENGINE_REQUIRED=wasm-bindgen` and the instance was verified against another pin | `bindgen_pin_not_exact` |
+| `SCRUB_ENGINE_REQUIRED=wasm-bindgen` and `SCRUB_ENGINE` is anything else | `engine_selection_required` (latched) |
+| Recognised tagged call refusal from the crate | that one call refuses (nonretryable `ScrubberError`); the instance stays healthy |
+| `WebAssembly.RuntimeError`, `RangeError`, or any unrecognised throw / malformed result | instance poisoned (sticky `scrubber_instance_poisoned`) |
+| Blank-only input (Rust `White_Space`, incl. U+0085) | refused at admission, engine not called, not poisoned |
+| Unwired call site | `seal_path_not_routed` |
+
+In every case `scrubEngineReady()` is false, the self-host ingest answers `503 scrub_unavailable`
+/ `/readyz` not ready, the Node services exit non-zero at startup, and nothing is stored.
+
+### Workers excluded
+
+Cloudflare Workers are not in this cutover. The hosted ingest Worker (`src/session-ingest/worker.ts`),
+`packages/session-read-worker` and `packages/amp-transport-worker` keep the TS path and reader
+ceiling 8. `createCompiledBindgenEngine` stays unwired. The ingest Worker passes
+`readWorkerBindgenArtifact`, which always throws `artifact_missing`, so a mis-set `SCRUB_ENGINE=wasm-bindgen`
+answers `503 not_configured` rather than reading any bytes. No Worker config sets the triple.
+`src/session-ingest/__tests__/worker-scrub-cutover-exclusion.test.ts` guards that the Worker never
+claims scrub version 10 (behaviour, bundle contents, sources and configs).
+
+### Rollback
+
+Unset the env triple on the writers and restart (every path returns to the TS engine and
+version 8), then revert this change. On readers keep `READER_MAX_RULESET=10` while any
+version-10 objects remain stored: reverting the writer does not downgrade existing objects.
 
 ## Import cycle (why `predicate-hook.ts`)
 
@@ -442,8 +554,9 @@ and calls `initScrubEngine()` before serving.
 - **delivery/prepare.ts**: `scrubText` and `scrubNumber` are seam accessors (wasm or throw). The
   `exceedsScrubBound` predicate only sets a flag.
 - **writer.ts sealRawChunk**: the seam's `sealRawChunk` refuses under wasm (`index.ts`). No TS
-  path and no raw write.
-- **publication-image.ts sealRawChunk**: the same seam refusal.
+  path and no raw write. (Under `wasm-bindgen` the wired constructors pass the bound sealer
+  instead; see "Cutover".)
+- **publication-image.ts sealRawChunk**: the same seam refusal (same `wasm-bindgen` note).
 - **owner-buffered.ts**: `scrubText` and `scrubJson` are seam accessors (wasm or throw). The
   `isSecretKeyName` post-pass only adds redactions to engine output.
 - **digest-narrative-selfhost.ts**: `scrubText` is re-exported by `vendor.ts` from the seam (wasm

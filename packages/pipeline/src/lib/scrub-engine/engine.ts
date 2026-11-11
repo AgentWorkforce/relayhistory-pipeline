@@ -125,6 +125,8 @@ export type BindgenManifestField =
  * - bindgen_init_conflict: a second initialisation with other pins or other bytes
  * - bindgen_path_conflict: the Node loader path and the Workers compiled-module path in one process
  * - bindgen_module_invalid: the compiled path was given something other than a WebAssembly.Module
+ * - bindgen_pin_not_exact: SCRUB_ENGINE_REQUIRED=wasm-bindgen, but the loaded instance was verified
+ *   against a pin other than the checked-in packages/pipeline/scrub-bindgen-pin.json
  */
 export type BindgenFailure =
   | "bindgen_pin_invalid"
@@ -148,7 +150,8 @@ export type BindgenFailure =
   | "bindgen_profile_mismatch"
   | "bindgen_init_conflict"
   | "bindgen_path_conflict"
-  | "bindgen_module_invalid";
+  | "bindgen_module_invalid"
+  | "bindgen_pin_not_exact";
 
 /** Scrubbing is refused: nothing is returned, nothing passes through unscrubbed. Retryable: no input is lost. */
 export class ScrubEngineUnavailable extends PipelineError {

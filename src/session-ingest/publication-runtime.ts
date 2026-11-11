@@ -12,6 +12,7 @@ import{gcPoolConfig,bufferedKeyAllowed}from'./buffered-gc-job.ts';
 import{deployTargetValue,AWS_ACCOUNT_ID,SUPABASE_PROJECT_REF,EC2_INSTANCE_ID}from'../shared/deploy-target.ts';
 import{publicationRpc}from'./publication-rpc.ts';
 import{canonicalPublicationTick}from'./publication-job.ts';
+import{routedRawChunkSealerDeps}from'../../packages/pipeline/src/lib/scrub-engine/index.ts';
 import{publicationGcLedger,collectPublicationObject}from'./publication-gc.ts';
 import type{PublicationTarget}from'./publication-protocol.ts';
 import type{AwsCredentials}from'../../packages/object-store/src/sigv4.ts';
@@ -74,7 +75,7 @@ export async function runCanonicalPublicationRuntime(env:NodeJS.ProcessEnv,mode:
   await read.queryBounded("SET LOCAL hoopdb.db_mode='supabase';"+Object.values(assets.verifiers).join('\n'),[],context());
   const target:PublicationTarget=config;
   const raw=scopedPublicationStore((overrides.store??createS3Store)({bucket:config.bucket,region:config.region,credentials,serverSideEncryption:'aws:kms',sseKmsKeyId:config.kmsKeyArn,fetch:fetcher}));
-  if(mode==='publish')return await canonicalPublicationTick({target,rpc:publicationRpc(sql,target),store:()=>raw},{enabled:true,signal,maxJobMs:config.budgetMs,candidateLimit:config.candidateLimit});
+  if(mode==='publish')return await canonicalPublicationTick({target,rpc:publicationRpc(sql,target),store:()=>raw,...routedRawChunkSealerDeps()},{enabled:true,signal,maxJobMs:config.budgetMs,candidateLimit:config.candidateLimit});
   const eraser=(overrides.eraser??createS3Eraser)({bucket:config.bucket,region:config.region,credentials:await credentials(),fetch:fetcher});
   const ledger=publicationGcLedger(sql,target),tickets=await ledger.claim(config.gcLimit,signal);let finished=0;
   for(const ticket of tickets){signal.throwIfAborted();if(!generationKey(ticket.key))no('eraser_scope');

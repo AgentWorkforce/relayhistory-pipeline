@@ -73,3 +73,116 @@ export function computeManifest(): TechnicalFoulManifest {
 }
 
 export const serializeManifest = (m: TechnicalFoulManifest) => `${JSON.stringify(m, null, 2)}\n`;
+
+/*
+ * Cutover entry (relayscrubber 0.5.0-alpha.4 via wasm-bindgen). This is a NEW,
+ * separate manifest: technical-foul.json above is immutable TS history and is
+ * never relabelled. The cutover manifest binds the pin, the vendored bytes the
+ * pin names, the bindgen sealer sources, and a reference to the TS entry it
+ * sits beside (including the unchanged raw-chunks.ts digest).
+ */
+
+export const CUTOVER_MANIFEST_PATH = fileURLToPath(
+  new URL("packages/pipeline/technical-foul-cutover.json", REPO_ROOT).href,
+);
+
+const PIN_PATH = "packages/pipeline/scrub-bindgen-pin.json";
+const BINDGEN_DIR = "packages/pipeline/scrub-bindgen";
+const ARTIFACT_JSON_PATH = `${BINDGEN_DIR}/generated/artifact.json`;
+const CUTOVER_SOURCES = [
+  "packages/pipeline/src/lib/pipeline/engine-raw-chunks.ts",
+  "packages/pipeline/src/lib/scrub-engine/bindgen-engine.ts",
+  "packages/pipeline/src/lib/scrub-engine/bindgen-admission.ts",
+  "packages/pipeline/src/lib/scrub-engine/index.ts",
+] as const;
+
+/** Raw-byte digest (vendored artifacts are data; never LF-normalised). */
+const sha256Bytes = (repoRel: string) =>
+  createHash("sha256").update(readFileSync(fileURLToPath(new URL(repoRel, REPO_ROOT).href))).digest("hex");
+
+export interface TechnicalFoulCutoverManifest {
+  schema: 1;
+  entry: "cutover-relayscrubber-0.5.0-alpha.4";
+  engine: "wasm-bindgen";
+  envTriple: { SCRUB_ENGINE: "wasm-bindgen"; SCRUB_ENGINE_REQUIRED: "wasm-bindgen"; READER_MAX_RULESET: "10" };
+  package: string;
+  packageVersion: string;
+  pinPath: string;
+  pinFileSha256: string;
+  pinDigests: { wasm: string; glue: string; loader: string };
+  scrubProfile: string;
+  crateManifest: Record<string, unknown>;
+  toolchain: { rust: string; wasmBindgen: string };
+  artifactJsonSha256: string;
+  vendoredFiles: Record<string, string>;
+  sealerSources: Record<string, string>;
+  tsReference: {
+    manifestPath: string;
+    manifestSha256: string;
+    rulesetVersion: number;
+    rulesetSourceSha256: string;
+    rawChunksPath: string;
+    rawChunksSha256: string;
+  };
+}
+
+export function computeCutoverManifest(): TechnicalFoulCutoverManifest {
+  const pin = JSON.parse(readLf(PIN_PATH));
+  const artifact = JSON.parse(readLf(ARTIFACT_JSON_PATH));
+  const vendoredFiles: Record<string, string> = {};
+  for (const rel of [
+    "index.js",
+    "index.d.ts",
+    "generated/relayscrubber.js",
+    "generated/relayscrubber.d.ts",
+    "generated/relayscrubber_bg.wasm",
+    "generated/relayscrubber_bg.wasm.d.ts",
+    "generated/artifact.json",
+  ]) {
+    vendoredFiles[rel] = sha256Bytes(`${BINDGEN_DIR}/${rel}`);
+  }
+  // Fail closed: the entry is only computable when the bytes match the pin.
+  const pinned: Array<[string, string]> = [
+    [pin.paths.wasm, pin.wasm_sha256],
+    [pin.paths.glue, pin.glue_sha256],
+    [pin.paths.loader, pin.loader_sha256],
+  ];
+  for (const [rel, want] of pinned) {
+    if (vendoredFiles[rel] !== want) {
+      throw new Error(`vendored ${rel} sha256 ${vendoredFiles[rel]} != pin ${want}`);
+    }
+  }
+  if (JSON.stringify(pin.manifest) !== JSON.stringify(artifact.manifest)) {
+    throw new Error("scrub-bindgen-pin.json manifest differs from vendored artifact.json manifest");
+  }
+  const sealerSources: Record<string, string> = {};
+  for (const rel of CUTOVER_SOURCES) sealerSources[rel] = sha256(readLf(rel));
+  const ts = computeManifest();
+  return {
+    schema: 1,
+    entry: "cutover-relayscrubber-0.5.0-alpha.4",
+    engine: "wasm-bindgen",
+    envTriple: { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen", READER_MAX_RULESET: "10" },
+    package: pin.package,
+    packageVersion: pin.package_version,
+    pinPath: PIN_PATH,
+    pinFileSha256: sha256Bytes(PIN_PATH),
+    pinDigests: { wasm: pin.wasm_sha256, glue: pin.glue_sha256, loader: pin.loader_sha256 },
+    scrubProfile: pin.scrub_profile,
+    crateManifest: pin.manifest,
+    toolchain: { rust: artifact.toolchain, wasmBindgen: artifact.wasmBindgen },
+    artifactJsonSha256: vendoredFiles["generated/artifact.json"],
+    vendoredFiles,
+    sealerSources,
+    tsReference: {
+      manifestPath: "packages/pipeline/technical-foul.json",
+      manifestSha256: sha256(serializeManifest(ts)),
+      rulesetVersion: ts.rulesetVersion,
+      rulesetSourceSha256: ts.rulesetSourceSha256,
+      rawChunksPath: RAW_CHUNKS_PATH,
+      rawChunksSha256: sha256(readLf(RAW_CHUNKS_PATH)),
+    },
+  };
+}
+
+export const serializeCutoverManifest = (m: TechnicalFoulCutoverManifest) => `${JSON.stringify(m, null, 2)}\n`;
