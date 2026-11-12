@@ -66,15 +66,20 @@ export async function requireReleaseOwner(client: pg.Client) {
   )
     refuse("release_owner");
 }
+/**
+ * `target`: the release target the caller splits this inventory at; steps it holds are not
+ * adoptable-index preflighted (inspectMigrations), as the targeted apply never runs them.
+ */
 export async function inspectRelease(
   client: pg.Client,
   boundary: "event-trigger" | "global-default-revoke",
+  target?: string,
 ) {
   await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
   try {
     await requireReleaseOwner(client);
     await client.query("SELECT pg_advisory_xact_lock(961996, 1)");
-    const report = await inspectMigrations(client, releaseProfile(boundary));
+    const report = await inspectMigrations(client, releaseProfile(boundary), { target });
     const existingBoundary = await inspectReleaseBoundary(client);
     return { ...report, existingBoundary };
   } finally {
