@@ -422,7 +422,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105047000_coordination_fact_readers.sql` | functions sessions.coordination_write_facts_for and sessions.coordination_output_facts_for |
 | `upstream:20261105056000_session_summary_activity.sql` | function sessions.session_summary_activity_for |
 | `upstream:20261105057010_upload_consent.sql` | function sessions.upload_consent_apply_v1 and table sessions.upload_consent_holds (server-owned upload consent; EXECUTE to bulls96_session_ingest only) |
-| `upstream:20261105058000_operator_user_erase_indexes.sql` | the five operator-user-erase foreign-key support indexes, exact definition, valid and ready |
+| `upstream:20261105058000_operator_user_erase_indexes.sql` | the eleven operator-user-erase support indexes, exact definition, valid and ready |
 | `upstream:20261105058010_operator_user_erase.sql` | table sessions.operator_user_erasures |
 | `upstream:20261105035000_semantic_copy_state.sql` | table sessions.search_feature_copy_state |
 | `upstream:20261105036000_canonical_consumer_lease.sql`        | table sessions.canonical_feature_consumer_lease |

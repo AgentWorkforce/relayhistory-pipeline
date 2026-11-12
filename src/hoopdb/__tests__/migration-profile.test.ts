@@ -2451,11 +2451,11 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await names()).not.toContain(UE);
     expect(await relation("sessions.operator_user_erasures")).toBeNull();
     expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.operator_user_erase_step(text,integer)')::text AS p")).rows[0]!.p).toBeNull();
-    // 20261105058000 (foreign-key support indexes) is then the newest: 057010's down refuses; its own down drops the five.
+    // 20261105058000 (foreign-key support indexes) is then the newest: 057010's down refuses; its own down drops the eleven.
     expect((await failure(rollback("20261105057010_upload_consent.down.sql")))?.code).toBe("55000");
     await rollback("20261105058000_operator_user_erase_indexes.down.sql");
     expect(await names()).not.toContain(UI);
-    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_class WHERE relnamespace='sessions'::regnamespace AND relname IN ('ingest_lazy_ack_decisions_native_key_sha256_idx','ingest_lazy_ack_decisions_seat_key_sha256_idx','ingest_lazy_native_slots_current_seat_key_idx','ingest_receipt_ord_seats_key_sha256_idx','ingest_receipt_record_heads_winner_key_sha256_idx')")).rows[0]!.n).toBe(0);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_class WHERE relnamespace='sessions'::regnamespace AND relname IN ('ingest_lazy_ack_decisions_native_key_sha256_idx','ingest_lazy_ack_decisions_seat_key_sha256_idx','ingest_lazy_native_slots_current_seat_key_idx','ingest_receipt_ord_seats_key_sha256_idx','ingest_receipt_record_heads_winner_key_sha256_idx','ingest_stage_intents_parent_stage_token_idx','ingest_stage_intents_gc_replacement_stage_token_idx','ingest_stage_intents_batch_idx','ingest_buffer_outbox_active_stage_token_idx','ingest_history_plans_stage_token_idx','ingest_lazy_native_slots_unowned_origin_idx')")).rows[0]!.n).toBe(0);
     // 20261105057010 (upload consent) is then the newest step: 057000's and 056000's downs refuse (55000) until its
     // checksum-pinned rollback removes its two entry points, four tables and ledger row.
     expect((await failure(rollback("20261105056000_session_summary_activity.down.sql")))?.code).toBe("55000");

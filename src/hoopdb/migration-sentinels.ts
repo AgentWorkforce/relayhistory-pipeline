@@ -104,7 +104,7 @@ export const ADOPTABLE_INDEXES: Readonly<Record<string, readonly AdoptableIndex[
       def: "CREATE INDEX session_output_facts_coordination_outcomes_idx ON sessions.session_output_facts USING btree (org_id, workspace_id, ts, row_id) WHERE (fact_kind = ANY (ARRAY['commit'::text, 'outcome'::text]))",
     },
   ],
-  // Operator per-user erase foreign-key support indexes, 20261105058000 (packet:
+  // Operator per-user erase support indexes (ten foreign-key, one un-owned-slot lookup), 20261105058000 (packet:
   // docs/packets/operator-user-erase-index-packet.md), in the step's build order.
   [OPERATOR_USER_ERASE_INDEXES_STEP]: [
     fkIndex("ingest_receipt_ord_seats_key_sha256_idx", "ingest_receipt_ord_seats", "key_sha256"),
@@ -112,6 +112,28 @@ export const ADOPTABLE_INDEXES: Readonly<Record<string, readonly AdoptableIndex[
     fkIndex("ingest_lazy_native_slots_current_seat_key_idx", "ingest_lazy_native_slots", "current_seat_key"),
     fkIndex("ingest_lazy_ack_decisions_native_key_sha256_idx", "ingest_lazy_ack_decisions", "native_key_sha256"),
     fkIndex("ingest_lazy_ack_decisions_seat_key_sha256_idx", "ingest_lazy_ack_decisions", "seat_key_sha256"),
+    {
+      name: "ingest_stage_intents_parent_stage_token_idx",
+      table: "sessions.ingest_stage_intents",
+      def: "CREATE INDEX ingest_stage_intents_parent_stage_token_idx ON sessions.ingest_stage_intents USING btree (parent_stage_token) WHERE (parent_stage_token IS NOT NULL)",
+    },
+    {
+      name: "ingest_stage_intents_gc_replacement_stage_token_idx",
+      table: "sessions.ingest_stage_intents",
+      def: "CREATE INDEX ingest_stage_intents_gc_replacement_stage_token_idx ON sessions.ingest_stage_intents USING btree (gc_replacement_stage_token) WHERE (gc_replacement_stage_token IS NOT NULL)",
+    },
+    fkIndex("ingest_stage_intents_batch_idx", "ingest_stage_intents", "org_id, workspace_id, origin_id, batch_id"),
+    {
+      name: "ingest_buffer_outbox_active_stage_token_idx",
+      table: "sessions.ingest_buffer_outbox",
+      def: "CREATE INDEX ingest_buffer_outbox_active_stage_token_idx ON sessions.ingest_buffer_outbox USING btree (active_stage_token) WHERE (active_stage_token IS NOT NULL)",
+    },
+    fkIndex("ingest_history_plans_stage_token_idx", "ingest_history_plans", "stage_token"),
+    {
+      name: "ingest_lazy_native_slots_unowned_origin_idx",
+      table: "sessions.ingest_lazy_native_slots",
+      def: "CREATE INDEX ingest_lazy_native_slots_unowned_origin_idx ON sessions.ingest_lazy_native_slots USING btree (org_id, workspace_id, origin_id) WHERE (current_owner IS NULL)",
+    },
   ],
 };
 
@@ -395,7 +417,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   },
   // Adoptable step: an unledgered "applied" here is accepted when every declared index is adoptable.
   [OPERATOR_USER_ERASE_INDEXES_STEP]: {
-    evidence: "the five operator-user-erase foreign-key support indexes, exact definition, valid and ready",
+    evidence: "the eleven operator-user-erase support indexes, exact definition, valid and ready",
     sql: adoptableIndexesSentinel(OPERATOR_USER_ERASE_INDEXES_STEP),
   },
   "upstream:20261105058010_operator_user_erase.sql": { evidence: "table sessions.operator_user_erasures (operator per-user erase)", sql: relation("sessions.operator_user_erasures") },

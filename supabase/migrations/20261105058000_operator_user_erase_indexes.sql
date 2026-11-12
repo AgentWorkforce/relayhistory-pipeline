@@ -1,23 +1,33 @@
 -- Slot 20261105058000. Foreign-key support indexes for the operator per-user erase (20261105058010). Code only:
 -- applying this to any real database needs Khaliq's explicit OK.
 --
--- Five foreign keys point at sessions.ingest_lazy_native_slots and sessions.ingest_receipt_seats from columns no
--- index leads with. Deleting a slot or a seat then makes PostgreSQL check every referencing table by sequential
--- scan, once per deleted row: on production (ingest_lazy_ack_decisions ~74M rows, ingest_lazy_native_slots ~28M)
--- a 100k-slot user erase never finishes (observed 2026-11-11). With these indexes each check is an index probe,
--- and the erase finds a user's referencing rows without a full scan:
+-- Eleven indexes. Ten serve foreign keys whose referencing column no index leads with: deleting a referenced row
+-- then makes PostgreSQL check the referencing table by sequential scan, once per deleted row. On production
+-- (ingest_lazy_ack_decisions ~74M rows, ingest_lazy_native_slots ~28M) a 100k-slot user erase never finishes
+-- (observed 2026-11-11). With these indexes each check is an index probe, and the erase finds a user's
+-- referencing rows without a full scan:
 --   ingest_lazy_ack_decisions(native_key_sha256)   -> ingest_lazy_native_slots(key_sha256)
 --   ingest_lazy_ack_decisions(seat_key_sha256)     -> ingest_receipt_seats(key_sha256)
 --   ingest_lazy_native_slots(current_seat_key)     -> ingest_receipt_seats(key_sha256)
 --   ingest_receipt_ord_seats(key_sha256)           -> ingest_receipt_seats(key_sha256)
 --   ingest_receipt_record_heads(winner_key_sha256) -> ingest_receipt_seats(key_sha256)
+--   ingest_stage_intents(parent_stage_token)       -> ingest_stage_intents(stage_token)   partial: IS NOT NULL
+--   ingest_stage_intents(gc_replacement_stage_token) -> ingest_stage_intents(stage_token) partial: IS NOT NULL
+--   ingest_stage_intents(org,ws,origin,batch_id)   -> ingest_batches(org,ws,origin,batch_id)
+--   ingest_buffer_outbox(active_stage_token)       -> ingest_stage_intents(stage_token)   partial: IS NOT NULL
+--   ingest_history_plans(stage_token)              -> ingest_stage_intents(stage_token)
+-- The eleventh serves the step's un-owned-slot arm (current_owner IS NULL AND origin_id = ANY(origins)), which
+-- otherwise scans the org's slots on every batch:
+--   ingest_lazy_native_slots(org_id,workspace_id,origin_id) WHERE current_owner IS NULL
 --
 -- Same adopt-or-create contract as 20261105044020 (read it there): an exact, valid, ready index of that name is
 -- adopted without locking its table; an absent one is created only on an EMPTY table (or with
 -- HOOPDB_ALLOW_BLOCKING_INDEX_BUILD=true); an absent one on a POPULATED table refuses (55000) naming the
 -- CONCURRENTLY prebuild packet (docs/packets/operator-user-erase-index-packet.md); anything else raises.
--- Production: ingest_receipt_ord_seats and ingest_receipt_record_heads are empty (created here); the three
--- indexes on ingest_lazy_ack_decisions and ingest_lazy_native_slots are prebuilt out of band, then adopted.
+-- Production: ingest_receipt_ord_seats and ingest_receipt_record_heads are empty (created here); the four
+-- indexes on ingest_lazy_ack_decisions and ingest_lazy_native_slots are prebuilt out of band, then adopted. The
+-- row counts of ingest_stage_intents, ingest_buffer_outbox and ingest_history_plans are not recorded: the packet
+-- checks them first and prebuilds any index whose table is populated (this step refuses a populated table anyway).
 -- The expected definitions are byte-identical to ADOPTABLE_INDEXES in src/hoopdb/migration-sentinels.ts (a test checks).
 DO $operator_user_erase_indexes$
 DECLARE
@@ -40,7 +50,19 @@ BEGIN
   ['ingest_lazy_ack_decisions_native_key_sha256_idx','ingest_lazy_ack_decisions',
    'CREATE INDEX ingest_lazy_ack_decisions_native_key_sha256_idx ON sessions.ingest_lazy_ack_decisions USING btree (native_key_sha256)'],
   ['ingest_lazy_ack_decisions_seat_key_sha256_idx','ingest_lazy_ack_decisions',
-   'CREATE INDEX ingest_lazy_ack_decisions_seat_key_sha256_idx ON sessions.ingest_lazy_ack_decisions USING btree (seat_key_sha256)']
+   'CREATE INDEX ingest_lazy_ack_decisions_seat_key_sha256_idx ON sessions.ingest_lazy_ack_decisions USING btree (seat_key_sha256)'],
+  ['ingest_stage_intents_parent_stage_token_idx','ingest_stage_intents',
+   'CREATE INDEX ingest_stage_intents_parent_stage_token_idx ON sessions.ingest_stage_intents USING btree (parent_stage_token) WHERE (parent_stage_token IS NOT NULL)'],
+  ['ingest_stage_intents_gc_replacement_stage_token_idx','ingest_stage_intents',
+   'CREATE INDEX ingest_stage_intents_gc_replacement_stage_token_idx ON sessions.ingest_stage_intents USING btree (gc_replacement_stage_token) WHERE (gc_replacement_stage_token IS NOT NULL)'],
+  ['ingest_stage_intents_batch_idx','ingest_stage_intents',
+   'CREATE INDEX ingest_stage_intents_batch_idx ON sessions.ingest_stage_intents USING btree (org_id, workspace_id, origin_id, batch_id)'],
+  ['ingest_buffer_outbox_active_stage_token_idx','ingest_buffer_outbox',
+   'CREATE INDEX ingest_buffer_outbox_active_stage_token_idx ON sessions.ingest_buffer_outbox USING btree (active_stage_token) WHERE (active_stage_token IS NOT NULL)'],
+  ['ingest_history_plans_stage_token_idx','ingest_history_plans',
+   'CREATE INDEX ingest_history_plans_stage_token_idx ON sessions.ingest_history_plans USING btree (stage_token)'],
+  ['ingest_lazy_native_slots_unowned_origin_idx','ingest_lazy_native_slots',
+   'CREATE INDEX ingest_lazy_native_slots_unowned_origin_idx ON sessions.ingest_lazy_native_slots USING btree (org_id, workspace_id, origin_id) WHERE (current_owner IS NULL)']
  ] LOOP
   v_tbl:=to_regclass(format('sessions.%I',v_spec[2]));
   IF v_tbl IS NULL THEN

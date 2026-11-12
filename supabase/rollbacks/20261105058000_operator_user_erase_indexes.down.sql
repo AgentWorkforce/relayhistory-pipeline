@@ -1,7 +1,8 @@
--- Drops the five foreign-key support indexes of 20261105058000 and its ledger row.
--- LOCAL/TEST ONLY. There are no down-migrations on real databases. On production three of these indexes are the
--- operator-built ones (CREATE INDEX CONCURRENTLY, adopted by the migration); dropping them puts every slot/seat
--- delete back on per-row sequential scans. Never run against a real database without the operator's explicit word.
+-- Drops the eleven operator-user-erase support indexes of 20261105058000 and its ledger row.
+-- LOCAL/TEST ONLY. There are no down-migrations on real databases. On production the four large-table indexes
+-- (and any other the packet prebuilt) are operator-built ones (CREATE INDEX CONCURRENTLY, adopted by the
+-- migration); dropping them puts every slot/seat/stage delete back on per-row sequential scans. Never run against
+-- a real database without the operator's explicit word.
 -- DROP INDEX here is not CONCURRENTLY (it cannot be inside this transaction) and takes ACCESS EXCLUSIVE locks.
 -- Explicit transaction: guard, drops and ledger removal are atomic. On an error the caller must ROLLBACK.
 BEGIN;
@@ -13,10 +14,16 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105058000_operator_user_erase_indexes.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator user erase indexes: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105058000_operator_user_erase_indexes.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'b04dc79d0e0aceb2c2a9084063a54e76692420a252adb9441e22a1f35e93313e'
+ IF NOT FOUND OR v_sha<>'12ee7205b47c5caa65797e236a1eaabb68f5f2cdcc78796372c98d294debf146'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator user erase indexes: own applied checksum required';END IF;
 END $rollback_guard$;
--- Reverse build order; only the five declared names.
+-- Reverse build order; only the eleven declared names.
+DROP INDEX IF EXISTS sessions.ingest_lazy_native_slots_unowned_origin_idx;
+DROP INDEX IF EXISTS sessions.ingest_history_plans_stage_token_idx;
+DROP INDEX IF EXISTS sessions.ingest_buffer_outbox_active_stage_token_idx;
+DROP INDEX IF EXISTS sessions.ingest_stage_intents_batch_idx;
+DROP INDEX IF EXISTS sessions.ingest_stage_intents_gc_replacement_stage_token_idx;
+DROP INDEX IF EXISTS sessions.ingest_stage_intents_parent_stage_token_idx;
 DROP INDEX IF EXISTS sessions.ingest_lazy_ack_decisions_seat_key_sha256_idx;
 DROP INDEX IF EXISTS sessions.ingest_lazy_ack_decisions_native_key_sha256_idx;
 DROP INDEX IF EXISTS sessions.ingest_lazy_native_slots_current_seat_key_idx;
