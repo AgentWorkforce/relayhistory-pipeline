@@ -581,10 +581,18 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
       const none = await failure(runMigrations(client(db), { profile: LOCAL }));
       expect(none?.code).toBe("index_prebuild_required");
       expect(none?.message).toContain(`index sessions.${LAZY} on sessions.ingest_lazy_native_slots (${STEP}) is absent and table sessions.ingest_lazy_native_slots is not empty`);
-      // 044020 inside the pending window (it is the target): refuses exactly as before.
+      // Later adoptable steps with ingest_lazy_native_slots indexes (e.g. 20261105058000) are unheld too, so they are reported.
+      const laterSlotSteps = Object.entries(ADOPTABLE_INDEXES)
+        .filter(([step, list]) => step > STEP && list.some((x) => x.table === "sessions.ingest_lazy_native_slots"))
+        .map(([step]) => step);
+      for (const step of laterSlotSteps) expect(none?.message).toContain(`(${step}) is absent`);
+      // 044020 inside the pending window (it is the target): refuses on 044020 exactly as before; every later
+      // adoptable step is HELD by the target and so is not preflighted (#565).
       const inside = await failure(runMigrations(client(db), { profile: LOCAL, target: STEP }));
       expect(inside?.code).toBe("index_prebuild_required");
-      expect(inside?.message).toBe(none?.message);
+      expect(inside?.message).toContain(`index sessions.${LAZY} on sessions.ingest_lazy_native_slots (${STEP}) is absent and table sessions.ingest_lazy_native_slots is not empty`);
+      for (const step of laterSlotSteps) expect(inside?.message).not.toContain(step);
+      if (laterSlotSteps.length === 0) expect(inside?.message).toBe(none?.message);
       // 044020 HELD (target = the step before it): the preflight no longer refuses; the run reaches the later
       // release-target gate (a held run needs the target commit binding), still before any write.
       expect((await failure(runMigrations(client(db), { profile: LOCAL, target: PREV })))?.code).toBe("release_target_binding_required");
