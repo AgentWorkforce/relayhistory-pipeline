@@ -2,6 +2,7 @@
 import type {BufferedStageSpec,BufferedClaimRecord} from "./buffered-protocol.ts";
 import type {ReceiptSeatSnapshot} from "./publication-seats.ts";
 import type {LedgerTenant} from "./ledger.ts";
+import type {LockerProvider} from "../shared/locker-selection.ts";
 export interface PublicationHead {
  groupIndex:number;ordinals:number[];generation:string;prefix:string;headVersion:string;revision:string;
  previousKey:string|null;previousRawSha256:string|null;basePointer:Record<string,unknown>|null;
@@ -16,7 +17,9 @@ export interface PublicationTicket {
  tenant:LedgerTenant;originId:string;batchId:string;batchDigest:string;claimToken:string;stage:BufferedStageSpec;
  records:BufferedClaimRecord[];receiptSeats:ReceiptSeatSnapshot;acceptedOrdinals:number[];heads:PublicationHead[];
 }
-export interface PublicationTarget {bucket:string;region:string;keyRoot:string;generation:string}
+/** provider is the Locker provider the read API selects for this install (src/shared/locker-selection.ts).
+ * It is stamped on the pointer row and the landed message, so canonical reads (canonical.ts) accept the row. */
+export interface PublicationTarget {bucket:string;region:string;keyRoot:string;generation:string;provider:LockerProvider}
 export interface PublicationObjectSpec {groupIndex:number;key:string;sha256:string;bytes:number;kind:"raw"|"manifest"}
 export interface PublicationImageSpec {
  groupIndex:number;manifestKey:string;manifestSha256:string;manifestBytes:number;rawSha256:string;startedAt:string;pointerRow:Record<string,unknown>;

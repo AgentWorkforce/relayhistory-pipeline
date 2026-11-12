@@ -2398,13 +2398,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const FP = "upstream:20261105047030_frozen_copy_progress.sql";
     const UI = "upstream:20261105058000_operator_user_erase_indexes.sql";
     const UE = "upstream:20261105058010_operator_user_erase.sql";
+    const GP = "upstream:20261105059000_ingest_publication_gcs_provider.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2447,10 +2448,6 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105058010 (operator per-user erase) is the newest: 058000's down refuses (55000) while it is applied;
-    // its own checksum-pinned down refuses while an erase is active, then restores 030000's ingest_lock_fences and
-    // 050010's GC claim exactly and drops the functions, the ledger table and its ledger row.
-    expect((await failure(rollback("20261105058000_operator_user_erase_indexes.down.sql")))?.code).toBe("55000");
     const procSrc = async (sig: string) =>
       (await db.query<{ s: string; d: boolean }>("SELECT prosrc s, prosecdef d FROM pg_proc WHERE oid=$1::regprocedure", [sig])).rows[0]!;
     const bodyOf = (file: string, name: string, tag: string) => {
@@ -2459,6 +2456,24 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // 20261105059000 (publication provider gcs) is the newest: 058010's down refuses (55000) while it is applied; its
+    // checksum-pinned down restores 060000's exact ingest_publication_prepare and 043850's exact
+    // ingest_publication_publish (SECURITY DEFINER kept) and removes its ledger row.
+    expect(await names()).toContain(GP);
+    expect((await procSrc("sessions.ingest_publication_prepare(jsonb)")).s).toContain("NOT IN('s3','gcs')");
+    expect((await procSrc("sessions.ingest_publication_publish(jsonb)")).s).toContain("NOT IN('s3','gcs')");
+    expect((await failure(rollback("20261105058010_operator_user_erase.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(UE);
+    await rollback("20261105059000_ingest_publication_gcs_provider.down.sql");
+    expect(await names()).not.toContain(GP);
+    expect(await procSrc("sessions.ingest_publication_prepare(jsonb)")).toEqual({ s: bodyOf("20261104060000_ingest_canonical_publication.sql", "ingest_publication_prepare", "$prepare$"), d: true });
+    expect(await procSrc("sessions.ingest_publication_publish(jsonb)")).toEqual({ s: bodyOf("20261105043850_ingest_acquisition_owner.sql", "ingest_publication_publish", "$publish$"), d: true });
+    // Its ledger row is gone, so running it again refuses.
+    expect((await failure(rollback("20261105059000_ingest_publication_gcs_provider.down.sql")))?.code).toBe("55000");
+    // 20261105058010 (operator per-user erase) is the newest: 058000's down refuses (55000) while it is applied;
+    // its own checksum-pinned down refuses while an erase is active, then restores 030000's ingest_lock_fences and
+    // 050010's GC claim exactly and drops the functions, the ledger table and its ledger row.
+    expect((await failure(rollback("20261105058000_operator_user_erase_indexes.down.sql")))?.code).toBe("55000");
     expect((await procSrc("sessions.ingest_lock_fences(text,text,text)")).s).toContain("operator_user_erasures");
     expect((await procSrc("sessions.ingest_buffer_gc_claim(jsonb)")).s).toContain("operator_user_erasures");
     expect((await procSrc("sessions.ingest_privacy_authority_begin(jsonb)")).s).toContain("operator_user_erase_control_gate");

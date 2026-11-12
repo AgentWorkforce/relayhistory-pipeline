@@ -61,7 +61,7 @@ try{
  pool=new pg.Pool({...cfg(database,'bulls96_session_ingest'),max:3});pool.on('error',()=>{});
  const bounded=new SemanticPostgresExecutor(pool),run=(sql:string,args:unknown[])=>bounded.queryBounded<any>(sql,args,{signal:AbortSignal.timeout(5000),deadline:Date.now()+5000});
  const producer=sqlLedger(run,{acceptanceMode:'buffered',expectedGeneration:expected});
- const target={bucket,region,keyRoot:'96bulls',generation:expected},rpc=publicationRpc(bounded,target),gc=publicationGcLedger(bounded,target);
+ const target={bucket,region,keyRoot:'96bulls',generation:expected,provider:'s3' as const},rpc=publicationRpc(bounded,target),gc=publicationGcLedger(bounded,target);
  const runId=crypto.randomUUID().slice(0,8);let serial=0;
  async function fixture(){const id=++serial,tenant={orgId:'pub-'+runId+'-'+id,workspaceId:'ws-'+id,userId:'user-'+id},origin='origin-'+id;
   await owner.query('BEGIN;SET LOCAL ROLE bulls96_session_ingest_seeder');try{await owner.query('SELECT sessions.ingest_seed_fence_baseline($1::jsonb)',[JSON.stringify({org_id:tenant.orgId,workspace_id:tenant.workspaceId,user_id:tenant.userId,deletions:[],resets:[]})]);await owner.query('COMMIT');}catch(e){await owner.query('ROLLBACK');throw e}

@@ -90,6 +90,14 @@ test("portable config: hosted identity, malformed target and budget values refus
     expect(codeOf(() => portablePublicationConfig({ ...GOOD, ...p }))).toBe("publication_budget_invalid");
 });
 
+test("portable config: provider follows the read API's Locker selection (LOCKER_PROVIDER), default s3", () => {
+  expect(portablePublicationConfig(GOOD).provider).toBe("s3");
+  expect(portablePublicationConfig({ ...GOOD, LOCKER_PROVIDER: "s3" }).provider).toBe("s3");
+  expect(portablePublicationConfig({ ...GOOD, LOCKER_PROVIDER: "gcs" }).provider).toBe("gcs");
+  expect(portablePublicationConfig({ ...GOOD, LOCKER_PROVIDER: " gcs " }).provider).toBe("gcs");
+  for (const v of ["GCS", "azure", "r2", "fs"]) expect(codeOf(() => portablePublicationConfig({ ...GOOD, LOCKER_PROVIDER: v }))).toBe("publication_target_invalid");
+});
+
 test("portable secret sources: exactly one of value or absolute *_FILE", () => {
   for (const k of ["INGEST_PUBLISH_S3_ACCESS_KEY_ID", "INGEST_PUBLISH_S3_SECRET_ACCESS_KEY", "INGEST_PUBLISH_DATABASE_URL"]) {
     expect(codeOf(() => portablePublicationConfig({ ...GOOD, [k + "_FILE"]: "/run/secrets/x" }))).toBe("publication_secret_source_ambiguous");
