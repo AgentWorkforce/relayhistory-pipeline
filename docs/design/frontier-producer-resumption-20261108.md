@@ -240,10 +240,10 @@ source-contract and whole-lane review conditions are unresolved.
 C3: recovered the original Book artifacts with exact pins dc068aef (v1 design),
 51d358b2 (v3 design), fd3f8908 (contract vectors) and 867f6b35 (bigint known
 answers). The two unmodified synthetic vector sets use their author-published canonical
-paths under docs/handoffs/frontier-attester-20261107, merged from 3caccf36, with
+paths under docs/contracts/frontier-attester-20261107, merged from 3caccf36, with
 their full SHA256 pins enforced by conformance tests. Duplicate docs/contracts
 copies are removed; artifact bytes and known answers are unchanged. The original v3
-design is also published unmodified under docs/handoffs/frontier-attester-20261107
+design is also published unmodified under docs/contracts/frontier-attester-20261107
 with its 51d358b2 pin enforced by the same tests. These historical design/test
 artifacts grant no operational authority. The v3 design governs:
 its source_plan_reuse_C3 explicitly retains the planner's exact existing output

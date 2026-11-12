@@ -4,7 +4,7 @@
   // fills the Hyperdrive id and the vars below from GitHub environment
   // variables. Secrets (CLICKHOUSE_URL, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD)
   // are set out of band with `wrangler secret put` and survive deploys.
-  // See runbooks/sessions-prod-session-read-worker.md.
+  // See sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-session-read-worker.md.
   "$schema": "../../node_modules/wrangler/config-schema.json",
   "name": "bulls96-session-read-api",
   "account_id": "f7232cb80f6fab86a95426302af243e4",

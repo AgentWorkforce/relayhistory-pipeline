@@ -1,5 +1,5 @@
 -- sessions_readonly_stats, step 1 of 2: the NOLOGIN read-only statistics role.
--- Used by .github/workflows/db-readonly-checks.yml (runbooks/sessions-prod-db-readonly-checks.md).
+-- Used by .github/workflows/db-readonly-checks.yml (sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-db-readonly-checks.md).
 --
 -- OWNER GATE. Applying this file to any real database is Khaliq's own separate go, in his own words
 -- (AGENTS.md: credentials, IAM and database changes are outside the agents' standing order). It is NOT a

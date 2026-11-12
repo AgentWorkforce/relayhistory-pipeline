@@ -4,7 +4,7 @@ import { BriefSummaryError, briefSummaryResponse, summaryActivityDays, type Brie
  * contract (packages/relayhistory/src/routes/recall.ts), served from ClickHouse
  * `transcript_events` with Supabase for erasure and the history floor.
  *
- * Phase A routes (runbooks/sessions-prod-session-read-api.md):
+ * Phase A routes (sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-session-read-api.md):
  *   GET /v1/sessions/:id/events     session replay page
  *   GET /v1/events?session=…        in-session reads (q, since, until, kind)
  *   GET /v1/events?q=…              workspace transcript search

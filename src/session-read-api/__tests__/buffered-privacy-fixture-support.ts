@@ -29,8 +29,8 @@ export interface CausalCase {
 export interface ParityCase { id: string; emitBuffered: boolean; patch: Record<string, Json> }
 
 export const root = join(import.meta.dir, "../../..");
-export const causalPath = "docs/handoffs/neon-census-role-20261107/fixtures/option-c-authority-gate-causal-fixtures-v3-20261108.json";
-export const parityPath = "docs/handoffs/neon-census-role-20261107/fixtures/option-c-parity-gate-fixture-addendum-v1-20261108.json";
+export const causalPath = "docs/contracts/owner-buffered-control-head-v5.3/fixtures/option-c-authority-gate-causal-fixtures-v3-20261108.json";
+export const parityPath = "docs/contracts/owner-buffered-control-head-v5.3/fixtures/option-c-parity-gate-fixture-addendum-v1-20261108.json";
 export const causal = JSON.parse(readFileSync(join(root, causalPath), "utf8")) as { cases: CausalCase[] };
 export const parity = JSON.parse(readFileSync(join(root, parityPath), "utf8")) as { base: Record<string, unknown>; cases: ParityCase[] };
 

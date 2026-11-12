@@ -17,7 +17,7 @@
  *                        live-sessions/, live-batches/, SSE-KMS headers required, no delete, no list).
  *                        Users, not roles: a Cloudflare Worker cannot assume a role. No access keys
  *                        are declared here: Alchemy state is plaintext, so keys are created out of
- *                        band straight into 1Password (runbooks/sessions-prod-transcript-store.md).
+ *                        band straight into 1Password (sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-transcript-store.md).
  *
  * Key layout, the 96Bulls pipeline's org-prefix mode (tenants.ts, packages/object-store/src/layout.ts):
  *

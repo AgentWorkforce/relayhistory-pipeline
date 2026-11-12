@@ -270,7 +270,7 @@ inputs and declares only the transcript bucket, its CMK, access logs,
 CloudTrail with S3 data events, a budget and four IAM users (writer, reader,
 eraser, srv-writer for the relayhistory-api live writer), none of the baseline above (`stacks/aws/transcript-store.ts`). Design,
 apply, credentials, Cloudflare wiring, rotation, teardown and the later export:
-`runbooks/sessions-prod-transcript-store.md`.
+`sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-transcript-store.md`.
 
 ## AWS observability
 

@@ -2,7 +2,7 @@ name: deploy session-read-worker
 # Deploys the session read Worker (packages/session-read-worker) to the Agent
 # Workforce Cloudflare account. Manual only, from main, in the
 # `session-read-worker` environment (give it required reviewers); see
-# runbooks/sessions-prod-session-read-worker.md.
+# sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-session-read-worker.md.
 #
 # Environment variables (not secrets; the deploy refuses to run without them):
 #   SESSION_READ_HYPERDRIVE_ID   the Hyperdrive config for bulls96_read_api (32 hex)

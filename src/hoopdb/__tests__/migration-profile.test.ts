@@ -2394,13 +2394,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const SA = "upstream:20261105056000_session_summary_activity.sql";
     const DU = "upstream:20261105057000_session_directory_users_aggregate.sql";
     const UC = "upstream:20261105057010_upload_consent.sql";
+    const FP = "upstream:20261105047030_frozen_copy_progress.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, FP]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2495,8 +2496,23 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await relation("sessions.session_erasure_receipts")).toBeNull();
     expect(await relation("sessions.session_erasure_fences")).toBeNull();
     expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.ingest_operator_erase_session(text,text,text,text,text,text,text)')::text AS p")).rows[0]!.p).toBeNull();
+    // 20261105047030 (frozen-copy progress) is then the newest step: 047010's down refuses (55000) while it is applied,
+    // and its checksum-pinned down drops the receipts guard trigger, the owner-only progress table and its ledger row.
+    const receiptsGuard = async () => (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgrelid='sessions.ingest_frozen_source_receipts'::regclass AND tgname='ingest_privacy_authority_guard'")).rows[0]!.n;
+    expect(await names()).toContain(FP);
+    expect(await relation("sessions.__96bulls_frozen_copy_progress")).toBe("sessions.__96bulls_frozen_copy_progress");
+    expect(await receiptsGuard()).toBe(1);
+    expect((await failure(rollback("20261105047010_buffered_exact_session_stages.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain("upstream:20261105047010_buffered_exact_session_stages.sql");
+    await rollback("20261105047030_frozen_copy_progress.down.sql");
+    expect(await names()).not.toContain(FP);
+    expect(await relation("sessions.__96bulls_frozen_copy_progress")).toBeNull();
+    expect(await receiptsGuard()).toBe(0);
+    expect(await relation("sessions.ingest_frozen_source_receipts")).toBe("sessions.ingest_frozen_source_receipts");
+    // Its ledger row is gone, so running it again refuses.
+    expect((await failure(rollback("20261105047030_frozen_copy_progress.down.sql")))?.code).toBe("55000");
     // Remaining additive successors between 047000 and 050000 roll back before the previous tail.
-    const newest = (await plan(SUPA_A)).filter((step) => step.name.startsWith("upstream:") && step.name > CQ && step.name < OE).reverse();
+    const newest = (await plan(SUPA_A)).filter((step) => step.name.startsWith("upstream:") && step.name > CQ && step.name < OE && step.name !== FP).reverse();
     if (newest.length) expect((await failure(rollback("20261105047000_coordination_fact_readers.down.sql")))?.code).toBe("55000");
     // The exact-session reader's down (047010) refuses while the paged 047020 successor, which
     // requires it, is still applied; the newest-first walk rolls 047020 back before 047010.
