@@ -1080,6 +1080,9 @@
     "sessions.operator_user_erase_count(text,jsonb)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.operator_user_erase_remaining(text,text,text,text[])": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.operator_user_erase_render(text)": [
       "<owner>:EXECUTE"
     ],

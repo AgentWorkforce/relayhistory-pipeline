@@ -428,7 +428,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "the eleven operator-user-erase support indexes, exact definition, valid and ready",
     sql: adoptableIndexesSentinel(OPERATOR_USER_ERASE_INDEXES_STEP),
   },
-  "upstream:20261105058010_operator_user_erase.sql": { evidence: "table sessions.operator_user_erasures (operator per-user erase)", sql: relation("sessions.operator_user_erasures") },
+  "upstream:20261105058010_operator_user_erase.sql": {
+    evidence: "table sessions.operator_user_erasures and the erase check in sessions.ingest_lock_fences (operator per-user erase)",
+    sql: "SELECT to_regclass('sessions.operator_user_erasures') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lock_fences(text,text,text)') AND NOT prosecdef AND prosrc LIKE '%operator_user_erasures%') AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),

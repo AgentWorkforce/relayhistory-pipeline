@@ -9,37 +9,57 @@
 --                                read_api_tokens deleted), fence the user's publication frontiers, capture the
 --                                user's origins (the byte eraser derives the S3 machine prefixes from them),
 --                                refuse published state
---   operator_user_erase_step     restartable. While the user has lazy slots, one call deletes at most p_limit
---                                slots and the receipt rows hanging off them. The call after the last slot is the
---                                final purge: every other per-user row of the tables below in ONE transaction, NOT
---                                bounded by p_limit (its size is the user's batches, claims and stages; the caller's
---                                statement_timeout bounds it), then probes assert none is left
---   operator_user_erase_complete the orchestrator reports that a fresh listing found zero object versions
+--   operator_user_erase_step     restartable. While the user has lazy slots, one call turns at most p_limit
+--                                slots into tombstones and deletes the receipt rows hanging off them (every seat
+--                                of every revision). The call after the last slot is the final purge: every other
+--                                per-user row of the tables below in ONE transaction, NOT bounded by p_limit (its
+--                                size is the user's batches, claims and stages; the caller's statement_timeout
+--                                bounds it), then probes assert none is left
+--   operator_user_erase_complete the orchestrator reports that a fresh listing found zero object versions; the
+--                                probes run again before bytes_verified is recorded
 --
--- All are owner-only (no EXECUTE grant): the operator job connects as the schema owner. begin and step take
--- pg_advisory_xact_lock(961996,50000) exclusively. Only the operator erase lanes take that lock (20261105050000,
--- 050010, 050020 and this file): it serializes erases with each other and with nothing else. The buffered GC
--- (20261105039000) and the ingest and publication writers never take it. What excludes them is the user's
--- ingest_fence_owners row, which begin and step take FOR UPDATE: the buffered GC takes that row before it claims
--- a stage, and publication's pointer guard takes it FOR UPDATE NOWAIT before a session_index row is written.
+-- All are owner-only (no EXECUTE grant): the operator job connects as the schema owner. begin, step and complete
+-- take pg_advisory_xact_lock(961996,50000) exclusively, then the user's ingest_fence_owners row FOR UPDATE. Every
+-- writer that takes the user's fence row through ingest_lock_fences first INSERTs it, and 20261105050010's statement
+-- trigger on ingest_fence_owners takes that advisory lock SHARED for the writer's whole transaction; the buffered GC
+-- claim takes it shared too. So an erase transaction and an ingest transaction for any user never overlap, and
+-- publication's pointer guard still takes the fence row FOR UPDATE NOWAIT before a session_index row is written.
 -- A step refuses to touch a user whose stage still holds a live GC lease (it answers retry_after_ms instead): GC
 -- PUTs a redacted child under that lease, and SQL cannot stop that in-flight object write.
 --
--- Published state: users with published or canonical state (session_index, publication heads/generations,
--- custody records, frozen-source sessions and records, record revisions, canonical history scope owners, the
--- history privacy outbox, a published history plan) are refused with RH040: their sessions go through the
--- per-session erase, which also owns search documents and canonical transcript bytes. The probe runs in begin, at
--- the start of every step and again at the end of the final purge, so a publication that commits after begin
--- turns the next step into RH040 (rolled back; the request stays 'purging'). Publication and history-plan claims
--- need the user's ingest_publication_frontiers row FOR SHARE: begin deletes those rows (waiting out an in-flight
--- claim), and the final purge deletes any the external frontier writer re-registered, after the stage rows (the
--- claims' own lock order: stage row, then frontier).
+-- Ingest fence (the upload policy). Deleting a user's rows does not stop a device from uploading again: a delivery
+-- from an origin begin never saw would otherwise land after the purge, and complete would still record
+-- bytes_verified. This file therefore CREATE OR REPLACEs 20261104030000's sessions.ingest_lock_fences: after it
+-- holds the user's fence row FOR UPDATE it refuses with SQLSTATE RH041 while an operator_user_erasures row for
+-- (org, workspace, user) has state<>'bytes_verified'. Every ingest admission path (claim, buffered stage prepare,
+-- buffered and direct commit, revisions, lazy records/acks/attempts, controls, resets, selections, fan-out,
+-- publication and history-plan claims, GC finish, custody, seed) calls it, and begin inserts the ledger row in the
+-- same transaction that holds the fence row, so the refusal starts at begin's commit. Uploads for the user are
+-- refused from begin until complete records bytes_verified; then the fence lifts and the ledger row stays with
+-- origins '{}' (a later upload is a new footprint, erased by a new request). The ingest edge answers 503
+-- delivery_unavailable and logs db_error_code RH041; the desktop keeps the batch and retries. The one path that
+-- locks the fence row without ingest_lock_fences and could reach this user, the buffered GC claim
+-- (20261105050010), is replaced here so it never leases a stage of a user under erase.
 --
--- Kept on purpose: the revoked auth_sessions rows. 20261104020000's auth_sessions_mirror keeps a revocation only
--- while the row exists; deleting it would let a replayed Neon mirror row re-insert the token un-revoked. The final
--- purge revokes any row that arrived since begin and asserts none is live. 20261105058000 provides the indexes
--- that keep each slot/seat/stage delete an index probe. Tables deliberately not covered: docs/operator-user-erase.md.
-
+-- The fence row is the lock anchor and is KEPT while the request is active: the final purge no longer deletes it
+-- and the "rows remain" probes do not count it. complete takes the same locks and re-runs the full "rows of the
+-- user remain" probe before it records bytes_verified (55000 'operator user erase: rows of the user remain at
+-- completion' otherwise); only then, in that same transaction, does it delete the fence row, so a returning user
+-- is adopted as a new one (20261105041000 admits an unsealed user only on the insert that creates the row).
+--
+-- Lazy slots are tombstoned, never deleted (20261104055000: the global native-key initialization persists so a
+-- stale source row can never reseed the slot). A tombstone keeps key_sha256, org, workspace, lineage and the hex
+-- source identity, control epoch and witness hashes; key_material becomes ["operator-user-erase-tombstone-v1"],
+-- origin_id and record_id become '' and every current_* column NULL. A later delivery of the same record from the
+-- same origin computes the same key, finds the tombstone, and is refused before it writes anything (55000 'native
+-- custody identity changed' in ingest_lazy_records, 'initialized native custody slot required' at the ACK): those
+-- record ids from that origin can never be uploaded again. New records, or a new device origin, are unaffected.
+--
+-- Receipt seats: every seat of the user goes, not only each slot's current one (a new seat is created per accepted
+-- revision). Collected from the slots' ACK decisions, the user's claims' decisions and ordinal seats, and seats
+-- whose key_material names (org, workspace, user) or (org, workspace, captured origin). The key_material arm and its
+-- probe scan ingest_receipt_seats and ingest_receipt_record_heads sequentially (no index; see the runbook).
+--
 CREATE TABLE sessions.operator_user_erasures (
  request_id text PRIMARY KEY,
  org_id text NOT NULL,
@@ -62,7 +82,67 @@ CREATE TABLE sessions.operator_user_erasures (
 CREATE UNIQUE INDEX operator_user_erasures_active ON sessions.operator_user_erasures(org_id,workspace_id,user_id)
  WHERE state<>'bytes_verified';
 ALTER TABLE sessions.operator_user_erasures ENABLE ROW LEVEL SECURITY;
-REVOKE ALL ON sessions.operator_user_erasures FROM PUBLIC;
+REVOKE ALL ON sessions.operator_user_erasures FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
+-- 20261104030000's body plus the erase check (that file is unchanged; the rollback restores its exact body). The
+-- check runs after the row lock, in a fresh read-committed statement snapshot: a writer that waited for begin
+-- (advisory lock, then this row) sees begin's committed ledger row. Owner-only, as before; ACL restated unchanged.
+CREATE OR REPLACE FUNCTION sessions.ingest_lock_fences(p_org text,p_ws text,p_user text)
+RETURNS void LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $lock$
+BEGIN
+ INSERT INTO sessions.ingest_fence_owners VALUES(p_org,p_ws,p_user) ON CONFLICT DO NOTHING;
+ PERFORM 1 FROM sessions.ingest_fence_owners AS f
+ WHERE f.org_id=p_org AND f.workspace_id=p_ws AND f.user_id=p_user FOR UPDATE;
+ IF EXISTS(SELECT 1 FROM sessions.operator_user_erasures AS e
+   WHERE e.org_id=p_org AND e.workspace_id=p_ws AND e.user_id=p_user AND e.state<>'bytes_verified') THEN
+  RAISE EXCEPTION USING ERRCODE='RH041',
+   MESSAGE='operator user erase: uploads for this user are refused until the erase is verified';
+ END IF;
+END
+$lock$;
+REVOKE ALL ON FUNCTION sessions.ingest_lock_fences(text,text,text)
+ FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;
+
+-- True while any row of the user remains in a table this lane erases. Not counted: the fence row (the lock anchor,
+-- kept until complete deletes it), revoked auth_sessions (kept on purpose, see above), slot tombstones (below) and this ledger. p_origins
+-- scopes un-owned lazy slots, the user's batches and origin-named seats. plpgsql, not sql: its body is bound at
+-- first call, so the file still applies on profiles that skip a table it names (043700's owner_buffered_parity).
+CREATE FUNCTION sessions.operator_user_erase_remaining(p_org text,p_ws text,p_user text,p_origins text[]) RETURNS boolean
+LANGUAGE plpgsql STABLE SET search_path=pg_catalog,pg_temp AS $remaining$
+BEGIN
+ RETURN EXISTS(SELECT 1 FROM sessions.ingest_lazy_native_slots WHERE org_id=p_org AND workspace_id=p_ws
+    AND (current_owner=p_user OR (current_owner IS NULL AND origin_id=ANY(p_origins) AND origin_id<>'')))
+  OR EXISTS(SELECT 1 FROM sessions.ingest_stage_intents WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_history_plans WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_claim_attempts WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_claim_sessions WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_buffer_outbox WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_batches WHERE org_id=p_org AND workspace_id=p_ws AND origin_id=ANY(p_origins)
+    AND user_id=p_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_session_ownership WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_fence_versions WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)
+  OR EXISTS(SELECT 1 FROM sessions.upload_deletions WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)
+  OR EXISTS(SELECT 1 FROM sessions.upload_resets WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_publication_frontiers WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)
+  OR EXISTS(SELECT 1 FROM sessions.upload_erasure_rearm WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_tenant_slots WHERE org_id=p_org AND user_id=p_user AND workspace_id=p_ws)
+  OR EXISTS(SELECT 1 FROM sessions.owner_buffered_parity WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)
+  OR EXISTS(SELECT 1 FROM sessions.upload_consent_policies WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)
+  OR EXISTS(SELECT 1 FROM sessions.upload_consent_sessions WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)
+  OR EXISTS(SELECT 1 FROM sessions.upload_consent_origins WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user)
+  OR EXISTS(SELECT 1 FROM sessions.read_api_tokens WHERE org_id=p_org AND user_id=p_user AND workspace_id=p_ws)
+  OR EXISTS(SELECT 1 FROM sessions.auth_sessions WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user
+    AND revoked_at IS NULL)
+  -- Receipt seats and record heads carry the user's ids in key_material ([.., 3 org, 4 workspace, 5 user,
+  -- 6 origin, ..], 20261104053000). No index serves this: a sequential scan of both tables. A seat a surviving
+  -- slot still points to (another user's) is not the user's to erase.
+  OR EXISTS(SELECT 1 FROM sessions.ingest_receipt_seats AS s WHERE s.key_material->>3=p_org AND s.key_material->>4=p_ws
+    AND (s.key_material->>5=p_user OR s.key_material->>6=ANY(p_origins))
+    AND NOT EXISTS(SELECT 1 FROM sessions.ingest_lazy_native_slots AS l WHERE l.current_seat_key=s.key_sha256))
+  OR EXISTS(SELECT 1 FROM sessions.ingest_receipt_record_heads AS h WHERE h.key_material->>3=p_org AND h.key_material->>4=p_ws
+    AND (h.key_material->>5=p_user OR h.key_material->>6=ANY(p_origins)));
+END
+$remaining$;
 
 -- Adds per-table delete counts into the ledger row.
 CREATE FUNCTION sessions.operator_user_erase_count(p_request text, p_counts jsonb) RETURNS void
@@ -107,6 +187,8 @@ BEGIN
  -- The user's fence row (the buffered GC and publication's pointer guard take it), then the publication fence: a
  -- publication or history-plan claim needs the user's frontier row FOR SHARE, so this DELETE waits out an
  -- in-flight claim, and the probe below (a fresh read-committed snapshot) sees whatever it committed.
+ -- The row is created when absent (a user who never uploaded): it is the anchor every later writer waits on.
+ INSERT INTO sessions.ingest_fence_owners VALUES(v_org,v_ws,v_user) ON CONFLICT DO NOTHING;
  PERFORM 1 FROM sessions.ingest_fence_owners WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user FOR UPDATE;
  DELETE FROM sessions.ingest_publication_frontiers WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user;
  GET DIAGNOSTICS v_frontiers=ROW_COUNT;
@@ -144,6 +226,8 @@ BEGIN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator user erase: a device origin of this user is shared with another user';
  END IF;
 
+ -- The ledger row is written in THIS transaction, which holds the fence row: from its commit on, every ingest
+ -- writer of the user that takes the fence row sees it and is refused (RH041).
  -- Revoke the tokens THIS database holds: auth_sessions (revoked, rows kept: see the header) and the session read
  -- API's read_api_tokens (deleted: that table has no revocation column and no mirror). relayhistory-cloud's Neon
  -- auth_sessions is a separate store this function cannot reach; the runbook revokes it BEFORE begin, and until
@@ -193,6 +277,14 @@ BEGIN
   RAISE EXCEPTION USING ERRCODE='RH040',
    MESSAGE='operator user erase: the user has published sessions; erase them with the per-session operator erase first';
  END IF;
+ -- begin's shared-origin refusal, again: another user may have started uploading from a captured origin since
+ -- (that user is not fenced). Their rows are never touched; the request stays 'purging'.
+ IF EXISTS(SELECT 1 FROM sessions.ingest_batches WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND origin_id=ANY(e.origins)
+    AND user_id<>e.user_id)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_lazy_native_slots WHERE org_id=e.org_id AND workspace_id=e.workspace_id
+    AND origin_id=ANY(e.origins) AND current_owner IS NOT NULL AND current_owner<>e.user_id) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator user erase: a device origin of this user is shared with another user';
+ END IF;
  SELECT max(gc_lease_until) INTO v_lease FROM sessions.ingest_stage_intents
   WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id AND gc_lease_until>clock_timestamp();
  IF v_lease IS NOT NULL THEN
@@ -200,30 +292,45 @@ BEGIN
    'retry_after_ms',ceil(extract(epoch FROM v_lease-clock_timestamp())*1000)::bigint+1000);
  END IF;
 
- -- Phase 1: one batch of the user's lazy slots and the receipt rows hanging off them.
+ -- Phase 1: one batch of the user's lazy slots and the receipt rows hanging off them. A slot is never deleted
+ -- (20261104055000: the global native-key initialization persists so a stale source row can never reseed it): it
+ -- becomes a TOMBSTONE that keeps key_sha256, org, workspace, lineage and the hex identity/witness hashes, and loses
+ -- everything naming the user, the device or the record (key_material, origin_id, record_id, current_*). A replay of
+ -- the same record from the same origin finds the slot, sees a different key_material and is refused (55000 'native
+ -- custody identity changed', or 'initialized native custody slot required' at the ACK) before it writes anything.
  SELECT array_agg(key_sha256),array_agg(DISTINCT current_seat_key) FILTER (WHERE current_seat_key IS NOT NULL)
  INTO v_keys,v_seats FROM (
   SELECT key_sha256,current_seat_key FROM sessions.ingest_lazy_native_slots
   WHERE org_id=e.org_id AND workspace_id=e.workspace_id
-    AND (current_owner=e.user_id OR (current_owner IS NULL AND origin_id=ANY(e.origins)))
+    AND (current_owner=e.user_id OR (current_owner IS NULL AND origin_id=ANY(e.origins) AND origin_id<>''))
   LIMIT p_limit) AS s;
  IF v_keys IS NOT NULL THEN
-  -- Seat-keyed rows go only with a seat no slot outside this batch references (never expected; another user's
-  -- slot on the seat keeps the seat and its rows). A seat shared with a later batch of this user goes with it.
-  SELECT coalesce(array_agg(x),'{}') INTO v_seats FROM unnest(coalesce(v_seats,'{}')) AS x
+  -- EVERY seat of these slots, not only the current one: a new seat is created per accepted revision, and the
+  -- ACK decisions of earlier revisions still reference theirs. A seat a slot outside this batch references (another
+  -- user's; never expected) stays with its rows. A seat shared with a later batch of this user goes with it.
+  SELECT coalesce(array_agg(x),'{}') INTO v_seats FROM (
+   SELECT unnest(coalesce(v_seats,'{}'))
+   UNION SELECT seat_key_sha256 FROM sessions.ingest_lazy_ack_decisions WHERE native_key_sha256=ANY(v_keys)) AS u(x)
    WHERE NOT EXISTS(SELECT 1 FROM sessions.ingest_lazy_native_slots AS l WHERE l.current_seat_key=x AND l.key_sha256<>ALL(v_keys));
   DELETE FROM sessions.ingest_lazy_ack_decisions WHERE native_key_sha256=ANY(v_keys) OR seat_key_sha256=ANY(v_seats);
   GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('ingest_lazy_ack_decisions',v_n);
+  UPDATE sessions.ingest_lazy_native_slots SET key_material='["operator-user-erase-tombstone-v1"]'::jsonb,origin_id='',record_id='',
+   current_owner=NULL,current_source=NULL,current_session=NULL,current_revision=NULL,current_digest=NULL,
+   current_reset_epoch=NULL,current_fence_epoch=NULL,current_seat_key=NULL,current_legacy_key=NULL
+  WHERE key_sha256=ANY(v_keys);
+  GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('ingest_lazy_native_slots_tombstoned',v_n);
+  -- After the UPDATE: 20261105026000's slot trigger may enqueue a reconcile request (it carries the owner).
   DELETE FROM sessions.ingest_history_reconcile_outbox WHERE native_key_sha256=ANY(v_keys);
   GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('ingest_history_reconcile_outbox',v_n);
   DELETE FROM sessions.ingest_receipt_record_heads WHERE key_sha256=ANY(v_keys) OR winner_key_sha256=ANY(v_seats);
   GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('ingest_receipt_record_heads',v_n);
   DELETE FROM sessions.ingest_receipt_ord_seats WHERE key_sha256=ANY(v_seats) OR candidate_key_sha256=ANY(v_keys);
   GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('ingest_receipt_ord_seats',v_n);
-  DELETE FROM sessions.ingest_lazy_native_slots WHERE key_sha256=ANY(v_keys);
-  GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('ingest_lazy_native_slots',v_n);
   DELETE FROM sessions.ingest_receipt_seats AS s WHERE s.key_sha256=ANY(v_seats)
-   AND NOT EXISTS(SELECT 1 FROM sessions.ingest_lazy_native_slots AS l WHERE l.current_seat_key=s.key_sha256);
+   AND NOT EXISTS(SELECT 1 FROM sessions.ingest_lazy_native_slots AS l WHERE l.current_seat_key=s.key_sha256)
+   AND NOT EXISTS(SELECT 1 FROM sessions.ingest_receipt_record_heads AS h WHERE h.winner_key_sha256=s.key_sha256)
+   AND NOT EXISTS(SELECT 1 FROM sessions.ingest_receipt_ord_seats AS o WHERE o.key_sha256=s.key_sha256)
+   AND NOT EXISTS(SELECT 1 FROM sessions.ingest_lazy_ack_decisions AS d WHERE d.seat_key_sha256=s.key_sha256);
   GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('ingest_receipt_seats',v_n);
   PERFORM sessions.operator_user_erase_count(e.request_id,v_c);
   RETURN sessions.operator_user_erase_render(e.request_id)||jsonb_build_object('phase','slots');
@@ -235,10 +342,30 @@ BEGIN
   WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id;
  SELECT coalesce(array_agg(stage_token),'{}') INTO v_stages FROM sessions.ingest_stage_intents
   WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id;
- DELETE FROM sessions.ingest_lazy_ack_decisions WHERE claim_token=ANY(v_claims);
+ -- Every remaining seat of the user: those the user's claims' ACK decisions and ordinal seats reference, and those
+ -- whose key_material names the user, or one of the user's origins, in this workspace (a seat whose decisions were
+ -- already cleaned up). Record heads and ordinal seats go first, then every such seat nothing else references; a
+ -- seat a surviving slot points to (another user's) stays.
+ SELECT coalesce(array_agg(DISTINCT x),'{}') INTO v_seats FROM (
+  SELECT seat_key_sha256 FROM sessions.ingest_lazy_ack_decisions WHERE claim_token=ANY(v_claims)
+  UNION SELECT key_sha256 FROM sessions.ingest_receipt_ord_seats WHERE claim_token=ANY(v_claims)
+  UNION SELECT key_sha256 FROM sessions.ingest_receipt_seats WHERE key_material->>3=e.org_id AND key_material->>4=e.workspace_id
+   AND (key_material->>5=e.user_id OR key_material->>6=ANY(e.origins))) AS u(x)
+  WHERE NOT EXISTS(SELECT 1 FROM sessions.ingest_lazy_native_slots AS l WHERE l.current_seat_key=x);
+ DELETE FROM sessions.ingest_lazy_ack_decisions WHERE claim_token=ANY(v_claims) OR seat_key_sha256=ANY(v_seats);
  GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('ingest_lazy_ack_decisions',v_n);
- DELETE FROM sessions.ingest_receipt_ord_seats WHERE claim_token=ANY(v_claims);
+ DELETE FROM sessions.ingest_receipt_record_heads WHERE winner_key_sha256=ANY(v_seats)
+  OR (key_material->>3=e.org_id AND key_material->>4=e.workspace_id
+   AND (key_material->>5=e.user_id OR key_material->>6=ANY(e.origins)));
+ GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('ingest_receipt_record_heads',v_n);
+ DELETE FROM sessions.ingest_receipt_ord_seats WHERE claim_token=ANY(v_claims) OR key_sha256=ANY(v_seats);
  GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('ingest_receipt_ord_seats',v_n);
+ DELETE FROM sessions.ingest_receipt_seats AS s WHERE s.key_sha256=ANY(v_seats)
+  AND NOT EXISTS(SELECT 1 FROM sessions.ingest_lazy_native_slots AS l WHERE l.current_seat_key=s.key_sha256)
+  AND NOT EXISTS(SELECT 1 FROM sessions.ingest_receipt_record_heads AS h WHERE h.winner_key_sha256=s.key_sha256)
+  AND NOT EXISTS(SELECT 1 FROM sessions.ingest_receipt_ord_seats AS o WHERE o.key_sha256=s.key_sha256)
+  AND NOT EXISTS(SELECT 1 FROM sessions.ingest_lazy_ack_decisions AS d WHERE d.seat_key_sha256=s.key_sha256);
+ GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('ingest_receipt_seats',v_n);
  DELETE FROM sessions.ingest_publication_deferrals WHERE stage_token=ANY(v_stages);
  GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('ingest_publication_deferrals',v_n);
  DELETE FROM sessions.ingest_publication_images WHERE attempt_token IN
@@ -305,8 +432,7 @@ BEGIN
  GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('upload_consent_origins',v_n);
  DELETE FROM sessions.upload_consent_policies WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id;
  GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('upload_consent_policies',v_n);
- DELETE FROM sessions.ingest_fence_owners WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id;
- GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('ingest_fence_owners',v_n);
+ -- ingest_fence_owners is NOT deleted: it is the lock anchor the ingest fence and complete take (header).
  -- Tokens: revoke (never delete) any auth session that arrived since begin; read API tokens again.
  UPDATE sessions.auth_sessions SET revoked_at=clock_timestamp(),revoked_reason='operator_user_erase',updated_at=clock_timestamp()
  WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id AND revoked_at IS NULL;
@@ -335,26 +461,11 @@ BEGIN
   RAISE EXCEPTION USING ERRCODE='RH040',
    MESSAGE='operator user erase: the user has published sessions; erase them with the per-session operator erase first';
  END IF;
- -- Nothing of the user may remain in any table this lane owns (index-backed probes only).
- IF EXISTS(SELECT 1 FROM sessions.ingest_lazy_native_slots WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND current_owner=e.user_id)
-  OR EXISTS(SELECT 1 FROM sessions.ingest_stage_intents WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id)
-  OR EXISTS(SELECT 1 FROM sessions.ingest_history_plans WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id)
-  OR EXISTS(SELECT 1 FROM sessions.ingest_claim_attempts WHERE claim_token=ANY(v_claims))
-  OR EXISTS(SELECT 1 FROM sessions.ingest_claim_sessions WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id)
-  OR EXISTS(SELECT 1 FROM sessions.ingest_buffer_outbox WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id)
-  OR EXISTS(SELECT 1 FROM sessions.ingest_batches AS b WHERE b.org_id=e.org_id AND b.workspace_id=e.workspace_id
-    AND b.origin_id=ANY(e.origins) AND b.user_id=e.user_id)
-  OR EXISTS(SELECT 1 FROM sessions.ingest_publication_frontiers WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id)
-  OR EXISTS(SELECT 1 FROM sessions.ingest_fence_owners WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id)
-  OR EXISTS(SELECT 1 FROM sessions.upload_erasure_rearm WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id)
-  OR EXISTS(SELECT 1 FROM sessions.ingest_tenant_slots WHERE org_id=e.org_id AND user_id=e.user_id AND workspace_id=e.workspace_id)
-  OR EXISTS(SELECT 1 FROM sessions.owner_buffered_parity WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id)
-  OR EXISTS(SELECT 1 FROM sessions.upload_consent_policies WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id)
-  OR EXISTS(SELECT 1 FROM sessions.upload_consent_sessions WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id)
-  OR EXISTS(SELECT 1 FROM sessions.upload_consent_origins WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id)
-  OR EXISTS(SELECT 1 FROM sessions.read_api_tokens WHERE org_id=e.org_id AND user_id=e.user_id AND workspace_id=e.workspace_id)
-  OR EXISTS(SELECT 1 FROM sessions.auth_sessions WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id
-    AND revoked_at IS NULL) THEN
+ -- Nothing of the user may remain in any table this lane owns (the fence row and slot tombstones excepted), and no
+ -- seat the user's claims referenced may survive unless a surviving slot still points to it.
+ IF sessions.operator_user_erase_remaining(e.org_id,e.workspace_id,e.user_id,e.origins)
+  OR EXISTS(SELECT 1 FROM sessions.ingest_receipt_seats AS s WHERE s.key_sha256=ANY(v_seats)
+    AND NOT EXISTS(SELECT 1 FROM sessions.ingest_lazy_native_slots AS l WHERE l.current_seat_key=s.key_sha256)) THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator user erase: rows of the user remain after the purge';
  END IF;
 
@@ -366,17 +477,41 @@ END
 $step$;
 
 -- The orchestrator calls this only after a fresh, strict listing found zero versions and zero delete markers under
--- every machine prefix of the captured origins. The origins are then cleared: the ledger keeps counts only.
+-- every machine prefix of the captured origins. Same locks as step; tokens that arrived since the final purge are
+-- revoked again (auth_sessions) or deleted (read_api_tokens, publication frontiers), then the full "rows of the user
+-- remain" probe runs once more: a row that landed after metadata_purged refuses the completion (55000) and the
+-- request stays metadata_purged. Otherwise the fence row is deleted, the origins are cleared (the ledger keeps
+-- counts only) and the ingest fence lifts.
 CREATE FUNCTION sessions.operator_user_erase_complete(p_request text) RETURNS jsonb
 LANGUAGE plpgsql VOLATILE SET search_path=pg_catalog,pg_temp AS $complete$
-DECLARE e sessions.operator_user_erasures%ROWTYPE;
+DECLARE e sessions.operator_user_erasures%ROWTYPE;v_n bigint;v_c jsonb:='{}'::jsonb;
 BEGIN
+ IF current_setting('transaction_isolation')<>'read committed' THEN
+  RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='operator user erase: read-committed transaction required';END IF;
+ PERFORM pg_advisory_xact_lock(961996,50000);
  SELECT * INTO e FROM sessions.operator_user_erasures
   WHERE request_id=sessions.ingest_identifier(to_jsonb(p_request),false) FOR UPDATE;
  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='operator user erase: unknown request';END IF;
  IF e.state='purging' THEN
   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator user erase: metadata purge is not finished';END IF;
  IF e.state='metadata_purged' THEN
+  PERFORM 1 FROM sessions.ingest_fence_owners WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id FOR UPDATE;
+  UPDATE sessions.auth_sessions SET revoked_at=clock_timestamp(),revoked_reason='operator_user_erase',updated_at=clock_timestamp()
+  WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id AND revoked_at IS NULL;
+  GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('auth_sessions_revoked_late',v_n);
+  DELETE FROM sessions.read_api_tokens WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id;
+  GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('read_api_tokens',v_n);
+  DELETE FROM sessions.ingest_publication_frontiers WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id;
+  GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('ingest_publication_frontiers',v_n);
+  IF sessions.operator_user_erase_remaining(e.org_id,e.workspace_id,e.user_id,e.origins) THEN
+   RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator user erase: rows of the user remain at completion';END IF;
+  -- The fence row goes with the transition, inside the transaction that holds it: a returning user is adopted
+  -- like a new one (20261105041000's ingest_lazy_user admits an unsealed user only on the INSERT that creates
+  -- the fence row). A writer queued on the row sees it gone, is not refused, and fails that adoption check
+  -- (55000, nothing written); its retry creates a fresh row.
+  DELETE FROM sessions.ingest_fence_owners WHERE org_id=e.org_id AND workspace_id=e.workspace_id AND user_id=e.user_id;
+  GET DIAGNOSTICS v_n=ROW_COUNT;v_c:=v_c||jsonb_build_object('ingest_fence_owners',v_n);
+  PERFORM sessions.operator_user_erase_count(e.request_id,v_c);
   UPDATE sessions.operator_user_erasures SET state='bytes_verified',bytes_verified_at=clock_timestamp(),origins='{}',
    updated_at=clock_timestamp() WHERE request_id=e.request_id;
  END IF;
@@ -384,6 +519,148 @@ BEGIN
 END
 $complete$;
 
+-- 20261105050010's buffered GC claim plus one candidate filter: never lease a stage of a user with an active erase
+-- (the claim takes the user's fence row directly, not through ingest_lock_fences). Otherwise unchanged; the
+-- rollback restores 20261105050010's body.
+CREATE OR REPLACE FUNCTION sessions.ingest_buffer_gc_claim(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $claim$
+DECLARE v_limit int;v_generation text;candidate record;s sessions.ingest_stage_intents%ROWTYPE;
+ child sessions.ingest_stage_intents%ROWTYPE;parent sessions.ingest_stage_intents%ROWTYPE;
+ v_keep jsonb;v_ordinals jsonb;v_phase text;v_ticket jsonb;v_tickets jsonb:='[]';v_has_outbox boolean;v_abort boolean;v_token uuid;v_outbox_version bigint;
+BEGIN
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ PERFORM pg_advisory_xact_lock_shared(961996,50000);
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['limit','generation']);
+ v_generation:=sessions.ingest_digest(p->'generation');
+ -- Marker first: metadata operations never wait for it while holding user/table
+ -- locks. The migrator's PENDING update waits for this short operation to finish.
+ PERFORM sessions.ingest_require_generation(v_generation);
+ v_limit:=sessions.ingest_bounded(p->'limit',1,100);
+ FOR candidate IN SELECT stage_token,org_id,workspace_id,user_id,origin_id,batch_id
+  FROM sessions.ingest_stage_intents
+  WHERE cleanup_state<>'redacted' AND (gc_lease_until IS NULL OR gc_lease_until<=clock_timestamp())
+   AND NOT EXISTS(SELECT 1 FROM sessions.operator_user_erasures AS e WHERE e.org_id=ingest_stage_intents.org_id
+    AND e.workspace_id=ingest_stage_intents.workspace_id AND e.user_id=ingest_stage_intents.user_id AND e.state<>'bytes_verified')
+  ORDER BY coalesce(gc_checked_at,created_at),stage_token LIMIT 4
+ LOOP
+  -- GC-only admission hint; legacy writers do not take this advisory lock.
+  -- The existing USER row lock below remains the authority shared with them.
+  -- An acquisition-only subtransaction releases EVERY lock on a busy skip.
+  -- No retention error, timeout, generation failure or mutation is swallowed.
+  BEGIN
+   IF NOT pg_try_advisory_xact_lock(hashtextextended(jsonb_build_array(
+      '96bulls:buffer-gc-user-v1',candidate.org_id,candidate.workspace_id,candidate.user_id)::text,0)) THEN
+    RAISE lock_not_available USING MESSAGE='buffer gc: user busy';
+   END IF;
+   PERFORM 1 FROM sessions.ingest_fence_owners WHERE org_id=candidate.org_id
+    AND workspace_id=candidate.workspace_id AND user_id=candidate.user_id FOR UPDATE NOWAIT;
+   IF NOT FOUND THEN
+    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='buffer gc: user fence missing';
+   END IF;
+   PERFORM 1 FROM sessions.ingest_batches WHERE org_id=candidate.org_id AND workspace_id=candidate.workspace_id
+    AND origin_id=candidate.origin_id AND batch_id=candidate.batch_id FOR UPDATE NOWAIT;
+   IF NOT FOUND THEN
+    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='buffer gc: batch missing';
+   END IF;
+   SELECT * INTO s FROM sessions.ingest_stage_intents WHERE stage_token=candidate.stage_token FOR UPDATE NOWAIT;
+   IF NOT FOUND OR s.cleanup_state='redacted' OR s.gc_lease_until>clock_timestamp() THEN
+    RAISE lock_not_available USING MESSAGE='buffer gc: candidate changed';
+   END IF;
+   PERFORM 1 FROM sessions.ingest_buffer_outbox WHERE org_id=s.org_id AND workspace_id=s.workspace_id
+    AND origin_id=s.origin_id AND batch_id=s.batch_id FOR UPDATE NOWAIT;
+  EXCEPTION WHEN lock_not_available THEN
+   CONTINUE;
+  END;
+  IF ROW(s.org_id,s.workspace_id,s.user_id,s.origin_id,s.batch_id) IS DISTINCT FROM
+    ROW(candidate.org_id,candidate.workspace_id,candidate.user_id,candidate.origin_id,candidate.batch_id)
+  THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='buffer gc: identity changed';END IF;
+  -- A prospective child cannot be independently aborted during its parent's copy.
+  IF s.parent_stage_token IS NOT NULL THEN
+   SELECT * INTO parent FROM sessions.ingest_stage_intents WHERE stage_token=s.parent_stage_token;
+   -- Prospective bytes have a deterministic key. They remain owned through
+   -- repeated parent crashes; retiring them merely because a lease expired would
+   -- make that same replacement key permanently unusable after its barrier.
+   IF parent.gc_replacement_stage_token=s.stage_token AND parent.cleanup_state='live' AND parent.receipt_state='acknowledged'
+    AND ROW(parent.org_id,parent.workspace_id,parent.user_id,parent.origin_id,parent.batch_id,parent.claim_token,parent.digest)
+      IS NOT DISTINCT FROM ROW(s.org_id,s.workspace_id,s.user_id,s.origin_id,s.batch_id,s.claim_token,s.digest)
+    AND EXISTS(SELECT 1 FROM sessions.ingest_buffer_outbox o WHERE o.org_id=parent.org_id AND o.workspace_id=parent.workspace_id
+      AND o.user_id=parent.user_id AND o.origin_id=parent.origin_id AND o.batch_id=parent.batch_id AND o.digest=parent.digest
+      AND o.state='buffered' AND o.active_stage_token=parent.stage_token)
+   THEN
+    UPDATE sessions.ingest_stage_intents SET gc_checked_at=clock_timestamp() WHERE stage_token=s.stage_token;
+    EXIT;
+   END IF;
+  END IF;
+  PERFORM 1 FROM sessions.ingest_buffer_outbox WHERE org_id=s.org_id AND workspace_id=s.workspace_id
+   AND origin_id=s.origin_id AND batch_id=s.batch_id FOR UPDATE;
+  SELECT row_version INTO v_outbox_version FROM sessions.ingest_buffer_outbox WHERE active_stage_token=s.stage_token;
+  v_has_outbox:=FOUND;
+  v_abort:=false;
+  IF s.cleanup_state='retired' THEN
+   IF v_has_outbox THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='buffer gc: current object cannot be cleaned';END IF;
+   v_keep:='[]';v_ordinals:='[]';v_phase:='cleanup';
+  ELSE
+   v_ordinals:=sessions.ingest_buffer_gc_ordinals(s.stage_token);
+   SELECT coalesce(jsonb_agg(idx-1 ORDER BY idx),'[]') INTO v_keep
+    FROM jsonb_array_elements(s.group_ordinals) WITH ORDINALITY g(value,idx)
+    WHERE EXISTS(SELECT 1 FROM jsonb_array_elements(value)o WHERE v_ordinals @> jsonb_build_array(o));
+   IF s.receipt_state='preparing' THEN
+    IF v_has_outbox THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='buffer gc: preparing current object';END IF;
+    v_abort:=s.expires_at<=clock_timestamp() OR jsonb_array_length(v_ordinals)<>(SELECT count(*) FROM jsonb_array_elements(s.group_ordinals)g CROSS JOIN LATERAL jsonb_array_elements(g)o);
+    IF NOT v_abort THEN
+     UPDATE sessions.ingest_stage_intents SET gc_checked_at=clock_timestamp() WHERE stage_token=s.stage_token;
+     EXIT;
+    END IF;
+    v_keep:='[]';v_ordinals:='[]';v_phase:='cleanup';
+   ELSE
+    IF NOT v_has_outbox THEN
+     -- Acknowledged but unreferenced intent is a known retired object.
+     v_abort:=true;v_keep:='[]';v_ordinals:='[]';v_phase:='cleanup';
+    ELSIF jsonb_array_length(v_ordinals)=(SELECT count(*) FROM jsonb_array_elements(s.group_ordinals)g CROSS JOIN LATERAL jsonb_array_elements(g)o) THEN
+     UPDATE sessions.ingest_stage_intents SET gc_checked_at=clock_timestamp() WHERE stage_token=s.stage_token;
+     EXIT;
+    ELSE v_phase:='plan';END IF;
+   END IF;
+  END IF;
+  -- A stale prospective child is never adopted into another keep set.
+  IF s.gc_replacement_stage_token IS NOT NULL THEN
+   SELECT * INTO child FROM sessions.ingest_stage_intents WHERE stage_token=s.gc_replacement_stage_token FOR UPDATE;
+   IF NOT FOUND OR child.cleanup_state<>'live' OR child.group_ordinals IS DISTINCT FROM
+     sessions.ingest_buffer_gc_groups(s.group_ordinals,v_ordinals)
+   THEN
+    IF FOUND AND NOT EXISTS(SELECT 1 FROM sessions.ingest_buffer_outbox WHERE active_stage_token=child.stage_token) THEN
+     UPDATE sessions.ingest_stage_intents SET cleanup_state='retired',row_version=row_version+1,
+      gc_lease_token=NULL,gc_lease_until=NULL,gc_lease_version=NULL WHERE stage_token=child.stage_token;
+    END IF;
+    s.gc_replacement_stage_token:=NULL;
+   END IF;
+  END IF;
+  v_token:=gen_random_uuid();
+  UPDATE sessions.ingest_stage_intents SET gc_generation=v_generation,gc_lease_token=v_token,gc_lease_until=clock_timestamp()+interval '5 minutes',
+   row_version=row_version+1,gc_lease_version=row_version+1,gc_checked_at=clock_timestamp(),gc_keep_groups=v_keep,gc_keep_ordinals=v_ordinals,
+   gc_replacement_stage_token=s.gc_replacement_stage_token,gc_outbox_version=v_outbox_version,
+   cleanup_state=CASE WHEN v_abort THEN 'retired' ELSE cleanup_state END
+   WHERE stage_token=s.stage_token RETURNING * INTO s;
+  v_ticket:=jsonb_build_object('stageToken',s.stage_token,'claimToken',s.claim_token,'leaseToken',v_token,
+   'rowVersion',s.row_version::text,'key',s.stage_key,'sha256',s.stage_sha256,'bytes',s.stage_bytes,
+   'groupOrdinals',s.group_ordinals,'keepGroupIndexes',v_keep,'keepOrdinals',v_ordinals,'receiptState',s.receipt_state,'phase',v_phase,
+   'resetEpoch',s.reset_epoch::text,'cleanupState',s.cleanup_state);
+  IF s.gc_replacement_stage_token IS NOT NULL THEN
+   SELECT * INTO child FROM sessions.ingest_stage_intents WHERE stage_token=s.gc_replacement_stage_token;
+   v_ticket:=v_ticket||jsonb_build_object('replacement',jsonb_build_object('stageToken',child.stage_token,
+    'key',child.stage_key,'sha256',child.stage_sha256,'bytes',child.stage_bytes,'groupOrdinals',child.group_ordinals));
+  END IF;
+  v_tickets:=v_tickets||jsonb_build_array(v_ticket);
+  EXIT; -- At most ONE fully evaluated candidate per transaction, including healthy rotations.
+ END LOOP;
+ IF EXISTS(SELECT 1 FROM jsonb_array_elements(v_tickets)t JOIN sessions.ingest_stage_intents i
+   ON i.stage_token=(t->>'stageToken')::uuid WHERE i.gc_lease_token IS DISTINCT FROM (t->>'leaseToken')::uuid
+    OR i.gc_lease_until<=clock_timestamp())
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='buffer gc: claim lease expired';END IF;
+ IF octet_length(v_tickets::text)>16777216 THEN RAISE EXCEPTION USING ERRCODE='54000',MESSAGE='buffer gc: ticket byte bound';END IF;
+ RETURN jsonb_build_object('tickets',v_tickets);
+END $claim$;
 REVOKE ALL ON FUNCTION sessions.operator_user_erase_count(text,jsonb),sessions.operator_user_erase_render(text),
+ sessions.operator_user_erase_remaining(text,text,text,text[]),
  sessions.operator_user_erase_begin(text,text,text,text),sessions.operator_user_erase_step(text,integer),
- sessions.operator_user_erase_complete(text) FROM PUBLIC;
+ sessions.operator_user_erase_complete(text) FROM PUBLIC,anon,authenticated,service_role,bulls96_session_ingest,bulls96_session_ingest_seeder;

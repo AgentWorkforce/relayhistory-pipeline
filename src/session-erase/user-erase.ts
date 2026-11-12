@@ -13,7 +13,9 @@
  *                origin: buffered batches, staged live batches, transcript objects and live pointers
  *   4. settle    wait, then a fresh strict listing of every prefix; anything found (a late in-flight PUT) is
  *                erased and the wait/verify repeats, up to `maxByteRounds`
- *   5. complete  only after every prefix verified empty; the ledger then drops the origins and keeps counts
+ *   5. complete  only after every prefix verified empty; re-runs the "rows of the user remain" probe (a late row
+ *                refuses with user_rows_remain_at_completion and nothing is reported verified), then the ledger
+ *                drops the origins and keeps counts. Uploads of the user are refused (RH041) from begin until here.
  *
  * The machine id is per (workspace, origin, user) (`liveMachineId`), so a prefix never holds another user's
  * objects. The buffered GC owns buffered objects only while their stage rows exist: the bytes phase starts
@@ -167,6 +169,8 @@ export async function runUserErase(db: UserEraseDb, req: UserEraseRequest, opts:
   }
   log({ event: "user_erase_metadata", state: view.state, steps });
   const base = { tokensRevoked: view.tokens_revoked, steps, leaseWaits };
+  // Only a verified erase short-circuits. A rerun of a metadata_purged request runs the byte phase and complete's
+  // recheck again, whatever an earlier run reported.
   if (view.state === "bytes_verified") {
     return { ...base, state: view.state, verified: true, deleted: view.deleted, prefixes: 0, versionsDeleted: 0, byteRounds: 0 };
   }
@@ -205,6 +209,19 @@ export async function runUserErase(db: UserEraseDb, req: UserEraseRequest, opts:
     verified = remaining === 0;
     log({ event: "user_erase_bytes", round: byteRounds, prefixes: prefixes.length, versions_deleted: versionsDeleted, remaining });
   }
-  if (verified) view = await call(db, "SELECT sessions.operator_user_erase_complete($1) AS r", [req.requestId]);
+  if (verified) {
+    try {
+      view = await call(db, "SELECT sessions.operator_user_erase_complete($1) AS r", [req.requestId]);
+    } catch (e) {
+      // A row of the user landed after the metadata purge (a writer the ingest fence does not cover): the request
+      // stays metadata_purged and is never reported verified. Only the code is surfaced, never the message.
+      const err = e as { code?: unknown; message?: unknown };
+      if (err?.code === "55000" && typeof err.message === "string" && err.message.includes("remain at completion")) {
+        log({ event: "user_erase_complete_refused", code: "user_rows_remain_at_completion" });
+        refuse("user_rows_remain_at_completion");
+      }
+      throw e;
+    }
+  }
   return { ...base, state: view.state, verified, deleted: view.deleted, prefixes: prefixes.length, versionsDeleted, byteRounds };
 }

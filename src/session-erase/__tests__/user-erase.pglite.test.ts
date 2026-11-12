@@ -13,7 +13,7 @@ import { authorityFixture, epoch, generation, identity } from "../../session-ing
 import { storeEraser } from "../../migration/neon-s3-erasure/eraser.ts";
 import { liveMachineId } from "../../migration/neon-s3-erasure/live.ts";
 import { objectKey } from "../../shared/vendor.ts";
-import { runUserErase, type UserEraseDb } from "../user-erase.ts";
+import { runUserErase, UserEraseRefused, type UserEraseDb } from "../user-erase.ts";
 
 setDefaultTimeout(300_000);
 const open: Array<() => unknown> = [];
@@ -34,11 +34,27 @@ async function fixture(): Promise<Fixture> {
   return f;
 }
 
+type DeliverOpts = { revision?: number; origin?: string; recordPrefix?: string };
 /** One real buffered delivery (claim -> stage -> commit -> lazy ACK) for `tenant`. */
-async function deliver(f: Fixture, tenant: Tenant, batchId: string, n: number) {
-  const origin = ORIGIN[tenant.userId]!;
+async function deliver(f: Fixture, tenant: Tenant, batchId: string, n: number, opts: DeliverOpts = {}) {
+  const out = await deliverRaw(f, tenant, batchId, n, opts);
+  expect(out.outcome).toBe("accepted_buffered");
+}
+/** The same delivery, returning null when accepted or the refusal's code (e.g. ledger_sqlstate_RH041). */
+async function tryDeliver(f: Fixture, tenant: Tenant, batchId: string, n: number, opts: DeliverOpts = {}): Promise<string | null> {
+  try {
+    const out = await deliverRaw(f, tenant, batchId, n, opts);
+    return out.outcome === "accepted_buffered" ? null : `outcome_${out.outcome}`;
+  } catch (e) {
+    const err = e as { cause_code?: string; code?: string };
+    return err.cause_code ?? err.code ?? "?";
+  }
+}
+async function deliverRaw(f: Fixture, tenant: Tenant, batchId: string, n: number, opts: DeliverOpts) {
+  const origin = opts.origin ?? ORIGIN[tenant.userId]!;
+  const prefix = opts.recordPrefix ?? batchId;
   const raw = await batch(
-    Array.from({ length: n }, (_, i) => record({ record_id: `${batchId}-r${i}`, revision: 2, session_id: `${batchId}-s${i % 2}`, origin_id: origin })),
+    Array.from({ length: n }, (_, i) => record({ record_id: `${prefix}-r${i}`, revision: opts.revision ?? 2, session_id: `${prefix}-s${i % 2}`, origin_id: origin })),
     { batch_id: batchId, origin_id: origin, account_id: await deliveryAccount(tenant) },
   );
   const p = await prepareDelivery(tenant, raw);
@@ -50,8 +66,7 @@ async function deliver(f: Fixture, tenant: Tenant, batchId: string, n: number) {
     privacy: { complete: true, deletions: [], resets: [] } };
   const sourceDigest = (await f.db.query<{ d: string }>("SELECT encode(sha256(convert_to($1::jsonb::text,'UTF8')),'hex') AS d", [JSON.stringify(w)])).rows[0]!.d;
   const ledger = sqlLedger(f.run, { acceptanceMode: "buffered", expectedGeneration: generation });
-  const out = await deliverBatch({ ...f.deps, ledger, custody: { witness: w, sourceDigest } } as never, tenant, raw);
-  expect(out.outcome).toBe("accepted_buffered");
+  return deliverBatch({ ...f.deps, ledger, custody: { witness: w, sourceDigest } } as never, tenant, raw);
 }
 
 async function authSession(f: Fixture, tenant: Tenant, id: string) {
@@ -125,6 +140,26 @@ async function storeKeys(f: Fixture): Promise<string[]> {
   } while (cursor);
   return out.sort();
 }
+/** Receipt seats and record heads whose key_material names the user (index 5; 053000 / 043500 key shape). */
+async function seatsNaming(f: Fixture, t: Tenant) {
+  return (await f.db.query<{ seats: number; heads: number }>(
+    `SELECT (SELECT count(*)::int FROM sessions.ingest_receipt_seats WHERE key_material->>3=$1 AND key_material->>4=$2 AND key_material->>5=$3) seats,
+            (SELECT count(*)::int FROM sessions.ingest_receipt_record_heads WHERE key_material->>3=$1 AND key_material->>4=$2 AND key_material->>5=$3) heads`,
+    [t.orgId, t.workspaceId, t.userId])).rows[0]!;
+}
+/** Rows in any sessions table whose text form contains `needle` (test-only full scan). */
+async function rowsContaining(f: Fixture, needle: string): Promise<Record<string, number>> {
+  const tables = (await f.db.query<{ t: string }>(
+    "SELECT table_name t FROM information_schema.tables WHERE table_schema='sessions' AND table_type='BASE TABLE' ORDER BY 1")).rows;
+  const out: Record<string, number> = {};
+  for (const { t } of tables) {
+    const n = (await f.db.query<{ n: number }>(`SELECT count(*)::int n FROM sessions.${t} x WHERE x::text LIKE $1`, [`%${needle}%`])).rows[0]!.n;
+    if (n > 0) out[t] = n;
+  }
+  return out;
+}
+const state = async (f: Fixture, req: string) =>
+  (await f.db.query<{ s: string }>("SELECT state s FROM sessions.operator_user_erasures WHERE request_id=$1", [req])).rows[0]!.s;
 const machine = (t: Tenant) => liveMachineId(t.workspaceId, ORIGIN[t.userId]!, t.userId);
 
 describe("operator per-user erase (058010)", () => {
@@ -151,11 +186,12 @@ describe("operator per-user erase (058010)", () => {
     const { r, phases } = await purge(f, "req-1", 2);
     expect(phases).toEqual(["slots", "slots", "slots", "purged"]); // 5 slots at 2 per step, then the purge
     expect(r).toMatchObject({ state: "metadata_purged", done: true });
-    expect(r.deleted).toMatchObject({ ingest_lazy_native_slots: 5, ingest_receipt_seats: 5, ingest_batches: 2, auth_sessions_revoked_late: 0 });
+    expect(r.deleted).toMatchObject({ ingest_lazy_native_slots_tombstoned: 5, ingest_receipt_seats: 5, ingest_batches: 2, auth_sessions_revoked_late: 0 });
     expect(r.deleted).not.toHaveProperty("auth_sessions");
 
-    // Only the revoked auth session stays: deleting it would let a replayed Neon mirror row re-insert it live.
-    expect(await footprint(f, ALICE)).toEqual({ "auth_sessions.user_id": 1 });
+    // Only the revoked auth session and the fence row stay: deleting the session would let a replayed Neon mirror
+    // row re-insert it live; the fence row is what the ingest fence locks.
+    expect(await footprint(f, ALICE)).toEqual({ "auth_sessions.user_id": 1, "ingest_fence_owners.user_id": 1 });
     expect((await f.db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.auth_sessions WHERE user_id=$1 AND revoked_at IS NULL", [ALICE.userId])).rows[0]!.n).toBe(0);
     expect(await receiptRows(f, ALICE)).toEqual({ slots: 0, seats: 0, acks: 0 });
     expect(await footprint(f, BOB)).toEqual(bobBefore);
@@ -240,7 +276,7 @@ describe("operator per-user erase (058010)", () => {
     const after = await storeKeys(f);
     expect(after.filter((k) => k.includes(`/m=${machine(ALICE)}/`))).toEqual([]);
     expect(after.filter((k) => k.includes(`/m=${machine(BOB)}/`))).toEqual(bobKeys);
-    expect(await footprint(f, ALICE)).toEqual({});
+    expect(await footprint(f, ALICE)).toEqual({}); // complete deleted the fence row with the bytes_verified transition
 
     // A rerun of the same request is a no-op that reports the completed erase.
     const again = await runUserErase(pgDb(f), { requestId: "req-e2e", ...ALICE }, { keyRoot: "96bulls", eraser: storeEraser(f.deps.target.store), sleep: async () => {} });
@@ -328,6 +364,8 @@ describe("operator per-user erase (058010)", () => {
     expect(await bobRows()).toEqual(before);
     expect((await slot(BOB.userId)).k).toBeDefined();
     expect((await receiptRows(f, ALICE)).slots).toBe(0);
+    // Of the seats naming Alice, only the one Bob's slot still points to survives.
+    expect(await seatsNaming(f, ALICE)).toEqual({ seats: 1, heads: 0 });
   });
 
   test("every per-user row goes: publication frontiers, consent, tenant slots, rearm, parity, read API tokens; late auth sessions are revoked", async () => {
@@ -361,9 +399,112 @@ describe("operator per-user erase (058010)", () => {
     const { r } = await purge(f, "req-1", 10);
     expect(r.deleted).toMatchObject({ ingest_publication_frontiers: 2, read_api_tokens: 1, upload_consent_policies: 1, upload_consent_sessions: 1,
       upload_consent_origins: 1, ingest_tenant_slots: 1, upload_erasure_rearm: 1, owner_buffered_parity: 1, auth_sessions_revoked_late: 1 });
-    expect(await footprint(f, ALICE)).toEqual({ "auth_sessions.user_id": 1 });
+    expect(await footprint(f, ALICE)).toEqual({ "auth_sessions.user_id": 1, "ingest_fence_owners.user_id": 1 });
     expect((await f.db.query<{ r: string }>("SELECT revoked_reason r FROM sessions.auth_sessions WHERE id='auth-alice-late'")).rows[0]!.r).toBe("operator_user_erase");
     expect(await footprint(f, BOB)).toEqual(bobBefore);
+  });
+
+  test("(a) a delivery from a device origin begin never captured is fenced (RH041) until bytes_verified, then admitted", async () => {
+    const f = await fixture();
+    await deliver(f, ALICE, "a1", 2);
+    const b = await begin(f, "req-1", ALICE);
+    expect(b.origins).toEqual(["origin-alice"]);
+    // The race: origin B was not captured at begin, so the purge would never look at what it writes.
+    expect(await tryDeliver(f, ALICE, "ob1", 1, { origin: "origin-b" })).toBe("ledger_sqlstate_RH041");
+    expect((await purge(f, "req-1", 10)).r.state).toBe("metadata_purged");
+    expect(await tryDeliver(f, ALICE, "ob2", 1, { origin: "origin-b" })).toBe("ledger_sqlstate_RH041");
+    expect(await rowsContaining(f, "origin-b")).toEqual({});
+    // A rerun of the metadata_purged request runs the byte phase and the completion recheck.
+    const out = await runUserErase(pgDb(f), { requestId: "req-1", ...ALICE }, { keyRoot: "96bulls", eraser: storeEraser(f.deps.target.store), settleMs: 1, sleep: async () => {} });
+    expect(out).toMatchObject({ state: "bytes_verified", verified: true });
+    expect(out.prefixes).toBeGreaterThan(0);
+    expect(await footprint(f, ALICE)).toEqual({});
+    expect(await rowsContaining(f, "origin-b")).toEqual({});
+    // The erase is over: the user may upload again, from any origin.
+    expect(await tryDeliver(f, ALICE, "ob3", 1, { origin: "origin-b" })).toBeNull();
+  });
+
+  test("(b) a row of the user planted after metadata_purged makes complete refuse (55000); the driver never reports verified", async () => {
+    const f = await fixture();
+    await deliver(f, ALICE, "a1", 1);
+    await begin(f, "req-1", ALICE);
+    expect((await purge(f, "req-1", 10)).r.state).toBe("metadata_purged");
+    // A writer the ingest fence does not cover (consent is written by the control plane).
+    await insertMinimal(f, "upload_consent_policies", { org_id: ALICE.orgId, workspace_id: ALICE.workspaceId, user_id: ALICE.userId, mode: "all", revision: "1" });
+    let msg = "";
+    try { await complete(f, "req-1"); } catch (e) { msg = `${(e as { code?: string }).code}:${(e as Error).message}`; }
+    expect(msg).toBe("55000:operator user erase: rows of the user remain at completion");
+    expect(await state(f, "req-1")).toBe("metadata_purged");
+    const err = await runUserErase(pgDb(f), { requestId: "req-1", ...ALICE }, { keyRoot: "96bulls", eraser: storeEraser(f.deps.target.store), settleMs: 1, sleep: async () => {} })
+      .then(() => null, (e) => e);
+    expect(err).toBeInstanceOf(UserEraseRefused);
+    expect(err.code).toBe("user_rows_remain_at_completion");
+    expect(await state(f, "req-1")).toBe("metadata_purged");
+    // Once the row is gone the same request completes.
+    await f.db.query("DELETE FROM sessions.upload_consent_policies WHERE user_id=$1", [ALICE.userId]);
+    expect(await complete(f, "req-1")).toMatchObject({ state: "bytes_verified" });
+  });
+
+  test("(c) erasing one user does not fence another user of the same workspace", async () => {
+    const f = await fixture();
+    await deliver(f, ALICE, "a1", 1);
+    await deliver(f, BOB, "b1", 1);
+    await begin(f, "req-1", ALICE);
+    expect(await tryDeliver(f, BOB, "b2", 1)).toBeNull();
+    expect(await tryDeliver(f, ALICE, "a2", 1)).toBe("ledger_sqlstate_RH041");
+    expect((await purge(f, "req-1", 10)).r.state).toBe("metadata_purged");
+    expect(await tryDeliver(f, BOB, "b3", 1)).toBeNull();
+    expect((await f.db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.ingest_lazy_native_slots WHERE current_owner=$1", [BOB.userId])).rows[0]!.n).toBe(3);
+  });
+
+  test("every receipt seat of the user goes, including the ones superseded by a later revision", async () => {
+    const f = await fixture();
+    await deliver(f, ALICE, "a1", 2, { revision: 2 });
+    await deliver(f, ALICE, "a2", 2, { revision: 3, recordPrefix: "a1" });
+    await deliver(f, BOB, "b1", 2);
+    const bobSeats = await seatsNaming(f, BOB);
+    const before = await seatsNaming(f, ALICE);
+    expect(before.seats).toBeGreaterThan(2); // a seat per accepted revision, not only the current one
+    await begin(f, "req-1", ALICE);
+    expect((await purge(f, "req-1", 1)).r.state).toBe("metadata_purged");
+    expect(await seatsNaming(f, ALICE)).toEqual({ seats: 0, heads: 0 });
+    expect(await seatsNaming(f, BOB)).toEqual(bobSeats);
+    expect(await rowsContaining(f, "a1-r")).toEqual({});
+  });
+
+  test("a replay of a pre-erase delivery after bytes_verified meets the slot tombstone: no reseed, no personal data", async () => {
+    const f = await fixture();
+    await deliver(f, ALICE, "a1", 2);
+    const out = await runUserErase(pgDb(f), { requestId: "req-1", ...ALICE }, { keyRoot: "96bulls", eraser: storeEraser(f.deps.target.store), settleMs: 1, sleep: async () => {} });
+    expect(out).toMatchObject({ state: "bytes_verified", verified: true });
+    const tombs = (await f.db.query<{ k: string; o: string | null; s: string | null; origin: string; rid: string }>(
+      `SELECT key_material::text k, current_owner o, current_seat_key s, origin_id origin, record_id rid FROM sessions.ingest_lazy_native_slots
+       WHERE org_id=$1 AND workspace_id=$2 ORDER BY key_sha256`, [ALICE.orgId, ALICE.workspaceId])).rows;
+    expect(tombs).toEqual([0, 1].map(() => ({ k: '["operator-user-erase-tombstone-v1"]', o: null, s: null, origin: "", rid: "" })));
+    // The same batch again (same origin, same records): the global native key finds the tombstone and is refused.
+    const replay = await tryDeliver(f, ALICE, "a1", 2);
+    expect(replay).not.toBeNull();
+    expect((await f.db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.ingest_lazy_native_slots WHERE current_owner IS NOT NULL OR origin_id<>''")).rows[0]!.n).toBe(0);
+    for (const needle of ["origin-alice", "a1-r", "a1-s"]) expect(await rowsContaining(f, needle)).toEqual({});
+    expect(await footprint(f, ALICE)).toEqual({});
+  });
+
+  test("a step refuses (55000) when another user starts uploading from the user's device origin after begin; their slots survive", async () => {
+    const f = await fixture();
+    await deliver(f, ALICE, "a1", 1);
+    await begin(f, "req-1", ALICE);
+    ORIGIN[BOB.userId] = ORIGIN[ALICE.userId]!;
+    try {
+      await deliver(f, BOB, "b1", 2);
+    } finally {
+      ORIGIN[BOB.userId] = "origin-bob";
+    }
+    let msg = "";
+    try { await step(f, "req-1", 10); } catch (e) { msg = `${(e as { code?: string }).code}:${(e as Error).message}`; }
+    expect(msg).toBe("55000:operator user erase: a device origin of this user is shared with another user");
+    expect(await state(f, "req-1")).toBe("purging");
+    expect((await f.db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.ingest_lazy_native_slots WHERE current_owner=$1 AND origin_id='origin-alice'", [BOB.userId])).rows[0]!.n).toBe(2);
+    expect((await receiptRows(f, ALICE)).slots).toBe(1); // the step rolled back whole
   });
 
   test("the eleven support indexes exist", async () => {

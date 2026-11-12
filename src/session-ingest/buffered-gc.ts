@@ -176,7 +176,7 @@ export async function bufferedGcTick(deps: BufferedGcDeps, limit = 10) {
     examined += tickets.length;
     for (const t of tickets) {
       try { if (await collectBufferedTicket(t, deps) === 'finished') finished++; else deferred++; }
-      catch (e) { if (e instanceof BufferedGcError && ['sql_40001', 'sql_55P03', 'sql_57014'].includes(e.code)) deferred++; else throw e; }
+      catch (e) { if (e instanceof BufferedGcError && ['sql_40001', 'sql_55P03', 'sql_57014', 'sql_RH041'].includes(e.code)) deferred++; else throw e; }
     }
   }
   return { examined, finished, deferred };

@@ -50,6 +50,9 @@ test("collect deferral rules are unchanged and the limit stays bounded",async()=
  const f=fakeLedger([[cleanupTicket(1)]]);
  const d=deps(f.ledger);d.eraser={eraseObjectExcept:async()=>{throw new BufferedGcError("sql_57014")}} as any;
  expect(await bufferedGcTick(d,1)).toEqual({examined:1,finished:0,deferred:1});
+ // RH041: the user is under an operator user erase (20261105058010); GC finish is refused until it is verified.
+ const r=fakeLedger([[cleanupTicket(1)]]);const rd=deps(r.ledger);rd.eraser={eraseObjectExcept:async()=>{throw new BufferedGcError("sql_RH041")}} as any;
+ expect(await bufferedGcTick(rd,1)).toEqual({examined:1,finished:0,deferred:1});
  const g=fakeLedger([[cleanupTicket(1)]]);const e=deps(g.ledger);e.eraser={eraseObjectExcept:async()=>{throw new BufferedGcError("barrier_unexpected_content")}} as any;
  await expect(bufferedGcTick(e,1)).rejects.toMatchObject({code:"barrier_unexpected_content"});
  for(const limit of [0,-1,1.5,101,Number.NaN])await expect(bufferedGcTick(deps(fakeLedger([]).ledger),limit)).rejects.toMatchObject({code:"claim_limit"});

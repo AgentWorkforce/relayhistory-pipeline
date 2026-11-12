@@ -2448,12 +2448,32 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
     // 20261105058010 (operator per-user erase) is the newest: 058000's down refuses (55000) while it is applied;
-    // its own checksum-pinned down drops the functions, the ledger table and its ledger row.
+    // its own checksum-pinned down refuses while an erase is active, then restores 030000's ingest_lock_fences and
+    // 050010's GC claim exactly and drops the functions, the ledger table and its ledger row.
     expect((await failure(rollback("20261105058000_operator_user_erase_indexes.down.sql")))?.code).toBe("55000");
+    const procSrc = async (sig: string) =>
+      (await db.query<{ s: string; d: boolean }>("SELECT prosrc s, prosecdef d FROM pg_proc WHERE oid=$1::regprocedure", [sig])).rows[0]!;
+    const bodyOf = (file: string, name: string, tag: string) => {
+      const src = readFileSync(join(root, `supabase/migrations/${file}`), "utf8");
+      const start = src.search(new RegExp(`CREATE(?: OR REPLACE)? FUNCTION sessions\\.${name}\\(`));
+      const open = src.indexOf(tag, start) + tag.length;
+      return src.slice(open, src.indexOf(tag, open));
+    };
+    expect((await procSrc("sessions.ingest_lock_fences(text,text,text)")).s).toContain("operator_user_erasures");
+    expect((await procSrc("sessions.ingest_buffer_gc_claim(jsonb)")).s).toContain("operator_user_erasures");
+    await db.query("INSERT INTO sessions.operator_user_erasures(request_id,org_id,workspace_id,user_id,state,origins) VALUES('rollback-probe','o','w','u','purging','{}')");
+    expect((await failure(rollback("20261105058010_operator_user_erase.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(UE);
+    await db.query("DELETE FROM sessions.operator_user_erasures WHERE request_id='rollback-probe'");
     await rollback("20261105058010_operator_user_erase.down.sql");
     expect(await names()).not.toContain(UE);
     expect(await relation("sessions.operator_user_erasures")).toBeNull();
     expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.operator_user_erase_step(text,integer)')::text AS p")).rows[0]!.p).toBeNull();
+    expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.operator_user_erase_remaining(text,text,text,text[])')::text AS p")).rows[0]!.p).toBeNull();
+    const fences = await procSrc("sessions.ingest_lock_fences(text,text,text)");
+    expect(fences).toEqual({ s: bodyOf("20261104030000_ingest_fence_ownership.sql", "ingest_lock_fences", "$lock$"), d: false });
+    const gcClaim = await procSrc("sessions.ingest_buffer_gc_claim(jsonb)");
+    expect(gcClaim).toEqual({ s: bodyOf("20261105050010_operator_session_erase_fence_check.sql", "ingest_buffer_gc_claim", "$claim$"), d: true });
     // 20261105058000 (foreign-key support indexes) is then the newest: 057030's down refuses; its own down drops the eleven.
     expect((await failure(rollback("20261105057030_selfhost_erase_directory_membership.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(MB);
