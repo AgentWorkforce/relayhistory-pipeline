@@ -1,5 +1,5 @@
 /**
- * Read-only production database checks (runbooks/sessions-prod-db-readonly-checks.md).
+ * Read-only production database checks (sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-db-readonly-checks.md).
  *
  * Run only by .github/workflows/db-readonly-checks.yml in the approval-gated `production-db-readonly`
  * environment. It connects as sessions_readonly_stats (scripts/sql/db-readonly-role.sql), executes only the

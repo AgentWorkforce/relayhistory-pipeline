@@ -61,7 +61,7 @@ normal reviewed deploy. Self-host sets the same env var on the pipeline image.
 So a build seen in a user agent does not bound the cohort in time. Hold by authenticated principal (or
 org). The build is **detection evidence only**: authorization is always the authenticated principal.
 
-Run as the read-only operator (`runbooks/sessions-prod-db-readonly-checks.md`). These queries read no
+Run as the read-only operator (`sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-db-readonly-checks.md`). These queries read no
 content columns:
 
 ```sql

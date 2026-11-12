@@ -452,11 +452,11 @@ console.log(
 await check("owner-buffered v5.3: 043700 RPCs + read consumer release fixtures", async () => {
   const fixtureHashes = {
     contract: createHash("sha256").update(readFileSync(join(ROOT,
-      "docs/handoffs/neon-census-role-20261107/r2-control-head-contract-v5.3-CURRENT.md"))).digest("hex"),
+      "docs/contracts/owner-buffered-control-head-v5.3/r2-control-head-contract-v5.3-CURRENT.md"))).digest("hex"),
     causal: createHash("sha256").update(readFileSync(join(ROOT,
-      "docs/handoffs/neon-census-role-20261107/fixtures/option-c-authority-gate-causal-fixtures-v3-20261108.json"))).digest("hex"),
+      "docs/contracts/owner-buffered-control-head-v5.3/fixtures/option-c-authority-gate-causal-fixtures-v3-20261108.json"))).digest("hex"),
     parity: createHash("sha256").update(readFileSync(join(ROOT,
-      "docs/handoffs/neon-census-role-20261107/fixtures/option-c-parity-gate-fixture-addendum-v1-20261108.json"))).digest("hex"),
+      "docs/contracts/owner-buffered-control-head-v5.3/fixtures/option-c-parity-gate-fixture-addendum-v1-20261108.json"))).digest("hex"),
   };
   const expected = {
     contract: "9f8a755027f1768d4122ec8b90607b87068cd6b5d495172886fe66cc65d204ab",

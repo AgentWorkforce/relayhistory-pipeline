@@ -1,7 +1,7 @@
 import { sqlBriefSummary } from "./brief-summary.ts";
 /**
  * AWS Lambda entry for the session read API (Function URL, payload v2;
- * stacks/aws/session-read-api.ts, runbooks/sessions-prod-session-read-api.md).
+ * stacks/aws/session-read-api.ts, sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-session-read-api.md).
  *
  * Configuration: plain env for ids and switches; credentials only from one
  * Secrets Manager secret (`SESSION_READ_API_SECRET_ARN`), read once per sandbox

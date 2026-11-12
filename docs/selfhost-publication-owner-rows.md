@@ -21,10 +21,10 @@ and the seeder. The seat and policy functions check `current_user` = function ow
 
 | Rows | Writer on main | Where it runs |
 |---|---|---|
-| `ingest_buffer_admission` | Owner `INSERT` in step S4 of `scripts/ops/cutover-20261105/cutover-ceremony.ts` (one transaction with the policy and seat clock). New orgs: `cutover-ceremony.ts --admit-new-orgs` (`INSERT ... ON CONFLICT (org_id) DO NOTHING`, copying the live policy's epoch, baseline, retention and generation). | Supabase owner via the CLI temporary login. `--admit-new-orgs` runs every 120 s from `mini/admit-new-orgs.sh` on sf-mac-mini. That script is outside this repository; see `docs/runbooks/buffered-cutover-20261105.md`. |
+| `ingest_buffer_admission` | Owner `INSERT` in step S4 of `scripts/ops/cutover-20261105/cutover-ceremony.ts` (one transaction with the policy and seat clock). New orgs: `cutover-ceremony.ts --admit-new-orgs` (`INSERT ... ON CONFLICT (org_id) DO NOTHING`, copying the live policy's epoch, baseline, retention and generation). | Supabase owner via the CLI temporary login. `--admit-new-orgs` runs every 120 s from `mini/admit-new-orgs.sh` on sf-mac-mini. That script is outside this repository; see `sessions-pipeline-cloud:hosted-ops/preserved/docs/runbooks/buffered-cutover-20261105.md`. |
 | Lazy custody policy | `sessions.ingest_lazy_policy_set(jsonb)`, `supabase/migrations/20261104055000_lazy_current_custody.sql`. Owner only, `issuer` must be `relayhistory-cloud`, and identity is immutable once set. | The same S4 transaction. |
 | Seat clock | `sessions.ingest_receipt_seat_initialize(jsonb)`, created in `supabase/migrations/20261104053000_ingest_first_ack_seats.sql` and replaced in 20261104055000. Owner only. Needs protocol `delivery-acceptance-floor-v1`, the captured Neon sequence floor, and an admission row or lazy policy with the same epoch and generation. | The same S4 transaction. |
-| `ingest_publication_frontiers` | **No tracked writer.** There is no migration function, RPC, ceremony step or runbook command. The only `INSERT`s are synthetic: test fixtures (`src/session-ingest/__tests__/publication.postgres.test.ts`, `publication-portable.pglite.test.ts`) and `scripts/proof-canonical-publication.ts` against a disposable owned PG17. | Nowhere in production from this repository. The attester is design-only: `docs/handoffs/frontier-attester-20261107/...` on branch `docs/frontier-attester-design-20261107` (d1f07ca2, slot 050000), and catch-up 051000 in `docs/design/bulk-catchup-publication-051000-20261107.md`. Both say not to invent the two digests. I did not query production. |
+| `ingest_publication_frontiers` | **No tracked writer.** There is no migration function, RPC, ceremony step or runbook command. The only `INSERT`s are synthetic: test fixtures (`src/session-ingest/__tests__/publication.postgres.test.ts`, `publication-portable.pglite.test.ts`) and `scripts/proof-canonical-publication.ts` against a disposable owned PG17. | Nowhere in production from this repository. The attester is design-only: `docs/contracts/frontier-attester-20261107/...` on branch `docs/frontier-attester-design-20261107` (d1f07ca2, slot 050000), and catch-up 051000 in `docs/design/bulk-catchup-publication-051000-20261107.md`. Both say not to invent the two digests. I did not query production. |
 
 ## Contract for each self-host row
 
@@ -45,7 +45,7 @@ and the seeder. The seat and policy functions check `current_user` = function ow
   does. Never rewrite an existing row's hashes.
 - **Renewal:** owner `UPDATE ... SET valid_until = <new>`. Do not re-insert.
 - **Revocation or deactivation:** `UPDATE ... SET valid_until = clock_timestamp() - interval '1 second'`.
-  Never `DELETE` (`docs/runbooks/buffered-cutover-20261105.md`, rollback step 2).
+  Never `DELETE` (`sessions-pipeline-cloud:hosted-ops/preserved/docs/runbooks/buffered-cutover-20261105.md`, rollback step 2).
   Expired admission refuses new claims and publication (`55000`).
 - **Self-host gap:** the hosted hashes come from the Neon export ceremony (S2). Self-host
   has no Neon source, so the operator must supply reviewed self-host privacy and
