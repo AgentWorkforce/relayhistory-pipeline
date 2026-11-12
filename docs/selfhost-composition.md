@@ -602,7 +602,8 @@ existing SELECT is retained for native title precedence.
 ### Summary flags on the read API (both default off)
 
 Two read API flags expose stored summaries. Each is on only when its value is
-exactly `true`; unset or any other value is off and leaves behaviour unchanged.
+exactly `true`; unset or any other value is off and leaves responses unchanged
+for requests that do not send the opt-in.
 Neither changes SQL, needs a new migration, or adds a credential. Turning
 either on for the hosted stack is a deploy decision and needs the owner's
 explicit approval; nothing in this repository sets them.
@@ -613,8 +614,8 @@ explicit approval; nothing in this repository sets them.
   which reads the same dependency). Off, both answer 501
   `summary_not_configured`, as before. It reads
   `sessions.session_brief_summary_for` from
-  `20261105044100_session_brief_summary_read.sql`, which is already applied in
-  production; the activity route still answers 501
+  `20261105044100_session_brief_summary_read.sql`, which must be applied before
+  the flag is turned on; the activity route still answers 501
   `summary_activity_not_migrated` until `20261105056000` is applied.
 - `READ_API_LIST_SHORT_SUMMARY_ENABLED` (either entry): `GET /v1/sessions`
   accepts the opt-in `includeShortSummary=recorded`. With it, each directory
