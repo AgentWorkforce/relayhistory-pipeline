@@ -251,12 +251,19 @@ above, `RELAYCAST_URL` set to the HTTPS gateway origin and
 with TLS verification. Run one supervised dispatcher. It holds a session advisory
 lock and replays external operations using their recorded targets.
 
-Apply `scripts/ops/account-reset/cloud-neon.sql` on Cloud Neon after reviewing the
-migration in a disposable environment. It installs the queue, three submission/resume
+Deploy the registered Cloud Neon migration through the [Cloud migration PR](https://github.com/AgentWorkforce/cloud/pull/6248).
+The standalone SQL in this repository is a pipeline test fixture. Running it on a
+migrated database would attempt to create the same objects twice.
+The Cloud migration installs the queue, three submission/resume
 functions, and guards against rebinding retired Relaycast IDs. Grant the dashboard
 EXECUTE on the three public admin enqueue/resume functions and SELECT on the status
 columns of `admin_account_resets` (user_id, phase, legacy_relay_only, stalled,
 deferred_error, error_code and history_targets). The dashboard needs no queue DML.
+Both new tables use default-deny row-level security. Provision dedicated non-owner
+roles without BYPASSRLS. Grant the dashboard a SELECT policy on the queue. Grant
+the dispatcher SELECT and UPDATE policies on the queue and SELECT and INSERT
+policies on the retired-workspace table. Scope these policies to the corresponding
+roles and verify them before starting the dispatcher.
 
 The dispatcher needs SELECT/UPDATE on the job table and SELECT/INSERT on
 `admin_reset_retired_workspaces`. Its Cloud login reads organizations, users,
