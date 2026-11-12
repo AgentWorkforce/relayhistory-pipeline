@@ -73,7 +73,8 @@ export async function runCanonicalPublicationRuntime(env:NodeJS.ProcessEnv,mode:
   const who=(await read.queryBounded<{me:string;session:string}>('SELECT current_user AS me,session_user AS session',[],context())).rows[0];
   if(who?.me!=='bulls96_session_ingest'||who.session!=='bulls96_session_ingest')no('database_role');
   await read.queryBounded("SET LOCAL hoopdb.db_mode='supabase';"+Object.values(assets.verifiers).join('\n'),[],context());
-  const target:PublicationTarget=config;
+  // The hosted runtime always writes AWS S3 (KMS, us-east-1), which the hosted reader selects as s3.
+  const target:PublicationTarget={...config,provider:'s3'};
   const raw=scopedPublicationStore((overrides.store??createS3Store)({bucket:config.bucket,region:config.region,credentials,serverSideEncryption:'aws:kms',sseKmsKeyId:config.kmsKeyArn,fetch:fetcher}));
   if(mode==='publish')return await canonicalPublicationTick({target,rpc:publicationRpc(sql,target),store:()=>raw,...routedRawChunkSealerDeps()},{enabled:true,signal,maxJobMs:config.budgetMs,candidateLimit:config.candidateLimit});
   const eraser=(overrides.eraser??createS3Eraser)({bucket:config.bucket,region:config.region,credentials:await credentials(),fetch:fetcher});

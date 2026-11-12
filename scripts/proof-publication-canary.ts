@@ -102,7 +102,7 @@ try {
   const producer = orderedFixtureLedger(ledger, owner as never);
   const store = createS3Store({ endpoint, bucket, region, credentials });
   const eraser = createS3Eraser({ endpoint, bucket, region, credentials });
-  const target = { bucket, region, keyRoot: "96bulls", generation: expected };
+  const target = { bucket, region, keyRoot: "96bulls", generation: expected, provider: "s3" as const };
   const rpc = publicationRpc(bounded, target);
   const gc = publicationGcLedger(bounded, target);
   const origin = "origin-canary";

@@ -67,6 +67,10 @@ dormant; any other value fails startup.
   versioned-bucket requirement are listed in that file's header. Until the
   frontier rows exist, an enabled portable publisher runs but finds nothing to
   publish.
+  On a GCS install set `LOCKER_PROVIDER=gcs` on the publisher as well as on the
+  read API: the publisher stamps that provider on every published row, the read
+  API refuses rows stamped with another provider, and the SQL admits `s3` and
+  `gcs` from migration `20261105059000` onward. Unset means `s3`.
 
 ### `SERVICE=session-erase-bytes`
 

@@ -19,6 +19,8 @@ const MAX_CHUNK=16*1024*1024,MAX_MANIFEST=16*1024*1024;
 const bytesSha=(bytes:Uint8Array)=>createHash("sha256").update(bytes).digest("hex");
 const enc=new TextEncoder(),dec=new TextDecoder();
 const refused=(code:string)=>Object.assign(Error(code),{code});
+/** The stamped provider must be one the read API can select; anything else would publish an unreadable row. */
+const assertTargetProvider=(target:PublicationTarget)=>{if(target.provider!=="s3"&&target.provider!=="gcs")throw refused("publication_target_provider_invalid");};
 const rawDigest=(value:unknown)=>typeof value==="string"?value.replace(/^\\x/,""):"";
 export interface PreparedPublicationImage {
  spec:PublicationImageSpec;manifest:ManifestV1;body:Uint8Array;head:PublicationHead;
@@ -77,7 +79,7 @@ async function readPrevious(ticket:PublicationTicket,head:PublicationHead,target
    throw refused("publication_previous_snapshot_mismatch");
  }else{
   const base=head.basePointer!;
-  if(at.prefix!==target.keyRoot+"/"+ticket.tenant.orgId||base.storage_provider!=="s3"||base.bucket!==target.bucket||
+  if(at.prefix!==target.keyRoot+"/"+ticket.tenant.orgId||base.storage_provider!==target.provider||base.bucket!==target.bucket||
    manifest.raw.content_sha256!==rawDigest(base.content_sha256)||String(manifest.revision)!==String(base.revision)||base.deleted_at!==null)
    throw refused("publication_legacy_base_mismatch");
  }
@@ -90,6 +92,7 @@ export async function preparePublicationImage(
 ):Promise<PreparedPublicationImage>{
  const rawSealer=rawChunkSealer??sealRawChunk;
  signal.throwIfAborted();
+ assertTargetProvider(target);
  const header=decoded.header,group=decoded.groups[head.groupIndex],ordinals=decoded.spec.groupOrdinals[head.groupIndex];
  if(header.org_id!==ticket.tenant.orgId||header.workspace_id!==ticket.tenant.workspaceId||header.user_id!==ticket.tenant.userId||
   header.origin_id!==ticket.originId||header.claim_token!==ticket.claimToken||header.batch_digest!==ticket.batchDigest||
@@ -134,7 +137,7 @@ export async function preparePublicationImage(
  if(body.byteLength>MAX_MANIFEST)throw refused("publication_manifest_limit");
  const row={org_id:ticket.tenant.orgId,workspace_id:ticket.tenant.workspaceId,harness:head.physicalSource,session_id:head.physicalSession,machine_id:head.machineId,
   user_id:ticket.tenant.userId,created_at:startedAt,last_activity_at:manifest.session.ended_at??manifest.raw.updated_at,event_count:chunks.reduce((n,c)=>n+(c.records??0),0),
-  storage_provider:"s3",bucket:target.bucket,manifest_key:key,content_sha256:"\\x"+manifest.raw.content_sha256,raw_bytes:manifest.raw.raw_bytes,chunk_count:chunks.length,
+  storage_provider:target.provider,bucket:target.bucket,manifest_key:key,content_sha256:"\\x"+manifest.raw.content_sha256,raw_bytes:manifest.raw.raw_bytes,chunk_count:chunks.length,
   raw_format:"ndjson",format_version:1,normalized_version:null,scrubbed:true,manifest_etag:null,revision:manifest.revision,trace_id:traceId,deleted_at:null};
  const baseCopies:PreparedPublicationImage["baseCopies"]=[];
  if(previous&&!head.previousKey){
@@ -151,6 +154,7 @@ export async function preparePublicationImage(
 export async function writePublicationImage(
  ticket:PublicationTicket,image:PreparedPublicationImage,rpc:PublicationRpc,store:ObjectStore,signal:AbortSignal,target:PublicationTarget,
 ):Promise<unknown|null>{
+ assertTargetProvider(target);
  await rpc.prepare(ticket,[image.spec],signal);
  const specs=[...image.baseCopies.map(c=>c.spec),image.newChunk.spec,
   {groupIndex:image.head.groupIndex,key:image.spec.manifestKey,sha256:image.spec.manifestSha256,bytes:image.body.byteLength,kind:"manifest" as const}];
@@ -171,7 +175,7 @@ export async function writePublicationImage(
  await putPublicationObject(store,image.newChunk.spec,image.newChunk.body,signal,image.newChunk.options);
  const ack=await putPublicationObject(store,{key:image.spec.manifestKey,sha256:image.spec.manifestSha256,bytes:image.body.byteLength},image.body,signal,{contentType:"application/json"});
  if(image.head.source==="_none"&&image.head.sessionId==="_origin")return null;
- const built=buildObjectLandedMessage({landed:{key:image.spec.manifestKey,provider:"s3",bucket:target.bucket,size:image.body.byteLength,...(ack.version.eTag?{etag:ack.version.eTag}:{}),...(ack.version.version?{version:ack.version.version}:{})},
+ const built=buildObjectLandedMessage({landed:{key:image.spec.manifestKey,provider:target.provider,bucket:target.bucket,size:image.body.byteLength,...(ack.version.eTag?{etag:ack.version.eTag}:{}),...(ack.version.version?{version:ack.version.version}:{})},
   orgId:ticket.tenant.orgId,manifest:image.manifest});
  if(built.status!=="enqueue")throw refused("publication_notification_invalid");
  return built.message;

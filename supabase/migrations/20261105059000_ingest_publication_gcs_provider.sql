@@ -1,0 +1,197 @@
+-- SLOT 059000. Forward fix to 20261104060000 and 20261105043850 (publication provider). The canonical publication
+-- RPCs only accepted storage provider 's3': sessions.ingest_publication_prepare refused a pointer row whose
+-- storage_provider was anything else, and sessions.ingest_publication_publish refused a landed message whose
+-- payload.provider was anything else. A GCS install therefore could not publish a canonical copy, and its stand-in
+-- pointer rows (stamped 's3') failed the read path's provider check, so GET /v1/sessions/:id/turns answered
+-- 501 turns_canonical_pointer_invalid. The TypeScript publisher now stamps the selected Locker's provider
+-- (src/shared/locker-selection.ts) on the pointer row and the landed message; this migration lets the SQL accept it.
+--
+-- Each function changes in one predicate only:
+--   * prepare: storage_provider must be 's3' or 'gcs' (coalesce(...,'') NOT IN('s3','gcs'), so NULL stays refused);
+--   * publish: payload.provider must be 's3' or 'gcs' (NULL still refused) and must equal the prepared image's
+--     pointer_row storage_provider, so a message cannot land a provider other than the one prepare admitted.
+-- Every other provider (azure, r2, fs, NULL) is still refused with 22023, as before.
+--
+-- No flag: the provider comes from the install's Locker selection, and 's3' installs behave exactly as before.
+--
+-- Replacement only: each body is its latest landed body byte for byte (prepare from 20261104060000, publish from
+-- 20261105043850) except the predicate above; signature, VOLATILE, SECURITY DEFINER, search_path, owner and ACL are
+-- unchanged (CREATE OR REPLACE keeps them). Return shapes are unchanged.
+--
+-- Does not change: other 's3'-only checks (the history lineage claims in 20261105026000 and the operator erase
+-- runtime in 20261105050020) are outside this fix.
+--
+-- Code only: applying this to any real database needs Khaliq's separate, explicit OK.
+CREATE OR REPLACE FUNCTION sessions.ingest_publication_prepare(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $prepare$
+DECLARE a sessions.ingest_publication_attempts%ROWTYPE;i jsonb;h jsonb;v_parts text[];v_key text;v_sha text;v_raw text;v_row jsonb;v_index int;
+ existing sessions.ingest_publication_images%ROWTYPE;v_bytes int;v_started timestamptz;
+BEGIN
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['attemptToken','leaseToken','images','generation']);
+ PERFORM sessions.ingest_require_generation(p->>'generation');
+ a:=sessions.ingest_publication_locked((p->>'attemptToken')::uuid,(p->>'leaseToken')::uuid,p->>'generation');
+ IF jsonb_typeof(p->'images') IS DISTINCT FROM'array' OR jsonb_array_length(p->'images') NOT BETWEEN 1 AND 500 OR octet_length(p::text)>16777216
+ THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='publication: image plan bounds';END IF;
+ FOR i IN SELECT value FROM jsonb_array_elements(p->'images') LOOP
+  PERFORM sessions.ingest_exact_keys(i,ARRAY['groupIndex','manifestKey','manifestSha256','manifestBytes','rawSha256','startedAt','pointerRow']);
+  v_index:=sessions.ingest_bounded(i->'groupIndex',0,499);
+  SELECT value INTO h FROM jsonb_array_elements(a.head_snapshots) WHERE(value->>'groupIndex')::int=v_index;
+  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='publication: image outside admitted groups';END IF;
+  v_key:=i->>'manifestKey';v_sha:=sessions.ingest_digest(i->'manifestSha256');v_raw:=sessions.ingest_digest(i->'rawSha256');
+  v_bytes:=sessions.ingest_bounded(i->'manifestBytes',1,16777216);v_started:=(i->>'startedAt')::timestamptz;
+  v_parts:=regexp_match(v_key,'^(.*)/v1/ws=([^/]+)/m=([^/]+)/h=([^/]+)/d=(\d{4}/\d{2}/\d{2})/s=([^/]+)/publications/([a-f0-9-]{36})/manifest\.json$');
+  IF v_parts IS NULL OR v_parts[1] IS DISTINCT FROM h->>'prefix' OR v_parts[2] IS DISTINCT FROM h->>'physicalWorkspace'
+   OR v_parts[3] IS DISTINCT FROM h->>'machineId' OR v_parts[4] IS DISTINCT FROM h->>'physicalSource'
+   OR v_parts[5] IS DISTINCT FROM to_char(v_started AT TIME ZONE'UTC','YYYY/MM/DD')
+   OR v_parts[6] IS DISTINCT FROM h->>'physicalSession' OR v_parts[7] IS DISTINCT FROM a.attempt_token::text
+  THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='publication: image namespace or attempt mismatch';END IF;
+  v_row:=i->'pointerRow';
+  PERFORM sessions.ingest_exact_keys(v_row,ARRAY['org_id','workspace_id','harness','session_id','machine_id','user_id','created_at','last_activity_at','event_count',
+    'storage_provider','bucket','manifest_key','content_sha256','raw_bytes','chunk_count','raw_format','format_version','normalized_version','scrubbed',
+    'manifest_etag','revision','trace_id','deleted_at']);
+  IF v_row->>'org_id' IS DISTINCT FROM a.org_id OR v_row->>'workspace_id' IS DISTINCT FROM a.workspace_id
+   OR v_row->>'user_id' IS DISTINCT FROM a.user_id OR v_row->>'harness' IS DISTINCT FROM h->>'physicalSource'
+   OR v_row->>'session_id' IS DISTINCT FROM h->>'physicalSession' OR v_row->>'machine_id' IS DISTINCT FROM h->>'machineId'
+   OR v_row->>'manifest_key' IS DISTINCT FROM v_key OR v_row->>'revision' IS DISTINCT FROM h->>'revision'
+   OR v_row->>'content_sha256' IS DISTINCT FROM chr(92)||'x'||v_raw
+   OR coalesce(v_row->>'storage_provider','') NOT IN('s3','gcs') OR v_row->>'bucket' IS DISTINCT FROM a.frontier->>'target_bucket'
+   OR v_row->>'raw_format' IS DISTINCT FROM'ndjson' OR v_row->>'scrubbed' IS DISTINCT FROM'true'
+   OR v_row->>'deleted_at' IS NOT NULL OR v_row->>'manifest_etag' IS NOT NULL OR octet_length(v_row::text)>32768
+  THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='publication: pointer metadata differs from admitted image';END IF;
+  -- Type/constraint casts are performed before any canonical pointer changes.
+  PERFORM 1 FROM jsonb_populate_record(NULL::sessions.session_index,v_row)q;
+  SELECT*INTO existing FROM sessions.ingest_publication_images WHERE attempt_token=a.attempt_token AND group_index=v_index FOR UPDATE;
+  IF FOUND THEN
+   IF ROW(existing.generation,existing.manifest_key,existing.manifest_sha256,existing.manifest_bytes,existing.raw_sha256,existing.pointer_revision,existing.pointer_row)
+      IS DISTINCT FROM ROW((h->>'generation')::uuid,v_key,v_sha,v_bytes::bigint,v_raw,(h->>'revision')::bigint,v_row)
+   THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: immutable image plan changed';END IF;
+  ELSE
+   INSERT INTO sessions.ingest_publication_images VALUES(a.attempt_token,v_index,(h->>'generation')::uuid,v_key,v_sha,v_bytes,v_raw,(h->>'revision')::bigint,v_row);
+  END IF;
+ END LOOP;
+ UPDATE sessions.ingest_publication_attempts SET state='prepared' WHERE attempt_token=a.attempt_token;
+ IF a.lease_until<=clock_timestamp() THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: prepare expired';END IF;
+ RETURN jsonb_build_object('prepared',true);
+END $prepare$;
+
+CREATE OR REPLACE FUNCTION sessions.ingest_publication_publish(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $publish$
+DECLARE a sessions.ingest_publication_attempts%ROWTYPE;v jsonb;i sessions.ingest_publication_images%ROWTYPE;message jsonb;
+ v_messages jsonb;v_message_sha text;v_expected int;v_written int;v_actual int;v_notice_count int;v_row jsonb;v_applied boolean;v_result record;
+BEGIN
+ PERFORM sessions.ingest_require_role('bulls96_session_ingest');
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['attemptToken','leaseToken','messages','generation']);
+ PERFORM sessions.ingest_require_generation(p->>'generation');
+ v_messages:=p->'messages';
+ IF jsonb_typeof(v_messages) IS DISTINCT FROM'array' OR jsonb_array_length(v_messages)>500 OR octet_length(p::text)>16777216
+ THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='publication: notification bounds';END IF;
+ v_message_sha:=encode(sha256(convert_to(v_messages::text,'UTF8')),'hex');
+ SELECT*INTO a FROM sessions.ingest_publication_attempts WHERE attempt_token=(p->>'attemptToken')::uuid;
+ IF NOT FOUND OR a.lease_token IS DISTINCT FROM(p->>'leaseToken')::uuid OR a.schema_generation IS DISTINCT FROM p->>'generation'
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: unknown attempt';END IF;
+ IF a.state='published' THEN
+  IF a.completion_sha256 IS DISTINCT FROM v_message_sha THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: completed request differs';END IF;
+  RETURN jsonb_build_object('published',true,'replay',true,'images',jsonb_array_length(a.head_snapshots),
+    'records',(SELECT count(DISTINCT x->>'record_id') FROM sessions.ingest_stage_intents s JOIN sessions.ingest_claim_attempts c ON c.claim_token=s.claim_token
+      CROSS JOIN LATERAL jsonb_array_elements(c.records)x WHERE s.stage_token=a.stage_token AND a.accepted_ordinals@>to_jsonb((x->>'ord')::int)),
+    'eligibleSessions',(SELECT count(*) FROM jsonb_array_elements(a.head_snapshots)h WHERE NOT(h->>'source'='_none' AND h->>'sessionId'='_origin')));
+ END IF;
+ -- Same lock as the existing complete canonical CH projector. Never wait
+ -- for a remote read while holding a user fence or publication head lock.
+ FOR v IN SELECT value FROM jsonb_array_elements(a.head_snapshots)
+  WHERE NOT(value->>'source'='_none' AND value->>'sessionId'='_origin') ORDER BY value->>'physicalSource' COLLATE"C",value->>'sessionId' COLLATE"C"
+ LOOP
+  IF NOT pg_try_advisory_xact_lock(hashtextextended(concat_ws(chr(31),'96bulls:directory-events',a.org_id,a.workspace_id,v->>'physicalSource',v->>'sessionId'),0))
+  THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: canonical projector busy';END IF;
+ END LOOP;
+ a:=sessions.ingest_publication_locked(a.attempt_token,a.lease_token,p->>'generation');
+ PERFORM sessions.ingest_acquisition_publish_check(a.org_id,a.workspace_id,a.head_snapshots);
+ IF sessions.ingest_publication_revision_snapshot(a.stage_token) IS DISTINCT FROM a.revision_snapshot
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: complete record maxima changed';END IF;
+ SELECT count(*) INTO v_actual FROM sessions.ingest_publication_images WHERE attempt_token=a.attempt_token;
+ IF v_actual<>jsonb_array_length(a.head_snapshots)
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: complete image set not prepared';END IF;
+ SELECT count(*) INTO v_notice_count FROM jsonb_array_elements(a.head_snapshots)h WHERE NOT(h->>'source'='_none' AND h->>'sessionId'='_origin');
+ IF jsonb_array_length(v_messages)<>v_notice_count OR
+  (SELECT count(DISTINCT m#>>'{payload,key}')FROM jsonb_array_elements(v_messages)m)<>v_notice_count
+ THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='publication: notification set differs';END IF;
+ -- All registered manifests must match the immutable prepared byte proof. A
+ -- trusted bounded caller invokes this only after exact immutable PUT ACKs.
+ IF EXISTS(SELECT 1 FROM sessions.ingest_publication_images x
+  LEFT JOIN sessions.ingest_publication_objects o ON o.object_key=x.manifest_key
+  WHERE x.attempt_token=a.attempt_token AND(o.object_key IS NULL OR o.generation<>x.generation OR o.sha256<>x.manifest_sha256
+    OR o.bytes<>x.manifest_bytes OR o.kind<>'manifest' OR o.cleanup_state<>'live'))
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: manifest intent proof missing';END IF;
+ -- A competing record owner/newer revision can win a unique-key wait after the
+ -- preceding snapshot. Require every admitted highest record to actually apply;
+ -- failure rolls back pointers/jobs/authority together.
+ WITH admitted AS(
+  SELECT x FROM sessions.ingest_stage_intents s JOIN sessions.ingest_claim_attempts c ON c.claim_token=s.claim_token
+   CROSS JOIN LATERAL jsonb_array_elements(c.records)x
+  WHERE s.stage_token=a.stage_token AND a.accepted_ordinals@>to_jsonb((x->>'ord')::int)
+ ), highest AS(
+  SELECT DISTINCT ON((x->>'record_id') COLLATE"C")x FROM admitted ORDER BY (x->>'record_id') COLLATE"C",(x->>'revision')::bigint DESC,(x->>'ord')::int
+ )
+ INSERT INTO sessions.ingest_record_revisions AS t(org_id,workspace_id,origin_id,record_id,revision,revision_id,digest,user_id,source,session_id)
+ SELECT a.org_id,a.workspace_id,a.origin_id,x->>'record_id',(x->>'revision')::bigint,x->>'revision_id',x->>'digest',a.user_id,x->>'source',x->>'session_id' FROM highest
+ ON CONFLICT(org_id,workspace_id,origin_id,record_id) DO UPDATE SET revision=excluded.revision,revision_id=excluded.revision_id,digest=excluded.digest,
+  user_id=excluded.user_id,source=excluded.source,session_id=excluded.session_id,updated_at=clock_timestamp()
+ WHERE t.user_id=excluded.user_id AND excluded.revision>t.revision;
+ GET DIAGNOSTICS v_written=ROW_COUNT;
+ SELECT count(DISTINCT x->>'record_id') INTO v_expected
+ FROM sessions.ingest_stage_intents s JOIN sessions.ingest_claim_attempts c ON c.claim_token=s.claim_token
+ CROSS JOIN LATERAL jsonb_array_elements(c.records)x WHERE s.stage_token=a.stage_token AND a.accepted_ordinals@>to_jsonb((x->>'ord')::int);
+ IF v_written<>v_expected THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: admitted record lost its revision race';END IF;
+ FOR v IN SELECT value FROM jsonb_array_elements(a.head_snapshots)ORDER BY value->>'physicalSource' COLLATE"C",value->>'physicalSession' COLLATE"C" LOOP
+  SELECT*INTO STRICT i FROM sessions.ingest_publication_images WHERE attempt_token=a.attempt_token AND group_index=(v->>'groupIndex')::int;
+  IF NOT(v->>'source'='_none' AND v->>'sessionId'='_origin') THEN
+   SELECT value INTO message FROM jsonb_array_elements(v_messages) WHERE value#>>'{payload,key}'=i.manifest_key;
+   IF NOT FOUND OR message->>'v' IS DISTINCT FROM'1' OR message->>'stage' IS DISTINCT FROM'object-landed'
+    OR message#>>'{ctx,orgId}' IS DISTINCT FROM a.org_id OR message#>>'{ctx,workspaceId}' IS DISTINCT FROM v->>'physicalWorkspace'
+    OR message#>>'{ctx,harness}' IS DISTINCT FROM v->>'physicalSource' OR message#>>'{ctx,sessionId}' IS DISTINCT FROM v->>'physicalSession'
+    OR message#>>'{ctx,machineId}' IS DISTINCT FROM v->>'machineId' OR message#>>'{ctx,traceId}' IS DISTINCT FROM lower(i.pointer_row->>'trace_id')
+    OR message->>'revision' IS DISTINCT FROM i.pointer_revision::text OR message#>>'{payload,revision}' IS DISTINCT FROM i.pointer_revision::text
+    OR message#>>'{payload,kind}' IS DISTINCT FROM'manifest' OR message#>>'{payload,deleted}' IS NOT NULL
+    OR (coalesce(message#>>'{payload,provider}','') NOT IN('s3','gcs') OR message#>>'{payload,provider}' IS DISTINCT FROM i.pointer_row->>'storage_provider') OR message#>>'{payload,bucket}' IS DISTINCT FROM a.frontier->>'target_bucket'
+    OR message#>>'{payload,scrubbed}' IS DISTINCT FROM'true'
+    OR coalesce(message#>>'{payload,version}',message#>>'{payload,etag}','')=''
+    OR octet_length(coalesce(message#>>'{payload,version}',message#>>'{payload,etag}'))>4096
+    OR message->>'workKey' IS DISTINCT FROM i.manifest_key||'@'||coalesce(message#>>'{payload,version}',message#>>'{payload,etag}')
+   THEN RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='publication: notification differs from current image';END IF;
+  ELSE message:=NULL;END IF;
+  UPDATE sessions.ingest_publication_generations SET state='live'WHERE generation=i.generation AND state IN('building','live');
+  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: generation retired';END IF;
+  UPDATE sessions.ingest_publication_heads SET current_key=i.manifest_key,current_raw_sha256=i.raw_sha256,pointer_revision=i.pointer_revision,
+   state='live',base_pointer=NULL,row_version=row_version+1,build_attempt_token=NULL,build_lease_until=NULL
+   WHERE org_id=a.org_id AND workspace_id=a.workspace_id AND user_id=a.user_id AND origin_id=a.origin_id
+    AND source=v->>'source' AND session_id=v->>'sessionId' AND generation=i.generation AND row_version=(v->>'headVersion')::bigint
+    AND acquisition_epoch=coalesce((v->>'acquisitionEpoch')::bigint,0);
+  IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: head CAS lost';END IF;
+  IF message IS NOT NULL THEN
+   v_row:=jsonb_set(i.pointer_row,'{manifest_etag}',to_jsonb(coalesce(message#>>'{payload,etag}',message#>>'{payload,version}')));
+   SELECT*INTO v_result FROM sessions.upsert_session_index(jsonb_build_array(v_row));
+   IF v_result.applied IS NOT TRUE THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: pointer CAS did not apply';END IF;
+   UPDATE sessions.session_index SET canonical_session_id=v->>'sessionId',canonical_machine_id=v->>'machineId'
+    WHERE org_id=a.org_id AND workspace_id=a.workspace_id AND harness=v->>'physicalSource' AND session_id=v->>'physicalSession'
+     AND machine_id=v->>'machineId' AND manifest_key=i.manifest_key AND revision=i.pointer_revision;
+   INSERT INTO sessions.pipeline_jobs(stage,work_key,trace_id,org_id,workspace_id,session_id,machine_id,message)
+   VALUES('object-landed',message->>'workKey',(message#>>'{ctx,traceId}')::uuid,a.org_id,message#>>'{ctx,workspaceId}',
+    message#>>'{ctx,sessionId}',message#>>'{ctx,machineId}',message);
+  END IF;
+ END LOOP;
+ -- "erased" here is the existing buffer-outbox state: no active buffered copy.
+ -- Canonical images already hold all admitted bytes;040510 cleans this retired
+ -- source object via its persistent barrier, including ambiguous old writes.
+ UPDATE sessions.ingest_buffer_outbox SET active_stage_token=NULL,state='erased',row_version=row_version+1
+  WHERE org_id=a.org_id AND workspace_id=a.workspace_id AND origin_id=a.origin_id AND batch_id=a.batch_id
+   AND active_stage_token=a.stage_token AND row_version=a.outbox_version;
+ IF NOT FOUND THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: source outbox CAS lost';END IF;
+ UPDATE sessions.ingest_stage_intents SET cleanup_state='retired',row_version=row_version+1,
+  gc_lease_token=NULL,gc_lease_until=NULL,gc_lease_version=NULL,gc_keep_groups=NULL WHERE stage_token=a.stage_token;
+ UPDATE sessions.ingest_publication_attempts SET state='published',published_at=clock_timestamp(),completion_sha256=v_message_sha WHERE attempt_token=a.attempt_token;
+ PERFORM sessions.ingest_require_buffer_admission(a.org_id);
+ IF a.lease_until<=clock_timestamp() OR (a.frontier->>'valid_until_epoch')::numeric<=extract(epoch FROM clock_timestamp())
+ THEN RAISE EXCEPTION USING ERRCODE='40001',MESSAGE='publication: final acknowledgement expired';END IF;
+ RETURN jsonb_build_object('published',true,'replay',false,'images',jsonb_array_length(a.head_snapshots),'records',v_written,'eligibleSessions',v_notice_count);
+END $publish$;

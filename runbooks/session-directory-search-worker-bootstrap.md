@@ -429,6 +429,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105057030_selfhost_erase_directory_membership.sql` | replacement: ingest_selfhost_set_session_uploads deletes the erased copy's directory membership rows |
 | `upstream:20261105058000_operator_user_erase_indexes.sql` | the sixteen operator-user-erase support indexes, exact definition, valid and ready |
 | `upstream:20261105058010_operator_user_erase.sql` | table sessions.operator_user_erasures and the erase check in sessions.ingest_lock_fences |
+| `upstream:20261105059000_ingest_publication_gcs_provider.sql` | replacement: ingest_publication_prepare and ingest_publication_publish admit storage provider gcs |
 | `upstream:20261105035000_semantic_copy_state.sql` | table sessions.search_feature_copy_state |
 | `upstream:20261105036000_canonical_consumer_lease.sql`        | table sessions.canonical_feature_consumer_lease |
 | `upstream:20261105037000_session_directory_document_pool.sql` | function sessions.canonical_feature_document_finish |

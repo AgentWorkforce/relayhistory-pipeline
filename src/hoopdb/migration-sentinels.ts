@@ -453,6 +453,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "table sessions.operator_user_erasures and the erase check in sessions.ingest_lock_fences (operator per-user erase)",
     sql: "SELECT to_regclass('sessions.operator_user_erasures') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lock_fences(text,text,text)') AND NOT prosecdef AND prosrc LIKE '%operator_user_erasures%') AS applied",
   },
+  "upstream:20261105059000_ingest_publication_gcs_provider.sql": {
+    evidence: "replacement: ingest_publication_prepare and ingest_publication_publish admit storage provider gcs",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_publication_prepare(jsonb)') AND prosecdef AND prosrc LIKE '%NOT IN(''s3'',''gcs'')%') AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_publication_publish(jsonb)') AND prosecdef AND prosrc LIKE '%NOT IN(''s3'',''gcs'')%') AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),
