@@ -11,17 +11,18 @@
  * Lambda treats as a failure of the whole batch (never a silent ack). Logs carry codes and counts only, never a key, body, witness or tenant id.
  *
  * Like buffered-gc-lambda.ts, the handler never accepts factories or credentials from its invocation
- * payload. The hosted runtime (S3 store, Worker-parity budget deps, the admission-queue send) is built by
- * `UploadAdmissionRuntimeFactory`; this module ships no hosted factory and no stack resource (stacks/aws
- * owns the function, queue, notification and IAM), so the default handler with the flag on fails every
- * record with `runtime_unavailable` until one is wired.
+ * payload. The hosted runtime (S3 store, Worker-parity budget deps, the admission-queue send, the witness key
+ * from Secrets Manager) is built by `UploadAdmissionRuntimeFactory`; the deployed `handler` uses the hosted
+ * factory (upload-admission-hosted.ts), imported only once the flag is on. stacks/aws owns the function,
+ * queue, mapping, notification and IAM. A factory that returns `witnessKey` overrides UPLOAD_WITNESS_KEY
+ * from the environment (hosted never puts the key in env or state).
  */
 import { promoteUpload, uploadDirectConfig, UPLOAD_WITNESS_KEY_VAR, type PromoteResult, type PromoteUploadDeps, type UploadDirectConfig } from "./upload-admission.ts";
 
 export interface SqsRecordLike { messageId?: unknown; body?: unknown }
 export interface UploadAdmissionBatchResponse { batchItemFailures: { itemIdentifier: string }[] }
 /** Builds the promotion deps once per cold start (store, deliver budget deps, enqueue). */
-export type UploadAdmissionRuntimeFactory = (env: NodeJS.ProcessEnv, config: UploadDirectConfig) => Promise<Omit<PromoteUploadDeps, "config" | "witnessKey">>;
+export type UploadAdmissionRuntimeFactory = (env: NodeJS.ProcessEnv, config: UploadDirectConfig) => Promise<Omit<PromoteUploadDeps, "config" | "witnessKey"> & { witnessKey?: string }>;
 
 /** S3 notification keys are URL-encoded with `+` for space. Null: not a notification record this handler serves. */
 export function notificationKeys(body: unknown): string[] | null {
@@ -44,26 +45,28 @@ type Log = (line: Record<string, unknown>) => void;
 const defaultLog: Log = (line) => console.log(JSON.stringify({ route: "upload.admission", ...line }));
 
 export function createUploadAdmissionHandler(runtime: UploadAdmissionRuntimeFactory | undefined, log: Log = defaultLog) {
-  let deps: Promise<Omit<PromoteUploadDeps, "config" | "witnessKey">> | undefined;
+  let deps: ReturnType<UploadAdmissionRuntimeFactory> | undefined;
   return async function handler(event: unknown, _context?: unknown): Promise<UploadAdmissionBatchResponse> {
     const records: SqsRecordLike[] = Array.isArray((event as { Records?: unknown } | null)?.Records) ? (event as { Records: SqsRecordLike[] }).Records : [];
     const ids = records.map((r) => (typeof r?.messageId === "string" ? r.messageId : ""));
-    const failAll = (code: string) => {
-      log({ outcome: code, records: records.length });
+    const failAll = (code: string, cause?: string) => {
+      log({ outcome: code, records: records.length, ...(cause ? { cause } : {}) });
       return { batchItemFailures: ids.map((itemIdentifier) => ({ itemIdentifier })) };
     };
     let config: UploadDirectConfig;
     try { config = uploadDirectConfig(process.env); } catch { return failAll("history_upload_direct_invalid"); }
     if (config.mode === "off") return failAll("history_upload_direct_off");
     if (!runtime) return failAll("runtime_unavailable");
-    let base: Omit<PromoteUploadDeps, "config" | "witnessKey">;
+    let base: Awaited<ReturnType<UploadAdmissionRuntimeFactory>>;
     try {
       base = await (deps ??= runtime(process.env, config));
-    } catch {
+    } catch (error) {
       deps = undefined;
-      return failAll("runtime_unavailable");
+      // Coded runtime errors only (upload-admission-hosted.ts UploadAdmissionRuntimeError, AwsCallError): never a message.
+      const code = (error as { code?: unknown } | null)?.code;
+      return failAll("runtime_unavailable", typeof code === "string" && /^[A-Za-z0-9_]{1,64}$/.test(code) ? code : undefined);
     }
-    const promote: PromoteUploadDeps = { ...base, config, witnessKey: process.env[UPLOAD_WITNESS_KEY_VAR] };
+    const promote: PromoteUploadDeps = { ...base, config, witnessKey: base.witnessKey ?? process.env[UPLOAD_WITNESS_KEY_VAR] };
     const failures: { itemIdentifier: string }[] = [];
     const counts: Record<string, number> = {};
     for (let i = 0; i < records.length; i++) {
@@ -84,5 +87,9 @@ export function createUploadAdmissionHandler(runtime: UploadAdmissionRuntimeFact
   };
 }
 
-/** The deployed entry: no runtime factory ships with this module (see the header). */
-export const handler = createUploadAdmissionHandler(undefined);
+/** The hosted factory, loaded lazily so a flag-off invocation imports no runtime code. */
+export const hostedRuntime: UploadAdmissionRuntimeFactory = async (env, config) =>
+  (await import("./upload-admission-hosted.ts")).hostedUploadAdmissionRuntime()(env, config);
+
+/** The deployed entry (stacks/aws/upload-inbox.ts uploadAdmissionFunctionProps). */
+export const handler = createUploadAdmissionHandler(hostedRuntime);
