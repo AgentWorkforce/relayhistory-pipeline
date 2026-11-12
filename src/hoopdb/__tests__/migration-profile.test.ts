@@ -2396,13 +2396,15 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const UC = "upstream:20261105057010_upload_consent.sql";
     const MB = "upstream:20261105057030_selfhost_erase_directory_membership.sql";
     const FP = "upstream:20261105047030_frozen_copy_progress.sql";
+    const UI = "upstream:20261105058000_operator_user_erase_indexes.sql";
+    const UE = "upstream:20261105058010_operator_user_erase.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2445,6 +2447,48 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
+    // 20261105058010 (operator per-user erase) is the newest: 058000's down refuses (55000) while it is applied;
+    // its own checksum-pinned down refuses while an erase is active, then restores 030000's ingest_lock_fences and
+    // 050010's GC claim exactly and drops the functions, the ledger table and its ledger row.
+    expect((await failure(rollback("20261105058000_operator_user_erase_indexes.down.sql")))?.code).toBe("55000");
+    const procSrc = async (sig: string) =>
+      (await db.query<{ s: string; d: boolean }>("SELECT prosrc s, prosecdef d FROM pg_proc WHERE oid=$1::regprocedure", [sig])).rows[0]!;
+    const bodyOf = (file: string, name: string, tag: string) => {
+      const src = readFileSync(join(root, `supabase/migrations/${file}`), "utf8");
+      const start = src.search(new RegExp(`CREATE(?: OR REPLACE)? FUNCTION sessions\\.${name}\\(`));
+      const open = src.indexOf(tag, start) + tag.length;
+      return src.slice(open, src.indexOf(tag, open));
+    };
+    expect((await procSrc("sessions.ingest_lock_fences(text,text,text)")).s).toContain("operator_user_erasures");
+    expect((await procSrc("sessions.ingest_buffer_gc_claim(jsonb)")).s).toContain("operator_user_erasures");
+    expect((await procSrc("sessions.ingest_privacy_authority_begin(jsonb)")).s).toContain("operator_user_erase_control_gate");
+    expect((await procSrc("sessions.ingest_source_control_begin(jsonb)")).s).toContain("operator_user_erase_control_gate");
+    await db.query("INSERT INTO sessions.operator_user_erasures(request_id,org_id,workspace_id,user_id,state,origins) VALUES('rollback-probe','o','w','u','purging','{}')");
+    expect((await failure(rollback("20261105058010_operator_user_erase.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(UE);
+    await db.query("DELETE FROM sessions.operator_user_erasures WHERE request_id='rollback-probe'");
+    await rollback("20261105058010_operator_user_erase.down.sql");
+    expect(await names()).not.toContain(UE);
+    expect(await relation("sessions.operator_user_erasures")).toBeNull();
+    expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.operator_user_erase_step(text,integer)')::text AS p")).rows[0]!.p).toBeNull();
+    expect((await db.query<{ p: string | null }>("SELECT to_regprocedure('sessions.operator_user_erase_remaining(text,text,text,text[])')::text AS p")).rows[0]!.p).toBeNull();
+    const fences = await procSrc("sessions.ingest_lock_fences(text,text,text)");
+    expect(fences).toEqual({ s: bodyOf("20261104030000_ingest_fence_ownership.sql", "ingest_lock_fences", "$lock$"), d: false });
+    const gcClaim = await procSrc("sessions.ingest_buffer_gc_claim(jsonb)");
+    expect(gcClaim).toEqual({ s: bodyOf("20261105050010_operator_session_erase_fence_check.sql", "ingest_buffer_gc_claim", "$claim$"), d: true });
+    // The two 041000 control begins come back byte-exact (SECURITY DEFINER kept); the gate, purge, ambiguity count and
+    // heads trigger are gone.
+    expect(await procSrc("sessions.ingest_privacy_authority_begin(jsonb)")).toEqual({ s: bodyOf("20261105041000_ingest_privacy_authority.sql", "ingest_privacy_authority_begin", "$authority_begin$"), d: true });
+    expect(await procSrc("sessions.ingest_source_control_begin(jsonb)")).toEqual({ s: bodyOf("20261105041000_ingest_privacy_authority.sql", "ingest_source_control_begin", "$control_begin$"), d: true });
+    for (const sig of ["sessions.operator_user_erase_purge(text,text,text,text[],boolean)", "sessions.operator_user_erase_control_gate(text,text,text)", "sessions.operator_user_erase_seat_ambiguity(text,text,text,text[])", "sessions.operator_user_erase_heads_guard()"])
+      expect((await db.query<{ p: string | null }>("SELECT to_regprocedure($1)::text AS p", [sig])).rows[0]!.p).toBeNull();
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname='operator_user_erase_guard'")).rows[0]!.n).toBe(0);
+    // 20261105058000 (foreign-key support indexes) is then the newest: 057030's down refuses; its own down drops the sixteen.
+    expect((await failure(rollback("20261105057030_selfhost_erase_directory_membership.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(MB);
+    await rollback("20261105058000_operator_user_erase_indexes.down.sql");
+    expect(await names()).not.toContain(UI);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_class WHERE relnamespace='sessions'::regnamespace AND relname IN ('ingest_lazy_ack_decisions_native_key_sha256_idx','ingest_lazy_ack_decisions_seat_key_sha256_idx','ingest_lazy_native_slots_current_seat_key_idx','ingest_receipt_ord_seats_key_sha256_idx','ingest_receipt_record_heads_winner_key_sha256_idx','ingest_stage_intents_parent_stage_token_idx','ingest_stage_intents_gc_replacement_stage_token_idx','ingest_stage_intents_batch_idx','ingest_buffer_outbox_active_stage_token_idx','ingest_history_plans_stage_token_idx','ingest_lazy_native_slots_unowned_origin_idx','ingest_receipt_seats_key_material_user_idx','ingest_receipt_seats_key_material_origin_idx','ingest_receipt_record_heads_key_material_user_idx','ingest_receipt_record_heads_key_material_origin_idx','ingest_receipt_ord_seats_candidate_key_idx')")).rows[0]!.n).toBe(0);
     // 20261105057030 (self-host erase directory membership, #566) is the newest step: 057010's down refuses (55000)
     // until its checksum-pinned rollback restores 044070's exact erase body (SECURITY DEFINER kept) and removes its ledger row.
     const eraseFn = async () =>
@@ -2575,7 +2619,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'output\\_facts\\_%'")).rows[0]!.n).toBe(0);
     // Other lanes newer than 20261105045000 (045010 same-second feed, 045030 consumer project-text grant) roll back next, newest first: 045000's down
     // refuses (55000) while any of them is applied. (046010 and 046000 already rolled back above, so they are excluded here.)
-    const newerThanDigest = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > DG && s.name < CQ && s.name !== OE && s.name !== EF && s.name !== ER && s.name !== SA && s.name !== DU && s.name !== UC && s.name !== OF && s.name !== LQ && s.name !== CQ && s.name !== "upstream:20261105046000_analysis_jobs.sql").reverse();
+    const newerThanDigest = (await plan(SUPA_A)).filter((s) => s.name.startsWith("upstream:") && s.name > DG && s.name < CQ && s.name !== OE && s.name !== EF && s.name !== ER && s.name !== SA && s.name !== DU && s.name !== UC && s.name !== UI && s.name !== UE && s.name !== OF && s.name !== LQ && s.name !== CQ && s.name !== "upstream:20261105046000_analysis_jobs.sql").reverse();
     if (newerThanDigest.length)
       expect((await failure(rollback("20261105045000_digest_narrative_cache.down.sql")))?.code).toBe("55000");
     for (const { name } of newerThanDigest)
@@ -3923,6 +3967,10 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
     expect(await snapshot(db)).toEqual(before);
     // After the operator's CONCURRENTLY build: the plan is green with 044020 pending, the apply adopts it.
     await db.exec(`CREATE INDEX CONCURRENTLY ${LAZY} ON sessions.ingest_lazy_native_slots USING btree (org_id)`);
+    // Later adoptable steps' indexes on the same populated table (20261105058000) are prebuilt the same way.
+    for (const [step, list] of Object.entries(ADOPTABLE_INDEXES)) {
+      if (step > CB) for (const x of list) if (x.table === "sessions.ingest_lazy_native_slots") await db.exec(x.def);
+    }
     await db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
     const report = await inspectMigrations(client(db), SUPA_ET);
     await db.exec("ROLLBACK");

@@ -1071,6 +1071,36 @@
     "sessions.migration_ingest_audit_append_only()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.operator_user_erase_begin(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_complete(text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_control_gate(text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_count(text,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_heads_guard()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_purge(text,text,text,text[],boolean)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_remaining(text,text,text,text[])": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_render(text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_seat_ambiguity(text,text,text,text[])": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_step(text,integer)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.output_facts_coverage_for(text,timestamp with time zone,timestamp with time zone)": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"

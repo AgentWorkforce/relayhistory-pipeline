@@ -24,6 +24,17 @@ const MIGRATION = join(root, "supabase/migrations", FILE);
 const DOWN = join(root, "supabase/rollbacks/20261105044020_claim_bootstrap_org_indexes.down.sql");
 const SQL = readFileSync(MIGRATION, "utf8");
 const IDX = ADOPTABLE_INDEXES[STEP]!;
+/**
+ * Later adoptable steps' indexes on ingest_lazy_native_slots (e.g. 20261105058000). Populating that table makes the
+ * migrator's preflight refuse them too; prebuilding them (as the operator would, CONCURRENTLY) keeps these tests about
+ * 044020's own decision.
+ */
+const LATER_SLOT_INDEXES = Object.entries(ADOPTABLE_INDEXES)
+  .filter(([step]) => step > STEP)
+  .flatMap(([, list]) => list.filter((x) => x.table === "sessions.ingest_lazy_native_slots").map((x) => x.def));
+const prebuildLaterSlotIndexes = async (db: { exec(sql: string): Promise<unknown> }) => {
+  for (const d of LATER_SLOT_INDEXES) await db.exec(d);
+};
 const LOCAL: MigrationProfile = { mode: "local", shim: true, bootstrap: true, verify: true, runtimeRole: "postgres" };
 
 /** The packet's eight definitions, in its build order (1..8). */
@@ -211,6 +222,7 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
       const db = await before044020();
       for (const x of IDX) if (x.name !== LAZY) await db.exec(x.def);
       await populateLazySlots(db);
+      await prebuildLaterSlotIndexes(db);
       const before = await orgIndexes(db);
       expect(before).toHaveLength(7);
       const error = (await failure(runMigrations(client(db), { profile: LOCAL }))) as { code?: string; message?: string } | null;
@@ -251,6 +263,7 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
       expect(markerBefore.map((r) => r.status)).toEqual(["pass"]);
       for (const x of IDX) if (x.name !== LAZY) await db.exec(x.def);
       await populateLazySlots(db);
+      await prebuildLaterSlotIndexes(db);
       const ledgerBefore = await ledgerRows();
       const error = await failure(runMigrations(client(db), { profile: LOCAL }));
       // The marker first: without the read-only refusal the migration would raise 55000 AFTER 'pending' was written.
@@ -568,10 +581,18 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
       const none = await failure(runMigrations(client(db), { profile: LOCAL }));
       expect(none?.code).toBe("index_prebuild_required");
       expect(none?.message).toContain(`index sessions.${LAZY} on sessions.ingest_lazy_native_slots (${STEP}) is absent and table sessions.ingest_lazy_native_slots is not empty`);
-      // 044020 inside the pending window (it is the target): refuses exactly as before.
+      // Later adoptable steps with ingest_lazy_native_slots indexes (e.g. 20261105058000) are unheld too, so they are reported.
+      const laterSlotSteps = Object.entries(ADOPTABLE_INDEXES)
+        .filter(([step, list]) => step > STEP && list.some((x) => x.table === "sessions.ingest_lazy_native_slots"))
+        .map(([step]) => step);
+      for (const step of laterSlotSteps) expect(none?.message).toContain(`(${step}) is absent`);
+      // 044020 inside the pending window (it is the target): refuses on 044020 exactly as before; every later
+      // adoptable step is HELD by the target and so is not preflighted (#565).
       const inside = await failure(runMigrations(client(db), { profile: LOCAL, target: STEP }));
       expect(inside?.code).toBe("index_prebuild_required");
-      expect(inside?.message).toBe(none?.message);
+      expect(inside?.message).toContain(`index sessions.${LAZY} on sessions.ingest_lazy_native_slots (${STEP}) is absent and table sessions.ingest_lazy_native_slots is not empty`);
+      for (const step of laterSlotSteps) expect(inside?.message).not.toContain(step);
+      if (laterSlotSteps.length === 0) expect(inside?.message).toBe(none?.message);
       // 044020 HELD (target = the step before it): the preflight no longer refuses; the run reaches the later
       // release-target gate (a held run needs the target commit binding), still before any write.
       expect((await failure(runMigrations(client(db), { profile: LOCAL, target: PREV })))?.code).toBe("release_target_binding_required");

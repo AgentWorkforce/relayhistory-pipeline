@@ -39,6 +39,15 @@ export function liveStagedPrefix(keyRoot: string, g: Pick<LiveFencedGroup, "org_
   return `${orgPrefix(keyRoot, g.org_id)}/live-batches/v1/ws=${component(g.workspace_id)}/m=${liveMachineId(g.workspace_id, g.origin_id, g.user_id)}/`;
 }
 
+/**
+ * The session ingest's buffered batch objects for one (workspace, user, origin) (relayhistory-api's buffered
+ * acceptance; the buffered GC redacts them in place). Production layout:
+ *   {root}/{org}/buffered-batches/v1/ws={ws}/m=srv_…/b={batch}-{content}-{claim}.staged.ndjson.zst
+ */
+export function liveBufferedPrefix(keyRoot: string, g: Pick<LiveFencedGroup, "org_id" | "workspace_id" | "origin_id" | "user_id">): string {
+  return `${orgPrefix(keyRoot, g.org_id)}/buffered-batches/v1/ws=${component(g.workspace_id)}/m=${liveMachineId(g.workspace_id, g.origin_id, g.user_id)}/`;
+}
+
 /** `h=…/s=…` of every session directory under `prefix` with at least one object version. */
 export function liveSessionsIn(prefix: string, keys: readonly string[]): Set<string> {
   const out = new Set<string>();
