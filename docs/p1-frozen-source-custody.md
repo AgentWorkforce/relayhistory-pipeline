@@ -26,11 +26,16 @@ The whole sequence is rehearsed in `frozen-custody.pglite.test.ts` ("rehearsed g
 ## Then
 1. **Copy and seal**, outside the window, each step a dispatch of the protected custody workflow (see "Supervisor (protected workflow)" below). Uploads keep working because frozen mode is not yet on: `plan`, then `copy` (resumable from the owner-only progress table), then `readback`, then `seal`.
 2. **Shadow**: deploy the ingest Worker with `custodySource: shadow`. Require `custody.shadow` outcome `match` on live batches and controls before going further.
+   Use the CI-only `step-0-shadow` profile in [private ingest production](../runbooks/private-ingest-production.md): a reviewed tracked-profile change, a fresh exact-SHA plan, deployment, and active-version readback. Keep async admission `drain` and the synchronous frozen-receipt bridge absent. A successful mode readback is not the shadow parity proof, and no copy/seal prerequisite is waived.
 3. **Mirror** (relayhistory PR): call `/v1/custody/control/begin` before Neon begin, require an equal `{version,digest}`, and call `/v1/custody/control/complete` after Neon complete. This must be live before any frozen flip. Shadow mismatches on `sourceControlVersion`/`pending` mean it isn't.
 4. **Flip**: deploy the ingest Worker with `custodySource: frozen-supabase`, then relayhistory `DELIVERY_CUSTODY_SOURCE_MODE=frozen-supabase` (skip the Neon witness/pending/status calls on batches).
 5. **Prove**: the runtime role's Neon upload-path statements reach zero (pg_stat_statements delta), and the upload 2xx rate is unchanged or better.
 
-**Rollback**: unset the relayhistory flag. It goes back to sending the Neon witness, which the Worker accepts in every mode.
+**Rollback**: first return relayhistory to its Neon witness mode and verify the active-version
+readback through its CI path. Only then may the Worker return from frozen to shadow through the
+private-ingest CI gate. The Worker accepts the Neon witness in every mode. Keep the RHC writer
+lane held through the Worker rollback; a frozen, opaque or Supabase-authority RHC mode refuses.
+Respect the separate one-way privacy/auth boundaries: this path cannot undo Supabase authority.
 
 ## Copy and seal operator (`scripts/frozen-source-copy.ts`)
 No production run of this operator is authorized by this document or by the PR that added it. Running `copy`, `readback` or `seal` against the real target, and applying the progress-table migration below, each need Khaliq's separate, explicit OK. `--copy`, `--readback` and `--seal` refuse unless they run as the protected workflow's job ("Supervisor (protected workflow)").

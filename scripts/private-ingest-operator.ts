@@ -60,6 +60,7 @@ import {
   SIGNING_KEY_SECRET,
 } from "../stacks/cloudflare/session-ingest.ts";
 import { sanitizePlan, captureFiles } from "../src/cli/plan-provenance.ts";
+import { requireCustodyEvidenceText } from "../src/session-ingest/private-ingest-custody-evidence.ts";
 import {
   privateIngestGithubGate,
   privateIngestGithubGet,
@@ -184,6 +185,7 @@ export function assertOperatorSource(
   )
     refuse("immutable_source_or_inputs");
   const allowed = new Set(captureFiles(SESSION_INGEST_STAGE));
+  allowed.add(`docs/plans/${SESSION_INGEST_STAGE}.custody-evidence.json`);
   if (source.changedFiles.some((path) => !allowed.has(path)))
     refuse("dirty_source");
   if (!source.host) refuse("host");
@@ -945,14 +947,15 @@ export function assertOperatorSnapshot(
               refuse("native_binding_target");
             deletedValue = oldAccepted;
           } else if (b.sid === "INGEST_CUSTODY_SOURCE") {
-            // CI rollout rollback: step 1 -> baseline only.
+            // Native deletion must match a known custody value; the CI live-phase
+            // gate separately requires shadow -> baseline (no direct frozen skip).
             if (input.sessionIngest.custodySource !== undefined ||
                 input.sessionIngest.syncAdmissionFrozenReceipt !== undefined ||
-                currentEnv?.INGEST_CUSTODY_SOURCE !== "frozen-supabase" ||
+                (currentEnv?.INGEST_CUSTODY_SOURCE !== "shadow" && currentEnv?.INGEST_CUSTODY_SOURCE !== "frozen-supabase") ||
                 currentEnv?.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT !== undefined ||
                 proposedEnv?.INGEST_CUSTODY_SOURCE !== undefined)
               refuse("native_binding_target");
-            deletedValue = "frozen-supabase";
+            deletedValue = currentEnv.INGEST_CUSTODY_SOURCE;
           } else if (b.sid === "INGEST_SYNC_ADMISSION_FROZEN_RECEIPT") {
             // CI rollout rollback: step 2 -> step 1 only.
             if (input.sessionIngest.syncAdmissionFrozenReceipt !== undefined ||
@@ -1361,6 +1364,7 @@ export async function operatorMain(argv = process.argv.slice(2)) {
   });
   const source = sourceNow();
   assertOperatorSource(options, source);
+  requireCustodyEvidenceText(readFileSync(PREFIX + ".custody-evidence.json", "utf8"));
   const secrets = {
     accountId: process.env.CLOUDFLARE_ACCOUNT_ID ?? "",
     apiToken: process.env.CLOUDFLARE_API_TOKEN ?? "",

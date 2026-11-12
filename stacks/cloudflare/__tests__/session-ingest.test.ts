@@ -736,3 +736,55 @@ describe("session ingest: SESSIONS_NEON_EXIT (neonExit, default off)", () => {
       await expect(ingestSettings(runtime(extra))).rejects.toBeInstanceOf(NeonExitRefusal);
   });
 });
+
+describe("session ingest: INGEST_UPLOAD_CONSENT (default off)", () => {
+  // Same shape as the INGEST_CLAIM_TIMEOUT_BUSY block: a var-only flag, no binding or resource.
+  const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };
+  const canonical: SessionIngestInputs = { ...inputs, acceptanceMode: "canonical" };
+
+  it("omitted: the var set is exactly main's (pinned), with no INGEST_UPLOAD_CONSENT", () => {
+    // Pinned from origin/main before this input existed, so the comparison is not the PR against itself.
+    const base = ["INGEST_INLINE_MAX_SESSIONS", "INGEST_KEY_ROOT", "INGEST_KMS_KEY_ARN", "INGEST_MAX_PER_ORG", "INGEST_MAX_PER_USER", "INGEST_REPLICA_MODE", "INGEST_S3_BUCKET", "INGEST_S3_REGION"];
+    expect(Object.keys(sessionIngestVars(inputs)).sort()).toEqual(base);
+    expect(Object.keys(sessionIngestVars(canonical)).sort()).toEqual(base);
+    expect(Object.keys(sessionIngestVars(buffered)).sort()).toEqual(["INGEST_ACCEPTANCE_MODE", "INGEST_EXPECT_GENERATION", ...base].sort());
+  });
+
+  it("omitted: no INGEST_UPLOAD_CONSENT key at all, vars and props byte-identical to a stack without the input", () => {
+    for (const p of [inputs, canonical, buffered]) {
+      expect(Object.hasOwn(sessionIngestVars(p), "INGEST_UPLOAD_CONSENT")).toBe(false);
+      expect(JSON.stringify(sessionIngestWorkerProps(p, bindings))).toBe(JSON.stringify(sessionIngestWorkerProps({ ...p, uploadConsent: undefined }, bindings)));
+    }
+  });
+
+  it("report / hold-only / enforce: exactly one more var, no new binding or resource", () => {
+    const env = { CLOUDFLARE_ACCOUNT_ID: hex("a") };
+    for (const mode of ["report", "hold-only", "enforce"] as const)
+      for (const base of [inputs, canonical, buffered]) {
+        const on = { ...base, uploadConsent: mode };
+        expect(() => assertSessionIngestInputs(on, refuse)).not.toThrow();
+        expect(sessionIngestVars(on)).toEqual({ ...sessionIngestVars(base), INGEST_UPLOAD_CONSENT: mode });
+        const p = props(on);
+        expect(p.env.INGEST_UPLOAD_CONSENT).toBe(mode);
+        expect(Object.keys(p.env).sort()).toEqual([...Object.keys(props(base).env), "INGEST_UPLOAD_CONSENT"].sort());
+        expect(() => assertNoSecretLiterals(p.env, refuse)).not.toThrow();
+        expect(() => assertPrivateWorker(p, refuse)).not.toThrow();
+        expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: on }, env)).not.toThrow();
+      }
+    expect(sessionIngestResources()).toBe(SESSION_INGEST_RESOURCES);
+  });
+
+  it("composes with neonExit: both vars render, each once", () => {
+    const exit: SessionIngestInputs = { ...buffered, custodySource: "frozen-supabase", neonExit: "on", uploadConsent: "report" };
+    expect(() => assertSessionIngestInputs(exit, refuse)).not.toThrow();
+    const vars = sessionIngestVars(exit);
+    expect([vars.INGEST_UPLOAD_CONSENT, vars.SESSIONS_NEON_EXIT]).toEqual(["report", "true"]);
+  });
+
+  it("is refused for any other value (off is spelled by omitting it)", () => {
+    for (const value of ["off", "on", "Report", "true", true, 1, "", null])
+      expect(() => assertSessionIngestInputs({ ...inputs, uploadConsent: value }, refuse)).toThrow('sessionIngest.uploadConsent must be "report", "hold-only" or "enforce" (omit for off)');
+    const env = { CLOUDFLARE_ACCOUNT_ID: hex("a") };
+    expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: { ...inputs, uploadConsent: "on" } }, env)).toThrow(/uploadConsent.*Nothing was changed/);
+  });
+});
