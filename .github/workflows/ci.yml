@@ -49,9 +49,11 @@ jobs:
         run: bun run e2e:selfhost
   unit-tests:
     runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
-    # The serial PGlite suite outgrew 40 minutes on GitHub-hosted runners.
-    # Preserve every test and the 30-second per-test limit below.
-    timeout-minutes: 90
+    # The serial PGlite suite outgrew 40 minutes on GitHub-hosted runners and, with
+    # concurrent runs sharing the runner pool, 90 minutes on 2026-11-12 (the job was
+    # still passing tests when cancelled). Preserve every test and the 30-second
+    # per-test limit below; sharding the suite is the real fix.
+    timeout-minutes: 150
     # A real ClickHouse for the session read API's query tests
     # (src/session-read-api/__tests__/page.clickhouse.test.ts), the version the
     # search proofs pin. Test-only credentials; no production data.
