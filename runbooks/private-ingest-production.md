@@ -30,10 +30,13 @@ separate decision owned by relayhistory-cloud.
 Adding shadow support does not change the tracked production profile or dispatch a deployment.
 For the P1 flow, change that profile to `custodySource=shadow` in its own reviewed commit, plan
 and deploy, then retain genuine `custody.shadow` match evidence on batches and controls before
-the separate frozen profile commit. A mode readback alone is not a parity receipt. Existing
-baseline-to-frozen transitions remain representable for already-qualified releases; that gate
-does not waive P1 copy/seal/mirror/shadow readiness. Shadow cannot enable the receipt bridge or
-async admission, and cannot skip directly to/from the advanced phases.
+the separate frozen profile commit. A mode readback alone is not a parity receipt. The live
+transition gate requires `baseline-drain <-> step-0-shadow <-> step-1-custody`; direct
+baseline-to-custody promotion and direct custody-to-baseline rollback both refuse. Already-live
+custody deployments remain recognizable and may be redeployed without a phase change. Neither
+an adjacent transition nor a mode readback waives P1 copy/seal/mirror/shadow evidence. Shadow
+cannot enable the receipt bridge or async admission, and cannot skip directly to/from the
+advanced phases.
 
 Khaliq's recorded production authorization is bound into the deploy capture by
 `src/session-ingest/private-ingest-release.ts`; every run must remain inside its authorized
@@ -98,8 +101,10 @@ readback is retained as `private-ingest-readback` for 30 days.
 
 ## Rollback
 
-- Step 1: revert the tracked profile to `baseline-drain` by a normal commit, then plan and deploy
-  through the same workflow. Step 2 rolls back to `step-1-custody`. Never rewrite `main`.
+- Step 1: change the tracked profile to `step-0-shadow` by a normal commit, then plan and deploy
+  through the same workflow. If a return to `baseline-drain` is required, use a second profile
+  commit and its own plan/deploy after the shadow readback passes. A direct step-1-to-baseline
+  revert refuses. Step 2 rolls back to `step-1-custody`. Never rewrite `main`.
 - Shadow may return to baseline through the same CI path; step 1 may return to shadow for
   diagnosis. Refuse a custody-binding deletion from an unknown mode or with a receipt bridge
   still enabled. RHC privacy/auth authority boundaries still apply independently.

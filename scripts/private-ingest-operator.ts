@@ -936,7 +936,8 @@ export function assertOperatorSnapshot(
               refuse("native_binding_target");
             deletedValue = oldAccepted;
           } else if (b.sid === "INGEST_CUSTODY_SOURCE") {
-            // CI custody rollback: shadow or frozen step 1 -> baseline only.
+            // Native deletion must match a known custody value; the CI live-phase
+            // gate separately requires shadow -> baseline (no direct frozen skip).
             if (input.sessionIngest.custodySource !== undefined ||
                 input.sessionIngest.syncAdmissionFrozenReceipt !== undefined ||
                 (currentEnv?.INGEST_CUSTODY_SOURCE !== "shadow" && currentEnv?.INGEST_CUSTODY_SOURCE !== "frozen-supabase") ||

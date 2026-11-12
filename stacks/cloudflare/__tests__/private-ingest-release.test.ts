@@ -126,13 +126,14 @@ test("shadow is drain-only and cannot smuggle the receipt bridge or async activa
   }
 });
 
-test("CI shadow transition and readback use the live phase without skipping advanced rollout steps", () => {
+test("CI shadow transition and readback require the adjacent live phase for promotion and rollback", () => {
   for (const [from, to] of [
     ["baseline-drain", "step-0-shadow"],
     ["step-0-shadow", "step-0-shadow"],
     ["step-0-shadow", "baseline-drain"],
     ["step-0-shadow", "step-1-custody"],
     ["step-1-custody", "step-0-shadow"],
+    ["step-1-custody", "step-1-custody"],
   ] as const) {
     const f = readbackFixture(from);
     expect(privateIngestTransitionReadback(privateIngestProfileForPhase(to, kmsKeyArn), f.active, f.version))
@@ -154,27 +155,25 @@ test("CI shadow transition and readback use the live phase without skipping adva
   expect(() => privateIngestVersionReadback(f.input, f.active, f.version)).toThrow();
 });
 
-test("live transition gate requires an independently deployed step 2 before step 4", () => {
+test.each([
+  ["baseline-drain", "step-1-custody"],
+  ["step-1-custody", "baseline-drain"],
+] as const)("CI refuses direct custody skip %s -> %s", (from, to) => {
+  const f = readbackFixture(from);
+  expect(() => privateIngestTransitionReadback(privateIngestProfileForPhase(to, kmsKeyArn), f.active, f.version))
+    .toThrow("private_ingest_live_transition");
+});
+
+test("live transition gate preserves baseline idempotency and requires an independently deployed step 2 before step 4", () => {
   const baseline = readbackFixture("step-1-custody");
   baseline.version.resources!.bindings = baseline.version.resources!.bindings!.filter(
     (binding) => binding.name !== "INGEST_CUSTODY_SOURCE",
   );
   expect(privateIngestTransitionReadback(
-    privateIngestProfileForPhase("step-1-custody", kmsKeyArn),
-    baseline.active,
-    baseline.version,
-  )).toMatchObject({ from: "baseline-drain", to: "step-1-custody" });
-  expect(privateIngestTransitionReadback(
     privateIngestProfileForPhase("baseline-drain", kmsKeyArn),
     baseline.active,
     baseline.version,
   )).toMatchObject({ from: "baseline-drain", to: "baseline-drain" });
-  const currentStep1ForRollback = readbackFixture("step-1-custody");
-  expect(privateIngestTransitionReadback(
-    privateIngestProfileForPhase("baseline-drain", kmsKeyArn),
-    currentStep1ForRollback.active,
-    currentStep1ForRollback.version,
-  )).toMatchObject({ from: "step-1-custody", to: "baseline-drain" });
   const currentStep1 = readbackFixture("step-1-custody");
   expect(privateIngestTransitionReadback(
     privateIngestProfileForPhase("step-2-frozen-receipt", kmsKeyArn),

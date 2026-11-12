@@ -272,7 +272,7 @@ export function privateIngestProfileForPhase(
   return { sessionIngest };
 }
 
-/** Advanced steps require the live predecessor; custody shadow is a separate diagnostic profile. */
+/** Each rollout or rollback requires an adjacent live phase, including custody shadow. */
 export function privateIngestTransitionReadback(
   input: CloudflareStageInputs,
   active: ReturnType<typeof privateIngestActiveVersion>,
@@ -293,9 +293,9 @@ export function privateIngestTransitionReadback(
   if (matches.length !== 1) privateIngestRefuse("private_ingest_live_phase");
   const from = matches[0]![0];
   const allowed: Record<PrivateIngestReleasePhase, readonly PrivateIngestTransitionReadback["from"][]> = {
-    "baseline-drain": ["baseline-drain", "step-0-shadow", "step-1-custody"],
+    "baseline-drain": ["baseline-drain", "step-0-shadow"],
     "step-0-shadow": ["baseline-drain", "step-0-shadow", "step-1-custody"],
-    "step-1-custody": ["baseline-drain", "step-0-shadow", "step-1-custody", "step-2-frozen-receipt"],
+    "step-1-custody": ["step-0-shadow", "step-1-custody", "step-2-frozen-receipt"],
     "step-2-frozen-receipt": ["step-1-custody", "step-2-frozen-receipt", "step-4-async-on"],
     "step-4-async-on": ["step-2-frozen-receipt", "step-4-async-on"],
   };
