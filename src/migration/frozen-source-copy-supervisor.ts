@@ -51,6 +51,8 @@ export const FROZEN_COPY_OPERATOR_FILES = [
   "src/migration/frozen-source-copy-progress.ts",
   "src/migration/frozen-source-copy-queries.ts",
   "src/migration/frozen-source-copy-supervisor.ts",
+  "src/migration/stdin-credentials.ts",
+  "src/hoopdb/frozen-control-head-repair.ts",
   "scripts/schema-release-github.ts",
   "scripts/frozen-source-copy.ts",
 ] as const;
