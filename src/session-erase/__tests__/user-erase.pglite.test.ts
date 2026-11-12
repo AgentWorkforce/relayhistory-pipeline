@@ -727,3 +727,45 @@ describe("operator per-user erase (058010)", () => {
     expect(cand).not.toContain("Seq Scan");
   });
 });
+
+test("admin queue to verified user erase preserves a neighboring user's same-named session and exact stored bytes", async () => {
+  const { PGlite } = await import("@electric-sql/pglite");
+  const { base, cloudSchema, enqueue, job, alice, bob, own, id } = await import("./account-reset-fixture.ts");
+  const { advanceReset } = await import("../account-reset-runner.ts");
+  const { parseUserEraseRequest } = await import("../user-erase.ts");
+  const { readAll } = await import("../../shared/vendor.ts");
+  const cloud = new PGlite();
+  open.push(() => cloud.close());
+  await cloud.exec(base + cloudSchema);
+  const connection = cloud as unknown as import("pg").Client;
+  const f = await fixture();
+  const a = { orgId: own, workspaceId: id(20), userId: alice };
+  const b = { ...a, userId: bob };
+  await deliver(f, a, "batch-a", 3, { origin: "device-a", recordPrefix: "collision" });
+  await deliver(f, b, "batch-b", 3, { origin: "device-b", recordPrefix: "collision" });
+  const bytes = async () => {
+    const snapshot = new Map<string, Uint8Array>();
+    for (const k of await storeKeys(f)) snapshot.set(k, await readAll(await f.deps.target.store.get(objectKey(k))));
+    return snapshot;
+  };
+  const before = await bytes(), bobMachine = liveMachineId(b.workspaceId, "device-b", bob);
+  const keep = new Map([...before].filter(([k]) => k.includes("/m=" + bobMachine + "/")));
+  expect(keep.size).toBeGreaterThan(0);
+  expect(keep.size).toBeLessThan(before.size);
+  const bobRows = await footprint(f, b);
+  await enqueue(connection);
+  const tick = async () => advanceReset(connection, await job(connection), {}, "https://cast.test", {
+    findWorkspaces: async () => [{ org_id: own, workspace_id: a.workspaceId }],
+    fetch: (async () => new Response(null, { status: 204 })) as typeof fetch,
+    erase: async (_env, request) => ({
+      enabled: true, ...await runUserErase(pgDb(f), parseUserEraseRequest(await request()), {
+        keyRoot: "96bulls", eraser: storeEraser(f.deps.target.store), sleep: async () => {}, stepLimit: 1,
+      }),
+    }),
+  });
+  await tick(); await tick(); await tick();
+  expect((await job(connection)).phase).toBe("complete");
+  expect(await bytes()).toEqual(keep);
+  expect(await footprint(f, b)).toEqual(bobRows);
+  expect(await footprint(f, a)).toEqual({});
+});

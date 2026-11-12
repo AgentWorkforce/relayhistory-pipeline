@@ -19,6 +19,7 @@ case "${SERVICE:-}" in
   session-ingest)   exec bun run /app/src/session-ingest/selfhost-server.ts ;;
   session-publication) exec bun run /app/src/session-ingest/publication-service.ts --continuous ;;
   session-erase-bytes) exec bun run /app/src/session-erase/selfhost-eraser-main.ts ;;
+  account-reset) exec bun run /app/src/session-erase/account-reset-runner.ts ;;
   user-erase) exec bun run /app/src/session-erase/user-erase-main.ts ;;
   *) echo "96bulls: unknown SERVICE='${SERVICE:-}'" >&2; exit 2 ;;
 esac

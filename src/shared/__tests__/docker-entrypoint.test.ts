@@ -30,6 +30,7 @@ const EXPECTED: Record<string, string[]> = {
   "session-pipeline-output-facts-bootstrap": ["run", "/app/src/session-pipeline/output-facts-bootstrap.ts"],
   acquisition: ["run", "/app/src/acquisition/main.ts"],
   "session-erase-bytes": ["run", "/app/src/session-erase/selfhost-eraser-main.ts"],
+  "account-reset": ["run", "/app/src/session-erase/account-reset-runner.ts"],
   "user-erase": ["run", "/app/src/session-erase/user-erase-main.ts"],
 };
 
