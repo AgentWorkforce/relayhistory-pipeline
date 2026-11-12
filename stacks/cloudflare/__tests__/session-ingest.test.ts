@@ -29,6 +29,8 @@ import {
   type SessionIngestInputs,
 } from "../session-ingest.ts";
 import { assertCloudflareStage, cloudflareMode } from "../alchemy.cloudflare.run.ts";
+import { ingestSettings, type IngestWorkerEnv } from "../../../src/session-ingest/worker.ts";
+import { NeonExitRefusal } from "../../../src/shared/neon-exit.ts";
 
 const refuse = (why: string): never => {
   throw new Error(why);
@@ -628,6 +630,113 @@ describe("session ingest: INGEST_CLAIM_TIMEOUT_BUSY (default off)", () => {
   });
 });
 
+describe("session ingest: SESSIONS_NEON_EXIT (neonExit, default off)", () => {
+  // The only shape the Neon-exit Worker serves (worker.ts ingestSettings): buffered, frozen-supabase, replica off.
+  const exit: SessionIngestInputs = {
+    ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, replicaMode: "off",
+    custodySource: "frozen-supabase", asyncAdmission: "off", neonExit: "on",
+  };
+  const { neonExit: _off, ...withoutExit } = exit;
+  const admissionQueue = { Type: "Cloudflare.Queues.Queue", queueName: ADMISSION_QUEUE };
+  const vars = () => sessionIngestVars(exit) as Record<string, string>;
+
+  it("omitted: no SESSIONS_NEON_EXIT key at all; the default vars are unchanged", () => {
+    expect(sessionIngestVars(inputs)).toEqual({
+      INGEST_S3_BUCKET: "96bulls-aws-sessions-prod-transcripts-941433935742",
+      INGEST_S3_REGION: "us-east-1",
+      INGEST_KEY_ROOT: "96bulls",
+      INGEST_KMS_KEY_ARN: KEY_ARN,
+      INGEST_MAX_PER_USER: "4",
+      INGEST_MAX_PER_ORG: "32",
+      INGEST_INLINE_MAX_SESSIONS: "40",
+      INGEST_REPLICA_MODE: "off",
+    });
+    const queue: SessionIngestInputs = { ...inputs, replicaMode: "queue", neonReplicaQueue: "relayhistory-neon-replica" };
+    for (const p of [inputs, queue, withoutExit, { ...withoutExit, asyncAdmission: "on" as const }]) {
+      const b = resolvedAsyncAdmission(p) !== "off" ? { ...bindings, INGEST_ADMISSION: admissionQueue } : bindings;
+      expect(Object.hasOwn(sessionIngestVars(p), "SESSIONS_NEON_EXIT")).toBe(false);
+      expect(Object.hasOwn((sessionIngestWorkerProps(p, b) as unknown as { env: Record<string, unknown> }).env, "SESSIONS_NEON_EXIT")).toBe(false);
+      expect(JSON.stringify(sessionIngestWorkerProps(p, b))).toBe(JSON.stringify(sessionIngestWorkerProps({ ...p, neonExit: undefined }, b)));
+    }
+  });
+
+  it('"on" with the accepted shape: exactly SESSIONS_NEON_EXIT "true" more, and no NEON_REPLICA binding', () => {
+    expect(() => assertSessionIngestInputs(exit, refuse)).not.toThrow();
+    expect(sessionIngestVars(exit)).toEqual({ ...sessionIngestVars(withoutExit), SESSIONS_NEON_EXIT: "true" });
+    const p = props(exit);
+    expect(p.env.SESSIONS_NEON_EXIT).toBe("true");
+    expect(Object.hasOwn(p.env, "NEON_REPLICA")).toBe(false);
+    expect(p.env.INGEST_REPLICA_MODE).toBe("off");
+    expect(Object.keys(p.env).sort()).toEqual([...Object.keys(props(withoutExit).env), "SESSIONS_NEON_EXIT"].sort());
+    expect(() => assertNoSecretLiterals(p.env, refuse)).not.toThrow();
+    expect(() => assertPrivateWorker(p, refuse)).not.toThrow();
+    expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: exit }, { CLOUDFLARE_ACCOUNT_ID: hex("a") })).not.toThrow();
+    // replicaMode omitted is off too; async admission and the frozen receipt stay independent.
+    const { replicaMode: _r, ...omittedReplica } = exit;
+    expect(() => assertSessionIngestInputs(omittedReplica, refuse)).not.toThrow();
+    const all = { ...exit, asyncAdmission: "on" as const, syncAdmissionFrozenReceipt: "on" as const, claimLockBusy: "on" as const };
+    expect(() => assertSessionIngestInputs(all, refuse)).not.toThrow();
+    const allEnv = (sessionIngestWorkerProps(all, { ...bindings, INGEST_ADMISSION: admissionQueue }) as unknown as { env: Record<string, unknown> }).env;
+    expect(allEnv.SESSIONS_NEON_EXIT).toBe("true");
+    expect(Object.hasOwn(allEnv, "NEON_REPLICA")).toBe(false);
+  });
+
+  it("refuses every configuration that still binds a Neon edge, naming the setting", () => {
+    const cases: Array<[Record<string, unknown>, RegExp]> = [
+      [{ ...exit, replicaMode: "queue", neonReplicaQueue: "relayhistory-neon-replica" }, /neonExit "on" refuses replicaMode/],
+      [{ ...exit, replicaMode: "queue" }, /neonExit "on" refuses replicaMode/],
+      [{ ...exit, neonReplicaQueue: "relayhistory-neon-replica" }, /neonExit "on" refuses neonReplicaQueue/],
+      [{ ...exit, replicaMode: undefined, neonReplicaQueue: "relayhistory-neon-replica" }, /neonExit "on" refuses neonReplicaQueue/],
+      [{ ...inputs, custodySource: "frozen-supabase", neonExit: "on" }, /neonExit "on" requires acceptanceMode "buffered"/],
+      [{ ...inputs, acceptanceMode: "canonical", custodySource: "frozen-supabase", neonExit: "on" }, /neonExit "on" requires acceptanceMode "buffered"/],
+      [{ ...inputs, neonExit: "on" }, /neonExit "on" requires acceptanceMode "buffered"/],
+      [{ ...exit, custodySource: undefined }, /neonExit "on" requires custodySource "frozen-supabase"/],
+      [{ ...exit, custodySource: "shadow" }, /neonExit "on" requires custodySource "frozen-supabase"/],
+      [{ ...exit, custodySource: "relayhistory" }, /neonExit "on" requires custodySource "frozen-supabase"/],
+    ];
+    for (const [bad, why] of cases) {
+      const shaped = Object.fromEntries(Object.entries(bad).filter(([, v]) => v !== undefined));
+      expect(() => assertSessionIngestInputs(shaped, refuse)).toThrow(why);
+      expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: shaped }, { CLOUDFLARE_ACCOUNT_ID: hex("a") })).toThrow(/neonExit.*Nothing was changed/);
+    }
+  });
+
+  it('is refused for any value but "on"', () => {
+    for (const value of ["true", true, "off", "ON", "On", 1, "", null, false])
+      expect(() => assertSessionIngestInputs({ ...exit, neonExit: value }, refuse)).toThrow('sessionIngest.neonExit must be "on" (omit for off)');
+    expect(() => assertSessionIngestInputs({ ...exit, SESSIONS_NEON_EXIT: "true" }, refuse)).toThrow("sessionIngest.SESSIONS_NEON_EXIT is not a known setting");
+  });
+
+  it("the Worker props never render NEON_REPLICA with neonExit set, even past the validator", () => {
+    const unchecked = { ...exit, replicaMode: "queue", neonReplicaQueue: "relayhistory-neon-replica" } as SessionIngestInputs;
+    expect(() => sessionIngestWorkerProps(unchecked, bindings)).toThrow('sessionIngest.neonExit "on" never renders the NEON_REPLICA binding');
+  });
+
+  it("stack and runtime agree: the rendered vars pass the Worker's own Neon-exit gate, and a Neon edge on them is refused", async () => {
+    const runtime = (extra: Partial<IngestWorkerEnv> = {}): IngestWorkerEnv => ({
+      ...vars(),
+      HYPERDRIVE: { connectionString: "postgres://never:never@hyperdrive.invalid:5432/never" },
+      INGEST_FANOUT: { send: async () => {}, sendBatch: async () => {} } as never,
+      S3_ACCESS_KEY_ID: "k",
+      S3_SECRET_ACCESS_KEY: "s",
+      INGEST_SIGNING_KEY: "synthetic-signing-key",
+      ...extra,
+    });
+    const settings = await ingestSettings(runtime());
+    expect(settings).not.toBeNull();
+    expect(settings?.replicaMode).toBe("off");
+    expect(settings?.acceptanceMode).toBe("buffered");
+    // Without the stack's own refusals, these would ship a Worker that refuses every request.
+    for (const extra of [
+      { NEON_REPLICA: { send: async () => {}, sendBatch: async () => {} } as never },
+      { INGEST_REPLICA_MODE: "queue" },
+      { INGEST_CUSTODY_SOURCE: "shadow" },
+      { INGEST_ACCEPTANCE_MODE: "canonical" },
+    ])
+      await expect(ingestSettings(runtime(extra))).rejects.toBeInstanceOf(NeonExitRefusal);
+  });
+});
+
 describe("session ingest: INGEST_UPLOAD_CONSENT (default off)", () => {
   // Same shape as the INGEST_CLAIM_TIMEOUT_BUSY block: a var-only flag, no binding or resource.
   const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };
@@ -663,6 +772,13 @@ describe("session ingest: INGEST_UPLOAD_CONSENT (default off)", () => {
         expect(() => assertCloudflareStage("cf-sessions-prod", "plan", { sessionIngest: on }, env)).not.toThrow();
       }
     expect(sessionIngestResources()).toBe(SESSION_INGEST_RESOURCES);
+  });
+
+  it("composes with neonExit: both vars render, each once", () => {
+    const exit: SessionIngestInputs = { ...buffered, custodySource: "frozen-supabase", neonExit: "on", uploadConsent: "report" };
+    expect(() => assertSessionIngestInputs(exit, refuse)).not.toThrow();
+    const vars = sessionIngestVars(exit);
+    expect([vars.INGEST_UPLOAD_CONSENT, vars.SESSIONS_NEON_EXIT]).toEqual(["report", "true"]);
   });
 
   it("is refused for any other value (off is spelled by omitting it)", () => {

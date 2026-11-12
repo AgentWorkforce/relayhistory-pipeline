@@ -177,12 +177,21 @@ export interface SessionIngestInputs {
   /**
    * INGEST_UPLOAD_CONSENT (src/session-ingest/upload-consent.ts, docs/upload-consent.md): server-owned upload
    * consent. "report" logs what would be held and never refuses an upload (also when the consent store is
-   * unreadable; a selection disable still 503s until its deny can be recorded, so apply the migration first);
-   * "hold-only" refuses principals under a containment hold; "enforce" refuses every upload without a
-   * confirmed choice. Apply migration 20261105057010 first (report still never refuses an upload, but a selection disable 503s until its deny can be recorded). Omit for off
+   * unreadable); "hold-only" refuses principals under a containment hold; "enforce" refuses every upload
+   * without a confirmed choice. Apply migration 20261105057010 first: until its deny can be recorded, a
+   * selection disable answers 503 in every mode. Omit for off
    * (no var rendered, vars byte-identical to before).
    */
   uploadConsent?: "report" | "hold-only" | "enforce";
+  /**
+   * SESSIONS_NEON_EXIT: the Neon-exit release profile (src/shared/neon-exit.ts, docs/neon-exit-edge-map.md).
+   * The Worker then refuses every request while any Neon edge is configured, so the stack refuses the
+   * same edges first (assertSessionIngestInputs mirrors worker.ts ingestSettings): replicaMode must be
+   * omitted or "off", no neonReplicaQueue, buffered acceptance, custodySource frozen-supabase. Present:
+   * the var only (no queue, no binding; NEON_REPLICA is never rendered). Omit for off (the Worker
+   * default; no var rendered, vars byte-identical to before).
+   */
+  neonExit?: "on";
 }
 
 /** The stack's async admission setting (the runtime var has the same values; absent there = "off"). */
@@ -212,7 +221,7 @@ const AUTHORITY_ENV_KEYS = [
   "INGEST_AUTHORITY_EXPECT_AUTH_EPOCH",
   "INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY",
 ] as const;
-const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "uploadConsent"];
+const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "neonExit", "uploadConsent"];
 
 function validAuthorityKeyRoot(value: unknown): value is string {
   if (typeof value !== "string" || !/^96bulls\/[A-Za-z0-9][A-Za-z0-9_/-]{0,151}$/.test(value) || value.endsWith("/")) return false;
@@ -292,6 +301,15 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
   };
   int("maxPerUser", 1, 64);
   int("maxPerOrg", 1, 1024);
+  // Before the generic mode checks, so a Neon edge under the profile is refused by name. Mirrors the
+  // Worker's own refusal (worker.ts ingestSettings) so a deploy never ships a Worker that refuses every request.
+  if (v.neonExit !== undefined) {
+    if (v.neonExit !== "on") refuse('sessionIngest.neonExit must be "on" (omit for off)');
+    if (v.replicaMode !== undefined && v.replicaMode !== "off") refuse('sessionIngest.neonExit "on" refuses replicaMode other than "off" (the Neon replica queue is a Neon edge)');
+    if (v.neonReplicaQueue !== undefined) refuse("sessionIngest.neonExit \"on\" refuses neonReplicaQueue (no NEON_REPLICA binding under the Neon-exit profile)");
+    if (v.acceptanceMode !== "buffered") refuse('sessionIngest.neonExit "on" requires acceptanceMode "buffered" (frozen-supabase custody needs it)');
+    if (v.custodySource !== "frozen-supabase") refuse('sessionIngest.neonExit "on" requires custodySource "frozen-supabase" (the relayhistory and shadow witnesses read Neon)');
+  }
   // 48 sessions is the Worker's subrequest budget per batch (relayhistory MAX_LIVE_SESSIONS).
   if (v.acceptanceMode !== undefined && v.acceptanceMode !== "canonical" && v.acceptanceMode !== "buffered") refuse("sessionIngest.acceptanceMode must be canonical or buffered");
   if (v.custodySource !== undefined && (!(v.custodySource === "shadow" || v.custodySource === "frozen-supabase") || v.acceptanceMode !== "buffered")) refuse("sessionIngest.custodySource must be shadow or frozen-supabase, in buffered mode only (omit for relayhistory)");
@@ -353,6 +371,7 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     ...(p.syncAdmissionFrozenReceipt === "on" ? { INGEST_SYNC_ADMISSION_FROZEN_RECEIPT: "on" } : {}),
     ...(p.claimLockBusy === "on" ? { INGEST_CLAIM_LOCK_BUSY: "on" } : {}),
     ...(p.claimTimeoutBusy === "on" ? { INGEST_CLAIM_TIMEOUT_BUSY: "on" } : {}),
+    ...(p.neonExit === "on" ? { SESSIONS_NEON_EXIT: "true" } : {}),
     ...(p.uploadConsent ? { INGEST_UPLOAD_CONSENT: p.uploadConsent } : {}),
   };
 }
@@ -366,6 +385,10 @@ export function sessionIngestWorkerProps(p: SessionIngestInputs, bindings: { HYP
   const withAdmission = resolvedAsyncAdmission(p) !== "off";
   if (withAdmission !== (bindings.INGEST_ADMISSION !== undefined))
     throw new Error("the INGEST_ADMISSION binding is declared exactly when the resolved sessionIngest.asyncAdmission is on or drain");
+  const withNeonReplica = p.replicaMode === "queue" && !!p.neonReplicaQueue;
+  // Belt and braces behind assertSessionIngestInputs: the Neon-exit Worker refuses a bound NEON_REPLICA.
+  if (p.neonExit !== undefined && withNeonReplica)
+    throw new Error('sessionIngest.neonExit "on" never renders the NEON_REPLICA binding');
   return {
     name: SESSION_INGEST_WORKER,
     main: "src/session-ingest/worker.ts",
@@ -387,7 +410,7 @@ export function sessionIngestWorkerProps(p: SessionIngestInputs, bindings: { HYP
       S3_ACCESS_KEY_ID: secretsStoreSecret(p.secretsStoreId, S3_ACCESS_KEY_SECRET),
       S3_SECRET_ACCESS_KEY: secretsStoreSecret(p.secretsStoreId, S3_SECRET_KEY_SECRET),
       INGEST_SIGNING_KEY: secretsStoreSecret(p.secretsStoreId, SIGNING_KEY_SECRET),
-      ...(p.replicaMode === "queue" && p.neonReplicaQueue ? { NEON_REPLICA: externalQueue(p.neonReplicaQueue) } : {}),
+      ...(withNeonReplica ? { NEON_REPLICA: externalQueue(p.neonReplicaQueue!) } : {}),
     },
   };
 }

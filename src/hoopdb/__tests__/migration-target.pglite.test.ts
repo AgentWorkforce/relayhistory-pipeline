@@ -38,7 +38,7 @@ import {
   type MigrationProfile,
   type ReleaseTargetBinding,
 } from "../migrate.ts";
-import { releaseTargetBinding, requireTargetCommit, treeSchemaSteps, treeVerifiers, type ReleaseTargetAnchor } from "../release-target.ts";
+import { releaseAnchorBinding, releaseTargetBinding, requireTargetCommit, treeSchemaSteps, treeVerifiers, type ReleaseTargetAnchor } from "../release-target.ts";
 import { sessionsFunctionAclDrift } from "../migrate-guards.ts";
 import { CONSUMER_RUNTIME_FUNCTIONS, RUNTIME_APPLICATION_FUNCTIONS } from "../migrate-guards.ts";
 import { schemaVerdict, sessionsFunctionGateSql, type ExpectedSchema, type Transact } from "../../shared/db.ts";
@@ -212,6 +212,46 @@ test("steps after the target are held: never applied or ledgered; both verifier 
   expect(second).toEqual({ applied: 2, skipped: 2, held: [] });
   expect(await ledger(db)).toEqual([u("1"), u("2"), u("3"), u("4")]);
   expect(await marker(db)).toEqual([{ generation: gen, status: "pass" }]);
+});
+
+test("condition (6), protected anchor: phase 2 runs target_sha's verifiers from the anchor commit's own objects and PASS binds the anchor generation only; held steps stay unledgered", async () => {
+  // Anchor D off main at A: A's steps, verifiers at the release sha's bytes ("tr"); the
+  // tip of release/schema-<u2 slot> in the release namespace. Not on main's history.
+  git(fx.repo, "checkout", "-q", "-b", "anchor-d", A);
+  const trFiles = verifierFiles("tr");
+  const D = fx.commit(trFiles, "D");
+  git(fx.repo, "checkout", "-q", "main");
+  git(fx.repo, "update-ref", "refs/remotes/origin/release/schema-000002", D);
+  try {
+    const held = [u("3"), u("4")];
+    const a = releaseAnchorBinding({ repo: fx.repo, releaseSha: R, targetSha: D, target: u("2"), prefix: fixturePrefix(held) });
+    const fromD = independentGeneration([[u("1"), contentOf(u("1"))], [u("2"), contentOf(u("2"))], ...verifierTexts(trFiles)]);
+    expect(a.targetSha).toBe(D);
+    expect(a.targetGeneration).toBe(fromD);
+    expect(a.targetGeneration).not.toBe(anchor(A, u("2"), held).targetGeneration);
+    const db = await fresh();
+    const gen = await generation();
+    expect(a.targetGeneration).not.toBe(gen);
+    const run = await runMigrations(client(db), {
+      profile: LOCAL, steps, target: u("2"), expectedPending: [u("1"), u("2")],
+      targetGeneration: a.targetGeneration, targetBinding: bindingOf(a),
+    });
+    expect(run).toEqual({ applied: 2, skipped: 0, held });
+    expect(await ledger(db)).toEqual([u("1"), u("2")]);
+    expect(await exists(db, "sessions.t3")).toBe(false);
+    expect(await exists(db, "sessions.t4")).toBe(false);
+    // D's seven verifiers ran (its "tr" texts), not A's.
+    expect(await tables(db, "tr_")).toEqual(RELEASE_TREE.verifiers.map((_, i) => `tr_${i}`));
+    expect(await tables(db, "ta_")).toEqual([]);
+    expect(await marker(db)).toEqual([{ generation: a.targetGeneration, status: "pass" }]);
+    // The same commit without its ref is refused.
+    git(fx.repo, "update-ref", "-d", "refs/remotes/origin/release/schema-000002");
+    expect(code(() => releaseAnchorBinding({ repo: fx.repo, releaseSha: R, targetSha: D, target: u("2"), prefix: fixturePrefix(held) }))).toBe(
+      "release_anchor_ref_missing",
+    );
+  } finally {
+    git(fx.repo, "update-ref", "-d", "refs/remotes/origin/release/schema-000002");
+  }
 });
 
 test("target_sha: abbreviated, unknown, missing from a shallow clone, not on the first-parent chain, not ending at the target, differing steps or a missing verifier refuse", () => {
@@ -567,7 +607,7 @@ const runTarget = (db: PGlite, s: { split: { expectedPending: string[] }; bindin
   });
 const heldProcs = (db: PGlite) =>
   db.query<{ n: number }>(
-    "SELECT count(*)::int n FROM pg_proc WHERE proname LIKE 'ingest_operator_erase%' OR proname LIKE 'ingest_operator_runtime%' OR proname LIKE 'ingest_erase_fence%' OR proname LIKE 'upload_consent%' OR proname IN ('buffered_session_stages_for_target', 'session_summary_activity_for', 'session_directory_users_for')",
+    "SELECT count(*)::int n FROM pg_proc WHERE proname LIKE 'ingest_operator_erase%' OR proname LIKE 'ingest_operator_runtime%' OR proname LIKE 'ingest_erase_fence%' OR proname LIKE 'upload_consent%' OR proname IN ('buffered_session_stages_for_target', 'buffered_session_stages_for_target_paged', 'session_summary_activity_for', 'session_directory_users_for')",
   ).then((r) => r.rows[0]!.n);
 
 test("real tree, target 047000: the target generation is target_sha's own (independently recomputed), not this tree's with or without the held steps", async () => {
@@ -575,7 +615,7 @@ test("real tree, target 047000: the target generation is target_sha's own (indep
   const split = migrationTargetSplit(names.map((name) => ({ name, pending: !name.startsWith("96bulls:") && names.indexOf(name) >= names.indexOf(TARGET) })), TARGET);
   expect(split.held).toContain(ERASE);
   expect(split.held).toContain(ERASE_FENCE);
-  // Every upstream step after the target (as of this tree: 047010, 050000, 050010, 050020, 056000, 057000, 057010).
+  // Every upstream step after the target (as of this tree: 047010, 047020, 050000, 050010, 050020, 056000, 057000, 057010).
   expect(split.held).toEqual(names.filter((n) => n.startsWith("upstream:") && n > TARGET));
   expect(split.held).toContain("upstream:20261105047010_buffered_exact_session_stages.sql");
   expect(split.held).toContain(ERASE_RUNTIME);

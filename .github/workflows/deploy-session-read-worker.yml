@@ -99,6 +99,11 @@ on:
         type: choice
         options: ["off", "on"]
         default: "off"
+      owner_buffered_stages_paged:
+        description: 047020 paged stages RPC; on requires applied migration, owner_buffered=on and owner_buffered_exact_session=on; off preserves live in profile/preserve, otherwise disables
+        type: choice
+        options: ["off", "on"]
+        default: "off"
       owner_buffered_events:
         description: Owner-buffered session events (GET /v1/sessions/:id/events with source); valid only with owner_buffered=on. profile = committed value; off = exactly the owner_buffered render
         type: choice
@@ -167,6 +172,7 @@ jobs:
       # Owner-buffered session events (default off); the render refuses on without owner_buffered=on.
       OWNER_BUFFERED_EVENTS: ${{ inputs.owner_buffered_events }}
       OWNER_BUFFERED_EXACT_SESSION: ${{ inputs.owner_buffered_exact_session }}
+      OWNER_BUFFERED_STAGES_PAGED: ${{ inputs.owner_buffered_stages_paged }}
       OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: ${{ inputs.owner_buffered_statement_timeout_ms }}
       # Owner-buffered events latency (default off); the render refuses either without owner_buffered_events=on.
       OWNER_BUFFERED_STAGE_CONCURRENCY: ${{ inputs.owner_buffered_stage_concurrency }}

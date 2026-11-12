@@ -1,5 +1,6 @@
 /** Read-only GitHub gate. Errors contain fixed codes only. */
 import {
+  releaseAnchorBranch,
   releaseInputs,
   SCHEMA_RELEASE as P,
   refuse,
@@ -15,7 +16,8 @@ const REQUIRED_PUSH_RUNS = [
   ],
 ] as const;
 /**
- * For each required workflow, the latest push run on main with head_sha === sha
+ * For each required workflow, the latest push run on `branch` (main for the release
+ * sha, the release/schema-<slot> anchor branch for target_sha) with head_sha === sha
  * must be completed/success, and every job of that run attempt completed/success
  * with head_sha === sha, the required job names included. Refuses codes.runs or
  * codes.jobs.
@@ -25,6 +27,7 @@ async function requireGreenPushRuns(
   base: string,
   sha: string,
   codes: { runs: string; jobs: string },
+  branch = "main",
 ) {
   for (const [workflow, names] of REQUIRED_PUSH_RUNS) {
     const listing = await get(
@@ -34,7 +37,7 @@ async function requireGreenPushRuns(
     const runs = (listing.workflow_runs ?? [])
       .filter(
         (r: Obj) =>
-          r.head_sha === sha && r.head_branch === "main" && r.event === "push",
+          r.head_sha === sha && r.head_branch === branch && r.event === "push",
       )
       .sort((a: Obj, b: Obj) => b.id - a.id);
     const latest = runs[0];
@@ -137,14 +140,38 @@ export async function githubReleaseGate(
     runs: "release_ci",
     jobs: "release_ci_jobs",
   });
-  // The runtime image is published at target_sha, so its own push CI and
-  // pg-proof runs on main must be green too (first-parent history alone does
-  // not prove that a historical main commit passed its checks).
-  if (input.targetSha !== input.sha)
-    await requireGreenPushRuns(get, base, input.targetSha, {
-      runs: "release_target_ci",
-      jobs: "release_target_ci_jobs",
-    });
+  // A held-step release is anchored to the protected release/schema-<slot>
+  // branch for its target: the branch must exist, be protected and have
+  // target_sha as its tip (read live, so the gate re-run under the migrator
+  // lock refuses an anchor ref that moved after the plan). The runtime image is
+  // published at target_sha, so its own push CI and pg-proof runs on that
+  // branch must be green too, exactly as strict as the release sha's on main.
+  if (input.targetSha !== input.sha) {
+    const branch = releaseAnchorBranch(input.target);
+    if (!branch) refuse("release_anchor_ref_missing");
+    const matching = await get(base + "/git/matching-refs/heads/" + branch);
+    const refs = Array.isArray(matching)
+      ? matching.filter((r: Obj) => r?.ref === "refs/heads/" + branch)
+      : [];
+    if (refs.length !== 1) refuse("release_anchor_ref_missing");
+    if (
+      refs[0].object?.type !== "commit" ||
+      refs[0].object?.sha !== input.targetSha
+    )
+      refuse("release_anchor_ref_mismatch");
+    const protection = await get(base + "/branches/" + branch);
+    if (protection?.name !== branch || protection?.protected !== true)
+      refuse("release_anchor_ref_unprotected");
+    if (protection?.commit?.sha !== input.targetSha)
+      refuse("release_anchor_ref_mismatch");
+    await requireGreenPushRuns(
+      get,
+      base,
+      input.targetSha,
+      { runs: "release_target_ci", jobs: "release_target_ci_jobs" },
+      branch,
+    );
+  }
   // Apply and bootstrap both consume a successful same-sha plan run under 24h old.
   if (input.mode !== "plan") {
     const plan = await get(base + "/actions/runs/" + input.planRun);

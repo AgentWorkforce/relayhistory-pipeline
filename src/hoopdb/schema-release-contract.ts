@@ -17,6 +17,23 @@ export const SCHEMA_RELEASE = {
 /** One schema step name exactly as the migrator ledgers it (migrate.ts schemaSteps). */
 export const RELEASE_TARGET_STEP =
   /^(?:upstream:[0-9]{14}|96bulls:[0-9]{4})_[a-z0-9_]+\.sql$/;
+/**
+ * The protected branch that anchors a held-step release: release/schema-<slot>, where
+ * the slot is the target's 6-digit migration slot for an upstream step
+ * (upstream:20261105047000_x.sql -> release/schema-047000) and 96bulls-NNNN for a
+ * history-lane step (96bulls:0005_x.sql -> release/schema-96bulls-0005). target_sha
+ * must be the tip of this branch whenever it differs from the release sha
+ * (src/hoopdb/release-target.ts requireReleaseAnchor; the GitHub gate). Returns
+ * undefined for a name that is not a schema step.
+ */
+export const RELEASE_ANCHOR_BRANCH_PREFIX = "release/schema-";
+export function releaseAnchorBranch(target: string): string | undefined {
+  if (!RELEASE_TARGET_STEP.test(target)) return undefined;
+  const up = /^upstream:[0-9]{8}([0-9]{6})_/.exec(target);
+  if (up) return RELEASE_ANCHOR_BRANCH_PREFIX + up[1];
+  const hist = /^96bulls:([0-9]{4})_/.exec(target);
+  return hist ? `${RELEASE_ANCHOR_BRANCH_PREFIX}96bulls-${hist[1]}` : undefined;
+}
 export function refuse(code: string): never {
   throw Object.assign(new Error(code), { code });
 }

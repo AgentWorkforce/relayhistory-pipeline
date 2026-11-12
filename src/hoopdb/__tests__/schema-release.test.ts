@@ -1,6 +1,7 @@
 import { test, expect } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import {
+  releaseAnchorBranch,
   releaseInputs,
   releaseConnection,
   SCHEMA_RELEASE as P,
@@ -48,14 +49,17 @@ import {
 const sha = "a".repeat(40),
   generation = "b".repeat(64),
   target = "upstream:20261105047000_coordination_fact_readers.sql",
-  // target_sha: the full commit (sha itself or on sha's first-parent main history) whose
-  // tree ends at the target; its own push CI and pg-proof runs must be green.
+  // target_sha: the full commit (sha itself, or the tip of the protected
+  // release/schema-047000 anchor branch) whose tree ends at the target; its own push CI
+  // and pg-proof runs on that branch must be green.
   targetSha = "9".repeat(40),
   // The plan's targetGeneration (target_sha's own generation); differs from generation
   // when held.
   targetGeneration = "f".repeat(64),
   // The plan's canonical manifest digest, carried only inside the typed approval.
-  manifestDigest = "8".repeat(64);
+  manifestDigest = "8".repeat(64),
+  // The protected branch anchoring target_sha (releaseAnchorBranch(target)).
+  anchorBranch = "release/schema-047000";
 const base = {
   RELEASE_MODE: "plan",
   RELEASE_SHA: sha,
@@ -232,13 +236,22 @@ function api() {
         conclusion: "success",
       })),
     },
-    // target_sha's own push runs on main (ids 20/21), checked when it differs from sha.
+    // The protected anchor branch for the target, its tip target_sha.
+    anchorRefs: [
+      { ref: "refs/heads/" + anchorBranch, object: { type: "commit", sha: targetSha } },
+    ] as any[],
+    anchorBranch: {
+      name: anchorBranch,
+      protected: true,
+      commit: { sha: targetSha },
+    } as any,
+    // target_sha's own push runs on the anchor branch (ids 20/21), checked when it differs from sha.
     tci: {
       workflow_runs: [
         {
           id: 20,
           head_sha: targetSha,
-          head_branch: "main",
+          head_branch: anchorBranch,
           event: "push",
           status: "completed",
           conclusion: "success",
@@ -251,7 +264,7 @@ function api() {
         {
           id: 21,
           head_sha: targetSha,
-          head_branch: "main",
+          head_branch: anchorBranch,
           event: "push",
           status: "completed",
           conclusion: "success",
@@ -290,6 +303,8 @@ type Fixture = ReturnType<typeof api>;
 function get(f: Fixture) {
   return async (path: string): Promise<any> => {
     if (path.endsWith("/git/ref/heads/main")) return f.ref;
+    if (path.endsWith("/git/matching-refs/heads/" + anchorBranch)) return f.anchorRefs;
+    if (path.endsWith("/branches/" + anchorBranch)) return f.anchorBranch;
     if (path.endsWith("/actions/runs/100")) return f.run;
     if (path.endsWith("/actions/runs/90")) return f.plan;
     if (path.endsWith("/environments/" + P.environment)) return f.env;
@@ -437,7 +452,24 @@ const targetCiMutations: [string, (f: Fixture) => void, string][] = [
   ["target pg-proof failed", (f) => (f.tpg.workflow_runs[0]!.conclusion = "failure"), "release_target_ci"],
   // A run listed for another commit or off main or not a push does not count.
   ["target run of another sha", (f) => (f.tci.workflow_runs[0]!.head_sha = sha), "release_target_ci"],
-  ["target run off main", (f) => (f.tpg.workflow_runs[0]!.head_branch = "feature"), "release_target_ci"],
+  ["target run off the anchor branch", (f) => (f.tpg.workflow_runs[0]!.head_branch = "feature"), "release_target_ci"],
+  // A run of target_sha on main (or another release branch) is not the anchor's CI.
+  ["target run on main", (f) => (f.tci.workflow_runs[0]!.head_branch = "main"), "release_target_ci"],
+  ["target run on another anchor branch", (f) => (f.tpg.workflow_runs[0]!.head_branch = "release/schema-047010"), "release_target_ci"],
+  // The anchor branch itself: present, exact, a commit at target_sha, protected.
+  ["anchor branch missing", (f) => (f.anchorRefs = []), "release_anchor_ref_missing"],
+  [
+    "only a longer branch name matches",
+    (f) => (f.anchorRefs[0].ref = "refs/heads/" + anchorBranch + "0"),
+    "release_anchor_ref_missing",
+  ],
+  ["matching-refs not a list", (f) => (f.anchorRefs = { ref: "x" } as any), "release_anchor_ref_missing"],
+  ["anchor branch moved", (f) => (f.anchorRefs[0].object.sha = "7".repeat(40)), "release_anchor_ref_mismatch"],
+  ["anchor branch at a tag object", (f) => (f.anchorRefs[0].object.type = "tag"), "release_anchor_ref_mismatch"],
+  ["anchor branch unprotected", (f) => (f.anchorBranch.protected = false), "release_anchor_ref_unprotected"],
+  ["anchor branch protection unknown", (f) => delete f.anchorBranch.protected, "release_anchor_ref_unprotected"],
+  ["anchor branch reads another name", (f) => (f.anchorBranch.name = "main"), "release_anchor_ref_unprotected"],
+  ["anchor branch moved between reads", (f) => (f.anchorBranch.commit.sha = "7".repeat(40)), "release_anchor_ref_mismatch"],
   // The latest run decides: an older green run does not mask a newer failed one.
   [
     "target latest run failed",
@@ -480,6 +512,8 @@ test("target_sha's own push CI and pg-proof runs are read and must be green when
     expect(paths).toContain(`/repos/${P.repository}/actions/workflows/${wf}/runs?event=push&head_sha=${sha}&per_page=100`);
     expect(paths).toContain(`/repos/${P.repository}/actions/workflows/${wf}/runs?event=push&head_sha=${targetSha}&per_page=100`);
   }
+  expect(paths).toContain(`/repos/${P.repository}/git/matching-refs/heads/release/schema-047000`);
+  expect(paths).toContain(`/repos/${P.repository}/branches/release/schema-047000`);
   expect(paths.some((p) => p.includes("/actions/runs/20/attempts/1/jobs"))).toBe(true);
   expect(paths.some((p) => p.includes("/actions/runs/21/attempts/1/jobs"))).toBe(true);
   // The release sha's check still runs first and keeps its own codes.
@@ -502,8 +536,24 @@ test("target_sha === sha: no extra GitHub calls for the target", async () => {
   expect((await githubReleaseGate(same, async (p) => (paths.push(p), inner(p)), true)).targetSha).toBe(sha);
   expect(paths.filter((p) => p.includes(`head_sha=${targetSha}`))).toEqual([]);
   expect(paths.filter((p) => p.includes("/runs/20/") || p.includes("/runs/21/"))).toEqual([]);
+  // No anchor branch read: nothing is held, the release sha is its own anchor.
+  expect(paths.filter((p) => p.includes("release/schema-"))).toEqual([]);
   // Exactly one listing per required workflow (the release sha's).
   expect(paths.filter((p) => p.includes("/actions/workflows/")).length).toBe(2);
+});
+test("releaseAnchorBranch: release/schema-<6-digit slot> for upstream, release/schema-96bulls-NNNN for the history lane, nothing else", () => {
+  expect(releaseAnchorBranch("upstream:20261105047000_coordination_fact_readers.sql")).toBe("release/schema-047000");
+  expect(releaseAnchorBranch("upstream:20261105047010_buffered_exact_session_stages.sql")).toBe("release/schema-047010");
+  expect(releaseAnchorBranch("upstream:20261105050010_operator_session_erase_fence_check.sql")).toBe("release/schema-050010");
+  expect(releaseAnchorBranch("96bulls:0005_operator_session_erase_guards.sql")).toBe("release/schema-96bulls-0005");
+  for (const bad of ["", "upstream:047000", "upstream:20261105047000_x.SQL", "verify:x", "96bulls:005_x.sql", "release/schema-047000"])
+    expect(releaseAnchorBranch(bad)).toBeUndefined();
+  // Two-digit lane/step ordering in branch names sorts like the migrator for one date.
+  expect(["release/schema-050010", "release/schema-047010", "release/schema-047000"].sort()).toEqual([
+    "release/schema-047000",
+    "release/schema-047010",
+    "release/schema-050010",
+  ]);
 });
 test("apply rejects foreign, stale, replayed or failed prior plan and artifact bindings", async () => {
   const env = {
@@ -1134,7 +1184,7 @@ test("operator plan renders the target split and refuses a missing target before
   expect(src).toMatch(
     /target: input\.target,\n\s+\.\.\.split,\n\s+targetSha: anchor\.targetSha,\n\s+targetGeneration,\n\s+manifestDigest: anchor\.manifestDigest,\n\s+targetManifest: anchor\.manifest,/,
   );
-  expect(src).toContain("const anchor = releaseTargetBinding({");
+  expect(src).toContain("const anchor = releaseAnchorBinding({");
   expect(src).toContain("prefix: await schemaStepDigests(split.held),");
   const r = Bun.spawnSync(
     [process.execPath, "scripts/schema-release-operator-plan.ts"],

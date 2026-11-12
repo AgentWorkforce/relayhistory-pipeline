@@ -148,6 +148,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105047000_coordination_fact_readers.sql",
       // Read-role-only exact-session buffered stage RPC; default-off and never called by the ingest Worker.
       "20261105047010_buffered_exact_session_stages.sql",
+      // Read-role-only paged exact-session buffered stage RPC (requires 047010); default-off and never called by the ingest Worker.
+      "20261105047020_buffered_session_stages_paged.sql",
       // Operator per-session erase: new tables and entry points; no ingest path calls them.
       "20261105050000_operator_session_erase.sql",
       // Its fence check also replaces publication scope / buffer GC for lock order and guards live writer tables.

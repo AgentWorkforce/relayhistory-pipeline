@@ -6,7 +6,9 @@ name: pg-proof
 on:
   pull_request:
   push:
-    branches: [main]
+    # release/schema-*: the protected release anchor branches (a held-step target_sha
+    # needs green push runs on its own branch; scripts/schema-release-github.ts).
+    branches: [main, 'release/schema-*']
 permissions:
   contents: read
 concurrency:

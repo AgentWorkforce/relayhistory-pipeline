@@ -41,14 +41,22 @@ import {
   seedSet,
   seedStepBytes,
   validateInputs,
+  anchorRefTip,
+  buildAnchorFixture,
+  moveAnchorRef,
+  mutateAnchorTip,
+  PLAN_ANCHOR_INJECTIONS,
+  removeAnchorRefs,
+  type AnchorGit,
   type RoleEdge,
   type RoleRow,
   type Runner,
 } from "../../../scripts/pg-proof/schema-rehearsal-core.ts";
 import { landingCommit } from "../../../scripts/pg-proof/schema-rehearsal.ts";
 import { manifestGeneration, migrationProfile, RELEASE_TREE } from "../migrate.ts";
-import { treeSchemaSteps, treeVerifiers } from "../release-target.ts";
-import { SCHEMA_RELEASE } from "../schema-release-contract.ts";
+import { releaseAnchorBinding, requireReleaseAnchor, treeSchemaSteps, treeVerifiers } from "../release-target.ts";
+import { releaseAnchorBranch, SCHEMA_RELEASE } from "../schema-release-contract.ts";
+import { SESSION_BOOTSTRAP_FILES } from "../session-bootstrap-chain.ts";
 import { releaseProfile } from "../schema-release-inspect.ts";
 
 const ROOT = join(import.meta.dir, "../../..");
@@ -691,5 +699,166 @@ describe("drift against production and the rehearsal files", () => {
   });
   test("the runbook says it authorizes nothing", () => {
     expect(read("runbooks/schema-release-rehearsal.md")).toContain("prerequisite proof only and authorizes nothing");
+  });
+});
+
+describe("release anchor fixture and injections (offline: temp repo, real git)", () => {
+  const ENV = { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" };
+  const real: Runner = (cmd, args, opts) => {
+    const r = spawnSync(cmd, [...args], { cwd: opts.cwd, env: opts.env, encoding: "utf8", timeout: opts.timeoutMs });
+    return { status: r.error ? null : r.status, signal: r.signal, stdout: r.stdout ?? "", stderr: r.stderr ?? "" };
+  };
+  const s = (n: string) => `upstream:20261105${n}_s${n}.sql`;
+  const file = (n: string) => `supabase/migrations/20261105${n}_s${n}.sql`;
+  const rollback = (n: string) => `supabase/rollbacks/20261105${n}_s${n}.down.sql`;
+  /**
+   * main: M0 (046000, 047000, verifiers, bootstrap b0, README) then R, the release sha
+   * (047010 with its rollback, 050000, 050010, 050020, bootstrap b1). Target 050010,
+   * 050020 held: no main commit has exactly that prefix.
+   */
+  const fixture = () => {
+    const repo = mkdtempSync(join(tmpdir(), "rehearsal-anchor-test-"));
+    const g = (...args: string[]) => {
+      const r = spawnSync("git", args, {
+        cwd: repo,
+        encoding: "utf8",
+        env: { ...ENV, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@x", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@x" },
+      });
+      if (r.status !== 0) throw new Error(r.stderr);
+      return r.stdout.trim();
+    };
+    const put = (p: string, text: string) => {
+      mkdirSync(join(repo, p, ".."), { recursive: true });
+      writeFileSync(join(repo, p), text);
+    };
+    g("init", "-q", "-b", "main");
+    for (const n of ["046000", "047000"]) put(file(n), `select '${n}';`);
+    for (const v of RELEASE_TREE.verifiers) put(v.path, `select 'verify ${v.name}';`);
+    SESSION_BOOTSTRAP_FILES.forEach((f, i) => put(f, `select 'bootstrap b0 ${i}';`));
+    put("README.md", "x");
+    g("add", "-A");
+    g("commit", "-q", "-m", "m0");
+    const m0 = g("rev-parse", "HEAD");
+    for (const n of ["047010", "050000", "050010", "050020"]) put(file(n), `select '${n}';`);
+    put(rollback("047010"), "select 'down';");
+    SESSION_BOOTSTRAP_FILES.forEach((f, i) => put(f, `select 'bootstrap b1 ${i}';`));
+    g("add", "-A");
+    g("commit", "-q", "-m", "r");
+    const release = g("rev-parse", "HEAD");
+    const ag: AnchorGit = { run: real, repo, env: ENV, indexFile: join(mkdtempSync(join(tmpdir(), "rehearsal-anchor-index-")), "index") };
+    const steps = treeSchemaSteps(repo, release);
+    const slots = new Map<string, number>();
+    for (const [n] of steps) {
+      const b = releaseAnchorBranch(n);
+      if (b) slots.set(b, (slots.get(b) ?? 0) + 1);
+    }
+    const prefixOf = (held: string[]) => steps.filter(([n]) => !held.includes(n));
+    const build = (target: string, held: string[], base = m0) =>
+      buildAnchorFixture({
+        ...ag,
+        sha: release,
+        base,
+        target,
+        prefix: prefixOf(held).map(([n]) => n),
+        baseSteps: new Set(treeSchemaSteps(repo, base).map(([n]) => n)),
+        bootstrapFiles: SESSION_BOOTSTRAP_FILES,
+        branchOf: releaseAnchorBranch,
+        uniqueBranch: (b) => slots.get(b) === 1,
+        stepPath: (n) => `supabase/migrations/${n.slice("upstream:".length)}`,
+        rollbackPath: (n) => `supabase/rollbacks/${n.slice("upstream:".length, -4)}.down.sql`,
+      });
+    const bind = (tip: string, target: string, held: string[]) =>
+      releaseAnchorBinding({ repo, releaseSha: release, targetSha: tip, target, prefix: prefixOf(held) });
+    return { repo, g, ag, m0, release, build, bind, cleanup: () => rmSync(repo, { recursive: true, force: true }) };
+  };
+
+  test("the fixture chain is linear, one anchor per unique slot, and production binds its tip", () => {
+    const f = fixture();
+    try {
+      const held = [s("050020")];
+      const built = f.build(s("050010"), held);
+      // The bootstrap-only base anchor (047000), then 047010, 050000 and the target.
+      expect(built.refs.map((r) => r.branch)).toEqual([
+        "release/schema-047000",
+        "release/schema-047010",
+        "release/schema-050000",
+        "release/schema-050010",
+      ]);
+      expect(built.tip).toBe(built.refs.at(-1)!.sha);
+      for (const r of built.refs) expect(anchorRefTip(f.ag, r.branch)).toBe(r.sha);
+      const chain = requireReleaseAnchor({ repo: f.repo, releaseSha: f.release, targetSha: built.tip, target: s("050010") });
+      expect(chain.mainBase).toBe(f.m0);
+      expect(chain.below).toEqual(["release/schema-050000", "release/schema-047010", "release/schema-047000"]);
+      // The generation is the prefix and the verifiers, independent of the anchor commits.
+      const b = f.bind(built.tip, s("050010"), held);
+      expect(b.targetGeneration).toBe(
+        manifestGeneration({
+          steps: treeSchemaSteps(f.repo, f.release).filter(([n]) => !held.includes(n)),
+          verifiers: treeVerifiers(f.repo, f.release).map((v) => [v.name, v.sha256]),
+        }),
+      );
+      // Every anchor of the chain binds its own target (each lower one through its slot).
+      expect(f.bind(built.refs[0]!.sha, s("047000"), [s("047010"), s("050000"), s("050010"), s("050020")]).targetSha).toBe(built.refs[0]!.sha);
+      expect(f.bind(built.refs[1]!.sha, s("047010"), [s("050000"), s("050010"), s("050020")]).targetSha).toBe(built.refs[1]!.sha);
+      // Never overwrites a ref: a second build refuses, and removal restores the namespace.
+      expect(code(() => f.build(s("050010"), held))).toBe("rehearsal_anchor_fixture_conflict");
+      expect(built.refs.every((r) => anchorRefTip(f.ag, r.branch) === r.sha)).toBe(true);
+      removeAnchorRefs(f.ag, built.refs);
+      for (const r of built.refs) expect(anchorRefTip(f.ag, r.branch)).toBeUndefined();
+      // A target the base already carries: one bootstrap-only anchor on the target's slot.
+      const a = f.build(s("047000"), [s("047010"), s("050000"), s("050010"), s("050020")]);
+      expect(a.refs.map((r) => r.branch)).toEqual(["release/schema-047000"]);
+      expect(f.g("diff-tree", "-r", "--name-only", "--no-commit-id", f.m0, a.tip).split("\n").sort()).toEqual([...SESSION_BOOTSTRAP_FILES].sort());
+      removeAnchorRefs(f.ag, a.refs);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("each anchor injection makes production's binding refuse with its pinned code", () => {
+    const f = fixture();
+    try {
+      const held = [s("050020")];
+      const target = s("050010");
+      const built = f.build(target, held);
+      const branch = releaseAnchorBranch(target)!;
+      const tip = built.tip;
+      expect(f.bind(tip, target, held).targetSha).toBe(tip);
+      for (const inject of PLAN_ANCHOR_INJECTIONS) {
+        const next = mutateAnchorTip({ ...f.ag, sha: f.release, branch, tip, inject, bootstrapFiles: SESSION_BOOTSTRAP_FILES, verifierPath: RELEASE_TREE.verifiers[0]!.path });
+        expect(next).not.toBe(tip);
+        expect(anchorRefTip(f.ag, branch)).toBe(next);
+        expect(code(() => f.bind(next, target, held))).toBe(INJECTION_REFUSAL[inject]);
+        moveAnchorRef(f.ag, branch, next, tip);
+        expect(f.bind(tip, target, held).targetSha).toBe(tip);
+      }
+      // anchor-ref-moved: the plan's target_sha (the old tip) no longer names the branch tip.
+      const twin = mutateAnchorTip({ ...f.ag, sha: f.release, branch, tip, inject: "anchor-ref-moved", bootstrapFiles: SESSION_BOOTSTRAP_FILES, verifierPath: RELEASE_TREE.verifiers[0]!.path });
+      expect(f.g("rev-parse", `${twin}^{tree}`)).toBe(f.g("rev-parse", `${tip}^{tree}`));
+      expect(code(() => f.bind(tip, target, held))).toBe(INJECTION_REFUSAL["anchor-ref-moved"]);
+      expect(f.bind(twin, target, held).targetSha).toBe(twin);
+      // Injections that are not anchor injections are refused by the helper.
+      expect(code(() => mutateAnchorTip({ ...f.ag, sha: f.release, branch, tip: twin, inject: "stale-plan", bootstrapFiles: SESSION_BOOTSTRAP_FILES, verifierPath: RELEASE_TREE.verifiers[0]!.path }))).toBe(
+        "rehearsal_injection_unavailable",
+      );
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  test("anchor injections are appended after the earlier rows, each with its refusal code", () => {
+    expect(INJECTIONS.slice(0, 7)).toEqual(["none", "ledger-gap", "boundary-drift", "late-step", "wrong-generation", "stale-plan", "missing-bootstrap"]);
+    expect(INJECTIONS.slice(7)).toEqual(["anchor-tampered", "anchor-nonlinear", "anchor-extra-file", "anchor-missing-verifier", "anchor-ref-moved"]);
+    expect([...PLAN_ANCHOR_INJECTIONS]).toEqual(INJECTIONS.slice(7, 11));
+    expect(INJECTION_REFUSAL["anchor-tampered"]).toBe("release_anchor_file_drift");
+    expect(INJECTION_REFUSAL["anchor-nonlinear"]).toBe("release_anchor_nonlinear");
+    expect(INJECTION_REFUSAL["anchor-extra-file"]).toBe("release_anchor_extra_file");
+    expect(INJECTION_REFUSAL["anchor-missing-verifier"]).toBe("release_target_verifier_missing");
+    expect(INJECTION_REFUSAL["anchor-ref-moved"]).toBe("release_anchor_ref_mismatch");
+    // The driver runs them as R1-<inject> (plan) and R4-anchor-ref-moved (apply).
+    const drv = read("scripts/pg-proof/schema-rehearsal.ts");
+    expect(drv).toContain("stage(`R1-${planInject}`");
+    expect(drv).toContain('stage("R4-anchor-ref-moved"');
+    expect(drv).toContain("discoverReleaseAnchor(");
   });
 });
