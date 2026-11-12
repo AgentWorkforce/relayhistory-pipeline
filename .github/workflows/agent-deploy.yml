@@ -111,16 +111,50 @@ jobs:
     concurrency:
       group: agent-deploy-dev
       cancel-in-progress: false
-    uses: AgentWorkforce/layered-agents/.github/workflows/layered-agent-deploy.yml@main
+    # This repo is public, and GitHub refuses a public repo's call to the
+    # private layered-agents reusable workflow before any job starts. So the
+    # job runs the same steps as layered-agents' composite action, from a
+    # read-only checkout fetched with a short-lived token from the org pusher
+    # App (contents:read on layered-agents only), as relay-desktop does. The
+    # environment is part of the deploy role's exact OIDC subject; the
+    # reusable workflow ran in the same one.
+    runs-on: ${{ vars.DEPLOY_LINUX_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
+    environment: agent-deploy
+    timeout-minutes: 60
     permissions:
       id-token: write
       contents: read
       packages: read
-    with:
-      role-arn: ${{ vars.LAYERED_AGENT_DEPLOY_ROLE_ARN }}
-      agent-dir: agent
-      stage: dev
-      allow-restart: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_restart }}
+    steps:
+      - name: Token for the layered-agents kit (contents:read)
+        id: kit-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.GH_APP_PUSHER_ID }}
+          private-key: ${{ secrets.GH_APP_PUSHER_PRIVATE_KEY }}
+          owner: AgentWorkforce
+          repositories: layered-agents
+          permission-contents: read
+      # github.sha, as the reusable workflow's checkout did.
+      - name: Check out this repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out the layered-agents kit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: AgentWorkforce/layered-agents
+          ref: main
+          token: ${{ steps.kit-token.outputs.token }}
+          path: .layered-agents
+          persist-credentials: false
+      - name: Deploy
+        uses: ./.layered-agents/.github/actions/layered-agent-deploy
+        with:
+          role-arn: ${{ vars.LAYERED_AGENT_DEPLOY_ROLE_ARN }}
+          agent-dir: agent
+          stage: dev
+          allow-restart: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_restart }}
 
   # Leaves a record of what was deployed: the next run reads the head sha of
   # this artifact's run to know what was last deployed.
