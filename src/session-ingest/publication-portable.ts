@@ -49,6 +49,7 @@ import{canonicalPublicationTick}from'./publication-job.ts';
 import{routedRawChunkSealerDeps}from'../../packages/pipeline/src/lib/scrub-engine/index.ts';
 import{publicationGcLedger,collectPublicationObject}from'./publication-gc.ts';
 import type{PublicationTarget}from'./publication-protocol.ts';
+import{lockerProvider,type LockerProvider}from'../shared/locker-selection.ts';
 const no=(code:string):never=>{throw Object.assign(Error('publication_'+code),{code:'publication_'+code});};
 const DB_MODES=['local','selfhosted','cloudsql','rds','supabase']as const;
 export type PortableDbMode=typeof DB_MODES[number];
@@ -58,6 +59,9 @@ export const HOSTED_ONLY_VARS=['INGEST_PUBLISH_SECRET_ARN','INGEST_PUBLISH_KMS_K
 export type SecretSource={env:string}|{file:string};
 export interface PortablePublicationConfig{
  kind:'portable';bucket:string;region:string;endpoint:string;keyRoot:'96bulls';generation:string;dbMode:PortableDbMode;
+ /** The install's Locker provider, from the same selection the read API uses (LOCKER_PROVIDER, default s3).
+  * Stamped on pointer rows and landed messages so canonical reads accept them. */
+ provider:LockerProvider;
  sse:'AES256'|undefined;budgetMs:number;candidateLimit:number;gcLimit:number;
  /** Where each secret is read from at run time; never the value. */
  sources:{accessKeyId:SecretSource;secretAccessKey:SecretSource;databaseUrl:SecretSource};
@@ -78,6 +82,8 @@ export function portablePublicationConfig(env:NodeJS.ProcessEnv):PortablePublica
  if(!/^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket)||!/^[a-f0-9]{64}$/.test(generation)||!/^[a-z0-9-]{1,63}$/.test(region)||!(DB_MODES as readonly string[]).includes(mode))no('target_invalid');
  let endpoint:URL;
  try{endpoint=assertDestinationUrl('INGEST_PUBLISH_S3_ENDPOINT',rawEndpoint,destinationPolicy(env),{allowPath:false});}catch{return no('target_invalid');}
+ let provider:LockerProvider;
+ try{provider=lockerProvider(env);}catch{return no('target_invalid');}
  const sseRaw=env.INGEST_PUBLISH_S3_SSE;
  if(sseRaw!==undefined&&sseRaw!=='none'&&sseRaw!=='AES256')no('target_invalid');
  // Validated now so a bad trust profile fails startup; re-read when the pool is built.
@@ -85,7 +91,7 @@ export function portablePublicationConfig(env:NodeJS.ProcessEnv):PortablePublica
  const sources={accessKeyId:source(env,'INGEST_PUBLISH_S3_ACCESS_KEY_ID'),secretAccessKey:source(env,'INGEST_PUBLISH_S3_SECRET_ACCESS_KEY'),databaseUrl:source(env,'INGEST_PUBLISH_DATABASE_URL')};
  const budgetMs=Number(env.INGEST_PUBLISH_BUDGET_MS??'1200000'),candidateLimit=Number(env.INGEST_PUBLISH_BATCH_LIMIT??'1'),gcLimit=Number(env.INGEST_PUBLICATION_GC_LIMIT??'20');
  if(!Number.isSafeInteger(budgetMs)||budgetMs<5000||budgetMs>3600000||!Number.isInteger(candidateLimit)||candidateLimit<1||candidateLimit>20||!Number.isInteger(gcLimit)||gcLimit<1||gcLimit>100)no('budget_invalid');
- return{kind:'portable',bucket,region,endpoint:endpoint.origin,keyRoot:'96bulls',generation,dbMode:mode as PortableDbMode,sse:sseRaw==='AES256'?'AES256':undefined,budgetMs,candidateLimit,gcLimit,sources};
+ return{kind:'portable',bucket,region,endpoint:endpoint.origin,keyRoot:'96bulls',generation,dbMode:mode as PortableDbMode,provider,sse:sseRaw==='AES256'?'AES256':undefined,budgetMs,candidateLimit,gcLimit,sources};
 }
 /** The selected target's validated config (startup checks such as the session-publication
  * service's budget read): hosted is publicationRuntimeConfig exactly, unchanged. */
@@ -148,7 +154,7 @@ export async function runPortablePublicationRuntime(env:NodeJS.ProcessEnv,mode:'
   if(await ingestLoginIdentity(q=>read.queryBounded<Record<string,unknown>>(q,[],context())))no('database_role');
   // dbMode is one of DB_MODES (a fixed allowlist), never free text.
   await read.queryBounded(`SET LOCAL hoopdb.db_mode='${config.dbMode}';`+Object.values(assets.verifiers).join('\n'),[],context());
-  const target:PublicationTarget={bucket:config.bucket,region:config.region,keyRoot:config.keyRoot,generation:config.generation};
+  const target:PublicationTarget={bucket:config.bucket,region:config.region,keyRoot:config.keyRoot,generation:config.generation,provider:config.provider};
   const raw=scopedPublicationStore((overrides.store??createS3Store)({bucket:config.bucket,region:config.region,endpoint:config.endpoint,credentials:secrets.credentials,
    ...(config.sse?{serverSideEncryption:config.sse}:{}),fetch:fetcher}));
   if(mode==='publish')return await canonicalPublicationTick({target,rpc:publicationRpc(sql,target),store:()=>raw,...routedRawChunkSealerDeps()},{enabled:true,signal,maxJobMs:config.budgetMs,candidateLimit:config.candidateLimit});

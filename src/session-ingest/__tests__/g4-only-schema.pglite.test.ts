@@ -171,10 +171,12 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       // (RH041 while the user has an active erase), the buffered GC claim (skips such a user's stages) and the two
       // source-control begins (refused for such a user).
       "20261105058010_operator_user_erase.sql",
+      // Publication provider: prepare and publish admit storage provider 'gcs' as well as 's3' (replacement only).
+      "20261105059000_ingest_publication_gcs_provider.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
-    expect(OBJECTS.replacedFunctions).toEqual(["buffered_session_stages_for", "buffered_sessions_for", "ingest_babysitter_retention_register", "ingest_buffer_gc_claim", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_lazy_guard", "ingest_lock_fences", "ingest_prepare_buffer_stage", "ingest_privacy_authority_begin", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_publish", "ingest_publication_retire_fence", "ingest_publication_scope", "ingest_require_generation", "ingest_source_control_begin"]);
+    expect(OBJECTS.replacedFunctions).toEqual(["buffered_session_stages_for", "buffered_sessions_for", "ingest_babysitter_retention_register", "ingest_buffer_gc_claim", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_lazy_guard", "ingest_lock_fences", "ingest_prepare_buffer_stage", "ingest_privacy_authority_begin", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_prepare", "ingest_publication_publish", "ingest_publication_retire_fence", "ingest_publication_scope", "ingest_require_generation", "ingest_source_control_begin"]);
   });
 
   test("no new table, function or column exists; the replaced RPCs exist in their prior form; no G4 body names a post-G4 object", async () => {

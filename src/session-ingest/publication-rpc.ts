@@ -40,7 +40,7 @@ export function parsePublicationTicket(v:any,target:PublicationTarget):Publicati
  return {...v,receiptSeats};
 }
 export function publicationRpc(db:SemanticBoundedSql,target:PublicationTarget,options:{now?:()=>number;queryTimeoutMs?:number}={}):PublicationRpc{
- if(!HEX.test(target.generation)||!target.bucket||!target.region||!target.keyRoot)throw bad();
+ if(!HEX.test(target.generation)||(target.provider!=="s3"&&target.provider!=="gcs")||!target.bucket||!target.region||!target.keyRoot)throw bad();
  const now=options.now??Date.now,timeout=options.queryTimeoutMs??15000;
  if(!Number.isSafeInteger(timeout)||timeout<1||timeout>60000)throw bad();
  const call=async(fn:string,p:Record<string,unknown>,signal:AbortSignal)=>{

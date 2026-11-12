@@ -67,7 +67,7 @@ async function fixture(frontier=true,initialRecords=[record({record_id:"new-r1"}
   return {key,row,evidence:{orgId:TENANT.orgId,workspaceId:TENANT.workspaceId,harness:h.physicalSource,sessionId:h.physicalSession,machineId:h.machineId,manifestKey:key,revision:h.revision,schemaGeneration:GEN}};
  };
  const claim=()=>call("ingest_publication_claim",{stageToken:stage,keyRoot:"96bulls",bucket:"synthetic",region:"us-east-1"});
- const target={bucket:"synthetic",region:"us-east-1",keyRoot:"96bulls",generation:GEN};
+ const target={bucket:"synthetic",region:"us-east-1",keyRoot:"96bulls",generation:GEN,provider:"s3" as const};
  const rpc=publicationRpc({queryBounded:async(q:string,p:unknown[],ctx:{signal:AbortSignal})=>{ctx.signal.throwIfAborted();return run(q,p);}}as never,target);
  const canaryCreatedAt=new Date(Date.now()-1000).toISOString(),canaryExpiresAt=new Date(Date.now()+60_000).toISOString();
  const inspect=()=>call("proof_publication_canary_inspect",{stageToken:stage,bucket:target.bucket,region:target.region,keyRoot:target.keyRoot,generation:GEN});
