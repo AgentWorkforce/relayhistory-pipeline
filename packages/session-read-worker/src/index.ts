@@ -105,6 +105,7 @@ import {
   boundedStreamDecompress,
   ownerBufferedEnabled,
   ownerBufferedExactSessionEnabled,
+  ownerBufferedStagesPagedEnabled,
   ownerBufferedEventsEnabled,
   ownerBufferedIndexVerifyEnabled,
   ownerBufferedPhaseLogEnabled,
@@ -196,6 +197,8 @@ export interface Env extends CanonicalEnv {
   READ_API_OWNER_BUFFERED_INDEX_VERIFY?: string;
   /** 047010 exact-session RPC: exactly "on" opts in; every other value uses the frozen RPC. */
   READ_API_OWNER_BUFFERED_EXACT_SESSION?: string;
+  /** "on" pages the exact-session stages read through the 047020 RPC; only with READ_API_OWNER_BUFFERED_EXACT_SESSION=on. */
+  READ_API_OWNER_BUFFERED_STAGES_PAGED?: string;
   /** The owner-buffered canary allowlist (parseDirectoryWorkspaces syntax); unset/empty = none. */
   READ_API_OWNER_BUFFERED_WORKSPACES?: string;
   /** The ingest bucket holding buffered-batches/ stage objects (owner-buffered reads only). */
@@ -563,7 +566,7 @@ export function ownerBufferedDeps(
   return {
     enabled: true,
     workspaces: parseDirectoryWorkspaces(env.READ_API_OWNER_BUFFERED_WORKSPACES),
-    reads: sqlOwnerBufferedReads(run, { statementTimeoutMs: ownerBufferedStatementTimeoutFlag(env), exactSession: ownerBufferedExactSessionEnabled(env.READ_API_OWNER_BUFFERED_EXACT_SESSION) }),
+    reads: sqlOwnerBufferedReads(run, { statementTimeoutMs: ownerBufferedStatementTimeoutFlag(env), exactSession: ownerBufferedExactSessionEnabled(env.READ_API_OWNER_BUFFERED_EXACT_SESSION), stagesPaged: ownerBufferedStagesPagedEnabled(env.READ_API_OWNER_BUFFERED_STAGES_PAGED) }),
     gate: serviceBindingControlHead(env.HISTORY_CONTROL_HEAD),
     store: createS3Store({ bucket, region: env.INGEST_S3_REGION?.trim() || "us-east-1", credentials: { accessKeyId, secretAccessKey }, fetch: fetcher }),
     decompress: boundedStreamDecompress(Decompress) /* stops at the bound; fzstd's one-shot form with a fixed buffer silently truncates */,

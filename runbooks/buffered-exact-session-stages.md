@@ -15,7 +15,7 @@ and ACK checks are retained. The gate-off fallback is unchanged.
 
 This removes unrelated-group privacy work only; it does not cap the number of
 requested-session records checked in one RPC. The separate default-off paged follow-up
-(050050) owns that target-heavy work bound. An independent synthetic PGlite check with
+(047020) owns that target-heavy work bound. An independent synthetic PGlite check with
 all 6,939 records in the target session returned the correct 17 rows / 6,939 ordinals
 in about 10.1 seconds. The mixed-batch regression asserts correctness/equivalence and
 counts only, with no timing budget assertion or production latency guarantee.
@@ -116,3 +116,104 @@ their `off` input is the historical unset convention, not an explicit reversal. 
 change the selection, use explicit owner-buffered mode. No automatic retry through a
 second RPC occurs after an error. Do not drop the existing GIN: the frozen fallback
 still depends on it.
+
+## Paged stages (047020)
+
+Migration `20261105047020_buffered_session_stages_paged.sql` adds
+`sessions.buffered_session_stages_for_target_paged`: the 047010 arguments plus
+`p_cursor jsonb` and `p_page_claims integer`, with no DEFAULT clauses (the release-target
+held-function check fails closed on them), so every caller passes all 12 arguments; a NULL
+`p_cursor` starts at the first page and a NULL `p_page_claims` is treated as 2. It returns exactly one
+envelope row per call: `stages` (a jsonb array of the rows
+`buffered_session_stages_for_target` returns, same column names as keys and the same
+order), `cursor` (NULL when exhausted), `has_more` and `snapshot_at`. 044090 and 047010
+are unchanged and stay callable.
+
+**What it bounds.** Each call expands at most `p_page_claims` candidate claims of the
+requested source/session. The first CTE after `ctl` is a MATERIALIZED `page` that reads
+the session's side rows through `ingest_claim_sessions_session_idx` and selects at most
+`p_page_claims + 1` claims in keyset order (batch `committed_at`, `batch_id`, `stage_key`,
+`stage_token`, all `COLLATE "C"`), strictly after the cursor. There is no OFFSET. Only the
+first `p_page_claims` claims are expanded (records/epochs jsonb and every 047010 privacy
+predicate). The extra claim only sets `has_more`. `p_page_claims` is clamped to 1..4 in
+SQL, so out-of-range values are clamped rather than rejected.
+
+**Page semantics.** The first page (`p_cursor` NULL) records `snapshot_at =
+clock_timestamp()`. The returned cursor carries that snapshot. Later pages admit only
+claims whose batch committed at or before it. The cursor is the position of the last
+claim the page inspected, whatever the privacy predicates hid, so a run of fully
+filtered pages still advances and ends. Concatenated pages equal the 047010 result in
+the same order. A malformed or future cursor is rejected with 22023. Scope, 22023, the
+control-head gate and the v2 reader gate are identical to 047010:
+- With the v2 gate off, the first page returns 047010's fallback result in one envelope.
+- A closed gate on a later page raises 55000, so a truncated traversal can never look
+  complete.
+
+**Worker.** `READ_API_OWNER_BUFFERED_STAGES_PAGED` is default off, and only the exact
+string `on` enables it. It takes effect only on the owner-buffered path with
+`READ_API_OWNER_BUFFERED_EXACT_SESSION=on`. Otherwise the reader uses the 047010 or 044090
+function exactly as before, and the deploy render refuses `on` without
+`owner_buffered=on` and `owner_buffered_exact_session=on`.
+
+When the flag is on, every stage read is a fresh complete traversal from cursor NULL with
+a new snapshot. This covers the first read, the not-found refresh and the recheck. The
+Worker:
+- asks for 2 claims per page (`BUFFERED_PAGED_STAGES_PAGE_CLAIMS`). Ingest admits at most
+  500 records per claim (`MAX_DELIVERY_RECORDS`; the claim SQL refuses more), so a Worker page
+  holds at most 2 x 500 = 1,000 records. The SQL accepts `p_page_claims` up to 4 (2,000
+  records), but the Worker never asks for more than 2. A unit test pins
+  `BUFFERED_PAGED_STAGES_PAGE_CLAIMS x MAX_DELIVERY_RECORDS = 1,000`, so a change to either
+  value fails the test. This bound covers paged traversals only. It does not cover the gate-off
+  047010 fallback (see below);
+- concatenates `stages` across pages;
+- uses the existing single-RPC statement budget for the whole traversal, setting each
+  page's `statement_timeout` to whatever remains of it.
+
+The traversal fails closed, never returning a partial stage set, on any of these:
+- a page error;
+- a malformed envelope;
+- snapshot drift between pages;
+- a repeated stage;
+- a cursor that did not advance;
+- more than 64 pages;
+- deadline overrun;
+- request abort.
+
+The outcome matches the single RPC's failures:
+- On the first read, it is answered as main (unverified).
+- After a candidate was found, it is a 503 `buffered_fenced`.
+- If the recheck's fresh traversal differs from the stages read, the existing changed
+  outcome applies: the result is hidden and answered as main.
+
+**Validation.** Run from the repository root:
+
+```sh
+bun test --timeout 600000 ./src/session-ingest/__tests__/stages-paged.pglite.test.ts
+bun test --timeout 600000 ./src/session-read-api/__tests__/owner-buffered-stages-paged.test.ts
+bun scripts/sync-sessions-function-boundary.ts --check
+```
+
+**Activation and inverse.** Code integration does not activate anything. Applying the
+migration and changing the production flag each require the production operator's
+explicit authorization.
+
+1. Apply 047020 after the exact-session reader 047010 (it sorts directly before 047020)
+   through the canonical migrator, refreshing the function boundary bootstrap first as for
+   047010. The migration refuses unless the exact owned 047010 reader function is present and
+   no paged function exists.
+2. Verify the new function's manifest entry, read-role ACL and migration sentinel.
+3. Immediately before enabling the flag, take a fresh read-only readback of
+   `sessions.ingest_claim_sessions_policy`. It must show `write_enabled`, `read_enabled` and
+   backfill complete (`backfill_complete_at IS NOT NULL`) all true, so the claim-sessions v2
+   writer, reader and backfill are all ready. Do not reuse an older proof. If any of them is
+   false, do not enable the flag. With the v2 gate off, the first page returns the 047010
+   fallback in one unpaged envelope. The 1,000 records/page bound does NOT apply to that
+   fallback: it returns every stage of the session in one call.
+4. Deploy with explicit `owner_buffered=on`, `owner_buffered_exact_session=on` and
+   `owner_buffered_stages_paged=on`. This renders `READ_API_OWNER_BUFFERED_STAGES_PAGED=on`.
+   `profile`/`preserve` deploys keep the live value and refuse an explicit `on`.
+
+Inverse: an explicit deploy with `owner_buffered_stages_paged=off` returns to the 047010
+single RPC without touching data. A separately authorized rollback can then use
+`supabase/rollbacks/20261105047020_buffered_session_stages_paged.down.sql`, but only after
+the flag is off. It drops only the paged function and its own ledger row.

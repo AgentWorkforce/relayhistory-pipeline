@@ -902,6 +902,15 @@ export function assertOperatorSnapshot(
           name: "NEON_REPLICA",
           queue_name: input.sessionIngest.neonReplicaQueue,
         };
+      // Neon-exit profile: a NEON_REPLICA binding that would remain on the Worker (create, update or
+      // noop) is a Neon edge the Worker refuses at startup. Refused by name before the generic
+      // inventory checks. A delete row removes a stale binding (the desired transition), so it is not
+      // this refusal; it still falls through to the reviewed delete allowlist below, which today
+      // admits no NEON_REPLICA unbind (native_binding_target, fail closed).
+      if (input.sessionIngest.neonExit === "on" && row.bindings.some((b: any) =>
+        b.action !== "delete" && (b.sid === "NEON_REPLICA" ||
+          (Array.isArray(b.data?.bindings) && b.data.bindings.some((d: any) => d?.name === "NEON_REPLICA")))))
+        refuse("native_neon_exit_replica");
       const overlapDeletes = row.bindings.filter(
         (binding: any) => binding.action === "delete",
       );
