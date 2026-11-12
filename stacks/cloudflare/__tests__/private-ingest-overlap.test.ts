@@ -67,6 +67,11 @@ test("dormant by default: the tracked production profile plans, confirms and rea
     .toBe("private_ingest_profile_overlap_unreviewed");
   expect(code(() => privateIngestProfileForPhase("step-1-custody-overlap", kmsKeyArn)))
     .toBe("private_ingest_profile_overlap_unreviewed");
+  expect(code(() => privateIngestProfileForPhase("step-0-shadow-overlap", kmsKeyArn)))
+    .toBe("private_ingest_profile_overlap_unreviewed");
+  expect(code(() => privateIngestReleasePhase(withTarget({
+    ...tracked.sessionIngest, custodySource: "shadow", overlapGeneration: H,
+  })))).toBe("private_ingest_profile_overlap_unreviewed");
 });
 
 test("overlapGeneration: malformed, equal, non-buffered, unreviewed, stale and unexpected values are refused distinctly", () => {
@@ -96,7 +101,7 @@ test("overlapGeneration: malformed, equal, non-buffered, unreviewed, stale and u
   ]) expect(code(() => privateIngestReleasePhase(withTarget(tracked.sessionIngest), bad)))
     .toBe("private_ingest_overlap_contract");
   // The base phases stay exactly as before under a reviewed pair.
-  for (const phase of ["baseline-drain", "step-1-custody", "step-2-frozen-receipt", "step-4-async-on"] as const) {
+  for (const phase of ["baseline-drain", "step-0-shadow", "step-1-custody", "step-2-frozen-receipt", "step-4-async-on"] as const) {
     expect(privateIngestReleasePhase(privateIngestProfileForPhase(phase, kmsKeyArn, atG), atG)).toBe(phase);
     expect(privateIngestReleasePhase(privateIngestProfileForPhase(`${phase}-overlap`, kmsKeyArn, atG), atG))
       .toBe(`${phase}-overlap`);
@@ -355,4 +360,149 @@ test("the retained plan unbinds INGEST_ACCEPT_GENERATIONS only for G+H -> H, or 
   expect(acceptGenerationsDeletionAllowed(profile(G), live(`${G},${H}`), proposed(G, { INGEST_ACCEPT_GENERATIONS: `${G},${H}` }), atG)).toBe(false);
   expect(acceptGenerationsDeletionAllowed(profile(H), live(`${G},${H}`), proposed(G), atG)).toBe(false);
   expect(acceptGenerationsDeletionAllowed(profile(G), undefined, proposed(G), atG)).toBe(false);
+});
+
+// step-0-shadow composed with the generation overlap: step-0-shadow-overlap is step-0-shadow's twin,
+// and the mandatory baseline-drain <-> step-0-shadow <-> step-1-custody graph still holds at every
+// generation state.
+type Phase = Parameters<typeof privateIngestProfileForPhase>[0];
+const at = (phase: Phase, contract: PrivateIngestGenerationContract) => privateIngestProfileForPhase(phase, kmsKeyArn, contract);
+const liveAt = (phase: Phase, contract: PrivateIngestGenerationContract) => liveFixture(at(phase, contract));
+const move = (target: CloudflareStageInputs, live: ReturnType<typeof liveFixture>, contract: PrivateIngestGenerationContract) =>
+  privateIngestTransitionReadback(target, live.active, live.version, contract);
+const moveCode = (target: CloudflareStageInputs, live: ReturnType<typeof liveFixture>, contract: PrivateIngestGenerationContract) =>
+  code(() => move(target, live, contract));
+
+test("step-0-shadow-overlap: tracked profile, phase builder and live candidate are shadow custody with exactly {G, H}", () => {
+  const tracked0 = withTarget({ ...tracked.sessionIngest, custodySource: "shadow", overlapGeneration: H });
+  expect(privateIngestReleasePhase(tracked0, atG)).toBe("step-0-shadow-overlap");
+  const built = at("step-0-shadow-overlap", atG);
+  expect(built.sessionIngest).toMatchObject({ custodySource: "shadow", asyncAdmission: "drain", expectedGeneration: G, overlapGeneration: H });
+  expect(built.sessionIngest.syncAdmissionFrozenReceipt).toBeUndefined();
+  const vars = sessionIngestVars(built.sessionIngest);
+  expect(vars.INGEST_CUSTODY_SOURCE).toBe("shadow");
+  expect(vars.INGEST_ACCEPT_GENERATIONS).toBe(`${G},${H}`);
+  expect(vars.INGEST_EXPECT_GENERATION).toBe(G);
+  // The overlap twin cannot carry the receipt bridge or async admission (still shadow's drain-only shape).
+  for (const extra of [{ syncAdmissionFrozenReceipt: "on" }, { asyncAdmission: "on" }])
+    expect(code(() => privateIngestReleasePhase(withTarget({ ...tracked0.sessionIngest, ...extra }), atG)))
+      .toBe("private_ingest_profile_phase");
+  // Stale and unexpected pairs refuse exactly as for the other base phases.
+  expect(code(() => at("step-0-shadow-overlap", atH))).toBe("private_ingest_profile_overlap_stale");
+  expect(code(() => privateIngestReleasePhase(withTarget({ ...tracked0.sessionIngest, overlapGeneration: X }), atG)))
+    .toBe("private_ingest_profile_overlap_unexpected");
+  // The live step-0-shadow-overlap version is one unambiguous candidate (same-state redeploy is a no-move).
+  expect(move(built, liveAt("step-0-shadow-overlap", atG), atG)).toMatchObject({
+    from: "step-0-shadow-overlap", to: "step-0-shadow-overlap", generationFrom: "G+H", generationTo: "G+H",
+  });
+  // A live shadow-overlap version reads back as neither the step-0-shadow nor the step-1-custody-overlap target.
+  expect(moveCode(at("step-1-custody-overlap", atG), liveAt("step-0-shadow-overlap", atG), atG)).toBe("private_ingest_live_transition");
+});
+
+test("step-0-shadow-overlap is reachable only beside step-0-shadow: open G -> G+H, finish G+H -> H, rollback G+H -> G", () => {
+  expect(move(at("step-0-shadow-overlap", atG), liveAt("step-0-shadow", atG), atG))
+    .toMatchObject({ from: "step-0-shadow", to: "step-0-shadow-overlap", generationFrom: "G", generationTo: "G+H" });
+  expect(move(at("step-0-shadow", atH), liveAt("step-0-shadow-overlap", atG), atH))
+    .toMatchObject({ from: "step-0-shadow-overlap", to: "step-0-shadow", generationFrom: "G+H", generationTo: "H" });
+  expect(move(at("step-0-shadow", atG), liveAt("step-0-shadow-overlap", atG), atG))
+    .toMatchObject({ from: "step-0-shadow-overlap", to: "step-0-shadow", generationFrom: "G+H", generationTo: "G" });
+  // After the window, the single-generation shadow graph applies again at H.
+  expect(move(at("step-1-custody", atH), liveAt("step-0-shadow", atH), atH))
+    .toMatchObject({ from: "step-0-shadow", to: "step-1-custody", generationFrom: "H", generationTo: "H" });
+  expect(move(at("step-0-shadow", atH), liveAt("baseline-drain", atH), atH))
+    .toMatchObject({ from: "baseline-drain", to: "step-0-shadow" });
+  expect(move(at("step-0-shadow", atH), liveAt("step-1-custody", atH), atH))
+    .toMatchObject({ from: "step-1-custody", to: "step-0-shadow" });
+  // Not reachable from any other phase, overlapped or not.
+  for (const [live, contract] of [
+    ["baseline-drain", atG], ["step-1-custody", atG], ["step-2-frozen-receipt", atG], ["step-4-async-on", atG],
+    ["baseline-drain-overlap", atG], ["step-1-custody-overlap", atG], ["step-2-frozen-receipt-overlap", atG],
+  ] as const)
+    expect(moveCode(at("step-0-shadow-overlap", atG), liveAt(live, contract), contract)).toBe("private_ingest_live_transition");
+  // And it cannot leave step-0-shadow's base while {G, H} is live.
+  for (const target of ["baseline-drain", "step-1-custody", "baseline-drain-overlap", "step-1-custody-overlap"] as const)
+    expect(moveCode(at(target, atG), liveAt("step-0-shadow-overlap", atG), atG)).toBe("private_ingest_live_transition");
+  for (const target of ["baseline-drain", "step-1-custody", "step-2-frozen-receipt"] as const)
+    expect(moveCode(at(target, atH), liveAt("step-0-shadow-overlap", atG), atH)).toBe("private_ingest_live_transition");
+});
+
+test("with an overlap present, no transition skips step-0-shadow between baseline-drain and step-1-custody", () => {
+  // Direct baseline -> custody (and the reverse) at every generation state and through every overlap edge.
+  const refusals: Array<[Phase, Phase, PrivateIngestGenerationContract]> = [
+    ["baseline-drain", "step-1-custody", atG],
+    ["baseline-drain", "step-1-custody", atH],
+    ["step-1-custody", "baseline-drain", atG],
+    ["step-1-custody", "baseline-drain", atH],
+    ["baseline-drain", "step-1-custody-overlap", atG],
+    ["baseline-drain-overlap", "step-1-custody-overlap", atG],
+    ["baseline-drain-overlap", "step-1-custody", atG],
+    ["step-1-custody-overlap", "baseline-drain-overlap", atG],
+    ["step-1-custody-overlap", "baseline-drain", atG],
+    ["step-1-custody", "baseline-drain-overlap", atG],
+  ];
+  for (const [live, target, contract] of refusals) {
+    const liveContract = live.endsWith("-overlap") ? atG : contract;
+    expect(moveCode(at(target, contract), liveAt(live, liveContract), contract)).toBe("private_ingest_live_transition");
+  }
+  // The rollback G+H -> H after the window lands at the base the overlap sat on; it never lands on custody.
+  expect(moveCode(at("step-1-custody", atH), liveAt("baseline-drain-overlap", atG), atH)).toBe("private_ingest_live_transition");
+  expect(move(at("baseline-drain", atH), liveAt("baseline-drain-overlap", atG), atH))
+    .toMatchObject({ from: "baseline-drain-overlap", to: "baseline-drain", generationTo: "H" });
+  // Dormant contract keeps #558's single-generation graph byte-for-byte.
+  const dormant = (phase: Phase) => privateIngestProfileForPhase(phase, kmsKeyArn);
+  const liveDormant = (phase: Phase) => liveFixture(dormant(phase));
+  expect(code(() => privateIngestTransitionReadback(dormant("step-1-custody"), liveDormant("baseline-drain").active, liveDormant("baseline-drain").version)))
+    .toBe("private_ingest_live_transition");
+  expect(Object.keys(privateIngestTransitionReadback(dormant("step-1-custody"), liveDormant("step-0-shadow").active, liveDormant("step-0-shadow").version)))
+    .toEqual(["status", "from", "to", "deploymentId", "versionId"]);
+});
+
+test("the shadow/custody CI hooks only fire on the exact single-generation edge, and the DB window stays admitDuringApply=false", () => {
+  // scripts/private-ingest-ci.ts gates the SHADOW receipt on from=step-0-shadow,to=step-1-custody and the
+  // RHC witness on the reverse edge. No overlap-phase transition can produce either pair of labels.
+  const pairs: string[] = [];
+  const phases: Phase[] = ["baseline-drain", "step-0-shadow", "step-1-custody", "step-2-frozen-receipt", "step-4-async-on"];
+  const states: Array<[Phase, PrivateIngestGenerationContract]> = [];
+  for (const base of phases) states.push([base, atG], [`${base}-overlap`, atG], [base, atH]);
+  for (const [livePhase, liveContract] of states)
+    for (const [targetPhase, targetContract] of states) {
+      if (liveContract !== targetContract && !(livePhase.endsWith("-overlap"))) continue;
+      try {
+        const r = move(at(targetPhase, targetContract), liveAt(livePhase, liveContract), targetContract);
+        pairs.push(`${r.from}>${r.to}`);
+      } catch { /* refused */ }
+    }
+  expect(pairs).toContain("step-0-shadow>step-1-custody");
+  expect(pairs).toContain("step-1-custody>step-0-shadow");
+  expect(pairs).toContain("step-0-shadow>step-0-shadow-overlap");
+  for (const pair of pairs) {
+    const [from, to] = pair.split(">") as [string, string];
+    if (from.endsWith("-overlap") || to.endsWith("-overlap"))
+      expect(from.replace(/-overlap$/u, "")).toBe(to.replace(/-overlap$/u, ""));
+    expect(pair).not.toBe("baseline-drain>step-1-custody");
+    expect(pair).not.toBe("step-1-custody>baseline-drain");
+  }
+  const ci = readFileSync("scripts/private-ingest-ci.ts", "utf8");
+  expect(ci).toContain('transition.from === "step-0-shadow" && transition.to === "step-1-custody"');
+  expect(ci).toContain('transition.from === "step-1-custody" && transition.to === "step-0-shadow"');
+  expect(ci).toContain("privateIngestReleaseInputs(process.env, overlapGeneration)");
+  // The DB window operator never admits the old generation during the apply, whatever the Worker phase.
+  const operator = readFileSync("src/hoopdb/ingest-generation-overlap-operator.ts", "utf8");
+  expect(operator.match(/admitDuringApply: *[a-z]+/gu)).toEqual(["admitDuringApply: false"]);
+  expect(operator).toContain("mine.admitDuringApply !== false");
+  expect(Object.keys(at("step-0-shadow-overlap", atG).sessionIngest)).not.toContain("admitDuringApply");
+});
+
+test("the deploy confirmation for step-0-shadow-overlap is the base confirmation plus OVERLAP <H>, never a bare SHADOW", () => {
+  const deploy = (confirmation: string) => ({
+    PRIVATE_INGEST_RELEASE_MODE: "deploy",
+    PRIVATE_INGEST_RELEASE_SHA: sha,
+    PRIVATE_INGEST_RELEASE_PLAN_RUN: planRun,
+    PRIVATE_INGEST_RELEASE_CONFIRMATION: confirmation,
+  });
+  const base = `DEPLOY ${P.worker} ${sha} PLAN ${planRun}`;
+  expect(privateIngestReleaseInputs(deploy(`${base} OVERLAP ${H}`), H).mode).toBe("deploy");
+  // REVIEWED_CUSTODY_SHADOW_MATCH is null at this revision, so no SHADOW form is accepted at all.
+  for (const bad of [`${base} SHADOW ${"a".repeat(64)} OVERLAP ${H}`, `${base} OVERLAP ${H} SHADOW ${"a".repeat(64)}`, base])
+    expect(code(() => privateIngestReleaseInputs(deploy(bad), H))).toBe("private_ingest_release_confirmation");
 });

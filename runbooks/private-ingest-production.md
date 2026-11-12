@@ -113,7 +113,10 @@ Dispatch the same workflow from the same still-current SHA with:
 
 For the first frozen promotion append ` SHADOW <reviewed receipt sha256>` to that confirmation.
 The digest must be the source-pinned receipt, not an operator-supplied replacement. Other phase
-changes use the base confirmation without the suffix.
+changes use the base confirmation without the suffix. The full form is
+`DEPLOY 96bulls-session-ingest <sha> PLAN <plan_run>[ SHADOW <sha256>][ OVERLAP <H>]`; SHADOW binds
+only to the single-generation `step-0-shadow -> step-1-custody` edge and OVERLAP only to a tracked
+`overlapGeneration`, and because the phase is frozen while G+H is live the two never co-occur.
 
 After those gates, the run downloads the exact artifact, binds the recorded production
 authorization to its hashes, repeats the live custody preflight immediately before the operator,
@@ -132,6 +135,10 @@ plus CI; nobody issues SQL by hand.
 1. **Review the pair.** By a normal commit, set `PRIVATE_INGEST_OVERLAP = { from: G, to: H }` while
    `expectedGeneration` is still G. Add `"overlapGeneration": "<H>"` to the tracked profile's
    `sessionIngest`. The rollout phase stays the same; the planner names it `<phase>-overlap`.
+   Every base phase has exactly one twin: `baseline-drain-overlap`, `step-0-shadow-overlap`,
+   `step-1-custody-overlap`, `step-2-frozen-receipt-overlap`, `step-4-async-on-overlap`. The twin
+   keeps its base's profile (for `step-0-shadow-overlap`: `custodySource=shadow`, async admission
+   `drain`, no frozen-receipt bridge) and adds `INGEST_ACCEPT_GENERATIONS=G,H`.
 2. **Worker to G+H.** Plan, then deploy as above. The confirmation is the usual
    `DEPLOY 96bulls-session-ingest <sha> PLAN <plan_run>` followed by ` OVERLAP <H>`. The readback
    requires `INGEST_ACCEPT_GENERATIONS=G,H`, and the transition gate allows only G -> G+H.
@@ -161,7 +168,11 @@ plus CI; nobody issues SQL by hand.
 
 While the live Worker is at G+H the rollout phase is frozen: a profile that changes the
 phase and the generation set together, or the phase alone, refuses with
-`private_ingest_live_transition`. Finish or roll back the overlap first. H -> G+H, G -> H and
+`private_ingest_live_transition`. Finish or roll back the overlap first. This includes the
+custody-shadow edges: `step-0-shadow-overlap` is reachable only from `step-0-shadow` (G -> G+H) and
+leaves only to `step-0-shadow` at H (finish) or G (rollback), so no overlap path skips
+`step-0-shadow` between `baseline-drain` and `step-1-custody`, and a direct baseline/custody move
+refuses at G, G+H and H alike. H -> G+H, G -> H and
 H -> G are always refused. A live accept set the tracked profile does not declare refuses with
 `private_ingest_live_undeclared_overlap`. A live state that matches no permitted phase refuses with
 `private_ingest_live_phase`.
