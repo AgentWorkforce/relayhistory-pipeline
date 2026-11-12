@@ -51,10 +51,6 @@ function fakeNeon(state: { status: Row; deletions: Row[]; resets: Row[]; heads: 
   return neon;
 }
 
-/** Same form as the landed guards (20261105041000 lines 115-124); ships with 20261105047030_frozen_copy_progress. */
-const RECEIPTS_GUARD = `CREATE TRIGGER ingest_privacy_authority_guard BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sessions.ingest_frozen_source_receipts
- FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_privacy_authority_guard();`;
-
 async function fixture(opts: { receiptsGuard?: boolean } = {}) {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(() => db.close());
@@ -62,8 +58,8 @@ async function fixture(opts: { receiptsGuard?: boolean } = {}) {
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
   for (const f of migrationFiles(root)) await db.exec(read("supabase/migrations/" + f));
-  if (opts.receiptsGuard !== false && !(await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname='ingest_privacy_authority_guard' AND tgrelid='sessions.ingest_frozen_source_receipts'::regclass")).rows[0]!.n)
-    await db.exec(RECEIPTS_GUARD);
+  // 20261105047030 puts the receipts guard trigger on in the chain; receiptsGuard:false removes it so the missing-guard path is exercised.
+  if (opts.receiptsGuard === false) await db.exec("DROP TRIGGER ingest_privacy_authority_guard ON sessions.ingest_frozen_source_receipts");
   await db.exec(`CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','${generation}','pass')`);
   await db.query("SELECT sessions.ingest_lazy_policy_set($1::jsonb)", [
     JSON.stringify({ baselineMode: "lazy-current", generation, sourceIdentitySha256: identity, controlEpoch: epoch, privacyBaselineSha256: baseline, retentionContractSha256: "b".repeat(64), sourceProofSha256: D, validUntil: new Date(Date.now() + 3600000).toISOString(), issuer: "relayhistory-cloud" }),

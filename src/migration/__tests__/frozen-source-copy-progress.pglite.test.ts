@@ -1,4 +1,4 @@
-// Causal tests of the resumable copy against the real migration chain in PGlite plus PROGRESS_TABLE_DDL. Fake values only.
+// Causal tests of the resumable copy against the real migration chain in PGlite (047030 creates the progress table). Fake values only.
 import { test, expect, afterEach, setDefaultTimeout } from "bun:test";
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
@@ -39,7 +39,8 @@ async function fixture(o: { table?: boolean } = {}) {
   await db.query("SELECT sessions.ingest_lazy_policy_set($1::jsonb)", [
     JSON.stringify({ baselineMode: "lazy-current", generation, sourceIdentitySha256: identity, controlEpoch: epoch, privacyBaselineSha256: baseline, retentionContractSha256: "b".repeat(64), sourceProofSha256: "d".repeat(64), validUntil: new Date(Date.now() + 3600000).toISOString(), issuer: "relayhistory-cloud" }),
   ]);
-  if (o.table !== false) await db.exec(PROGRESS_TABLE_DDL);
+  // 20261105047030 creates the progress table in the chain; table:false removes it so the missing-table path is exercised.
+  if (o.table === false) await db.exec(`DROP TABLE ${PROGRESS_TABLE}`);
   const log: string[] = [];
   const before: Array<(sql: string) => Promise<void> | void> = [];
   let commit: ((run: () => Promise<unknown>) => Promise<unknown>) | null = null;
