@@ -19,6 +19,10 @@
  *   INGEST_PUBLISH_S3_ACCESS_KEY_ID[_FILE]       exactly one of the pair
  *   INGEST_PUBLISH_S3_SECRET_ACCESS_KEY[_FILE]   exactly one of the pair
  *   INGEST_PUBLISH_S3_SSE              optional: unset | "none" | "AES256"
+ *   LOCKER_PROVIDER                    optional: unset | "s3" | "gcs" (default s3); the
+ *                                      provider stamped on every published row and landed
+ *                                      message; must equal the read API's LOCKER_PROVIDER
+ *                                      (locker-selection.ts), or reads answer 501
  *   INGEST_PUBLISH_DATABASE_URL[_FILE] exactly one: postgresql://bulls96_session_ingest:<pw>@host[:port]/db
  *   HOOPDB_DB_MODE                     local | selfhosted | cloudsql | rds | supabase
  *                                      (the verifier profile; no default)
