@@ -146,8 +146,10 @@ origin. Deleting rows does not stop a device from uploading again: without the f
   3. re-runs the full "rows of the user remain" probe. A row still there (a control head, which `complete` never
      drops silently, or an upload root) refuses with `55000` 'operator user erase: rows of the user remain at
      completion'; the request stays `metadata_purged`, the job exits `2` with `user_rows_remain_at_completion` and
-     never reports `verified`. Operator action: find and remove that row through its owning lane (for a head: let
-     the control finish or cancel it through the control lane; do not edit the ledger), then rerun the same request;
+     never reports `verified`. Operator action: find and remove that row through its owning lane (for a head: the
+     erase guard refuses every control write for this user until the erase is verified, so a head here means a
+     writer bypassed the gate; cancel that control through the control lane rather than waiting for it to finish;
+     do not edit the ledger), then rerun the same request;
   4. runs the seat-ambiguity check (below).
 
 ## Seat ambiguity
