@@ -122,6 +122,37 @@ test("each forged GitHub answer refuses with its own code and check", async () =
     expect({ forge: Object.keys(forge)[0], r: await refusal(attest("copy", { forge })) }).toEqual({ forge: Object.keys(forge)[0], r: { code: `frozen_copy_supervisor_${kind}`, check } });
 });
 
+test("CI gate: the full default push proof (ci.yml checks + session-read-worker / worker, pg-proof.yml PostgreSQL 15/16/17)", async () => {
+  // (a) Every default run and job green: the GitHub half passes and reads both workflows and both job listings.
+  const get = fakeGithub();
+  expect(await verifyCustodyGithub(supervisorEnv("copy", fixtureApproval(fixtureFacts("copy"))), get, { protectedJob: true })).toEqual({ planRun: PLAN_RUN });
+  for (const part of ["/actions/workflows/ci.yml/runs?", "/actions/workflows/pg-proof.yml/runs?", "/actions/runs/6001/attempts/1/jobs", "/actions/runs/6002/attempts/1/jobs"])
+    expect(get.calls.some((c) => c.includes(part))).toBe(true);
+  const worker = "session-read-worker / worker", pg16 = "real PostgreSQL 16";
+  const job = (name: string, over: Record<string, unknown>) => (b: any) => ({ ...b, jobs: b.jobs.map((j: any) => (j.name === name ? { ...j, ...over } : j)) });
+  const cases: Array<[string, Forge]> = [
+    // (b) ci.yml worker job missing (listing stays self-consistent so only the missing name can refuse).
+    ["worker missing", { ciJobs: (b) => ({ total_count: b.jobs.length - 1, jobs: b.jobs.filter((j: any) => j.name !== worker) }) }],
+    // (c) worker job still running; (d) worker job failed.
+    ["worker in_progress", { ciJobs: job(worker, { status: "in_progress", conclusion: null }) }],
+    ["worker failed", { ciJobs: job(worker, { conclusion: "failure" }) }],
+    // (e) no pg-proof.yml push run at the sha.
+    ["pg-proof missing", { pgRuns: () => ({ workflow_runs: [] }) }],
+    // (f) pg-proof PostgreSQL 16 failed; (g) pg-proof run still running.
+    ["pg16 failed", { pgJobs: job(pg16, { conclusion: "failure" }) }],
+    ["pg-proof in_progress", { pgRuns: (b) => ({ workflow_runs: [{ ...b.workflow_runs[0], status: "in_progress", conclusion: null }] }) }],
+  ];
+  for (const [name, forge] of cases) {
+    const g = fakeGithub(forge);
+    expect({ name, r: await refusal(attest("copy", { forge })) }).toEqual({ name, r: { code: "frozen_copy_supervisor_unqualified", check: "ci" } });
+    expect({ name, r: await refusal(verifyCustodyGithub(supervisorEnv("copy", fixtureApproval(fixtureFacts("copy"))), g, { protectedJob: false })) })
+      .toEqual({ name, r: { code: "frozen_copy_supervisor_unqualified", check: "ci" } });
+    // Refused at the CI step: nothing after it (plan run, approvals, deployments) is read.
+    expect({ name, later: g.calls.some((c) => c.includes(`/actions/runs/${PLAN_RUN}`) || c.includes("/approvals") || c.includes("/deployments")) })
+      .toEqual({ name, later: false });
+  }
+});
+
 test("each approval field is bound: a change anywhere refuses mismatch naming that field", async () => {
   const f = fixtureFacts("copy");
   const good = fixtureApproval(f);

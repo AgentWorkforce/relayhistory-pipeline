@@ -9,11 +9,11 @@ const H = (c: string) => c.repeat(64);
 export const FIXTURE_POLICY = { generation: H("c"), source_identity_sha256: H("d"), control_epoch: H("a"), privacy_baseline_sha256: H("b") };
 export const FIXTURE_STATUS = { phase: "active", epoch: FIXTURE_POLICY.control_epoch, privacyBaselineSha256: FIXTURE_POLICY.privacy_baseline_sha256 };
 export const SOURCE_SHA = "5".repeat(40), RUN_ID = "7001", PLAN_RUN = "7000";
-const ENV_ID = 4242, CI_RUN = 6001, DEPLOYMENT = 8001;
+const ENV_ID = 4242, CI_RUN = 6001, PG_RUN = 6002, DEPLOYMENT = 8001;
 const base = `/repos/${FROZEN_CUSTODY.repository}`;
 const pinned = { login: FROZEN_CUSTODY.dispatcher.login, id: FROZEN_CUSTODY.dispatcher.id, type: "User" };
 
-export type Route = "main" | "run" | "plan" | "environment" | "branches" | "ciRuns" | "ciJobs" | "approvals" | "deployments" | "statuses";
+export type Route = "main" | "run" | "plan" | "environment" | "branches" | "ciRuns" | "ciJobs" | "pgRuns" | "pgJobs" | "approvals" | "deployments" | "statuses";
 export type Forge = Partial<Record<Route, (body: any) => any>>;
 
 /** Answers exactly the supervisor's reads; `forge` rewrites one route's body (or throws, as an API failure). */
@@ -36,7 +36,14 @@ export function fakeGithub(forge: Forge = {}, mode: CustodyAction | "plan" = "co
     ["ciRuns", `/actions/workflows/ci.yml/runs?event=push&head_sha=${sha}&per_page=100`, () => ({
       workflow_runs: [{ id: CI_RUN, head_sha: sha, head_branch: "main", event: "push", status: "completed", conclusion: "success", run_attempt: 1 }],
     })],
-    ["ciJobs", `/actions/runs/${CI_RUN}/attempts/1/jobs?per_page=100`, () => ({ total_count: 1, jobs: [{ name: "checks", status: "completed", conclusion: "success", head_sha: sha }] })],
+    // The full default push proof of scripts/schema-release-github.ts: ci.yml and pg-proof.yml with every named job.
+    ["ciJobs", `/actions/runs/${CI_RUN}/attempts/1/jobs?per_page=100`, () => ({ total_count: 2, jobs: ["checks", "session-read-worker / worker"].map((name) => (
+      { name, status: "completed", conclusion: "success", head_sha: sha })) })],
+    ["pgRuns", `/actions/workflows/pg-proof.yml/runs?event=push&head_sha=${sha}&per_page=100`, () => ({
+      workflow_runs: [{ id: PG_RUN, head_sha: sha, head_branch: "main", event: "push", status: "completed", conclusion: "success", run_attempt: 1 }],
+    })],
+    ["pgJobs", `/actions/runs/${PG_RUN}/attempts/1/jobs?per_page=100`, () => ({ total_count: 3, jobs: [15, 16, 17].map((v) => (
+      { name: `real PostgreSQL ${v}`, status: "completed", conclusion: "success", head_sha: sha })) })],
     ["approvals", `/actions/runs/${RUN_ID}/approvals`, () => [{ state: "approved", user: { ...pinned }, environments: [{ id: ENV_ID, name: FROZEN_CUSTODY.environment }] }]],
     ["deployments", `/deployments?environment=${FROZEN_CUSTODY.environment}&sha=${sha}&per_page=100`, () => [{ id: DEPLOYMENT, environment: FROZEN_CUSTODY.environment, sha }]],
     ["statuses", `/deployments/${DEPLOYMENT}/statuses?per_page=100`, () => [{ state: "in_progress", log_url: `https://github.com/${FROZEN_CUSTODY.repository}/actions/runs/${RUN_ID}/job/1` }]],

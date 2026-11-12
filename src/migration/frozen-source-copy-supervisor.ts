@@ -8,9 +8,10 @@
  * verifySupervisor re-reads everything live through the GitHub API with the job's GITHUB_TOKEN (never a file from a
  * previous job): fixed repository id + workflow path, workflow_dispatch on refs/heads/main, run_attempt 1, actor
  * AND triggering_actor = the pinned dispatcher, source sha = live main head, the protected environment (reviewers
- * or pinned dispatcher, single `main` branch policy, human approval, a deployment of this run), ci.yml `checks`
- * green at that head, an exact-source plan-mode run under 24h old, and the typed approval equal (exact string) to
- * the one this operator derives from the live source/target state. Refusal codes:
+ * or pinned dispatcher, single `main` branch policy, human approval, a deployment of this run), the full default
+ * push proof of scripts/schema-release-github.ts green at that head (ci.yml jobs `checks` + `session-read-worker /
+ * worker`, pg-proof.yml jobs `real PostgreSQL 15/16/17`), an exact-source plan-mode run under 24h old, and the typed
+ * approval equal (exact string) to the one this operator derives from the live source/target state. Refusal codes:
  *   frozen_copy_supervisor_missing      no Actions context / token / approval / plan run / proof
  *   frozen_copy_supervisor_unqualified  wrong repository, workflow, event, ref, attempt, actor, environment, CI or plan run
  *   frozen_copy_supervisor_stale        main moved past the source sha, or the plan run is older than 24h
@@ -212,7 +213,8 @@ export async function verifyCustodyGithub(env: Env, get: Get, o: { protectedJob:
   const gate = await as("unqualified", "environment", () =>
     requireProtectedEnvironment(get, base, FROZEN_CUSTODY.environment, true, { environment: "environment", branch: "environment_branch" }));
   await as("unqualified", "ci", () =>
-    requireGreenPushRuns(get, base, source, { runs: "ci", jobs: "ci_jobs" }, "main", [["ci.yml", ["checks"]]]));
+    // The full default push proof of the schema-release gate (no override): ci.yml + pg-proof.yml, all named jobs.
+    requireGreenPushRuns(get, base, source, { runs: "ci", jobs: "ci_jobs" }));
   let planRun: string | null = null;
   if (mode !== "plan") {
     planRun = env.CUSTODY_PLAN_RUN!;
