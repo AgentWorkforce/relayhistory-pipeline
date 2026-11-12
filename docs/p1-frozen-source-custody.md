@@ -34,4 +34,8 @@ The whole sequence is rehearsed in `frozen-custody.pglite.test.ts` ("rehearsed g
 4. **Flip**: deploy the ingest Worker with `custodySource: frozen-supabase`, then relayhistory `DELIVERY_CUSTODY_SOURCE_MODE=frozen-supabase` (skip the Neon witness/pending/status calls on batches).
 5. **Prove**: the runtime role's Neon upload-path statements reach zero (pg_stat_statements delta), and the upload 2xx rate is unchanged or better.
 
-**Rollback**: unset the relayhistory flag. It goes back to sending the Neon witness, which the Worker accepts in every mode.
+**Rollback**: first return relayhistory to its Neon witness mode and verify the active-version
+readback through its CI path. Only then may the Worker return from frozen to shadow through the
+private-ingest CI gate. The Worker accepts the Neon witness in every mode. Keep the RHC writer
+lane held through the Worker rollback; a frozen, opaque or Supabase-authority RHC mode refuses.
+Respect the separate one-way privacy/auth boundaries: this path cannot undo Supabase authority.

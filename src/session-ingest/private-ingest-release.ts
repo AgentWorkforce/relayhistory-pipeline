@@ -7,6 +7,7 @@
  * frozen custody in drain, the synchronous frozen-receipt bridge in drain, then async on.
  */
 import { createHash } from "node:crypto";
+import { custodyEvidenceConfirmationSuffix } from "./private-ingest-custody-evidence.ts";
 import {
   ADMISSION_QUEUE,
   COMPATIBILITY_DATE,
@@ -30,6 +31,7 @@ export const PRIVATE_INGEST_RELEASE = {
   workflow: ".github/workflows/deploy-private-ingest-worker.yml",
   accountId: "f7232cb80f6fab86a95426302af243e4",
   worker: SESSION_INGEST_WORKER,
+  relayhistoryWorker: "relayhistory-api",
   approval: {
     by: "Khaliq Gant",
     directDate: "2026-11-11",
@@ -58,7 +60,8 @@ export function privateIngestReleaseInputs(env: Record<string, string | undefine
   if (mode === "plan" && (confirmation || planRun))
     privateIngestRefuse("private_ingest_release_plan_confirmation");
   if (mode === "deploy" && (!/^[1-9][0-9]*$/u.test(planRun) ||
-      confirmation !== `DEPLOY ${PRIVATE_INGEST_RELEASE.worker} ${sha} PLAN ${planRun}`))
+      (confirmation !== `DEPLOY ${PRIVATE_INGEST_RELEASE.worker} ${sha} PLAN ${planRun}` &&
+       confirmation !== `DEPLOY ${PRIVATE_INGEST_RELEASE.worker} ${sha} PLAN ${planRun}${custodyEvidenceConfirmationSuffix()}`)))
     privateIngestRefuse("private_ingest_release_confirmation");
   return { mode, sha: sha!, planRun, confirmation } as const;
 }

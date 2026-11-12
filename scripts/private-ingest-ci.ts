@@ -10,19 +10,35 @@ import {
   privateIngestActiveVersion,
   privateIngestRefuse,
   privateIngestReleasePhase,
+  privateIngestReleaseInputs,
   privateIngestTransitionReadback,
   privateIngestVersionReadback,
   type CloudflareWorkerVersion,
 } from "../src/session-ingest/private-ingest-release.ts";
+import {
+  REVIEWED_CUSTODY_SHADOW_MATCH,
+  custodyEvidenceText,
+  requireCustodyEvidenceText,
+  requireCustodyShadowMatch,
+  requireRelayhistoryWitness,
+} from "../src/session-ingest/private-ingest-custody-evidence.ts";
 
 const SOURCE = resolve("config/cloudflare/private-ingest-production.json");
 const RUNTIME = resolve(".96bulls/cf-sessions-prod/cloudflare-inputs.json");
 const PREFIX = resolve("docs/plans/cf-sessions-prod");
+const CUSTODY_EVIDENCE = PREFIX + ".custody-evidence.json";
 const RECEIPT = resolve("release-receipt/private-ingest-readback.json");
 // Preflight runs before the retained operator's clean-source gate. Keep its diagnostic receipt in
 // the already-ignored, mode-0600 runtime tree so it cannot make the checkout dirty.
 const PREFLIGHT = resolve(".96bulls/private-ingest-release/preflight.json");
 const sha256 = (text: string) => createHash("sha256").update(text).digest("hex");
+
+function verifyCustodyEvidenceFile() {
+  let text: string;
+  try { text = readFileSync(CUSTODY_EVIDENCE, "utf8"); }
+  catch { return privateIngestRefuse("private_ingest_custody_evidence_missing"); }
+  requireCustodyEvidenceText(text);
+}
 
 function trackedInput(): { text: string; input: CloudflareStageInputs } {
   const tracked = JSON.parse(readFileSync(SOURCE, "utf8")) as CloudflareStageInputs;
@@ -49,13 +65,17 @@ export function stagePrivateIngestInput() {
   const { text, input } = trackedInput();
   mkdirSync(dirname(RUNTIME), { recursive: true });
   writeFileSync(RUNTIME, text, { mode: 0o600 });
-  const values = { phase: privateIngestReleasePhase(input), inputs_sha256: inputsDigest(text) };
+  const evidenceText = custodyEvidenceText();
+  mkdirSync(dirname(CUSTODY_EVIDENCE), { recursive: true });
+  writeFileSync(CUSTODY_EVIDENCE, evidenceText, { mode: 0o600 });
+  const values = { phase: privateIngestReleasePhase(input), inputs_sha256: inputsDigest(text), custody_evidence_sha256: sha256(evidenceText) };
   output(values);
   return values;
 }
 
 export function approvePrivateIngestCapture() {
   const { input } = trackedInput(), runtimeText = readFileSync(RUNTIME, "utf8");
+  verifyCustodyEvidenceFile();
   if (inputsDigest(runtimeText) !== inputsDigest(JSON.stringify(input)))
     privateIngestRefuse("private_ingest_runtime_input_drift");
   const provenanceText = readFileSync(PREFIX + ".provenance.json", "utf8"),
@@ -99,11 +119,11 @@ export function approvePrivateIngestCapture() {
   return values;
 }
 
-async function cloudflareGet(path: string): Promise<unknown> {
+async function cloudflareGet(path: string, worker: typeof P.worker | typeof P.relayhistoryWorker = P.worker): Promise<unknown> {
   const token = process.env.CLOUDFLARE_API_TOKEN;
   if (!token || token.length < 16) privateIngestRefuse("private_ingest_cloudflare_token");
   const response = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${P.accountId}/workers/scripts/${P.worker}${path}`,
+    `https://api.cloudflare.com/client/v4/accounts/${P.accountId}/workers/scripts/${worker}${path}`,
     {
       headers: { Authorization: `Bearer ${token}` },
       redirect: "error",
@@ -124,6 +144,8 @@ export async function readBackPrivateIngest() {
   const version = await cloudflareGet(`/versions/${active.versionId}`) as CloudflareWorkerVersion;
   const receipt = {
     ...privateIngestVersionReadback(input, active, version),
+    custodyEvidenceSha256: sha256(custodyEvidenceText()),
+    reviewedSourceShadowReceiptSha256: REVIEWED_CUSTODY_SHADOW_MATCH?.receiptSha256 ?? null,
     at: new Date().toISOString(),
     sourceCommit: process.env.GITHUB_SHA ?? null,
     providerWrites: 0,
@@ -138,8 +160,28 @@ export async function readBackPrivateIngest() {
 export async function preflightPrivateIngest() {
   const { input } = trackedInput(), active = privateIngestActiveVersion(await cloudflareGet("/deployments"));
   const version = await cloudflareGet(`/versions/${active.versionId}`) as CloudflareWorkerVersion;
+  verifyCustodyEvidenceFile();
+  const transition = privateIngestTransitionReadback(input, active, version);
+  const shadowReceiptSha256 = transition.from === "step-0-shadow" && transition.to === "step-1-custody"
+    ? requireCustodyShadowMatch({ ...active, phase: transition.from }, input.sessionIngest.expectedGeneration!)
+    : null;
+  if (process.env.PRIVATE_INGEST_RELEASE_MODE === "deploy") {
+    const release = privateIngestReleaseInputs(process.env);
+    const expected = `DEPLOY ${P.worker} ${release.sha} PLAN ${release.planRun}` +
+      (shadowReceiptSha256 === null ? "" : ` SHADOW ${shadowReceiptSha256}`);
+    if (release.confirmation !== expected) privateIngestRefuse("private_ingest_shadow_confirmation");
+  }
+  let rollbackWitness = null;
+  if (transition.from === "step-1-custody" && transition.to === "step-0-shadow") {
+    const rhcActive = privateIngestActiveVersion(await cloudflareGet("/deployments", P.relayhistoryWorker));
+    const rhcVersion = await cloudflareGet(`/versions/${rhcActive.versionId}`, P.relayhistoryWorker) as CloudflareWorkerVersion;
+    rollbackWitness = requireRelayhistoryWitness(rhcActive, rhcVersion);
+  }
   const receipt = {
-    ...privateIngestTransitionReadback(input, active, version),
+    ...transition,
+    shadowReceiptSha256,
+    custodyEvidenceSha256: sha256(custodyEvidenceText()),
+    rollbackWitness,
     at: new Date().toISOString(),
     sourceCommit: process.env.GITHUB_SHA ?? null,
     providerWrites: 0,

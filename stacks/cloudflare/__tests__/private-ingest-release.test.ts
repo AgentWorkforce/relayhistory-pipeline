@@ -49,6 +49,10 @@ test("typed release confirmation binds mode, main SHA and prior plan", () => {
     PRIVATE_INGEST_RELEASE_PLAN_RUN: "91",
     PRIVATE_INGEST_RELEASE_CONFIRMATION: "yes",
   })) expect(() => privateIngestReleaseInputs({ ...deploy, [key]: value })).toThrow();
+  expect(() => privateIngestReleaseInputs({
+    ...deploy,
+    PRIVATE_INGEST_RELEASE_CONFIRMATION: `${deploy.PRIVATE_INGEST_RELEASE_CONFIRMATION} SHADOW ${"f".repeat(64)}`,
+  })).toThrow("private_ingest_release_confirmation");
 });
 
 function readbackFixture(phase: PrivateIngestReleasePhase) {
@@ -270,4 +274,8 @@ test("workflow is CI-only and binds production credentials only after install", 
   expect(readFileSync("scripts/private-ingest-ci.ts", "utf8")).toContain(
     'resolve(".96bulls/private-ingest-release/preflight.json")',
   );
+  expect(workflow).toContain("docs/plans/cf-sessions-prod.custody-evidence.json");
+  expect(workflow.match(/bun scripts\/private-ingest-ci\.ts preflight/gu)).toHaveLength(2);
+  expect(workflow.indexOf("run: rm -- docs/plans/cf-sessions-prod.custody-evidence.json"))
+    .toBeLessThan(workflow.indexOf("- name: Download the exact prior plan"));
 });

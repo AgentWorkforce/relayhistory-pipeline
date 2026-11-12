@@ -38,6 +38,22 @@ an adjacent transition nor a mode readback waives P1 copy/seal/mirror/shadow evi
 cannot enable the receipt bridge or async admission, and cannot skip directly to/from the
 advanced phases.
 
+The first `step-0-shadow -> step-1-custody` promotion also requires
+`REVIEWED_CUSTODY_SHADOW_MATCH` in `src/session-ingest/private-ingest-custody-evidence.ts`.
+It is deliberately `null` until genuine evidence is retained and its exact metadata/digest is
+reviewed into source. A mode-only deployment cannot populate it. The closed receipt schema keeps
+only generation, exact shadow deployment/version, UTC observation window, aggregate batch/control
+match counts, zero mismatch/error counts, and copy/seal plus mirror receipt digests. It permits
+no tenant identifiers, bodies, headers or raw log errors. The receipt hash is SHA-256 over compact
+JSON in the schema's declared field order, without a newline.
+
+Require at least ten minutes of observations after that deployment began, at least one matching
+batch and control, no errors or mismatches, and an end time within the preceding 24 hours. The
+generation and both live shadow IDs must still match at plan and deploy. Missing, stale, future,
+wrong-generation or non-shadow predecessor evidence refuses. Later idempotent custody redeploys
+and adjacent advanced-phase changes retain their phase guards; they cannot stand in for the first
+promotion's evidence.
+
 Khaliq's recorded production authorization is bound into the deploy capture by
 `src/session-ingest/private-ingest-release.ts`; every run must remain inside its authorized
 scope. The workflow requires his exact authenticated dispatch and triggering identity plus
@@ -80,7 +96,9 @@ worker** with:
 
 The run reads live state without provider writes, enforces the native resource and binding
 inventory, and uploads one `private-ingest-plan` artifact for 24 hours. Review both compact and
-detailed plans. Only creates for an authorized addition, or in-place updates/noops, are allowed;
+detailed plans and `cf-sessions-prod.custody-evidence.json`. That evidence capsule must match the
+exact reviewed source bytes; deploy checks it again after downloading the plan. Only creates for
+an authorized addition, or in-place updates/noops, are allowed;
 replacement, deletion, adoption, foreign resources, credential literals, and unexpected binding
 changes refuse.
 
@@ -93,18 +111,31 @@ Dispatch the same workflow from the same still-current SHA with:
 - `plan_run=<successful plan run id>`
 - `confirmation=DEPLOY 96bulls-session-ingest <sha> PLAN <plan_run>`
 
+For the first frozen promotion append ` SHADOW <reviewed receipt sha256>` to that confirmation.
+The digest must be the source-pinned receipt, not an operator-supplied replacement. Other phase
+changes use the base confirmation without the suffix.
+
 After those gates, the run downloads the exact artifact, binds the recorded production
-authorization to its hashes, regenerates the live plan, refuses any drift, and applies once. It
+authorization to its hashes, repeats the live custody preflight immediately before the operator,
+regenerates the live plan, refuses any drift, and applies once. It
 then requires the current deployment to have exactly one Worker version at 100% and checks every expected `INGEST_*`
 value plus Hyperdrive, both Queue bindings, and the three Secrets Store bindings. The sanitized
 readback is retained as `private-ingest-readback` for 30 days.
 
 ## Rollback
 
-- Step 1: change the tracked profile to `step-0-shadow` by a normal commit, then plan and deploy
+- Step 1: first return relayhistory to its Neon witness mode through its CI path and verify that
+  readback, respecting the independent one-way privacy/auth boundaries. Hold the RHC writer lane
+  until the Worker rollback finishes. Then change the tracked profile to `step-0-shadow` by a normal commit, then plan and deploy
   through the same workflow. If a return to `baseline-drain` is required, use a second profile
   commit and its own plan/deploy after the shadow readback passes. A direct step-1-to-baseline
   revert refuses. Step 2 rolls back to `step-1-custody`. Never rewrite `main`.
+- The Worker rollback preflight reads the sole current RHC version at 100% and requires a complete
+  binding response with `DELIVERY_CUSTODY_SOURCE_MODE` absent, empty, or exactly `relayhistory`.
+  Its existing `NEON_APP_DATABASE_URL` secret binding must still be present; its value is never read.
+  Frozen/Supabase-authority, unknown/opaque modes, missing metadata and split deployments refuse;
+  no credential or permission fallback is allowed. Its read-only RHC check is repeated immediately
+  before apply. Once RHC has crossed the one-way Supabase privacy boundary, this rollback is unavailable.
 - Shadow may return to baseline through the same CI path; step 1 may return to shadow for
   diagnosis. Refuse a custody-binding deletion from an unknown mode or with a receipt bridge
   still enabled. RHC privacy/auth authority boundaries still apply independently.
