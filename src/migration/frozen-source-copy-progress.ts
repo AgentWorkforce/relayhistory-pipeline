@@ -25,6 +25,7 @@ import {
   FrozenCopyRefusal, FrozenCopyUnknownCommit, hasSqlState, policyRefusal, type CutoverStatus, type InDoubt, type Queryable,
   type SealResult,
 } from "./frozen-source-copy-seal.ts";
+import { FROZEN_COPY_RECEIPT_SCHEMA, isSupervisorProof, supervisorProofRefusal, type CustodyAction, type SupervisorBlock } from "./frozen-source-copy-supervisor.ts";
 
 const refuse = (code: string, detail?: Record<string, string>): never => {
   throw new FrozenCopyRefusal(code, detail);
@@ -347,7 +348,7 @@ export function progressTracker(totalOrgs: number) {
 }
 
 export type JobOutcome = "pass" | "refused" | "aborted" | "unknown-commit";
-export type JobStatus = "COPIED" | "SEALED" | "REFUSED" | "ABORTED" | "UNKNOWN_COMMIT";
+export type JobStatus = "COPIED" | "SEALED" | "VERIFIED" | "REFUSED" | "ABORTED" | "UNKNOWN_COMMIT";
 
 export function classifyJobOutcome(error: unknown): { outcome: JobOutcome; code: string | null } {
   if (error === undefined) return { outcome: "pass", code: null };
@@ -360,7 +361,7 @@ export function classifyJobOutcome(error: unknown): { outcome: JobOutcome; code:
 export interface JobEnvelope {
   startedAt: number;
   finishedAt: number;
-  budget: { maxWallMs: number; deadline: number; pageSizes: { records: number; receipts: number }; concurrency: number; maxPageMs: number; statementTimeoutMs: number; lockTimeoutMs: number };
+  budget: { maxWallMs: number; deadline: number; pageSizes: { records: number; receipts: number }; maxPages: number; concurrency: number; maxPageMs: number; statementTimeoutMs: number; lockTimeoutMs: number };
   progress: ProgressTracker["state"];
   abort: ReturnType<typeof abortController>["state"] & { completedAt: number | null; sourceClosed: boolean; targetClosed: boolean; writesStopped: boolean };
   reconciliation: { result: Reconciliation; readbackAt: number | null };
@@ -368,57 +369,89 @@ export interface JobEnvelope {
 
 const iso = (t: number | null) => (t === null ? null : new Date(t).toISOString());
 
-const NEXT: Record<JobStatus, Record<"copy" | "seal", string>> = {
-  COPIED: { copy: "run --seal", seal: "run --seal" },
-  SEALED: { copy: "none", seal: "none; the completeness seal is committed" },
+const NEXT: Record<JobStatus, Record<CustodyAction, string>> = {
+  COPIED: { copy: "dispatch readback", seal: "dispatch readback", readback: "dispatch readback" },
+  SEALED: { copy: "none", seal: "none; the completeness seal is committed", readback: "none" },
+  VERIFIED: { copy: "dispatch seal", seal: "dispatch seal", readback: "dispatch seal with this manifest in the typed approval" },
   REFUSED: {
-    copy: "fix the refusal, then rerun --copy (resumes from the owner-only checkpoints; never delete them)",
-    seal: "no seal row was written; fix the refusal, then rerun --seal",
+    copy: "fix the refusal, then dispatch copy again (resumes from the owner-only checkpoints; never delete them)",
+    seal: "no seal row was written; fix the refusal, then dispatch readback and seal again",
+    readback: "nothing was written; fix the refusal, then dispatch readback again",
   },
   ABORTED: {
-    copy: "rerun --copy when ready (resumes from the owner-only checkpoints; nothing in flight was committed without its checkpoint)",
-    seal: "no seal row was written; rerun --seal when ready",
+    copy: "dispatch copy when ready (resumes from the owner-only checkpoints; nothing in flight was committed without its checkpoint)",
+    seal: "no seal row was written; dispatch seal when ready",
+    readback: "nothing was written; dispatch readback when ready",
   },
   UNKNOWN_COMMIT: {
-    copy: "do not retry blindly: rerun --copy, whose start-up reads the checkpoint row (the readback) and resumes after a committed page or re-reads an uncommitted one",
-    seal: "do not retry blindly: read sessions.ingest_frozen_source_completeness; this run's manifest means sealed (rerun --seal confirms with inserted=false), no row means rerun --seal",
+    copy: "do not retry blindly: dispatch copy again, whose start-up reads the checkpoint row (the readback) and resumes after a committed page or re-reads an uncommitted one",
+    seal: "do not retry blindly: read sessions.ingest_frozen_source_completeness; this run's manifest means sealed (a new seal run confirms with inserted=false), no row means dispatch seal again",
+    readback: "readback writes nothing; dispatch readback again",
   },
 };
 
+/** --readback: the manifest the seal would commit, computed read-only (no fence, no write). */
+export interface ReadbackResult {
+  manifestSha256: string;
+  orgs: number;
+}
 export interface JobReceipt {
-  receipt: "frozen-source-copy-job-v2";
-  mode: "copy" | "seal";
+  receipt: typeof FROZEN_COPY_RECEIPT_SCHEMA;
+  mode: CustodyAction;
   outcome: JobOutcome;
   status: JobStatus;
   code: string | null;
   startedAt: string;
   finishedAt: string;
   progress: { schemaVersion: number; stateTable: string; bindingSha: string | null; totalOrgs: number; completedOrgs: number; dataset: Dataset | null; pages: number; rows: number; resumeCount: number; lastCheckpointAt: string | null; cursorSha256: string | null };
-  budget: { maxWallMs: number; elapsedWallMs: number; deadline: string; pageSizes: { records: number; receipts: number }; concurrency: number; maxPageMs: number; statementTimeoutMs: number; lockTimeoutMs: number; exceeded: boolean };
+  budget: { maxWallMs: number; elapsedWallMs: number; deadline: string; pageSizes: { records: number; receipts: number }; maxPages: number; concurrency: number; maxPageMs: number; statementTimeoutMs: number; lockTimeoutMs: number; exceeded: boolean };
   abort: { requested: boolean; observed: boolean; boundedReason: string | null; requestedAt: string | null; completedAt: string | null; inFlightResolved: boolean; sourceClosed: boolean; targetClosed: boolean; writesStopped: boolean };
   unknownCommit: { detected: boolean; phase: "copy" | "seal" | null; dataset: Dataset | null; checkpointSeq: number | null; detectedAt: string | null; reconciliation: Reconciliation; readbackAt: string | null; resolvedAt: string | null; noBlindRetry: true };
   seal: SealResult | null;
+  readback: ReadbackResult | null;
+  /** The sanitized supervisor attestation (null when none was proven). */
+  supervisor: SupervisorBlock | null;
   next: string;
 }
 
-/** The one sanitized receipt: no credential, no org id, no raw key (cursor only as sha256). */
-export function jobReceipt(mode: "copy" | "seal", error: unknown, env: JobEnvelope, seal: SealResult | null = null): JobReceipt {
+/**
+ * The one sanitized receipt: no credential, no org id, no raw key (cursor only as sha256). COPIED / SEALED / VERIFIED
+ * need a minted SupervisorProof for exactly this mode; otherwise the receipt is REFUSED frozen_copy_supervisor_*.
+ */
+export function jobReceipt(
+  mode: CustodyAction,
+  error: unknown,
+  env: JobEnvelope,
+  seal: SealResult | null = null,
+  extra: { supervisor?: unknown; readback?: ReadbackResult | null } = {},
+): JobReceipt {
   const { outcome, code } = classifyJobOutcome(error);
   const doubt = error instanceof FrozenCopyUnknownCommit ? error.context : null;
+  const readback = extra.readback ?? null;
+  // A "pass" is COPIED / SEALED / VERIFIED only with its result (seal manifest, readback manifest) AND the proof.
+  let passed: JobStatus = "COPIED", passCode: string | null = null;
+  if (mode === "seal") {
+    passed = "SEALED";
+    if (!seal?.manifestSha256) passCode = "frozen_copy_seal_missing";
+  } else if (mode === "readback") {
+    passed = "VERIFIED";
+    if (!readback?.manifestSha256) passCode = "frozen_copy_readback_missing";
+  }
+  if (!passCode) passCode = supervisorProofRefusal(extra.supervisor, mode)?.code ?? null;
   const status: JobStatus =
     outcome === "unknown-commit" ? "UNKNOWN_COMMIT"
     : outcome === "aborted" ? "ABORTED"
     : outcome === "refused" ? "REFUSED"
-    : mode === "seal" ? (seal?.manifestSha256 ? "SEALED" : "REFUSED")
-    : "COPIED";
+    : passCode ? "REFUSED"
+    : passed;
   const reconciliation: Reconciliation = doubt ? env.reconciliation.result : "NOT_REQUIRED";
   const p = env.progress;
   return {
-    receipt: "frozen-source-copy-job-v2",
+    receipt: FROZEN_COPY_RECEIPT_SCHEMA,
     mode,
     outcome: status === "REFUSED" && outcome === "pass" ? "refused" : outcome,
     status,
-    code: status === "REFUSED" && outcome === "pass" ? "frozen_copy_seal_missing" : code,
+    code: status === "REFUSED" && outcome === "pass" ? passCode : code,
     startedAt: new Date(env.startedAt).toISOString(),
     finishedAt: new Date(env.finishedAt).toISOString(),
     progress: { schemaVersion: PROGRESS_SCHEMA_VERSION, stateTable: PROGRESS_TABLE, bindingSha: p.bindingSha, totalOrgs: p.totalOrgs, completedOrgs: p.completedOrgs, dataset: p.dataset, pages: p.pages, rows: p.rows, resumeCount: p.resumeCount, lastCheckpointAt: p.lastCheckpointAt, cursorSha256: p.cursorSha256 },
@@ -446,6 +479,8 @@ export function jobReceipt(mode: "copy" | "seal", error: unknown, env: JobEnvelo
       noBlindRetry: true,
     },
     seal,
+    readback,
+    supervisor: isSupervisorProof(extra.supervisor) ? { ...extra.supervisor.block } : null,
     next: NEXT[status][mode],
   };
 }

@@ -7,20 +7,32 @@
  * supabaseOwnerUrl is the existing direct schema-owner login (`postgres.<project>` through the pinned session
  * pooler); src/migration/frozen-source-copy-seal.ts validates it against the fixed schema-release pins, connects
  * with the pinned CA, and requires current_user = session_user = the owner. Nothing is minted, stored or logged.
- * Producer (operator shell; docs/p1-frozen-source-custody.md): `op read` the two URLs | jq -> this script.
+ * Producer: ONLY the protected workflow .github/workflows/frozen-source-custody.yml (FROZEN_COPY_CREDENTIAL_PRODUCER,
+ * the environment secret FROZEN_COPY_CREDENTIALS piped in); docs/p1-frozen-source-custody.md.
+ *
+ * Supervisor: --copy, --seal and --readback refuse frozen_copy_supervisor_missing|stale|mismatch|unqualified unless
+ * they run as that workflow's protected job and the typed approval matches what this run derives
+ * (src/migration/frozen-source-copy-supervisor.ts). COPIED / SEALED / VERIFIED are impossible without the proof.
  *
  * Usage:
- *   bun scripts/frozen-source-copy.ts --plan                   read-only: per-org Neon row counts, no writes
+ *   bun scripts/frozen-source-copy.ts --plan                   read-only: per-org Neon row counts, no writes; with the
+ *                                                              owner URL also the expected copy / readback approvals
  *   bun scripts/frozen-source-copy.ts --copy [--org X] [--concurrency 2] [--page 5000] [--max-page-ms 4000]
+ *   bun scripts/frozen-source-copy.ts --readback               read-only: every checkpoint complete, verify every org
+ *                                                              and the privacy state; VERIFIED + the manifest the seal
+ *                                                              must commit (and the expected seal approval)
  *   bun scripts/frozen-source-copy.ts --seal                   every org x dataset checkpoint complete under this
  *                                                              binding, verify every org and the privacy state, then
  *                                                              seal inside the fence (sealFence); refusal = no seal row
- *   --copy / --seal also take [--budget-ms N] (wall clock, default 6h) and [--receipt PATH] (new file, 0600):
- *   the job ends with ONE sanitized receipt (frozen-source-copy-job-v2: status COPIED | SEALED | REFUSED | ABORTED |
- *   UNKNOWN_COMMIT, progress / budget / abort / unknownCommit, next action). No credential, org id or raw key in it.
- *   bun scripts/frozen-source-copy.ts --repair-head --org O --workspace W --user U [--execute]
- *                                                              re-seed ONE stale mirror control head from Neon (dry run by default;
- *                                                              src/hoopdb/frozen-control-head-repair.ts has the refusal rules)
+ *   --copy / --seal / --readback also take [--budget-ms N] (wall clock, default 6h), [--max-pages N] (pages per run,
+ *   0 = no limit; frozen_copy_page_limit) and [--receipt PATH] (new file, 0600): the job ends with ONE sanitized
+ *   receipt (frozen-source-copy-job-v3: status COPIED | SEALED | VERIFIED | REFUSED | ABORTED | UNKNOWN_COMMIT,
+ *   progress / budget / abort / unknownCommit, the sanitized supervisor block, next action). No credential, org id or
+ *   raw key in it.
+ *   bun scripts/frozen-source-copy.ts --repair-head --org O --workspace W --user U
+ *                                                              dry run only: what re-seeding ONE stale mirror control
+ *                                                              head from Neon would do (src/hoopdb/frozen-control-head-repair.ts);
+ *                                                              --execute is refused (no supervised repair action exists)
  *
  * Resumable: the ONLY cursor is the owner-only progress table in the target (src/migration/frozen-source-copy-progress.ts);
  * each page and its checkpoint commit in one target transaction; a resume re-proves the frozen source, the owner and
@@ -29,56 +41,66 @@
  * SIGINT/SIGTERM: stop before the next read/write, roll back what is open, receipt ABORTED; checkpoints are kept.
  * Never writes Neon. Never prints credentials.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 import pg from "pg";
+import { githubGet } from "./schema-release-github.ts";
 import { SUPA_PAGE, SUPA_RECEIPTS } from "../src/migration/frozen-source-copy-queries.ts";
 import { CredentialRefusal, readStdinCredentials, refuseCredentialEnv } from "../src/migration/stdin-credentials.ts";
 import {
   FrozenCopyRefusal, FrozenCopyUnknownCommit, type FrozenCopyMode, type OrgVerification, type OwnerConnection, RECORD_COLS as COLS, SUPA_EXTRA_ORGS,
-  addDigest, emptyDigest, extraOrgRefusal, frozenCopyCredentialKeys, frozenCopyCredentials, frozenCopyOwnerClientConfig,
+  addDigest, emptyDigest, extraOrgRefusal, frozenCopyCredentialKeys, frozenCopyCredentials, frozenCopyNeonClientConfig, frozenCopyOwnerClientConfig,
   neonFrozenStatus, orgParityRefusal, preRead, receiptText, requireFrozenCopyOwner, rowText, sealFence,
-  DEFAULT_BUDGET_MS, type SealResult, guardedWrite, jobBudget,
+  DEFAULT_BUDGET_MS, type SealResult, guardedWrite, jobBudget, buildManifest, type CutoverStatus, type PreRead,
 } from "../src/migration/frozen-source-copy-seal.ts";
 import {
-  type CopyBinding, type Dataset, type Reconciliation, abortController, copyBinding, copyDataset, jobReceipt, operatorSha256, progressTracker,
+  type CopyBinding, type Dataset, type ReadbackResult, type Reconciliation, abortController, copyBinding, copyDataset, jobReceipt, progressTracker,
   reconcileInDoubt, requireCopyComplete, requireProgressTable, requireResumeBinding, serialQueue, takeCopyOwnership,
 } from "../src/migration/frozen-source-copy-progress.ts";
+import {
+  type CustodyAction, type SupervisorFacts, type SupervisorProof, approvalText, frozenCopyOperatorSha256, sourceDescriptorSha256,
+  supervisorContextRefusal, targetDescriptorSha256, verifySupervisor,
+} from "../src/migration/frozen-source-copy-supervisor.ts";
 import { repairControlHead } from "../src/hoopdb/frozen-control-head-repair.ts";
 
+// The workflow hands the credential document to this process through stdin only; drop the step's copy of it.
+delete process.env.FROZEN_COPY_CREDENTIALS;
 const args = process.argv.slice(2), flag = (k: string) => args.includes(k), val = (k: string, d: string) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1]! : d; };
-const mode = (flag("--plan") ? "plan" : flag("--copy") ? "copy" : flag("--seal") ? "seal" : flag("--repair-head") ? "repair-head" : "") as FrozenCopyMode | "";
-if (!mode) { console.error("one of --plan | --copy | --seal | --repair-head"); process.exit(64); }
+const modes = (["plan", "copy", "seal", "readback", "repair-head"] as const).filter((m) => flag("--" + m));
+if (modes.length !== 1) { console.error("exactly one of --plan | --copy | --readback | --seal | --repair-head"); process.exit(64); }
+const mode: FrozenCopyMode = modes[0]!;
+const job = mode === "copy" || mode === "seal" || mode === "readback" ? mode as CustodyAction : null;
+// A head write needs a supervised action; none exists for repair, so only its dry run may run (locally).
+if (mode === "repair-head" && flag("--execute")) { console.error("--repair-head --execute is refused: no supervised repair action exists; run the dry run"); process.exit(64); }
 const PAGE = Number(val("--page", "5000")), CONC = Number(val("--concurrency", "2")), MAX_PAGE_MS = Number(val("--max-page-ms", "4000")), ONLY = val("--org", "");
 const RECEIPT_PAGE = Math.min(PAGE, 1000);
 if (![PAGE, CONC, MAX_PAGE_MS].every((v) => Number.isSafeInteger(v) && v > 0)) { console.error("--page, --concurrency and --max-page-ms must be positive integers"); process.exit(64); }
-// A subset must never become the global completeness seal.
-if (flag("--seal") && flag("--org")) {
-  console.error("--seal requires the complete source; --org is not allowed");
+// A subset must never become the global completeness seal (nor its readback).
+if ((flag("--seal") || flag("--readback")) && flag("--org")) {
+  console.error(`--${mode} requires the complete source; --org is not allowed`);
   process.exit(64);
 }
-const BUDGET_MS = Number(val("--budget-ms", String(DEFAULT_BUDGET_MS))), RECEIPT = val("--receipt", "");
-if (!Number.isSafeInteger(BUDGET_MS) || BUDGET_MS < 0 || RECEIPT.startsWith("--")) { console.error("--budget-ms must be a non-negative integer; --receipt needs a path"); process.exit(64); }
+const BUDGET_MS = Number(val("--budget-ms", String(DEFAULT_BUDGET_MS))), RECEIPT = val("--receipt", ""), MAX_PAGES = Number(val("--max-pages", "0"));
+if (!Number.isSafeInteger(BUDGET_MS) || BUDGET_MS < 0 || !Number.isSafeInteger(MAX_PAGES) || MAX_PAGES < 0 || RECEIPT.startsWith("--")) {
+  console.error("--budget-ms and --max-pages must be non-negative integers; --receipt needs a path");
+  process.exit(64);
+}
 const log = (m: string, f: Record<string, unknown> = {}) => console.log(JSON.stringify({ at: new Date().toISOString(), m, ...f }));
 
 /** Operator identity for the binding: the bytes of the operator's own source (driver + the modules it executes). */
-const OPERATOR_SHA = operatorSha256(
-  ["../src/migration/frozen-source-copy-seal.ts", "../src/migration/frozen-source-copy-progress.ts", "../src/migration/frozen-source-copy-queries.ts", "./frozen-source-copy.ts"]
-    .map((f) => ({ name: f, bytes: readFileSync(new URL(f, import.meta.url)) })),
-);
+const OPERATOR_SHA = frozenCopyOperatorSha256();
 
-let neonOwnerUrl = "", owner: OwnerConnection | null = null;
+let neonConn: OwnerConnection | null = null, owner: OwnerConnection | null = null;
 try {
   refuseCredentialEnv();
   const keys = frozenCopyCredentialKeys(mode);
-  ({ neonOwnerUrl, owner } = frozenCopyCredentials(await readStdinCredentials(keys.required, keys.allowed), mode));
+  ({ neon: neonConn, owner } = frozenCopyCredentials(await readStdinCredentials(keys.required, keys.allowed), mode));
 } catch (e) {
   if (!(e instanceof CredentialRefusal || e instanceof FrozenCopyRefusal)) throw e;
   console.error(`credentials refused: ${e.message}`);
   process.exit(64);
 }
-if (!/^postgresql:\/\/neondb_owner:.+ep-floral-pond-apkvat38/.test(neonOwnerUrl)) { console.error("neonOwnerUrl (production owner) required on stdin"); process.exit(64); }
 
-const neon = () => { const c = new pg.Client({ connectionString: neonOwnerUrl, ssl: { rejectUnauthorized: true }, application_name: "p1-frozen-copy-readonly", statement_timeout: 30000 }); return c; };
+const neon = () => new pg.Client(frozenCopyNeonClientConfig(neonConn!));
 /**
  * The ONE Supabase owner connection of this run (copy keeps it for the whole job). The validated owner credential is
  * taken once and dropped from module state; the session must then be the pinned owner (no role switching anywhere).
@@ -179,7 +201,7 @@ async function repairHead() {
     await n.connect();
     const s = await supa();
     try {
-      const r = await repairControlHead(n, s, key, { dryRun: !flag("--execute") });
+      const r = await repairControlHead(n, s, key, { dryRun: true });
       log("control head repair", { ...r });
     } finally { await s.end().catch(() => {}); }
   } finally { await n.end().catch(() => {}); }
@@ -191,11 +213,24 @@ const abort = abortController();
 const progress = progressTracker(0);
 const closed = { completedAt: null as number | null, sourceClosed: false, targetClosed: false, writesStopped: false };
 const reconciliation = { result: "NOT_REQUIRED" as Reconciliation, readbackAt: null as number | null };
-let openSource = 0, sealResult: SealResult | null = null;
+let openSource = 0, sealResult: SealResult | null = null, readbackResult: ReadbackResult | null = null, supervisor: SupervisorProof | null = null;
 // Only the jobs that check abort take over SIGINT/SIGTERM; --plan and --repair-head keep the default (terminate).
-if (mode === "copy" || mode === "seal")
+if (job)
   for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => { abort.request(sig); log("abort requested", { signal: sig }); });
-const check = () => { abort.check(); budget.check(); };
+const check = () => {
+  abort.check();
+  budget.check();
+  if (MAX_PAGES > 0 && progress.state.pages >= MAX_PAGES) throw new FrozenCopyRefusal("frozen_copy_page_limit", { maxPages: String(MAX_PAGES) });
+};
+
+/** Everything this run derives itself from the live source and target; the typed approval must spell exactly this. */
+const custodyFacts = (action: CustodyAction, status: CutoverStatus, b: CopyBinding): SupervisorFacts => ({
+  action, source: sourceDescriptorSha256(status), target: targetDescriptorSha256(b), epoch: b.controlEpoch, privacy: b.privacyBaselineSha256,
+  generation: b.generation, manifest: null, operator: OPERATOR_SHA, page: PAGE, maxPages: MAX_PAGES, budgetMs: BUDGET_MS,
+});
+/** The approval line a dispatcher would type for `action` (logged by --plan and --readback; no secret in it). */
+const expectedApproval = (action: CustodyAction, status: CutoverStatus, b: CopyBinding, planRun: string, manifest: string | null = null) =>
+  approvalText({ ...custodyFacts(action, status, b), manifest, sha: process.env.CUSTODY_SHA || "<sha>", planRun });
 
 /** Bounded readback of an in-doubt COMMIT on the same owner session; no answer in 5s stays PENDING (the next run's resume reads it). */
 async function readback(s: pg.Client, e: FrozenCopyUnknownCommit) {
@@ -213,15 +248,30 @@ async function openJob(status: Awaited<ReturnType<typeof neonFrozenStatus>>) {
     await requireProgressTable(s);
     await takeCopyOwnership(s);
     const binding = await copyBinding(s, status, OPERATOR_SHA);
+    // The supervisor attestation, re-read live from GitHub with this job's token, before any write.
+    supervisor = await verifySupervisor(process.env, githubGet(process.env.GITHUB_TOKEN), custodyFacts(job!, status, binding));
+    log("supervisor attested", { ...supervisor.block });
     progress.bind(binding);
     const resumed = await requireResumeBinding(s, binding);
     log("job bound", { mode, checkpoints: resumed });
-    return { s, binding };
+    return { s, binding, status };
   } catch (error) { await s.end().catch(() => {}); throw error; }
+}
+
+/** --plan with the owner URL: the read-only target binding and the approvals the next dispatches must carry. */
+async function planApprovals(status: CutoverStatus) {
+  const s = await supa();
+  try {
+    const binding = await copyBinding(s, status, OPERATOR_SHA);
+    const planRun = process.env.GITHUB_RUN_ID || "<this-plan-run-id>";
+    log("expected approvals", { copy: expectedApproval("copy", status, binding, planRun), readback: expectedApproval("readback", status, binding, planRun) });
+  } finally { await s.end().catch(() => {}); }
 }
 
 async function main() {
   if (mode === "repair-head") return repairHead();
+  // Before any connection: a copy / seal / readback that is not the protected workflow's job stops here.
+  if (job) { const unsupervised = supervisorContextRefusal(process.env, job); if (unsupervised) throw unsupervised; }
   const n = neon();
   openSource++;
   try {
@@ -233,6 +283,8 @@ async function main() {
     if (mode === "plan") {
       const est = (await n.query("SELECT reltuples::bigint AS n FROM pg_class WHERE oid='sessions.delivery_records'::regclass")).rows[0].n;
       log("plan", { phase: status.phase, epoch: status.epoch, orgs: all.length, estimatedRecords: String(est) });
+      await n.query("ROLLBACK");
+      if (owner) await planApprovals(status);
       return;
     }
     await n.query("ROLLBACK");
@@ -240,7 +292,7 @@ async function main() {
     const { s, binding } = await openJob(status);
     try {
       if (mode === "copy") await copyJob(n, s, binding, all);
-      else await sealJob(n, s, binding, all);
+      else await sealJob(n, s, binding, all, status);
     } catch (error) {
       if (error instanceof FrozenCopyUnknownCommit) await readback(s, error);
       throw error;
@@ -292,7 +344,8 @@ async function copyJob(n: pg.Client, s: pg.Client, binding: CopyBinding, all: st
 
 // --seal: every org x dataset checkpoint complete under THIS binding; pre-read the privacy state (it must already
 // agree), verify every Neon org, then write the org seals and the completeness seal inside the fence (sealFence).
-async function sealJob(n: pg.Client, s: pg.Client, binding: CopyBinding, all: string[]) {
+// --readback: the same verification, read-only; it stops before the fence and reports the manifest instead.
+async function sealJob(n: pg.Client, s: pg.Client, binding: CopyBinding, all: string[], status: CutoverStatus) {
   await requireCopyComplete(s, binding, all);
   const pre = await preRead(n, s);
   const results: OrgVerification[] = [];
@@ -314,24 +367,32 @@ async function sealJob(n: pg.Client, s: pg.Client, binding: CopyBinding, all: st
   log("orgs verified", { orgs: results.length });
   const extra = extraOrgRefusal((await s.query(SUPA_EXTRA_ORGS, [all])).rows[0].n);
   if (extra) throw extra;
-  sealResult = await sealFence(n, s, { orgs: results, pre }, { budget: check });
+  if (mode === "readback") return readbackManifest(results, pre, status, binding);
+  sealResult = await sealFence(n, s, { orgs: results, pre }, { budget: check, supervisor });
   log("sealed", { ...sealResult });
+}
+
+/** The manifest the seal fence will rebuild and must match (the seal approval binds it). */
+function readbackManifest(results: OrgVerification[], pre: PreRead, status: CutoverStatus, binding: CopyBinding) {
+  const m = buildManifest(results, pre.supa);
+  readbackResult = { manifestSha256: m.sha256, orgs: m.totals.orgs };
+  log("readback verified", { ...readbackResult, sealApproval: expectedApproval("seal", status, binding, process.env.CUSTODY_PLAN_RUN || "<plan-run-id>", m.sha256) });
 }
 
 /** The one job receipt (copy/seal): stdout always, plus a NEW 0600 file when --receipt is given. Sanitized (no org id). */
 function writeReceipt(error: unknown) {
-  if (mode !== "copy" && mode !== "seal") return;
-  const r = jobReceipt(mode, error, {
+  if (!job) return;
+  const r = jobReceipt(job, error, {
     startedAt: budget.startedAt,
     finishedAt: Date.now(),
-    budget: { maxWallMs: BUDGET_MS, deadline: budget.deadline, pageSizes: { records: PAGE, receipts: RECEIPT_PAGE }, concurrency: CONC, maxPageMs: MAX_PAGE_MS, statementTimeoutMs: 60000, lockTimeoutMs: 5000 },
+    budget: { maxWallMs: BUDGET_MS, deadline: budget.deadline, pageSizes: { records: PAGE, receipts: RECEIPT_PAGE }, maxPages: MAX_PAGES, concurrency: CONC, maxPageMs: MAX_PAGE_MS, statementTimeoutMs: 60000, lockTimeoutMs: 5000 },
     progress: progress.state,
     abort: { ...abort.state, ...closed },
     reconciliation,
-  }, sealResult);
+  }, sealResult, { supervisor, readback: readbackResult });
   log("receipt", { ...r });
-  // Only COPIED / SEALED exit 0 (a seal "pass" without a committed manifest is REFUSED).
-  if (r.status !== "COPIED" && r.status !== "SEALED") process.exitCode = 1;
+  // Only COPIED / SEALED / VERIFIED exit 0 (a pass without its result or without the supervisor proof is REFUSED).
+  if (r.status !== "COPIED" && r.status !== "SEALED" && r.status !== "VERIFIED") process.exitCode = 1;
   if (RECEIPT) {
     try { writeFileSync(RECEIPT, JSON.stringify(r) + "\n", { flag: "wx", mode: 0o600 }); }
     catch { log("receipt file not written", { path: RECEIPT }); process.exitCode = 1; }

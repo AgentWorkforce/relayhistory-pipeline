@@ -22,8 +22,9 @@ import { createHash } from "node:crypto";
 import { SCHEMA_RELEASE, releaseConnection } from "../hoopdb/schema-release-contract.ts";
 import { requireReleaseOwner } from "../hoopdb/schema-release-inspect.ts";
 import { SUPABASE_PROD_CA_2021 } from "../session-pipeline/supabase-ca.ts";
-import { CredentialRefusal, postgresUrl } from "./stdin-credentials.ts";
+import { CredentialRefusal, sessionAffinityUrl } from "./stdin-credentials.ts";
 import { SUPA_CONTROL_HEADS, SUPA_DELETIONS, SUPA_RESETS } from "./frozen-source-copy-queries.ts";
+import { supervisorProofRefusal, type SupervisorProof } from "./frozen-source-copy-supervisor.ts";
 
 /** A refusal with a stable code. `detail` carries counts and org ids only, never a credential. */
 export class FrozenCopyRefusal extends Error {
@@ -44,7 +45,7 @@ export interface Queryable {
 // 1. Credential document and the direct-owner adapter
 // ---------------------------------------------------------------------------------------------------------------
 
-export type FrozenCopyMode = "plan" | "copy" | "seal" | "repair-head";
+export type FrozenCopyMode = "plan" | "copy" | "seal" | "readback" | "repair-head";
 export const FROZEN_COPY_CREDENTIAL_KEYS = ["neonOwnerUrl", "supabaseOwnerUrl"] as const;
 
 /** Keys of the stdin document: --plan never connects to Supabase, every other mode needs the owner URL. */
@@ -77,12 +78,69 @@ export function frozenCopyOwnerConnection(v: unknown): OwnerConnection {
   }
 }
 
-/** The validated stdin document. The Neon URL keeps its existing production-owner pattern check in the driver. */
-export function frozenCopyCredentials(doc: Record<string, unknown>, mode: FrozenCopyMode): { neonOwnerUrl: string; owner: OwnerConnection | null } {
-  const neonOwnerUrl = postgresUrl(doc.neonOwnerUrl, "neonOwnerUrl");
-  if (mode === "plan" && doc.supabaseOwnerUrl === undefined) return { neonOwnerUrl, owner: null };
+/**
+ * The Neon production owner, pinned in source: login `neondb_owner`, database `neondb`, and the production endpoint,
+ * pinned by the sha256 of the endpoint id (the first host label) so the id itself is not repeated in this module.
+ */
+export const FROZEN_COPY_NEON_PIN = {
+  user: "neondb_owner",
+  database: "neondb",
+  endpointSha256: "01517ad6b2c5336b53725c7e06fb36f43f1bcbee4ee9a298ef28abf6fa52adbc",
+} as const;
+
+/**
+ * The Neon owner URL. sessionAffinityUrl first (stdin-credentials.ts): no `-pooler.` host
+ * (neon_owner_url_pooler), no port 6543 / pgbouncer=true (neon_owner_url_transaction_pooler), and an explicit user,
+ * NON-EMPTY password and TCP host (neon_owner_url_user_required|password_required|host_required). The password check
+ * is what makes node-postgres' ~/.pgpass fallback unreachable: pg reads ~/.pgpass only when the password is null or
+ * empty. Then the source pins (user, database, endpoint digest) and only `sslmode=require|verify-full` /
+ * `channel_binding=require` in the query. The result is discrete fields; the client never gets a connectionString.
+ */
+export function frozenCopyNeonConnection(v: unknown): OwnerConnection {
+  const u = new URL(sessionAffinityUrl(v, "neonOwnerUrl", "neon"));
+  const dec = (x: string) => {
+    try {
+      return decodeURIComponent(x);
+    } catch {
+      throw new CredentialRefusal("neon_owner_url_refused");
+    }
+  };
+  const user = dec(u.username), password = dec(u.password);
+  if (user !== FROZEN_COPY_NEON_PIN.user) throw new CredentialRefusal("neon_owner_url_user_refused");
+  if (!password) throw new CredentialRefusal("neon_owner_url_password_required");
+  const label = u.hostname.split(".")[0] ?? "";
+  if (createHash("sha256").update(label).digest("hex") !== FROZEN_COPY_NEON_PIN.endpointSha256) throw new CredentialRefusal("neon_owner_url_endpoint_refused");
+  if (dec(u.pathname) !== `/${FROZEN_COPY_NEON_PIN.database}`) throw new CredentialRefusal("neon_owner_url_database_refused");
+  if (u.hash || (u.port !== "" && u.port !== "5432")) throw new CredentialRefusal("neon_owner_url_refused");
+  for (const [k, val] of u.searchParams) {
+    const ok = (k === "sslmode" && (val === "require" || val === "verify-full")) || (k === "channel_binding" && val === "require");
+    if (!ok) throw new CredentialRefusal("neon_owner_url_options_refused");
+  }
+  return { host: u.hostname, port: 5432, database: FROZEN_COPY_NEON_PIN.database, user, password };
+}
+
+/** The validated stdin document: the pinned Neon owner (frozenCopyNeonConnection) and the pinned Supabase owner. */
+export function frozenCopyCredentials(doc: Record<string, unknown>, mode: FrozenCopyMode): { neon: OwnerConnection; owner: OwnerConnection | null } {
+  const neon = frozenCopyNeonConnection(doc.neonOwnerUrl);
+  if (mode === "plan" && doc.supabaseOwnerUrl === undefined) return { neon, owner: null };
   if (doc.supabaseOwnerUrl === undefined) throw new CredentialRefusal("credentials_missing_key.supabaseOwnerUrl");
-  return { neonOwnerUrl, owner: frozenCopyOwnerConnection(doc.supabaseOwnerUrl) };
+  return { neon, owner: frozenCopyOwnerConnection(doc.supabaseOwnerUrl) };
+}
+
+export const FROZEN_COPY_NEON_APPLICATION_NAME = "p1-frozen-copy-readonly";
+
+/** Discrete Neon client config (never a connectionString, so no URL parameter can override it): TLS verified. */
+export function frozenCopyNeonClientConfig(c: OwnerConnection) {
+  return {
+    host: c.host,
+    port: c.port,
+    database: c.database,
+    user: c.user,
+    password: c.password,
+    ssl: { rejectUnauthorized: true as const },
+    application_name: FROZEN_COPY_NEON_APPLICATION_NAME,
+    statement_timeout: 30000,
+  };
 }
 
 export const FROZEN_COPY_APPLICATION_NAME = "p1-frozen-copy";
@@ -387,6 +445,9 @@ export const FENCED_TABLES = [
   "sessions.ingest_frozen_source_deletions",
   "sessions.ingest_frozen_source_resets",
   "sessions.ingest_frozen_source_records",
+  // Receipt parity is sealed too: the receipts guard trigger ships with the progress table (migration
+  // 20261105047030_frozen_copy_progress); until it is applied the seal refuses frozen_copy_fence_unavailable.
+  "sessions.ingest_frozen_source_receipts",
 ] as const;
 /** Each fenced table must carry an enabled guard trigger whose function takes exactly the key the sealer holds. */
 export const FENCE_GUARD_CHECK = `SELECT count(DISTINCT t.tgrelid)::int AS n FROM pg_trigger t JOIN pg_proc p ON p.oid=t.tgfoid
@@ -426,16 +487,22 @@ export interface SealResult {
  *   4. Neon BEGIN REPEATABLE READ READ ONLY: phase active, privacy rows and heads (one snapshot);
  *   5. Supabase privacy rows, heads and policy; policy == descriptor == pre-read; fenceRefusal;
  *   6. org seals + completeness; Neon ROLLBACK (read only); Supabase COMMIT.
+ * deps.supervisor must be a minted SupervisorProof for action seal (frozen-source-copy-supervisor.ts): without it the
+ * fence refuses before the lock (frozen_copy_supervisor_missing); its epoch/privacy must equal the live policy and its
+ * approved MANIFEST the in-fence manifest (frozen_copy_supervisor_mismatch, rolled back).
  * Any refusal or error: ROLLBACK both, release the key, throw. A serialization failure is a refusal, not a retry.
  */
 export async function sealFence(
   neon: Queryable,
   supa: Queryable,
   input: { orgs: OrgVerification[]; pre: PreRead },
-  deps: { requireOwner?: (c: Queryable) => Promise<void>; budget?: () => void } = {},
+  deps: { requireOwner?: (c: Queryable) => Promise<void>; budget?: () => void; supervisor?: unknown } = {},
 ): Promise<SealResult> {
   const requireOwner = deps.requireOwner ?? requireFrozenCopyOwner;
   const budget = deps.budget ?? (() => {});
+  const unsupervised = supervisorProofRefusal(deps.supervisor, "seal");
+  if (unsupervised) throw unsupervised;
+  const proof = deps.supervisor as SupervisorProof;
   let locked = false, neonOpen = false;
   try {
     budget();
@@ -457,7 +524,9 @@ export async function sealFence(
     const conv = fenceRefusal(input.pre, n, sp);
     if (conv) refuse(conv);
 
+    if (proof.epoch !== policy!.control_epoch || proof.privacy !== policy!.privacy_baseline_sha256) refuse("frozen_copy_supervisor_mismatch", { check: "binding" });
     const m = buildManifest(input.orgs, sp);
+    if (proof.manifest !== m.sha256) refuse("frozen_copy_supervisor_mismatch", { check: "manifest" });
     for (const o of input.orgs) {
       const p = m.orgPrivacy.get(o.org)!;
       await supa.query(ORG_SEAL, [o.org, String(o.records.n), String(o.records.sum), String(p.n), String(p.sum)]);

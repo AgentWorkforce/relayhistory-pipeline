@@ -10,8 +10,10 @@ import { SESSION_BOOTSTRAP_FILES } from "../../hoopdb/session-bootstrap-chain.ts
 import { migrationFiles } from "../../session-ingest/__tests__/pglite-schema.ts";
 import {
   AUTHORITY_LOCK, FENCE_GUARD_CHECK, FENCED_TABLES, FrozenCopyUnknownCommit, MANIFEST_VERSION, NEON_CONTROL_HEADS, NEON_DELETIONS, NEON_RESETS,
-  addDigest, emptyDigest, jobBudget, preRead, sealFence, type OrgVerification, type Queryable,
+  addDigest, buildManifest, emptyDigest, jobBudget, preRead, sealFence, type OrgVerification, type PreRead, type Queryable,
 } from "../frozen-source-copy-seal.ts";
+import type { SupervisorProof } from "../frozen-source-copy-supervisor.ts";
+import { mintSupervisorProof } from "./fixtures/frozen-copy-supervisor.ts";
 import { jobReceipt, reconcileInDoubt } from "../frozen-source-copy-progress.ts";
 import { testEnvelope } from "./fixtures/frozen-copy-envelope.ts";
 
@@ -49,13 +51,19 @@ function fakeNeon(state: { status: Row; deletions: Row[]; resets: Row[]; heads: 
   return neon;
 }
 
-async function fixture() {
+/** Same form as the landed guards (20261105041000 lines 115-124); ships with 20261105047030_frozen_copy_progress. */
+const RECEIPTS_GUARD = `CREATE TRIGGER ingest_privacy_authority_guard BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sessions.ingest_frozen_source_receipts
+ FOR EACH STATEMENT EXECUTE FUNCTION sessions.ingest_privacy_authority_guard();`;
+
+async function fixture(opts: { receiptsGuard?: boolean } = {}) {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(() => db.close());
   const read = (p: string) => readFileSync(join(root, p), "utf8");
   await db.exec(read("supabase/tests/supabase_shim.sql"));
   for (const f of SESSION_BOOTSTRAP_FILES) await db.exec(read(f));
   for (const f of migrationFiles(root)) await db.exec(read("supabase/migrations/" + f));
+  if (opts.receiptsGuard !== false && !(await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname='ingest_privacy_authority_guard' AND tgrelid='sessions.ingest_frozen_source_receipts'::regclass")).rows[0]!.n)
+    await db.exec(RECEIPTS_GUARD);
   await db.exec(`CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','${generation}','pass')`);
   await db.query("SELECT sessions.ingest_lazy_policy_set($1::jsonb)", [
     JSON.stringify({ baselineMode: "lazy-current", generation, sourceIdentitySha256: identity, controlEpoch: epoch, privacyBaselineSha256: baseline, retentionContractSha256: "b".repeat(64), sourceProofSha256: D, validUntil: new Date(Date.now() + 3600000).toISOString(), issuer: "relayhistory-cloud" }),
@@ -101,7 +109,20 @@ async function fixture() {
     orgSeals: (await db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.ingest_frozen_source_org_seals")).rows[0]!.n,
   });
   const noOwnerCheck = { requireOwner: async () => {} }; // PGlite's user is a superuser; identity is tested in the pure suite
-  return { db, neon, neonState, supa, log, before, setCommit: (f: typeof commit) => void (commit = f), orgs, seals, noOwnerCheck };
+  // The supervisor proof the protected workflow's seal job would hold: minted through verifySupervisor (fake GitHub),
+  // approving the manifest this pre-read state yields. Minted up front so a test's state mutations cannot change it.
+  const proofs = new Map<PreRead, SupervisorProof>();
+  const mint = async (pre: PreRead) => {
+    proofs.set(pre, await mintSupervisorProof("seal", { manifest: buildManifest(orgs, pre.supa).sha256, epoch, privacy: baseline }));
+    return pre;
+  };
+  const preReadSupervised = async () => mint(await preRead(neon, supa));
+  const deps = (pre: PreRead) => ({ ...noOwnerCheck, supervisor: proofs.get(pre) });
+  const args = async () => {
+    const pre = await preReadSupervised();
+    return [{ orgs, pre }, deps(pre)] as const;
+  };
+  return { db, neon, neonState, supa, log, before, setCommit: (f: typeof commit) => void (commit = f), orgs, seals, noOwnerCheck, deps, args, preRead: preReadSupervised };
 }
 const refusal = async (p: Promise<unknown>) => {
   try {
@@ -117,10 +138,68 @@ test("the landed guard covers exactly the fenced tables with the sealer's key", 
   expect((await f.db.query<{ n: number }>(FENCE_GUARD_CHECK)).rows[0]!.n).toBe(FENCED_TABLES.length);
 });
 
+test("receipts are fenced: without the receipts guard trigger the seal refuses frozen_copy_fence_unavailable, no seal row", async () => {
+  expect(FENCED_TABLES).toContain("sessions.ingest_frozen_source_receipts");
+  const f = await fixture({ receiptsGuard: false });
+  expect((await f.db.query<{ n: number }>(FENCE_GUARD_CHECK)).rows[0]!.n).toBe(FENCED_TABLES.length - 1);
+  const pre = await f.preRead();
+  expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.deps(pre)))).toBe("frozen_copy_fence_unavailable");
+  expect(f.log).not.toContain("COMMIT");
+  expect(await f.seals()).toEqual({ completeness: 0, orgSeals: 0 });
+});
+
+// Supervisor (causal): SEALED is impossible without a minted proof for exactly this seal; each forgery refuses, no seal row.
+test("no supervisor proof: refuses frozen_copy_supervisor_missing before the authority lock, no seal row", async () => {
+  const f = await fixture();
+  const pre = await f.preRead();
+  const before = f.log.length;
+  expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.noOwnerCheck))).toBe("frozen_copy_supervisor_missing");
+  expect(f.log.slice(before)).toEqual([]); // not even the lock
+  expect(await f.seals()).toEqual({ completeness: 0, orgSeals: 0 });
+});
+test("a hand-built or copied proof is rejected (only verifySupervisor mints one)", async () => {
+  const f = await fixture();
+  const pre = await f.preRead();
+  const real = f.deps(pre).supervisor!;
+  const forged = [
+    { ...real },
+    Object.assign(Object.create(Object.getPrototypeOf(real)), real),
+    JSON.parse(JSON.stringify(real)),
+    { action: "seal", manifest: real.manifest, epoch, privacy: baseline, block: real.block, [Symbol("frozen-copy-supervisor-proof")]: true },
+  ];
+  for (const supervisor of forged)
+    expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, { ...f.noOwnerCheck, supervisor }))).toBe("frozen_copy_supervisor_missing");
+  expect(f.log).not.toContain("SELECT pg_advisory_lock($1,$2)");
+  expect(await f.seals()).toEqual({ completeness: 0, orgSeals: 0 });
+});
+test("a proof for another action (copy / readback) refuses mismatch", async () => {
+  const f = await fixture();
+  const pre = await f.preRead();
+  for (const action of ["copy", "readback"] as const)
+    expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, { ...f.noOwnerCheck, supervisor: await mintSupervisorProof(action, { epoch, privacy: baseline }) }))).toBe("frozen_copy_supervisor_mismatch");
+  expect(await f.seals()).toEqual({ completeness: 0, orgSeals: 0 });
+});
+for (const [name, o] of [
+  ["an approved manifest that is not the in-fence manifest", { manifest: "e".repeat(64), epoch, privacy: baseline }],
+  ["a proof for another epoch", { manifest: null, epoch: "4".repeat(64), privacy: baseline }],
+  ["a proof for another privacy baseline", { manifest: null, epoch, privacy: "5".repeat(64) }],
+] as const)
+  test(`${name}: refuses frozen_copy_supervisor_mismatch inside the fence, rolled back, no seal row`, async () => {
+    const f = await fixture();
+    const pre = await f.preRead();
+    const manifest = o.manifest ?? buildManifest(f.orgs, pre.supa).sha256;
+    const supervisor = await mintSupervisorProof("seal", { ...o, manifest });
+    expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, { ...f.noOwnerCheck, supervisor }))).toBe("frozen_copy_supervisor_mismatch");
+    expect(f.log).toContain("ROLLBACK");
+    expect(f.log).not.toContain("COMMIT");
+    expect(f.log.at(-1)).toBe("SELECT pg_advisory_unlock($1,$2)");
+    expect(await f.seals()).toEqual({ completeness: 0, orgSeals: 0 });
+  });
+
 test("success: one transaction writes org seals (privacy = deletions + resets) and a completeness row whose manifest lists resets", async () => {
   const f = await fixture();
-  const pre = await preRead(f.neon, f.supa);
-  const r = await sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.noOwnerCheck);
+  const pre = await f.preRead();
+  const r = await sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.deps(pre));
   expect(r).toMatchObject({ inserted: true, orgs: 2, records: "3", deletions: "1", resets: "2", controlHeads: "1" });
   const c = (await f.db.query<any>("SELECT * FROM sessions.ingest_frozen_source_completeness")).rows[0];
   expect(c).toMatchObject({ source_identity_sha256: identity, control_epoch: epoch, privacy_baseline_sha256: baseline, manifest_sha256: r.manifestSha256 });
@@ -137,7 +216,7 @@ test("success: one transaction writes org seals (privacy = deletions + resets) a
   expect(f.neon.log.filter((s) => s.startsWith("BEGIN")).length).toBe(f.neon.log.filter((s) => s === "ROLLBACK").length);
   expect((await f.db.query<{ n: number }>("SELECT count(*)::int n FROM pg_locks WHERE locktype='advisory'")).rows[0]!.n).toBe(0);
   // Rerun with the same manifest is idempotent; the completeness row is not rewritten.
-  const again = await sealFence(f.neon, f.supa, { orgs: f.orgs, pre: await preRead(f.neon, f.supa) }, f.noOwnerCheck);
+  const again = await sealFence(f.neon, f.supa, ...(await f.args()));
   expect(again).toMatchObject({ inserted: false, manifestSha256: r.manifestSha256 });
 });
 
@@ -147,7 +226,7 @@ test("the exclusive authority key is held for the whole fence (a guarded writer 
   f.before.push(async (sql) => {
     if (sql === "COMMIT") heldAtCommit = (await f.db.query<{ n: number }>("SELECT count(*)::int n FROM pg_locks WHERE locktype='advisory' AND mode='ExclusiveLock' AND classid=$1 AND objid=$2", [AUTHORITY_LOCK[0], AUTHORITY_LOCK[1]])).rows[0]!.n;
   });
-  await sealFence(f.neon, f.supa, { orgs: f.orgs, pre: await preRead(f.neon, f.supa) }, f.noOwnerCheck);
+  await sealFence(f.neon, f.supa, ...(await f.args()));
   expect(heldAtCommit).toBe(1);
 });
 
@@ -166,22 +245,22 @@ for (const [name, mutate, codeWanted] of [
 
 test("a reset row changed AFTER the pre-read is caught inside the fence (rollback, no seal row)", async () => {
   const f = await fixture();
-  const pre = await preRead(f.neon, f.supa);
+  const pre = await f.preRead();
   await f.db.exec("UPDATE sessions.ingest_frozen_source_resets SET deleted=5 WHERE request_id='req-2'");
-  expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.noOwnerCheck))).toBe("frozen_copy_reset_changed");
+  expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.deps(pre)))).toBe("frozen_copy_reset_changed");
   expect(await f.seals()).toEqual({ completeness: 0, orgSeals: 0 });
 });
 
 test("mirror advance between the pre-read and the in-transaction read: frozen_copy_mirror_advanced, ROLLBACK, no seal", async () => {
   const f = await fixture();
-  const pre = await preRead(f.neon, f.supa);
+  const pre = await f.preRead();
   // A mirror writer commits a new control head just before the fence takes the key.
   f.before.push(async (sql) => {
     if (sql === "SELECT pg_advisory_lock($1,$2)")
       await f.db.exec(`INSERT INTO sessions.ingest_source_control_heads(org_id,workspace_id,user_id,epoch,version,digest,kind,payload,pending)
         VALUES('org-b','ws','u2','${epoch}',1,'${D}','selection','{}',true)`);
   });
-  expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.noOwnerCheck))).toBe("frozen_copy_mirror_advanced");
+  expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.deps(pre)))).toBe("frozen_copy_mirror_advanced");
   expect(f.log).toContain("ROLLBACK");
   expect(f.log).not.toContain("COMMIT");
   expect(await f.seals()).toEqual({ completeness: 0, orgSeals: 0 });
@@ -189,27 +268,27 @@ test("mirror advance between the pre-read and the in-transaction read: frozen_co
 
 test("a mirror head version bump (same user) is also an advance", async () => {
   const f = await fixture();
-  const pre = await preRead(f.neon, f.supa);
+  const pre = await f.preRead();
   await f.db.exec("UPDATE sessions.ingest_source_control_heads SET version=2");
-  expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.noOwnerCheck))).toBe("frozen_copy_mirror_advanced");
+  expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.deps(pre)))).toBe("frozen_copy_mirror_advanced");
   expect(await f.seals()).toEqual({ completeness: 0, orgSeals: 0 });
 });
 
 test("Neon advancing after the pre-read (heads move on both sides in lockstep) still refuses", async () => {
   const f = await fixture();
-  const pre = await preRead(f.neon, f.supa);
+  const pre = await f.preRead();
   f.neonState.heads = [{ ...f.neonState.heads[0]!, v: "2" }];
   await f.db.exec("UPDATE sessions.ingest_source_control_heads SET version=2");
-  expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.noOwnerCheck))).toBe("frozen_copy_mirror_advanced");
+  expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.deps(pre)))).toBe("frozen_copy_mirror_advanced");
   expect(await f.seals()).toEqual({ completeness: 0, orgSeals: 0 });
 });
 
 test("Neon privacy advancing after the pre-read (both sides agree, but not with the pre-read) refuses", async () => {
   const f = await fixture();
-  const pre = await preRead(f.neon, f.supa);
+  const pre = await f.preRead();
   f.neonState.resets = [...f.neonState.resets, { org_id: "org-b", workspace_id: "ws", user_id: "u2", request_id: "req-3", deleted: "1" }];
   await f.db.exec("INSERT INTO sessions.ingest_frozen_source_resets VALUES('org-b','ws','u2','req-3',1)");
-  expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.noOwnerCheck))).toBe("frozen_copy_privacy_advanced");
+  expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.deps(pre)))).toBe("frozen_copy_privacy_advanced");
   expect(await f.seals()).toEqual({ completeness: 0, orgSeals: 0 });
 });
 
@@ -233,30 +312,30 @@ for (const [name, change, codeWanted] of [
 ] as const)
   test(`epoch/baseline/identity are checked in the same transaction: ${name}`, async () => {
     const f = await fixture();
-    const pre = await preRead(f.neon, f.supa);
+    const pre = await f.preRead();
     await change(f);
-    expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.noOwnerCheck))).toBe(codeWanted);
+    expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.deps(pre)))).toBe(codeWanted);
     expect(await f.seals()).toEqual({ completeness: 0, orgSeals: 0 });
   });
 
 test("authority already active refuses before any read", async () => {
   const f = await fixture();
-  const pre = await preRead(f.neon, f.supa);
+  const pre = await f.preRead();
   await f.db.query("INSERT INTO sessions.ingest_privacy_authority(state,control_epoch,neon_fingerprint_sha256,activated_at) VALUES('active',$1,$2,now())", [epoch, D]);
-  expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.noOwnerCheck))).toBe("frozen_copy_privacy_authority_active");
+  expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.deps(pre)))).toBe("frozen_copy_privacy_authority_active");
   expect(f.neon.log.filter((s) => s.startsWith("BEGIN")).length).toBe(1); // only the pre-read's snapshot
   expect(await f.seals()).toEqual({ completeness: 0, orgSeals: 0 });
 });
 
 test("serialization failure at COMMIT: refusal, ROLLBACK, no retry, no seal row, key released", async () => {
   const f = await fixture();
-  const pre = await preRead(f.neon, f.supa);
+  const pre = await f.preRead();
   let commits = 0;
   f.setCommit(async () => {
     commits++;
     throw Object.assign(new Error("could not serialize access due to read/write dependencies among transactions"), { code: "40001" });
   });
-  expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.noOwnerCheck))).toBe("frozen_copy_serialization_failure");
+  expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.deps(pre)))).toBe("frozen_copy_serialization_failure");
   expect(commits).toBe(1);
   expect(f.log.slice(f.log.indexOf("COMMIT"))).toEqual(["COMMIT", "ROLLBACK", "SELECT pg_advisory_unlock($1,$2)"]);
   expect(await f.seals()).toEqual({ completeness: 0, orgSeals: 0 });
@@ -265,7 +344,7 @@ test("serialization failure at COMMIT: refusal, ROLLBACK, no retry, no seal row,
 
 test("budget exhausted at the last check before COMMIT: refused receipt, ROLLBACK, no seal row", async () => {
   const f = await fixture();
-  const pre = await preRead(f.neon, f.supa);
+  const pre = await f.preRead();
   let t = 0;
   const budget = jobBudget(100, () => t);
   f.before.push((sql) => {
@@ -273,7 +352,7 @@ test("budget exhausted at the last check before COMMIT: refused receipt, ROLLBAC
   });
   let error: unknown;
   try {
-    await sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, { ...f.noOwnerCheck, budget: budget.check });
+    await sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, { ...f.deps(pre), budget: budget.check });
   } catch (e) {
     error = e;
   }
@@ -289,14 +368,14 @@ test("budget exhausted at the last check before COMMIT: refused receipt, ROLLBAC
 
 test("unknown commit: COMMIT reached the server but the answer was lost; the receipt says unknown-commit and the seal exists", async () => {
   const f = await fixture();
-  const pre = await preRead(f.neon, f.supa);
+  const pre = await f.preRead();
   f.setCommit(async (run) => {
     await run();
     throw new Error("Connection terminated unexpectedly");
   });
   let error: unknown;
   try {
-    await sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.noOwnerCheck);
+    await sealFence(f.neon, f.supa, { orgs: f.orgs, pre }, f.deps(pre));
   } catch (e) {
     error = e;
   }
@@ -320,6 +399,6 @@ test("unknown commit: COMMIT reached the server but the answer was lost; the rec
 test("an existing completeness row for a different manifest refuses (evidence is immutable)", async () => {
   const f = await fixture();
   await f.db.query("INSERT INTO sessions.ingest_frozen_source_completeness(source_identity_sha256,control_epoch,privacy_baseline_sha256,org_count,record_rows,manifest_sha256,neon_snapshot) VALUES($1,$2,$3,0,0,$4,'{}')", [identity, epoch, baseline, "e".repeat(64)]);
-  expect(await refusal(sealFence(f.neon, f.supa, { orgs: f.orgs, pre: await preRead(f.neon, f.supa) }, f.noOwnerCheck))).toBe("frozen_copy_completeness_conflict");
+  expect(await refusal(sealFence(f.neon, f.supa, ...(await f.args())))).toBe("frozen_copy_completeness_conflict");
   expect((await f.seals()).orgSeals).toBe(0);
 });

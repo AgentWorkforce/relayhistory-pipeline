@@ -4,6 +4,8 @@ import { writeSync } from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { FROZEN_COPY_TEST_OWNER_PASSWORD } from "./frozen-copy-owner-url.ts";
 import { PROGRESS_COLUMNS } from "../../frozen-source-copy-progress.ts";
+import { FIXTURE_POLICY, fakeGithub } from "./frozen-copy-supervisor.ts";
+export { FIXTURE_POLICY };
 const cp = createRequire(import.meta.url)("node:child_process");
 let processCalls=0, neoCreated=0, targetCreated=0, targetClosed=0, identityChecks=0, ownershipLocks=0;
 let closedWhileWorkersActive=false;
@@ -12,15 +14,23 @@ const clients: FakeClient[] = [], records: string[] = [], targetConfigs: any[] =
 const checkpoints = new Map<string, any>();
 for (const k of ["execFileSync","execSync","spawnSync","execFile","exec","spawn"]) cp[k] = () => { processCalls++; throw Error("unexpected_process_refused"); };
 syncBuiltinESMExports();
-globalThis.fetch = async () => { throw Error("network_refused_in_copy_fixture"); };
 const env = process.env;
+// No network. FROZEN_COPY_TEST_GITHUB=1 serves the synthetic GitHub API of the custody workflow (fixtures/frozen-copy-supervisor.ts);
+// FROZEN_COPY_TEST_GITHUB_FORGE=<route> drops that route's body (an unqualified answer).
+globalThis.fetch = (async (url: string | URL) => {
+  const u = String(url), api = "https://api.github.com";
+  if (env.FROZEN_COPY_TEST_GITHUB !== "1" || !u.startsWith(api)) throw Error("network_refused_in_copy_fixture");
+  const forge = env.FROZEN_COPY_TEST_GITHUB_FORGE ? { [env.FROZEN_COPY_TEST_GITHUB_FORGE]: () => ({}) } : {};
+  try { return Response.json(await fakeGithub(forge, (env.CUSTODY_MODE ?? "copy") as "copy")(u.slice(api.length))); }
+  catch { return new Response("{}", { status: 404 }); }
+}) as typeof fetch;
 const H = (c: string) => c.repeat(64);
-export const FIXTURE_POLICY = { generation: H("c"), source_identity_sha256: H("d"), control_epoch: H("a"), privacy_baseline_sha256: H("b") };
 class FakeClient {
   target: boolean; neoIndex=0; ended=false; cfg: any;
   tx: { records: string[]; checkpoints: Map<string, any> } | null = null;
   constructor(cfg: any) {
-    this.cfg=cfg;this.target=!!cfg.host;
+    this.cfg=cfg;this.target=cfg.application_name!=="p1-frozen-copy-readonly";
+    if(!this.target && ("connectionString" in cfg || cfg.password!=="synthetic-not-authorized" || cfg.ssl?.rejectUnauthorized!==true)) throw Error("neon_client_config_refused_in_fixture");
     if(this.target) { targetCreated++; targetConfigs.push({...cfg,password:cfg.password===FROZEN_COPY_TEST_OWNER_PASSWORD?"<synthetic>":"<other>"}); }
     else this.neoIndex=++neoCreated;
     clients.push(this);

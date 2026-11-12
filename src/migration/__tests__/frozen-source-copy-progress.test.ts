@@ -8,6 +8,8 @@ import {
   jobReceipt, operatorSha256, progressTracker, reconcileInDoubt, requireProgressTable, requireResumeBinding, serialQueue, takeCopyOwnership, type CopyBinding,
 } from "../frozen-source-copy-progress.ts";
 import { testEnvelope } from "./fixtures/frozen-copy-envelope.ts";
+import { mintSupervisorProof } from "./fixtures/frozen-copy-supervisor.ts";
+import { FROZEN_COPY_CREDENTIAL_PRODUCER } from "../frozen-source-copy-supervisor.ts";
 
 const B: CopyBinding = { generation: "a".repeat(64), sourceIdentitySha256: "c".repeat(64), controlEpoch: "3".repeat(64), privacyBaselineSha256: "b".repeat(64), operatorSha256: "0".repeat(64) };
 const answer = (rows: unknown[]): Queryable => ({ query: async () => ({ rows }) as never });
@@ -173,17 +175,22 @@ test("classifyJobOutcome: aborted, refused, unknown-commit, SQLSTATE and unclass
   expect(classifyJobOutcome(new Error("password=hunter2"))).toEqual({ outcome: "refused", code: "frozen_copy_job_failed" });
 });
 
-test("jobReceipt v2: statuses, budget/abort/unknown-commit blocks, and no org id, raw key or error text", () => {
+test("jobReceipt v3: statuses, budget/abort/unknown-commit/supervisor blocks, and no org id, raw key or error text", async () => {
   const p = progressTracker(2);
   p.bind(B);
   p.page("records", { cursor: ["ws-secret", "origin-secret", "rec-secret"], pageSeq: 1, rows: 3, status: "in_progress", updatedAt: "2026-01-01 00:00:00+00" }, 3);
   const env = testEnvelope({ progress: p.state });
-  const copied = jobReceipt("copy", undefined, env);
-  expect(copied).toMatchObject({ receipt: "frozen-source-copy-job-v2", status: "COPIED", outcome: "pass", code: null });
+  const copyProof = await mintSupervisorProof("copy");
+  // COPIED needs the supervisor proof for exactly this action.
+  expect(jobReceipt("copy", undefined, env)).toMatchObject({ status: "REFUSED", code: "frozen_copy_supervisor_missing", supervisor: null });
+  expect(jobReceipt("copy", undefined, env, null, { supervisor: { ...copyProof } })).toMatchObject({ status: "REFUSED", code: "frozen_copy_supervisor_missing" });
+  expect(jobReceipt("copy", undefined, env, null, { supervisor: await mintSupervisorProof("readback") })).toMatchObject({ status: "REFUSED", code: "frozen_copy_supervisor_mismatch" });
+  const copied = jobReceipt("copy", undefined, env, null, { supervisor: copyProof });
+  expect(copied).toMatchObject({ receipt: "frozen-source-copy-job-v3", status: "COPIED", outcome: "pass", code: null, supervisor: { ...copyProof.block } });
   expect(copied.progress).toMatchObject({ schemaVersion: 1, stateTable: PROGRESS_TABLE, bindingSha: bindingSha(B), pages: 1, rows: 3, totalOrgs: 2 });
   expect(copied.progress.cursorSha256).toMatch(/^[0-9a-f]{64}$/);
   expect(copied.unknownCommit).toMatchObject({ detected: false, reconciliation: "NOT_REQUIRED", noBlindRetry: true });
-  expect(Object.keys(copied.budget).sort()).toEqual(["concurrency", "deadline", "elapsedWallMs", "exceeded", "lockTimeoutMs", "maxPageMs", "maxWallMs", "pageSizes", "statementTimeoutMs"]);
+  expect(Object.keys(copied.budget).sort()).toEqual(["concurrency", "deadline", "elapsedWallMs", "exceeded", "lockTimeoutMs", "maxPageMs", "maxPages", "maxWallMs", "pageSizes", "statementTimeoutMs"]);
   expect(Object.keys(copied.abort).sort()).toEqual(["boundedReason", "completedAt", "inFlightResolved", "observed", "requested", "requestedAt", "sourceClosed", "targetClosed", "writesStopped"]);
 
   const aborted = jobReceipt("copy", new FrozenCopyRefusal("frozen_copy_aborted", { org: "org-secret" }), testEnvelope({ progress: { ...p.state, inFlight: 0 }, abort: { requested: true, observed: true, reason: "SIGTERM", requestedAt: 0, completedAt: 1, sourceClosed: true, targetClosed: true, writesStopped: true } }));
@@ -202,12 +209,24 @@ test("jobReceipt v2: statuses, budget/abort/unknown-commit blocks, and no org id
   const resolved = jobReceipt("copy", doubt, testEnvelope({ reconciliation: { result: "COMMITTED", readbackAt: 5 } }));
   expect(resolved.unknownCommit.resolvedAt).toBe(new Date(5).toISOString());
 
-  // A seal "pass" without a committed manifest is never SEALED.
-  expect(jobReceipt("seal", undefined, env, null)).toMatchObject({ status: "REFUSED", outcome: "refused", code: "frozen_copy_seal_missing" });
-  const sealed = jobReceipt("seal", undefined, env, { manifestSha256: "m".repeat(64), inserted: true, orgs: 2, records: "3", deletions: "0", resets: "1", controlHeads: "0" });
-  expect(sealed.status).toBe("SEALED");
+  // A seal "pass" without a committed manifest, or without the seal proof, is never SEALED.
+  const sealProof = await mintSupervisorProof("seal", { manifest: "e".repeat(64) });
+  expect(jobReceipt("seal", undefined, env, null, { supervisor: sealProof })).toMatchObject({ status: "REFUSED", outcome: "refused", code: "frozen_copy_seal_missing" });
+  const seal = { manifestSha256: "e".repeat(64), inserted: true, orgs: 2, records: "3", deletions: "0", resets: "1", controlHeads: "0" };
+  expect(jobReceipt("seal", undefined, env, seal)).toMatchObject({ status: "REFUSED", code: "frozen_copy_supervisor_missing" });
+  expect(jobReceipt("seal", undefined, env, seal, { supervisor: copyProof })).toMatchObject({ status: "REFUSED", code: "frozen_copy_supervisor_mismatch" });
+  const sealed = jobReceipt("seal", undefined, env, seal, { supervisor: sealProof });
+  expect(sealed).toMatchObject({ status: "SEALED", supervisor: { action: "seal" } });
+  // A readback "pass" needs its manifest and the readback proof; VERIFIED names the manifest the seal approval must carry.
+  const readbackProof = await mintSupervisorProof("readback");
+  expect(jobReceipt("readback", undefined, env, null, { supervisor: readbackProof })).toMatchObject({ status: "REFUSED", code: "frozen_copy_readback_missing" });
+  const verified = jobReceipt("readback", undefined, env, null, { supervisor: readbackProof, readback: { manifestSha256: "e".repeat(64), orgs: 2 } });
+  expect(verified).toMatchObject({ status: "VERIFIED", readback: { manifestSha256: "e".repeat(64), orgs: 2 }, supervisor: { action: "readback" } });
+  expect(verified.next).toContain("dispatch seal");
+  // A refusal still carries the attestation that was proven (or null).
+  expect(jobReceipt("copy", new FrozenCopyRefusal("frozen_copy_budget_exhausted"), env, null, { supervisor: copyProof }).supervisor).toEqual({ ...copyProof.block });
 
-  for (const r of [copied, aborted, budget, unknown, resolved, sealed]) {
+  for (const r of [copied, aborted, budget, unknown, resolved, sealed, verified]) {
     const text = JSON.stringify(r);
     for (const secret of ["org-secret", "ws-secret", "origin-secret", "rec-secret", "hunter2", "postgres"]) expect(text).not.toContain(secret);
   }
@@ -216,6 +235,7 @@ test("jobReceipt v2: statuses, budget/abort/unknown-commit blocks, and no org id
 test("the custody doc carries the proposed DDL verbatim and the required statements", () => {
   const doc = readFileSync(join(import.meta.dir, "../../../docs/p1-frozen-source-custody.md"), "utf8");
   expect(doc).toContain("```sql\n" + PROGRESS_TABLE_DDL + "\n```");
-  for (const s of ["No production run of this operator is authorized", "Rollback = no seal row", "not recomputed", "frozen_copy_mirror_advanced", "frozen_copy_progress_table_missing", "PR #558", "does not select or depend on it", "op read"])
+  for (const s of ["No production run of this operator is authorized", "Rollback = no seal row", "not recomputed", "frozen_copy_mirror_advanced", "frozen_copy_progress_table_missing", "PR #558", "does not select or depend on it",
+    "20261105047030_frozen_copy_progress", "frozen_copy_supervisor_unqualified", "Khaliq's actions only", "FROZEN_COPY_CREDENTIALS", FROZEN_COPY_CREDENTIAL_PRODUCER])
     expect(doc).toContain(s);
 });

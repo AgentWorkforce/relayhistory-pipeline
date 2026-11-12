@@ -5,7 +5,7 @@ import { SCHEMA_RELEASE } from "../../hoopdb/schema-release-contract.ts";
 import { SUPABASE_PROD_CA_2021 } from "../../session-pipeline/supabase-ca.ts";
 import {
   FrozenCopyRefusal, FrozenCopyUnknownCommit, MANIFEST_VERSION, SEAL_VERIFIED, addDigest, buildManifest,
-  emptyDigest, extraOrgRefusal, fenceRefusal, frozenCopyCredentials, frozenCopyCredentialKeys, frozenCopyOwnerClientConfig,
+  emptyDigest, extraOrgRefusal, fenceRefusal, frozenCopyCredentials, frozenCopyCredentialKeys, frozenCopyNeonClientConfig, frozenCopyNeonConnection, frozenCopyOwnerClientConfig,
   frozenCopyOwnerConnection, guardedWrite, jobBudget, orgParityRefusal, policyRefusal, privacyParityRefusal,
   privacySide, requireFrozenCopyOwner, resetParityRefusal, sealSnapshot, type Digest, type PreRead,
 } from "../frozen-source-copy-seal.ts";
@@ -71,6 +71,52 @@ test("the owner client verifies TLS against the pinned CA and pooler name, with 
   expect("connectionString" in cfg).toBe(false);
   expect(cfg.options).toBe("-c statement_timeout=60000 -c lock_timeout=5000");
   expect(cfg.options).not.toMatch(/role|session_authorization/i);
+});
+
+// The Neon owner URL with one part replaced (the synthetic fixture already carries the pinned endpoint label).
+const neonUrl = (f: (u: URL) => void) => {
+  const u = new URL(SYNTHETIC_NEON_URL);
+  f(u);
+  return u.toString();
+};
+test("Neon owner URL: sessionAffinityUrl rules, then the source pins (user, database, endpoint digest, options)", () => {
+  const ok = frozenCopyNeonConnection(SYNTHETIC_NEON_URL);
+  expect(ok).toEqual({ host: new URL(SYNTHETIC_NEON_URL).hostname, port: 5432, database: "neondb", user: "neondb_owner", password: "synthetic-not-authorized" });
+  expect(frozenCopyNeonConnection(neonUrl((u) => (u.search = "?sslmode=require&channel_binding=require"))).user).toBe("neondb_owner");
+  const cases: [string, unknown][] = [
+    ["neon_owner_url_password_required", neonUrl((u) => (u.password = ""))],
+    ["neon_owner_url_user_required", neonUrl((u) => ((u.username = ""), (u.password = "")))],
+    ["neon_owner_url_pooler", neonUrl((u) => (u.hostname = u.hostname.replace(/^([^.]+)\./, "$1-pooler.")))],
+    ["neon_owner_url_transaction_pooler", neonUrl((u) => (u.port = "6543"))],
+    ["neon_owner_url_transaction_pooler", neonUrl((u) => (u.search = "?pgbouncer=true"))],
+    ["neon_owner_url_host_required", neonUrl((u) => (u.search = "?host=/tmp"))],
+    ["neon_owner_url_user_refused", neonUrl((u) => (u.username = "neon_superuser"))],
+    ["neon_owner_url_endpoint_refused", neonUrl((u) => (u.hostname = "ep-other-endpoint.synthetic.invalid"))],
+    ["neon_owner_url_database_refused", neonUrl((u) => (u.pathname = "/postgres"))],
+    ["neon_owner_url_refused", neonUrl((u) => (u.port = "5433"))],
+    ["neon_owner_url_options_refused", neonUrl((u) => (u.search = "?sslmode=disable"))],
+    ["neon_owner_url_options_refused", neonUrl((u) => (u.search = "?options=-c%20role%3Dx"))],
+    ["credentials_invalid.neonOwnerUrl", 7],
+  ];
+  for (const [want, bad] of cases) expect(code(() => frozenCopyNeonConnection(bad))).toBe(want);
+  expect(code(() => frozenCopyCredentials({ neonOwnerUrl: neonUrl((u) => (u.password = "")) }, "plan"))).toBe("neon_owner_url_password_required");
+});
+
+test("the ~/.pgpass fallback is unreachable: an empty Neon password never reaches a client, and the config is discrete", () => {
+  // node-postgres reads ~/.pgpass only when the password is null/empty (client.js); both are refused before a Client.
+  let constructed = 0;
+  const FakeClient = function (this: unknown, _cfg: unknown) { constructed++; } as unknown as new (cfg: unknown) => unknown;
+  const connect = (url: string) => new FakeClient(frozenCopyNeonClientConfig(frozenCopyNeonConnection(url)));
+  for (const url of [neonUrl((u) => (u.password = "")), SYNTHETIC_NEON_URL.replace(/:[^:@]+@/, "@"), SYNTHETIC_NEON_URL.replace(/:[^:@]+@/, ":@")])
+    expect(code(() => connect(url))).toMatch(/^neon_owner_url_(password|user)_required$/);
+  expect(constructed).toBe(0);
+  const cfg = frozenCopyNeonClientConfig(frozenCopyNeonConnection(SYNTHETIC_NEON_URL));
+  expect("connectionString" in cfg).toBe(false);
+  expect(cfg.password.length).toBeGreaterThan(0);
+  expect(cfg.ssl).toEqual({ rejectUnauthorized: true });
+  const script = readFileSync(new URL("../../../scripts/frozen-source-copy.ts", import.meta.url), "utf8");
+  expect(script).not.toMatch(/connectionString|neondb_owner|ep-[a-z]/);
+  expect(script).toContain("new pg.Client(frozenCopyNeonClientConfig(");
 });
 
 const identityRow = { me: "postgres", session: "postgres", db: "postgres", rolcanlogin: true, rolsuper: false, rolcreaterole: true, rolcreatedb: true, rolbypassrls: true, rolreplication: true, schema_owner: "postgres" };

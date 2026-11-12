@@ -55,14 +55,14 @@ test("frozen sealer reads actual control-head SQL without collating positional i
 });
 
 
-for (const args of [["--seal", "--org", "subset"], ["--seal", "--org", ""], ["--seal", "--org"]]) {
+for (const args of [["--seal", "--org", "subset"], ["--seal", "--org", ""], ["--seal", "--org"], ["--readback", "--org", "subset"]]) {
   test("partial completeness seal refuses before reading credentials: " + JSON.stringify(args), () => {
     const script = fileURLToPath(new URL("../../../scripts/frozen-source-copy.ts", import.meta.url));
     const result = spawnSync(process.execPath, [script, ...args], {
       input: "not-json-not-a-credential", encoding: "utf8", env: { PATH: process.env.PATH },
     });
     expect(result.status).toBe(64);
-    expect(result.stderr).toContain("--seal requires the complete source");
+    expect(result.stderr).toContain(`${args[0]} requires the complete source`);
     expect(result.stdout).toBe("");
   });
 }
