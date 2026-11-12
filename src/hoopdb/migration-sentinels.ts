@@ -373,6 +373,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "function sessions.upload_consent_apply_v1 and table sessions.upload_consent_holds",
     sql: "SELECT to_regprocedure('sessions.upload_consent_apply_v1(text,text,text,jsonb,boolean,bigint)') IS NOT NULL AND to_regclass('sessions.upload_consent_holds') IS NOT NULL AS applied",
   },
+  "upstream:20261105057030_selfhost_erase_directory_membership.sql": {
+    evidence: "replacement: ingest_selfhost_set_session_uploads deletes the erased copy's directory membership rows",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)') AND prosecdef AND prosrc LIKE '%DELETE FROM sessions.session_directory_machines%') AS applied",
+  },
   "upstream:20261105047030_frozen_copy_progress.sql": {
     evidence: "table sessions.__96bulls_frozen_copy_progress and trigger ingest_privacy_authority_guard on sessions.ingest_frozen_source_receipts",
     sql: "SELECT to_regclass('sessions.__96bulls_frozen_copy_progress') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid=to_regclass('sessions.ingest_frozen_source_receipts') AND tgname='ingest_privacy_authority_guard' AND NOT tgisinternal) AS applied",

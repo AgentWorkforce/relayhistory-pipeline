@@ -163,6 +163,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105057000_session_directory_users_aggregate.sql",
       // Server-owned upload consent: four new owner-only tables and two ingest-role entry points; no G4 function names them.
       "20261105057010_upload_consent.sql",
+      // Replacement of the post-G4 self-host erase (043910, last 044070): it also deletes the erased copy's directory membership rows.
+      "20261105057030_selfhost_erase_directory_membership.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
