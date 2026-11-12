@@ -2394,6 +2394,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const SA = "upstream:20261105056000_session_summary_activity.sql";
     const DU = "upstream:20261105057000_session_directory_users_aggregate.sql";
     const UC = "upstream:20261105057010_upload_consent.sql";
+    const MB = "upstream:20261105057030_selfhost_erase_directory_membership.sql";
     const FP = "upstream:20261105047030_frozen_copy_progress.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
@@ -2401,7 +2402,7 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, FP]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2444,7 +2445,23 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect((await failure(rollback("20261105032000_session_large_read_routing_fixes.down.sql")))?.code).toBe("55000");
     expect(await relation("sessions.session_large_read_scope_errors")).toBe("sessions.session_large_read_scope_errors");
     await db.query("DELETE FROM sessions.__96bulls_migrations WHERE name = $1", [LATER]);
-    // 20261105057010 (upload consent) is the newest step: 057000's and 056000's downs refuse (55000) until its
+    // 20261105057030 (self-host erase directory membership, #566) is the newest step: 057010's down refuses (55000)
+    // until its checksum-pinned rollback restores 044070's exact erase body (SECURITY DEFINER kept) and removes its ledger row.
+    const eraseFn = async () =>
+      (await db.query<{ s: string; d: boolean }>("SELECT prosrc s, prosecdef d FROM pg_proc WHERE oid='sessions.ingest_selfhost_set_session_uploads(jsonb)'::regprocedure")).rows[0]!;
+    expect(await names()).toContain(MB);
+    expect((await eraseFn()).s).toContain("DELETE FROM sessions.session_directory_machines");
+    expect((await failure(rollback("20261105057010_upload_consent.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(UC);
+    await rollback("20261105057030_selfhost_erase_directory_membership.down.sql");
+    expect(await names()).not.toContain(MB);
+    const restored = await eraseFn();
+    expect(restored.d).toBe(true);
+    expect(restored.s).not.toContain("session_directory_machines");
+    expect(restored.s).toContain("session_directory_search_text(");
+    // Its ledger row is gone, so running it again refuses.
+    expect((await failure(rollback("20261105057030_selfhost_erase_directory_membership.down.sql")))?.code).toBe("55000");
+    // 20261105057010 (upload consent) is then the newest step: 057000's and 056000's downs refuse (55000) until its
     // checksum-pinned rollback removes its two entry points, four tables and ledger row.
     expect((await failure(rollback("20261105056000_session_summary_activity.down.sql")))?.code).toBe("55000");
     expect((await failure(rollback("20261105057000_session_directory_users_aggregate.down.sql")))?.code).toBe("55000");
