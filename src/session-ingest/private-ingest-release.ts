@@ -3,10 +3,11 @@
  *
  * The desired profile is tracked in the repository. The workflow materializes it into the
  * gitignored Alchemy input path, but no workflow input is allowed to alter the profile. The
- * three authorized rollout states are deliberately sequential: frozen custody in drain,
- * the synchronous frozen-receipt bridge in drain, then async admission on.
+ * custody shadow preparation and three rollout states are explicit: shadow in drain,
+ * frozen custody in drain, the synchronous frozen-receipt bridge in drain, then async on.
  */
 import { createHash } from "node:crypto";
+import { custodyEvidenceConfirmationSuffix } from "./private-ingest-custody-evidence.ts";
 import {
   ADMISSION_QUEUE,
   COMPATIBILITY_DATE,
@@ -30,6 +31,7 @@ export const PRIVATE_INGEST_RELEASE = {
   workflow: ".github/workflows/deploy-private-ingest-worker.yml",
   accountId: "f7232cb80f6fab86a95426302af243e4",
   worker: SESSION_INGEST_WORKER,
+  relayhistoryWorker: "relayhistory-api",
   approval: {
     by: "Khaliq Gant",
     directDate: "2026-11-11",
@@ -39,6 +41,7 @@ export const PRIVATE_INGEST_RELEASE = {
 
 export type PrivateIngestReleasePhase =
   | "baseline-drain"
+  | "step-0-shadow"
   | "step-1-custody"
   | "step-2-frozen-receipt"
   | "step-4-async-on";
@@ -57,7 +60,8 @@ export function privateIngestReleaseInputs(env: Record<string, string | undefine
   if (mode === "plan" && (confirmation || planRun))
     privateIngestRefuse("private_ingest_release_plan_confirmation");
   if (mode === "deploy" && (!/^[1-9][0-9]*$/u.test(planRun) ||
-      confirmation !== `DEPLOY ${PRIVATE_INGEST_RELEASE.worker} ${sha} PLAN ${planRun}`))
+      (confirmation !== `DEPLOY ${PRIVATE_INGEST_RELEASE.worker} ${sha} PLAN ${planRun}` &&
+       confirmation !== `DEPLOY ${PRIVATE_INGEST_RELEASE.worker} ${sha} PLAN ${planRun}${custodyEvidenceConfirmationSuffix()}`)))
     privateIngestRefuse("private_ingest_release_confirmation");
   return { mode, sha: sha!, planRun, confirmation } as const;
 }
@@ -83,7 +87,7 @@ export function privateIngestReleasePhase(input: CloudflareStageInputs): Private
   for (const [key, value] of Object.entries(COMMON_PROFILE))
     if (profile[key] !== value) privateIngestRefuse("private_ingest_profile_common");
   if (!KMS_ARN.test(String(profile.kmsKeyArn ?? "")) ||
-      (profile.custodySource !== undefined && profile.custodySource !== "frozen-supabase"))
+      (profile.custodySource !== undefined && profile.custodySource !== "shadow" && profile.custodySource !== "frozen-supabase"))
     privateIngestRefuse("private_ingest_profile_target");
   const allowed = new Set([
     ...Object.keys(COMMON_PROFILE),
@@ -96,8 +100,11 @@ export function privateIngestReleasePhase(input: CloudflareStageInputs): Private
     privateIngestRefuse("private_ingest_profile_extra");
   const asyncAdmission = profile.asyncAdmission,
     frozenReceipt = profile.syncAdmissionFrozenReceipt;
-  if (profile.custodySource === undefined && asyncAdmission === "drain" && frozenReceipt === undefined)
-    return "baseline-drain";
+  if (profile.custodySource === undefined || profile.custodySource === "shadow") {
+    if (asyncAdmission !== "drain" || frozenReceipt !== undefined)
+      privateIngestRefuse("private_ingest_profile_phase");
+    return profile.custodySource === "shadow" ? "step-0-shadow" : "baseline-drain";
+  }
   if (asyncAdmission === "drain" && frozenReceipt === undefined)
     return "step-1-custody";
   if (asyncAdmission === "drain" && frozenReceipt === "on")
@@ -259,16 +266,16 @@ export function privateIngestProfileForPhase(
   const sessionIngest: SessionIngestInputs = {
     ...COMMON_PROFILE,
     kmsKeyArn,
-    ...(phase === "baseline-drain" ? {} : { custodySource: "frozen-supabase" as const }),
+    ...(phase === "baseline-drain" ? {} : { custodySource: phase === "step-0-shadow" ? "shadow" as const : "frozen-supabase" as const }),
     asyncAdmission: phase === "step-4-async-on" ? "on" : "drain",
-    ...(phase === "baseline-drain" || phase === "step-1-custody"
-      ? {}
-      : { syncAdmissionFrozenReceipt: "on" as const }),
+    ...(phase === "step-2-frozen-receipt" || phase === "step-4-async-on"
+      ? { syncAdmissionFrozenReceipt: "on" as const }
+      : {}),
   };
   return { sessionIngest };
 }
 
-/** A forward step must be observed independently on the live 100% version; rollbacks unwind one step. */
+/** Each rollout or rollback requires an adjacent live phase, including custody shadow. */
 export function privateIngestTransitionReadback(
   input: CloudflareStageInputs,
   active: ReturnType<typeof privateIngestActiveVersion>,
@@ -277,6 +284,7 @@ export function privateIngestTransitionReadback(
   const to = privateIngestReleasePhase(input), kmsKeyArn = input.sessionIngest.kmsKeyArn;
   const candidates = [
     ["baseline-drain", privateIngestProfileForPhase("baseline-drain", kmsKeyArn)],
+    ["step-0-shadow", privateIngestProfileForPhase("step-0-shadow", kmsKeyArn)],
     ["step-1-custody", privateIngestProfileForPhase("step-1-custody", kmsKeyArn)],
     ["step-2-frozen-receipt", privateIngestProfileForPhase("step-2-frozen-receipt", kmsKeyArn)],
     ["step-4-async-on", privateIngestProfileForPhase("step-4-async-on", kmsKeyArn)],
@@ -288,8 +296,9 @@ export function privateIngestTransitionReadback(
   if (matches.length !== 1) privateIngestRefuse("private_ingest_live_phase");
   const from = matches[0]![0];
   const allowed: Record<PrivateIngestReleasePhase, readonly PrivateIngestTransitionReadback["from"][]> = {
-    "baseline-drain": ["baseline-drain", "step-1-custody"],
-    "step-1-custody": ["baseline-drain", "step-1-custody", "step-2-frozen-receipt"],
+    "baseline-drain": ["baseline-drain", "step-0-shadow"],
+    "step-0-shadow": ["baseline-drain", "step-0-shadow", "step-1-custody"],
+    "step-1-custody": ["step-0-shadow", "step-1-custody", "step-2-frozen-receipt"],
     "step-2-frozen-receipt": ["step-1-custody", "step-2-frozen-receipt", "step-4-async-on"],
     "step-4-async-on": ["step-2-frozen-receipt", "step-4-async-on"],
   };
