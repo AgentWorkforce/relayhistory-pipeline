@@ -2,7 +2,7 @@ name: ingest generation overlap window
 run-name: ingest overlap ${{ inputs.mode }} ${{ inputs.sha }}
 
 # CI-only operator for the DB half of a reviewed generation overlap (migration 20261105044030;
-# runbooks/private-ingest-production.md "Generation overlap"). The G -> H pair is the reviewed
+# docs/design/zero-503-schema-windows.md section 3.2). The G -> H pair is the reviewed
 # PRIVATE_INGEST_OVERLAP constant in src/session-ingest/private-ingest-release.ts, never an input;
 # while it is null every mode refuses. Nothing runs unless dispatched.
 on:

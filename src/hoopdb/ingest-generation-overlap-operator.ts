@@ -1,6 +1,6 @@
 /**
  * CI operator for the DB half of a reviewed generation overlap (migration 20261105044030;
- * docs/design/zero-503-schema-windows.md section 3.2; runbooks/private-ingest-production.md).
+ * docs/design/zero-503-schema-windows.md section 3.2).
  *
  * The pair is never a dispatch input: it is the reviewed PRIVATE_INGEST_OVERLAP constant in
  * src/session-ingest/private-ingest-release.ts, the same constant the ingest Worker deploy reads. A

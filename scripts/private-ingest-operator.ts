@@ -817,7 +817,7 @@ export function resourcePlanView(
  * The only two plans that may unbind INGEST_ACCEPT_GENERATIONS, both with no overlap in the tracked
  * profile and no accept set proposed:
  * - closure G+H -> H (unchanged): live expected G with accepted "G,H", proposed expected H;
- * - rollback G+H -> G (runbooks/private-ingest-production.md): only under a reviewed
+ * - rollback G+H -> G (docs/design/zero-503-schema-windows.md section 3.2): only under a reviewed
  *   PRIVATE_INGEST_OVERLAP {from: G, to: H} still bound at G, live expected G with accepted exactly
  *   "G,H", and proposed expected G. Dormant (null) keeps today's closure-only rule.
  */
