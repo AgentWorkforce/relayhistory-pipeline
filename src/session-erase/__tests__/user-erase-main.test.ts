@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { CONFIRMATION, parseUserEraseRequest, userErasePrefixes, UserEraseRefused } from "../user-erase.ts";
+import { CONFIRMATION, parseUserEraseRequest, runUserErase, USER_ERASE_LOCK_TIMEOUT_MS, USER_ERASE_STATEMENT_TIMEOUT_MS, userErasePrefixes, UserEraseRefused } from "../user-erase.ts";
 import { exitCodeForError, exitCodeForResult, runUserEraseMain, settleMs, userEraseEnabled } from "../user-erase-main.ts";
 import { liveMachineId } from "../../migration/neon-s3-erasure/live.ts";
 
@@ -54,5 +54,27 @@ describe("user-erase entry", () => {
     expect(exitCodeForError(Object.assign(new Error("published"), { code: "RH040" }))).toBe(2);
     expect(exitCodeForError(Object.assign(new Error("busy"), { code: "55000" }))).toBe(2);
     expect(exitCodeForError(new Error("network"))).toBe(4);
+  });
+  test("every call bounds its own transaction: SET LOCAL lock_timeout and statement_timeout right after BEGIN", async () => {
+    expect(USER_ERASE_LOCK_TIMEOUT_MS).toBe(30_000);
+    expect(USER_ERASE_STATEMENT_TIMEOUT_MS).toBe(900_000);
+    const seen: string[] = [];
+    const view = { state: "bytes_verified", origins: [], tokens_revoked: 0, deleted: {}, done: true };
+    const db = { query: async (text: string) => { seen.push(text); return { rows: text.startsWith("SELECT") ? [{ r: view }] : [] }; } };
+    const eraser = { eraseStep: async () => { throw new Error("no bytes phase expected"); } };
+    const r = await runUserErase(db, { requestId: "r", orgId: "o", workspaceId: "w", userId: "u" }, { keyRoot: "96bulls", eraser: eraser as never });
+    expect(r.state).toBe("bytes_verified");
+    expect(seen).toEqual([
+      "BEGIN ISOLATION LEVEL READ COMMITTED",
+      "SET LOCAL lock_timeout = 30000",
+      "SET LOCAL statement_timeout = 900000",
+      "SELECT sessions.operator_user_erase_begin($1,$2,$3,$4) AS r",
+      "COMMIT",
+    ]);
+    // A failed statement still rolls the transaction (and with it the SET LOCALs) back.
+    seen.length = 0;
+    const failing = { query: async (text: string) => { seen.push(text); if (text.startsWith("SELECT")) throw Object.assign(new Error("lock"), { code: "55P03" }); return { rows: [] }; } };
+    await expect(runUserErase(failing, { requestId: "r", orgId: "o", workspaceId: "w", userId: "u" }, { keyRoot: "96bulls", eraser: eraser as never })).rejects.toThrow("lock");
+    expect(seen.at(-1)).toBe("ROLLBACK");
   });
 });

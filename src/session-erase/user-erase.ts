@@ -2,8 +2,13 @@
  * Operator per-user erase of buffered desktop uploads (data-subject deletion), DEFAULT OFF.
  * SQL: supabase/migrations/20261105058010_operator_user_erase.sql. Runbook: docs/operator-user-erase.md.
  *
- *   1. begin     ledger row, every auth session of the user revoked, the user's device origins captured
- *   2. step*     bounded, restartable metadata purge (waits out a live buffered-GC lease when told to)
+ *   1. begin     ledger row, the user's tokens held in this database revoked (auth_sessions revoked and kept,
+ *                read_api_tokens deleted; Neon-held tokens are revoked out of band BEFORE this), the user's
+ *                publication frontiers fenced, the user's device origins captured
+ *   2. step*     restartable metadata purge: while slots remain each step deletes at most `stepLimit` of them; the
+ *                last step is the final purge of every other per-user row in ONE transaction, sized by the user's
+ *                batches/claims/stages and bounded only by USER_ERASE_STATEMENT_TIMEOUT_MS (a timeout rolls it
+ *                back; the request stays purging and a rerun resumes). Waits out a live buffered-GC lease.
  *   3. bytes     every version and delete marker under each of the user's machine prefixes, for every captured
  *                origin: buffered batches, staged live batches, transcript objects and live pointers
  *   4. settle    wait, then a fresh strict listing of every prefix; anything found (a late in-flight PUT) is
@@ -74,9 +79,21 @@ interface LedgerView {
   retry_after_ms?: number;
 }
 
+/**
+ * Per-transaction bounds, set with SET LOCAL inside every call's transaction (they end with it). Lock waits are on
+ * the gate, the ledger row and the user's fence/frontier rows, whose other holders (another erase, the buffered
+ * GC, a publication claim) are short transactions: past 30 s something is stuck and the call fails (55P03)
+ * instead of queueing behind it. A statement is one begin, one step or the final purge; 15 min bounds the final
+ * purge of a very large user (57014 rolls it back, the request stays purging, a rerun resumes).
+ */
+export const USER_ERASE_LOCK_TIMEOUT_MS = 30_000;
+export const USER_ERASE_STATEMENT_TIMEOUT_MS = 15 * 60_000;
+
 async function call(db: UserEraseDb, sql: string, params: unknown[]): Promise<LedgerView> {
   await db.query("BEGIN ISOLATION LEVEL READ COMMITTED");
   try {
+    await db.query(`SET LOCAL lock_timeout = ${USER_ERASE_LOCK_TIMEOUT_MS}`);
+    await db.query(`SET LOCAL statement_timeout = ${USER_ERASE_STATEMENT_TIMEOUT_MS}`);
     const r = await db.query(sql, params);
     await db.query("COMMIT");
     return r.rows[0]!.r as LedgerView;
