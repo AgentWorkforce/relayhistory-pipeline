@@ -253,6 +253,20 @@ a fresh plan in the maintenance window. Resume the paused components after the
 activation attempt. Data repair and the Desktop relationship/model catalog
 (`catalog_read_version` / forget tracking) use their own procedures.
 
+**Fresh installs.** By default the plan requires at least one live, fully
+projected session, so a brand-new install cannot open the agent filter before
+its first upload. A fresh install may instead activate before the first session
+by adding `--fresh-install` to both commands (`--plan --fresh-install`, then
+`--apply PLAN_FINGERPRINT --fresh-install`). This is eligible only when the
+install is empty everywhere: no `session_directory` rows at all (live or
+tombstoned), no live `session_index` pointers and every other audit count zero.
+On a non-empty install the flag changes nothing: the normal checks still apply.
+The mode is part of the fingerprint, so a plan from one mode refuses with
+`native_catalog_plan_changed` when applied in the other. The marker only gates
+reads: later sessions keep projecting through the normal consumer and appear in
+`agent=` results once their catalog projection completes. Without the flag,
+behavior is unchanged.
+
 To reproduce the lock behavior on an already running test PostgreSQL 17
 container, run
 `bun scripts/proof-native-agent-catalog-activation.ts CONTEXT CONTAINER`
