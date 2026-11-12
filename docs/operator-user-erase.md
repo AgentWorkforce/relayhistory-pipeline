@@ -138,9 +138,8 @@ Rerunning the same `request_id` is always safe: a finished erase answers from it
 
 ## Before the first production run
 
-1. Prebuild the four `ingest_lazy_ack_decisions`/`ingest_lazy_native_slots` indexes CONCURRENTLY, and check the
-   row counts of `ingest_stage_intents`, `ingest_buffer_outbox` and `ingest_history_plans` (prebuild their indexes too
-   if populated) (`docs/packets/operator-user-erase-index-packet.md`). Apply 057010 first, then 058000 (adopts the
+1. Prebuild CONCURRENTLY every 058000 index whose table is populated; an empty table's index may be left to 058000
+   (`docs/packets/operator-user-erase-index-packet.md`). Apply 057010 first, then 058000 (adopts the
    prebuilt indexes) and 058010, through the normal reviewed migration path.
 2. Store the eraser key and the owner URL in the secret store; never on disk.
 3. Run once against a non-production copy with a seeded user and confirm `verified: true`.
