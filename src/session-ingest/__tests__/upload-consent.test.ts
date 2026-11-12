@@ -559,3 +559,64 @@ describe("recordSelectionDeny (replay/stale path)", () => {
   });
 });
 
+
+describe("report mode never refuses, even with the consent store unreadable", () => {
+  const broken: UploadConsentStore = { snapshot: async () => { throw new Error("relation does not exist"); }, apply: async () => { throw new Error("relation does not exist"); } };
+  test("report: an upload is accepted and the store outage is logged (e.g. before migration 057010 is applied)", async () => {
+    const h = harness({ enforcement: "report", consent: broken });
+    expect((await h.post(await batch([sess("a")]))).status).toBe(200);
+    expect(h.ledger.commits).toHaveLength(1);
+    expect(h.lines.find((l) => l.error_code === "upload_consent_store_unavailable")).toMatchObject({ state: "reported", org_id: TENANT.orgId });
+  });
+  test("report: a selection disable whose deny cannot be recorded is a retryable 503, never a silent success", async () => {
+    const h = harness({ enforcement: "report", consent: broken });
+    const body = JSON.stringify({ account_id: await deliveryAccount(TENANT), origin_id: "origin-1", sessions: [{ source: "claude", session_id: "x" }], enabled: false });
+    const res = await h.app.request("/v1/delivery/sessions/selection", { method: "POST", headers: { "content-type": "application/json", ...h.as({}) }, body });
+    expect(res.status).toBe(503);
+    // The fence applied and is idempotent: the Desktop's retry, once the store answers, records the deny.
+    expect(h.ledger.deleted.has(sessionKey("claude", "x"))).toBe(true);
+    const good = new MemoryConsentStore();
+    const retry = harness({ enforcement: "report", consent: good, ledger: h.ledger });
+    expect((await retry.app.request("/v1/delivery/sessions/selection", { method: "POST", headers: { "content-type": "application/json", ...retry.as({}) }, body })).status).toBe(200);
+    expect(good.decisions.get(JSON.stringify([TENANT.orgId, TENANT.workspaceId, TENANT.userId]))?.get(sessionKey("claude", "x"))).toBe("deny");
+  });
+  test("hold-only and enforce: a selection disable whose deny cannot be recorded is a 503 too", async () => {
+    for (const enforcement of ["hold-only", "enforce"] as const) {
+      const h = harness({ enforcement, consent: broken });
+      const res = await h.app.request("/v1/delivery/sessions/selection", { method: "POST", headers: { "content-type": "application/json", ...h.as({}) },
+        body: JSON.stringify({ account_id: await deliveryAccount(TENANT), origin_id: "origin-1", sessions: [{ source: "claude", session_id: "x" }], enabled: false }) });
+      expect(res.status).toBe(503);
+    }
+  });
+
+  test("report + an enforced operator capture-policy cap: the cap fails closed on a store outage", async () => {
+    const lines: Record<string, unknown>[] = [];
+    const app = createIngestApp({
+      identify: () => ({ ...TENANT, scopes: [SYNC_SCOPE], role: "member", capturePolicy: { revision: 7, settings: { sharing_mode: "selected" } } }) as never,
+      log: (f) => void lines.push(f), capturePolicyUploads: "enforce",
+      deliver: { ledger: new MemoryLedger(), target: { store: store(), keyRoot: "96bulls", sleep: async () => {} } } as never,
+      uploadConsent: { enforcement: "report", store: broken, nowMs: () => T0 },
+    });
+    const res = await app.request("/v1/delivery/batches", { method: "POST", headers: { "content-type": "application/json", "x-agent-relay-capture-policy-revision": "7" },
+      body: JSON.stringify({ protocolVersion: 1, batch: await batch([sess("a")]) }) });
+    expect(res.status).toBe(503);
+  });
+
+  test("the outage log carries the store's closed db_error_code (a missing migration is distinguishable)", async () => {
+    const missing: UploadConsentStore = { snapshot: async () => { throw Object.assign(new Error("relation sessions.upload_consent_snapshot_v1 does not exist"), { code: "ledger_sqlstate_42883" }); }, apply: broken.apply };
+    const h = harness({ enforcement: "report", consent: missing });
+    expect((await h.post(await batch([sess("a")]))).status).toBe(200);
+    const line = h.lines.find((l) => l.error_code === "upload_consent_store_unavailable")!;
+    expect(line.db_error_code).toBe("ledger_sqlstate_42883");
+    expect(JSON.stringify(h.lines)).not.toContain("does not exist");
+    for (const key of Object.keys(line)) expect(ALLOWED_LOG_FIELDS.has(key)).toBe(true);
+  });
+
+  test("hold-only and enforce still fail closed on a store outage", async () => {
+    for (const enforcement of ["hold-only", "enforce"] as const) {
+      const h = harness({ enforcement, consent: broken });
+      expect((await h.post(await batch([sess("a")]))).status).toBe(503);
+      expect(h.ledger.claims).toHaveLength(0);
+    }
+  });
+});

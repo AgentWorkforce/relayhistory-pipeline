@@ -176,7 +176,7 @@ function sessionIndex(deps:IndexDeps,authorized:boolean):SessionPointerIndex{
           (n: number, c: { records?: number }) => n + (c.records ?? 0),
           0,
         ),
-        storage_provider: pointer.provider ?? "s3",
+        storage_provider: pointer.provider ?? deps.reader.provider ?? "s3",
         bucket: pointer.bucket ?? deps.reader.bucket ?? "",
         manifest_key: pointer.manifestKey,
         content_sha256: `\\x${f.contentSha256}`,

@@ -96,6 +96,16 @@ export function ownerBufferedExactSessionEnabled(raw: string | undefined): boole
   return raw === "on";
 }
 
+/**
+ * READ_API_OWNER_BUFFERED_STAGES_PAGED: selects the paged exact-session RPC added by 047020;
+ * default off, only the exact string "on" enables. It has effect only on the owner-buffered path
+ * and only together with READ_API_OWNER_BUFFERED_EXACT_SESSION=on (the deploy renderer refuses
+ * it otherwise; the reader falls back to the exact-session/frozen switch).
+ */
+export function ownerBufferedStagesPagedEnabled(raw: string | undefined): boolean {
+  return raw === "on";
+}
+
 export const OWNER_BUFFERED_EVENTS_FLAG = "READ_API_OWNER_BUFFERED_EVENTS";
 
 /** READ_API_OWNER_BUFFERED_EVENTS holds a value other than unset, empty or "on". Names the field, never the value. */
@@ -644,7 +654,8 @@ export interface BufferedListPosition {
 
 export interface OwnerBufferedReads {
   list(scope: BufferedScope, authority: AuthorityHead, args: { cursor?: BufferedListPosition; limit: number }): Promise<BufferedSessionRow[]>;
-  stages(scope: BufferedScope, authority: AuthorityHead, source: string, sessionId: string): Promise<BufferedStageRow[]>;
+  /** `signal`: the request's abort signal; the paged reader checks it before every page. */
+  stages(scope: BufferedScope, authority: AuthorityHead, source: string, sessionId: string, signal?: AbortSignal): Promise<BufferedStageRow[]>;
 }
 
 /** The app's dependency: `enabled` is the flag; the worker wires the rest only when it is on. */
@@ -859,6 +870,39 @@ export const BUFFERED_STAGES_SQL =
 /** Same scope/head/source/session arguments; only the closed RPC name changes. */
 export const BUFFERED_TARGET_STAGES_SQL = BUFFERED_STAGES_SQL.replace("sessions.buffered_session_stages_for(", "sessions.buffered_session_stages_for_target(");
 
+/**
+ * 047020 paged exact-session stages: the same scope/head/source/session arguments plus the
+ * cursor ($11, NULL on the first page) and the page size ($12). One envelope row per call.
+ */
+export const BUFFERED_PAGED_STAGES_SQL =
+  `SELECT stages, cursor, has_more, snapshot_at ` +
+  `FROM sessions.buffered_session_stages_for_target_paged(p_workspace => $1, ${HEAD_ARGS}, p_source => $9, p_session_id => $10, p_cursor => $11::jsonb, p_page_claims => $12::integer)`;
+/**
+ * Claims expanded per paged call (the SQL clamps to 1..4). Ingest admits at most
+ * MAX_DELIVERY_RECORDS (500) records per claim (vendor/delivery/delivery-contracts.ts; the claim
+ * SQL refuses jsonb_array_length(records) > 500), so one Worker page holds at most
+ * 2 x 500 = 1,000 records. owner-buffered-stages-paged.test.ts pins this product. The bound does
+ * not apply to the gate-off 047010 fallback, which answers in one unpaged envelope.
+ */
+export const BUFFERED_PAGED_STAGES_PAGE_CLAIMS = 2;
+/** Hard cap on pages per traversal; one more page than this fails closed (rpc_error). */
+export const BUFFERED_PAGED_STAGES_MAX_PAGES = 64;
+
+export type BufferedStagesMode = "frozen" | "target" | "paged";
+/**
+ * THE single SQL switch for stage reads: frozen 044090, 047010 exact-session, or 047020 paged.
+ * Paged requires exact-session; anything else keeps the earlier choice.
+ */
+export function bufferedStagesMode(options: { exactSession?: boolean; stagesPaged?: boolean }): BufferedStagesMode {
+  if (options.exactSession !== true) return "frozen";
+  return options.stagesPaged === true ? "paged" : "target";
+}
+const STAGES_SQL: Record<BufferedStagesMode, string> = {
+  frozen: BUFFERED_STAGES_SQL,
+  target: BUFFERED_TARGET_STAGES_SQL,
+  paged: BUFFERED_PAGED_STAGES_SQL,
+};
+
 export function statementTimeoutSql(ms: number = BUFFERED_STATEMENT_TIMEOUT_MS): string {
   if (!Number.isSafeInteger(ms) || ms < 1 || ms > 30_000) throw new Error("buffered statement timeout out of range");
   return `SET LOCAL statement_timeout = ${ms}`;
@@ -932,12 +976,20 @@ function stageRow(raw: Record<string, unknown>): BufferedStageRow {
  * (which binds bulls96_read.org_id / workspace_id): a per-transaction statement_timeout, the
  * user binding, then the RPC with the observed head. No row lock, no write.
  */
-export function sqlOwnerBufferedReads(run: TenantRunner, options: { statementTimeoutMs?: number; exactSession?: boolean } = {}): OwnerBufferedReads {
-  const timeout = statementTimeoutSql(options.statementTimeoutMs ?? BUFFERED_STATEMENT_TIMEOUT_MS);
-  const call = async (scope: BufferedScope, sql: string, params: unknown[]) => {
+export function sqlOwnerBufferedReads(
+  run: TenantRunner,
+  options: { statementTimeoutMs?: number; exactSession?: boolean; stagesPaged?: boolean; maxPages?: number; now?: () => number } = {},
+): OwnerBufferedReads {
+  const timeoutMs = options.statementTimeoutMs ?? BUFFERED_STATEMENT_TIMEOUT_MS;
+  const timeout = statementTimeoutSql(timeoutMs);
+  const mode = bufferedStagesMode(options);
+  const maxPages = options.maxPages ?? BUFFERED_PAGED_STAGES_MAX_PAGES;
+  // Monotonic: the traversal budget is an elapsed time, never a wall-clock timestamp.
+  const now = options.now ?? (() => performance.now());
+  const call = async (scope: BufferedScope, sql: string, params: unknown[], timeoutSql: string = timeout) => {
     try {
       return await run(scope.orgId, scope.workspaceId, async (q) => {
-        await q.query(timeout);
+        await q.query(timeoutSql);
         await q.query(BUFFERED_USER_SQL, [scope.userId]);
         return (await q.query<Record<string, unknown>>(sql, params)).rows;
       });
@@ -957,11 +1009,71 @@ export function sqlOwnerBufferedReads(run: TenantRunner, options: { statementTim
       if (rows.length > limit) invalid();
       return rows.map((r) => sessionRow(r, scope));
     },
-    async stages(scope, authority, source, sessionId) {
-      const rows = await call(scope, options.exactSession === true ? BUFFERED_TARGET_STAGES_SQL : BUFFERED_STAGES_SQL, [scope.workspaceId, ...head(authority), source, sessionId]);
-      return rows.map(stageRow);
+    async stages(scope, authority, source, sessionId, signal) {
+      const sql = STAGES_SQL[mode];
+      const args = [scope.workspaceId, ...head(authority), source, sessionId];
+      if (mode !== "paged") return (await call(scope, sql, args)).map(stageRow);
+      // 047020: a FRESH complete traversal on every call (first read, 404 refresh and recheck each
+      // start from cursor NULL with a new snapshot). The whole traversal shares the single-RPC
+      // statement budget: each page's statement_timeout is what is left of it. A page error, an
+      // overrun, an abort or more than maxPages pages fails closed; no partial set is returned.
+      const deadline = now() + timeoutMs;
+      const out: BufferedStageRow[] = [];
+      const keys = new Set<string>();
+      let cursor: string | null = null;
+      let snapshot: string | undefined;
+      for (let pages = 0; ; pages++) {
+        if (signal?.aborted) throw new BufferedFenced("request_aborted");
+        if (pages >= maxPages) throw new BufferedFenced("rpc_error");
+        const left = Math.ceil(deadline - now());
+        if (left < 1) throw new BufferedFenced("rpc_timeout");
+        const rows = await call(scope, sql, [...args, cursor, BUFFERED_PAGED_STAGES_PAGE_CLAIMS], statementTimeoutSql(Math.min(timeoutMs, left)));
+        if (signal?.aborted) throw new BufferedFenced("request_aborted");
+        if (now() > deadline) throw new BufferedFenced("rpc_timeout");
+        const page = pagedEnvelope(rows);
+        if (snapshot !== undefined && page.snapshotAt !== snapshot) throw new BufferedFenced("rpc_error");
+        snapshot = page.snapshotAt;
+        for (const raw of page.stages) {
+          const row = stageRow(raw);
+          if (keys.has(row.stage_key)) throw new BufferedFenced("rpc_error");
+          keys.add(row.stage_key);
+          out.push(row);
+        }
+        if (!page.hasMore) return out;
+        if (page.cursor === cursor) throw new BufferedFenced("rpc_error");
+        cursor = page.cursor;
+      }
     },
   };
+}
+
+const jsonValue = (v: unknown): unknown => {
+  if (typeof v !== "string") return v;
+  try {
+    return JSON.parse(v);
+  } catch {
+    return undefined;
+  }
+};
+
+/** One 047020 envelope, strictly: exactly one row, a stages array, cursor present iff has_more. */
+function pagedEnvelope(rows: Array<Record<string, unknown>>): { stages: Array<Record<string, unknown>>; cursor: string | null; hasMore: boolean; snapshotAt: string } {
+  if (rows.length !== 1) throw new BufferedFenced("rpc_error");
+  const row = rows[0]!;
+  const stages = jsonValue(row.stages);
+  const cursor = row.cursor === null || row.cursor === undefined ? null : jsonValue(row.cursor);
+  const hasMore = row.has_more;
+  if (!Array.isArray(stages) || !stages.every((s) => s !== null && typeof s === "object" && !Array.isArray(s))) throw new BufferedFenced("rpc_error");
+  if (typeof hasMore !== "boolean") throw new BufferedFenced("rpc_error");
+  if (hasMore !== (cursor !== null && typeof cursor === "object" && !Array.isArray(cursor))) throw new BufferedFenced("rpc_error");
+  if (!hasMore && cursor !== null) throw new BufferedFenced("rpc_error");
+  let snapshotAt: string;
+  try {
+    snapshotAt = isoTs(row.snapshot_at);
+  } catch {
+    throw new BufferedFenced("rpc_error");
+  }
+  return { stages: stages as Array<Record<string, unknown>>, cursor: hasMore ? JSON.stringify(cursor) : null, hasMore, snapshotAt };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1284,7 +1396,7 @@ async function readStagesUngated(
       // GetObjects in flight, kept in `first` order. Decompress is synchronous, so the shared
       // `decompressed` total is never raced.
       let refreshing: Promise<BufferedStageRow[]> | undefined;
-      const refresh = () => (refreshing ??= deps.reads.stages(scope, authority, source, sessionId).then((rows) => {
+      const refresh = () => (refreshing ??= deps.reads.stages(scope, authority, source, sessionId, opts.signal).then((rows) => {
         assertCompressedBounds(rows);
         return rows;
       }));
@@ -1310,7 +1422,7 @@ async function readStagesUngated(
         fetched.push(await fetchOne(row));
       } catch (error) {
         if (!isObjectStoreError(error, "not_found")) throw error;
-        refreshed ??= await deps.reads.stages(scope, authority, source, sessionId);
+        refreshed ??= await deps.reads.stages(scope, authority, source, sessionId, opts.signal);
         assertCompressedBounds(refreshed);
         const again = refreshed.find((r) => r.stage_key === row.stage_key);
         if (!again) continue;
@@ -1322,7 +1434,7 @@ async function readStagesUngated(
       }
     }
   });
-  const recheck = await timed(phases, "recheck", () => deps.reads.stages(scope, authority, source, sessionId));
+  const recheck = await timed(phases, "recheck", () => deps.reads.stages(scope, authority, source, sessionId, opts.signal));
   if (recheck.length === 0) return { kind: "erased" };
   if (recheck.length !== fetched.length || !fetched.every(({ row }) => recheck.some((r) => sameStage(r, row))) ||
       !recheck.every((r) => fetched.some(({ row }) => sameStage(r, row)))) return { kind: "changed" };
@@ -1457,7 +1569,7 @@ async function readGatedSession(deps: OwnerBufferedDeps, scope: BufferedScope, s
     // READ_API_OWNER_BUFFERED_INDEX_VERIFY=on: the out-of-band index first (cached per isolate).
     if (deps.indexCheck) await deps.indexCheck.ensure(scope);
     first = await timed(phases, "control_head_1", () => deps.gate.observe(scope));
-    initial = await timed(phases, "stages_sql", () => deps.reads.stages(scope, first, source, sessionId));
+    initial = await timed(phases, "stages_sql", () => deps.reads.stages(scope, first, source, sessionId, opts.signal));
   } catch (error) {
     if (error instanceof BufferedFenced) return unverified(error);
     throw error;

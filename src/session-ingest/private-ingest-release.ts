@@ -3,16 +3,18 @@
  *
  * The desired profile is tracked in the repository. The workflow materializes it into the
  * gitignored Alchemy input path, but no workflow input is allowed to alter the profile. The
- * three authorized rollout states are deliberately sequential: frozen custody in drain,
- * the synchronous frozen-receipt bridge in drain, then async admission on.
+ * custody shadow preparation and three rollout states are explicit: shadow in drain,
+ * frozen custody in drain, the synchronous frozen-receipt bridge in drain, then async on.
  *
  * Generation overlap (docs/design/zero-503-schema-windows.md section 3.2) is a second, orthogonal axis
  * and is dormant unless PRIVATE_INGEST_OVERLAP names a reviewed G -> H pair. With a reviewed pair the
  * only generation sequence is G -> G+H -> H (rollback G+H -> G), each as its own reviewed deploy of the
- * tracked profile, with the rollout phase held fixed. With the constant null every plan, confirmation,
- * readback and transition is byte-identical to the no-overlap contract.
+ * tracked profile, with the rollout phase held fixed. Every base phase, step-0-shadow included, has a
+ * `<phase>-overlap` twin. With the constant null every plan, confirmation, readback and transition is
+ * byte-identical to the no-overlap contract.
  */
 import { createHash } from "node:crypto";
+import { custodyEvidenceConfirmationSuffix } from "./private-ingest-custody-evidence.ts";
 import {
   ADMISSION_QUEUE,
   COMPATIBILITY_DATE,
@@ -36,6 +38,7 @@ export const PRIVATE_INGEST_RELEASE = {
   workflow: ".github/workflows/deploy-private-ingest-worker.yml",
   accountId: "f7232cb80f6fab86a95426302af243e4",
   worker: SESSION_INGEST_WORKER,
+  relayhistoryWorker: "relayhistory-api",
   approval: {
     by: "Khaliq Gant",
     directDate: "2026-11-11",
@@ -45,6 +48,7 @@ export const PRIVATE_INGEST_RELEASE = {
 
 export type PrivateIngestBasePhase =
   | "baseline-drain"
+  | "step-0-shadow"
   | "step-1-custody"
   | "step-2-frozen-receipt"
   | "step-4-async-on";
@@ -92,7 +96,8 @@ export function privateIngestReleaseInputs(env: Record<string, string | undefine
     privateIngestRefuse("private_ingest_release_overlap");
   const overlapSuffix = profileOverlap === undefined ? "" : ` OVERLAP ${profileOverlap}`;
   if (mode === "deploy" && (!/^[1-9][0-9]*$/u.test(planRun) ||
-      confirmation !== `DEPLOY ${PRIVATE_INGEST_RELEASE.worker} ${sha} PLAN ${planRun}${overlapSuffix}`))
+      (confirmation !== `DEPLOY ${PRIVATE_INGEST_RELEASE.worker} ${sha} PLAN ${planRun}${overlapSuffix}` &&
+       confirmation !== `DEPLOY ${PRIVATE_INGEST_RELEASE.worker} ${sha} PLAN ${planRun}${custodyEvidenceConfirmationSuffix()}${overlapSuffix}`)))
     privateIngestRefuse("private_ingest_release_confirmation");
   return { mode, sha: sha!, planRun, confirmation } as const;
 }
@@ -166,7 +171,7 @@ export function privateIngestReleasePhase(
     if (profile[key] !== (key === "expectedGeneration" ? c.generation : value))
       privateIngestRefuse("private_ingest_profile_common");
   if (!KMS_ARN.test(String(profile.kmsKeyArn ?? "")) ||
-      (profile.custodySource !== undefined && profile.custodySource !== "frozen-supabase"))
+      (profile.custodySource !== undefined && profile.custodySource !== "shadow" && profile.custodySource !== "frozen-supabase"))
     privateIngestRefuse("private_ingest_profile_target");
   const allowed = new Set([
     ...Object.keys(COMMON_PROFILE),
@@ -191,8 +196,11 @@ export function privateIngestReleasePhase(
 function basePhase(profile: Record<string, unknown>): PrivateIngestBasePhase {
   const asyncAdmission = profile.asyncAdmission,
     frozenReceipt = profile.syncAdmissionFrozenReceipt;
-  if (profile.custodySource === undefined && asyncAdmission === "drain" && frozenReceipt === undefined)
-    return "baseline-drain";
+  if (profile.custodySource === undefined || profile.custodySource === "shadow") {
+    if (asyncAdmission !== "drain" || frozenReceipt !== undefined)
+      privateIngestRefuse("private_ingest_profile_phase");
+    return profile.custodySource === "shadow" ? "step-0-shadow" : "baseline-drain";
+  }
   if (asyncAdmission === "drain" && frozenReceipt === undefined)
     return "step-1-custody";
   if (asyncAdmission === "drain" && frozenReceipt === "on")
@@ -367,17 +375,23 @@ function profileFor(
     ...COMMON_PROFILE,
     expectedGeneration,
     kmsKeyArn,
-    ...(base === "baseline-drain" ? {} : { custodySource: "frozen-supabase" as const }),
+    ...(base === "baseline-drain" ? {} : { custodySource: base === "step-0-shadow" ? "shadow" as const : "frozen-supabase" as const }),
     asyncAdmission: base === "step-4-async-on" ? "on" : "drain",
-    ...(base === "baseline-drain" || base === "step-1-custody"
-      ? {}
-      : { syncAdmissionFrozenReceipt: "on" as const }),
+    ...(base === "step-2-frozen-receipt" || base === "step-4-async-on"
+      ? { syncAdmissionFrozenReceipt: "on" as const }
+      : {}),
     ...(overlapGeneration === undefined ? {} : { overlapGeneration }),
   };
   return { sessionIngest };
 }
 
-const BASE_PHASES = ["baseline-drain", "step-1-custody", "step-2-frozen-receipt", "step-4-async-on"] as const;
+const BASE_PHASES = [
+  "baseline-drain",
+  "step-0-shadow",
+  "step-1-custody",
+  "step-2-frozen-receipt",
+  "step-4-async-on",
+] as const;
 
 function splitPhase(phase: PrivateIngestReleasePhase): { base: PrivateIngestBasePhase; overlap: boolean } {
   const overlap = phase.endsWith("-overlap");
@@ -399,7 +413,8 @@ export function privateIngestProfileForPhase(
 }
 
 /**
- * A forward step must be observed independently on the live 100% version; rollbacks unwind one step.
+ * A forward step must be observed independently on the live 100% version; rollbacks unwind one step,
+ * including custody shadow (baseline-drain <-> step-0-shadow <-> step-1-custody, no direct skip).
  * The generation axis moves only with the rollout phase held fixed: G -> G+H -> H, or G+H -> G.
  */
 export function privateIngestTransitionReadback(
@@ -435,9 +450,11 @@ export function privateIngestTransitionReadback(
   const [fromBase, generationFrom, fromOverlap] = matches[0]!;
   const generationTo: PrivateIngestGenerationState = target.overlap ? "G+H" : label(c.generation);
   const from: PrivateIngestReleasePhase = fromOverlap ? `${fromBase}-overlap` : fromBase;
+  // step-0-shadow is mandatory between baseline-drain and step-1-custody in both directions.
   const allowed: Record<PrivateIngestBasePhase, readonly PrivateIngestBasePhase[]> = {
-    "baseline-drain": ["baseline-drain", "step-1-custody"],
-    "step-1-custody": ["baseline-drain", "step-1-custody", "step-2-frozen-receipt"],
+    "baseline-drain": ["baseline-drain", "step-0-shadow"],
+    "step-0-shadow": ["baseline-drain", "step-0-shadow", "step-1-custody"],
+    "step-1-custody": ["step-0-shadow", "step-1-custody", "step-2-frozen-receipt"],
     "step-2-frozen-receipt": ["step-1-custody", "step-2-frozen-receipt", "step-4-async-on"],
     "step-4-async-on": ["step-2-frozen-receipt", "step-4-async-on"],
   };
