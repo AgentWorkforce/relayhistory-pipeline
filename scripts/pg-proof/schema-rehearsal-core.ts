@@ -511,6 +511,25 @@ export function errorCode(error: unknown): string {
   return typeof code === "string" && /^[a-zA-Z0-9_]{1,64}$/.test(code) ? code : "rehearsal_failed";
 }
 
+/**
+ * Evidence for a stage that failed with a production refusal: for index_prebuild_required, the
+ * refusing indexes (index, table, step) and the operator packets the message names, parsed from
+ * the migrator's fixed refusal text into identifier-shaped values only (never the raw message).
+ * Any other refusal, or a message that does not parse, gives {} as before.
+ */
+export function refusalEvidence(error: unknown): Record<string, unknown> {
+  if (errorCode(error) !== "index_prebuild_required") return {};
+  const message = (error as { message?: unknown } | null)?.message;
+  if (typeof message !== "string") return {};
+  const indexes = [
+    ...message.matchAll(/index sessions\.([a-z_][a-z0-9_]*) on (sessions\.[a-z_][a-z0-9_]*) \(((?:upstream|96bulls):[A-Za-z0-9_.-]+)\)/g),
+  ].map(([, index, table, step]) => ({ index, table, step }));
+  const packets = (/CREATE INDEX CONCURRENTLY \(([^()]*)\), then rerun/.exec(message)?.[1] ?? "")
+    .split("; ")
+    .filter((p) => /^[A-Za-z0-9 ._/#,-]{1,200}$/.test(p));
+  return indexes.length ? { indexes, packets } : {};
+}
+
 // ---- R2-bootstrap: the release tree's bootstrap chain applied before the apply.
 
 /**

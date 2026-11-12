@@ -83,6 +83,7 @@ import {
   bootstrapRefreshEvidence,
   disposableEnvRefusal,
   errorCode,
+  refusalEvidence,
   expectedWindow,
   flipHex,
   checkLandingSeed,
@@ -150,7 +151,7 @@ async function stage<T extends Record<string, unknown>>(name: string, fn: () => 
     evidence = await fn();
   } catch (e) {
     if (e instanceof Stop) throw e;
-    await emit(name, "FAIL", e instanceof RehearsalRefusal ? e.detail : {}, errorCode(e));
+    await emit(name, "FAIL", e instanceof RehearsalRefusal ? e.detail : refusalEvidence(e), errorCode(e));
     throw new Stop();
   }
   await emit(name, "PASS", evidence);
@@ -387,7 +388,7 @@ async function main() {
       // start (R0 for the guards); never over a stage that already has a record.
       const name = results.some((r) => r.stage === current) ? `${current}-after` : current;
       try {
-        await emit(name, "FAIL", e instanceof RehearsalRefusal ? e.detail : {}, errorCode(e));
+        await emit(name, "FAIL", e instanceof RehearsalRefusal ? e.detail : refusalEvidence(e), errorCode(e));
       } catch {}
     }
   }
