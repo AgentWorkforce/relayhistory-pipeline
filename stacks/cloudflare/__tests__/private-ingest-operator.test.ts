@@ -72,19 +72,21 @@ const tools = {
     nativeBindingsSha256: "f".repeat(64),
   };
 const digest = (v: string) => createHash("sha256").update(v).digest("hex");
-async function actualPlanProof(declared: "canonical" | "buffered" | "admission" | "admission-default" | "admission-drain" | "custody" | "custody-shadow" | "custody-shadow-drain" | "frozen-receipt") {
+async function actualPlanProof(declared: "canonical" | "buffered" | "admission" | "admission-default" | "admission-drain" | "custody" | "custody-shadow" | "custody-shadow-drain" | "frozen-receipt" | "neon-exit") {
   // "admission": buffered + asyncAdmission "on" (the three admission resources and two more bindings).
   // "admission-default": buffered with asyncAdmission OMITTED, which resolves to "on" (same as "admission").
   // "admission-drain": buffered + asyncAdmission "drain" (same resources, the var says drain).
   // "buffered": buffered + explicit asyncAdmission "off": the four resources, byte-identical to before.
   // "custody" / "frozen-receipt": buffered + frozen custody, optionally the receipt; asyncAdmission "off".
   // "custody-shadow" / "custody-shadow-drain": shadow custody, no receipt bridge; the latter retains admission resources.
+  // "neon-exit": frozen custody plus SESSIONS_NEON_EXIT, with no NEON_REPLICA binding.
   const mode = declared === "canonical" ? "canonical" : "buffered";
+  const neonExit = declared === "neon-exit";
   const shadowDrain = declared === "custody-shadow-drain", shadow = declared === "custody-shadow" || shadowDrain;
   const admission = declared === "admission" || declared === "admission-default" || declared === "admission-drain" || shadowDrain;
   const admissionVar = declared === "admission-drain" || shadowDrain ? "drain" : "on";
-  const frozenReceipt = declared === "frozen-receipt", custody = declared === "custody" || shadow || frozenReceipt;
-  const bindingCount = (admission ? 17 : mode === "buffered" ? 15 : 13) + (custody ? 1 : 0) + (frozenReceipt ? 1 : 0);
+  const frozenReceipt = declared === "frozen-receipt", custody = declared === "custody" || shadow || frozenReceipt || neonExit;
+  const bindingCount = (admission ? 17 : mode === "buffered" ? 15 : 13) + (custody ? 1 : 0) + (frozenReceipt ? 1 : 0) + (neonExit ? 1 : 0);
   const input = {
     ...baseInput,
     sessionIngest: {
@@ -94,6 +96,7 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
       ...(declared === "buffered" || custody ? { asyncAdmission: shadowDrain ? "drain" as const : "off" as const } : {}),
       ...(custody ? { custodySource: shadow ? "shadow" as const : "frozen-supabase" as const } : {}),
       ...(frozenReceipt ? { syncAdmissionFrozenReceipt: "on" as const } : {}),
+      ...(neonExit ? { neonExit: "on" as const } : {}),
       ...(mode === "buffered"
         ? {
             acceptanceMode: "buffered" as const,
@@ -437,7 +440,46 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
         },
       } } }, { ...input, sessionIngest: withoutFlag })).toThrow("native_binding_target");
     }
-    if (custody && !frozenReceipt) {
+    if (neonExit) {
+      const rowsOf = native.native.resources, worker = rowsOf["session-ingest"];
+      const at = (bindings: any[]) => ({ ...native, native: { ...native.native, resources: { ...rowsOf, "session-ingest": { ...worker, bindings } } } });
+      // The expected var flows from sessionIngestVars: rendered, read back, and required.
+      expect(worker.bindings.find((b: any) => b.sid === "SESSIONS_NEON_EXIT").data.bindings[0])
+        .toEqual({ type: "plain_text", name: "SESSIONS_NEON_EXIT", text: "true" });
+      expect(worker.bindings.some((b: any) => b.sid === "NEON_REPLICA")).toBe(false);
+      expect(() => assertOperatorSnapshot(at(worker.bindings.filter((b: any) => b.sid !== "SESSIONS_NEON_EXIT")), input))
+        .toThrow("native_binding_inventory");
+      expect(() => assertOperatorSnapshot(at(worker.bindings.map((b: any) => b.sid !== "SESSIONS_NEON_EXIT" ? b :
+        { ...b, data: { bindings: [{ ...b.data.bindings[0], text: "false" }] } })), input)).toThrow("native_binding_target");
+      const { neonExit: _exit, ...withoutExit } = input.sessionIngest as any;
+      expect(() => assertOperatorSnapshot(native, { ...input, sessionIngest: withoutExit })).toThrow("native_binding_inventory");
+      // A NEON_REPLICA binding that would remain on the Worker: refused by name, for every remaining action,
+      // by sid or by the wire binding's name.
+      const replica = { type: "queue", name: "NEON_REPLICA", queue_name: "relayhistory-neon-replica" };
+      for (const action of ["create", "update", "noop"])
+        expect(() => assertOperatorSnapshot(at([...worker.bindings, { sid: "NEON_REPLICA", action, data: { bindings: [replica] } }]), input))
+          .toThrow("native_neon_exit_replica");
+      expect(() => assertOperatorSnapshot(at([...worker.bindings, { sid: "FOREIGN", action: "create", data: { bindings: [replica] } }]), input))
+        .toThrow("native_neon_exit_replica");
+      // Without the profile the same row is only an unknown binding (generic inventory refusal).
+      expect(() => assertOperatorSnapshot(at([...worker.bindings, { sid: "NEON_REPLICA", action: "create", data: { bindings: [replica] } }]),
+        { ...input, sessionIngest: withoutExit })).toThrow("native_binding_inventory");
+      // A delete of a stale NEON_REPLICA is the desired transition, so it is NOT the Neon-exit refusal. The
+      // reviewed delete allowlist admits no NEON_REPLICA unbind today, so it still fails closed.
+      const unbind = { ...worker, action: "update", state: { status: "updated", props: { ...worker.props,
+        env: { ...worker.props.env, NEON_REPLICA: { Type: "Cloudflare.Queues.Queue", queueName: "relayhistory-neon-replica" } } } },
+        bindings: [...worker.bindings, { sid: "NEON_REPLICA", action: "delete", data: { bindings: [replica] } }] };
+      let refusal: unknown;
+      try {
+        assertOperatorSnapshot({ ...native, native: { ...native.native, resources: { ...rowsOf, "session-ingest": unbind } } }, input);
+      } catch (error) {
+        refusal = error;
+      }
+      expect(refusal).toBeInstanceOf(OperatorRefusal);
+      expect(String((refusal as Error).message)).toContain("native_binding_target");
+      expect(String((refusal as Error).message)).not.toContain("native_neon_exit_replica");
+    }
+    if (custody && !frozenReceipt && !neonExit) {
       const rowsOf = native.native.resources, worker = rowsOf["session-ingest"];
       const custodyBinding = worker.bindings.find((b: any) => b.sid === "INGEST_CUSTODY_SOURCE");
       const { INGEST_CUSTODY_SOURCE: _custody, ...custodyRollbackEnv } = worker.props.env;
@@ -642,7 +684,7 @@ async function actualPlanProof(declared: "canonical" | "buffered" | "admission" 
     await rm(dir, { recursive: true, force: true });
   }
 }
-test.each(["canonical", "buffered", "admission", "admission-default", "admission-drain", "custody", "custody-shadow", "custody-shadow-drain", "frozen-receipt"] as const)(
+test.each(["canonical", "buffered", "admission", "admission-default", "admission-drain", "custody", "custody-shadow", "custody-shadow-drain", "frozen-receipt", "neon-exit"] as const)(
   "actual original four-resource declaration %s uses authenticated HTTP state and retained plan",
   actualPlanProof,
 );

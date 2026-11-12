@@ -433,3 +433,26 @@ describe("047010 exact-session RPC render", () => {
     expect(WORKFLOW).toMatch(/owner_buffered_exact_session:[\s\S]*?default: "off"/);
   });
 });
+
+
+describe("047020 paged exact-session stages render", () => {
+  const EXACT = { ...ON, ownerBufferedExactSession: "on" };
+  test("default/off leaves the render byte-identical; on adds only its flag", () => {
+    for (const base of [ON, EXACT, { hyperdriveId: HD }]) {
+      const baseline = renderDeployConfig(TEMPLATE, base);
+      for (const value of [undefined, "", "off", " off "]) expect(renderDeployConfig(TEMPLATE, { ...base, ownerBufferedStagesPaged: value })).toBe(baseline);
+    }
+    const before = parse(renderDeployConfig(TEMPLATE, EXACT));
+    expect(parse(renderDeployConfig(TEMPLATE, { ...EXACT, ownerBufferedStagesPaged: "on" }))).toEqual({ ...before, vars: { ...before.vars, READ_API_OWNER_BUFFERED_STAGES_PAGED: "on" } });
+  });
+  test("on requires owner_buffered=on AND exact_session=on; unknown values and predeclared flags refused", () => {
+    expect(() => renderDeployConfig(TEMPLATE, { hyperdriveId: HD, ownerBufferedStagesPaged: "on" })).toThrow(/stages_paged=on needs owner_buffered=on and owner_buffered_exact_session=on/);
+    expect(() => renderDeployConfig(TEMPLATE, { ...ON, ownerBufferedStagesPaged: "on" })).toThrow(/stages_paged=on needs/);
+    expect(() => renderDeployConfig(TEMPLATE, { ...ON, ownerBufferedExactSession: "off", ownerBufferedStagesPaged: "on" })).toThrow(/stages_paged=on needs/);
+    for (const value of ["true", "1", "ON", "yes"]) expect(() => renderDeployConfig(TEMPLATE, { ...EXACT, ownerBufferedStagesPaged: value })).toThrow(/owner_buffered_stages_paged must be/);
+    const declared = TEMPLATE.replace('"vars": {', '"vars": { "READ_API_OWNER_BUFFERED_STAGES_PAGED": "on",');
+    expect(() => renderDeployConfig(declared, EXACT)).toThrow();
+    expect(WORKFLOW).toContain('OWNER_BUFFERED_STAGES_PAGED: ${{ inputs.owner_buffered_stages_paged }}');
+    expect(WORKFLOW).toMatch(/owner_buffered_stages_paged:\n[\s\S]*?type: choice\n\s*options: \["off", "on"\]\n\s*default: "off"/);
+  });
+});
