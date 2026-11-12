@@ -23,7 +23,7 @@
  *                checkout
  *   R1 plan      inspectRelease (READ ONLY; refuses function_acl_drift, ledger_gap, ...),
  *                migrationTargetSplit checked against an independent window, the target
- *                commit found on the release sha's first-parent history at the dispatched
+ *                commit (below) bound by production's targetAnchor at the dispatched
  *                generation, validateReleasePlan on the plan exactly as production builds it
  *   R2 boundary  the planned boundary is safe and still the previous body (prosrc not exact)
  *   R2-bootstrap the operator's pre-apply chain refresh: every SESSION_BOOTSTRAP_FILES file
@@ -42,9 +42,22 @@
  *   R6 ingest    the session-ingest Worker vars during (A,B overlap) and after (B only)
  *   R7 fence     old/next/both Workers around the owner rebind (needs the overlap, 044030)
  *   R8 read      the 047010 mixed-claim shape 17/170/6939/177 on real PostgreSQL
+ * The target commit: nothing held, the release sha. Held steps on a release checkout with
+ * the protected anchor (release-target.ts releaseAnchorBinding): the tip of the target's
+ * release/schema-<slot> branch in the full checkout (refs/remotes/origin/, source "ref");
+ * when the checkout has no such branch, a fixture anchor chain is built in the disposable
+ * checkout's own object database and local refs only (schema-rehearsal-core.ts
+ * buildAnchorFixture, source "fixture"; never pushed) off a first-parent main commit whose
+ * lane steps are prefix steps at the release bytes. Older release checkouts: the commit
+ * on the release sha's first-parent history at the dispatched generation (source "main").
  * Injections (REHEARSAL_INJECT) prove each refusal: ledger-gap, boundary-drift, late-step,
  * wrong-generation, stale-plan, missing-bootstrap (R2-bootstrap skipped: the apply refuses
- * 42704, then R2-bootstrap-rerun and R1-rerun complete the release as late-step does).
+ * 42704, then R2-bootstrap-rerun and R1-rerun complete the release as late-step does);
+ * anchor-tampered, anchor-nonlinear, anchor-extra-file, anchor-missing-verifier (stage
+ * R1-<inject>: the anchor tip is replaced by a mutated commit, mutateAnchorTip, and the
+ * plan refuses with production's code) and anchor-ref-moved (stage R4-anchor-ref-moved:
+ * after the plan the anchor branch moves to a twin commit; the apply's first anchor
+ * recompute refuses release_anchor_ref_mismatch before connecting, nothing written).
  * Every stage writes rehearsal-out/<stage>.json; the first FAIL stops the run.
  * REHEARSAL_EXPECT_REFUSAL (`<stage>:<code>`) marks a known-negative row: the run then
  * passes only if exactly that stage FAILs with exactly that code.
@@ -59,6 +72,12 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  anchorRefTip,
+  buildAnchorFixture,
+  mutateAnchorTip,
+  PLAN_ANCHOR_INJECTIONS,
+  removeAnchorRefs,
+  type AnchorGit,
   BOOTSTRAP_NEW_ROLES,
   bootstrapFiles,
   bootstrapRefreshEvidence,
@@ -262,6 +281,92 @@ export async function discoverAnchor(x: {
       ? rehearsalRefuse("rehearsal_generation_mismatch", { candidates: [...new Set(found.map((a) => a.targetGeneration))], scanned })
       : rehearsalRefuse("rehearsal_target_anchor_missing", { scanned });
   return hit;
+}
+/** The phase 2 verifier files' blob oids at a commit (the generation's verifier half). */
+function verifierKey(sha: string, paths: readonly string[]): string {
+  return paths.map((p) => git(["ls-tree", "--full-tree", sha, "--", p]).split("\t")[0]!.split(" ")[2] ?? "").join(",");
+}
+/**
+ * The held-step target commit on a release checkout with the protected anchor: the
+ * target's release/schema-<slot> branch tip when the checkout has it (source "ref",
+ * returned unbound: the plan binds it through production's targetAnchor). Otherwise a
+ * fixture chain (buildAnchorFixture) off the newest first-parent main commit, per
+ * verifier generation, whose lane steps are all prefix steps at the release bytes (down
+ * to the commit that landed the baseline), bound by the release checkout's own
+ * releaseAnchorBinding at the dispatched generation; the fixture refs of every other
+ * candidate are removed. None: rehearsal_target_anchor_missing; only other generations:
+ * rehearsal_generation_mismatch.
+ */
+export async function discoverReleaseAnchor(x: {
+  RT: { releaseAnchorBinding: (i: Record<string, unknown>) => any };
+  C: { releaseAnchorBranch: (step: string) => string | undefined };
+  M: { schemaStepDigests: (held: readonly string[]) => Promise<[string, string][]> };
+  ag: AnchorGit;
+  sha: string;
+  baseline: string;
+  target: string;
+  generation: string;
+  held: readonly string[];
+  bootstrapFiles: readonly string[];
+  verifierPaths: readonly string[];
+}): Promise<{ targetSha: string; source: "ref" | "fixture"; branch: string; refs: { branch: string; sha: string }[] }> {
+  const branch = x.C.releaseAnchorBranch(x.target);
+  if (!branch) return rehearsalRefuse("rehearsal_target_anchor_missing", { reason: "no_anchor_branch" });
+  const tip = anchorRefTip(x.ag, branch);
+  if (tip) return { targetSha: tip, source: "ref", branch, refs: [] };
+  const prefix = await x.M.schemaStepDigests(x.held);
+  const names = new Set(prefix.map(([n]) => n));
+  const release = laneTree(x.sha);
+  const want = new Map([...release].filter(([n]) => names.has(n)));
+  const slots = new Map<string, number>();
+  for (const n of release.keys()) {
+    const b = x.C.releaseAnchorBranch(n);
+    if (b) slots.set(b, (slots.get(b) ?? 0) + 1);
+  }
+  const rollbackPath = (n: string) => (n.startsWith("upstream:") ? `supabase/rollbacks/${n.slice(9, -4)}.down.sql` : undefined);
+  const stop = landingCommit(x.sha, x.baseline);
+  const seen = new Set<string>();
+  const generations = new Set<string>();
+  let scanned = 0;
+  for (const c of git(["rev-list", "--first-parent", "--max-count=3000", x.sha]).trim().split("\n")) {
+    scanned++;
+    const lanes = laneTree(c);
+    const key = [...lanes].every(([n, oid]) => want.get(n) === oid) ? verifierKey(c, x.verifierPaths) : undefined;
+    if (key !== undefined && !seen.has(key)) {
+      seen.add(key);
+      let built: { tip: string; refs: { branch: string; sha: string }[] } | undefined;
+      try {
+        built = buildAnchorFixture({
+          ...x.ag,
+          sha: x.sha,
+          base: c,
+          target: x.target,
+          prefix: prefix.map(([n]) => n),
+          baseSteps: new Set(lanes.keys()),
+          bootstrapFiles: x.bootstrapFiles,
+          branchOf: x.C.releaseAnchorBranch,
+          uniqueBranch: (b) => slots.get(b) === 1,
+          stepPath,
+          rollbackPath,
+        });
+      } catch (e) {
+        // A ref that already exists is never overwritten: stop rather than guess.
+        if (errorCode(e) === "rehearsal_anchor_fixture_conflict") throw e;
+      }
+      if (built) {
+        try {
+          const b = x.RT.releaseAnchorBinding({ repo: ROOT, releaseSha: x.sha, targetSha: built.tip, target: x.target, prefix });
+          if (b.targetGeneration === x.generation) return { targetSha: built.tip, source: "fixture", branch, refs: built.refs };
+          generations.add(b.targetGeneration);
+        } catch {}
+        removeAnchorRefs(x.ag, built.refs);
+      }
+    }
+    if (c === stop) break;
+  }
+  return generations.size
+    ? rehearsalRefuse("rehearsal_generation_mismatch", { candidates: [...generations], scanned, source: "fixture" })
+    : rehearsalRefuse("rehearsal_target_anchor_missing", { scanned, source: "fixture" });
 }
 const sameNames = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((n, i) => n === b[i]);
 const psql = (text: string) => text.split("\n").filter((l) => !l.startsWith("\\")).join("\n");
@@ -644,6 +749,39 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
   // sameAnchor): the repo is process.cwd(), which is ROOT.
   const sameAnchor = (a: unknown, b: unknown): boolean => D.sameAnchor(a, b);
   const anchorAt = async (targetSha: string, held: string[]) => D.targetAnchor({ sha, target, targetSha }, held);
+  // The held-step target commit (see the header): the protected anchor when the release
+  // checkout has the anchor API, else the first-parent main commit. A fixture is built
+  // once; later plans find its ref.
+  const anchored = typeof RT.releaseAnchorBinding === "function" && typeof C.releaseAnchorBranch === "function";
+  const ag: AnchorGit = {
+    run: runCommand,
+    repo: ROOT,
+    env: { PATH: process.env.PATH, HOME: process.env.HOME },
+    indexFile: join(mkdtempSync(join(tmpdir(), "rehearsal-anchor-")), "index"),
+  };
+  const verifierPaths = (M.RELEASE_TREE.verifiers as { path: string }[]).map((v) => v.path);
+  let anchorInfo: { source: "main" | "ref" | "fixture"; branch?: string } = { source: "main" };
+  let fixtureMade = false;
+  const resolveTarget = async (held: string[]): Promise<string> => {
+    if (!held.length) return sha;
+    if (!anchored) return (await discoverAnchor({ RT, M, sha, target, generation: B, held })).targetSha;
+    const r = await discoverReleaseAnchor({
+      RT,
+      C,
+      M,
+      ag,
+      sha,
+      baseline,
+      target,
+      generation: B,
+      held,
+      bootstrapFiles: SESSION_BOOTSTRAP_FILES,
+      verifierPaths,
+    });
+    if (r.source === "fixture") fixtureMade = true;
+    anchorInfo = { source: fixtureMade ? "fixture" : r.source, branch: r.branch };
+    return r.targetSha;
+  };
   const makePlan = async () => {
     const inspection = await I.inspectRelease(owner, BOUNDARY);
     const split = M.migrationTargetSplit(inspection.inventory, target);
@@ -651,8 +789,12 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
     const window = expectedWindow(tree, ledgered, target);
     if (!sameNames(window.expectedPending, split.expectedPending) || !sameNames(window.held, split.held))
       rehearsalRefuse("rehearsal_expected_pending", { expected: window.expectedPending.length, got: split.expectedPending.length });
-    const anchor = await discoverAnchor({ RT, M, sha, target, generation: B, held: split.held });
+    // Production's own binding of the target commit (targetAnchor: releaseAnchorBinding
+    // on an anchor-aware release checkout), so its refusals surface unchanged.
+    const anchor = await anchorAt(await resolveTarget(split.held), split.held);
     if (!split.held.length && anchor.targetGeneration !== fullGen) C.refuse("release_target_generation_changed");
+    if (split.held.length && anchor.targetGeneration !== B)
+      rehearsalRefuse("rehearsal_generation_mismatch", { candidates: [anchor.targetGeneration], source: anchorInfo.source });
     // As production writes release-plan/plan.json and reads it back.
     const plan = JSON.parse(
       JSON.stringify({
@@ -693,6 +835,33 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
     return;
   }
 
+  // The anchor tip mutated before the plan: production's binding refuses it.
+  const anchorTip = async () => {
+    const inspection = await I.inspectRelease(owner, BOUNDARY);
+    const held: string[] = M.migrationTargetSplit(inspection.inventory, target).held;
+    if (!anchored || !held.length) rehearsalRefuse("rehearsal_injection_unavailable", { inject, reason: anchored ? "nothing_held" : "no_anchor_api" });
+    return resolveTarget(held);
+  };
+  const mutateTip = (tip: string) =>
+    mutateAnchorTip({
+      ...ag,
+      sha,
+      branch: anchorInfo.branch!,
+      tip,
+      inject,
+      bootstrapFiles: SESSION_BOOTSTRAP_FILES,
+      verifierPath: verifierPaths[0]!,
+    });
+  const planInject = PLAN_ANCHOR_INJECTIONS.find((i) => i === inject);
+  if (planInject) {
+    await stage(`R1-${planInject}`, async () => {
+      const tip = await anchorTip();
+      mutateTip(tip);
+      return { anchorSource: anchorInfo.source, ...(await expectRefusal(INJECTION_REFUSAL[planInject], makePlan)) };
+    });
+    return;
+  }
+
   let planned!: Awaited<ReturnType<typeof makePlan>>;
   await stage("R1", async () => {
     planned = await makePlan();
@@ -706,6 +875,7 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
       expectedPending: a.expectedPending,
       held: a.held.length,
       inventory: planned.plan.inventory.length,
+      anchorSource: anchorInfo.source,
     };
   });
   const firstPending: string[] = planned.approved.expectedPending;
@@ -816,6 +986,17 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
       const r = await expectRefusal(INJECTION_REFUSAL["boundary-drift"], () => apply(planned, owner));
       if ((await ledgerDigest()) !== ledgerBefore) rehearsalRefuse("rehearsal_ledger_written");
       return { ...r, ledgerUnchanged: true };
+    });
+    return;
+  }
+  if (inject === "anchor-ref-moved") {
+    await stage("R4-anchor-ref-moved", async () => {
+      if (!planned.approved.held.length || anchorInfo.source === "main")
+        rehearsalRefuse("rehearsal_injection_unavailable", { inject });
+      const before = await snapshot();
+      mutateTip(planned.approved.targetSha);
+      const r = await expectRefusal(INJECTION_REFUSAL["anchor-ref-moved"], () => apply(planned, owner));
+      return { anchorSource: anchorInfo.source, ...r, ...(await unchanged(before)) };
     });
     return;
   }

@@ -48,6 +48,86 @@ SELECT (SELECT value->>'phase' FROM status) AS cutover_status,
        (SELECT count(*)::text FROM reset_rows) AS reset_count,
        (SELECT ${RESET_SET_DIGEST} FROM reset_rows) AS reset_set_sha256`;
 
+/**
+ * Step-6 edge 5: the same exact-user source snapshot, read from the frozen
+ * Supabase copy instead of Neon. It returns the NEON_OWNER_BUFFERED_CENSUS_SQL
+ * row shape and reuses the same digest expressions, so equal logical rows give
+ * byte-identical digests. `cutover_status` is 'active' only when the
+ * completeness seal is bound to the live ingest_lazy_policy (the predicate of
+ * sessions.ingest_frozen_source_policy(), without its valid_until lease) and
+ * sessions.ingest_privacy_authority is 'active' at the sealed epoch; otherwise
+ * it carries the refusal code and the census refuses before the target read.
+ * Owner-only tables; read-only; never writes.
+ */
+export const FROZEN_OWNER_BUFFERED_CENSUS_SQL = `
+WITH policy AS MATERIALIZED (
+  SELECT source_identity_sha256,control_epoch,privacy_baseline_sha256
+    FROM sessions.ingest_lazy_policy WHERE singleton
+), seal AS MATERIALIZED (
+  SELECT s.control_epoch,s.privacy_baseline_sha256
+    FROM sessions.ingest_frozen_source_completeness s
+    JOIN policy p ON p.source_identity_sha256=s.source_identity_sha256
+     AND p.control_epoch=s.control_epoch AND p.privacy_baseline_sha256=s.privacy_baseline_sha256
+   WHERE s.singleton
+), authority AS MATERIALIZED (
+  SELECT a.state
+    FROM sessions.ingest_privacy_authority a
+    JOIN seal ON seal.control_epoch=a.control_epoch
+   WHERE a.singleton
+), status AS MATERIALIZED (
+  SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM seal) THEN 'frozen_source_unsealed'
+              WHEN NOT EXISTS (SELECT 1 FROM authority WHERE state='active') THEN 'privacy_authority_not_active'
+              ELSE 'active' END AS phase
+), head AS MATERIALIZED (
+  SELECT epoch,version::text AS version,digest,kind,pending
+    FROM sessions.ingest_source_control_heads
+   WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3
+), deletion_rows AS MATERIALIZED (
+  SELECT origin_id,source,session_id
+    FROM sessions.ingest_frozen_source_deletions
+   WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3
+), reset_rows AS MATERIALIZED (
+  SELECT request_id
+    FROM sessions.ingest_frozen_source_resets
+   WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3
+)
+SELECT (SELECT phase FROM status) AS cutover_status,
+       (SELECT control_epoch FROM seal) AS control_epoch,
+       (SELECT privacy_baseline_sha256 FROM seal) AS privacy_baseline_sha256,
+       (SELECT to_jsonb(head) FROM head) AS head,
+       (SELECT count(*)::text FROM deletion_rows) AS deletion_count,
+       (SELECT ${DELETION_SET_DIGEST} FROM deletion_rows) AS deletion_set_sha256,
+       (SELECT count(*)::text FROM reset_rows) AS reset_count,
+       (SELECT ${RESET_SET_DIGEST} FROM reset_rows) AS reset_set_sha256`;
+
+/** Where G1/G2 read the source side. `neon` is the default and the pre-edge-5 behaviour. */
+export type ParityCensusSource = "neon" | "frozen-supabase";
+export const PARITY_CENSUS_SOURCES: readonly ParityCensusSource[] = Object.freeze(["neon", "frozen-supabase"] as const);
+
+interface CensusSourceSpec {
+  sql: string;
+  /** Prefix of every source-side refusal code (`${prefix}_row_missing`, ...). */
+  prefix: string;
+  changedCode: string;
+  /** Refuse an unready source on snapshot A, before the target is read. */
+  preflight: boolean;
+}
+
+const CENSUS_SOURCES: Readonly<Record<ParityCensusSource, CensusSourceSpec>> = {
+  "neon": { sql: NEON_OWNER_BUFFERED_CENSUS_SQL, prefix: "neon", changedCode: "neon_changed_during_census", preflight: false },
+  "frozen-supabase": {
+    sql: FROZEN_OWNER_BUFFERED_CENSUS_SQL, prefix: "frozen_source",
+    changedCode: "frozen_source_changed_during_census", preflight: true,
+  },
+};
+
+const FROZEN_STATUS_REFUSALS = new Set(["frozen_source_unsealed", "privacy_authority_not_active"]);
+
+function censusSourceSpec(source: ParityCensusSource): CensusSourceSpec {
+  if (!Object.hasOwn(CENSUS_SOURCES, source)) throw new ParityCensusRefusal("census_source_invalid");
+  return CENSUS_SOURCES[source];
+}
+
 /** One exact-user target snapshot through 043700's canonical digest helper. */
 export const TARGET_OWNER_BUFFERED_CENSUS_SQL = `
 WITH policy AS MATERIALIZED (
@@ -315,16 +395,28 @@ function parseReceipt(value: unknown, code: string): ControlReceipt | null {
   return receipt;
 }
 
-function censusInput(tenant: ParityTenant, source: NeonCensusRow, destination: TargetCensusRow): ParityCensusInput {
-  if (source.cutover_status !== "active") throw new ParityCensusRefusal("neon_cutover_not_active");
-  boundedCount(source.deletion_count, 200_000n, "neon_deletion_set_too_large");
-  boundedCount(source.reset_count, 100_000n, "neon_reset_set_too_large");
+function requireSourceActive(spec: CensusSourceSpec, source: NeonCensusRow): void {
+  if (source.cutover_status === "active") return;
+  if (spec.preflight && typeof source.cutover_status === "string" && FROZEN_STATUS_REFUSALS.has(source.cutover_status))
+    throw new ParityCensusRefusal(source.cutover_status);
+  throw new ParityCensusRefusal(`${spec.prefix}_cutover_not_active`);
+}
+
+function censusInput(
+  tenant: ParityTenant,
+  source: NeonCensusRow,
+  destination: TargetCensusRow,
+  spec: CensusSourceSpec = CENSUS_SOURCES.neon,
+): ParityCensusInput {
+  requireSourceActive(spec, source);
+  boundedCount(source.deletion_count, 200_000n, `${spec.prefix}_deletion_set_too_large`);
+  boundedCount(source.reset_count, 100_000n, `${spec.prefix}_reset_set_too_large`);
   if (typeof destination.receipts_contiguous !== "boolean") throw new ParityCensusRefusal("target_lineage_shape_invalid");
   return {
     tenant,
     controlEpoch: String(source.control_epoch ?? ""),
     privacyBaselineSha256: String(source.privacy_baseline_sha256 ?? ""),
-    head: parseHead(source.head, "neon_head_shape_invalid"),
+    head: parseHead(source.head, `${spec.prefix}_head_shape_invalid`),
     sourceDeletionSetSha256: String(source.deletion_set_sha256 ?? ""),
     sourceResetSetSha256: String(source.reset_set_sha256 ?? ""),
     targetControlEpoch: String(destination.control_epoch ?? ""),
@@ -338,14 +430,14 @@ function censusInput(tenant: ParityTenant, source: NeonCensusRow, destination: T
   };
 }
 
-function targetParams(tenant: ParityTenant, source: NeonCensusRow): unknown[] {
-  const head = parseHead(source.head, "neon_head_shape_invalid");
+function targetParams(tenant: ParityTenant, source: NeonCensusRow, spec: CensusSourceSpec): unknown[] {
+  const head = parseHead(source.head, `${spec.prefix}_head_shape_invalid`);
   return [tenant.orgId, tenant.workspaceId, tenant.userId, String(source.control_epoch ?? ""),
     head?.version ?? null, head?.digest ?? null, head?.kind ?? null];
 }
 
-function sourceSnapshotKey(source: NeonCensusRow): string {
-  const head = parseHead(source.head, "neon_head_shape_invalid");
+function sourceSnapshotKey(source: NeonCensusRow, spec: CensusSourceSpec): string {
+  const head = parseHead(source.head, `${spec.prefix}_head_shape_invalid`);
   return JSON.stringify([
     source.cutover_status, source.control_epoch, source.privacy_baseline_sha256,
     head === null ? null : [head.epoch, head.version, head.digest, head.kind, head.pending],
@@ -375,23 +467,47 @@ function storedProof(tenant: ParityTenant, row: Record<string, unknown> | undefi
   return proof;
 }
 
-/** G1: read both databases only, then emit one content-free proof receipt. */
+/** Source snapshot A; a frozen source that is unsealed or not authority-active refuses here. */
+async function readSourceA(source: Queryable, spec: CensusSourceSpec, params: unknown[]): Promise<NeonCensusRow> {
+  const row = await readOnly<NeonCensusRow>(source, spec.sql, params, spec.prefix);
+  if (spec.preflight) requireSourceActive(spec, row);
+  return row;
+}
+
+/** Source snapshot B; equality with A proves the source did not move across the target-side census. */
+async function readSourceB(
+  source: Queryable,
+  spec: CensusSourceSpec,
+  params: unknown[],
+  sourceA: NeonCensusRow,
+): Promise<NeonCensusRow> {
+  const row = await readOnly<NeonCensusRow>(source, spec.sql, params, `${spec.prefix}_recheck`);
+  if (sourceSnapshotKey(sourceA, spec) !== sourceSnapshotKey(row, spec)) throw new ParityCensusRefusal(spec.changedCode);
+  return row;
+}
+
+/**
+ * G1: read both databases only, then emit one content-free proof receipt.
+ * `censusSource` selects the source-side reader; the default is Neon.
+ */
 export async function readParityCensus(
   neon: Queryable,
   target: Queryable,
   tenant: ParityTenant,
+  censusSource: ParityCensusSource = "neon",
 ): Promise<ParityCensusReceipt> {
+  const spec = censusSourceSpec(censusSource);
   if (!validParityTenant(tenant)) throw new ParityCensusRefusal("tenant_invalid");
   const params = [tenant.orgId, tenant.workspaceId, tenant.userId];
-  const sourceA = await readOnly<NeonCensusRow>(neon, NEON_OWNER_BUFFERED_CENSUS_SQL, params, "neon");
-  const destination = await readOnly<TargetCensusRow>(target, TARGET_OWNER_BUFFERED_CENSUS_SQL, targetParams(tenant, sourceA), "target");
-  const sourceB = await readOnly<NeonCensusRow>(neon, NEON_OWNER_BUFFERED_CENSUS_SQL, params, "neon_recheck");
-  if (sourceSnapshotKey(sourceA) !== sourceSnapshotKey(sourceB)) throw new ParityCensusRefusal("neon_changed_during_census");
-  return evaluateParityCensus(censusInput(tenant, sourceB, destination));
+  const sourceA = await readSourceA(neon, spec, params);
+  const destination = await readOnly<TargetCensusRow>(target, TARGET_OWNER_BUFFERED_CENSUS_SQL, targetParams(tenant, sourceA, spec), "target");
+  const sourceB = await readSourceB(neon, spec, params, sourceA);
+  return evaluateParityCensus(censusInput(tenant, sourceB, destination, spec));
 }
 
 /**
- * G2 orchestration. Caller supplies pinned Neon-read and target-owner sessions;
+ * G2 orchestration. Caller supplies pinned source-read (Neon by default, or the
+ * frozen Supabase copy) and target-owner sessions;
  * credentials never enter the proof or logs. This function is the only writer.
  */
 export async function writeCurrentParityProof(
@@ -399,7 +515,9 @@ export async function writeCurrentParityProof(
   targetOwner: Queryable,
   tenant: ParityTenant,
   expectedTargetGeneration?: string,
+  censusSource: ParityCensusSource = "neon",
 ): Promise<{ census: ParityCensusReceipt; outcome: ProofWritePlan; writtenAt: unknown | null }> {
+  const spec = censusSourceSpec(censusSource);
   if (!validParityTenant(tenant)) throw new ParityCensusRefusal("tenant_invalid");
   const params = [tenant.orgId, tenant.workspaceId, tenant.userId];
   await targetOwner.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
@@ -407,14 +525,13 @@ export async function writeCurrentParityProof(
     await targetOwner.query("SET LOCAL statement_timeout = '2s'");
     // REPEATABLE READ takes its snapshot on the first data statement, not BEGIN/SET.
     await targetOwner.query("SELECT control_epoch AS snapshot_anchor FROM sessions.ingest_lazy_policy WHERE singleton");
-    const sourceA = await readOnly<NeonCensusRow>(neon, NEON_OWNER_BUFFERED_CENSUS_SQL, params, "neon");
-    const destination = (await targetOwner.query<TargetCensusRow>(TARGET_OWNER_BUFFERED_CENSUS_SQL, targetParams(tenant, sourceA))).rows[0];
+    const sourceA = await readSourceA(neon, spec, params);
+    const destination = (await targetOwner.query<TargetCensusRow>(TARGET_OWNER_BUFFERED_CENSUS_SQL, targetParams(tenant, sourceA, spec))).rows[0];
     if (!destination) throw new ParityCensusRefusal("target_row_missing");
     const prior = storedProof(tenant, (await targetOwner.query<Record<string, unknown>>(READ_OWNER_BUFFERED_PARITY_SQL, params)).rows[0]);
-    // Equality proves Neon did not move across the target-side census.
-    const sourceB = await readOnly<NeonCensusRow>(neon, NEON_OWNER_BUFFERED_CENSUS_SQL, params, "neon_recheck");
-    if (sourceSnapshotKey(sourceA) !== sourceSnapshotKey(sourceB)) throw new ParityCensusRefusal("neon_changed_during_census");
-    const census = evaluateParityCensus(censusInput(tenant, sourceB, destination));
+    // Equality proves the source did not move across the target-side census.
+    const sourceB = await readSourceB(neon, spec, params, sourceA);
+    const census = evaluateParityCensus(censusInput(tenant, sourceB, destination, spec));
     if (!census.equal || !census.proof) throw new ParityCensusRefusal(`parity_mismatch:${census.mismatches.join(",")}`);
     if (expectedTargetGeneration !== undefined && census.proof.targetGeneration !== expectedTargetGeneration)
       throw new ParityCensusRefusal("target_generation_mismatch");

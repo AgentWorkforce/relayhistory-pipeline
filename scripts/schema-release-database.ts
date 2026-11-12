@@ -12,7 +12,8 @@ import {
 } from "../src/hoopdb/migrate.ts";
 import {
   parseReleaseManifest,
-  releaseTargetBinding,
+  releaseAnchorBinding,
+  requireReleaseAnchor,
   requireTargetCommit,
   type ReleaseTargetAnchor,
 } from "../src/hoopdb/release-target.ts";
@@ -129,11 +130,15 @@ export function validateReleasePlan(
 }
 /**
  * The target anchor from the local Git object database only (no fetch): target_sha
- * must be the release sha or on its first-parent (main) history, and its tree's schema steps equal this
- * checkout's steps without `held`, by name and sha256 (release-target.ts).
+ * must be the release sha (nothing held) or the tip of the protected
+ * release/schema-<slot> anchor branch for the target, linear off main with an
+ * allowlisted, release-identical diff, and its tree's schema steps equal this
+ * checkout's steps without `held`, by name and sha256 (release-target.ts
+ * releaseAnchorBinding). Recomputed before connecting, after inspection and under the
+ * migrator lock.
  */
 export async function targetAnchor(input: { sha: string; target: string; targetSha: string }, held: string[]) {
-  return releaseTargetBinding({
+  return releaseAnchorBinding({
     repo: process.cwd(),
     releaseSha: input.sha,
     targetSha: input.targetSha,
@@ -297,8 +302,11 @@ export async function releaseDatabase() {
     (await generation()) !== input.generation
   )
     refuse("release_checkout_generation");
-  // target_sha: a local commit, the release sha or on its first-parent chain (no network git).
-  requireTargetCommit(process.cwd(), input.sha, input.targetSha);
+  // target_sha: the release sha itself, or the tip of the protected release/schema-<slot>
+  // anchor branch for the target (release-target.ts requireReleaseAnchor; no network git).
+  if (input.targetSha === input.sha) requireTargetCommit(process.cwd(), input.sha, input.targetSha);
+  else
+    requireReleaseAnchor({ repo: process.cwd(), releaseSha: input.sha, targetSha: input.targetSha, target: input.target });
   if (input.mode === "bootstrap") return releaseBootstrap(get, input);
   const profile = releaseProfile(input.boundary);
   const approvedPlan =
