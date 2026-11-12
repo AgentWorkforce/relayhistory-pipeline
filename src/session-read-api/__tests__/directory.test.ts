@@ -338,6 +338,45 @@ describe("mapping and cursors", () => {
       expect(() => sessionFromDirectoryRow(bad)).toThrow(DirectoryError);
   });
 
+  test("includeShortSummary=recorded: absent keeps the exact key set; present adds only the two recorded keys", () => {
+    const recorded = { short_summary: "Recorded summary", short_summary_generated_at: new Date("2026-10-03T04:05:06.789Z") };
+    const plain = sessionFromDirectoryRow(dirRow());
+    const plainWithStored = sessionFromDirectoryRow(dirRow(recorded));
+    // Not requested: byte-identical to a row with no stored summary, and none of the keys.
+    expect(JSON.stringify(plainWithStored)).toBe(JSON.stringify(plain));
+    expect(plainWithStored).not.toHaveProperty("shortSummary");
+    expect(plainWithStored).not.toHaveProperty("shortSummaryGeneratedAt");
+    expect(JSON.stringify(sessionFromDirectoryRow(dirRow(recorded), { includeAgentName: "recorded" }))).toBe(JSON.stringify(plain));
+    // Requested, populated: the stored text and an ISO timestamp, nothing else changes.
+    const withSummary = sessionFromDirectoryRow(dirRow(recorded), { includeShortSummary: "recorded" });
+    const { shortSummary, shortSummaryGeneratedAt, ...rest } = withSummary;
+    expect([shortSummary, shortSummaryGeneratedAt]).toEqual(["Recorded summary", "2026-10-03T04:05:06.789Z"]);
+    expect(JSON.stringify(rest)).toBe(JSON.stringify(plain));
+    expect(sessionFromDirectoryRow(dirRow({ short_summary: "s", short_summary_generated_at: "2026-10-03 04:05:06.789+00" }), { includeShortSummary: "recorded" }).shortSummaryGeneratedAt)
+      .toBe("2026-10-03T04:05:06.789Z");
+    // Requested, null: both keys present as null; no title or task-title substitution.
+    const nulls = sessionFromDirectoryRow(dirRow(), { includeShortSummary: "recorded" });
+    expect(nulls).toHaveProperty("shortSummary", null);
+    expect(nulls).toHaveProperty("shortSummaryGeneratedAt", null);
+    expect(sessionFromDirectoryRow(dirRow({ short_summary: undefined as never, short_summary_generated_at: undefined as never }), { includeShortSummary: "recorded" }))
+      .toMatchObject({ shortSummary: null, shortSummaryGeneratedAt: null });
+    expect(Object.keys(nulls).slice(-2)).toEqual(["shortSummary", "shortSummaryGeneratedAt"]);
+  });
+
+  test("includeShortSummary=recorded: the producer's 1000-character bound, in code points; beyond it or a bad value is a parse error", () => {
+    const opt = { includeShortSummary: "recorded" } as const;
+    expect(sessionFromDirectoryRow(dirRow({ short_summary: "s".repeat(1000) }), opt).shortSummary).toHaveLength(1000);
+    expect(sessionFromDirectoryRow(dirRow({ short_summary: "😀".repeat(1000) }), opt).shortSummary).toBe("😀".repeat(1000));
+    for (const bad of [
+      dirRow({ short_summary: "s".repeat(1001) }), dirRow({ short_summary: "😀".repeat(1001) }),
+      dirRow({ short_summary: 42 as never }), dirRow({ short_summary: "s", short_summary_generated_at: "not a time" }),
+    ]) {
+      expect(() => sessionFromDirectoryRow(bad, opt)).toThrow(DirectoryError);
+      // Not requested: the summary columns are never read.
+      expect(() => sessionFromDirectoryRow(bad)).not.toThrow();
+    }
+  });
+
   test("cursor round trip keeps microseconds; anything else is foreign or invalid", () => {
     const c = { lastActivityAt: "2026-10-02T03:04:05.123456Z", sessionId: "s/é 1", harness: "claude" };
     expect(decodeListCursor(encodeListCursor(c))).toEqual(c);
