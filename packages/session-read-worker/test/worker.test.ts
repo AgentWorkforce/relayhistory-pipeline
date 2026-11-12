@@ -247,6 +247,30 @@ describe("entry and configuration", () => {
     }
   });
 
+  test("047020 paged stages flag: default off; the paged RPC only with exact-session on and the exact string on", async () => {
+    const seen: string[] = [];
+    const envelope = { stages: [], cursor: null, has_more: false, snapshot_at: "2026-11-05T12:30:00.000Z" };
+    const run = (async (_org: string, _ws: string, work: any) =>
+      work({ query: async (sql: string) => { seen.push(sql); return { rows: sql.includes("buffered_session_stages_for_target_paged(") ? [envelope] : [] }; } })) as never;
+    const keys = { RELAYHISTORY_READ_OWNER_BUFFERED: "true", INGEST_S3_BUCKET: "ingest-bucket-example", PIPELINE_RAW_S3_ACCESS_KEY_ID: "k", PIPELINE_RAW_S3_SECRET_ACCESS_KEY: "s" };
+    const head = { cutoverEpoch: "1".repeat(64), privacyBaselineSha256: "4".repeat(64), head: null } as never;
+    const scope = { orgId: "org-a", workspaceId: "ws-a", userId: "u-1" };
+    for (const exact of [undefined, "off", "on"]) {
+      for (const paged of [undefined, "", "off", "true", "ON", " on ", "on"]) {
+        const deps = ownerBufferedDeps({ ...E, ...keys, READ_API_OWNER_BUFFERED_EXACT_SESSION: exact, READ_API_OWNER_BUFFERED_STAGES_PAGED: paged } as Env, run)!;
+        seen.length = 0;
+        await deps.reads.stages(scope, head, "droid", "fixture-session");
+        const rpc = seen.filter((sql) => sql.includes("sessions.buffered_session_stages_for"));
+        expect(rpc, `${exact}/${paged}`).toHaveLength(1);
+        const want = exact !== "on" ? "sessions.buffered_session_stages_for(" : paged === "on" ? "sessions.buffered_session_stages_for_target_paged(" : "sessions.buffered_session_stages_for_target(";
+        expect(rpc[0], `${exact}/${paged}`).toContain(want);
+        if (!(exact === "on" && paged === "on")) expect(seen.some((sql) => sql.includes("_paged(")), `${exact}/${paged}`).toBe(false);
+      }
+    }
+    // The paged flag alone never enables owner-buffered reads.
+    expect(ownerBufferedDeps({ ...E, ...keys, RELAYHISTORY_READ_OWNER_BUFFERED: undefined, READ_API_OWNER_BUFFERED_EXACT_SESSION: "on", READ_API_OWNER_BUFFERED_STAGES_PAGED: "on" } as Env, run)).toBeUndefined();
+  });
+
   test("READ_API_OWNER_BUFFERED_STATEMENT_TIMEOUT_MS: unset keeps 2000; 2000..6000 is passed to the buffered RPCs; a bad value is a 503", async () => {
     const seen: string[] = [];
     const run = (async (_org: string, _ws: string, work: (q: { query(sql: string, params?: unknown[]): Promise<{ rows: unknown[] }> }) => Promise<unknown>) =>

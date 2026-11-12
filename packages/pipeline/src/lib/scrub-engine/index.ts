@@ -410,7 +410,7 @@ const boundSealers = new WeakMap<ScrubEngine, BoundRawChunkSealer>();
 
 /**
  * The raw-chunk sealer a production constructor installs as `rawChunkSealer`
- * (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.6").
+ * (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.8").
  *
  * - SCRUB_ENGINE unset, "" or "ts" (and the raw-ABI "wasm"): `undefined`, with no
  *   selection or any other side effect, so the constructor's object is exactly
