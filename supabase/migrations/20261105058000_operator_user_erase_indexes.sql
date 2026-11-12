@@ -2,9 +2,8 @@
 -- applying this to any real database needs Khaliq's explicit OK.
 --
 -- Eleven indexes. Ten serve foreign keys whose referencing column no index leads with: deleting a referenced row
--- then makes PostgreSQL check the referencing table by sequential scan, once per deleted row. On production
--- (ingest_lazy_ack_decisions ~74M rows, ingest_lazy_native_slots ~28M) a 100k-slot user erase never finishes
--- (observed 2026-11-11). With these indexes each check is an index probe, and the erase finds a user's
+-- then makes PostgreSQL check the referencing table by sequential scan, once per deleted row. On production-size
+-- tables a large user's erase never finishes that way. With these indexes each check is an index probe, and the erase finds a user's
 -- referencing rows without a full scan:
 --   ingest_lazy_ack_decisions(native_key_sha256)   -> ingest_lazy_native_slots(key_sha256)
 --   ingest_lazy_ack_decisions(seat_key_sha256)     -> ingest_receipt_seats(key_sha256)
