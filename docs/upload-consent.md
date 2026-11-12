@@ -121,6 +121,17 @@ Every refusal (and every would-be refusal under `report`) logs one line. It uses
 
 It never includes a user, origin, session or record id, and never content.
 
+## Configuration
+
+- Hosted ingest Worker: the Cloudflare stack input `sessionIngest.uploadConsent` (`"report"`, `"hold-only"` or
+  `"enforce"`; omit for off) renders `INGEST_UPLOAD_CONSENT`. Any other value is refused at plan time.
+- Self-host: set `INGEST_UPLOAD_CONSENT` on the pipeline image.
+- relayhistory-cloud: set `UPLOAD_CONSENT_REQUIRES_INGEST=on` so that local-path uploads are held too.
+- Apply migration `20261105057010_upload_consent.sql` before any mode, report included. Report never
+  refuses an upload. It logs `error_code=upload_consent_store_unavailable` with the store's closed
+  `db_error_code` (for example `ledger_sqlstate_42883` when the migration is missing). But a selection
+  disable answers 503 until its deny can be recorded.
+
 ## Modes
 
 `off` (default) → `report` → `hold-only` (containment cohort) → `enforce`.

@@ -24,7 +24,7 @@ on:
         type: string
         default: ""
       confirmation:
-        description: 'Deploy only: DEPLOY 96bulls-session-ingest <sha> PLAN <plan_run>'
+        description: 'Deploy: DEPLOY 96bulls-session-ingest <sha> PLAN <run>; first frozen promotion appends SHADOW <reviewed receipt sha256>; then " OVERLAP <H>" only when the tracked profile declares overlapGeneration'
         type: string
         default: ""
 
@@ -138,8 +138,12 @@ jobs:
             docs/plans/cf-sessions-prod.plan.detailed.txt
             docs/plans/cf-sessions-prod.inputs.sanitized.json
             docs/plans/cf-sessions-prod.provenance.json
+            docs/plans/cf-sessions-prod.custody-evidence.json
           if-no-files-found: error
           retention-days: 1
+      - name: Remove staged custody evidence before downloading the retained plan
+        if: inputs.mode == 'deploy'
+        run: rm -- docs/plans/cf-sessions-prod.custody-evidence.json
       - name: Download the exact prior plan
         if: inputs.mode == 'deploy'
         uses: actions/download-artifact@v4
@@ -162,11 +166,12 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           PRIVATE_INGEST_STATE_TOKEN: ${{ secrets.PRIVATE_INGEST_STATE_TOKEN }}
           PRIVATE_INGEST_GITHUB_GATE: approved
-        run: >-
-          bun scripts/private-ingest-operator.ts deploy
-          --expected-sha "$GITHUB_SHA"
-          --inputs-sha256 "${{ steps.profile.outputs.inputs_sha256 }}"
-          --provenance-sha256 "${{ steps.approval.outputs.provenance_sha256 }}"
+        run: |
+          bun scripts/private-ingest-ci.ts preflight
+          bun scripts/private-ingest-operator.ts deploy \
+            --expected-sha "$GITHUB_SHA" \
+            --inputs-sha256 "${{ steps.profile.outputs.inputs_sha256 }}" \
+            --provenance-sha256 "${{ steps.approval.outputs.provenance_sha256 }}"
       - name: Verify the current 100% version and exact ingest profile
         if: inputs.mode == 'deploy'
         env:

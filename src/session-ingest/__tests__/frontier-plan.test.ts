@@ -165,7 +165,7 @@ describe("canonical frontier read-only planner", () => {
   });
 
   test("unsupported non-ASCII or surrogate identifiers HOLD without changing planner order", () => {
-    const bytes = readFileSync(new URL("../../../docs/handoffs/frontier-attester-20261107/publication-frontier-contract-vectors-20261107.json", import.meta.url));
+    const bytes = readFileSync(new URL("../../../docs/contracts/frontier-attester-20261107/publication-frontier-contract-vectors-20261107.json", import.meta.url));
     expect(createHash("sha256").update(bytes).digest("hex")).toBe("fd3f8908524b708b24e1511dc88795eb365304f7e3d74cb6267f4491a3231abe");
     const vector = JSON.parse(bytes.toString("utf8")).plannerNonAsciiOrderVector as { identifiers: string[]; expected: string };
     expect(vector.expected).toBe("HOLD_UNTIL_REVIEWED_049_AMENDMENT");

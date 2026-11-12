@@ -243,14 +243,40 @@ To keep that one window as short as possible:
    under concurrent synthetic uploads (§4). The approved owner-apply can instead open it under its own lock
    through `generationOverlapIntegration` (`src/hoopdb/ingest-generation-overlap.ts`). That fixed entry is a
    separate reviewed change, and the stock CLI is not modified here.
-3. **Apply.** Use the normal owner-apply. Marker `(H, pending)` → `(H, pass)`. Uploads continue at G
-   throughout.
+3. **Apply.** Use the normal owner-apply. Marker `(H, pending)` → `(H, pass)`. With the stock CI path
+   (`admitDuringApply` off, pinned by `src/hoopdb/ingest-generation-overlap-operator.ts`) uploads at G are
+   refused from the pending write until the marker is PASS at H: a 503 with `Retry-After`, as long as the
+   apply. The window closes the PASS → rebind → Worker-deploy gap, not the apply interval. Uploads continue
+   at G throughout the apply only with `--admit-during-apply`, which is a separately reviewed follow-up
+   (§4 full-union rehearsal first).
 4. **Other runtime replacements.** GC and publisher, as today. The GC at G is also admitted during the
    window (same role). The publisher and history stay on exact PASS and pause, as today.
 5. **Rebind.** `ingest-generation-rebind.ts --from G --to H --execute` moves the policy and admissions and
    closes the window in one transaction. The `{G,H}` Worker's next G call gets 55000, retries at H, and is
    admitted.
 6. **Worker cleanup.** Deploy with `expectedGeneration = H` and no overlap.
+
+**Production CI path.** For the production private-ingest Worker, steps 1 and 6 use the reviewed
+`PRIVATE_INGEST_OVERLAP` pair in `src/session-ingest/private-ingest-release.ts`, the tracked
+`overlapGeneration` and the private-ingest deploy workflow. Step 2, plus a read-only readback and an owner
+close, use `.github/workflows/ingest-generation-overlap.yml`, which calls
+`src/hoopdb/ingest-generation-overlap-operator.ts`. The pair is never a dispatch input, and
+`admitDuringApply` is always off on that path.
+
+Release contract on that path (`src/session-ingest/private-ingest-release.ts`, `scripts/private-ingest-ci.ts`):
+- The deploy confirmation is `DEPLOY 96bulls-session-ingest <sha> PLAN <plan_run>[ SHADOW <sha256>][ OVERLAP <H>]`.
+  `SHADOW` binds only to the single-generation `step-0-shadow -> step-1-custody` edge and `OVERLAP` only to a
+  tracked `overlapGeneration`, so the two never co-occur.
+- Every base phase has exactly one twin named `<phase>-overlap` that keeps the base profile and adds
+  `INGEST_ACCEPT_GENERATIONS=G,H`.
+- The gate allows only G -> G+H (step 1), G+H -> H (step 6) and the rollback G+H -> G. H -> G+H, G -> H and
+  H -> G always refuse. While the live Worker is at G+H the rollout phase is frozen: changing it refuses with
+  `private_ingest_live_transition`. `step-0-shadow-overlap` is entered only from `step-0-shadow` and leaves
+  only to `step-0-shadow` at H or G, so no overlap path skips `step-0-shadow`.
+- A live accept set the tracked profile does not declare refuses with `private_ingest_live_undeclared_overlap`;
+  a live state that matches no permitted phase refuses with `private_ingest_live_phase`.
+- Roll back G+H -> G only while the marker is still at G. Once the apply has moved it to H, finish the rebind
+  and go forward to H.
 
 If the window expires before step 5, the fence fails closed: today's outage, never a widening. Choose a TTL
 that covers steps 3–5. The maximum is 4 h.

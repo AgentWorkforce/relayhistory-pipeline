@@ -1,0 +1,79 @@
+name: frozen source custody
+# The qualified supervisor of the frozen-source copy (docs/p1-frozen-source-custody.md, "Supervisor (protected workflow)").
+# Creating and protecting the environment, adding its secret and every dispatch are Khaliq's actions only.
+run-name: frozen-source-custody ${{ inputs.mode }} ${{ inputs.sha }}
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [plan, copy, seal, readback]
+        required: true
+      sha:
+        type: string
+        required: true
+      plan_run:
+        type: string
+        default: ""
+      approval:
+        type: string
+        default: ""
+permissions:
+  contents: read
+  actions: read
+  deployments: read
+concurrency:
+  group: frozen-source-custody-production
+  cancel-in-progress: false
+env:
+  CUSTODY_MODE: ${{ inputs.mode }}
+  CUSTODY_SHA: ${{ inputs.sha }}
+  CUSTODY_PLAN_RUN: ${{ inputs.plan_run }}
+  CUSTODY_APPROVAL: ${{ inputs.approval }}
+jobs:
+  # No environment here: a typo/missing environment must not auto-create an unprotected one.
+  prerequisite-gate:
+    if: github.repository_id == '1437714333' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Verify dispatcher, live main, environment protection, exact-head CI and plan run
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          bun scripts/frozen-source-custody-github.ts
+          echo "environment=frozen-source-custody-production" >> "$GITHUB_OUTPUT"
+  custody:
+    needs: prerequisite-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    environment: ${{ needs.prerequisite-gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - name: Re-verify under the environment (approval and deployment of this run)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/frozen-source-custody-github.ts --protected
+      - name: Frozen-source custody operator
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          FROZEN_COPY_CREDENTIALS: ${{ secrets.FROZEN_COPY_CREDENTIALS }}
+        run: printf '%s' "$FROZEN_COPY_CREDENTIALS" | bun scripts/frozen-source-copy.ts "--$CUSTODY_MODE" --page 5000 --max-pages 0 --budget-ms 19800000

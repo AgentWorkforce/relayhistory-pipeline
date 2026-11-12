@@ -90,6 +90,7 @@ describe("unified sessions function-boundary generator", () => {
       "supabase/rollbacks/20261105050000_operator_session_erase.down.sql",
       "supabase/rollbacks/20261105050010_operator_session_erase_fence_check.down.sql",
       "supabase/rollbacks/20261105050020_operator_session_erase_runtime.down.sql",
+      "supabase/rollbacks/20261105057030_selfhost_erase_directory_membership.down.sql",
     ]);
   });
 

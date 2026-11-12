@@ -1,6 +1,6 @@
 /**
  * Guarded 96bulls AWS stage. The aws-sessions-prod transcript store was applied
- * in two passes on 2026-10-31 (runbooks/sessions-prod-transcript-store.md);
+ * in two passes on 2026-10-31 (sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-transcript-store.md);
  * other stages have their own evidence. Kept in its own Alchemy config so the
  * local stack never loads AWS providers or looks for credentials.
  *

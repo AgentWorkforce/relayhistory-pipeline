@@ -1175,6 +1175,19 @@ test("workflow carries the required target through env and into the approval tex
   expect(w.match(/inputs\.target_generation\b/g)).toHaveLength(1);
   expect(w.match(/inputs\.target_sha\b/g)).toHaveLength(1);
 });
+test("every release plan/apply inspection is scoped to its release target (held adoptable-index steps are not preflighted)", () => {
+  const read = (rel: string) => readFileSync(new URL(`../../../${rel}`, import.meta.url), "utf8");
+  expect(read("src/hoopdb/schema-release-inspect.ts")).toContain("inspectMigrations(client, releaseProfile(boundary), { target });");
+  const db = read("scripts/schema-release-database.ts");
+  expect(db.match(/inspectRelease\(/g)).toHaveLength(1);
+  expect(db).toContain("await inspectRelease(client, input.boundary, input.target);");
+  const op = read("scripts/schema-release-operator-plan.ts");
+  expect(op.match(/inspectRelease\(/g)).toHaveLength(1);
+  expect(op).toContain("await inspectRelease(client, input.boundary, input.target);");
+  const rehearsal = read("scripts/pg-proof/schema-rehearsal.ts");
+  expect(rehearsal.match(/I\.inspectRelease\(/g)).toHaveLength(3);
+  expect(rehearsal.match(/I\.inspectRelease\((owner|client), BOUNDARY, target\)/g)).toHaveLength(3);
+});
 test("operator plan renders the target split and refuses a missing target before connecting", () => {
   const src = readFileSync(
     new URL("../../../scripts/schema-release-operator-plan.ts", import.meta.url),

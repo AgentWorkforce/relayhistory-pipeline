@@ -1248,8 +1248,12 @@ async function adoptableIndexReason(
 /**
  * The adoptable-index steps' blocking-build decision, read-only, before any write (the
  * migrator writes its 'pending' readiness marker only after this passes, and the release
- * plan runs the same check). For every UNLEDGERED step in ADOPTABLE_INDEXES and each of its
- * declared indexes, the same table the step itself applies (20261105044020):
+ * plan runs the same check). For every UNLEDGERED step in ADOPTABLE_INDEXES that the run will
+ * apply and each of its declared indexes, the same table the step itself applies (20261105044020).
+ * `opts.held` names the steps a release target holds (pending steps after the target; see
+ * migrationTargetSplit): they are never applied or ledgered by this run, so they are skipped here
+ * too and are preflighted by the later release whose window includes them. Without a release
+ * target nothing is held and every unledgered adoptable step is checked:
  *   adoptable (exact, valid, ready, no constraint)             accepted, the step adopts it;
  *   absent, table not created yet                              accepted (an earlier step creates it empty);
  *   absent, table empty                                        accepted, the step creates it;
@@ -1266,14 +1270,14 @@ export async function adoptableIndexBuildPreflight(
   client: GuardClient,
   schemaSteps: GuardStep[],
   ledger: Map<string, string>,
-  opts: { allowBlockingIndexBuild?: boolean } = {},
+  opts: { allowBlockingIndexBuild?: boolean; held?: ReadonlySet<string> } = {},
 ): Promise<void> {
   const allow = opts.allowBlockingIndexBuild === true;
   const refused: string[] = [];
   const packets = new Set<string>();
   for (const step of schemaSteps) {
     const declared = ADOPTABLE_INDEXES[step.name];
-    if (!declared?.length || ledger.has(step.name)) continue;
+    if (!declared?.length || ledger.has(step.name) || opts.held?.has(step.name)) continue;
     const before = refused.length;
     for (const x of declared) {
       const where = `index sessions.${x.name} on ${x.table} (${step.name})`;

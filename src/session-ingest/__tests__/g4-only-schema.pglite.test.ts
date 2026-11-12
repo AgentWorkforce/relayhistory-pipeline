@@ -150,6 +150,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105047010_buffered_exact_session_stages.sql",
       // Read-role-only paged exact-session buffered stage RPC (requires 047010); default-off and never called by the ingest Worker.
       "20261105047020_buffered_session_stages_paged.sql",
+      // Owner-only frozen-copy progress table (no grant, no function) and the 041000 privacy guard trigger on frozen receipts; no G4 function names them.
+      "20261105047030_frozen_copy_progress.sql",
       // Operator per-session erase: new tables and entry points; no ingest path calls them.
       "20261105050000_operator_session_erase.sql",
       // Its fence check also replaces publication scope / buffer GC for lock order and guards live writer tables.
@@ -161,6 +163,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105057000_session_directory_users_aggregate.sql",
       // Server-owned upload consent: four new owner-only tables and two ingest-role entry points; no G4 function names them.
       "20261105057010_upload_consent.sql",
+      // Replacement of the post-G4 self-host erase (043910, last 044070): it also deletes the erased copy's directory membership rows.
+      "20261105057030_selfhost_erase_directory_membership.sql",
       // Five foreign-key support indexes for the per-user erase; no function changes.
       "20261105058000_operator_user_erase_indexes.sql",
       // Operator per-user erase: an owner-only ledger table and entry points; no ingest path calls them.

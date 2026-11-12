@@ -882,6 +882,9 @@ export function createIngestApp(deps: IngestAppDeps) {
       // A replay or a stale one may follow an attempt whose consent write failed (or a newer control that
       // landed first), but must never overwrite an allow the person confirmed since: it denies only sessions
       // with no decision yet (revision-checked).
+      // In every mode a failed deny write answers 503: the deletion fence is idempotent and the Desktop
+      // retries, so the principal-wide deny is never silently lost (it guards the person's other
+      // installations once uploads are enforced). Hence the migration precedes even report mode.
       if (!input.enabled && deps.uploadConsent && deps.uploadConsent.enforcement !== "off")
         await recordSelectionDeny(deps.uploadConsent, selection.tenant, input.origin_id,
           input.sessions.map((x) => ({ source: x.source, sessionId: x.session_id })), controlAck !== undefined && controlAck.outcome !== "applied");

@@ -335,7 +335,11 @@ lock and before any write, the migrator refuses:
   ledger rows.
 - `index_prebuild_required`: an unrecorded step that declares adoptable indexes
   (`ADOPTABLE_INDEXES`: 20261105044020, the eight claim-bootstrap
-  `<table>_org_id_idx` indexes; 20261105044040, `ingest_claim_attempts_records_gin_idx`) would refuse or could not be applied safely. Read-only, the
+  `<table>_org_id_idx` indexes; 20261105044040, `ingest_claim_attempts_records_gin_idx`) would refuse or could not be applied safely.
+  Only steps the run will apply are checked: with a release target, a step held after
+  the target (`migrationTargetSplit` `held`) is skipped, exactly as the apply skips it, and
+  is checked by the later release whose window includes it; without a target every
+  unrecorded such step is checked. Read-only, the
   same decision the step makes: an exact, valid, ready index that backs no constraint is
   adopted; an absent index on a table that does not exist yet or is empty is created by
   the step; an absent index on a **populated** table is refused unless the run opts in
@@ -422,6 +426,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105047000_coordination_fact_readers.sql` | functions sessions.coordination_write_facts_for and sessions.coordination_output_facts_for |
 | `upstream:20261105056000_session_summary_activity.sql` | function sessions.session_summary_activity_for |
 | `upstream:20261105057010_upload_consent.sql` | function sessions.upload_consent_apply_v1 and table sessions.upload_consent_holds (server-owned upload consent; EXECUTE to bulls96_session_ingest only) |
+| `upstream:20261105057030_selfhost_erase_directory_membership.sql` | replacement: ingest_selfhost_set_session_uploads deletes the erased copy's directory membership rows |
 | `upstream:20261105058000_operator_user_erase_indexes.sql` | the eleven operator-user-erase support indexes, exact definition, valid and ready |
 | `upstream:20261105058010_operator_user_erase.sql` | table sessions.operator_user_erasures |
 | `upstream:20261105035000_semantic_copy_state.sql` | table sessions.search_feature_copy_state |
@@ -454,6 +459,7 @@ names every step, and that each sentinel is false before its step and true after
 | `upstream:20261105044090_claim_sessions_reader.sql` | column sessions.ingest_claim_sessions_policy.read_enabled (slot 044090; default false; buffered_sessions_for / buffered_session_stages_for read the side table only while read_enabled, write_enabled and backfill completion all hold; owner-only commit-time accepted_at refresh trigger on ingest_batches) |
 | `upstream:20261105047010_buffered_exact_session_stages.sql` | function sessions.buffered_session_stages_for_target (slot 047010; new default-off exact-session detail RPC; frozen 044090 remains callable) |
 | `upstream:20261105047020_buffered_session_stages_paged.sql` | function sessions.buffered_session_stages_for_target_paged (slot 047020; new default-off paged exact-session detail RPC; requires the exact-session reader; 044090 and the exact-session reader remain callable) |
+| `upstream:20261105047030_frozen_copy_progress.sql` | table sessions.__96bulls_frozen_copy_progress and trigger ingest_privacy_authority_guard on sessions.ingest_frozen_source_receipts (slot 047030; owner-only frozen-copy cursor, RLS on, no grants; receipts join the privacy authority statement guard) |
 | `upstream:20261105044100_session_brief_summary_read.sql` | tenant-scoped `sessions.session_brief_summary_for(text,text,text)` read RPC with EXECUTE only for `bulls96_read_api`; bounded recorded-title column and owner-only invoker invalidation trigger; no new table grants or changes to G4 ingest functions |
 | `upstream:20261105045010_buffered_search_feed_same_second.sql` | replacement: buffered_search_feed_stage returns the `sameSecond` sibling counts (slot 045010; same signature, SECURITY DEFINER and ACL; must be applied before `INGEST_BUFFERED_SEARCH_FEED_SECOND_VERSION=on`, else the feeder refuses every stage `sql_same_second_unavailable`) |
 | `upstream:20261105045030_session_consumer_project_text_grant.sql` | search_consumer_runtime EXECUTE on `sessions.session_directory_project_text(text,text,text)` (slot 045030; grant only; the partial expression index `session_directory_tenant_project_text_trgm_idx` evaluates it as the writing role, so without it consumer directory writes carrying a project id, project key or repository fail `42501`; needs the bare consumer role first, absent fails closed `55000`) |

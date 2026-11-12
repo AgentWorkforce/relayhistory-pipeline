@@ -9,6 +9,7 @@ import {
   privateIngestReleasePhase,
   privateIngestTransitionReadback,
   privateIngestVersionReadback,
+  type PrivateIngestReleasePhase,
   type CloudflareWorkerVersion,
 } from "../../../src/session-ingest/private-ingest-release.ts";
 import { privateIngestGithubGate } from "../../../scripts/private-ingest-release-github.ts";
@@ -21,7 +22,7 @@ test("tracked production config is exact step 1; only the rollout phases and bas
   const expected = privateIngestProfileForPhase("step-1-custody", kmsKeyArn);
   const { kmsKeyArn: _target, ...expectedTracked } = expected.sessionIngest;
   expect(tracked).toEqual({ sessionIngest: expectedTracked });
-  for (const phase of ["baseline-drain", "step-1-custody", "step-2-frozen-receipt", "step-4-async-on"] as const)
+  for (const phase of ["baseline-drain", "step-0-shadow", "step-1-custody", "step-2-frozen-receipt", "step-4-async-on"] as const)
     expect(privateIngestReleasePhase(privateIngestProfileForPhase(phase, kmsKeyArn))).toBe(phase);
   for (const bad of [
     { ...tracked, sessionIngest: { ...tracked.sessionIngest, custodySource: "foreign" } },
@@ -48,9 +49,13 @@ test("typed release confirmation binds mode, main SHA and prior plan", () => {
     PRIVATE_INGEST_RELEASE_PLAN_RUN: "91",
     PRIVATE_INGEST_RELEASE_CONFIRMATION: "yes",
   })) expect(() => privateIngestReleaseInputs({ ...deploy, [key]: value })).toThrow();
+  expect(() => privateIngestReleaseInputs({
+    ...deploy,
+    PRIVATE_INGEST_RELEASE_CONFIRMATION: `${deploy.PRIVATE_INGEST_RELEASE_CONFIRMATION} SHADOW ${"f".repeat(64)}`,
+  })).toThrow("private_ingest_release_confirmation");
 });
 
-function readbackFixture(phase: "baseline-drain" | "step-1-custody" | "step-2-frozen-receipt" | "step-4-async-on") {
+function readbackFixture(phase: PrivateIngestReleasePhase) {
   const input = privateIngestProfileForPhase(phase, kmsKeyArn), vars = sessionIngestVars(input.sessionIngest);
   const bindings: any[] = Object.entries(vars).map(([name, text]) => ({ name, type: "plain_text", text }));
   bindings.push(
@@ -109,27 +114,70 @@ test("post-deploy readback requires one 100% version and every targeted binding"
   }
 });
 
-test("live transition gate requires an independently deployed step 2 before step 4", () => {
+test("shadow is drain-only and cannot smuggle the receipt bridge or async activation", () => {
+  const shadow = privateIngestProfileForPhase("step-0-shadow", kmsKeyArn);
+  expect(shadow.sessionIngest.custodySource).toBe("shadow");
+  expect(shadow.sessionIngest.asyncAdmission).toBe("drain");
+  expect(shadow.sessionIngest.syncAdmissionFrozenReceipt).toBeUndefined();
+  for (const custodySource of [undefined, "shadow"] as const) {
+    for (const overrides of [
+      { asyncAdmission: "on" },
+      { syncAdmissionFrozenReceipt: "on" },
+      { asyncAdmission: "on", syncAdmissionFrozenReceipt: "on" },
+    ]) expect(() => privateIngestReleasePhase({
+      sessionIngest: { ...shadow.sessionIngest, custodySource, ...overrides },
+    } as any)).toThrow("private_ingest_profile_phase");
+  }
+});
+
+test("CI shadow transition and readback require the adjacent live phase for promotion and rollback", () => {
+  for (const [from, to] of [
+    ["baseline-drain", "step-0-shadow"],
+    ["step-0-shadow", "step-0-shadow"],
+    ["step-0-shadow", "baseline-drain"],
+    ["step-0-shadow", "step-1-custody"],
+    ["step-1-custody", "step-0-shadow"],
+    ["step-1-custody", "step-1-custody"],
+  ] as const) {
+    const f = readbackFixture(from);
+    expect(privateIngestTransitionReadback(privateIngestProfileForPhase(to, kmsKeyArn), f.active, f.version))
+      .toMatchObject({ from, to });
+    expect(privateIngestVersionReadback(f.input, f.active, f.version).phase).toBe(from);
+  }
+  for (const [from, to] of [
+    ["step-0-shadow", "step-2-frozen-receipt"],
+    ["step-0-shadow", "step-4-async-on"],
+    ["step-2-frozen-receipt", "step-0-shadow"],
+    ["step-4-async-on", "step-0-shadow"],
+  ] as const) {
+    const f = readbackFixture(from);
+    expect(() => privateIngestTransitionReadback(privateIngestProfileForPhase(to, kmsKeyArn), f.active, f.version))
+      .toThrow("private_ingest_live_transition");
+  }
+  const f = readbackFixture("step-0-shadow");
+  f.version.resources!.bindings!.find((b) => b.name === "INGEST_CUSTODY_SOURCE")!.text = "frozen-supabase";
+  expect(() => privateIngestVersionReadback(f.input, f.active, f.version)).toThrow();
+});
+
+test.each([
+  ["baseline-drain", "step-1-custody"],
+  ["step-1-custody", "baseline-drain"],
+] as const)("CI refuses direct custody skip %s -> %s", (from, to) => {
+  const f = readbackFixture(from);
+  expect(() => privateIngestTransitionReadback(privateIngestProfileForPhase(to, kmsKeyArn), f.active, f.version))
+    .toThrow("private_ingest_live_transition");
+});
+
+test("live transition gate preserves baseline idempotency and requires an independently deployed step 2 before step 4", () => {
   const baseline = readbackFixture("step-1-custody");
   baseline.version.resources!.bindings = baseline.version.resources!.bindings!.filter(
     (binding) => binding.name !== "INGEST_CUSTODY_SOURCE",
   );
   expect(privateIngestTransitionReadback(
-    privateIngestProfileForPhase("step-1-custody", kmsKeyArn),
-    baseline.active,
-    baseline.version,
-  )).toMatchObject({ from: "baseline-drain", to: "step-1-custody" });
-  expect(privateIngestTransitionReadback(
     privateIngestProfileForPhase("baseline-drain", kmsKeyArn),
     baseline.active,
     baseline.version,
   )).toMatchObject({ from: "baseline-drain", to: "baseline-drain" });
-  const currentStep1ForRollback = readbackFixture("step-1-custody");
-  expect(privateIngestTransitionReadback(
-    privateIngestProfileForPhase("baseline-drain", kmsKeyArn),
-    currentStep1ForRollback.active,
-    currentStep1ForRollback.version,
-  )).toMatchObject({ from: "step-1-custody", to: "baseline-drain" });
   const currentStep1 = readbackFixture("step-1-custody");
   expect(privateIngestTransitionReadback(
     privateIngestProfileForPhase("step-2-frozen-receipt", kmsKeyArn),
@@ -226,4 +274,8 @@ test("workflow is CI-only and binds production credentials only after install", 
   expect(readFileSync("scripts/private-ingest-ci.ts", "utf8")).toContain(
     'resolve(".96bulls/private-ingest-release/preflight.json")',
   );
+  expect(workflow).toContain("docs/plans/cf-sessions-prod.custody-evidence.json");
+  expect(workflow.match(/bun scripts\/private-ingest-ci\.ts preflight/gu)).toHaveLength(2);
+  expect(workflow.indexOf("run: rm -- docs/plans/cf-sessions-prod.custody-evidence.json"))
+    .toBeLessThan(workflow.indexOf("- name: Download the exact prior plan"));
 });
