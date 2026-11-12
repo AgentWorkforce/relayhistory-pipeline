@@ -2,7 +2,7 @@
  * Release provenance for the vendored relayscrubber package (docs/scrub-engine.md,
  * "Provenance"): src/lib/scrub-bindgen-provenance.ts verifies a release tarball against
  * the pin's `release` block and the vendored bytes. Synthetic tarballs only (no network,
- * nothing executed); the real alpha.6 tarball is checked by
+ * nothing executed); the real alpha.8 tarball is checked by
  * `bun scripts/scrub-bindgen-receipt.ts --tarball <path>` outside CI.
  */
 import { createHash } from "node:crypto";

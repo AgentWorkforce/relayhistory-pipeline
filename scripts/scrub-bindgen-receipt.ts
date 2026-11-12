@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
  * Build receipt for the vendored relayscrubber package (docs/scrub-engine.md,
- * "Cutover: pinned relayscrubber 0.5.0-alpha.6").
+ * "Cutover: pinned relayscrubber 0.5.0-alpha.8").
  *
  * Reads packages/pipeline/scrub-bindgen/ as data (nothing in it is executed),
  * recomputes the sha256 of every vendored file, and compares them to
