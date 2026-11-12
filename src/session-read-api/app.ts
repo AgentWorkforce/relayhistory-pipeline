@@ -1,4 +1,5 @@
 import { BriefSummaryError, briefSummaryResponse, summaryActivityDays, type BriefSummary } from "./brief-summary.ts";
+import { longSummaryResponse, type LongSummary } from "./long-summary.ts";
 /**
  * The session read API: an API-compatible subset of relayhistory's /v1 read
  * contract (packages/relayhistory/src/routes/recall.ts), served from ClickHouse
@@ -32,6 +33,10 @@ import { BriefSummaryError, briefSummaryResponse, summaryActivityDays, type Brie
  *   GET /v1/sessions/summaries/activity  ready native summaries per UTC day (counts only;
  *                                   brief-summary.ts, migration 20261105056000)
  *   GET /v1/sessions/users          per-user session counts (one aggregate, migration 20261105057000)
+ *   GET /v1/sessions/:id/summary    kind=short (brief-summary.ts, migration 20261105044100); kind=long
+ *                                   only when `longSummary` is wired (long-summary.ts, migration
+ *                                   20261105060000, READ_API_LONG_SUMMARY_ENABLED exactly "true"),
+ *                                   otherwise 501 `summary_kind`.
  * Both answer 501 `directory_workspace_not_enabled` unless the token's workspace is on
  * READ_API_DIRECTORY_WORKSPACES (the canary allowlist; unset = none), and 501
  * `directory_not_migrated` until migration 20261105034000 is applied. Never Neon.
@@ -209,6 +214,8 @@ export interface ReadApiDeps {
   briefTitles?: BriefTitles;
   /** Node self-host only; absence refuses summary reads. Uses directory workspace admission. */
   briefSummary?: BriefSummary;
+  /** Scrubbed long summary (long-summary.ts); absent = `kind=long` answers 501 `summary_kind`. */
+  longSummary?: LongSummary;
   /** READ_API_BRIEF_TITLES_WORKSPACES (parseDirectoryWorkspaces syntax): "*" = all. Absent/empty = none. */
   briefTitleWorkspaces?: ReadonlySet<string> | "*";
   /** Session timing from canonical S3 (session-timing-source.ts); absent = 501 `timing_not_configured`. */
@@ -1458,12 +1465,21 @@ export function createReadApi(deps: ReadApiDeps) {
     try {
       const identity=c.get("identity");
       attestWorkspace(c,identity); requireCanary(identity,"summary"); rejectUnsupported(c);
-      if(!deps.briefSummary)throw unsupported("summary_not_configured");
+      if(!deps.briefSummary&&!deps.longSummary)throw unsupported("summary_not_configured");
       for(const name of Object.keys(c.req.query()))if(!["workspace","source","kind"].includes(name))throw unsupported(`param_${name}`);
       const kind=single(c,"kind")??"short";
-      if(kind!=="short")throw unsupported("summary_kind");
+      // kind=long exists only when wired (READ_API_LONG_SUMMARY_ENABLED); unwired it is 501 summary_kind as before.
+      if(kind==="long") {
+        if(!deps.longSummary)throw unsupported("summary_kind");
+      } else if(kind!=="short")throw unsupported("summary_kind");
       const source=single(c,"source"),sessionId=c.req.param("sessionId");
       if(!source||!HARNESS_NAME.test(source)||!sessionId||sessionId.length>MAX_ID_CHARS)throw bad("invalid session key");
+      if(kind==="long") {
+        const rows=await deps.longSummary!.read(identity.orgId,identity.workspaceId,source,sessionId);
+        if(rows===null)throw unsupported("summary_not_migrated");
+        return c.json({summary:longSummaryResponse(rows,{...identity,source,sessionId})});
+      }
+      if(!deps.briefSummary)throw unsupported("summary_not_configured");
       const rows=await deps.briefSummary.read(identity.orgId,identity.workspaceId,source,sessionId);
       if(rows===null)throw unsupported("summary_not_migrated");
       return c.json({summary:briefSummaryResponse(rows,{...identity,source,sessionId})});

@@ -341,6 +341,8 @@ off; anything else, `true` included, fails startup).
 | `session-ingest` | `RELAYHISTORY_SELFHOST_INGEST` | `RELAYHISTORY_INGEST_ORIGIN`, `RELAYCONTROL_INTROSPECT_URL`, `RELAYHISTORY_INGEST_DATABASE_URL`, `SESSION_POSTGRES_TLS_PROFILE`, `LOCKER_BUCKET` (+ Locker endpoint/region or Pod Identity/GCS), optional `RELAYHISTORY_INGEST_PORT`, `INGEST_KEY_ROOT`, `INGEST_MAX_PER_USER`, `INGEST_MAX_PER_ORG`, `RELAYHISTORY_INGEST_PG_POOL_MAX`, `ALLOW_IN_CLUSTER_HTTP`, `SELFHOST_INGEST_ADMISSION` (`sync` default, `async`, `drain`) with `SELFHOST_ADMISSION_CONCURRENCY` / `_SCAN_MS` / `_MAX_ATTEMPTS`, `SESSION_ERASE_API_ENABLED` (`1`; default off), `RELAYHISTORY_SELFHOST_SESSION_SELECTION`, `RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT` (both `true`; default off), `RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS` (`report` default, `enforce`; the capture policy upload check, section 2), `RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS` (positive introspection cache in ms, `0`-`60000`; default `0` = off; revocation lag = the TTL), `INGEST_CLAIM_LOCK_BUSY` (`on`; default off; a claim lock wait is a 429 with Retry-After 5-10 s, section 3) | `RELAYCONTROL_INTROSPECT_SECRET`, `RELAYHISTORY_INGEST_DATABASE_URL` (password), Locker keys, `SESSION_ERASE_API_SECRET` (+ `_PREVIOUS` during a rotation; at least 32 characters; only read when the erase flag is on) |
 | `session-erase-bytes` (Job) | `SESSION_ERASE_BYTES_ENABLED` (exactly `1`; see below) | `SESSION_ERASE_S3_BUCKET`, `SESSION_ERASE_S3_REGION`, `SESSION_ERASE_REQUEST_FILE`, optional `SESSION_ERASE_S3_ENDPOINT` (bare origin; https, loopback, or a Service name with `ALLOW_IN_CLUSTER_HTTP`), `SESSION_ERASE_KEY_ROOT` (default `96bulls`, must equal `INGEST_KEY_ROOT`), `SESSION_ERASE_DRY_RUN` (`1` = list and count only), `SESSION_ERASE_CONCURRENCY` (1..16, default 4) | `SESSION_ERASE_S3_ACCESS_KEY_ID[_FILE]`, `SESSION_ERASE_S3_SECRET_ACCESS_KEY[_FILE]`: a separate eraser key (ListBucketVersions + DeleteObjectVersion on the key root), not the ingest writer's key |
 | workers | per service (`docs/local-stack.md`) | `HOOPDB_URL`, `WORKER_HEALTH_PORT` | `HOOPDB_URL` password |
+| `session-read-api` | `READ_API_LONG_SUMMARY_ENABLED` (exactly `true`; default off; any other value is off) | migration `20261105060000` applied; serves `kind=long` on `GET /v1/sessions/:id/summary` (section 6) | none beyond `RELAYHISTORY_READ_API_SECRET` |
+| `bob-costas` | `SESSION_LONG_SUMMARY_PROJECTION_ENABLED` (exactly `true`; default off; any other value is off) | migration `20261105060000` applied; `HOOPDB_URL` (the runtime role) | `HOOPDB_URL` password |
 
 Installs with bigger sessions must raise the read API container memory limit and
 `READ_API_CANONICAL_SCOPE_BYTES` together, because a raw scope is held several times over per request. The shipped
@@ -641,6 +643,35 @@ first; the model's output is scrubbed before it is stored. Logs carry the model
 id, token counts from the Responses usage block, attempt count and codes only:
 never prompts, outputs, request or response bodies, provider error text or the
 key.
+
+### Long summary projection and `kind=long` (default off)
+
+Bob Costas always writes the long summary as the encrypted Locker object
+`summary/long.json.enc`. Two independent flags, both off unless set to exactly
+`true`, add a scrubbed HoopDb copy and a read route for it. Apply migration
+`20261105060000_session_long_summary.sql` before turning either on.
+
+| Variable | Service | Default | Meaning |
+| --- | --- | --- | --- |
+| `SESSION_LONG_SUMMARY_PROJECTION_ENABLED` | `bob-costas` | unset (off) | exactly `true`: after a `summary-long` object is written, project the long summary into `sessions.session_directory.long_summary`. Any other value, including `1` or `TRUE`, is off and the worker issues no long-summary SQL |
+| `READ_API_LONG_SUMMARY_ENABLED` | `session-read-api` (service and Lambda entries) | unset (off) | exactly `true`: `GET /v1/sessions/:id/summary?workspace=<id>&source=<source>&kind=long` reads through `sessions.session_long_summary_for`. Off: `kind=long` answers 501 `summary_kind`, as before |
+
+The projection re-scrubs the text with the same `relayhistory-scrub` binding as
+the short summary, bounds it to 8000 code points and stores its provenance
+(ruleset, scrub version, producer source, generation time). An older generation
+never overwrites a newer one. A summary that is empty, too long, fails or
+changes on re-scrub, or has an invalid source is logged
+(`long summary not projected` with a reason code) and not written; any older
+long summary for the row is cleared. The long summary only exists beside a
+current short summary: whenever the short summary is cleared (erase, tombstone,
+history invalidation) the database clears the long one in the same row write.
+If the long stage finishes before the short one, the long summary is projected
+on its next redelivery or the next revision.
+
+The route has the same admission, tenancy and error mapping as `kind=short`.
+A missing long summary is an explicit empty response (`status: "empty"`); a
+ready one carries `summary`, `source` and `builtAt`. The long summary is not part
+of `search_text`, the brief document or any `authenticated` column grant.
 
 ### One transport for both services
 

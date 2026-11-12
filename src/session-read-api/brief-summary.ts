@@ -15,7 +15,7 @@ export class BriefSummaryError extends Error {
 }
 export const BRIEF_SUMMARY_SIGNATURE="sessions.session_brief_summary_for(text,text,text)";
 export const SUMMARY_ACTIVITY_SIGNATURE="sessions.session_summary_activity_for(text,timestamptz,timestamptz)";
-function mapSummaryError(e:unknown):never {
+export function mapSummaryError(e:unknown):never {
  const code=(e as {code?:string})?.code;
  if(code==="22023")throw new BriefSummaryError("invalid_argument");
  if(code==="42501")throw new BriefSummaryError("refused");

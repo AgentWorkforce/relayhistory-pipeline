@@ -38,6 +38,12 @@ import {
   type ShortSummaryInput,
 } from "../hoopdb/session-directory-summary.ts";
 import {
+  LongSummaryRejected,
+  clearLongSummary,
+  writeLongSummary,
+  type LongSummaryInput,
+} from "../hoopdb/session-long-summary.ts";
+import {
   clearSummaryObject,
   readSummaryObject,
   summaryObjectKey,
@@ -59,6 +65,25 @@ export interface BobCostasDeps {
   directory?: ShortSummaryDirectory;
   /** READER_MAX_RULESET; undefined (default) keeps the legacy presence-only scrub check. */
   readerMaxRuleset?: number;
+  /**
+   * The session_directory long_summary projection (migration 20261105060000). Undefined
+   * (the default; SESSION_LONG_SUMMARY_PROJECTION_ENABLED unset or not exactly "true")
+   * projects nothing and issues no SQL for it.
+   */
+  longSummary?: LongSummaryDirectory;
+}
+
+/** Where Bob Costas publishes the bounded, scrubbed long summary for the read API. */
+export interface LongSummaryDirectory {
+  write(input: LongSummaryInput): Promise<{ written: boolean }>;
+  clear(key: SessionDirectoryKey): Promise<boolean>;
+}
+
+export function sqlLongSummaryDirectory(db: HoopDb): LongSummaryDirectory {
+  return {
+    write: (input) => writeLongSummary(db, input),
+    clear: (key) => clearLongSummary(db, key),
+  };
 }
 
 /** Where Bob Costas publishes the bounded, scrubbed short summary for search (G6). */
@@ -109,6 +134,45 @@ async function publishShortSummary(
     if (!(err instanceof ShortSummaryRejected)) throw err;
     log.info("short summary not projected", {
       stage: "summary-short",
+      reason: err.reason,
+      trace_id: traceId,
+    });
+  }
+}
+
+/**
+ * Publish (or clear) the directory long summary. Idempotent: writeLongSummary only
+ * replaces an older-or-equal generated_at, clearLongSummary is a no-op when empty. A
+ * refused summary is logged by reason only and not written; a row without a live short
+ * summary is not written either (the long summary never outlives the short one).
+ */
+async function publishLongSummary(
+  directory: LongSummaryDirectory,
+  key: SessionDirectoryKey,
+  ready: { summary: string; model: string; generatedAt: Date } | null,
+  traceId: string,
+): Promise<void> {
+  if (!ready) {
+    await directory.clear(key);
+    return;
+  }
+  try {
+    const { written } = await directory.write({
+      ...key,
+      summary: ready.summary,
+      source: directorySource(ready.model),
+      generatedAt: ready.generatedAt,
+    });
+    if (!written)
+      log.info("long summary not projected", {
+        stage: "summary-long",
+        reason: "no_live_row_with_short_summary_or_newer",
+        trace_id: traceId,
+      });
+  } catch (err) {
+    if (!(err instanceof LongSummaryRejected)) throw err;
+    log.info("long summary not projected", {
+      stage: "summary-long",
       reason: err.reason,
       trace_id: traceId,
     });
@@ -367,6 +431,56 @@ export function bobCostasHandler(
           );
         }
       }
+      if (kind === "long" && deps.longSummary) {
+        // Same reconcile for the optional long projection, but never a dead letter: the
+        // encrypted object stays the source of truth, so an object that cannot be read
+        // or authenticated only clears the projection; a transient read error retries.
+        const dirKey = {
+          orgId: message.ctx.orgId,
+          workspaceId: s.workspace_id,
+          harness: s.harness,
+          sessionId: canonicalManifestIdentity(m).sessionId,
+        };
+        let published: SummaryRecord | null = null;
+        if (row.status === "ready" && row.object_key && row.object_sha256) {
+          try {
+            published = await readSummaryObject({
+              store: deps.store,
+              keyring: deps.keyring,
+              ids,
+              key: row.object_key,
+              sha256: row.object_sha256,
+              kind,
+              revision: m.revision,
+            });
+          } catch (err) {
+            log.warn("long summary object read failed", {
+              stage: "summary-long",
+              error_code: err instanceof PipelineError ? err.code : "summary_object_read_failed",
+              retryable: err instanceof PipelineError ? err.retryable : true,
+              session_id: dirKey.sessionId,
+              revision: m.revision,
+              trace_id: m.trace_id,
+            });
+            // Best effort, so a failing clear never masks the original error.
+            await deps.longSummary.clear(dirKey).catch(() => undefined);
+            if (!(err instanceof PipelineError) || err.retryable) throw err;
+            published = null;
+          }
+        }
+        await publishLongSummary(
+          deps.longSummary,
+          dirKey,
+          published?.status === "ready" && published.summary && published.model
+            ? {
+                summary: published.summary,
+                model: published.model,
+                generatedAt: new Date(published.built_at),
+              }
+            : null,
+          m.trace_id,
+        );
+      }
       return { status: "skipped", reason: "summary_current" };
     }
 
@@ -481,6 +595,27 @@ export function bobCostasHandler(
       await publishShortSummary(
         directory,
         dirKey,
+        outcome.status === "ready"
+          ? {
+              summary: outcome.summary!,
+              model: outcome.model!,
+              generatedAt: new Date(record.built_at),
+            }
+          : null,
+        m.trace_id,
+      );
+    }
+    // The long summary projection is optional (SESSION_LONG_SUMMARY_PROJECTION_ENABLED):
+    // without deps.longSummary nothing below runs and no SQL is issued for it.
+    if (kind === "long" && deps.longSummary) {
+      await publishLongSummary(
+        deps.longSummary,
+        {
+          orgId: message.ctx.orgId,
+          workspaceId: s.workspace_id,
+          harness: s.harness,
+          sessionId: canonicalManifestIdentity(m).sessionId,
+        },
         outcome.status === "ready"
           ? {
               summary: outcome.summary!,

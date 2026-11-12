@@ -173,6 +173,9 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105058010_operator_user_erase.sql",
       // Publication provider: prepare and publish admit storage provider 'gcs' as well as 's3' (replacement only).
       "20261105059000_ingest_publication_gcs_provider.sql",
+      // Long summary: six nullable columns on session_directory (cleared by a BEFORE trigger whenever the short
+      // summary goes or the row is tombstoned) and one read-role SECURITY DEFINER reader.
+      "20261105060000_session_long_summary.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);

@@ -38,7 +38,9 @@ import { sqlBriefSummary } from "./brief-summary.ts";
  * migration 20261105046010; unset/""/"false" off = 501 `param_q` as before; anything else
  * fails startup, see sessionQueryEnabled). READ_API_COORDINATION_OVERLAPS_ENABLED (exactly
  * "true") exposes GET /v1/coordination/overlaps; READ_API_COORDINATION_OVERLAPS_BACKEND selects
- * clickhouse (default) or postgres (self-host service only).
+ * clickhouse (default) or postgres (self-host service only). READ_API_LONG_SUMMARY_ENABLED
+ * (exactly "true"; default off, both entries) wires `kind=long` on GET /v1/sessions/:id/summary
+ * through sessions.session_long_summary_for (migration 20261105060000); off = 501 `summary_kind`.
  *
  * Owner-only buffered reads (RELAYHISTORY_READ_OWNER_BUFFERED, owner-buffered.ts) are
  * Worker-only: they need the HISTORY_CONTROL_HEAD service binding. This entry never wires
@@ -68,7 +70,9 @@ import {
   coordinationOverlapsEnabled, parseCompleteSince, parseFactsBackend, readApiRouteEnabled,
   READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_COORDINATION_OVERLAPS_ENABLED,
   READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND,
+  READ_API_LONG_SUMMARY_ENABLED, exactTrueFlag,
 } from "./config.ts";
+import { sqlLongSummary } from "./long-summary.ts";
 import { poolTenantRunner, sqlLiveness, sqlOperatorErased, type SqlQuery } from "./liveness.ts";
 import { ERASE_FENCE_FLAG, eraseRuntimeFlag } from "../session-erase/flags.ts";
 import { createS3Store } from "../shared/vendor.ts";
@@ -643,6 +647,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
     ...(analysis ? { analysis } : {}),
     ...(entry === "service" ? {briefSummary: sqlBriefSummary(poolTenantRunner(pool as never))} : {}),
+    ...(exactTrueFlag(env[READ_API_LONG_SUMMARY_ENABLED]) ? {longSummary: sqlLongSummary(poolTenantRunner(pool as never))} : {}),
     briefTitles: sqlBriefTitles(poolTenantRunner(pool as never)),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,

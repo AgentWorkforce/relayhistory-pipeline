@@ -11,6 +11,7 @@ import { TENANT_SETTINGS_SQL } from "../liveness.ts";
 import { factsBackends, READER_LOGIN_SQL, READER_PG16_SQL, readApiDepsFromSecret } from "../lambda.ts";
 import { READER_LOGIN_ROW, readerLoginAnswer } from "./reader-login-support.ts";
 import { selfhostSearchComposition } from "../server.ts";
+import { exactTrueFlag, READ_API_LONG_SUMMARY_ENABLED } from "../config.ts";
 
 const PG_URL = "postgresql://reader:pw@db.selfhost.internal:6543/history";
 const ENV = {
@@ -110,5 +111,28 @@ describe("self-host service facts backends", () => {
     expect(factsBackends({ READ_API_OUTPUT_BACKEND: "clickhouse" }, "lambda")).toEqual({ output: "clickhouse", digest: "clickhouse", coordination: "clickhouse" });
     expect(factsBackends({ READ_API_OUTPUT_BACKEND: "postgres", READ_API_DIGEST_BACKEND: "postgres", READ_API_COORDINATION_OVERLAPS_BACKEND: "postgres" }, "service"))
       .toEqual({ output: "postgres", digest: "postgres", coordination: "postgres" });
+  });
+});
+
+describe("READ_API_LONG_SUMMARY_ENABLED (kind=long on the summary route)", () => {
+  test("only the exact string \"true\" is on", () => {
+    expect(exactTrueFlag("true")).toBe(true);
+    for (const raw of [undefined, null, "", "1", "TRUE", "True", " true", "true ", "yes", "on", true, 1])
+      expect([raw, exactTrueFlag(raw)]).toEqual([raw, false]);
+  });
+
+  test("the service wires longSummary only for exactly \"true\", and issues no SQL at startup for it", async () => {
+    const on = await build({ ...ENV, [READ_API_LONG_SUMMARY_ENABLED]: "true" });
+    try {
+      expect(typeof on.deps.longSummary?.read).toBe("function");
+      expect(on.deps.briefSummary).toBeDefined();
+    } finally { await on.close(); }
+    for (const value of [undefined, "", "1", "TRUE", " true", "false"]) {
+      const extra = value === undefined ? {} : { [READ_API_LONG_SUMMARY_ENABLED]: value };
+      const built = await build({ ...ENV, ...extra });
+      expect([value, built.deps.longSummary]).toEqual([value, undefined]);
+      await built.close();
+    }
+    expect(sql.filter((s) => s.text.includes("session_long_summary_for"))).toEqual([]);
   });
 });

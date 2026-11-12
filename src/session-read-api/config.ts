@@ -17,6 +17,10 @@ export const READ_API_OUTPUT_BACKEND = "READ_API_OUTPUT_BACKEND";
 export const READ_API_DIGEST_BACKEND = "READ_API_DIGEST_BACKEND";
 export const READ_API_COORDINATION_OVERLAPS_BACKEND = "READ_API_COORDINATION_OVERLAPS_BACKEND";
 export const READ_API_COORDINATION_OVERLAPS_ENABLED = "READ_API_COORDINATION_OVERLAPS_ENABLED";
+/** Wires `kind=long` on GET /v1/sessions/:sessionId/summary (migration 20261105060000). Off by default. */
+export const READ_API_LONG_SUMMARY_ENABLED = "READ_API_LONG_SUMMARY_ENABLED";
+/** Bob Costas projects the scrubbed long summary into HoopDb (migration 20261105060000). Off by default. */
+export const SESSION_LONG_SUMMARY_PROJECTION_ENABLED = "SESSION_LONG_SUMMARY_PROJECTION_ENABLED";
 
 /**
  * READ_API_OUTPUT_BACKEND / READ_API_DIGEST_BACKEND: unset or "" = "clickhouse" (the default,
@@ -31,6 +35,14 @@ export function parseFactsBackend(
   if (raw === undefined || raw === "" || raw === "clickhouse") return "clickhouse";
   if (raw === "postgres") return "postgres";
   throw new Error(`session read api: ${name} must be unset, "", "clickhouse" or "postgres"`);
+}
+
+/**
+ * A default-off flag whose ONLY on-value is the exact string "true": unset, "", "1", "TRUE",
+ * " true" and every non-string are off. Never echoes the value.
+ */
+export function exactTrueFlag(raw: unknown): boolean {
+  return raw === "true";
 }
 
 /** Only the exact string "true" exposes GET /v1/coordination/overlaps. */

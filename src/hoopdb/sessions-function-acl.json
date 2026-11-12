@@ -1380,6 +1380,9 @@
     "sessions.session_directory_list_sql(integer,boolean,integer,boolean,boolean,boolean,boolean,boolean,boolean,boolean,boolean)": [
       "<owner>:EXECUTE"
     ],
+    "sessions.session_directory_long_summary_follows_short()": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.session_directory_pointers(text,text,text)": [
       "<owner>:EXECUTE",
       "session_directory_search_worker:EXECUTE"
@@ -1491,6 +1494,10 @@
     "sessions.session_index_scrub_sticky()": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
+    ],
+    "sessions.session_long_summary_for(text,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
     ],
     "sessions.session_publication_is_managed(text,text,text,text,text)": [
       "<owner>:EXECUTE",

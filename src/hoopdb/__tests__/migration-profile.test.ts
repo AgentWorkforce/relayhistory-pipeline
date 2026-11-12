@@ -2399,13 +2399,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const UI = "upstream:20261105058000_operator_user_erase_indexes.sql";
     const UE = "upstream:20261105058010_operator_user_erase.sql";
     const GP = "upstream:20261105059000_ingest_publication_gcs_provider.sql";
+    const LS = "upstream:20261105060000_session_long_summary.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, LS]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2456,6 +2457,24 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
+    // 20261105060000 (long summary) is the newest: 059000's down refuses (55000) while it is applied; its
+    // checksum-pinned down drops the reader, the trigger and its function, the two row constraints and the six
+    // long_summary columns, and removes its ledger row.
+    expect(await names()).toContain(LS);
+    const longColumns = async () =>
+      (await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_attribute WHERE attrelid='sessions.session_directory'::regclass AND attname LIKE 'long_summary%' AND NOT attisdropped")).rows[0]!.n;
+    expect(await longColumns()).toBe(6);
+    expect((await failure(rollback("20261105059000_ingest_publication_gcs_provider.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(GP);
+    await rollback("20261105060000_session_long_summary.down.sql");
+    expect(await names()).not.toContain(LS);
+    expect(await longColumns()).toBe(0);
+    for (const sig of ["sessions.session_long_summary_for(text,text,text)", "sessions.session_directory_long_summary_follows_short()"])
+      expect((await db.query<{ p: string | null }>("SELECT to_regprocedure($1)::text AS p", [sig])).rows[0]!.p).toBeNull();
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname='session_directory_zz_long_summary_follows_short'")).rows[0]!.n).toBe(0);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_constraint WHERE conrelid='sessions.session_directory'::regclass AND conname LIKE 'session_directory_long_summary%'")).rows[0]!.n).toBe(0);
+    // Its ledger row is gone, so running it again refuses.
+    expect((await failure(rollback("20261105060000_session_long_summary.down.sql")))?.code).toBe("55000");
     // 20261105059000 (publication provider gcs) is the newest: 058010's down refuses (55000) while it is applied; its
     // checksum-pinned down restores 060000's exact ingest_publication_prepare and 043850's exact
     // ingest_publication_publish (SECURITY DEFINER kept) and removes its ledger row.

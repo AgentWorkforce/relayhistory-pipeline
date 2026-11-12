@@ -457,6 +457,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "replacement: ingest_publication_prepare and ingest_publication_publish admit storage provider gcs",
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_publication_prepare(jsonb)') AND prosecdef AND prosrc LIKE '%NOT IN(''s3'',''gcs'')%') AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_publication_publish(jsonb)') AND prosecdef AND prosrc LIKE '%NOT IN(''s3'',''gcs'')%') AS applied",
   },
+  "upstream:20261105060000_session_long_summary.sql": {
+    evidence: "function sessions.session_long_summary_for and column sessions.session_directory.long_summary",
+    sql: "SELECT to_regprocedure('sessions.session_long_summary_for(text,text,text)') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=to_regclass('sessions.session_directory') AND attname='long_summary' AND NOT attisdropped) AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),

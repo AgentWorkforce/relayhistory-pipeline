@@ -607,7 +607,7 @@ const runTarget = (db: PGlite, s: { split: { expectedPending: string[] }; bindin
   });
 const heldProcs = (db: PGlite) =>
   db.query<{ n: number }>(
-    "SELECT count(*)::int n FROM pg_proc WHERE proname LIKE 'ingest_operator_erase%' OR proname LIKE 'ingest_operator_runtime%' OR proname LIKE 'ingest_erase_fence%' OR proname LIKE 'upload_consent%' OR proname IN ('buffered_session_stages_for_target', 'buffered_session_stages_for_target_paged', 'session_summary_activity_for', 'session_directory_users_for')",
+    "SELECT count(*)::int n FROM pg_proc WHERE proname LIKE 'ingest_operator_erase%' OR proname LIKE 'ingest_operator_runtime%' OR proname LIKE 'ingest_erase_fence%' OR proname LIKE 'upload_consent%' OR proname IN ('buffered_session_stages_for_target', 'buffered_session_stages_for_target_paged', 'session_summary_activity_for', 'session_directory_users_for', 'session_long_summary_for', 'session_directory_long_summary_follows_short')",
   ).then((r) => r.rows[0]!.n);
 
 test("real tree, target 047000: the target generation is target_sha's own (independently recomputed), not this tree's with or without the held steps", async () => {
@@ -621,6 +621,7 @@ test("real tree, target 047000: the target generation is target_sha's own (indep
   expect(split.held).toContain(ERASE_RUNTIME);
   expect(split.held).toContain("upstream:20261105056000_session_summary_activity.sql");
   expect(split.held).toContain("upstream:20261105057000_session_directory_users_aggregate.sql");
+  expect(split.held).toContain("upstream:20261105060000_session_long_summary.sql");
   expect(split.held.every((n) => n.startsWith("upstream:") && n > TARGET)).toBe(true);
   const { anchor: a, independent } = await snapshotBinding(split.held);
   // Non-circular: the snapshot's verifier files differ from this tree's, and the expected
@@ -738,7 +739,7 @@ test("real tree: the prefix-scoped ACL check excuses only absent functions a hel
   // Unscoped, the full manifest names every held function as missing.
   const unscoped = await sessionsFunctionAclDrift(c, "history_rt");
   expect(unscoped.length).toBeGreaterThan(0);
-  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|upload_consent_)\w*\(.*\): missing/.test(d))).toBe(true);
+  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|session_long_summary_for|session_directory_long_summary_follows_short|upload_consent_)\w*\(.*\): missing/.test(d))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.ingest_operator_runtime_upsert(jsonb,text,text): missing"))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.buffered_session_stages_for_target("))).toBe(true);
   // A function a held step only replaces (it exists) is still compared exactly.
