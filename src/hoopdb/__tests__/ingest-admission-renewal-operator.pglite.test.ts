@@ -12,10 +12,15 @@ import {
   admissionRenewalConfirmation,
   admissionRenewalDispatch,
   admissionRenewalInputs,
+  admissionRenewalLedger,
   parseAdmissionRenewalPlan,
   type AdmissionRenewalPlan,
 } from "../ingest-admission-renewal-operator.ts";
 import { ADMISSION_RENEWAL_ENABLED, ADMISSION_RENEWAL_HORIZON_MS } from "../admission-renewal-contract.ts";
+import { generation, RELEASE_TREE } from "../migrate.ts";
+import { appendFileSync, cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 setDefaultTimeout(120_000);
 
 const open: RenewalFixture[] = [];
@@ -28,6 +33,13 @@ const sha256 = (t: string) => createHash("sha256").update(t).digest("hex");
 type Hook = (text: string, params: unknown[] | undefined, next: () => Promise<{ rows: any[] }>) => Promise<{ rows: any[] }>;
 const hooked = (f: RenewalFixture, hook: Hook) => ({ query: (text: string, params?: unknown[]) => hook(text, params, () => f.client.query(text, params)) });
 const ADMISSION_UPDATE = "UPDATE sessions.ingest_buffer_admission SET valid_until=$1";
+/** Marker, policy and every admission row at generation `g` (consistent with each other). */
+const atGeneration = async (f: RenewalFixture, g: string) => {
+  await f.db.query("UPDATE sessions.__96bulls_role_validation SET generation=$1", [g]);
+  await f.db.query("UPDATE sessions.ingest_lazy_policy SET generation=$1", [g]);
+  await f.db.query("UPDATE sessions.ingest_buffer_admission SET schema_generation=$1", [g]);
+};
+const LEDGER = "sessions.__96bulls_migrations";
 /** Renew refuses with `expected` and both tables are byte-identical (microseconds) afterwards. */
 async function refusesUnchanged(f: RenewalFixture, run: () => Promise<unknown>, expected: string) {
   const before = await f.state();
@@ -66,7 +78,7 @@ test("readback reports verdicts without writing; with no admission rows it repor
   const before = await f.state();
   const r = (await f.op("readback")).receipt;
   expect(r).toMatchObject({ drift: null, admissionRows: F.orgs.length, policyValidUntilBefore: f.validUntil,
-    admissionMinValidUntil: f.validUntil, admissionMaxValidUntil: f.validUntil, generationPrefix: F.generation.slice(0, 8) });
+    admissionMinValidUntil: f.validUntil, admissionMaxValidUntil: f.validUntil, generationPrefix: F.generation.slice(0, 8), ledgerTail: F.ledgerTail });
   expect(Object.values(r.verdicts).every(Boolean)).toBe(true);
   expect(await f.state()).toEqual(before);
   const empty = await fixture({ orgs: [] });
@@ -81,16 +93,17 @@ test("plan writes nothing and binds capturedAt + exactly 30 days, the count, the
   expect(await f.state()).toEqual(before);
   expect(plan).not.toBeNull();
   const p = plan!;
-  expect(Object.keys(p).sort()).toEqual(["admissionCount", "capturedAt", "descriptorSha256", "generation", "oldValidUntil",
-    "orgsSha256", "planRun", "renewTo", "sha"]);
+  expect(Object.keys(p).sort()).toEqual(["admissionCount", "capturedAt", "descriptorSha256", "generation",
+    "ledgerPrefixDigest", "ledgerTail", "oldValidUntil", "orgsSha256", "planRun", "renewTo", "sha", "stepCount"]);
   expect(Date.parse(p.renewTo) - Date.parse(p.capturedAt)).toBe(ADMISSION_RENEWAL_HORIZON_MS);
   expect(new Date(Date.parse(p.capturedAt)).toISOString()).toBe(p.capturedAt);
   expect(Math.abs(Date.parse(p.capturedAt) - Date.now())).toBeLessThan(60_000);
-  expect(p).toMatchObject({ oldValidUntil: f.validUntil, admissionCount: F.orgs.length, generation: F.generation, sha: F.sha, planRun: F.planRun });
+  expect(p).toMatchObject({ oldValidUntil: f.validUntil, admissionCount: F.orgs.length, generation: F.generation, ledgerTail: F.ledgerTail,
+    stepCount: F.stepCount, ledgerPrefixDigest: F.ledgerPrefixDigest, sha: F.sha, planRun: F.planRun });
   const cOrder = [...F.orgs].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)));
   expect(p.orgsSha256).toBe(sha256(cOrder.join("\n")));
   expect(p.descriptorSha256).toMatch(/^[0-9a-f]{64}$/);
-  expect(receipt).toMatchObject({ status: "ADMISSION_RENEWAL_PLANNED", renewTo: p.renewTo, committed: false });
+  expect(receipt).toMatchObject({ status: "ADMISSION_RENEWAL_PLANNED", renewTo: p.renewTo, committed: false, ledgerTail: F.ledgerTail });
   expect(parseAdmissionRenewalPlan(JSON.parse(JSON.stringify(p)))).toEqual(p);
 }, 120_000);
 
@@ -110,13 +123,16 @@ test("renew moves the policy and every admission row together through ingest_laz
   for (const org of F.orgs) await f.db.query("SELECT sessions.ingest_lazy_guard($1)", [org]);
   const text = JSON.stringify(receipt);
   for (const secret of [F.source, F.epoch, F.privacy, F.retention, F.proof, F.generation, ...F.orgs]) expect(text).not.toContain(secret);
-  // Lock order, the owner-only setter (no raw policy UPDATE), then the CAS update, in one transaction.
-  const at = (s: string) => seen.findIndex((t) => t.includes(s));
+  // Lock order (the ingest admission path's: marker, policy, admission table, admission rows), the owner-only
+  // setter (no raw policy UPDATE), then the CAS update, in one transaction.
+  const at = (s: string) => { const i = seen.findIndex((t) => t.includes(s)); expect(i).toBeGreaterThanOrEqual(0); return i; };
   expect(seen[0]).toBe("BEGIN");
   expect(seen.at(-1)).toBe("COMMIT");
-  expect(at("pg_advisory_xact_lock(961996, 1)")).toBeLessThan(at("IN SHARE ROW EXCLUSIVE MODE"));
-  expect(at("IN SHARE ROW EXCLUSIVE MODE")).toBeLessThan(at("FROM sessions.ingest_lazy_policy FOR UPDATE"));
-  expect(at("FROM sessions.ingest_lazy_policy FOR UPDATE")).toBeLessThan(at('COLLATE "C" FOR UPDATE'));
+  expect(at("pg_advisory_xact_lock(961996, 1)")).toBeLessThan(at("FROM sessions.__96bulls_migrations"));
+  expect(at("FROM sessions.__96bulls_migrations")).toBeLessThan(at("WHERE name=$1 FOR SHARE"));
+  expect(at("WHERE name=$1 FOR SHARE")).toBeLessThan(at("FROM sessions.ingest_lazy_policy FOR UPDATE"));
+  expect(at("FROM sessions.ingest_lazy_policy FOR UPDATE")).toBeLessThan(at("IN SHARE ROW EXCLUSIVE MODE"));
+  expect(at("IN SHARE ROW EXCLUSIVE MODE")).toBeLessThan(at('COLLATE "C" FOR UPDATE'));
   expect(at('COLLATE "C" FOR UPDATE')).toBeLessThan(at("ingest_lazy_policy_set"));
   expect(at("ingest_lazy_policy_set")).toBeLessThan(at(ADMISSION_UPDATE));
   expect(seen.some((t) => /UPDATE sessions\.ingest_lazy_policy\b/u.test(t))).toBe(false);
@@ -131,13 +147,15 @@ test("forged approval or timestamp normalization refuses", async () => {
   const f = await fixture();
   const p = (await f.op("plan")).plan!;
   const phrase = admissionRenewalConfirmation("renew", F.project, p);
-  expect(phrase).toBe(`RENEW-ADMISSION ${F.project} ${F.sha} GENERATION ${F.generation} FROM ${p.oldValidUntil} TO ${p.renewTo}` +
+  expect(phrase).toBe(`RENEW-ADMISSION ${F.project} ${F.sha} GENERATION ${F.generation} TAIL ${F.ledgerTail}` +
+    ` FROM ${p.oldValidUntil} TO ${p.renewTo}` +
     ` ROWS ${F.orgs.length} ORGS ${p.orgsSha256} DESCRIPTOR ${p.descriptorSha256} PLAN ${F.planRun}`);
   const noMs = (t: string) => t.replace(/\.000Z$/u, "Z").replace(/\.([0-9]{3})Z$/u, ".$1000Z");
   for (const forged of [phrase + " ", " " + phrase, phrase.toLowerCase(), phrase.replace(F.project, "otherprojectref00000"),
     phrase.replace(` PLAN ${F.planRun}`, " PLAN 1"), phrase.replace(p.oldValidUntil, noMs(p.oldValidUntil)),
     phrase.replace(p.renewTo, noMs(p.renewTo)), phrase.replace(p.renewTo, p.renewTo.replace("Z", "+00:00")),
-    phrase.replace(` ROWS ${F.orgs.length} `, ` ROWS 0${F.orgs.length} `)])
+    phrase.replace(` ROWS ${F.orgs.length} `, ` ROWS 0${F.orgs.length} `), phrase.replace(` TAIL ${F.ledgerTail}`, ""),
+    phrase.replace(` TAIL ${F.ledgerTail}`, ` TAIL ${F.held[0]}`)])
     await refusesUnchanged(f, () => f.op("renew", { plan: p, confirmation: forged }), "admission_renewal_confirmation");
   // A plan artifact whose timestamps are not the canonical bytes, or whose target is not capturedAt + 30 days.
   for (const bad of [{ ...p, renewTo: noMs(p.renewTo) }, { ...p, oldValidUntil: p.oldValidUntil.replace("Z", "+00:00") },
@@ -162,16 +180,21 @@ test("target <= old expiry refuses", async () => {
   expect(await code(() => parseAdmissionRenewalPlan(equal))).toBe("admission_renewal_not_extension");
 }, 120_000);
 
-test("stale plan, stale generation, wrong plan run or sha refuse", async () => {
+test("stale plan, plan generation not the live marker's, ledger proof not the live ledger's, wrong plan run or sha refuse", async () => {
   const f = await fixture();
   const p = (await f.op("plan")).plan!;
+  const generation_ = await generation();
   const captured = Date.parse(p.capturedAt);
   expect(await code(() => f.op("renew", { plan: p, now: captured + 24 * 3600_000 }))).toBe("admission_renewal_plan_stale");
   expect(await code(() => f.op("renew", { plan: p, now: captured - 6 * 60_000 }))).toBe("admission_renewal_plan_stale");
-  expect(await code(() => f.op("renew", { plan: p, expectedGeneration: "e".repeat(64) }))).toBe("admission_renewal_generation_stale");
+  // A self-consistent plan (phrase rebuilt from it) bound to another generation or ledger tail than the live one.
+  await refusesUnchanged(f, () => f.op("renew", { plan: { ...p, generation: "e".repeat(64) } }), "admission_renewal_generation_stale");
+  await refusesUnchanged(f, () => f.op("renew", { plan: { ...p, generation: generation_ } }), "admission_renewal_generation_stale");
+  for (const forged of [{ ...p, ledgerTail: F.held[0]! }, { ...p, stepCount: p.stepCount + 1 }, { ...p, ledgerPrefixDigest: "0".repeat(64) }])
+    await refusesUnchanged(f, () => f.op("renew", { plan: forged }), "admission_renewal_ledger_drift");
   const base = { RENEWAL_MODE: "renew", RENEWAL_SHA: F.sha, RENEWAL_PLAN_RUN: F.planRun, RENEWAL_CONFIRMATION: admissionRenewalConfirmation("renew", F.project, p) };
   const inputs = (env: Record<string, string>, plan: unknown = p) =>
-    code(() => admissionRenewalInputs(env, { expectedGeneration: F.generation, plan, enabled: true, project: F.project }));
+    code(() => admissionRenewalInputs(env, { plan, enabled: true, project: F.project }));
   expect(await inputs({ ...base, RENEWAL_PLAN_RUN: "424243" })).toBe("admission_renewal_plan_run");
   expect(await inputs({ ...base, RENEWAL_SHA: "2".repeat(40) })).toBe("admission_renewal_plan_sha");
   expect(await inputs(base, null)).toBe("admission_renewal_plan");
@@ -181,7 +204,7 @@ test("stale plan, stale generation, wrong plan run or sha refuse", async () => {
   await refusesUnchanged(f, () => f.op("renew", { plan: aged, now: Date.now() - 2 * 3600_000 }), "admission_renewal_plan_stale");
 }, 120_000);
 
-test("stale PASS or generation drift refuses: marker not pass, marker at another generation, policy not at the exact-SHA generation", async () => {
+test("stale PASS or generation drift refuses: marker not pass, policy or an admission row not at the marker generation, marker moved since plan", async () => {
   const f = await fixture();
   const p = (await f.op("plan")).plan!;
   const marker = (g: string, s: string) => f.db.query("UPDATE sessions.__96bulls_role_validation SET generation=$1,status=$2", [g, s]);
@@ -192,8 +215,20 @@ test("stale PASS or generation drift refuses: marker not pass, marker at another
   expect((await f.op("readback")).receipt.drift).toBe("admission_renewal_generation_drift");
   await refusesUnchanged(f, () => f.op("renew", { plan: p }), "admission_renewal_generation_drift");
   await marker(F.generation, "pass");
-  expect((await f.op("readback", { expectedGeneration: "e".repeat(64) })).receipt.drift).toBe("admission_renewal_generation_stale");
-  expect(await code(() => f.op("plan", { expectedGeneration: "e".repeat(64) }))).toBe("admission_renewal_generation_stale");
+  // One admission row not at the marker generation.
+  await f.db.query("UPDATE sessions.ingest_buffer_admission SET schema_generation=$1 WHERE org_id=$2", ["e".repeat(64), F.orgs[1]]);
+  expect((await f.op("readback")).receipt.drift).toBe("admission_renewal_identity_drift");
+  await refusesUnchanged(f, () => f.op("renew", { plan: p }), "admission_renewal_identity_drift");
+  await atGeneration(f, F.generation);
+  // Marker, policy and rows moved together to another PASS generation after plan: the old plan is stale; a new
+  // plan takes the new marker generation as-is.
+  await atGeneration(f, "e".repeat(64));
+  expect((await f.op("readback")).receipt.drift).toBeNull();
+  await refusesUnchanged(f, () => f.op("renew", { plan: p }), "admission_renewal_generation_stale");
+  // (The policy generation is forward-only: the overlap trigger retires the old one, so this block comes last.)
+  const moved = (await f.op("plan")).plan!;
+  expect(moved.generation).toBe("e".repeat(64));
+  expect((await f.op("renew", { plan: moved })).receipt.committed).toBe(true);
   await f.db.query("DELETE FROM sessions.__96bulls_role_validation");
   expect((await f.op("readback")).receipt.drift).toBe("admission_renewal_marker_not_pass");
 }, 120_000);
@@ -337,4 +372,148 @@ test("extra or missing policy row refuses", async () => {
   });
   expect((await f.op("readback", { client: missing })).receipt.drift).toBe("admission_renewal_policy_missing");
   await refusesUnchanged(f, () => f.op("renew", { plan: p, client: missing }), "admission_renewal_policy_missing");
+}, 120_000);
+
+test("generation: the live PASS marker generation is taken as-is (never recomputed); a shorter checksum-equal ledger passes and binds its tail", async () => {
+  const f = await fixture();
+  // The marker generation is opaque: not this tree's generation(), not any recomputation; plan binds it unchanged.
+  expect(F.generation).not.toBe(await generation());
+  const { plan, receipt } = await f.op("plan");
+  expect(plan).toMatchObject({ generation: F.generation, ledgerTail: F.ledgerTail, stepCount: F.stepCount, ledgerPrefixDigest: F.ledgerPrefixDigest });
+  expect(receipt).toMatchObject({ ledgerTail: F.ledgerTail, drift: null });
+  expect(F.held.length).toBe(2);
+  // Shorter still (the tail row removed, checksums unchanged): passes with the earlier tail; the earlier plan
+  // was bound to the longer prefix and refuses as ledger drift.
+  const upstream = F.ledger.filter(([n]) => n.startsWith("upstream:"));
+  await f.db.query(`DELETE FROM ${LEDGER} WHERE name=$1`, [F.ledgerTail]);
+  const shorter = (await f.op("plan")).plan!;
+  expect(shorter).toMatchObject({ generation: F.generation, ledgerTail: upstream.at(-2)![0], stepCount: F.stepCount - 1 });
+  expect(shorter.descriptorSha256).not.toBe(plan!.descriptorSha256);
+  await refusesUnchanged(f, () => f.op("renew", { plan }), "admission_renewal_ledger_drift");
+  await f.db.query(`INSERT INTO ${LEDGER}(name, sha256) VALUES($1, $2)`, upstream.at(-1)!);
+  expect((await f.op("renew", { plan })).receipt).toMatchObject({ committed: true, ledgerTail: F.ledgerTail });
+}, 120_000);
+
+test("ledger proof reads the dispatched tree: verifier-file drift and a held-step edit still pass; a recorded migration file edit refuses", async () => {
+  const f = await fixture();
+  const repo = join(import.meta.dir, "../../..");
+  const tree = mkdtempSync(join(tmpdir(), "renewal-tree-"));
+  try {
+    for (const lane of RELEASE_TREE.lanes) cpSync(join(repo, lane.dir), join(tree, lane.dir), { recursive: true });
+    for (const v of RELEASE_TREE.verifiers) {
+      mkdirSync(dirname(join(tree, v.path)), { recursive: true });
+      cpSync(join(repo, v.path), join(tree, v.path));
+    }
+    const live = await admissionRenewalLedger(f.client as never);
+    expect(live).toEqual({ ledgerTail: F.ledgerTail, stepCount: F.stepCount, ledgerPrefixDigest: F.ledgerPrefixDigest });
+    expect(await admissionRenewalLedger(f.client as never, tree)).toEqual(live);
+    // Every verifier file drifts (generation() of the copy changes); the ledger prefix is unchanged: still passes.
+    for (const v of RELEASE_TREE.verifiers) appendFileSync(join(tree, v.path), "\n-- drift\n");
+    expect(await admissionRenewalLedger(f.client as never, tree)).toEqual(live);
+    // A held (unrecorded) step's file changes: not part of the prefix, still passes.
+    const laneOf = (n: string) => RELEASE_TREE.lanes.find((l) => n.startsWith(l.prefix))!;
+    const file = (n: string) => join(tree, laneOf(n).dir, n.slice(laneOf(n).prefix.length));
+    appendFileSync(file(F.held[0]!), "\n-- held edit\n");
+    expect(await admissionRenewalLedger(f.client as never, tree)).toEqual(live);
+    // A recorded step's file changes: migration_changed.
+    appendFileSync(file(F.ledger[3]![0]), "\n-- recorded edit\n");
+    expect(await code(() => admissionRenewalLedger(f.client as never, tree))).toBe("migration_changed");
+  } finally {
+    rmSync(tree, { recursive: true, force: true });
+  }
+}, 120_000);
+
+test("ledger proof: a changed ledgered checksum, an unknown step, a ledger longer than the tree or a gap refuses with the migrator's preflight codes", async () => {
+  const f = await fixture();
+  const p = (await f.op("plan")).plan!;
+  const cases: [string, () => Promise<unknown>, () => Promise<unknown>][] = [
+    ["migration_changed",
+      () => f.db.query(`UPDATE ${LEDGER} SET sha256=$1 WHERE name=$2`, ["0".repeat(64), F.ledger[3]![0]]),
+      () => f.db.query(`UPDATE ${LEDGER} SET sha256=$1 WHERE name=$2`, [F.ledger[3]![1], F.ledger[3]![0]])],
+    ["ledger_unknown_step",
+      () => f.db.query(`INSERT INTO ${LEDGER}(name, sha256) VALUES('96bulls:9999_not_in_this_tree.sql', $1)`, ["0".repeat(64)]),
+      () => f.db.query(`DELETE FROM ${LEDGER} WHERE name='96bulls:9999_not_in_this_tree.sql'`)],
+    ["ledger_gap",
+      () => f.db.query(`DELETE FROM ${LEDGER} WHERE name=$1`, [F.ledger[5]![0]]),
+      () => f.db.query(`INSERT INTO ${LEDGER}(name, sha256) VALUES($1, $2)`, F.ledger[5]!)],
+  ];
+  for (const [expected, damage, repair] of cases) {
+    await damage();
+    expect((await f.op("readback")).receipt.drift).toBe(expected);
+    expect(await code(() => f.op("plan"))).toBe(expected);
+    await refusesUnchanged(f, () => f.op("renew", { plan: p }), expected);
+    await repair();
+  }
+  // A ledger longer than the dispatched tree (every tree step recorded, plus a later upstream step this tree
+  // does not have) refuses as an unknown step.
+  const tree = (await (await import("../migrate.ts")).schemaStepDigests([]));
+  for (const [name, sha] of tree.filter(([n]) => F.held.includes(n)))
+    await f.db.query(`INSERT INTO ${LEDGER}(name, sha256) VALUES($1, $2)`, [name, sha]);
+  expect((await f.op("plan")).plan!.ledgerTail).toBe(tree.at(-1)![0]);
+  await f.db.query(`INSERT INTO ${LEDGER}(name, sha256) VALUES('upstream:99991231000000_future.sql', $1)`, ["0".repeat(64)]);
+  expect(await code(() => f.op("plan"))).toBe("ledger_unknown_step");
+  await refusesUnchanged(f, () => f.op("renew", { plan: p }), "ledger_unknown_step");
+  await f.db.query(`DELETE FROM ${LEDGER} WHERE name='upstream:99991231000000_future.sql' OR name=ANY($1)`, [F.held]);
+  // A recorded held step (upstream recorded past an unrecorded one) is a gap too.
+  await f.db.query(`INSERT INTO ${LEDGER}(name, sha256) SELECT $1, sha256 FROM ${LEDGER} LIMIT 1`, [F.held[1]!]);
+  expect(await code(() => f.op("plan"))).toBe("ledger_gap");
+  await f.db.query(`DELETE FROM ${LEDGER} WHERE name=$1`, [F.held[1]!]);
+  await f.db.query(`DROP TABLE ${LEDGER}`);
+  expect(await code(() => f.op("plan"))).toBe("admission_renewal_ledger_empty");
+  expect((await f.op("readback")).receipt.drift).toBe("admission_renewal_ledger_empty");
+}, 120_000);
+
+/** The ingest admission insert exactly as ingest_lazy_begin issues it (columns from the policy; ON CONFLICT DO NOTHING). */
+const INGEST_INSERT = `INSERT INTO sessions.ingest_buffer_admission(org_id,privacy_baseline_sha256,retention_contract_sha256,
+  schema_generation,valid_until,control_epoch) SELECT $1,privacy_baseline_sha256,retention_contract_sha256,generation,valid_until,
+  control_epoch FROM sessions.ingest_lazy_policy ON CONFLICT DO NOTHING`;
+
+test("lock order matches the ingest admission path (read from the live function bodies), so the two cannot deadlock", async () => {
+  const f = await fixture();
+  const body = async (name: string) => (await f.db.query<{ src: string }>(
+    "SELECT prosrc AS src FROM pg_proc WHERE oid=$1::regprocedure", [name])).rows[0]!.src.replace(/\s+/gu, " ");
+  const begin = await body("sessions.ingest_lazy_begin(jsonb,text)");
+  const require = await body("sessions.ingest_require_generation(text)");
+  const guard = await body("sessions.ingest_lazy_guard(text)");
+  const pos = (src: string, needle: string) => { const i = src.indexOf(needle); expect(i).toBeGreaterThanOrEqual(0); return i; };
+  // Ingest takes no 961996 advisory lock; it locks the marker, then the policy, then the admission table and row.
+  for (const src of [begin, require, guard]) expect(src).not.toContain("961996");
+  expect(require).toMatch(/__96bulls_role_validation[^;]*FOR SHARE/u);
+  expect(pos(begin, "ingest_require_generation")).toBeLessThan(pos(begin, "FROM sessions.ingest_lazy_policy WHERE singleton FOR SHARE"));
+  expect(pos(begin, "FROM sessions.ingest_lazy_policy WHERE singleton FOR SHARE")).toBeLessThan(pos(begin, "INSERT INTO sessions.ingest_buffer_admission"));
+  expect(pos(guard, "__96bulls_role_validation")).toBeLessThan(pos(guard, "FROM sessions.ingest_lazy_policy WHERE singleton FOR SHARE"));
+  expect(pos(guard, "FROM sessions.ingest_lazy_policy WHERE singleton FOR SHARE")).toBeLessThan(pos(guard, "FROM sessions.ingest_buffer_admission"));
+  // renew: advisory, marker, policy, admission table, admission rows (the same relative order).
+  const p = (await f.op("plan")).plan!;
+  const seen: string[] = [];
+  await f.op("renew", { plan: p, client: hooked(f, (t, _p, next) => { seen.push(t.replace(/\s+/gu, " ")); return next(); }) });
+  const at = (s: string) => { const i = seen.findIndex((t) => t.includes(s)); expect(i).toBeGreaterThanOrEqual(0); return i; };
+  const order = ["pg_advisory_xact_lock(961996, 1)", "WHERE name=$1 FOR SHARE", "FROM sessions.ingest_lazy_policy FOR UPDATE",
+    "IN SHARE ROW EXCLUSIVE MODE", 'COLLATE "C" FOR UPDATE'].map(at);
+  expect(order).toEqual([...order].sort((a, b) => a - b));
+}, 120_000);
+
+test("concurrent ingest admission insert vs renew: an insert that wins the race is refused by the locked re-check; one that waits serializes after commit; never a partial set", async () => {
+  const f = await fixture();
+  const p = (await f.op("plan")).plan!;
+  // PGlite has one session. The two interleavings PostgreSQL permits are modelled at their boundary:
+  // (1) the ingest insert lands before renew's SHARE ROW EXCLUSIVE is granted (it is visible to the locked read):
+  //     renew refuses on the roster re-check and rolls back whole.
+  const won = hooked(f, async (t, _p, next) => {
+    if (t.includes("IN SHARE ROW EXCLUSIVE MODE")) await f.db.query(INGEST_INSERT, ["org-race"]);
+    return next();
+  });
+  await refusesUnchanged(f, () => f.op("renew", { plan: p, client: won }), "admission_renewal_plan_roster_mismatch");
+  // (2) the insert waits on renew's table lock and runs after COMMIT: it copies the renewed policy expiry, so the
+  //     whole set stays uniform and admitted.
+  const renewed = await f.op("renew", { plan: p });
+  expect(renewed.receipt.committed).toBe(true);
+  await f.db.query(INGEST_INSERT, ["org-late"]);
+  const after = await f.state();
+  const want = p.renewTo.replace("Z", "000Z");
+  expect(after.policy).toBe(want);
+  expect(after.rows.length).toBe(F.orgs.length + 1);
+  expect(after.rows.every((r) => r.v === want)).toBe(true);
+  expect((await f.op("readback")).receipt).toMatchObject({ drift: null, admissionRows: F.orgs.length + 1 });
+  for (const org of [...F.orgs, "org-late"]) await f.db.query("SELECT sessions.ingest_lazy_guard($1)", [org]);
 }, 120_000);

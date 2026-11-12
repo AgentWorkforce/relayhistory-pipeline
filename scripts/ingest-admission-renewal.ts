@@ -1,15 +1,15 @@
 /**
  * Workflow entry point (database job of .github/workflows/ingest-admission-renewal.yml) for the dormant admission
  * renewal. Mode, SHA, plan run, dormant switch and confirmation shape are checked before the owner credential is
- * read; generation() of this checkout (the dispatched SHA) is the expected generation; renew reads the plan
- * artifact the workflow downloaded from the plan run. The connection is the guarded schema release's verify-full
+ * read; the generation is the live PASS marker's, discovered by plan and re-checked by renew (never an input), and
+ * the live ledger is proven against this checkout's (the dispatched SHA's) schema steps inside the operator's
+ * transaction; renew reads the plan artifact the workflow downloaded from the plan run. The connection is the guarded schema release's verify-full
  * owner client (releaseClient) and must prove the pinned owner identity (requireReleaseOwner) before any query.
  * Writes the plan artifact file (plan mode) and a sanitized receipt (always, REFUSED on error); errors print a fixed
  * code only. Nothing here runs unless the workflow is dispatched.
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { generation } from "../src/hoopdb/migrate.ts";
 import { releaseClient, releaseErrorCode, requireReleaseOwner } from "../src/hoopdb/schema-release-inspect.ts";
 import {
   admissionRenewalDispatch,
@@ -35,7 +35,7 @@ async function main() {
       throw Object.assign(new Error("admission_renewal_plan"), { code: "admission_renewal_plan" });
     }
   }
-  const input = admissionRenewalInputs(process.env, { expectedGeneration: await generation(), plan });
+  const input = admissionRenewalInputs(process.env, { plan });
   const client = releaseClient(process.env.SUPABASE_MIGRATION_OWNER_URL);
   await client.connect();
   try {

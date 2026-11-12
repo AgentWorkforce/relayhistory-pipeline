@@ -24,7 +24,7 @@ on:
         type: string
         default: ""
       confirmation:
-        description: 'Renew: RENEW-ADMISSION <project> <sha> GENERATION <g> FROM <old> TO <renewTo> ROWS <n> ORGS <d> DESCRIPTOR <d> PLAN <plan_run>, from the plan artifact. Plan and readback: empty'
+        description: 'Renew: RENEW-ADMISSION <project> <sha> GENERATION <g> TAIL <ledgerTail> FROM <old> TO <renewTo> ROWS <n> ORGS <d> DESCRIPTOR <d> PLAN <plan_run>, from the plan artifact. Plan and readback: empty'
         type: string
         default: ""
   pull_request:

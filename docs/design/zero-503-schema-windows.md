@@ -294,16 +294,32 @@ synthetic PGlite proof.
 
 - **readback** reports counts, canonical timestamps, digests and verdicts. It writes nothing.
 - **plan** writes nothing. Its 1-day artifact fixes `renewTo` = capture time + exactly 30 days (canonical
-  `YYYY-MM-DDTHH:MM:SS.mmmZ`) and binds the generation, old expiry, row count, the C-ordered org roster digest
-  and a descriptor digest over every immutable policy field and `updated_at`.
+  `YYYY-MM-DDTHH:MM:SS.mmmZ`) and binds the generation, the ledger proof (`ledgerTail`, `stepCount`,
+  `ledgerPrefixDigest`), old expiry, row count, the C-ordered org roster digest and a descriptor digest over every
+  immutable policy field, `updated_at` and the ledger proof.
+- **Generation.** The generation is the live readiness marker's, discovered by plan with status `pass`. It is never
+  an input and never recomputed from the checkout: `generation()` also hashes verifier files, which may change on
+  `main` without a schema change. The policy and every admission row must be at that generation.
+- **Ledger proof.** Separately, the live `sessions.__96bulls_migrations` ledger must be gap-free and
+  checksum-equal to a contiguous prefix of the dispatched SHA's schema steps, using the migrator's preflight rules
+  and codes (`ledger_unknown_step`, `ledger_gap`, `migration_changed`). A ledger longer than the dispatched tree
+  refuses as `ledger_unknown_step`. `ledgerPrefixDigest` is sha256 over the ordered `[name, sha256]` pairs of
+  that prefix, taken from the dispatched tree. The SHA binds only the audited operator and workflow and the
+  current source prefix; it is not the historical preimage of the marker generation.
 - **renew** needs a same-SHA plan run under 24 h old and this typed confirmation, byte for byte:
-  `RENEW-ADMISSION <project> <sha> GENERATION <generation> FROM <oldValidUntil> TO <renewTo> ROWS <admissionCount> ORGS <orgsSha256> DESCRIPTOR <descriptorSha256> PLAN <planRun>`.
-  In one owner transaction it takes `pg_advisory_xact_lock(961996, 1)`, then
+  `RENEW-ADMISSION <project> <sha> GENERATION <livePassGeneration> TAIL <ledgerTail> FROM <oldValidUntil> TO <renewTo> ROWS <admissionCount> ORGS <orgsSha256> DESCRIPTOR <descriptorSha256> PLAN <planRun>`.
+  In one owner transaction (`lock_timeout` 5 s) it takes `pg_advisory_xact_lock(961996, 1)`, re-proves the
+  ledger (a different tail, count or digest refuses as `admission_renewal_ledger_drift`), then locks in the
+  ingest admission path's order: the readiness marker `FOR SHARE`, the policy `FOR UPDATE`, then
   `LOCK TABLE sessions.ingest_buffer_admission IN SHARE ROW EXCLUSIVE MODE` (blocks concurrent org inserts,
-  allows reads), then the policy and rows `FOR UPDATE`. It recomputes every planned value and refuses on any
-  drift, then calls `ingest_lazy_policy_set` with the unchanged identity, compare-and-sets every admission row
-  from the exact old expiry, asserts the row count, re-reads both tables and runs `ingest_lazy_guard` for every
-  org before `COMMIT`. A 30-day sanitized receipt carries no org ids.
+  allows reads), then the rows `FOR UPDATE`. Ingest locks marker, policy, then the admission table and row, and
+  takes no advisory lock, so the two cannot wait on each other in opposite orders. A marker generation other
+  than the plan's refuses as `admission_renewal_generation_stale`. It recomputes every planned value and
+  refuses on any drift, then calls `ingest_lazy_policy_set` with the unchanged identity, compare-and-sets every
+  admission row from the exact old expiry, asserts the row count, re-reads both tables and runs
+  `ingest_lazy_guard` for every org before `COMMIT`. An insert that commits first is caught by the roster
+  re-check; one that waits commits after renew and copies the renewed expiry. A 30-day sanitized receipt
+  carries no org ids.
 
 Any refusal or postcondition failure rolls the transaction back; that rollback is the only inverse. Emergency
 fail-closed expiry is a separate typed operation outside this workflow.

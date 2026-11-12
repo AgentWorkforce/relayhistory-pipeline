@@ -7,6 +7,8 @@
  * reviewed one-line PR. Nothing about a specific renewal lives here: the old expiry, row count, org
  * roster digest and descriptor are captured by a `plan` run and carried in its artifact, and the new
  * expiry is fixed by that plan (capturedAt + exactly ADMISSION_RENEWAL_HORIZON_MS), never an input.
+ * The generation is likewise never an input: plan discovers the live PASS marker generation, and binds a
+ * separate proof that the live migration ledger is a checksum-equal prefix of the dispatched SHA's steps.
  */
 export const ADMISSION_RENEWAL_ENABLED: boolean = false;
 

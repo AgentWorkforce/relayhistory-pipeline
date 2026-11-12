@@ -55,7 +55,7 @@ const context = {
   GITHUB_REPOSITORY: P.repository, GITHUB_REPOSITORY_ID: PRIVATE_INGEST_RELEASE.repositoryId, GITHUB_EVENT_NAME: "workflow_dispatch",
   GITHUB_REF: "refs/heads/main", GITHUB_SHA: sha, GITHUB_RUN_ATTEMPT: "1", GITHUB_RUN_ID: "100",
 };
-const phrase = `RENEW-ADMISSION ${P.project} ${sha} GENERATION ${G} FROM 2026-12-01T00:00:00.000Z TO 2026-12-31T00:00:00.000Z` +
+const phrase = `RENEW-ADMISSION ${P.project} ${sha} GENERATION ${G} TAIL upstream:20261105044030_ingest_generation_overlap.sql FROM 2026-12-01T00:00:00.000Z TO 2026-12-31T00:00:00.000Z` +
   ` ROWS 6 ORGS ${O} DESCRIPTOR ${D} PLAN ${planRun}`;
 const env = (mode: string, extra: Record<string, string> = {}) => ({ ...context, RENEWAL_MODE: mode, RENEWAL_SHA: sha, ...extra });
 const renewEnv = env("renew", { RENEWAL_PLAN_RUN: planRun, RENEWAL_CONFIRMATION: phrase });
