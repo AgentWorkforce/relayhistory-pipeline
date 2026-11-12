@@ -281,6 +281,33 @@ Release contract on that path (`src/session-ingest/private-ingest-release.ts`, `
 If the window expires before step 5, the fence fails closed: today's outage, never a widening. Choose a TTL
 that covers steps 3–5. The maximum is 4 h.
 
+### 3.3 Admission renewal (dormant, CI-only)
+
+Buffered ingest is admitted only until `sessions.ingest_lazy_policy.valid_until` and the matching
+`sessions.ingest_buffer_admission.valid_until` rows expire; after that the guard refuses every upload.
+`.github/workflows/ingest-admission-renewal.yml` (operator `src/hoopdb/ingest-admission-renewal-operator.ts`)
+moves the policy and every admission row together, with no migration. It is **dormant**: while
+`ADMISSION_RENEWAL_ENABLED` is `false` in `src/hoopdb/admission-renewal-contract.ts`, `plan` and `renew` refuse
+and only `readback` runs. Enabling it is a separate reviewed PR, and every real run is a dispatch that Khaliq
+approves on the existing `session-schema-production` environment. Push and pull-request runs execute only the
+synthetic PGlite proof.
+
+- **readback** reports counts, canonical timestamps, digests and verdicts. It writes nothing.
+- **plan** writes nothing. Its 1-day artifact fixes `renewTo` = capture time + exactly 30 days (canonical
+  `YYYY-MM-DDTHH:MM:SS.mmmZ`) and binds the generation, old expiry, row count, the C-ordered org roster digest
+  and a descriptor digest over every immutable policy field and `updated_at`.
+- **renew** needs a same-SHA plan run under 24 h old and this typed confirmation, byte for byte:
+  `RENEW-ADMISSION <project> <sha> GENERATION <generation> FROM <oldValidUntil> TO <renewTo> ROWS <admissionCount> ORGS <orgsSha256> DESCRIPTOR <descriptorSha256> PLAN <planRun>`.
+  In one owner transaction it takes `pg_advisory_xact_lock(961996, 1)`, then
+  `LOCK TABLE sessions.ingest_buffer_admission IN SHARE ROW EXCLUSIVE MODE` (blocks concurrent org inserts,
+  allows reads), then the policy and rows `FOR UPDATE`. It recomputes every planned value and refuses on any
+  drift, then calls `ingest_lazy_policy_set` with the unchanged identity, compare-and-sets every admission row
+  from the exact old expiry, asserts the row count, re-reads both tables and runs `ingest_lazy_guard` for every
+  org before `COMMIT`. A 30-day sanitized receipt carries no org ids.
+
+Any refusal or postcondition failure rolls the transaction back; that rollback is the only inverse. Emergency
+fail-closed expiry is a separate typed operation outside this workflow.
+
 ## 4. Limits and residual risks
 
 - **Compatibility is a precondition, not a guarantee.** While the window is open, a G Worker runs against
