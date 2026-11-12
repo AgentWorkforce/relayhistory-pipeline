@@ -51,6 +51,7 @@ import {
   migrationLedgerSha256,
   migrate,
   migrationProfile,
+  migrationTargetSplit,
   pendingMigrationSql,
   plan,
   runMigrations,
@@ -3911,6 +3912,54 @@ CREATE FUNCTION sessions.zz_future_probe_fn() RETURNS integer LANGUAGE sql AS 'S
     expect(report.inventory.filter((s) => s.pending).map((s) => s.name)).toEqual([CB, ...later]);
     expect(await failure(runMigrations(client(db), { profile: SUPA_ET, expectedLedgerSha256: report.ledgerSha256 }))).toBeNull();
     expect(((await snapshot(db)).marker as Array<{ status: string }>).map((r) => r.status)).toEqual(["pass"]);
+  });
+
+  test("release read-only plan with a release target: a HELD 20261105044020 (absent index, populated table) does not go red; once inside the window (the target) it refuses", async () => {
+    const db = await supabaseLike();
+    await db.exec(ET_BOOT);
+    const CB = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
+    const PREV = "upstream:20261105044010_selfhost_erase_lock_fences.sql";
+    const LAZY = "ingest_lazy_native_slots_org_id_idx";
+    const full = await plan(SUPA_ET);
+    expect(full.findIndex((s) => s.name === PREV)).toBe(full.findIndex((s) => s.name === CB) - 1);
+    // The previous release stopped before 044010: 044010, 044020 and every later upstream step are pending.
+    const { steps, later, restore } = await previousReleaseModel(full, PREV);
+    try {
+      expect(await failure(runMigrations(client(db), { profile: SUPA_ET, steps }))).toBeNull();
+    } finally {
+      restore();
+    }
+    expect(later[0]).toBe(CB);
+    await db.query(
+      `INSERT INTO sessions.ingest_lazy_native_slots(key_sha256,key_material,org_id,workspace_id,origin_id,record_id,
+         source_identity_sha256,control_epoch,initialized_witness_sha256) VALUES ($1,'{}','org-probe','ws-probe','o','r',$1,$1,$1)`,
+      ["a".repeat(64)],
+    );
+    const before = await snapshot(db);
+    const inspect = async (target?: string) => {
+      await db.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      try {
+        return await inspectMigrations(client(db), SUPA_ET, target === undefined ? {} : { target });
+      } finally {
+        await db.exec("ROLLBACK");
+      }
+    };
+    // Target 044010: 044020 is held (the split the release plan records), so the plan is green.
+    const report = await inspect(PREV);
+    expect(report.inventory.filter((s) => s.pending).map((s) => s.name)).toEqual([PREV, ...later]);
+    expect(migrationTargetSplit(report.inventory, PREV)).toEqual({ expectedPending: [PREV], held: later });
+    // Target 044020 (inside the window) and no target: red exactly as before.
+    for (const target of [CB, undefined]) {
+      const planned = await failure(inspect(target));
+      expect(planned?.code).toBe("index_prebuild_required");
+      expect(planned?.message).toContain(`index sessions.${LAZY} on sessions.ingest_lazy_native_slots (${CB}) is absent and table sessions.ingest_lazy_native_slots is not empty`);
+      expect(planned?.message).toContain("claim-bootstrap index packet");
+    }
+    // The apply of a target that holds 044020 passes the preflight and stops at the binding gate; an apply
+    // whose window includes 044020 refuses index_prebuild_required. Nothing is written either way.
+    expect((await failure(runMigrations(client(db), { profile: SUPA_ET, target: PREV })))?.code).toBe("release_target_binding_required");
+    expect((await failure(runMigrations(client(db), { profile: SUPA_ET, target: CB })))?.code).toBe("index_prebuild_required");
+    expect(await snapshot(db)).toEqual(before);
   });
 
   test("release read-only plan shows rename adoptions, nothing pending, and binds the ledger as stored", async () => {

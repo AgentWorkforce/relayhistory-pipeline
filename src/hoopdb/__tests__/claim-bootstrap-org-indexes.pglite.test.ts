@@ -58,15 +58,20 @@ const failure = async (run: Promise<unknown>) =>
  * the migration order). A database "before 044020" must not hold any of them: 044020 unrecorded with a later upstream
  * step recorded is a ledger gap the migrator refuses.
  */
-const laterUpstream = (steps: Array<{ name: string }>) => steps.filter((s) => s.name.startsWith("upstream:") && s.name > STEP);
+const laterUpstream = (steps: Array<{ name: string }>, cutoff = STEP) =>
+  steps.filter((s) => s.name.startsWith("upstream:") && s.name > cutoff);
 
 /** Every migration before 044020 applied and ledgered through the real migrator (no later upstream step either: that would be a ledger gap). */
 async function before044020(): Promise<PGlite> {
+  return beforeStep(STEP);
+}
+/** Every migration before upstream step `cutoff` applied and ledgered (cutoff and every later upstream step unledgered). */
+async function beforeStep(cutoff: string): Promise<PGlite> {
   const db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   open.push(db);
   const all = (await plan(LOCAL)).filter((s) => !s.name.startsWith("verify:"));
-  const later = laterUpstream(all).map((s) => s.name);
-  const steps = all.filter((s) => s.name !== STEP && !later.includes(s.name));
+  const later = laterUpstream(all, cutoff).map((s) => s.name);
+  const steps = all.filter((s) => s.name !== cutoff && !later.includes(s.name));
   expect(steps.length).toBe(all.length - 1 - later.length);
   await runMigrations(client(db), { profile: { ...LOCAL, verify: false }, steps });
   return db;
@@ -530,6 +535,51 @@ describe("20261105044020 claim-bootstrap org_id indexes", () => {
       const db = await before044020();
       await populateLazySlots(db);
       expect(await failure(adoptableIndexBuildPreflight(client(db), [{ name: "upstream:20261105044000_read_api_tokens.sql", path: MIGRATION }] as never, new Map()))).toBeNull();
+    });
+  });
+
+  describe("release target: a HELD adoptable-index step (after the target) is not preflighted; inside the window it refuses", () => {
+    /** The upstream step right before 044020: a pending release target that holds 044020. */
+    const PREV = "upstream:20261105044010_selfhost_erase_lock_fences.sql";
+    const steps = [{ name: STEP, path: MIGRATION }] as never;
+    const migrations = async (db: PGlite) =>
+      (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations ORDER BY name")).rows.map((r) => r.name);
+
+    test("adoptableIndexBuildPreflight: a step named in opts.held is skipped; any other held name changes nothing", async () => {
+      const db = await before044020();
+      await populateLazySlots(db);
+      expect(await failure(adoptableIndexBuildPreflight(client(db), steps, new Map(), { held: new Set([STEP]) }))).toBeNull();
+      expect((await failure(adoptableIndexBuildPreflight(client(db), steps, new Map(), { held: new Set([PREV]) })))?.code)
+        .toBe("index_prebuild_required");
+      expect((await failure(adoptableIndexBuildPreflight(client(db), steps, new Map(), { held: new Set() })))?.code)
+        .toBe("index_prebuild_required");
+    });
+
+    test("migrator apply path: target before 044020 passes the preflight (044020 held); target 044020 or no target refuses index_prebuild_required; nothing written", async () => {
+      const all = (await plan(LOCAL)).map((s) => s.name);
+      expect(all.indexOf(PREV)).toBe(all.indexOf(STEP) - 1);
+      const db = await beforeStep(PREV);
+      await populateLazySlots(db);
+      expect((await orgIndexes(db)).map((r) => r.name)).not.toContain(LAZY);
+      const before = await migrations(db);
+      expect(before).not.toContain(PREV);
+      expect(before).not.toContain(STEP);
+      // Control, no release target (nothing held): unchanged, every unledgered adoptable step is checked.
+      const none = await failure(runMigrations(client(db), { profile: LOCAL }));
+      expect(none?.code).toBe("index_prebuild_required");
+      expect(none?.message).toContain(`index sessions.${LAZY} on sessions.ingest_lazy_native_slots (${STEP}) is absent and table sessions.ingest_lazy_native_slots is not empty`);
+      // 044020 inside the pending window (it is the target): refuses exactly as before.
+      const inside = await failure(runMigrations(client(db), { profile: LOCAL, target: STEP }));
+      expect(inside?.code).toBe("index_prebuild_required");
+      expect(inside?.message).toBe(none?.message);
+      // 044020 HELD (target = the step before it): the preflight no longer refuses; the run reaches the later
+      // release-target gate (a held run needs the target commit binding), still before any write.
+      expect((await failure(runMigrations(client(db), { profile: LOCAL, target: PREV })))?.code).toBe("release_target_binding_required");
+      // A target the split refuses holds nothing: every step is checked (fail closed).
+      expect((await failure(runMigrations(client(db), { profile: LOCAL, target: "upstream:20991231000000_unknown.sql" })))?.code)
+        .toBe("index_prebuild_required");
+      expect(await migrations(db)).toEqual(before);
+      expect(await ledgered(db)).toBe(false);
     });
   });
 

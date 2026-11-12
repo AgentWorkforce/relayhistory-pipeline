@@ -326,7 +326,7 @@ export async function releaseDatabase() {
   const client = releaseClient(process.env.SUPABASE_MIGRATION_OWNER_URL);
   try {
     await client.connect();
-    const inspection = await inspectRelease(client, input.boundary);
+    const inspection = await inspectRelease(client, input.boundary, input.target);
     // The target gate (read-only): refuses an unknown, applied or passed target.
     const split = migrationTargetSplit(inspection.inventory, input.target);
     // The generation this release marks PASS: that of target_sha, whose tree must end at

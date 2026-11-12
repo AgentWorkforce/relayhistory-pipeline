@@ -44,7 +44,7 @@ export async function operatorPlan() {
   const client = releaseClient(process.env.SUPABASE_MIGRATION_OWNER_URL);
   try {
     await client.connect();
-    const report = await inspectRelease(client, input.boundary);
+    const report = await inspectRelease(client, input.boundary, input.target);
     // The same target gate the CI plan records: held steps are never applied.
     const split = migrationTargetSplit(report.inventory, input.target);
     // The generation an apply of this plan marks PASS: target_sha's, whose tree must end

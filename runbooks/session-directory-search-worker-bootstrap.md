@@ -335,7 +335,11 @@ lock and before any write, the migrator refuses:
   ledger rows.
 - `index_prebuild_required`: an unrecorded step that declares adoptable indexes
   (`ADOPTABLE_INDEXES`: 20261105044020, the eight claim-bootstrap
-  `<table>_org_id_idx` indexes; 20261105044040, `ingest_claim_attempts_records_gin_idx`) would refuse or could not be applied safely. Read-only, the
+  `<table>_org_id_idx` indexes; 20261105044040, `ingest_claim_attempts_records_gin_idx`) would refuse or could not be applied safely.
+  Only steps the run will apply are checked: with a release target, a step held after
+  the target (`migrationTargetSplit` `held`) is skipped, exactly as the apply skips it, and
+  is checked by the later release whose window includes it; without a target every
+  unrecorded such step is checked. Read-only, the
   same decision the step makes: an exact, valid, ready index that backs no constraint is
   adopted; an absent index on a table that does not exist yet or is empty is created by
   the step; an absent index on a **populated** table is refused unless the run opts in

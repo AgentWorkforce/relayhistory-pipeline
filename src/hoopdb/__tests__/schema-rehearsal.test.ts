@@ -21,6 +21,7 @@ import {
   disposableEnvRefusal,
   expectedWindow,
   errorCode,
+  refusalEvidence,
   flipHex,
   INJECTION_REFUSAL,
   INJECTIONS,
@@ -861,4 +862,27 @@ describe("release anchor fixture and injections (offline: temp repo, real git)",
     expect(drv).toContain('stage("R4-anchor-ref-moved"');
     expect(drv).toContain("discoverReleaseAnchor(");
   });
+});
+
+test("a stage failing index_prebuild_required keeps the refusing indexes and packets as evidence (never the raw message); other refusals stay {}", async () => {
+  const { ADOPTABLE_INDEX_STEPS } = await import("../migration-sentinels.ts");
+  const step = "upstream:20261105044020_claim_bootstrap_org_indexes.sql";
+  const packet = ADOPTABLE_INDEX_STEPS[step]!.packet;
+  // The migrator's refusal text (adoptableIndexBuildPreflight), one absent index and one INVALID one.
+  const message =
+    `index sessions.ingest_lazy_native_slots_org_id_idx on sessions.ingest_lazy_native_slots (${step}) is absent and table sessions.ingest_lazy_native_slots is not empty; a blocking CREATE INDEX on a populated table is refused; ` +
+    `index sessions.ingest_seed_captures_org_id_idx on sessions.ingest_seed_captures (${step}) is INVALID or still building: wait. ` +
+    `Prebuild each absent index out of band with CREATE INDEX CONCURRENTLY (${packet}), then rerun: the step adopts it. Nothing was written.`;
+  const evidence = refusalEvidence(Object.assign(new Error(message), { code: "index_prebuild_required" }));
+  expect(evidence).toEqual({
+    indexes: [
+      { index: "ingest_lazy_native_slots_org_id_idx", table: "sessions.ingest_lazy_native_slots", step },
+      { index: "ingest_seed_captures_org_id_idx", table: "sessions.ingest_seed_captures", step },
+    ],
+    packets: [packet],
+  });
+  expect(resultRecord("R1", "FAIL", evidence, "index_prebuild_required").evidence).toEqual(evidence);
+  expect(refusalEvidence(Object.assign(new Error(message), { code: "ledger_gap" }))).toEqual({});
+  expect(refusalEvidence(Object.assign(new Error("an unparsable driver message"), { code: "index_prebuild_required" }))).toEqual({});
+  expect(refusalEvidence(null)).toEqual({});
 });

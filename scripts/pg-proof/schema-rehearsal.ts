@@ -83,6 +83,7 @@ import {
   bootstrapRefreshEvidence,
   disposableEnvRefusal,
   errorCode,
+  refusalEvidence,
   expectedWindow,
   flipHex,
   checkLandingSeed,
@@ -150,7 +151,7 @@ async function stage<T extends Record<string, unknown>>(name: string, fn: () => 
     evidence = await fn();
   } catch (e) {
     if (e instanceof Stop) throw e;
-    await emit(name, "FAIL", e instanceof RehearsalRefusal ? e.detail : {}, errorCode(e));
+    await emit(name, "FAIL", e instanceof RehearsalRefusal ? e.detail : refusalEvidence(e), errorCode(e));
     throw new Stop();
   }
   await emit(name, "PASS", evidence);
@@ -387,7 +388,7 @@ async function main() {
       // start (R0 for the guards); never over a stage that already has a record.
       const name = results.some((r) => r.stage === current) ? `${current}-after` : current;
       try {
-        await emit(name, "FAIL", e instanceof RehearsalRefusal ? e.detail : {}, errorCode(e));
+        await emit(name, "FAIL", e instanceof RehearsalRefusal ? e.detail : refusalEvidence(e), errorCode(e));
       } catch {}
     }
   }
@@ -783,7 +784,7 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
     return r.targetSha;
   };
   const makePlan = async () => {
-    const inspection = await I.inspectRelease(owner, BOUNDARY);
+    const inspection = await I.inspectRelease(owner, BOUNDARY, target);
     const split = M.migrationTargetSplit(inspection.inventory, target);
     const ledgered = new Set<string>(inspection.inventory.filter((s: any) => !s.pending).map((s: any) => s.name));
     const window = expectedWindow(tree, ledgered, target);
@@ -837,7 +838,7 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
 
   // The anchor tip mutated before the plan: production's binding refuses it.
   const anchorTip = async () => {
-    const inspection = await I.inspectRelease(owner, BOUNDARY);
+    const inspection = await I.inspectRelease(owner, BOUNDARY, target);
     const held: string[] = M.migrationTargetSplit(inspection.inventory, target).held;
     if (!anchored || !held.length) rehearsalRefuse("rehearsal_injection_unavailable", { inject, reason: anchored ? "nothing_held" : "no_anchor_api" });
     return resolveTarget(held);
@@ -932,7 +933,7 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
   const apply = async (p: typeof planned, client: { query: (...a: any[]) => Promise<any> }, overrides: { targetGeneration?: string } = {}) => {
     const approved = p.approved;
     if (!sameAnchor(await anchorAt(approved.targetSha, approved.held), approved)) C.refuse("release_target_manifest_changed");
-    const inspection = await I.inspectRelease(client, BOUNDARY);
+    const inspection = await I.inspectRelease(client, BOUNDARY, target);
     const split = M.migrationTargetSplit(inspection.inventory, target);
     const anchor = await anchorAt(approved.targetSha, split.held);
     if (!split.held.length && anchor.targetGeneration !== fullGen) C.refuse("release_target_generation_changed");

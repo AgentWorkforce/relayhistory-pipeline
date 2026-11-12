@@ -580,8 +580,33 @@ export function migrationTargetSplit(
   };
 }
 
-/** Shared read-only preflight: release planning and apply enforce the same guards. */
-async function migrationPreflight(client: MigrationClient, profile: MigrationProfile, schema: Step[]) {
+/**
+ * The steps a release target holds, for the adoptable-index preflight only: migrationTargetSplit's
+ * `held` over this ledger. No target: nothing is held. A target the split refuses (unknown, applied,
+ * passed) holds nothing here, so every unledgered adoptable step is still checked (fail closed); the
+ * caller's own migrationTargetSplit then raises that refusal unchanged.
+ */
+function preflightHeld(schema: Step[], ledger: Map<string, string>, target: string | undefined): Set<string> {
+  if (target === undefined) return new Set();
+  try {
+    return new Set(
+      migrationTargetSplit(schema.map((s) => ({ name: s.name, pending: !ledger.has(s.name) })), target).held,
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Shared read-only preflight: release planning and apply enforce the same guards. `target` is the
+ * release target of the run or plan, if any: steps it holds are not adoptable-index preflighted.
+ */
+async function migrationPreflight(
+  client: MigrationClient,
+  profile: MigrationProfile,
+  schema: Step[],
+  target?: string,
+) {
   const physical = await readLedger(client);
   const stepShas = await stepSha256s(schema);
   // The release binding covers the rows exactly as stored, before any in-memory adoption.
@@ -633,9 +658,11 @@ async function migrationPreflight(client: MigrationClient, profile: MigrationPro
   await sequencePreflight(client, schema, ledger);
   // Adoptable-index steps (20261105044020, 20261105044040): an absent index on a populated table without the
   // opt-in refuses HERE, read-only, so the release plan goes red and a refused apply never
-  // reaches the 'pending' readiness marker below.
+  // reaches the 'pending' readiness marker below. Steps held by the release target are not
+  // applied by this run and are not checked (preflightHeld).
   await adoptableIndexBuildPreflight(client, schema, ledger, {
     allowBlockingIndexBuild: profile.allowBlockingIndexBuild === true,
+    held: preflightHeld(schema, ledger, target),
   });
   return { ledger, ledgerSha256, renameAliases, runtime };
 }
@@ -652,12 +679,20 @@ async function stepSha256s(steps: Step[]): Promise<Map<string, string>> {
 export function migrationLedgerSha256(ledger: Map<string, string>): string {
   return createHash("sha256").update(JSON.stringify([...ledger].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0))).digest("hex");
 }
-/** Caller owns the READ ONLY transaction; never invokes bootstrap or schema SQL. */
-export async function inspectMigrations(client: MigrationClient, profile: MigrationProfile) {
+/**
+ * Caller owns the READ ONLY transaction; never invokes bootstrap or schema SQL. `opts.target`: the
+ * release target the caller plans (and splits the inventory at); steps it holds are not
+ * adoptable-index preflighted, exactly as the targeted apply skips them.
+ */
+export async function inspectMigrations(
+  client: MigrationClient,
+  profile: MigrationProfile,
+  opts: { target?: string } = {},
+) {
   if (profile.mode !== "supabase" || profile.shim || profile.bootstrap || !profile.verify)
     throw profileError("release_profile", "release inspection requires Supabase, verifier enabled, shim/bootstrap disabled");
   const steps = await schemaSteps();
-  const { ledger, ledgerSha256, renameAliases } = await migrationPreflight(client, profile, steps);
+  const { ledger, ledgerSha256, renameAliases } = await migrationPreflight(client, profile, steps, opts.target);
   // The pending steps' SQL: the preview credits the EXECUTE grants they add (pending-added).
   const pendingSql = await Promise.all(steps.filter(s => !ledger.has(s.name)).map(s => readFile(s.path, "utf8")));
   const acl = await sessionsFunctionAclPreview(client, profile.runtimeRole, pendingSql);
@@ -734,7 +769,7 @@ export async function runMigrations(
       (st) => st.name.startsWith("upstream:") || st.name.startsWith("96bulls:"),
     );
     // Read-only preflight, all under the lock: nothing below writes until every check passes.
-    const { ledger, ledgerSha256, runtime } = await migrationPreflight(client, profile, schema);
+    const { ledger, ledgerSha256, runtime } = await migrationPreflight(client, profile, schema, opts.target);
     if (opts.expectedLedgerSha256 !== undefined &&
         ledgerSha256 !== opts.expectedLedgerSha256)
       throw profileError("release_ledger_changed", "database ledger changed since the approved read-only plan");
