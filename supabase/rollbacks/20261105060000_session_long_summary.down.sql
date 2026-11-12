@@ -11,7 +11,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105060000_session_long_summary.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='long summary: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105060000_session_long_summary.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'df3dc2fa12745a037f46a4aa16de568cf56e6e3f7bbd66c21e11bfbf1332d6eb'
+ IF NOT FOUND OR v_sha<>'e0a5e8cc29ad52c95e986e6a5cd16af613e50fb6b669189ad8b9d6184fbb7566'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='long summary: own applied checksum required';END IF;
 END $rollback_guard$;
 DROP FUNCTION sessions.session_long_summary_for(text,text,text);

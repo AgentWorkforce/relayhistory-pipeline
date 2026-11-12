@@ -653,7 +653,7 @@ Bob Costas always writes the long summary as the encrypted Locker object
 
 | Variable | Service | Default | Meaning |
 | --- | --- | --- | --- |
-| `SESSION_LONG_SUMMARY_PROJECTION_ENABLED` | `bob-costas` | unset (off) | exactly `true`: after a `summary-long` object is written, project the long summary into `sessions.session_directory.long_summary`. Any other value, including `1` or `TRUE`, is off and the worker issues no long-summary SQL |
+| `SESSION_LONG_SUMMARY_PROJECTION_ENABLED` | `bob-costas` | unset (off) | exactly `true`: after a `summary-long` object is written, and again after a ready short summary is written, project the long summary into `sessions.session_directory.long_summary`. Any other value, including `1` or `TRUE`, is off and the worker issues no long-summary SQL |
 | `READ_API_LONG_SUMMARY_ENABLED` | `session-read-api` (service and Lambda entries) | unset (off) | exactly `true`: `GET /v1/sessions/:id/summary?workspace=<id>&source=<source>&kind=long` reads through `sessions.session_long_summary_for`. Off: `kind=long` answers 501 `summary_kind`, as before |
 
 The projection re-scrubs the text with the same `relayhistory-scrub` binding as
@@ -665,12 +665,25 @@ changes on re-scrub, or has an invalid source is logged
 long summary for the row is cleared. The long summary only exists beside a
 current short summary: whenever the short summary is cleared (erase, tombstone,
 history invalidation) the database clears the long one in the same row write.
-If the long stage finishes before the short one, the long summary is projected
-on its next redelivery or the next revision.
+The long stage does not write when the row has no short summary yet; that
+message still succeeds and is not redelivered. Instead, whenever Bob Costas
+writes a ready short summary (a new one, or the `summary_current`
+reconcile on a redelivery), it also reads the stored long summary object of
+the same revision and content and, if that object is ready, projects it under
+the same checks and generation fence. So a long stage that finished first, or
+a long summary cleared with the short one and the short one later rewritten,
+is restored once the short summary lands. If no ready long object exists yet,
+the short stage writes nothing for it and the long stage projects it when it
+runs. A transient error reading the long object fails the short message, which
+retries; it issues no long-summary SQL. With
+`SESSION_LONG_SUMMARY_PROJECTION_ENABLED` off the short stage does none of
+this.
 
 The route has the same admission, tenancy and error mapping as `kind=short`.
 A missing long summary is an explicit empty response (`status: "empty"`); a
-ready one carries `summary`, `source` and `builtAt`. The long summary is not part
+ready one carries `summary`, `model` and `builtAt`, the same fields as
+`kind=short`; `model` is the stored producer provenance (`long_summary_source`,
+for example `bob-costas/extractive/v1`). The long summary is not part
 of `search_text`, the brief document or any `authenticated` column grant.
 
 ### One transport for both services

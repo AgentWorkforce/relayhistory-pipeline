@@ -12,9 +12,10 @@
 --     short_summary in the same statement. The trigger below clears the long summary in that same row
 --     write, so no erase function is replaced;
 --   * tenancy and RLS are the row's own. `authenticated` reads session_directory only through the
---     column-level SELECT grant of 20261030020000, which does not name these columns; they are revoked
---     again below so a later table-level grant cannot expose them by default. They are not part of
---     search_text and not part of the brief document (sessions.session_brief_document_json).
+--     column-level SELECT grant of 20261030020000, which does not name these columns. The column-level
+--     REVOKE below is explicit and defensive only: a later table-level GRANT SELECT on session_directory
+--     would still expose every column, these included. They are not part of search_text and not part
+--     of the brief document (sessions.session_brief_document_json).
 --
 -- Invariants (checked by the database, repeated by src/hoopdb/session-long-summary.ts):
 --   - hard length bound: char_length(long_summary) BETWEEN 1 AND 8000 code points;
@@ -85,8 +86,9 @@ CREATE TRIGGER session_directory_zz_long_summary_follows_short
   FOR EACH ROW EXECUTE FUNCTION sessions.session_directory_long_summary_follows_short();
 REVOKE ALL ON FUNCTION sessions.session_directory_long_summary_follows_short() FROM PUBLIC;
 
--- Direct column reads stay closed to end-user and anonymous roles (the column-level grant of
--- 20261030020000 never named these columns; this keeps a later table-level grant from opening them).
+-- Direct column reads stay closed to end-user and anonymous roles: the column-level grant of
+-- 20261030020000 never names these columns. This REVOKE is explicit and defensive only; it does not
+-- stop a later table-level GRANT SELECT on session_directory from exposing every column.
 DO $long_summary_columns$
 DECLARE role_name text;
 BEGIN

@@ -36,5 +36,5 @@ export function longSummaryResponse(rows:readonly LongSummaryRow[], scope:{orgId
  if(row.harness!==scope.source||row.session_id!==scope.sessionId)throw new BriefSummaryError("parse");
  const builtAt=row.generated_at instanceof Date?row.generated_at:new Date(row.generated_at);
  if(typeof row.long_summary!=="string"||!row.long_summary.trim()||[...row.long_summary].length>LONG_SUMMARY_MAX_CHARS||typeof row.source!=="string"||!SOURCE.test(row.source)||!Number.isFinite(builtAt.getTime()))throw new BriefSummaryError("parse");
- return {status:"ready" as const,kind:"long" as const,summary:row.long_summary,source:row.source,builtAt:builtAt.toISOString(),state:null};
+ return {status:"ready" as const,kind:"long" as const,summary:row.long_summary,model:row.source,builtAt:builtAt.toISOString(),state:null};
 }

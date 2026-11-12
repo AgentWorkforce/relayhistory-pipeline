@@ -144,7 +144,9 @@ async function publishShortSummary(
  * Publish (or clear) the directory long summary. Idempotent: writeLongSummary only
  * replaces an older-or-equal generated_at, clearLongSummary is a no-op when empty. A
  * refused summary is logged by reason only and not written; a row without a live short
- * summary is not written either (the long summary never outlives the short one).
+ * summary is not written either (the long summary never outlives the short one). The short
+ * path re-projects the stored long object once a ready short summary lands
+ * (projectStoredLongSummary), so that skip is not permanent.
  */
 async function publishLongSummary(
   directory: LongSummaryDirectory,
@@ -177,6 +179,87 @@ async function publishLongSummary(
       trace_id: traceId,
     });
   }
+}
+
+/**
+ * Re-project the stored long summary after this run published a ready short summary (only
+ * with deps.longSummary). Not gated on this run's short write landing: the short summary may
+ * be held by another producer (a model-written brief fences Bob Costas's write out), and the
+ * long writer itself refuses to write without a live short summary and enforces its own
+ * generated_at fence. That refusal is why a long stage that finished first, or a long
+ * summary the database cleared together with the short one, would otherwise stay
+ * unprojected: a successful long message is never redelivered.
+ * Reads the long pointer of the same revision and content, authenticates the long object and
+ * hands it to publishLongSummary (same generated_at fence and refusal handling as the long
+ * stage). No pointer, another revision or content, or a non-ready status: no long write; the
+ * long stage projects it itself when it runs. A retryable read error rethrows with no long SQL
+ * (the short message retries and reconciles); a non-retryable one is logged and skipped, since
+ * the long stage owns that object's integrity. Never clears the long projection.
+ */
+async function projectStoredLongSummary(
+  deps: BobCostasDeps,
+  longSummary: LongSummaryDirectory,
+  pk: readonly unknown[],
+  ids: { orgId: string; workspaceId: string },
+  m: ManifestV1,
+  dirKey: SessionDirectoryKey,
+): Promise<void> {
+  const res = await deps.db.query<{
+    content_sha256: string;
+    revision: string;
+    status: string;
+    object_key: string | null;
+    object_sha256: string | null;
+  }>(
+    `SELECT content_sha256, revision, status, object_key, object_sha256 FROM sessions.session_summaries
+      WHERE org_id=$1 AND workspace_id=$2 AND harness=$3 AND session_id=$4 AND machine_id=$5 AND kind=$6`,
+    [...pk, "long"],
+  );
+  const row = res.rows[0];
+  if (
+    !row ||
+    row.status !== "ready" ||
+    !row.object_key ||
+    !row.object_sha256 ||
+    Number(row.revision) !== m.revision ||
+    row.content_sha256 !== m.raw.content_sha256
+  )
+    return;
+  let published: SummaryRecord | null;
+  try {
+    published = await readSummaryObject({
+      store: deps.store,
+      keyring: deps.keyring,
+      ids,
+      key: row.object_key,
+      sha256: row.object_sha256,
+      kind: "long",
+      revision: m.revision,
+    });
+  } catch (err) {
+    const retryable = err instanceof PipelineError ? err.retryable : true;
+    log.warn("long summary object read failed on short publish", {
+      stage: "summary-short",
+      error_code: err instanceof PipelineError ? err.code : "summary_object_read_failed",
+      retryable,
+      session_id: dirKey.sessionId,
+      revision: m.revision,
+      trace_id: m.trace_id,
+    });
+    if (retryable) throw err;
+    return;
+  }
+  if (published?.status !== "ready" || !published.summary || !published.model) return;
+  await publishLongSummary(
+    longSummary,
+    dirKey,
+    {
+      summary: published.summary,
+      model: published.model,
+      generatedAt: new Date(published.built_at),
+    },
+    m.trace_id,
+  );
 }
 
 /** SHA-256 of the manifest as indexed: the `summary-manifest` fence for the object. */
@@ -429,6 +512,9 @@ export function bobCostasHandler(
             },
             m.trace_id,
           );
+          // A ready short summary is back: restore a long summary that was skipped or cleared.
+          if (deps.longSummary)
+            await projectStoredLongSummary(deps, deps.longSummary, pk, ids, m, dirKey);
         }
       }
       if (kind === "long" && deps.longSummary) {
@@ -604,6 +690,9 @@ export function bobCostasHandler(
           : null,
         m.trace_id,
       );
+      // A long stage that finished first skipped its projection (no short summary yet).
+      if (outcome.status === "ready" && deps.longSummary)
+        await projectStoredLongSummary(deps, deps.longSummary, pk, ids, m, dirKey);
     }
     // The long summary projection is optional (SESSION_LONG_SUMMARY_PROJECTION_ENABLED):
     // without deps.longSummary nothing below runs and no SQL is issued for it.

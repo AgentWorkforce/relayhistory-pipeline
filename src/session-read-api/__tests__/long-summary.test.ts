@@ -33,7 +33,7 @@ test("unwired: kind=long is 501 summary_kind and nothing is read (today's behavi
 test("wired: ready text with provenance, no-store, read with the token's own org/workspace",async()=>{
  const a=api(),r=await a.get();
  expect(r.status).toBe(200);expect(r.headers.get("cache-control")).toBe("private, no-store");
- expect(await r.json()).toEqual({summary:{status:"ready",kind:"long",summary:row.long_summary,source:row.source,builtAt:"2026-11-09T00:00:00.000Z",state:null}});
+ expect(await r.json()).toEqual({summary:{status:"ready",kind:"long",summary:row.long_summary,model:row.source,builtAt:"2026-11-09T00:00:00.000Z",state:null}});
  expect(a.calls).toEqual([["o","w","codex","s"]]);expect(a.briefCalls).toHaveLength(0);
  // A missing row is the same explicit empty as kind=short.
  const e=await api({rows:[]}).get();expect(e.status).toBe(200);

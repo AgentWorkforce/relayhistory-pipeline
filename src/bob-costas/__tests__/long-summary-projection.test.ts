@@ -2,7 +2,8 @@
  * Bob Costas's optional long summary projection (SESSION_LONG_SUMMARY_PROJECTION_ENABLED,
  * src/hoopdb/session-long-summary.ts). Off (no `longSummary` dep, the default) issues no SQL
  * for it and calls nothing; on, the ready long summary is published once after COMMIT and
- * reconciled on a `summary_current` retry. The SQL writer itself is covered by
+ * reconciled on a `summary_current` retry; a ready short summary also re-projects the stored long
+ * object (long-before-short ordering, short cleared then rewritten). The SQL writer itself is covered by
  * src/hoopdb/__tests__/session-long-summary.test.ts and session-long-summary.pglite.test.ts.
  */
 import { afterEach, describe, expect, it } from "bun:test";
@@ -17,6 +18,7 @@ import { masterKeyring, parseMasterKeys } from "../../shared/keyring.ts";
 import { bobCostasHandler, sqlLongSummaryDirectory, type LongSummaryDirectory } from "../handler.ts";
 import { extractiveSummarizer } from "../summarizer.ts";
 import { LongSummaryRejected, type LongSummaryInput } from "../../hoopdb/session-long-summary.ts";
+import { ShortSummaryRejected } from "../../hoopdb/session-directory-summary.ts";
 import { exactTrueFlag } from "../../session-read-api/config.ts";
 
 const MIG = (f: string) => readFileSync(join(import.meta.dir, "../../hoopdb/migrations", f), "utf8");
@@ -32,12 +34,15 @@ async function setup() {
   await pg.exec(MIG("0002_session_ext_and_summaries.sql"));
   await pg.exec(MIG("0004_summary_pointers.sql"));
   const sql: string[] = [];
-  const q = async (text: string, params?: unknown[]) => {
+  const params: unknown[][] = [];
+  const q = async (text: string, values?: unknown[]) => {
     sql.push(text);
-    return { rows: (await pg.query(text, params as never)).rows as never[] };
+    params.push(values ?? []);
+    const params_ = values;
+    return { rows: (await pg.query(text, params_ as never)).rows as never[] };
   };
   const db = { query: q, pool: { connect: async () => ({ query: q, release() {} }) }, end: async () => {} } as never;
-  return { pg, db, sql };
+  return { pg, db, sql, params };
 }
 
 const loc = { workspaceId: "w", machineId: "m", harness: "claude", sessionId: "s1", startDate: "2026-10-29" };
@@ -52,7 +57,7 @@ const recorder = { log: { info() {} } } as never;
 const noDirectory = { write: async () => ({ written: false }), clear: async () => false };
 
 async function world() {
-  const { pg, db, sql } = await setup();
+  const { pg, db, sql, params } = await setup();
   const store = createFsStore({ root: mkdtempSync(join(tmpdir(), "bcl-")) });
   const line = JSON.stringify({ type: "user", message: { role: "user", content: "fix the flaky build" } });
   await store.put(rawChunkKey(loc, 0, 0, "abcdef12", "jsonl"), zstdCompressSync(Buffer.from(line + "\n")));
@@ -66,7 +71,7 @@ async function world() {
     keyring,
     now: () => new Date("2026-11-09T00:00:00Z"),
   };
-  return { pg, sql, base };
+  return { pg, sql, params, base };
 }
 
 function recording(write: (input: LongSummaryInput) => Promise<{ written: boolean }> = async () => ({ written: true })) {
@@ -83,6 +88,46 @@ function recording(write: (input: LongSummaryInput) => Promise<{ written: boolea
     },
   };
   return { directory, writes, clears };
+}
+
+/**
+ * A fake of the session_directory row semantics the SQL writers enforce: the long writer
+ * writes nothing without a live short summary, and clearing the short summary clears the
+ * long one in the same write (the 060000 trigger).
+ */
+function directoryModel() {
+  const state: { short: string | null; long: string | null } = { short: null, long: null };
+  const longWrites: LongSummaryInput[] = [];
+  let longClears = 0;
+  const short = {
+    write: async (input: { summary: string }) => {
+      state.short = input.summary;
+      return { written: true };
+    },
+    clear: async () => {
+      const had = state.short !== null;
+      state.short = null;
+      state.long = null;
+      return had;
+    },
+  };
+  const long: LongSummaryDirectory = {
+    write: async (input) => {
+      longWrites.push(input);
+      if (state.short === null) return { written: false };
+      state.long = input.summary;
+      return { written: true };
+    },
+    clear: async () => {
+      longClears++;
+      state.long = null;
+      return false;
+    },
+  };
+  return {
+    state, short, long, longWrites,
+    get longClears() { return longClears; },
+  };
 }
 
 describe("Bob Costas long summary projection", () => {
@@ -118,10 +163,12 @@ describe("Bob Costas long summary projection", () => {
     expect(rec.writes[1]).toEqual(rec.writes[0]);
     // The SQL writer is not used through `db` when a directory is injected.
     expect(sql.some((text) => text.includes("long_summary"))).toBe(false);
-    // The short kind never touches the long projection.
+    // A ready short summary re-projects the stored long object (same text and generation),
+    // and never clears it.
     const short = recording();
     await bobCostasHandler("short", { ...base, longSummary: short.directory })(message, recorder);
-    expect([short.writes, short.clears]).toEqual([[], []]);
+    expect(short.writes).toEqual([rec.writes[0]!]);
+    expect(short.clears).toEqual([]);
   }, 30_000);
 
   it("flag on: a refused long summary is logged, not written, and does not fail the message", async () => {
@@ -141,6 +188,99 @@ describe("Bob Costas long summary projection", () => {
       throw new Error("connection reset");
     });
     await expect(bobCostasHandler("long", { ...base, longSummary: rec.directory })(message, recorder)).rejects.toThrow("connection reset");
+  }, 30_000);
+
+  it("long before short: the skipped long summary is projected once the short summary lands", async () => {
+    const { base } = await world();
+    const db = directoryModel();
+    const deps = { ...base, directory: db.short, longSummary: db.long };
+    await bobCostasHandler("long", deps)(message, recorder);
+    // The long stage ran first: the writer found no short summary and wrote nothing.
+    expect(db.longWrites).toHaveLength(1);
+    expect(db.state).toEqual({ short: null, long: null });
+    await bobCostasHandler("short", deps)(message, recorder);
+    expect(db.state.short).not.toBeNull();
+    expect(db.state.long).toContain("flaky build");
+    expect(db.longWrites).toHaveLength(2);
+    expect(db.longWrites[1]).toEqual(db.longWrites[0]);
+  }, 30_000);
+
+  it("short cleared then rewritten: the reconciled short summary re-projects the long one", async () => {
+    const { base } = await world();
+    const db = directoryModel();
+    const deps = { ...base, directory: db.short, longSummary: db.long };
+    await bobCostasHandler("short", deps)(message, recorder);
+    await bobCostasHandler("long", deps)(message, recorder);
+    expect(db.state.long).toContain("flaky build");
+    // An erase-like clear of the short summary also clears the long one (the database trigger).
+    await db.short.clear({ orgId: "o", workspaceId: "w", harness: "claude", sessionId: "s1" });
+    expect(db.state).toEqual({ short: null, long: null });
+    // The short summary is rewritten on its next (summary_current) delivery; the long one follows.
+    expect(await bobCostasHandler("short", deps)(message, recorder)).toEqual({ status: "skipped", reason: "summary_current" });
+    expect(db.state.short).not.toBeNull();
+    expect(db.state.long).toContain("flaky build");
+    expect(db.longClears).toBe(0);
+  }, 30_000);
+
+  it("flag off: the short path reads no long pointer and writes no long summary, even with a stored long object", async () => {
+    const { sql, params, base } = await world();
+    await bobCostasHandler("long", base)(message, recorder);
+    const before = sql.length;
+    const db = directoryModel();
+    await bobCostasHandler("short", { ...base, directory: db.short })(message, recorder);
+    expect(await bobCostasHandler("short", { ...base, directory: db.short })(message, recorder)).toEqual({ status: "skipped", reason: "summary_current" });
+    expect(params.slice(before).some((values) => values.includes("long"))).toBe(false);
+    expect(sql.some((text) => text.includes("long_summary"))).toBe(false);
+    expect(db.longWrites).toEqual([]);
+  }, 30_000);
+
+  it("a refused short summary leaves no long summary (the writer finds no short one) and clears nothing", async () => {
+    const { base } = await world();
+    const db = directoryModel();
+    await bobCostasHandler("long", { ...base, directory: db.short, longSummary: db.long })(message, recorder);
+    const refusing = { write: async () => { throw new ShortSummaryRejected("over_length"); }, clear: async () => false };
+    await bobCostasHandler("short", { ...base, directory: refusing, longSummary: db.long })(message, recorder);
+    expect([db.longWrites.length, db.longClears, db.state.long]).toEqual([2, 0, null]);
+  }, 30_000);
+
+  it("no long object: the short path issues no long write or clear", async () => {
+    const { base } = await world();
+    const db = directoryModel();
+    const deps = { ...base, directory: db.short, longSummary: db.long };
+    await bobCostasHandler("short", deps)(message, recorder);
+    expect(await bobCostasHandler("short", deps)(message, recorder)).toEqual({ status: "skipped", reason: "summary_current" });
+    expect(db.state.short).not.toBeNull();
+    expect([db.longWrites, db.longClears]).toEqual([[], 0]);
+  }, 30_000);
+
+  it("a retryable long object read error on the short path rethrows with no long SQL", async () => {
+    const { base } = await world();
+    const db = directoryModel();
+    const deps = { ...base, directory: db.short, longSummary: db.long };
+    await bobCostasHandler("short", deps)(message, recorder);
+    await bobCostasHandler("long", deps)(message, recorder);
+    await db.short.clear();
+    const inner = base.store as unknown as Record<string, unknown>;
+    const store = new Proxy(inner, {
+      get: (target, prop) => {
+        if (prop === "getObject")
+          return async (key: unknown) => {
+            if (String(key).includes("long.json.enc")) throw new Error("connection reset");
+            return (target.getObject as (k: unknown) => Promise<unknown>).call(target, key);
+          };
+        const value = target[prop as string];
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }) as never;
+    const writesBefore = db.longWrites.length;
+    // The summary_current reconcile rewrites the short summary, then the long read fails transiently.
+    await expect(bobCostasHandler("short", { ...deps, store })(message, recorder)).rejects.toMatchObject({ code: "summary_store_unavailable", retryable: true });
+    expect(db.state.short).not.toBeNull();
+    expect(db.state.long).toBeNull();
+    expect([db.longWrites.length, db.longClears]).toEqual([writesBefore, 0]);
+    // The retry with a healthy store restores it.
+    expect(await bobCostasHandler("short", deps)(message, recorder)).toEqual({ status: "skipped", reason: "summary_current" });
+    expect(db.state.long).toContain("flaky build");
   }, 30_000);
 
   it("sqlLongSummaryDirectory: an invalid source is refused; the only SQL is the fenced clear of older text", async () => {
