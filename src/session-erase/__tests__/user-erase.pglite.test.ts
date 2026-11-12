@@ -151,9 +151,12 @@ describe("operator per-user erase (058010)", () => {
     const { r, phases } = await purge(f, "req-1", 2);
     expect(phases).toEqual(["slots", "slots", "slots", "purged"]); // 5 slots at 2 per step, then the purge
     expect(r).toMatchObject({ state: "metadata_purged", done: true });
-    expect(r.deleted).toMatchObject({ ingest_lazy_native_slots: 5, ingest_receipt_seats: 5, ingest_batches: 2, auth_sessions: 1 });
+    expect(r.deleted).toMatchObject({ ingest_lazy_native_slots: 5, ingest_receipt_seats: 5, ingest_batches: 2, auth_sessions_revoked_late: 0 });
+    expect(r.deleted).not.toHaveProperty("auth_sessions");
 
-    expect(await footprint(f, ALICE)).toEqual({});
+    // Only the revoked auth session stays: deleting it would let a replayed Neon mirror row re-insert it live.
+    expect(await footprint(f, ALICE)).toEqual({ "auth_sessions.user_id": 1 });
+    expect((await f.db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.auth_sessions WHERE user_id=$1 AND revoked_at IS NULL", [ALICE.userId])).rows[0]!.n).toBe(0);
     expect(await receiptRows(f, ALICE)).toEqual({ slots: 0, seats: 0, acks: 0 });
     expect(await footprint(f, BOB)).toEqual(bobBefore);
     expect(await receiptRows(f, BOB)).toEqual(bobReceipts);
@@ -258,13 +261,121 @@ describe("operator per-user erase (058010)", () => {
     expect((await storeKeys(f)).filter((k) => k.includes(`/m=${machine(ALICE)}/`))).toEqual([]);
   });
 
-  test("the five foreign-key support indexes exist", async () => {
+  test("a publication that commits after begin turns the next step into RH040; the request stays purging", async () => {
+    const f = await fixture();
+    await deliver(f, ALICE, "a1", 3);
+    await begin(f, "req-1", ALICE);
+    expect((await step(f, "req-1", 1)).phase).toBe("slots");
+    await f.db.query("SET session_replication_role=replica");
+    await insertMinimal(f, "session_index", { org_id: ALICE.orgId, workspace_id: ALICE.workspaceId, harness: "claude", session_id: "s-pub", machine_id: "srv_x", user_id: ALICE.userId, storage_provider: "s3" });
+    await f.db.query("SET session_replication_role=origin");
+    const before = await footprint(f, ALICE);
+    expect(await sqlstate(step(f, "req-1", 1))).toBe("RH040");
+    expect(await footprint(f, ALICE)).toEqual(before); // the step rolled back whole
+    expect((await f.db.query<{ s: string }>("SELECT state s FROM sessions.operator_user_erasures WHERE request_id='req-1'")).rows[0]!.s).toBe("purging");
+    // The same for every published-state table the probe covers, e.g. the canonical history scope owners.
+    await f.db.query("DELETE FROM sessions.session_index WHERE user_id=$1", [ALICE.userId]);
+    await insertMinimal(f, "ingest_history_scope_owners", { org_id: ALICE.orgId, workspace_id: ALICE.workspaceId, user_id: ALICE.userId, control_epoch: "a".repeat(64) });
+    expect(await sqlstate(step(f, "req-1", 1))).toBe("RH040");
+    await f.db.query("DELETE FROM sessions.ingest_history_scope_owners WHERE user_id=$1", [ALICE.userId]);
+    expect((await purge(f, "req-1", 10)).r.state).toBe("metadata_purged");
+  });
+
+  test("the final purge refuses (RH040) when a publication committed while its deletes waited", async () => {
+    const f = await fixture();
+    await deliver(f, ALICE, "a1", 1);
+    await begin(f, "req-1", ALICE);
+    expect((await step(f, "req-1", 10)).phase).toBe("slots");
+    // Stand-in for a publication committing during the purge: a parked session_index row becomes Alice's when the
+    // purge deletes her batches (ENABLE ALWAYS fires under replica, which the parked row needs to skip its checks).
+    await f.db.query("SET session_replication_role=replica");
+    await insertMinimal(f, "session_index", { org_id: ALICE.orgId, workspace_id: ALICE.workspaceId, harness: "claude", session_id: "s-pub", machine_id: "srv_x", user_id: "parked", storage_provider: "s3" });
+    await f.db.exec(`CREATE FUNCTION pg_temp.publish_now() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+      UPDATE sessions.session_index SET user_id='${ALICE.userId}' WHERE user_id='parked'; RETURN NULL; END $$;
+      CREATE TRIGGER publish_now AFTER DELETE ON sessions.ingest_batches FOR EACH STATEMENT EXECUTE FUNCTION pg_temp.publish_now();
+      ALTER TABLE sessions.ingest_batches ENABLE ALWAYS TRIGGER publish_now;`);
+    const before = await footprint(f, ALICE);
+    expect(await sqlstate(step(f, "req-1", 10))).toBe("RH040");
+    expect(await footprint(f, ALICE)).toEqual(before);
+    expect((await f.db.query<{ s: string }>("SELECT state s FROM sessions.operator_user_erasures WHERE request_id='req-1'")).rows[0]!.s).toBe("purging");
+    await f.db.exec("DROP TRIGGER publish_now ON sessions.ingest_batches; SET session_replication_role=origin;");
+    await f.db.query("DELETE FROM sessions.session_index WHERE user_id IN ($1,'parked')", [ALICE.userId]);
+    expect((await purge(f, "req-1", 10)).r.state).toBe("metadata_purged");
+  });
+
+  test("a receipt seat another user's slot references keeps its seat-keyed rows", async () => {
+    const f = await fixture();
+    await deliver(f, ALICE, "a1", 2);
+    await deliver(f, BOB, "b1", 2);
+    const slot = async (u: string) => (await f.db.query<{ k: string; s: string }>(
+      "SELECT key_sha256 k, current_seat_key s FROM sessions.ingest_lazy_native_slots WHERE current_owner=$1 ORDER BY key_sha256 LIMIT 1", [u])).rows[0]!;
+    const shared = (await slot(ALICE.userId)).s, bob = (await slot(BOB.userId)).k;
+    // Bob's slot and its seat-keyed receipt rows move onto Alice's seat (never expected in production).
+    await f.db.query("SET session_replication_role=replica");
+    await f.db.query("UPDATE sessions.ingest_lazy_native_slots SET current_seat_key=$1 WHERE key_sha256=$2", [shared, bob]);
+    await f.db.query("UPDATE sessions.ingest_lazy_ack_decisions SET seat_key_sha256=$1 WHERE native_key_sha256=$2", [shared, bob]);
+    await f.db.query("UPDATE sessions.ingest_receipt_ord_seats SET key_sha256=$1 WHERE candidate_key_sha256=$2", [shared, bob]);
+    await f.db.query("SET session_replication_role=origin");
+    const bobRows = async () => (await f.db.query<{ a: number; o: number; seat: number }>(
+      `SELECT (SELECT count(*)::int FROM sessions.ingest_lazy_ack_decisions WHERE native_key_sha256=$1 AND seat_key_sha256=$2) a,
+              (SELECT count(*)::int FROM sessions.ingest_receipt_ord_seats WHERE candidate_key_sha256=$1 AND key_sha256=$2) o,
+              (SELECT count(*)::int FROM sessions.ingest_receipt_seats WHERE key_sha256=$2) seat`, [bob, shared])).rows[0]!;
+    const before = await bobRows();
+    expect(before.a + before.o).toBeGreaterThan(0);
+    expect(before.seat).toBe(1);
+    await begin(f, "req-1", ALICE);
+    expect((await purge(f, "req-1", 1)).r.state).toBe("metadata_purged");
+    expect(await bobRows()).toEqual(before);
+    expect((await slot(BOB.userId)).k).toBeDefined();
+    expect((await receiptRows(f, ALICE)).slots).toBe(0);
+  });
+
+  test("every per-user row goes: publication frontiers, consent, tenant slots, rearm, parity, read API tokens; late auth sessions are revoked", async () => {
+    const f = await fixture();
+    await deliver(f, ALICE, "a1", 1);
+    await deliver(f, BOB, "b1", 1);
+    const hex = (c: string) => c.repeat(64);
+    const perUser = async (t: Tenant, n: string) => {
+      const k = { org_id: t.orgId, workspace_id: t.workspaceId, user_id: t.userId };
+      await insertMinimal(f, "upload_consent_policies", { ...k, mode: "all", revision: "1" });
+      await insertMinimal(f, "upload_consent_sessions", { ...k, source: "claude", session_id: `s-${n}` });
+      await insertMinimal(f, "upload_consent_origins", { ...k, origin_id: ORIGIN[t.userId]! });
+      await insertMinimal(f, "ingest_tenant_slots", { ...k, holder: `h-${n}` });
+      await insertMinimal(f, "upload_erasure_rearm", { ...k, origin_id: ORIGIN[t.userId]!, machine_id: machine(t), source: "claude", session_id: `s-${n}` });
+      await insertMinimal(f, "owner_buffered_parity", { ...k, cutover_epoch: hex("a"), no_head: true as never, privacy_baseline_sha256: hex("b"),
+        deletion_set_digest: hex("c"), reset_set_digest: hex("d"), target_lineage_digest: hex("e"), target_generation: hex("f") });
+      await insertMinimal(f, "read_api_tokens", { ...k, id: `rt-${n}`, token_family_id: `rt-${n}`, subject_type: "cli", audience: "rth",
+        access_token_hash: hex(n === "a" ? "1" : "2"), refresh_token_hash: hex(n === "a" ? "3" : "4") });
+      await insertMinimal(f, "ingest_publication_frontiers", { ...k, origin_id: ORIGIN[t.userId]!, source_frontier_sha256: hex("a"),
+        record_maxima_sha256: hex("b"), target_region: "us-east-1", key_root: "96bulls", schema_generation: hex("c") });
+    };
+    await perUser(ALICE, "a");
+    await perUser(BOB, "b");
+    const bobBefore = await footprint(f, BOB);
+    const b = await begin(f, "req-1", ALICE);
+    expect(b.deleted).toEqual({ ingest_publication_frontiers: 1, read_api_tokens: 1 });
+    // Arrivals after begin: the external writer re-registers a frontier, the Neon mirror adds a live auth session.
+    await insertMinimal(f, "ingest_publication_frontiers", { org_id: ALICE.orgId, workspace_id: ALICE.workspaceId, user_id: ALICE.userId,
+      origin_id: "origin-late", source_frontier_sha256: hex("a"), record_maxima_sha256: hex("b"), target_region: "us-east-1", key_root: "96bulls", schema_generation: hex("c") });
+    await authSession(f, ALICE, "auth-alice-late");
+    const { r } = await purge(f, "req-1", 10);
+    expect(r.deleted).toMatchObject({ ingest_publication_frontiers: 2, read_api_tokens: 1, upload_consent_policies: 1, upload_consent_sessions: 1,
+      upload_consent_origins: 1, ingest_tenant_slots: 1, upload_erasure_rearm: 1, owner_buffered_parity: 1, auth_sessions_revoked_late: 1 });
+    expect(await footprint(f, ALICE)).toEqual({ "auth_sessions.user_id": 1 });
+    expect((await f.db.query<{ r: string }>("SELECT revoked_reason r FROM sessions.auth_sessions WHERE id='auth-alice-late'")).rows[0]!.r).toBe("operator_user_erase");
+    expect(await footprint(f, BOB)).toEqual(bobBefore);
+  });
+
+  test("the eleven support indexes exist", async () => {
     const f = await fixture();
     const idx = (await f.db.query<{ d: string }>(
       `SELECT pg_get_indexdef(indexrelid) d FROM pg_index WHERE indexrelid::regclass::text IN (
         'sessions.ingest_lazy_ack_decisions_native_key_sha256_idx','sessions.ingest_lazy_ack_decisions_seat_key_sha256_idx',
         'sessions.ingest_lazy_native_slots_current_seat_key_idx','sessions.ingest_receipt_ord_seats_key_sha256_idx',
-        'sessions.ingest_receipt_record_heads_winner_key_sha256_idx') ORDER BY 1`)).rows.map((r) => r.d);
-    expect(idx).toHaveLength(5);
+        'sessions.ingest_receipt_record_heads_winner_key_sha256_idx','sessions.ingest_stage_intents_parent_stage_token_idx',
+        'sessions.ingest_stage_intents_gc_replacement_stage_token_idx','sessions.ingest_stage_intents_batch_idx',
+        'sessions.ingest_buffer_outbox_active_stage_token_idx','sessions.ingest_history_plans_stage_token_idx',
+        'sessions.ingest_lazy_native_slots_unowned_origin_idx') ORDER BY 1`)).rows.map((r) => r.d);
+    expect(idx).toHaveLength(11);
   });
 });

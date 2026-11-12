@@ -11,7 +11,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105058010_operator_user_erase.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator user erase: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105058010_operator_user_erase.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'d807ac22f5994ae5128a8929a34c55af281a576223c45beccd287c1d7c212559'
+ IF NOT FOUND OR v_sha<>'42ad782904550b86936cf11664bdb683264a19344a76da613305eafd6ae8e15b'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator user erase: own applied checksum required';END IF;
 END $rollback_guard$;
 DROP FUNCTION sessions.operator_user_erase_complete(text);
