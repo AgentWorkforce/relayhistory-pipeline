@@ -16,6 +16,8 @@
  *   5. complete  only after every prefix verified empty; re-runs the "rows of the user remain" probe (a late row
  *                refuses with user_rows_remain_at_completion and nothing is reported verified), then the ledger
  *                drops the origins and keeps counts. Uploads of the user are refused (RH041) from begin until here.
+ *                A seat naming the user that another user's slot still references is kept, counted in the ledger's
+ *                `retained`, and refuses completion with user_seat_ambiguity until an operator repairs it.
  *
  * The machine id is per (workspace, origin, user) (`liveMachineId`), so a prefix never holds another user's
  * objects. The buffered GC owns buffered objects only while their stage rows exist: the bytes phase starts
@@ -76,6 +78,8 @@ interface LedgerView {
   origins: string[];
   tokens_revoked: number;
   deleted: Record<string, number>;
+  /** Material naming the user that was kept, never counted as deleted (user_seats_referenced_by_other_slots). */
+  retained?: Record<string, number>;
   done: boolean;
   phase?: string;
   retry_after_ms?: number;
@@ -216,6 +220,12 @@ export async function runUserErase(db: UserEraseDb, req: UserEraseRequest, opts:
       // A row of the user landed after the metadata purge (a writer the ingest fence does not cover): the request
       // stays metadata_purged and is never reported verified. Only the code is surfaced, never the message.
       const err = e as { code?: unknown; message?: unknown };
+      // A seat naming the user that another user's slot references: kept, and completion refuses until repaired
+      // (docs/operator-user-erase.md). A distinct reason, so it is not retried as a late row.
+      if (err?.code === "55000" && typeof err.message === "string" && err.message.includes("seats naming the user remain referenced by other slots")) {
+        log({ event: "user_erase_complete_refused", code: "user_seat_ambiguity" });
+        refuse("user_seat_ambiguity");
+      }
       if (err?.code === "55000" && typeof err.message === "string" && err.message.includes("remain at completion")) {
         log({ event: "user_erase_complete_refused", code: "user_rows_remain_at_completion" });
         refuse("user_rows_remain_at_completion");

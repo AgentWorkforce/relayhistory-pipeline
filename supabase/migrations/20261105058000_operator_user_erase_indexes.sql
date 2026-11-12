@@ -1,7 +1,7 @@
 -- Slot 20261105058000. Foreign-key support indexes for the operator per-user erase (20261105058010). Code only:
 -- applying this to any real database needs Khaliq's explicit OK.
 --
--- Fifteen indexes. Ten serve foreign keys whose referencing column no index leads with: deleting a referenced row
+-- Sixteen indexes. Ten serve foreign keys whose referencing column no index leads with: deleting a referenced row
 -- then makes PostgreSQL check the referencing table by sequential scan, once per deleted row. On production-size
 -- tables a large user's erase never finishes that way. With these indexes each check is an index probe, and the erase finds a user's
 -- referencing rows without a full scan:
@@ -27,6 +27,10 @@
 --   ingest_receipt_seats((key_material->>3),(key_material->>4),(key_material->>6))         org, workspace, origin
 --   ingest_receipt_record_heads((key_material->>3),(key_material->>4),(key_material->>5))  org, workspace, user
 --   ingest_receipt_record_heads((key_material->>3),(key_material->>4),(key_material->>6))  org, workspace, origin
+-- The sixteenth serves the step's ord-seat delete by candidate key (candidate_key_sha256 = ANY(the user's slot keys));
+-- ingest_receipt_ord_seats' primary key is (claim_token, ord), so without it that delete is a sequential scan of the
+-- table on every slot batch, under the same exclusive erase lock:
+--   ingest_receipt_ord_seats(candidate_key_sha256)
 --
 -- Same adopt-or-create contract as 20261105044020 (read it there): an exact, valid, ready index of that name is
 -- adopted without locking its table; an absent one is created only on an EMPTY table (or with
@@ -79,7 +83,9 @@ BEGIN
   ['ingest_receipt_record_heads_key_material_user_idx','ingest_receipt_record_heads',
    'CREATE INDEX ingest_receipt_record_heads_key_material_user_idx ON sessions.ingest_receipt_record_heads USING btree (((key_material ->> 3)), ((key_material ->> 4)), ((key_material ->> 5)))'],
   ['ingest_receipt_record_heads_key_material_origin_idx','ingest_receipt_record_heads',
-   'CREATE INDEX ingest_receipt_record_heads_key_material_origin_idx ON sessions.ingest_receipt_record_heads USING btree (((key_material ->> 3)), ((key_material ->> 4)), ((key_material ->> 6)))']
+   'CREATE INDEX ingest_receipt_record_heads_key_material_origin_idx ON sessions.ingest_receipt_record_heads USING btree (((key_material ->> 3)), ((key_material ->> 4)), ((key_material ->> 6)))'],
+  ['ingest_receipt_ord_seats_candidate_key_idx','ingest_receipt_ord_seats',
+   'CREATE INDEX ingest_receipt_ord_seats_candidate_key_idx ON sessions.ingest_receipt_ord_seats USING btree (candidate_key_sha256)']
  ] LOOP
   v_tbl:=to_regclass(format('sessions.%I',v_spec[2]));
   IF v_tbl IS NULL THEN

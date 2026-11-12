@@ -104,7 +104,7 @@ export const ADOPTABLE_INDEXES: Readonly<Record<string, readonly AdoptableIndex[
       def: "CREATE INDEX session_output_facts_coordination_outcomes_idx ON sessions.session_output_facts USING btree (org_id, workspace_id, ts, row_id) WHERE (fact_kind = ANY (ARRAY['commit'::text, 'outcome'::text]))",
     },
   ],
-  // Operator per-user erase support indexes (ten foreign-key, one un-owned-slot lookup, four key_material lookups), 20261105058000 (packet:
+  // Operator per-user erase support indexes (ten foreign-key, one un-owned-slot lookup, four key_material lookups, one ord-seat candidate-key lookup), 20261105058000 (packet:
   // docs/packets/operator-user-erase-index-packet.md), in the step's build order.
   [OPERATOR_USER_ERASE_INDEXES_STEP]: [
     fkIndex("ingest_receipt_ord_seats_key_sha256_idx", "ingest_receipt_ord_seats", "key_sha256"),
@@ -154,6 +154,7 @@ export const ADOPTABLE_INDEXES: Readonly<Record<string, readonly AdoptableIndex[
       table: "sessions.ingest_receipt_record_heads",
       def: "CREATE INDEX ingest_receipt_record_heads_key_material_origin_idx ON sessions.ingest_receipt_record_heads USING btree (((key_material ->> 3)), ((key_material ->> 4)), ((key_material ->> 6)))",
     },
+    fkIndex("ingest_receipt_ord_seats_candidate_key_idx", "ingest_receipt_ord_seats", "candidate_key_sha256"),
   ],
 };
 
@@ -445,7 +446,7 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   },
   // Adoptable step: an unledgered "applied" here is accepted when every declared index is adoptable.
   [OPERATOR_USER_ERASE_INDEXES_STEP]: {
-    evidence: "the fifteen operator-user-erase support indexes, exact definition, valid and ready",
+    evidence: "the sixteen operator-user-erase support indexes, exact definition, valid and ready",
     sql: adoptableIndexesSentinel(OPERATOR_USER_ERASE_INDEXES_STEP),
   },
   "upstream:20261105058010_operator_user_erase.sql": {

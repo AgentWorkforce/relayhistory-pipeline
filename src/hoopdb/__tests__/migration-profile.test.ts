@@ -2461,6 +2461,8 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     };
     expect((await procSrc("sessions.ingest_lock_fences(text,text,text)")).s).toContain("operator_user_erasures");
     expect((await procSrc("sessions.ingest_buffer_gc_claim(jsonb)")).s).toContain("operator_user_erasures");
+    expect((await procSrc("sessions.ingest_privacy_authority_begin(jsonb)")).s).toContain("operator_user_erase_control_gate");
+    expect((await procSrc("sessions.ingest_source_control_begin(jsonb)")).s).toContain("operator_user_erase_control_gate");
     await db.query("INSERT INTO sessions.operator_user_erasures(request_id,org_id,workspace_id,user_id,state,origins) VALUES('rollback-probe','o','w','u','purging','{}')");
     expect((await failure(rollback("20261105058010_operator_user_erase.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(UE);
@@ -2474,12 +2476,19 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     expect(fences).toEqual({ s: bodyOf("20261104030000_ingest_fence_ownership.sql", "ingest_lock_fences", "$lock$"), d: false });
     const gcClaim = await procSrc("sessions.ingest_buffer_gc_claim(jsonb)");
     expect(gcClaim).toEqual({ s: bodyOf("20261105050010_operator_session_erase_fence_check.sql", "ingest_buffer_gc_claim", "$claim$"), d: true });
-    // 20261105058000 (foreign-key support indexes) is then the newest: 057030's down refuses; its own down drops the fifteen.
+    // The two 041000 control begins come back byte-exact (SECURITY DEFINER kept); the gate, purge, ambiguity count and
+    // heads trigger are gone.
+    expect(await procSrc("sessions.ingest_privacy_authority_begin(jsonb)")).toEqual({ s: bodyOf("20261105041000_ingest_privacy_authority.sql", "ingest_privacy_authority_begin", "$authority_begin$"), d: true });
+    expect(await procSrc("sessions.ingest_source_control_begin(jsonb)")).toEqual({ s: bodyOf("20261105041000_ingest_privacy_authority.sql", "ingest_source_control_begin", "$control_begin$"), d: true });
+    for (const sig of ["sessions.operator_user_erase_purge(text,text,text,text[],boolean)", "sessions.operator_user_erase_control_gate(text,text,text)", "sessions.operator_user_erase_seat_ambiguity(text,text,text,text[])", "sessions.operator_user_erase_heads_guard()"])
+      expect((await db.query<{ p: string | null }>("SELECT to_regprocedure($1)::text AS p", [sig])).rows[0]!.p).toBeNull();
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_trigger WHERE tgname='operator_user_erase_guard'")).rows[0]!.n).toBe(0);
+    // 20261105058000 (foreign-key support indexes) is then the newest: 057030's down refuses; its own down drops the sixteen.
     expect((await failure(rollback("20261105057030_selfhost_erase_directory_membership.down.sql")))?.code).toBe("55000");
     expect(await names()).toContain(MB);
     await rollback("20261105058000_operator_user_erase_indexes.down.sql");
     expect(await names()).not.toContain(UI);
-    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_class WHERE relnamespace='sessions'::regnamespace AND relname IN ('ingest_lazy_ack_decisions_native_key_sha256_idx','ingest_lazy_ack_decisions_seat_key_sha256_idx','ingest_lazy_native_slots_current_seat_key_idx','ingest_receipt_ord_seats_key_sha256_idx','ingest_receipt_record_heads_winner_key_sha256_idx','ingest_stage_intents_parent_stage_token_idx','ingest_stage_intents_gc_replacement_stage_token_idx','ingest_stage_intents_batch_idx','ingest_buffer_outbox_active_stage_token_idx','ingest_history_plans_stage_token_idx','ingest_lazy_native_slots_unowned_origin_idx','ingest_receipt_seats_key_material_user_idx','ingest_receipt_seats_key_material_origin_idx','ingest_receipt_record_heads_key_material_user_idx','ingest_receipt_record_heads_key_material_origin_idx')")).rows[0]!.n).toBe(0);
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_class WHERE relnamespace='sessions'::regnamespace AND relname IN ('ingest_lazy_ack_decisions_native_key_sha256_idx','ingest_lazy_ack_decisions_seat_key_sha256_idx','ingest_lazy_native_slots_current_seat_key_idx','ingest_receipt_ord_seats_key_sha256_idx','ingest_receipt_record_heads_winner_key_sha256_idx','ingest_stage_intents_parent_stage_token_idx','ingest_stage_intents_gc_replacement_stage_token_idx','ingest_stage_intents_batch_idx','ingest_buffer_outbox_active_stage_token_idx','ingest_history_plans_stage_token_idx','ingest_lazy_native_slots_unowned_origin_idx','ingest_receipt_seats_key_material_user_idx','ingest_receipt_seats_key_material_origin_idx','ingest_receipt_record_heads_key_material_user_idx','ingest_receipt_record_heads_key_material_origin_idx','ingest_receipt_ord_seats_candidate_key_idx')")).rows[0]!.n).toBe(0);
     // 20261105057030 (self-host erase directory membership, #566) is the newest step: 057010's down refuses (55000)
     // until its checksum-pinned rollback restores 044070's exact erase body (SECURITY DEFINER kept) and removes its ledger row.
     const eraseFn = async () =>

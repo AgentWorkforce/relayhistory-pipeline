@@ -1,6 +1,8 @@
--- Reverse of 20261105058010. Restores 20261104030000's exact sessions.ingest_lock_fences (and its ACL) and
--- 20261105050010's exact sessions.ingest_buffer_gc_claim (owner, SECURITY DEFINER and ACL unchanged), then drops the
--- operator per-user erase functions, its ledger table and its ledger row. Erasures already performed are not undone
+-- Reverse of 20261105058010. Restores 20261104030000's exact sessions.ingest_lock_fences (and its ACL),
+-- 20261105050010's exact sessions.ingest_buffer_gc_claim (owner, SECURITY DEFINER and ACL unchanged) and
+-- 20261105041000's exact sessions.ingest_privacy_authority_begin and sessions.ingest_source_control_begin (SECURITY
+-- DEFINER, EXECUTE for bulls96_session_ingest only, as before), then drops the heads trigger, the operator per-user
+-- erase functions, its ledger table and its ledger row. Erasures already performed are not undone
 -- (deleted rows and objects stay deleted; lazy slot tombstones stay and keep refusing a reseed of their keys).
 -- Refused (55000) while any erase is not bytes_verified: dropping the fence mid-erase would readmit the user's
 -- uploads before the purge and the byte verification finished. Completed erases have already deleted their fence rows.
@@ -15,7 +17,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105058010_operator_user_erase.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator user erase: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105058010_operator_user_erase.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'dc023f92eb682b2565b12950f7371e2d1bd16b2fe66a74669a5a1e37ea7681bf'
+ IF NOT FOUND OR v_sha<>'b0ce9a9c37b9c9fc11e07189610bd1e8074f1442a7f54dbe46a3b76b9e48c08f'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator user erase: own applied checksum required';END IF;
  PERFORM pg_advisory_xact_lock(961996,50000);
  IF EXISTS(SELECT 1 FROM sessions.operator_user_erasures WHERE state<>'bytes_verified')
@@ -169,10 +171,119 @@ BEGIN
  IF octet_length(v_tickets::text)>16777216 THEN RAISE EXCEPTION USING ERRCODE='54000',MESSAGE='buffer gc: ticket byte bound';END IF;
  RETURN jsonb_build_object('tickets',v_tickets);
 END $claim$;
+-- sessions.ingest_privacy_authority_begin(jsonb): restored from 20261105041000 (exact body; CREATE OR REPLACE keeps owner and ACL).
+CREATE OR REPLACE FUNCTION sessions.ingest_privacy_authority_begin(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $authority_begin$
+DECLARE pol sessions.ingest_lazy_policy%ROWTYPE;h sessions.ingest_source_control_heads%ROWTYPE;
+ v_org text;v_ws text;v_user text;v_kind text;v_epoch text;v_payload jsonb;d text;fresh boolean;v_deleted bigint;s jsonb;
+BEGIN
+ -- The writer marker the statement guard checks: transaction-local, set here (a function-level SET of a custom
+ -- parameter needs superuser on PG15+) and cleared before every normal return. It is not a trust boundary.
+ PERFORM set_config('bulls96.privacy_authority_writer','authority',true);
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['epoch','tenant','kind','payload']);
+ PERFORM sessions.ingest_exact_keys(p->'tenant',ARRAY['orgId','workspaceId','userId']);
+ v_org:=sessions.ingest_identifier(p#>'{tenant,orgId}',false);v_ws:=sessions.ingest_identifier(p#>'{tenant,workspaceId}',true);
+ v_user:=sessions.ingest_identifier(p#>'{tenant,userId}',false);v_kind:=p->>'kind';v_epoch:=p->>'epoch';v_payload:=p->'payload';
+ IF v_kind IS NULL OR v_kind NOT IN('selection','reset') OR jsonb_typeof(v_payload) IS DISTINCT FROM 'object' OR octet_length(v_payload::text)>2113536 THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='frozen source: invalid control';END IF;
+ IF v_kind='selection' THEN
+  PERFORM sessions.ingest_exact_keys(v_payload,ARRAY['origin_id','sessions','enabled']);
+  PERFORM sessions.ingest_identifier(v_payload->'origin_id',false);
+  IF jsonb_typeof(v_payload->'enabled') IS DISTINCT FROM 'boolean' OR jsonb_typeof(v_payload->'sessions') IS DISTINCT FROM 'array'
+   OR jsonb_array_length(v_payload->'sessions') NOT BETWEEN 1 AND 2048 THEN
+   RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='frozen source: invalid selection';END IF;
+  FOR s IN SELECT value FROM jsonb_array_elements(v_payload->'sessions') LOOP
+   PERFORM sessions.ingest_exact_keys(s,ARRAY['source','session_id']);
+   PERFORM sessions.ingest_identifier(s->'source',false);PERFORM sessions.ingest_identifier(s->'session_id',false);
+  END LOOP;
+ ELSE
+  PERFORM sessions.ingest_exact_keys(v_payload,ARRAY['request_id']);PERFORM sessions.ingest_identifier(v_payload->'request_id',false);
+ END IF;
+ PERFORM sessions.ingest_privacy_authority_lock(false);
+ pol:=sessions.ingest_frozen_source_policy();
+ IF NOT EXISTS(SELECT 1 FROM sessions.ingest_privacy_authority WHERE state='active' AND control_epoch=pol.control_epoch) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: supabase privacy authority not active';END IF;
+ IF v_epoch IS DISTINCT FROM pol.control_epoch THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: invalid control epoch';END IF;
+ d:=encode(sha256(convert_to(jsonb_build_array('delivery-cutover-control-v1',v_epoch,v_org,v_ws,v_user,v_kind,v_payload)::text,'UTF8')),'hex');
+ INSERT INTO sessions.ingest_source_control_heads(org_id,workspace_id,user_id,epoch,version,digest,kind,payload,pending)
+  VALUES(v_org,v_ws,v_user,v_epoch,1,d,v_kind,v_payload,true) ON CONFLICT DO NOTHING RETURNING true INTO fresh;
+ SELECT * INTO STRICT h FROM sessions.ingest_source_control_heads WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user FOR UPDATE;
+ IF coalesce(fresh,false) THEN
+  -- PRE before the apply below can change it (Neon persists PRE before selection/reset create fences).
+  UPDATE sessions.ingest_source_control_heads SET before_privacy=sessions.ingest_frozen_source_privacy(v_org,v_ws,v_user),privacy_version=0
+   WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user RETURNING * INTO h;
+ END IF;
+ IF h.epoch IS DISTINCT FROM v_epoch THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: invalid control epoch';END IF;
+ IF NOT coalesce(fresh,false) THEN
+  IF h.pending THEN
+   IF h.digest IS DISTINCT FROM d OR h.kind IS DISTINCT FROM v_kind THEN
+    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: control pending';END IF;
+   PERFORM set_config('bulls96.privacy_authority_writer','',true);
+   RETURN jsonb_build_object('epoch',h.epoch,'version',h.version::text,'digest',h.digest,'kind',h.kind,'pending',true,
+    'deleted',h.deleted::text,'apply',false);
+  END IF;
+  IF h.version=9223372036854775807 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: control version exhausted';END IF;
+  UPDATE sessions.ingest_source_control_heads SET version=h.version+1,digest=d,kind=v_kind,payload=v_payload,pending=true,
+   before_privacy=NULL,privacy_version=h.version,deleted=NULL,updated_at=clock_timestamp()
+   WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user RETURNING * INTO h;
+ END IF;
+ v_deleted:=sessions.ingest_privacy_authority_apply(v_org,v_ws,v_user,v_kind,v_payload);
+ IF v_kind='reset' THEN
+  UPDATE sessions.ingest_source_control_heads SET deleted=v_deleted WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user;
+ END IF;
+ PERFORM set_config('bulls96.privacy_authority_writer','',true);
+ RETURN jsonb_build_object('epoch',h.epoch,'version',h.version::text,'digest',h.digest,'kind',h.kind,'pending',true,
+  'deleted',v_deleted::text,'apply',true);
+END $authority_begin$;
+-- sessions.ingest_source_control_begin(jsonb): restored from 20261105041000 (exact body; CREATE OR REPLACE keeps owner and ACL).
+CREATE OR REPLACE FUNCTION sessions.ingest_source_control_begin(p jsonb) RETURNS jsonb
+LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog,sessions,pg_temp AS $control_begin$
+DECLARE pol sessions.ingest_lazy_policy%ROWTYPE;h sessions.ingest_source_control_heads%ROWTYPE;
+ v_org text;v_ws text;v_user text;v_kind text;v_epoch text;d text;fresh boolean;
+BEGIN
+ PERFORM sessions.ingest_exact_keys(p,ARRAY['epoch','tenant','kind','payload']);
+ PERFORM sessions.ingest_exact_keys(p->'tenant',ARRAY['orgId','workspaceId','userId']);
+ v_org:=sessions.ingest_identifier(p#>'{tenant,orgId}',false);v_ws:=sessions.ingest_identifier(p#>'{tenant,workspaceId}',true);
+ v_user:=sessions.ingest_identifier(p#>'{tenant,userId}',false);v_kind:=p->>'kind';v_epoch:=p->>'epoch';
+ IF v_kind IS NULL OR v_kind NOT IN('selection','reset') OR p->'payload' IS NULL OR jsonb_typeof(p->'payload')='null'
+  OR octet_length((p->'payload')::text)>2113536 THEN
+  RAISE EXCEPTION USING ERRCODE='22023',MESSAGE='frozen source: invalid control';END IF;
+ PERFORM sessions.ingest_privacy_authority_lock(false);
+ IF EXISTS(SELECT 1 FROM sessions.ingest_privacy_authority) THEN
+  RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: privacy authority moved; legacy control refused';END IF;
+ pol:=sessions.ingest_frozen_source_policy();
+ IF v_epoch IS DISTINCT FROM pol.control_epoch THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: invalid control epoch';END IF;
+ d:=encode(sha256(convert_to(jsonb_build_array('delivery-cutover-control-v1',v_epoch,v_org,v_ws,v_user,v_kind,p->'payload')::text,'UTF8')),'hex');
+ INSERT INTO sessions.ingest_source_control_heads(org_id,workspace_id,user_id,epoch,version,digest,kind,payload,pending)
+  VALUES(v_org,v_ws,v_user,v_epoch,1,d,v_kind,p->'payload',true) ON CONFLICT DO NOTHING RETURNING true INTO fresh;
+ SELECT * INTO STRICT h FROM sessions.ingest_source_control_heads WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user FOR UPDATE;
+ IF coalesce(fresh,false) THEN
+  UPDATE sessions.ingest_source_control_heads SET before_privacy=sessions.ingest_frozen_source_privacy(v_org,v_ws,v_user),privacy_version=0
+   WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user RETURNING * INTO h;
+ END IF;
+ IF h.epoch IS DISTINCT FROM v_epoch THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: invalid control epoch';END IF;
+ IF NOT coalesce(fresh,false) THEN
+  IF h.pending THEN
+   IF h.digest IS DISTINCT FROM d OR h.kind IS DISTINCT FROM v_kind THEN
+    RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: control pending';END IF;
+   RETURN jsonb_build_object('epoch',h.epoch,'version',h.version::text,'digest',h.digest,'kind',h.kind,'pending',true,'apply',false);
+  END IF;
+  IF h.version=9223372036854775807 THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='frozen source: control version exhausted';END IF;
+  UPDATE sessions.ingest_source_control_heads SET version=h.version+1,digest=d,kind=v_kind,payload=p->'payload',pending=true,
+   before_privacy=NULL,privacy_version=h.version,updated_at=clock_timestamp()
+   WHERE org_id=v_org AND workspace_id=v_ws AND user_id=v_user RETURNING * INTO h;
+ END IF;
+ RETURN jsonb_build_object('epoch',h.epoch,'version',h.version::text,'digest',h.digest,'kind',h.kind,'pending',true,'apply',true);
+END $control_begin$;
+DROP TRIGGER operator_user_erase_guard ON sessions.ingest_source_control_heads;
+DROP FUNCTION sessions.operator_user_erase_heads_guard();
+DROP FUNCTION sessions.operator_user_erase_control_gate(text,text,text);
 DROP FUNCTION sessions.operator_user_erase_complete(text);
 DROP FUNCTION sessions.operator_user_erase_step(text,integer);
 DROP FUNCTION sessions.operator_user_erase_begin(text,text,text,text);
+DROP FUNCTION sessions.operator_user_erase_purge(text,text,text,text[],boolean);
 DROP FUNCTION sessions.operator_user_erase_remaining(text,text,text,text[]);
+DROP FUNCTION sessions.operator_user_erase_seat_ambiguity(text,text,text,text[]);
 DROP FUNCTION sessions.operator_user_erase_render(text);
 DROP FUNCTION sessions.operator_user_erase_count(text,jsonb);
 DROP TABLE sessions.operator_user_erasures;

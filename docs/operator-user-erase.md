@@ -18,9 +18,10 @@ way:
 
 1. **Unindexed foreign keys.** Deleting a lazy slot or receipt seat made PostgreSQL check `ingest_lazy_ack_decisions`
    and `ingest_lazy_native_slots` (both large) by sequential scan, once per deleted row. The erase never finished. 058000 adds the missing indexes: ten foreign-key support indexes (slots, seats, ack decisions, receipt
-   rows, stage intents, outbox, history plans), one for the step's un-owned-slot lookup, and four `key_material`
+   rows, stage intents, outbox, history plans), one for the step's un-owned-slot lookup, four `key_material`
    expression indexes on `ingest_receipt_seats` and `ingest_receipt_record_heads` (org, workspace, user and org,
-   workspace, origin) for the seat and record-head lookups that run under the exclusive erase lock.
+   workspace, origin) for the seat and record-head lookups, and one on `ingest_receipt_ord_seats(candidate_key_sha256)`
+   for the step's ord-seat delete: sixteen in all, every lookup that runs under the exclusive erase lock.
 2. **One long transaction.** A ~35-minute transaction lost its connection before COMMIT. The slot phase commits in
    bounded steps (`stepLimit` slots per transaction) and the entry uses TCP keepalives. The **final purge is NOT
    bounded by `stepLimit`**: it deletes every other per-user row (batches, claims, stage intents, outbox, history
@@ -46,7 +47,8 @@ way:
   `ingest_history_reconcile_outbox`, `ingest_receipt_record_heads`, `ingest_receipt_ord_seats`) and **every** receipt
   seat of the user, not only each slot's current one (a new seat is created per accepted revision): seats from the
   user's ACK decisions and ordinal seats, and seats whose `key_material` names (org, workspace, user) or (org,
-  workspace, captured origin). A seat another user's slot still points to survives. The `key_material` arm and its
+  workspace, captured origin). A seat another user's slot still points to survives, and blocks completion (see
+  "Seat ambiguity" below). The `key_material` arm and its
   probe run while holding the exclusive erase lock, which every publication and fence-row write takes shared; they
   use 058000's `key_material` expression indexes on `ingest_receipt_seats` and `ingest_receipt_record_heads`
   (one per OR arm: user, origin; both share the org/workspace prefix) rather than scanning both tables. Then
@@ -58,7 +60,9 @@ way:
   `ingest_control_receipts`, `ingest_source_control_heads`, `ingest_lazy_user_seals`, `ingest_seed_fence_baselines`,
   `ingest_tenant_slots`, `owner_buffered_parity`, `upload_consent_sessions`, `upload_consent_origins`,
   `upload_consent_policies`, `read_api_tokens` (begin and again at the end), and `history.probe_connections` when
-  present and deletable by the owner login. The user's `ingest_fence_owners` row is the lock anchor of the ingest
+  present and deletable by the owner login. **Inventory rule**: every table the purge or a step deletes from is also
+  probed by `sessions.operator_user_erase_remaining` (through an index); `user-erase.pglite.test.ts` diffs the two
+  function bodies, so a new purge target without a probe fails the test. The user's `ingest_fence_owners` row is the lock anchor of the ingest
   fence (below): it stays while the request is active and `complete` deletes it in the transaction that records
   `bytes_verified`, so a returning user is adopted as a new one.
 - **Revoked, rows kept**: the user's `sessions.auth_sessions` in this database (`revoked_reason='operator_user_erase'`
@@ -116,12 +120,53 @@ origin. Deleting rows does not stop a device from uploading again: without the f
   finish as a deferral. The buffered GC claim (20261105050010's body, replaced here) never leases a stage of a user
   with an active erase.
 - Other users are unaffected, including users of the same workspace.
-- `complete` re-checks: after the byte phase it takes the same locks, revokes or deletes tokens that arrived since,
-  and re-runs the full "rows of the user remain" probe. A row that landed after `metadata_purged` through a writer
-  the fence does not cover (e.g. consent rows written by the control plane) refuses the completion with `55000`
-  'operator user erase: rows of the user remain at completion'; the request stays `metadata_purged`, the job exits
-  `2` with `user_rows_remain_at_completion` and never reports `verified`. Operator action: find and remove that row
-  through its owning lane (do not edit the ledger), then rerun the same request.
+- **Source controls.** `ingest_source_control_begin` and `ingest_privacy_authority_begin` (20261105041000) write the
+  user's `ingest_source_control_heads` row without `ingest_lock_fences`. 058010 re-creates both with their exact
+  bodies plus one call, `sessions.operator_user_erase_control_gate`, before their privacy-authority lock: it takes the
+  erase lock `(961996,50000)` shared and refuses `55000` 'operator user erase: source controls for this user are
+  refused until the erase is verified' while the user has an active erase. Nothing is written before the gate. At the
+  control routes (`custody.control.begin` and the privacy-authority begin) it surfaces like any other ledger refusal
+  there: 503 `delivery_unavailable` (stage `fence`); the client retries the control after the erase. A row trigger on `ingest_source_control_heads` (`operator_user_erase_guard`) refuses any other
+  writer of the user's head with the same message; it takes no lock (see "Locking").
+- **Privacy authority.** While `ingest_privacy_authority` is `active`, 20261105041000's guard refuses every write to
+  `ingest_source_control_heads` unless `bulls96.privacy_authority_writer` is `authority`. The final purge sets that
+  marker for its one heads `DELETE` and restores the previous value right after: the erase is an authority-class
+  writer of this user's head (it holds the erase lock exclusive and the authority lock shared, and the user's control
+  begins are gated). Without it an active authority would leave the request stuck in `purging` with the user's
+  uploads refused. **Residual**: authority activation rewrites heads; while a user's erase is active the trigger
+  refuses activation writing that user's head (activation fails whole and can be retried after `bytes_verified`), and
+  activation after the erase may write a fresh head for the user from authority state; erase the user again after it.
+- `complete` re-checks: after the byte phase it takes the same locks and the fence row `FOR UPDATE`, then:
+  1. refuses without changing anything if an **upload root** came back (a lazy slot, stage intent, batch, claim
+     attempt or claim session, outbox, publication attempt or history plan of the user: bytes may have landed after
+     the listing);
+  2. **re-runs the final purge** (every metadata table except control heads) idempotently, so a late consent row,
+     seal, token, receipt or frontier is deleted rather than stranding the request; the ledger's `deleted` counts
+     add up across both runs;
+  3. re-runs the full "rows of the user remain" probe. A row still there (a control head, which `complete` never
+     drops silently, or an upload root) refuses with `55000` 'operator user erase: rows of the user remain at
+     completion'; the request stays `metadata_purged`, the job exits `2` with `user_rows_remain_at_completion` and
+     never reports `verified`. Operator action: find and remove that row through its owning lane (for a head: let
+     the control finish or cancel it through the control lane; do not edit the ledger), then rerun the same request;
+  4. runs the seat-ambiguity check (below).
+
+## Seat ambiguity
+
+A receipt seat whose `key_material` names the user (or a captured origin) but which **another user's** slot still
+references is kept: deleting it would break that user's slot. Identity and reference disagree, so the erase fails
+closed:
+
+- the final purge counts such seats in the ledger's `retained` (`user_seats_referenced_by_other_slots`); they are
+  never counted as deleted;
+- `complete` refuses with `55000` 'operator user erase: seats naming the user remain referenced by other slots'; the
+  request stays `metadata_purged` and the job exits `2` with `user_seat_ambiguity`. It never certifies
+  `bytes_verified` while such a seat exists.
+
+**Manual repair** (the owning ingest lane, never this job, and never by editing the ledger): establish which user the
+seat really belongs to. If it is the user under erase, move the other slot off it (clear or re-point that slot's
+`current_seat_key_sha256` through the slot's owning lane, and remove that slot's ACK decisions and ordinal seats on
+the shared seat); if it is the other user's, record why the `key_material` names the erased user and get the owner's
+decision. Then rerun the same request: `complete` deletes the now-unreferenced seat and certifies.
 
 ## Phases
 
@@ -130,7 +175,7 @@ origin. Deleting rows does not stop a device from uploading again: without the f
 | `begin` | `sessions.operator_user_erase_begin(request, org, ws, user)` | Creates (if absent) and locks the user's fence row, deletes the user's `ingest_publication_frontiers` (publication and history-plan claims need them), refuses published state (`RH040`), captures the device origins, revokes this database's `auth_sessions` of the user (rows kept) and deletes the user's `read_api_tokens`, writes the ledger row (`purging`) in that same transaction, which turns on the ingest fence. Idempotent per `request_id`; a request id reused for another user is `22023`; a second active request for the same user is refused (`55000`) until the first reaches `bytes_verified`. |
 | `step` × N | `sessions.operator_user_erase_step(request, limit)` | One transaction per call; every call first re-runs the `RH040` probe and the shared-origin refusal (`55000` when another user's batches or slots appeared under a captured origin; nothing is changed). Phase `slots`: up to `limit` lazy slots tombstoned, plus their acks, record heads, ord seats and reconcile rows, and every seat of theirs no other slot references. Last call (`purged`, not bounded by `limit`): the user's remaining seats, every remaining per-user row in foreign-key order, the `RH040` probe once more, then probes prove none is left (`55000` otherwise), ledger → `metadata_purged`. Answers `gc_lease_active` + `retry_after_ms` while a buffered-GC lease is live on the user's stage. |
 | bytes | `src/session-erase/user-erase.ts` | Every version/delete marker under each machine prefix (strict paged eraser), settle wait, then a fresh read-only full listing. Anything found (a late in-flight PUT) is erased and re-verified, up to 3 rounds. |
-| `complete` | `sessions.operator_user_erase_complete(request)` | Only after the listing found nothing. Same locks as `step`; revokes late auth sessions, deletes late read-API tokens and frontiers, re-runs the full "rows remain" probe (`55000` otherwise), deletes the fence row, ledger → `bytes_verified`, origins cleared (the ledger keeps counts only); the ingest fence lifts. A rerun of a `metadata_purged` request always runs the byte phase and this recheck; only `bytes_verified` short-circuits. |
+| `complete` | `sessions.operator_user_erase_complete(request)` | Only after the listing found nothing. Same locks as `step`; refuses on a late upload root, re-runs the final purge (heads excepted: late auth sessions revoked, late tokens, consent, seals, frontiers deleted), re-runs the full "rows remain" probe (`55000` otherwise) and the seat-ambiguity check (`55000`), deletes the fence row, ledger → `bytes_verified`, origins cleared (the ledger keeps counts only); the ingest fence lifts. A rerun of a `metadata_purged` request always runs the byte phase and this recheck; only `bytes_verified` short-circuits. |
 
 Locking: `begin`, `step` and `complete` take `pg_advisory_xact_lock(961996,50000)` exclusively; it serializes erases
 with each other. Ingest writers take it shared through the 050010 statement trigger on `ingest_fence_owners`, and the
@@ -140,6 +185,13 @@ publication's pointer guard takes it `FOR UPDATE NOWAIT` before writing `session
 erase step fails fast instead of waiting. `begin` deletes the frontier rows after the fence row (a publication claim
 holding a frontier `FOR SHARE` makes it wait, then the `RH040` probe sees what that claim committed); the final purge
 deletes frontiers only after the stage rows, the claims' own order (stage row, then frontier). No lock-order cycle.
+
+The privacy-authority lock `(1919249529,96)` joins in one order, always erase lock first: `step` and `complete` take
+it shared right after the erase lock; both control begins take the erase lock shared (the gate) and then it shared;
+authority activation takes it exclusive and never takes the erase lock; control completes take it shared only. The
+heads trigger takes no lock: activation writes heads while holding the authority lock exclusive, so an erase-lock
+wait there could deadlock with a step holding the erase lock and waiting for the authority lock. With `step` taking
+the authority lock shared, activation and an erase transaction simply wait for each other in one direction.
 The bytes phase starts only after the stage rows are gone, so the GC can no longer claim the user's objects.
 
 ## Running it
@@ -172,8 +224,9 @@ bun run src/session-erase/user-erase-main.ts --request /abs/path/request.json
   everyone else, including administrator SSO roles.
 - Exit codes: `0` verified (or disabled), `3` not verified yet (rerun the same request; every phase resumes),
   `2` refused or misconfigured (do not retry unchanged; `RH040` means hand the published sessions to the
-  per-session erase first; `user_rows_remain_at_completion` means a row of the user landed after the purge, see
-  "Ingest fence"), `4` other failure, including a `lock_timeout` (`55P03`) or `statement_timeout`
+  per-session erase first; `user_rows_remain_at_completion` means an upload root or a control head of the user
+  landed after the purge, see "Ingest fence"; `user_seat_ambiguity` means a seat naming the user is still referenced
+  by another user's slot, see "Seat ambiguity"), `4` other failure, including a `lock_timeout` (`55P03`) or `statement_timeout`
   (`57014`) (rerun).
 - Output is one JSON line of counts; nothing logged carries an id or a key.
 

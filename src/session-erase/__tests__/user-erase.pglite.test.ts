@@ -360,12 +360,38 @@ describe("operator per-user erase (058010)", () => {
     expect(before.a + before.o).toBeGreaterThan(0);
     expect(before.seat).toBe(1);
     await begin(f, "req-1", ALICE);
-    expect((await purge(f, "req-1", 1)).r.state).toBe("metadata_purged");
+    const { r } = await purge(f, "req-1", 1);
+    expect(r.state).toBe("metadata_purged");
+    // Kept, and recorded as kept (never as deleted).
+    expect(r.retained).toEqual({ user_seats_referenced_by_other_slots: 1 });
     expect(await bobRows()).toEqual(before);
     expect((await slot(BOB.userId)).k).toBeDefined();
     expect((await receiptRows(f, ALICE)).slots).toBe(0);
     // Of the seats naming Alice, only the one Bob's slot still points to survives.
     expect(await seatsNaming(f, ALICE)).toEqual({ seats: 1, heads: 0 });
+    // Identity and reference disagree: completion fails closed with its own message, and the driver its own reason.
+    let msg = "";
+    try { await complete(f, "req-1"); } catch (e) { msg = `${(e as { code?: string }).code}:${(e as Error).message}`; }
+    expect(msg).toBe("55000:operator user erase: seats naming the user remain referenced by other slots");
+    expect(await state(f, "req-1")).toBe("metadata_purged");
+    const logs: Array<Record<string, unknown>> = [];
+    const err = await runUserErase(pgDb(f), { requestId: "req-1", ...ALICE }, { keyRoot: "96bulls", eraser: storeEraser(f.deps.target.store), settleMs: 1,
+      sleep: async () => {}, log: (e) => { logs.push(e); } }).then(() => null, (e) => e);
+    expect(err).toBeInstanceOf(UserEraseRefused);
+    expect(err.code).toBe("user_seat_ambiguity");
+    expect(logs.at(-1)).toEqual({ event: "user_erase_complete_refused", code: "user_seat_ambiguity" });
+    expect(await state(f, "req-1")).toBe("metadata_purged");
+    expect(await bobRows()).toEqual(before);
+    expect(await seatsNaming(f, ALICE)).toEqual({ seats: 1, heads: 0 });
+    // The documented repair: Bob's slot gets its own seat back (here: the seat-keyed rows move off Alice's seat),
+    // after which the seat is no longer referenced and the same request completes.
+    await f.db.query("SET session_replication_role=replica");
+    await f.db.query("UPDATE sessions.ingest_lazy_native_slots SET current_seat_key=NULL WHERE key_sha256=$1", [bob]);
+    await f.db.query("DELETE FROM sessions.ingest_lazy_ack_decisions WHERE native_key_sha256=$1 AND seat_key_sha256=$2", [bob, shared]);
+    await f.db.query("DELETE FROM sessions.ingest_receipt_ord_seats WHERE candidate_key_sha256=$1 AND key_sha256=$2", [bob, shared]);
+    await f.db.query("SET session_replication_role=origin");
+    expect(await complete(f, "req-1")).toMatchObject({ state: "bytes_verified", retained: { user_seats_referenced_by_other_slots: 0 } });
+    expect(await seatsNaming(f, ALICE)).toEqual({ seats: 0, heads: 0 });
   });
 
   test("every per-user row goes: publication frontiers, consent, tenant slots, rearm, parity, read API tokens; late auth sessions are revoked", async () => {
@@ -424,25 +450,54 @@ describe("operator per-user erase (058010)", () => {
     expect(await tryDeliver(f, ALICE, "ob3", 1, { origin: "origin-b" })).toBeNull();
   });
 
-  test("(b) a row of the user planted after metadata_purged makes complete refuse (55000); the driver never reports verified", async () => {
+  test("(b) complete re-purges a late metadata row (consent, seal: no 23503) and refuses an upload root or a control head it may not drop", async () => {
     const f = await fixture();
     await deliver(f, ALICE, "a1", 1);
     await begin(f, "req-1", ALICE);
-    expect((await purge(f, "req-1", 10)).r.state).toBe("metadata_purged");
-    // A writer the ingest fence does not cover (consent is written by the control plane).
-    await insertMinimal(f, "upload_consent_policies", { org_id: ALICE.orgId, workspace_id: ALICE.workspaceId, user_id: ALICE.userId, mode: "all", revision: "1" });
-    let msg = "";
-    try { await complete(f, "req-1"); } catch (e) { msg = `${(e as { code?: string }).code}:${(e as Error).message}`; }
-    expect(msg).toBe("55000:operator user erase: rows of the user remain at completion");
-    expect(await state(f, "req-1")).toBe("metadata_purged");
-    const err = await runUserErase(pgDb(f), { requestId: "req-1", ...ALICE }, { keyRoot: "96bulls", eraser: storeEraser(f.deps.target.store), settleMs: 1, sleep: async () => {} })
+    const purged = (await purge(f, "req-1", 10)).r;
+    expect(purged.state).toBe("metadata_purged");
+    const k = { org_id: ALICE.orgId, workspace_id: ALICE.workspaceId, user_id: ALICE.userId };
+    const err = async () => {
+      try { await complete(f, "req-1"); return ""; } catch (e) { return `${(e as { code?: string }).code}:${(e as Error).message}`; }
+    };
+    const driver = () => runUserErase(pgDb(f), { requestId: "req-1", ...ALICE }, { keyRoot: "96bulls", eraser: storeEraser(f.deps.target.store), settleMs: 1, sleep: async () => {} })
       .then(() => null, (e) => e);
-    expect(err).toBeInstanceOf(UserEraseRefused);
-    expect(err.code).toBe("user_rows_remain_at_completion");
+
+    // Unreachable for complete's re-purge: a control head (planted under replica, bypassing the heads guard) is never
+    // dropped silently, and an upload root (a claim session: bytes may have landed after the listing) refuses at once.
+    await f.db.query("SET session_replication_role=replica");
+    await f.db.query(`INSERT INTO sessions.ingest_source_control_heads(org_id,workspace_id,user_id,epoch,version,digest,kind,payload,pending)
+      VALUES($1,$2,$3,$4,1,$5,'reset','{"request_id":"planted"}'::jsonb,false)`, [ALICE.orgId, ALICE.workspaceId, ALICE.userId, epoch, "d".repeat(64)]);
+    await f.db.query("SET session_replication_role=origin");
+    expect(await err()).toBe("55000:operator user erase: rows of the user remain at completion");
     expect(await state(f, "req-1")).toBe("metadata_purged");
-    // Once the row is gone the same request completes.
-    await f.db.query("DELETE FROM sessions.upload_consent_policies WHERE user_id=$1", [ALICE.userId]);
-    expect(await complete(f, "req-1")).toMatchObject({ state: "bytes_verified" });
+    const e1 = await driver();
+    expect(e1).toBeInstanceOf(UserEraseRefused);
+    expect(e1.code).toBe("user_rows_remain_at_completion");
+    expect((await f.db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.ingest_source_control_heads WHERE user_id=$1", [ALICE.userId])).rows[0]!.n).toBe(1);
+    await f.db.query("DELETE FROM sessions.ingest_source_control_heads WHERE user_id=$1", [ALICE.userId]);
+    await f.db.query("SET session_replication_role=replica");
+    await insertMinimal(f, "ingest_claim_sessions", { ...k, origin_id: ORIGIN[ALICE.userId]!, source: "claude", session_id: "s-late" });
+    await f.db.query("SET session_replication_role=origin");
+    expect(await err()).toBe("55000:operator user erase: rows of the user remain at completion");
+    expect((await f.db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.ingest_claim_sessions WHERE user_id=$1", [ALICE.userId])).rows[0]!.n).toBe(1);
+    await f.db.query("DELETE FROM sessions.ingest_claim_sessions WHERE user_id=$1", [ALICE.userId]);
+
+    // Reachable: writers the ingest fence does not cover (consent is written by the control plane), a lazy-user seal
+    // (RESTRICT on the fence row complete deletes: it must be purged first, never surface as 23503), a late read
+    // token. complete purges them under its locks and the fence row, then certifies.
+    await insertMinimal(f, "upload_consent_policies", { ...k, mode: "all", revision: "1" });
+    await f.db.query("SET session_replication_role=replica");
+    await insertMinimal(f, "ingest_lazy_user_seals", { ...k, source_identity_sha256: identity, control_epoch: epoch, privacy_fingerprint: "a".repeat(64) });
+    await f.db.query("SET session_replication_role=origin");
+    await insertMinimal(f, "read_api_tokens", { ...k, id: "rt-late", token_family_id: "rt-late", subject_type: "cli", audience: "rth",
+      access_token_hash: "1".repeat(64), refresh_token_hash: "2".repeat(64) });
+    const done = await complete(f, "req-1");
+    expect(done).toMatchObject({ state: "bytes_verified" });
+    // The ledger counts are cumulative: complete added exactly the planted rows (and the fence row).
+    const added = (t: string) => (done.deleted[t] ?? 0) - (purged.deleted[t] ?? 0);
+    expect(["upload_consent_policies", "ingest_lazy_user_seals", "read_api_tokens", "ingest_fence_owners"].map(added)).toEqual([1, 1, 1, 1]);
+    expect(await footprint(f, ALICE)).toEqual({});
   });
 
   test("(c) erasing one user does not fence another user of the same workspace", async () => {
@@ -507,7 +562,120 @@ describe("operator per-user erase (058010)", () => {
     expect((await receiptRows(f, ALICE)).slots).toBe(1); // the step rolled back whole
   });
 
-  test("the fifteen support indexes exist", async () => {
+  test("A: a source control for the user after begin is refused (distinct 55000) and writes no head; a pre-begin head is purged", async () => {
+    const f = await fixture();
+    await deliver(f, ALICE, "a1", 1);
+    const control = (t: Tenant, id: string) => f.rpc("ingest_source_control_begin", { epoch, tenant: t, kind: "reset", payload: { request_id: id } });
+    const heads = async (t: Tenant) => (await f.db.query<{ n: number }>(
+      "SELECT count(*)::int n FROM sessions.ingest_source_control_heads WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3", [t.orgId, t.workspaceId, t.userId])).rows[0]!.n;
+    const refusal = async (p: Promise<unknown>) => { try { await p; return ""; } catch (e) { return `${(e as { code?: string }).code}:${(e as Error).message}`; } };
+    const GATED = "55000:operator user erase: source controls for this user are refused until the erase is verified";
+    // Before the erase the legacy writer works (the gate lets it through) and leaves a head the purge must remove.
+    expect(await control(ALICE, "early-control")).toMatchObject({ pending: true, apply: true });
+    expect(await heads(ALICE)).toBe(1);
+    await begin(f, "req-1", ALICE);
+    expect(await refusal(control(ALICE, "during-purge"))).toBe(GATED);
+    const { r } = await purge(f, "req-1", 10);
+    expect(r.state).toBe("metadata_purged");
+    expect(r.deleted).toMatchObject({ ingest_source_control_heads: 1 });
+    expect(await heads(ALICE)).toBe(0);
+    // bct's causal shape: the real RPC as the ingest role after metadata_purged.
+    expect(await refusal(control(ALICE, "late-control"))).toBe(GATED);
+    expect(await heads(ALICE)).toBe(0);
+    // Any other writer of the head (here the owner, directly) meets the row guard.
+    expect(await refusal(f.db.query(`INSERT INTO sessions.ingest_source_control_heads(org_id,workspace_id,user_id,epoch,version,digest,kind,payload,pending)
+      VALUES($1,$2,$3,$4,1,$5,'reset','{}'::jsonb,true)`, [ALICE.orgId, ALICE.workspaceId, ALICE.userId, epoch, "d".repeat(64)]))).toBe(GATED);
+    expect(await heads(ALICE)).toBe(0);
+    // Another user of the workspace is not gated.
+    expect(await control(BOB, "bob-control")).toMatchObject({ pending: true, apply: true });
+    expect(await complete(f, "req-1")).toMatchObject({ state: "bytes_verified" });
+    // Verified: the gate lifts.
+    expect(await control(ALICE, "after-verified")).toMatchObject({ pending: true, apply: true });
+  });
+
+  test("A: the control gate takes the erase lock SHARED before the privacy-authority lock (order 50000 -> 96)", async () => {
+    const f = await fixture();
+    const locks = async () => (await f.db.query<{ k: string; m: string }>(
+      `SELECT classid::text||','||objid::text k, mode m FROM pg_locks WHERE locktype='advisory' AND pid=pg_backend_pid()
+         AND objsubid=2 AND ((classid=961996 AND objid=50000) OR (classid=1919249529 AND objid=96)) ORDER BY 1`)).rows;
+    // The real legacy begin, as the ingest role, in an open transaction: it holds both keys SHARED afterwards.
+    await f.db.exec("BEGIN;SET LOCAL ROLE bulls96_session_ingest");
+    try {
+      await f.db.query("SELECT sessions.ingest_source_control_begin($1::jsonb)", [JSON.stringify({ epoch, tenant: BOB, kind: "reset", payload: { request_id: "x" } })]);
+      expect(await locks()).toEqual([{ k: "1919249529,96", m: "ShareLock" }, { k: "961996,50000", m: "ShareLock" }]);
+    } finally {
+      await f.db.exec("ROLLBACK");
+    }
+    // The gate line sits before the authority lock in both replaced bodies.
+    for (const fn of ["ingest_source_control_begin", "ingest_privacy_authority_begin"]) {
+      const src = (await f.db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid=$1::regprocedure", [`sessions.${fn}(jsonb)`])).rows[0]!.s;
+      const gate = src.indexOf("PERFORM sessions.operator_user_erase_control_gate(v_org,v_ws,v_user);");
+      expect(gate).toBeGreaterThan(0);
+      expect(gate).toBeLessThan(src.indexOf("PERFORM sessions.ingest_privacy_authority_lock(false);"));
+      expect(src.slice(0, gate)).not.toMatch(/INSERT|UPDATE|DELETE/);
+    }
+    // step and complete take 96 SHARED right after 50000 EXCLUSIVE.
+    for (const fn of ["operator_user_erase_step(text,integer)", "operator_user_erase_complete(text)"]) {
+      const src = (await f.db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid=$1::regprocedure", [`sessions.${fn}`])).rows[0]!.s;
+      const x = src.indexOf("pg_advisory_xact_lock(961996,50000)"), sh = src.indexOf("pg_advisory_xact_lock_shared(1919249529,96)");
+      expect(x).toBeGreaterThan(0);
+      expect(sh).toBeGreaterThan(x);
+      expect(src.slice(0, x)).not.toMatch(/FOR UPDATE|INSERT|DELETE/);
+    }
+  });
+
+  test("B: with the privacy authority active the full erase completes, the authority begin is the gated writer, and the writer marker is restored", async () => {
+    const f = await fixture();
+    await deliver(f, ALICE, "a1", 2);
+    await deliver(f, BOB, "b1", 1);
+    // A head from before the authority moved (the legacy mirror), then activation (owner, as the handoff does).
+    await f.rpc("ingest_source_control_begin", { epoch, tenant: ALICE, kind: "reset", payload: { request_id: "pre-authority" } });
+    await f.db.query("UPDATE sessions.ingest_source_control_heads SET pending=false WHERE user_id=$1", [ALICE.userId]);
+    await f.db.query("INSERT INTO sessions.ingest_privacy_authority(state,control_epoch,neon_fingerprint_sha256,activated_at) VALUES('active',$1,$2,now())",
+      [epoch, "f".repeat(64)]);
+    const refusal = async (p: Promise<unknown>) => { try { await p; return ""; } catch (e) { return `${(e as { code?: string }).code}:${(e as Error).message}`; } };
+    // The legacy guard still holds for everyone else (041000 unchanged).
+    expect(await refusal(f.db.query("DELETE FROM sessions.ingest_source_control_heads WHERE user_id='nobody'"))).toContain("privacy authority is supabase");
+    await begin(f, "req-1", ALICE);
+    const authority = (t: Tenant, id: string) => f.rpc("ingest_privacy_authority_begin", { epoch, tenant: t, kind: "reset", payload: { request_id: id } });
+    expect(await refusal(authority(ALICE, "late-authority"))).toBe("55000:operator user erase: source controls for this user are refused until the erase is verified");
+    // The final purge runs in a caller transaction that already set the marker: it is restored after the DELETE.
+    let r: any;
+    for (let i = 0; i < 20; i++) {
+      await f.db.exec("BEGIN");
+      await f.db.query("SELECT set_config('bulls96.privacy_authority_writer','caller',true)");
+      r = await step(f, "req-1", 10);
+      const after = (await f.db.query<{ v: string }>("SELECT current_setting('bulls96.privacy_authority_writer',true) v")).rows[0]!.v;
+      await f.db.exec("COMMIT");
+      expect(after).toBe("caller");
+      if (r.done) break;
+    }
+    expect(r).toMatchObject({ state: "metadata_purged", phase: "purged" });
+    expect(r.deleted).toMatchObject({ ingest_source_control_heads: 1 });
+    expect(await refusal(authority(ALICE, "late-authority-2"))).toBe("55000:operator user erase: source controls for this user are refused until the erase is verified");
+    expect(await complete(f, "req-1")).toMatchObject({ state: "bytes_verified" });
+    expect(await footprint(f, ALICE)).toEqual({});
+    expect((await f.db.query<{ n: number }>("SELECT count(*)::int n FROM sessions.ingest_source_control_heads WHERE user_id=$1", [ALICE.userId])).rows[0]!.n).toBe(0);
+    // Outside the erase's DELETE the marker is unset again: the statement guard still refuses a plain write.
+    expect(await refusal(f.db.query("DELETE FROM sessions.ingest_source_control_heads WHERE user_id='nobody'"))).toContain("privacy authority is supabase");
+  });
+
+  test("inventory: every table the purge or a step deletes from is probed by operator_user_erase_remaining", async () => {
+    const f = await fixture();
+    const src = async (fn: string) => (await f.db.query<{ s: string }>("SELECT prosrc s FROM pg_proc WHERE oid=$1::regprocedure", [`sessions.${fn}`])).rows[0]!.s;
+    const targets = new Set<string>();
+    for (const fn of ["operator_user_erase_purge(text,text,text,text[],boolean)", "operator_user_erase_step(text,integer)"]) {
+      for (const m of (await src(fn)).matchAll(/DELETE FROM ((?:sessions|history)\.\w+)/g)) targets.add(m[1]!);
+    }
+    expect(targets.size).toBeGreaterThan(30);
+    const remaining = await src("operator_user_erase_remaining(text,text,text,text[])");
+    const missing = [...targets].filter((t) => !new RegExp(`(FROM|JOIN) ${t.replace(".", "\\.")}\\b`).test(remaining));
+    expect(missing).toEqual([]);
+    // The lock anchor is deleted only by complete, with the transition.
+    expect(targets.has("sessions.ingest_fence_owners")).toBe(false);
+  });
+
+  test("the sixteen support indexes exist", async () => {
     const f = await fixture();
     const idx = (await f.db.query<{ d: string }>(
       `SELECT pg_get_indexdef(indexrelid) d FROM pg_index WHERE indexrelid::regclass::text IN (
@@ -518,8 +686,9 @@ describe("operator per-user erase (058010)", () => {
         'sessions.ingest_buffer_outbox_active_stage_token_idx','sessions.ingest_history_plans_stage_token_idx',
         'sessions.ingest_lazy_native_slots_unowned_origin_idx',
         'sessions.ingest_receipt_seats_key_material_user_idx','sessions.ingest_receipt_seats_key_material_origin_idx',
-        'sessions.ingest_receipt_record_heads_key_material_user_idx','sessions.ingest_receipt_record_heads_key_material_origin_idx') ORDER BY 1`)).rows.map((r) => r.d);
-    expect(idx).toHaveLength(15);
+        'sessions.ingest_receipt_record_heads_key_material_user_idx','sessions.ingest_receipt_record_heads_key_material_origin_idx',
+        'sessions.ingest_receipt_ord_seats_candidate_key_idx') ORDER BY 1`)).rows.map((r) => r.d);
+    expect(idx).toHaveLength(16);
   });
 
   test("the key_material predicates of the erase match 058000's expression indexes", async () => {
@@ -546,5 +715,15 @@ describe("operator per-user erase (058010)", () => {
       expect(p).toMatch(new RegExp(`${t}_key_material_(user|origin)_idx`));
       expect(p).not.toContain("Seq Scan");
     }
+    // D: the phase-1 ordinal-seat DELETE (key_sha256 OR candidate_key_sha256) under the erase lock: both arms indexed.
+    const ord = await plan("SELECT 1 FROM sessions.ingest_receipt_ord_seats WHERE key_sha256=ANY($1::text[]) OR candidate_key_sha256=ANY($2::text[])",
+      [["a".repeat(64)], ["b".repeat(64)]]);
+    console.log(`EXPLAIN ord seats:\n${ord}`);
+    expect(ord).toContain("ingest_receipt_ord_seats_candidate_key_idx");
+    expect(ord).toContain("ingest_receipt_ord_seats_key_sha256_idx");
+    expect(ord).not.toContain("Seq Scan");
+    const cand = await plan("SELECT 1 FROM sessions.ingest_receipt_ord_seats WHERE candidate_key_sha256=ANY($1::text[])", [["b".repeat(64)]]);
+    expect(cand).toContain("ingest_receipt_ord_seats_candidate_key_idx");
+    expect(cand).not.toContain("Seq Scan");
   });
 });

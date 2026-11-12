@@ -1,9 +1,10 @@
 # Operator user erase indexes (migration 20261105058000)
 
 Migration `supabase/migrations/20261105058000_operator_user_erase_indexes.sql`
-adds fifteen indexes: ten foreign-key support indexes, one for the un-owned-slot
-lookup and four `key_material` expression indexes for the receipt seat and record-head
-lookups (org, workspace, user and org, workspace, origin), so the operator per-user erase (20261105058010) probes the referencing tables by
+adds sixteen indexes: ten foreign-key support indexes, one for the un-owned-slot
+lookup, four `key_material` expression indexes for the receipt seat and record-head
+lookups (org, workspace, user and org, workspace, origin) and one for the ord-seat
+lookup by candidate key, so the operator per-user erase (20261105058010) probes the referencing tables by
 index instead of by sequential scan. On a populated table it refuses a blocking
 build and its error hint points here.
 
@@ -30,8 +31,9 @@ the migration. The exact definitions are the
 | `sessions.ingest_receipt_seats_key_material_origin_idx` | `(key_material ->> 3), (key_material ->> 4), (key_material ->> 6)` | |
 | `sessions.ingest_receipt_record_heads_key_material_user_idx` | `(key_material ->> 3), (key_material ->> 4), (key_material ->> 5)` | |
 | `sessions.ingest_receipt_record_heads_key_material_origin_idx` | `(key_material ->> 3), (key_material ->> 4), (key_material ->> 6)` | |
+| `sessions.ingest_receipt_ord_seats_candidate_key_idx` | `candidate_key_sha256` | |
 
-All are `USING btree`; the last four are expression indexes (each column is a `->>`
+All are `USING btree`; the four `key_material` indexes are expression indexes (each column is a `->>`
 expression on the `jsonb` `key_material` array, written `((key_material ->> 3))` in the exact definition). An index whose table is empty may be left absent; the
 migration builds it itself. Every index on a populated table must be prebuilt;
 `SELECT EXISTS (SELECT 1 FROM sessions.<table>)` tells you which tables are
