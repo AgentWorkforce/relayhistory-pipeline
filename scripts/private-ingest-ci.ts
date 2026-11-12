@@ -166,9 +166,13 @@ export async function preflightPrivateIngest() {
     ? requireCustodyShadowMatch({ ...active, phase: transition.from }, input.sessionIngest.expectedGeneration!)
     : null;
   if (process.env.PRIVATE_INGEST_RELEASE_MODE === "deploy") {
-    const release = privateIngestReleaseInputs(process.env);
+    const overlapGeneration = input.sessionIngest.overlapGeneration;
+    const release = privateIngestReleaseInputs(process.env, overlapGeneration);
+    // SHADOW is bound to the step-0-shadow -> step-1-custody edge; OVERLAP to a tracked overlap
+    // profile. The transition gate holds the phase fixed while {G, H} is live, so both never co-occur.
     const expected = `DEPLOY ${P.worker} ${release.sha} PLAN ${release.planRun}` +
-      (shadowReceiptSha256 === null ? "" : ` SHADOW ${shadowReceiptSha256}`);
+      (shadowReceiptSha256 === null ? "" : ` SHADOW ${shadowReceiptSha256}`) +
+      (overlapGeneration === undefined ? "" : ` OVERLAP ${overlapGeneration}`);
     if (release.confirmation !== expected) privateIngestRefuse("private_ingest_shadow_confirmation");
   }
   let rollbackWitness = null;

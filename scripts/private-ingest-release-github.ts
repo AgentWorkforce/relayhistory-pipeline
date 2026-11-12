@@ -1,5 +1,5 @@
 /** Read-only GitHub Actions/environment gate for the private-ingest production release. */
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync } from "node:fs";
 import {
   PRIVATE_INGEST_RELEASE as P,
   privateIngestRefuse,
@@ -9,12 +9,24 @@ import {
 type Obj = Record<string, any>;
 type Get = (path: string) => Promise<any>;
 
+/**
+ * The tracked profile's overlapGeneration, read from the checked-out SHA (the same file the operator
+ * job stages). Undefined when the profile declares no overlap, which keeps the confirmation unchanged.
+ */
+export function trackedOverlapGeneration(path = "config/cloudflare/private-ingest-production.json"): unknown {
+  let tracked: { sessionIngest?: Record<string, unknown> };
+  try { tracked = JSON.parse(readFileSync(path, "utf8")); }
+  catch { return privateIngestRefuse("private_ingest_release_profile"); }
+  return tracked?.sessionIngest?.overlapGeneration;
+}
+
 export async function privateIngestGithubGate(
   env: Record<string, string | undefined>,
   get: Get,
   approved = false,
+  profileOverlap: unknown = trackedOverlapGeneration(),
 ) {
-  const input = privateIngestReleaseInputs(env);
+  const input = privateIngestReleaseInputs(env, profileOverlap);
   if (env.GITHUB_REPOSITORY !== P.repository || env.GITHUB_REPOSITORY_ID !== P.repositoryId ||
       env.GITHUB_EVENT_NAME !== "workflow_dispatch" || env.GITHUB_REF !== "refs/heads/main" ||
       env.GITHUB_SHA !== input.sha || env.GITHUB_RUN_ATTEMPT !== "1" ||

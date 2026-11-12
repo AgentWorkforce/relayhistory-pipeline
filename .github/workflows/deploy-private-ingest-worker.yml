@@ -24,7 +24,7 @@ on:
         type: string
         default: ""
       confirmation:
-        description: 'Deploy: DEPLOY 96bulls-session-ingest <sha> PLAN <run>; first frozen promotion appends SHADOW <reviewed receipt sha256>'
+        description: 'Deploy: DEPLOY 96bulls-session-ingest <sha> PLAN <run>; first frozen promotion appends SHADOW <reviewed receipt sha256>; then " OVERLAP <H>" only when the tracked profile declares overlapGeneration'
         type: string
         default: ""
 

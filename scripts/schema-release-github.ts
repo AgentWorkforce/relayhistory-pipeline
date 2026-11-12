@@ -22,7 +22,7 @@ const REQUIRED_PUSH_RUNS = [
  * with head_sha === sha, the required job names included. Refuses codes.runs or
  * codes.jobs.
  */
-async function requireGreenPushRuns(
+export async function requireGreenPushRuns(
   get: Get,
   base: string,
   sha: string,
