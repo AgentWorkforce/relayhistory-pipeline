@@ -1,7 +1,7 @@
 name: production DB read-only checks
 run-name: db read-only checks (interval ${{ inputs.interval_seconds }}s, statement timeout ${{ inputs.statement_timeout_seconds }}s)
 
-# Read-only production database checks: runbooks/sessions-prod-db-readonly-checks.md.
+# Read-only production database checks: sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-db-readonly-checks.md.
 #
 # Environment `production-db-readonly` (create it first: required reviewer Khaliq, deployment branches
 # limited to main; the gate job refuses otherwise):

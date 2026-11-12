@@ -3,6 +3,14 @@
 **Date:** 2026-11-06
 **Status:** accepted for implementation; first live publication remains validation
 
+> **Update (2026-11-11):** Khaliq decided to make this repository public, which
+> is the separate visibility decision the first alternative below calls for.
+> Hosted operator runbooks and handoff packets were removed from the tree first
+> and preserved in the private `AgentWorkforce/sessions-pipeline-cloud` under
+> `hosted-ops/preserved/`; git history keeps the originals. The Cosign/Sigstore
+> path below stays in place. Switching to GitHub's native artifact attestations,
+> now available for this repository, is a separate change.
+
 ## Context
 
 The services repository is private on GitHub Free. GitHub's native artifact

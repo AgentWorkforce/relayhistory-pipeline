@@ -150,6 +150,8 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105047010_buffered_exact_session_stages.sql",
       // Read-role-only paged exact-session buffered stage RPC (requires 047010); default-off and never called by the ingest Worker.
       "20261105047020_buffered_session_stages_paged.sql",
+      // Owner-only frozen-copy progress table (no grant, no function) and the 041000 privacy guard trigger on frozen receipts; no G4 function names them.
+      "20261105047030_frozen_copy_progress.sql",
       // Operator per-session erase: new tables and entry points; no ingest path calls them.
       "20261105050000_operator_session_erase.sql",
       // Its fence check also replaces publication scope / buffer GC for lock order and guards live writer tables.

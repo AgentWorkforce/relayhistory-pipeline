@@ -3,7 +3,7 @@ import {SemanticPostgresExecutor} from "../search-features/semantic-copy-postgre
 import { largeReadJobState, routeLargeRead } from "./large-read-worker.ts";
 /**
  * AWS Lambda entry for the sessions-prod session pipeline
- * (stacks/aws/session-pipeline.ts, runbooks/sessions-prod-session-pipeline.md).
+ * (stacks/aws/session-pipeline.ts, sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-session-pipeline.md).
  *
  *   SQS batch (S3 object events, reconcile items) -> processBatch -> partial batch response
  *   EventBridge schedule {"reconcile": true}      -> list recent manifests -> SQS

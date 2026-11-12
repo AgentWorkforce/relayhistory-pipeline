@@ -1,5 +1,5 @@
 // Operator step only (slot 044080). Fills sessions.ingest_claim_sessions from ingest_claim_attempts.records,
-// resuming from the policy row's backfill_cursor. Runbook: docs/handoffs/ingest-claim-sessions-044080/operator-packet.md.
+// resuming from the policy row's backfill_cursor. Runbook: sessions-pipeline-cloud:hosted-ops/preserved/docs/handoffs/ingest-claim-sessions-044080/operator-packet.md.
 // stdin (one JSON line, piped from 1Password, never written to disk): {"ownerUrl": "postgresql://user:password@host:port/db"}
 // No query parameters except sslmode=verify-full (src/shared/owner-pg-config.ts).
 // Flags: [--batch-size 500] [--statement-timeout-ms 30000] [--max-batches N] [--dry-run]

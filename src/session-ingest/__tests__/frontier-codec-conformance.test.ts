@@ -6,7 +6,7 @@ import { parseFrontierJson } from "../frontier-plan-input.ts";
 import { frontierUtf8TupleCompare } from "../frontier-order.ts";
 const root = new URL("../../../", import.meta.url);
 const fixture = (name: string, sha: string) => {
-  const bytes = readFileSync(new URL(`docs/handoffs/frontier-attester-20261107/${name}`, root));
+  const bytes = readFileSync(new URL(`docs/contracts/frontier-attester-20261107/${name}`, root));
   if (createHash("sha256").update(bytes).digest("hex") !== sha) throw new Error("frontier_vector_pin_mismatch");
   return JSON.parse(bytes.toString("utf8"));
 };
