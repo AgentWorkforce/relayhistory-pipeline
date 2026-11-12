@@ -1,5 +1,5 @@
 /**
- * Operator per-session erase: the internal route relay-control (Control) calls, PR 1 of 6 (contract only).
+ * Operator per-session erase: the internal route relay-control (Control) calls.
  * Contract: docs/operator-session-erase-contract.md. Runtime-neutral (Worker and node:http); no DB access.
  *
  *   POST /internal/v1/session-erase/organizations/{orgId}/workspaces/{workspaceId}/sources/{source}/sessions/{sessionId}
@@ -10,12 +10,13 @@
  * answers 501 NOT_IMPLEMENTED_BODY and nothing is read. A hosted Worker whose erase settings are invalid keeps
  * serving ingest and answers 503 UNAVAILABLE_BODY here instead (reason "config_invalid"). With both set, the request is authenticated
  * (Bearer SESSION_ERASE_API_SECRET, or SESSION_ERASE_API_SECRET_PREVIOUS during a rotation, compared in
- * constant time), the path and body are validated, and the answer is still 501: the erase itself ships in
- * a later PR. Control decides membership before calling; this service never calls Control. The secret,
+ * constant time), the path and body are validated, and the self-host service orchestrates erasure.
+ * Hosted or unbound runtimes retain the 501 stub. Control decides membership before calling; this service never calls Control. The secret,
  * ids and the body are never logged or echoed.
  */
 import type { Context, Hono } from "hono";
 import { secretMatches } from "../session-read-api/self-issued.ts";
+import { erasureReceipt, SessionEraseServiceError } from "../session-erase/receipt.ts";
 
 export const SESSION_ERASE_PREFIX = "/internal/v1/session-erase";
 export const SESSION_ERASE_FLAG_VAR = "SESSION_ERASE_API_ENABLED";
@@ -111,6 +112,10 @@ export function parseSessionErasePath(pathname: string): SessionEraseKey | null 
 }
 
 export interface SessionEraseRequest { requestId: string; actor: { kind: "user" | "bootstrap"; id: string } }
+export interface SessionEraseService {
+  erase(key: SessionEraseKey, request: SessionEraseRequest): Promise<unknown>;
+  receipt(key: SessionEraseKey): Promise<unknown | null>;
+}
 
 function exactKeys(v: Record<string, unknown>, keys: readonly string[]): boolean {
   const got = Object.keys(v);
@@ -169,7 +174,7 @@ const errorJson = (c: Context, status: number, code: string) => {
  * existing route or middleware sees it). `log` gets one line per request: route, kind (the HTTP method), status, outcome
  * and the correlation id only.
  */
-export function registerSessionEraseRoutes(app: Hono<any>, config: SessionEraseConfig, log: (fields: Record<string, unknown>) => void): void {
+export function registerSessionEraseRoutes(app: Hono<any>, config: SessionEraseConfig, log: (fields: Record<string, unknown>) => void, service?: SessionEraseService): void {
   const handler = async (c: Context) => {
     const line = (status: number, outcome: string) =>
       log({ route: "operator.session_erase", kind: c.req.method, status, outcome, correlation_id: c.get("correlationId") });
@@ -196,16 +201,33 @@ export function registerSessionEraseRoutes(app: Hono<any>, config: SessionEraseC
         } catch {
           throw new EraseError(400, "invalid_request");
         }
-        parseSessionEraseBody(value);
+        const request = parseSessionEraseBody(value);
+        if (service) {
+          const receipt = erasureReceipt(await service.erase(key, request), key);
+          const status = receipt.status === "in_progress" ? 202 : 200;
+          line(status, receipt.status);
+          return c.json(receipt, status);
+        }
       } else if (c.req.method !== "GET") {
         c.header("Allow", "GET, POST");
         throw new EraseError(405, "method_not_allowed");
+      } else if (service) {
+        const value = await service.receipt(key);
+        if (value === null) throw new EraseError(404, "erasure_not_found");
+        const receipt = erasureReceipt(value, key);
+        line(200, receipt.status);
+        return c.json(receipt, 200);
       }
-      // PR 1: authenticated and validated, but the erase itself is a later PR.
+      // Hosted or unbound runtime: preserve the authenticated, validated stub.
       line(501, "not_implemented");
       return c.json(NOT_IMPLEMENTED_BODY, 501);
     } catch (error) {
-      if (!(error instanceof EraseError)) throw error;
+      if (!(error instanceof EraseError)) {
+        const code = error instanceof SessionEraseServiceError ? error.code : "unavailable";
+        line(503, code);
+        c.header("Retry-After", SESSION_ERASE_RETRY_AFTER_SECONDS);
+        return errorJson(c, 503, code);
+      }
       line(error.status, error.code);
       return errorJson(c, error.status, error.code);
     }

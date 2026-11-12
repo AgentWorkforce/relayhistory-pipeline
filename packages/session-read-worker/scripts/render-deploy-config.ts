@@ -88,6 +88,8 @@ export const BUFFERED_SEARCH_GATE_VAR = "READ_API_BUFFERED_SEARCH_GATE";
 
 /** Exact-session RPC opt-in; absent is off. */
 export const OWNER_BUFFERED_EXACT_SESSION_VAR = "READ_API_OWNER_BUFFERED_EXACT_SESSION";
+/** Paged exact-session stages (047020) opt-in; absent is off; needs owner_buffered=on AND exact_session=on. */
+export const OWNER_BUFFERED_STAGES_PAGED_VAR = "READ_API_OWNER_BUFFERED_STAGES_PAGED";
 /** The owner-buffered events flag (index.ts Env; ownerBufferedEventsEnabled accepts only "on"). */
 export const OWNER_BUFFERED_EVENTS_VAR = "READ_API_OWNER_BUFFERED_EVENTS";
 /** The owner-buffered events read's stage concurrency (index.ts Env; ownerBufferedStageConcurrency accepts 2..32). */
@@ -98,7 +100,7 @@ export const OWNER_BUFFERED_PHASE_LOG_VAR = "READ_API_OWNER_BUFFERED_PHASE_LOG";
 /** The owner-buffered out-of-band index check (index.ts Env; ownerBufferedIndexVerifyEnabled accepts only "on"). */
 export const OWNER_BUFFERED_INDEX_VERIFY_VAR = "READ_API_OWNER_BUFFERED_INDEX_VERIFY";
 /** Vars only this render adds; a template declaring any of them is refused in every mode. */
-const RENDER_ONLY_VARS = [OWNER_BUFFERED_EXACT_SESSION_VAR, OWNER_BUFFERED_STATEMENT_TIMEOUT_VAR, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR] as const;
+const RENDER_ONLY_VARS = [OWNER_BUFFERED_EXACT_SESSION_VAR, OWNER_BUFFERED_STAGES_PAGED_VAR, OWNER_BUFFERED_STATEMENT_TIMEOUT_VAR, OWNER_BUFFERED_EVENTS_VAR, OWNER_BUFFERED_STAGE_CONCURRENCY_VAR, OWNER_BUFFERED_PHASE_LOG_VAR, OWNER_BUFFERED_INDEX_VERIFY_VAR] as const;
 
 export interface RenderInputs {
   hyperdriveId: string;
@@ -115,6 +117,8 @@ export interface RenderInputs {
   ownerBufferedEvents?: string;
   /** Opt in to the 047010 exact-session RPC; requires owner-buffered reads. */
   ownerBufferedExactSession?: string;
+  /** Opt in to the 047020 paged exact-session stages RPC; "" (no input) = off; requires owner_buffered=on and exact_session=on. */
+  ownerBufferedStagesPaged?: string;
   /** The owner_buffered_stage_concurrency workflow_dispatch input; "" or "off" = off, else 2..32; needs owner_buffered_events=on. */
   ownerBufferedStageConcurrency?: string;
   /** The owner_buffered_phase_log workflow_dispatch input; "" (no input) = off; on needs owner_buffered_events=on. */
@@ -196,6 +200,10 @@ export function renderDeployConfig(template: string, inputs: RenderInputs): stri
   if (exactMode !== "off" && exactMode !== "on") throw new RenderError('owner_buffered_exact_session must be "off" or "on"');
   const exact = exactMode === "on";
   if (exact && mode !== "on") throw new RenderError("owner_buffered_exact_session needs owner_buffered=on");
+  const pagedMode = (inputs.ownerBufferedStagesPaged ?? "").trim() || "off";
+  if (pagedMode !== "off" && pagedMode !== "on") throw new RenderError('owner_buffered_stages_paged must be "off" or "on"');
+  const paged = pagedMode === "on";
+  if (paged && (mode !== "on" || !exact)) throw new RenderError("owner_buffered_stages_paged=on needs owner_buffered=on and owner_buffered_exact_session=on; refusing a flag that would have no effect");
   const eventsMode = (inputs.ownerBufferedEvents ?? "").trim() || "off";
   if (eventsMode !== "off" && eventsMode !== "on") throw new RenderError('owner_buffered_events must be "off" or "on"');
   const events = eventsMode === "on";
@@ -262,6 +270,7 @@ export function renderDeployConfig(template: string, inputs: RenderInputs): stri
       // One binding serves both readers; the gate adds only its flag.
       ...(gate ? { [BUFFERED_SEARCH_GATE_VAR]: "on" } : {}),
       ...(exact ? { [OWNER_BUFFERED_EXACT_SESSION_VAR]: "on" } : {}),
+      ...(paged ? { [OWNER_BUFFERED_STAGES_PAGED_VAR]: "on" } : {}),
       ...(events ? { [OWNER_BUFFERED_EVENTS_VAR]: "on" } : {}),
       ...(concurrency !== undefined ? { [OWNER_BUFFERED_STAGE_CONCURRENCY_VAR]: concurrency } : {}),
       ...(phaseLog ? { [OWNER_BUFFERED_PHASE_LOG_VAR]: "1" } : {}),
@@ -284,6 +293,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
       bufferedSearchGate: process.env.BUFFERED_SEARCH_GATE,
       ownerBufferedEvents: process.env.OWNER_BUFFERED_EVENTS,
       ownerBufferedExactSession: process.env.OWNER_BUFFERED_EXACT_SESSION,
+      ownerBufferedStagesPaged: process.env.OWNER_BUFFERED_STAGES_PAGED,
       ownerBufferedStageConcurrency: process.env.OWNER_BUFFERED_STAGE_CONCURRENCY,
       ownerBufferedPhaseLog: process.env.OWNER_BUFFERED_PHASE_LOG,
       ownerBufferedIndexVerify: process.env.OWNER_BUFFERED_INDEX_VERIFY,
@@ -299,6 +309,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
     const concurrencyOut = (process.env.OWNER_BUFFERED_STAGE_CONCURRENCY ?? "").trim() || "off";
     if (concurrencyOut !== "off") console.log(`deploy config: owner-buffered events stage concurrency ON, ${OWNER_BUFFERED_STAGE_CONCURRENCY_VAR}=${concurrencyOut}`);
     if (((process.env.OWNER_BUFFERED_PHASE_LOG ?? "").trim() || "off") === "on") console.log(`deploy config: owner-buffered events phase log ON, ${OWNER_BUFFERED_PHASE_LOG_VAR}=1`);
+    if (((process.env.OWNER_BUFFERED_STAGES_PAGED ?? "").trim() || "off") === "on") console.log(`deploy config: owner-buffered paged exact-session stages ON, ${OWNER_BUFFERED_STAGES_PAGED_VAR}=on`);
     if (((process.env.OWNER_BUFFERED_INDEX_VERIFY ?? "").trim() || "off") === "on") console.log(`deploy config: owner-buffered index verify ON, ${OWNER_BUFFERED_INDEX_VERIFY_VAR}=on`);
     if (gate) console.log(`deploy config: buffered search gate ON, ${BUFFERED_SEARCH_GATE_VAR}=on, ${binding}${on ? " (shared with owner-buffered, rendered once)" : ""}`);
   } catch (error) {

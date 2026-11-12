@@ -63,7 +63,14 @@ export const RELAYCONTROL_TOKEN_PREFIX = "sh_at_";
 export const RELAYCONTROL_INTROSPECT_PATH = "/internal/v1/auth/introspect";
 /** The only relaycontrol scopes that grant anything here, and what they grant. */
 export const RELAYCONTROL_SCOPE_ALLOWLIST: Readonly<Record<string, string>> =
-  Object.freeze({ "rth:read": "rth:read", "rth:sync": "rth:sync" });
+  Object.freeze({
+    "rth:read": "rth:read",
+    "rth:sync": "rth:sync",
+    // Upload consent (session-ingest upload-consent.ts): lets a person's CONFIRMED sharing choice widen
+    // uploads. relaycontrol must mint it only from an interactive confirmation, never on a sync token;
+    // it grants no sync or read route here (those still require rth:sync / rth:read).
+    "rth:consent": "rth:consent",
+  });
 export const RELAYCONTROL_TOKEN_SUBJECT = "relaycontrol_user_access_token";
 /** relaycontrol's NODE_ID_PATTERN: a claimed machine id it would not answer 400 to. */
 export const RELAYCONTROL_MACHINE_ID_PATTERN = /^[A-Za-z0-9._:-]{1,200}$/;

@@ -148,14 +148,19 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105047000_coordination_fact_readers.sql",
       // Read-role-only exact-session buffered stage RPC; default-off and never called by the ingest Worker.
       "20261105047010_buffered_exact_session_stages.sql",
+      // Read-role-only paged exact-session buffered stage RPC (requires 047010); default-off and never called by the ingest Worker.
+      "20261105047020_buffered_session_stages_paged.sql",
       // Operator per-session erase: new tables and entry points; no ingest path calls them.
       "20261105050000_operator_session_erase.sql",
       // Its fence check also replaces publication scope / buffer GC for lock order and guards live writer tables.
       "20261105050010_operator_session_erase_fence_check.sql",
+      "20261105050020_operator_session_erase_runtime.sql",
       // One read-role-only SECURITY DEFINER summary activity counter; no ingest path touches it.
       "20261105056000_session_summary_activity.sql",
       // One read-role-only SECURITY DEFINER per-user session aggregate; no ingest path touches it.
       "20261105057000_session_directory_users_aggregate.sql",
+      // Server-owned upload consent: four new owner-only tables and two ingest-role entry points; no G4 function names them.
+      "20261105057010_upload_consent.sql",
       // Five foreign-key support indexes for the per-user erase; no function changes.
       "20261105058000_operator_user_erase_indexes.sql",
       // Operator per-user erase: an owner-only ledger table and entry points; no ingest path calls them.

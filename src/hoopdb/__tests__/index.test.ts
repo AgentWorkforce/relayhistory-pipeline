@@ -102,6 +102,51 @@ describe("HoopDb session index", () => {
     expect(rows[0]?.scrubbed).toBe(true);
   });
 
+  test("a pointer without provider takes the configured reader provider, not a hardcoded s3", async () => {
+    const calls: Array<{ text: string; params?: unknown[] }> = [];
+    const db = {
+      async query<R>(text: string, params?: unknown[]) {
+        calls.push({ text, params });
+        if (text.includes("upsert_session_index")) return { rows: [{ applied: true, revision: "1" }] as R[] };
+        return { rows: [] as R[] };
+      },
+    } as unknown as HoopDb;
+    const manifest = scrubbedManifest();
+    const reader: ManifestReader = {
+      provider: "gcs",
+      bucket: "locker-gcs",
+      async read() { return { manifest, etag: "etag-1" }; },
+    };
+    const queue: PipelineQueue = {
+      backend: "memory",
+      async send() {},
+      async sendBatch() {},
+    };
+    const pointer: RawPointer = {
+      traceId,
+      workspaceId: "ws-test",
+      machineId: "machine-test",
+      harness: "codex",
+      sessionId: "session-test",
+      manifestKey,
+    };
+    const ctx: TraceContext = {
+      traceId,
+      orgId: "org-test",
+      workspaceId: "ws-test",
+      machineId: "machine-test",
+      harness: "codex",
+      sessionId: "session-test",
+    };
+
+    await hoopDbSessionIndex({ db, reader, queue, current: () => undefined }).upsertRawPointer(pointer, ctx);
+
+    const upsert = calls.find((call) => call.text.includes("upsert_session_index"));
+    const rows = JSON.parse(String(upsert?.params?.[0])) as Array<{ storage_provider?: string; bucket?: string }>;
+    expect(rows[0]?.storage_provider).toBe("gcs");
+    expect(rows[0]?.bucket).toBe("locker-gcs");
+  });
+
   test("repairs equal-revision identity before projecting the directory", async () => {
     const calls: Array<{ text: string; params?: unknown[] }> = [];
     const db = {
@@ -184,4 +229,29 @@ describe("HoopDb session index", () => {
       "machine:encoded",
     ]);
   });
+});
+
+test("operator fence denial ends enforced indexing before identity repair, projections or fanout", async () => {
+  const previous = process.env.SESSION_ERASE_FENCE_ENFORCED;
+  process.env.SESSION_ERASE_FENCE_ENFORCED = "1";
+  const calls: string[] = [];
+  let sent = 0;
+  try {
+    const db = { async query(text: string) {
+      calls.push(text);
+      return { rows: text.includes("ingest_operator_runtime_upsert") ? [{ applied: false, revision: "0", fenced: true }] : [] };
+    } } as unknown as HoopDb;
+    const manifest = scrubbedManifest();
+    const index = hoopDbSessionIndex({ db, reader: { provider: "s3", bucket: "locker", read: async () => ({ manifest, etag: "etag" }) },
+      queue: { backend: "memory", send: async () => { sent++; }, sendBatch: async () => { sent++; } }, current: () => undefined });
+    const result = await index.upsertRawPointer({ traceId, workspaceId: "ws-test", machineId: "machine-test", harness: "codex", sessionId: "session-test", manifestKey, provider: "s3", bucket: "locker" },
+      { traceId, orgId: "org-test", workspaceId: "ws-test", machineId: "machine-test", harness: "codex", sessionId: "session-test" });
+    expect(result).toMatchObject({ status: "skipped", reason: "operator_erased" });
+    expect(calls.some(text => text.includes("ingest_operator_runtime_upsert"))).toBe(true);
+    expect(calls.some(text => /INSERT INTO|UPDATE sessions/.test(text))).toBe(false);
+    expect(sent).toBe(0);
+  } finally {
+    if (previous === undefined) delete process.env.SESSION_ERASE_FENCE_ENFORCED;
+    else process.env.SESSION_ERASE_FENCE_ENFORCED = previous;
+  }
 });

@@ -92,6 +92,7 @@
  * INGEST_CUSTODY_SOURCE other than relayhistory/unset, INGEST_PRIVACY_AUTHORITY other than neon/unset,
  * INGEST_SIGNING_KEY (the relayhistory HMAC is never accepted here).
  */
+import { UPLOAD_CONSENT_VAR, uploadConsentEnforcement, type UploadConsentEnforcement } from "./upload-consent.ts";
 import type { CapturePolicyUploadsMode } from "./capture-policy.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { normalizedAudience } from "@rhc/auth/relaycontrol.ts";
@@ -101,6 +102,7 @@ import { sessionEraseConfig, type SessionEraseConfig } from "./session-erase.ts"
 import { analyticsConfig, type AnalyticsConfig } from "../shared/analytics-config.ts";
 // Already in the self-host graph through deliver.ts; the same parser as the Worker's INGEST_CLAIM_LOCK_BUSY.
 import { routingFlag } from "./babysitter-retention.ts";
+import { eraseRuntimeSettings } from "../session-erase/flags.ts";
 import { UPLOAD_DIRECT_FLAG, UPLOAD_WITNESS_KEY_VAR, uploadDirectConfig, type UploadDirectConfig } from "./upload-admission.ts";
 
 export const SELFHOST_INGEST_FLAG = "RELAYHISTORY_SELFHOST_INGEST";
@@ -145,10 +147,14 @@ export interface SelfhostIngestSettings {
   heartbeatAccept: boolean;
   /** RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: the capture policy upload check (capture-policy.ts). Default report. */
   capturePolicyUploads: CapturePolicyUploadsMode;
+  /** INGEST_UPLOAD_CONSENT (upload-consent.ts): off (default) | report | hold-only | enforce. */
+  uploadConsent: UploadConsentEnforcement;
   /** RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS: positive introspection cache, ms. 0 (default) = none. */
   introspectPositiveTtlMs: number;
   /** SESSION_ERASE_API_ENABLED (session-erase.ts). Default: disabled, the route answers 501. */
   sessionErase: SessionEraseConfig;
+  eraseFenceEnforced?: true;
+  eraseBytesEnabled?: true;
   /** Present only for SELFHOST_INGEST_ADMISSION=async|drain. */
   admission?: SelfhostAdmissionSettings;
   /** HISTORY_UPLOAD_DIRECT allowlist|on (upload-admission.ts). Absent: off, nothing reads the upload prefix. */
@@ -301,6 +307,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   const sessionSelection = selfhostSessionSelectionEnabled(env);
   const heartbeatAccept = selfhostHeartbeatAcceptEnabled(env);
   const capturePolicyUploads = selfhostCapturePolicyUploads(env);
+  const uploadConsent = uploadConsentEnforcement(env[UPLOAD_CONSENT_VAR]);
   const introspectPositiveTtlMs = selfhostIntrospectPositiveTtlMs(env);
   const sessionErase = sessionEraseConfig(env);
   const policy = destinationPolicy(env);
@@ -320,6 +327,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   const keyRoot = env.INGEST_KEY_ROOT?.trim() || "96bulls";
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/u.test(keyRoot)) throw new Error("96bulls: INGEST_KEY_ROOT must be a single key segment");
   const admission = selfhostAdmissionSettings(env);
+  const eraseRuntime = eraseRuntimeSettings(env, sessionErase, admission);
   const uploadDirect = selfhostUploadDirectSettings(env, keyRoot, admission);
   const analytics = analyticsConfig(env, "selfhost");
   const claimLockBusy = routingFlag(env[SELFHOST_CLAIM_LOCK_BUSY_VAR]);
@@ -336,8 +344,10 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     sessionSelection,
     heartbeatAccept,
     capturePolicyUploads,
+    uploadConsent,
     introspectPositiveTtlMs,
     sessionErase,
+    ...eraseRuntime,
     ...(admission ? { admission } : {}),
     ...(uploadDirect ? { uploadDirect } : {}),
     ...(analytics.sink !== "noop" ? { analytics } : {}),

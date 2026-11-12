@@ -22,6 +22,7 @@
  * claim is caught by the existing ACK recheck (original epochs and reset count), and one applied
  * after the ACK erases as today.
  */
+import type { OperatorSharingCap } from "./upload-consent.ts";
 import { createHash } from "node:crypto";
 import { rawZstdFrame } from "@rhc/lib/pipeline/raw-chunks.ts";
 import { scrubRecords } from "@rhc/lib/scrub-engine/index.ts";
@@ -135,6 +136,11 @@ interface InboxHeader {
   receivedAtMs: number;
   /** The privacy journal seq witnessed before the request body was read (the admission fence). */
   journalSeq: number;
+  /**
+   * Upload consent (upload-consent.ts): the operator's enforced sharing-mode cap derived on the request
+   * path from the verified identity, so the consumer enforces the same cap. Absent: no cap.
+   */
+  consentCap?: OperatorSharingCap;
   tenant: LedgerTenant;
   originId: string;
   batchId: string;
@@ -149,9 +155,9 @@ interface InboxHeader {
 }
 
 /** Header line (ids only) + one scrubbed payload line per prepared record, as one zstd frame. */
-export function encodeInbox(tenant: LedgerTenant, prepared: PreparedDelivery, receivedAtMs: number, journalSeq: number): Uint8Array {
+export function encodeInbox(tenant: LedgerTenant, prepared: PreparedDelivery, receivedAtMs: number, journalSeq: number, consentCap?: OperatorSharingCap): Uint8Array {
   if (!Number.isSafeInteger(journalSeq) || journalSeq < 0) throw new Error("admission_witness_invalid");
-  const header: InboxHeader = { v: 1, kind: INBOX_KIND, receivedAtMs, journalSeq, tenant: { orgId: tenant.orgId, workspaceId: tenant.workspaceId, userId: tenant.userId },
+  const header: InboxHeader = { v: 1, kind: INBOX_KIND, receivedAtMs, journalSeq, ...(consentCap ? { consentCap } : {}), tenant: { orgId: tenant.orgId, workspaceId: tenant.workspaceId, userId: tenant.userId },
     originId: prepared.originId, batchId: prepared.batchId, batchDigest: prepared.batchDigest, receipt: prepared.receipt,
     records: prepared.records.map((r) => [r.record_id, r.revision_id, r.revision, r.digest, r.kind, r.source, r.session_id ?? null, r.operation]) };
   // Payloads are already the service form (servicePayload); the pipeline scrubber runs once more so
@@ -185,7 +191,15 @@ function inboxRecord(id: unknown, line: unknown, originId: string): PreparedDeli
   return fitForScrub(record);
 }
 
-export interface DecodedInbox { tenant: LedgerTenant; prepared: PreparedDelivery; receivedAtMs: number; journalSeq: number }
+export interface DecodedInbox { tenant: LedgerTenant; prepared: PreparedDelivery; receivedAtMs: number; journalSeq: number; consentCap?: OperatorSharingCap }
+
+/** A stored cap must be exactly the shape the request path writes; anything else is a malformed object. */
+function inboxConsentCap(v: unknown): OperatorSharingCap | undefined {
+  if (v === undefined) return undefined;
+  if (!isObject(v) || (v.mode !== "selected" && v.mode !== "new") || Object.keys(v).some((k) => k !== "mode" && k !== "sinceMs")) return bad();
+  if (v.sinceMs !== undefined && (!Number.isSafeInteger(v.sinceMs) || (v.sinceMs as number) < 0)) return bad();
+  return { mode: v.mode, ...(v.sinceMs !== undefined ? { sinceMs: v.sinceMs as number } : {}) };
+}
 
 /** Decode and bind an inbox object to the key it was read from. `null`: tombstoned (already terminal). */
 export async function decodeInbox(keyRoot: string, key: string, raw: Uint8Array): Promise<DecodedInbox | null> {
@@ -220,7 +234,8 @@ export async function decodeInbox(keyRoot: string, key: string, raw: Uint8Array)
   if (new Set(records.map((r) => r.revision_id)).size !== records.length) bad();
   const accepted = new Set(receipt.acceptedRevisionIds as unknown[]);
   if (records.some((r) => !accepted.has(r.revision_id))) bad();
-  return { tenant, receivedAtMs: h.receivedAtMs as number, journalSeq: h.journalSeq as number,
+  const consentCap = inboxConsentCap(h.consentCap);
+  return { tenant, receivedAtMs: h.receivedAtMs as number, journalSeq: h.journalSeq as number, ...(consentCap ? { consentCap } : {}),
     prepared: { originId: h.originId as string, batchId: h.batchId as string, batchDigest: h.batchDigest as string, receipt: receipt as unknown as PreparedDelivery["receipt"], records } };
 }
 
@@ -237,11 +252,11 @@ export interface AsyncAdmissionTarget {
  * The request path: durable inbox PUT, then the queue send. Either failing is a retryable 503
  * (nothing was acknowledged; a retry writes a new attempt object and the claim dedupes).
  */
-export async function enqueueAdmission(target: AsyncAdmissionTarget, tenant: LedgerTenant, prepared: PreparedDelivery, receivedAtMs: number, journalSeq: number): Promise<string> {
+export async function enqueueAdmission(target: AsyncAdmissionTarget, tenant: LedgerTenant, prepared: PreparedDelivery, receivedAtMs: number, journalSeq: number, consentCap?: OperatorSharingCap): Promise<string> {
   assertInboxTenant(target.keyRoot, tenant.orgId);
   const nonce = (target.nonce ?? (() => crypto.randomUUID().replace(/-/g, "").slice(0, 16)))();
   const key = inboxKey(target.keyRoot, tenant, prepared.originId, prepared.receipt.receiptId, receivedAtMs, nonce);
-  await target.store.put(objectKey(key), encodeInbox(tenant, prepared, receivedAtMs, journalSeq), { ifNoneMatch: true, contentType: "application/zstd" });
+  await target.store.put(objectKey(key), encodeInbox(tenant, prepared, receivedAtMs, journalSeq, consentCap), { ifNoneMatch: true, contentType: "application/zstd" });
   try {
     await target.enqueue({ v: 1, kind: "ingest-admission", key });
   } catch (error) {

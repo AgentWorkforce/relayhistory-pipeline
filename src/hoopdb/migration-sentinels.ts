@@ -220,6 +220,8 @@ const adoptableIndexesSentinel = (step: string) =>
       AND (c.relname, i.indrelid, pg_get_indexdef(i.indexrelid)) IN (${ADOPTABLE_INDEXES[step]!.map((x) => `('${x.name}', to_regclass('${x.table}'), '${x.def}')`).join(", ")})`;
 
 export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
+  "96bulls:0005_operator_session_erase_guards.sql": { evidence: "table sessions.session_erasure_optional_guards", sql: relation("sessions.session_erasure_optional_guards") },
+  "upstream:20261105050020_operator_session_erase_runtime.sql": { evidence: "table sessions.session_erasure_writes", sql: relation("sessions.session_erasure_writes") },
   "upstream:20261105041000_ingest_privacy_authority.sql": {
     evidence: "table sessions.ingest_privacy_authority + lazy-current adoption uses the EXACT source-table list (no prefix)",
     sql: "SELECT to_regclass('sessions.ingest_privacy_authority') IS NOT NULL AND (SELECT count(*)=2 FROM pg_proc WHERE oid IN(to_regprocedure('sessions.ingest_lazy_user(jsonb,text,jsonb)'),to_regprocedure('sessions.ingest_lazy_begin(jsonb,text)')) AND position('NOT IN(''ingest_frozen_source_records''' in prosrc)>0 AND position('''ingest_frozen_source_owned_sessions'')' in prosrc)>0 AND position('NOT LIKE ''ingest' in prosrc)=0) AS applied",
@@ -387,6 +389,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     sql: "SELECT to_regprocedure('sessions.coordination_write_facts_for(text,timestamptz,timestamptz,text,integer)') IS NOT NULL AND to_regprocedure('sessions.coordination_output_facts_for(text,timestamptz,timestamptz,text,integer)') IS NOT NULL AS applied",
   },
   "upstream:20261105056000_session_summary_activity.sql": { evidence: "function sessions.session_summary_activity_for", sql: "SELECT to_regprocedure('sessions.session_summary_activity_for(text,timestamptz,timestamptz)') IS NOT NULL AS applied" },
+  "upstream:20261105057010_upload_consent.sql": {
+    evidence: "function sessions.upload_consent_apply_v1 and table sessions.upload_consent_holds",
+    sql: "SELECT to_regprocedure('sessions.upload_consent_apply_v1(text,text,text,jsonb,boolean,bigint)') IS NOT NULL AND to_regclass('sessions.upload_consent_holds') IS NOT NULL AS applied",
+  },
   // Adoptable step: an unledgered "applied" here is accepted when every declared index is adoptable.
   [OPERATOR_USER_ERASE_INDEXES_STEP]: {
     evidence: "the five operator-user-erase foreign-key support indexes, exact definition, valid and ready",
@@ -453,6 +459,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105047010_buffered_exact_session_stages.sql": {
     evidence: "new exact-session stage RPC (047010)",
     sql: fn("sessions", "buffered_session_stages_for_target"),
+  },
+  "upstream:20261105047020_buffered_session_stages_paged.sql": {
+    evidence: "new paged exact-session stage RPC (047020)",
+    sql: fn("sessions", "buffered_session_stages_for_target_paged"),
   },
   "upstream:20261105046000_analysis_jobs.sql": { evidence: "table sessions.session_analysis_jobs_v2", sql: relation("sessions.session_analysis_jobs_v2") },
   // Adoptable step: an unledgered "applied" here is accepted when every declared index is adoptable.

@@ -1,6 +1,6 @@
 /** Injected-engine raw sealer. Default off: only SCRUB_ENGINE=wasm-bindgen routes
  * here, through routedRawChunkSealer() in scrub-engine/index.ts, which binds this to
- * the verified pinned relayscrubber 0.5.0-alpha.6 instance (docs/scrub-engine.md,
+ * the verified pinned relayscrubber 0.5.0-alpha.8 instance (docs/scrub-engine.md,
  * "Cutover"). This module, the pin and the vendored bytes are digested in the
  * separate technical-foul-cutover.json entry. The historical TS sealer stays frozen.
  */

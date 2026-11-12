@@ -1,11 +1,11 @@
 # Injected-engine raw sealing scaffold
 
-Status (cutover, pinned to relayscrubber `0.5.0-alpha.6`; first routed with `0.5.0-alpha.4`): the sealer is now routed in production, opt-in only.
+Status (cutover, pinned to relayscrubber `0.5.0-alpha.8`; first routed with `0.5.0-alpha.4`): the sealer is now routed in production, opt-in only.
 Under `SCRUB_ENGINE=wasm-bindgen` + `SCRUB_ENGINE_REQUIRED=wasm-bindgen` +
 `READER_MAX_RULESET=10`, `routedRawChunkSealer()` in `scrub-engine/index.ts` binds
-this sealer to the verified relayscrubber `0.5.0-alpha.6` instance and the four
+this sealer to the verified relayscrubber `0.5.0-alpha.8` instance and the four
 production constructors inject it (see docs/scrub-engine.md, "Cutover: pinned
-relayscrubber 0.5.0-alpha.6"). The seam's own `sealRawChunk` still refuses non-TS
+relayscrubber 0.5.0-alpha.8"). The seam's own `sealRawChunk` still refuses non-TS
 engines with `seal_path_not_routed`, so an unwired call site refuses. With the
 default (unset/`ts`) nothing here is reached. The cutover's provenance is the new
 `packages/pipeline/technical-foul-cutover.json` entry; the historical TypeScript

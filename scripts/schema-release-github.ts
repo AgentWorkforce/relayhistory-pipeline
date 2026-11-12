@@ -1,11 +1,74 @@
 /** Read-only GitHub gate. Errors contain fixed codes only. */
 import {
+  releaseAnchorBranch,
   releaseInputs,
   SCHEMA_RELEASE as P,
   refuse,
 } from "../src/hoopdb/schema-release-contract.ts";
 type Obj = Record<string, any>;
 type Get = (path: string) => Promise<any>;
+/** Required push workflows on main and the job names each latest run must contain. */
+const REQUIRED_PUSH_RUNS = [
+  ["ci.yml", ["checks", "session-read-worker / worker"]],
+  [
+    "pg-proof.yml",
+    ["real PostgreSQL 15", "real PostgreSQL 16", "real PostgreSQL 17"],
+  ],
+] as const;
+/**
+ * For each required workflow, the latest push run on `branch` (main for the release
+ * sha, the release/schema-<slot> anchor branch for target_sha) with head_sha === sha
+ * must be completed/success, and every job of that run attempt completed/success
+ * with head_sha === sha, the required job names included. Refuses codes.runs or
+ * codes.jobs.
+ */
+async function requireGreenPushRuns(
+  get: Get,
+  base: string,
+  sha: string,
+  codes: { runs: string; jobs: string },
+  branch = "main",
+) {
+  for (const [workflow, names] of REQUIRED_PUSH_RUNS) {
+    const listing = await get(
+      base +
+        `/actions/workflows/${workflow}/runs?event=push&head_sha=${sha}&per_page=100`,
+    );
+    const runs = (listing.workflow_runs ?? [])
+      .filter(
+        (r: Obj) =>
+          r.head_sha === sha && r.head_branch === branch && r.event === "push",
+      )
+      .sort((a: Obj, b: Obj) => b.id - a.id);
+    const latest = runs[0];
+    if (
+      !latest ||
+      latest.status !== "completed" ||
+      latest.conclusion !== "success"
+    )
+      refuse(codes.runs);
+    const jobs = await get(
+      base +
+        "/actions/runs/" +
+        latest.id +
+        "/attempts/" +
+        latest.run_attempt +
+        "/jobs?per_page=100",
+    );
+    if (
+      jobs.total_count !== jobs.jobs?.length ||
+      !jobs.jobs.length ||
+      jobs.jobs.some(
+        (j: Obj) =>
+          j.status !== "completed" ||
+          j.conclusion !== "success" ||
+          j.head_sha !== sha,
+      ) ||
+      names.some((n) => !jobs.jobs.some((j: Obj) => j.name === n))
+    )
+      refuse(codes.jobs);
+  }
+}
 export async function githubReleaseGate(
   env: Record<string, string | undefined>,
   get: Get,
@@ -73,54 +136,44 @@ export async function githubReleaseGate(
     branches.branch_policies[0].type !== "branch"
   )
     refuse("release_environment_branch");
-  for (const [workflow, names] of [
-    ["ci.yml", ["checks", "session-read-worker / worker"]],
-    [
-      "pg-proof.yml",
-      ["real PostgreSQL 15", "real PostgreSQL 16", "real PostgreSQL 17"],
-    ],
-  ] as const) {
-    const listing = await get(
-      base +
-        `/actions/workflows/${workflow}/runs?event=push&head_sha=${input.sha}&per_page=100`,
-    );
-    const runs = (listing.workflow_runs ?? [])
-      .filter(
-        (r: Obj) =>
-          r.head_sha === input.sha &&
-          r.head_branch === "main" &&
-          r.event === "push",
-      )
-      .sort((a: Obj, b: Obj) => b.id - a.id);
-    const latest = runs[0];
+  await requireGreenPushRuns(get, base, input.sha, {
+    runs: "release_ci",
+    jobs: "release_ci_jobs",
+  });
+  // A held-step release is anchored to the protected release/schema-<slot>
+  // branch for its target: the branch must exist, be protected and have
+  // target_sha as its tip (read live, so the gate re-run under the migrator
+  // lock refuses an anchor ref that moved after the plan). The runtime image is
+  // published at target_sha, so its own push CI and pg-proof runs on that
+  // branch must be green too, exactly as strict as the release sha's on main.
+  if (input.targetSha !== input.sha) {
+    const branch = releaseAnchorBranch(input.target);
+    if (!branch) refuse("release_anchor_ref_missing");
+    const matching = await get(base + "/git/matching-refs/heads/" + branch);
+    const refs = Array.isArray(matching)
+      ? matching.filter((r: Obj) => r?.ref === "refs/heads/" + branch)
+      : [];
+    if (refs.length !== 1) refuse("release_anchor_ref_missing");
     if (
-      !latest ||
-      latest.status !== "completed" ||
-      latest.conclusion !== "success"
+      refs[0].object?.type !== "commit" ||
+      refs[0].object?.sha !== input.targetSha
     )
-      refuse("release_ci");
-    const jobs = await get(
-      base +
-        "/actions/runs/" +
-        latest.id +
-        "/attempts/" +
-        latest.run_attempt +
-        "/jobs?per_page=100",
+      refuse("release_anchor_ref_mismatch");
+    const protection = await get(base + "/branches/" + branch);
+    if (protection?.name !== branch || protection?.protected !== true)
+      refuse("release_anchor_ref_unprotected");
+    if (protection?.commit?.sha !== input.targetSha)
+      refuse("release_anchor_ref_mismatch");
+    await requireGreenPushRuns(
+      get,
+      base,
+      input.targetSha,
+      { runs: "release_target_ci", jobs: "release_target_ci_jobs" },
+      branch,
     );
-    if (
-      jobs.total_count !== jobs.jobs?.length ||
-      !jobs.jobs.length ||
-      jobs.jobs.some(
-        (j: Obj) =>
-          j.status !== "completed" ||
-          j.conclusion !== "success" ||
-          j.head_sha !== input.sha,
-      ) ||
-      names.some((n) => !jobs.jobs.some((j: Obj) => j.name === n))
-    )
-      refuse("release_ci_jobs");
   }
-  if (input.mode === "apply") {
+  // Apply and bootstrap both consume a successful same-sha plan run under 24h old.
+  if (input.mode !== "plan") {
     const plan = await get(base + "/actions/runs/" + input.planRun);
     if (
       String(plan.id) === env.GITHUB_RUN_ID ||

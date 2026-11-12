@@ -35,7 +35,10 @@
 -- (#332) and session_read_api_role_verify.sql. Before PG16 pg_auth_members has no
 -- inherit_option / set_option columns, so any member refuses.
 --
--- Idempotent and atomic (one DO block). Roles are cluster-wide.
+-- The bulls96_analysis_admit and bulls96_digest_narrative blocks below apply the same
+-- membership predicate in both directions, text identical to this block.
+--
+-- Idempotent; each DO block is atomic. Roles are cluster-wide.
 DO $bootstrap$
 DECLARE
   v_name text := 'bulls96_read_api';
@@ -91,12 +94,15 @@ $bootstrap$;
 
 -- Lane F1 (migration 20261105046000): the read API's separate session-analysis admission
 -- principal, bulls96_analysis_admit. The same bare NOLOGIN provisioning and refusals as
--- bulls96_read_api above; the migration grants it EXECUTE on sessions.analysis_request_v1
+-- bulls96_read_api above, including the inbound-membership check (a member could SET ROLE into
+-- it and reach what the migration grants it): the "Inbound" predicate in the header, text
+-- identical to the block above. The migration grants it EXECUTE on sessions.analysis_request_v1
 -- only. Making it LOGIN (its own Hyperdrive/secret URL) is a separate, approved operator step.
 DO $bootstrap$
 DECLARE
   v_name text := 'bulls96_analysis_admit';
   v_me record;
+  m record;
   r pg_roles%ROWTYPE;
   v_mode text := coalesce(current_setting('hoopdb.db_mode', true), '');
   v_version int := current_setting('server_version_num')::int;
@@ -126,17 +132,35 @@ BEGIN
       MESSAGE = format('bootstrap %s: the role is a member of another role', v_name),
       HINT = 'Nothing was changed. Revoke the membership by hand, then rerun.';
   END IF;
+  IF v_version >= 160000 THEN
+    FOR m IN EXECUTE 'SELECT u.rolname, g.rolname AS grantor, g.rolsuper AS grantor_super, a.admin_option, a.inherit_option, a.set_option FROM pg_auth_members a JOIN pg_roles u ON u.oid = a.member JOIN pg_roles g ON g.oid = a.grantor WHERE a.roleid = $1' USING r.oid LOOP
+      IF v_mode = 'supabase' AND m.rolname = 'postgres' AND m.grantor = 'supabase_admin' AND m.grantor_super
+         AND m.admin_option AND NOT m.inherit_option AND NOT m.set_option THEN
+        NULL; -- Supabase PG16+ creator edge: ADMIN only, no SET, no INHERIT
+      ELSE
+        RAISE EXCEPTION USING ERRCODE = '55000',
+          MESSAGE = format('bootstrap %s: the role has an unexpected member', v_name),
+          HINT = 'Nothing was changed. Revoke the membership by hand, then rerun.';
+      END IF;
+    END LOOP;
+  ELSIF EXISTS (SELECT 1 FROM pg_auth_members WHERE roleid = r.oid) THEN
+    RAISE EXCEPTION USING ERRCODE = '55000',
+      MESSAGE = format('bootstrap %s: the role has an unexpected member', v_name),
+      HINT = 'Nothing was changed. Revoke the membership by hand, then rerun.';
+  END IF;
 END
 $bootstrap$;
 -- The digest narrative writer (lane F4, migration 20261105045000), part of the read Worker's
 -- package: bulls96_digest_narrative, the narrative Worker's Supabase login. The identical
--- contract and checks as above (bare, NOLOGIN, not elevated, member of none); made LOGIN after
+-- contract and checks as above (bare, NOLOGIN, not elevated, member of none, and no member but
+-- the "Inbound" Supabase creator edge, text identical to the first block); made LOGIN after
 -- migrate by digest_narrative_role.sql. Provisioned here so every migrate and test that already
 -- runs this bootstrap creates it before 20261105045000's fail-closed role check.
 DO $bootstrap_narrative$
 DECLARE
   v_name text := 'bulls96_digest_narrative';
   v_me record;
+  m record;
   r pg_roles%ROWTYPE;
   v_mode text := coalesce(current_setting('hoopdb.db_mode', true), '');
   v_version int := current_setting('server_version_num')::int;
@@ -164,6 +188,22 @@ BEGIN
   IF EXISTS (SELECT 1 FROM pg_auth_members WHERE member = r.oid) THEN
     RAISE EXCEPTION USING ERRCODE = '55000',
       MESSAGE = format('bootstrap %s: the role is a member of another role', v_name),
+      HINT = 'Nothing was changed. Revoke the membership by hand, then rerun.';
+  END IF;
+  IF v_version >= 160000 THEN
+    FOR m IN EXECUTE 'SELECT u.rolname, g.rolname AS grantor, g.rolsuper AS grantor_super, a.admin_option, a.inherit_option, a.set_option FROM pg_auth_members a JOIN pg_roles u ON u.oid = a.member JOIN pg_roles g ON g.oid = a.grantor WHERE a.roleid = $1' USING r.oid LOOP
+      IF v_mode = 'supabase' AND m.rolname = 'postgres' AND m.grantor = 'supabase_admin' AND m.grantor_super
+         AND m.admin_option AND NOT m.inherit_option AND NOT m.set_option THEN
+        NULL; -- Supabase PG16+ creator edge: ADMIN only, no SET, no INHERIT
+      ELSE
+        RAISE EXCEPTION USING ERRCODE = '55000',
+          MESSAGE = format('bootstrap %s: the role has an unexpected member', v_name),
+          HINT = 'Nothing was changed. Revoke the membership by hand, then rerun.';
+      END IF;
+    END LOOP;
+  ELSIF EXISTS (SELECT 1 FROM pg_auth_members WHERE roleid = r.oid) THEN
+    RAISE EXCEPTION USING ERRCODE = '55000',
+      MESSAGE = format('bootstrap %s: the role has an unexpected member', v_name),
       HINT = 'Nothing was changed. Revoke the membership by hand, then rerun.';
   END IF;
 END

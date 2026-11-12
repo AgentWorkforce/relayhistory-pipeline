@@ -69,7 +69,8 @@ import {
   READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_COORDINATION_OVERLAPS_ENABLED,
   READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND,
 } from "./config.ts";
-import { poolTenantRunner, sqlLiveness, type SqlQuery } from "./liveness.ts";
+import { poolTenantRunner, sqlLiveness, sqlOperatorErased, type SqlQuery } from "./liveness.ts";
+import { ERASE_FENCE_FLAG, eraseRuntimeFlag } from "../session-erase/flags.ts";
 import { createS3Store } from "../shared/vendor.ts";
 import { sqlAnalysisSource } from "./analysis-source.ts";
 import { sqlNarrativeCache, type DigestNarrativeDeps } from "./digest-narrative.ts";
@@ -610,6 +611,8 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   // their 501 `*_not_configured` there).
   const canonical = entry === "service" ? await serviceCanonicalDeps(env, poolTenantRunner(pool as never)) : undefined;
   const liveness = sqlLiveness(poolTenantRunner(pool as never));
+  const operatorErased = entry === "service" && eraseRuntimeFlag(env, ERASE_FENCE_FLAG)
+    ? sqlOperatorErased(poolTenantRunner(pool as never)) : undefined;
   // The self-host service only, READ_API_DIGEST_ENABLED=1 (digest-narrative-selfhost.ts): the
   // narrative cache on this read pool and, with a model, key and READ_API_DIGEST_NARRATIVE_DB_URL,
   // in-process generation through a separate writer pool. Also returned beside `deps`; it serves
@@ -635,6 +638,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const deps: Omit<ReadApiDeps, "verify"> = {
     ...(adapter ? { adapter } : { ch: createClickHouseClient(secret.clickhouse!) }),
     liveness,
+    ...(operatorErased ? { operatorErased } : {}),
     directory: sqlDirectory(poolTenantRunner(pool as never)),
     directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
     ...(analysis ? { analysis } : {}),

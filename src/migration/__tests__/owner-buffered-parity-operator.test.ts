@@ -132,7 +132,7 @@ describe("owner-buffered parity operator arguments", () => {
   test("pins census to source and target generation", () => {
     expect(parseOperatorArgs([
       "census", "--expect-source-sha", SHA, "--expect-target-generation", GENERATION,
-    ])).toEqual({ mode: "census", expectedSourceSha: SHA, expectedTargetGeneration: GENERATION });
+    ])).toEqual({ mode: "census", expectedSourceSha: SHA, expectedTargetGeneration: GENERATION, censusSource: "neon" });
   });
 
   test("requires the exact explicit G2 confirmation", () => {
@@ -149,7 +149,9 @@ describe("owner-buffered parity operator arguments", () => {
     expect(parseOperatorArgs([
       "bulk", "--confirm-write", "owner-buffered-parity-bulk/v1", "--batch-size", "100",
       "--expect-target-generation", GENERATION, "--expect-source-sha", SHA,
-    ])).toEqual({ mode: "bulk", expectedSourceSha: SHA, expectedTargetGeneration: GENERATION, batchSize: 100 });
+    ])).toEqual({
+      mode: "bulk", expectedSourceSha: SHA, expectedTargetGeneration: GENERATION, censusSource: "neon", batchSize: 100,
+    });
     for (const size of ["0", "101", "1.5", "NaN"]) expect(() => parseOperatorArgs([
       "bulk", "--confirm-write", "owner-buffered-parity-bulk/v1", "--batch-size", size,
       "--expect-target-generation", GENERATION, "--expect-source-sha", SHA,
