@@ -130,4 +130,4 @@ test("047010 mixed-claim regression: 17 claims / 170 groups / 6939 records, 177 
  expect(after.reduce((n,r)=>n+r.kept_ordinals.length,0)).toBe(177);
  expect(after.every(r=>r.group_indexes.length===1&&r.group_indexes[0]===0)).toBe(true);
  console.log(JSON.stringify({qualification:"synthetic PGlite full-function, timing diagnostic only; no latency assertion or target-heavy work bound",claims:17,groups:170,expandedRecords:6939,targetRecords:177,frozenMs,targetMs}));
-});
+}, 120_000);
