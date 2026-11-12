@@ -507,7 +507,7 @@ describe("operator per-user erase (058010)", () => {
     expect((await receiptRows(f, ALICE)).slots).toBe(1); // the step rolled back whole
   });
 
-  test("the eleven support indexes exist", async () => {
+  test("the fifteen support indexes exist", async () => {
     const f = await fixture();
     const idx = (await f.db.query<{ d: string }>(
       `SELECT pg_get_indexdef(indexrelid) d FROM pg_index WHERE indexrelid::regclass::text IN (
@@ -516,7 +516,35 @@ describe("operator per-user erase (058010)", () => {
         'sessions.ingest_receipt_record_heads_winner_key_sha256_idx','sessions.ingest_stage_intents_parent_stage_token_idx',
         'sessions.ingest_stage_intents_gc_replacement_stage_token_idx','sessions.ingest_stage_intents_batch_idx',
         'sessions.ingest_buffer_outbox_active_stage_token_idx','sessions.ingest_history_plans_stage_token_idx',
-        'sessions.ingest_lazy_native_slots_unowned_origin_idx') ORDER BY 1`)).rows.map((r) => r.d);
-    expect(idx).toHaveLength(11);
+        'sessions.ingest_lazy_native_slots_unowned_origin_idx',
+        'sessions.ingest_receipt_seats_key_material_user_idx','sessions.ingest_receipt_seats_key_material_origin_idx',
+        'sessions.ingest_receipt_record_heads_key_material_user_idx','sessions.ingest_receipt_record_heads_key_material_origin_idx') ORDER BY 1`)).rows.map((r) => r.d);
+    expect(idx).toHaveLength(15);
+  });
+
+  test("the key_material predicates of the erase match 058000's expression indexes", async () => {
+    const f = await fixture();
+    // Index applicability, not cost: a tiny fixture table would otherwise always be scanned.
+    const plan = async (sql: string, params: unknown[]) => {
+      await f.db.query("BEGIN");
+      try {
+        await f.db.query("SET LOCAL enable_seqscan=off");
+        return (await f.db.query<{ "QUERY PLAN": string }>(`EXPLAIN ${sql}`, params)).rows.map((r) => r["QUERY PLAN"]).join("\n");
+      } finally { await f.db.query("ROLLBACK"); }
+    };
+    const seat = await plan("SELECT 1 FROM sessions.ingest_receipt_seats WHERE key_material->>3=$1 AND key_material->>4=$2 AND key_material->>5=$3",
+      [ALICE.orgId, ALICE.workspaceId, ALICE.userId]);
+    console.log(`EXPLAIN seat probe:\n${seat}`);
+    expect(seat).toContain("ingest_receipt_seats_key_material_user_idx");
+    expect(seat).not.toContain("Seq Scan");
+    // The OR form used by operator_user_erase_remaining and the final purge: served by a key_material
+    // index of that table (a BitmapOr over both, or the shared (3, 4) prefix plus a filter, per cost).
+    for (const t of ["ingest_receipt_seats", "ingest_receipt_record_heads"]) {
+      const p = await plan(`SELECT 1 FROM sessions.${t} WHERE key_material->>3=$1 AND key_material->>4=$2
+        AND (key_material->>5=$3 OR key_material->>6=ANY($4::text[]))`, [ALICE.orgId, ALICE.workspaceId, ALICE.userId, ["origin-alice"]]);
+      console.log(`EXPLAIN ${t} OR probe:\n${p}`);
+      expect(p).toMatch(new RegExp(`${t}_key_material_(user|origin)_idx`));
+      expect(p).not.toContain("Seq Scan");
+    }
   });
 });

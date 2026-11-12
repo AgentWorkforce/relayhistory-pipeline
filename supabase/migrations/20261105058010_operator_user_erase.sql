@@ -58,7 +58,8 @@
 -- Receipt seats: every seat of the user goes, not only each slot's current one (a new seat is created per accepted
 -- revision). Collected from the slots' ACK decisions, the user's claims' decisions and ordinal seats, and seats
 -- whose key_material names (org, workspace, user) or (org, workspace, captured origin). The key_material arm and its
--- probe scan ingest_receipt_seats and ingest_receipt_record_heads sequentially (no index; see the runbook).
+-- probe use 058000's expression indexes ingest_receipt_seats_key_material_{user,origin}_idx and
+-- ingest_receipt_record_heads_key_material_{user,origin}_idx (keep the predicates in the key_material->>N form).
 --
 CREATE TABLE sessions.operator_user_erasures (
  request_id text PRIMARY KEY,
@@ -134,8 +135,10 @@ BEGIN
   OR EXISTS(SELECT 1 FROM sessions.auth_sessions WHERE org_id=p_org AND workspace_id=p_ws AND user_id=p_user
     AND revoked_at IS NULL)
   -- Receipt seats and record heads carry the user's ids in key_material ([.., 3 org, 4 workspace, 5 user,
-  -- 6 origin, ..], 20261104053000). No index serves this: a sequential scan of both tables. A seat a surviving
-  -- slot still points to (another user's) is not the user's to erase.
+  -- 6 origin, ..], 20261104053000). Served by 058000's ingest_receipt_seats_key_material_{user,origin}_idx and
+  -- ingest_receipt_record_heads_key_material_{user,origin}_idx (one per OR arm, or the shared org/workspace
+  -- prefix; keep the key_material->>N form so they match). A seat a surviving slot still points to (another
+  -- user's) is not the user's to erase.
   OR EXISTS(SELECT 1 FROM sessions.ingest_receipt_seats AS s WHERE s.key_material->>3=p_org AND s.key_material->>4=p_ws
     AND (s.key_material->>5=p_user OR s.key_material->>6=ANY(p_origins))
     AND NOT EXISTS(SELECT 1 FROM sessions.ingest_lazy_native_slots AS l WHERE l.current_seat_key=s.key_sha256))
@@ -345,7 +348,8 @@ BEGIN
  -- Every remaining seat of the user: those the user's claims' ACK decisions and ordinal seats reference, and those
  -- whose key_material names the user, or one of the user's origins, in this workspace (a seat whose decisions were
  -- already cleaned up). Record heads and ordinal seats go first, then every such seat nothing else references; a
- -- seat a surviving slot points to (another user's) stays.
+ -- seat a surviving slot points to (another user's) stays. The key_material arms here and in the record-heads
+ -- DELETE below are served by 058000's key_material_{user,origin} indexes on both tables.
  SELECT coalesce(array_agg(DISTINCT x),'{}') INTO v_seats FROM (
   SELECT seat_key_sha256 FROM sessions.ingest_lazy_ack_decisions WHERE claim_token=ANY(v_claims)
   UNION SELECT key_sha256 FROM sessions.ingest_receipt_ord_seats WHERE claim_token=ANY(v_claims)

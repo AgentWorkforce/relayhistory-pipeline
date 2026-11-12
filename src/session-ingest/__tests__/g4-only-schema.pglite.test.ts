@@ -165,7 +165,7 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105057010_upload_consent.sql",
       // Replacement of the post-G4 self-host erase (043910, last 044070): it also deletes the erased copy's directory membership rows.
       "20261105057030_selfhost_erase_directory_membership.sql",
-      // Eleven foreign-key support indexes for the per-user erase; no function changes.
+      // Fifteen support indexes for the per-user erase (foreign keys, un-owned slots, key_material); no function changes.
       "20261105058000_operator_user_erase_indexes.sql",
       // Operator per-user erase: an owner-only ledger table and entry points; it also replaces ingest_lock_fences
       // (RH041 while the user has an active erase) and the buffered GC claim (skips such a user's stages).

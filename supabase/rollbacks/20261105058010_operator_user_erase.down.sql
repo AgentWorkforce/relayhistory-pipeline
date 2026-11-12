@@ -15,7 +15,7 @@ DO $rollback_guard$ DECLARE v_sha text; BEGIN
  IF EXISTS(SELECT 1 FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' AND name COLLATE "C">'upstream:20261105058010_operator_user_erase.sql')
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator user erase: a later migration is applied; roll it back first';END IF;
  SELECT sha256 INTO v_sha FROM sessions.__96bulls_migrations WHERE name='upstream:20261105058010_operator_user_erase.sql' FOR UPDATE;
- IF NOT FOUND OR v_sha<>'580a64bfb6d17fda2175d69d38267f085219187d0b94831ecf1cd7700e4a739c'
+ IF NOT FOUND OR v_sha<>'dc023f92eb682b2565b12950f7371e2d1bd16b2fe66a74669a5a1e37ea7681bf'
  THEN RAISE EXCEPTION USING ERRCODE='55000',MESSAGE='operator user erase: own applied checksum required';END IF;
  PERFORM pg_advisory_xact_lock(961996,50000);
  IF EXISTS(SELECT 1 FROM sessions.operator_user_erasures WHERE state<>'bytes_verified')

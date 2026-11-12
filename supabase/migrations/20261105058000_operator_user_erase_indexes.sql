@@ -1,7 +1,7 @@
 -- Slot 20261105058000. Foreign-key support indexes for the operator per-user erase (20261105058010). Code only:
 -- applying this to any real database needs Khaliq's explicit OK.
 --
--- Eleven indexes. Ten serve foreign keys whose referencing column no index leads with: deleting a referenced row
+-- Fifteen indexes. Ten serve foreign keys whose referencing column no index leads with: deleting a referenced row
 -- then makes PostgreSQL check the referencing table by sequential scan, once per deleted row. On production-size
 -- tables a large user's erase never finishes that way. With these indexes each check is an index probe, and the erase finds a user's
 -- referencing rows without a full scan:
@@ -18,6 +18,15 @@
 -- The eleventh serves the step's un-owned-slot arm (current_owner IS NULL AND origin_id = ANY(origins)), which
 -- otherwise scans the org's slots on every batch:
 --   ingest_lazy_native_slots(org_id,workspace_id,origin_id) WHERE current_owner IS NULL
+-- The last four serve the key_material arms of the erase (058010's "rows remain" probe and the step's seat and
+-- record-head collection), which find a user's receipt seats and record heads by the ids in key_material
+-- ([.., 3 org, 4 workspace, 5 user, 6 origin, ..], 20261104053000). Those run under the exclusive erase lock
+-- (961996,50000) that every publication and fence-row write takes shared; without these they are sequential
+-- scans of both tables while publication waits:
+--   ingest_receipt_seats((key_material->>3),(key_material->>4),(key_material->>5))         org, workspace, user
+--   ingest_receipt_seats((key_material->>3),(key_material->>4),(key_material->>6))         org, workspace, origin
+--   ingest_receipt_record_heads((key_material->>3),(key_material->>4),(key_material->>5))  org, workspace, user
+--   ingest_receipt_record_heads((key_material->>3),(key_material->>4),(key_material->>6))  org, workspace, origin
 --
 -- Same adopt-or-create contract as 20261105044020 (read it there): an exact, valid, ready index of that name is
 -- adopted without locking its table; an absent one is created only on an EMPTY table (or with
@@ -27,6 +36,7 @@
 -- indexes on ingest_lazy_ack_decisions and ingest_lazy_native_slots are prebuilt out of band, then adopted. The
 -- row counts of ingest_stage_intents, ingest_buffer_outbox and ingest_history_plans are not recorded: the packet
 -- checks them first and prebuilds any index whose table is populated (this step refuses a populated table anyway).
+-- The same rule covers the four key_material indexes on ingest_receipt_seats and ingest_receipt_record_heads.
 -- The expected definitions are byte-identical to ADOPTABLE_INDEXES in src/hoopdb/migration-sentinels.ts (a test checks).
 DO $operator_user_erase_indexes$
 DECLARE
@@ -61,7 +71,15 @@ BEGIN
   ['ingest_history_plans_stage_token_idx','ingest_history_plans',
    'CREATE INDEX ingest_history_plans_stage_token_idx ON sessions.ingest_history_plans USING btree (stage_token)'],
   ['ingest_lazy_native_slots_unowned_origin_idx','ingest_lazy_native_slots',
-   'CREATE INDEX ingest_lazy_native_slots_unowned_origin_idx ON sessions.ingest_lazy_native_slots USING btree (org_id, workspace_id, origin_id) WHERE (current_owner IS NULL)']
+   'CREATE INDEX ingest_lazy_native_slots_unowned_origin_idx ON sessions.ingest_lazy_native_slots USING btree (org_id, workspace_id, origin_id) WHERE (current_owner IS NULL)'],
+  ['ingest_receipt_seats_key_material_user_idx','ingest_receipt_seats',
+   'CREATE INDEX ingest_receipt_seats_key_material_user_idx ON sessions.ingest_receipt_seats USING btree (((key_material ->> 3)), ((key_material ->> 4)), ((key_material ->> 5)))'],
+  ['ingest_receipt_seats_key_material_origin_idx','ingest_receipt_seats',
+   'CREATE INDEX ingest_receipt_seats_key_material_origin_idx ON sessions.ingest_receipt_seats USING btree (((key_material ->> 3)), ((key_material ->> 4)), ((key_material ->> 6)))'],
+  ['ingest_receipt_record_heads_key_material_user_idx','ingest_receipt_record_heads',
+   'CREATE INDEX ingest_receipt_record_heads_key_material_user_idx ON sessions.ingest_receipt_record_heads USING btree (((key_material ->> 3)), ((key_material ->> 4)), ((key_material ->> 5)))'],
+  ['ingest_receipt_record_heads_key_material_origin_idx','ingest_receipt_record_heads',
+   'CREATE INDEX ingest_receipt_record_heads_key_material_origin_idx ON sessions.ingest_receipt_record_heads USING btree (((key_material ->> 3)), ((key_material ->> 4)), ((key_material ->> 6)))']
  ] LOOP
   v_tbl:=to_regclass(format('sessions.%I',v_spec[2]));
   IF v_tbl IS NULL THEN

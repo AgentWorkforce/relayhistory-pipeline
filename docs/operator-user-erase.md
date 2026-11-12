@@ -18,7 +18,9 @@ way:
 
 1. **Unindexed foreign keys.** Deleting a lazy slot or receipt seat made PostgreSQL check `ingest_lazy_ack_decisions`
    and `ingest_lazy_native_slots` (both large) by sequential scan, once per deleted row. The erase never finished. 058000 adds the missing indexes: ten foreign-key support indexes (slots, seats, ack decisions, receipt
-   rows, stage intents, outbox, history plans) and one for the step's un-owned-slot lookup.
+   rows, stage intents, outbox, history plans), one for the step's un-owned-slot lookup, and four `key_material`
+   expression indexes on `ingest_receipt_seats` and `ingest_receipt_record_heads` (org, workspace, user and org,
+   workspace, origin) for the seat and record-head lookups that run under the exclusive erase lock.
 2. **One long transaction.** A ~35-minute transaction lost its connection before COMMIT. The slot phase commits in
    bounded steps (`stepLimit` slots per transaction) and the entry uses TCP keepalives. The **final purge is NOT
    bounded by `stepLimit`**: it deletes every other per-user row (batches, claims, stage intents, outbox, history
@@ -45,8 +47,9 @@ way:
   seat of the user, not only each slot's current one (a new seat is created per accepted revision): seats from the
   user's ACK decisions and ordinal seats, and seats whose `key_material` names (org, workspace, user) or (org,
   workspace, captured origin). A seat another user's slot still points to survives. The `key_material` arm and its
-  probe scan `ingest_receipt_seats` and `ingest_receipt_record_heads` sequentially (no index) while holding the
-  exclusive erase lock, which stalls ingest for that time: measure it on a production-size copy first. Then
+  probe run while holding the exclusive erase lock, which every publication and fence-row write takes shared; they
+  use 058000's `key_material` expression indexes on `ingest_receipt_seats` and `ingest_receipt_record_heads`
+  (one per OR arm: user, origin; both share the org/workspace prefix) rather than scanning both tables. Then
   `ingest_publication_deferrals`,
   `ingest_publication_images`, `ingest_publication_attempts`, `ingest_history_plan_refs`,
   `ingest_history_plan_carriers`, `ingest_history_plans`, `ingest_buffer_outbox`, `ingest_stage_intents`,
