@@ -62,6 +62,14 @@
  *                              Deny on the writer, reader and srv-writer). The plan contract accepts it only as
  *                              its own "upload inbox rollout" / "upload inbox update" phase.
  *
+ * Cross-account sessions worker (decision 0007; stacks/aws/cross-account-worker-policy.ts), default OFF:
+ *
+ *   transcriptStore.crossAccountWorkerRoleArn  the summary/status worker's role in another account. Unset:
+ *                              byte-identical policies. Set: the bucket and key policies also carry its list,
+ *                              read, summary-write and via-S3 key statements. The plan contract accepts the
+ *                              change only alone, as its own "cross-account worker grants" phase, with the
+ *                              statements byte-for-byte as built (docs/cross-account-sessions-worker.md).
+ *
  * Pure functions, unit-tested in stacks/aws/__tests__/transcript-store.test.ts;
  * `transcriptStoreStage` declares the resources.
  */
@@ -151,8 +159,8 @@ export interface TranscriptStoreInputs {
   bufferedGcRoleArn?: string;
   /**
    * Default off. The sessions worker role in ANOTHER account (decision 0007: the summary worker on agentrelay
-   * EKS, infra terraform/examples/aws-sessions-worker-cross-account). Present: the bucket and key policies add
-   * exactly its list/read/summary-write and via-S3 key statements (cross-account-worker-policy.ts). Omit: both
+   * EKS, infra terraform/examples/aws-sessions-worker-cross-account). Present: the bucket and key policies also
+   * carry exactly its list/read/summary-write and via-S3 key statements (cross-account-worker-policy.ts). Omit: both
    * policies are byte-for-byte as without it.
    */
   crossAccountWorkerRoleArn?: string;
@@ -880,30 +888,37 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
  * The cross-account worker grants phase: everything noop except `transcripts` and/or `transcripts-key`
  * updates, and each update's detailed diff is the live policy (-) and the planned policy (+) where every
  * other statement is unchanged and the only difference is that resource's worker Sids, all of them, added
- * (crossAccountWorkerRoleArn set) or removed (unset again: the revocation path).
- * Returns undefined when the plan is not shaped like this phase at all.
+ * (crossAccountWorkerRoleArn set) or removed (unset again: the revocation path). Added statements must be
+ * byte-for-byte what cross-account-worker-policy.ts builds for the one role they name.
+ *
+ * It also guards every other phase: a plan whose bucket or key diff adds, removes or changes a worker
+ * statement is refused unless it is exactly this phase (the grant deploys alone), so the worker Sids can
+ * never ride along in a phase that does not inspect those policies (srv-writer addition, upload inbox rollout).
+ * Returns undefined when the plan does not touch the worker statements at all.
  */
 function crossAccountWorkerGrantsPhase(operations: ReadonlyMap<string, string>, detailedPlanText: string, refuse: (why: string) => never): TranscriptStorePlanPhase | undefined {
-  const changed = [...operations].filter(([, a]) => a !== "noop");
-  if (changed.length === 0 || !changed.every(([r, a]) => (r === "transcripts" || r === "transcripts-key") && a === "update")) return undefined;
   const lines = detailedPlanText.split(/\r?\n/);
-  // A worker Sid on only one side of the diff: added or removed. A policy re-rendered with them on both
-  // sides (another phase's cascade) is not this phase.
-  const touches = (r: string) => {
-    const sids = (m: string) => planResourceBlock(lines, r).flatMap((l) => {
-      const hit = /^ {2}([+-])\s+(?:- )?Sid:\s*(SessionsWorker[A-Za-z0-9]*)\s*$/.exec(l);
-      return hit && hit[1] === m ? [hit[2]!] : [];
-    }).sort().join(",");
-    return sids("+") !== sids("-");
-  };
-  // Not this phase unless the diff adds or removes a worker Sid (other bucket/key-only updates keep their existing refusals).
-  if (!changed.some(([r]) => touches(r))) return undefined;
-  for (const [r] of changed) {
-    const expected: readonly string[] = r === "transcripts" ? CROSS_ACCOUNT_WORKER_BUCKET_SIDS : CROSS_ACCOUNT_WORKER_KEY_SIDS;
-    assertAppendOnlyPolicyDiff(planResourceBlock(lines, r), expected, (why) => refuse(`cross-account worker grants: ${r}: ${why}`));
-  }
+  const say = (r: string) => (why: string): never => refuse(`cross-account worker grants: ${r}: ${why}`);
+  const updated = WORKER_POLICY_RESOURCES.filter((r) => operations.get(r) === "update");
+  const touched = updated.filter((r) => {
+    const block = planResourceBlock(lines, r);
+    if (!block.some((l) => WORKER_SID_LINE.test(l))) return false;
+    const { live, planned } = policyDiffSides(block, say(r));
+    const worker = (m: Map<string, string>) => [...m].filter(([sid]) => sid.startsWith(WORKER_SID_PREFIX)).sort(([a], [b]) => (a < b ? -1 : 1));
+    // Worker statements re-rendered unchanged on both sides (another phase's cascade): not touched.
+    return JSON.stringify(worker(live.bySid)) !== JSON.stringify(worker(planned.bySid));
+  });
+  if (touched.length === 0) return undefined;
+  const changed = [...operations].filter(([, a]) => a !== "noop");
+  if (!changed.every(([r, a]) => (WORKER_POLICY_RESOURCES as readonly string[]).includes(r) && a === "update"))
+    return refuse(`cross-account worker grants must deploy alone (only transcripts and transcripts-key may update): ${changed.map(([r, a]) => `${r}:${a}`).join(", ")}`);
+  for (const r of updated) assertWorkerGrantDiff(planResourceBlock(lines, r), r, say(r));
   return "cross-account worker grants";
 }
+
+const WORKER_POLICY_RESOURCES = ["transcripts", "transcripts-key"] as const;
+const WORKER_SID_PREFIX = "SessionsWorker";
+const WORKER_SID_LINE = /^ {2}[+-]\s+(?:- )?Sid:\s*SessionsWorker/;
 
 function planResourceBlock(lines: readonly string[], resource: string): string[] {
   const start = lines.findIndex((line) => new RegExp(`^\\s*\\[${resource.replace(/[-]/g, "\\-")}\\]\\s+update\\s*$`).test(line));
@@ -913,8 +928,10 @@ function planResourceBlock(lines: readonly string[], resource: string): string[]
   return end < 0 ? rest : rest.slice(0, end);
 }
 
+type PolicyDiffSide = { header: string; itemIndent: number; bySid: Map<string, string> };
+
 /** Splits one side of a policy diff into header lines and statement items keyed by direct Sid. */
-function policyDiffSide(side: string[], refuse: (why: string) => never) {
+function policyDiffSide(side: string[], refuse: (why: string) => never): PolicyDiffSide {
   const dashIndents = side.map((l) => /^( *)- /.exec(l)?.[1]?.length).filter((n): n is number => n !== undefined);
   if (dashIndents.length === 0) return refuse("policy diff has no statements");
   const itemIndent = Math.min(...dashIndents);
@@ -927,35 +944,67 @@ function policyDiffSide(side: string[], refuse: (why: string) => never) {
     else header.push(l);
   }
   const bySid = new Map<string, string>();
+  const direct = new RegExp(`^ {${itemIndent + 2}}Sid:\\s*([A-Za-z][A-Za-z0-9]*)\\s*$`);
   for (const item of items) {
-    const body = item.map((l, i) => (i === 0 ? l.replace("- ", "  ") : l));
-    const direct = new RegExp(`^ {${itemIndent + 2}}Sid:\\s*([A-Za-z][A-Za-z0-9]*)\\s*$`);
-    const sids = body.map((l) => direct.exec(l)?.[1]).filter((v): v is string => v !== undefined);
+    const sids = item.map((l, i) => direct.exec(i === 0 ? l.replace("- ", "  ") : l)?.[1]).filter((v): v is string => v !== undefined);
     if (sids.length !== 1) refuse("every statement must have exactly one direct Sid");
     if (bySid.has(sids[0]!)) refuse(`duplicate Sid ${sids[0]}`);
-    bySid.set(sids[0]!, body.join("\n"));
+    bySid.set(sids[0]!, item.join("\n"));
   }
-  return { header: header.join("\n"), bySid };
+  return { header: header.join("\n"), itemIndent, bySid };
 }
 
-function assertAppendOnlyPolicyDiff(block: readonly string[], expected: readonly string[], refuse: (why: string) => never) {
+function policyDiffSides(block: readonly string[], refuse: (why: string) => never) {
   // Alchemy marks a changed line in column 3 ("  - " / "  + "); unchanged lines are indented past it.
   const marked = block.filter((l) => /^ {2}[+-] /.test(l));
   if (marked.length === 0) refuse("the detailed plan must show the policy diff (no declared property changes is not reviewable)");
   const side = (m: "+" | "-") => marked.filter((l) => l[2] === m).map((l) => l.slice(3));
-  const live = policyDiffSide(side("-"), refuse);
-  const planned = policyDiffSide(side("+"), refuse);
+  return { live: policyDiffSide(side("-"), refuse), planned: policyDiffSide(side("+"), refuse) };
+}
+
+/** Alchemy's plan YAML for a statement: sorted keys, `- ` items, a map item's first key on the dash line. */
+function planYaml(v: unknown, indent: number): string[] {
+  const pad = " ".repeat(indent);
+  if (Array.isArray(v)) return v.flatMap((item) => {
+    if (item !== null && typeof item === "object") { const [first, ...rest] = planYaml(item, indent + 2); return [`${pad}- ${first!.trimStart()}`, ...rest]; }
+    return [`${pad}- ${String(item)}`];
+  });
+  return Object.keys(v as object).sort().flatMap((k) => {
+    const x = (v as Record<string, unknown>)[k];
+    return x !== null && typeof x === "object" ? [`${pad}${k}:`, ...planYaml(x, indent + 2)] : [`${pad}${k}: ${String(x)}`];
+  });
+}
+
+/** Plan YAML quotes some scalars ("*", digit strings); compare values unquoted, line for line. */
+const unquoteYaml = (text: string) => text.split("\n").map((l) => l.replace(/^(\s*(?:- )?(?:[^\s"][^"]*?: )?)("(?:[^"\\]|\\.)*")\s*$/, (_, head: string, q: string) => head + JSON.parse(q))).join("\n");
+
+function assertWorkerGrantDiff(block: readonly string[], resource: (typeof WORKER_POLICY_RESOURCES)[number], refuse: (why: string) => never) {
+  const expected: readonly string[] = resource === "transcripts" ? CROSS_ACCOUNT_WORKER_BUCKET_SIDS : CROSS_ACCOUNT_WORKER_KEY_SIDS;
+  const { live, planned } = policyDiffSides(block, refuse);
   if (live.header !== planned.header) refuse("only policy statements may change");
   const added = [...planned.bySid.keys()].filter((sid) => !live.bySid.has(sid)).sort();
   const removed = [...live.bySid.keys()].filter((sid) => !planned.bySid.has(sid)).sort();
-  const exact = JSON.stringify([...expected].sort());
   for (const [sid, text] of live.bySid) {
-    if (planned.bySid.has(sid) && planned.bySid.get(sid) !== text) refuse(`existing statement ${sid} must stay byte-identical`);
-    if (!planned.bySid.has(sid) && !expected.includes(sid)) refuse(`existing statement ${sid} must stay byte-identical`);
+    if (planned.bySid.has(sid) ? planned.bySid.get(sid) !== text : !expected.includes(sid)) refuse(`existing statement ${sid} must stay byte-identical`);
   }
+  const exact = JSON.stringify([...expected].sort());
   const adds = removed.length === 0 && JSON.stringify(added) === exact;
   const removes = added.length === 0 && JSON.stringify(removed) === exact;
   if (!adds && !removes) refuse(`must add (or, to revoke, remove) exactly ${expected.join(", ")}; adds ${added.join(", ") || "(none)"}, removes ${removed.join(", ") || "(none)"}`);
+  if (!adds) return;
+  // The added bodies are exactly what the builder makes for the one role they name (srv-writer recovery precedent).
+  const principals = new Set(added.map((sid) => [...planned.bySid.get(sid)!.matchAll(/^\s*AWS:\s*(\S+)\s*$/gm)].map((m) => m[1]!)).flat());
+  if (principals.size !== 1) refuse("the worker statements must name exactly one role");
+  const roleArn = unquoteYaml(`AWS: ${[...principals][0]!}`).slice(5);
+  try { assertCrossAccountWorkerRoleArn(roleArn, TRANSCRIPT_ACCOUNT_ID); } catch { refuse("the worker statements must name an exact role in another account"); }
+  const n = transcriptNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID);
+  const want = resource === "transcripts"
+    ? crossAccountWorkerBucketStatements({ bucketAccountId: TRANSCRIPT_ACCOUNT_ID, bucketArn: n.bucketArn, roleArn })
+    : crossAccountWorkerKeyStatements({ bucketAccountId: TRANSCRIPT_ACCOUNT_ID, region: TRANSCRIPT_REGION, bucketName: n.bucket, roleArn });
+  for (const statement of want) {
+    const got = planned.bySid.get(statement.Sid)!;
+    if (unquoteYaml(got) !== planYaml([statement], planned.itemIndent).join("\n")) refuse(`${statement.Sid} must be exactly the reviewed statement`);
+  }
 }
 
 /**

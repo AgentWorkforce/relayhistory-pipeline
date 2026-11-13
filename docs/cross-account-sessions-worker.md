@@ -14,7 +14,8 @@ statement merged by hand would be dropped by the next stack deploy.
 before. A role in the bucket's own account, a wildcard, a user, an assumed-role session or any
 other shape refuses at input validation.
 
-Set, it appends (`stacks/aws/cross-account-worker-policy.ts`):
+Set, both policies also carry these statements (`stacks/aws/cross-account-worker-policy.ts`; the bucket
+statements sit before the pipeline's, order is not significant):
 
 | Policy | Sid | Grant |
 | --- | --- | --- |
@@ -27,13 +28,24 @@ Set, it appends (`stacks/aws/cross-account-worker-policy.ts`):
 These match the pipeline's own worker grant. There is no delete, no old-version access and no
 bucket change. `OnlyTheEraserDeletes` and the upload-inbox wall still deny the worker.
 
+The read glob is as wide as the in-account worker's. IAM `*` spans `/`, so `96bulls/*/v1/*` also covers
+the upload inbox, buffered batches, analysis results and the admission journals. Inside this account
+only the bucket-policy inbox wall (`UploadInboxOnlyItsRoles`, when the upload inbox is on) narrows it.
+The in-account identity deny on the inbox cannot apply to a role in another account, so anything
+narrower must come from the worker account's own identity policy.
+
 ## Deploying it
 
 The deploy plan contract accepts it as its own phase, **cross-account worker grants**. In that phase,
 everything is noop except the `transcripts` and/or `transcripts-key` updates. Each update's detailed
-diff must leave every other statement byte-identical, and add exactly that policy's worker Sids. To
-revoke, unset the input: the same phase then accepts removing exactly those Sids. A plan that mixes
-this with any other change is refused, so deploy it alone.
+diff must leave every other statement byte-identical, and add exactly that policy's worker
+statements, byte-for-byte as `cross-account-worker-policy.ts` builds them for the one role they name.
+To revoke, unset the input: the same phase then accepts removing exactly those Sids. Any plan that
+adds, removes or changes a worker statement together with any other change is refused, whatever
+other phase it would match, so deploy it alone.
+
+To move to another role, use two deploys: revoke, then grant the new one. Changing the role in place
+keeps the same Sids on both sides, and the contract refuses it.
 
 Order:
 1. Create the role in the worker's account. The bucket and key policies reject a principal that does not exist yet.
