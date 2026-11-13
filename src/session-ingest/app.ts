@@ -541,7 +541,7 @@ export function createIngestApp(deps: IngestAppDeps) {
   const nowMs = deps.asyncAdmission?.nowMs ?? Date.now;
   const syncFrozenReceipt = deps.syncAdmissionFrozenReceipt === "on";
   const stoppedOrgs = deps.httpAdmissionStoppedOrgs;
-  /** INGEST_HTTP_ADMISSION_STOPPED_ORGS: throws the retryable refusal for a stopped org (no IO before it). */
+  /** INGEST_HTTP_ADMISSION_STOPPED_ORGS: throws the retryable refusal for a stopped org, before the body is parsed and before any ledger call (the /v1 middleware's bounded body read, identity check and, with async admission on, privacy-journal read still run first). */
   const assertHttpAdmissionOpen = (orgId: string) => { if (stoppedOrgs?.has(orgId)) throw new HttpAdmissionStopped(); };
   /**
    * A reset or re-enable, bracketed by the privacy journal (async-admission.ts) while async admission

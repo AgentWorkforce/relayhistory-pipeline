@@ -3,10 +3,10 @@
  * batches, turns and recovery POSTs are a retryable 503 with Retry-After and no ledger call; an unlisted org and
  * every control or read route are unchanged; a malformed list refuses Worker startup. */
 import { afterEach, describe, expect, test } from "bun:test";
-import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SYNC_SCOPE } from "../app.ts";
+import { bindingIdentity, createIngestApp, encodeIdentity, IDENTITY_HEADER, SIGNATURE_HEADER, signRequest, SYNC_SCOPE } from "../app.ts";
 import { sqlLedger } from "../ledger-sql.ts";
 import { HTTP_ADMISSION_STOPPED_ORGS_VAR, HTTP_ADMISSION_STOPPED_RETRY_AFTER_SECONDS, httpAdmissionStoppedOrgs } from "../http-admission-stop.ts";
-import { ingestSettings, type IngestWorkerEnv } from "../worker.ts";
+import { ingestApp, ingestSettings, type IngestWorkerEnv } from "../worker.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { RECOVERY_CONTENT_TYPE, RECOVERY_PROTOCOL } from "../recovery-protocol.ts";
 import { batch, record, scratchStore, TENANT } from "./support.ts";
@@ -78,6 +78,32 @@ describe("the Worker settings", () => {
   });
   test("malformed: refuses startup (every request 503 not_configured), never off", async () => {
     await expect(ingestSettings({ ...full, INGEST_HTTP_ADMISSION_STOPPED_ORGS: "org-a,,org-b" })).rejects.toThrow(HTTP_ADMISSION_STOPPED_ORGS_VAR);
+  });
+  /** The deployed wiring (worker.ts ingestApp): var -> ingestSettings -> ingestApp -> a signed POST is refused. */
+  test("end to end through ingestApp: a listed org's signed batch is the stop, an unlisted org reaches the ledger", async () => {
+    const s = scratchStore();
+    cleanups.push(s.done);
+    const sql: string[] = [];
+    const run = (async (text: string) => { sql.push(text); throw Object.assign(new Error("db down"), { code: "08006" }); }) as never;
+    const post = async (orgId: string) => {
+      const env = { ...full, INGEST_HTTP_ADMISSION_STOPPED_ORGS: `other-org,${orgId}` };
+      const settings = (await ingestSettings(env))!;
+      const app = ingestApp(env, settings, run, { store: s.store, keyRoot: settings.keyRoot, sleep: async () => {} } as never);
+      const identity = encodeIdentity({ ...TENANT, scopes: [SYNC_SCOPE] });
+      const body = new TextEncoder().encode(await deliveryBody());
+      const res = await app.request("/v1/delivery/batches", { method: "POST", body, headers: { "content-type": "application/json", [IDENTITY_HEADER]: identity,
+        [SIGNATURE_HEADER]: signRequest(settings.signingKey, Math.floor(Date.now() / 1000), "POST", "/v1/delivery/batches", identity, body) } });
+      return { status: res.status, retryAfter: res.headers.get("retry-after"), json: await res.json() as { error?: { code: string } } };
+    };
+    const stopped = await post(TENANT.orgId);
+    expect(stopped.status).toBe(503);
+    expect(stopped.json.error?.code).toBe("delivery_unavailable");
+    expect(stopped.retryAfter).toBe(String(HTTP_ADMISSION_STOPPED_RETRY_AFTER_SECONDS));
+    expect(sql).toEqual([]);
+    // Control: the same signed request for an org NOT listed gets past the stop and reaches the (failing) ledger,
+    // so the 503 above is the stop and not a signature or settings failure.
+    await post("unrelated-org");
+    expect(sql.length).toBeGreaterThan(0);
   });
 });
 

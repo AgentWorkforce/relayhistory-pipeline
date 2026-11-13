@@ -147,8 +147,10 @@ schema drift lists.
   1. Deploy the infra from 0004.
   2. Set `HISTORY_UPLOAD_DIRECT=allowlist` for Khaliq's workspace.
   3. Compare against the HTTP path.
-  4. Per org, before its fence-authority marker: stop the Worker's HTTP admission for it
-     (`INGEST_HTTP_ADMISSION_STOPPED_ORGS`), wait for the Worker's admission queue to drain, run its fence,
+  4. Per org, before its fence-authority marker: confirm its turns write path is `neon` (turns have no
+     direct path, so the stop refuses them), stop the Worker's HTTP admission for it
+     (`INGEST_HTTP_ADMISSION_STOPPED_ORGS`), wait for the Worker's admission queue to drain, verify the stop
+     took effect (`http_admission_stopped` log lines, no new SQL admission for the org), run its fence,
      revision and ownership backfills, then write the marker. The stop comes first because the desktop falls
      back to the Worker's SQL-ledger POST on a direct-upload credential error; an SQL admission after the
      backfills would be missing from the S3 index and owner stubs.
