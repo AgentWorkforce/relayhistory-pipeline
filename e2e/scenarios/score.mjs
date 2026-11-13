@@ -67,6 +67,7 @@ async function probeKindEvidence(workspace, sessions, since, until) {
         (SELECT max(d.git_repo) FROM sessions.session_directory d WHERE d.workspace_id='${workspace}' AND d.session_id=ids.session_id) AS git_repo,
         (SELECT count(*) FROM sessions.session_event_facts e WHERE e.workspace_id='${workspace}' AND e.session_id=ids.session_id) AS event_count,
         (SELECT count(*) FROM sessions.session_event_facts e WHERE e.workspace_id='${workspace}' AND e.session_id=ids.session_id AND e.ts >= '${start}' AND e.ts < '${end}' AND cardinality(e.files_touched)>0) AS write_count,
+        (SELECT count(*) FROM sessions.session_event_facts e WHERE e.workspace_id='${workspace}' AND e.session_id=ids.session_id AND e.ts >= '${start}' AND e.ts < '${end}' AND cardinality(e.files_touched)>0 AND e.branch IS NOT NULL AND e.branch<>'') AS branched_write_count,
         (SELECT count(*) FROM sessions.session_event_facts e WHERE e.workspace_id='${workspace}' AND e.session_id=ids.session_id AND e.ts < '2000-01-01') AS ancient_event_count,
         (SELECT array_agg(DISTINCT e.project_id) FROM sessions.session_event_facts e WHERE e.workspace_id='${workspace}' AND e.session_id=ids.session_id AND e.project_id IS NOT NULL) AS fact_project_ids,
         (SELECT count(*) FROM sessions.session_output_facts o WHERE o.workspace_id='${workspace}' AND o.session_id=ids.session_id) AS output_count,
@@ -194,7 +195,8 @@ function requiredSignalMissing(pair, counts) {
   if (!counts.every(Boolean)) return false;
   if (pair.required_evidence === "writes_both" && counts.some((row) => Number(row.write_count) === 0)) return true;
   const label = pair.expected_label;
-  if (label === "duplicate_work" || label === "concurrent_edit") return counts.some((row) => Number(row.write_count) === 0);
+  if (label === "duplicate_work") return counts.some((row) => Number(row.write_count) === 0);
+  if (label === "concurrent_edit") return counts.some((row) => Number(row.write_count) === 0 || Number(row.branched_write_count) === 0);
   if (label === "superseded_work") return Number(counts[0].commit_count) === 0 || Number(counts[1].outcome_count) === 0;
   return false;
 }
@@ -204,6 +206,7 @@ for (const scenario of manifest.scenarios) {
   for (const pair of scenario.pairs) {
     const left = byRole.get(pair.left), right = byRole.get(pair.right);
     const base = { scenario: scenario.id, pair: `${pair.left}:${pair.right}`, expected: pair.expected_label,
+      ...(scenario.known_evidence_gaps ? { known_evidence_gaps: scenario.known_evidence_gaps } : {}),
       ...(pair.expected_actor_kinds ? { expected_actor_kinds: pair.expected_actor_kinds } : {}) };
     if (scenario.status !== "complete" || (!left.session_id && left.harness !== "human") || (!right.session_id && right.harness !== "human")) {
       results.push({ ...base, state: "pending" });
@@ -275,6 +278,8 @@ const scenarioResults = manifest.scenarios.map((scenario) => {
     : states.some((state) => ["wrong_relation", "evidence_no_finding", "episode_mismatch"].includes(state)) ? "miss"
     : states.some((state) => ["no_evidence", "missing_signal", "missing_project_tag", "wrong_project", "unverified_evidence", "unverified_no_finding", "ledger_unavailable", "duration_short"].includes(state)) ? "inconclusive"
     : "hit";
-  return { scenario: scenario.id, outcome, pair_states: pairs.map((row) => row.state), ...(episode ? { episode_state: episode.state, duration_state: episode.duration?.state ?? null } : {}) };
+  return { scenario: scenario.id, outcome, pair_states: pairs.map((row) => row.state),
+    ...(scenario.known_evidence_gaps ? { known_evidence_gaps: scenario.known_evidence_gaps } : {}),
+    ...(episode ? { episode_state: episode.state, duration_state: episode.duration?.state ?? null } : {}) };
 });
 console.log(JSON.stringify({ scored_at: new Date().toISOString(), window: overlaps.window, coverage: overlaps.coverage, quality_gate: evidenceDefects.length ? "evidence_defect" : "clear", evidenceDefects, summary, scenarioResults, results, projectResults, episodes }, null, 2));

@@ -9,6 +9,7 @@
     {
       "id": "a",
       "title": "Exact duplicate feature and migration number",
+      "known_evidence_gaps": ["scrubber_redacted_project_key"],
       "status": "complete",
       "sessions": [
         { "role": "first", "harness": "claude", "session_id": "74059fb8-2ded-4a45-8c3f-cda4be81fc24", "started_at": "2026-11-13T08:25:45.377Z", "ended_at": "2026-11-13T08:26:03.227Z", "expected_project": "a", "branch": "feat/audit-log-a1", "commit": "e5a0b6c" },
@@ -24,6 +25,7 @@
     {
       "id": "b",
       "title": "Same file on different branches within one hour",
+      "known_evidence_gaps": ["scrubber_redacted_project_key", "write_branch_absent"],
       "status": "complete",
       "sessions": [
         { "role": "first", "harness": "claude", "session_id": "0d21cfd8-ae30-44d2-90dc-73eff68b6433", "started_at": "2026-11-13T08:26:20.616Z", "ended_at": "2026-11-13T08:26:34.857Z", "expected_project": "a", "branch": "feat/flags-env-override", "commit": "9f4ba71" },
@@ -39,6 +41,7 @@
     {
       "id": "c",
       "title": "B reverts A commit",
+      "known_evidence_gaps": ["claude_commit_fact_absent", "selfhost_revert_facts_absent"],
       "status": "complete",
       "sessions": [
         { "role": "first", "harness": "claude", "session_id": "74059fb8-2ded-4a45-8c3f-cda4be81fc24", "started_at": "2026-11-13T08:25:45.377Z", "ended_at": "2026-11-13T08:26:03.227Z", "expected_project": "a", "branch": "feat/audit-log-a1", "commit": "e5a0b6c" },
@@ -49,6 +52,7 @@
     {
       "id": "d",
       "title": "Same directory, different feature",
+      "known_evidence_gaps": ["scrubber_redacted_project_key"],
       "status": "complete",
       "sessions": [
         { "role": "first", "harness": "claude", "session_id": "66e6c547-fc96-48bf-8dea-69c91c9a2035", "started_at": "2026-11-13T08:32:06.255Z", "ended_at": "2026-11-13T08:32:21.649Z", "expected_project": "a", "branch": "feat/report-subtitle", "commit": "a2294f5" },
@@ -137,6 +141,7 @@
     {
       "id": "cross_project_unrelated",
       "title": "Similar files in separate repositories, unrelated outcomes",
+      "known_evidence_gaps": ["scrubber_redacted_project_key"],
       "status": "complete",
       "sessions": [
         { "role": "first", "harness": "codex", "session_id": "01a1d408-f2bc-73f3-a85f-20b8c402e694", "started_at": "2026-11-13T08:31:59.628Z", "ended_at": "2026-11-13T08:32:41.089Z", "expected_project": "a", "branch": "docs/readme-setup", "commit": "1a095ca" },
@@ -147,6 +152,7 @@
     {
       "id": "cross_project_same_feature",
       "title": "Same feature built independently in separate repositories",
+      "known_evidence_gaps": ["scrubber_redacted_project_key"],
       "status": "complete",
       "sessions": [
         { "role": "first", "harness": "claude", "session_id": "74059fb8-2ded-4a45-8c3f-cda4be81fc24", "started_at": "2026-11-13T08:25:45.377Z", "ended_at": "2026-11-13T08:26:03.227Z", "expected_project": "a", "branch": "feat/audit-log-a1", "commit": "e5a0b6c" },

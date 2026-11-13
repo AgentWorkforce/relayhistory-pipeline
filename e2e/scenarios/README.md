@@ -25,4 +25,6 @@ The score states distinguish:
 
 Facts dated before 2000 fail the result's `quality_gate` as `evidence_defect`, even when a pair also has another score state. This catches zero-time file edits before interpreting detector misses.
 
+`known_evidence_gaps` records independently diagnosed blockers without changing the measured state. In the current local run, capture computes a stable Git remote project key for Claude worktrees, but the deployed wasm scrubber redacts its value and Claude provides no `repo_url` fallback. The manifest calls this `scrubber_redacted_project_key`. Write facts also lack branch values (`write_branch_absent`), which the current concurrent-edit detector requires. The revert scenario lacks A's Claude commit fact (`claude_commit_fact_absent`), and self-host output facts lack revert outcomes (`selfhost_revert_facts_absent`). Scrubbing changes belong to the relayscrubber project.
+
 `planned_parallel`, `continuation`, and `none` expect no overlap alert. Their positive relationship labels, plus the multi-episode expectation in scenario `j`, need the ledger endpoint once its contract exists. The current overlaps endpoint supports `duplicate_work`, `concurrent_edit`, and `superseded_work`; other positive labels remain measured misses until implemented.
