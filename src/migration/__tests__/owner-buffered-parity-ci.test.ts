@@ -320,7 +320,8 @@ test("bulk recovery: aggregate plan, dormant write, enabled idempotent write and
     OWNER_PARITY_CONFIRMATION: ownerParityBulkConfirmation(plan) });
   const dormant = world();
   const refused = await runOwnerParityBulk(env, dormant.sessions,
-    { roster: {}, census: plan, runId: "402", now: () => T0 + 1, deps: dormant.deps });
+    { roster: {}, census: plan, runId: "402", now: () => T0 + 1,
+      bulkWriteEnabled: false, deps: dormant.deps });
   expect(refused.receipt.code).toBe("owner_parity_bulk_write_dormant");
   expect(dormant.w.statements).toEqual([]);
 

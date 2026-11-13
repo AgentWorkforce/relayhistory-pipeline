@@ -1309,7 +1309,7 @@ export async function ownerParityProof(): Promise<{ cases: ProofCase[]; failed: 
       OWNER_PARITY_CONFIRMATION: `WRITE-OWNER-PARITY-BULK ${plan.sourceSha} GENERATION ${plan.generation} ` +
         `SOURCE neon DESCRIPTOR ${plan.descriptorSha256} PLAN ${plan.censusRun}` };
     const dormant = await runOwnerParityBulk(bulkWriteEnv, sessions(),
-      { roster: {}, census: plan, runId: "502", now: () => T0 + 1 });
+      { roster: {}, census: plan, runId: "502", now: () => T0 + 1, bulkWriteEnabled: false });
     expectCode(dormant, "owner_parity_bulk_write_dormant");
     const written = await runOwnerParityBulk(bulkWriteEnv, sessions(),
       { roster: {}, census: plan, runId: "502", now: () => T0 + 1, bulkWriteEnabled: true });
