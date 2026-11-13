@@ -392,7 +392,7 @@ async function deliverPreparedCore(deps: DeliverDeps, tenant: LedgerTenant, prep
   if (claim.kind === "replay_fast")
     return { custodyAck:claim.custodyAck,receipt: withLimits(prepared), outcome: "replay_fast", stats: { ...base, deleted_sessions: claim.deleted.length, stale: claim.stale.length, timing_ms: timing } };
 
-  if (deps.admissionGate) await stage("admission_gate", deps.admissionGate);
+  if (deps.admissionGate) { await stage("admission_gate", deps.admissionGate); mark("admission_gate"); }
   const dropped: ReadonlySet<string> = new Set(claim.deleted.map(([s, id]) => sessionKey(s, id)));
   if (deps.consentGate) await consentStage(deps, dropped, "admit");
   // The deletion filter (records of sessions the user deleted from this origin are

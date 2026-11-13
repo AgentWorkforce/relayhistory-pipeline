@@ -463,6 +463,15 @@ Defaults are unchanged: with neither flag set nothing new is wired.
 default 20) are read only in `async` and `drain`. The mode is never taken from a
 request. Semantics: `docs/selfhost-async-admission.md`.
 
+Sizing with `INGEST_LEDGER=s3`: one admission of a 100-record batch holds a few MB (the batch, its
+chunk, and ~100 revision-index shards of ~10 KB each) and makes ~300 small S3 requests, 32 at a time
+(`SERVER_LEDGER_PARALLEL`). Concurrency 16 is safe on a 512Mi ingest-edge (~5 MB per admission
+above the process baseline). 1536Mi has room for 32, but for one user's uploads throughput stops
+rising at about 16: their batches race on the same revision-index shards (CAS retries), so more only
+helps when many users upload at once. Each
+admission logs its per-phase wall time (`admission_read_ms`, `admission_claim_ms`,
+`admission_gate_ms`, `admission_objects_ms`, `admission_commit_ms`, `admission_finish_ms`).
+
 Once enabled, both `GET /healthz` and `GET /readyz` pin the effective mode:
 
 ```json

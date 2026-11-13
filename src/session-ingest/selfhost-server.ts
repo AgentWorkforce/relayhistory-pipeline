@@ -89,7 +89,7 @@ import { promoteUpload } from "./upload-admission.ts";
 import type { DeliverDeps } from "./deliver.ts";
 import { selfhostAdmissionConsumer, type SelfhostAdmissionConsumer, type SelfhostAdmissionOptions, type SelfhostAdmissionStatus } from "./selfhost-admission.ts";
 import { sqlLedger } from "./ledger-sql.ts";
-import { s3Ledger, withSqlControlMirror } from "./ledger-s3.ts";
+import { SERVER_LEDGER_PARALLEL, s3Ledger, withSqlControlMirror } from "./ledger-s3.ts";
 import type { Ledger } from "./ledger.ts";
 import type { SqlRun } from "./ledger-sql.ts";
 import { relaycontrolIngestIdentity, selfhostIntrospector } from "./selfhost-auth.ts";
@@ -210,7 +210,7 @@ export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run
   let sqlControls: Ledger | undefined;
   const sqlControl = (): Ledger => (sqlControls ??= sqlLedger(parts.run, { acceptanceMode: "canonical" }));
   return withSqlControlMirror(
-    s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false }),
+    s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false, parallel: SERVER_LEDGER_PARALLEL }),
     { setSessionUploads: (i) => sqlControl().setSessionUploads(i), resetUploadedSessions: (t, r) => sqlControl().resetUploadedSessions(t, r) },
     parts.store, keyRoot);
 }
