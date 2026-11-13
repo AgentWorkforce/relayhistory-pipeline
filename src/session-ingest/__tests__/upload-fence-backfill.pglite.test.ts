@@ -1,9 +1,10 @@
 import { afterAll, afterEach, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
-import { applyFenceChange, fenceEpoch, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "../ledger-s3.ts";
+import { applyFenceChange, entryForgotten, fenceEpoch, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "../ledger-s3.ts";
 import { backfillUploadFences, type BackfillOptions, type BackfillSql } from "../upload-fence-backfill.ts";
 import { parseBackfillArgs } from "../../../scripts/upload-fence-backfill.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
@@ -24,8 +25,9 @@ let db: PGlite;
 beforeAll(async () => {
   db = new PGlite({ extensions: { btree_gin, pg_trgm } });
   // upload_deletions / upload_resets / ingest_batches / ingest_record_revisions (022000), ingest_session_ownership
-  // (030000), and the nullable seed-proof revision columns (040000). No later migration alters them.
-  await applySupabaseSchema(db, { until: "20261104040000_ingest_s3_proof_seed.sql" });
+  // (030000), the nullable seed-proof revision columns (040000) and ingest_lazy_native_slots (055000). No later
+  // migration alters their columns.
+  await applySupabaseSchema(db, { until: "20261104055000_lazy_current_custody.sql" });
 });
 afterAll(async () => { await db.close(); });
 
@@ -34,7 +36,7 @@ afterEach(async () => {
   cleanup.forEach((c) => c());
   cleanup = [];
   await db.exec(`DELETE FROM sessions.upload_deletions; DELETE FROM sessions.upload_resets; DELETE FROM sessions.ingest_session_ownership;
-    DELETE FROM sessions.ingest_record_revisions; DELETE FROM sessions.ingest_batches;`);
+    DELETE FROM sessions.ingest_record_revisions; DELETE FROM sessions.ingest_batches; DELETE FROM sessions.ingest_lazy_native_slots;`);
 });
 function scratch(): ObjectStore {
   const s = scratchStore();
@@ -55,6 +57,12 @@ const rev = (t: T, origin: string, record: string, revision: number, source: str
          VALUES ($1,$2,$3,$4,$5,NULL,NULL,$6,$7,$8,$9,$9,$5)`, [t.orgId, t.workspaceId, origin, record, revision, t.userId, source, session, hex("e")])
     : q("INSERT INTO sessions.ingest_record_revisions (org_id, workspace_id, origin_id, record_id, revision, revision_id, digest, user_id, source, session_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
         [t.orgId, t.workspaceId, origin, record, revision, revisionId, digest, t.userId, source, session]);
+/** A lazy native slot; `owner` null is a cleared (or erase-tombstoned) slot. */
+const slot = (t: T, origin: string, record: string, owner: string | null, source: string | null, session: string | null, revision: number | null, digest: string | null) =>
+  q(`INSERT INTO sessions.ingest_lazy_native_slots (key_sha256, key_material, org_id, workspace_id, origin_id, record_id, source_identity_sha256, control_epoch,
+       initialized_witness_sha256, current_owner, current_source, current_session, current_revision, current_digest, current_reset_epoch, current_fence_epoch)
+     VALUES ($1, '[]'::jsonb, $2, $3, $4, $5, $6, $6, $6, $7, $8, $9, $10, $11, $12, $12)`,
+    [createHash("sha256").update(record).digest("hex"), t.orgId, t.workspaceId, origin, record, hex("e"), owner, source, session, revision, digest, owner === null ? null : 0]);
 const batch = (t: T, origin: string, id: string) =>
   q("INSERT INTO sessions.ingest_batches (org_id, workspace_id, origin_id, batch_id, user_id, digest, receipt_id, state, committed_at) VALUES ($1,$2,$3,$4,$5,$6,$7,'committed',now())",
     [t.orgId, t.workspaceId, origin, id, t.userId, hex("b"), `rhr_${hex("c")}`]);
@@ -160,13 +168,46 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
       [{ recordId: "rec-1", revision: 9, revisionId: "rec-1:r9", digest: hex("9"), sessionKey: sessionKeyHash("claude", "sess-1"), epoch: 0, resets: 1 }]);
 
     const summary = await run(store);
-    expect(summary.revisions).toMatchObject({ rows: 4, merged: 2, skipped_deleted: 1, unrepresentable_seed: 1, invalid: 0, failed: 0 });
-    // A seed-proof row #580's entry cannot express leaves the section incomplete (reported, not guessed).
-    expect(summary.sections.revisions).toBe("incomplete");
+    expect(summary.revisions).toMatchObject({ rows: 4, seed_rows: 1, merged: 3, skipped_deleted: 1, invalid: 0, failed: 0 });
+    expect(summary.sections.revisions).toBe("complete");
     expect(await entryOf(store, A, "origin-1", "rec-1")).toEqual([9, "rec-1:r9", hex("9"), sessionKeyHash("claude", "sess-1"), 0, 1]);
     expect(await entryOf(store, A, "origin-1", "rec-2")).toEqual([2, "rec-2:r2", hex("2"), null, 0, 0]);
     expect(await entryOf(store, A, "origin-1", "rec-3")).toBeUndefined();
-    expect(await entryOf(store, A, "origin-1", "rec-4")).toBeUndefined();
+    // The operator seed's row: a revision-only entry (#587), stale by revision alone, as SQL's #250 check.
+    expect(await entryOf(store, A, "origin-1", "rec-4")).toEqual([7, null, null, sessionKeyHash("claude", "sess-1"), 0, 1]);
+  });
+
+  test("lazy native slots: under their owner and session, forgotten by S3 exactly as ingest_lazy_clear forgets them", async () => {
+    const store = scratch();
+    const D = { orgId: "org-a", workspaceId: "ws-a", userId: "user-only-in-slots" };
+    await slot(A, "origin-1", "s0001", A.userId, "claude", "sess-1", 5, hex("5"));   // a sessioned slot
+    await slot(A, "origin-1", "s0002", A.userId, "claude", null, 3, hex("3"));       // a session-less slot
+    await slot(A, "origin-1", "s0003", null, null, null, null, null);               // cleared (or erase-tombstoned)
+    await slot(A, "origin-1", "s0004", A.userId, "claude", "gone", 2, hex("2"));     // a deleted session
+    await del(A, "origin-1", "claude", "gone");
+    await slot(D, "origin-2", "s0005", D.userId, "codex", "sess-9", 1, hex("1"));     // a user known only from a slot
+    const summary = await run(store);
+    expect(summary.revisions).toMatchObject({ slot_rows: 5, slots_empty: 1, skipped_deleted: 1, merged: 3, invalid: 0, failed: 0 });
+    expect(summary.sections.revisions).toBe("complete");
+    const k = sessionKeyHash("claude", "sess-1");
+    const sessioned = (await entryOf(store, A, "origin-1", "s0001"))!;
+    expect(sessioned).toEqual([5, null, hex("5"), k, 0, 0]);
+    const sessionless = (await entryOf(store, A, "origin-1", "s0002"))!;
+    expect(sessionless).toEqual([3, null, hex("3"), null, 0, 0]);
+    expect(await entryOf(store, A, "origin-1", "s0004")).toBeUndefined();
+    expect(await fenceOf(store, D)).not.toBeNull();
+    expect(await entryOf(store, D, "origin-2", "s0005")).toEqual([1, null, hex("1"), sessionKeyHash("codex", "sess-9"), 0, 0]);
+    // SQL's ingest_lazy_clear clears sessioned slots on a disable of their session or a reset, never session-less
+    // ones: ledger-s3 forgets the copies the same way.
+    const fence = (await fenceOf(store, A))!;
+    const reset = structuredClone(fence);
+    applyFenceChange(reset, { reset: { requestId: "later", atMs: 1, result: 0 } });
+    expect(entryForgotten(reset, "origin-1", sessioned)).toBe(true);
+    expect(entryForgotten(reset, "origin-1", sessionless)).toBe(false);
+    const disabled = structuredClone(fence);
+    applyFenceChange(disabled, { deletions: [{ originId: "origin-1", sessions: [["claude", "sess-1"]] }] });
+    expect(entryForgotten(disabled, "origin-1", sessioned)).toBe(true);
+    expect(entryForgotten(disabled, "origin-1", sessionless)).toBe(false);
   });
 
   test("a rerun is a no-op; merging keeps everything already in the fence", async () => {

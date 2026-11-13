@@ -15,9 +15,17 @@
  *   ownership  `ingest_session_ownership` (written at claim, so pending and committed claims alike) into the
  *              ownership stubs (`registerOwner`), at the backfilled fence's current generation
  *              (`recordGeneration`), so a later reset lists sessions owned only in SQL.
- *   revisions  `ingest_record_revisions` into the per-origin revision shards (`mergeIndex`) as
- *              current-generation entries, so #250 stale checks hold at cutover. mergeIndex never lowers a
- *              stored revision (an equal one keeps the stored entry).
+ *   revisions  SQL's stored revisions into the per-origin revision shards (`mergeIndex`) as current-generation
+ *              entries, so #250 stale checks hold at cutover. mergeIndex never lowers a stored revision (an
+ *              equal one keeps the stored entry). Two sources, as SQL's claim reads them:
+ *                - `ingest_record_revisions`, including the operator seed's revision-only rows
+ *                  (`ingest_seed_proven_records`: no revision id or digest), as revision-only entries;
+ *                - `ingest_lazy_native_slots` (the buffered/lazy stale source: revision + digest, no revision id),
+ *                  under the slot's owner (`current_owner`) and session (`current_source`, `current_session`),
+ *                  so S3 forgets them exactly when SQL's `ingest_lazy_clear` clears them (a disable of that
+ *                  session, or a reset; a session-less slot never). Slots with no owner (cleared, or an erase
+ *                  tombstone) hold no revision and are skipped.
+ *              Every entry is validated with ledger-s3 `checkIndexEntryInput`.
  *
  * SQL is read-only: one `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` snapshot, checked with
  * `SHOW transaction_read_only`, always ended by ROLLBACK; SELECTs only, keyset-paged, optionally scoped to
@@ -32,11 +40,10 @@
  * Nothing here logs; the summary holds counts only: never a tenant id, session id, record id or key.
  */
 import type { ObjectStore } from "../shared/vendor.ts";
-import { applyFenceChange, isDeleted, newFence, recordGeneration, s3LedgerObjects, type FenceChange, type FenceDoc, type IndexEntryInput } from "./ledger-s3.ts";
+import { applyFenceChange, checkIndexEntryInput, isDeleted, newFence, recordGeneration, s3LedgerObjects, type FenceChange, type FenceDoc, type IndexEntryInput } from "./ledger-s3.ts";
 import type { LedgerTenant } from "./ledger.ts";
 
 const ORG = /^(?!\.)[A-Za-z0-9._-]{1,128}$/;
-const HEX64 = /^[0-9a-f]{64}$/;
 export const MAX_BACKFILL_CONCURRENCY = 16;
 export type BackfillSection = "fences" | "ownership" | "revisions";
 export const BACKFILL_SECTIONS: readonly BackfillSection[] = ["fences", "ownership", "revisions"];
@@ -75,7 +82,13 @@ export interface BackfillSummary {
     resets_in_flight: number;
   };
   ownership: { rows: number; registered: number; would_register: number; unchanged: number; skipped_deleted: number; skipped_no_fence: number; invalid: number; failed: number };
-  revisions: { rows: number; merged: number; would_merge: number; skipped_deleted: number; skipped_no_fence: number; unrepresentable_seed: number; invalid: number; shards: number; failed: number };
+  revisions: {
+    /** ingest_record_revisions rows, of which `seed_rows` revision-only (the operator seed). */
+    rows: number; seed_rows: number;
+    /** ingest_lazy_native_slots rows, of which `slots_empty` hold no revision (no owner). */
+    slot_rows: number; slots_empty: number;
+    merged: number; would_merge: number; skipped_deleted: number; skipped_no_fence: number; invalid: number; shards: number; failed: number;
+  };
   /** Per section: complete (nothing skipped for want of a fence, nothing invalid or failed), incomplete, or not run. */
   sections: Record<BackfillSection, "complete" | "incomplete" | "not_run">;
 }
@@ -87,6 +100,7 @@ SELECT DISTINCT org_id, workspace_id, user_id FROM (
   UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.ingest_session_ownership
   UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.ingest_record_revisions
   UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.ingest_batches
+  UNION ALL SELECT org_id, workspace_id, current_owner FROM sessions.ingest_lazy_native_slots WHERE current_owner IS NOT NULL
 ) AS u
 WHERE ($1::text[] IS NULL OR org_id = ANY($1::text[]))
 ORDER BY org_id, workspace_id, user_id`;
@@ -107,6 +121,12 @@ WHERE ($1::text[] IS NULL OR org_id = ANY($1::text[]))
   AND (org_id, workspace_id, user_id, origin_id, source, session_id) > ($2::text, $3::text, $4::text, $5::text, $6::text, $7::text)
 ORDER BY org_id, workspace_id, user_id, origin_id, source, session_id
 LIMIT $8::int`;
+const SLOTS_PAGE = `
+SELECT key_sha256, org_id, workspace_id, origin_id, record_id, current_owner, current_source, current_session, current_revision, current_digest
+FROM sessions.ingest_lazy_native_slots
+WHERE ($1::text[] IS NULL OR org_id = ANY($1::text[])) AND key_sha256 > $2::text
+ORDER BY key_sha256
+LIMIT $3::int`;
 const REVISIONS_PAGE = `
 SELECT org_id, workspace_id, origin_id, record_id, revision, revision_id, digest, user_id, source, session_id
 FROM sessions.ingest_record_revisions
@@ -163,7 +183,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     mode: opts.dryRun ? "dry_run" : "execute", users: 0,
     fences: { deletion_rows: 0, reset_rows: 0, created: 0, updated: 0, unchanged: 0, would_create: 0, would_update: 0, pairs_added: 0, resets_added: 0, unreadable: 0, contended: 0, tenant_invalid: 0, input_invalid: 0, failed: 0, resets_in_flight: 0 },
     ownership: { rows: 0, registered: 0, would_register: 0, unchanged: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, failed: 0 },
-    revisions: { rows: 0, merged: 0, would_merge: 0, skipped_deleted: 0, skipped_no_fence: 0, unrepresentable_seed: 0, invalid: 0, shards: 0, failed: 0 },
+    revisions: { rows: 0, merged: 0, would_merge: 0, skipped_deleted: 0, seed_rows: 0, slot_rows: 0, slots_empty: 0, skipped_no_fence: 0, invalid: 0, shards: 0, failed: 0 },
     sections: { fences: "not_run", ownership: "not_run", revisions: "not_run" },
   };
   /** Each user's fence as it stands after the fence section (or as read, when that section is not run). */
@@ -310,52 +330,73 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
 
     // ---- revisions ----
     if (sections.has("revisions")) {
+      type Group = { key: string; fence: FenceDoc; originId: string; entries: IndexEntryInput[] };
+      /** One SQL stored revision -> an entry in its user's shard; false when skipped (counted). */
+      const add = (groups: Map<string, Group>, row: { org: unknown; ws: unknown; user: unknown; origin: unknown; record: unknown; revision: unknown; revisionId: unknown; digest: unknown; source: unknown; session: unknown }) => {
+        const fence = fences.get(userKey(row.org, row.ws, row.user));
+        if (!fence) { summary.revisions.skipped_no_fence++; return; }
+        const revision = int(row.revision);
+        if (!id(row.origin) || !id(row.record) || !id(row.source) || revision === undefined || !(row.session === null || id(row.session)) ||
+            !(row.revisionId === null || typeof row.revisionId === "string") || !(row.digest === null || typeof row.digest === "string")) { summary.revisions.invalid++; return; }
+        const sessionId = row.session as string | null;
+        if (sessionId !== null && isDeleted(fence, row.origin, row.source, sessionId)) { summary.revisions.skipped_deleted++; return; }
+        const [sessionKey, epoch, resets] = recordGeneration(fence, row.origin, row.source, sessionId);
+        const entry: IndexEntryInput = { recordId: row.record, revision, revisionId: row.revisionId as string | null, digest: row.digest as string | null, sessionKey, epoch, resets };
+        let key: string;
+        try {
+          checkIndexEntryInput(entry);
+          key = io.keysFor({ orgId: text(row.org), workspaceId: text(row.ws), userId: text(row.user) }).revisions(row.origin, row.record);
+        } catch {
+          summary.revisions.invalid++;
+          return;
+        }
+        const g = groups.get(key) ?? { key, fence, originId: row.origin, entries: [] };
+        g.entries.push(entry);
+        groups.set(key, g);
+      };
+      const flush = async (groups: Map<string, Group>) => mapLimit([...groups.values()], concurrency, async (g) => {
+        if (opts.dryRun) { summary.revisions.would_merge += g.entries.length; return; }
+        try {
+          await io.mergeIndex(g.key, g.fence, g.originId, g.entries);
+          summary.revisions.merged += g.entries.length;
+          summary.revisions.shards++;
+        } catch {
+          summary.revisions.failed += g.entries.length;
+        }
+      });
+
+      // (a) ingest_record_revisions, seeded revision-only rows included.
       let cursor = ["", "", "", ""];
       for (;;) {
         const rows = (await sql.query(REVISIONS_PAGE, [orgs, ...cursor, rowPageSize])).rows;
         if (!rows.length) break;
         const last = rows[rows.length - 1]!;
         cursor = [text(last.org_id), text(last.workspace_id), text(last.origin_id), text(last.record_id)];
-        // Per (user, origin, shard): one mergeIndex per shard per page.
-        const groups = new Map<string, { key: string; fence: FenceDoc; originId: string; entries: IndexEntryInput[] }>();
+        const groups = new Map<string, Group>();
         for (const r of rows) {
           summary.revisions.rows++;
-          // Seed-proof rows (20261104040000 ingest_seed_proven_records, the operator S3-proof bootstrap) carry no
-          // revision id or digest, and #580's entry cannot express them. They stand for REAL user records that
-          // SQL's #250 check uses by revision alone, so they are counted and the section stays incomplete.
-          if (r.revision_id === null || r.digest === null) { summary.revisions.unrepresentable_seed++; continue; }
-          const fence = fences.get(userKey(r.org_id, r.workspace_id, r.user_id));
-          if (!fence) { summary.revisions.skipped_no_fence++; continue; }
-          const revision = int(r.revision);
-          if (!id(r.origin_id) || !id(r.record_id) || !id(r.source) || !id(r.revision_id) || typeof r.digest !== "string" || !HEX64.test(r.digest) ||
-              revision === undefined || revision < 1 || !(r.session_id === null || id(r.session_id))) { summary.revisions.invalid++; continue; }
-          const sessionId = r.session_id as string | null;
-          if (sessionId !== null && isDeleted(fence, r.origin_id, r.source, sessionId)) { summary.revisions.skipped_deleted++; continue; }
-          let key: string;
-          try {
-            key = io.keysFor({ orgId: text(r.org_id), workspaceId: text(r.workspace_id), userId: text(r.user_id) }).revisions(r.origin_id, r.record_id);
-          } catch {
-            summary.revisions.invalid++;
-            continue;
-          }
-          const [sessionKey, epoch, resets] = recordGeneration(fence, r.origin_id, r.source, sessionId);
-          const g = groups.get(key) ?? { key, fence, originId: r.origin_id, entries: [] };
-          g.entries.push({ recordId: r.record_id, revision, revisionId: r.revision_id, digest: r.digest, sessionKey, epoch, resets });
-          groups.set(key, g);
+          if (r.revision_id === null && r.digest === null) summary.revisions.seed_rows++;
+          add(groups, { org: r.org_id, ws: r.workspace_id, user: r.user_id, origin: r.origin_id, record: r.record_id, revision: r.revision, revisionId: r.revision_id, digest: r.digest, source: r.source, session: r.session_id });
         }
-        await mapLimit([...groups.values()], concurrency, async (g) => {
-          if (opts.dryRun) { summary.revisions.would_merge += g.entries.length; return; }
-          try {
-            await io.mergeIndex(g.key, g.fence, g.originId, g.entries);
-            summary.revisions.merged += g.entries.length;
-            summary.revisions.shards++;
-          } catch {
-            summary.revisions.failed += g.entries.length;
-          }
-        });
+        await flush(groups);
+      }
+
+      // (b) ingest_lazy_native_slots: the owner's current revision, under its session (ingest_lazy_clear's scope).
+      let slotCursor = "";
+      for (;;) {
+        const rows = (await sql.query(SLOTS_PAGE, [orgs, slotCursor, rowPageSize])).rows;
+        if (!rows.length) break;
+        slotCursor = text(rows[rows.length - 1]!.key_sha256);
+        const groups = new Map<string, Group>();
+        for (const r of rows) {
+          summary.revisions.slot_rows++;
+          if (r.current_owner === null) { summary.revisions.slots_empty++; continue; }
+          add(groups, { org: r.org_id, ws: r.workspace_id, user: r.current_owner, origin: r.origin_id, record: r.record_id, revision: r.current_revision, revisionId: null, digest: r.current_digest, source: r.current_source, session: r.current_session });
+        }
+        await flush(groups);
       }
       const v = summary.revisions;
-      summary.sections.revisions = v.skipped_no_fence + v.unrepresentable_seed + v.invalid + v.failed === 0 ? "complete" : "incomplete";
+      summary.sections.revisions = v.skipped_no_fence + v.invalid + v.failed === 0 ? "complete" : "incomplete";
     }
   } finally {
     await sql.query("ROLLBACK").catch(() => {});
