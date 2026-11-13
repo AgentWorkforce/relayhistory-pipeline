@@ -1,6 +1,6 @@
 /**
- * Negative reachability proof for the relayscrubber 0.5.0-alpha.8 cutover
- * (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.8").
+ * Negative reachability proof for the relayscrubber 0.5.0-alpha.9 cutover
+ * (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.9").
  *
  * Every TypeScript scrub/seal entry point (lib/scrub.ts and lib/pipeline/raw-chunks.ts)
  * is replaced in place by a counting spy. Then each in-scope ingress path (ingest
@@ -144,7 +144,7 @@ async function run(caller: Caller, mode: Row['mode']) {
   return { row, text: o.text };
 }
 
-describe('under the env triple (real vendored alpha.8 engine)', () => {
+describe('under the env triple (real vendored alpha.9 engine)', () => {
   for (const caller of CALLERS)
     test(`${caller}: the TS scrub/sealer is never invoked; the sealed object is the crate's (version 10)`, async () => {
       Object.assign(process.env, TRIPLE);

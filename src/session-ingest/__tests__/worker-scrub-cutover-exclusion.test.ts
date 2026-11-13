@@ -1,11 +1,11 @@
 /**
- * Cloudflare Workers are excluded from the relayscrubber 0.5.0-alpha.8 cutover
- * (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.8"): the hosted
+ * Cloudflare Workers are excluded from the relayscrubber 0.5.0-alpha.9 cutover
+ * (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.9"): the hosted
  * ingest Worker keeps the TS engine (scrub version 8), bundles no relayscrubber package,
  * never wires `createCompiledBindgenEngine`, and refuses SCRUB_ENGINE=wasm-bindgen
  * outright (503 not_configured), so no Worker can claim scrub version 10.
  *
- * The checked-in bindgen pin (ruleset 10, relayhistory-secrets-v10, the alpha.8 wasm digest)
+ * The checked-in bindgen pin (ruleset 10, relayhistory-secrets-v10, the alpha.9 wasm digest)
  * is read from disk only by the Node / Bun wasm-bindgen initialisation (scrub-engine/index.ts
  * `loadScrubBindgenPin`), never statically imported, so the Worker bundle carries none of it.
  * In workerd that disk read fails too (`bindgen_pin_unreadable`); under `bun test` the pin file

@@ -1,5 +1,5 @@
 /**
- * Byte limits for the pinned relayscrubber 0.5.0-alpha.8 engine (bindgen-admission.ts):
+ * Byte limits for the pinned relayscrubber 0.5.0-alpha.9 engine (bindgen-admission.ts):
  * 16 MiB UTF-8 per text and per LF-delimited record, 64 MiB per record stream. The JS
  * preflight refuses before the engine is called (zero crate calls, never poisons); the
  * Rust crate independently rechecks the same limits (driven directly, without the adapter).
@@ -191,7 +191,7 @@ describe("the Rust crate rechecks the same limits (vendored glue driven directly
     expect(rustRefusal(() => raw.scrubRecords(enc.encode(`{}\n"${"x".repeat(MAX_RECORD_BYTES - 4)}€"\n`)))).toStrictEqual({ code: "record_too_large", disposition: "call_refusal", record: 2 });
   }, LONG);
 
-  it("stream: limit accepted; limit+1 stream_too_large (alpha.8 tags it record 0)", () => {
+  it("stream: limit accepted; limit+1 stream_too_large (alpha.9 tags it record 0)", () => {
     expect(JSON.parse(raw.scrubRecords(new Uint8Array(MAX_STREAM_BYTES).fill(0x0a))).recordCount).toBe(0);
     const tag = (() => { try { raw.scrubRecords(new Uint8Array(MAX_STREAM_BYTES + 1).fill(0x0a)); } catch (e) { return String(e); } return ""; })();
     expect(JSON.parse(tag)).toStrictEqual({ code: "stream_too_large", disposition: "call_refusal", record: 0 });
