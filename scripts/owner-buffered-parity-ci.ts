@@ -35,7 +35,6 @@ import {
   BULK_CURSOR,
   BULK_TARGET_GENERATION_SQL,
   OwnerBufferedOperatorRefusal,
-  client,
   connectNeon,
   generationMatches,
   operatorCredentialKeys,
@@ -45,8 +44,10 @@ import {
   tenantSha256,
   validateCensusSourceInput,
   verifyCheckout,
-  withParityOwnerSession,
 } from "./owner-buffered-parity-operator.ts";
+import { releaseClient } from "../src/hoopdb/schema-release-inspect.ts";
+import { SCHEMA_RELEASE } from "../src/hoopdb/schema-release-contract.ts";
+import { roleAudit, type ConnectedOwnerClient } from "../src/hoopdb/owner-operator-apply.ts";
 import {
   ParityCensusRefusal,
   READ_OWNER_BUFFERED_PARITY_SQL,
@@ -210,31 +211,90 @@ export function ownerParityCode(error: unknown): string {
   return /^[A-Za-z0-9_.:,-]{1,160}$/u.test(code) ? code : "owner_parity_failed";
 }
 
-const OWNER_PARITY_DIAGNOSTIC_PHASES = [
-  "inputs", "credential_env", "preflight", "checkout", "stdin", "source_input", "supabase_url", "pg_config",
-  "neon_url", "session_setup", "operator",
-] as const;
-type OwnerParityDiagnosticPhase = typeof OWNER_PARITY_DIAGNOSTIC_PHASES[number];
+interface WorkflowOwnerIdentity {
+  actor: string;
+  login: string;
+  db: string;
+  pid: number;
+  ro: string;
+  schemaOwner: string;
+  parityOwner: string;
+  rolcanlogin: boolean;
+  rolsuper: boolean;
+  rolcreaterole: boolean;
+  rolcreatedb: boolean;
+  rolbypassrls: boolean;
+  rolreplication: boolean;
+}
 
 /**
- * Temporary, content-free runtime instrumentation for the operator-child boundary. It records only the fixed
- * code-path phase and structural shape of an otherwise-redacted thrown value. It never reads error.message,
- * stack, cause, query, host, role or any enumerable driver field. Remove after the live refusal is identified.
+ * The CI workflow intentionally reuses SUPABASE_MIGRATION_OWNER_URL, whose reviewed identity is the direct
+ * project owner (`postgres.<project>`). The standalone operator keeps its distinct short-lived
+ * `cli_login_postgres` route. Fence the workflow identity, backend, role attributes and owned objects before and
+ * after every application query so the two credential contracts can never be confused again.
  */
-export function ownerParityDiagnosticCode(error: unknown, phase: OwnerParityDiagnosticPhase): string {
-  const classified = ownerParityCode(error);
-  if (classified !== "owner_parity_failed") return classified;
-  let shape: string;
-  if (error === null) shape = "null";
-  else if (error === undefined) shape = "undefined";
-  else if (typeof error !== "object") shape = `primitive_${typeof error}`;
-  else {
-    const hasCode = "code" in error;
-    const code = hasCode ? (error as { code?: unknown }).code : undefined;
-    const kind = error instanceof Error ? "error" : "object";
-    shape = `${kind}_${hasCode ? (typeof code === "string" ? "code_other" : `code_${typeof code}`) : "no_code"}`;
+async function requireWorkflowOwnerIdentity(
+  client: Queryable,
+  pid?: number,
+  readOnly?: boolean,
+): Promise<WorkflowOwnerIdentity> {
+  let rows: WorkflowOwnerIdentity[];
+  try {
+    rows = (await client.query<WorkflowOwnerIdentity>(`
+      SELECT current_user AS actor,session_user AS login,current_database() AS db,
+             pg_backend_pid() AS pid,current_setting('transaction_read_only') AS ro,
+             pg_get_userbyid(n.nspowner) AS "schemaOwner",pg_get_userbyid(c.relowner) AS "parityOwner",
+             r.rolcanlogin,r.rolsuper,r.rolcreaterole,r.rolcreatedb,r.rolbypassrls,r.rolreplication
+        FROM pg_roles r
+        JOIN pg_namespace n ON n.nspname='sessions'
+        JOIN pg_class c ON c.relnamespace=n.oid AND c.relname='owner_buffered_parity' AND c.relkind='r'
+       WHERE r.rolname=current_user`)).rows;
+  } catch {
+    throw new OwnerBufferedOperatorRefusal("workflow_owner_identity_unverifiable");
   }
-  return `owner_parity_diag_${phase}_${shape}`;
+  const row = rows[0];
+  if (rows.length !== 1 || row?.actor !== SCHEMA_RELEASE.owner || row.login !== SCHEMA_RELEASE.owner ||
+      row.db !== SCHEMA_RELEASE.database || row.schemaOwner !== SCHEMA_RELEASE.owner ||
+      row.parityOwner !== SCHEMA_RELEASE.owner || !Number.isInteger(row.pid) ||
+      (pid !== undefined && row.pid !== pid) || (readOnly !== undefined && row.ro !== (readOnly ? "on" : "off")) ||
+      row.rolcanlogin !== true || row.rolsuper !== false || row.rolcreaterole !== true ||
+      row.rolcreatedb !== true || row.rolbypassrls !== true || row.rolreplication !== true)
+    throw new OwnerBufferedOperatorRefusal("workflow_owner_identity_refused");
+  return row;
+}
+
+/** Exact direct-owner workflow session; never used by the standalone temporary-login operator. */
+export async function withWorkflowParityOwnerSession<T>(
+  target: ConnectedOwnerClient,
+  readOnly: boolean,
+  work: (target: Queryable) => Promise<T>,
+): Promise<T> {
+  let connected = false;
+  try {
+    await target.connect();
+    connected = true;
+    if (readOnly) await target.query("SET default_transaction_read_only = on");
+    const identity = await requireWorkflowOwnerIdentity(target, undefined, readOnly);
+    const fenced: Queryable = {
+      async query<R>(sql: string, params?: unknown[]) {
+        const cleanup = /^\s*ROLLBACK\s*;?\s*$/iu.test(sql);
+        if (!cleanup) {
+          roleAudit(sql);
+          await requireWorkflowOwnerIdentity(target, identity.pid, readOnly);
+        }
+        const result = await target.query<R>(sql, params);
+        if (!cleanup) await requireWorkflowOwnerIdentity(target, identity.pid, readOnly);
+        return result;
+      },
+    };
+    return await work(fenced);
+  } finally {
+    try {
+      if (connected) await target.query("ROLLBACK").catch(() => undefined);
+    } finally {
+      await target.end().catch(() => undefined);
+    }
+  }
 }
 
 /**
@@ -733,29 +793,20 @@ async function parent(): Promise<number> {
 async function operatorChild(): Promise<number> {
   const env = process.env;
   let paths: ReturnType<typeof outputPaths> | null = null;
-  let diagnosticPhase: OwnerParityDiagnosticPhase = "inputs";
   try {
     const read = inputs(env);
     paths = read.paths;
     const { roster, census } = read;
-    diagnosticPhase = "credential_env";
     refuseOwnerParityCredentialEnv(env);
-    diagnosticPhase = "preflight";
     const pre = ownerParityPreflight(env, roster, census);
-    diagnosticPhase = "checkout";
     verifyCheckout(pre.dispatch.sha);
     const args = { mode: "bulk" as const, expectedSourceSha: pre.dispatch.sha, expectedTargetGeneration: "0".repeat(64),
       censusSource: pre.dispatch.censusSource, batchSize: FETCH_PAGE };
     const keys = operatorCredentialKeys(args);
-    diagnosticPhase = "stdin";
     const input = await readStdinCredentials(keys.required, keys.allowed);
-    diagnosticPhase = "source_input";
     validateCensusSourceInput(args, input);
-    diagnosticPhase = "supabase_url";
     const supabaseUrl = sessionAffinityUrl(input.supabaseUrl, "supabaseUrl", "supabase");
-    diagnosticPhase = "pg_config";
     pinnedPgConfig(supabaseUrl, "supabaseUrl", "supabase");
-    diagnosticPhase = "neon_url";
     const neonUrl = pre.dispatch.censusSource === "neon" ? sessionAffinityUrl(input.neonUrl, "neonUrl", "neon") : null;
     if (neonUrl !== null) pinnedPgConfig(neonUrl, "neonUrl", "neon");
     // Only `write` has a writable target session (OWNER_PARITY_MODE_POLICY); discovery is read-only like census.
@@ -767,26 +818,24 @@ async function operatorChild(): Promise<number> {
       discovered = await runOwnerParityDiscovery(env, sessions, { roster, runId: env.GITHUB_RUN_ID ?? "" });
       return { receipt: discoveryRunReceipt(discovered.receipt), census: null, exitCode: discovered.exitCode };
     };
-    const run = (source: Queryable) => withParityOwnerSession(
-      client(supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-ci-enumerator-readonly"), true, (enumerator) =>
-        withParityOwnerSession(
-          client(supabaseUrl, "supabaseUrl", "supabase", write ? "owner-buffered-ci-target-owner" : "owner-buffered-ci-target-readonly"),
+    const workflowClient = () => releaseClient(supabaseUrl) as ConnectedOwnerClient;
+    const run = (source: Queryable) => withWorkflowParityOwnerSession(
+      workflowClient(), true, (enumerator) =>
+        withWorkflowParityOwnerSession(
+          workflowClient(),
           !write, (target) => work({ source, enumerator, target })));
     let outcome: OwnerParityOutcome;
-    diagnosticPhase = "session_setup";
     if (neonUrl !== null) {
       const neon = await connectNeon(neonUrl);
       try {
         await requireReadOnly(neon, "neonUrl");
-        diagnosticPhase = "operator";
         outcome = await run(neon);
       } finally {
         await neon.end().catch(() => undefined);
       }
     } else {
-      outcome = await withParityOwnerSession(
-        client(supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-ci-frozen-source-readonly"), true, async (source) => {
-          diagnosticPhase = "operator";
+      outcome = await withWorkflowParityOwnerSession(
+        workflowClient(), true, async (source) => {
           return run(source);
         });
     }
@@ -796,7 +845,7 @@ async function operatorChild(): Promise<number> {
     announce(outcome.receipt);
     return outcome.exitCode;
   } catch (error) {
-    writeRefused(env, paths, ownerParityDiagnosticCode(error, diagnosticPhase));
+    writeRefused(env, paths, ownerParityCode(error));
     return 1;
   }
 }

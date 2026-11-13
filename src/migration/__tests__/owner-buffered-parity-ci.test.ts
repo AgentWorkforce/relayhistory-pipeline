@@ -12,14 +12,15 @@ import { join } from "node:path";
 import {
   OWNER_PARITY_CHILD_ENV,
   ownerParityCode,
-  ownerParityDiagnosticCode,
   ownerParityChildSpawn,
   refuseOwnerParityCredentialEnv,
   runOwnerParity,
+  withWorkflowParityOwnerSession,
   type OwnerParityDependencies,
   type OwnerParityOutcome,
   type OwnerParitySessions,
 } from "../../../scripts/owner-buffered-parity-ci.ts";
+import type { ConnectedOwnerClient } from "../../hoopdb/owner-operator-apply.ts";
 import { BULK_TARGET_GENERATION_SQL, tenantSha256 } from "../../../scripts/owner-buffered-parity-operator.ts";
 import { ParityCensusRefusal, READ_OWNER_BUFFERED_PARITY_SQL, type OwnerBufferedParityProof, type ParityCensusReceipt, type ParityTenant } from "../owner-buffered-parity.ts";
 import { OWNER_PARITY_WRITE_ENABLED, ownerParityConfirmation, type OwnerParityCensusArtifact } from "../owner-buffered-parity-ci-contract.ts";
@@ -126,20 +127,47 @@ test("diagnostic codes expose only fixed SQLSTATE/connection classes and never d
     .not.toMatch(/secret|private\.example|SELECT|tenant_id/u);
 });
 
-test("temporary phase diagnostic exposes only fixed path and structural shape", () => {
-  const arbitrary = Object.assign(new Error("password=secret host=private.example query=SELECT tenant_id"), {
-    code: "private.example", detail: "tenant-secret", query: "SELECT private_row",
-  });
-  const noCode = new TypeError("postgres://owner:secret@private.example/database");
-  expect(ownerParityDiagnosticCode(arbitrary, "session_setup"))
-    .toBe("owner_parity_diag_session_setup_error_code_other");
-  expect(ownerParityDiagnosticCode(noCode, "supabase_url"))
-    .toBe("owner_parity_diag_supabase_url_error_no_code");
-  expect(ownerParityDiagnosticCode(null, "stdin")).toBe("owner_parity_diag_stdin_null");
-  expect(JSON.stringify([
-    ownerParityDiagnosticCode(arbitrary, "session_setup"),
-    ownerParityDiagnosticCode(noCode, "supabase_url"),
-  ])).not.toMatch(/secret|private\.example|SELECT|tenant|database/u);
+function workflowOwnerClient(login = "postgres", tableOwner = "postgres") {
+  const calls: string[] = [];
+  let readOnly = false, identityReads = 0;
+  const client: ConnectedOwnerClient = {
+    async connect() { calls.push("connect"); },
+    async query<R>(sql: string) {
+      calls.push(sql);
+      if (sql === "SET default_transaction_read_only = on") readOnly = true;
+      if (sql.includes("FROM pg_roles r")) {
+        identityReads++;
+        return { rows: [{ actor: "postgres", login, db: "postgres", pid: 96, ro: readOnly ? "on" : "off",
+          schemaOwner: "postgres", parityOwner: tableOwner, rolcanlogin: true, rolsuper: false,
+          rolcreaterole: true, rolcreatedb: true, rolbypassrls: true, rolreplication: true }] as R[] };
+      }
+      return { rows: [] as R[] };
+    },
+    async end() { calls.push("end"); },
+  };
+  return { calls, client, identityReads: () => identityReads };
+}
+
+test("workflow route accepts only the direct release owner and fences each query read-only", async () => {
+  const route = workflowOwnerClient();
+  await withWorkflowParityOwnerSession(route.client, true, (session) => session.query("SELECT parity_probe"));
+  expect(route.calls[0]).toBe("connect");
+  expect(route.calls[1]).toBe("SET default_transaction_read_only = on");
+  expect(route.identityReads()).toBe(3);
+  const probe = route.calls.indexOf("SELECT parity_probe");
+  expect(route.calls[probe - 1]).toContain("FROM pg_roles r");
+  expect(route.calls[probe + 1]).toContain("FROM pg_roles r");
+  expect(route.calls.at(-1)).toBe("end");
+});
+
+test("workflow route refuses the temporary-login identity and wrong table owner before work", async () => {
+  for (const route of [workflowOwnerClient("cli_login_postgres"), workflowOwnerClient("postgres", "other")]) {
+    let worked = false;
+    await expect(withWorkflowParityOwnerSession(route.client, true, async () => { worked = true; }))
+      .rejects.toThrow("workflow_owner_identity_refused");
+    expect(worked).toBeFalse();
+    expect(route.calls.at(-1)).toBe("end");
+  }
 });
 
 test("census then write: seven rows, roster order, exact readback; unlisted tenants never reach G1 or a write", async () => {

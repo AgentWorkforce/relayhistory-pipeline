@@ -46,7 +46,10 @@ The generation is never an input. Census discovers the live PASS marker generati
 ### Census source
 
 - `frozen-supabase` reads the sealed frozen copy inside the target project over a fenced read-only owner
-  session, using the same `SUPABASE_MIGRATION_OWNER_URL`.
+  session, using the same direct-owner `SUPABASE_MIGRATION_OWNER_URL` as the guarded schema release. The workflow
+  pins `postgres.<project>` through the reviewed session pooler, then fences `current_user`, `session_user`,
+  database, backend PID, role attributes, schema owner, parity-table owner and read-only state around every query.
+  This is deliberately separate from the standalone operator's short-lived `cli_login_postgres` route.
 - `neon` **refuses `credentials_missing_key.neonUrl`**. No Neon secret exists for this workflow, and this
   change adds none. Creating one would need its own approval.
 
@@ -195,8 +198,9 @@ discovery run carries the counts only (`found` = scanned, `equal` = canonical cu
 
 ## Credentials
 
-Only the one database step receives a secret: the existing `SUPABASE_MIGRATION_OWNER_URL`. No new secrets,
-variables or environments are added.
+Only the one database step receives a secret: the existing direct-owner `SUPABASE_MIGRATION_OWNER_URL`. No new
+secrets, variables or environments are added. The URL must retain the exact guarded-schema-release identity
+(`postgres.<project>`); a CLI temporary-login URL is refused rather than silently mixing the two owner contracts.
 
 The script works in two processes:
 
@@ -206,6 +210,8 @@ The script works in two processes:
 3. It spawns the credential child with fixed argv and an allowlisted environment, with no secret and no token.
 4. It writes `{"supabaseUrl": ...}` to the child's stdin pipe.
 5. The child refuses any credential in its environment and reads the URL only through `readStdinCredentials`.
+6. It reconstructs the exact guarded-schema-release client and applies the direct-owner identity/PID/object/read-only
+   fence before and after every application query.
 
 The URL never appears in argv, in the child's environment, in a log line or in a file. Every session is
 fenced: pinned TLS, the parity-table owner, and read-only except for the write session.
