@@ -456,6 +456,20 @@ function workState(row: DirectoryListRow): WorkState {
 /** An explicitly negotiated self-host list extension; absent preserves cloud-client 0.2.0. */
 export interface DirectoryListMetadata {
   includeAgentName?: "recorded";
+  /** includeShortSummary=recorded (READ_API_LIST_SHORT_SUMMARY_ENABLED=true): the recorded short summary. */
+  includeShortSummary?: "recorded";
+}
+
+/** The SQL producer's bound (migration 20261030020000): char_length(short_summary) <= 1000 code points. */
+export const SHORT_SUMMARY_MAX_CHARS = 1000;
+
+/** The recorded short summary as stored: no title substitution, no fallback. A value outside the producer's bound is a parse error. */
+function recordedShortSummary(row: DirectoryListRow): { shortSummary: string | null; shortSummaryGeneratedAt: string | null } {
+  const summary = row.short_summary ?? null;
+  if (summary !== null && (typeof summary !== "string" || Array.from(summary).length > SHORT_SUMMARY_MAX_CHARS))
+    throw new DirectoryError("parse");
+  const generatedAt = row.short_summary_generated_at ?? null;
+  return { shortSummary: summary, shortSummaryGeneratedAt: generatedAt === null ? null : iso(generatedAt) };
 }
 
 /** Catalog names are a recorded set, not an ordering or a current/primary-agent claim. */
@@ -491,11 +505,13 @@ export function sessionFromDirectoryRow(row: DirectoryListRow, metadata: Directo
   // sessionSummary bound (cloud-client 0.2.0 and later): title at most 90 characters.
   if (row.title !== null && row.title !== undefined && row.title.length > 90) throw new DirectoryError("parse");
   const agentName = metadata.includeAgentName === "recorded" ? recordedAgentName(row) : undefined;
+  const shortSummary = metadata.includeShortSummary === "recorded" ? recordedShortSummary(row) : undefined;
   return {
     title: row.title ?? null,
-    // shortSummary is deliberately not sent: Cloud validates with the strict
-    // @relayhistory/cloud-client 0.2.0 sessionSummary, which has no such key. Add it
-    // when Cloud moves to a contract version that has it.
+    // shortSummary is not sent by default: Cloud validates with the strict
+    // @relayhistory/cloud-client 0.2.0 sessionSummary, which has no such key. It
+    // appears (with shortSummaryGeneratedAt) only on an explicit
+    // includeShortSummary=recorded request, see the end of this object.
     sessionId: row.session_id,
     userIds: strings(row.user_ids).sort(),
     source: row.harness,
@@ -520,6 +536,7 @@ export function sessionFromDirectoryRow(row: DirectoryListRow, metadata: Directo
     totalCacheCreate1hTokens: null,
     ...(catalog ? { catalog } : {}),
     ...(agentName === undefined ? {} : { agentName }),
+    ...(shortSummary === undefined ? {} : shortSummary),
   };
 }
 

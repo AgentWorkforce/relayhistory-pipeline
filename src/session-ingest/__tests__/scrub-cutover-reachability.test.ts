@@ -320,6 +320,9 @@ describe('wiring inventory is complete (source scan)', () => {
   // Matches the target shape but never seals a raw chunk.
   const NOT_SEAL_SITES = [
     ['write/export target', 'src/session-ingest/app.ts', 1], // enqueueAdmission: inbox object only
+    // Hosted upload admission: promoteUpload -> prepareForAdmission + enqueueAdmission (inbox and status
+    // objects only); the ingest Worker's admission consumer seals and writes.
+    ['write/export target', 'src/session-ingest/upload-admission-hosted.ts', 1],
   ] as const;
 
   function sources(): string[] {
