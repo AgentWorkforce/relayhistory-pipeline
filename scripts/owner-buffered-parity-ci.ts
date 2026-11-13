@@ -1,0 +1,722 @@
+/**
+ * CI wrapper for .github/workflows/owner-buffered-parity.yml: the exact-seven owner-buffered parity census
+ * (G1), the dormant G2 write and the read-only readback (docs/owner-buffered-parity-ci.md).
+ *
+ * It adds no parity SQL. Tenants are enumerated with the operator's bulk cursor SQL
+ * (BULK_BUFFERED_TENANTS_SQL, read-only repeatable read), kept only when their tenantSha256 is on the committed
+ * roster (src/migration/owner-buffered-parity-roster.json), and each kept tenant then goes through the
+ * single-tenant path (readParityCensus, writeCurrentParityProof) in roster order. The operator's bulk runner is
+ * never imported and `bulk` is not a mode here.
+ *
+ * Credentials. The workflow step runs `bun scripts/owner-buffered-parity-ci.ts` with SUPABASE_MIGRATION_OWNER_URL
+ * in its environment. This parent first runs every check that needs no credential (mode, dormant switch, roster,
+ * census artifact, confirmation, checkout pin), then removes the URL from its own environment and spawns
+ * `bun scripts/owner-buffered-parity-ci.ts --operator-stdin` with an allowlisted environment and fixed argv, and
+ * writes {"supabaseUrl": ...} to the child's stdin pipe from its own memory. The child refuses a credential in
+ * its environment and reads the URL only through readStdinCredentials. Nothing credential-like is logged or
+ * written: the receipt and the census artifact carry digests, counts and public proof fields only.
+ *
+ * `--proof` runs the synthetic PGlite proof (all migrations, 7 roster tenants + 2 others) with no credentials.
+ */
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import {
+  BULK_BUFFERED_TENANTS_SQL,
+  BULK_CURSOR,
+  BULK_TARGET_GENERATION_SQL,
+  OwnerBufferedOperatorRefusal,
+  client,
+  connectNeon,
+  generationMatches,
+  operatorCredentialKeys,
+  parseTenant,
+  publicCensusReceipt,
+  requireReadOnly,
+  tenantSha256,
+  validateCensusSourceInput,
+  verifyCheckout,
+  withParityOwnerSession,
+} from "./owner-buffered-parity-operator.ts";
+import {
+  ParityCensusRefusal,
+  READ_OWNER_BUFFERED_PARITY_SQL,
+  readParityCensus,
+  storedProof,
+  writeCurrentParityProof,
+  type ParityTenant,
+} from "../src/migration/owner-buffered-parity.ts";
+import {
+  CredentialRefusal,
+  pinnedPgConfig,
+  readStdinCredentials,
+  refuseCredentialEnv,
+  sessionAffinityUrl,
+} from "../src/migration/stdin-credentials.ts";
+import {
+  OWNER_PARITY_CENSUS_CONTRACT,
+  OWNER_PARITY_CENSUS_FILE_NAME,
+  OWNER_PARITY_EXACT_COUNT,
+  OWNER_PARITY_RECEIPT_CONTRACT,
+  OWNER_PARITY_RECEIPT_FILE_NAME,
+  OWNER_PARITY_ROSTER_FILE,
+  OWNER_PARITY_WRITE_ENABLED,
+  OwnerParityCiRefusal,
+  canonicalJson,
+  keepRosterTenants,
+  ownerParityCensusDescriptor,
+  ownerParityDispatch,
+  parseOwnerParityCensus,
+  parseOwnerParityRoster,
+  refuseOwnerParity,
+  verifyOwnerParityWriteInputs,
+  type OwnerParityCensusArtifact,
+  type OwnerParityCensusBody,
+  type OwnerParityCensusEntry,
+  type OwnerParityDispatch,
+} from "../src/migration/owner-buffered-parity-ci-contract.ts";
+import type { Queryable } from "../src/migration/relayhistory-export.ts";
+
+const ROOT = join(import.meta.dir, "..");
+const HEX64 = /^[0-9a-f]{64}$/u;
+const FETCH_PAGE = 100;
+/** The workflow secret. Only the parent's own environment may hold it; it reaches the child over stdin. */
+export const OWNER_PARITY_SECRET_ENV = "SUPABASE_MIGRATION_OWNER_URL";
+/** The child's whole environment: no secret, no token. */
+export const OWNER_PARITY_CHILD_ENV = [
+  "PATH", "HOME", "LANG", "TMPDIR", "RUNNER_TEMP", "GITHUB_RUN_ID", "GITHUB_SHA",
+  "OWNER_PARITY_MODE", "OWNER_PARITY_SHA", "OWNER_PARITY_CENSUS_SOURCE", "OWNER_PARITY_CENSUS_RUN",
+  "OWNER_PARITY_CONFIRMATION",
+] as const;
+const CHILD_FLAG = "--operator-stdin";
+
+export interface OwnerParitySessions {
+  /** Source-side reader: the fenced read-only frozen-copy owner session (or a read-only Neon session). */
+  source: Queryable;
+  /** Fenced read-only owner session holding the enumeration cursor. */
+  enumerator: Queryable;
+  /** Fenced target owner session; read-only except in write. */
+  target: Queryable;
+}
+
+export interface OwnerParityDependencies {
+  readCensus?: typeof readParityCensus;
+  writeProof?: typeof writeCurrentParityProof;
+}
+
+export interface OwnerParityRunOptions {
+  /** Raw roster document (the committed JSON). */
+  roster: unknown;
+  /** This run's id; becomes censusRun in a census artifact. */
+  runId: string;
+  /** write only: the downloaded census artifact, raw. */
+  census?: unknown;
+  now?: () => number;
+  /** Test/proof injection only. Production never passes it; the workflow cannot set it. */
+  writeEnabled?: boolean;
+  deps?: OwnerParityDependencies;
+}
+
+export type OwnerParityTenantStatus =
+  | "equal" | "mismatch" | "stale" | "missing" | "inserted" | "updated" | "unchanged" | "refused" | "not_attempted";
+
+export interface OwnerParityCounts {
+  roster: number;
+  found: number;
+  equal: number;
+  mismatch: number;
+  stale: number;
+  missing: number;
+  inserted: number;
+  updated: number;
+  unchanged: number;
+  verified: number;
+}
+
+export interface OwnerParityReceipt {
+  contract: typeof OWNER_PARITY_RECEIPT_CONTRACT;
+  status: "ok" | "mismatch" | "refused";
+  code?: string;
+  mode: string;
+  runId: string;
+  sourceSha: string | null;
+  generation: string | null;
+  censusSource: string | null;
+  counts: OwnerParityCounts;
+  tenants: Array<{ tenantSha256: string; status: OwnerParityTenantStatus }>;
+  at: string;
+  credentialsPersisted: false;
+}
+
+export interface OwnerParityOutcome {
+  receipt: OwnerParityReceipt;
+  /** census mode, all seven equal: the artifact to publish. */
+  census: OwnerParityCensusArtifact | null;
+  exitCode: number;
+}
+
+interface Kept { digest: string; tenant: ParityTenant }
+
+function emptyCounts(): OwnerParityCounts {
+  return { roster: 0, found: 0, equal: 0, mismatch: 0, stale: 0, missing: 0, inserted: 0, updated: 0, unchanged: 0,
+    verified: 0 };
+}
+
+/** Fixed codes only; anything else (driver text could carry a host) collapses to a constant. */
+export function ownerParityCode(error: unknown): string {
+  const code = error instanceof OwnerParityCiRefusal || error instanceof OwnerBufferedOperatorRefusal ||
+    error instanceof ParityCensusRefusal || error instanceof CredentialRefusal ? error.code : "owner_parity_failed";
+  return /^[A-Za-z0-9_.:,-]{1,160}$/u.test(code) ? code : "owner_parity_failed";
+}
+
+/**
+ * Every check that needs no credential: inputs and the dormant switch, the roster, and for write the census
+ * artifact and the typed confirmation. Runs in the parent before the secret is touched and again in the child.
+ */
+export function ownerParityPreflight(
+  env: Record<string, string | undefined>,
+  roster: unknown,
+  census: unknown,
+  enabled: boolean = OWNER_PARITY_WRITE_ENABLED,
+  now: number = Date.now(),
+): { dispatch: OwnerParityDispatch; roster: string[]; census: OwnerParityCensusArtifact | null } {
+  const dispatch = ownerParityDispatch(env, enabled);
+  const digests = parseOwnerParityRoster(roster);
+  if (dispatch.mode !== "write") return { dispatch, roster: digests, census: null };
+  const artifact = parseOwnerParityCensus(census);
+  verifyOwnerParityWriteInputs(dispatch, artifact, digests, now);
+  return { dispatch, roster: digests, census: artifact };
+}
+
+/** The live PASS marker generation; discovered, never an input. */
+export async function readLiveGeneration(target: Queryable): Promise<string> {
+  const rows = (await target.query<{ generation: unknown }>(BULK_TARGET_GENERATION_SQL)).rows;
+  if (rows.length !== 1 || typeof rows[0]?.generation !== "string" || !HEX64.test(rows[0].generation))
+    refuseOwnerParity("owner_parity_generation_unavailable");
+  return rows[0].generation;
+}
+
+/**
+ * One read-only repeatable-read snapshot of the target's buffered tenants (the operator's bulk cursor SQL),
+ * filtered to roster digests as each bounded page arrives. Unlisted tenants are hashed and dropped; nothing
+ * else is done with them. Refuses roster_incomplete unless all seven are found.
+ */
+export async function enumerateRosterTenants(enumerator: Queryable, roster: readonly string[]): Promise<Kept[]> {
+  const wanted = new Set(roster);
+  const candidates: Kept[] = [];
+  await enumerator.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  try {
+    await enumerator.query("SET LOCAL statement_timeout = '30s'");
+    await enumerator.query(`DECLARE ${BULK_CURSOR} NO SCROLL CURSOR FOR ${BULK_BUFFERED_TENANTS_SQL}`);
+    for (;;) {
+      const rows = (await enumerator.query<Record<string, unknown>>(`FETCH FORWARD ${FETCH_PAGE} FROM ${BULK_CURSOR}`)).rows;
+      if (rows.length > FETCH_PAGE) refuseOwnerParity("owner_parity_page_too_large");
+      if (rows.length === 0) break;
+      for (const row of rows) {
+        let tenant: ParityTenant;
+        try {
+          tenant = parseTenant({ orgId: row.org_id, workspaceId: row.workspace_id, userId: row.user_id });
+        } catch {
+          continue;
+        }
+        const digest = tenantSha256(tenant);
+        if (wanted.has(digest)) candidates.push({ digest, tenant });
+      }
+    }
+    await enumerator.query(`CLOSE ${BULK_CURSOR}`);
+    await enumerator.query("COMMIT");
+  } catch (error) {
+    await enumerator.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  }
+  return keepRosterTenants(candidates, roster);
+}
+
+/**
+ * G2 for the kept roster, in roster order: fresh G1 (equal, at the census generation and byte-equal to the
+ * census entry), writeCurrentParityProof, then same-run exact readback of the stored row. The first refusal
+ * stops the loop; rows already written stay and are reported. Fewer than seven verified rows fails closed.
+ */
+export async function writeOwnerParityTenants(
+  sessions: OwnerParitySessions,
+  kept: readonly Kept[],
+  census: OwnerParityCensusArtifact,
+  generation: string,
+  counts: OwnerParityCounts,
+  statuses: Map<string, OwnerParityTenantStatus>,
+  deps: OwnerParityDependencies = {},
+): Promise<void> {
+  const readCensus = deps.readCensus ?? readParityCensus;
+  const writeProof = deps.writeProof ?? writeCurrentParityProof;
+  if (kept.length !== OWNER_PARITY_EXACT_COUNT) refuseOwnerParity("owner_parity_write_incomplete");
+  const entries = new Map(census.tenants.map((entry) => [entry.tenantSha256, entry]));
+  for (const { digest, tenant } of kept) {
+    statuses.set(digest, "refused");
+    const entry = entries.get(digest);
+    if (!entry) refuseOwnerParity("owner_parity_census_roster_mismatch");
+    const g1 = await readCensus(sessions.source, sessions.target, tenant, census.censusSource);
+    if (!g1.equal || !g1.proof) refuseOwnerParity("owner_parity_write_parity_mismatch");
+    if (!generationMatches(g1, generation)) refuseOwnerParity("owner_parity_generation_mismatch");
+    if (canonicalJson(publicCensusReceipt(g1)) !== canonicalJson(entry.census)) refuseOwnerParity("owner_parity_census_drift");
+    const result = await writeProof(sessions.source, sessions.target, tenant, generation, census.censusSource);
+    if (!generationMatches(result.census, generation)) refuseOwnerParity("owner_parity_generation_postcondition");
+    if (result.outcome === "insert") { counts.inserted++; statuses.set(digest, "inserted"); }
+    else if (result.outcome === "update") { counts.updated++; statuses.set(digest, "updated"); }
+    else { counts.unchanged++; statuses.set(digest, "unchanged"); }
+    const stored = storedProof(tenant, (await sessions.target.query<Record<string, unknown>>(
+      READ_OWNER_BUFFERED_PARITY_SQL, [tenant.orgId, tenant.workspaceId, tenant.userId])).rows[0]);
+    const after = await readCensus(sessions.source, sessions.target, tenant, census.censusSource);
+    if (stored === null || !after.equal || !after.proof || canonicalJson(stored) !== canonicalJson(after.proof) ||
+        canonicalJson(stored) !== canonicalJson(result.census.proof))
+      refuseOwnerParity("owner_parity_readback_mismatch");
+    counts.verified++;
+  }
+  if (counts.verified !== OWNER_PARITY_EXACT_COUNT) refuseOwnerParity("owner_parity_write_incomplete");
+}
+
+/**
+ * The workflow's database work over three sessions. Never throws a refusal: it returns a sanitized receipt
+ * (status refused + fixed code) so rows already written are still reported.
+ */
+export async function runOwnerParity(
+  env: Record<string, string | undefined>,
+  sessions: OwnerParitySessions,
+  options: OwnerParityRunOptions,
+): Promise<OwnerParityOutcome> {
+  const now = options.now ?? Date.now;
+  const counts = emptyCounts();
+  const statuses = new Map<string, OwnerParityTenantStatus>();
+  let dispatch: OwnerParityDispatch | null = null;
+  let generation: string | null = null;
+  let censusOut: OwnerParityCensusArtifact | null = null;
+  const receipt = (status: OwnerParityReceipt["status"], code?: string): OwnerParityReceipt => ({
+    contract: OWNER_PARITY_RECEIPT_CONTRACT, status, ...(code === undefined ? {} : { code }),
+    mode: dispatch?.mode ?? "refused", runId: /^[1-9][0-9]{0,19}$/u.test(options.runId) ? options.runId : "0",
+    sourceSha: dispatch?.sha ?? null, generation, censusSource: dispatch?.censusSource ?? null, counts,
+    tenants: [...statuses].map(([tenantSha256, s]) => ({ tenantSha256, status: s })),
+    at: new Date(now()).toISOString(), credentialsPersisted: false,
+  });
+  try {
+    const pre = ownerParityPreflight(env, options.roster, options.census,
+      options.writeEnabled ?? OWNER_PARITY_WRITE_ENABLED, now());
+    dispatch = pre.dispatch;
+    counts.roster = pre.roster.length;
+    for (const digest of pre.roster) statuses.set(digest, "not_attempted");
+    const readCensus = options.deps?.readCensus ?? readParityCensus;
+    generation = await readLiveGeneration(sessions.target);
+    if (pre.census && pre.census.generation !== generation) refuseOwnerParity("owner_parity_generation_mismatch");
+    const kept = await enumerateRosterTenants(sessions.enumerator, pre.roster);
+    counts.found = kept.length;
+
+    if (dispatch.mode === "write") {
+      await writeOwnerParityTenants(sessions, kept, pre.census!, generation, counts, statuses, options.deps);
+    } else {
+      const entries: OwnerParityCensusEntry[] = [];
+      for (const { digest, tenant } of kept) {
+        const g1 = await readCensus(sessions.source, sessions.target, tenant, dispatch.censusSource);
+        if (g1.equal && g1.proof && !generationMatches(g1, generation)) refuseOwnerParity("owner_parity_generation_mismatch");
+        if (dispatch.mode === "census") {
+          const status = g1.equal && g1.proof ? "equal" : "mismatch";
+          counts[status]++;
+          statuses.set(digest, status);
+          entries.push({ tenantSha256: digest, status, census: publicCensusReceipt(g1) });
+        } else {
+          const stored = storedProof(tenant, (await sessions.target.query<Record<string, unknown>>(
+            READ_OWNER_BUFFERED_PARITY_SQL, [tenant.orgId, tenant.workspaceId, tenant.userId])).rows[0]);
+          const status = stored === null ? "missing"
+            : g1.equal && g1.proof && canonicalJson(stored) === canonicalJson(g1.proof) ? "equal" : "stale";
+          counts[status]++;
+          statuses.set(digest, status);
+        }
+      }
+      if (await readLiveGeneration(sessions.target) !== generation) refuseOwnerParity("owner_parity_generation_mismatch");
+      if (dispatch.mode === "census" && counts.equal === OWNER_PARITY_EXACT_COUNT) {
+        const body: OwnerParityCensusBody = {
+          contract: OWNER_PARITY_CENSUS_CONTRACT, sourceSha: dispatch.sha, generation,
+          censusSource: dispatch.censusSource, capturedAt: new Date(now()).toISOString(), censusRun: options.runId,
+          tenants: entries,
+        };
+        censusOut = { ...body, descriptorSha256: ownerParityCensusDescriptor(body) };
+      }
+      if (counts.equal !== OWNER_PARITY_EXACT_COUNT) return { receipt: receipt("mismatch"), census: null, exitCode: 3 };
+    }
+    return { receipt: receipt("ok"), census: censusOut, exitCode: 0 };
+  } catch (error) {
+    return { receipt: receipt("refused", ownerParityCode(error)), census: null, exitCode: 1 };
+  }
+}
+
+/** Spawn spec for the credential child: fixed argv, allowlisted env, the URL only in the stdin payload. */
+export function ownerParityChildSpawn(
+  env: Record<string, string | undefined>,
+  supabaseUrl: string,
+  script: string = join(ROOT, "scripts/owner-buffered-parity-ci.ts"),
+): { command: string; args: string[]; env: Record<string, string>; input: string } {
+  const childEnv: Record<string, string> = {};
+  for (const key of OWNER_PARITY_CHILD_ENV) if (typeof env[key] === "string") childEnv[key] = env[key]!;
+  return { command: process.execPath, args: [script, CHILD_FLAG], env: childEnv, input: JSON.stringify({ supabaseUrl }) };
+}
+
+/** The child holds no credential in its environment: the URL arrives only over the stdin pipe. */
+export function refuseOwnerParityCredentialEnv(env: Record<string, string | undefined>): void {
+  refuseCredentialEnv(env);
+  for (const key of Object.keys(env))
+    if (!(OWNER_PARITY_CHILD_ENV as readonly string[]).includes(key)) refuseOwnerParity("owner_parity_credential_env");
+}
+
+function outputPaths(env: Record<string, string | undefined>) {
+  const temp = env.RUNNER_TEMP ?? "";
+  if (!temp.startsWith("/")) refuseOwnerParity("owner_parity_runner_temp");
+  return {
+    census: join(temp, "owner-parity-census", OWNER_PARITY_CENSUS_FILE_NAME),
+    out: join(temp, "owner-parity-out", OWNER_PARITY_CENSUS_FILE_NAME),
+    receipt: join(temp, "owner-parity-out", OWNER_PARITY_RECEIPT_FILE_NAME),
+  };
+}
+
+function writePrivate(path: string, value: unknown): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  writeFileSync(path, JSON.stringify(value) + "\n", { mode: 0o600 });
+}
+
+function readJson(path: string, code: string): unknown {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return refuseOwnerParity(code);
+  }
+}
+
+function inputs(env: Record<string, string | undefined>) {
+  const paths = outputPaths(env);
+  const roster = readJson(join(ROOT, OWNER_PARITY_ROSTER_FILE), "roster_invalid");
+  const census = env.OWNER_PARITY_MODE === "write" && existsSync(paths.census)
+    ? readJson(paths.census, "owner_parity_census_invalid") : undefined;
+  return { paths, roster, census };
+}
+
+function announce(receipt: OwnerParityReceipt): void {
+  // Aggregate line only: no digests, URLs or identifiers.
+  console.log("owner_buffered_parity_ci " + JSON.stringify({
+    status: receipt.status, ...(receipt.code ? { code: receipt.code } : {}), mode: receipt.mode, counts: receipt.counts,
+  }));
+}
+
+function refusedReceipt(env: Record<string, string | undefined>, code: string): OwnerParityReceipt {
+  return {
+    contract: OWNER_PARITY_RECEIPT_CONTRACT, status: "refused", code, mode: env.OWNER_PARITY_MODE === "census" ||
+      env.OWNER_PARITY_MODE === "write" || env.OWNER_PARITY_MODE === "readback" ? env.OWNER_PARITY_MODE : "refused",
+    runId: /^[1-9][0-9]{0,19}$/u.test(env.GITHUB_RUN_ID ?? "") ? env.GITHUB_RUN_ID! : "0",
+    sourceSha: null, generation: null, censusSource: null, counts: emptyCounts(), tenants: [],
+    at: new Date().toISOString(), credentialsPersisted: false,
+  };
+}
+
+/** Workflow step: pre-credential checks, then pipe the one secret to the credential child. */
+async function parent(): Promise<number> {
+  const env = process.env;
+  let receiptPath: string | null = null;
+  try {
+    // The secret leaves the environment first (git subprocesses below inherit it otherwise).
+    const url = env[OWNER_PARITY_SECRET_ENV];
+    delete process.env[OWNER_PARITY_SECRET_ENV];
+    const { paths, roster, census } = inputs(env);
+    receiptPath = paths.receipt;
+    // Then the credential-free checks (dormant switch, roster, census, confirmation, checkout),
+    // and only after those is the value examined.
+    const pre = ownerParityPreflight(env, roster, census);
+    verifyCheckout(pre.dispatch.sha);
+    if (typeof url !== "string" || url === "") refuseOwnerParity("owner_parity_credential_missing");
+    const spec = ownerParityChildSpawn(env, url);
+    return await new Promise<number>((resolve) => {
+      const child = spawn(spec.command, spec.args, { cwd: ROOT, env: spec.env, stdio: ["pipe", "inherit", "inherit"] });
+      child.on("error", () => resolve(1));
+      child.on("close", (code) => resolve(code === null ? 1 : code));
+      child.stdin.on("error", () => undefined);
+      child.stdin.end(spec.input);
+    });
+  } catch (error) {
+    const receipt = refusedReceipt(env, ownerParityCode(error));
+    if (receiptPath) writePrivate(receiptPath, receipt);
+    announce(receipt);
+    return 1;
+  }
+}
+
+/** Credential child: the URL arrives over stdin only, and every session is fenced. */
+async function operatorChild(): Promise<number> {
+  const env = process.env;
+  let receiptPath: string | null = null;
+  try {
+    const { paths, roster, census } = inputs(env);
+    receiptPath = paths.receipt;
+    refuseOwnerParityCredentialEnv(env);
+    const pre = ownerParityPreflight(env, roster, census);
+    verifyCheckout(pre.dispatch.sha);
+    const args = { mode: "bulk" as const, expectedSourceSha: pre.dispatch.sha, expectedTargetGeneration: "0".repeat(64),
+      censusSource: pre.dispatch.censusSource, batchSize: FETCH_PAGE };
+    const keys = operatorCredentialKeys(args);
+    const input = await readStdinCredentials(keys.required, keys.allowed);
+    validateCensusSourceInput(args, input);
+    const supabaseUrl = sessionAffinityUrl(input.supabaseUrl, "supabaseUrl", "supabase");
+    pinnedPgConfig(supabaseUrl, "supabaseUrl", "supabase");
+    const neonUrl = pre.dispatch.censusSource === "neon" ? sessionAffinityUrl(input.neonUrl, "neonUrl", "neon") : null;
+    if (neonUrl !== null) pinnedPgConfig(neonUrl, "neonUrl", "neon");
+    const write = pre.dispatch.mode === "write";
+    const run = (source: Queryable) => withParityOwnerSession(
+      client(supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-ci-enumerator-readonly"), true, (enumerator) =>
+        withParityOwnerSession(
+          client(supabaseUrl, "supabaseUrl", "supabase", write ? "owner-buffered-ci-target-owner" : "owner-buffered-ci-target-readonly"),
+          !write, (target) => runOwnerParity(env, { source, enumerator, target }, { roster, census, runId: env.GITHUB_RUN_ID ?? "" })));
+    let outcome: OwnerParityOutcome;
+    if (neonUrl !== null) {
+      const neon = await connectNeon(neonUrl);
+      try {
+        await requireReadOnly(neon, "neonUrl");
+        outcome = await run(neon);
+      } finally {
+        await neon.end().catch(() => undefined);
+      }
+    } else {
+      outcome = await withParityOwnerSession(
+        client(supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-ci-frozen-source-readonly"), true, run);
+    }
+    writePrivate(paths.receipt, outcome.receipt);
+    if (outcome.census) writePrivate(paths.out, outcome.census);
+    announce(outcome.receipt);
+    return outcome.exitCode;
+  } catch (error) {
+    const receipt = refusedReceipt(env, ownerParityCode(error));
+    if (receiptPath) writePrivate(receiptPath, receipt);
+    announce(receipt);
+    return 1;
+  }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Synthetic PGlite proof: no credentials, no network. Fixture identifiers only.
+// ---------------------------------------------------------------------------------------------------------------
+
+const H = (c: string) => c.repeat(64);
+export const PROOF_SHA = "5".repeat(40);
+export const PROOF_TENANTS: ParityTenant[] = Array.from({ length: 9 }, (_, i) => ({
+  orgId: `fixture-org-${i + 1}`, workspaceId: `fixture-ws-${i + 1}`, userId: `fixture-user-${i + 1}`,
+}));
+/** Roster tenants are the first seven; tenants 8 and 9 are buffered but unlisted and must never be touched. */
+export const PROOF_ROSTER = {
+  contract: "owner-buffered-parity-roster/v1",
+  comment: "synthetic proof roster",
+  tenants: PROOF_TENANTS.slice(0, OWNER_PARITY_EXACT_COUNT).map(tenantSha256),
+};
+
+export interface ProofCase { name: string; pass: boolean; detail?: string }
+
+export async function ownerParityProof(): Promise<{ cases: ProofCase[]; failed: number }> {
+  const { PGlite } = await import("@electric-sql/pglite");
+  const { btree_gin } = await import("@electric-sql/pglite/contrib/btree_gin");
+  const { pg_trgm } = await import("@electric-sql/pglite/contrib/pg_trgm");
+  const { SESSION_BOOTSTRAP_FILES } = await import("../src/hoopdb/session-bootstrap-chain.ts");
+  const { readdirSync } = await import("node:fs");
+  const read = (path: string) => readFileSync(join(ROOT, path), "utf8");
+  const extensions = { btree_gin, pg_trgm };
+  const template = new PGlite({ extensions });
+  await template.exec(read("supabase/tests/supabase_shim.sql"));
+  for (const file of SESSION_BOOTSTRAP_FILES) await template.exec(read(file));
+  for (const file of readdirSync(join(ROOT, "supabase/migrations")).filter((n) => n.endsWith(".sql")).sort())
+    await template.exec(read(`supabase/migrations/${file}`));
+  await template.exec(read("supabase/bootstrap/session_read_api_role.sql").split("\n")
+    .filter((line) => !line.startsWith("\\")).join("\n"));
+  const lit = (t: ParityTenant) => `'${t.orgId}','${t.workspaceId}','${t.userId}'`;
+  let seed = `CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);
+    INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','${H("4")}','pass');
+    INSERT INTO sessions.ingest_lazy_policy(singleton,baseline_mode,generation,source_identity_sha256,control_epoch,
+      privacy_baseline_sha256,retention_contract_sha256,source_proof_sha256,issuer,valid_until)
+    VALUES(true,'lazy-current','${H("4")}','${H("c")}','${H("1")}','${H("2")}','${H("b")}','${H("d")}',
+      'relayhistory-cloud',clock_timestamp()+interval '1 hour');
+    SET session_replication_role = replica;`;
+  for (const [i, t] of PROOF_TENANTS.entries()) {
+    const version = i + 1;
+    seed += `
+    INSERT INTO sessions.upload_deletions(org_id,workspace_id,user_id,origin_id,source,session_id)
+      VALUES(${lit(t)},'origin-${i}','claude','session-${i}');
+    INSERT INTO sessions.upload_resets(org_id,workspace_id,user_id,request_id) VALUES(${lit(t)},'request-${i}');
+    INSERT INTO sessions.ingest_control_receipts(org_id,workspace_id,user_id,epoch,version,digest,kind,result,schema_generation)
+      SELECT ${lit(t)},'${H("1")}',n,'${H("3")}','selection','{}'::jsonb,'${H("4")}' FROM generate_series(1,${version}) AS n;
+    INSERT INTO sessions.ingest_source_control_heads(org_id,workspace_id,user_id,epoch,version,digest,kind,payload,pending)
+      VALUES(${lit(t)},'${H("1")}',${version},'${H("3")}','selection','{}'::jsonb,false);
+    INSERT INTO sessions.ingest_frozen_source_deletions(org_id,workspace_id,user_id,origin_id,source,session_id)
+      VALUES(${lit(t)},'origin-${i}','claude','session-${i}');
+    INSERT INTO sessions.ingest_frozen_source_resets(org_id,workspace_id,user_id,request_id,deleted)
+      VALUES(${lit(t)},'request-${i}',1);
+    INSERT INTO sessions.ingest_buffer_outbox(org_id,workspace_id,origin_id,batch_id,user_id,digest,active_stage_token)
+      VALUES('${t.orgId}','${t.workspaceId}','origin','batch-${i}','${t.userId}','${H("e")}',gen_random_uuid()),
+            ('${t.orgId}','${t.workspaceId}','origin','batch-${i}-b','${t.userId}','${H("e")}',gen_random_uuid());`;
+  }
+  seed += `
+    RESET session_replication_role;
+    INSERT INTO sessions.ingest_frozen_source_completeness(singleton,source_identity_sha256,control_epoch,
+      privacy_baseline_sha256,org_count,record_rows,manifest_sha256,neon_snapshot)
+      VALUES(true,'${H("c")}','${H("1")}','${H("2")}',9,0,'${H("e")}','{}'::jsonb);
+    INSERT INTO sessions.ingest_privacy_authority(singleton,state,control_epoch,neon_fingerprint_sha256,activated_at)
+      VALUES(true,'active','${H("1")}','${H("f")}',clock_timestamp());`;
+  await template.exec(seed);
+  const image = await template.dumpDataDir();
+  await template.close();
+
+  type Db = InstanceType<typeof PGlite>;
+  const open = async () => new PGlite({ extensions, loadDataDir: image });
+  const queryable = (db: Db, log?: Array<{ sql: string; params: unknown[] }>): Queryable => ({
+    query: async <R>(sql: string, params?: unknown[]) => {
+      log?.push({ sql, params: params ?? [] });
+      return (params?.length ? db.query(sql, params as never) : db.query(sql)) as Promise<{ rows: R[] }>;
+    },
+  });
+  const cases: ProofCase[] = [];
+  const check = async (name: string, work: () => Promise<void>) => {
+    try {
+      await work();
+      cases.push({ name, pass: true });
+    } catch (error) {
+      cases.push({ name, pass: false, detail: error instanceof Error ? error.message.slice(0, 200) : "failed" });
+    }
+  };
+  const assert = (ok: unknown, why: string) => { if (!ok) throw new Error(why); };
+  const expectCode = (outcome: OwnerParityOutcome, code: string) =>
+    assert(outcome.exitCode === 1 && outcome.receipt.status === "refused" && outcome.receipt.code === code,
+      `expected ${code}, got ${outcome.receipt.status}/${outcome.receipt.code ?? "-"}`);
+  const base = { OWNER_PARITY_SHA: PROOF_SHA, OWNER_PARITY_CENSUS_SOURCE: "frozen-supabase" };
+  const env = (mode: string, extra: Record<string, string> = {}) => ({ ...base, OWNER_PARITY_MODE: mode, ...extra });
+
+  // One database plays the target and the frozen copy (they are the same Supabase project), opened as three
+  // independent PGlite instances from one image so the sessions do not share a transaction.
+  let source = await open(), target = await open(), enumeratorDb = await open();
+  const log: Array<{ sql: string; params: unknown[] }> = [];
+  const sessions = () => ({ source: queryable(source, log), enumerator: queryable(enumeratorDb, log), target: queryable(target, log) });
+  const parityRows = async () => (await target.query<{ user_id: string }>(
+    "SELECT user_id FROM sessions.owner_buffered_parity ORDER BY user_id")).rows.map((r) => r.user_id);
+  const T0 = Date.parse("2026-11-13T00:00:00.000Z");
+  let census: OwnerParityCensusArtifact | null = null;
+  const writeEnv = (c: OwnerParityCensusArtifact, extra: Record<string, string> = {}) =>
+    env("write", { OWNER_PARITY_CENSUS_RUN: c.censusRun, OWNER_PARITY_CONFIRMATION:
+      `WRITE-OWNER-PARITY ${c.sourceSha} GENERATION ${c.generation} SOURCE ${c.censusSource} DESCRIPTOR ${c.descriptorSha256} CENSUS ${c.censusRun}`,
+      ...extra });
+  const write = (c: unknown, e: Record<string, string>, now = T0 + 3600_000) =>
+    runOwnerParity(e, sessions(), { roster: PROOF_ROSTER, runId: "202", census: c, now: () => now, writeEnabled: true });
+
+  await check("census: exactly the seven roster tenants, all equal, at the live PASS generation", async () => {
+    const outcome = await runOwnerParity(env("census"), sessions(), { roster: PROOF_ROSTER, runId: "101", now: () => T0 });
+    assert(outcome.exitCode === 0 && outcome.receipt.status === "ok", "census not ok: " + outcome.receipt.code);
+    census = outcome.census;
+    assert(census && census.tenants.length === 7 && census.tenants.every((t) => t.status === "equal"), "census shape");
+    assert(census!.generation === H("4") && census!.censusRun === "101" && census!.capturedAt === new Date(T0).toISOString(),
+      "census binding");
+    assert(JSON.stringify(census!.tenants.map((t) => t.tenantSha256)) === JSON.stringify(PROOF_ROSTER.tenants), "roster order");
+    assert(parseOwnerParityCensus(JSON.parse(JSON.stringify(census))).descriptorSha256 === census!.descriptorSha256, "descriptor");
+  });
+  const c = () => { if (!census) throw new Error("no census"); return census; };
+
+  await check("refuses write while dormant, before any database statement", async () => {
+    const before = log.length;
+    const outcome = await runOwnerParity(writeEnv(c()), sessions(), { roster: PROOF_ROSTER, runId: "202", census: c(), now: () => T0 });
+    expectCode(outcome, "owner_parity_write_dormant");
+    assert(log.length === before, "dormant write touched a session");
+  });
+  await check("refuses roster_empty", async () => {
+    expectCode(await runOwnerParity(env("census"), sessions(), { roster: { ...PROOF_ROSTER, tenants: [] }, runId: "1" }), "roster_empty");
+  });
+  await check("refuses roster_incomplete (six listed)", async () => {
+    expectCode(await runOwnerParity(env("census"), sessions(),
+      { roster: { ...PROOF_ROSTER, tenants: PROOF_ROSTER.tenants.slice(0, 6) }, runId: "1" }), "roster_incomplete");
+  });
+  await check("refuses roster_incomplete (a listed tenant has no buffered row)", async () => {
+    const roster = { ...PROOF_ROSTER, tenants: [...PROOF_ROSTER.tenants.slice(0, 6), tenantSha256({ orgId: "absent",
+      workspaceId: "absent", userId: "absent" })] };
+    expectCode(await runOwnerParity(env("census"), sessions(), { roster, runId: "1" }), "roster_incomplete");
+  });
+  await check("bulk is unreachable", async () => {
+    expectCode(await runOwnerParity(env("bulk"), sessions(), { roster: PROOF_ROSTER, runId: "1", writeEnabled: true }),
+      "owner_parity_inputs");
+  });
+  await check("refuses a wrong confirmation", async () => {
+    expectCode(await write(c(), writeEnv(c(), { OWNER_PARITY_CONFIRMATION: writeEnv(c()).OWNER_PARITY_CONFIRMATION + " " })),
+      "owner_parity_confirmation");
+  });
+  await check("refuses a stale census (24h)", async () => {
+    expectCode(await write(c(), writeEnv(c()), T0 + 24 * 3600_000), "owner_parity_census_stale");
+  });
+  await check("refuses a census for another sha", async () => {
+    expectCode(await write(c(), writeEnv(c(), { OWNER_PARITY_SHA: "6".repeat(40) })), "owner_parity_census_sha_mismatch");
+  });
+  await check("refuses a substituted roster digest in the census", async () => {
+    const forged = JSON.parse(JSON.stringify(c()));
+    forged.tenants[0].tenantSha256 = forged.tenants[0].census.tenantSha256 = tenantSha256(PROOF_TENANTS[7]!);
+    expectCode(await write(forged, writeEnv(c())), "owner_parity_census_descriptor");
+  });
+  await check("refuses when the live PASS generation moved since the census", async () => {
+    await target.exec(`UPDATE sessions.__96bulls_role_validation SET generation='${H("9")}'`);
+    try {
+      expectCode(await write(c(), writeEnv(c())), "owner_parity_generation_mismatch");
+      assert((await parityRows()).length === 0, "rows written after generation drift");
+    } finally {
+      await target.exec(`UPDATE sessions.__96bulls_role_validation SET generation='${H("4")}'`);
+    }
+  });
+  await check("write: seven rows, exact readback, the eighth and ninth tenants never touched", async () => {
+    const outcome = await write(c(), writeEnv(c()));
+    assert(outcome.exitCode === 0 && outcome.receipt.status === "ok", "write not ok: " + outcome.receipt.code);
+    assert(outcome.receipt.counts.inserted === 7 && outcome.receipt.counts.verified === 7, "counts");
+    const rows = await parityRows();
+    assert(JSON.stringify(rows) === JSON.stringify(PROOF_TENANTS.slice(0, 7).map((t) => t.userId).sort()), "rows");
+    for (const t of PROOF_TENANTS.slice(7))
+      assert(!log.some((q) => q.params.includes(t.userId) || q.sql.includes(t.userId)), "unlisted tenant touched");
+  });
+  await check("write is idempotent: a second run reports unchanged", async () => {
+    const outcome = await write(c(), writeEnv(c()));
+    assert(outcome.exitCode === 0 && outcome.receipt.counts.unchanged === 7, "not unchanged");
+  });
+  await check("readback: equal for all seven", async () => {
+    const outcome = await runOwnerParity(env("readback"), sessions(), { roster: PROOF_ROSTER, runId: "303" });
+    assert(outcome.exitCode === 0 && outcome.receipt.counts.equal === 7, "readback");
+  });
+  await check("readback: a deleted row reads missing and a moved source reads stale", async () => {
+    const t = PROOF_TENANTS[0]!, u = PROOF_TENANTS[1]!;
+    await target.query("DELETE FROM sessions.owner_buffered_parity WHERE user_id=$1", [t.userId]);
+    await source.exec(`INSERT INTO sessions.ingest_frozen_source_resets(org_id,workspace_id,user_id,request_id,deleted)
+      SELECT ${lit(u)},'request-extra',1`).catch(async () => {
+      await source.exec(`SET bulls96.privacy_authority_writer='authority';
+        INSERT INTO sessions.ingest_frozen_source_resets(org_id,workspace_id,user_id,request_id,deleted)
+        VALUES(${lit(u)},'request-extra',1); RESET bulls96.privacy_authority_writer;`);
+    });
+    const outcome = await runOwnerParity(env("readback"), sessions(), { roster: PROOF_ROSTER, runId: "304" });
+    assert(outcome.exitCode === 3 && outcome.receipt.status === "mismatch", "readback status");
+    const byDigest = new Map(outcome.receipt.tenants.map((x) => [x.tenantSha256, x.status]));
+    assert(byDigest.get(tenantSha256(t)) === "missing" && byDigest.get(tenantSha256(u)) === "stale" &&
+      outcome.receipt.counts.equal === 5, "readback per-digest " + JSON.stringify([...byDigest.values()]));
+  });
+  await check("receipt and census carry no private field names or values", async () => {
+    const outcome = await runOwnerParity(env("readback"), sessions(), { roster: PROOF_ROSTER, runId: "305" });
+    const text = JSON.stringify(outcome.receipt) + JSON.stringify(c());
+    for (const key of ["orgId", "workspaceId", "userId", "neonUrl", "supabaseUrl", "org_id", "user_id"])
+      assert(!text.includes(`"${key}"`), "key " + key);
+    for (const t of PROOF_TENANTS) assert(!text.includes(t.orgId) && !text.includes(t.userId), "tenant value");
+  });
+  await Promise.all([source.close(), target.close(), enumeratorDb.close()]);
+  return { cases, failed: cases.filter((x) => !x.pass).length };
+}
+
+function dieQuietly(): never {
+  console.log("owner_buffered_parity_ci " + JSON.stringify({ status: "refused", code: "owner_parity_failed" }));
+  process.exit(1);
+}
+
+if (import.meta.main) {
+  process.on("uncaughtException", dieQuietly);
+  process.on("unhandledRejection", dieQuietly);
+  if (process.argv.includes("--proof")) {
+    const result = await ownerParityProof();
+    for (const c of result.cases) console.log(`${c.pass ? "PASS" : "FAIL"} ${c.name}${c.detail ? ` | ${c.detail}` : ""}`);
+    console.log(`owner_buffered_parity_ci_proof ${result.cases.length - result.failed}/${result.cases.length}`);
+    process.exit(result.failed ? 1 : 0);
+  }
+  process.exit(process.argv.includes(CHILD_FLAG) ? await operatorChild() : await parent());
+}

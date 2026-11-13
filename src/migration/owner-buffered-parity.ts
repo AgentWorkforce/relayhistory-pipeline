@@ -445,7 +445,7 @@ function sourceSnapshotKey(source: NeonCensusRow, spec: CensusSourceSpec): strin
   ]);
 }
 
-function storedProof(tenant: ParityTenant, row: Record<string, unknown> | undefined): OwnerBufferedParityProof | null {
+export function storedProof(tenant: ParityTenant, row: Record<string, unknown> | undefined): OwnerBufferedParityProof | null {
   if (!row) return null;
   const noHead = row.no_head;
   if (typeof noHead !== "boolean") throw new ParityCensusRefusal("stored_proof_shape_invalid");
