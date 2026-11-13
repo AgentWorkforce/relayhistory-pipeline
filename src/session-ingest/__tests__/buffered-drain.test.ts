@@ -5,7 +5,9 @@ import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import { BUFFER_STAGE_MAX_BYTES, prepareBufferedStage, putBufferedStage } from "../staging.ts";
 import type { Group } from "../writer.ts";
 import {
+  ACCEPTED_SUFFIX,
   DRAINED_SUFFIX,
+  acceptedCompleteKey,
   acquireDrainLock,
   drainBufferedBatches,
   drainLockKey,
@@ -38,7 +40,16 @@ function group(source: string, sessionId: string, recs: Rec[]): Group {
   };
 }
 
-async function stage(store: ObjectStore, groups: Group[], over: { batch?: string; claim?: string; received?: string } = {}): Promise<string> {
+/** The accepted-stage export's sidecar (0005 step 0b): SQL acknowledged this stage, with these bytes. */
+const accept = (store: ObjectStore, key: string, stageSha256: string) =>
+  store.put(objectKey(key + ACCEPTED_SUFFIX), enc.encode(JSON.stringify({ v: 1, kind: "buffered-accepted", stage_sha256: stageSha256 })));
+/** A raw object at a staged key, accepted (so the drain reads and classifies it). */
+async function putStaged(store: ObjectStore, key: string, bytes: Uint8Array) {
+  await store.put(objectKey(key), bytes);
+  await accept(store, key, sha(bytes));
+}
+
+async function stage(store: ObjectStore, groups: Group[], over: { batch?: string; claim?: string; received?: string; accepted?: boolean } = {}): Promise<string> {
   let ord = 0;
   const prepared = prepareBufferedStage(ROOT, {
     claim_token: over.claim ?? randomUUID(),
@@ -47,6 +58,7 @@ async function stage(store: ObjectStore, groups: Group[], over: { batch?: string
     org_id: TENANT.orgId, workspace_id: TENANT.workspaceId, origin_id: ORIGIN, user_id: TENANT.userId,
   }, groups, groups.map((g) => g.lines.map(() => ord++)));
   await putBufferedStage(store, prepared);
+  if (over.accepted !== false) await accept(store, prepared.spec.key, prepared.spec.sha256);
   return prepared.spec.key;
 }
 
@@ -107,12 +119,15 @@ const run = (store: ObjectStore, over: Partial<DrainOptions> = {}) =>
 let cleanup: (() => void)[] = [];
 afterEach(() => { cleanup.forEach((c) => c()); cleanup = []; });
 /** A scratch store whose user has a backfilled, empty fence (0005 step 0), unless `fence: false`. */
-async function scratch(opts: { fence?: boolean } = {}) {
+async function scratch(opts: { fence?: boolean; exportComplete?: boolean } = {}) {
   const s = scratchStore();
   cleanup.push(s.done);
   if (opts.fence !== false) await putFence(s.store);
+  if (opts.exportComplete !== false) await markExportComplete(s.store);
   return s.store;
 }
+const markExportComplete = (store: ObjectStore) =>
+  store.put(objectKey(acceptedCompleteKey(ROOT, TENANT.orgId)), enc.encode(JSON.stringify({ v: 1, kind: "buffered-accepted-complete", stages: 0, completedAtMs: 1 })));
 const putJournal = (store: ObjectStore, journal: unknown) => store.put(objectKey(journalKeyFor(ROOT, TENANT)), enc.encode(JSON.stringify(journal)));
 
 describe("buffered backlog drain (0005)", () => {
@@ -224,7 +239,7 @@ describe("buffered backlog drain (0005)", () => {
     const store = await scratch();
     await putFence(store, { deletions: [{ originId: ORIGIN, sessions: [["claude", "sess-2"]] }] });
     await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }]), group("claude", "sess-2", [{ id: "r2", rev: 1 }])]);
-    await store.put(objectKey(`${ROOT}/${TENANT.orgId}/buffered-batches/v1/ws=ws-a/m=srv_${"0".repeat(32)}/b=${"1".repeat(32)}-${"2".repeat(16)}-${"3".repeat(32)}.staged.ndjson.zst`), enc.encode("not zstd"));
+    await putStaged(store, `${ROOT}/${TENANT.orgId}/buffered-batches/v1/ws=ws-a/m=srv_${"0".repeat(32)}/b=${"1".repeat(32)}-${"2".repeat(16)}-${"3".repeat(32)}.staged.ndjson.zst`, enc.encode("not zstd"));
     const before = await allKeys(store);
     const summary = await run(store, { dryRun: true });
     expect(summary.mode).toBe("dry_run");
@@ -243,12 +258,12 @@ describe("buffered backlog drain (0005)", () => {
     const good = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
     const dir = good.slice(0, good.lastIndexOf("/"));
     // Garbage at a well-formed key.
-    await store.put(objectKey(`${dir}/b=${"1".repeat(32)}-${"2".repeat(16)}-${"3".repeat(32)}.staged.ndjson.zst`), enc.encode("garbage"));
+    await putStaged(store, `${dir}/b=${"1".repeat(32)}-${"2".repeat(16)}-${"3".repeat(32)}.staged.ndjson.zst`, enc.encode("garbage"));
     // A valid object copied to a key that does not name its bytes.
     const bytes = await readAll(await store.get(objectKey(good)));
-    await store.put(objectKey(`${dir}/b=${"4".repeat(32)}-${"5".repeat(16)}-${"6".repeat(32)}.staged.ndjson.zst`), bytes);
+    await putStaged(store, `${dir}/b=${"4".repeat(32)}-${"5".repeat(16)}-${"6".repeat(32)}.staged.ndjson.zst`, bytes);
     // A buffered-GC redaction barrier.
-    await store.put(objectKey(`${dir}/b=${"7".repeat(32)}-${"8".repeat(16)}-${"9".repeat(32)}.staged.ndjson.zst`), enc.encode(JSON.stringify({ v: 1, kind: "buffered-redaction" })));
+    await putStaged(store, `${dir}/b=${"7".repeat(32)}-${"8".repeat(16)}-${"9".repeat(32)}.staged.ndjson.zst`, enc.encode(JSON.stringify({ v: 1, kind: "buffered-redaction" })));
     // A stray key in the namespace.
     await store.put(objectKey(`${dir}/stray.json`), enc.encode("{}"));
     const summary = await run(store);
@@ -319,6 +334,50 @@ describe("buffered backlog drain (0005)", () => {
     await expect(run(store, { resetMarginMs: 59_999 })).rejects.toThrow("drain_reset_margin_invalid");
     expect(() => parseDrainArgs(["--dry-run", "--bucket", "my-bucket", "--reset-margin-seconds", "59"])).toThrow("--reset-margin-seconds");
     expect(parseDrainArgs(["--dry-run", "--bucket", "my-bucket", "--reset-margin-seconds", "600"]).resetMarginMs).toBe(600_000);
+  });
+
+  test("0005 step 0b: only acknowledged stages are written; the rest are reported, unread", async () => {
+    const store = await scratch();
+    const ok = await stage(store, [group("claude", "sess-ok", [{ id: "a", rev: 1 }])]);
+    const refused = await stage(store, [group("claude", "sess-refused", [{ id: "b", rev: 1 }])], { accepted: false });
+    const wrong = await stage(store, [group("claude", "sess-wrong", [{ id: "c", rev: 1 }])], { accepted: false });
+    await accept(store, wrong, "0".repeat(64)); // a sidecar naming other bytes
+    const reads: string[] = [];
+    const watched = new Proxy(store, {
+      get(target, prop) {
+        if (prop === "getObject") return (k: Parameters<ObjectStore["getObject"]>[0]) => { reads.push(String(k)); return target.getObject(k); };
+        const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    const summary = await run(watched);
+    expect(summary.objects).toMatchObject({ drained: 1, stage_unacknowledged: 1, accepted_mismatch: 1 });
+    expect([...(await canonical(store)).keys()]).toEqual(["sess-ok"]);
+    expect(reads).not.toContain(refused); // an unacknowledged stage is never even read
+    for (const k of [refused, wrong]) expect(await exists(store, k + DRAINED_SUFFIX)).toBe(false);
+    expect(await exists(store, ok + DRAINED_SUFFIX)).toBe(true);
+  });
+
+  test("0005 step 0b: an org whose accepted-stage export never completed writes nothing", async () => {
+    const store = await scratch({ exportComplete: false });
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    for (const dryRun of [true, false]) expect((await run(store, { dryRun })).objects.stage_export_missing).toBe(1);
+    expect(await exists(store, key + DRAINED_SUFFIX)).toBe(false);
+    await store.put(objectKey(acceptedCompleteKey(ROOT, TENANT.orgId)), enc.encode("{\"v\":1}")); // invalid: still missing
+    expect((await run(store)).objects.stage_export_missing).toBe(1);
+    await markExportComplete(store);
+    expect((await run(store)).objects.drained).toBe(1);
+  });
+
+  test("a GC replacement SQL acknowledged drains; its unacknowledged original is not a peer", async () => {
+    const store = await scratch();
+    const claim = randomUUID();
+    const original = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }, { id: "r2", rev: 1 }])], { batch: "same", claim, accepted: false });
+    await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { batch: "same", claim });
+    const summary = await run(store);
+    expect(summary.objects).toMatchObject({ drained: 1, stage_unacknowledged: 1, ambiguous_replacement: 0 });
+    expect((await canonical(store)).get("sess-1")).toEqual(["r1@1"]);
+    expect(await exists(store, original + DRAINED_SUFFIX)).toBe(false);
   });
 
   test("an interrupted GC replacement (two live objects for one claim) is never guessed", async () => {

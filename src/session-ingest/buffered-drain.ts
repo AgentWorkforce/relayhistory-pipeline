@@ -7,6 +7,10 @@
  *
  * Per staged object, in key order, with bounded concurrency:
  *
+ *   0. 0005 step 0b: write ONLY stages SQL acknowledged. Without the org's accepted-stage completion object
+ *      every stage of it is `stage_export_missing`; a stage without its `<staged key>.accepted.json` sidecar
+ *      is `stage_unacknowledged` (e.g. the consent gate refused it after the PUT, before the ACK); a sidecar
+ *      whose sha256 is not the object's is `accepted_mismatch`. None of them is read further or written.
  *   1. Skip it when its create-only `drained` marker (`<staged key>.drained.json`) exists.
  *   2. Read it (bounded), refuse a buffered-GC redaction barrier, check that the key names exactly this
  *      header and these bytes (org, workspace, machine, batch digest, claim token, sha256 of the stored
@@ -78,6 +82,33 @@ import {
 } from "./writer.ts";
 
 export const DRAINED_SUFFIX = ".drained.json";
+/**
+ * 0005 step 0b: the accepted-stage export (accepted-stage-export.ts) writes one create-only sidecar per stage
+ * whose receipt SQL acknowledged, and one completion object per org once that org's export is whole. The drain
+ * writes ONLY stages with a sidecar naming their exact bytes, and none of an org without a completion object.
+ */
+export const ACCEPTED_SUFFIX = ".accepted.json";
+export const acceptedCompleteKey = (keyRoot: string, orgId: string) => `${keyRoot}/.drain/accepted-stages/v1/${orgId}.complete.json`;
+export interface AcceptedMarker { v: 1; kind: "buffered-accepted"; stage_sha256: string }
+export interface AcceptedComplete { v: 1; kind: "buffered-accepted-complete"; stages: number; completedAtMs: number }
+export function parseAcceptedMarker(text: string): AcceptedMarker | null {
+  try {
+    const v = JSON.parse(text) as Record<string, unknown>;
+    return isObject(v) && v.v === 1 && v.kind === "buffered-accepted" && typeof v.stage_sha256 === "string" && HEX64.test(v.stage_sha256) && Object.keys(v).length === 3
+      ? (v as unknown as AcceptedMarker) : null;
+  } catch {
+    return null;
+  }
+}
+export function parseAcceptedComplete(text: string): AcceptedComplete | null {
+  try {
+    const v = JSON.parse(text) as Record<string, unknown>;
+    return isObject(v) && v.v === 1 && v.kind === "buffered-accepted-complete" && Number.isSafeInteger(v.stages) && (v.stages as number) >= 0 &&
+      Number.isSafeInteger(v.completedAtMs) && (v.completedAtMs as number) > 0 ? (v as unknown as AcceptedComplete) : null;
+  } catch {
+    return null;
+  }
+}
 /** Clock-skew margin around a user's last reset (see step 3): default and floor. */
 export const RESET_MARGIN_DEFAULT_MS = 5 * 60_000;
 export const RESET_MARGIN_MIN_MS = 60_000;
@@ -234,13 +265,16 @@ export type ObjectOutcome =
   | "index_merge_failed"
   | "fence_recheck_failed"
   | "fence_moved"
+  | "stage_unacknowledged"
+  | "stage_export_missing"
+  | "accepted_mismatch"
   | "marker_failed"
   | "internal_error";
 
 const OUTCOMES: ObjectOutcome[] = [
   "drained", "would_drain", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch",
   "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "index_unreadable", "write_failed",
-  "index_merge_failed", "fence_recheck_failed", "fence_moved", "marker_failed", "internal_error",
+  "index_merge_failed", "fence_recheck_failed", "fence_moved", "stage_unacknowledged", "stage_export_missing", "accepted_mismatch", "marker_failed", "internal_error",
 ];
 
 export interface DrainSummary {
@@ -356,6 +390,10 @@ interface BatchGroup {
   /** Staged keys sharing one `…/b=<batch32>-` prefix, in key order. */
   staged: string[];
   markers: Set<string>;
+  /** Staged keys with an accepted-stage sidecar (0005 step 0b). */
+  accepted: Set<string>;
+  /** Whether this org's accepted-stage export completed (its completion object exists and is valid). */
+  exportComplete: boolean;
   lastKey: string;
 }
 
@@ -363,7 +401,7 @@ interface BatchGroup {
  * Listed keys grouped by `…/m=…/b=<batch32>`. Every object of one batch digest (retries with other
  * claim tokens, a GC replacement, their markers) sorts contiguously, so the group is complete.
  */
-async function* batchGroups(store: ObjectStore, prefix: string, startAfter: string | undefined, summary: DrainSummary): AsyncGenerator<BatchGroup> {
+async function* batchGroups(store: ObjectStore, prefix: string, startAfter: string | undefined, summary: DrainSummary, exportComplete: boolean): AsyncGenerator<BatchGroup> {
   let current: (BatchGroup & { id: string }) | null = null;
   let cursor: string | undefined;
   do {
@@ -372,7 +410,8 @@ async function* batchGroups(store: ObjectStore, prefix: string, startAfter: stri
     for (const item of page.items) {
       const key = String(item.key);
       if (startAfter !== undefined && key <= startAfter) continue;
-      const staged = key.endsWith(DRAINED_SUFFIX) ? key.slice(0, -DRAINED_SUFFIX.length) : key;
+      const suffix = key.endsWith(DRAINED_SUFFIX) ? DRAINED_SUFFIX : key.endsWith(ACCEPTED_SUFFIX) ? ACCEPTED_SUFFIX : "";
+      const staged = suffix ? key.slice(0, -suffix.length) : key;
       const parts = parseStagedKey(staged);
       if (!parts) {
         summary.foreign_keys++;
@@ -383,10 +422,11 @@ async function* batchGroups(store: ObjectStore, prefix: string, startAfter: stri
         yield current;
         current = null;
       }
-      current ??= { id, staged: [], markers: new Set(), lastKey: key };
+      current ??= { id, staged: [], markers: new Set(), accepted: new Set(), exportComplete, lastKey: key };
       current.lastKey = key;
-      if (staged === key) current.staged.push(key);
-      else current.markers.add(staged);
+      if (!suffix) current.staged.push(key);
+      else if (suffix === DRAINED_SUFFIX) current.markers.add(staged);
+      else current.accepted.add(staged);
     }
   } while (cursor);
   if (current) yield current;
@@ -567,7 +607,15 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       const prefix = `${opts.keyRoot}/${org}/buffered-batches/v1`;
       // Every key under a prefix that sorts before start-after, and does not contain it, is before it.
       if (opts.startAfter !== undefined && `${prefix}/` < opts.startAfter && !opts.startAfter.startsWith(`${prefix}/`)) continue;
-      yield* batchGroups(opts.store, prefix, opts.startAfter, summary);
+      // 0005 step 0b: without this org's completed accepted-stage export, nothing of it is written.
+      let complete = false;
+      try {
+        const got = await readText(opts.store, acceptedCompleteKey(opts.keyRoot, org), 64 * 1024);
+        complete = got !== null && parseAcceptedComplete(got.text) !== null;
+      } catch {
+        complete = false;
+      }
+      yield* batchGroups(opts.store, prefix, opts.startAfter, summary, complete);
     }
   }
 
@@ -631,10 +679,12 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   return summary;
 
   async function drainGroup(group: BatchGroup) {
-    // Read everything not yet drained, then decide per claim token (GC replacement detection).
+    // Only stages SQL acknowledged (0005 step 0b) are candidates; nothing else is even read.
+    const candidate = (key: string) => !group.markers.has(key) && group.exportComplete && group.accepted.has(key);
+    // Read every candidate, then decide per claim token (GC replacement detection).
     const reads = new Map<string, Read>();
     for (const key of group.staged) {
-      if (group.markers.has(key)) continue;
+      if (!candidate(key)) continue;
       try {
         reads.set(key, await readStagedObject(store, key, parseStagedKey(key)!, opts.decompress));
       } catch {
@@ -647,6 +697,14 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
         summary.objects.already_drained++;
         continue;
       }
+      if (!group.exportComplete) {
+        summary.objects.stage_export_missing++;
+        continue;
+      }
+      if (!group.accepted.has(key)) {
+        summary.objects.stage_unacknowledged++;
+        continue;
+      }
       const read = reads.get(key)!;
       if (read.kind !== "live") {
         summary.objects[read.kind]++;
@@ -656,9 +714,22 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       // than one live (or drained, or unreadable just now) object for one claim means a GC swap was
       // interrupted: never guess.
       const claim32 = parseStagedKey(key)!.claim32;
-      const peers = group.staged.filter((k) => k !== key && parseStagedKey(k)!.claim32 === claim32 && (group.markers.has(k) || reads.get(k)?.kind === "live" || reads.get(k)?.kind === "internal_error"));
+      // Among ACCEPTED stages only: SQL names one current stage per batch, so a replaced original is not a peer.
+      const peers = group.staged.filter((k) => k !== key && group.accepted.has(k) && parseStagedKey(k)!.claim32 === claim32 && (group.markers.has(k) || reads.get(k)?.kind === "live" || reads.get(k)?.kind === "internal_error"));
       if (peers.length) {
         summary.objects.ambiguous_replacement++;
+        continue;
+      }
+      // The sidecar must name these exact bytes (the export copied SQL's stage_sha256).
+      try {
+        const got = await readText(store, key + ACCEPTED_SUFFIX, 64 * 1024);
+        const marker = got ? parseAcceptedMarker(got.text) : null;
+        if (!marker || marker.stage_sha256 !== read.decoded.sha256) {
+          summary.objects.accepted_mismatch++;
+          continue;
+        }
+      } catch {
+        summary.objects.internal_error++;
         continue;
       }
       try {
