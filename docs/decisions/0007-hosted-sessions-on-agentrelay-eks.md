@@ -179,6 +179,10 @@ Each phase lands in dev first, then goes to prod on his OK.
 - **Portability.** Self-host stays on the infra repo's EKS and GKE profiles. durable-actors has GCS and
   S3 storage providers. Azure would need an Azure Blob provider in durable-actors and in this repo's
   object store, and is not planned.
+- **Superseded in flight:** #574 (migration slot `060000`, a Postgres column for the long summary) is
+  dropped (Khaliq, 2026-11-13). Long summaries are read from the encrypted summary object next to the
+  session, which bob-costas already writes and the actors keep. The publication-frontier attester
+  (slot `061000`) is held, because 0005's S3 drain replaces the outbox path for the backlog.
 - **Superseded:** the AWS-only Lambda paths (#561's hosted runtime, the session-pipeline and read-API
   Lambdas) and the Cloudflare stack in `stacks/cloudflare`. They stay in the tree, unused, until their
   phase retires them.
