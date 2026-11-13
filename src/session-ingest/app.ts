@@ -912,10 +912,10 @@ export function createIngestApp(deps: IngestAppDeps) {
         const s3Input={...selection,control:{...control,kind:"selection" as const}};
         const result=await journal(async()=>{
           // SQL decides; S3 follows its verdict (s3FenceMirror). A disable is pending in S3 while SQL decides.
-          if(!input.enabled)await mirrorFence(identity.orgId,()=>mirror!.beginOrdered(s3Input));
+          const hold=input.enabled?undefined:await mirrorFence(identity.orgId,()=>mirror!.beginOrdered(s3Input));
           let r;
           try{r=orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({...s3Input,...(custody?{custody}:{})}),control);}
-          catch(error){if(!input.enabled&&definitelyNotApplied(error))await mirrorFence(identity.orgId,()=>mirror!.abortOrdered(s3Input));throw error;}
+          catch(error){if(!input.enabled&&definitelyNotApplied(error))await mirrorFence(identity.orgId,()=>mirror!.abortOrdered(s3Input,hold));throw error;}
           await mirrorFence(identity.orgId,()=>mirror!.finishOrdered(s3Input,r.control.outcome));
           return r;
         },(r)=>r.control.outcome);
@@ -970,10 +970,10 @@ export function createIngestApp(deps: IngestAppDeps) {
         const s3Input={tenant,requestId:input.request_id,control:{...control,kind:"reset" as const}};
         const result=await journal(async()=>{
           // SQL decides; S3 follows its verdict. The reset is pending in S3 (every claim refused) while SQL decides.
-          await mirrorFence(identity.orgId,()=>mirror!.beginOrdered(s3Input));
+          const hold=await mirrorFence(identity.orgId,()=>mirror!.beginOrdered(s3Input));
           let r;
           try{r=orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({...s3Input,...(custody?{custody}:{})}),control);}
-          catch(error){if(definitelyNotApplied(error))await mirrorFence(identity.orgId,()=>mirror!.abortOrdered(s3Input));throw error;}
+          catch(error){if(definitelyNotApplied(error))await mirrorFence(identity.orgId,()=>mirror!.abortOrdered(s3Input,hold));throw error;}
           await mirrorFence(identity.orgId,()=>mirror!.finishOrdered(s3Input,r.control.outcome));
           return r;
         },(r)=>r.control.outcome);

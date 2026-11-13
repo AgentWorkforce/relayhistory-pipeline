@@ -137,7 +137,7 @@ describe("ordered controls: SQL decides, S3 follows (never live in S3 where SQL 
     expect((await send()).status).toBe(503);
     // SQL applied it, the answer was lost: S3 still treats s1 as deleted (pending), never live.
     const f = JSON.parse(new TextDecoder().decode(await readAll((await s.store.getObject(objectKey(fenceKey))).body)));
-    expect(Object.values(f.pending)).toEqual([{ kind: "selection", originId: "origin-1", sessions: [["claude", "s1"]] }]);
+    expect(Object.values(f.pending)).toEqual([expect.objectContaining({ kind: "selection", originId: "origin-1", sessions: [["claude", "s1"]] })]);
     expect((await s3Ledger(s.store, ROOT).claim({ tenant: TENANT, originId: "origin-1", batchId: "b", batchDigest: "c".repeat(64), receiptId: `rhr_${"c".repeat(64)}`, sessions: [["claude", "s1"]], records: [] })).kind).toBe("replay_fast");
     expect((await send()).status).toBe(200); // the retry: SQL replays, the verdict lands
     expect(await s3Deleted(s.store)).toEqual(["s1"]);

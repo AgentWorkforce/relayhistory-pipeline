@@ -152,13 +152,17 @@ Migration `supabase/migrations/20261104022000_session_ingest_ledger.sql`. It nev
   - **Ordered controls (`identity.control`): SQL is the ordering authority, and S3 follows its verdict** (`ledger-s3.ts` `s3ControlMirror`). S3 never judges order itself: its view of the control head can lag SQL's, and it cannot check SQL's epoch or digest rules.
     - **A disable or reset is first pending in S3** (`beginOrdered`). Admission treats a pending disable's sessions as deleted, and refuses every claim (a retry) while a reset is pending. This keeps S3 fail closed while SQL decides.
     - **Then SQL applies or refuses it:**
-      - Applied or replay: the effect lands (`finishOrdered`).
-      - Stale: nothing lands.
-      - A definite refusal (a SQLSTATE: gap, epoch, digest): the pending entry is removed and nothing else changes (`abortOrdered`). A refused control therefore never wedges the legitimate one.
-      - An ambiguous failure: the entry stays pending (fail closed) until the retry's verdict.
+      - Applied, replay **or stale**: the effect lands (`finishOrdered`), under per-session order. SQL answers stale only when a same-digest receipt exists, so stale means "applied earlier, since superseded", never "not applied". A stale reset therefore begins the S3 reset if its request id is new.
+      - A definite refusal (a SQLSTATE: gap, epoch, digest) releases only **this request's** hold on the pending entry (`abortOrdered`). The entry goes when no hold is left. A duplicate request that got the control applied, then died before its finish, keeps the entry pending, so a refused duplicate can never release an applied control. A refused control never wedges the legitimate one either: its own entry carries its own digest.
+      - An ambiguous failure: the hold stays, so the entry stays pending (fail closed) until a retry's verdict.
     - **A re-enable** lands in S3 only after SQL applied or replayed it.
-    - **Finalisation keeps per-session order.** An effect lands only if the control is newer than the last one applied to that session, and an enable never lands under a newer ordered reset.
-    - The result: S3 is never live where SQL is deleted. S3 may stay deleted where SQL is live only while a control is pending or a write failed, until the retry.
+    - **Finalisation keeps per-session order.** An effect lands only if the control is newer than the last one applied to that session, and an enable never lands under a reset at or after it.
+      - Across an epoch rotation the order of two controls is unknown, so S3 fails closed: a disable lands and an enable does not.
+      - A disable that finishes after a newer reset still tombstones. That is the fail-closed direction, and it is accepted.
+    - The result: S3 is never live where SQL is deleted. S3 may be deleted where SQL is live while a control is pending, after a failed S3 write, or across an epoch rotation, until a later control or retry.
+    - **A pending entry nobody retries stays pending indefinitely.** There is no resolver yet. A pending reset refuses every claim of that user (`ledger_control_pending`, a retry). A pending disable keeps its sessions deleted, even after a later enable.
+      - Operator note: a user whose uploads keep answering `ledger_control_pending` has an ordered control whose verdict never reached S3. Re-send that control (the same epoch, version and digest): SQL replays it, and its verdict lands.
+  - **Deploy order before turning the flag on.** Every fence reader must run code that knows `pending`: the Worker, the hosted upload-admission Lambda, self-host and the rearm sweeper. The fence is `v: 2` while anything is pending, and readers from before `pending` accept only `v: 1`, so they refuse (fail closed, a retry) rather than ignore a pending disable or reset. Deploy the readers first, then turn the flag on.
   - **A reset only begins in S3** (one fence CAS, no listing), so it fits the subrequest budget however many sessions the user has. The next S3-ledger claim for the user finishes it. Until then nothing is forgotten (the fence's `resetsCompleted`).
 - **Acquisition owner (dormant):** an enrolled `(org, workspace, source)` admits only the grant-holding owner of each session, and the edge answers a refusal with a typed 409. Nothing is enrolled and the switch is off. See `docs/ingest-acquisition-owner.md`.
 
