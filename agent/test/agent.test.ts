@@ -42,7 +42,9 @@ test("names: the module's defaults for a new agent, except the platform prefix (
   const props = hostTemplate(agent, "X").Resources.AgentHost.Properties;
   assert.equal(props.InstanceType, "m7i.xlarge");
   assert.equal(props.BlockDeviceMappings[0]?.Ebs.VolumeSize, 100);
-  assert.match(String(hostTemplate(agent, "X").Parameters.AmiId.Default), /\/amd64\//);
+  // Pinned to the AMI the host runs; the unpinned pointer stays the amd64 one.
+  assert.equal(String(hostTemplate(agent, "X").Parameters.AmiId.Default), "ami-08cf17e3856f70154");
+  assert.match(agent.amiParam, /\/amd64\//);
 });
 
 test("network: the existing agent-hosts VPC ids relaycast-cloud's agent-host stack publishes", () => {
@@ -265,7 +267,7 @@ function runCli(args: string[], endpoint: string, outputFile: string): Promise<{
   });
 }
 
-test("first deploy through the CLI: refused without --allow-restart (exit 2), allowed with it, never pinned", async () => {
+test("first deploy through the CLI: refused without --allow-restart (exit 2), allowed with it, and reports the AMI pin", async () => {
   const fake = await fakeCloudFormation();
   const dir = mkdtempSync(join(tmpdir(), "sp-agent-decide-"));
   try {
@@ -273,12 +275,12 @@ test("first deploy through the CLI: refused without --allow-restart (exit 2), al
     assert.equal(automatic.code, 2, automatic.stderr);
     assert.match(automatic.stdout, /full deploy: stack layered-agent-sessions-pipeline-dev does not exist yet/);
     assert.match(automatic.stderr, /refusing: a full deploy/);
-    assert.equal(readFileSync(join(dir, "auto"), "utf8"), "decision=full\n");
+    assert.equal(readFileSync(join(dir, "auto"), "utf8"), "decision=full\nami_pin=ami-08cf17e3856f70154\n");
 
     const dispatched = await runCli(["--allow-restart", "--pin-file", join(dir, "pin.json")], fake.url, join(dir, "manual"));
     assert.equal(dispatched.code, 0, dispatched.stderr);
     // No pin_file output: the Alchemy deploy that follows builds the template.
-    assert.equal(readFileSync(join(dir, "manual"), "utf8"), "decision=full\n");
+    assert.equal(readFileSync(join(dir, "manual"), "utf8"), "decision=full\nami_pin=ami-08cf17e3856f70154\n");
     assert.ok(fake.requests.length >= 2 && fake.requests.every((r) => r.endsWith(" GetTemplate")), fake.requests.join(", "));
   } finally {
     await fake.close();
