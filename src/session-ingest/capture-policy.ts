@@ -15,8 +15,11 @@
  * Uploads (POST /v1/delivery/batches and /v1/turns/batches): Agent Relay
  * Desktop names the policy revision it applies in
  * X-Agent-Relay-Capture-Policy-Revision. When the policy sets any key, a
- * missing or older revision is a violation, and so is (under `sharing_mode:
+ * missing or older revision is a violation when the policy restricts uploads,
+ * and so is (under `sharing_mode:
  * new`) a session record whose first activity is before `sharing_mode_since`.
+ * An All-only policy (with an optional delete setting) does not require the
+ * header: its absence on an older client does not violate that upload policy.
  * RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS=report (default) logs it
  * (`capture_policy_upload_violation`) and accepts; `enforce` refuses: 409
  * `capture_policy_stale` (Desktop retries; its next policy read sends the
@@ -66,6 +69,11 @@ export type UploadViolation = "missing" | "stale" | "session_predates";
 export function uploadPolicyViolation(subject: CapturePolicySubject, header: string | undefined, batch: Pick<HistoryExportBatch, "records">): UploadViolation | null {
   const policy = subject.capturePolicy;
   if (!policy || Object.keys(policy.settings).length === 0) return null;
+  // All alone places no restriction on uploaded content. A revision header
+  // is not consent, and older clients do not send one. Delete policy is
+  // enforced separately on delete routes and must not stop ordinary uploads.
+  if (policy.settings.sharing_mode === "all" &&
+      Object.keys(policy.settings).every(key => key === "sharing_mode" || key === USER_RETROACTIVE_DELETE)) return null;
   const raw = (header ?? "").trim();
   // A revision is a non-negative integer; 0 is one (always older than a set policy's).
   if (!/^(?:0|[1-9][0-9]{0,9})$/.test(raw)) return "missing";

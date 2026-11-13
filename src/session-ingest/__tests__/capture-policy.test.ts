@@ -71,6 +71,19 @@ describe("uploadPolicyViolation", () => {
     expect(uploadPolicyViolation(subject({}), undefined, batch())).toBeNull();
   });
 
+  test("All-only policy accepts legacy headers while other upload restrictions still require a revision", () => {
+    for (const header of [undefined, "", "0", "old-client"]) {
+      expect(uploadPolicyViolation(subject({ sharing_mode: "all" }), header, batch(session(0)))).toBeNull();
+      expect(uploadPolicyViolation(subject({ sharing_mode: "all", user_retroactive_delete: false }), header, batch(session(0)))).toBeNull();
+    }
+    for (const restriction of [{ oops_window_seconds: 60 }, { upload_control: "nobody" }, { future_upload_restriction: true }]) {
+      expect(uploadPolicyViolation(subject({ sharing_mode: "all", ...restriction }), undefined, batch())).toBe("missing");
+      expect(uploadPolicyViolation(subject({ sharing_mode: "all", ...restriction }), "3", batch())).toBe("stale");
+    }
+    expect(uploadPolicyViolation(subject({ sharing_mode: "new" }), undefined, batch(session(SINCE + 1)))).toBe("missing");
+    expect(uploadPolicyViolation(subject({ sharing_mode: "selected" }), undefined, batch())).toBe("missing");
+  });
+
   test("a set policy needs the current revision (or newer); owners are not exempt", () => {
     const s = subject({ upload_control: "operator" });
     expect(uploadPolicyViolation(s, undefined, batch())).toBe("missing");
