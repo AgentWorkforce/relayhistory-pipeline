@@ -32,7 +32,6 @@ const u = uploadInboxNames(stage, accountId, region);
 // The consumer's role is the one Alchemy's Lambda provider owns (a generated name): synthetic here.
 const consumerRoleArn = `arn:aws:iam::${accountId}:role/synthetic-upload-admission-role`;
 const roles = { uploadRoleArn: u.uploadRoleArn, consumerRoleArn };
-const cf = { cloudflareAccountId: "0123456789abcdef0123456789abcdef", admissionQueueId: "fedcba9876543210fedcba9876543210" };
 
 const inboxKey = `${bucketArn}/96bulls/.upload-inbox/org-a/v1/ws=w1/u=abc/0001.json.zst`;
 const sessionKey = `${bucketArn}/96bulls/org-a/v1/ws=w1/m=m1/h=claude/d=2026/11/11/s=s1/manifest.json`;
@@ -137,7 +136,7 @@ describe("flag off renders the stack byte-identical", () => {
     mock.module('@alchemy.run/aws',()=>({IAM:ns('User','Role','Policy'),KMS:ns('Key','Alias'),S3:ns('Bucket'),CloudTrail:ns('Trail'),Budgets:ns('Budget'),Lambda:ns('Function','EventSourceMapping','Permission','Url','FunctionUrl'),SQS:ns('Queue'),SecretsManager:ns('Secret'),EventBridge:ns('Rule'),CloudWatch:ns('Alarm'),Logs:ns('LogGroup')}));
     const {transcriptStoreStage}=await import(${JSON.stringify(modulePath)});
     const gc='arn:aws:iam::'+acct+':role/synthetic-buffered-gc';
-    const ua={direct:'allowlist',allowlist:['ws:w1','org:org-a'],cloudflareAccountId:'${cf.cloudflareAccountId}',admissionQueueId:'${cf.admissionQueueId}'};
+    const ua={direct:'allowlist',allowlist:['ws:w1','org:org-a']};
     const base={stage:'${stage}',accountId:acct,region,budgetUsd:1,budgetEmail:'test@example.invalid',tags:(c)=>({component:c})};
     const scenarios={
       store:{bufferedGcRoleArn:gc},
@@ -209,8 +208,9 @@ describe("flag off renders the stack byte-identical", () => {
       expect(UPLOAD_ADMISSION_RESERVED_CONCURRENCY).toBe(4);
       expect(fn.env).toEqual({
         DEPLOYMENT: stage, HISTORY_UPLOAD_DIRECT: "allowlist", HISTORY_UPLOAD_DIRECT_ALLOWLIST: "ws:w1,org:org-a", HISTORY_UPLOAD_INBOX_SSE: "aws:kms",
-        UPLOAD_ADMISSION_BUCKET: bucketName, UPLOAD_ADMISSION_SECRET_ID: u.secret, UPLOAD_ADMISSION_CF_ACCOUNT_ID: cf.cloudflareAccountId, UPLOAD_ADMISSION_CF_QUEUE_ID: cf.admissionQueueId,
-        INGEST_KEY_ROOT: "96bulls", INGEST_ACCEPTANCE_MODE: "buffered", NODE_OPTIONS: "--enable-source-maps",
+        UPLOAD_ADMISSION_BUCKET: bucketName, UPLOAD_ADMISSION_SECRET_ID: u.secret,
+        // Decision 0005: the consumer admits itself with the S3 ledger, and refuses to start with anything else.
+        INGEST_KEY_ROOT: "96bulls", INGEST_LEDGER: "s3", NODE_OPTIONS: "--enable-source-maps",
       });
       // No secret value anywhere in the rendered stack: only the container's name.
       expect(JSON.stringify(on)).not.toMatch(/upload_witness_key|cloudflare_queue_token|UPLOAD_WITNESS_KEY/);
@@ -450,14 +450,15 @@ describe("upload-admission consumer (bucket grants on its function role)", () =>
     const refuse = (why: string): never => { throw new Error(why); };
     expect(() => assertUploadAdmissionInputs(undefined, false, refuse)).not.toThrow();
     expect(() => assertUploadAdmissionInputs(undefined, true, refuse)).toThrow(/uploadAdmission is required/);
-    for (const direct of ["off", "on"]) expect(() => assertUploadAdmissionInputs({ direct, ...cf }, true, refuse)).not.toThrow();
-    expect(() => assertUploadAdmissionInputs({ direct: "allowlist", allowlist: ["ws:w1"], ...cf }, true, refuse)).not.toThrow();
+    for (const direct of ["off", "on"]) expect(() => assertUploadAdmissionInputs({ direct }, true, refuse)).not.toThrow();
+    expect(() => assertUploadAdmissionInputs({ direct: "allowlist", allowlist: ["ws:w1"] }, true, refuse)).not.toThrow();
     for (const bad of [
-      { direct: "allowlist", ...cf }, { direct: "allowlist", allowlist: [], ...cf }, { direct: "allowlist", allowlist: ["w1"], ...cf },
-      { direct: "allowlist", allowlist: ["ws:.x"], ...cf }, { direct: "allowlist", allowlist: ["ws:a", "ws:a"], ...cf },
-      { direct: "on", allowlist: ["ws:w1"], ...cf }, { direct: "ON", ...cf }, { ...cf },
-      { direct: "on", ...cf, cloudflareAccountId: "x" }, { direct: "on", ...cf, admissionQueueId: "96bulls-session-ingest-admission" },
-      { direct: "on", ...cf, witnessKey: "x" }, null, [],
+      { direct: "allowlist" }, { direct: "allowlist", allowlist: [] }, { direct: "allowlist", allowlist: ["w1"] },
+      { direct: "allowlist", allowlist: ["ws:.x"] }, { direct: "allowlist", allowlist: ["ws:a", "ws:a"] },
+      { direct: "on", allowlist: ["ws:w1"] }, { direct: "ON" }, {},
+      // Decision 0005 removed the Cloudflare queue hand-off: its old inputs are unknown settings now.
+      { direct: "on", cloudflareAccountId: "0123456789abcdef0123456789abcdef" }, { direct: "on", admissionQueueId: "fedcba9876543210fedcba9876543210" },
+      { direct: "on", witnessKey: "x" }, null, [],
     ]) expect(() => assertUploadAdmissionInputs(bad, false, refuse)).toThrow(/uploadAdmission/);
   });
 

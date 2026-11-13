@@ -267,6 +267,7 @@ describe('production constructors install the routed sealer', () => {
   const root = new URL('../../../', import.meta.url);
   const WIRED: [string, RegExp][] = [
     ['src/session-ingest/selfhost-server.ts', /\.\.\.routedRawChunkSealerDeps\(\)/],
+    ['src/session-ingest/upload-admission-hosted.ts', /\.\.\.routedRawChunkSealerDeps\(\)/],
     ['src/alleyoop/ingest.ts', /\.\.\.routedRawChunkSealerDeps\(\)/],
     ['src/session-ingest/publication-runtime.ts', /\.\.\.routedRawChunkSealerDeps\(\)/],
     ['src/session-ingest/publication-portable.ts', /\.\.\.routedRawChunkSealerDeps\(\)/],
@@ -296,6 +297,9 @@ describe('wiring inventory is complete (source scan)', () => {
   const WIRED_SITES = [
     ['DeliverDeps', 'src/session-ingest/selfhost-server.ts', 1],
     ['write/export target', 'src/session-ingest/selfhost-server.ts', 1],
+    // Decision 0005: the hosted upload-admission Lambda admits (and so seals) itself, inline, TS-only by config.
+    ['DeliverDeps', 'src/session-ingest/upload-admission-hosted.ts', 1],
+    ['write/export target', 'src/session-ingest/upload-admission-hosted.ts', 1],
     ['PipelineRouteDeps', 'src/alleyoop/ingest.ts', 1],
     ['PublicationJobDeps', 'src/session-ingest/publication-runtime.ts', 1],
     ['PublicationJobDeps', 'src/session-ingest/publication-portable.ts', 1],
@@ -322,9 +326,6 @@ describe('wiring inventory is complete (source scan)', () => {
   // Matches the target shape but never seals a raw chunk.
   const NOT_SEAL_SITES = [
     ['write/export target', 'src/session-ingest/app.ts', 1], // enqueueAdmission: inbox object only
-    // Hosted upload admission: promoteUpload -> prepareForAdmission + enqueueAdmission (inbox and status
-    // objects only); the ingest Worker's admission consumer seals and writes.
-    ['write/export target', 'src/session-ingest/upload-admission-hosted.ts', 1],
   ] as const;
 
   function sources(): string[] {

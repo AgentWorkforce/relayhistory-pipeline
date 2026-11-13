@@ -437,7 +437,7 @@ Provenance checks:
   and non-sensitive assignments stay byte-identical. alpha.6 returned those three inputs unchanged.
 - `scripts/scrub-bindgen-receipt.ts` writes a receipt (pin digests, package version, crate manifest,
   toolchain, the pin's `release` block, timestamp, git HEAD) and exits non-zero on any mismatch. CI
-  runs it in the `unit-tests` job WITHOUT `--tarball` (no network in CI) and uploads
+  runs it in the `unit-tests-aux` job (part of the `unit-tests` aggregate) WITHOUT `--tarball` (no network in CI) and uploads
   `scrub-bindgen-receipt.json` as an artifact; that receipt's `release` has `verified: false`,
   `reason: "tarball not supplied"` by design. It still checks that `release.sha256sums["artifact.json"]`
   equals the vendored `artifact.json`.

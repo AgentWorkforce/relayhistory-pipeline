@@ -1,18 +1,21 @@
 /**
- * Upload-admission Lambda entry (relay-upload-inbox-v1, decision 0004): an SQS batch of S3
+ * Upload-admission Lambda entry (relay-upload-inbox-v1, decisions 0004 and 0005): an SQS batch of S3
  * ObjectCreated notifications for `<keyRoot>/.upload-inbox/`, answered with `batchItemFailures`
  * (ReportBatchItemFailures). Default off: with HISTORY_UPLOAD_DIRECT off every record is reported as a
  * failure without reading storage, so a mis-armed queue only redrives into its DLQ.
  *
  * Per record: a malformed SQS body or S3 notification, a key that is not this key root's upload key, and
  * every `retry` from promoteUpload are failures (the queue re-drives them; maxReceiveCount routes them to the
- * DLQ). An `ack` (handed off, refused with a recorded §6 code, already promoted, gone) is a success. An
+ * DLQ). An `ack` (admitted or refused by the inline admission, refused with a recorded §6 code, already
+ * promoted, gone) is a success. A retry's log label carries the admission's own code when it has one
+ * (`admission_enqueue_failed:admission_<code>`). An
  * s3:TestEvent body acks. A record without a messageId is reported with an empty itemIdentifier, which
  * Lambda treats as a failure of the whole batch (never a silent ack). Logs carry codes and counts only, never a key, body, witness or tenant id.
  *
  * Like buffered-gc-lambda.ts, the handler never accepts factories or credentials from its invocation
- * payload. The hosted runtime (S3 store, Worker-parity budget deps, the admission-queue send, the witness key
- * from Secrets Manager) is built by `UploadAdmissionRuntimeFactory`; the deployed `handler` uses the hosted
+ * payload. The hosted runtime (S3 store, the S3 upload ledger, the in-invocation admission, the witness key
+ * from Secrets Manager; it refuses to build unless INGEST_LEDGER=s3) is built by
+ * `UploadAdmissionRuntimeFactory`; the deployed `handler` uses the hosted
  * factory (upload-admission-hosted.ts), imported only once the flag is on. stacks/aws owns the function,
  * queue, mapping, notification and IAM. A factory that returns `witnessKey` overrides UPLOAD_WITNESS_KEY
  * from the environment (hosted never puts the key in env or state).
@@ -76,7 +79,9 @@ export function createUploadAdmissionHandler(runtime: UploadAdmissionRuntimeFact
       if (keys === null) counts.malformed_record = (counts.malformed_record ?? 0) + 1;
       for (const key of failed ? [] : keys!) {
         const result: PromoteResult = await promoteUpload(key, promote).catch((error) => ({ action: "retry", code: "promote_failed", error }) as const);
-        const label = result.action === "ack" ? (result.code ?? result.outcome) : result.code;
+        const cause = result.action === "retry" ? (result.error as { code?: unknown } | undefined)?.code : undefined;
+        const label = result.action === "ack" ? (result.code ?? result.outcome)
+          : typeof cause === "string" && /^[A-Za-z0-9_]{1,64}$/.test(cause) ? `${result.code}:${cause}` : result.code;
         counts[label] = (counts[label] ?? 0) + 1;
         if (result.action !== "ack") failed = true;
       }
