@@ -182,6 +182,12 @@ schema drift lists.
   legacy entry is present in the new layout at an equal or higher revision (or is one the fence has
   forgotten), or the listing found no legacy shard. Any org with a marker from before this change ran
   its backfill into the old layout, so it needs the reshard and verify too, not only agent-relay-dev.
+  **Deploy precondition.** This requirement has no off switch: the moment a deployment runs this code,
+  every org whose marker lacks `revisionLayout` stops admitting and draining (503 retry / skipped) until
+  its reshard, `--verify` and marker rewrite are done. Today only agent-relay-dev has a marker (org
+  22409be8 dev test org); prod has none. So on dev: deploy, then reshard `--execute`, `--verify`, and
+  rewrite the marker with the field, with dev uploads retrying in between. For any later org, write its
+  first marker with the field (a fresh org has no legacy shards, so `--verify` passes on an empty listing).
 - **Index and manifest disagree after a crash.** A crash between the canonical write and the index
   merge leaves the batch `pending`. The retry resumes, rewrites idempotently under manifest CAS, and
   then merges. The index can lag the manifest, but it never leads it.
