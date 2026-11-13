@@ -54,6 +54,7 @@ import { layoutComponent } from "../shared/layout-component.ts";
 import { journalKey } from "./async-admission.ts";
 import type { LedgerTenant } from "./ledger.ts";
 import { fitLine } from "./oversize.ts";
+import { routedRawChunkSealerDeps } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { BUFFER_STAGE_MAX_BYTES, decodeStaged, type StagedHeader } from "./staging.ts";
 import {
   IngestWriteError,
@@ -544,7 +545,6 @@ export interface DrainOptions {
   onCheckpoint?: (key: string) => void | Promise<void>;
   /** Called after each batch group with the running summary (counts only). */
   onProgress?: (summary: DrainSummary) => void;
-  rawChunkSealer?: WriteTarget["rawChunkSealer"];
   now?: () => Date;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
@@ -564,7 +564,8 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   const ledger = opts.ledger ?? s3DrainLedger(store, opts.keyRoot, { ...(opts.sleep ? { sleep: opts.sleep } : {}), ...(opts.random ? { random: opts.random } : {}) });
   const target: WriteTarget = {
     store, keyRoot: opts.keyRoot,
-    ...(opts.rawChunkSealer ? { rawChunkSealer: opts.rawChunkSealer } : {}),
+    // SCRUB_ENGINE routing, as every production write constructor (scrub-cutover-reachability.test.ts).
+    ...routedRawChunkSealerDeps(),
     ...(opts.now ? { now: opts.now } : {}),
     ...(opts.sleep ? { sleep: opts.sleep } : {}),
     ...(opts.random ? { random: opts.random } : {}),

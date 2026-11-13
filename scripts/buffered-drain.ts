@@ -25,7 +25,6 @@ import { zstdDecompressSync } from "node:zlib";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
 import { signRequest, type AwsCredentials } from "../packages/object-store/src/sigv4.ts";
 import { xmlElements, xmlText } from "../packages/object-store/src/xml.ts";
-import { routedRawChunkSealerDeps } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { BUFFER_STAGE_MAX_BYTES } from "../src/session-ingest/staging.ts";
 import { MAX_DRAIN_CONCURRENCY, drainBufferedBatches, parseStagedKey, type DrainSummary } from "../src/session-ingest/buffered-drain.ts";
 
@@ -170,7 +169,6 @@ if (import.meta.main) {
         lastProgress = Date.now();
         process.stderr.write(progressLine(s) + "\n");
       },
-      ...routedRawChunkSealerDeps(),
     });
     process.stdout.write(JSON.stringify(summary) + "\n");
   } catch (error) {
