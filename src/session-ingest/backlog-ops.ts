@@ -4,9 +4,9 @@
  * export (scripts/accepted-stage-export.ts) and the S3 drain (scripts/buffered-drain.ts); see
  * docs/decisions/0005-s3-native-upload-ledger.md "The buffered backlog" and docs/backlog-ops-workflow.md.
  *
- * Six modes, a dry and an execute of each tool. Every execute is dormant (BACKLOG_OPS_EXECUTE_ENABLED, flipped only
- * by a reviewed commit) and bound by a typed confirmation to earlier successful runs of this workflow at the same
- * commit:
+ * Six modes, a dry and an execute of each tool. Executes are switched by BACKLOG_OPS_EXECUTE_ENABLED (changed only
+ * by a reviewed commit; dormant while false) and bound by a typed confirmation to earlier successful runs of this
+ * workflow at the same commit:
  *   backfill-execute  DRY <backfill-dry run>
  *   export-execute    DRY <export-dry run> BACKFILL <backfill-execute run>
  *   drain-execute     DRY <drain-dry run>  BACKFILL <backfill-execute run> EXPORT <export-execute run>
@@ -21,7 +21,7 @@
  * Receipts are counts only: every leaf a number, a boolean or a short lowercase code; any other string (an id, a
  * key, a URL) refuses the receipt. Errors carry fixed codes only.
  */
-/** Execute modes stay refused until a reviewed commit flips this. Dry modes are always allowed. */
+/** Execute modes are refused while this is false; only a reviewed commit changes it. Dry modes are always allowed. */
 export const BACKLOG_OPS_EXECUTE_ENABLED: boolean = true;
 
 export const BACKLOG_OPS_WORKFLOW = ".github/workflows/backlog-ops.yml";

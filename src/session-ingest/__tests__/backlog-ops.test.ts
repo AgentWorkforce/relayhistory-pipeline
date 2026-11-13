@@ -72,7 +72,7 @@ const dispatchEnv = (mode: BacklogOpsMode, extra: Record<string, string> = {}) =
 
 // ---- dispatch ----
 
-test("six modes; executes are enabled, and refuse before anything else while disabled", () => {
+test("six modes; executes are enabled, and refuse as dormant (after the input shape check) while disabled", () => {
   expect([...BACKLOG_OPS_MODES]).toEqual(["backfill-dry", "backfill-execute", "export-dry", "export-execute", "drain-dry", "drain-execute"]);
   expect(BACKLOG_OPS_EXECUTE_ENABLED).toBe(true);
   for (const mode of BACKLOG_OPS_MODES) {

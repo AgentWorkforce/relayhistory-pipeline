@@ -36,6 +36,10 @@ Run them in this order, all at the same `main` commit:
 7. `export-execute` again
 8. `drain-execute`
 
+Keep `main` frozen for the whole chain. The gate binds every run to the exact live main head, so a commit landing
+mid-chain strands the earlier runs, and dry runs made before the switch commit lands cannot be bound: redo them at
+the landed head.
+
 The drain needs a backfill rerun immediately before it, because a control made after a backfill is not in the
 fence. The gate requires the drain's bound backfill to be under 3 hours old and its export to have been created
 after that backfill.
@@ -108,8 +112,9 @@ id, a key or a URL, refuses the receipt. They are kept for 30 days as the `backl
 ## IAM
 
 The provider, both roles, the two key statements and the five variables on `session-schema-production` were applied
-by hand with Khaliq's OK on 2026-11-13 at 17:49Z. **The write role's trust and the `session-backlog-execute`
-environment are not done yet** (see "Still to apply" below). The two key statements are reverted by the next
+by hand with Khaliq's OK on 2026-11-13 at 17:49Z. The write role's trust and the `session-backlog-execute`
+environment followed the same day (see "Still to apply" below; the trust was read back narrowed to the
+`session-backlog-execute` subject at 22:20Z). The two key statements are reverted by the next
 `aws-sessions-prod` stack deploy until the backlog-ops key phase (`transcriptStore.backlogOpsRoles`) lands and is
 set in the stage inputs; until then, re-add them after any stack deploy.
 
@@ -139,16 +144,17 @@ and the srv-writer and writer policies are prefix-scoped. So the workflow needs,
 
 ### Still to apply (before the first execute)
 
-1. Create the GitHub environment `session-backlog-execute` with deployments from `main` only (one branch policy,
+1. (Done 2026-11-13.) Create the GitHub environment `session-backlog-execute` with deployments from `main` only (one branch policy,
    `main`, type branch), as on `session-schema-production`. The gate refuses an environment without that branch
    policy. Required reviewers are optional: with the pinned dispatcher (`trustedDispatcher`), the gate accepts an
    environment with only the branch policy and no approval, exactly as on `session-schema-production`. The real
    control is the pinned dispatcher identity plus the write role's IAM trust in this environment's subject.
    (Created 2026-11-13 with the `main` branch policy, the secret and the five variables; the write role's trust was
    narrowed to this subject the same day.)
-2. Set on it the environment secret `SUPABASE_MIGRATION_OWNER_URL` (the same value as on `session-schema-production`;
+2. (Done 2026-11-13.) Set on it the environment secret `SUPABASE_MIGRATION_OWNER_URL` (the same value as on `session-schema-production`;
    backfill-execute and export-execute need it) and the same five `BACKLOG_OPS_*` variables.
-3. Change the write role's trust to the `session-backlog-execute` subject above (it currently trusts the
+3. (Done 2026-11-13, read back 22:20Z.) Change the write role's trust to the `session-backlog-execute` subject above (it currently trusts the
    `session-schema-production` subject, like the read role).
 
-Dry runs need none of this and can run now.
+Dry runs never needed any of this. Note that `session-backlog-execute` has no required reviewers: the human gates on an
+execute are the pinned dispatcher and the typed confirmation.
