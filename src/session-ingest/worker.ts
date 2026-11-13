@@ -94,7 +94,7 @@ import { sessionEraseConfig, sessionEraseEnabled, SESSION_ERASE_CONFIG_INVALID, 
 import type { DeliverDeps } from "./deliver.ts";
 import type { AnalyticsPort } from "../shared/analytics.ts";
 import { WORKER_LIMITS } from "../shared/analytics-export.ts";
-import { ingestLedgerMode } from "./ledger-s3.ts";
+import { ingestLedgerMode, s3Ledger } from "./ledger-s3.ts";
 import { AnalyticsConfigError, analyticsConfig, analyticsCounterFields, createAnalyticsSink, type AnalyticsConfig } from "../shared/analytics-config.ts";
 
 interface QueueLike<T> {
@@ -117,6 +117,8 @@ export interface IngestWorkerEnv {
   INGEST_UPLOAD_CONSENT?: string;
   /** INGEST_LEDGER: sql (default) only. s3 (decision 0005) is served by the upload-admission Lambda, never here. */
   INGEST_LEDGER?: string;
+  /** INGEST_S3_FENCE_MIRROR: off (default) | on. on: selection / reset also write the S3 upload fence (app.ts s3FenceMirror). */
+  INGEST_S3_FENCE_MIRROR?: string;
   /** off (default) | allowlist | on (upload-admission.ts): the ?uploadKey= admission status only. */
   HISTORY_UPLOAD_DIRECT?: string;
   /** HISTORY_UPLOAD_DIRECT=allowlist: comma-separated org:<id> / ws:<id>. */
@@ -241,9 +243,19 @@ export interface IngestSettings {
   sessionErase?: SessionEraseConfig;
   /** INGEST_UPLOAD_CONSENT report|hold-only|enforce. Absent (the default): off. An invalid value refuses startup. */
   uploadConsent?: Exclude<UploadConsentEnforcement, "off">;
+  /** INGEST_S3_FENCE_MIRROR=on (decision 0005 "Controls"). Absent (the default): no S3 fence write. */
+  s3FenceMirror?: true;
 }
 
 /** The settings, or null while any required one is missing (every request is then 503 not_configured). */
+/** INGEST_S3_FENCE_MIRROR: unset, "" or "off" is off; "on" is on; anything else throws (a privacy control is never silently off). */
+export function s3FenceMirrorFlag(raw: string | undefined): boolean {
+  const v = (raw ?? "").trim();
+  if (v === "" || v === "off") return false;
+  if (v === "on") return true;
+  throw new Error("session ingest: INGEST_S3_FENCE_MIRROR must be off or on");
+}
+
 export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettings | null> {
   // Before the not-configured checks, so a Neon edge under the profile is a loud refusal, never a quiet 503.
   assertNoNeonEdge(neonExitProfile(env as Record<string, unknown>), "the session ingest", {
@@ -279,6 +291,8 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   const syncFrozenReceipt = syncAdmissionFrozenReceiptMode(env.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT);
   // A privacy control: an invalid value is a loud configuration error (every request 503), never off.
   const uploadConsent = uploadConsentEnforcement(env.INGEST_UPLOAD_CONSENT);
+  // A privacy control too: an invalid value is a loud configuration error, never off.
+  const fenceMirror = s3FenceMirrorFlag(env.INGEST_S3_FENCE_MIRROR);
   // Default off; the secrets are read and validated only when the flag is exactly "1". Isolated: the
   // secrets are runtime-mutable Secrets Store values, so an invalid flag or secret must never fail delivery
   // or the queue consumer. The erase route alone fails closed (503 unavailable); the log carries a code only.
@@ -331,6 +345,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(sessionErase ? { sessionErase } : {}),
     ...(uploadDirect.mode !== "off" ? { uploadDirect } : {}),
     ...(uploadConsent !== "off" ? { uploadConsent } : {}),
+    ...(fenceMirror ? { s3FenceMirror: true as const } : {}),
   };
 }
 
@@ -462,6 +477,8 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: R
     ...(settings.sessionErase ? { sessionErase: settings.sessionErase } : {}),
     ...(settings.uploadDirect ? { uploadDirect: settings.uploadDirect } : {}),
     ...(settings.uploadConsent ? { uploadConsent: { enforcement: settings.uploadConsent, store: sqlUploadConsentStore(run) } } : {}),
+    // Only the fence methods are used: the S3 ledger never admits on the Worker (INGEST_LEDGER=s3 refuses here).
+    ...(settings.s3FenceMirror ? { s3FenceMirror: s3Ledger(target.store, target.keyRoot, { acceptanceMode: "canonical" }) } : {}),
   });
 }
 
