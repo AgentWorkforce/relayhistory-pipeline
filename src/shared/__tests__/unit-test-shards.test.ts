@@ -9,17 +9,16 @@ import {
   loadWeights,
   planShards,
   TEST_FILE,
+  weightOf,
 } from "../../../scripts/ci/unit-test-shards.ts";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const weights = loadWeights(join(repo, "scripts/ci/unit-test-weights.json"));
 const files = discoverTestFiles(repo);
-const HEAVY = [
-  "src/hoopdb/__tests__/migration-profile.test.ts",
-  "src/hoopdb/__tests__/session-directory-short-summary.test.ts",
-  "src/hoopdb/__tests__/session-large-read-routing.test.ts",
-  "src/session-pipeline/__tests__/consumer-service.test.ts",
-];
+// The four heaviest files, ordered as planShards orders them; longest-first places each on its own shard.
+const HEAVY = [...files]
+  .sort((a, b) => weightOf(b, weights) - weightOf(a, weights) || (a < b ? -1 : a > b ? 1 : 0))
+  .slice(0, 4);
 
 describe("unit-test shard planner", () => {
   test("discovers the repository's test files, sorted, including this one", () => {
@@ -73,7 +72,7 @@ describe("unit-test shard planner", () => {
     const homes = HEAVY.map((file) => shards.findIndex((s) => s.files.includes(file)));
     expect(new Set(homes).size).toBe(HEAVY.length);
     const seconds = shards.map((s) => s.seconds);
-    expect(Math.max(...seconds) - Math.min(...seconds)).toBeLessThan(weights.files[HEAVY[1]]);
+    expect(Math.max(...seconds) - Math.min(...seconds)).toBeLessThan(weightOf(HEAVY[1], weights));
   });
 
   test("checkPlan reports missing, duplicated and unknown files", () => {

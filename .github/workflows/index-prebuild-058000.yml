@@ -1,0 +1,163 @@
+name: index prebuild 058000
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('index prebuild 058000 {0} {1}', inputs.mode, inputs.sha) || format('index prebuild 058000 proof {0}', github.sha) }}
+
+# Guarded CREATE INDEX CONCURRENTLY prebuild of the sixteen indexes of migration 20261105058000, so the schema
+# release adopts them on populated tables instead of refusing a blocking build (src/hoopdb/index-prebuild-058000.ts;
+# docs/packets/operator-user-erase-index-packet.md "Guarded workflow"). The names, definitions and order are
+# ADOPTABLE_INDEXES; the only DDL is each declared definition with CONCURRENTLY, one at a time. This workflow never
+# applies 058000, never runs a blocking build and never sets the blocking-build opt-in. While INDEX_PREBUILD_ENABLED
+# is false, prebuild refuses before any credential is read; census and readback (READ ONLY) are always allowed.
+# Push and pull_request run only the synthetic PGlite tests (no secrets, no environment).
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [census, prebuild, readback]
+        default: census
+        required: true
+      sha:
+        description: Exact current main commit (40 lowercase hex)
+        type: string
+        required: true
+      census_run:
+        description: Prebuild only - the successful census run id of this workflow at the same sha (under 24h old); empty otherwise
+        type: string
+        default: ""
+      confirmation:
+        description: 'Prebuild: PREBUILD-058000 <sha> GENERATION <g> TAIL <ledgerTail> LEDGER <ledgerPrefixDigest> DESCRIPTOR <d> CENSUS <census_run> INDEXES <required, comma-joined>, from the census artifact. Census and readback: empty'
+        type: string
+        default: ""
+  pull_request:
+    paths:
+      - .github/workflows/index-prebuild-058000.yml
+      - scripts/index-prebuild-058000*.ts
+      - src/hoopdb/index-prebuild-058000.ts
+      - src/hoopdb/migration-sentinels.ts
+      - src/hoopdb/__tests__/index-prebuild-058000*
+      - supabase/migrations/**
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/index-prebuild-058000.yml
+      - scripts/index-prebuild-058000*.ts
+      - src/hoopdb/index-prebuild-058000.ts
+      - src/hoopdb/migration-sentinels.ts
+      - src/hoopdb/__tests__/index-prebuild-058000*
+      - supabase/migrations/**
+
+permissions:
+  contents: read
+  actions: read
+  deployments: read
+
+# Dispatches serialize with the guarded schema release and every other guarded operator on the same database.
+# Proof runs get their own per-sha group so a push never queues behind (or cancels) a pending dispatch.
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && 'guarded-session-schema-production' || format('index-prebuild-058000-proof-{0}', github.sha) }}
+  cancel-in-progress: false
+
+env:
+  PREBUILD_MODE: ${{ inputs.mode }}
+  PREBUILD_SHA: ${{ inputs.sha }}
+  PREBUILD_CENSUS_RUN: ${{ inputs.census_run }}
+  PREBUILD_CONFIRMATION: ${{ inputs.confirmation }}
+
+jobs:
+  proof:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without database credentials
+        run: bun install --frozen-lockfile
+      - name: Operator, gate and workflow tests (PGlite, no credentials)
+        run: |
+          bun test --timeout 300000 ./src/hoopdb/__tests__/index-prebuild-058000.pglite.test.ts
+          bun test --timeout 300000 ./src/hoopdb/__tests__/index-prebuild-058000-gate.test.ts
+
+  # No environment here: a typo/missing environment must not auto-create an unprotected one.
+  prerequisite-gate:
+    if: github.event_name == 'workflow_dispatch' && github.repository_id == '1437714333' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without database credentials
+        run: bun install --frozen-lockfile
+      - name: Verify dormant switch, mode, exact main, dispatch identity, green CI and the census run
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          bun scripts/index-prebuild-058000-github.ts
+          echo "environment=session-schema-production" >> "$GITHUB_OUTPUT"
+
+  database:
+    needs: prerequisite-gate
+    runs-on: ubuntu-latest
+    # Above the operator's run budget (300 minutes): no new build starts that could not finish inside it.
+    timeout-minutes: 340
+    environment:
+      name: ${{ needs.prerequisite-gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without database credentials
+        run: bun install --frozen-lockfile
+      - name: Recheck live gates and the recorded environment approval
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/index-prebuild-058000-github.ts --approved
+      - name: Download the census artifact (prebuild only)
+        if: inputs.mode == 'prebuild'
+        uses: actions/download-artifact@v4
+        with:
+          name: index-prebuild-058000-census
+          path: ${{ runner.temp }}/index-prebuild-census
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.census_run }}
+          github-token: ${{ github.token }}
+      # The parent checks everything that needs no credential, then hands the URL to a child over a stdin pipe
+      # (never argv, never the child's environment). Nothing credential-like is logged or written.
+      - name: Census, prebuild or read back the 058000 indexes (only step with the database secret)
+        env:
+          SUPABASE_MIGRATION_OWNER_URL: ${{ secrets.SUPABASE_MIGRATION_OWNER_URL }}
+        run: bun scripts/index-prebuild-058000.ts
+      - name: Publish the census artifact (census only)
+        if: inputs.mode == 'census' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: index-prebuild-058000-census
+          path: ${{ runner.temp }}/index-prebuild-out/index-prebuild-058000-census.json
+          if-no-files-found: ignore
+          retention-days: 1
+      - name: Publish the sanitized receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: index-prebuild-058000
+          path: ${{ runner.temp }}/index-prebuild-out/index-prebuild-058000.json
+          if-no-files-found: ignore
+          retention-days: 30

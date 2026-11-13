@@ -38,7 +38,9 @@
  * tenant id or content. --checkpoint-file (execute only) holds the resume checkpoint as JSON: the watermark key
  * (which names an org) and the accepted-stage export generation of every org up to it. It is operator state, not
  * output, and is read on start if it exists; after a re-export of any of those orgs the run starts from the
- * beginning (`resume: "reset_export_changed"`), since a re-export can turn a refused stage live.
+ * beginning (`resume: "reset_export_changed"`), since a re-export can turn a refused stage live. A file it refuses
+ * (`checkpoint_invalid`, for example one written by an older drain) is safe to delete: rerun without it, and the
+ * create-only `drained` markers skip every object already written, so a restart only re-lists.
  */
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { zstdDecompressSync } from "node:zlib";

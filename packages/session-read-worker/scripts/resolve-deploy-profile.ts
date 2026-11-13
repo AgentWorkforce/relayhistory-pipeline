@@ -33,6 +33,11 @@ const FLAGS = {
   OWNER_BUFFERED_INDEX_VERIFY: ["READ_API_OWNER_BUFFERED_INDEX_VERIFY", ["on"]],
   BUFFERED_SEARCH_GATE: ["READ_API_BUFFERED_SEARCH_GATE", ["on"]],
 } as const;
+/** Deploy-command-only flags (--var, never the render): an "on" input renders exactly "true"; off renders nothing. */
+export const SUMMARY_FLAGS = {
+  BRIEF_SUMMARY: "READ_API_BRIEF_SUMMARY_ENABLED",
+  LIST_SHORT_SUMMARY: "READ_API_LIST_SHORT_SUMMARY_ENABLED",
+} as const;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function activeVersion(d: unknown): string {
@@ -124,6 +129,9 @@ export function unchangedOtherSettings(version: Version, template: string, env: 
   for (const [key, name] of [["BRIEF_TITLES_WORKSPACES", "READ_API_BRIEF_TITLES_WORKSPACES"], ["TIMING_ASSUME_NO_TURNS", "READ_API_TIMING_ASSUME_NO_TURNS"]] as const) {
     if (env[key]) vars[name] = env[key];
   }
+  for (const [key, name] of Object.entries(SUMMARY_FLAGS)) {
+    if (env[key] === "on") vars[name] = "true";
+  }
   const managed = new Set<string>([...Object.values(VARIABLES), ...Object.values(FLAGS).map(([name]) => name)]);
   for (const b of version.resources?.bindings ?? []) {
     need(typeof b.name === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(b.name), "Invalid live binding name");
@@ -187,6 +195,7 @@ export function profileInputs(env: Environment): RenderInputs {
 export async function resolveProfile(env: Environment, template: string, get: (path: string) => Promise<unknown>, committed?: CommittedProfile): Promise<Record<string, string>> {
   const requested = env.OWNER_BUFFERED?.trim() || "profile";
   need(["profile", "preserve", "on", "off"].includes(requested), "owner_buffered must be profile, preserve, on or off");
+  for (const key of Object.keys(SUMMARY_FLAGS)) need(["", "off", "on"].includes(env[key] ?? ""), `${key.toLowerCase()} must be off or on`);
   // An empty or "profile" child input defers to the committed profile; below it is simply unset.
   const explicit: Environment = { ...env };
   for (const key of PROFILE_CHILDREN) if (!env[key]?.trim() || env[key]!.trim() === "profile") explicit[key] = "";

@@ -1180,8 +1180,9 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
           : parsed.kept.length !== groups.length || parsed.kept.some((ls, g) => ls.some((j) => j >= groups[g]!.lines.length)) ? "accepted_mismatch"
           : null;
         if (refusal) {
-          // Never drained under this export generation: release any hold entry for it first. (A re-export that changes
-          // the verdict starts a new generation; the batch then drains normally, with no hold needed.)
+          // Never drained under this export generation: release any hold entry for it first. A re-export that changes
+          // the verdict starts a new generation and the batch drains then, but with its hold released it no longer
+          // orders the user's later batches: those may drain first (the same trade-off as other terminal refusals).
           const h = read.decoded.header;
           note((await releaseHeld({ orgId: h.org_id, workspaceId: h.workspace_id, userId: h.user_id }, key)) ? refusal : "hold_failed");
           continue;

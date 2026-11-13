@@ -746,10 +746,10 @@ describe("transcript store: deploy plan contract", () => {
   });
 
   it("checks the production contract before a capture can replace reviewed files, and again before deploy", () => {
-    const captureCheck = captureWorkflow.indexOf("if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(plan, { detailedPlanText: detailed, provenanceText, stateSnapshotText: snapText });");
+    const captureCheck = captureWorkflow.indexOf("if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(plan, { detailedPlanText: detailed, provenanceText, stateSnapshotText: snapText, uploadInputs: (inputs as { transcriptStore?: { uploadControlRoleArn?: unknown; uploadPresignIssuer?: unknown } }).transcriptStore ?? {} });");
     expect(captureCheck).toBeGreaterThan(0);
     expect(captureCheck).toBeLessThan(captureWorkflow.indexOf("writeFileSync(p.plan, plan)"));
-    expect(stack).toContain("assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText })");
+    expect(stack).toContain("assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText, uploadInputs: inputs.transcriptStore ?? {} })");
   });
 });
 
@@ -823,7 +823,7 @@ describe("transcript store: inputs", () => {
     expect(at).toBeGreaterThan(0);
     expect(at).toBeLessThan(stack.indexOf('AWS.KMS.Key("locker-key"'));
     expect(stack).not.toContain("if (inputs.transcriptStore)");
-    expect(stack).toContain("assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText })");
+    expect(stack).toContain("assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText, uploadInputs: inputs.transcriptStore ?? {} })");
   });
 
   it("accepts only an exact named audit role in the intended account and partition", () => {

@@ -16,7 +16,12 @@
  *   INGEST_REARM_CREDENTIALS         "role" (default): the execution role's session keys from the environment
  *                                    (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN, as Lambda and ECS
  *                                    inject them); "keys": INGEST_REARM_S3_ACCESS_KEY_ID[_FILE] and
- *                                    INGEST_REARM_S3_SECRET_ACCESS_KEY[_FILE] (a mounted secret; re-read every pass)
+ *                                    INGEST_REARM_S3_SECRET_ACCESS_KEY[_FILE] (a mounted secret; re-read every pass);
+ *                                    "podIdentity": EKS Pod Identity, through the SAME helper as every Locker client
+ *                                    (src/shared/locker.ts podIdentityCredentials: AWS_CONTAINER_CREDENTIALS_FULL_URI,
+ *                                    trusted endpoints only, and AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE). The store
+ *                                    refreshes them; the eraser takes them per pass, and a pass ends 5 min before they
+ *                                    expire. IRSA (web identity) is not supported: the shared helper has no such mode.
  *
  * `--loop` runs a pass every interval until SIGTERM / SIGINT (the current pass finishes first); an incomplete pass's
  * next one continues where it stopped (the durable cursor in the bucket; a dry run keeps it in memory). Without it: one pass, exit 0 when complete (or dry run / disabled), 3 when
@@ -30,6 +35,8 @@ import { createS3Eraser, type PagedEraser, type S3EraserConfig } from "../migrat
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import type { ObjectStore } from "../shared/vendor.ts";
 import { lambdaCredentials } from "../session-pipeline/aws-json.ts";
+import { podIdentityCredentials, trustedCredentialsUri } from "../shared/locker.ts";
+import type { AwsCredentials } from "../../packages/object-store/src/sigv4.ts";
 import { readRearmCursor, rearmCursorKey, rearmScopes, RearmSweepRefused, REARM_MAX_CONCURRENCY, sweepRearmMarkers, writeRearmCursor, type RearmSweepOptions, type RearmSweepResult, type RearmSweepResume } from "./rearm-sweeper.ts";
 
 export const REARM_ENABLE_FLAG = "INGEST_REARM_SWEEPER_ENABLED";
@@ -53,8 +60,9 @@ export interface RearmSweeperConfig {
   concurrency: number;
   maxMarkers: number;
   intervalMs: number;
-  credentials: "role" | "keys";
+  credentials: RearmCredentialMode;
 }
+export type RearmCredentialMode = "role" | "keys" | "podIdentity";
 
 const int = (raw: string | undefined, dflt: number, min: number, max: number): number => {
   const n = Number(raw === undefined || raw === "" ? dflt : raw);
@@ -82,14 +90,14 @@ export function rearmSweeperConfig(env: NodeJS.ProcessEnv, argv: readonly string
   const at = argv.indexOf("--interval-ms");
   if (at >= 0 && (!argv[at + 1] || argv[at + 1]!.startsWith("--"))) refuse("config_invalid");
   const credentials = env.INGEST_REARM_CREDENTIALS || "role";
-  if (credentials !== "role" && credentials !== "keys") refuse("config_invalid");
+  if (credentials !== "role" && credentials !== "keys" && credentials !== "podIdentity") refuse("config_invalid");
   return {
     bucket, region, ...(endpoint ? { endpoint } : {}), keyRoot, ...(orgs ? { orgs } : {}),
     dryRun: dry === "1" || argv.includes("--dry-run"),
     concurrency: int(env.INGEST_REARM_CONCURRENCY, 4, 1, REARM_MAX_CONCURRENCY),
     maxMarkers: int(env.INGEST_REARM_MAX_MARKERS, 500, 1, 10_000),
     intervalMs: int(at >= 0 ? argv[at + 1] : env.INGEST_REARM_INTERVAL_MS, 600_000, 10_000, 86_400_000),
-    credentials: credentials as "role" | "keys",
+    credentials: credentials as RearmCredentialMode,
   };
 }
 
@@ -110,12 +118,30 @@ function secret(env: NodeJS.ProcessEnv, name: string): string {
   return text;
 }
 
-/** The pass's credentials. Never logged, never written. */
-export function rearmSweeperCredentials(env: NodeJS.ProcessEnv, cfg: Pick<RearmSweeperConfig, "credentials">): S3EraserConfig["credentials"] {
-  if (cfg.credentials === "role") {
-    try { return lambdaCredentials(env); } catch { return refuse("credentials_missing"); }
+/** Time a pass keeps before its credentials expire (the eraser holds one snapshot for the whole pass). */
+export const REARM_CREDENTIAL_MARGIN_MS = 5 * 60_000;
+
+/**
+ * The pass's credentials. Never logged, never written. `provider` is what the store uses (Pod Identity: refreshed by
+ * the store's cache before expiry); `snapshot` is what the eraser holds for the pass. A missing or untrusted Pod Identity
+ * endpoint refuses (exit 2); an endpoint that answers an error throws a retryable failure (exit 4, the loop retries).
+ */
+export async function rearmSweeperCredentials(env: NodeJS.ProcessEnv, cfg: Pick<RearmSweeperConfig, "credentials">, fetcher: typeof fetch = fetch):
+  Promise<{ snapshot: AwsCredentials; provider: () => Promise<AwsCredentials> }> {
+  if (cfg.credentials === "podIdentity") {
+    const uri = env.AWS_CONTAINER_CREDENTIALS_FULL_URI;
+    if (!uri) refuse("credentials_missing");
+    if (!trustedCredentialsUri(uri!)) refuse("credentials_endpoint_untrusted");
+    const provider = () => podIdentityCredentials(env, fetcher);
+    const snapshot = await provider();
+    if (!snapshot.accessKeyId || !snapshot.secretAccessKey) refuse("credentials_missing");
+    return { snapshot, provider };
   }
-  return { accessKeyId: secret(env, "INGEST_REARM_S3_ACCESS_KEY_ID"), secretAccessKey: secret(env, "INGEST_REARM_S3_SECRET_ACCESS_KEY") };
+  let snapshot: AwsCredentials;
+  if (cfg.credentials === "role") {
+    try { snapshot = lambdaCredentials(env); } catch { return refuse("credentials_missing"); }
+  } else snapshot = { accessKeyId: secret(env, "INGEST_REARM_S3_ACCESS_KEY_ID"), secretAccessKey: secret(env, "INGEST_REARM_S3_SECRET_ACCESS_KEY") };
+  return { snapshot, provider: async () => snapshot };
 }
 
 export interface RearmSweeperOverrides {
@@ -123,6 +149,8 @@ export interface RearmSweeperOverrides {
   store?: (config: Parameters<typeof createS3Store>[0]) => ObjectStore;
   eraser?: (config: S3EraserConfig) => PagedEraser;
   now?: () => number;
+  /** The Pod Identity endpoint's fetch (tests point it at a fake container endpoint). */
+  fetcher?: typeof fetch;
 }
 
 /** `cursor`: "saved" (the position is in the bucket), "contended" (another sweeper saved first) or "memory" (dry run: never written). */
@@ -137,11 +165,17 @@ export async function runRearmSweeperPass(env: NodeJS.ProcessEnv, argv: readonly
   resume: RearmSweepResume | null = null, extra: Pick<RearmSweepOptions, "deadlineAt"> = {}): Promise<{ output: RearmPassOutput; resume: RearmSweepResume | null }> {
   if (!rearmSweeperEnabled(env)) return { output: { enabled: false }, resume: null };
   const cfg = rearmSweeperConfig(env, argv);
-  const credentials = rearmSweeperCredentials(env, cfg);
-  const s3 = { bucket: cfg.bucket, region: cfg.region, ...(cfg.endpoint ? { endpoint: cfg.endpoint } : {}), credentials };
-  const store = (overrides.store ?? createS3Store)({ ...s3, credentials: async () => credentials }) as unknown as ObjectStore;
+  const { snapshot, provider } = await rearmSweeperCredentials(env, cfg, overrides.fetcher);
+  const s3 = { bucket: cfg.bucket, region: cfg.region, ...(cfg.endpoint ? { endpoint: cfg.endpoint } : {}), credentials: snapshot };
+  const store = (overrides.store ?? createS3Store)({ ...s3, credentials: provider }) as unknown as ObjectStore;
   const eraser = (overrides.eraser ?? createS3Eraser)(s3);
   const now = overrides.now ?? Date.now;
+  // Expiring credentials (Pod Identity): the eraser's snapshot must outlive the pass.
+  if (snapshot.expiresAt !== undefined) {
+    const until = snapshot.expiresAt.getTime() - REARM_CREDENTIAL_MARGIN_MS;
+    if (!(until > now())) refuse("credentials_expiring");
+    extra = { ...extra, deadlineAt: Math.min(extra.deadlineAt ?? Infinity, until) };
+  }
   const cursorKey = rearmCursorKey(cfg.keyRoot, rearmScopes(cfg.keyRoot, cfg.orgs ?? null));
   const saved = cfg.dryRun ? null : await readRearmCursor(store, cursorKey);
   // Saved after every finished marker whose erase ran and at every page end (onProgress), then once at the end; each

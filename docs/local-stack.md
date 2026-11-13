@@ -254,6 +254,10 @@ token gets nothing from org A), durability across a restart of Postgres, MinIO
 and all services, and erase through the session selection route (BLOCKED, not
 FAIL, on a build where that route still answers 501).
 
+`bun run e2e:pipeline` runs this stack extended with the S3-ledger ingest and the
+courier pipeline (AlleyOop, indexer, referee, Bob Costas), and asserts every piece
+of the pipeline on its own line: [pipeline-e2e.md](pipeline-e2e.md).
+
 ## Ports and credentials
 
 Host ports are bound to `127.0.0.1` only; the ingest API is the boundary, and

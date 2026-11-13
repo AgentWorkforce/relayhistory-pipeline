@@ -3,8 +3,8 @@ info:
   title: Session Read API
   version: 1.2.1
   license:
-    name: Apache-2.0
-    identifier: Apache-2.0
+    name: FSL-1.1-ALv2
+    url: https://fsl.software/FSL-1.1-ALv2.template.md
   description: |
     The read API clients use to render session data: relay-webapp (browser),
     relay-desktop and the agent-relay MCP. One contract for list, turns, search

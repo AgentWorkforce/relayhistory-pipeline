@@ -5,6 +5,8 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import { storeEraser, type PagedEraser } from "../../migration/neon-s3-erasure/eraser.ts";
 import { LIVE_SKEW_MS } from "../../migration/neon-s3-erasure/job.ts";
@@ -597,6 +599,78 @@ describe("re-arm sweeper entry", () => {
     expect(rearmSweeperEnabled({ INGEST_REARM_SWEEPER_ENABLED: "false" })).toBe(false);
     expect(() => rearmSweeperEnabled({ INGEST_REARM_SWEEPER_ENABLED: "1" })).toThrow(RearmSweepRefused);
     expect((await runRearmSweeperPass({ INGEST_REARM_BUCKET: "!!" }, [])).output).toEqual({ enabled: false });
+  });
+
+  describe("credentials", () => {
+    const POD = { ...ENV, INGEST_REARM_CREDENTIALS: "podIdentity", INGEST_REARM_S3_ACCESS_KEY_ID: undefined, INGEST_REARM_S3_SECRET_ACCESS_KEY: undefined,
+      AWS_CONTAINER_CREDENTIALS_FULL_URI: "http://169.254.170.23/v1/credentials" };
+    function tokenFile(): string {
+      const base = process.env.TMPDIR ?? join(process.env.HOME ?? ".", ".agent-tmp", "tmp");
+      mkdirSync(base, { recursive: true, mode: 0o700 });
+      const dir = mkdtempSync(join(base, "pod-identity-"));
+      cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+      const path = join(dir, "eks-pod-identity-token");
+      writeFileSync(path, "fake-pod-identity-token\n", { mode: 0o600 });
+      return path;
+    }
+    /** A fake EKS Pod Identity agent: records each call, answers container credentials. */
+    function fakeAgent(expiresInMs = 60 * 60_000) {
+      const calls: { url: string; authorization: string | null }[] = [];
+      const fetcher = (async (url: string | URL | Request, init?: RequestInit) => {
+        calls.push({ url: String(url), authorization: new Headers(init?.headers).get("authorization") });
+        return new Response(JSON.stringify({ AccessKeyId: "pod-access-key", SecretAccessKey: "pod-secret", Token: "pod-session-token",
+          Expiration: new Date(Date.now() + expiresInMs).toISOString() }), { status: 200 });
+      }) as typeof fetch;
+      return { calls, fetcher };
+    }
+
+    test("podIdentity: fetched from the container endpoint with the token file; the store refreshes, the eraser holds the pass's snapshot", async () => {
+      const store = fresh();
+      const env = { ...POD, AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE: tokenFile() };
+      expect(rearmSweeperConfig(env).credentials).toBe("podIdentity");
+      const agent = fakeAgent();
+      let storeCreds: (() => Promise<unknown>) | undefined, eraserCreds: unknown;
+      const { output } = await runRearmSweeperPass(env, [], {
+        store: (c) => { storeCreds = c.credentials as () => Promise<unknown>; return store; },
+        eraser: (c) => { eraserCreds = c.credentials; return storeEraser(store); },
+        fetcher: agent.fetcher, now: LATER,
+      });
+      expect(output).toMatchObject({ enabled: true, complete: true });
+      expect(agent.calls[0]).toEqual({ url: "http://169.254.170.23/v1/credentials", authorization: "fake-pod-identity-token" });
+      expect(eraserCreds).toMatchObject({ accessKeyId: "pod-access-key", secretAccessKey: "pod-secret", sessionToken: "pod-session-token" });
+      const before = agent.calls.length;
+      expect(await storeCreds!()).toMatchObject({ accessKeyId: "pod-access-key", sessionToken: "pod-session-token" });
+      expect(agent.calls.length).toBe(before + 1); // the store's provider asks the agent again (the S3 driver caches it)
+      expect(JSON.stringify(output)).not.toContain("pod-");
+    });
+
+    test("podIdentity refuses a missing or untrusted endpoint (before any token is sent) and credentials about to expire", async () => {
+      const agent = fakeAgent();
+      const run = (env: Record<string, string | undefined>, fetcher = agent.fetcher) =>
+        runRearmSweeperPass(env as NodeJS.ProcessEnv, [], { store: () => fresh(), eraser: () => storeEraser(fresh()), fetcher, now: LATER });
+      await expect(run({ ...POD, AWS_CONTAINER_CREDENTIALS_FULL_URI: undefined })).rejects.toMatchObject({ code: "credentials_missing" });
+      await expect(run({ ...POD, AWS_CONTAINER_CREDENTIALS_FULL_URI: "http://attacker.example/creds" })).rejects.toMatchObject({ code: "credentials_endpoint_untrusted" });
+      expect(agent.calls).toHaveLength(0);
+      await expect(run(POD, fakeAgent(60_000).fetcher)).rejects.toMatchObject({ code: "credentials_expiring" });
+      const down = (async () => new Response("", { status: 500 })) as unknown as typeof fetch;
+      const err = await run(POD, down).catch((e) => e);
+      expect(err).not.toBeInstanceOf(RearmSweepRefused); // retryable (exit 4), not a misconfiguration
+      expect(exitCodeForError(err)).toBe(4);
+    });
+
+    test("the default (role) and keys modes are unchanged", async () => {
+      const store = fresh();
+      let eraserCreds: unknown;
+      const capture = { store: () => store, eraser: (c: { credentials: unknown }) => { eraserCreds = c.credentials; return storeEraser(store); }, now: LATER };
+      await runRearmSweeperPass(ENV, [], capture as never);
+      expect(eraserCreds).toEqual({ accessKeyId: "test-access-key-id", secretAccessKey: "test-only-secret" });
+      const role = { ...ENV, INGEST_REARM_CREDENTIALS: undefined, AWS_ACCESS_KEY_ID: "role-key", AWS_SECRET_ACCESS_KEY: "role-secret", AWS_SESSION_TOKEN: "role-token" };
+      expect(rearmSweeperConfig(role as NodeJS.ProcessEnv).credentials).toBe("role");
+      await runRearmSweeperPass(role as NodeJS.ProcessEnv, [], capture as never);
+      expect(eraserCreds).toEqual({ accessKeyId: "role-key", secretAccessKey: "role-secret", sessionToken: "role-token" });
+      await expect(runRearmSweeperPass({ ...role, AWS_ACCESS_KEY_ID: undefined } as NodeJS.ProcessEnv, [], capture as never)).rejects.toMatchObject({ code: "credentials_missing" });
+      expect(() => rearmSweeperConfig({ ...ENV, INGEST_REARM_CREDENTIALS: "irsa" })).toThrow(RearmSweepRefused);
+    });
   });
 
   test("config: bounds, flags and argv", () => {
