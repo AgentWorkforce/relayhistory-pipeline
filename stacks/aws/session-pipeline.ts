@@ -117,6 +117,32 @@ export interface SessionPipelineInputs {
    * Omit for off (no var rendered, env byte-identical to before). Only `true` is accepted.
    */
   neonExit?: true;
+  /**
+   * Which optional schedule groups this stage declares at all (EventBridge rule plus its invoke permission).
+   * Each key is its own reviewed deploy phase (transcript-store.ts), so a stage adds them one at a time:
+   * a group that is not listed renders no resources, and its lane cannot be enabled. Absent: none declared.
+   * Every value is `true` (omit a key to leave its group out). A stage whose Alchemy state already holds a
+   * group must list it, or its next plan deletes that rule and permission.
+   */
+  schedules?: Partial<Record<SessionPipelineScheduleGroup, true>>;
+}
+
+/** The optional schedule groups (sessionPipeline.schedules keys) and the resources each declares. */
+export const SESSION_PIPELINE_SCHEDULE_GROUPS = ["analysisCache", "semanticCopy", "analysisJob", "bufferedSearchFeed", "bufferedErasureDelete"] as const;
+export type SessionPipelineScheduleGroup = (typeof SESSION_PIPELINE_SCHEDULE_GROUPS)[number];
+/** Whether this stage declares a schedule group (`sessionPipeline.schedules`); absent means not declared. */
+export const declaresSchedule = (p: SessionPipelineInputs, group: SessionPipelineScheduleGroup): boolean => p.schedules?.[group] === true;
+/** The resources each optional schedule group declares (the same lists the deploy plan checks phase by phase). */
+const SCHEDULE_GROUP_RESOURCES: Record<SessionPipelineScheduleGroup, readonly string[]> = {
+  get analysisCache() { return SESSION_ANALYSIS_CACHE_RESOURCES; },
+  get semanticCopy() { return SESSION_SEMANTIC_COPY_RESOURCES; },
+  get analysisJob() { return SESSION_ANALYSIS_JOB_RESOURCES; },
+  get bufferedSearchFeed() { return SESSION_BUFFERED_SEARCH_FEED_RESOURCES; },
+  get bufferedErasureDelete() { return SESSION_BUFFERED_ERASURE_DELETE_RESOURCES; },
+};
+/** The optional schedule resources this stage renders: only its declared groups, so an undeclared group plans nothing. */
+export function declaredScheduleResources(p: SessionPipelineInputs): string[] {
+  return SESSION_PIPELINE_SCHEDULE_GROUPS.filter((g) => declaresSchedule(p, g)).flatMap((g) => [...SCHEDULE_GROUP_RESOURCES[g]]);
 }
 
 /**
@@ -219,7 +245,7 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     refuse("transcriptStore.sessionPipeline must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
+    if (k !== "searchIndex" && k !== "replayPages" && k!=="analysisCache" && k !== "desktopCatalog" && k !== "maxConcurrency" && k !== "reconcileMinutes" && k !== "briefs" && k !== "semanticCopy" && k !== "analysisJobs" && k !== "bufferedSearchFeed" && k !== "bufferedErasureDelete" && k !== "neonExit" && k !== "schedules") refuse(`transcriptStore.sessionPipeline.${k} is not a known setting`);
   if (v.searchIndex !== undefined && typeof v.searchIndex !== "boolean") refuse("transcriptStore.sessionPipeline.searchIndex must be a boolean");
   if (v.replayPages !== undefined && typeof v.replayPages !== "boolean") refuse("transcriptStore.sessionPipeline.replayPages must be a boolean");
   if(v.analysisCache!==undefined&&typeof v.analysisCache!=="boolean")refuse("transcriptStore.sessionPipeline.analysisCache must be a boolean");
@@ -306,6 +332,23 @@ export function assertSessionPipelineInputs(p: unknown, refuse: (why: string) =>
     if (b.sweepSeconds !== undefined && !(Number.isInteger(b.sweepSeconds) && (b.sweepSeconds as number) >= 0 && (b.sweepSeconds as number) <= 86_400))
       refuse("transcriptStore.sessionPipeline.briefs.sweepSeconds must be an integer from 0 to 86400");
   }
+  if (v.schedules !== undefined) {
+    const sc = v.schedules as Record<string, unknown> | null;
+    if (sc === null || typeof sc !== "object" || Array.isArray(sc) || Object.getPrototypeOf(sc) !== Object.prototype)
+      refuse("transcriptStore.sessionPipeline.schedules must be a plain object");
+    for (const k of Object.keys(sc)) {
+      if (!(SESSION_PIPELINE_SCHEDULE_GROUPS as readonly string[]).includes(k)) refuse(`transcriptStore.sessionPipeline.schedules.${k} is not a known schedule group`);
+      if (sc[k] !== true) refuse(`transcriptStore.sessionPipeline.schedules.${k} must be true (omit it to leave the group out)`);
+    }
+  }
+  // A lane runs only from its schedule: enabling one whose group is not declared would arm nothing.
+  const declared = (g: SessionPipelineScheduleGroup) => (v.schedules as Record<string, unknown> | undefined)?.[g] === true;
+  const enabled = (o: unknown) => (o as { enabled?: unknown } | null | undefined)?.enabled === true;
+  // analysisCache: true is refused above (not wired), so its group is only ever declared DISABLED.
+  if (enabled(v.semanticCopy) && !declared("semanticCopy")) refuse("transcriptStore.sessionPipeline.semanticCopy.enabled requires schedules.semanticCopy");
+  if (enabled(v.analysisJobs) && !declared("analysisJob")) refuse("transcriptStore.sessionPipeline.analysisJobs.enabled requires schedules.analysisJob");
+  if (enabled(v.bufferedSearchFeed) && !declared("bufferedSearchFeed")) refuse("transcriptStore.sessionPipeline.bufferedSearchFeed.enabled requires schedules.bufferedSearchFeed");
+  if (enabled(v.bufferedErasureDelete) && !declared("bufferedErasureDelete")) refuse("transcriptStore.sessionPipeline.bufferedErasureDelete.enabled requires schedules.bufferedErasureDelete");
 }
 
 /** The pipeline role reads session objects through S3 only, for objects under `96bulls/` (as the reader user). */
@@ -707,23 +750,26 @@ export const sessionPipelineWiring = (
       tags: i.tags("session-pipeline"),
     } as never);
     const briefRule = yield* AWS.EventBridge.Rule("session-brief-schedule", briefScheduleProps({ names, functionArn: i.fn.functionArn as unknown as string, p: i.p, tags: i.tags("session-pipeline") }) as never);
-    const analysisRule=yield* AWS.EventBridge.Rule("session-analysis-cache-schedule",analysisCacheScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
-    const analysisReconcileRule=yield* AWS.EventBridge.Rule("session-analysis-reconcile-schedule",analysisReconcileScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
-    const semanticRule=yield* AWS.EventBridge.Rule("session-semantic-copy-schedule",semanticCopyScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
-    const analysisJobRule=yield* AWS.EventBridge.Rule("session-analysis-job-schedule",analysisJobScheduleProps({names,functionArn:i.fn.functionArn as unknown as string,p:i.p,tags:i.tags("session-pipeline")}) as never);
-    const bufferedSearchFeedRule = yield* AWS.EventBridge.Rule("session-buffered-search-feed-schedule", bufferedSearchFeedScheduleProps({ names, functionArn: i.fn.functionArn as unknown as string, p: i.p, tags: i.tags("session-pipeline") }) as never);
-    const bufferedErasureDeleteRule = yield* AWS.EventBridge.Rule("session-buffered-erasure-delete-schedule", bufferedErasureDeleteScheduleProps({ names, functionArn: i.fn.functionArn as unknown as string, p: i.p, tags: i.tags("session-pipeline") }) as never);
+    const scheduleArgs = { names, functionArn: i.fn.functionArn as unknown as string, p: i.p, tags: i.tags("session-pipeline") };
+    const ruleArn = (r: unknown) => (r as { ruleArn: string }).ruleArn;
+    // Each optional group exists only when this stage declares it (sessionPipeline.schedules), one reviewed phase at a time.
+    const analysisRule = declaresSchedule(i.p, "analysisCache") ? yield* AWS.EventBridge.Rule("session-analysis-cache-schedule", analysisCacheScheduleProps(scheduleArgs) as never) : undefined;
+    const analysisReconcileRule = declaresSchedule(i.p, "analysisCache") ? yield* AWS.EventBridge.Rule("session-analysis-reconcile-schedule", analysisReconcileScheduleProps(scheduleArgs) as never) : undefined;
+    const semanticRule = declaresSchedule(i.p, "semanticCopy") ? yield* AWS.EventBridge.Rule("session-semantic-copy-schedule", semanticCopyScheduleProps(scheduleArgs) as never) : undefined;
+    const analysisJobRule = declaresSchedule(i.p, "analysisJob") ? yield* AWS.EventBridge.Rule("session-analysis-job-schedule", analysisJobScheduleProps(scheduleArgs) as never) : undefined;
+    const bufferedSearchFeedRule = declaresSchedule(i.p, "bufferedSearchFeed") ? yield* AWS.EventBridge.Rule("session-buffered-search-feed-schedule", bufferedSearchFeedScheduleProps(scheduleArgs) as never) : undefined;
+    const bufferedErasureDeleteRule = declaresSchedule(i.p, "bufferedErasureDelete") ? yield* AWS.EventBridge.Rule("session-buffered-erasure-delete-schedule", bufferedErasureDeleteScheduleProps(scheduleArgs) as never) : undefined;
     for (const { id, props } of sessionPipelinePermissions({
       accountId: i.accountId,
       functionName: i.fn.functionName as unknown as string,
       ruleArn: (rule as unknown as { ruleArn: string }).ruleArn,
       briefRuleArn: (briefRule as unknown as { ruleArn: string }).ruleArn,
-      analysisRuleArn:(analysisRule as unknown as {ruleArn:string}).ruleArn,
-      analysisReconcileRuleArn:(analysisReconcileRule as unknown as {ruleArn:string}).ruleArn,
-      semanticRuleArn:(semanticRule as unknown as {ruleArn:string}).ruleArn,
-      analysisJobRuleArn:(analysisJobRule as unknown as {ruleArn:string}).ruleArn,
-      bufferedSearchFeedRuleArn: (bufferedSearchFeedRule as unknown as { ruleArn: string }).ruleArn,
-      bufferedErasureDeleteRuleArn: (bufferedErasureDeleteRule as unknown as { ruleArn: string }).ruleArn,
+      ...(analysisRule !== undefined ? { analysisRuleArn: ruleArn(analysisRule) } : {}),
+      ...(analysisReconcileRule !== undefined ? { analysisReconcileRuleArn: ruleArn(analysisReconcileRule) } : {}),
+      ...(semanticRule !== undefined ? { semanticRuleArn: ruleArn(semanticRule) } : {}),
+      ...(analysisJobRule !== undefined ? { analysisJobRuleArn: ruleArn(analysisJobRule) } : {}),
+      ...(bufferedSearchFeedRule !== undefined ? { bufferedSearchFeedRuleArn: ruleArn(bufferedSearchFeedRule) } : {}),
+      ...(bufferedErasureDeleteRule !== undefined ? { bufferedErasureDeleteRuleArn: ruleArn(bufferedErasureDeleteRule) } : {}),
       roleArn,
     }))
       yield* AWS.Lambda.Permission(id, props as never);

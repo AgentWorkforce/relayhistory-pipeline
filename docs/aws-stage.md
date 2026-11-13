@@ -895,6 +895,15 @@ only blocks the explicit destroy command; it does not stop an ordinary deploy
 from reconciling a removed declaration, which is why this operation-level
 check is required.
 
+**Optional pipeline schedules are declared one group at a time.** The session pipeline's optional
+EventBridge schedules exist only when the stage lists them in `transcriptStore.sessionPipeline.schedules`
+(`analysisCache`, which is the cache and reconcile pair, plus `semanticCopy`, `analysisJob`, `bufferedSearchFeed`
+and `bufferedErasureDelete`, each set to `true`). An unlisted group renders no rule and no permission, so a plan
+from main adds none of them, and each group is then added in its own reviewed phase above. A lane cannot be
+enabled unless its group is declared. A stage whose Alchemy state already holds a group must list it before its
+next plan, or that plan deletes the rule and its permission. The reconcile and brief schedules are not optional
+and are unaffected.
+
 **How a capture stays read-only.** `alchemy plan` against `AWS.state` is not
 read-only: Alchemy takes a lease (PUT then DELETE of `__lease__.json`) and
 reconciles the state bucket's versioning, ownership and encryption if they
