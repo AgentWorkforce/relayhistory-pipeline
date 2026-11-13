@@ -54,7 +54,8 @@
     "scripts/sync-sessions-function-boundary.ts",
     "scripts/sync-ingest-history-boundary.ts",
     "scripts/sessions-function-boundary",
-    "scripts/opensearch-proof"
+    "scripts/opensearch-proof",
+    "scripts/buffered-drain.ts"
   ],
   "exclude": [
     "node_modules",

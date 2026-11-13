@@ -126,7 +126,8 @@ export async function readStaged(store: ObjectStore, key: string, decompress: (b
   return decodeStaged(decompress(await readAll((await store.getObject(objectKey(key))).body)));
 }
 
-function decodeStaged(bytes: Uint8Array): { header: StagedHeader; groups: Group[] } {
+/** Decode a staged object's decompressed bytes (header + lines). Exported for the buffered drain. */
+export function decodeStaged(bytes: Uint8Array): { header: StagedHeader; groups: Group[] } {
   const text = decoder.decode(bytes);
   const newline = text.indexOf("\n");
   const header = JSON.parse(text.slice(0, newline)) as StagedHeader;
