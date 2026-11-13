@@ -244,8 +244,8 @@ describe("upload consent: the baseline reproduction now stores nothing", () => {
     expect([stored.payloadFound, stored.committedBatches]).toEqual([true, 1]);
   });
 
-  test("a missing policy revision is still refused before storage (unchanged)", async () => {
-    const rc = await relaycontrol(() => active(["rth:sync"], { role: "member", capture_policy: { version: 1, revision: 7, settings: { sharing_mode: "all" } } }));
+  test("a restrictive upload policy still refuses a missing revision before storage", async () => {
+    const rc = await relaycontrol(() => active(["rth:sync"], { role: "member", capture_policy: { version: 1, revision: 7, settings: { sharing_mode: "all", oops_window_seconds: 60 } } }));
     const { url, store, db } = await start(rc, { RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS: "enforce" });
     const response = await post(url("/v1/delivery/batches"), await deliveryBody("synthetic-legacy-all"));
     expect([response.status, await code(response)]).toEqual([409, "capture_policy_stale"]);
@@ -275,4 +275,3 @@ describe("upload consent: the baseline reproduction now stores nothing", () => {
     expect([batches.status, await code(batches)]).toEqual([403, "forbidden"]);
   });
 });
-
