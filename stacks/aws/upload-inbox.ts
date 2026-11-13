@@ -202,12 +202,20 @@ export function desktopUploadPolicy(i: { bucketArn: string; accountId: string; r
  * SseHeaderMustNameThisKey refuse anything else. Deletes stay inbox-only (OnlyTheEraserDeletes and the inbox
  * wall), and the explicit deny keeps version history and bucket administration out of reach.
  */
+/**
+ * The fence-authority marker the consumer reads before it admits (decision 0005, ledger-s3.ts fenceAuthorityKey and
+ * FenceAuthorityDoc; INGEST_KEY_ROOT is TENANT_KEY_BASE). Read only: an operator writes it, never this role.
+ */
+export const FENCE_AUTHORITY_MARKER_KEY = `${TENANT_KEY_BASE}/.ledger/fence-authority.json`;
+
 export function uploadAdmissionBucketStatements(i: { bucketArn: string; consumerRoleArn: string; promotionObjects: string[] }) {
   const inbox = uploadInboxObjects(i.bucketArn);
   const principal = { AWS: i.consumerRoleArn };
   return [
     { Sid: "UploadAdmissionReadsTombstonesDeletesUploads", Effect: "Allow" as const, Principal: principal, Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"], Resource: [inbox] },
     { Sid: "UploadAdmissionPromotes", Effect: "Allow" as const, Principal: principal, Action: ["s3:GetObject", "s3:PutObject"], Resource: i.promotionObjects },
+    // Exactly the one marker key, GET only (no wildcard): without it every record is a retry (fails closed).
+    { Sid: "UploadAdmissionReadsFenceAuthority", Effect: "Allow" as const, Principal: principal, Action: ["s3:GetObject"], Resource: [`${i.bucketArn}/${FENCE_AUTHORITY_MARKER_KEY}`] },
     // Missing keys must answer 404 (create-only reads, the status object), as for the srv-writer: key names only.
     { Sid: "UploadAdmissionListsForMissingKeys", Effect: "Allow" as const, Principal: principal, Action: ["s3:ListBucket"], Resource: [i.bucketArn] },
     {
