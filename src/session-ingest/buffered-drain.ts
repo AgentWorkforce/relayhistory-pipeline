@@ -18,29 +18,30 @@
  *        `privacy_control_open`, skipped, as the async consumer waits rather than guess.
  *      - Superseded by a later reset: the fence holds a reset COUNT (`resets`) and the journal a
  *        `seq` watermark with no times; a buffered staged header holds `received_at` but no journal
- *        witness (only async inbox objects carry one). So supersession is determinable only with the
- *        time of the user's last reset, which ledger-s3's `FenceDoc` does not carry yet (requested in
- *        #580; `DrainOptions.lastResetAtMs` reads it once it does). `resets > 0` without it:
- *        `reset_undeterminable`, skipped. With it, and a clock-skew margin M
+ *        witness (only async inbox objects carry one). So supersession uses the fence's
+ *        `lastResetAtMs` (ledger-s3; the backfill sets it from SQL's reset times). `resets > 0` with
+ *        `lastResetAtMs` 0: `reset_undeterminable`, skipped. With it, and a clock-skew margin M
  *        (default 5 minutes, floor 1 minute; `received_at` is the Worker's clock, `lastResetAtMs`
  *        the database's): `received_at <= lastResetAtMs - M` is `pre_reset`, dropped and marked;
  *        within M on either side of the reset is `reset_margin`, skipped and left undrained (never
  *        written, never marked); only `received_at >= lastResetAtMs + M` drains.
- *   4. Read the per-session revision index (ledger-s3 `IndexDoc`) for every surviving session. As the
- *      claim does, an index of a stale generation (`indexGeneration`: a disable or reset since) counts
- *      as empty. Then an equal or higher stored revision is skipped, counted as `stale` (lower),
+ *   4. Read the per-origin revision index shards (ledger-s3, per (origin, record id)). As the claim
+ *      does, an entry the fence has forgotten (`entryForgotten`: a disable or reset since) counts as
+ *      absent. Then an equal or higher stored revision is skipped, counted as `stale` (lower),
  *      `already_stored` (equal, same digest) or `revision_conflict` (equal, another digest: never
  *      written, since the reader fold refuses it, relayhistory-transform.ts chooseRelayhistoryRevision).
+ *   4b. Register the ownership stubs of the sessions to be written (ledger-s3 `registerOwner`) BEFORE any
+ *      canonical write, as the claim does, then re-read the fence: if it moved, `fence_moved` (rerun).
  *   5. Write the surviving groups through the writer (`writeGroups` with the staged batch digest and
  *      received_at, lines refitted with `fitLine`), as the staged fan-out would. The fan-out itself
  *      refuses buffered objects on purpose (`buffered_publication_refused`); this is the drain's own
  *      entry and does not touch that check. Idempotent under manifest CAS: a replay of the same batch
  *      digest appends nothing.
- *   6. Merge the written revisions into the index with ledger-s3 `mergeIndex`, stamped with the
- *      generation of the fence read in step 3 (max wins, equal keeps the stored digest).
- *   7. Re-read the fence and journal. A deletion of a written session, a reset, or any journal `seq`
- *      move, or an epoch bump of a written session, that landed meanwhile writes a create-only re-arm
- *      marker for the eraser (ledger-s3 `writeRearm`, per origin and session). Every session dropped as deleted in step 3 is re-armed too: an earlier
+ *   6. As ledger-s3's commit: re-read the fence and journal; a deletion, epoch bump or reset that reached
+ *      a written session, or any journal `seq` move, writes a create-only re-arm marker for the eraser
+ *      (`writeRearm`) BEFORE any index merge.
+ *   7. Merge the other written revisions with `mergeIndex`, stamped with step 3's generation (max wins,
+ *      equal keeps the stored digest, forgotten entries dropped). Every session dropped as deleted in step 3 is re-armed too: an earlier
  *      partial run of this batch may have written it before the deletion.
  *   8. Write the create-only drained marker. Only now is the object done; any failure before this
  *      leaves it for a rerun, which is safe because every step above is idempotent.
@@ -60,8 +61,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { isObjectStoreError, objectKey, type ObjectStore, type ObjectVersion } from "../shared/vendor.ts";
 import { layoutComponent } from "../shared/layout-component.ts";
 import { journalKey } from "./async-admission.ts";
-import type { LedgerRecord, LedgerTenant } from "./ledger.ts";
-import { indexGeneration, s3LedgerObjects, type FenceDoc, type IndexDoc } from "./ledger-s3.ts";
+import type { LedgerTenant } from "./ledger.ts";
+import { entryForgotten, fenceEpoch, isDeleted, newFence, recordGeneration, s3LedgerObjects, sessionKeyHash, type FenceDoc, type FenceRead, type IndexEntryInput } from "./ledger-s3.ts";
 import { fitLine } from "./oversize.ts";
 import { routedRawChunkSealerDeps } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { BUFFER_STAGE_MAX_BYTES, decodeStaged, type StagedHeader } from "./staging.ts";
@@ -120,32 +121,15 @@ export interface JournalState {
   ambiguous: number;
 }
 
-export interface RearmEntry {
-  originId: string;
-  source: string;
-  sessionId: string;
-  machineId: string;
-}
-
 /**
- * What the drain needs from the S3 upload ledger. `s3DrainLedger` adapts ledger-s3.ts `s3LedgerObjects`, so the
- * drain reads and merges exactly the formats the upload consumer and the control mirror use: the fence
- * (`FenceDoc`), the per-session revision index with its generation (`IndexDoc`), and the per-origin re-arm
- * marker. Only the privacy journal is read here (async-admission.ts owns it). Every method fails closed (throws)
- * on an unreadable object, never treating it as absent.
+ * The drain's ledger: ledger-s3.ts `s3LedgerObjects` itself (keys, fence read, revision shards, ownership stubs,
+ * re-arm markers; the SAME formats and rules as admission), plus the privacy journal reader. Tests override
+ * single methods. Every method fails closed (throws) on an unreadable object.
  */
-export interface DrainLedger {
-  /** null when the user has no fence object (not backfilled). */
-  readFence(tenant: LedgerTenant): Promise<FenceDoc | null>;
+export type DrainLedger = Pick<ReturnType<typeof s3LedgerObjects>, "keysFor" | "readFence" | "readIndex" | "mergeIndex" | "registerOwner" | "writeRearm"> & {
   /** null when the user has no journal (no ordered control ever ran). */
   readJournal(tenant: LedgerTenant): Promise<JournalState | null>;
-  /** The index as stored, or null. The caller applies `indexGeneration`: a stale generation counts as empty. */
-  readIndex(tenant: LedgerTenant, originId: string, source: string | null, sessionId: string | null): Promise<IndexDoc | null>;
-  /** ledger-s3 `mergeIndex`: max revision wins, an equal one keeps the stored digest, an older generation never overwrites a newer one. */
-  mergeIndex(tenant: LedgerTenant, originId: string, source: string | null, sessionId: string | null, generation: { epoch: number; resets: number }, records: LedgerRecord[]): Promise<void>;
-  /** ledger-s3 `writeRearm`: create-only, per origin and session. */
-  rearm(tenant: LedgerTenant, entry: RearmEntry): Promise<void>;
-}
+};
 
 export class DrainLedgerError extends Error {
   constructor(readonly code: "journal_invalid") {
@@ -205,27 +189,13 @@ async function boundedRead(body: ReadableStream<Uint8Array>, max: number): Promi
   return out;
 }
 
-/** The drain's view of ledger-s3.ts `s3LedgerObjects` (same keys, formats, CAS and merge semantics). */
 export function s3DrainLedger(store: ObjectStore, keyRoot: string, opts: { sleep?: (ms: number) => Promise<void>; random?: () => number; nowMs?: () => number } = {}): DrainLedger {
   const io = s3LedgerObjects(store, keyRoot, opts);
   return {
-    async readFence(tenant) {
-      // ledger-s3 reads an absent fence as an empty one with no version: absent is what the drain refuses.
-      const got = await io.readFence(io.keysFor(tenant).fence);
-      return got.version === undefined ? null : got.doc;
-    },
+    keysFor: io.keysFor, readFence: io.readFence, readIndex: io.readIndex, mergeIndex: io.mergeIndex, registerOwner: io.registerOwner, writeRearm: io.writeRearm,
     async readJournal(tenant) {
       const got = await readText(store, journalKey(keyRoot, tenant));
       return got ? parseJournal(got.text) : null;
-    },
-    async readIndex(tenant, originId, source, sessionId) {
-      return (await io.readIndex(io.keysFor(tenant).revisions(originId, source, sessionId)))?.doc ?? null;
-    },
-    async mergeIndex(tenant, originId, source, sessionId, generation, records) {
-      await io.mergeIndex(io.keysFor(tenant).revisions(originId, source, sessionId), { originId, source, sessionId, ...generation }, records);
-    },
-    async rearm(tenant, entry) {
-      await io.writeRearm(io.keysFor(tenant).rearm(entry.originId, entry.source, entry.sessionId), entry);
     },
   };
 }
@@ -263,13 +233,14 @@ export type ObjectOutcome =
   | "write_failed"
   | "index_merge_failed"
   | "fence_recheck_failed"
+  | "fence_moved"
   | "marker_failed"
   | "internal_error";
 
 const OUTCOMES: ObjectOutcome[] = [
   "drained", "would_drain", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch",
   "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "index_unreadable", "write_failed",
-  "index_merge_failed", "fence_recheck_failed", "marker_failed", "internal_error",
+  "index_merge_failed", "fence_recheck_failed", "fence_moved", "marker_failed", "internal_error",
 ];
 
 export interface DrainSummary {
@@ -529,12 +500,6 @@ export interface DrainOptions {
   lockTtlMs?: number;
   /** Clock-skew margin around the last reset. Default RESET_MARGIN_DEFAULT_MS; below RESET_MARGIN_MIN_MS refuses. */
   resetMarginMs?: number;
-  /**
-   * When the user's last reset was applied, from their fence. TODO(#580): ledger-s3's `FenceDoc` has no reset
-   * time yet (requested); until it does the default returns undefined, so every user with `resets > 0` is
-   * `reset_undeterminable` (skipped, fail closed). Wire this to the new field when it lands. Tests inject it.
-   */
-  lastResetAtMs?: (fence: FenceDoc) => number | undefined;
   /** Lease holder id (no personal data). Default a random `drain-<uuid>`. */
   lockHolder?: string;
   /** Ledger override (tests; later ledger-s3.ts). Default: s3DrainLedger over `store`. */
@@ -708,19 +673,21 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     const tenant: LedgerTenant = { orgId: header.org_id, workspaceId: header.workspace_id, userId: header.user_id };
     const origin = header.origin_id;
     const receivedMs = Date.parse(header.received_at);
-    let fence: FenceDoc | null;
+    let keys: ReturnType<DrainLedger["keysFor"]>;
+    let read: FenceRead;
     try {
-      fence = await ledger.readFence(tenant);
+      keys = ledger.keysFor(tenant);
+      read = await ledger.readFence(keys.fence);
     } catch {
       return "fence_unreadable";
     }
     // 0005 step 0: a user without a backfilled fence may have deletions recorded only in SQL.
-    if (!fence) {
+    let fence: FenceDoc;
+    if (read.state === "absent") {
       if (!(opts.dryRun && opts.assumeEmptyFence)) return "fence_absent";
       summary.fence_assumed_empty++;
-      fence = { v: 1, version: 0, resets: 0, deleted: {}, epochs: {}, resetRequests: {} };
-    }
-    const before = fence;
+      fence = newFence(); // a classification view only: never written
+    } else fence = read.fence;
     let journal: JournalState | null;
     try {
       journal = await ledger.readJournal(tenant);
@@ -730,17 +697,15 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     if (journal && (journal.pending > 0 || journal.ambiguous > 0)) return "privacy_control_open";
     const counts = { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0 };
     if (fence.resets > 0) {
-      const resetAt = (opts.lastResetAtMs ?? (() => undefined))(fence);
-      if (resetAt === undefined) return "reset_undeterminable";
-      if (receivedMs <= resetAt - resetMarginMs) {
+      // ledger-s3 `lastResetAtMs`: 0 means no reset time was recorded (it only ever rises).
+      if (fence.lastResetAtMs === 0) return "reset_undeterminable";
+      if (receivedMs <= fence.lastResetAtMs - resetMarginMs) {
         if (!opts.dryRun && !(await putMarker(key, sha256, "pre_reset", counts, 0))) return "marker_failed";
         return "pre_reset";
       }
       // Too close to the reset to order across two clocks: never written, never marked, reported.
-      if (receivedMs < resetAt + resetMarginMs) return "reset_margin";
+      if (receivedMs < fence.lastResetAtMs + resetMarginMs) return "reset_margin";
     }
-    const deletedOf = (f: FenceDoc) => new Set((Object.hasOwn(f.deleted, origin) ? f.deleted[origin]! : []).map((p) => JSON.stringify([p[0], p[1]])));
-    const deleted = deletedOf(fence);
     type Kept = { group: Group; lines: string[]; meta: LineMeta[] };
     const kept: Kept[] = [];
     /** Deleted sessions this batch carries: an earlier partial run may have written them (re-armed below). */
@@ -750,7 +715,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       g.lines.forEach((line, i) => {
         counts.candidate++;
         const m = g.meta![i]!;
-        if (m[3] !== null && deleted.has(JSON.stringify([m[2], m[3]]))) {
+        if (m[3] !== null && isDeleted(fence, origin, m[2], m[3])) {
           counts.fenced++;
           fencedSessions.set(JSON.stringify([m[2], m[3]]), [m[2], m[3]]);
         } else {
@@ -761,48 +726,51 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       if (k.lines.length) kept.push(k);
     }
 
-    // Revision index per (origin, session), or the origin's `_origin` index for records with no session (ledger-s3).
-    type Scope = { source: string | null; sessionId: string | null };
-    const scopeOf = (m: LineMeta): Scope => (m[3] === null ? { source: null, sessionId: null } : { source: m[2], sessionId: m[3] });
-    const scopeId = (sc: Scope) => JSON.stringify([sc.source, sc.sessionId]);
-    const scopes = new Map<string, Scope>();
-    for (const k of kept) for (const m of k.meta) scopes.set(scopeId(scopeOf(m)), scopeOf(m));
-    const lockPrefix = JSON.stringify([tenant.orgId, tenant.workspaceId, tenant.userId, origin]);
-    const release = await locks.acquire([...scopes.keys()].map((s) => `${lockPrefix}\u001f${s}`));
+    // The revision index is per (origin, record id) in 64 shards (ledger-s3): lock the shards this batch touches.
+    const recordOf = (line: string) => JSON.parse(line) as { record_id: string; revision: string };
+    const shardKeys = new Set<string>();
+    for (const k of kept) for (const line of k.lines) shardKeys.add(keys.revisions(origin, recordOf(line).record_id));
+    const release = await locks.acquire([...shardKeys]);
     try {
-      const indexes = new Map<string, Record<string, [number, string, string]>>();
+      const shards = new Map<string, Record<string, [number, string, string, string | null, number, number]>>();
       try {
-        for (const [id, sc] of scopes) {
-          const doc = await ledger.readIndex(tenant, origin, sc.source, sc.sessionId);
-          // As the claim (ledger-s3 judge): a stale generation (a disable or reset since) counts as empty.
-          const gen = indexGeneration(fence, origin, sc.source, sc.sessionId);
-          indexes.set(id, doc && doc.epoch === gen.epoch && doc.resets === gen.resets ? doc.records : {});
+        for (const sk of shardKeys) {
+          const doc = (await ledger.readIndex(sk))?.doc;
+          if (doc && doc.originId !== origin) return "index_unreadable";
+          shards.set(sk, doc?.records ?? {});
         }
       } catch {
         return "index_unreadable";
       }
       const toWrite: Group[] = [];
-      const merges = new Map<string, LedgerRecord[]>();
+      const entries = new Map<string, IndexEntryInput[]>();
       const inBatch = new Map<string, [number, string]>();
+      const writtenSessions = new Map<string, [string, string]>();
       for (const k of kept) {
         const lines: string[] = [];
         const meta: LineMeta[] = [];
         k.lines.forEach((line, i) => {
           const m = k.meta[i]!;
-          const r = JSON.parse(line) as { record_id: string; revision: string };
+          const r = recordOf(line);
           const revision = Number(r.revision);
-          const id = scopeId(scopeOf(m));
-          const stored = Object.hasOwn(indexes.get(id)!, r.record_id) ? indexes.get(id)![r.record_id] : undefined;
-          const seen = inBatch.get(`${id}\u001f${r.record_id}`);
-          // ledger-s3: an equal or higher stored revision is stale. Split only for the counts.
+          const sk = keys.revisions(origin, r.record_id);
+          const shard = shards.get(sk)!;
+          const e = Object.hasOwn(shard, r.record_id) ? shard[r.record_id] : undefined;
+          // As the claim (ledger-s3 judge): an entry the fence has forgotten counts as absent; an equal or
+          // higher stored revision is stale. Split only for the counts.
+          const stored = e && !entryForgotten(fence, origin, e) ? e : undefined;
+          const seen = inBatch.get(r.record_id);
           if (stored && revision < stored[0]) counts.stale++;
           else if (stored && revision === stored[0]) {
             if (stored[2] === m[1]) counts.already_stored++;
             else counts.revision_conflict++;
           } else if (seen && revision === seen[0] && seen[1] !== m[1]) counts.revision_conflict++;
           else {
-            inBatch.set(`${id}\u001f${r.record_id}`, [revision, m[1]]);
-            merges.set(id, [...(merges.get(id) ?? []), { source: m[2], sessionId: m[3], recordId: r.record_id, revisionId: m[0], revision, digest: m[1] }]);
+            inBatch.set(r.record_id, [revision, m[1]]);
+            // Stamped with this read's generation, as a commit stamps its claim's.
+            const [sessionKey, epoch, resets] = recordGeneration(fence, origin, m[2], m[3]);
+            entries.set(sk, [...(entries.get(sk) ?? []), { recordId: r.record_id, revision, revisionId: m[0], digest: m[1], sessionKey, epoch, resets }]);
+            if (m[3] !== null) writtenSessions.set(JSON.stringify([m[2], m[3]]), [m[2], m[3]]);
             lines.push(fitLine(line));
             meta.push(m);
           }
@@ -815,6 +783,22 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
         addCounts(counts, toWrite.length);
         return "would_drain";
       }
+      const snapshot = { instance: fence.instance, version: fence.version, resets: fence.resets };
+      const epochOf = (f: FenceDoc, s: string, id: string) => fenceEpoch(f, origin, sessionKeyHash(s, id));
+      // Ownership (ingest_session_ownership) BEFORE any canonical write, as the claim: a reset that begins after
+      // this lists these sessions. Then the fence again: if it moved, leave the batch for a rerun.
+      if (writtenSessions.size) {
+        try {
+          for (const [s, id] of writtenSessions.values()) {
+            const [, epoch, resets] = recordGeneration(fence, origin, s, id);
+            await ledger.registerOwner(keys.owner(origin, s, id), { v: 1, originId: origin, source: s, sessionId: id, epoch, resets });
+          }
+          const again = await ledger.readFence(keys.fence);
+          if (again.state !== "present" || again.fence.instance !== snapshot.instance || again.fence.version !== snapshot.version) return "fence_moved";
+        } catch {
+          return "fence_recheck_failed";
+        }
+      }
       let machineId = liveMachineId(header.workspace_id, origin, header.user_id);
       if (toWrite.length) {
         try {
@@ -825,37 +809,38 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
           return "write_failed";
         }
       }
+      // The commit (ledger-s3 commit): read the fence, re-arm what it reached BEFORE any index merge, then merge
+      // the rest stamped with the first read's generation; mergeIndex drops what the latest fence forgot.
+      let after: FenceDoc;
+      const fencedNow = new Set<string>();
       try {
-        for (const [id, records] of merges) {
-          const sc = scopes.get(id)!;
-          // Stamped with the generation of the fence read before the write, as a commit stamps its claim's.
-          await ledger.mergeIndex(tenant, origin, sc.source, sc.sessionId, indexGeneration(fence, origin, sc.source, sc.sessionId), records);
-        }
-      } catch {
-        return "index_merge_failed";
-      }
-      // 0005 commit recheck: a deletion, disable, reset or privacy control that landed during the write re-arms erasure.
-      try {
-        const after = await ledger.readFence(tenant);
+        const now = await ledger.readFence(keys.fence);
         const journalAfter = await ledger.readJournal(tenant);
-        const deletedAfter = after ? deletedOf(after) : new Set<string>();
-        const everything = !after || after.resets !== before.resets ||
-          (journalAfter?.seq ?? 0) !== (journal?.seq ?? 0) || (journalAfter?.pending ?? 0) > 0 || (journalAfter?.ambiguous ?? 0) > 0;
+        after = now.state === "present" ? now.fence : newFence();
+        const same = now.state === "present" && now.fence.instance === snapshot.instance && now.fence.version === snapshot.version;
+        const journalMoved = (journalAfter?.seq ?? 0) !== (journal?.seq ?? 0) || (journalAfter?.pending ?? 0) > 0 || (journalAfter?.ambiguous ?? 0) > 0;
         const rearm = new Map(fencedSessions);
-        for (const g of toWrite) {
-          const sid = g.meta![0]![3];
-          if (sid === null) continue;
-          const source = g.meta![0]![2];
-          const moved = after !== null && indexGeneration(after, origin, source, sid).epoch !== indexGeneration(before, origin, source, sid).epoch;
-          if (everything || moved || deletedAfter.has(JSON.stringify([source, sid]))) rearm.set(JSON.stringify([source, sid]), [source, sid]);
+        for (const [pk, [s, id]] of writtenSessions) {
+          const reached = journalMoved || (!same && (now.state !== "present" || isDeleted(after, origin, s, id) || after.resets !== snapshot.resets || epochOf(after, s, id) !== epochOf(fence, s, id)));
+          if (reached) {
+            rearm.set(pk, [s, id]);
+            fencedNow.add(pk);
+          }
         }
-        // Create-only and keyed per (origin, session), so a deleted session is re-armed at most once.
-        for (const [source, sessionId] of rearm.values()) {
-          await ledger.rearm(tenant, { originId: origin, source, sessionId, machineId });
+        for (const [s, id] of rearm.values()) {
+          await ledger.writeRearm(keys.rearm(origin, s, id), { originId: origin, source: s, sessionId: id, machineId });
           summary.rearmed++;
         }
       } catch {
         return "fence_recheck_failed";
+      }
+      try {
+        for (const [sk, list] of entries) {
+          const keep = list.filter((e) => e.sessionKey === null || ![...fencedNow].some((pk) => { const [s, id] = JSON.parse(pk) as [string, string]; return sessionKeyHash(s, id) === e.sessionKey; }));
+          if (keep.length) await ledger.mergeIndex(sk, after, origin, keep);
+        }
+      } catch {
+        return "index_merge_failed";
       }
       if (!(await putMarker(key, sha256, "drained", counts, toWrite.length))) return "marker_failed";
       addCounts(counts, toWrite.length);
