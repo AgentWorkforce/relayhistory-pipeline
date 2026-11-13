@@ -13,8 +13,10 @@ import { dirname, join } from "node:path";
 import { RELEASE_TREE, manifestGeneration, sha256Text } from "../migrate.ts";
 import {
   RELEASE_ANCHOR_FIXED_PATHS,
+  RELEASE_ANCHOR_WORKFLOW_PATHS,
   releaseAnchorBinding,
   releaseAnchorPathAllowed,
+  releaseAnchorWorkflowTransform,
   requireReleaseAnchor,
   treeSchemaSteps,
 } from "../release-target.ts";
@@ -71,6 +73,55 @@ const commit = (files: Record<string, string | null>, message = "c") => {
   return git(repo, "rev-parse", "HEAD");
 };
 const step = (slot: string) => `-- step ${slot}\nSELECT 1;\n`;
+/**
+ * ci.yml and pg-proof.yml at the main base, in the pre-42797f3c form (push on main only,
+ * as at 113dc657), and the exact hunk 42797f3c added: the only form an anchor may carry.
+ */
+const CI = ".github/workflows/ci.yml";
+const PG = ".github/workflows/pg-proof.yml";
+const CI_BASE = [
+  "name: ci",
+  "on:",
+  "  pull_request:",
+  "  push:",
+  "    branches: [main]",
+  "permissions:",
+  "  contents: read",
+  "jobs:",
+  "  checks:",
+  "    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}",
+  "    steps:",
+  "      - uses: actions/checkout@v4",
+  "  session-read-worker:",
+  "    uses: ./.github/workflows/session-read-worker-checks.yml",
+  "",
+].join("\n");
+const PG_BASE = [
+  "name: pg-proof",
+  "# Real PostgreSQL (disposable service containers).",
+  "on:",
+  "  pull_request:",
+  "  push:",
+  "    branches: [main]",
+  "permissions:",
+  "  contents: read",
+  "jobs:",
+  "  real-postgres:",
+  "    name: real PostgreSQL ${{ matrix.pg }}",
+  "    runs-on: ubuntu-latest",
+  "",
+].join("\n");
+const RELEASE_PUSH = [
+  "    # release/schema-*: the protected release anchor branches (a held-step target_sha",
+  "    # needs green push runs on its own branch; scripts/schema-release-github.ts).",
+  "    branches: [main, 'release/schema-*']",
+].join("\n");
+/** Written out, not computed by the transform under test. */
+const CI_ANCHOR = CI_BASE.replace("    branches: [main]\n", `${RELEASE_PUSH}\n`);
+const PG_ANCHOR = PG_BASE.replace("    branches: [main]\n", `${RELEASE_PUSH}\n`);
+/** Main moved on after the base (as current main has): the release sha's workflows differ further. */
+const CI_MAIN = CI_ANCHOR + "  selfhost-e2e:\n    runs-on: ubuntu-latest\n";
+const PG_MAIN = PG_ANCHOR.replace("name: pg-proof\n", "name: pg-proof\n# More proofs.\n");
 const M0 = commit({
   [upPath("046000")]: step("046000"),
   [upPath("047000")]: step("047000"),
@@ -78,6 +129,8 @@ const M0 = commit({
   ...verifiers("v0"),
   ...bootstrap("b0"),
   "src/hoopdb/session-bootstrap-chain.ts": readFileSync(new URL("../session-bootstrap-chain.ts", import.meta.url), "utf8"),
+  [CI]: CI_BASE,
+  [PG]: PG_BASE,
   "README.md": "main\n",
 }, "M0");
 const R = commit({
@@ -88,6 +141,8 @@ const R = commit({
   [rbPath("047010")]: "-- rb 047010\n",
   "src/hoopdb/migrate-guards.ts": "export const g = 1;\n",
   ...bootstrap("b1"),
+  [CI]: CI_MAIN,
+  [PG]: PG_MAIN,
   "README.md": "main 2\n",
 }, "R");
 git(repo, "checkout", "-q", "-b", "anchors", M0);
@@ -113,7 +168,7 @@ const PREFIX = {
 const bind = (targetSha: string, target: string, prefix: [string, string][], r = repo) =>
   releaseAnchorBinding({ repo: r, releaseSha: R, targetSha, target, prefix });
 /** A commit with `tree` built from `base`'s tree plus `files`, with the given parents; no checkout. */
-const forge = (base: string, files: Record<string, string | null>, parents: string[], message = "forged") => {
+const forge = (base: string, files: Record<string, string | null>, parents: string[], message = "forged", mode = "100644") => {
   const index = join(mkdtempSync(join(tmpdir(), "release-anchor-index-")), "index");
   const env = { ...process.env, GIT_INDEX_FILE: index };
   const g = (args: string[], input?: string) =>
@@ -121,7 +176,7 @@ const forge = (base: string, files: Record<string, string | null>, parents: stri
   g(["read-tree", base]);
   for (const [path, content] of Object.entries(files)) {
     if (content === null) g(["update-index", "--force-remove", "--", path]);
-    else g(["update-index", "--add", "--cacheinfo", `100644,${g(["hash-object", "-w", "--stdin"], content)},${path}`]);
+    else g(["update-index", "--add", "--cacheinfo", `${mode},${g(["hash-object", "-w", "--stdin"], content)},${path}`]);
   }
   const tree = g(["write-tree"]);
   return execFileSync(
@@ -311,6 +366,89 @@ test("allowlisted, reproducible diff: an extra file, a tampered or re-moded file
   withRef("release/schema-047000", noVerifier, () =>
     expect(code(() => bind(noVerifier, up("047000"), PREFIX.A))).toBe("release_target_verifier_missing"),
   );
+});
+
+test("workflow transform: the one push-selector line becomes main's 42797f3c hunk; any other base shape refuses", () => {
+  expect(releaseAnchorWorkflowTransform(CI_BASE)).toBe(CI_ANCHOR);
+  expect(releaseAnchorWorkflowTransform(PG_BASE)).toBe(PG_ANCHOR);
+  expect(RELEASE_ANCHOR_WORKFLOW_PATHS).toEqual([CI, PG]);
+  const drift = (base: string) => code(() => releaseAnchorWorkflowTransform(base));
+  for (const [label, base] of [
+    ["no push selector", CI_BASE.replace("    branches: [main]\n", "")],
+    ["already transformed (current main)", CI_ANCHOR],
+    ["selector twice", CI_BASE.replace("  pull_request:\n", "  pull_request:\n    branches: [main]\n")],
+    ["selector under pull_request only", CI_BASE.replace("  pull_request:\n  push:\n    branches: [main]\n", "  push:\n  pull_request:\n    branches: [main]\n")],
+    ["push not in the top-level on block", CI_BASE.replace("on:\n  pull_request:\n  push:\n    branches: [main]\n", "on:\n  pull_request:\nx:\n  push:\n    branches: [main]\n")],
+    ["other indentation", CI_BASE.replace("    branches: [main]", "      branches: [main]")],
+    ["CRLF base", CI_BASE.replaceAll("\n", "\r\n")],
+    ["empty", ""],
+  ] as [string, string][])
+    expect([label, drift(base)]).toEqual([label, "release_anchor_workflow_drift"]);
+});
+
+test("workflow files: an anchor may carry ci.yml and pg-proof.yml only as transform(main base), mode 100644", () => {
+  // The two transformed files (or just one) pass, though the release sha's copies differ:
+  // they are bound to the main base, not the release sha.
+  const wf = forge(A, { [CI]: CI_ANCHOR, [PG]: PG_ANCHOR }, [M0], "A with workflows");
+  const ciOnly = forge(A, { [CI]: CI_ANCHOR }, [M0], "A with ci.yml");
+  for (const sha of [wf, ciOnly])
+    withRef("release/schema-047000", sha, () => {
+      expect(bind(sha, up("047000"), PREFIX.A).targetSha).toBe(sha);
+      expect(requireReleaseAnchor({ repo, releaseSha: R, targetSha: sha, target: up("047000") }).mainBase).toBe(M0);
+    });
+  // Stacked: B on top of the workflow anchor still diffs against M0 and passes.
+  const bOnWf = forge(B, { [CI]: CI_ANCHOR, [PG]: PG_ANCHOR }, [wf], "B on workflow A");
+  withRef("release/schema-047000", wf, () =>
+    withRef("release/schema-047010", bOnWf, () => expect(bind(bOnWf, up("047010"), PREFIX.B).targetSha).toBe(bOnWf)),
+  );
+  // Unchanged workflows (A itself) are not in the diff at all.
+  expect(bind(A, up("047000"), PREFIX.A).targetSha).toBe(A);
+  const tweak = (text: string, from: string, to: string) => {
+    expect(text).toContain(from);
+    return text.replace(from, to);
+  };
+  for (const [label, files] of [
+    ["ci.yml copied from the release sha (current main)", { [CI]: CI_MAIN, [PG]: PG_ANCHOR }],
+    ["pg-proof.yml copied from the release sha", { [CI]: CI_ANCHOR, [PG]: PG_MAIN }],
+    ["other branch glob", { [CI]: tweak(CI_ANCHOR, "[main, 'release/schema-*']", "[main, 'release/*']") }],
+    ["branches line without the comments", { [CI]: CI_BASE.replace("[main]", "[main, 'release/schema-*']") }],
+    ["comment reworded", { [CI]: tweak(CI_ANCHOR, "protected release anchor", "release anchor") }],
+    ["job renamed", { [CI]: tweak(CI_ANCHOR, "  checks:\n", "  check:\n") }],
+    ["permissions widened", { [CI]: tweak(CI_ANCHOR, "contents: read", "contents: write") }],
+    ["runner changed", { [PG]: tweak(PG_ANCHOR, "runs-on: ubuntu-latest", "runs-on: self-hosted") }],
+    ["action version changed", { [CI]: tweak(CI_ANCHOR, "actions/checkout@v4", "actions/checkout@v5") }],
+    ["event added", { [CI]: tweak(CI_ANCHOR, "  pull_request:\n", "  pull_request:\n  workflow_dispatch:\n") }],
+    ["trailing newline dropped", { [CI]: CI_ANCHOR.slice(0, -1) }],
+    ["CRLF anchor", { [CI]: CI_ANCHOR.replaceAll("\n", "\r\n") }],
+    ["workflow deleted", { [CI]: null }],
+    ["third workflow file", { [CI]: CI_ANCHOR, [PG]: PG_ANCHOR, ".github/workflows/other.yml": CI_ANCHOR }],
+    ["third workflow file alone", { ".github/workflows/session-read-worker-checks.yml": "name: x\n" }],
+  ] as [string, Record<string, string | null>][]) {
+    const forged = forge(A, files, [M0], label);
+    withRef("release/schema-047000", forged, () =>
+      expect([label, code(() => bind(forged, up("047000"), PREFIX.A))]).toEqual([label, "release_anchor_workflow_drift"]),
+    );
+  }
+  // Mode: the transformed bytes, executable.
+  const exec = forge(A, { [CI]: CI_ANCHOR }, [M0], "executable ci.yml", "100755");
+  withRef("release/schema-047000", exec, () => expect(code(() => bind(exec, up("047000"), PREFIX.A))).toBe("release_anchor_workflow_drift"));
+  // A main base without the main-only selector: nothing an anchor carries can match.
+  const other = mkdtempSync(join(tmpdir(), "release-anchor-wf-base-"));
+  execFileSync("git", ["clone", "-q", "--no-local", repo, other]);
+  git(other, "checkout", "-q", "main");
+  writeFileSync(join(other, CI), CI_BASE.replace("[main]", "[main, develop]"));
+  git(other, "commit", "-q", "-am", "main base with another push selector");
+  const R3 = git(other, "rev-parse", "HEAD");
+  for (const text of [CI_ANCHOR, CI_BASE.replace("[main]", "[main, develop, 'release/schema-*']")]) {
+    git(other, "checkout", "-q", "--detach", R3);
+    writeFileSync(join(other, CI), text);
+    git(other, "commit", "-q", "-am", "anchor");
+    const anchor = git(other, "rev-parse", "HEAD");
+    git(other, "update-ref", `${NS}release/schema-047000`, anchor);
+    expect(code(() => requireReleaseAnchor({ repo: other, releaseSha: R3, targetSha: anchor, target: up("047000") }))).toBe(
+      "release_anchor_workflow_drift",
+    );
+  }
 });
 
 test("prefix proof: the release sha and the anchor must both prove the prefix; no step above the target in the anchor", () => {
