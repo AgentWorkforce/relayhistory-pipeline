@@ -518,6 +518,24 @@ describe("re-arm sweeper: #596 review notes", () => {
       records: input.records, machineId: machineOf(TENANT) })).rejects.toMatchObject({ code: "ledger_owner_invalid" });
     const marker = s3LedgerKeys(ROOT, TENANT).rearm(ORIGIN, "claude", "sess-1");
     expect(JSON.parse(await text(store, marker))).toMatchObject({ v: 1, sessionId: "sess-1", machineId: machineOf(TENANT), workspaceId: TENANT.workspaceId });
+    // The sweep: the session's own stub is unreadable, so it is treated as unstamped and the machine is derived from the
+    // session's manifest (hash-verified, not taken from the marker); the data is erased.
+    const files = canonical(TENANT);
+    await put(store, files[0]!, manifestOf(TENANT.userId));
+    await seed(store, files.slice(1));
+    expect((await sweep(store)).counts).toMatchObject({ machineDerived: 1, erased: 1, failed: 0, layoutCollision: 0 });
+    for (const k of files) expect(await exists(store, k)).toBe(false);
+    expect(await doneOf(store, marker)).toMatchObject({ outcome: "erased" });
+  });
+
+  test("a corrupt stub of ANOTHER session of the origin still fails closed (it could be a colliding live session)", async () => {
+    const store = fresh();
+    await ledgerOn(store).claim(claimInput(TENANT, "bx", [rec("r-bx", 1, "sess-2")]));
+    await rearmed(store, TENANT, "b1");
+    await seed(store, canonical(TENANT));
+    await put(store, ownerKey(TENANT, "sess-2"), "{corrupt other stub");
+    expect((await sweep(store)).counts).toMatchObject({ layoutCollision: 1, erased: 0, failed: 0 });
+    for (const k of canonical(TENANT)) expect(await exists(store, k)).toBe(true);
   });
 
   test("`empty` is version-aware: a delete marker over an old version under the machine is not empty (unbound, nothing recorded)", async () => {

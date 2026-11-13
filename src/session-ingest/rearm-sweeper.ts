@@ -326,24 +326,25 @@ export async function sweepRearmMarkers(deps: { store: ObjectStore; eraser: Page
   }
 
   /** The origin's ownership stubs, read once per pass (cached), bounded by REARM_MAX_OWNER_SCAN and the deadline. */
-  const ownerScans = new Map<string, OwnerDoc[] | "invalid" | "too_large">();
-  async function ownersOf(prefix: string): Promise<OwnerDoc[] | "invalid" | "too_large" | "deferred"> {
+  /** An origin's stubs: the readable ones, and the keys of unreadable (corrupt) ones. */
+  interface OwnerScan { docs: OwnerDoc[]; invalid: string[] }
+  const ownerScans = new Map<string, OwnerScan | "too_large">();
+  async function ownersOf(prefix: string): Promise<OwnerScan | "too_large" | "deferred"> {
     const cached = ownerScans.get(prefix);
     if (cached !== undefined) return cached;
-    const out: OwnerDoc[] = [];
-    let cursor: string | undefined, result: OwnerDoc[] | "invalid" | "too_large" = out;
+    const out: OwnerScan = { docs: [], invalid: [] };
+    let cursor: string | undefined, result: OwnerScan | "too_large" = out;
     scan: do {
       if (expired()) return "deferred";
       const page = await store.list(objectKey(prefix), cursor);
       for (const item of page.items) {
         const k = String(item.key);
         if (!k.startsWith(`${prefix}/`) || !k.endsWith(".json")) continue;
-        if (out.length >= ownerScanLimit) { result = "too_large"; break scan; }
+        if (out.docs.length + out.invalid.length >= ownerScanLimit) { result = "too_large"; break scan; }
         if (expired()) return "deferred";
         const other = await readOwnerLoose(k);
-        // An unreadable stub could be a colliding live session: fail closed.
-        if (other === "invalid") { result = "invalid"; break scan; }
-        if (other !== null) out.push(other);
+        if (other === "invalid") out.invalid.push(k);
+        else if (other !== null) out.docs.push(other);
       }
       cursor = page.nextCursor;
     } while (cursor);
@@ -351,11 +352,17 @@ export async function sweepRearmMarkers(deps: { store: ObjectStore; eraser: Page
     return result;
   }
 
-  /** Step 4: the marker's machine is its user's (the ownership stub, or derived), and no live session shares its physical dir. */
+  /**
+   * Step 4: the marker's machine is its user's (the ownership stub, or derived), and no live session shares its physical
+   * dir. The session's OWN stub unreadable (corrupt: e.g. the stamp that failed after the marker was written) is treated
+   * as unstamped: the machine is derived and hash-verified (derivedMachine), never taken from the marker. Any OTHER
+   * unreadable stub of the origin could be a colliding live session, so it still fails closed (`layoutCollision`).
+   */
   async function bound(at: { dir: string; orgId: string; workspaceSegment: string }, key: string, digest: string, fence: FenceDoc, m: RearmDoc): Promise<Outcome | null> {
-    const stub = await io.readOwner(ownerKeyIn(at.dir, m.originId, m.source, m.sessionId));
-    if (!stub || stub.doc.originId !== m.originId || stub.doc.source !== m.source || stub.doc.sessionId !== m.sessionId) return "ownerMissing";
-    if (stub.doc.machineId === undefined) {
+    const ownKey = ownerKeyIn(at.dir, m.originId, m.source, m.sessionId);
+    const stub = await readOwnerLoose(ownKey);
+    if (stub === null || (stub !== "invalid" && (stub.originId !== m.originId || stub.source !== m.source || stub.sessionId !== m.sessionId))) return "ownerMissing";
+    if (stub === "invalid" || stub.machineId === undefined) {
       const derived = await derivedMachine(at, m);
       if (derived === "deferred") return "deferred";
       if (derived === "unbound") return "machineUnbound";
@@ -364,13 +371,13 @@ export async function sweepRearmMarkers(deps: { store: ObjectStore; eraser: Page
         return "emptyUnbound";
       }
       counts.machineDerived++;
-    } else if (stub.doc.machineId !== m.machineId) return "machineMismatch";
+    } else if (stub.machineId !== m.machineId) return "machineMismatch";
     const owners = await ownersOf(ownersOriginPrefix(at.dir, m.originId));
     if (owners === "deferred") return "deferred";
     if (owners === "too_large") return "layoutScanTooLarge";
-    if (owners === "invalid") return "layoutCollision";
+    if (owners.invalid.some((k) => k !== ownKey)) return "layoutCollision";
     const h = layoutComponent(m.source), s = layoutComponent(m.sessionId);
-    for (const other of owners) {
+    for (const other of owners.docs) {
       if (other.source === m.source && other.sessionId === m.sessionId) continue;
       if (layoutComponent(other.source) === h && layoutComponent(other.sessionId) === s && !isDeleted(fence, m.originId, other.source, other.sessionId)) return "layoutCollision";
     }
