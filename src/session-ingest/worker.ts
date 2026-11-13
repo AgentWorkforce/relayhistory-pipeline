@@ -94,6 +94,7 @@ import { sessionEraseConfig, sessionEraseEnabled, SESSION_ERASE_CONFIG_INVALID, 
 import type { DeliverDeps } from "./deliver.ts";
 import type { AnalyticsPort } from "../shared/analytics.ts";
 import { WORKER_LIMITS } from "../shared/analytics-export.ts";
+import { ingestLedgerMode } from "./ledger-s3.ts";
 import { AnalyticsConfigError, analyticsConfig, analyticsCounterFields, createAnalyticsSink, type AnalyticsConfig } from "../shared/analytics-config.ts";
 
 interface QueueLike<T> {
@@ -114,6 +115,8 @@ export interface IngestWorkerEnv {
   INGEST_SYNC_ADMISSION_FROZEN_RECEIPT?: string;
   /** INGEST_UPLOAD_CONSENT: off (default) | report | hold-only | enforce (upload-consent.ts). */
   INGEST_UPLOAD_CONSENT?: string;
+  /** INGEST_LEDGER: sql (default) only. s3 (decision 0005) is served by the upload-admission Lambda, never here. */
+  INGEST_LEDGER?: string;
   /** off (default) | allowlist | on (upload-admission.ts): the ?uploadKey= admission status only. */
   HISTORY_UPLOAD_DIRECT?: string;
   /** HISTORY_UPLOAD_DIRECT=allowlist: comma-separated org:<id> / ws:<id>. */
@@ -259,6 +262,8 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   if (!accessKeyId || !secretAccessKey || !signingKey) return null;
   const acceptanceMode = env.INGEST_ACCEPTANCE_MODE ?? "canonical";
   if (acceptanceMode !== "canonical" && acceptanceMode !== "buffered") throw new Error("session ingest: acceptance mode invalid");
+  // Decision 0005: the Worker's ledger is SQL (unset or "sql": unchanged). s3 is the upload-admission Lambda's only.
+  if (ingestLedgerMode(env.INGEST_LEDGER) !== "sql") throw new Error("session ingest: INGEST_LEDGER=s3 is served only by the upload-admission consumer");
   if(acceptanceMode==="buffered"&&(!/^[a-f0-9]{64}$/.test(env.INGEST_EXPECT_GENERATION??"")||env.INGEST_KEY_ROOT&&env.INGEST_KEY_ROOT!=="96bulls"))throw new Error("session ingest: buffered generation or prefix invalid");
   const acceptGenerations = acceptedGenerations(env, acceptanceMode);
   const raw = env.INGEST_REPLICA_MODE ?? "off";

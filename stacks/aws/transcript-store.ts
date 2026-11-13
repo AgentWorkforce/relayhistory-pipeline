@@ -52,7 +52,7 @@
  *                              `uploadInbox.consumerEnvironment`; "none", "" or unset refuse here and are
  *                              for self-host only).
  *                              and `transcriptStore.uploadAdmission` (the consumer's HISTORY_UPLOAD_DIRECT
- *                              mode, its allowlist, and the Cloudflare account + admission-queue ids).
+ *                              mode and its allowlist; it admits with INGEST_LEDGER=s3, decision 0005).
  *                              Declares the desktop-upload role (create-only SSE-KMS PutObject under
  *                              `96bulls/.upload-inbox/*`), the upload-admission consumer Lambda (reserved
  *                              concurrency 4, SQS batch size 1, ReportBatchItemFailures) with its secret
