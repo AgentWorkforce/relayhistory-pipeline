@@ -73,6 +73,7 @@ import { KMS_ADMIN_ACTIONS, denyInsecureTransport, trailKeyPolicy } from "./hard
 import { alchemyStatePrefix } from "./preflight.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
 import { assertBufferedGcRoleArn, bufferedGcBucketStatements, bufferedGcKeyStatements } from "./buffered-gc-policy.ts";
+import { CROSS_ACCOUNT_WORKER_BUCKET_SIDS, CROSS_ACCOUNT_WORKER_KEY_SIDS, assertCrossAccountWorkerRoleArn, crossAccountWorkerBucketStatements, crossAccountWorkerKeyStatements } from "./cross-account-worker-policy.ts";
 import {
   UPLOAD_ADMISSION_DLQ_RETENTION,
   UPLOAD_ADMISSION_MAX_RECEIVE_COUNT,
@@ -148,6 +149,13 @@ export const INBOX_CANDIDATE_KEY_ROOT = "96bulls/upload-inbox/v1";
 export interface TranscriptStoreInputs {
   /** Exact, separately managed GC role. Required for this production stage: omission must never revoke active GC access. */
   bufferedGcRoleArn?: string;
+  /**
+   * Default off. The sessions worker role in ANOTHER account (decision 0007: the summary worker on agentrelay
+   * EKS, infra terraform/examples/aws-sessions-worker-cross-account). Present: the bucket and key policies add
+   * exactly its list/read/summary-write and via-S3 key statements (cross-account-worker-policy.ts). Omit: both
+   * policies are byte-for-byte as without it.
+   */
+  crossAccountWorkerRoleArn?: string;
   /**
    * Log management events too (default true). Set false only when another trail
    * in the account already logs them (a second copy is billed).
@@ -286,8 +294,9 @@ export function assertTranscriptStoreInputs(
   if (inputs.region !== TRANSCRIPT_REGION) refuse(`transcript content must stay in ${TRANSCRIPT_REGION} (migration plan, regional boundaries), got ${inputs.region}`);
   if (inputs.partition !== TRANSCRIPT_PARTITION) refuse(`partition must be exactly ${TRANSCRIPT_PARTITION}, got ${JSON.stringify(inputs.partition)}`);
   for (const k of Object.keys(store))
-    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "uploadControlRoleArn" && k !== "uploadInboxSse" && k !== "uploadAdmission" && k !== "uploadPresignIssuer" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn") refuse(`transcriptStore.${k} is not a known setting`);
+    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "uploadControlRoleArn" && k !== "uploadInboxSse" && k !== "uploadAdmission" && k !== "uploadPresignIssuer" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn" && k !== "crossAccountWorkerRoleArn") refuse(`transcriptStore.${k} is not a known setting`);
   assertBufferedGcRoleArn(store.bufferedGcRoleArn, inputs.accountId);
+  if (store.crossAccountWorkerRoleArn !== undefined) assertCrossAccountWorkerRoleArn(store.crossAccountWorkerRoleArn, inputs.accountId);
   assertInboxAuthorityKeyRoot(store.inboxAuthorityKeyRoot, refuse);
   assertUploadControlRoleArn(store.uploadControlRoleArn, refuse);
   assertHostedUploadInboxSse(store.uploadInboxSse, false, refuse);
@@ -336,7 +345,8 @@ export type TranscriptStorePlanPhase =
   | "session buffered erasure delete update"
   | "repo tag rename"
   | "upload inbox rollout"
-  | "upload inbox update";
+  | "upload inbox update"
+  | "cross-account worker grants";
 
 /**
  * The read API's own phases (session-read-api.ts). It touches nothing else: no
@@ -800,6 +810,10 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
     assertRepoTagRenameDiff(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
     return "repo tag rename";
   }
+  // The cross-account worker's grants (crossAccountWorkerRoleArn) are added alone: only the bucket
+  // and key policies update, and only by appending exactly its reviewed statements.
+  const workerGrantPhase = crossAccountWorkerGrantsPhase(compact.operations, capture.detailedPlanText, refuse);
+  if (workerGrantPhase) return workerGrantPhase;
   // The upload inbox (HISTORY_UPLOAD_DIRECT_INFRA=on) rolls out and updates alone.
   const uploadPhase = uploadInboxPhase(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
   if (uploadPhase) return uploadPhase;
@@ -860,6 +874,88 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   if (phase.name === "srv-writer propagation recovery") assertSrvWriterRecoveryDiff(capture.detailedPlanText, capture.stateSnapshotText, refuse);
   if (phase.name === "srv-writer inbox policy update") assertSrvWriterInboxPolicyDiff(capture.detailedPlanText, refuse);
   return phase.name;
+}
+
+/**
+ * The cross-account worker grants phase: everything noop except `transcripts` and/or `transcripts-key`
+ * updates, and each update's detailed diff is the live policy (-) and the planned policy (+) where every
+ * other statement is unchanged and the only difference is that resource's worker Sids, all of them, added
+ * (crossAccountWorkerRoleArn set) or removed (unset again: the revocation path).
+ * Returns undefined when the plan is not shaped like this phase at all.
+ */
+function crossAccountWorkerGrantsPhase(operations: ReadonlyMap<string, string>, detailedPlanText: string, refuse: (why: string) => never): TranscriptStorePlanPhase | undefined {
+  const changed = [...operations].filter(([, a]) => a !== "noop");
+  if (changed.length === 0 || !changed.every(([r, a]) => (r === "transcripts" || r === "transcripts-key") && a === "update")) return undefined;
+  const lines = detailedPlanText.split(/\r?\n/);
+  // A worker Sid on only one side of the diff: added or removed. A policy re-rendered with them on both
+  // sides (another phase's cascade) is not this phase.
+  const touches = (r: string) => {
+    const sids = (m: string) => planResourceBlock(lines, r).flatMap((l) => {
+      const hit = /^ {2}([+-])\s+(?:- )?Sid:\s*(SessionsWorker[A-Za-z0-9]*)\s*$/.exec(l);
+      return hit && hit[1] === m ? [hit[2]!] : [];
+    }).sort().join(",");
+    return sids("+") !== sids("-");
+  };
+  // Not this phase unless the diff adds or removes a worker Sid (other bucket/key-only updates keep their existing refusals).
+  if (!changed.some(([r]) => touches(r))) return undefined;
+  for (const [r] of changed) {
+    const expected: readonly string[] = r === "transcripts" ? CROSS_ACCOUNT_WORKER_BUCKET_SIDS : CROSS_ACCOUNT_WORKER_KEY_SIDS;
+    assertAppendOnlyPolicyDiff(planResourceBlock(lines, r), expected, (why) => refuse(`cross-account worker grants: ${r}: ${why}`));
+  }
+  return "cross-account worker grants";
+}
+
+function planResourceBlock(lines: readonly string[], resource: string): string[] {
+  const start = lines.findIndex((line) => new RegExp(`^\\s*\\[${resource.replace(/[-]/g, "\\-")}\\]\\s+update\\s*$`).test(line));
+  if (start < 0) return [];
+  const rest = lines.slice(start + 1);
+  const end = rest.findIndex((line) => /^\s*\[[^\]]+\]\s+\S+\s*$/.test(line));
+  return end < 0 ? rest : rest.slice(0, end);
+}
+
+/** Splits one side of a policy diff into header lines and statement items keyed by direct Sid. */
+function policyDiffSide(side: string[], refuse: (why: string) => never) {
+  const dashIndents = side.map((l) => /^( *)- /.exec(l)?.[1]?.length).filter((n): n is number => n !== undefined);
+  if (dashIndents.length === 0) return refuse("policy diff has no statements");
+  const itemIndent = Math.min(...dashIndents);
+  const header: string[] = [];
+  const items: string[][] = [];
+  for (const l of side) {
+    const indent = /^( *)/.exec(l)![1]!.length;
+    if (indent === itemIndent && l.slice(indent).startsWith("- ")) items.push([l]);
+    else if (indent > itemIndent && items.length > 0) items[items.length - 1]!.push(l);
+    else header.push(l);
+  }
+  const bySid = new Map<string, string>();
+  for (const item of items) {
+    const body = item.map((l, i) => (i === 0 ? l.replace("- ", "  ") : l));
+    const direct = new RegExp(`^ {${itemIndent + 2}}Sid:\\s*([A-Za-z][A-Za-z0-9]*)\\s*$`);
+    const sids = body.map((l) => direct.exec(l)?.[1]).filter((v): v is string => v !== undefined);
+    if (sids.length !== 1) refuse("every statement must have exactly one direct Sid");
+    if (bySid.has(sids[0]!)) refuse(`duplicate Sid ${sids[0]}`);
+    bySid.set(sids[0]!, body.join("\n"));
+  }
+  return { header: header.join("\n"), bySid };
+}
+
+function assertAppendOnlyPolicyDiff(block: readonly string[], expected: readonly string[], refuse: (why: string) => never) {
+  // Alchemy marks a changed line in column 3 ("  - " / "  + "); unchanged lines are indented past it.
+  const marked = block.filter((l) => /^ {2}[+-] /.test(l));
+  if (marked.length === 0) refuse("the detailed plan must show the policy diff (no declared property changes is not reviewable)");
+  const side = (m: "+" | "-") => marked.filter((l) => l[2] === m).map((l) => l.slice(3));
+  const live = policyDiffSide(side("-"), refuse);
+  const planned = policyDiffSide(side("+"), refuse);
+  if (live.header !== planned.header) refuse("only policy statements may change");
+  const added = [...planned.bySid.keys()].filter((sid) => !live.bySid.has(sid)).sort();
+  const removed = [...live.bySid.keys()].filter((sid) => !planned.bySid.has(sid)).sort();
+  const exact = JSON.stringify([...expected].sort());
+  for (const [sid, text] of live.bySid) {
+    if (planned.bySid.has(sid) && planned.bySid.get(sid) !== text) refuse(`existing statement ${sid} must stay byte-identical`);
+    if (!planned.bySid.has(sid) && !expected.includes(sid)) refuse(`existing statement ${sid} must stay byte-identical`);
+  }
+  const adds = removed.length === 0 && JSON.stringify(added) === exact;
+  const removes = added.length === 0 && JSON.stringify(removed) === exact;
+  if (!adds && !removes) refuse(`must add (or, to revoke, remove) exactly ${expected.join(", ")}; adds ${added.join(", ") || "(none)"}, removes ${removed.join(", ") || "(none)"}`);
 }
 
 /**
@@ -1371,7 +1467,7 @@ export function trailLifecycleRules() {
  * including `aws:kms` without a key id (S3 would use `aws/s3`). SSE-C is blocked
  * separately by the encryption configuration.
  */
-export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string; accountId?: string; bufferedGcRoleArn?: string; analysisDeleterArn?: string; uploadInbox?: { uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string } }) {
+export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string; accountId?: string; bufferedGcRoleArn?: string; crossAccountWorkerRoleArn?: string; analysisDeleterArn?: string; uploadInbox?: { uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string } }) {
   if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId ?? "");
   // The eraser+GC principal list is shared by the analysis-on and analysis-off variants of
   // the eraser-only deny below: a single control point, covered by the hardening mutations.
@@ -1450,6 +1546,7 @@ export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; e
     },
     ...(i.bufferedGcRoleArn ? bufferedGcBucketStatements({ accountId: i.accountId!, bucketArn: i.bucketArn, roleArn: i.bufferedGcRoleArn }) : []),
     ...(i.uploadInbox ? uploadInboxBucketStatements({ bucketArn: i.bucketArn, eraserArn: i.eraserArn, ...i.uploadInbox }) : []),
+    ...(i.crossAccountWorkerRoleArn !== undefined ? crossAccountWorkerBucketStatements({ bucketAccountId: i.accountId ?? "", bucketArn: i.bucketArn, roleArn: i.crossAccountWorkerRoleArn }) : []),
   ];
 }
 
@@ -1501,7 +1598,7 @@ export function trailLogBucketPolicy(i: { bucketArn: string; trailArn: string; a
  * The eraser and every other operator role have no use of it: deleting needs no key,
  * and nobody reads transcripts with the console.
  */
-export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; bufferedGcRoleArn?: string; analysisResults?: boolean; readApiRoleArn?: string; uploadInbox?: { uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string } }) {
+export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; bufferedGcRoleArn?: string; crossAccountWorkerRoleArn?: string; analysisResults?: boolean; readApiRoleArn?: string; uploadInbox?: { uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string } }) {
   if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId);
   const via = {
     StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
@@ -1519,6 +1616,7 @@ export function transcriptKeyPolicy(i: { accountId: string; region: string; buck
       ...(i.readApiRoleArn ? [readApiAnalysisKeyStatement({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.readApiRoleArn, glob: ANALYSIS_RESULT_OBJECT_GLOB })] : []),
       ...(i.bufferedGcRoleArn ? bufferedGcKeyStatements({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.bufferedGcRoleArn }) : []),
       ...(i.uploadInbox ? uploadInboxKeyStatements({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, ...i.uploadInbox }) : []),
+      ...(i.crossAccountWorkerRoleArn !== undefined ? crossAccountWorkerKeyStatements({ bucketAccountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.crossAccountWorkerRoleArn }) : []),
     ],
   };
 }
@@ -1682,6 +1780,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
     // Defense in depth for direct callers: refuse before declaring the first resource.
     if (i.stage === TRANSCRIPT_STAGE || i.transcriptStore.bufferedGcRoleArn !== undefined)
       assertBufferedGcRoleArn(i.transcriptStore.bufferedGcRoleArn, i.accountId);
+    if (i.transcriptStore.crossAccountWorkerRoleArn !== undefined) assertCrossAccountWorkerRoleArn(i.transcriptStore.crossAccountWorkerRoleArn, i.accountId);
     assertInboxAuthorityKeyRoot(i.transcriptStore.inboxAuthorityKeyRoot, (why) => { throw new Error(why); });
     const uploadDirect = i.historyUploadDirectInfra === true;
     if (i.historyUploadDirectInfra !== undefined && typeof i.historyUploadDirectInfra !== "boolean")
@@ -1830,6 +1929,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
         srvWriterArn: srvWriter.userArn as unknown as string,
         readerArn: reader.userArn as unknown as string,
         bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn,
+        ...(i.transcriptStore.crossAccountWorkerRoleArn !== undefined ? { crossAccountWorkerRoleArn: i.transcriptStore.crossAccountWorkerRoleArn } : {}),
         ...(pipelineRoleArn ? { pipelineRoleArn } : {}),
         ...(pipeline?.analysisJobs?.enabled ? { analysisResults: true } : {}),
         ...(readApiRoleArn ? { readApiRoleArn } : {}),
@@ -1862,7 +1962,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       publicAccessBlock: PUBLIC_ACCESS_BLOCK,
       objectOwnership: "BucketOwnerEnforced",
       policy: [
-        ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn, accountId: i.accountId, bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn, ...(pipelineRoleArn && pipeline?.analysisJobs?.enabled ? { analysisDeleterArn: pipelineRoleArn } : {}), ...(uploadInboxRoles ? { uploadInbox: uploadInboxRoles } : {}) }),
+        ...transcriptBucketPolicy({ bucketArn: n.bucketArn, keyArn: key.keyArn as unknown as string, eraserArn, accountId: i.accountId, bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn, ...(i.transcriptStore.crossAccountWorkerRoleArn !== undefined ? { crossAccountWorkerRoleArn: i.transcriptStore.crossAccountWorkerRoleArn } : {}), ...(pipelineRoleArn && pipeline?.analysisJobs?.enabled ? { analysisDeleterArn: pipelineRoleArn } : {}), ...(uploadInboxRoles ? { uploadInbox: uploadInboxRoles } : {}) }),
         ...(pipelineRoleArn ? pipelineBucketStatements({ bucketArn: n.bucketArn, roleArn: pipelineRoleArn, analysisResults: pipeline?.analysisJobs?.enabled === true }) : []),
         ...(readApiRoleArn ? [readApiAnalysisBucketStatement({ bucketArn: n.bucketArn, roleArn: readApiRoleArn, glob: ANALYSIS_RESULT_OBJECT_GLOB })] : []),
         ...(uploadInboxRoles ? uploadAdmissionBucketStatements({ bucketArn: n.bucketArn, consumerRoleArn: uploadInboxRoles.consumerRoleArn, promotionObjects: srvWriterObjects(n.bucketArn, i.transcriptStore.inboxAuthorityKeyRoot) }) : []),
