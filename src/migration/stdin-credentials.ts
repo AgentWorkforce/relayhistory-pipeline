@@ -185,7 +185,9 @@ export interface PinnedPgConfig {
 /**
  * Parses a stdin URL (already checked by its provider guard) into the discrete config the client gets: host, port,
  * user, password and database are decoded from the URL here, so nothing but the bounded stdin document supplies
- * them. Only `sslmode` may appear in the query (anything else would be silently dropped, or override the identity).
+ * them. Only `sslmode` and `channel_binding=require` may appear in the query (anything else would be silently dropped,
+ * or override the identity). `channel_binding` is accepted only as exactly `require` (every occurrence, so a repeated
+ * key cannot smuggle a second value) and is not forwarded to node-postgres, as in frozen-source-copy-seal.ts.
  */
 export function pinnedPgConfig(url: string, name: string, trust: "supabase" | "neon"): PinnedPgConfig {
   const prefix = name.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase());
@@ -197,8 +199,11 @@ export function pinnedPgConfig(url: string, name: string, trust: "supabase" | "n
   }
   if (u.protocol !== "postgres:" && u.protocol !== "postgresql:") throw new CredentialRefusal(`credentials_invalid.${name}`);
   requireUrlIdentity(u, prefix);
-  for (const k of u.searchParams.keys())
-    if (k !== "sslmode") throw new CredentialRefusal(`${prefix}_startup_parameter_refused.${/^[a-z_]{1,32}$/.test(k) ? k : "other"}`);
+  for (const k of u.searchParams.keys()) {
+    if (k === "sslmode") continue;
+    if (k === "channel_binding" && u.searchParams.getAll("channel_binding").every((v) => v === "require")) continue;
+    throw new CredentialRefusal(`${prefix}_startup_parameter_refused.${/^[a-z_]{1,32}$/.test(k) ? k : "other"}`);
+  }
   let user: string, password: string, database: string;
   try {
     user = decodeURIComponent(u.username);

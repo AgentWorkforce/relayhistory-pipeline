@@ -14,6 +14,26 @@ test("builds discrete pinned fields: no connectionString, verified TLS with the 
   expect("connectionString" in c).toBe(false);
   expect(ownerClientConfig(good + "?sslmode=verify-full", "x", "CA")).toEqual({ ...c, application_name: "x" });
 });
+test("accepts the production secret shape sslmode=verify-full&channel_binding=require (either order); channel_binding is not forwarded", () => {
+  const base = ownerClientConfig(good + "?sslmode=verify-full", "x", "CA");
+  for (const q of ["?sslmode=verify-full&channel_binding=require", "?channel_binding=require&sslmode=verify-full"]) {
+    const c = ownerClientConfig(good + q, "x", "CA");
+    expect(c).toEqual(base);
+    expect("channel_binding" in c).toBe(false);
+  }
+  const cases = [
+    "?sslmode=verify-full&channel_binding=disable", "?sslmode=verify-full&channel_binding=prefer", "?sslmode=verify-full&channel_binding=",
+    "?sslmode=verify-full&channel_binding=Require", "?channel_binding=require", "?sslmode=require&channel_binding=require",
+    "?sslmode=verify-full&channel_binding=require&channel_binding=require", "?sslmode=verify-full&channel_binding=require&channel_binding=disable",
+    "?sslmode=verify-full&sslmode=verify-full&channel_binding=require", "?sslmode=verify-full&channel_binding=require&options=-c%20role%3Dpostgres",
+    "?sslmode=verify-full&channel_binding=require&application_name=other", "?sslmode=verify-full&options=-c%20role%3Dpostgres", "?sslmode=require",
+  ];
+  for (const q of cases) {
+    let got: unknown;
+    try { ownerClientConfig(good + q, "x", "CA"); } catch (e) { got = e; }
+    expect({ q, err: got instanceof OwnerUrlError ? (got as OwnerUrlError).code : String(got) }).toEqual({ q, err: "query_params" });
+  }
+});
 test("refuses every URL variant that would weaken TLS, rename the session, or fall back to the environment", () => {
   process.env.PGPASSWORD = "from-env"; process.env.PGUSER = "env-user"; process.env.PGSSLMODE = "disable";
   const cases: Array<[string, string]> = [

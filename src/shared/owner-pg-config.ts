@@ -4,8 +4,9 @@
  * turns TLS off, `?sslmode=no-verify` keeps TLS but skips verification, `?application_name=` replaces
  * the pinned name, and a missing user/password silently falls back to PG* environment variables or
  * ~/.pgpass. So this NEVER passes a connectionString. It requires an explicit
- * postgresql://user:password@host[:port]/database, accepts at most the one normalized parameter
- * `sslmode=verify-full`, and builds every field itself:
+ * postgresql://user:password@host[:port]/database, accepts either no query or exactly one
+ * `sslmode=verify-full` plus at most one `channel_binding=require` (the production secret shape; as in
+ * src/migration/frozen-source-copy-seal.ts it is validated but not forwarded), and builds every field itself:
  *  - TLS is always verified against the pinned Supabase Root 2021 CA;
  *  - application_name is fixed;
  *  - `options` is non-empty, so PGOPTIONS is never consulted;
@@ -24,7 +25,8 @@ export function ownerClientConfig(ownerUrl: string, applicationName: string, ca:
   if (u.protocol !== "postgresql:" && u.protocol !== "postgres:") no("protocol");
   if (u.hash) no("fragment");
   const params = [...u.searchParams.entries()];
-  if (params.length > 1 || (params.length === 1 && (params[0]![0] !== "sslmode" || params[0]![1] !== "verify-full"))) no("query_params");
+  const sslmode = params.filter(([k]) => k === "sslmode"), binding = params.filter(([k]) => k === "channel_binding");
+  if (params.length > 0 && (sslmode.length !== 1 || sslmode[0]![1] !== "verify-full" || binding.length > 1 || (binding.length === 1 && binding[0]![1] !== "require") || sslmode.length + binding.length !== params.length)) no("query_params");
   const host = u.hostname, user = decodeURIComponent(u.username), password = decodeURIComponent(u.password);
   if (!host || host.startsWith("[") === false && !/^[A-Za-z0-9.-]{1,253}$/.test(host)) no("host");
   if (!user) no("user"); if (!password) no("password");

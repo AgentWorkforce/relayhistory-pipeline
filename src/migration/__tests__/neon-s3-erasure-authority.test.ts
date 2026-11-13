@@ -209,6 +209,26 @@ describe("no ~/.pgpass fallback: stdin DB URLs carry their own password (dogpatc
     for (const k of ["connectionString", "password", "user", "host"]) expect(code(() => pinnedPgClient(r.pg, "postgres://u:s@h/d?sslmode=verify-full", "databaseUrl", "neon", { [k]: "x" }))).toBe("database_url_config_override_refused");
   });
 
+  test("channel_binding is accepted only as exactly require (not forwarded); every other value or key is refused", () => {
+    // The production session-schema URL carries sslmode=verify-full&channel_binding=require: the config is unchanged by it.
+    const base = "postgres://u:s@db.ref.supabase.co:5432/postgres";
+    for (const trust of ["supabase", "neon"] as const) {
+      const expected = pinnedPgConfig(`${base}?sslmode=verify-full`, "databaseUrl", trust);
+      expect(expected.ssl).toEqual(trust === "supabase" ? postgresTlsOptions() : { rejectUnauthorized: true });
+      expect(pinnedPgConfig(`${base}?sslmode=verify-full&channel_binding=require`, "databaseUrl", trust)).toEqual(expected);
+      expect(pinnedPgConfig(`${base}?channel_binding=require&sslmode=verify-full`, "databaseUrl", trust)).toEqual(expected);
+      expect("channel_binding" in pinnedPgConfig(`${base}?sslmode=verify-full&channel_binding=require`, "databaseUrl", trust)).toBe(false);
+    }
+    for (const q of ["channel_binding=disable", "channel_binding=prefer", "channel_binding=", "channel_binding", "channel_binding=Require", "channel_binding=require&channel_binding=disable", "channel_binding=disable&channel_binding=require"])
+      expect(code(() => pinnedPgConfig(`${base}?sslmode=verify-full&${q}`, "databaseUrl", "neon"))).toBe("database_url_startup_parameter_refused.channel_binding");
+    // Every other key is still refused, with or without channel_binding=require alongside.
+    expect(code(() => pinnedPgConfig(`${base}?sslmode=verify-full&channel_binding=require&options=-c%20x%3Dy`, "databaseUrl", "neon"))).toBe("database_url_startup_parameter_refused.options");
+    expect(code(() => pinnedPgConfig(`${base}?sslmode=verify-full&application_name=x`, "databaseUrl", "supabase"))).toBe("database_url_startup_parameter_refused.application_name");
+    // channel_binding does not stand in for TLS: without sslmode the URL is still refused.
+    expect(code(() => pinnedPgConfig(`${base}?channel_binding=require`, "databaseUrl", "neon"))).toBe("database_url_sslmode_required");
+    expect(code(() => pinnedPgConfig(`${base}?channel_binding=require&sslmode=require`, "databaseUrl", "neon"))).toBe("database_url_sslmode_refused");
+  });
+
   test("a client whose resolved password differs from the stdin one (pg would consult ~/.pgpass) is refused pre-connect", () => {
     const dropped = recordingPg((c) => void (c.password = ""));
     expect(code(() => pinnedPgClient(dropped.pg, "postgres://u:s@h/d?sslmode=verify-full", "databaseUrl", "neon"))).toBe("database_url_password_not_pinned");
