@@ -206,13 +206,19 @@ export interface OwnerDoc { v: 1; originId: string; source: string; sessionId: s
  *   controlMirror "on"        every control route writes the S3 fence before SQL (INGEST_S3_FENCE_MIRROR=on on
  *                             the Worker, or this ledger's own controls on self-host), so no deletion lands in
  *                             SQL alone from then on;
- *   rearmSweeper "live"       the eraser sweeps `ledger/rearm/` markers (nothing in this repo consumes them yet).
+ *   rearmSweeper "live"       the eraser sweeps `ledger/rearm/` markers (nothing in this repo consumes them yet);
+ *   workerHttpAdmission "off" the Worker's HTTP upload path (its ledger is SQL: INGEST_LEDGER=s3 refuses there) no
+ *                             longer admits for any user this deployment's S3 consumers serve: stopped, or redirected
+ *                             to direct upload, BEFORE the revision and ownership backfills run. An admission it made
+ *                             after them would be absent from the S3 index and owner stubs, so a direct upload could
+ *                             later re-admit an older or equal revision (#250) and the session would escape S3 resets.
+ *                             0005's "compare against the HTTP path" step therefore runs BEFORE the marker is written.
  * Without it an absent fence cannot be told from a user whose SQL deletions were never copied, so admission
  * refuses (retries) rather than treat absent as empty. Deleting it is the kill switch for NEW claims only: each
  * ledger trusts a valid read for up to 60 s (fenceAuthorityTtlMs), and a batch already claimed still commits
  * (commit never reads the marker), so its canonical objects can land after the marker is gone.
  */
-export interface FenceAuthorityDoc { v: 1; fenceBackfill: "complete"; revisionBackfill: "complete"; ownershipBackfill: "complete"; controlMirror: "on"; rearmSweeper: "live"; writtenAtMs: number }
+export interface FenceAuthorityDoc { v: 1; fenceBackfill: "complete"; revisionBackfill: "complete"; ownershipBackfill: "complete"; controlMirror: "on"; rearmSweeper: "live"; workerHttpAdmission: "off"; writtenAtMs: number }
 
 const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 const count = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
@@ -259,8 +265,9 @@ export function validOwner(v: unknown): v is OwnerDoc {
   return isObject(v) && v.v === 1 && str(v.originId) && str(v.source) && str(v.sessionId) && count(v.epoch) && count(v.resets);
 }
 export function validFenceAuthority(v: unknown): v is FenceAuthorityDoc {
-  return isObject(v) && exactKeys(v, ["v", "fenceBackfill", "revisionBackfill", "ownershipBackfill", "controlMirror", "rearmSweeper", "writtenAtMs"]) && v.v === 1
-    && v.fenceBackfill === "complete" && v.revisionBackfill === "complete" && v.ownershipBackfill === "complete" && v.controlMirror === "on" && v.rearmSweeper === "live" && count(v.writtenAtMs) && v.writtenAtMs > 0;
+  return isObject(v) && exactKeys(v, ["v", "fenceBackfill", "revisionBackfill", "ownershipBackfill", "controlMirror", "rearmSweeper", "workerHttpAdmission", "writtenAtMs"]) && v.v === 1
+    && v.fenceBackfill === "complete" && v.revisionBackfill === "complete" && v.ownershipBackfill === "complete" && v.controlMirror === "on" && v.rearmSweeper === "live"
+    && v.workerHttpAdmission === "off" && count(v.writtenAtMs) && v.writtenAtMs > 0;
 }
 
 // ---- fence rules (shared with the backfill and the drain: never reimplement them) ----
@@ -582,7 +589,25 @@ export function s3LedgerObjects(store: ObjectStore, keyRoot: string, opts: Omit<
 
   const readBatch = (key: string) => readDoc(store, key, validBatch, "ledger_batch_record_invalid");
 
-  return { attempts, backoff, nowMs, keysFor, readFence, editFence, readIndex, mergeIndex, readOwner, registerOwner, writeRearm, readBatch };
+  /** Every owner stub of a user (LIST + GET, 8 at a time). A corrupt stub is `ledger_owner_invalid`; a store error is coded. */
+  async function listOwners(keys: ReturnType<typeof s3LedgerKeys>): Promise<OwnerDoc[]> {
+    const out: OwnerDoc[] = [];
+    const prefix = keys.ownersRoot + "/";
+    let cursor: string | undefined;
+    try {
+      do {
+        const page = await store.list(objectKey(keys.ownersRoot), cursor);
+        const docs = await mapLimit(page.items.map((i) => String(i.key)).filter((k) => k.startsWith(prefix)), RESET_READS, async (k) => (await readOwner(k))?.doc);
+        for (const d of docs) if (d) out.push(d);
+        cursor = page.nextCursor;
+      } while (cursor);
+    } catch (error) {
+      throw storeFailure(error);
+    }
+    return out;
+  }
+
+  return { attempts, backoff, nowMs, keysFor, readFence, editFence, readIndex, mergeIndex, readOwner, registerOwner, listOwners, writeRearm, readBatch };
 }
 
 export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOptions = {}): Ledger {
@@ -984,10 +1009,14 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
  * upload accounting: claims and commits never touch SQL.
  *
  *   selection          S3, then SQL for its sessions per the fence.
- *   reset              S3, then SQL: every session the fence deletes (per origin, pages of 2048) and any it
- *                      stopped deleting during the rounds; then SQL resetUploadedSessions (its request record).
- *                      Sessions only SQL owned are covered by the ownership backfill, a precondition of the
- *                      fence-authority marker (the ingest role cannot read SQL ownership without a migration).
+ *   reset              S3, then SQL resetUploadedSessions (its request record, which the read side's reset
+ *                      gates read), then the reconcile over every session the fence deletes AND every session
+ *                      with an owner stub. SQL's own reset tombstones everything SQL owns, including a session
+ *                      S3 keeps live (disabled then re-enabled with no upload since: its stub is an older epoch,
+ *                      so the S3 reset does not own it); the reconcile lifts those again, so SQL ends with exactly
+ *                      the fence's deletions. Sessions only SQL owned are covered by the ownership backfill, a
+ *                      precondition of the fence-authority marker (the ingest role cannot read SQL ownership
+ *                      without a migration).
  *   ordered controls   S3's applyOrderedControl, then the same reconcile (even when S3 judged it stale: S3 decides);
  *                      a stale reset writes no SQL reset record.
  */
@@ -1019,6 +1048,11 @@ export function withSqlControlMirror(s3: Ledger, sql: Pick<Ledger, "setSessionUp
     throw new LedgerUnavailableError("ledger_control_mirror_unstable");
   }
   const of = (originId: string, sessions: [string, string][]) => sessions.map((pair) => ({ originId, pair }));
+  /** After SQL's reset: every session S3 knows (owner stubs) and every one it deletes, set in SQL as the fence says. */
+  const reconcileAfterReset = async (tenant: LedgerTenant) => {
+    const owners = await io.listOwners(io.keysFor(tenant));
+    await reconcile(tenant, owners.map((d) => ({ originId: d.originId, pair: [d.source, d.sessionId] as [string, string] })), true);
+  };
   return {
     ...s3,
     async setSessionUploads(input) {
@@ -1027,16 +1061,16 @@ export function withSqlControlMirror(s3: Ledger, sql: Pick<Ledger, "setSessionUp
     },
     async resetUploadedSessions(tenant, requestId) {
       const n = await s3.resetUploadedSessions(tenant, requestId);
-      await reconcile(tenant, [], true);
       await sql.resetUploadedSessions(tenant, requestId);
+      await reconcileAfterReset(tenant);
       return n;
     },
     async applyOrderedControl(input) {
       const r = await s3.applyOrderedControl!(input);
       if ("requestId" in input) {
-        await reconcile(input.tenant, [], true);
         // SQL's request record only for a reset S3 applied (or replays): a stale one never resets in SQL.
         if (r.control.outcome !== "stale") await sql.resetUploadedSessions(input.tenant, input.requestId);
+        await reconcileAfterReset(input.tenant);
       } else await reconcile(input.tenant, of(input.originId, input.sessions), false);
       return r;
     },
