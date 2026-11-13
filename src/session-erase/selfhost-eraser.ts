@@ -95,6 +95,13 @@ export interface SessionEraseBytesOptions {
   now?: () => number;
   /** Re-checks the caller's authority before every page's deletes (default: none). */
   authorize?: () => Promise<void>;
+  /**
+   * Successor cutoff (ms since epoch): only versions last modified BEFORE it are erased (a version without a
+   * timestamp is never erased), as the hosted live lane keeps versions newer than its fence re-read (neon-s3-erasure
+   * job.ts LIVE_SKEW_MS). Kept versions still count against verification, so `verified` stays false while any remain.
+   * Default: none (every version).
+   */
+  modifiedBefore?: number;
   log?: (line: Record<string, unknown>) => void;
 }
 
@@ -316,6 +323,48 @@ export async function eraseSessionBytes(eraser: PagedEraser, req: SessionEraseBy
   return executeTargets(eraser, req.key, targets, opts);
 }
 
+/** One (workspace, machine, source, session)'s canonical bytes: physical layout segments, as the writer derives them. */
+export interface MachineSessionKey {
+  orgId: string;
+  /** The PHYSICAL workspace segment (`layoutComponent(workspaceId)`, as it appears in `ws=`). */
+  workspaceSegment: string;
+  /** The writer's machine id (`srv_` + 32 hex: writer.ts liveMachineId). */
+  machineId: string;
+  /** Canonical (pre-layout) source and session ids; mapped with `layoutComponent` exactly as the writer does. */
+  source: string;
+  sessionId: string;
+}
+
+/**
+ * The targets of ONE machine's copy of a session (the S3 ledger's re-arm sweep, ledger-s3.ts): the transcript dir under
+ * every date and the live pointer, exactly where writer.ts writeGroup puts them. Unlike planDiscoveryTargets it is
+ * fixed to one machine (one user's origin), so another user's session with the same id is never in scope. Ids map
+ * through `layoutComponent` like planTargets: two raw ids sharing a physical dir share its erasure.
+ */
+export function planMachineSessionTargets(key: MachineSessionKey, opts: Pick<SessionEraseBytesOptions, "keyRoot">): EraseTarget[] {
+  if (!KEY_ROOT.test(opts.keyRoot)) refuse("key_root_invalid");
+  if (!key || typeof key.orgId !== "string" || !SEGMENT.test(key.orgId) || key.orgId.startsWith(".")) refuse("org_invalid");
+  const ws = physical(key.workspaceSegment);
+  if (typeof key.machineId !== "string" || !/^srv_[0-9a-f]{32}$/.test(key.machineId)) refuse("location_invalid");
+  const h = layoutComponent(nonEmpty(key.source, "key_invalid")), s = layoutComponent(nonEmpty(key.sessionId, "key_invalid"));
+  const org = `${opts.keyRoot}/${key.orgId}`;
+  const base = `${org}/v1/ws=${ws}/m=${key.machineId}/h=${h}/`;
+  const pointerDir = `${org}/live-sessions/v1/ws=${ws}/m=${key.machineId}/h=${h}/`;
+  const list: EraseTarget[] = [
+    { kind: "transcript", prefix: base, match: new RegExp(`^${escapePattern(base)}d=\\d{4}/\\d{2}/\\d{2}/s=${escapePattern(s)}/.+$`) },
+    { kind: "pointer", prefix: pointerDir, exactKey: `${pointerDir}s=${s}.json` },
+  ];
+  for (const t of list) assertAllowed(list, t.exactKey ? [t.exactKey] : []);
+  return list;
+}
+
+/** Erase (or, dry run, count) one machine's copy of a session through the same executor as every other path. */
+export async function eraseMachineSessionBytes(eraser: PagedEraser, key: MachineSessionKey, opts: SessionEraseBytesOptions): Promise<SessionEraseBytesResult> {
+  const targets = planMachineSessionTargets(key, opts);
+  return executeTargets(eraser, { orgId: key.orgId, workspaceId: key.workspaceSegment, source: key.source, sessionId: key.sessionId }, targets,
+    { ...opts, log: opts.log ?? (() => {}) });
+}
+
 /** Automatic self-host path: no supplied locations, staged keys or user-built prefixes. */
 export async function eraseDiscoveredSessionBytes(eraser: PagedEraser, key: SessionEraseKey, opts: SessionEraseBytesOptions): Promise<SessionEraseBytesResult> {
   return executeTargets(eraser, key, planDiscoveryTargets(key, opts), opts);
@@ -338,15 +387,19 @@ async function executeTargets(eraser: PagedEraser, key: SessionEraseKey, targets
   let versions = 0, stagedPending = 0, incomplete = 0, stagedKept = false;
   const cutoff = now() - minAge;
   const stagedOld = (v: ListedVersion) => v.lastModified !== undefined && v.lastModified < cutoff;
+  const before = opts.modifiedBefore;
+  if (before !== undefined && !Number.isFinite(before)) refuse("modified_before_invalid");
+  // Successors (written after the caller's authority read) are never erased; they keep `verified` false.
+  const settled = (v: ListedVersion) => before === undefined || (v.lastModified !== undefined && v.lastModified < before);
 
   const run = async (t: EraseTarget, stopped: () => boolean) => {
     const keep = t.kind === "staged"
       ? (v: ListedVersion) => {
-          if (stagedOld(v)) return true;
+          if (stagedOld(v) && settled(v)) return true;
           if (t.exactKey === undefined || v.key === t.exactKey) stagedKept = true;
           return false;
         }
-      : () => true;
+      : settled;
     const select = dryRun
       ? (v: ListedVersion) => {
           if (!matchesTarget(t, v.key)) return false;

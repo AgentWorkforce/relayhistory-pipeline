@@ -24,8 +24,11 @@
  *       sessionId]...]}, epochs: {<origin>: {<sessionKey>: n}}, resetRequests: {<requestId>: n | null}, ordered?}
  *       edited with If-Match by every selection, reset and ordered control. Unreadable: a retry, never empty.
  *       Created only by `newFence` (a random instance id), changed only by `applyFenceChange`'s rules.
- *   ledger/rearm/o=<h(origin)>/<sessionKey>.json   the re-arm marker for the eraser:
- *       {v, originId, source, sessionId, machineId, atMs}, create-only.
+ *   ledger/rearm/o=<h(origin)>/<sessionKey>.json   the re-arm marker for the eraser (RearmDoc):
+ *       {v, originId, source, sessionId, machineId, atMs}. Created by the first re-arm; every later re-arm of the
+ *       session RE-ARMS it (If-Match, atMs strictly later), so its content changes and the sweeper erases again.
+ *   ledger/rearm/o=<h(origin)>/<sessionKey>.done/<h(marker bytes)>.json   the sweeper's completion record for one
+ *       marker content (rearm-sweeper.ts RearmDoneDoc), create-only. Nothing here deletes a marker.
  *
  * And one deployment-wide object, written by an operator (never by this code):
  *
@@ -190,6 +193,12 @@ export interface BatchDoc {
  */
 export type IndexEntry = [number, string | null, string | null, string | null, number, number];
 export interface IndexDoc { v: 1; originId: string; shard: string; records: Record<string, IndexEntry> }
+/**
+ * A re-arm marker: "this session's canonical objects may hold data written after its erasure; erase it again".
+ * `machineId` is the writer's machine (writer.ts liveMachineId of the user's workspace and origin), which with the
+ * marker's own admission directory (org, workspace) names exactly the canonical prefix the commit wrote.
+ */
+export interface RearmDoc { v: 1; originId: string; source: string; sessionId: string; machineId: string; atMs: number }
 /** The ownership stub (ingest_session_ownership): the OLDEST generation this session was claimed under at its current epoch. */
 export interface OwnerDoc { v: 1; originId: string; source: string; sessionId: string; epoch: number; resets: number }
 
@@ -206,7 +215,8 @@ export interface OwnerDoc { v: 1; originId: string; source: string; sessionId: s
  *   controlMirror "on"        every control route writes the S3 fence before SQL (INGEST_S3_FENCE_MIRROR=on on
  *                             the Worker, or this ledger's own controls on self-host), so no deletion lands in
  *                             SQL alone from then on;
- *   rearmSweeper "live"       the eraser sweeps `ledger/rearm/` markers (nothing in this repo consumes them yet);
+ *   rearmSweeper "live"       the re-arm sweeper (rearm-sweeper.ts) runs against this bucket and key root, armed and
+ *                             not in dry run, so every `ledger/rearm/` marker is erased again;
  *   workerHttpAdmission "off" the Worker's HTTP upload path (its ledger is SQL: INGEST_LEDGER=s3 refuses there) no
  *                             longer admits for any user this deployment's S3 consumers serve: stopped, or redirected
  *                             to direct upload, BEFORE the revision and ownership backfills run. An admission it made
@@ -263,6 +273,14 @@ export function validIndex(v: unknown): v is IndexDoc {
 }
 export function validOwner(v: unknown): v is OwnerDoc {
   return isObject(v) && v.v === 1 && str(v.originId) && str(v.source) && str(v.sessionId) && count(v.epoch) && count(v.resets);
+}
+export function validRearm(v: unknown): v is RearmDoc {
+  return isObject(v) && exactKeys(v, ["v", "originId", "source", "sessionId", "machineId", "atMs"]) && v.v === 1 && mapKey(v.originId) && str(v.source) && str(v.sessionId)
+    && typeof v.machineId === "string" && /^srv_[0-9a-f]{32}$/.test(v.machineId) && count(v.atMs);
+}
+/** True when `key` is where ledger-s3 writes `doc`'s marker (its origin hash and session key), under `dir`. */
+export function rearmKeyMatches(dir: string, key: string, doc: RearmDoc): boolean {
+  return key === `${dir}/ledger/rearm/o=${h(doc.originId)}/${sessionKeyHash(doc.source, doc.sessionId)}.json`;
 }
 export function validFenceAuthority(v: unknown): v is FenceAuthorityDoc {
   return isObject(v) && exactKeys(v, ["v", "fenceBackfill", "revisionBackfill", "ownershipBackfill", "controlMirror", "rearmSweeper", "workerHttpAdmission", "writtenAtMs"]) && v.v === 1
@@ -485,7 +503,7 @@ export function checkIndexEntryInput(r: IndexEntryInput): void {
  *                                       revision; an equal revision keeps the stored entry; entries the fence
  *                                       has forgotten are dropped (both stored and incoming). CAS-retried.
  *   registerOwner(key, doc)           the ownership stub, kept at its oldest generation of its current epoch
- *   writeRearm(key, marker)             create-only re-arm marker for the eraser
+ *   writeRearm(key, marker)             the re-arm marker for the eraser: created, or re-armed (If-Match) when present
  *   readBatch(key)                      a batch record, or null when absent
  */
 export function s3LedgerObjects(store: ObjectStore, keyRoot: string, opts: Omit<S3LedgerOptions, "acceptanceMode" | "newToken" | "fenceAuthority" | "fenceAuthorityTtlMs"> & { newFenceId?: () => string } = {}) {
@@ -582,9 +600,32 @@ export function s3LedgerObjects(store: ObjectStore, keyRoot: string, opts: Omit<
     throw new LedgerUnavailableError("ledger_owner_contended");
   }
 
+  /**
+   * Arm the session's marker. A marker already there may be one the sweeper has finished (its `.done/<hash>` record
+   * written), and the canonical objects this commit wrote came AFTER that erase, so a present marker is re-armed: its
+   * content is replaced (If-Match) with a strictly later `atMs`, which is a new content hash the sweeper has no
+   * completion for. Re-arming one the sweeper has not reached yet costs one extra erase pass, never a lost one.
+   */
   async function writeRearm(key: string, marker: { originId: string; source: string; sessionId: string; machineId: string }): Promise<void> {
-    // Create-only: an unswept marker for the session is already enough for the eraser.
-    await casPut(store, key, { v: 1, ...marker, atMs: nowMs() }, undefined);
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      let got: { doc: RearmDoc; version: ObjectVersion } | null;
+      try {
+        got = await readDoc(store, key, validRearm, "ledger_rearm_invalid");
+      } catch (error) {
+        if (!(error instanceof LedgerUnavailableError) || error.code !== "ledger_rearm_invalid") throw error;
+        // A corrupt marker (the sweeper reports it, `corrupt`) is replaced by a valid one, so it is erased again and
+        // never wedges this session's commits. Still If-Match on the version just seen.
+        let meta;
+        try { meta = await store.head(objectKey(key)); } catch (e) { throw storeFailure(e); }
+        if (meta && await casPut(store, key, { v: 1, ...marker, atMs: nowMs() }, meta.version)) return;
+        await backoff(attempt);
+        continue;
+      }
+      const atMs = got ? Math.max(nowMs(), got.doc.atMs + 1) : nowMs();
+      if (await casPut(store, key, { v: 1, ...marker, atMs }, got?.version)) return;
+      await backoff(attempt);
+    }
+    throw new LedgerUnavailableError("ledger_rearm_contended");
   }
 
   const readBatch = (key: string) => readDoc(store, key, validBatch, "ledger_batch_record_invalid");
