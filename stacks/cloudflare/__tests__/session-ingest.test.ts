@@ -737,6 +737,26 @@ describe("session ingest: SESSIONS_NEON_EXIT (neonExit, default off)", () => {
   });
 });
 
+describe("session ingest: INGEST_S3_FENCE_MIRROR (default off)", () => {
+  const canonical: SessionIngestInputs = { ...inputs, acceptanceMode: "canonical" };
+  it("omitted: no INGEST_S3_FENCE_MIRROR key, vars and props byte-identical to a stack without the input", () => {
+    for (const p of [inputs, canonical]) {
+      expect(Object.hasOwn(sessionIngestVars(p), "INGEST_S3_FENCE_MIRROR")).toBe(false);
+      expect(JSON.stringify(sessionIngestWorkerProps(p, bindings))).toBe(JSON.stringify(sessionIngestWorkerProps({ ...p, s3FenceMirror: undefined }, bindings)));
+    }
+  });
+  it("on: exactly one more var, no new binding or resource; anything else refuses", () => {
+    for (const base of [inputs, canonical]) {
+      const on = { ...base, s3FenceMirror: "on" as const };
+      expect(() => assertSessionIngestInputs(on, refuse)).not.toThrow();
+      expect(sessionIngestVars(on)).toEqual({ ...sessionIngestVars(base), INGEST_S3_FENCE_MIRROR: "on" });
+      expect(() => assertNoSecretLiterals(props(on).env, refuse)).not.toThrow();
+    }
+    for (const bad of ["off", "true", true, 1, ""]) expect(() => assertSessionIngestInputs({ ...inputs, s3FenceMirror: bad as never }, refuse)).toThrow(/s3FenceMirror must be "on"/);
+    expect(sessionIngestResources()).toBe(SESSION_INGEST_RESOURCES);
+  });
+});
+
 describe("session ingest: INGEST_UPLOAD_CONSENT (default off)", () => {
   // Same shape as the INGEST_CLAIM_TIMEOUT_BUSY block: a var-only flag, no binding or resource.
   const buffered: SessionIngestInputs = { ...inputs, acceptanceMode: "buffered", expectedGeneration: "a".repeat(64), inlineMaxSessions: 0, asyncAdmission: "off" };

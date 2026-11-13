@@ -247,7 +247,6 @@ export interface IngestSettings {
   s3FenceMirror?: true;
 }
 
-/** The settings, or null while any required one is missing (every request is then 503 not_configured). */
 /** INGEST_S3_FENCE_MIRROR: unset, "" or "off" is off; "on" is on; anything else throws (a privacy control is never silently off). */
 export function s3FenceMirrorFlag(raw: string | undefined): boolean {
   const v = (raw ?? "").trim();
@@ -256,6 +255,7 @@ export function s3FenceMirrorFlag(raw: string | undefined): boolean {
   throw new Error("session ingest: INGEST_S3_FENCE_MIRROR must be off or on");
 }
 
+/** The settings, or null while any required one is missing (every request is then 503 not_configured). */
 export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettings | null> {
   // Before the not-configured checks, so a Neon edge under the profile is a loud refusal, never a quiet 503.
   assertNoNeonEdge(neonExitProfile(env as Record<string, unknown>), "the session ingest", {
@@ -478,7 +478,9 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: R
     ...(settings.uploadDirect ? { uploadDirect: settings.uploadDirect } : {}),
     ...(settings.uploadConsent ? { uploadConsent: { enforcement: settings.uploadConsent, store: sqlUploadConsentStore(run) } } : {}),
     // Only the fence methods are used: the S3 ledger never admits on the Worker (INGEST_LEDGER=s3 refuses here).
-    ...(settings.s3FenceMirror ? { s3FenceMirror: s3Ledger(target.store, target.keyRoot, { acceptanceMode: "canonical" }) } : {}),
+    // A reset is BEGUN only (one fence CAS), so it fits any subrequest budget however many sessions the user has;
+    // the next S3-ledger claim for the user (or the reset's own retry elsewhere) finishes it (ledger-s3.ts finishResets).
+    ...(settings.s3FenceMirror ? { s3FenceMirror: s3Ledger(target.store, target.keyRoot, { acceptanceMode: "canonical", resetBeginOnly: true }) } : {}),
   });
 }
 
