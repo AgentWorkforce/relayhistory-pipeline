@@ -570,18 +570,24 @@ What `s3` requires and changes:
   - `RELAYHISTORY_SELFHOST_SESSION_SELECTION`;
   - the operator session erase runtime (`SESSION_ERASE_API_ENABLED` and the erase fence and bytes settings);
   - `INGEST_UPLOAD_CONSENT` other than `off`.
-- **No admission until the fence-authority marker exists.** Until `<root>/.ledger/fence-authority.json` is present and valid, every claim is a retry. On the synchronous path that means every upload answers 503; nothing is admitted on any path.
-  - The marker is exactly `{"v":1,"fenceBackfill":"complete","revisionBackfill":"complete","ownershipBackfill":"complete","controlMirror":"on","rearmSweeper":"live","workerHttpAdmission":"off","writtenAtMs":<ms>}`.
-  - An operator writes it only once all of these hold:
+- **No admission for an org until a fence-authority marker covers it.** Until then, every claim for that org is a retry. On the synchronous path that means its uploads answer 503; nothing of that org is admitted on any path. There are two forms:
+  - **Per org (use this first):** `<root>/.ledger/fence-authority/<org>.json` covers that one org. Orgs are turned on one at a time, each once its own users' state is backfilled. It holds the fields below plus `"orgId":"<org>"`, which must equal the org in the key. A per-org marker that is present but invalid, or that names another org, refuses that org even if the deployment-wide marker exists.
+  - **Deployment-wide:** `<root>/.ledger/fence-authority.json` covers every org at once. It is for **after the full backfill** of every org, and it holds exactly the fields below, with no `orgId`.
+  - The fields are exactly `{"v":1,"fenceBackfill":"complete","revisionBackfill":"complete","ownershipBackfill":"complete","controlMirror":"on","rearmSweeper":"live","workerHttpAdmission":"off","writtenAtMs":<ms>}`.
+  - An operator writes a marker only once all of these hold, for its org or for every org:
     1. Nothing else admits these users through a SQL ledger any more (`workerHttpAdmission: "off"`).
     2. The one-time backfills have copied SQL's deletions and resets into each user's fence (`fenceBackfill`), its stored revisions into the index (`revisionBackfill`), and its session ownership into owner stubs (`ownershipBackfill`). They must run after step 1, so no SQL-only state appears after them.
     3. Controls write the S3 fence before SQL (`controlMirror`; on self-host the ledger does this itself).
     4. The eraser sweeps the S3 re-arm markers (`rearmSweeper`).
-  - Deleting the marker stops **new** claims within 60 s. A batch already claimed still commits.
+  - Deleting a marker stops **new** claims for the orgs it covered within 60 s (the cache is per org). A batch already claimed still commits. Errors carry codes only (`ledger_fence_authority_missing`, `_invalid`, `_org_mismatch`), never an org id.
+  - **Stopping admission (kill switch).** Per-org markers are read first, and a missing per-org marker falls back to the deployment-wide one. So:
+    - To stop **one org**, write an *invalid* marker at `<keyRoot>/.ledger/fence-authority/<org>.json` (for example `{}`). An invalid per-org marker refuses that org even while the deployment-wide marker is valid. Deleting the org's marker is **not** enough while a valid deployment-wide marker exists.
+    - To stop **every org**, delete the deployment-wide marker **and** every per-org marker under `<keyRoot>/.ledger/fence-authority/`, or write an invalid marker for each org. Deleting only the deployment-wide marker leaves orgs with their own valid marker admitting.
+    - Either way, already-claimed batches still commit, and each warm instance stops within its 60 s cache.
 - **Controls also write SQL.** Selection, reset and ordered controls write the S3 fence first, then reconcile SQL `upload_deletions` (and write SQL's reset record) to the fence's final state. The read API and the eraser still read SQL. A failure on either side fails the control (503), and its retry is idempotent. This is deletion state for readers, never upload accounting: claims and commits never call SQL.
 - **A reset is completed only by its own retry** on self-host: a claim never completes a reset left running, so the SQL half is never skipped. A client that abandons a reset leaves it running until a retry with the same `request_id`.
 - **The conditional-write startup probe** (the `.admission-probe` row above) runs in every admission mode, including `sync`.
-- **Object store.** Besides the rows above, the Locker credential needs GetObject and conditional PutObject (`If-None-Match: *` and `If-Match`) under `…/m=srv_<user>/ledger/` (`batches/`, `revisions/`, `owners/`, `rearm/`) and on `…/upload-fences.json`. A reset also needs ListBucket with prefix `…/ledger/owners/`. The marker needs GetObject on `<root>/.ledger/fence-authority.json`. Nothing in the S3 ledger is ever deleted.
+- **Object store.** Besides the rows above, the Locker credential needs GetObject and conditional PutObject (`If-None-Match: *` and `If-Match`) under `…/m=srv_<user>/ledger/` (`batches/`, `revisions/`, `owners/`, `rearm/`) and on `…/upload-fences.json`. A reset also needs ListBucket with prefix `…/ledger/owners/`. The markers need GetObject on `<root>/.ledger/fence-authority.json` and `<root>/.ledger/fence-authority/*`. Nothing in the S3 ledger is ever deleted.
 - **No tenant slots.** `INGEST_MAX_PER_USER` and `INGEST_MAX_PER_ORG` do not bound the synchronous path while the ledger is `s3`.
 
 ## 6. Summaries and the model transport (Bob Costas, session-brief)
