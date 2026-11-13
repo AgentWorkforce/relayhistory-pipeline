@@ -82,7 +82,7 @@ const WRITE_CONFIRMATION = "owner-buffered-parity/v1";
 const BULK_WRITE_CONFIRMATION = "owner-buffered-parity-bulk/v1";
 const DEFAULT_BULK_BATCH_SIZE = 25;
 const MAX_BULK_BATCH_SIZE = 100;
-const BULK_CURSOR = "owner_buffered_parity_bulk_tenants";
+export const BULK_CURSOR = "owner_buffered_parity_bulk_tenants";
 const BULK_CURSOR_KEEPALIVE_SQL = "SELECT 1 AS owner_buffered_bulk_keepalive";
 
 export const BULK_TARGET_GENERATION_SQL = `
@@ -180,7 +180,7 @@ export function validateCensusSourceInput(args: OperatorArgs, input: Record<stri
     if (input[key] === undefined) throw new CredentialRefusal(`credentials_missing_key.${key}`);
 }
 
-function parseTenant(value: unknown): ParityTenant {
+export function parseTenant(value: unknown): ParityTenant {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new OwnerBufferedOperatorRefusal("tenant_invalid");
   const row = value as Record<string, unknown>;
@@ -192,7 +192,7 @@ function parseTenant(value: unknown): ParityTenant {
   return tenant as ParityTenant;
 }
 
-function tenantSha256(tenant: ParityTenant): string {
+export function tenantSha256(tenant: ParityTenant): string {
   return createHash("sha256")
     .update("owner-buffered-parity-tenant-v1\0")
     .update(tenant.orgId).update("\0")
@@ -223,7 +223,7 @@ export function publicCensusReceipt(receipt: ParityCensusReceipt): Record<string
   };
 }
 
-function verifyCheckout(expected: string): void {
+export function verifyCheckout(expected: string): void {
   const options = { encoding: "utf8" as const, stdio: ["ignore", "pipe", "ignore"] as const };
   let head = "";
   let dirty = "";
@@ -236,7 +236,7 @@ function verifyCheckout(expected: string): void {
   if (head !== expected || dirty) throw new OwnerBufferedOperatorRefusal("checkout_pin_mismatch");
 }
 
-function client(
+export function client(
   url: string,
   name: "neonUrl" | "supabaseUrl",
   trust: "neon" | "supabase",
@@ -250,13 +250,13 @@ function client(
   });
 }
 
-async function connectNeon(url: string): Promise<pg.Client> {
+export async function connectNeon(url: string): Promise<pg.Client> {
   const neon = client(url, "neonUrl", "neon", "owner-buffered-g1-neon-readonly");
   await neon.connect();
   return neon;
 }
 
-async function requireReadOnly(client: Queryable, name: "neonUrl" | "supabaseUrl"): Promise<void> {
+export async function requireReadOnly(client: Queryable, name: "neonUrl" | "supabaseUrl"): Promise<void> {
   await client.query("SET default_transaction_read_only = on");
   const row = (await client.query<{ ro: string }>(
     "SELECT current_setting('default_transaction_read_only') AS ro",
@@ -306,7 +306,7 @@ export async function withBulkParityOwnerSessions<T>(
       work(fencedEnumerator, fencedTargetOwner)));
 }
 
-function generationMatches(receipt: ParityCensusReceipt, expected: string): boolean {
+export function generationMatches(receipt: ParityCensusReceipt, expected: string): boolean {
   return receipt.proof !== null && receipt.proof.targetGeneration === expected;
 }
 
