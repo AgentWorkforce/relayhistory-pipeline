@@ -29,8 +29,8 @@
  *           records (stale, in-batch revision reuse = revision_conflict) -> the batch record, committed
  *           at once when nothing needs writing (replay_fast).
  *   commit  fence (what changed since the claim's snapshot) -> re-arm markers for the fenced sessions ->
- *           merge the written revisions of the others -> fence again (a selection or reset that landed
- *           during the merge) -> clear the fenced sessions' indexes -> batch record committed. A fenced
+ *           merge the written revisions of the others, stamped with the claim's generation (IndexDoc: a
+ *           disable or reset since makes them stale at once) -> batch record committed. A fenced
  *           session the fence no longer deletes (a reset or a re-enable since the claim) is
  *           `ledger_attempt_superseded`, as SQL's `invalidated`: the retry claims again, and the
  *           consumer's privacy-journal gate decides.
@@ -39,8 +39,9 @@
  * replay_fast that skips this commit) never loses one. The index can lag the manifest (a crash between
  * the canonical write and the merge resumes) but never leads it: the merge runs after the canonical write.
  *
- * Nothing here deletes: an index is "cleared" by a CAS write of an empty record set, so the consumer needs
- * no DeleteObject on its promotion grant. Errors are LedgerUnavailableError with a code only, never a key.
+ * Nothing here deletes or rewrites an index to forget it: a disable bumps the session's fence epoch and a reset
+ * the user's reset count, which makes every index of the old generation stale (IndexDoc). A selection is one
+ * fence CAS however many sessions it names; a reset also lists and reads the user's indexes once. Errors are LedgerUnavailableError with a code only, never a key.
  *
  * Refused (LedgerUnavailableError, never a fallback): buffered acceptance, the staged fan-out, Babysitter
  * retention, frozen-supabase custody and every source/privacy-authority call, and acquisition grants.
@@ -126,7 +127,22 @@ export interface BatchDoc {
   /** The claim's fence snapshot: the epoch of every session of the batch. */
   epochs: Record<string, number>;
 }
-export interface IndexDoc { v: 1; originId: string; source: string | null; sessionId: string | null; records: Record<string, [number, string, string]> }
+/**
+ * `epoch` and `resets` are the generation the records were stored under: the session's fence epoch and the
+ * user's reset count of the claim that wrote them. A disable bumps the epoch and a reset bumps the count, so
+ * either one forgets the session's revisions by making its index stale (a claim treats a stale index as empty),
+ * without writing any index: a control costs one fence CAS however many sessions it names. Records with no
+ * session (`s=_origin`) are never fenced: their generation is always (0, 0).
+ */
+export interface IndexDoc { v: 1; originId: string; source: string | null; sessionId: string | null; epoch: number; resets: number; records: Record<string, [number, string, string]> }
+
+/** The generation a session's index must carry to count (IndexDoc). */
+export function indexGeneration(fence: FenceDoc, originId: string, source: string | null, sessionId: string | null): { epoch: number; resets: number } {
+  if (source === null || sessionId === null) return { epoch: 0, resets: 0 };
+  const epochs = Object.hasOwn(fence.epochs, originId) ? fence.epochs[originId]! : {};
+  const k = pairHash(source, sessionId);
+  return { epoch: Object.hasOwn(epochs, k) ? epochs[k]! : 0, resets: fence.resets };
+}
 
 const emptyFence = (): FenceDoc => ({ v: 1, version: 0, resets: 0, deleted: {}, epochs: {}, resetRequests: {} });
 
@@ -157,7 +173,7 @@ export function validBatch(v: unknown): v is BatchDoc {
     && isObject(v.epochs) && Object.values(v.epochs).every(count);
 }
 export function validIndex(v: unknown): v is IndexDoc {
-  return isObject(v) && v.v === 1 && str(v.originId) && (v.source === null || str(v.source)) && (v.sessionId === null || str(v.sessionId)) && isObject(v.records)
+  return isObject(v) && v.v === 1 && str(v.originId) && (v.source === null || str(v.source)) && (v.sessionId === null || str(v.sessionId)) && count(v.epoch) && count(v.resets) && isObject(v.records)
     && Object.values(v.records).every((r) => Array.isArray(r) && r.length === 3 && Number.isSafeInteger(r[0]) && (r[0] as number) >= 1 && str(r[1]) && typeof r[2] === "string" && HEX64.test(r[2]));
 }
 
@@ -239,8 +255,11 @@ const PARALLEL = 6;
  *   readFence(key)                      the fence, or an empty one when absent; unreadable throws (fail closed)
  *   editFence(key, edit)                CAS edit; `edit` returns {next: null} for no change; version + 1 per write
  *   readIndex(key)                      a revision index, or null when absent; unreadable throws
- *   mergeIndex(key, shape, records)     max revision wins, an equal revision keeps the stored digest; CAS-retried
+ *   mergeIndex(key, shape, records)     max revision wins, an equal revision keeps the stored digest; CAS-retried.
+ *                                       `shape` carries the generation: an older stored one is replaced, a newer
+ *                                       one is left alone (these records predate a fence change)
  *   clearIndex(key)                     forget a session's revisions (an empty record set, never a delete)
+ *   indexGeneration(fence, origin, s, id)  the generation an index must carry to count (exported separately)
  *   writeRearm(key, marker)             create-only re-arm marker for the eraser
  *   readBatch(key)                      a batch record, or null when absent
  */
@@ -283,8 +302,12 @@ export function s3LedgerObjects(store: ObjectStore, keyRoot: string, opts: Omit<
     }
     for (let attempt = 0; attempt < attempts; attempt++) {
       const got = await readIndex(key);
-      const map = new Map(Object.entries(got?.doc.records ?? {}));
-      let changed = false;
+      const cur = got?.doc;
+      // A newer generation is stored: these records were claimed before a disable or reset. Never overwrite it.
+      if (cur && (cur.resets > shape.resets || (cur.resets === shape.resets && cur.epoch > shape.epoch))) return;
+      const same = cur !== undefined && cur.resets === shape.resets && cur.epoch === shape.epoch;
+      const map = new Map(same ? Object.entries(cur.records) : []);
+      let changed = !same;
       for (const [id, r] of best) {
         const stored = map.get(id);
         if (stored && stored[0] >= r.revision) continue; // #250: an equal revision keeps the stored digest
@@ -324,7 +347,7 @@ export function s3LedgerObjects(store: ObjectStore, keyRoot: string, opts: Omit<
 export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOptions = {}): Ledger {
   if (opts.acceptanceMode === "buffered") throw new LedgerUnavailableError("ledger_s3_mode_refused");
   const io = s3LedgerObjects(store, keyRoot, opts);
-  const { attempts, backoff, keysFor, readFence, editFence, readIndex, mergeIndex, clearIndex, writeRearm } = io;
+  const { attempts, backoff, keysFor, readFence, editFence, readIndex, mergeIndex, writeRearm } = io;
   const newToken = opts.newToken ?? randomUUID;
 
   const unsupported = (name: string) => async (): Promise<never> => { throw new LedgerUnavailableError(`ledger_s3_unsupported_${name}`); };
@@ -358,7 +381,12 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
     const deletedSet = new Set(deleted.map(([s, id]) => pairId(s, id)));
     const live = input.records.map((r, ord) => ({ ...r, ord })).filter((r) => r.sessionId === null || !deletedSet.has(pairId(r.source, r.sessionId)));
     const indexKeys = [...new Set(live.map((r) => keys.revisions(input.originId, r.source, r.sessionId)))];
-    const loaded = await mapLimit(indexKeys, PARALLEL, async (k) => [k, (await readIndex(k))?.doc.records ?? {}] as const);
+    const loaded = await mapLimit(indexKeys, PARALLEL, async (k) => {
+      const doc = (await readIndex(k))?.doc;
+      // A stale generation (a disable or reset since it was written) counts as empty: those revisions are forgotten.
+      const gen = doc ? indexGeneration(fence, input.originId, doc.source, doc.sessionId) : undefined;
+      return [k, doc && gen && doc.epoch === gen.epoch && doc.resets === gen.resets ? doc.records : {}] as const;
+    });
     const indexes = new Map(loaded.map(([k, recs]) => [k, new Map(Object.entries(recs))]));
     const storedOf = (r: (typeof live)[number]) => indexes.get(keys.revisions(input.originId, r.source, r.sessionId))!.get(r.recordId)?.[0];
     // Identity order (record_id, revision, revision_id, ord); a NEW revision is judged against its first peer.
@@ -389,13 +417,9 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
     if (!mapKey(input.originId) || !Array.isArray(input.sessions) || !input.sessions.every(pairOk) || typeof input.enabled !== "boolean") throw new LedgerUnavailableError("ledger_input_refused");
     const keys = keysFor(input.tenant);
     const pairs = batchPairs(input.sessions, []);
-    const indexOf = ([s, id]: [string, string]) => keys.revisions(input.originId, s, id);
     if (input.enabled) {
-      // Forget first, then lift the tombstone: an upload in between still sees the session deleted, and
-      // one after it never meets revisions the disable left behind.
-      const { doc } = await readFence(keys.fence);
-      const fenced = new Set((own(doc.deleted, input.originId) ?? []).map(([s, id]) => pairId(s, id)));
-      await mapLimit(pairs.filter(([s, id]) => fenced.has(pairId(s, id))), PARALLEL, (p) => clearIndex(indexOf(p)));
+      // Lift the tombstone. The disable that set it bumped the session's epoch, so its old revisions stay
+      // forgotten (a stale index generation) and the next upload writes them again.
       return editFence<{ outcome: "applied" | "replay" | "stale"; updated: number }>(keys.fence, (f) => {
         const decided = mark?.(f);
         if (decided && decided !== "apply") return { next: null, result: { outcome: decided.outcome, updated: decided.result } };
@@ -419,14 +443,13 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
         epochs[k] = (epochs[k] ?? 0) + 1;
       }
       f.deleted[input.originId] = [...have.values()].sort(pairCompare);
+      if (control) finishOrdered(f, control, pairs.length);
       return { next: f, result: "apply" as const };
     });
     if (decided !== "apply") return { outcome: decided.outcome, updated: decided.result };
-    // Then forget: a commit that merged before this edit is cleared here; one after it sees the fence.
-    const forgotten = await mapLimit(pairs, PARALLEL, (p) => clearIndex(indexOf(p)));
-    const updated = forgotten.reduce((a, b) => a + b, 0);
-    if (control) await editFence(keys.fence, (f) => ({ next: finishOrdered(f, control, updated) ? f : null, result: undefined }));
-    return { outcome: "applied", updated };
+    // The epoch bump already forgot the sessions' revisions (their indexes are now a stale generation). The
+    // count is the sessions fenced: SQL's revision-row count has no S3 equivalent without reading every index.
+    return { outcome: "applied", updated: pairs.length };
   }
 
   /** A reset (ingest_apply_reset): begin (resets + 1), list the owned sessions, tombstone them, forget their revisions. */
@@ -446,7 +469,10 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       return { next: f, result: "apply" as const };
     });
     if (begun !== "apply") return { outcome: begun.outcome, deleted: begun.result };
-    // Owned: every session index with stored revisions (a pending claim is caught at its commit by the reset count).
+    // Owned: every session index of the generation this reset ends (written under the previous reset count, at
+    // the session's current epoch) that holds revisions. A pending claim is caught at its commit by the reset
+    // count. Cost: one LIST page per 1000 index objects plus one GET each; no index is written.
+    const { doc: now } = await readFence(keys.fence);
     const owned: { key: string; originId: string; pair: [string, string] }[] = [];
     let cursor: string | undefined;
     const prefix = keys.revisionsRoot + "/";
@@ -457,8 +483,10 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
           const key = String(item.key);
           if (!key.startsWith(prefix) || key.endsWith("/s=_origin.json")) continue;
           const got = await readIndex(key);
-          if (got && got.doc.source !== null && got.doc.sessionId !== null && Object.keys(got.doc.records).length > 0)
-            owned.push({ key, originId: got.doc.originId, pair: [got.doc.source, got.doc.sessionId] });
+          const d = got?.doc;
+          if (!d || d.source === null || d.sessionId === null || Object.keys(d.records).length === 0) continue;
+          const gen = indexGeneration(now, d.originId, d.source, d.sessionId);
+          if (d.resets === now.resets - 1 && d.epoch === gen.epoch) owned.push({ key, originId: d.originId, pair: [d.source, d.sessionId] });
         }
         cursor = page.nextCursor;
       } while (cursor);
@@ -480,7 +508,6 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       if (control) finishOrdered(f, control, total);
       return { next: f, result: undefined };
     });
-    await mapLimit(owned, PARALLEL, (o) => clearIndex(o.key));
     return { outcome: "applied", deleted: total };
   }
 
@@ -589,27 +616,23 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       // 1. The fence, and re-arm markers for what it reached, BEFORE any index merge.
       const first = fencedBy((await readFence(keys.fence)).doc);
       await rearm(first.fenced);
-      // 2. The written revisions become stored (max wins, an equal revision keeps the stored digest).
+      // 2. The written revisions become stored (max wins, an equal revision keeps the stored digest), stamped with
+      //    the CLAIM's generation: a disable or reset that lands after the fence read makes them stale at once.
       const firstSet = new Set(first.fenced.map(([s, id]) => pairId(s, id)));
       const groups = new Map<string, { shape: Omit<IndexDoc, "v" | "records">; records: LedgerRecord[] }>();
       for (const r of input.records) {
         if (r.sessionId !== null && firstSet.has(pairId(r.source, r.sessionId))) continue;
         const key = keys.revisions(input.originId, r.source, r.sessionId);
-        const g = groups.get(key) ?? { shape: { originId: input.originId, source: r.sessionId === null ? null : r.source, sessionId: r.sessionId }, records: [] };
+        const gen = r.sessionId === null ? { epoch: 0, resets: 0 } : { epoch: snapshot.epochs[pairHash(r.source, r.sessionId)]!, resets: snapshot.resets };
+        const g = groups.get(key) ?? { shape: { originId: input.originId, source: r.sessionId === null ? null : r.source, sessionId: r.sessionId, ...gen }, records: [] };
         g.records.push(r);
         groups.set(key, g);
       }
       await mapLimit([...groups], PARALLEL, ([key, g]) => mergeIndex(key, g.shape, g.records));
-      // 3. The fence again: a selection or reset that landed during the merge has its index cleared here
-      //    (one that lands after this read clears it itself, after its own fence edit).
-      const second = fencedBy((await readFence(keys.fence)).doc);
-      const late = second.fenced.filter(([s, id]) => !firstSet.has(pairId(s, id)));
-      await rearm(late);
-      const fenced = [...first.fenced, ...late];
-      await mapLimit(fenced, PARALLEL, ([s, id]) => clearIndex(keys.revisions(input.originId, s, id)));
       // A fenced session the fence no longer deletes (reset or re-enabled since the claim): SQL's invalidated.
-      if (fenced.some(([s, id]) => !second.deleted.has(pairId(s, id)))) throw new LedgerUnavailableError("ledger_attempt_superseded");
-      // 4. pending -> committed.
+      const fenced = first.fenced;
+      if (fenced.some(([s, id]) => !first.deleted.has(pairId(s, id)))) throw new LedgerUnavailableError("ledger_attempt_superseded");
+      // 3. pending -> committed.
       if (!(await casPut(store, batchKey, { ...snapshot, state: "committed" }, stored.version))) {
         const now = await readDoc(store, batchKey, validBatch, "ledger_batch_record_invalid");
         if (!(now && now.doc.state === "committed" && now.doc.claimToken === input.claimToken && now.doc.digest === input.batchDigest))

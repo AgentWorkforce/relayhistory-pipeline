@@ -269,7 +269,9 @@ describe("fences: selection, reset, and the commit's recheck", () => {
     const a = claimInput("b1", [rec("r1", 1)]);
     await ledger.commit(commitOf(a, (await claimed(ledger, a)).claimToken));
     await ledger.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "sess-1"]], enabled: false });
-    expect((await json(store, indexKey("sess-1"))).records).toEqual({});
+    // One fence CAS: the index is not rewritten, its generation (epoch 0) is now stale (the fence is at epoch 1).
+    expect(await json(store, indexKey("sess-1"))).toMatchObject({ epoch: 0, resets: 0, records: { r1: [1, "r1:r1", rec("r1", 1).digest] } });
+    expect((await json(store, keys.fence)).epochs[ORIGIN]).toEqual({ [createHash("sha256").update("claude\u001fsess-1").digest("hex").slice(0, 32)]: 1 });
     await ledger.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "sess-1"]], enabled: true });
     expect(await ledger.claim(claimInput("b2", [rec("r1", 1)]))).toMatchObject({ kind: "claimed", stale: [] });
   });
@@ -298,8 +300,12 @@ describe("fences: selection, reset, and the commit's recheck", () => {
     expect(await ledger.resetUploadedSessions(TENANT, "req-1")).toBe(1);
     expect(await ledger.commit(commitOf(input, c.claimToken))).toEqual({ rearmed: 1 });
     expect(await exists(store, keys.rearm(ORIGIN, "claude", "sess-1"))).toBe(true);
-    expect((await json(store, indexKey("sess-1"))).records).toEqual({});
+    // The index keeps the pre-reset generation (resets 0): stale under the fence's resets 1.
+    expect(await json(store, indexKey("sess-1"))).toMatchObject({ resets: 0 });
     expect(await ledger.claim(claimInput("b2", [rec("r5", 1)]))).toMatchObject({ kind: "replay_fast", deleted: [["claude", "sess-1"]], resets: 1 });
+    // Re-enabled: the old revisions are forgotten, so r0 is written again (not stale).
+    await ledger.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "sess-1"]], enabled: true });
+    expect(await ledger.claim(claimInput("b3", [rec("r0", 1)]))).toMatchObject({ kind: "claimed", stale: [] });
   });
 
   test("reset between claim and commit of a NEW session: rearmed, and superseded (SQL's invalidated) so the retry re-claims", async () => {
@@ -328,7 +334,7 @@ describe("fences: selection, reset, and the commit's recheck", () => {
     expect(await exists(store, keys.rearm(ORIGIN, "claude", "sess-1"))).toBe(true);
   });
 
-  test("a selection that lands during the commit's merge is caught by the second fence read", async () => {
+  test("a disable that lands during the commit's merge leaves those revisions stale (the claim's generation), so a re-enable rewrites them", async () => {
     const base = fresh();
     const setup = ledgerOn(base);
     const input = claimInput("b1", [rec("r1", 1)]);
@@ -342,9 +348,27 @@ describe("fences: selection, reset, and the commit's recheck", () => {
         if (String(k) === indexKey("sess-1") && fenceReads === 1) await setup.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "sess-1"]], enabled: false });
         return ack;
       } };
-    expect(await ledgerOn(store).commit(commitOf(input, c.claimToken))).toEqual({ rearmed: 1 });
-    expect((await json(base, indexKey("sess-1"))).records).toEqual({});
-    expect(await exists(base, keys.rearm(ORIGIN, "claude", "sess-1"))).toBe(true);
+    // The disable came after the commit's fence read and after the objects were written: the disable's own
+    // erasure sweeps them, so no re-arm; the merged revisions carry the claim's epoch (0) and are stale now.
+    expect(await ledgerOn(store).commit(commitOf(input, c.claimToken))).toEqual({ rearmed: 0 });
+    expect(await json(base, indexKey("sess-1"))).toMatchObject({ epoch: 0, records: { r1: [1, "r1:r1", rec("r1", 1).digest] } });
+    await setup.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "sess-1"]], enabled: true });
+    expect(await setup.claim(claimInput("b2", [rec("r1", 1)]))).toMatchObject({ kind: "claimed", stale: [] });
+  });
+
+  test("a commit from before a disable+enable never overwrites the newer generation's index", async () => {
+    const store = fresh();
+    const ledger = ledgerOn(store);
+    const old = claimInput("b-old", [rec("r1", 5)]);
+    const co = await claimed(ledger, old);
+    await ledger.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "sess-1"]], enabled: false });
+    await ledger.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "sess-1"]], enabled: true });
+    const fresh2 = claimInput("b-new", [rec("r2", 1)]);
+    await ledger.commit(commitOf(fresh2, (await claimed(ledger, fresh2)).claimToken));
+    expect(await json(store, indexKey("sess-1"))).toMatchObject({ epoch: 1, records: { r2: [1, "r2:r1", rec("r2", 1).digest] } });
+    // The old attempt is superseded (epoch moved) and its records never reach the epoch-1 index.
+    await expect(ledger.commit(commitOf(old, co.claimToken))).rejects.toMatchObject({ code: "ledger_attempt_superseded" });
+    expect(Object.keys((await json(store, indexKey("sess-1"))).records)).toEqual(["r2"]);
   });
 
   test("reset is idempotent by request id, tombstones every owned session of every origin, and counts distinct sessions", async () => {
