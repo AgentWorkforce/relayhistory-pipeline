@@ -557,6 +557,7 @@ export async function runtimeRoleViolations(
   cfg: RuntimeRoleConfig,
   tables: RuntimeTables,
   phase: "pre" | "post" = "post",
+  heldSql: readonly string[] = [],
 ): Promise<string[]> {
   const out: string[] = [];
   const migrationOwner = cfg.mode === "rds"
@@ -940,10 +941,24 @@ export async function runtimeRoleViolations(
   for (const fnr of effectiveFunctions)
     if (!catalog.functions.includes(fnr.fn))
       out.push(`EXECUTE on ${fnr.fn}`);
-  if (phase === "post")
+  if (phase === "post") {
+    // Release-target prefix scope (as in sessionsFunctionAclDrift): a listed function may
+    // lack EXECUTE only when it is ABSENT from the catalog and a held step creates it.
+    const heldCreates = createdSessionsFunctions(heldSql);
+    const heldAbsent = new Set(
+      heldCreates.size
+        ? (
+            await client.query<{ fn: string }>(
+              "SELECT x AS fn FROM unnest($1::text[]) x WHERE to_regprocedure(x) IS NULL",
+              [catalog.functions.filter((fn) => heldCreates.has(fn))],
+            )
+          ).rows.map((r) => r.fn)
+        : [],
+    );
     for (const fn of catalog.functions)
-      if (!effectiveFunctions.some((row) => row.fn === fn))
+      if (!heldAbsent.has(fn) && !effectiveFunctions.some((row) => row.fn === fn))
         out.push(`missing EXECUTE on ${fn}`);
+  }
 
   const grantable = (
     await client.query<{ what: string }>(
