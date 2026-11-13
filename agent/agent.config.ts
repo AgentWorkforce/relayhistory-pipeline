@@ -24,6 +24,9 @@ export default defineLayeredAgent({
   stage,
   accountId: process.env.LAYERED_AGENT_ACCOUNT_ID,
   arch: "x64",
+  // Pinned to the AMI the host runs: a new Canonical "current" AMI would
+  // otherwise turn every deploy into a host replacement. Move it deliberately.
+  ami: "ami-08cf17e3856f70154",
   // 4 vCPU / 16 GiB: one Fable lead plus a few subagents running bun install,
   // tsc and vitest (PGlite, in process) over two TypeScript repos. Nothing
   // here compiles native code or runs containers.
