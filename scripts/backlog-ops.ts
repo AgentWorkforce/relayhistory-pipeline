@@ -9,8 +9,8 @@
  * argv and an allowlisted environment: the AWS session in the child's environment (the tools read AWS_* only from
  * there), the database URL only on the child's stdin pipe as {"dbUrl": ...} (backfill and export; the drain gets no
  * database), never argv, a file or a log. The owner URL is the environment's SUPABASE_MIGRATION_OWNER_URL, checked
- * against the pinned release connection (releaseConnection) and re-encoded with sslmode=verify-full only, which is
- * what the tools' strict parser accepts (ownerClientConfig pins TLS to the Supabase CA itself).
+ * against the pinned release connection (releaseConnection) and handed to the tool in one normal form
+ * (sslmode=verify-full; ownerClientConfig pins TLS to the Supabase CA itself and never forwards channel_binding).
  *
  * The child's single stdout summary line becomes a counts-only receipt (any non-code string refuses it), written to
  * $RUNNER_TEMP/backlog-ops-out and echoed to the log. The step's exit code is the tool's.
@@ -31,6 +31,7 @@ import {
   backlogOpsTarget,
   backlogOpsToolArgs,
   checkBoundReceipt,
+  checkStsExpiration,
   parseStsCredentials,
   refuseBacklogOps as refuse,
   type BacklogOpsDispatch,
@@ -118,7 +119,9 @@ export async function assumeRole(
     method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body,
   });
   if (!res.ok) refuse("backlog_ops_sts_refused");
-  return parseStsCredentials(await res.text());
+  const creds = parseStsCredentials(await res.text());
+  checkStsExpiration(creds.expiration);
+  return creds;
 }
 
 function writePrivate(path: string, value: unknown): void {

@@ -18,19 +18,24 @@ import {
 import { SCHEMA_RELEASE as P } from "../../hoopdb/schema-release-contract.ts";
 import { PRIVATE_INGEST_RELEASE } from "../private-ingest-release.ts";
 import {
+  BACKLOG_OPS_DRY_ENVIRONMENT,
   BACKLOG_OPS_EXECUTE_ENABLED,
+  BACKLOG_OPS_EXECUTE_ENVIRONMENT,
+  BACKLOG_OPS_MIN_SESSION_REMAINING_MS,
   BACKLOG_OPS_MODES,
   BACKLOG_OPS_RECEIPT_ARTIFACT,
   BACKLOG_OPS_RECEIPT_CONTRACT,
   BACKLOG_OPS_WORKFLOW,
   backlogOpsConfirmation,
   backlogOpsDispatch,
+  backlogOpsEnvironment,
   backlogOpsReceipt,
   backlogOpsRole,
   backlogOpsRunName,
   backlogOpsTarget,
   backlogOpsToolArgs,
   checkBoundReceipt,
+  checkStsExpiration,
   countsOnly,
   parseStsCredentials,
   type BacklogOpsMode,
@@ -213,7 +218,7 @@ test("database URL: only the pinned release login, re-encoded with sslmode=verif
 test("STS: the OIDC token is exchanged for the mode's role in memory; a bad response refuses", async () => {
   const calls: Array<{ url: string; body?: string }> = [];
   const xml = "<AssumeRoleWithWebIdentityResponse><Credentials><AccessKeyId>ASIAAAAAAAAAAAAAAAAA</AccessKeyId>" +
-    "<SecretAccessKey>secret</SecretAccessKey><SessionToken>token</SessionToken><Expiration>2026-11-13T20:00:00Z</Expiration></Credentials></AssumeRoleWithWebIdentityResponse>";
+    `<SecretAccessKey>secret</SecretAccessKey><SessionToken>token</SessionToken><Expiration>${new Date(Date.now() + 6 * 3600_000).toISOString()}</Expiration></Credentials></AssumeRoleWithWebIdentityResponse>`;
   const fetcher = (async (url: string, init?: RequestInit) => {
     calls.push({ url, body: init?.body?.toString() });
     if (url.startsWith("https://token.example/")) return new Response(JSON.stringify({ value: "a.b.c" }));
@@ -247,7 +252,7 @@ function githubFixture(mode: BacklogOpsMode) {
     ref: { object: { sha } },
     run: { id: 100, head_sha: sha, head_branch: "main", event: "workflow_dispatch", path: BACKLOG_OPS_WORKFLOW, run_attempt: 1,
       actor, triggering_actor: { ...actor }, display_title: backlogOpsRunName(mode, sha) },
-    environment: { id: 7, name: P.environment, protection_rules: [{ type: "branch_policy" }] as any[],
+    environment: { id: 7, name: backlogOpsEnvironment(mode), protection_rules: [{ type: "branch_policy" }] as any[] | undefined,
       deployment_branch_policy: { protected_branches: false, custom_branch_policies: true } },
     branches: { total_count: 1, branch_policies: [{ name: "main", type: "branch" }] },
     runs: { workflow_runs: [{ id: 10, head_sha: sha, head_branch: "main", event: "push", status: "completed", conclusion: "success", run_attempt: 1 }] },
@@ -261,6 +266,7 @@ function githubFixture(mode: BacklogOpsMode) {
     } as Record<string, any>,
     artifacts: { [DRY]: 1, [BACKFILL]: 1, [EXPORT]: 1 } as Record<string, number>,
     expired: false,
+    artifactsTotalDelta: 0,
   };
 }
 type Fixture = ReturnType<typeof githubFixture>;
@@ -272,7 +278,8 @@ const githubGet = (f: Fixture, seen: string[] = []) => async (path: string): Pro
   for (const id of [DRY, BACKFILL, EXPORT]) {
     if (path.endsWith(`/actions/runs/${id}`)) return f.bound[id];
     if (path.endsWith(`/actions/runs/${id}/artifacts?per_page=100`))
-      return { artifacts: Array.from({ length: f.artifacts[id]! }, () => ({ name: BACKLOG_OPS_RECEIPT_ARTIFACT, expired: f.expired })) };
+      return { total_count: f.artifacts[id]! + f.artifactsTotalDelta,
+        artifacts: Array.from({ length: f.artifacts[id]! }, () => ({ name: BACKLOG_OPS_RECEIPT_ARTIFACT, expired: f.expired })) };
   }
   if (path.endsWith("/environments/" + f.environment.name)) return f.environment;
   if (path.includes("deployment-branch-policies")) return f.branches;
@@ -315,7 +322,14 @@ test("gate: context, main, run, environment, CI and approval refuse", async () =
     ["drain-dry", (f) => { f.branches.branch_policies.push({ name: "dev", type: "branch" }); f.branches.total_count = 2; }, {}, "backlog_ops_gate_environment_branch"],
     ["drain-dry", (f) => { f.runs.workflow_runs[0]!.conclusion = "failure"; }, {}, "backlog_ops_gate_ci"],
     ["drain-dry", (f) => { f.jobs.jobs[0]!.conclusion = "failure"; }, {}, "backlog_ops_gate_ci_jobs"],
-    ["drain-dry", (f) => { f.environment.protection_rules.push({ type: "required_reviewers", reviewers: [{ type: "User", reviewer: { type: "User", id: 5 } }] }); }, {}, "backlog_ops_gate_human_approval"],
+    ["drain-dry", (f) => { f.environment.protection_rules!.push({ type: "required_reviewers", reviewers: [{ type: "User", reviewer: { type: "User", id: 5 } }] }); }, {}, "backlog_ops_gate_human_approval"],
+    ["drain-dry", (f) => { f.environment.protection_rules = undefined; }, {}, "backlog_ops_gate_environment"],
+    // A rejection recorded for this environment refuses even beside an approval.
+    ["drain-dry", (f) => {
+      f.environment.protection_rules!.push({ type: "required_reviewers", reviewers: [{ type: "User", reviewer: { type: "User", id: 5 } }] });
+      const envs = [{ id: 7, name: BACKLOG_OPS_DRY_ENVIRONMENT }];
+      f.approvals.push({ state: "approved", user: { type: "User", id: 5 }, environments: envs }, { state: "rejected", user: { type: "User", id: 6 }, environments: envs });
+    }, {}, "backlog_ops_gate_human_rejected"],
   ];
   for (const [mode, mutate, extra, want] of cases) expect(await gate(mode, mutate, extra)).toBe(want);
 });
@@ -334,6 +348,8 @@ test("gate: bound runs must be this workflow, this sha, success, attempt 1, the 
     ["backfill-execute", (f) => { f.artifacts[DRY] = 0; }, "backlog_ops_gate_dry_artifact"],
     ["backfill-execute", (f) => { f.artifacts[DRY] = 2; }, "backlog_ops_gate_dry_artifact"],
     ["backfill-execute", (f) => { f.expired = true; }, "backlog_ops_gate_dry_artifact"],
+    // A truncated artifact listing (total_count above the page) refuses.
+    ["backfill-execute", (f) => { f.artifactsTotalDelta = 1; }, "backlog_ops_gate_dry_artifact"],
     ["export-execute", (f) => { f.bound[BACKFILL].display_title = backlogOpsRunName("backfill-dry", sha); }, "backlog_ops_gate_backfill_run"],
     ["drain-execute", (f) => { f.bound[EXPORT].display_title = backlogOpsRunName("export-dry", sha); }, "backlog_ops_gate_export_run"],
     // The drain's backfill must be fresh (3 h), and its export after it.
@@ -349,14 +365,21 @@ test("gate: bound runs must be this workflow, this sha, success, attempt 1, the 
 
 test("workflow: dispatch inputs, gates, one credential step, OIDC, protected vars, counts-only receipt, one op at a time", () => {
   const yml = readFileSync(fileURLToPath(new URL("../../../" + BACKLOG_OPS_WORKFLOW, import.meta.url)), "utf8");
+  const code_ = yml.split("\n").filter((l) => !l.trimStart().startsWith("#")).join("\n");
   expect(yml).toContain("options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute]");
   expect(yml).toContain("run-name: ${{ github.event_name == 'workflow_dispatch' && format('backlog ops {0} {1}', inputs.mode, inputs.sha)");
   expect(backlogOpsRunName("drain-dry", sha)).toBe(`backlog ops drain-dry ${sha}`);
-  expect(yml).toContain("group: ${{ github.event_name == 'workflow_dispatch' && 'guarded-backlog-ops-production'");
+  // Dispatches serialise with every guarded production operator on the owner database.
+  expect(yml).toContain("group: ${{ github.event_name == 'workflow_dispatch' && 'guarded-session-schema-production'");
+  expect(yml).not.toContain("guarded-backlog-ops-production");
   expect(yml).toContain("cancel-in-progress: false");
   expect(yml).toContain("github.repository_id == '1437714333' && github.ref == 'refs/heads/main'");
   expect(yml).toContain("bun scripts/backlog-ops-github.ts --approved");
-  expect(yml).toContain('echo "environment=session-schema-production"');
+  // The environment comes from the gate (derived from the mode), never a literal or an input.
+  expect(yml).not.toContain('echo "environment=');
+  expect(yml).toContain("name: ${{ needs.prerequisite-gate.outputs.environment }}");
+  // Only the operate job may mint an OIDC token.
+  expect(code_.match(/id-token: write/g)?.length).toBe(1);
   expect(yml).toContain("id-token: write");
   // The secret appears exactly once, only for the database tools, in the one credential step.
   expect(yml.match(/secrets\./g)?.length).toBe(1);
@@ -364,7 +387,6 @@ test("workflow: dispatch inputs, gates, one credential step, OIDC, protected var
   for (const v of ["BACKLOG_OPS_BUCKET", "BACKLOG_OPS_REGION", "BACKLOG_OPS_KMS_KEY_ARN", "BACKLOG_OPS_DRY_ROLE_ARN", "BACKLOG_OPS_EXECUTE_ROLE_ARN"])
     expect(yml).toContain(`${v}: \${{ vars.${v} }}`);
   expect(yml).not.toContain("configure-aws-credentials");
-  const code_ = yml.split("\n").filter((l) => !l.trimStart().startsWith("#")).join("\n");
   expect(code_).not.toMatch(/checkpoint|start-after|--org/);
   expect(yml).toContain("name: backlog-ops-receipt");
   expect(yml).toContain("path: ${{ runner.temp }}/backlog-ops-out/backlog-ops-receipt.json");
@@ -373,4 +395,37 @@ test("workflow: dispatch inputs, gates, one credential step, OIDC, protected var
   const proof = yml.slice(yml.indexOf("  proof:"), yml.indexOf("  prerequisite-gate:"));
   expect(proof).not.toMatch(/^\s+environment:/m);
   expect(proof).not.toContain("secrets.");
+});
+
+test("environments: dry modes use the schema environment, every execute its own; the gate checks the mode's", async () => {
+  for (const mode of BACKLOG_OPS_MODES)
+    expect(backlogOpsEnvironment(mode)).toBe(mode.endsWith("-execute") ? BACKLOG_OPS_EXECUTE_ENVIRONMENT : BACKLOG_OPS_DRY_ENVIRONMENT);
+  expect(BACKLOG_OPS_DRY_ENVIRONMENT).toBe(P.environment);
+  expect(BACKLOG_OPS_EXECUTE_ENVIRONMENT).not.toBe(P.environment);
+  for (const mode of BACKLOG_OPS_MODES) {
+    const seen: string[] = [];
+    expect(await gate(mode, () => {}, {}, true, seen)).toBeNull();
+    expect(seen.some((p) => p.endsWith("/environments/" + backlogOpsEnvironment(mode)))).toBe(true);
+    expect(seen.some((p) => p.endsWith("/environments/" + (mode.endsWith("-execute") ? BACKLOG_OPS_DRY_ENVIRONMENT : BACKLOG_OPS_EXECUTE_ENVIRONMENT)))).toBe(false);
+  }
+  // An execute whose protected environment is the schema one is refused (the fake only knows the wrong name).
+  expect(await gate("drain-execute", (f) => { f.environment.name = BACKLOG_OPS_DRY_ENVIRONMENT; })).not.toBeNull();
+  // The gate returns the environment the workflow's operate job must use.
+  const f = githubFixture("export-execute");
+  const r = await backlogOpsGithubGate({ ...context, ...dispatchEnv("export-execute") }, githubGet(f), false, { enabled: true });
+  expect(r.environment).toBe(BACKLOG_OPS_EXECUTE_ENVIRONMENT);
+});
+
+test("STS expiration: the session must have at least the job's lifetime left", () => {
+  const now = Date.parse("2026-11-13T18:00:00Z");
+  expect(codeSync(() => checkStsExpiration("2026-11-14T00:00:00Z", now))).toBeNull();
+  expect(codeSync(() => checkStsExpiration(new Date(now + BACKLOG_OPS_MIN_SESSION_REMAINING_MS - 1).toISOString(), now))).toBe("backlog_ops_sts_expiration");
+  expect(codeSync(() => checkStsExpiration("2026-11-13T17:00:00Z", now))).toBe("backlog_ops_sts_expiration");
+  expect(codeSync(() => checkStsExpiration("tomorrow", now))).toBe("backlog_ops_sts_expiration");
+});
+
+test("target: multi-region (mrk-) KMS key ids are accepted, other key-id shapes still refuse", () => {
+  const mrk = { ...target, BACKLOG_OPS_KMS_KEY_ARN: "arn:aws:kms:us-east-1:000000000000:key/mrk-" + "0".repeat(32) };
+  expect(codeSync(() => backlogOpsTarget(mrk))).toBeNull();
+  expect(codeSync(() => backlogOpsTarget({ ...target, BACKLOG_OPS_KMS_KEY_ARN: "arn:aws:kms:us-east-1:000000000000:key/mrk-xyz" }))).toBe("backlog_ops_target_kms");
 });

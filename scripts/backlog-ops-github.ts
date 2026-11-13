@@ -2,14 +2,16 @@
  * Read-only GitHub gate for .github/workflows/backlog-ops.yml (the 0005 backlog tools against production; contract in
  * src/session-ingest/backlog-ops.ts). The same gates as the guarded schema release and its operators
  * (scripts/schema-release-github.ts): repository id, main ref, the exact live main head, first attempt, the pinned
- * human dispatcher on both actor and triggering_actor, the protected session-schema-production environment (main
- * only), green push CI and pg-proof at the SHA, and, inside the protected job, the recorded environment approval.
+ * human dispatcher on both actor and triggering_actor, the mode's protected environment (session-schema-production for
+ * a dry run, session-backlog-execute for an execute; main only), green push CI and pg-proof at the SHA, and, inside
+ * the protected job, the recorded approval for that environment.
  * An execute also binds earlier runs of this workflow at the same SHA: each completed/success, first attempt, by the
  * pinned dispatcher, of the expected mode (read back from its run-name), under 24 h old, holding exactly one
  * unexpired receipt artifact; the drain's backfill under BACKLOG_OPS_FRESH_BACKFILL_MS old and its export created
  * after that backfill. The dormant switch and the inputs are checked first, before any GitHub read. Errors carry
  * fixed codes only.
  */
+import { appendFileSync } from "node:fs";
 import { PRIVATE_INGEST_RELEASE } from "../src/session-ingest/private-ingest-release.ts";
 import { SCHEMA_RELEASE as S } from "../src/hoopdb/schema-release-contract.ts";
 import {
@@ -20,6 +22,7 @@ import {
   BACKLOG_OPS_WORKFLOW,
   backlogOpsBindings,
   backlogOpsDispatch,
+  backlogOpsEnvironment,
   backlogOpsRunName,
   refuseBacklogOps as refuse,
 } from "../src/session-ingest/backlog-ops.ts";
@@ -54,7 +57,9 @@ export async function backlogOpsGithubGate(
       run.path !== BACKLOG_OPS_WORKFLOW || run.run_attempt !== 1 || !isPinnedDispatcher(run) ||
       run.display_title !== backlogOpsRunName(input.mode, input.sha))
     refuse("backlog_ops_gate_run");
-  const gate = await requireProtectedEnvironment(get, base, S.environment, true, {
+  // Dry modes: the schema release environment. Executes: their own environment, which alone the write role trusts.
+  const environment = backlogOpsEnvironment(input.mode);
+  const gate = await requireProtectedEnvironment(get, base, environment, true, {
     environment: "backlog_ops_gate_environment",
     branch: "backlog_ops_gate_environment_branch",
   });
@@ -72,23 +77,28 @@ export async function backlogOpsGithubGate(
       refuse(`backlog_ops_gate_${b.kind}_run`);
     const artifacts = await get(base + "/actions/runs/" + b.run + "/artifacts?per_page=100");
     const named = (artifacts.artifacts ?? []).filter((a: Obj) => a.name === BACKLOG_OPS_RECEIPT_ARTIFACT);
-    if (named.length !== 1 || named[0].expired !== false) refuse(`backlog_ops_gate_${b.kind}_artifact`);
+    if (artifacts.total_count !== artifacts.artifacts?.length || named.length !== 1 || named[0].expired !== false)
+      refuse(`backlog_ops_gate_${b.kind}_artifact`);
     created[b.kind] = at;
   }
   // The drain's export ran after its backfill (the export reads the fences the backfill wrote).
   if (input.mode === "drain-execute" && !(created.export! > created.backfill!)) refuse("backlog_ops_gate_order");
   if (approved)
-    await requireHumanApproval(get, base, env.GITHUB_RUN_ID!, S.environment, gate, true, {
+    await requireHumanApproval(get, base, env.GITHUB_RUN_ID!, environment, gate, true, {
       approval: "backlog_ops_gate_human_approval",
       rejected: "backlog_ops_gate_human_rejected",
       dispatch: "backlog_ops_gate_human_dispatch",
     });
-  return input;
+  return { ...input, environment };
 }
 
 if (import.meta.main)
   backlogOpsGithubGate(process.env, githubGet(), process.argv.includes("--approved"))
-    .then(() => console.log("backlog_ops_github_gate_ok"))
+    .then((r) => {
+      console.log("backlog_ops_github_gate_ok");
+      // The protected environment the operate job must run in, derived from the mode (never an input).
+      if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `environment=${r.environment}\n`);
+    })
     .catch((error) => {
       const code = (error as { code?: unknown })?.code;
       console.error("backlog_ops_github_gate_refused " +

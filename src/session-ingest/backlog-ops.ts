@@ -40,13 +40,25 @@ export const BACKLOG_OPS_BINDING_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 export const BACKLOG_OPS_FRESH_BACKFILL_MS = 3 * 60 * 60 * 1000;
 /** The role session: the job's timeout is above it, so no tool outlives its credentials unnoticed. */
 export const BACKLOG_OPS_SESSION_SECONDS = 6 * 60 * 60;
+/**
+ * The protected GitHub environments. Dry modes run in the schema release environment; every execute runs in its own
+ * environment, so the write role can trust only that environment's OIDC subject and no other job in the schema
+ * environment (this workflow's dry runs, or the other guarded operators there) can assume it. The environment is
+ * derived from the mode here, never taken from an input.
+ */
+export const BACKLOG_OPS_DRY_ENVIRONMENT = "session-schema-production";
+export const BACKLOG_OPS_EXECUTE_ENVIRONMENT = "session-backlog-execute";
+export const backlogOpsEnvironment = (mode: BacklogOpsMode) =>
+  isExecute(mode) ? BACKLOG_OPS_EXECUTE_ENVIRONMENT : BACKLOG_OPS_DRY_ENVIRONMENT;
+/** A role session must outlive the job (355 min timeout) with this margin, or the run refuses before the tool starts. */
+export const BACKLOG_OPS_MIN_SESSION_REMAINING_MS = 5 * 60 * 60 * 1000;
 export const BACKLOG_OPS_MAX_OBJECTS_CEILING = 1_000_000;
 
 const SHA40 = /^[0-9a-f]{40}$/u;
 const RUN_ID = /^[1-9][0-9]{0,19}$/u;
 const BUCKET = /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/u;
 const REGION = /^[a-z]{2}(-gov)?-[a-z]+-[0-9]$/u;
-const KMS_KEY_ARN = /^arn:aws:kms:([a-z]{2}(?:-gov)?-[a-z]+-[0-9]):([0-9]{12}):key\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const KMS_KEY_ARN = /^arn:aws:kms:([a-z]{2}(?:-gov)?-[a-z]+-[0-9]):([0-9]{12}):key\/(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|mrk-[0-9a-f]{32})$/u;
 const ROLE_ARN = /^arn:aws:iam::([0-9]{12}):role\/[A-Za-z0-9+=,.@_-]{1,64}$/u;
 const CODE = /^[a-z][a-z0-9_]{0,39}$/u;
 const KEY = /^[a-z][a-z0-9_]{0,63}$/u;
@@ -235,6 +247,13 @@ export function parseStsCredentials(xml: string): { accessKeyId: string; secretA
   const accessKeyId = pick("AccessKeyId"), secretAccessKey = pick("SecretAccessKey"), sessionToken = pick("SessionToken"), expiration = pick("Expiration");
   if (!/^ASIA[A-Z0-9]{12,124}$/u.test(accessKeyId) || !secretAccessKey || !sessionToken || !expiration) refuse("backlog_ops_sts_response");
   return { accessKeyId, secretAccessKey, sessionToken, expiration };
+}
+
+/** The session must be valid now and for at least BACKLOG_OPS_MIN_SESSION_REMAINING_MS more. */
+export function checkStsExpiration(expiration: string, now = Date.now()): void {
+  const at = Date.parse(expiration);
+  if (!/^\d{4}-\d{2}-\d{2}T/u.test(expiration) || !Number.isFinite(at) || at - now < BACKLOG_OPS_MIN_SESSION_REMAINING_MS)
+    refuse("backlog_ops_sts_expiration");
 }
 
 /** A role session name that names the run, never a person or tenant. */
