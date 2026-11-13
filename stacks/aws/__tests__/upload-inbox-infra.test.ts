@@ -9,14 +9,14 @@ import {
   TRANSCRIPT_ACCOUNT_ID, TRANSCRIPT_REGION, TRANSCRIPT_STAGE,
 } from "../transcript-store.ts";
 import {
-  FENCE_AUTHORITY_MARKER_KEY, UPLOAD_ADMISSION_FUNCTION_TIMEOUT_SECONDS, UPLOAD_ADMISSION_VISIBILITY_TIMEOUT_SECONDS, UPLOAD_INBOX_NOTIFICATION_ID,
+  FENCE_AUTHORITY_MARKER_KEY, FENCE_AUTHORITY_ORG_MARKERS, UPLOAD_ADMISSION_FUNCTION_TIMEOUT_SECONDS, UPLOAD_ADMISSION_VISIBILITY_TIMEOUT_SECONDS, UPLOAD_INBOX_NOTIFICATION_ID,
   UPLOAD_INBOX_PREFIX, UPLOAD_INBOX_RESOURCES, UPLOAD_INBOX_SSE_ENV, desktopUploadPolicy, desktopUploadTrustPolicy, parseHistoryUploadDirectInfra,
   UPLOAD_ADMISSION_RESERVED_CONCURRENCY, assertUploadAdmissionInputs, uploadAdmissionBucketStatements, uploadAdmissionEnvironment,
   uploadAdmissionQueuePolicy, uploadAdmissionSecretPolicy, uploadInboxNames,
   PRESIGN_MAX_SIGNATURE_AGE_MS, presignIssuerUserName, uploadPresignIssuerPolicy,
 } from "../upload-inbox.ts";
 import { UPLOAD_INBOX_SSE_VAR, uploadDirectConfig } from "../../../src/session-ingest/upload-admission.ts";
-import { fenceAuthorityKey, s3LedgerKeys } from "../../../src/session-ingest/ledger-s3.ts";
+import { fenceAuthorityKey, orgFenceAuthorityKey, s3LedgerKeys } from "../../../src/session-ingest/ledger-s3.ts";
 import { TENANT_KEY_BASE } from "../tenants.ts";
 
 // Synthetic identifiers only.
@@ -483,7 +483,17 @@ describe("upload-admission consumer (bucket grants on its function role)", () =>
       expect(allowed([], bucketOn, "s3:GetObject", other, ctx)).toBe(false);
     expect(allowed([], bucketOn, "s3:GetObject", marker, { ...ctx, "aws:PrincipalArn": pipelineRoleArn })).toBe(false);
     const grant = consumerBucket.find((st) => st.Sid === "UploadAdmissionReadsFenceAuthority")!;
-    expect(grant).toMatchObject({ Effect: "Allow", Action: ["s3:GetObject"], Resource: [marker] });
+    expect(grant).toMatchObject({ Effect: "Allow", Action: ["s3:GetObject"], Resource: [marker, `${bucketArn}/${FENCE_AUTHORITY_ORG_MARKERS}`] });
+  });
+
+  it("reads the per-org markers (GET only, that prefix only), the keys ledger-s3.ts reads per org", () => {
+    const orgMarker = `${bucketArn}/${orgFenceAuthorityKey(TENANT_KEY_BASE, "org-a")}`;
+    expect(orgMarker).toBe(`${bucketArn}/${TENANT_KEY_BASE}/.ledger/fence-authority/org-a.json`);
+    expect(allowed([], bucketOn, "s3:GetObject", orgMarker, ctx)).toBe(true);
+    for (const action of ["s3:PutObject", "s3:DeleteObject", "s3:GetObjectVersion"]) expect(allowed([], bucketOn, action, orgMarker, ctx)).toBe(false);
+    for (const other of [`${bucketArn}/${TENANT_KEY_BASE}/.ledger/fence-authorityX/org-a.json`, `${bucketArn}/${TENANT_KEY_BASE}/.ledger/org-a.json`, `${bucketArn}/${TENANT_KEY_BASE}/.ledger/fence-authority`])
+      expect(allowed([], bucketOn, "s3:GetObject", other, ctx)).toBe(false);
+    expect(allowed([], bucketOn, "s3:GetObject", orgMarker, { ...ctx, "aws:PrincipalArn": pipelineRoleArn })).toBe(false);
   });
 
   it("the existing promotion grant covers every S3 ledger object (owners, revisions, batches, fence, re-arm): read and write, never delete", () => {

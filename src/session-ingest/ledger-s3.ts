@@ -27,11 +27,14 @@
  *   ledger/rearm/o=<h(origin)>/<sessionKey>.json   the re-arm marker for the eraser:
  *       {v, originId, source, sessionId, machineId, atMs}, create-only.
  *
- * And one deployment-wide object, written by an operator (never by this code):
+ * And the fence-authority markers, written by an operator (never by this code):
  *
- *   <keyRoot>/.ledger/fence-authority.json   FenceAuthorityDoc. While it is absent or invalid, a ledger built
- *       with `fenceAuthority: "required"` answers every claim with a retry (`ledger_fence_authority_missing`),
- *       never an admit. See FenceAuthorityDoc for what writing it asserts.
+ *   <keyRoot>/.ledger/fence-authority/<org>.json   FenceAuthorityDoc + orgId, read first for the claim's org.
+ *   <keyRoot>/.ledger/fence-authority.json         FenceAuthorityDoc, the deployment-wide fallback (after the
+ *       full backfill). With `fenceAuthority: "required"`, a claim admits only when its org's marker is valid,
+ *       or its org has no marker and the deployment-wide one is valid. An invalid or mismatched per-org marker
+ *       refuses that org outright. Otherwise every claim is a retry (`ledger_fence_authority_missing`), never an
+ *       admit. Kill switch: docs/selfhost-composition.md ("Stopping admission").
  *
  * h(x) = sha256(x) hex [0:32]. sessionKey = sessionKeyHash(source, sessionId) = h(JSON.stringify([source, sessionId])).
  *
@@ -125,8 +128,13 @@ export function s3LedgerKeys(keyRoot: string, tenant: LedgerTenant) {
   };
 }
 
-/** The deployment-wide fence-authority marker (FenceAuthorityDoc). */
+/** The deployment-wide fence-authority marker (FenceAuthorityDoc): covers every org. For after the FULL backfill. */
 export const fenceAuthorityKey = (keyRoot: string) => `${keyRoot}/.ledger/fence-authority.json`;
+/**
+ * One org's fence-authority marker (OrgFenceAuthorityDoc): covers that org only. `orgId` is a validated tenant
+ * segment (the claim's keysFor refuses anything else), so it is a plain path segment here.
+ */
+export const orgFenceAuthorityKey = (keyRoot: string, orgId: string) => `${keyRoot}/.ledger/fence-authority/${orgId}.json`;
 
 // ---- object shapes ----
 
@@ -194,7 +202,14 @@ export interface IndexDoc { v: 1; originId: string; shard: string; records: Reco
 export interface OwnerDoc { v: 1; originId: string; source: string; sessionId: string; epoch: number; resets: number }
 
 /**
- * `<keyRoot>/.ledger/fence-authority.json`. An operator writes it, once, and ONLY when all of these hold:
+ * The fence-authority marker. Two forms; a claim for tenant org X admits only if one of them is valid:
+ *   `<keyRoot>/.ledger/fence-authority/<X>.json`  PER ORG (OrgFenceAuthorityDoc: these fields plus `orgId`, which
+ *       must equal X). Used first: an org is turned on once ITS users' state has been backfilled. A per-org marker
+ *       that is present but invalid, or names another org, refuses (fail closed); the deployment-wide one is then
+ *       not consulted.
+ *   `<keyRoot>/.ledger/fence-authority.json`       DEPLOYMENT-WIDE (exactly these fields): every org at once, for
+ *       after the FULL backfill of every org.
+ * An operator writes a marker, once, and ONLY when all of these hold (for its org, or for every org):
  *   fenceBackfill "complete"  the one-time fence backfill (0005 "The buffered backlog" step 0) has copied every
  *                             user's SQL deletions and resets (upload_deletions, upload_resets) into their fence;
  *   revisionBackfill "complete"  SQL ingest_record_revisions is copied into the index shards at the current generation
@@ -216,9 +231,12 @@ export interface OwnerDoc { v: 1; originId: string; source: string; sessionId: s
  * Without it an absent fence cannot be told from a user whose SQL deletions were never copied, so admission
  * refuses (retries) rather than treat absent as empty. Deleting it is the kill switch for NEW claims only: each
  * ledger trusts a valid read for up to 60 s (fenceAuthorityTtlMs), and a batch already claimed still commits
- * (commit never reads the marker), so its canonical objects can land after the marker is gone.
+ * (commit never reads the marker), so its canonical objects can land after the marker is gone. The cache is per
+ * org, and errors carry codes only (never an org id).
  */
 export interface FenceAuthorityDoc { v: 1; fenceBackfill: "complete"; revisionBackfill: "complete"; ownershipBackfill: "complete"; controlMirror: "on"; rearmSweeper: "live"; workerHttpAdmission: "off"; writtenAtMs: number }
+/** The per-org marker: FenceAuthorityDoc plus the org it covers (it must match the key it is stored under). */
+export interface OrgFenceAuthorityDoc extends FenceAuthorityDoc { orgId: string }
 
 const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 const count = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
@@ -264,8 +282,15 @@ export function validIndex(v: unknown): v is IndexDoc {
 export function validOwner(v: unknown): v is OwnerDoc {
   return isObject(v) && v.v === 1 && str(v.originId) && str(v.source) && str(v.sessionId) && count(v.epoch) && count(v.resets);
 }
+const AUTHORITY_FIELDS = ["v", "fenceBackfill", "revisionBackfill", "ownershipBackfill", "controlMirror", "rearmSweeper", "workerHttpAdmission", "writtenAtMs"];
+/** The per-org marker's shape (its `orgId` is checked against the key by the claim: ledger_fence_authority_org_mismatch). */
+export function validOrgFenceAuthority(v: unknown): v is OrgFenceAuthorityDoc {
+  if (!isObject(v) || !str(v.orgId)) return false;
+  const { orgId: _orgId, ...rest } = v;
+  return Object.keys(v).length === AUTHORITY_FIELDS.length + 1 && validFenceAuthority(rest);
+}
 export function validFenceAuthority(v: unknown): v is FenceAuthorityDoc {
-  return isObject(v) && exactKeys(v, ["v", "fenceBackfill", "revisionBackfill", "ownershipBackfill", "controlMirror", "rearmSweeper", "workerHttpAdmission", "writtenAtMs"]) && v.v === 1
+  return isObject(v) && exactKeys(v, AUTHORITY_FIELDS) && v.v === 1
     && v.fenceBackfill === "complete" && v.revisionBackfill === "complete" && v.ownershipBackfill === "complete" && v.controlMirror === "on" && v.rearmSweeper === "live"
     && v.workerHttpAdmission === "off" && count(v.writtenAtMs) && v.writtenAtMs > 0;
 }
@@ -625,16 +650,25 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
   const claimCompletesResets = opts.claimCompletesResets ?? true;
   const authorityTtl = opts.fenceAuthorityTtlMs ?? 60_000;
   if (!count(authorityTtl)) throw new LedgerUnavailableError("ledger_s3_options_refused");
-  let authorityUntil = -Infinity;
+  /** Per org: until when a valid marker read is trusted. Bounded (cleared when full): only a cache. */
+  const authorityUntil = new Map<string, number>();
 
-  /** Fail closed: no admission without a valid fence-authority marker (FenceAuthorityDoc). */
-  async function requireFenceAuthority(): Promise<void> {
+  /**
+   * Fail closed: no admission for an org without a valid fence-authority marker (FenceAuthorityDoc): its own
+   * per-org marker, or else the deployment-wide one. A present-but-invalid per-org marker refuses outright.
+   */
+  async function requireFenceAuthority(orgId: string): Promise<void> {
     if (opts.fenceAuthority !== "required") return;
     const now = nowMs();
-    if (now < authorityUntil) return;
-    const got = await readDoc(store, fenceAuthorityKey(keyRoot), validFenceAuthority, "ledger_fence_authority_invalid");
-    if (!got) throw new LedgerUnavailableError("ledger_fence_authority_missing");
-    authorityUntil = now + authorityTtl;
+    if (now < (authorityUntil.get(orgId) ?? -Infinity)) return;
+    const org = await readDoc(store, orgFenceAuthorityKey(keyRoot, orgId), validOrgFenceAuthority, "ledger_fence_authority_invalid");
+    if (org) {
+      if (org.doc.orgId !== orgId) throw new LedgerUnavailableError("ledger_fence_authority_org_mismatch");
+    } else if (!(await readDoc(store, fenceAuthorityKey(keyRoot), validFenceAuthority, "ledger_fence_authority_invalid"))) {
+      throw new LedgerUnavailableError("ledger_fence_authority_missing");
+    }
+    if (authorityUntil.size >= 10_000) authorityUntil.clear();
+    authorityUntil.set(orgId, now + authorityTtl);
   }
 
   const unsupported = (name: string) => async (): Promise<never> => { throw new LedgerUnavailableError(`ledger_s3_unsupported_${name}`); };
@@ -862,7 +896,7 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
     async claim(input: ClaimInput): Promise<ClaimResult> {
       checkClaimInput(input);
       const keys = keysFor(input.tenant);
-      await requireFenceAuthority();
+      await requireFenceAuthority(input.tenant.orgId);
       const batchKey = keys.batch(input.originId, input.batchId);
       for (let attempt = 0; attempt < attempts; attempt++) {
         // (a) A known batch id: its receipt, a resume, or a batch-id 409.
