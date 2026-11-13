@@ -184,6 +184,14 @@ export interface SessionIngestInputs {
    */
   uploadConsent?: "report" | "hold-only" | "enforce";
   /**
+   * INGEST_S3_FENCE_MIRROR (src/session-ingest/app.ts s3FenceMirror, decision 0005 "Controls"): the selection and
+   * reset routes also write the S3 upload fence (disable and reset S3 first; re-enable after SQL; ordered controls
+   * through the fence's ordered mark; a reset only begins in S3). "on" needs Khaliq's OK, the Worker's S3
+   * credential to reach the user's admission directory (Get/Put, ListBucket), and it is a precondition of the
+   * fence-authority marker. Omit for off (no var rendered, vars byte-identical to before).
+   */
+  s3FenceMirror?: "on";
+  /**
    * SESSIONS_NEON_EXIT: the Neon-exit release profile (src/shared/neon-exit.ts, docs/neon-exit-edge-map.md).
    * The Worker then refuses every request while any Neon edge is configured, so the stack refuses the
    * same edges first (assertSessionIngestInputs mirrors worker.ts ingestSettings): replicaMode must be
@@ -221,7 +229,7 @@ const AUTHORITY_ENV_KEYS = [
   "INGEST_AUTHORITY_EXPECT_AUTH_EPOCH",
   "INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY",
 ] as const;
-const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "neonExit", "uploadConsent"];
+const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "neonExit", "uploadConsent", "s3FenceMirror"];
 
 function validAuthorityKeyRoot(value: unknown): value is string {
   if (typeof value !== "string" || !/^96bulls\/[A-Za-z0-9][A-Za-z0-9_/-]{0,151}$/.test(value) || value.endsWith("/")) return false;
@@ -337,6 +345,8 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
     refuse('sessionIngest.claimTimeoutBusy must be "on" (omit for off)');
   if (v.uploadConsent !== undefined && v.uploadConsent !== "report" && v.uploadConsent !== "hold-only" && v.uploadConsent !== "enforce")
     refuse('sessionIngest.uploadConsent must be "report", "hold-only" or "enforce" (omit for off)');
+  if (v.s3FenceMirror !== undefined && v.s3FenceMirror !== "on")
+    refuse('sessionIngest.s3FenceMirror must be "on" (omit for off)');
 }
 
 /** A producer binding to a queue this stack does not own (no state row: never created, changed or deleted here). */
@@ -373,6 +383,7 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     ...(p.claimTimeoutBusy === "on" ? { INGEST_CLAIM_TIMEOUT_BUSY: "on" } : {}),
     ...(p.neonExit === "on" ? { SESSIONS_NEON_EXIT: "true" } : {}),
     ...(p.uploadConsent ? { INGEST_UPLOAD_CONSENT: p.uploadConsent } : {}),
+    ...(p.s3FenceMirror === "on" ? { INGEST_S3_FENCE_MIRROR: "on" } : {}),
   };
 }
 

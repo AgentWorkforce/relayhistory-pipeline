@@ -1,4 +1,5 @@
-import type {FrozenWitnessInput,LedgerTenant} from "./ledger.ts";
+import type { S3FenceMirror } from "./ledger-s3.ts";
+import type {FrozenWitnessInput,Ledger,LedgerTenant} from "./ledger.ts";
 import {decodeCustodyEnvelope} from "./custody-wire.ts";
 import {validatedCustodyAck} from "./custody-ack.ts";
 import {CURRENT_CUSTODY_CONTENT_TYPE,CURRENT_CUSTODY_ACK_HEADER,PRIVATE_CUSTODY_BYTES,type CurrentCustodyPacket} from "./custody-protocol.ts";
@@ -195,6 +196,23 @@ export interface IngestAppDeps {
    * the upload-admission Lambda (hosted) or the self-host scan, never in this app.
    */
   uploadDirect?: UploadDirectConfig;
+  /**
+   * INGEST_S3_FENCE_MIRROR=on (decision 0005 "Controls"): the S3 upload fence (ledger-s3.ts) mirrors the SQL
+   * ledger's selection and reset fences, so the S3-native consumers and the backlog drain see every deletion.
+   *   disable / reset  S3 FIRST, then SQL. A failed S3 write fails the control (503): a deletion never lands
+   *                    in SQL alone.
+   *   re-enable        S3 AFTER SQL, and only when SQL applied or replayed it (never for a stale ordered
+   *                    control), so a late stale enable can never lift an S3 tombstone. A failed S3 write
+   *                    answers 503; the retry replays SQL and lifts again.
+   * Ordered controls (identity.control): SQL is the ordering authority (gap, epoch, digest), and S3 follows its
+   * verdict (ledger-s3.ts s3ControlMirror). A disable or reset is first PENDING in S3 (fail closed for admission),
+   * then SQL decides, then the verdict lands (applied / replay: the effect, in per-session order; stale: nothing);
+   * a control SQL refuses definitely is removed from S3 with no effect, and an ambiguous failure stays pending
+   * until the retry. An enable lands in S3 only after SQL applied or replayed it. So S3 is never live where SQL is
+   * deleted, and a refused control never wedges the legitimate one. Every route refusal (control kind, journal)
+   * runs before any S3 write. Absent (the default): no S3 fence write, unchanged.
+   */
+  s3FenceMirror?: S3FenceMirror;
   /**
    * Operator per-session erase (session-erase.ts, docs/operator-session-erase-contract.md). Absent: the
    * disabled config, so /internal/v1/session-erase/* answers 501 not_implemented and reads nothing.
@@ -544,6 +562,21 @@ export function createIngestApp(deps: IngestAppDeps) {
     }
     return result;
   };
+  /**
+   * The S3 fence write of a control (s3FenceMirror). Absent mirror: nothing. An id the S3 fence refuses (it never
+   * takes `__proto__` as a map key) is a 400, before SQL. Any other failure is a 503 `s3_fence_unavailable`; the
+   * ledger's own code (a safe enumeration, never a message or key) is logged, so an access denial can be told
+   * from contention.
+   */
+  const mirrorFence = async <T>(orgId: string, write: () => Promise<T>): Promise<T | undefined> => {
+    if (!deps.s3FenceMirror) return undefined;
+    try { return await write(); } catch (error) {
+      const code = error instanceof LedgerUnavailableError && /^[a-z0-9_]{1,64}$/.test(error.code) ? error.code : "s3_fence_error";
+      emit({ route: "delivery.s3_fence_mirror", outcome: code, org_id: orgId });
+      if (code === "ledger_input_refused") invalid("Invalid control identifier");
+      throw new IngestUnavailable("fence", "s3_fence_unavailable");
+    }
+  };
   const privacyAuthority = deps.privacyAuthority ?? "neon";
   if (privacyAuthority !== "neon" && (privacyAuthority !== "supabase" || custodyMode !== "frozen-supabase"))
     throw new Error("session ingest: privacyAuthority=supabase requires custodySource=frozen-supabase");
@@ -870,12 +903,28 @@ export function createIngestApp(deps: IngestAppDeps) {
        if(identity.control&&!c.get("custody")&&custodyMode==="frozen-supabase")c.set("custody",await frozenWitness(controlWitnessInput("selection",t,input.origin_id)));
        else if(identity.control&&c.get("custody"))await shadow("delivery.sessions.selection",c.get("custody")!,()=>controlWitnessInput("selection",t,input.origin_id));}
       const custody=c.get("custody");if(custody&&!identity.control)throw new IngestUnavailable("fence","control_unavailable");
-      if(identity.control){
-        if(identity.control.kind!=="selection"||!deps.deliver.ledger.applyOrderedControl)throw new IngestUnavailable("fence","control_unavailable");
-        const control=identity.control;
-        const result=await journal(async()=>orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({...selection,control:{...control,kind:"selection"},...(custody?{custody}:{})}),control),(r)=>r.control.outcome);
+      // Every cheap refusal before any S3 write.
+      const ordered=identity.control;
+      if(ordered&&(ordered.kind!=="selection"||!deps.deliver.ledger.applyOrderedControl))throw new IngestUnavailable("fence","control_unavailable");
+      const mirror=deps.s3FenceMirror;
+      if(ordered){
+        const control=ordered;
+        const s3Input={...selection,control:{...control,kind:"selection" as const}};
+        const result=await journal(async()=>{
+          // SQL decides; S3 follows its verdict (s3FenceMirror). A disable is pending in S3 while SQL decides.
+          const hold=input.enabled?undefined:await mirrorFence(identity.orgId,()=>mirror!.beginOrdered(s3Input));
+          let r;
+          try{r=orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({...s3Input,...(custody?{custody}:{})}),control);}
+          catch(error){if(!input.enabled&&definitelyNotApplied(error))await mirrorFence(identity.orgId,()=>mirror!.abortOrdered(s3Input,hold));throw error;}
+          await mirrorFence(identity.orgId,()=>mirror!.finishOrdered(s3Input,r.control.outcome));
+          return r;
+        },(r)=>r.control.outcome);
         controlAck=result.control;custodyHeader(c,result.custodyAck);
-      }else await journal(()=>deps.deliver.ledger.setSessionUploads(selection),()=>"applied");
+      }else{
+        // Unordered: a deletion lands in the S3 fence before SQL; a lift after it.
+        if(!input.enabled)await mirrorFence(identity.orgId,()=>mirror!.setSessionUploads(selection));
+        await journal(async()=>{await deps.deliver.ledger.setSessionUploads(selection);if(input.enabled)await mirrorFence(identity.orgId,()=>mirror!.setSessionUploads(selection));},()=>"applied");
+      }
       // A "Don't upload" is also the principal's explicit deny (every origin, every mode, kept when the mode
       // becomes "all"). Narrowing only. A re-enable never broadens consent: that needs a confirmed write.
       // Ordered controls: an applied disable is the newest intent, so it denies (also over an earlier allow).
@@ -910,12 +959,26 @@ export function createIngestApp(deps: IngestAppDeps) {
        if(identity.control&&!c.get("custody")&&custodyMode==="frozen-supabase")c.set("custody",await frozenWitness(controlWitnessInput("reset",t,null)));
        else if(identity.control&&c.get("custody"))await shadow("delivery.sessions.reset",c.get("custody")!,()=>controlWitnessInput("reset",t,null));}
       const custody=c.get("custody");if(custody&&!identity.control)throw new IngestUnavailable("fence","control_unavailable");
-      if(identity.control){
-        if(identity.control.kind!=="reset"||!deps.deliver.ledger.applyOrderedControl)throw new IngestUnavailable("fence","control_unavailable");
-        const control=identity.control;
-        const result=await journal(async()=>orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({tenant,requestId:input.request_id,control:{...control,kind:"reset"},...(custody?{custody}:{})}),control),(r)=>r.control.outcome);
+      // Every cheap refusal before any S3 write.
+      const ordered=identity.control;
+      if(ordered&&(ordered.kind!=="reset"||!deps.deliver.ledger.applyOrderedControl))throw new IngestUnavailable("fence","control_unavailable");
+      // 0005: inside the privacy-journal bracket, so a journal refusal changes nothing in S3. An S3 failure leaves
+      // the journal mark pending (conservative: TTL, then SQL resolves it on the retry), never settled.
+      const mirror=deps.s3FenceMirror;
+      if(ordered){
+        const control=ordered;
+        const s3Input={tenant,requestId:input.request_id,control:{...control,kind:"reset" as const}};
+        const result=await journal(async()=>{
+          // SQL decides; S3 follows its verdict. The reset is pending in S3 (every claim refused) while SQL decides.
+          const hold=await mirrorFence(identity.orgId,()=>mirror!.beginOrdered(s3Input));
+          let r;
+          try{r=orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({...s3Input,...(custody?{custody}:{})}),control);}
+          catch(error){if(definitelyNotApplied(error))await mirrorFence(identity.orgId,()=>mirror!.abortOrdered(s3Input,hold));throw error;}
+          await mirrorFence(identity.orgId,()=>mirror!.finishOrdered(s3Input,r.control.outcome));
+          return r;
+        },(r)=>r.control.outcome);
         deleted=result.deleted!;controlAck=result.control;custodyHeader(c,result.custodyAck);
-      }else deleted=await journal(()=>deps.deliver.ledger.resetUploadedSessions(tenant,input.request_id),()=>"applied");
+      }else deleted=await journal(async()=>{await mirrorFence(identity.orgId,()=>mirror!.resetUploadedSessions(tenant,input.request_id));return deps.deliver.ledger.resetUploadedSessions(tenant,input.request_id);},()=>"applied");
       emit({ route: "delivery.sessions.reset", outcome: controlAck?"control_"+controlAck.outcome:"reset", org_id: identity.orgId, deleted });
       return c.json({ reset: true, deleted,...(controlAck?{control:controlAck}:{}) });
     } catch (error) {
