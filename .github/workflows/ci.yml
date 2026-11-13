@@ -14,20 +14,25 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   checks:
-    # Preserve the existing required check name: neither parallel job may be
-    # skipped, canceled or failing when this gate goes green.
-    needs: [unit-tests, aws-hardening-mutations, selfhost-e2e]
+    # Preserve the existing required check name: no needed job may be skipped,
+    # canceled or failing when this gate goes green. It needs the leaf jobs directly
+    # (not the unit-tests aggregate) so a backlogged runner queue costs one hop less;
+    # needs.unit-tests-shard.result is success only when every matrix shard succeeded.
+    needs: [unit-tests-shard, unit-tests-aux, aws-hardening-mutations, selfhost-e2e]
     if: ${{ always() }}
     runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Require unit and mutation checks
         env:
-          UNIT_RESULT: ${{ needs.unit-tests.result }}
+          SHARD_RESULT: ${{ needs.unit-tests-shard.result }}
+          AUX_RESULT: ${{ needs.unit-tests-aux.result }}
           MUTATION_RESULT: ${{ needs.aws-hardening-mutations.result }}
           E2E_RESULT: ${{ needs.selfhost-e2e.result }}
         run: |
-          test "$UNIT_RESULT" = "success"
+          echo "unit-tests-shard: $SHARD_RESULT, unit-tests-aux: $AUX_RESULT, aws-hardening-mutations: $MUTATION_RESULT, selfhost-e2e: $E2E_RESULT"
+          test "$SHARD_RESULT" = "success"
+          test "$AUX_RESULT" = "success"
           test "$MUTATION_RESULT" = "success"
           test "$E2E_RESULT" = "success"
   selfhost-e2e:
