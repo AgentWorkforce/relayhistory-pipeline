@@ -5,20 +5,27 @@ import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../sh
 import { BUFFER_STAGE_MAX_BYTES, prepareBufferedStage, putBufferedStage } from "../staging.ts";
 import type { Group } from "../writer.ts";
 import {
+  ACCEPTED_SUFFIX,
+  SUPERSEDED_SUFFIX,
   DRAINED_SUFFIX,
+  acceptedCompleteKey,
   acquireDrainLock,
   drainBufferedBatches,
   drainHoldKey,
+  parseDrainCheckpoint,
+  type DrainCheckpoint,
   drainLockKey,
   readOnlyStore,
   s3DrainLedger,
   type DrainLedger,
   type DrainOptions,
 } from "../buffered-drain.ts";
-import { parseDrainArgs } from "../../../scripts/buffered-drain.ts";
+import { parseDrainArgs, runDrain, validResumeKey } from "../../../scripts/buffered-drain.ts";
+import { mkdtempSync, readFileSync as readFileSyncFs, rmSync, writeFileSync as writeFileSyncFs } from "node:fs";
+import { join } from "node:path";
 import { scratchStore } from "./support.ts";
 import { journalKey as journalKeyFor } from "../async-admission.ts";
-import { applyFenceChange, fenceAuthorityKey, orgFenceAuthorityKey, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceChange, type IndexEntryInput } from "../ledger-s3.ts";
+import { applyFenceChange, fenceAuthorityKey, fenceEpoch, orgFenceAuthorityKey, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceChange, type IndexEntryInput } from "../ledger-s3.ts";
 import type { OrderedControlInput } from "../ledger.ts";
 
 const ROOT = "96bulls";
@@ -40,7 +47,37 @@ function group(source: string, sessionId: string, recs: Rec[]): Group {
   };
 }
 
-async function stage(store: ObjectStore, groups: Group[], over: { batch?: string; claim?: string; received?: string } = {}): Promise<string> {
+/**
+ * A stand-in for the accepted-stage export (v2 verdicts): the stages it would record, refreshed into sidecars at the
+ * start of every run() (as an export just before the drain), with a snapshot of the user's CURRENT S3 fence.
+ * `live` / `keep` stand for SQL's verdict; a test that needs the snapshot to go stale passes { refresh: false }.
+ */
+type Verdict = { sha: string; lineCounts: number[]; sessions: [string, string][]; live: boolean; keep?: number[][] };
+const VERDICTS = new Map<string, Verdict>();
+const accept = (key: string, v: Verdict) => { VERDICTS.set(key, v); };
+async function refreshVerdicts(store: ObjectStore) {
+  // An unreadable fence gives no fence view (the drain refuses it before the verdict matters).
+  const read = await s3LedgerObjects(store, ROOT).readFence(s3LedgerKeys(ROOT, TENANT).fence).catch(() => ({ state: "absent" as const }));
+  for (const [key, v] of VERDICTS) {
+    const fence = read.state === "present" ? read.fence : null;
+    const marker = {
+      v: 2, kind: "buffered-accepted", stage_sha256: v.sha, live: v.live,
+      kept: v.live ? (v.keep ?? v.lineCounts.map((n) => [...Array(n).keys()])) : [],
+      fence: fence && {
+        instance: fence.instance, resets: fence.resets, resetsCompleted: fence.resetsCompleted,
+        epochs: Object.fromEntries(v.sessions.map(([so, id]) => [sessionKeyHash(so, id), fenceEpoch(fence, ORIGIN, sessionKeyHash(so, id))])),
+      },
+    };
+    await store.put(objectKey(key + ACCEPTED_SUFFIX), enc.encode(JSON.stringify(marker)));
+  }
+}
+/** A raw object at a staged key, accepted (so the drain reads and classifies it). */
+async function putStaged(store: ObjectStore, key: string, bytes: Uint8Array) {
+  await store.put(objectKey(key), bytes);
+  accept(key, { sha: sha(bytes), lineCounts: [], sessions: [], live: true });
+}
+
+async function stage(store: ObjectStore, groups: Group[], over: { batch?: string; claim?: string; received?: string; accepted?: boolean; live?: boolean; keep?: number[][] } = {}): Promise<string> {
   let ord = 0;
   const prepared = prepareBufferedStage(ROOT, {
     claim_token: over.claim ?? randomUUID(),
@@ -49,6 +86,10 @@ async function stage(store: ObjectStore, groups: Group[], over: { batch?: string
     org_id: TENANT.orgId, workspace_id: TENANT.workspaceId, origin_id: ORIGIN, user_id: TENANT.userId,
   }, groups, groups.map((g) => g.lines.map(() => ord++)));
   await putBufferedStage(store, prepared);
+  if (over.accepted !== false) accept(prepared.spec.key, {
+    sha: prepared.spec.sha256, lineCounts: groups.map((g) => g.lines.length), sessions: groups.map((g) => [g.source, g.sessionId] as [string, string]),
+    live: over.live ?? true, ...(over.keep ? { keep: over.keep } : {}),
+  });
   return prepared.spec.key;
 }
 
@@ -103,23 +144,28 @@ async function storedEntry(store: ObjectStore, recordId: string) {
   const doc = (await s3LedgerObjects(store, ROOT).readIndex(KEYS.revisions(ORIGIN, recordId)))?.doc;
   return doc && Object.hasOwn(doc.records, recordId) ? doc.records[recordId] : undefined;
 }
-const run = (store: ObjectStore, over: Partial<DrainOptions> = {}) =>
-  drainBufferedBatches({ store, keyRoot: ROOT, orgs: [TENANT.orgId], dryRun: false, decompress, sleep: async () => {}, ...over });
+async function run(store: ObjectStore, over: Partial<DrainOptions> = {}, o: { refresh?: boolean } = {}) {
+  if (o.refresh !== false) await refreshVerdicts(store);
+  return drainBufferedBatches({ store, keyRoot: ROOT, orgs: [TENANT.orgId], dryRun: false, decompress, sleep: async () => {}, ...over });
+}
 
 let cleanup: (() => void)[] = [];
-afterEach(() => { cleanup.forEach((c) => c()); cleanup = []; });
+afterEach(() => { cleanup.forEach((c) => c()); cleanup = []; VERDICTS.clear(); });
 /** A scratch store whose user has a backfilled, empty fence (0005 step 0), unless `fence: false`. */
 /** A valid fence-authority marker (main's OrgFenceAuthorityDoc / FenceAuthorityDoc): every precondition attested. */
 const AUTHORITY = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: 1 };
 const putOrgAuthority = (store: ObjectStore, doc: unknown = { ...AUTHORITY, orgId: TENANT.orgId }) =>
   store.put(objectKey(orgFenceAuthorityKey(ROOT, TENANT.orgId)), enc.encode(JSON.stringify(doc)));
-async function scratch(opts: { fence?: boolean; authority?: boolean } = {}) {
+async function scratch(opts: { fence?: boolean; exportComplete?: boolean; authority?: boolean } = {}) {
   const s = scratchStore();
   cleanup.push(s.done);
   if (opts.fence !== false) await putFence(s.store);
   if (opts.authority !== false) await putOrgAuthority(s.store);
+  if (opts.exportComplete !== false) await markExportComplete(s.store);
   return s.store;
 }
+const markExportComplete = (store: ObjectStore) =>
+  store.put(objectKey(acceptedCompleteKey(ROOT, TENANT.orgId)), enc.encode(JSON.stringify({ v: 1, kind: "buffered-accepted-complete", stages: 0, completedAtMs: 1 })));
 const putJournal = (store: ObjectStore, journal: unknown) => store.put(objectKey(journalKeyFor(ROOT, TENANT)), enc.encode(JSON.stringify(journal)));
 
 describe("buffered backlog drain (0005)", () => {
@@ -129,7 +175,7 @@ describe("buffered backlog drain (0005)", () => {
     const summary = await run(store);
     expect(summary.objects.drained).toBe(1);
     expect(summary.sessions_written).toBe(2);
-    expect(summary.lines).toEqual({ candidate: 3, written: 3, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0 });
+    expect(summary.lines).toEqual({ candidate: 3, written: 3, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0, not_kept: 0 });
     const lines = await canonical(store);
     expect(lines.get("sess-1")).toEqual(["r1@1", "r2@2"]);
     expect(lines.get("sess-2")).toEqual(["r3@1"]);
@@ -211,7 +257,7 @@ describe("buffered backlog drain (0005)", () => {
     await stage(store, [group("claude", "sess-1", [{ id: "conflict", rev: 3 }, { id: "stale", rev: 4 }, { id: "same", rev: 2 }, { id: "fresh", rev: 1 }])]);
     const summary = await run(store);
     expect(summary.objects.drained).toBe(1);
-    expect(summary.lines).toEqual({ candidate: 4, written: 1, fenced: 0, stale: 1, already_stored: 1, revision_conflict: 1 });
+    expect(summary.lines).toEqual({ candidate: 4, written: 1, fenced: 0, stale: 1, already_stored: 1, revision_conflict: 1, not_kept: 0 });
     expect((await canonical(store)).get("sess-1")).toEqual(["fresh@1"]);
     expect(await storedEntry(store, "conflict")).toEqual([3, "x", "f".repeat(64), SESS1, 0, 0]); // the stored digest is kept
     expect(await storedEntry(store, "fresh")).toEqual([1, "fresh:r1", sha("fresh:1"), SESS1, 0, 0]);
@@ -245,9 +291,10 @@ describe("buffered backlog drain (0005)", () => {
     const store = await scratch();
     await putFence(store, { deletions: [{ originId: ORIGIN, sessions: [["claude", "sess-2"]] }] });
     await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }]), group("claude", "sess-2", [{ id: "r2", rev: 1 }])]);
-    await store.put(objectKey(`${ROOT}/${TENANT.orgId}/buffered-batches/v1/ws=ws-a/m=srv_${"0".repeat(32)}/b=${"1".repeat(32)}-${"2".repeat(16)}-${"3".repeat(32)}.staged.ndjson.zst`), enc.encode("not zstd"));
+    await putStaged(store, `${ROOT}/${TENANT.orgId}/buffered-batches/v1/ws=ws-a/m=srv_${"0".repeat(32)}/b=${"1".repeat(32)}-${"2".repeat(16)}-${"3".repeat(32)}.staged.ndjson.zst`, enc.encode("not zstd"));
+    await refreshVerdicts(store); // the export ran; the dry run itself writes nothing
     const before = await allKeys(store);
-    const summary = await run(store, { dryRun: true });
+    const summary = await run(store, { dryRun: true }, { refresh: false });
     expect(summary.mode).toBe("dry_run");
     expect(summary.objects.would_drain).toBe(1);
     expect(summary.objects.corrupt).toBe(1);
@@ -264,12 +311,12 @@ describe("buffered backlog drain (0005)", () => {
     const good = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
     const dir = good.slice(0, good.lastIndexOf("/"));
     // Garbage at a well-formed key.
-    await store.put(objectKey(`${dir}/b=${"1".repeat(32)}-${"2".repeat(16)}-${"3".repeat(32)}.staged.ndjson.zst`), enc.encode("garbage"));
+    await putStaged(store, `${dir}/b=${"1".repeat(32)}-${"2".repeat(16)}-${"3".repeat(32)}.staged.ndjson.zst`, enc.encode("garbage"));
     // A valid object copied to a key that does not name its bytes.
     const bytes = await readAll(await store.get(objectKey(good)));
-    await store.put(objectKey(`${dir}/b=${"4".repeat(32)}-${"5".repeat(16)}-${"6".repeat(32)}.staged.ndjson.zst`), bytes);
+    await putStaged(store, `${dir}/b=${"4".repeat(32)}-${"5".repeat(16)}-${"6".repeat(32)}.staged.ndjson.zst`, bytes);
     // A buffered-GC redaction barrier.
-    await store.put(objectKey(`${dir}/b=${"7".repeat(32)}-${"8".repeat(16)}-${"9".repeat(32)}.staged.ndjson.zst`), enc.encode(JSON.stringify({ v: 1, kind: "buffered-redaction" })));
+    await putStaged(store, `${dir}/b=${"7".repeat(32)}-${"8".repeat(16)}-${"9".repeat(32)}.staged.ndjson.zst`, enc.encode(JSON.stringify({ v: 1, kind: "buffered-redaction" })));
     // A stray key in the namespace.
     await store.put(objectKey(`${dir}/stray.json`), enc.encode("{}"));
     const summary = await run(store);
@@ -390,6 +437,50 @@ describe("buffered backlog drain (0005)", () => {
     await expect(run(store, { resetMarginMs: 59_999 })).rejects.toThrow("drain_reset_margin_invalid");
     expect(() => parseDrainArgs(["--dry-run", "--bucket", "my-bucket", "--reset-margin-seconds", "59"])).toThrow("--reset-margin-seconds");
     expect(parseDrainArgs(["--dry-run", "--bucket", "my-bucket", "--reset-margin-seconds", "600"]).resetMarginMs).toBe(600_000);
+  });
+
+  test("0005 step 0b: only acknowledged stages are written; the rest are reported, unread", async () => {
+    const store = await scratch();
+    const ok = await stage(store, [group("claude", "sess-ok", [{ id: "a", rev: 1 }])]);
+    const refused = await stage(store, [group("claude", "sess-refused", [{ id: "b", rev: 1 }])], { accepted: false });
+    const wrong = await stage(store, [group("claude", "sess-wrong", [{ id: "c", rev: 1 }])], { accepted: false });
+    accept(wrong, { sha: "0".repeat(64), lineCounts: [1], sessions: [["claude", "sess-wrong"]], live: true }); // a sidecar naming other bytes
+    const reads: string[] = [];
+    const watched = new Proxy(store, {
+      get(target, prop) {
+        if (prop === "getObject") return (k: Parameters<ObjectStore["getObject"]>[0]) => { reads.push(String(k)); return target.getObject(k); };
+        const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    const summary = await run(watched);
+    expect(summary.objects).toMatchObject({ drained: 1, stage_unacknowledged: 1, accepted_mismatch: 1 });
+    expect([...(await canonical(store)).keys()]).toEqual(["sess-ok"]);
+    expect(reads).not.toContain(refused); // an unacknowledged stage is never even read
+    for (const k of [refused, wrong]) expect(await exists(store, k + DRAINED_SUFFIX)).toBe(false);
+    expect(await exists(store, ok + DRAINED_SUFFIX)).toBe(true);
+  });
+
+  test("0005 step 0b: an org whose accepted-stage export never completed writes nothing", async () => {
+    const store = await scratch({ exportComplete: false });
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    for (const dryRun of [true, false]) expect((await run(store, { dryRun })).objects.stage_export_missing).toBe(1);
+    expect(await exists(store, key + DRAINED_SUFFIX)).toBe(false);
+    await store.put(objectKey(acceptedCompleteKey(ROOT, TENANT.orgId)), enc.encode("{\"v\":1}")); // invalid: still missing
+    expect((await run(store)).objects.stage_export_missing).toBe(1);
+    await markExportComplete(store);
+    expect((await run(store)).objects.drained).toBe(1);
+  });
+
+  test("a GC replacement SQL acknowledged drains; its unacknowledged original is not a peer", async () => {
+    const store = await scratch();
+    const claim = randomUUID();
+    const original = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }, { id: "r2", rev: 1 }])], { batch: "same", claim, accepted: false });
+    await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { batch: "same", claim });
+    const summary = await run(store);
+    expect(summary.objects).toMatchObject({ drained: 1, stage_unacknowledged: 1, ambiguous_replacement: 0 });
+    expect((await canonical(store)).get("sess-1")).toEqual(["r1@1"]);
+    expect(await exists(store, original + DRAINED_SUFFIX)).toBe(false);
   });
 
   test("an interrupted GC replacement (two live objects for one claim) is never guessed", async () => {
@@ -521,8 +612,9 @@ describe("buffered backlog drain (0005)", () => {
   test("--assume-empty-fence classifies an unbackfilled user in a dry run, and is refused with execute", async () => {
     const store = await scratch({ fence: false });
     await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    await refreshVerdicts(store);
     const before = await allKeys(store);
-    const summary = await run(store, { dryRun: true, assumeEmptyFence: true });
+    const summary = await run(store, { dryRun: true, assumeEmptyFence: true }, { refresh: false });
     expect(summary.objects.would_drain).toBe(1);
     expect(summary.objects.fence_absent).toBe(0);
     expect(summary.fence_assumed_empty).toBe(1);
@@ -659,6 +751,72 @@ describe("buffered backlog drain (0005)", () => {
     await run(store);
     const stub = await readJson(store, ownerKey("claude", "sess-1"));
     expect(stub.machineId).toMatch(/^srv_[0-9a-f]{32}$/);
+  });
+
+  test("finding 1: SQL's verdict not live (e.g. disabled then re-enabled before the export) is never written", async () => {
+    const store = await scratch();
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { live: false });
+    const summary = await run(store);
+    expect(summary.objects.stage_not_live).toBe(1);
+    expect((await canonical(store)).size).toBe(0);
+    expect(await exists(store, key + DRAINED_SUFFIX)).toBe(false);
+  });
+
+  test("finding 1: a disable then re-enable AFTER the export moves the session's epoch: the stage waits for a re-export", async () => {
+    const store = await scratch();
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }]), group("claude", "sess-2", [{ id: "r2", rev: 1 }])]);
+    await refreshVerdicts(store); // the export ran
+    const mirror = s3ControlMirror(store, ROOT);
+    await mirror.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "sess-1"]], enabled: false });
+    await mirror.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "sess-1"]], enabled: true });
+    expect((await currentFence(store)).deleted).toEqual({}); // re-enabled: nothing tombstoned, the epoch moved
+    const summary = await run(store, {}, { refresh: false });
+    expect(summary.objects.fence_moved_since_export).toBe(1);
+    expect((await canonical(store)).size).toBe(0);
+    expect(await exists(store, key + DRAINED_SUFFIX)).toBe(false);
+    // A reset begun after the export moves resets: the same.
+    await mirror.resetUploadedSessions(TENANT, "req-after");
+    expect((await run(store, {}, { refresh: false })).objects.fence_moved_since_export).toBe(1);
+  });
+
+  test("finding 2: only the lines SQL keeps are written (GC-kept groups, lazy body_accepted)", async () => {
+    const store = await scratch();
+    await stage(store, [group("claude", "sess-1", [{ id: "keep", rev: 1 }, { id: "drop", rev: 1 }]), group("claude", "sess-2", [{ id: "gone", rev: 1 }])],
+      { keep: [[0], []] });
+    const summary = await run(store);
+    expect(summary.objects.drained).toBe(1);
+    expect(summary.lines).toMatchObject({ candidate: 1, written: 1, not_kept: 2 });
+    expect([...(await canonical(store)).entries()]).toEqual([["sess-1", ["keep@1"]]]);
+    expect(await storedEntry(store, "drop")).toBeUndefined();
+  });
+
+  test("finding 6: the CLI resumes from a checkpoint that ends on an accepted-stage sidecar", async () => {
+    const store = await scratch();
+    for (let i = 0; i < 3; i++) await stage(store, [group("claude", `sess-${i}`, [{ id: `r${i}`, rev: 1 }])]);
+    await refreshVerdicts(store);
+    const dir = mkdtempSync(join(process.env.TMPDIR ?? ".", "drain-cli-"));
+    cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+    const checkpoint = join(dir, "checkpoint");
+    const kms = `arn:aws:kms:us-east-1:000000000000:key/${"0".repeat(8)}-0000-0000-0000-${"0".repeat(12)}`;
+    const args = (more: string[]) => parseDrainArgs(["--execute", "--bucket", "my-bucket", "--kms-key-arn", kms, "--org", TENANT.orgId, "--concurrency", "1", "--checkpoint-file", checkpoint, ...more]);
+    const deps = { store, orgs: async () => [TENANT.orgId], stderr: () => {} };
+    const first = await runDrain(args(["--max-objects", "1"]), deps);
+    expect(first.objects.drained).toBe(1);
+    const file = JSON.parse(readFileSyncFs(checkpoint, "utf8"));
+    // The watermark, bound to the export generation of every org up to it (lander P2-A).
+    expect(file).toEqual({ v: 1, key: expect.any(String), exports: { [TENANT.orgId]: 1 } });
+    const saved = file.key as string;
+    expect(saved.endsWith(ACCEPTED_SUFFIX)).toBe(true); // a group's last listed key is its sidecar
+    expect(validResumeKey(saved)).toBe(true);
+    // A group can also end on the export's create-only superseded record (finding 7).
+    expect(validResumeKey(saved.slice(0, -ACCEPTED_SUFFIX.length) + ".superseded.json")).toBe(true);
+    const rest = await runDrain(args([]), deps);
+    expect(rest.resume).toBe("resumed");
+    expect(rest.objects).toMatchObject({ drained: 2, already_drained: 0 });
+    // A file this code did not write is refused, never guessed.
+    writeFileSyncFs(checkpoint, saved + "\n");
+    await expect(runDrain(args([]), deps)).rejects.toThrow("checkpoint_invalid");
+    expect((await canonical(store)).size).toBe(3);
   });
 
   test("CLI: the mode is never implied and --execute needs the KMS key", () => {
@@ -936,5 +1094,92 @@ describe("buffered backlog drain (0005)", () => {
     const summary = await run(store, { maxObjects: 2, concurrency: 1 });
     expect(summary.listed).toBeLessThanOrEqual(2);
     expect(summary.stopped).toBe("max_objects");
+  });
+
+  // ---- the same two P1s across 0005 step 0b's outcomes (#585) ----
+
+  test("P1-1 (#585): a held stage that a later export superseded holds nothing: pruned, the user's next batch drains", async () => {
+    const store = await scratch();
+    const a = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { batch: "A" });
+    await putHold(store, [a]);
+    await store.put(objectKey(a + SUPERSEDED_SUFFIX), enc.encode(JSON.stringify({ v: 1, kind: "buffered-superseded", stage_sha256: "0".repeat(64) })));
+    const c = await stage(store, [group("claude", "sess-2", [{ id: "r2", rev: 1 }])], { batch: "C" });
+    const summary = await run(store, { concurrency: 1 });
+    expect(summary.objects.stage_superseded).toBe(1);
+    expect(summary.holds_pruned).toBe(1);
+    expect(await exists(store, c + DRAINED_SUFFIX)).toBe(true);
+    expect(await holdKeys(store)).toEqual([]);
+  });
+
+  test("P1-1 (#585): a held stage SQL's verdict refuses (stage_not_live) releases its hold", async () => {
+    const store = await scratch();
+    const a = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { batch: "A", live: false });
+    await putHold(store, [a]);
+    const c = await stage(store, [group("claude", "sess-2", [{ id: "r2", rev: 1 }])], { batch: "C" });
+    const first = await run(store, { concurrency: 1 });
+    expect(first.objects.stage_not_live).toBe(1);
+    expect(await holdKeys(store)).toEqual([]);
+    if (!(await exists(store, c + DRAINED_SUFFIX))) await run(store, { concurrency: 1 });
+    expect(await exists(store, c + DRAINED_SUFFIX)).toBe(true);
+  });
+
+  test("P1-2 (#585): an org whose export is missing never advances the checkpoint; after the export a rerun drains", async () => {
+    const store = await scratch({ exportComplete: false });
+    await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    let checkpoint: string | undefined;
+    const first = await run(store, { onCheckpoint: (k) => { checkpoint = k; } });
+    expect(first.objects.stage_export_missing).toBe(1);
+    expect(checkpoint).toBeUndefined();
+    await markExportComplete(store);
+    expect((await run(store)).objects.drained).toBe(1);
+  });
+
+  // ---- lander P2-A on #585: step 0b refusals are final only within one export generation ----
+
+  test("P2-A: a re-export that flips a stage to live resets an older checkpoint; the stage is not skipped", async () => {
+    const store = await scratch();
+    const a = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { batch: "A", live: false });
+    await stage(store, [group("claude", "sess-2", [{ id: "r2", rev: 1 }])], { batch: "B" });
+    let saved: DrainCheckpoint | undefined;
+    const first = await run(store, { concurrency: 1, onCheckpoint: (_k, c) => { saved = c; } });
+    expect(first.objects.stage_not_live).toBe(1);
+    expect(first.objects.drained).toBe(1);
+    // Both groups are terminal under generation 1: the watermark passes A.
+    expect(saved!.key >= a).toBe(true);
+    expect(saved!.exports).toEqual({ [TENANT.orgId]: 1 });
+
+    // Same generation: the resume holds, and A stays refused (final within the generation).
+    const same = await run(store, { resume: saved! });
+    expect(same.resume).toBe("resumed");
+    expect(same.objects.drained).toBe(0);
+    expect(await exists(store, a + DRAINED_SUFFIX)).toBe(false);
+
+    // A re-export: SQL's gate reopened, so A's sidecar is replaced with a live verdict and the completion renewed.
+    VERDICTS.set(a, { ...VERDICTS.get(a)!, live: true });
+    await store.put(objectKey(acceptedCompleteKey(ROOT, TENANT.orgId)), enc.encode(JSON.stringify({ v: 1, kind: "buffered-accepted-complete", stages: 2, completedAtMs: 2 })));
+    const resumed = await run(store, { resume: saved! });
+    expect(resumed.resume).toBe("reset_export_changed");
+    expect(resumed.objects.drained).toBe(1);
+    expect(resumed.objects.already_drained).toBe(1);
+    expect(await exists(store, a + DRAINED_SUFFIX)).toBe(true);
+    expect((await canonical(store)).get("sess-1")).toEqual(["r1@1"]);
+  });
+
+  test("P2-A: a revoked export, or a new org before the watermark, also resets the checkpoint", async () => {
+    const store = await scratch();
+    await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    let saved: DrainCheckpoint | undefined;
+    await run(store, { onCheckpoint: (_k, c) => { saved = c; } });
+    await store.put(objectKey(acceptedCompleteKey(ROOT, TENANT.orgId)), enc.encode(JSON.stringify({ v: 1, kind: "buffered-accepted-revoked", revokedAtMs: 3 })));
+    expect((await run(store, { resume: saved! })).resume).toBe("reset_export_changed");
+    await markExportComplete(store);
+    expect((await run(store, { resume: saved! })).resume).toBe("resumed");
+    // An org sorting before the watermark that the checkpoint never saw.
+    expect((await run(store, { orgs: ["aaa-org", TENANT.orgId], resume: saved! })).resume).toBe("reset_export_changed");
+    // An explicit --start-after and a resume never mix; neither does a malformed checkpoint.
+    await expect(run(store, { resume: saved!, startAfter: saved!.key })).rejects.toThrow("drain_resume_and_start_after");
+    expect(parseDrainCheckpoint(JSON.stringify({ ...saved!, exports: { x: 0 } }))).toBeNull();
+    expect(parseDrainCheckpoint(JSON.stringify({ ...saved!, key: "96bulls/../x" }))).toBeNull();
+    expect(parseDrainCheckpoint(JSON.stringify(saved!))).toEqual(saved!);
   });
 });

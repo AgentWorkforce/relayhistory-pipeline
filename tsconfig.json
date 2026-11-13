@@ -57,6 +57,7 @@
     "scripts/sessions-function-boundary",
     "scripts/opensearch-proof",
     "scripts/buffered-drain.ts",
+    "scripts/accepted-stage-export.ts",
     "scripts/upload-fence-backfill.ts"
   ],
   "exclude": [

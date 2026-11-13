@@ -7,6 +7,14 @@
  *
  * Per staged object, in key order, with bounded concurrency:
  *
+ *   0. 0005 step 0b: write ONLY stages SQL would publish, and only the lines it keeps: the sidecar (v2) carries SQL's
+ *      own verdict (accepted-stage-export.ts): not live is `stage_not_live`; lines SQL does not keep are dropped
+ *      (`not_kept`); and the user's S3 fence must be exactly as the export saw it (same instance, resets,
+ *      resetsCompleted, kept-session epochs), else `fence_moved_since_export` (re-export first). The clock-based
+ *      reset margin below stays as an extra guard. Write ONLY stages SQL acknowledged. Without the org's accepted-stage completion object
+ *      every stage of it is `stage_export_missing`; a stage without its `<staged key>.accepted.json` sidecar
+ *      is `stage_unacknowledged` (e.g. the consent gate refused it after the PUT, before the ACK); a sidecar
+ *      whose sha256 is not the object's is `accepted_mismatch`. None of them is read further or written.
  *   0b. --execute writes nothing of an org without a valid fence-authority marker, by admission's own rule
  *      (ledger-s3 requireFenceAuthority: per-org marker, else the deployment-wide one): `fence_authority_missing`
  *      or `fence_authority_invalid`. The dry run classifies anyway and counts `orgs_without_authority`.
@@ -87,6 +95,84 @@ import {
 } from "./writer.ts";
 
 export const DRAINED_SUFFIX = ".drained.json";
+/**
+ * 0005 step 0b: the accepted-stage export (accepted-stage-export.ts) writes one create-only sidecar per stage
+ * whose receipt SQL acknowledged, and one completion object per org once that org's export is whole. The drain
+ * writes ONLY stages with a sidecar naming their exact bytes, and none of an org without a completion object.
+ */
+export const ACCEPTED_SUFFIX = ".accepted.json";
+/**
+ * Create-only `<stage key>.superseded.json` (accepted-stage-export.ts): the stage left SQL's candidate set after an
+ * earlier export wrote its sidecar. The drain never writes a superseded stage (`stage_superseded`), whatever its sidecar.
+ */
+export const SUPERSEDED_SUFFIX = ".superseded.json";
+export interface SupersededRecord { v: 1; kind: "buffered-superseded"; stage_sha256: string }
+export const acceptedCompleteKey = (keyRoot: string, orgId: string) => `${keyRoot}/.drain/accepted-stages/v1/${orgId}.complete.json`;
+/**
+ * A resumable drain checkpoint (lander P2-A on #585): the low watermark AND the accepted-stage export generation
+ * (`completedAtMs` of each org's completion object, or null without one) of every org at or before it. Outcomes like
+ * `stage_not_live` are final only within one export generation: a re-export can replace a sidecar's verdict by CAS, so
+ * a checkpoint taken under another generation is never trusted (the run restarts from the beginning instead).
+ */
+export interface DrainCheckpoint { v: 1; key: string; exports: Record<string, number | null> }
+const stripSidecar = (key: string) => key.replace(/\.(drained|accepted|superseded)\.json$/, "");
+export function parseDrainCheckpoint(text: string): DrainCheckpoint | null {
+  try {
+    const v = JSON.parse(text) as Record<string, unknown>;
+    if (!isObject(v) || v.v !== 1 || typeof v.key !== "string" || parseStagedKey(stripSidecar(v.key)) === null || !isObject(v.exports)) return null;
+    for (const [org, g] of Object.entries(v.exports)) {
+      if (org === "__proto__" || !(g === null || (Number.isSafeInteger(g) && (g as number) > 0))) return null;
+    }
+    return { v: 1, key: v.key, exports: { ...(v.exports as Record<string, number | null>) } };
+  } catch {
+    return null;
+  }
+}
+/**
+ * The export's verdict for one stage (v2, accepted-stage-export.ts): SQL's own liveness test, the lines SQL keeps
+ * (per object group, the kept line indexes), and the user's S3 fence as the export saw it.
+ */
+export interface AcceptedMarker {
+  v: 2;
+  kind: "buffered-accepted";
+  stage_sha256: string;
+  live: boolean;
+  kept: number[][];
+  fence: { instance: string; resets: number; resetsCompleted: number; epochs: Record<string, number> } | null;
+}
+export interface AcceptedComplete { v: 1; kind: "buffered-accepted-complete"; stages: number; completedAtMs: number }
+export function parseAcceptedMarker(text: string): AcceptedMarker | null {
+  try {
+    const v = JSON.parse(text) as Record<string, unknown>;
+    if (!isObject(v) || v.v !== 2 || v.kind !== "buffered-accepted" || typeof v.stage_sha256 !== "string" || !HEX64.test(v.stage_sha256) ||
+        typeof v.live !== "boolean" || !Array.isArray(v.kept) || Object.keys(v).length !== 6) return null;
+    for (const g of v.kept as unknown[]) {
+      if (!Array.isArray(g)) return null;
+      let prev = -1;
+      for (const j of g) {
+        if (!Number.isInteger(j) || (j as number) <= prev) return null;
+        prev = j as number;
+      }
+    }
+    const f = v.fence;
+    if (f !== null) {
+      if (!isObject(f) || typeof f.instance !== "string" || !Number.isSafeInteger(f.resets) || !Number.isSafeInteger(f.resetsCompleted) || !isObject(f.epochs) ||
+          !Object.values(f.epochs).every((n) => Number.isSafeInteger(n) && (n as number) >= 0)) return null;
+    }
+    return v as unknown as AcceptedMarker;
+  } catch {
+    return null;
+  }
+}
+export function parseAcceptedComplete(text: string): AcceptedComplete | null {
+  try {
+    const v = JSON.parse(text) as Record<string, unknown>;
+    return isObject(v) && v.v === 1 && v.kind === "buffered-accepted-complete" && Number.isSafeInteger(v.stages) && (v.stages as number) >= 0 &&
+      Number.isSafeInteger(v.completedAtMs) && (v.completedAtMs as number) > 0 ? (v as unknown as AcceptedComplete) : null;
+  } catch {
+    return null;
+  }
+}
 /** Clock-skew margin around a user's last reset (see step 3): default and floor. */
 export const RESET_MARGIN_DEFAULT_MS = 5 * 60_000;
 export const RESET_MARGIN_MIN_MS = 60_000;
@@ -265,13 +351,19 @@ export type ObjectOutcome =
   | "index_merge_failed"
   | "fence_recheck_failed"
   | "fence_moved"
+  | "stage_unacknowledged"
+  | "stage_export_missing"
+  | "accepted_mismatch"
+  | "stage_not_live"
+  | "stage_superseded"
+  | "fence_moved_since_export"
   | "marker_failed"
   | "internal_error";
 
 const OUTCOMES: ObjectOutcome[] = [
   "drained", "would_drain", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch",
   "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "control_pending", "fence_authority_missing", "fence_authority_invalid", "user_hold", "user_stopped", "hold_failed", "lock_lost", "index_unreadable", "write_failed",
-  "index_merge_failed", "fence_recheck_failed", "fence_moved", "marker_failed", "internal_error",
+  "index_merge_failed", "fence_recheck_failed", "fence_moved", "stage_unacknowledged", "stage_export_missing", "accepted_mismatch", "stage_not_live", "stage_superseded", "fence_moved_since_export", "marker_failed", "internal_error",
 ];
 
 /**
@@ -282,6 +374,11 @@ const OUTCOMES: ObjectOutcome[] = [
  */
 export const TERMINAL_OUTCOMES: ReadonlySet<ObjectOutcome> = new Set<ObjectOutcome>([
   "drained", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch", "ambiguous_replacement",
+  // 0005 step 0b: SQL never acknowledged it, or its verdict refuses it. Final only within one export generation: a
+  // re-export can write or replace a sidecar (by CAS) with another verdict, so a checkpoint records each org's generation
+  // and is not trusted under another (DrainCheckpoint). (`stage_export_missing` and `fence_moved_since_export` are left
+  // for a rerun after a fresh export.)
+  "stage_unacknowledged", "accepted_mismatch", "stage_not_live", "stage_superseded",
 ]);
 /** A staged object in one of these states can never drain: a hold entry naming it holds nothing (pruned). */
 const UNDRAINABLE_READS: ReadonlySet<Read["kind"]> = new Set<Read["kind"]>(["redacted", "vanished", "corrupt", "key_mismatch"]);
@@ -303,6 +400,8 @@ export interface DrainSummary {
     stale: number;
     already_stored: number;
     revision_conflict: number;
+    /** Lines SQL does not keep (the export's verdict: GC-dropped, not body-accepted, or not live). */
+    not_kept: number;
   };
   /** Session groups written (execute) or that would be (dry run). */
   sessions_written: number;
@@ -321,14 +420,20 @@ export interface DrainSummary {
   /** Write failures by closed code (IngestWriteError code, or `storage`). */
   write_failures: Record<string, number>;
   stopped: "complete" | "max_objects";
+  /**
+   * How a `resume` checkpoint was used: `none` (none given), `resumed`, or `reset_export_changed`. In that last case an
+   * org at or before the checkpoint has a different accepted-stage export generation now (a re-export can flip a stage's
+   * verdict), so the run starts from the beginning: drained objects are skipped by their markers.
+   */
+  resume: "none" | "resumed" | "reset_export_changed";
 }
 
 function emptySummary(mode: DrainSummary["mode"]): DrainSummary {
   return {
     mode, orgs: 0, listed: 0, foreign_keys: 0,
     objects: Object.fromEntries(OUTCOMES.map((o) => [o, 0])) as Record<ObjectOutcome, number>,
-    lines: { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0 },
-    sessions_written: 0, rearmed: 0, hold_failures: 0, holds_pruned: 0, orgs_without_authority: 0, fence_assumed_empty: 0, write_failures: {}, stopped: "complete",
+    lines: { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0, not_kept: 0 },
+    sessions_written: 0, rearmed: 0, hold_failures: 0, holds_pruned: 0, orgs_without_authority: 0, fence_assumed_empty: 0, write_failures: {}, stopped: "complete", resume: "none",
   };
 }
 
@@ -408,6 +513,12 @@ interface BatchGroup {
   /** Staged keys sharing one `…/b=<batch32>-` prefix, in key order. */
   staged: string[];
   markers: Set<string>;
+  /** Staged keys with an accepted-stage sidecar (0005 step 0b). */
+  accepted: Set<string>;
+  /** Staged keys the export superseded (left SQL's candidate set after an earlier sidecar): never written. */
+  superseded: Set<string>;
+  /** Whether this org's accepted-stage export completed (its completion object exists and is valid). */
+  exportComplete: boolean;
   /** The org's fence authority, as admission requires it (ledger-s3 requireFenceAuthority). */
   authority: Authority;
   lastKey: string;
@@ -446,7 +557,7 @@ async function orgAuthority(store: ObjectStore, keyRoot: string, orgId: string):
   }
 }
 
-async function* batchGroups(store: ObjectStore, prefix: string, startAfter: string | undefined, summary: DrainSummary, authority: Authority): AsyncGenerator<BatchGroup> {
+async function* batchGroups(store: ObjectStore, prefix: string, startAfter: string | undefined, summary: DrainSummary, exportComplete: boolean, authority: Authority): AsyncGenerator<BatchGroup> {
   let current: (BatchGroup & { id: string }) | null = null;
   let cursor: string | undefined;
   do {
@@ -455,7 +566,8 @@ async function* batchGroups(store: ObjectStore, prefix: string, startAfter: stri
     for (const item of page.items) {
       const key = String(item.key);
       if (startAfter !== undefined && key <= startAfter) continue;
-      const staged = key.endsWith(DRAINED_SUFFIX) ? key.slice(0, -DRAINED_SUFFIX.length) : key;
+      const suffix = [DRAINED_SUFFIX, ACCEPTED_SUFFIX, SUPERSEDED_SUFFIX].find((x) => key.endsWith(x)) ?? "";
+      const staged = suffix ? key.slice(0, -suffix.length) : key;
       const parts = parseStagedKey(staged);
       if (!parts) {
         summary.foreign_keys++;
@@ -466,10 +578,12 @@ async function* batchGroups(store: ObjectStore, prefix: string, startAfter: stri
         yield current;
         current = null;
       }
-      current ??= { id, staged: [], markers: new Set(), authority, lastKey: key };
+      current ??= { id, staged: [], markers: new Set(), accepted: new Set(), superseded: new Set(), exportComplete, authority, lastKey: key };
       current.lastKey = key;
-      if (staged === key) current.staged.push(key);
-      else current.markers.add(staged);
+      if (!suffix) current.staged.push(key);
+      else if (suffix === DRAINED_SUFFIX) current.markers.add(staged);
+      else if (suffix === SUPERSEDED_SUFFIX) current.superseded.add(staged);
+      else current.accepted.add(staged);
     }
   } while (cursor);
   if (current) yield current;
@@ -526,10 +640,12 @@ export function parseDrainHold(text: string): DrainHold | null {
  */
 export const DRAIN_LOCK_TTL_MS = 15 * 60_000;
 export const drainLockKey = (keyRoot: string) => `${keyRoot}/.drain/lock.json`;
+/** The accepted-stage export's lease (accepted-stage-export.ts): the drain and the export exclude each other. */
+export const exportLockKey = (keyRoot: string) => `${keyRoot}/.drain/export-lock.json`;
 interface DrainLockBody { v: 1; kind: "buffered-drain-lock"; holder: string; expiresAtMs: number; token?: number }
 
 export class DrainLockError extends Error {
-  constructor(readonly code: "drain_locked" | "drain_lock_invalid" | "drain_lock_lost") {
+  constructor(readonly code: "drain_locked" | "drain_peer_locked" | "drain_lock_invalid" | "drain_lock_lost") {
     super(code);
     this.name = "DrainLockError";
   }
@@ -554,6 +670,30 @@ async function readLock(store: ObjectStore, key: string): Promise<{ body: DrainL
 export async function assertDrainUnlocked(store: ObjectStore, keyRoot: string, nowMs: number, key = drainLockKey(keyRoot)): Promise<void> {
   const held = await readLock(store, key);
   if (held && held.body.expiresAtMs > nowMs) throw new DrainLockError("drain_locked");
+}
+
+/**
+ * The drain and the accepted-stage export never run beside each other (an export rewrites the verdicts a drain acts
+ * on): each refuses, in both modes, while the other's lease is live (`drain_peer_locked`; unreadable is held).
+ */
+export async function assertPeerUnlocked(store: ObjectStore, peerKey: string, nowMs: number): Promise<void> {
+  const held = await readLock(store, peerKey);
+  if (held && held.body.expiresAtMs > nowMs) throw new DrainLockError("drain_peer_locked");
+}
+
+/**
+ * Take this run's lease, THEN check the peer's: two runs starting together both see the other and both refuse, never
+ * both run. A refused lease is expired in place.
+ */
+export async function acquireExclusiveLock(store: ObjectStore, keyRoot: string, opts: { holder: string; ttlMs: number; now: () => number; key?: string; peerKey: string }): Promise<DrainLease> {
+  const lease = await acquireDrainLock(store, keyRoot, opts);
+  try {
+    await assertPeerUnlocked(store, opts.peerKey, opts.now());
+  } catch (error) {
+    await lease.release();
+    throw error;
+  }
+  return lease;
 }
 
 export interface DrainLease {
@@ -646,7 +786,13 @@ export interface DrainOptions {
    * object is early keeps resuming from there: that object is retried, and the marked ones after it are skipped
    * cheaply. Persist it to resume.
    */
-  onCheckpoint?: (key: string) => void | Promise<void>;
+  onCheckpoint?: (key: string, checkpoint: DrainCheckpoint) => void | Promise<void>;
+  /**
+   * Resume from a checkpoint `onCheckpoint` produced. Used only if every org at or before its key still has the export
+   * generation it recorded; otherwise the run starts from the beginning (`summary.resume`). Exclusive with startAfter,
+   * which is an operator's explicit key and is not checked against the export.
+   */
+  resume?: DrainCheckpoint;
   /** Called after each batch group with the running summary (counts only). */
   onProgress?: (summary: DrainSummary) => void;
   now?: () => Date;
@@ -667,6 +813,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   if (opts.assumeEmptyFence && !opts.dryRun) throw new Error("drain_assume_empty_fence_requires_dry_run");
   // A dry run writes nothing, so a watermark it recorded would let --execute skip everything it only classified.
   if (opts.dryRun && opts.onCheckpoint) throw new Error("drain_checkpoint_requires_execute");
+  if (opts.resume && opts.startAfter !== undefined) throw new Error("drain_resume_and_start_after");
   const lockTtlMs = opts.lockTtlMs ?? DRAIN_LOCK_TTL_MS;
   if (!Number.isSafeInteger(lockTtlMs) || lockTtlMs < 1_000) throw new Error("drain_lock_ttl_invalid");
   const resetMarginMs = opts.resetMarginMs ?? RESET_MARGIN_DEFAULT_MS;
@@ -688,9 +835,11 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   let lease: DrainLease | undefined;
   let lockLost: unknown;
   let renewTimer: ReturnType<typeof setInterval> | undefined;
-  if (opts.dryRun) await assertDrainUnlocked(opts.store, opts.keyRoot, nowMs());
-  else {
-    lease = await acquireDrainLock(raw, opts.keyRoot, { holder: opts.lockHolder ?? `drain-${randomUUID()}`, ttlMs: lockTtlMs, now: nowMs });
+  if (opts.dryRun) {
+    await assertDrainUnlocked(opts.store, opts.keyRoot, nowMs());
+    await assertPeerUnlocked(opts.store, exportLockKey(opts.keyRoot), nowMs());
+  } else {
+    lease = await acquireExclusiveLock(raw, opts.keyRoot, { holder: opts.lockHolder ?? `drain-${randomUUID()}`, ttlMs: lockTtlMs, now: nowMs, peerKey: exportLockKey(opts.keyRoot) });
     let renewing = false;
     renewTimer = setInterval(() => {
       if (renewing || lockLost !== undefined) return;
@@ -700,6 +849,36 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   }
   const locks = new KeyedLocks();
   const orgs = orgOrder(opts.orgs);
+  /**
+   * Each org's accepted-stage export generation for this run (`completedAtMs`, or null: no valid completion, so nothing of
+   * the org is written). Read once: the export and the drain exclude each other by lease, so it cannot change mid-run.
+   */
+  const generations = new Map<string, number | null>();
+  for (const org of orgs) {
+    let gen: number | null = null;
+    try {
+      const got = await readText(opts.store, acceptedCompleteKey(opts.keyRoot, org), 64 * 1024);
+      gen = got ? (parseAcceptedComplete(got.text)?.completedAtMs ?? null) : null;
+    } catch {
+      gen = null;
+    }
+    generations.set(org, gen);
+  }
+  const orgOf = (key: string) => parseStagedKey(stripSidecar(key))!.orgId;
+  /** The generations of every listed org at or before `key`'s org (S3 key order). */
+  const exportsUpTo = (key: string): Record<string, number | null> => {
+    const upto = `${orgOf(key)}/`;
+    return Object.fromEntries(orgs.filter((o) => `${o}/` <= upto).map((o) => [o, generations.get(o) ?? null]));
+  };
+  let startAfter = opts.startAfter;
+  if (opts.resume) {
+    const now = exportsUpTo(opts.resume.key);
+    const same = Object.entries(now).every(([o, g]) => Object.hasOwn(opts.resume!.exports, o) && opts.resume!.exports[o] === g);
+    if (same) {
+      startAfter = opts.resume.key;
+      summary.resume = "resumed";
+    } else summary.resume = "reset_export_changed";
+  }
   summary.orgs = orgs.length;
 
   /**
@@ -757,6 +936,8 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   function settled(key: string): Promise<boolean> {
     if (!settledCache.has(key)) settledCache.set(key, (async () => {
       if (await readText(opts.store, key + DRAINED_SUFFIX, 64 * 1024)) return true;
+      // A later export found it no longer a candidate: never written again (stage_superseded).
+      if (await readText(opts.store, key + SUPERSEDED_SUFFIX, 64 * 1024)) return true;
       const parts = parseStagedKey(key);
       if (!parts) return false;
       return UNDRAINABLE_READS.has((await readStagedObject(opts.store, key, parts, opts.decompress)).kind);
@@ -819,10 +1000,12 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     for (const org of orgs) {
       const prefix = `${opts.keyRoot}/${org}/buffered-batches/v1`;
       // Every key under a prefix that sorts before start-after, and does not contain it, is before it.
-      if (opts.startAfter !== undefined && `${prefix}/` < opts.startAfter && !opts.startAfter.startsWith(`${prefix}/`)) continue;
+      if (startAfter !== undefined && `${prefix}/` < startAfter && !startAfter.startsWith(`${prefix}/`)) continue;
+      // 0005 step 0b: without this org's completed accepted-stage export, nothing of it is written.
+      const complete = generations.get(org) !== null && generations.get(org) !== undefined;
       const authority = await currentAuthority(org);
       if (authority !== "ok") summary.orgs_without_authority++;
-      yield* batchGroups(opts.store, prefix, opts.startAfter, summary, authority);
+      yield* batchGroups(opts.store, prefix, startAfter, summary, complete, authority);
     }
   }
 
@@ -854,7 +1037,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     }
     if (mark !== undefined && opts.onCheckpoint) {
       const key = mark;
-      checkpointChain = checkpointChain.then(() => (checkpointError === undefined ? opts.onCheckpoint!(key) : undefined)).catch((e) => { checkpointError ??= e; });
+      checkpointChain = checkpointChain.then(() => (checkpointError === undefined ? opts.onCheckpoint!(key, { v: 1, key, exports: exportsUpTo(key) }) : undefined)).catch((e) => { checkpointError ??= e; });
     }
   };
 
@@ -912,12 +1095,14 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       summary.objects[outcome]++;
       if (!isTerminal) terminal = false;
     };
-    // Read everything not yet drained, then decide per claim token (GC replacement detection).
+    // Only stages SQL acknowledged (0005 step 0b) are candidates; nothing else is even read.
+    // Read every candidate, then decide per claim token (GC replacement detection).
     const reads = new Map<string, Read>();
     // Re-read (at most every AUTHORITY_TTL_MS): deleting the org's or the global marker stops the run's writes.
-    const authority = opts.dryRun ? group.authority : await currentAuthority(parseStagedKey(group.lastKey.replace(/\.(drained|accepted)\.json$/, ""))!.orgId);
+    const authority = opts.dryRun ? group.authority : await currentAuthority(parseStagedKey(group.lastKey.replace(/\.(drained|accepted|superseded)\.json$/, ""))!.orgId);
+    const candidate = (key: string) => !group.markers.has(key) && group.exportComplete && group.accepted.has(key) && !group.superseded.has(key) && (opts.dryRun || authority === "ok");
     for (const key of group.staged) {
-      if (group.markers.has(key) || (!opts.dryRun && authority !== "ok")) continue;
+      if (!candidate(key)) continue;
       try {
         reads.set(key, await readStagedObject(store, key, parseStagedKey(key)!, opts.decompress));
       } catch {
@@ -930,10 +1115,24 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
         note("already_drained");
         continue;
       }
+      if (!group.exportComplete) {
+        note("stage_export_missing");
+        continue;
+      }
       // --execute writes only for an org admission itself would admit (the dry run still classifies, and reports
       // the org in orgs_without_authority).
       if (!opts.dryRun && authority !== "ok") {
         note(authority === "missing" ? "fence_authority_missing" : "fence_authority_invalid");
+        continue;
+      }
+      if (!group.accepted.has(key)) {
+        note("stage_unacknowledged");
+        continue;
+      }
+      // The export found this stage no longer a candidate after it had written a sidecar: never written, never read.
+      if (group.superseded.has(key)) {
+        // Not read, so no header names its user: a hold entry for it is pruned by the user's next batch (liveHold).
+        note("stage_superseded");
         continue;
       }
       const read = reads.get(key)!;
@@ -947,7 +1146,8 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       // than one live (or drained, or unreadable just now) object for one claim means a GC swap was
       // interrupted: never guess.
       const claim32 = parseStagedKey(key)!.claim32;
-      const peers = group.staged.filter((k) => k !== key && parseStagedKey(k)!.claim32 === claim32 && (group.markers.has(k) || reads.get(k)?.kind === "live" || reads.get(k)?.kind === "internal_error"));
+      // Among ACCEPTED stages only: SQL names one current stage per batch, so a replaced original is not a peer.
+      const peers = group.staged.filter((k) => k !== key && group.accepted.has(k) && parseStagedKey(k)!.claim32 === claim32 && (group.markers.has(k) || reads.get(k)?.kind === "live" || reads.get(k)?.kind === "internal_error"));
       if (peers.length) {
         // A peer unreadable just now may read cleanly on a rerun: only then is this left for one.
         if (peers.some((k) => reads.get(k)?.kind === "internal_error")) {
@@ -968,8 +1168,32 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
         note("ambiguous_replacement");
         continue;
       }
+      // The sidecar must name these exact bytes (the export copied SQL's stage_sha256), carry SQL's verdict that the
+      // stage is live, and keep lines that exist in this object.
+      let marker: AcceptedMarker;
       try {
-        note(await drainOne(key, read.decoded));
+        const got = await readText(store, key + ACCEPTED_SUFFIX, 1024 * 1024);
+        const parsed = got ? parseAcceptedMarker(got.text) : null;
+        const groups = read.decoded.groups;
+        const refusal: ObjectOutcome | null = !parsed || parsed.stage_sha256 !== read.decoded.sha256 ? "accepted_mismatch"
+          : !parsed.live ? "stage_not_live"
+          : parsed.kept.length !== groups.length || parsed.kept.some((ls, g) => ls.some((j) => j >= groups[g]!.lines.length)) ? "accepted_mismatch"
+          : null;
+        if (refusal) {
+          // Never drained under this export generation: release any hold entry for it first. A re-export that changes
+          // the verdict starts a new generation and the batch drains then, but with its hold released it no longer
+          // orders the user's later batches: those may drain first (the same trade-off as other terminal refusals).
+          const h = read.decoded.header;
+          note((await releaseHeld({ orgId: h.org_id, workspaceId: h.workspace_id, userId: h.user_id }, key)) ? refusal : "hold_failed");
+          continue;
+        }
+        marker = parsed!;
+      } catch {
+        note("internal_error");
+        continue;
+      }
+      try {
+        note(await drainOne(key, read.decoded, marker));
       } catch {
         note("internal_error");
       }
@@ -996,7 +1220,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     return true;
   }
 
-  async function drainOne(key: string, { header, groups, sha256 }: Decoded): Promise<ObjectOutcome> {
+  async function drainOne(key: string, { header, groups, sha256 }: Decoded, verdict: AcceptedMarker): Promise<ObjectOutcome> {
     const tenant: LedgerTenant = { orgId: header.org_id, workspaceId: header.workspace_id, userId: header.user_id };
     const origin = header.origin_id;
     const receivedMs = Date.parse(header.received_at);
@@ -1026,7 +1250,28 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       return "journal_unreadable";
     }
     if (journal && (journal.pending > 0 || journal.ambiguous > 0)) return "privacy_control_open";
-    const counts = { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0 };
+    const counts = { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0, not_kept: 0 };
+    // The fence must be exactly as the export saw it when it took SQL's verdict (finding 1): the same fence object, no
+    // reset begun or finished since, and every kept session at the same epoch. Anything else needs a fresh export.
+    const vf = verdict.fence;
+    // The export saw no fence: a fence since then means a fresh export (only the dry run's assume-empty view gets past).
+    if (vf === null ? read.state === "present" : fence.instance !== vf.instance || fence.resets !== vf.resets || fence.resetsCompleted !== vf.resetsCompleted)
+      return "fence_moved_since_export";
+    // Only the lines SQL keeps (finding 2); kept sessions must all be at the export's epoch.
+    groups = groups.map((g, gi) => {
+      const keep = new Set(verdict.kept[gi]);
+      const lines: string[] = [], meta: LineMeta[] = [];
+      g.lines.forEach((l, j) => {
+        if (keep.has(j)) { lines.push(l); meta.push(g.meta![j]!); }
+        else counts.not_kept++;
+      });
+      return { ...g, lines, meta };
+    }).filter((g) => g.lines.length > 0);
+    if (vf) for (const g of groups) for (const m of g.meta!) {
+      if (m[3] === null) continue;
+      const sk = sessionKeyHash(m[2], m[3]);
+      if (!Object.hasOwn(vf.epochs, sk) || vf.epochs[sk] !== fenceEpoch(fence, origin, sk)) return "fence_moved_since_export";
+    }
     // ledger-s3 resetsCompleted: a reset begun but not finished is still applying its tombstones (a claim
     // finishes it). Writing now could republish a session it is about to tombstone: skip, unmarked.
     // As admission's claim (ledger-s3 hasPendingReset): an ordered reset SQL has not decided yet refuses the user.
