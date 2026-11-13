@@ -30,6 +30,7 @@
     "stacks",
     "alchemy.run.ts",
     "smoke",
+    "e2e/pipeline",
     "src/types/*.d.ts",
     "scripts/proof-buffer-gc.ts",
     "scripts/sync-ingest-buffer-gc-boundary.ts",
@@ -55,7 +56,8 @@
     "scripts/sync-ingest-history-boundary.ts",
     "scripts/sessions-function-boundary",
     "scripts/opensearch-proof",
-    "scripts/buffered-drain.ts"
+    "scripts/buffered-drain.ts",
+    "scripts/upload-fence-backfill.ts"
   ],
   "exclude": [
     "node_modules",

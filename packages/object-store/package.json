@@ -1,7 +1,7 @@
 {
   "name": "@relayhistory/object-store",
   "version": "0.1.0",
-  "license": "Apache-2.0",
+  "license": "FSL-1.1-ALv2",
   "private": true,
   "description": "Read side of RelayHistory's raw session object storage: S3/R2/MinIO, GCS, Azure Blob and local directory adapters, the v1 key layout and manifest validation. Runs in Cloudflare Workers and Node.",
   "type": "module",

@@ -55,6 +55,11 @@
  *   INGEST_SYNC_ADMISSION_FROZEN_RECEIPT  unset/off (default) | on: under frozen-supabase custody, a queued-v1
  *                              caller on the synchronous path reads the frozen legacy receipt before any claim
  *                              (app.ts acceptBatch, as the admission consumer does)
+ *   INGEST_HTTP_ADMISSION_STOPPED_ORGS  unset/blank (default): none | comma-separated org ids
+ *                              (http-admission-stop.ts, decision 0005): a listed org's HTTP admission (batches,
+ *                              turns, recovery) is 503 delivery_unavailable with Retry-After before any ledger call;
+ *                              controls, reads and the INGEST_ADMISSION consumer are unchanged. A malformed list
+ *                              refuses startup (every request 503 not_configured), never off
  *   SESSIONS_NEON_EXIT         unset/false (default) | true: refuse every Neon edge at startup
  *                              (replica, NEON_REPLICA binding, a custody source other than
  *                              frozen-supabase in buffered mode); docs/neon-exit-edge-map.md
@@ -80,6 +85,7 @@ import type { ReadBindgenArtifact } from "@rhc/lib/scrub-engine/bindgen-engine.t
 import { dbClientErrorFields } from "./db-error-class.ts";
 import { assertNoNeonEdge, neonExitProfile, NeonExitRefusal } from "../shared/neon-exit.ts";
 import { createIngestApp } from "./app.ts";
+import { httpAdmissionStoppedOrgs } from "./http-admission-stop.ts";
 import { sqlLedger } from "./ledger-sql.ts";
 import type { ReplicaMode, ReplicaSink, NeonReplicaMessage } from "./replica.ts";
 import { fanout, type FanoutMessage } from "./staging.ts";
@@ -119,6 +125,8 @@ export interface IngestWorkerEnv {
   INGEST_LEDGER?: string;
   /** INGEST_S3_FENCE_MIRROR: off (default) | on. on: selection / reset also write the S3 upload fence (app.ts s3FenceMirror). */
   INGEST_S3_FENCE_MIRROR?: string;
+  /** Comma-separated org ids whose HTTP upload admission is stopped (http-admission-stop.ts). Unset: none. */
+  INGEST_HTTP_ADMISSION_STOPPED_ORGS?: string;
   /** off (default) | allowlist | on (upload-admission.ts): the ?uploadKey= admission status only. */
   HISTORY_UPLOAD_DIRECT?: string;
   /** HISTORY_UPLOAD_DIRECT=allowlist: comma-separated org:<id> / ws:<id>. */
@@ -245,6 +253,8 @@ export interface IngestSettings {
   uploadConsent?: Exclude<UploadConsentEnforcement, "off">;
   /** INGEST_S3_FENCE_MIRROR=on (decision 0005 "Controls"). Absent (the default): no S3 fence write. */
   s3FenceMirror?: true;
+  /** INGEST_HTTP_ADMISSION_STOPPED_ORGS (http-admission-stop.ts). Absent (the default): no org is stopped. */
+  httpAdmissionStoppedOrgs?: ReadonlySet<string>;
 }
 
 /** INGEST_S3_FENCE_MIRROR: unset, "" or "off" is off; "on" is on; anything else throws (a privacy control is never silently off). */
@@ -293,6 +303,8 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   const uploadConsent = uploadConsentEnforcement(env.INGEST_UPLOAD_CONSENT);
   // A privacy control too: an invalid value is a loud configuration error, never off.
   const fenceMirror = s3FenceMirrorFlag(env.INGEST_S3_FENCE_MIRROR);
+  // The fence-authority precondition (decision 0005): a malformed stop list is a loud configuration error, never off.
+  const stoppedOrgs = httpAdmissionStoppedOrgs(env.INGEST_HTTP_ADMISSION_STOPPED_ORGS);
   // Default off; the secrets are read and validated only when the flag is exactly "1". Isolated: the
   // secrets are runtime-mutable Secrets Store values, so an invalid flag or secret must never fail delivery
   // or the queue consumer. The erase route alone fails closed (503 unavailable); the log carries a code only.
@@ -346,6 +358,7 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
     ...(uploadDirect.mode !== "off" ? { uploadDirect } : {}),
     ...(uploadConsent !== "off" ? { uploadConsent } : {}),
     ...(fenceMirror ? { s3FenceMirror: true as const } : {}),
+    ...(stoppedOrgs ? { httpAdmissionStoppedOrgs: stoppedOrgs } : {}),
   };
 }
 
@@ -476,6 +489,7 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: R
     ...(settings.syncAdmissionFrozenReceipt ? { syncAdmissionFrozenReceipt: "on" as const } : {}),
     ...(settings.sessionErase ? { sessionErase: settings.sessionErase } : {}),
     ...(settings.uploadDirect ? { uploadDirect: settings.uploadDirect } : {}),
+    ...(settings.httpAdmissionStoppedOrgs ? { httpAdmissionStoppedOrgs: settings.httpAdmissionStoppedOrgs } : {}),
     ...(settings.uploadConsent ? { uploadConsent: { enforcement: settings.uploadConsent, store: sqlUploadConsentStore(run) } } : {}),
     // Only the fence methods are used: the S3 ledger never admits on the Worker (INGEST_LEDGER=s3 refuses here).
     // A reset is BEGUN only (one fence CAS), so it fits any subrequest budget however many sessions the user has;

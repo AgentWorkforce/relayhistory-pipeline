@@ -6,14 +6,14 @@
  * consumer, read API), runs the acceptance checks, and tears everything down.
  * Set E2E_KEEP=1 to leave the stack up for debugging. Exit non-zero on any FAIL.
  */
-import { buildImage, createStack } from "./stack.ts";
+import { buildImage, createStack, DEFAULT_IMAGE } from "./stack.ts";
 import { runAcceptance, type Check } from "./acceptance.ts";
 
 const line = (c: Check) => console.log(`${c.result.padEnd(7)} ${c.name}  ${c.detail}`);
 let failed = false;
 if (!process.env.E2E_SKIP_BUILD) {
   console.log("building 96bulls/services:e2e ...");
-  buildImage();
+  buildImage(process.env.E2E_IMAGE?.trim() || DEFAULT_IMAGE); // the tag compose.yaml runs
 }
 const stack = createStack();
 const down = () => {

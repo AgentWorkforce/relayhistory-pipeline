@@ -348,7 +348,28 @@ interface TargetCensusRow {
   reset_set_sha256: unknown;
 }
 
-async function readOnly<T>(db: Queryable, sql: string, params: unknown[], label: string): Promise<T> {
+/**
+ * Who owns the transaction around each census read. `own` (the default, census/write/readback): every read runs
+ * in its own REPEATABLE READ READ ONLY transaction with a 2 s statement timeout. `caller` (discovery only): the
+ * caller already holds one REPEATABLE READ READ ONLY transaction (and its statement timeout) on the session, so
+ * the reads issue no BEGIN, SET LOCAL, COMMIT or ROLLBACK and all observe the caller's snapshot.
+ */
+export interface ParityCensusReadOptions {
+  transaction?: "own" | "caller";
+}
+
+async function readOnly<T>(
+  db: Queryable,
+  sql: string,
+  params: unknown[],
+  label: string,
+  options: ParityCensusReadOptions = {},
+): Promise<T> {
+  if (options.transaction === "caller") {
+    const row = (await db.query<T>(sql, params)).rows[0];
+    if (!row) throw new ParityCensusRefusal(`${label}_row_missing`);
+    return row;
+  }
   await db.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
   try {
     await db.query("SET LOCAL statement_timeout = '2s'");
@@ -468,8 +489,13 @@ export function storedProof(tenant: ParityTenant, row: Record<string, unknown> |
 }
 
 /** Source snapshot A; a frozen source that is unsealed or not authority-active refuses here. */
-async function readSourceA(source: Queryable, spec: CensusSourceSpec, params: unknown[]): Promise<NeonCensusRow> {
-  const row = await readOnly<NeonCensusRow>(source, spec.sql, params, spec.prefix);
+async function readSourceA(
+  source: Queryable,
+  spec: CensusSourceSpec,
+  params: unknown[],
+  options: ParityCensusReadOptions = {},
+): Promise<NeonCensusRow> {
+  const row = await readOnly<NeonCensusRow>(source, spec.sql, params, spec.prefix, options);
   if (spec.preflight) requireSourceActive(spec, row);
   return row;
 }
@@ -480,28 +506,32 @@ async function readSourceB(
   spec: CensusSourceSpec,
   params: unknown[],
   sourceA: NeonCensusRow,
+  options: ParityCensusReadOptions = {},
 ): Promise<NeonCensusRow> {
-  const row = await readOnly<NeonCensusRow>(source, spec.sql, params, `${spec.prefix}_recheck`);
+  const row = await readOnly<NeonCensusRow>(source, spec.sql, params, `${spec.prefix}_recheck`, options);
   if (sourceSnapshotKey(sourceA, spec) !== sourceSnapshotKey(row, spec)) throw new ParityCensusRefusal(spec.changedCode);
   return row;
 }
 
 /**
  * G1: read both databases only, then emit one content-free proof receipt.
- * `censusSource` selects the source-side reader; the default is Neon.
+ * `censusSource` selects the source-side reader; the default is Neon. `options.transaction: "caller"` (discovery
+ * only) runs the three reads inside the caller's open read-only snapshot instead of three own transactions.
  */
 export async function readParityCensus(
   neon: Queryable,
   target: Queryable,
   tenant: ParityTenant,
   censusSource: ParityCensusSource = "neon",
+  options: ParityCensusReadOptions = {},
 ): Promise<ParityCensusReceipt> {
   const spec = censusSourceSpec(censusSource);
   if (!validParityTenant(tenant)) throw new ParityCensusRefusal("tenant_invalid");
   const params = [tenant.orgId, tenant.workspaceId, tenant.userId];
-  const sourceA = await readSourceA(neon, spec, params);
-  const destination = await readOnly<TargetCensusRow>(target, TARGET_OWNER_BUFFERED_CENSUS_SQL, targetParams(tenant, sourceA, spec), "target");
-  const sourceB = await readSourceB(neon, spec, params, sourceA);
+  const sourceA = await readSourceA(neon, spec, params, options);
+  const destination = await readOnly<TargetCensusRow>(target, TARGET_OWNER_BUFFERED_CENSUS_SQL, targetParams(tenant, sourceA, spec),
+    "target", options);
+  const sourceB = await readSourceB(neon, spec, params, sourceA, options);
   return evaluateParityCensus(censusInput(tenant, sourceB, destination, spec));
 }
 

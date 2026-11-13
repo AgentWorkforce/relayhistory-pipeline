@@ -52,7 +52,10 @@ asynchronously through the admission path it already has. RelayHistory Cloud
 
 ## Workstreams and owners
 
-1. **relay-control credentials (relay-control owner).**
+1. **relay-control credentials (relay-control owner).** This is the STS path. Hosted Cloud does not use it: it
+   hands desktops **presigned** upload URLs (cloud#6244), signed by the presigned issuer user
+   (`transcriptStore.uploadPresignIssuer: true`, #562). A hosted stage with the issuer and no
+   `uploadControlRoleArn` creates no desktop-upload role at all (#592).
    - Add `POST /api/v1/workspaces/{ws}/relayhistory/upload-credentials`.
    - Assume the desktop-upload role with `sts:SetSourceIdentity` and a session
      policy limited to the caller's key prefix.
@@ -65,10 +68,18 @@ asynchronously through the admission path it already has. RelayHistory Cloud
    - Poll admission status, and fall back to the HTTP POST path on 404 from
      control.
 3. **Hosted pipeline Alchemy stacks (this repository).**
-   - **Desktop-upload role:** an IAM role that trusts only the control role,
+   - **Desktop-upload role (STS path only):** an IAM role that trusts only the control role,
      with `sts:SetSourceIdentity`. It may PutObject only under
-     `96bulls/.upload-inbox/*`, with the session policy narrowing it further.
-   - **KMS grant:** lets that role encrypt under the bucket key.
+     `96bulls/.upload-inbox/*`, with the session policy narrowing it further. It is
+     created only when `transcriptStore.uploadControlRoleArn` is set. With
+     `uploadPresignIssuer: true` and no `uploadControlRoleArn` (hosted, presigned
+     uploads) there is no such role: the inbox wall admits the consumer, the eraser
+     and the issuer user, and the plan contract accepts the upload inbox without
+     `desktop-upload-role` only when the stage inputs say exactly that.
+   - **Presigned issuer (hosted):** the `upload-presign-issuer` IAM user, whose
+     presigned PUTs land under `96bulls/.upload-inbox/*` (upload-inbox.ts
+     `uploadPresignIssuerPolicy`).
+   - **KMS grant:** lets the uploading principal (the role, or the issuer user) encrypt under the bucket key.
    - **Second bucket notification:** Id `96bulls-upload-inbox`, prefix
      `96bulls/.upload-inbox/`, suffix `.json.zst`, `s3:ObjectCreated:*`. It
      does not overlap the existing manifest rule, which has prefix `96bulls/`
@@ -183,8 +194,8 @@ asynchronously through the admission path it already has. RelayHistory Cloud
 ## Still needs Khaliq's explicit OK for each exact action
 
 - Creating the desktop-upload IAM role and its trust policy, including
-  `sts:SetSourceIdentity`.
-- The KMS grant for that role.
+  `sts:SetSourceIdentity` (STS path only), or the presigned issuer user (hosted).
+- The KMS grant for that principal.
 - Adding the `96bulls-upload-inbox` bucket notification, and the SQS queue
   and DLQ.
 - Deploying the upload-admission Lambda.

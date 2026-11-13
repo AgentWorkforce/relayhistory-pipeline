@@ -16,10 +16,19 @@
  * its environment and reads the URL only through readStdinCredentials. Nothing credential-like is logged or
  * written: the receipt and the census artifact carry digests, counts and public proof fields only.
  *
+ * Discovery (one-time, read-only, only while the roster is empty, frozen-supabase source only) holds ONE
+ * read-only repeatable-read snapshot on the enumerator session from the in-snapshot marker read through the
+ * same cursor, the canonical readback comparison of every owner (missing / stale / canonical current), the
+ * exact-seven check and a final in-snapshot marker read, fenced by generation reads on the target before and
+ * after. It emits only digests and dispositions of exactly seven missing-or-stale owners, so a separate
+ * reviewed roster-only PR can be written from the receipt. It never writes, never selects a writable session
+ * and refuses roster_present, generation_unstable and unexpected_scope (counts only on refusal).
+ *
  * `--proof` runs the synthetic PGlite proof (all migrations, 7 roster tenants + 2 others) with no credentials.
+ * `--discovery-summary` (no credentials) re-validates the discovery receipt and appends it to the job summary.
  */
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
   BULK_BUFFERED_TENANTS_SQL,
@@ -44,6 +53,7 @@ import {
   readParityCensus,
   storedProof,
   writeCurrentParityProof,
+  type ParityCensusSource,
   type ParityTenant,
 } from "../src/migration/owner-buffered-parity.ts";
 import {
@@ -56,23 +66,35 @@ import {
 import {
   OWNER_PARITY_CENSUS_CONTRACT,
   OWNER_PARITY_CENSUS_FILE_NAME,
+  OWNER_PARITY_DISCOVERY_CONTRACT,
+  OWNER_PARITY_DISCOVERY_FILE_NAME,
   OWNER_PARITY_EXACT_COUNT,
+  OWNER_PARITY_MODE_POLICY,
+  OWNER_PARITY_MODES,
   OWNER_PARITY_RECEIPT_CONTRACT,
   OWNER_PARITY_RECEIPT_FILE_NAME,
   OWNER_PARITY_ROSTER_FILE,
   OWNER_PARITY_WRITE_ENABLED,
   OwnerParityCiRefusal,
   canonicalJson,
+  emptyOwnerParityDiscoveryCounts,
   keepRosterTenants,
   ownerParityCensusDescriptor,
   ownerParityDispatch,
   parseOwnerParityCensus,
+  parseOwnerParityDiscoveryReceipt,
   parseOwnerParityRoster,
   refuseOwnerParity,
+  requireEmptyOwnerParityRoster,
+  requireOwnerParityDiscoveryScope,
   verifyOwnerParityWriteInputs,
   type OwnerParityCensusArtifact,
   type OwnerParityCensusBody,
   type OwnerParityCensusEntry,
+  type OwnerParityDiscoveryCounts,
+  type OwnerParityDiscoveryOwner,
+  type OwnerParityDiscoveryReceipt,
+  type OwnerParityDisposition,
   type OwnerParityDispatch,
 } from "../src/migration/owner-buffered-parity-ci-contract.ts";
 import type { Queryable } from "../src/migration/relayhistory-export.ts";
@@ -89,6 +111,7 @@ export const OWNER_PARITY_CHILD_ENV = [
   "OWNER_PARITY_CONFIRMATION",
 ] as const;
 const CHILD_FLAG = "--operator-stdin";
+const SUMMARY_FLAG = "--discovery-summary";
 
 export interface OwnerParitySessions {
   /** Source-side reader: the fenced read-only frozen-copy owner session (or a read-only Neon session). */
@@ -181,6 +204,14 @@ export function ownerParityPreflight(
   now: number = Date.now(),
 ): { dispatch: OwnerParityDispatch; roster: string[]; census: OwnerParityCensusArtifact | null } {
   const dispatch = ownerParityDispatch(env, enabled);
+  if (OWNER_PARITY_MODE_POLICY[dispatch.mode].roster === "empty") {
+    // Discovery: one-time, so it needs the empty roster and refuses roster_present once digests are listed.
+    requireEmptyOwnerParityRoster(roster);
+    // One snapshot covers the owner list and every comparison only when the source is the frozen copy in the
+    // target project; a Neon source would be a second database (and no Neon secret exists).
+    if (dispatch.censusSource !== "frozen-supabase") refuseOwnerParity("owner_parity_discovery_census_source");
+    return { dispatch, roster: [], census: null };
+  }
   const digests = parseOwnerParityRoster(roster);
   if (dispatch.mode !== "write") return { dispatch, roster: digests, census: null };
   const artifact = parseOwnerParityCensus(census);
@@ -300,6 +331,7 @@ export async function runOwnerParity(
     const pre = ownerParityPreflight(env, options.roster, options.census,
       options.writeEnabled ?? OWNER_PARITY_WRITE_ENABLED, now());
     dispatch = pre.dispatch;
+    if (dispatch.mode === "discovery") refuseOwnerParity("owner_parity_mode_route");
     counts.roster = pre.roster.length;
     for (const digest of pre.roster) statuses.set(digest, "not_attempted");
     const readCensus = options.deps?.readCensus ?? readParityCensus;
@@ -346,6 +378,206 @@ export async function runOwnerParity(
   }
 }
 
+
+// ---------------------------------------------------------------------------------------------------------------
+// Discovery: one read-only snapshot of every buffered owner, classified by the canonical readback comparison.
+// ---------------------------------------------------------------------------------------------------------------
+
+export interface OwnerParityDiscoveryOutcome {
+  receipt: OwnerParityDiscoveryReceipt;
+  exitCode: number;
+}
+
+export interface OwnerParityDiscoveryDependencies {
+  readCensus?: typeof readParityCensus;
+  /**
+   * Test injection only (production never passes it): runs inside the snapshot after the cursor is closed and
+   * before the first comparison, so a causal test can commit a concurrent change at exactly that point.
+   */
+  afterEnumeration?: () => Promise<void>;
+}
+
+export interface OwnerParityDiscoveryOptions {
+  /** Raw roster document (the committed JSON); must be the empty roster. */
+  roster: unknown;
+  runId: string;
+  now?: () => number;
+  deps?: OwnerParityDiscoveryDependencies;
+}
+
+/** Discovery's census reads join the snapshot the caller holds; no other mode ever passes this. */
+const DISCOVERY_SNAPSHOT_READ = Object.freeze({ transaction: "caller" as const });
+
+/**
+ * The operator's bulk cursor SQL in bounded pages, inside the caller's open transaction; the cursor is closed
+ * before this returns. Rows that are not a valid tenant tuple are only counted.
+ */
+export async function scanBufferedOwners(snapshot: Queryable): Promise<{ tenants: ParityTenant[]; unparsable: number }> {
+  const tenants: ParityTenant[] = [];
+  let unparsable = 0;
+  await snapshot.query(`DECLARE ${BULK_CURSOR} NO SCROLL CURSOR FOR ${BULK_BUFFERED_TENANTS_SQL}`);
+  for (;;) {
+    const rows = (await snapshot.query<Record<string, unknown>>(`FETCH FORWARD ${FETCH_PAGE} FROM ${BULK_CURSOR}`)).rows;
+    if (rows.length > FETCH_PAGE) refuseOwnerParity("owner_parity_page_too_large");
+    if (rows.length === 0) break;
+    for (const row of rows) {
+      try {
+        tenants.push(parseTenant({ orgId: row.org_id, workspaceId: row.workspace_id, userId: row.user_id }));
+      } catch {
+        unparsable++;
+      }
+    }
+  }
+  await snapshot.query(`CLOSE ${BULK_CURSOR}`);
+  return { tenants, unparsable };
+}
+
+/**
+ * The whole classification in ONE `REPEATABLE READ READ ONLY` transaction on one session (the fenced read-only
+ * enumerator): the PASS marker generation as the snapshot's first read (must equal `generation`), the bounded
+ * cursor, every canonical comparison (readParityCensus source/target reads and the stored-proof read, all with
+ * DISCOVERY_SNAPSHOT_READ, so none opens or ends a transaction), the exact-seven check and a final marker read,
+ * then COMMIT. Every disposition therefore comes from the same snapshot as the owner list. Any refusal rolls back.
+ * `counts` and `found` are filled in place so a refused receipt can still report counts.
+ */
+export async function discoverOwnersInSnapshot(
+  snapshot: Queryable,
+  generation: string,
+  censusSource: ParityCensusSource,
+  counts: OwnerParityDiscoveryCounts,
+  found: OwnerParityDiscoveryOwner[],
+  deps: OwnerParityDiscoveryDependencies = {},
+): Promise<void> {
+  const readCensus = deps.readCensus ?? readParityCensus;
+  await snapshot.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  try {
+    // Per statement, for the whole transaction; the census reads add no SET LOCAL of their own.
+    await snapshot.query("SET LOCAL statement_timeout = '30s'");
+    if (await readLiveGeneration(snapshot) !== generation) refuseOwnerParity("generation_unstable");
+    const scan = await scanBufferedOwners(snapshot);
+    counts.scanned = scan.tenants.length + scan.unparsable;
+    counts.unparsable = scan.unparsable;
+    await deps.afterEnumeration?.();
+    for (const tenant of scan.tenants) {
+      const g1 = await readCensus(snapshot, snapshot, tenant, censusSource, DISCOVERY_SNAPSHOT_READ);
+      if (g1.equal && g1.proof && !generationMatches(g1, generation)) refuseOwnerParity("generation_unstable");
+      const stored = storedProof(tenant, (await snapshot.query<Record<string, unknown>>(
+        READ_OWNER_BUFFERED_PARITY_SQL, [tenant.orgId, tenant.workspaceId, tenant.userId])).rows[0]);
+      const status = stored === null ? "missing"
+        : g1.equal && g1.proof && canonicalJson(stored) === canonicalJson(g1.proof) ? "equal" : "stale";
+      if (status === "equal") { counts.canonicalCurrent++; continue; }
+      counts[status]++;
+      found.push({ tenantSha256: tenantSha256(tenant), disposition: status satisfies OwnerParityDisposition });
+      // Fail fast: the scope is already wrong, so stop paying four statements per remaining owner; counts only on refusal.
+      if (counts.missing + counts.stale > OWNER_PARITY_EXACT_COUNT) refuseOwnerParity("unexpected_scope");
+    }
+    requireOwnerParityDiscoveryScope(counts, found);
+    // The closing marker read, still in the snapshot: it can differ only if a read escaped the snapshot.
+    if (generation !== await readLiveGeneration(snapshot)) refuseOwnerParity("generation_unstable");
+    await snapshot.query("COMMIT");
+  } catch (error) {
+    await snapshot.query("ROLLBACK").catch(() => undefined);
+    throw error;
+  }
+}
+
+/**
+ * The read-only discovery run. Never throws a refusal and never writes: generation A on the target, then the
+ * single-snapshot classification on the enumerator session (discoverOwnersInSnapshot: in-snapshot generation,
+ * owner list, every comparison by the readback rule -- no stored row is missing, a stored row byte-equal to a
+ * fresh equal proof at A is canonical current, anything else is stale -- the exact-seven check and a final
+ * in-snapshot generation), then generation B on the target, which must equal A (generation_unstable). The source
+ * and target sessions carry no comparison read; the target only answers the two external generation reads.
+ * Exactly seven missing+stale owners or unexpected_scope; a refused receipt carries counts only, never digests.
+ */
+export async function runOwnerParityDiscovery(
+  env: Record<string, string | undefined>,
+  sessions: OwnerParitySessions,
+  options: OwnerParityDiscoveryOptions,
+): Promise<OwnerParityDiscoveryOutcome> {
+  const now = options.now ?? Date.now;
+  const counts: OwnerParityDiscoveryCounts = emptyOwnerParityDiscoveryCounts();
+  const found: OwnerParityDiscoveryOwner[] = [];
+  let dispatch: OwnerParityDispatch | null = null;
+  let generation: string | null = null;
+  const discoveryReceipt = (code?: string): OwnerParityDiscoveryReceipt => ({
+    contract: OWNER_PARITY_DISCOVERY_CONTRACT, status: code === undefined ? "ok" : "refused",
+    ...(code === undefined ? {} : { code }),
+    runId: /^[1-9][0-9]{0,19}$/u.test(options.runId) ? options.runId : "0",
+    sourceSha: dispatch?.sha ?? null, generation, censusSource: dispatch?.censusSource ?? null, counts,
+    owners: code === undefined ? [...found].sort((a, b) => (a.tenantSha256 < b.tenantSha256 ? -1 : 1)) : [],
+    capturedAt: new Date(now()).toISOString(), credentialsPersisted: false,
+  });
+  try {
+    const pre = ownerParityPreflight(env, options.roster, undefined);
+    dispatch = pre.dispatch;
+    if (dispatch.mode !== "discovery") refuseOwnerParity("owner_parity_mode_route");
+    generation = await readLiveGeneration(sessions.target);
+    await discoverOwnersInSnapshot(sessions.enumerator, generation, dispatch.censusSource, counts, found, options.deps);
+    if (await readLiveGeneration(sessions.target) !== generation) refuseOwnerParity("generation_unstable");
+    return { receipt: discoveryReceipt(), exitCode: 0 };
+  } catch (error) {
+    return { receipt: discoveryReceipt(ownerParityCode(error)), exitCode: 1 };
+  }
+}
+
+/** The generic receipt for a discovery run: aggregate counts only, never digests (those are in the discovery receipt). */
+export function discoveryRunReceipt(discovery: OwnerParityDiscoveryReceipt): OwnerParityReceipt {
+  return {
+    contract: OWNER_PARITY_RECEIPT_CONTRACT, status: discovery.status, ...(discovery.code ? { code: discovery.code } : {}),
+    mode: "discovery", runId: discovery.runId, sourceSha: discovery.sourceSha, generation: discovery.generation,
+    censusSource: discovery.censusSource,
+    counts: { ...emptyCounts(), found: discovery.counts.scanned, equal: discovery.counts.canonicalCurrent,
+      missing: discovery.counts.missing, stale: discovery.counts.stale },
+    tenants: [], at: discovery.capturedAt, credentialsPersisted: false,
+  };
+}
+
+function refusedDiscoveryReceipt(env: Record<string, string | undefined>, code: string): OwnerParityDiscoveryReceipt {
+  return {
+    contract: OWNER_PARITY_DISCOVERY_CONTRACT, status: "refused", code,
+    runId: /^[1-9][0-9]{0,19}$/u.test(env.GITHUB_RUN_ID ?? "") ? env.GITHUB_RUN_ID! : "0",
+    sourceSha: null, generation: null, censusSource: null, counts: emptyOwnerParityDiscoveryCounts(), owners: [],
+    capturedAt: new Date().toISOString(), credentialsPersisted: false,
+  };
+}
+
+/** Job summary text for a validated discovery receipt: digests and dispositions on ok, counts only on refusal. */
+export function ownerParityDiscoverySummary(raw: unknown): string {
+  const r = parseOwnerParityDiscoveryReceipt(raw);
+  const c = r.counts;
+  const lines = [
+    `### Owner buffered parity discovery (${OWNER_PARITY_DISCOVERY_CONTRACT})`, "",
+    `- status: ${r.status}${r.code ? ` (${r.code})` : ""}`,
+    `- sha: ${r.sourceSha ?? "-"}`, `- generation: ${r.generation ?? "-"}`, `- census source: ${r.censusSource ?? "-"}`,
+    `- run: ${r.runId}`, `- captured at: ${r.capturedAt}`,
+    `- scanned ${c.scanned}, canonical current ${c.canonicalCurrent}, missing ${c.missing}, stale ${c.stale}, unparsable ${c.unparsable}`,
+  ];
+  if (r.status === "ok") {
+    lines.push("", "| tenantSha256 | disposition |", "| --- | --- |");
+    for (const o of r.owners) lines.push(`| \`${o.tenantSha256}\` | ${o.disposition} |`);
+    lines.push("", "Write the roster from these digests in a separate reviewed roster-only PR.");
+  }
+  lines.push("", "```json", JSON.stringify(r, null, 2), "```", "");
+  return lines.join("\n");
+}
+
+/** `--discovery-summary`: no credential, no database; re-validates the receipt file before publishing it. */
+function discoverySummary(): number {
+  const env = process.env;
+  try {
+    const summary = env.GITHUB_STEP_SUMMARY ?? "";
+    if (!summary.startsWith("/")) refuseOwnerParity("owner_parity_summary_path");
+    const text = ownerParityDiscoverySummary(readJson(outputPaths(env).discovery, "owner_parity_discovery_receipt_invalid"));
+    appendFileSync(summary, text);
+    console.log("owner_buffered_parity_discovery_summary " + JSON.stringify({ status: "published" }));
+    return 0;
+  } catch (error) {
+    console.log("owner_buffered_parity_discovery_summary " + JSON.stringify({ status: "refused", code: ownerParityCode(error) }));
+    return 1;
+  }
+}
+
 /** Spawn spec for the credential child: fixed argv, allowlisted env, the URL only in the stdin payload. */
 export function ownerParityChildSpawn(
   env: Record<string, string | undefined>,
@@ -371,6 +603,7 @@ function outputPaths(env: Record<string, string | undefined>) {
     census: join(temp, "owner-parity-census", OWNER_PARITY_CENSUS_FILE_NAME),
     out: join(temp, "owner-parity-out", OWNER_PARITY_CENSUS_FILE_NAME),
     receipt: join(temp, "owner-parity-out", OWNER_PARITY_RECEIPT_FILE_NAME),
+    discovery: join(temp, "owner-parity-out", OWNER_PARITY_DISCOVERY_FILE_NAME),
   };
 }
 
@@ -404,24 +637,34 @@ function announce(receipt: OwnerParityReceipt): void {
 
 function refusedReceipt(env: Record<string, string | undefined>, code: string): OwnerParityReceipt {
   return {
-    contract: OWNER_PARITY_RECEIPT_CONTRACT, status: "refused", code, mode: env.OWNER_PARITY_MODE === "census" ||
-      env.OWNER_PARITY_MODE === "write" || env.OWNER_PARITY_MODE === "readback" ? env.OWNER_PARITY_MODE : "refused",
+    contract: OWNER_PARITY_RECEIPT_CONTRACT, status: "refused", code,
+    mode: (OWNER_PARITY_MODES as readonly unknown[]).includes(env.OWNER_PARITY_MODE) ? env.OWNER_PARITY_MODE! : "refused",
     runId: /^[1-9][0-9]{0,19}$/u.test(env.GITHUB_RUN_ID ?? "") ? env.GITHUB_RUN_ID! : "0",
     sourceSha: null, generation: null, censusSource: null, counts: emptyCounts(), tenants: [],
     at: new Date().toISOString(), credentialsPersisted: false,
   };
 }
 
+function writeRefused(env: Record<string, string | undefined>, paths: ReturnType<typeof outputPaths> | null, code: string): void {
+  const receipt = refusedReceipt(env, code);
+  if (paths) {
+    writePrivate(paths.receipt, receipt);
+    if (env.OWNER_PARITY_MODE === "discovery") writePrivate(paths.discovery, refusedDiscoveryReceipt(env, code));
+  }
+  announce(receipt);
+}
+
 /** Workflow step: pre-credential checks, then pipe the one secret to the credential child. */
 async function parent(): Promise<number> {
   const env = process.env;
-  let receiptPath: string | null = null;
+  let paths: ReturnType<typeof outputPaths> | null = null;
   try {
     // The secret leaves the environment first (git subprocesses below inherit it otherwise).
     const url = env[OWNER_PARITY_SECRET_ENV];
     delete process.env[OWNER_PARITY_SECRET_ENV];
-    const { paths, roster, census } = inputs(env);
-    receiptPath = paths.receipt;
+    const read = inputs(env);
+    paths = read.paths;
+    const { roster, census } = read;
     // Then the credential-free checks (dormant switch, roster, census, confirmation, checkout),
     // and only after those is the value examined.
     const pre = ownerParityPreflight(env, roster, census);
@@ -436,9 +679,7 @@ async function parent(): Promise<number> {
       child.stdin.end(spec.input);
     });
   } catch (error) {
-    const receipt = refusedReceipt(env, ownerParityCode(error));
-    if (receiptPath) writePrivate(receiptPath, receipt);
-    announce(receipt);
+    writeRefused(env, paths, ownerParityCode(error));
     return 1;
   }
 }
@@ -446,10 +687,11 @@ async function parent(): Promise<number> {
 /** Credential child: the URL arrives over stdin only, and every session is fenced. */
 async function operatorChild(): Promise<number> {
   const env = process.env;
-  let receiptPath: string | null = null;
+  let paths: ReturnType<typeof outputPaths> | null = null;
   try {
-    const { paths, roster, census } = inputs(env);
-    receiptPath = paths.receipt;
+    const read = inputs(env);
+    paths = read.paths;
+    const { roster, census } = read;
     refuseOwnerParityCredentialEnv(env);
     const pre = ownerParityPreflight(env, roster, census);
     verifyCheckout(pre.dispatch.sha);
@@ -462,12 +704,20 @@ async function operatorChild(): Promise<number> {
     pinnedPgConfig(supabaseUrl, "supabaseUrl", "supabase");
     const neonUrl = pre.dispatch.censusSource === "neon" ? sessionAffinityUrl(input.neonUrl, "neonUrl", "neon") : null;
     if (neonUrl !== null) pinnedPgConfig(neonUrl, "neonUrl", "neon");
-    const write = pre.dispatch.mode === "write";
+    // Only `write` has a writable target session (OWNER_PARITY_MODE_POLICY); discovery is read-only like census.
+    const write = !OWNER_PARITY_MODE_POLICY[pre.dispatch.mode].readOnly;
+    const discovery = pre.dispatch.mode === "discovery";
+    let discovered: OwnerParityDiscoveryOutcome | null = null;
+    const work = async (sessions: OwnerParitySessions): Promise<OwnerParityOutcome> => {
+      if (!discovery) return runOwnerParity(env, sessions, { roster, census, runId: env.GITHUB_RUN_ID ?? "" });
+      discovered = await runOwnerParityDiscovery(env, sessions, { roster, runId: env.GITHUB_RUN_ID ?? "" });
+      return { receipt: discoveryRunReceipt(discovered.receipt), census: null, exitCode: discovered.exitCode };
+    };
     const run = (source: Queryable) => withParityOwnerSession(
       client(supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-ci-enumerator-readonly"), true, (enumerator) =>
         withParityOwnerSession(
           client(supabaseUrl, "supabaseUrl", "supabase", write ? "owner-buffered-ci-target-owner" : "owner-buffered-ci-target-readonly"),
-          !write, (target) => runOwnerParity(env, { source, enumerator, target }, { roster, census, runId: env.GITHUB_RUN_ID ?? "" })));
+          !write, (target) => work({ source, enumerator, target })));
     let outcome: OwnerParityOutcome;
     if (neonUrl !== null) {
       const neon = await connectNeon(neonUrl);
@@ -483,12 +733,11 @@ async function operatorChild(): Promise<number> {
     }
     writePrivate(paths.receipt, outcome.receipt);
     if (outcome.census) writePrivate(paths.out, outcome.census);
+    if (discovered) writePrivate(paths.discovery, (discovered as OwnerParityDiscoveryOutcome).receipt);
     announce(outcome.receipt);
     return outcome.exitCode;
   } catch (error) {
-    const receipt = refusedReceipt(env, ownerParityCode(error));
-    if (receiptPath) writePrivate(receiptPath, receipt);
-    announce(receipt);
+    writeRefused(env, paths, ownerParityCode(error));
     return 1;
   }
 }
@@ -509,24 +758,16 @@ export const PROOF_ROSTER = {
   tenants: PROOF_TENANTS.slice(0, OWNER_PARITY_EXACT_COUNT).map(tenantSha256),
 };
 
-export interface ProofCase { name: string; pass: boolean; detail?: string }
+/** `'org','workspace','user'` for a fixture tenant (fixture identifiers only; never for real input). */
+export const proofTenantLiteral = (t: ParityTenant) => `'${t.orgId}','${t.workspaceId}','${t.userId}'`;
 
-export async function ownerParityProof(): Promise<{ cases: ProofCase[]; failed: number }> {
-  const { PGlite } = await import("@electric-sql/pglite");
-  const { btree_gin } = await import("@electric-sql/pglite/contrib/btree_gin");
-  const { pg_trgm } = await import("@electric-sql/pglite/contrib/pg_trgm");
-  const { SESSION_BOOTSTRAP_FILES } = await import("../src/hoopdb/session-bootstrap-chain.ts");
-  const { readdirSync } = await import("node:fs");
-  const read = (path: string) => readFileSync(join(ROOT, path), "utf8");
-  const extensions = { btree_gin, pg_trgm };
-  const template = new PGlite({ extensions });
-  await template.exec(read("supabase/tests/supabase_shim.sql"));
-  for (const file of SESSION_BOOTSTRAP_FILES) await template.exec(read(file));
-  for (const file of readdirSync(join(ROOT, "supabase/migrations")).filter((n) => n.endsWith(".sql")).sort())
-    await template.exec(read(`supabase/migrations/${file}`));
-  await template.exec(read("supabase/bootstrap/session_read_api_role.sql").split("\n")
-    .filter((line) => !line.startsWith("\\")).join("\n"));
-  const lit = (t: ParityTenant) => `'${t.orgId}','${t.workspaceId}','${t.userId}'`;
+/**
+ * The synthetic proof seed, applied after the shim, bootstrap chain and migrations: the nine PROOF_TENANTS buffered
+ * with frozen-source state at generation H("4"), frozen completeness and an active privacy authority. Shared by the
+ * PGlite proof and the PostgreSQL discovery snapshot test.
+ */
+export function ownerParityProofSeedSql(): string {
+  const lit = proofTenantLiteral;
   let seed = `CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY,generation text,status text);
     INSERT INTO sessions.__96bulls_role_validation VALUES('session_directory_search_worker','${H("4")}','pass');
     INSERT INTO sessions.ingest_lazy_policy(singleton,baseline_mode,generation,source_identity_sha256,control_epoch,
@@ -559,7 +800,28 @@ export async function ownerParityProof(): Promise<{ cases: ProofCase[]; failed: 
       VALUES(true,'${H("c")}','${H("1")}','${H("2")}',9,0,'${H("e")}','{}'::jsonb);
     INSERT INTO sessions.ingest_privacy_authority(singleton,state,control_epoch,neon_fingerprint_sha256,activated_at)
       VALUES(true,'active','${H("1")}','${H("f")}',clock_timestamp());`;
-  await template.exec(seed);
+  return seed;
+}
+
+export interface ProofCase { name: string; pass: boolean; detail?: string }
+
+export async function ownerParityProof(): Promise<{ cases: ProofCase[]; failed: number }> {
+  const { PGlite } = await import("@electric-sql/pglite");
+  const { btree_gin } = await import("@electric-sql/pglite/contrib/btree_gin");
+  const { pg_trgm } = await import("@electric-sql/pglite/contrib/pg_trgm");
+  const { SESSION_BOOTSTRAP_FILES } = await import("../src/hoopdb/session-bootstrap-chain.ts");
+  const { readdirSync } = await import("node:fs");
+  const read = (path: string) => readFileSync(join(ROOT, path), "utf8");
+  const extensions = { btree_gin, pg_trgm };
+  const template = new PGlite({ extensions });
+  await template.exec(read("supabase/tests/supabase_shim.sql"));
+  for (const file of SESSION_BOOTSTRAP_FILES) await template.exec(read(file));
+  for (const file of readdirSync(join(ROOT, "supabase/migrations")).filter((n) => n.endsWith(".sql")).sort())
+    await template.exec(read(`supabase/migrations/${file}`));
+  await template.exec(read("supabase/bootstrap/session_read_api_role.sql").split("\n")
+    .filter((line) => !line.startsWith("\\")).join("\n"));
+  const lit = proofTenantLiteral;
+  await template.exec(ownerParityProofSeedSql());
   const image = await template.dumpDataDir();
   await template.close();
 
@@ -700,7 +962,81 @@ export async function ownerParityProof(): Promise<{ cases: ProofCase[]; failed: 
       assert(!text.includes(`"${key}"`), "key " + key);
     for (const t of PROOF_TENANTS) assert(!text.includes(t.orgId) && !text.includes(t.userId), "tenant value");
   });
+  await check("discovery: refuses roster_present with a committed roster, before any statement", async () => {
+    const before = log.length;
+    const outcome = await runOwnerParityDiscovery(env("discovery"), sessions(), { roster: PROOF_ROSTER, runId: "401" });
+    assert(outcome.exitCode === 1 && outcome.receipt.code === "roster_present" && outcome.receipt.owners.length === 0,
+      "discovery roster_present: " + outcome.receipt.code);
+    assert(log.length === before, "roster_present touched a session");
+  });
+  await check("discovery: three missing owners refuses unexpected_scope with counts only", async () => {
+    // Discovery reads only its one snapshot session, so it runs on the instance holding the parity rows (the
+    // target): tenant 1 deleted (missing), 2-7 written and unchanged there (current), 8-9 never written.
+    const outcome = await runOwnerParityDiscovery(env("discovery"),
+      { source: queryable(source, log), enumerator: queryable(target, log), target: queryable(target, log) },
+      { roster: { ...PROOF_ROSTER, tenants: [] }, runId: "402" });
+    const k = outcome.receipt.counts;
+    assert(outcome.exitCode === 1 && outcome.receipt.code === "unexpected_scope" && outcome.receipt.owners.length === 0 &&
+      k.scanned === 9 && k.canonicalCurrent === 6 && k.missing === 3 && k.stale === 0, "scope " + JSON.stringify(outcome.receipt));
+    assert(!JSON.stringify(outcome.receipt).includes("tenantSha256"), "digests on refusal");
+  });
   await Promise.all([source.close(), target.close(), enumeratorDb.close()]);
+
+  await check("discovery: read-only snapshot on a fresh image finds exactly seven missing/stale owners and writes nothing", async () => {
+    const setupSource = await open(), setupTarget = await open();
+    let dSource: Db | null = null, dTarget: Db | null = null, dEnumerator: Db | null = null;
+    try {
+      // Setup only (not discovery): canonical rows for tenants 1-3, then tenant 2's frozen source moves (stale).
+      // Both land on the setup target, whose image then backs every discovery session (one database, as in prod).
+      for (const t of PROOF_TENANTS.slice(0, 3))
+        await writeCurrentParityProof(queryable(setupSource), queryable(setupTarget), t, H("4"), "frozen-supabase");
+      const u = PROOF_TENANTS[1]!;
+      await setupTarget.exec(`SET bulls96.privacy_authority_writer='authority';
+        INSERT INTO sessions.ingest_frozen_source_resets(org_id,workspace_id,user_id,request_id,deleted)
+        VALUES(${lit(u)},'request-discovery',1); RESET bulls96.privacy_authority_writer;`).catch(() =>
+        setupTarget.exec(`INSERT INTO sessions.ingest_frozen_source_resets(org_id,workspace_id,user_id,request_id,deleted)
+          VALUES(${lit(u)},'request-discovery',1)`));
+      const discoveryImage = await setupTarget.dumpDataDir();
+      const openDiscovery = () => new PGlite({ extensions, loadDataDir: discoveryImage });
+      [dSource, dTarget, dEnumerator] = await Promise.all([openDiscovery(), openDiscovery(), openDiscovery()]);
+      // Discovery itself runs on sessions where every transaction defaults to read-only.
+      for (const db of [dSource, dTarget, dEnumerator]) await db.exec("SET default_transaction_read_only = on");
+      const dLog: Array<{ sql: string; params: unknown[] }> = [];
+      const sourceLog: Array<{ sql: string; params: unknown[] }> = [], targetLog: Array<{ sql: string; params: unknown[] }> = [];
+      const into = (db: Db, ...logs: Array<Array<{ sql: string; params: unknown[] }>>): Queryable => ({
+        query: async <R>(sql: string, params?: unknown[]) => {
+          for (const l of logs) l.push({ sql, params: params ?? [] });
+          return queryable(db).query<R>(sql, params);
+        },
+      });
+      const outcome = await runOwnerParityDiscovery(env("discovery"), {
+        source: into(dSource, dLog, sourceLog), enumerator: into(dEnumerator, dLog), target: into(dTarget, dLog, targetLog),
+      }, { roster: { ...PROOF_ROSTER, tenants: [] }, runId: "403", now: () => T0 });
+      assert(outcome.exitCode === 0 && outcome.receipt.status === "ok", "discovery not ok: " + JSON.stringify(outcome.receipt));
+      const k = outcome.receipt.counts;
+      assert(k.scanned === 9 && k.canonicalCurrent === 2 && k.missing === 6 && k.stale === 1 && k.unparsable === 0,
+        "counts " + JSON.stringify(k));
+      const byDigest = new Map(outcome.receipt.owners.map((o) => [o.tenantSha256, o.disposition]));
+      assert(byDigest.get(tenantSha256(u)) === "stale" && !byDigest.has(tenantSha256(PROOF_TENANTS[0]!)) &&
+        !byDigest.has(tenantSha256(PROOF_TENANTS[2]!)) &&
+        PROOF_TENANTS.slice(3).every((t) => byDigest.get(tenantSha256(t)) === "missing"), "dispositions");
+      assert(outcome.receipt.generation === H("4") && outcome.receipt.sourceSha === PROOF_SHA, "binding");
+      parseOwnerParityDiscoveryReceipt(JSON.parse(JSON.stringify(outcome.receipt)));
+      assert(!dLog.some((q) => /\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE)\b/iu.test(q.sql)), "discovery issued a write statement");
+      // One snapshot: exactly one BEGIN and one COMMIT, both on the enumerator; source idle; target fence reads only.
+      assert(dLog.filter((q) => q.sql === "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY").length === 1 &&
+        dLog.filter((q) => /^(BEGIN|START|COMMIT|END|ROLLBACK)\b/iu.test(q.sql)).length === 2 &&
+        dLog.filter((q) => q.sql === "COMMIT").length === 1, "not exactly one read-only snapshot");
+      assert(sourceLog.length === 0, "the source session was used");
+      assert(targetLog.length === 2 && targetLog.every((q) => q.sql === BULK_TARGET_GENERATION_SQL), "the target did more than the fence");
+      const rows = (await dEnumerator.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.owner_buffered_parity")).rows[0]!.n;
+      assert(rows === 3, "parity rows changed: " + rows);
+      const text = JSON.stringify(outcome.receipt) + ownerParityDiscoverySummary(outcome.receipt);
+      for (const t of PROOF_TENANTS) assert(!text.includes(t.orgId) && !text.includes(t.workspaceId) && !text.includes(t.userId), "identifier");
+    } finally {
+      await Promise.all([setupSource, setupTarget, dSource, dTarget, dEnumerator].map((db) => db?.close()));
+    }
+  });
   return { cases, failed: cases.filter((x) => !x.pass).length };
 }
 
@@ -718,5 +1054,6 @@ if (import.meta.main) {
     console.log(`owner_buffered_parity_ci_proof ${result.cases.length - result.failed}/${result.cases.length}`);
     process.exit(result.failed ? 1 : 0);
   }
+  if (process.argv.includes(SUMMARY_FLAG)) process.exit(discoverySummary());
   process.exit(process.argv.includes(CHILD_FLAG) ? await operatorChild() : await parent());
 }

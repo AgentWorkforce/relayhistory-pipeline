@@ -16,7 +16,7 @@ import {
   PRESIGN_MAX_SIGNATURE_AGE_MS, presignIssuerUserName, uploadPresignIssuerPolicy,
 } from "../upload-inbox.ts";
 import { UPLOAD_INBOX_SSE_VAR, uploadDirectConfig } from "../../../src/session-ingest/upload-admission.ts";
-import { fenceAuthorityKey, orgFenceAuthorityKey, s3LedgerKeys } from "../../../src/session-ingest/ledger-s3.ts";
+import { fenceAuthorityKey, fenceAuthorityStopKey, orgFenceAuthorityKey, s3LedgerKeys } from "../../../src/session-ingest/ledger-s3.ts";
 import { TENANT_KEY_BASE } from "../tenants.ts";
 
 // Synthetic identifiers only.
@@ -494,6 +494,10 @@ describe("upload-admission consumer (bucket grants on its function role)", () =>
     for (const other of [`${bucketArn}/${TENANT_KEY_BASE}/.ledger/fence-authorityX/org-a.json`, `${bucketArn}/${TENANT_KEY_BASE}/.ledger/org-a.json`, `${bucketArn}/${TENANT_KEY_BASE}/.ledger/fence-authority`])
       expect(allowed([], bucketOn, "s3:GetObject", other, ctx)).toBe(false);
     expect(allowed([], bucketOn, "s3:GetObject", orgMarker, { ...ctx, "aws:PrincipalArn": pipelineRoleArn })).toBe(false);
+    // The deployment-wide stop sits under the same prefix: the existing grant covers it, GET only.
+    const stop = `${bucketArn}/${fenceAuthorityStopKey(TENANT_KEY_BASE)}`;
+    expect(allowed([], bucketOn, "s3:GetObject", stop, ctx)).toBe(true);
+    expect(allowed([], bucketOn, "s3:PutObject", stop, ctx)).toBe(false);
   });
 
   it("the existing promotion grant covers every S3 ledger object (owners, revisions, batches, fence, re-arm): read and write, never delete", () => {

@@ -77,7 +77,10 @@ function world() {
     },
   };
   const deps: Required<OwnerParityDependencies> = {
-    readCensus: (async (_s: unknown, _t: unknown, tenant: ParityTenant) => {
+    readCensus: (async (s: unknown, t: unknown, tenant: ParityTenant, _source: unknown, options?: unknown) => {
+      // Census, write and readback keep readParityCensus's own transactions on the source/target pair; only
+      // discovery may pass the caller-held snapshot option.
+      if (s !== sessions.source || t !== sessions.target || options !== undefined) throw new Error("census read off its own sessions");
       w.statements.push({ sql: "G1", params: [tenant.userId] });
       return g1(tenant);
     }) as never,

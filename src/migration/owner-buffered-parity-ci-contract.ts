@@ -4,7 +4,8 @@
  * scripts/owner-buffered-parity-github.ts; docs/owner-buffered-parity-ci.md).
  *
  * While OWNER_PARITY_WRITE_ENABLED is false, `write` refuses owner_parity_write_dormant before any
- * credential is read; `census` and `readback` (read-only) are always allowed. Enabling write is a
+ * credential is read; `census`, `readback` and the one-time `discovery` (all read-only) are always allowed.
+ * `discovery` runs only while the roster is empty and emits the digests for a separate roster PR. Enabling write is a
  * separate reviewed one-line PR. Tenant tuples are private and never appear here, in a workflow input,
  * log line or artifact: the committed roster holds only the operator's per-tenant digests
  * (tenantSha256 in scripts/owner-buffered-parity-operator.ts). The generation is never an input either:
@@ -29,14 +30,31 @@ export const OWNER_PARITY_RECEIPT_ARTIFACT = "owner-buffered-parity";
 export const OWNER_PARITY_RECEIPT_FILE_NAME = "owner-buffered-parity.json";
 
 /** The workflow's modes. The operator's `bulk` mode is deliberately absent and refused. */
-export const OWNER_PARITY_MODES = ["census", "write", "readback"] as const;
+export const OWNER_PARITY_MODES = ["census", "write", "readback", "discovery"] as const;
 export type OwnerParityMode = (typeof OWNER_PARITY_MODES)[number];
+
+/**
+ * Per-mode dispatch policy. `readOnly` selects the target session (only `write` gets a writable one) and
+ * `roster` selects the roster rule: `seven` is parseOwnerParityRoster (exactly seven digests), `empty` is
+ * requireEmptyOwnerParityRoster (discovery is one-time: it refuses roster_present once a roster exists).
+ */
+export const OWNER_PARITY_MODE_POLICY: Readonly<Record<OwnerParityMode, { readOnly: boolean; roster: "seven" | "empty" }>> =
+  Object.freeze({
+    census: Object.freeze({ readOnly: true, roster: "seven" as const }),
+    write: Object.freeze({ readOnly: false, roster: "seven" as const }),
+    readback: Object.freeze({ readOnly: true, roster: "seven" as const }),
+    discovery: Object.freeze({ readOnly: true, roster: "empty" as const }),
+  });
 export const OWNER_PARITY_CENSUS_SOURCES = ["frozen-supabase", "neon"] as const;
 export type OwnerParityCensusSource = (typeof OWNER_PARITY_CENSUS_SOURCES)[number];
 
 export const OWNER_PARITY_ROSTER_CONTRACT = "owner-buffered-parity-roster/v1";
 export const OWNER_PARITY_CENSUS_CONTRACT = "owner-buffered-parity-census-artifact/v1";
 export const OWNER_PARITY_RECEIPT_CONTRACT = "owner-buffered-parity-ci-receipt/v1";
+export const OWNER_PARITY_DISCOVERY_CONTRACT = "owner-buffered-parity-discovery/v1";
+/** Discovery receipt (retention 30 days): digests and dispositions only on success, counts only on refusal. */
+export const OWNER_PARITY_DISCOVERY_ARTIFACT = "owner-buffered-parity-discovery";
+export const OWNER_PARITY_DISCOVERY_FILE_NAME = "owner-buffered-parity-discovery.json";
 
 const SHA40 = /^[0-9a-f]{40}$/u;
 const HEX64 = /^[0-9a-f]{64}$/u;
@@ -64,7 +82,7 @@ export interface OwnerParityDispatch {
 }
 
 /**
- * Workflow inputs (env OWNER_PARITY_*). Refuses anything but the three modes (so `bulk` is unreachable), a
+ * Workflow inputs (env OWNER_PARITY_*). Refuses anything but the four modes (so `bulk` is unreachable), a
  * non-40-hex sha, an unknown census source, and, while dormant, `write` before any credential is read.
  * `enabled` exists only for the synthetic proof and tests; production callers never pass it.
  */
@@ -107,6 +125,21 @@ export function parseOwnerParityRoster(value: unknown): string[] {
     refuseOwnerParity("roster_invalid");
   if (tenants.length !== OWNER_PARITY_EXACT_COUNT) refuseOwnerParity("roster_incomplete");
   return [...(tenants as string[])];
+}
+
+/**
+ * Discovery's roster rule: the same strict document shape, but it must be empty. Any listed digest refuses
+ * roster_present (discovery is one-time; once a roster exists it is pointless); a malformed document still
+ * refuses roster_invalid.
+ */
+export function requireEmptyOwnerParityRoster(value: unknown): void {
+  try {
+    parseOwnerParityRoster(value);
+  } catch (error) {
+    if (error instanceof OwnerParityCiRefusal && error.code === "roster_empty") return;
+    if (error instanceof OwnerParityCiRefusal && error.code === "roster_invalid") throw error;
+  }
+  refuseOwnerParity("roster_present");
 }
 
 /**
@@ -235,4 +268,117 @@ export function verifyOwnerParityWriteInputs(
     refuseOwnerParity("owner_parity_census_roster_mismatch");
   if (census.tenants.some((t) => t.status !== "equal")) refuseOwnerParity("owner_parity_census_not_equal");
   if (dispatch.confirmation !== ownerParityConfirmation(census)) refuseOwnerParity("owner_parity_confirmation");
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Discovery (read-only, one-time): which buffered owners lack a canonical current parity row.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** The readback vocabulary for an owner without a canonical current row. */
+export type OwnerParityDisposition = "missing" | "stale";
+
+export interface OwnerParityDiscoveryCounts {
+  /** Buffered owners read from the snapshot cursor. */
+  scanned: number;
+  /** Owners whose stored row equals the fresh equal proof (readback `equal`). */
+  canonicalCurrent: number;
+  missing: number;
+  stale: number;
+  /** Cursor rows that are not a valid tenant tuple; any one refuses unexpected_scope. */
+  unparsable: number;
+}
+
+export interface OwnerParityDiscoveryOwner {
+  tenantSha256: string;
+  disposition: OwnerParityDisposition;
+}
+
+export interface OwnerParityDiscoveryReceipt {
+  contract: typeof OWNER_PARITY_DISCOVERY_CONTRACT;
+  status: "ok" | "refused";
+  code?: string;
+  runId: string;
+  sourceSha: string | null;
+  generation: string | null;
+  censusSource: OwnerParityCensusSource | null;
+  counts: OwnerParityDiscoveryCounts;
+  /** Sorted by digest; always empty unless status is ok. */
+  owners: OwnerParityDiscoveryOwner[];
+  capturedAt: string;
+  credentialsPersisted: false;
+}
+
+export function emptyOwnerParityDiscoveryCounts(): OwnerParityDiscoveryCounts {
+  return { scanned: 0, canonicalCurrent: 0, missing: 0, stale: 0, unparsable: 0 };
+}
+
+/**
+ * The live scope must be exactly OWNER_PARITY_EXACT_COUNT missing/stale owners (both dispositions together),
+ * every scanned row classified, and the owner list exactly those distinct digests. Anything else refuses
+ * unexpected_scope; the caller then emits counts only.
+ */
+export function requireOwnerParityDiscoveryScope(
+  counts: OwnerParityDiscoveryCounts,
+  owners: readonly OwnerParityDiscoveryOwner[],
+): void {
+  const missing = owners.filter((o) => o.disposition === "missing").length;
+  if (counts.missing + counts.stale !== OWNER_PARITY_EXACT_COUNT || counts.unparsable !== 0 ||
+      counts.scanned !== counts.canonicalCurrent + counts.missing + counts.stale ||
+      owners.length !== OWNER_PARITY_EXACT_COUNT || new Set(owners.map((o) => o.tenantSha256)).size !== owners.length ||
+      owners.some((o) => !HEX64.test(o.tenantSha256)) || missing !== counts.missing ||
+      owners.length - missing !== counts.stale)
+    refuseOwnerParity("unexpected_scope");
+}
+
+const DISCOVERY_KEYS = ["contract", "status", "runId", "sourceSha", "generation", "censusSource", "counts", "owners",
+  "capturedAt", "credentialsPersisted"];
+const DISCOVERY_COUNT_KEYS = ["canonicalCurrent", "missing", "scanned", "stale", "unparsable"];
+const CODE = /^[A-Za-z0-9_.:,-]{1,160}$/u;
+
+/**
+ * Strict discovery receipt shape (what the job summary step publishes): only the listed keys, hex digests,
+ * the two dispositions, non-negative integer counts, owners only on ok (and then exactly the scope), none on
+ * refusal. Anything else refuses owner_parity_discovery_receipt_invalid.
+ */
+export function parseOwnerParityDiscoveryReceipt(value: unknown): OwnerParityDiscoveryReceipt {
+  const bad = () => refuseOwnerParity("owner_parity_discovery_receipt_invalid");
+  if (value === null || typeof value !== "object" || Array.isArray(value)) bad();
+  const doc = value as Record<string, unknown>;
+  const keys = Object.keys(doc).sort();
+  const expected = (doc.status === "refused" ? [...DISCOVERY_KEYS, "code"] : DISCOVERY_KEYS).sort();
+  if (keys.join(",") !== expected.join(",") || doc.contract !== OWNER_PARITY_DISCOVERY_CONTRACT ||
+      (doc.status !== "ok" && doc.status !== "refused") ||
+      (doc.status === "refused" && (typeof doc.code !== "string" || !CODE.test(doc.code))) ||
+      typeof doc.runId !== "string" || !/^(0|[1-9][0-9]{0,19})$/u.test(doc.runId) ||
+      !(doc.sourceSha === null || (typeof doc.sourceSha === "string" && SHA40.test(doc.sourceSha))) ||
+      !(doc.generation === null || (typeof doc.generation === "string" && HEX64.test(doc.generation))) ||
+      !(doc.censusSource === null || (OWNER_PARITY_CENSUS_SOURCES as readonly unknown[]).includes(doc.censusSource)) ||
+      canonicalMs(doc.capturedAt) === null || doc.credentialsPersisted !== false || !Array.isArray(doc.owners))
+    bad();
+  const counts = doc.counts as Record<string, unknown> | null;
+  if (counts === null || typeof counts !== "object" || Array.isArray(counts) ||
+      Object.keys(counts).sort().join(",") !== DISCOVERY_COUNT_KEYS.join(",") ||
+      Object.values(counts).some((n) => typeof n !== "number" || !Number.isSafeInteger(n) || n < 0))
+    bad();
+  const owners = doc.owners as unknown[];
+  for (const owner of owners) {
+    const o = owner as Record<string, unknown> | null;
+    if (o === null || typeof o !== "object" || Array.isArray(o) || Object.keys(o).sort().join(",") !== "disposition,tenantSha256" ||
+        typeof o.tenantSha256 !== "string" || !HEX64.test(o.tenantSha256) || (o.disposition !== "missing" && o.disposition !== "stale"))
+      bad();
+  }
+  const receipt = doc as unknown as OwnerParityDiscoveryReceipt;
+  if (receipt.status === "refused") {
+    if (owners.length !== 0) bad();
+  } else {
+    if (receipt.sourceSha === null || receipt.generation === null || receipt.censusSource === null) bad();
+    const sorted = [...receipt.owners].map((o) => o.tenantSha256);
+    if (sorted.some((d, i) => i > 0 && sorted[i - 1]! >= d)) bad();
+    try {
+      requireOwnerParityDiscoveryScope(receipt.counts, receipt.owners);
+    } catch {
+      bad();
+    }
+  }
+  return receipt;
 }

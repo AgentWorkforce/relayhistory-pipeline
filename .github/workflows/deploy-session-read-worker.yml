@@ -75,6 +75,14 @@ name: deploy session-read-worker
 # (#339) is enabled. Turning it on is a production change: dispatch is Khaliq's call. Every later
 # dispatch without feature changes preserves the live gate.
 #
+# Brief summaries (src/session-read-api/brief-summary.ts; hosted-Lambda parity), default off.
+# brief_summary=on adds --var READ_API_BRIEF_SUMMARY_ENABLED:true (GET /v1/sessions/:id/summary);
+# list_short_summary=on adds --var READ_API_LIST_SHORT_SUMMARY_ENABLED:true (the GET /v1/sessions
+# includeShortSummary=recorded extension). off (the default) renders neither var, so the Worker
+# answers 501 summary_not_configured / param_includeShortSummary exactly as before these inputs.
+# Neither is preserved from live: once one is on, a later profile/preserve dispatch must repeat
+# it (the live-settings guard refuses a dispatch that would drop it). Dispatch is Khaliq's call.
+#
 # The Worker's own secrets (CLICKHOUSE_URL, CLICKHOUSE_USER, CLICKHOUSE_PASSWORD)
 # are never handled here: they are set with `wrangler secret put` from 1Password
 # and survive deploys. This workflow checks that they exist, by name only.
@@ -132,6 +140,16 @@ on:
         type: choice
         options: ["off", "on"]
         default: "off"
+      brief_summary:
+        description: GET /v1/sessions/:id/summary (READ_API_BRIEF_SUMMARY_ENABLED=true); off = no var, 501 summary_not_configured. Not preserved from live; repeat it on later dispatches
+        type: choice
+        options: ["off", "on"]
+        default: "off"
+      list_short_summary:
+        description: GET /v1/sessions includeShortSummary=recorded (READ_API_LIST_SHORT_SUMMARY_ENABLED=true); off = no var, 501 param_includeShortSummary. Not preserved from live; repeat it on later dispatches
+        type: choice
+        options: ["off", "on"]
+        default: "off"
 permissions:
   contents: read
 concurrency:
@@ -181,6 +199,9 @@ jobs:
       OWNER_BUFFERED_INDEX_VERIFY: ${{ inputs.owner_buffered_index_verify }}
       # Buffered search gate (default off); renders the flag and the pinned binding when on.
       BUFFERED_SEARCH_GATE: ${{ inputs.buffered_search_gate }}
+      # Brief summaries (default off); on adds the exact "true" var on the deploy command only.
+      BRIEF_SUMMARY: ${{ inputs.brief_summary }}
+      LIST_SHORT_SUMMARY: ${{ inputs.list_short_summary }}
     defaults:
       run:
         working-directory: packages/session-read-worker
@@ -215,6 +236,8 @@ jobs:
           # assertion audience (new URL(...).origin). workers.dev is disabled
           # because same-account Worker fetches through it can fail with 1042.
           test "$ORIGIN" = "https://sessions-read.agentrelay.com" || fail "SESSION_READ_ORIGIN must be https://sessions-read.agentrelay.com"
+          case "$BRIEF_SUMMARY" in off|on) ;; *) fail 'brief_summary must be "off" or "on"' ;; esac
+          case "$LIST_SHORT_SUMMARY" in off|on) ;; *) fail 'list_short_summary must be "off" or "on"' ;; esac
           if [ "$COMPLETE_SINCE" != "epoch" ]; then
             node -e 'const t=Date.parse(process.argv[1]);if(!/^\d{4}-\d{2}-\d{2}T/.test(process.argv[1])||Number.isNaN(t))process.exit(1)' "$COMPLETE_SINCE" || fail 'SESSION_READ_COMPLETE_SINCE must be an ISO UTC timestamp or "epoch"'
           fi
@@ -246,12 +269,16 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
         run: |
           bun run scripts/resolve-deploy-profile.ts --check-live-version
+          brief_summary=""; if [ "$BRIEF_SUMMARY" = "on" ]; then brief_summary=true; fi
+          list_short_summary=""; if [ "$LIST_SHORT_SUMMARY" = "on" ]; then list_short_summary=true; fi
           bunx wrangler deploy --config wrangler.deploy.jsonc \
             --var "READ_API_ORIGIN:$ORIGIN" \
             --var "READ_API_COMPLETE_SINCE:$COMPLETE_SINCE" \
             ${DIRECTORY_WORKSPACES:+--var "READ_API_DIRECTORY_WORKSPACES:$DIRECTORY_WORKSPACES"} \
             ${BRIEF_TITLES_WORKSPACES:+--var "READ_API_BRIEF_TITLES_WORKSPACES:$BRIEF_TITLES_WORKSPACES"} \
             ${TIMING_ASSUME_NO_TURNS:+--var "READ_API_TIMING_ASSUME_NO_TURNS:$TIMING_ASSUME_NO_TURNS"} \
+            ${brief_summary:+--var "READ_API_BRIEF_SUMMARY_ENABLED:$brief_summary"} \
+            ${list_short_summary:+--var "READ_API_LIST_SHORT_SUMMARY_ENABLED:$list_short_summary"} \
             --message "96BullSessions ${GITHUB_SHA}"
       - name: Check the Worker's secrets exist (names only)
         env:

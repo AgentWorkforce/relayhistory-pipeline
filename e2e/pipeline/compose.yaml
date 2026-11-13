@@ -1,0 +1,108 @@
+# The full-pipeline e2e stack (`bun run e2e:pipeline`, docs/pipeline-e2e.md), layered over
+# e2e/selfhost/compose.yaml. Everything the self-host acceptance test runs, plus:
+#   session-ingest-s3   the same ingest with INGEST_LEDGER=s3 (decision 0005), fence authority required
+#   locker-init-hoop    the AlleyOop bucket
+#   alleyoop-ingest, hoopdb-indexer, referee, bob-costas
+#                       the courier pipeline of the local stack (docs/local-stack.md "What runs"),
+#                       Bob Costas on the extractive summariser (BOB_COSTAS_MODEL=off: no model calls)
+# and loopback-only, ephemeral host ports for MinIO and AlleyOop so the driver can assert storage.
+# Every credential is generated per run by e2e/pipeline/stack.ts and passed in the environment.
+x-services-image: &services-image
+  image: ${E2E_IMAGE:-96bulls/services:e2e}
+x-hoop-env: &hoop-env
+  HOOPDB_URL: postgresql://postgres:${E2E_PG_PASSWORD:?}@db:5432/postgres
+  LOCKER_ENDPOINT: http://minio:9000
+  LOCKER_BUCKET: locker
+  LOCKER_PROVIDER: s3
+  LOCKER_REGION: us-east-1
+  LOCKER_ACCESS_KEY_ID: ${E2E_MINIO_USER:?}
+  LOCKER_SECRET_ACCESS_KEY: ${E2E_MINIO_PASSWORD:?}
+  TENANT_ORG_ID: org_hoop
+  WORKSPACE_ID: ws_hoop
+  DEPLOYMENT: selfhost
+  DEPLOYMENT_ID: e2e-pipeline
+  ENVIRONMENT: local
+  WORKER_HEALTH_PORT: "8081"
+services:
+  minio:
+    ports: ["127.0.0.1::9000"]
+  session-ingest-s3:
+    <<: *services-image
+    environment:
+      SESSION_POSTGRES_TLS_PROFILE: custom-ca
+      SESSION_POSTGRES_CA_FILE: /certs/ca.crt
+      SESSION_POSTGRES_CA_SHA256: ${E2E_CA_SHA256:?}
+      ALLOW_IN_CLUSTER_HTTP: "true"
+      LOCKER_BUCKET: transcripts
+      LOCKER_PROVIDER: s3
+      LOCKER_ENDPOINT: http://minio:9000
+      LOCKER_REGION: us-east-1
+      LOCKER_ACCESS_KEY_ID: ${E2E_MINIO_USER:?}
+      LOCKER_SECRET_ACCESS_KEY: ${E2E_MINIO_PASSWORD:?}
+      PIPELINE_KEY_PREFIX: 96bulls
+      PIPELINE_ORG_FROM_PREFIX: "true"
+      RELAYCONTROL_INTROSPECT_URL: http://control.e2e.svc:8090
+      RELAYCONTROL_INTROSPECT_SECRET: ${E2E_INTROSPECT_SECRET:?}
+      SERVICE: session-ingest
+      RELAYHISTORY_SELFHOST_INGEST: "true"
+      RELAYHISTORY_INGEST_PORT: "8081"
+      RELAYHISTORY_INGEST_ORIGIN: https://history.e2e.test
+      RELAYHISTORY_INGEST_DATABASE_URL: postgresql://bulls96_session_ingest:${E2E_INGEST_PASSWORD:?}@db:5432/postgres
+      INGEST_LEDGER: s3
+    volumes:
+      - ${E2E_CERTS_DIR:?}:/certs:ro
+    ports: ["127.0.0.1::8081"]
+    depends_on:
+      roles: { condition: service_completed_successfully }
+      control-stub: { condition: service_started }
+      # The S3 ledger proves conditional writes against the bucket at startup, so the bucket must exist first.
+      locker-init: { condition: service_completed_successfully }
+    restart: on-failure:5
+  locker-init-hoop:
+    <<: *services-image
+    environment:
+      <<: *hoop-env
+      SERVICE: locker-init
+    depends_on: [minio]
+    restart: "no"
+  alleyoop-ingest:
+    <<: *services-image
+    environment:
+      <<: *hoop-env
+      SERVICE: alleyoop-ingest
+      INGEST_PORT: "8080"
+      JWKS_JSON: ${E2E_JWKS_JSON:?}
+      AUTH_ISSUER: https://96bulls.e2e
+      # Local fixture auth only, as the local stack: tokens are minted from this run's own key.
+      ALLOW_INTERIM_RELAYAUTH_BEARER: "true"
+    ports: ["127.0.0.1::8080"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      locker-init-hoop: { condition: service_completed_successfully }
+    restart: on-failure:5
+  hoopdb-indexer:
+    <<: *services-image
+    environment:
+      <<: *hoop-env
+      SERVICE: hoopdb-indexer
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    restart: on-failure:5
+  referee:
+    <<: *services-image
+    environment:
+      <<: *hoop-env
+      SERVICE: referee
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    restart: on-failure:5
+  bob-costas:
+    <<: *services-image
+    environment:
+      <<: *hoop-env
+      SERVICE: bob-costas
+      BOB_COSTAS_MODEL: "off"
+      SUMMARY_MASTER_KEYS: ${E2E_SUMMARY_MASTER_KEYS:?}
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    restart: on-failure:5

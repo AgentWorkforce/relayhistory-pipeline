@@ -89,7 +89,7 @@ No database URL is exposed to install/check-out/download/upload steps. Only the 
 
 When a release holds steps, target_sha is never a generated worktree or an arbitrary main commit: it is the immutable tip of a protected branch `release/schema-<slot>` (src/hoopdb/schema-release-contract.ts releaseAnchorBranch). An upstream target `upstream:YYYYMMDDnnnnnn_name.sql` uses `release/schema-nnnnnn`; a history-lane target `96bulls:NNNN_name.sql` uses `release/schema-96bulls-NNNN`. A slot the release tree names twice (6-digit slots repeat across dates) cannot anchor. src/hoopdb/release-target.ts requireReleaseAnchor and releaseAnchorBinding check it from the local Git object database only; scripts/schema-release-github.ts checks the GitHub side. Plan, bootstrap and apply all recompute it before connecting, and apply recomputes it again under the migrator lock (beforeWrite).
 
-**Ref.** The plan, bootstrap and apply jobs check out full history (fetch-depth: 0), which brings every branch in as `refs/remotes/origin/<branch>`. The exact ref `refs/remotes/origin/release/schema-<slot>` must exist and its tip must be the commit target_sha (a tag, a local branch or another namespace does not count). On GitHub the branch must exist, point at target_sha and be protected, and its own latest **push** ci and pg-proof runs (filtered to that branch) must be completed and successful at target_sha, with every job green. ci.yml and pg-proof.yml run on pushes to `release/schema-*` for this.
+**Ref.** The plan, bootstrap and apply jobs check out full history (fetch-depth: 0), which brings every branch in as `refs/remotes/origin/<branch>`. The exact ref `refs/remotes/origin/release/schema-<slot>` must exist and its tip must be the commit target_sha (a tag, a local branch or another namespace does not count). On GitHub the branch must exist, point at target_sha and be protected, and its own latest **push** ci and pg-proof runs (filtered to that branch) must be completed and successful at target_sha, with every job green. ci.yml and pg-proof.yml run on pushes to `release/schema-*` for this; an anchor on an older main base carries that trigger itself (see Workflow files below).
 
 **Chain.** Each anchor commit has exactly one parent. Walking first parents from target_sha, every commit before main is the tip of a lower `release/schema-<slot>` anchor (strictly lower in migrator order), at most 64 levels; the first main commit reached (on the release sha's first-parent history) is the **main base**. target_sha itself must not be a main commit.
 
@@ -103,6 +103,16 @@ When a release holds steps, target_sha is never a generated worktree or an arbit
 
 Nothing else (tests, docs, runtime code outside that list) may differ from the main base.
 
+**Workflow files.** A push runs the workflow files of the pushed tree, so an anchor whose main base predates 42797f3c (for example 113dc657, where ci.yml and pg-proof.yml run on `push: branches: [main]` only) gets no release/schema-* push run unless it carries the trigger itself. The anchor may therefore also change `.github/workflows/ci.yml` and `.github/workflows/pg-proof.yml`, and only as releaseAnchorWorkflowTransform (src/hoopdb/release-target.ts) of the main base's own bytes: the base must contain the line `    branches: [main]` exactly once, directly under `  push:` in the top-level `on:` block, and that one line is replaced by the three lines main's 42797f3c added:
+
+```
+    # release/schema-*: the protected release anchor branches (a held-step target_sha
+    # needs green push runs on its own branch; scripts/schema-release-github.ts).
+    branches: [main, 'release/schema-*']
+```
+
+Every other byte stays the main base's (jobs, permissions, actions, runners, paths, events, line endings). Both files must be mode 100644 at the main base and target_sha. These two files are compared with the main base, not the release sha. No other `.github/workflows/` file may differ. To build it, apply main's hunk: `git show 42797f3c -- .github/workflows/ci.yml .github/workflows/pg-proof.yml | git apply --index` on the main base (it applies cleanly to 113dc657 and yields exactly the transform). A main base that already runs on release/schema-* needs no workflow change; any change to its workflow files refuses.
+
 **Prefix.** The release sha's own tree must prove the same ordered prefix through the target (every release step of the target's lane up to the target, the same names and sha256 in migrator order), and target_sha's tree must hold exactly that prefix with no step above the target in its lane (release_target_tail, release_target_tree_mismatch). The generation is the prefix plus target_sha's verifiers; phase 2 runs target_sha's verifiers from the object database and the PASS marker is written only for that generation. Held steps are never applied or ledgered.
 
 **Refusal codes** (all fail closed before connecting, or before the first write under the lock):
@@ -114,12 +124,13 @@ Nothing else (tests, docs, runtime code outside that list) may differ from the m
 - `release_anchor_nonlinear`: an anchor commit has zero or several parents.
 - `release_anchor_extra_file`: the anchor changes a path outside the allowlist.
 - `release_anchor_file_drift`: an anchor path (or a bootstrap chain file) differs from the release sha's bytes or mode.
+- `release_anchor_workflow_drift`: the anchor changes ci.yml or pg-proof.yml to anything but the transform of the main base's bytes (including a copy from main, any other change, deletion or a mode other than 100644), the main base lacks the main-only push selector in its documented form, or the anchor changes any other `.github/workflows/` file.
 - `release_anchor_prefix_mismatch`: the release sha's tree does not prove the prefix through the target.
 
 Existing codes also apply: release_target_sha_unknown (unreadable or shallow history), release_target_verifier_missing, release_target_tail, release_target_tree_mismatch, release_target_ci and release_target_ci_jobs (anchor branch CI).
 
 **Operator steps.**
-1. Create the anchor commit off the main base (or off the lower anchor tip) with exactly one parent, carrying only allowlisted paths at the release sha's bytes. Never generate it in a worktree and dispatch the result.
+1. Create the anchor commit off the main base (or off the lower anchor tip) with exactly one parent, carrying only allowlisted paths at the release sha's bytes (and, when the main base's ci.yml and pg-proof.yml run on main pushes only, the workflow transform above). Never generate it in a worktree and dispatch the result.
 2. Push it as `release/schema-<slot>` through the authorized integration process and protect the branch (no force-push, no deletion) before the plan. Wait for its push ci and pg-proof to be green.
 3. Dispatch plan, bootstrap (when needed) and apply with target_sha = the anchor tip. Never move the branch between plan and apply; a moved branch refuses and needs a new plan.
 

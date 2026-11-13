@@ -2,6 +2,10 @@
 *.log
 .96bulls/
 .alchemy/
+# Flow reports and the flows daemon's data (flows/, docs/maintainer-workflow.md).
+.relayflow/
+.relayflowd/
+flows/.claude/
 # Rehearsal tooling checkout (.github/workflows/rehearse-session-schema.yml).
 .rehearsal-tooling/
 .env

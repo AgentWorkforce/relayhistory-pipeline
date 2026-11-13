@@ -28,9 +28,10 @@ function build(actions: Record<string, string>, blocks: Record<string, string[]>
   const detailed = `${summary}\n${resources.map((r) => [`[${r}] ${actions[r] ?? "noop"}`, ...(blocks[r] ?? [])].join("\n")).join("\n")}\n`;
   return { compact, detailed };
 }
-function check(actions: Record<string, string>, blocks: Record<string, string[]> = {}, snapshotRole: string | null = ROLE, resources = all) {
+function check(actions: Record<string, string>, blocks: Record<string, string[]> = {}, snapshotRole: string | null = ROLE, resources = all, uploadInputs?: Record<string, unknown>) {
   const { compact, detailed } = build(actions, blocks, resources);
   return assertTranscriptStorePlanContract(compact, {
+    ...(uploadInputs ? { uploadInputs } : {}),
     detailedPlanText: detailed,
     provenanceText: JSON.stringify({
       schema: 1,
@@ -127,11 +128,18 @@ describe("upload inbox update", () => {
 describe("presign-only upload inbox (uploadPresignIssuer, no uploadControlRoleArn): no desktop-upload-role", () => {
   const presignOnly = [...store, ...SESSION_PIPELINE_RESOURCES, ...UPLOAD_INBOX_RESOURCES.filter((r) => r !== "desktop-upload-role"), "upload-presign-issuer"];
   const grants = { transcripts: "update", "transcripts-key": "update", "transcript-writer": "update", "transcript-reader": "update", "transcript-srv-writer": "update" };
+  const issuerInputs = { uploadPresignIssuer: true };
   it("the rollout accepts the resource set without the role, the issuer created with it", () => {
     const creates = Object.fromEntries(presignOnly.filter((r) => (UPLOAD_INBOX_RESOURCES as readonly string[]).includes(r) || r === "upload-presign-issuer").map((r) => [r, "create"]));
-    expect(check({ ...creates, ...grants }, {}, ROLE, presignOnly)).toBe("upload inbox rollout");
-    expect(check({}, {}, ROLE, presignOnly)).toBe("post-apply");
-    expect(check({ "upload-admission": "update" }, {}, ROLE, presignOnly)).toBe("upload inbox update");
+    expect(check({ ...creates, ...grants }, {}, ROLE, presignOnly, issuerInputs)).toBe("upload inbox rollout");
+    expect(check({}, {}, ROLE, presignOnly, issuerInputs)).toBe("post-apply");
+    expect(check({ "upload-admission": "update" }, {}, ROLE, presignOnly, issuerInputs)).toBe("upload inbox update");
+  });
+  it("only when the stage's inputs really have uploadControlRoleArn unset and uploadPresignIssuer true", () => {
+    for (const bad of [undefined, {}, { uploadPresignIssuer: true, uploadControlRoleArn: `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:role/control` }, { uploadPresignIssuer: "true" }])
+      expect(() => check({}, {}, ROLE, presignOnly, bad)).toThrow(/without desktop-upload-role, but the inputs do not have uploadPresignIssuer true with uploadControlRoleArn unset/);
+    // The role-shaped plan needs no inputs (unchanged).
+    expect(check({}, {}, ROLE, all)).toBe("post-apply");
   });
   it("without the role AND without the issuer, the plan still misses desktop-upload-role", () => {
     const neither = presignOnly.filter((r) => r !== "upload-presign-issuer");
