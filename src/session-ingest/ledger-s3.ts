@@ -11,7 +11,8 @@
  *       pending -> committed with If-Match. Same digest committed: replay. Same digest pending: resume
  *       (a new claim token and fence snapshot, If-Match). Other digest: batch_conflict.
  *   ledger/revisions/o=<h(origin)>/r=<shard>.json   the revision index, PER ORIGIN (as ingest_record_revisions'
- *       key (org, ws, origin, record_id) and the reader's per-origin fold), sharded by sha256(recordId):
+ *       key (org, ws, origin, record_id) and the reader's per-origin fold), sharded 4096 ways by sha256(recordId)
+ *       (REVISION_SHARDS; three hex digits, so a superseded two-digit shard never shares a key):
  *       {v, originId, shard, records: {<recordId>: [revision, revisionId, digest, sessionKey | null, epoch, resets]}}
  *       Each entry carries the session it was written under and that session's generation, so a disable or a
  *       reset forgets it without rewriting it (IndexEntry). Read at claim (an equal or lower stored revision of
@@ -110,10 +111,23 @@ const h = (v: string) => sha256Hex(v).slice(0, 32);
  */
 export const sessionKeyHash = (source: string, sessionId: string) => h(JSON.stringify([source, sessionId]));
 
-/** The revision index is sharded per origin by sha256(recordId)'s first byte, mod this. */
-export const REVISION_SHARDS = 64;
-export const revisionShard = (recordId: string) => (createHash("sha256").update(recordId).digest()[0]! % REVISION_SHARDS).toString(16).padStart(2, "0");
-const SHARD = /^[0-9a-f]{2}$/;
+/**
+ * The revision index is sharded per origin by sha256(recordId)'s first 12 bits: 4096 shards, named by three hex
+ * digits. A shard holds every record of the origin that hashes to it, so its size grows with the origin's whole
+ * history: at 64 shards a 210k-record origin had ~660 KB shards, and every 100-record batch read and rewrote ~51
+ * of them (~100 MB per admission). At 4096 the same origin has ~10 KB shards and a batch touches about one shard
+ * per record. Shards of the 64-shard layout (two hex digits, LEGACY_REVISION_SHARDS) are never read; the one-time
+ * `scripts/ledger-reshard-revisions.ts` merges them into this layout.
+ */
+export const REVISION_SHARDS = 4096;
+export const revisionShard = (recordId: string) => {
+  const d = createHash("sha256").update(recordId).digest();
+  return (((d[0]! << 8) | d[1]!) % REVISION_SHARDS).toString(16).padStart(3, "0");
+};
+const SHARD = /^[0-9a-f]{3}$/;
+/** The superseded 64-shard layout (`r=<2 hex>.json`, sha256(recordId)[0] % 64): read only by the reshard. */
+export const LEGACY_REVISION_SHARDS = 64;
+export const LEGACY_SHARD_KEY = /\/ledger\/revisions\/o=([0-9a-f]{32})\/r=([0-9a-f]{2})\.json$/;
 
 export function s3LedgerKeys(keyRoot: string, tenant: LedgerTenant) {
   const dir = admissionUserDir(keyRoot, tenant);
@@ -336,6 +350,11 @@ export function validBatch(v: unknown): v is BatchDoc {
 }
 const entryOk = (r: unknown): r is IndexEntry => Array.isArray(r) && r.length === 6 && Number.isSafeInteger(r[0]) && (r[0] as number) >= 1 && (r[1] === null || str(r[1]))
   && (r[2] === null || (typeof r[2] === "string" && HEX64.test(r[2]))) && (r[3] === null || (typeof r[3] === "string" && HEX32.test(r[3]))) && count(r[4]) && count(r[5]);
+/** A shard of the superseded 64-shard layout (two hex digits), as the reshard reads it. */
+export function validLegacyIndex(v: unknown): v is IndexDoc {
+  return isObject(v) && v.v === 1 && str(v.originId) && typeof v.shard === "string" && /^[0-9a-f]{2}$/.test(v.shard) && isObject(v.records)
+    && Object.values(v.records).every(entryOk);
+}
 export function validIndex(v: unknown): v is IndexDoc {
   return isObject(v) && v.v === 1 && str(v.originId) && typeof v.shard === "string" && SHARD.test(v.shard) && isObject(v.records)
     && Object.values(v.records).every(entryOk); // record ids are read with own() and Maps only, so any id is a plain key
@@ -389,6 +408,8 @@ export function newFence(newId: () => string = randomUUID): FenceDoc {
 /** What a missing fence means to ADMISSION (claim / commit) only: nothing deleted, never reset. Never written. */
 const ABSENT_VIEW: FenceDoc = Object.freeze({ v: 1, instance: "", version: 0, resets: 0, resetsCompleted: 0, lastResetAtMs: 0, deleted: {}, epochs: {}, resetRequests: {} }) as FenceDoc;
 const admissionView = (read: FenceRead): FenceDoc => (read.state === "present" ? read.fence : ABSENT_VIEW);
+/** The fence an admission judges by: the stored one, or the empty view of an absent fence (exported for the reshard). */
+export const admissionFenceView = admissionView;
 const instanceOf = (read: FenceRead): string | null => (read.state === "present" ? read.fence.instance : null);
 
 /** A session's current epoch in the fence (0 when it never had one). */
@@ -545,6 +566,13 @@ export interface S3LedgerOptions {
   /** CAS attempts per object before `ledger_*_contended` (default 8, as the manifest and the journal). */
   casAttempts?: number;
   /**
+   * Ledger requests one claim or commit runs at once: revision-index shard reads and merges, ownership stubs and
+   * re-arm markers (default 6, a Cloudflare Worker's concurrent-connection budget). Different shard objects never
+   * order against each other (each merge is its own CAS), so this changes latency only. Self-host and the hosted
+   * Lambda, which have no such budget, use SERVER_LEDGER_PARALLEL. 1..64.
+   */
+  parallel?: number;
+  /**
    * "required": every claim first checks `<keyRoot>/.ledger/fence-authority.json` (FenceAuthorityDoc) and
    * answers a retry (`ledger_fence_authority_missing` / `_invalid`) without it. The hosted Lambda always sets
    * it; self-host always sets it with INGEST_LEDGER=s3 (every admission path). Controls are never gated.
@@ -573,6 +601,12 @@ export interface S3LedgerOptions {
 }
 
 const PARALLEL = 6;
+/**
+ * `parallel` for a server process (self-host ingest-edge, the hosted upload-admission Lambda): a 100-record batch
+ * falls in ~100 of the 4096 index shards, so at 6 its reads and merges take ~17 sequential waves each; at 32, ~4.
+ * Shards are ~10 KB, so this many in flight costs little memory (scripts/bench/s3-ledger-admission.ts).
+ */
+export const SERVER_LEDGER_PARALLEL = 32;
 /** Reset: ownership stubs read at once per LIST page. */
 const RESET_READS = 8;
 
@@ -609,6 +643,8 @@ export function checkIndexEntryInput(r: IndexEntryInput): void {
 export function s3LedgerObjects(store: ObjectStore, keyRoot: string, opts: Omit<S3LedgerOptions, "acceptanceMode" | "newToken" | "fenceAuthority" | "fenceAuthorityTtlMs"> & { newFenceId?: () => string } = {}) {
   const attempts = opts.casAttempts ?? 8;
   if (!Number.isSafeInteger(attempts) || attempts < 1 || attempts > 64) throw new LedgerUnavailableError("ledger_s3_options_refused");
+  const parallel = opts.parallel ?? PARALLEL;
+  if (!Number.isSafeInteger(parallel) || parallel < 1 || parallel > 64) throw new LedgerUnavailableError("ledger_s3_options_refused");
   const nowMs = opts.nowMs ?? Date.now;
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
   const random = opts.random ?? Math.random;
@@ -654,7 +690,7 @@ export function s3LedgerObjects(store: ObjectStore, keyRoot: string, opts: Omit<
         : r.revisionId !== null && byteCompare(r.revisionId, cur.revisionId) < 0));
       if (better) best.set(r.recordId, r);
     }
-    const shard = /\/r=([0-9a-f]{2})\.json$/.exec(key)?.[1];
+    const shard = /\/r=([0-9a-f]{3})\.json$/.exec(key)?.[1];
     if (!shard) throw new LedgerUnavailableError("ledger_input_refused");
     for (const r of best.values()) if (revisionShard(r.recordId) !== shard) throw new LedgerUnavailableError("ledger_input_refused");
     for (let attempt = 0; attempt < attempts; attempt++) {
@@ -757,13 +793,13 @@ export function s3LedgerObjects(store: ObjectStore, keyRoot: string, opts: Omit<
     return out;
   }
 
-  return { attempts, backoff, nowMs, keysFor, readFence, editFence, readIndex, mergeIndex, readOwner, registerOwner, listOwners, writeRearm, readBatch };
+  return { attempts, parallel, backoff, nowMs, keysFor, readFence, editFence, readIndex, mergeIndex, readOwner, registerOwner, listOwners, writeRearm, readBatch };
 }
 
 export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOptions = {}): Ledger {
   if (opts.acceptanceMode === "buffered") throw new LedgerUnavailableError("ledger_s3_mode_refused");
   const io = s3LedgerObjects(store, keyRoot, opts);
-  const { attempts, backoff, nowMs, keysFor, readFence, editFence, readIndex, mergeIndex, readOwner, registerOwner, writeRearm } = io;
+  const { attempts, parallel, backoff, nowMs, keysFor, readFence, editFence, readIndex, mergeIndex, readOwner, registerOwner, writeRearm } = io;
   const newToken = opts.newToken ?? randomUUID;
   const claimCompletesResets = opts.claimCompletesResets ?? true;
   const authorityTtl = opts.fenceAuthorityTtlMs ?? 60_000;
@@ -816,19 +852,27 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
     return [...all.values()].sort(pairCompare);
   }
 
-  /** Claim steps (b) and (c): the deletion filter, then #250's revision rules over the origin's stored index. */
-  async function judge(input: ClaimInput, keys: ReturnType<typeof s3LedgerKeys>, fence: FenceDoc) {
-    const fenced = new Set(admissionDeletedPairs(fence, input.originId).map(([s, id]) => pairId(s, id)));
-    const deleted = batchPairs(input.sessions, input.records).filter(([s, id]) => fenced.has(pairId(s, id)));
-    const deletedSet = new Set(deleted.map(([s, id]) => pairId(s, id)));
-    const live = input.records.map((r, ord) => ({ ...r, ord })).filter((r) => r.sessionId === null || !deletedSet.has(pairId(r.source, r.sessionId)));
-    const shardKeys = [...new Set(live.map((r) => keys.revisions(input.originId, r.recordId)))];
-    const loaded = await mapLimit(shardKeys, PARALLEL, async (k) => {
+  /**
+   * The revision-index shards every record of the batch falls in (a superset of what judge needs: records of a
+   * session the fence deletes are read too, and ignored), so they can be read at the same time as the batch record
+   * and the fence. Reads only: what judge decides still depends on the fence read of the same attempt.
+   */
+  async function readShards(input: ClaimInput, keys: ReturnType<typeof s3LedgerKeys>): Promise<Map<string, IndexDoc["records"]>> {
+    const shardKeys = [...new Set(input.records.map((r) => keys.revisions(input.originId, r.recordId)))];
+    const loaded = await mapLimit(shardKeys, parallel, async (k) => {
       const doc = (await readIndex(k))?.doc;
       if (doc && doc.originId !== input.originId) throw new LedgerUnavailableError("ledger_revision_index_invalid");
       return [k, doc?.records ?? {}] as const;
     });
-    const shards = new Map(loaded.map(([k, recs]) => [k, recs]));
+    return new Map(loaded.map(([k, recs]) => [k, recs]));
+  }
+
+  /** Claim steps (b) and (c): the deletion filter, then #250's revision rules over the origin's stored index. */
+  function judge(input: ClaimInput, keys: ReturnType<typeof s3LedgerKeys>, fence: FenceDoc, shards: Map<string, IndexDoc["records"]>) {
+    const fenced = new Set(admissionDeletedPairs(fence, input.originId).map(([s, id]) => pairId(s, id)));
+    const deleted = batchPairs(input.sessions, input.records).filter(([s, id]) => fenced.has(pairId(s, id)));
+    const deletedSet = new Set(deleted.map(([s, id]) => pairId(s, id)));
+    const live = input.records.map((r, ord) => ({ ...r, ord })).filter((r) => r.sessionId === null || !deletedSet.has(pairId(r.source, r.sessionId)));
     // Per (origin, record id), whichever session stored it; an entry the fence has forgotten counts as absent.
     const storedOf = (r: (typeof live)[number]) => {
       const e = own(shards.get(keys.revisions(input.originId, r.recordId))!, r.recordId);
@@ -1020,15 +1064,23 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       await requireFenceAuthority(input.tenant.orgId);
       const batchKey = keys.batch(input.originId, input.batchId);
       for (let attempt = 0; attempt < attempts; attempt++) {
+        // (a), (b) and (c) read at once: the batch record, the fence and the index shards of the batch's records.
+        // Independent reads (the claim's own CAS below, and the commit's fence recheck, decide), so only the
+        // latency changes. Settled before any result is used, so a failure is answered in the same order as
+        // sequential reads would: the batch record's first, then the fence's, then the shards'.
+        const [storedR, readR, shardsR] = await Promise.allSettled([
+          readDoc(store, batchKey, validBatch, "ledger_batch_record_invalid"), readFence(keys.fence), readShards(input, keys)]);
+        if (storedR.status === "rejected") throw storedR.reason;
+        const stored = storedR.value;
         // (a) A known batch id: its receipt, a resume, or a batch-id 409.
-        const stored = await readDoc(store, batchKey, validBatch, "ledger_batch_record_invalid");
         if (stored) {
           if (stored.doc.originId !== input.originId || stored.doc.batchId !== input.batchId) throw new LedgerUnavailableError("ledger_batch_record_invalid");
           if (stored.doc.digest !== input.batchDigest) return { kind: "batch_conflict", currentDigest: stored.doc.digest };
           if (stored.doc.state === "committed") return { kind: "replay", receiptId: stored.doc.receiptId };
         }
         // (b) + (c): the fence, then the stored revisions of what is left.
-        const read = await readFence(keys.fence);
+        if (readR.status === "rejected") throw readR.reason;
+        const read = readR.value;
         const fence = admissionView(read);
         // An ordered reset SQL has not decided yet (s3ControlMirror): no claim until its verdict lands (fail closed).
         if (hasPendingReset(fence)) throw new LedgerUnavailableError("ledger_control_pending");
@@ -1041,7 +1093,8 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
           try { await finishResets(keys); finished = true; } catch (error) { if (!(error instanceof LedgerUnavailableError)) throw error; }
           if (finished) { await backoff(attempt); continue; }
         }
-        const judged = await judge(input, keys, fence);
+        if (shardsR.status === "rejected") throw shardsR.reason;
+        const judged = judge(input, keys, fence, shardsR.value);
         if (judged.twins > 0) return { kind: "revision_conflict", conflicts: judged.conflicts, count: judged.twins };
         const pairs = batchPairs(input.sessions, input.records);
         if (!judged.fast) {
@@ -1049,7 +1102,7 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
           // lists these sessions. Then the fence again: if it moved meanwhile (a reset could have listed before
           // the stubs landed), claim again under the new fence rather than carry a generation it outran.
           const live = pairs.filter(([s, id]) => !judged.deletedSet.has(pairId(s, id)));
-          await mapLimit(live, PARALLEL, ([s, id]) => {
+          await mapLimit(live, parallel, ([s, id]) => {
             const [, epoch, resets] = recordGeneration(fence, input.originId, s, id);
             return registerOwner(keys.owner(input.originId, s, id), { v: 1, originId: input.originId, source: s, sessionId: id, epoch, resets,
               machineId: liveMachineId(input.tenant.workspaceId, input.originId, input.tenant.userId) });
@@ -1089,7 +1142,11 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       // The re-arm marker names the canonical prefix the sweeper erases: only this tenant's own writer machine.
       if (input.machineId !== liveMachineId(input.tenant.workspaceId, input.originId, input.tenant.userId)) throw new LedgerUnavailableError("ledger_input_refused");
       const batchKey = keys.batch(input.originId, input.batchId);
-      const stored = await readDoc(store, batchKey, validBatch, "ledger_batch_record_invalid");
+      // The batch record and the fence read at once. Both reads follow the canonical writes (the caller commits
+      // only after them), which is all the fence recheck needs; a batch-record failure is answered first.
+      const [storedR, fenceR] = await Promise.allSettled([readDoc(store, batchKey, validBatch, "ledger_batch_record_invalid"), readFence(keys.fence)]);
+      if (storedR.status === "rejected") throw storedR.reason;
+      const stored = storedR.value;
       if (!stored || stored.doc.digest !== input.batchDigest || stored.doc.originId !== input.originId || stored.doc.batchId !== input.batchId)
         throw new LedgerUnavailableError("ledger_no_claim");
       if (stored.doc.claimToken !== input.claimToken) throw new LedgerUnavailableError("ledger_attempt_superseded");
@@ -1115,7 +1172,7 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       // (rearm-sweeper.ts derivedMachine). `input.machineId` was checked against the tenant above. The stub keeps its
       // generation (registerOwner); one missing is written at the claim's. Distinct raw workspace ids never share a stub
       // (admissionUserDir hashes the RAW id), so a machine conflict here is a corrupt or forged stub, which it refuses.
-      const rearm = (list: [string, string][]) => mapLimit(list, PARALLEL, async ([s, id]) => {
+      const rearm = (list: [string, string][]) => mapLimit(list, parallel, async ([s, id]) => {
         const sk = sessionKeyHash(s, id);
         await writeRearm(keys.rearm(input.originId, s, id), { originId: input.originId, source: s, sessionId: id, machineId: input.machineId,
           workspaceId: input.tenant.workspaceId });
@@ -1123,8 +1180,10 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
           epoch: snapshot.epochs[sk]!, resets: snapshot.resets, machineId: input.machineId });
       });
 
-      // 1. The fence, and re-arm markers for what it reached, BEFORE any index merge.
-      const first = fencedBy(await readFence(keys.fence));
+      // 1. The fence (read above, after the canonical writes), and re-arm markers for what it reached, BEFORE any
+      //    index merge.
+      if (fenceR.status === "rejected") throw fenceR.reason;
+      const first = fencedBy(fenceR.value);
       await rearm(first.fenced);
       // 2. The written revisions become stored (see mergeIndex), stamped with the CLAIM's generation: a disable or
       //    reset that lands after the fence read makes them stale at once.
@@ -1139,7 +1198,7 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
           epoch: sk === null ? 0 : snapshot.epochs[sk]!, resets: sk === null ? 0 : snapshot.resets });
         groups.set(key, g);
       }
-      await mapLimit([...groups], PARALLEL, ([key, entries]) => mergeIndex(key, first.fence, input.originId, entries));
+      await mapLimit([...groups], parallel, ([key, entries]) => mergeIndex(key, first.fence, input.originId, entries));
       // A fenced session the fence no longer deletes (re-enabled since the claim): SQL's invalidated.
       const fenced = first.fenced;
       if (fenced.some(([s, id]) => !first.deleted.has(pairId(s, id)))) throw new LedgerUnavailableError("ledger_attempt_superseded");

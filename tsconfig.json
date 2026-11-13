@@ -58,7 +58,9 @@
     "scripts/opensearch-proof",
     "scripts/buffered-drain.ts",
     "scripts/accepted-stage-export.ts",
-    "scripts/upload-fence-backfill.ts"
+    "scripts/upload-fence-backfill.ts",
+    "scripts/ledger-reshard-revisions.ts",
+    "scripts/bench/s3-ledger-admission.ts"
   ],
   "exclude": [
     "node_modules",

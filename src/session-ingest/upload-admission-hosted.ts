@@ -36,7 +36,7 @@ import { admitMessage } from "./admission-consumer.ts";
 import type { AdmissionMessage } from "./async-admission.ts";
 import { routingFlag } from "./babysitter-retention.ts";
 import type { DeliverDeps } from "./deliver.ts";
-import { INGEST_LEDGER_VAR, ingestLedgerMode, s3Ledger } from "./ledger-s3.ts";
+import { INGEST_LEDGER_VAR, SERVER_LEDGER_PARALLEL, ingestLedgerMode, s3Ledger } from "./ledger-s3.ts";
 import { uploadConsentEnforcement, UPLOAD_CONSENT_VAR } from "./upload-consent.ts";
 import type { PromoteUploadDeps, UploadDirectConfig } from "./upload-admission.ts";
 
@@ -144,7 +144,7 @@ export function hostedUploadAdmissionRuntime(overrides: HostedRuntimeOverrides =
     const deliver: DeliverDeps = {
       // Fail closed: no admission until an operator has written the fence-authority marker (ledger-s3.ts
       // FenceAuthorityDoc: fence backfill complete, control mirror on, re-arm sweeper live). Every record retries.
-      ledger: s3Ledger(store, config.keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required" }),
+      ledger: s3Ledger(store, config.keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", parallel: SERVER_LEDGER_PARALLEL }),
       acceptanceMode: "canonical",
       // SCRUB_ENGINE is refused above unless ts, so this is {} today; it stays wired if that ever widens.
       target: { store, keyRoot: config.keyRoot, ...routedRawChunkSealerDeps() },

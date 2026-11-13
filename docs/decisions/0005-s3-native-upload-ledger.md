@@ -30,7 +30,7 @@ still a claim, a stage intent and a receipt ACK in Postgres. The fix is to stop 
 | Today (`ledger.ts`, SQL) | 0005 (S3) |
 | --- | --- |
 | Batch idempotency (`ingest_batches`): a retry replays; a reused batch id with other content is a 409 `batch_id` | A **batch record** object, written create-only. Same digest and committed: replay. Same digest and pending: resume. Other digest: 409. |
-| Stored revisions (`ingest_record_revisions`, keyed per origin and record): an equal or lower revision is `stale` and skipped | A **revision index** keyed per (origin, record id), sharded 64 ways by a hash of the record id. Each entry carries its generation: the session's fence epoch and the user's reset count when it was written. A claim reads the shards its records fall in, and an equal or lower revision of the current generation is `stale`, exactly as relayhistory-cloud #250. An entry of an older generation counts as absent, so a disable followed by a re-enable, or a reset, lets the re-upload through. The commit merges written revisions with `If-Match` (a first write is create-only): max wins, and an equal revision keeps the stored digest. This is required, not an optimisation: the reader fold is per origin and refuses equal revisions with different content (`chooseRelayhistoryRevision`, `packages/pipeline/src/lib/pipeline/relayhistory-transform.ts:377-392`). |
+| Stored revisions (`ingest_record_revisions`, keyed per origin and record): an equal or lower revision is `stale` and skipped | A **revision index** keyed per (origin, record id), sharded 4096 ways by a hash of the record id (64 until 2026-11-13; see "Shard count"). Each entry carries its generation: the session's fence epoch and the user's reset count when it was written. A claim reads the shards its records fall in, and an equal or lower revision of the current generation is `stale`, exactly as relayhistory-cloud #250. An entry of an older generation counts as absent, so a disable followed by a re-enable, or a reset, lets the re-upload through. The commit merges written revisions with `If-Match` (a first write is create-only): max wins, and an equal revision keeps the stored digest. This is required, not an optimisation: the reader fold is per origin and refuses equal revisions with different content (`chooseRelayhistoryRevision`, `packages/pipeline/src/lib/pipeline/relayhistory-transform.ts:377-392`). |
 | In-batch revision reuse: 409 `record_revision` | Computed from the batch alone. It never needed stored state. |
 | Deletion fences and resets (`upload_deletions`, `upload_resets`) | One **fence object** per user, edited with CAS. The claim reads it to get `deleted` and `resets`. |
 | Fence recheck at commit, erasure re-arm (`upload_erasure_rearm`) | The commit re-reads the fence. If a reset, or a deletion of a written session, landed in between, it writes a **re-arm marker** for the eraser. That is today's `rearmed` semantics. |
@@ -50,8 +50,8 @@ All of these sit under the per-user admission directory that already holds `priv
 - `…/ledger/revisions/o=<sha256(origin)[0:32]>/r=<shard>.json`
   `{v:1, records:{<recordId>:[revision, revisionId, digest, sessionKey|null, epoch, resets]}}`. It is read at claim and
   merged at commit (create-only for the first write, `If-Match` after), retrying on
-  `precondition_failed`. The shard is the first byte of `sha256(recordId)` mod 64, as two hex digits, so a claim reads and a
-  commit writes at most 64 shard objects.
+  `precondition_failed`. The shard is the first 12 bits of `sha256(recordId)` (4096 shards), as three hex digits, so a
+  claim reads and a commit writes at most one shard object per record of the batch.
 - `…/ledger/owners/o=<sha256(origin)[0:32]>/s=<sha256(JSON [source, sessionId])[0:32]>.json`
   The session's ownership stub, written at **claim**, before any canonical write, as
   `ingest_session_ownership` is. A reset lists these, so a session first uploaded while a reset is in
@@ -163,6 +163,17 @@ schema drift lists.
 - **Revision index contention.** Two batches for records in the same shard race on its CAS. The loser
   re-reads and re-merges. Merging is commutative (max wins, an equal revision keeps the first, a newer
   generation is never overwritten by an older one), so the order doesn't matter.
+- **Shard count.** A shard holds every record of its origin that hashes to it, so it grows with the
+  origin's whole history, not with the batch. At the original 64 shards, the agent-relay-dev end-to-end
+  test (one origin, ~210k records) had ~660 KB shards; every 100-record batch read ~51 of them at the
+  claim and read and rewrote them at the commit (~100 MB per admission), at ~4 s each, and 16 concurrent
+  admissions OOM-killed a 512Mi ingest-edge. At 4096 shards the same origin's shards are ~10 KB and a
+  batch moves ~2 MB (`scripts/bench/s3-ledger-admission.ts`). The 64-shard layout (`r=<2 hex>.json`) is
+  never read; `scripts/ledger-reshard-revisions.ts` merges it once into the new one (dry run first,
+  idempotent, safe while admissions run). Run it once every pod runs the new code: during a rolling
+  deploy an old pod still writes the old layout, and the reshard picks those entries up too. Until it
+  has run for a user, an already stored record re-sent is judged new rather than stale; it is written
+  again, and nothing is lost. Only agent-relay-dev ever wrote the old layout.
 - **Index and manifest disagree after a crash.** A crash between the canonical write and the index
   merge leaves the batch `pending`. The retry resumes, rewrites idempotently under manifest CAS, and
   then merges. The index can lag the manifest, but it never leads it.
