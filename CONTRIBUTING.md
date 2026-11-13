@@ -5,7 +5,11 @@ welcome.
 
 ## Proposing a change
 
-This repository does not take pull requests. Open a
+Pull requests will be switched off on this repository; once they are, it takes
+none. Until then, fork pull request CI runs without repository secrets:
+workflows that use secrets (publishing and deploys) run only from `main`, from
+release tags, or when a maintainer with write access starts them. Either way,
+the way to propose a change is an issue. Open a
 [GitHub issue](https://github.com/AgentWorkforce/relayhistory-pipeline/issues) instead:
 
 - **Security issues:** do not open a public issue. Follow [SECURITY.md](SECURITY.md).

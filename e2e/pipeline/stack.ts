@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateLocalKeys, type LocalKeys } from "../../src/alleyoop/auth.ts";
 import { createS3Store } from "../../src/shared/vendor.ts";
-import { createStack, type StackSession } from "../selfhost/stack.ts";
+import { createStack, DEFAULT_IMAGE, type StackSession } from "../selfhost/stack.ts";
 
 export const SELFHOST_SERVICES = ["session-ingest", "session-ingest-s3", "session-pipeline-consumer", "session-read-api"] as const;
 export const HOOP_SERVICES = ["alleyoop-ingest", "hoopdb-indexer", "referee", "bob-costas"] as const;
@@ -21,6 +21,8 @@ export const HOOP_TENANT = { orgId: "org_hoop", workspaceId: "ws_hoop", userId: 
 
 export interface PipelineStack extends StackSession {
   project: string;
+  /** The services image this run starts (and, unless E2E_SKIP_BUILD, builds and removes). */
+  image: string;
   keys: LocalKeys;
   summaryMasterKeys: string;
   urls: { ingestS3: string; minio: string; alleyoop: string };
@@ -34,10 +36,13 @@ export interface PipelineStack extends StackSession {
 export function createPipelineStack(project = `rh-pipe-${randomBytes(4).toString("hex")}`): PipelineStack {
   const keys = generateLocalKeys();
   const summaryMasterKeys = `e2e-1:${randomBytes(32).toString("hex")}`;
+  // A per-run image tag: two runs on one Docker host (two CI flows, or this beside e2e:selfhost) never start
+  // containers from the other's build. E2E_SKIP_BUILD=1 runs an image built before, named by E2E_IMAGE.
+  const image = process.env.E2E_SKIP_BUILD ? process.env.E2E_IMAGE?.trim() || DEFAULT_IMAGE : `96bulls/services:e2e-${project}`;
   const base = createStack({
     files: [fileURLToPath(new URL("compose.yaml", import.meta.url))],
     project,
-    extraEnv: { E2E_JWKS_JSON: JSON.stringify(keys.jwks), E2E_SUMMARY_MASTER_KEYS: summaryMasterKeys },
+    extraEnv: { E2E_JWKS_JSON: JSON.stringify(keys.jwks), E2E_SUMMARY_MASTER_KEYS: summaryMasterKeys, E2E_IMAGE: image },
   });
   const hostPort = (service: string, port: string) => {
     const out = base.compose(["port", service, port], { quiet: true, allowFail: true }).stdout.trim();
@@ -48,6 +53,7 @@ export function createPipelineStack(project = `rh-pipe-${randomBytes(4).toString
   };
   const stack = base as PipelineStack;
   stack.project = project;
+  stack.image = image;
   stack.keys = keys;
   stack.summaryMasterKeys = summaryMasterKeys;
   stack.urls = { ingestS3: "", minio: "", alleyoop: "" };

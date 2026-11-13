@@ -12,8 +12,10 @@
  * throwaway microVM (e2e/pipeline/sandbox.ts) and copies its report back. Either way the result is
  * report.md (a PASS/FAIL/SKIP line per step) and report.json under $RELAYFLOW_STATE_DIR/pipeline-e2e/, or
  * .relayflow/pipeline-e2e/ in the checkout. Exits 1 on any FAIL. E2E_KEEP=1 leaves a local stack up;
- * E2E_SKIP_BUILD=1 reuses a built 96bulls/services:e2e image.
+ * E2E_SKIP_BUILD=1 reuses a built image (E2E_IMAGE, default 96bulls/services:e2e); otherwise each run builds
+ * and removes its own `96bulls/services:e2e-<project>`.
  */
+import { spawnSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -76,22 +78,26 @@ async function local(): Promise<boolean> {
   // A report from an earlier run must never stand for this one.
   // (Only the report files: pipeline-e2e.flow.ts keeps its fleet state in the same directory.)
   for (const file of ["report.md", "report.json"]) rmSync(join(reportDir(), file), { force: true });
-  if (!process.env.E2E_SKIP_BUILD) {
-    console.log("building 96bulls/services:e2e ...");
+  const stack = createPipelineStack();
+  const built = !process.env.E2E_SKIP_BUILD;
+  const down = () => {
+    if (process.env.E2E_KEEP === "1") return console.log(`E2E_KEEP=1: stack left up (compose project ${stack.project}, image ${stack.image})`);
+    stack.compose(["down", "-v", "--remove-orphans"], { quiet: true, allowFail: true });
+    stack.cleanup();
+    if (built) spawnSync("docker", ["rmi", "-f", stack.image], { stdio: "ignore" });
+  };
+  process.on("SIGINT", () => { down(); process.exit(130); });
+  process.on("SIGTERM", () => { down(); process.exit(143); });
+  if (built) {
+    console.log(`building ${stack.image} ...`);
     try {
-      buildImage();
+      buildImage(stack.image);
     } catch (error) {
+      down();
       write([], { target: "local", wallMs: Date.now() - started, stackMs: 0, selection, aborted: `the services image did not build: ${(error as Error).message.split("\n")[0]}` });
       return false;
     }
   }
-  const stack = createPipelineStack();
-  const down = () => {
-    if (process.env.E2E_KEEP === "1") return console.log(`E2E_KEEP=1: stack left up (compose project ${stack.project})`);
-    stack.compose(["down", "-v", "--remove-orphans"], { quiet: true, allowFail: true });
-    stack.cleanup();
-  };
-  for (const signal of ["SIGINT", "SIGTERM"] as const) process.on(signal, () => { down(); process.exit(130); });
   const dump = () => {
     for (const svc of ["migrate", "roles", ...services]) console.error(`--- ${svc}\n${stack.logs(svc).split("\n").slice(-60).join("\n")}`);
   };

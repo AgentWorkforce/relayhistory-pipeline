@@ -51,7 +51,7 @@ Only the services the selected steps need are started.
 | --- | --- |
 | `upload.http` | a. upload over HTTP on the SQL ledger: no token 401, read-only token 403, then admitted (ingest log: `accepted`, one manifest written) |
 | `upload.s3_ledger` | a. upload over the S3 ledger: refused 503 `ledger_fence_authority_missing` until the test fence-authority marker is written, then admitted; the S3 batch record is `committed` with the receipt; no SQL `ingest_batches` row |
-| `canonical.objects` | b. both sessions' canonical `manifest.json` and every chunk it names are in the object store, sealed (the marker is not readable in the stored bytes) |
+| `canonical.objects` | b. both sessions' canonical `manifest.json`; every chunk it names, at the key the reader derives (`chunkKeys`), is stored and sealed (the marker is not readable in its bytes) |
 | `index.directory` | c. the consumer indexes both: one `sessions.session_directory` row each and their `search_index.transcript_events` rows |
 | `search` | d. search returns each session to its tenant, a near-miss query returns nothing, and another tenant gets nothing |
 | `read.api` | f. the read API: anonymous list 401; the list carries the session; `/v1/sessions/:id/events` serves its events |
@@ -61,7 +61,7 @@ Only the services the selected steps need are started.
 | `rearm.sweeper` | h. the re-arm sweeper (#590): a session admitted over HTTP; a batch claimed before a disable and committed after it, through the real ledger, writes the re-arm marker (`rearmed: 1`); `sweepRearmMarkers` with the S3 eraser (as `rearm-sweeper-main.ts`) erases that session's every canonical object version, leaves the org's other sessions, and a second pass answers `alreadyDone` |
 | `backlog.drain` | i. **skipped, pending #578** (the S3-only buffered backlog drain). Same rule for `src/session-ingest/buffered-drain.ts` |
 | `upload.courier` | a. the real courier (`runCourierOnce`) over a Concourse `history.db` built from a fixture, with a token minted from the run's key: chunks and a validated manifest through AlleyOop into the Locker |
-| `index.hoop` | c. the indexer writes `session_index` and `session_index_ext` (a minted UUIDv7), and the referee classifies it |
+| `index.hoop` | c. the indexer writes `session_index` and `session_index_ext` (a minted UUIDv7), and the referee classifies the finished fixture `done` |
 | `summary.extractive` | e. Bob Costas writes both summary pointers (`ready`) and the encrypted `summary/{short,long}.json.enc` objects; each decrypts with the run's master key to a ready summary built by `extractive/v1`, and its plain text is not in the stored bytes |
 
 ## The report
@@ -70,19 +70,29 @@ Only the services the selected steps need are started.
 `.relayflow/pipeline-e2e/` in the checkout: a PASS, FAIL or SKIP line per step
 with what it observed, the wall clock and the stack start-up time. The run
 exits 1 on any FAIL. On a FAIL the tail of every service's log is printed.
-`E2E_KEEP=1` leaves a local stack up; `E2E_SKIP_BUILD=1` reuses a built
-`96bulls/services:e2e` image.
+A report from an earlier run is removed first, so a run that aborts never
+leaves a green report behind. Each run builds, runs and removes its own image
+tag (`96bulls/services:e2e-<project>`, `E2E_IMAGE` in both compose files), so
+two runs on one Docker host never start each other's code. `E2E_KEEP=1` leaves
+a local stack up; `E2E_SKIP_BUILD=1` runs an image built before (`E2E_IMAGE`,
+default `96bulls/services:e2e`).
 
 ## The sandbox target
 
 `--target sandbox` (`e2e/pipeline/sandbox.ts`) snapshots the working tree
-(tracked and staged edits; nothing untracked), creates a Blaxel sandbox from
+(tracked and staged edits; nothing untracked), refuses to upload it on the
+same grounds as a push to the public remote (machine-local state, secret-like
+files, production identifiers, any added line included), creates a Blaxel sandbox from
 `blaxel/docker-in-sandbox` (16 GB, with Docker's data on a 60 GB disk-backed
 ephemeral volume), uploads the archive, runs
 `e2e/pipeline/sandbox-run.sh` there (CI's bun, the locked install, the same
 `run.ts --target local` on the sandbox's own Docker), copies the report back
-and deletes the sandbox, whatever happened. `BL_API_KEY` and `BL_WORKSPACE`
-come from the environment only.
+and deletes the sandbox, whatever happened, a SIGINT or SIGTERM included. Its
+budget (5 minutes to deploy, 30 to run) stays inside the CI flow's 45-minute
+lane limit. `BL_API_KEY` and `BL_WORKSPACE` come from the environment only.
+Not yet pinned: the image is `blaxel/docker-in-sandbox:latest` (no versioned
+tag is published), and `sandbox-run.sh` installs CI's bun version through
+bun's installer script.
 
 Status (2026-11-12): **not yet proven end to end.** Probed by hand in this
 workspace: the image has Docker 27 and Compose 2.31 on Alpine x86_64, CI's bun

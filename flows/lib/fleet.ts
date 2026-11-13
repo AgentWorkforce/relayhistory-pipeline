@@ -8,7 +8,7 @@
 // returns. A short poll keeps that within the retries; a 13-minute poll can
 // spend them all and leave the run terminal.
 import type { Ctx } from "@relayflows/surface";
-import { shellWord } from "./shell.ts";
+import { lib, shellWord } from "./shell.ts";
 
 export interface FleetStep {
   name: string;
@@ -58,12 +58,12 @@ export async function runFleet(f: Ctx, dir: string, jobs: FleetJob[], maxPolls: 
   if (!(pollMinutes > 0 && pollMinutes <= 13)) throw new Error(`a fleet poll lasts more than 0 and at most 13 minutes, not ${pollMinutes}`);
   await f.run(`mkdir -p ${shellWord(dir)} && ${writeFile(`${dir}/jobs.json`, JSON.stringify(jobs))}`);
   // Each wait names this fleet by the token `start` prints, so a newer one in the same directory is never waited on or stopped as ours.
-  const started = await f.run(`node flows/lib/fleet.mjs start ${shellWord(dir)}`);
+  const started = await f.run(`node ${lib("fleet.mjs")} start ${shellWord(dir)}`);
   const token = /token (\S+)/.exec(started)?.[1] ?? "";
   let results: FleetResult[] = [];
   for (let poll = 0; poll < maxPolls; poll++) {
     // The command's lease: the poll plus two minutes for node and the result, within the 15-minute ceiling.
-    const wait = `node flows/lib/fleet.mjs wait ${shellWord(dir)} ${shellWord(token)}${pollMinutes === DEFAULT_POLL_MINUTES ? "" : ` ${pollMinutes}`}`;
+    const wait = `node ${lib("fleet.mjs")} wait ${shellWord(dir)} ${shellWord(token)}${pollMinutes === DEFAULT_POLL_MINUTES ? "" : ` ${pollMinutes}`}`;
     const status = JSON.parse(await f.run(wait, { timeout: `${Math.min(15, Math.ceil(pollMinutes) + 2)}m` })) as {
       state: "done" | "pending";
       results: FleetResult[];
@@ -72,7 +72,7 @@ export async function runFleet(f: Ctx, dir: string, jobs: FleetJob[], maxPolls: 
     results = status.results;
   }
   // Out of polls: keep what finished, mark what did not, and leave nothing of this fleet running.
-  await f.run(`node flows/lib/fleet.mjs stop ${shellWord(dir)} ${shellWord(token)}`);
+  await f.run(`node ${lib("fleet.mjs")} stop ${shellWord(dir)} ${shellWord(token)}`);
   return results.map((r) =>
     r.step === "fleet" && !r.ok ? { ...r, output: OUT_OF_POLLS(maxPolls * pollMinutes) } : r,
   );

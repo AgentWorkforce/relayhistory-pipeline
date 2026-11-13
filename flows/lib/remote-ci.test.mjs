@@ -19,9 +19,18 @@ test("the gate dispatches only ci.yml and pg-proof.yml, and both keep their push
   }
 });
 
-test("secret-like files are recognized by the same rule as ci.yml's guard", () => {
-  for (const path of [".env", "a/.env", "inputs.json", "x/key.pem"]) assert.ok(SECRET_LIKE.test(path), path);
-  for (const path of [".env.example.md", "src/env.ts", "docs/inputs.json.md"]) assert.ok(!SECRET_LIKE.test(path), path);
+test("secret-like files: ci.yml's guard and more", () => {
+  for (const path of [".env", "a/.env", ".env.local", "inputs.json", "x/key.pem", "tls.key", "id_rsa", "home/.ssh/id_ed25519", ".npmrc", "credentials.json"]) assert.ok(SECRET_LIKE.test(path), path);
+  for (const path of ["src/env.ts", "docs/inputs.json.md", "src/keys.ts", "docs/credentials.md"]) assert.ok(!SECRET_LIKE.test(path), path);
+});
+
+test("the added-line identifier scan finds what a diff adds and ignores what it removes", async () => {
+  const { scanAddedLines } = await import("./publish-guard.mjs");
+  const { scanText } = await import("../../scripts/check-engine-identifiers.ts");
+  // No real identifier is in this repo's tests: a line the scanner flags is found by trying candidates against its digests.
+  assert.equal(scanText("x", "nothing here 123").length, 0);
+  const diff = ["diff --git a/docs/x.md b/docs/x.md", "--- a/docs/x.md", "+++ b/docs/x.md", "@@ -1,0 +1,2 @@", "+harmless", "+also harmless"].join("\n");
+  assert.deepEqual(scanAddedLines(diff), []);
 });
 
 test("only this dispatch's newest run per workflow counts", () => {
@@ -99,7 +108,7 @@ test("only old snapshot branches made in this checkout are swept", () => {
   }
 });
 
-test("a snapshot holding machine-local state is never pushed", () => {
+test("a snapshot holding machine-local state is never pushed", async () => {
   const repo = mkdtempSync(join(tmpdir(), "publish-test-"));
   const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
   git("init", "-q", "-b", "main");
@@ -114,11 +123,28 @@ test("a snapshot holding machine-local state is never pushed", () => {
   const cwd = process.cwd();
   process.chdir(repo);
   try {
-    const why = refuseToPublish(git("rev-parse", "HEAD"), repo);
+    const why = await refuseToPublish(git("rev-parse", "HEAD"), undefined, repo);
     assert.match(why, /machine-local state/);
     assert.match(why, /\.claude\/settings\.json/);
     assert.match(why, /sub\/\.agentworkforce\/key/);
   } finally {
     process.chdir(cwd);
   }
+});
+
+test("a snapshot holding a secret-like file is never pushed, and a clean one is", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "publish-secret-"));
+  const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+  git("init", "-q", "-b", "main");
+  git("config", "user.email", "t@example.com");
+  git("config", "user.name", "t");
+  writeFileSync(join(repo, "a.txt"), "one\n");
+  git("add", "-A");
+  git("commit", "-qm", "base");
+  const base = git("rev-parse", "HEAD");
+  assert.equal(await refuseToPublish(base, base, repo), "");
+  writeFileSync(join(repo, ".env.local"), "X=1\n");
+  git("add", "-A");
+  git("commit", "-qm", "oops");
+  assert.match(await refuseToPublish(git("rev-parse", "HEAD"), base, repo), /secret-like files \(\.env\.local\)/);
 });

@@ -24,8 +24,13 @@ const API = "https://api.blaxel.ai/v0";
 const IMAGE = "blaxel/docker-in-sandbox:latest";
 const MEMORY_MB = 16384;
 const DOCKER_DISK_MB = 60_000;
-/** The whole lane's ceiling inside the sandbox: the image build, the install and the steps. */
-const RUN_MINUTES = 40;
+/**
+ * The whole lane's ceiling inside the sandbox: the image build, the install and the steps. With the 5-minute
+ * deploy wait and the upload it stays inside the CI flow's 45-minute lane limit, so the flow's own stop never
+ * has to cut a run short (and a stop deletes the sandbox anyway: see the signal handler below).
+ */
+const RUN_MINUTES = 30;
+const DEPLOY_POLLS = 60; // 5-second polls: 5 minutes
 const PART_BYTES = 5 * 1024 * 1024;
 
 export interface SandboxOptions { steps?: string[]; reportDir: string }
@@ -52,10 +57,18 @@ async function api(path: string, init: RequestInit & { base?: string } = {}) {
   return json ?? text;
 }
 
-/** The snapshot commit of the working tree and a gzipped archive of it. */
+/**
+ * The snapshot commit of the working tree and a gzipped archive of it. The upload leaves this machine, so it
+ * passes the same refusals as a push to the public remote (remote-ci.mjs refuseToPublish: machine-local state,
+ * secret-like files, production identifiers, including any line added over the merge base with main).
+ */
 async function archive(dir: string): Promise<{ sha: string; file: string }> {
-  const { snapshot } = await import("../../flows/lib/remote-ci.mjs" as string) as { snapshot: () => string };
-  const sha = snapshot();
+  const ci = await import("../../flows/lib/remote-ci.mjs" as string) as { snapshot: () => string; refuseToPublish: (sha: string, base: string | undefined, root: string) => Promise<string> };
+  const sha = ci.snapshot();
+  let base: string | undefined;
+  try { base = execFileSync("git", ["-C", ROOT, "merge-base", "origin/main", sha], { encoding: "utf8" }).trim(); } catch {}
+  const refused = await ci.refuseToPublish(sha, base, ROOT);
+  if (refused) throw new Error(`not uploaded to the sandbox: ${refused}`);
   const file = join(dir, "repo.tgz");
   execFileSync("git", ["-C", ROOT, "archive", "--format=tar.gz", "-o", file, sha]);
   return { sha, file };
@@ -96,11 +109,18 @@ async function readFile(base: string, path: string): Promise<string | undefined>
 export async function runInSandbox(opts: SandboxOptions): Promise<boolean> {
   credentials();
   const started = Date.now();
+  // A report from an earlier run must never stand for this one.
+  for (const f of ["report.md", "report.json"]) rmSync(join(opts.reportDir, f), { force: true });
   const scratch = mkdtempSync(join(tmpdir(), "rh-pipe-sandbox-"));
   const { sha, file } = await archive(scratch);
   const name = `rh-pipe-${sha.slice(0, 12)}-${Math.random().toString(36).slice(2, 6)}`;
   console.log(`sandbox ${name}: snapshot ${sha}`);
   let ok = false;
+  // A stop (the CI fleet's SIGTERM, a ^C) deletes the 16 GB microVM now rather than leaving it to its 2-hour ttl.
+  const remove = () => api(`/sandboxes/${name}`, { method: "DELETE" }).catch((e) => console.error(`could not delete sandbox ${name}: ${(e as Error).message}`));
+  const onSignal = (code: number) => () => { void remove().finally(() => process.exit(code)); };
+  process.once("SIGINT", onSignal(130));
+  process.once("SIGTERM", onSignal(143));
   try {
     // The image's Docker runs on vfs over the in-memory root filesystem, and building the services image there
     // fills a 32 GB sandbox (measured 2026-11-12). Docker's data goes on a disk-backed ephemeral volume instead.
@@ -112,14 +132,14 @@ export async function runInSandbox(opts: SandboxOptions): Promise<boolean> {
       },
     }) });
     let sandbox: any;
-    for (let i = 0; i < 120; i++) {
+    for (let i = 0; i < DEPLOY_POLLS; i++) {
       sandbox = await api(`/sandboxes/${name}`);
       if (sandbox.status === "DEPLOYED") break;
       if (["FAILED", "DELETING", "TERMINATED"].includes(sandbox.status)) throw new Error(`sandbox ${sandbox.status}`);
       await new Promise((r) => setTimeout(r, 5_000));
     }
     const base = String(sandbox?.metadata?.url ?? "");
-    if (!base) throw new Error("sandbox has no URL after 10 minutes");
+    if (!base || sandbox?.status !== "DEPLOYED") throw new Error("sandbox not deployed after 5 minutes");
     await upload(base, "/tmp/repo.tgz", readFileSync(file));
     const steps = opts.steps?.length ? ` --steps '${opts.steps.join(",").replace(/[^a-z0-9.,_]/g, "")}'` : "";
     const run = await exec(base, "pipeline-e2e", `sh -c 'mkdir -p /work && tar xzf /tmp/repo.tgz -C /work && sh /work/e2e/pipeline/sandbox-run.sh${steps}'`, RUN_MINUTES);
@@ -133,7 +153,7 @@ export async function runInSandbox(opts: SandboxOptions): Promise<boolean> {
     if (!md) console.error("the sandbox run wrote no report");
   } finally {
     rmSync(scratch, { recursive: true, force: true });
-    await api(`/sandboxes/${name}`, { method: "DELETE" }).catch((e) => console.error(`could not delete sandbox ${name}: ${(e as Error).message}`));
+    await remove();
   }
   return ok;
 }

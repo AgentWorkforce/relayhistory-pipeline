@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { applyOverride, jobs } from "../ci.flow.ts";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { applyOverride, cleanStateDir, jobs, STATE_MARKER } from "../ci.flow.ts";
 import { classifyPaths, lanesFor } from "./classify.mjs";
+import { LIB } from "./shell.ts";
 
 const classification = (paths) => {
   const c = classifyPaths(paths);
@@ -26,7 +32,9 @@ test("full runs every lane, pg-proof on 15/16/17 and the whole e2e, in five conc
   for (const v of ["15", "16", "17"]) assert.ok(all.includes(`pg-proof: real PostgreSQL ${v}`), v);
   assert.ok(all.some((s) => s.startsWith("checks: package tests")), "aux");
   const e2e = js.find((j) => j.name === "e2e").steps[0].command;
-  assert.match(e2e, /lane\.sh e2e --target local$/);
+  assert.match(e2e, /lane\.sh' e2e --target local$/);
+  // The gate's own scripts are run from where the flow was loaded, never from the tree under review.
+  assert.ok(e2e.includes(`'${LIB}/lane.sh'`), e2e);
   assert.doesNotMatch(e2e, /--steps/);
 });
 
@@ -41,7 +49,26 @@ test("targeted runs the unit lanes and only the e2e steps the paths reach", () =
 test("the GitHub gate is a job only when a merge base is given", () => {
   const sha = "a".repeat(40);
   const js = jobs(classification(["src/session-ingest/app.ts"]), ".relayflow/ci", sha, "local", "ci.yml,pg-proof.yml");
-  assert.match(js.at(-1).steps[0].command, new RegExp(`remote-ci\\.mjs watch '${sha}' 'ci\\.yml,pg-proof\\.yml'$`));
+  assert.match(js.at(-1).steps[0].command, new RegExp(`remote-ci\\.mjs' watch '${sha}' 'ci\\.yml,pg-proof\\.yml'$`));
+  for (const job of js) for (const s of job.steps) assert.doesNotMatch(s.command, /(^|\s)(bash|node) flows\/lib\//, `${s.name} runs the tree's own gate script`);
+});
+
+test("the state dir is emptied only when this flow made it", () => {
+  const sh = (cmd, cwd) => spawnSync("/bin/sh", ["-c", cmd], { cwd, encoding: "utf8" });
+  const root = mkdtempSync(join(tmpdir(), "ci-state-"));
+  const foreign = join(root, "home");
+  mkdirSync(foreign);
+  writeFileSync(join(foreign, "keep.txt"), "x");
+  const refused = sh(cleanStateDir(foreign), root);
+  assert.notEqual(refused.status, 0);
+  assert.match(refused.stderr, /refusing to empty/);
+  assert.ok(existsSync(join(foreign, "keep.txt")), "a directory the flow did not make survives");
+  const ours = join(root, "ci");
+  assert.equal(sh(cleanStateDir(ours), root).status, 0);
+  assert.ok(existsSync(join(ours, STATE_MARKER)));
+  writeFileSync(join(ours, "old-report.md"), "x");
+  assert.equal(sh(cleanStateDir(ours), root).status, 0);
+  assert.ok(!existsSync(join(ours, "old-report.md")), "its own earlier state is cleared");
 });
 
 test("an override raises the verdict and never lowers it", () => {

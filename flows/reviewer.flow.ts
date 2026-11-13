@@ -6,7 +6,7 @@
 // hand; the input is written by flows/lib/review.ts.
 import { flow } from "@relayflows/surface";
 import type { ReviewerInput } from "./lib/review.ts";
-import { shellWord } from "./lib/shell.ts";
+import { lib, shellWord } from "./lib/shell.ts";
 
 export default flow<ReviewerInput>(
   "sessions-pipeline.reviewer",
@@ -23,7 +23,7 @@ export default flow<ReviewerInput>(
       })
       .gate({
         type: "subprocess_gate",
-        command: `node flows/lib/check-findings.mjs ${shellWord(input.findings)} ${shellWord(input.files)}`,
+        command: `node ${lib("check-findings.mjs")} ${shellWord(input.findings)} ${shellWord(input.files)}`,
       });
     f.done("success");
   },

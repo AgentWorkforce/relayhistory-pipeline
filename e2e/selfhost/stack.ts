@@ -105,9 +105,12 @@ export function createStack(options: StackOptions = {}): StackSession {
   };
 }
 
-export function buildImage(): void {
+/** The default tag; the pipeline lane builds and runs its own per-run tag (E2E_IMAGE in both compose files). */
+export const DEFAULT_IMAGE = "96bulls/services:e2e";
+
+export function buildImage(tag = DEFAULT_IMAGE): void {
   // E2E_DOCKER_BUILD_NETWORK=host: for a Docker whose build containers have no DNS of their own (the Blaxel
   // docker-in-sandbox image; e2e/pipeline/sandbox-run.sh sets it).
   const network = process.env.E2E_DOCKER_BUILD_NETWORK === "host" ? ["--network", "host"] : [];
-  execFileSync("docker", ["build", ...network, "-q", "-f", join(root, "docker/services.Dockerfile"), "-t", "96bulls/services:e2e", root], { stdio: ["ignore", "ignore", "inherit"] });
+  execFileSync("docker", ["build", ...network, "-q", "-f", join(root, "docker/services.Dockerfile"), "-t", tag, root], { stdio: ["ignore", "ignore", "inherit"] });
 }

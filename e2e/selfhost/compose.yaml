@@ -5,7 +5,7 @@
 # All credentials are generated per run by run.ts and passed in the environment.
 name: rh-e2e
 x-services-image: &services-image
-  image: 96bulls/services:e2e
+  image: ${E2E_IMAGE:-96bulls/services:e2e}
 x-common-env: &common-env
   SESSION_POSTGRES_TLS_PROFILE: custom-ca
   SESSION_POSTGRES_CA_FILE: /certs/ca.crt

@@ -11,9 +11,44 @@
 #
 # Every container is disposable (trust auth or a CI-only password, loopback port, removed on exit); no
 # credential is read or written. Run from the repository root with CI's bun (1.4.2) first on PATH.
+#
+# The lanes run the change's own code (its tests, its e2e) before anyone has approved it, so they run
+# without the caller's credentials: the script re-executes itself under `env -i` with an allowlist
+# (PATH, locale, temp dir, the state dir and the e2e switches; BL_API_KEY/BL_WORKSPACE only for
+# `e2e --target sandbox`), a fresh empty HOME (no ~/.config/gh, no ~/.git-credentials, no npm or docker
+# credentials), git's global and system config off (no credential helper), and Docker reached by its socket
+# with only the CLI plugins of the caller's Docker config. What this does not stop: a process of the same
+# user that asks the OS keychain, or code that uses the Docker socket to mount the host (Docker is root on
+# the host). On a lander host that holds a token able to push main, run the lanes on a runner without it,
+# or use the sandbox target (docs/maintainer-workflow.md "Trust").
+#
+# This file is gate code: ci.flow.ts runs it from the flows it was loaded from (lib/shell.ts LIB), and it
+# works on the change in the current directory.
 set -euo pipefail
+GATE_LIB="$(cd "$(dirname "$0")" && pwd)"
+if [ -z "${RH_LANE_HOME:-}" ]; then
+  keep=(PATH TERM LANG LC_ALL TMPDIR USER LOGNAME SHELL RELAYFLOW_STATE_DIR E2E_KEEP E2E_SKIP_BUILD E2E_DOCKER_BUILD_NETWORK E2E_IMAGE)
+  case " $* " in *" e2e "*"--target sandbox"*) keep+=(BL_API_KEY BL_WORKSPACE) ;; esac
+  docker_host="${DOCKER_HOST:-$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)}"
+  home="$(mktemp -d "${TMPDIR:-/tmp}/rh-lane-home.XXXXXX")"
+  mkdir -p "$home/.docker"
+  plugins="${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins"
+  [ ! -d "$plugins" ] || ln -s "$plugins" "$home/.docker/cli-plugins"
+  args=()
+  for v in "${keep[@]}"; do [ -z "${!v:-}" ] || args+=("$v=${!v}"); done
+  exec env -i "${args[@]}" HOME="$home" DOCKER_CONFIG="$home/.docker" ${docker_host:+DOCKER_HOST="$docker_host"} \
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 RH_LANE_HOME="$home" bash "$0" "$@"
+fi
 cd "$(git rev-parse --show-toplevel)"
-lane="${1:?usage: lane.sh guards|typecheck|shard <n>|aux|pg-proof <major>}"
+lane="${1:?usage: lane.sh guards|typecheck|shard <n>|aux|pg-proof <major>|flows|e2e [args]}"
+if [ "$lane" = env-check ]; then
+  # What the lanes' commands see (names only, never values): flows/lib/lane-env.test.mjs holds the scrub to it.
+  env | cut -d= -f1 | sort
+  echo "HOME_IS_SCRATCH=$([ "$HOME" = "$RH_LANE_HOME" ] && echo yes || echo no)"
+  echo "GIT_HELPER=$(git config --get credential.helper || echo none)"
+  rm -rf "$RH_LANE_HOME"
+  exit 0
+fi
 want_bun="$(sed -n 's/^ *bun-version: *//p' .github/workflows/ci.yml | head -1)"
 have_bun="$(bun --version)"
 if [ "$have_bun" != "$want_bun" ]; then
@@ -28,14 +63,17 @@ if [ -n "$want_node" ] && [ "${have_node:-0}" -lt "$want_node" ]; then
   exit 1
 fi
 
+# The caller sets `container` BEFORE `port="$(start ...)"`: start runs in that command substitution's
+# subshell, so a name it assigned would never reach this trap.
 container=""
-cleanup() { [ -z "$container" ] || docker rm -f "$container" >/dev/null 2>&1 || true; }
-trap cleanup EXIT INT TERM
+cleanup() { [ -z "$container" ] || docker rm -f "$container" >/dev/null 2>&1 || true; rm -rf "$RH_LANE_HOME"; }
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 # Starts a disposable container, waits for its health check, and prints its loopback host port.
 start() { # name image internal-port health-cmd docker-run-args...
   local name="$1" image="$2" port="$3" health="$4"; shift 4
-  container="$name"
   docker rm -f "$name" >/dev/null 2>&1 || true
   docker run -d --name "$name" -p "127.0.0.1::$port" --health-cmd "$health" --health-interval 2s --health-retries 60 "$@" "$image" >/dev/null
   for _ in $(seq 1 90); do
@@ -45,7 +83,7 @@ start() { # name image internal-port health-cmd docker-run-args...
   [ "$(docker inspect -f '{{.State.Health.Status}}' "$name")" = healthy ] || { echo "$image did not become healthy" >&2; docker logs "$name" | tail -20 >&2; exit 1; }
   docker port "$name" "$port/tcp" | head -1 | sed 's/.*://'
 }
-checkout="$(printf '%s' "$PWD" | shasum | cut -c1-8)"
+checkout="$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"
 run_id="$checkout-$$"
 # A lane killed hard (the fleet's stop, a SIGKILL) skips its trap: remove this checkout's lane containers whose
 # lane process is gone. Another checkout's, or a live lane's, are never touched.
@@ -59,7 +97,9 @@ case "$lane" in
     key="helm.sh/ho""ok"
     ! grep -rn "$key" --include='*.yaml' --include='*.yml' --include='*.tpl' . --exclude-dir=node_modules --exclude-dir=vendor --exclude-dir=.github || { echo "helm hooks are not allowed (Alchemy renders --no-hooks)"; exit 1; }
     ! git ls-files | grep -E '(^|/)(\.env|inputs\.json|.*\.pem)$' || { echo "secret-like file tracked"; exit 1; }
-    bun scripts/check-engine-identifiers.ts
+    # The identifier guard and the lockfile check are gate code: run from the gate's checkout, over this tree.
+    node "$GATE_LIB/publish-guard.mjs" engine "$PWD"
+    node "$GATE_LIB/check-lockfiles.mjs" "$PWD"
     ;;
   typecheck)
     bunx tsc --noEmit -p tsconfig.json
@@ -67,7 +107,8 @@ case "$lane" in
     ;;
   shard)
     n="${2:?shard number}"
-    port="$(start "rh-ci-ch-$run_id-$n" clickhouse/clickhouse-server:26.8.34.13 8123 "clickhouse-client --password ci-only -q 'SELECT 1'" \
+    container="rh-ci-ch-$run_id-$n"
+    port="$(start "$container" clickhouse/clickhouse-server:26.8.34.13 8123 "clickhouse-client --password ci-only -q 'SELECT 1'" \
       -e CLICKHOUSE_PASSWORD=ci-only -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1)"
     list="$(mktemp)"
     bun scripts/ci/unit-test-shards.ts --shard "$n" --of 4 > "$list"
@@ -96,7 +137,8 @@ case "$lane" in
     ;;
   pg-proof)
     major="${2:?postgres major}"
-    port="$(start "rh-ci-pg-$run_id-$major" "postgres:$major" 5432 "pg_isready -U postgres" -e POSTGRES_HOST_AUTH_METHOD=trust)"
+    container="rh-ci-pg-$run_id-$major"
+    port="$(start "$container" "postgres:$major" 5432 "pg_isready -U postgres" -e POSTGRES_HOST_AUTH_METHOD=trust)"
     head="$(git rev-parse HEAD)"
     out="$(mktemp -d)"
     if [ "$major" = 15 ]; then
@@ -119,6 +161,10 @@ case "$lane" in
     jq -r '"role proof: \(.passed) passed, \(.failed) failed on PostgreSQL \(.pg_version)"' "$out/role.json"
     jq -r '"auth upgrade: \(.passed) passed, \(.failed) failed"' "$out/auth.json"
     rm -rf "$out"
+    ;;
+  flows)
+    # The flows' own typecheck, flows check and helper tests: the change's code, so it runs here, scrubbed.
+    (cd flows && npm run -s check)
     ;;
   e2e)
     shift

@@ -24,10 +24,14 @@ Copied from AgentWorkforce/relay-app `flows/` at `5316a98` (2026-11-12), and
 kept close to it so fixes can move both ways:
 
 - **Unchanged apart from names** (`relay-app.*` flow ids are `sessions-pipeline.*`):
-  `lib/fleet.ts`, `lib/fleet.mjs`, `lib/review.ts`, `lib/review-state.mjs`,
-  `lib/state-dir.mjs`, `lib/shell.ts`, `lib/check-findings.mjs`,
-  `lib/check-budgets.mjs`, `reviewer.flow.ts`, and their tests; pinned to the
-  same `relayflows` / `@relayflows/surface` 2.0.59.
+  `lib/review-state.mjs`, `lib/state-dir.mjs`, `lib/check-findings.mjs`,
+  `lib/check-budgets.mjs`, and their tests; pinned to the same `relayflows` /
+  `@relayflows/surface` 2.0.59.
+- **Trust changes** (docs/maintainer-workflow.md "Trust"): `lib/shell.ts` gains
+  `LIB`/`FLOWS`, and `lib/fleet.ts`, `lib/review.ts`, `reviewer.flow.ts` run
+  every gate script from there rather than from the reviewed tree's
+  `flows/lib/`; `lib/fleet.mjs` binds a stop's delayed SIGKILL to the step it
+  stopped (relay-app's copy re-reads the running step and can kill the next one).
 - **Adapted**: the reviewer lenses in `adversarial-review.flow.ts`,
   `context-review.flow.ts` and `cloud-review.flow.ts` (this repo's deployments,
   Postgres and object stores in place of macOS/GTK/Windows; its conventions in
@@ -37,7 +41,8 @@ kept close to it so fixes can move both ways:
   `pg-proof.yml`, and refuses secret-like files and production identifiers
   before a push); `ci.flow.ts` (this repo's lanes and the classifier).
 - **New here**: `lib/classify.mjs` (path rules, optional Jev escalation),
-  `lib/lane.sh`, `pipeline-e2e.flow.ts`, and their tests.
+  `lib/lane.sh` (credential-free lanes), `lib/publish-guard.mjs`,
+  `lib/check-lockfiles.mjs`, `pipeline-e2e.flow.ts`, and their tests.
 - **Not copied**: relay-app's review sizing (`sized-review.flow.ts`,
   `plan-review.flow.ts`, `lib/depth.ts`, `lib/plan.ts`,
   `lib/change-summary.mjs`) and the tests that need its `agent/review.sh`.

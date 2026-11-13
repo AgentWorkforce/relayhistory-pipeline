@@ -74,24 +74,31 @@ export function snapshot(include = []) {
   }
 }
 
-/** ci.yml's "nothing secret-like committed" guard, over a tree's file list. */
-export const SECRET_LIKE = /(^|\/)(\.env|inputs\.json|.*\.pem)$/;
+/** ci.yml's "nothing secret-like committed" guard, widened: env files, keys, credentials files. */
+export const SECRET_LIKE = /(^|\/)(\.env(\.[^/]*)?|inputs\.json|[^/]*\.(pem|key|p12|pfx)|id_(rsa|dsa|ecdsa|ed25519)|\.npmrc|\.netrc|\.pypirc|credentials(\.json)?)$/;
+const SECRET_ALLOWED = /(^|\/)\.env\.example$/;
 
 /**
  * Why a snapshot must not leave this machine, or "" when it may. The remote
- * is public: machine-local state and secret-like files never go, and the tree
- * must pass the production-identifier guard before the push rather than beside it.
+ * is public (and a sandbox upload leaves too): machine-local state and
+ * secret-like files never go; the engine roots must pass the production
+ * identifier guard; and no line the snapshot adds over `base`, in any file,
+ * may carry a production identifier. The guard is gate code (publish-guard.mjs
+ * beside this file), never the snapshot's own script.
  */
-export function refuseToPublish(sha, root = ".") {
-  const files = git(["ls-tree", "-r", "--name-only", sha]).split("\n");
+export async function refuseToPublish(sha, base, root = ".") {
+  const files = git(["-C", root, "ls-tree", "-r", "--name-only", sha]).split("\n");
   const local = files.filter((file) => MACHINE_LOCAL.some((dir) => file === dir || file.startsWith(`${dir}/`) || file.includes(`/${dir}/`)));
   if (local.length) return `the snapshot holds machine-local state (${local.slice(0, 5).join(", ")}); unstage it`;
-  const secret = files.filter((file) => SECRET_LIKE.test(file) && file !== ".env.example");
+  const secret = files.filter((file) => SECRET_LIKE.test(file) && !SECRET_ALLOWED.test(file));
   if (secret.length) return `the snapshot holds secret-like files (${secret.slice(0, 5).join(", ")}); unstage them`;
   try {
-    sh("bun", [join(root, "scripts/check-engine-identifiers.ts")]);
+    const { addedHits } = await import("./publish-guard.mjs");
+    const guard = await import(new URL("../../scripts/check-engine-identifiers.ts", import.meta.url).href);
+    const hits = [...guard.scanRepository(root), ...(base ? addedHits(root, base, sha) : [])];
+    if (hits.length) return `production identifiers, so nothing was published:\n${hits.slice(0, 10).map((h) => `${h.path}:${h.line} (${h.kind})`).join("\n")}`;
   } catch (error) {
-    return `scripts/check-engine-identifiers.ts failed, so nothing was pushed:\n${String(error.stdout ?? "").trim()}${String(error.stderr ?? "").trim()}`;
+    return `the identifier guard could not run, so nothing was published: ${error.message}`;
   }
   return "";
 }
@@ -158,7 +165,7 @@ async function watch(base, csv) {
     console.log(`could not sweep old snapshot branches: ${error.message}`);
   }
   const sha = snapshot();
-  const refused = refuseToPublish(sha);
+  const refused = await refuseToPublish(sha, base);
   if (refused) throw new Error(refused);
   const branch = `ci/${sha.slice(0, 12)}`;
   git(["push", "--quiet", "origin", `${sha}:refs/heads/${branch}`]);
@@ -194,7 +201,13 @@ async function watch(base, csv) {
         runs = latestRuns(listed, since, workflows);
         if (runs.length === workflows.length && runs.every((run) => run.status === "completed")) break;
       }
-      if (Date.now() > deadline) throw new Error(`GitHub Actions still running after two hours on ${sha}`);
+      if (Date.now() > deadline) {
+        // Never leave a dispatched run going past the gate's own deadline.
+        for (const run of runs.filter((r) => r.status !== "completed")) {
+          try { gh("run", "cancel", String(run.databaseId)); } catch (error) { console.log(`could not cancel run ${run.databaseId}: ${error.message}`); }
+        }
+        throw new Error(`GitHub Actions still running after two hours on ${sha}; the dispatched runs were cancelled`);
+      }
       await sleep(30_000);
     }
     for (const run of runs.filter((r) => r.conclusion !== "success")) {

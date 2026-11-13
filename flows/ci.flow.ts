@@ -32,7 +32,7 @@ import { flow } from "@relayflows/surface";
 import { classifyCommand, GITHUB_STEP, UNTRACKED } from "./lib/changes.ts";
 import { runFleet, writeFile, type FleetJob } from "./lib/fleet.ts";
 import { resolveBase } from "./lib/review.ts";
-import { shellWord } from "./lib/shell.ts";
+import { LIB, lib, shellWord } from "./lib/shell.ts";
 
 // 2-minute polls (lib/fleet.ts says why they are short), 130 minutes in all: they cover GitHub's 125-minute step, inside the 150m budget.
 export const POLL_MINUTES = 2;
@@ -78,8 +78,16 @@ export function applyOverride(c: Classification, given: CiInput["verdict"]): Cla
 
 const E2E_STEP = "pipeline e2e";
 
+/** The marker a state dir this flow made carries; a non-empty directory without it is never deleted. */
+export const STATE_MARKER = ".sessions-pipeline-ci";
+export const cleanStateDir = (dir: string): string => {
+  const d = shellWord(dir);
+  return `if [ -d ${d} ] && [ -n "$(ls -A ${d})" ] && [ ! -f ${d}/${STATE_MARKER} ]; then echo ${shellWord(`refusing to empty ${dir}: ci.flow.ts did not make it (no ${STATE_MARKER})`)} >&2; exit 1; fi; ` +
+    `rm -rf ${d} && mkdir -p ${d} && : > ${d}/${STATE_MARKER}`;
+};
+
 export function jobs(c: Classification, dir: string, remote: string | undefined, e2eTarget: "local" | "sandbox", workflows: string): FleetJob[] {
-  const lane = (name: string, ...args: string[]) => ({ name, command: `bash flows/lib/lane.sh ${args.map(shellWord).join(" ")}` });
+  const lane = (name: string, ...args: string[]) => ({ name, command: `bash ${lib("lane.sh")} ${args.map(shellWord).join(" ")}` });
   // Concurrency is capped by grouping: every job runs at once, its steps in order. Measured on an 8-core
   // machine, eleven heavy jobs at once (four shards, aux, three PostgreSQL proofs, the e2e) drove the load
   // past 35, starved Docker and timed out 5-second vitest cases that pass alone. So: two shard jobs of two
@@ -93,7 +101,7 @@ export function jobs(c: Classification, dir: string, remote: string | undefined,
     }
   }
   if (c.lanes.pgProof) all.push({ name: "pg-proof", steps: ["15", "16", "17"].map((major) => lane(`real PostgreSQL ${major}`, "pg-proof", major)) });
-  if (c.lanes.flows) checks.steps.push({ name: "typecheck, flows check and helper tests", command: "cd flows && npm run -s check" });
+  if (c.lanes.flows) checks.steps.push(lane("typecheck, flows check and helper tests", "flows"));
   const steps = c.verdict === "full" ? [] : c.steps;
   if (c.verdict === "full" || steps.length) {
     // The e2e writes its own report under the CI state dir; ci.flow.ts inlines it.
@@ -102,13 +110,13 @@ export function jobs(c: Classification, dir: string, remote: string | undefined,
       name: "e2e",
       steps: [{
         name: E2E_STEP,
-        command: `RELAYFLOW_STATE_DIR=${shellWord(dir)} bash flows/lib/lane.sh e2e --target ${e2eTarget}${select}`,
+        command: `RELAYFLOW_STATE_DIR=${shellWord(dir)} bash ${lib("lane.sh")} e2e --target ${e2eTarget}${select}`,
         timeoutMinutes: 45,
       }],
     });
   }
   if (remote) {
-    all.push({ name: "github", steps: [{ name: GITHUB_STEP, command: `node flows/lib/remote-ci.mjs watch ${shellWord(remote)} ${shellWord(workflows)}`, timeoutMinutes: 125 }] });
+    all.push({ name: "github", steps: [{ name: GITHUB_STEP, command: `node ${lib("remote-ci.mjs")} watch ${shellWord(remote)} ${shellWord(workflows)}`, timeoutMinutes: 125 }] });
   }
   return all;
 }
@@ -130,21 +138,30 @@ export default flow<CiInput>(
   async (f, input) => {
     const started = Date.now();
     const base = input?.base ?? "origin/main";
-    const dir = (await f.run("node flows/lib/state-dir.mjs ci")).trim();
-    await f.run(`rm -rf ${shellWord(dir)} && mkdir -p ${shellWord(dir)}`);
+    const dir = (await f.run(`node ${lib("state-dir.mjs")} ci`)).trim();
+    // Never delete a directory this flow did not make: RELAYFLOW_STATE_DIR may point anywhere.
+    await f.run(cleanStateDir(dir));
     // The same fetch, lease handling and explanation as the review flows.
     const problem = await resolveBase(f, base);
     if (problem) throw new Error(problem);
+    // The tree under test must be the commit being landed: no tracked edits, and the report names the commit.
+    const head = (await f.run("git rev-parse HEAD")).trim();
+    const dirty = (await f.run("git diff --no-ext-diff --name-only HEAD --", { onNonZero: "record" })).stdout.split("\n").filter(Boolean);
+    if (dirty.length) {
+      await f.run(writeFile(`${dir}/report.md`, `# CI: NOT RUN: the working tree differs from ${head}\n\nCommit or drop these first (${dirty.length}): ${dirty.slice(0, 10).join(", ")}\n`));
+      return f.done("needs_human", { detail: `${dirty.length} tracked file(s) differ from HEAD ${head.slice(0, 12)}; CI tests a commit, so commit or drop them and rerun` });
+    }
+    const gateSource = (await f.run(`git -C ${shellWord(LIB)} rev-parse HEAD`, { onNonZero: "record" })).stdout.trim() || "unknown";
     const mergeBase = (await f.run(`git merge-base ${shellWord(base)} HEAD`)).trim();
     const classification = applyOverride(
       JSON.parse(await f.run(classifyCommand(mergeBase, input?.jev === true), { timeout: "2m" })) as Classification,
       input?.verdict,
     );
-    // New files reach the classifier and GitHub only once staged. A change with
-    // unstaged new files is never reported CI-green.
+    // New files are not in the commit, so they are never tested: a change with untracked files is never reported CI-green.
     const untracked = (await f.run(UNTRACKED)).split("\n").filter(Boolean);
-    const dispatchable = (await f.run("node flows/lib/remote-ci.mjs dispatchable")).trim() === "1";
-    const wantGithub = input?.github === true && classification.verdict !== "none";
+    const dispatchable = (await f.run(`node ${lib("remote-ci.mjs")} dispatchable`)).trim() === "1";
+    // The GitHub gate runs for every verdict, docs-only included: it is the run main's own push gets.
+    const wantGithub = input?.github === true;
     const remote = wantGithub && !untracked.length && dispatchable ? mergeBase : undefined;
     const e2eTarget = input?.e2eTarget === "sandbox" ? "sandbox" : "local";
 
@@ -153,17 +170,18 @@ export default flow<CiInput>(
     const e2eRan = results.some((r) => r.step === E2E_STEP);
     const e2eReport = e2eRan ? (await f.run(`cat ${shellWord(`${dir}/pipeline-e2e/report.md`)} 2>/dev/null || true`)).trim() : "";
 
-    const localOnly = input?.github !== true && classification.verdict !== "none";
+    const localOnly = input?.github !== true;
     const minutes = Math.round((Date.now() - started) / 60_000);
     const report = [
       `# CI: ${red.length ? `${red.length} red` : untracked.length ? "NOT CI-green: untracked files were not tested" : localOnly ? "local checks green; GitHub gate still to come" : "green"}`,
       "",
+      `Commit under test: ${head} (merge base ${mergeBase}). Gate code: ${LIB} at ${gateSource}.`,
       ...describeClassification(classification),
       `Wall clock: ${minutes} min for a ${classification.verdict} verdict.`,
       localOnly
         ? `GitHub Actions: not run; before the squash push, rerun with --input '{"github":true}'`
-        : remote ? "" : wantGithub && !dispatchable ? "GitHub Actions: not dispatchable yet (ci.yml and pg-proof.yml gain workflow_dispatch on main with this change); main's own push run gates it"
-          : untracked.length ? "GitHub Actions: skipped until the new files are staged" : "GitHub Actions: not needed",
+        : remote ? "" : !dispatchable ? "GitHub Actions: not dispatchable yet (ci.yml and pg-proof.yml gain workflow_dispatch on main with this change); main's own push run gates it"
+          : "GitHub Actions: skipped until the untracked files are committed or excluded",
       untracked.length ? `Not covered: ${untracked.length} untracked file(s); stage the ones that belong to the change and list machine-local ones in .git/info/exclude (first: ${untracked.slice(0, 5).join(", ")})` : "",
       "Left to GitHub: the AWS hardening mutations, the AMP transport image, the session read Worker and pg-proof's other jobs (RDS emulation, ingest, consumer, buffered feed, credential probe).",
       "",
@@ -171,7 +189,7 @@ export default flow<CiInput>(
       ...(e2eReport ? ["", e2eReport.replace(/^# /, "## ")] : []),
       ...red.flatMap((r) => ["", `## ${r.job}: ${r.step}`, "", ...(r.log ? [`Full log: ${r.log} (stderr: ${r.errLog})`, ""] : []), "```", r.output, "```"]),
     ].filter((line, i, all) => line !== "" || all[i - 1] !== "").join("\n");
-    await f.run(`${writeFile(`${dir}/report.md`, report)} && ${writeFile(`${dir}/report.json`, JSON.stringify({ classification, results, minutes }, null, 2))}`);
+    await f.run(`${writeFile(`${dir}/report.md`, report)} && ${writeFile(`${dir}/report.json`, JSON.stringify({ head, mergeBase, gate: { lib: LIB, commit: gateSource }, classification, results, minutes }, null, 2))}`);
 
     if (red.length) {
       return f.done("step_failed", { detail: `${red.map((r) => `${r.job}: ${r.step}`).join("; ")}; see ${dir}/report.md` });
@@ -179,7 +197,7 @@ export default flow<CiInput>(
     if (untracked.length) {
       return f.done("needs_human", { detail: `${untracked.length} untracked file(s) were not tested; stage the ones that belong to the change and rerun` });
     }
-    if (wantGithub && !dispatchable) {
+    if (!localOnly && !dispatchable) {
       // Green locally, but the gate could not run: never report that as the final gate passing.
       return f.done("needs_human", { detail: `${classification.verdict}: local checks green in ${minutes} min; the GitHub gate could not be dispatched (ci.yml or pg-proof.yml has no workflow_dispatch on origin/main)` });
     }

@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { spawn } from "node:child_process";
-import { failedTests, PREEMPTED, stopPrevious, wait } from "./fleet.mjs";
+import { failedTests, PREEMPTED, stopPrevious, stopStep, wait } from "./fleet.mjs";
 import { preempted, PREEMPTED as PREEMPTED_TS } from "./fleet.ts";
 
 const FLEET = fileURLToPath(new URL("./fleet.mjs", import.meta.url));
@@ -347,4 +347,19 @@ test("stopping a fleet also stops the step of a job that already died", () => {
   process.kill(-firstPid(dir), "SIGKILL");
   fleet("stop", dir);
   assert.ok(gone(own(marker)), "stop must reach the dead job's step");
+});
+
+test("a stop's SIGKILL reaches only the step it stopped, never the step that runs next", async () => {
+  const sleeper = () => spawn("/bin/sh", ["-c", "sleep 30"], { detached: true, stdio: "ignore" });
+  // The first step obeys SIGTERM at once; the job moves on to a second step before the grace runs out.
+  const first = sleeper();
+  const exited = new Promise((r) => first.on("exit", r));
+  stopStep(first, 200);
+  await exited;
+  const second = sleeper();
+  await new Promise((r) => setTimeout(r, 400));
+  let alive = true;
+  try { process.kill(second.pid, 0); } catch { alive = false; }
+  process.kill(-second.pid, "SIGKILL");
+  assert.ok(alive, "the delayed SIGKILL hit the next step");
 });

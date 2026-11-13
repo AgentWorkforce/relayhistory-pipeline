@@ -21,7 +21,7 @@ import { liveMachineId } from "../../src/session-ingest/writer.ts";
 import type { LedgerTenant } from "../../src/session-ingest/ledger.ts";
 import { deliveryAccount } from "../../src/session-ingest/vendor/delivery/prepare.ts";
 import { masterKeyring, parseMasterKeys } from "../../src/shared/keyring.ts";
-import { manifestKey, objectKey, readAll, type ObjectStore } from "../../src/shared/vendor.ts";
+import { chunkKeys, manifestKey, objectKey, readAll, type ObjectStore } from "../../src/shared/vendor.ts";
 import { TENANT_A, TENANT_B, type Tenant } from "../selfhost/stack.ts";
 import { COURIER_SESSION, FENCE_AUTHORITY, FIXTURES, SOURCE, STARTED_MS, courierTranscript, deliveryBatch, type Fixture } from "./fixtures.ts";
 import { CANONICAL_BUCKET, HOOP_BUCKET, HOOP_SERVICES, HOOP_TENANT, KEY_ROOT, SELFHOST_SERVICES, type PipelineStack } from "./stack.ts";
@@ -177,10 +177,16 @@ export const STEPS: readonly Step[] = [
       for (const [t, f] of [[TENANT_A, FIXTURES.http], [TENANT_B, FIXTURES.s3]] as const) {
         const c = await canonical(stack, t, f);
         must(c.manifest, `${f.originId}: no manifest.json among ${c.keys.length} object(s) for the session`);
-        must(c.manifest.raw.chunks.length >= 1 && c.chunks.length >= c.manifest.raw.chunks.length, `${f.originId}: manifest names ${c.manifest.raw.chunks.length} chunk(s), ${c.chunks.length} stored`);
-        const raw = await readAll(await stack.store(CANONICAL_BUCKET).get(objectKey(c.chunks[0]!)));
-        must(raw.length > 0 && !Buffer.from(raw).toString("latin1").includes(f.marker), `${f.originId}: a stored chunk is empty or not sealed (marker readable as plain bytes)`);
-        parts.push(`${f.originId}: manifest rev ${c.manifest.revision}, ${c.chunks.length} chunk object(s)`);
+        must(c.manifest.raw.chunks.length >= 1, `${f.originId}: the manifest names no chunk`);
+        // Every chunk the manifest names, at the key the reader derives for it, is stored and sealed.
+        const prefix = c.manifestKey!.slice(0, c.manifestKey!.indexOf("/v1/"));
+        const named = chunkKeys(c.manifest as never, { prefix }).map((k) => String(k.key));
+        for (const key of named) {
+          must(c.keys.includes(key), `${f.originId}: the manifest names ${key.split("/").slice(-2).join("/")}, which is not stored`);
+          const raw = await readAll(await stack.store(CANONICAL_BUCKET).get(objectKey(key)));
+          must(raw.length > 0 && !Buffer.from(raw).toString("latin1").includes(f.marker), `${f.originId}: chunk ${key.split("/").pop()} is empty or not sealed (marker readable as plain bytes)`);
+        }
+        parts.push(`${f.originId}: manifest rev ${c.manifest.revision}, all ${named.length} named chunk(s) stored and sealed`);
       }
       return parts.join("; ");
     },
@@ -388,6 +394,8 @@ export const STEPS: readonly Step[] = [
         if (!row) return { last: "no session_index row" };
         const [st, uuid, src] = row;
         if (st === "unknown") return { last: `indexed (${uuid}) but not classified yet` };
+        // The fixture is a finished session: the referee classifies it done, deterministically.
+        if (st !== "done") throw new Failed(`the referee classified the fixture ${st}, not done`);
         state.courierSessionUuid = uuid;
         return { done: `session_index state=${st}; session_index_ext uuid=${uuid} (${src})` };
       });

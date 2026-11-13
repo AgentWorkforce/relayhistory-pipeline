@@ -31,30 +31,30 @@ const done = (results) => JSON.stringify({ state: "done", results });
 
 test("runFleet waits on, and stops, the fleet by the token its start printed", async () => {
   const { f, runs } = fakeCtx([
-    [/fleet\.mjs start/, started],
-    [/fleet\.mjs wait/, done([{ job: "a", step: "s", ok: true, output: "" }])],
+    [/fleet\.mjs' start/, started],
+    [/fleet\.mjs' wait/, done([{ job: "a", step: "s", ok: true, output: "" }])],
   ]);
   const results = await runFleet(f, ".relayflow/x/fleet", [{ name: "a", steps: [{ name: "s", command: "true" }] }], 2);
   assert.equal(results.length, 1);
-  assert.ok(runs.some((c) => c.includes("fleet.mjs wait '.relayflow/x/fleet' 'TOKEN-abc123'")), runs.join("\n"));
+  assert.ok(runs.some((c) => c.includes("fleet.mjs' wait '.relayflow/x/fleet' 'TOKEN-abc123'")), runs.join("\n"));
   const pending = fakeCtx([
-    [/fleet\.mjs start/, started],
-    [/fleet\.mjs wait/, JSON.stringify({ state: "pending", results: [{ job: "a", step: "fleet", ok: false, output: "still running when this wait ended" }] })],
+    [/fleet\.mjs' start/, started],
+    [/fleet\.mjs' wait/, JSON.stringify({ state: "pending", results: [{ job: "a", step: "fleet", ok: false, output: "still running when this wait ended" }] })],
   ]);
   const late = await runFleet(pending.f, ".relayflow/x/fleet", [{ name: "a", steps: [{ name: "s", command: "sleep 9" }] }], 1);
   assert.match(late[0].output, /^still running after 13 minutes/);
-  assert.ok(pending.runs.some((c) => c.includes("fleet.mjs stop '.relayflow/x/fleet' 'TOKEN-abc123'")), "the out-of-polls stop names the fleet too");
+  assert.ok(pending.runs.some((c) => c.includes("fleet.mjs' stop '.relayflow/x/fleet' 'TOKEN-abc123'")), "the out-of-polls stop names the fleet too");
 });
 
 test("runFleet polls for the minutes it is given and counts them when it runs out", async () => {
   const pending = fakeCtx([
-    [/fleet\.mjs start/, started],
-    [/fleet\.mjs wait/, JSON.stringify({ state: "pending", results: [{ job: "a", step: "fleet", ok: false, output: "still running when this wait ended" }] })],
+    [/fleet\.mjs' start/, started],
+    [/fleet\.mjs' wait/, JSON.stringify({ state: "pending", results: [{ job: "a", step: "fleet", ok: false, output: "still running when this wait ended" }] })],
   ]);
   const late = await runFleet(pending.f, ".relayflow/x/fleet", [{ name: "a", steps: [{ name: "s", command: "sleep 9" }] }], 3, 2);
-  const waits = pending.runs.filter((c) => c.includes("fleet.mjs wait"));
+  const waits = pending.runs.filter((c) => c.includes("fleet.mjs' wait"));
   assert.equal(waits.length, 3);
-  assert.ok(waits.every((c) => c.endsWith("fleet.mjs wait '.relayflow/x/fleet' 'TOKEN-abc123' 2")), waits.join("\n"));
+  assert.ok(waits.every((c) => c.endsWith("fleet.mjs' wait '.relayflow/x/fleet' 'TOKEN-abc123' 2")), waits.join("\n"));
   assert.match(late[0].output, /^still running after 6 minutes/);
   await assert.rejects(runFleet(pending.f, ".relayflow/x/fleet", [], 1, 14), /at most 13 minutes/, "a poll never outgrows the command ceiling");
 });
@@ -72,8 +72,8 @@ const fleetOptions = { flow: "adversarial-review", root: "/repo", dir: ".relayfl
 
 test("a review fleet a newer fleet took over counts every lens as unreviewed", async () => {
   const { f } = fakeCtx([
-    [/fleet\.mjs start/, started],
-    [/fleet\.mjs wait/, done([{ job: "correctness", step: "review", ok: true, output: "" }, { job: "fleet", step: "fleet", ok: false, output: PREEMPTED }])],
+    [/fleet\.mjs' start/, started],
+    [/fleet\.mjs' wait/, done([{ job: "correctness", step: "review", ok: true, output: "" }, { job: "fleet", step: "fleet", ok: false, output: PREEMPTED }])],
   ]);
   const result = await reviewFleet(f, { ...fleetOptions, model: "claude-opus-5-5" });
   assert.equal(result.preempted, true);
@@ -93,8 +93,8 @@ test("runReview hands the model to every reviewer input and to the verifier, and
   };
   const green = fakeCtx([
     [/git hash-object --stdin/, "fingerprint"],
-    [/fleet\.mjs start/, started],
-    [/fleet\.mjs wait/, done([{ job: "correctness", step: "review", ok: true, output: "" }, { job: "tests", step: "review", ok: true, output: "" }])],
+    [/fleet\.mjs' start/, started],
+    [/fleet\.mjs' wait/, done([{ job: "correctness", step: "review", ok: true, output: "" }, { job: "tests", step: "review", ok: true, output: "" }])],
     [/^node -e /, "0 2"],
   ]);
   const verdict = await runReview(green.f, { flow: "adversarial-review", prepared, lenses, clis: ["claude"], model: "claude-fable-5-1", preamble: "P" });
@@ -105,23 +105,23 @@ test("runReview hands the model to every reviewer input and to the verifier, and
   assert.equal(green.agents.length, 1);
   assert.equal(green.agents[0].name, "verifier");
   assert.equal(green.agents[0].options.model, "claude-fable-5-1");
-  assert.ok(green.runs.some((c) => c.includes("review-state.mjs save 'adversarial-review'")), "a clean round is saved");
+  assert.ok(green.runs.some((c) => c.includes("review-state.mjs' save 'adversarial-review'")), "a clean round is saved");
 
   const taken = fakeCtx([
     [/git hash-object --stdin/, "fingerprint"],
-    [/fleet\.mjs start/, started],
-    [/fleet\.mjs wait/, done([{ job: "fleet", step: "fleet", ok: false, output: PREEMPTED }])],
+    [/fleet\.mjs' start/, started],
+    [/fleet\.mjs' wait/, done([{ job: "fleet", step: "fleet", ok: false, output: PREEMPTED }])],
   ]);
   const lost = await runReview(taken.f, { flow: "adversarial-review", prepared, lenses, clis: ["claude"], model: "claude-fable-5-1", preamble: "P" });
   assert.equal(lost.reason, "step_failed");
   assert.match(lost.detail, /preempted by a newer review/);
   assert.equal(taken.agents.length, 0, "no verifier ran");
-  assert.ok(!taken.runs.some((c) => c.includes("review-state.mjs save")), "nothing was saved");
+  assert.ok(!taken.runs.some((c) => c.includes("review-state.mjs' save")), "nothing was saved");
 
   const plain = fakeCtx([
     [/git hash-object --stdin/, "fingerprint"],
-    [/fleet\.mjs start/, started],
-    [/fleet\.mjs wait/, done([{ job: "correctness", step: "review", ok: true, output: "" }, { job: "tests", step: "review", ok: true, output: "" }])],
+    [/fleet\.mjs' start/, started],
+    [/fleet\.mjs' wait/, done([{ job: "correctness", step: "review", ok: true, output: "" }, { job: "tests", step: "review", ok: true, output: "" }])],
     [/^node -e /, "0 0"],
   ]);
   await runReview(plain.f, { flow: "adversarial-review", prepared, lenses, clis: ["claude"], preamble: "P" });
@@ -172,10 +172,10 @@ test("every agent is told where a copy of the repository may go: outside the run
 
 test("a review fleet waits in its short polls", async () => {
   const { f, runs } = fakeCtx([
-    [/fleet\.mjs start/, started],
-    [/fleet\.mjs wait/, done([{ job: "correctness", step: "review", ok: true, output: "" }, { job: "tests", step: "review", ok: true, output: "" }])],
+    [/fleet\.mjs' start/, started],
+    [/fleet\.mjs' wait/, done([{ job: "correctness", step: "review", ok: true, output: "" }, { job: "tests", step: "review", ok: true, output: "" }])],
   ]);
   await reviewFleet(f, { ...fleetOptions, model: "claude-opus-5-5" });
-  const waits = runs.filter((c) => c.includes("fleet.mjs wait"));
+  const waits = runs.filter((c) => c.includes("fleet.mjs' wait"));
   assert.ok(waits.length > 0 && waits.every((c) => c.endsWith(` ${REVIEW_POLL_MINUTES}`)), waits.join("\n"));
 });

@@ -7,7 +7,7 @@
 import type { Ctx } from "@relayflows/surface";
 import { MACHINE_LOCAL } from "./changes.ts";
 import { preempted, runFleet, writeFile } from "./fleet.ts";
-import { shellWord } from "./shell.ts";
+import { FLOWS, lib, shellWord } from "./shell.ts";
 
 export { shellWord };
 
@@ -144,7 +144,7 @@ export async function prepare(f: Ctx, flowName: string, input: ReviewInput | und
   if (problem) throw new Error(problem);
   const state = JSON.parse(
     await f.run(
-      `node flows/lib/review-state.mjs prepare ${shellWord(flowName)} ${shellWord(base)} ${input?.full ? 1 : 0} ` +
+      `node ${lib("review-state.mjs")} prepare ${shellWord(flowName)} ${shellWord(base)} ${input?.full ? 1 : 0} ` +
         (input?.include ?? []).map(shellWord).join(" "),
       { timeout: "2m" },
     ),
@@ -160,7 +160,7 @@ export async function prepare(f: Ctx, flowName: string, input: ReviewInput | und
 
 /** Record the reviewed snapshot and its open findings for the next run. */
 export const saveState = (f: Ctx, flowName: string, prepared: Prepared) =>
-  f.run(`node flows/lib/review-state.mjs save ${shellWord(flowName)} ${shellWord(prepared.snapshot)} ${shellWord(prepared.mergeBase)}`);
+  f.run(`node ${lib("review-state.mjs")} save ${shellWord(flowName)} ${shellWord(prepared.snapshot)} ${shellWord(prepared.mergeBase)}`);
 
 /** How each flow tells its fleet which part of the change the patch is. */
 export const roundNote = (p: Prepared): string =>
@@ -227,7 +227,7 @@ const WRITE_AS_YOU_GO =
 /** The gate every reviewer's file must pass: parseable, the shape above, and every finding in a changed file. */
 export const findingsGate = (path: string, files: string) => ({
   type: "subprocess_gate" as const,
-  command: `node flows/lib/check-findings.mjs ${shellWord(path)} ${shellWord(files)}`,
+  command: `node ${lib("check-findings.mjs")} ${shellWord(path)} ${shellWord(files)}`,
 });
 
 /**
@@ -294,13 +294,13 @@ export async function reviewFleet(f: Ctx, opts: FleetOptions): Promise<{ paths: 
     inputs.map((input) => `mkdir -p ${shellWord(input.cwd)} && ${writeFile(`${input.cwd}/input.json`, JSON.stringify(input))}`).join(" && "),
   );
   // One daemon for the whole fleet; it runs the reviewers' runs side by side.
-  const flows = `flows/node_modules/.bin/flows run --local-agent --no-observer-link --data-dir .relayflowd/${opts.flow}-fleet`;
+  const flows = `${shellWord(`${FLOWS}/node_modules/.bin/flows`)} run --local-agent --no-observer-link --data-dir .relayflowd/${opts.flow}-fleet`;
   const results = await runFleet(
     f,
     `${opts.dir}/fleet`,
     inputs.map((input) => ({
       name: input.lens,
-      steps: [{ name: "review", command: `${flows} flows/reviewer.flow.ts --input ${shellWord(`${input.cwd}/input.json`)}` }],
+      steps: [{ name: "review", command: `${flows} ${shellWord(`${FLOWS}/reviewer.flow.ts`)} --input ${shellWord(`${input.cwd}/input.json`)}` }],
     })),
     REVIEW_POLLS,
     REVIEW_POLL_MINUTES,

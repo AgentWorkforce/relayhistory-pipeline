@@ -23,8 +23,15 @@ import { fileURLToPath } from "node:url";
 export const VERDICTS = ["none", "targeted", "full"];
 const rank = (v) => VERDICTS.indexOf(v);
 
-/** Docs: Markdown and images under docs/, plus the license files. Agent instructions are docs here too. */
-export const DOCS = /(^|\/)[^/]+\.md$|^docs\/.*\.(png|jpg|jpeg|svg)$|^(LICENSE|NOTICE)$/;
+/**
+ * Plain docs, the only paths that can be `none`: Markdown and images under docs/, except the contracts
+ * (pg-proof hashes them), the decisions and handoffs (policy), and any doc the code reads (`referenced`
+ * below: a test or script that names the file). Root Markdown (AGENTS.md is the agents' policy), agent/
+ * (a deployed prompt), runbooks/ and Markdown anywhere else are never `none`.
+ */
+export const DOCS = /^docs\/(?!contracts\/|decisions\/|handoffs\/|packets\/)[^]*\.(md|png|jpg|jpeg|svg)$/;
+/** Markdown that is policy, a prompt or an operator procedure: at least the unit lanes and the gate. */
+export const POLICY_DOCS = /^[^/]+\.md$|^(agent|runbooks|docs\/(decisions|handoffs|packets))\/|^(LICENSE|NOTICE)$/;
 
 /**
  * Paths whose change runs the whole pipeline e2e: the ingest and every ledger, the database
@@ -50,8 +57,11 @@ export const FULL_RULES = [
   [/^config\//, "service config"],
   [/^(package\.json|bun\.lock|bunfig\.toml|tsconfig\.json|versions\.lock\.json|\.gitmodules|\.gitignore|\.gitattributes)$/, "dependencies or build config"],
   [/^\.github\//, "GitHub workflows"],
-  [/^flows\/(ci\.flow\.ts|lib\/(classify\.mjs|fleet\.(mjs|ts)|remote-ci\.mjs|changes\.ts|state-dir\.mjs|lane\.sh))$/, "the CI gate itself"],
+  [/^flows\//, "the CI and review gate itself (every file under flows/)"],
   [/^land\.config\.json$/, "the landing config"],
+  [/^docs\/contracts\//, "a contract (pg-proof hashes the current ones)"],
+  [/^scripts\/(pg-proof|ci)\//, "pg-proof or the CI shard plan"],
+  [/^src\/(acquisition|migration)\//, "acquisition or migration (the erasure executor the re-arm sweeper uses lives here)"],
 ];
 
 /** Code that reaches only some of the e2e: its steps, by e2e/pipeline/steps.ts id. */
@@ -61,14 +71,13 @@ export const TARGETED_RULES = [
   [/^src\/bob-costas\//, COURIER],
   [/^src\/referee\//, ["upload.courier", "index.hoop"]],
   // Unit lanes only: no e2e step drives these.
-  [/^src\/(session-brief|acquisition|amp|canonical-project-events|session-analysis|search-features|history-db|migration|proof|smoke|cli|session-brief)\//, []],
+  [/^src\/(session-brief|amp|canonical-project-events|session-analysis|search-features|history-db|proof|smoke|cli)\//, []],
   [/^packages\/(session-read-worker|coordination-detect)\//, []],
   [/^(scripts|benchmarks|runbooks|integration|certs|bin|agent)\//, []],
-  [/^flows\//, []],
 ];
 
 /** The path rules' verdict and why, for each path (exported for the tests). */
-export function classifyPaths(paths) {
+export function classifyPaths(paths, referenced = () => false) {
   if (paths.length === 0) return { verdict: "none", reasons: ["no changes against the base"], steps: [] };
   const reasons = [];
   const steps = new Set();
@@ -77,7 +86,11 @@ export function classifyPaths(paths) {
   for (const path of paths) {
     const full = FULL_RULES.find(([re]) => re.test(path));
     if (full) { raise("full"); reasons.push(`full: ${path} (${full[1]})`); continue; }
-    if (DOCS.test(path)) continue;
+    if (POLICY_DOCS.test(path)) { raise("targeted"); reasons.push(`targeted: ${path} (policy, prompt or runbook text: unit lanes)`); continue; }
+    if (DOCS.test(path)) {
+      if (referenced(path)) { raise("targeted"); reasons.push(`targeted: ${path} (a test or script reads this doc: unit lanes)`); }
+      continue;
+    }
     const targeted = TARGETED_RULES.find(([re]) => re.test(path));
     if (targeted) { raise("targeted"); for (const s of targeted[1]) steps.add(s); reasons.push(`targeted: ${path}${targeted[1].length ? ` (e2e: ${targeted[1].join(", ")})` : " (unit lanes)"}`); continue; }
     raise("full");
@@ -165,14 +178,24 @@ export function combine(rules, jev) {
 
 const git = (...args) => execFileSync("git", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }).trim();
 
+/** Whether any tracked file other than Markdown names this doc (a test or script that reads it). */
+export function referencedBy(path) {
+  try {
+    return git("grep", "-l", "-F", "-e", path, "HEAD", "--", ":!*.md").length > 0;
+  } catch {
+    return false; // git grep exits 1 when nothing matches
+  }
+}
+
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const [mergeBase, ...flags] = process.argv.slice(2);
   try {
     if (!/^[0-9a-f]{40}$/.test(mergeBase ?? "")) throw new Error("usage: classify.mjs <merge-base sha> [--jev]");
-    const paths = git("diff", "--no-renames", "--name-only", mergeBase).split("\n").filter(Boolean);
-    const rules = classifyPaths(paths);
+    // The commit, not the working tree: ci.flow.ts refuses a tree with tracked edits.
+    const paths = git("diff", "--no-renames", "--name-only", mergeBase, "HEAD").split("\n").filter(Boolean);
+    const rules = classifyPaths(paths, referencedBy);
     const jev = flags.includes("--jev")
-      ? await askJev(paths, git("diff", "--no-renames", "--stat=200", mergeBase), rules.verdict)
+      ? await askJev(paths, git("diff", "--no-renames", "--stat=200", mergeBase, "HEAD"), rules.verdict)
       : { asked: false, reason: "not requested (--jev)" };
     const verdict = combine(rules, jev);
     console.log(JSON.stringify({ ...verdict, rulesVerdict: rules.verdict, jev, lanes: lanesFor(verdict.verdict, paths), paths: paths.length }));

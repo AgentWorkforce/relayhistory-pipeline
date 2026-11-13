@@ -12,7 +12,7 @@
 // PASS/FAIL/SKIP line per step. The run ends step_failed on any FAIL.
 import { flow } from "@relayflows/surface";
 import { runFleet } from "./lib/fleet.ts";
-import { shellWord } from "./lib/shell.ts";
+import { lib, shellWord } from "./lib/shell.ts";
 
 interface E2eInput {
   /** Where the stack runs. Default "local". */
@@ -31,13 +31,13 @@ export default flow<E2eInput>(
     const steps = input?.steps ?? [];
     if (steps.some((s) => !STEP_ID.test(s))) throw new Error("steps must be e2e/pipeline/steps.ts ids");
     // The state root holds every flow's directory; run.ts writes <root>/pipeline-e2e/.
-    const root = (await f.run("node flows/lib/state-dir.mjs")).trim();
-    const dir = (await f.run("node flows/lib/state-dir.mjs pipeline-e2e")).trim();
+    const root = (await f.run(`node ${lib("state-dir.mjs")}`)).trim();
+    const dir = (await f.run(`node ${lib("state-dir.mjs")} pipeline-e2e`)).trim();
     const select = steps.length ? ` --steps ${shellWord(steps.join(","))}` : "";
     // One job in the fleet: its polls are short, so a lost root lease is followed (lib/fleet.ts).
     const [result] = await runFleet(f, `${dir}/fleet`, [{
       name: "e2e",
-      steps: [{ name: "pipeline e2e", command: `RELAYFLOW_STATE_DIR=${shellWord(root)} bash flows/lib/lane.sh e2e --target ${target}${select}`, timeoutMinutes: 50 }],
+      steps: [{ name: "pipeline e2e", command: `RELAYFLOW_STATE_DIR=${shellWord(root)} bash ${lib("lane.sh")} e2e --target ${target}${select}`, timeoutMinutes: 50 }],
     }], 27, 2);
     const report = (await f.run(`cat ${shellWord(`${dir}/report.md`)} 2>/dev/null || true`)).trim();
     if (!result?.ok) return f.done("step_failed", { detail: `${report.split("\n")[0] || result?.output || "no report"}; see ${dir}/report.md` });

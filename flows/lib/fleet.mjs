@@ -127,18 +127,23 @@ function start(dir) {
 // its own process group, outside the job's.
 let running;
 const STOP_GRACE_MS = 10_000;
-const signalRunning = (signal) => {
+const signalStep = (child, signal) => {
   try {
-    if (running) process.kill(-running.pid, signal);
+    if (child) process.kill(-child.pid, signal);
   } catch {
     // Already gone.
   }
 };
-/** SIGTERM first, so a step can clean up after itself (remote-ci deletes its branch), then SIGKILL. */
-const stopRunning = () => {
-  signalRunning("SIGTERM");
-  setTimeout(() => signalRunning("SIGKILL"), STOP_GRACE_MS).unref();
+/**
+ * SIGTERM first, so a step can clean up after itself (remote-ci deletes its branch), then SIGKILL. The kill is
+ * bound to the step that was running when the stop began: if it exits within the grace and the job moves on,
+ * the next step is never killed in its place. (Changed from relay-app's copy, which re-read `running`.)
+ */
+export const stopStep = (child, grace = STOP_GRACE_MS) => {
+  signalStep(child, "SIGTERM");
+  setTimeout(() => signalStep(child, "SIGKILL"), grace).unref();
 };
+const stopRunning = () => stopStep(running);
 
 // The running step's pid and start time, beside its job's results: a job that
 // dies cannot stop its step, so `wait` does, once it has checked the pid still

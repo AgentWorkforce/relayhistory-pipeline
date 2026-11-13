@@ -2,7 +2,7 @@
 // the review flows and their tests. Adapted from relay-app's flows/lib/changes.ts
 // (see flows/README.md for provenance); the lane selection itself lives in
 // flows/lib/classify.mjs.
-import { shellWord } from "./shell.ts";
+import { lib, shellWord } from "./shell.ts";
 
 /**
  * Machine-local state that lives in the checkout but is never part of a
@@ -25,4 +25,4 @@ export const GITHUB_STEP = "Actions";
 
 /** The classifier's verdict for the paths changed from the merge base to the working tree (flows/lib/classify.mjs). */
 export const classifyCommand = (mergeBase: string, jev: boolean): string =>
-  `node flows/lib/classify.mjs ${shellWord(mergeBase)}${jev ? " --jev" : ""}`;
+  `node ${lib("classify.mjs")} ${shellWord(mergeBase)}${jev ? " --jev" : ""}`;
