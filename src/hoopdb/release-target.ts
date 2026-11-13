@@ -225,6 +225,73 @@ export function releaseAnchorPathAllowed(path: string, anchorSteps: ReadonlySet<
   return !!rb && anchorSteps.has(`upstream:${rb[1]}.sql`);
 }
 
+/**
+ * The two workflow files an anchor may carry, and only in one form: its main base's
+ * bytes after releaseAnchorWorkflowTransform. A push runs the workflow files of the
+ * pushed tree, so an anchor built on a main base from before ci.yml and pg-proof.yml ran
+ * on release/schema-* pushes (for example 113dc657) needs exactly that one change to
+ * get the push ci and pg-proof runs scripts/schema-release-github.ts requires
+ * (release_target_ci). Not in RELEASE_ANCHOR_FIXED_PATHS: releaseAnchorPathAllowed
+ * refuses them, and requireReleaseAnchor checks them byte for byte against the main base
+ * (release_anchor_workflow_drift), never against the release sha.
+ */
+export const RELEASE_ANCHOR_WORKFLOW_PATHS: readonly string[] = [".github/workflows/ci.yml", ".github/workflows/pg-proof.yml"];
+const RELEASE_ANCHOR_WORKFLOW_DIR = ".github/workflows/";
+/** The main-only push branch selector the transform replaces (two-space YAML indent). */
+export const RELEASE_ANCHOR_WORKFLOW_PUSH_MAIN = "    branches: [main]";
+/** Its replacement: the exact hunk main's 42797f3c added to both files. */
+export const RELEASE_ANCHOR_WORKFLOW_PUSH_RELEASE: readonly string[] = [
+  "    # release/schema-*: the protected release anchor branches (a held-step target_sha",
+  "    # needs green push runs on its own branch; scripts/schema-release-github.ts).",
+  "    branches: [main, 'release/schema-*']",
+];
+
+/**
+ * The one change an anchor may make to ci.yml or pg-proof.yml (pure; text split on
+ * "\n", so a caller passing latin1-decoded bytes gets a byte-exact result). `base` must
+ * contain the line `    branches: [main]` exactly once, directly under the line
+ * `  push:`, inside the top-level `on:` block (the lines between `on:` and `  push:` are
+ * empty or indented). That one line is replaced by RELEASE_ANCHOR_WORKFLOW_PUSH_RELEASE
+ * (two comment lines and `    branches: [main, 'release/schema-*']`); every other byte,
+ * line endings and the final newline included, is kept. Otherwise refuses
+ * release_anchor_workflow_drift.
+ */
+export function releaseAnchorWorkflowTransform(base: string): string {
+  const lines = base.split("\n");
+  const at = lines.flatMap((l, i) => (l === RELEASE_ANCHOR_WORKFLOW_PUSH_MAIN ? [i] : []));
+  if (at.length !== 1)
+    refuse("release_anchor_workflow_drift", "the main base workflow does not have exactly one main-only push branch selector");
+  const i = at[0]!;
+  if (lines[i - 1] !== "  push:")
+    refuse("release_anchor_workflow_drift", "the main base workflow's branch selector is not directly under push");
+  let on = i - 2;
+  while (on >= 0 && (lines[on] === "" || lines[on]!.startsWith(" "))) on--;
+  if (on < 0 || lines[on] !== "on:")
+    refuse("release_anchor_workflow_drift", "the main base workflow's push trigger is not in the top-level on block");
+  return [...lines.slice(0, i), ...RELEASE_ANCHOR_WORKFLOW_PUSH_RELEASE, ...lines.slice(i + 1)].join("\n");
+}
+
+/**
+ * An anchor's ci.yml or pg-proof.yml (a path its diff from the main base changes): a
+ * regular 100644 blob at both, and target_sha's bytes exactly
+ * releaseAnchorWorkflowTransform(main base bytes). release_anchor_workflow_drift otherwise.
+ */
+function requireAnchorWorkflow(repo: string, mainBase: string, targetSha: string, path: string): void {
+  const blob = (sha: string): Buffer => {
+    const es = lsTree(repo, sha, path).filter((e) => e.path === path);
+    if (es.length !== 1 || es[0]!.type !== "blob" || es[0]!.mode !== "100644")
+      refuse("release_anchor_workflow_drift", "an anchor workflow file is not a regular 100644 file at the main base and target_sha");
+    const r = git(repo, ["cat-file", "blob", es[0]!.oid]);
+    if (r.status !== 0) refuse("release_target_sha_unknown", "a target blob is not in the local object database");
+    return r.stdout;
+  };
+  const base = blob(mainBase);
+  const anchor = blob(targetSha);
+  // latin1 maps each byte to one code unit and back, so the comparison is byte for byte.
+  if (!Buffer.from(releaseAnchorWorkflowTransform(base.toString("latin1")), "latin1").equals(anchor))
+    refuse("release_anchor_workflow_drift", "an anchor workflow file is not its main base with only the release/schema-* push branches added");
+}
+
 /** Migrator order (compareSteps): lane first (RELEASE_TREE.lanes), then the name. */
 function stepOrder(a: string, b: string): number {
   const lane = (n: string) => RELEASE_TREE.lanes.findIndex((l) => n.startsWith(l.prefix));
@@ -283,7 +350,10 @@ export interface ReleaseAnchorChain {
  *    (releaseAnchorPathAllowed; release_anchor_extra_file) and byte-identical, mode
  *    included, to the release sha's (release_anchor_file_drift; absent at both counts as
  *    identical); the five SESSION_BOOTSTRAP_FILES must match the release sha even when
- *    the anchor does not change them.
+ *    the anchor does not change them. Exception: .github/workflows/ci.yml and
+ *    pg-proof.yml may differ, only as releaseAnchorWorkflowTransform of the main base's
+ *    bytes, mode 100644 at both (release_anchor_workflow_drift; also for any other
+ *    .github/workflows/ path).
  */
 export function requireReleaseAnchor(input: {
   repo: string;
@@ -353,12 +423,19 @@ export function requireReleaseAnchor(input: {
   const diff = git(repo, ["diff-tree", "-r", "-z", "--no-renames", "--no-ext-diff", "--name-only", mainBase, targetSha, "--"]);
   if (diff.status !== 0) refuse("release_target_sha_unknown", "the anchor diff could not be read");
   const paths = diff.stdout.toString("utf8").split("\0").filter(Boolean);
+  // ci.yml and pg-proof.yml: only main base -> releaseAnchorWorkflowTransform, checked
+  // against the main base (not the release sha); any other workflow file refuses.
+  const workflows = paths.filter((p) => p.startsWith(RELEASE_ANCHOR_WORKFLOW_DIR));
   for (const path of paths)
-    if (!releaseAnchorPathAllowed(path, anchorSteps))
+    if (path.startsWith(RELEASE_ANCHOR_WORKFLOW_DIR)) {
+      if (!RELEASE_ANCHOR_WORKFLOW_PATHS.includes(path))
+        refuse("release_anchor_workflow_drift", "the anchor changes a workflow file other than ci.yml and pg-proof.yml");
+    } else if (!releaseAnchorPathAllowed(path, anchorSteps))
       refuse("release_anchor_extra_file", "the anchor changes a path outside the release anchor allowlist");
-  // The diff paths, and the five bootstrap files whether or not the anchor changes them
-  // (an anchor that leaves them at main base bytes would bootstrap something else).
-  for (const path of new Set([...paths, ...SESSION_BOOTSTRAP_FILES]))
+  for (const path of workflows) requireAnchorWorkflow(repo, mainBase, targetSha, path);
+  // The other diff paths, and the five bootstrap files whether or not the anchor changes
+  // them (an anchor that leaves them at main base bytes would bootstrap something else).
+  for (const path of new Set([...paths.filter((p) => !workflows.includes(p)), ...SESSION_BOOTSTRAP_FILES]))
     if (entryAt(repo, targetSha, path) !== entryAt(repo, releaseSha, path))
       refuse("release_anchor_file_drift", "an anchor file differs from the release sha");
   return { branch, mainBase, below };
