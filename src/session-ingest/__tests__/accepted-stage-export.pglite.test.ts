@@ -652,8 +652,26 @@ describe("accepted-stage export (0005 step 0b): SQL's own verdict per stage", ()
     expect(refused.objects.stage_export_missing).toBe(2);
     expect(refused.objects.would_drain).toBe(0);
     // A clean export reopens it.
-    expect((await run(store)).orgs).toMatchObject({ incomplete: 0, complete: 1 });
+    // P3-3: the revocation the failed run left still counts as an earlier completion (renewed, not new).
+    expect((await run(store)).orgs).toMatchObject({ incomplete: 0, complete: 0, already_complete: 1 });
     expect(parseAcceptedComplete(await readText(store, acceptedCompleteKey(ROOT, A.orgId)))).toMatchObject({ stages: 2 });
     expect((await drain()).objects.would_drain).toBe(2);
+  });
+
+  test("lander P3-2: an org with a completion but no stage intent left is revoked, superseded and renewed too", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    const s = await stageInBoth(store, [{ source: "claude", session: "s1", records: [{ id: "a", rev: 1 }] }]);
+    expect((await run(store)).orgs.complete).toBe(1);
+    expect(parseAcceptedMarker(await readText(store, s.key + ACCEPTED_SUFFIX))).toMatchObject({ live: true });
+    // SQL loses every stage intent of the org (an erased user): it is not in ORGS any more.
+    await db.exec("DELETE FROM sessions.ingest_buffer_outbox; DELETE FROM sessions.ingest_stage_intents");
+    for (const scope of [{}, { orgs: [A.orgId] }] as Partial<ExportOptions>[]) {
+      const summary = await run(store, scope);
+      expect(summary.orgs).toMatchObject({ incomplete: 0, already_complete: 1 });
+      // Its live sidecar is superseded, so the drain never writes the stage on the old verdict.
+      expect(await exists(store, s.key + SUPERSEDED_SUFFIX)).toBe(true);
+      expect(parseAcceptedComplete(await readText(store, acceptedCompleteKey(ROOT, A.orgId)))).toMatchObject({ stages: 0 });
+    }
   });
 });

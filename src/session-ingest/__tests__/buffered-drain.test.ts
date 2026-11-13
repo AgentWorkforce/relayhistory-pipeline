@@ -12,6 +12,8 @@ import {
   acquireDrainLock,
   drainBufferedBatches,
   drainHoldKey,
+  parseDrainCheckpoint,
+  type DrainCheckpoint,
   drainLockKey,
   readOnlyStore,
   s3DrainLedger,
@@ -19,7 +21,7 @@ import {
   type DrainOptions,
 } from "../buffered-drain.ts";
 import { parseDrainArgs, runDrain, validResumeKey } from "../../../scripts/buffered-drain.ts";
-import { mkdtempSync, readFileSync as readFileSyncFs, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync as readFileSyncFs, rmSync, writeFileSync as writeFileSyncFs } from "node:fs";
 import { join } from "node:path";
 import { scratchStore } from "./support.ts";
 import { journalKey as journalKeyFor } from "../async-admission.ts";
@@ -800,13 +802,20 @@ describe("buffered backlog drain (0005)", () => {
     const deps = { store, orgs: async () => [TENANT.orgId], stderr: () => {} };
     const first = await runDrain(args(["--max-objects", "1"]), deps);
     expect(first.objects.drained).toBe(1);
-    const saved = readFileSyncFs(checkpoint, "utf8").trim();
+    const file = JSON.parse(readFileSyncFs(checkpoint, "utf8"));
+    // The watermark, bound to the export generation of every org up to it (lander P2-A).
+    expect(file).toEqual({ v: 1, key: expect.any(String), exports: { [TENANT.orgId]: 1 } });
+    const saved = file.key as string;
     expect(saved.endsWith(ACCEPTED_SUFFIX)).toBe(true); // a group's last listed key is its sidecar
     expect(validResumeKey(saved)).toBe(true);
     // A group can also end on the export's create-only superseded record (finding 7).
     expect(validResumeKey(saved.slice(0, -ACCEPTED_SUFFIX.length) + ".superseded.json")).toBe(true);
     const rest = await runDrain(args([]), deps);
+    expect(rest.resume).toBe("resumed");
     expect(rest.objects).toMatchObject({ drained: 2, already_drained: 0 });
+    // A file this code did not write is refused, never guessed.
+    writeFileSyncFs(checkpoint, saved + "\n");
+    await expect(runDrain(args([]), deps)).rejects.toThrow("checkpoint_invalid");
     expect((await canonical(store)).size).toBe(3);
   });
 
@@ -1123,5 +1132,54 @@ describe("buffered backlog drain (0005)", () => {
     expect(checkpoint).toBeUndefined();
     await markExportComplete(store);
     expect((await run(store)).objects.drained).toBe(1);
+  });
+
+  // ---- lander P2-A on #585: step 0b refusals are final only within one export generation ----
+
+  test("P2-A: a re-export that flips a stage to live resets an older checkpoint; the stage is not skipped", async () => {
+    const store = await scratch();
+    const a = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { batch: "A", live: false });
+    await stage(store, [group("claude", "sess-2", [{ id: "r2", rev: 1 }])], { batch: "B" });
+    let saved: DrainCheckpoint | undefined;
+    const first = await run(store, { concurrency: 1, onCheckpoint: (_k, c) => { saved = c; } });
+    expect(first.objects.stage_not_live).toBe(1);
+    expect(first.objects.drained).toBe(1);
+    // Both groups are terminal under generation 1: the watermark passes A.
+    expect(saved!.key >= a).toBe(true);
+    expect(saved!.exports).toEqual({ [TENANT.orgId]: 1 });
+
+    // Same generation: the resume holds, and A stays refused (final within the generation).
+    const same = await run(store, { resume: saved! });
+    expect(same.resume).toBe("resumed");
+    expect(same.objects.drained).toBe(0);
+    expect(await exists(store, a + DRAINED_SUFFIX)).toBe(false);
+
+    // A re-export: SQL's gate reopened, so A's sidecar is replaced with a live verdict and the completion renewed.
+    VERDICTS.set(a, { ...VERDICTS.get(a)!, live: true });
+    await store.put(objectKey(acceptedCompleteKey(ROOT, TENANT.orgId)), enc.encode(JSON.stringify({ v: 1, kind: "buffered-accepted-complete", stages: 2, completedAtMs: 2 })));
+    const resumed = await run(store, { resume: saved! });
+    expect(resumed.resume).toBe("reset_export_changed");
+    expect(resumed.objects.drained).toBe(1);
+    expect(resumed.objects.already_drained).toBe(1);
+    expect(await exists(store, a + DRAINED_SUFFIX)).toBe(true);
+    expect((await canonical(store)).get("sess-1")).toEqual(["r1@1"]);
+  });
+
+  test("P2-A: a revoked export, or a new org before the watermark, also resets the checkpoint", async () => {
+    const store = await scratch();
+    await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    let saved: DrainCheckpoint | undefined;
+    await run(store, { onCheckpoint: (_k, c) => { saved = c; } });
+    await store.put(objectKey(acceptedCompleteKey(ROOT, TENANT.orgId)), enc.encode(JSON.stringify({ v: 1, kind: "buffered-accepted-revoked", revokedAtMs: 3 })));
+    expect((await run(store, { resume: saved! })).resume).toBe("reset_export_changed");
+    await markExportComplete(store);
+    expect((await run(store, { resume: saved! })).resume).toBe("resumed");
+    // An org sorting before the watermark that the checkpoint never saw.
+    expect((await run(store, { orgs: ["aaa-org", TENANT.orgId], resume: saved! })).resume).toBe("reset_export_changed");
+    // An explicit --start-after and a resume never mix; neither does a malformed checkpoint.
+    await expect(run(store, { resume: saved!, startAfter: saved!.key })).rejects.toThrow("drain_resume_and_start_after");
+    expect(parseDrainCheckpoint(JSON.stringify({ ...saved!, exports: { x: 0 } }))).toBeNull();
+    expect(parseDrainCheckpoint(JSON.stringify({ ...saved!, key: "96bulls/../x" }))).toBeNull();
+    expect(parseDrainCheckpoint(JSON.stringify(saved!))).toEqual(saved!);
   });
 });

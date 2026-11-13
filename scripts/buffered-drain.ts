@@ -35,8 +35,10 @@
  *
  * Without --org, orgs are discovered with one delimiter listing of `96bulls/` (S3 ListObjectsV2,
  * read-only). Output: one JSON summary line on stdout, and counts-only progress on stderr. Never a key,
- * tenant id or content. --checkpoint-file holds the resume key (which names an org); it is operator
- * state, not output, and is read on start if it exists.
+ * tenant id or content. --checkpoint-file (execute only) holds the resume checkpoint as JSON: the watermark key
+ * (which names an org) and the accepted-stage export generation of every org up to it. It is operator state, not
+ * output, and is read on start if it exists; after a re-export of any of those orgs the run starts from the
+ * beginning (`resume: "reset_export_changed"`), since a re-export can turn a refused stage live.
  */
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { zstdDecompressSync } from "node:zlib";
@@ -44,7 +46,7 @@ import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
 import { signRequest, type AwsCredentials } from "../packages/object-store/src/sigv4.ts";
 import { xmlElements, xmlText } from "../packages/object-store/src/xml.ts";
 import { BUFFER_STAGE_MAX_BYTES } from "../src/session-ingest/staging.ts";
-import { ACCEPTED_SUFFIX, DRAINED_SUFFIX, MAX_DRAIN_CONCURRENCY, SUPERSEDED_SUFFIX, drainBufferedBatches, parseStagedKey, type DrainSummary } from "../src/session-ingest/buffered-drain.ts";
+import { ACCEPTED_SUFFIX, DRAINED_SUFFIX, MAX_DRAIN_CONCURRENCY, SUPERSEDED_SUFFIX, drainBufferedBatches, parseDrainCheckpoint, parseStagedKey, type DrainCheckpoint, type DrainSummary } from "../src/session-ingest/buffered-drain.ts";
 
 export const KEY_ROOT = "96bulls";
 const REGION = /^[a-z]{2}(-[a-z]+)+-\d$/;
@@ -162,11 +164,14 @@ const progressLine = (s: DrainSummary) =>
  * atomically after every group), the drain and its progress. The process entry below only builds the S3 store.
  */
 export async function runDrain(args: DrainArgs, deps: { store: ObjectStore; orgs: () => Promise<string[]>; stderr?: (line: string) => void }): Promise<DrainSummary> {
-  let startAfter = args.startAfter;
+  const startAfter = args.startAfter;
+  // The checkpoint file holds a DrainCheckpoint: the watermark and the export generation of every org up to it. The
+  // drain uses it only under the same generations (else it restarts from the beginning: summary.resume).
+  let resume: DrainCheckpoint | undefined;
   if (args.checkpointFile && existsSync(args.checkpointFile)) {
-    const saved = readFileSync(args.checkpointFile, "utf8").trim();
-    if (!validResumeKey(saved)) throw new Error("checkpoint_invalid");
-    startAfter = saved;
+    const saved = parseDrainCheckpoint(readFileSync(args.checkpointFile, "utf8"));
+    if (!saved || !validResumeKey(saved.key)) throw new Error("checkpoint_invalid");
+    resume = saved;
   }
   const orgs = args.orgs.length ? args.orgs : await deps.orgs();
   let lastProgress = 0;
@@ -177,10 +182,11 @@ export async function runDrain(args: DrainArgs, deps: { store: ObjectStore; orgs
     decompress: (bytes) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: BUFFER_STAGE_MAX_BYTES })),
     ...(args.maxObjects !== undefined ? { maxObjects: args.maxObjects } : {}),
     ...(startAfter !== undefined ? { startAfter } : {}),
+    ...(resume ? { resume } : {}),
     ...(args.checkpointFile ? {
-      onCheckpoint: (key: string) => {
+      onCheckpoint: (_key: string, checkpoint: DrainCheckpoint) => {
         const tmp = `${args.checkpointFile}.tmp`;
-        writeFileSync(tmp, key + "\n", { mode: 0o600 });
+        writeFileSync(tmp, JSON.stringify(checkpoint) + "\n", { mode: 0o600 });
         renameSync(tmp, args.checkpointFile!);
       },
     } : {}),

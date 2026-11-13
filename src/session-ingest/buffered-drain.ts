@@ -109,6 +109,26 @@ export const SUPERSEDED_SUFFIX = ".superseded.json";
 export interface SupersededRecord { v: 1; kind: "buffered-superseded"; stage_sha256: string }
 export const acceptedCompleteKey = (keyRoot: string, orgId: string) => `${keyRoot}/.drain/accepted-stages/v1/${orgId}.complete.json`;
 /**
+ * A resumable drain checkpoint (lander P2-A on #585): the low watermark AND the accepted-stage export generation
+ * (`completedAtMs` of each org's completion object, or null without one) of every org at or before it. Outcomes like
+ * `stage_not_live` are final only within one export generation: a re-export can replace a sidecar's verdict by CAS, so
+ * a checkpoint taken under another generation is never trusted (the run restarts from the beginning instead).
+ */
+export interface DrainCheckpoint { v: 1; key: string; exports: Record<string, number | null> }
+const stripSidecar = (key: string) => key.replace(/\.(drained|accepted|superseded)\.json$/, "");
+export function parseDrainCheckpoint(text: string): DrainCheckpoint | null {
+  try {
+    const v = JSON.parse(text) as Record<string, unknown>;
+    if (!isObject(v) || v.v !== 1 || typeof v.key !== "string" || parseStagedKey(stripSidecar(v.key)) === null || !isObject(v.exports)) return null;
+    for (const [org, g] of Object.entries(v.exports)) {
+      if (org === "__proto__" || !(g === null || (Number.isSafeInteger(g) && (g as number) > 0))) return null;
+    }
+    return { v: 1, key: v.key, exports: { ...(v.exports as Record<string, number | null>) } };
+  } catch {
+    return null;
+  }
+}
+/**
  * The export's verdict for one stage (v2, accepted-stage-export.ts): SQL's own liveness test, the lines SQL keeps
  * (per object group, the kept line indexes), and the user's S3 fence as the export saw it.
  */
@@ -354,8 +374,10 @@ const OUTCOMES: ObjectOutcome[] = [
  */
 export const TERMINAL_OUTCOMES: ReadonlySet<ObjectOutcome> = new Set<ObjectOutcome>([
   "drained", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch", "ambiguous_replacement",
-  // 0005 step 0b: SQL never acknowledged it, or its verdict refuses it. Sidecars are create-only and the bytes immutable.
-  // (`stage_export_missing` and `fence_moved_since_export` are left for a rerun after a fresh export.)
+  // 0005 step 0b: SQL never acknowledged it, or its verdict refuses it. Final only within one export generation: a
+  // re-export can write or replace a sidecar (by CAS) with another verdict, so a checkpoint records each org's generation
+  // and is not trusted under another (DrainCheckpoint). (`stage_export_missing` and `fence_moved_since_export` are left
+  // for a rerun after a fresh export.)
   "stage_unacknowledged", "accepted_mismatch", "stage_not_live", "stage_superseded",
 ]);
 /** A staged object in one of these states can never drain: a hold entry naming it holds nothing (pruned). */
@@ -398,6 +420,12 @@ export interface DrainSummary {
   /** Write failures by closed code (IngestWriteError code, or `storage`). */
   write_failures: Record<string, number>;
   stopped: "complete" | "max_objects";
+  /**
+   * How a `resume` checkpoint was used: `none` (none given), `resumed`, or `reset_export_changed`. In that last case an
+   * org at or before the checkpoint has a different accepted-stage export generation now (a re-export can flip a stage's
+   * verdict), so the run starts from the beginning: drained objects are skipped by their markers.
+   */
+  resume: "none" | "resumed" | "reset_export_changed";
 }
 
 function emptySummary(mode: DrainSummary["mode"]): DrainSummary {
@@ -405,7 +433,7 @@ function emptySummary(mode: DrainSummary["mode"]): DrainSummary {
     mode, orgs: 0, listed: 0, foreign_keys: 0,
     objects: Object.fromEntries(OUTCOMES.map((o) => [o, 0])) as Record<ObjectOutcome, number>,
     lines: { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0, not_kept: 0 },
-    sessions_written: 0, rearmed: 0, hold_failures: 0, holds_pruned: 0, orgs_without_authority: 0, fence_assumed_empty: 0, write_failures: {}, stopped: "complete",
+    sessions_written: 0, rearmed: 0, hold_failures: 0, holds_pruned: 0, orgs_without_authority: 0, fence_assumed_empty: 0, write_failures: {}, stopped: "complete", resume: "none",
   };
 }
 
@@ -758,7 +786,13 @@ export interface DrainOptions {
    * object is early keeps resuming from there: that object is retried, and the marked ones after it are skipped
    * cheaply. Persist it to resume.
    */
-  onCheckpoint?: (key: string) => void | Promise<void>;
+  onCheckpoint?: (key: string, checkpoint: DrainCheckpoint) => void | Promise<void>;
+  /**
+   * Resume from a checkpoint `onCheckpoint` produced. Used only if every org at or before its key still has the export
+   * generation it recorded; otherwise the run starts from the beginning (`summary.resume`). Exclusive with startAfter,
+   * which is an operator's explicit key and is not checked against the export.
+   */
+  resume?: DrainCheckpoint;
   /** Called after each batch group with the running summary (counts only). */
   onProgress?: (summary: DrainSummary) => void;
   now?: () => Date;
@@ -779,6 +813,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   if (opts.assumeEmptyFence && !opts.dryRun) throw new Error("drain_assume_empty_fence_requires_dry_run");
   // A dry run writes nothing, so a watermark it recorded would let --execute skip everything it only classified.
   if (opts.dryRun && opts.onCheckpoint) throw new Error("drain_checkpoint_requires_execute");
+  if (opts.resume && opts.startAfter !== undefined) throw new Error("drain_resume_and_start_after");
   const lockTtlMs = opts.lockTtlMs ?? DRAIN_LOCK_TTL_MS;
   if (!Number.isSafeInteger(lockTtlMs) || lockTtlMs < 1_000) throw new Error("drain_lock_ttl_invalid");
   const resetMarginMs = opts.resetMarginMs ?? RESET_MARGIN_DEFAULT_MS;
@@ -814,6 +849,36 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   }
   const locks = new KeyedLocks();
   const orgs = orgOrder(opts.orgs);
+  /**
+   * Each org's accepted-stage export generation for this run (`completedAtMs`, or null: no valid completion, so nothing of
+   * the org is written). Read once: the export and the drain exclude each other by lease, so it cannot change mid-run.
+   */
+  const generations = new Map<string, number | null>();
+  for (const org of orgs) {
+    let gen: number | null = null;
+    try {
+      const got = await readText(opts.store, acceptedCompleteKey(opts.keyRoot, org), 64 * 1024);
+      gen = got ? (parseAcceptedComplete(got.text)?.completedAtMs ?? null) : null;
+    } catch {
+      gen = null;
+    }
+    generations.set(org, gen);
+  }
+  const orgOf = (key: string) => parseStagedKey(stripSidecar(key))!.orgId;
+  /** The generations of every listed org at or before `key`'s org (S3 key order). */
+  const exportsUpTo = (key: string): Record<string, number | null> => {
+    const upto = `${orgOf(key)}/`;
+    return Object.fromEntries(orgs.filter((o) => `${o}/` <= upto).map((o) => [o, generations.get(o) ?? null]));
+  };
+  let startAfter = opts.startAfter;
+  if (opts.resume) {
+    const now = exportsUpTo(opts.resume.key);
+    const same = Object.entries(now).every(([o, g]) => Object.hasOwn(opts.resume!.exports, o) && opts.resume!.exports[o] === g);
+    if (same) {
+      startAfter = opts.resume.key;
+      summary.resume = "resumed";
+    } else summary.resume = "reset_export_changed";
+  }
   summary.orgs = orgs.length;
 
   /**
@@ -935,18 +1000,12 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     for (const org of orgs) {
       const prefix = `${opts.keyRoot}/${org}/buffered-batches/v1`;
       // Every key under a prefix that sorts before start-after, and does not contain it, is before it.
-      if (opts.startAfter !== undefined && `${prefix}/` < opts.startAfter && !opts.startAfter.startsWith(`${prefix}/`)) continue;
+      if (startAfter !== undefined && `${prefix}/` < startAfter && !startAfter.startsWith(`${prefix}/`)) continue;
       // 0005 step 0b: without this org's completed accepted-stage export, nothing of it is written.
-      let complete = false;
-      try {
-        const got = await readText(opts.store, acceptedCompleteKey(opts.keyRoot, org), 64 * 1024);
-        complete = got !== null && parseAcceptedComplete(got.text) !== null;
-      } catch {
-        complete = false;
-      }
+      const complete = generations.get(org) !== null && generations.get(org) !== undefined;
       const authority = await currentAuthority(org);
       if (authority !== "ok") summary.orgs_without_authority++;
-      yield* batchGroups(opts.store, prefix, opts.startAfter, summary, complete, authority);
+      yield* batchGroups(opts.store, prefix, startAfter, summary, complete, authority);
     }
   }
 
@@ -978,7 +1037,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     }
     if (mark !== undefined && opts.onCheckpoint) {
       const key = mark;
-      checkpointChain = checkpointChain.then(() => (checkpointError === undefined ? opts.onCheckpoint!(key) : undefined)).catch((e) => { checkpointError ??= e; });
+      checkpointChain = checkpointChain.then(() => (checkpointError === undefined ? opts.onCheckpoint!(key, { v: 1, key, exports: exportsUpTo(key) }) : undefined)).catch((e) => { checkpointError ??= e; });
     }
   };
 
@@ -1121,7 +1180,8 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
           : parsed.kept.length !== groups.length || parsed.kept.some((ls, g) => ls.some((j) => j >= groups[g]!.lines.length)) ? "accepted_mismatch"
           : null;
         if (refusal) {
-          // Never drained (the sidecar is create-only, the bytes immutable): release any hold entry for it first.
+          // Never drained under this export generation: release any hold entry for it first. (A re-export that changes
+          // the verdict starts a new generation; the batch then drains normally, with no hold needed.)
           const h = read.decoded.header;
           note((await releaseHeld({ orgId: h.org_id, workspaceId: h.workspace_id, userId: h.user_id }, key)) ? refusal : "hold_failed");
           continue;

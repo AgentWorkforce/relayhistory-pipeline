@@ -474,10 +474,16 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
     // clean for the org. A rerun that fails for some stages, or dies part way, leaves the org refused by the drain
     // (stage_export_missing) instead of opening it on an earlier run's verdicts for the stages this run could not
     // refresh. Overwritten in place under the export lease (which excludes the drain and every other export).
+    // P3-2: an org with a completion but no stage intent left in SQL (in --org, or, unscoped, any completion object) joins
+    // the run too, so its stale sidecars are superseded and its completion is revoked and renewed like every other org's.
+    for (const org of orgScope ?? (await completionOrgs())) {
+      if (ORG.test(org) && !perOrg.has(org) && (await completionState(org)) !== "none") perOrg.set(org, { stages: 0, bad: false });
+    }
     const hadCompletion = new Set<string>();
     if (!opts.dryRun) {
       for (const org of [...perOrg.keys()].filter((o) => ORG.test(o)).sort()) {
-        if (await readCompletion(org)) hadCompletion.add(org);
+        // P3-3: a revocation left by an aborted run still means an earlier export completed the org.
+        if ((await completionState(org)) !== "none") hadCompletion.add(org);
         await putCompletion(org, { v: 1, kind: "buffered-accepted-revoked", revokedAtMs: nowMs() });
       }
     }
@@ -628,8 +634,32 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
   }
   return summary;
 
-  async function readCompletion(org: string): Promise<AcceptedComplete | null> {
-    return store.getObject(objectKey(acceptedCompleteKey(opts.keyRoot, org))).then(async (g) => parseAcceptedComplete(decoder.decode(await readAll(g.body))), () => null);
+  /** An org's completion object: a valid completion, a revocation (an execute run began and has not renewed it), or none. */
+  async function completionState(org: string): Promise<"complete" | "revoked" | "none"> {
+    const text = await store.getObject(objectKey(acceptedCompleteKey(opts.keyRoot, org))).then(async (g) => decoder.decode(await readAll(g.body)), () => null);
+    if (text === null) return "none";
+    if (parseAcceptedComplete(text)) return "complete";
+    try {
+      const v = JSON.parse(text) as { v?: unknown; kind?: unknown };
+      return v.v === 1 && v.kind === "buffered-accepted-revoked" ? "revoked" : "none";
+    } catch {
+      return "none";
+    }
+  }
+  /** Every org with an object under the completion prefix (an unscoped run's view of orgs an earlier export completed). */
+  async function completionOrgs(): Promise<string[]> {
+    const prefix = `${opts.keyRoot}/.drain/accepted-stages/v1/`;
+    const out: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await store.list(objectKey(prefix.slice(0, -1)), cursor);
+      cursor = page.nextCursor;
+      for (const item of page.items) {
+        const m = /^(.+)\.complete\.json$/.exec(String(item.key).slice(prefix.length));
+        if (m && String(item.key).startsWith(prefix)) out.push(m[1]!);
+      }
+    } while (cursor);
+    return out.sort();
   }
   /** Replace an org's completion object (a completion, or a revocation the drain reads as absent), under the lease. */
   async function putCompletion(org: string, doc: AcceptedComplete | { v: 1; kind: "buffered-accepted-revoked"; revokedAtMs: number }): Promise<void> {
