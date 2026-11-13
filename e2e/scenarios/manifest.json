@@ -41,7 +41,7 @@
     {
       "id": "c",
       "title": "B reverts A commit",
-      "known_evidence_gaps": ["claude_commit_fact_absent", "selfhost_revert_facts_absent"],
+      "known_evidence_gaps": ["claude_commit_fact_absent"],
       "status": "complete",
       "sessions": [
         { "role": "first", "harness": "claude", "session_id": "74059fb8-2ded-4a45-8c3f-cda4be81fc24", "started_at": "2026-11-13T08:25:45.377Z", "ended_at": "2026-11-13T08:26:03.227Z", "expected_project": "a", "branch": "feat/audit-log-a1", "commit": "e5a0b6c" },

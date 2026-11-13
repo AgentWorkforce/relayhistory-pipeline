@@ -9,9 +9,9 @@ const manifestDefault = fileURLToPath(new URL("./manifest.json", import.meta.url
 const args = new Map();
 for (let i = 2; i < process.argv.length;) {
   const key = process.argv[i++];
-  if (key === "--in-process") { args.set("in-process", true); continue; }
+  if (key === "--in-process" || key === "--branch-fallback") { args.set(key.slice(2), true); continue; }
   if (!key?.startsWith("--") || i >= process.argv.length) {
-    throw new Error("usage: score.mjs [--in-process] [--detector-module path] [--manifest path] [--response path] [--evidence path] [--ledger-response path] [--workspace id] [--since ISO] [--until ISO]");
+    throw new Error("usage: score.mjs [--in-process] [--branch-fallback] [--capture-db path] [--detector-module path] [--manifest path] [--response path] [--evidence path] [--ledger-response path] [--workspace id] [--since ISO] [--until ISO]");
   }
   args.set(key.slice(2), process.argv[i++]);
 }
@@ -65,6 +65,7 @@ async function probeKindEvidence(workspace, sessions, since, until) {
       SELECT ids.session_id,
         (SELECT count(*) FROM sessions.session_directory d WHERE d.workspace_id='${workspace}' AND d.session_id=ids.session_id) AS directory_count,
         (SELECT max(d.git_repo) FROM sessions.session_directory d WHERE d.workspace_id='${workspace}' AND d.session_id=ids.session_id) AS git_repo,
+        (SELECT max(d.git_branch) FROM sessions.session_directory d WHERE d.workspace_id='${workspace}' AND d.session_id=ids.session_id) AS git_branch,
         (SELECT count(*) FROM sessions.session_event_facts e WHERE e.workspace_id='${workspace}' AND e.session_id=ids.session_id) AS event_count,
         (SELECT count(*) FROM sessions.session_event_facts e WHERE e.workspace_id='${workspace}' AND e.session_id=ids.session_id AND e.ts >= '${start}' AND e.ts < '${end}' AND cardinality(e.files_touched)>0) AS write_count,
         (SELECT count(*) FROM sessions.session_event_facts e WHERE e.workspace_id='${workspace}' AND e.session_id=ids.session_id AND e.ts >= '${start}' AND e.ts < '${end}' AND cardinality(e.files_touched)>0 AND e.branch IS NOT NULL AND e.branch<>'') AS branched_write_count,
@@ -78,6 +79,21 @@ async function probeKindEvidence(workspace, sessions, since, until) {
     ) x`;
   const raw = await run("docker", [...kube, "postgres-0", "--", "psql", "-U", "postgres", "-d", "hoopdb", "-X", "-At", "-v", "ON_ERROR_STOP=1", "-c", sql], "");
   return { sessions: JSON.parse(raw) };
+}
+
+async function readCaptureProjects(database, sessions) {
+  if (!sessions.length) return new Map();
+  const ids = [...new Set(sessions.map((session) => requiredId(session.session_id, "session ID")))];
+  const sqlIds = ids.map((id) => `'${id}'`).join(",");
+  const raw = await run("sqlite3", ["-readonly", "-json", database,
+    `SELECT source,session_id,project_key,project_key_method FROM sessions WHERE session_id IN (${sqlIds})`], "");
+  const rows = raw ? JSON.parse(raw) : [];
+  return new Map(rows.flatMap((row) => {
+    if (row.project_key_method !== "remote" || typeof row.project_key !== "string" ||
+      !/^[A-Za-z0-9.-]+\/[A-Za-z0-9._-]+\/[A-Za-z0-9._/-]+$/.test(row.project_key)) return [];
+    const repo = row.project_key.replace(/^github\.com\//i, "").toLowerCase();
+    return [[`${row.source}\u0000${row.session_id}`, repo]];
+  }));
 }
 
 async function readKindFacts(workspace, sessions, since, until) {
@@ -98,7 +114,7 @@ async function readKindFacts(workspace, sessions, since, until) {
   return JSON.parse(raw);
 }
 
-async function detectInProcess(workspace, sessions, since, until) {
+async function detectInProcess(workspace, sessions, since, until, captureProjects) {
   const detectorModule = args.get("detector-module") ?? fileURLToPath(new URL("../../packages/coordination-detect/src/index.ts", import.meta.url));
   const { detectCoordination } = await import(pathToFileURL(resolve(detectorModule)).href);
   const facts = await readKindFacts(workspace, sessions, since, until);
@@ -131,7 +147,7 @@ async function detectInProcess(workspace, sessions, since, until) {
     return [{
       sessionId: session.session_id, source: session.harness,
       userId: lastEvent?.user_id ?? null, projectId: lastEvent?.project_id ?? null,
-      repo: directory?.git_repo ?? null, branch: latest(lastEvent?.branch, directory?.git_branch),
+      repo: directory?.git_repo || captureProjects.get(k) || null, branch: latest(lastEvent?.branch, directory?.git_branch),
       taskRef: null, title: directory?.title ?? null, parentSessionId: parentSets.get(k)?.size === 1 ? [...parentSets.get(k)][0] : null,
       startedAt: iso(directory?.created_at ?? events[0]?.ts ?? outputs[0].ts),
       lastActionAt: iso(directory?.last_activity_at ?? lastEvent?.ts ?? outputs.at(-1).ts),
@@ -172,14 +188,18 @@ function validateManifest(manifest) {
 const manifest = JSON.parse(await readFile(args.get("manifest") ?? manifestDefault, "utf8"));
 validateManifest(manifest);
 const sessions = manifest.scenarios.flatMap((scenario) => scenario.sessions).filter((session) => session.session_id);
+if ((args.has("capture-db") || args.has("branch-fallback")) && !args.has("in-process")) {
+  throw new Error("--capture-db and --branch-fallback require --in-process");
+}
 const workspace = args.get("workspace") ?? process.env.SCENARIO_WORKSPACE_ID;
 const now = Date.now();
 const since = args.get("since") ?? new Date(now - 24 * 60 * 60 * 1000).toISOString();
 const until = args.get("until") ?? new Date(now + 60 * 1000).toISOString();
 if (!(Date.parse(since) < Date.parse(until))) throw new Error("since must precede until");
 if (!args.has("response") && !workspace) throw new Error("--workspace or SCENARIO_WORKSPACE_ID is required for a live read");
+const captureProjects = args.has("capture-db") ? await readCaptureProjects(args.get("capture-db"), sessions) : new Map();
 const overlaps = args.has("response") ? JSON.parse(await readFile(args.get("response"), "utf8"))
-  : args.has("in-process") ? await detectInProcess(requiredId(workspace, "workspace ID"), sessions, since, until)
+  : args.has("in-process") ? await detectInProcess(requiredId(workspace, "workspace ID"), sessions, since, until, captureProjects)
   : await fetchKindOverlaps(requiredId(workspace, "workspace ID"), since, until);
 if (overlaps.contract !== "coordination-overlaps/1" || !Array.isArray(overlaps.findings)) throw new Error("unexpected overlaps contract");
 const evidence = args.has("evidence") ? JSON.parse(await readFile(args.get("evidence"), "utf8"))
@@ -191,12 +211,27 @@ if (ledger && !Array.isArray(ledgerEntries)) throw new Error("ledger response ha
 
 const suppressing = new Set(["none", "planned_parallel", "continuation"]);
 const normalizedRepo = (value) => value?.trim().replace(/^git@github\.com:/i, "").replace(/^https?:\/\/github\.com\//i, "").replace(/\.git$/i, "").toLowerCase() || null;
+const sessionKey = (session) => `${session.harness}\u0000${session.session_id}`;
+const observedRepo = (session, row) => normalizedRepo(row?.git_repo) ?? captureProjects.get(sessionKey(session)) ?? null;
+function evidenceGaps(scenario) {
+  const known = scenario.known_evidence_gaps ?? [];
+  const mitigated = known.filter((gap) =>
+    (gap === "write_branch_absent" && args.has("branch-fallback") && scenario.sessions.filter((session) => session.session_id)
+      .every((session) => evidenceById.get(session.session_id)?.git_branch)) ||
+    (gap === "scrubber_redacted_project_key" && scenario.sessions.filter((session) => session.harness === "claude" && session.session_id)
+      .every((session) => observedRepo(session, evidenceById.get(session.session_id)))));
+  return {
+    ...(known.length ? { known_evidence_gaps: known } : {}),
+    ...(mitigated.length ? { mitigated_evidence_gaps: mitigated } : {}),
+  };
+}
 function requiredSignalMissing(pair, counts) {
   if (!counts.every(Boolean)) return false;
   if (pair.required_evidence === "writes_both" && counts.some((row) => Number(row.write_count) === 0)) return true;
   const label = pair.expected_label;
   if (label === "duplicate_work") return counts.some((row) => Number(row.write_count) === 0);
-  if (label === "concurrent_edit") return counts.some((row) => Number(row.write_count) === 0 || Number(row.branched_write_count) === 0);
+  if (label === "concurrent_edit") return counts.some((row) => Number(row.write_count) === 0 ||
+    Number(row.branched_write_count) === 0 && !(args.has("branch-fallback") && row.git_branch));
   if (label === "superseded_work") return Number(counts[0].commit_count) === 0 || Number(counts[1].outcome_count) === 0;
   return false;
 }
@@ -206,7 +241,7 @@ for (const scenario of manifest.scenarios) {
   for (const pair of scenario.pairs) {
     const left = byRole.get(pair.left), right = byRole.get(pair.right);
     const base = { scenario: scenario.id, pair: `${pair.left}:${pair.right}`, expected: pair.expected_label,
-      ...(scenario.known_evidence_gaps ? { known_evidence_gaps: scenario.known_evidence_gaps } : {}),
+      ...evidenceGaps(scenario),
       ...(pair.expected_actor_kinds ? { expected_actor_kinds: pair.expected_actor_kinds } : {}) };
     if (scenario.status !== "complete" || (!left.session_id && left.harness !== "human") || (!right.session_id && right.harness !== "human")) {
       results.push({ ...base, state: "pending" });
@@ -222,7 +257,7 @@ for (const scenario of manifest.scenarios) {
     const counts = [left, right].map((session) => evidenceById.get(session.session_id));
     const lacksEvidence = counts.some((row) => row && Number(row.event_count) + Number(row.output_count) === 0);
     const projectTagState = pair.required_project_tags && evidence ? [left, right].map((session, index) => {
-      const observed = normalizedRepo(counts[index]?.git_repo);
+      const observed = observedRepo(session, counts[index]);
       return observed === manifest.projects[session.expected_project] ? null : observed ? "wrong_project" : "missing_project_tag";
     }).find(Boolean) : null;
     const state = evidence && counts.some((row) => !row) ? "unverified_evidence"
@@ -251,9 +286,10 @@ const projectResults = [...new Map(manifest.scenarios.flatMap((scenario) => scen
     const expected = manifest.projects[session.expected_project];
     const row = evidenceById.get(session.session_id);
     if (!row) return { session_id: session.session_id, harness: session.harness, expected, state: "unverified" };
-    const observed = normalizedRepo(row.git_repo);
+    const observed = observedRepo(session, row);
     return {
       session_id: session.session_id, harness: session.harness, expected, observed,
+      project_source: normalizedRepo(row.git_repo) ? "kind_directory" : captureProjects.has(sessionKey(session)) ? "capture_override" : null,
       state: observed === expected ? "hit" : observed ? "wrong_project" : "missing_project_tag",
       fact_project_ids: row.fact_project_ids ?? [],
     };
@@ -279,7 +315,9 @@ const scenarioResults = manifest.scenarios.map((scenario) => {
     : states.some((state) => ["no_evidence", "missing_signal", "missing_project_tag", "wrong_project", "unverified_evidence", "unverified_no_finding", "ledger_unavailable", "duration_short"].includes(state)) ? "inconclusive"
     : "hit";
   return { scenario: scenario.id, outcome, pair_states: pairs.map((row) => row.state),
-    ...(scenario.known_evidence_gaps ? { known_evidence_gaps: scenario.known_evidence_gaps } : {}),
+    ...evidenceGaps(scenario),
     ...(episode ? { episode_state: episode.state, duration_state: episode.duration?.state ?? null } : {}) };
 });
-console.log(JSON.stringify({ scored_at: new Date().toISOString(), window: overlaps.window, coverage: overlaps.coverage, quality_gate: evidenceDefects.length ? "evidence_defect" : "clear", evidenceDefects, summary, scenarioResults, results, projectResults, episodes }, null, 2));
+console.log(JSON.stringify({ scored_at: new Date().toISOString(), window: overlaps.window, coverage: overlaps.coverage,
+  replay_overrides: { branch_fallback: args.has("branch-fallback"), capture_project_count: captureProjects.size },
+  quality_gate: evidenceDefects.length ? "evidence_defect" : "clear", evidenceDefects, summary, scenarioResults, results, projectResults, episodes }, null, 2));
