@@ -63,7 +63,7 @@ import { isObjectStoreError, objectKey, type ObjectStore, type ObjectVersion } f
 import { layoutComponent } from "../shared/layout-component.ts";
 import { journalKey } from "./async-admission.ts";
 import type { LedgerTenant } from "./ledger.ts";
-import { entryForgotten, fenceEpoch, isDeleted, newFence, recordGeneration, s3LedgerObjects, sessionKeyHash, type FenceDoc, type FenceRead, type IndexEntryInput } from "./ledger-s3.ts";
+import { entryForgotten, fenceEpoch, isDeleted, newFence, recordGeneration, s3LedgerObjects, sessionKeyHash, type FenceDoc, type FenceRead, type IndexEntry, type IndexEntryInput } from "./ledger-s3.ts";
 import { fitLine } from "./oversize.ts";
 import { routedRawChunkSealerDeps } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { BUFFER_STAGE_MAX_BYTES, decodeStaged, type StagedHeader } from "./staging.ts";
@@ -737,7 +737,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     for (const k of kept) for (const line of k.lines) shardKeys.add(keys.revisions(origin, recordOf(line).record_id));
     const release = await locks.acquire([...shardKeys]);
     try {
-      const shards = new Map<string, Record<string, [number, string, string, string | null, number, number]>>();
+      const shards = new Map<string, Record<string, IndexEntry>>();
       try {
         for (const sk of shardKeys) {
           const doc = (await ledger.readIndex(sk))?.doc;
@@ -766,6 +766,8 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
           const stored = e && !entryForgotten(fence, origin, e) ? e : undefined;
           const seen = inBatch.get(r.record_id);
           if (stored && revision < stored[0]) counts.stale++;
+          // A revision-only stored entry (#587: SQL's seeded records and lazy slots) has no digest to compare: stale.
+          else if (stored && revision === stored[0] && stored[2] === null) counts.stale++;
           else if (stored && revision === stored[0]) {
             if (stored[2] === m[1]) counts.already_stored++;
             else counts.revision_conflict++;
