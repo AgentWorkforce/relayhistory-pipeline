@@ -74,8 +74,9 @@ Every run passes the same gates as the guarded schema release:
 
 Every execute additionally needs all of the following:
 
-- **Dormant switch:** `BACKLOG_OPS_EXECUTE_ENABLED` in `src/session-ingest/backlog-ops.ts` is `false`, and only a
-  reviewed commit flips it. A dry run never needs it.
+- **Dormant switch:** `BACKLOG_OPS_EXECUTE_ENABLED` in `src/session-ingest/backlog-ops.ts` was `false` until a
+  reviewed commit flipped it to `true` for the backlog run; flip it back the same way to make executes dormant again.
+  A dry run never needs it.
 - **Bound runs:** each one is a successful first attempt of this workflow at the same commit, by the pinned
   dispatcher, of the expected mode, under 24 hours old, with exactly one unexpired receipt artifact.
 - **Receipts, checked before any credential is read:**

@@ -32,7 +32,7 @@
 import { createHash } from "node:crypto";
 
 /** Execute modes stay refused until a reviewed commit flips this. Dry modes are always allowed. */
-export const BACKLOG_OPS_EXECUTE_ENABLED: boolean = false;
+export const BACKLOG_OPS_EXECUTE_ENABLED: boolean = true;
 
 export const BACKLOG_OPS_WORKFLOW = ".github/workflows/backlog-ops.yml";
 export const BACKLOG_OPS_MODES = [
