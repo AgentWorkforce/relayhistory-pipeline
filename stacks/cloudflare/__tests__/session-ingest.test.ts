@@ -31,6 +31,7 @@ import {
 import { assertCloudflareStage, cloudflareMode } from "../alchemy.cloudflare.run.ts";
 import { ingestSettings, type IngestWorkerEnv } from "../../../src/session-ingest/worker.ts";
 import { NeonExitRefusal } from "../../../src/shared/neon-exit.ts";
+import { httpAdmissionStoppedOrgs } from "../../../src/session-ingest/http-admission-stop.ts";
 
 const refuse = (why: string): never => {
   throw new Error(why);
@@ -754,6 +755,31 @@ describe("session ingest: INGEST_S3_FENCE_MIRROR (default off)", () => {
     }
     for (const bad of ["off", "true", true, 1, ""]) expect(() => assertSessionIngestInputs({ ...inputs, s3FenceMirror: bad as never }, refuse)).toThrow(/s3FenceMirror must be "on"/);
     expect(sessionIngestResources()).toBe(SESSION_INGEST_RESOURCES);
+  });
+});
+
+describe("session ingest: INGEST_HTTP_ADMISSION_STOPPED_ORGS (default none)", () => {
+  const canonical: SessionIngestInputs = { ...inputs, acceptanceMode: "canonical" };
+  it("omitted: no INGEST_HTTP_ADMISSION_STOPPED_ORGS key, vars and props byte-identical to a stack without the input", () => {
+    for (const p of [inputs, canonical]) {
+      expect(Object.hasOwn(sessionIngestVars(p), "INGEST_HTTP_ADMISSION_STOPPED_ORGS")).toBe(false);
+      expect(JSON.stringify(sessionIngestWorkerProps(p, bindings))).toBe(JSON.stringify(sessionIngestWorkerProps({ ...p, httpAdmissionStoppedOrgs: undefined }, bindings)));
+    }
+  });
+  it("a list: exactly one more var (comma-joined), no new binding or resource; the Worker parses it back", async () => {
+    for (const base of [inputs, canonical]) {
+      const on = { ...base, httpAdmissionStoppedOrgs: ["org-a", "org_b.2"] };
+      expect(() => assertSessionIngestInputs(on, refuse)).not.toThrow();
+      expect(sessionIngestVars(on)).toEqual({ ...sessionIngestVars(base), INGEST_HTTP_ADMISSION_STOPPED_ORGS: "org-a,org_b.2" });
+      expect(() => assertNoSecretLiterals(props(on).env, refuse)).not.toThrow();
+      expect([...httpAdmissionStoppedOrgs(sessionIngestVars(on).INGEST_HTTP_ADMISSION_STOPPED_ORGS)!]).toEqual(["org-a", "org_b.2"]);
+    }
+    expect(sessionIngestResources()).toBe(SESSION_INGEST_RESOURCES);
+  });
+  it("anything but a non-empty list of distinct org ids refuses", () => {
+    for (const bad of [[], "org-a", ["org-a", "org-a"], [""], [".x"], ["a,b"], ["org a"], [1], ["x".repeat(129)], null])
+      expect(() => assertSessionIngestInputs({ ...inputs, httpAdmissionStoppedOrgs: bad as never }, refuse)).toThrow(/httpAdmissionStoppedOrgs must be a non-empty list of distinct org ids/);
+    expect(() => assertSessionIngestInputs({ ...inputs, INGEST_HTTP_ADMISSION_STOPPED_ORGS: "org-a" }, refuse)).toThrow("sessionIngest.INGEST_HTTP_ADMISSION_STOPPED_ORGS is not a known setting");
   });
 });
 

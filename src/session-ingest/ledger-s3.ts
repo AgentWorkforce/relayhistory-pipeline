@@ -277,7 +277,8 @@ export interface OwnerDoc { v: 1; originId: string; source: string; sessionId: s
  *                             not in dry run, so every `ledger/rearm/` marker is erased again;
  *   workerHttpAdmission "off" the Worker's HTTP upload path (its ledger is SQL: INGEST_LEDGER=s3 refuses there) no
  *                             longer admits for any user this deployment's S3 consumers serve: stopped, or redirected
- *                             to direct upload, BEFORE the revision and ownership backfills run. An admission it made
+ *                             to direct upload (hosted: INGEST_HTTP_ADMISSION_STOPPED_ORGS, http-admission-stop.ts),
+ *                             BEFORE the revision and ownership backfills run. An admission it made
  *                             after them would be absent from the S3 index and owner stubs, so a direct upload could
  *                             later re-admit an older or equal revision (#250) and the session would escape S3 resets.
  *                             0005's "compare against the HTTP path" step therefore runs BEFORE the marker is written.
