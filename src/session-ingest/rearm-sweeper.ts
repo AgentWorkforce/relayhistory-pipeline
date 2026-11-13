@@ -17,12 +17,22 @@
  *        tombstoned by a finished reset)             -> `superseded`: nothing erased, completion recorded
  *        absent or unreadable                        -> `fenceAbsent` / `fenceUnreadable`: nothing erased or recorded
  *   4. before any delete, bind the marker to its user: the session's ownership stub (same admission directory, same
- *      origin and session key) must exist (`ownerMissing`) and carry the SAME writer machine (`machineMismatch`; a stub
- *      with none yet: `machineUnbound`). The ledger computes that machine from the tenant at claim and refuses a commit
- *      whose machine is not the tenant's, so a marker can only name its own user's canonical prefix. Then refuse a
- *      layout collision (`layoutCollision`): `layoutComponent` maps e.g. `a:b` and `a_b` to one physical `s=a_b` dir,
- *      so when another live (not deleted) session of the same origin shares this one's physical source and session
- *      segments, erasing would destroy its bytes too; nothing is erased and the marker waits for an operator.
+ *      origin and session key) must exist (`ownerMissing`) and carry the SAME writer machine (`machineMismatch`). The
+ *      ledger computes that machine from the tenant, stamps it on the stub at claim AND at the fenced commit (before
+ *      the marker), and refuses a commit whose machine is not the tenant's, so a marker can only name its own user's
+ *      canonical prefix. A stub with no machine (written before the binding, or by older code mid-deploy; claims skip
+ *      deleted sessions, so none will stamp it) is resolved by DERIVING the machine (derivedMachine): the session's
+ *      canonical manifest under the marker's machine names the uploader, and the machine is accepted only when that
+ *      user id reproduces both the marker's admission directory and its machine exactly as the commit computes them
+ *      (`machineDerived`); unverifiable: `machineUnbound`; nothing of the session under that machine: `emptyUnbound`
+ *      (completion `empty`, nothing erased). Then refuse a layout collision (`layoutCollision`): `layoutComponent` maps
+ *      e.g. `a:b` and `a_b` to one physical `s=a_b` dir, so when another live (not deleted) session of the same origin
+ *      shares this one's physical source and session segments, erasing would destroy its bytes too; nothing is erased
+ *      and the marker waits for an operator. The origin's stubs are read once per pass (cached), at most
+ *      REARM_MAX_OWNER_SCAN (`layoutScanTooLarge` beyond), and against the deadline (`deferred`: the pass stops and the
+ *      next one starts at this marker). Workspaces: two raw workspace ids that share one `ws=` segment still get
+ *      distinct admission directories (admissionUserDir hashes the RAW id) and distinct machines, so one stub never
+ *      holds two machines and their canonical prefixes never overlap.
  *   5. erase that machine's copy of the session through the SAME executor as the operator and self-host erasers
  *      (session-erase/selfhost-eraser.ts eraseMachineSessionBytes -> the shared strict paged primitive,
  *      neon-s3-erasure/eraser.ts): every version of the transcript dir under every date, then the live pointer, then a
@@ -36,10 +46,12 @@
  *
  * Budget and progress: `maxMarkers` counts only markers whose ERASE ran (erased, pending, reenabled, wouldErase), so
  * markers that cannot progress (corrupt, unbound, fence absent...) cost a few reads and never starve the ones after
- * them; `deadlineAt` bounds the time. A pass that stops returns where it stopped: the scope, the page's list cursor
- * and the last key it finished (`afterKey`), so the next pass continues at the next marker, never the same page from
- * its start. The entry (rearm-sweeper-main.ts) keeps that position durably in the bucket, so successive Lambda
- * invocations walk the whole namespace and then wrap around to the start.
+ * them; `deadlineAt` bounds the time (scans included). A pass that stops returns where it stopped: the scope, the
+ * page's list cursor and the last key before which every marker finished (`afterKey`), so the next pass continues at
+ * the next marker, never the same page from its start. The entry (rearm-sweeper-main.ts) keeps that position durably
+ * in the bucket and saves it after every finished marker whose erase ran and at every page end (`onProgress`), so a
+ * pass that dies (a Lambda timeout, a throw) resumes right after the last finished marker; successive invocations walk
+ * the whole namespace and then wrap around to the start.
  *
  * Access: a 401/403 from the store or the eraser aborts the pass (RearmSweepRefused `access_denied`): the role is
  * misconfigured (for instance `s3:ListBucket` conditioned on a prefix makes every HEAD of a missing completion record a
@@ -62,19 +74,22 @@ import { isObjectStoreError, objectKey, readAll, type ObjectStore, type ObjectVe
 import type { PagedEraser } from "../migration/neon-s3-erasure/eraser.ts";
 import { layoutComponent } from "../shared/layout-component.ts";
 import { eraseMachineSessionBytes, SessionEraseRefused } from "../session-erase/selfhost-eraser.ts";
-import { INBOX_NAMESPACE } from "./async-admission.ts";
+import { admissionUserDir, INBOX_NAMESPACE } from "./async-admission.ts";
 import { LedgerUnavailableError } from "./ledger.ts";
 import { isDeleted, ownerKeyIn, ownersOriginPrefix, rearmKeyMatches, s3LedgerObjects, validRearm, type FenceDoc, type OwnerDoc, type RearmDoc } from "./ledger-s3.ts";
-import { assertTenantSegment } from "./writer.ts";
+import { assertTenantSegment, BULLS_EXTENSION, liveMachineId } from "./writer.ts";
 
 export const REARM_DEFAULT_CONCURRENCY = 4;
 export const REARM_MAX_CONCURRENCY = 16;
 export const REARM_DEFAULT_MAX_MARKERS = 500;
 /** neon-s3-erasure/job.ts LIVE_SKEW_MS (pinned by a test; not imported, so this job does not load the Neon job). */
 export const REARM_SKEW_MS = 2 * 60 * 1000;
+/** Ownership stubs one collision scan reads at most (per origin, cached per pass); beyond it: `layoutScanTooLarge`. */
+export const REARM_MAX_OWNER_SCAN = 20_000;
 
 /** A marker's completion: one per marker CONTENT (hash), create-only. */
-export interface RearmDoneDoc { v: 1; outcome: "erased" | "superseded"; marker: string; atMs: number }
+/** `empty`: an unstamped stub whose marker's machine holds nothing of the session (nothing to erase there). */
+export interface RearmDoneDoc { v: 1; outcome: "erased" | "superseded" | "empty"; marker: string; atMs: number }
 /** A corrupt marker's record: one per marker content, create-only, so an operator can find it (see the header). */
 export interface RearmCorruptDoc { v: 1; reason: "unparseable" | "invalid" | "key_mismatch"; atMs: number }
 
@@ -94,6 +109,14 @@ export interface RearmSweepOptions {
   /** Versions modified within this of the fence read are kept (default REARM_SKEW_MS). */
   skewMs?: number;
   now?: () => number;
+  /**
+   * Called (in order, one at a time) with the position after each marker whose erase ran, and at each page's end:
+   * every marker up to `afterKey` has finished. The entry saves it durably, so a pass that dies (a timeout, a throw)
+   * resumes right after the last finished marker. A failed save aborts the pass.
+   */
+  onProgress?: (resume: RearmSweepResume) => Promise<void>;
+  /** Ownership stubs one collision scan reads at most (default REARM_MAX_OWNER_SCAN). */
+  ownerScanLimit?: number;
 }
 
 /**
@@ -120,6 +143,14 @@ export interface RearmSweepCounts {
   machineMismatch: number;
   machineUnbound: number;
   layoutCollision: number;
+  /** The origin has more ownership stubs than one collision scan reads (REARM_MAX_OWNER_SCAN): needs an operator. */
+  layoutScanTooLarge: number;
+  /** Unstamped stub, machine derived from the session's manifest and verified (not an outcome: the erase follows). */
+  machineDerived: number;
+  /** Unstamped stub and nothing under the marker's machine for the session: completion recorded, nothing erased. */
+  emptyUnbound: number;
+  /** The scan for this marker ran out of time: the pass stopped, the next one starts at this marker. */
+  deferred: number;
   /** The marker was gone when read (a user erase removed the directory meanwhile). */
   gone: number;
   failed: number;
@@ -150,9 +181,9 @@ class Reenabled extends Error {}
 
 const SEGMENT = /^[A-Za-z0-9._-]{1,128}$/;
 const zero = (): RearmSweepCounts => ({ listed: 0, erased: 0, superseded: 0, alreadyDone: 0, pending: 0, resetRunning: 0, reenabled: 0,
-  fenceAbsent: 0, fenceUnreadable: 0, corrupt: 0, ownerMissing: 0, machineMismatch: 0, machineUnbound: 0, layoutCollision: 0, gone: 0,
+  fenceAbsent: 0, fenceUnreadable: 0, corrupt: 0, ownerMissing: 0, machineMismatch: 0, machineUnbound: 0, layoutCollision: 0, layoutScanTooLarge: 0, machineDerived: 0, emptyUnbound: 0, deferred: 0, gone: 0,
   failed: 0, wouldErase: 0, wouldSupersede: 0, versions: 0 });
-type Outcome = Exclude<keyof RearmSweepCounts, "listed" | "failed" | "versions">;
+type Outcome = Exclude<keyof RearmSweepCounts, "listed" | "failed" | "versions" | "machineDerived">;
 /** The outcomes whose erase ran: only these spend the budget. */
 const ERASE_RAN: ReadonlySet<Outcome> = new Set(["erased", "pending", "reenabled", "wouldErase"]);
 
@@ -205,6 +236,8 @@ export async function sweepRearmMarkers(deps: { store: ObjectStore; eraser: Page
   const concurrency = opts.concurrency ?? REARM_DEFAULT_CONCURRENCY;
   const maxMarkers = opts.maxMarkers ?? REARM_DEFAULT_MAX_MARKERS;
   const skewMs = opts.skewMs ?? REARM_SKEW_MS;
+  const ownerScanLimit = opts.ownerScanLimit ?? REARM_MAX_OWNER_SCAN;
+  if (!Number.isInteger(ownerScanLimit) || ownerScanLimit < 1) throw new RearmSweepRefused("budget_invalid");
   const now = opts.now ?? Date.now;
   if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > REARM_MAX_CONCURRENCY) throw new RearmSweepRefused("concurrency_invalid");
   if (!Number.isInteger(maxMarkers) || maxMarkers < 1) throw new RearmSweepRefused("budget_invalid");
@@ -238,28 +271,116 @@ export async function sweepRearmMarkers(deps: { store: ObjectStore; eraser: Page
     return "corrupt";
   }
 
-  /** Step 4: the marker's machine is its user's (the ownership stub), and no live session shares its physical dir. */
-  async function bound(dir: string, fence: FenceDoc, m: RearmDoc): Promise<Outcome | null> {
-    const stub = await io.readOwner(ownerKeyIn(dir, m.originId, m.source, m.sessionId));
-    if (!stub || stub.doc.originId !== m.originId || stub.doc.source !== m.source || stub.doc.sessionId !== m.sessionId) return "ownerMissing";
-    if (stub.doc.machineId === undefined) return "machineUnbound";
-    if (stub.doc.machineId !== m.machineId) return "machineMismatch";
+  const expired = () => opts.deadlineAt !== undefined && now() >= opts.deadlineAt;
+  const escapeRe = (v: string) => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+  /**
+   * An UNSTAMPED stub (written before the ledger bound machines, or by older code during a rolling deploy): derive the
+   * machine instead of trusting the marker. The session's canonical manifest under the marker's machine carries the
+   * uploader (`extensions.96bulls.user_id`, writer.ts admittedIdentity) and its session id; the machine is accepted only
+   * when, with that user id, the marker's origin and the tenant's RAW workspace id, BOTH the marker's admission directory
+   * (admissionUserDir) and its machine (liveMachineId) are exactly what the commit computes. The raw workspace id is the
+   * marker's `workspaceId` (every commit writes it) when its layoutComponent is the path's `ws=` segment, else the
+   * segment itself (older markers; right whenever the id was layout-safe): a wrong candidate cannot reproduce both
+   * hashes, so it is never trusted on its own. `empty` only when a VERSION-AWARE strict listing (the eraser's, as the
+   * erase itself uses) finds no version and no delete marker of the session dir or its pointer under that machine.
+   */
+  async function derivedMachine(at: { dir: string; orgId: string; workspaceSegment: string }, m: RearmDoc): Promise<"ok" | "empty" | "unbound" | "deferred"> {
     const h = layoutComponent(m.source), s = layoutComponent(m.sessionId);
-    const prefix = ownersOriginPrefix(dir, m.originId);
-    let cursor: string | undefined;
+    const base = `${opts.keyRoot}/${at.orgId}/v1/ws=${at.workspaceSegment}/m=${m.machineId}/h=${h}`;
+    const inSession = new RegExp(`^${escapeRe(base)}/d=\\d{4}/\\d{2}/\\d{2}/s=${escapeRe(s)}/`);
+    const isManifest = new RegExp(`^${escapeRe(base)}/d=\\d{4}/\\d{2}/\\d{2}/s=${escapeRe(s)}/manifest\\.json$`);
+    let manifestKey: string | undefined, cursor: string | undefined;
     do {
+      if (expired()) return "deferred";
+      const page = await store.list(objectKey(base), cursor);
+      for (const i of page.items) { const k = String(i.key); if (isManifest.test(k)) { manifestKey = k; break; } }
+      cursor = manifestKey === undefined ? page.nextCursor : undefined;
+    } while (cursor);
+    if (manifestKey === undefined) {
+      // No current manifest to verify against. Empty only if no version of anything of the session is left there
+      // (older versions and data behind delete markers included); otherwise it cannot be attributed: unbound.
+      if (expired()) return "deferred";
+      const authorize = async () => {};
+      const dirProof = await eraser.verifyErased(`${base}/`, { select: (v) => inSession.test(v.key), authorize, now });
+      if (dirProof.status !== "erased") return "unbound";
+      const pointerDir = `${opts.keyRoot}/${at.orgId}/live-sessions/v1/ws=${at.workspaceSegment}/m=${m.machineId}/h=${h}/`;
+      const pointerProof = await eraser.verifyErased(pointerDir, { exactKey: `${pointerDir}s=${s}.json`, authorize, now });
+      return pointerProof.status === "erased" ? "empty" : "unbound";
+    }
+    let identity: Record<string, unknown> | undefined;
+    try {
+      const doc = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await readAll((await store.getObject(objectKey(manifestKey))).body)));
+      const ext = doc?.extensions?.[BULLS_EXTENSION];
+      identity = ext && typeof ext === "object" && !Array.isArray(ext) ? ext : undefined;
+    } catch (error) {
+      if (isAccessDenied(error)) throw error;
+      return "unbound";
+    }
+    const userId = identity?.user_id;
+    if (typeof userId !== "string" || !userId || identity?.canonical_session_id !== m.sessionId) return "unbound";
+    const candidates = [...new Set([m.workspaceId, at.workspaceSegment])]
+      .filter((w): w is string => typeof w === "string" && w.length > 0 && layoutComponent(w) === at.workspaceSegment);
+    return candidates.some((workspaceId) => admissionUserDir(opts.keyRoot, { orgId: at.orgId, workspaceId, userId }) === at.dir
+      && liveMachineId(workspaceId, m.originId, userId) === m.machineId) ? "ok" : "unbound";
+  }
+
+  /** The origin's ownership stubs, read once per pass (cached), bounded by REARM_MAX_OWNER_SCAN and the deadline. */
+  /** An origin's stubs: the readable ones, and the keys of unreadable (corrupt) ones. */
+  interface OwnerScan { docs: OwnerDoc[]; invalid: string[] }
+  const ownerScans = new Map<string, OwnerScan | "too_large">();
+  async function ownersOf(prefix: string): Promise<OwnerScan | "too_large" | "deferred"> {
+    const cached = ownerScans.get(prefix);
+    if (cached !== undefined) return cached;
+    const out: OwnerScan = { docs: [], invalid: [] };
+    let cursor: string | undefined, result: OwnerScan | "too_large" = out;
+    scan: do {
+      if (expired()) return "deferred";
       const page = await store.list(objectKey(prefix), cursor);
       for (const item of page.items) {
         const k = String(item.key);
         if (!k.startsWith(`${prefix}/`) || !k.endsWith(".json")) continue;
+        if (out.docs.length + out.invalid.length >= ownerScanLimit) { result = "too_large"; break scan; }
+        if (expired()) return "deferred";
         const other = await readOwnerLoose(k);
-        // An unreadable stub could be a colliding live session: fail closed.
-        if (other === "invalid") return "layoutCollision";
-        if (other === null || (other.source === m.source && other.sessionId === m.sessionId)) continue;
-        if (layoutComponent(other.source) === h && layoutComponent(other.sessionId) === s && !isDeleted(fence, m.originId, other.source, other.sessionId)) return "layoutCollision";
+        if (other === "invalid") out.invalid.push(k);
+        else if (other !== null) out.docs.push(other);
       }
       cursor = page.nextCursor;
     } while (cursor);
+    ownerScans.set(prefix, result);
+    return result;
+  }
+
+  /**
+   * Step 4: the marker's machine is its user's (the ownership stub, or derived), and no live session shares its physical
+   * dir. The session's OWN stub unreadable (corrupt: e.g. the stamp that failed after the marker was written) is treated
+   * as unstamped: the machine is derived and hash-verified (derivedMachine), never taken from the marker. Any OTHER
+   * unreadable stub of the origin could be a colliding live session, so it still fails closed (`layoutCollision`).
+   */
+  async function bound(at: { dir: string; orgId: string; workspaceSegment: string }, key: string, digest: string, fence: FenceDoc, m: RearmDoc): Promise<Outcome | null> {
+    const ownKey = ownerKeyIn(at.dir, m.originId, m.source, m.sessionId);
+    const stub = await readOwnerLoose(ownKey);
+    if (stub === null || (stub !== "invalid" && (stub.originId !== m.originId || stub.source !== m.source || stub.sessionId !== m.sessionId))) return "ownerMissing";
+    if (stub === "invalid" || stub.machineId === undefined) {
+      const derived = await derivedMachine(at, m);
+      if (derived === "deferred") return "deferred";
+      if (derived === "unbound") return "machineUnbound";
+      if (derived === "empty") {
+        if (!dryRun) await createOnly(rearmDoneKey(key, digest), { v: 1, outcome: "empty", marker: digest, atMs: now() } satisfies RearmDoneDoc);
+        return "emptyUnbound";
+      }
+      counts.machineDerived++;
+    } else if (stub.machineId !== m.machineId) return "machineMismatch";
+    const owners = await ownersOf(ownersOriginPrefix(at.dir, m.originId));
+    if (owners === "deferred") return "deferred";
+    if (owners === "too_large") return "layoutScanTooLarge";
+    if (owners.invalid.some((k) => k !== ownKey)) return "layoutCollision";
+    const h = layoutComponent(m.source), s = layoutComponent(m.sessionId);
+    for (const other of owners.docs) {
+      if (other.source === m.source && other.sessionId === m.sessionId) continue;
+      if (layoutComponent(other.source) === h && layoutComponent(other.sessionId) === s && !isDeleted(fence, m.originId, other.source, other.sessionId)) return "layoutCollision";
+    }
     return null;
   }
   async function readOwnerLoose(key: string): Promise<OwnerDoc | null | "invalid"> {
@@ -301,7 +422,7 @@ export async function sweepRearmMarkers(deps: { store: ObjectStore; eraser: Page
       await createOnly(rearmDoneKey(key, digest), { v: 1, outcome: "superseded", marker: digest, atMs: now() } satisfies RearmDoneDoc);
       return "superseded";
     }
-    const refused = await bound(at.dir, read.fence, marker);
+    const refused = await bound(at, key, digest, read.fence, marker);
     if (refused) return refused;
     const checkedAt = now();
     // Before every page's deletes: the session must still be deleted (a re-enable since stops the erase).
@@ -325,16 +446,26 @@ export async function sweepRearmMarkers(deps: { store: ObjectStore; eraser: Page
   }
 
   let erases = 0;
-  let denied: unknown = null;
-  const spent = () => erases >= maxMarkers || (opts.deadlineAt !== undefined && now() >= opts.deadlineAt);
+  let fatal: unknown = null;
+  const spent = () => erases >= maxMarkers || expired();
   const stopAt = (scope: number, cursor: string | undefined, afterKey: string | undefined): RearmSweepResult =>
-    ({ dryRun, complete: false, counts, failures, resume: { scope, ...(cursor !== undefined ? { cursor } : {}), ...(afterKey !== undefined ? { afterKey } : {}) } });
+    ({ dryRun, complete: false, counts, failures, resume: resumeOf(scope, cursor, afterKey) });
+  const resumeOf = (scope: number, cursor: string | undefined, afterKey: string | undefined): RearmSweepResume =>
+    ({ scope, ...(cursor !== undefined ? { cursor } : {}), ...(afterKey !== undefined ? { afterKey } : {}) });
   const list = async (prefix: string, cursor: string | undefined) => {
     try { return await store.list(objectKey(prefix), cursor); } catch (error) {
       if (isAccessDenied(error)) throw new RearmSweepRefused("access_denied");
       throw error;
     }
   };
+  // Progress saves run one at a time, in order; a failed save is fatal for the pass (its error is rethrown).
+  let saving: Promise<void> = Promise.resolve();
+  const save = (r: RearmSweepResume): Promise<void> => {
+    if (!opts.onProgress) return saving;
+    saving = saving.then(() => opts.onProgress!(r)).catch((error) => { fatal ??= error; });
+    return saving;
+  };
+  const rethrow = (error: unknown): never => { throw isAccessDenied(error) || error instanceof RearmSweepRefused ? (error instanceof RearmSweepRefused ? error : new RearmSweepRefused("access_denied")) : error; };
 
   for (let scope = resume?.scope ?? 0, cursor = resume?.cursor, afterKey = resume?.afterKey; scope < scopes.length; scope++, cursor = undefined, afterKey = undefined) {
     const prefix = scopes[scope]!;
@@ -353,25 +484,38 @@ export async function sweepRearmMarkers(deps: { store: ObjectStore; eraser: Page
       resumed = false;
       const markers = page.items.map((i) => String(i.key))
         .filter((k) => k.startsWith(`${prefix}/`) && parseRearmKey(opts.keyRoot, k) !== null && (afterKey === undefined || byteAfter(k, afterKey)));
-      // In key order, `concurrency` at once. Out of budget part way: everything before `next` has finished, so the next
-      // pass lists this page again and continues after the last of them.
-      let next = 0;
+      // In key order, `concurrency` at once. `frontier`: every marker before it has finished, so it is the position
+      // saved after each marker whose erase ran (a pass that dies later resumes right after it) and returned on a stop.
+      // A `deferred` marker (its scan ran out of time) halts the pass and is NOT finished: the next pass starts at it.
+      const finished = new Array<boolean>(markers.length).fill(false);
+      let next = 0, frontier = 0, halt = false;
+      const pageCursor = cursor;
       await Promise.all(Array.from({ length: Math.min(concurrency, markers.length) }, async () => {
-        while (next < markers.length && !spent() && denied === null) {
-          const key = markers[next++]!;
+        while (next < markers.length && !spent() && fatal === null && !halt) {
+          const i = next++;
           counts.listed++;
           let outcome: Outcome | null = null;
-          try { outcome = await one(key); } catch (error) {
-            if (isAccessDenied(error)) { denied = error; return; }
+          try { outcome = await one(markers[i]!); } catch (error) {
+            if (isAccessDenied(error)) { fatal ??= error; return; }
             fail(error instanceof SessionEraseRefused || error instanceof LedgerUnavailableError ? error.code : isObjectStoreError(error) ? `store_${error.code}` : safeCode(error));
           }
+          if (outcome === "deferred") { counts.deferred++; halt = true; return; }
           if (outcome !== null) { counts[outcome]++; if (ERASE_RAN.has(outcome)) erases++; }
+          finished[i] = true;
+          const before = frontier;
+          while (frontier < markers.length && finished[frontier]) frontier++;
+          if (frontier > before && outcome !== null && ERASE_RAN.has(outcome)) await save(resumeOf(scope, pageCursor, markers[frontier - 1]));
         }
       }));
-      if (denied !== null) throw new RearmSweepRefused("access_denied");
-      if (next < markers.length) return stopAt(scope, cursor, markers[next - 1] ?? afterKey);
+      await saving;
+      if (fatal !== null) rethrow(fatal);
+      const last = markers[frontier - 1] ?? afterKey;
+      if (frontier < markers.length) return stopAt(scope, pageCursor, last);
+      if (markers.length > 0) await save(resumeOf(scope, pageCursor, last));
+      if (fatal !== null) rethrow(fatal);
       // `afterKey` stays for the rest of the scope: later pages sort after it anyway, and after a stale-cursor restart
       // it keeps skipping every page that was already finished.
+      afterKey = last;
       if (!page.nextCursor) break;
       cursor = page.nextCursor;
     }
@@ -411,14 +555,16 @@ export async function readRearmCursor(store: ObjectStore, key: string): Promise<
   return { resume: null, version };
 }
 
-/** Save the position: create-only, or If-Match the version read. false: another sweeper saved first (its position stands). */
-export async function writeRearmCursor(store: ObjectStore, key: string, resume: RearmSweepResume | null, version: ObjectVersion | undefined, atMs: number): Promise<boolean> {
+/**
+ * Save the position: create-only, or If-Match `version`. The new version (for the next save), or null: another sweeper
+ * saved first (its position stands).
+ */
+export async function writeRearmCursor(store: ObjectStore, key: string, resume: RearmSweepResume | null, version: ObjectVersion | undefined, atMs: number): Promise<ObjectVersion | null> {
   const body = new TextEncoder().encode(JSON.stringify({ v: 1, resume, atMs } satisfies RearmCursorDoc));
   try {
-    await store.put(objectKey(key), body, version ? { ifMatch: version, contentType: "application/json" } : { ifNoneMatch: true, contentType: "application/json" });
-    return true;
+    return (await store.put(objectKey(key), body, version ? { ifMatch: version, contentType: "application/json" } : { ifNoneMatch: true, contentType: "application/json" })).version;
   } catch (error) {
-    if (isObjectStoreError(error, "precondition_failed") || isObjectStoreError(error, "already_exists")) return false;
+    if (isObjectStoreError(error, "precondition_failed") || isObjectStoreError(error, "already_exists")) return null;
     if (isAccessDenied(error)) throw new RearmSweepRefused("access_denied");
     throw error;
   }

@@ -408,6 +408,186 @@ describe("re-arm sweeper: review fixes", () => {
   });
 });
 
+describe("re-arm sweeper: follow-ups (unstamped stubs, progress, bounded scans)", () => {
+  const ownerKey = (sessionId = "sess-1", tenant = TENANT) => s3LedgerKeys(ROOT, tenant).owner(ORIGIN, "claude", sessionId);
+  const unstamp = async (store: ObjectStore, sessionId = "sess-1") => {
+    const { machineId: _, ...legacy } = JSON.parse(await text(store, ownerKey(sessionId)));
+    await put(store, ownerKey(sessionId), JSON.stringify(legacy));
+  };
+  /** A canonical manifest as writer.ts writes it: the uploader and session in extensions.96bulls. */
+  const manifestOf = (userId: string, sessionId = "sess-1") => JSON.stringify({ extensions: { "96bulls": { user_id: userId, canonical_session_id: sessionId } } });
+
+  test("the commit stamps the ownership stub's machine before the marker (an old-code stub is bound by the fenced commit)", async () => {
+    const store = fresh();
+    const ledger = ledgerOn(store);
+    const input = claimInput(TENANT, "b1", [rec("r-b1", 1)]);
+    const c = await ledger.claim(input);
+    if (c.kind !== "claimed") throw new Error("unexpected");
+    await unstamp(store); // as written by code from before the binding (a rolling deploy)
+    await ledger.setSessionUploads(selection(TENANT, false));
+    expect(await ledger.commit({ tenant: TENANT, originId: ORIGIN, batchId: "b1", batchDigest: input.batchDigest, claimToken: c.claimToken, sessions: input.sessions,
+      records: input.records, machineId: machineOf(TENANT) })).toEqual({ rearmed: 1 });
+    expect(JSON.parse(await text(store, ownerKey()))).toMatchObject({ machineId: machineOf(TENANT) });
+    await seed(store, canonical(TENANT));
+    expect((await sweep(store)).counts).toMatchObject({ erased: 1, machineUnbound: 0, machineDerived: 0 });
+  });
+
+  test("an existing unstamped stub: the machine is derived from the session's manifest and verified, never trusted", async () => {
+    const store = fresh();
+    const marker = await rearmed(store, TENANT, "b1");
+    await unstamp(store);
+    const [manifest, ...rest] = canonical(TENANT);
+    await put(store, manifest!, manifestOf("someone-else")); // a user whose admission dir and machine are not these
+    await seed(store, rest);
+    expect((await sweep(store)).counts).toMatchObject({ machineUnbound: 1, erased: 0 });
+    for (const k of canonical(TENANT)) expect(await exists(store, k)).toBe(true);
+    await put(store, manifest!, manifestOf(TENANT.userId));
+    expect((await sweep(store)).counts).toMatchObject({ machineDerived: 1, erased: 1 });
+    for (const k of canonical(TENANT)) expect(await exists(store, k)).toBe(false);
+    expect(await doneOf(store, marker)).toMatchObject({ outcome: "erased" });
+  });
+
+  test("an unstamped stub with nothing under the marker's machine: completed as empty, nothing erased", async () => {
+    const store = fresh();
+    const marker = await rearmed(store, TENANT, "b1");
+    await unstamp(store);
+    await seed(store, canonical(TENANT, "sess-2")); // another session's bytes stay
+    expect((await sweep(store, { dryRun: true })).counts).toMatchObject({ emptyUnbound: 1 });
+    expect(await doneOf(store, marker)).toBeNull();
+    expect((await sweep(store)).counts).toMatchObject({ emptyUnbound: 1, erased: 0 });
+    expect(await doneOf(store, marker)).toMatchObject({ outcome: "empty" });
+    for (const k of canonical(TENANT, "sess-2")) expect(await exists(store, k)).toBe(true);
+  });
+
+  test("a pass that dies mid-way resumes right after the last finished marker (saved per marker)", async () => {
+    const store = fresh();
+    const markers = [await rearmed(store, TENANT, "b1", "s-a"), await rearmed(store, TENANT, "b2", "s-b"), await rearmed(store, TENANT, "b3", "s-c")].sort();
+    for (const sid of ["s-a", "s-b", "s-c"]) await seed(store, canonical(TENANT, sid));
+    // The third marker (in key order) kills the pass: a 403 on its completion-record HEAD.
+    const dying = `${markers[2]!.slice(0, -".json".length)}.done/`;
+    const killing = new Proxy(store, { get(t, k) {
+      if (k === "head") return async (key: unknown) => { if (String(key).startsWith(dying)) throw new ObjectStoreError("unauthorized", "s3", "HEAD", { status: 403 }); return t.head(key as never); };
+      const v = (t as any)[k]; return typeof v === "function" ? v.bind(t) : v;
+    } }) as ObjectStore;
+    const env = { ...ENTRY_ENV, INGEST_REARM_CONCURRENCY: "1" };
+    await expect(runRearmSweeperPass(env, [], { store: () => killing, eraser: () => storeEraser(store), now: LATER })).rejects.toMatchObject({ code: "access_denied" });
+    const saved = JSON.parse(await text(store, rearmCursorKey(ROOT, rearmScopes(ROOT, null))));
+    expect(saved.resume.afterKey).toBe(markers[1]);
+    const { output } = await runRearmSweeperPass(env, [], { store: () => store, eraser: () => storeEraser(store), now: LATER });
+    expect(output).toMatchObject({ complete: true, counts: { listed: 1, erased: 1, alreadyDone: 0 } });
+  });
+
+  test("the collision scan is bounded: over the limit it refuses, out of time it defers the marker to the next pass", async () => {
+    const store = fresh();
+    await ledgerOn(store).claim(claimInput(TENANT, "bx", [rec("r-bx", 1, "sess-2")])); // a second stub in the origin
+    await rearmed(store, TENANT, "b1");
+    await seed(store, canonical(TENANT));
+    expect((await sweep(store, { ownerScanLimit: 1 })).counts).toMatchObject({ layoutScanTooLarge: 1, erased: 0 });
+    // The clock jumps past the deadline as soon as the owners are listed: the marker is deferred, not finished.
+    let late = false;
+    const slow = new Proxy(store, { get(t, k) {
+      if (k === "list") return async (p: unknown, c?: string) => { if (String(p).includes("/ledger/owners/")) late = true; return t.list(p as never, c); };
+      const v = (t as any)[k]; return typeof v === "function" ? v.bind(t) : v;
+    } }) as ObjectStore;
+    const deadlineAt = Date.now() + 60 * 60_000;
+    const r = await sweepRearmMarkers({ store: slow, eraser: storeEraser(store) }, { keyRoot: ROOT, bucket: "transcripts", deadlineAt, now: () => (late ? deadlineAt + 1 : LATER()) });
+    expect(r).toMatchObject({ complete: false, counts: { deferred: 1, erased: 0 } });
+    expect(r.resume!.afterKey).toBeUndefined(); // the deferred marker is NOT behind the saved position
+    const again = await sweepRearmMarkers({ store, eraser: storeEraser(store) }, { keyRoot: ROOT, bucket: "transcripts", now: LATER }, r.resume);
+    expect(again.counts).toMatchObject({ listed: 1, erased: 1 });
+  });
+});
+
+describe("re-arm sweeper: #596 review notes", () => {
+  const ownerKey = (tenant: LedgerTenant = TENANT, sessionId = "sess-1") => s3LedgerKeys(ROOT, tenant).owner(ORIGIN, "claude", sessionId);
+  const unstamp = async (store: ObjectStore, tenant: LedgerTenant = TENANT) => {
+    const { machineId: _, ...legacy } = JSON.parse(await text(store, ownerKey(tenant)));
+    await put(store, ownerKey(tenant), JSON.stringify(legacy));
+  };
+  const manifestOf = (userId: string, sessionId = "sess-1") => JSON.stringify({ extensions: { "96bulls": { user_id: userId, canonical_session_id: sessionId } } });
+
+  test("a stamp that fails (corrupt stub) still leaves the marker: the commit fails AFTER it, and the marker names the raw workspace", async () => {
+    const store = fresh();
+    const ledger = ledgerOn(store);
+    const input = claimInput(TENANT, "b1", [rec("r-b1", 1)]);
+    const c = await ledger.claim(input);
+    if (c.kind !== "claimed") throw new Error("unexpected");
+    await ledger.setSessionUploads(selection(TENANT, false));
+    await put(store, ownerKey(), "{corrupt stub");
+    await expect(ledger.commit({ tenant: TENANT, originId: ORIGIN, batchId: "b1", batchDigest: input.batchDigest, claimToken: c.claimToken, sessions: input.sessions,
+      records: input.records, machineId: machineOf(TENANT) })).rejects.toMatchObject({ code: "ledger_owner_invalid" });
+    const marker = s3LedgerKeys(ROOT, TENANT).rearm(ORIGIN, "claude", "sess-1");
+    expect(JSON.parse(await text(store, marker))).toMatchObject({ v: 1, sessionId: "sess-1", machineId: machineOf(TENANT), workspaceId: TENANT.workspaceId });
+    // The sweep: the session's own stub is unreadable, so it is treated as unstamped and the machine is derived from the
+    // session's manifest (hash-verified, not taken from the marker); the data is erased.
+    const files = canonical(TENANT);
+    await put(store, files[0]!, manifestOf(TENANT.userId));
+    await seed(store, files.slice(1));
+    expect((await sweep(store)).counts).toMatchObject({ machineDerived: 1, erased: 1, failed: 0, layoutCollision: 0 });
+    for (const k of files) expect(await exists(store, k)).toBe(false);
+    expect(await doneOf(store, marker)).toMatchObject({ outcome: "erased" });
+  });
+
+  test("a corrupt stub of ANOTHER session of the origin still fails closed (it could be a colliding live session)", async () => {
+    const store = fresh();
+    await ledgerOn(store).claim(claimInput(TENANT, "bx", [rec("r-bx", 1, "sess-2")]));
+    await rearmed(store, TENANT, "b1");
+    await seed(store, canonical(TENANT));
+    await put(store, ownerKey(TENANT, "sess-2"), "{corrupt other stub");
+    expect((await sweep(store)).counts).toMatchObject({ layoutCollision: 1, erased: 0, failed: 0 });
+    for (const k of canonical(TENANT)) expect(await exists(store, k)).toBe(true);
+  });
+
+  test("`empty` is version-aware: a delete marker over an old version under the machine is not empty (unbound, nothing recorded)", async () => {
+    const store = fresh();
+    const marker = await rearmed(store, TENANT, "b1");
+    await unstamp(store);
+    // No CURRENT object of the session (a plain list sees nothing), but the versioned bucket still holds an old
+    // version of its manifest behind a delete marker.
+    const [manifestKey] = canonical(TENANT);
+    const hidden = [
+      { key: manifestKey!, versionId: "v-delete-marker", latest: true, deleteMarker: true, lastModified: Date.now() },
+      { key: manifestKey!, versionId: "v-old", latest: false, deleteMarker: false, lastModified: Date.now() - 1000 },
+    ];
+    const inner = storeEraser(store);
+    const versioned: PagedEraser = {
+      ...inner,
+      async verifyErased(prefix, o) {
+        const left = hidden.filter((v) => v.key.startsWith(prefix) && (o.exactKey === undefined || v.key === o.exactKey) && (!o.select || o.select(v)));
+        return left.length ? { status: "pending", reason: "remaining", remaining: left.length, listed: left.length } : inner.verifyErased(prefix, o);
+      },
+    };
+    expect((await sweep(store, {}, versioned)).counts).toMatchObject({ machineUnbound: 1, emptyUnbound: 0 });
+    expect(await doneOf(store, marker)).toBeNull();
+  });
+
+  test("a workspace id layoutComponent rewrites: the machine is derived with the marker's RAW workspace id (legacy markers without it stay unbound)", async () => {
+    const store = fresh();
+    const raw = { orgId: "org-a", workspaceId: "ws:x", userId: "user-1" }; // its ws= segment is ws_x
+    const physical = { ...raw, workspaceId: "ws_x" };
+    const marker = await rearmed(store, raw, "b1");
+    await unstamp(store, raw);
+    const files = canonical(physical, "sess-1", machineOf(raw));
+    await put(store, files[0]!, manifestOf(raw.userId));
+    await seed(store, files.slice(1));
+    // A legacy marker (no workspaceId): the segment is not the raw id, so the hashes cannot match.
+    const written = JSON.parse(await text(store, marker));
+    const { workspaceId: _, ...legacy } = written;
+    await put(store, marker, JSON.stringify(legacy));
+    expect((await sweep(store)).counts).toMatchObject({ machineUnbound: 1, erased: 0 });
+    // A wrong raw id is never trusted: it does not reproduce the hashes.
+    await put(store, marker, JSON.stringify({ ...written, workspaceId: "ws/x" }));
+    expect((await sweep(store)).counts).toMatchObject({ machineUnbound: 1, erased: 0 });
+    for (const k of files) expect(await exists(store, k)).toBe(true);
+    await put(store, marker, JSON.stringify(written));
+    expect((await sweep(store)).counts).toMatchObject({ machineDerived: 1, erased: 1 });
+    for (const k of files) expect(await exists(store, k)).toBe(false);
+  });
+});
+
+const ENTRY_ENV = { INGEST_REARM_SWEEPER_ENABLED: "true", INGEST_REARM_BUCKET: "transcripts", INGEST_REARM_REGION: "us-east-1", INGEST_REARM_CREDENTIALS: "keys",
+  INGEST_REARM_S3_ACCESS_KEY_ID: "test-access-key-id", INGEST_REARM_S3_SECRET_ACCESS_KEY: "test-only-secret" };
+
 describe("re-arm sweeper entry", () => {
   const ENV = { INGEST_REARM_SWEEPER_ENABLED: "true", INGEST_REARM_BUCKET: "transcripts", INGEST_REARM_REGION: "us-east-1", INGEST_REARM_CREDENTIALS: "keys",
     INGEST_REARM_S3_ACCESS_KEY_ID: "test-access-key-id", INGEST_REARM_S3_SECRET_ACCESS_KEY: "test-only-secret" };
