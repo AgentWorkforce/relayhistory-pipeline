@@ -7,11 +7,16 @@
  *
  * Per staged object, in key order, with bounded concurrency:
  *
+ *   0b. --execute writes nothing of an org without a valid fence-authority marker, by admission's own rule
+ *      (ledger-s3 requireFenceAuthority: per-org marker, else the deployment-wide one): `fence_authority_missing`
+ *      or `fence_authority_invalid`. The dry run classifies anyway and counts `orgs_without_authority`.
  *   1. Skip it when its create-only `drained` marker (`<staged key>.drained.json`) exists.
  *   2. Read it (bounded), refuse a buffered-GC redaction barrier, check that the key names exactly this
  *      header and these bytes (org, workspace, machine, batch digest, claim token, sha256 of the stored
  *      frame), and validate every line and its ledger meta.
  *   3. Read the user's fence (`upload-fences.json`) and privacy journal (`privacy-journal.json`).
+ *      - As admission: a PENDING ordered reset (`hasPendingReset`) is `control_pending`, skipped; a pending ordered
+ *        disable's sessions count as deleted (`isDeletedForAdmission`). Fences may be v1 or v2 (v2 while pending).
  *      - Fence absent: `fence_absent`, skipped (not backfilled; it could republish a deleted session).
  *        Fence unreadable: `fence_unreadable`, skipped. Deleted (origin, source, session) lines drop.
  *      - Journal unreadable: skipped. A control pending or unresolved (`ambiguous`) in the journal:
@@ -63,7 +68,10 @@ import { isObjectStoreError, objectKey, type ObjectStore, type ObjectVersion } f
 import { layoutComponent } from "../shared/layout-component.ts";
 import { journalKey } from "./async-admission.ts";
 import type { LedgerTenant } from "./ledger.ts";
-import { entryForgotten, fenceEpoch, isDeleted, newFence, recordGeneration, s3LedgerObjects, sessionKeyHash, type FenceDoc, type FenceRead, type IndexEntry, type IndexEntryInput } from "./ledger-s3.ts";
+import {
+  entryForgotten, fenceAuthorityKey, fenceEpoch, hasPendingReset, isDeletedForAdmission, newFence, orgFenceAuthorityKey, recordGeneration, s3LedgerObjects,
+  sessionKeyHash, validFenceAuthority, validOrgFenceAuthority, type FenceDoc, type FenceRead, type IndexEntry, type IndexEntryInput,
+} from "./ledger-s3.ts";
 import { fitLine } from "./oversize.ts";
 import { routedRawChunkSealerDeps } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { BUFFER_STAGE_MAX_BYTES, decodeStaged, type StagedHeader } from "./staging.ts";
@@ -231,6 +239,9 @@ export type ObjectOutcome =
   | "reset_undeterminable"
   | "reset_margin"
   | "reset_in_flight"
+  | "control_pending"
+  | "fence_authority_missing"
+  | "fence_authority_invalid"
   | "index_unreadable"
   | "write_failed"
   | "index_merge_failed"
@@ -241,7 +252,7 @@ export type ObjectOutcome =
 
 const OUTCOMES: ObjectOutcome[] = [
   "drained", "would_drain", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch",
-  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "index_unreadable", "write_failed",
+  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "control_pending", "fence_authority_missing", "fence_authority_invalid", "index_unreadable", "write_failed",
   "index_merge_failed", "fence_recheck_failed", "fence_moved", "marker_failed", "internal_error",
 ];
 
@@ -266,6 +277,8 @@ export interface DrainSummary {
   /** Session groups written (execute) or that would be (dry run). */
   sessions_written: number;
   rearmed: number;
+  /** Orgs without a valid fence-authority marker (per-org, else deployment-wide): --execute writes nothing of them. */
+  orgs_without_authority: number;
   /** Dry run with assumeEmptyFence: batches whose user had no fence, classified as if it were empty. */
   fence_assumed_empty: number;
   /** Write failures by closed code (IngestWriteError code, or `storage`). */
@@ -278,7 +291,7 @@ function emptySummary(mode: DrainSummary["mode"]): DrainSummary {
     mode, orgs: 0, listed: 0, foreign_keys: 0,
     objects: Object.fromEntries(OUTCOMES.map((o) => [o, 0])) as Record<ObjectOutcome, number>,
     lines: { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0 },
-    sessions_written: 0, rearmed: 0, fence_assumed_empty: 0, write_failures: {}, stopped: "complete",
+    sessions_written: 0, rearmed: 0, orgs_without_authority: 0, fence_assumed_empty: 0, write_failures: {}, stopped: "complete",
   };
 }
 
@@ -358,6 +371,8 @@ interface BatchGroup {
   /** Staged keys sharing one `…/b=<batch32>-` prefix, in key order. */
   staged: string[];
   markers: Set<string>;
+  /** The org's fence authority, as admission requires it (ledger-s3 requireFenceAuthority). */
+  authority: Authority;
   lastKey: string;
 }
 
@@ -365,7 +380,36 @@ interface BatchGroup {
  * Listed keys grouped by `…/m=…/b=<batch32>`. Every object of one batch digest (retries with other
  * claim tokens, a GC replacement, their markers) sorts contiguously, so the group is complete.
  */
-async function* batchGroups(store: ObjectStore, prefix: string, startAfter: string | undefined, summary: DrainSummary): AsyncGenerator<BatchGroup> {
+type Authority = "ok" | "missing" | "invalid";
+
+/**
+ * Exactly admission's rule (ledger-s3 requireFenceAuthority): the org's own marker
+ * (`.ledger/fence-authority/<org>.json`, with that orgId), else the deployment-wide one; a present but invalid
+ * per-org marker refuses outright. The marker attests the drain's own preconditions (fence, ownership and revision
+ * backfills complete, control mirror on, re-arm sweeper live, Worker HTTP admission off).
+ */
+async function orgAuthority(store: ObjectStore, keyRoot: string, orgId: string): Promise<Authority> {
+  const read = async (key: string) => {
+    const got = await readText(store, key, 64 * 1024);
+    if (!got) return null;
+    try {
+      return { v: JSON.parse(got.text) as unknown };
+    } catch {
+      return { v: undefined };
+    }
+  };
+  try {
+    const org = await read(orgFenceAuthorityKey(keyRoot, orgId));
+    if (org) return validOrgFenceAuthority(org.v) && (org.v as { orgId: string }).orgId === orgId ? "ok" : "invalid";
+    const all = await read(fenceAuthorityKey(keyRoot));
+    if (!all) return "missing";
+    return validFenceAuthority(all.v) ? "ok" : "invalid";
+  } catch {
+    return "invalid";
+  }
+}
+
+async function* batchGroups(store: ObjectStore, prefix: string, startAfter: string | undefined, summary: DrainSummary, authority: Authority): AsyncGenerator<BatchGroup> {
   let current: (BatchGroup & { id: string }) | null = null;
   let cursor: string | undefined;
   do {
@@ -385,7 +429,7 @@ async function* batchGroups(store: ObjectStore, prefix: string, startAfter: stri
         yield current;
         current = null;
       }
-      current ??= { id, staged: [], markers: new Set(), lastKey: key };
+      current ??= { id, staged: [], markers: new Set(), authority, lastKey: key };
       current.lastKey = key;
       if (staged === key) current.staged.push(key);
       else current.markers.add(staged);
@@ -569,7 +613,9 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       const prefix = `${opts.keyRoot}/${org}/buffered-batches/v1`;
       // Every key under a prefix that sorts before start-after, and does not contain it, is before it.
       if (opts.startAfter !== undefined && `${prefix}/` < opts.startAfter && !opts.startAfter.startsWith(`${prefix}/`)) continue;
-      yield* batchGroups(opts.store, prefix, opts.startAfter, summary);
+      const authority = await orgAuthority(opts.store, opts.keyRoot, org);
+      if (authority !== "ok") summary.orgs_without_authority++;
+      yield* batchGroups(opts.store, prefix, opts.startAfter, summary, authority);
     }
   }
 
@@ -636,7 +682,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     // Read everything not yet drained, then decide per claim token (GC replacement detection).
     const reads = new Map<string, Read>();
     for (const key of group.staged) {
-      if (group.markers.has(key)) continue;
+      if (group.markers.has(key) || (!opts.dryRun && group.authority !== "ok")) continue;
       try {
         reads.set(key, await readStagedObject(store, key, parseStagedKey(key)!, opts.decompress));
       } catch {
@@ -647,6 +693,12 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     for (const key of group.staged) {
       if (group.markers.has(key)) {
         summary.objects.already_drained++;
+        continue;
+      }
+      // --execute writes only for an org admission itself would admit (the dry run still classifies, and reports
+      // the org in orgs_without_authority).
+      if (!opts.dryRun && group.authority !== "ok") {
+        summary.objects[group.authority === "missing" ? "fence_authority_missing" : "fence_authority_invalid"]++;
         continue;
       }
       const read = reads.get(key)!;
@@ -700,6 +752,8 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     const counts = { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0 };
     // ledger-s3 resetsCompleted: a reset begun but not finished is still applying its tombstones (a claim
     // finishes it). Writing now could republish a session it is about to tombstone: skip, unmarked.
+    // As admission's claim (ledger-s3 hasPendingReset): an ordered reset SQL has not decided yet refuses the user.
+    if (hasPendingReset(fence)) return "control_pending";
     if (fence.resetsCompleted < fence.resets) return "reset_in_flight";
     if (fence.resets > 0) {
       // ledger-s3 `lastResetAtMs`: 0 means no reset time was recorded (it only ever rises).
@@ -720,7 +774,8 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       g.lines.forEach((line, i) => {
         counts.candidate++;
         const m = g.meta![i]!;
-        if (m[3] !== null && isDeleted(fence, origin, m[2], m[3])) {
+        // As admission (ledger-s3 isDeletedForAdmission): tombstoned, or named by a PENDING ordered disable.
+        if (m[3] !== null && isDeletedForAdmission(fence, origin, m[2], m[3])) {
           counts.fenced++;
           fencedSessions.set(JSON.stringify([m[2], m[3]]), [m[2], m[3]]);
         } else {
@@ -828,7 +883,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
         const journalMoved = (journalAfter?.seq ?? 0) !== (journal?.seq ?? 0) || (journalAfter?.pending ?? 0) > 0 || (journalAfter?.ambiguous ?? 0) > 0;
         const rearm = new Map(fencedSessions);
         for (const [pk, [s, id]] of writtenSessions) {
-          const reached = journalMoved || (!same && (now.state !== "present" || isDeleted(after, origin, s, id) || after.resets !== snapshot.resets || after.resetsCompleted !== snapshot.resetsCompleted || epochOf(after, s, id) !== epochOf(fence, s, id)));
+          const reached = journalMoved || hasPendingReset(after) || (!same && (now.state !== "present" || isDeletedForAdmission(after, origin, s, id) || after.resets !== snapshot.resets || after.resetsCompleted !== snapshot.resetsCompleted || epochOf(after, s, id) !== epochOf(fence, s, id)));
           if (reached) {
             rearm.set(pk, [s, id]);
             fencedNow.add(pk);

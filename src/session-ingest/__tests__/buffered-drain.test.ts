@@ -17,7 +17,8 @@ import {
 import { parseDrainArgs } from "../../../scripts/buffered-drain.ts";
 import { scratchStore } from "./support.ts";
 import { journalKey as journalKeyFor } from "../async-admission.ts";
-import { applyFenceChange, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceChange, type IndexEntryInput } from "../ledger-s3.ts";
+import { applyFenceChange, fenceAuthorityKey, orgFenceAuthorityKey, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceChange, type IndexEntryInput } from "../ledger-s3.ts";
+import type { OrderedControlInput } from "../ledger.ts";
 
 const ROOT = "96bulls";
 const TENANT = { orgId: "org-a", workspaceId: "ws-a", userId: "user-1" };
@@ -107,10 +108,15 @@ const run = (store: ObjectStore, over: Partial<DrainOptions> = {}) =>
 let cleanup: (() => void)[] = [];
 afterEach(() => { cleanup.forEach((c) => c()); cleanup = []; });
 /** A scratch store whose user has a backfilled, empty fence (0005 step 0), unless `fence: false`. */
-async function scratch(opts: { fence?: boolean } = {}) {
+/** A valid fence-authority marker (main's OrgFenceAuthorityDoc / FenceAuthorityDoc): every precondition attested. */
+const AUTHORITY = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: 1 };
+const putOrgAuthority = (store: ObjectStore, doc: unknown = { ...AUTHORITY, orgId: TENANT.orgId }) =>
+  store.put(objectKey(orgFenceAuthorityKey(ROOT, TENANT.orgId)), enc.encode(JSON.stringify(doc)));
+async function scratch(opts: { fence?: boolean; authority?: boolean } = {}) {
   const s = scratchStore();
   cleanup.push(s.done);
   if (opts.fence !== false) await putFence(s.store);
+  if (opts.authority !== false) await putOrgAuthority(s.store);
   return s.store;
 }
 const putJournal = (store: ObjectStore, journal: unknown) => store.put(objectKey(journalKeyFor(ROOT, TENANT)), enc.encode(JSON.stringify(journal)));
@@ -302,6 +308,44 @@ describe("buffered backlog drain (0005)", () => {
     expect(lines.get("sess-2")).toEqual(["r2@1"]);
     expect((await readJson(store, early + DRAINED_SUFFIX)).outcome).toBe("pre_reset");
     expect((await readJson(store, late + DRAINED_SUFFIX)).outcome).toBe("drained");
+  });
+
+  test("pending ordered controls, as admission: a pending disable's session is deleted, a pending reset refuses the user", async () => {
+    const store = await scratch();
+    const mirror = s3ControlMirror(store, ROOT);
+    const control = (version: string, kind: "selection" | "reset") => ({ epoch: "e".repeat(64), version, digest: `${kind === "reset" ? "a" : "d"}${version.padStart(63, "0")}`, kind });
+    await mirror.beginOrdered({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "sess-2"]], enabled: false, control: control("1", "selection") } as OrderedControlInput);
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }]), group("claude", "sess-2", [{ id: "r2", rev: 1 }])]);
+    const first = await run(store);
+    expect(first.objects.drained).toBe(1);
+    expect(first.lines.fenced).toBe(1);
+    expect([...(await canonical(store)).keys()]).toEqual(["sess-1"]);
+    expect(await exists(store, key + DRAINED_SUFFIX)).toBe(true);
+    // A pending reset (SQL has not decided): no batch of the user is written.
+    await mirror.beginOrdered({ tenant: TENANT, requestId: "req-1", control: control("2", "reset") } as OrderedControlInput);
+    const key2 = await stage(store, [group("claude", "sess-3", [{ id: "r3", rev: 1 }])]);
+    for (const dryRun of [true, false]) expect((await run(store, { dryRun })).objects.control_pending).toBe(1);
+    expect(await exists(store, key2 + DRAINED_SUFFIX)).toBe(false);
+    expect((await currentFence(store)).v).toBe(2); // main's v:2 while a control is pending: read as-is
+  });
+
+  test("fence authority, as admission: --execute writes nothing of an org without it; the dry run still classifies", async () => {
+    const store = await scratch({ authority: false });
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    const dry = await run(store, { dryRun: true });
+    expect(dry.objects.would_drain).toBe(1);
+    expect(dry.orgs_without_authority).toBe(1);
+    const missing = await run(store);
+    expect(missing.objects).toMatchObject({ fence_authority_missing: 1, drained: 0 });
+    expect(missing.orgs_without_authority).toBe(1);
+    // A present but invalid per-org marker refuses outright, even with a valid deployment-wide one.
+    await store.put(objectKey(fenceAuthorityKey(ROOT)), enc.encode(JSON.stringify(AUTHORITY)));
+    await putOrgAuthority(store, { ...AUTHORITY, orgId: "another-org" });
+    expect((await run(store)).objects.fence_authority_invalid).toBe(1);
+    expect(await exists(store, key + DRAINED_SUFFIX)).toBe(false);
+    // The deployment-wide marker alone (no per-org one) is enough, as for admission.
+    await store.delete(objectKey(orgFenceAuthorityKey(ROOT, TENANT.orgId)));
+    expect((await run(store)).objects.drained).toBe(1);
   });
 
   test("a reset begun but not finished (resetsCompleted < resets) skips the batch until it completes", async () => {
