@@ -13,6 +13,13 @@ const ANALYTICS_COUNTER_FIELDS = [
   "analytics_export_failures",
 ];
 
+/** One async admission's wall time per phase (selfhost-admission.ts): deliverPrepared's timing_ms keys it may log. */
+export const ADMISSION_PHASE_FIELDS: ReadonlyMap<string, string> = new Map([
+  ["read", "admission_read_ms"], ["claim", "admission_claim_ms"], ["admission_gate", "admission_gate_ms"],
+  ["objects", "admission_objects_ms"], ["commit", "admission_commit_ms"], ["finish", "admission_finish_ms"],
+]);
+const ADMISSION_PHASE_FIELDS_LIST = [...ADMISSION_PHASE_FIELDS.values()];
+
 export const ALLOWED_LOG_FIELDS = new Set([
   "service", "deployment", "deployment_id", "stage", "status", "outcome", "attempt",
   "trace_id", "span_id", "traceparent", "session_uuid", "session_uuid_source",
@@ -35,6 +42,8 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "buffered_checked", "buffered_dropped",
   // Self-host async admission consumer (src/session-ingest/selfhost-admission.ts): bounded counts only.
   "admission_backlog", "admission_oldest_age_ms", "admission_dead_letters", "admission_in_flight",
+  // ...and one admission's wall time per phase (ADMISSION_PHASE_FIELDS): bounded counts only.
+  ...ADMISSION_PHASE_FIELDS_LIST,
   // Search index failures (searchIndexErrorDetail): the adapter's bounded detail code only
   // (e.g. `http_429:bulk_items_812:bulk_bytes_4190000`), never backend text or a reason.
   "error_detail",
@@ -57,6 +66,7 @@ export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ["admission_oldest_age_ms", 10 * 365 * 24 * 3600 * 1000],
   ["admission_dead_letters", 10_000_000],
   ["admission_in_flight", 1_000],
+  ...ADMISSION_PHASE_FIELDS_LIST.map((f): [string, number] => [f, 3_600_000]),
   ...ANALYTICS_COUNTER_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
 ]);
 
