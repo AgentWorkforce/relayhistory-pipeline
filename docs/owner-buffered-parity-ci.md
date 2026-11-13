@@ -1,4 +1,4 @@
-# Owner-buffered parity CI workflow (exact eight, dormant write, one-time discovery)
+# Owner-buffered parity CI workflow (exact eight, dormant write, discovery and temporary scope diagnostic)
 
 `.github/workflows/owner-buffered-parity.yml` runs the owner-buffered parity census (G1), the G2 write of
 `sessions.owner_buffered_parity` and a read-only readback for **exactly eight** tenants, from CI only. It adds
@@ -6,6 +6,11 @@ no parity SQL: it drives the existing operator code (`scripts/owner-buffered-par
 `src/migration/owner-buffered-parity.ts`) through the single-tenant path, one tenant at a time. A one-time,
 read-only `discovery` mode finds which eight buffered owners lack a canonical current parity row, so the
 roster can be written (see [Discovery](#discovery-read-only-one-time)).
+
+`scope-diagnostic` is temporary recovery instrumentation. After two consecutive discovery cardinality refusals,
+it uses the same fenced read-only snapshots and bounded cursor to classify the complete buffered-owner set. It
+collects no tenant digests, always refuses `owner_parity_scope_diagnostic`, and publishes aggregate counts only.
+Run it twice to distinguish a stable scope from a moving one, then remove the mode with the recovery fix-forward.
 
 **Every dispatch, in any mode, needs Khaliq's own word.** Merging this workflow authorizes nothing.
 **Enabling write is a separate reviewed PR** that flips one line
@@ -17,7 +22,8 @@ roster can be written (see [Discovery](#discovery-read-only-one-time)).
   in the gate job and again in the database step **before any credential is read**.
 - The roster `src/migration/owner-buffered-parity-roster.json` ships **empty**, so every census, write and
   readback dispatch refuses `roster_empty`. Adding the eight digests is a separate follow-up PR. `discovery`
-  is the only mode that runs on the empty roster, and it refuses `roster_present` once the roster is filled.
+  and temporary `scope-diagnostic` are the only modes that run on the empty roster, and both refuse
+  `roster_present` once the roster is filled.
 - Census and readback stay callable once the roster is populated.
 
 ## Roster
@@ -35,7 +41,7 @@ this workflow and cannot be reached (`owner_parity_inputs`).
 
 | Input | Values | Notes |
 | --- | --- | --- |
-| `mode` | `census` (default), `write`, `readback`, `discovery` | Anything else refuses `owner_parity_inputs`. |
+| `mode` | `census` (default), `write`, `readback`, `discovery`, temporary `scope-diagnostic` | Anything else refuses `owner_parity_inputs`. |
 | `sha` | 40 lowercase hex | Must equal the live `main` head and `github.sha`. |
 | `census_run` | run id | Write only; empty otherwise (discovery included). |
 | `confirmation` | text | Write only; empty otherwise (discovery included). |
@@ -183,10 +189,10 @@ Refusals specific to discovery:
 | --- | --- |
 | `roster_present` | The committed roster lists any digest. A malformed roster still refuses `roster_invalid`. |
 | `generation_unstable` | The generation inside the snapshot, after the comparison, or in a fresh equal proof differs from the one read first. |
-| `unexpected_scope` | missing + stale is not exactly 7, or any cursor row is not a valid tenant tuple. Refused as soon as more than 7 are seen (counts so far only). |
+| `unexpected_scope` | missing + stale is not exactly 8, or any cursor row is not a valid tenant tuple. Refused as soon as more than 8 are seen (counts so far only). |
 | `owner_parity_discovery_session_alias` | Neon and target were not supplied as distinct sessions. |
 | `owner_parity_discovery_source_anchor` | The Neon read-only snapshot could not be anchored before enumeration. |
-| `owner_parity_mode_route` | Internal guard: discovery reached the census/write/readback runner, or another mode reached the discovery runner. |
+| `owner_parity_mode_route` | Internal guard: discovery/diagnostic reached the census/write/readback runner, or another mode reached the discovery runner. |
 
 Every other refusal stays (`owner_parity_inputs`, `owner_parity_census_run`, `owner_parity_confirmation`,
 the gate codes, the credential codes). A census, write or readback dispatch still refuses `roster_empty`.
@@ -207,6 +213,15 @@ file strictly before publishing it. The receipt holds:
 **A refused run carries counts only, never digests.** No receipt, summary or log line carries a tenant id,
 workspace id, slug, email, row, SQL text or credential. The generic `owner-buffered-parity` receipt of a
 discovery run carries the counts only (`found` = scanned, `equal` = canonical current) and no digests.
+
+### `scope-diagnostic` (temporary, read-only, counts only)
+
+This mode answers one question: **how many buffered owners are currently missing or stale when the full bounded
+cursor is classified in the same stable source/target snapshots?** Unlike normal discovery, it does not fail fast
+at the ninth affected owner. It never collects or emits tenant digests, completes both generation fences, and then
+deliberately refuses `owner_parity_scope_diagnostic`. Its discovery receipt therefore has `owners: []` and only
+the aggregate `scanned`, `canonicalCurrent`, `missing`, `stale`, and `unparsable` counts. It is diagnostic
+scaffolding, not an activation path; remove it immediately after the recovery scope is measured.
 
 ## Credentials
 

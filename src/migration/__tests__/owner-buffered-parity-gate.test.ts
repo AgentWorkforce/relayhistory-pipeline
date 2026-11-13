@@ -87,7 +87,7 @@ const writeEnv = env("write", { OWNER_PARITY_CENSUS_RUN: censusRun, OWNER_PARITY
 const gate = (e: Record<string, string>, f: Fixture, enabled = true, seen?: string[]) =>
   code(() => ownerParityGithubGate(e, githubGet(f, seen), true, { enabled }));
 
-test("dormant gate: write refuses before any GitHub read while disabled; census and readback pass every gate", async () => {
+test("dormant gate: write refuses before any GitHub read; read-only modes pass every gate", async () => {
   expect(OWNER_PARITY_WRITE_ENABLED).toBe(false);
   const seen: string[] = [];
   expect(await gate(writeEnv, githubFixture(), false, seen)).toBe("owner_parity_write_dormant");
@@ -103,11 +103,12 @@ test("dormant gate: write refuses before any GitHub read while disabled; census 
   expect(discoverySeen.some((path) => path.includes("/artifacts") || path.includes("/actions/runs/" + censusRun))).toBe(false);
   expect(await gate(env("discovery", { OWNER_PARITY_CENSUS_RUN: censusRun }), githubFixture())).toBe("owner_parity_census_run");
   expect(await gate(env("discovery", { OWNER_PARITY_CONFIRMATION: "x" }), githubFixture())).toBe("owner_parity_confirmation");
+  expect(await gate(env("scope-diagnostic"), githubFixture())).toBeNull();
   expect(await gate(writeEnv, githubFixture())).toBeNull();
 });
 
-test("only census, write, readback and discovery are modes: bulk and anything else refuse before any GitHub read", async () => {
-  expect([...OWNER_PARITY_MODES]).toEqual(["census", "write", "readback", "discovery"]);
+test("only the four operator modes and temporary scope diagnostic are reachable; bulk refuses before GitHub", async () => {
+  expect([...OWNER_PARITY_MODES]).toEqual(["census", "write", "readback", "discovery", "scope-diagnostic"]);
   for (const mode of ["bulk", "BULK", "census ", "", "renew", "Discovery", "discovery "]) {
     const seen: string[] = [];
     expect(await gate(env(mode), githubFixture(), true, seen)).toBe("owner_parity_inputs");
@@ -253,7 +254,7 @@ test("workflow: two pinned secrets in one step, gate without environment, proof 
   expect([...new Set(workflow.match(/OWNER_PARITY_NEON_[A-Z0-9_]+/gu) ?? [])])
     .toEqual(["OWNER_PARITY_NEON_READONLY_URL"]);
   expect(workflow.match(/vars\.[A-Za-z_]+/gu)).toBeNull();
-  expect(workflow).toContain("options: [census, write, readback, discovery]");
+  expect(workflow).toContain("options: [census, write, readback, discovery, scope-diagnostic]");
   expect(workflow).toContain("options: [frozen-supabase, neon]");
   expect(workflow).toContain("default: census\n");
   expect(workflow).toContain("default: frozen-supabase\n");

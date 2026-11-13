@@ -318,7 +318,7 @@ export function ownerParityPreflight(
 ): { dispatch: OwnerParityDispatch; roster: string[]; census: OwnerParityCensusArtifact | null } {
   const dispatch = ownerParityDispatch(env, enabled);
   if (OWNER_PARITY_MODE_POLICY[dispatch.mode].roster === "empty") {
-    // Discovery: one-time, so it needs the empty roster and refuses roster_present once digests are listed.
+    // Discovery and its temporary count-only diagnostic need the empty roster and refuse once digests are listed.
     requireEmptyOwnerParityRoster(roster);
     return { dispatch, roster: [], census: null };
   }
@@ -441,7 +441,8 @@ export async function runOwnerParity(
     const pre = ownerParityPreflight(env, options.roster, options.census,
       options.writeEnabled ?? OWNER_PARITY_WRITE_ENABLED, now());
     dispatch = pre.dispatch;
-    if (dispatch.mode === "discovery") refuseOwnerParity("owner_parity_mode_route");
+    if (dispatch.mode === "discovery" || dispatch.mode === "scope-diagnostic")
+      refuseOwnerParity("owner_parity_mode_route");
     counts.roster = pre.roster.length;
     for (const digest of pre.roster) statuses.set(digest, "not_attempted");
     const readCensus = options.deps?.readCensus ?? readParityCensus;
@@ -566,6 +567,7 @@ export async function discoverOwnersInSnapshot(
   counts: OwnerParityDiscoveryCounts,
   found: OwnerParityDiscoveryOwner[],
   deps: OwnerParityDiscoveryDependencies = {},
+  fullCountDiagnostic: boolean = false,
 ): Promise<void> {
   const readCensus = deps.readCensus ?? readParityCensus;
   const splitSource = censusSource === "neon";
@@ -598,11 +600,13 @@ export async function discoverOwnersInSnapshot(
         : g1.equal && g1.proof && canonicalJson(stored) === canonicalJson(g1.proof) ? "equal" : "stale";
       if (status === "equal") { counts.canonicalCurrent++; continue; }
       counts[status]++;
-      found.push({ tenantSha256: tenantSha256(tenant), disposition: status satisfies OwnerParityDisposition });
-      // Fail fast: the scope is already wrong, so stop paying four statements per remaining owner; counts only on refusal.
-      if (counts.missing + counts.stale > OWNER_PARITY_EXACT_COUNT) refuseOwnerParity("unexpected_scope");
+      if (!fullCountDiagnostic) {
+        found.push({ tenantSha256: tenantSha256(tenant), disposition: status satisfies OwnerParityDisposition });
+        // Normal discovery fails fast: once the scope is wrong, stop paying four statements per remaining owner.
+        if (counts.missing + counts.stale > OWNER_PARITY_EXACT_COUNT) refuseOwnerParity("unexpected_scope");
+      }
     }
-    requireOwnerParityDiscoveryScope(counts, found);
+    if (!fullCountDiagnostic) requireOwnerParityDiscoveryScope(counts, found);
     // The closing marker read, still in the snapshot: it can differ only if a read escaped the snapshot.
     if (generation !== await readLiveGeneration(snapshot)) refuseOwnerParity("generation_unstable");
     if (sourceTransactionOpen) {
@@ -625,6 +629,8 @@ export async function discoverOwnersInSnapshot(
  * generation B on the target, which must equal A (generation_unstable). Frozen source shares the target snapshot;
  * Neon uses its own caller-owned snapshot. The target session only answers the two external generation reads.
  * Exactly eight missing+stale owners or unexpected_scope; a refused receipt carries counts only, never digests.
+ * The temporary scope-diagnostic mode classifies the complete bounded cursor without collecting digests and
+ * always refuses owner_parity_scope_diagnostic after both generation fences, publishing aggregate counts only.
  */
 export async function runOwnerParityDiscovery(
   env: Record<string, string | undefined>,
@@ -647,10 +653,14 @@ export async function runOwnerParityDiscovery(
   try {
     const pre = ownerParityPreflight(env, options.roster, undefined);
     dispatch = pre.dispatch;
-    if (dispatch.mode !== "discovery") refuseOwnerParity("owner_parity_mode_route");
+    if (dispatch.mode !== "discovery" && dispatch.mode !== "scope-diagnostic")
+      refuseOwnerParity("owner_parity_mode_route");
+    const fullCountDiagnostic = dispatch.mode === "scope-diagnostic";
     generation = await readLiveGeneration(sessions.target);
-    await discoverOwnersInSnapshot(sessions.enumerator, sessions.source, generation, dispatch.censusSource, counts, found, options.deps);
+    await discoverOwnersInSnapshot(sessions.enumerator, sessions.source, generation, dispatch.censusSource, counts,
+      found, options.deps, fullCountDiagnostic);
     if (await readLiveGeneration(sessions.target) !== generation) refuseOwnerParity("generation_unstable");
+    if (fullCountDiagnostic) refuseOwnerParity("owner_parity_scope_diagnostic");
     return { receipt: discoveryReceipt(), exitCode: 0 };
   } catch (error) {
     return { receipt: discoveryReceipt(ownerParityCode(error)), exitCode: 1 };
@@ -658,10 +668,13 @@ export async function runOwnerParityDiscovery(
 }
 
 /** The generic receipt for a discovery run: aggregate counts only, never digests (those are in the discovery receipt). */
-export function discoveryRunReceipt(discovery: OwnerParityDiscoveryReceipt): OwnerParityReceipt {
+export function discoveryRunReceipt(
+  discovery: OwnerParityDiscoveryReceipt,
+  mode: "discovery" | "scope-diagnostic" = "discovery",
+): OwnerParityReceipt {
   return {
     contract: OWNER_PARITY_RECEIPT_CONTRACT, status: discovery.status, ...(discovery.code ? { code: discovery.code } : {}),
-    mode: "discovery", runId: discovery.runId, sourceSha: discovery.sourceSha, generation: discovery.generation,
+    mode, runId: discovery.runId, sourceSha: discovery.sourceSha, generation: discovery.generation,
     censusSource: discovery.censusSource,
     counts: { ...emptyCounts(), found: discovery.counts.scanned, equal: discovery.counts.canonicalCurrent,
       missing: discovery.counts.missing, stale: discovery.counts.stale },
@@ -802,7 +815,8 @@ function writeRefused(env: Record<string, string | undefined>, paths: ReturnType
   const receipt = refusedReceipt(env, code);
   if (paths) {
     writePrivate(paths.receipt, receipt);
-    if (env.OWNER_PARITY_MODE === "discovery") writePrivate(paths.discovery, refusedDiscoveryReceipt(env, code));
+    if (env.OWNER_PARITY_MODE === "discovery" || env.OWNER_PARITY_MODE === "scope-diagnostic")
+      writePrivate(paths.discovery, refusedDiscoveryReceipt(env, code));
   }
   announce(receipt);
 }
@@ -881,14 +895,15 @@ async function operatorChild(): Promise<number> {
     pinnedPgConfig(supabaseUrl, "supabaseUrl", "supabase");
     const neonUrl = pre.dispatch.censusSource === "neon" ? sessionAffinityUrl(input.neonUrl, "neonUrl", "neon") : null;
     if (neonUrl !== null) pinnedPgConfig(neonUrl, "neonUrl", "neon");
-    // Only `write` has a writable target session (OWNER_PARITY_MODE_POLICY); discovery is read-only like census.
+    // Only `write` has a writable target session; discovery and its diagnostic are read-only like census.
     const write = !OWNER_PARITY_MODE_POLICY[pre.dispatch.mode].readOnly;
-    const discovery = pre.dispatch.mode === "discovery";
+    const discovery = pre.dispatch.mode === "discovery" || pre.dispatch.mode === "scope-diagnostic";
     let discovered: OwnerParityDiscoveryOutcome | null = null;
     const work = async (sessions: OwnerParitySessions): Promise<OwnerParityOutcome> => {
       if (!discovery) return runOwnerParity(env, sessions, { roster, census, runId: env.GITHUB_RUN_ID ?? "" });
       discovered = await runOwnerParityDiscovery(env, sessions, { roster, runId: env.GITHUB_RUN_ID ?? "" });
-      return { receipt: discoveryRunReceipt(discovered.receipt), census: null, exitCode: discovered.exitCode };
+      return { receipt: discoveryRunReceipt(discovered.receipt, pre.dispatch.mode as "discovery" | "scope-diagnostic"),
+        census: null, exitCode: discovered.exitCode };
     };
     const workflowClient = () => releaseClient(supabaseUrl) as ConnectedOwnerClient;
     const run = (source: Queryable) => withWorkflowParityOwnerSession(

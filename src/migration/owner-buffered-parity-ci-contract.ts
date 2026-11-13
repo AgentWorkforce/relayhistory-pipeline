@@ -4,7 +4,8 @@
  * scripts/owner-buffered-parity-github.ts; docs/owner-buffered-parity-ci.md).
  *
  * While OWNER_PARITY_WRITE_ENABLED is false, `write` refuses owner_parity_write_dormant before any
- * credential is read; `census`, `readback` and the one-time `discovery` (all read-only) are always allowed.
+ * credential is read; `census`, `readback`, the one-time `discovery`, and its temporary count-only
+ * `scope-diagnostic` (all read-only) are always allowed.
  * `discovery` runs only while the roster is empty and emits the digests for a separate roster PR. Enabling write is a
  * separate reviewed one-line PR. Tenant tuples are private and never appear here, in a workflow input,
  * log line or artifact: the committed roster holds only the operator's per-tenant digests
@@ -30,13 +31,13 @@ export const OWNER_PARITY_RECEIPT_ARTIFACT = "owner-buffered-parity";
 export const OWNER_PARITY_RECEIPT_FILE_NAME = "owner-buffered-parity.json";
 
 /** The workflow's modes. The operator's `bulk` mode is deliberately absent and refused. */
-export const OWNER_PARITY_MODES = ["census", "write", "readback", "discovery"] as const;
+export const OWNER_PARITY_MODES = ["census", "write", "readback", "discovery", "scope-diagnostic"] as const;
 export type OwnerParityMode = (typeof OWNER_PARITY_MODES)[number];
 
 /**
  * Per-mode dispatch policy. `readOnly` selects the target session (only `write` gets a writable one) and
  * `roster` selects the roster rule: `fixed` is parseOwnerParityRoster (exactly eight digests), `empty` is
- * requireEmptyOwnerParityRoster (discovery is one-time: it refuses roster_present once a roster exists).
+ * requireEmptyOwnerParityRoster (discovery and its temporary scope diagnostic refuse once a roster exists).
  */
 export const OWNER_PARITY_MODE_POLICY: Readonly<Record<OwnerParityMode, { readOnly: boolean; roster: "fixed" | "empty" }>> =
   Object.freeze({
@@ -44,6 +45,7 @@ export const OWNER_PARITY_MODE_POLICY: Readonly<Record<OwnerParityMode, { readOn
     write: Object.freeze({ readOnly: false, roster: "fixed" as const }),
     readback: Object.freeze({ readOnly: true, roster: "fixed" as const }),
     discovery: Object.freeze({ readOnly: true, roster: "empty" as const }),
+    "scope-diagnostic": Object.freeze({ readOnly: true, roster: "empty" as const }),
   });
 export const OWNER_PARITY_CENSUS_SOURCES = ["frozen-supabase", "neon"] as const;
 export type OwnerParityCensusSource = (typeof OWNER_PARITY_CENSUS_SOURCES)[number];
@@ -82,7 +84,7 @@ export interface OwnerParityDispatch {
 }
 
 /**
- * Workflow inputs (env OWNER_PARITY_*). Refuses anything but the four modes (so `bulk` is unreachable), a
+ * Workflow inputs (env OWNER_PARITY_*). Refuses anything but the five modes (so `bulk` is unreachable), a
  * non-40-hex sha, an unknown census source, and, while dormant, `write` before any credential is read.
  * `enabled` exists only for the synthetic proof and tests; production callers never pass it.
  */

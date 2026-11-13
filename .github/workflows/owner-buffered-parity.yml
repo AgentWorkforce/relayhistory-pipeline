@@ -9,6 +9,8 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && format('owner buffered
 # to roster_empty: it runs only while the roster is empty (roster_present otherwise), scans every buffered
 # owner in one read-only snapshot and publishes the digests and dispositions of exactly eight missing/stale
 # owners (generation_unstable, unexpected_scope refuse; counts only) for a separate reviewed roster-only PR.
+# Temporary scope-diagnostic uses the same read-only snapshots but classifies the full bounded cursor, collects
+# no digests and always refuses after publishing aggregate counts. Remove it after the recovery scope is measured.
 # Every dispatch needs Khaliq's own word to the production actor; see docs/owner-buffered-parity-ci.md.
 # Push and pull_request run only the synthetic PGlite proof job (no secrets, no environment).
 on:
@@ -16,7 +18,7 @@ on:
     inputs:
       mode:
         type: choice
-        options: [census, write, readback, discovery]
+        options: [census, write, readback, discovery, scope-diagnostic]
         default: census
         required: true
       sha:
@@ -181,14 +183,14 @@ jobs:
           retention-days: 30
       # Discovery only: the sanitized discovery receipt (digests and dispositions on success, counts only on
       # refusal) for a separate reviewed roster-only PR. No credential; the summary step re-validates the file.
-      - name: Publish the discovery receipt (discovery only)
-        if: always() && inputs.mode == 'discovery'
+      - name: Publish the discovery receipt (discovery and temporary scope diagnostic only)
+        if: always() && (inputs.mode == 'discovery' || inputs.mode == 'scope-diagnostic')
         uses: actions/upload-artifact@v4
         with:
           name: owner-buffered-parity-discovery
           path: ${{ runner.temp }}/owner-parity-out/owner-buffered-parity-discovery.json
           if-no-files-found: ignore
           retention-days: 30
-      - name: Discovery job summary (discovery only)
-        if: always() && inputs.mode == 'discovery'
+      - name: Discovery job summary (discovery and temporary scope diagnostic only)
+        if: always() && (inputs.mode == 'discovery' || inputs.mode == 'scope-diagnostic')
         run: bun scripts/owner-buffered-parity-ci.ts --discovery-summary
