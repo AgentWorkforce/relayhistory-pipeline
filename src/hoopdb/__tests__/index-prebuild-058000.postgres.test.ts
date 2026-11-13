@@ -1,7 +1,8 @@
 /**
  * The 058000 CONCURRENTLY index prebuild (src/hoopdb/index-prebuild-058000.ts) on a REAL PostgreSQL server: real
  * concurrent builds, a genuinely in-progress build visible in pg_stat_progress_create_index (held in
- * "waiting for writers" by an open writer transaction), and the 058000 migration adopting the prebuilt indexes.
+ * "waiting for writers" by an open writer transaction), a build backend terminated mid-build (57P01) read back on a
+ * fresh session, and the 058000 migration adopting the prebuilt indexes.
  * PGlite cannot run two sessions, so these cases live here.
  *
  * Opt-in OWNED PostgreSQL (SESSION_INGEST_TEST_PG_URL, a superuser URL of a DISPOSABLE server: pg-proof's brief-postgres
@@ -136,6 +137,45 @@ test.skipIf(!URL_ENV)("a build in progress is reported from pg_stat_progress_cre
   expect(await build).toBeNull();
   const after = (await census(c, "424244")).census!;
   expect(after.indexes.find((i) => i.name === target.name)).toMatchObject({ action: "present", valid: true, ready: true, live: true, progress: null });
+});
+
+test.skipIf(!URL_ENV)("a build backend terminated mid-build (57P01, FATAL) is read back on a NEW session, refused, never retried", async () => {
+  const c = await connect();
+  const artifact = (await census(c, "626262")).census!;
+  expect(artifact.required).toEqual(REQUIRED.slice(1));
+  const target = SPEC.find((s) => s.name === REQUIRED[1])!;
+  const writer = await connect();
+  await writer.query("BEGIN");
+  await populate(writer, target.table.slice("sessions.".length));
+  const b = await connect();
+  const log: string[] = [];
+  let freshOpened = 0;
+  const run = runIndexPrebuild({ PREBUILD_MODE: "prebuild", PREBUILD_SHA: SHA, PREBUILD_CENSUS_RUN: artifact.censusRun,
+    PREBUILD_CONFIRMATION: indexPrebuildConfirmation(artifact) },
+  { db: adapter(b, log), fresh: async () => { freshOpened++; const f = await connect(); return { db: adapter(f), close: () => f.end() }; } },
+  { runId: "636363", census: artifact, enabled: true });
+  let pid: number | null = null;
+  for (let i = 0; i < 800 && pid === null; i++) {
+    pid = (await c.query<{ pid: number }>(`SELECT pid FROM pg_stat_progress_create_index
+      WHERE command = 'CREATE INDEX CONCURRENTLY' AND index_relid = to_regclass($1)`, ["sessions." + target.name])).rows[0]?.pid ?? null;
+    if (pid === null) await Bun.sleep(25);
+  }
+  expect(pid).not.toBeNull();
+  expect((await c.query("SELECT pg_terminate_backend($1) AS ok", [pid])).rows[0].ok).toBe(true);
+  const out = await run;
+  await writer.query("COMMIT");
+  expect(out.receipt.status).toBe("refused");
+  expect(out.receipt.code).toBe("index_prebuild_unknown_commit_invalid");
+  expect(freshOpened).toBe(1);
+  // Nothing ran on the terminated session after the build statement, and the build was not retried.
+  expect(log.slice(log.indexOf(concurrentStatement(target)) + 1)).toEqual([]);
+  expect(log.filter((s) => s.startsWith("CREATE INDEX"))).toEqual([concurrentStatement(target)]);
+  expect(out.receipt.indexes.find((e) => e.name === target.name)).toMatchObject({ status: "refused", error: "57P01", reason: "invalid",
+    readback: { presence: "exact", valid: false } });
+  // The INVALID index was left in place; this test (not the operator) removes it so the next case starts clean.
+  expect((await c.query("SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)", ["sessions." + target.name])).rows)
+    .toEqual([{ indisvalid: false }]);
+  await c.query(`DROP INDEX sessions.${target.name}`);
 });
 
 test.skipIf(!URL_ENV)("real concurrent prebuild, then the 058000 migration adopts every prebuilt index and readback is complete", async () => {

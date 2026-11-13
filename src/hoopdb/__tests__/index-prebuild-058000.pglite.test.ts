@@ -22,10 +22,13 @@ import {
   INDEX_PREBUILD_STEP,
   concurrentStatement,
   indexPrebuildConfirmation,
+  indexPrebuildDescriptor,
   indexPrebuildDispatch,
   indexPrebuildSpec,
   parseIndexPrebuildCensus,
   runIndexPrebuild,
+  sessionFatalError,
+  verifyIndexPrebuildInputs,
   type IndexPrebuildCensusArtifact,
   type IndexPrebuildOutcome,
   type IndexPrebuildReceipt,
@@ -433,9 +436,228 @@ test("unknown commit: the outcome is read back on a fresh session and never retr
   expectRefused(out2, "index_prebuild_unknown_commit_absent_after_build");
   expect(ddl(log2).length).toBe(1);
   expect(await indexRows(db2)).toEqual([]);
-  // With no way to open a fresh session the outcome stays unverified (refused, not retried).
-  const out3 = await prebuild(db2, c2, { hook: lost, fresh: false });
+  // With no way to open a fresh session the outcome stays unverified (refused, not retried), durably recorded.
+  const persisted3: IndexPrebuildReceipt[] = [];
+  const out3 = await prebuild(db2, c2, { hook: lost, fresh: false, persisted: persisted3 });
   expectRefused(out3, "index_prebuild_unknown_commit_unverified");
+  expect(out3.receipt.indexes.find((e) => e.name === REQUIRED[0])).toMatchObject({ status: "outcome_unknown", error: "unknown" });
+  expect(persisted3.at(-1)!.indexes.find((e) => e.name === REQUIRED[0])!.status).toBe("outcome_unknown");
+});
+
+test("session-fatal classification: no SQLSTATE, FATAL/PANIC, 08, 57P01-57P05, 25P03/25P04, 58, XX are fatal; statement errors are not", () => {
+  for (const e of [new Error("Connection terminated unexpectedly"), { code: "ECONNRESET" }, { code: "08006" }, { code: "08003" },
+    { code: "57P01" }, { code: "57P02" }, { code: "57P03" }, { code: "57P04" }, { code: "57P05" }, { code: "25P03" },
+    { code: "25P04" }, { code: "58030" }, { code: "XX000" }, { code: "23505", severity: "FATAL" }, { code: "42P07", severity: "PANIC" }, null])
+    expect(`${JSON.stringify(e)} ${sessionFatalError(e)}`).toBe(`${JSON.stringify(e)} true`);
+  for (const e of [{ code: "57014" }, { code: "55P03" }, { code: "23505" }, { code: "42P07" }, { code: "40P01" }, { code: "57014", severity: "ERROR" }])
+    expect(`${JSON.stringify(e)} ${sessionFatalError(e)}`).toBe(`${JSON.stringify(e)} false`);
+});
+
+test("a connection-fatal SQLSTATE (57P01) is read back on a NEW session only, never on the dead one, and never retried", async () => {
+  const setup = async () => {
+    const db = await fresh();
+    for (const t of POPULATED) await populate(db, t);
+    return { db, c: (await census(db)).census! };
+  };
+  // The backend is terminated after the build committed: the dead session is never queried again.
+  const { db, c } = await setup();
+  let dead = false;
+  const after: string[] = [];
+  const terminated: Hook = async (sql, _p, next) => {
+    if (dead) { after.push(sql); throw new Error("Connection terminated"); }
+    if (sql.startsWith("CREATE INDEX CONCURRENTLY")) {
+      await next();
+      dead = true;
+      throw Object.assign(new Error("terminating connection due to administrator command"), { code: "57P01" });
+    }
+    return next();
+  };
+  let freshOpened = 0;
+  const persisted: IndexPrebuildReceipt[] = [];
+  const log: string[] = [];
+  const out = await runIndexPrebuild(prebuildEnv(c), {
+    db: adapter(db, log, terminated),
+    fresh: async () => { freshOpened++; return { db: adapter(db), close: async () => {} }; },
+  }, { runId: "1", census: c, now: () => T0 + 3600_000, enabled: true, persist: (r) => persisted.push(JSON.parse(JSON.stringify(r))) });
+  expectRefused(out, "index_prebuild_unknown_commit_verified_stop");
+  expect(after).toEqual([]);
+  expect(freshOpened).toBe(1);
+  expect(ddl(log).length).toBe(1);
+  expect(out.receipt.indexes.find((e) => e.name === REQUIRED[0])).toMatchObject({ status: "committed_after_error", error: "57P01",
+    readback: { presence: "exact", valid: true } });
+  expect(persisted.at(-1)!.indexes.some((e) => e.status === "building")).toBe(false);
+
+  // Terminated mid-build (INVALID left behind): fresh readback refuses it; no retry, nothing dropped.
+  const s2 = await setup();
+  const target = SPEC.find((s) => s.name === REQUIRED[0])!;
+  const midBuild: Hook = async (sql, _p, next) => {
+    if (sql.startsWith("CREATE INDEX CONCURRENTLY")) {
+      await next();
+      await s2.db.exec(`UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'sessions.${target.name}'::regclass`);
+      throw Object.assign(new Error("terminating connection"), { code: "57P01", severity: "FATAL" });
+    }
+    return next();
+  };
+  const log2: string[] = [];
+  const out2 = await prebuild(s2.db, s2.c, { log: log2, hook: midBuild });
+  expectRefused(out2, "index_prebuild_unknown_commit_invalid");
+  expect(log2.slice(log2.indexOf(concurrentStatement(target)) + 1)).toEqual([]);
+  expect(ddl(log2).length).toBe(1);
+  expect(await indexRows(s2.db)).toEqual([{ name: target.name, valid: false, def: target.def }]);
+
+  // No fresh session, or the fresh readback itself fails: a durable outcome_unknown receipt, never "building".
+  for (const variant of ["no_fresh", "fresh_fails"] as const) {
+    const s3 = await setup();
+    let gone = false;
+    const fatal: Hook = async (sql, _p, next) => {
+      if (gone) throw new Error("Connection terminated");
+      if (sql.startsWith("CREATE INDEX CONCURRENTLY")) { gone = true; throw Object.assign(new Error("x"), { code: "08006" }); }
+      return next();
+    };
+    const persisted3: IndexPrebuildReceipt[] = [];
+    const out3 = await runIndexPrebuild(prebuildEnv(s3.c), {
+      db: adapter(s3.db, [], fatal),
+      ...(variant === "no_fresh" ? {} : { fresh: async () => ({ db: { query: async () => { throw new Error("refused"); } }, close: async () => {} }) }),
+    }, { runId: "1", census: s3.c, now: () => T0 + 3600_000, enabled: true, persist: (r) => persisted3.push(JSON.parse(JSON.stringify(r))) });
+    expectRefused(out3, "index_prebuild_unknown_commit_unverified");
+    expect(out3.receipt.indexes.find((e) => e.name === REQUIRED[0])).toMatchObject({ status: "outcome_unknown", error: "08006" });
+    expect(persisted3.at(-1)!.indexes.find((e) => e.name === REQUIRED[0])!.status).toBe("outcome_unknown");
+    expect(out3.receipt.statements).toBe(1);
+  }
+
+  // A definite SQLSTATE whose session then fails on RESET is treated as broken: fresh readback, nothing more on it.
+  const s4 = await setup();
+  let broke = false;
+  const lateBreak: Hook = async (sql, _p, next) => {
+    if (broke) throw new Error("Connection terminated");
+    if (sql.startsWith("CREATE INDEX CONCURRENTLY")) {
+      await next();
+      broke = true;
+      throw Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
+    }
+    return next();
+  };
+  const log4: string[] = [];
+  const out4 = await prebuild(s4.db, s4.c, { log: log4, hook: lateBreak });
+  expectRefused(out4, "index_prebuild_unknown_commit_verified_stop");
+  expect(log4.slice(log4.indexOf(concurrentStatement(target)) + 1)).toEqual(["RESET statement_timeout"]);
+  expect(out4.receipt.indexes.find((e) => e.name === REQUIRED[0])).toMatchObject({ status: "committed_after_error", error: "57014" });
+});
+
+test("a pending readiness marker: census reports it but blocks; no artifact from it can prebuild; zero DDL", async () => {
+  const db = await fresh();
+  for (const t of POPULATED) await populate(db, t);
+  await db.query("UPDATE sessions.__96bulls_role_validation SET status = 'pending'");
+  const out = await census(db);
+  expect(out.exitCode).toBe(3);
+  expect(out.receipt.status).toBe("blocked");
+  const c = out.census!;
+  expect(c).toMatchObject({ markerStatus: "pending", verdict: "blocked", generation: GENERATION });
+  expect(c.indexes.filter((i) => i.action === "prebuild").map((i) => i.name)).toEqual(REQUIRED);
+  expect(c.indexes.every((i) => i.action !== "refused")).toBe(true);
+  // Even after the marker returns to pass, the pending census is refused before any statement.
+  await db.query("UPDATE sessions.__96bulls_role_validation SET status = 'pass'");
+  const log: string[] = [];
+  expectRefused(await prebuild(db, c, { log }), "index_prebuild_marker_not_pass");
+  // A forged prebuild_required verdict with a recomputed descriptor fails the recomputed verdict.
+  const { descriptorSha256: _d, ...body } = c;
+  const forgedBody = { ...body, verdict: "prebuild_required" as const };
+  const forged = { ...forgedBody, descriptorSha256: indexPrebuildDescriptor(forgedBody) };
+  expectRefused(await prebuild(db, forged, { log }), "index_prebuild_census_invalid");
+  expect(log).toEqual([]);
+  // The input check refuses a non-pass marker on its own, whatever the verdict says.
+  const dispatch = indexPrebuildDispatch(prebuildEnv(forged), true);
+  expect(() => verifyIndexPrebuildInputs(dispatch, forged, T0 + 60_000)).toThrow("index_prebuild_marker_not_pass");
+  expect(await indexRows(db)).toEqual([]);
+
+  // A pass census, but the marker turns pending before the run: the re-census refuses, zero DDL.
+  const pass = (await census(db)).census!;
+  expect(pass.verdict).toBe("prebuild_required");
+  await db.query("UPDATE sessions.__96bulls_role_validation SET status = 'pending'");
+  const log2: string[] = [];
+  const out2 = await prebuild(db, pass, { log: log2 });
+  expect(out2.receipt.status).toBe("refused");
+  expect(["index_prebuild_binding_moved", "index_prebuild_marker_not_pass"]).toContain(out2.receipt.code!);
+  expect(ddl(log2)).toEqual([]);
+
+  // The marker turns pending between builds: the next build is refused before its statement.
+  await db.query("UPDATE sessions.__96bulls_role_validation SET status = 'pass'");
+  const flip: Hook = async (sql, _p, next) => {
+    const r = await next();
+    if (sql.startsWith("CREATE INDEX CONCURRENTLY")) await db.query("UPDATE sessions.__96bulls_role_validation SET status = 'pending'");
+    return r;
+  };
+  const log3: string[] = [];
+  const out3 = await prebuild(db, pass, { log: log3, hook: flip });
+  expectRefused(out3, "index_prebuild_marker_not_pass");
+  expect(ddl(log3).length).toBe(1);
+
+  // Readback still reports with a pending marker (read-only), as before.
+  const rb = await runIndexPrebuild(env("readback"), { db: adapter(db) }, { runId: "7" });
+  expect(rb.receipt.status).toBe("incomplete");
+});
+
+test("a same-named index in another schema (any owner or definition) is refused in census and before every build; zero DDL", async () => {
+  const db = await fresh();
+  for (const t of POPULATED) await populate(db, t);
+  const req = SPEC.find((s) => s.name === REQUIRED[0])!;
+  const deferred = SPEC.find((s) => !POPULATED.includes(s.table.slice("sessions.".length)))!;
+  await db.exec(`CREATE SCHEMA archive; CREATE TABLE archive.t(org_id text, other text);
+    CREATE INDEX ${req.name} ON archive.t USING btree (org_id); CREATE INDEX ${deferred.name} ON archive.t USING hash (other)`);
+  const out = await census(db);
+  expect(out.exitCode).toBe(3);
+  const c = out.census!;
+  expect(c.verdict).toBe("blocked");
+  for (const n of [req.name, deferred.name])
+    expect(c.indexes.find((i) => i.name === n)).toMatchObject({ presence: "absent", sameNameCount: 1, action: "refused", reason: "name_collision" });
+  expect(parseIndexPrebuildCensus(JSON.parse(JSON.stringify(c))).descriptorSha256).toBe(c.descriptorSha256);
+  const log: string[] = [];
+  expectRefused(await prebuild(db, c, { log }), "index_prebuild_census_blocked");
+  expect(ddl(log)).toEqual([]);
+
+  // A clean census, then a collision appears: the immediate re-inspection refuses before any build.
+  const db2 = await fresh();
+  for (const t of POPULATED) await populate(db2, t);
+  const c2 = (await census(db2)).census!;
+  await db2.exec(`CREATE SCHEMA archive; CREATE TABLE archive.t(org_id text); CREATE INDEX ${req.name} ON archive.t USING btree (org_id)`);
+  const log2: string[] = [];
+  expectRefused(await prebuild(db2, c2, { log: log2 }), "index_prebuild_refused_name_collision");
+  expect(ddl(log2)).toEqual([]);
+
+  // A collision that appears between builds: the next index's pre-build inspection refuses it, no statement for it.
+  const db3 = await fresh();
+  for (const t of POPULATED) await populate(db3, t);
+  const c3 = (await census(db3)).census!;
+  const second = SPEC.find((s) => s.name === REQUIRED[1])!;
+  const collide: Hook = async (sql, _p, next) => {
+    const r = await next();
+    if (sql.startsWith("CREATE INDEX CONCURRENTLY"))
+      await db3.exec(`CREATE SCHEMA IF NOT EXISTS archive; CREATE TABLE IF NOT EXISTS archive.t(org_id text);
+        CREATE INDEX IF NOT EXISTS ${second.name} ON archive.t USING btree (org_id)`);
+    return r;
+  };
+  const log3: string[] = [];
+  const out3 = await prebuild(db3, c3, { log: log3, hook: collide });
+  expectRefused(out3, "index_prebuild_refused_name_collision");
+  expect(ddl(log3)).toEqual([concurrentStatement(req)]);
+  expect(out3.receipt.indexes.find((e) => e.name === second.name)).toMatchObject({ status: "refused", reason: "name_collision" });
+  expect((await indexRows(db3)).map((r) => r.name)).toEqual([req.name]);
+});
+
+test("an exact index of a required name with a different owner is refused (wrong_owner); zero DDL", async () => {
+  const db = await fresh();
+  for (const t of POPULATED) await populate(db, t);
+  const req = SPEC.find((s) => s.name === REQUIRED[0])!;
+  await db.exec(req.def);
+  await db.exec(`CREATE ROLE prebuild_other_owner;
+    UPDATE pg_class SET relowner = 'prebuild_other_owner'::regrole WHERE oid = 'sessions.${req.name}'::regclass`);
+  const c = (await census(db)).census!;
+  expect(c.verdict).toBe("blocked");
+  expect(c.indexes.find((i) => i.name === req.name)).toMatchObject({ presence: "exact", owner: "prebuild_other_owner", action: "refused",
+    reason: "wrong_owner" });
+  const log: string[] = [];
+  expectRefused(await prebuild(db, c, { log }), "index_prebuild_census_blocked");
+  expect(ddl(log)).toEqual([]);
 });
 
 test("a failed build (SQLSTATE) is read back on the same session, refused and its INVALID index left in place", async () => {

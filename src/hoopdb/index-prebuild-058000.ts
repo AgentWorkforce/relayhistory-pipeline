@@ -16,18 +16,23 @@
  *             indisvalid/indisready/indislive, owner, schema, definition digest and the matching
  *             pg_stat_progress_create_index row, then an action: present, deferred (absent on an empty table: the
  *             migration builds it), prebuild (absent on a populated table) or refused (drifted, invalid, in progress,
- *             wrong owner, table missing). The binding (live readiness marker generation and status, the ledger tail,
- *             prefix step count and prefix digest, whether 058000 is ledgered) is read before and after and must not
- *             move. Emits the census artifact with a descriptor digest over every field.
+ *             wrong owner, table missing, or a same-named index in another schema). The binding (live readiness marker
+ *             generation and status, the ledger tail, prefix step count and prefix digest, whether 058000 is ledgered)
+ *             is read before and after and must not move. A marker whose status is not `pass` (e.g. `pending`: readers
+ *             non-ready, possibly a crashed migration's residue) is reported but makes the verdict blocked. Emits the
+ *             census artifact with a descriptor digest over every field.
  *   prebuild  Dormant while INDEX_PREBUILD_ENABLED is false. Needs a census artifact under 24h old with verdict
  *             prebuild_required and the byte-exact typed confirmation built from it (indexPrebuildConfirmation).
  *             Holds the dedicated session advisory lock INDEX_PREBUILD_LOCK (try, never wait), re-censuses and
  *             refuses any drift from the artifact, then for each required index, one at a time, in declared order:
  *             re-inspects it (an already exact valid/ready/live index is resumed, nothing else is), runs one
  *             CREATE INDEX CONCURRENTLY in autocommit with a finite statement and lock budget, reads it back and
- *             records a per-index receipt. A statement whose outcome is unknown (the connection failed) is read back
- *             on a fresh session and never retried. An invalid, in-progress, drifted or wrong-owner object is refused
- *             and left in place: nothing is dropped automatically.
+ *             records a per-index receipt. The marker status must be `pass` at the re-census and before every build.
+ *             A statement whose outcome is unknown (no SQLSTATE, a connection-fatal SQLSTATE such as 57P01, or a
+ *             session that fails right after the statement) is read back on a fresh session only, never on the
+ *             failed one, and never retried; without a fresh readback the receipt records outcome_unknown and the run
+ *             stops. An invalid, in-progress, drifted, wrong-owner or name-colliding object is refused and left in
+ *             place: nothing is dropped automatically.
  *   readback  READ ONLY. Complete only when all sixteen are exact, valid, ready and live and no create-index
  *             progress row exists on their tables (normally after the release applies 058000, which creates the
  *             indexes on empty tables itself).
@@ -47,7 +52,12 @@ import { admissionRenewalLedger } from "./ingest-admission-renewal-operator.ts";
 import { MIGRATION_LEDGER } from "./migrate.ts";
 import { ROLE_VALIDATION_NAME, ROLE_VALIDATION_TABLE } from "../shared/db.ts";
 
-/** Writes (prebuild) stay refused until a separate reviewed one-line change enables them. */
+/**
+ * Writes (prebuild) stay refused until a separate reviewed one-line change enables them. Before that change: a
+ * guarded disposable/dev long-statement proof through the session pooler (or a proven direct owner endpoint), since
+ * TCP keepalive alone cannot tell a pooler statement/lifetime cap from a dead peer, and a guarded read-only
+ * census/readback run proving the protected-environment stdin handoff.
+ */
 export const INDEX_PREBUILD_ENABLED: boolean = false;
 
 export const INDEX_PREBUILD_STEP = "upstream:20261105058000_operator_user_erase_indexes.sql";
@@ -163,7 +173,10 @@ export function indexPrebuildDispatch(
 
 export type IndexPresence = "absent" | "exact" | "drifted";
 export type IndexAction = "present" | "deferred" | "prebuild" | "refused";
-export type IndexRefusalReason = "table_missing" | "drifted" | "invalid" | "in_progress" | "wrong_owner";
+export type IndexRefusalReason = "table_missing" | "drifted" | "invalid" | "in_progress" | "wrong_owner" | "name_collision";
+const REFUSAL_REASONS: readonly IndexRefusalReason[] = ["table_missing", "drifted", "invalid", "in_progress", "wrong_owner", "name_collision"];
+/** The only readiness-marker status under which prebuild may write (as in the admission-renewal operator). */
+export const INDEX_PREBUILD_MARKER_PASS = "pass";
 
 export interface IndexProgress {
   command: string | null;
@@ -291,10 +304,14 @@ export async function inspectIndex(
   const valid = bool(r.valid), ready = bool(r.ready), live = bool(r.live);
   const owner = text(r.owner), tableOwner = text(r.table_owner);
   const usable = presence === "exact" && valid === true && ready === true && live === true;
+  const sameNameCount = typeof r.same_name === "number" ? r.same_name : Number(r.same_name ?? 0);
   let action: IndexAction;
   let reason: IndexRefusalReason | null = null;
   if (!tableExists) reason = "table_missing";
   else if (own || (!usable && tableBuilds > 0)) reason = "in_progress";
+  // Any other index of this name (another schema, whatever its owner or definition): a build here would leave two,
+  // which the migration's adoption check refuses, so refuse before any DDL (and for the migration's own build too).
+  else if (!Number.isSafeInteger(sameNameCount) || sameNameCount > (presence === "absent" ? 0 : 1)) reason = "name_collision";
   else if (presence === "drifted") reason = "drifted";
   else if (tableOwner !== me || (presence !== "absent" && owner !== me)) reason = "wrong_owner";
   else if (presence === "exact" && !usable) reason = "invalid";
@@ -304,7 +321,7 @@ export async function inspectIndex(
   return {
     name: spec.name, table: spec.table, tableExists, tableNonEmpty, presence, valid, ready, live, owner, tableOwner,
     schema: text(r.schema), defSha256: def === null ? null : sha256(def), expectedDefSha256: sha256(spec.def),
-    sameNameCount: typeof r.same_name === "number" ? r.same_name : Number(r.same_name ?? 0),
+    sameNameCount,
     progress: own ? { command: own.command, phase: own.phase } : null, tableBuilds, action, reason, tableOid,
   };
 }
@@ -363,9 +380,10 @@ const sameBinding = (a: IndexPrebuildBinding, b: IndexPrebuildBinding) =>
   a.generation === b.generation && a.markerStatus === b.markerStatus && a.ledgerTail === b.ledgerTail &&
   a.stepCount === b.stepCount && a.ledgerPrefixDigest === b.ledgerPrefixDigest && a.stepLedgered === b.stepLedgered;
 
-function verdictOf(indexes: readonly CensusIndex[], progressRows: number, unattributable: number) {
+function verdictOf(indexes: readonly CensusIndex[], progressRows: number, unattributable: number, markerStatus: string) {
   const required = indexes.filter((i) => i.action === "prebuild").map((i) => i.name);
-  const blocked = indexes.some((i) => i.action === "refused") || unattributable > 0 || progressRows > 0;
+  const blocked = indexes.some((i) => i.action === "refused") || unattributable > 0 || progressRows > 0 ||
+    markerStatus !== INDEX_PREBUILD_MARKER_PASS;
   return { required, verdict: blocked ? "blocked" as const : required.length ? "prebuild_required" as const : "nothing_to_prebuild" as const };
 }
 
@@ -411,7 +429,7 @@ export async function indexPrebuildSnapshot(db: PrebuildDb): Promise<IndexPrebui
     if (!sameBinding(before, after)) refuse("index_prebuild_binding_moved");
     await db.query("COMMIT");
     return { ...before, owner: me, capturedAt: head.now, progressRows, unattributableProgressRows: unattributable, indexes,
-      ...verdictOf(indexes, progressRows, unattributable) };
+      ...verdictOf(indexes, progressRows, unattributable, before.markerStatus) };
   } catch (error) {
     await db.query("ROLLBACK").catch(() => undefined);
     throw error;
@@ -498,14 +516,14 @@ export function parseIndexPrebuildCensus(value: unknown): IndexPrebuildCensusArt
         !nullable(e.tableOwner, "string") || !nullable(e.schema, "string") || !nullable(e.defSha256, "string") ||
         e.expectedDefSha256 !== sha256(spec[n]!.def) || !Number.isSafeInteger(e.sameNameCount) ||
         !Number.isSafeInteger(e.tableBuilds) || !["present", "deferred", "prebuild", "refused"].includes(e.action as string) ||
-        !(e.reason === null || ["table_missing", "drifted", "invalid", "in_progress", "wrong_owner"].includes(e.reason as string)) ||
+        !(e.reason === null || (REFUSAL_REASONS as readonly string[]).includes(e.reason as string)) ||
         (e.action === "refused") !== (e.reason !== null) ||
         !(p === null || (typeof p === "object" && !Array.isArray(p) && sameKeys(p, ["command", "phase"]) &&
           nullable(p.command, "string") && nullable(p.phase, "string"))))
       bad();
   });
   const artifact = doc as unknown as IndexPrebuildCensusArtifact;
-  const expected = verdictOf(artifact.indexes, artifact.progressRows, artifact.unattributableProgressRows);
+  const expected = verdictOf(artifact.indexes, artifact.progressRows, artifact.unattributableProgressRows, artifact.markerStatus);
   if (JSON.stringify(artifact.required) !== JSON.stringify(expected.required) || artifact.verdict !== expected.verdict) bad();
   if (indexPrebuildDescriptor(artifact) !== artifact.descriptorSha256) refuse("index_prebuild_census_descriptor");
   return artifact;
@@ -528,6 +546,7 @@ export function verifyIndexPrebuildInputs(
   const captured = canonicalMs(census.capturedAt)!;
   if (captured - now > 5 * 60 * 1000 || now - captured >= INDEX_PREBUILD_CENSUS_MAX_AGE_MS) refuse("index_prebuild_census_stale");
   if (census.stepLedgered) refuse("index_prebuild_step_already_applied");
+  if (census.markerStatus !== INDEX_PREBUILD_MARKER_PASS) refuse("index_prebuild_marker_not_pass");
   if (census.verdict === "blocked") refuse("index_prebuild_census_blocked");
   if (census.verdict !== "prebuild_required" || census.required.length === 0) refuse("index_prebuild_nothing_required");
   if (dispatch.confirmation !== indexPrebuildConfirmation(census)) refuse("index_prebuild_confirmation");
@@ -539,14 +558,16 @@ export function verifyIndexPrebuildInputs(
 
 export type IndexReceiptStatus =
   | "present" | "deferred" | "pending" | "building" | "built" | "resumed_exact" | "committed_after_error"
-  | "refused" | "not_attempted";
+  | "refused" | "not_attempted"
+  /** The statement's outcome could not be read back on a fresh session: a human must inspect the index. */
+  | "outcome_unknown";
 
 export interface IndexReceiptEntry {
   name: string;
   status: IndexReceiptStatus;
   action: IndexAction | null;
   reason: IndexRefusalReason | "absent_after_build" | "budget" | null;
-  /** SQLSTATE of a failed statement, or "unknown" when the connection failed and the outcome had to be read back. */
+  /** SQLSTATE of a failed statement, or "unknown" when it failed without one (the connection failed). */
   error: string | null;
   readback: Pick<CensusIndex, "presence" | "valid" | "ready" | "live" | "defSha256" | "progress" | "tableBuilds"> | null;
   startedAt: string | null;
@@ -625,10 +646,24 @@ export interface IndexPrebuildRunOptions {
   persist?: (receipt: IndexPrebuildReceipt) => void;
 }
 
-/** A driver error that came from the server (a SQLSTATE) leaves the session usable: its outcome is definite. */
-function definiteSqlError(error: unknown): string | null {
+/** The SQLSTATE of a server error, or null (a client-side or connection failure). */
+function sqlstateOf(error: unknown): string | null {
   const code = (error as { code?: unknown } | null)?.code;
   return typeof code === "string" && SQLSTATE.test(code) ? code : null;
+}
+
+/**
+ * Whether the session can no longer be used after this error: no SQLSTATE at all (a client-side or connection
+ * failure), a FATAL or PANIC severity, or a SQLSTATE after which the server has ended (or is ending) the session:
+ * connection exceptions (08), the 57P01-57P05 terminations (admin/crash shutdown, cannot connect now, database
+ * dropped, idle session timeout), idle-in-transaction and transaction timeouts (25P03, 25P04), system errors (58) and
+ * internal errors (XX). Erring towards fatal is safe: it only moves the readback to a fresh session and stops the run.
+ */
+export function sessionFatalError(error: unknown): boolean {
+  const severity = (error as { severity?: unknown } | null)?.severity;
+  if (severity === "FATAL" || severity === "PANIC") return true;
+  const code = sqlstateOf(error);
+  return code === null || /^(08|57P0[1-5]|25P0[34]|58|XX)/u.test(code);
 }
 
 /**
@@ -654,6 +689,7 @@ function requireNoDrift(census: IndexPrebuildCensusArtifact, live: IndexPrebuild
   if (live.generation !== census.generation || live.markerStatus !== census.markerStatus || live.ledgerTail !== census.ledgerTail ||
       live.stepCount !== census.stepCount || live.ledgerPrefixDigest !== census.ledgerPrefixDigest)
     refuse("index_prebuild_binding_moved");
+  if (live.markerStatus !== INDEX_PREBUILD_MARKER_PASS) refuse("index_prebuild_marker_not_pass");
   if (live.stepLedgered) refuse("index_prebuild_step_already_applied");
   if (live.owner !== census.owner) refuse("index_prebuild_owner_changed");
   if (live.unattributableProgressRows > 0) refuse("index_prebuild_progress_unattributable");
@@ -733,6 +769,7 @@ export async function runIndexPrebuild(
         const entry = entries.find((e) => e.name === name)!;
         // Before each build: the binding has not moved, the owner is unchanged and nothing builds on the table.
         const binding = await readBinding(sessions.db);
+        if (binding.markerStatus !== INDEX_PREBUILD_MARKER_PASS) refuse("index_prebuild_marker_not_pass");
         if (!sameBinding(binding, c)) refuse("index_prebuild_binding_moved");
         const me = (await sessions.db.query<{ me: unknown }>("SELECT current_user AS me")).rows[0]?.me;
         if (me !== c.owner) refuse("index_prebuild_owner_changed");
@@ -766,36 +803,52 @@ export async function runIndexPrebuild(
         entry.startedAt = iso();
         persist();
         let error: string | null = null;
+        // Whether the build session can no longer be trusted: then the outcome is read back on a fresh session only.
         let unknown = false;
         statements++;
         try {
           await sessions.db.query(concurrentStatement(s));
         } catch (caught) {
-          error = definiteSqlError(caught);
-          if (error === null) { unknown = true; error = "unknown"; }
+          error = sqlstateOf(caught) ?? "unknown";
+          unknown = sessionFatalError(caught);
         }
         entry.error = error;
-        // Read back on the same session when its outcome is definite, otherwise on a fresh one; never retry.
-        let after: CensusIndex;
-        if (unknown) {
-          unlock = false;
-          if (!sessions.fresh) { entry.status = "refused"; persist(); refuse("index_prebuild_unknown_commit_unverified"); }
-          const fresh = await sessions.fresh().catch(() => null);
-          if (!fresh) { entry.status = "refused"; persist(); refuse("index_prebuild_unknown_commit_unverified"); }
+        let after: CensusIndex | null = null;
+        if (!unknown) {
+          // A definite outcome: read back on the same session. If that session fails now, it is broken after all.
           try {
-            after = (await readbackIndex(fresh.db, s, c.owner)).index;
-          } finally {
-            await fresh.close().catch(() => undefined);
+            await sessions.db.query("RESET statement_timeout");
+            await sessions.db.query("RESET lock_timeout");
+            after = (await readbackIndex(sessions.db, s, c.owner)).index;
+          } catch {
+            unknown = true;
           }
-        } else {
-          await sessions.db.query("RESET statement_timeout");
-          await sessions.db.query("RESET lock_timeout");
-          after = (await readbackIndex(sessions.db, s, c.owner)).index;
         }
-        entry.readback = readbackOf(after);
-        entry.action = after.action;
+        if (unknown) {
+          // Never on the failed session, never a retry: one fresh session reads the outcome, then the run stops.
+          unlock = false;
+          after = null;
+          const fresh = sessions.fresh ? await sessions.fresh().catch(() => null) : null;
+          if (fresh) {
+            try {
+              after = (await readbackIndex(fresh.db, s, c.owner)).index;
+            } catch {
+              after = null;
+            } finally {
+              await fresh.close().catch(() => undefined);
+            }
+          }
+          if (!after) {
+            entry.status = "outcome_unknown";
+            entry.finishedAt = iso();
+            persist();
+            refuse("index_prebuild_unknown_commit_unverified");
+          }
+        }
+        entry.readback = readbackOf(after!);
+        entry.action = after!.action;
         entry.finishedAt = iso();
-        if (after.action === "present") {
+        if (after!.action === "present") {
           entry.status = error === null ? "built" : "committed_after_error";
           persist();
           // The session that failed is gone; nothing more runs on this dispatch, the next one resumes.
@@ -803,7 +856,7 @@ export async function runIndexPrebuild(
           continue;
         }
         entry.status = "refused";
-        entry.reason = after.action === "refused" ? after.reason : after.presence === "absent" ? "absent_after_build" : null;
+        entry.reason = after!.action === "refused" ? after!.reason : after!.presence === "absent" ? "absent_after_build" : null;
         persist();
         refuse(unknown ? "index_prebuild_unknown_commit_" + (entry.reason ?? "state") : "index_prebuild_build_failed");
       }

@@ -60,21 +60,29 @@ allowlisted child process, over stdin. Prebuild is dormant (`INDEX_PREBUILD_ENAB
    `prebuild` (absent on a populated table) or `refused`. The readiness-marker generation
    and the ledger tail and digest must not change during the census. The run publishes
    a census artifact (kept 1 day). A `blocked` census means something needs a human:
-   an invalid, in-progress, drifted or wrong-owner object.
+   an invalid, in-progress, drifted or wrong-owner object, an index of the same name in
+   another schema, or a readiness marker whose status is not `pass` (for example
+   `pending`, which can be left by a failed migration). The census still reports these.
 2. `prebuild`. It needs a census run from under 24 hours ago with verdict
    `prebuild_required`, and a typed confirmation copied byte for byte from that census:
    `PREBUILD-058000 <sha> GENERATION <g> TAIL <tail> LEDGER <digest> DESCRIPTOR <d> CENSUS <run> INDEXES <names>`.
    It holds a dedicated advisory lock (try-only) and re-checks the census against the
-   live database. Then it builds the `prebuild` indexes one at a time, with a finite
+   live database. The readiness marker must be `pass` then and before every build. Then it builds the `prebuild` indexes one at a time, with a finite
    statement and lock budget, and reads each one back. After every step it rewrites a
    per-index receipt (kept 30 days). A rerun with the same census resumes: an index that
    is already exact and valid/ready/live is accepted, and nothing else is. If a
-   statement's outcome is unknown (the connection dropped), the run reads it back on a
-   fresh session and stops. It never retries.
+   statement's outcome is unknown (the connection dropped, or the server ended the
+   session, for example `57P01`), the run reads it back on a fresh session, never on the
+   failed one, and stops. It never retries. If no fresh readback is possible, the receipt
+   records `outcome_unknown` for that index and a human checks it.
 3. Apply the release. The migration adopts the prebuilt indexes and builds the
    deferred ones on empty tables.
 4. `readback` (read-only). It passes only when all sixteen are exact, valid, ready and
    live, and no create-index progress row exists on their tables.
+
+Before the separate change that enables prebuild: prove a long statement through the
+session pooler on a disposable or dev database (or use a proven direct owner endpoint),
+and run a guarded read-only census or readback to prove the credential hand-off.
 
 If an index is refused as invalid or in progress, follow "Failed or cancelled builds"
 in the guide by hand: check `pg_stat_progress_create_index` before dropping anything.

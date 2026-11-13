@@ -5,7 +5,7 @@
  */
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { indexPrebuildGithubGate } from "../../../scripts/index-prebuild-058000-github.ts";
@@ -266,4 +266,34 @@ test("workflow: dormant source, one secret in one step, gate without environment
     "schema-release-database.ts", "psql", "DROP INDEX", "supabase db", P.project])
     expect(workflow).not.toContain(forbidden);
   expect(workflow.match(/CREATE INDEX(?! CONCURRENTLY)/gu)).toBeNull();
+});
+
+test("pg-proof: the 058000 real-PostgreSQL step is skipped with a warning at an older PR head that lacks its test file", () => {
+  const workflow = readFileSync(".github/workflows/pg-proof.yml", "utf8");
+  const file = "src/hoopdb/__tests__/index-prebuild-058000.postgres.test.ts";
+  const at = workflow.indexOf("- name: Prove the 058000 index prebuild");
+  expect(at).toBeGreaterThan(-1);
+  const step = workflow.slice(at, workflow.indexOf("\n      - name:", at + 1));
+  const run = step.slice(step.indexOf("run: |\n") + "run: |\n".length).replace(/^ {10}/gmu, "");
+  const guard = run.indexOf(`if [ ! -f ${file} ]; then`);
+  expect(guard).toBeGreaterThan(-1);
+  expect(guard).toBeLessThan(run.indexOf(`bun test --timeout 300000 ${file}`));
+  // Execute the step's own script with bun test stubbed: absent file -> warning, exit 0, no test; present -> runs it.
+  const script = run.replace(`bun test --timeout 300000 ${file}`, "echo RAN-TEST");
+  expect(script).toContain("echo RAN-TEST");
+  for (const present of [false, true]) {
+    const dir = mkdtempSync(join(tmpdir(), "pg-proof-guard-"));
+    try {
+      if (present) {
+        mkdirSync(join(dir, "src/hoopdb/__tests__"), { recursive: true });
+        writeFileSync(join(dir, file), "");
+      }
+      const r = spawnSync("bash", ["-e", "-c", script], { cwd: dir, encoding: "utf8" });
+      expect(r.status).toBe(0);
+      expect(r.stdout.includes("RAN-TEST")).toBe(present);
+      expect(r.stdout.includes("::warning title=pg-proof::index-prebuild-058000.postgres.test.ts absent")).toBe(!present);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
 });

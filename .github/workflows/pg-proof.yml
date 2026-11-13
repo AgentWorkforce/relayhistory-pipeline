@@ -246,7 +246,13 @@ jobs:
       - name: Prove the 058000 index prebuild builds CONCURRENTLY, refuses a live build and is adopted by 058000
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
-        run: bun test --timeout 300000 src/hoopdb/__tests__/index-prebuild-058000.postgres.test.ts
+        run: |
+          # pg-proof checks out the PR head; heads predating this step lack the test. Remove once no open PR predates it.
+          if [ ! -f src/hoopdb/__tests__/index-prebuild-058000.postgres.test.ts ]; then
+            echo "::warning title=pg-proof::index-prebuild-058000.postgres.test.ts absent at this head; forward-merge main to run the 058000 prebuild proof"
+            exit 0
+          fi
+          bun test --timeout 300000 src/hoopdb/__tests__/index-prebuild-058000.postgres.test.ts
       - name: Prove one session's buffered stages answer under 1 s on a 167k-batch backlog via the records GIN (044040)
         env:
           SESSION_INGEST_TEST_PG_URL: postgres://postgres@127.0.0.1:5432/postgres
