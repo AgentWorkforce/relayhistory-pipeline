@@ -78,7 +78,7 @@ async function upload(store: ObjectStore, batchId: string, records = [record({ r
 
 /** The operator's fence-authority marker (ledger-s3.ts FenceAuthorityDoc): without it nothing is admitted. */
 const writeAuthority = (store: ObjectStore) => store.put(objectKey(fenceAuthorityKey(ROOT)),
-  new TextEncoder().encode(JSON.stringify({ v: 1, fenceBackfill: "complete", controlMirror: "on", rearmSweeper: "live", writtenAtMs: T0 })), { contentType: "application/json" });
+  new TextEncoder().encode(JSON.stringify({ v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", writtenAtMs: T0 })), { contentType: "application/json" });
 
 function lambda(authority = true) {
   const s = scratchStore();
@@ -262,6 +262,29 @@ describe("self-host (ingest-edge) with INGEST_LEDGER=s3: the consumer admits thr
     expect((await listAll(store, `${ROOT}/${TENANT.orgId}/v1`)).filter((k) => k.endsWith("/manifest.json"))).toEqual([]);
     expect(sqlCalls).toEqual([]);
     await runtime.close();
+  });
+
+  test("INGEST_LEDGER=s3 requires the marker on EVERY admission path, with direct upload off too (the synchronous HTTP path's ledger)", async () => {
+    const { selfhostS3Ledger } = await import("../selfhost-server.ts");
+    const { prepareDelivery: prep } = await import("../vendor/delivery/prepare.ts");
+    const s = scratchStore();
+    cleanups.push(s.done);
+    const store = s.store;
+    const ledger = selfhostS3Ledger(ROOT, { run: (async () => { throw new Error("SQL runner called"); }) as never, store });
+    const p = await prep(TENANT, await batch([record({ record_id: "r1" })], { batch_id: "batch-sync" }));
+    const input = { tenant: TENANT, originId: "origin-1", batchId: p.batchId, batchDigest: p.batchDigest, receiptId: p.receipt.receiptId, sessions: [["claude", "sess-1"]] as [string, string][],
+      records: [{ source: "claude", sessionId: "sess-1", recordId: "r1", revisionId: "r1:r1", revision: 1, digest: "a".repeat(64) }] };
+    await expect(ledger.claim(input)).rejects.toMatchObject({ code: "ledger_fence_authority_missing" });
+    expect(await exists(store, s3LedgerKeys(ROOT, TENANT).batch("origin-1", p.batchId))).toBe(false);
+    await writeAuthority(store);
+    expect((await ledger.claim(input)).kind).toBe("claimed");
+    expect(sqlCalls).toEqual([]);
+  });
+
+  test("the synchronous runtime (no admission mode, no direct upload) is built on that gated ledger", async () => {
+    const src = readFileSync(join(import.meta.dir, "../selfhost-server.ts"), "utf8");
+    expect(src).toContain('const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts) : sqlLedger(');
+    expect(src).toContain('s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required" })');
   });
 
   test("a direct caller cannot combine the S3 ledger with a SQL-only feature", async () => {

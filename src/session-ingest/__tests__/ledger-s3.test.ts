@@ -10,7 +10,7 @@ import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../sh
 import { deliverPrepared, IngestUnavailable } from "../deliver.ts";
 import { LedgerUnavailableError, type ClaimInput, type CommitInput, type Ledger, type LedgerRecord } from "../ledger.ts";
 import {
-  applyFenceChange, fenceAuthorityKey, ingestLedgerMode, newFence, revisionShard, s3Ledger, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, withSqlControlMirror,
+  applyFenceChange, entryForgotten, fenceAuthorityKey, ingestLedgerMode, newFence, revisionShard, s3Ledger, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, withSqlControlMirror,
   type FenceDoc,
 } from "../ledger-s3.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
@@ -582,14 +582,13 @@ describe("resets: overlapping and interrupted (each tombstones every session own
     await expect(ledgerOn(crashingList(base, 1)).resetUploadedSessions(TENANT, "req-2")).rejects.toBeInstanceOf(LedgerUnavailableError);
     expect((await json(base, keys.fence)).resets).toBe(2);
     expect(await ledgerOn(base).resetUploadedSessions(TENANT, "req-1")).toBe(2);
-    // R2 then finds nothing left to tombstone (their epochs moved) and finishes with 0.
-    expect(await ledgerOn(base).resetUploadedSessions(TENANT, "req-2")).toBe(0);
+    // R1's finish also finished R2 (both were running at its listing): one CAS, both counts, resetsCompleted 2.
     const f = await json(base, keys.fence);
-    expect(f).toMatchObject({ resets: 2, resetRequests: { "req-1": 2, "req-2": 0 }, deleted: { [ORIGIN]: [["claude", "s1"], ["claude", "s2"]] } });
+    expect(f).toMatchObject({ resets: 2, resetsCompleted: 2, resetRequests: { "req-1": 2, "req-2": 2 }, deleted: { [ORIGIN]: [["claude", "s1"], ["claude", "s2"]] } });
     expect(f.epochs[ORIGIN]).toEqual({ [SK("claude", "s1")]: 1, [SK("claude", "s2")]: 1 });
-    // Replays answer their first counts.
+    // Replays answer their counts.
     expect(await ledgerOn(base).resetUploadedSessions(TENANT, "req-1")).toBe(2);
-    expect(await ledgerOn(base).resetUploadedSessions(TENANT, "req-2")).toBe(0);
+    expect(await ledgerOn(base).resetUploadedSessions(TENANT, "req-2")).toBe(2);
   });
 
   test("R1 stalls, R2 runs to completion, then R1's retry finishes with what is left", async () => {
@@ -597,8 +596,9 @@ describe("resets: overlapping and interrupted (each tombstones every session own
     await committedSessions(ledgerOn(base), ["s1"]);
     await expect(ledgerOn(crashingList(base, 1)).resetUploadedSessions(TENANT, "req-1")).rejects.toBeInstanceOf(LedgerUnavailableError);
     expect(await ledgerOn(base).resetUploadedSessions(TENANT, "req-2")).toBe(1);
-    expect(await ledgerOn(base).resetUploadedSessions(TENANT, "req-1")).toBe(0);
-    expect(await json(base, keys.fence)).toMatchObject({ resets: 2, deleted: { [ORIGIN]: [["claude", "s1"]] } });
+    // R2's finish also finished R1, which was running at its listing: R1's retry replays the same count.
+    expect(await ledgerOn(base).resetUploadedSessions(TENANT, "req-1")).toBe(1);
+    expect(await json(base, keys.fence)).toMatchObject({ resets: 2, resetsCompleted: 2, deleted: { [ORIGIN]: [["claude", "s1"]] } });
   });
 
   test("a session re-enabled after a reset tombstoned it is not owned again until it uploads again", async () => {
@@ -709,7 +709,7 @@ describe("revisions are judged per (origin, record id), as ingest_record_revisio
 });
 
 describe("the fence-authority marker (fail closed)", () => {
-  const marker = { v: 1, fenceBackfill: "complete", controlMirror: "on", rearmSweeper: "live", writtenAtMs: 1 };
+  const marker = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", writtenAtMs: 1 };
   const put = (store: ObjectStore, v: unknown) => store.put(objectKey(fenceAuthorityKey(ROOT)), new TextEncoder().encode(JSON.stringify(v)), { contentType: "application/json" });
 
   test("required: absent or invalid is a retry for every claim, never an admit; a valid marker admits; controls are never gated", async () => {
@@ -720,7 +720,7 @@ describe("the fence-authority marker (fail closed)", () => {
     await expect(ledger.claim(input)).rejects.toMatchObject({ code: "ledger_fence_authority_missing" });
     expect(await exists(store, keys.batch(ORIGIN, "b1"))).toBe(false);
     await ledger.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "s9"]], enabled: false });
-    for (const bad of [{ ...marker, rearmSweeper: "pending" }, { ...marker, controlMirror: "off" }, { ...marker, fenceBackfill: "partial" }, { ...marker, extra: 1 }, { ...marker, writtenAtMs: 0 }, { v: 2 }]) {
+    for (const bad of [{ ...marker, revisionBackfill: "partial" }, { ...marker, ownershipBackfill: undefined }, { ...marker, rearmSweeper: "pending" }, { ...marker, controlMirror: "off" }, { ...marker, fenceBackfill: "partial" }, { ...marker, extra: 1 }, { ...marker, writtenAtMs: 0 }, { v: 2 }]) {
       await put(store, bad);
       await expect(ledger.claim(input)).rejects.toMatchObject({ code: "ledger_fence_authority_invalid" });
     }
@@ -775,14 +775,14 @@ describe("self-host s3 controls also write SQL (withSqlControlMirror)", () => {
     expect(sqlSel).toEqual([{ originId: ORIGIN, sessions: [["claude", "s1"]], enabled: false }]);
   });
 
-  test("ordered controls mirror the plain SQL control, except a control S3 judged stale", async () => {
+  test("ordered controls reconcile SQL to the fence, even a control S3 judged stale (S3 decides)", async () => {
     const { order, ledger } = setupMirror();
     const control = (version: string) => ({ epoch: "e".repeat(64), version, digest: "d".repeat(64), kind: "selection" as const });
     const sel = { tenant: TENANT, originId: ORIGIN, sessions: [["claude", "s1"]] as [string, string][], enabled: false };
     await ledger.applyOrderedControl!({ ...sel, control: control("5") });
     expect(order).toEqual(["sql:disable"]);
     await ledger.applyOrderedControl!({ ...sel, control: control("4") });
-    expect(order).toEqual(["sql:disable"]);
+    expect(order).toEqual(["sql:disable", "sql:disable"]);
   });
 
   test("an S3 failure never reaches SQL", async () => {
@@ -857,5 +857,90 @@ describe("fence identity, keys and the exported fence rules", () => {
     now = 9_000;
     await ledger.resetUploadedSessions(TENANT, "req-2");
     expect((await json(store, keys.fence)).lastResetAtMs).toBe(9_000);
+  });
+});
+
+describe("second review: unfinished resets, mirror reconcile, claim restarts", () => {
+  const crashList = (base: ObjectStore) => {
+    let left = 1;
+    return wrap(base, { list: async (p, c) => { if (left > 0 && String(p) === keys.ownersRoot) { left--; throw new ObjectStoreError("transient", "fs", "x"); } return base.list(p, c); } });
+  };
+
+  test("a reset begun but unfinished forgets NOTHING (entries judged as before); the next claim finishes it, tombstones, then forgets", async () => {
+    const base = fresh();
+    const ledger = ledgerOn(base);
+    const a = claimInput("b1", [rec("r1", 1)]);
+    await ledger.commit(commitOf(a, (await claimed(ledger, a)).claimToken));
+    await expect(ledgerOn(crashList(base)).resetUploadedSessions(TENANT, "req-1")).rejects.toBeInstanceOf(LedgerUnavailableError);
+    const begun: FenceDoc = await json(base, keys.fence);
+    expect(begun).toMatchObject({ resets: 1, resetsCompleted: 0, resetRequests: { "req-1": null }, deleted: {} });
+    // Judged as before by any reader of the exported rules (the drain): the entry is not forgotten.
+    expect(entryForgotten(begun, ORIGIN, await entryOf(base, "r1"))).toBe(false);
+    // The next claim (any session) finishes the reset before judging.
+    const other = claimInput("b2", [rec("q1", 1, { sessionId: "sess-9" })]);
+    expect(await claimed(ledger, other)).toMatchObject({ kind: "claimed", resets: 1 });
+    const done: FenceDoc = await json(base, keys.fence);
+    expect(done).toMatchObject({ resets: 1, resetsCompleted: 1, resetRequests: { "req-1": 1 }, deleted: { [ORIGIN]: [["claude", "sess-1"]] } });
+    expect(entryForgotten(done, ORIGIN, await entryOf(base, "r1"))).toBe(true);
+    expect(await ledger.claim(claimInput("b3", [rec("r1", 1)]))).toMatchObject({ kind: "replay_fast", deleted: [["claude", "sess-1"]] });
+    // The reset's own retry replays the count the claim recorded.
+    expect(await ledger.resetUploadedSessions(TENANT, "req-1")).toBe(1);
+  });
+
+  test("an unrelated session's fence edits never restart a claim (one attempt suffices); a change to the claim's own session does", async () => {
+    const base = fresh();
+    const setup = ledgerOn(base);
+    let n = 0;
+    const noisy = wrap(base, { put: async (k, b, o) => {
+      if (String(k).includes("/ledger/owners/")) await setup.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", `other-${n++}`]], enabled: false });
+      return base.put(k, b, o);
+    } });
+    expect(await ledgerOn(noisy, { casAttempts: 1 }).claim(claimInput("b1", [rec("r1", 1)]))).toMatchObject({ kind: "claimed", deleted: [] });
+    let once = false;
+    const related = wrap(base, { put: async (k, b, o) => {
+      if (!once && String(k) === keys.owner(ORIGIN, "claude", "sess-2")) { once = true; await setup.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "sess-2"]], enabled: false }); }
+      return base.put(k, b, o);
+    } });
+    await expect(ledgerOn(related, { casAttempts: 1 }).claim(claimInput("b2", [rec("r2", 1, { sessionId: "sess-2" })]))).rejects.toMatchObject({ code: "ledger_batch_contended" });
+    // With a retry left it claims again and sees the deletion.
+    expect(await ledgerOn(base).claim(claimInput("b2", [rec("r2", 1, { sessionId: "sess-2" })]))).toMatchObject({ kind: "replay_fast", deleted: [["claude", "sess-2"]] });
+  });
+
+  test("mirror: a competing control that lands during this control's SQL write is reconciled; SQL ends at the fence's final state", async () => {
+    const store = fresh();
+    const s3 = ledgerOn(store);
+    const sqlState = new Map<string, boolean>();
+    const writes: string[] = [];
+    let mirror: Ledger;
+    let raced = false;
+    const sql: Pick<Ledger, "setSessionUploads" | "resetUploadedSessions"> = {
+      setSessionUploads: async (i) => {
+        if (!raced && !i.enabled) {
+          // The disable's SQL write is slow: a re-enable runs S3 + SQL to completion first, then the disable lands.
+          raced = true;
+          await mirror.setSessionUploads({ ...i, enabled: true });
+        }
+        for (const [s, id] of i.sessions) { sqlState.set(`${s}/${id}`, i.enabled); writes.push(`${id}:${i.enabled ? "on" : "off"}`); }
+      },
+      resetUploadedSessions: async () => 0,
+    };
+    mirror = withSqlControlMirror(s3, sql, store, ROOT);
+    await mirror.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "s1"]], enabled: false });
+    expect((await json(store, keys.fence)).deleted).toEqual({});
+    expect(writes).toEqual(["s1:on", "s1:off", "s1:on"]);
+    expect(sqlState.get("claude/s1")).toBe(true);
+  });
+
+  test("mirror: a fence that never settles fails the control (bounded), never a silent divergence", async () => {
+    const store = fresh();
+    const s3 = ledgerOn(store);
+    let k = 0;
+    const sql: Pick<Ledger, "setSessionUploads" | "resetUploadedSessions"> = {
+      setSessionUploads: async () => { await s3.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", `churn-${k++}`]], enabled: false }); },
+      resetUploadedSessions: async () => 0,
+    };
+    await expect(withSqlControlMirror(s3, sql, store, ROOT, { rounds: 3 }).setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "s1"]], enabled: false }))
+      .rejects.toMatchObject({ code: "ledger_control_mirror_unstable" });
+    expect(k).toBe(3);
   });
 });
