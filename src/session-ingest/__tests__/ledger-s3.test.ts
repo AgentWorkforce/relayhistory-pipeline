@@ -10,7 +10,7 @@ import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../sh
 import { deliverPrepared, IngestUnavailable } from "../deliver.ts";
 import { LedgerUnavailableError, type ClaimInput, type CommitInput, type Ledger, type LedgerRecord } from "../ledger.ts";
 import {
-  applyFenceChange, entryForgotten, fenceAuthorityKey, ingestLedgerMode, newFence, revisionShard, s3Ledger, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, withSqlControlMirror,
+  applyFenceChange, checkIndexEntryInput, entryForgotten, fenceAuthorityKey, ingestLedgerMode, newFence, revisionShard, s3Ledger, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, withSqlControlMirror,
   type FenceDoc,
 } from "../ledger-s3.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
@@ -942,5 +942,155 @@ describe("second review: unfinished resets, mirror reconcile, claim restarts", (
     await expect(withSqlControlMirror(s3, sql, store, ROOT, { rounds: 3 }).setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "s1"]], enabled: false }))
       .rejects.toMatchObject({ code: "ledger_control_mirror_unstable" });
     expect(k).toBe(3);
+  });
+});
+
+describe("third review follow-ups", () => {
+  const crashOwnersList = (base: ObjectStore) => {
+    let left = 1;
+    return wrap(base, { list: async (p, c) => { if (left > 0 && String(p) === keys.ownersRoot) { left--; throw new ObjectStoreError("transient", "fs", "x"); } return base.list(p, c); } });
+  };
+  async function committed(ledger: Ledger, batchId: string, sessionId: string) {
+    const input = claimInput(batchId, [rec(`r-${batchId}`, 1, { sessionId })]);
+    await ledger.commit(commitOf(input, (await claimed(ledger, input)).claimToken));
+  }
+
+  test("self-host (claimCompletesResets false): a claim never completes a running reset, so completion always goes through the control path's SQL mirror", async () => {
+    const base = fresh();
+    await committed(ledgerOn(base), "b0", "s1");
+    await expect(ledgerOn(crashOwnersList(base)).resetUploadedSessions(TENANT, "req-1")).rejects.toBeInstanceOf(LedgerUnavailableError);
+    const selfhost = ledgerOn(base, { claimCompletesResets: false });
+    // The claim admits against the fence as it is (the reset is running) and completes nothing.
+    expect(await claimed(selfhost, claimInput("b1", [rec("q1", 1, { sessionId: "s9" })]))).toMatchObject({ kind: "claimed", resets: 1 });
+    expect(await json(base, keys.fence)).toMatchObject({ resets: 1, resetsCompleted: 0, resetRequests: { "req-1": null }, deleted: {} });
+    // The reset's retry through the mirror completes it: S3 first, then SQL for every tombstoned session.
+    const sqlWrites: string[] = [];
+    const mirror = withSqlControlMirror(selfhost, {
+      setSessionUploads: async (i) => { for (const [, id] of i.sessions) sqlWrites.push(`${id}:${i.enabled ? "on" : "off"}`); },
+      resetUploadedSessions: async () => { sqlWrites.push("reset"); return 0; },
+    }, base, ROOT);
+    expect(await mirror.resetUploadedSessions(TENANT, "req-1")).toBe(1);
+    expect(sqlWrites).toEqual(["s1:off", "reset"]);
+    expect(await json(base, keys.fence)).toMatchObject({ resetsCompleted: 1, deleted: { [ORIGIN]: [["claude", "s1"]] } });
+  });
+
+  test("hosted (default): a claim completes a running reset, backed off before it claims again", async () => {
+    const base = fresh();
+    await committed(ledgerOn(base), "b0", "s1");
+    await expect(ledgerOn(crashOwnersList(base)).resetUploadedSessions(TENANT, "req-1")).rejects.toBeInstanceOf(LedgerUnavailableError);
+    const sleeps: number[] = [];
+    const ledger = s3Ledger(base, ROOT, { sleep: async (ms) => { sleeps.push(ms); }, random: () => 0.5 });
+    expect(await claimed(ledger, claimInput("b1", [rec("q1", 1, { sessionId: "s9" })]))).toMatchObject({ kind: "claimed", resets: 1 });
+    expect(sleeps.length).toBe(1);
+    expect((await json(base, keys.fence)).resetsCompleted).toBe(1);
+  });
+
+  test("a corrupt owner stub fails only the reset's completion (coded), never an unrelated claim", async () => {
+    const base = fresh();
+    await committed(ledgerOn(base), "b0", "s1");
+    await expect(ledgerOn(crashOwnersList(base)).resetUploadedSessions(TENANT, "req-1")).rejects.toBeInstanceOf(LedgerUnavailableError);
+    await base.put(objectKey(keys.owner(ORIGIN, "claude", "broken")), new TextEncoder().encode("{\"v\":9}"), { contentType: "application/json" });
+    const ledger = ledgerOn(base);
+    expect(await claimed(ledger, claimInput("b1", [rec("q1", 1, { sessionId: "s9" })]))).toMatchObject({ kind: "claimed" });
+    await expect(ledger.resetUploadedSessions(TENANT, "req-1")).rejects.toMatchObject({ code: "ledger_reset_owner_invalid" });
+    expect(await json(base, keys.fence)).toMatchObject({ resetsCompleted: 0, resetRequests: { "req-1": null } });
+  });
+
+  test("a finisher never closes the ordered mark of a reset that began after its listing (that reset's retry is not a replay before its tombstones)", async () => {
+    const base = fresh();
+    await committed(ledgerOn(base), "b0", "s1");
+    // Reset A begins and stops before it lists.
+    await expect(ledgerOn(crashOwnersList(base)).resetUploadedSessions(TENANT, "req-A")).rejects.toBeInstanceOf(LedgerUnavailableError);
+    const y = { epoch: "e".repeat(64), version: "7", digest: "c".repeat(64), kind: "reset" as const };
+    let yBegun = false;
+    // A's retry: right after its LIST returns, ordered reset Y begins (and stops before its own listing).
+    const aStore = wrap(base, { list: async (p, c) => {
+      const page = await base.list(p, c);
+      if (!yBegun && String(p) === keys.ownersRoot) {
+        yBegun = true;
+        await expect(ledgerOn(crashOwnersList(base)).applyOrderedControl!({ tenant: TENANT, requestId: "req-Y", control: y })).rejects.toBeInstanceOf(LedgerUnavailableError);
+      }
+      return page;
+    } });
+    expect(await ledgerOn(aStore).resetUploadedSessions(TENANT, "req-A")).toBe(1);
+    const f = await json(base, keys.fence);
+    expect(f.ordered).toMatchObject({ kind: "reset", requestId: "req-Y", result: null });
+    expect(f).toMatchObject({ resets: 2, resetsCompleted: 1, resetRequests: { "req-A": 1, "req-Y": null } });
+    // Y's retry finishes Y (applied, not replay) and only then closes its mark.
+    expect(await ledgerOn(base).applyOrderedControl!({ tenant: TENANT, requestId: "req-Y", control: y })).toMatchObject({ control: { outcome: "applied" } });
+    expect(await json(base, keys.fence)).toMatchObject({ resetsCompleted: 2, resetRequests: { "req-Y": 0 }, ordered: { requestId: "req-Y", result: 0 } });
+  });
+
+  test("a fence written before resetsCompleted: equal to resets when no reset is running, else fail closed", async () => {
+    const store = fresh();
+    const legacy = { ...newFence(), resets: 2, lastResetAtMs: 5, resetRequests: { q1: 0, q2: 1 } } as Record<string, unknown>;
+    delete legacy.resetsCompleted;
+    await store.put(objectKey(keys.fence), new TextEncoder().encode(JSON.stringify(legacy)), { contentType: "application/json" });
+    const io = s3LedgerObjects(store, ROOT, noSleep);
+    const read = await io.readFence(keys.fence);
+    expect(read.state === "present" && read.fence.resetsCompleted).toBe(2);
+    expect((await ledgerOn(store).claim(claimInput("b1", [rec("r1", 1)]))).kind).toBe("claimed");
+    await store.put(objectKey(keys.fence), new TextEncoder().encode(JSON.stringify({ ...legacy, resetRequests: { q1: 0, q2: null } })), { contentType: "application/json" });
+    await expect(io.readFence(keys.fence)).rejects.toMatchObject({ code: "ledger_fence_invalid" });
+    await expect(ledgerOn(store).claim(claimInput("b2", [rec("r2", 1)]))).rejects.toMatchObject({ code: "ledger_fence_invalid" });
+  });
+
+  test("deleting the marker stops NEW claims after the cache window, but a batch already claimed still commits", async () => {
+    const store = fresh();
+    let now = 0;
+    const marker = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", writtenAtMs: 1 };
+    await store.put(objectKey(fenceAuthorityKey(ROOT)), new TextEncoder().encode(JSON.stringify(marker)), { contentType: "application/json" });
+    const ledger = ledgerOn(store, { fenceAuthority: "required", nowMs: () => now });
+    const a = claimInput("b1", [rec("r1", 1)]);
+    const c = await claimed(ledger, a);
+    await store.delete(objectKey(fenceAuthorityKey(ROOT)));
+    now += 60_000;
+    await expect(ledger.claim(claimInput("b2", [rec("r2", 1)]))).rejects.toMatchObject({ code: "ledger_fence_authority_missing" });
+    expect(await ledger.commit(commitOf(a, c.claimToken))).toEqual({ rearmed: 0 });
+  });
+});
+
+describe("revision-only index entries (seeded proven records, lazy native slots)", () => {
+  const io = (store: ObjectStore) => s3LedgerObjects(store, ROOT, noSleep);
+  const absentView = newFence();
+  const entry = (recordId: string, revision: number, revisionId: string | null, digest: string | null, sessionId: string | null = "sess-1") =>
+    ({ recordId, revision, revisionId, digest, sessionKey: sessionId === null ? null : SK("claude", sessionId), epoch: 0, resets: 0 });
+
+  test("a revision-only entry judges stale by revision alone, whatever the submitted digest, as SQL's claim step (c)", async () => {
+    const store = fresh();
+    await io(store).mergeIndex(shardKey("R"), absentView, ORIGIN, [entry("R", 5, null, null)]);
+    await io(store).mergeIndex(shardKey("L"), absentView, ORIGIN, [entry("L", 3, null, hex("lazy"), null)]); // a lazy native slot: digest, no revision id
+    expect(await entryOf(store, "R")).toEqual([5, null, null, SK("claude", "sess-1"), 0, 0]);
+    expect(await entryOf(store, "L")).toEqual([3, null, hex("lazy"), null, 0, 0]);
+    const ledger = ledgerOn(store);
+    expect(await ledger.claim(claimInput("b1", [rec("R", 5, { digest: hex("any") }), rec("R", 4), rec("L", 3, { sessionId: "sess-2", digest: hex("other") })])))
+      .toMatchObject({ kind: "replay_fast", stale: [0, 1, 2] });
+    const up = claimInput("b2", [rec("R", 6)]);
+    expect(await claimed(ledger, up)).toMatchObject({ kind: "claimed", stale: [] });
+    // Max wins: the full revision 6 replaces the revision-only 5.
+    await ledger.commit(commitOf(up, (await claimed(ledger, up)).claimToken));
+    expect(await entryOf(store, "R")).toEqual([6, "R:r6", rec("R", 6).digest, SK("claude", "sess-1"), 0, 0]);
+  });
+
+  test("at an equal revision neither form overwrites the other (the stored entry is kept), and a higher one of either form wins", async () => {
+    const store = fresh();
+    await io(store).mergeIndex(shardKey("A"), absentView, ORIGIN, [entry("A", 5, "A:r5", hex("a"))]);
+    await io(store).mergeIndex(shardKey("A"), absentView, ORIGIN, [entry("A", 5, null, null)]);
+    expect(await entryOf(store, "A")).toEqual([5, "A:r5", hex("a"), SK("claude", "sess-1"), 0, 0]);
+    await io(store).mergeIndex(shardKey("B"), absentView, ORIGIN, [entry("B", 5, null, null)]);
+    await io(store).mergeIndex(shardKey("B"), absentView, ORIGIN, [entry("B", 5, "B:r5", hex("b"))]);
+    expect(await entryOf(store, "B")).toEqual([5, null, null, SK("claude", "sess-1"), 0, 0]);
+    await io(store).mergeIndex(shardKey("A"), absentView, ORIGIN, [entry("A", 6, null, null)]);
+    expect(await entryOf(store, "A")).toEqual([6, null, null, SK("claude", "sess-1"), 0, 0]);
+    // In one merge, a full entry is preferred over a revision-only one at the same revision.
+    await io(store).mergeIndex(shardKey("C"), absentView, ORIGIN, [entry("C", 2, null, null), entry("C", 2, "C:r2", hex("c"))]);
+    expect(await entryOf(store, "C")).toEqual([2, "C:r2", hex("c"), SK("claude", "sess-1"), 0, 0]);
+  });
+
+  test("malformed entries refuse (a digest that is not hex, an empty revision id)", async () => {
+    const store = fresh();
+    await expect(io(store).mergeIndex(shardKey("A"), absentView, ORIGIN, [entry("A", 1, null, "nothex")])).rejects.toMatchObject({ code: "ledger_input_refused" });
+    await expect(io(store).mergeIndex(shardKey("A"), absentView, ORIGIN, [entry("A", 1, "", null)])).rejects.toMatchObject({ code: "ledger_input_refused" });
+    expect(() => checkIndexEntryInput(entry("A", 0, null, null))).toThrow(LedgerUnavailableError);
   });
 });
