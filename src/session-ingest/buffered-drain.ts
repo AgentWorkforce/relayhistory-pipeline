@@ -1311,7 +1311,9 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       if (k.lines.length) kept.push(k);
     }
 
-    // The revision index is per (origin, record id) in 64 shards (ledger-s3): lock the shards this batch touches.
+    // The revision index is per (origin, record id) in 4096 shards (ledger-s3): lock the shards this batch touches.
+    // It is complete only once the org's marker records revisionLayout "4096" (the reshard verified), which
+    // orgAuthority below requires, so a record indexed only in the superseded 64-shard layout is never judged new.
     const recordOf = (line: string) => JSON.parse(line) as { record_id: string; revision: string };
     const shardKeys = new Set<string>();
     for (const k of kept) for (const line of k.lines) shardKeys.add(keys.revisions(origin, recordOf(line).record_id));

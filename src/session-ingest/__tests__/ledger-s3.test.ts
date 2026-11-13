@@ -709,7 +709,7 @@ describe("revisions are judged per (origin, record id), as ingest_record_revisio
 });
 
 describe("the fence-authority marker (fail closed)", () => {
-  const marker = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: 1 };
+  const marker = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", revisionLayout: "4096", workerHttpAdmission: "off", writtenAtMs: 1 };
   const put = (store: ObjectStore, v: unknown) => store.put(objectKey(fenceAuthorityKey(ROOT)), new TextEncoder().encode(JSON.stringify(v)), { contentType: "application/json" });
 
   test("required: absent or invalid is a retry for every claim, never an admit; a valid marker admits; controls are never gated", async () => {
@@ -720,7 +720,7 @@ describe("the fence-authority marker (fail closed)", () => {
     await expect(ledger.claim(input)).rejects.toMatchObject({ code: "ledger_fence_authority_missing" });
     expect(await exists(store, keys.batch(ORIGIN, "b1"))).toBe(false);
     await ledger.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "s9"]], enabled: false });
-    for (const bad of [{ ...marker, workerHttpAdmission: "mirrored" }, { ...marker, workerHttpAdmission: undefined }, { ...marker, revisionBackfill: "partial" }, { ...marker, ownershipBackfill: undefined }, { ...marker, rearmSweeper: "pending" }, { ...marker, controlMirror: "off" }, { ...marker, fenceBackfill: "partial" }, { ...marker, extra: 1 }, { ...marker, writtenAtMs: 0 }, { v: 2 }]) {
+    for (const bad of [{ ...marker, workerHttpAdmission: "mirrored" }, { ...marker, workerHttpAdmission: undefined }, { ...marker, revisionBackfill: "partial" }, { ...marker, ownershipBackfill: undefined }, { ...marker, rearmSweeper: "pending" }, { ...marker, controlMirror: "off" }, { ...marker, fenceBackfill: "partial" }, { ...marker, extra: 1 }, { ...marker, writtenAtMs: 0 }, { ...marker, revisionLayout: undefined }, { ...marker, revisionLayout: "64" }, { v: 2 }]) {
       await put(store, bad);
       await expect(ledger.claim(input)).rejects.toMatchObject({ code: "ledger_fence_authority_invalid" });
     }
@@ -1039,7 +1039,7 @@ describe("third review follow-ups", () => {
   test("deleting the marker stops NEW claims after the cache window, but a batch already claimed still commits", async () => {
     const store = fresh();
     let now = 0;
-    const marker = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: 1 };
+    const marker = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", revisionLayout: "4096", workerHttpAdmission: "off", writtenAtMs: 1 };
     await store.put(objectKey(fenceAuthorityKey(ROOT)), new TextEncoder().encode(JSON.stringify(marker)), { contentType: "application/json" });
     const ledger = ledgerOn(store, { fenceAuthority: "required", nowMs: () => now });
     const a = claimInput("b1", [rec("r1", 1)]);
@@ -1138,7 +1138,7 @@ describe("layered review P2-A: a SQL reset never keeps a tombstone S3 has lifted
 });
 
 describe("per-org fence-authority markers", () => {
-  const fields = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: 1 };
+  const fields = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", revisionLayout: "4096", workerHttpAdmission: "off", writtenAtMs: 1 };
   const putJson = (store: ObjectStore, key: string, v: unknown) => store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(v)), { contentType: "application/json" });
   const TENANT_B = { ...TENANT, orgId: "org-b" };
   const claimFor = (tenant: typeof TENANT, batchId: string) => claimInput(batchId, [rec("r1", 1)], { tenant });
@@ -1157,7 +1157,7 @@ describe("per-org fence-authority markers", () => {
     const store = fresh();
     const ledger = ledgerOn(store, { fenceAuthority: "required" });
     await expect(ledger.claim(claimFor(TENANT, "a1"))).rejects.toMatchObject({ code: "ledger_fence_authority_missing" });
-    for (const bad of [{ ...fields }, { ...fields, orgId: TENANT.orgId, rearmSweeper: "pending" }, { ...fields, orgId: TENANT.orgId, extra: 1 }, { ...fields, orgId: "" }]) {
+    for (const bad of [{ ...fields }, { ...fields, orgId: TENANT.orgId, rearmSweeper: "pending" }, { ...fields, orgId: TENANT.orgId, extra: 1 }, { ...fields, orgId: TENANT.orgId, revisionLayout: undefined }, { ...fields, orgId: "" }]) {
       await putJson(store, orgFenceAuthorityKey(ROOT, TENANT.orgId), bad);
       const err = await ledger.claim(claimFor(TENANT, "a1")).catch((e) => e);
       expect(err).toMatchObject({ code: "ledger_fence_authority_invalid" });
@@ -1203,7 +1203,7 @@ describe("per-org fence-authority markers", () => {
 });
 
 describe("fence authority: the deployment-wide stop, and per-org fallbacks", () => {
-  const fields = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: 1 };
+  const fields = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", revisionLayout: "4096", workerHttpAdmission: "off", writtenAtMs: 1 };
   const putJson = (store: ObjectStore, key: string, v: unknown) => store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(v)), { contentType: "application/json" });
   const TENANT_B = { ...TENANT, orgId: "org-b" };
   const claimFor = (tenant: typeof TENANT, batchId: string) => claimInput(batchId, [rec("r1", 1)], { tenant });
