@@ -20,7 +20,7 @@
  *   ledger/owners/o=<h(origin)>/s=<sessionKey>.json   the session's ownership stub (ingest_session_ownership):
  *       {v, originId, source, sessionId, epoch, resets}, registered at CLAIM, before any canonical write, so a
  *       reset that lands mid-flight lists the session and tombstones it.
- *   upload-fences.json   the fence: {v, instance, version, resets, lastResetAtMs, deleted: {<origin>: [[source,
+ *   upload-fences.json   the fence: {v, instance, version, resets, resetsCompleted, lastResetAtMs, deleted: {<origin>: [[source,
  *       sessionId]...]}, epochs: {<origin>: {<sessionKey>: n}}, resetRequests: {<requestId>: n | null}, ordered?}
  *       edited with If-Match by every selection, reset and ordered control. Unreadable: a retry, never empty.
  *       Created only by `newFence` (a random instance id), changed only by `applyFenceChange`'s rules.
@@ -138,7 +138,13 @@ export interface FenceDoc {
   instance: string;
   /** Bumped by every edit: a commit whose claim saw this (instance, version) has nothing to recheck. */
   version: number;
+  /** Resets BEGUN (a reset's first CAS bumps it). New entries and owner stubs are stamped with it. */
   resets: number;
+  /**
+   * The reset count whose tombstones have all landed (<= resets). Entries are forgotten by THIS count, so a
+   * begun-but-unfinished reset leaves every entry judged as before; the next reset retry or claim finishes it.
+   */
+  resetsCompleted: number;
   /** ms since epoch of the latest reset; only ever increases (applyFenceChange). 0: never reset. */
   lastResetAtMs: number;
   deleted: Record<string, [string, string][]>;
@@ -183,6 +189,12 @@ export interface OwnerDoc { v: 1; originId: string; source: string; sessionId: s
  * `<keyRoot>/.ledger/fence-authority.json`. An operator writes it, once, and ONLY when all of these hold:
  *   fenceBackfill "complete"  the one-time fence backfill (0005 "The buffered backlog" step 0) has copied every
  *                             user's SQL deletions and resets (upload_deletions, upload_resets) into their fence;
+ *   revisionBackfill "complete"  SQL ingest_record_revisions is copied into the index shards at the current generation
+ *                             (s3LedgerObjects mergeIndex, recordGeneration), so a pre-cutover revision is still stale;
+ *   ownershipBackfill "complete" SQL ingest_session_ownership (and every session with SQL revisions) is copied into
+ *                             owner stubs (registerOwner), so an S3 reset owns sessions only SQL knew. Both copies run
+ *                             AFTER every writer of SQL ownership has stopped (INGEST_LEDGER=s3 everywhere it admits):
+ *                             the S3 reset reads only owner stubs;
  *   controlMirror "on"        every control route writes the S3 fence before SQL (INGEST_S3_FENCE_MIRROR=on on
  *                             the Worker, or this ledger's own controls on self-host), so no deletion lands in
  *                             SQL alone from then on;
@@ -190,7 +202,7 @@ export interface OwnerDoc { v: 1; originId: string; source: string; sessionId: s
  * Without it an absent fence cannot be told from a user whose SQL deletions were never copied, so admission
  * refuses (retries) rather than treat absent as empty. Deleting it is the kill switch (cached up to 60 s).
  */
-export interface FenceAuthorityDoc { v: 1; fenceBackfill: "complete"; controlMirror: "on"; rearmSweeper: "live"; writtenAtMs: number }
+export interface FenceAuthorityDoc { v: 1; fenceBackfill: "complete"; revisionBackfill: "complete"; ownershipBackfill: "complete"; controlMirror: "on"; rearmSweeper: "live"; writtenAtMs: number }
 
 const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 const count = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
@@ -206,7 +218,7 @@ const own = <T>(o: Record<string, T>, k: string): T | undefined => (Object.hasOw
 const exactKeys = (o: Record<string, unknown>, keys: string[]) => Object.keys(o).length === keys.length && keys.every((k) => Object.hasOwn(o, k));
 
 export function validFence(v: unknown): v is FenceDoc {
-  if (!isObject(v) || v.v !== 1 || typeof v.instance !== "string" || !TOKEN.test(v.instance) || !count(v.version) || !count(v.resets) || !count(v.lastResetAtMs)
+  if (!isObject(v) || v.v !== 1 || typeof v.instance !== "string" || !TOKEN.test(v.instance) || !count(v.version) || !count(v.resets) || !count(v.resetsCompleted) || (v.resetsCompleted as number) > (v.resets as number) || !count(v.lastResetAtMs)
     || !isObject(v.deleted) || !isObject(v.epochs) || !isObject(v.resetRequests)) return false;
   if (Object.hasOwn(v.deleted, "__proto__") || Object.hasOwn(v.epochs, "__proto__") || Object.hasOwn(v.resetRequests, "__proto__")) return false;
   if (!Object.values(v.deleted).every((list) => Array.isArray(list) && list.every(pairOk))) return false;
@@ -233,8 +245,8 @@ export function validOwner(v: unknown): v is OwnerDoc {
   return isObject(v) && v.v === 1 && str(v.originId) && str(v.source) && str(v.sessionId) && count(v.epoch) && count(v.resets);
 }
 export function validFenceAuthority(v: unknown): v is FenceAuthorityDoc {
-  return isObject(v) && exactKeys(v, ["v", "fenceBackfill", "controlMirror", "rearmSweeper", "writtenAtMs"]) && v.v === 1
-    && v.fenceBackfill === "complete" && v.controlMirror === "on" && v.rearmSweeper === "live" && count(v.writtenAtMs) && v.writtenAtMs > 0;
+  return isObject(v) && exactKeys(v, ["v", "fenceBackfill", "revisionBackfill", "ownershipBackfill", "controlMirror", "rearmSweeper", "writtenAtMs"]) && v.v === 1
+    && v.fenceBackfill === "complete" && v.revisionBackfill === "complete" && v.ownershipBackfill === "complete" && v.controlMirror === "on" && v.rearmSweeper === "live" && count(v.writtenAtMs) && v.writtenAtMs > 0;
 }
 
 // ---- fence rules (shared with the backfill and the drain: never reimplement them) ----
@@ -243,11 +255,11 @@ export function validFenceAuthority(v: unknown): v is FenceAuthorityDoc {
 export function newFence(newId: () => string = randomUUID): FenceDoc {
   const instance = newId();
   if (!TOKEN.test(instance)) throw new LedgerUnavailableError("ledger_fence_instance_invalid");
-  return { v: 1, instance, version: 0, resets: 0, lastResetAtMs: 0, deleted: {}, epochs: {}, resetRequests: {} };
+  return { v: 1, instance, version: 0, resets: 0, resetsCompleted: 0, lastResetAtMs: 0, deleted: {}, epochs: {}, resetRequests: {} };
 }
 
 /** What a missing fence means to ADMISSION (claim / commit) only: nothing deleted, never reset. Never written. */
-const ABSENT_VIEW: FenceDoc = Object.freeze({ v: 1, instance: "", version: 0, resets: 0, lastResetAtMs: 0, deleted: {}, epochs: {}, resetRequests: {} }) as FenceDoc;
+const ABSENT_VIEW: FenceDoc = Object.freeze({ v: 1, instance: "", version: 0, resets: 0, resetsCompleted: 0, lastResetAtMs: 0, deleted: {}, epochs: {}, resetRequests: {} }) as FenceDoc;
 const admissionView = (read: FenceRead): FenceDoc => (read.state === "present" ? read.fence : ABSENT_VIEW);
 const instanceOf = (read: FenceRead): string | null => (read.state === "present" ? read.fence.instance : null);
 
@@ -265,7 +277,9 @@ export interface FenceChange {
   deletions?: { originId: string; sessions: [string, string][] }[];
   /**
    * Record a reset. A NEW request id is recorded (`result`: null while it runs, or its final count), increments
-   * `resets` and raises `lastResetAtMs` to `atMs` (never lowers it). A known request id changes nothing.
+   * `resets` and raises `lastResetAtMs` to `atMs` (never lowers it). A known request id changes nothing. With a
+   * final count (an already finished reset, e.g. the backfill copying SQL's) and no other reset still running,
+   * `resetsCompleted` follows `resets`: the caller applies that reset's tombstones in the same edit.
    */
   reset?: { requestId: string; atMs: number; result: number | null };
 }
@@ -301,13 +315,14 @@ export function applyFenceChange(fence: FenceDoc, change: FenceChange): FenceCha
       fence.resetRequests[requestId] = result;
       fence.resets += 1;
       fence.lastResetAtMs = Math.max(fence.lastResetAtMs, atMs);
+      if (result !== null && !Object.values(fence.resetRequests).includes(null)) fence.resetsCompleted = fence.resets;
       reset = "recorded";
     }
   }
   return { changed: newlyDeleted.length > 0 || reset === "recorded", newlyDeleted, reset };
 }
 
-/** The generation a record written now for (source, sessionId) is stamped with: [sessionKey, epoch, resets]. */
+/** The generation a record (or owner stub) written now for (source, sessionId) is stamped with: [sessionKey, epoch, resets BEGUN]. */
 export function recordGeneration(fence: FenceDoc, originId: string, source: string, sessionId: string | null): [string | null, number, number] {
   if (sessionId === null) return [null, 0, 0];
   const k = sessionKeyHash(source, sessionId);
@@ -315,15 +330,15 @@ export function recordGeneration(fence: FenceDoc, originId: string, source: stri
 }
 
 /**
- * True when the fence has forgotten this entry: its generation is BELOW the fence's for its session (a disable or
- * a reset since it was written). An entry at a NEWER generation than this fence knows was written after it was
- * read, so it counts. Session-less entries are never forgotten.
+ * True when the fence has forgotten this entry: it was written before a reset that has COMPLETED (its tombstones
+ * landed), or under an older epoch of its session (a disable, or a reset's tombstone, since). A reset that is begun
+ * but unfinished forgets nothing. An entry newer than this fence knows was written after it was read, so it
+ * counts. Session-less entries are never forgotten.
  */
 export function entryForgotten(fence: FenceDoc, originId: string, e: IndexEntry): boolean {
   const [, , , k, epoch, resets] = e;
   if (k === null) return false;
-  if (resets !== fence.resets) return resets < fence.resets;
-  return epoch < fenceEpoch(fence, originId, k);
+  return resets < fence.resetsCompleted || epoch < fenceEpoch(fence, originId, k);
 }
 const genNewer = (a: { epoch: number; resets: number }, b: { epoch: number; resets: number }) => a.resets > b.resets || (a.resets === b.resets && a.epoch > b.epoch);
 
@@ -392,7 +407,7 @@ export interface S3LedgerOptions {
   /**
    * "required": every claim first checks `<keyRoot>/.ledger/fence-authority.json` (FenceAuthorityDoc) and
    * answers a retry (`ledger_fence_authority_missing` / `_invalid`) without it. The hosted Lambda always sets
-   * it; self-host sets it with INGEST_LEDGER=s3 and direct upload admission. Controls are never gated.
+   * it; self-host always sets it with INGEST_LEDGER=s3 (every admission path). Controls are never gated.
    */
   fenceAuthority?: "required";
   /** How long a VALID marker read is trusted (default 60 s). A missing or invalid one is never cached. */
@@ -645,10 +660,7 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
 
   /**
    * A reset (ingest_apply_reset). Begin: record the request id, resets + 1, lastResetAtMs (applyFenceChange).
-   * Then list the ownership stubs and tombstone every session claimed at a reset count BELOW the current one
-   * whose epoch has not moved since (not disabled or already tombstoned), and record the count. Overlapping or
-   * interrupted resets: whichever finishes first tombstones everything older than the count it sees; a retried
-   * request id (begun, not finished) finishes the same way; a finished one replays its count.
+   * Then finishResets. A finished request id replays its count.
    */
   async function applyReset(tenant: LedgerTenant, requestId: string, control?: OrderedControl): Promise<{ outcome: "applied" | "replay" | "stale"; deleted: number }> {
     const mark = control ? orderedMark(control) : undefined;
@@ -659,16 +671,30 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       const d = mark?.(f);
       if (d && d !== "apply") return { next: null, result: d };
       const prior = own(f.resetRequests, requestId);
-      if (typeof prior === "number") return { next: null, result: { outcome: "replay" as const, result: prior } };
+      // Finished (by this request's earlier attempt, or by a claim or another reset): replay, closing the ordered mark.
+      if (typeof prior === "number") return { next: control && finishOrdered(f, control, prior) ? f : null, result: { outcome: "replay" as const, result: prior } };
       // Begun by an earlier attempt that stopped part way: finish it (the ordered mark, if any, is kept).
       if (prior === null) return { next: control ? f : null, result: "apply" as const };
       applyFenceChange(f, { reset: { requestId, atMs, result: null } });
       return { next: f, result: "apply" as const };
     });
     if (begun !== "apply") return { outcome: begun.outcome, deleted: begun.result };
+    const n = await finishResets(keys, requestId, control);
+    return { outcome: "applied", deleted: n };
+  }
+
+  /**
+   * Finish every reset that was running when the owner stubs are listed: tombstone each session claimed at a
+   * reset count BELOW the begun count whose epoch has not moved (not disabled or already tombstoned), give each of
+   * those resets the count, and advance `resetsCompleted` in the SAME CAS, so no entry is forgotten before its
+   * session is tombstoned. Overlapping or interrupted resets all converge here; a reset begun after the listing
+   * stays running for its own retry or the next claim. Returns `requestId`'s count (or the count tombstoned).
+   */
+  async function finishResets(keys: ReturnType<typeof s3LedgerKeys>, requestId?: string, control?: OrderedControl): Promise<number> {
     const read = await readFence(keys.fence);
-    if (read.state === "absent") throw new LedgerUnavailableError("ledger_fence_invalid"); // the begin wrote it
+    if (read.state === "absent") throw new LedgerUnavailableError("ledger_fence_invalid"); // a begun reset wrote it
     const now = read.fence;
+    const runningAtList = Object.entries(now.resetRequests).filter(([, v]) => v === null).map(([k]) => k);
     const owned: OwnerDoc[] = [];
     let cursor: string | undefined;
     const prefix = keys.ownersRoot + "/";
@@ -685,20 +711,23 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
     } catch (error) {
       throw storeFailure(error);
     }
-    const total = await editFence<number>(keys.fence, (f) => {
-      const prior = own(f.resetRequests, requestId);
-      if (typeof prior === "number") return { next: null, result: prior };
+    return editFence<number>(keys.fence, (f) => {
+      const prior = requestId === undefined ? undefined : own(f.resetRequests, requestId);
+      if (typeof prior === "number") return { next: control && finishOrdered(f, control, prior) ? f : null, result: prior };
       // Only what is still as listed: a session disabled, re-enabled or tombstoned since moved its epoch.
       const still = owned.filter((d) => fenceEpoch(f, d.originId, sessionKeyHash(d.source, d.sessionId)) === d.epoch);
       const byOrigin = new Map<string, [string, string][]>();
       for (const d of still) byOrigin.set(d.originId, [...(byOrigin.get(d.originId) ?? []), [d.source, d.sessionId]]);
       const { newlyDeleted } = applyFenceChange(f, { deletions: [...byOrigin].map(([originId, sessions]) => ({ originId, sessions })) });
       const n = new Set(newlyDeleted.map(([, s, id]) => pairId(s, id))).size;
-      f.resetRequests[requestId] = n;
-      if (control) finishOrdered(f, control, n);
-      return { next: f, result: n };
+      let changed = newlyDeleted.length > 0;
+      for (const id of runningAtList) if (own(f.resetRequests, id) === null) { f.resetRequests[id] = n; changed = true; }
+      if (f.resetsCompleted < now.resets) { f.resetsCompleted = now.resets; changed = true; }
+      if (control) changed = finishOrdered(f, control, n) || changed;
+      else if (f.ordered && f.ordered.kind === "reset" && f.ordered.result === null) { f.ordered.result = n; changed = true; }
+      const mine = requestId === undefined ? n : own(f.resetRequests, requestId) ?? n;
+      return { next: changed ? f : null, result: typeof mine === "number" ? mine : n };
     });
-    return { outcome: "applied", deleted: total };
   }
 
   /**
@@ -759,6 +788,9 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
         // (b) + (c): the fence, then the stored revisions of what is left.
         const read = await readFence(keys.fence);
         const fence = admissionView(read);
+        // A reset begun but not finished (it crashed, or is still running): finish it before judging, so a reset is
+        // never left half done by a client that stopped retrying. Then claim against the finished fence.
+        if (fence.resets > fence.resetsCompleted) { await finishResets(keys); continue; }
         const judged = await judge(input, keys, fence);
         if (judged.twins > 0) return { kind: "revision_conflict", conflicts: judged.conflicts, count: judged.twins };
         const pairs = batchPairs(input.sessions, input.records);
@@ -771,8 +803,15 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
             const [, epoch, resets] = recordGeneration(fence, input.originId, s, id);
             return registerOwner(keys.owner(input.originId, s, id), { v: 1, originId: input.originId, source: s, sessionId: id, epoch, resets });
           });
+          // Claim again only if the fence moved in a way that touches THIS claim (a reset, or one of its sessions'
+          // epoch or deletion), never for an unrelated edit, so other sessions' controls cannot starve it.
+          // A recreated fence (another instance) is rechecked in full at commit, as any snapshot mismatch is.
           const again = await readFence(keys.fence);
-          if (instanceOf(again) !== instanceOf(read) || admissionView(again).version !== fence.version) { await backoff(attempt); continue; }
+          const next = admissionView(again);
+          if (next.resets !== fence.resets || pairs.some(([s, id]) => {
+            const k = sessionKeyHash(s, id);
+            return fenceEpoch(next, input.originId, k) !== fenceEpoch(fence, input.originId, k) || isDeleted(next, input.originId, s, id) !== isDeleted(fence, input.originId, s, id);
+          })) { await backoff(attempt); continue; }
         }
         // (d) The claim; committed at once when nothing needs writing (replay_fast).
         const token = judged.fast ? null : newToken();
@@ -877,47 +916,68 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
 
 /**
  * Self-host with INGEST_LEDGER=s3, until the read side moves (decision 0005 "Read side"): the read API and the
- * eraser still read SQL `upload_deletions`, so every control writes the S3 fence FIRST (the authority for
- * admission) and then the SQL controls. A failure of either fails the control (the retry is idempotent on both
- * sides). This is transitional deletion state for readers, not upload accounting: claims and commits never
- * touch SQL.
+ * eraser still read SQL `upload_deletions`, so every control writes the S3 fence FIRST (the authority) and then
+ * RECONCILES SQL to the fence: each session the control touched is disabled in SQL if the fence deletes it and
+ * enabled if not. After the SQL writes the fence is read again; if it moved (another control landed), SQL is
+ * reconciled again, up to `rounds` times, else the control fails (`ledger_control_mirror_unstable`; its retry is
+ * idempotent). A failure of either side fails the control. This is transitional deletion state for readers, not
+ * upload accounting: claims and commits never touch SQL.
  *
- *   selection          S3, then SQL setSessionUploads with the same input.
- *   reset              S3, then SQL: every session the S3 fence deletes for this user, per origin in pages of
- *                      2048, as a disable (the S3 reset's owned sessions live only in S3, so SQL's own reset
- *                      would find none), then SQL resetUploadedSessions (its request record). Mirroring the
- *                      whole deleted set makes a retry after a partial failure converge.
- *   ordered controls   S3's applyOrderedControl, then the plain SQL control above (SQL's ordered controls are
- *                      buffered-only). Skipped on SQL only when S3 judged the control stale.
+ *   selection          S3, then SQL for its sessions per the fence.
+ *   reset              S3, then SQL: every session the fence deletes (per origin, pages of 2048) and any it
+ *                      stopped deleting during the rounds; then SQL resetUploadedSessions (its request record).
+ *                      Sessions only SQL owned are covered by the ownership backfill, a precondition of the
+ *                      fence-authority marker (the ingest role cannot read SQL ownership without a migration).
+ *   ordered controls   S3's applyOrderedControl, then the same reconcile (even when S3 judged it stale: S3 decides);
+ *                      a stale reset writes no SQL reset record.
  */
-export function withSqlControlMirror(s3: Ledger, sql: Pick<Ledger, "setSessionUploads" | "resetUploadedSessions">, store: ObjectStore, keyRoot: string): Ledger {
+export function withSqlControlMirror(s3: Ledger, sql: Pick<Ledger, "setSessionUploads" | "resetUploadedSessions">, store: ObjectStore, keyRoot: string, opts: { rounds?: number } = {}): Ledger {
   const io = s3LedgerObjects(store, keyRoot);
-  const mirrorReset = async (tenant: LedgerTenant, requestId: string) => {
-    const read = await io.readFence(io.keysFor(tenant).fence);
-    if (read.state === "present") {
-      for (const [originId, pairs] of Object.entries(read.fence.deleted)) {
-        for (let i = 0; i < pairs.length; i += 2048) await sql.setSessionUploads({ tenant, originId, sessions: pairs.slice(i, i + 2048), enabled: false });
+  const rounds = opts.rounds ?? 4;
+  const same = (a: FenceRead, b: FenceRead) => a.state === "absent" ? b.state === "absent"
+    : b.state === "present" && a.fence.instance === b.fence.instance && a.fence.version === b.fence.version;
+  async function reconcile(tenant: LedgerTenant, sessions: { originId: string; pair: [string, string] }[], everyDeleted: boolean): Promise<void> {
+    const key = io.keysFor(tenant).fence;
+    const touched = new Map(sessions.map((t) => [JSON.stringify([t.originId, ...t.pair]), t]));
+    let read = await io.readFence(key);
+    for (let round = 0; round < rounds; round++) {
+      const f = admissionView(read);
+      if (everyDeleted) for (const [originId, pairs] of Object.entries(f.deleted)) for (const pair of pairs) touched.set(JSON.stringify([originId, ...pair]), { originId, pair });
+      const groups = new Map<string, { originId: string; enabled: boolean; sessions: [string, string][] }>();
+      for (const { originId, pair } of touched.values()) {
+        const enabled = !isDeleted(f, originId, pair[0], pair[1]);
+        const g = groups.get(JSON.stringify([originId, enabled])) ?? { originId, enabled, sessions: [] };
+        g.sessions.push(pair);
+        groups.set(JSON.stringify([originId, enabled]), g);
       }
+      for (const g of groups.values())
+        for (let i = 0; i < g.sessions.length; i += 2048) await sql.setSessionUploads({ tenant, originId: g.originId, sessions: g.sessions.slice(i, i + 2048), enabled: g.enabled });
+      const again = await io.readFence(key);
+      if (same(read, again)) return;
+      read = again;
     }
-    await sql.resetUploadedSessions(tenant, requestId);
-  };
+    throw new LedgerUnavailableError("ledger_control_mirror_unstable");
+  }
+  const of = (originId: string, sessions: [string, string][]) => sessions.map((pair) => ({ originId, pair }));
   return {
     ...s3,
     async setSessionUploads(input) {
       await s3.setSessionUploads(input);
-      await sql.setSessionUploads(input);
+      await reconcile(input.tenant, of(input.originId, input.sessions), false);
     },
     async resetUploadedSessions(tenant, requestId) {
       const n = await s3.resetUploadedSessions(tenant, requestId);
-      await mirrorReset(tenant, requestId);
+      await reconcile(tenant, [], true);
+      await sql.resetUploadedSessions(tenant, requestId);
       return n;
     },
     async applyOrderedControl(input) {
       const r = await s3.applyOrderedControl!(input);
-      if (r.control.outcome !== "stale") {
-        if ("requestId" in input) await mirrorReset(input.tenant, input.requestId);
-        else await sql.setSessionUploads({ tenant: input.tenant, originId: input.originId, sessions: input.sessions, enabled: input.enabled });
-      }
+      if ("requestId" in input) {
+        await reconcile(input.tenant, [], true);
+        // SQL's request record only for a reset S3 applied (or replays): a stale one never resets in SQL.
+        if (r.control.outcome !== "stale") await sql.resetUploadedSessions(input.tenant, input.requestId);
+      } else await reconcile(input.tenant, of(input.originId, input.sessions), false);
       return r;
     },
   };

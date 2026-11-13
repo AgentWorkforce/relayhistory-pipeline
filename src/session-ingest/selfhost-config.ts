@@ -97,8 +97,9 @@
  *                                    ledger-s3.ts, no SQL for upload accounting). s3 refuses the per-session erase
  *                                    route, the operator erase runtime and INGEST_UPLOAD_CONSENT other than off.
  *                                    Until the read side moves, s3 controls also write SQL upload_deletions (S3
- *                                    first; ledger-s3.ts withSqlControlMirror). With HISTORY_UPLOAD_DIRECT on, no
- *                                    admission at all until the fence-authority marker exists (FenceAuthorityDoc).
+ *                                    first, reconciled to the fence; ledger-s3.ts withSqlControlMirror). No
+ *                                    admission on ANY path (sync, async, direct upload) until the fence-authority
+ *                                    marker exists (FenceAuthorityDoc).
  */
 import { UPLOAD_CONSENT_VAR, uploadConsentEnforcement, type UploadConsentEnforcement } from "./upload-consent.ts";
 import { INGEST_LEDGER_VAR, ingestLedgerMode } from "./ledger-s3.ts";

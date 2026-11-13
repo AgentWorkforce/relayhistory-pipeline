@@ -306,6 +306,18 @@ describe("buffered backlog drain (0005)", () => {
     expect((await readJson(store, late + DRAINED_SUFFIX)).outcome).toBe("drained");
   });
 
+  test("a reset begun but not finished (resetsCompleted < resets) skips the batch until it completes", async () => {
+    const store = await scratch();
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { received: "2030-01-04T00:00:00.000Z" });
+    // ledger-s3: a reset recorded while it runs (result null) does not advance resetsCompleted.
+    await putFence(store, { reset: { requestId: "q-running", atMs: Date.parse("2030-01-03T00:00:00.000Z"), result: null } });
+    const f = await currentFence(store);
+    expect(f.resetsCompleted).toBeLessThan(f.resets);
+    for (const dryRun of [true, false]) expect((await run(store, { dryRun })).objects.reset_in_flight).toBe(1);
+    expect(await exists(store, key + DRAINED_SUFFIX)).toBe(false);
+    expect((await canonical(store)).size).toBe(0);
+  });
+
   test("reset margin: batches within the margin of the last reset, either side, are skipped unmarked", async () => {
     const store = await scratch();
     const R = Date.parse("2030-01-03T00:00:00.000Z");
