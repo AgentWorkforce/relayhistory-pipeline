@@ -1,11 +1,11 @@
 /**
- * Dormant switch, fixed constants and pure validators for the exact-eight owner-buffered parity workflow
+ * Dormant switches, fixed constants and pure validators for owner-buffered parity recovery
  * (.github/workflows/owner-buffered-parity.yml, scripts/owner-buffered-parity-ci.ts,
  * scripts/owner-buffered-parity-github.ts; docs/owner-buffered-parity-ci.md).
  *
  * While OWNER_PARITY_WRITE_ENABLED is false, `write` refuses owner_parity_write_dormant before any
  * credential is read; `census`, `readback`, the one-time `discovery`, and its temporary count-only
- * `scope-diagnostic` (all read-only) are always allowed.
+ * discovery and bulk plan/readback (all read-only) are always allowed.
  * `discovery` runs only while the roster is empty and emits the digests for a separate roster PR. Enabling write is a
  * separate reviewed one-line PR. Tenant tuples are private and never appear here, in a workflow input,
  * log line or artifact: the committed roster holds only the operator's per-tenant digests
@@ -15,6 +15,8 @@
 import { createHash } from "node:crypto";
 
 export const OWNER_PARITY_WRITE_ENABLED: boolean = false;
+/** Bulk recovery is enabled by a separate reviewed one-line change only after a successful bound plan. */
+export const OWNER_PARITY_BULK_WRITE_ENABLED: boolean = false;
 
 /** The roster must name exactly this many tenant digests, and every one must be found on the target ledger. */
 export const OWNER_PARITY_EXACT_COUNT = 8;
@@ -31,21 +33,25 @@ export const OWNER_PARITY_RECEIPT_ARTIFACT = "owner-buffered-parity";
 export const OWNER_PARITY_RECEIPT_FILE_NAME = "owner-buffered-parity.json";
 
 /** The workflow's modes. The operator's `bulk` mode is deliberately absent and refused. */
-export const OWNER_PARITY_MODES = ["census", "write", "readback", "discovery", "scope-diagnostic"] as const;
+export const OWNER_PARITY_MODES = ["census", "write", "readback", "discovery",
+  "bulk-plan", "bulk-write", "bulk-readback"] as const;
 export type OwnerParityMode = (typeof OWNER_PARITY_MODES)[number];
 
 /**
  * Per-mode dispatch policy. `readOnly` selects the target session (only `write` gets a writable one) and
  * `roster` selects the roster rule: `fixed` is parseOwnerParityRoster (exactly eight digests), `empty` is
- * requireEmptyOwnerParityRoster (discovery and its temporary scope diagnostic refuse once a roster exists).
+ * requireEmptyOwnerParityRoster (discovery refuses once a roster exists), and `all` ignores the roster while
+ * the bounded bulk cursor enumerates every buffered owner.
  */
-export const OWNER_PARITY_MODE_POLICY: Readonly<Record<OwnerParityMode, { readOnly: boolean; roster: "fixed" | "empty" }>> =
+export const OWNER_PARITY_MODE_POLICY: Readonly<Record<OwnerParityMode, { readOnly: boolean; roster: "fixed" | "empty" | "all" }>> =
   Object.freeze({
     census: Object.freeze({ readOnly: true, roster: "fixed" as const }),
     write: Object.freeze({ readOnly: false, roster: "fixed" as const }),
     readback: Object.freeze({ readOnly: true, roster: "fixed" as const }),
     discovery: Object.freeze({ readOnly: true, roster: "empty" as const }),
-    "scope-diagnostic": Object.freeze({ readOnly: true, roster: "empty" as const }),
+    "bulk-plan": Object.freeze({ readOnly: true, roster: "all" as const }),
+    "bulk-write": Object.freeze({ readOnly: false, roster: "all" as const }),
+    "bulk-readback": Object.freeze({ readOnly: true, roster: "all" as const }),
   });
 export const OWNER_PARITY_CENSUS_SOURCES = ["frozen-supabase", "neon"] as const;
 export type OwnerParityCensusSource = (typeof OWNER_PARITY_CENSUS_SOURCES)[number];
@@ -57,6 +63,7 @@ export const OWNER_PARITY_DISCOVERY_CONTRACT = "owner-buffered-parity-discovery/
 /** Discovery receipt (retention 30 days): digests and dispositions only on success, counts only on refusal. */
 export const OWNER_PARITY_DISCOVERY_ARTIFACT = "owner-buffered-parity-discovery";
 export const OWNER_PARITY_DISCOVERY_FILE_NAME = "owner-buffered-parity-discovery.json";
+export const OWNER_PARITY_BULK_PLAN_CONTRACT = "owner-buffered-parity-bulk-plan/v1";
 
 const SHA40 = /^[0-9a-f]{40}$/u;
 const HEX64 = /^[0-9a-f]{64}$/u;
@@ -84,13 +91,14 @@ export interface OwnerParityDispatch {
 }
 
 /**
- * Workflow inputs (env OWNER_PARITY_*). Refuses anything but the five modes (so `bulk` is unreachable), a
+ * Workflow inputs (env OWNER_PARITY_*). Refuses anything but the reviewed fixed-roster/discovery/bulk modes, a
  * non-40-hex sha, an unknown census source, and, while dormant, `write` before any credential is read.
  * `enabled` exists only for the synthetic proof and tests; production callers never pass it.
  */
 export function ownerParityDispatch(
   env: Record<string, string | undefined>,
   enabled: boolean = OWNER_PARITY_WRITE_ENABLED,
+  bulkEnabled: boolean = OWNER_PARITY_BULK_WRITE_ENABLED,
 ): OwnerParityDispatch {
   const mode = env.OWNER_PARITY_MODE ?? "", sha = env.OWNER_PARITY_SHA ?? "",
     censusSource = env.OWNER_PARITY_CENSUS_SOURCE ?? "", censusRun = env.OWNER_PARITY_CENSUS_RUN ?? "",
@@ -100,13 +108,79 @@ export function ownerParityDispatch(
   if (!(OWNER_PARITY_CENSUS_SOURCES as readonly string[]).includes(censusSource))
     refuseOwnerParity("owner_parity_census_source");
   if (mode === "write" && enabled !== true) refuseOwnerParity("owner_parity_write_dormant");
-  if (mode === "write" ? !RUN_ID.test(censusRun) : censusRun !== "") refuseOwnerParity("owner_parity_census_run");
-  if (mode === "write" ? !confirmation.startsWith("WRITE-OWNER-PARITY ") : confirmation !== "")
+  if (mode === "bulk-write" && bulkEnabled !== true)
+    refuseOwnerParity("owner_parity_bulk_write_dormant");
+  const plannedWrite = mode === "write" || mode === "bulk-write";
+  if (plannedWrite ? !RUN_ID.test(censusRun) : censusRun !== "") refuseOwnerParity("owner_parity_census_run");
+  if (mode === "write" ? !confirmation.startsWith("WRITE-OWNER-PARITY ")
+    : mode === "bulk-write" ? !confirmation.startsWith("WRITE-OWNER-PARITY-BULK ") : confirmation !== "")
     refuseOwnerParity("owner_parity_confirmation");
   return {
     mode: mode as OwnerParityMode, sha, censusSource: censusSource as OwnerParityCensusSource,
-    censusRun: mode === "write" ? censusRun : null, confirmation,
+    censusRun: plannedWrite ? censusRun : null, confirmation,
   };
+}
+
+export interface OwnerParityBulkPlanBody {
+  contract: typeof OWNER_PARITY_BULK_PLAN_CONTRACT;
+  sourceSha: string;
+  generation: string;
+  censusSource: "neon";
+  capturedAt: string;
+  censusRun: string;
+  counts: { candidates: number; g1Equal: number; g1Mismatch: number; tenantRefused: number };
+}
+
+export interface OwnerParityBulkPlanArtifact extends OwnerParityBulkPlanBody { descriptorSha256: string }
+
+export function ownerParityBulkPlanDescriptor(body: OwnerParityBulkPlanBody): string {
+  const { descriptorSha256: _ignored, ...rest } = body as OwnerParityBulkPlanBody & { descriptorSha256?: unknown };
+  return createHash("sha256").update("owner-buffered-parity-bulk-plan-descriptor/v1\0")
+    .update(canonicalJson(rest)).digest("hex");
+}
+
+export function ownerParityBulkConfirmation(plan: OwnerParityBulkPlanArtifact): string {
+  return `WRITE-OWNER-PARITY-BULK ${plan.sourceSha} GENERATION ${plan.generation} SOURCE neon ` +
+    `DESCRIPTOR ${plan.descriptorSha256} PLAN ${plan.censusRun}`;
+}
+
+export function parseOwnerParityBulkPlan(value: unknown): OwnerParityBulkPlanArtifact {
+  if (value === null || typeof value !== "object" || Array.isArray(value))
+    refuseOwnerParity("owner_parity_bulk_plan_invalid");
+  const doc = value as Record<string, unknown>;
+  const keys = Object.keys(doc).sort().join(",");
+  const counts = doc.counts as Record<string, unknown> | null;
+  if (keys !== "capturedAt,censusRun,censusSource,contract,counts,descriptorSha256,generation,sourceSha" ||
+      doc.contract !== OWNER_PARITY_BULK_PLAN_CONTRACT || typeof doc.sourceSha !== "string" || !SHA40.test(doc.sourceSha) ||
+      typeof doc.generation !== "string" || !HEX64.test(doc.generation) || doc.censusSource !== "neon" ||
+      canonicalMs(doc.capturedAt) === null || typeof doc.censusRun !== "string" || !RUN_ID.test(doc.censusRun) ||
+      typeof doc.descriptorSha256 !== "string" || !HEX64.test(doc.descriptorSha256) ||
+      counts === null || typeof counts !== "object" || Array.isArray(counts) ||
+      Object.keys(counts).sort().join(",") !== "candidates,g1Equal,g1Mismatch,tenantRefused" ||
+      Object.values(counts).some((n) => typeof n !== "number" || !Number.isSafeInteger(n) || n < 0))
+    refuseOwnerParity("owner_parity_bulk_plan_invalid");
+  const artifact = doc as unknown as OwnerParityBulkPlanArtifact;
+  if (artifact.counts.candidates < 1 || artifact.counts.g1Equal !== artifact.counts.candidates ||
+      artifact.counts.g1Mismatch !== 0 || artifact.counts.tenantRefused !== 0)
+    refuseOwnerParity("owner_parity_bulk_plan_incomplete");
+  if (ownerParityBulkPlanDescriptor(artifact) !== artifact.descriptorSha256)
+    refuseOwnerParity("owner_parity_bulk_plan_descriptor");
+  return artifact;
+}
+
+export function verifyOwnerParityBulkWriteInputs(
+  dispatch: OwnerParityDispatch,
+  plan: OwnerParityBulkPlanArtifact,
+  now: number = Date.now(),
+): void {
+  if (dispatch.mode !== "bulk-write") refuseOwnerParity("owner_parity_inputs");
+  if (plan.sourceSha !== dispatch.sha) refuseOwnerParity("owner_parity_bulk_plan_sha_mismatch");
+  if (plan.censusRun !== dispatch.censusRun) refuseOwnerParity("owner_parity_bulk_plan_run_mismatch");
+  if (dispatch.censusSource !== "neon") refuseOwnerParity("owner_parity_bulk_source");
+  const captured = canonicalMs(plan.capturedAt)!;
+  if (captured > now || now - captured >= OWNER_PARITY_CENSUS_MAX_AGE_MS)
+    refuseOwnerParity("owner_parity_bulk_plan_stale");
+  if (dispatch.confirmation !== ownerParityBulkConfirmation(plan)) refuseOwnerParity("owner_parity_confirmation");
 }
 
 /**

@@ -54,7 +54,9 @@ import pg from "pg";
 import {
   PARITY_CENSUS_SOURCES,
   ParityCensusRefusal,
+  READ_OWNER_BUFFERED_PARITY_SQL,
   readParityCensus,
+  storedProof,
   validParityTenant,
   writeCurrentParityProof,
   type ParityCensusReceipt,
@@ -319,15 +321,31 @@ export interface BulkParityCounts {
   inserted: number;
   updated: number;
   unchanged: number;
+  missing: number;
+  stale: number;
+  verified: number;
 }
 
-export function bulkCompletionStatus(counts: BulkParityCounts): "complete" | "partial" {
-  return counts.g1Mismatch === 0 && counts.tenantRefused === 0 ? "complete" : "partial";
+export type BulkParityOperation = "plan" | "write" | "readback";
+
+export function bulkCompletionStatus(
+  counts: BulkParityCounts,
+  operation: BulkParityOperation = "write",
+): "complete" | "partial" {
+  if (counts.g1Mismatch !== 0 || counts.tenantRefused !== 0) return "partial";
+  if (operation === "write" &&
+      (counts.verified !== counts.candidates ||
+       counts.inserted + counts.updated + counts.unchanged !== counts.candidates)) return "partial";
+  if (operation === "readback" &&
+      (counts.missing !== 0 || counts.stale !== 0 || counts.verified !== counts.candidates)) return "partial";
+  return "complete";
 }
 
 export interface BulkParityDependencies {
   readCensus?: typeof readParityCensus;
   writeProof?: typeof writeCurrentParityProof;
+  /** Test seam only. Production always reads the committed row from the target after each write. */
+  readStoredProof?: (target: Queryable, tenant: ParityTenant) => Promise<ReturnType<typeof storedProof>>;
 }
 
 class BulkParityFatal extends OwnerBufferedOperatorRefusal {
@@ -336,7 +354,7 @@ class BulkParityFatal extends OwnerBufferedOperatorRefusal {
 
 function emptyBulkCounts(): BulkParityCounts {
   return { batches: 0, candidates: 0, g1Equal: 0, g1Mismatch: 0, tenantRefused: 0,
-    inserted: 0, updated: 0, unchanged: 0 };
+    inserted: 0, updated: 0, unchanged: 0, missing: 0, stale: 0, verified: 0 };
 }
 
 function bulkTenant(row: Record<string, unknown>): ParityTenant | null {
@@ -350,6 +368,22 @@ function bulkTenant(row: Record<string, unknown>): ParityTenant | null {
 function fatalGeneration(code: string): boolean {
   return code === "target_generation_mismatch" || code === "bulk_target_generation_mismatch" ||
     code === "target_generation_postcondition_failed";
+}
+
+function proofKey(proof: ReturnType<typeof storedProof>): string | null {
+  if (proof === null) return null;
+  return JSON.stringify([
+    proof.tenant.orgId, proof.tenant.workspaceId, proof.tenant.userId,
+    proof.controlEpoch, proof.privacyBaselineSha256, proof.explicitNoHead,
+    proof.head === null ? null : [proof.head.epoch, proof.head.version, proof.head.digest, proof.head.kind],
+    proof.deletionSetSha256, proof.resetSetSha256, proof.targetLineageDigest, proof.targetGeneration,
+  ]);
+}
+
+async function readStoredProof(target: Queryable, tenant: ParityTenant): Promise<ReturnType<typeof storedProof>> {
+  return storedProof(tenant, (await target.query<Record<string, unknown>>(
+    READ_OWNER_BUFFERED_PARITY_SQL, [tenant.orgId, tenant.workspaceId, tenant.userId],
+  )).rows[0]);
 }
 
 async function requireBulkGeneration(
@@ -375,6 +409,7 @@ export async function runBulkParity(
   batchSize: number,
   dependencies: BulkParityDependencies = {},
   censusSource: ParityCensusSource = "neon",
+  operation: BulkParityOperation = "write",
 ): Promise<BulkParityCounts> {
   if (!HEX64.test(expectedTargetGeneration) || !Number.isSafeInteger(batchSize) ||
       batchSize < 1 || batchSize > MAX_BULK_BATCH_SIZE)
@@ -382,6 +417,7 @@ export async function runBulkParity(
   const counts = emptyBulkCounts();
   const readCensus = dependencies.readCensus ?? readParityCensus;
   const writeProof = dependencies.writeProof ?? writeCurrentParityProof;
+  const readStored = dependencies.readStoredProof ?? readStoredProof;
   await requireBulkGeneration(targetOwner, expectedTargetGeneration, counts);
 
   await enumerator.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
@@ -413,12 +449,32 @@ export async function runBulkParity(
                 if (!generationMatches(g1, expectedTargetGeneration))
                   throw new BulkParityFatal("bulk_target_generation_mismatch", counts);
                 counts.g1Equal++;
-                const result = await writeProof(neon, targetOwner, tenant, expectedTargetGeneration, censusSource);
-                if (!generationMatches(result.census, expectedTargetGeneration))
-                  throw new BulkParityFatal("target_generation_postcondition_failed", counts);
-                if (result.outcome === "insert") counts.inserted++;
-                else if (result.outcome === "update") counts.updated++;
-                else counts.unchanged++;
+                if (operation === "write") {
+                  const result = await writeProof(neon, targetOwner, tenant, expectedTargetGeneration, censusSource);
+                  if (!generationMatches(result.census, expectedTargetGeneration))
+                    throw new BulkParityFatal("target_generation_postcondition_failed", counts);
+                  if (result.outcome === "insert") counts.inserted++;
+                  else if (result.outcome === "update") counts.updated++;
+                  else counts.unchanged++;
+                  // Unit tests that replace the writer must also opt into the storage seam to exercise readback.
+                  // Production supplies neither seam and always re-reads the committed target row.
+                  const stored = dependencies.writeProof !== undefined && dependencies.readStoredProof === undefined
+                    ? result.census.proof : await readStored(targetOwner, tenant);
+                  const after = await readCensus(neon, targetOwner, tenant, censusSource);
+                  if (!after.equal || !after.proof || proofKey(stored) !== proofKey(after.proof) ||
+                      proofKey(stored) !== proofKey(result.census.proof))
+                    throw new BulkParityFatal("bulk_proof_readback_mismatch", counts);
+                  counts.verified++;
+                } else if (operation === "readback") {
+                  const stored = await readStored(targetOwner, tenant);
+                  if (stored === null) {
+                    counts.missing++;
+                  } else {
+                    const after = await readCensus(neon, targetOwner, tenant, censusSource);
+                    if (after.equal && after.proof && proofKey(stored) === proofKey(after.proof)) counts.verified++;
+                    else counts.stale++;
+                  }
+                }
               }
             } catch (error) {
               if (error instanceof BulkParityFatal) throw error;

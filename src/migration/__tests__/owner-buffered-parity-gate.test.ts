@@ -16,13 +16,19 @@ import {
   OWNER_PARITY_ROSTER_FILE,
   OWNER_PARITY_WORKFLOW,
   OWNER_PARITY_WRITE_ENABLED,
+  OWNER_PARITY_BULK_PLAN_CONTRACT,
   keepRosterTenants,
+  ownerParityBulkConfirmation,
+  ownerParityBulkPlanDescriptor,
   ownerParityCensusDescriptor,
   ownerParityConfirmation,
   ownerParityDispatch,
   parseOwnerParityCensus,
+  parseOwnerParityBulkPlan,
   parseOwnerParityRoster,
   verifyOwnerParityWriteInputs,
+  verifyOwnerParityBulkWriteInputs,
+  type OwnerParityBulkPlanBody,
   type OwnerParityCensusArtifact,
   type OwnerParityCensusBody,
 } from "../owner-buffered-parity-ci-contract.ts";
@@ -44,6 +50,15 @@ function censusArtifact(over: Partial<OwnerParityCensusBody> = {}): OwnerParityC
   return { ...body, descriptorSha256: ownerParityCensusDescriptor(body) };
 }
 const phrase = ownerParityConfirmation(censusArtifact());
+
+function bulkPlan(over: Partial<OwnerParityBulkPlanBody> = {}) {
+  const body: OwnerParityBulkPlanBody = {
+    contract: OWNER_PARITY_BULK_PLAN_CONTRACT, sourceSha: sha, generation: G, censusSource: "neon",
+    capturedAt: "2026-11-13T00:00:00.000Z", censusRun,
+    counts: { candidates: 142, g1Equal: 142, g1Mismatch: 0, tenantRefused: 0 }, ...over,
+  };
+  return { ...body, descriptorSha256: ownerParityBulkPlanDescriptor(body) };
+}
 
 function githubFixture() {
   const actor = { id: P.dispatcher.id, login: P.dispatcher.login, type: "User" };
@@ -84,8 +99,8 @@ const context = {
 const env = (mode: string, extra: Record<string, string> = {}) =>
   ({ ...context, OWNER_PARITY_MODE: mode, OWNER_PARITY_SHA: sha, OWNER_PARITY_CENSUS_SOURCE: "frozen-supabase", ...extra });
 const writeEnv = env("write", { OWNER_PARITY_CENSUS_RUN: censusRun, OWNER_PARITY_CONFIRMATION: phrase });
-const gate = (e: Record<string, string>, f: Fixture, enabled = true, seen?: string[]) =>
-  code(() => ownerParityGithubGate(e, githubGet(f, seen), true, { enabled }));
+const gate = (e: Record<string, string>, f: Fixture, enabled = true, seen?: string[], bulkEnabled = false) =>
+  code(() => ownerParityGithubGate(e, githubGet(f, seen), true, { enabled, bulkEnabled }));
 
 test("dormant gate: write refuses before any GitHub read; read-only modes pass every gate", async () => {
   expect(OWNER_PARITY_WRITE_ENABLED).toBe(false);
@@ -103,13 +118,17 @@ test("dormant gate: write refuses before any GitHub read; read-only modes pass e
   expect(discoverySeen.some((path) => path.includes("/artifacts") || path.includes("/actions/runs/" + censusRun))).toBe(false);
   expect(await gate(env("discovery", { OWNER_PARITY_CENSUS_RUN: censusRun }), githubFixture())).toBe("owner_parity_census_run");
   expect(await gate(env("discovery", { OWNER_PARITY_CONFIRMATION: "x" }), githubFixture())).toBe("owner_parity_confirmation");
-  expect(await gate(env("scope-diagnostic"), githubFixture())).toBeNull();
+  expect(await gate(env("bulk-plan", { OWNER_PARITY_CENSUS_SOURCE: "neon" }), githubFixture())).toBeNull();
+  expect(await gate(env("bulk-readback", { OWNER_PARITY_CENSUS_SOURCE: "neon" }), githubFixture())).toBeNull();
+  expect(await gate(env("bulk-write", { OWNER_PARITY_CENSUS_SOURCE: "neon" }), githubFixture()))
+    .toBe("owner_parity_bulk_write_dormant");
   expect(await gate(writeEnv, githubFixture())).toBeNull();
 });
 
-test("only the four operator modes and temporary scope diagnostic are reachable; bulk refuses before GitHub", async () => {
-  expect([...OWNER_PARITY_MODES]).toEqual(["census", "write", "readback", "discovery", "scope-diagnostic"]);
-  for (const mode of ["bulk", "BULK", "census ", "", "renew", "Discovery", "discovery "]) {
+test("only the reviewed fixed-roster, discovery and bulk recovery modes are reachable", async () => {
+  expect([...OWNER_PARITY_MODES]).toEqual(["census", "write", "readback", "discovery",
+    "bulk-plan", "bulk-write", "bulk-readback"]);
+  for (const mode of ["bulk", "BULK", "census ", "", "renew", "Discovery", "discovery ", "scope-diagnostic"]) {
     const seen: string[] = [];
     expect(await gate(env(mode), githubFixture(), true, seen)).toBe("owner_parity_inputs");
     expect(seen).toEqual([]);
@@ -118,6 +137,17 @@ test("only the four operator modes and temporary scope diagnostic are reachable;
   expect(await gate(env("census", { OWNER_PARITY_CENSUS_SOURCE: "supabase" }), githubFixture())).toBe("owner_parity_census_source");
   expect(await gate(env("census", { OWNER_PARITY_CENSUS_RUN: censusRun }), githubFixture())).toBe("owner_parity_census_run");
   expect(await gate(env("readback", { OWNER_PARITY_CONFIRMATION: phrase }), githubFixture())).toBe("owner_parity_confirmation");
+});
+
+test("enabled bulk write requires the same-SHA successful plan run and exact typed phrase", async () => {
+  const plan = bulkPlan();
+  const bulkWrite = env("bulk-write", { OWNER_PARITY_CENSUS_SOURCE: "neon", OWNER_PARITY_CENSUS_RUN: censusRun,
+    OWNER_PARITY_CONFIRMATION: ownerParityBulkConfirmation(plan) });
+  expect(await gate(bulkWrite, githubFixture(), true, undefined, true)).toBeNull();
+  const seen: string[] = [];
+  expect(await gate({ ...bulkWrite, OWNER_PARITY_CONFIRMATION: ownerParityBulkConfirmation(plan) + " " },
+    githubFixture(), true, seen, true)).toBe("owner_parity_confirmation");
+  expect(seen).toEqual([]);
 });
 
 test("stale main, CI, attempt, dispatcher, census run, artifact, environment and approval refuse the gate", async () => {
@@ -246,6 +276,31 @@ test("census artifact: descriptor binds every field; substitution, age, sha, sou
   expect(verify(moved)).toBe("owner_parity_confirmation");
 });
 
+test("bulk plan binds the complete aggregate scope and typed write confirmation", () => {
+  const now = Date.parse("2026-11-13T01:00:00.000Z");
+  const plan = parseOwnerParityBulkPlan(bulkPlan());
+  const dispatch = ownerParityDispatch(env("bulk-write", {
+    OWNER_PARITY_CENSUS_SOURCE: "neon", OWNER_PARITY_CENSUS_RUN: censusRun,
+    OWNER_PARITY_CONFIRMATION: ownerParityBulkConfirmation(plan),
+  }), false, true);
+  expect(() => verifyOwnerParityBulkWriteInputs(dispatch, plan, now)).not.toThrow();
+  for (const counts of [
+    { candidates: 142, g1Equal: 141, g1Mismatch: 1, tenantRefused: 0 },
+    { candidates: 142, g1Equal: 141, g1Mismatch: 0, tenantRefused: 1 },
+    { candidates: 0, g1Equal: 0, g1Mismatch: 0, tenantRefused: 0 },
+  ]) expect(code(() => parseOwnerParityBulkPlan(bulkPlan({ counts })))).resolves.toBe("owner_parity_bulk_plan_incomplete");
+  const forged = bulkPlan();
+  forged.counts.candidates++;
+  expect(code(() => parseOwnerParityBulkPlan(forged))).resolves.toBe("owner_parity_bulk_plan_incomplete");
+  const descriptorForged = bulkPlan();
+  descriptorForged.capturedAt = "2026-11-13T00:00:01.000Z";
+  expect(code(() => parseOwnerParityBulkPlan(descriptorForged))).resolves
+    .toBe("owner_parity_bulk_plan_descriptor");
+  const wrong = bulkPlan({ sourceSha: "2".repeat(40) });
+  expect(code(() => verifyOwnerParityBulkWriteInputs(dispatch, wrong, now))).resolves
+    .toBe("owner_parity_bulk_plan_sha_mismatch");
+});
+
 test("workflow: two pinned secrets in one step, gate without environment, proof without secrets, census 1d and receipt 30d", () => {
   const workflow = readFileSync(OWNER_PARITY_WORKFLOW, "utf8");
   expect(workflow.match(/secrets\.[A-Z_]+/gu)).toEqual([
@@ -254,7 +309,7 @@ test("workflow: two pinned secrets in one step, gate without environment, proof 
   expect([...new Set(workflow.match(/OWNER_PARITY_NEON_[A-Z0-9_]+/gu) ?? [])])
     .toEqual(["OWNER_PARITY_NEON_READONLY_URL"]);
   expect(workflow.match(/vars\.[A-Za-z_]+/gu)).toBeNull();
-  expect(workflow).toContain("options: [census, write, readback, discovery, scope-diagnostic]");
+  expect(workflow).toContain("options: [census, write, readback, discovery, bulk-plan, bulk-write, bulk-readback]");
   expect(workflow).toContain("options: [frozen-supabase, neon]");
   expect(workflow).toContain("default: census\n");
   expect(workflow).toContain("default: frozen-supabase\n");
@@ -278,16 +333,16 @@ test("workflow: two pinned secrets in one step, gate without environment, proof 
   expect(workflow.indexOf("owner-buffered-parity-github.ts --approved")).toBeLessThan(workflow.indexOf("secrets.OWNER_PARITY_NEON_READONLY_URL"));
   expect(workflow.match(/persist-credentials: false/gu)?.length).toBe(3);
   expect(workflow.match(/uses: actions\/checkout@v4/gu)?.length).toBe(3);
-  const census = workflow.slice(workflow.indexOf("Publish the census artifact"), workflow.indexOf("Publish the sanitized receipt"));
+  const census = workflow.slice(workflow.indexOf("Publish the census or bulk plan artifact"), workflow.indexOf("Publish the sanitized receipt"));
   expect(census).toContain(`name: ${OWNER_PARITY_CENSUS_ARTIFACT}\n`);
   expect(census).toContain("retention-days: 1\n");
   const receipt = workflow.slice(workflow.indexOf("Publish the sanitized receipt"));
   expect(receipt).toContain("name: owner-buffered-parity\n");
   expect(receipt).toContain("retention-days: 30\n");
   // The step holding the secret runs the wrapper only; the URL never reaches argv.
-  const step = workflow.slice(workflow.indexOf("only step with the database secret"), workflow.indexOf("Publish the census artifact"));
+  const step = workflow.slice(workflow.indexOf("only step with the database secret"), workflow.indexOf("Publish the census or bulk plan artifact"));
   expect(step).toContain("run: bun scripts/owner-buffered-parity-ci.ts\n");
   expect(step).toContain("OWNER_PARITY_NEON_READONLY_URL: ${{ inputs.census_source == 'neon' && secrets.OWNER_PARITY_NEON_READONLY_URL || '' }}");
   expect(step).not.toMatch(/\$SUPABASE|\$\{SUPABASE|echo/u);
-  for (const forbidden of ["supabase login", "SET ROLE", "neonUrl", "bulk", P.project]) expect(workflow).not.toContain(forbidden);
+  for (const forbidden of ["supabase login", "SET ROLE", "neonUrl", P.project]) expect(workflow).not.toContain(forbidden);
 });

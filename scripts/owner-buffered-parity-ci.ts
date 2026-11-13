@@ -1,5 +1,5 @@
 /**
- * CI wrapper for .github/workflows/owner-buffered-parity.yml: the exact-eight owner-buffered parity census
+ * CI wrapper for .github/workflows/owner-buffered-parity.yml: fixed-roster parity plus bounded all-owner recovery
  * (G1), the dormant G2 write and the read-only readback (docs/owner-buffered-parity-ci.md).
  *
  * It adds no parity SQL. Tenants are enumerated with the operator's bulk cursor SQL
@@ -35,12 +35,14 @@ import {
   BULK_BUFFERED_TENANTS_SQL,
   BULK_CURSOR,
   BULK_TARGET_GENERATION_SQL,
+  bulkCompletionStatus,
   OwnerBufferedOperatorRefusal,
   connectNeon,
   generationMatches,
   operatorCredentialKeys,
   parseTenant,
   publicCensusReceipt,
+  runBulkParity,
   requireReadOnly,
   tenantSha256,
   validateCensusSourceInput,
@@ -61,6 +63,7 @@ import {
   writeCurrentParityProof,
   type ParityCensusSource,
   type ParityTenant,
+  type OwnerBufferedParityProof,
 } from "../src/migration/owner-buffered-parity.ts";
 import {
   CredentialRefusal,
@@ -81,19 +84,25 @@ import {
   OWNER_PARITY_RECEIPT_FILE_NAME,
   OWNER_PARITY_ROSTER_FILE,
   OWNER_PARITY_WRITE_ENABLED,
+  OWNER_PARITY_BULK_WRITE_ENABLED,
   OwnerParityCiRefusal,
   canonicalJson,
   emptyOwnerParityDiscoveryCounts,
   keepRosterTenants,
   ownerParityCensusDescriptor,
+  ownerParityBulkPlanDescriptor,
   ownerParityDispatch,
   parseOwnerParityCensus,
+  parseOwnerParityBulkPlan,
   parseOwnerParityDiscoveryReceipt,
   parseOwnerParityRoster,
   refuseOwnerParity,
   requireEmptyOwnerParityRoster,
   requireOwnerParityDiscoveryScope,
   verifyOwnerParityWriteInputs,
+  verifyOwnerParityBulkWriteInputs,
+  type OwnerParityBulkPlanArtifact,
+  type OwnerParityBulkPlanBody,
   type OwnerParityCensusArtifact,
   type OwnerParityCensusBody,
   type OwnerParityCensusEntry,
@@ -133,6 +142,7 @@ export interface OwnerParitySessions {
 export interface OwnerParityDependencies {
   readCensus?: typeof readParityCensus;
   writeProof?: typeof writeCurrentParityProof;
+  readStoredProof?: (target: Queryable, tenant: ParityTenant) => Promise<OwnerBufferedParityProof | null>;
 }
 
 export interface OwnerParityRunOptions {
@@ -145,6 +155,7 @@ export interface OwnerParityRunOptions {
   now?: () => number;
   /** Test/proof injection only. Production never passes it; the workflow cannot set it. */
   writeEnabled?: boolean;
+  bulkWriteEnabled?: boolean;
   deps?: OwnerParityDependencies;
 }
 
@@ -182,7 +193,7 @@ export interface OwnerParityReceipt {
 export interface OwnerParityOutcome {
   receipt: OwnerParityReceipt;
   /** census mode, all eight equal: the artifact to publish. */
-  census: OwnerParityCensusArtifact | null;
+  census: OwnerParityCensusArtifact | OwnerParityBulkPlanArtifact | null;
   exitCode: number;
 }
 
@@ -288,10 +299,10 @@ export async function withWorkflowParityOwnerSession<T>(
         const cleanup = /^\s*ROLLBACK\s*;?\s*$/iu.test(sql);
         if (!cleanup) {
           roleAudit(sql);
-          await requireWorkflowOwnerIdentity(target, identity.pid, readOnly);
+          await requireWorkflowOwnerIdentity(target, identity.pid, readOnly ? true : undefined);
         }
         const result = await target.query<R>(sql, params);
-        if (!cleanup) await requireWorkflowOwnerIdentity(target, identity.pid, readOnly);
+        if (!cleanup) await requireWorkflowOwnerIdentity(target, identity.pid, readOnly ? true : undefined);
         return result;
       },
     };
@@ -314,19 +325,28 @@ export function ownerParityPreflight(
   roster: unknown,
   census: unknown,
   enabled: boolean = OWNER_PARITY_WRITE_ENABLED,
+  bulkEnabled: boolean = OWNER_PARITY_BULK_WRITE_ENABLED,
   now: number = Date.now(),
-): { dispatch: OwnerParityDispatch; roster: string[]; census: OwnerParityCensusArtifact | null } {
-  const dispatch = ownerParityDispatch(env, enabled);
+): { dispatch: OwnerParityDispatch; roster: string[]; census: OwnerParityCensusArtifact | null;
+      bulkPlan: OwnerParityBulkPlanArtifact | null } {
+  const dispatch = ownerParityDispatch(env, enabled, bulkEnabled);
   if (OWNER_PARITY_MODE_POLICY[dispatch.mode].roster === "empty") {
-    // Discovery and its temporary count-only diagnostic need the empty roster and refuse once digests are listed.
+    // Discovery needs the empty roster and refuses once digests are listed.
     requireEmptyOwnerParityRoster(roster);
-    return { dispatch, roster: [], census: null };
+    return { dispatch, roster: [], census: null, bulkPlan: null };
+  }
+  if (OWNER_PARITY_MODE_POLICY[dispatch.mode].roster === "all") {
+    if (dispatch.censusSource !== "neon") refuseOwnerParity("owner_parity_bulk_source");
+    if (dispatch.mode !== "bulk-write") return { dispatch, roster: [], census: null, bulkPlan: null };
+    const plan = parseOwnerParityBulkPlan(census);
+    verifyOwnerParityBulkWriteInputs(dispatch, plan, now);
+    return { dispatch, roster: [], census: null, bulkPlan: plan };
   }
   const digests = parseOwnerParityRoster(roster);
-  if (dispatch.mode !== "write") return { dispatch, roster: digests, census: null };
+  if (dispatch.mode !== "write") return { dispatch, roster: digests, census: null, bulkPlan: null };
   const artifact = parseOwnerParityCensus(census);
   verifyOwnerParityWriteInputs(dispatch, artifact, digests, now);
-  return { dispatch, roster: digests, census: artifact };
+  return { dispatch, roster: digests, census: artifact, bulkPlan: null };
 }
 
 /** The live PASS marker generation; discovered, never an input. */
@@ -439,9 +459,10 @@ export async function runOwnerParity(
   });
   try {
     const pre = ownerParityPreflight(env, options.roster, options.census,
-      options.writeEnabled ?? OWNER_PARITY_WRITE_ENABLED, now());
+      options.writeEnabled ?? OWNER_PARITY_WRITE_ENABLED,
+      options.bulkWriteEnabled ?? OWNER_PARITY_BULK_WRITE_ENABLED, now());
     dispatch = pre.dispatch;
-    if (dispatch.mode === "discovery" || dispatch.mode === "scope-diagnostic")
+    if (dispatch.mode === "discovery" || dispatch.mode.startsWith("bulk-"))
       refuseOwnerParity("owner_parity_mode_route");
     counts.roster = pre.roster.length;
     for (const digest of pre.roster) statuses.set(digest, "not_attempted");
@@ -485,6 +506,101 @@ export async function runOwnerParity(
     }
     return { receipt: receipt("ok"), census: censusOut, exitCode: 0 };
   } catch (error) {
+    const refusalCode = ownerParityCode(error);
+    return { receipt: receipt("refused", refusalCode), census: null, exitCode: 1 };
+  }
+}
+
+function bulkPlanCounts(counts: import("./owner-buffered-parity-operator.ts").BulkParityCounts) {
+  return { candidates: counts.candidates, g1Equal: counts.g1Equal,
+    g1Mismatch: counts.g1Mismatch, tenantRefused: counts.tenantRefused };
+}
+
+function applyBulkCounts(target: OwnerParityCounts, source: import("./owner-buffered-parity-operator.ts").BulkParityCounts): void {
+  target.found = source.candidates;
+  target.equal = source.g1Equal;
+  target.mismatch = source.g1Mismatch + source.tenantRefused;
+  target.inserted = source.inserted;
+  target.updated = source.updated;
+  target.unchanged = source.unchanged;
+  target.missing = source.missing;
+  target.stale = source.stale;
+  target.verified = source.verified;
+}
+
+/** Aggregate-only all-buffered-owner recovery. No tenant tuple or digest reaches the receipt or plan artifact. */
+export async function runOwnerParityBulk(
+  env: Record<string, string | undefined>,
+  sessions: OwnerParitySessions,
+  options: OwnerParityRunOptions,
+): Promise<OwnerParityOutcome> {
+  const now = options.now ?? Date.now;
+  const counts = emptyCounts();
+  let dispatch: OwnerParityDispatch | null = null;
+  let generation: string | null = null;
+  const receipt = (status: OwnerParityReceipt["status"], code?: string): OwnerParityReceipt => ({
+    contract: OWNER_PARITY_RECEIPT_CONTRACT, status, ...(code === undefined ? {} : { code }),
+    mode: dispatch?.mode ?? "refused", runId: /^[1-9][0-9]{0,19}$/u.test(options.runId) ? options.runId : "0",
+    sourceSha: dispatch?.sha ?? null, generation, censusSource: dispatch?.censusSource ?? null, counts, tenants: [],
+    at: new Date(now()).toISOString(), credentialsPersisted: false,
+  });
+  try {
+    const pre = ownerParityPreflight(env, options.roster, options.census,
+      options.writeEnabled ?? OWNER_PARITY_WRITE_ENABLED,
+      options.bulkWriteEnabled ?? OWNER_PARITY_BULK_WRITE_ENABLED, now());
+    dispatch = pre.dispatch;
+    if (!dispatch.mode.startsWith("bulk-")) refuseOwnerParity("owner_parity_mode_route");
+    generation = await readLiveGeneration(sessions.target);
+    if (pre.bulkPlan && pre.bulkPlan.generation !== generation)
+      refuseOwnerParity("owner_parity_generation_mismatch");
+
+    if (dispatch.mode === "bulk-plan") {
+      const planned = await runBulkParity(sessions.source, sessions.enumerator, sessions.target,
+        generation, 25, options.deps, "neon", "plan");
+      applyBulkCounts(counts, planned);
+      if (bulkCompletionStatus(planned, "plan") !== "complete" || planned.candidates < 1)
+        return { receipt: receipt("mismatch"), census: null, exitCode: 3 };
+      const body: OwnerParityBulkPlanBody = {
+        contract: "owner-buffered-parity-bulk-plan/v1", sourceSha: dispatch.sha, generation,
+        censusSource: "neon", capturedAt: new Date(now()).toISOString(), censusRun: options.runId,
+        counts: bulkPlanCounts(planned),
+      };
+      return { receipt: receipt("ok"), census: { ...body, descriptorSha256: ownerParityBulkPlanDescriptor(body) }, exitCode: 0 };
+    }
+
+    if (dispatch.mode === "bulk-write") {
+      const currentPlan = await runBulkParity(sessions.source, sessions.enumerator, sessions.target,
+        generation, 25, options.deps, "neon", "plan");
+      if (canonicalJson(bulkPlanCounts(currentPlan)) !== canonicalJson(pre.bulkPlan!.counts))
+        refuseOwnerParity("owner_parity_bulk_plan_drift");
+      const written = await runBulkParity(sessions.source, sessions.enumerator, sessions.target,
+        generation, 25, options.deps, "neon", "write");
+      applyBulkCounts(counts, written);
+      if (bulkCompletionStatus(written, "write") !== "complete")
+        return { receipt: receipt("refused", "owner_parity_bulk_write_partial"), census: null, exitCode: 1 };
+      const checked = await runBulkParity(sessions.source, sessions.enumerator, sessions.target,
+        generation, 25, options.deps, "neon", "readback");
+      counts.found = checked.candidates;
+      counts.equal = checked.g1Equal;
+      counts.mismatch = checked.g1Mismatch + checked.tenantRefused;
+      counts.missing = checked.missing;
+      counts.stale = checked.stale;
+      counts.verified = checked.verified;
+      if (bulkCompletionStatus(checked, "readback") !== "complete")
+        return { receipt: receipt("refused", "owner_parity_bulk_readback_mismatch"), census: null, exitCode: 1 };
+      return { receipt: receipt("ok"), census: null, exitCode: 0 };
+    }
+
+    const checked = await runBulkParity(sessions.source, sessions.enumerator, sessions.target,
+      generation, 25, options.deps, "neon", "readback");
+    applyBulkCounts(counts, checked);
+    return bulkCompletionStatus(checked, "readback") === "complete"
+      ? { receipt: receipt("ok"), census: null, exitCode: 0 }
+      : { receipt: receipt("mismatch"), census: null, exitCode: 3 };
+  } catch (error) {
+    const partial = typeof error === "object" && error !== null && "counts" in error
+      ? (error as { counts?: import("./owner-buffered-parity-operator.ts").BulkParityCounts }).counts : undefined;
+    if (partial) applyBulkCounts(counts, partial);
     return { receipt: receipt("refused", ownerParityCode(error)), census: null, exitCode: 1 };
   }
 }
@@ -567,7 +683,6 @@ export async function discoverOwnersInSnapshot(
   counts: OwnerParityDiscoveryCounts,
   found: OwnerParityDiscoveryOwner[],
   deps: OwnerParityDiscoveryDependencies = {},
-  fullCountDiagnostic: boolean = false,
 ): Promise<void> {
   const readCensus = deps.readCensus ?? readParityCensus;
   const splitSource = censusSource === "neon";
@@ -600,13 +715,11 @@ export async function discoverOwnersInSnapshot(
         : g1.equal && g1.proof && canonicalJson(stored) === canonicalJson(g1.proof) ? "equal" : "stale";
       if (status === "equal") { counts.canonicalCurrent++; continue; }
       counts[status]++;
-      if (!fullCountDiagnostic) {
-        found.push({ tenantSha256: tenantSha256(tenant), disposition: status satisfies OwnerParityDisposition });
-        // Normal discovery fails fast: once the scope is wrong, stop paying four statements per remaining owner.
-        if (counts.missing + counts.stale > OWNER_PARITY_EXACT_COUNT) refuseOwnerParity("unexpected_scope");
-      }
+      found.push({ tenantSha256: tenantSha256(tenant), disposition: status satisfies OwnerParityDisposition });
+      // Discovery fails fast: once the scope is wrong, stop paying four statements per remaining owner.
+      if (counts.missing + counts.stale > OWNER_PARITY_EXACT_COUNT) refuseOwnerParity("unexpected_scope");
     }
-    if (!fullCountDiagnostic) requireOwnerParityDiscoveryScope(counts, found);
+    requireOwnerParityDiscoveryScope(counts, found);
     // The closing marker read, still in the snapshot: it can differ only if a read escaped the snapshot.
     if (generation !== await readLiveGeneration(snapshot)) refuseOwnerParity("generation_unstable");
     if (sourceTransactionOpen) {
@@ -629,8 +742,6 @@ export async function discoverOwnersInSnapshot(
  * generation B on the target, which must equal A (generation_unstable). Frozen source shares the target snapshot;
  * Neon uses its own caller-owned snapshot. The target session only answers the two external generation reads.
  * Exactly eight missing+stale owners or unexpected_scope; a refused receipt carries counts only, never digests.
- * The temporary scope-diagnostic mode classifies the complete bounded cursor without collecting digests and
- * always refuses owner_parity_scope_diagnostic after both generation fences, publishing aggregate counts only.
  */
 export async function runOwnerParityDiscovery(
   env: Record<string, string | undefined>,
@@ -653,14 +764,11 @@ export async function runOwnerParityDiscovery(
   try {
     const pre = ownerParityPreflight(env, options.roster, undefined);
     dispatch = pre.dispatch;
-    if (dispatch.mode !== "discovery" && dispatch.mode !== "scope-diagnostic")
-      refuseOwnerParity("owner_parity_mode_route");
-    const fullCountDiagnostic = dispatch.mode === "scope-diagnostic";
+    if (dispatch.mode !== "discovery") refuseOwnerParity("owner_parity_mode_route");
     generation = await readLiveGeneration(sessions.target);
     await discoverOwnersInSnapshot(sessions.enumerator, sessions.source, generation, dispatch.censusSource, counts,
-      found, options.deps, fullCountDiagnostic);
+      found, options.deps);
     if (await readLiveGeneration(sessions.target) !== generation) refuseOwnerParity("generation_unstable");
-    if (fullCountDiagnostic) refuseOwnerParity("owner_parity_scope_diagnostic");
     return { receipt: discoveryReceipt(), exitCode: 0 };
   } catch (error) {
     return { receipt: discoveryReceipt(ownerParityCode(error)), exitCode: 1 };
@@ -670,7 +778,7 @@ export async function runOwnerParityDiscovery(
 /** The generic receipt for a discovery run: aggregate counts only, never digests (those are in the discovery receipt). */
 export function discoveryRunReceipt(
   discovery: OwnerParityDiscoveryReceipt,
-  mode: "discovery" | "scope-diagnostic" = "discovery",
+  mode: "discovery" = "discovery",
 ): OwnerParityReceipt {
   return {
     contract: OWNER_PARITY_RECEIPT_CONTRACT, status: discovery.status, ...(discovery.code ? { code: discovery.code } : {}),
@@ -789,7 +897,7 @@ function readJson(path: string, code: string): unknown {
 function inputs(env: Record<string, string | undefined>) {
   const paths = outputPaths(env);
   const roster = readJson(join(ROOT, OWNER_PARITY_ROSTER_FILE), "roster_invalid");
-  const census = env.OWNER_PARITY_MODE === "write" && existsSync(paths.census)
+  const census = (env.OWNER_PARITY_MODE === "write" || env.OWNER_PARITY_MODE === "bulk-write") && existsSync(paths.census)
     ? readJson(paths.census, "owner_parity_census_invalid") : undefined;
   return { paths, roster, census };
 }
@@ -815,7 +923,7 @@ function writeRefused(env: Record<string, string | undefined>, paths: ReturnType
   const receipt = refusedReceipt(env, code);
   if (paths) {
     writePrivate(paths.receipt, receipt);
-    if (env.OWNER_PARITY_MODE === "discovery" || env.OWNER_PARITY_MODE === "scope-diagnostic")
+    if (env.OWNER_PARITY_MODE === "discovery")
       writePrivate(paths.discovery, refusedDiscoveryReceipt(env, code));
   }
   announce(receipt);
@@ -895,14 +1003,16 @@ async function operatorChild(): Promise<number> {
     pinnedPgConfig(supabaseUrl, "supabaseUrl", "supabase");
     const neonUrl = pre.dispatch.censusSource === "neon" ? sessionAffinityUrl(input.neonUrl, "neonUrl", "neon") : null;
     if (neonUrl !== null) pinnedPgConfig(neonUrl, "neonUrl", "neon");
-    // Only `write` has a writable target session; discovery and its diagnostic are read-only like census.
+    // Only the two write modes have a writable target session; every other mode is read-only.
     const write = !OWNER_PARITY_MODE_POLICY[pre.dispatch.mode].readOnly;
-    const discovery = pre.dispatch.mode === "discovery" || pre.dispatch.mode === "scope-diagnostic";
+    const discovery = pre.dispatch.mode === "discovery";
+    const bulk = pre.dispatch.mode.startsWith("bulk-");
     let discovered: OwnerParityDiscoveryOutcome | null = null;
     const work = async (sessions: OwnerParitySessions): Promise<OwnerParityOutcome> => {
+      if (bulk) return runOwnerParityBulk(env, sessions, { roster, census, runId: env.GITHUB_RUN_ID ?? "" });
       if (!discovery) return runOwnerParity(env, sessions, { roster, census, runId: env.GITHUB_RUN_ID ?? "" });
       discovered = await runOwnerParityDiscovery(env, sessions, { roster, runId: env.GITHUB_RUN_ID ?? "" });
-      return { receipt: discoveryRunReceipt(discovered.receipt, pre.dispatch.mode as "discovery" | "scope-diagnostic"),
+      return { receipt: discoveryRunReceipt(discovered.receipt),
         census: null, exitCode: discovered.exitCode };
     };
     const workflowClient = () => releaseClient(supabaseUrl) as ConnectedOwnerClient;
@@ -1018,6 +1128,16 @@ export async function ownerParityProof(): Promise<{ cases: ProofCase[]; failed: 
     .filter((line) => !line.startsWith("\\")).join("\n"));
   const lit = proofTenantLiteral;
   await template.exec(ownerParityProofSeedSql());
+  await template.exec(`CREATE TABLE sessions.delivery_cutover_control_heads(org_id text,workspace_id text,user_id text,epoch text,
+      version bigint,digest text,kind text,pending boolean);
+    CREATE TABLE sessions.deleted_upload_sessions(org_id text,workspace_id text,user_id text,origin_id text,source text,session_id text);
+    CREATE TABLE sessions.session_resets(org_id text,workspace_id text,user_id text,request_id text,deleted bigint);
+    CREATE FUNCTION sessions.delivery_cutover_status() RETURNS jsonb LANGUAGE sql STABLE AS $$
+      SELECT jsonb_build_object('phase','active','epoch','${H("1")}','privacyBaselineSha256','${H("2")}') $$;`);
+  for (const [i, tenant] of PROOF_TENANTS.entries()) await template.exec(`
+    INSERT INTO sessions.delivery_cutover_control_heads VALUES(${lit(tenant)},'${H("1")}',${i + 1},'${H("3")}','selection',false);
+    INSERT INTO sessions.deleted_upload_sessions VALUES(${lit(tenant)},'origin-${i}','claude','session-${i}');
+    INSERT INTO sessions.session_resets VALUES(${lit(tenant)},'request-${i}',1);`);
   const image = await template.dumpDataDir();
   await template.close();
 
@@ -1178,6 +1298,30 @@ export async function ownerParityProof(): Promise<{ cases: ProofCase[]; failed: 
       k.scanned === 9 && k.canonicalCurrent === 7 && k.missing === 2 && k.stale === 0, "scope " + JSON.stringify(outcome.receipt));
     assert(!JSON.stringify(outcome.receipt).includes("tenantSha256"), "digests on refusal");
   });
+  await check("bulk recovery: aggregate plan, dormant gate, all-owner write and independent readback", async () => {
+    const bulkBase = { OWNER_PARITY_SHA: PROOF_SHA, OWNER_PARITY_CENSUS_SOURCE: "neon" };
+    const planOutcome = await runOwnerParityBulk({ ...bulkBase, OWNER_PARITY_MODE: "bulk-plan" }, sessions(),
+      { roster: {}, runId: "501", now: () => T0 });
+    assert(planOutcome.exitCode === 0 && planOutcome.census !== null, "bulk plan");
+    const plan = planOutcome.census as OwnerParityBulkPlanArtifact;
+    assert(plan.counts.candidates === 9 && plan.counts.g1Equal === 9, "bulk plan counts");
+    const bulkWriteEnv = { ...bulkBase, OWNER_PARITY_MODE: "bulk-write", OWNER_PARITY_CENSUS_RUN: plan.censusRun,
+      OWNER_PARITY_CONFIRMATION: `WRITE-OWNER-PARITY-BULK ${plan.sourceSha} GENERATION ${plan.generation} ` +
+        `SOURCE neon DESCRIPTOR ${plan.descriptorSha256} PLAN ${plan.censusRun}` };
+    const dormant = await runOwnerParityBulk(bulkWriteEnv, sessions(),
+      { roster: {}, census: plan, runId: "502", now: () => T0 + 1 });
+    expectCode(dormant, "owner_parity_bulk_write_dormant");
+    const written = await runOwnerParityBulk(bulkWriteEnv, sessions(),
+      { roster: {}, census: plan, runId: "502", now: () => T0 + 1, bulkWriteEnabled: true });
+    assert(written.exitCode === 0 && written.receipt.counts.verified === 9 &&
+      written.receipt.counts.inserted + written.receipt.counts.updated + written.receipt.counts.unchanged === 9,
+    "bulk write/readback");
+    const readback = await runOwnerParityBulk({ ...bulkBase, OWNER_PARITY_MODE: "bulk-readback" }, sessions(),
+      { roster: {}, runId: "503" });
+    assert(readback.exitCode === 0 && readback.receipt.counts.verified === 9 &&
+      readback.receipt.counts.missing === 0 && readback.receipt.counts.stale === 0, "bulk readback");
+  });
+
   await Promise.all([source.close(), target.close(), enumeratorDb.close()]);
 
   await check("discovery: read-only snapshot on a fresh image finds exactly eight missing/stale owners and writes nothing", async () => {

@@ -9,8 +9,8 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && format('owner buffered
 # to roster_empty: it runs only while the roster is empty (roster_present otherwise), scans every buffered
 # owner in one read-only snapshot and publishes the digests and dispositions of exactly eight missing/stale
 # owners (generation_unstable, unexpected_scope refuse; counts only) for a separate reviewed roster-only PR.
-# Temporary scope-diagnostic uses the same read-only snapshots but classifies the full bounded cursor, collects
-# no digests and always refuses after publishing aggregate counts. Remove it after the recovery scope is measured.
+# Bulk plan/write/readback cover every buffered owner with aggregate-only artifacts. Bulk write remains dormant
+# behind OWNER_PARITY_BULK_WRITE_ENABLED and requires a fresh same-SHA bound plan.
 # Every dispatch needs Khaliq's own word to the production actor; see docs/owner-buffered-parity-ci.md.
 # Push and pull_request run only the synthetic PGlite proof job (no secrets, no environment).
 on:
@@ -18,7 +18,7 @@ on:
     inputs:
       mode:
         type: choice
-        options: [census, write, readback, discovery, scope-diagnostic]
+        options: [census, write, readback, discovery, bulk-plan, bulk-write, bulk-readback]
         default: census
         required: true
       sha:
@@ -26,11 +26,11 @@ on:
         type: string
         required: true
       census_run:
-        description: Write only - the successful census run id of this workflow at the same sha (under 24h old); empty otherwise
+        description: Write/bulk-write only - the successful census/bulk-plan run id at the same sha (under 24h old); empty otherwise
         type: string
         default: ""
       confirmation:
-        description: 'Write: WRITE-OWNER-PARITY <sha> GENERATION <gen> SOURCE <censusSource> DESCRIPTOR <descriptor> CENSUS <census_run>, from the census artifact. Census, readback and discovery: empty'
+        description: 'Write uses WRITE-OWNER-PARITY ... CENSUS <run>; bulk-write uses WRITE-OWNER-PARITY-BULK ... PLAN <run>. Read-only modes: empty'
         type: string
         default: ""
       census_source:
@@ -132,7 +132,7 @@ jobs:
   database:
     needs: prerequisite-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     environment:
       name: ${{ needs.prerequisite-gate.outputs.environment }}
     steps:
@@ -149,8 +149,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: bun scripts/owner-buffered-parity-github.ts --approved
-      - name: Download the census artifact (write only)
-        if: inputs.mode == 'write'
+      - name: Download the bound census or bulk plan artifact (write modes only)
+        if: inputs.mode == 'write' || inputs.mode == 'bulk-write'
         uses: actions/download-artifact@v4
         with:
           name: owner-buffered-parity-census
@@ -165,8 +165,8 @@ jobs:
           SUPABASE_MIGRATION_OWNER_URL: ${{ secrets.SUPABASE_MIGRATION_OWNER_URL }}
           OWNER_PARITY_NEON_READONLY_URL: ${{ inputs.census_source == 'neon' && secrets.OWNER_PARITY_NEON_READONLY_URL || '' }}
         run: bun scripts/owner-buffered-parity-ci.ts
-      - name: Publish the census artifact (census only)
-        if: inputs.mode == 'census'
+      - name: Publish the census or bulk plan artifact
+        if: inputs.mode == 'census' || inputs.mode == 'bulk-plan'
         uses: actions/upload-artifact@v4
         with:
           name: owner-buffered-parity-census
@@ -183,14 +183,14 @@ jobs:
           retention-days: 30
       # Discovery only: the sanitized discovery receipt (digests and dispositions on success, counts only on
       # refusal) for a separate reviewed roster-only PR. No credential; the summary step re-validates the file.
-      - name: Publish the discovery receipt (discovery and temporary scope diagnostic only)
-        if: always() && (inputs.mode == 'discovery' || inputs.mode == 'scope-diagnostic')
+      - name: Publish the discovery receipt (discovery only)
+        if: always() && inputs.mode == 'discovery'
         uses: actions/upload-artifact@v4
         with:
           name: owner-buffered-parity-discovery
           path: ${{ runner.temp }}/owner-parity-out/owner-buffered-parity-discovery.json
           if-no-files-found: ignore
           retention-days: 30
-      - name: Discovery job summary (discovery and temporary scope diagnostic only)
-        if: always() && (inputs.mode == 'discovery' || inputs.mode == 'scope-diagnostic')
+      - name: Discovery job summary (discovery only)
+        if: always() && inputs.mode == 'discovery'
         run: bun scripts/owner-buffered-parity-ci.ts --discovery-summary

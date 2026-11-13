@@ -317,27 +317,6 @@ test("discovery: stops after the ninth missing/stale owner instead of comparing 
   expectCountsOnly(out);
 });
 
-test("scope diagnostic classifies every owner, collects no digests and always refuses with aggregate counts", async () => {
-  const state = ["current", ...Array.from({ length: 11 }, () => "missing")] as Disposition[];
-  const x = world(state);
-  const calls: string[] = [];
-  const inner = x.deps.readCensus as (...a: unknown[]) => Promise<ParityCensusReceipt>;
-  const out = await runOwnerParityDiscovery(env("scope-diagnostic"), x.sessions, {
-    roster: emptyRoster, runId: "506", now: () => T0,
-    deps: { readCensus: ((...a: unknown[]) => { calls.push("call"); return inner(...a); }) as never },
-  });
-  expect(out.exitCode).toBe(1);
-  expect(out.receipt).toMatchObject({ status: "refused", code: "owner_parity_scope_diagnostic",
-    counts: { scanned: 12, canonicalCurrent: 1, missing: 11, stale: 0, unparsable: 0 }, owners: [] });
-  expect(calls.length).toBe(12);
-  expect(x.w.g1.length).toBe(12);
-  expect(x.w.statements.filter((s) => s.session === "enumerator").at(-1)!.sql).toBe("COMMIT");
-  expect(discoveryRunReceipt(out.receipt, "scope-diagnostic"))
-    .toMatchObject({ mode: "scope-diagnostic", status: "refused", code: "owner_parity_scope_diagnostic",
-      tenants: [], counts: { found: 12, equal: 1, missing: 11, stale: 0 } });
-  expectCountsOnly(out);
-});
-
 test("discovery: an unparsable buffered row refuses unexpected_scope even with eight missing/stale owners", async () => {
   const x = world(eight, { extraRows: [{ org_id: null, workspace_id: "w", user_id: "u" }] });
   const out = await discover(x);
@@ -391,14 +370,17 @@ test("discovery refuses roster_present for any non-empty roster and roster_inval
   }
 });
 
-test("mode dispatch table: write and bulk are unreachable from discovery; only write has a writable session", async () => {
-  expect([...OWNER_PARITY_MODES]).toEqual(["census", "write", "readback", "discovery", "scope-diagnostic"]);
+test("mode dispatch table: bulk recovery is explicit and only write modes have writable sessions", async () => {
+  expect([...OWNER_PARITY_MODES]).toEqual(["census", "write", "readback", "discovery",
+    "bulk-plan", "bulk-write", "bulk-readback"]);
   expect(Object.keys(OWNER_PARITY_MODE_POLICY).sort()).toEqual([...OWNER_PARITY_MODES].sort());
-  expect(OWNER_PARITY_MODES.filter((m) => !OWNER_PARITY_MODE_POLICY[m].readOnly)).toEqual(["write"]);
+  expect(OWNER_PARITY_MODES.filter((m) => !OWNER_PARITY_MODE_POLICY[m].readOnly)).toEqual(["write", "bulk-write"]);
   expect(OWNER_PARITY_MODE_POLICY.discovery).toEqual({ readOnly: true, roster: "empty" });
-  expect(OWNER_PARITY_MODE_POLICY["scope-diagnostic"]).toEqual({ readOnly: true, roster: "empty" });
+  expect(OWNER_PARITY_MODE_POLICY["bulk-plan"]).toEqual({ readOnly: true, roster: "all" });
+  expect(OWNER_PARITY_MODE_POLICY["bulk-write"]).toEqual({ readOnly: false, roster: "all" });
+  expect(OWNER_PARITY_MODE_POLICY["bulk-readback"]).toEqual({ readOnly: true, roster: "all" });
   expect(OWNER_PARITY_MODES.filter((m) => OWNER_PARITY_MODE_POLICY[m].roster === "empty"))
-    .toEqual(["discovery", "scope-diagnostic"]);
+    .toEqual(["discovery"]);
   expect(Object.isFrozen(OWNER_PARITY_MODE_POLICY) && Object.isFrozen(OWNER_PARITY_MODE_POLICY.discovery)).toBe(true);
   expect(OWNER_PARITY_WRITE_ENABLED).toBe(false);
   // Discovery takes no census run or confirmation, and passes no census artifact.
@@ -407,7 +389,6 @@ test("mode dispatch table: write and bulk are unreachable from discovery; only w
   expect(refusal(() => ownerParityDispatch(env("discovery", { OWNER_PARITY_CENSUS_RUN: "101" }), true))).toBe("owner_parity_census_run");
   expect(refusal(() => ownerParityDispatch(env("discovery", { OWNER_PARITY_CONFIRMATION: "WRITE-OWNER-PARITY" }), true))).toBe("owner_parity_confirmation");
   expect(ownerParityPreflight(env(), emptyRoster, { forged: "census" }, true)).toMatchObject({ roster: [], census: null });
-  expect(ownerParityDispatch(env("scope-diagnostic"), false)).toMatchObject({ mode: "scope-diagnostic", sha: SHA });
   // The discovery runner refuses every non-discovery mode (bulk, write even with the switch on) before a statement.
   for (const [mode, roster, code] of [["bulk", emptyRoster, "owner_parity_inputs"], ["BULK", emptyRoster, "owner_parity_inputs"],
     ["write", fullRoster, "owner_parity_write_dormant"], ["census", fullRoster, "owner_parity_mode_route"],
@@ -417,8 +398,8 @@ test("mode dispatch table: write and bulk are unreachable from discovery; only w
     expect(out.receipt.code).toBe(code);
     expect(x.w.statements).toEqual([]);
   }
-  // And the census/write/readback runner refuses both empty-roster modes before any statement.
-  for (const mode of ["discovery", "scope-diagnostic"]) {
+  // And the census/write/readback runner refuses the discovery mode before any statement.
+  for (const mode of ["discovery"]) {
     const x = world(eight);
     const out = await runOwnerParity(env(mode), x.sessions,
       { roster: emptyRoster, runId: "1", writeEnabled: true, deps: x.deps });
