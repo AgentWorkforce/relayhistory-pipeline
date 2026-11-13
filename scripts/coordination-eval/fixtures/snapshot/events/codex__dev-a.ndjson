@@ -1,0 +1,2 @@
+{"type":"session_meta","source":"codex","session_id":"dev-a","bounded_sample":false}
+{"type":"tool_call","timestamp":"2026-11-01T00:10:00.000Z","event_id":"dev-a-write","tool_name":"exec","status":"success","args_json":"{\"input\":\"const patch = \\\"*** Begin Patch\\\\n*** Add File: db/migrations/0042_alpha.sql\\\\n+invented\\\\n*** End Patch\\\"; await tools.apply_patch(patch);\"}","content_truncated":false}

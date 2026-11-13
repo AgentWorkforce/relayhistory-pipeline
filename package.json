@@ -17,6 +17,7 @@
   },
   "scripts": {
     "build": "bun run --filter @relayhistory/object-store build",
+    "coordination-eval": "bun run scripts/coordination-eval/cli.ts",
     "typecheck": "tsc --noEmit && bun run --filter @96bulls/pipeline typecheck && bun run --filter @relayhistory/object-store typecheck && bun run --filter @96bulls/session-read-worker typecheck && bun run --filter @96bulls/coordination-detect typecheck",
     "test": "bun test && bun test ./stacks && bun run --filter @96bulls/pipeline test && bun run --filter @relayhistory/object-store test && bun run --filter @96bulls/coordination-detect test",
     "up:local": "bun run bin/96bulls up local",

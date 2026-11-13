@@ -1,0 +1,11 @@
+{
+  "version": "fixture-1",
+  "incidents": {
+    "dev": ["fixture-dev-incident"],
+    "heldout": ["fixture-heldout-incident"]
+  },
+  "negatives": {
+    "dev": ["fixture-dev-negative"],
+    "heldout": []
+  }
+}

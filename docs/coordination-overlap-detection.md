@@ -119,6 +119,39 @@ This runs offline, with the customer's authorization. The automated steps narrow
 
 For 5,008 sessions, the harvest took about 108 minutes and roughly 1,600 requests.
 
+## Re-running the evaluation
+
+The repository harness verifies the frozen snapshot manifest, maps its retained
+lane, write, commit, outcome, branch and parent evidence into the detector input
+shape used by the read API, runs
+`outcome-facts` (T1, T2 and T3) and the selectable `shared-write-60m` baseline,
+then scores development and held-out labels separately:
+
+```sh
+bun run coordination-eval \
+  --snapshot /path/to/snapshot-v2 \
+  --truth /path/to/truth-v1/split.json \
+  --projection snapshot \
+  --out /path/to/private-output
+```
+
+`report.json` and `report.md` are deterministic: they include the verified input
+hashes, repository SHA and detector parameter hashes, but no run timestamp or
+measured duration. The command prints wall-clock runtime to stderr so two runs
+produce byte-identical report files. Reports contain aggregate scores and incident
+IDs, never transcript or session text.
+
+`--projection snapshot` uses the frozen snapshot's derived write paths.
+`--projection current` instead passes retained raw tool inputs through the current
+relayhistory projection, including Codex code-mode `apply_patch` and Claude
+`MultiEdit`; it never falls back to stored `files_written`. If a frozen snapshot
+contains only `command_or_target` text capped at 600 characters and lacks complete `args_json`, the
+report is marked `projection_unavailable` and names that evidence gap precisely.
+
+Proposed cadence: run this evaluation every Monday over the trailing 14 days.
+That schedule is only a proposal. Khaliq must approve retention for each rolling
+harvest and designate who labels newly discovered incidents before it is adopted.
+
 ## Next steps that would raise recall
 
 - **Normalized tool-call facts:** `git revert`, reset, force push and rebase, and `gh` PR and CI refs, so T2-style evidence exists without forge access. Estimated 3 to 5 days, and it needs a schema decision.
