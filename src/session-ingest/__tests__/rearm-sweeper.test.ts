@@ -498,6 +498,75 @@ describe("re-arm sweeper: follow-ups (unstamped stubs, progress, bounded scans)"
   });
 });
 
+describe("re-arm sweeper: #596 review notes", () => {
+  const ownerKey = (tenant: LedgerTenant = TENANT, sessionId = "sess-1") => s3LedgerKeys(ROOT, tenant).owner(ORIGIN, "claude", sessionId);
+  const unstamp = async (store: ObjectStore, tenant: LedgerTenant = TENANT) => {
+    const { machineId: _, ...legacy } = JSON.parse(await text(store, ownerKey(tenant)));
+    await put(store, ownerKey(tenant), JSON.stringify(legacy));
+  };
+  const manifestOf = (userId: string, sessionId = "sess-1") => JSON.stringify({ extensions: { "96bulls": { user_id: userId, canonical_session_id: sessionId } } });
+
+  test("a stamp that fails (corrupt stub) still leaves the marker: the commit fails AFTER it, and the marker names the raw workspace", async () => {
+    const store = fresh();
+    const ledger = ledgerOn(store);
+    const input = claimInput(TENANT, "b1", [rec("r-b1", 1)]);
+    const c = await ledger.claim(input);
+    if (c.kind !== "claimed") throw new Error("unexpected");
+    await ledger.setSessionUploads(selection(TENANT, false));
+    await put(store, ownerKey(), "{corrupt stub");
+    await expect(ledger.commit({ tenant: TENANT, originId: ORIGIN, batchId: "b1", batchDigest: input.batchDigest, claimToken: c.claimToken, sessions: input.sessions,
+      records: input.records, machineId: machineOf(TENANT) })).rejects.toMatchObject({ code: "ledger_owner_invalid" });
+    const marker = s3LedgerKeys(ROOT, TENANT).rearm(ORIGIN, "claude", "sess-1");
+    expect(JSON.parse(await text(store, marker))).toMatchObject({ v: 1, sessionId: "sess-1", machineId: machineOf(TENANT), workspaceId: TENANT.workspaceId });
+  });
+
+  test("`empty` is version-aware: a delete marker over an old version under the machine is not empty (unbound, nothing recorded)", async () => {
+    const store = fresh();
+    const marker = await rearmed(store, TENANT, "b1");
+    await unstamp(store);
+    // No CURRENT object of the session (a plain list sees nothing), but the versioned bucket still holds an old
+    // version of its manifest behind a delete marker.
+    const [manifestKey] = canonical(TENANT);
+    const hidden = [
+      { key: manifestKey!, versionId: "v-delete-marker", latest: true, deleteMarker: true, lastModified: Date.now() },
+      { key: manifestKey!, versionId: "v-old", latest: false, deleteMarker: false, lastModified: Date.now() - 1000 },
+    ];
+    const inner = storeEraser(store);
+    const versioned: PagedEraser = {
+      ...inner,
+      async verifyErased(prefix, o) {
+        const left = hidden.filter((v) => v.key.startsWith(prefix) && (o.exactKey === undefined || v.key === o.exactKey) && (!o.select || o.select(v)));
+        return left.length ? { status: "pending", reason: "remaining", remaining: left.length, listed: left.length } : inner.verifyErased(prefix, o);
+      },
+    };
+    expect((await sweep(store, {}, versioned)).counts).toMatchObject({ machineUnbound: 1, emptyUnbound: 0 });
+    expect(await doneOf(store, marker)).toBeNull();
+  });
+
+  test("a workspace id layoutComponent rewrites: the machine is derived with the marker's RAW workspace id (legacy markers without it stay unbound)", async () => {
+    const store = fresh();
+    const raw = { orgId: "org-a", workspaceId: "ws:x", userId: "user-1" }; // its ws= segment is ws_x
+    const physical = { ...raw, workspaceId: "ws_x" };
+    const marker = await rearmed(store, raw, "b1");
+    await unstamp(store, raw);
+    const files = canonical(physical, "sess-1", machineOf(raw));
+    await put(store, files[0]!, manifestOf(raw.userId));
+    await seed(store, files.slice(1));
+    // A legacy marker (no workspaceId): the segment is not the raw id, so the hashes cannot match.
+    const written = JSON.parse(await text(store, marker));
+    const { workspaceId: _, ...legacy } = written;
+    await put(store, marker, JSON.stringify(legacy));
+    expect((await sweep(store)).counts).toMatchObject({ machineUnbound: 1, erased: 0 });
+    // A wrong raw id is never trusted: it does not reproduce the hashes.
+    await put(store, marker, JSON.stringify({ ...written, workspaceId: "ws/x" }));
+    expect((await sweep(store)).counts).toMatchObject({ machineUnbound: 1, erased: 0 });
+    for (const k of files) expect(await exists(store, k)).toBe(true);
+    await put(store, marker, JSON.stringify(written));
+    expect((await sweep(store)).counts).toMatchObject({ machineDerived: 1, erased: 1 });
+    for (const k of files) expect(await exists(store, k)).toBe(false);
+  });
+});
+
 const ENTRY_ENV = { INGEST_REARM_SWEEPER_ENABLED: "true", INGEST_REARM_BUCKET: "transcripts", INGEST_REARM_REGION: "us-east-1", INGEST_REARM_CREDENTIALS: "keys",
   INGEST_REARM_S3_ACCESS_KEY_ID: "test-access-key-id", INGEST_REARM_S3_SECRET_ACCESS_KEY: "test-only-secret" };
 

@@ -210,8 +210,11 @@ export interface IndexDoc { v: 1; originId: string; shard: string; records: Reco
  * A re-arm marker: "this session's canonical objects may hold data written after its erasure; erase it again".
  * `machineId` is the writer's machine (writer.ts liveMachineId of the user's workspace and origin), which with the
  * marker's own admission directory (org, workspace) names exactly the canonical prefix the commit wrote.
+ * `workspaceId`: the tenant's RAW workspace id (the path's `ws=` is its lossy layoutComponent), written by every commit
+ * since the sweeper derives unstamped machines; absent on older markers. Never trusted alone: the sweeper uses it only
+ * when it reproduces the marker's admission directory and machine (rearm-sweeper.ts derivedMachine).
  */
-export interface RearmDoc { v: 1; originId: string; source: string; sessionId: string; machineId: string; atMs: number }
+export interface RearmDoc { v: 1; originId: string; source: string; sessionId: string; machineId: string; atMs: number; workspaceId?: string }
 /**
  * The ownership stub (ingest_session_ownership): the OLDEST generation this session was claimed under at its current epoch.
  * `machineId`: the claiming user's writer machine (writer.ts liveMachineId of the tenant's workspace and this origin),
@@ -304,8 +307,9 @@ export function validOwner(v: unknown): v is OwnerDoc {
     && (v.machineId === undefined || (typeof v.machineId === "string" && /^srv_[0-9a-f]{32}$/.test(v.machineId)));
 }
 export function validRearm(v: unknown): v is RearmDoc {
-  return isObject(v) && exactKeys(v, ["v", "originId", "source", "sessionId", "machineId", "atMs"]) && v.v === 1 && mapKey(v.originId) && str(v.source) && str(v.sessionId)
-    && typeof v.machineId === "string" && /^srv_[0-9a-f]{32}$/.test(v.machineId) && count(v.atMs);
+  const base = ["v", "originId", "source", "sessionId", "machineId", "atMs"];
+  return isObject(v) && (exactKeys(v, base) || (exactKeys(v, [...base, "workspaceId"]) && typeof v.workspaceId === "string")) && v.v === 1 && mapKey(v.originId)
+    && str(v.source) && str(v.sessionId) && typeof v.machineId === "string" && /^srv_[0-9a-f]{32}$/.test(v.machineId) && count(v.atMs);
 }
 /** True when `key` is where ledger-s3 writes `doc`'s marker (its origin hash and session key), under `dir`. */
 export function rearmKeyMatches(dir: string, key: string, doc: RearmDoc): boolean {
@@ -657,7 +661,7 @@ export function s3LedgerObjects(store: ObjectStore, keyRoot: string, opts: Omit<
    * content is replaced (If-Match) with a strictly later `atMs`, which is a new content hash the sweeper has no
    * completion for. Re-arming one the sweeper has not reached yet costs one extra erase pass, never a lost one.
    */
-  async function writeRearm(key: string, marker: { originId: string; source: string; sessionId: string; machineId: string }): Promise<void> {
+  async function writeRearm(key: string, marker: { originId: string; source: string; sessionId: string; machineId: string; workspaceId?: string }): Promise<void> {
     for (let attempt = 0; attempt < attempts; attempt++) {
       let got: { doc: RearmDoc; version: ObjectVersion } | null;
       try {
@@ -1046,16 +1050,18 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
           || fenceEpoch(fence, input.originId, sessionKeyHash(s, id)) !== snapshot.epochs[sessionKeyHash(s, id)]);
         return { fence, fenced, deleted };
       };
-      // Stamp the ownership stub's machine BEFORE the marker: the sweeper erases only a marker its stub binds, and claims
-      // skip deleted sessions, so this commit is the last writer that knows the tenant. `input.machineId` was checked
-      // against the tenant above. The stub keeps its generation (registerOwner); one missing is written at the claim's.
-      // Distinct raw workspace ids never share a stub (admissionUserDir hashes the RAW id), so a machine conflict here
-      // is a corrupt or forged stub: registerOwner refuses it (`ledger_owner_invalid`, the commit retries).
+      // The marker FIRST, so data this commit wrote is always re-erased: then stamp the ownership stub's machine (claims
+      // skip deleted sessions, so this commit is the last writer that knows the tenant). A stamp that fails (a corrupt
+      // stub, contention) fails the commit AFTER the marker stands; the sweeper derives an unstamped stub's machine
+      // (rearm-sweeper.ts derivedMachine). `input.machineId` was checked against the tenant above. The stub keeps its
+      // generation (registerOwner); one missing is written at the claim's. Distinct raw workspace ids never share a stub
+      // (admissionUserDir hashes the RAW id), so a machine conflict here is a corrupt or forged stub, which it refuses.
       const rearm = (list: [string, string][]) => mapLimit(list, PARALLEL, async ([s, id]) => {
         const sk = sessionKeyHash(s, id);
+        await writeRearm(keys.rearm(input.originId, s, id), { originId: input.originId, source: s, sessionId: id, machineId: input.machineId,
+          workspaceId: input.tenant.workspaceId });
         await registerOwner(keys.owner(input.originId, s, id), { v: 1, originId: input.originId, source: s, sessionId: id,
           epoch: snapshot.epochs[sk]!, resets: snapshot.resets, machineId: input.machineId });
-        await writeRearm(keys.rearm(input.originId, s, id), { originId: input.originId, source: s, sessionId: id, machineId: input.machineId });
       });
 
       // 1. The fence, and re-arm markers for what it reached, BEFORE any index merge.
