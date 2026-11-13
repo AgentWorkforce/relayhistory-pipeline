@@ -95,6 +95,20 @@ describe("preserve the deployed Reader profile", () => {
     await expect(resolveProfile(env, template, get(withBinding({ name: "FIXTURE_QUEUE", type: "queue" })))).rejects.toThrow(/cannot compare live binding FIXTURE_QUEUE/);
     await expect(resolveProfile(env, template, get(withBinding({ name: "CLICKHOUSE_DATABASE", type: "secret_text" })))).rejects.toThrow(/replacing secret binding CLICKHOUSE_DATABASE/);
   });
+  test("brief_summary / list_short_summary: off renders no var, on is the exact \"true\" --var, and a dispatch never silently drops a live one", async () => {
+    for (const [key, name] of [["BRIEF_SUMMARY", "READ_API_BRIEF_SUMMARY_ENABLED"], ["LIST_SHORT_SUMMARY", "READ_API_LIST_SHORT_SUMMARY_ENABLED"]] as const) {
+      // Not live and off (the default dispatch, or no input): unchanged.
+      for (const flag of [undefined, "", "off"]) await expect(resolveProfile({ ...env, [key]: flag }, template, get()), `${key}=${flag}`).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+      // Not live and on: a new variable, not a collateral change.
+      await expect(resolveProfile({ ...env, [key]: "on" }, template, get())).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+      // Live "true": repeating on keeps it; off would drop it, so profile/preserve refuses.
+      const live = get(version({ ...values, [name]: "true" }));
+      await expect(resolveProfile({ ...env, [key]: "on" }, template, live)).resolves.toHaveProperty("OWNER_BUFFERED", "on");
+      for (const flag of [undefined, "off"]) await expect(resolveProfile({ ...env, [key]: flag }, template, live), `${key}=${flag}`).rejects.toThrow(new RegExp(`change or drop live setting ${name}`));
+      // Only off/on are inputs; nothing else is passed through as a value.
+      for (const bad of ["true", "1", "ON", " on", "yes"]) await expect(resolveProfile({ ...env, [key]: bad }, template, get()), `${key}=${bad}`).rejects.toThrow(/must be off or on/);
+    }
+  });
   test("default deploy accepts unchanged unrelated variables and checks the real CLI overrides", async () => {
     const base = ts.parseConfigFileTextToJson("base.jsonc", template).config;
     await expect(resolveProfile(env, template, get(version({ ...values, CLICKHOUSE_DATABASE: base.vars.CLICKHOUSE_DATABASE })))).resolves.toHaveProperty("OWNER_BUFFERED", "on");
