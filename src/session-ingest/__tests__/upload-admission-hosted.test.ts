@@ -20,7 +20,9 @@ const code = (f: () => unknown) => { try { f(); } catch (e) { return (e as Uploa
 
 describe("hostedUploadAdmissionConfig", () => {
   it("reads the stack's environment", () => {
-    expect(hostedUploadAdmissionConfig(env)).toEqual({ region: "us-east-1", bucket: env.UPLOAD_ADMISSION_BUCKET, keyRoot: "96bulls", secretId: env.UPLOAD_ADMISSION_SECRET_ID });
+    expect(hostedUploadAdmissionConfig(env)).toEqual({ region: "us-east-1", bucket: env.UPLOAD_ADMISSION_BUCKET, keyRoot: "96bulls", secretId: env.UPLOAD_ADMISSION_SECRET_ID, ledgerParallel: 32 });
+    expect(hostedUploadAdmissionConfig({ ...env, INGEST_LEDGER_PARALLEL: "8" }).ledgerParallel).toBe(8);
+    for (const bad of ["0", "65", "08", "1.5", "x", " 8", "-1"]) expect(code(() => hostedUploadAdmissionConfig({ ...env, INGEST_LEDGER_PARALLEL: bad }))).toBe("ledger_parallel_invalid");
     expect(hostedUploadAdmissionConfig({ ...env, INGEST_ACCEPTANCE_MODE: "canonical", INGEST_UPLOAD_CONSENT: "off", INGEST_REPLICA_MODE: "off" }).keyRoot).toBe("96bulls");
   });
 

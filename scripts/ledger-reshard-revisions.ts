@@ -3,9 +3,13 @@
  *
  *   bun scripts/ledger-reshard-revisions.ts --bucket <name> [--region us-west-2] [--org <orgId> ...] [--key-root 96bulls]
  *   bun scripts/ledger-reshard-revisions.ts --execute --kms-key-arn <arn> --bucket <name> [--org <orgId> ...]
+ *   bun scripts/ledger-reshard-revisions.ts --verify --bucket <name> [--org <orgId> ...]
  *
  * Dry run by default (lists and reads only). --execute merges each legacy entry into the new layout under the user's
  * current fence (idempotent; safe to rerun and to run while admissions run). Legacy shards are never deleted.
+ * --verify (read-only) reads every legacy entry back from the new layout and exits 0 only with `verify_passed: true`
+ * (missing, invalid and failed all zero). Only then may the operator add `"revisionLayout":"4096"` to that org's
+ * fence-authority marker; admission and the drain refuse the org until the marker has it.
  * AWS_* credentials in the environment. Prints one JSON summary per org: counts only, never keys or ids.
  */
 import { parseArgs } from "node:util";
@@ -19,15 +23,15 @@ if (import.meta.main) {
   try {
     ({ values } = parseArgs({ options: {
       bucket: { type: "string" }, region: { type: "string", default: "us-east-1" }, org: { type: "string", multiple: true },
-      "key-root": { type: "string", default: "96bulls" }, execute: { type: "boolean", default: false }, "kms-key-arn": { type: "string" },
+      "key-root": { type: "string", default: "96bulls" }, execute: { type: "boolean", default: false }, verify: { type: "boolean", default: false }, "kms-key-arn": { type: "string" },
       concurrency: { type: "string", default: "8" },
     } }));
   } catch {
     values = undefined;
   }
   const kms = values?.["kms-key-arn"];
-  if (!values?.bucket || (values.execute && !kms?.startsWith("arn:aws:kms:")) || (values.org ?? []).some((o) => !ORG.test(o)) || !/^[a-z0-9_.-]{1,64}$/.test(values["key-root"]!)) {
-    console.error("usage: --bucket <name> [--region r] [--org <orgId> ...] [--key-root 96bulls] [--concurrency 8] [--execute --kms-key-arn <arn>]; dry run unless --execute; AWS_* credentials in the environment");
+  if (!values?.bucket || (values.execute && values.verify) || (values.execute && !kms?.startsWith("arn:aws:kms:")) || (values.org ?? []).some((o) => !ORG.test(o)) || !/^[a-z0-9_.-]{1,64}$/.test(values["key-root"]!)) {
+    console.error("usage: --bucket <name> [--region r] [--org <orgId> ...] [--key-root 96bulls] [--concurrency 8] [--execute --kms-key-arn <arn> | --verify]; dry run unless --execute; AWS_* credentials in the environment");
     process.exit(2);
   }
   const accessKeyId = process.env.AWS_ACCESS_KEY_ID, secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
@@ -45,9 +49,11 @@ if (import.meta.main) {
   let failed = false;
   for (const [i, prefix] of prefixes.entries()) {
     try {
-      const summary = await reshardRevisions(store, keyRoot, { prefix, execute: values.execute!, concurrency: Number(values.concurrency) });
-      process.stdout.write(JSON.stringify({ org_index: i, mode: values.execute ? "execute" : "dry_run", ...summary }) + "\n");
-      if (summary.failed > 0 || summary.invalid > 0) failed = true;
+      const summary = await reshardRevisions(store, keyRoot, { prefix, execute: values.execute!, verify: values.verify!, concurrency: Number(values.concurrency) });
+      const clean = summary.failed === 0 && summary.invalid === 0 && summary.missing === 0;
+      const mode = values.execute ? "execute" : values.verify ? "verify" : "dry_run";
+      process.stdout.write(JSON.stringify({ org_index: i, mode, ...summary, ...(values.verify ? { verify_passed: clean } : {}) }) + "\n");
+      if (!clean) failed = true;
     } catch (error) {
       const m = (error as Error)?.message;
       process.stdout.write(JSON.stringify({ org_index: i, refused: typeof m === "string" && /^[a-z0-9_]{1,64}$/.test(m) ? m : "internal_error" }) + "\n");

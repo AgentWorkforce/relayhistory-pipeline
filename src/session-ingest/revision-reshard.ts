@@ -13,12 +13,18 @@
  * written) is never carried over. So it is idempotent, safe to rerun, and safe while admissions run (their merges and
  * these commute). Legacy shards are never deleted or changed (nothing in the S3 ledger is deleted).
  *
+ * Verify (`verify: true`, read-only) reads every legacy entry back from the new layout: it passes when each one is
+ * present there at an equal or higher revision (or a newer generation of the same session), or is one the user's
+ * current fence has forgotten (never carried over). Only a verify with `missing`, `invalid` and `failed` all zero
+ * permits the operator to write `revisionLayout: "4096"` into the org's fence-authority marker; until then
+ * admission and the drain refuse that org (ledger-s3 validFenceAuthority).
+ *
  * Dry run (default) lists and validates only. A legacy shard that is unreadable or invalid is counted and skipped,
  * never guessed at. Codes and counts only in the summary: no keys or ids.
  */
 import { createHash } from "node:crypto";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore } from "../shared/vendor.ts";
-import { LEGACY_SHARD_KEY, admissionFenceView, revisionShard, s3LedgerObjects, validLegacyIndex, type FenceDoc, type IndexEntryInput } from "./ledger-s3.ts";
+import { LEGACY_SHARD_KEY, admissionFenceView, entryForgotten, revisionShard, s3LedgerObjects, validLegacyIndex, type FenceDoc, type IndexEntry, type IndexEntryInput } from "./ledger-s3.ts";
 
 export interface ReshardSummary {
   /** Objects listed under the prefix. */
@@ -36,6 +42,9 @@ export interface ReshardSummary {
   invalid: number;
   /** Entries whose merge failed (a store error or `ledger_revision_contended`); a rerun retries them. */
   failed: number;
+  /** Verify only: legacy entries found in the new layout (or forgotten by the fence), and those that are not. */
+  verified: number;
+  missing: number;
 }
 
 const decoder = new TextDecoder();
@@ -48,8 +57,12 @@ async function mapLimit<T>(items: readonly T[], limit: number, fn: (item: T) => 
 }
 const originHash = (originId: string) => createHash("sha256").update(originId).digest("hex").slice(0, 32);
 
-export async function reshardRevisions(store: ObjectStore, keyRoot: string, opts: { prefix: string; execute: boolean; concurrency?: number }): Promise<ReshardSummary> {
-  const summary: ReshardSummary = { listed: 0, legacy_shards: 0, entries: 0, merged: 0, would_merge: 0, shards: 0, invalid: 0, failed: 0 };
+/** True when the new layout's entry `e` covers the legacy entry `l`: an equal or higher revision, or a newer generation. */
+const covers = (e: IndexEntry, l: IndexEntry) => e[0] >= l[0] || e[5] > l[5] || (e[5] === l[5] && e[4] > l[4]);
+
+export async function reshardRevisions(store: ObjectStore, keyRoot: string, opts: { prefix: string; execute: boolean; verify?: boolean; concurrency?: number }): Promise<ReshardSummary> {
+  if (opts.execute && opts.verify) throw new Error("reshard_mode_refused");
+  const summary: ReshardSummary = { listed: 0, legacy_shards: 0, entries: 0, merged: 0, would_merge: 0, shards: 0, invalid: 0, failed: 0, verified: 0, missing: 0 };
   const inbox = `${keyRoot}/.admission-inbox/`;
   if (!opts.prefix.startsWith(inbox)) throw new Error("reshard_prefix_refused");
   const concurrency = opts.concurrency ?? 8;
@@ -67,8 +80,11 @@ export async function reshardRevisions(store: ObjectStore, keyRoot: string, opts
   do {
     const page = await store.list(objectKey(opts.prefix.replace(/\/$/, "")), cursor);
     for (const item of page.items) {
-      summary.listed++;
       const key = String(item.key);
+      // The listing is by the prefix without its trailing slash (objectKey), so `--org org1` also lists `org10/`:
+      // keep only keys under the exact prefix.
+      if (!key.startsWith(opts.prefix)) continue;
+      summary.listed++;
       if (key.startsWith(inbox) && LEGACY_SHARD_KEY.test(key)) legacy.push(key);
     }
     cursor = page.nextCursor;
@@ -98,6 +114,24 @@ export async function reshardRevisions(store: ObjectStore, keyRoot: string, opts
       groups.set(target, g);
     }
   });
+  if (opts.verify) {
+    await mapLimit([...groups], concurrency, async ([target, g]) => {
+      try {
+        const fence = await fenceOf(g.dir);
+        const doc = (await io.readIndex(target))?.doc;
+        if (doc && doc.originId !== g.originId) { summary.invalid += g.entries.length; return; }
+        for (const x of g.entries) {
+          const l: IndexEntry = [x.revision, x.revisionId, x.digest, x.sessionKey, x.epoch, x.resets];
+          const e = doc && Object.hasOwn(doc.records, x.recordId) ? doc.records[x.recordId] : undefined;
+          if (entryForgotten(fence, g.originId, l) || (e && covers(e, l))) summary.verified++;
+          else summary.missing++;
+        }
+      } catch {
+        summary.failed += g.entries.length;
+      }
+    });
+    return summary;
+  }
   if (!opts.execute) {
     for (const g of groups.values()) summary.would_merge += g.entries.length;
     return summary;
