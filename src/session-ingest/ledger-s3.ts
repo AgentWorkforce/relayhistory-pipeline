@@ -131,7 +131,8 @@ export const fenceAuthorityKey = (keyRoot: string) => `${keyRoot}/.ledger/fence-
 // ---- object shapes ----
 
 type Decision = "apply" | { outcome: "replay" | "stale"; result: number };
-interface OrderedMark { epoch: string; version: string; digest: string; kind: "selection" | "reset"; result: number | null }
+/** An ordered control's dedupe mark. A reset's mark names its request id: only a finish that ran it may close it. */
+interface OrderedMark { epoch: string; version: string; digest: string; kind: "selection" | "reset"; result: number | null; requestId?: string }
 export interface FenceDoc {
   v: 1;
   /** Random per created fence (newFence): a commit compares it with its claim's, so a deleted and recreated fence is never "unchanged". */
@@ -200,7 +201,9 @@ export interface OwnerDoc { v: 1; originId: string; source: string; sessionId: s
  *                             SQL alone from then on;
  *   rearmSweeper "live"       the eraser sweeps `ledger/rearm/` markers (nothing in this repo consumes them yet).
  * Without it an absent fence cannot be told from a user whose SQL deletions were never copied, so admission
- * refuses (retries) rather than treat absent as empty. Deleting it is the kill switch (cached up to 60 s).
+ * refuses (retries) rather than treat absent as empty. Deleting it is the kill switch for NEW claims only: each
+ * ledger trusts a valid read for up to 60 s (fenceAuthorityTtlMs), and a batch already claimed still commits
+ * (commit never reads the marker), so its canonical objects can land after the marker is gone.
  */
 export interface FenceAuthorityDoc { v: 1; fenceBackfill: "complete"; revisionBackfill: "complete"; ownershipBackfill: "complete"; controlMirror: "on"; rearmSweeper: "live"; writtenAtMs: number }
 
@@ -218,15 +221,19 @@ const own = <T>(o: Record<string, T>, k: string): T | undefined => (Object.hasOw
 const exactKeys = (o: Record<string, unknown>, keys: string[]) => Object.keys(o).length === keys.length && keys.every((k) => Object.hasOwn(o, k));
 
 export function validFence(v: unknown): v is FenceDoc {
-  if (!isObject(v) || v.v !== 1 || typeof v.instance !== "string" || !TOKEN.test(v.instance) || !count(v.version) || !count(v.resets) || !count(v.resetsCompleted) || (v.resetsCompleted as number) > (v.resets as number) || !count(v.lastResetAtMs)
+  if (!isObject(v) || v.v !== 1 || typeof v.instance !== "string" || !TOKEN.test(v.instance) || !count(v.version) || !count(v.resets) || !count(v.lastResetAtMs)
     || !isObject(v.deleted) || !isObject(v.epochs) || !isObject(v.resetRequests)) return false;
+  // A fence from before `resetsCompleted`: it means `resets` when no reset is running, else fail closed (we
+  // cannot know which tombstones landed). readFence fills it in; nothing else may treat it as absent.
+  if (v.resetsCompleted === undefined) { if (Object.values(v.resetRequests).includes(null)) return false; }
+  else if (!count(v.resetsCompleted) || v.resetsCompleted > v.resets) return false;
   if (Object.hasOwn(v.deleted, "__proto__") || Object.hasOwn(v.epochs, "__proto__") || Object.hasOwn(v.resetRequests, "__proto__")) return false;
   if (!Object.values(v.deleted).every((list) => Array.isArray(list) && list.every(pairOk))) return false;
   if (!Object.values(v.epochs).every((m) => isObject(m) && Object.entries(m).every(([k, n]) => HEX32.test(k) && count(n)))) return false;
   if (!Object.values(v.resetRequests).every((n) => n === null || count(n))) return false;
   const o = v.ordered;
   return o === undefined || (isObject(o) && str(o.epoch) && typeof o.version === "string" && /^[1-9][0-9]{0,18}$/.test(o.version) && str(o.digest)
-    && (o.kind === "selection" || o.kind === "reset") && (o.result === null || count(o.result)));
+    && (o.kind === "selection" || o.kind === "reset") && (o.result === null || count(o.result)) && (o.requestId === undefined || mapKey(o.requestId)));
 }
 export function validBatch(v: unknown): v is BatchDoc {
   return isObject(v) && v.v === 1 && str(v.originId) && str(v.batchId) && typeof v.digest === "string" && HEX64.test(v.digest)
@@ -250,6 +257,14 @@ export function validFenceAuthority(v: unknown): v is FenceAuthorityDoc {
 }
 
 // ---- fence rules (shared with the backfill and the drain: never reimplement them) ----
+
+/**
+ * A valid fence with every field present: a fence written before `resetsCompleted` existed (validFence accepts it
+ * only with no reset running) gets `resetsCompleted = resets`. readFence applies it; call it on any other read.
+ */
+export function normalizedFence(f: FenceDoc): FenceDoc {
+  return (f as Partial<FenceDoc>).resetsCompleted === undefined ? { ...f, resetsCompleted: f.resets } : f;
+}
 
 /** The ONLY way a fence is created: empty, version 0, a fresh random instance id. */
 export function newFence(newId: () => string = randomUUID): FenceDoc {
@@ -412,6 +427,13 @@ export interface S3LedgerOptions {
   fenceAuthority?: "required";
   /** How long a VALID marker read is trusted (default 60 s). A missing or invalid one is never cached. */
   fenceAuthorityTtlMs?: number;
+  /**
+   * false: a claim never completes a reset another attempt left running; it admits against the fence as it is
+   * (a running reset is a state claims already handle) and only the reset's own retry completes it. Self-host
+   * sets false, because its SQL mirror runs on the control path only: a claim-side completion would land the
+   * tombstones in S3 and never reach SQL. Default true (hosted: no SQL; the reset retry replays the count).
+   */
+  claimCompletesResets?: boolean;
   nowMs?: () => number;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
@@ -457,7 +479,7 @@ export function s3LedgerObjects(store: ObjectStore, keyRoot: string, opts: Omit<
   };
   async function readFence(key: string): Promise<FenceRead> {
     const got = await readDoc(store, key, validFence, "ledger_fence_invalid");
-    return got ? { state: "present", fence: got.doc, version: got.version } : { state: "absent" };
+    return got ? { state: "present", fence: normalizedFence(got.doc), version: got.version } : { state: "absent" };
   }
 
   /** CAS edit of the fence, as async-admission.ts editJournal. `edit` returns null for "no change". */
@@ -546,6 +568,7 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
   const io = s3LedgerObjects(store, keyRoot, opts);
   const { attempts, backoff, nowMs, keysFor, readFence, editFence, readIndex, mergeIndex, readOwner, registerOwner, writeRearm } = io;
   const newToken = opts.newToken ?? randomUUID;
+  const claimCompletesResets = opts.claimCompletesResets ?? true;
   const authorityTtl = opts.fenceAuthorityTtlMs ?? 60_000;
   if (!count(authorityTtl)) throw new LedgerUnavailableError("ledger_s3_options_refused");
   let authorityUntil = -Infinity;
@@ -663,7 +686,7 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
    * Then finishResets. A finished request id replays its count.
    */
   async function applyReset(tenant: LedgerTenant, requestId: string, control?: OrderedControl): Promise<{ outcome: "applied" | "replay" | "stale"; deleted: number }> {
-    const mark = control ? orderedMark(control) : undefined;
+    const mark = control ? orderedMark(control, requestId) : undefined;
     if (!mapKey(requestId)) throw new LedgerUnavailableError("ledger_input_refused");
     const keys = keysFor(tenant);
     const atMs = nowMs();
@@ -701,7 +724,13 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
     try {
       do {
         const page = await store.list(objectKey(keys.ownersRoot), cursor);
-        const docs = await mapLimit(page.items.map((i) => String(i.key)).filter((k) => k.startsWith(prefix)), RESET_READS, async (k) => (await readOwner(k))?.doc);
+        const docs = await mapLimit(page.items.map((i) => String(i.key)).filter((k) => k.startsWith(prefix)), RESET_READS, async (k) => {
+          // A corrupt stub fails the completion (fail closed: it could be an owned session), never silently skipped.
+          try { return (await readOwner(k))?.doc; } catch (error) {
+            if (error instanceof LedgerUnavailableError && error.code === "ledger_owner_invalid") throw new LedgerUnavailableError("ledger_reset_owner_invalid");
+            throw error;
+          }
+        });
         for (const d of docs) {
           if (!d || !mapKey(d.originId)) continue;
           if (d.resets < now.resets && d.epoch === fenceEpoch(now, d.originId, sessionKeyHash(d.source, d.sessionId)) && !isDeleted(now, d.originId, d.source, d.sessionId)) owned.push(d);
@@ -724,7 +753,10 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       for (const id of runningAtList) if (own(f.resetRequests, id) === null) { f.resetRequests[id] = n; changed = true; }
       if (f.resetsCompleted < now.resets) { f.resetsCompleted = now.resets; changed = true; }
       if (control) changed = finishOrdered(f, control, n) || changed;
-      else if (f.ordered && f.ordered.kind === "reset" && f.ordered.result === null) { f.ordered.result = n; changed = true; }
+      // Another reset's ordered mark: close it only if THAT reset was running at this listing (its tombstones are
+      // the ones just landed). A mark without a request id, or of a reset begun after the listing, stays open.
+      else if (f.ordered && f.ordered.kind === "reset" && f.ordered.result === null && f.ordered.requestId !== undefined
+        && runningAtList.includes(f.ordered.requestId) && typeof own(f.resetRequests, f.ordered.requestId) === "number") { f.ordered.result = n; changed = true; }
       const mine = requestId === undefined ? n : own(f.resetRequests, requestId) ?? n;
       return { next: changed ? f : null, result: typeof mine === "number" ? mine : n };
     });
@@ -735,7 +767,7 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
    * dual-write (decision 0005 "Controls"), so this only dedupes: a lower version of the same epoch is stale,
    * the same version replays (another digest refuses), anything higher applies.
    */
-  const orderedMark = (control: OrderedControl) => (f: FenceDoc): "apply" | { outcome: "replay" | "stale"; result: number } => {
+  const orderedMark = (control: OrderedControl, requestId?: string) => (f: FenceDoc): "apply" | { outcome: "replay" | "stale"; result: number } => {
     const o = f.ordered;
     if (o && o.epoch === control.epoch) {
       const cur = BigInt(o.version), v = BigInt(control.version);
@@ -746,7 +778,7 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
         return "apply"; // begun, not finished: finish it (every step is idempotent)
       }
     }
-    f.ordered = { epoch: control.epoch, version: control.version, digest: control.digest, kind: control.kind, result: null };
+    f.ordered = { epoch: control.epoch, version: control.version, digest: control.digest, kind: control.kind, result: null, ...(requestId !== undefined ? { requestId } : {}) };
     return "apply";
   };
 
@@ -789,8 +821,14 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
         const read = await readFence(keys.fence);
         const fence = admissionView(read);
         // A reset begun but not finished (it crashed, or is still running): finish it before judging, so a reset is
-        // never left half done by a client that stopped retrying. Then claim against the finished fence.
-        if (fence.resets > fence.resetsCompleted) { await finishResets(keys); continue; }
+        // never left half done by a client that stopped retrying, then claim again (backed off, with jitter: many
+        // claims may race to finish it). A completion that fails (a corrupt owner stub, a store error) fails only
+        // the completion: this claim goes on against the fence as it is, and the reset's own retry reports the code.
+        if (claimCompletesResets && fence.resets > fence.resetsCompleted && attempt < attempts - 1) {
+          let finished = false;
+          try { await finishResets(keys); finished = true; } catch (error) { if (!(error instanceof LedgerUnavailableError)) throw error; }
+          if (finished) { await backoff(attempt); continue; }
+        }
         const judged = await judge(input, keys, fence);
         if (judged.twins > 0) return { kind: "revision_conflict", conflicts: judged.conflicts, count: judged.twins };
         const pairs = batchPairs(input.sessions, input.records);
