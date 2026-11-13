@@ -64,11 +64,13 @@ canonical current parity row. The full contract is in
 - It is read-only. It uses the same gates, environment and single secret as
   census; the target session is fenced read-only and nothing is written. It
   reuses the bounded buffered-tenant cursor and the canonical readback
-  comparison. The owner listing and the generation re-read share one
-  `REPEATABLE READ READ ONLY` snapshot, while each owner's comparison runs in
-  `readParityCensus`'s own read-only transactions, with the generation checked
-  before, inside and after. It adds no query SQL (only the transaction, cursor
-  and timeout statements around the existing cursor query).
+  comparison. One `REPEATABLE READ READ ONLY` snapshot on the read-only
+  enumerator session covers the marker read, the enumeration, every
+  comparison and the final marker read. The external generation fence on the
+  target reads the generation before and after it. It adds no query SQL (only
+  the transaction, cursor and timeout statements around the existing cursor
+  query). It needs the `frozen-supabase` census source and refuses
+  `owner_parity_discovery_census_source` otherwise.
 - It runs only while the roster is empty. It refuses `roster_present` once a
   digest is listed, `generation_unstable` if the PASS generation moves
   around the snapshot, and `unexpected_scope` unless exactly 7 owners are

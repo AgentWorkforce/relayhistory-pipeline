@@ -139,18 +139,29 @@ environment. It never writes:
 - it adds no query SQL (only the transaction, cursor and timeout statements around the existing cursor
   query).
 
-The database work, in order:
+The database work, in order. One `REPEATABLE READ READ ONLY` snapshot on the read-only enumerator session
+covers the marker read, the enumeration, every comparison and the final marker read. The external generation
+fence on the target brackets it.
 
 1. Read the live PASS marker generation on the target (`BULK_TARGET_GENERATION_SQL`).
-2. Open one `REPEATABLE READ READ ONLY` transaction on the enumerator session. Its first read is the
-   generation again, which must equal step 1. Then the operator's bounded buffered-tenant cursor
-   (`BULK_BUFFERED_TENANTS_SQL`, `FETCH` 100) lists every buffered owner in that snapshot.
-3. Classify each owner with the canonical readback comparison: a fresh G1 (`readParityCensus`) and the stored
-   row (`READ_OWNER_BUFFERED_PARITY_SQL`, `storedProof`):
+2. Open the one `REPEATABLE READ READ ONLY` transaction on the enumerator session (`statement_timeout` 30s
+   for each statement). Its first read is the generation again, which must equal step 1. Then the operator's
+   bounded buffered-tenant cursor (`BULK_BUFFERED_TENANTS_SQL`, `FETCH` 100) lists every buffered owner in
+   that snapshot.
+3. In the same snapshot, classify each owner with the canonical readback comparison: a fresh G1
+   (`readParityCensus` with the caller-held transaction option, so it opens no transaction of its own) and the
+   stored row (`READ_OWNER_BUFFERED_PARITY_SQL`, `storedProof`):
    - no stored row is `missing`;
    - a stored row byte-equal to an equal fresh proof at the generation is canonical current;
    - anything else is `stale`.
-4. Read the generation on the target again. It must still equal step 1.
+
+   A change committed elsewhere after the enumeration cannot change a disposition.
+4. Still in the snapshot, check exactly seven, read the generation a final time (it must equal step 1), then
+   `COMMIT`. Any refusal rolls the snapshot back.
+5. Read the generation on the target again. It must still equal step 1.
+
+The census source must be `frozen-supabase`. A Neon census would be a second database that cannot share the
+snapshot, so discovery refuses it before any statement (`owner_parity_discovery_census_source`).
 
 Refusals specific to discovery:
 
@@ -159,6 +170,7 @@ Refusals specific to discovery:
 | `roster_present` | The committed roster lists any digest. A malformed roster still refuses `roster_invalid`. |
 | `generation_unstable` | The generation inside the snapshot, after the comparison, or in a fresh equal proof differs from the one read first. |
 | `unexpected_scope` | missing + stale is not exactly 7, or any cursor row is not a valid tenant tuple. Refused as soon as more than 7 are seen (counts so far only). |
+| `owner_parity_discovery_census_source` | The census source is not `frozen-supabase`. Refused before any statement. |
 | `owner_parity_mode_route` | Internal guard: discovery reached the census/write/readback runner, or another mode reached the discovery runner. |
 
 Every other refusal stays (`owner_parity_inputs`, `owner_parity_census_run`, `owner_parity_confirmation`,

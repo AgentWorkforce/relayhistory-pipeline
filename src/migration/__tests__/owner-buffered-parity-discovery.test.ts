@@ -1,7 +1,8 @@
 /**
  * Mocked-session tests for the one-time, read-only discovery mode of the owner-buffered parity workflow
  * (scripts/owner-buffered-parity-ci.ts runOwnerParityDiscovery): exactly-seven scope, generation stability
- * before/inside/after the snapshot, the empty-roster rule, the mode dispatch table (write and bulk unreachable
+ * before/inside/after the snapshot, one REPEATABLE READ READ ONLY snapshot on the enumerator session holding the
+ * marker reads, enumeration and every comparison, the empty-roster rule, the mode dispatch table (write and bulk unreachable
  * from discovery), statement shape (read-only only) and sanitization. Fixture identifiers only; no database.
  */
 import { expect, test } from "bun:test";
@@ -19,7 +20,13 @@ import {
   type OwnerParitySessions,
 } from "../../../scripts/owner-buffered-parity-ci.ts";
 import { BULK_BUFFERED_TENANTS_SQL, BULK_TARGET_GENERATION_SQL, tenantSha256 } from "../../../scripts/owner-buffered-parity-operator.ts";
-import { READ_OWNER_BUFFERED_PARITY_SQL, type OwnerBufferedParityProof, type ParityCensusReceipt, type ParityTenant } from "../owner-buffered-parity.ts";
+import {
+  READ_OWNER_BUFFERED_PARITY_SQL,
+  type OwnerBufferedParityProof,
+  type ParityCensusReadOptions,
+  type ParityCensusReceipt,
+  type ParityTenant,
+} from "../owner-buffered-parity.ts";
 import {
   OWNER_PARITY_DISCOVERY_CONTRACT,
   OWNER_PARITY_MODE_POLICY,
@@ -30,8 +37,10 @@ import {
   parseOwnerParityDiscoveryReceipt,
   requireEmptyOwnerParityRoster,
 } from "../owner-buffered-parity-ci-contract.ts";
+import type { Queryable } from "../relayhistory-export.ts";
 
 const H = (c: string) => c.repeat(64);
+const CENSUS_PROBE = "/* census read */ SELECT 1";
 const SHA = "5".repeat(40);
 // Identifier-shaped fixtures (slug-like org, workspace id, email-like user) that must never be emitted.
 const tenants: ParityTenant[] = Array.from({ length: 12 }, (_, i) => ({
@@ -59,6 +68,7 @@ function world(state: Disposition[], opts: { extraRows?: Array<Record<string, un
     proofGeneration: null as string | null,
     statements: [] as Array<{ session: string; sql: string; params: unknown[] }>,
     g1: [] as string[],
+    censusSessions: [] as Array<[Queryable, Queryable]>,
   };
   const proof = (t: ParityTenant): OwnerBufferedParityProof => ({
     contract: "owner-buffered-parity/v1", tenant: { ...t }, controlEpoch: H("1"), privacyBaselineSha256: H("2"), explicitNoHead: false,
@@ -77,6 +87,11 @@ function world(state: Disposition[], opts: { extraRows?: Array<Record<string, un
       query: async <R>(sql: string, params: unknown[] = []) => {
         w.statements.push({ session: "enumerator", sql, params });
         if (sql === BULK_TARGET_GENERATION_SQL) return { rows: [{ generation: w.snapshotGeneration ?? w.generation }] as R[] };
+        if (sql === READ_OWNER_BUFFERED_PARITY_SQL) {
+          const hit = byUser.get(String(params[2]));
+          if (!hit || hit.d === "missing") return { rows: [] as R[] };
+          return { rows: [row(proof(hit.t), hit.d === "stale")] as R[] };
+        }
         if (sql.startsWith("DECLARE")) fetched = false;
         if (sql.startsWith("FETCH")) {
           const rows = fetched ? [] : [...buffered.map((t) => ({ org_id: t.orgId, workspace_id: t.workspaceId, user_id: t.userId })),
@@ -90,17 +105,24 @@ function world(state: Disposition[], opts: { extraRows?: Array<Record<string, un
     target: {
       query: async <R>(sql: string, params: unknown[] = []) => {
         w.statements.push({ session: "target", sql, params });
+        // The target answers only the external generation fence.
         if (sql === BULK_TARGET_GENERATION_SQL) return { rows: [{ generation: w.targetGenerations.shift() ?? w.generation }] as R[] };
-        if (sql === READ_OWNER_BUFFERED_PARITY_SQL) {
-          const hit = byUser.get(String(params[2]));
-          if (!hit || hit.d === "missing") return { rows: [] as R[] };
-          return { rows: [row(proof(hit.t), hit.d === "stale")] as R[] };
-        }
         throw new Error("unexpected target sql");
       },
     },
   };
-  const readCensus = (async (_s: unknown, _t: unknown, tenant: ParityTenant): Promise<ParityCensusReceipt> => {
+  // Faithful to readParityCensus's statement shape: by default each read opens and commits its own transaction on
+  // the session it is given; with { transaction: "caller" } it issues only the read inside the caller's snapshot.
+  const readCensus = (async (s: Queryable, t: Queryable, tenant: ParityTenant, _source: unknown,
+    options?: ParityCensusReadOptions): Promise<ParityCensusReceipt> => {
+    w.censusSessions.push([s, t]);
+    for (const db of [s, s, t]) {
+      if (options?.transaction === "caller") { await db.query(CENSUS_PROBE); continue; }
+      await db.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      await db.query("SET LOCAL statement_timeout = '2s'");
+      await db.query(CENSUS_PROBE);
+      await db.query("COMMIT");
+    }
     w.g1.push(tenant.userId);
     return { contract: "owner-buffered-parity-census/v1", tenant: { ...tenant }, equal: true, mismatches: [], proof: proof(tenant) };
   }) as never;
@@ -132,8 +154,8 @@ test("discovery: exactly seven missing/stale owners yields sorted digests, dispo
   expect(parseOwnerParityDiscoveryReceipt(JSON.parse(JSON.stringify(out.receipt)))).toEqual(out.receipt);
   expect(x.w.g1.length).toBe(9);
   for (const s of x.w.statements) expect(s.sql).not.toMatch(/\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|LOCK|SET ROLE)\b/iu);
-  expect(x.w.statements.filter((s) => s.session === "target").every((s) =>
-    s.sql === BULK_TARGET_GENERATION_SQL || s.sql === READ_OWNER_BUFFERED_PARITY_SQL)).toBe(true);
+  expect(x.w.statements.filter((s) => s.session === "target").map((s) => s.sql))
+    .toEqual([BULK_TARGET_GENERATION_SQL, BULK_TARGET_GENERATION_SQL]);
   const summary = ownerParityDiscoverySummary(out.receipt);
   for (const o of expected) expect(summary).toContain(`| \`${o.tenantSha256}\` | ${o.disposition} |`);
   expect(discoveryRunReceipt(out.receipt)).toMatchObject({ mode: "discovery", status: "ok", tenants: [],
@@ -149,12 +171,75 @@ test("discovery reads the generation before, as the snapshot's first read, and a
   expect(e[2]).toBe(BULK_TARGET_GENERATION_SQL);
   expect(e[3]).toContain(`NO SCROLL CURSOR FOR ${BULK_BUFFERED_TENANTS_SQL}`);
   expect(e.filter((s) => s.startsWith("BEGIN")).length).toBe(1);
+  expect(e.at(-2)).toBe(BULK_TARGET_GENERATION_SQL);
   expect(e.at(-1)).toBe("COMMIT");
   const t = x.w.statements.filter((s) => s.session === "target").map((s) => s.sql);
   expect(t[0]).toBe(BULK_TARGET_GENERATION_SQL);
   expect(t.at(-1)).toBe(BULK_TARGET_GENERATION_SQL);
   expect(x.w.statements.findIndex((s) => s.session === "target")).toBeLessThan(
     x.w.statements.findIndex((s) => s.session === "enumerator"));
+});
+
+/** Statements on one session, asserting it holds exactly one transaction and every statement sits inside it. */
+const oneTransaction = (x: ReturnType<typeof world>, end: "COMMIT" | "ROLLBACK") => {
+  const e = x.w.statements.filter((s) => s.session === "enumerator").map((s) => s.sql);
+  expect(e.filter((s) => /^(BEGIN|START|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/iu.test(s))).toEqual(
+    ["BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", end]);
+  expect(e[0]).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  expect(e.at(-1)).toBe(end);
+  // Outside the snapshot only the external fence: the target's generation reads, and nothing on the source.
+  for (const s of x.w.statements.filter((s) => s.session !== "enumerator")) {
+    expect(s.session).toBe("target");
+    expect(s.sql).toBe(BULK_TARGET_GENERATION_SQL);
+  }
+  return e;
+};
+
+test("discovery holds one snapshot: marker, enumeration, every G1 and stored-proof comparison, final marker", async () => {
+  const x = world(seven);
+  const out = await discover(x);
+  expect(out.exitCode).toBe(0);
+  const e = oneTransaction(x, "COMMIT");
+  // Every census read and stored-proof read ran on the snapshot session between BEGIN and COMMIT.
+  expect(e.filter((s) => s === CENSUS_PROBE).length).toBe(3 * 9);
+  expect(e.filter((s) => s === READ_OWNER_BUFFERED_PARITY_SQL).length).toBe(9);
+  expect(e.filter((s) => s === BULK_TARGET_GENERATION_SQL).length).toBe(2);
+  expect(e.some((s) => s.includes("statement_timeout = '2s'"))).toBe(false);
+  // readCensus received the single snapshot session for both of its sides.
+  expect(x.w.censusSessions.length).toBe(9);
+  for (const [s, t] of x.w.censusSessions) { expect(s).toBe(x.sessions.enumerator); expect(t).toBe(x.sessions.enumerator); }
+  // The external fence brackets the snapshot: first and last statements of the run are target generation reads.
+  expect(x.w.statements[0]).toMatchObject({ session: "target", sql: BULK_TARGET_GENERATION_SQL });
+  expect(x.w.statements.at(-1)).toMatchObject({ session: "target", sql: BULK_TARGET_GENERATION_SQL });
+});
+
+test("discovery refusal paths roll the snapshot back and run nothing on the source or target beyond the fence", async () => {
+  const cases: Array<[ReturnType<typeof world>, string]> = [];
+  const scope = world(["missing", "stale"]); cases.push([scope, "unexpected_scope"]);
+  const eighth = world(Array.from({ length: 12 }, () => "missing")); cases.push([eighth, "unexpected_scope"]);
+  const unparsable = world(seven, { extraRows: [{ org_id: null, workspace_id: "w", user_id: "u" }] });
+  cases.push([unparsable, "unexpected_scope"]);
+  const inside = world(seven); inside.w.snapshotGeneration = H("9"); cases.push([inside, "generation_unstable"]);
+  const proof = world(seven); proof.w.proofGeneration = H("8"); cases.push([proof, "generation_unstable"]);
+  for (const [x, code] of cases) {
+    const out = await discover(x);
+    expect(out.receipt).toMatchObject({ status: "refused", code });
+    oneTransaction(x, "ROLLBACK");
+    expect(x.w.statements.filter((s) => s.session === "target").length).toBe(1);
+    expectCountsOnly(out);
+  }
+  // A drift seen only by the external after-read: the snapshot already committed, then the run refuses.
+  const after = world(seven); after.w.targetGenerations = [H("4"), H("9")];
+  expect((await discover(after)).receipt.code).toBe("generation_unstable");
+  oneTransaction(after, "COMMIT");
+});
+
+test("discovery refuses the neon census source before any statement: it cannot share the enumerator snapshot", async () => {
+  const x = world(seven);
+  const out = await discover(x, env("discovery", { OWNER_PARITY_CENSUS_SOURCE: "neon" }));
+  expect(out.receipt).toMatchObject({ status: "refused", code: "owner_parity_discovery_census_source", owners: [] });
+  expect(x.w.statements).toEqual([]);
+  expect(x.w.censusSessions).toEqual([]);
 });
 
 test("discovery: a count other than seven refuses unexpected_scope with counts only, never digests", async () => {
