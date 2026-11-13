@@ -199,6 +199,22 @@ export interface SelfhostRuntimeOptions {
   log?: SelfhostAdmissionOptions["log"];
 }
 
+/**
+ * INGEST_LEDGER=s3: this process's one ledger, for EVERY admission path (the synchronous HTTP path, the async
+ * consumer and upload-inbox promotion). No admission until the fence-authority marker exists (ledger-s3.ts
+ * FenceAuthorityDoc): until then every claim is a retry. Controls ALSO write SQL after S3, reconciled to the fence
+ * (withSqlControlMirror), while the read API and the eraser still read upload_deletions; claims and commits never
+ * do. The SQL ledger is built lazily, so only a control reaches SQL.
+ */
+export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run" | "store">): Ledger {
+  let sqlControls: Ledger | undefined;
+  const sqlControl = (): Ledger => (sqlControls ??= sqlLedger(parts.run, { acceptanceMode: "canonical" }));
+  return withSqlControlMirror(
+    s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required" }),
+    { setSessionUploads: (i) => sqlControl().setSessionUploads(i), resetUploadedSessions: (t, r) => sqlControl().resetUploadedSessions(t, r) },
+    parts.store, keyRoot);
+}
+
 /** The ingest app over the given parts. Canonical acceptance, inline writes, no fan-out, no replica, no custody. */
 export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect" | "capturePolicyUploads" | "uploadConsent" | "ledger">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
   const sessionSelection = settings.sessionSelection === true;
@@ -209,17 +225,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   const s3 = settings.ledger === "s3";
   if (s3 && (sessionSelection || settings.uploadConsent && settings.uploadConsent !== "off" || parts.withSessionWrites || parts.sessionEraseService))
     throw new Error("96bulls: INGEST_LEDGER=s3 refuses SQL-only features (session selection erase, operator erase, upload consent)");
-  // With s3, controls ALSO write SQL (after S3) while the read API and the eraser still read upload_deletions
-  // (ledger-s3.ts withSqlControlMirror); claims and commits never do. Built lazily: only a control reaches SQL.
-  // With direct upload admission on, no admission until the fence-authority marker exists (FenceAuthorityDoc).
-  let sqlControls: Ledger | undefined;
-  const sqlControl = (): Ledger => (sqlControls ??= sqlLedger(parts.run, { acceptanceMode: "canonical" }));
-  const ledger: Ledger = s3
-    ? withSqlControlMirror(
-      s3Ledger(parts.store, settings.keyRoot, { acceptanceMode: "canonical", ...(settings.uploadDirect ? { fenceAuthority: "required" as const } : {}) }),
-      { setSessionUploads: (i) => sqlControl().setSessionUploads(i), resetUploadedSessions: (t, r) => sqlControl().resetUploadedSessions(t, r) },
-      parts.store, settings.keyRoot)
-    : sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection });
+  const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts) : sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection });
   const deliver: DeliverDeps = {
     ledger,
     ...(parts.withSessionWrites ? { withSessionWrites: parts.withSessionWrites } : {}),
