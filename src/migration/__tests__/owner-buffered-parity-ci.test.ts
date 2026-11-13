@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   OWNER_PARITY_CHILD_ENV,
+  ownerParityCode,
   ownerParityChildSpawn,
   refuseOwnerParityCredentialEnv,
   runOwnerParity,
@@ -112,6 +113,17 @@ const writeEnv = (c: OwnerParityCensusArtifact) => ({ ...base, OWNER_PARITY_MODE
 const write = (c: OwnerParityCensusArtifact, x: ReturnType<typeof world>) =>
   runOwnerParity(writeEnv(c), x.sessions, { roster, runId: "202", census: c, now: () => T0 + 3600_000, writeEnabled: true, deps: x.deps });
 const statuses = (o: OwnerParityOutcome) => o.receipt.tenants.map((t) => t.status);
+
+test("diagnostic codes expose only fixed SQLSTATE/connection classes and never driver content", () => {
+  const pg = Object.assign(new Error("password=secret host=private.example query=SELECT tenant_id"), { code: "42501" });
+  const connection = Object.assign(new Error("connect ECONNRESET private.example"), { code: "ECONNRESET" });
+  const arbitrary = Object.assign(new Error("host=private.example"), { code: "private.example" });
+  expect(ownerParityCode(pg)).toBe("owner_parity_pg_42501");
+  expect(ownerParityCode(connection)).toBe("owner_parity_connection_econnreset");
+  expect(ownerParityCode(arbitrary)).toBe("owner_parity_failed");
+  expect(JSON.stringify([ownerParityCode(pg), ownerParityCode(connection), ownerParityCode(arbitrary)]))
+    .not.toMatch(/secret|private\.example|SELECT|tenant_id/u);
+});
 
 test("census then write: seven rows, roster order, exact readback; unlisted tenants never reach G1 or a write", async () => {
   const c = await census();

@@ -187,8 +187,26 @@ function emptyCounts(): OwnerParityCounts {
 
 /** Fixed codes only; anything else (driver text could carry a host) collapses to a constant. */
 export function ownerParityCode(error: unknown): string {
-  const code = error instanceof OwnerParityCiRefusal || error instanceof OwnerBufferedOperatorRefusal ||
-    error instanceof ParityCensusRefusal || error instanceof CredentialRefusal ? error.code : "owner_parity_failed";
+  let code: string;
+  if (error instanceof OwnerParityCiRefusal || error instanceof OwnerBufferedOperatorRefusal ||
+      error instanceof ParityCensusRefusal || error instanceof CredentialRefusal) {
+    code = error.code;
+  } else {
+    const driverCode = typeof error === "object" && error !== null && "code" in error
+      ? (error as { code?: unknown }).code : undefined;
+    // PostgreSQL SQLSTATE is a fixed five-character protocol field. It contains no query, host, role,
+    // identifier or server message, so it is safe evidence for a fail-closed production diagnostic.
+    if (typeof driverCode === "string" && /^[0-9A-Z]{5}$/u.test(driverCode)) {
+      code = `owner_parity_pg_${driverCode}`;
+    } else if (typeof driverCode === "string" && [
+      "ECONNREFUSED", "ECONNRESET", "EPIPE", "ETIMEDOUT", "ENOTFOUND", "EAI_AGAIN",
+    ].includes(driverCode)) {
+      // Node's fixed connection classes are also content-free; arbitrary error.code values remain redacted.
+      code = `owner_parity_connection_${driverCode.toLowerCase()}`;
+    } else {
+      code = "owner_parity_failed";
+    }
+  }
   return /^[A-Za-z0-9_.:,-]{1,160}$/u.test(code) ? code : "owner_parity_failed";
 }
 
