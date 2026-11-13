@@ -9,13 +9,15 @@ import {
   TRANSCRIPT_ACCOUNT_ID, TRANSCRIPT_REGION, TRANSCRIPT_STAGE,
 } from "../transcript-store.ts";
 import {
-  UPLOAD_ADMISSION_FUNCTION_TIMEOUT_SECONDS, UPLOAD_ADMISSION_VISIBILITY_TIMEOUT_SECONDS, UPLOAD_INBOX_NOTIFICATION_ID,
+  FENCE_AUTHORITY_MARKER_KEY, UPLOAD_ADMISSION_FUNCTION_TIMEOUT_SECONDS, UPLOAD_ADMISSION_VISIBILITY_TIMEOUT_SECONDS, UPLOAD_INBOX_NOTIFICATION_ID,
   UPLOAD_INBOX_PREFIX, UPLOAD_INBOX_RESOURCES, UPLOAD_INBOX_SSE_ENV, desktopUploadPolicy, desktopUploadTrustPolicy, parseHistoryUploadDirectInfra,
   UPLOAD_ADMISSION_RESERVED_CONCURRENCY, assertUploadAdmissionInputs, uploadAdmissionBucketStatements, uploadAdmissionEnvironment,
   uploadAdmissionQueuePolicy, uploadAdmissionSecretPolicy, uploadInboxNames,
   PRESIGN_MAX_SIGNATURE_AGE_MS, presignIssuerUserName, uploadPresignIssuerPolicy,
 } from "../upload-inbox.ts";
 import { UPLOAD_INBOX_SSE_VAR, uploadDirectConfig } from "../../../src/session-ingest/upload-admission.ts";
+import { fenceAuthorityKey, s3LedgerKeys } from "../../../src/session-ingest/ledger-s3.ts";
+import { TENANT_KEY_BASE } from "../tenants.ts";
 
 // Synthetic identifiers only.
 const accountId = "111111111111", region = "us-east-1", stage = "aws-synthetic";
@@ -32,7 +34,6 @@ const u = uploadInboxNames(stage, accountId, region);
 // The consumer's role is the one Alchemy's Lambda provider owns (a generated name): synthetic here.
 const consumerRoleArn = `arn:aws:iam::${accountId}:role/synthetic-upload-admission-role`;
 const roles = { uploadRoleArn: u.uploadRoleArn, consumerRoleArn };
-const cf = { cloudflareAccountId: "0123456789abcdef0123456789abcdef", admissionQueueId: "fedcba9876543210fedcba9876543210" };
 
 const inboxKey = `${bucketArn}/96bulls/.upload-inbox/org-a/v1/ws=w1/u=abc/0001.json.zst`;
 const sessionKey = `${bucketArn}/96bulls/org-a/v1/ws=w1/m=m1/h=claude/d=2026/11/11/s=s1/manifest.json`;
@@ -137,7 +138,7 @@ describe("flag off renders the stack byte-identical", () => {
     mock.module('@alchemy.run/aws',()=>({IAM:ns('User','Role','Policy'),KMS:ns('Key','Alias'),S3:ns('Bucket'),CloudTrail:ns('Trail'),Budgets:ns('Budget'),Lambda:ns('Function','EventSourceMapping','Permission','Url','FunctionUrl'),SQS:ns('Queue'),SecretsManager:ns('Secret'),EventBridge:ns('Rule'),CloudWatch:ns('Alarm'),Logs:ns('LogGroup')}));
     const {transcriptStoreStage}=await import(${JSON.stringify(modulePath)});
     const gc='arn:aws:iam::'+acct+':role/synthetic-buffered-gc';
-    const ua={direct:'allowlist',allowlist:['ws:w1','org:org-a'],cloudflareAccountId:'${cf.cloudflareAccountId}',admissionQueueId:'${cf.admissionQueueId}'};
+    const ua={direct:'allowlist',allowlist:['ws:w1','org:org-a']};
     const base={stage:'${stage}',accountId:acct,region,budgetUsd:1,budgetEmail:'test@example.invalid',tags:(c)=>({component:c})};
     const scenarios={
       store:{bufferedGcRoleArn:gc},
@@ -209,8 +210,9 @@ describe("flag off renders the stack byte-identical", () => {
       expect(UPLOAD_ADMISSION_RESERVED_CONCURRENCY).toBe(4);
       expect(fn.env).toEqual({
         DEPLOYMENT: stage, HISTORY_UPLOAD_DIRECT: "allowlist", HISTORY_UPLOAD_DIRECT_ALLOWLIST: "ws:w1,org:org-a", HISTORY_UPLOAD_INBOX_SSE: "aws:kms",
-        UPLOAD_ADMISSION_BUCKET: bucketName, UPLOAD_ADMISSION_SECRET_ID: u.secret, UPLOAD_ADMISSION_CF_ACCOUNT_ID: cf.cloudflareAccountId, UPLOAD_ADMISSION_CF_QUEUE_ID: cf.admissionQueueId,
-        INGEST_KEY_ROOT: "96bulls", INGEST_ACCEPTANCE_MODE: "buffered", NODE_OPTIONS: "--enable-source-maps",
+        UPLOAD_ADMISSION_BUCKET: bucketName, UPLOAD_ADMISSION_SECRET_ID: u.secret,
+        // Decision 0005: the consumer admits itself with the S3 ledger, and refuses to start with anything else.
+        INGEST_KEY_ROOT: "96bulls", INGEST_LEDGER: "s3", NODE_OPTIONS: "--enable-source-maps",
       });
       // No secret value anywhere in the rendered stack: only the container's name.
       expect(JSON.stringify(on)).not.toMatch(/upload_witness_key|cloudflare_queue_token|UPLOAD_WITNESS_KEY/);
@@ -218,7 +220,7 @@ describe("flag off renders the stack byte-identical", () => {
       expect(byName("upload-admission-secret").resourcePolicy).toEqual(uploadAdmissionSecretPolicy({ roleArn: fnRoleArn }));
       expect(byName("upload-admission-events").policy.Statement.find((s: any) => s.Sid === "UploadAdmissionConsumes").Principal).toEqual({ AWS: fnRoleArn });
       expect(byName("transcripts").policy.filter((s: any) => s.Sid?.startsWith("UploadAdmission")).map((s: any) => s.Sid))
-        .toEqual(["UploadAdmissionReadsTombstonesDeletesUploads", "UploadAdmissionPromotes", "UploadAdmissionListsForMissingKeys", "UploadAdmissionNoHistoryNoAdmin"]);
+        .toEqual(["UploadAdmissionReadsTombstonesDeletesUploads", "UploadAdmissionPromotes", "UploadAdmissionReadsFenceAuthority", "UploadAdmissionListsForMissingKeys", "UploadAdmissionNoHistoryNoAdmin"]);
       expect(byName("transcripts-key").policy.Statement.map((s: any) => s.Sid)).toContain("DesktopUploadEncryptsInboxViaS3");
       expect(byName("transcripts").policy.map((s: any) => s.Sid)).toContain("UploadInboxOnlyItsRoles");
       for (const user of ["transcript-writer", "transcript-reader", "transcript-srv-writer"])
@@ -441,6 +443,30 @@ describe("upload-admission consumer (bucket grants on its function role)", () =>
     expect(allowed([], bucketOn, "s3:GetObject", admissionKey, { ...ctx, "aws:PrincipalArn": pipelineRoleArn })).toBe(false);
   });
 
+  it("reads exactly the fence-authority marker (GET only), the key ledger-s3.ts reads under INGEST_KEY_ROOT", () => {
+    expect(FENCE_AUTHORITY_MARKER_KEY).toBe(fenceAuthorityKey(TENANT_KEY_BASE));
+    const marker = `${bucketArn}/${FENCE_AUTHORITY_MARKER_KEY}`;
+    expect(allowed([], bucketOn, "s3:GetObject", marker, ctx)).toBe(true);
+    for (const action of ["s3:PutObject", "s3:DeleteObject", "s3:GetObjectVersion"]) expect(allowed([], bucketOn, action, marker, ctx)).toBe(false);
+    for (const other of [`${bucketArn}/${TENANT_KEY_BASE}/.ledger/other.json`, `${bucketArn}/${TENANT_KEY_BASE}/.ledger/fence-authority.json.bak`])
+      expect(allowed([], bucketOn, "s3:GetObject", other, ctx)).toBe(false);
+    expect(allowed([], bucketOn, "s3:GetObject", marker, { ...ctx, "aws:PrincipalArn": pipelineRoleArn })).toBe(false);
+    const grant = consumerBucket.find((st) => st.Sid === "UploadAdmissionReadsFenceAuthority")!;
+    expect(grant).toMatchObject({ Effect: "Allow", Action: ["s3:GetObject"], Resource: [marker] });
+  });
+
+  it("the existing promotion grant covers every S3 ledger object (owners, revisions, batches, fence, re-arm): read and write, never delete", () => {
+    const k = s3LedgerKeys(TENANT_KEY_BASE, { orgId: "org-a", workspaceId: "w1", userId: "user-1" });
+    const ledgerKeys = [k.owner("origin-1", "claude", "s1"), k.revisions("origin-1", "r1"), k.batch("origin-1", "b1"), k.fence, k.rearm("origin-1", "claude", "s1")];
+    expect(ledgerKeys[0]).toContain("/ledger/owners/");
+    expect(ledgerKeys[1]).toContain("/ledger/revisions/");
+    for (const key of ledgerKeys.map((x) => `${bucketArn}/${x}`)) {
+      expect(allowed([], bucketOn, "s3:GetObject", key, ctx)).toBe(true);
+      expect(allowed([], bucketOn, "s3:PutObject", key, ctx)).toBe(true);
+      expect(allowed([], bucketOn, "s3:DeleteObject", key, ctx)).toBe(false);
+    }
+  });
+
   it("the consumer's admin deny names only the consumer", () => {
     const deny = consumerBucket.find((s) => s.Sid === "UploadAdmissionNoHistoryNoAdmin")!;
     expect(deny.Condition).toEqual({ ArnEquals: { "aws:PrincipalArn": consumerRoleArn } });
@@ -450,14 +476,15 @@ describe("upload-admission consumer (bucket grants on its function role)", () =>
     const refuse = (why: string): never => { throw new Error(why); };
     expect(() => assertUploadAdmissionInputs(undefined, false, refuse)).not.toThrow();
     expect(() => assertUploadAdmissionInputs(undefined, true, refuse)).toThrow(/uploadAdmission is required/);
-    for (const direct of ["off", "on"]) expect(() => assertUploadAdmissionInputs({ direct, ...cf }, true, refuse)).not.toThrow();
-    expect(() => assertUploadAdmissionInputs({ direct: "allowlist", allowlist: ["ws:w1"], ...cf }, true, refuse)).not.toThrow();
+    for (const direct of ["off", "on"]) expect(() => assertUploadAdmissionInputs({ direct }, true, refuse)).not.toThrow();
+    expect(() => assertUploadAdmissionInputs({ direct: "allowlist", allowlist: ["ws:w1"] }, true, refuse)).not.toThrow();
     for (const bad of [
-      { direct: "allowlist", ...cf }, { direct: "allowlist", allowlist: [], ...cf }, { direct: "allowlist", allowlist: ["w1"], ...cf },
-      { direct: "allowlist", allowlist: ["ws:.x"], ...cf }, { direct: "allowlist", allowlist: ["ws:a", "ws:a"], ...cf },
-      { direct: "on", allowlist: ["ws:w1"], ...cf }, { direct: "ON", ...cf }, { ...cf },
-      { direct: "on", ...cf, cloudflareAccountId: "x" }, { direct: "on", ...cf, admissionQueueId: "96bulls-session-ingest-admission" },
-      { direct: "on", ...cf, witnessKey: "x" }, null, [],
+      { direct: "allowlist" }, { direct: "allowlist", allowlist: [] }, { direct: "allowlist", allowlist: ["w1"] },
+      { direct: "allowlist", allowlist: ["ws:.x"] }, { direct: "allowlist", allowlist: ["ws:a", "ws:a"] },
+      { direct: "on", allowlist: ["ws:w1"] }, { direct: "ON" }, {},
+      // Decision 0005 removed the Cloudflare queue hand-off: its old inputs are unknown settings now.
+      { direct: "on", cloudflareAccountId: "0123456789abcdef0123456789abcdef" }, { direct: "on", admissionQueueId: "fedcba9876543210fedcba9876543210" },
+      { direct: "on", witnessKey: "x" }, null, [],
     ]) expect(() => assertUploadAdmissionInputs(bad, false, refuse)).toThrow(/uploadAdmission/);
   });
 
