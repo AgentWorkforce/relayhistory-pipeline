@@ -144,12 +144,21 @@ export async function runRearmSweeperPass(env: NodeJS.ProcessEnv, argv: readonly
   const now = overrides.now ?? Date.now;
   const cursorKey = rearmCursorKey(cfg.keyRoot, rearmScopes(cfg.keyRoot, cfg.orgs ?? null));
   const saved = cfg.dryRun ? null : await readRearmCursor(store, cursorKey);
+  // Saved after every finished marker whose erase ran and at every page end (onProgress), then once at the end; each
+  // save is If-Match the previous one. Once another sweeper wins a save, this pass stops saving (its position stands).
+  let version = saved?.version, contended = false;
+  const persist = async (position: RearmSweepResume | null) => {
+    if (contended) return;
+    const v = await writeRearmCursor(store, cursorKey, position, version, now());
+    if (v === null) contended = true; else version = v;
+  };
   const r = await sweepRearmMarkers({ store, eraser }, {
     keyRoot: cfg.keyRoot, bucket: cfg.bucket, dryRun: cfg.dryRun, concurrency: cfg.concurrency, maxMarkers: cfg.maxMarkers,
-    ...(cfg.orgs ? { orgs: cfg.orgs } : {}), now, ...extra,
+    ...(cfg.orgs ? { orgs: cfg.orgs } : {}), now, ...extra, ...(saved ? { onProgress: persist } : {}),
   }, saved ? saved.resume : resume);
   const { resume: next, ...output } = r;
-  const cursor = saved === null ? "memory" as const : (await writeRearmCursor(store, cursorKey, next, saved.version, now())) ? "saved" as const : "contended" as const;
+  if (saved) await persist(next);
+  const cursor = saved === null ? "memory" as const : contended ? "contended" as const : "saved" as const;
   return { output: { enabled: true, cursor, ...output }, resume: next };
 }
 

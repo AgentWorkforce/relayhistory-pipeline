@@ -1046,8 +1046,17 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
           || fenceEpoch(fence, input.originId, sessionKeyHash(s, id)) !== snapshot.epochs[sessionKeyHash(s, id)]);
         return { fence, fenced, deleted };
       };
-      const rearm = (list: [string, string][]) => mapLimit(list, PARALLEL, ([s, id]) =>
-        writeRearm(keys.rearm(input.originId, s, id), { originId: input.originId, source: s, sessionId: id, machineId: input.machineId }));
+      // Stamp the ownership stub's machine BEFORE the marker: the sweeper erases only a marker its stub binds, and claims
+      // skip deleted sessions, so this commit is the last writer that knows the tenant. `input.machineId` was checked
+      // against the tenant above. The stub keeps its generation (registerOwner); one missing is written at the claim's.
+      // Distinct raw workspace ids never share a stub (admissionUserDir hashes the RAW id), so a machine conflict here
+      // is a corrupt or forged stub: registerOwner refuses it (`ledger_owner_invalid`, the commit retries).
+      const rearm = (list: [string, string][]) => mapLimit(list, PARALLEL, async ([s, id]) => {
+        const sk = sessionKeyHash(s, id);
+        await registerOwner(keys.owner(input.originId, s, id), { v: 1, originId: input.originId, source: s, sessionId: id,
+          epoch: snapshot.epochs[sk]!, resets: snapshot.resets, machineId: input.machineId });
+        await writeRearm(keys.rearm(input.originId, s, id), { originId: input.originId, source: s, sessionId: id, machineId: input.machineId });
+      });
 
       // 1. The fence, and re-arm markers for what it reached, BEFORE any index merge.
       const first = fencedBy(await readFence(keys.fence));
