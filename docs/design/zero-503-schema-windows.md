@@ -292,7 +292,9 @@ recovers with this exact sequence, entirely through CI:
 
 1. **Source + Worker G+H.** Set `PRIVATE_INGEST_OVERLAP = {from: G, to: H}`, keep
    `expectedGeneration = G`, add `overlapGeneration: H` to the tracked profile, and deploy G+H at the
-   unchanged rollout phase (`step-1-custody` -> `step-1-custody-overlap`, confirmation `... OVERLAP <H>`).
+   unchanged **live** rollout phase (`baseline-drain` -> `baseline-drain-overlap`, confirmation
+   `... OVERLAP <H>`). Do not add `custodySource`: generation recovery cannot also perform the separately
+   gated Neon -> frozen-Supabase custody transition.
    Uploads stay refused: the database is not at G or H yet.
 2. **CI rebind G -> H.** Dispatch `.github/workflows/ingest-generation-overlap.yml` twice at the same main SHA:
    - `rebind-dry-run`, confirmation `REBIND-DRY-RUN <G> <H> SHA <sha>`: runs `rebindIngestGeneration` with
