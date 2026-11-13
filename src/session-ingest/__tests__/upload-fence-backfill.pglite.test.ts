@@ -4,7 +4,8 @@ import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
-import { applyFenceChange, entryForgotten, fenceEpoch, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "../ledger-s3.ts";
+import { applyFenceChange, entryForgotten, fenceEpoch, isDeletedForAdmission, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "../ledger-s3.ts";
+import type { OrderedControlInput } from "../ledger.ts";
 import { backfillUploadFences, type BackfillOptions, type BackfillSql } from "../upload-fence-backfill.ts";
 import { parseBackfillArgs } from "../../../scripts/upload-fence-backfill.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
@@ -298,6 +299,22 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     expect(summary.sections.fences).toBe("incomplete");
     const f = (await fenceOf(store, A))!;
     expect(f.resetsCompleted).toBeLessThan(f.resets); // ledger-s3's rule: never advanced past a reset in flight
+  });
+
+  test("main's v:2 fence (a control pending): the backfill merges into it and keeps the pending control and v:2", async () => {
+    const store = scratch();
+    const control = { epoch: "e".repeat(64), version: "1", digest: `d${"1".padStart(63, "0")}`, kind: "selection" as const };
+    await s3ControlMirror(store, ROOT).beginOrdered({ tenant: A, originId: "origin-1", sessions: [["claude", "pending"]], enabled: false, control } as OrderedControlInput);
+    expect((await fenceOf(store, A))!.v).toBe(2);
+    await del(A, "origin-1", "claude", "sess-1");
+    await reset(A, "req-1", "2030-01-02T00:00:00.000Z", 1);
+    const summary = await run(store);
+    expect(summary.fences).toMatchObject({ updated: 1, pairs_added: 1, resets_added: 1, unreadable: 0 });
+    const f = (await fenceOf(store, A))!;
+    expect(f.v).toBe(2);
+    expect(isDeletedForAdmission(f, "origin-1", "claude", "pending")).toBe(true); // the pending disable survives
+    expect(isDeletedForAdmission(f, "origin-1", "claude", "sess-1")).toBe(true);
+    expect(f.resetsCompleted).toBe(f.resets);
   });
 
   test("a contended fence CAS retries and lands; tallies count once", async () => {
