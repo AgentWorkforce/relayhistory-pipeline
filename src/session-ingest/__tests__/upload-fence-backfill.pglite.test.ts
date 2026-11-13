@@ -38,7 +38,7 @@ afterEach(async () => {
   cleanup = [];
   await db.exec(`DELETE FROM sessions.upload_deletions; DELETE FROM sessions.upload_resets; DELETE FROM sessions.ingest_session_ownership;
     DELETE FROM sessions.ingest_record_revisions; DELETE FROM sessions.ingest_batches; DELETE FROM sessions.ingest_lazy_native_slots;
-    DELETE FROM sessions.ingest_seed_fence_baselines;`);
+    DELETE FROM sessions.ingest_seed_fence_baselines; DELETE FROM sessions.ingest_control_receipts;`);
 });
 function scratch(): ObjectStore {
   const s = scratchStore();
@@ -65,6 +65,19 @@ const slot = (t: T, origin: string, record: string, owner: string | null, source
        initialized_witness_sha256, current_owner, current_source, current_session, current_revision, current_digest, current_reset_epoch, current_fence_epoch)
      VALUES ($1, '[]'::jsonb, $2, $3, $4, $5, $6, $6, $6, $7, $8, $9, $10, $11, $12, $12)`,
     [createHash("sha256").update(record).digest("hex"), t.orgId, t.workspaceId, origin, record, hex("e"), owner, source, session, revision, digest, owner === null ? null : 0]);
+/** SQL's ordered-control receipt (052000), as ingest_apply_ordered_control writes it with the control's effect. */
+const receipt = (t: T, epoch: string, version: number, kind: "selection" | "reset" = "selection") =>
+  q(`INSERT INTO sessions.ingest_control_receipts (org_id, workspace_id, user_id, epoch, version, digest, kind, result, schema_generation)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,'{}'::jsonb,$8)`, [t.orgId, t.workspaceId, t.userId, epoch, version, hex("d"), kind, hex("f")]);
+const EPOCH = hex("e");
+/** An ordered selection through main's control mirror, begun and finished (SQL applied it), as the Worker does. */
+async function mirrored(store: ObjectStore, t: T, session: string, enabled: boolean, version: number, epoch = EPOCH) {
+  const input = { tenant: t, originId: "origin-1", sessions: [["claude", session]], enabled,
+    control: { epoch, version: String(version), digest: hex("d"), kind: "selection" as const } } as OrderedControlInput;
+  const mirror = s3ControlMirror(store, ROOT);
+  await mirror.beginOrdered(input);
+  await mirror.finishOrdered(input, "applied");
+}
 const batch = (t: T, origin: string, id: string) =>
   q("INSERT INTO sessions.ingest_batches (org_id, workspace_id, origin_id, batch_id, user_id, digest, receipt_id, state, committed_at) VALUES ($1,$2,$3,$4,$5,$6,$7,'committed',now())",
     [t.orgId, t.workspaceId, origin, id, t.userId, hex("b"), `rhr_${hex("c")}`]);
@@ -339,17 +352,66 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     for (const sid of ["from-revision", "from-slot"]) expect(await ownerOf(store, A, "origin-1", "claude", sid)).toMatchObject({ epoch: 0, resets: 0, machineId: expect.stringMatching(/^srv_/) });
   });
 
-  test("finding 5: a rerun does not re-delete a session S3 re-enabled after the snapshot", async () => {
+  test("finding 5: a rerun does not re-delete a session an ordered control re-enabled after SQL's snapshot", async () => {
+    const store = scratch();
+    // SQL applied the disable (receipt v1, its deletion row); S3 has it too, then the user's re-enable (v2), which SQL's
+    // snapshot predates: S3's control is provably newer than everything the snapshot holds.
+    await receipt(A, EPOCH, 1);
+    await del(A, "origin-1", "claude", "sess-1");
+    await mirrored(store, A, "sess-1", false, 1);
+    await mirrored(store, A, "sess-1", true, 2);
+    expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "sess-1")).toBe(false);
+    const rerun = await run(store);
+    expect(rerun.fences).toMatchObject({ deletions_superseded: 1, deletions_unproven: 0, pairs_added: 0 });
+    expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "sess-1")).toBe(false);
+  });
+
+  test("second review 8: mirror disable then re-enable, then a SQL reset tombstones the session: it ends deleted in S3", async () => {
+    const store = scratch();
+    await mirrored(store, A, "S", false, 1);
+    await mirrored(store, A, "S", true, 2);
+    expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "S")).toBe(false);
+    // SQL's reset (not yet seen by S3) tombstones S. With no receipt at all the version rule alone could not order it,
+    // and a reset S3 has not completed for its request id never lets a deletion be skipped.
+    await del(A, "origin-1", "claude", "S");
+    await reset(A, "req-9", "2030-01-02T00:00:00.000Z", 1);
+    const summary = await run(store);
+    expect(summary.fences).toMatchObject({ deletions_superseded: 0, deletions_unproven: 1, pairs_added: 1, resets_added: 1 });
+    expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "S")).toBe(true);
+  });
+
+  test("second review 8: S3's control no newer than SQL's latest receipt never supersedes SQL's deletion", async () => {
+    const store = scratch();
+    await mirrored(store, A, "S", false, 1);
+    await mirrored(store, A, "S", true, 2);
+    // SQL went on to v3, a disable of S S3 has not seen yet: S3's v2 is OLDER than the deletion.
+    for (const v of [1, 2, 3]) await receipt(A, EPOCH, v);
+    await del(A, "origin-1", "claude", "S");
+    const summary = await run(store);
+    expect(summary.fences).toMatchObject({ deletions_superseded: 0, deletions_unproven: 1, pairs_added: 1 });
+    expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "S")).toBe(true);
+  });
+
+  test("second review 8: across control epochs the order is unknown, so SQL's deletion is applied", async () => {
+    const store = scratch();
+    await mirrored(store, A, "S", false, 1, hex("7"));
+    await mirrored(store, A, "S", true, 2, hex("7"));
+    await receipt(A, EPOCH, 1); // SQL's receipts are on another epoch than S3's control
+    await del(A, "origin-1", "claude", "S");
+    const summary = await run(store);
+    expect(summary.fences).toMatchObject({ deletions_superseded: 0, deletions_unproven: 1 });
+    expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "S")).toBe(true);
+  });
+
+  test("second review 8: an unordered S3 re-enable (no control version) cannot prove it is newer: re-applied, counted", async () => {
     const store = scratch();
     await del(A, "origin-1", "claude", "sess-1");
     await run(store);
-    expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "sess-1")).toBe(true);
-    // The user re-enables it through the live control mirror; SQL's row is still in the (stale) snapshot.
     await s3ControlMirror(store, ROOT).setSessionUploads({ tenant: A, originId: "origin-1", sessions: [["claude", "sess-1"]], enabled: true });
     expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "sess-1")).toBe(false);
     const rerun = await run(store);
-    expect(rerun.fences).toMatchObject({ deletions_superseded: 1, pairs_added: 0 });
-    expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "sess-1")).toBe(false);
+    expect(rerun.fences).toMatchObject({ deletions_superseded: 0, deletions_unproven: 1, pairs_added: 1 });
+    expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "sess-1")).toBe(true);
   });
 
   test("finding 8: a cold-imported reset is placed before every batch; one that cannot be is needs_review, never a drop", async () => {

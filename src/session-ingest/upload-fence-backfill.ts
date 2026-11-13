@@ -8,8 +8,15 @@
  *              `editFence` (absent starts from `newFence()`; main sets v1/v2), SQL's deletions and resets applied
  *              with `applyFenceChange` (a new deletion bumps the session's epoch; a new reset request id is recorded
  *              with its tombstone count, increments `resets`, raises `lastResetAtMs`; resetsCompleted == resets).
- *              - A deletion S3 has SUPERSEDED is not re-applied (finding 5): the control mirror ordered that session
- *                (`controlOrder`), or S3 disabled and re-enabled it (epoch > 0, not deleted). Counted.
+ *              - A deletion S3 has SUPERSEDED is not re-applied (finding 5), but only when that is PROVEN: S3's
+ *                ordered control for the session (`controlOrder`, [epoch, version]) is on the one control epoch of
+ *                the user's SQL receipts and above SQL's latest receipt version read in the SAME snapshot as the
+ *                deletion. SQL is the ordering authority and writes each receipt with its control's effect, so
+ *                such a control was decided after the snapshot, after the deletion. And never while the user has a
+ *                SQL reset S3 has not completed for its request id (that reset's tombstones are among the
+ *                deletions). Anything else (an unordered S3 re-enable with no version, receipts on another or on
+ *                several epochs, no receipt at all: the operator user erase deletes them) is applied, counted in
+ *                `deletions_unproven` when S3 had lifted or ordered the session (second review, finding 8).
  *              - A COLD-IMPORTED reset (the seed's baseline import, `ingest_seed_fence_baseline`: its `reset_at` is
  *                the import time, not the reset's) is recorded at time 1: the baseline import requires the user to
  *                have no batch yet, so it predates every batch of the user. If that does not hold for the user
@@ -73,8 +80,10 @@ export interface BackfillSummary {
     deletion_rows: number; reset_rows: number;
     created: number; updated: number; unchanged: number; would_create: number; would_update: number;
     pairs_added: number; resets_added: number;
-    /** SQL deletions not re-applied because S3 has a newer control for the session (finding 5). */
+    /** SQL deletions not re-applied because S3's control for the session is provably newer (finding 5). */
     deletions_superseded: number;
+    /** SQL deletions re-applied although S3 had lifted or ordered the session since: newer not provable (finding 8). */
+    deletions_unproven: number;
     /** Cold-imported resets recorded at COLD_RESET_AT_MS. */
     cold_resets: number;
     /** Users given no fence because a cold-imported reset could not be placed before all their batches. */
@@ -105,10 +114,19 @@ SELECT DISTINCT org_id, workspace_id, user_id FROM (
 WHERE (org_id, workspace_id, user_id) > ($2::text, $3::text, $4::text)
 ORDER BY org_id, workspace_id, user_id
 LIMIT $5::int`;
+/**
+ * Deletions, each with the user's control watermark from the SAME snapshot (finding 8): how many control epochs the
+ * user's SQL receipts span, that epoch, and the latest receipt version on it.
+ */
 const DELETIONS_FOR = `
-SELECT d.org_id, d.workspace_id, d.user_id, d.origin_id, d.source, d.session_id
+SELECT d.org_id, d.workspace_id, d.user_id, d.origin_id, d.source, d.session_id, wm.ctl_epochs, wm.ctl_epoch, wm.ctl_version
 FROM sessions.upload_deletions AS d
 JOIN unnest($1::text[], $2::text[], $3::text[]) AS p(o, w, u) ON d.org_id = p.o AND d.workspace_id = p.w AND d.user_id = p.u
+CROSS JOIN LATERAL (
+  SELECT count(DISTINCT r.epoch) AS ctl_epochs, min(r.epoch) AS ctl_epoch, max(r.version)::text AS ctl_version
+    FROM sessions.ingest_control_receipts AS r
+   WHERE r.org_id = d.org_id AND r.workspace_id = d.workspace_id AND r.user_id = d.user_id
+) AS wm
 ORDER BY d.org_id, d.workspace_id, d.user_id, d.origin_id, d.source, d.session_id`;
 /** Resets, with the cold-import evidence: the user's seed baseline import time, and whether a batch predates it. */
 const RESETS_FOR = `
@@ -166,28 +184,64 @@ async function mapLimit<T>(items: readonly T[], limit: number, fn: (item: T) => 
   }));
 }
 
+/**
+ * The user's SQL control watermark, read in the deletions' snapshot: the number of control epochs their receipts span,
+ * that epoch (when one), and the latest receipt version on it. `null` when unreadable.
+ */
+export interface SqlControlWatermark { epochs: number; epoch: string | null; version: bigint | null }
+
 /** One user's SQL control state, as read. */
 interface UserControls {
   tenant: LedgerTenant;
   deletions: Map<string, [string, string][]>;
+  watermark: SqlControlWatermark | null;
   resets: { requestId: string; atMs: number; result: number; cold: boolean }[];
   invalid: boolean;
   needsReview: boolean;
 }
 
+const VERSION = /^[1-9][0-9]{0,18}$/;
+const HEX64 = /^[0-9a-f]{64}$/;
+function watermarkOf(r: Record<string, unknown>): SqlControlWatermark | null {
+  const epochs = int(r.ctl_epochs);
+  if (epochs === undefined) return null;
+  if (epochs === 0) return { epochs, epoch: null, version: null };
+  if (typeof r.ctl_epoch !== "string" || !HEX64.test(r.ctl_epoch) || typeof r.ctl_version !== "string" || !VERSION.test(r.ctl_version)) return null;
+  return { epochs, epoch: r.ctl_epoch, version: BigInt(r.ctl_version) };
+}
+
 /**
- * SQL's controls applied to `f` with ledger-s3's rules (in place). A deletion S3 has superseded is skipped: the mirror
- * ordered that session since (controlOrder), or S3 disabled and re-enabled it (an epoch, no tombstone).
+ * S3's ordered control `at` ([epoch, version]) for a session is provably newer than everything SQL's snapshot holds:
+ * the user's receipts are on exactly one epoch, `at`'s, and `at` is above their latest version. SQL orders controls
+ * and writes a receipt with each control's effect, contiguously per epoch, so `at` was decided after the snapshot.
+ * No receipt at all proves nothing (an operator erase deletes them); several epochs, or another one, are unordered.
  */
-export function applySqlControls(f: FenceDoc, st: Pick<UserControls, "deletions" | "resets">): { changed: boolean; pairs: number; resets: number; superseded: number } {
-  let changed = false, pairs = 0, resets = 0, superseded = 0;
+export function provablyNewer(at: unknown, wm: SqlControlWatermark | null | undefined): boolean {
+  if (!wm || wm.epochs !== 1 || wm.epoch === null || wm.version === null) return false;
+  if (!Array.isArray(at) || at.length !== 2 || at[0] !== wm.epoch || typeof at[1] !== "string" || !VERSION.test(at[1])) return false;
+  return BigInt(at[1]) > wm.version;
+}
+
+/**
+ * SQL's controls applied to `f` with ledger-s3's rules (in place). A deletion is skipped only when S3's ordered control
+ * for the session is provably newer than it (provablyNewer, against the deletion snapshot's watermark), and never while
+ * the user has a SQL reset S3 has not completed for its request id. A deletion applied although S3 had lifted or
+ * ordered the session is counted `unproven`.
+ */
+export function applySqlControls(f: FenceDoc, st: Pick<UserControls, "deletions" | "resets"> & { watermark?: SqlControlWatermark | null }): { changed: boolean; pairs: number; resets: number; superseded: number; unproven: number } {
+  let changed = false, pairs = 0, resets = 0, superseded = 0, unproven = 0;
   const deletions: FenceChange["deletions"] = [];
+  // A SQL reset S3 has not recorded, or has recorded but not finished: its tombstones are SQL's deletions, so none of
+  // them may be skipped, whatever S3's order says.
+  const resetOpen = st.resets.some((r) => !Object.hasOwn(f.resetRequests, r.requestId) || f.resetRequests[r.requestId] === null);
   for (const [originId, sessions] of st.deletions) {
     const keep = sessions.filter(([s, sid]) => {
       const sk = sessionKeyHash(s, sid);
-      const ordered = f.controlOrder?.sessions && Object.hasOwn(f.controlOrder.sessions, originId) && Object.hasOwn(f.controlOrder.sessions[originId]!, sk);
+      const perOrigin = f.controlOrder?.sessions && Object.hasOwn(f.controlOrder.sessions, originId) ? f.controlOrder.sessions[originId]! : undefined;
+      const at = perOrigin && Object.hasOwn(perOrigin, sk) ? perOrigin[sk] : undefined;
+      if (!resetOpen && at !== undefined && provablyNewer(at, st.watermark)) { superseded++; return false; }
       const lifted = fenceEpoch(f, originId, sk) > 0 && !isDeleted(f, originId, s, sid);
-      if (ordered || lifted) { superseded++; return false; }
+      if (at !== undefined || lifted) unproven++;
       return true;
     });
     if (keep.length) deletions.push({ originId, sessions: keep });
@@ -198,7 +252,7 @@ export function applySqlControls(f: FenceDoc, st: Pick<UserControls, "deletions"
     pairs += r.newlyDeleted.length;
     if (r.reset === "recorded") resets++;
   }
-  return { changed, pairs, resets, superseded };
+  return { changed, pairs, resets, superseded, unproven };
 }
 
 /** Paged, short-transaction, read-only S3 ledger backfill. Counts only. */
@@ -230,7 +284,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   const summary: BackfillSummary = {
     mode: opts.dryRun ? "dry_run" : "execute", users: 0,
     fences: { deletion_rows: 0, reset_rows: 0, created: 0, updated: 0, unchanged: 0, would_create: 0, would_update: 0, pairs_added: 0, resets_added: 0,
-      deletions_superseded: 0, cold_resets: 0, needs_review: 0, unreadable: 0, contended: 0, tenant_invalid: 0, input_invalid: 0, failed: 0, resets_in_flight: 0 },
+      deletions_superseded: 0, deletions_unproven: 0, cold_resets: 0, needs_review: 0, unreadable: 0, contended: 0, tenant_invalid: 0, input_invalid: 0, failed: 0, resets_in_flight: 0 },
     ownership: { rows: 0, registered: 0, would_register: 0, unchanged: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, failed: 0 },
     revisions: { rows: 0, seed_rows: 0, slot_rows: 0, slots_empty: 0, merged: 0, would_merge: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, shards: 0, failed: 0 },
     sections: { fences: "not_run", ownership: "not_run", revisions: "not_run" },
@@ -253,11 +307,12 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   /** SQL's controls for a page of users (two short transactions). */
   async function controlsFor(users: [string, string, string][]): Promise<Map<string, UserControls>> {
     const cols = [users.map((p) => p[0]), users.map((p) => p[1]), users.map((p) => p[2])];
-    const states = new Map<string, UserControls>(users.map(([o, w, u]) => [userKey(o, w, u), { tenant: { orgId: o, workspaceId: w, userId: u }, deletions: new Map(), resets: [], invalid: false, needsReview: false }]));
+    const states = new Map<string, UserControls>(users.map(([o, w, u]) => [userKey(o, w, u), { tenant: { orgId: o, workspaceId: w, userId: u }, deletions: new Map(), watermark: null, resets: [], invalid: false, needsReview: false }]));
     for (const r of await readOnly(DELETIONS_FOR, cols)) {
       const st = states.get(userKey(r.org_id, r.workspace_id, r.user_id))!;
       summary.fences.deletion_rows++;
       if (!id(r.origin_id) || !id(r.source) || !id(r.session_id)) { st.invalid = true; continue; }
+      st.watermark ??= watermarkOf(r);
       st.deletions.set(r.origin_id, [...(st.deletions.get(r.origin_id) ?? []), [r.source, r.session_id]]);
     }
     for (const r of await readOnly(RESETS_FOR, cols)) {
@@ -321,6 +376,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
             summary.fences.pairs_added += t.pairs;
             summary.fences.resets_added += t.resets;
             summary.fences.deletions_superseded += t.superseded;
+            summary.fences.deletions_unproven += t.unproven;
             summary.fences.cold_resets += cold;
             if (f.resetsCompleted < f.resets) summary.fences.resets_in_flight++;
             if (read.state === "absent") summary.fences.would_create++;
@@ -341,6 +397,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
           summary.fences.pairs_added += landed.t.pairs;
           summary.fences.resets_added += landed.t.resets;
           summary.fences.deletions_superseded += landed.t.superseded;
+          summary.fences.deletions_unproven += landed.t.unproven;
           summary.fences.cold_resets += cold;
           if (landed.inFlight) summary.fences.resets_in_flight++;
         } catch (error) {
