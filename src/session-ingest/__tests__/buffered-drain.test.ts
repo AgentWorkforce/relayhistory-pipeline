@@ -669,4 +669,127 @@ describe("buffered backlog drain (0005)", () => {
     expect(() => parseDrainArgs(["--bucket", "my-bucket", "--dry-run", "--concurrency", "99"])).toThrow("--concurrency");
     expect(parseDrainArgs(["--dry-run", "--bucket", "my-bucket", "--org", "o1", "--org", "o2"])).toEqual({ mode: "dry_run", bucket: "my-bucket", region: "us-east-1", orgs: ["o1", "o2"], concurrency: 4 });
   });
+
+  // ---- second review: finding 4 (hold intent, lock-time recheck) and the fencing margin ----
+
+  /** A store proxy whose `put` runs `hook` first (which may throw, or await). */
+  const hooked = (store: ObjectStore, hook: (key: string) => void | Promise<void>) => new Proxy(store, {
+    get(target, prop) {
+      if (prop === "put") return async (...args: Parameters<ObjectStore["put"]>) => { await hook(String(args[0])); return target.put(...args); };
+      const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+      return typeof v === "function" ? (v as (...x: unknown[]) => unknown).bind(target) : v;
+    },
+  });
+  /** `record:payload text` of every canonical sess-1 line. */
+  const sess1Texts = async (store: ObjectStore) => {
+    const out: string[] = [];
+    for (const k of await allKeys(store, `${ROOT}/${TENANT.orgId}/v1`)) {
+      if (!k.includes("/raw/") || !k.includes("/s=sess-1/")) continue;
+      for (const l of dec.decode(decompress(await readAll(await store.get(objectKey(k))))).split("\n").filter(Boolean)) {
+        const r = JSON.parse(l);
+        out.push(`${r.record_id}:${r.payload.text}`);
+      }
+    }
+    return out;
+  };
+
+  test("finding 4 (same run): a batch queued behind a failing batch's shard lock re-checks the user and stops", async () => {
+    const store = await scratch();
+    // Both batches carry r1 at the same revision with other content (one shard), plus a sess-2 record.
+    const one = (tag: string, d: string) => [group("claude", "sess-1", [{ id: "r1", rev: 5, digest: d.repeat(64) }]), group("claude", "sess-2", [{ id: `r-${tag}`, rev: 1 }])];
+    await stage(store, one("x", "a"), { batch: "X" });
+    await stage(store, one("y", "b"), { batch: "Y" });
+    // The first sess-2 manifest put fails (non-retryable), but only once BOTH batches are past their start checks,
+    // so the second is queued on the first's shard lock when the first fails.
+    let journalReads = 0, failed = false;
+    const base = s3DrainLedger(store, ROOT);
+    const ledger: DrainLedger = { ...base, async readJournal(t) { journalReads++; return base.readJournal(t); } };
+    const flaky = hooked(store, async (k) => {
+      if (!failed && k.includes("/s=sess-2/") && k.endsWith("manifest.json")) {
+        while (journalReads < 2) await new Promise((r) => setTimeout(r, 1));
+        await new Promise((r) => setTimeout(r, 20));
+        failed = true;
+        throw new ObjectStoreError("unauthorized", "fs", "injected");
+      }
+    });
+    const summary = await run(flaky, { ledger, concurrency: 2 });
+    expect(summary.objects.write_failed).toBe(1);
+    expect(summary.objects.user_stopped).toBe(1);
+    expect(summary.objects.drained).toBe(0);
+    // Only the failing batch's copy of r1 reached canonical.
+    expect((await sess1Texts(store)).length).toBe(1);
+  });
+
+  test("finding 4 (crash): the hold is an intent written before the first canonical byte; the next run restores first", async () => {
+    const store = await scratch();
+    const a = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 5, digest: "a".repeat(64) }]), group("claude", "sess-2", [{ id: "r2", rev: 1 }])], { batch: "A" });
+    // SIGKILL right after sess-1's manifest lands: from then on nothing reaches storage (no partial() path, no hold write).
+    let dead = false;
+    const t0 = Date.parse("2030-01-05T00:00:00.000Z");
+    const crashing = hooked(store, (k) => {
+      if (dead) throw new ObjectStoreError("unauthorized", "fs", "process gone");
+      if (k.includes("/s=sess-1/") && k.endsWith("manifest.json")) dead = true;
+    });
+    await run(crashing, { concurrency: 1, now: () => new Date(t0) }).catch(() => {});
+    expect(dead).toBe(true);
+    expect(await readJson(store, drainHoldKey(ROOT, TENANT))).toEqual({ v: 1, kind: "buffered-drain-hold", keys: [a] });
+    // A conflicting batch arrives, sorting BEFORE A (the key's batch segment is sha256(batch digest)); the next run
+    // (the dead lease has expired) reaches it first, holds it, and restores A.
+    const segment = (label: string) => sha(sha(label));
+    let label = "B";
+    for (let i = 0; segment(label) >= segment("A"); i++) label = `B${i}`;
+    const b = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 5, digest: "b".repeat(64) }])], { batch: label });
+    expect(b < a).toBe(true);
+    const later = () => new Date(t0 + 60 * 60_000);
+    const second = await run(store, { concurrency: 1, now: later });
+    expect(second.objects.user_hold).toBe(1);
+    expect(second.objects.drained).toBe(1);
+    expect(await exists(store, a + DRAINED_SUFFIX)).toBe(true);
+    expect(await storedEntry(store, "r1")).toEqual([5, "r1:r5", "a".repeat(64), SESS1, 0, 0]);
+    expect((await readJson(store, drainHoldKey(ROOT, TENANT))).keys).toEqual([]);
+    await run(store, { concurrency: 1, now: later });
+    expect(await exists(store, b + DRAINED_SUFFIX)).toBe(true); // marked: refused as a conflict
+    expect(await sess1Texts(store)).toEqual(["r1:t-r1-5"]);
+  });
+
+  test("finding 4: a hold intent that cannot be written refuses the batch before any canonical byte", async () => {
+    const store = await scratch();
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    const holdKey = drainHoldKey(ROOT, TENANT);
+    const summary = await run(hooked(store, (k) => { if (k === holdKey) throw new ObjectStoreError("unauthorized", "fs", "injected"); }));
+    expect(summary.objects.hold_failed).toBe(1);
+    expect(summary.objects.drained).toBe(0);
+    expect((await canonical(store)).size).toBe(0);
+    expect(await exists(store, key + DRAINED_SUFFIX)).toBe(false);
+    expect(await storedEntry(store, "r1")).toBeUndefined();
+    // Once the hold can be written, the batch drains and its intent is cleared.
+    expect((await run(store)).objects.drained).toBe(1);
+    expect((await readJson(store, holdKey)).keys).toEqual([]);
+  });
+
+  test("fencing: the lease counts as dead a third of its TTL before it expires", async () => {
+    const store = await scratch();
+    let t = Date.parse("2030-01-05T00:00:00.000Z");
+    const lease = await acquireDrainLock(store, ROOT, { holder: "drain-a", ttlMs: 60_000, now: () => t });
+    t += 39_999;
+    expect(lease.alive()).toBe(true);
+    t += 1;
+    expect(lease.alive()).toBe(false);
+    await lease.renew();
+    expect(lease.alive()).toBe(true);
+  });
+
+  test("fencing: the lease is re-checked between groups inside one batch's write, and the write stops at once", async () => {
+    const store = await scratch();
+    let t = Date.parse("2030-01-05T00:00:00.000Z");
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }]), group("claude", "sess-2", [{ id: "r2", rev: 1 }]), group("claude", "sess-3", [{ id: "r3", rev: 1 }])]);
+    // The first session's manifest lands, then the clock passes the lease's safety margin (not its expiry).
+    const slow = hooked(store, (k) => { if (k.endsWith("manifest.json") && k.includes("/s=sess-1/")) t += 45_000; });
+    const summary = await run(slow, { lockTtlMs: 60_000, now: () => new Date(t) });
+    expect(summary.objects.lock_lost).toBe(1);
+    expect([...(await canonical(store)).keys()]).toEqual(["sess-1"]);
+    expect(await exists(store, key + DRAINED_SUFFIX)).toBe(false);
+    // The intent survives, so the next run restores this batch before any other of the user.
+    expect((await readJson(store, drainHoldKey(ROOT, TENANT))).keys).toEqual([key]);
+  });
 });

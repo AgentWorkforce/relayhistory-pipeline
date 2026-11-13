@@ -220,6 +220,20 @@ export function readOnlyStore(store: ObjectStore): ObjectStore {
   });
 }
 
+/** A store whose `put` and `delete` refuse (DrainLockError) whenever `ok()` is false: the lease fence on every write. */
+export function leaseGuardedStore(store: ObjectStore, ok: () => boolean): ObjectStore {
+  return new Proxy(store, {
+    get(target, prop) {
+      const value = (target as unknown as Record<PropertyKey, unknown>)[prop];
+      if (prop === "put" || prop === "delete") return async (...args: unknown[]) => {
+        if (!ok()) throw new DrainLockError("drain_lock_lost");
+        return (value as (...a: unknown[]) => unknown).apply(target, args);
+      };
+      return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(target) : value;
+    },
+  });
+}
+
 // ---- classification ----
 
 export type ObjectOutcome =
@@ -244,6 +258,7 @@ export type ObjectOutcome =
   | "fence_authority_invalid"
   | "user_hold"
   | "user_stopped"
+  | "hold_failed"
   | "lock_lost"
   | "index_unreadable"
   | "write_failed"
@@ -255,7 +270,7 @@ export type ObjectOutcome =
 
 const OUTCOMES: ObjectOutcome[] = [
   "drained", "would_drain", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch",
-  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "control_pending", "fence_authority_missing", "fence_authority_invalid", "user_hold", "user_stopped", "lock_lost", "index_unreadable", "write_failed",
+  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "control_pending", "fence_authority_missing", "fence_authority_invalid", "user_hold", "user_stopped", "hold_failed", "lock_lost", "index_unreadable", "write_failed",
   "index_merge_failed", "fence_recheck_failed", "fence_moved", "marker_failed", "internal_error",
 ];
 
@@ -280,7 +295,10 @@ export interface DrainSummary {
   /** Session groups written (execute) or that would be (dry run). */
   sessions_written: number;
   rearmed: number;
-  /** A hold that could not be recorded after a partial write: the operator must rerun before anything else. */
+  /**
+   * Hold writes that failed: an intent before a write (the batch is refused, `hold_failed`), a release after its
+   * index merge (left unmarked, `hold_failed`), or the best-effort re-record after a partial write.
+   */
   hold_failures: number;
   /** Orgs without a valid fence-authority marker (per-org, else deployment-wide): --execute writes nothing of them. */
   orgs_without_authority: number;
@@ -528,7 +546,10 @@ export interface DrainLease {
   /** The fencing token of this lease (one above the previous holder's). */
   readonly token: number;
   renew(): Promise<void>;
-  /** True while the last successful write of the lease is still unexpired: checked before every mutation. */
+  /**
+   * True while the lease is held and its last renewal is more than a third of the TTL from expiry: checked before
+   * every mutation and before every canonical put.
+   */
   alive(): boolean;
   release(): Promise<void>;
 }
@@ -566,7 +587,8 @@ export async function acquireDrainLock(store: ObjectStore, keyRoot: string, opts
       }
     },
     alive() {
-      return !lost && opts.now() < expiresAt;
+      // A safety margin: dead a third of the TTL before expiry (one missed renewal), never at the edge.
+      return !lost && opts.now() < expiresAt - Math.floor(opts.ttlMs / 3);
     },
     async release() {
       // Expire it in place (the drain never deletes). A lost lease is someone else's now: leave it.
@@ -628,7 +650,10 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   if (!Number.isSafeInteger(lockTtlMs) || lockTtlMs < 1_000) throw new Error("drain_lock_ttl_invalid");
   const resetMarginMs = opts.resetMarginMs ?? RESET_MARGIN_DEFAULT_MS;
   if (!Number.isSafeInteger(resetMarginMs) || resetMarginMs < RESET_MARGIN_MIN_MS) throw new Error("drain_reset_margin_invalid");
-  const store = opts.dryRun ? readOnlyStore(opts.store) : opts.store;
+  const raw = opts.dryRun ? readOnlyStore(opts.store) : opts.store;
+  // Every mutation but the lease's own goes through `store`, which refuses a put the moment the lease is not
+  // fresh (DrainLockError: never retried by the writer), so a long write stops between any two objects.
+  const store = opts.dryRun ? raw : leaseGuardedStore(raw, () => leaseOk());
   const ledger = opts.ledger ?? s3DrainLedger(store, opts.keyRoot, { ...(opts.sleep ? { sleep: opts.sleep } : {}), ...(opts.random ? { random: opts.random } : {}) });
   const target: WriteTarget = {
     store, keyRoot: opts.keyRoot,
@@ -644,7 +669,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   let renewTimer: ReturnType<typeof setInterval> | undefined;
   if (opts.dryRun) await assertDrainUnlocked(opts.store, opts.keyRoot, nowMs());
   else {
-    lease = await acquireDrainLock(store, opts.keyRoot, { holder: opts.lockHolder ?? `drain-${randomUUID()}`, ttlMs: lockTtlMs, now: nowMs });
+    lease = await acquireDrainLock(raw, opts.keyRoot, { holder: opts.lockHolder ?? `drain-${randomUUID()}`, ttlMs: lockTtlMs, now: nowMs });
     let renewing = false;
     renewTimer = setInterval(() => {
       if (renewing || lockLost !== undefined) return;
@@ -656,7 +681,11 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   const orgs = orgOrder(opts.orgs);
   summary.orgs = orgs.length;
 
-  /** Admission's fence authority per org, re-read at most every AUTHORITY_TTL_MS (as admission's cache). */
+  /**
+   * Admission's fence authority per org, re-read at most every AUTHORITY_TTL_MS (as admission's cache).
+   * TODO(#595): once the deployment-wide stop (`.ledger/fence-authority/.stop.json`) is on main, read it here through
+   * main's fence-authority reader on the same cadence, and once more before each canonical write (refuse on stop).
+   */
   const authorities = new Map<string, { value: Authority; at: number }>();
   async function currentAuthority(org: string): Promise<Authority> {
     const hit = authorities.get(org);
@@ -666,31 +695,51 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     return value;
   }
   /** The run's lease is held and fresh: checked before every mutation (the dry run has none). */
-  const leaseOk = () => opts.dryRun || (lockLost === undefined && lease !== undefined && lease.alive());
+  function leaseOk(): boolean {
+    return opts.dryRun || (lockLost === undefined && lease !== undefined && lease.alive());
+  }
 
   /**
    * Per-user hold (finding 4): a batch whose canonical write may have landed without its index entries holds its
    * user. Until that batch drains (re-deriving those entries from the same staged lines before anything else of
    * the user is written), every other batch of the user is `user_hold`; in the failing run the user is also
    * `user_stopped`. Durable, so a rerun honours it; never deleted, emptied by CAS.
+   *
+   * The hold is an INTENT: a batch adds itself before its first canonical byte (refused, `hold_failed`, if that
+   * write fails) and removes itself only after its index merge, so a SIGKILL, OOM or host death mid-write still
+   * leaves it. `intents` are this run's own in-flight entries: they do not hold the user's other batches (a failure
+   * stops the user through `stoppedUsers` instead); every other entry, from an earlier run, does.
    */
   const stoppedUsers = new Set<string>();
+  const intents = new Set<string>();
   const holds = new Map<string, Promise<DrainHold | "invalid" | null>>();
   const holdKeyOf = (t: LedgerTenant) => drainHoldKey(opts.keyRoot, t);
   const userKeyOf = (t: LedgerTenant) => JSON.stringify([t.orgId, t.workspaceId, t.userId]);
-  function readHold(t: LedgerTenant) {
+  function readHold(t: LedgerTenant, fresh = false) {
     const uk = userKeyOf(t);
-    if (!holds.has(uk)) holds.set(uk, readText(opts.store, holdKeyOf(t), 1024 * 1024).then((got) => (got ? parseDrainHold(got.text) ?? "invalid" : null), () => "invalid" as const));
+    if (fresh || !holds.has(uk)) holds.set(uk, readText(opts.store, holdKeyOf(t), 1024 * 1024).then((got) => (got ? parseDrainHold(got.text) ?? "invalid" : null), () => "invalid" as const));
     return holds.get(uk)!;
+  }
+  /** Held back: an unreadable hold (fail closed), or entries from an earlier run that do not include this batch. */
+  function heldBack(hold: DrainHold | "invalid" | null, key: string): boolean {
+    if (hold === "invalid") return true;
+    const earlier = (hold?.keys ?? []).filter((k) => !intents.has(k));
+    return earlier.length > 0 && !earlier.includes(key);
   }
   async function editHold(t: LedgerTenant, edit: (keys: string[]) => string[]): Promise<void> {
     const key = holdKeyOf(t);
-    for (let attempt = 0; attempt < 8; attempt++) {
+    for (let attempt = 0; attempt < 16; attempt++) {
+      // Same-user batches CAS one hold object (an intent per batch): back off, jittered, on contention.
+      if (attempt > 0) await (opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))))(Math.floor((opts.random ?? Math.random)() * Math.min(2_000, 25 * 2 ** attempt)));
       const got = await readText(store, key, 1024 * 1024);
       const cur = got ? parseDrainHold(got.text) : null;
       if (got && !cur) throw new Error("drain_hold_invalid");
       const keys = edit([...(cur?.keys ?? [])]);
       const doc: DrainHold = { v: 1, kind: "buffered-drain-hold", keys };
+      if ((cur ? cur.keys : []).length === keys.length && keys.every((k, i) => k === cur!.keys[i])) {
+        holds.set(userKeyOf(t), Promise.resolve(doc));
+        return;
+      }
       try {
         await store.put(objectKey(key), encoder.encode(JSON.stringify(doc)), got ? { ifMatch: got.version, contentType: "application/json" } : { ifNoneMatch: true, contentType: "application/json" });
         holds.set(userKeyOf(t), Promise.resolve(doc));
@@ -825,9 +874,8 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     const receivedMs = Date.parse(header.received_at);
     const uk = userKeyOf(tenant);
     if (stoppedUsers.has(uk)) return "user_stopped";
-    const hold = await readHold(tenant);
     // An unreadable hold fails closed; a held user writes only its held batches until they drain.
-    if (hold === "invalid" || (hold && hold.keys.length > 0 && !hold.keys.includes(key))) return "user_hold";
+    if (heldBack(await readHold(tenant), key)) return "user_hold";
     let keys: ReturnType<DrainLedger["keysFor"]>;
     let read: FenceRead;
     try {
@@ -893,6 +941,13 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     for (const k of kept) for (const line of k.lines) shardKeys.add(keys.revisions(origin, recordOf(line).record_id));
     const release = await locks.acquire([...shardKeys]);
     try {
+      // Again under the shard lock: a batch queued behind one that failed (or held the user) meanwhile stops here.
+      // The hold is re-read from storage, not the cache.
+      if (stoppedUsers.has(uk)) return "user_stopped";
+      const hold = await readHold(tenant, true);
+      if (heldBack(hold, key)) return "user_hold";
+      /** This batch is an entry of a hold from an earlier run: it re-derives its index entries, then releases it. */
+      const heldEarlier = hold !== "invalid" && hold !== null && hold.keys.includes(key) && !intents.has(key);
       const shards = new Map<string, Record<string, IndexEntry>>();
       try {
         for (const sk of shardKeys) {
@@ -951,6 +1006,8 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       /** A failure after the canonical write began: stop the user for the run, hold the batch, re-arm (finding 4). */
       const partial = async (outcome: ObjectOutcome): Promise<ObjectOutcome> => {
         stoppedUsers.add(uk);
+        // The intent is on storage already: from now on it holds the user's other batches (this run and later).
+        intents.delete(key);
         try {
           for (const [s, id] of writtenSessions.values()) {
             await ledger.writeRearm(keys.rearm(origin, s, id), { originId: origin, source: s, sessionId: id, machineId: machine, workspaceId: header.workspace_id });
@@ -958,6 +1015,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
           }
         } catch { /* best effort: the hold below is what protects the index */ }
         try {
+          // Normally a no-op: the intent was written before the first canonical byte.
           await editHold(tenant, (ks) => (ks.includes(key) ? ks : [...ks, key]));
         } catch {
           summary.hold_failures++;
@@ -986,9 +1044,26 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       if (await currentAuthority(header.org_id) !== "ok") return "fence_authority_missing";
       if (!leaseOk()) return "lock_lost";
       if (toWrite.length) {
+        // The hold intent, BEFORE the first canonical byte: without it on storage, nothing of the batch is written.
+        if (!heldEarlier) {
+          try {
+            await editHold(tenant, (ks) => (ks.includes(key) ? ks : [...ks, key]));
+          } catch {
+            // Possibly written anyway (an ambiguous put): then it holds the user until this batch drains. Fail closed.
+            summary.hold_failures++;
+            return "hold_failed";
+          }
+          intents.add(key);
+        }
+        const batch = { orgId: header.org_id, workspaceId: header.workspace_id, originId: origin, userId: header.user_id, batchDigest: header.batch_digest };
         try {
-          machineId = (await writeGroups(target, { orgId: header.org_id, workspaceId: header.workspace_id, originId: origin, userId: header.user_id, batchDigest: header.batch_digest }, toWrite, new Date(receivedMs))).machineId;
+          // One session group at a time, the lease re-checked between them (and before every put, by `store`).
+          for (const g of toWrite) {
+            if (!leaseOk()) return partial("lock_lost");
+            machineId = (await writeGroups(target, batch, [g], new Date(receivedMs))).machineId;
+          }
         } catch (error) {
+          if (error instanceof DrainLockError) return partial("lock_lost");
           const code = error instanceof IngestWriteError ? error.code : "storage";
           summary.write_failures[code] = (summary.write_failures[code] ?? 0) + 1;
           // Some groups may have landed: their records have no index entries until this batch drains.
@@ -1021,8 +1096,8 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
           await ledger.registerOwner(keys.owner(origin, s, id), { v: 1, originId: origin, source: s, sessionId: id, epoch, resets, machineId });
           summary.rearmed++;
         }
-      } catch {
-        return partial("fence_recheck_failed");
+      } catch (error) {
+        return partial(error instanceof DrainLockError ? "lock_lost" : "fence_recheck_failed");
       }
       if (!leaseOk()) return partial("lock_lost");
       try {
@@ -1030,19 +1105,27 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
           const keep = list.filter((e) => e.sessionKey === null || ![...fencedNow].some((pk) => { const [s, id] = JSON.parse(pk) as [string, string]; return sessionKeyHash(s, id) === e.sessionKey; }));
           if (keep.length) await ledger.mergeIndex(sk, after, origin, keep);
         }
-      } catch {
-        return partial("index_merge_failed");
+      } catch (error) {
+        return partial(error instanceof DrainLockError ? "lock_lost" : "index_merge_failed");
       }
-      if (!leaseOk()) return "lock_lost"; // written and merged: a rerun only re-marks it
-      if (!(await putMarker(key, sha256, "drained", counts, toWrite.length, lease?.token))) return "marker_failed";
-      // This batch's index entries are in: release its hold, if it had one.
-      if (hold && hold.keys.includes(key)) {
+      // Written and merged. A lost lease leaves the intent: the next run re-derives (a no-op) and releases it.
+      if (!leaseOk()) {
+        intents.delete(key);
+        return "lock_lost";
+      }
+      // This batch's index entries are in: release its hold entry (an intent, or an earlier run's), THEN mark it, so a
+      // marked batch never leaves an entry no run would revisit. A failed release leaves the batch unmarked.
+      if (intents.has(key) || heldEarlier) {
         try {
           await editHold(tenant, (ks) => ks.filter((k) => k !== key));
         } catch {
+          intents.delete(key);
           summary.hold_failures++;
+          return "hold_failed";
         }
+        intents.delete(key);
       }
+      if (!(await putMarker(key, sha256, "drained", counts, toWrite.length, lease?.token))) return "marker_failed";
       addCounts(counts, toWrite.length);
       return "drained";
     } finally {
