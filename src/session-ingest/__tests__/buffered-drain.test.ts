@@ -262,6 +262,36 @@ describe("buffered backlog drain (0005)", () => {
     expect((await readJson(store, late + DRAINED_SUFFIX)).outcome).toBe("drained");
   });
 
+  test("reset margin: batches within the margin of the last reset, either side, are skipped unmarked", async () => {
+    const store = await scratch();
+    const R = Date.parse("2030-01-03T00:00:00.000Z");
+    const at = (ms: number) => new Date(R + ms).toISOString();
+    const keys = {
+      before: await stage(store, [group("claude", "s-before", [{ id: "a", rev: 1 }])], { received: at(-6 * 60_000) }),
+      nearBefore: await stage(store, [group("claude", "s-near-before", [{ id: "b", rev: 1 }])], { received: at(-2 * 60_000) }),
+      nearAfter: await stage(store, [group("claude", "s-near-after", [{ id: "c", rev: 1 }])], { received: at(2 * 60_000) }),
+      edge: await stage(store, [group("claude", "s-edge", [{ id: "e", rev: 1 }])], { received: at(5 * 60_000) }),
+      after: await stage(store, [group("claude", "s-after", [{ id: "d", rev: 1 }])], { received: at(6 * 60_000) }),
+    };
+    await putFence(store, { v: 1, resets: 1, deleted: {}, lastResetAtMs: R });
+    const summary = await run(store);
+    expect(summary.objects.pre_reset).toBe(1);
+    expect(summary.objects.reset_margin).toBe(2);
+    expect(summary.objects.drained).toBe(2); // received exactly at reset + margin drains
+    expect([...(await canonical(store)).keys()].sort()).toEqual(["s-after", "s-edge"]);
+    expect(await exists(store, keys.nearBefore + DRAINED_SUFFIX)).toBe(false);
+    expect(await exists(store, keys.nearAfter + DRAINED_SUFFIX)).toBe(false);
+    expect((await readJson(store, keys.before + DRAINED_SUFFIX)).outcome).toBe("pre_reset");
+
+    // A wider margin skips more; below the 1-minute floor is refused, here and at the CLI.
+    const wide = await run(store, { resetMarginMs: 10 * 60_000 });
+    expect(wide.objects.reset_margin).toBe(2);
+    expect(wide.objects.already_drained).toBe(3);
+    await expect(run(store, { resetMarginMs: 59_999 })).rejects.toThrow("drain_reset_margin_invalid");
+    expect(() => parseDrainArgs(["--dry-run", "--bucket", "my-bucket", "--reset-margin-seconds", "59"])).toThrow("--reset-margin-seconds");
+    expect(parseDrainArgs(["--dry-run", "--bucket", "my-bucket", "--reset-margin-seconds", "600"]).resetMarginMs).toBe(600_000);
+  });
+
   test("an interrupted GC replacement (two live objects for one claim) is never guessed", async () => {
     const store = await scratch();
     const claim = randomUUID();

@@ -20,8 +20,11 @@
  *        `seq` watermark with no times; a buffered staged header holds `received_at` but no journal
  *        witness (only async inbox objects carry one). So supersession is determinable only when the
  *        fence also carries `lastResetAtMs` (an optional field this module proposes for the backfill).
- *        `resets > 0` without it: `reset_undeterminable`, skipped. With it, `received_at <=
- *        lastResetAtMs`: `pre_reset`, dropped and marked.
+ *        `resets > 0` without it: `reset_undeterminable`, skipped. With it, and a clock-skew margin M
+ *        (default 5 minutes, floor 1 minute; `received_at` is the Worker's clock, `lastResetAtMs`
+ *        the database's): `received_at <= lastResetAtMs - M` is `pre_reset`, dropped and marked;
+ *        within M on either side of the reset is `reset_margin`, skipped and left undrained (never
+ *        written, never marked); only `received_at >= lastResetAtMs + M` drains.
  *   4. Read the per-session revision index (0005 `ledger/revisions/…`) for every surviving session:
  *      a lower revision is `stale`, an equal one with the stored digest is `already_stored`, an equal
  *      one with another digest is a `revision_conflict` and is never written (the reader fold refuses
@@ -71,6 +74,9 @@ import {
 } from "./writer.ts";
 
 export const DRAINED_SUFFIX = ".drained.json";
+/** Clock-skew margin around a user's last reset (see step 3): default and floor. */
+export const RESET_MARGIN_DEFAULT_MS = 5 * 60_000;
+export const RESET_MARGIN_MIN_MS = 60_000;
 export const STAGED_SUFFIX = ".staged.ndjson.zst";
 export const MAX_DRAIN_CONCURRENCY = 32;
 const INDEX_CAS_ATTEMPTS = 8;
@@ -343,6 +349,7 @@ export type ObjectOutcome =
   | "journal_unreadable"
   | "privacy_control_open"
   | "reset_undeterminable"
+  | "reset_margin"
   | "index_unreadable"
   | "write_failed"
   | "index_merge_failed"
@@ -352,7 +359,7 @@ export type ObjectOutcome =
 
 const OUTCOMES: ObjectOutcome[] = [
   "drained", "would_drain", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch",
-  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "index_unreadable", "write_failed",
+  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "index_unreadable", "write_failed",
   "index_merge_failed", "fence_recheck_failed", "marker_failed", "internal_error",
 ];
 
@@ -611,6 +618,8 @@ export interface DrainOptions {
   assumeEmptyFence?: boolean;
   /** Lease TTL for the run lock (renewed every third of it). Default DRAIN_LOCK_TTL_MS. */
   lockTtlMs?: number;
+  /** Clock-skew margin around the last reset. Default RESET_MARGIN_DEFAULT_MS; below RESET_MARGIN_MIN_MS refuses. */
+  resetMarginMs?: number;
   /** Lease holder id (no personal data). Default a random `drain-<uuid>`. */
   lockHolder?: string;
   /** Ledger override (tests; later ledger-s3.ts). Default: s3DrainLedger over `store`. */
@@ -643,6 +652,8 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   if (opts.assumeEmptyFence && !opts.dryRun) throw new Error("drain_assume_empty_fence_requires_dry_run");
   const lockTtlMs = opts.lockTtlMs ?? DRAIN_LOCK_TTL_MS;
   if (!Number.isSafeInteger(lockTtlMs) || lockTtlMs < 1_000) throw new Error("drain_lock_ttl_invalid");
+  const resetMarginMs = opts.resetMarginMs ?? RESET_MARGIN_DEFAULT_MS;
+  if (!Number.isSafeInteger(resetMarginMs) || resetMarginMs < RESET_MARGIN_MIN_MS) throw new Error("drain_reset_margin_invalid");
   const store = opts.dryRun ? readOnlyStore(opts.store) : opts.store;
   const ledger = opts.ledger ?? s3DrainLedger(store, opts.keyRoot, { ...(opts.sleep ? { sleep: opts.sleep } : {}), ...(opts.random ? { random: opts.random } : {}) });
   const target: WriteTarget = {
@@ -803,10 +814,12 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     const counts = { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0 };
     if (fence.resets > 0) {
       if (fence.lastResetAtMs === undefined) return "reset_undeterminable";
-      if (receivedMs <= fence.lastResetAtMs) {
+      if (receivedMs <= fence.lastResetAtMs - resetMarginMs) {
         if (!opts.dryRun && !(await putMarker(key, sha256, "pre_reset", counts, 0))) return "marker_failed";
         return "pre_reset";
       }
+      // Too close to the reset to order across two clocks: never written, never marked, reported.
+      if (receivedMs < fence.lastResetAtMs + resetMarginMs) return "reset_margin";
     }
     const deleted = new Set((fence.deleted[header.origin_id] ?? []).map((p) => JSON.stringify(p)));
     type Kept = { group: Group; lines: string[]; meta: LineMeta[] };
