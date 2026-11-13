@@ -54,6 +54,8 @@ jobs:
       actions: read
       packages: write
       id-token: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       # Keep the verifier from the trusted workflow commit, not the older image source.
       - uses: actions/checkout@v4
@@ -186,3 +188,63 @@ jobs:
             ${{ runner.temp }}/build-provenance.sigstore.json
             ${{ runner.temp }}/reviewed-source.sigstore.json
           if-no-files-found: error
+
+  notify-release-candidate:
+    name: Attest and notify Agent Relay release candidate
+    needs: [preflight, publish]
+    if: ${{ needs.publish.result == 'success' && github.ref == 'refs/heads/main' }}
+    runs-on: ${{ vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Require GitHub-attestable source identity
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.preflight.outputs.sha }}
+          WORKFLOW_SHA: ${{ github.sha }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          [[ "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          # GitHub's trusted builder binds provenance to the workflow commit;
+          # it cannot truthfully override that field with an older selected
+          # source. Keep the older-source publisher available, but fail this
+          # separate candidate notification instead of sending a false claim.
+          [[ "$SOURCE_SHA" == "$WORKFLOW_SHA" ]] || {
+            echo "::error::The published source differs from the main workflow commit, so GitHub provenance cannot truthfully bind this image to its source. The image is published but is not eligible for automatic release-candidate intake."
+            exit 1
+          }
+
+      - name: Store GitHub build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-name: ghcr.io/agentworkforce/sessions-pipeline
+          subject-digest: ${{ needs.publish.outputs.digest }}
+
+      - name: Mint infra dispatch token
+        id: pusher
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
+        with:
+          app-id: ${{ secrets.GH_APP_PUSHER_ID }}
+          private-key: ${{ secrets.GH_APP_PUSHER_PRIVATE_KEY }}
+          owner: AgentWorkforce
+          repositories: infra
+          permission-contents: write
+
+      - name: Dispatch immutable component publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.pusher.outputs.token }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          SOURCE_SHA: ${{ needs.preflight.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh api --method POST repos/AgentWorkforce/infra/dispatches \
+            -f 'event_type=component-published' \
+            -f 'client_payload[component]=sessions-pipeline' \
+            -f "client_payload[digest]=$DIGEST" \
+            -f "client_payload[source_sha]=$SOURCE_SHA"
