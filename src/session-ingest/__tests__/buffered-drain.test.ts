@@ -9,19 +9,15 @@ import {
   acquireDrainLock,
   drainBufferedBatches,
   drainLockKey,
-  mergeRevisionRecords,
   readOnlyStore,
-  rearmKey,
-  revisionIndexKey,
   s3DrainLedger,
-  uploadFenceKey,
   type DrainLedger,
   type DrainOptions,
-  type UploadFence,
 } from "../buffered-drain.ts";
 import { parseDrainArgs } from "../../../scripts/buffered-drain.ts";
 import { scratchStore } from "./support.ts";
 import { journalKey as journalKeyFor } from "../async-admission.ts";
+import { s3LedgerKeys, type FenceDoc } from "../ledger-s3.ts";
 
 const ROOT = "96bulls";
 const TENANT = { orgId: "org-a", workspaceId: "ws-a", userId: "user-1" };
@@ -79,7 +75,13 @@ async function canonical(store: ObjectStore): Promise<Map<string, string[]>> {
   return out;
 }
 
-const putFence = (store: ObjectStore, fence: UploadFence) => store.put(objectKey(uploadFenceKey(ROOT, TENANT)), enc.encode(JSON.stringify(fence)));
+// #580's keys and formats (ledger-s3.ts): the drain must read and write exactly these.
+const KEYS = s3LedgerKeys(ROOT, TENANT);
+const uploadFenceKey = () => KEYS.fence;
+const revisionIndexKey = (source: string, sessionId: string) => KEYS.revisions(ORIGIN, source, sessionId);
+const rearmKey = (source: string, sessionId: string) => KEYS.rearm(ORIGIN, source, sessionId);
+const fenceDoc = (over: Partial<FenceDoc> = {}): FenceDoc => ({ v: 1, version: 1, resets: 0, deleted: {}, epochs: {}, resetRequests: {}, ...over });
+const putFence = (store: ObjectStore, over: Partial<FenceDoc> = {}) => store.put(objectKey(uploadFenceKey()), enc.encode(JSON.stringify(fenceDoc(over))));
 const run = (store: ObjectStore, over: Partial<DrainOptions> = {}) =>
   drainBufferedBatches({ store, keyRoot: ROOT, orgs: [TENANT.orgId], dryRun: false, decompress, sleep: async () => {}, ...over });
 
@@ -89,7 +91,7 @@ afterEach(() => { cleanup.forEach((c) => c()); cleanup = []; });
 async function scratch(opts: { fence?: boolean } = {}) {
   const s = scratchStore();
   cleanup.push(s.done);
-  if (opts.fence !== false) await putFence(s.store, { v: 1, resets: 0, deleted: {} });
+  if (opts.fence !== false) await putFence(s.store);
   return s.store;
 }
 const putJournal = (store: ObjectStore, journal: unknown) => store.put(objectKey(journalKeyFor(ROOT, TENANT)), enc.encode(JSON.stringify(journal)));
@@ -106,8 +108,8 @@ describe("buffered backlog drain (0005)", () => {
     expect(lines.get("sess-1")).toEqual(["r1@1", "r2@2"]);
     expect(lines.get("sess-2")).toEqual(["r3@1"]);
     expect(await exists(store, key + DRAINED_SUFFIX)).toBe(true);
-    const index = await readJson(store, revisionIndexKey(ROOT, TENANT, ORIGIN, "claude", "sess-1"));
-    expect(index).toEqual({ v: 1, records: { r1: [1, "r1:r1", sha("r1:1")], r2: [2, "r2:r2", sha("r2:2")] } });
+    const index = await readJson(store, revisionIndexKey("claude", "sess-1"));
+    expect(index).toEqual({ v: 1, originId: ORIGIN, source: "claude", sessionId: "sess-1", epoch: 0, resets: 0, records: { r1: [1, "r1:r1", sha("r1:1")], r2: [2, "r2:r2", sha("r2:2")] } });
     // The summary is counts only: no key, tenant id or content.
     const text = JSON.stringify(summary);
     for (const needle of ["org-a", "ws-a", "user-1", ORIGIN, "sess-1", "96bulls", "hello", "t-r1"]) expect(text).not.toContain(needle);
@@ -140,7 +142,7 @@ describe("buffered backlog drain (0005)", () => {
     const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
     await run(store);
     await store.delete(objectKey(key + DRAINED_SUFFIX));
-    await store.delete(objectKey(revisionIndexKey(ROOT, TENANT, ORIGIN, "claude", "sess-1")));
+    await store.delete(objectKey(revisionIndexKey("claude", "sess-1")));
     const resumed = await run(store);
     expect(resumed.objects.drained).toBe(1);
     expect(resumed.lines.written).toBe(1);
@@ -149,7 +151,7 @@ describe("buffered backlog drain (0005)", () => {
 
   test("a fenced (deleted) session is dropped; the rest of the batch lands", async () => {
     const store = await scratch();
-    await putFence(store, { v: 1, resets: 0, deleted: { [ORIGIN]: [["claude", "sess-2"]], "other-origin": [["claude", "sess-1"]] } });
+    await putFence(store, { deleted: { [ORIGIN]: [["claude", "sess-2"]], "other-origin": [["claude", "sess-1"]] } });
     const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }]), group("claude", "sess-2", [{ id: "r2", rev: 1 }, { id: "r3", rev: 1 }])]);
     const summary = await run(store);
     expect(summary.objects.drained).toBe(1);
@@ -158,25 +160,25 @@ describe("buffered backlog drain (0005)", () => {
     const lines = await canonical(store);
     expect(lines.get("sess-1")).toEqual(["r1@1"]);
     expect(lines.has("sess-2")).toBe(false);
-    expect(await exists(store, revisionIndexKey(ROOT, TENANT, ORIGIN, "claude", "sess-2"))).toBe(false);
+    expect(await exists(store, revisionIndexKey("claude", "sess-2"))).toBe(false);
     expect(await exists(store, key + DRAINED_SUFFIX)).toBe(true);
     // An earlier partial run may have written the deleted session: it is re-armed for the eraser.
     expect(summary.rearmed).toBe(1);
-    expect(await exists(store, rearmKey(ROOT, TENANT, "claude", "sess-2"))).toBe(true);
-    expect(await exists(store, rearmKey(ROOT, TENANT, "claude", "sess-1"))).toBe(false);
+    expect(await exists(store, rearmKey("claude", "sess-2"))).toBe(true);
+    expect(await exists(store, rearmKey("claude", "sess-1"))).toBe(false);
   });
 
   test("equal revision with another digest is never written; stale and already-stored are skipped", async () => {
     const store = await scratch();
-    await store.put(objectKey(revisionIndexKey(ROOT, TENANT, ORIGIN, "claude", "sess-1")), enc.encode(JSON.stringify({
-      v: 1, records: { conflict: [3, "x", "f".repeat(64)], stale: [5, "y", sha("stale:4")], same: [2, "same:r2", sha("same:2")] },
+    await store.put(objectKey(revisionIndexKey("claude", "sess-1")), enc.encode(JSON.stringify({
+      v: 1, originId: ORIGIN, source: "claude", sessionId: "sess-1", epoch: 0, resets: 0, records: { conflict: [3, "x", "f".repeat(64)], stale: [5, "y", sha("stale:4")], same: [2, "same:r2", sha("same:2")] },
     })));
     await stage(store, [group("claude", "sess-1", [{ id: "conflict", rev: 3 }, { id: "stale", rev: 4 }, { id: "same", rev: 2 }, { id: "fresh", rev: 1 }])]);
     const summary = await run(store);
     expect(summary.objects.drained).toBe(1);
     expect(summary.lines).toEqual({ candidate: 4, written: 1, fenced: 0, stale: 1, already_stored: 1, revision_conflict: 1 });
     expect((await canonical(store)).get("sess-1")).toEqual(["fresh@1"]);
-    const index = await readJson(store, revisionIndexKey(ROOT, TENANT, ORIGIN, "claude", "sess-1"));
+    const index = await readJson(store, revisionIndexKey("claude", "sess-1"));
     expect(index.records.conflict).toEqual([3, "x", "f".repeat(64)]); // the stored digest is kept
     expect(index.records.fresh).toEqual([1, "fresh:r1", sha("fresh:1")]);
   });
@@ -194,7 +196,7 @@ describe("buffered backlog drain (0005)", () => {
 
   test("dry run lists and classifies, and writes nothing", async () => {
     const store = await scratch();
-    await putFence(store, { v: 1, resets: 0, deleted: { [ORIGIN]: [["claude", "sess-2"]] } });
+    await putFence(store, { deleted: { [ORIGIN]: [["claude", "sess-2"]] } });
     await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }]), group("claude", "sess-2", [{ id: "r2", rev: 1 }])]);
     await store.put(objectKey(`${ROOT}/${TENANT.orgId}/buffered-batches/v1/ws=ws-a/m=srv_${"0".repeat(32)}/b=${"1".repeat(32)}-${"2".repeat(16)}-${"3".repeat(32)}.staged.ndjson.zst`), enc.encode("not zstd"));
     const before = await allKeys(store);
@@ -234,7 +236,7 @@ describe("buffered backlog drain (0005)", () => {
 
   test("an unreadable fence skips the batch (fail closed) and leaves it undrained", async () => {
     const store = await scratch();
-    await store.put(objectKey(uploadFenceKey(ROOT, TENANT)), enc.encode("{\"v\":1,\"resets\":\"x\"}"));
+    await store.put(objectKey(uploadFenceKey()), enc.encode("{\"v\":1,\"resets\":\"x\"}"));
     const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
     const summary = await run(store);
     expect(summary.objects.fence_unreadable).toBe(1);
@@ -242,17 +244,16 @@ describe("buffered backlog drain (0005)", () => {
     expect((await canonical(store)).size).toBe(0);
   });
 
-  test("resets: undeterminable without lastResetAtMs; pre-reset batches dropped with it", async () => {
+  test("resets: undeterminable without a reset time (today's #580 fence); pre-reset batches dropped with one", async () => {
     const store = await scratch();
     const early = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { received: "2030-01-02T00:00:00.000Z" });
     const late = await stage(store, [group("claude", "sess-2", [{ id: "r2", rev: 1 }])], { received: "2030-01-04T00:00:00.000Z" });
-    await putFence(store, { v: 1, resets: 1, deleted: {} });
+    await putFence(store, { resets: 1 });
     const blind = await run(store);
     expect(blind.objects.reset_undeterminable).toBe(2);
     expect((await canonical(store)).size).toBe(0);
 
-    await putFence(store, { v: 1, resets: 1, deleted: {}, lastResetAtMs: Date.parse("2030-01-03T00:00:00.000Z") });
-    const summary = await run(store);
+    const summary = await run(store, { lastResetAtMs: () => Date.parse("2030-01-03T00:00:00.000Z") });
     expect(summary.objects.pre_reset).toBe(1);
     expect(summary.objects.drained).toBe(1);
     const lines = await canonical(store);
@@ -273,8 +274,9 @@ describe("buffered backlog drain (0005)", () => {
       edge: await stage(store, [group("claude", "s-edge", [{ id: "e", rev: 1 }])], { received: at(5 * 60_000) }),
       after: await stage(store, [group("claude", "s-after", [{ id: "d", rev: 1 }])], { received: at(6 * 60_000) }),
     };
-    await putFence(store, { v: 1, resets: 1, deleted: {}, lastResetAtMs: R });
-    const summary = await run(store);
+    await putFence(store, { resets: 1 });
+    const hook = { lastResetAtMs: () => R };
+    const summary = await run(store, hook);
     expect(summary.objects.pre_reset).toBe(1);
     expect(summary.objects.reset_margin).toBe(2);
     expect(summary.objects.drained).toBe(2); // received exactly at reset + margin drains
@@ -284,7 +286,7 @@ describe("buffered backlog drain (0005)", () => {
     expect((await readJson(store, keys.before + DRAINED_SUFFIX)).outcome).toBe("pre_reset");
 
     // A wider margin skips more; below the 1-minute floor is refused, here and at the CLI.
-    const wide = await run(store, { resetMarginMs: 10 * 60_000 });
+    const wide = await run(store, { ...hook, resetMarginMs: 10 * 60_000 });
     expect(wide.objects.reset_margin).toBe(2);
     expect(wide.objects.already_drained).toBe(3);
     await expect(run(store, { resetMarginMs: 59_999 })).rejects.toThrow("drain_reset_margin_invalid");
@@ -312,16 +314,16 @@ describe("buffered backlog drain (0005)", () => {
     const ledger: DrainLedger = {
       ...base,
       async readFence(t) {
-        return reads++ === 0 ? { v: 1, resets: 0, deleted: {} } : { v: 1, resets: 0, deleted: { [ORIGIN]: [["claude", "sess-1"]] } };
+        return reads++ === 0 ? fenceDoc() : fenceDoc({ version: 2, deleted: { [ORIGIN]: [["claude", "sess-1"]] }, epochs: { [ORIGIN]: {} } });
       },
     };
     await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }]), group("claude", "sess-2", [{ id: "r2", rev: 1 }])]);
     const summary = await run(store, { ledger });
     expect(summary.objects.drained).toBe(1);
     expect(summary.rearmed).toBe(1);
-    const rearm = await readJson(store, rearmKey(ROOT, TENANT, "claude", "sess-1"));
+    const rearm = await readJson(store, rearmKey("claude", "sess-1"));
     expect(rearm).toMatchObject({ v: 1, originId: ORIGIN, source: "claude", sessionId: "sess-1" });
-    expect(await exists(store, rearmKey(ROOT, TENANT, "claude", "sess-2"))).toBe(false);
+    expect(await exists(store, rearmKey("claude", "sess-2"))).toBe(false);
   });
 
   test("a user without a backfilled fence is refused: nothing written, nothing marked", async () => {
@@ -361,8 +363,8 @@ describe("buffered backlog drain (0005)", () => {
     const summary = await run(store, { ledger });
     expect(summary.objects.drained).toBe(1);
     expect(summary.rearmed).toBe(2);
-    expect(await exists(store, rearmKey(ROOT, TENANT, "claude", "sess-1"))).toBe(true);
-    expect(await exists(store, rearmKey(ROOT, TENANT, "claude", "sess-2"))).toBe(true);
+    expect(await exists(store, rearmKey("claude", "sess-1"))).toBe(true);
+    expect(await exists(store, rearmKey("claude", "sess-2"))).toBe(true);
   });
 
   test("max-objects stops early with a checkpoint; resuming from it drains the rest", async () => {
@@ -379,11 +381,20 @@ describe("buffered backlog drain (0005)", () => {
     expect((await canonical(store)).size).toBe(4);
   });
 
-  test("the revision merge is commutative: max wins, an equal revision keeps the stored entry", () => {
-    const a = { r: [2, "a", "1".repeat(64)] as [number, string, string] };
-    const b = { r: [2, "b", "2".repeat(64)] as [number, string, string] };
-    expect(mergeRevisionRecords(a, b)).toEqual({ records: a, changed: false });
-    expect(mergeRevisionRecords(a, { r: [3, "c", "3".repeat(64)] }).records.r[0]).toBe(3);
+  test("a stale index generation (a disable since) counts as empty, as the claim; the merge restamps it", async () => {
+    const store = await scratch();
+    // Stored under epoch 0, but the session's fence epoch is now 1 (disabled and re-enabled since).
+    await store.put(objectKey(revisionIndexKey("claude", "sess-1")), enc.encode(JSON.stringify({
+      v: 1, originId: ORIGIN, source: "claude", sessionId: "sess-1", epoch: 0, resets: 0, records: { r1: [5, "old", "a".repeat(64)] },
+    })));
+    const pairHash = KEYS.rearm(ORIGIN, "claude", "sess-1").split("/").pop()!.replace(/\.json$/, "");
+    await putFence(store, { epochs: { [ORIGIN]: { [pairHash]: 1 } } });
+    await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    const summary = await run(store);
+    expect(summary.lines.stale).toBe(0);
+    expect(summary.lines.written).toBe(1);
+    const index = await readJson(store, revisionIndexKey("claude", "sess-1"));
+    expect(index).toMatchObject({ epoch: 1, resets: 0, records: { r1: [1, "r1:r1", sha("r1:1")] } });
   });
 
   test("--assume-empty-fence classifies an unbackfilled user in a dry run, and is refused with execute", async () => {
