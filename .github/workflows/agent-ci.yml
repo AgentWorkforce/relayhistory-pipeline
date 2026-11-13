@@ -18,7 +18,7 @@ permissions:
 jobs:
   agent:
     name: Agent stack checks
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: read

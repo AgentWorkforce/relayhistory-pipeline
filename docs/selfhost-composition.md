@@ -336,7 +336,7 @@ off; anything else, `true` included, fails startup).
 
 | SERVICE | Flag | Required when enabled | Secret material (from the secret store, never on disk) |
 | --- | --- | --- | --- |
-| `session-read-api` | `RELAYHISTORY_SELFHOST_READ_API` | `READ_API_ORIGIN`, `READ_API_COMPLETE_SINCE` (ISO or `epoch`), `READ_API_DIRECTORY_WORKSPACES` (canary allowlist; login answers 501 for an unlisted workspace), `SEARCH_INDEX_BACKEND` (`postgres`), `SEARCH_INDEX_POSTGRES_BACKEND_ID`, `SESSION_POSTGRES_TLS_PROFILE`, `READ_API_COORDINATION_OVERLAPS_ENABLED` (exactly `true`) with `READ_API_COORDINATION_OVERLAPS_BACKEND=postgres`, the relaycontrol trio in section 2, optional `ALLOW_IN_CLUSTER_HTTP`, `RELAYHISTORY_READ_API_PORT`, `READ_API_CANONICAL_PIN_LAGGING_POINTER` (recommended `true` with `SELFHOST_INGEST_ADMISSION=async`; default off; any value other than `true` is off, see `docs/selfhost-async-admission.md`), `READ_API_SESSION_QUERY` (exactly `true` enables the Dashboard session query `q` on the list and activity routes over the directory, migration 046010; default off, off is unchanged 501 `param_q`; `""`/`false` are off, any other value fails startup; `path:`, `upload:` and `is:on-relay` stay explicit 501s, see `docs/local-stack.md`), `READ_API_CANONICAL_SCOPE_BYTES` / `READ_API_CANONICAL_SCOPE_EVENTS` (canonical snapshot budget; defaults 32 MiB / 100000 (raise bytes only with the pod memory limit), bytes accepted 16 MiB..2 GiB, events up to 4000000; out of range fails startup, see `docs/local-stack.md`), `READ_API_CANONICAL_DEADLINE_MS` (canonical read deadline in ms; default 3000, accepted 3000..60000; out of range fails startup) | `RELAYHISTORY_READ_API_SECRET` (JSON `{supabase_url}`; no `clickhouse` with `postgres`), `RELAYCONTROL_INTROSPECT_SECRET` |
+| `session-read-api` | `RELAYHISTORY_SELFHOST_READ_API` | `READ_API_ORIGIN`, `READ_API_COMPLETE_SINCE` (ISO or `epoch`), `READ_API_DIRECTORY_WORKSPACES` (canary allowlist; login answers 501 for an unlisted workspace), `SEARCH_INDEX_BACKEND` (`postgres`), `SEARCH_INDEX_POSTGRES_BACKEND_ID`, `SESSION_POSTGRES_TLS_PROFILE`, `READ_API_COORDINATION_OVERLAPS_ENABLED` (exactly `true`) with `READ_API_COORDINATION_OVERLAPS_BACKEND=postgres`, optional `READ_API_LIST_SHORT_SUMMARY_ENABLED` (exactly `true` serves the opt-in `includeShortSummary=recorded` on `GET /v1/sessions`; default off, see section 6), the relaycontrol trio in section 2, optional `ALLOW_IN_CLUSTER_HTTP`, `RELAYHISTORY_READ_API_PORT`, `READ_API_CANONICAL_PIN_LAGGING_POINTER` (recommended `true` with `SELFHOST_INGEST_ADMISSION=async`; default off; any value other than `true` is off, see `docs/selfhost-async-admission.md`), `READ_API_SESSION_QUERY` (exactly `true` enables the Dashboard session query `q` on the list and activity routes over the directory, migration 046010; default off, off is unchanged 501 `param_q`; `""`/`false` are off, any other value fails startup; `path:`, `upload:` and `is:on-relay` stay explicit 501s, see `docs/local-stack.md`), `READ_API_CANONICAL_SCOPE_BYTES` / `READ_API_CANONICAL_SCOPE_EVENTS` (canonical snapshot budget; defaults 32 MiB / 100000 (raise bytes only with the pod memory limit), bytes accepted 16 MiB..2 GiB, events up to 4000000; out of range fails startup, see `docs/local-stack.md`), `READ_API_CANONICAL_DEADLINE_MS` (canonical read deadline in ms; default 3000, accepted 3000..60000; out of range fails startup) | `RELAYHISTORY_READ_API_SECRET` (JSON `{supabase_url}`; no `clickhouse` with `postgres`), `RELAYCONTROL_INTROSPECT_SECRET` |
 | `session-publication` | `INGEST_PUBLISH_ENABLED` | `INGEST_PUBLISH_{BUCKET,EXPECT_GENERATION,AWS_ACCOUNT_ID,SUPABASE_PROJECT_REF,INSTANCE_ID,SECRET_ARN,KMS_KEY_ARN,INSTANCE_PROFILE_ARN,ROLE_NAME}`, `AWS_REGION=us-east-1`, `HOOPDB_DB_MODE=supabase`, optional `INGEST_PUBLISH_BUDGET_MS`, `INGEST_PUBLISH_BATCH_LIMIT`, `WORKER_HEALTH_PORT` | none in env: IMDSv2 plus Secrets Manager (see the caveat in section 1) |
 | `session-ingest` | `RELAYHISTORY_SELFHOST_INGEST` | `RELAYHISTORY_INGEST_ORIGIN`, `RELAYCONTROL_INTROSPECT_URL`, `RELAYHISTORY_INGEST_DATABASE_URL`, `SESSION_POSTGRES_TLS_PROFILE`, `LOCKER_BUCKET` (+ Locker endpoint/region or Pod Identity/GCS), optional `RELAYHISTORY_INGEST_PORT`, `INGEST_KEY_ROOT`, `INGEST_MAX_PER_USER`, `INGEST_MAX_PER_ORG`, `RELAYHISTORY_INGEST_PG_POOL_MAX`, `ALLOW_IN_CLUSTER_HTTP`, `SELFHOST_INGEST_ADMISSION` (`sync` default, `async`, `drain`) with `SELFHOST_ADMISSION_CONCURRENCY` / `_SCAN_MS` / `_MAX_ATTEMPTS`, `SESSION_ERASE_API_ENABLED` (`1`; default off), `RELAYHISTORY_SELFHOST_SESSION_SELECTION`, `RELAYHISTORY_SELFHOST_HEARTBEAT_ACCEPT` (both `true`; default off), `RELAYHISTORY_SELFHOST_CAPTURE_POLICY_UPLOADS` (`report` default, `enforce`; the capture policy upload check, section 2), `RELAYHISTORY_SELFHOST_INTROSPECT_POSITIVE_TTL_MS` (positive introspection cache in ms, `0`-`60000`; default `0` = off; revocation lag = the TTL), `INGEST_CLAIM_LOCK_BUSY` (`on`; default off; a claim lock wait is a 429 with Retry-After 5-10 s, section 3) | `RELAYCONTROL_INTROSPECT_SECRET`, `RELAYHISTORY_INGEST_DATABASE_URL` (password), Locker keys, `SESSION_ERASE_API_SECRET` (+ `_PREVIOUS` during a rotation; at least 32 characters; only read when the erase flag is on) |
 | `session-erase-bytes` (Job) | `SESSION_ERASE_BYTES_ENABLED` (exactly `1`; see below) | `SESSION_ERASE_S3_BUCKET`, `SESSION_ERASE_S3_REGION`, `SESSION_ERASE_REQUEST_FILE`, optional `SESSION_ERASE_S3_ENDPOINT` (bare origin; https, loopback, or a Service name with `ALLOW_IN_CLUSTER_HTTP`), `SESSION_ERASE_KEY_ROOT` (default `96bulls`, must equal `INGEST_KEY_ROOT`), `SESSION_ERASE_DRY_RUN` (`1` = list and count only), `SESSION_ERASE_CONCURRENCY` (1..16, default 4) | `SESSION_ERASE_S3_ACCESS_KEY_ID[_FILE]`, `SESSION_ERASE_S3_SECRET_ACCESS_KEY[_FILE]`: a separate eraser key (ListBucketVersions + DeleteObjectVersion on the key root), not the ingest writer's key |
@@ -602,6 +602,41 @@ pending output is explicitly empty. State is `null` because the brief's state
 enum is not the dashboard state contract. The reader receives only a scoped
 function grant. The consumer receives no new summary-table privileges; its
 existing SELECT is retained for native title precedence.
+
+### Summary flags on the read API (both default off)
+
+Two read API flags expose stored summaries. Each is on only when its value is
+exactly `true`; unset or any other value is off and leaves responses unchanged
+for requests that do not send the opt-in.
+Neither changes SQL, needs a new migration, or adds a credential. Turning
+either on for the hosted stack is a deploy decision and needs the owner's
+explicit approval; nothing in this repository sets them.
+
+- `READ_API_BRIEF_SUMMARY_ENABLED`: the Node self-host service always wires the
+  brief-summary read above. The hosted Lambda entry wires it only with this
+  flag (`GET /v1/sessions/:id/summary`, and `GET /v1/sessions/summaries/activity`,
+  which reads the same dependency). Off, both answer 501
+  `summary_not_configured`, as before. It reads
+  `sessions.session_brief_summary_for` from
+  `20261105044100_session_brief_summary_read.sql`, which must be applied before
+  the flag is turned on; the activity route still answers 501
+  `summary_activity_not_migrated` until `20261105056000` is applied.
+- `READ_API_LIST_SHORT_SUMMARY_ENABLED` (either entry): `GET /v1/sessions`
+  accepts the opt-in `includeShortSummary=recorded`. With it, each directory
+  row gains `shortSummary` (string or `null`, at most 1000 characters, the
+  producer's `char_length` bound) and `shortSummaryGeneratedAt` (ISO 8601 or
+  `null`). The value is the recorded directory short summary as stored: no
+  title substitution and no fallback. A stored value over the bound is a
+  row out of contract, handled like an over-long title (a first page answers
+  501 `directory_row_out_of_contract`, a cursor page 503). Any other param
+  value is a 400. With the flag off the param answers 501
+  `param_includeShortSummary`. The hosted read Worker
+  (`packages/session-read-worker`) does not read either flag, so there the
+  summary routes and the param keep their 501s.
+
+Without the param the list rows are byte-identical to today's, so Cloud's
+strict `@relayhistory/cloud-client` 0.2.0 `sessionSummary` parse is
+unaffected: the two keys appear only when a client asks for them.
 
 The same migration stores bounded recorded catalog titles separately. Native model
 titles win over pointer titles; a current complete recorded title is the final list

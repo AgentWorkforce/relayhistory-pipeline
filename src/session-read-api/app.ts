@@ -27,7 +27,10 @@ import { BriefSummaryError, briefSummaryResponse, summaryActivityDays, type Brie
  *     where the existing backend must continue strictly below it.
  *
  * Directory routes (P3b, docs in src/session-read-api/directory.ts):
- *   GET /v1/sessions                session list without `q`, from the Supabase directory
+ *   GET /v1/sessions                session list without `q`, from the Supabase directory;
+ *                                   opt-in includeShortSummary=recorded adds shortSummary and
+ *                                   shortSummaryGeneratedAt (READ_API_LIST_SHORT_SUMMARY_ENABLED=true,
+ *                                   deps.listShortSummary; otherwise 501 param_includeShortSummary)
  *   GET /v1/sessions/activity       sessions per UTC day without `q` (span semantics)
  *   GET /v1/sessions/summaries/activity  ready native summaries per UTC day (counts only;
  *                                   brief-summary.ts, migration 20261105056000)
@@ -207,8 +210,18 @@ export interface ReadApiDeps {
   directoryWorkspaces?: ReadonlySet<string> | "*";
   /** Cached brief titles (brief-titles.ts); absent = GET /v1/sessions/titles answers 501. */
   briefTitles?: BriefTitles;
-  /** Node self-host only; absence refuses summary reads. Uses directory workspace admission. */
+  /**
+   * The self-host service always; the hosted Lambda entry only with READ_API_BRIEF_SUMMARY_ENABLED=true
+   * (exactly "true"). Absence refuses summary reads (501 `summary_not_configured`). Uses directory
+   * workspace admission.
+   */
   briefSummary?: BriefSummary;
+  /**
+   * READ_API_LIST_SHORT_SUMMARY_ENABLED=true (exactly "true"): GET /v1/sessions serves the opt-in
+   * includeShortSummary=recorded (shortSummary, shortSummaryGeneratedAt). Not true = the param is a
+   * 501 `param_includeShortSummary`; without the param the list shape is unchanged either way.
+   */
+  listShortSummary?: boolean;
   /** READ_API_BRIEF_TITLES_WORKSPACES (parseDirectoryWorkspaces syntax): "*" = all. Absent/empty = none. */
   briefTitleWorkspaces?: ReadonlySet<string> | "*";
   /** Session timing from canonical S3 (session-timing-source.ts); absent = 501 `timing_not_configured`. */
@@ -1120,7 +1133,13 @@ export function createReadApi(deps: ReadApiDeps) {
       const includeAgentName = single(c, "includeAgentName");
       if (includeAgentName !== undefined && includeAgentName !== "recorded") throw bad("includeAgentName must be recorded");
       if (includeAgentName !== undefined && !deps.selfhost) throw unsupported("param_includeAgentName");
-      const metadata: DirectoryListMetadata = includeAgentName === "recorded" ? { includeAgentName } : {};
+      const includeShortSummary = single(c, "includeShortSummary");
+      if (includeShortSummary !== undefined && includeShortSummary !== "recorded") throw bad("includeShortSummary must be recorded");
+      if (includeShortSummary !== undefined && deps.listShortSummary !== true) throw unsupported("param_includeShortSummary");
+      const metadata: DirectoryListMetadata = {
+        ...(includeAgentName === "recorded" ? { includeAgentName } : {}),
+        ...(includeShortSummary === "recorded" ? { includeShortSummary } : {}),
+      };
       const queryOn = deps.sessionQuery === true;
       for (const p of LIST_UNSUPPORTED_PARAMS) if (!(queryOn && (p === "q" || p === "search")) && c.req.queries(p)?.length) throw unsupported(`param_${p}`);
       const terms = queryOn ? sessionQueryTerms(c, "list") : undefined;
@@ -1247,7 +1266,8 @@ export function createReadApi(deps: ReadApiDeps) {
    * same source GET /v1/sessions/:id/summary reads (sessions.session_briefs through
    * session_summary_activity_for, 056000). Same workspace attestation, canary and since/until
    * rules as /v1/sessions/activity. Counts only. 501 where the summary read is not
-   * configured (directory/self-host entries) or 056000 is not applied.
+   * configured (deps.briefSummary: the self-host service, or the hosted Lambda with
+   * READ_API_BRIEF_SUMMARY_ENABLED=true) or 056000 is not applied.
    */
   app.get("/v1/sessions/summaries/activity", async (c) => {
     try {
