@@ -23,7 +23,8 @@
  * Refuses to start (every record fails, then the DLQ) unless INGEST_LEDGER=s3, and with anything this path
  * cannot honour without SQL: buffered acceptance, Babysitter retention routing, a replica, upload consent
  * (its store is SQL) or a non-TypeScript scrub engine. And it never ADMITS until an operator has written
- * `<keyRoot>/.ledger/fence-authority.json` (ledger-s3.ts FenceAuthorityDoc: fence backfill complete, control
+ * a fence-authority marker for the tenant's org: `<keyRoot>/.ledger/fence-authority/<org>.json`, or the
+ * deployment-wide `<keyRoot>/.ledger/fence-authority.json` (ledger-s3.ts FenceAuthorityDoc: fence backfill complete, control
  * mirror on, re-arm sweeper live): until then every record is a retry. Errors carry codes only: never a
  * secret, key, body or tenant id.
  */

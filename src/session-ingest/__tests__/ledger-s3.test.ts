@@ -10,7 +10,7 @@ import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../sh
 import { deliverPrepared, IngestUnavailable } from "../deliver.ts";
 import { LedgerUnavailableError, type ClaimInput, type CommitInput, type Ledger, type LedgerRecord } from "../ledger.ts";
 import {
-  applyFenceChange, checkIndexEntryInput, entryForgotten, fenceAuthorityKey, ingestLedgerMode, newFence, revisionShard, s3Ledger, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, withSqlControlMirror,
+  applyFenceChange, checkIndexEntryInput, entryForgotten, fenceAuthorityKey, orgFenceAuthorityKey, ingestLedgerMode, newFence, revisionShard, s3Ledger, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, withSqlControlMirror,
   type FenceDoc,
 } from "../ledger-s3.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
@@ -336,7 +336,7 @@ describe("fences: selection, reset, and the commit's recheck", () => {
     const ledger = ledgerOn(store);
     const input = claimInput("b1", [rec("r1", 1)]);
     const c = await claimed(ledger, input);
-    expect(await json(store, keys.owner(ORIGIN, "claude", "sess-1"))).toEqual({ v: 1, originId: ORIGIN, source: "claude", sessionId: "sess-1", epoch: 0, resets: 0 });
+    expect(await json(store, keys.owner(ORIGIN, "claude", "sess-1"))).toEqual({ v: 1, originId: ORIGIN, source: "claude", sessionId: "sess-1", epoch: 0, resets: 0, machineId: MACHINE });
     expect(await ledger.resetUploadedSessions(TENANT, "req-1")).toBe(1);
     expect(await ledger.commit(commitOf(input, c.claimToken))).toEqual({ rearmed: 1 });
     expect(await exists(store, keys.rearm(ORIGIN, "claude", "sess-1"))).toBe(true);
@@ -709,7 +709,7 @@ describe("revisions are judged per (origin, record id), as ingest_record_revisio
 });
 
 describe("the fence-authority marker (fail closed)", () => {
-  const marker = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", writtenAtMs: 1 };
+  const marker = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: 1 };
   const put = (store: ObjectStore, v: unknown) => store.put(objectKey(fenceAuthorityKey(ROOT)), new TextEncoder().encode(JSON.stringify(v)), { contentType: "application/json" });
 
   test("required: absent or invalid is a retry for every claim, never an admit; a valid marker admits; controls are never gated", async () => {
@@ -720,7 +720,7 @@ describe("the fence-authority marker (fail closed)", () => {
     await expect(ledger.claim(input)).rejects.toMatchObject({ code: "ledger_fence_authority_missing" });
     expect(await exists(store, keys.batch(ORIGIN, "b1"))).toBe(false);
     await ledger.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "s9"]], enabled: false });
-    for (const bad of [{ ...marker, revisionBackfill: "partial" }, { ...marker, ownershipBackfill: undefined }, { ...marker, rearmSweeper: "pending" }, { ...marker, controlMirror: "off" }, { ...marker, fenceBackfill: "partial" }, { ...marker, extra: 1 }, { ...marker, writtenAtMs: 0 }, { v: 2 }]) {
+    for (const bad of [{ ...marker, workerHttpAdmission: "mirrored" }, { ...marker, workerHttpAdmission: undefined }, { ...marker, revisionBackfill: "partial" }, { ...marker, ownershipBackfill: undefined }, { ...marker, rearmSweeper: "pending" }, { ...marker, controlMirror: "off" }, { ...marker, fenceBackfill: "partial" }, { ...marker, extra: 1 }, { ...marker, writtenAtMs: 0 }, { v: 2 }]) {
       await put(store, bad);
       await expect(ledger.claim(input)).rejects.toMatchObject({ code: "ledger_fence_authority_invalid" });
     }
@@ -766,12 +766,12 @@ describe("self-host s3 controls also write SQL (withSqlControlMirror)", () => {
     expect(failing.order).toEqual(["s3:disable", "sql:disable"]);
   });
 
-  test("reset: S3 first, then every session the S3 fence deletes as a SQL disable, then the SQL reset record", async () => {
+  test("reset: S3 first, then the SQL reset record, then every session the S3 fence deletes as a SQL disable", async () => {
     const { order, sqlSel, ledger } = setupMirror();
     const input = claimInput("b1", [rec("r1", 1, { sessionId: "s1" })]);
     await ledger.commit(commitOf(input, (await claimed(ledger, input)).claimToken));
     expect(await ledger.resetUploadedSessions(TENANT, "req-1")).toBe(1);
-    expect(order).toEqual(["s3:reset", "sql:disable", "sql:reset"]);
+    expect(order).toEqual(["s3:reset", "sql:reset", "sql:disable"]);
     expect(sqlSel).toEqual([{ originId: ORIGIN, sessions: [["claude", "s1"]], enabled: false }]);
   });
 
@@ -970,7 +970,8 @@ describe("third review follow-ups", () => {
       resetUploadedSessions: async () => { sqlWrites.push("reset"); return 0; },
     }, base, ROOT);
     expect(await mirror.resetUploadedSessions(TENANT, "req-1")).toBe(1);
-    expect(sqlWrites).toEqual(["s1:off", "reset"]);
+    expect(sqlWrites[0]).toBe("reset");
+    expect(sqlWrites.slice(1).sort()).toEqual(["s1:off", "s9:on"]);
     expect(await json(base, keys.fence)).toMatchObject({ resetsCompleted: 1, deleted: { [ORIGIN]: [["claude", "s1"]] } });
   });
 
@@ -1038,7 +1039,7 @@ describe("third review follow-ups", () => {
   test("deleting the marker stops NEW claims after the cache window, but a batch already claimed still commits", async () => {
     const store = fresh();
     let now = 0;
-    const marker = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", writtenAtMs: 1 };
+    const marker = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: 1 };
     await store.put(objectKey(fenceAuthorityKey(ROOT)), new TextEncoder().encode(JSON.stringify(marker)), { contentType: "application/json" });
     const ledger = ledgerOn(store, { fenceAuthority: "required", nowMs: () => now });
     const a = claimInput("b1", [rec("r1", 1)]);
@@ -1092,5 +1093,111 @@ describe("revision-only index entries (seeded proven records, lazy native slots)
     await expect(io(store).mergeIndex(shardKey("A"), absentView, ORIGIN, [entry("A", 1, null, "nothex")])).rejects.toMatchObject({ code: "ledger_input_refused" });
     await expect(io(store).mergeIndex(shardKey("A"), absentView, ORIGIN, [entry("A", 1, "", null)])).rejects.toMatchObject({ code: "ledger_input_refused" });
     expect(() => checkIndexEntryInput(entry("A", 0, null, null))).toThrow(LedgerUnavailableError);
+  });
+});
+
+describe("layered review P2-A: a SQL reset never keeps a tombstone S3 has lifted", () => {
+  test("disabled then re-enabled through the mirror (no upload since), then reset: S3 keeps it live, and SQL ends live too", async () => {
+    const store = fresh();
+    const s3 = ledgerOn(store);
+    // A session S3 knows (owner stub from a backfill or an earlier claim), owned in SQL as well.
+    const a = claimInput("b0", [rec("r0", 1, { sessionId: "s1" })]);
+    await s3.commit(commitOf(a, (await claimed(s3, a)).claimToken));
+    const sqlDeleted = new Set<string>();
+    const sqlOwned = new Set<string>(["s1"]);
+    const mirror = withSqlControlMirror(s3, {
+      setSessionUploads: async (i) => { for (const [, id] of i.sessions) { if (i.enabled) sqlDeleted.delete(id); else sqlDeleted.add(id); } },
+      // SQL's own reset tombstones everything SQL owns (ingest_record_revisions UNION ingest_session_ownership).
+      resetUploadedSessions: async () => { for (const id of sqlOwned) sqlDeleted.add(id); return sqlOwned.size; },
+    }, store, ROOT);
+    await mirror.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "s1"]], enabled: false });
+    await mirror.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "s1"]], enabled: true });
+    expect(sqlDeleted.has("s1")).toBe(false);
+    // The S3 reset does not own s1 (its stub is the pre-disable epoch), so S3 keeps it live.
+    expect(await mirror.resetUploadedSessions(TENANT, "req-1")).toBe(0);
+    expect((await json(store, keys.fence)).deleted).toEqual({});
+    // SQL's reset tombstoned it; the reconcile after it lifts the tombstone S3 does not hold.
+    expect(sqlDeleted.has("s1")).toBe(false);
+  });
+
+  test("the same through an ordered reset", async () => {
+    const store = fresh();
+    const s3 = ledgerOn(store);
+    const a = claimInput("b0", [rec("r0", 1, { sessionId: "s1" })]);
+    await s3.commit(commitOf(a, (await claimed(s3, a)).claimToken));
+    const sqlDeleted = new Set<string>();
+    const mirror = withSqlControlMirror(s3, {
+      setSessionUploads: async (i) => { for (const [, id] of i.sessions) { if (i.enabled) sqlDeleted.delete(id); else sqlDeleted.add(id); } },
+      resetUploadedSessions: async () => { sqlDeleted.add("s1"); return 1; },
+    }, store, ROOT);
+    await mirror.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "s1"]], enabled: false });
+    await mirror.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "s1"]], enabled: true });
+    await mirror.applyOrderedControl!({ tenant: TENANT, requestId: "req-o", control: { epoch: "e".repeat(64), version: "3", digest: "d".repeat(64), kind: "reset" } });
+    expect(sqlDeleted.has("s1")).toBe(false);
+  });
+});
+
+describe("per-org fence-authority markers", () => {
+  const fields = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: 1 };
+  const putJson = (store: ObjectStore, key: string, v: unknown) => store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(v)), { contentType: "application/json" });
+  const TENANT_B = { ...TENANT, orgId: "org-b" };
+  const claimFor = (tenant: typeof TENANT, batchId: string) => claimInput(batchId, [rec("r1", 1)], { tenant });
+
+  test("org A's marker admits A and not B; B stays a retry until its own marker", async () => {
+    const store = fresh();
+    await putJson(store, orgFenceAuthorityKey(ROOT, TENANT.orgId), { ...fields, orgId: TENANT.orgId });
+    const ledger = ledgerOn(store, { fenceAuthority: "required" });
+    expect((await ledger.claim(claimFor(TENANT, "a1"))).kind).toBe("claimed");
+    await expect(ledger.claim(claimFor(TENANT_B, "b1"))).rejects.toMatchObject({ code: "ledger_fence_authority_missing" });
+    await putJson(store, orgFenceAuthorityKey(ROOT, "org-b"), { ...fields, orgId: "org-b" });
+    expect((await ledger.claim(claimFor(TENANT_B, "b1"))).kind).toBe("claimed");
+  });
+
+  test("a missing or invalid per-org marker is a coded retry (never an admit), with no org id in the error", async () => {
+    const store = fresh();
+    const ledger = ledgerOn(store, { fenceAuthority: "required" });
+    await expect(ledger.claim(claimFor(TENANT, "a1"))).rejects.toMatchObject({ code: "ledger_fence_authority_missing" });
+    for (const bad of [{ ...fields }, { ...fields, orgId: TENANT.orgId, rearmSweeper: "pending" }, { ...fields, orgId: TENANT.orgId, extra: 1 }, { ...fields, orgId: "" }]) {
+      await putJson(store, orgFenceAuthorityKey(ROOT, TENANT.orgId), bad);
+      const err = await ledger.claim(claimFor(TENANT, "a1")).catch((e) => e);
+      expect(err).toMatchObject({ code: "ledger_fence_authority_invalid" });
+      expect(String(err)).not.toContain(TENANT.orgId);
+    }
+    expect(await exists(store, keys.batch(ORIGIN, "a1"))).toBe(false);
+  });
+
+  test("a per-org marker naming another org is refused, even when the deployment-wide marker is valid", async () => {
+    const store = fresh();
+    await putJson(store, orgFenceAuthorityKey(ROOT, TENANT.orgId), { ...fields, orgId: "org-b" });
+    await putJson(store, fenceAuthorityKey(ROOT), fields);
+    const err = await ledgerOn(store, { fenceAuthority: "required" }).claim(claimFor(TENANT, "a1")).catch((e) => e);
+    expect(err).toMatchObject({ code: "ledger_fence_authority_org_mismatch" });
+    expect(String(err)).not.toContain("org-b");
+  });
+
+  test("the deployment-wide marker still covers every org", async () => {
+    const store = fresh();
+    await putJson(store, fenceAuthorityKey(ROOT), fields);
+    const ledger = ledgerOn(store, { fenceAuthority: "required" });
+    expect((await ledger.claim(claimFor(TENANT, "a1"))).kind).toBe("claimed");
+    expect((await ledger.claim(claimFor(TENANT_B, "b1"))).kind).toBe("claimed");
+    // A per-org marker is not a deployment-wide one: the wide key with an orgId refuses.
+    await putJson(store, fenceAuthorityKey(ROOT), { ...fields, orgId: TENANT.orgId });
+    await expect(ledgerOn(store, { fenceAuthority: "required" }).claim(claimFor(TENANT, "a2"))).rejects.toMatchObject({ code: "ledger_fence_authority_invalid" });
+  });
+
+  test("the 60 s cache is per org: deleting A's marker stops A's new claims after A's window; B is unaffected", async () => {
+    const store = fresh();
+    let now = 0;
+    for (const org of [TENANT.orgId, "org-b"]) await putJson(store, orgFenceAuthorityKey(ROOT, org), { ...fields, orgId: org });
+    const ledger = ledgerOn(store, { fenceAuthority: "required", nowMs: () => now });
+    expect((await ledger.claim(claimFor(TENANT, "a1"))).kind).toBe("claimed");
+    now = 30_000;
+    expect((await ledger.claim(claimFor(TENANT_B, "b1"))).kind).toBe("claimed");
+    await store.delete(objectKey(orgFenceAuthorityKey(ROOT, TENANT.orgId)));
+    expect((await ledger.claim(claimFor(TENANT, "a2"))).kind).toBe("claimed"); // inside A's window
+    now = 60_000;
+    await expect(ledger.claim(claimFor(TENANT, "a3"))).rejects.toMatchObject({ code: "ledger_fence_authority_missing" });
+    expect((await ledger.claim(claimFor(TENANT_B, "b2"))).kind).toBe("claimed"); // B's window runs to 90 s
   });
 });

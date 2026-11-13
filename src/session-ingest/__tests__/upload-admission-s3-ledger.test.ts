@@ -36,7 +36,7 @@ const { createUploadAdmissionHandler } = await import("../upload-admission-lambd
 const { hostedUploadAdmissionRuntime } = await import("../upload-admission-hosted.ts");
 const { uploadAdmissionStatus, uploadDirectConfig, uploadStatusKey } = await import("../upload-admission.ts");
 const { journalKey, outcomeKey, receiptDir } = await import("../async-admission.ts");
-const { fenceAuthorityKey, s3LedgerKeys } = await import("../ledger-s3.ts");
+const { fenceAuthorityKey, orgFenceAuthorityKey, s3LedgerKeys } = await import("../ledger-s3.ts");
 const { encodeUploadWitness, parseUploadKey, parseUploadWitnessKey, uploadKeyPrefix, uploadObjectKey, uploadObjectSha256Hex } = await import("../upload-inbox-contract.ts");
 const { prepareDelivery } = await import("../vendor/delivery/prepare.ts");
 
@@ -78,7 +78,7 @@ async function upload(store: ObjectStore, batchId: string, records = [record({ r
 
 /** The operator's fence-authority marker (ledger-s3.ts FenceAuthorityDoc): without it nothing is admitted. */
 const writeAuthority = (store: ObjectStore) => store.put(objectKey(fenceAuthorityKey(ROOT)),
-  new TextEncoder().encode(JSON.stringify({ v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", writtenAtMs: T0 })), { contentType: "application/json" });
+  new TextEncoder().encode(JSON.stringify({ v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: T0 })), { contentType: "application/json" });
 
 function lambda(authority = true) {
   const s = scratchStore();
@@ -164,6 +164,17 @@ describe("upload -> promoteUpload -> inline admission with the S3 ledger (decisi
     await writeAuthority(store);
     expect(await handler({ Records: [{ messageId: "m2", body: s3Body(key) }] })).toEqual({ batchItemFailures: [] });
     expect(await exists(store, key)).toBe(false);
+    expect(sqlCalls).toEqual([]);
+  });
+
+  test("a per-org marker turns direct uploads on for that org only (the deployment-wide marker absent)", async () => {
+    const { store, handler } = lambda(false);
+    await store.put(objectKey(orgFenceAuthorityKey(ROOT, TENANT.orgId)), new TextEncoder().encode(JSON.stringify({ v: 1, orgId: TENANT.orgId, fenceBackfill: "complete",
+      revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: T0 })), { contentType: "application/json" });
+    const { key } = await upload(store, "batch-org");
+    expect(await handler({ Records: [{ messageId: "m1", body: s3Body(key) }] })).toEqual({ batchItemFailures: [] });
+    expect(await exists(store, key)).toBe(false);
+    expect(await json(store, s3LedgerKeys(ROOT, TENANT).batch("origin-1", "batch-org"))).toMatchObject({ state: "committed" });
     expect(sqlCalls).toEqual([]);
   });
 
