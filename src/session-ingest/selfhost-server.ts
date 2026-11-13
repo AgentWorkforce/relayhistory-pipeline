@@ -210,7 +210,7 @@ export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run
   let sqlControls: Ledger | undefined;
   const sqlControl = (): Ledger => (sqlControls ??= sqlLedger(parts.run, { acceptanceMode: "canonical" }));
   return withSqlControlMirror(
-    s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required" }),
+    s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false }),
     { setSessionUploads: (i) => sqlControl().setSessionUploads(i), resetUploadedSessions: (t, r) => sqlControl().resetUploadedSessions(t, r) },
     parts.store, keyRoot);
 }

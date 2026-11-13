@@ -224,6 +224,19 @@ describe("buffered backlog drain (0005)", () => {
     expect(await storedEntry(store, "fresh")).toEqual([1, "fresh:r1", sha("fresh:1"), SESS1, 0, 0]);
   });
 
+  test("revision-only stored entries (#587: seeded records, lazy slots) make an equal or lower revision stale", async () => {
+    const store = await scratch();
+    await seedIndex(store, [
+      { recordId: "seeded", revision: 4, revisionId: null, digest: null, sessionKey: SESS1, epoch: 0, resets: 0 },
+      { recordId: "slot", revision: 2, revisionId: null, digest: sha("slot:2"), sessionKey: SESS1, epoch: 0, resets: 0 },
+    ]);
+    await stage(store, [group("claude", "sess-1", [{ id: "seeded", rev: 4 }, { id: "slot", rev: 1 }, { id: "fresh", rev: 1 }])]);
+    const summary = await run(store);
+    expect(summary.lines).toMatchObject({ candidate: 3, written: 1, stale: 2, already_stored: 0, revision_conflict: 0 });
+    expect((await canonical(store)).get("sess-1")).toEqual(["fresh@1"]);
+    expect(await storedEntry(store, "seeded")).toEqual([4, null, null, SESS1, 0, 0]); // never overwritten by the drain
+  });
+
   test("across backlog batches: a later batch's equal revision with another digest is refused by the merged index", async () => {
     const store = await scratch();
     await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1, digest: "a".repeat(64) }])], { batch: "b1" });
