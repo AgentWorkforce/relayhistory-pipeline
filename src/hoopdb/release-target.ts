@@ -346,9 +346,11 @@ export interface ReleaseAnchorChain {
  *    tip is target_sha (release_anchor_ref_mismatch);
  *  - target_sha is not itself on the release sha's first-parent history, has exactly
  *    one parent, and every commit on its first-parent walk until main's first-parent
- *    history is a single-parent tip of a lower release/schema-<t> branch, t strictly
- *    below the previous one in migrator order (release_anchor_nonlinear for a merge or
- *    root commit; release_anchor_chain otherwise);
+ *    history is either a single-parent tip of a lower release/schema-<t> branch, t
+ *    strictly below the previous one in migrator order, or a same-slot repair commit
+ *    that changes only fixed anchor files to the release sha's exact bytes
+ *    (release_anchor_nonlinear for a merge or root commit; release_anchor_chain
+ *    otherwise);
  *  - target_sha's seven verifier files exist (release_target_verifier_missing);
  *  - every path that differs between the main base and target_sha is allowlisted
  *    (releaseAnchorPathAllowed; release_anchor_extra_file) and byte-identical, mode
@@ -415,7 +417,28 @@ export function requireReleaseAnchor(input: {
       .map(([b]) => [b, stepOf.get(b)] as const)
       .filter((x): x is readonly [string, string] => typeof x[1] === "string" && stepOrder(x[1], floor) < 0)
       .sort((a, b) => stepOrder(b[1], a[1]));
-    if (!lower.length) refuse("release_anchor_chain", "an anchor's parent is neither main nor the tip of a lower release anchor");
+    if (!lower.length) {
+      // A protected anchor cannot be rewritten when a time-sensitive fixed fixture
+      // expires after its first push. Permit an append-only repair only when this
+      // individual commit changes one or more fixed anchor paths and every changed
+      // entry (mode and bytes) is already the exact release-sha entry. The final tree
+      // is still checked in full against mainBase below. A tampered intermediate,
+      // schema/workflow change or unrelated path therefore cannot hide in the walk.
+      const repair = git(repo, ["diff-tree", "-r", "-z", "--no-renames", "--no-ext-diff", "--name-only", p, cur, "--"]);
+      if (repair.status !== 0)
+        refuse("release_target_sha_unknown", "an anchor repair diff could not be read");
+      const repairPaths = repair.stdout.toString("utf8").split("\0").filter(Boolean);
+      if (
+        repairPaths.length > 0 &&
+        repairPaths.every(
+          (path) => RELEASE_ANCHOR_FIXED_PATHS.includes(path) && entryAt(repo, cur, path) === entryAt(repo, releaseSha, path),
+        )
+      ) {
+        cur = p;
+        continue;
+      }
+      refuse("release_anchor_chain", "an anchor's parent is neither main, a fixed-file repair, nor the tip of a lower release anchor");
+    }
     below.push(lower[0]![0]);
     floor = lower[0]![1];
     cur = p;

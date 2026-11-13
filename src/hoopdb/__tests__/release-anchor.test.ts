@@ -336,6 +336,34 @@ test("linear chain: a merge anchor, a root anchor, a side parent, a parent that 
   );
 });
 
+test("a protected anchor may append only an exact fixed-file repair", () => {
+  // The first anchor carried the fixture bytes that were valid when it was pushed.
+  // Its append-only successor repairs that one fixed path to the release sha's exact
+  // bytes, without rewriting protected branch history.
+  const old = forge(A, { [RTH_TEST]: "old fixed-clock fixture\n" }, [M0], "old anchor");
+  const repaired = forge(A, {}, [old], "repair fixed fixture");
+  withRef("release/schema-047000", repaired, () => {
+    expect(bind(repaired, up("047000"), PREFIX.A).targetSha).toBe(repaired);
+    expect(requireReleaseAnchor({ repo, releaseSha: R, targetSha: repaired, target: up("047000") })).toEqual({
+      branch: "release/schema-047000",
+      mainBase: M0,
+      below: [],
+    });
+  });
+
+  // Exact path alone is insufficient: its resulting bytes must be the release bytes.
+  const tampered = forge(A, { [RTH_TEST]: "tampered\n" }, [old], "tampered repair");
+  withRef("release/schema-047000", tampered, () =>
+    expect(code(() => bind(tampered, up("047000"), PREFIX.A))).toBe("release_anchor_chain"),
+  );
+  // A repair commit cannot smuggle any non-fixed path, even when the resulting fixed
+  // fixture itself is exact.
+  const wide = forge(A, { "README.md": "repair side effect\n" }, [old], "wide repair");
+  withRef("release/schema-047000", wide, () =>
+    expect(code(() => bind(wide, up("047000"), PREFIX.A))).toBe("release_anchor_chain"),
+  );
+});
+
 test("allowlisted, reproducible diff: an extra file, a tampered or re-moded file, or a rollback outside the prefix refuses", () => {
   for (const [label, files, expected] of [
     ["extra file", { "README.md": "anchor\n" }, "release_anchor_extra_file"],
