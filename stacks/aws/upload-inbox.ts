@@ -207,6 +207,8 @@ export function desktopUploadPolicy(i: { bucketArn: string; accountId: string; r
  * FenceAuthorityDoc; INGEST_KEY_ROOT is TENANT_KEY_BASE). Read only: an operator writes it, never this role.
  */
 export const FENCE_AUTHORITY_MARKER_KEY = `${TENANT_KEY_BASE}/.ledger/fence-authority.json`;
+/** The per-org markers (ledger-s3.ts orgFenceAuthorityKey): `96bulls/.ledger/fence-authority/<org>.json`, read only. */
+export const FENCE_AUTHORITY_ORG_MARKERS = `${TENANT_KEY_BASE}/.ledger/fence-authority/*`;
 
 export function uploadAdmissionBucketStatements(i: { bucketArn: string; consumerRoleArn: string; promotionObjects: string[] }) {
   const inbox = uploadInboxObjects(i.bucketArn);
@@ -214,8 +216,10 @@ export function uploadAdmissionBucketStatements(i: { bucketArn: string; consumer
   return [
     { Sid: "UploadAdmissionReadsTombstonesDeletesUploads", Effect: "Allow" as const, Principal: principal, Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"], Resource: [inbox] },
     { Sid: "UploadAdmissionPromotes", Effect: "Allow" as const, Principal: principal, Action: ["s3:GetObject", "s3:PutObject"], Resource: i.promotionObjects },
-    // Exactly the one marker key, GET only (no wildcard): without it every record is a retry (fails closed).
-    { Sid: "UploadAdmissionReadsFenceAuthority", Effect: "Allow" as const, Principal: principal, Action: ["s3:GetObject"], Resource: [`${i.bucketArn}/${FENCE_AUTHORITY_MARKER_KEY}`] },
+    // The deployment-wide marker (exact key) and the per-org markers (that one prefix), GET only: without a valid
+    // marker for its org every record is a retry (fails closed). Nothing outside `.ledger/fence-authority`.
+    { Sid: "UploadAdmissionReadsFenceAuthority", Effect: "Allow" as const, Principal: principal, Action: ["s3:GetObject"],
+      Resource: [`${i.bucketArn}/${FENCE_AUTHORITY_MARKER_KEY}`, `${i.bucketArn}/${FENCE_AUTHORITY_ORG_MARKERS}`] },
     // Missing keys must answer 404 (create-only reads, the status object), as for the srv-writer: key names only.
     { Sid: "UploadAdmissionListsForMissingKeys", Effect: "Allow" as const, Principal: principal, Action: ["s3:ListBucket"], Resource: [i.bucketArn] },
     {
