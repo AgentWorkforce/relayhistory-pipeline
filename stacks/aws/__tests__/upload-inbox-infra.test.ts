@@ -159,11 +159,12 @@ describe("flag off renders the stack byte-identical", () => {
       res[k].issuerOnly=await render({...base,transcriptStore:{...store,uploadControlRoleArn:'${controlRoleArn}',uploadInboxSse:'aws:kms',uploadAdmission:ua,uploadPresignIssuer:true}});
       if(store.sessionPipeline) res[k].on=await render({...base,historyUploadDirectInfra:true,transcriptStore:{...store,uploadControlRoleArn:'${controlRoleArn}',uploadInboxSse:'aws:kms',uploadAdmission:ua}});
       if(store.sessionPipeline) res[k].onIssuer=await render({...base,historyUploadDirectInfra:true,transcriptStore:{...store,uploadControlRoleArn:'${controlRoleArn}',uploadInboxSse:'aws:kms',uploadAdmission:ua,uploadPresignIssuer:true}});
+      if(store.sessionPipeline) res[k].onIssuerOnly=await render({...base,historyUploadDirectInfra:true,transcriptStore:{...store,uploadInboxSse:'aws:kms',uploadAdmission:ua,uploadPresignIssuer:true}});
     }
     console.log(JSON.stringify(res));`;
   const result = spawnSync(process.execPath, ["--eval", script], { encoding: "utf8", env: { PATH: process.env.PATH }, timeout: 120_000 });
   if (result.status !== 0) throw new Error(result.stderr);
-  const renders = JSON.parse(result.stdout) as Record<string, { absent: string; explicitFalse: string; controlOnly: string; sseOnly: string; admissionOnly: string; issuerOnly: string; on?: string; onIssuer?: string }>;
+  const renders = JSON.parse(result.stdout) as Record<string, { absent: string; explicitFalse: string; controlOnly: string; sseOnly: string; admissionOnly: string; issuerOnly: string; on?: string; onIssuer?: string; onIssuerOnly?: string }>;
   const uploadSids = ["DenyUploadInbox", "UploadInboxOnlyItsRoles", "UploadInboxOnlyEraserOrConsumerDeletes", "DesktopUploadEncryptsInboxViaS3", "UploadAdmissionEncryptsAndReadsViaS3",
     "UploadAdmissionReadsTombstonesDeletesUploads", "UploadAdmissionPromotes", "UploadAdmissionListsForMissingKeys", "UploadAdmissionNoHistoryNoAdmin", "UploadAdmissionReads"];
 
@@ -260,11 +261,41 @@ describe("flag off renders the stack byte-identical", () => {
     }
   });
 
+  it("on + uploadPresignIssuer, no uploadControlRoleArn (hosted presigned uploads): no desktop-upload role, and nothing names one", () => {
+    for (const scenario of ["full", "noAnalysis"]) {
+      const withRole = JSON.parse(renders[scenario]!.onIssuer!);
+      const issuerOnly = JSON.parse(renders[scenario]!.onIssuerOnly!);
+      const names = (r: any) => r.resources.map((x: any) => x.name);
+      expect(names(issuerOnly)).not.toContain("desktop-upload-role");
+      expect(names(withRole).filter((n: string) => n !== "desktop-upload-role")).toEqual(names(issuerOnly));
+      const byName = (n: string) => issuerOnly.resources.find((r: any) => r.name === n).props;
+      const issuerArn = `arn:aws:iam::${accountId}:user/96bulls/${presignIssuerUserName(stage)}`;
+      const fnRoleArn = `arn:aws:iam::${accountId}:role/upload-admission-role`;
+      // The wall admits the consumer, the eraser and the issuer only; the key policy has no desktop-upload grant.
+      const wall = byName("transcripts").policy.find((st: any) => st.Sid === "UploadInboxOnlyItsRoles");
+      const admitted = wall.Condition.ArnNotEquals["aws:PrincipalArn"];
+      expect(admitted).toHaveLength(3);
+      expect(admitted).toContain(fnRoleArn);
+      expect(admitted).toContain(issuerArn);
+      expect(admitted).not.toContain(u.uploadRoleArn);
+      expect(byName("transcripts-key").policy.Statement.map((st: any) => st.Sid)).not.toContain("DesktopUploadEncryptsInboxViaS3");
+      expect(byName("transcripts-key").policy.Statement.filter((st: any) => st.Principal?.AWS === issuerArn).map((st: any) => st.Sid)).toEqual(["PresignIssuerEncryptsInboxViaS3", "PresignIssuerReadsJournalsViaS3"]);
+      expect(JSON.stringify(issuerOnly)).not.toContain(u.uploadRole);
+      expect(issuerOnly.ret.uploadInbox.uploadRoleArn).toBeUndefined();
+      expect(issuerOnly.ret.uploadInbox.presignIssuerUser).toBe(presignIssuerUserName(stage));
+    }
+  });
+
   it("on: refuses without a control role or without the session pipeline", () => {
     const refuse = (store: string) => spawnSync(process.execPath, ["--eval", script.replace(/const res=\{\};[\s\S]*$/, `await E.runPromise(transcriptStoreStage({...base,historyUploadDirectInfra:true,transcriptStore:${store}}));`)], { encoding: "utf8", env: { PATH: process.env.PATH }, timeout: 60_000 });
     const noControl = refuse("scenarios.full");
     expect(noControl.status).not.toBe(0);
     expect(noControl.stderr).toContain("uploadControlRoleArn is required");
+    expect(noControl.stderr).toContain("unless transcriptStore.uploadPresignIssuer is true");
+    // Neither the role ARN nor the presign issuer: still refused (also with the issuer flag absent but the rest set).
+    const neither = refuse(`{...scenarios.full,uploadInboxSse:'aws:kms',uploadAdmission:ua}`);
+    expect(neither.status).not.toBe(0);
+    expect(neither.stderr).toContain("uploadControlRoleArn is required");
     const noPipeline = refuse(`{...scenarios.store,uploadControlRoleArn:'${controlRoleArn}',uploadInboxSse:'aws:kms',uploadAdmission:ua}`);
     expect(noPipeline.status).not.toBe(0);
     expect(noPipeline.stderr).toContain("sessionPipeline is required");
