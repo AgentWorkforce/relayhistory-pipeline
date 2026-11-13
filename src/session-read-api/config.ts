@@ -39,7 +39,9 @@ export function parseFactsBackend(
 
 /**
  * A default-off flag whose ONLY on-value is the exact string "true": unset, "", "1", "TRUE",
- * " true" and every non-string are off. Never echoes the value.
+ * " true" and every non-string are off. Never echoes the value. Used by
+ * READ_API_LONG_SUMMARY_ENABLED, SESSION_LONG_SUMMARY_PROJECTION_ENABLED,
+ * READ_API_BRIEF_SUMMARY_ENABLED and READ_API_LIST_SHORT_SUMMARY_ENABLED.
  */
 export function exactTrueFlag(raw: unknown): boolean {
   return raw === "true";
@@ -49,6 +51,11 @@ export function exactTrueFlag(raw: unknown): boolean {
 export function coordinationOverlapsEnabled(raw: unknown): boolean {
   return raw === "true";
 }
+
+/** Hosted Lambda entry: wire the brief-summary read (GET /v1/sessions/:id/summary). The service always wires it. */
+export const READ_API_BRIEF_SUMMARY_ENABLED = "READ_API_BRIEF_SUMMARY_ENABLED";
+/** GET /v1/sessions: serve the opt-in includeShortSummary=recorded list extension. */
+export const READ_API_LIST_SHORT_SUMMARY_ENABLED = "READ_API_LIST_SHORT_SUMMARY_ENABLED";
 
 /** READ_API_OUTPUT_ENABLED / READ_API_DIGEST_ENABLED: only "1" (trimmed) enables, as on the read Worker. */
 export function readApiRouteEnabled(raw: unknown): boolean {

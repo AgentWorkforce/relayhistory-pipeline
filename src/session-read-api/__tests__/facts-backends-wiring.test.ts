@@ -136,3 +136,78 @@ describe("READ_API_LONG_SUMMARY_ENABLED (kind=long on the summary route)", () =>
     expect(sql.filter((s) => s.text.includes("session_long_summary_for"))).toEqual([]);
   });
 });
+
+describe("brief-summary and list short-summary flags (READ_API_BRIEF_SUMMARY_ENABLED, READ_API_LIST_SHORT_SUMMARY_ENABLED)", () => {
+  const LAMBDA_SECRET = JSON.stringify({
+    supabase_url: PG_URL,
+    clickhouse: { url: "https://ch.example.invalid:8443", user: "reader", password: "p", database: "relay_search" },
+  });
+  const buildLambda = (env: NodeJS.ProcessEnv) => readApiDepsFromSecret(LAMBDA_SECRET, { READ_API_COMPLETE_SINCE: "epoch", ...env }, undefined, { entry: "lambda" });
+
+  test("the hosted Lambda entry wires neither unless the flag is exactly \"true\"", async () => {
+    for (const value of [undefined, "", "1", "TRUE", "True", "yes", " true", "true "]) {
+      const env = value === undefined ? {} : { READ_API_BRIEF_SUMMARY_ENABLED: value, READ_API_LIST_SHORT_SUMMARY_ENABLED: value };
+      const built = await buildLambda(env);
+      try {
+        expect([value, built.deps.briefSummary, built.deps.listShortSummary]).toEqual([value, undefined, undefined]);
+      } finally {
+        await built.close();
+      }
+    }
+  });
+
+  test("\"true\" wires the brief-summary read on the hosted Lambda entry, and each flag is independent", async () => {
+    const summary = await buildLambda({ READ_API_BRIEF_SUMMARY_ENABLED: "true" });
+    try {
+      expect(typeof summary.deps.briefSummary?.read).toBe("function");
+      expect(typeof summary.deps.briefSummary?.activity).toBe("function");
+      expect(summary.deps.listShortSummary).toBeUndefined();
+    } finally {
+      await summary.close();
+    }
+    const list = await buildLambda({ READ_API_LIST_SHORT_SUMMARY_ENABLED: "true" });
+    try {
+      expect(list.deps.listShortSummary).toBe(true);
+      expect(list.deps.briefSummary).toBeUndefined();
+    } finally {
+      await list.close();
+    }
+  });
+
+  test("the self-host service always wires the brief-summary read; the list opt-in still needs its flag", async () => {
+    for (const value of [undefined, "false"]) {
+      const built = await build({ ...ENV, ...(value === undefined ? {} : { READ_API_BRIEF_SUMMARY_ENABLED: value }) });
+      try {
+        expect(built.deps.briefSummary).toBeDefined();
+        expect(built.deps.listShortSummary).toBeUndefined();
+      } finally {
+        await built.close();
+      }
+    }
+    const built = await build({ ...ENV, READ_API_LIST_SHORT_SUMMARY_ENABLED: "true" });
+    try {
+      expect(built.deps.listShortSummary).toBe(true);
+    } finally {
+      await built.close();
+    }
+  });
+
+  test("on the hosted Lambda entry the long and brief summary flags are independent, both default off", async () => {
+    const cases: Array<[NodeJS.ProcessEnv, boolean, boolean]> = [
+      [{}, false, false],
+      [{ [READ_API_LONG_SUMMARY_ENABLED]: "true" }, true, false],
+      [{ READ_API_BRIEF_SUMMARY_ENABLED: "true" }, false, true],
+      [{ [READ_API_LONG_SUMMARY_ENABLED]: "true", READ_API_BRIEF_SUMMARY_ENABLED: "true" }, true, true],
+    ];
+    for (const [env, long, brief] of cases) {
+      const built = await buildLambda(env);
+      try {
+        expect([env, typeof built.deps.longSummary?.read, typeof built.deps.briefSummary?.read])
+          .toEqual([env, long ? "function" : "undefined", brief ? "function" : "undefined"]);
+      } finally {
+        await built.close();
+      }
+    }
+    expect(sql.filter((s) => s.text.includes("session_long_summary_for"))).toEqual([]);
+  });
+});

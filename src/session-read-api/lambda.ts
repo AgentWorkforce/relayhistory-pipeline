@@ -38,7 +38,13 @@ import { sqlBriefSummary } from "./brief-summary.ts";
  * migration 20261105046010; unset/""/"false" off = 501 `param_q` as before; anything else
  * fails startup, see sessionQueryEnabled). READ_API_COORDINATION_OVERLAPS_ENABLED (exactly
  * "true") exposes GET /v1/coordination/overlaps; READ_API_COORDINATION_OVERLAPS_BACKEND selects
- * clickhouse (default) or postgres (self-host service only). READ_API_LONG_SUMMARY_ENABLED
+ * clickhouse (default) or postgres (self-host service only). READ_API_BRIEF_SUMMARY_ENABLED (exactly
+ * "true") wires the brief-summary read (GET /v1/sessions/:id/summary and
+ * /v1/sessions/summaries/activity) on this entry too; unset/any other value = 501
+ * `summary_not_configured` as before (the self-host service always wires it).
+ * READ_API_LIST_SHORT_SUMMARY_ENABLED (exactly "true", either entry) serves the opt-in
+ * includeShortSummary=recorded on GET /v1/sessions; otherwise that param is 501
+ * `param_includeShortSummary` and the list shape is unchanged. READ_API_LONG_SUMMARY_ENABLED
  * (exactly "true"; default off, both entries) wires `kind=long` on GET /v1/sessions/:id/summary
  * through sessions.session_long_summary_for (migration 20261105060000); off = 501 `summary_kind`.
  *
@@ -67,10 +73,11 @@ import {
 import { parseSelfhostLoginSync, parseSelfhostReadApi } from "./selfhost.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import {
-  coordinationOverlapsEnabled, parseCompleteSince, parseFactsBackend, readApiRouteEnabled,
-  READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_COORDINATION_OVERLAPS_ENABLED,
+  coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince, parseFactsBackend, readApiRouteEnabled,
+  READ_API_BRIEF_SUMMARY_ENABLED, READ_API_COORDINATION_OVERLAPS_BACKEND, READ_API_COORDINATION_OVERLAPS_ENABLED,
+  READ_API_LIST_SHORT_SUMMARY_ENABLED,
   READ_API_DIGEST_BACKEND, READ_API_OUTPUT_BACKEND,
-  READ_API_LONG_SUMMARY_ENABLED, exactTrueFlag,
+  READ_API_LONG_SUMMARY_ENABLED,
 } from "./config.ts";
 import { sqlLongSummary } from "./long-summary.ts";
 import { poolTenantRunner, sqlLiveness, sqlOperatorErased, type SqlQuery } from "./liveness.ts";
@@ -543,6 +550,9 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const loginSync = parseSelfhostLoginSync(env);
   const facts = factsBackends(env, entry);
   const coordinationEnabled = coordinationOverlapsEnabled(env[READ_API_COORDINATION_OVERLAPS_ENABLED]);
+  // The service always wires the brief-summary read; the hosted Lambda only with the exact flag.
+  const briefSummaryWired = entry === "service" || exactTrueFlag(env[READ_API_BRIEF_SUMMARY_ENABLED]);
+  const listShortSummary = exactTrueFlag(env[READ_API_LIST_SHORT_SUMMARY_ENABLED]);
   // The self-host service never inherits the hosted Supabase pin by omission.
   if (entry === "service" && !env.SESSION_POSTGRES_TLS_PROFILE)
     throw new Error("session read api: the self-host service needs SESSION_POSTGRES_TLS_PROFILE set explicitly");
@@ -646,8 +656,9 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     directory: sqlDirectory(poolTenantRunner(pool as never)),
     directoryWorkspaces: parseDirectoryWorkspaces(env.READ_API_DIRECTORY_WORKSPACES),
     ...(analysis ? { analysis } : {}),
-    ...(entry === "service" ? {briefSummary: sqlBriefSummary(poolTenantRunner(pool as never))} : {}),
-    ...(exactTrueFlag(env[READ_API_LONG_SUMMARY_ENABLED]) ? {longSummary: sqlLongSummary(poolTenantRunner(pool as never))} : {}),
+    ...(briefSummaryWired ? { briefSummary: sqlBriefSummary(poolTenantRunner(pool as never)) } : {}),
+    ...(listShortSummary ? { listShortSummary: true } : {}),
+    ...(exactTrueFlag(env[READ_API_LONG_SUMMARY_ENABLED]) ? { longSummary: sqlLongSummary(poolTenantRunner(pool as never)) } : {}),
     briefTitles: sqlBriefTitles(poolTenantRunner(pool as never)),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
