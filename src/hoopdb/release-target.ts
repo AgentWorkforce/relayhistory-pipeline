@@ -175,8 +175,9 @@ export const RELEASE_ANCHOR_MAX_CHAIN = 64;
  * the function-boundary lane modules (scripts/sessions-function-boundary/lanes/*.ts):
  * the five bootstrap chain files, the seven phase 2 verifiers, the function-boundary
  * generator inputs and every output it writes (scripts/sync-sessions-function-boundary.ts),
- * the migration sentinels and the bootstrap contract modules the bootstrap stage reads
- * from the anchor. Every one must also be byte-identical to the release sha.
+ * the migration sentinels, the bootstrap contract modules the bootstrap stage reads
+ * from the anchor, and the one test-only clock repair required by old anchors. Every
+ * one must also be byte-identical to the release sha.
  */
 export const RELEASE_ANCHOR_FIXED_PATHS: readonly string[] = [
   ...new Set([
@@ -205,6 +206,9 @@ export const RELEASE_ANCHOR_FIXED_PATHS: readonly string[] = [
     "src/hoopdb/session-bootstrap-chain.ts",
     "src/hoopdb/session-bootstrap-roles.ts",
     "src/hoopdb/session-bootstrap-consumers.ts",
+    // Test-only clock repair needed by old anchors after their fixed fixture expiry.
+    // As with every fixed path, the anchor bytes must equal the release sha.
+    "src/session-ingest/__tests__/rth-verifier.test.ts",
   ]),
 ];
 const BOUNDARY_LANE_MODULE = /^scripts\/sessions-function-boundary\/lanes\/[a-z0-9-]+\.ts$/;

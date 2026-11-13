@@ -79,6 +79,7 @@ const step = (slot: string) => `-- step ${slot}\nSELECT 1;\n`;
  */
 const CI = ".github/workflows/ci.yml";
 const PG = ".github/workflows/pg-proof.yml";
+const RTH_TEST = "src/session-ingest/__tests__/rth-verifier.test.ts";
 const CI_BASE = [
   "name: ci",
   "on:",
@@ -131,6 +132,7 @@ const M0 = commit({
   "src/hoopdb/session-bootstrap-chain.ts": readFileSync(new URL("../session-bootstrap-chain.ts", import.meta.url), "utf8"),
   [CI]: CI_BASE,
   [PG]: PG_BASE,
+  [RTH_TEST]: "old fixed-clock fixture\n",
   "README.md": "main\n",
 }, "M0");
 const R = commit({
@@ -143,10 +145,11 @@ const R = commit({
   ...bootstrap("b1"),
   [CI]: CI_MAIN,
   [PG]: PG_MAIN,
+  [RTH_TEST]: "explicit test clock\n",
   "README.md": "main 2\n",
 }, "R");
 git(repo, "checkout", "-q", "-b", "anchors", M0);
-const A = commit(bootstrap("b1"), "A");
+const A = commit({ ...bootstrap("b1"), [RTH_TEST]: "explicit test clock\n" }, "A");
 const B = commit({ [upPath("047010")]: step("047010"), [rbPath("047010")]: "-- rb 047010\n", "src/hoopdb/migrate-guards.ts": "export const g = 1;\n" }, "B");
 const C = commit({ [upPath("050000")]: step("050000"), [upPath("050010")]: step("050010") }, "C");
 git(repo, "checkout", "-q", "main");
@@ -344,6 +347,7 @@ test("allowlisted, reproducible diff: an extra file, a tampered or re-moded file
     ["tampered step", { [upPath("047000")]: step("047000") + "-- tampered\n" }, "release_anchor_file_drift"],
     ["verifier differing from the release", { [RELEASE_TREE.verifiers[0]!.path]: "-- other\n" }, "release_anchor_file_drift"],
     ["sentinels absent at the release", { "src/hoopdb/migration-sentinels.ts": "x\n" }, "release_anchor_file_drift"],
+    ["test clock fix differing from the release", { [RTH_TEST]: "tampered\n" }, "release_anchor_file_drift"],
   ] as [string, Record<string, string>, string][]) {
     const forged = forge(A, files, [M0], label);
     withRef("release/schema-047000", forged, () =>
@@ -488,6 +492,7 @@ test("the allowlist covers every function-boundary generator output and the boot
   for (const path of Object.keys(generated.outputs)) expect([path, releaseAnchorPathAllowed(path, all)]).toEqual([path, true]);
   for (const f of [...SESSION_BOOTSTRAP_FILES, ...RELEASE_TREE.verifiers.map((v) => v.path)])
     expect(RELEASE_ANCHOR_FIXED_PATHS).toContain(f);
+  expect(RELEASE_ANCHOR_FIXED_PATHS).toContain(RTH_TEST);
   for (const path of [
     "README.md",
     "package.json",
