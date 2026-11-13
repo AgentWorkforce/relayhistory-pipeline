@@ -30,7 +30,7 @@ still a claim, a stage intent and a receipt ACK in Postgres. The fix is to stop 
 | Today (`ledger.ts`, SQL) | 0005 (S3) |
 | --- | --- |
 | Batch idempotency (`ingest_batches`): a retry replays; a reused batch id with other content is a 409 `batch_id` | A **batch record** object, written create-only. Same digest and committed: replay. Same digest and pending: resume. Other digest: 409. |
-| Stored revisions (`ingest_record_revisions`): an equal or lower revision is `stale` and skipped | A **revision index** object per (origin, session). The claim reads the batch's sessions' indexes, and an equal or lower revision is `stale`, exactly as relayhistory-cloud #250. The commit merges the written revisions in with `If-Match` (max wins, an equal revision keeps the stored digest). This is required, not an optimisation: the reader fold refuses equal revisions with different content (`chooseRelayhistoryRevision`, `packages/pipeline/src/lib/pipeline/relayhistory-transform.ts:384-392`). |
+| Stored revisions (`ingest_record_revisions`, keyed per origin and record): an equal or lower revision is `stale` and skipped | A **revision index** keyed per (origin, record id), sharded by a hash of the record id. Each entry carries its generation: the session's fence epoch and the user's reset count when it was written. A claim reads the shards its records fall in, and an equal or lower revision of the current generation is `stale`, exactly as relayhistory-cloud #250. An entry of an older generation counts as absent, so a disable followed by a re-enable, or a reset, lets the re-upload through. The commit merges written revisions with `If-Match` (a first write is create-only): max wins, and an equal revision keeps the stored digest. This is required, not an optimisation: the reader fold is per origin and refuses equal revisions with different content (`chooseRelayhistoryRevision`, `packages/pipeline/src/lib/pipeline/relayhistory-transform.ts:377-392`). |
 | In-batch revision reuse: 409 `record_revision` | Computed from the batch alone. It never needed stored state. |
 | Deletion fences and resets (`upload_deletions`, `upload_resets`) | One **fence object** per user, edited with CAS. The claim reads it to get `deleted` and `resets`. |
 | Fence recheck at commit, erasure re-arm (`upload_erasure_rearm`) | The commit re-reads the fence. If a reset, or a deletion of a written session, landed in between, it writes a **re-arm marker** for the eraser. That is today's `rearmed` semantics. |
@@ -47,12 +47,20 @@ All of these sit under the per-user admission directory that already holds `priv
   `{v:1, originId, batchId, digest, receiptId, state:"pending"|"committed", claimToken, fenceVersion}`.
   It is written `If-None-Match: *` at claim and moved from `pending` to `committed` with `If-Match` at
   commit.
-- `…/ledger/revisions/o=<sha256(origin)[0:32]>/s=<sha256(source \x1f sessionId)[0:32]>.json`
-  `{v:1, records:{<recordId>:[revision, revisionId, digest]}}`. It is read at claim and merged with
-  `If-Match` at commit, retrying on `precondition_failed`. Records with no session share one
-  `s=_origin` index, as the writer's `_origin` session does.
+- `…/ledger/revisions/o=<sha256(origin)[0:32]>/r=<shard>.json`
+  `{v:1, records:{<recordId>:[revision, revisionId, digest, epoch, resets]}}`. It is read at claim and
+  merged at commit (create-only for the first write, `If-Match` after), retrying on
+  `precondition_failed`. The shard is a fixed-width prefix of `sha256(recordId)`.
+- `…/ledger/owners/o=<sha256(origin)[0:32]>/s=<sha256(JSON [source, sessionId])[0:32]>.json`
+  The session's ownership stub, written at **claim**, before any canonical write, as
+  `ingest_session_ownership` is. A reset lists these, so a session first uploaded while a reset is in
+  flight is still caught by it.
 - `…/upload-fences.json`
-  `{v:1, resets:<n>, deleted:{<origin>:[[source, sessionId], …]}}`. Every selection, reset or erase
+  `{v:1, instance, version, resets, lastResetAtMs, resetRequests, epochs, deleted:{<origin>:[[source, sessionId], …]}}`.
+  `instance` is random per fence, so a deleted and recreated fence never matches an old snapshot.
+  `resetRequests` makes a retried reset idempotent by request id. A reset tombstones every owned
+  session whose generation is below the new reset count, so overlapping or interrupted resets still
+  finish. Every selection, reset or erase
   edits it with `If-Match`, retrying on `precondition_failed` as `editJournal` does. It fails closed:
   an unreadable fence is a retry, never an empty fence.
 - `…/ledger/rearm/<sha256(source \x1f sessionId)[0:32]>.json`
@@ -101,6 +109,12 @@ one-time **fence backfill**:
    `upload-fences.json`, and from then on controls dual-write it (see Controls). This is a one-time
    migration of existing state, not ongoing accounting. The drain refuses a user whose fence has not been
    backfilled, so it can never republish a deleted session.
+0b. **Accepted-stage export.** S3 alone cannot tell an accepted stage from an abandoned one: a stage
+   object can exist after `putBufferedStage` while its receipt was never committed, for example when
+   the consent gate refused it between the PUT and the ACK (`deliver.ts`). A one-time read-only export
+   lists the stage keys whose receipt was acknowledged (`ingest_buffer_outbox.active_stage_token` and the
+   committed `ingest_batches` rows) into an S3 manifest. The drain writes only stages on that list and
+   reports the rest. Like the fence backfill, this is a one-time migration read, not ongoing accounting.
 1. List `buffered-batches/v1/` staged objects. Each carries its tenant, origin and grouped scrubbed
    lines (`staging.ts:222`).
 2. Read the user's fence and privacy journal. Drop deleted sessions and batches the user's last reset
@@ -136,12 +150,14 @@ schema drift lists.
 
 ## Risks
 
-- **Revision index contention.** Two batches for the same session race on its index's CAS. The loser
-  re-reads and re-merges. Merging is commutative (max wins, an equal revision keeps the first), so the
-  order doesn't matter.
+- **Revision index contention.** Two batches for records in the same shard race on its CAS. The loser
+  re-reads and re-merges. Merging is commutative (max wins, an equal revision keeps the first, a newer
+  generation is never overwritten by an older one), so the order doesn't matter.
 - **Index and manifest disagree after a crash.** A crash between the canonical write and the index
   merge leaves the batch `pending`. The retry resumes, rewrites idempotently under manifest CAS, and
   then merges. The index can lag the manifest, but it never leads it.
+- **Fence growth.** The fence only grows (deleted sessions, epochs, reset request ids). Compaction of
+  entries older than the user's last reset is a follow-up.
 - **Fence contention.** One user's controls and admissions all touch one fence object. Controls are
   rare, admissions only read it, and CAS retries are bounded (`privacy_journal_contended` is the
   model).
