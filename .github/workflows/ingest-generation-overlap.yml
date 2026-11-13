@@ -5,12 +5,15 @@ run-name: ingest overlap ${{ inputs.mode }} ${{ inputs.sha }}
 # docs/design/zero-503-schema-windows.md section 3.2). The G -> H pair is the reviewed
 # PRIVATE_INGEST_OVERLAP constant in src/session-ingest/private-ingest-release.ts, never an input;
 # while it is null every mode refuses. Nothing runs unless dispatched.
+# rebind-dry-run / rebind: the post-apply G -> H rebind of the lazy policy and admission rows
+# (src/hoopdb/ingest-generation-rebind.ts) for the reviewed pair, offered only while the contract is
+# still bound to G; rebind must name a successful same-SHA rebind-dry-run run of this workflow.
 on:
   workflow_dispatch:
     inputs:
       mode:
         type: choice
-        options: [readback, open, close]
+        options: [readback, open, close, rebind-dry-run, rebind]
         default: readback
         required: true
       sha:
@@ -21,8 +24,12 @@ on:
         description: Open only - window TTL in seconds (60 to 14400); empty otherwise
         type: string
         default: ""
+      dry_run_id:
+        description: Rebind only - run id of a successful rebind-dry-run of this workflow at the same sha; empty otherwise
+        type: string
+        default: ""
       confirmation:
-        description: 'Open: OPEN-OVERLAP <G> <H> TTL <ttl_seconds> SHA <sha>. Close: CLOSE-OVERLAP <G> <H> SHA <sha>. Readback: empty'
+        description: 'Open: OPEN-OVERLAP <G> <H> TTL <ttl_seconds> SHA <sha>. Close: CLOSE-OVERLAP <G> <H> SHA <sha>. Rebind-dry-run: REBIND-DRY-RUN <G> <H> SHA <sha>. Rebind: REBIND <G> <H> SHA <sha> DRY <dry_run_id>. Readback: empty'
         type: string
         default: ""
 
@@ -42,6 +49,7 @@ env:
   OVERLAP_SHA: ${{ inputs.sha }}
   OVERLAP_TTL_SECONDS: ${{ inputs.ttl_seconds }}
   OVERLAP_CONFIRMATION: ${{ inputs.confirmation }}
+  OVERLAP_DRY_RUN_ID: ${{ inputs.dry_run_id }}
 
 jobs:
   # No environment here: a typo/missing environment must not auto-create an unprotected one.
@@ -89,7 +97,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: bun scripts/ingest-generation-overlap-github.ts --approved
-      - name: Open, read back or close the reviewed window (only step with the database secret)
+      - name: Open, read back, close or rebind the reviewed pair (only step with the database secret)
         env:
           SUPABASE_MIGRATION_OWNER_URL: ${{ secrets.SUPABASE_MIGRATION_OWNER_URL }}
         run: bun scripts/ingest-generation-overlap-ci.ts

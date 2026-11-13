@@ -12,14 +12,15 @@ import {
   type PrivateIngestReleasePhase,
   type CloudflareWorkerVersion,
 } from "../../../src/session-ingest/private-ingest-release.ts";
-import { privateIngestGithubGate } from "../../../scripts/private-ingest-release-github.ts";
+import { privateIngestGithubGate, trackedOverlapGeneration } from "../../../scripts/private-ingest-release-github.ts";
 
 const sha = "a".repeat(40), planRun = "90";
 const kmsKeyArn = "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-0000-000000000000";
 
-test("tracked production config is exact step 1; only the rollout phases and baseline rollback are representable", () => {
+test("tracked production config is exact step 1 with the reviewed G+H overlap; only the rollout phases and baseline rollback are representable", () => {
   const tracked = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
-  const expected = privateIngestProfileForPhase("step-1-custody", kmsKeyArn);
+  // Post-apply generation recovery (2026-11-13): step-1-custody held, Worker accepting exactly {G, H}.
+  const expected = privateIngestProfileForPhase("step-1-custody-overlap", kmsKeyArn);
   const { kmsKeyArn: _target, ...expectedTracked } = expected.sessionIngest;
   expect(tracked).toEqual({ sessionIngest: expectedTracked });
   for (const phase of ["baseline-drain", "step-0-shadow", "step-1-custody", "step-2-frozen-receipt", "step-4-async-on"] as const)
@@ -235,7 +236,8 @@ const githubBase = {
   PRIVATE_INGEST_RELEASE_MODE: "deploy",
   PRIVATE_INGEST_RELEASE_SHA: sha,
   PRIVATE_INGEST_RELEASE_PLAN_RUN: planRun,
-  PRIVATE_INGEST_RELEASE_CONFIRMATION: `DEPLOY ${P.worker} ${sha} PLAN ${planRun}`,
+  // The tracked profile declares an overlap, so the gate's typed confirmation ends in OVERLAP <H>.
+  PRIVATE_INGEST_RELEASE_CONFIRMATION: `DEPLOY ${P.worker} ${sha} PLAN ${planRun} OVERLAP ${trackedOverlapGeneration()}`,
   GITHUB_REPOSITORY: P.repository,
   GITHUB_REPOSITORY_ID: P.repositoryId,
   GITHUB_EVENT_NAME: "workflow_dispatch",

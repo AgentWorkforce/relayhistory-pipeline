@@ -260,7 +260,8 @@ To keep that one window as short as possible:
 `PRIVATE_INGEST_OVERLAP` pair in `src/session-ingest/private-ingest-release.ts`, the tracked
 `overlapGeneration` and the private-ingest deploy workflow. Step 2, plus a read-only readback and an owner
 close, use `.github/workflows/ingest-generation-overlap.yml`, which calls
-`src/hoopdb/ingest-generation-overlap-operator.ts`. The pair is never a dispatch input, and
+`src/hoopdb/ingest-generation-overlap-operator.ts`. The same workflow offers step 5 as `rebind-dry-run` then
+`rebind` (see "Post-apply recovery" below). The pair is never a dispatch input, and
 `admitDuringApply` is always off on that path.
 
 Release contract on that path (`src/session-ingest/private-ingest-release.ts`, `scripts/private-ingest-ci.ts`):
@@ -280,6 +281,35 @@ Release contract on that path (`src/session-ingest/private-ingest-release.ts`, `
 
 If the window expires before step 5, the fence fails closed: today's outage, never a widening. Choose a TTL
 that covers steps 3–5. The maximum is 4 h.
+
+#### Post-apply recovery (marker already at H, no window)
+
+When an owner-apply has moved readiness to `(H, pass)` before the Worker offered H and before a window was
+opened, the policy and admission rows are still at G and every buffered upload fails closed (G and H both
+refuse 55000). `open` refuses too (readiness is no longer PASS at G), and G -> H directly is not a permitted
+Worker move. The 2026-11-13 incident (G `7db65adb..`, H `52a3f2f0..`, guarded apply run 43471961540)
+recovers with this exact sequence, entirely through CI:
+
+1. **Source + Worker G+H.** Set `PRIVATE_INGEST_OVERLAP = {from: G, to: H}`, keep
+   `expectedGeneration = G`, add `overlapGeneration: H` to the tracked profile, and deploy G+H at the
+   unchanged rollout phase (`step-1-custody` -> `step-1-custody-overlap`, confirmation `... OVERLAP <H>`).
+   Uploads stay refused: the database is not at G or H yet.
+2. **CI rebind G -> H.** Dispatch `.github/workflows/ingest-generation-overlap.yml` twice at the same main SHA:
+   - `rebind-dry-run`, confirmation `REBIND-DRY-RUN <G> <H> SHA <sha>`: runs `rebindIngestGeneration` with
+     `dryRun` and rolls back; the receipt carries counts and flags only.
+   - `rebind`, `dry_run_id` = that run's id, confirmation `REBIND <G> <H> SHA <sha> DRY <dry_run_id>`: the gate
+     requires the bound run to be a successful, first-attempt `rebind-dry-run` of this workflow at the same SHA
+     by the pinned dispatcher, under 24 h old, with exactly one unexpired receipt artifact. It then moves the
+     policy and every admission row to H in one owner transaction (`overlapClosed: false`, there is no window).
+   Both modes take the pair only from the reviewed contract, refuse a dormant pair, and are offered only while
+   the contract is still bound to G. The `{G,H}` Worker's next G call gets 55000, retries at H, and is
+   admitted: uploads resume at that instant.
+3. **Worker H (later commit).** `expectedGeneration = H`, remove `overlapGeneration`, keep the pair; deploy
+   G+H -> H.
+4. **Dormant again (later commit).** Set the pair back to `null` once the live Worker reads back exactly `{H}`.
+
+The buffered GC and the publisher read their own expected generation and move to H separately, as in step 4
+of the normal sequence.
 
 ### 3.3 Admission renewal (dormant, CI-only)
 
@@ -384,6 +414,9 @@ fail-closed expiry is a separate typed operation outside this workflow.
     - a window naming G is refused;
     - the retired record is append-only.
   - Missing-policy negative (review P2): `open` with no lazy policy is refused and records nothing.
+  - Post-apply recovery (marker PASS at H, policy at G, no window): G, H and `{G,H}` are refused;
+    `rebind-dry-run` through the CI operator changes nothing; `rebind` moves the policy and admission rows
+    with `overlapClosed: false`; then `{G,H}` admits at H, G is refused and H admits.
   - Worker configuration parsing and the `sqlLedger` set validation.
 - `src/session-ingest/__tests__/generation-overlap.postgres.test.ts` (real PostgreSQL 17, opt-in via
   `SESSION_INGEST_TEST_PG_URL`):

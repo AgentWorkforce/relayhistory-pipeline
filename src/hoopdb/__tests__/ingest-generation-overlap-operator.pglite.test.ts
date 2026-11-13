@@ -3,6 +3,8 @@
  * reviewed pair opens, reads back and closes through the 044030 owner functions; it refuses unless readiness
  * is PASS at the old generation and the custody policy is still there; a foreign window blocks it; an
  * expired window admits nothing and closes as 'expired'; the rebind closes the window it covered.
+ * rebind-dry-run / rebind (the post-apply recovery): typed confirmations, step-1 contract only, a dry run
+ * that changes nothing, and a committed rebind of the policy and admission rows with no window.
  */
 import {test,expect,afterEach,setDefaultTimeout} from "bun:test";
 import {PGlite} from "@electric-sql/pglite";
@@ -13,7 +15,7 @@ import {join} from "node:path";
 import {SESSION_BOOTSTRAP_FILES} from "../session-bootstrap-chain.ts";
 import {rebindIngestGeneration} from "../ingest-generation-rebind.ts";
 import {generationOverlapStatus} from "../ingest-generation-overlap.ts";
-import {overlapOperatorInputs,runOverlapOperator} from "../ingest-generation-overlap-operator.ts";
+import {overlapOperatorConfirmation,overlapOperatorInputs,runOverlapOperator,runRebindOperator} from "../ingest-generation-overlap-operator.ts";
 import type {PrivateIngestGenerationContract} from "../../session-ingest/private-ingest-release.ts";
 setDefaultTimeout(120000);
 const root=join(import.meta.dir,"../../.."),A="a".repeat(64),B="f".repeat(64),C="e".repeat(64),sha="1".repeat(40);
@@ -36,7 +38,13 @@ async function fixture(){
  const op=async(mode:"open"|"readback"|"close",contract:PrivateIngestGenerationContract=atA,ttl="600")=>runOverlapOperator(client as never,overlapOperatorInputs({
   OVERLAP_MODE:mode,OVERLAP_SHA:sha,OVERLAP_TTL_SECONDS:mode==="open"?ttl:"",
   OVERLAP_CONFIRMATION:mode==="open"?`OPEN-OVERLAP ${A} ${B} TTL ${ttl} SHA ${sha}`:mode==="close"?`CLOSE-OVERLAP ${A} ${B} SHA ${sha}`:""},contract));
- return{db,client,marker,expiredWindow,liveWindow,op};
+ const rebindEnv=(mode:"rebind-dry-run"|"rebind",dry="95")=>({OVERLAP_MODE:mode,OVERLAP_SHA:sha,OVERLAP_TTL_SECONDS:"",
+  OVERLAP_DRY_RUN_ID:mode==="rebind"?dry:"",
+  OVERLAP_CONFIRMATION:mode==="rebind"?`REBIND ${A} ${B} SHA ${sha} DRY ${dry}`:`REBIND-DRY-RUN ${A} ${B} SHA ${sha}`});
+ const rebindOp=(mode:"rebind-dry-run"|"rebind",contract:PrivateIngestGenerationContract=atA)=>runRebindOperator(client as never,overlapOperatorInputs(rebindEnv(mode),contract));
+ const admissions=async()=>(await db.query<{schema_generation:string;n:number}>("SELECT schema_generation,count(*)::int AS n FROM sessions.ingest_buffer_admission GROUP BY 1 ORDER BY 1")).rows;
+ const policyGeneration=async()=>(await db.query<{generation:string}>("SELECT generation FROM sessions.ingest_lazy_policy WHERE singleton")).rows[0]?.generation;
+ return{db,client,marker,expiredWindow,liveWindow,op,rebindEnv,rebindOp,admissions,policyGeneration};
 }
 const code=async(p:Promise<unknown>)=>{try{await p;return null}catch(e){return (e as {code?:string}).code??String((e as Error).message)}};
 
@@ -109,4 +117,69 @@ test("rebind closes the operator's window; afterwards the contract at H reads ba
  expect(await f.op("readback",atB)).toMatchObject({status:"OVERLAP_WINDOW_READBACK_PASS",window:"none",policyGeneration:B});
  expect(await f.op("close",atB)).toMatchObject({status:"OVERLAP_WINDOW_NONE_OPEN"});
  expect(await code(f.op("open",atB))).toBe("overlap_operator_stale");
+});
+
+test("rebind modes: exact confirmations, refusals for dormant, stale, unknown mode and missing/invalid DRY",async()=>{
+ const f=await fixture();
+ expect(overlapOperatorConfirmation("rebind-dry-run",A,B,sha)).toBe(`REBIND-DRY-RUN ${A} ${B} SHA ${sha}`);
+ expect(overlapOperatorConfirmation("rebind",A,B,sha,"","95")).toBe(`REBIND ${A} ${B} SHA ${sha} DRY 95`);
+ expect(overlapOperatorInputs(f.rebindEnv("rebind-dry-run"),atA)).toMatchObject({mode:"rebind-dry-run",from:A,to:B,ttlSeconds:null,dryRunId:null});
+ expect(overlapOperatorInputs(f.rebindEnv("rebind"),atA)).toMatchObject({mode:"rebind",from:A,to:B,dryRunId:"95"});
+ const refusal=(env:Record<string,string>,contract:PrivateIngestGenerationContract=atA)=>{try{overlapOperatorInputs(env,contract);return null}catch(e){return (e as {code?:string}).code}};
+ for(const mode of ["rebind-dry-run","rebind"] as const){
+  expect(refusal(f.rebindEnv(mode),{generation:A,overlap:null})).toBe("overlap_operator_dormant");
+  // Stale: the contract already moved to H (the rebind is offered only while it is still bound to G).
+  expect(refusal(f.rebindEnv(mode),atB)).toBe("overlap_operator_stale");
+  expect(refusal({...f.rebindEnv(mode),OVERLAP_TTL_SECONDS:"600"})).toBe("overlap_operator_ttl");
+ }
+ expect(refusal({...f.rebindEnv("rebind"),OVERLAP_DRY_RUN_ID:""})).toBe("overlap_operator_dry_run_id");
+ for(const bad of ["0","01","-1","1.5","abc"," 95","9".repeat(21)])
+  expect(refusal(f.rebindEnv("rebind",bad))).toBe("overlap_operator_dry_run_id");
+ expect(refusal({...f.rebindEnv("rebind-dry-run"),OVERLAP_DRY_RUN_ID:"95"})).toBe("overlap_operator_dry_run_id");
+ expect(refusal({...f.rebindEnv("rebind"),OVERLAP_CONFIRMATION:`REBIND ${A} ${B} SHA ${sha} DRY 96`})).toBe("overlap_operator_confirmation");
+ expect(refusal({...f.rebindEnv("rebind"),OVERLAP_CONFIRMATION:`REBIND ${A} ${B} SHA ${sha}`})).toBe("overlap_operator_confirmation");
+ expect(refusal({...f.rebindEnv("rebind-dry-run"),OVERLAP_CONFIRMATION:`REBIND-DRY-RUN ${A} ${C} SHA ${sha}`})).toBe("overlap_operator_confirmation");
+ expect(refusal({...f.rebindEnv("rebind-dry-run"),OVERLAP_MODE:"rebind-now"})).toBe("overlap_operator_inputs");
+ // Each runner refuses the other's modes.
+ expect(await code(runOverlapOperator(f.client as never,overlapOperatorInputs(f.rebindEnv("rebind"),atA)))).toBe("overlap_operator_inputs");
+ const openInput=overlapOperatorInputs({OVERLAP_MODE:"open",OVERLAP_SHA:sha,OVERLAP_TTL_SECONDS:"600",OVERLAP_CONFIRMATION:`OPEN-OVERLAP ${A} ${B} TTL 600 SHA ${sha}`},atA);
+ expect(await code(runRebindOperator(f.client as never,openInput))).toBe("overlap_operator_inputs");
+ expect(await code(runRebindOperator(f.client as never,{...overlapOperatorInputs(f.rebindEnv("rebind"),atA),dryRunId:null}))).toBe("overlap_operator_inputs");
+ expect(await f.policyGeneration()).toBe(A);
+});
+
+test("rebind-dry-run changes nothing; rebind moves the policy and admission rows with no window; refusals while readiness is not PASS at H",async()=>{
+ const f=await fixture();
+ // Readiness still at G: both modes refuse in SQL and nothing moves.
+ expect(await code(f.rebindOp("rebind-dry-run"))).toBe("readiness_not_pass_for_target");
+ expect(await code(f.rebindOp("rebind"))).toBe("readiness_not_pass_for_target");
+ await f.marker(B,"pending");
+ expect(await code(f.rebindOp("rebind"))).toBe("readiness_not_pass_for_target");
+ // The post-apply state: marker PASS at H, policy at G, no window.
+ await f.marker(B,"pass");
+ expect(await generationOverlapStatus(f.client as never)).toBeNull();
+ const before=await f.admissions();
+ const dry=await f.rebindOp("rebind-dry-run");
+ expect(dry).toMatchObject({status:"INGEST_REBIND_DRY_RUN_PASS",mode:"rebind-dry-run",from:A,to:B,dryRunId:null,
+  rebind:{policy:"rebound",dryRun:true,overlapClosed:false},marker:{generation:B,status:"pass"},policyGeneration:A});
+ expect(dry.approvalSha256).toMatch(/^[0-9a-f]{64}$/);
+ expect(await f.policyGeneration()).toBe(A);
+ expect(await f.admissions()).toEqual(before);
+ const done=await f.rebindOp("rebind");
+ expect(done).toMatchObject({status:"INGEST_REBIND_COMMITTED",mode:"rebind",dryRunId:"95",
+  rebind:{policy:"rebound",dryRun:false,overlapClosed:false},marker:{generation:B,status:"pass"},policyGeneration:B});
+ expect(done.rebind.admissionsRebound).toBe(done.rebind.admissionsTotal);
+ expect(await f.policyGeneration()).toBe(B);
+ expect((await f.admissions()).every((r)=>r.schema_generation===B)).toBe(true);
+ // The receipt holds counts and fixed fields only.
+ expect(Object.keys(done.rebind).sort()).toEqual(["admissionsRebound","admissionsTotal","dryRun","from","overlapClosed","policy","to"]);
+ // Rerunning against the still-G contract is idempotent ("already"); readback at the moved contract sees no window.
+ expect(await f.rebindOp("rebind")).toMatchObject({status:"INGEST_REBIND_COMMITTED",rebind:{policy:"already",admissionsRebound:0}});
+ expect(await f.op("readback",atB)).toMatchObject({status:"OVERLAP_WINDOW_READBACK_PASS",window:"none",policyGeneration:B});
+ // A live foreign window blocks the rebind.
+ const g=await fixture();
+ await g.marker(B,"pass");
+ await g.liveWindow(C);
+ expect(await code(g.rebindOp("rebind-dry-run"))).toBe("overlap_window_mismatch");
+ expect(await g.policyGeneration()).toBe(A);
 });

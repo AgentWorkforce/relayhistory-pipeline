@@ -16,6 +16,7 @@ import {deliverBatch} from "../deliver.ts";
 import {prepareDelivery} from "../vendor/delivery/prepare.ts";
 import {rebindIngestGeneration} from "../../hoopdb/ingest-generation-rebind.ts";
 import {openGenerationOverlap,closeGenerationOverlap,generationOverlapStatus} from "../../hoopdb/ingest-generation-overlap.ts";
+import {overlapOperatorInputs,runRebindOperator} from "../../hoopdb/ingest-generation-overlap-operator.ts";
 import {TENANT,batch,record,scratchStore} from "./support.ts";
 import {SESSION_BOOTSTRAP_FILES} from "../../hoopdb/session-bootstrap-chain.ts";
 setDefaultTimeout(60000);
@@ -68,6 +69,48 @@ test("status quo without a window: from the pending write until the rebind every
  expect((await f.refused(f.worker(B,[B,A]))).code).toBe("ledger_sqlstate_55000");
  await rebindIngestGeneration(f.client,{from:A,to:B});
  await f.ok(f.worker(B));
+});
+
+test("post-apply recovery (marker already at H, no window): both single Workers refused; rebind-dry-run changes nothing; rebind moves policy and admissions; then {G,H} admits at H, G refused, H admits",async()=>{
+ const f=await fixture();
+ // Live before the apply: admissions recorded at A.
+ await f.ok(f.worker(A));
+ const state=async()=>({
+  policy:(await f.db.query<{generation:string}>("SELECT generation FROM sessions.ingest_lazy_policy WHERE singleton")).rows[0]!.generation,
+  admissions:(await f.db.query<{g:string;n:number}>("SELECT schema_generation AS g,count(*)::int AS n FROM sessions.ingest_buffer_admission GROUP BY 1 ORDER BY 1")).rows,
+  attemptsAtB:(await f.db.query<{n:number}>("SELECT count(*)::int AS n FROM sessions.ingest_claim_attempts WHERE schema_generation=$1",[B])).rows[0]!.n,
+ });
+ expect((await state()).admissions).toEqual([{g:A,n:1}]);
+ // The incident state: the guarded apply moved readiness to H = B with no window open; policy still at G = A.
+ await f.marker(B,"pass");
+ expect(await generationOverlapStatus(f.client)).toBeNull();
+ expect((await f.refused(f.worker(A))).code).toBe("ledger_sqlstate_55000");
+ expect((await f.refused(f.worker(B))).code).toBe("ledger_sqlstate_55000");
+ expect((await f.refused(f.worker(A,[A,B]))).code).toBe("ledger_sqlstate_55000");
+ const before=await state();
+ expect(before).toEqual({policy:A,admissions:[{g:A,n:1}],attemptsAtB:0});
+ // The CI modes, driven exactly as the workflow does: the reviewed pair at the step-1 contract (still bound to A).
+ const contract={generation:A,overlap:{from:A,to:B}};
+ const sha="1".repeat(40);
+ const dry=await runRebindOperator(f.client,overlapOperatorInputs({OVERLAP_MODE:"rebind-dry-run",OVERLAP_SHA:sha,
+  OVERLAP_CONFIRMATION:`REBIND-DRY-RUN ${A} ${B} SHA ${sha}`},contract));
+ expect(dry).toMatchObject({status:"INGEST_REBIND_DRY_RUN_PASS",policyGeneration:A,
+  rebind:{policy:"rebound",admissionsRebound:1,admissionsTotal:1,dryRun:true,overlapClosed:false}});
+ expect(await state()).toEqual(before);
+ expect((await f.refused(f.worker(A,[A,B]))).code).toBe("ledger_sqlstate_55000");
+ const real=await runRebindOperator(f.client,overlapOperatorInputs({OVERLAP_MODE:"rebind",OVERLAP_SHA:sha,OVERLAP_DRY_RUN_ID:"95",
+  OVERLAP_CONFIRMATION:`REBIND ${A} ${B} SHA ${sha} DRY 95`},contract));
+ expect(real).toMatchObject({status:"INGEST_REBIND_COMMITTED",policyGeneration:B,marker:{generation:B,status:"pass"},
+  rebind:{policy:"rebound",admissionsRebound:1,admissionsTotal:1,dryRun:false,overlapClosed:false}});
+ expect(await state()).toEqual({policy:B,admissions:[{g:B,n:1}],attemptsAtB:0});
+ expect((await f.db.query("SELECT count(*)::int AS n FROM sessions.ingest_generation_overlap_windows")).rows).toEqual([{n:0}]);
+ // The production {G,H} Worker (expected G, accept G,H) now admits, at H.
+ await f.ok(f.worker(A,[A,B]));
+ expect((await state()).attemptsAtB).toBe(1);
+ // A single-G Worker stays refused; a single-H Worker admits (the follow-up G+H -> H deploy).
+ expect((await f.refused(f.worker(A))).code).toBe("ledger_sqlstate_55000");
+ await f.ok(f.worker(B));
+ expect((await state()).attemptsAtB).toBe(2);
 });
 
 test("zero-503 window: a Worker at A keeps admitting while the DB moves to B; {B,A} admits throughout; after the rebind B admits and A is refused",async()=>{

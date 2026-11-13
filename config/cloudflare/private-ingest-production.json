@@ -11,6 +11,7 @@
     "replicaMode": "off",
     "claimLockBusy": "on",
     "custodySource": "frozen-supabase",
-    "asyncAdmission": "drain"
+    "asyncAdmission": "drain",
+    "overlapGeneration": "52a3f2f05d3dfa2342d3828c6b14eeeb61f1e47e5b97cddffb91dd0cfee04c0f"
   }
 }

@@ -2,6 +2,9 @@
  * Read-only GitHub gate for .github/workflows/ingest-generation-overlap.yml. Mirrors the private-ingest
  * and schema release gates: exact main head, first attempt, Khaliq's exact dispatch identity, the
  * protected session-schema-production environment (main only), and green push CI at the SHA.
+ * `rebind` additionally binds its DRY <dry_run_id> to a successful, first-attempt, same-SHA
+ * rebind-dry-run run of this workflow by the same pinned dispatcher, under 24h old, holding exactly
+ * one unexpired receipt artifact (the plan-run binding of ingest-admission-renewal / private-ingest).
  * Errors carry fixed codes only.
  */
 import { PRIVATE_INGEST_RELEASE } from "../src/session-ingest/private-ingest-release.ts";
@@ -16,12 +19,15 @@ import { githubGet, requireGreenPushRuns } from "./schema-release-github.ts";
 type Obj = Record<string, any>;
 type Get = (path: string) => Promise<any>;
 export const OVERLAP_WORKFLOW = ".github/workflows/ingest-generation-overlap.yml";
+export const OVERLAP_RECEIPT_ARTIFACT = "ingest-generation-overlap";
+export const REBIND_DRY_RUN_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 export async function overlapGithubGate(
   env: Record<string, string | undefined>,
   get: Get,
   approved = false,
   contract?: PrivateIngestGenerationContract,
+  now: number = Date.now(),
 ) {
   const input = overlapOperatorInputs(env, contract);
   if (env.GITHUB_REPOSITORY !== S.repository || env.GITHUB_REPOSITORY_ID !== PRIVATE_INGEST_RELEASE.repositoryId ||
@@ -48,6 +54,22 @@ export async function overlapGithubGate(
       branches.branch_policies[0].name !== "main" || branches.branch_policies[0].type !== "branch")
     refuse("overlap_gate_environment_branch");
   await requireGreenPushRuns(get, base, input.sha, { runs: "overlap_gate_ci", jobs: "overlap_gate_ci_jobs" });
+  if (input.mode === "rebind") {
+    // The run-name is `ingest overlap <mode> <sha>`, so the title proves the bound run was a rebind-dry-run.
+    const dry = await get(base + "/actions/runs/" + input.dryRunId);
+    const created = Date.parse(dry.created_at);
+    if (String(dry.id) !== input.dryRunId || String(dry.id) === env.GITHUB_RUN_ID || dry.path !== OVERLAP_WORKFLOW ||
+        dry.head_sha !== input.sha || dry.head_branch !== "main" || dry.event !== "workflow_dispatch" ||
+        dry.run_attempt !== 1 || dry.status !== "completed" || dry.conclusion !== "success" ||
+        dry.display_title !== `ingest overlap rebind-dry-run ${input.sha}` ||
+        !pinned(dry.actor) || !pinned(dry.triggering_actor) ||
+        !Number.isFinite(created) || created > now || now - created >= REBIND_DRY_RUN_MAX_AGE_MS)
+      refuse("overlap_gate_dry_run");
+    const artifacts = await get(base + "/actions/runs/" + input.dryRunId + "/artifacts?per_page=100");
+    const receipts = (artifacts.artifacts ?? []).filter((a: Obj) => a.name === OVERLAP_RECEIPT_ARTIFACT);
+    if (artifacts.total_count !== artifacts.artifacts?.length || receipts.length !== 1 || receipts[0].expired !== false)
+      refuse("overlap_gate_dry_run_artifact");
+  }
   const reviewerRule = environment.protection_rules.find((r: Obj) => r.type === "required_reviewers");
   if (approved && reviewerRule) {
     // With environment reviewers configured, a recorded human approval for this environment is also required.

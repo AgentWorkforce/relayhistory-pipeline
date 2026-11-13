@@ -1,6 +1,8 @@
 /**
- * Generation overlap on the private-ingest release contract: dormant by default (byte-identical to the
- * no-overlap contract), and with a reviewed pair exactly G -> G+H -> H plus the rollback G+H -> G.
+ * Generation overlap on the private-ingest release contract: a dormant contract is byte-identical to the
+ * no-overlap contract, and with a reviewed pair exactly G -> G+H -> H plus the rollback G+H -> G.
+ * Since the post-apply generation recovery (2026-11-13) the production contract carries the reviewed
+ * pair {7db65adb.., 52a3f2f0..}; the synthetic tests below pass their contract explicitly.
  */
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
@@ -20,15 +22,19 @@ import {
   type PrivateIngestGenerationContract,
 } from "../../../src/session-ingest/private-ingest-release.ts";
 import { privateIngestGithubGate, trackedOverlapGeneration } from "../../../scripts/private-ingest-release-github.ts";
-import { overlapGithubGate, OVERLAP_WORKFLOW } from "../../../scripts/ingest-generation-overlap-github.ts";
+import { overlapGithubGate, OVERLAP_RECEIPT_ARTIFACT, OVERLAP_WORKFLOW, REBIND_DRY_RUN_MAX_AGE_MS } from "../../../scripts/ingest-generation-overlap-github.ts";
 import { acceptGenerationsDeletionAllowed } from "../../../scripts/private-ingest-operator.ts";
 import { SCHEMA_RELEASE } from "../../../src/hoopdb/schema-release-contract.ts";
 import type { CloudflareStageInputs } from "../alchemy.cloudflare.run.ts";
 
 const kmsKeyArn = "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-0000-000000000000";
 const sha = "a".repeat(40), planRun = "90";
-const tracked = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
+const trackedFile = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
+// The tracked step-1 base without the recovery overlap: the synthetic pair tests build on it.
+const { overlapGeneration: REAL_H, ...trackedBase } = trackedFile.sessionIngest;
+const tracked = { ...trackedFile, sessionIngest: trackedBase };
 const G: string = tracked.sessionIngest.expectedGeneration;
+const DORMANT: PrivateIngestGenerationContract = { generation: G, overlap: null };
 const H = G === "e".repeat(64) ? "d".repeat(64) : "e".repeat(64);
 const X = G === "c".repeat(64) ? "b".repeat(64) : "c".repeat(64);
 const atG: PrivateIngestGenerationContract = { generation: G, overlap: { from: G, to: H } };
@@ -40,12 +46,13 @@ const code = (fn: () => unknown) => {
 const withTarget = (sessionIngest: Record<string, unknown>): CloudflareStageInputs =>
   ({ ...tracked, sessionIngest: { ...sessionIngest, kmsKeyArn } }) as CloudflareStageInputs;
 
-test("dormant by default: the tracked production profile plans, confirms and reads back byte-identically", () => {
-  expect(PRIVATE_INGEST_OVERLAP).toBeNull();
-  expect(PRIVATE_INGEST_GENERATION_CONTRACT).toEqual({ generation: G, overlap: null });
-  // Digests captured at the base commit (7c3a8295) before this change, with the test KMS target.
-  expect(sha256(readFileSync("config/cloudflare/private-ingest-production.json", "utf8")))
-    .toBe("3c8a5c3b5ef52c4b1ee0246fd931ee4286592ddefa99d3ec96bae25b1350509c");
+test("dormant contract: the tracked step-1 base profile plans, confirms and reads back byte-identically", () => {
+  // Digests captured at the base commit (7c3a8295) before the overlap existed, with the test KMS target;
+  // the tracked file minus the recovery overlapGeneration is still that exact profile.
+  const file = readFileSync("config/cloudflare/private-ingest-production.json", "utf8");
+  const baseFile = file.replace(/,\n {4}"overlapGeneration": "[0-9a-f]{64}"(?=\n {2}\})/u, "");
+  expect(baseFile).not.toBe(file);
+  expect(sha256(baseFile)).toBe("3c8a5c3b5ef52c4b1ee0246fd931ee4286592ddefa99d3ec96bae25b1350509c");
   const input = withTarget(tracked.sessionIngest);
   expect(inputsDigest(JSON.stringify(input, null, 2) + "\n"))
     .toBe("3e6ba55f3110efa6729f4780ac689c9204aea8716e428640758c0fe1126d1fe4");
@@ -54,24 +61,71 @@ test("dormant by default: the tracked production profile plans, confirms and rea
   expect(sha256(JSON.stringify(input.sessionIngest)))
     .toBe("41eaf5aac40a7b63f13deea9e5976cd233faba18d96886b25506ab067200e7c3");
   expect(sessionIngestVars(input.sessionIngest).INGEST_ACCEPT_GENERATIONS).toBeUndefined();
-  expect(privateIngestReleasePhase(input)).toBe("step-1-custody");
-  expect(trackedOverlapGeneration()).toBeUndefined();
+  expect(privateIngestReleasePhase(input, DORMANT)).toBe("step-1-custody");
   expect(privateIngestReleaseInputs({
     PRIVATE_INGEST_RELEASE_MODE: "deploy",
     PRIVATE_INGEST_RELEASE_SHA: sha,
     PRIVATE_INGEST_RELEASE_PLAN_RUN: planRun,
     PRIVATE_INGEST_RELEASE_CONFIRMATION: `DEPLOY ${P.worker} ${sha} PLAN ${planRun}`,
-  }, trackedOverlapGeneration()).mode).toBe("deploy");
+  }, undefined).mode).toBe("deploy");
   // A dormant contract refuses any tracked overlap and cannot build an overlap phase.
-  expect(code(() => privateIngestReleasePhase(withTarget({ ...tracked.sessionIngest, overlapGeneration: H }))))
+  expect(code(() => privateIngestReleasePhase(withTarget({ ...tracked.sessionIngest, overlapGeneration: H }), DORMANT)))
     .toBe("private_ingest_profile_overlap_unreviewed");
-  expect(code(() => privateIngestProfileForPhase("step-1-custody-overlap", kmsKeyArn)))
+  expect(code(() => privateIngestProfileForPhase("step-1-custody-overlap", kmsKeyArn, DORMANT)))
     .toBe("private_ingest_profile_overlap_unreviewed");
-  expect(code(() => privateIngestProfileForPhase("step-0-shadow-overlap", kmsKeyArn)))
+  expect(code(() => privateIngestProfileForPhase("step-0-shadow-overlap", kmsKeyArn, DORMANT)))
     .toBe("private_ingest_profile_overlap_unreviewed");
   expect(code(() => privateIngestReleasePhase(withTarget({
     ...tracked.sessionIngest, custodySource: "shadow", overlapGeneration: H,
-  })))).toBe("private_ingest_profile_overlap_unreviewed");
+  }), DORMANT))).toBe("private_ingest_profile_overlap_unreviewed");
+});
+
+test("post-apply recovery: the real tracked profile and constants are G+H at step-1-custody, and G -> G+H is the allowed move", () => {
+  // The reviewed pair is the incident's: G = the generation the policy/Worker are bound to, H = the
+  // RELEASE_TARGET_GENERATION the guarded apply (run 43471961540, target eac3e98b) bound the marker to.
+  const realG = "7db65adb97f034a7b4cc2c85c87da2ebadf969f6bb74096f33ae00ad83e500a4";
+  const realH = "52a3f2f05d3dfa2342d3828c6b14eeeb61f1e47e5b97cddffb91dd0cfee04c0f";
+  expect(G).toBe(realG);
+  expect(REAL_H).toBe(realH);
+  expect(PRIVATE_INGEST_OVERLAP).toEqual({ from: realG, to: realH });
+  expect(PRIVATE_INGEST_GENERATION_CONTRACT).toEqual({ generation: realG, overlap: { from: realG, to: realH } });
+  expect(trackedOverlapGeneration()).toBe(realH);
+  // The real tracked file (default production contract) parses as the step-1 overlap phase.
+  const target = { ...trackedFile, sessionIngest: { ...trackedFile.sessionIngest, kmsKeyArn } } as CloudflareStageInputs;
+  expect(privateIngestReleasePhase(target)).toBe("step-1-custody-overlap");
+  expect(target).toEqual(privateIngestProfileForPhase("step-1-custody-overlap", kmsKeyArn));
+  const vars = sessionIngestVars(target.sessionIngest);
+  expect(vars.INGEST_EXPECT_GENERATION).toBe(realG);
+  expect(vars.INGEST_ACCEPT_GENERATIONS).toBe(`${realG},${realH}`);
+  // Live production today: step-1-custody at the single generation G (deployed before the pair existed).
+  const liveG = liveFixture(privateIngestProfileForPhase("step-1-custody", kmsKeyArn, DORMANT));
+  expect(privateIngestTransitionReadback(target, liveG.active, liveG.version)).toMatchObject({
+    status: "PRIVATE_INGEST_LIVE_TRANSITION_PASS", from: "step-1-custody", to: "step-1-custody-overlap",
+    generationFrom: "G", generationTo: "G+H",
+  });
+  // The same live version built under the real contract is byte-identical (the base phase ignores the pair).
+  expect(liveFixture(privateIngestProfileForPhase("step-1-custody", kmsKeyArn))).toEqual(liveG);
+  // After the deploy, the version readback of the {G, H} Worker passes under the production contract.
+  const liveGH = liveFixture(target);
+  expect(privateIngestVersionReadback(target, liveGH.active, liveGH.version)).toMatchObject({ phase: "step-1-custody-overlap" });
+  // Never a direct G -> H, and no phase move rides along with the generation move.
+  const single = (gen: string) => liveFixture(privateIngestProfileForPhase("step-1-custody", kmsKeyArn, { generation: gen, overlap: { from: realG, to: realH } }));
+  expect(code(() => privateIngestTransitionReadback(target, single(realH).active, single(realH).version)))
+    .toBe("private_ingest_live_transition");
+  const liveShadow = liveFixture(privateIngestProfileForPhase("step-0-shadow", kmsKeyArn, DORMANT));
+  expect(code(() => privateIngestTransitionReadback(target, liveShadow.active, liveShadow.version)))
+    .toBe("private_ingest_live_transition");
+  // The typed deploy confirmation must name the real H.
+  const deploy = {
+    PRIVATE_INGEST_RELEASE_MODE: "deploy",
+    PRIVATE_INGEST_RELEASE_SHA: sha,
+    PRIVATE_INGEST_RELEASE_PLAN_RUN: planRun,
+    PRIVATE_INGEST_RELEASE_CONFIRMATION: `DEPLOY ${P.worker} ${sha} PLAN ${planRun} OVERLAP ${realH}`,
+  };
+  expect(privateIngestReleaseInputs(deploy, trackedOverlapGeneration()).mode).toBe("deploy");
+  expect(code(() => privateIngestReleaseInputs({ ...deploy,
+    PRIVATE_INGEST_RELEASE_CONFIRMATION: `DEPLOY ${P.worker} ${sha} PLAN ${planRun}` }, trackedOverlapGeneration())))
+    .toBe("private_ingest_release_confirmation");
 });
 
 test("overlapGeneration: malformed, equal, non-buffered, unreviewed, stale and unexpected values are refused distinctly", () => {
@@ -160,13 +214,13 @@ const liveOverlap = (base = "step-1-custody" as const) =>
 test("live readback admits INGEST_ACCEPT_GENERATIONS only when declared; refuses undeclared, mismatched and unknown bindings", () => {
   const overlapInput = privateIngestProfileForPhase("step-1-custody-overlap", kmsKeyArn, atG);
   const live = liveOverlap();
-  // The version readback uses the production contract, which is dormant here: an overlap profile refuses.
-  expect(() => privateIngestVersionReadback(overlapInput, live.active, live.version)).toThrow("private_ingest_profile_overlap_unreviewed");
+  // The version readback uses the production contract, whose reviewed pair names another H: refused.
+  expect(() => privateIngestVersionReadback(overlapInput, live.active, live.version)).toThrow("private_ingest_profile_overlap_unexpected");
   // Causal revert: the profile (and contract) dropped the overlap while the live Worker still accepts {G, H}.
-  const single = privateIngestProfileForPhase("step-1-custody", kmsKeyArn);
+  const single = privateIngestProfileForPhase("step-1-custody", kmsKeyArn, DORMANT);
   expect(code(() => privateIngestVersionReadback(single, live.active, live.version))).toBe("private_ingest_live_undeclared_overlap");
   // The same under the transition gate, with a dormant contract: its own code, never an ambiguous miss.
-  expect(code(() => privateIngestTransitionReadback(single, live.active, live.version)))
+  expect(code(() => privateIngestTransitionReadback(single, live.active, live.version, DORMANT)))
     .toBe("private_ingest_live_undeclared_overlap");
   // Declared overlap but the live accept set names another generation, or is missing.
   const wrong = structuredClone(live.version);
@@ -203,8 +257,8 @@ test("G -> G+H -> H and the rollback G+H -> G are the only generation moves, wit
   // The existing phase table still applies within one generation state.
   expect(pass(to("step-2-frozen-receipt", atH), h, atH)).toMatchObject({ from: "step-1-custody", to: "step-2-frozen-receipt" });
   // A dormant receipt keeps its exact shape.
-  const dormant = liveFixture(privateIngestProfileForPhase("step-1-custody", kmsKeyArn));
-  expect(Object.keys(privateIngestTransitionReadback(privateIngestProfileForPhase("step-1-custody", kmsKeyArn), dormant.active, dormant.version)))
+  const dormant = liveFixture(privateIngestProfileForPhase("step-1-custody", kmsKeyArn, DORMANT));
+  expect(Object.keys(privateIngestTransitionReadback(privateIngestProfileForPhase("step-1-custody", kmsKeyArn, DORMANT), dormant.active, dormant.version, DORMANT)))
     .toEqual(["status", "from", "to", "deploymentId", "versionId"]);
 });
 
@@ -241,8 +295,12 @@ function githubFixture(path: string, environment: string) {
     approvals: [] as any[],
     plan: { ...run, id: Number(planRun), path: P.workflow, status: "completed", conclusion: "success" },
     artifacts: { total_count: 1, artifacts: [{ name: "private-ingest-plan", expired: false }] },
+    dryRun: { ...run, id: Number(dryRunId), status: "completed", conclusion: "success",
+      display_title: `ingest overlap rebind-dry-run ${sha}`, created_at: new Date(Date.now() - 60_000).toISOString() } as Record<string, any>,
+    dryRunArtifacts: { total_count: 1, artifacts: [{ name: OVERLAP_RECEIPT_ARTIFACT, expired: false }] } as Record<string, any>,
   };
 }
+const dryRunId = "95";
 
 function githubGet(f: ReturnType<typeof githubFixture>) {
   return async (path: string): Promise<any> => {
@@ -251,6 +309,8 @@ function githubGet(f: ReturnType<typeof githubFixture>) {
     if (path.endsWith("/actions/runs/100/approvals")) return f.approvals;
     if (path.endsWith(`/actions/runs/${planRun}`)) return f.plan;
     if (path.endsWith(`/actions/runs/${planRun}/artifacts?per_page=100`)) return f.artifacts;
+    if (path.endsWith(`/actions/runs/${dryRunId}`)) return f.dryRun;
+    if (path.endsWith(`/actions/runs/${dryRunId}/artifacts?per_page=100`)) return f.dryRunArtifacts;
     if (path.endsWith("/environments/" + f.environment.name)) return f.environment;
     if (path.includes("deployment-branch-policies")) return f.branches;
     if (path.includes("/actions/workflows/")) return f.runs;
@@ -288,7 +348,7 @@ test("overlap window GitHub gate: dormant refuses, exact pair/confirmation/TTL, 
   });
   const openEnv = env("open", "3600", `OPEN-OVERLAP ${G} ${H} TTL 3600 SHA ${sha}`);
   const fresh = () => githubFixture(OVERLAP_WORKFLOW, SCHEMA_RELEASE.environment);
-  await expect(overlapGithubGate(openEnv, githubGet(fresh()), true)).rejects.toThrow("overlap_operator_dormant");
+  await expect(overlapGithubGate(openEnv, githubGet(fresh()), true, DORMANT)).rejects.toThrow("overlap_operator_dormant");
   expect(await overlapGithubGate(openEnv, githubGet(fresh()), true, atG)).toMatchObject({ mode: "open", from: G, to: H, ttlSeconds: 3600 });
   expect(await overlapGithubGate(env("readback"), githubGet(fresh()), true, atH)).toMatchObject({ mode: "readback", approvalSha256: null });
   expect(await overlapGithubGate(env("close", "", `CLOSE-OVERLAP ${G} ${H} SHA ${sha}`), githubGet(fresh()), true, atH))
@@ -322,13 +382,92 @@ test("overlap window GitHub gate: dormant refuses, exact pair/confirmation/TTL, 
   await expect(overlapGithubGate(openEnv, githubGet(fresh()), true, atH)).rejects.toThrow("overlap_operator_stale");
 });
 
+test("rebind GitHub gate: exact confirmations, step-1 contract only, and DRY bound to a successful same-SHA rebind-dry-run", async () => {
+  const env = (mode: string, confirmation: string, dry = "") => ({
+    ...context, OVERLAP_MODE: mode, OVERLAP_SHA: sha, OVERLAP_TTL_SECONDS: "", OVERLAP_CONFIRMATION: confirmation,
+    OVERLAP_DRY_RUN_ID: dry,
+  });
+  const dryEnv = env("rebind-dry-run", `REBIND-DRY-RUN ${G} ${H} SHA ${sha}`);
+  const rebindEnv = env("rebind", `REBIND ${G} ${H} SHA ${sha} DRY ${dryRunId}`, dryRunId);
+  const fresh = () => githubFixture(OVERLAP_WORKFLOW, SCHEMA_RELEASE.environment);
+  expect(await overlapGithubGate(dryEnv, githubGet(fresh()), true, atG))
+    .toMatchObject({ mode: "rebind-dry-run", from: G, to: H, ttlSeconds: null, dryRunId: null });
+  const ok = await overlapGithubGate(rebindEnv, githubGet(fresh()), true, atG);
+  expect(ok).toMatchObject({ mode: "rebind", from: G, to: H, dryRunId });
+  expect(ok.approvalSha256).toBe(sha256(`REBIND ${G} ${H} SHA ${sha} DRY ${dryRunId}`));
+  // Dormant and stale contracts refuse before any GitHub read.
+  const never = async (path: string) => { throw new Error("unexpected " + path); };
+  for (const input of [dryEnv, rebindEnv]) {
+    await expect(overlapGithubGate(input, never, true, DORMANT)).rejects.toThrow("overlap_operator_dormant");
+    await expect(overlapGithubGate(input, never, true, atH)).rejects.toThrow("overlap_operator_stale");
+  }
+  const now = Date.now();
+  const failures: Array<[Record<string, string>, (f: ReturnType<typeof githubFixture>) => void, string]> = [
+    // Inputs: the pair, sha and DRY id are all inside the typed confirmation; DRY only for rebind.
+    [env("rebind", `REBIND ${G} ${H} SHA ${sha} DRY ${dryRunId}`), () => {}, "overlap_operator_dry_run_id"],
+    [env("rebind", `REBIND ${G} ${H} SHA ${sha} DRY 0`, "0"), () => {}, "overlap_operator_dry_run_id"],
+    [env("rebind", `REBIND ${G} ${H} SHA ${sha} DRY x1`, "x1"), () => {}, "overlap_operator_dry_run_id"],
+    [env("rebind", `REBIND ${G} ${H} SHA ${sha} DRY ${"9".repeat(21)}`, "9".repeat(21)), () => {}, "overlap_operator_dry_run_id"],
+    [env("rebind-dry-run", `REBIND-DRY-RUN ${G} ${H} SHA ${sha}`, dryRunId), () => {}, "overlap_operator_dry_run_id"],
+    [{ ...env("open", `OPEN-OVERLAP ${G} ${H} TTL 3600 SHA ${sha}`, dryRunId), OVERLAP_TTL_SECONDS: "3600" }, () => {}, "overlap_operator_dry_run_id"],
+    [env("rebind", `REBIND ${G} ${H} SHA ${sha} DRY 96`, dryRunId), () => {}, "overlap_operator_confirmation"],
+    [env("rebind", `REBIND ${G} ${X} SHA ${sha} DRY ${dryRunId}`, dryRunId), () => {}, "overlap_operator_confirmation"],
+    [env("rebind", `REBIND ${H} ${G} SHA ${sha} DRY ${dryRunId}`, dryRunId), () => {}, "overlap_operator_confirmation"],
+    [env("rebind", `REBIND-DRY-RUN ${G} ${H} SHA ${sha}`, dryRunId), () => {}, "overlap_operator_confirmation"],
+    [env("rebind-dry-run", `REBIND ${G} ${H} SHA ${sha} DRY ${dryRunId}`), () => {}, "overlap_operator_confirmation"],
+    [env("rebind-dry-run", ""), () => {}, "overlap_operator_confirmation"],
+    [{ ...dryEnv, OVERLAP_TTL_SECONDS: "3600" }, () => {}, "overlap_operator_ttl"],
+    // The existing gates still apply to both modes.
+    [dryEnv, (f) => { f.ref.object.sha = "b".repeat(40); }, "overlap_gate_main_moved"],
+    [rebindEnv, (f) => { f.run.actor.id = 42; }, "overlap_gate_run"],
+    [rebindEnv, (f) => { f.run.run_attempt = 2; }, "overlap_gate_run"],
+    [rebindEnv, (f) => { f.runs.workflow_runs[0]!.conclusion = "failure"; }, "overlap_gate_ci"],
+    [{ ...rebindEnv, GITHUB_RUN_ATTEMPT: "2" }, () => {}, "overlap_gate_context"],
+    // DRY must be a successful, first-attempt, same-SHA rebind-dry-run of this workflow by the dispatcher.
+    [rebindEnv, (f) => { f.dryRun.conclusion = "failure"; }, "overlap_gate_dry_run"],
+    [rebindEnv, (f) => { f.dryRun.status = "in_progress"; }, "overlap_gate_dry_run"],
+    [rebindEnv, (f) => { f.dryRun.head_sha = "b".repeat(40); }, "overlap_gate_dry_run"],
+    [rebindEnv, (f) => { f.dryRun.head_branch = "dev"; }, "overlap_gate_dry_run"],
+    [rebindEnv, (f) => { f.dryRun.path = P.workflow; }, "overlap_gate_dry_run"],
+    [rebindEnv, (f) => { f.dryRun.event = "push"; }, "overlap_gate_dry_run"],
+    [rebindEnv, (f) => { f.dryRun.run_attempt = 2; }, "overlap_gate_dry_run"],
+    [rebindEnv, (f) => { f.dryRun.id = 96; }, "overlap_gate_dry_run"],
+    [rebindEnv, (f) => { f.dryRun.display_title = `ingest overlap readback ${sha}`; }, "overlap_gate_dry_run"],
+    [rebindEnv, (f) => { f.dryRun.display_title = `ingest overlap rebind ${sha}`; }, "overlap_gate_dry_run"],
+    [rebindEnv, (f) => { f.dryRun.display_title = undefined; }, "overlap_gate_dry_run"],
+    [rebindEnv, (f) => { f.dryRun.actor = { ...f.dryRun.actor, id: 42 }; }, "overlap_gate_dry_run"],
+    [rebindEnv, (f) => { f.dryRun.triggering_actor = { ...f.dryRun.triggering_actor, login: "someone" }; }, "overlap_gate_dry_run"],
+    [rebindEnv, (f) => { f.dryRun.created_at = new Date(now - REBIND_DRY_RUN_MAX_AGE_MS - 60_000).toISOString(); }, "overlap_gate_dry_run"],
+    [rebindEnv, (f) => { f.dryRun.created_at = new Date(now + 3_600_000).toISOString(); }, "overlap_gate_dry_run"],
+    [rebindEnv, (f) => { f.dryRun.created_at = "never"; }, "overlap_gate_dry_run"],
+    // The current run can never be its own dry run.
+    [{ ...rebindEnv, GITHUB_RUN_ID: dryRunId }, (f) => { f.run.id = Number(dryRunId); }, "overlap_gate_dry_run"],
+    // Exactly one unexpired receipt artifact on a complete listing.
+    [rebindEnv, (f) => { f.dryRunArtifacts.artifacts = []; f.dryRunArtifacts.total_count = 0; }, "overlap_gate_dry_run_artifact"],
+    [rebindEnv, (f) => { f.dryRunArtifacts.artifacts[0].expired = true; }, "overlap_gate_dry_run_artifact"],
+    [rebindEnv, (f) => { f.dryRunArtifacts.total_count = 2; }, "overlap_gate_dry_run_artifact"],
+    [rebindEnv, (f) => { f.dryRunArtifacts.artifacts[0].name = "private-ingest-plan"; }, "overlap_gate_dry_run_artifact"],
+    [rebindEnv, (f) => { f.dryRunArtifacts.artifacts.push({ name: OVERLAP_RECEIPT_ARTIFACT, expired: false }); f.dryRunArtifacts.total_count = 2; }, "overlap_gate_dry_run_artifact"],
+  ];
+  for (const [input, mutate, expected] of failures) {
+    const f = fresh();
+    mutate(f);
+    await expect(overlapGithubGate(input, githubGet(f), true, atG, now)).rejects.toThrow(expected);
+  }
+  // rebind-dry-run itself never reads another run.
+  const f = fresh();
+  const seen: string[] = [];
+  await overlapGithubGate(dryEnv, (path) => { seen.push(path); return githubGet(f)(path); }, true, atG);
+  expect(seen.some((path) => path.includes(`/runs/${dryRunId}`))).toBe(false);
+});
+
 test("overlap workflow is dispatch-only, gates outside the environment and scopes the existing owner secret to one step", () => {
   const workflow = readFileSync(OVERLAP_WORKFLOW, "utf8");
   const triggers = workflow.slice(workflow.indexOf("\non:"), workflow.indexOf("\npermissions:"));
   expect(triggers).toContain("workflow_dispatch:");
   for (const other of ["push:", "schedule:", "pull_request", "workflow_run", "repository_dispatch"])
     expect(triggers).not.toContain(other);
-  expect(workflow).toContain("options: [readback, open, close]");
+  expect(workflow).toContain("options: [readback, open, close, rebind-dry-run, rebind]");
   expect(workflow.match(/secrets\.[A-Z_]+/gu)).toEqual(["secrets.SUPABASE_MIGRATION_OWNER_URL"]);
   const gate = workflow.slice(workflow.indexOf("  prerequisite-gate:"), workflow.indexOf("  database:"));
   expect(gate).not.toContain("environment:\n");
@@ -352,7 +491,7 @@ test("the retained plan unbinds INGEST_ACCEPT_GENERATIONS only for G+H -> H, or 
   expect(acceptGenerationsDeletionAllowed(profile(H), live(`${H},${G}`), proposed(H), atH)).toBe(false);
   // Rollback G+H -> G: only under a reviewed pair still bound at G, with the exact live accept set.
   expect(acceptGenerationsDeletionAllowed(profile(G), live(`${G},${H}`), proposed(G), atG)).toBe(true);
-  expect(acceptGenerationsDeletionAllowed(profile(G), live(`${G},${H}`), proposed(G))).toBe(false);
+  expect(acceptGenerationsDeletionAllowed(profile(G), live(`${G},${H}`), proposed(G), DORMANT)).toBe(false);
   expect(acceptGenerationsDeletionAllowed(profile(G), live(`${G},${H}`), proposed(G), atH)).toBe(false);
   expect(acceptGenerationsDeletionAllowed(profile(G), live(`${G},${X}`), proposed(G), atG)).toBe(false);
   expect(acceptGenerationsDeletionAllowed(profile(G), live(`${H},${G}`), proposed(G), atG)).toBe(false);
@@ -449,11 +588,11 @@ test("with an overlap present, no transition skips step-0-shadow between baselin
   expect(move(at("baseline-drain", atH), liveAt("baseline-drain-overlap", atG), atH))
     .toMatchObject({ from: "baseline-drain-overlap", to: "baseline-drain", generationTo: "H" });
   // Dormant contract keeps #558's single-generation graph byte-for-byte.
-  const dormant = (phase: Phase) => privateIngestProfileForPhase(phase, kmsKeyArn);
+  const dormant = (phase: Phase) => privateIngestProfileForPhase(phase, kmsKeyArn, DORMANT);
   const liveDormant = (phase: Phase) => liveFixture(dormant(phase));
-  expect(code(() => privateIngestTransitionReadback(dormant("step-1-custody"), liveDormant("baseline-drain").active, liveDormant("baseline-drain").version)))
+  expect(code(() => privateIngestTransitionReadback(dormant("step-1-custody"), liveDormant("baseline-drain").active, liveDormant("baseline-drain").version, DORMANT)))
     .toBe("private_ingest_live_transition");
-  expect(Object.keys(privateIngestTransitionReadback(dormant("step-1-custody"), liveDormant("step-0-shadow").active, liveDormant("step-0-shadow").version)))
+  expect(Object.keys(privateIngestTransitionReadback(dormant("step-1-custody"), liveDormant("step-0-shadow").active, liveDormant("step-0-shadow").version, DORMANT)))
     .toEqual(["status", "from", "to", "deploymentId", "versionId"]);
 });
 

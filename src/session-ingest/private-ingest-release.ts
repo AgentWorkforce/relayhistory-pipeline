@@ -129,8 +129,20 @@ const COMMON_PROFILE = {
  * Lifecycle: (1) set {from: G, to: H} while COMMON_PROFILE.expectedGeneration is G; (2) after PASS
  * at H and the rebind, move expectedGeneration to H and keep the pair for the G+H -> H deploy; (3) set
  * this back to null once the live Worker reads back exactly {H}.
+ *
+ * Post-apply recovery (2026-11-13, docs/design/zero-503-schema-windows.md section 3.2): readiness is
+ * already PASS at H = 52a3f2f0... (guarded apply run 43471961540 at 1b2f5bca, release target
+ * upstream:20261105047000 at eac3e98b) while the Worker, the lazy policy and the admission rows are
+ * still at G = 7db65adb... and no window was opened, so buffered uploads fail closed. Step (1) of the
+ * lifecycle with expectedGeneration still G: deploy G+H at the unchanged rollout phase, then the
+ * guarded CI rebind (ingest-generation-overlap.yml rebind-dry-run, rebind) moves the policy and rows
+ * to H with no window open; the G+H Worker's retry at H is admitted from that commit on. Then
+ * steps (2) and (3) as above, each its own reviewed commit.
  */
-export const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = null;
+export const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = {
+  from: "7db65adb97f034a7b4cc2c85c87da2ebadf969f6bb74096f33ae00ad83e500a4",
+  to: "52a3f2f05d3dfa2342d3828c6b14eeeb61f1e47e5b97cddffb91dd0cfee04c0f",
+};
 
 export const PRIVATE_INGEST_GENERATION_CONTRACT: PrivateIngestGenerationContract = {
   generation: COMMON_PROFILE.expectedGeneration,
