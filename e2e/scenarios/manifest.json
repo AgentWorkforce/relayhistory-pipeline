@@ -1,0 +1,158 @@
+{
+  "schemaVersion": 1,
+  "description": "Real-agent coordination scenarios. Null session IDs and times mean the run has not happened; never score a pending pair as a detector miss.",
+  "projects": {
+    "a": "example/overlap-sandbox",
+    "b": "example/overlap-sandbox-b"
+  },
+  "scenarios": [
+    {
+      "id": "a",
+      "title": "Exact duplicate feature and migration number",
+      "status": "complete",
+      "sessions": [
+        { "role": "first", "harness": "claude", "session_id": "74059fb8-2ded-4a45-8c3f-cda4be81fc24", "started_at": "2026-11-13T08:25:45.377Z", "ended_at": "2026-11-13T08:26:03.227Z", "expected_project": "a", "branch": "feat/audit-log-a1", "commit": "e5a0b6c" },
+        { "role": "second", "harness": "claude", "session_id": "9c7e15dc-61af-4e25-b97b-a32758220a52", "started_at": "2026-11-13T08:25:52.611Z", "ended_at": "2026-11-13T08:26:20.771Z", "expected_project": "a", "branch": "feat/audit-log-a2", "commit": "48387fc" },
+        { "role": "codex", "harness": "codex", "session_id": "01a1d405-3444-7850-aab9-59bbc83869d0", "started_at": "2026-11-13T08:27:54.308Z", "ended_at": "2026-11-13T08:30:34.087Z", "expected_project": "a", "branch": "feat/audit-trail-codex", "commit": "c90a135" }
+      ],
+      "pairs": [
+        { "left": "first", "right": "second", "expected_label": "duplicate_work" },
+        { "left": "first", "right": "codex", "expected_label": "duplicate_work" },
+        { "left": "second", "right": "codex", "expected_label": "duplicate_work" }
+      ]
+    },
+    {
+      "id": "b",
+      "title": "Same file on different branches within one hour",
+      "status": "complete",
+      "sessions": [
+        { "role": "first", "harness": "claude", "session_id": "0d21cfd8-ae30-44d2-90dc-73eff68b6433", "started_at": "2026-11-13T08:26:20.616Z", "ended_at": "2026-11-13T08:26:34.857Z", "expected_project": "a", "branch": "feat/flags-env-override", "commit": "9f4ba71" },
+        { "role": "second", "harness": "claude", "session_id": "bb245bbf-6cc4-4918-a947-5d7f12751b23", "started_at": "2026-11-13T08:26:26.409Z", "ended_at": "2026-11-13T08:26:35.944Z", "expected_project": "a", "branch": "fix/flags-default-values", "commit": "40bd5a4" },
+        { "role": "codex", "harness": "codex", "session_id": "01a1d405-3444-7c10-b964-e4c30567c5a3", "started_at": "2026-11-13T08:27:54.054Z", "ended_at": "2026-11-13T08:30:59.523Z", "expected_project": "a", "branch": "feat/flags-percentage-rollout", "commit": "915ca82" }
+      ],
+      "pairs": [
+        { "left": "first", "right": "second", "expected_label": "concurrent_edit" },
+        { "left": "first", "right": "codex", "expected_label": "concurrent_edit" },
+        { "left": "second", "right": "codex", "expected_label": "concurrent_edit" }
+      ]
+    },
+    {
+      "id": "c",
+      "title": "B reverts A commit",
+      "status": "complete",
+      "sessions": [
+        { "role": "first", "harness": "claude", "session_id": "74059fb8-2ded-4a45-8c3f-cda4be81fc24", "started_at": "2026-11-13T08:25:45.377Z", "ended_at": "2026-11-13T08:26:03.227Z", "expected_project": "a", "branch": "feat/audit-log-a1", "commit": "e5a0b6c" },
+        { "role": "second", "harness": "codex", "session_id": "01a1d405-3444-73b2-8dfd-1cebb1f10e3e", "started_at": "2026-11-13T08:27:54.204Z", "ended_at": "2026-11-13T08:31:04.780Z", "expected_project": "a", "branch": "revert/audit-helpers", "commit": "8e4fe26", "reverts": "e5a0b6c" }
+      ],
+      "pairs": [{ "left": "first", "right": "second", "expected_label": "superseded_work" }]
+    },
+    {
+      "id": "d",
+      "title": "Same directory, different feature",
+      "status": "complete",
+      "sessions": [
+        { "role": "first", "harness": "claude", "session_id": "66e6c547-fc96-48bf-8dea-69c91c9a2035", "started_at": "2026-11-13T08:32:06.255Z", "ended_at": "2026-11-13T08:32:21.649Z", "expected_project": "a", "branch": "feat/report-subtitle", "commit": "a2294f5" },
+        { "role": "second", "harness": "codex", "session_id": "01a1d408-f2bc-7403-aa47-74f81e2fb668", "started_at": "2026-11-13T08:31:59.467Z", "ended_at": "2026-11-13T08:32:56.729Z", "expected_project": "a", "branch": "feat/report-csv", "commit": "0519f1f" }
+      ],
+      "pairs": [{ "left": "first", "right": "second", "expected_label": "tangent", "required_evidence": "writes_both" }]
+    },
+    {
+      "id": "e",
+      "title": "Lead explicitly splits a task between agents",
+      "status": "pending",
+      "sessions": [
+        { "role": "lead", "harness": "codex", "session_id": null, "started_at": null, "ended_at": null, "expected_project": "a" },
+        { "role": "first", "harness": "claude", "session_id": null, "started_at": null, "ended_at": null, "expected_project": "a" },
+        { "role": "second", "harness": "codex", "session_id": null, "started_at": null, "ended_at": null, "expected_project": "a" }
+      ],
+      "pairs": [{ "left": "first", "right": "second", "expected_label": "planned_parallel", "required_evidence": "writes_both" }]
+    },
+    {
+      "id": "e_unsplit",
+      "title": "Agents chat without an assigned split",
+      "status": "pending",
+      "sessions": [
+        { "role": "first", "harness": "claude", "session_id": null, "started_at": null, "ended_at": null, "expected_project": "a" },
+        { "role": "second", "harness": "codex", "session_id": null, "started_at": null, "ended_at": null, "expected_project": "a" }
+      ],
+      "pairs": [{ "left": "first", "right": "second", "expected_label": "duplicate_work" }]
+    },
+    {
+      "id": "f",
+      "title": "A stops and B continues on A branch",
+      "status": "complete",
+      "sessions": [
+        { "role": "first", "harness": "claude", "session_id": "a295365c-f461-489f-8b04-d063027b268b", "started_at": "2026-11-13T08:32:13.147Z", "ended_at": "2026-11-13T08:32:31.893Z", "expected_project": "a", "branch": "feat/report-pagination", "commit": "79fee74" },
+        { "role": "second", "harness": "codex", "session_id": "01a1d40a-e065-7ed3-8930-458f391bd5d1", "started_at": "2026-11-13T08:34:05.709Z", "ended_at": "2026-11-13T08:35:47.726Z", "expected_project": "a", "branch": "feat/report-pagination", "commit": "7a81693" }
+      ],
+      "pairs": [{ "left": "first", "right": "second", "expected_label": "continuation" }]
+    },
+    {
+      "id": "g",
+      "title": "Unrelated tasks in one repository",
+      "status": "complete",
+      "sessions": [
+        { "role": "first", "harness": "codex", "session_id": "01a1d408-f2bc-73f3-a85f-20b8c402e694", "started_at": "2026-11-13T08:31:59.628Z", "ended_at": "2026-11-13T08:32:41.089Z", "expected_project": "a", "branch": "docs/readme-setup", "commit": "1a095ca" },
+        { "role": "second", "harness": "claude", "session_id": "66e6c547-fc96-48bf-8dea-69c91c9a2035", "started_at": "2026-11-13T08:32:06.255Z", "ended_at": "2026-11-13T08:32:21.649Z", "expected_project": "a", "branch": "feat/report-subtitle", "commit": "a2294f5" }
+      ],
+      "pairs": [{ "left": "first", "right": "second", "expected_label": "none" }]
+    },
+    {
+      "id": "h",
+      "title": "Two agents debug the same bug without writes",
+      "status": "complete",
+      "sessions": [
+        { "role": "first", "harness": "claude", "session_id": "6f00465c-b0e7-48bc-a16c-543e9c62aad4", "started_at": "2026-11-13T08:32:18.291Z", "ended_at": "2026-11-13T08:32:44.856Z", "expected_project": "a", "branch": "investigate/flags-unknown" },
+        { "role": "second", "harness": "codex", "session_id": "01a1d408-f2bc-7ea2-aaa5-ee01696eec5a", "started_at": "2026-11-13T08:31:59.347Z", "ended_at": "2026-11-13T08:32:30.314Z", "expected_project": "a", "branch": "investigate/flags-codex" }
+      ],
+      "pairs": [{ "left": "first", "right": "second", "expected_label": "investigation_overlap" }]
+    },
+    {
+      "id": "i",
+      "title": "Human and agent edit the same file",
+      "status": "complete",
+      "sessions": [
+        { "role": "human", "harness": "human", "session_id": null, "started_at": "2026-11-13T08:39:30.000Z", "ended_at": "2026-11-13T08:39:30.000Z", "expected_project": "a", "branch": "feat/report-human", "commit": "a45f441", "author_kind": "human", "author_name": "Scenario Human" },
+        { "role": "agent", "harness": "codex", "session_id": "01a1d416-a24d-74b3-939c-bbecdb57ddc8", "started_at": "2026-11-13T08:46:56.507Z", "ended_at": "2026-11-13T08:48:08.270Z", "expected_project": "a", "branch": "feat/report-agent", "commit": "5a09add", "commit_provenance": "operator commit after agent sandbox denied Git index lock" }
+      ],
+      "pairs": [{ "left": "human", "right": "agent", "expected_label": "concurrent_edit", "expected_actor_kinds": ["human", "agent"] }]
+    },
+    {
+      "id": "j",
+      "title": "One session pivots across unrelated tasks",
+      "minimum_duration_minutes": 15,
+      "status": "complete",
+      "sessions": [
+        { "role": "pivoting", "harness": "claude", "session_id": "ce507224-490e-4d1a-87be-aee8929d7656", "started_at": "2026-11-13T08:32:30.615Z", "ended_at": "2026-11-13T08:37:42.025Z", "expected_project": "a", "branch": "chore/maintenance-j1", "commits": ["e1c23ee", "d373284"] },
+        { "role": "reviewed", "harness": "claude", "session_id": "0d21cfd8-ae30-44d2-90dc-73eff68b6433", "started_at": "2026-11-13T08:26:20.616Z", "ended_at": "2026-11-13T08:26:34.857Z", "expected_project": "a", "branch": "feat/flags-env-override", "commit": "9f4ba71" }
+      ],
+      "pairs": [{ "left": "pivoting", "right": "reviewed", "expected_label": "none", "note": "Episode 3 reviewed the other session's diff; informational review relation, no overlap alert." }],
+      "expected_episodes": [
+        { "sequence": 1, "category": "implementation", "start_turn_at": "2026-11-13T08:32:30.691Z", "boundary_after": "CONTRIBUTING.md committed at assistant turn 08:32:37.656Z" },
+        { "sequence": 2, "category": "debugging", "start_turn_at": "2026-11-13T08:34:00.437Z", "boundary_after": "reportTitle fix committed at assistant turn 08:34:08.697Z" },
+        { "sequence": 3, "category": "review", "start_turn_at": "2026-11-13T08:36:24.048Z", "boundary_after": "review answer at assistant turn 08:36:36.836Z" },
+        { "sequence": 4, "category": "research", "start_turn_at": "2026-11-13T08:37:31.260Z", "boundary_after": "research answer at assistant turn 08:37:42.025Z" }
+      ]
+    },
+    {
+      "id": "cross_project_unrelated",
+      "title": "Similar files in separate repositories, unrelated outcomes",
+      "status": "complete",
+      "sessions": [
+        { "role": "first", "harness": "codex", "session_id": "01a1d408-f2bc-73f3-a85f-20b8c402e694", "started_at": "2026-11-13T08:31:59.628Z", "ended_at": "2026-11-13T08:32:41.089Z", "expected_project": "a", "branch": "docs/readme-setup", "commit": "1a095ca" },
+        { "role": "second", "harness": "claude", "session_id": "9ff3be4c-2ed0-40a2-bfeb-839b58a8094a", "started_at": "2026-11-13T08:32:23.940Z", "ended_at": "2026-11-13T08:32:44.856Z", "expected_project": "b", "branch": "feat/audit-log-b", "commit": "7f8afd5" }
+      ],
+      "pairs": [{ "left": "first", "right": "second", "expected_label": "none", "required_project_tags": true }]
+    },
+    {
+      "id": "cross_project_same_feature",
+      "title": "Same feature built independently in separate repositories",
+      "status": "complete",
+      "sessions": [
+        { "role": "first", "harness": "claude", "session_id": "74059fb8-2ded-4a45-8c3f-cda4be81fc24", "started_at": "2026-11-13T08:25:45.377Z", "ended_at": "2026-11-13T08:26:03.227Z", "expected_project": "a", "branch": "feat/audit-log-a1", "commit": "e5a0b6c" },
+        { "role": "second", "harness": "claude", "session_id": "9ff3be4c-2ed0-40a2-bfeb-839b58a8094a", "started_at": "2026-11-13T08:32:23.940Z", "ended_at": "2026-11-13T08:32:44.856Z", "expected_project": "b", "branch": "feat/audit-log-b", "commit": "7f8afd5" }
+      ],
+      "pairs": [{ "left": "first", "right": "second", "expected_label": "none", "required_evidence": "writes_both", "required_project_tags": true, "note": "Project isolation wins over matching feature names and migration numbers." }]
+    }
+  ]
+}
