@@ -11,7 +11,8 @@ import {
 import {
   UPLOAD_ADMISSION_FUNCTION_TIMEOUT_SECONDS, UPLOAD_ADMISSION_VISIBILITY_TIMEOUT_SECONDS, UPLOAD_INBOX_NOTIFICATION_ID,
   UPLOAD_INBOX_PREFIX, UPLOAD_INBOX_RESOURCES, UPLOAD_INBOX_SSE_ENV, desktopUploadPolicy, desktopUploadTrustPolicy, parseHistoryUploadDirectInfra,
-  uploadAdmissionEnvironment, uploadAdmissionPolicy, uploadAdmissionQueuePolicy, uploadInboxNames,
+  UPLOAD_ADMISSION_RESERVED_CONCURRENCY, assertUploadAdmissionInputs, uploadAdmissionBucketStatements, uploadAdmissionEnvironment,
+  uploadAdmissionQueuePolicy, uploadAdmissionSecretPolicy, uploadInboxNames,
 } from "../upload-inbox.ts";
 import { UPLOAD_INBOX_SSE_VAR, uploadDirectConfig } from "../../../src/session-ingest/upload-admission.ts";
 
@@ -27,7 +28,10 @@ const srvWriterArn = `arn:aws:iam::${accountId}:user/96bulls/synthetic-srv-write
 const pipelineRoleArn = `arn:aws:iam::${accountId}:role/synthetic-pipeline`;
 const gcRoleArn = `arn:aws:iam::${accountId}:role/synthetic-buffered-gc`;
 const u = uploadInboxNames(stage, accountId, region);
-const roles = { uploadRoleArn: u.uploadRoleArn, consumerRoleArn: u.consumerRoleArn };
+// The consumer's role is the one Alchemy's Lambda provider owns (a generated name): synthetic here.
+const consumerRoleArn = `arn:aws:iam::${accountId}:role/synthetic-upload-admission-role`;
+const roles = { uploadRoleArn: u.uploadRoleArn, consumerRoleArn };
+const cf = { cloudflareAccountId: "0123456789abcdef0123456789abcdef", admissionQueueId: "fedcba9876543210fedcba9876543210" };
 
 const inboxKey = `${bucketArn}/96bulls/.upload-inbox/org-a/v1/ws=w1/u=abc/0001.json.zst`;
 const sessionKey = `${bucketArn}/96bulls/org-a/v1/ws=w1/m=m1/h=claude/d=2026/11/11/s=s1/manifest.json`;
@@ -64,8 +68,9 @@ function allowed(identity: Statement[], bucket: Statement[], action: string, res
 }
 const tls = { "aws:SecureTransport": "true", "s3:TlsVersion": "1.3" };
 const sse = { "s3:x-amz-server-side-encryption": "aws:kms", "s3:x-amz-server-side-encryption-aws-kms-key-id": keyArn };
-const bucketOn = transcriptBucketPolicy({ bucketArn, keyArn, eraserArn, accountId, bufferedGcRoleArn: gcRoleArn, uploadInbox: roles }) as Statement[];
-const bucketOnAnalysis = transcriptBucketPolicy({ bucketArn, keyArn, eraserArn, accountId, bufferedGcRoleArn: gcRoleArn, analysisDeleterArn: pipelineRoleArn, uploadInbox: roles }) as Statement[];
+const consumerBucket = uploadAdmissionBucketStatements({ bucketArn, consumerRoleArn, promotionObjects: srvWriterObjects(bucketArn) }) as Statement[];
+const bucketOn = [...transcriptBucketPolicy({ bucketArn, keyArn, eraserArn, accountId, bufferedGcRoleArn: gcRoleArn, uploadInbox: roles }), ...consumerBucket] as Statement[];
+const bucketOnAnalysis = [...transcriptBucketPolicy({ bucketArn, keyArn, eraserArn, accountId, bufferedGcRoleArn: gcRoleArn, analysisDeleterArn: pipelineRoleArn, uploadInbox: roles }), ...consumerBucket] as Statement[];
 
 describe("HISTORY_UPLOAD_DIRECT_INFRA", () => {
   it("is off unless exactly 'on', and refuses anything else", () => {
@@ -122,12 +127,13 @@ describe("flag off renders the stack byte-identical", () => {
   // (every declared resource's props, in declaration order, plus the stage's return value).
   const script = `import { mock } from 'bun:test'; import * as E from 'effect/Effect';
     const acct='${accountId}', region='${region}'; const seen=[];
-    const out=(name,p)=>({userName:p.userName,userArn:'arn:aws:iam::'+acct+':user/96bulls/'+p.userName,roleName:p.roleName,roleArn:'arn:aws:iam::'+acct+':role'+(p.path??'/')+(p.roleName??name),keyArn:'arn:aws:kms:'+region+':'+acct+':key/synthetic-'+name,keyId:'synthetic-'+name,bucketName:p.bucketName,trailName:p.trailName,functionName:p.functionName??name,functionArn:'arn:aws:lambda:'+region+':'+acct+':function:'+(p.functionName??name),queueArn:'arn:aws:sqs:'+region+':'+acct+':'+(p.queueName??name),ruleArn:'arn:aws:events:'+region+':'+acct+':rule/'+name,secretArn:'arn:aws:secretsmanager:'+region+':'+acct+':secret:'+name,uuid:'uuid-'+name,functionUrl:'https://synthetic.invalid/'});
+    const out=(name,p)=>({userName:p.userName,userArn:'arn:aws:iam::'+acct+':user/96bulls/'+p.userName,roleName:p.roleName,roleArn:'arn:aws:iam::'+acct+':role'+(p.path??'/')+(p.roleName??(p.functionName?name+'-role':name)),keyArn:'arn:aws:kms:'+region+':'+acct+':key/synthetic-'+name,keyId:'synthetic-'+name,bucketName:p.bucketName,trailName:p.trailName,functionName:p.functionName??name,functionArn:'arn:aws:lambda:'+region+':'+acct+':function:'+(p.functionName??name),queueArn:'arn:aws:sqs:'+region+':'+acct+':'+(p.queueName??name),ruleArn:'arn:aws:events:'+region+':'+acct+':rule/'+name,secretArn:'arn:aws:secretsmanager:'+region+':'+acct+':secret:'+name,uuid:'uuid-'+name,functionUrl:'https://synthetic.invalid/'});
     const f=(type)=>(name,props)=>{seen.push({type,name,props});return E.succeed(out(name,props??{}))};
     const ns=(...t)=>Object.fromEntries(t.map(x=>[x,f(x)]));
     mock.module('@alchemy.run/aws',()=>({IAM:ns('User','Role','Policy'),KMS:ns('Key','Alias'),S3:ns('Bucket'),CloudTrail:ns('Trail'),Budgets:ns('Budget'),Lambda:ns('Function','EventSourceMapping','Permission','Url','FunctionUrl'),SQS:ns('Queue'),SecretsManager:ns('Secret'),EventBridge:ns('Rule'),CloudWatch:ns('Alarm'),Logs:ns('LogGroup')}));
     const {transcriptStoreStage}=await import(${JSON.stringify(modulePath)});
     const gc='arn:aws:iam::'+acct+':role/synthetic-buffered-gc';
+    const ua={direct:'allowlist',allowlist:['ws:w1','org:org-a'],cloudflareAccountId:'${cf.cloudflareAccountId}',admissionQueueId:'${cf.admissionQueueId}'};
     const base={stage:'${stage}',accountId:acct,region,budgetUsd:1,budgetEmail:'test@example.invalid',tags:(c)=>({component:c})};
     const scenarios={
       store:{bufferedGcRoleArn:gc},
@@ -143,21 +149,24 @@ describe("flag off renders the stack byte-identical", () => {
         explicitFalse:await render({...base,historyUploadDirectInfra:false,transcriptStore:store}),
         controlOnly:await render({...base,transcriptStore:{...store,uploadControlRoleArn:'${controlRoleArn}'}}),
         sseOnly:await render({...base,transcriptStore:{...store,uploadControlRoleArn:'${controlRoleArn}',uploadInboxSse:'aws:kms'}}),
+        admissionOnly:await render({...base,transcriptStore:{...store,uploadControlRoleArn:'${controlRoleArn}',uploadInboxSse:'aws:kms',uploadAdmission:ua}}),
       };
-      if(store.sessionPipeline) res[k].on=await render({...base,historyUploadDirectInfra:true,transcriptStore:{...store,uploadControlRoleArn:'${controlRoleArn}',uploadInboxSse:'aws:kms'}});
+      if(store.sessionPipeline) res[k].on=await render({...base,historyUploadDirectInfra:true,transcriptStore:{...store,uploadControlRoleArn:'${controlRoleArn}',uploadInboxSse:'aws:kms',uploadAdmission:ua}});
     }
     console.log(JSON.stringify(res));`;
   const result = spawnSync(process.execPath, ["--eval", script], { encoding: "utf8", env: { PATH: process.env.PATH }, timeout: 120_000 });
   if (result.status !== 0) throw new Error(result.stderr);
-  const renders = JSON.parse(result.stdout) as Record<string, { absent: string; explicitFalse: string; controlOnly: string; sseOnly: string; on?: string }>;
-  const uploadSids = ["DenyUploadInbox", "UploadInboxOnlyItsRoles", "UploadInboxOnlyEraserOrConsumerDeletes", "DesktopUploadEncryptsInboxViaS3", "UploadAdmissionEncryptsAndReadsViaS3"];
+  const renders = JSON.parse(result.stdout) as Record<string, { absent: string; explicitFalse: string; controlOnly: string; sseOnly: string; admissionOnly: string; on?: string }>;
+  const uploadSids = ["DenyUploadInbox", "UploadInboxOnlyItsRoles", "UploadInboxOnlyEraserOrConsumerDeletes", "DesktopUploadEncryptsInboxViaS3", "UploadAdmissionEncryptsAndReadsViaS3",
+    "UploadAdmissionReadsTombstonesDeletesUploads", "UploadAdmissionPromotes", "UploadAdmissionListsForMissingKeys", "UploadAdmissionNoHistoryNoAdmin", "UploadAdmissionReads"];
 
   for (const scenario of ["store", "full", "noAnalysis"]) {
-    it(`${scenario}: off, explicit false and inert control-role / uploadInboxSse inputs are identical`, () => {
+    it(`${scenario}: off, explicit false and inert control-role / uploadInboxSse / uploadAdmission inputs are identical`, () => {
       const r = renders[scenario]!;
       expect(r.explicitFalse).toBe(r.absent);
       expect(r.controlOnly).toBe(r.absent);
       expect(r.sseOnly).toBe(r.absent);
+      expect(r.admissionOnly).toBe(r.absent);
     });
     it(`${scenario}: off declares no upload resource, Sid, queue rule or output`, () => {
       const off = renders[scenario]!.absent;
@@ -179,12 +188,30 @@ describe("flag off renders the stack byte-identical", () => {
       expect(added.sort()).toEqual([...UPLOAD_INBOX_RESOURCES].sort());
       expect(on.ret.sessionPipeline.notification.QueueConfigurations.map((q: any) => q.Id)).toEqual(["96bulls-session-pipeline-manifests", UPLOAD_INBOX_NOTIFICATION_ID]);
       expect(on.ret.sessionPipeline.notification).toEqual(bucketNotificationConfiguration(sessionPipelineNames(stage, accountId, region).queueArn, u.queueArn));
-      expect(on.ret.uploadInbox).toEqual({ queueUrl: u.queueUrl, queueArn: u.queueArn, dlqArn: u.dlqArn, uploadRoleArn: u.uploadRoleArn, consumerRoleArn: u.consumerRoleArn, consumerEnvironment: { HISTORY_UPLOAD_INBOX_SSE: "aws:kms" } });
+      const fnRoleArn = `arn:aws:iam::${accountId}:role/upload-admission-role`;
+      expect(on.ret.uploadInbox).toEqual({ queueUrl: u.queueUrl, queueArn: u.queueArn, dlqArn: u.dlqArn, uploadRoleArn: u.uploadRoleArn, consumerRoleArn: fnRoleArn,
+        functionName: u.function, secretName: u.secret, mappingUuid: "uuid-upload-admission-mapping", consumerEnvironment: { HISTORY_UPLOAD_INBOX_SSE: "aws:kms" } });
       const byName = (n: string) => on.resources.find((r: any) => r.name === n).props;
-      // Principals before the key: both roles are declared before transcripts-key.
+      // Principals before the key: the upload role and the consumer function (its role) precede transcripts-key.
       const order = on.resources.map((r: any) => r.name);
       expect(order.indexOf("desktop-upload-role")).toBeLessThan(order.indexOf("transcripts-key"));
-      expect(order.indexOf("upload-admission-role")).toBeLessThan(order.indexOf("transcripts-key"));
+      expect(order.indexOf("upload-admission")).toBeLessThan(order.indexOf("transcripts-key"));
+      // Decision 0004: reserved concurrency 4, batch size 1, partial-batch failures, timeout x6 visibility.
+      const fn = byName("upload-admission");
+      expect(fn).toMatchObject({ functionName: u.function, main: "src/session-ingest/upload-admission-lambda.ts", handler: "handler", reservedConcurrentExecutions: UPLOAD_ADMISSION_RESERVED_CONCURRENCY, functionUrl: false, timeout: `${UPLOAD_ADMISSION_FUNCTION_TIMEOUT_SECONDS} seconds` });
+      expect(UPLOAD_ADMISSION_RESERVED_CONCURRENCY).toBe(4);
+      expect(fn.env).toEqual({
+        DEPLOYMENT: stage, HISTORY_UPLOAD_DIRECT: "allowlist", HISTORY_UPLOAD_DIRECT_ALLOWLIST: "ws:w1,org:org-a", HISTORY_UPLOAD_INBOX_SSE: "aws:kms",
+        UPLOAD_ADMISSION_BUCKET: bucketName, UPLOAD_ADMISSION_SECRET_ID: u.secret, UPLOAD_ADMISSION_CF_ACCOUNT_ID: cf.cloudflareAccountId, UPLOAD_ADMISSION_CF_QUEUE_ID: cf.admissionQueueId,
+        INGEST_KEY_ROOT: "96bulls", INGEST_ACCEPTANCE_MODE: "buffered", NODE_OPTIONS: "--enable-source-maps",
+      });
+      // No secret value anywhere in the rendered stack: only the container's name.
+      expect(JSON.stringify(on)).not.toMatch(/upload_witness_key|cloudflare_queue_token|UPLOAD_WITNESS_KEY/);
+      expect(byName("upload-admission-mapping")).toMatchObject({ functionName: u.function, eventSourceArn: u.queueArn, batchSize: 1, functionResponseTypes: ["ReportBatchItemFailures"], enabled: true });
+      expect(byName("upload-admission-secret").resourcePolicy).toEqual(uploadAdmissionSecretPolicy({ roleArn: fnRoleArn }));
+      expect(byName("upload-admission-events").policy.Statement.find((s: any) => s.Sid === "UploadAdmissionConsumes").Principal).toEqual({ AWS: fnRoleArn });
+      expect(byName("transcripts").policy.filter((s: any) => s.Sid?.startsWith("UploadAdmission")).map((s: any) => s.Sid))
+        .toEqual(["UploadAdmissionReadsTombstonesDeletesUploads", "UploadAdmissionPromotes", "UploadAdmissionListsForMissingKeys", "UploadAdmissionNoHistoryNoAdmin"]);
       expect(byName("transcripts-key").policy.Statement.map((s: any) => s.Sid)).toContain("DesktopUploadEncryptsInboxViaS3");
       expect(byName("transcripts").policy.map((s: any) => s.Sid)).toContain("UploadInboxOnlyItsRoles");
       for (const user of ["transcript-writer", "transcript-reader", "transcript-srv-writer"])
@@ -207,15 +234,18 @@ describe("flag off renders the stack byte-identical", () => {
     const noControl = refuse("scenarios.full");
     expect(noControl.status).not.toBe(0);
     expect(noControl.stderr).toContain("uploadControlRoleArn is required");
-    const noPipeline = refuse(`{...scenarios.store,uploadControlRoleArn:'${controlRoleArn}',uploadInboxSse:'aws:kms'}`);
+    const noPipeline = refuse(`{...scenarios.store,uploadControlRoleArn:'${controlRoleArn}',uploadInboxSse:'aws:kms',uploadAdmission:ua}`);
     expect(noPipeline.status).not.toBe(0);
     expect(noPipeline.stderr).toContain("sessionPipeline is required");
+    const noAdmission = refuse(`{...scenarios.full,uploadControlRoleArn:'${controlRoleArn}',uploadInboxSse:'aws:kms'}`);
+    expect(noAdmission.status).not.toBe(0);
+    expect(noAdmission.stderr).toContain("transcriptStore.uploadAdmission is required");
   });
 
   // Hosted HISTORY_UPLOAD_INBOX_SSE: required, exactly aws:kms. Each case reports how many resources were
   // declared before the refusal (must be 0) and the refusal message.
   const attempt = (infra: boolean, sse: string | undefined) => {
-    const store = `{...scenarios.full,uploadControlRoleArn:'${controlRoleArn}'${sse === undefined ? "" : `,uploadInboxSse:${JSON.stringify(sse)}`}}`;
+    const store = `{...scenarios.full,uploadControlRoleArn:'${controlRoleArn}',uploadAdmission:ua${sse === undefined ? "" : `,uploadInboxSse:${JSON.stringify(sse)}`}}`;
     const r = spawnSync(process.execPath, ["--eval", script.replace(/const res=\{\};[\s\S]*$/, `try{await E.runPromise(transcriptStoreStage({...base,historyUploadDirectInfra:${infra},transcriptStore:${store}}));console.log(JSON.stringify({ok:true,declared:seen.length}));}catch(e){console.log(JSON.stringify({ok:false,declared:seen.length,message:String(e?.message??e)}));}`)], { encoding: "utf8", env: { PATH: process.env.PATH }, timeout: 60_000 });
     if (r.status !== 0) throw new Error(r.stderr);
     return JSON.parse(r.stdout.trim().split("\n").at(-1)!) as { ok: boolean; declared: number; message?: string };
@@ -343,16 +373,16 @@ describe("the inbox wall", () => {
   it("only the consumer and the eraser delete inbox objects; elsewhere the eraser-only deny is unchanged", () => {
     const wideAllow = [{ Effect: "Allow", Action: ["s3:*"], Resource: [`${bucketArn}/*`] }];
     for (const bucket of [bucketOn, bucketOnAnalysis]) {
-      expect(allowed(wideAllow, bucket, "s3:DeleteObject", inboxKey, ctx(u.consumerRoleArn))).toBe(true);
+      expect(allowed(wideAllow, bucket, "s3:DeleteObject", inboxKey, ctx(consumerRoleArn))).toBe(true);
       expect(allowed(wideAllow, bucket, "s3:DeleteObject", inboxKey, ctx(eraserArn))).toBe(true);
       expect(allowed(wideAllow, bucket, "s3:DeleteObject", inboxKey, ctx(u.uploadRoleArn))).toBe(false);
-      expect(allowed(wideAllow, bucket, "s3:DeleteObject", sessionKey, ctx(u.consumerRoleArn))).toBe(false);
+      expect(allowed(wideAllow, bucket, "s3:DeleteObject", sessionKey, ctx(consumerRoleArn))).toBe(false);
       expect(allowed(wideAllow, bucket, "s3:DeleteObject", sessionKey, ctx(eraserArn))).toBe(true);
     }
     // Outside the inbox every principal's delete outcome equals the flag-off policy's.
     const offPolicy = transcriptBucketPolicy({ bucketArn, keyArn, eraserArn, accountId, bufferedGcRoleArn: gcRoleArn }) as Statement[];
     const bufferedKey = `${bucketArn}/96bulls/org-a/live-batches/b1/x.ndjson`;
-    for (const p of [eraserArn, gcRoleArn, pipelineRoleArn, writerArn, u.consumerRoleArn, u.uploadRoleArn])
+    for (const p of [eraserArn, gcRoleArn, pipelineRoleArn, writerArn, consumerRoleArn, u.uploadRoleArn])
       for (const key of [sessionKey, srvKey, bufferedKey])
         for (const action of ["s3:DeleteObject", "s3:DeleteObjectVersion"])
           expect(allowed(wideAllow, bucketOn, action, key, ctx(p))).toBe(allowed(wideAllow, offPolicy, action, key, ctx(p)));
@@ -362,27 +392,52 @@ describe("the inbox wall", () => {
   });
 });
 
-describe("upload-admission consumer role", () => {
-  const policy = uploadAdmissionPolicy({ bucketArn, accountId, region, keyAlias, queueArn: u.queueArn, functionName: u.function, promotionObjects: srvWriterObjects(bucketArn) }).Statement as Statement[];
-  const ctx = { ...tls, ...sse, "aws:PrincipalArn": u.consumerRoleArn };
+describe("upload-admission consumer (bucket grants on its function role)", () => {
+  const ctx = { ...tls, "aws:PrincipalArn": consumerRoleArn };
 
-  it("reads, tombstones and deletes inbox objects, and promotes through the srv-writer layout", () => {
-    for (const action of ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]) expect(allowed(policy, bucketOn, action, inboxKey, ctx)).toBe(true);
-    expect(allowed(policy, bucketOn, "s3:PutObject", admissionKey, ctx)).toBe(true);
-    expect(allowed(policy, bucketOn, "s3:PutObject", srvKey, ctx)).toBe(true);
-    expect(allowed(policy, bucketOn, "s3:GetObject", sessionKey, ctx)).toBe(false);
-    expect(allowed(policy, bucketOn, "s3:DeleteObject", srvKey, ctx)).toBe(false);
-    expect(allowed(policy, bucketOn, "s3:DeleteObjectVersion", inboxKey, ctx)).toBe(false);
-    expect(allowed(policy, bucketOn, "s3:GetObjectVersion", inboxKey, ctx)).toBe(false);
-    expect(allowed(policy, bucketOn, "s3:PutObject", inboxKey, { ...ctx, "s3:x-amz-server-side-encryption": "AES256" })).toBe(false);
+  it("reads, tombstones and deletes inbox objects, and promotes through the srv-writer layout (no identity policy needed)", () => {
+    for (const action of ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]) expect(allowed([], bucketOn, action, inboxKey, ctx)).toBe(true);
+    expect(allowed([], bucketOn, "s3:PutObject", admissionKey, ctx)).toBe(true);
+    expect(allowed([], bucketOn, "s3:PutObject", srvKey, ctx)).toBe(true);
+    expect(allowed([], bucketOn, "s3:GetObject", sessionKey, ctx)).toBe(false);
+    expect(allowed([], bucketOn, "s3:DeleteObject", srvKey, ctx)).toBe(false);
+    expect(allowed([], bucketOn, "s3:DeleteObject", admissionKey, ctx)).toBe(false);
+    expect(allowed([], bucketOn, "s3:DeleteObjectVersion", inboxKey, ctx)).toBe(false);
+    expect(allowed([], bucketOn, "s3:GetObjectVersion", inboxKey, ctx)).toBe(false);
+    expect(allowed([], bucketOn, "s3:ListBucket", bucketArn, ctx)).toBe(true);
+    // A PUT without SSE headers gets the bucket default key; any other encryption is refused.
+    expect(allowed([], bucketOn, "s3:PutObject", srvKey, { ...ctx, "s3:x-amz-server-side-encryption": "AES256" })).toBe(false);
+    expect(allowed([], bucketOn, "s3:PutObject", srvKey, { ...ctx, "s3:x-amz-server-side-encryption": "aws:kms", "s3:x-amz-server-side-encryption-aws-kms-key-id": `arn:aws:kms:${region}:${accountId}:key/other` })).toBe(false);
+    // Another principal gets nothing from these grants.
+    expect(allowed([], bucketOn, "s3:GetObject", admissionKey, { ...ctx, "aws:PrincipalArn": pipelineRoleArn })).toBe(false);
+  });
+
+  it("the consumer's admin deny names only the consumer", () => {
+    const deny = consumerBucket.find((s) => s.Sid === "UploadAdmissionNoHistoryNoAdmin")!;
+    expect(deny.Condition).toEqual({ ArnEquals: { "aws:PrincipalArn": consumerRoleArn } });
+  });
+
+  it("inputs: required when on, validated when off, allowlist only with direct allowlist", () => {
+    const refuse = (why: string): never => { throw new Error(why); };
+    expect(() => assertUploadAdmissionInputs(undefined, false, refuse)).not.toThrow();
+    expect(() => assertUploadAdmissionInputs(undefined, true, refuse)).toThrow(/uploadAdmission is required/);
+    for (const direct of ["off", "on"]) expect(() => assertUploadAdmissionInputs({ direct, ...cf }, true, refuse)).not.toThrow();
+    expect(() => assertUploadAdmissionInputs({ direct: "allowlist", allowlist: ["ws:w1"], ...cf }, true, refuse)).not.toThrow();
+    for (const bad of [
+      { direct: "allowlist", ...cf }, { direct: "allowlist", allowlist: [], ...cf }, { direct: "allowlist", allowlist: ["w1"], ...cf },
+      { direct: "allowlist", allowlist: ["ws:.x"], ...cf }, { direct: "allowlist", allowlist: ["ws:a", "ws:a"], ...cf },
+      { direct: "on", allowlist: ["ws:w1"], ...cf }, { direct: "ON", ...cf }, { ...cf },
+      { direct: "on", ...cf, cloudflareAccountId: "x" }, { direct: "on", ...cf, admissionQueueId: "96bulls-session-ingest-admission" },
+      { direct: "on", ...cf, witnessKey: "x" }, null, [],
+    ]) expect(() => assertUploadAdmissionInputs(bad, false, refuse)).toThrow(/uploadAdmission/);
   });
 
   it("the queue takes S3 events from this bucket only, and the consumer cannot send", () => {
-    const q = uploadAdmissionQueuePolicy({ queueArn: u.queueArn, bucketArn, accountId, consumerRoleArn: u.consumerRoleArn }).Statement as Statement[];
+    const q = uploadAdmissionQueuePolicy({ queueArn: u.queueArn, bucketArn, accountId, consumerRoleArn }).Statement as Statement[];
     const s3 = q.find((s) => s.Principal?.Service === "s3.amazonaws.com")!;
     expect(s3.Condition).toEqual({ ArnEquals: { "aws:SourceArn": bucketArn }, StringEquals: { "aws:SourceAccount": accountId } });
     expect(many(s3.Action)).toEqual(["sqs:SendMessage"]);
-    const consumer = q.find((s) => s.Principal?.AWS === u.consumerRoleArn)!;
+    const consumer = q.find((s) => s.Principal?.AWS === consumerRoleArn)!;
     expect(many(consumer.Action)).not.toContain("sqs:SendMessage");
     expect(UPLOAD_ADMISSION_VISIBILITY_TIMEOUT_SECONDS).toBe(6 * UPLOAD_ADMISSION_FUNCTION_TIMEOUT_SECONDS);
   });

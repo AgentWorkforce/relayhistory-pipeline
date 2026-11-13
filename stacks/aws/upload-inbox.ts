@@ -9,10 +9,16 @@
  *                         s3:PutObject on `96bulls/.upload-inbox/*` only, create-only, SSE-KMS
  *                         required. relay-control narrows each session to one org/workspace/upload
  *                         with an inline session policy. No List, no Get, no Delete.
- *   upload-admission role 96bulls-<stage>-upload-admission  the consumer Lambda's execution role
- *                         (the Lambda itself is a separate change): consumes the upload queue,
- *                         reads/tombstones/deletes inbox objects, and promotes through the
- *                         srv-writer layout (`.admission-inbox` and `m=srv_*`).
+ *   upload-admission      the consumer Lambda (src/session-ingest/upload-admission-lambda.ts), reserved
+ *                         concurrency 4, fed by an SQS event source mapping (batch size 1,
+ *                         ReportBatchItemFailures). Its execution role is the one Alchemy's Lambda
+ *                         provider owns (it cannot take a separately declared role), so, as for the
+ *                         session pipeline and the read API, every grant is a resource policy naming
+ *                         that role: the bucket (uploadAdmissionBucketStatements: read/tombstone/delete
+ *                         inbox objects, promote through the srv-writer layout `.admission-inbox` and
+ *                         `m=srv_*`), the key (uploadInboxKeyStatements), the queue and its secret.
+ *   upload-admission-secret  Secrets Manager container `96bulls/<stage>/upload-admission` (value set out
+ *                         of band from 1Password: UPLOAD_WITNESS_KEY and the Cloudflare Queues token).
  *   upload-admission      SQS queue + DLQ (S3 events from this bucket only), DLQ depth alarm.
  *   bucket notification   Id `96bulls-upload-inbox`, written together with the manifests rule by
  *                         scripts/sessions-prod-bucket-notification.sh (one Put owns both Ids).
@@ -32,7 +38,7 @@ import { TENANT_KEY_BASE } from "./tenants.ts";
 export const UPLOAD_INBOX_PREFIX = `${TENANT_KEY_BASE}/${INBOX_UPLOAD_NAMESPACE}/`;
 export const UPLOAD_INBOX_NOTIFICATION_ID = "96bulls-upload-inbox";
 export const UPLOAD_INBOX_NOTIFICATION_SUFFIX = UPLOAD_OBJECT_SUFFIX;
-/** The consumer Lambda's timeout (set by the Lambda change; keep these in step). */
+/** The consumer Lambda's timeout. */
 export const UPLOAD_ADMISSION_FUNCTION_TIMEOUT_SECONDS = 300;
 /** AWS guidance for SQS-triggered Lambdas: visibility at least 6x the function timeout. */
 export const UPLOAD_ADMISSION_VISIBILITY_TIMEOUT_SECONDS = 6 * UPLOAD_ADMISSION_FUNCTION_TIMEOUT_SECONDS;
@@ -40,12 +46,21 @@ export const UPLOAD_ADMISSION_MAX_RECEIVE_COUNT = 8;
 export const UPLOAD_ADMISSION_DLQ_RETENTION = "14 days";
 export const UPLOAD_ADMISSION_QUEUE_RETENTION = "4 days";
 
-/** Alchemy resource ids this flag adds (for a future reviewed plan-contract rollout phase). */
+/** Decision 0004: reserved concurrency 4 bounds the consumer (and its downstream claims). */
+export const UPLOAD_ADMISSION_RESERVED_CONCURRENCY = 4;
+export const UPLOAD_ADMISSION_MEMORY_MB = 1024;
+
+/** Alchemy resource ids this flag adds (transcript-store.ts plan contract: "upload inbox rollout" / "update"). */
 export const UPLOAD_INBOX_RESOURCES = [
-  "desktop-upload-role", "upload-admission-role",
-  "upload-admission-dlq", "upload-admission-events",
-  "upload-admission-dlq-alarm", "upload-admission-age-alarm",
+  "desktop-upload-role", "upload-admission", "upload-admission-secret",
+  "upload-admission-dlq", "upload-admission-events", "upload-admission-mapping",
+  "upload-admission-dlq-alarm", "upload-admission-age-alarm", "upload-admission-errors-alarm",
 ] as const;
+/**
+ * The resources whose policies name the consumer function's (Alchemy-owned) role. A function update re-plans
+ * its `roleArn` as `(known after apply)`, so each of these may show exactly that role-ARN cascade.
+ */
+export const UPLOAD_ADMISSION_ROLE_GRANT_RESOURCES = ["transcripts", "transcripts-key", "upload-admission-events", "upload-admission-secret"] as const;
 
 /** HISTORY_UPLOAD_DIRECT_INFRA: unset, "" or "off" is off; "on" is on; anything else refuses. */
 export function parseHistoryUploadDirectInfra(value: string | undefined): boolean {
@@ -95,9 +110,8 @@ export interface UploadInboxNames {
   rolePath: string;
   uploadRole: string;
   uploadRoleArn: string;
-  consumerRole: string;
-  consumerRoleArn: string;
   function: string;
+  secret: string;
   queue: string;
   dlq: string;
   queueArn: string;
@@ -112,9 +126,8 @@ export function uploadInboxNames(stage: string, accountId: string, region: strin
     rolePath,
     uploadRole: n("desktop-upload"),
     uploadRoleArn: `arn:aws:iam::${accountId}:role${rolePath}${n("desktop-upload")}`,
-    consumerRole: n("upload-admission"),
-    consumerRoleArn: `arn:aws:iam::${accountId}:role${rolePath}${n("upload-admission")}`,
     function: n("upload-admission"),
+    secret: `96bulls/${stage}/upload-admission`,
     queue: n("upload-admission"),
     dlq: n("upload-admission-dlq"),
     queueArn: `arn:aws:sqs:${region}:${accountId}:${n("upload-admission")}`,
@@ -179,68 +192,42 @@ export function desktopUploadPolicy(i: { bucketArn: string; accountId: string; r
   };
 }
 
-export function uploadAdmissionTrustPolicy() {
-  return {
-    Version: "2012-10-17" as const,
-    Statement: [{ Sid: "LambdaAssumes", Effect: "Allow" as const, Principal: { Service: "lambda.amazonaws.com" }, Action: ["sts:AssumeRole"] }],
-  };
+/**
+ * The upload-admission consumer's grants on the bucket (its Alchemy-owned role holds no S3 identity policy):
+ * read the upload, tombstone and delete it, and promote it through the srv-writer layout
+ * (`promotionObjects`, the srv-writer's object grant: `.admission-inbox` and the `m=srv_*` tenant layout).
+ * PUTs carry no SSE header and get the bucket default (this key); DenyOtherEncryption and
+ * SseHeaderMustNameThisKey refuse anything else. Deletes stay inbox-only (OnlyTheEraserDeletes and the inbox
+ * wall), and the explicit deny keeps version history and bucket administration out of reach.
+ */
+export function uploadAdmissionBucketStatements(i: { bucketArn: string; consumerRoleArn: string; promotionObjects: string[] }) {
+  const inbox = uploadInboxObjects(i.bucketArn);
+  const principal = { AWS: i.consumerRoleArn };
+  return [
+    { Sid: "UploadAdmissionReadsTombstonesDeletesUploads", Effect: "Allow" as const, Principal: principal, Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"], Resource: [inbox] },
+    { Sid: "UploadAdmissionPromotes", Effect: "Allow" as const, Principal: principal, Action: ["s3:GetObject", "s3:PutObject"], Resource: i.promotionObjects },
+    // Missing keys must answer 404 (create-only reads, the status object), as for the srv-writer: key names only.
+    { Sid: "UploadAdmissionListsForMissingKeys", Effect: "Allow" as const, Principal: principal, Action: ["s3:ListBucket"], Resource: [i.bucketArn] },
+    {
+      Sid: "UploadAdmissionNoHistoryNoAdmin",
+      Effect: "Deny" as const,
+      Principal: "*",
+      Action: [
+        "s3:DeleteObjectVersion", "s3:GetObjectVersion", "s3:ListBucketVersions",
+        "s3:PutBucketPolicy", "s3:DeleteBucketPolicy", "s3:PutLifecycleConfiguration", "s3:PutEncryptionConfiguration",
+        "s3:PutBucketVersioning", "s3:PutObjectAcl", "s3:PutBucketAcl", "s3:DeleteBucket", "s3:PutBucketNotification",
+      ],
+      Resource: [i.bucketArn, `${i.bucketArn}/*`],
+      Condition: { ArnEquals: { "aws:PrincipalArn": i.consumerRoleArn } },
+    },
+  ];
 }
 
-/**
- * The upload-admission consumer: take the inbox notification, read the upload, promote it
- * through the srv-writer layout (`promotionObjects`, the same grant the srv-writer holds:
- * `.admission-inbox` and the `m=srv_*` tenant layout), tombstone and delete the upload.
- * Deletes only inbox objects; never old versions, never the bucket.
- */
-export function uploadAdmissionPolicy(i: { bucketArn: string; accountId: string; region: string; keyAlias: string; queueArn: string; functionName: string; promotionObjects: string[] }) {
-  const inbox = uploadInboxObjects(i.bucketArn);
-  const sseKms = {
-    StringEquals: { "s3:x-amz-server-side-encryption": "aws:kms" },
-    StringLike: { "s3:x-amz-server-side-encryption-aws-kms-key-id": keyArnPattern(i.region, i.accountId) },
-  };
+/** Only the consumer's role reads its secret. */
+export function uploadAdmissionSecretPolicy(i: { roleArn: string }) {
   return {
     Version: "2012-10-17" as const,
-    Statement: [
-      {
-        Sid: "ConsumeUploadAdmissionQueue",
-        Effect: "Allow" as const,
-        Action: ["sqs:ReceiveMessage", "sqs:DeleteMessage", "sqs:ChangeMessageVisibility", "sqs:GetQueueAttributes"],
-        Resource: [i.queueArn],
-      },
-      { Sid: "ReadAndDeleteUploads", Effect: "Allow" as const, Action: ["s3:GetObject", "s3:DeleteObject"], Resource: [inbox] },
-      { Sid: "TombstoneUploadsSseKmsOnly", Effect: "Allow" as const, Action: ["s3:PutObject"], Resource: [inbox], Condition: sseKms },
-      { Sid: "ReadPromotionObjects", Effect: "Allow" as const, Action: ["s3:GetObject"], Resource: i.promotionObjects },
-      { Sid: "WritePromotionObjectsSseKmsOnly", Effect: "Allow" as const, Action: ["s3:PutObject"], Resource: i.promotionObjects, Condition: sseKms },
-      {
-        Sid: "UseTranscriptKeyViaS3",
-        Effect: "Allow" as const,
-        Action: ["kms:GenerateDataKey", "kms:Decrypt"],
-        Resource: [keyArnPattern(i.region, i.accountId)],
-        Condition: {
-          StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com` },
-          "ForAnyValue:StringEquals": { "kms:ResourceAliases": i.keyAlias },
-        },
-      },
-      // Missing keys must answer 404 (create-only reads), as for the srv-writer: key names only.
-      { Sid: "ListForMissingKeySemantics", Effect: "Allow" as const, Action: ["s3:ListBucket"], Resource: [i.bucketArn] },
-      {
-        Sid: "OwnLogs",
-        Effect: "Allow" as const,
-        Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
-        Resource: [`arn:aws:logs:${i.region}:${i.accountId}:log-group:/aws/lambda/${i.functionName}`, `arn:aws:logs:${i.region}:${i.accountId}:log-group:/aws/lambda/${i.functionName}:*`],
-      },
-      { Sid: "DeleteOnlyUploads", Effect: "Deny" as const, Action: ["s3:DeleteObject"], NotResource: [inbox] },
-      {
-        Sid: "NoHistoryNoAdmin",
-        Effect: "Deny" as const,
-        Action: [
-          "s3:DeleteObjectVersion", "s3:GetObjectVersion", "s3:ListBucketVersions",
-          "s3:PutBucketPolicy", "s3:DeleteBucketPolicy", "s3:PutLifecycleConfiguration", "s3:PutEncryptionConfiguration",
-          "s3:PutBucketVersioning", "s3:PutObjectAcl", "s3:PutBucketAcl", "s3:DeleteBucket", "s3:PutBucketNotification",
-        ],
-        Resource: [i.bucketArn, `${i.bucketArn}/*`],
-      },
-    ],
+    Statement: [{ Sid: "UploadAdmissionReads", Effect: "Allow" as const, Principal: { AWS: i.roleArn }, Action: "secretsmanager:GetSecretValue", Resource: "*" }],
   };
 }
 
@@ -332,5 +319,100 @@ export function uploadInboxQueueConfiguration(queueArn: string) {
     QueueArn: queueArn,
     Events: ["s3:ObjectCreated:*"],
     Filter: { Key: { FilterRules: [{ Name: "prefix", Value: UPLOAD_INBOX_PREFIX }, { Name: "suffix", Value: UPLOAD_INBOX_NOTIFICATION_SUFFIX }] } },
+  };
+}
+
+/**
+ * `transcriptStore.uploadAdmission`: the consumer Lambda's runtime settings. Required when
+ * historyUploadDirectInfra is on; inert (but still validated) otherwise.
+ *
+ *   direct              HISTORY_UPLOAD_DIRECT on the consumer: "off" | "allowlist" | "on". Required, never
+ *                       defaulted. "off": every record fails without reading storage (redrives, then the DLQ).
+ *   allowlist           allowlist only (and required then): `org:<id>` / `ws:<id>` entries
+ *                       (HISTORY_UPLOAD_DIRECT_ALLOWLIST). It must match the issuer's allowlist: a tenant the
+ *                       consumer excludes waits (retry, then the DLQ), never refuses.
+ *   cloudflareAccountId the Cloudflare account that owns the ingest Worker's admission queue (32 hex).
+ *   admissionQueueId    the id (32 hex, not the name) of `96bulls-session-ingest-admission` in that account.
+ *
+ * Not inputs: UPLOAD_WITNESS_KEY and the Cloudflare Queues token live in the `upload-admission-secret`
+ * container, set out of band (never in env, state or source).
+ */
+export interface UploadAdmissionInputs {
+  direct: "off" | "allowlist" | "on";
+  allowlist?: string[];
+  cloudflareAccountId: string;
+  admissionQueueId: string;
+}
+
+const ALLOWLIST_ENTRY = /^(org|ws):(?!\.)[A-Za-z0-9._-]{1,128}$/;
+const HEX32 = /^[0-9a-f]{32}$/;
+
+export function assertUploadAdmissionInputs(value: unknown, required: boolean, refuse: (why: string) => never): asserts value is UploadAdmissionInputs | undefined {
+  if (value === undefined) {
+    if (required) refuse("transcriptStore.uploadAdmission is required (direct, cloudflareAccountId, admissionQueueId)");
+    return;
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return refuse("transcriptStore.uploadAdmission must be an object");
+  const v = value as Record<string, unknown>;
+  for (const k of Object.keys(v))
+    if (k !== "direct" && k !== "allowlist" && k !== "cloudflareAccountId" && k !== "admissionQueueId") refuse(`transcriptStore.uploadAdmission.${k} is not a known setting`);
+  if (v.direct !== "off" && v.direct !== "allowlist" && v.direct !== "on") refuse('transcriptStore.uploadAdmission.direct must be "off", "allowlist" or "on"');
+  if (v.direct === "allowlist") {
+    if (!Array.isArray(v.allowlist) || v.allowlist.length === 0 || v.allowlist.length > 100 || !v.allowlist.every((e) => typeof e === "string" && ALLOWLIST_ENTRY.test(e)) || new Set(v.allowlist).size !== v.allowlist.length)
+      refuse("transcriptStore.uploadAdmission.allowlist must be 1-100 distinct org:<id> / ws:<id> entries with direct \"allowlist\"");
+  } else if (v.allowlist !== undefined) refuse('transcriptStore.uploadAdmission.allowlist is only for direct "allowlist"');
+  if (typeof v.cloudflareAccountId !== "string" || !HEX32.test(v.cloudflareAccountId)) refuse("transcriptStore.uploadAdmission.cloudflareAccountId must be a 32-hex Cloudflare account id");
+  if (typeof v.admissionQueueId !== "string" || !HEX32.test(v.admissionQueueId)) refuse("transcriptStore.uploadAdmission.admissionQueueId must be the 32-hex Cloudflare queue id");
+}
+
+/**
+ * The consumer's environment: settings and ids only (src/session-ingest/upload-admission-hosted.ts reads them).
+ * HISTORY_UPLOAD_INBOX_SSE comes from uploadAdmissionEnvironment (always aws:kms on hosted).
+ */
+export function uploadAdmissionFunctionEnv(i: { stage: string; bucket: string; names: UploadInboxNames; p: UploadAdmissionInputs; sse: typeof HOSTED_UPLOAD_INBOX_SSE }) {
+  return {
+    DEPLOYMENT: i.stage,
+    HISTORY_UPLOAD_DIRECT: i.p.direct,
+    ...(i.p.direct === "allowlist" ? { HISTORY_UPLOAD_DIRECT_ALLOWLIST: i.p.allowlist!.join(",") } : {}),
+    ...uploadAdmissionEnvironment(i.sse),
+    UPLOAD_ADMISSION_BUCKET: i.bucket,
+    UPLOAD_ADMISSION_SECRET_ID: i.names.secret,
+    UPLOAD_ADMISSION_CF_ACCOUNT_ID: i.p.cloudflareAccountId,
+    UPLOAD_ADMISSION_CF_QUEUE_ID: i.p.admissionQueueId,
+    INGEST_KEY_ROOT: TENANT_KEY_BASE,
+    INGEST_ACCEPTANCE_MODE: "buffered",
+    NODE_OPTIONS: "--enable-source-maps",
+  };
+}
+
+/** The consumer function: SQS-driven only (no Function URL, no other invoker), reserved concurrency 4. */
+export function uploadAdmissionFunctionProps(i: { stage: string; bucket: string; names: UploadInboxNames; p: UploadAdmissionInputs; sse: typeof HOSTED_UPLOAD_INBOX_SSE }) {
+  return {
+    functionName: i.names.function,
+    main: "src/session-ingest/upload-admission-lambda.ts",
+    handler: "handler",
+    runtime: "nodejs24.x",
+    architecture: "arm64",
+    memorySize: UPLOAD_ADMISSION_MEMORY_MB,
+    timeout: `${UPLOAD_ADMISSION_FUNCTION_TIMEOUT_SECONDS} seconds`,
+    reservedConcurrentExecutions: UPLOAD_ADMISSION_RESERVED_CONCURRENCY,
+    env: uploadAdmissionFunctionEnv(i),
+    logging: { retention: "30 days" },
+    functionUrl: false as const,
+    build: { tsconfig: "tsconfig.json" },
+  };
+}
+
+/** SQS -> the consumer: one message per invocation, partial-batch failures reported per record. */
+export function uploadAdmissionMappingProps(i: { functionName: string; queueArn: string; tags: Record<string, string> }) {
+  return {
+    functionName: i.functionName,
+    eventSourceArn: i.queueArn,
+    batchSize: 1,
+    functionResponseTypes: ["ReportBatchItemFailures"],
+    // The function's reserved concurrency (4) already caps it; the mapping never asks for more.
+    scalingConfig: { MaximumConcurrency: UPLOAD_ADMISSION_RESERVED_CONCURRENCY },
+    enabled: true,
+    tags: i.tags,
   };
 }
