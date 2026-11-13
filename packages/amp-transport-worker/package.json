@@ -2,7 +2,7 @@
   "name": "@96bulls/amp-transport-worker",
   "version": "0.0.0",
   "private": true,
-  "license": "Apache-2.0",
+  "license": "FSL-1.1-ALv2",
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
