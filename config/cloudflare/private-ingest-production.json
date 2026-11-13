@@ -2,7 +2,7 @@
   "sessionIngest": {
     "acceptanceMode": "buffered",
     "accountId": "f7232cb80f6fab86a95426302af243e4",
-    "expectedGeneration": "7db65adb97f034a7b4cc2c85c87da2ebadf969f6bb74096f33ae00ad83e500a4",
+    "expectedGeneration": "52a3f2f05d3dfa2342d3828c6b14eeeb61f1e47e5b97cddffb91dd0cfee04c0f",
     "hyperdriveId": "0fcc0265e96f43a39976b5aa4263f4a6",
     "secretsStoreId": "59e0dcc52f0a4bd7863730548299fb2f",
     "maxPerUser": 4,
@@ -10,7 +10,6 @@
     "inlineMaxSessions": 0,
     "replicaMode": "off",
     "claimLockBusy": "on",
-    "asyncAdmission": "drain",
-    "overlapGeneration": "52a3f2f05d3dfa2342d3828c6b14eeeb61f1e47e5b97cddffb91dd0cfee04c0f"
+    "asyncAdmission": "drain"
   }
 }

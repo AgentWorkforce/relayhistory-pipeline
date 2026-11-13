@@ -12,16 +12,16 @@ import {
   type PrivateIngestReleasePhase,
   type CloudflareWorkerVersion,
 } from "../../../src/session-ingest/private-ingest-release.ts";
-import { privateIngestGithubGate, trackedOverlapGeneration } from "../../../scripts/private-ingest-release-github.ts";
+import { privateIngestGithubGate } from "../../../scripts/private-ingest-release-github.ts";
 
 const sha = "a".repeat(40), planRun = "90";
 const kmsKeyArn = "arn:aws:kms:us-east-1:000000000000:key/00000000-0000-0000-0000-000000000000";
 
-test("tracked production config is baseline drain with the reviewed G+H overlap; only the rollout phases and baseline rollback are representable", () => {
+test("tracked production config is H-only baseline drain; only the rollout phases and baseline rollback are representable", () => {
   const tracked = JSON.parse(readFileSync("config/cloudflare/private-ingest-production.json", "utf8"));
   // Post-apply generation recovery (2026-11-13): the live baseline-drain phase is held while the
-  // Worker starts accepting exactly {G, H}. Custody promotion remains a separate reviewed transition.
-  const expected = privateIngestProfileForPhase("baseline-drain-overlap", kmsKeyArn);
+  // Worker returns from temporary {G, H} acceptance to exactly H.
+  const expected = privateIngestProfileForPhase("baseline-drain", kmsKeyArn);
   const { kmsKeyArn: _target, ...expectedTracked } = expected.sessionIngest;
   expect(tracked).toEqual({ sessionIngest: expectedTracked });
   for (const phase of ["baseline-drain", "step-0-shadow", "step-1-custody", "step-2-frozen-receipt", "step-4-async-on"] as const)
@@ -237,8 +237,7 @@ const githubBase = {
   PRIVATE_INGEST_RELEASE_MODE: "deploy",
   PRIVATE_INGEST_RELEASE_SHA: sha,
   PRIVATE_INGEST_RELEASE_PLAN_RUN: planRun,
-  // The tracked profile declares an overlap, so the gate's typed confirmation ends in OVERLAP <H>.
-  PRIVATE_INGEST_RELEASE_CONFIRMATION: `DEPLOY ${P.worker} ${sha} PLAN ${planRun} OVERLAP ${trackedOverlapGeneration()}`,
+  PRIVATE_INGEST_RELEASE_CONFIRMATION: `DEPLOY ${P.worker} ${sha} PLAN ${planRun}`,
   GITHUB_REPOSITORY: P.repository,
   GITHUB_REPOSITORY_ID: P.repositoryId,
   GITHUB_EVENT_NAME: "workflow_dispatch",

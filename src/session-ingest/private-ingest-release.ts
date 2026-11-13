@@ -105,7 +105,7 @@ export function privateIngestReleaseInputs(env: Record<string, string | undefine
 const COMMON_PROFILE = {
   acceptanceMode: "buffered",
   accountId: PRIVATE_INGEST_RELEASE.accountId,
-  expectedGeneration: "7db65adb97f034a7b4cc2c85c87da2ebadf969f6bb74096f33ae00ad83e500a4",
+  expectedGeneration: "52a3f2f05d3dfa2342d3828c6b14eeeb61f1e47e5b97cddffb91dd0cfee04c0f",
   hyperdriveId: "0fcc0265e96f43a39976b5aa4263f4a6",
   secretsStoreId: "59e0dcc52f0a4bd7863730548299fb2f",
   maxPerUser: 4,
@@ -133,11 +133,12 @@ const COMMON_PROFILE = {
  * Post-apply recovery (2026-11-13, docs/design/zero-503-schema-windows.md section 3.2): readiness is
  * already PASS at H = 52a3f2f0... (guarded apply run 43471961540 at 1b2f5bca, release target
  * upstream:20261105047000 at eac3e98b) while the Worker, the lazy policy and the admission rows are
- * still at G = 7db65adb... and no window was opened, so buffered uploads fail closed. Step (1) of the
- * lifecycle with expectedGeneration still G: deploy G+H at the unchanged rollout phase, then the
- * guarded CI rebind (ingest-generation-overlap.yml rebind-dry-run, rebind) moves the policy and rows
- * to H with no window open; the G+H Worker's retry at H is admitted from that commit on. Then
- * steps (2) and (3) as above, each its own reviewed commit.
+ * still at G = 7db65adb... and no window was opened, so buffered uploads failed closed. The guarded
+ * recovery deployed G+H at the unchanged rollout phase, then rebind run 43485447067 moved the policy
+ * and all 1043 admission rows to H; readback run 43485770890 proved marker, policy and admissions at H.
+ * This is lifecycle step (2): deploy H-only at the same baseline phase while retaining the reviewed
+ * pair solely to authorize the G+H -> H transition. Step (3) removes the pair in a later reviewed
+ * source change after the live Worker reads back exactly H.
  */
 export const PRIVATE_INGEST_OVERLAP: PrivateIngestOverlap | null = {
   from: "7db65adb97f034a7b4cc2c85c87da2ebadf969f6bb74096f33ae00ad83e500a4",
