@@ -4,8 +4,8 @@
  *
  *   stdin (one JSON line, piped from 1Password, never written to disk):
  *     {"dbUrl": "postgresql://user:password@host:port/db?sslmode=verify-full"}
- *     A read-only login is recommended; the job also opens a READ ONLY transaction, checks
- *     SHOW transaction_read_only, sets default_transaction_read_only=on, and always rolls back.
+ *     A read-only login is recommended; every page is its own short READ ONLY transaction (checked with
+ *     SHOW transaction_read_only, always rolled back), and the session sets default_transaction_read_only=on.
  *   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY [/ AWS_SESSION_TOKEN] from the environment only.
  *
  *   bun run scripts/accepted-stage-export.ts --dry-run  --bucket <name> [--region us-east-1] [--org <org> ...]
@@ -13,8 +13,11 @@
  *   bun run scripts/accepted-stage-export.ts --execute  --bucket <name> --kms-key-arn <arn> [same flags]
  *
  * Exactly one of --dry-run / --execute is required. --dry-run reads SQL and the existing sidecars and writes
- * nothing (refused in code as well). --execute writes create-only `<stage>.accepted.json` sidecars and the
- * per-org completion objects the drain requires, and needs the owner's explicit OK. Rerunning converges.
+ * nothing (refused in code as well). --execute writes each candidate stage's `<stage>.accepted.json` sidecar (v2:
+ * SQL's own liveness verdict, the lines SQL keeps, and the user's S3 fence as seen; replaced by CAS when a rerun's
+ * verdict differs) and the create-only per-org completion objects the drain requires, under a fenced lease
+ * (96bulls/.drain/export-lock.json, one export at a time). It runs AFTER the fence backfill, and again right before
+ * the drain. It needs the owner's explicit OK. Rerunning converges.
  *
  * Output: one JSON line of counts only (never a key, tenant id, hash or URL).
  */

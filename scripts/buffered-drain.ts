@@ -44,7 +44,7 @@ import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
 import { signRequest, type AwsCredentials } from "../packages/object-store/src/sigv4.ts";
 import { xmlElements, xmlText } from "../packages/object-store/src/xml.ts";
 import { BUFFER_STAGE_MAX_BYTES } from "../src/session-ingest/staging.ts";
-import { MAX_DRAIN_CONCURRENCY, drainBufferedBatches, parseStagedKey, type DrainSummary } from "../src/session-ingest/buffered-drain.ts";
+import { ACCEPTED_SUFFIX, DRAINED_SUFFIX, MAX_DRAIN_CONCURRENCY, drainBufferedBatches, parseStagedKey, type DrainSummary } from "../src/session-ingest/buffered-drain.ts";
 
 export const KEY_ROOT = "96bulls";
 const REGION = /^[a-z]{2}(-[a-z]+)+-\d$/;
@@ -119,8 +119,10 @@ export function parseDrainArgs(argv: string[]): DrainArgs {
   };
 }
 
-function validResumeKey(key: string): boolean {
-  const staged = key.endsWith(".drained.json") ? key.slice(0, -".drained.json".length) : key;
+/** A checkpoint is a group's last listed key: a stage, or its `.drained.json` / `.accepted.json` sidecar. */
+export function validResumeKey(key: string): boolean {
+  const suffix = [DRAINED_SUFFIX, ACCEPTED_SUFFIX].find((x) => key.endsWith(x));
+  const staged = suffix ? key.slice(0, -suffix.length) : key;
   const parts = parseStagedKey(staged);
   return parts !== null && parts.keyRoot === KEY_ROOT;
 }
@@ -153,6 +155,41 @@ export async function discoverOrgs(args: { bucket: string; region: string; crede
 const progressLine = (s: DrainSummary) =>
   JSON.stringify({ progress: true, listed: s.listed, ...Object.fromEntries(Object.entries(s.objects).filter(([, n]) => n > 0)), lines_written: s.lines.written });
 
+/**
+ * Everything the CLI does after building its store: the checkpoint (read, validated, resumed from, rewritten
+ * atomically after every group), the drain and its progress. The process entry below only builds the S3 store.
+ */
+export async function runDrain(args: DrainArgs, deps: { store: ObjectStore; orgs: () => Promise<string[]>; stderr?: (line: string) => void }): Promise<DrainSummary> {
+  let startAfter = args.startAfter;
+  if (args.checkpointFile && existsSync(args.checkpointFile)) {
+    const saved = readFileSync(args.checkpointFile, "utf8").trim();
+    if (!validResumeKey(saved)) throw new Error("checkpoint_invalid");
+    startAfter = saved;
+  }
+  const orgs = args.orgs.length ? args.orgs : await deps.orgs();
+  let lastProgress = 0;
+  return drainBufferedBatches({
+    store: deps.store, keyRoot: KEY_ROOT, orgs, dryRun: args.mode === "dry_run", concurrency: args.concurrency,
+    ...(args.assumeEmptyFence ? { assumeEmptyFence: true } : {}),
+    ...(args.resetMarginMs !== undefined ? { resetMarginMs: args.resetMarginMs } : {}),
+    decompress: (bytes) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: BUFFER_STAGE_MAX_BYTES })),
+    ...(args.maxObjects !== undefined ? { maxObjects: args.maxObjects } : {}),
+    ...(startAfter !== undefined ? { startAfter } : {}),
+    ...(args.checkpointFile ? {
+      onCheckpoint: (key: string) => {
+        const tmp = `${args.checkpointFile}.tmp`;
+        writeFileSync(tmp, key + "\n", { mode: 0o600 });
+        renameSync(tmp, args.checkpointFile!);
+      },
+    } : {}),
+    onProgress: (s) => {
+      if (Date.now() - lastProgress < 30_000) return;
+      lastProgress = Date.now();
+      (deps.stderr ?? ((l) => process.stderr.write(l)))(progressLine(s) + "\n");
+    },
+  });
+}
+
 if (import.meta.main) {
   let args: DrainArgs;
   try {
@@ -168,37 +205,11 @@ if (import.meta.main) {
   }
   const credentials: AwsCredentials = { accessKeyId, secretAccessKey, ...(process.env.AWS_SESSION_TOKEN ? { sessionToken: process.env.AWS_SESSION_TOKEN } : {}) };
   try {
-    let startAfter = args.startAfter;
-    if (args.checkpointFile && existsSync(args.checkpointFile)) {
-      const saved = readFileSync(args.checkpointFile, "utf8").trim();
-      if (!validResumeKey(saved)) throw new Error("checkpoint_invalid");
-      startAfter = saved;
-    }
     const store = createS3Store({
       bucket: args.bucket, region: args.region, credentials,
       ...(args.mode === "execute" ? { serverSideEncryption: "aws:kms" as const, sseKmsKeyId: args.kmsKeyArn! } : {}),
     }) as unknown as ObjectStore;
-    const orgs = args.orgs.length ? args.orgs : await discoverOrgs({ bucket: args.bucket, region: args.region, credentials });
-    let lastProgress = 0;
-    const summary = await drainBufferedBatches({
-      store, keyRoot: KEY_ROOT, orgs, dryRun: args.mode === "dry_run", concurrency: args.concurrency,
-      ...(args.assumeEmptyFence ? { assumeEmptyFence: true } : {}),
-      ...(args.resetMarginMs !== undefined ? { resetMarginMs: args.resetMarginMs } : {}),      decompress: (bytes) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: BUFFER_STAGE_MAX_BYTES })),
-      ...(args.maxObjects !== undefined ? { maxObjects: args.maxObjects } : {}),
-      ...(startAfter !== undefined ? { startAfter } : {}),
-      ...(args.checkpointFile ? {
-        onCheckpoint: (key: string) => {
-          const tmp = `${args.checkpointFile}.tmp`;
-          writeFileSync(tmp, key + "\n", { mode: 0o600 });
-          renameSync(tmp, args.checkpointFile!);
-        },
-      } : {}),
-      onProgress: (s) => {
-        if (Date.now() - lastProgress < 30_000) return;
-        lastProgress = Date.now();
-        process.stderr.write(progressLine(s) + "\n");
-      },
-    });
+    const summary = await runDrain(args, { store, orgs: () => discoverOrgs({ bucket: args.bucket, region: args.region, credentials }) });
     process.stdout.write(JSON.stringify(summary) + "\n");
   } catch (error) {
     // A closed reason only: an S3 error message can carry a key.

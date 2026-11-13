@@ -7,7 +7,11 @@
  *
  * Per staged object, in key order, with bounded concurrency:
  *
- *   0. 0005 step 0b: write ONLY stages SQL acknowledged. Without the org's accepted-stage completion object
+ *   0. 0005 step 0b: write ONLY stages SQL would publish, and only the lines it keeps: the sidecar (v2) carries SQL's
+ *      own verdict (accepted-stage-export.ts): not live is `stage_not_live`; lines SQL does not keep are dropped
+ *      (`not_kept`); and the user's S3 fence must be exactly as the export saw it (same instance, resets,
+ *      resetsCompleted, kept-session epochs), else `fence_moved_since_export` (re-export first). The clock-based
+ *      reset margin below stays as an extra guard. Write ONLY stages SQL acknowledged. Without the org's accepted-stage completion object
  *      every stage of it is `stage_export_missing`; a stage without its `<staged key>.accepted.json` sidecar
  *      is `stage_unacknowledged` (e.g. the consent gate refused it after the PUT, before the ACK); a sidecar
  *      whose sha256 is not the object's is `accepted_mismatch`. None of them is read further or written.
@@ -98,13 +102,38 @@ export const DRAINED_SUFFIX = ".drained.json";
  */
 export const ACCEPTED_SUFFIX = ".accepted.json";
 export const acceptedCompleteKey = (keyRoot: string, orgId: string) => `${keyRoot}/.drain/accepted-stages/v1/${orgId}.complete.json`;
-export interface AcceptedMarker { v: 1; kind: "buffered-accepted"; stage_sha256: string }
+/**
+ * The export's verdict for one stage (v2, accepted-stage-export.ts): SQL's own liveness test, the lines SQL keeps
+ * (per object group, the kept line indexes), and the user's S3 fence as the export saw it.
+ */
+export interface AcceptedMarker {
+  v: 2;
+  kind: "buffered-accepted";
+  stage_sha256: string;
+  live: boolean;
+  kept: number[][];
+  fence: { instance: string; resets: number; resetsCompleted: number; epochs: Record<string, number> } | null;
+}
 export interface AcceptedComplete { v: 1; kind: "buffered-accepted-complete"; stages: number; completedAtMs: number }
 export function parseAcceptedMarker(text: string): AcceptedMarker | null {
   try {
     const v = JSON.parse(text) as Record<string, unknown>;
-    return isObject(v) && v.v === 1 && v.kind === "buffered-accepted" && typeof v.stage_sha256 === "string" && HEX64.test(v.stage_sha256) && Object.keys(v).length === 3
-      ? (v as unknown as AcceptedMarker) : null;
+    if (!isObject(v) || v.v !== 2 || v.kind !== "buffered-accepted" || typeof v.stage_sha256 !== "string" || !HEX64.test(v.stage_sha256) ||
+        typeof v.live !== "boolean" || !Array.isArray(v.kept) || Object.keys(v).length !== 6) return null;
+    for (const g of v.kept as unknown[]) {
+      if (!Array.isArray(g)) return null;
+      let prev = -1;
+      for (const j of g) {
+        if (!Number.isInteger(j) || (j as number) <= prev) return null;
+        prev = j as number;
+      }
+    }
+    const f = v.fence;
+    if (f !== null) {
+      if (!isObject(f) || typeof f.instance !== "string" || !Number.isSafeInteger(f.resets) || !Number.isSafeInteger(f.resetsCompleted) || !isObject(f.epochs) ||
+          !Object.values(f.epochs).every((n) => Number.isSafeInteger(n) && (n as number) >= 0)) return null;
+    }
+    return v as unknown as AcceptedMarker;
   } catch {
     return null;
   }
@@ -284,13 +313,15 @@ export type ObjectOutcome =
   | "stage_unacknowledged"
   | "stage_export_missing"
   | "accepted_mismatch"
+  | "stage_not_live"
+  | "fence_moved_since_export"
   | "marker_failed"
   | "internal_error";
 
 const OUTCOMES: ObjectOutcome[] = [
   "drained", "would_drain", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch",
   "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "control_pending", "fence_authority_missing", "fence_authority_invalid", "user_hold", "user_stopped", "lock_lost", "index_unreadable", "write_failed",
-  "index_merge_failed", "fence_recheck_failed", "fence_moved", "stage_unacknowledged", "stage_export_missing", "accepted_mismatch", "marker_failed", "internal_error",
+  "index_merge_failed", "fence_recheck_failed", "fence_moved", "stage_unacknowledged", "stage_export_missing", "accepted_mismatch", "stage_not_live", "fence_moved_since_export", "marker_failed", "internal_error",
 ];
 
 export interface DrainSummary {
@@ -310,6 +341,8 @@ export interface DrainSummary {
     stale: number;
     already_stored: number;
     revision_conflict: number;
+    /** Lines SQL does not keep (the export's verdict: GC-dropped, not body-accepted, or not live). */
+    not_kept: number;
   };
   /** Session groups written (execute) or that would be (dry run). */
   sessions_written: number;
@@ -329,7 +362,7 @@ function emptySummary(mode: DrainSummary["mode"]): DrainSummary {
   return {
     mode, orgs: 0, listed: 0, foreign_keys: 0,
     objects: Object.fromEntries(OUTCOMES.map((o) => [o, 0])) as Record<ObjectOutcome, number>,
-    lines: { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0 },
+    lines: { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0, not_kept: 0 },
     sessions_written: 0, rearmed: 0, hold_failures: 0, orgs_without_authority: 0, fence_assumed_empty: 0, write_failures: {}, stopped: "complete",
   };
 }
@@ -870,27 +903,39 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
         summary.objects.ambiguous_replacement++;
         continue;
       }
-      // The sidecar must name these exact bytes (the export copied SQL's stage_sha256).
+      // The sidecar must name these exact bytes (the export copied SQL's stage_sha256), carry SQL's verdict that the
+      // stage is live, and keep lines that exist in this object.
+      let marker: AcceptedMarker;
       try {
-        const got = await readText(store, key + ACCEPTED_SUFFIX, 64 * 1024);
-        const marker = got ? parseAcceptedMarker(got.text) : null;
-        if (!marker || marker.stage_sha256 !== read.decoded.sha256) {
+        const got = await readText(store, key + ACCEPTED_SUFFIX, 1024 * 1024);
+        const parsed = got ? parseAcceptedMarker(got.text) : null;
+        if (!parsed || parsed.stage_sha256 !== read.decoded.sha256) {
           summary.objects.accepted_mismatch++;
           continue;
         }
+        if (!parsed.live) {
+          summary.objects.stage_not_live++;
+          continue;
+        }
+        const groups = read.decoded.groups;
+        if (parsed.kept.length !== groups.length || parsed.kept.some((ls, g) => ls.some((j) => j >= groups[g]!.lines.length))) {
+          summary.objects.accepted_mismatch++;
+          continue;
+        }
+        marker = parsed;
       } catch {
         summary.objects.internal_error++;
         continue;
       }
       try {
-        summary.objects[await drainOne(key, read.decoded)]++;
+        summary.objects[await drainOne(key, read.decoded, marker)]++;
       } catch {
         summary.objects.internal_error++;
       }
     }
   }
 
-  async function drainOne(key: string, { header, groups, sha256 }: Decoded): Promise<ObjectOutcome> {
+  async function drainOne(key: string, { header, groups, sha256 }: Decoded, verdict: AcceptedMarker): Promise<ObjectOutcome> {
     const tenant: LedgerTenant = { orgId: header.org_id, workspaceId: header.workspace_id, userId: header.user_id };
     const origin = header.origin_id;
     const receivedMs = Date.parse(header.received_at);
@@ -921,7 +966,28 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       return "journal_unreadable";
     }
     if (journal && (journal.pending > 0 || journal.ambiguous > 0)) return "privacy_control_open";
-    const counts = { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0 };
+    const counts = { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0, not_kept: 0 };
+    // The fence must be exactly as the export saw it when it took SQL's verdict (finding 1): the same fence object, no
+    // reset begun or finished since, and every kept session at the same epoch. Anything else needs a fresh export.
+    const vf = verdict.fence;
+    // The export saw no fence: a fence since then means a fresh export (only the dry run's assume-empty view gets past).
+    if (vf === null ? read.state === "present" : fence.instance !== vf.instance || fence.resets !== vf.resets || fence.resetsCompleted !== vf.resetsCompleted)
+      return "fence_moved_since_export";
+    // Only the lines SQL keeps (finding 2); kept sessions must all be at the export's epoch.
+    groups = groups.map((g, gi) => {
+      const keep = new Set(verdict.kept[gi]);
+      const lines: string[] = [], meta: LineMeta[] = [];
+      g.lines.forEach((l, j) => {
+        if (keep.has(j)) { lines.push(l); meta.push(g.meta![j]!); }
+        else counts.not_kept++;
+      });
+      return { ...g, lines, meta };
+    }).filter((g) => g.lines.length > 0);
+    if (vf) for (const g of groups) for (const m of g.meta!) {
+      if (m[3] === null) continue;
+      const sk = sessionKeyHash(m[2], m[3]);
+      if (!Object.hasOwn(vf.epochs, sk) || vf.epochs[sk] !== fenceEpoch(fence, origin, sk)) return "fence_moved_since_export";
+    }
     // ledger-s3 resetsCompleted: a reset begun but not finished is still applying its tombstones (a claim
     // finishes it). Writing now could republish a session it is about to tombstone: skip, unmarked.
     // As admission's claim (ledger-s3 hasPendingReset): an ordered reset SQL has not decided yet refuses the user.

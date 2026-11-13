@@ -17,10 +17,12 @@ import {
   type DrainLedger,
   type DrainOptions,
 } from "../buffered-drain.ts";
-import { parseDrainArgs } from "../../../scripts/buffered-drain.ts";
+import { parseDrainArgs, runDrain, validResumeKey } from "../../../scripts/buffered-drain.ts";
+import { mkdtempSync, readFileSync as readFileSyncFs, rmSync } from "node:fs";
+import { join } from "node:path";
 import { scratchStore } from "./support.ts";
 import { journalKey as journalKeyFor } from "../async-admission.ts";
-import { applyFenceChange, fenceAuthorityKey, orgFenceAuthorityKey, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceChange, type IndexEntryInput } from "../ledger-s3.ts";
+import { applyFenceChange, fenceAuthorityKey, fenceEpoch, orgFenceAuthorityKey, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceChange, type IndexEntryInput } from "../ledger-s3.ts";
 import type { OrderedControlInput } from "../ledger.ts";
 
 const ROOT = "96bulls";
@@ -42,16 +44,37 @@ function group(source: string, sessionId: string, recs: Rec[]): Group {
   };
 }
 
-/** The accepted-stage export's sidecar (0005 step 0b): SQL acknowledged this stage, with these bytes. */
-const accept = (store: ObjectStore, key: string, stageSha256: string) =>
-  store.put(objectKey(key + ACCEPTED_SUFFIX), enc.encode(JSON.stringify({ v: 1, kind: "buffered-accepted", stage_sha256: stageSha256 })));
+/**
+ * A stand-in for the accepted-stage export (v2 verdicts): the stages it would record, refreshed into sidecars at the
+ * start of every run() (as an export just before the drain), with a snapshot of the user's CURRENT S3 fence.
+ * `live` / `keep` stand for SQL's verdict; a test that needs the snapshot to go stale passes { refresh: false }.
+ */
+type Verdict = { sha: string; lineCounts: number[]; sessions: [string, string][]; live: boolean; keep?: number[][] };
+const VERDICTS = new Map<string, Verdict>();
+const accept = (key: string, v: Verdict) => { VERDICTS.set(key, v); };
+async function refreshVerdicts(store: ObjectStore) {
+  // An unreadable fence gives no fence view (the drain refuses it before the verdict matters).
+  const read = await s3LedgerObjects(store, ROOT).readFence(s3LedgerKeys(ROOT, TENANT).fence).catch(() => ({ state: "absent" as const }));
+  for (const [key, v] of VERDICTS) {
+    const fence = read.state === "present" ? read.fence : null;
+    const marker = {
+      v: 2, kind: "buffered-accepted", stage_sha256: v.sha, live: v.live,
+      kept: v.live ? (v.keep ?? v.lineCounts.map((n) => [...Array(n).keys()])) : [],
+      fence: fence && {
+        instance: fence.instance, resets: fence.resets, resetsCompleted: fence.resetsCompleted,
+        epochs: Object.fromEntries(v.sessions.map(([so, id]) => [sessionKeyHash(so, id), fenceEpoch(fence, ORIGIN, sessionKeyHash(so, id))])),
+      },
+    };
+    await store.put(objectKey(key + ACCEPTED_SUFFIX), enc.encode(JSON.stringify(marker)));
+  }
+}
 /** A raw object at a staged key, accepted (so the drain reads and classifies it). */
 async function putStaged(store: ObjectStore, key: string, bytes: Uint8Array) {
   await store.put(objectKey(key), bytes);
-  await accept(store, key, sha(bytes));
+  accept(key, { sha: sha(bytes), lineCounts: [], sessions: [], live: true });
 }
 
-async function stage(store: ObjectStore, groups: Group[], over: { batch?: string; claim?: string; received?: string; accepted?: boolean } = {}): Promise<string> {
+async function stage(store: ObjectStore, groups: Group[], over: { batch?: string; claim?: string; received?: string; accepted?: boolean; live?: boolean; keep?: number[][] } = {}): Promise<string> {
   let ord = 0;
   const prepared = prepareBufferedStage(ROOT, {
     claim_token: over.claim ?? randomUUID(),
@@ -60,7 +83,10 @@ async function stage(store: ObjectStore, groups: Group[], over: { batch?: string
     org_id: TENANT.orgId, workspace_id: TENANT.workspaceId, origin_id: ORIGIN, user_id: TENANT.userId,
   }, groups, groups.map((g) => g.lines.map(() => ord++)));
   await putBufferedStage(store, prepared);
-  if (over.accepted !== false) await accept(store, prepared.spec.key, prepared.spec.sha256);
+  if (over.accepted !== false) accept(prepared.spec.key, {
+    sha: prepared.spec.sha256, lineCounts: groups.map((g) => g.lines.length), sessions: groups.map((g) => [g.source, g.sessionId] as [string, string]),
+    live: over.live ?? true, ...(over.keep ? { keep: over.keep } : {}),
+  });
   return prepared.spec.key;
 }
 
@@ -115,11 +141,13 @@ async function storedEntry(store: ObjectStore, recordId: string) {
   const doc = (await s3LedgerObjects(store, ROOT).readIndex(KEYS.revisions(ORIGIN, recordId)))?.doc;
   return doc && Object.hasOwn(doc.records, recordId) ? doc.records[recordId] : undefined;
 }
-const run = (store: ObjectStore, over: Partial<DrainOptions> = {}) =>
-  drainBufferedBatches({ store, keyRoot: ROOT, orgs: [TENANT.orgId], dryRun: false, decompress, sleep: async () => {}, ...over });
+async function run(store: ObjectStore, over: Partial<DrainOptions> = {}, o: { refresh?: boolean } = {}) {
+  if (o.refresh !== false) await refreshVerdicts(store);
+  return drainBufferedBatches({ store, keyRoot: ROOT, orgs: [TENANT.orgId], dryRun: false, decompress, sleep: async () => {}, ...over });
+}
 
 let cleanup: (() => void)[] = [];
-afterEach(() => { cleanup.forEach((c) => c()); cleanup = []; });
+afterEach(() => { cleanup.forEach((c) => c()); cleanup = []; VERDICTS.clear(); });
 /** A scratch store whose user has a backfilled, empty fence (0005 step 0), unless `fence: false`. */
 /** A valid fence-authority marker (main's OrgFenceAuthorityDoc / FenceAuthorityDoc): every precondition attested. */
 const AUTHORITY = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: 1 };
@@ -144,7 +172,7 @@ describe("buffered backlog drain (0005)", () => {
     const summary = await run(store);
     expect(summary.objects.drained).toBe(1);
     expect(summary.sessions_written).toBe(2);
-    expect(summary.lines).toEqual({ candidate: 3, written: 3, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0 });
+    expect(summary.lines).toEqual({ candidate: 3, written: 3, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0, not_kept: 0 });
     const lines = await canonical(store);
     expect(lines.get("sess-1")).toEqual(["r1@1", "r2@2"]);
     expect(lines.get("sess-2")).toEqual(["r3@1"]);
@@ -226,7 +254,7 @@ describe("buffered backlog drain (0005)", () => {
     await stage(store, [group("claude", "sess-1", [{ id: "conflict", rev: 3 }, { id: "stale", rev: 4 }, { id: "same", rev: 2 }, { id: "fresh", rev: 1 }])]);
     const summary = await run(store);
     expect(summary.objects.drained).toBe(1);
-    expect(summary.lines).toEqual({ candidate: 4, written: 1, fenced: 0, stale: 1, already_stored: 1, revision_conflict: 1 });
+    expect(summary.lines).toEqual({ candidate: 4, written: 1, fenced: 0, stale: 1, already_stored: 1, revision_conflict: 1, not_kept: 0 });
     expect((await canonical(store)).get("sess-1")).toEqual(["fresh@1"]);
     expect(await storedEntry(store, "conflict")).toEqual([3, "x", "f".repeat(64), SESS1, 0, 0]); // the stored digest is kept
     expect(await storedEntry(store, "fresh")).toEqual([1, "fresh:r1", sha("fresh:1"), SESS1, 0, 0]);
@@ -261,8 +289,9 @@ describe("buffered backlog drain (0005)", () => {
     await putFence(store, { deletions: [{ originId: ORIGIN, sessions: [["claude", "sess-2"]] }] });
     await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }]), group("claude", "sess-2", [{ id: "r2", rev: 1 }])]);
     await putStaged(store, `${ROOT}/${TENANT.orgId}/buffered-batches/v1/ws=ws-a/m=srv_${"0".repeat(32)}/b=${"1".repeat(32)}-${"2".repeat(16)}-${"3".repeat(32)}.staged.ndjson.zst`, enc.encode("not zstd"));
+    await refreshVerdicts(store); // the export ran; the dry run itself writes nothing
     const before = await allKeys(store);
-    const summary = await run(store, { dryRun: true });
+    const summary = await run(store, { dryRun: true }, { refresh: false });
     expect(summary.mode).toBe("dry_run");
     expect(summary.objects.would_drain).toBe(1);
     expect(summary.objects.corrupt).toBe(1);
@@ -412,7 +441,7 @@ describe("buffered backlog drain (0005)", () => {
     const ok = await stage(store, [group("claude", "sess-ok", [{ id: "a", rev: 1 }])]);
     const refused = await stage(store, [group("claude", "sess-refused", [{ id: "b", rev: 1 }])], { accepted: false });
     const wrong = await stage(store, [group("claude", "sess-wrong", [{ id: "c", rev: 1 }])], { accepted: false });
-    await accept(store, wrong, "0".repeat(64)); // a sidecar naming other bytes
+    accept(wrong, { sha: "0".repeat(64), lineCounts: [1], sessions: [["claude", "sess-wrong"]], live: true }); // a sidecar naming other bytes
     const reads: string[] = [];
     const watched = new Proxy(store, {
       get(target, prop) {
@@ -580,8 +609,9 @@ describe("buffered backlog drain (0005)", () => {
   test("--assume-empty-fence classifies an unbackfilled user in a dry run, and is refused with execute", async () => {
     const store = await scratch({ fence: false });
     await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    await refreshVerdicts(store);
     const before = await allKeys(store);
-    const summary = await run(store, { dryRun: true, assumeEmptyFence: true });
+    const summary = await run(store, { dryRun: true, assumeEmptyFence: true }, { refresh: false });
     expect(summary.objects.would_drain).toBe(1);
     expect(summary.objects.fence_absent).toBe(0);
     expect(summary.fence_assumed_empty).toBe(1);
@@ -718,6 +748,63 @@ describe("buffered backlog drain (0005)", () => {
     await run(store);
     const stub = await readJson(store, ownerKey("claude", "sess-1"));
     expect(stub.machineId).toMatch(/^srv_[0-9a-f]{32}$/);
+  });
+
+  test("finding 1: SQL's verdict not live (e.g. disabled then re-enabled before the export) is never written", async () => {
+    const store = await scratch();
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { live: false });
+    const summary = await run(store);
+    expect(summary.objects.stage_not_live).toBe(1);
+    expect((await canonical(store)).size).toBe(0);
+    expect(await exists(store, key + DRAINED_SUFFIX)).toBe(false);
+  });
+
+  test("finding 1: a disable then re-enable AFTER the export moves the session's epoch: the stage waits for a re-export", async () => {
+    const store = await scratch();
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }]), group("claude", "sess-2", [{ id: "r2", rev: 1 }])]);
+    await refreshVerdicts(store); // the export ran
+    const mirror = s3ControlMirror(store, ROOT);
+    await mirror.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "sess-1"]], enabled: false });
+    await mirror.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "sess-1"]], enabled: true });
+    expect((await currentFence(store)).deleted).toEqual({}); // re-enabled: nothing tombstoned, the epoch moved
+    const summary = await run(store, {}, { refresh: false });
+    expect(summary.objects.fence_moved_since_export).toBe(1);
+    expect((await canonical(store)).size).toBe(0);
+    expect(await exists(store, key + DRAINED_SUFFIX)).toBe(false);
+    // A reset begun after the export moves resets: the same.
+    await mirror.resetUploadedSessions(TENANT, "req-after");
+    expect((await run(store, {}, { refresh: false })).objects.fence_moved_since_export).toBe(1);
+  });
+
+  test("finding 2: only the lines SQL keeps are written (GC-kept groups, lazy body_accepted)", async () => {
+    const store = await scratch();
+    await stage(store, [group("claude", "sess-1", [{ id: "keep", rev: 1 }, { id: "drop", rev: 1 }]), group("claude", "sess-2", [{ id: "gone", rev: 1 }])],
+      { keep: [[0], []] });
+    const summary = await run(store);
+    expect(summary.objects.drained).toBe(1);
+    expect(summary.lines).toMatchObject({ candidate: 1, written: 1, not_kept: 2 });
+    expect([...(await canonical(store)).entries()]).toEqual([["sess-1", ["keep@1"]]]);
+    expect(await storedEntry(store, "drop")).toBeUndefined();
+  });
+
+  test("finding 6: the CLI resumes from a checkpoint that ends on an accepted-stage sidecar", async () => {
+    const store = await scratch();
+    for (let i = 0; i < 3; i++) await stage(store, [group("claude", `sess-${i}`, [{ id: `r${i}`, rev: 1 }])]);
+    await refreshVerdicts(store);
+    const dir = mkdtempSync(join(process.env.TMPDIR ?? ".", "drain-cli-"));
+    cleanup.push(() => rmSync(dir, { recursive: true, force: true }));
+    const checkpoint = join(dir, "checkpoint");
+    const kms = `arn:aws:kms:us-east-1:000000000000:key/${"0".repeat(8)}-0000-0000-0000-${"0".repeat(12)}`;
+    const args = (more: string[]) => parseDrainArgs(["--execute", "--bucket", "my-bucket", "--kms-key-arn", kms, "--org", TENANT.orgId, "--concurrency", "1", "--checkpoint-file", checkpoint, ...more]);
+    const deps = { store, orgs: async () => [TENANT.orgId], stderr: () => {} };
+    const first = await runDrain(args(["--max-objects", "1"]), deps);
+    expect(first.objects.drained).toBe(1);
+    const saved = readFileSyncFs(checkpoint, "utf8").trim();
+    expect(saved.endsWith(ACCEPTED_SUFFIX)).toBe(true); // a group's last listed key is its sidecar
+    expect(validResumeKey(saved)).toBe(true);
+    const rest = await runDrain(args([]), deps);
+    expect(rest.objects).toMatchObject({ drained: 2, already_drained: 0 });
+    expect((await canonical(store)).size).toBe(3);
   });
 
   test("CLI: the mode is never implied and --execute needs the KMS key", () => {
