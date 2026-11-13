@@ -262,6 +262,14 @@ jobs:
             exit 0
           fi
           bun test --timeout 300000 src/acquisition/__tests__/db-login.postgres.test.ts
+      - name: Prove owner-parity discovery holds one read-only snapshot across enumeration and comparison
+        run: |
+          # pg-proof checks out the PR head; heads predating this step lack the test. Remove once no open PR predates it.
+          if [ ! -f src/migration/__tests__/owner-buffered-parity-discovery.postgres.test.ts ]; then
+            echo "::warning title=pg-proof::owner-buffered-parity-discovery.postgres.test.ts absent at this head; forward-merge main to run the owner-parity discovery snapshot proof"
+            exit 0
+          fi
+          OWNER_PARITY_TEST_PG_URL=postgres://postgres@127.0.0.1:5432/postgres bun test --timeout 300000 src/migration/__tests__/owner-buffered-parity-discovery.postgres.test.ts
       # Service containers cannot take server flags, so the 53200 causal proof gets its own disposable,
       # loopback-only, trust-auth container (same image as the service above, no credential anywhere).
       - name: Start a lock-constrained PostgreSQL for the 043500 advisory-footprint proof
