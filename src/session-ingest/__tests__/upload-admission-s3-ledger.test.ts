@@ -78,7 +78,7 @@ async function upload(store: ObjectStore, batchId: string, records = [record({ r
 
 /** The operator's fence-authority marker (ledger-s3.ts FenceAuthorityDoc): without it nothing is admitted. */
 const writeAuthority = (store: ObjectStore) => store.put(objectKey(fenceAuthorityKey(ROOT)),
-  new TextEncoder().encode(JSON.stringify({ v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", writtenAtMs: T0 })), { contentType: "application/json" });
+  new TextEncoder().encode(JSON.stringify({ v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: T0 })), { contentType: "application/json" });
 
 function lambda(authority = true) {
   const s = scratchStore();
@@ -284,7 +284,7 @@ describe("self-host (ingest-edge) with INGEST_LEDGER=s3: the consumer admits thr
   test("the synchronous runtime (no admission mode, no direct upload) is built on that gated ledger", async () => {
     const src = readFileSync(join(import.meta.dir, "../selfhost-server.ts"), "utf8");
     expect(src).toContain('const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts) : sqlLedger(');
-    expect(src).toContain('s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required" })');
+    expect(src).toContain('s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false })');
   });
 
   test("a direct caller cannot combine the S3 ledger with a SQL-only feature", async () => {
