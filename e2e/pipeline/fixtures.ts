@@ -89,5 +89,5 @@ export function courierTranscript(): string {
 /** The deployment-wide marker an operator writes (ledger-s3.ts FenceAuthorityDoc): a test value, every gate asserted. */
 export const FENCE_AUTHORITY = {
   v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete",
-  controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: STARTED_MS,
+  controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", revisionLayout: "4096", writtenAtMs: STARTED_MS,
 } as const;
