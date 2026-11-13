@@ -25,6 +25,10 @@
  * `provider_not_configured`; default off = 501),
  * READ_API_COORDINATION_OVERLAPS_ENABLED (exactly "true": GET /v1/coordination/overlaps from
  * the existing ClickHouse facts; every other value = 404),
+ * READ_API_BRIEF_SUMMARY_ENABLED (exactly "true": GET /v1/sessions/:id/summary through the
+ * brief-summary SQL, as the hosted Lambda; every other value = 501 summary_not_configured),
+ * READ_API_LIST_SHORT_SUMMARY_ENABLED (exactly "true": the GET /v1/sessions
+ * includeShortSummary=recorded extension; every other value = 501 param_includeShortSummary),
  * READ_API_BRIEF_TITLES_WORKSPACES (the brief-titles allowlist; unset = none), and
  * RELAYAUTH_JWKS_URL / RELAYAUTH_ISSUER (production
  * values in wrangler.jsonc; the verifier's fallback JWKS does not resolve), and
@@ -86,10 +90,11 @@ import { createReadApi, parseDirectoryWorkspaces } from "../../../src/session-re
 import { sqlDirectory } from "../../../src/session-read-api/directory.ts";
 import { serviceNarrativeGenerator, sqlNarrativeCache } from "../../../src/session-read-api/digest-narrative.ts";
 import { sqlBriefTitles } from "../../../src/session-read-api/brief-titles.ts";
+import { sqlBriefSummary } from "../../../src/session-read-api/brief-summary.ts";
 import { readApiVerifier, type AuthConfig } from "../../../src/session-read-api/auth.ts";
 import { assertDestinationUrl, destinationPolicy } from "../../../src/shared/destination-url.ts";
 import { repeatableReadEnabled, sqlLiveness, TENANT_SETTINGS_SQL, tenantBeginSql, type SqlQuery, type TenantRunner } from "../../../src/session-read-api/liveness.ts";
-import { coordinationOverlapsEnabled, parseCompleteSince } from "../../../src/session-read-api/config.ts";
+import { coordinationOverlapsEnabled, exactTrueFlag, parseCompleteSince } from "../../../src/session-read-api/config.ts";
 import { AnalyticsConfigError, analyticsConfig, analyticsCounterFields, createAnalyticsSink, type AnalyticsConfig } from "../../../src/shared/analytics-config.ts";
 import {
   createBufferedSearchGate,
@@ -137,6 +142,10 @@ export interface Env extends CanonicalEnv {
   READ_API_DIGEST_ENABLED?: string;
   /** Exactly "true": serve GET /v1/coordination/overlaps from ClickHouse facts. */
   READ_API_COORDINATION_OVERLAPS_ENABLED?: string;
+  /** Exactly "true": serve GET /v1/sessions/:id/summary (sqlBriefSummary); anything else = 501 summary_not_configured. */
+  READ_API_BRIEF_SUMMARY_ENABLED?: string;
+  /** Exactly "true": serve the GET /v1/sessions includeShortSummary=recorded extension; anything else = 501 param_includeShortSummary. */
+  READ_API_LIST_SHORT_SUMMARY_ENABLED?: string;
   /** The digest narrative Worker (wrangler.digest-narrative.jsonc), bound at activation only. */
   DIGEST_NARRATIVE?: Fetcher;
   /** Babysitter evidence reader (GET /v1/delivery/records for its kinds): only "on" enables; default off. */
@@ -450,6 +459,9 @@ export async function handle(request: Request, env: Env, ctx: ExecutionContext, 
       ? { digest: { cache: sqlNarrativeCache(tenant.run), ...(env.DIGEST_NARRATIVE ? { generator: serviceNarrativeGenerator(env.DIGEST_NARRATIVE) } : {}) } }
       : {}),
     ...(coordinationOverlapsEnabled(env.READ_API_COORDINATION_OVERLAPS_ENABLED) ? { coordination: { enabled: true as const } } : {}),
+    // Parity with the hosted Lambda (src/session-read-api/lambda.ts): each only with the exact flag.
+    ...(exactTrueFlag(env.READ_API_BRIEF_SUMMARY_ENABLED) ? { briefSummary: sqlBriefSummary(tenant.run) } : {}),
+    ...(exactTrueFlag(env.READ_API_LIST_SHORT_SUMMARY_ENABLED) ? { listShortSummary: true } : {}),
     briefTitles: sqlBriefTitles(tenant.run),
     briefTitleWorkspaces: parseDirectoryWorkspaces(env.READ_API_BRIEF_TITLES_WORKSPACES),
     completeSinceMs,
