@@ -1,8 +1,8 @@
 /**
  * Causal two-connection proof that owner-parity discovery (scripts/owner-buffered-parity-ci.ts
- * runOwnerParityDiscovery) classifies every owner inside ONE REPEATABLE READ READ ONLY snapshot on the enumerator
- * session: the marker read, the owner enumeration, every G1 and stored-proof comparison and the final marker read.
- * After enumeration, a second connection commits a change to a parity input (a frozen-source reset) or to an
+ * runOwnerParityDiscovery) classifies every owner inside caller-owned REPEATABLE READ READ ONLY snapshots: one on
+ * the target for the marker, enumeration, target G1 and stored proofs, plus one on Neon when Neon is the source.
+ * After enumeration, a second connection commits a change to a parity input (a source reset) or to an
  * owner_buffered_parity row without moving the PASS generation; discovery must still report the pre-change
  * dispositions. The pre-repair code compared each owner in its own autocommit snapshot after enumeration, so it saw
  * the change, counted an eighth missing/stale owner and refused unexpected_scope: this test fails on it.
@@ -37,7 +37,8 @@ const root = join(import.meta.dir, "../../..");
 const read = (p: string) => readFileSync(join(root, p), "utf8").split("\n").filter((l) => !l.startsWith("\\")).join("\n");
 const H = (c: string) => c.repeat(64);
 const SHA = "5".repeat(40);
-const env = { OWNER_PARITY_MODE: "discovery", OWNER_PARITY_SHA: SHA, OWNER_PARITY_CENSUS_SOURCE: "frozen-supabase" };
+const env = (source: "frozen-supabase" | "neon" = "frozen-supabase") =>
+  ({ OWNER_PARITY_MODE: "discovery", OWNER_PARITY_SHA: SHA, OWNER_PARITY_CENSUS_SOURCE: source });
 const emptyRoster = { contract: "owner-buffered-parity-roster/v1", tenants: [] as string[] };
 const BASE = "owner_parity_disc_base_" + crypto.randomUUID().replaceAll("-", "");
 const databases: string[] = [];
@@ -57,6 +58,10 @@ async function moveSource(c: pg.Client, index: number, request: string): Promise
   await c.query(`SET bulls96.privacy_authority_writer='authority'; ${insert}; RESET bulls96.privacy_authority_writer;`)
     .catch(() => c.query(insert));
 }
+async function moveNeonSource(c: pg.Client, index: number, request: string): Promise<void> {
+  const t = proofTenantLiteral(PROOF_TENANTS[index]!);
+  await c.query(`INSERT INTO sessions.session_resets(org_id,workspace_id,user_id,request_id,deleted) VALUES(${t},'${request}',1)`);
+}
 
 // Before any change: tenants 1 and 3 canonical current, tenant 2 stale, tenants 4-9 missing (exactly seven).
 const PRE_CHANGE = [
@@ -64,7 +69,7 @@ const PRE_CHANGE = [
   ...PROOF_TENANTS.slice(3).map((t) => ({ tenantSha256: tenantSha256(t), disposition: "missing" })),
 ].sort((a, b) => (a.tenantSha256 < b.tenantSha256 ? -1 : 1));
 
-describe.skipIf(!url)("owner parity discovery holds one snapshot across enumeration and comparison (PostgreSQL)", () => {
+describe.skipIf(!url)("owner parity discovery holds stable snapshots across enumeration and comparison (PostgreSQL)", () => {
   beforeAll(async () => {
     admin = new pg.Client({ connectionString: url });
     await admin.connect();
@@ -78,6 +83,19 @@ describe.skipIf(!url)("owner parity discovery holds one snapshot across enumerat
       for (const f of readdirSync(join(root, "supabase/migrations")).filter((n) => n.endsWith(".sql")).sort())
         await c.query(read("supabase/migrations/" + f));
       await c.query(ownerParityProofSeedSql());
+      await c.query(`
+        CREATE TABLE sessions.delivery_cutover_control_heads(org_id text,workspace_id text,user_id text,epoch text,
+          version bigint,digest text,kind text,pending boolean);
+        CREATE TABLE sessions.deleted_upload_sessions(org_id text,workspace_id text,user_id text,origin_id text,source text,session_id text);
+        CREATE TABLE sessions.session_resets(org_id text,workspace_id text,user_id text,request_id text,deleted bigint);
+        CREATE FUNCTION sessions.delivery_cutover_status() RETURNS jsonb LANGUAGE sql STABLE AS $$
+          SELECT jsonb_build_object('phase','active','epoch','${H("1")}','privacyBaselineSha256','${H("2")}') $$;`);
+      for (const [i, t] of PROOF_TENANTS.entries()) {
+        await c.query(`INSERT INTO sessions.delivery_cutover_control_heads VALUES(${proofTenantLiteral(t)},'${H("1")}',${i + 1},
+          '${H("3")}','selection',false);
+          INSERT INTO sessions.deleted_upload_sessions VALUES(${proofTenantLiteral(t)},'origin-${i}','claude','session-${i}');
+          INSERT INTO sessions.session_resets VALUES(${proofTenantLiteral(t)},'request-${i}',1);`);
+      }
     } finally {
       await c.end();
     }
@@ -87,6 +105,7 @@ describe.skipIf(!url)("owner parity discovery holds one snapshot across enumerat
       for (const tenant of PROOF_TENANTS.slice(0, 3))
         await writeCurrentParityProof(queryable(s), queryable(t), tenant, H("4"), "frozen-supabase");
       await moveSource(s, 1, "request-stale");
+      await moveNeonSource(s, 1, "request-neon-stale");
     } finally {
       await Promise.all([s.end(), t.end()]);
     }
@@ -98,7 +117,7 @@ describe.skipIf(!url)("owner parity discovery holds one snapshot across enumerat
     await admin?.end();
   }, 60_000);
 
-  async function scenario(change: (b: pg.Client) => Promise<void>) {
+  async function scenario(sourceKind: "frozen-supabase" | "neon", change: (b: pg.Client) => Promise<void>) {
     const name = "owner_parity_disc_" + crypto.randomUUID().replaceAll("-", "");
     await admin!.query(`CREATE DATABASE ${name} TEMPLATE ${BASE}`);
     databases.push(name);
@@ -107,7 +126,7 @@ describe.skipIf(!url)("owner parity discovery holds one snapshot across enumerat
       for (const c of [a, target, source]) await c.query("SET default_transaction_read_only = on");
       const sessions: OwnerParitySessions = { source: queryable(source), enumerator: queryable(a), target: queryable(target) };
       let hooked = 0;
-      const out = await runOwnerParityDiscovery(env, sessions, {
+      const out = await runOwnerParityDiscovery(env(sourceKind), sessions, {
         roster: emptyRoster, runId: "707",
         deps: {
           // Connection B, after A enumerated the owners and before any comparison: an autocommit change that the
@@ -121,7 +140,7 @@ describe.skipIf(!url)("owner parity discovery holds one snapshot across enumerat
         },
       });
       // A fresh run after the change sees it: the change was causal (an eighth missing/stale owner).
-      const fresh = await runOwnerParityDiscovery(env, sessions, { roster: emptyRoster, runId: "708" });
+      const fresh = await runOwnerParityDiscovery(env(sourceKind), sessions, { roster: emptyRoster, runId: "708" });
       return { out, fresh, hooked };
     } finally {
       await Promise.all([a, target, source, b].map((c) => c.end()));
@@ -139,12 +158,16 @@ describe.skipIf(!url)("owner parity discovery holds one snapshot across enumerat
 
   test("a parity input moved on connection B after enumeration: dispositions stay those of the snapshot", async () => {
     // Tenant 1 is canonical current in the snapshot; its frozen source moves (it would read stale outside it).
-    expectPreChange(await scenario((b) => moveSource(b, 0, "request-after-enumeration")));
+    expectPreChange(await scenario("frozen-supabase", (b) => moveSource(b, 0, "request-after-enumeration")));
+  }, 300_000);
+
+  test("a Neon parity input moved after enumeration: dispositions stay those of the Neon snapshot", async () => {
+    expectPreChange(await scenario("neon", (b) => moveNeonSource(b, 0, "request-neon-after-enumeration")));
   }, 300_000);
 
   test("an owner_buffered_parity row deleted on connection B after enumeration: dispositions stay those of the snapshot", async () => {
     // Tenant 3 is canonical current in the snapshot; its stored proof disappears (it would read missing outside it).
-    expectPreChange(await scenario(async (b) => {
+    expectPreChange(await scenario("frozen-supabase", async (b) => {
       const r = await b.query("DELETE FROM sessions.owner_buffered_parity WHERE user_id=$1", [PROOF_TENANTS[2]!.userId]);
       expect(r.rowCount).toBe(1);
     }));

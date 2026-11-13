@@ -352,10 +352,21 @@ interface TargetCensusRow {
  * Who owns the transaction around each census read. `own` (the default, census/write/readback): every read runs
  * in its own REPEATABLE READ READ ONLY transaction with a 2 s statement timeout. `caller` (discovery only): the
  * caller already holds one REPEATABLE READ READ ONLY transaction (and its statement timeout) on the session, so
- * the reads issue no BEGIN, SET LOCAL, COMMIT or ROLLBACK and all observe the caller's snapshot.
+ * the reads issue no BEGIN, SET LOCAL, COMMIT or ROLLBACK and observe the caller's snapshot. `sourceTransaction`
+ * and `targetTransaction` let cross-database discovery join one caller-owned snapshot on each database; the
+ * legacy `transaction` applies to both sides when a side-specific value is absent.
  */
 export interface ParityCensusReadOptions {
   transaction?: "own" | "caller";
+  sourceTransaction?: "own" | "caller";
+  targetTransaction?: "own" | "caller";
+}
+
+function sideReadOptions(
+  options: ParityCensusReadOptions,
+  side: "source" | "target",
+): ParityCensusReadOptions {
+  return { transaction: options[side === "source" ? "sourceTransaction" : "targetTransaction"] ?? options.transaction };
 }
 
 async function readOnly<T>(
@@ -515,8 +526,9 @@ async function readSourceB(
 
 /**
  * G1: read both databases only, then emit one content-free proof receipt.
- * `censusSource` selects the source-side reader; the default is Neon. `options.transaction: "caller"` (discovery
- * only) runs the three reads inside the caller's open read-only snapshot instead of three own transactions.
+ * `censusSource` selects the source-side reader; the default is Neon. Caller-owned transaction options are for
+ * discovery only: same-database discovery applies `transaction: "caller"`; cross-database discovery applies the
+ * side-specific caller values so all three reads join the appropriate database snapshot.
  */
 export async function readParityCensus(
   neon: Queryable,
@@ -528,10 +540,12 @@ export async function readParityCensus(
   const spec = censusSourceSpec(censusSource);
   if (!validParityTenant(tenant)) throw new ParityCensusRefusal("tenant_invalid");
   const params = [tenant.orgId, tenant.workspaceId, tenant.userId];
-  const sourceA = await readSourceA(neon, spec, params, options);
+  const sourceOptions = sideReadOptions(options, "source");
+  const targetOptions = sideReadOptions(options, "target");
+  const sourceA = await readSourceA(neon, spec, params, sourceOptions);
   const destination = await readOnly<TargetCensusRow>(target, TARGET_OWNER_BUFFERED_CENSUS_SQL, targetParams(tenant, sourceA, spec),
-    "target", options);
-  const sourceB = await readSourceB(neon, spec, params, sourceA, options);
+    "target", targetOptions);
+  const sourceB = await readSourceB(neon, spec, params, sourceA, sourceOptions);
   return evaluateParityCensus(censusInput(tenant, sourceB, destination, spec));
 }
 

@@ -13,6 +13,7 @@ import { join } from "node:path";
 import {
   discoveryRunReceipt,
   ownerParityDiscoverySummary,
+  NEON_DISCOVERY_SNAPSHOT_ANCHOR_SQL,
   ownerParityPreflight,
   runOwnerParity,
   runOwnerParityDiscovery,
@@ -69,6 +70,7 @@ function world(state: Disposition[], opts: { extraRows?: Array<Record<string, un
     statements: [] as Array<{ session: string; sql: string; params: unknown[] }>,
     g1: [] as string[],
     censusSessions: [] as Array<[Queryable, Queryable]>,
+    censusOptions: [] as ParityCensusReadOptions[],
   };
   const proof = (t: ParityTenant): OwnerBufferedParityProof => ({
     contract: "owner-buffered-parity/v1", tenant: { ...t }, controlEpoch: H("1"), privacyBaselineSha256: H("2"), explicitNoHead: false,
@@ -82,7 +84,11 @@ function world(state: Disposition[], opts: { extraRows?: Array<Record<string, un
   const byUser = new Map(buffered.map((t, i) => [t.userId, { t, d: state[i]! }]));
   let fetched = false;
   const sessions: OwnerParitySessions = {
-    source: { query: async () => { throw new Error("source used directly"); } },
+    source: { query: async <R>(sql: string, params: unknown[] = []) => {
+      w.statements.push({ session: "source", sql, params });
+      if (sql === NEON_DISCOVERY_SNAPSHOT_ANCHOR_SQL) return { rows: [{ snapshot_anchor: true }] as R[] };
+      return { rows: [] as R[] };
+    } },
     enumerator: {
       query: async <R>(sql: string, params: unknown[] = []) => {
         w.statements.push({ session: "enumerator", sql, params });
@@ -116,8 +122,10 @@ function world(state: Disposition[], opts: { extraRows?: Array<Record<string, un
   const readCensus = (async (s: Queryable, t: Queryable, tenant: ParityTenant, _source: unknown,
     options?: ParityCensusReadOptions): Promise<ParityCensusReceipt> => {
     w.censusSessions.push([s, t]);
-    for (const db of [s, s, t]) {
-      if (options?.transaction === "caller") { await db.query(CENSUS_PROBE); continue; }
+    w.censusOptions.push(options ?? {});
+    for (const [db, side] of [[s, "source"], [s, "source"], [t, "target"]] as const) {
+      const transaction = options?.[side === "source" ? "sourceTransaction" : "targetTransaction"] ?? options?.transaction;
+      if (transaction === "caller") { await db.query(CENSUS_PROBE); continue; }
       await db.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
       await db.query("SET LOCAL statement_timeout = '2s'");
       await db.query(CENSUS_PROBE);
@@ -234,12 +242,25 @@ test("discovery refusal paths roll the snapshot back and run nothing on the sour
   oneTransaction(after, "COMMIT");
 });
 
-test("discovery refuses the neon census source before any statement: it cannot share the enumerator snapshot", async () => {
+test("discovery with Neon holds one caller-owned read-only snapshot on each database", async () => {
   const x = world(seven);
   const out = await discover(x, env("discovery", { OWNER_PARITY_CENSUS_SOURCE: "neon" }));
-  expect(out.receipt).toMatchObject({ status: "refused", code: "owner_parity_discovery_census_source", owners: [] });
-  expect(x.w.statements).toEqual([]);
-  expect(x.w.censusSessions).toEqual([]);
+  expect(out.receipt).toMatchObject({ status: "ok", censusSource: "neon",
+    counts: { scanned: 9, canonicalCurrent: 2, missing: 6, stale: 1, unparsable: 0 } });
+  expect(x.w.censusSessions).toHaveLength(9);
+  for (const [source, target] of x.w.censusSessions) {
+    expect(source).toBe(x.sessions.source);
+    expect(target).toBe(x.sessions.enumerator);
+  }
+  expect(x.w.censusOptions).toEqual(Array.from({ length: 9 }, () =>
+    ({ sourceTransaction: "caller", targetTransaction: "caller" })));
+  expect(x.w.statements.filter((s) => s.session === "source").map((s) => s.sql)).toEqual([
+    "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", "SET LOCAL statement_timeout = '30s'",
+    NEON_DISCOVERY_SNAPSHOT_ANCHOR_SQL, ...Array.from({ length: 18 }, () => CENSUS_PROBE), "COMMIT",
+  ]);
+  const enumerator = x.w.statements.filter((s) => s.session === "enumerator").map((s) => s.sql);
+  expect(enumerator[0]).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  expect(enumerator.at(-1)).toBe("COMMIT");
 });
 
 test("discovery: a count other than seven refuses unexpected_scope with counts only, never digests", async () => {

@@ -50,8 +50,10 @@ The generation is never an input. Census discovers the live PASS marker generati
   pins `postgres.<project>` through the reviewed session pooler, then fences `current_user`, `session_user`,
   database, backend PID, role attributes, schema owner, parity-table owner and read-only state around every query.
   This is deliberately separate from the standalone operator's short-lived `cli_login_postgres` route.
-- `neon` **refuses `credentials_missing_key.neonUrl`**. No Neon secret exists for this workflow, and this
-  change adds none. Creating one would need its own approval.
+- `neon` reads only through `OWNER_PARITY_NEON_READONLY_URL` on the same protected environment. Before the child
+  starts, the parent pins the URL to the reviewed direct endpoint, database and `relayhistory_readonly` role and
+  normalizes verify-full TLS. A missing secret refuses `owner_parity_neon_credential_missing`; it never falls back
+  to the frozen copy or a runtime application role.
 
 ## Gates
 
@@ -134,24 +136,25 @@ Discovery exists only to find the seven digests for the roster. The production S
 run. Its receipt authorizes nothing either: the roster is a **separate reviewed roster-only PR** written from
 the discovery receipt, and census, write and readback then run against that roster as before.
 
-It uses the same gates, environment and single secret as the other modes, and adds no secret, variable or
-environment. It never writes:
+It uses the same gates and environment as the other modes. Frozen-source discovery uses the existing Supabase
+secret; Neon discovery additionally uses the pinned read-only Neon secret described above. It never writes:
 
 - the target session is fenced read-only (`OWNER_PARITY_MODE_POLICY`: only `write` has a writable session);
 - it never calls `writeCurrentParityProof`;
 - it adds no query SQL (only the transaction, cursor and timeout statements around the existing cursor
   query).
 
-The database work, in order. One `REPEATABLE READ READ ONLY` snapshot on the read-only enumerator session
-covers the marker read, the enumeration, every comparison and the final marker read. The external generation
-fence on the target brackets it.
+The database work, in order. One `REPEATABLE READ READ ONLY` target snapshot on the read-only enumerator session
+covers every target-side step. Frozen-source reads join it. Neon discovery opens and anchors a second
+`REPEATABLE READ READ ONLY` snapshot after the target marker and before enumeration; every Neon source read joins
+it. No comparison uses autocommit. The external generation fence on the target brackets the work.
 
 1. Read the live PASS marker generation on the target (`BULK_TARGET_GENERATION_SQL`).
 2. Open the one `REPEATABLE READ READ ONLY` transaction on the enumerator session (`statement_timeout` 30s
    for each statement). Its first read is the generation again, which must equal step 1. Then the operator's
    bounded buffered-tenant cursor (`BULK_BUFFERED_TENANTS_SQL`, `FETCH` 100) lists every buffered owner in
    that snapshot.
-3. In the same snapshot, classify each owner with the canonical readback comparison: a fresh G1
+3. In the stable snapshot(s), classify each owner with the canonical readback comparison: a fresh G1
    (`readParityCensus` with the caller-held transaction option, so it opens no transaction of its own) and the
    stored row (`READ_OWNER_BUFFERED_PARITY_SQL`, `storedProof`):
    - no stored row is `missing`;
@@ -163,8 +166,10 @@ fence on the target brackets it.
    `COMMIT`. Any refusal rolls the snapshot back.
 5. Read the generation on the target again. It must still equal step 1.
 
-The census source must be `frozen-supabase`. A Neon census would be a second database that cannot share the
-snapshot, so discovery refuses it before any statement (`owner_parity_discovery_census_source`).
+With `census_source=neon`, discovery pins the protected environment's `OWNER_PARITY_NEON_READONLY_URL`, holds the
+Neon snapshot on that separate read-only connection and still uses the Supabase snapshot for enumeration, target
+G1 and stored proofs. Census and G2 write independently re-prove each listed owner after discovery; discovery never
+writes a proof.
 
 Refusals specific to discovery:
 
@@ -173,7 +178,8 @@ Refusals specific to discovery:
 | `roster_present` | The committed roster lists any digest. A malformed roster still refuses `roster_invalid`. |
 | `generation_unstable` | The generation inside the snapshot, after the comparison, or in a fresh equal proof differs from the one read first. |
 | `unexpected_scope` | missing + stale is not exactly 7, or any cursor row is not a valid tenant tuple. Refused as soon as more than 7 are seen (counts so far only). |
-| `owner_parity_discovery_census_source` | The census source is not `frozen-supabase`. Refused before any statement. |
+| `owner_parity_discovery_session_alias` | Neon and target were not supplied as distinct sessions. |
+| `owner_parity_discovery_source_anchor` | The Neon read-only snapshot could not be anchored before enumeration. |
 | `owner_parity_mode_route` | Internal guard: discovery reached the census/write/readback runner, or another mode reached the discovery runner. |
 
 Every other refusal stays (`owner_parity_inputs`, `owner_parity_census_run`, `owner_parity_confirmation`,
@@ -198,17 +204,20 @@ discovery run carries the counts only (`found` = scanned, `equal` = canonical cu
 
 ## Credentials
 
-Only the one database step receives a secret: the existing direct-owner `SUPABASE_MIGRATION_OWNER_URL`. No new
-secrets, variables or environments are added. The URL must retain the exact guarded-schema-release identity
-(`postgres.<project>`); a CLI temporary-login URL is refused rather than silently mixing the two owner contracts.
+Only the one database step receives secrets: the existing direct-owner `SUPABASE_MIGRATION_OWNER_URL` and the
+restricted `OWNER_PARITY_NEON_READONLY_URL`. No new environment is added. The Supabase URL must retain the exact
+guarded-schema-release identity (`postgres.<project>`); a CLI temporary-login URL is refused rather than silently
+mixing the two owner contracts. The Neon URL is used only when `census_source=neon` and is pinned to the reviewed
+`relayhistory_readonly` target before it can reach the credential child.
 
 The script works in two processes:
 
 1. The parent checks everything that needs no credential: mode, dormant switch, roster, census, confirmation
    and checkout.
-2. It removes the URL from its own environment.
+2. It removes both URL names from its own environment.
 3. It spawns the credential child with fixed argv and an allowlisted environment, with no secret and no token.
-4. It writes `{"supabaseUrl": ...}` to the child's stdin pipe.
+4. It writes `{"supabaseUrl": ...}` (frozen source) or `{"supabaseUrl": ..., "neonUrl": ...}` (Neon source) to
+   the child's stdin pipe.
 5. The child refuses any credential in its environment and reads the URL only through `readStdinCredentials`.
 6. It reconstructs the exact guarded-schema-release client and applies the direct-owner identity/PID/object/read-only
    fence before and after every application query.

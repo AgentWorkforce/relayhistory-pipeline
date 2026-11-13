@@ -9,18 +9,19 @@
  * never imported and `bulk` is not a mode here.
  *
  * Credentials. The workflow step runs `bun scripts/owner-buffered-parity-ci.ts` with SUPABASE_MIGRATION_OWNER_URL
- * in its environment. This parent first runs every check that needs no credential (mode, dormant switch, roster,
- * census artifact, confirmation, checkout pin), then removes the URL from its own environment and spawns
+ * and, for Neon, OWNER_PARITY_NEON_READONLY_URL in its environment. This parent first runs every check that needs
+ * no credential (mode, dormant switch, roster, census artifact, confirmation, checkout pin), removes both names
+ * from its own environment, pins the selected credential target and spawns
  * `bun scripts/owner-buffered-parity-ci.ts --operator-stdin` with an allowlisted environment and fixed argv, and
- * writes {"supabaseUrl": ...} to the child's stdin pipe from its own memory. The child refuses a credential in
+ * writes the selected URL set to the child's stdin pipe from its own memory. The child refuses a credential in
  * its environment and reads the URL only through readStdinCredentials. Nothing credential-like is logged or
  * written: the receipt and the census artifact carry digests, counts and public proof fields only.
  *
- * Discovery (one-time, read-only, only while the roster is empty, frozen-supabase source only) holds ONE
- * read-only repeatable-read snapshot on the enumerator session from the in-snapshot marker read through the
- * same cursor, the canonical readback comparison of every owner (missing / stale / canonical current), the
- * exact-seven check and a final in-snapshot marker read, fenced by generation reads on the target before and
- * after. It emits only digests and dispositions of exactly seven missing-or-stale owners, so a separate
+ * Discovery (one-time, read-only, only while the roster is empty) holds one read-only repeatable-read target
+ * snapshot from the in-snapshot marker through the cursor, target comparisons and exact-seven check. Frozen
+ * source reads join it. Neon uses a second caller-owned read-only snapshot, anchored after the target marker and
+ * before enumeration; no comparison is autocommit. External target-generation reads fence both sides. It emits
+ * only digests and dispositions of exactly seven missing-or-stale owners, so a separate
  * reviewed roster-only PR can be written from the receipt. It never writes, never selects a writable session
  * and refuses roster_present, generation_unstable and unexpected_scope (counts only on refusal).
  *
@@ -48,6 +49,10 @@ import {
 import { releaseClient } from "../src/hoopdb/schema-release-inspect.ts";
 import { SCHEMA_RELEASE } from "../src/hoopdb/schema-release-contract.ts";
 import { roleAudit, type ConnectedOwnerClient } from "../src/hoopdb/owner-operator-apply.ts";
+import {
+  OwnerParityCredentialProducerRefusal,
+  pinnedNeonReadonlyUrl,
+} from "./owner-buffered-parity-credential-producer.ts";
 import {
   ParityCensusRefusal,
   READ_OWNER_BUFFERED_PARITY_SQL,
@@ -105,6 +110,8 @@ const HEX64 = /^[0-9a-f]{64}$/u;
 const FETCH_PAGE = 100;
 /** The workflow secret. Only the parent's own environment may hold it; it reaches the child over stdin. */
 export const OWNER_PARITY_SECRET_ENV = "SUPABASE_MIGRATION_OWNER_URL";
+/** Optional source credential. Required and exact-target pinned only when census_source=neon. */
+export const OWNER_PARITY_NEON_SECRET_ENV = "OWNER_PARITY_NEON_READONLY_URL";
 /** The child's whole environment: no secret, no token. */
 export const OWNER_PARITY_CHILD_ENV = [
   "PATH", "HOME", "LANG", "TMPDIR", "RUNNER_TEMP", "GITHUB_RUN_ID", "GITHUB_SHA",
@@ -190,6 +197,7 @@ function emptyCounts(): OwnerParityCounts {
 export function ownerParityCode(error: unknown): string {
   let code: string;
   if (error instanceof OwnerParityCiRefusal || error instanceof OwnerBufferedOperatorRefusal ||
+      error instanceof OwnerParityCredentialProducerRefusal ||
       error instanceof ParityCensusRefusal || error instanceof CredentialRefusal) {
     code = error.code;
   } else {
@@ -312,9 +320,6 @@ export function ownerParityPreflight(
   if (OWNER_PARITY_MODE_POLICY[dispatch.mode].roster === "empty") {
     // Discovery: one-time, so it needs the empty roster and refuses roster_present once digests are listed.
     requireEmptyOwnerParityRoster(roster);
-    // One snapshot covers the owner list and every comparison only when the source is the frozen copy in the
-    // target project; a Neon source would be a second database (and no Neon secret exists).
-    if (dispatch.censusSource !== "frozen-supabase") refuseOwnerParity("owner_parity_discovery_census_source");
     return { dispatch, roster: [], census: null };
   }
   const digests = parseOwnerParityRoster(roster);
@@ -485,7 +490,7 @@ export async function runOwnerParity(
 
 
 // ---------------------------------------------------------------------------------------------------------------
-// Discovery: one read-only snapshot of every buffered owner, classified by the canonical readback comparison.
+// Discovery: stable read-only snapshot(s) of every buffered owner, classified by the canonical readback comparison.
 // ---------------------------------------------------------------------------------------------------------------
 
 export interface OwnerParityDiscoveryOutcome {
@@ -510,8 +515,16 @@ export interface OwnerParityDiscoveryOptions {
   deps?: OwnerParityDiscoveryDependencies;
 }
 
-/** Discovery's census reads join the snapshot the caller holds; no other mode ever passes this. */
+/** Same-database discovery joins the one snapshot the caller holds; no other mode ever passes this. */
 const DISCOVERY_SNAPSHOT_READ = Object.freeze({ transaction: "caller" as const });
+/** Cross-database discovery holds one caller-owned snapshot on each database. */
+const DISCOVERY_SPLIT_SNAPSHOT_READ = Object.freeze({
+  sourceTransaction: "caller" as const,
+  targetTransaction: "caller" as const,
+});
+/** Anchors the Neon MVCC snapshot without reading a tenant or emitting source state. */
+export const NEON_DISCOVERY_SNAPSHOT_ANCHOR_SQL =
+  "SELECT sessions.delivery_cutover_status() IS NOT NULL AS snapshot_anchor";
 
 /**
  * The operator's bulk cursor SQL in bounded pages, inside the caller's open transaction; the cursor is closed
@@ -538,15 +551,16 @@ export async function scanBufferedOwners(snapshot: Queryable): Promise<{ tenants
 }
 
 /**
- * The whole classification in ONE `REPEATABLE READ READ ONLY` transaction on one session (the fenced read-only
- * enumerator): the PASS marker generation as the snapshot's first read (must equal `generation`), the bounded
- * cursor, every canonical comparison (readParityCensus source/target reads and the stored-proof read, all with
- * DISCOVERY_SNAPSHOT_READ, so none opens or ends a transaction), the exact-seven check and a final marker read,
- * then COMMIT. Every disposition therefore comes from the same snapshot as the owner list. Any refusal rolls back.
+ * The target classification runs in one `REPEATABLE READ READ ONLY` transaction on the fenced enumerator: PASS
+ * marker, bounded cursor, every target G1/stored-proof read, exact-seven and final marker. Frozen source reads
+ * join it. Neon source reads join a separate caller-owned read-only snapshot anchored after the target marker and
+ * before enumeration. Every disposition therefore uses stable target and source snapshots; no comparison uses
+ * autocommit. Any refusal rolls back every open snapshot.
  * `counts` and `found` are filled in place so a refused receipt can still report counts.
  */
 export async function discoverOwnersInSnapshot(
   snapshot: Queryable,
+  source: Queryable,
   generation: string,
   censusSource: ParityCensusSource,
   counts: OwnerParityDiscoveryCounts,
@@ -554,17 +568,29 @@ export async function discoverOwnersInSnapshot(
   deps: OwnerParityDiscoveryDependencies = {},
 ): Promise<void> {
   const readCensus = deps.readCensus ?? readParityCensus;
+  const splitSource = censusSource === "neon";
+  if (splitSource && source === snapshot) refuseOwnerParity("owner_parity_discovery_session_alias");
+  let sourceTransactionOpen = false;
   await snapshot.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
   try {
     // Per statement, for the whole transaction; the census reads add no SET LOCAL of their own.
     await snapshot.query("SET LOCAL statement_timeout = '30s'");
     if (await readLiveGeneration(snapshot) !== generation) refuseOwnerParity("generation_unstable");
+    if (splitSource) {
+      await source.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      sourceTransactionOpen = true;
+      await source.query("SET LOCAL statement_timeout = '30s'");
+      const anchor = (await source.query<{ snapshot_anchor: unknown }>(NEON_DISCOVERY_SNAPSHOT_ANCHOR_SQL)).rows;
+      if (anchor.length !== 1 || anchor[0]?.snapshot_anchor !== true)
+        refuseOwnerParity("owner_parity_discovery_source_anchor");
+    }
     const scan = await scanBufferedOwners(snapshot);
     counts.scanned = scan.tenants.length + scan.unparsable;
     counts.unparsable = scan.unparsable;
     await deps.afterEnumeration?.();
     for (const tenant of scan.tenants) {
-      const g1 = await readCensus(snapshot, snapshot, tenant, censusSource, DISCOVERY_SNAPSHOT_READ);
+      const g1 = await readCensus(splitSource ? source : snapshot, snapshot, tenant, censusSource,
+        splitSource ? DISCOVERY_SPLIT_SNAPSHOT_READ : DISCOVERY_SNAPSHOT_READ);
       if (g1.equal && g1.proof && !generationMatches(g1, generation)) refuseOwnerParity("generation_unstable");
       const stored = storedProof(tenant, (await snapshot.query<Record<string, unknown>>(
         READ_OWNER_BUFFERED_PARITY_SQL, [tenant.orgId, tenant.workspaceId, tenant.userId])).rows[0]);
@@ -579,8 +605,13 @@ export async function discoverOwnersInSnapshot(
     requireOwnerParityDiscoveryScope(counts, found);
     // The closing marker read, still in the snapshot: it can differ only if a read escaped the snapshot.
     if (generation !== await readLiveGeneration(snapshot)) refuseOwnerParity("generation_unstable");
+    if (sourceTransactionOpen) {
+      await source.query("COMMIT");
+      sourceTransactionOpen = false;
+    }
     await snapshot.query("COMMIT");
   } catch (error) {
+    if (sourceTransactionOpen) await source.query("ROLLBACK").catch(() => undefined);
     await snapshot.query("ROLLBACK").catch(() => undefined);
     throw error;
   }
@@ -588,11 +619,11 @@ export async function discoverOwnersInSnapshot(
 
 /**
  * The read-only discovery run. Never throws a refusal and never writes: generation A on the target, then the
- * single-snapshot classification on the enumerator session (discoverOwnersInSnapshot: in-snapshot generation,
- * owner list, every comparison by the readback rule -- no stored row is missing, a stored row byte-equal to a
- * fresh equal proof at A is canonical current, anything else is stale -- the exact-seven check and a final
- * in-snapshot generation), then generation B on the target, which must equal A (generation_unstable). The source
- * and target sessions carry no comparison read; the target only answers the two external generation reads.
+ * stable-snapshot classification (discoverOwnersInSnapshot: in-snapshot generation, owner list, every comparison
+ * by the readback rule -- no stored row is missing, a stored row byte-equal to a fresh equal proof at A is
+ * canonical current, anything else is stale -- the exact-seven check and a final in-snapshot generation), then
+ * generation B on the target, which must equal A (generation_unstable). Frozen source shares the target snapshot;
+ * Neon uses its own caller-owned snapshot. The target session only answers the two external generation reads.
  * Exactly seven missing+stale owners or unexpected_scope; a refused receipt carries counts only, never digests.
  */
 export async function runOwnerParityDiscovery(
@@ -618,7 +649,7 @@ export async function runOwnerParityDiscovery(
     dispatch = pre.dispatch;
     if (dispatch.mode !== "discovery") refuseOwnerParity("owner_parity_mode_route");
     generation = await readLiveGeneration(sessions.target);
-    await discoverOwnersInSnapshot(sessions.enumerator, generation, dispatch.censusSource, counts, found, options.deps);
+    await discoverOwnersInSnapshot(sessions.enumerator, sessions.source, generation, dispatch.censusSource, counts, found, options.deps);
     if (await readLiveGeneration(sessions.target) !== generation) refuseOwnerParity("generation_unstable");
     return { receipt: discoveryReceipt(), exitCode: 0 };
   } catch (error) {
@@ -688,10 +719,12 @@ export function ownerParityChildSpawn(
   env: Record<string, string | undefined>,
   supabaseUrl: string,
   script: string = join(ROOT, "scripts/owner-buffered-parity-ci.ts"),
+  neonUrl?: string,
 ): { command: string; args: string[]; env: Record<string, string>; input: string } {
   const childEnv: Record<string, string> = {};
   for (const key of OWNER_PARITY_CHILD_ENV) if (typeof env[key] === "string") childEnv[key] = env[key]!;
-  return { command: process.execPath, args: [script, CHILD_FLAG], env: childEnv, input: JSON.stringify({ supabaseUrl }) };
+  return { command: process.execPath, args: [script, CHILD_FLAG], env: childEnv,
+    input: JSON.stringify({ supabaseUrl, ...(neonUrl === undefined ? {} : { neonUrl }) }) };
 }
 
 /** The child holds no credential in its environment: the URL arrives only over the stdin pipe. */
@@ -759,14 +792,16 @@ function writeRefused(env: Record<string, string | undefined>, paths: ReturnType
   announce(receipt);
 }
 
-/** Workflow step: pre-credential checks, then pipe the one secret to the credential child. */
+/** Workflow step: pre-credential checks, then pipe only the selected secret set to the credential child. */
 async function parent(): Promise<number> {
   const env = process.env;
   let paths: ReturnType<typeof outputPaths> | null = null;
   try {
     // The secret leaves the environment first (git subprocesses below inherit it otherwise).
     const url = env[OWNER_PARITY_SECRET_ENV];
+    const rawNeonUrl = env[OWNER_PARITY_NEON_SECRET_ENV];
     delete process.env[OWNER_PARITY_SECRET_ENV];
+    delete process.env[OWNER_PARITY_NEON_SECRET_ENV];
     const read = inputs(env);
     paths = read.paths;
     const { roster, census } = read;
@@ -775,7 +810,11 @@ async function parent(): Promise<number> {
     const pre = ownerParityPreflight(env, roster, census);
     verifyCheckout(pre.dispatch.sha);
     if (typeof url !== "string" || url === "") refuseOwnerParity("owner_parity_credential_missing");
-    const spec = ownerParityChildSpawn(env, url);
+    const neonUrl = pre.dispatch.censusSource === "neon"
+      ? (typeof rawNeonUrl === "string" && rawNeonUrl !== "" ? pinnedNeonReadonlyUrl(rawNeonUrl)
+        : refuseOwnerParity("owner_parity_neon_credential_missing"))
+      : undefined;
+    const spec = ownerParityChildSpawn(env, url, undefined, neonUrl);
     return await new Promise<number>((resolve) => {
       const child = spawn(spec.command, spec.args, { cwd: ROOT, env: spec.env, stdio: ["pipe", "inherit", "inherit"] });
       child.on("error", () => resolve(1));

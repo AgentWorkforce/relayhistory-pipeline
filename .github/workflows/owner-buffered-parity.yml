@@ -32,7 +32,7 @@ on:
         type: string
         default: ""
       census_source:
-        description: frozen-supabase (the frozen copy in the target project) or neon (refuses; no Neon secret exists)
+        description: frozen-supabase (requires a sealed copy) or neon (pinned relayhistory_readonly source)
         type: choice
         options: [frozen-supabase, neon]
         default: frozen-supabase
@@ -161,6 +161,7 @@ jobs:
       - name: Census, write, read back or discover owner-buffered parity (only step with the database secret)
         env:
           SUPABASE_MIGRATION_OWNER_URL: ${{ secrets.SUPABASE_MIGRATION_OWNER_URL }}
+          OWNER_PARITY_NEON_READONLY_URL: ${{ secrets.OWNER_PARITY_NEON_READONLY_URL }}
         run: bun scripts/owner-buffered-parity-ci.ts
       - name: Publish the census artifact (census only)
         if: inputs.mode == 'census'

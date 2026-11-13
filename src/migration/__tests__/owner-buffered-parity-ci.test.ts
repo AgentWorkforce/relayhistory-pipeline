@@ -265,16 +265,20 @@ test("bulk mode is unreachable and dormant write issues no statement", async () 
 
 test("credential leakage: the child gets the URL on stdin only, never argv or env; the child refuses a credential env", () => {
   const url = "postgresql://fixture-user:fixture-secret@db.fixture.invalid:5432/postgres";
+  const neonUrl = "postgresql://fixture-reader:neon-secret@ep.fixture.invalid:5432/neondb?sslmode=verify-full";
   const env = { PATH: "/usr/bin", HOME: "/home/runner", RUNNER_TEMP: "/tmp/r", GITHUB_RUN_ID: "202", GITHUB_SHA: SHA,
     GITHUB_TOKEN: "fixture-token", SUPABASE_MIGRATION_OWNER_URL: url, DATABASE_URL: url, ACTIONS_RUNTIME_TOKEN: "fixture-token",
     OWNER_PARITY_MODE: "census", OWNER_PARITY_SHA: SHA, OWNER_PARITY_CENSUS_SOURCE: "frozen-supabase" };
-  const spec = ownerParityChildSpawn(env, url, "/x/scripts/owner-buffered-parity-ci.ts");
+  const spec = ownerParityChildSpawn(env, url, "/x/scripts/owner-buffered-parity-ci.ts", neonUrl);
   expect(spec.args).toEqual(["/x/scripts/owner-buffered-parity-ci.ts", "--operator-stdin"]);
   expect(Object.keys(spec.env).sort()).toEqual(["GITHUB_RUN_ID", "GITHUB_SHA", "HOME", "OWNER_PARITY_CENSUS_SOURCE", "OWNER_PARITY_MODE",
     "OWNER_PARITY_SHA", "PATH", "RUNNER_TEMP"]);
   expect(JSON.stringify([spec.command, spec.args, spec.env])).not.toContain("fixture-secret");
+  expect(JSON.stringify([spec.command, spec.args, spec.env])).not.toContain("neon-secret");
   expect(JSON.stringify([spec.command, spec.args, spec.env])).not.toContain("fixture-token");
-  expect(JSON.parse(spec.input)).toEqual({ supabaseUrl: url });
+  expect(JSON.parse(spec.input)).toEqual({ supabaseUrl: url, neonUrl });
+  expect(JSON.parse(ownerParityChildSpawn(env, url, "/x/scripts/owner-buffered-parity-ci.ts").input))
+    .toEqual({ supabaseUrl: url });
   for (const k of Object.keys(spec.env)) expect((OWNER_PARITY_CHILD_ENV as readonly string[]).includes(k)).toBe(true);
   expect(() => refuseOwnerParityCredentialEnv(spec.env)).not.toThrow();
   for (const extra of [{ SUPABASE_MIGRATION_OWNER_URL: url }, { GITHUB_TOKEN: "t" }, { PGPASSWORD: "p" }])
@@ -285,9 +289,11 @@ test("parent process: dormant write and the empty committed roster refuse before
   const temp = mkdtempSync(join(tmpdir(), "owner-parity-ci-"));
   try {
     const url = "postgresql://fixture-user:fixture-secret@db.fixture.invalid:5432/postgres";
+    const neonUrl = "postgresql://fixture-reader:neon-secret@ep.fixture.invalid:5432/neondb?sslmode=verify-full";
     const run = (extra: Record<string, string>) => spawnSync(process.execPath, ["scripts/owner-buffered-parity-ci.ts"], {
       cwd: join(import.meta.dir, "../../.."), encoding: "utf8",
-      env: { PATH: process.env.PATH ?? "", RUNNER_TEMP: temp, GITHUB_RUN_ID: "202", SUPABASE_MIGRATION_OWNER_URL: url, ...base, ...extra },
+      env: { PATH: process.env.PATH ?? "", RUNNER_TEMP: temp, GITHUB_RUN_ID: "202", SUPABASE_MIGRATION_OWNER_URL: url,
+        OWNER_PARITY_NEON_READONLY_URL: neonUrl, ...base, ...extra },
     });
     const dormant = run({ OWNER_PARITY_MODE: "write", OWNER_PARITY_CENSUS_RUN: "101", OWNER_PARITY_CONFIRMATION: "WRITE-OWNER-PARITY x" });
     expect(dormant.status).toBe(1);
@@ -298,6 +304,7 @@ test("parent process: dormant write and the empty committed roster refuse before
     const receipt = readFileSync(join(temp, "owner-parity-out", "owner-buffered-parity.json"), "utf8");
     for (const text of [dormant.stdout, dormant.stderr, empty.stdout, empty.stderr, receipt]) {
       expect(text).not.toContain("fixture-secret");
+      expect(text).not.toContain("neon-secret");
       expect(text).not.toContain("db.fixture.invalid");
       for (const k of ["orgId", "workspaceId", "userId", "neonUrl", "supabaseUrl"]) expect(text).not.toContain(`"${k}"`);
     }

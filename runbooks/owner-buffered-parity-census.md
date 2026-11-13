@@ -61,16 +61,14 @@ canonical current parity row. The full contract is in
 
 - **Every dispatch is Khaliq's own word to the production actor.** Merging
   the mode authorizes no run.
-- It is read-only. It uses the same gates, environment and single secret as
-  census; the target session is fenced read-only and nothing is written. It
-  reuses the bounded buffered-tenant cursor and the canonical readback
-  comparison. One `REPEATABLE READ READ ONLY` snapshot on the read-only
-  enumerator session covers the marker read, the enumeration, every
-  comparison and the final marker read. The external generation fence on the
-  target reads the generation before and after it. It adds no query SQL (only
-  the transaction, cursor and timeout statements around the existing cursor
-  query). It needs the `frozen-supabase` census source and refuses
-  `owner_parity_discovery_census_source` otherwise.
+- It is read-only. It uses the same gates and environment as census; the
+  target session is fenced read-only and nothing is written. It reuses the
+  bounded buffered-tenant cursor and canonical readback comparison. The target
+  is one `REPEATABLE READ READ ONLY` snapshot. `frozen-supabase` joins it and
+  requires a sealed frozen copy. `neon` requires the pinned
+  `OWNER_PARITY_NEON_READONLY_URL` environment secret and holds a second
+  caller-owned read-only snapshot, anchored before enumeration. The external
+  generation fence reads the target generation before and after the work.
 - It runs only while the roster is empty. It refuses `roster_present` once a
   digest is listed, `generation_unstable` if the PASS generation moves
   around the snapshot, and `unexpected_scope` unless exactly 7 owners are

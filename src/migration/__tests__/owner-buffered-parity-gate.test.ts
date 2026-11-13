@@ -245,9 +245,11 @@ test("census artifact: descriptor binds every field; substitution, age, sha, sou
   expect(verify(moved)).toBe("owner_parity_confirmation");
 });
 
-test("workflow: one secret in one step, gate without environment, proof without secrets, census 1d and receipt 30d", () => {
+test("workflow: two pinned secrets in one step, gate without environment, proof without secrets, census 1d and receipt 30d", () => {
   const workflow = readFileSync(OWNER_PARITY_WORKFLOW, "utf8");
-  expect(workflow.match(/secrets\.[A-Z_]+/gu)).toEqual(["secrets.SUPABASE_MIGRATION_OWNER_URL"]);
+  expect(workflow.match(/secrets\.[A-Z_]+/gu)).toEqual([
+    "secrets.SUPABASE_MIGRATION_OWNER_URL", "secrets.OWNER_PARITY_NEON_READONLY_URL",
+  ]);
   expect(workflow.match(/vars\.[A-Za-z_]+/gu)).toBeNull();
   expect(workflow).toContain("options: [census, write, readback, discovery]");
   expect(workflow).toContain("options: [frozen-supabase, neon]");
@@ -270,6 +272,7 @@ test("workflow: one secret in one step, gate without environment, proof without 
   expect(db).toContain("environment:\n      name: ${{ needs.prerequisite-gate.outputs.environment }}\n");
   expect(workflow).toContain("echo \"environment=session-schema-production\"");
   expect(workflow.indexOf("owner-buffered-parity-github.ts --approved")).toBeLessThan(workflow.indexOf("secrets.SUPABASE_MIGRATION_OWNER_URL"));
+  expect(workflow.indexOf("owner-buffered-parity-github.ts --approved")).toBeLessThan(workflow.indexOf("secrets.OWNER_PARITY_NEON_READONLY_URL"));
   expect(workflow.match(/persist-credentials: false/gu)?.length).toBe(3);
   expect(workflow.match(/uses: actions\/checkout@v4/gu)?.length).toBe(3);
   const census = workflow.slice(workflow.indexOf("Publish the census artifact"), workflow.indexOf("Publish the sanitized receipt"));
@@ -282,5 +285,5 @@ test("workflow: one secret in one step, gate without environment, proof without 
   const step = workflow.slice(workflow.indexOf("only step with the database secret"), workflow.indexOf("Publish the census artifact"));
   expect(step).toContain("run: bun scripts/owner-buffered-parity-ci.ts\n");
   expect(step).not.toMatch(/\$SUPABASE|\$\{SUPABASE|echo/u);
-  for (const forbidden of ["supabase login", "SET ROLE", "NEON_", "neonUrl", "bulk", P.project]) expect(workflow).not.toContain(forbidden);
+  for (const forbidden of ["supabase login", "SET ROLE", "neonUrl", "bulk", P.project]) expect(workflow).not.toContain(forbidden);
 });
