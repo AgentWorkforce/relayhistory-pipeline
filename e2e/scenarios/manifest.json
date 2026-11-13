@@ -62,23 +62,29 @@
     {
       "id": "e",
       "title": "Lead explicitly splits a task between agents",
-      "status": "pending",
+      "known_evidence_gaps": ["scrubber_redacted_project_key"],
+      "status": "complete",
       "sessions": [
-        { "role": "lead", "harness": "codex", "session_id": null, "started_at": null, "ended_at": null, "expected_project": "a" },
-        { "role": "first", "harness": "claude", "session_id": null, "started_at": null, "ended_at": null, "expected_project": "a" },
-        { "role": "second", "harness": "codex", "session_id": null, "started_at": null, "ended_at": null, "expected_project": "a" }
+        { "role": "lead", "harness": "claude", "session_id": "d256d050-167f-4698-b533-62f260b4311c", "started_at": "2026-11-13T16:25:55.000Z", "ended_at": "2026-11-13T16:28:11.000Z", "expected_project": "a", "branch": "main", "note": "Read-only lead sent part 1 by Agent Relay DM and launched Codex with part 2 in its prompt." },
+        { "role": "first", "harness": "claude", "session_id": "f2682484-a776-4f17-8849-a415adf7e7ca", "started_at": "2026-11-13T16:25:50.000Z", "ended_at": "2026-11-13T16:27:06.000Z", "expected_project": "a", "branch": "feat/i18n-messages", "commit": "22a3b50", "note": "Added lookup and localized reportTitle; replied to lead with commit SHA by DM." },
+        { "role": "second", "harness": "codex", "session_id": "01a1d5bb-25f5-7583-9187-4dd292c27424", "started_at": "2026-11-13T16:26:14.000Z", "ended_at": "2026-11-13T16:29:21.000Z", "expected_project": "a", "branch": "feat/i18n-locale-files", "note": "Lead-launched Codex session wrote en/fr locale files; sandbox blocked Git commit. Two resumes stayed in this session." },
+        { "role": "second_relaunch", "harness": "codex", "session_id": "01a1d5bc-02b7-7560-9367-09bf820946ed", "started_at": "2026-11-13T16:27:11.000Z", "ended_at": "2026-11-13T16:27:59.000Z", "expected_project": "a", "branch": "feat/i18n-locale-files", "note": "Lead relaunched Codex; Git commit was blocked again." },
+        { "role": "second_commit", "harness": "codex", "session_id": "01a1d5be-2a8b-7df1-ab00-647be7754121", "started_at": "2026-11-13T16:29:32.000Z", "ended_at": "2026-11-13T16:31:46.000Z", "expected_project": "a", "branch": "feat/i18n-locale-files", "commit": "08f454f", "commit_provenance": "operator-launched Codex session used lead's part-2 assignment and committed via git commit-tree/update-ref" }
       ],
-      "pairs": [{ "left": "first", "right": "second", "expected_label": "planned_parallel", "required_evidence": "writes_both" }]
+      "pairs": [
+        { "left": "first", "right": "second", "expected_label": "planned_parallel", "required_evidence": "writes_both", "note": "Lead sent part 1 over Agent Relay and launched part 2 in Codex's prompt; a later Codex session committed the original work after sandbox denials." }
+      ]
     },
     {
       "id": "e_unsplit",
       "title": "Agents chat without an assigned split",
-      "status": "pending",
+      "known_evidence_gaps": ["scrubber_redacted_project_key"],
+      "status": "complete",
       "sessions": [
-        { "role": "first", "harness": "claude", "session_id": null, "started_at": null, "ended_at": null, "expected_project": "a" },
-        { "role": "second", "harness": "codex", "session_id": null, "started_at": null, "ended_at": null, "expected_project": "a" }
+        { "role": "first", "harness": "claude", "session_id": "baa3050c-f8ad-4344-96b2-84c9deefb088", "started_at": "2026-11-13T16:26:00.000Z", "ended_at": "2026-11-13T16:27:43.000Z", "expected_project": "a", "branch": "feat/report-i18n-u1", "commit": "98e69ad" },
+        { "role": "second", "harness": "claude", "session_id": "2585af3e-f5e2-4f11-85ef-41bde1a715c7", "started_at": "2026-11-13T16:26:03.000Z", "ended_at": "2026-11-13T16:27:42.000Z", "expected_project": "a", "branch": "feat/report-i18n-u2", "commit": "2b5a8b2" }
       ],
-      "pairs": [{ "left": "first", "right": "second", "expected_label": "duplicate_work" }]
+      "pairs": [{ "left": "first", "right": "second", "expected_label": "duplicate_work", "first_successful_chat_at": "2026-11-13T16:27:23.000Z", "last_commit_before_chat_at": "2026-11-13T16:26:16.000Z", "note": "Both independently built the whole report i18n feature and committed before their status notes crossed. An earlier 16:26:07 DM attempt failed because the peer was not registered. They later exchanged DMs, confirmed duplication, and changed nothing; post-commit chat must not suppress the duplicate." }]
     },
     {
       "id": "f",
