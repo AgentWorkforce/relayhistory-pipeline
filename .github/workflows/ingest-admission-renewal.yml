@@ -1,0 +1,161 @@
+name: ingest admission renewal
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('ingest admission renewal {0} {1}', inputs.mode, inputs.sha) || format('ingest admission renewal proof {0}', github.sha) }}
+
+# Dormant, CI-only operator that renews buffered-ingest admission: the custody policy expiry
+# (sessions.ingest_lazy_policy.valid_until) and every sessions.ingest_buffer_admission.valid_until move
+# together to plan capturedAt + 30 days in ONE owner transaction (src/hoopdb/ingest-admission-renewal-operator.ts;
+# docs/design/zero-503-schema-windows.md "Admission renewal"). No migration. While ADMISSION_RENEWAL_ENABLED is
+# false in src/hoopdb/admission-renewal-contract.ts, plan and renew refuse; readback is always allowed.
+# Push and pull_request run only the synthetic PGlite proof job (no secrets, no environment).
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [readback, plan, renew]
+        default: readback
+        required: true
+      sha:
+        description: Exact current main commit (40 lowercase hex)
+        type: string
+        required: true
+      plan_run:
+        description: Renew only - the successful plan run id of this workflow at the same sha (under 24h old); empty otherwise
+        type: string
+        default: ""
+      confirmation:
+        description: 'Renew: RENEW-ADMISSION <project> <sha> GENERATION <g> TAIL <ledgerTail> FROM <old> TO <renewTo> ROWS <n> ORGS <d> DESCRIPTOR <d> PLAN <plan_run>, from the plan artifact. Plan and readback: empty'
+        type: string
+        default: ""
+  pull_request:
+    paths:
+      - .github/workflows/ingest-admission-renewal.yml
+      - scripts/ingest-admission-renewal*.ts
+      - src/hoopdb/admission-renewal-contract.ts
+      - src/hoopdb/ingest-admission-renewal-operator.ts
+      - src/hoopdb/__tests__/ingest-admission-renewal-*.ts
+      - supabase/migrations/**
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/ingest-admission-renewal.yml
+      - scripts/ingest-admission-renewal*.ts
+      - src/hoopdb/admission-renewal-contract.ts
+      - src/hoopdb/ingest-admission-renewal-operator.ts
+      - src/hoopdb/__tests__/ingest-admission-renewal-*.ts
+      - supabase/migrations/**
+
+permissions:
+  contents: read
+  actions: read
+  deployments: read
+
+# Dispatches serialize with the guarded schema release and the overlap operator on the same database. Proof
+# runs get their own per-sha group so a push never queues behind (or cancels) a pending dispatch.
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && 'guarded-session-schema-production' || format('ingest-admission-renewal-proof-{0}', github.sha) }}
+  cancel-in-progress: false
+
+env:
+  RENEWAL_MODE: ${{ inputs.mode }}
+  RENEWAL_SHA: ${{ inputs.sha }}
+  RENEWAL_PLAN_RUN: ${{ inputs.plan_run }}
+  RENEWAL_CONFIRMATION: ${{ inputs.confirmation }}
+
+jobs:
+  proof:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without database credentials
+        run: bun install --frozen-lockfile
+      - name: Synthetic PGlite renewal proof over every migration
+        run: bun scripts/ingest-admission-renewal-ci.ts
+      - name: Operator and gate tests
+        run: |
+          bun test --timeout 300000 ./src/hoopdb/__tests__/ingest-admission-renewal-operator.pglite.test.ts
+          bun test --timeout 300000 ./src/hoopdb/__tests__/ingest-admission-renewal-gate.test.ts
+
+  # No environment here: a typo/missing environment must not auto-create an unprotected one.
+  prerequisite-gate:
+    if: github.event_name == 'workflow_dispatch' && github.repository_id == '1437714333' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without database credentials
+        run: bun install --frozen-lockfile
+      - name: Verify dormant switch, mode, exact main, dispatch identity, green CI and the plan run
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          bun scripts/ingest-admission-renewal-github.ts
+          echo "environment=session-schema-production" >> "$GITHUB_OUTPUT"
+
+  database:
+    needs: prerequisite-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: ${{ needs.prerequisite-gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without database credentials
+        run: bun install --frozen-lockfile
+      - name: Recheck live gates and any recorded environment approval
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/ingest-admission-renewal-github.ts --approved
+      - name: Download the plan artifact (renew only)
+        if: inputs.mode == 'renew'
+        uses: actions/download-artifact@v4
+        with:
+          name: ingest-admission-renewal-plan
+          path: release-plan
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.plan_run }}
+          github-token: ${{ github.token }}
+      - name: Plan, renew or read back admission (only step with the database secret)
+        env:
+          SUPABASE_MIGRATION_OWNER_URL: ${{ secrets.SUPABASE_MIGRATION_OWNER_URL }}
+        run: bun scripts/ingest-admission-renewal.ts
+      - name: Publish the plan artifact (plan only)
+        if: inputs.mode == 'plan'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingest-admission-renewal-plan
+          path: release-plan/ingest-admission-renewal-plan.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Publish the sanitized receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ingest-admission-renewal
+          path: release-receipt/ingest-admission-renewal.json
+          if-no-files-found: ignore
+          retention-days: 30

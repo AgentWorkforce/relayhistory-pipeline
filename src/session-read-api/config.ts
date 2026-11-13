@@ -38,6 +38,16 @@ export function coordinationOverlapsEnabled(raw: unknown): boolean {
   return raw === "true";
 }
 
+/** Hosted Lambda entry: wire the brief-summary read (GET /v1/sessions/:id/summary). The service always wires it. */
+export const READ_API_BRIEF_SUMMARY_ENABLED = "READ_API_BRIEF_SUMMARY_ENABLED";
+/** GET /v1/sessions: serve the opt-in includeShortSummary=recorded list extension. */
+export const READ_API_LIST_SHORT_SUMMARY_ENABLED = "READ_API_LIST_SHORT_SUMMARY_ENABLED";
+
+/** READ_API_BRIEF_SUMMARY_ENABLED / READ_API_LIST_SHORT_SUMMARY_ENABLED: only the exact string "true" enables, as coordinationOverlapsEnabled. */
+export function exactTrueFlag(raw: unknown): boolean {
+  return raw === "true";
+}
+
 /** READ_API_OUTPUT_ENABLED / READ_API_DIGEST_ENABLED: only "1" (trimmed) enables, as on the read Worker. */
 export function readApiRouteEnabled(raw: unknown): boolean {
   return typeof raw === "string" && raw.trim() === "1";
