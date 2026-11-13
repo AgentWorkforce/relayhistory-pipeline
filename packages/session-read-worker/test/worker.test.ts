@@ -423,29 +423,30 @@ describe("entry and configuration", () => {
     const list = `/v1/sessions?workspace=${t.ws}&includeShortSummary=recorded`;
     const summarySql = () => seen.filter((q) => q.params?.includes(BRIEF_SUMMARY_SIGNATURE));
     // Unset (the default deploy) and every value but exactly "true": unchanged 501s, no summary SQL.
+    // As on the hosted Lambda (the shared app), the 501 code is unsupported_by_backend; the cause is error.reason.
     for (const flag of [undefined, "", "1", "TRUE", "True", " true", "true ", "on", "yes"]) {
       seen.length = 0;
       const s = await call(summary, { READ_API_BRIEF_SUMMARY_ENABLED: flag, READ_API_LIST_SHORT_SUMMARY_ENABLED: flag });
       expect(s.status, `summary ${String(flag)}`).toBe(501);
-      expect((await body(s)).error.code, `summary ${String(flag)}`).toBe("summary_not_configured");
+      expect((await body(s)).error, `summary ${String(flag)}`).toMatchObject({ code: "unsupported_by_backend", reason: "summary_not_configured" });
       expect(summarySql(), `summary ${String(flag)}`).toHaveLength(0);
       const l = await call(list, { READ_API_BRIEF_SUMMARY_ENABLED: flag, READ_API_LIST_SHORT_SUMMARY_ENABLED: flag });
       expect(l.status, `list ${String(flag)}`).toBe(501);
-      expect((await body(l)).error.code, `list ${String(flag)}`).toBe("param_includeShortSummary");
+      expect((await body(l)).error, `list ${String(flag)}`).toMatchObject({ code: "unsupported_by_backend", reason: "param_includeShortSummary" });
     }
     // Exactly "true": the summary route reaches the brief-summary SQL through the request's tenant runner.
     seen.length = 0;
     const on = await call(summary, { READ_API_BRIEF_SUMMARY_ENABLED: "true" });
     expect(summarySql()).toHaveLength(1);
     expect(on.status).toBe(501);
-    expect((await body(on)).error.code).toBe("summary_not_migrated");
+    expect((await body(on)).error).toMatchObject({ code: "unsupported_by_backend", reason: "summary_not_migrated" });
     // Each flag is independent: the summary flag alone leaves the list extension off, and vice versa.
     const listOff = await call(list, { READ_API_BRIEF_SUMMARY_ENABLED: "true" });
-    expect((await body(listOff)).error?.code).toBe("param_includeShortSummary");
+    expect((await body(listOff)).error).toMatchObject({ code: "unsupported_by_backend", reason: "param_includeShortSummary" });
     const listOn = await call(list, { READ_API_LIST_SHORT_SUMMARY_ENABLED: "true" });
-    expect((await body(listOn)).error?.code).not.toBe("param_includeShortSummary");
+    expect((await body(listOn)).error?.reason).not.toBe("param_includeShortSummary");
     const summaryOff = await call(summary, { READ_API_LIST_SHORT_SUMMARY_ENABLED: "true" });
-    expect((await body(summaryOff)).error.code).toBe("summary_not_configured");
+    expect((await body(summaryOff)).error).toMatchObject({ code: "unsupported_by_backend", reason: "summary_not_configured" });
   });
 
   test("Supabase or ClickHouse down is a 503 the caller falls back from, never a page without erasure checks", async () => {
