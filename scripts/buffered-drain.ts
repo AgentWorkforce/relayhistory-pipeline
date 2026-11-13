@@ -6,10 +6,20 @@
  *     (CloudShell / a role session; never a file).
  *   bun run scripts/buffered-drain.ts --dry-run  --bucket <name> [--region us-east-1] [--org <org> ...]
  *       [--concurrency 4] [--max-objects N] [--start-after <key> | --checkpoint-file <path>]
- *   bun run scripts/buffered-drain.ts --execute  --bucket <name> --kms-key-arn <arn> [same flags]
+ *       [--assume-empty-fence]
+ *   bun run scripts/buffered-drain.ts --execute  --bucket <name> --kms-key-arn <arn> [same flags, never
+ *       --assume-empty-fence]
+ *
+ * ONE DRAIN PROCESS AT A TIME. --execute takes a create-only lease at `96bulls/.drain/lock.json`
+ * (holder + expiry, renewed while it runs, expired in place on exit) and refuses to start while an
+ * unexpired one exists; --dry-run writes no lock but also refuses beside a live one. A crashed run's
+ * lease expires after its TTL (15 minutes).
  *
  * A user without a backfilled `upload-fences.json` (0005 step 0) is always refused (`fence_absent`):
  * the backlog's deletions and resets were recorded in SQL, and the drain reads S3 alone.
+ * --assume-empty-fence (dry run only; refused with --execute) classifies such a user as if the fence
+ * were empty, counted in `fence_assumed_empty`, so a dry run before the backfill still measures the
+ * backlog.
  *
  * Exactly one of --dry-run / --execute is required. --dry-run needs only s3:ListBucket and s3:GetObject
  * (and kms:Decrypt); every put/delete is refused in code as well. --execute writes the canonical layout,
@@ -40,6 +50,8 @@ export interface DrainArgs {
   region: string;
   orgs: string[];
   concurrency: number;
+  /** Dry run only (refused with --execute here and in drainBufferedBatches). */
+  assumeEmptyFence?: true;
   maxObjects?: number;
   startAfter?: string;
   checkpointFile?: string;
@@ -47,7 +59,7 @@ export interface DrainArgs {
 }
 
 const VALUE_FLAGS = new Set(["--bucket", "--region", "--org", "--concurrency", "--max-objects", "--start-after", "--checkpoint-file", "--kms-key-arn"]);
-const BOOL_FLAGS = new Set(["--dry-run", "--execute"]);
+const BOOL_FLAGS = new Set(["--dry-run", "--execute", "--assume-empty-fence"]);
 
 /** Strict parsing: nothing unvalidated reaches the S3 host, and the mode is never implied. */
 export function parseDrainArgs(argv: string[]): DrainArgs {
@@ -83,8 +95,11 @@ export function parseDrainArgs(argv: string[]): DrainArgs {
   if (startAfter !== undefined && !validResumeKey(startAfter)) throw new Error("--start-after must be a buffered staged key or its drained marker");
   if (mode === "execute" && (kmsKeyArn === undefined || !KMS.test(kmsKeyArn))) throw new Error("--execute requires --kms-key-arn (the bucket's KMS key ARN)");
   if (mode === "dry_run" && kmsKeyArn !== undefined) throw new Error("--kms-key-arn is only for --execute");
+  const assumeEmptyFence = bools.has("--assume-empty-fence");
+  if (assumeEmptyFence && mode !== "dry_run") throw new Error("--assume-empty-fence is only for --dry-run");
   return {
     mode, bucket, region, orgs, concurrency,
+    ...(assumeEmptyFence ? { assumeEmptyFence: true as const } : {}),
     ...(maxObjects !== undefined ? { maxObjects } : {}),
     ...(startAfter !== undefined ? { startAfter } : {}),
     ...(checkpointFile !== undefined ? { checkpointFile } : {}),
@@ -131,7 +146,7 @@ if (import.meta.main) {
   try {
     args = parseDrainArgs(process.argv.slice(2));
   } catch (error) {
-    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--concurrency n] [--max-objects n] [--start-after key | --checkpoint-file path]; AWS_* credentials in the environment`);
+    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--concurrency n] [--max-objects n] [--start-after key | --checkpoint-file path] [--assume-empty-fence (dry run only)]; one drain process at a time (lease at 96bulls/.drain/lock.json); AWS_* credentials in the environment`);
     process.exit(2);
   }
   const accessKeyId = process.env.AWS_ACCESS_KEY_ID, secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
@@ -154,7 +169,8 @@ if (import.meta.main) {
     const orgs = args.orgs.length ? args.orgs : await discoverOrgs({ bucket: args.bucket, region: args.region, credentials });
     let lastProgress = 0;
     const summary = await drainBufferedBatches({
-      store, keyRoot: KEY_ROOT, orgs, dryRun: args.mode === "dry_run", concurrency: args.concurrency,      decompress: (bytes) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: BUFFER_STAGE_MAX_BYTES })),
+      store, keyRoot: KEY_ROOT, orgs, dryRun: args.mode === "dry_run", concurrency: args.concurrency,
+      ...(args.assumeEmptyFence ? { assumeEmptyFence: true } : {}),      decompress: (bytes) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: BUFFER_STAGE_MAX_BYTES })),
       ...(args.maxObjects !== undefined ? { maxObjects: args.maxObjects } : {}),
       ...(startAfter !== undefined ? { startAfter } : {}),
       ...(args.checkpointFile ? {

@@ -6,7 +6,9 @@ import { BUFFER_STAGE_MAX_BYTES, prepareBufferedStage, putBufferedStage } from "
 import type { Group } from "../writer.ts";
 import {
   DRAINED_SUFFIX,
+  acquireDrainLock,
   drainBufferedBatches,
+  drainLockKey,
   mergeRevisionRecords,
   readOnlyStore,
   rearmKey,
@@ -352,6 +354,55 @@ describe("buffered backlog drain (0005)", () => {
     const b = { r: [2, "b", "2".repeat(64)] as [number, string, string] };
     expect(mergeRevisionRecords(a, b)).toEqual({ records: a, changed: false });
     expect(mergeRevisionRecords(a, { r: [3, "c", "3".repeat(64)] }).records.r[0]).toBe(3);
+  });
+
+  test("--assume-empty-fence classifies an unbackfilled user in a dry run, and is refused with execute", async () => {
+    const store = await scratch({ fence: false });
+    await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    const before = await allKeys(store);
+    const summary = await run(store, { dryRun: true, assumeEmptyFence: true });
+    expect(summary.objects.would_drain).toBe(1);
+    expect(summary.objects.fence_absent).toBe(0);
+    expect(summary.fence_assumed_empty).toBe(1);
+    expect(summary.lines.written).toBe(1);
+    expect(await allKeys(store)).toEqual(before);
+    await expect(run(store, { dryRun: false, assumeEmptyFence: true })).rejects.toThrow("drain_assume_empty_fence_requires_dry_run");
+    expect(await allKeys(store)).toEqual(before); // refused before the lock or any write
+    expect(() => parseDrainArgs(["--execute", "--bucket", "my-bucket", "--kms-key-arn", `arn:aws:kms:us-east-1:000000000000:key/${"0".repeat(8)}-0000-0000-0000-${"0".repeat(12)}`, "--assume-empty-fence"])).toThrow("only for --dry-run");
+    expect(parseDrainArgs(["--dry-run", "--bucket", "my-bucket", "--assume-empty-fence"]).assumeEmptyFence).toBe(true);
+  });
+
+  test("one drain at a time: a live lease refuses both modes; an expired one is taken and released", async () => {
+    const store = await scratch();
+    const key = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    const T = Date.parse("2030-01-05T00:00:00.000Z");
+    const now = () => new Date(T);
+    await store.put(objectKey(drainLockKey(ROOT)), enc.encode(JSON.stringify({ v: 1, kind: "buffered-drain-lock", holder: "drain-other", expiresAtMs: T + 60_000 })));
+    await expect(run(store, { now })).rejects.toThrow("drain_locked");
+    await expect(run(store, { now, dryRun: true })).rejects.toThrow("drain_locked");
+    expect(await exists(store, key + DRAINED_SUFFIX)).toBe(false);
+
+    await store.put(objectKey(drainLockKey(ROOT)), enc.encode(JSON.stringify({ v: 1, kind: "buffered-drain-lock", holder: "drain-other", expiresAtMs: T - 1 })));
+    const summary = await run(store, { now, lockHolder: "drain-test" });
+    expect(summary.objects.drained).toBe(1);
+    expect(await readJson(store, drainLockKey(ROOT))).toEqual({ v: 1, kind: "buffered-drain-lock", holder: "drain-test", expiresAtMs: 0 });
+
+    // A lock this code cannot read is treated as held.
+    await store.put(objectKey(drainLockKey(ROOT)), enc.encode("{}"));
+    await expect(run(store, { now })).rejects.toThrow("drain_lock_invalid");
+  });
+
+  test("a lease taken over by another holder fails its renewal (the run then stops)", async () => {
+    const store = await scratch();
+    let t = 1_000_000;
+    const lease = await acquireDrainLock(store, ROOT, { holder: "drain-a", ttlMs: 60_000, now: () => t });
+    await lease.renew();
+    await expect(acquireDrainLock(store, ROOT, { holder: "drain-b", ttlMs: 60_000, now: () => t })).rejects.toThrow("drain_locked");
+    t += 120_000; // expired: b takes it over
+    await acquireDrainLock(store, ROOT, { holder: "drain-b", ttlMs: 60_000, now: () => t });
+    await expect(lease.renew()).rejects.toThrow("drain_lock_lost");
+    await lease.release(); // never clobbers b's lease
+    expect((await readJson(store, drainLockKey(ROOT))).holder).toBe("drain-b");
   });
 
   test("CLI: the mode is never implied and --execute needs the KMS key", () => {

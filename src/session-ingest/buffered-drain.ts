@@ -44,11 +44,13 @@
  * the 0005 object formats.
  *
  * Within one process, batches touching the same (tenant, origin, session) index are serialised, so the
- * index check and the write cannot race each other. Run ONE drain process at a time.
+ * index check and the write cannot race each other. Across processes, an execute run holds a
+ * create-only lease at `<keyRoot>/.drain/lock.json` (holder + expiry, CAS-renewed) and every run refuses
+ * to start while an unexpired lease exists: ONE drain process at a time.
  *
  * Nothing here logs, and the summary holds counts only: never a key, tenant id or content.
  */
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { isObjectStoreError, objectKey, type ObjectStore, type ObjectVersion } from "../shared/vendor.ts";
 import { layoutComponent } from "../shared/layout-component.ts";
 import { journalKey } from "./async-admission.ts";
@@ -375,6 +377,8 @@ export interface DrainSummary {
   /** Session groups written (execute) or that would be (dry run). */
   sessions_written: number;
   rearmed: number;
+  /** Dry run with assumeEmptyFence: batches whose user had no fence, classified as if it were empty. */
+  fence_assumed_empty: number;
   /** Write failures by closed code (IngestWriteError code, or `storage`). */
   write_failures: Record<string, number>;
   stopped: "complete" | "max_objects";
@@ -385,7 +389,7 @@ function emptySummary(mode: DrainSummary["mode"]): DrainSummary {
     mode, orgs: 0, listed: 0, foreign_keys: 0,
     objects: Object.fromEntries(OUTCOMES.map((o) => [o, 0])) as Record<ObjectOutcome, number>,
     lines: { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0 },
-    sessions_written: 0, rearmed: 0, write_failures: {}, stopped: "complete",
+    sessions_written: 0, rearmed: 0, fence_assumed_empty: 0, write_failures: {}, stopped: "complete",
   };
 }
 
@@ -525,6 +529,72 @@ class KeyedLocks {
   }
 }
 
+// ---- the run lock ----
+
+/** One drain process at a time: a create-only lease at `<keyRoot>/.drain/lock.json`, renewed by CAS. */
+export const DRAIN_LOCK_TTL_MS = 15 * 60_000;
+export const drainLockKey = (keyRoot: string) => `${keyRoot}/.drain/lock.json`;
+interface DrainLockBody { v: 1; kind: "buffered-drain-lock"; holder: string; expiresAtMs: number }
+
+export class DrainLockError extends Error {
+  constructor(readonly code: "drain_locked" | "drain_lock_invalid" | "drain_lock_lost") {
+    super(code);
+    this.name = "DrainLockError";
+  }
+}
+
+async function readLock(store: ObjectStore, key: string): Promise<{ body: DrainLockBody; version: ObjectVersion } | null> {
+  const got = await readText(store, key, 64 * 1024);
+  if (!got) return null;
+  let v: unknown;
+  try {
+    v = JSON.parse(got.text);
+  } catch {
+    throw new DrainLockError("drain_lock_invalid");
+  }
+  // Fail closed: a lock this code cannot read is held.
+  if (!isObject(v) || v.v !== 1 || v.kind !== "buffered-drain-lock" || typeof v.holder !== "string" || !Number.isSafeInteger(v.expiresAtMs)) throw new DrainLockError("drain_lock_invalid");
+  return { body: v as unknown as DrainLockBody, version: got.version };
+}
+
+/** The dry run never writes the lock, but still refuses to run beside a live drain. */
+export async function assertDrainUnlocked(store: ObjectStore, keyRoot: string, nowMs: number): Promise<void> {
+  const held = await readLock(store, drainLockKey(keyRoot));
+  if (held && held.body.expiresAtMs > nowMs) throw new DrainLockError("drain_locked");
+}
+
+export interface DrainLease { renew(): Promise<void>; release(): Promise<void> }
+
+/** Take the lease: create-only, or CAS over an expired one. A live lease (anyone's) refuses. */
+export async function acquireDrainLock(store: ObjectStore, keyRoot: string, opts: { holder: string; ttlMs: number; now: () => number }): Promise<DrainLease> {
+  const key = drainLockKey(keyRoot);
+  const body = (expiresAtMs: number) => encoder.encode(JSON.stringify({ v: 1, kind: "buffered-drain-lock", holder: opts.holder, expiresAtMs } satisfies DrainLockBody));
+  const held = await readLock(store, key);
+  if (held && held.body.expiresAtMs > opts.now()) throw new DrainLockError("drain_locked");
+  let version: ObjectVersion;
+  try {
+    version = (await store.put(objectKey(key), body(opts.now() + opts.ttlMs), held ? { ifMatch: held.version, contentType: "application/json" } : { ifNoneMatch: true, contentType: "application/json" })).version;
+  } catch (error) {
+    // Another process took it between the read and the write.
+    if (isObjectStoreError(error, "precondition_failed") || isObjectStoreError(error, "already_exists")) throw new DrainLockError("drain_locked");
+    throw error;
+  }
+  return {
+    async renew() {
+      try {
+        version = (await store.put(objectKey(key), body(opts.now() + opts.ttlMs), { ifMatch: version, contentType: "application/json" })).version;
+      } catch (error) {
+        if (isObjectStoreError(error, "precondition_failed") || isObjectStoreError(error, "already_exists")) throw new DrainLockError("drain_lock_lost");
+        throw error;
+      }
+    },
+    async release() {
+      // Expire it in place (the drain never deletes). A lost lease is someone else's now: leave it.
+      await store.put(objectKey(key), body(0), { ifMatch: version, contentType: "application/json" }).catch(() => {});
+    },
+  };
+}
+
 // ---- the drain ----
 
 export interface DrainOptions {
@@ -533,6 +603,16 @@ export interface DrainOptions {
   /** Orgs to drain. Required: discovery (a delimiter listing) is the caller's (scripts/buffered-drain.ts). */
   orgs: string[];
   dryRun: boolean;
+  /**
+   * Dry run only: classify a user with no fence object as if the fence were empty (counted in
+   * `fence_assumed_empty`), so a dry run before the backfill still measures the backlog. Refused with
+   * `dryRun: false`: an execute run never writes for an unbackfilled user.
+   */
+  assumeEmptyFence?: boolean;
+  /** Lease TTL for the run lock (renewed every third of it). Default DRAIN_LOCK_TTL_MS. */
+  lockTtlMs?: number;
+  /** Lease holder id (no personal data). Default a random `drain-<uuid>`. */
+  lockHolder?: string;
   /** Ledger override (tests; later ledger-s3.ts). Default: s3DrainLedger over `store`. */
   ledger?: DrainLedger;
   decompress: (bytes: Uint8Array) => Uint8Array;
@@ -560,6 +640,9 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   if (opts.maxObjects !== undefined && (!Number.isSafeInteger(opts.maxObjects) || opts.maxObjects < 1)) throw new Error("drain_max_objects_invalid");
   if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(opts.keyRoot)) throw new Error("drain_key_root_invalid");
   for (const org of opts.orgs) if (!/^(?!\.)[A-Za-z0-9._-]{1,128}$/.test(org)) throw new Error("drain_org_invalid");
+  if (opts.assumeEmptyFence && !opts.dryRun) throw new Error("drain_assume_empty_fence_requires_dry_run");
+  const lockTtlMs = opts.lockTtlMs ?? DRAIN_LOCK_TTL_MS;
+  if (!Number.isSafeInteger(lockTtlMs) || lockTtlMs < 1_000) throw new Error("drain_lock_ttl_invalid");
   const store = opts.dryRun ? readOnlyStore(opts.store) : opts.store;
   const ledger = opts.ledger ?? s3DrainLedger(store, opts.keyRoot, { ...(opts.sleep ? { sleep: opts.sleep } : {}), ...(opts.random ? { random: opts.random } : {}) });
   const target: WriteTarget = {
@@ -570,6 +653,20 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     ...(opts.sleep ? { sleep: opts.sleep } : {}),
     ...(opts.random ? { random: opts.random } : {}),
   };
+  const nowMs = () => (opts.now ?? (() => new Date()))().getTime();
+  let lease: DrainLease | undefined;
+  let lockLost: unknown;
+  let renewTimer: ReturnType<typeof setInterval> | undefined;
+  if (opts.dryRun) await assertDrainUnlocked(opts.store, opts.keyRoot, nowMs());
+  else {
+    lease = await acquireDrainLock(store, opts.keyRoot, { holder: opts.lockHolder ?? `drain-${randomUUID()}`, ttlMs: lockTtlMs, now: nowMs });
+    let renewing = false;
+    renewTimer = setInterval(() => {
+      if (renewing || lockLost !== undefined) return;
+      renewing = true;
+      lease!.renew().catch((e) => { lockLost ??= e; }).finally(() => { renewing = false; });
+    }, Math.max(500, Math.floor(lockTtlMs / 3)));
+  }
   const locks = new KeyedLocks();
   const orgs = orgOrder(opts.orgs);
   summary.orgs = orgs.length;
@@ -604,10 +701,11 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   let objects = 0;
   let fatal: { error: unknown } | undefined;
   const iterator = allGroups();
+  try {
   await Promise.all(
     Array.from({ length: concurrency }, async () => {
       for (;;) {
-        if (fatal || checkpointError !== undefined) return;
+        if (fatal || checkpointError !== undefined || lockLost !== undefined) return;
         if (opts.maxObjects !== undefined && objects >= opts.maxObjects) {
           summary.stopped = "max_objects";
           return;
@@ -632,8 +730,13 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     }),
   );
   await checkpointChain;
+  } finally {
+    if (renewTimer) clearInterval(renewTimer);
+    if (lockLost === undefined) await lease?.release();
+  }
   if (fatal) throw fatal.error;
   if (checkpointError !== undefined) throw checkpointError;
+  if (lockLost !== undefined) throw lockLost;
   return summary;
 
   async function drainGroup(group: BatchGroup) {
@@ -685,7 +788,11 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       return "fence_unreadable";
     }
     // 0005 step 0: a user without a backfilled fence may have deletions recorded only in SQL.
-    if (!fence) return "fence_absent";
+    if (!fence) {
+      if (!(opts.dryRun && opts.assumeEmptyFence)) return "fence_absent";
+      summary.fence_assumed_empty++;
+      fence = { v: 1, resets: 0, deleted: {} };
+    }
     let journal: JournalState | null;
     try {
       journal = await ledger.readJournal(tenant);
