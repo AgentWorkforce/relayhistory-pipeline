@@ -448,6 +448,13 @@ export interface S3LedgerOptions {
    * tombstones in S3 and never reach SQL. Default true (hosted: no SQL; the reset retry replays the count).
    */
   claimCompletesResets?: boolean;
+  /**
+   * true: a reset only BEGINS (records the request id, resets + 1, lastResetAtMs: one fence CAS) and answers at
+   * once; it never lists owner stubs. For a caller with a hard subrequest budget (the Worker's fence mirror,
+   * INGEST_S3_FENCE_MIRROR): the next claim that completes resets, or a reset retry through a full ledger, finishes
+   * it, and until then every entry is judged as before (resetsCompleted). Its answer counts nothing (0).
+   */
+  resetBeginOnly?: boolean;
   nowMs?: () => number;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
@@ -749,6 +756,7 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       return { next: f, result: "apply" as const };
     });
     if (begun !== "apply") return { outcome: begun.outcome, deleted: begun.result };
+    if (opts.resetBeginOnly) return { outcome: "applied", deleted: 0 };
     const n = await finishResets(keys, requestId, control);
     return { outcome: "applied", deleted: n };
   }
