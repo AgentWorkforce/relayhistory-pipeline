@@ -6,6 +6,7 @@ import { BUFFER_STAGE_MAX_BYTES, prepareBufferedStage, putBufferedStage } from "
 import type { Group } from "../writer.ts";
 import {
   ACCEPTED_SUFFIX,
+  SUPERSEDED_SUFFIX,
   DRAINED_SUFFIX,
   acceptedCompleteKey,
   acquireDrainLock,
@@ -939,5 +940,188 @@ describe("buffered backlog drain (0005)", () => {
     expect(await exists(store, key + DRAINED_SUFFIX)).toBe(false);
     // The intent survives, so the next run restores this batch before any other of the user.
     expect((await readJson(store, drainHoldKey(ROOT, TENANT))).keys).toEqual([key]);
+  });
+
+  // ---- lander review of d24acaaf: P1-1 (holds released on every terminal outcome), P1-2 (checkpoint) ----
+
+  /** An earlier run's hold naming `keys` (as partial() leaves it after a failed write). */
+  const putHold = (store: ObjectStore, keys: string[]) =>
+    store.put(objectKey(drainHoldKey(ROOT, TENANT)), enc.encode(JSON.stringify({ v: 1, kind: "buffered-drain-hold", keys })));
+  const holdKeys = async (store: ObjectStore) => (await readJson(store, drainHoldKey(ROOT, TENANT))).keys as string[];
+
+  test("P1-1: a held batch that turns pre_reset releases its hold, then is marked; the user's later batch drains", async () => {
+    const store = await scratch();
+    const a = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { batch: "A", received: "2030-01-02T00:00:00.000Z" });
+    await putHold(store, [a]);
+    await putFence(store, { reset: { requestId: "q1", atMs: Date.parse("2030-01-03T00:00:00.000Z"), result: 0 } });
+    const c = await stage(store, [group("claude", "sess-2", [{ id: "r2", rev: 1 }])], { batch: "C", received: "2030-01-04T00:00:00.000Z" });
+    const first = await run(store, { concurrency: 1 });
+    expect(first.objects.pre_reset).toBe(1);
+    expect((await readJson(store, a + DRAINED_SUFFIX)).outcome).toBe("pre_reset");
+    expect(await holdKeys(store)).toEqual([]);
+    // C drained in the same run if it sorted after A, else on the next: never user_hold for good.
+    if (!(await exists(store, c + DRAINED_SUFFIX))) expect((await run(store, { concurrency: 1 })).objects.drained).toBe(1);
+    expect(await exists(store, c + DRAINED_SUFFIX)).toBe(true);
+    expect((await canonical(store)).get("sess-2")).toEqual(["r2@1"]);
+  });
+
+  for (const [name, spoil] of [
+    ["vanished", (store: ObjectStore, k: string) => store.delete(objectKey(k))],
+    ["redacted", (store: ObjectStore, k: string) => store.put(objectKey(k), enc.encode(JSON.stringify({ v: 1, kind: "buffered-redaction" })))],
+    ["corrupt", (store: ObjectStore, k: string) => store.put(objectKey(k), enc.encode("garbage"))],
+    ["already_drained", (store: ObjectStore, k: string) => store.put(objectKey(k + DRAINED_SUFFIX), enc.encode(JSON.stringify({ v: 1, kind: "buffered-drained", outcome: "pre_reset" })))],
+  ] as const) {
+    test(`P1-1: a hold entry whose batch is ${name} holds nothing: the user's next batch prunes it and drains`, async () => {
+      const store = await scratch();
+      const a = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { batch: "A" });
+      await putHold(store, [a]);
+      await spoil(store, a);
+      const c = await stage(store, [group("claude", "sess-2", [{ id: "r2", rev: 1 }])], { batch: "C" });
+      // The dry run sees through it without writing.
+      const dry = await run(store, { dryRun: true });
+      expect(dry.objects.would_drain).toBe(1);
+      expect(dry.objects.user_hold).toBe(0);
+      expect(await holdKeys(store)).toEqual([a]);
+      const summary = await run(store, { concurrency: 1 });
+      expect(summary.objects.drained).toBe(1);
+      expect(summary.objects.user_hold).toBe(0);
+      expect(summary.holds_pruned).toBe(1);
+      expect(await exists(store, c + DRAINED_SUFFIX)).toBe(true);
+      expect(await holdKeys(store)).toEqual([]);
+    });
+  }
+
+  test("P1-1: a live held batch still holds the user (pruning never drops an entry that can drain)", async () => {
+    const store = await scratch();
+    const a = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { batch: "A" });
+    await putHold(store, [a]);
+    const c = await stage(store, [group("claude", "sess-2", [{ id: "r2", rev: 1 }])], { batch: "C" });
+    const summary = await run(store, { concurrency: 1 });
+    expect(summary.holds_pruned).toBe(0);
+    // A drains (re-deriving its entries) and releases; C drains after it, in this run or the next.
+    if (!(await exists(store, c + DRAINED_SUFFIX))) await run(store, { concurrency: 1 });
+    expect(await exists(store, a + DRAINED_SUFFIX)).toBe(true);
+    expect(await exists(store, c + DRAINED_SUFFIX)).toBe(true);
+    expect(await holdKeys(store)).toEqual([]);
+  });
+
+  test("P1-1: an ambiguous replacement that was held releases its hold (it is never drained)", async () => {
+    const store = await scratch();
+    const claim = randomUUID();
+    const a1 = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }, { id: "r2", rev: 1 }])], { batch: "same", claim });
+    await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { batch: "same", claim });
+    await putHold(store, [a1]);
+    const c = await stage(store, [group("claude", "sess-3", [{ id: "r3", rev: 1 }])], { batch: "C" });
+    const first = await run(store, { concurrency: 1 });
+    expect(first.objects.ambiguous_replacement).toBe(2);
+    expect(await holdKeys(store)).toEqual([]);
+    if (!(await exists(store, c + DRAINED_SUFFIX))) await run(store, { concurrency: 1 });
+    expect(await exists(store, c + DRAINED_SUFFIX)).toBe(true);
+  });
+
+  test("P1-1: a hold release that fails leaves the pre_reset batch unmarked (hold_failed), for a rerun", async () => {
+    const store = await scratch();
+    const a = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { received: "2030-01-02T00:00:00.000Z" });
+    await putHold(store, [a]);
+    await putFence(store, { reset: { requestId: "q1", atMs: Date.parse("2030-01-03T00:00:00.000Z"), result: 0 } });
+    const holdKey = drainHoldKey(ROOT, TENANT);
+    const failing = await run(hooked(store, (k) => { if (k === holdKey) throw new ObjectStoreError("unauthorized", "fs", "injected"); }));
+    expect(failing.objects.hold_failed).toBe(1);
+    expect(await exists(store, a + DRAINED_SUFFIX)).toBe(false);
+    expect(await holdKeys(store)).toEqual([a]);
+    expect((await run(store)).objects.pre_reset).toBe(1);
+    expect(await holdKeys(store)).toEqual([]);
+  });
+
+  test("P1-2: retryable outcomes never advance the checkpoint; a rerun from it drains them", async () => {
+    const store = await scratch();
+    for (let i = 0; i < 2; i++) await stage(store, [group("claude", `sess-${i}`, [{ id: `r${i}`, rev: 1 }])]);
+    await putJournal(store, { v: 3, seq: 2, pending: [{ id: "o:e:3", startMs: 1 }], ambiguous: [] });
+    let checkpoint: string | undefined;
+    const first = await run(store, { concurrency: 2, onCheckpoint: (k) => { checkpoint = k; } });
+    expect(first.objects.privacy_control_open).toBe(2);
+    expect(checkpoint).toBeUndefined();
+    await putJournal(store, { v: 3, seq: 2, pending: [], ambiguous: [] });
+    const second = await run(store, { ...(checkpoint ? { startAfter: checkpoint } : {}) });
+    expect(second.objects.drained).toBe(2);
+  });
+
+  test("P1-2: the watermark stops before the first group left for a rerun, and passes terminal ones", async () => {
+    const store = await scratch();
+    const keys: string[] = [];
+    for (let i = 0; i < 4; i++) keys.push(await stage(store, [group("claude", `sess-${i}`, [{ id: `r${i}`, rev: 1 }])]));
+    const sorted = [...keys].sort();
+    // The third object in key order cannot be read just now (a storage error: internal_error, retryable).
+    const flaky = new Proxy(store, {
+      get(target, prop) {
+        if (prop === "getObject") return async (...args: Parameters<ObjectStore["getObject"]>) => {
+          if (String(args[0]) === sorted[2]) throw new ObjectStoreError("unauthorized", "fs", "injected");
+          return target.getObject(...args);
+        };
+        const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof v === "function" ? (v as (...x: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    const marks: string[] = [];
+    const first = await run(flaky, { concurrency: 1, onCheckpoint: (k) => { marks.push(k); } });
+    expect(first.objects.drained).toBe(3);
+    expect(first.objects.internal_error).toBe(1);
+    // Never at or past the unreadable object, though the fourth drained.
+    expect(marks.at(-1)! < sorted[2]!).toBe(true);
+    const second = await run(store, { startAfter: marks.at(-1)! });
+    expect(second.objects.drained).toBe(1);
+    expect(second.objects.already_drained).toBe(1);
+    expect((await canonical(store)).size).toBe(4);
+  });
+
+  test("P2: a dry run refuses a checkpoint (the CLI too), and max-objects never splits or overruns by a group", async () => {
+    const store = await scratch();
+    await expect(run(store, { dryRun: true, onCheckpoint: () => {} })).rejects.toThrow("drain_checkpoint_requires_execute");
+    expect(() => parseDrainArgs(["--dry-run", "--bucket", "my-bucket", "--checkpoint-file", "/tmp/x"])).toThrow("--checkpoint-file");
+    // Two objects in one batch group (a retry under another claim), then a single.
+    await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { batch: "G" });
+    await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { batch: "G" });
+    await stage(store, [group("claude", "sess-2", [{ id: "r2", rev: 1 }])], { batch: "H" });
+    const summary = await run(store, { maxObjects: 2, concurrency: 1 });
+    expect(summary.listed).toBeLessThanOrEqual(2);
+    expect(summary.stopped).toBe("max_objects");
+  });
+
+  // ---- the same two P1s across 0005 step 0b's outcomes (#585) ----
+
+  test("P1-1 (#585): a held stage that a later export superseded holds nothing: pruned, the user's next batch drains", async () => {
+    const store = await scratch();
+    const a = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { batch: "A" });
+    await putHold(store, [a]);
+    await store.put(objectKey(a + SUPERSEDED_SUFFIX), enc.encode(JSON.stringify({ v: 1, kind: "buffered-superseded", stage_sha256: "0".repeat(64) })));
+    const c = await stage(store, [group("claude", "sess-2", [{ id: "r2", rev: 1 }])], { batch: "C" });
+    const summary = await run(store, { concurrency: 1 });
+    expect(summary.objects.stage_superseded).toBe(1);
+    expect(summary.holds_pruned).toBe(1);
+    expect(await exists(store, c + DRAINED_SUFFIX)).toBe(true);
+    expect(await holdKeys(store)).toEqual([]);
+  });
+
+  test("P1-1 (#585): a held stage SQL's verdict refuses (stage_not_live) releases its hold", async () => {
+    const store = await scratch();
+    const a = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])], { batch: "A", live: false });
+    await putHold(store, [a]);
+    const c = await stage(store, [group("claude", "sess-2", [{ id: "r2", rev: 1 }])], { batch: "C" });
+    const first = await run(store, { concurrency: 1 });
+    expect(first.objects.stage_not_live).toBe(1);
+    expect(await holdKeys(store)).toEqual([]);
+    if (!(await exists(store, c + DRAINED_SUFFIX))) await run(store, { concurrency: 1 });
+    expect(await exists(store, c + DRAINED_SUFFIX)).toBe(true);
+  });
+
+  test("P1-2 (#585): an org whose export is missing never advances the checkpoint; after the export a rerun drains", async () => {
+    const store = await scratch({ exportComplete: false });
+    await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    let checkpoint: string | undefined;
+    const first = await run(store, { onCheckpoint: (k) => { checkpoint = k; } });
+    expect(first.objects.stage_export_missing).toBe(1);
+    expect(checkpoint).toBeUndefined();
+    await markExportComplete(store);
+    expect((await run(store)).objects.drained).toBe(1);
   });
 });

@@ -470,6 +470,17 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
     });
     for (const r of orgRows)
       if (typeof r.org_id === "string") perOrg.set(r.org_id, { stages: 0, bad: !ORG.test(r.org_id) });
+    // Lander P2-1 (#585): an execute run first REVOKES each org's completion, and writes it again only if this run ends
+    // clean for the org. A rerun that fails for some stages, or dies part way, leaves the org refused by the drain
+    // (stage_export_missing) instead of opening it on an earlier run's verdicts for the stages this run could not
+    // refresh. Overwritten in place under the export lease (which excludes the drain and every other export).
+    const hadCompletion = new Set<string>();
+    if (!opts.dryRun) {
+      for (const org of [...perOrg.keys()].filter((o) => ORG.test(o)).sort()) {
+        if (await readCompletion(org)) hadCompletion.add(org);
+        await putCompletion(org, { v: 1, kind: "buffered-accepted-revoked", revokedAtMs: nowMs() });
+      }
+    }
     /** The user's S3 fence, once per page per user (the backfill wrote it; absent means not backfilled). */
     let fences = new Map<string, Promise<FenceDoc | null | "invalid">>();
     const fenceOf = (org: string, ws: string, user: string) => {
@@ -590,7 +601,8 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
         if (tally) tally.bad = true;
       }
     }
-    // Completion objects, create-only (finding 9), after every candidate stage of the org has its verdict.
+    // Completion objects (finding 9), after every candidate stage of the org has its verdict: written only for an org
+    // this run ended clean for; a bad org stays revoked (above), so the drain refuses it.
     for (const [org, t] of [...perOrg].sort(([a], [b]) => (a < b ? -1 : 1))) {
       if (t.bad || !ORG.test(org)) {
         summary.orgs.incomplete++;
@@ -602,18 +614,12 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
       }
       const doc: AcceptedComplete = { v: 1, kind: "buffered-accepted-complete", stages: t.stages, completedAtMs: nowMs() };
       try {
-        if (!leaseOk()) throw new Error("export_lock_lost");
-        const ack = await store.put(objectKey(acceptedCompleteKey(opts.keyRoot, org)), encoder.encode(JSON.stringify(doc)), { ifNoneMatch: true, contentType: "application/json" });
-        // An identical object already there is an idempotent create (created: false), not a new completion.
-        if (ack.created) summary.orgs.complete++;
-        else summary.orgs.already_complete++;
-      } catch (error) {
-        if (isObjectStoreError(error, "already_exists") || isObjectStoreError(error, "precondition_failed")) {
-          // An earlier export completed the org; this run's verdicts were (re)written above.
-          const prior = await store.getObject(objectKey(acceptedCompleteKey(opts.keyRoot, org))).then(async (g) => parseAcceptedComplete(decoder.decode(await readAll(g.body))), () => null);
-          if (prior) summary.orgs.already_complete++;
-          else summary.orgs.incomplete++;
-        } else summary.orgs.incomplete++;
+        await putCompletion(org, doc);
+        // A renewal of an earlier export's completion counts as already_complete.
+        if (hadCompletion.has(org)) summary.orgs.already_complete++;
+        else summary.orgs.complete++;
+      } catch {
+        summary.orgs.incomplete++;
       }
     }
   } finally {
@@ -621,6 +627,15 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
     await lease?.release();
   }
   return summary;
+
+  async function readCompletion(org: string): Promise<AcceptedComplete | null> {
+    return store.getObject(objectKey(acceptedCompleteKey(opts.keyRoot, org))).then(async (g) => parseAcceptedComplete(decoder.decode(await readAll(g.body))), () => null);
+  }
+  /** Replace an org's completion object (a completion, or a revocation the drain reads as absent), under the lease. */
+  async function putCompletion(org: string, doc: AcceptedComplete | { v: 1; kind: "buffered-accepted-revoked"; revokedAtMs: number }): Promise<void> {
+    if (!leaseOk()) throw new Error("export_lock_lost");
+    await store.put(objectKey(acceptedCompleteKey(opts.keyRoot, org)), encoder.encode(JSON.stringify(doc)), { contentType: "application/json" });
+  }
 
   /** The stale-sidecar pass for one org: list its sidecars, ask SQL which stages are still candidates, supersede the rest. */
   async function supersedeStale(org: string): Promise<void> {

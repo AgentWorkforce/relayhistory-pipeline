@@ -292,7 +292,7 @@ describe("accepted-stage export (0005 step 0b): SQL's own verdict per stage", ()
     await expect(exportAcceptedStages({ sql: notReadOnly, store, keyRoot: ROOT, dryRun: false })).rejects.toThrow("export_not_read_only");
   });
 
-  test("a rerun is a no-op; dry run writes nothing; org scope; completion objects are create-only", async () => {
+  test("a rerun is a no-op; dry run writes nothing; org scope; completion objects renewed only on a clean run", async () => {
     const store = scratch();
     await backfillFence(store, A);
     await backfillFence(store, C);
@@ -306,11 +306,14 @@ describe("accepted-stage export (0005 step 0b): SQL's own verdict per stage", ()
     expect(scoped).toMatchObject({ rows: 1, written: 1, orgs: { complete: 1 } });
     await run(store);
     // Everything but the export's own lease (renewed and released by every run) is untouched by a rerun.
-    const settled = async () => (await allKeys(store)).filter((k) => !k.startsWith(exportLockKey(ROOT)));
+    // The completion objects are renewed by every execute run (revoked first, rewritten on a clean finish: P2-1).
+    const completion = (k: string) => k.startsWith(`${ROOT}/.drain/accepted-stages/`);
+    const settled = async () => (await allKeys(store)).filter((k) => !k.startsWith(exportLockKey(ROOT)) && !completion(k));
     const before = await settled();
     const again = await run(store);
     expect(again).toMatchObject({ rows: 2, written: 0, updated: 0, already: 2, orgs: { complete: 0, already_complete: 2 } });
     expect(await settled()).toEqual(before);
+    for (const org of [A.orgId, C.orgId]) expect(parseAcceptedComplete(await readText(store, acceptedCompleteKey(ROOT, org)))).toMatchObject({ stages: 1 });
     await expect(run(store, { orgs: ["../x"] })).rejects.toThrow("export_org_invalid");
   });
 
@@ -621,5 +624,36 @@ describe("accepted-stage export (0005 step 0b): SQL's own verdict per stage", ()
     expect(() => parseExportArgs(["--bucket", "my-bucket", "--execute"])).toThrow("--kms-key-arn");
     expect(() => parseExportArgs(["--bucket", "my-bucket", "--dry-run", "--org", "../x"])).toThrow("--org");
     expect(parseExportArgs(["--dry-run", "--bucket", "my-bucket"])).toEqual({ mode: "dry_run", bucket: "my-bucket", region: "us-east-1", orgs: [], pageSize: 1_000, concurrency: 8, statementTimeoutMs: 30_000 });
+  });
+
+  test("lander P2-1: a rerun that fails for an org revokes its completion; the drain refuses the org until a clean export", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    await stageInBoth(store, [{ source: "claude", session: "s1", records: [{ id: "a", rev: 1 }] }]);
+    expect((await run(store)).orgs.complete).toBe(1);
+    const s2 = await stageInBoth(store, [{ source: "claude", session: "s2", records: [{ id: "b", rev: 1 }] }]);
+    // The rerun cannot write the new stage's sidecar: the org ends incomplete.
+    const failing = new Proxy(store, {
+      get(target, prop) {
+        if (prop === "put") return async (...args: Parameters<ObjectStore["put"]>) => {
+          if (String(args[0]) === s2.key + ACCEPTED_SUFFIX) throw new Error("injected");
+          return target.put(...args);
+        };
+        const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof v === "function" ? (v as (...x: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    const partial = await run(failing);
+    expect(partial.orgs.incomplete).toBe(1);
+    expect(parseAcceptedComplete(await readText(store, acceptedCompleteKey(ROOT, A.orgId)))).toBeNull();
+    const drain = () => drainBufferedBatches({ store, keyRoot: ROOT, orgs: [A.orgId], dryRun: true, sleep: async () => {},
+      decompress: (b) => new Uint8Array(zstdDecompressSync(b, { maxOutputLength: BUFFER_STAGE_MAX_BYTES })) });
+    const refused = await drain();
+    expect(refused.objects.stage_export_missing).toBe(2);
+    expect(refused.objects.would_drain).toBe(0);
+    // A clean export reopens it.
+    expect((await run(store)).orgs).toMatchObject({ incomplete: 0, complete: 1 });
+    expect(parseAcceptedComplete(await readText(store, acceptedCompleteKey(ROOT, A.orgId)))).toMatchObject({ stages: 2 });
+    expect((await drain()).objects.would_drain).toBe(2);
   });
 });
