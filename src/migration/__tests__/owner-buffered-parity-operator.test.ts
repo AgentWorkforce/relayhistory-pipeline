@@ -240,7 +240,8 @@ describe("owner-buffered parity bulk runner", () => {
           }),
         },
       );
-      expect(seen).toEqual([maxBytesUser, "private-user-1", "private-user-2"]);
+      expect(seen).toEqual([maxBytesUser, maxBytesUser, "private-user-1", "private-user-1",
+        "private-user-2", "private-user-2"]);
       expect(counts).toMatchObject({ batches: 3, candidates: 3, inserted: 3, tenantRefused: 0 });
     } finally {
       await db.close();
@@ -261,7 +262,7 @@ describe("owner-buffered parity bulk runner", () => {
       },
     );
     expect(counts).toEqual({ batches: 2, candidates: 3, g1Equal: 3, g1Mismatch: 0, tenantRefused: 0,
-      inserted: 1, updated: 1, unchanged: 1 });
+      inserted: 1, updated: 1, unchanged: 1, missing: 0, stale: 0, verified: 3 });
     expect(statements[0]).toContain("REPEATABLE READ READ ONLY");
     expect(statements.some((sql) => sql.includes(BULK_BUFFERED_TENANTS_SQL))).toBeTrue();
     expect(statements.filter((sql) => sql === "FETCH FORWARD 2 FROM owner_buffered_parity_bulk_tenants")).toHaveLength(3);

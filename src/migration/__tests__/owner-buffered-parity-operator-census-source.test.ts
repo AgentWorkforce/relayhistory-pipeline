@@ -112,7 +112,7 @@ describe("bulk runner forwards the census source", () => {
       },
     }, ...(args as [ParityCensusSource?]));
     expect(counts).toMatchObject({ inserted: 1 });
-    expect(seen).toEqual([`read:${source}`, `write:${source}`]);
+    expect(seen).toEqual([`read:${source}`, `write:${source}`, `read:${source}`]);
     pages = [];
   });
 });

@@ -15,6 +15,7 @@ import {
   OWNER_PARITY_CENSUS_MAX_AGE_MS,
   OWNER_PARITY_WORKFLOW,
   OWNER_PARITY_WRITE_ENABLED,
+  OWNER_PARITY_BULK_WRITE_ENABLED,
   ownerParityDispatch,
   refuseOwnerParity as refuse,
 } from "../src/migration/owner-buffered-parity-ci-contract.ts";
@@ -39,9 +40,10 @@ export async function ownerParityGithubGate(
   env: Record<string, string | undefined>,
   get: Get,
   approved = false,
-  options: { enabled?: boolean; now?: number } = {},
+  options: { enabled?: boolean; bulkEnabled?: boolean; now?: number } = {},
 ) {
-  const input = ownerParityDispatch(env, options.enabled ?? OWNER_PARITY_WRITE_ENABLED);
+  const input = ownerParityDispatch(env, options.enabled ?? OWNER_PARITY_WRITE_ENABLED,
+    options.bulkEnabled ?? OWNER_PARITY_BULK_WRITE_ENABLED);
   const now = options.now ?? Date.now();
   if (env.GITHUB_REPOSITORY !== S.repository || env.GITHUB_REPOSITORY_ID !== PRIVATE_INGEST_RELEASE.repositoryId ||
       env.GITHUB_EVENT_NAME !== "workflow_dispatch" || env.GITHUB_REF !== "refs/heads/main" ||
@@ -52,6 +54,11 @@ export async function ownerParityGithubGate(
       !(input.confirmation.startsWith(`WRITE-OWNER-PARITY ${input.sha} GENERATION `) &&
         input.confirmation.includes(` SOURCE ${input.censusSource} DESCRIPTOR `) &&
         input.confirmation.endsWith(` CENSUS ${input.censusRun}`)))
+    refuse("owner_parity_confirmation");
+  if (input.mode === "bulk-write" &&
+      !(input.confirmation.startsWith(`WRITE-OWNER-PARITY-BULK ${input.sha} GENERATION `) &&
+        input.confirmation.includes(" SOURCE neon DESCRIPTOR ") &&
+        input.confirmation.endsWith(` PLAN ${input.censusRun}`)))
     refuse("owner_parity_confirmation");
   const base = `/repos/${S.repository}`;
   if ((await get(base + "/git/ref/heads/main")).object?.sha !== input.sha) refuse("owner_parity_gate_main_moved");
@@ -67,7 +74,7 @@ export async function ownerParityGithubGate(
     runs: "owner_parity_gate_ci",
     jobs: "owner_parity_gate_ci_jobs",
   }, "main", OWNER_PARITY_REQUIRED_PUSH_RUNS);
-  if (input.mode === "write") {
+  if (input.mode === "write" || input.mode === "bulk-write") {
     const census = await get(base + "/actions/runs/" + input.censusRun);
     const created = Date.parse(census.created_at);
     if (String(census.id) !== input.censusRun || String(census.id) === env.GITHUB_RUN_ID ||

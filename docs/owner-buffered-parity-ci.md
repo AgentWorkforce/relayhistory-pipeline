@@ -1,29 +1,28 @@
-# Owner-buffered parity CI workflow (exact eight, dormant write, discovery and temporary scope diagnostic)
+# Owner-buffered parity CI workflow (fixed roster plus bounded all-owner recovery)
 
 `.github/workflows/owner-buffered-parity.yml` runs the owner-buffered parity census (G1), the G2 write of
 `sessions.owner_buffered_parity` and a read-only readback for **exactly eight** tenants, from CI only. It adds
 no parity SQL: it drives the existing operator code (`scripts/owner-buffered-parity-operator.ts`,
 `src/migration/owner-buffered-parity.ts`) through the single-tenant path, one tenant at a time. A one-time,
-read-only `discovery` mode finds which eight buffered owners lack a canonical current parity row, so the
-roster can be written (see [Discovery](#discovery-read-only-one-time)).
-
-`scope-diagnostic` is temporary recovery instrumentation. After two consecutive discovery cardinality refusals,
-it uses the same fenced read-only snapshots and bounded cursor to classify the complete buffered-owner set. It
-collects no tenant digests, always refuses `owner_parity_scope_diagnostic`, and publishes aggregate counts only.
-Run it twice to distinguish a stable scope from a moving one, then remove the mode with the recovery fix-forward.
+read-only `discovery` mode supports the fixed-roster lane. After recovery measurement proved that every buffered
+owner needs a current-generation proof, the workflow also gained aggregate-only `bulk-plan`, dormant
+`bulk-write`, and `bulk-readback` modes. These reuse the existing bounded bulk operator; they never publish a
+tenant tuple or digest.
 
 **Every dispatch, in any mode, needs Khaliq's own word.** Merging this workflow authorizes nothing.
 **Enabling write is a separate reviewed PR** that flips one line
-(`OWNER_PARITY_WRITE_ENABLED` in `src/migration/owner-buffered-parity-ci-contract.ts`) and nothing else.
+(`OWNER_PARITY_WRITE_ENABLED` for the fixed roster or `OWNER_PARITY_BULK_WRITE_ENABLED` for all-owner recovery in
+`src/migration/owner-buffered-parity-ci-contract.ts`) and nothing else.
 
 ## State at merge
 
-- Write is dormant: `OWNER_PARITY_WRITE_ENABLED = false`. A write dispatch refuses `owner_parity_write_dormant`
+- Both writes are dormant: `OWNER_PARITY_WRITE_ENABLED = false` and `OWNER_PARITY_BULK_WRITE_ENABLED = false`.
+  A write dispatch refuses its dormant code
   in the gate job and again in the database step **before any credential is read**.
 - The roster `src/migration/owner-buffered-parity-roster.json` ships **empty**, so every census, write and
   readback dispatch refuses `roster_empty`. Adding the eight digests is a separate follow-up PR. `discovery`
-  and temporary `scope-diagnostic` are the only modes that run on the empty roster, and both refuse
-  `roster_present` once the roster is filled.
+  is the only fixed-roster mode that runs on the empty roster. Bulk modes deliberately ignore the roster and
+  enumerate every buffered owner.
 - Census and readback stay callable once the roster is populated.
 
 ## Roster
@@ -34,17 +33,18 @@ tuple). Tenant identifiers never appear in the repository, a workflow input, a l
 The database step enumerates buffered tenants from the target ledger with the operator's own bulk cursor SQL
 (`BULK_BUFFERED_TENANTS_SQL`, one read-only repeatable-read snapshot, bounded `FETCH` pages), hashes each row
 and keeps only roster digests. Unlisted tenants are hashed and dropped; nothing else is done with them.
-Unless all eight are found the run refuses `roster_incomplete`. The operator's `bulk` mode is not a mode of
-this workflow and cannot be reached (`owner_parity_inputs`).
+Unless all eight are found the fixed-roster run refuses `roster_incomplete`. The operator's raw `bulk` CLI mode
+is not dispatchable; only the reviewed `bulk-plan`, `bulk-write`, and `bulk-readback` workflow routes can reach
+the core.
 
 ## Inputs
 
 | Input | Values | Notes |
 | --- | --- | --- |
-| `mode` | `census` (default), `write`, `readback`, `discovery`, temporary `scope-diagnostic` | Anything else refuses `owner_parity_inputs`. |
+| `mode` | `census` (default), `write`, `readback`, `discovery`, `bulk-plan`, `bulk-write`, `bulk-readback` | Anything else refuses `owner_parity_inputs`. |
 | `sha` | 40 lowercase hex | Must equal the live `main` head and `github.sha`. |
-| `census_run` | run id | Write only; empty otherwise (discovery included). |
-| `confirmation` | text | Write only; empty otherwise (discovery included). |
+| `census_run` | run id | `write` or `bulk-write` only; empty otherwise. |
+| `confirmation` | text | `write` or `bulk-write` only; empty otherwise. |
 | `census_source` | `frozen-supabase` (default), `neon` | See below. |
 
 The generation is never an input. Census discovers the live PASS marker generation; write re-reads it.
@@ -89,6 +89,32 @@ every check with `--approved` before the secret step. The gate refuses unless:
 Discovery passes exactly the census gates (1 to 7) and reads no census run.
 
 Write also checks the confirmation's shape in the gate. The database step then checks it byte for byte.
+
+### `bulk-plan`, `bulk-write`, `bulk-readback` (aggregate all-owner recovery)
+
+Bulk recovery always uses the pinned `relayhistory_readonly` Neon source and the live PASS generation. It holds a
+bounded `REPEATABLE READ READ ONLY` cursor over every distinct buffered owner and processes at most 25 tenants per
+page. The plan performs a fresh G1 for every candidate and emits only aggregate counts. It succeeds only when the
+candidate count is nonzero, every G1 is equal, and there are no mismatches or tenant refusals. Its one-day artifact
+binds source SHA, generation, source, capture time, plan run, aggregate counts, and a descriptor digest.
+
+`bulk-write` is dormant. Once separately enabled it requires the exact phrase:
+
+```
+WRITE-OWNER-PARITY-BULK <sha> GENERATION <generation> SOURCE neon DESCRIPTOR <descriptorSha256> PLAN <plan_run>
+```
+
+Before the first mutation it recomputes the complete aggregate plan and requires byte-equal counts. For each owner
+it then performs a fresh G1, the existing CAS/idempotent `writeCurrentParityProof`, an immediate stored-row readback,
+and a second fresh G1. Generation drift or a readback mismatch stops the run. A stopped run is resumed by rerunning
+the same pinned operation: already committed rows report `unchanged`; no private cursor is persisted. After the
+write pass, the same workflow performs an independent full `bulk-readback`; success requires every current buffered
+owner to verify with zero missing, stale, mismatch, or refusal counts. `bulk-readback` exposes that final read-only
+check independently.
+
+There is no destructive rollback. Rows proven current at the pinned generation are valid evidence; a partial run is
+completed by a guarded rerun. The dormant switch is the pre-activation rollback, and generation/source drift is the
+automatic stop condition.
 
 Dispatches share the concurrency group `guarded-session-schema-production` with the other guarded operators.
 Proof runs use a per-sha group.
@@ -214,15 +240,6 @@ file strictly before publishing it. The receipt holds:
 workspace id, slug, email, row, SQL text or credential. The generic `owner-buffered-parity` receipt of a
 discovery run carries the counts only (`found` = scanned, `equal` = canonical current) and no digests.
 
-### `scope-diagnostic` (temporary, read-only, counts only)
-
-This mode answers one question: **how many buffered owners are currently missing or stale when the full bounded
-cursor is classified in the same stable source/target snapshots?** Unlike normal discovery, it does not fail fast
-at the ninth affected owner. It never collects or emits tenant digests, completes both generation fences, and then
-deliberately refuses `owner_parity_scope_diagnostic`. Its discovery receipt therefore has `owners: []` and only
-the aggregate `scanned`, `canonicalCurrent`, `missing`, `stale`, and `unparsable` counts. It is diagnostic
-scaffolding, not an activation path; remove it immediately after the recovery scope is measured.
-
 ## Credentials
 
 Only the one database step can receive secrets: the existing direct-owner `SUPABASE_MIGRATION_OWNER_URL` and,
@@ -271,7 +288,8 @@ Pull requests and pushes that touch these files run only the proof job. It has n
   - `roster_empty`
   - `roster_incomplete`
   - wrong confirmation
-  - bulk unreachable
+  - raw `bulk` mode unreachable
+  - bulk write dormant, bound aggregate plan, plan drift refusal, per-owner readback and final full readback
   - stale census
   - sha mismatch
   - substituted digest
@@ -283,14 +301,14 @@ Pull requests and pushes that touch these files run only the proof job. It has n
   - fail-closed partial write
   - readback mismatch
   - generation and source drift between census and write
-  - bulk
+  - bounded aggregate bulk plan/write/readback
   - dormant before any statement
   - the stdin-only credential hand-off
   - a parent process run checking that nothing secret is printed
 - `src/migration/__tests__/owner-buffered-parity-discovery.test.ts` uses mocked sessions. It covers the
   exact-eight scope (`unexpected_scope` with counts only), generation drift before, inside and after the
-  snapshot (`generation_unstable`), `roster_present`, the mode dispatch table (write and bulk unreachable from
-  discovery), read-only statement shape, receipt validation, sanitization against identifier fixtures, and a
+  snapshot (`generation_unstable`), `roster_present`, the mode dispatch table, read-only statement shape,
+  receipt validation, sanitization against identifier fixtures, and a
   parent process run plus the summary step.
 - `src/migration/__tests__/owner-buffered-parity-gate.test.ts` uses mocked GitHub. It covers every gate
   refusal, the contract validators and the workflow shape.

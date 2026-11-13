@@ -14,7 +14,7 @@ test("PGlite proof: census, dormant/roster/confirmation/bulk/stale/sha/generatio
   const names = cases.map((c) => c.name).join("\n");
   for (const required of ["census:", "dormant", "roster_empty", "roster_incomplete", "bulk is unreachable", "wrong confirmation",
     "stale census", "another sha", "generation moved", "ninth tenant never touched", "readback: equal",
-    "missing", "no private field names", "discovery: refuses roster_present", "discovery: two missing owners refuses unexpected_scope",
+    "missing", "bulk recovery: aggregate plan", "no private field names", "discovery: refuses roster_present", "discovery: two missing owners refuses unexpected_scope",
     "discovery: read-only snapshot on a fresh image finds exactly eight"])
     expect(names).toContain(required);
 }, 300000);

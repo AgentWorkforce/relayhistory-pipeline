@@ -17,6 +17,7 @@ import {
   requireNeonParityReadonlyIdentity,
   refuseOwnerParityCredentialEnv,
   runOwnerParity,
+  runOwnerParityBulk,
   withWorkflowParityOwnerSession,
   type OwnerParityDependencies,
   type OwnerParityOutcome,
@@ -25,7 +26,9 @@ import {
 import type { ConnectedOwnerClient } from "../../hoopdb/owner-operator-apply.ts";
 import { BULK_TARGET_GENERATION_SQL, tenantSha256 } from "../../../scripts/owner-buffered-parity-operator.ts";
 import { ParityCensusRefusal, READ_OWNER_BUFFERED_PARITY_SQL, type OwnerBufferedParityProof, type ParityCensusReceipt, type ParityTenant } from "../owner-buffered-parity.ts";
-import { OWNER_PARITY_WRITE_ENABLED, ownerParityConfirmation, ownerParityDispatch,
+import { OWNER_PARITY_BULK_PLAN_CONTRACT, OWNER_PARITY_WRITE_ENABLED, ownerParityBulkConfirmation,
+  ownerParityBulkPlanDescriptor, ownerParityConfirmation, ownerParityDispatch,
+  type OwnerParityBulkPlanArtifact, type OwnerParityBulkPlanBody,
   type OwnerParityCensusArtifact } from "../owner-buffered-parity-ci-contract.ts";
 import { OWNER_PARITY_CREDENTIAL_TARGET as TARGET } from "../../../scripts/owner-buffered-parity-credential-producer.ts";
 
@@ -43,6 +46,7 @@ function world() {
     stored: new Map<string, Record<string, unknown>>(),
     statements: [] as Array<{ sql: string; params: unknown[] }>,
     writes: [] as string[],
+    buffered: [...tenants],
     failWriteAt: -1,
     corruptWriteAt: -1,
     generationAfterTenant: -1,
@@ -64,7 +68,7 @@ function world() {
         w.statements.push({ sql, params });
         if (sql.startsWith("DECLARE")) fetched = false;
         if (sql.startsWith("FETCH")) {
-          const rows = fetched ? [] : tenants.map((t) => ({ org_id: t.orgId, workspace_id: t.workspaceId, user_id: t.userId }));
+          const rows = fetched ? [] : w.buffered.map((t) => ({ org_id: t.orgId, workspace_id: t.workspaceId, user_id: t.userId }));
           fetched = true;
           return { rows: rows as R[] };
         }
@@ -83,7 +87,7 @@ function world() {
       },
     },
   };
-  const deps: Required<OwnerParityDependencies> = {
+  const deps: OwnerParityDependencies = {
     readCensus: (async (s: unknown, t: unknown, tenant: ParityTenant, _source: unknown, options?: unknown) => {
       // Census, write and readback keep readParityCensus's own transactions on the source/target pair; only
       // discovery may pass the caller-held snapshot option.
@@ -102,6 +106,15 @@ function world() {
       if (index === w.generationAfterTenant) w.generation = H("9");
       return { census: g1(tenant), outcome: existing ? "unchanged" : "insert", writtenAt: null };
     }) as never,
+    readStoredProof: async (_target, tenant) => {
+      const stored = w.stored.get(key(tenant));
+      if (!stored) return null;
+      return {
+        ...proof(tenant),
+        resetSetSha256: String(stored.reset_set_digest),
+        targetGeneration: String(stored.target_generation),
+      };
+    },
   };
   return { w, sessions, deps };
 }
@@ -120,6 +133,18 @@ const write = (c: OwnerParityCensusArtifact, x: ReturnType<typeof world>) =>
   runOwnerParity(writeEnv(c), x.sessions, { roster, runId: "202", census: c, now: () => T0 + 3600_000, writeEnabled: true, deps: x.deps });
 const statuses = (o: OwnerParityOutcome) => o.receipt.tenants.map((t) => t.status);
 
+const bulkEnv = (mode: "bulk-plan" | "bulk-write" | "bulk-readback", extra: Record<string, string> = {}) =>
+  ({ OWNER_PARITY_SHA: SHA, OWNER_PARITY_CENSUS_SOURCE: "neon", OWNER_PARITY_MODE: mode, ...extra });
+
+function bulkPlanArtifact(): OwnerParityBulkPlanArtifact {
+  const body: OwnerParityBulkPlanBody = {
+    contract: OWNER_PARITY_BULK_PLAN_CONTRACT, sourceSha: SHA, generation: H("4"), censusSource: "neon",
+    capturedAt: new Date(T0).toISOString(), censusRun: "401",
+    counts: { candidates: 9, g1Equal: 9, g1Mismatch: 0, tenantRefused: 0 },
+  };
+  return { ...body, descriptorSha256: ownerParityBulkPlanDescriptor(body) };
+}
+
 test("diagnostic codes expose only fixed SQLSTATE/connection classes and never driver content", () => {
   const pg = Object.assign(new Error("password=secret host=private.example query=SELECT tenant_id"), { code: "42501" });
   const connection = Object.assign(new Error("connect ECONNRESET private.example"), { code: "ECONNRESET" });
@@ -133,15 +158,17 @@ test("diagnostic codes expose only fixed SQLSTATE/connection classes and never d
 
 function workflowOwnerClient(login = "postgres", tableOwner = "postgres") {
   const calls: string[] = [];
-  let readOnly = false, identityReads = 0;
+  let readOnly = false, transactionReadOnly = false, identityReads = 0;
   const client: ConnectedOwnerClient = {
     async connect() { calls.push("connect"); },
     async query<R>(sql: string) {
       calls.push(sql);
-      if (sql === "SET default_transaction_read_only = on") readOnly = true;
+      if (sql === "SET default_transaction_read_only = on") readOnly = transactionReadOnly = true;
+      if (/^BEGIN .*READ ONLY$/u.test(sql)) transactionReadOnly = true;
+      if (sql === "COMMIT" || sql === "ROLLBACK") transactionReadOnly = readOnly;
       if (sql.includes("FROM pg_roles r")) {
         identityReads++;
-        return { rows: [{ actor: "postgres", login, db: "postgres", pid: 96, ro: readOnly ? "on" : "off",
+        return { rows: [{ actor: "postgres", login, db: "postgres", pid: 96, ro: transactionReadOnly ? "on" : "off",
           schemaOwner: "postgres", parityOwner: tableOwner, rolcanlogin: true, rolsuper: false,
           rolcreaterole: true, rolcreatedb: true, rolbypassrls: true, rolreplication: true }] as R[] };
       }
@@ -162,6 +189,17 @@ test("workflow route accepts only the direct release owner and fences each query
   expect(route.calls[probe - 1]).toContain("FROM pg_roles r");
   expect(route.calls[probe + 1]).toContain("FROM pg_roles r");
   expect(route.calls.at(-1)).toBe("end");
+});
+
+test("writable workflow route keeps identity fencing while a G1 uses a nested READ ONLY transaction", async () => {
+  const route = workflowOwnerClient();
+  await withWorkflowParityOwnerSession(route.client, false, async (session) => {
+    await session.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    await session.query("SELECT parity_probe");
+    await session.query("COMMIT");
+  });
+  expect(route.calls.filter((sql) => sql.includes("FROM pg_roles r"))).toHaveLength(7);
+  expect(route.calls).toContain("SELECT parity_probe");
 });
 
 test("workflow route refuses the temporary-login identity and wrong table owner before work", async () => {
@@ -265,6 +303,79 @@ test("bulk mode is unreachable and dormant write issues no statement", async () 
   const out = await runOwnerParity(writeEnv(c), x.sessions, { roster, runId: "202", census: c, now: () => T0, deps: x.deps });
   expect(out.receipt.code).toBe("owner_parity_write_dormant");
   expect(x.w.statements).toEqual([]);
+});
+
+test("bulk recovery: aggregate plan, dormant write, enabled idempotent write and exact readback", async () => {
+  const plannedWorld = world();
+  const planned = await runOwnerParityBulk(bulkEnv("bulk-plan"), plannedWorld.sessions,
+    { roster: { contract: "owner-buffered-parity-roster/v1", tenants: [] }, runId: "401", now: () => T0,
+      deps: plannedWorld.deps });
+  expect(planned.exitCode).toBe(0);
+  expect(planned.receipt).toMatchObject({ status: "ok", mode: "bulk-plan",
+    counts: { found: 9, equal: 9, mismatch: 0, inserted: 0, verified: 0 }, tenants: [] });
+  expect(planned.census).toEqual(bulkPlanArtifact());
+
+  const plan = planned.census as OwnerParityBulkPlanArtifact;
+  const env = bulkEnv("bulk-write", { OWNER_PARITY_CENSUS_RUN: plan.censusRun,
+    OWNER_PARITY_CONFIRMATION: ownerParityBulkConfirmation(plan) });
+  const dormant = world();
+  const refused = await runOwnerParityBulk(env, dormant.sessions,
+    { roster: {}, census: plan, runId: "402", now: () => T0 + 1, deps: dormant.deps });
+  expect(refused.receipt.code).toBe("owner_parity_bulk_write_dormant");
+  expect(dormant.w.statements).toEqual([]);
+
+  const writable = world();
+  const written = await runOwnerParityBulk(env, writable.sessions, { roster: {}, census: plan, runId: "402",
+    now: () => T0 + 1, bulkWriteEnabled: true, deps: writable.deps });
+  expect(written.exitCode).toBe(0);
+  expect(written.receipt).toMatchObject({ status: "ok", mode: "bulk-write",
+    counts: { found: 9, equal: 9, mismatch: 0, inserted: 9, missing: 0, stale: 0, verified: 9 }, tenants: [] });
+  expect(writable.w.writes).toEqual(tenants.map(key));
+
+  const readback = await runOwnerParityBulk(bulkEnv("bulk-readback"), writable.sessions,
+    { roster: {}, runId: "403", deps: writable.deps });
+  expect(readback).toMatchObject({ exitCode: 0, receipt: { status: "ok", mode: "bulk-readback",
+    counts: { found: 9, verified: 9, missing: 0, stale: 0 }, tenants: [] } });
+});
+
+test("bulk write refuses plan drift before a write and post-write readback mismatch stops the run", async () => {
+  const plan = bulkPlanArtifact();
+  const env = bulkEnv("bulk-write", { OWNER_PARITY_CENSUS_RUN: plan.censusRun,
+    OWNER_PARITY_CONFIRMATION: ownerParityBulkConfirmation(plan) });
+  const drift = world();
+  drift.w.buffered.pop();
+  const moved = await runOwnerParityBulk(env, drift.sessions, { roster: {}, census: plan, runId: "402",
+    now: () => T0 + 1, bulkWriteEnabled: true, deps: drift.deps });
+  expect(moved.receipt.code).toBe("owner_parity_bulk_plan_drift");
+  expect(drift.w.writes).toEqual([]);
+
+  const corrupt = world();
+  corrupt.w.corruptWriteAt = 2;
+  const stopped = await runOwnerParityBulk(env, corrupt.sessions, { roster: {}, census: plan, runId: "402",
+    now: () => T0 + 1, bulkWriteEnabled: true, deps: corrupt.deps });
+  expect(stopped.receipt.code).toBe("bulk_proof_readback_mismatch");
+  expect(corrupt.w.writes).toEqual(tenants.slice(0, 3).map(key));
+});
+
+test("bulk write refuses when the independent full readback differs after every immediate readback passed", async () => {
+  const plan = bulkPlanArtifact();
+  const env = bulkEnv("bulk-write", { OWNER_PARITY_CENSUS_RUN: plan.censusRun,
+    OWNER_PARITY_CONFIRMATION: ownerParityBulkConfirmation(plan) });
+  const x = world();
+  const readStored = x.deps.readStoredProof!;
+  let reads = 0;
+  x.deps.readStoredProof = async (target, tenant) => {
+    const stored = await readStored(target, tenant);
+    reads++;
+    return reads === tenants.length + 1 && stored !== null
+      ? { ...stored, resetSetSha256: H("f") }
+      : stored;
+  };
+  const outcome = await runOwnerParityBulk(env, x.sessions, { roster: {}, census: plan, runId: "402",
+    now: () => T0 + 1, bulkWriteEnabled: true, deps: x.deps });
+  expect(outcome).toMatchObject({ exitCode: 1, receipt: { status: "refused",
+    code: "owner_parity_bulk_readback_mismatch", counts: { verified: 8, stale: 1, missing: 0 } } });
+  expect(x.w.writes).toEqual(tenants.map(key));
 });
 
 test("credential leakage: the child gets the URL on stdin only, never argv or env; the child refuses a credential env", () => {
