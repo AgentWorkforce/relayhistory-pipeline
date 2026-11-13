@@ -413,6 +413,20 @@ describe("deploy workflow wiring", () => {
     expect(WORKFLOW).not.toContain("--var \"READ_API_OWNER_BUFFERED_PHASE_LOG");
     expect(WORKFLOW).not.toContain("--var \"READ_API_OWNER_BUFFERED_INDEX_VERIFY");
   });
+
+  test("brief_summary / list_short_summary: default off; on adds only the exact \"true\" --var to the deploy command", () => {
+    expect(WORKFLOW).toMatch(/brief_summary:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+    expect(WORKFLOW).toMatch(/list_short_summary:\n\s+description:[^\n]*\n\s+type: choice\n\s+options: \["off", "on"\]\n\s+default: "off"/);
+    expect(WORKFLOW).toContain("BRIEF_SUMMARY: ${{ inputs.brief_summary }}");
+    expect(WORKFLOW).toContain("LIST_SHORT_SUMMARY: ${{ inputs.list_short_summary }}");
+    expect(WORKFLOW).toContain('brief_summary=""; if [ "$BRIEF_SUMMARY" = "on" ]; then brief_summary=true; fi');
+    expect(WORKFLOW).toContain('list_short_summary=""; if [ "$LIST_SHORT_SUMMARY" = "on" ]; then list_short_summary=true; fi');
+    expect(WORKFLOW).toContain('${brief_summary:+--var "READ_API_BRIEF_SUMMARY_ENABLED:$brief_summary"}');
+    expect(WORKFLOW).toContain('${list_short_summary:+--var "READ_API_LIST_SHORT_SUMMARY_ENABLED:$list_short_summary"}');
+    // Never in the template or the render: a default deploy carries neither variable.
+    expect(TEMPLATE).not.toContain("READ_API_BRIEF_SUMMARY_ENABLED");
+    expect(TEMPLATE).not.toContain("READ_API_LIST_SHORT_SUMMARY_ENABLED");
+  });
 });
 
 

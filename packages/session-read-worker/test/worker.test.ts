@@ -13,6 +13,7 @@ import { createClickHouseClient, type ClickHouseClient } from "../../../src/sess
 import { row } from "../../../src/session-read-api/__tests__/support.ts";
 import { boundedClickHouse, connectPg, handle, ownerBufferedDeps, type Env } from "../src/index.ts";
 import { BufferedFenced, BufferedIndexVerifier } from "../../../src/session-read-api/owner-buffered.ts";
+import { BRIEF_SUMMARY_SIGNATURE } from "../../../src/session-read-api/brief-summary.ts";
 
 type TestEnv = Env & {
   TEST_PG_ADMIN: Hyperdrive;
@@ -399,6 +400,53 @@ describe("entry and configuration", () => {
     expect((await body(unbound)).error.code).toBe("backend_unavailable");
     const binding = { fetch: async () => new Response("{}", { status: 503 }) } as unknown as Fetcher;
     expect((await call({ ...all, HISTORY_CONTROL_HEAD: binding })).status).not.toBe(503);
+  });
+
+  test("brief summary and list short summary: default off (501), on only with the exact string \"true\", as the hosted Lambda", async () => {
+    const t = tenant();
+    const seen: Array<{ text: string; params?: unknown[] }> = [];
+    // A fake pg client: records every statement; the brief-summary function reads as not installed.
+    const connect = async () => ({
+      async query(text: string, params?: unknown[]) {
+        seen.push({ text, params });
+        return { rows: text.includes("to_regprocedure") ? [{ installed: false }] : [] };
+      },
+      async end() {},
+    }) as unknown as pg.Client;
+    const call = async (path: string, over: Partial<Env>) => {
+      const ctx = createExecutionContext();
+      const r = await handle(new Request(`${ORIGIN}${path}`, { headers: { authorization: `Bearer ${await token(t)}` } }), { ...E, READ_API_DIRECTORY_WORKSPACES: t.ws, ...over }, ctx, { connect });
+      await waitOnExecutionContext(ctx);
+      return r;
+    };
+    const summary = `/v1/sessions/s-x/summary?workspace=${t.ws}&source=claude`;
+    const list = `/v1/sessions?workspace=${t.ws}&includeShortSummary=recorded`;
+    const summarySql = () => seen.filter((q) => q.params?.includes(BRIEF_SUMMARY_SIGNATURE));
+    // Unset (the default deploy) and every value but exactly "true": unchanged 501s, no summary SQL.
+    // As on the hosted Lambda (the shared app), the 501 code is unsupported_by_backend; the cause is error.reason.
+    for (const flag of [undefined, "", "1", "TRUE", "True", " true", "true ", "on", "yes"]) {
+      seen.length = 0;
+      const s = await call(summary, { READ_API_BRIEF_SUMMARY_ENABLED: flag, READ_API_LIST_SHORT_SUMMARY_ENABLED: flag });
+      expect(s.status, `summary ${String(flag)}`).toBe(501);
+      expect((await body(s)).error, `summary ${String(flag)}`).toMatchObject({ code: "unsupported_by_backend", reason: "summary_not_configured" });
+      expect(summarySql(), `summary ${String(flag)}`).toHaveLength(0);
+      const l = await call(list, { READ_API_BRIEF_SUMMARY_ENABLED: flag, READ_API_LIST_SHORT_SUMMARY_ENABLED: flag });
+      expect(l.status, `list ${String(flag)}`).toBe(501);
+      expect((await body(l)).error, `list ${String(flag)}`).toMatchObject({ code: "unsupported_by_backend", reason: "param_includeShortSummary" });
+    }
+    // Exactly "true": the summary route reaches the brief-summary SQL through the request's tenant runner.
+    seen.length = 0;
+    const on = await call(summary, { READ_API_BRIEF_SUMMARY_ENABLED: "true" });
+    expect(summarySql()).toHaveLength(1);
+    expect(on.status).toBe(501);
+    expect((await body(on)).error).toMatchObject({ code: "unsupported_by_backend", reason: "summary_not_migrated" });
+    // Each flag is independent: the summary flag alone leaves the list extension off, and vice versa.
+    const listOff = await call(list, { READ_API_BRIEF_SUMMARY_ENABLED: "true" });
+    expect((await body(listOff)).error).toMatchObject({ code: "unsupported_by_backend", reason: "param_includeShortSummary" });
+    const listOn = await call(list, { READ_API_LIST_SHORT_SUMMARY_ENABLED: "true" });
+    expect((await body(listOn)).error?.reason).not.toBe("param_includeShortSummary");
+    const summaryOff = await call(summary, { READ_API_LIST_SHORT_SUMMARY_ENABLED: "true" });
+    expect((await body(summaryOff)).error).toMatchObject({ code: "unsupported_by_backend", reason: "summary_not_configured" });
   });
 
   test("Supabase or ClickHouse down is a 503 the caller falls back from, never a page without erasure checks", async () => {

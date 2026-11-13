@@ -5,15 +5,18 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && format('owner buffered
 # sessions.owner_buffered_parity and a read-only readback, for exactly the seven tenants whose digests are
 # committed in src/migration/owner-buffered-parity-roster.json (ships empty, so every dispatch refuses
 # roster_empty). Write refuses owner_parity_write_dormant while OWNER_PARITY_WRITE_ENABLED is false in
-# src/migration/owner-buffered-parity-ci-contract.ts. Every dispatch needs Khaliq's own word; see
-# docs/owner-buffered-parity-ci.md. Push and pull_request run only the synthetic PGlite proof job (no secrets,
-# no environment).
+# src/migration/owner-buffered-parity-ci-contract.ts. The one-time, read-only discovery mode is the exception
+# to roster_empty: it runs only while the roster is empty (roster_present otherwise), scans every buffered
+# owner in one read-only snapshot and publishes the digests and dispositions of exactly seven missing/stale
+# owners (generation_unstable, unexpected_scope refuse; counts only) for a separate reviewed roster-only PR.
+# Every dispatch needs Khaliq's own word to the production actor; see docs/owner-buffered-parity-ci.md.
+# Push and pull_request run only the synthetic PGlite proof job (no secrets, no environment).
 on:
   workflow_dispatch:
     inputs:
       mode:
         type: choice
-        options: [census, write, readback]
+        options: [census, write, readback, discovery]
         default: census
         required: true
       sha:
@@ -25,7 +28,7 @@ on:
         type: string
         default: ""
       confirmation:
-        description: 'Write: WRITE-OWNER-PARITY <sha> GENERATION <gen> SOURCE <censusSource> DESCRIPTOR <descriptor> CENSUS <census_run>, from the census artifact. Census and readback: empty'
+        description: 'Write: WRITE-OWNER-PARITY <sha> GENERATION <gen> SOURCE <censusSource> DESCRIPTOR <descriptor> CENSUS <census_run>, from the census artifact. Census, readback and discovery: empty'
         type: string
         default: ""
       census_source:
@@ -97,6 +100,7 @@ jobs:
           bun test --timeout 300000 ./src/migration/__tests__/owner-buffered-parity-ci.test.ts
           bun test --timeout 300000 ./src/migration/__tests__/owner-buffered-parity-gate.test.ts
           bun test --timeout 300000 ./src/migration/__tests__/owner-buffered-parity-ci.pglite.test.ts
+          bun test --timeout 300000 ./src/migration/__tests__/owner-buffered-parity-discovery.test.ts
 
   # No environment here: a typo/missing environment must not auto-create an unprotected one.
   prerequisite-gate:
@@ -154,7 +158,7 @@ jobs:
           github-token: ${{ github.token }}
       # The parent checks everything that needs no credential, then hands the URL to a child over a stdin pipe
       # (never argv, never the child's environment). Nothing credential-like is logged or written.
-      - name: Census, write or read back owner-buffered parity (only step with the database secret)
+      - name: Census, write, read back or discover owner-buffered parity (only step with the database secret)
         env:
           SUPABASE_MIGRATION_OWNER_URL: ${{ secrets.SUPABASE_MIGRATION_OWNER_URL }}
         run: bun scripts/owner-buffered-parity-ci.ts
@@ -174,3 +178,16 @@ jobs:
           path: ${{ runner.temp }}/owner-parity-out/owner-buffered-parity.json
           if-no-files-found: ignore
           retention-days: 30
+      # Discovery only: the sanitized discovery receipt (digests and dispositions on success, counts only on
+      # refusal) for a separate reviewed roster-only PR. No credential; the summary step re-validates the file.
+      - name: Publish the discovery receipt (discovery only)
+        if: always() && inputs.mode == 'discovery'
+        uses: actions/upload-artifact@v4
+        with:
+          name: owner-buffered-parity-discovery
+          path: ${{ runner.temp }}/owner-parity-out/owner-buffered-parity-discovery.json
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Discovery job summary (discovery only)
+        if: always() && inputs.mode == 'discovery'
+        run: bun scripts/owner-buffered-parity-ci.ts --discovery-summary
