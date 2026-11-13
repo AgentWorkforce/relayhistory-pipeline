@@ -118,7 +118,7 @@ jobs:
     # App (contents:read on layered-agents only), as relay-desktop does. The
     # environment is part of the deploy role's exact OIDC subject; the
     # reusable workflow ran in the same one.
-    runs-on: ${{ vars.DEPLOY_LINUX_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
+    runs-on: ${{ vars.DEPLOY_LINUX_RUNNER || 'ubuntu-24.04' }}
     environment: agent-deploy
     timeout-minutes: 60
     permissions:

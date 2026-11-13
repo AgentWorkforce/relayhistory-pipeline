@@ -17,7 +17,7 @@ const row = (over: Partial<DirectoryListRow> = {}): DirectoryListRow => ({
   child_session_count: 0, short_summary: null, short_summary_generated_at: null,
   catalog_projected_at: time, projected_at: time, ...over,
 });
-function api(options: { rows?: DirectoryListRow[] | null; selfhost?: boolean; error?: Error } = {}) {
+function api(options: { rows?: DirectoryListRow[] | null; selfhost?: boolean; error?: Error; listShortSummary?: boolean } = {}) {
   const calls: string[] = [];
   const list = async () => {
     calls.push("list");
@@ -37,6 +37,7 @@ function api(options: { rows?: DirectoryListRow[] | null; selfhost?: boolean; er
     liveness: memoryLiveness().liveness, completeSinceMs: 0,
     directory, directoryWorkspaces: new Set([identity.workspaceId]), sessionQuery: true,
     ...(options.selfhost === false ? {} : { selfhost: {} }),
+    ...(options.listShortSummary === undefined ? {} : { listShortSummary: options.listShortSummary }),
   });
   return { calls, get: (query = "", token = "good", workspace = "ws-a") => app.request(`/v1/sessions?workspace=${workspace}${query}`, {
     headers: { authorization: `Bearer ${token}` },
@@ -144,5 +145,65 @@ describe("explicit recorded-agent list metadata", () => {
     ];
     const projected = projectRelayhistorySession(records, { workspaceId: "ws-a", source: "codex", sessionId: "s-a", machineId: "m-a", userId: "user-a" });
     expect(projected.rows.filter((item) => item.table === "session_catalog_agents").map((item) => item.row.agent_name)).toEqual(["Recorded-Agent"]);
+  });
+});
+
+const summaryOptIn = "&includeShortSummary=recorded";
+const stored = { short_summary: "Recorded summary", short_summary_generated_at: "2026-11-02T03:04:05.678Z" };
+type ErrorBody = { error?: { code?: string; reason?: string } };
+
+describe("opt-in list short summary (includeShortSummary=recorded, READ_API_LIST_SHORT_SUMMARY_ENABLED)", () => {
+  test("flag off (absent or false): the param is 501 param_includeShortSummary before any directory call", async () => {
+    for (const listShortSummary of [undefined, false]) {
+      const { get, calls } = api({ rows: [row(stored)], ...(listShortSummary === undefined ? {} : { listShortSummary }) });
+      const response = await get(summaryOptIn);
+      expect(response.status).toBe(501);
+      const error = (await response.json() as ErrorBody).error;
+      expect(error).toMatchObject({ code: "unsupported_by_backend", reason: "param_includeShortSummary" });
+      expect(calls).toEqual([]);
+    }
+  });
+
+  test("only the exact singleton value is accepted (400 otherwise), flag on or off, before any directory call", async () => {
+    for (const listShortSummary of [true, false])
+      for (const query of ["&includeShortSummary=", "&includeShortSummary=true", "&includeShortSummary=Recorded", `${summaryOptIn}${summaryOptIn}`]) {
+        const { get, calls } = api({ listShortSummary });
+        expect([query, (await get(query)).status]).toEqual([query, 400]);
+        expect(calls).toEqual([]);
+      }
+  });
+
+  test("flag on + recorded: the two keys on list and query reads; nothing else changes", async () => {
+    for (const query of ["", "&q=recorded"]) {
+      const { get } = api({ rows: [row(stored)], listShortSummary: true });
+      const response = await get(`${query}${summaryOptIn}`);
+      expect(response.status).toBe(200);
+      const { shortSummary, shortSummaryGeneratedAt, ...unchanged } = (await body(response)).sessions![0]!;
+      expect([shortSummary, shortSummaryGeneratedAt]).toEqual(["Recorded summary", "2026-11-02T03:04:05.678Z"]);
+      expect(unchanged).toEqual(sessionFromDirectoryRow(row(stored)));
+    }
+    const nulls = (await body(await api({ listShortSummary: true }).get(summaryOptIn))).sessions![0]!;
+    expect(nulls).toMatchObject({ shortSummary: null, shortSummaryGeneratedAt: null, title: "Recorded title" });
+  });
+
+  test("combined with includeAgentName both extensions appear", async () => {
+    const item = (await body(await api({ rows: [row(stored)], listShortSummary: true }).get(`${optIn}${summaryOptIn}`))).sessions![0]!;
+    expect(item).toMatchObject({ agentName: "Recorded-Agent", shortSummary: "Recorded summary" });
+  });
+
+  test("no param: the keys are absent and the bytes match the flag-off response", async () => {
+    const on = await body(await api({ rows: [row(stored)], listShortSummary: true }).get());
+    const off = await body(await api({ rows: [row(stored)] }).get());
+    expect(on.sessions?.[0]).not.toHaveProperty("shortSummary");
+    expect(on.sessions?.[0]).not.toHaveProperty("shortSummaryGeneratedAt");
+    expect({ ...on, correlationId: null }).toEqual({ ...off, correlationId: null });
+  });
+
+  test("an over-long stored summary is out of contract like an over-long title, never a truncated or substituted value", async () => {
+    const response = await api({ rows: [row({ ...stored, short_summary: "s".repeat(1001) })], listShortSummary: true }).get(summaryOptIn);
+    expect(response.status).toBe(501);
+    const text = await response.text();
+    expect((JSON.parse(text) as ErrorBody).error?.reason).toBe("directory_row_out_of_contract");
+    expect(text).not.toContain("sss");
   });
 });
