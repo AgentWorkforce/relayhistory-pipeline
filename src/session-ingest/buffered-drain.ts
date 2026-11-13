@@ -274,6 +274,18 @@ const OUTCOMES: ObjectOutcome[] = [
   "index_merge_failed", "fence_recheck_failed", "fence_moved", "marker_failed", "internal_error",
 ];
 
+/**
+ * Outcomes that end an object for good: marked (`drained`, `already_drained`, `pre_reset`), or a staged object no rerun
+ * can ever drain (`redacted`, `vanished`, `corrupt`, `key_mismatch`, and an `ambiguous_replacement` whose peers all
+ * read cleanly). Every other outcome is left for a rerun: the checkpoint never passes it, and a hold entry is never
+ * released for it.
+ */
+export const TERMINAL_OUTCOMES: ReadonlySet<ObjectOutcome> = new Set<ObjectOutcome>([
+  "drained", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch", "ambiguous_replacement",
+]);
+/** A staged object in one of these states can never drain: a hold entry naming it holds nothing (pruned). */
+const UNDRAINABLE_READS: ReadonlySet<Read["kind"]> = new Set<Read["kind"]>(["redacted", "vanished", "corrupt", "key_mismatch"]);
+
 export interface DrainSummary {
   mode: "dry_run" | "execute";
   orgs: number;
@@ -300,6 +312,8 @@ export interface DrainSummary {
    * index merge (left unmarked, `hold_failed`), or the best-effort re-record after a partial write.
    */
   hold_failures: number;
+  /** Hold entries removed because their batch was already marked or can never drain (execute only). */
+  holds_pruned: number;
   /** Orgs without a valid fence-authority marker (per-org, else deployment-wide): --execute writes nothing of them. */
   orgs_without_authority: number;
   /** Dry run with assumeEmptyFence: batches whose user had no fence, classified as if it were empty. */
@@ -314,7 +328,7 @@ function emptySummary(mode: DrainSummary["mode"]): DrainSummary {
     mode, orgs: 0, listed: 0, foreign_keys: 0,
     objects: Object.fromEntries(OUTCOMES.map((o) => [o, 0])) as Record<ObjectOutcome, number>,
     lines: { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0 },
-    sessions_written: 0, rearmed: 0, hold_failures: 0, orgs_without_authority: 0, fence_assumed_empty: 0, write_failures: {}, stopped: "complete",
+    sessions_written: 0, rearmed: 0, hold_failures: 0, holds_pruned: 0, orgs_without_authority: 0, fence_assumed_empty: 0, write_failures: {}, stopped: "complete",
   };
 }
 
@@ -626,7 +640,12 @@ export interface DrainOptions {
   concurrency?: number;
   /** Stop pulling new batches after this many staged objects. */
   maxObjects?: number;
-  /** Called with the low watermark: every key at or before it is processed. Persist it to resume. */
+  /**
+   * Execute only (refused in a dry run). Called with the low watermark: every object at or before it reached a
+   * terminal outcome (TERMINAL_OUTCOMES). It never passes an object left for a rerun, so a run whose first such
+   * object is early keeps resuming from there: that object is retried, and the marked ones after it are skipped
+   * cheaply. Persist it to resume.
+   */
   onCheckpoint?: (key: string) => void | Promise<void>;
   /** Called after each batch group with the running summary (counts only). */
   onProgress?: (summary: DrainSummary) => void;
@@ -646,6 +665,8 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(opts.keyRoot)) throw new Error("drain_key_root_invalid");
   for (const org of opts.orgs) if (!/^(?!\.)[A-Za-z0-9._-]{1,128}$/.test(org)) throw new Error("drain_org_invalid");
   if (opts.assumeEmptyFence && !opts.dryRun) throw new Error("drain_assume_empty_fence_requires_dry_run");
+  // A dry run writes nothing, so a watermark it recorded would let --execute skip everything it only classified.
+  if (opts.dryRun && opts.onCheckpoint) throw new Error("drain_checkpoint_requires_execute");
   const lockTtlMs = opts.lockTtlMs ?? DRAIN_LOCK_TTL_MS;
   if (!Number.isSafeInteger(lockTtlMs) || lockTtlMs < 1_000) throw new Error("drain_lock_ttl_invalid");
   const resetMarginMs = opts.resetMarginMs ?? RESET_MARGIN_DEFAULT_MS;
@@ -709,6 +730,13 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
    * write fails) and removes itself only after its index merge, so a SIGKILL, OOM or host death mid-write still
    * leaves it. `intents` are this run's own in-flight entries: they do not hold the user's other batches (a failure
    * stops the user through `stoppedUsers` instead); every other entry, from an earlier run, does.
+   *
+   * Every terminal outcome releases the batch's entry: `drained` after its index merge, `pre_reset` and an
+   * `ambiguous_replacement` before they end (the batch is never drained), each BEFORE its marker. A batch with no
+   * readable header (`redacted`, `vanished`, `corrupt`, `key_mismatch`) cannot name its user, so the user's next batch
+   * prunes the entry (`liveHold`), as it does an entry whose batch was already marked. Pruning an undrainable entry
+   * gives up re-deriving its index entries: the records an earlier partial write landed stay unindexed (the reader's
+   * fold still refuses an equal revision with other content). Counted in `holds_pruned`.
    */
   const stoppedUsers = new Set<string>();
   const intents = new Set<string>();
@@ -719,6 +747,42 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     const uk = userKeyOf(t);
     if (fresh || !holds.has(uk)) holds.set(uk, readText(opts.store, holdKeyOf(t), 1024 * 1024).then((got) => (got ? parseDrainHold(got.text) ?? "invalid" : null), () => "invalid" as const));
     return holds.get(uk)!;
+  }
+  /**
+   * An entry that holds nothing: its batch was marked (a crash after its marker, or a run before releases preceded
+   * marks), or its staged object can never drain (UNDRAINABLE_READS). Checked once per run per entry; a storage
+   * error is not settled (the entry keeps holding).
+   */
+  const settledCache = new Map<string, Promise<boolean>>();
+  function settled(key: string): Promise<boolean> {
+    if (!settledCache.has(key)) settledCache.set(key, (async () => {
+      if (await readText(opts.store, key + DRAINED_SUFFIX, 64 * 1024)) return true;
+      const parts = parseStagedKey(key);
+      if (!parts) return false;
+      return UNDRAINABLE_READS.has((await readStagedObject(opts.store, key, parts, opts.decompress)).kind);
+    })().catch(() => false));
+    return settledCache.get(key)!;
+  }
+  /**
+   * The user's hold without its settled entries from earlier runs (never `self`, never this run's intents). An
+   * execute run also removes them from storage; a failed removal fails closed (`invalid`: the user is held).
+   */
+  async function liveHold(t: LedgerTenant, self: string, fresh = false): Promise<DrainHold | "invalid" | null> {
+    const hold = await readHold(t, fresh);
+    if (hold === null || hold === "invalid") return hold;
+    const stale = new Set<string>();
+    for (const k of hold.keys) if (k !== self && !intents.has(k) && (await settled(k))) stale.add(k);
+    if (!stale.size) return hold;
+    if (!opts.dryRun) {
+      try {
+        await editHold(t, (ks) => ks.filter((k) => !stale.has(k)));
+      } catch {
+        summary.hold_failures++;
+        return "invalid";
+      }
+      summary.holds_pruned += stale.size;
+    }
+    return { ...hold, keys: hold.keys.filter((k) => !stale.has(k)) };
   }
   /** Held back: an unreadable hold (fail closed), or entries from an earlier run that do not include this batch. */
   function heldBack(hold: DrainHold | "invalid" | null, key: string): boolean {
@@ -764,13 +828,27 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
 
   // Low-watermark checkpointing over concurrent groups.
   let pulled = 0, nextToCommit = 0;
+  /** Finished terminal groups (by pull order) not yet under the watermark: their last key. */
   const done = new Map<number, string>();
+  /**
+   * The earliest group with an object left for a rerun: the watermark never reaches it this run. Groups after it are
+   * not kept (they could never be committed), so memory stays bounded by the concurrency however long the run.
+   */
+  let blockAt = Infinity;
   let checkpointChain: Promise<void> = Promise.resolve();
   let checkpointError: unknown;
-  const complete = (seq: number, lastKey: string) => {
+  const complete = (seq: number, lastKey: string, terminal: boolean) => {
+    if (!terminal) {
+      if (seq < blockAt) {
+        blockAt = seq;
+        for (const s of done.keys()) if (s > blockAt) done.delete(s);
+      }
+      return;
+    }
+    if (seq > blockAt) return;
     done.set(seq, lastKey);
     let mark: string | undefined;
-    while (done.has(nextToCommit)) {
+    while (nextToCommit < blockAt && done.has(nextToCommit)) {
       mark = done.get(nextToCommit);
       done.delete(nextToCommit++);
     }
@@ -781,13 +859,14 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   };
 
   let objects = 0;
+  let stopPulling = false;
   let fatal: { error: unknown } | undefined;
   const iterator = allGroups();
   try {
   await Promise.all(
     Array.from({ length: concurrency }, async () => {
       for (;;) {
-        if (fatal || checkpointError !== undefined || lockLost !== undefined) return;
+        if (fatal || checkpointError !== undefined || lockLost !== undefined || stopPulling) return;
         if (opts.maxObjects !== undefined && objects >= opts.maxObjects) {
           summary.stopped = "max_objects";
           return;
@@ -802,11 +881,16 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
         }
         if (next.done) return;
         const group = next.value;
+        // A group never splits: one that would cross the limit is left for the next run (unless it is the first).
+        if (opts.maxObjects !== undefined && objects > 0 && objects + group.staged.length > opts.maxObjects) {
+          summary.stopped = "max_objects";
+          stopPulling = true;
+          return;
+        }
         const seq = pulled++;
         objects += group.staged.length;
         summary.listed += group.staged.length;
-        await drainGroup(group);
-        complete(seq, group.lastKey);
+        complete(seq, group.lastKey, await drainGroup(group));
         opts.onProgress?.(summary);
       }
     }),
@@ -821,7 +905,13 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   if (lockLost !== undefined) throw lockLost;
   return summary;
 
-  async function drainGroup(group: BatchGroup) {
+  /** Drain one batch group. True when every object of it reached a terminal outcome (the checkpoint may pass it). */
+  async function drainGroup(group: BatchGroup): Promise<boolean> {
+    let terminal = true;
+    const note = (outcome: ObjectOutcome, isTerminal = TERMINAL_OUTCOMES.has(outcome)) => {
+      summary.objects[outcome]++;
+      if (!isTerminal) terminal = false;
+    };
     // Read everything not yet drained, then decide per claim token (GC replacement detection).
     const reads = new Map<string, Read>();
     // Re-read (at most every AUTHORITY_TTL_MS): deleting the org's or the global marker stops the run's writes.
@@ -837,18 +927,20 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     }
     for (const key of group.staged) {
       if (group.markers.has(key)) {
-        summary.objects.already_drained++;
+        note("already_drained");
         continue;
       }
       // --execute writes only for an org admission itself would admit (the dry run still classifies, and reports
       // the org in orgs_without_authority).
       if (!opts.dryRun && authority !== "ok") {
-        summary.objects[authority === "missing" ? "fence_authority_missing" : "fence_authority_invalid"]++;
+        note(authority === "missing" ? "fence_authority_missing" : "fence_authority_invalid");
         continue;
       }
       const read = reads.get(key)!;
       if (read.kind !== "live") {
-        summary.objects[read.kind]++;
+        // An undrainable object has no header to name its user: a hold entry naming it is pruned by the user's
+        // next batch (liveHold).
+        note(read.kind);
         continue;
       }
       // A buffered-GC replacement keeps the batch digest and claim token under a new content hash. More
@@ -857,15 +949,51 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       const claim32 = parseStagedKey(key)!.claim32;
       const peers = group.staged.filter((k) => k !== key && parseStagedKey(k)!.claim32 === claim32 && (group.markers.has(k) || reads.get(k)?.kind === "live" || reads.get(k)?.kind === "internal_error"));
       if (peers.length) {
-        summary.objects.ambiguous_replacement++;
+        // A peer unreadable just now may read cleanly on a rerun: only then is this left for one.
+        if (peers.some((k) => reads.get(k)?.kind === "internal_error")) {
+          note("ambiguous_replacement", false);
+          continue;
+        }
+        // Never drained: a hold entry for it (an earlier run's partial write) would hold its user for good.
+        const h = read.decoded.header;
+        try {
+          if (!(await releaseHeld({ orgId: h.org_id, workspaceId: h.workspace_id, userId: h.user_id }, key))) {
+            note("hold_failed");
+            continue;
+          }
+        } catch {
+          note("internal_error");
+          continue;
+        }
+        note("ambiguous_replacement");
         continue;
       }
       try {
-        summary.objects[await drainOne(key, read.decoded)]++;
+        note(await drainOne(key, read.decoded));
       } catch {
-        summary.objects.internal_error++;
+        note("internal_error");
       }
     }
+    return terminal;
+  }
+
+  /**
+   * Remove `key` from its user's hold, if it is there, before the batch ends for good without draining. True when it
+   * is no longer held (a dry run writes nothing and reports true); false, counted in hold_failures, when the release
+   * failed: the batch is then left for a rerun, never marked.
+   */
+  async function releaseHeld(t: LedgerTenant, key: string): Promise<boolean> {
+    if (opts.dryRun) return true;
+    const hold = await readHold(t, true);
+    if (hold === null || (hold !== "invalid" && !hold.keys.includes(key))) return true;
+    try {
+      await editHold(t, (ks) => ks.filter((k) => k !== key));
+    } catch {
+      summary.hold_failures++;
+      return false;
+    }
+    intents.delete(key);
+    return true;
   }
 
   async function drainOne(key: string, { header, groups, sha256 }: Decoded): Promise<ObjectOutcome> {
@@ -875,7 +1003,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     const uk = userKeyOf(tenant);
     if (stoppedUsers.has(uk)) return "user_stopped";
     // An unreadable hold fails closed; a held user writes only its held batches until they drain.
-    if (heldBack(await readHold(tenant), key)) return "user_hold";
+    if (heldBack(await liveHold(tenant, key), key)) return "user_hold";
     let keys: ReturnType<DrainLedger["keysFor"]>;
     let read: FenceRead;
     try {
@@ -908,6 +1036,9 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       // ledger-s3 `lastResetAtMs`: 0 means no reset time was recorded (it only ever rises).
       if (fence.lastResetAtMs === 0) return "reset_undeterminable";
       if (receivedMs <= fence.lastResetAtMs - resetMarginMs) {
+        // The reset supersedes the batch, including anything an earlier partial run wrote of it (its sessions
+        // were registered as owned first, so the reset reaches them). Release its hold entry, THEN mark it.
+        if (!opts.dryRun && !(await releaseHeld(tenant, key))) return "hold_failed";
         if (!opts.dryRun && !(await putMarker(key, sha256, "pre_reset", counts, 0))) return "marker_failed";
         return "pre_reset";
       }
@@ -944,7 +1075,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       // Again under the shard lock: a batch queued behind one that failed (or held the user) meanwhile stops here.
       // The hold is re-read from storage, not the cache.
       if (stoppedUsers.has(uk)) return "user_stopped";
-      const hold = await readHold(tenant, true);
+      const hold = await liveHold(tenant, key, true);
       if (heldBack(hold, key)) return "user_hold";
       /** This batch is an entry of a hold from an earlier run: it re-derives its index entries, then releases it. */
       const heldEarlier = hold !== "invalid" && hold !== null && hold.keys.includes(key) && !intents.has(key);

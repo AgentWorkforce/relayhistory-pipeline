@@ -103,6 +103,8 @@ export function parseDrainArgs(argv: string[]): DrainArgs {
   const resetMarginSeconds = int("--reset-margin-seconds", 60, 86_400);
   const startAfter = one.get("--start-after"), checkpointFile = one.get("--checkpoint-file"), kmsKeyArn = one.get("--kms-key-arn");
   if (startAfter !== undefined && checkpointFile !== undefined) throw new Error("use --start-after or --checkpoint-file, not both");
+  // A dry run writes nothing: a watermark it saved would let a later --execute skip everything it only classified.
+  if (checkpointFile !== undefined && mode === "dry_run") throw new Error("--checkpoint-file is only for --execute (use --start-after to page a dry run)");
   if (startAfter !== undefined && !validResumeKey(startAfter)) throw new Error("--start-after must be a buffered staged key or its drained marker");
   if (mode === "execute" && (kmsKeyArn === undefined || !KMS.test(kmsKeyArn))) throw new Error("--execute requires --kms-key-arn (the bucket's KMS key ARN)");
   if (mode === "dry_run" && kmsKeyArn !== undefined) throw new Error("--kms-key-arn is only for --execute");
@@ -158,7 +160,7 @@ if (import.meta.main) {
   try {
     args = parseDrainArgs(process.argv.slice(2));
   } catch (error) {
-    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--concurrency n] [--max-objects n] [--start-after key | --checkpoint-file path] [--assume-empty-fence (dry run only)] [--reset-margin-seconds n (default 300, min 60)]; --execute only after controls dual-write is live and a fresh backfill rerun; one drain process at a time (lease at 96bulls/.drain/lock.json); AWS_* credentials in the environment`);
+    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--concurrency n] [--max-objects n] [--start-after key | --checkpoint-file path (execute only)] [--assume-empty-fence (dry run only)] [--reset-margin-seconds n (default 300, min 60)]; --execute only after controls dual-write is live and a fresh backfill rerun; one drain process at a time (lease at 96bulls/.drain/lock.json); AWS_* credentials in the environment`);
     process.exit(2);
   }
   const accessKeyId = process.env.AWS_ACCESS_KEY_ID, secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
@@ -183,7 +185,8 @@ if (import.meta.main) {
     const summary = await drainBufferedBatches({
       store, keyRoot: KEY_ROOT, orgs, dryRun: args.mode === "dry_run", concurrency: args.concurrency,
       ...(args.assumeEmptyFence ? { assumeEmptyFence: true } : {}),
-      ...(args.resetMarginMs !== undefined ? { resetMarginMs: args.resetMarginMs } : {}),      decompress: (bytes) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: BUFFER_STAGE_MAX_BYTES })),
+      ...(args.resetMarginMs !== undefined ? { resetMarginMs: args.resetMarginMs } : {}),
+      decompress: (bytes) => new Uint8Array(zstdDecompressSync(bytes, { maxOutputLength: BUFFER_STAGE_MAX_BYTES })),
       ...(args.maxObjects !== undefined ? { maxObjects: args.maxObjects } : {}),
       ...(startAfter !== undefined ? { startAfter } : {}),
       ...(args.checkpointFile ? {
