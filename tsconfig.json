@@ -58,7 +58,9 @@
     "scripts/opensearch-proof",
     "scripts/buffered-drain.ts",
     "scripts/accepted-stage-export.ts",
-    "scripts/upload-fence-backfill.ts"
+    "scripts/upload-fence-backfill.ts",
+    "scripts/backlog-ops.ts",
+    "scripts/backlog-ops-github.ts"
   ],
   "exclude": [
     "node_modules",
