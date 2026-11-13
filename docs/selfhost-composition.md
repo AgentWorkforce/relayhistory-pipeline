@@ -578,6 +578,10 @@ What `s3` requires and changes:
     3. Controls write the S3 fence before SQL (`controlMirror`; on self-host the ledger does this itself).
     4. The eraser sweeps the S3 re-arm markers (`rearmSweeper`).
   - Deleting a marker stops **new** claims for the orgs it covered within 60 s (the cache is per org). A batch already claimed still commits. Errors carry codes only (`ledger_fence_authority_missing`, `_invalid`, `_org_mismatch`), never an org id.
+  - **Stopping admission (kill switch).** Per-org markers are read first, and a missing per-org marker falls back to the deployment-wide one. So:
+    - To stop **one org**, write an *invalid* marker at `<keyRoot>/.ledger/fence-authority/<org>.json` (for example `{}`). An invalid per-org marker refuses that org even while the deployment-wide marker is valid. Deleting the org's marker is **not** enough while a valid deployment-wide marker exists.
+    - To stop **every org**, delete the deployment-wide marker **and** every per-org marker under `<keyRoot>/.ledger/fence-authority/`, or write an invalid marker for each org. Deleting only the deployment-wide marker leaves orgs with their own valid marker admitting.
+    - Either way, already-claimed batches still commit, and each warm instance stops within its 60 s cache.
 - **Controls also write SQL.** Selection, reset and ordered controls write the S3 fence first, then reconcile SQL `upload_deletions` (and write SQL's reset record) to the fence's final state. The read API and the eraser still read SQL. A failure on either side fails the control (503), and its retry is idempotent. This is deletion state for readers, never upload accounting: claims and commits never call SQL.
 - **A reset is completed only by its own retry** on self-host: a claim never completes a reset left running, so the SQL half is never skipped. A client that abandons a reset leaves it running until a retry with the same `request_id`.
 - **The conditional-write startup probe** (the `.admission-probe` row above) runs in every admission mode, including `sync`.

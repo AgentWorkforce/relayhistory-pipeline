@@ -27,11 +27,14 @@
  *   ledger/rearm/o=<h(origin)>/<sessionKey>.json   the re-arm marker for the eraser:
  *       {v, originId, source, sessionId, machineId, atMs}, create-only.
  *
- * And one deployment-wide object, written by an operator (never by this code):
+ * And the fence-authority markers, written by an operator (never by this code):
  *
- *   <keyRoot>/.ledger/fence-authority.json   FenceAuthorityDoc. While it is absent or invalid, a ledger built
- *       with `fenceAuthority: "required"` answers every claim with a retry (`ledger_fence_authority_missing`),
- *       never an admit. See FenceAuthorityDoc for what writing it asserts.
+ *   <keyRoot>/.ledger/fence-authority/<org>.json   FenceAuthorityDoc + orgId, read first for the claim's org.
+ *   <keyRoot>/.ledger/fence-authority.json         FenceAuthorityDoc, the deployment-wide fallback (after the
+ *       full backfill). With `fenceAuthority: "required"`, a claim admits only when its org's marker is valid,
+ *       or its org has no marker and the deployment-wide one is valid. An invalid or mismatched per-org marker
+ *       refuses that org outright. Otherwise every claim is a retry (`ledger_fence_authority_missing`), never an
+ *       admit. Kill switch: docs/selfhost-composition.md ("Stopping admission").
  *
  * h(x) = sha256(x) hex [0:32]. sessionKey = sessionKeyHash(source, sessionId) = h(JSON.stringify([source, sessionId])).
  *
