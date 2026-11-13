@@ -7,7 +7,7 @@ import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import { exportAcceptedStages, type ExportOptions, type ExportSql } from "../accepted-stage-export.ts";
 import { ACCEPTED_SUFFIX, acceptedCompleteKey, drainBufferedBatches, parseAcceptedComplete } from "../buffered-drain.ts";
-import { s3LedgerKeys, s3LedgerObjects } from "../ledger-s3.ts";
+import { orgFenceAuthorityKey, s3LedgerKeys, s3LedgerObjects } from "../ledger-s3.ts";
 import { BUFFER_STAGE_MAX_BYTES, prepareBufferedStage, putBufferedStage, stagedKey } from "../staging.ts";
 import { parseExportArgs } from "../../../scripts/accepted-stage-export.ts";
 import { applySupabaseSchema } from "./pglite-schema.ts";
@@ -169,6 +169,9 @@ describe("accepted-stage export (0005 step 0b)", () => {
     await seed(A, { key: refused.prepared.spec.key, sha256: refused.prepared.spec.sha256, digest: refused.digest, claim: refused.claim, receipt: "preparing", outbox: "none" });
     expect((await run(store)).written).toBe(1);
     await s3LedgerObjects(store, ROOT).editFence(s3LedgerKeys(ROOT, A).fence, (f) => ({ next: f, result: undefined }));
+    // --execute needs the org's fence authority, as admission does (main's OrgFenceAuthorityDoc).
+    await store.put(objectKey(orgFenceAuthorityKey(ROOT, A.orgId)), enc.encode(JSON.stringify({ v: 1, fenceBackfill: "complete", revisionBackfill: "complete",
+      ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: 1, orgId: A.orgId })));
     const drained = await drainBufferedBatches({ store, keyRoot: ROOT, orgs: [A.orgId], dryRun: false, sleep: async () => {},
       decompress: (b) => new Uint8Array(zstdDecompressSync(b, { maxOutputLength: BUFFER_STAGE_MAX_BYTES })) });
     expect(drained.objects).toMatchObject({ drained: 1, stage_unacknowledged: 1, accepted_mismatch: 0, stage_export_missing: 0 });

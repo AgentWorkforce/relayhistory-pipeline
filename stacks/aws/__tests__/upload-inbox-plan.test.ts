@@ -124,6 +124,21 @@ describe("upload inbox update", () => {
   });
 });
 
+describe("presign-only upload inbox (uploadPresignIssuer, no uploadControlRoleArn): no desktop-upload-role", () => {
+  const presignOnly = [...store, ...SESSION_PIPELINE_RESOURCES, ...UPLOAD_INBOX_RESOURCES.filter((r) => r !== "desktop-upload-role"), "upload-presign-issuer"];
+  const grants = { transcripts: "update", "transcripts-key": "update", "transcript-writer": "update", "transcript-reader": "update", "transcript-srv-writer": "update" };
+  it("the rollout accepts the resource set without the role, the issuer created with it", () => {
+    const creates = Object.fromEntries(presignOnly.filter((r) => (UPLOAD_INBOX_RESOURCES as readonly string[]).includes(r) || r === "upload-presign-issuer").map((r) => [r, "create"]));
+    expect(check({ ...creates, ...grants }, {}, ROLE, presignOnly)).toBe("upload inbox rollout");
+    expect(check({}, {}, ROLE, presignOnly)).toBe("post-apply");
+    expect(check({ "upload-admission": "update" }, {}, ROLE, presignOnly)).toBe("upload inbox update");
+  });
+  it("without the role AND without the issuer, the plan still misses desktop-upload-role", () => {
+    const neither = presignOnly.filter((r) => r !== "upload-presign-issuer");
+    expect(() => check({}, {}, ROLE, neither)).toThrow(/missing resource desktop-upload-role/);
+  });
+});
+
 describe("upload presign issuer (uploadPresignIssuer)", () => {
   const withIssuer = [...all, "upload-presign-issuer"];
   const grants = { transcripts: "update", "transcripts-key": "update" };

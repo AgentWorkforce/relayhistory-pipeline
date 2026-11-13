@@ -1,0 +1,5 @@
+{
+  "contract": "owner-buffered-parity-roster/v1",
+  "comment": "Exactly seven tenantSha256 digests (scripts/owner-buffered-parity-operator.ts tenantSha256), never tenant identifiers. Ships empty: every workflow run refuses roster_empty until a reviewed follow-up PR fills it.",
+  "tenants": []
+}

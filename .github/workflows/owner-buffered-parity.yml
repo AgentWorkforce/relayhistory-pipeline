@@ -1,0 +1,176 @@
+name: owner buffered parity
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('owner buffered parity {0} {1}', inputs.mode, inputs.sha) || format('owner buffered parity proof {0}', github.sha) }}
+
+# Dormant, CI-only exact-seven owner-buffered parity: census (G1, read-only), the G2 write of
+# sessions.owner_buffered_parity and a read-only readback, for exactly the seven tenants whose digests are
+# committed in src/migration/owner-buffered-parity-roster.json (ships empty, so every dispatch refuses
+# roster_empty). Write refuses owner_parity_write_dormant while OWNER_PARITY_WRITE_ENABLED is false in
+# src/migration/owner-buffered-parity-ci-contract.ts. Every dispatch needs Khaliq's own word; see
+# docs/owner-buffered-parity-ci.md. Push and pull_request run only the synthetic PGlite proof job (no secrets,
+# no environment).
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [census, write, readback]
+        default: census
+        required: true
+      sha:
+        description: Exact current main commit (40 lowercase hex)
+        type: string
+        required: true
+      census_run:
+        description: Write only - the successful census run id of this workflow at the same sha (under 24h old); empty otherwise
+        type: string
+        default: ""
+      confirmation:
+        description: 'Write: WRITE-OWNER-PARITY <sha> GENERATION <gen> SOURCE <censusSource> DESCRIPTOR <descriptor> CENSUS <census_run>, from the census artifact. Census and readback: empty'
+        type: string
+        default: ""
+      census_source:
+        description: frozen-supabase (the frozen copy in the target project) or neon (refuses; no Neon secret exists)
+        type: choice
+        options: [frozen-supabase, neon]
+        default: frozen-supabase
+        required: true
+  pull_request:
+    paths:
+      - .github/workflows/owner-buffered-parity.yml
+      - scripts/owner-buffered-parity-ci.ts
+      - scripts/owner-buffered-parity-github.ts
+      - scripts/owner-buffered-parity-operator.ts
+      - src/migration/owner-buffered-parity*.ts
+      - src/migration/owner-buffered-parity-roster.json
+      - src/migration/__tests__/owner-buffered-parity-*.ts
+      - supabase/migrations/**
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/owner-buffered-parity.yml
+      - scripts/owner-buffered-parity-ci.ts
+      - scripts/owner-buffered-parity-github.ts
+      - scripts/owner-buffered-parity-operator.ts
+      - src/migration/owner-buffered-parity*.ts
+      - src/migration/owner-buffered-parity-roster.json
+      - src/migration/__tests__/owner-buffered-parity-*.ts
+      - supabase/migrations/**
+
+permissions:
+  contents: read
+  actions: read
+  deployments: read
+
+# Dispatches serialize with every other guarded operator on the same database. Proof runs get their own per-sha
+# group so a push never queues behind (or cancels) a pending dispatch.
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && 'guarded-session-schema-production' || format('owner-buffered-parity-proof-{0}', github.sha) }}
+  cancel-in-progress: false
+
+env:
+  OWNER_PARITY_MODE: ${{ inputs.mode }}
+  OWNER_PARITY_SHA: ${{ inputs.sha }}
+  OWNER_PARITY_CENSUS_RUN: ${{ inputs.census_run }}
+  OWNER_PARITY_CONFIRMATION: ${{ inputs.confirmation }}
+  OWNER_PARITY_CENSUS_SOURCE: ${{ inputs.census_source }}
+
+jobs:
+  proof:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without database credentials
+        run: bun install --frozen-lockfile
+      - name: Synthetic PGlite census, write and readback proof over every migration
+        run: bun scripts/owner-buffered-parity-ci.ts --proof
+      - name: Wrapper, gate and PGlite tests
+        run: |
+          bun test --timeout 300000 ./src/migration/__tests__/owner-buffered-parity-ci.test.ts
+          bun test --timeout 300000 ./src/migration/__tests__/owner-buffered-parity-gate.test.ts
+          bun test --timeout 300000 ./src/migration/__tests__/owner-buffered-parity-ci.pglite.test.ts
+
+  # No environment here: a typo/missing environment must not auto-create an unprotected one.
+  prerequisite-gate:
+    if: github.event_name == 'workflow_dispatch' && github.repository_id == '1437714333' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without database credentials
+        run: bun install --frozen-lockfile
+      - name: Verify dormant switch, mode, exact main, dispatch identity, green CI and the census run
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          bun scripts/owner-buffered-parity-github.ts
+          echo "environment=session-schema-production" >> "$GITHUB_OUTPUT"
+
+  database:
+    needs: prerequisite-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: ${{ needs.prerequisite-gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without database credentials
+        run: bun install --frozen-lockfile
+      - name: Recheck live gates and any recorded environment approval
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/owner-buffered-parity-github.ts --approved
+      - name: Download the census artifact (write only)
+        if: inputs.mode == 'write'
+        uses: actions/download-artifact@v4
+        with:
+          name: owner-buffered-parity-census
+          path: ${{ runner.temp }}/owner-parity-census
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.census_run }}
+          github-token: ${{ github.token }}
+      # The parent checks everything that needs no credential, then hands the URL to a child over a stdin pipe
+      # (never argv, never the child's environment). Nothing credential-like is logged or written.
+      - name: Census, write or read back owner-buffered parity (only step with the database secret)
+        env:
+          SUPABASE_MIGRATION_OWNER_URL: ${{ secrets.SUPABASE_MIGRATION_OWNER_URL }}
+        run: bun scripts/owner-buffered-parity-ci.ts
+      - name: Publish the census artifact (census only)
+        if: inputs.mode == 'census'
+        uses: actions/upload-artifact@v4
+        with:
+          name: owner-buffered-parity-census
+          path: ${{ runner.temp }}/owner-parity-out/owner-buffered-parity-census.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Publish the sanitized receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: owner-buffered-parity
+          path: ${{ runner.temp }}/owner-parity-out/owner-buffered-parity.json
+          if-no-files-found: ignore
+          retention-days: 30
