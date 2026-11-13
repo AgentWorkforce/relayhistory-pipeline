@@ -57,9 +57,22 @@ cluster has an `actors` node group.
    no Workers, Queues, Hyperdrive or R2.
 3. **No Lambdas for the pipeline.** The read API, upload admission and the workers run as pods. The
    sessions Lambdas are retired once nothing calls them.
-4. **Durable actors replace the Postgres implementation for pipeline state.** One `Sessions` actor per
-   workspace, on the durable-actors control plane that relaycast and relayfile use, owns that
-   workspace's derived session state and work:
+4. **Durable actors replace the Postgres implementation for pipeline state.** Actors run on the
+   durable-actors control plane that relaycast and relayfile use. They are **sharded so that no single
+   actor is on a workspace's hot path**: one actor executes one call at a time. The Relaycast benchmark
+   measured about 1.5-3 channel posts a second per workspace actor, against about 10-16 on Postgres,
+   with ~80 s queue waits under overload (infra branch `bench/relaycast-postgres-vs-actors`,
+   `docs/benchmarks/relaycast-postgres-vs-actors.md`). So:
+   - **A `Session` actor per session** takes that session's appends and derived work: index row,
+     summary, category and status. Writes arrive in batches (one per upload), each with an idempotency
+     key, so a retried call never double-applies.
+   - **A `Workspace` actor per workspace** holds only the aggregate: the directory, the running ledger,
+     the live lanes for overlap detection, and the alert queue. It is fed small, batched updates from
+     session actors, never raw events.
+   - Actor memory is sized above the shipped 256 MiB (the benchmark peaked at 230-247 MiB), and the
+     shared tier (gateway replicas, control plane, start-rate limits) is sized for the session count.
+
+   Between them, these actors own each workspace's derived session state and work:
    - **Session directory and index:** today's Supabase `session_index` and `session_directory`, held
      in actor SQLite.
    - **Summaries and categories:** the actor runs the summarizer on new session data, writes the
@@ -75,8 +88,13 @@ cluster has an `actors` node group.
 5. **Object storage stays the record.** Transcripts and manifests stay in the bucket, and so does 0005's
    upload ledger. 0005's S3 accounting needs no database, and actors don't change it. An upload
    becoming durable in S3 is the event that wakes the workspace's actor.
-6. **Gateways stay stateless.** read-api and ingest-edge route each request to the workspace actor by a
-   verified credential, as the relaycast gateway does.
+6. **Gateways stay stateless.** read-api and ingest-edge route each request to the right session or
+   workspace actor by a verified credential, as the relaycast gateway does. Actors cannot call into the
+   cluster (the sandbox NetworkPolicy allows only public egress and the control plane), so gateways
+   push facts to actors and never the other way.
+7. **No Neon.** The Neon path is removed completely: custody checks against Neon, the legacy-receipt
+   reads, relayhistory-cloud's Neon reads and writes, and the Neon replica queue
+   (`docs/neon-exit-edge-map.md`). Nothing on the sessions upload, read or work path may touch Neon.
 
 ## What moves where
 
@@ -124,9 +142,12 @@ Each phase lands in dev first, then goes to prod on his OK.
      migration can also be a rebuild.
    - Switch read-api to read from the actors.
    - Retire the Postgres job queue, the polling workers and the phase-2 stopgap.
-5. **Off Cloudflare:** retire the ingest, read and amp-transport Workers, the Queues and Hyperdrive, then
+5. **Off Neon:** remove every Neon read and write on the sessions paths (custody, legacy receipts,
+   relayhistory-cloud's session tables, the replica queue). This needs the custody and privacy
+   authority moved first, so it runs alongside phases 1 and 3.
+6. **Off Cloudflare:** retire the ingest, read and amp-transport Workers, the Queues and Hyperdrive, then
    the relayhistory-cloud Worker. The Cloud web Worker follows the Cloud owners' plan.
-6. **Consolidate the accounts:**
+7. **Consolidate the accounts:**
    - Give agentrelay-prod a sessions bucket in the transcript region, and copy the transcripts and the
      drained backlog with versions and re-encryption.
    - Repoint everything and run old and new side by side until reads match.
@@ -140,9 +161,21 @@ Each phase lands in dev first, then goes to prod on his OK.
 - **The durable-actors control plane still uses Postgres** (`credentialsSecret.postgres-url`) for its
   registry. That is the platform's own metadata, shared with relaycast and relayfile, not pipeline
   state.
-- **Durable actors on EKS** need the AgentWorkforce fork's control-plane image (S3 storage provider,
-  infra's `charts/durable-actors/UPSTREAM.md` patch 10). Its GHCR packages may be private. Nodes must be
-  able to pull them, or they need mirroring.
+- **Durable actors on EKS**, from the Relaycast move (infra#271/#272/#274):
+  - **Images:** they need the AgentWorkforce fork's control-plane image (S3 provider). Mirror its images
+    into the registry the nodes pull from.
+  - **TLS to RDS:** the control plane needs a CA bundle of the system roots plus the RDS CA, with
+    `sslmode=require`.
+  - **Node group:** a dedicated actor node group, labelled and tainted, in one zone that matches
+    `placement.zone`.
+  - **Sockets:** set `DURABLE_ACTORS_SOCKET_ORIGIN` so the gateway can reach the control plane's socket
+    path inside the VPC.
+  - **Migration:** a full copy that never drops data. Each table is verified by count and digest, and a
+    workspace goes live only on an explicit `open`.
+- **Not yet measured for this workload:** per-actor SQLite size, snapshot size and time, and start
+  latency at session scale (the benchmark measured 0.9 s median and 7.5 s p95 to create, and seconds
+  after idle). Phase 4 starts with a sessions-shaped benchmark in agentrelay-dev before any design is
+  final.
 - **Portability.** Self-host stays on the infra repo's EKS and GKE profiles. durable-actors has GCS and
   S3 storage providers. Azure would need an Azure Blob provider in durable-actors and in this repo's
   object store, and is not planned.
