@@ -32,7 +32,7 @@ import { OWNER_PARITY_CREDENTIAL_TARGET as TARGET } from "../../../scripts/owner
 const H = (c: string) => c.repeat(64);
 const SHA = "5".repeat(40);
 const tenants: ParityTenant[] = Array.from({ length: 9 }, (_, i) => ({ orgId: `fixture-org-${i}`, workspaceId: `fixture-ws-${i}`, userId: `fixture-user-${i}` }));
-const roster = { contract: "owner-buffered-parity-roster/v1", tenants: tenants.slice(0, 7).map(tenantSha256) };
+const roster = { contract: "owner-buffered-parity-roster/v1", tenants: tenants.slice(0, 8).map(tenantSha256) };
 const key = (t: ParityTenant) => t.userId;
 
 /** A mock world: the ledger (9 buffered tenants), the live generation, per-tenant source digests and stored rows. */
@@ -174,18 +174,18 @@ test("workflow route refuses the temporary-login identity and wrong table owner 
   }
 });
 
-test("census then write: seven rows, roster order, exact readback; unlisted tenants never reach G1 or a write", async () => {
+test("census then write: eight rows, roster order, exact readback; unlisted tenants never reach G1 or a write", async () => {
   const c = await census();
   expect(c.tenants.map((t) => t.tenantSha256)).toEqual(roster.tenants);
   const x = world();
   const out = await write(c, x);
   expect(out.exitCode).toBe(0);
-  expect(out.receipt.counts).toMatchObject({ roster: 7, found: 7, inserted: 7, verified: 7 });
-  expect(x.w.writes).toEqual(tenants.slice(0, 7).map(key));
-  for (const t of tenants.slice(7)) expect(x.w.statements.some((s) => s.params.includes(t.userId))).toBe(false);
+  expect(out.receipt.counts).toMatchObject({ roster: 8, found: 8, inserted: 8, verified: 8 });
+  expect(x.w.writes).toEqual(tenants.slice(0, 8).map(key));
+  for (const t of tenants.slice(8)) expect(x.w.statements.some((s) => s.params.includes(t.userId))).toBe(false);
 });
 
-test("partial seven-row write fails closed: first refusal stops the loop, written rows are reported, exit is non-zero", async () => {
+test("partial eight-row write fails closed: first refusal stops the loop, written rows are reported, exit is non-zero", async () => {
   const c = await census();
   const x = world();
   x.w.failWriteAt = 3;
@@ -195,7 +195,7 @@ test("partial seven-row write fails closed: first refusal stops the loop, writte
   expect(out.receipt.code).toBe("parity_mismatch:source_moved");
   expect(out.receipt.counts.inserted).toBe(3);
   expect(out.receipt.counts.verified).toBe(3);
-  expect(statuses(out)).toEqual(["inserted", "inserted", "inserted", "refused", "not_attempted", "not_attempted", "not_attempted"]);
+  expect(statuses(out)).toEqual(["inserted", "inserted", "inserted", "refused", "not_attempted", "not_attempted", "not_attempted", "not_attempted"]);
   expect(x.w.writes).toEqual(tenants.slice(0, 3).map(key));
 });
 
@@ -219,8 +219,8 @@ test("readback mode: a stale or missing row fails the run", async () => {
   const out = await runOwnerParity({ ...base, OWNER_PARITY_MODE: "readback" }, x.sessions, { roster, runId: "303", deps: x.deps });
   expect(out.exitCode).toBe(3);
   expect(out.receipt.status).toBe("mismatch");
-  expect(statuses(out)).toEqual(["missing", "stale", "equal", "equal", "equal", "equal", "equal"]);
-  expect(x.w.writes.length).toBe(7);
+  expect(statuses(out)).toEqual(["missing", "stale", "equal", "equal", "equal", "equal", "equal", "equal"]);
+  expect(x.w.writes.length).toBe(8);
 });
 
 test("concurrent change between census and write: a moved PASS generation refuses before any write", async () => {

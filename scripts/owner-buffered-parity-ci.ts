@@ -1,5 +1,5 @@
 /**
- * CI wrapper for .github/workflows/owner-buffered-parity.yml: the exact-seven owner-buffered parity census
+ * CI wrapper for .github/workflows/owner-buffered-parity.yml: the exact-eight owner-buffered parity census
  * (G1), the dormant G2 write and the read-only readback (docs/owner-buffered-parity-ci.md).
  *
  * It adds no parity SQL. Tenants are enumerated with the operator's bulk cursor SQL
@@ -18,10 +18,10 @@
  * written: the receipt and the census artifact carry digests, counts and public proof fields only.
  *
  * Discovery (one-time, read-only, only while the roster is empty) holds one read-only repeatable-read target
- * snapshot from the in-snapshot marker through the cursor, target comparisons and exact-seven check. Frozen
+ * snapshot from the in-snapshot marker through the cursor, target comparisons and exact-eight check. Frozen
  * source reads join it. Neon uses a second caller-owned read-only snapshot, anchored after the target marker and
  * before enumeration; no comparison is autocommit. External target-generation reads fence both sides. It emits
- * only digests and dispositions of exactly seven missing-or-stale owners, so a separate
+ * only digests and dispositions of exactly eight missing-or-stale owners, so a separate
  * reviewed roster-only PR can be written from the receipt. It never writes, never selects a writable session
  * and refuses roster_present, generation_unstable and unexpected_scope (counts only on refusal).
  *
@@ -181,7 +181,7 @@ export interface OwnerParityReceipt {
 
 export interface OwnerParityOutcome {
   receipt: OwnerParityReceipt;
-  /** census mode, all seven equal: the artifact to publish. */
+  /** census mode, all eight equal: the artifact to publish. */
   census: OwnerParityCensusArtifact | null;
   exitCode: number;
 }
@@ -340,7 +340,7 @@ export async function readLiveGeneration(target: Queryable): Promise<string> {
 /**
  * One read-only repeatable-read snapshot of the target's buffered tenants (the operator's bulk cursor SQL),
  * filtered to roster digests as each bounded page arrives. Unlisted tenants are hashed and dropped; nothing
- * else is done with them. Refuses roster_incomplete unless all seven are found.
+ * else is done with them. Refuses roster_incomplete unless all eight are found.
  */
 export async function enumerateRosterTenants(enumerator: Queryable, roster: readonly string[]): Promise<Kept[]> {
   const wanted = new Set(roster);
@@ -376,7 +376,7 @@ export async function enumerateRosterTenants(enumerator: Queryable, roster: read
 /**
  * G2 for the kept roster, in roster order: fresh G1 (equal, at the census generation and byte-equal to the
  * census entry), writeCurrentParityProof, then same-run exact readback of the stored row. The first refusal
- * stops the loop; rows already written stay and are reported. Fewer than seven verified rows fails closed.
+ * stops the loop; rows already written stay and are reported. Fewer than eight verified rows fails closed.
  */
 export async function writeOwnerParityTenants(
   sessions: OwnerParitySessions,
@@ -552,7 +552,7 @@ export async function scanBufferedOwners(snapshot: Queryable): Promise<{ tenants
 
 /**
  * The target classification runs in one `REPEATABLE READ READ ONLY` transaction on the fenced enumerator: PASS
- * marker, bounded cursor, every target G1/stored-proof read, exact-seven and final marker. Frozen source reads
+ * marker, bounded cursor, every target G1/stored-proof read, exact-eight and final marker. Frozen source reads
  * join it. Neon source reads join a separate caller-owned read-only snapshot anchored after the target marker and
  * before enumeration. Every disposition therefore uses stable target and source snapshots; no comparison uses
  * autocommit. Any refusal rolls back every open snapshot.
@@ -621,10 +621,10 @@ export async function discoverOwnersInSnapshot(
  * The read-only discovery run. Never throws a refusal and never writes: generation A on the target, then the
  * stable-snapshot classification (discoverOwnersInSnapshot: in-snapshot generation, owner list, every comparison
  * by the readback rule -- no stored row is missing, a stored row byte-equal to a fresh equal proof at A is
- * canonical current, anything else is stale -- the exact-seven check and a final in-snapshot generation), then
+ * canonical current, anything else is stale -- the exact-eight check and a final in-snapshot generation), then
  * generation B on the target, which must equal A (generation_unstable). Frozen source shares the target snapshot;
  * Neon uses its own caller-owned snapshot. The target session only answers the two external generation reads.
- * Exactly seven missing+stale owners or unexpected_scope; a refused receipt carries counts only, never digests.
+ * Exactly eight missing+stale owners or unexpected_scope; a refused receipt carries counts only, never digests.
  */
 export async function runOwnerParityDiscovery(
   env: Record<string, string | undefined>,
@@ -932,7 +932,7 @@ export const PROOF_SHA = "5".repeat(40);
 export const PROOF_TENANTS: ParityTenant[] = Array.from({ length: 9 }, (_, i) => ({
   orgId: `fixture-org-${i + 1}`, workspaceId: `fixture-ws-${i + 1}`, userId: `fixture-user-${i + 1}`,
 }));
-/** Roster tenants are the first seven; tenants 8 and 9 are buffered but unlisted and must never be touched. */
+/** Roster tenants are the first eight; tenant 9 is buffered but unlisted and must never be touched. */
 export const PROOF_ROSTER = {
   contract: "owner-buffered-parity-roster/v1",
   comment: "synthetic proof roster",
@@ -1046,11 +1046,11 @@ export async function ownerParityProof(): Promise<{ cases: ProofCase[]; failed: 
   const write = (c: unknown, e: Record<string, string>, now = T0 + 3600_000) =>
     runOwnerParity(e, sessions(), { roster: PROOF_ROSTER, runId: "202", census: c, now: () => now, writeEnabled: true });
 
-  await check("census: exactly the seven roster tenants, all equal, at the live PASS generation", async () => {
+  await check("census: exactly the eight roster tenants, all equal, at the live PASS generation", async () => {
     const outcome = await runOwnerParity(env("census"), sessions(), { roster: PROOF_ROSTER, runId: "101", now: () => T0 });
     assert(outcome.exitCode === 0 && outcome.receipt.status === "ok", "census not ok: " + outcome.receipt.code);
     census = outcome.census;
-    assert(census && census.tenants.length === 7 && census.tenants.every((t) => t.status === "equal"), "census shape");
+    assert(census && census.tenants.length === OWNER_PARITY_EXACT_COUNT && census.tenants.every((t) => t.status === "equal"), "census shape");
     assert(census!.generation === H("4") && census!.censusRun === "101" && census!.capturedAt === new Date(T0).toISOString(),
       "census binding");
     assert(JSON.stringify(census!.tenants.map((t) => t.tenantSha256)) === JSON.stringify(PROOF_ROSTER.tenants), "roster order");
@@ -1067,12 +1067,12 @@ export async function ownerParityProof(): Promise<{ cases: ProofCase[]; failed: 
   await check("refuses roster_empty", async () => {
     expectCode(await runOwnerParity(env("census"), sessions(), { roster: { ...PROOF_ROSTER, tenants: [] }, runId: "1" }), "roster_empty");
   });
-  await check("refuses roster_incomplete (six listed)", async () => {
+  await check("refuses roster_incomplete (seven listed)", async () => {
     expectCode(await runOwnerParity(env("census"), sessions(),
-      { roster: { ...PROOF_ROSTER, tenants: PROOF_ROSTER.tenants.slice(0, 6) }, runId: "1" }), "roster_incomplete");
+      { roster: { ...PROOF_ROSTER, tenants: PROOF_ROSTER.tenants.slice(0, OWNER_PARITY_EXACT_COUNT - 1) }, runId: "1" }), "roster_incomplete");
   });
   await check("refuses roster_incomplete (a listed tenant has no buffered row)", async () => {
-    const roster = { ...PROOF_ROSTER, tenants: [...PROOF_ROSTER.tenants.slice(0, 6), tenantSha256({ orgId: "absent",
+    const roster = { ...PROOF_ROSTER, tenants: [...PROOF_ROSTER.tenants.slice(0, OWNER_PARITY_EXACT_COUNT - 1), tenantSha256({ orgId: "absent",
       workspaceId: "absent", userId: "absent" })] };
     expectCode(await runOwnerParity(env("census"), sessions(), { roster, runId: "1" }), "roster_incomplete");
   });
@@ -1092,7 +1092,7 @@ export async function ownerParityProof(): Promise<{ cases: ProofCase[]; failed: 
   });
   await check("refuses a substituted roster digest in the census", async () => {
     const forged = JSON.parse(JSON.stringify(c()));
-    forged.tenants[0].tenantSha256 = forged.tenants[0].census.tenantSha256 = tenantSha256(PROOF_TENANTS[7]!);
+    forged.tenants[0].tenantSha256 = forged.tenants[0].census.tenantSha256 = tenantSha256(PROOF_TENANTS[8]!);
     expectCode(await write(forged, writeEnv(c())), "owner_parity_census_descriptor");
   });
   await check("refuses when the live PASS generation moved since the census", async () => {
@@ -1104,22 +1104,23 @@ export async function ownerParityProof(): Promise<{ cases: ProofCase[]; failed: 
       await target.exec(`UPDATE sessions.__96bulls_role_validation SET generation='${H("4")}'`);
     }
   });
-  await check("write: seven rows, exact readback, the eighth and ninth tenants never touched", async () => {
+  await check("write: eight rows, exact readback, the ninth tenant never touched", async () => {
     const outcome = await write(c(), writeEnv(c()));
     assert(outcome.exitCode === 0 && outcome.receipt.status === "ok", "write not ok: " + outcome.receipt.code);
-    assert(outcome.receipt.counts.inserted === 7 && outcome.receipt.counts.verified === 7, "counts");
+    assert(outcome.receipt.counts.inserted === OWNER_PARITY_EXACT_COUNT &&
+      outcome.receipt.counts.verified === OWNER_PARITY_EXACT_COUNT, "counts");
     const rows = await parityRows();
-    assert(JSON.stringify(rows) === JSON.stringify(PROOF_TENANTS.slice(0, 7).map((t) => t.userId).sort()), "rows");
-    for (const t of PROOF_TENANTS.slice(7))
+    assert(JSON.stringify(rows) === JSON.stringify(PROOF_TENANTS.slice(0, OWNER_PARITY_EXACT_COUNT).map((t) => t.userId).sort()), "rows");
+    for (const t of PROOF_TENANTS.slice(OWNER_PARITY_EXACT_COUNT))
       assert(!log.some((q) => q.params.includes(t.userId) || q.sql.includes(t.userId)), "unlisted tenant touched");
   });
   await check("write is idempotent: a second run reports unchanged", async () => {
     const outcome = await write(c(), writeEnv(c()));
-    assert(outcome.exitCode === 0 && outcome.receipt.counts.unchanged === 7, "not unchanged");
+    assert(outcome.exitCode === 0 && outcome.receipt.counts.unchanged === OWNER_PARITY_EXACT_COUNT, "not unchanged");
   });
-  await check("readback: equal for all seven", async () => {
+  await check("readback: equal for all eight", async () => {
     const outcome = await runOwnerParity(env("readback"), sessions(), { roster: PROOF_ROSTER, runId: "303" });
-    assert(outcome.exitCode === 0 && outcome.receipt.counts.equal === 7, "readback");
+    assert(outcome.exitCode === 0 && outcome.receipt.counts.equal === OWNER_PARITY_EXACT_COUNT, "readback");
   });
   await check("readback: a deleted row reads missing and a moved source reads stale", async () => {
     const t = PROOF_TENANTS[0]!, u = PROOF_TENANTS[1]!;
@@ -1134,7 +1135,8 @@ export async function ownerParityProof(): Promise<{ cases: ProofCase[]; failed: 
     assert(outcome.exitCode === 3 && outcome.receipt.status === "mismatch", "readback status");
     const byDigest = new Map(outcome.receipt.tenants.map((x) => [x.tenantSha256, x.status]));
     assert(byDigest.get(tenantSha256(t)) === "missing" && byDigest.get(tenantSha256(u)) === "stale" &&
-      outcome.receipt.counts.equal === 5, "readback per-digest " + JSON.stringify([...byDigest.values()]));
+      outcome.receipt.counts.equal === OWNER_PARITY_EXACT_COUNT - 2,
+      "readback per-digest " + JSON.stringify([...byDigest.values()]));
   });
   await check("receipt and census carry no private field names or values", async () => {
     const outcome = await runOwnerParity(env("readback"), sessions(), { roster: PROOF_ROSTER, runId: "305" });
@@ -1150,26 +1152,26 @@ export async function ownerParityProof(): Promise<{ cases: ProofCase[]; failed: 
       "discovery roster_present: " + outcome.receipt.code);
     assert(log.length === before, "roster_present touched a session");
   });
-  await check("discovery: three missing owners refuses unexpected_scope with counts only", async () => {
+  await check("discovery: two missing owners refuses unexpected_scope with counts only", async () => {
     // Discovery reads only its one snapshot session, so it runs on the instance holding the parity rows (the
-    // target): tenant 1 deleted (missing), 2-7 written and unchanged there (current), 8-9 never written.
+    // target): tenant 1 deleted (missing), 2-8 written and unchanged there (current), 9 never written.
     const outcome = await runOwnerParityDiscovery(env("discovery"),
       { source: queryable(source, log), enumerator: queryable(target, log), target: queryable(target, log) },
       { roster: { ...PROOF_ROSTER, tenants: [] }, runId: "402" });
     const k = outcome.receipt.counts;
     assert(outcome.exitCode === 1 && outcome.receipt.code === "unexpected_scope" && outcome.receipt.owners.length === 0 &&
-      k.scanned === 9 && k.canonicalCurrent === 6 && k.missing === 3 && k.stale === 0, "scope " + JSON.stringify(outcome.receipt));
+      k.scanned === 9 && k.canonicalCurrent === 7 && k.missing === 2 && k.stale === 0, "scope " + JSON.stringify(outcome.receipt));
     assert(!JSON.stringify(outcome.receipt).includes("tenantSha256"), "digests on refusal");
   });
   await Promise.all([source.close(), target.close(), enumeratorDb.close()]);
 
-  await check("discovery: read-only snapshot on a fresh image finds exactly seven missing/stale owners and writes nothing", async () => {
+  await check("discovery: read-only snapshot on a fresh image finds exactly eight missing/stale owners and writes nothing", async () => {
     const setupSource = await open(), setupTarget = await open();
     let dSource: Db | null = null, dTarget: Db | null = null, dEnumerator: Db | null = null;
     try {
-      // Setup only (not discovery): canonical rows for tenants 1-3, then tenant 2's frozen source moves (stale).
+      // Setup only (not discovery): canonical rows for tenants 1-2, then tenant 2's frozen source moves (stale).
       // Both land on the setup target, whose image then backs every discovery session (one database, as in prod).
-      for (const t of PROOF_TENANTS.slice(0, 3))
+      for (const t of PROOF_TENANTS.slice(0, 2))
         await writeCurrentParityProof(queryable(setupSource), queryable(setupTarget), t, H("4"), "frozen-supabase");
       const u = PROOF_TENANTS[1]!;
       await setupTarget.exec(`SET bulls96.privacy_authority_writer='authority';
@@ -1195,12 +1197,11 @@ export async function ownerParityProof(): Promise<{ cases: ProofCase[]; failed: 
       }, { roster: { ...PROOF_ROSTER, tenants: [] }, runId: "403", now: () => T0 });
       assert(outcome.exitCode === 0 && outcome.receipt.status === "ok", "discovery not ok: " + JSON.stringify(outcome.receipt));
       const k = outcome.receipt.counts;
-      assert(k.scanned === 9 && k.canonicalCurrent === 2 && k.missing === 6 && k.stale === 1 && k.unparsable === 0,
+      assert(k.scanned === 9 && k.canonicalCurrent === 1 && k.missing === 7 && k.stale === 1 && k.unparsable === 0,
         "counts " + JSON.stringify(k));
       const byDigest = new Map(outcome.receipt.owners.map((o) => [o.tenantSha256, o.disposition]));
       assert(byDigest.get(tenantSha256(u)) === "stale" && !byDigest.has(tenantSha256(PROOF_TENANTS[0]!)) &&
-        !byDigest.has(tenantSha256(PROOF_TENANTS[2]!)) &&
-        PROOF_TENANTS.slice(3).every((t) => byDigest.get(tenantSha256(t)) === "missing"), "dispositions");
+        PROOF_TENANTS.slice(2).every((t) => byDigest.get(tenantSha256(t)) === "missing"), "dispositions");
       assert(outcome.receipt.generation === H("4") && outcome.receipt.sourceSha === PROOF_SHA, "binding");
       parseOwnerParityDiscoveryReceipt(JSON.parse(JSON.stringify(outcome.receipt)));
       assert(!dLog.some((q) => /\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE)\b/iu.test(q.sql)), "discovery issued a write statement");
@@ -1211,7 +1212,7 @@ export async function ownerParityProof(): Promise<{ cases: ProofCase[]; failed: 
       assert(sourceLog.length === 0, "the source session was used");
       assert(targetLog.length === 2 && targetLog.every((q) => q.sql === BULK_TARGET_GENERATION_SQL), "the target did more than the fence");
       const rows = (await dEnumerator.query<{ n: number }>("SELECT count(*)::int AS n FROM sessions.owner_buffered_parity")).rows[0]!.n;
-      assert(rows === 3, "parity rows changed: " + rows);
+      assert(rows === 2, "parity rows changed: " + rows);
       const text = JSON.stringify(outcome.receipt) + ownerParityDiscoverySummary(outcome.receipt);
       for (const t of PROOF_TENANTS) assert(!text.includes(t.orgId) && !text.includes(t.workspaceId) && !text.includes(t.userId), "identifier");
     } finally {

@@ -1,13 +1,13 @@
 name: owner buffered parity
 run-name: ${{ github.event_name == 'workflow_dispatch' && format('owner buffered parity {0} {1}', inputs.mode, inputs.sha) || format('owner buffered parity proof {0}', github.sha) }}
 
-# Dormant, CI-only exact-seven owner-buffered parity: census (G1, read-only), the G2 write of
-# sessions.owner_buffered_parity and a read-only readback, for exactly the seven tenants whose digests are
+# Dormant, CI-only exact-eight owner-buffered parity: census (G1, read-only), the G2 write of
+# sessions.owner_buffered_parity and a read-only readback, for exactly the eight tenants whose digests are
 # committed in src/migration/owner-buffered-parity-roster.json (ships empty, so every dispatch refuses
 # roster_empty). Write refuses owner_parity_write_dormant while OWNER_PARITY_WRITE_ENABLED is false in
 # src/migration/owner-buffered-parity-ci-contract.ts. The one-time, read-only discovery mode is the exception
 # to roster_empty: it runs only while the roster is empty (roster_present otherwise), scans every buffered
-# owner in one read-only snapshot and publishes the digests and dispositions of exactly seven missing/stale
+# owner in one read-only snapshot and publishes the digests and dispositions of exactly eight missing/stale
 # owners (generation_unstable, unexpected_scope refuse; counts only) for a separate reviewed roster-only PR.
 # Every dispatch needs Khaliq's own word to the production actor; see docs/owner-buffered-parity-ci.md.
 # Push and pull_request run only the synthetic PGlite proof job (no secrets, no environment).

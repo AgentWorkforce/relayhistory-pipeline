@@ -5,7 +5,7 @@
  * After enumeration, a second connection commits a change to a parity input (a source reset) or to an
  * owner_buffered_parity row without moving the PASS generation; discovery must still report the pre-change
  * dispositions. The pre-repair code compared each owner in its own autocommit snapshot after enumeration, so it saw
- * the change, counted an eighth missing/stale owner and refused unexpected_scope: this test fails on it.
+ * the change, counted a ninth missing/stale owner and refused unexpected_scope: this test fails on it.
  *
  * OWNED disposable PostgreSQL only: loopback, user postgres, no password, scratch databases.
  * Run: OWNER_PARITY_TEST_PG_URL=postgres://postgres@127.0.0.1:5432/postgres bun test --timeout 300000 <this file>
@@ -63,10 +63,10 @@ async function moveNeonSource(c: pg.Client, index: number, request: string): Pro
   await c.query(`INSERT INTO sessions.session_resets(org_id,workspace_id,user_id,request_id,deleted) VALUES(${t},'${request}',1)`);
 }
 
-// Before any change: tenants 1 and 3 canonical current, tenant 2 stale, tenants 4-9 missing (exactly seven).
+// Before any change: tenant 1 canonical current, tenant 2 stale, tenants 3-9 missing (exactly eight).
 const PRE_CHANGE = [
   { tenantSha256: tenantSha256(PROOF_TENANTS[1]!), disposition: "stale" },
-  ...PROOF_TENANTS.slice(3).map((t) => ({ tenantSha256: tenantSha256(t), disposition: "missing" })),
+  ...PROOF_TENANTS.slice(2).map((t) => ({ tenantSha256: tenantSha256(t), disposition: "missing" })),
 ].sort((a, b) => (a.tenantSha256 < b.tenantSha256 ? -1 : 1));
 
 describe.skipIf(!url)("owner parity discovery holds stable snapshots across enumeration and comparison (PostgreSQL)", () => {
@@ -99,10 +99,10 @@ describe.skipIf(!url)("owner parity discovery holds stable snapshots across enum
     } finally {
       await c.end();
     }
-    // Setup only: canonical rows for tenants 1-3 through the real writer (two sessions), then tenant 2's source moves.
+    // Setup only: canonical rows for tenants 1-2 through the real writer (two sessions), then tenant 2's source moves.
     const [s, t] = [await connect(BASE), await connect(BASE)];
     try {
-      for (const tenant of PROOF_TENANTS.slice(0, 3))
+      for (const tenant of PROOF_TENANTS.slice(0, 2))
         await writeCurrentParityProof(queryable(s), queryable(t), tenant, H("4"), "frozen-supabase");
       await moveSource(s, 1, "request-stale");
       await moveNeonSource(s, 1, "request-neon-stale");
@@ -139,7 +139,7 @@ describe.skipIf(!url)("owner parity discovery holds stable snapshots across enum
           },
         },
       });
-      // A fresh run after the change sees it: the change was causal (an eighth missing/stale owner).
+      // A fresh run after the change sees it: the change was causal (a ninth missing/stale owner).
       const fresh = await runOwnerParityDiscovery(env(sourceKind), sessions, { roster: emptyRoster, runId: "708" });
       return { out, fresh, hooked };
     } finally {
@@ -151,7 +151,7 @@ describe.skipIf(!url)("owner parity discovery holds stable snapshots across enum
     expect(r.hooked).toBe(1);
     expect(r.out.exitCode).toBe(0);
     expect(r.out.receipt).toMatchObject({ status: "ok", generation: H("4"),
-      counts: { scanned: 9, canonicalCurrent: 2, missing: 6, stale: 1, unparsable: 0 } });
+      counts: { scanned: 9, canonicalCurrent: 1, missing: 7, stale: 1, unparsable: 0 } });
     expect(r.out.receipt.owners).toEqual(PRE_CHANGE);
     expect(r.fresh.receipt).toMatchObject({ status: "refused", code: "unexpected_scope", owners: [] });
   };
@@ -166,9 +166,9 @@ describe.skipIf(!url)("owner parity discovery holds stable snapshots across enum
   }, 300_000);
 
   test("an owner_buffered_parity row deleted on connection B after enumeration: dispositions stay those of the snapshot", async () => {
-    // Tenant 3 is canonical current in the snapshot; its stored proof disappears (it would read missing outside it).
+    // Tenant 1 is canonical current in the snapshot; its stored proof disappears (it would read missing outside it).
     expectPreChange(await scenario("frozen-supabase", async (b) => {
-      const r = await b.query("DELETE FROM sessions.owner_buffered_parity WHERE user_id=$1", [PROOF_TENANTS[2]!.userId]);
+      const r = await b.query("DELETE FROM sessions.owner_buffered_parity WHERE user_id=$1", [PROOF_TENANTS[0]!.userId]);
       expect(r.rowCount).toBe(1);
     }));
   }, 300_000);

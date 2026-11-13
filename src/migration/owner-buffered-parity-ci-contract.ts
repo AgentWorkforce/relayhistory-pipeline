@@ -1,5 +1,5 @@
 /**
- * Dormant switch, fixed constants and pure validators for the exact-seven owner-buffered parity workflow
+ * Dormant switch, fixed constants and pure validators for the exact-eight owner-buffered parity workflow
  * (.github/workflows/owner-buffered-parity.yml, scripts/owner-buffered-parity-ci.ts,
  * scripts/owner-buffered-parity-github.ts; docs/owner-buffered-parity-ci.md).
  *
@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 export const OWNER_PARITY_WRITE_ENABLED: boolean = false;
 
 /** The roster must name exactly this many tenant digests, and every one must be found on the target ledger. */
-export const OWNER_PARITY_EXACT_COUNT = 7;
+export const OWNER_PARITY_EXACT_COUNT = 8;
 /** A census older than this (by its run's created_at and by its capturedAt) cannot feed a write. */
 export const OWNER_PARITY_CENSUS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
@@ -35,14 +35,14 @@ export type OwnerParityMode = (typeof OWNER_PARITY_MODES)[number];
 
 /**
  * Per-mode dispatch policy. `readOnly` selects the target session (only `write` gets a writable one) and
- * `roster` selects the roster rule: `seven` is parseOwnerParityRoster (exactly seven digests), `empty` is
+ * `roster` selects the roster rule: `fixed` is parseOwnerParityRoster (exactly eight digests), `empty` is
  * requireEmptyOwnerParityRoster (discovery is one-time: it refuses roster_present once a roster exists).
  */
-export const OWNER_PARITY_MODE_POLICY: Readonly<Record<OwnerParityMode, { readOnly: boolean; roster: "seven" | "empty" }>> =
+export const OWNER_PARITY_MODE_POLICY: Readonly<Record<OwnerParityMode, { readOnly: boolean; roster: "fixed" | "empty" }>> =
   Object.freeze({
-    census: Object.freeze({ readOnly: true, roster: "seven" as const }),
-    write: Object.freeze({ readOnly: false, roster: "seven" as const }),
-    readback: Object.freeze({ readOnly: true, roster: "seven" as const }),
+    census: Object.freeze({ readOnly: true, roster: "fixed" as const }),
+    write: Object.freeze({ readOnly: false, roster: "fixed" as const }),
+    readback: Object.freeze({ readOnly: true, roster: "fixed" as const }),
     discovery: Object.freeze({ readOnly: true, roster: "empty" as const }),
   });
 export const OWNER_PARITY_CENSUS_SOURCES = ["frozen-supabase", "neon"] as const;

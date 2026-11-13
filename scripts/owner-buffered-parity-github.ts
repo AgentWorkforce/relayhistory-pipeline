@@ -1,5 +1,5 @@
 /**
- * Read-only GitHub gate for .github/workflows/owner-buffered-parity.yml (exact-seven owner-buffered parity
+ * Read-only GitHub gate for .github/workflows/owner-buffered-parity.yml (exact-eight owner-buffered parity
  * census, dormant G2 write, readback). Mirrors the admission-renewal gate: repository id, main ref, the exact
  * live main head, first attempt, the pinned human dispatcher (strict: no environment-reviewer substitute), the
  * protected session-schema-production environment (main only) and green push CI at the SHA (ci `checks`,

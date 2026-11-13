@@ -1,10 +1,10 @@
-# Owner-buffered parity CI workflow (exact seven, dormant write, one-time discovery)
+# Owner-buffered parity CI workflow (exact eight, dormant write, one-time discovery)
 
 `.github/workflows/owner-buffered-parity.yml` runs the owner-buffered parity census (G1), the G2 write of
-`sessions.owner_buffered_parity` and a read-only readback for **exactly seven** tenants, from CI only. It adds
+`sessions.owner_buffered_parity` and a read-only readback for **exactly eight** tenants, from CI only. It adds
 no parity SQL: it drives the existing operator code (`scripts/owner-buffered-parity-operator.ts`,
 `src/migration/owner-buffered-parity.ts`) through the single-tenant path, one tenant at a time. A one-time,
-read-only `discovery` mode finds which seven buffered owners lack a canonical current parity row, so the
+read-only `discovery` mode finds which eight buffered owners lack a canonical current parity row, so the
 roster can be written (see [Discovery](#discovery-read-only-one-time)).
 
 **Every dispatch, in any mode, needs Khaliq's own word.** Merging this workflow authorizes nothing.
@@ -16,7 +16,7 @@ roster can be written (see [Discovery](#discovery-read-only-one-time)).
 - Write is dormant: `OWNER_PARITY_WRITE_ENABLED = false`. A write dispatch refuses `owner_parity_write_dormant`
   in the gate job and again in the database step **before any credential is read**.
 - The roster `src/migration/owner-buffered-parity-roster.json` ships **empty**, so every census, write and
-  readback dispatch refuses `roster_empty`. Adding the seven digests is a separate follow-up PR. `discovery`
+  readback dispatch refuses `roster_empty`. Adding the eight digests is a separate follow-up PR. `discovery`
   is the only mode that runs on the empty roster, and it refuses `roster_present` once the roster is filled.
 - Census and readback stay callable once the roster is populated.
 
@@ -28,7 +28,7 @@ tuple). Tenant identifiers never appear in the repository, a workflow input, a l
 The database step enumerates buffered tenants from the target ledger with the operator's own bulk cursor SQL
 (`BULK_BUFFERED_TENANTS_SQL`, one read-only repeatable-read snapshot, bounded `FETCH` pages), hashes each row
 and keeps only roster digests. Unlisted tenants are hashed and dropped; nothing else is done with them.
-Unless all seven are found the run refuses `roster_incomplete`. The operator's `bulk` mode is not a mode of
+Unless all eight are found the run refuses `roster_incomplete`. The operator's `bulk` mode is not a mode of
 this workflow and cannot be reached (`owner_parity_inputs`).
 
 ## Inputs
@@ -94,7 +94,7 @@ Proof runs use a per-sha group.
 For each roster tenant, in roster order, the database step runs G1 (`readParityCensus`). It reads source
 snapshot A, then the target, then source snapshot B, all on fenced read-only sessions.
 
-When all seven are equal at the live generation, it uploads the census artifact `owner-buffered-parity-census`
+When all eight are equal at the live generation, it uploads the census artifact `owner-buffered-parity-census`
 (retention 1 day). The artifact holds:
 
 - `sourceSha`, the live `generation`, `censusSource`, `capturedAt` and `censusRun`;
@@ -127,16 +127,16 @@ Per tenant, in roster order:
 2. `writeCurrentParityProof` writes the row.
 3. An exact readback of the stored row must equal the fresh proof (`owner_parity_readback_mismatch`).
 
-The first refusal stops the loop. Rows already written stay and are reported per digest. Fewer than seven
+The first refusal stops the loop. Rows already written stay and are reported per digest. Fewer than eight
 verified rows fails the run.
 
 ### `readback` (read-only)
 
-Reports `equal`, `stale` or `missing` per digest. It exits 3 unless all seven are equal.
+Reports `equal`, `stale` or `missing` per digest. It exits 3 unless all eight are equal.
 
 ### `discovery` (read-only, one-time)
 
-Discovery exists only to find the seven digests for the roster. The production SQL actor asked for it.
+Discovery exists only to find the eight digests for the roster. The production SQL actor asked for it.
 
 **Every discovery dispatch is Khaliq's own word to the production actor.** Merging the mode authorizes no
 run. Its receipt authorizes nothing either: the roster is a **separate reviewed roster-only PR** written from
@@ -168,7 +168,7 @@ it. No comparison uses autocommit. The external generation fence on the target b
    - anything else is `stale`.
 
    A change committed elsewhere after the enumeration cannot change a disposition.
-4. Still in the snapshot, check exactly seven, read the generation a final time (it must equal step 1), then
+4. Still in the snapshot, check exactly eight, read the generation a final time (it must equal step 1), then
    `COMMIT`. Any refusal rolls the snapshot back.
 5. Read the generation on the target again. It must still equal step 1.
 
@@ -200,7 +200,7 @@ file strictly before publishing it. The receipt holds:
 - `status` and, on refusal, a fixed `code`;
 - `runId`, `sourceSha`, `generation`, `censusSource` and `capturedAt`;
 - counts: `scanned`, `canonicalCurrent`, `missing`, `stale` and `unparsable`;
-- on success only, `owners`: exactly seven `{tenantSha256, disposition}` entries, sorted by digest, where the
+- on success only, `owners`: exactly eight `{tenantSha256, disposition}` entries, sorted by digest, where the
   disposition is `missing` or `stale`;
 - `credentialsPersisted: false`.
 
@@ -250,8 +250,8 @@ that neither the receipt nor stdout contains a key named `orgId`, `workspaceId`,
 Pull requests and pushes that touch these files run only the proof job. It has no secrets and no environment.
 
 - `bun scripts/owner-buffered-parity-ci.ts --proof` builds PGlite over every migration with nine buffered
-  tenants, seven of them on the roster, and a PASS marker. It proves census, write (enabled only by test
-  injection) and readback, and that tenants 8 and 9 are never touched. It also proves these refusals:
+  tenants, eight of them on the roster, and a PASS marker. It proves census, write (enabled only by test
+  injection) and readback, and that tenant 9 is never touched. It also proves these refusals:
   - dormant
   - `roster_empty`
   - `roster_incomplete`
@@ -262,7 +262,7 @@ Pull requests and pushes that touch these files run only the proof job. It has n
   - substituted digest
   - generation mismatch
   - discovery: `roster_present`, `unexpected_scope` (counts only), and on a fresh image with read-only
-    sessions exactly seven missing/stale owners (six missing, one stale, two canonical current) with no write
+    sessions exactly eight missing/stale owners (seven missing, one stale, one canonical current) with no write
     statement and the parity table unchanged
 - `src/migration/__tests__/owner-buffered-parity-ci.test.ts` uses mocked sessions. It covers:
   - fail-closed partial write
@@ -273,7 +273,7 @@ Pull requests and pushes that touch these files run only the proof job. It has n
   - the stdin-only credential hand-off
   - a parent process run checking that nothing secret is printed
 - `src/migration/__tests__/owner-buffered-parity-discovery.test.ts` uses mocked sessions. It covers the
-  exactly-seven scope (`unexpected_scope` with counts only), generation drift before, inside and after the
+  exact-eight scope (`unexpected_scope` with counts only), generation drift before, inside and after the
   snapshot (`generation_unstable`), `roster_present`, the mode dispatch table (write and bulk unreachable from
   discovery), read-only statement shape, receipt validation, sanitization against identifier fixtures, and a
   parent process run plus the summary step.

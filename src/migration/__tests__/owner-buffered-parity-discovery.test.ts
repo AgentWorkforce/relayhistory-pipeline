@@ -1,6 +1,6 @@
 /**
  * Mocked-session tests for the one-time, read-only discovery mode of the owner-buffered parity workflow
- * (scripts/owner-buffered-parity-ci.ts runOwnerParityDiscovery): exactly-seven scope, generation stability
+ * (scripts/owner-buffered-parity-ci.ts runOwnerParityDiscovery): exact-eight scope, generation stability
  * before/inside/after the snapshot, one REPEATABLE READ READ ONLY snapshot on the enumerator session holding the
  * marker reads, enumeration and every comparison, the empty-roster rule, the mode dispatch table (write and bulk unreachable
  * from discovery), statement shape (read-only only) and sanitization. Fixture identifiers only; no database.
@@ -49,7 +49,7 @@ const tenants: ParityTenant[] = Array.from({ length: 12 }, (_, i) => ({
 }));
 const IDENTIFIERS = tenants.flatMap((t) => [t.orgId, t.workspaceId, t.userId]).concat(["example.invalid", "fixture-org-slug"]);
 const emptyRoster = { contract: "owner-buffered-parity-roster/v1", comment: "ships empty", tenants: [] as string[] };
-const fullRoster = { contract: "owner-buffered-parity-roster/v1", tenants: tenants.slice(0, 7).map(tenantSha256) };
+const fullRoster = { contract: "owner-buffered-parity-roster/v1", tenants: tenants.slice(0, 8).map(tenantSha256) };
 const env = (mode = "discovery", extra: Record<string, string> = {}) =>
   ({ OWNER_PARITY_MODE: mode, OWNER_PARITY_SHA: SHA, OWNER_PARITY_CENSUS_SOURCE: "frozen-supabase", ...extra });
 const T0 = Date.parse("2026-11-13T00:00:00.000Z");
@@ -138,7 +138,7 @@ function world(state: Disposition[], opts: { extraRows?: Array<Record<string, un
   return { w, sessions, deps: { readCensus } };
 }
 
-const seven: Disposition[] = ["current", "missing", "missing", "stale", "missing", "current", "missing", "missing", "missing"];
+const eight: Disposition[] = ["current", "missing", "missing", "stale", "missing", "current", "missing", "missing", "missing", "missing"];
 const discover = (x: ReturnType<typeof world>, e: Record<string, string> = env(), roster: unknown = emptyRoster) =>
   runOwnerParityDiscovery(e, x.sessions, { roster, runId: "505", now: () => T0, deps: x.deps });
 const serialized = (o: OwnerParityDiscoveryOutcome) =>
@@ -149,30 +149,30 @@ const expectCountsOnly = (o: OwnerParityDiscoveryOutcome) => {
   expect(serialized(o)).not.toContain("tenantSha256");
 };
 
-test("discovery: exactly seven missing/stale owners yields sorted digests, dispositions and counts; nothing is written", async () => {
-  const x = world(seven);
+test("discovery: exactly eight missing/stale owners yields sorted digests, dispositions and counts; nothing is written", async () => {
+  const x = world(eight);
   const out = await discover(x);
   expect(out.exitCode).toBe(0);
   expect(out.receipt).toMatchObject({ contract: OWNER_PARITY_DISCOVERY_CONTRACT, status: "ok", runId: "505", sourceSha: SHA,
     generation: H("4"), censusSource: "frozen-supabase", capturedAt: new Date(T0).toISOString(), credentialsPersisted: false,
-    counts: { scanned: 9, canonicalCurrent: 2, missing: 6, stale: 1, unparsable: 0 } });
-  const expected = tenants.slice(0, 9).map((t, i) => ({ tenantSha256: tenantSha256(t), d: seven[i]! }))
+    counts: { scanned: 10, canonicalCurrent: 2, missing: 7, stale: 1, unparsable: 0 } });
+  const expected = tenants.slice(0, 10).map((t, i) => ({ tenantSha256: tenantSha256(t), d: eight[i]! }))
     .filter((o) => o.d !== "current").map((o) => ({ tenantSha256: o.tenantSha256, disposition: o.d }))
     .sort((a, b) => (a.tenantSha256 < b.tenantSha256 ? -1 : 1));
   expect(out.receipt.owners).toEqual(expected);
   expect(parseOwnerParityDiscoveryReceipt(JSON.parse(JSON.stringify(out.receipt)))).toEqual(out.receipt);
-  expect(x.w.g1.length).toBe(9);
+  expect(x.w.g1.length).toBe(10);
   for (const s of x.w.statements) expect(s.sql).not.toMatch(/\b(INSERT|UPDATE|DELETE|MERGE|TRUNCATE|LOCK|SET ROLE)\b/iu);
   expect(x.w.statements.filter((s) => s.session === "target").map((s) => s.sql))
     .toEqual([BULK_TARGET_GENERATION_SQL, BULK_TARGET_GENERATION_SQL]);
   const summary = ownerParityDiscoverySummary(out.receipt);
   for (const o of expected) expect(summary).toContain(`| \`${o.tenantSha256}\` | ${o.disposition} |`);
   expect(discoveryRunReceipt(out.receipt)).toMatchObject({ mode: "discovery", status: "ok", tenants: [],
-    counts: { found: 9, equal: 2, missing: 6, stale: 1, inserted: 0, updated: 0, verified: 0 } });
+    counts: { found: 10, equal: 2, missing: 7, stale: 1, inserted: 0, updated: 0, verified: 0 } });
 });
 
 test("discovery reads the generation before, as the snapshot's first read, and after; one read-only repeatable-read cursor", async () => {
-  const x = world(seven);
+  const x = world(eight);
   await discover(x);
   const e = x.w.statements.filter((s) => s.session === "enumerator").map((s) => s.sql);
   expect(e[0]).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
@@ -205,17 +205,17 @@ const oneTransaction = (x: ReturnType<typeof world>, end: "COMMIT" | "ROLLBACK")
 };
 
 test("discovery holds one snapshot: marker, enumeration, every G1 and stored-proof comparison, final marker", async () => {
-  const x = world(seven);
+  const x = world(eight);
   const out = await discover(x);
   expect(out.exitCode).toBe(0);
   const e = oneTransaction(x, "COMMIT");
   // Every census read and stored-proof read ran on the snapshot session between BEGIN and COMMIT.
-  expect(e.filter((s) => s === CENSUS_PROBE).length).toBe(3 * 9);
-  expect(e.filter((s) => s === READ_OWNER_BUFFERED_PARITY_SQL).length).toBe(9);
+  expect(e.filter((s) => s === CENSUS_PROBE).length).toBe(3 * 10);
+  expect(e.filter((s) => s === READ_OWNER_BUFFERED_PARITY_SQL).length).toBe(10);
   expect(e.filter((s) => s === BULK_TARGET_GENERATION_SQL).length).toBe(2);
   expect(e.some((s) => s.includes("statement_timeout = '2s'"))).toBe(false);
   // readCensus received the single snapshot session for both of its sides.
-  expect(x.w.censusSessions.length).toBe(9);
+  expect(x.w.censusSessions.length).toBe(10);
   for (const [s, t] of x.w.censusSessions) { expect(s).toBe(x.sessions.enumerator); expect(t).toBe(x.sessions.enumerator); }
   // The external fence brackets the snapshot: first and last statements of the run are target generation reads.
   expect(x.w.statements[0]).toMatchObject({ session: "target", sql: BULK_TARGET_GENERATION_SQL });
@@ -225,11 +225,11 @@ test("discovery holds one snapshot: marker, enumeration, every G1 and stored-pro
 test("discovery refusal paths roll the snapshot back and run nothing on the source or target beyond the fence", async () => {
   const cases: Array<[ReturnType<typeof world>, string]> = [];
   const scope = world(["missing", "stale"]); cases.push([scope, "unexpected_scope"]);
-  const eighth = world(Array.from({ length: 12 }, () => "missing")); cases.push([eighth, "unexpected_scope"]);
-  const unparsable = world(seven, { extraRows: [{ org_id: null, workspace_id: "w", user_id: "u" }] });
+  const ninth = world(Array.from({ length: 12 }, () => "missing")); cases.push([ninth, "unexpected_scope"]);
+  const unparsable = world(eight, { extraRows: [{ org_id: null, workspace_id: "w", user_id: "u" }] });
   cases.push([unparsable, "unexpected_scope"]);
-  const inside = world(seven); inside.w.snapshotGeneration = H("9"); cases.push([inside, "generation_unstable"]);
-  const proof = world(seven); proof.w.proofGeneration = H("8"); cases.push([proof, "generation_unstable"]);
+  const inside = world(eight); inside.w.snapshotGeneration = H("9"); cases.push([inside, "generation_unstable"]);
+  const proof = world(eight); proof.w.proofGeneration = H("8"); cases.push([proof, "generation_unstable"]);
   for (const [x, code] of cases) {
     const out = await discover(x);
     expect(out.receipt).toMatchObject({ status: "refused", code });
@@ -238,26 +238,26 @@ test("discovery refusal paths roll the snapshot back and run nothing on the sour
     expectCountsOnly(out);
   }
   // A drift seen only by the external after-read: the snapshot already committed, then the run refuses.
-  const after = world(seven); after.w.targetGenerations = [H("4"), H("9")];
+  const after = world(eight); after.w.targetGenerations = [H("4"), H("9")];
   expect((await discover(after)).receipt.code).toBe("generation_unstable");
   oneTransaction(after, "COMMIT");
 });
 
 test("discovery with Neon holds one caller-owned read-only snapshot on each database", async () => {
-  const x = world(seven);
+  const x = world(eight);
   const out = await discover(x, env("discovery", { OWNER_PARITY_CENSUS_SOURCE: "neon" }));
   expect(out.receipt).toMatchObject({ status: "ok", censusSource: "neon",
-    counts: { scanned: 9, canonicalCurrent: 2, missing: 6, stale: 1, unparsable: 0 } });
-  expect(x.w.censusSessions).toHaveLength(9);
+    counts: { scanned: 10, canonicalCurrent: 2, missing: 7, stale: 1, unparsable: 0 } });
+  expect(x.w.censusSessions).toHaveLength(10);
   for (const [source, target] of x.w.censusSessions) {
     expect(source).toBe(x.sessions.source);
     expect(target).toBe(x.sessions.enumerator);
   }
-  expect(x.w.censusOptions).toEqual(Array.from({ length: 9 }, () =>
+  expect(x.w.censusOptions).toEqual(Array.from({ length: 10 }, () =>
     ({ sourceTransaction: "caller", targetTransaction: "caller" })));
   expect(x.w.statements.filter((s) => s.session === "source").map((s) => s.sql)).toEqual([
     "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", "SET LOCAL statement_timeout = '30s'",
-    NEON_DISCOVERY_SNAPSHOT_ANCHOR_SQL, ...Array.from({ length: 18 }, () => CENSUS_PROBE), "COMMIT",
+    NEON_DISCOVERY_SNAPSHOT_ANCHOR_SQL, ...Array.from({ length: 20 }, () => CENSUS_PROBE), "COMMIT",
   ]);
   const enumerator = x.w.statements.filter((s) => s.session === "enumerator").map((s) => s.sql);
   expect(enumerator[0]).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
@@ -265,7 +265,7 @@ test("discovery with Neon holds one caller-owned read-only snapshot on each data
 });
 
 test("Neon discovery refuses a missing source anchor with counts only and rolls both snapshots back", async () => {
-  const x = world(seven, { sourceAnchor: false });
+  const x = world(eight, { sourceAnchor: false });
   const out = await discover(x, env("discovery", { OWNER_PARITY_CENSUS_SOURCE: "neon" }));
   expect(out.receipt).toMatchObject({ status: "refused", code: "owner_parity_discovery_source_anchor",
     counts: { scanned: 0, canonicalCurrent: 0, missing: 0, stale: 0, unparsable: 0 } });
@@ -278,7 +278,7 @@ test("Neon discovery refuses a missing source anchor with counts only and rolls 
 });
 
 test("Neon discovery refuses when source and target snapshot sessions alias before any transaction", async () => {
-  const x = world(seven);
+  const x = world(eight);
   x.sessions.source = x.sessions.enumerator;
   const out = await discover(x, env("discovery", { OWNER_PARITY_CENSUS_SOURCE: "neon" }));
   expect(out.receipt).toMatchObject({ status: "refused", code: "owner_parity_discovery_session_alias",
@@ -287,12 +287,12 @@ test("Neon discovery refuses when source and target snapshot sessions alias befo
   expectCountsOnly(out);
 });
 
-test("discovery: a count other than seven refuses unexpected_scope with counts only, never digests", async () => {
+test("discovery: a count other than eight refuses unexpected_scope with counts only, never digests", async () => {
   for (const [state, missing, stale] of [
     [["current", "current", "current", "missing", "missing", "missing", "stale", "stale", "stale"], 3, 3],
-    [["missing", "missing", "missing", "missing", "stale", "stale", "stale", "missing", "current"], 5, 3],
+    [["missing", "missing", "missing", "missing", "stale", "stale", "stale", "current", "current"], 4, 3],
     [[], 0, 0],
-    [Array.from({ length: 12 }, () => "missing"), 8, 0], // fails fast at the eighth, scanned stays 12
+    [Array.from({ length: 12 }, () => "missing"), 9, 0], // fails fast at the ninth, scanned stays 12
   ] as Array<[Disposition[], number, number]>) {
     const x = world(state);
     const out = await discover(x);
@@ -303,29 +303,29 @@ test("discovery: a count other than seven refuses unexpected_scope with counts o
   }
 });
 
-test("discovery: stops after the eighth missing/stale owner instead of comparing the rest", async () => {
+test("discovery: stops after the ninth missing/stale owner instead of comparing the rest", async () => {
   const x = world(Array.from({ length: 12 }, () => "missing"));
   const calls: string[] = [];
   const inner = x.deps.readCensus as (...a: unknown[]) => Promise<ParityCensusReceipt>;
   const out = await runOwnerParityDiscovery(env(), x.sessions, { roster: emptyRoster, runId: "505", now: () => T0,
     deps: { readCensus: ((...a: unknown[]) => { calls.push("call"); return inner(...a); }) as never } });
   expect(out.exitCode).toBe(1);
-  expect(out.receipt).toMatchObject({ status: "refused", code: "unexpected_scope", counts: { scanned: 12, missing: 8, stale: 0 } });
+  expect(out.receipt).toMatchObject({ status: "refused", code: "unexpected_scope", counts: { scanned: 12, missing: 9, stale: 0 } });
   expect(out.receipt.owners).toEqual([]);
-  expect(calls.length).toBe(8);
-  expect(x.w.g1.length).toBe(8);
+  expect(calls.length).toBe(9);
+  expect(x.w.g1.length).toBe(9);
   expectCountsOnly(out);
 });
 
-test("discovery: an unparsable buffered row refuses unexpected_scope even with seven missing/stale owners", async () => {
-  const x = world(seven, { extraRows: [{ org_id: null, workspace_id: "w", user_id: "u" }] });
+test("discovery: an unparsable buffered row refuses unexpected_scope even with eight missing/stale owners", async () => {
+  const x = world(eight, { extraRows: [{ org_id: null, workspace_id: "w", user_id: "u" }] });
   const out = await discover(x);
-  expect(out.receipt).toMatchObject({ status: "refused", code: "unexpected_scope", counts: { scanned: 10, unparsable: 1 } });
+  expect(out.receipt).toMatchObject({ status: "refused", code: "unexpected_scope", counts: { scanned: 11, unparsable: 1 } });
   expectCountsOnly(out);
 });
 
 test("discovery: generation drift before/inside the snapshot, after it, or in a fresh proof refuses generation_unstable", async () => {
-  const inside = world(seven);
+  const inside = world(eight);
   inside.w.snapshotGeneration = H("9");
   const a = await discover(inside);
   expect(a.receipt).toMatchObject({ status: "refused", code: "generation_unstable" });
@@ -333,13 +333,13 @@ test("discovery: generation drift before/inside the snapshot, after it, or in a 
   expect(inside.w.statements.some((s) => s.sql.startsWith("DECLARE"))).toBe(false);
   expect(inside.w.statements.filter((s) => s.session === "enumerator").at(-1)!.sql).toBe("ROLLBACK");
 
-  const after = world(seven);
+  const after = world(eight);
   after.w.targetGenerations = [H("4"), H("9")];
   const b = await discover(after);
-  expect(b.receipt).toMatchObject({ status: "refused", code: "generation_unstable", counts: { scanned: 9, missing: 6, stale: 1 } });
-  expect(after.w.g1.length).toBe(9);
+  expect(b.receipt).toMatchObject({ status: "refused", code: "generation_unstable", counts: { scanned: 10, missing: 7, stale: 1 } });
+  expect(after.w.g1.length).toBe(10);
 
-  const proof = world(seven);
+  const proof = world(eight);
   proof.w.proofGeneration = H("8");
   const c = await discover(proof);
   expect(c.receipt).toMatchObject({ status: "refused", code: "generation_unstable" });
@@ -355,7 +355,7 @@ test("discovery refuses roster_present for any non-empty roster and roster_inval
     [{ ...emptyRoster, extra: true }, "roster_invalid"],
     [null, "roster_invalid"],
   ] as Array<[unknown, string]>) {
-    const x = world(seven);
+    const x = world(eight);
     const out = await discover(x, env(), roster);
     expect(out.receipt).toMatchObject({ status: "refused", code, owners: [] });
     expect(x.w.statements).toEqual([]);
@@ -363,7 +363,7 @@ test("discovery refuses roster_present for any non-empty roster and roster_inval
   expect(() => requireEmptyOwnerParityRoster(emptyRoster)).not.toThrow();
   // The other modes keep every roster refusal: the empty roster still refuses roster_empty.
   for (const mode of ["census", "readback"]) {
-    const x = world(seven);
+    const x = world(eight);
     const out = await runOwnerParity(env(mode), x.sessions, { roster: emptyRoster, runId: "1", deps: x.deps });
     expect(out.receipt.code).toBe("roster_empty");
     expect(x.w.statements).toEqual([]);
@@ -388,21 +388,21 @@ test("mode dispatch table: write and bulk are unreachable from discovery; only w
   for (const [mode, roster, code] of [["bulk", emptyRoster, "owner_parity_inputs"], ["BULK", emptyRoster, "owner_parity_inputs"],
     ["write", fullRoster, "owner_parity_write_dormant"], ["census", fullRoster, "owner_parity_mode_route"],
     ["readback", fullRoster, "owner_parity_mode_route"]] as Array<[string, unknown, string]>) {
-    const x = world(seven);
+    const x = world(eight);
     const out = await discover(x, env(mode), roster);
     expect(out.receipt.code).toBe(code);
     expect(x.w.statements).toEqual([]);
   }
   // And the census/write/readback runner refuses discovery before any statement (it never runs readback logic).
-  const x = world(seven);
+  const x = world(eight);
   const out = await runOwnerParity(env(), x.sessions, { roster: emptyRoster, runId: "1", writeEnabled: true, deps: x.deps });
   expect(out.receipt.code).toBe("owner_parity_mode_route");
   expect(x.w.statements).toEqual([]);
 });
 
 test("sanitization: no identifier fixture, private key name or credential reaches the receipt, run receipt or summary", async () => {
-  const outcomes = [await discover(world(seven)), await discover(world(["missing", "stale"])),
-    await discover(world(seven, { extraRows: [{ org_id: "fixture-org-slug-x", workspace_id: "w", user_id: 7 }] }))];
+  const outcomes = [await discover(world(eight)), await discover(world(["missing", "stale"])),
+    await discover(world(eight, { extraRows: [{ org_id: "fixture-org-slug-x", workspace_id: "w", user_id: 7 }] }))];
   for (const out of outcomes) {
     const text = serialized(out);
     for (const id of IDENTIFIERS) expect(text).not.toContain(id);
@@ -413,7 +413,7 @@ test("sanitization: no identifier fixture, private key name or credential reache
 });
 
 test("discovery receipt parser: only the contract shape is publishable", async () => {
-  const ok = (await discover(world(seven))).receipt;
+  const ok = (await discover(world(eight))).receipt;
   const refused = (await discover(world(["missing"]))).receipt;
   const bad = (v: unknown) => { try { parseOwnerParityDiscoveryReceipt(v); return null; } catch (e) { return (e as OwnerParityCiRefusal).code; } };
   const clone = <T>(v: T): any => JSON.parse(JSON.stringify(v));

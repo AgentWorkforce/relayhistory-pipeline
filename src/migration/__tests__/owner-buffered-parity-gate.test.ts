@@ -1,5 +1,5 @@
 /**
- * GitHub gate, contract validators and workflow shape for the exact-seven owner-buffered parity workflow
+ * GitHub gate, contract validators and workflow shape for the exact-eight owner-buffered parity workflow
  * (scripts/owner-buffered-parity-github.ts, src/migration/owner-buffered-parity-ci-contract.ts,
  * .github/workflows/owner-buffered-parity.yml). GitHub is mocked; nothing here reaches the network.
  */
@@ -31,7 +31,7 @@ const sha = "1".repeat(40), censusRun = "424242", G = "a".repeat(64);
 const code = async (fn: () => unknown) => {
   try { await fn(); return null; } catch (e) { return (e as { code?: string }).code ?? String(e); }
 };
-const digests = Array.from({ length: 7 }, (_, i) => String(i + 1).repeat(64));
+const digests = Array.from({ length: 8 }, (_, i) => String(i + 1).repeat(64));
 const roster = { contract: "owner-buffered-parity-roster/v1", tenants: digests };
 
 function censusArtifact(over: Partial<OwnerParityCensusBody> = {}): OwnerParityCensusArtifact {
@@ -190,17 +190,17 @@ test("confirmation shape: sha, source and census run are bound before any GitHub
   expect(await gate(env("write", { OWNER_PARITY_CONFIRMATION: phrase }), githubFixture())).toBe("owner_parity_census_run");
 });
 
-test("roster: committed roster ships empty; exactly seven distinct digests; unlisted candidates are dropped", () => {
+test("roster: committed roster ships empty; exactly eight distinct digests; unlisted candidates are dropped", () => {
   const committed = JSON.parse(readFileSync(OWNER_PARITY_ROSTER_FILE, "utf8"));
   expect(committed.tenants).toEqual([]);
   expect(code(() => parseOwnerParityRoster(committed))).resolves.toBe("roster_empty");
-  expect(OWNER_PARITY_EXACT_COUNT).toBe(7);
+  expect(OWNER_PARITY_EXACT_COUNT).toBe(8);
   expect(parseOwnerParityRoster(roster)).toEqual(digests);
   const refused = (v: unknown) => { try { parseOwnerParityRoster(v); return null; } catch (e) { return (e as { code: string }).code; } };
-  expect(refused({ ...roster, tenants: digests.slice(0, 6) })).toBe("roster_incomplete");
+  expect(refused({ ...roster, tenants: digests.slice(0, 7) })).toBe("roster_incomplete");
   expect(refused({ ...roster, tenants: [...digests, "f".repeat(64)] })).toBe("roster_incomplete");
-  expect(refused({ ...roster, tenants: [...digests.slice(0, 6), digests[0]] })).toBe("roster_invalid");
-  expect(refused({ ...roster, tenants: [...digests.slice(0, 6), "X".repeat(64)] })).toBe("roster_invalid");
+  expect(refused({ ...roster, tenants: [...digests.slice(0, 7), digests[0]] })).toBe("roster_invalid");
+  expect(refused({ ...roster, tenants: [...digests.slice(0, 7), "X".repeat(64)] })).toBe("roster_invalid");
   expect(refused({ ...roster, orgIds: [] })).toBe("roster_invalid");
   expect(refused({ ...roster, contract: "v0" })).toBe("roster_invalid");
   const other = "e".repeat(64);
