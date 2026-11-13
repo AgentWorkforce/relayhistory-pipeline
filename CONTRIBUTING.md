@@ -1,16 +1,23 @@
 # Contributing
 
-Thanks for your interest in The Agent Relay sessions pipeline. Bug reports, fixes and improvements
-are welcome.
+Thanks for your interest in The Agent Relay sessions pipeline. Bug reports, fixes and ideas are
+welcome.
 
-## Before you start
+## Proposing a change
+
+This repository does not take pull requests. Open a
+[GitHub issue](https://github.com/AgentWorkforce/relayhistory-pipeline/issues) instead:
 
 - **Security issues:** do not open a public issue. Follow [SECURITY.md](SECURITY.md).
-- **Bugs:** open an issue with the version or commit, what you expected, what
-  happened, and the smallest reproduction you can manage. Remove credentials,
-  tokens and personal data from logs before you paste them.
-- **Larger changes:** open an issue first to discuss the approach, so your work
-  doesn't conflict with something already in progress.
+- **Bugs:** the version or commit, what you expected, what happened, and the smallest
+  reproduction you can manage. Remove credentials, tokens and personal data from logs before
+  you paste them.
+- **Features:** the problem you want solved and how you would use it.
+- **A fix you already have:** describe it in the issue, and include the diff if it is short.
+  The maintainers make the change, put it through review and CI, and credit you in the commit.
+
+Never include secrets, credentials, real customer data or production identifiers in an issue,
+including in diffs and fixtures. Use obviously fake values.
 
 ## Development
 
@@ -19,26 +26,13 @@ git submodule update --init
 bun install --frozen-lockfile
 bun run typecheck
 bun run test
+bun run e2e:pipeline     # the full-pipeline e2e on a fresh local stack (needs Docker)
 ```
 
-Run these checks before you open a pull request. CI (see `.github/workflows/`)
-runs its own set of checks, which can differ slightly from this list; a green
-CI run is required before merge.
-
-## Pull requests
-
-- Branch from `main` and keep each pull request focused on one change.
-- Add or update tests for behaviour you change.
-- Use short, conventional commit messages (`fix: ...`, `feat: ...`, `docs: ...`).
-- Describe what changed and why, and how you tested it.
-- Never commit secrets, credentials, real customer data or production
-  identifiers, including in tests and fixtures. Use obviously fake values.
-- Fork pull request CI runs without repository secrets. Workflows that use
-  secrets (publishing and deploys) run only from `main`, from release tags, or
-  when a maintainer with write access starts them.
-
-A maintainer reviews every pull request. We may ask for changes, or decline a
-change that doesn't fit the project's direction.
+The maintainers' CI is a flow (`flows/ci.flow.ts`) that runs these and more; see
+[docs/maintainer-workflow.md](docs/maintainer-workflow.md) and
+[docs/pipeline-e2e.md](docs/pipeline-e2e.md). The rules in [AGENTS.md](AGENTS.md) apply to
+every change in this repository.
 
 ## License
 

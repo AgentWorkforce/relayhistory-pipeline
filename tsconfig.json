@@ -30,6 +30,7 @@
     "stacks",
     "alchemy.run.ts",
     "smoke",
+    "e2e/pipeline",
     "src/types/*.d.ts",
     "scripts/proof-buffer-gc.ts",
     "scripts/sync-ingest-buffer-gc-boundary.ts",

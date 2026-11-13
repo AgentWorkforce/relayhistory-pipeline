@@ -5,10 +5,11 @@
  */
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-export const here = import.meta.dir;
+export const here = fileURLToPath(new URL(".", import.meta.url));
 const root = join(here, "../..");
 const rand = () => randomBytes(18).toString("hex");
 
@@ -34,7 +35,7 @@ function makeCerts(dir: string): string {
     "-keyout", join(dir, "ca.key"), "-out", join(dir, "ca.crt"));
   openssl("req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=db", "-keyout", join(dir, "server.key"), "-out", join(dir, "server.csr"));
   const ext = join(dir, "ext.cnf");
-  Bun.write(ext, "subjectAltName=DNS:db\n");
+  writeFileSync(ext, "subjectAltName=DNS:db\n");
   execFileSync("sh", ["-c", `openssl x509 -req -in "${dir}/server.csr" -CA "${dir}/ca.crt" -CAkey "${dir}/ca.key" -CAcreateserial -days 2 -extfile "${ext}" -out "${dir}/server.crt"`], { stdio: "ignore" });
   rmSync(join(dir, "ca.key"));
   rmSync(join(dir, "server.csr"));
@@ -43,7 +44,14 @@ function makeCerts(dir: string): string {
   return createHash("sha256").update(readFileSync(join(dir, "ca.crt"))).digest("hex");
 }
 
-export function createStack(): StackSession {
+/**
+ * `files` layers more compose files over compose.yaml and `project` names the compose project (default the
+ * file's own `rh-e2e`), so another lane (e2e/pipeline) runs the same stack, extended, beside this one.
+ * `extraEnv` adds per-run values those files read.
+ */
+export interface StackOptions { files?: string[]; project?: string; extraEnv?: Record<string, string> }
+
+export function createStack(options: StackOptions = {}): StackSession {
   mkdirSync(join(root, ".96bulls"), { recursive: true });
   const certs = mkdtempSync(join(root, ".96bulls/e2e-"));
   chmodSync(certs, 0o755);
@@ -54,7 +62,7 @@ export function createStack(): StackSession {
     [tokens.b]: { ...TENANT_B, scopes: ["rth:read", "rth:sync"] },
     [tokens.aReadOnly]: { ...TENANT_A, scopes: ["rth:read"] },
   };
-    const env: NodeJS.ProcessEnv = {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     E2E_CERTS_DIR: certs,
     E2E_CA_SHA256: caSha,
@@ -66,9 +74,12 @@ export function createStack(): StackSession {
     E2E_CONSUMER_PASSWORD: rand(),
     E2E_INTROSPECT_SECRET: rand(),
     E2E_TOKENS: JSON.stringify(tokenTable),
+    ...options.extraEnv,
   };
+  const files = [join(here, "compose.yaml"), ...(options.files ?? [])].flatMap((f) => ["-f", f]);
+  const project = options.project ? ["-p", options.project] : [];
   const compose: StackSession["compose"] = (args, options) => {
-    const r = spawnSync("docker", ["compose", "-f", join(here, "compose.yaml"), ...args], { env, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", options?.quiet ? "pipe" : "inherit"] });
+    const r = spawnSync("docker", ["compose", ...project, ...files, ...args], { env, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", options?.quiet ? "pipe" : "inherit"] });
     if (r.status !== 0 && !options?.allowFail) throw new Error(`docker compose ${args[0]} failed (${r.status})`);
     return { status: r.status ?? 1, stdout: r.stdout ?? "" };
   };
@@ -95,5 +106,8 @@ export function createStack(): StackSession {
 }
 
 export function buildImage(): void {
-  execFileSync("docker", ["build", "-q", "-f", join(root, "docker/services.Dockerfile"), "-t", "96bulls/services:e2e", root], { stdio: ["ignore", "ignore", "inherit"] });
+  // E2E_DOCKER_BUILD_NETWORK=host: for a Docker whose build containers have no DNS of their own (the Blaxel
+  // docker-in-sandbox image; e2e/pipeline/sandbox-run.sh sets it).
+  const network = process.env.E2E_DOCKER_BUILD_NETWORK === "host" ? ["--network", "host"] : [];
+  execFileSync("docker", ["build", ...network, "-q", "-f", join(root, "docker/services.Dockerfile"), "-t", "96bulls/services:e2e", root], { stdio: ["ignore", "ignore", "inherit"] });
 }
