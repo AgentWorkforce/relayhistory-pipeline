@@ -135,6 +135,15 @@ export const fenceAuthorityKey = (keyRoot: string) => `${keyRoot}/.ledger/fence-
  * segment (the claim's keysFor refuses anything else), so it is a plain path segment here.
  */
 export const orgFenceAuthorityKey = (keyRoot: string, orgId: string) => `${keyRoot}/.ledger/fence-authority/${orgId}.json`;
+/**
+ * The deployment-wide STOP (FenceAuthorityStopDoc): while present, every claim of every org is refused, whatever
+ * the per-org and deployment-wide markers say. The one-step kill switch. Its name starts with a dot, which no
+ * tenant segment may (assertTenantSegment), so it can never be an org's marker. Covered by the consumer's read
+ * grant on `fence-authority/*`.
+ */
+export const fenceAuthorityStopKey = (keyRoot: string) => `${keyRoot}/.ledger/fence-authority/.stop.json`;
+/** The stop marker: `{"v":1,"stop":"all","writtenAtMs":<ms>}`. A present but invalid one refuses too (fail closed). */
+export interface FenceAuthorityStopDoc { v: 1; stop: "all"; writtenAtMs: number }
 
 // ---- object shapes ----
 
@@ -288,6 +297,9 @@ export function validOrgFenceAuthority(v: unknown): v is OrgFenceAuthorityDoc {
   if (!isObject(v) || !str(v.orgId)) return false;
   const { orgId: _orgId, ...rest } = v;
   return Object.keys(v).length === AUTHORITY_FIELDS.length + 1 && validFenceAuthority(rest);
+}
+export function validFenceAuthorityStop(v: unknown): v is FenceAuthorityStopDoc {
+  return isObject(v) && exactKeys(v, ["v", "stop", "writtenAtMs"]) && v.v === 1 && v.stop === "all" && count(v.writtenAtMs) && v.writtenAtMs > 0;
 }
 export function validFenceAuthority(v: unknown): v is FenceAuthorityDoc {
   return isObject(v) && exactKeys(v, AUTHORITY_FIELDS) && v.v === 1
@@ -661,6 +673,9 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
     if (opts.fenceAuthority !== "required") return;
     const now = nowMs();
     if (now < (authorityUntil.get(orgId) ?? -Infinity)) return;
+    // The deployment-wide stop first: present (valid or not) refuses every org.
+    if (await readDoc(store, fenceAuthorityStopKey(keyRoot), validFenceAuthorityStop, "ledger_fence_authority_stopped"))
+      throw new LedgerUnavailableError("ledger_fence_authority_stopped");
     const org = await readDoc(store, orgFenceAuthorityKey(keyRoot, orgId), validOrgFenceAuthority, "ledger_fence_authority_invalid");
     if (org) {
       if (org.doc.orgId !== orgId) throw new LedgerUnavailableError("ledger_fence_authority_org_mismatch");

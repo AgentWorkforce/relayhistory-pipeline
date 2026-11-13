@@ -610,6 +610,11 @@ export interface TranscriptStorePlanCapture {
    * snapshot; it is bound to the same state by the capture's version digest (capture-verify.ts).
    */
   stateSnapshotText?: string;
+  /**
+   * The stage's upload inputs (transcriptStore). A plan with the upload inbox but without `desktop-upload-role` is
+   * accepted only when these say it should be: uploadPresignIssuer true and uploadControlRoleArn unset.
+   */
+  uploadInputs?: { uploadControlRoleArn?: unknown; uploadPresignIssuer?: unknown };
 }
 
 /**
@@ -775,6 +780,13 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   };
   const compact = transcriptPlanOperations(planText, "compact", refuse);
   const detailed = transcriptPlanOperations(capture.detailedPlanText, "detailed", refuse);
+  // The presign-only shape (no desktop-upload-role) only for a stage whose inputs ask for it.
+  const ops = compact.operations;
+  if (UPLOAD_INBOX_RESOURCES.some((r) => ops.has(r)) && !ops.has(UPLOAD_INBOX_DESKTOP_ROLE_RESOURCE) && ops.has(PRESIGN_ISSUER_RESOURCE)) {
+    const u = capture.uploadInputs;
+    if (!u || u.uploadControlRoleArn !== undefined || u.uploadPresignIssuer !== true)
+      refuse("the plan has the upload inbox without desktop-upload-role, but the inputs do not have uploadPresignIssuer true with uploadControlRoleArn unset");
+  }
   if (compact.summary !== detailed.summary) refuse("compact and detailed plan summaries differ");
   for (const resource of expectedResources(compact.operations.keys()))
     if (compact.operations.get(resource) !== detailed.operations.get(resource))
