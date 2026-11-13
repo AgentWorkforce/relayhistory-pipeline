@@ -30,7 +30,7 @@ still a claim, a stage intent and a receipt ACK in Postgres. The fix is to stop 
 | Today (`ledger.ts`, SQL) | 0005 (S3) |
 | --- | --- |
 | Batch idempotency (`ingest_batches`): a retry replays; a reused batch id with other content is a 409 `batch_id` | A **batch record** object, written create-only. Same digest and committed: replay. Same digest and pending: resume. Other digest: 409. |
-| Stored revisions (`ingest_record_revisions`, keyed per origin and record): an equal or lower revision is `stale` and skipped | A **revision index** keyed per (origin, record id), sharded by a hash of the record id. Each entry carries its generation: the session's fence epoch and the user's reset count when it was written. A claim reads the shards its records fall in, and an equal or lower revision of the current generation is `stale`, exactly as relayhistory-cloud #250. An entry of an older generation counts as absent, so a disable followed by a re-enable, or a reset, lets the re-upload through. The commit merges written revisions with `If-Match` (a first write is create-only): max wins, and an equal revision keeps the stored digest. This is required, not an optimisation: the reader fold is per origin and refuses equal revisions with different content (`chooseRelayhistoryRevision`, `packages/pipeline/src/lib/pipeline/relayhistory-transform.ts:377-392`). |
+| Stored revisions (`ingest_record_revisions`, keyed per origin and record): an equal or lower revision is `stale` and skipped | A **revision index** keyed per (origin, record id), sharded 64 ways by a hash of the record id. Each entry carries its generation: the session's fence epoch and the user's reset count when it was written. A claim reads the shards its records fall in, and an equal or lower revision of the current generation is `stale`, exactly as relayhistory-cloud #250. An entry of an older generation counts as absent, so a disable followed by a re-enable, or a reset, lets the re-upload through. The commit merges written revisions with `If-Match` (a first write is create-only): max wins, and an equal revision keeps the stored digest. This is required, not an optimisation: the reader fold is per origin and refuses equal revisions with different content (`chooseRelayhistoryRevision`, `packages/pipeline/src/lib/pipeline/relayhistory-transform.ts:377-392`). |
 | In-batch revision reuse: 409 `record_revision` | Computed from the batch alone. It never needed stored state. |
 | Deletion fences and resets (`upload_deletions`, `upload_resets`) | One **fence object** per user, edited with CAS. The claim reads it to get `deleted` and `resets`. |
 | Fence recheck at commit, erasure re-arm (`upload_erasure_rearm`) | The commit re-reads the fence. If a reset, or a deletion of a written session, landed in between, it writes a **re-arm marker** for the eraser. That is today's `rearmed` semantics. |
@@ -48,9 +48,10 @@ All of these sit under the per-user admission directory that already holds `priv
   It is written `If-None-Match: *` at claim and moved from `pending` to `committed` with `If-Match` at
   commit.
 - `…/ledger/revisions/o=<sha256(origin)[0:32]>/r=<shard>.json`
-  `{v:1, records:{<recordId>:[revision, revisionId, digest, epoch, resets]}}`. It is read at claim and
+  `{v:1, records:{<recordId>:[revision, revisionId, digest, sessionKey|null, epoch, resets]}}`. It is read at claim and
   merged at commit (create-only for the first write, `If-Match` after), retrying on
-  `precondition_failed`. The shard is a fixed-width prefix of `sha256(recordId)`.
+  `precondition_failed`. The shard is the first byte of `sha256(recordId)` mod 64, as two hex digits, so a claim reads and a
+  commit writes at most 64 shard objects.
 - `…/ledger/owners/o=<sha256(origin)[0:32]>/s=<sha256(JSON [source, sessionId])[0:32]>.json`
   The session's ownership stub, written at **claim**, before any canonical write, as
   `ingest_session_ownership` is. A reset lists these, so a session first uploaded while a reset is in
