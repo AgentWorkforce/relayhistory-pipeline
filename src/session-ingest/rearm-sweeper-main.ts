@@ -19,7 +19,7 @@
  *                                    INGEST_REARM_S3_SECRET_ACCESS_KEY[_FILE] (a mounted secret; re-read every pass)
  *
  * `--loop` runs a pass every interval until SIGTERM / SIGINT (the current pass finishes first); an incomplete pass's
- * next one continues where it stopped. Without it: one pass, exit 0 when complete (or dry run / disabled), 3 when
+ * next one continues where it stopped (the durable cursor in the bucket; a dry run keeps it in memory). Without it: one pass, exit 0 when complete (or dry run / disabled), 3 when
  * incomplete or any marker failed (rerun), 2 refused / misconfigured, 4 any other failure. One JSON line per pass, counts
  * and codes only.
  */
@@ -30,7 +30,7 @@ import { createS3Eraser, type PagedEraser, type S3EraserConfig } from "../migrat
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import type { ObjectStore } from "../shared/vendor.ts";
 import { lambdaCredentials } from "../session-pipeline/aws-json.ts";
-import { RearmSweepRefused, REARM_MAX_CONCURRENCY, sweepRearmMarkers, type RearmSweepOptions, type RearmSweepResult, type RearmSweepResume } from "./rearm-sweeper.ts";
+import { readRearmCursor, rearmCursorKey, rearmScopes, RearmSweepRefused, REARM_MAX_CONCURRENCY, sweepRearmMarkers, writeRearmCursor, type RearmSweepOptions, type RearmSweepResult, type RearmSweepResume } from "./rearm-sweeper.ts";
 
 export const REARM_ENABLE_FLAG = "INGEST_REARM_SWEEPER_ENABLED";
 const refuse = (code: string): never => { throw new RearmSweepRefused(code); };
@@ -125,9 +125,14 @@ export interface RearmSweeperOverrides {
   now?: () => number;
 }
 
-export type RearmPassOutput = { enabled: false } | ({ enabled: true } & Omit<RearmSweepResult, "resume">);
+/** `cursor`: "saved" (the position is in the bucket), "contended" (another sweeper saved first) or "memory" (dry run: never written). */
+export type RearmPassOutput = { enabled: false } | ({ enabled: true; cursor: "saved" | "contended" | "memory" } & Omit<RearmSweepResult, "resume">);
 
-/** One pass with fresh credentials. With the flag off nothing else is read and no client is built. */
+/**
+ * One pass with fresh credentials. With the flag off nothing else is read and no client is built. A real pass starts
+ * where the durable cursor (rearm-sweeper.ts rearmCursorKey) says and saves where it stopped (start over once complete),
+ * so successive invocations walk the namespace and wrap around. A dry run writes nothing: it uses `resume` (in memory).
+ */
 export async function runRearmSweeperPass(env: NodeJS.ProcessEnv, argv: readonly string[], overrides: RearmSweeperOverrides = {},
   resume: RearmSweepResume | null = null, extra: Pick<RearmSweepOptions, "deadlineAt"> = {}): Promise<{ output: RearmPassOutput; resume: RearmSweepResume | null }> {
   if (!rearmSweeperEnabled(env)) return { output: { enabled: false }, resume: null };
@@ -136,12 +141,16 @@ export async function runRearmSweeperPass(env: NodeJS.ProcessEnv, argv: readonly
   const s3 = { bucket: cfg.bucket, region: cfg.region, ...(cfg.endpoint ? { endpoint: cfg.endpoint } : {}), credentials };
   const store = (overrides.store ?? createS3Store)({ ...s3, credentials: async () => credentials }) as unknown as ObjectStore;
   const eraser = (overrides.eraser ?? createS3Eraser)(s3);
+  const now = overrides.now ?? Date.now;
+  const cursorKey = rearmCursorKey(cfg.keyRoot, rearmScopes(cfg.keyRoot, cfg.orgs ?? null));
+  const saved = cfg.dryRun ? null : await readRearmCursor(store, cursorKey);
   const r = await sweepRearmMarkers({ store, eraser }, {
     keyRoot: cfg.keyRoot, bucket: cfg.bucket, dryRun: cfg.dryRun, concurrency: cfg.concurrency, maxMarkers: cfg.maxMarkers,
-    ...(cfg.orgs ? { orgs: cfg.orgs } : {}), ...(overrides.now ? { now: overrides.now } : {}), ...extra,
-  }, resume);
+    ...(cfg.orgs ? { orgs: cfg.orgs } : {}), now, ...extra,
+  }, saved ? saved.resume : resume);
   const { resume: next, ...output } = r;
-  return { output: { enabled: true, ...output }, resume: next };
+  const cursor = saved === null ? "memory" as const : (await writeRearmCursor(store, cursorKey, next, saved.version, now())) ? "saved" as const : "contended" as const;
+  return { output: { enabled: true, cursor, ...output }, resume: next };
 }
 
 /** 0: complete (or disabled, or dry run) with no failed marker; 3: rerun (incomplete, or a marker failed). */

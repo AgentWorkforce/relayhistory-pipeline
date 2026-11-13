@@ -5,13 +5,13 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
+import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import { storeEraser, type PagedEraser } from "../../migration/neon-s3-erasure/eraser.ts";
 import { LIVE_SKEW_MS } from "../../migration/neon-s3-erasure/job.ts";
 import type { ClaimInput, LedgerRecord, LedgerTenant } from "../ledger.ts";
 import { s3Ledger, s3LedgerKeys } from "../ledger-s3.ts";
-import { parseRearmKey, rearmDoneKey, REARM_SKEW_MS, RearmSweepRefused, sweepRearmMarkers, type RearmSweepOptions } from "../rearm-sweeper.ts";
-import { exitCodeForPass, rearmSweeperConfig, rearmSweeperEnabled, runRearmSweeperLoop, runRearmSweeperPass } from "../rearm-sweeper-main.ts";
+import { parseRearmKey, rearmCorruptKey, rearmCursorKey, rearmDoneKey, rearmScopes, REARM_SKEW_MS, RearmSweepRefused, sweepRearmMarkers, type RearmSweepOptions } from "../rearm-sweeper.ts";
+import { exitCodeForError, exitCodeForPass, rearmSweeperConfig, rearmSweeperEnabled, runRearmSweeperLoop, runRearmSweeperPass } from "../rearm-sweeper-main.ts";
 import { liveMachineId } from "../writer.ts";
 import { TENANT, scratchStore } from "./support.ts";
 
@@ -252,10 +252,12 @@ describe("re-arm sweeper", () => {
     await seed(store, [...canonical(TENANT), ...canonical(TENANT, "sess-2")]);
     const first = await sweep(store, { maxMarkers: 1, concurrency: 1 });
     expect(first).toMatchObject({ complete: false, resume: { scope: 0 } });
+    expect(first.resume!.afterKey).toBeString();
     expect(first.counts).toMatchObject({ listed: 1, erased: 1 });
     const second = await sweepRearmMarkers({ store, eraser: storeEraser(store) }, { keyRoot: ROOT, bucket: "transcripts", maxMarkers: 1, concurrency: 1, now: LATER }, first.resume);
     expect(second).toMatchObject({ complete: true, resume: null });
-    expect(second.counts).toMatchObject({ listed: 2, alreadyDone: 1, erased: 1 });
+    // It continues AFTER the last finished key: the first marker is not even read again.
+    expect(second.counts).toMatchObject({ listed: 1, alreadyDone: 0, erased: 1 });
     // A deadline already passed: nothing is listed at all.
     expect(await sweep(store, { deadlineAt: 0 })).toMatchObject({ complete: false, counts: { listed: 0 } });
   });
@@ -301,6 +303,111 @@ describe("re-arm sweeper", () => {
   });
 });
 
+describe("re-arm sweeper: review fixes", () => {
+  const ownerKey = (sessionId = "sess-1", tenant = TENANT) => s3LedgerKeys(ROOT, tenant).owner(ORIGIN, "claude", sessionId);
+
+  test("stuck markers that cannot progress cost no budget: the real one after them is erased in the same pass", async () => {
+    const store = fresh();
+    await rearmed(store, TENANT, "b1");
+    await seed(store, canonical(TENANT));
+    const dir = s3LedgerKeys(ROOT, TENANT).dir;
+    for (let i = 0; i < 5; i++) await put(store, `${dir}/ledger/rearm/o=${"0".repeat(32)}/${String(i).repeat(32)}.json`, "{stuck");
+    const r = await sweep(store, { maxMarkers: 1, concurrency: 1 });
+    expect(r.counts).toMatchObject({ corrupt: 5, erased: 1 });
+    expect(r.complete).toBe(true);
+  });
+
+  test("a stale saved list cursor: the scope is listed again from its start, still skipping what was finished", async () => {
+    const store = fresh();
+    const m1 = await rearmed(store, TENANT, "b1");
+    const m2 = await rearmed(store, TENANT, "b2", "sess-2");
+    const [firstKey] = [m1, m2].sort();
+    const failing = new Proxy(store, { get(t, k) {
+      if (k === "list") return async (p: unknown, cursor?: string) => { if (cursor === "stale") throw new ObjectStoreError("backend", "s3", "LIST", { status: 400 }); return t.list(p as never, cursor); };
+      const v = (t as any)[k]; return typeof v === "function" ? v.bind(t) : v;
+    } }) as ObjectStore;
+    const r = await sweepRearmMarkers({ store: failing, eraser: storeEraser(store) }, { keyRoot: ROOT, bucket: "transcripts", now: LATER }, { scope: 0, cursor: "stale", afterKey: firstKey });
+    expect(r).toMatchObject({ complete: true, counts: { listed: 1, erased: 1 } });
+  });
+
+  test("a corrupt marker is recorded next to itself (findable without a key in any log); a dry run records nothing", async () => {
+    const store = fresh();
+    const dir = s3LedgerKeys(ROOT, TENANT).dir;
+    const key = `${dir}/ledger/rearm/o=${"0".repeat(32)}/${"1".repeat(32)}.json`;
+    await put(store, key, "{broken");
+    const record = rearmCorruptKey(key, hex("{broken").slice(0, 32));
+    expect((await sweep(store, { dryRun: true })).counts.corrupt).toBe(1);
+    expect(await exists(store, record)).toBe(false);
+    expect((await sweep(store)).counts.corrupt).toBe(1);
+    expect(JSON.parse(await text(store, record))).toMatchObject({ v: 1, reason: "unparseable" });
+  });
+
+  test("access denied (a 403, e.g. ListBucket conditioned on a prefix makes a missing HEAD 403) aborts the pass with a coded refusal", async () => {
+    const store = fresh();
+    await rearmed(store, TENANT, "b1");
+    const denying = new Proxy(store, { get(t, k) {
+      if (k === "head") return async () => { throw new ObjectStoreError("unauthorized", "s3", "HEAD", { status: 403 }); };
+      const v = (t as any)[k]; return typeof v === "function" ? v.bind(t) : v;
+    } }) as ObjectStore;
+    const err = await sweepRearmMarkers({ store: denying, eraser: storeEraser(store) }, { keyRoot: ROOT, bucket: "transcripts", now: LATER }).catch((e) => e);
+    expect(err).toBeInstanceOf(RearmSweepRefused);
+    expect(err.code).toBe("access_denied");
+    expect(exitCodeForError(err)).toBe(2);
+    const listDenied = new Proxy(store, { get(t, k) {
+      if (k === "list") return async () => { throw new ObjectStoreError("unauthorized", "s3", "LIST", { status: 403 }); };
+      const v = (t as any)[k]; return typeof v === "function" ? v.bind(t) : v;
+    } }) as ObjectStore;
+    expect(sweepRearmMarkers({ store: listDenied, eraser: storeEraser(store) }, { keyRoot: ROOT, bucket: "transcripts" })).rejects.toMatchObject({ code: "access_denied" });
+  });
+
+  test("the marker's machine is bound to its user's ownership stub: mismatch, unbound and missing stubs erase nothing", async () => {
+    const store = fresh();
+    const marker = await rearmed(store, TENANT, "b1");
+    await seed(store, canonical(TENANT));
+    expect(JSON.parse(await text(store, ownerKey()))).toMatchObject({ machineId: machineOf(TENANT) });
+    const good = await text(store, marker);
+    const stub = await text(store, ownerKey());
+    // A marker naming another machine (another user's prefix): refused.
+    await put(store, marker, JSON.stringify({ ...JSON.parse(good), machineId: `srv_${"b".repeat(32)}` }));
+    expect((await sweep(store)).counts).toMatchObject({ machineMismatch: 1, erased: 0 });
+    await put(store, marker, good);
+    const { machineId: _, ...unbound } = JSON.parse(stub);
+    await put(store, ownerKey(), JSON.stringify(unbound));
+    expect((await sweep(store)).counts).toMatchObject({ machineUnbound: 1, erased: 0 });
+    await store.delete(objectKey(ownerKey()));
+    expect((await sweep(store)).counts).toMatchObject({ ownerMissing: 1, erased: 0 });
+    for (const k of canonical(TENANT)) expect(await exists(store, k)).toBe(true);
+    await put(store, ownerKey(), stub);
+    expect((await sweep(store)).counts).toMatchObject({ erased: 1 });
+  });
+
+  test("the ledger refuses a commit whose machine is not the tenant's, and binds an older stub's machine on the next claim", async () => {
+    const store = fresh();
+    const ledger = ledgerOn(store);
+    const input = claimInput(TENANT, "c1", [rec("r-c1", 1, "sess-5")]);
+    const c = await ledger.claim(input);
+    if (c.kind !== "claimed") throw new Error("unexpected");
+    await expect(ledger.commit({ tenant: TENANT, originId: ORIGIN, batchId: "c1", batchDigest: input.batchDigest, claimToken: c.claimToken, sessions: input.sessions,
+      records: input.records, machineId: `srv_${"c".repeat(32)}` })).rejects.toMatchObject({ code: "ledger_input_refused" });
+    const { machineId: _, ...legacy } = JSON.parse(await text(store, ownerKey("sess-5")));
+    await put(store, ownerKey("sess-5"), JSON.stringify(legacy));
+    await ledger.claim(claimInput(TENANT, "c2", [rec("r-c2", 1, "sess-5")]));
+    expect(JSON.parse(await text(store, ownerKey("sess-5")))).toMatchObject({ machineId: machineOf(TENANT), epoch: legacy.epoch, resets: legacy.resets });
+  });
+
+  test("a layout collision (a:b and a_b share s=a_b) with a live session erases nothing; once both are deleted it erases", async () => {
+    const store = fresh();
+    await ledgerOn(store).claim(claimInput(TENANT, "bx", [rec("r-bx", 1, "a_b")])); // a live session of the same origin
+    await rearmed(store, TENANT, "b1", "a:b");
+    await seed(store, canonical(TENANT, "a_b")); // the one physical dir both map to
+    expect((await sweep(store)).counts).toMatchObject({ layoutCollision: 1, erased: 0 });
+    for (const k of canonical(TENANT, "a_b")) expect(await exists(store, k)).toBe(true);
+    await ledgerOn(store).setSessionUploads(selection(TENANT, false, "a_b"));
+    expect((await sweep(store)).counts).toMatchObject({ erased: 1, layoutCollision: 0 });
+    for (const k of canonical(TENANT, "a_b")) expect(await exists(store, k)).toBe(false);
+  });
+});
+
 describe("re-arm sweeper entry", () => {
   const ENV = { INGEST_REARM_SWEEPER_ENABLED: "true", INGEST_REARM_BUCKET: "transcripts", INGEST_REARM_REGION: "us-east-1", INGEST_REARM_CREDENTIALS: "keys",
     INGEST_REARM_S3_ACCESS_KEY_ID: "test-access-key-id", INGEST_REARM_S3_SECRET_ACCESS_KEY: "test-only-secret" };
@@ -317,6 +424,40 @@ describe("re-arm sweeper entry", () => {
     expect(rearmSweeperConfig({ ...ENV, INGEST_REARM_ORGS: "org-a, org-b" }).orgs).toEqual(["org-a", "org-b"]);
     for (const bad of [{ INGEST_REARM_CONCURRENCY: "17" }, { INGEST_REARM_INTERVAL_MS: "5" }, { INGEST_REARM_ORGS: "../x" }, { INGEST_REARM_CREDENTIALS: "env" }, { INGEST_REARM_DRY_RUN: "yes" }, { INGEST_REARM_BUCKET: "" }])
       expect(() => rearmSweeperConfig({ ...ENV, ...bad })).toThrow(RearmSweepRefused);
+  });
+
+  test("N stuck markers that DO spend budget ahead of a real one: the durable cursor gets the real one erased within bounded passes, then wraps", async () => {
+    const store = fresh();
+    const stuck = Array.from({ length: 5 }, (_, i) => ({ ...TENANT, orgId: `org-stuck-${i}` }));
+    for (const t of stuck) { await rearmed(store, t, "b1"); await seed(store, canonical(t)); }
+    const real = { ...TENANT, orgId: "org-z" }; // lists after every stuck org
+    await rearmed(store, real, "b1");
+    await seed(store, canonical(real));
+    // The stuck orgs' erases never verify (pending forever): each spends budget on every pass.
+    const inner = storeEraser(store);
+    const eraser: PagedEraser = { ...inner, verifyErased: (prefix, o) => prefix.includes("/org-stuck-")
+      ? Promise.resolve({ status: "pending", reason: "remaining", remaining: 1, listed: 1 }) : inner.verifyErased(prefix, o) };
+    const env = { ...ENV, INGEST_REARM_MAX_MARKERS: "2", INGEST_REARM_CONCURRENCY: "1" };
+    const overrides = { store: () => store, eraser: () => eraser, now: LATER };
+    let passes = 0, erased = 0;
+    while (erased === 0 && passes < 4) {
+      const { output } = await runRearmSweeperPass(env, [], overrides); // a fresh invocation each time: no in-memory state
+      passes++;
+      if (!output.enabled) throw new Error("disabled");
+      expect(output.cursor).toBe("saved");
+      erased = output.counts.erased;
+    }
+    expect(erased).toBe(1);
+    expect(passes).toBe(3); // 2 + 2 + (1 + the real one)
+    for (const k of canonical(real)) expect(await exists(store, k)).toBe(false);
+    const cursorKey = rearmCursorKey(ROOT, rearmScopes(ROOT, null));
+    expect(JSON.parse(await text(store, cursorKey))).toMatchObject({ v: 1, resume: null }); // complete: the next pass starts over
+    const { output } = await runRearmSweeperPass(env, [], overrides);
+    expect(output).toMatchObject({ complete: false, counts: { pending: 2, alreadyDone: 0 } }); // wrapped to the start
+    // A dry run never reads or writes the cursor.
+    const before = await text(store, cursorKey);
+    await runRearmSweeperPass({ ...env, INGEST_REARM_DRY_RUN: "1" }, [], overrides);
+    expect(await text(store, cursorKey)).toBe(before);
   });
 
   test("a pass through the entry: counts only, never a key or tenant id; the loop runs passes until stopped", async () => {

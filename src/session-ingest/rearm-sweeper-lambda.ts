@@ -2,9 +2,10 @@
  * EventBridge-scheduled Lambda entry for the S3 ledger re-arm sweeper (rearm-sweeper.ts), packaged like
  * buffered-gc-lambda.ts: DEFAULT OFF. With INGEST_REARM_SWEEPER_ENABLED unset or "false" it returns {enabled:false}
  * before reading any setting or credential. Armed, it runs ONE bounded pass with the execution role
- * (INGEST_REARM_CREDENTIALS must be unset or "role"), stopping before its next marker once the invocation's budget is spent. A
- * Lambda keeps no cursor between invocations: each pass lists from the start, and finished markers cost a GET and a
- * HEAD each. The handler never accepts factories, credentials or settings from its invocation payload.
+ * (INGEST_REARM_CREDENTIALS must be unset or "role"), stopping before its next marker once the invocation's budget is spent.
+ * Its position is kept in the bucket (rearm-sweeper.ts rearmCursorKey, create-only then If-Match), so each invocation
+ * continues where the last one stopped and wraps to the start once the namespace is done: no marker is starved by the
+ * ones before it. The handler never accepts factories, credentials or settings from its invocation payload.
  * One EMF line per pass: counts only.
  */
 import { REARM_ENABLE_FLAG, rearmSweeperEnabled } from "./rearm-sweeper-main.ts";

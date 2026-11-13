@@ -83,7 +83,7 @@ import {
   type SelectionInput,
 } from "./ledger.ts";
 import { MAX_DELIVERY_CONFLICTS } from "./vendor/delivery/delivery-contracts.ts";
-import { assertTenantSegment, backoffMs } from "./writer.ts";
+import { assertTenantSegment, backoffMs, liveMachineId } from "./writer.ts";
 
 // ---- INGEST_LEDGER ----
 
@@ -123,10 +123,15 @@ export function s3LedgerKeys(keyRoot: string, tenant: LedgerTenant) {
     revisions: (originId: string, recordId: string) => `${dir}/ledger/revisions/o=${h(originId)}/r=${revisionShard(recordId)}.json`,
     revisionShard: (originId: string, shard: string) => `${dir}/ledger/revisions/o=${h(originId)}/r=${shard}.json`,
     ownersRoot: `${dir}/ledger/owners`,
-    owner: (originId: string, source: string, sessionId: string) => `${dir}/ledger/owners/o=${h(originId)}/s=${sessionKeyHash(source, sessionId)}.json`,
+    owner: (originId: string, source: string, sessionId: string) => ownerKeyIn(dir, originId, source, sessionId),
     rearm: (originId: string, source: string, sessionId: string) => `${dir}/ledger/rearm/o=${h(originId)}/${sessionKeyHash(source, sessionId)}.json`,
   };
 }
+
+/** An origin's ownership-stub directory under a user's admission directory `dir` (no trailing slash). */
+export const ownersOriginPrefix = (dir: string, originId: string) => `${dir}/ledger/owners/o=${h(originId)}`;
+/** A session's ownership stub under a user's admission directory `dir`. */
+export const ownerKeyIn = (dir: string, originId: string, source: string, sessionId: string) => `${ownersOriginPrefix(dir, originId)}/s=${sessionKeyHash(source, sessionId)}.json`;
 
 /** The deployment-wide fence-authority marker (FenceAuthorityDoc). */
 export const fenceAuthorityKey = (keyRoot: string) => `${keyRoot}/.ledger/fence-authority.json`;
@@ -199,8 +204,13 @@ export interface IndexDoc { v: 1; originId: string; shard: string; records: Reco
  * marker's own admission directory (org, workspace) names exactly the canonical prefix the commit wrote.
  */
 export interface RearmDoc { v: 1; originId: string; source: string; sessionId: string; machineId: string; atMs: number }
-/** The ownership stub (ingest_session_ownership): the OLDEST generation this session was claimed under at its current epoch. */
-export interface OwnerDoc { v: 1; originId: string; source: string; sessionId: string; epoch: number; resets: number }
+/**
+ * The ownership stub (ingest_session_ownership): the OLDEST generation this session was claimed under at its current epoch.
+ * `machineId`: the claiming user's writer machine (writer.ts liveMachineId of the tenant's workspace and this origin),
+ * computed by the ledger from the tenant, never from input. The re-arm sweeper erases only a marker whose machineId
+ * equals it. Absent on stubs written before it existed (the next claim of the session fills it in) and on backfilled ones.
+ */
+export interface OwnerDoc { v: 1; originId: string; source: string; sessionId: string; epoch: number; resets: number; machineId?: string }
 
 /**
  * `<keyRoot>/.ledger/fence-authority.json`. An operator writes it, once, and ONLY when all of these hold:
@@ -272,7 +282,8 @@ export function validIndex(v: unknown): v is IndexDoc {
     && Object.values(v.records).every(entryOk); // record ids are read with own() and Maps only, so any id is a plain key
 }
 export function validOwner(v: unknown): v is OwnerDoc {
-  return isObject(v) && v.v === 1 && str(v.originId) && str(v.source) && str(v.sessionId) && count(v.epoch) && count(v.resets);
+  return isObject(v) && v.v === 1 && str(v.originId) && str(v.source) && str(v.sessionId) && count(v.epoch) && count(v.resets)
+    && (v.machineId === undefined || (typeof v.machineId === "string" && /^srv_[0-9a-f]{32}$/.test(v.machineId)));
 }
 export function validRearm(v: unknown): v is RearmDoc {
   return isObject(v) && exactKeys(v, ["v", "originId", "source", "sessionId", "machineId", "atMs"]) && v.v === 1 && mapKey(v.originId) && str(v.source) && str(v.sessionId)
@@ -599,9 +610,17 @@ export function s3LedgerObjects(store: ObjectStore, keyRoot: string, opts: Omit<
       const got = await readOwner(key);
       if (got) {
         if (got.doc.originId !== doc.originId || got.doc.source !== doc.source || got.doc.sessionId !== doc.sessionId) throw new LedgerUnavailableError("ledger_owner_invalid");
-        if (got.doc.epoch >= doc.epoch) return;
+        if (got.doc.machineId !== undefined && doc.machineId !== undefined && got.doc.machineId !== doc.machineId) throw new LedgerUnavailableError("ledger_owner_invalid");
+        if (got.doc.epoch >= doc.epoch) {
+          // Same or older generation: keep the stored one, only binding its machine when it has none yet.
+          if (got.doc.machineId !== undefined || doc.machineId === undefined) return;
+          if (await casPut(store, key, { ...got.doc, machineId: doc.machineId }, got.version)) return;
+          await backoff(attempt);
+          continue;
+        }
       }
-      if (await casPut(store, key, doc, got?.version)) return;
+      const next: OwnerDoc = got?.doc.machineId !== undefined && doc.machineId === undefined ? { ...doc, machineId: got.doc.machineId } : doc;
+      if (await casPut(store, key, next, got?.version)) return;
       await backoff(attempt);
     }
     throw new LedgerUnavailableError("ledger_owner_contended");
@@ -935,7 +954,8 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
           const live = pairs.filter(([s, id]) => !judged.deletedSet.has(pairId(s, id)));
           await mapLimit(live, PARALLEL, ([s, id]) => {
             const [, epoch, resets] = recordGeneration(fence, input.originId, s, id);
-            return registerOwner(keys.owner(input.originId, s, id), { v: 1, originId: input.originId, source: s, sessionId: id, epoch, resets });
+            return registerOwner(keys.owner(input.originId, s, id), { v: 1, originId: input.originId, source: s, sessionId: id, epoch, resets,
+              machineId: liveMachineId(input.tenant.workspaceId, input.originId, input.tenant.userId) });
           });
           // Claim again only if the fence moved in a way that touches THIS claim (a reset, or one of its sessions'
           // epoch or deletion), never for an unrelated edit, so other sessions' controls cannot starve it.
@@ -969,6 +989,8 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
         throw new LedgerUnavailableError("ledger_input_refused");
       checkRecords(input.records);
       const keys = keysFor(input.tenant);
+      // The re-arm marker names the canonical prefix the sweeper erases: only this tenant's own writer machine.
+      if (input.machineId !== liveMachineId(input.tenant.workspaceId, input.originId, input.tenant.userId)) throw new LedgerUnavailableError("ledger_input_refused");
       const batchKey = keys.batch(input.originId, input.batchId);
       const stored = await readDoc(store, batchKey, validBatch, "ledger_batch_record_invalid");
       if (!stored || stored.doc.digest !== input.batchDigest || stored.doc.originId !== input.originId || stored.doc.batchId !== input.batchId)
