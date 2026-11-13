@@ -237,6 +237,19 @@ test("STS: the OIDC token is exchanged for the mode's role in memory; a bad resp
   expect(codeSync(() => parseStsCredentials("<Error><Code>AccessDenied</Code></Error>"))).toBe("backlog_ops_sts_response");
 });
 
+test("STS: assumeRole refuses a session with too little time left (the expiry check is wired in)", async () => {
+  const xml = (expiresAt: number) => "<AssumeRoleWithWebIdentityResponse><Credentials><AccessKeyId>ASIAAAAAAAAAAAAAAAAA</AccessKeyId>" +
+    `<SecretAccessKey>secret</SecretAccessKey><SessionToken>token</SessionToken><Expiration>${new Date(expiresAt).toISOString()}</Expiration></Credentials></AssumeRoleWithWebIdentityResponse>`;
+  const env = { ACTIONS_ID_TOKEN_REQUEST_URL: "https://token.example/x?api=1", ACTIONS_ID_TOKEN_REQUEST_TOKEN: "req" };
+  const fetcherFor = (expiresAt: number) => (async (url: string) =>
+    url.startsWith("https://token.example/") ? new Response(JSON.stringify({ value: "a.b.c" })) : new Response(xml(expiresAt))) as unknown as typeof fetch;
+  // Ten minutes left: assumeRole itself must refuse, not hand back credentials.
+  expect(await code(() => assumeRole(env, target.BACKLOG_OPS_DRY_ROLE_ARN, "us-east-1", "s", fetcherFor(Date.now() + 10 * 60_000))))
+    .toBe("backlog_ops_sts_expiration");
+  const ok = await assumeRole(env, target.BACKLOG_OPS_DRY_ROLE_ARN, "us-east-1", "s", fetcherFor(Date.now() + 6 * 3600_000));
+  expect(ok.accessKeyId).toBe("ASIAAAAAAAAAAAAAAAAA");
+});
+
 // ---- GitHub gate ----
 
 function githubFixture(mode: BacklogOpsMode) {

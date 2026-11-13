@@ -38,7 +38,7 @@ export const BACKLOG_OPS_RECEIPT_CONTRACT = "backlog-ops-receipt/v1";
 export const BACKLOG_OPS_BINDING_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 /** The drain's backfill must be this fresh: "a rerun of the fence backfill immediately before". */
 export const BACKLOG_OPS_FRESH_BACKFILL_MS = 3 * 60 * 60 * 1000;
-/** The role session: the job's timeout is above it, so no tool outlives its credentials unnoticed. */
+/** The role session (360 min). The operate job's timeout (355 min) is below it, so a tool never outlives its credentials. */
 export const BACKLOG_OPS_SESSION_SECONDS = 6 * 60 * 60;
 /**
  * The protected GitHub environments. Dry modes run in the schema release environment; every execute runs in its own
