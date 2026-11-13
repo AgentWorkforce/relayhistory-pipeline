@@ -216,6 +216,8 @@ describe("session pipeline: not reachable from the internet", () => {
       "aws/session-pipeline.ts: Permission(id, props as never);",
       // The read API has a Function URL by design (application auth); its props are pinned in session-read-api.test.ts.
       'aws/session-read-api.ts: Function("session-read-api", sessionReadApiFunctionProps({ stage: i.stage, names, p: i.p, ...(i.analysisBucketName ? { analysisBucketName: i.analysisBucketName } : {}) }) as never);',
+      // The upload-admission consumer (HISTORY_UPLOAD_DIRECT_INFRA=on): SQS-driven, functionUrl false (upload-inbox-infra.test.ts).
+      'aws/transcript-store.ts: Function("upload-admission", uploadAdmissionFunctionProps({ stage: i.stage, bucket: n.bucket, names: u, p: i.transcriptStore.uploadAdmission!, sse: i.transcriptStore.uploadInboxSse! }) as never)',
     ]);
   });
 });
