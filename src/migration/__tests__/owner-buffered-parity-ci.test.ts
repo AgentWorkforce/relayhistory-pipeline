@@ -12,6 +12,7 @@ import { join } from "node:path";
 import {
   OWNER_PARITY_CHILD_ENV,
   ownerParityCode,
+  ownerParityDiagnosticCode,
   ownerParityChildSpawn,
   refuseOwnerParityCredentialEnv,
   runOwnerParity,
@@ -123,6 +124,22 @@ test("diagnostic codes expose only fixed SQLSTATE/connection classes and never d
   expect(ownerParityCode(arbitrary)).toBe("owner_parity_failed");
   expect(JSON.stringify([ownerParityCode(pg), ownerParityCode(connection), ownerParityCode(arbitrary)]))
     .not.toMatch(/secret|private\.example|SELECT|tenant_id/u);
+});
+
+test("temporary phase diagnostic exposes only fixed path and structural shape", () => {
+  const arbitrary = Object.assign(new Error("password=secret host=private.example query=SELECT tenant_id"), {
+    code: "private.example", detail: "tenant-secret", query: "SELECT private_row",
+  });
+  const noCode = new TypeError("postgres://owner:secret@private.example/database");
+  expect(ownerParityDiagnosticCode(arbitrary, "session_setup"))
+    .toBe("owner_parity_diag_session_setup_error_code_other");
+  expect(ownerParityDiagnosticCode(noCode, "supabase_url"))
+    .toBe("owner_parity_diag_supabase_url_error_no_code");
+  expect(ownerParityDiagnosticCode(null, "stdin")).toBe("owner_parity_diag_stdin_null");
+  expect(JSON.stringify([
+    ownerParityDiagnosticCode(arbitrary, "session_setup"),
+    ownerParityDiagnosticCode(noCode, "supabase_url"),
+  ])).not.toMatch(/secret|private\.example|SELECT|tenant|database/u);
 });
 
 test("census then write: seven rows, roster order, exact readback; unlisted tenants never reach G1 or a write", async () => {

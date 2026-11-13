@@ -210,6 +210,33 @@ export function ownerParityCode(error: unknown): string {
   return /^[A-Za-z0-9_.:,-]{1,160}$/u.test(code) ? code : "owner_parity_failed";
 }
 
+const OWNER_PARITY_DIAGNOSTIC_PHASES = [
+  "inputs", "credential_env", "preflight", "checkout", "stdin", "source_input", "supabase_url", "pg_config",
+  "neon_url", "session_setup", "operator",
+] as const;
+type OwnerParityDiagnosticPhase = typeof OWNER_PARITY_DIAGNOSTIC_PHASES[number];
+
+/**
+ * Temporary, content-free runtime instrumentation for the operator-child boundary. It records only the fixed
+ * code-path phase and structural shape of an otherwise-redacted thrown value. It never reads error.message,
+ * stack, cause, query, host, role or any enumerable driver field. Remove after the live refusal is identified.
+ */
+export function ownerParityDiagnosticCode(error: unknown, phase: OwnerParityDiagnosticPhase): string {
+  const classified = ownerParityCode(error);
+  if (classified !== "owner_parity_failed") return classified;
+  let shape: string;
+  if (error === null) shape = "null";
+  else if (error === undefined) shape = "undefined";
+  else if (typeof error !== "object") shape = `primitive_${typeof error}`;
+  else {
+    const hasCode = "code" in error;
+    const code = hasCode ? (error as { code?: unknown }).code : undefined;
+    const kind = error instanceof Error ? "error" : "object";
+    shape = `${kind}_${hasCode ? (typeof code === "string" ? "code_other" : `code_${typeof code}`) : "no_code"}`;
+  }
+  return `owner_parity_diag_${phase}_${shape}`;
+}
+
 /**
  * Every check that needs no credential: inputs and the dormant switch, the roster, and for write the census
  * artifact and the typed confirmation. Runs in the parent before the secret is touched and again in the child.
@@ -706,20 +733,29 @@ async function parent(): Promise<number> {
 async function operatorChild(): Promise<number> {
   const env = process.env;
   let paths: ReturnType<typeof outputPaths> | null = null;
+  let diagnosticPhase: OwnerParityDiagnosticPhase = "inputs";
   try {
     const read = inputs(env);
     paths = read.paths;
     const { roster, census } = read;
+    diagnosticPhase = "credential_env";
     refuseOwnerParityCredentialEnv(env);
+    diagnosticPhase = "preflight";
     const pre = ownerParityPreflight(env, roster, census);
+    diagnosticPhase = "checkout";
     verifyCheckout(pre.dispatch.sha);
     const args = { mode: "bulk" as const, expectedSourceSha: pre.dispatch.sha, expectedTargetGeneration: "0".repeat(64),
       censusSource: pre.dispatch.censusSource, batchSize: FETCH_PAGE };
     const keys = operatorCredentialKeys(args);
+    diagnosticPhase = "stdin";
     const input = await readStdinCredentials(keys.required, keys.allowed);
+    diagnosticPhase = "source_input";
     validateCensusSourceInput(args, input);
+    diagnosticPhase = "supabase_url";
     const supabaseUrl = sessionAffinityUrl(input.supabaseUrl, "supabaseUrl", "supabase");
+    diagnosticPhase = "pg_config";
     pinnedPgConfig(supabaseUrl, "supabaseUrl", "supabase");
+    diagnosticPhase = "neon_url";
     const neonUrl = pre.dispatch.censusSource === "neon" ? sessionAffinityUrl(input.neonUrl, "neonUrl", "neon") : null;
     if (neonUrl !== null) pinnedPgConfig(neonUrl, "neonUrl", "neon");
     // Only `write` has a writable target session (OWNER_PARITY_MODE_POLICY); discovery is read-only like census.
@@ -737,17 +773,22 @@ async function operatorChild(): Promise<number> {
           client(supabaseUrl, "supabaseUrl", "supabase", write ? "owner-buffered-ci-target-owner" : "owner-buffered-ci-target-readonly"),
           !write, (target) => work({ source, enumerator, target })));
     let outcome: OwnerParityOutcome;
+    diagnosticPhase = "session_setup";
     if (neonUrl !== null) {
       const neon = await connectNeon(neonUrl);
       try {
         await requireReadOnly(neon, "neonUrl");
+        diagnosticPhase = "operator";
         outcome = await run(neon);
       } finally {
         await neon.end().catch(() => undefined);
       }
     } else {
       outcome = await withParityOwnerSession(
-        client(supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-ci-frozen-source-readonly"), true, run);
+        client(supabaseUrl, "supabaseUrl", "supabase", "owner-buffered-ci-frozen-source-readonly"), true, async (source) => {
+          diagnosticPhase = "operator";
+          return run(source);
+        });
     }
     writePrivate(paths.receipt, outcome.receipt);
     if (outcome.census) writePrivate(paths.out, outcome.census);
@@ -755,7 +796,7 @@ async function operatorChild(): Promise<number> {
     announce(outcome.receipt);
     return outcome.exitCode;
   } catch (error) {
-    writeRefused(env, paths, ownerParityCode(error));
+    writeRefused(env, paths, ownerParityDiagnosticCode(error, diagnosticPhase));
     return 1;
   }
 }
