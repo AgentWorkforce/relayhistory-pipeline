@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
-import { EC2_USER_DATA_ENCODED_LIMIT, RELAY_SESSIONS_KIT_FILES, WORKER_KIT_FILES, decide, fileReader, hostBoundaryPolicy, hostRolePolicy, hostRoleProps, hostTemplate, networkParams, userDataBase64 } from "@agentworkforce/layered-agent";
+import { AGENT_CARD_FILE, EC2_USER_DATA_ENCODED_LIMIT, RELAY_SESSIONS_KIT_FILES, WORKER_KIT_FILES, decide, fileReader, hostBoundaryPolicy, hostRolePolicy, hostRoleProps, hostTemplate, networkParams, renderAgentCard, userDataBase64 } from "@agentworkforce/layered-agent";
 import agent from "../agent.config.ts";
 
 const AGENT_DIR = fileURLToPath(new URL("..", import.meta.url));
@@ -97,9 +97,28 @@ test(`user data: under ${USER_DATA_BUDGET} bytes encoded (EC2 caps it at ${EC2_U
   // 0.1.12). The kit's OPTIONAL_KIT_FILES, which its own test/host.test.ts and
   // test/fresh-host.test.ts use, is not exported, so those two are listed here.
   const optional: readonly string[] = ["headless.py", "delegation.md", ...WORKER_KIT_FILES, ...RELAY_SESSIONS_KIT_FILES];
-  for (const f of agent.files) if (!optional.includes(f.name)) assert.ok(script.includes(`cat > /opt/agent-host/${f.name} <<'`), f.name);
+  // The generated card file (module 0.1.17) travels by hot update, never in user data.
+  for (const f of agent.files) if (f.source !== "generated" && !optional.includes(f.name)) assert.ok(script.includes(`cat > /opt/agent-host/${f.name} <<'`), f.name);
   for (const f of optional) assert.ok(!script.includes(`/opt/agent-host/${f} <<'`), `${f} is not in user data`);
   assert.doesNotMatch(script, /sk-ant-|ghp_|ghs_|gho_|github_pat_|BEGIN [A-Z ]*PRIVATE KEY/);
+});
+
+test("the A2A card renders within the relay's limits, one skill per kind of work, and is generated, never in user data", () => {
+  assert.ok(agent.input.relaySessions, "the lead publishes the card with the agent-relay MCP");
+  const rendered = renderAgentCard(agent.input.card!);
+  const card = JSON.parse(rendered) as { description: string; skills: { id: string; tags?: string[]; examples?: string[] }[]; documentation_url?: string; version: string };
+  assert.match(card.description, /^layered-sessions-pipeline coordinates work on the Agent Relay sessions pipeline/);
+  assert.deepEqual(card.skills.map((s) => s.id), ["track-work", "check-overlaps", "review-and-land", "consolidate-prs", "implement-change"]);
+  for (const s of card.skills) {
+    assert.ok((s.tags?.length ?? 0) > 0, `${s.id} has tags`);
+    assert.ok((s.examples?.length ?? 0) >= 2 && (s.examples?.length ?? 0) <= 4, `${s.id} has 2 to 4 examples`);
+  }
+  assert.equal(card.documentation_url, "https://github.com/AgentWorkforce/relayhistory-pipeline");
+  assert.match(card.version, /^[0-9a-f]{12}$/);
+  assert.equal(agent.generated[AGENT_CARD_FILE], rendered);
+  assert.deepEqual(agent.files.filter((f) => f.source === "generated"), [{ name: AGENT_CARD_FILE, source: "generated" }]);
+  const script = gunzipSync(Buffer.from(userDataBase64(agent, read), "base64")).toString("utf8");
+  assert.ok(!script.includes(`/opt/agent-host/${AGENT_CARD_FILE}`), "the card never rides in user data");
 });
 
 test("the lead runs on Fable: the rendered lead unit starts the kit's lead-run.sh, which runs the kit's headless supervisor with --model claude-fable-5-1", () => {
