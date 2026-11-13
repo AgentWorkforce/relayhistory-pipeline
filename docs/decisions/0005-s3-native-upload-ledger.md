@@ -14,18 +14,12 @@ changes. 0004's consumer passes each upload to `deliverPrepared` with the SQL le
 
 ## Context
 
-The Nov 5 05:33Z buffered cutover moved upload bytes to S3, but not the bookkeeping. Every batch still
-makes four Supabase round trips before its receipt: `ingest_claim_buffered_batch`, the slot lease,
+The buffered cutover moved upload bytes to S3, but not the bookkeeping. Every batch still makes four
+Supabase round trips before its receipt: `ingest_claim_buffered_batch`, the slot lease,
 `ingest_prepare_buffer_stage` and `ingest_commit_buffered_batch`. Those calls leave one
 `ingest_batches` row and one `ingest_buffer_outbox` row. The publisher that would drain the outbox into
-the canonical layout has never run, so on 2026-11-12 at 23:35Z:
-
-- `ingest_buffer_outbox` held ~795k rows and was still growing.
-- All `ingest_publication_*` tables were empty.
-- ClickHouse had received nothing after 2026-11-05 05:33:38Z.
-
-These are the live-tuple stats from a read-only prod check. Sessions uploaded since then never reach
-the dashboard.
+the canonical layout has not run, so the outbox only grows, and sessions uploaded since the cutover
+never reach the dashboard.
 
 The async designs move the SQL off the request path (`docs/design/s3-first-async-ingest.md`,
 `docs/selfhost-async-admission.md`, 0004), but they keep it as the accounting. Every admission is
@@ -97,22 +91,33 @@ The fence object becomes the authority for what the ingest stores. Until reads m
 The read side (session-read-api deletion filters) and the eraser move to the fence object in a
 follow-up. They are named here, so nothing new may start reading `upload_deletions`.
 
-## The ~795k stuck batches
+## The buffered backlog
 
-There is no outbox replay. A one-off **drain job** works through the S3 objects directly:
+There is no outbox replay. A one-off **drain job** works through the S3 objects directly, after a
+one-time **fence backfill**:
 
+0. **Fence backfill.** The backlog's deletions and resets were recorded in SQL (`upload_deletions`,
+   `upload_resets`). Before the drain, a one-time job copies each affected user's current fence state into
+   `upload-fences.json`, and from then on controls dual-write it (see Controls). This is a one-time
+   migration of existing state, not ongoing accounting. The drain refuses a user whose fence has not been
+   backfilled, so it can never republish a deleted session.
 1. List `buffered-batches/v1/` staged objects. Each carries its tenant, origin and grouped scrubbed
    lines (`staging.ts:222`).
-2. Read the user's fence and drop deleted sessions and pre-reset batches.
-3. Write each batch with `writeBatchObjects`, as the staged fan-out does (`staging.ts:154`). This is
-   idempotent under manifest CAS.
+2. Read the user's fence and privacy journal. Drop deleted sessions and batches the user's last reset
+   superseded.
+3. Read the sessions' revision indexes and drop stale records. Write the rest to the canonical layout
+   through a drain-specific entry, idempotent under manifest CAS. The staged fan-out (`staging.ts:154`)
+   refuses buffered objects on purpose (`buffered_publication_refused`, `staging.ts:160`), so the drain
+   does not relax that check; it calls the writer itself. Then merge the written revisions into the
+   indexes.
 4. Write a create-only `drained` marker next to each staged object, so a rerun skips it.
 
 The drain replaces the publisher path for the existing backlog. Until it has run and been verified,
 the `ingest_publication_*` tables, their claim and ack functions, and the frontier row contract
 (`20261104060000`) stay intact. Rate is bounded by job concurrency. The job is dry-run first against dev, then against prod with
 read-only listing, and then for real with his OK. Afterwards the outbox, batches and publication
-tables are dead weight to drop, with his OK.
+tables are dead weight to drop, with his OK. Dropping them needs its own migration slot and updates to the
+schema drift lists.
 
 ## Rollout
 
