@@ -93,9 +93,9 @@ tool's environment.
 
 The credential step is the only step given the database secret or the role session, and the only one that requests
 the OIDC token. It is **not** the only step that could request one: GitHub exposes `ACTIONS_ID_TOKEN_REQUEST_*` to
-every step of a job with `id-token: write`. So only the operate job has `id-token: write`, every action in it is
-first-party (`actions/checkout`, `actions/download-artifact`, `oven-sh/setup-bun`), and the separation that matters
-is in IAM: the write role trusts only the `session-backlog-execute` environment's subject, which no other job uses.
+every step of a job with `id-token: write`. So only the operate job has `id-token: write`, its actions are
+`actions/checkout` and `actions/download-artifact` (GitHub's own) plus the third-party `oven-sh/setup-bun`, which is
+pinned to a full commit SHA (v2.2.0) rather than a mutable tag. The separation that matters is in IAM: the write role trusts only the `session-backlog-execute` environment's subject, which no other job uses.
 
 Both environments' protected variables pin the target (set the same five on each): `BACKLOG_OPS_BUCKET`, `BACKLOG_OPS_REGION`,
 `BACKLOG_OPS_KMS_KEY_ARN` (a key ARN, `key/<uuid>` or `key/mrk-<id>`, not an alias), `BACKLOG_OPS_DRY_ROLE_ARN` and `BACKLOG_OPS_EXECUTE_ROLE_ARN`.
@@ -138,8 +138,13 @@ and the srv-writer and writer policies are prefix-scoped. So the workflow needs,
 
 ### Still to apply (before the first execute)
 
-1. Create the GitHub environment `session-backlog-execute`: required reviewers as on `session-schema-production`, and
-   deployments from `main` only (one branch policy, `main`, type branch). The gate refuses it otherwise.
+1. Create the GitHub environment `session-backlog-execute` with deployments from `main` only (one branch policy,
+   `main`, type branch), as on `session-schema-production`. The gate refuses an environment without that branch
+   policy. Required reviewers are optional: with the pinned dispatcher (`trustedDispatcher`), the gate accepts an
+   environment with only the branch policy and no approval, exactly as on `session-schema-production`. The real
+   control is the pinned dispatcher identity plus the write role's IAM trust in this environment's subject.
+   (Created 2026-11-13 with the `main` branch policy, the secret and the five variables; the write role's trust was
+   narrowed to this subject the same day.)
 2. Set on it the environment secret `SUPABASE_MIGRATION_OWNER_URL` (the same value as on `session-schema-production`;
    backfill-execute and export-execute need it) and the same five `BACKLOG_OPS_*` variables.
 3. Change the write role's trust to the `session-backlog-execute` subject above (it currently trusts the
