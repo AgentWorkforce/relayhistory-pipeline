@@ -1,11 +1,11 @@
 /**
- * The routed raw-chunk sealer against the REAL vendored relayscrubber 0.5.0-alpha.8
+ * The routed raw-chunk sealer against the REAL vendored relayscrubber 0.5.0-alpha.9
  * wasm, under the AA env triple (SCRUB_ENGINE=wasm-bindgen,
  * SCRUB_ENGINE_REQUIRED=wasm-bindgen, READER_MAX_RULESET=10).
  *
  * The blank predicate is PR-A's Rust-exact one (hasRecordContent): NEL-only input is
  * refused as chunk_empty before the crate and without poisoning; U+FEFF is content, so
- * FEFF-only input reaches the crate and the crate's own answer stands (alpha.8 answers
+ * FEFF-only input reaches the crate and the crate's own answer stands (alpha.9 answers
  * a tagged invalid_json call refusal, which refuses that one call and never poisons).
  */
 import { zstdDecompressSync } from "node:zlib";

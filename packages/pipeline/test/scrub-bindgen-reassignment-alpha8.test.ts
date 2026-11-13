@@ -1,6 +1,6 @@
 /**
  * Pipeline-side regression for the relayscrubber alpha.8 bare-reassignment repair
- * (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.8").
+ * (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.9").
  *
  * The relayscrubber receipt (docs/results/alpha8-reassignment-repair.json there) proves the
  * crate. This proves OUR binding uses it: the real vendored wasm, loaded and verified by
@@ -56,10 +56,10 @@ afterEach(async () => {
 
 async function realEngine() {
   const engine = await initScrubEngine({ env: TRIPLE });
-  // Guard against a silent fallback: this must be the verified alpha.8 instance.
+  // Guard against a silent fallback: this must be the verified pinned instance (alpha.9 carries the repair).
   expect(engine.kind).toBe("wasm-bindgen");
-  expect(PIN.package_version).toBe("0.5.0-alpha.8");
-  expect((engine as unknown as { manifest: { crateVersion: string } }).manifest.crateVersion).toBe("0.5.0-alpha.8");
+  expect(PIN.package_version).toBe("0.5.0-alpha.9");
+  expect((engine as unknown as { manifest: { crateVersion: string } }).manifest.crateVersion).toBe("0.5.0-alpha.9");
   return engine;
 }
 
