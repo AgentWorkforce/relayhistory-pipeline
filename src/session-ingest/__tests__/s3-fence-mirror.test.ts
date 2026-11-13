@@ -78,16 +78,16 @@ describe("s3FenceMirror", () => {
     expect((await fence(store)).deleted).toEqual({});
   });
 
-  test("a stale ordered re-enable never lifts the S3 tombstone", async () => {
+  test("a stale ordered re-enable never lifts the S3 tombstone of the newer disable that superseded it", async () => {
     const ledger = new MemoryLedger();
-    const control = { epoch: "e".repeat(64), version: "3", digest: "d".repeat(64), kind: "selection" as const };
-    ledger.applyOrderedControl = async () => ({ control: { ...control, outcome: "stale" as const }, updated: 0 });
+    const v = (version: string) => ({ epoch: "e".repeat(64), version, digest: "d".repeat(63) + version, kind: "selection" as const });
+    // SQL: disable v4 applied; enable v3 is stale (applied earlier, superseded by v4).
+    ledger.applyOrderedControl = async (i: OrderedControlInput) => ({ control: { ...i.control, outcome: i.control.version === "4" ? "applied" as const : "stale" as const }, updated: 1 });
     const { store, order, post } = setup("s3", ledger);
-    await post("/v1/delivery/sessions/selection", await selection(false));
-    const res = await post("/v1/delivery/sessions/selection", await selection(true), { ...TENANT, scopes: [SYNC_SCOPE], control });
-    expect(res.status).toBe(200);
-    // SQL's verdict (stale) is mirrored, and lands nothing.
-    expect(order).toEqual(["s3:disable", "sql:disable", "s3:ordered:enable:v3:stale"]);
+    expect((await post("/v1/delivery/sessions/selection", await selection(false), { ...TENANT, scopes: [SYNC_SCOPE], control: v("4") })).status).toBe(200);
+    expect((await post("/v1/delivery/sessions/selection", await selection(true), { ...TENANT, scopes: [SYNC_SCOPE], control: v("3") })).status).toBe(200);
+    // The stale verdict lands under per-session order: v4 already landed for s1, so v3's lift does not.
+    expect(order).toContain("s3:ordered:enable:v3:stale");
     expect((await fence(store)).deleted).toEqual({ "origin-1": [["claude", "s1"]] });
   });
 
@@ -164,14 +164,16 @@ describe("s3FenceMirror: ordered controls go through the fence's ordered mark (r
     expect(sql.deleted.has("s1")).toBe(false);
   });
 
-  test("P2: a stale ordered reset writes nothing to S3 (no reset begun, nothing tombstoned)", async () => {
+  test("a stale ordered reset (SQL applied it earlier) begins it in S3, idempotently by request id", async () => {
     const sql = orderedSql();
     const env = setup("s3", sql.ledger);
     expect((await env.post("/v1/delivery/sessions/selection", await selection(false), as(ctl("9")))).status).toBe(200);
     const body = { account_id: (await batch([])).account_id, request_id: "req-late", confirmation: "DELETE ALL SESSIONS" };
     expect((await env.post("/v1/delivery/sessions/reset", body, as(ctl("8", "reset")))).status).toBe(200);
     expect(env.order).toContain("s3:ordered:reset:v8:stale");
-    expect(await fence(env.store)).toMatchObject({ resets: 0, resetRequests: {} });
+    expect(await fence(env.store)).toMatchObject({ resets: 1, resetRequests: { "req-late": null } });
+    expect((await env.post("/v1/delivery/sessions/reset", body, as(ctl("8", "reset")))).status).toBe(200);
+    expect(await fence(env.store)).toMatchObject({ resets: 1 });
   });
 
   test("P2: a mis-kinded control is refused before any S3 write", async () => {

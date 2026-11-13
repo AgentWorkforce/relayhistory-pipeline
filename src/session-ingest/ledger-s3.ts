@@ -148,10 +148,21 @@ export const orgFenceAuthorityKey = (keyRoot: string, orgId: string) => `${keyRo
 
 type Decision = "apply" | { outcome: "replay" | "stale"; result: number };
 /** An ordered control's dedupe mark. A reset's mark names its request id: only a finish that ran it may close it. */
-export type PendingControl = { kind: "selection"; originId: string; sessions: [string, string][] } | { kind: "reset"; requestId: string };
+/**
+ * `holders`: one random id per request that recorded the control pending (beginOrdered). An abort releases only its
+ * own hold, and the entry goes only when no hold is left or SQL's verdict lands, so a refused duplicate never
+ * releases a control another request got applied. Capped: a request that finds it full holds nothing (fail closed).
+ */
+export type PendingControl = ({ kind: "selection"; originId: string; sessions: [string, string][] } | { kind: "reset"; requestId: string }) & { holders?: string[] };
+const MAX_HOLDERS = 32;
 interface OrderedMark { epoch: string; version: string; digest: string; kind: "selection" | "reset"; result: number | null; requestId?: string }
 export interface FenceDoc {
-  v: 1;
+  /**
+   * 1, or 2 while any control is `pending`. Readers from before `pending` existed accept only v1, so they refuse
+   * (a retry) rather than ignore a pending disable or reset: every fence reader must run code that knows `pending`
+   * before INGEST_S3_FENCE_MIRROR is turned on, and an older one fails closed meanwhile. editFence sets it.
+   */
+  v: 1 | 2;
   /** Random per created fence (newFence): a commit compares it with its claim's, so a deleted and recreated fence is never "unchanged". */
   instance: string;
   /** Bumped by every edit: a commit whose claim saw this (instance, version) has nothing to recheck. */
@@ -285,7 +296,7 @@ const own = <T>(o: Record<string, T>, k: string): T | undefined => (Object.hasOw
 const exactKeys = (o: Record<string, unknown>, keys: string[]) => Object.keys(o).length === keys.length && keys.every((k) => Object.hasOwn(o, k));
 
 export function validFence(v: unknown): v is FenceDoc {
-  if (!isObject(v) || v.v !== 1 || typeof v.instance !== "string" || !TOKEN.test(v.instance) || !count(v.version) || !count(v.resets) || !count(v.lastResetAtMs)
+  if (!isObject(v) || (v.v !== 1 && v.v !== 2) || typeof v.instance !== "string" || !TOKEN.test(v.instance) || !count(v.version) || !count(v.resets) || !count(v.lastResetAtMs)
     || !isObject(v.deleted) || !isObject(v.epochs) || !isObject(v.resetRequests)) return false;
   // A fence from before `resetsCompleted`: it means `resets` when no reset is running, else fail closed (we
   // cannot know which tombstones landed). readFence fills it in; nothing else may treat it as absent.
@@ -297,7 +308,8 @@ export function validFence(v: unknown): v is FenceDoc {
   if (!Object.values(v.resetRequests).every((n) => n === null || count(n))) return false;
   const ctl = (t: unknown) => Array.isArray(t) && t.length === 2 && str(t[0]) && typeof t[1] === "string" && /^[1-9][0-9]{0,18}$/.test(t[1]);
   if (v.pending !== undefined && !(isObject(v.pending) && !Object.hasOwn(v.pending, "__proto__") && Object.values(v.pending).every((p) => isObject(p)
-    && ((p.kind === "selection" && mapKey(p.originId) && Array.isArray(p.sessions) && p.sessions.every(pairOk)) || (p.kind === "reset" && mapKey(p.requestId)))))) return false;
+    && ((p.kind === "selection" && mapKey(p.originId) && Array.isArray(p.sessions) && p.sessions.every(pairOk)) || (p.kind === "reset" && mapKey(p.requestId)))
+    && (p.holders === undefined || (Array.isArray(p.holders) && p.holders.length <= MAX_HOLDERS && p.holders.every((t) => typeof t === "string" && TOKEN.test(t))))))) return false;
   const co = v.controlOrder;
   if (co !== undefined && !(isObject(co) && (co.reset === undefined || ctl(co.reset)) && (co.sessions === undefined || (isObject(co.sessions)
     && !Object.hasOwn(co.sessions, "__proto__") && Object.values(co.sessions).every((m) => isObject(m) && Object.entries(m).every(([k, t]) => HEX32.test(k) && ctl(t))))))) return false;
@@ -608,6 +620,7 @@ export function s3LedgerObjects(store: ObjectStore, keyRoot: string, opts: Omit<
       const { next, result } = edit(base);
       if (!next) return result;
       next.version = prior + 1;
+      next.v = next.pending && Object.keys(next.pending).length > 0 ? 2 : 1;
       if (await casPut(store, key, next, read.state === "present" ? read.version : undefined)) return result;
       await backoff(attempt);
     }
@@ -1151,11 +1164,20 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
 
 /** The Worker's S3 fence mirror (INGEST_S3_FENCE_MIRROR): unordered controls as s3Ledger's, ordered ones by SQL's verdict. */
 export interface S3FenceMirror extends Pick<Ledger, "setSessionUploads" | "resetUploadedSessions"> {
-  /** Before SQL decides an ordered disable or reset: record it PENDING (fail closed for admission). An enable: nothing. */
-  beginOrdered(input: OrderedControlInput): Promise<void>;
-  /** SQL refused the control (definitely not applied): remove its pending entry, no other effect. */
-  abortOrdered(input: OrderedControlInput): Promise<void>;
-  /** SQL's verdict: applied or replay lands the effect (per-session order kept), stale lands nothing; pending removed. */
+  /**
+   * Before SQL decides an ordered disable or reset: record it PENDING (fail closed for admission) and return this
+   * request's hold (pass it to abortOrdered). An enable: nothing, undefined.
+   */
+  beginOrdered(input: OrderedControlInput): Promise<string | undefined>;
+  /**
+   * SQL refused the control definitely: release THIS request's hold only. The entry goes when no hold is left, so a
+   * duplicate request that got it applied (and died before its finish) keeps it pending: fail closed.
+   */
+  abortOrdered(input: OrderedControlInput, hold: string | undefined): Promise<void>;
+  /**
+   * SQL's verdict. applied, replay and stale all land the effect: SQL answers stale only with a same-digest receipt,
+   * so the control WAS applied (since superseded). Per-session order decides what still lands; pending removed.
+   */
   finishOrdered(input: OrderedControlInput, outcome: "applied" | "replay" | "stale"): Promise<void>;
 }
 
@@ -1186,26 +1208,38 @@ export function s3ControlMirror(store: ObjectStore, keyRoot: string, opts: Omit<
       throw new LedgerUnavailableError("ledger_input_refused");
     return { control, key: `${control.epoch}:${control.version}:${control.digest}`, fenceKey: io.keysFor(input.tenant).fence };
   };
-  const newer = (a: [string, string], b: [string, string] | undefined) => !b || a[0] !== b[0] || BigInt(a[1]) > BigInt(b[1]);
+  /** Two ordered controls' order: by version within one epoch; across epochs it is not known (`unknown`). */
+  const compare = (a: [string, string], b: [string, string]): "newer" | "same" | "older" | "unknown" =>
+    a[0] !== b[0] ? "unknown" : BigInt(a[1]) > BigInt(b[1]) ? "newer" : BigInt(a[1]) === BigInt(b[1]) ? "same" : "older";
+  const sameCtl = (a: [string, string], b: [string, string] | undefined) => b !== undefined && a[0] === b[0] && a[1] === b[1];
+  const newHold = opts.newToken ?? randomUUID;
   return {
     setSessionUploads: (input) => ledger.setSessionUploads(input),
     resetUploadedSessions: (tenant, requestId) => ledger.resetUploadedSessions(tenant, requestId),
     async beginOrdered(input) {
       const { key, fenceKey } = parse(input);
-      if (!("requestId" in input) && input.enabled) return;
+      if (!("requestId" in input) && input.enabled) return undefined;
+      const hold = newHold();
       const entry: PendingControl = "requestId" in input ? { kind: "reset", requestId: input.requestId } : { kind: "selection", originId: input.originId, sessions: input.sessions.map(([a, b]) => [a, b]) };
       await io.editFence(fenceKey, (f) => {
-        if (f.pending && Object.hasOwn(f.pending, key)) return { next: null, result: undefined };
-        (f.pending ??= {})[key] = entry;
+        const pending = (f.pending ??= {});
+        const cur = Object.hasOwn(pending, key) ? pending[key]! : (pending[key] = { ...entry, holders: [] });
+        const holders = (cur.holders ??= []);
+        if (holders.length < MAX_HOLDERS) holders.push(hold); // full: this request holds nothing (it cannot release it)
         return { next: f, result: undefined };
       });
+      return hold;
     },
-    async abortOrdered(input) {
+    async abortOrdered(input, hold) {
       const { key, fenceKey } = parse(input);
       if (!("requestId" in input) && input.enabled) return;
+      if (hold === undefined) return;
       await io.editFence(fenceKey, (f) => {
-        if (!f.pending || !Object.hasOwn(f.pending, key)) return { next: null, result: undefined };
-        delete f.pending[key];
+        const cur = f.pending && Object.hasOwn(f.pending, key) ? f.pending[key]! : undefined;
+        const i = cur?.holders?.indexOf(hold) ?? -1;
+        if (!cur || i < 0) return { next: null, result: undefined };
+        cur.holders!.splice(i, 1);
+        if (cur.holders!.length === 0) delete f.pending![key];
         return { next: f, result: undefined };
       });
     },
@@ -1216,11 +1250,12 @@ export function s3ControlMirror(store: ObjectStore, keyRoot: string, opts: Omit<
       await io.editFence(fenceKey, (f) => {
         let changed = false;
         if (f.pending && Object.hasOwn(f.pending, key)) { delete f.pending[key]; changed = true; }
-        if (outcome === "stale") return { next: changed ? f : null, result: undefined };
+        // applied, replay and stale alike: SQL applied this control (stale = applied earlier, since superseded).
+        void outcome;
         const order = (f.controlOrder ??= {});
         if ("requestId" in input) {
           if (!Object.hasOwn(f.resetRequests, input.requestId)) { applyFenceChange(f, { reset: { requestId: input.requestId, atMs, result: null } }); changed = true; }
-          if (newer(at, order.reset)) { order.reset = at; changed = true; }
+          if (order.reset === undefined || compare(at, order.reset) !== "older") { if (!sameCtl(at, order.reset)) { order.reset = at; changed = true; } }
           return { next: changed ? f : null, result: undefined };
         }
         const sessions = (order.sessions ??= {});
@@ -1228,8 +1263,14 @@ export function s3ControlMirror(store: ObjectStore, keyRoot: string, opts: Omit<
         const land: [string, string][] = [];
         for (const [src, id] of input.sessions) {
           const k = sessionKeyHash(src, id);
-          if (!newer(at, own(perOrigin, k))) continue; // this control (a replay) or a newer one already landed for the session
-          if (input.enabled && order.reset && !newer(at, order.reset)) { perOrigin[k] = at; changed = true; continue; } // a newer reset
+          const cur = own(perOrigin, k);
+          const vs = cur === undefined ? "newer" : compare(at, cur);
+          // A replay, or a newer control already landed for the session: nothing.
+          if (vs === "older" || vs === "same") continue;
+          // Across an epoch rotation the order is unknown: fail closed (a disable lands, an enable does not).
+          if (vs === "unknown" && input.enabled) continue;
+          // An enable never lifts under a reset at or after it (or of an unknown order).
+          if (input.enabled && order.reset && compare(at, order.reset) !== "newer") { perOrigin[k] = at; changed = true; continue; }
           perOrigin[k] = at;
           land.push([src, id]);
           changed = true;
