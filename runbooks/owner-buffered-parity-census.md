@@ -51,3 +51,30 @@ identifier.
 
 Tests: `src/migration/__tests__/owner-buffered-parity-frozen.pglite.test.ts`,
 `src/migration/__tests__/owner-buffered-parity-operator-census-source.test.ts`.
+
+## CI discovery mode (roster source)
+
+The CI workflow `.github/workflows/owner-buffered-parity.yml` has a one-time,
+read-only `discovery` mode that finds the seven buffered owners without a
+canonical current parity row. The full contract is in
+`docs/owner-buffered-parity-ci.md`. In short:
+
+- **Every dispatch is Khaliq's own word to the production actor.** Merging
+  the mode authorizes no run.
+- It is read-only. It uses the same gates, environment and single secret as
+  census; the target session is fenced read-only and nothing is written. It
+  reuses the bounded buffered-tenant cursor and the canonical readback
+  comparison. The owner listing and the generation re-read share one
+  `REPEATABLE READ READ ONLY` snapshot, while each owner's comparison runs in
+  `readParityCensus`'s own read-only transactions, with the generation checked
+  before, inside and after. It adds no query SQL (only the transaction, cursor
+  and timeout statements around the existing cursor query).
+- It runs only while the roster is empty. It refuses `roster_present` once a
+  digest is listed, `generation_unstable` if the PASS generation moves
+  around the snapshot, and `unexpected_scope` unless exactly 7 owners are
+  missing or stale. A refusal carries counts only, never digests.
+- On success the `owner-buffered-parity-discovery/v1` receipt (job summary
+  and artifact) lists each owner's `tenantSha256` with `missing` or `stale`,
+  plus the counts. It holds no tenant identifier.
+- **The roster is a separate reviewed roster-only PR** written from that
+  receipt. Discovery never edits the roster.

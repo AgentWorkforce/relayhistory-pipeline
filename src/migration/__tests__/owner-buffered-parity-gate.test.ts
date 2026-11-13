@@ -95,12 +95,20 @@ test("dormant gate: write refuses before any GitHub read while disabled; census 
   expect(await code(() => ownerParityGithubGate(writeEnv, githubGet(githubFixture())))).toBe("owner_parity_write_dormant");
   expect(await gate(env("census"), githubFixture(), false)).toBeNull();
   expect(await gate(env("readback"), githubFixture(), false)).toBeNull();
+  // Discovery passes exactly the census gates (exact main, pinned dispatcher, environment, green CI) and never
+  // reads a census run.
+  const discoverySeen: string[] = [];
+  expect(await gate(env("discovery"), githubFixture(), false, discoverySeen)).toBeNull();
+  expect(discoverySeen.length).toBeGreaterThan(0);
+  expect(discoverySeen.some((path) => path.includes("/artifacts") || path.includes("/actions/runs/" + censusRun))).toBe(false);
+  expect(await gate(env("discovery", { OWNER_PARITY_CENSUS_RUN: censusRun }), githubFixture())).toBe("owner_parity_census_run");
+  expect(await gate(env("discovery", { OWNER_PARITY_CONFIRMATION: "x" }), githubFixture())).toBe("owner_parity_confirmation");
   expect(await gate(writeEnv, githubFixture())).toBeNull();
 });
 
-test("only census, write and readback are modes: bulk and anything else refuse before any GitHub read", async () => {
-  expect([...OWNER_PARITY_MODES]).toEqual(["census", "write", "readback"]);
-  for (const mode of ["bulk", "BULK", "census ", "", "renew"]) {
+test("only census, write, readback and discovery are modes: bulk and anything else refuse before any GitHub read", async () => {
+  expect([...OWNER_PARITY_MODES]).toEqual(["census", "write", "readback", "discovery"]);
+  for (const mode of ["bulk", "BULK", "census ", "", "renew", "Discovery", "discovery "]) {
     const seen: string[] = [];
     expect(await gate(env(mode), githubFixture(), true, seen)).toBe("owner_parity_inputs");
     expect(seen).toEqual([]);
@@ -241,7 +249,7 @@ test("workflow: one secret in one step, gate without environment, proof without 
   const workflow = readFileSync(OWNER_PARITY_WORKFLOW, "utf8");
   expect(workflow.match(/secrets\.[A-Z_]+/gu)).toEqual(["secrets.SUPABASE_MIGRATION_OWNER_URL"]);
   expect(workflow.match(/vars\.[A-Za-z_]+/gu)).toBeNull();
-  expect(workflow).toContain("options: [census, write, readback]");
+  expect(workflow).toContain("options: [census, write, readback, discovery]");
   expect(workflow).toContain("options: [frozen-supabase, neon]");
   expect(workflow).toContain("default: census\n");
   expect(workflow).toContain("default: frozen-supabase\n");
