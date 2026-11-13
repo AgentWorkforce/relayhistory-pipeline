@@ -86,7 +86,7 @@ function readInputs(stage: string): AwsInputs & { mode: AwsMode } {
       throw new Error(`96bulls: deploy needs the reviewed capture docs/plans/${stage}.{provenance.json,plan.txt,plan.detailed.txt}. Nothing was changed.`);
     }
     assertApprovalBinding(inputs.approval?.capture, { provenanceText, planText, inputsText });
-    if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText });
+    if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText, uploadInputs: inputs.transcriptStore ?? {} });
     // And this deploy really is that capture: source commit and tree, live state, plan files,
     // inputs. Here, not only in bin/96bulls, so a direct `alchemy deploy` is held to it too.
     verifyDeployCapture(
