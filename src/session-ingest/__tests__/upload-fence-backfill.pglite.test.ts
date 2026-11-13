@@ -155,9 +155,10 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
       expect(tx[0]).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
       expect(tx[1]).toBe("SHOW transaction_read_only");
       expect(tx.at(-1)).toBe("ROLLBACK");
-      expect(tx.length).toBe(5); // BEGIN, SHOW, SET LOCAL, one SELECT, ROLLBACK
+      // BEGIN, SHOW, SET LOCAL, one SELECT (two for a page's controls: deletions and resets, one snapshot), ROLLBACK
+      expect([5, 6]).toContain(tx.length);
       expect(tx[2]).toMatch(/^SET LOCAL statement_timeout = \d+$/);
-      expect(tx[3]).toMatch(/^SELECT/);
+      for (const st of tx.slice(3, -1)) expect(st).toMatch(/^SELECT/);
     }
     const refused: string[] = [];
     const notReadOnly: BackfillSql = { async query(text) { refused.push(text); return { rows: text.startsWith("SHOW") ? [{ transaction_read_only: "off" }] : [] }; } };
@@ -364,6 +365,35 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     const rerun = await run(store);
     expect(rerun.fences).toMatchObject({ deletions_superseded: 1, deletions_unproven: 0, pairs_added: 0 });
     expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "sess-1")).toBe(false);
+  });
+
+  test("third review: a page's deletions and resets are read in ONE snapshot: a reset landing between them is seen whole or not at all", async () => {
+    const store = scratch();
+    await del(A, "origin-1", "claude", "other"); // the user exists (a deletion page row)
+    // A reset that tombstones `S` commits right after the deletions are read (the first transaction that read them
+    // ends): one snapshot sees neither its tombstone nor its reset; two separate reads would see only the reset.
+    let armed = false, landed = false;
+    const sql: BackfillSql = {
+      async query(text, params) {
+        const rows = (await db.query(text, params as unknown[])).rows as Record<string, unknown>[];
+        if (text.includes("FROM sessions.upload_deletions AS d")) armed = true;
+        else if (armed && !landed && text === "ROLLBACK") {
+          landed = true;
+          await del(A, "origin-1", "claude", "S");
+          await reset(A, "req-x", "2030-01-02T00:00:00.000Z", 1);
+        }
+        return { rows };
+      },
+    };
+    await backfillUploadFences({ sql, store, keyRoot: ROOT, dryRun: false, sleep: async () => {}, sections: ["fences"] });
+    expect(landed).toBe(true);
+    const f = (await fenceOf(store, A))!;
+    // Consistent: the reset is not recorded as complete while its tombstone is missing.
+    expect([f.resets, isDeletedForAdmission(f, "origin-1", "claude", "S")]).toEqual([0, false]);
+    // A rerun sees both.
+    await run(store, { sections: ["fences"] });
+    const g = (await fenceOf(store, A))!;
+    expect([g.resets, g.resetsCompleted, isDeletedForAdmission(g, "origin-1", "claude", "S")]).toEqual([1, 1, true]);
   });
 
   test("second review 8: mirror disable then re-enable, then a SQL reset tombstones the session: it ends deleted in S3", async () => {

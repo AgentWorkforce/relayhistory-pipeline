@@ -291,31 +291,38 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   };
   const { sql } = opts;
 
-  /** One short, verified read-only transaction per page (finding 8). */
-  async function readOnly(query: string, params: unknown[]): Promise<Record<string, unknown>[]> {
+  /** One short, verified read-only transaction per page (finding 8): every query in it reads ONE snapshot. */
+  async function readOnlyAll(queries: [string, unknown[]][]): Promise<Record<string, unknown>[][]> {
     await sql.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
     try {
       const ro = (await sql.query("SHOW transaction_read_only")).rows[0]?.transaction_read_only;
       if (ro !== "on") throw new Error("backfill_not_read_only");
       await sql.query(`SET LOCAL statement_timeout = ${statementTimeoutMs}`);
-      return (await sql.query(query, params)).rows;
+      const out: Record<string, unknown>[][] = [];
+      for (const [query, params] of queries) out.push((await sql.query(query, params)).rows);
+      return out;
     } finally {
       await sql.query("ROLLBACK").catch(() => {});
     }
   }
+  const readOnly = async (query: string, params: unknown[]) => (await readOnlyAll([[query, params]]))[0]!;
 
-  /** SQL's controls for a page of users (two short transactions). */
+  /**
+   * SQL's controls for a page of users: deletions and resets in ONE read-only snapshot (third review), so a reset is
+   * never seen without the tombstones it wrote (or the reverse).
+   */
   async function controlsFor(users: [string, string, string][]): Promise<Map<string, UserControls>> {
     const cols = [users.map((p) => p[0]), users.map((p) => p[1]), users.map((p) => p[2])];
     const states = new Map<string, UserControls>(users.map(([o, w, u]) => [userKey(o, w, u), { tenant: { orgId: o, workspaceId: w, userId: u }, deletions: new Map(), watermark: null, resets: [], invalid: false, needsReview: false }]));
-    for (const r of await readOnly(DELETIONS_FOR, cols)) {
+    const [deletionRows, resetRows] = await readOnlyAll([[DELETIONS_FOR, cols], [RESETS_FOR, cols]]);
+    for (const r of deletionRows!) {
       const st = states.get(userKey(r.org_id, r.workspace_id, r.user_id))!;
       summary.fences.deletion_rows++;
       if (!id(r.origin_id) || !id(r.source) || !id(r.session_id)) { st.invalid = true; continue; }
       st.watermark ??= watermarkOf(r);
       st.deletions.set(r.origin_id, [...(st.deletions.get(r.origin_id) ?? []), [r.source, r.session_id]]);
     }
-    for (const r of await readOnly(RESETS_FOR, cols)) {
+    for (const r of resetRows!) {
       const st = states.get(userKey(r.org_id, r.workspace_id, r.user_id))!;
       summary.fences.reset_rows++;
       const atMs = int(r.at_ms), result = int(r.deleted);
