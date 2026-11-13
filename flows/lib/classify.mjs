@@ -182,8 +182,9 @@ const git = (...args) => execFileSync("git", args, { encoding: "utf8", maxBuffer
 export function referencedBy(path) {
   try {
     return git("grep", "-l", "-F", "-e", path, "HEAD", "--", ":!*.md").length > 0;
-  } catch {
-    return false; // git grep exits 1 when nothing matches
+  } catch (error) {
+    // git grep exits 1 when nothing matches; any other failure counts as "read by code", toward more testing.
+    return error?.status !== 1;
   }
 }
 

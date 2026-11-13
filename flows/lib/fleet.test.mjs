@@ -7,7 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { spawn } from "node:child_process";
-import { failedTests, PREEMPTED, stopPrevious, stopStep, wait } from "./fleet.mjs";
+import { failedTests, jobEnv, PREEMPTED, SECRET_NAME, stopPrevious, stopStep, wait } from "./fleet.mjs";
 import { preempted, PREEMPTED as PREEMPTED_TS } from "./fleet.ts";
 
 const FLEET = fileURLToPath(new URL("./fleet.mjs", import.meta.url));
@@ -347,6 +347,24 @@ test("stopping a fleet also stops the step of a job that already died", () => {
   process.kill(-firstPid(dir), "SIGKILL");
   fleet("stop", dir);
   assert.ok(gone(own(marker)), "stop must reach the dead job's step");
+});
+
+test("a job's steps start without the caller's credentials unless the job asks for them", () => {
+  const secrets = { GH_TOKEN: "s", GITHUB_TOKEN: "s", JEV_TOKEN: "s", AWS_ACCESS_KEY_ID: "s", BL_API_KEY: "s", BL_WORKSPACE: "s", OP_SESSION_x: "s", NPM_TOKEN: "s" };
+  const dir = fleetDir([
+    { name: "lane", steps: [{ name: "env", command: "env | cut -d= -f1 | sort" }] },
+    { name: "sandbox", credentials: "blaxel", steps: [{ name: "env", command: "env | cut -d= -f1 | sort" }] },
+    { name: "gate", credentials: "all", steps: [{ name: "env", command: "env | cut -d= -f1 | sort" }] },
+  ]);
+  execFileSync(process.execPath, [FLEET, "start", dir], { encoding: "utf8", env: { ...env, ...secrets } });
+  const results = JSON.parse(fleet("wait", dir)).results;
+  const names = (job) => new Set(readFileSync(results.find((r) => r.job === job).log, "utf8").split("\n"));
+  for (const s of Object.keys(secrets)) assert.ok(!names("lane").has(s), `${s} reached a lane job`);
+  assert.ok(names("lane").has("PATH"));
+  assert.ok(names("sandbox").has("BL_API_KEY") && !names("sandbox").has("GH_TOKEN"), "the sandbox job keeps only BL_*");
+  assert.ok(names("gate").has("GH_TOKEN"), "the GitHub gate keeps the caller's login");
+  assert.ok(SECRET_NAME.test("RELAYCONTROL_INTROSPECT_SECRET") && !SECRET_NAME.test("PATH"));
+  assert.deepEqual(Object.keys(jobEnv({ A: "1", GH_TOKEN: "x" })), ["A"]);
 });
 
 test("a stop's SIGKILL reaches only the step it stopped, never the step that runs next", async () => {

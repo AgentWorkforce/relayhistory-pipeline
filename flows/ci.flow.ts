@@ -108,6 +108,7 @@ export function jobs(c: Classification, dir: string, remote: string | undefined,
     const select = steps.length ? ` --steps ${shellWord(steps.join(","))}` : "";
     all.push({
       name: "e2e",
+      ...(e2eTarget === "sandbox" ? { credentials: "blaxel" as const } : {}),
       steps: [{
         name: E2E_STEP,
         command: `RELAYFLOW_STATE_DIR=${shellWord(dir)} bash ${lib("lane.sh")} e2e --target ${e2eTarget}${select}`,
@@ -116,7 +117,7 @@ export function jobs(c: Classification, dir: string, remote: string | undefined,
     });
   }
   if (remote) {
-    all.push({ name: "github", steps: [{ name: GITHUB_STEP, command: `node ${lib("remote-ci.mjs")} watch ${shellWord(remote)} ${shellWord(workflows)}`, timeoutMinutes: 125 }] });
+    all.push({ name: "github", credentials: "all", steps: [{ name: GITHUB_STEP, command: `node ${lib("remote-ci.mjs")} watch ${shellWord(remote)} ${shellWord(workflows)}`, timeoutMinutes: 125 }] });
   }
   return all;
 }

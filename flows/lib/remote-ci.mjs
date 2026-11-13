@@ -169,7 +169,15 @@ async function watch(base, csv) {
   if (refused) throw new Error(refused);
   const branch = `ci/${sha.slice(0, 12)}`;
   git(["push", "--quiet", "origin", `${sha}:refs/heads/${branch}`]);
+  // The runs seen so far: a stop cancels the ones still going, as the deadline does.
+  let runs = [];
+  const cancelRunning = () => {
+    for (const run of runs.filter((r) => r.status !== "completed")) {
+      try { gh("run", "cancel", String(run.databaseId)); } catch (error) { console.log(`could not cancel run ${run.databaseId}: ${error.message}`); }
+    }
+  };
   const stop = (signal) => {
+    cancelRunning();
     deleteBranch(branch);
     process.exit(signal === "SIGINT" ? 130 : 143);
   };
@@ -184,7 +192,6 @@ async function watch(base, csv) {
     console.log(`Testing snapshot ${sha} on ${branch} (merge base ${base}): ${workflows.join(", ")}`);
 
     const deadline = Date.now() + 120 * 60_000;
-    let runs = [];
     let misses = 0;
     for (;;) {
       let listed;
@@ -203,9 +210,7 @@ async function watch(base, csv) {
       }
       if (Date.now() > deadline) {
         // Never leave a dispatched run going past the gate's own deadline.
-        for (const run of runs.filter((r) => r.status !== "completed")) {
-          try { gh("run", "cancel", String(run.databaseId)); } catch (error) { console.log(`could not cancel run ${run.databaseId}: ${error.message}`); }
-        }
+        cancelRunning();
         throw new Error(`GitHub Actions still running after two hours on ${sha}; the dispatched runs were cancelled`);
       }
       await sleep(30_000);

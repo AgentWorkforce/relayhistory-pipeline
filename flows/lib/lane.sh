@@ -26,18 +26,33 @@
 # works on the change in the current directory.
 set -euo pipefail
 GATE_LIB="$(cd "$(dirname "$0")" && pwd)"
-if [ -z "${RH_LANE_HOME:-}" ]; then
+# Scrubbed exactly when this process re-executed itself: `exec` keeps the pid, so RH_LANE_PID equals $$ only
+# in the re-executed copy. An RH_LANE_HOME/RH_LANE_PID inherited from an outer lane (or set by a caller) does
+# not match, so it neither skips the scrub nor names a directory this lane would delete.
+if [ "${RH_LANE_PID:-}" != "$$" ]; then
   keep=(PATH TERM LANG LC_ALL TMPDIR USER LOGNAME SHELL RELAYFLOW_STATE_DIR E2E_KEEP E2E_SKIP_BUILD E2E_DOCKER_BUILD_NETWORK E2E_IMAGE)
   case " $* " in *" e2e "*"--target sandbox"*) keep+=(BL_API_KEY BL_WORKSPACE) ;; esac
   docker_host="${DOCKER_HOST:-$(docker context inspect --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)}"
   home="$(mktemp -d "${TMPDIR:-/tmp}/rh-lane-home.XXXXXX")"
-  mkdir -p "$home/.docker"
+  mkdir -p "$home/.docker" "$home/bin"
   plugins="${DOCKER_CONFIG:-$HOME/.docker}/cli-plugins"
   [ ! -d "$plugins" ] || ln -s "$plugins" "$home/.docker/cli-plugins"
+  # Credential CLIs are shadowed first on PATH: a test that calls `gh` (or a gh wrapper that reads the host's
+  # token file), `op` or the macOS `security` keychain tool by name gets a refusal, not the caller's login.
+  for tool in gh op security git-credential-osxkeychain git-credential-manager; do
+    printf '#!/bin/sh\necho "%s is not available in a CI lane (flows/lib/lane.sh)" >&2\nexit 127\n' "$tool" > "$home/bin/$tool"
+    chmod +x "$home/bin/$tool"
+  done
   args=()
   for v in "${keep[@]}"; do [ -z "${!v:-}" ] || args+=("$v=${!v}"); done
+  args+=("PATH=$home/bin:$PATH")
+  # A fixed, synthetic git identity: git's global config is off, and the sandbox snapshot (remote-ci.mjs
+  # snapshot, `git commit-tree`) needs one. It names no person and grants nothing.
   exec env -i "${args[@]}" HOME="$home" DOCKER_CONFIG="$home/.docker" ${docker_host:+DOCKER_HOST="$docker_host"} \
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 RH_LANE_HOME="$home" bash "$0" "$@"
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+    GIT_AUTHOR_NAME="sessions-pipeline CI lane" GIT_AUTHOR_EMAIL="ci-lane@invalid" \
+    GIT_COMMITTER_NAME="sessions-pipeline CI lane" GIT_COMMITTER_EMAIL="ci-lane@invalid" \
+    RH_GATE_LIB="$GATE_LIB" RH_LANE_HOME="$home" RH_LANE_PID="$$" bash "$0" "$@"
 fi
 cd "$(git rev-parse --show-toplevel)"
 lane="${1:?usage: lane.sh guards|typecheck|shard <n>|aux|pg-proof <major>|flows|e2e [args]}"
@@ -46,6 +61,8 @@ if [ "$lane" = env-check ]; then
   env | cut -d= -f1 | sort
   echo "HOME_IS_SCRATCH=$([ "$HOME" = "$RH_LANE_HOME" ] && echo yes || echo no)"
   echo "GIT_HELPER=$(git config --get credential.helper || echo none)"
+  echo "GH_SHADOWED=$([ "$(command -v gh)" = "$RH_LANE_HOME/bin/gh" ] && ! gh auth token >/dev/null 2>&1 && echo yes || echo no)"
+  echo "GIT_IDENT=$(git var GIT_COMMITTER_IDENT >/dev/null 2>&1 && echo yes || echo no)"
   rm -rf "$RH_LANE_HOME"
   exit 0
 fi

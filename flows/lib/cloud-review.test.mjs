@@ -13,6 +13,8 @@ import test from "node:test";
 import { packWorkingTree } from "@relayflows/sdk";
 import { getFlowDefinition } from "@relayflows/surface/runtime";
 import cloudReview, {
+  gateCommand,
+  MODULE_GATE,
   CAP_SLACK_MINUTES,
   DEPTH_PLANS,
   inputDescribesTree,
@@ -166,7 +168,7 @@ test("lead codex: every lens and verifier on codex with no model; a claude extra
 
 test("a verifier that leaves no valid report fails its flow in summary.json; the run still succeeds and names it", async () => {
   const { f, events, done } = fakeCtx(
-    sandbox([[/check-findings\.mjs 'cloud-review\/adversarial-review\/(report|failure-modes)/, { exitCode: 1, ok: false, stdout: "", stderr: "not readable JSON", output: "" }]]),
+    sandbox([[/node "\$g" 'cloud-review\/adversarial-review\/(report|failure-modes)/, { exitCode: 1, ok: false, stdout: "", stderr: "not readable JSON", output: "" }]]),
     { failAgents: [/verifier$/, /-failure-modes$/] },
   );
   await body(f, { depth: "small", flows: ["adversarial-review"], model: "claude-sonnet-5-5", dir: "cloud-review" });
@@ -381,4 +383,14 @@ test("the flow's static wallclock is the deep cap; review.sh holds each depth to
   const source = readFileSync(new URL("../cloud-review.flow.ts", import.meta.url), "utf8");
   assert.deepEqual([...source.matchAll(/wallclock:\s*"([^"]*)"/g)].map((m) => m[1]), [`${DEPTH_PLANS.deep.cap}m`]);
   assert.equal(Math.max(...Object.values(DEPTH_PLANS).map((p) => p.cap)), DEPTH_PLANS.deep.cap);
+});
+
+test("the Cloud round's findings gate runs from beside the flow module; the tree's copy only when the module has no lib/", () => {
+  assert.equal(MODULE_GATE, new URL("./check-findings.mjs", import.meta.url).pathname);
+  const cmd = gateCommand("cloud-review/x/findings.json", "cloud-review/input/files.txt");
+  assert.ok(cmd.startsWith(`g='${MODULE_GATE}';`), cmd);
+  const which = (gate) =>
+    spawnSync("/bin/sh", ["-c", cmd.replace(`g='${MODULE_GATE}'`, `g='${gate}'`).replace(/node "\$g".*/, 'echo "$g"')], { encoding: "utf8" }).stdout.trim();
+  assert.equal(which(MODULE_GATE), MODULE_GATE, "a present module gate is the one used");
+  assert.equal(which("/nonexistent/check-findings.mjs"), "flows/lib/check-findings.mjs", "a bundle with no sibling lib/ uses the uploaded tree's copy, which the submitter makes main's");
 });

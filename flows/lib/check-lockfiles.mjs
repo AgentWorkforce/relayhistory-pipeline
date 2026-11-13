@@ -18,10 +18,17 @@ const OWN_REGISTRY = "https://npm.pkg.github.com/download/@agentworkforce/";
 export function checkBunLock(text) {
   const problems = [];
   for (const [i, line] of text.split("\n").entries()) {
+    // Every package entry: ["<spec>", ...]. One that does not have a registry entry's shape (a github:, git+
+    // or tarball URL spec, which bun writes without the registry field) is refused, never skipped.
+    const entry = /^\s*"([^"]+)": \["([^"]+)"/.exec(line);
+    if (!entry) continue;
+    if (/@(workspace|link|file):/.test(entry[2])) continue;
     const m = /^\s*"([^"]+)": \["([^"]+)", "([^"]*)",/.exec(line);
-    if (!m) continue;
-    const [, key, spec, url] = m;
-    if (/@(workspace|link|file):/.test(spec)) continue;
+    if (!m || /@(github:|git\+|git:|https?:)/.test(entry[2])) {
+      problems.push(`bun.lock:${i + 1}: ${entry[1]} (${entry[2]}) is not a registry package; only npm registry packages with a sha512 integrity are accepted`);
+      continue;
+    }
+    const [, key, , url] = m;
     if (url !== "" && !url.startsWith(REGISTRY)) problems.push(`bun.lock:${i + 1}: ${key} resolves from ${url.split("/").slice(0, 3).join("/")}, not the npm registry`);
     if (!/"sha512-[A-Za-z0-9+/=]+"\],?\s*$/.test(line)) problems.push(`bun.lock:${i + 1}: ${key} has no sha512 integrity`);
   }

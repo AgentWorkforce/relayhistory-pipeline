@@ -12,17 +12,22 @@ import { fileURLToPath } from "node:url";
 const guard = await import(new URL("../../scripts/check-engine-identifiers.ts", import.meta.url).href);
 
 /** Hits on the lines a diff adds (unified diff text, as `git diff -U0`). Pending-move paths are skipped, as in the engine scan. */
-export function scanAddedLines(diff) {
+export function scanAddedLines(diff, scan = guard.scanText) {
   const hits = [];
   let path = null;
   let line = 0;
+  // File headers come only between a `diff --git` line and the file's first hunk: an added line whose own text
+  // starts with "++ " also reads "+++ ..." in the diff, and must be scanned, not taken for a header.
+  let header = false;
   for (const raw of diff.split("\n")) {
-    if (raw.startsWith("+++ ")) { path = raw === "+++ /dev/null" ? null : raw.replace(/^\+\+\+ b\//, ""); continue; }
+    if (raw.startsWith("diff --git ")) { header = true; path = null; continue; }
+    if (header && raw.startsWith("+++ ")) { path = raw === "+++ /dev/null" ? null : raw.replace(/^\+\+\+ b\//, ""); continue; }
     const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
-    if (hunk) { line = Number(hunk[1]); continue; }
+    if (hunk) { header = false; line = Number(hunk[1]); continue; }
+    if (header) continue;
     if (!path || guard.pendingMove(path)) continue;
     if (raw.startsWith("+")) {
-      for (const h of guard.scanText(path, raw.slice(1))) hits.push({ ...h, line });
+      for (const h of scan(path, raw.slice(1))) hits.push({ ...h, line });
       line++;
     } else if (!raw.startsWith("-") && !raw.startsWith("\\")) line++;
   }
