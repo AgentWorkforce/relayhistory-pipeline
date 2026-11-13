@@ -33,7 +33,8 @@ describe("session analysis job schedule", () => {
 
   test("the input shape is exact and the permission names only its own rule", () => {
     expect(() => assertSessionPipelineInputs({ analysisJobs: { enabled: true, model: "x" } }, refuse)).toThrow(/analysisJobs/);
-    expect(() => assertSessionPipelineInputs({ analysisJobs: { enabled: true } }, refuse)).not.toThrow();
+    expect(() => assertSessionPipelineInputs({ analysisJobs: { enabled: true }, schedules: { analysisJob: true } }, refuse)).not.toThrow();
+    expect(() => assertSessionPipelineInputs({ analysisJobs: { enabled: true } }, refuse)).toThrow(/analysisJobs.enabled requires schedules.analysisJob/);
     const perms = sessionPipelinePermissions({ accountId: "a", functionName: "f", ruleArn: "r", briefRuleArn: "b", analysisJobRuleArn: "aj", roleArn: "role" });
     expect(perms.find((p) => p.id === "session-analysis-job-permission")?.props).toMatchObject({ sourceArn: "aj", principal: "events.amazonaws.com" });
     expect(SESSION_ANALYSIS_JOB_RESOURCES).toEqual(["session-analysis-job-schedule", "session-analysis-job-permission"]);

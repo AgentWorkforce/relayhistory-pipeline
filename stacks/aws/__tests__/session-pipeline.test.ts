@@ -378,7 +378,7 @@ describe("session pipeline: deploy plan contract", () => {
   it("analysis job phase requires both resources and refuses permission widening, mixed schedules and unrelated writes",()=>{const creates=Object.fromEntries(SESSION_ANALYSIS_JOB_RESOURCES.map(r=>[r,"create"]));expect(check(plan(creates,withJobs))).toBe("session analysis jobs rollout");expect(check(plan({"session-analysis-job-schedule":"update"},withJobs))).toBe("session analysis jobs update");expect(()=>check(plan({"session-analysis-job-permission":"update"},withJobs))).toThrow(/unsafe action combination/);expect(()=>check(plan(creates,[...all,"session-analysis-job-schedule"]))).toThrow(/missing resource session-analysis-job-permission/);expect(()=>check(plan({...creates,"session-events-dlq":"create"},withJobs))).toThrow(/must be noop or session pipeline update/);expect(()=>check(plan({...creates,"session-brief-schedule":"update"},[...withJobs,...SESSION_BRIEF_RESOURCES]))).toThrow(/separate reviewed phase/);for(const action of ["delete","replace"])expect(()=>check(plan({"session-analysis-job-schedule":action},withJobs))).toThrow(/forbidden action/)});
   it("analysis job phases refuse unproven role and read-api cascades",()=>{const creates=Object.fromEntries(SESSION_ANALYSIS_JOB_RESOURCES.map(r=>[r,"create"]));expect(()=>check(plan({...creates,"session-pipeline":"update","session-events":"update"},withJobs))).toThrow(/session-events updates without the role-ARN cascade/);const withApi=[...withJobs,"session-read-api","session-read-api-secret","session-read-api-errors-alarm","session-read-api-throttles-alarm"];expect(()=>check(plan({...creates,"session-read-api":"update"},withApi))).toThrow(/session-read-api may update only with no declared property changes/);expect(()=>check(plan({...creates,"session-read-api-errors-alarm":"update"},withApi))).toThrow(/read api may not change/)});
   const withBufferedFeed = [...all, ...SESSION_BUFFERED_SEARCH_FEED_RESOURCES];
-  const armed = { searchIndex: true, bufferedSearchFeed: { enabled: true, gateDeclared: BUFFERED_SEARCH_FEED_GATE_CONTRACT } };
+  const armed = { searchIndex: true, bufferedSearchFeed: { enabled: true, gateDeclared: BUFFERED_SEARCH_FEED_GATE_CONTRACT }, schedules: { bufferedSearchFeed: true as const } };
   it("buffered feed defaults disabled and sets no feed variable",()=>{
     expect(bufferedSearchFeedScheduleProps({names:p,functionArn:"fn",p:{},tags:{}})).toMatchObject({state:"DISABLED",scheduleExpression:"rate(1 minute)",targets:[{Input:JSON.stringify({bufferedSearchFeed:true})}]});
     const env=sessionPipelineEnv({stage:STAGE,bucket:t.bucket,names:p,p:{}});
@@ -479,7 +479,7 @@ describe("session pipeline: deploy plan contract", () => {
   });
   it("buffered erasure delete arms only with the gate declaration and searchIndex; knobs are bounded like the lane's",()=>{
     const gate={enabled:false,gateDeclared:BUFFERED_SEARCH_FEED_GATE_CONTRACT};
-    const erasure={searchIndex:true,bufferedSearchFeed:gate,bufferedErasureDelete:{enabled:true}};
+    const erasure={searchIndex:true,bufferedSearchFeed:gate,bufferedErasureDelete:{enabled:true},schedules:{bufferedErasureDelete:true as const}};
     expect(refusedBy(erasure)).toBe("");
     expect(refusedBy({searchIndex:true,bufferedErasureDelete:{enabled:true}})).toMatch(/bufferedErasureDelete.enabled requires bufferedSearchFeed.gateDeclared/);
     expect(refusedBy({searchIndex:true,bufferedSearchFeed:{enabled:false},bufferedErasureDelete:{enabled:true}})).toMatch(/requires bufferedSearchFeed.gateDeclared/);
@@ -884,7 +884,7 @@ describe("session pipeline: SESSIONS_NEON_EXIT (neonExit, default off)", () => {
     expect(() => validate(withPipeline({ neonExit: true, semanticCopy }))).toThrow(
       "transcriptStore.sessionPipeline.neonExit refuses semanticCopy.enabled: true (SESSION_SEMANTIC_COPY_ENABLED reads the Neon readonly source)");
     // Without the profile, semantic copy stays accepted as before.
-    expect(() => validate(withPipeline({ semanticCopy }))).not.toThrow(/sessionPipeline/);
+    expect(() => validate(withPipeline({ semanticCopy, schedules: { semanticCopy: true } }))).not.toThrow(/sessionPipeline/);
   });
 
   it("stack and runtime agree: the rendered env passes lambdaEnv's Neon-exit gate, and either flag on it is refused", () => {
