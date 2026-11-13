@@ -1,6 +1,7 @@
 /**
- * Operator CLI for the one-time fence backfill (src/session-ingest/upload-fence-backfill.ts,
- * docs/decisions/0005-s3-native-upload-ledger.md "The buffered backlog", step 0).
+ * Operator CLI for the one-time S3 ledger backfill (src/session-ingest/upload-fence-backfill.ts,
+ * docs/decisions/0005-s3-native-upload-ledger.md "The buffered backlog", step 0): fences, ownership stubs
+ * and revision index shards, in #580's ledger-s3 formats, from read-only SQL.
  *
  *   stdin (one JSON line, piped from 1Password, never written to disk):
  *     {"dbUrl": "postgresql://user:password@host:port/db?sslmode=verify-full"}
@@ -9,20 +10,23 @@
  *   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY [/ AWS_SESSION_TOKEN] from the environment only.
  *
  *   bun run scripts/upload-fence-backfill.ts --dry-run  --bucket <name> [--region us-east-1] [--org <org> ...]
- *       [--page-size 500] [--concurrency 4] [--max-users N] [--statement-timeout-ms 30000]
+ *       [--section fences|ownership|revisions ...] [--page-size 500] [--row-page-size 5000] [--concurrency 4]
+ *       [--statement-timeout-ms 30000]
  *   bun run scripts/upload-fence-backfill.ts --execute  --bucket <name> --kms-key-arn <arn> [same flags]
  *
  * Exactly one of --dry-run / --execute is required. --dry-run reads SQL and the existing fences and
- * writes nothing (refused in code as well). --execute merges into each user's `upload-fences.json` by
- * CAS and needs the owner's explicit OK. Rerunning is a no-op for fences already up to date.
+ * writes nothing (refused in code as well). --execute writes through ledger-s3 (fence CAS edits, ownership
+ * stubs, revision shard merges) and needs the owner's explicit OK. Rerunning is a no-op for what is there.
  *
- * Output: one JSON line of counts only (never a tenant id, session id, key or URL).
+ * Output: one JSON line of counts only (never a tenant id, session id, key or URL), with each section's
+ * completion (`sections.fences|ownership|revisions`: complete | incomplete | not_run), which the
+ * fence-authority marker's `fenceBackfill` / `ownershipBackfill` / `revisionBackfill` record.
  */
 import { readFileSync } from "node:fs";
 import pg from "pg";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
 import { ownerClientConfig } from "../src/shared/owner-pg-config.ts";
-import { MAX_BACKFILL_CONCURRENCY, backfillUploadFences } from "../src/session-ingest/upload-fence-backfill.ts";
+import { BACKFILL_SECTIONS, MAX_BACKFILL_CONCURRENCY, backfillUploadFences, type BackfillSection } from "../src/session-ingest/upload-fence-backfill.ts";
 
 const REGION = /^[a-z]{2}(-[a-z]+)+-\d$/;
 const BUCKET = /^(?!.*\.\.)(?!\d+\.\d+\.\d+\.\d+$)[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/;
@@ -34,19 +38,21 @@ export interface BackfillArgs {
   bucket: string;
   region: string;
   orgs: string[];
+  sections: BackfillSection[];
   pageSize: number;
+  rowPageSize: number;
   concurrency: number;
   statementTimeoutMs: number;
-  maxUsers?: number;
   kmsKeyArn?: string;
 }
 
-const VALUE_FLAGS = new Set(["--bucket", "--region", "--org", "--page-size", "--concurrency", "--max-users", "--statement-timeout-ms", "--kms-key-arn"]);
+const VALUE_FLAGS = new Set(["--bucket", "--region", "--org", "--section", "--page-size", "--row-page-size", "--concurrency", "--statement-timeout-ms", "--kms-key-arn"]);
 const BOOL_FLAGS = new Set(["--dry-run", "--execute"]);
 
 /** Strict parsing: the mode is never implied, and nothing unvalidated reaches a host. */
 export function parseBackfillArgs(argv: string[]): BackfillArgs {
   const orgs: string[] = [];
+  const sections: BackfillSection[] = [];
   const one = new Map<string, string>();
   const bools = new Set<string>();
   for (let i = 0; i < argv.length; i++) {
@@ -56,6 +62,10 @@ export function parseBackfillArgs(argv: string[]): BackfillArgs {
     const v = argv[++i];
     if (v === undefined || v.startsWith("--")) throw new Error(`${a} needs a value`);
     if (a === "--org") orgs.push(v);
+    else if (a === "--section") {
+      if (!BACKFILL_SECTIONS.includes(v as BackfillSection)) throw new Error("--section must be fences, ownership or revisions");
+      sections.push(v as BackfillSection);
+    }
     else if (one.has(a)) throw new Error(`${a} given twice`);
     else one.set(a, v);
   }
@@ -74,13 +84,12 @@ export function parseBackfillArgs(argv: string[]): BackfillArgs {
   const pageSize = int("--page-size", 1, 5_000) ?? 500;
   const concurrency = int("--concurrency", 1, MAX_BACKFILL_CONCURRENCY) ?? 4;
   const statementTimeoutMs = int("--statement-timeout-ms", 1_000, 600_000) ?? 30_000;
-  const maxUsers = int("--max-users", 1, 100_000_000);
+  const rowPageSize = int("--row-page-size", 1, 50_000) ?? 5_000;
   const kmsKeyArn = one.get("--kms-key-arn");
   if (mode === "execute" && (kmsKeyArn === undefined || !KMS.test(kmsKeyArn))) throw new Error("--execute requires --kms-key-arn (the bucket's KMS key ARN)");
   if (mode === "dry_run" && kmsKeyArn !== undefined) throw new Error("--kms-key-arn is only for --execute");
   return {
-    mode, bucket, region, orgs, pageSize, concurrency, statementTimeoutMs,
-    ...(maxUsers !== undefined ? { maxUsers } : {}),
+    mode, bucket, region, orgs, sections: sections.length ? [...new Set(sections)] : [...BACKFILL_SECTIONS], pageSize, rowPageSize, concurrency, statementTimeoutMs,
     ...(kmsKeyArn !== undefined ? { kmsKeyArn } : {}),
   };
 }
@@ -99,7 +108,7 @@ if (import.meta.main) {
   try {
     args = parseBackfillArgs(process.argv.slice(2));
   } catch (error) {
-    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--page-size n] [--concurrency n] [--max-users n] [--statement-timeout-ms n]; {"dbUrl": …} on stdin; AWS_* credentials in the environment`);
+    console.error(`${(error as Error).message}\nusage: (--dry-run | --execute --kms-key-arn <arn>) --bucket <name> [--region r] [--org o ...] [--section s ...] [--page-size n] [--row-page-size n] [--concurrency n] [--statement-timeout-ms n]; {"dbUrl": …} on stdin; AWS_* credentials in the environment`);
     process.exit(2);
   }
   let client: pg.Client | undefined;
@@ -127,8 +136,7 @@ if (import.meta.main) {
       sql: { query: async (text, params) => ({ rows: (await db.query(text, params)).rows }) },
       store, keyRoot: "96bulls", dryRun: args.mode === "dry_run",
       ...(args.orgs.length ? { orgs: args.orgs } : {}),
-      pageSize: args.pageSize, concurrency: args.concurrency, statementTimeoutMs: args.statementTimeoutMs,
-      ...(args.maxUsers !== undefined ? { maxUsers: args.maxUsers } : {}),
+      sections: args.sections, pageSize: args.pageSize, rowPageSize: args.rowPageSize, concurrency: args.concurrency, statementTimeoutMs: args.statementTimeoutMs,
     });
     process.stdout.write(JSON.stringify(summary) + "\n");
   } catch (e) {

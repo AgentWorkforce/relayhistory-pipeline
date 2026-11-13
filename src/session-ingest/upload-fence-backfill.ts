@@ -1,131 +1,45 @@
 /**
- * The one-time fence backfill (docs/decisions/0005-s3-native-upload-ledger.md, "The buffered backlog",
- * step 0). The backlog's deletions and resets were recorded in SQL (`sessions.upload_deletions`,
- * `sessions.upload_resets`). This copies each affected user's state into their S3 fence object,
- * `<per-user admission dir>/upload-fences.json`, so the buffered drain (which reads S3 alone and refuses
- * a user with no fence) can never republish a deleted session.
+ * The one-time S3 ledger backfill (docs/decisions/0005-s3-native-upload-ledger.md, "The buffered backlog",
+ * step 0, and #580's fence-authority preconditions). At cutover S3 must know what SQL knows, in #580's
+ * ledger-s3 formats and through its exported rules only (no local copy of any format or rule):
+ *
+ *   fences     every user with any upload state (upload_deletions, upload_resets, ingest_session_ownership,
+ *              ingest_record_revisions, ingest_batches) gets `upload-fences.json`: `editFence` (an absent fence
+ *              starts from `newFence()`), SQL's deletions and resets applied with `applyFenceChange` (a new
+ *              deletion bumps the session's epoch; a new reset request id is recorded with its tombstone
+ *              count, increments `resets` and raises `lastResetAtMs` to SQL's `reset_at`, rounded up to the
+ *              ms). A user with no controls still gets an (empty) fence: the drain refuses an absent one.
+ *   ownership  `ingest_session_ownership` (written at claim, so pending and committed claims alike) into the
+ *              ownership stubs (`registerOwner`), at the backfilled fence's current generation
+ *              (`recordGeneration`), so a later reset lists sessions owned only in SQL.
+ *   revisions  `ingest_record_revisions` into the per-origin revision shards (`mergeIndex`) as
+ *              current-generation entries, so #250 stale checks hold at cutover. mergeIndex never lowers a
+ *              stored revision (an equal one keeps the stored entry).
  *
  * SQL is read-only: one `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` snapshot, checked with
- * `SHOW transaction_read_only`, always ended by ROLLBACK. Only SELECTs on the two tables. Users are
- * paged by keyset over (org_id, workspace_id, user_id), optionally scoped to a set of orgs.
+ * `SHOW transaction_read_only`, always ended by ROLLBACK; SELECTs only, keyset-paged, optionally scoped to
+ * a set of orgs. Every write is a ledger-s3 CAS or create; rerunning is a no-op for what is already there.
  *
- * S3 is merge-only, by CAS (`If-Match`, or `If-None-Match: *` to create), retried on contention:
- *   - `deleted`: the union of the stored pairs and SQL's, per origin. Never drops an entry (a session
- *     re-enabled in SQL since an earlier run stays fenced in S3: the fail-safe direction).
- *   - `resets`: max(stored, SQL row count).
- *   - `lastResetAtMs`: max(stored, SQL's latest `reset_at`, rounded UP to the millisecond so a batch
- *     received within that millisecond counts as pre-reset). The drain needs it to drop pre-reset batches.
- * A fence with fields this job does not know (a richer format written by another module) is never
- * rewritten: `fence_foreign_format`, reported. An unreadable fence fails closed: `fence_unreadable`.
- * A fence the merge would not change is not written (`unchanged`). Rerunning is therefore a no-op.
+ * Fail closed: a fence that is unreadable is never rewritten, and a user with ANY row the ledger cannot
+ * represent (an empty id, a `__proto__` key) gets no fence at all, so the drain keeps refusing them. Rows of
+ * a user without a backfilled fence are skipped (`skipped_no_fence`). Each section reports `complete` only
+ * when nothing was skipped for those reasons or failed: #580's fence-authority marker records
+ * `fenceBackfill`, `ownershipBackfill` and `revisionBackfill` from these.
  *
- * The fence format is 0005's as the drain reads it ({v:1, resets, deleted:{origin:[[source, session]]},
- * lastResetAtMs}). TODO(ledger-s3): when src/session-ingest/ledger-s3.ts lands, use its fence key and
- * edit functions instead of the local ones here, so both writers agree on one format.
- *
- * Nothing here logs; the summary holds counts only: never a tenant id, session id or key.
+ * Nothing here logs; the summary holds counts only: never a tenant id, session id, record id or key.
  */
-import { isObjectStoreError, objectKey, readAll, type ObjectStore, type ObjectVersion } from "../shared/vendor.ts";
-import { journalKey } from "./async-admission.ts";
+import type { ObjectStore } from "../shared/vendor.ts";
+import { applyFenceChange, isDeleted, newFence, recordGeneration, s3LedgerObjects, type FenceChange, type FenceDoc, type IndexEntryInput } from "./ledger-s3.ts";
 import type { LedgerTenant } from "./ledger.ts";
-import { backoffMs } from "./writer.ts";
 
-const encoder = new TextEncoder();
-const decoder = new TextDecoder("utf-8", { fatal: true });
-const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 const ORG = /^(?!\.)[A-Za-z0-9._-]{1,128}$/;
-const KNOWN_FENCE_KEYS = new Set(["v", "resets", "deleted", "lastResetAtMs"]);
-const CAS_ATTEMPTS = 8;
+const HEX64 = /^[0-9a-f]{64}$/;
 export const MAX_BACKFILL_CONCURRENCY = 16;
+export type BackfillSection = "fences" | "ownership" | "revisions";
+export const BACKFILL_SECTIONS: readonly BackfillSection[] = ["fences", "ownership", "revisions"];
 
 export interface BackfillSql {
   query(sql: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
-}
-
-export interface BackfillFence {
-  v: 1;
-  resets: number;
-  deleted: Record<string, [source: string, sessionId: string][]>;
-  lastResetAtMs?: number;
-}
-
-/** The per-user admission directory that holds `privacy-journal.json` (async-admission.ts). */
-export function backfillFenceKey(keyRoot: string, tenant: LedgerTenant): string {
-  const key = journalKey(keyRoot, tenant);
-  return `${key.slice(0, key.length - "/privacy-journal.json".length)}/upload-fences.json`;
-}
-
-/** SQL's state for one user. */
-export interface UserFenceState {
-  tenant: LedgerTenant;
-  deleted: Map<string, [string, string][]>;
-  resetRows: number;
-  lastResetAtMs?: number;
-}
-
-type Parsed = { kind: "ok"; fence: BackfillFence } | { kind: "unreadable" | "foreign" };
-
-export function parseBackfillFence(text: string): Parsed {
-  let v: unknown;
-  try {
-    v = JSON.parse(text);
-  } catch {
-    return { kind: "unreadable" };
-  }
-  if (!isObject(v)) return { kind: "unreadable" };
-  if (Object.keys(v).some((k) => !KNOWN_FENCE_KEYS.has(k))) return { kind: "foreign" };
-  if (v.v !== 1 || !Number.isSafeInteger(v.resets) || (v.resets as number) < 0 || !isObject(v.deleted)) return { kind: "unreadable" };
-  if (v.lastResetAtMs !== undefined && (!Number.isSafeInteger(v.lastResetAtMs) || (v.lastResetAtMs as number) < 0)) return { kind: "unreadable" };
-  for (const pairs of Object.values(v.deleted)) {
-    if (!Array.isArray(pairs)) return { kind: "unreadable" };
-    for (const p of pairs) if (!Array.isArray(p) || p.length !== 2 || typeof p[0] !== "string" || typeof p[1] !== "string") return { kind: "unreadable" };
-  }
-  return { kind: "ok", fence: v as unknown as BackfillFence };
-}
-
-/** Merge SQL's state into a stored fence. Never removes anything. Deterministic (sorted) output. */
-export function mergeFence(stored: BackfillFence | null, state: UserFenceState): { fence: BackfillFence; added: number } {
-  const deleted = new Map<string, Map<string, [string, string]>>();
-  const add = (origin: string, pair: [string, string]) => {
-    const m = deleted.get(origin) ?? new Map<string, [string, string]>();
-    const k = JSON.stringify(pair);
-    const fresh = !m.has(k);
-    m.set(k, pair);
-    deleted.set(origin, m);
-    return fresh;
-  };
-  for (const [origin, pairs] of Object.entries(stored?.deleted ?? {})) for (const p of pairs) add(origin, [p[0], p[1]]);
-  let added = 0;
-  for (const [origin, pairs] of state.deleted) for (const p of pairs) if (add(origin, p)) added++;
-  const out: BackfillFence = {
-    v: 1,
-    resets: Math.max(stored?.resets ?? 0, state.resetRows),
-    deleted: Object.fromEntries(
-      [...deleted.keys()].sort().map((origin) => [origin, [...deleted.get(origin)!.values()].sort((a, b) => (JSON.stringify(a) < JSON.stringify(b) ? -1 : 1))]),
-    ),
-  };
-  const last = Math.max(stored?.lastResetAtMs ?? -1, state.lastResetAtMs ?? -1);
-  if (last >= 0) out.lastResetAtMs = last;
-  return { fence: out, added };
-}
-
-const sameFence = (a: BackfillFence, b: BackfillFence) => {
-  const norm = (f: BackfillFence) => mergeFence(f, { tenant: { orgId: "", workspaceId: "", userId: "" }, deleted: new Map(), resetRows: 0 }).fence;
-  return JSON.stringify(norm(a)) === JSON.stringify(norm(b));
-};
-
-export type FenceOutcome = "created" | "updated" | "unchanged" | "would_create" | "would_update" | "fence_unreadable" | "fence_foreign_format" | "fence_contended" | "tenant_invalid" | "failed";
-const OUTCOMES: FenceOutcome[] = ["created", "updated", "unchanged", "would_create", "would_update", "fence_unreadable", "fence_foreign_format", "fence_contended", "tenant_invalid", "failed"];
-
-export interface BackfillSummary {
-  mode: "dry_run" | "execute";
-  users: number;
-  deletion_rows: number;
-  reset_rows: number;
-  /** (origin, source, session) pairs the merge added (or would add) to fences. */
-  pairs_added: number;
-  fences: Record<FenceOutcome, number>;
-  stopped: "complete" | "max_users";
 }
 
 export interface BackfillOptions {
@@ -133,66 +47,102 @@ export interface BackfillOptions {
   store: ObjectStore;
   keyRoot: string;
   dryRun: boolean;
-  /** Only these orgs (exact org ids). Default: every org in the two tables. */
+  /** Only these orgs (exact org ids). Default: every org in the tables. */
   orgs?: string[];
+  /** Default all three. Ownership and revisions need the fences (backfilled now, or in an earlier run). */
+  sections?: BackfillSection[];
+  /** Users per fence page (default 500); rows per ownership/revision page (default 5000). */
   pageSize?: number;
+  rowPageSize?: number;
   concurrency?: number;
-  maxUsers?: number;
   statementTimeoutMs?: number;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
 }
 
-const USERS_PAGE = `
-SELECT org_id, workspace_id, user_id FROM (
+export interface BackfillSummary {
+  mode: "dry_run" | "execute";
+  users: number;
+  fences: {
+    deletion_rows: number; reset_rows: number;
+    created: number; updated: number; unchanged: number; would_create: number; would_update: number;
+    pairs_added: number; resets_added: number;
+    unreadable: number; contended: number; tenant_invalid: number; input_invalid: number; failed: number;
+  };
+  ownership: { rows: number; registered: number; would_register: number; unchanged: number; skipped_deleted: number; skipped_no_fence: number; invalid: number; failed: number };
+  revisions: { rows: number; merged: number; would_merge: number; skipped_deleted: number; skipped_no_fence: number; unrepresentable: number; invalid: number; shards: number; failed: number };
+  /** Per section: complete (nothing skipped for want of a fence, nothing invalid or failed), incomplete, or not run. */
+  sections: Record<BackfillSection, "complete" | "incomplete" | "not_run">;
+}
+
+const USERS = `
+SELECT DISTINCT org_id, workspace_id, user_id FROM (
   SELECT org_id, workspace_id, user_id FROM sessions.upload_deletions
-  UNION
-  SELECT org_id, workspace_id, user_id FROM sessions.upload_resets
+  UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.upload_resets
+  UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.ingest_session_ownership
+  UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.ingest_record_revisions
+  UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.ingest_batches
 ) AS u
 WHERE ($1::text[] IS NULL OR org_id = ANY($1::text[]))
-  AND (org_id, workspace_id, user_id) > ($2::text, $3::text, $4::text)
-ORDER BY org_id, workspace_id, user_id
-LIMIT $5::int`;
+ORDER BY org_id, workspace_id, user_id`;
 const DELETIONS_FOR = `
 SELECT d.org_id, d.workspace_id, d.user_id, d.origin_id, d.source, d.session_id
 FROM sessions.upload_deletions AS d
 JOIN unnest($1::text[], $2::text[], $3::text[]) AS p(o, w, u) ON d.org_id = p.o AND d.workspace_id = p.w AND d.user_id = p.u
 ORDER BY d.org_id, d.workspace_id, d.user_id, d.origin_id, d.source, d.session_id`;
 const RESETS_FOR = `
-SELECT r.org_id, r.workspace_id, r.user_id, count(*)::bigint AS n,
-       ceil(extract(epoch FROM max(r.reset_at)) * 1000)::bigint AS last_ms
+SELECT r.org_id, r.workspace_id, r.user_id, r.request_id, r.deleted,
+       ceil(extract(epoch FROM r.reset_at) * 1000)::bigint AS at_ms
 FROM sessions.upload_resets AS r
 JOIN unnest($1::text[], $2::text[], $3::text[]) AS p(o, w, u) ON r.org_id = p.o AND r.workspace_id = p.w AND r.user_id = p.u
-GROUP BY r.org_id, r.workspace_id, r.user_id`;
+ORDER BY r.org_id, r.workspace_id, r.user_id, r.reset_at, r.request_id`;
+const OWNERSHIP_PAGE = `
+SELECT org_id, workspace_id, user_id, origin_id, source, session_id FROM sessions.ingest_session_ownership
+WHERE ($1::text[] IS NULL OR org_id = ANY($1::text[]))
+  AND (org_id, workspace_id, user_id, origin_id, source, session_id) > ($2::text, $3::text, $4::text, $5::text, $6::text, $7::text)
+ORDER BY org_id, workspace_id, user_id, origin_id, source, session_id
+LIMIT $8::int`;
+const REVISIONS_PAGE = `
+SELECT org_id, workspace_id, origin_id, record_id, revision, revision_id, digest, user_id, source, session_id
+FROM sessions.ingest_record_revisions
+WHERE ($1::text[] IS NULL OR org_id = ANY($1::text[]))
+  AND (org_id, workspace_id, origin_id, record_id) > ($2::text, $3::text, $4::text, $5::text)
+ORDER BY org_id, workspace_id, origin_id, record_id
+LIMIT $6::int`;
 
-const tenantKey = (o: unknown, w: unknown, u: unknown) => JSON.stringify([o, w, u]);
-const str = (v: unknown): string => {
+const userKey = (o: unknown, w: unknown, u: unknown) => JSON.stringify([o, w, u]);
+const text = (v: unknown): string => {
   if (typeof v !== "string") throw new Error("backfill_row_invalid");
   return v;
 };
-const int = (v: unknown): number => {
-  const n = typeof v === "bigint" ? Number(v) : typeof v === "string" ? Number(v) : v;
-  if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0) throw new Error("backfill_row_invalid");
-  return n;
+const id = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v !== "__proto__";
+const int = (v: unknown): number | undefined => {
+  const n = typeof v === "bigint" || typeof v === "string" ? Number(v) : v;
+  return typeof n === "number" && Number.isSafeInteger(n) && n >= 0 ? n : undefined;
 };
 
-/** One read-only snapshot over the two tables; S3 fences merged by CAS. Counts only. */
+async function mapLimit<T>(items: readonly T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) await fn(items[next++]!);
+  }));
+}
+
+/** One read-only snapshot; S3 written only through ledger-s3's exports. Counts only. */
 export async function backfillUploadFences(opts: BackfillOptions): Promise<BackfillSummary> {
   const pageSize = opts.pageSize ?? 500;
+  const rowPageSize = opts.rowPageSize ?? 5_000;
   const concurrency = opts.concurrency ?? 4;
   const statementTimeoutMs = opts.statementTimeoutMs ?? 30_000;
+  const sections = new Set(opts.sections ?? BACKFILL_SECTIONS);
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 5_000) throw new Error("backfill_page_size_invalid");
+  if (!Number.isInteger(rowPageSize) || rowPageSize < 1 || rowPageSize > 50_000) throw new Error("backfill_row_page_size_invalid");
   if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > MAX_BACKFILL_CONCURRENCY) throw new Error("backfill_concurrency_invalid");
-  if (opts.maxUsers !== undefined && (!Number.isSafeInteger(opts.maxUsers) || opts.maxUsers < 1)) throw new Error("backfill_max_users_invalid");
   if (!Number.isInteger(statementTimeoutMs) || statementTimeoutMs < 1_000 || statementTimeoutMs > 600_000) throw new Error("backfill_statement_timeout_invalid");
   if (!/^[a-z0-9][a-z0-9-]{0,62}$/.test(opts.keyRoot)) throw new Error("backfill_key_root_invalid");
   if (opts.orgs) for (const org of opts.orgs) if (!ORG.test(org)) throw new Error("backfill_org_invalid");
-  const summary: BackfillSummary = {
-    mode: opts.dryRun ? "dry_run" : "execute", users: 0, deletion_rows: 0, reset_rows: 0, pairs_added: 0,
-    fences: Object.fromEntries(OUTCOMES.map((o) => [o, 0])) as Record<FenceOutcome, number>, stopped: "complete",
-  };
+  if (![...sections].every((s) => BACKFILL_SECTIONS.includes(s)) || sections.size === 0) throw new Error("backfill_sections_invalid");
   const orgs = opts.orgs && opts.orgs.length ? [...new Set(opts.orgs)] : null;
-  const { sql } = opts;
   // The dry run's defence in depth: every mutation throws (and is counted `failed`), so nothing is written.
   const store: ObjectStore = opts.dryRun
     ? new Proxy(opts.store, {
@@ -203,96 +153,202 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
         },
       })
     : opts.store;
+  const io = s3LedgerObjects(store, opts.keyRoot, { ...(opts.sleep ? { sleep: opts.sleep } : {}), ...(opts.random ? { random: opts.random } : {}) });
+  const summary: BackfillSummary = {
+    mode: opts.dryRun ? "dry_run" : "execute", users: 0,
+    fences: { deletion_rows: 0, reset_rows: 0, created: 0, updated: 0, unchanged: 0, would_create: 0, would_update: 0, pairs_added: 0, resets_added: 0, unreadable: 0, contended: 0, tenant_invalid: 0, input_invalid: 0, failed: 0 },
+    ownership: { rows: 0, registered: 0, would_register: 0, unchanged: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, failed: 0 },
+    revisions: { rows: 0, merged: 0, would_merge: 0, skipped_deleted: 0, skipped_no_fence: 0, unrepresentable: 0, invalid: 0, shards: 0, failed: 0 },
+    sections: { fences: "not_run", ownership: "not_run", revisions: "not_run" },
+  };
+  /** Each user's fence as it stands after the fence section (or as read, when that section is not run). */
+  const fences = new Map<string, FenceDoc>();
+  const { sql } = opts;
 
   await sql.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
   try {
     const ro = (await sql.query("SHOW transaction_read_only")).rows[0]?.transaction_read_only;
     if (ro !== "on") throw new Error("backfill_not_read_only");
     await sql.query(`SET LOCAL statement_timeout = ${statementTimeoutMs}`);
-    let cursor: [string, string, string] = ["", "", ""];
-    for (;;) {
-      const remaining = opts.maxUsers === undefined ? pageSize : Math.min(pageSize, opts.maxUsers - summary.users);
-      if (remaining <= 0) {
-        summary.stopped = "max_users";
-        break;
-      }
-      const page = (await sql.query(USERS_PAGE, [orgs, ...cursor, remaining])).rows.map((r) => [str(r.org_id), str(r.workspace_id), str(r.user_id)] as [string, string, string]);
-      if (!page.length) break;
-      cursor = page[page.length - 1]!;
+    const users = (await sql.query(USERS, [orgs])).rows.map((r) => [text(r.org_id), text(r.workspace_id), text(r.user_id)] as [string, string, string]);
+    summary.users = users.length;
+
+    // ---- fences ----
+    for (let at = 0; at < users.length; at += pageSize) {
+      const page = users.slice(at, at + pageSize);
       const cols = [page.map((p) => p[0]), page.map((p) => p[1]), page.map((p) => p[2])];
-      const states = new Map<string, UserFenceState>(page.map(([o, w, u]) => [tenantKey(o, w, u), { tenant: { orgId: o, workspaceId: w, userId: u }, deleted: new Map(), resetRows: 0 }]));
-      for (const r of (await sql.query(DELETIONS_FOR, cols)).rows) {
-        const state = states.get(tenantKey(r.org_id, r.workspace_id, r.user_id));
-        if (!state) throw new Error("backfill_row_invalid");
-        const origin = str(r.origin_id);
-        state.deleted.set(origin, [...(state.deleted.get(origin) ?? []), [str(r.source), str(r.session_id)]]);
-        summary.deletion_rows++;
+      type State = { tenant: LedgerTenant; deletions: Map<string, [string, string][]>; resets: { requestId: string; atMs: number; result: number }[]; invalid: boolean };
+      const states = new Map<string, State>(page.map(([o, w, u]) => [userKey(o, w, u), { tenant: { orgId: o, workspaceId: w, userId: u }, deletions: new Map(), resets: [], invalid: false }]));
+      if (sections.has("fences")) {
+        for (const r of (await sql.query(DELETIONS_FOR, cols)).rows) {
+          const st = states.get(userKey(r.org_id, r.workspace_id, r.user_id))!;
+          summary.fences.deletion_rows++;
+          if (!id(r.origin_id) || !id(r.source) || !id(r.session_id)) { st.invalid = true; continue; }
+          st.deletions.set(r.origin_id, [...(st.deletions.get(r.origin_id) ?? []), [r.source, r.session_id]]);
+        }
+        for (const r of (await sql.query(RESETS_FOR, cols)).rows) {
+          const st = states.get(userKey(r.org_id, r.workspace_id, r.user_id))!;
+          summary.fences.reset_rows++;
+          const atMs = int(r.at_ms), result = int(r.deleted);
+          if (!id(r.request_id) || atMs === undefined || result === undefined) { st.invalid = true; continue; }
+          st.resets.push({ requestId: r.request_id, atMs, result });
+        }
       }
-      for (const r of (await sql.query(RESETS_FOR, cols)).rows) {
-        const state = states.get(tenantKey(r.org_id, r.workspace_id, r.user_id));
-        if (!state) throw new Error("backfill_row_invalid");
-        state.resetRows = int(r.n);
-        state.lastResetAtMs = int(r.last_ms);
-        summary.reset_rows += state.resetRows;
+      await mapLimit([...states.values()], concurrency, async (st) => {
+        let key: string;
+        try {
+          key = io.keysFor(st.tenant).fence;
+        } catch {
+          summary.fences.tenant_invalid++;
+          return;
+        }
+        if (!sections.has("fences")) {
+          // Ownership / revisions only: use the fence an earlier run backfilled.
+          try {
+            const read = await io.readFence(key);
+            if (read.state === "present") fences.set(userKey(st.tenant.orgId, st.tenant.workspaceId, st.tenant.userId), read.fence);
+          } catch { /* counted as skipped_no_fence by the sections that need it */ }
+          return;
+        }
+        if (st.invalid) {
+          summary.fences.input_invalid++;
+          return;
+        }
+        const changes: FenceChange[] = [
+          { deletions: [...st.deletions].map(([originId, sessions]) => ({ originId, sessions })) },
+          ...st.resets.map((reset) => ({ reset })),
+        ];
+        /** ledger-s3's rules on `f` (in place). Tallies are returned, and counted once by the caller. */
+        const apply = (f: FenceDoc) => {
+          let changed = false, pairs = 0, resets = 0;
+          for (const c of changes) {
+            const r = applyFenceChange(f, c);
+            changed ||= r.changed;
+            pairs += r.newlyDeleted.length;
+            if (r.reset === "recorded") resets++;
+          }
+          return { changed, pairs, resets };
+        };
+        const tally = (t: { pairs: number; resets: number }) => { summary.fences.pairs_added += t.pairs; summary.fences.resets_added += t.resets; };
+        const uk = userKey(st.tenant.orgId, st.tenant.workspaceId, st.tenant.userId);
+        try {
+          if (opts.dryRun) {
+            const read = await io.readFence(key);
+            const f = read.state === "present" ? structuredClone(read.fence) : newFence();
+            const t = apply(f);
+            tally(t);
+            if (read.state === "absent") summary.fences.would_create++;
+            else if (t.changed) summary.fences.would_update++;
+            else summary.fences.unchanged++;
+            fences.set(uk, f);
+            return;
+          }
+          // editFence may run the edit more than once (CAS retries): only the landed attempt's result counts.
+          type Landed = { outcome: "created" | "updated" | "unchanged"; t: { changed: boolean; pairs: number; resets: number } };
+          const landed = await io.editFence<Landed>(key, (f) => {
+            const absent = f.version === 0; // editFence starts an absent fence from newFence() (version 0)
+            const t = apply(f);
+            fences.set(uk, f);
+            if (!t.changed && !absent) return { next: null, result: { outcome: "unchanged", t } };
+            return { next: f, result: { outcome: absent ? "created" : "updated", t } };
+          });
+          summary.fences[landed.outcome]++;
+          tally(landed.t);
+        } catch (error) {
+          const code = (error as { code?: unknown })?.code;
+          if (code === "ledger_fence_invalid") summary.fences.unreadable++;
+          else if (code === "ledger_fence_contended") summary.fences.contended++;
+          else summary.fences.failed++;
+          fences.delete(uk);
+        }
+      });
+    }
+    if (sections.has("fences")) {
+      const f = summary.fences;
+      summary.sections.fences = f.unreadable + f.contended + f.tenant_invalid + f.input_invalid + f.failed === 0 ? "complete" : "incomplete";
+    }
+
+    // ---- ownership ----
+    if (sections.has("ownership")) {
+      let cursor = ["", "", "", "", "", ""];
+      for (;;) {
+        const rows = (await sql.query(OWNERSHIP_PAGE, [orgs, ...cursor, rowPageSize])).rows;
+        if (!rows.length) break;
+        const last = rows[rows.length - 1]!;
+        cursor = [text(last.org_id), text(last.workspace_id), text(last.user_id), text(last.origin_id), text(last.source), text(last.session_id)];
+        await mapLimit(rows, concurrency, async (r) => {
+          summary.ownership.rows++;
+          const fence = fences.get(userKey(r.org_id, r.workspace_id, r.user_id));
+          if (!fence) { summary.ownership.skipped_no_fence++; return; }
+          if (!id(r.origin_id) || !id(r.source) || !id(r.session_id)) { summary.ownership.invalid++; return; }
+          if (isDeleted(fence, r.origin_id, r.source, r.session_id)) { summary.ownership.skipped_deleted++; return; }
+          const [, epoch, resets] = recordGeneration(fence, r.origin_id, r.source, r.session_id);
+          try {
+            const key = io.keysFor({ orgId: text(r.org_id), workspaceId: text(r.workspace_id), userId: text(r.user_id) }).owner(r.origin_id, r.source, r.session_id);
+            const stored = (await io.readOwner(key))?.doc;
+            // registerOwner keeps a stub at its current epoch (its oldest generation): nothing to do then.
+            if (stored && stored.epoch >= epoch) { summary.ownership.unchanged++; return; }
+            if (opts.dryRun) { summary.ownership.would_register++; return; }
+            await io.registerOwner(key, { v: 1, originId: r.origin_id, source: r.source, sessionId: r.session_id, epoch, resets });
+            summary.ownership.registered++;
+          } catch {
+            summary.ownership.failed++;
+          }
+        });
       }
-      summary.users += page.length;
-      const queue = [...states.values()];
-      await Promise.all(Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
-        for (let s = queue.shift(); s; s = queue.shift()) summary.fences[await applyFence(s)]++;
-      }));
+      const o = summary.ownership;
+      summary.sections.ownership = o.skipped_no_fence + o.invalid + o.failed === 0 ? "complete" : "incomplete";
+    }
+
+    // ---- revisions ----
+    if (sections.has("revisions")) {
+      let cursor = ["", "", "", ""];
+      for (;;) {
+        const rows = (await sql.query(REVISIONS_PAGE, [orgs, ...cursor, rowPageSize])).rows;
+        if (!rows.length) break;
+        const last = rows[rows.length - 1]!;
+        cursor = [text(last.org_id), text(last.workspace_id), text(last.origin_id), text(last.record_id)];
+        // Per (user, origin, shard): one mergeIndex per shard per page.
+        const groups = new Map<string, { key: string; fence: FenceDoc; originId: string; entries: IndexEntryInput[] }>();
+        for (const r of rows) {
+          summary.revisions.rows++;
+          // Seed-proof rows (20261104040000) carry no revision id or digest: #580's entry cannot express them.
+          if (r.revision_id === null || r.digest === null) { summary.revisions.unrepresentable++; continue; }
+          const fence = fences.get(userKey(r.org_id, r.workspace_id, r.user_id));
+          if (!fence) { summary.revisions.skipped_no_fence++; continue; }
+          const revision = int(r.revision);
+          if (!id(r.origin_id) || !id(r.record_id) || !id(r.source) || !id(r.revision_id) || typeof r.digest !== "string" || !HEX64.test(r.digest) ||
+              revision === undefined || revision < 1 || !(r.session_id === null || id(r.session_id))) { summary.revisions.invalid++; continue; }
+          const sessionId = r.session_id as string | null;
+          if (sessionId !== null && isDeleted(fence, r.origin_id, r.source, sessionId)) { summary.revisions.skipped_deleted++; continue; }
+          let key: string;
+          try {
+            key = io.keysFor({ orgId: text(r.org_id), workspaceId: text(r.workspace_id), userId: text(r.user_id) }).revisions(r.origin_id, r.record_id);
+          } catch {
+            summary.revisions.invalid++;
+            continue;
+          }
+          const [sessionKey, epoch, resets] = recordGeneration(fence, r.origin_id, r.source, sessionId);
+          const g = groups.get(key) ?? { key, fence, originId: r.origin_id, entries: [] };
+          g.entries.push({ recordId: r.record_id, revision, revisionId: r.revision_id, digest: r.digest, sessionKey, epoch, resets });
+          groups.set(key, g);
+        }
+        await mapLimit([...groups.values()], concurrency, async (g) => {
+          if (opts.dryRun) { summary.revisions.would_merge += g.entries.length; return; }
+          try {
+            await io.mergeIndex(g.key, g.fence, g.originId, g.entries);
+            summary.revisions.merged += g.entries.length;
+            summary.revisions.shards++;
+          } catch {
+            summary.revisions.failed += g.entries.length;
+          }
+        });
+      }
+      const v = summary.revisions;
+      summary.sections.revisions = v.skipped_no_fence + v.unrepresentable + v.invalid + v.failed === 0 ? "complete" : "incomplete";
     }
   } finally {
     await sql.query("ROLLBACK").catch(() => {});
   }
   return summary;
-
-  async function applyFence(state: UserFenceState): Promise<FenceOutcome> {
-    if (!ORG.test(state.tenant.orgId)) return "tenant_invalid";
-    let key: string;
-    try {
-      key = backfillFenceKey(opts.keyRoot, state.tenant);
-      objectKey(key);
-    } catch {
-      return "tenant_invalid";
-    }
-    try {
-      for (let attempt = 0; attempt < CAS_ATTEMPTS; attempt++) {
-        let stored: { fence: BackfillFence; version: ObjectVersion } | null = null;
-        try {
-          const got = await store.getObject(objectKey(key));
-          const bytes = await readAll(got.body);
-          if (bytes.byteLength > 8 * 1024 * 1024) return "fence_unreadable";
-          let text: string;
-          try {
-            text = decoder.decode(bytes);
-          } catch {
-            return "fence_unreadable";
-          }
-          const parsed = parseBackfillFence(text);
-          if (parsed.kind !== "ok") return parsed.kind === "foreign" ? "fence_foreign_format" : "fence_unreadable";
-          stored = { fence: parsed.fence, version: got.meta.version };
-        } catch (error) {
-          if (!isObjectStoreError(error, "not_found")) throw error;
-        }
-        const { fence, added } = mergeFence(stored?.fence ?? null, state);
-        if (stored && sameFence(stored.fence, fence)) return "unchanged";
-        if (opts.dryRun) {
-          summary.pairs_added += added;
-          return stored ? "would_update" : "would_create";
-        }
-        try {
-          await store.put(objectKey(key), encoder.encode(JSON.stringify(fence)),
-            stored ? { ifMatch: stored.version, contentType: "application/json" } : { ifNoneMatch: true, contentType: "application/json" });
-          summary.pairs_added += added;
-          return stored ? "updated" : "created";
-        } catch (error) {
-          if (!isObjectStoreError(error, "precondition_failed") && !isObjectStoreError(error, "already_exists")) throw error;
-          await (opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))))(backoffMs(attempt, opts.random));
-        }
-      }
-      return "fence_contended";
-    } catch {
-      return "failed";
-    }
-  }
 }
