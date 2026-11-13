@@ -172,8 +172,16 @@ schema drift lists.
   never read; `scripts/ledger-reshard-revisions.ts` merges it once into the new one (dry run first,
   idempotent, safe while admissions run). Run it once every pod runs the new code: during a rolling
   deploy an old pod still writes the old layout, and the reshard picks those entries up too. Until it
-  has run for a user, an already stored record re-sent is judged new rather than stale; it is written
-  again, and nothing is lost. Only agent-relay-dev ever wrote the old layout.
+  has run for a user, a record stored only in the old layout is absent from the new one. Re-sent at the
+  same revision with the same digest it would only be written again, but with a different digest (a
+  desktop re-sends whole histories, and a scrub change alters the digest) it would land a second record
+  at one revision, and the reader then fails that session (`relayhistory_revision_conflict`). So the
+  fence-authority marker requires `revisionLayout: "4096"`, and admission and the drain refuse (retry)
+  an org until its marker has it. The operator adds it only after
+  `scripts/ledger-reshard-revisions.ts --verify` for that org reports `verify_passed: true`: every
+  legacy entry is present in the new layout at an equal or higher revision (or is one the fence has
+  forgotten), or the listing found no legacy shard. Any org with a marker from before this change ran
+  its backfill into the old layout, so it needs the reshard and verify too, not only agent-relay-dev.
 - **Index and manifest disagree after a crash.** A crash between the canonical write and the index
   merge leaves the batch `pending`. The retry resumes, rewrites idempotently under manifest CAS, and
   then merges. The index can lag the manifest, but it never leads it.

@@ -54,7 +54,7 @@ const store: ObjectStore = {
 };
 
 // Seed: the authority marker, and an origin index with EXISTING records spread over the shards.
-await fs.put(objectKey(`${ROOT}/.ledger/fence-authority.json`), new TextEncoder().encode(JSON.stringify({ v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: 1 })), { contentType: "application/json" });
+await fs.put(objectKey(`${ROOT}/.ledger/fence-authority.json`), new TextEncoder().encode(JSON.stringify({ v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", revisionLayout: "4096", workerHttpAdmission: "off", writtenAtMs: 1 })), { contentType: "application/json" });
 const keys = s3LedgerKeys(ROOT, TENANT);
 const shards = new Map<string, Record<string, unknown>>();
 const sk = sessionKeyHash("claude", "old-session");

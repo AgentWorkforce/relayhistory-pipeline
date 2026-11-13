@@ -190,7 +190,7 @@ async function allKeys(store: ObjectStore): Promise<string[]> {
 
 const grantAuthority = (store: ObjectStore) =>
   store.put(objectKey(orgFenceAuthorityKey(ROOT, A.orgId)), enc.encode(JSON.stringify({ v: 1, fenceBackfill: "complete", revisionBackfill: "complete",
-    ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: 1, orgId: A.orgId })));
+    ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", revisionLayout: "4096", workerHttpAdmission: "off", writtenAtMs: 1, orgId: A.orgId })));
 const objectLine = (id: string) => JSON.stringify({ kind: "session_event", origin_id: ORIGIN, record_id: id, revision: "1", operation: "upsert", received_at: "2030-01-02T00:00:00.000Z", payload: { text: id, ts_ms: 1_893_542_400_000 } });
 /** A real staged object in S3 for user A, and the same batch in SQL (seed). */
 async function stageInBoth(store: ObjectStore, groups: SeedGroup[], o: Parameters<typeof seed>[2] = {}) {

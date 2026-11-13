@@ -11,7 +11,7 @@ import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import { ADMISSION_PHASE_FIELDS, sanitizeLogField } from "../../shared/log.ts";
 import { deliverPrepared } from "../deliver.ts";
 import { LedgerUnavailableError, type ClaimInput, type CommitInput, type LedgerRecord } from "../ledger.ts";
-import { LEGACY_REVISION_SHARDS, REVISION_SHARDS, SERVER_LEDGER_PARALLEL, revisionShard, s3Ledger, s3LedgerKeys, s3LedgerObjects, sessionKeyHash } from "../ledger-s3.ts";
+import { LEGACY_REVISION_SHARDS, REVISION_SHARDS, SERVER_LEDGER_PARALLEL, revisionShard, s3Ledger, s3LedgerKeys, s3LedgerObjects, serverLedgerParallel, sessionKeyHash } from "../ledger-s3.ts";
 import { reshardRevisions } from "../revision-reshard.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
 import { liveMachineId } from "../writer.ts";
@@ -71,6 +71,15 @@ describe("the 4096-shard revision index", () => {
     expect(keys.revisions(ORIGIN, "r1")).toMatch(/\/ledger\/revisions\/o=[0-9a-f]{32}\/r=[0-9a-f]{3}\.json$/);
   });
 
+  test("the shard is the first three hex digits (12 bits) of sha256(recordId), as decision 0005 says", () => {
+    // Known vectors: sha256("") = e3b0c442..., sha256("r1") = 82f..., sha256("record-123") = 35b..., sha256("a") = ca97...
+    expect(revisionShard("")).toBe("e3b");
+    expect(revisionShard("r1")).toBe("82f");
+    expect(revisionShard("record-123")).toBe("35b");
+    expect(revisionShard("a")).toBe("ca9");
+    for (let i = 0; i < 1000; i++) expect(revisionShard(`id-${i}`)).toBe(hex(`id-${i}`).slice(0, 3));
+  });
+
   test("a merge into a legacy (two-digit) shard key is refused", async () => {
     const io = s3LedgerObjects(fresh(), ROOT);
     const fence = (await import("../ledger-s3.ts")).newFence();
@@ -80,6 +89,13 @@ describe("the 4096-shard revision index", () => {
 });
 
 describe("parallel", () => {
+  test("INGEST_LEDGER_PARALLEL: unset or empty is SERVER_LEDGER_PARALLEL, 1..64 integers are taken, anything else refuses", () => {
+    expect(serverLedgerParallel({})).toBe(SERVER_LEDGER_PARALLEL);
+    expect(serverLedgerParallel({ INGEST_LEDGER_PARALLEL: "" })).toBe(SERVER_LEDGER_PARALLEL);
+    for (const ok of ["1", "8", "64"]) expect(serverLedgerParallel({ INGEST_LEDGER_PARALLEL: ok })).toBe(Number(ok));
+    for (const bad of ["0", "65", "08", "1.5", "x", " 8", "-1", "100"]) expect(() => serverLedgerParallel({ INGEST_LEDGER_PARALLEL: bad })).toThrow(LedgerUnavailableError);
+  });
+
   test("1..64 integers only; servers use SERVER_LEDGER_PARALLEL", () => {
     for (const bad of [0, 65, 1.5, -1, Number.NaN]) expect(() => s3Ledger(fresh(), ROOT, { parallel: bad })).toThrow(LedgerUnavailableError);
     for (const ok of [1, 6, 32, 64]) expect(() => s3Ledger(fresh(), ROOT, { parallel: ok })).not.toThrow();
@@ -95,6 +111,36 @@ describe("concurrent reads keep every ordering guarantee", () => {
     await base.put(objectKey(keys.batch(ORIGIN, "b1")), enc.encode("{not json"), { contentType: "application/json" });
     await base.put(objectKey(keys.fence), enc.encode("{not json"), { contentType: "application/json" });
     await expect(s3Ledger(base, ROOT, noSleep).claim(input)).rejects.toMatchObject({ code: "ledger_batch_record_invalid" });
+  });
+
+  test("claim: a replay (committed batch id) reads no index shard", async () => {
+    const base = fresh();
+    const input = claimInput("b1", [rec("r1", 1), rec("r2", 1)]);
+    const first = s3Ledger(base, ROOT, noSleep);
+    const c = await first.claim(input);
+    if (c.kind !== "claimed") throw new Error(c.kind);
+    await first.commit(commitOf(input, c.claimToken));
+    const log: string[] = [];
+    expect((await s3Ledger(logged(base, log), ROOT, noSleep).claim(input)).kind).toBe("replay");
+    expect(log.filter((l) => l.includes("/ledger/revisions/"))).toEqual([]);
+    // A batch-id 409 (same id, other digest) reads none either.
+    log.length = 0;
+    expect((await s3Ledger(logged(base, log), ROOT, noSleep).claim({ ...input, batchDigest: hex("other") })).kind).toBe("batch_conflict");
+    expect(log.filter((l) => l.includes("/ledger/revisions/"))).toEqual([]);
+  });
+
+  test("claim: a corrupt shard holding only a deleted session's records never fails the batch", async () => {
+    const base = fresh();
+    const ledger = s3Ledger(base, ROOT, noSleep);
+    await ledger.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "sess-2"]], enabled: false });
+    let d = 0;
+    while (revisionShard(`d${d}`) === revisionShard("live-1")) d++;
+    await base.put(objectKey(keys.revisions(ORIGIN, `d${d}`)), enc.encode("{corrupt"), { contentType: "application/json" });
+    const input = claimInput("b-mixed", [rec("live-1", 1), rec(`d${d}`, 1, { sessionId: "sess-2" })]);
+    expect((await ledger.claim(input)).kind).toBe("claimed");
+    // The same corrupt shard under a LIVE record still fails closed.
+    const bad = claimInput("b-live", [rec(`d${d}`, 1)]);
+    await expect(ledger.claim(bad)).rejects.toMatchObject({ code: "ledger_revision_index_invalid" });
   });
 
   test("commit: a missing claim is answered as ledger_no_claim even when the fence read also fails", async () => {
@@ -207,6 +253,40 @@ describe("reshardRevisions (64 -> 4096 shards)", () => {
     const k2 = legacyKey("q2-other");
     await store.put(objectKey(k2), enc.encode(JSON.stringify({ v: 1, originId: "origin-2", shard: /r=([0-9a-f]{2})\.json$/.exec(k2)![1], records: { "q2-other": [1, null, null, null, 0, 0] } })), { contentType: "application/json" });
     expect(await reshardRevisions(store, ROOT, { prefix, execute: true })).toMatchObject({ legacy_shards: 2, invalid: 2, merged: 0 });
+  });
+
+  test("verify: before execute every live legacy entry is missing; after execute none is; forgotten entries pass", async () => {
+    const store = fresh();
+    await seedLegacy(store, { v1: [2, "v1:r2", hex("v1"), SK1, 0, 0], v2: [1, "v2:r1", hex("v2"), SK1, 0, 0], g1: [1, "g1:r1", hex("g1"), SK2, 0, 0] });
+    await s3Ledger(store, ROOT, noSleep).setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "sess-2"]], enabled: false });
+    const puts: string[] = [];
+    const before = await reshardRevisions(logged(store, puts), ROOT, { prefix, execute: false, verify: true });
+    expect(before).toMatchObject({ entries: 3, verified: 1, missing: 2, invalid: 0, failed: 0 }); // g1: forgotten
+    expect(puts.filter((l) => l.startsWith("put "))).toEqual([]); // verify is read-only
+    await reshardRevisions(store, ROOT, { prefix, execute: true });
+    expect(await reshardRevisions(store, ROOT, { prefix, execute: false, verify: true })).toMatchObject({ entries: 3, verified: 3, missing: 0 });
+  });
+
+  test("verify: a new-layout entry at a LOWER revision of the same generation is missing", async () => {
+    const store = fresh();
+    await seedLegacy(store, { w: [5, "w:r5", hex("w5"), SK1, 0, 0] });
+    await s3LedgerObjects(store, ROOT).mergeIndex(keys.revisions(ORIGIN, "w"), (await import("../ledger-s3.ts")).newFence(), ORIGIN,
+      [{ recordId: "w", revision: 2, revisionId: "w:r2", digest: hex("w2"), sessionKey: SK1, epoch: 0, resets: 0 }]);
+    expect(await reshardRevisions(store, ROOT, { prefix, execute: false, verify: true })).toMatchObject({ verified: 0, missing: 1 });
+  });
+
+  test("execute and verify together are refused", async () => {
+    await expect(reshardRevisions(fresh(), ROOT, { prefix, execute: true, verify: true })).rejects.toThrow("reshard_mode_refused");
+  });
+
+  test("--org keeps its trailing slash: org-a does not pick up org-ab's shards", async () => {
+    const store = fresh();
+    await seedLegacy(store, { o1: [1, "o1:r1", hex("o1"), SK1, 0, 0] });
+    const other = s3LedgerKeys(ROOT, { ...TENANT, orgId: `${TENANT.orgId}b` });
+    const ok = other.revisionShard(ORIGIN, legacyShard("o2"));
+    await store.put(objectKey(ok), enc.encode(JSON.stringify({ v: 1, originId: ORIGIN, shard: legacyShard("o2"), records: { o2: [1, null, null, null, 0, 0] } })), { contentType: "application/json" });
+    expect(ok.startsWith(`${ROOT}/.admission-inbox/${TENANT.orgId}b/`)).toBe(true);
+    expect(await reshardRevisions(store, ROOT, { prefix, execute: false })).toMatchObject({ legacy_shards: 1, entries: 1 });
   });
 
   test("a prefix outside the admission inbox is refused", async () => {
