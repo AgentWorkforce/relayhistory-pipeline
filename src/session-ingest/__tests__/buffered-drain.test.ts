@@ -802,6 +802,8 @@ describe("buffered backlog drain (0005)", () => {
     const saved = readFileSyncFs(checkpoint, "utf8").trim();
     expect(saved.endsWith(ACCEPTED_SUFFIX)).toBe(true); // a group's last listed key is its sidecar
     expect(validResumeKey(saved)).toBe(true);
+    // A group can also end on the export's create-only superseded record (finding 7).
+    expect(validResumeKey(saved.slice(0, -ACCEPTED_SUFFIX.length) + ".superseded.json")).toBe(true);
     const rest = await runDrain(args([]), deps);
     expect(rest.objects).toMatchObject({ drained: 2, already_drained: 0 });
     expect((await canonical(store)).size).toBe(3);

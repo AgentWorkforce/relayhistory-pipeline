@@ -101,6 +101,12 @@ export const DRAINED_SUFFIX = ".drained.json";
  * writes ONLY stages with a sidecar naming their exact bytes, and none of an org without a completion object.
  */
 export const ACCEPTED_SUFFIX = ".accepted.json";
+/**
+ * Create-only `<stage key>.superseded.json` (accepted-stage-export.ts): the stage left SQL's candidate set after an
+ * earlier export wrote its sidecar. The drain never writes a superseded stage (`stage_superseded`), whatever its sidecar.
+ */
+export const SUPERSEDED_SUFFIX = ".superseded.json";
+export interface SupersededRecord { v: 1; kind: "buffered-superseded"; stage_sha256: string }
 export const acceptedCompleteKey = (keyRoot: string, orgId: string) => `${keyRoot}/.drain/accepted-stages/v1/${orgId}.complete.json`;
 /**
  * The export's verdict for one stage (v2, accepted-stage-export.ts): SQL's own liveness test, the lines SQL keeps
@@ -329,6 +335,7 @@ export type ObjectOutcome =
   | "stage_export_missing"
   | "accepted_mismatch"
   | "stage_not_live"
+  | "stage_superseded"
   | "fence_moved_since_export"
   | "marker_failed"
   | "internal_error";
@@ -336,7 +343,7 @@ export type ObjectOutcome =
 const OUTCOMES: ObjectOutcome[] = [
   "drained", "would_drain", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch",
   "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "control_pending", "fence_authority_missing", "fence_authority_invalid", "user_hold", "user_stopped", "hold_failed", "lock_lost", "index_unreadable", "write_failed",
-  "index_merge_failed", "fence_recheck_failed", "fence_moved", "stage_unacknowledged", "stage_export_missing", "accepted_mismatch", "stage_not_live", "fence_moved_since_export", "marker_failed", "internal_error",
+  "index_merge_failed", "fence_recheck_failed", "fence_moved", "stage_unacknowledged", "stage_export_missing", "accepted_mismatch", "stage_not_live", "stage_superseded", "fence_moved_since_export", "marker_failed", "internal_error",
 ];
 
 export interface DrainSummary {
@@ -463,6 +470,8 @@ interface BatchGroup {
   markers: Set<string>;
   /** Staged keys with an accepted-stage sidecar (0005 step 0b). */
   accepted: Set<string>;
+  /** Staged keys the export superseded (left SQL's candidate set after an earlier sidecar): never written. */
+  superseded: Set<string>;
   /** Whether this org's accepted-stage export completed (its completion object exists and is valid). */
   exportComplete: boolean;
   /** The org's fence authority, as admission requires it (ledger-s3 requireFenceAuthority). */
@@ -512,7 +521,7 @@ async function* batchGroups(store: ObjectStore, prefix: string, startAfter: stri
     for (const item of page.items) {
       const key = String(item.key);
       if (startAfter !== undefined && key <= startAfter) continue;
-      const suffix = key.endsWith(DRAINED_SUFFIX) ? DRAINED_SUFFIX : key.endsWith(ACCEPTED_SUFFIX) ? ACCEPTED_SUFFIX : "";
+      const suffix = [DRAINED_SUFFIX, ACCEPTED_SUFFIX, SUPERSEDED_SUFFIX].find((x) => key.endsWith(x)) ?? "";
       const staged = suffix ? key.slice(0, -suffix.length) : key;
       const parts = parseStagedKey(staged);
       if (!parts) {
@@ -524,10 +533,11 @@ async function* batchGroups(store: ObjectStore, prefix: string, startAfter: stri
         yield current;
         current = null;
       }
-      current ??= { id, staged: [], markers: new Set(), accepted: new Set(), exportComplete, authority, lastKey: key };
+      current ??= { id, staged: [], markers: new Set(), accepted: new Set(), superseded: new Set(), exportComplete, authority, lastKey: key };
       current.lastKey = key;
       if (!suffix) current.staged.push(key);
       else if (suffix === DRAINED_SUFFIX) current.markers.add(staged);
+      else if (suffix === SUPERSEDED_SUFFIX) current.superseded.add(staged);
       else current.accepted.add(staged);
     }
   } while (cursor);
@@ -907,8 +917,8 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     // Read every candidate, then decide per claim token (GC replacement detection).
     const reads = new Map<string, Read>();
     // Re-read (at most every AUTHORITY_TTL_MS): deleting the org's or the global marker stops the run's writes.
-    const authority = opts.dryRun ? group.authority : await currentAuthority(parseStagedKey(group.lastKey.replace(/\.(drained|accepted)\.json$/, ""))!.orgId);
-    const candidate = (key: string) => !group.markers.has(key) && group.exportComplete && group.accepted.has(key) && (opts.dryRun || authority === "ok");
+    const authority = opts.dryRun ? group.authority : await currentAuthority(parseStagedKey(group.lastKey.replace(/\.(drained|accepted|superseded)\.json$/, ""))!.orgId);
+    const candidate = (key: string) => !group.markers.has(key) && group.exportComplete && group.accepted.has(key) && !group.superseded.has(key) && (opts.dryRun || authority === "ok");
     for (const key of group.staged) {
       if (!candidate(key)) continue;
       try {
@@ -935,6 +945,11 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       }
       if (!group.accepted.has(key)) {
         summary.objects.stage_unacknowledged++;
+        continue;
+      }
+      // The export found this stage no longer a candidate after it had written a sidecar: never written, never read.
+      if (group.superseded.has(key)) {
+        summary.objects.stage_superseded++;
         continue;
       }
       const read = reads.get(key)!;

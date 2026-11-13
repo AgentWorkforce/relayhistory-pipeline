@@ -22,16 +22,33 @@
  *                   - a group is kept only when all its lines are one session, and (outside lazy) all are live;
  *                     under lazy each live line counts.
  *                 Two inputs the reader takes from its caller are derived here: the admission epoch is the lazy
- *                 policy's control epoch, and the admission version is the user's latest `ingest_control_receipts`
- *                 version in that epoch (0 with none). The claim-sessions side-row check applies when its reader
- *                 gate is on, as in the reader. Any divergence makes a stage NOT live, never live.
+ *                 policy's control epoch, and the admission version is the user's mirrored current control head
+ *                 (`ingest_source_control_heads`), never max(receipts) (see `the gate`). The claim-sessions side-row
+ *                 check applies as in the reader; the export refuses to run with that reader gate off
+ *                 (`export_claim_sessions_gate_off`), because the reader then answers from 047010's fallback, which
+ *                 is not transcribed here. Any divergence makes a stage NOT live, never live.
+ *   the gate      the reader's PER-USER gate (`owner_buffered_read_scope`, 20261105043700), read-only, per user: the
+ *                 privacy authority not fenced; the lazy policy valid now; the mirrored head at the policy's control
+ *                 epoch and not pending, with `owner_buffered_parity_expected` (reused as is) proving receipts exactly
+ *                 1..version at that epoch with the head's tip digest and kind and none on another epoch; an absent
+ *                 head counts as version 0 only while the privacy authority is ACTIVE (its heads are authoritative),
+ *                 else it is unproven; and the owner's G2 parity row matching that head and the deletion-set,
+ *                 reset-set and lineage digests recomputed now. A closed gate is not live, counted by reason
+ *                 (`gated`). The export role must be able to run the owner-only parity function (the owner login).
  *   the S3 fence  the user's S3 fence as the export saw it (instance, resets, resetsCompleted, and the epoch of every
- *                 kept session): the drain refuses a stage when any of these has moved since (`fence_moved_since_export`),
- *                 so a control that lands between export and drain is honoured exactly.
+ *                 kept session), read BEFORE the SQL snapshot of the verdict (a candidate page lists the users first):
+ *                 the drain refuses a stage when any of these has moved since (`fence_moved_since_export`), so a
+ *                 control that lands after the fence read, during the snapshot or before the drain, is honoured. A
+ *                 row whose user was not read first (it entered the page range in between) is `fence_late`: no
+ *                 sidecar, and the org stays incomplete.
  *   per stage     a sidecar `<stage key>.accepted.json` (v2): {stage_sha256, live, kept: per object group the line
  *                 indexes SQL keeps, fence}. Replaced by CAS when a rerun's verdict differs.
+ *   superseded    a create-only `<stage key>.superseded.json` for an earlier LIVE sidecar whose stage is no longer a
+ *                 candidate (its outbox row erased or replaced, its receipt or batch no longer accepted): the drain
+ *                 never writes a superseded stage (`stage_superseded`). Never deleted or undone.
  *   per org       `<keyRoot>/.drain/accepted-stages/v1/<org>.complete.json`, create-only, once every candidate stage
- *                 of the org has its verdict. Without it the drain writes nothing of the org.
+ *                 of the org has its verdict and its stale sidecars are superseded. Without it the drain writes
+ *                 nothing of the org.
  *
  * One export at a time: an --execute run holds a fenced lease (`.drain/export-lock.json`, as the drain's).
  *
@@ -39,7 +56,9 @@
  *   - a GC swap after the export: the replacement has no sidecar (`stage_unacknowledged`), and the original, once its
  *     key is a redaction barrier, is `redacted`; a GC that dropped lines because of a deletion moved the S3 fence too.
  *   - an outbox erased after the export (a user erase): the erase deletes the user's S3 fence, so the drain refuses
- *     the user (`fence_absent`).
+ *     the user (`fence_absent`); the next export also supersedes the stage's sidecar.
+ *   - an org with no stage intent left in SQL is not visited by the stale pass unless named with --org (its users'
+ *     erase deleted their fences: `fence_absent`).
  *
  * SQL: every page is its own short `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` transaction, checked with
  * `SHOW transaction_read_only` and always ended by ROLLBACK; SELECTs only, keyset-paged by stage key, optionally scoped
@@ -48,8 +67,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore, type ObjectVersion } from "../shared/vendor.ts";
 import {
-  ACCEPTED_SUFFIX, acceptedCompleteKey, acquireDrainLock, assertDrainUnlocked, parseAcceptedComplete, parseAcceptedMarker, parseStagedKey,
-  DRAIN_LOCK_TTL_MS, type AcceptedComplete, type AcceptedMarker, type DrainLease,
+  ACCEPTED_SUFFIX, SUPERSEDED_SUFFIX, acceptedCompleteKey, acquireDrainLock, assertDrainUnlocked, parseAcceptedComplete, parseAcceptedMarker, parseStagedKey,
+  DRAIN_LOCK_TTL_MS, type AcceptedComplete, type AcceptedMarker, type DrainLease, type SupersededRecord,
 } from "./buffered-drain.ts";
 import { fenceEpoch, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "./ledger-s3.ts";
 import { liveMachineId } from "./writer.ts";
@@ -80,6 +99,17 @@ export interface ExportOptions {
   lockTtlMs?: number;
 }
 
+/** Why the reader's per-user gate is closed (closed codes, from VERDICT_PAGE's `gate`). */
+export const GATE_REASONS = ["privacy_fenced", "policy_invalid", "head_unproven", "head_pending", "head_foreign_epoch", "receipts_mismatch", "parity_missing", "parity_mismatch"] as const;
+export type GateReason = (typeof GATE_REASONS)[number];
+
+export class ExportError extends Error {
+  constructor(readonly code: "export_claim_sessions_gate_off") {
+    super(code);
+    this.name = "ExportError";
+  }
+}
+
 export interface ExportSummary {
   mode: "dry_run" | "execute";
   /** Candidate stages (active, acknowledged, of a committed buffered batch). */
@@ -96,8 +126,49 @@ export interface ExportSummary {
   /** A row whose stage key, tenant or sha does not bind (never written). */
   invalid: number;
   failed: number;
+  /** Not live because the reader's per-user gate is closed, by reason (stages, not users). */
+  gated: Partial<Record<GateReason, number>>;
+  /**
+   * A row of a user whose S3 fence was not read before the verdict snapshot (the stage entered the page range between
+   * the two reads): no sidecar, and the org stays incomplete until a rerun.
+   */
+  fence_late: number;
+  /** Earlier live sidecars of stages no longer candidates: create-only superseded records written / that would be. */
+  superseded: number;
+  would_supersede: number;
   orgs: { complete: number; would_complete: number; already_complete: number; incomplete: number };
 }
+
+/** The candidate stages: active, acknowledged, not redacted, of a committed buffered batch (one definition, three uses). */
+const CANDIDATE_FROM = `
+    FROM sessions.ingest_buffer_outbox AS o
+    JOIN sessions.ingest_stage_intents AS s ON s.stage_token = o.active_stage_token
+    JOIN sessions.ingest_claim_attempts AS a ON a.claim_token = s.claim_token
+    JOIN sessions.ingest_batches AS b
+      ON b.org_id = o.org_id AND b.workspace_id = o.workspace_id AND b.origin_id = o.origin_id AND b.batch_id = o.batch_id
+   WHERE o.state = 'buffered' AND s.receipt_state = 'acknowledged' AND s.cleanup_state <> 'redacted'
+     AND b.state = 'committed' AND b.digest = o.digest`;
+
+/** The reader's v2 claim-sessions gate (044090): the export only runs while it is on (finding 5). */
+export const CLAIM_SESSIONS_GATE = `
+SELECT coalesce(bool_or(cp.read_enabled AND cp.write_enabled AND cp.backfill_complete_at IS NOT NULL), false) AS v2
+  FROM sessions.ingest_claim_sessions_policy AS cp WHERE cp.singleton`;
+
+/**
+ * A page's candidate keys and users, BEFORE the verdict snapshot (finding 6): the export reads these users' S3 fences
+ * first, then takes SQL's verdict over the same key range.
+ */
+export const CANDIDATE_PAGE = `
+SELECT s.stage_key, s.org_id, s.workspace_id, s.user_id${CANDIDATE_FROM}
+     AND ($1::text[] IS NULL OR o.org_id = ANY($1::text[]))
+     AND s.stage_key > $2::text
+   ORDER BY s.stage_key
+   LIMIT $3::int`;
+
+/** Which of these stage keys are candidates now (the stale-sidecar pass, finding 7). */
+export const CANDIDATES_IN = `
+SELECT s.stage_key${CANDIDATE_FROM}
+     AND s.stage_key = ANY($1::text[])`;
 
 /** Orgs with any stage at all, so an org whose stages were all refused still completes (with 0). */
 const ORGS = `
@@ -114,6 +185,10 @@ WITH pol AS MATERIALIZED (
   SELECT EXISTS (SELECT 1 FROM sessions.ingest_lazy_policy AS lp WHERE lp.singleton) AS lazy,
          (SELECT lp.source_identity_sha256 FROM sessions.ingest_lazy_policy AS lp WHERE lp.singleton) AS pol_identity,
          (SELECT lp.control_epoch FROM sessions.ingest_lazy_policy AS lp WHERE lp.singleton) AS pol_epoch,
+         (SELECT lp.privacy_baseline_sha256 FROM sessions.ingest_lazy_policy AS lp WHERE lp.singleton) AS pol_baseline,
+         EXISTS (SELECT 1 FROM sessions.ingest_lazy_policy AS lp WHERE lp.singleton AND lp.valid_until > clock_timestamp()) AS pol_valid,
+         EXISTS (SELECT 1 FROM sessions.ingest_privacy_authority AS pa WHERE pa.singleton AND pa.state = 'fenced') AS authority_fenced,
+         EXISTS (SELECT 1 FROM sessions.ingest_privacy_authority AS pa WHERE pa.singleton AND pa.state = 'active') AS authority_active,
          (SELECT ck.control_epoch FROM sessions.ingest_receipt_seat_clock AS ck WHERE ck.singleton) AS clock_epoch,
          (SELECT ck.source_identity_sha256 FROM sessions.ingest_receipt_seat_clock AS ck WHERE ck.singleton) AS clock_identity,
          coalesce((SELECT bool_or(cp.read_enabled AND cp.write_enabled AND cp.backfill_complete_at IS NOT NULL)
@@ -130,28 +205,57 @@ WITH pol AS MATERIALIZED (
           AND b.user_id = s.user_id AND b.publication_state = 'buffered' AND b.committed_at IS NOT NULL
           AND jsonb_typeof(a.records) = 'array' AND jsonb_typeof(a.epochs) = 'array'
           AND jsonb_typeof(s.group_ordinals) = 'array' AND a.reset_epoch IS NOT NULL) AS shape_ok
-    FROM sessions.ingest_buffer_outbox AS o
-    JOIN sessions.ingest_stage_intents AS s ON s.stage_token = o.active_stage_token
-    JOIN sessions.ingest_claim_attempts AS a ON a.claim_token = s.claim_token
-    JOIN sessions.ingest_batches AS b
-      ON b.org_id = o.org_id AND b.workspace_id = o.workspace_id AND b.origin_id = o.origin_id AND b.batch_id = o.batch_id
-   WHERE o.state = 'buffered' AND s.receipt_state = 'acknowledged' AND s.cleanup_state <> 'redacted'
-     AND b.state = 'committed' AND b.digest = o.digest
+${CANDIDATE_FROM}
      AND ($1::text[] IS NULL OR o.org_id = ANY($1::text[]))
-     AND s.stage_key > $2::text
+     AND s.stage_key > $2::text AND s.stage_key <= $4::text
    ORDER BY s.stage_key
    LIMIT $3::int
+), users AS MATERIALIZED (
+  SELECT DISTINCT c.org_id, c.workspace_id, c.user_id FROM cand AS c
+), gate AS MATERIALIZED (
+  -- The reader's per-user gate (owner_buffered_read_scope, 20261105043700) and its control head, per user, read-only.
+  -- The head is the mirrored current head (ingest_source_control_heads), never max(receipts): it must be at the
+  -- policy's control epoch and not pending, and owner_buffered_parity_expected (reused as is) must prove the user's
+  -- receipts are exactly 1..version at that epoch with the head's tip digest and kind, and none on another epoch. An
+  -- absent head is version 0 only when proven absent: the privacy authority is ACTIVE (its heads are authoritative).
+  -- Then the owner's G2 parity row must match that head and the digests recomputed now. The first failing check names
+  -- the reason; a NULL reason is an open gate.
+  SELECT u.org_id, u.workspace_id, u.user_id, coalesce(h.version, 0) AS head_version,
+         CASE
+           WHEN pol.authority_fenced THEN 'privacy_fenced'
+           WHEN NOT pol.pol_valid OR pol.pol_epoch IS NULL OR pol.pol_baseline IS NULL THEN 'policy_invalid'
+           WHEN h.org_id IS NULL AND NOT pol.authority_active THEN 'head_unproven'
+           WHEN h.pending IS NOT FALSE AND h.org_id IS NOT NULL THEN 'head_pending'
+           WHEN h.org_id IS NOT NULL AND h.epoch IS DISTINCT FROM pol.pol_epoch THEN 'head_foreign_epoch'
+           WHEN NOT coalesce(x.receipts_ok, false) THEN 'receipts_mismatch'
+           WHEN par.org_id IS NULL THEN 'parity_missing'
+           WHEN NOT coalesce(x.target_generation IS NOT NULL
+             AND par.cutover_epoch = pol.pol_epoch AND par.privacy_baseline_sha256 = pol.pol_baseline
+             AND par.no_head = (h.org_id IS NULL)
+             AND par.head_epoch IS NOT DISTINCT FROM h.epoch AND par.head_version IS NOT DISTINCT FROM h.version
+             AND par.head_digest IS NOT DISTINCT FROM h.digest AND par.head_kind IS NOT DISTINCT FROM h.kind
+             AND par.target_generation = x.target_generation
+             AND par.deletion_set_digest = x.deletion_set_digest AND par.reset_set_digest = x.reset_set_digest
+             AND par.target_lineage_digest = x.target_lineage_digest, false) THEN 'parity_mismatch'
+           ELSE NULL
+         END AS gate_reason
+    FROM users AS u CROSS JOIN pol
+    LEFT JOIN sessions.ingest_source_control_heads AS h
+      ON h.org_id = u.org_id AND h.workspace_id = u.workspace_id AND h.user_id = u.user_id
+    LEFT JOIN sessions.owner_buffered_parity AS par
+      ON par.org_id = u.org_id AND par.workspace_id = u.workspace_id AND par.user_id = u.user_id
+    LEFT JOIN LATERAL sessions.owner_buffered_parity_expected(u.org_id, u.workspace_id, u.user_id, pol.pol_epoch,
+                                                              h.version, h.digest, h.kind) AS x ON true
 ), stg AS MATERIALIZED (
   SELECT c.*, pol.lazy, pol.pol_identity, pol.pol_epoch, pol.clock_epoch, pol.clock_identity, pol.v2,
          (SELECT count(*) FROM sessions.upload_resets AS ur
            WHERE ur.org_id = c.org_id AND ur.workspace_id = c.workspace_id AND ur.user_id = c.user_id) AS resets,
-         coalesce((SELECT max(r.version) FROM sessions.ingest_control_receipts AS r
-                    WHERE r.org_id = c.org_id AND r.workspace_id = c.workspace_id AND r.user_id = c.user_id
-                      AND r.epoch = pol.pol_epoch), 0) AS head_version
+         g.head_version, g.gate_reason
     FROM cand AS c CROSS JOIN pol
+    JOIN gate AS g ON g.org_id = c.org_id AND g.workspace_id = c.workspace_id AND g.user_id = c.user_id
 ), stage_ok AS (
   SELECT st.stage_token,
-         coalesce(st.shape_ok AND st.resets = st.reset_epoch
+         coalesce(st.gate_reason IS NULL AND st.shape_ok AND st.resets = st.reset_epoch
            AND NOT EXISTS (SELECT 1 FROM sessions.upload_resets AS ur
                             WHERE ur.org_id = st.org_id AND ur.workspace_id = st.workspace_id AND ur.user_id = st.user_id
                               AND (ur.reset_at IS NULL OR ur.reset_at >= st.committed_at))
@@ -257,7 +361,7 @@ WITH pol AS MATERIALIZED (
      AND (st.lazy OR count(*) FILTER (WHERE j.live) = count(*))
 )
 SELECT st.stage_key, st.stage_sha256, st.claim_token::text AS claim_token, st.org_id, st.workspace_id, st.user_id,
-       st.origin_id, st.digest, st.group_ordinals,
+       st.origin_id, st.digest, st.group_ordinals, st.v2, st.gate_reason,
        (so.ok AND NOT EXISTS (SELECT 1 FROM bad_stage AS bs WHERE bs.stage_token = st.stage_token)) AS stage_ok,
        coalesce((SELECT jsonb_agg(jsonb_build_object('group', k.group_index, 'ords', to_jsonb(k.ords), 'source', k.source, 'session', k.session_id))
                    FROM kept AS k WHERE k.stage_token = st.stage_token), '[]'::jsonb) AS kept
@@ -320,7 +424,7 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
   const io = s3LedgerObjects(store, opts.keyRoot);
   const summary: ExportSummary = {
     mode: opts.dryRun ? "dry_run" : "execute", rows: 0, live: 0, not_live: 0, fence_absent: 0,
-    written: 0, updated: 0, already: 0, would_write: 0, invalid: 0, failed: 0,
+    written: 0, updated: 0, already: 0, would_write: 0, invalid: 0, failed: 0, gated: {}, fence_late: 0, superseded: 0, would_supersede: 0,
     orgs: { complete: 0, would_complete: 0, already_complete: 0, incomplete: 0 },
   };
   const perOrg = new Map<string, { stages: number; bad: boolean }>();
@@ -348,7 +452,13 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
   const leaseOk = () => opts.dryRun || (lease !== undefined && lease.alive());
 
   try {
-    for (const r of (await readOnly(() => sql.query(ORGS, [orgScope]))).rows)
+    const orgRows = await readOnly(async () => {
+      // Finding 5: with the v2 claim-sessions reader gate off, the reader answers from 047010's fallback, which this
+      // export does not transcribe. Refuse before any write rather than claim equivalence.
+      if ((await sql.query(CLAIM_SESSIONS_GATE)).rows[0]?.v2 !== true) throw new ExportError("export_claim_sessions_gate_off");
+      return (await sql.query(ORGS, [orgScope])).rows;
+    });
+    for (const r of orgRows)
       if (typeof r.org_id === "string") perOrg.set(r.org_id, { stages: 0, bad: !ORG.test(r.org_id) });
     /** The user's S3 fence, once per page per user (the backfill wrote it; absent means not backfilled). */
     let fences = new Map<string, Promise<FenceDoc | null | "invalid">>();
@@ -366,10 +476,25 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
     };
     let cursor = "";
     for (;;) {
-      const rows = (await readOnly(() => sql.query(VERDICT_PAGE, [orgScope, cursor, pageSize]))).rows;
-      if (!rows.length) break;
-      cursor = String(rows[rows.length - 1]!.stage_key);
+      // Finding 6: the page's users and their S3 fences FIRST, then SQL's verdict over the same key range. A control
+      // landing after the fence read moves the fence past what the sidecar records, so the drain refuses
+      // (fence_moved_since_export); read the other way round, the sidecar could carry the post-control fence beside a
+      // pre-control verdict.
+      const page = (await readOnly(() => sql.query(CANDIDATE_PAGE, [orgScope, cursor, pageSize]))).rows;
+      if (!page.length) break;
+      const upper = String(page[page.length - 1]!.stage_key);
       fences = new Map();
+      const userKey = (r: Record<string, unknown>) => JSON.stringify([r.org_id, r.workspace_id, r.user_id]);
+      const preRead = new Set<string>();
+      await mapLimit([...new Map(page.map((r) => [userKey(r), r])).values()], concurrency, async (r) => {
+        if (typeof r.org_id !== "string" || typeof r.workspace_id !== "string" || typeof r.user_id !== "string") return;
+        preRead.add(userKey(r));
+        await fenceOf(r.org_id, r.workspace_id, r.user_id);
+      });
+      const rows = (await readOnly(() => sql.query(VERDICT_PAGE, [orgScope, cursor, pageSize, upper]))).rows;
+      // The v2 gate turned off mid-export: stop before writing this page.
+      if (rows.some((r) => r.v2 !== true)) throw new ExportError("export_claim_sessions_gate_off");
+      cursor = rows.length ? String(rows[rows.length - 1]!.stage_key) : upper;
       await mapLimit(rows, concurrency, async (r) => {
         summary.rows++;
         const org = typeof r.org_id === "string" ? r.org_id : "";
@@ -381,9 +506,20 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
           tally.bad = true;
           return;
         }
+        if (!preRead.has(userKey(r))) {
+          summary.fence_late++;
+          tally.bad = true;
+          return;
+        }
         const keptRows = (Array.isArray(r.kept) ? r.kept : []) as { group: number; ords: number[]; source: string; session: string }[];
         const lines = keptLines(r.group_ordinals, keptRows);
-        const live = r.stage_ok === true && lines !== null && lines.some((l) => l.length > 0);
+        // Finding 3: a closed per-user gate is not live (r.stage_ok is false then too), counted by reason.
+        const gate = typeof r.gate_reason === "string" ? r.gate_reason : null;
+        if (gate !== null) {
+          const reason = (GATE_REASONS as readonly string[]).includes(gate) ? (gate as GateReason) : "parity_mismatch";
+          summary.gated[reason] = (summary.gated[reason] ?? 0) + 1;
+        }
+        const live = gate === null && r.stage_ok === true && lines !== null && lines.some((l) => l.length > 0);
         let fenceView: AcceptedMarker["fence"] = null;
         if (live) {
           const fence = await fenceOf(org, r.workspace_id as string, r.user_id as string);
@@ -429,6 +565,21 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
         }
       });
     }
+    // Finding 7: an earlier export's LIVE sidecar whose stage is no longer a candidate (its outbox row erased or
+    // replaced, its receipt or batch no longer accepted) gets a create-only superseded record, which the drain honours
+    // over any sidecar (stage_superseded). Never deleted, never undone. Before the completion objects, so a failure
+    // here leaves a first completion unwritten.
+    // Every org SQL still names, and every org the operator scoped (one with no stage intent left in SQL included).
+    for (const org of [...new Set([...perOrg.keys(), ...(orgScope ?? [])])].sort()) {
+      if (!ORG.test(org)) continue;
+      try {
+        await supersedeStale(org);
+      } catch {
+        summary.failed++;
+        const tally = perOrg.get(org);
+        if (tally) tally.bad = true;
+      }
+    }
     // Completion objects, create-only (finding 9), after every candidate stage of the org has its verdict.
     for (const [org, t] of [...perOrg].sort(([a], [b]) => (a < b ? -1 : 1))) {
       if (t.bad || !ORG.test(org)) {
@@ -460,6 +611,61 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
     await lease?.release();
   }
   return summary;
+
+  /** The stale-sidecar pass for one org: list its sidecars, ask SQL which stages are still candidates, supersede the rest. */
+  async function supersedeStale(org: string): Promise<void> {
+    // The listing is on a `/` boundary (object-store list), so this prefix is exactly the org's staged objects.
+    const prefix = `${opts.keyRoot}/${org}/buffered-batches/v1`;
+    // Per stage key: has a sidecar / a superseded record (they list right after the stage, in key order).
+    let batch: string[] = [];
+    const superseded = new Set<string>();
+    const flush = async () => {
+      const keys = batch.filter((k) => !superseded.has(k));
+      batch = [];
+      if (!keys.length) return;
+      const live: { key: string; sha: string }[] = [];
+      for (const k of keys) {
+        const got = await readMarker(store, k + ACCEPTED_SUFFIX);
+        if (got === "invalid") throw new Error("export_sidecar_invalid");
+        if (got && got.doc.live) live.push({ key: k, sha: got.doc.stage_sha256 });
+      }
+      if (!live.length) return;
+      const still = new Set((await readOnly(() => sql.query(CANDIDATES_IN, [live.map((l) => l.key)]))).rows.map((r) => String(r.stage_key)));
+      for (const l of live) {
+        if (still.has(l.key)) continue;
+        if (opts.dryRun) {
+          summary.would_supersede++;
+          continue;
+        }
+        if (!leaseOk()) throw new Error("export_lock_lost");
+        const doc: SupersededRecord = { v: 1, kind: "buffered-superseded", stage_sha256: l.sha };
+        try {
+          await store.put(objectKey(l.key + SUPERSEDED_SUFFIX), encoder.encode(JSON.stringify(doc)), { ifNoneMatch: true, contentType: "application/json" });
+          summary.superseded++;
+        } catch (error) {
+          // Already superseded (an earlier run, or a lost response): it is there either way.
+          if (!isObjectStoreError(error, "already_exists") && !isObjectStoreError(error, "precondition_failed")) throw error;
+        }
+      }
+    };
+    let cursor: string | undefined;
+    do {
+      const listed = await store.list(objectKey(prefix), cursor);
+      cursor = listed.nextCursor;
+      for (const item of listed.items) {
+        const key = String(item.key);
+        if (key.endsWith(SUPERSEDED_SUFFIX)) superseded.add(key.slice(0, -SUPERSEDED_SUFFIX.length));
+        else if (key.endsWith(ACCEPTED_SUFFIX)) {
+          const stage = key.slice(0, -ACCEPTED_SUFFIX.length);
+          if (parseStagedKey(stage)?.orgId === org) batch.push(stage);
+        }
+      }
+      // A stage's superseded record lists right after its sidecar, possibly on the next listing page: `superseded` only
+      // saves a write, the create-only put is what makes a second record impossible.
+      if (batch.length >= pageSize) await flush();
+    } while (cursor);
+    await flush();
+  }
 }
 
 async function readMarker(store: ObjectStore, key: string): Promise<{ doc: AcceptedMarker; version: ObjectVersion } | "invalid" | null> {

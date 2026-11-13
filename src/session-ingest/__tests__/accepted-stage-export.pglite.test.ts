@@ -6,7 +6,7 @@ import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import { exportAcceptedStages, exportLockKey, type ExportOptions, type ExportSql } from "../accepted-stage-export.ts";
-import { ACCEPTED_SUFFIX, acceptedCompleteKey, acquireDrainLock, drainBufferedBatches, parseAcceptedComplete, parseAcceptedMarker } from "../buffered-drain.ts";
+import { ACCEPTED_SUFFIX, SUPERSEDED_SUFFIX, acceptedCompleteKey, acquireDrainLock, drainBufferedBatches, parseAcceptedComplete, parseAcceptedMarker } from "../buffered-drain.ts";
 import { applyFenceChange, fenceEpoch, orgFenceAuthorityKey, s3LedgerKeys, s3LedgerObjects, sessionKeyHash } from "../ledger-s3.ts";
 import { BUFFER_STAGE_MAX_BYTES, prepareBufferedStage, putBufferedStage, stagedKey } from "../staging.ts";
 import type { Group } from "../writer.ts";
@@ -38,8 +38,51 @@ beforeAll(async () => {
     [GEN, POLICY_IDENTITY, POLICY_EPOCH]);
   await db.query(`INSERT INTO sessions.ingest_receipt_seat_clock (singleton, control_epoch, source_identity_sha256, allocated_high_water, last_seat, baseline, initial_generation)
       VALUES (true, $1, $2, 0, 0, '{}', $3)`, [CLOCK_EPOCH, CLOCK_IDENTITY, GEN]);
+  // The reader's per-user gate (owner_buffered_read_scope) holds by default: the role-validation PASS generation (made by
+  // the migrator outside the migration set), an ACTIVE privacy authority (so an absent control head is proven absent),
+  // and the v2 claim-sessions reader gate on.
+  await db.exec(`CREATE TABLE sessions.__96bulls_role_validation(name text PRIMARY KEY, generation text, status text);
+    INSERT INTO sessions.__96bulls_role_validation VALUES ('session_directory_search_worker', '${GEN}', 'pass')`);
+  await db.exec("UPDATE sessions.ingest_claim_sessions_policy SET write_enabled = true, backfill_complete_at = now(), read_enabled = true");
   await db.exec("SET session_replication_role = origin");
+  await setAuthority("active");
 });
+/** The privacy authority singleton: 'active' (default), 'fenced', or absent (Neon is the authority). */
+async function setAuthority(state: "active" | "fenced" | null) {
+  await db.exec("SET session_replication_role = replica");
+  await db.exec("DELETE FROM sessions.ingest_privacy_authority");
+  if (state === "active") await db.query("INSERT INTO sessions.ingest_privacy_authority (singleton, state, control_epoch, neon_fingerprint_sha256, activated_at) VALUES (true, 'active', $1, $2, now())", [POLICY_EPOCH, hex("6")]);
+  if (state === "fenced") await db.query("INSERT INTO sessions.ingest_privacy_authority (singleton, state, control_epoch) VALUES (true, 'fenced', $1)", [POLICY_EPOCH]);
+  await db.exec("SET session_replication_role = origin");
+}
+type Head = { version: number; digest: string; kind: "selection" | "reset"; epoch?: string; pending?: boolean };
+/** The mirrored control head (ingest_source_control_heads) and, unless `receipts: false`, receipts 1..version. */
+async function putHead(t: T, h: Head, o: { receipts?: { version: number; digest: string; kind: string; epoch?: string }[] } = {}) {
+  await db.exec("SET session_replication_role = replica");
+  await db.query(`INSERT INTO sessions.ingest_source_control_heads (org_id, workspace_id, user_id, epoch, version, digest, kind, payload, pending)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,'{}',$8)`, [t.orgId, t.workspaceId, t.userId, h.epoch ?? POLICY_EPOCH, h.version, h.digest, h.kind, h.pending ?? false]);
+  const receipts = o.receipts ?? Array.from({ length: h.version }, (_, i) => ({ version: i + 1, digest: i + 1 === h.version ? h.digest : hex("a"), kind: i + 1 === h.version ? h.kind : "selection" }));
+  for (const r of receipts)
+    await db.query(`INSERT INTO sessions.ingest_control_receipts (org_id, workspace_id, user_id, epoch, version, digest, kind, result, schema_generation)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,'{}',$8)`, [t.orgId, t.workspaceId, t.userId, r.epoch ?? POLICY_EPOCH, r.version, r.digest, r.kind, GEN]);
+  await db.exec("SET session_replication_role = origin");
+}
+/**
+ * The owner's G2 parity proof for the user, as the writer contract computes it (owner_buffered_parity_expected), bound
+ * to the user's mirrored head (or no head). Recomputed from SQL's current deletion and reset sets.
+ */
+async function prove(t: T) {
+  await db.exec("SET session_replication_role = replica");
+  await db.query("DELETE FROM sessions.owner_buffered_parity WHERE org_id = $1 AND workspace_id = $2 AND user_id = $3", [t.orgId, t.workspaceId, t.userId]);
+  await db.query(`INSERT INTO sessions.owner_buffered_parity (org_id, workspace_id, user_id, cutover_epoch, head_epoch, head_version, head_digest, head_kind, no_head,
+      privacy_baseline_sha256, deletion_set_digest, reset_set_digest, target_lineage_digest, target_generation)
+    SELECT $1, $2, $3, $4, h.epoch, h.version, h.digest, h.kind, h.org_id IS NULL, $5, e.deletion_set_digest, e.reset_set_digest, e.target_lineage_digest, e.target_generation
+      FROM (SELECT 1) AS one
+      LEFT JOIN sessions.ingest_source_control_heads AS h ON h.org_id = $1 AND h.workspace_id = $2 AND h.user_id = $3
+     CROSS JOIN LATERAL sessions.owner_buffered_parity_expected($1, $2, $3, $4, h.version, h.digest, h.kind) AS e`,
+    [t.orgId, t.workspaceId, t.userId, POLICY_EPOCH, GEN]);
+  await db.exec("SET session_replication_role = origin");
+}
 afterAll(async () => { await db.close(); });
 let cleanup: (() => void)[] = [];
 afterEach(async () => {
@@ -49,7 +92,12 @@ afterEach(async () => {
     DELETE FROM sessions.ingest_buffer_outbox; DELETE FROM sessions.ingest_lazy_ack_decisions; DELETE FROM sessions.ingest_lazy_native_slots;
     DELETE FROM sessions.ingest_receipt_seats; DELETE FROM sessions.ingest_stage_intents; DELETE FROM sessions.ingest_claim_attempts;
     DELETE FROM sessions.ingest_batches; DELETE FROM sessions.ingest_fence_versions; DELETE FROM sessions.upload_deletions; DELETE FROM sessions.upload_resets;
+    DELETE FROM sessions.ingest_claim_sessions; DELETE FROM sessions.owner_buffered_parity; DELETE FROM sessions.ingest_source_control_heads;
+    DELETE FROM sessions.ingest_control_receipts;
+    UPDATE sessions.ingest_lazy_policy SET valid_until = now() + interval '1 day';
+    UPDATE sessions.ingest_claim_sessions_policy SET write_enabled = true, backfill_complete_at = now(), read_enabled = true;
     SET session_replication_role = origin;`);
+  await setAuthority("active");
 });
 function scratch(): ObjectStore {
   const s = scratchStore();
@@ -66,7 +114,7 @@ let seat = 0;
  * native slot and ACK decision. The ACK candidate key is computed in SQL with the reader's exact expression.
  */
 async function seed(t: T, groups: SeedGroup[], o: { claimEpoch?: number; fenceVersion?: number; receipt?: "acknowledged" | "preparing"; active?: boolean;
-  batchState?: "committed" | "pending"; key?: string; sha256?: string; digest?: string; claim?: string } = {}): Promise<Seeded> {
+  batchState?: "committed" | "pending"; key?: string; sha256?: string; digest?: string; claim?: string; admVersion?: number; prove?: boolean } = {}): Promise<Seeded> {
   const batchId = randomUUID(), digest = o.digest ?? sha(batchId), claim = o.claim ?? randomUUID(), token = randomUUID();
   const sha256 = o.sha256 ?? sha(token);
   const key = o.key ?? stagedKey(ROOT, { org_id: t.orgId, workspace_id: t.workspaceId, origin_id: ORIGIN, user_id: t.userId, batch_digest: digest, claim_token: claim }, sha256, "buffered-batches");
@@ -82,7 +130,11 @@ async function seed(t: T, groups: SeedGroup[], o: { claimEpoch?: number; fenceVe
   await db.query(`INSERT INTO sessions.ingest_batches (org_id, workspace_id, origin_id, batch_id, user_id, digest, receipt_id, state, committed_at, publication_state)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,${committed ? "now()" : "NULL"},'buffered')`, [t.orgId, t.workspaceId, ORIGIN, batchId, t.userId, digest, `rhr_${hex("c")}`, committed ? "committed" : "pending"]);
   await db.query(`INSERT INTO sessions.ingest_claim_attempts (claim_token, org_id, workspace_id, user_id, origin_id, batch_id, digest, epochs, records, reset_epoch, source_control_version, source_identity_sha256)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,0,0,$10)`, [claim, t.orgId, t.workspaceId, t.userId, ORIGIN, batchId, digest, JSON.stringify(epochs), JSON.stringify(records), POLICY_IDENTITY]);
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9::jsonb,0,$11,$10)`, [claim, t.orgId, t.workspaceId, t.userId, ORIGIN, batchId, digest, JSON.stringify(epochs), JSON.stringify(records), POLICY_IDENTITY, o.admVersion ?? 0]);
+  // The v2 claim-sessions side rows (044080), as admission writes them while its writer is on.
+  for (const g of sessions)
+    await db.query(`INSERT INTO sessions.ingest_claim_sessions (claim_token, source, session_id, org_id, workspace_id, user_id, origin_id, batch_id, digest, reset_epoch, accepted_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,now())`, [claim, g.source, g.session, t.orgId, t.workspaceId, t.userId, ORIGIN, batchId, digest]);
   await db.query(`INSERT INTO sessions.ingest_stage_intents (stage_token, claim_token, org_id, workspace_id, user_id, origin_id, batch_id, digest, stage_key, stage_sha256, stage_bytes, group_ordinals, reset_epoch, receipt_state, cleanup_state, expires_at)
     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,100,$11::jsonb,0,$12,'live',now() + interval '1 day')`,
     [token, claim, t.orgId, t.workspaceId, t.userId, ORIGIN, batchId, digest, key, sha256, JSON.stringify(groupOrdinals), o.receipt ?? "acknowledged"]);
@@ -101,9 +153,9 @@ async function seed(t: T, groups: SeedGroup[], o: { claimEpoch?: number; fenceVe
         body_accepted, seat_key_sha256, reset_epoch, fence_epoch, generation, source_control_version, source_witness_sha256)
       SELECT $1, $2, $3, 0, encode(sha256(convert_to(jsonb_build_array('buffer-first-ack-seat-v1', $4::text, $5::text, $6::text, $7::text, $8::text, $9::text,
                $10::text, $11::text, '0'::text, $12::text, $13::text, $14::text)::text, 'UTF8')), 'hex'),
-             $15, $15, $16, $17, 0, $18, $19, 0, $19`,
+             $15, $15, $16, $17, 0, $18, $19, $20, $19`,
       [claim, l.ord, slotKey, CLOCK_EPOCH, CLOCK_IDENTITY, t.orgId, t.workspaceId, t.userId, ORIGIN, l.r.id, String(l.r.rev), l.g.source, l.g.session, String(epoch),
-        l.digest, l.r.accepted !== false, seatKey, epoch, GEN]);
+        l.digest, l.r.accepted !== false, seatKey, epoch, GEN, o.admVersion ?? 0]);
   }
   if (o.fenceVersion !== undefined)
     for (const g of sessions)
@@ -111,6 +163,7 @@ async function seed(t: T, groups: SeedGroup[], o: { claimEpoch?: number; fenceVe
         ON CONFLICT (org_id, workspace_id, user_id, origin_id, source, session_id) DO UPDATE SET epoch = excluded.epoch`,
         [t.orgId, t.workspaceId, t.userId, ORIGIN, g.source, g.session, o.fenceVersion]);
   await db.exec("SET session_replication_role = origin");
+  if (o.prove !== false) await prove(t);
   return { key, sha256, groups };
 }
 
@@ -134,6 +187,23 @@ async function allKeys(store: ObjectStore): Promise<string[]> {
   } while (cursor);
   return out.sort();
 }
+
+const grantAuthority = (store: ObjectStore) =>
+  store.put(objectKey(orgFenceAuthorityKey(ROOT, A.orgId)), enc.encode(JSON.stringify({ v: 1, fenceBackfill: "complete", revisionBackfill: "complete",
+    ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: 1, orgId: A.orgId })));
+const objectLine = (id: string) => JSON.stringify({ kind: "session_event", origin_id: ORIGIN, record_id: id, revision: "1", operation: "upsert", received_at: "2030-01-02T00:00:00.000Z", payload: { text: id, ts_ms: 1_893_542_400_000 } });
+/** A real staged object in S3 for user A, and the same batch in SQL (seed). */
+async function stageInBoth(store: ObjectStore, groups: SeedGroup[], o: Parameters<typeof seed>[2] = {}) {
+  const claim = randomUUID(), digest = sha(randomUUID());
+  const objectGroups: Group[] = groups.map((g) => ({ source: g.source, sessionId: g.session, lines: g.records.map((r) => objectLine(r.id)), meta: g.records.map((r) => [`${r.id}:r${r.rev}`, sha(`${r.id}:${r.rev}`), g.source, g.session]) }));
+  let ord = 0;
+  const prepared = prepareBufferedStage(ROOT, { claim_token: claim, batch_digest: digest, received_at: "2030-01-02T00:00:00.000Z", org_id: A.orgId, workspace_id: A.workspaceId, origin_id: ORIGIN, user_id: A.userId },
+    objectGroups, groups.map((g) => g.records.map(() => ord++)));
+  await putBufferedStage(store, prepared);
+  return seed(A, groups, { ...o, key: prepared.spec.key, sha256: prepared.spec.sha256, digest, claim });
+}
+const drain = (store: ObjectStore) => drainBufferedBatches({ store, keyRoot: ROOT, orgs: [A.orgId], dryRun: false, sleep: async () => {},
+  decompress: (b) => new Uint8Array(zstdDecompressSync(b, { maxOutputLength: BUFFER_STAGE_MAX_BYTES })) });
 
 describe("accepted-stage export (0005 step 0b): SQL's own verdict per stage", () => {
   test("a live stage: SQL's kept lines per object group, and the S3 fence the export saw", async () => {
@@ -175,11 +245,13 @@ describe("accepted-stage export (0005 step 0b): SQL's own verdict per stage", ()
     await backfillFence(store, A);
     const reset = await seed(A, [{ source: "claude", session: "sess-1", records: [{ id: "a", rev: 1 }] }]);
     await db.query("INSERT INTO sessions.upload_resets (org_id, workspace_id, user_id, request_id, reset_at) VALUES ($1,$2,$3,'req-1', now() + interval '1 minute')", [A.orgId, A.workspaceId, A.userId]);
+    await prove(A); // the owner's proof follows SQL's reset set: the line predicates alone decide here
     await run(store);
     expect((await verdict(store, reset.key))!.live).toBe(false);
     await db.exec("DELETE FROM sessions.upload_resets");
     const deleted = await seed(A, [{ source: "claude", session: "gone", records: [{ id: "b", rev: 1 }] }]);
     await db.query("INSERT INTO sessions.upload_deletions (org_id, workspace_id, user_id, origin_id, source, session_id) VALUES ($1,$2,$3,$4,'claude','gone')", [A.orgId, A.workspaceId, A.userId, ORIGIN]);
+    await prove(A);
     await run(store);
     expect((await verdict(store, deleted.key))!.live).toBe(false);
     expect((await verdict(store, reset.key))!.live).toBe(true); // the reset is gone: its verdict is rewritten (CAS)
@@ -274,18 +346,8 @@ describe("accepted-stage export (0005 step 0b): SQL's own verdict per stage", ()
   test("end to end: the drain writes exactly the lines SQL keeps, and nothing of a stage SQL hides", async () => {
     const store = scratch();
     await backfillFence(store, A);
-    await store.put(objectKey(orgFenceAuthorityKey(ROOT, A.orgId)), enc.encode(JSON.stringify({ v: 1, fenceBackfill: "complete", revisionBackfill: "complete",
-      ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: 1, orgId: A.orgId })));
-    const line = (id: string) => JSON.stringify({ kind: "session_event", origin_id: ORIGIN, record_id: id, revision: "1", operation: "upsert", received_at: "2030-01-02T00:00:00.000Z", payload: { text: id, ts_ms: 1_893_542_400_000 } });
-    const make = async (groups: SeedGroup[], o: Parameters<typeof seed>[2] = {}) => {
-      const claim = randomUUID(), digest = sha(randomUUID());
-      const objectGroups: Group[] = groups.map((g) => ({ source: g.source, sessionId: g.session, lines: g.records.map((r) => line(r.id)), meta: g.records.map((r) => [`${r.id}:r${r.rev}`, sha(`${r.id}:${r.rev}`), g.source, g.session]) }));
-      let ord = 0;
-      const prepared = prepareBufferedStage(ROOT, { claim_token: claim, batch_digest: digest, received_at: "2030-01-02T00:00:00.000Z", org_id: A.orgId, workspace_id: A.workspaceId, origin_id: ORIGIN, user_id: A.userId },
-        objectGroups, groups.map((g) => g.records.map(() => ord++)));
-      await putBufferedStage(store, prepared);
-      return seed(A, groups, { ...o, key: prepared.spec.key, sha256: prepared.spec.sha256, digest, claim });
-    };
+    await grantAuthority(store);
+    const make = (groups: SeedGroup[], o: Parameters<typeof seed>[2] = {}) => stageInBoth(store, groups, o);
     await make([{ source: "claude", session: "kept", records: [{ id: "yes", rev: 1 }, { id: "no", rev: 1, accepted: false }] }]);
     await make([{ source: "claude", session: "reenabled", records: [{ id: "hidden", rev: 1 }] }], { fenceVersion: 1 });
     expect(await run(store)).toMatchObject({ live: 1, not_live: 1 });
@@ -304,6 +366,181 @@ describe("accepted-stage export (0005 step 0b): SQL's own verdict per stage", ()
       decompress: (b) => new Uint8Array(zstdDecompressSync(b, { maxOutputLength: BUFFER_STAGE_MAX_BYTES })) });
     expect(after.objects.fence_moved_since_export).toBe(1);
     expect(await exists(store, third.key + ".drained.json")).toBe(false);
+  });
+
+
+  // ---- second review: the reader's per-user gate (3), the control head (4), the gate-off path (5), fence order (6),
+  // stale sidecars (7) ----
+
+  const one = [{ source: "claude", session: "s1", records: [{ id: "a", rev: 1 }] }];
+  /** Export, then the stage's verdict and the summary. */
+  const exportOne = async (store: ObjectStore, s: Seeded) => {
+    const summary = await run(store);
+    return { summary, v: (await verdict(store, s.key))! };
+  };
+
+  test("finding 3: a fenced privacy authority hides every user (counted with a reason)", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    const s = await seed(A, one);
+    await setAuthority("fenced");
+    const { summary, v } = await exportOne(store, s);
+    expect(v.live).toBe(false);
+    expect(summary).toMatchObject({ live: 0, not_live: 1, gated: { privacy_fenced: 1 } });
+  });
+
+  test("finding 3: an expired lazy policy hides the user", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    const s = await seed(A, one);
+    await db.exec("UPDATE sessions.ingest_lazy_policy SET valid_until = now() - interval '1 second'");
+    const { summary, v } = await exportOne(store, s);
+    expect(v.live).toBe(false);
+    expect(summary.gated).toMatchObject({ policy_invalid: 1 });
+  });
+
+  test("finding 3: no parity row, or one whose digests no longer match SQL, hides the user", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    const s = await seed(A, one, { prove: false });
+    expect((await exportOne(store, s)).summary.gated).toMatchObject({ parity_missing: 1 });
+    expect((await verdict(store, s.key))!.live).toBe(false);
+    await prove(A);
+    expect((await exportOne(store, s)).v.live).toBe(true);
+    // A deletion of ANOTHER session after the proof: the line predicates still pass, the deletion-set digest does not.
+    await db.query("INSERT INTO sessions.upload_deletions (org_id, workspace_id, user_id, origin_id, source, session_id) VALUES ($1,$2,$3,$4,'claude','other')", [A.orgId, A.workspaceId, A.userId, ORIGIN]);
+    const after = await exportOne(store, s);
+    expect(after.v.live).toBe(false);
+    expect(after.summary.gated).toMatchObject({ parity_mismatch: 1 });
+  });
+
+  test("finding 3: a control pending at the head hides the user", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    await putHead(A, { version: 1, digest: hex("d"), kind: "selection", pending: true });
+    const s = await seed(A, one, { admVersion: 1 });
+    const { summary, v } = await exportOne(store, s);
+    expect(v.live).toBe(false);
+    expect(summary.gated).toMatchObject({ head_pending: 1 });
+  });
+
+  test("finding 4: the mirrored head proves receipts 1..v (tip digest and kind) and sets the admission version", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    await putHead(A, { version: 2, digest: hex("d"), kind: "reset" });
+    const ok = await seed(A, one, { admVersion: 2 });
+    const older = await seed(A, [{ source: "claude", session: "s2", records: [{ id: "b", rev: 1 }] }], { admVersion: 1 });
+    const summary = await run(store);
+    expect((await verdict(store, ok.key))!.live).toBe(true);
+    // Admitted before the latest control: not live by design (the drain's fence recheck covers later controls).
+    expect((await verdict(store, older.key))!.live).toBe(false);
+    expect(summary).toMatchObject({ live: 1, not_live: 1 });
+  });
+
+  test("finding 4: never max(receipts): a head behind the receipts, a gap, a foreign epoch or a tip mismatch is not live", async () => {
+    const cases: [string, (t: T) => Promise<number>][] = [
+      // The head says 1; receipts run to 2 (max would say 2, the claim's version).
+      ["head behind receipts", async (t) => { await putHead(t, { version: 1, digest: hex("d"), kind: "selection" }, { receipts: [{ version: 1, digest: hex("d"), kind: "selection" }, { version: 2, digest: hex("e"), kind: "selection" }] }); return 2; }],
+      ["gap", async (t) => { await putHead(t, { version: 2, digest: hex("d"), kind: "selection" }, { receipts: [{ version: 2, digest: hex("d"), kind: "selection" }] }); return 2; }],
+      ["tip digest", async (t) => { await putHead(t, { version: 2, digest: hex("d"), kind: "selection" }, { receipts: [{ version: 1, digest: hex("a"), kind: "selection" }, { version: 2, digest: hex("e"), kind: "selection" }] }); return 2; }],
+      ["tip kind", async (t) => { await putHead(t, { version: 1, digest: hex("d"), kind: "selection" }, { receipts: [{ version: 1, digest: hex("d"), kind: "reset" }] }); return 1; }],
+      ["foreign-epoch receipt", async (t) => { await putHead(t, { version: 1, digest: hex("d"), kind: "selection" }, { receipts: [{ version: 1, digest: hex("d"), kind: "selection" }, { version: 1, digest: hex("d"), kind: "selection", epoch: hex("9") }] }); return 1; }],
+      ["foreign-epoch head", async (t) => { await putHead(t, { version: 1, digest: hex("d"), kind: "selection", epoch: hex("9") }, { receipts: [{ version: 1, digest: hex("d"), kind: "selection", epoch: hex("9") }] }); return 1; }],
+      ["no head, receipts", async (t) => {
+        await db.exec("SET session_replication_role = replica");
+        await db.query(`INSERT INTO sessions.ingest_control_receipts (org_id, workspace_id, user_id, epoch, version, digest, kind, result, schema_generation) VALUES ($1,$2,$3,$4,1,$5,'selection','{}',$6)`, [t.orgId, t.workspaceId, t.userId, POLICY_EPOCH, hex("d"), GEN]);
+        await db.exec("SET session_replication_role = origin");
+        return 1;
+      }],
+    ];
+    for (const [name, arrange] of cases) {
+      const store = scratch();
+      await backfillFence(store, A);
+      const version = await arrange(A);
+      const s = await seed(A, one, { admVersion: version });
+      const { v, summary } = await exportOne(store, s);
+      expect([name, v.live]).toEqual([name, false]);
+      expect([name, summary.live]).toEqual([name, 0]);
+      await db.exec(`SET session_replication_role = replica; DELETE FROM sessions.ingest_source_control_heads; DELETE FROM sessions.ingest_control_receipts;
+        DELETE FROM sessions.owner_buffered_parity; DELETE FROM sessions.ingest_buffer_outbox; SET session_replication_role = origin;`);
+    }
+  });
+
+  test("finding 4: an absent head counts as 0 only when proven (an active privacy authority); else not live", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    const s = await seed(A, one);
+    expect((await exportOne(store, s)).v.live).toBe(true);
+    await setAuthority(null); // Neon is the authority: the Supabase mirror may lack a head
+    const { summary, v } = await exportOne(store, s);
+    expect(v.live).toBe(false);
+    expect(summary.gated).toMatchObject({ head_unproven: 1 });
+  });
+
+  test("finding 5: with the claim-sessions reader gate off, the export refuses before any write", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    await seed(A, one);
+    await db.exec("UPDATE sessions.ingest_claim_sessions_policy SET read_enabled = false");
+    const before = await allKeys(store);
+    await expect(run(store)).rejects.toThrow("export_claim_sessions_gate_off");
+    expect((await allKeys(store)).filter((k) => !k.startsWith(exportLockKey(ROOT)))).toEqual(before.filter((k) => !k.startsWith(exportLockKey(ROOT))));
+    expect(await exists(store, acceptedCompleteKey(ROOT, A.orgId))).toBe(false);
+  });
+
+  test("finding 6: the S3 fence is read BEFORE the SQL snapshot: a disable and re-enable right after it is caught", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    await grantAuthority(store);
+    const s = await stageInBoth(store, one);
+    // Right after the verdict snapshot, a disable then re-enable lands: S3 bumps the session's epoch and drops the
+    // tombstone (SQL moves too, but the snapshot already said live).
+    let landed = false;
+    const sql: ExportSql = {
+      async query(text, params) {
+        const rows = (await db.query(text, params as unknown[])).rows as Record<string, unknown>[];
+        if (!landed && text.includes("judged AS")) {
+          landed = true;
+          await s3LedgerObjects(store, ROOT).editFence(s3LedgerKeys(ROOT, A).fence, (f) => {
+            applyFenceChange(f, { deletions: [{ originId: ORIGIN, sessions: [["claude", "s1"]] }] });
+            f.deleted[ORIGIN] = (f.deleted[ORIGIN] ?? []).filter(([src, id]) => !(src === "claude" && id === "s1")); // the re-enable
+            return { next: f, result: undefined };
+          });
+        }
+        return { rows };
+      },
+    };
+    await exportAcceptedStages({ sql, store, keyRoot: ROOT, dryRun: false, nowMs: () => 1_893_542_400_000 });
+    expect(landed).toBe(true);
+    expect((await verdict(store, s.key))!.fence!.epochs[sessionKeyHash("claude", "s1")]).toBe(0); // the pre-control view
+    const drained = await drain(store);
+    expect(drained.objects).toMatchObject({ drained: 0, fence_moved_since_export: 1 });
+  });
+
+  test("finding 7: a stage that left the candidate set gets a create-only superseded record the drain honours", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    await grantAuthority(store);
+    const s = await stageInBoth(store, one);
+    const keep = await stageInBoth(store, [{ source: "claude", session: "s2", records: [{ id: "b", rev: 1 }] }]);
+    expect(await run(store)).toMatchObject({ live: 2 });
+    expect((await verdict(store, s.key))!.live).toBe(true);
+    // The stage is no longer a candidate (its outbox row is gone), but its live sidecar remains from the first export.
+    await db.exec("SET session_replication_role = replica");
+    await db.query("DELETE FROM sessions.ingest_buffer_outbox WHERE active_stage_token = (SELECT stage_token FROM sessions.ingest_stage_intents WHERE stage_key = $1)", [s.key]);
+    await db.exec("SET session_replication_role = origin");
+    const dry = await run(store, { dryRun: true });
+    expect(dry).toMatchObject({ would_supersede: 1, superseded: 0 });
+    const rerun = await run(store);
+    expect(rerun).toMatchObject({ rows: 1, superseded: 1 });
+    const record = JSON.parse(await readText(store, s.key + SUPERSEDED_SUFFIX));
+    expect(record).toEqual({ v: 1, kind: "buffered-superseded", stage_sha256: s.sha256 });
+    expect(await exists(store, keep.key + SUPERSEDED_SUFFIX)).toBe(false);
+    // A third run changes nothing (the record is create-only and already there).
+    expect(await run(store)).toMatchObject({ superseded: 0 });
+    const drained = await drain(store);
+    expect(drained.objects).toMatchObject({ drained: 1, stage_superseded: 1 });
+    expect(await exists(store, s.key + ".drained.json")).toBe(false);
   });
 
   test("CLI: the mode is never implied and --execute needs the KMS key", () => {

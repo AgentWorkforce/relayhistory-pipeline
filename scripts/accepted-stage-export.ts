@@ -15,9 +15,14 @@
  * Exactly one of --dry-run / --execute is required. --dry-run reads SQL and the existing sidecars and writes
  * nothing (refused in code as well). --execute writes each candidate stage's `<stage>.accepted.json` sidecar (v2:
  * SQL's own liveness verdict, the lines SQL keeps, and the user's S3 fence as seen; replaced by CAS when a rerun's
- * verdict differs) and the create-only per-org completion objects the drain requires, under a fenced lease
- * (96bulls/.drain/export-lock.json, one export at a time). It runs AFTER the fence backfill, and again right before
- * the drain. It needs the owner's explicit OK. Rerunning converges.
+ * verdict differs), a create-only `<stage>.superseded.json` for an earlier live sidecar whose stage is no longer a
+ * candidate, and the create-only per-org completion objects the drain requires, under a fenced lease
+ * (96bulls/.drain/export-lock.json, one export at a time). The verdict applies the reader's per-user gate (privacy
+ * authority, lazy policy, mirrored control head and its receipts, the owner's G2 parity row): a closed gate is not
+ * live, counted by reason in `gated`. It refuses to run (`export_claim_sessions_gate_off`) while the v2
+ * claim-sessions reader gate is off. The login must be able to run the owner-only owner_buffered_parity_expected.
+ * It runs AFTER the fence backfill, and again right before the drain. It needs the owner's explicit OK. Rerunning
+ * converges. Before draining: `failed`, `fence_late` and `orgs.incomplete` must all be 0.
  *
  * Output: one JSON line of counts only (never a key, tenant id, hash or URL).
  */

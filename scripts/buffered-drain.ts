@@ -44,7 +44,7 @@ import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
 import { signRequest, type AwsCredentials } from "../packages/object-store/src/sigv4.ts";
 import { xmlElements, xmlText } from "../packages/object-store/src/xml.ts";
 import { BUFFER_STAGE_MAX_BYTES } from "../src/session-ingest/staging.ts";
-import { ACCEPTED_SUFFIX, DRAINED_SUFFIX, MAX_DRAIN_CONCURRENCY, drainBufferedBatches, parseStagedKey, type DrainSummary } from "../src/session-ingest/buffered-drain.ts";
+import { ACCEPTED_SUFFIX, DRAINED_SUFFIX, MAX_DRAIN_CONCURRENCY, SUPERSEDED_SUFFIX, drainBufferedBatches, parseStagedKey, type DrainSummary } from "../src/session-ingest/buffered-drain.ts";
 
 export const KEY_ROOT = "96bulls";
 const REGION = /^[a-z]{2}(-[a-z]+)+-\d$/;
@@ -121,7 +121,7 @@ export function parseDrainArgs(argv: string[]): DrainArgs {
 
 /** A checkpoint is a group's last listed key: a stage, or its `.drained.json` / `.accepted.json` sidecar. */
 export function validResumeKey(key: string): boolean {
-  const suffix = [DRAINED_SUFFIX, ACCEPTED_SUFFIX].find((x) => key.endsWith(x));
+  const suffix = [DRAINED_SUFFIX, ACCEPTED_SUFFIX, SUPERSEDED_SUFFIX].find((x) => key.endsWith(x));
   const staged = suffix ? key.slice(0, -suffix.length) : key;
   const parts = parseStagedKey(staged);
   return parts !== null && parts.keyRoot === KEY_ROOT;
