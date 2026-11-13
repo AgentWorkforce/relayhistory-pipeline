@@ -1,0 +1,230 @@
+[
+  {
+    "id": "collision",
+    "workstream": "collision",
+    "split": "development",
+    "sessions": [
+      "[\"synthetic\",\"collision-a\"]",
+      "[\"synthetic\",\"collision-b\"]"
+    ],
+    "asOf": "2026-11-07T12:00:00Z",
+    "mode": "replay",
+    "expected": "suggest",
+    "kind": "conflicting_changes",
+    "rationale": "Both change the same billing retry handler with incompatible retry counts.",
+    "evidenceIds": [
+      "collision-a-e1",
+      "collision-b-e1"
+    ],
+    "labelSource": "synthetic"
+  },
+  {
+    "id": "duplicate",
+    "workstream": "duplicate",
+    "split": "held_out",
+    "sessions": [
+      "[\"synthetic\",\"duplicate-a\"]",
+      "[\"synthetic\",\"duplicate-b\"]"
+    ],
+    "asOf": "2026-11-07T12:00:00Z",
+    "mode": "replay",
+    "expected": "suggest",
+    "kind": "duplicate_work",
+    "rationale": "Both independently investigate the same upload stall symptom.",
+    "evidenceIds": [
+      "duplicate-a-e1",
+      "duplicate-b-e1"
+    ],
+    "labelSource": "synthetic"
+  },
+  {
+    "id": "contract",
+    "workstream": "contract",
+    "split": "development",
+    "sessions": [
+      "[\"synthetic\",\"contract-a\"]",
+      "[\"synthetic\",\"contract-b\"]"
+    ],
+    "asOf": "2026-11-07T12:00:00Z",
+    "mode": "replay",
+    "expected": "suggest",
+    "kind": "dependency",
+    "rationale": "Frontend is blocked on the exact response contract the other session is producing across repos.",
+    "evidenceIds": [
+      "contract-a-e1",
+      "contract-b-e1"
+    ],
+    "labelSource": "synthetic"
+  },
+  {
+    "id": "discovery",
+    "workstream": "discovery",
+    "split": "held_out",
+    "sessions": [
+      "[\"synthetic\",\"discovery-a\"]",
+      "[\"synthetic\",\"discovery-b\"]"
+    ],
+    "asOf": "2026-11-07T12:00:00Z",
+    "mode": "replay",
+    "expected": "suggest",
+    "kind": "reusable_finding",
+    "rationale": "A concrete cause discovered by one agent answers the other agent\u2019s current blocker.",
+    "evidenceIds": [
+      "discovery-a-e1",
+      "discovery-b-e1"
+    ],
+    "labelSource": "synthetic"
+  },
+  {
+    "id": "feature",
+    "workstream": "feature",
+    "split": "development",
+    "sessions": [
+      "[\"synthetic\",\"feature-a\"]",
+      "[\"synthetic\",\"feature-b\"]"
+    ],
+    "asOf": "2026-11-07T12:00:00Z",
+    "mode": "replay",
+    "expected": "suggest",
+    "kind": "shared_outcome",
+    "rationale": "Separate implementations have a shared acceptance criterion and would benefit from agreeing on the boundary.",
+    "evidenceIds": [
+      "feature-a-e1",
+      "feature-b-e1"
+    ],
+    "labelSource": "synthetic"
+  },
+  {
+    "id": "ownership",
+    "workstream": "ownership",
+    "split": "held_out",
+    "sessions": [
+      "[\"synthetic\",\"ownership-a\"]",
+      "[\"synthetic\",\"ownership-b\"]"
+    ],
+    "asOf": "2026-11-07T12:00:00Z",
+    "mode": "replay",
+    "expected": "suggest",
+    "kind": "ownership_gap",
+    "rationale": "Both explicitly leave schema migration ownership to the other.",
+    "evidenceIds": [
+      "ownership-a-e1",
+      "ownership-b-e1"
+    ],
+    "labelSource": "synthetic"
+  },
+  {
+    "id": "review",
+    "workstream": "review",
+    "split": "development",
+    "sessions": [
+      "[\"synthetic\",\"review-a\"]",
+      "[\"synthetic\",\"review-b\"]"
+    ],
+    "asOf": "2026-11-07T12:00:00Z",
+    "mode": "replay",
+    "expected": "suppress",
+    "kind": "conflicting_changes",
+    "rationale": "Explicitly coordinated independent verification should not interrupt either agent.",
+    "evidenceIds": [
+      "review-a-e1",
+      "review-b-e1"
+    ],
+    "labelSource": "synthetic"
+  },
+  {
+    "id": "reads",
+    "workstream": "reads",
+    "split": "held_out",
+    "sessions": [
+      "[\"synthetic\",\"reads-a\"]",
+      "[\"synthetic\",\"reads-b\"]"
+    ],
+    "asOf": "2026-11-07T12:00:00Z",
+    "mode": "replay",
+    "expected": "suppress",
+    "kind": "conflicting_changes",
+    "rationale": "Both read a common utility but pursue unrelated changes.",
+    "evidenceIds": [
+      "reads-a-e1",
+      "reads-b-e1"
+    ],
+    "labelSource": "synthetic"
+  },
+  {
+    "id": "fork",
+    "workstream": "fork",
+    "split": "development",
+    "sessions": [
+      "[\"synthetic\",\"fork-a\"]",
+      "[\"synthetic\",\"fork-b\"]"
+    ],
+    "asOf": "2026-11-07T12:00:00Z",
+    "mode": "replay",
+    "expected": "suppress",
+    "kind": "conflicting_changes",
+    "rationale": "Identical paths in different repositories do not establish overlap.",
+    "evidenceIds": [
+      "fork-a-e1",
+      "fork-b-e1"
+    ],
+    "labelSource": "synthetic"
+  },
+  {
+    "id": "generic",
+    "workstream": "generic",
+    "split": "held_out",
+    "sessions": [
+      "[\"synthetic\",\"generic-a\"]",
+      "[\"synthetic\",\"generic-b\"]"
+    ],
+    "asOf": "2026-11-07T12:00:00Z",
+    "mode": "replay",
+    "expected": "suppress",
+    "kind": "shared_outcome",
+    "rationale": "Generic authentication vocabulary does not establish a shared task.",
+    "evidenceIds": [
+      "generic-a-e1",
+      "generic-b-e1"
+    ],
+    "labelSource": "synthetic"
+  },
+  {
+    "id": "unproven",
+    "workstream": "unproven",
+    "split": "development",
+    "sessions": [
+      "[\"synthetic\",\"unproven-a\"]",
+      "[\"synthetic\",\"unproven-b\"]"
+    ],
+    "asOf": "2026-11-07T12:00:00Z",
+    "mode": "replay",
+    "expected": "uncertain",
+    "kind": null,
+    "rationale": "Topic overlap alone does not establish useful intervention.",
+    "evidenceIds": [
+      "unproven-a-e1",
+      "unproven-b-e1"
+    ],
+    "labelSource": "synthetic"
+  },
+  {
+    "id": "future",
+    "workstream": "future",
+    "split": "held_out",
+    "sessions": [
+      "[\"synthetic\",\"future-a\"]",
+      "[\"synthetic\",\"future-b\"]"
+    ],
+    "asOf": "2026-11-07T12:00:00Z",
+    "mode": "replay",
+    "expected": "uncertain",
+    "kind": null,
+    "rationale": "The useful finding was not available at the evaluation cutoff.",
+    "evidenceIds": [
+      "future-a-e1",
+      "future-b-e1"
+    ],
+    "labelSource": "synthetic"
+  }
+]
