@@ -178,6 +178,11 @@ describe("cross-account worker grants plan phase", () => {
     expect(() => check({ transcripts: bucketBlock(liveBucket, [...liveBucket, ...crossAccountWorkerBucketStatements({ bucketAccountId: "999999999999", bucketArn: P.bucketArn, roleArn: same })]) }, { transcripts: "update" })).toThrow(/exact role in another account/);
   });
 
+  it("refuses a plan whose bucket and key grants name different roles", () => {
+    const other = `arn:aws:iam::${workerAccount}:role/other-worker`;
+    expect(() => check({ transcripts: bucketBlock(liveBucket, pBucket(roleArn)), "transcripts-key": keyBlock(liveKey, pKey(other)) }, both)).toThrow(/must name the same role/);
+  });
+
   it("the grant deploys alone: any other change in the same plan is refused, whatever phase it would match", () => {
     expect(() => check({ transcripts: bucketBlock(liveBucket, plannedBucket) }, { transcripts: "update", "transcript-reader": "update" })).toThrow(/must deploy alone/);
     // Ride-alongs on phases that accept a key or bucket update without inspecting it (P2-2).

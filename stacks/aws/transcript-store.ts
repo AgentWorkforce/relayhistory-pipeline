@@ -912,7 +912,9 @@ function crossAccountWorkerGrantsPhase(operations: ReadonlyMap<string, string>, 
   const changed = [...operations].filter(([, a]) => a !== "noop");
   if (!changed.every(([r, a]) => (WORKER_POLICY_RESOURCES as readonly string[]).includes(r) && a === "update"))
     return refuse(`cross-account worker grants must deploy alone (only transcripts and transcripts-key may update): ${changed.map(([r, a]) => `${r}:${a}`).join(", ")}`);
-  for (const r of updated) assertWorkerGrantDiff(planResourceBlock(lines, r), r, say(r));
+  // One role per plan: the bucket and key grants must name the same worker.
+  const roles = new Set(updated.map((r) => assertWorkerGrantDiff(planResourceBlock(lines, r), r, say(r))).filter((v): v is string => v !== undefined));
+  if (roles.size > 1) return refuse("cross-account worker grants: the bucket and key policies must name the same role");
   return "cross-account worker grants";
 }
 
@@ -978,7 +980,8 @@ function planYaml(v: unknown, indent: number): string[] {
 /** Plan YAML quotes some scalars ("*", digit strings); compare values unquoted, line for line. */
 const unquoteYaml = (text: string) => text.split("\n").map((l) => l.replace(/^(\s*(?:- )?(?:[^\s"][^"]*?: )?)("(?:[^"\\]|\\.)*")\s*$/, (_, head: string, q: string) => head + JSON.parse(q))).join("\n");
 
-function assertWorkerGrantDiff(block: readonly string[], resource: (typeof WORKER_POLICY_RESOURCES)[number], refuse: (why: string) => never) {
+/** Returns the role an added grant names (undefined for a revocation). */
+function assertWorkerGrantDiff(block: readonly string[], resource: (typeof WORKER_POLICY_RESOURCES)[number], refuse: (why: string) => never): string | undefined {
   const expected: readonly string[] = resource === "transcripts" ? CROSS_ACCOUNT_WORKER_BUCKET_SIDS : CROSS_ACCOUNT_WORKER_KEY_SIDS;
   const { live, planned } = policyDiffSides(block, refuse);
   if (live.header !== planned.header) refuse("only policy statements may change");
@@ -991,7 +994,7 @@ function assertWorkerGrantDiff(block: readonly string[], resource: (typeof WORKE
   const adds = removed.length === 0 && JSON.stringify(added) === exact;
   const removes = added.length === 0 && JSON.stringify(removed) === exact;
   if (!adds && !removes) refuse(`must add (or, to revoke, remove) exactly ${expected.join(", ")}; adds ${added.join(", ") || "(none)"}, removes ${removed.join(", ") || "(none)"}`);
-  if (!adds) return;
+  if (!adds) return undefined;
   // The added bodies are exactly what the builder makes for the one role they name (srv-writer recovery precedent).
   const principals = new Set(added.map((sid) => [...planned.bySid.get(sid)!.matchAll(/^\s*AWS:\s*(\S+)\s*$/gm)].map((m) => m[1]!)).flat());
   if (principals.size !== 1) refuse("the worker statements must name exactly one role");
@@ -1005,6 +1008,7 @@ function assertWorkerGrantDiff(block: readonly string[], resource: (typeof WORKE
     const got = planned.bySid.get(statement.Sid)!;
     if (unquoteYaml(got) !== planYaml([statement], planned.itemIndent).join("\n")) refuse(`${statement.Sid} must be exactly the reviewed statement`);
   }
+  return roleArn;
 }
 
 /**
