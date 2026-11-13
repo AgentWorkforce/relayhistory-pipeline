@@ -10,7 +10,7 @@ import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../sh
 import { deliverPrepared, IngestUnavailable } from "../deliver.ts";
 import { LedgerUnavailableError, type ClaimInput, type CommitInput, type Ledger, type LedgerRecord } from "../ledger.ts";
 import {
-  applyFenceChange, checkIndexEntryInput, entryForgotten, fenceAuthorityKey, ingestLedgerMode, newFence, revisionShard, s3Ledger, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, withSqlControlMirror,
+  applyFenceChange, checkIndexEntryInput, entryForgotten, fenceAuthorityKey, orgFenceAuthorityKey, ingestLedgerMode, newFence, revisionShard, s3Ledger, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, withSqlControlMirror,
   type FenceDoc,
 } from "../ledger-s3.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
@@ -336,7 +336,7 @@ describe("fences: selection, reset, and the commit's recheck", () => {
     const ledger = ledgerOn(store);
     const input = claimInput("b1", [rec("r1", 1)]);
     const c = await claimed(ledger, input);
-    expect(await json(store, keys.owner(ORIGIN, "claude", "sess-1"))).toEqual({ v: 1, originId: ORIGIN, source: "claude", sessionId: "sess-1", epoch: 0, resets: 0 });
+    expect(await json(store, keys.owner(ORIGIN, "claude", "sess-1"))).toEqual({ v: 1, originId: ORIGIN, source: "claude", sessionId: "sess-1", epoch: 0, resets: 0, machineId: MACHINE });
     expect(await ledger.resetUploadedSessions(TENANT, "req-1")).toBe(1);
     expect(await ledger.commit(commitOf(input, c.claimToken))).toEqual({ rearmed: 1 });
     expect(await exists(store, keys.rearm(ORIGIN, "claude", "sess-1"))).toBe(true);
@@ -1134,5 +1134,70 @@ describe("layered review P2-A: a SQL reset never keeps a tombstone S3 has lifted
     await mirror.setSessionUploads({ tenant: TENANT, originId: ORIGIN, sessions: [["claude", "s1"]], enabled: true });
     await mirror.applyOrderedControl!({ tenant: TENANT, requestId: "req-o", control: { epoch: "e".repeat(64), version: "3", digest: "d".repeat(64), kind: "reset" } });
     expect(sqlDeleted.has("s1")).toBe(false);
+  });
+});
+
+describe("per-org fence-authority markers", () => {
+  const fields = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: 1 };
+  const putJson = (store: ObjectStore, key: string, v: unknown) => store.put(objectKey(key), new TextEncoder().encode(JSON.stringify(v)), { contentType: "application/json" });
+  const TENANT_B = { ...TENANT, orgId: "org-b" };
+  const claimFor = (tenant: typeof TENANT, batchId: string) => claimInput(batchId, [rec("r1", 1)], { tenant });
+
+  test("org A's marker admits A and not B; B stays a retry until its own marker", async () => {
+    const store = fresh();
+    await putJson(store, orgFenceAuthorityKey(ROOT, TENANT.orgId), { ...fields, orgId: TENANT.orgId });
+    const ledger = ledgerOn(store, { fenceAuthority: "required" });
+    expect((await ledger.claim(claimFor(TENANT, "a1"))).kind).toBe("claimed");
+    await expect(ledger.claim(claimFor(TENANT_B, "b1"))).rejects.toMatchObject({ code: "ledger_fence_authority_missing" });
+    await putJson(store, orgFenceAuthorityKey(ROOT, "org-b"), { ...fields, orgId: "org-b" });
+    expect((await ledger.claim(claimFor(TENANT_B, "b1"))).kind).toBe("claimed");
+  });
+
+  test("a missing or invalid per-org marker is a coded retry (never an admit), with no org id in the error", async () => {
+    const store = fresh();
+    const ledger = ledgerOn(store, { fenceAuthority: "required" });
+    await expect(ledger.claim(claimFor(TENANT, "a1"))).rejects.toMatchObject({ code: "ledger_fence_authority_missing" });
+    for (const bad of [{ ...fields }, { ...fields, orgId: TENANT.orgId, rearmSweeper: "pending" }, { ...fields, orgId: TENANT.orgId, extra: 1 }, { ...fields, orgId: "" }]) {
+      await putJson(store, orgFenceAuthorityKey(ROOT, TENANT.orgId), bad);
+      const err = await ledger.claim(claimFor(TENANT, "a1")).catch((e) => e);
+      expect(err).toMatchObject({ code: "ledger_fence_authority_invalid" });
+      expect(String(err)).not.toContain(TENANT.orgId);
+    }
+    expect(await exists(store, keys.batch(ORIGIN, "a1"))).toBe(false);
+  });
+
+  test("a per-org marker naming another org is refused, even when the deployment-wide marker is valid", async () => {
+    const store = fresh();
+    await putJson(store, orgFenceAuthorityKey(ROOT, TENANT.orgId), { ...fields, orgId: "org-b" });
+    await putJson(store, fenceAuthorityKey(ROOT), fields);
+    const err = await ledgerOn(store, { fenceAuthority: "required" }).claim(claimFor(TENANT, "a1")).catch((e) => e);
+    expect(err).toMatchObject({ code: "ledger_fence_authority_org_mismatch" });
+    expect(String(err)).not.toContain("org-b");
+  });
+
+  test("the deployment-wide marker still covers every org", async () => {
+    const store = fresh();
+    await putJson(store, fenceAuthorityKey(ROOT), fields);
+    const ledger = ledgerOn(store, { fenceAuthority: "required" });
+    expect((await ledger.claim(claimFor(TENANT, "a1"))).kind).toBe("claimed");
+    expect((await ledger.claim(claimFor(TENANT_B, "b1"))).kind).toBe("claimed");
+    // A per-org marker is not a deployment-wide one: the wide key with an orgId refuses.
+    await putJson(store, fenceAuthorityKey(ROOT), { ...fields, orgId: TENANT.orgId });
+    await expect(ledgerOn(store, { fenceAuthority: "required" }).claim(claimFor(TENANT, "a2"))).rejects.toMatchObject({ code: "ledger_fence_authority_invalid" });
+  });
+
+  test("the 60 s cache is per org: deleting A's marker stops A's new claims after A's window; B is unaffected", async () => {
+    const store = fresh();
+    let now = 0;
+    for (const org of [TENANT.orgId, "org-b"]) await putJson(store, orgFenceAuthorityKey(ROOT, org), { ...fields, orgId: org });
+    const ledger = ledgerOn(store, { fenceAuthority: "required", nowMs: () => now });
+    expect((await ledger.claim(claimFor(TENANT, "a1"))).kind).toBe("claimed");
+    now = 30_000;
+    expect((await ledger.claim(claimFor(TENANT_B, "b1"))).kind).toBe("claimed");
+    await store.delete(objectKey(orgFenceAuthorityKey(ROOT, TENANT.orgId)));
+    expect((await ledger.claim(claimFor(TENANT, "a2"))).kind).toBe("claimed"); // inside A's window
+    now = 60_000;
+    await expect(ledger.claim(claimFor(TENANT, "a3"))).rejects.toMatchObject({ code: "ledger_fence_authority_missing" });
+    expect((await ledger.claim(claimFor(TENANT_B, "b2"))).kind).toBe("claimed"); // B's window runs to 90 s
   });
 });

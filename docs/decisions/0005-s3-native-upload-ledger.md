@@ -64,9 +64,11 @@ All of these sit under the per-user admission directory that already holds `priv
   finish. Every selection, reset or erase
   edits it with `If-Match`, retrying on `precondition_failed` as `editJournal` does. It fails closed:
   an unreadable fence is a retry, never an empty fence.
-- `…/ledger/rearm/<sha256(source \x1f sessionId)[0:32]>.json`
-  `{v:1, originId, source, sessionId, machineId, atMs}`. It is written create-only, and the eraser
-  sweeps it.
+- `…/ledger/rearm/o=<sha256(origin)[0:32]>/<sessionKey>.json`
+  `{v:1, originId, source, sessionId, machineId, atMs}`. The first re-arm creates it. A later re-arm of
+  the same session rewrites it (`If-Match`, with a strictly later `atMs`), so its content changes. The
+  re-arm sweeper (`rearm-sweeper.ts`) erases the session again. It then records completion in a
+  create-only `<marker>.done/<sha256(marker bytes)[0:32]>.json`. A marker is never deleted.
 
 ### What the S3 ledger refuses
 
