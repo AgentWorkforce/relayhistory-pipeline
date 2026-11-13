@@ -186,6 +186,26 @@
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
     ],
+    "sessions.coordination_advisories_ack_v1(text,text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.coordination_advisories_mark_delivered_v1(text,text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.coordination_advisories_pending_for_v1(text,text,text,text)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
+    "sessions.coordination_advisories_sweep_v1()": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
+    "sessions.coordination_advisories_upsert_v1(text,text,jsonb)": [
+      "<owner>:EXECUTE",
+      "service_role:EXECUTE"
+    ],
     "sessions.coordination_output_facts_for(text,timestamp with time zone,timestamp with time zone,text,integer)": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"

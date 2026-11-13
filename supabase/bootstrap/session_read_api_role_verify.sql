@@ -123,6 +123,8 @@ BEGIN
          'sessions.buffered_session_stages_for_target(text,text,text,text,text,text,text,text,boolean,text)',
          'sessions.buffered_session_stages_for_target_paged(text,text,text,text,text,text,text,text,boolean,text,jsonb,integer)',
          'sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)',
+         'sessions.coordination_advisories_ack_v1(text,text,text,text,text)',
+         'sessions.coordination_advisories_pending_for_v1(text,text,text,text)',
          'sessions.coordination_output_facts_for(text,timestamp with time zone,timestamp with time zone,text,integer)',
          'sessions.coordination_write_facts_for(text,timestamp with time zone,timestamp with time zone,text,integer)',
          'sessions.digest_narrative_read(text,date,text,text)',

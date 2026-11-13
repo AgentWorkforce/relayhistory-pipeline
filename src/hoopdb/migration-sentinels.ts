@@ -457,6 +457,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     evidence: "replacement: ingest_publication_prepare and ingest_publication_publish admit storage provider gcs",
     sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_publication_prepare(jsonb)') AND prosecdef AND prosrc LIKE '%NOT IN(''s3'',''gcs'')%') AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_publication_publish(jsonb)') AND prosecdef AND prosrc LIKE '%NOT IN(''s3'',''gcs'')%') AS applied",
   },
+  "upstream:20261105062000_coordination_advisories.sql": {
+    evidence: "function sessions.coordination_advisories_upsert_v1 and table sessions.coordination_advisories",
+    sql: "SELECT to_regprocedure('sessions.coordination_advisories_upsert_v1(text,text,jsonb)') IS NOT NULL AND to_regclass('sessions.coordination_advisories') IS NOT NULL AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),
