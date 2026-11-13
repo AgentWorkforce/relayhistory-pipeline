@@ -20,7 +20,8 @@
  *        `seq` watermark with no times; a buffered staged header holds `received_at` but no journal
  *        witness (only async inbox objects carry one). So supersession uses the fence's
  *        `lastResetAtMs` (ledger-s3; the backfill sets it from SQL's reset times). `resets > 0` with
- *        `lastResetAtMs` 0: `reset_undeterminable`, skipped. With it, and a clock-skew margin M
+ *        `lastResetAtMs` 0: `reset_undeterminable`, skipped. A reset begun but not finished
+ *        (`resetsCompleted < resets`): `reset_in_flight`, skipped (a claim finishes it; rerun after). With it, and a clock-skew margin M
  *        (default 5 minutes, floor 1 minute; `received_at` is the Worker's clock, `lastResetAtMs`
  *        the database's): `received_at <= lastResetAtMs - M` is `pre_reset`, dropped and marked;
  *        within M on either side of the reset is `reset_margin`, skipped and left undrained (never
@@ -229,6 +230,7 @@ export type ObjectOutcome =
   | "privacy_control_open"
   | "reset_undeterminable"
   | "reset_margin"
+  | "reset_in_flight"
   | "index_unreadable"
   | "write_failed"
   | "index_merge_failed"
@@ -239,7 +241,7 @@ export type ObjectOutcome =
 
 const OUTCOMES: ObjectOutcome[] = [
   "drained", "would_drain", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch",
-  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "index_unreadable", "write_failed",
+  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "index_unreadable", "write_failed",
   "index_merge_failed", "fence_recheck_failed", "fence_moved", "marker_failed", "internal_error",
 ];
 
@@ -696,6 +698,9 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     }
     if (journal && (journal.pending > 0 || journal.ambiguous > 0)) return "privacy_control_open";
     const counts = { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0 };
+    // ledger-s3 resetsCompleted: a reset begun but not finished is still applying its tombstones (a claim
+    // finishes it). Writing now could republish a session it is about to tombstone: skip, unmarked.
+    if (fence.resetsCompleted < fence.resets) return "reset_in_flight";
     if (fence.resets > 0) {
       // ledger-s3 `lastResetAtMs`: 0 means no reset time was recorded (it only ever rises).
       if (fence.lastResetAtMs === 0) return "reset_undeterminable";
@@ -783,7 +788,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
         addCounts(counts, toWrite.length);
         return "would_drain";
       }
-      const snapshot = { instance: fence.instance, version: fence.version, resets: fence.resets };
+      const snapshot = { instance: fence.instance, version: fence.version, resets: fence.resets, resetsCompleted: fence.resetsCompleted };
       const epochOf = (f: FenceDoc, s: string, id: string) => fenceEpoch(f, origin, sessionKeyHash(s, id));
       // Ownership (ingest_session_ownership) BEFORE any canonical write, as the claim: a reset that begins after
       // this lists these sessions. Then the fence again: if it moved, leave the batch for a rerun.
@@ -821,7 +826,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
         const journalMoved = (journalAfter?.seq ?? 0) !== (journal?.seq ?? 0) || (journalAfter?.pending ?? 0) > 0 || (journalAfter?.ambiguous ?? 0) > 0;
         const rearm = new Map(fencedSessions);
         for (const [pk, [s, id]] of writtenSessions) {
-          const reached = journalMoved || (!same && (now.state !== "present" || isDeleted(after, origin, s, id) || after.resets !== snapshot.resets || epochOf(after, s, id) !== epochOf(fence, s, id)));
+          const reached = journalMoved || (!same && (now.state !== "present" || isDeleted(after, origin, s, id) || after.resets !== snapshot.resets || after.resetsCompleted !== snapshot.resetsCompleted || epochOf(after, s, id) !== epochOf(fence, s, id)));
           if (reached) {
             rearm.set(pk, [s, id]);
             fencedNow.add(pk);
