@@ -60,10 +60,12 @@ permissions:
   actions: read
   deployments: read
 
-# One backlog operation at a time across every mode (the tools also hold their own S3 leases).
+# Dispatches serialise with every guarded production operator (apply-session-schema, ingest-generation-overlap,
+# index-prebuild-058000, owner-buffered-parity, ingest-admission-renewal): a backfill or export never reads the owner
+# database mid-apply or mid-rebind, and only one backlog operation runs at a time (the tools also hold S3 leases).
 # Proof runs get their own per-sha group so a push never queues behind (or cancels) a pending dispatch.
 concurrency:
-  group: ${{ github.event_name == 'workflow_dispatch' && 'guarded-backlog-ops-production' || format('backlog-ops-proof-{0}', github.sha) }}
+  group: ${{ github.event_name == 'workflow_dispatch' && 'guarded-session-schema-production' || format('backlog-ops-proof-{0}', github.sha) }}
   cancel-in-progress: false
 
 env:
@@ -115,14 +117,15 @@ jobs:
         id: gate
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          bun scripts/backlog-ops-github.ts
-          echo "environment=session-schema-production" >> "$GITHUB_OUTPUT"
+        # Writes environment=<the mode's protected environment> to GITHUB_OUTPUT: session-schema-production for a
+        # dry run, session-backlog-execute for an execute (src/session-ingest/backlog-ops.ts backlogOpsEnvironment).
+        run: bun scripts/backlog-ops-github.ts
 
   operate:
     needs: prerequisite-gate
     runs-on: ubuntu-latest
-    # Above the role session (6 hours is the hosted-runner cap): the tool cannot outlive its credentials unnoticed.
+    # Below the 6 h role session (and the 6 h hosted-runner cap): the job ends before its credentials expire, and the
+    # run refuses before the tool starts unless the session has at least 5 h left (checkStsExpiration).
     timeout-minutes: 355
     permissions:
       contents: read
@@ -172,10 +175,13 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.export_run }}
           github-token: ${{ github.token }}
-      # The only step with a credential: the owner URL secret, and the OIDC token it exchanges for the mode's role.
-      # Bucket, region, key and role ARNs are the environment's protected variables. The URL reaches the tool only
-      # over its stdin pipe; the role session only in the tool's environment. Nothing credential-like is logged.
-      - name: Run the backlog tool (only step with credentials)
+      # The only step given the owner URL secret, and the only step that requests the OIDC token and exchanges it for
+      # the mode's role. GitHub exposes ACTIONS_ID_TOKEN_REQUEST_* to every step of a job with id-token: write, so the
+      # job's other steps (checkout, setup-bun, install, gate, download-artifact) could request a token too. That is
+      # why only this job has id-token: write, the write role trusts only the execute environment's subject, and
+      # every action is first-party. Bucket, region, key and role ARNs are the environment's protected variables. The
+      # URL reaches the tool only over its stdin pipe; the role session only in the tool's environment.
+      - name: Run the backlog tool (the only step holding the DB secret or the role session)
         env:
           SUPABASE_MIGRATION_OWNER_URL: ${{ (startsWith(inputs.mode, 'backfill-') || startsWith(inputs.mode, 'export-')) && secrets.SUPABASE_MIGRATION_OWNER_URL || '' }}
           BACKLOG_OPS_BUCKET: ${{ vars.BACKLOG_OPS_BUCKET }}
