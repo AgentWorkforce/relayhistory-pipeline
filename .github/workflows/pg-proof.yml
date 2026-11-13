@@ -381,7 +381,7 @@ jobs:
         run: |
           set -o pipefail
           log=publication-pg${{ matrix.pg }}.log
-          bun test src/session-ingest/__tests__/publication.postgres.test.ts src/session-ingest/__tests__/operator-session-erase.postgres.test.ts src/session-ingest/__tests__/operator-session-erase-runtime.postgres.test.ts src/session-erase/__tests__/search-login.postgres.test.ts src/session-erase/__tests__/user-erase.postgres.test.ts 2>&1 | tee "$log"
+          bun test src/session-ingest/__tests__/publication.postgres.test.ts src/session-ingest/__tests__/operator-session-erase.postgres.test.ts src/session-ingest/__tests__/operator-session-erase-runtime.postgres.test.ts src/session-erase/__tests__/search-login.postgres.test.ts src/session-erase/__tests__/user-erase.postgres.test.ts src/session-erase/__tests__/account-reset.postgres.test.ts 2>&1 | tee "$log"
           # A green run must have executed tests, not skipped them.
           grep -Eq '^ *[1-9][0-9]* pass$' "$log"
           if grep -Eq '^ *[1-9][0-9]* skip$' "$log"; then echo "tests were skipped"; exit 1; fi
@@ -431,7 +431,7 @@ jobs:
             await s3("PUT", "?versioning", `<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>`);
           '
           log=frontier-plan-pg${{ matrix.pg }}.log
-          bun test src/session-ingest/__tests__/frontier-plan.postgres.test.ts src/session-erase/__tests__/selfhost-eraser.minio.test.ts src/session-erase/__tests__/operator-flow.minio.test.ts 2>&1 | tee "$log"
+          bun test src/session-ingest/__tests__/frontier-plan.postgres.test.ts src/session-erase/__tests__/selfhost-eraser.minio.test.ts src/session-erase/__tests__/operator-flow.minio.test.ts src/session-erase/__tests__/account-reset-versioned.test.ts 2>&1 | tee "$log"
           grep -Eq '^ *[1-9][0-9]* pass$' "$log"
           if grep -Eq '^ *[1-9][0-9]* skip$' "$log"; then echo "tests were skipped"; exit 1; fi
           grep -E '^ *[0-9]+ (pass|fail)$' "$log" | tr -s ' ' | paste -sd, | sed "s/^/frontier-plan PostgreSQL ${{ matrix.pg }}:/" >> "$GITHUB_STEP_SUMMARY"

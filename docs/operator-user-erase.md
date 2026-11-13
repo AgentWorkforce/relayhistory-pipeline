@@ -241,3 +241,54 @@ Rerunning the same `request_id` is always safe: a finished erase answers from it
    prebuilt indexes) and 058010, through the normal reviewed migration path.
 2. Store the eraser key and the owner URL in the secret store; never on disk.
 3. Run once against a non-production copy with a seeded user and confirm `verified: true`.
+
+## Admin account resets
+
+The admin dashboard submits a durable Cloud Neon job and links to its status. The
+services image runs it with `SERVICE=account-reset`, the user-erase configuration
+above, `RELAYCAST_URL` set to the HTTPS gateway origin and
+`ACCOUNT_RESET_CLOUD_DATABASE_URL` set to a direct/session-mode Cloud Neon URL
+with TLS verification. Run one supervised dispatcher. It holds a session advisory
+lock and replays external operations using their recorded targets.
+
+Deploy the registered Cloud Neon migration through the [Cloud migration PR](https://github.com/AgentWorkforce/cloud/pull/6248).
+The standalone SQL in this repository is a pipeline test fixture. Running it on a
+migrated database would attempt to create the same objects twice.
+The Cloud migration installs the queue, three submission/resume
+functions, and guards against rebinding retired Relaycast IDs. Grant the dashboard
+EXECUTE on the three public admin enqueue/resume functions and SELECT on the status
+columns of `admin_account_resets` (user_id, phase, legacy_relay_only, stalled,
+deferred_error, error_code and history_targets). The dashboard needs no queue DML.
+Both new tables use default-deny row-level security. Provision dedicated non-owner
+roles without BYPASSRLS. Grant the dashboard a SELECT policy on the queue. Grant
+the dispatcher SELECT and UPDATE policies on the queue and SELECT and INSERT
+policies on the retired-workspace table. Scope these policies to the corresponding
+roles and verify them before starting the dispatcher.
+
+The dispatcher needs SELECT/UPDATE on the job table and SELECT/INSERT on
+`admin_reset_retired_workspaces`. Its Cloud login reads organizations, users,
+memberships, workspaces and the Relaycast registry, including provider ID and key.
+It updates users, memberships, API tokens, workspace bindings and registry timestamps,
+and deletes the target's Cloud identity. The brief explicit table locks require
+the corresponding PostgreSQL LOCK privileges (including UPDATE on organizations).
+Use a dedicated role with the privileges needed by the installed invoker-rights
+legacy History reset function. It also reads legacy ownership and digest tables,
+revokes History auth sessions and deletes only the user's own probe connections.
+
+Submission captures the target's own private organizations and its owned Relaycast
+IDs. The dispatcher intersects that scope with current ownership and excludes
+organizations with another current or former member on record. It rechecks the
+confirmation and commits Cloud revocation, profile scrub and exact cleanup targets
+together. Legacy uploads use `reset_uploaded_sessions(org, workspace, user, request)`.
+A digest with another contributor or unattributed turns requires operator action.
+Modern uploads use the per-user eraser. For RH040, follow the published-session
+procedure above. Mixed published/buffered cases still require the erase owner.
+
+Before a Relaycast request the dispatcher checks the current registry owner, provider
+ID and every binding, records retirement and detaches the old Cloud bindings in
+one short transaction. It calls the engine's explicit-ID endpoint after commit.
+A 204 acknowledges retirement; the engine can finish physical removal in its reaper.
+A 401 or 404 cannot prove deletion: the job retains its target for investigation.
+Rate limits and outages retry. One failed cleanup can be deferred while the other
+finishes. The job remains incomplete until the pending cleanup is acknowledged.
+After repairing the cause, use the status page to resume the stored job.
