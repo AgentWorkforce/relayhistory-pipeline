@@ -31,8 +31,9 @@
  *                 privacy authority not fenced; the lazy policy valid now; the mirrored head at the policy's control
  *                 epoch and not pending, with `owner_buffered_parity_expected` (reused as is) proving receipts exactly
  *                 1..version at that epoch with the head's tip digest and kind and none on another epoch; an absent
- *                 head counts as version 0 only while the privacy authority is ACTIVE (its heads are authoritative),
- *                 else it is unproven; and the owner's G2 parity row matching that head and the deletion-set,
+ *                 head counts as version 0 only when the privacy authority is ACTIVE on the policy's control epoch,
+ *                 the user has no receipt on any epoch, and the current parity row proves no_head; else it is
+ *                 unproven; and the owner's G2 parity row matching that head and the deletion-set,
  *                 reset-set and lineage digests recomputed now. A closed gate is not live, counted by reason
  *                 (`gated`). The export role must be able to run the owner-only parity function (the owner login).
  *   the S3 fence  the user's S3 fence as the export saw it (instance, resets, resetsCompleted, and the epoch of every
@@ -67,7 +68,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore, type ObjectVersion } from "../shared/vendor.ts";
 import {
-  ACCEPTED_SUFFIX, SUPERSEDED_SUFFIX, acceptedCompleteKey, acquireDrainLock, assertDrainUnlocked, parseAcceptedComplete, parseAcceptedMarker, parseStagedKey,
+  ACCEPTED_SUFFIX, SUPERSEDED_SUFFIX, acceptedCompleteKey, acquireExclusiveLock, assertDrainUnlocked, assertPeerUnlocked, drainLockKey, exportLockKey, parseAcceptedComplete, parseAcceptedMarker, parseStagedKey,
   DRAIN_LOCK_TTL_MS, type AcceptedComplete, type AcceptedMarker, type DrainLease, type SupersededRecord,
 } from "./buffered-drain.ts";
 import { fenceEpoch, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "./ledger-s3.ts";
@@ -80,7 +81,7 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const sha256Hex = (v: string) => createHash("sha256").update(v).digest("hex");
 export const MAX_EXPORT_CONCURRENCY = 16;
-export const exportLockKey = (keyRoot: string) => `${keyRoot}/.drain/export-lock.json`;
+export { exportLockKey };
 
 export interface ExportSql {
   query(sql: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
@@ -189,6 +190,7 @@ WITH pol AS MATERIALIZED (
          EXISTS (SELECT 1 FROM sessions.ingest_lazy_policy AS lp WHERE lp.singleton AND lp.valid_until > clock_timestamp()) AS pol_valid,
          EXISTS (SELECT 1 FROM sessions.ingest_privacy_authority AS pa WHERE pa.singleton AND pa.state = 'fenced') AS authority_fenced,
          EXISTS (SELECT 1 FROM sessions.ingest_privacy_authority AS pa WHERE pa.singleton AND pa.state = 'active') AS authority_active,
+         (SELECT pa.control_epoch FROM sessions.ingest_privacy_authority AS pa WHERE pa.singleton) AS authority_epoch,
          (SELECT ck.control_epoch FROM sessions.ingest_receipt_seat_clock AS ck WHERE ck.singleton) AS clock_epoch,
          (SELECT ck.source_identity_sha256 FROM sessions.ingest_receipt_seat_clock AS ck WHERE ck.singleton) AS clock_identity,
          coalesce((SELECT bool_or(cp.read_enabled AND cp.write_enabled AND cp.backfill_complete_at IS NOT NULL)
@@ -217,14 +219,19 @@ ${CANDIDATE_FROM}
   -- The head is the mirrored current head (ingest_source_control_heads), never max(receipts): it must be at the
   -- policy's control epoch and not pending, and owner_buffered_parity_expected (reused as is) must prove the user's
   -- receipts are exactly 1..version at that epoch with the head's tip digest and kind, and none on another epoch. An
-  -- absent head is version 0 only when proven absent: the privacy authority is ACTIVE (its heads are authoritative).
+  -- absent head is version 0 only when proven absent (all four conditions below).
   -- Then the owner's G2 parity row must match that head and the digests recomputed now. The first failing check names
   -- the reason; a NULL reason is an open gate.
   SELECT u.org_id, u.workspace_id, u.user_id, coalesce(h.version, 0) AS head_version,
          CASE
            WHEN pol.authority_fenced THEN 'privacy_fenced'
            WHEN NOT pol.pol_valid OR pol.pol_epoch IS NULL OR pol.pol_baseline IS NULL THEN 'policy_invalid'
-           WHEN h.org_id IS NULL AND NOT pol.authority_active THEN 'head_unproven'
+           -- An absent head is version 0 only when ALL hold: the privacy authority is active, on the policy's control
+           -- epoch; the user has no receipt on ANY epoch; and the current G2 parity row proves no_head.
+           WHEN h.org_id IS NULL AND NOT coalesce(pol.authority_active AND pol.authority_epoch = pol.pol_epoch
+             AND NOT EXISTS (SELECT 1 FROM sessions.ingest_control_receipts AS r
+                              WHERE r.org_id = u.org_id AND r.workspace_id = u.workspace_id AND r.user_id = u.user_id)
+             AND par.org_id IS NOT NULL AND par.no_head, false) THEN 'head_unproven'
            WHEN h.pending IS NOT FALSE AND h.org_id IS NOT NULL THEN 'head_pending'
            WHEN h.org_id IS NOT NULL AND h.epoch IS DISTINCT FROM pol.pol_epoch THEN 'head_foreign_epoch'
            WHEN NOT coalesce(x.receipts_ok, false) THEN 'receipts_mismatch'
@@ -443,10 +450,13 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
     }
   }
 
-  // One export at a time (finding 9): the drain's fenced lease, under its own key.
+  // One export at a time (finding 9): the drain's fenced lease, under its own key. Never beside a drain (third
+  // review): both modes refuse while the drain's lease is live (drain_peer_locked).
   let lease: DrainLease | undefined;
-  if (opts.dryRun) await assertDrainUnlocked(opts.store, opts.keyRoot, nowMs(), exportLockKey(opts.keyRoot));
-  else lease = await acquireDrainLock(store, opts.keyRoot, { holder: `export-${randomUUID()}`, ttlMs: opts.lockTtlMs ?? DRAIN_LOCK_TTL_MS, now: nowMs, key: exportLockKey(opts.keyRoot) });
+  if (opts.dryRun) {
+    await assertDrainUnlocked(opts.store, opts.keyRoot, nowMs(), exportLockKey(opts.keyRoot));
+    await assertPeerUnlocked(opts.store, drainLockKey(opts.keyRoot), nowMs());
+  } else lease = await acquireExclusiveLock(store, opts.keyRoot, { holder: `export-${randomUUID()}`, ttlMs: opts.lockTtlMs ?? DRAIN_LOCK_TTL_MS, now: nowMs, key: exportLockKey(opts.keyRoot), peerKey: drainLockKey(opts.keyRoot) });
   const ttl = opts.lockTtlMs ?? DRAIN_LOCK_TTL_MS;
   const renew = lease ? setInterval(() => { lease!.renew().catch(() => {}); }, Math.max(500, Math.floor(ttl / 3))) : undefined;
   const leaseOk = () => opts.dryRun || (lease !== undefined && lease.alive());

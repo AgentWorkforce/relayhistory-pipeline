@@ -595,10 +595,12 @@ export function parseDrainHold(text: string): DrainHold | null {
  */
 export const DRAIN_LOCK_TTL_MS = 15 * 60_000;
 export const drainLockKey = (keyRoot: string) => `${keyRoot}/.drain/lock.json`;
+/** The accepted-stage export's lease (accepted-stage-export.ts): the drain and the export exclude each other. */
+export const exportLockKey = (keyRoot: string) => `${keyRoot}/.drain/export-lock.json`;
 interface DrainLockBody { v: 1; kind: "buffered-drain-lock"; holder: string; expiresAtMs: number; token?: number }
 
 export class DrainLockError extends Error {
-  constructor(readonly code: "drain_locked" | "drain_lock_invalid" | "drain_lock_lost") {
+  constructor(readonly code: "drain_locked" | "drain_peer_locked" | "drain_lock_invalid" | "drain_lock_lost") {
     super(code);
     this.name = "DrainLockError";
   }
@@ -623,6 +625,30 @@ async function readLock(store: ObjectStore, key: string): Promise<{ body: DrainL
 export async function assertDrainUnlocked(store: ObjectStore, keyRoot: string, nowMs: number, key = drainLockKey(keyRoot)): Promise<void> {
   const held = await readLock(store, key);
   if (held && held.body.expiresAtMs > nowMs) throw new DrainLockError("drain_locked");
+}
+
+/**
+ * The drain and the accepted-stage export never run beside each other (an export rewrites the verdicts a drain acts
+ * on): each refuses, in both modes, while the other's lease is live (`drain_peer_locked`; unreadable is held).
+ */
+export async function assertPeerUnlocked(store: ObjectStore, peerKey: string, nowMs: number): Promise<void> {
+  const held = await readLock(store, peerKey);
+  if (held && held.body.expiresAtMs > nowMs) throw new DrainLockError("drain_peer_locked");
+}
+
+/**
+ * Take this run's lease, THEN check the peer's: two runs starting together both see the other and both refuse, never
+ * both run. A refused lease is expired in place.
+ */
+export async function acquireExclusiveLock(store: ObjectStore, keyRoot: string, opts: { holder: string; ttlMs: number; now: () => number; key?: string; peerKey: string }): Promise<DrainLease> {
+  const lease = await acquireDrainLock(store, keyRoot, opts);
+  try {
+    await assertPeerUnlocked(store, opts.peerKey, opts.now());
+  } catch (error) {
+    await lease.release();
+    throw error;
+  }
+  return lease;
 }
 
 export interface DrainLease {
@@ -750,9 +776,11 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   let lease: DrainLease | undefined;
   let lockLost: unknown;
   let renewTimer: ReturnType<typeof setInterval> | undefined;
-  if (opts.dryRun) await assertDrainUnlocked(opts.store, opts.keyRoot, nowMs());
-  else {
-    lease = await acquireDrainLock(raw, opts.keyRoot, { holder: opts.lockHolder ?? `drain-${randomUUID()}`, ttlMs: lockTtlMs, now: nowMs });
+  if (opts.dryRun) {
+    await assertDrainUnlocked(opts.store, opts.keyRoot, nowMs());
+    await assertPeerUnlocked(opts.store, exportLockKey(opts.keyRoot), nowMs());
+  } else {
+    lease = await acquireExclusiveLock(raw, opts.keyRoot, { holder: opts.lockHolder ?? `drain-${randomUUID()}`, ttlMs: lockTtlMs, now: nowMs, peerKey: exportLockKey(opts.keyRoot) });
     let renewing = false;
     renewTimer = setInterval(() => {
       if (renewing || lockLost !== undefined) return;

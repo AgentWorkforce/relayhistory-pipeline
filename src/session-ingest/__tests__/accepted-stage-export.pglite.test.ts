@@ -403,7 +403,8 @@ describe("accepted-stage export (0005 step 0b): SQL's own verdict per stage", ()
     const store = scratch();
     await backfillFence(store, A);
     const s = await seed(A, one, { prove: false });
-    expect((await exportOne(store, s)).summary.gated).toMatchObject({ parity_missing: 1 });
+    // With no head, a missing proof fails the absent-head proof first (head_unproven); with a head it is parity_missing.
+    expect((await exportOne(store, s)).summary.gated).toMatchObject({ head_unproven: 1 });
     expect((await verdict(store, s.key))!.live).toBe(false);
     await prove(A);
     expect((await exportOne(store, s)).v.live).toBe(true);
@@ -475,6 +476,78 @@ describe("accepted-stage export (0005 step 0b): SQL's own verdict per stage", ()
     const { summary, v } = await exportOne(store, s);
     expect(v.live).toBe(false);
     expect(summary.gated).toMatchObject({ head_unproven: 1 });
+  });
+
+  test("finding 4 (third round): an absent head is 0 only with an active authority on the policy's epoch, no receipt anywhere, and a no-head proof", async () => {
+    const cases: [string, () => Promise<void>][] = [
+      ["authority on another epoch", async () => {
+        await db.exec("SET session_replication_role = replica");
+        await db.query("UPDATE sessions.ingest_privacy_authority SET control_epoch = $1", [hex("9")]);
+        await db.exec("SET session_replication_role = origin");
+      }],
+      ["a receipt on another epoch", async () => {
+        await db.exec("SET session_replication_role = replica");
+        await db.query(`INSERT INTO sessions.ingest_control_receipts (org_id, workspace_id, user_id, epoch, version, digest, kind, result, schema_generation) VALUES ($1,$2,$3,$4,1,$5,'selection','{}',$6)`, [A.orgId, A.workspaceId, A.userId, hex("9"), hex("d"), GEN]);
+        await db.exec("SET session_replication_role = origin");
+        await prove(A);
+      }],
+      ["no parity row", async () => {
+        await db.exec("SET session_replication_role = replica; DELETE FROM sessions.owner_buffered_parity; SET session_replication_role = origin;");
+      }],
+      ["a parity row proving a head", async () => {
+        await db.exec("SET session_replication_role = replica");
+        await db.query("UPDATE sessions.owner_buffered_parity SET no_head = false, head_epoch = $1, head_version = 1, head_digest = $2, head_kind = 'selection'", [POLICY_EPOCH, hex("d")]);
+        await db.exec("SET session_replication_role = origin");
+      }],
+    ];
+    for (const [name, arrange] of cases) {
+      const store = scratch();
+      await backfillFence(store, A);
+      const s = await seed(A, one);
+      expect([name, (await exportOne(store, s)).v.live]).toEqual([name, true]); // all four hold: version 0
+      await arrange();
+      const { summary, v } = await exportOne(store, s);
+      expect([name, v.live, summary.gated]).toEqual([name, false, { head_unproven: 1 }]);
+      await db.exec(`SET session_replication_role = replica; DELETE FROM sessions.ingest_control_receipts; DELETE FROM sessions.owner_buffered_parity;
+        DELETE FROM sessions.ingest_buffer_outbox; SET session_replication_role = origin;`);
+      await setAuthority("active");
+    }
+  });
+
+  test("finding 3: with a proven head, a missing parity row is parity_missing", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    await putHead(A, { version: 1, digest: hex("d"), kind: "selection" });
+    const s = await seed(A, one, { admVersion: 1, prove: false });
+    const { summary, v } = await exportOne(store, s);
+    expect(v.live).toBe(false);
+    expect(summary.gated).toEqual({ parity_missing: 1 });
+  });
+
+  test("third review: the export and the drain exclude each other, in both modes, both directions", async () => {
+    const store = scratch();
+    await backfillFence(store, A);
+    await grantAuthority(store);
+    const s = await stageInBoth(store, one);
+    const T0 = 1_893_542_400_000;
+    const drainRun = (dryRun: boolean) => drainBufferedBatches({ store, keyRoot: ROOT, orgs: [A.orgId], dryRun, sleep: async () => {}, now: () => new Date(T0),
+      decompress: (b) => new Uint8Array(zstdDecompressSync(b, { maxOutputLength: BUFFER_STAGE_MAX_BYTES })) });
+    // A live drain lease: the export refuses in both modes and writes nothing.
+    const drainLease = await acquireDrainLock(store, ROOT, { holder: "drain-other", ttlMs: 60_000, now: () => T0 });
+    await expect(run(store, { dryRun: true })).rejects.toThrow("drain_peer_locked");
+    await expect(run(store)).rejects.toThrow("drain_peer_locked");
+    expect(await exists(store, s.key + ACCEPTED_SUFFIX)).toBe(false);
+    // The refused export expired its own lease in place: it does not block anyone.
+    expect(JSON.parse(await readText(store, exportLockKey(ROOT))).expiresAtMs).toBe(0);
+    await drainLease.release();
+    expect((await run(store)).written).toBe(1);
+    // A live export lease: the drain refuses in both modes and writes nothing.
+    const exportLease = await acquireDrainLock(store, ROOT, { holder: "export-other", ttlMs: 60_000, now: () => T0, key: exportLockKey(ROOT) });
+    await expect(drainRun(true)).rejects.toThrow("drain_peer_locked");
+    await expect(drainRun(false)).rejects.toThrow("drain_peer_locked");
+    expect(await exists(store, s.key + ".drained.json")).toBe(false);
+    await exportLease.release();
+    expect((await drainRun(false)).objects.drained).toBe(1);
   });
 
   test("finding 5: with the claim-sessions reader gate off, the export refuses before any write", async () => {
