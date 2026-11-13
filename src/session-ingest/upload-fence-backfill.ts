@@ -1,52 +1,50 @@
 /**
  * The one-time S3 ledger backfill (docs/decisions/0005-s3-native-upload-ledger.md, "The buffered backlog",
- * step 0, and #580's fence-authority preconditions). At cutover S3 must know what SQL knows, in #580's
- * ledger-s3 formats and through its exported rules only (no local copy of any format or rule):
+ * step 0, and the fence-authority marker's `fenceBackfill` / `ownershipBackfill` / `revisionBackfill`). At cutover
+ * S3 must know what SQL knows, in ledger-s3's formats and through its exported rules only:
  *
  *   fences     every user with any upload state (upload_deletions, upload_resets, ingest_session_ownership,
- *              ingest_record_revisions, ingest_batches) gets `upload-fences.json`: `editFence` (an absent fence
- *              starts from `newFence()`), SQL's deletions and resets applied with `applyFenceChange` (a new
- *              deletion bumps the session's epoch; a new reset request id is recorded with its tombstone
- *              count, increments `resets` and raises `lastResetAtMs` to SQL's `reset_at`, rounded up to the
- *              ms). Each backfilled reset is recorded with its final count, so `resetsCompleted == resets`
- *              (a backfilled reset is complete by definition); a fence that still holds a reset in flight
- *              (the control mirror's) is counted `resets_in_flight` and leaves the section incomplete.
+ *              ingest_record_revisions, owned ingest_lazy_native_slots, ingest_batches) gets `upload-fences.json`:
+ *              `editFence` (absent starts from `newFence()`; main sets v1/v2), SQL's deletions and resets applied
+ *              with `applyFenceChange` (a new deletion bumps the session's epoch; a new reset request id is recorded
+ *              with its tombstone count, increments `resets`, raises `lastResetAtMs`; resetsCompleted == resets).
+ *              - A deletion S3 has SUPERSEDED is not re-applied (finding 5): the control mirror ordered that session
+ *                (`controlOrder`), or S3 disabled and re-enabled it (epoch > 0, not deleted). Counted.
+ *              - A COLD-IMPORTED reset (the seed's baseline import, `ingest_seed_fence_baseline`: its `reset_at` is
+ *                the import time, not the reset's) is recorded at time 1: the baseline import requires the user to
+ *                have no batch yet, so it predates every batch of the user. If that does not hold for the user
+ *                (a batch claimed at or before the import), the user gets NO fence and is `needs_review`: the drain
+ *                refuses them rather than drop their stages as pre-reset.
  *              A user with no controls still gets an (empty) fence: the drain refuses an absent one.
- *   ownership  `ingest_session_ownership` (written at claim, so pending and committed claims alike) into the
- *              ownership stubs (`registerOwner`), at the backfilled fence's current generation
- *              (`recordGeneration`), so a later reset lists sessions owned only in SQL.
- *   revisions  SQL's stored revisions into the per-origin revision shards (`mergeIndex`) as current-generation
- *              entries, so #250 stale checks hold at cutover. mergeIndex never lowers a stored revision (an
- *              equal one keeps the stored entry). Two sources, as SQL's claim reads them:
- *                - `ingest_record_revisions`, including the operator seed's revision-only rows
- *                  (`ingest_seed_proven_records`: no revision id or digest), as revision-only entries;
- *                - `ingest_lazy_native_slots` (the buffered/lazy stale source: revision + digest, no revision id),
- *                  under the slot's owner (`current_owner`) and session (`current_source`, `current_session`),
- *                  so S3 forgets them exactly when SQL's `ingest_lazy_clear` clears them (a disable of that
- *                  session, or a reset; a session-less slot never). Slots with no owner (cleared, or an erase
- *                  tombstone) hold no revision and are skipped.
- *              Every entry is validated with ledger-s3 `checkIndexEntryInput`.
+ *   ownership  the distinct sessions SQL's reset would own (finding 3): `ingest_session_ownership` (claims, pending
+ *              and committed), the sessions of `ingest_record_revisions`, and the sessions of owned lazy native
+ *              slots; each a stub (`registerOwner`) at the backfilled fence's generation, with the writer machine.
+ *   revisions  SQL's stored revisions into the per-origin shards (`mergeIndex`, never lowering a stored revision):
+ *              `ingest_record_revisions` (seeded rows as revision-only entries) and owned `ingest_lazy_native_slots`
+ *              (under the slot's owner and session, so S3 forgets them exactly when SQL's `ingest_lazy_clear` does).
  *
- * SQL is read-only: one `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` snapshot, checked with
- * `SHOW transaction_read_only`, always ended by ROLLBACK; SELECTs only, keyset-paged, optionally scoped to
- * a set of orgs. Every write is a ledger-s3 CAS or create; rerunning is a no-op for what is already there.
+ * SQL (finding 8): no long snapshot and nothing held whole in memory. Every page is its own short `BEGIN ISOLATION
+ * LEVEL REPEATABLE READ READ ONLY` transaction, checked with `SHOW transaction_read_only`, always ended by ROLLBACK;
+ * SELECTs only, keyset-paged in a stable order, optionally scoped to orgs. Fences are read from S3 per page.
  *
- * Fail closed: a fence that is unreadable is never rewritten, and a user with ANY row the ledger cannot
- * represent (an empty id, a `__proto__` key) gets no fence at all, so the drain keeps refusing them. Rows of
- * a user without a backfilled fence are skipped (`skipped_no_fence`). Each section reports `complete` only
- * when nothing was skipped for those reasons or failed: #580's fence-authority marker records
- * `fenceBackfill`, `ownershipBackfill` and `revisionBackfill` from these.
- *
- * Nothing here logs; the summary holds counts only: never a tenant id, session id, record id or key.
+ * Fail closed: an unreadable fence is never rewritten; a user with any unrepresentable row gets no fence. Each
+ * section reports `complete` only when nothing was skipped for want of a fence, needed review, was invalid or failed.
+ * Nothing here logs; the summary holds counts only.
  */
 import type { ObjectStore } from "../shared/vendor.ts";
-import { applyFenceChange, checkIndexEntryInput, isDeleted, newFence, recordGeneration, s3LedgerObjects, type FenceChange, type FenceDoc, type IndexEntryInput } from "./ledger-s3.ts";
+import {
+  applyFenceChange, checkIndexEntryInput, fenceEpoch, isDeleted, newFence, recordGeneration, s3LedgerObjects, sessionKeyHash,
+  type FenceChange, type FenceDoc, type IndexEntryInput,
+} from "./ledger-s3.ts";
 import type { LedgerTenant } from "./ledger.ts";
+import { liveMachineId } from "./writer.ts";
 
 const ORG = /^(?!\.)[A-Za-z0-9._-]{1,128}$/;
 export const MAX_BACKFILL_CONCURRENCY = 16;
 export type BackfillSection = "fences" | "ownership" | "revisions";
 export const BACKFILL_SECTIONS: readonly BackfillSection[] = ["fences", "ownership", "revisions"];
+/** A cold-imported reset's time: before every batch of the user (see the header). */
+export const COLD_RESET_AT_MS = 1;
 
 export interface BackfillSql {
   query(sql: string, params?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
@@ -57,9 +55,7 @@ export interface BackfillOptions {
   store: ObjectStore;
   keyRoot: string;
   dryRun: boolean;
-  /** Only these orgs (exact org ids). Default: every org in the tables. */
   orgs?: string[];
-  /** Default all three. Ownership and revisions need the fences (backfilled now, or in an earlier run). */
   sections?: BackfillSection[];
   /** Users per fence page (default 500); rows per ownership/revision page (default 5000). */
   pageSize?: number;
@@ -77,61 +73,78 @@ export interface BackfillSummary {
     deletion_rows: number; reset_rows: number;
     created: number; updated: number; unchanged: number; would_create: number; would_update: number;
     pairs_added: number; resets_added: number;
+    /** SQL deletions not re-applied because S3 has a newer control for the session (finding 5). */
+    deletions_superseded: number;
+    /** Cold-imported resets recorded at COLD_RESET_AT_MS. */
+    cold_resets: number;
+    /** Users given no fence because a cold-imported reset could not be placed before all their batches. */
+    needs_review: number;
     unreadable: number; contended: number; tenant_invalid: number; input_invalid: number; failed: number;
-    /** Fences left with a reset begun and not finished (resetsCompleted < resets): a mirrored reset in flight. */
     resets_in_flight: number;
   };
   ownership: { rows: number; registered: number; would_register: number; unchanged: number; skipped_deleted: number; skipped_no_fence: number; invalid: number; failed: number };
   revisions: {
-    /** ingest_record_revisions rows, of which `seed_rows` revision-only (the operator seed). */
     rows: number; seed_rows: number;
-    /** ingest_lazy_native_slots rows, of which `slots_empty` hold no revision (no owner). */
     slot_rows: number; slots_empty: number;
     merged: number; would_merge: number; skipped_deleted: number; skipped_no_fence: number; invalid: number; shards: number; failed: number;
   };
-  /** Per section: complete (nothing skipped for want of a fence, nothing invalid or failed), incomplete, or not run. */
   sections: Record<BackfillSection, "complete" | "incomplete" | "not_run">;
 }
 
-const USERS = `
+const SCOPE = `($1::text[] IS NULL OR org_id = ANY($1::text[]))`;
+/** Users, keyset-paged (stable: org, workspace, user). */
+const USERS_PAGE = `
 SELECT DISTINCT org_id, workspace_id, user_id FROM (
-  SELECT org_id, workspace_id, user_id FROM sessions.upload_deletions
-  UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.upload_resets
-  UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.ingest_session_ownership
-  UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.ingest_record_revisions
-  UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.ingest_batches
-  UNION ALL SELECT org_id, workspace_id, current_owner FROM sessions.ingest_lazy_native_slots WHERE current_owner IS NOT NULL
+  SELECT org_id, workspace_id, user_id FROM sessions.upload_deletions WHERE ${SCOPE}
+  UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.upload_resets WHERE ${SCOPE}
+  UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.ingest_session_ownership WHERE ${SCOPE}
+  UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.ingest_record_revisions WHERE ${SCOPE}
+  UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.ingest_batches WHERE ${SCOPE}
+  UNION ALL SELECT org_id, workspace_id, current_owner FROM sessions.ingest_lazy_native_slots WHERE ${SCOPE} AND current_owner IS NOT NULL
 ) AS u
-WHERE ($1::text[] IS NULL OR org_id = ANY($1::text[]))
-ORDER BY org_id, workspace_id, user_id`;
+WHERE (org_id, workspace_id, user_id) > ($2::text, $3::text, $4::text)
+ORDER BY org_id, workspace_id, user_id
+LIMIT $5::int`;
 const DELETIONS_FOR = `
 SELECT d.org_id, d.workspace_id, d.user_id, d.origin_id, d.source, d.session_id
 FROM sessions.upload_deletions AS d
 JOIN unnest($1::text[], $2::text[], $3::text[]) AS p(o, w, u) ON d.org_id = p.o AND d.workspace_id = p.w AND d.user_id = p.u
 ORDER BY d.org_id, d.workspace_id, d.user_id, d.origin_id, d.source, d.session_id`;
+/** Resets, with the cold-import evidence: the user's seed baseline import time, and whether a batch predates it. */
 const RESETS_FOR = `
 SELECT r.org_id, r.workspace_id, r.user_id, r.request_id, r.deleted,
-       ceil(extract(epoch FROM r.reset_at) * 1000)::bigint AS at_ms
+       ceil(extract(epoch FROM r.reset_at) * 1000)::bigint AS at_ms,
+       (bl.imported_at IS NOT NULL AND r.reset_at <= bl.imported_at) AS cold,
+       EXISTS (SELECT 1 FROM sessions.ingest_batches AS b
+                WHERE b.org_id = r.org_id AND b.workspace_id = r.workspace_id AND b.user_id = r.user_id
+                  AND bl.imported_at IS NOT NULL AND b.claimed_at <= bl.imported_at) AS batch_before_import
 FROM sessions.upload_resets AS r
 JOIN unnest($1::text[], $2::text[], $3::text[]) AS p(o, w, u) ON r.org_id = p.o AND r.workspace_id = p.w AND r.user_id = p.u
+LEFT JOIN sessions.ingest_seed_fence_baselines AS bl
+  ON bl.org_id = r.org_id AND bl.workspace_id = r.workspace_id AND bl.user_id = r.user_id
 ORDER BY r.org_id, r.workspace_id, r.user_id, r.reset_at, r.request_id`;
+/** The sessions SQL's reset would own (finding 3), distinct, keyset-paged. */
 const OWNERSHIP_PAGE = `
-SELECT org_id, workspace_id, user_id, origin_id, source, session_id FROM sessions.ingest_session_ownership
-WHERE ($1::text[] IS NULL OR org_id = ANY($1::text[]))
-  AND (org_id, workspace_id, user_id, origin_id, source, session_id) > ($2::text, $3::text, $4::text, $5::text, $6::text, $7::text)
+SELECT DISTINCT org_id, workspace_id, user_id, origin_id, source, session_id FROM (
+  SELECT org_id, workspace_id, user_id, origin_id, source, session_id FROM sessions.ingest_session_ownership WHERE ${SCOPE}
+  UNION ALL SELECT org_id, workspace_id, user_id, origin_id, source, session_id FROM sessions.ingest_record_revisions
+   WHERE ${SCOPE} AND session_id IS NOT NULL
+  UNION ALL SELECT org_id, workspace_id, current_owner, origin_id, current_source, current_session FROM sessions.ingest_lazy_native_slots
+   WHERE ${SCOPE} AND current_owner IS NOT NULL AND current_source IS NOT NULL AND current_session IS NOT NULL
+) AS o
+WHERE (org_id, workspace_id, user_id, origin_id, source, session_id) > ($2::text, $3::text, $4::text, $5::text, $6::text, $7::text)
 ORDER BY org_id, workspace_id, user_id, origin_id, source, session_id
 LIMIT $8::int`;
 const SLOTS_PAGE = `
 SELECT key_sha256, org_id, workspace_id, origin_id, record_id, current_owner, current_source, current_session, current_revision, current_digest
 FROM sessions.ingest_lazy_native_slots
-WHERE ($1::text[] IS NULL OR org_id = ANY($1::text[])) AND key_sha256 > $2::text
+WHERE ${SCOPE} AND key_sha256 > $2::text
 ORDER BY key_sha256
 LIMIT $3::int`;
 const REVISIONS_PAGE = `
 SELECT org_id, workspace_id, origin_id, record_id, revision, revision_id, digest, user_id, source, session_id
 FROM sessions.ingest_record_revisions
-WHERE ($1::text[] IS NULL OR org_id = ANY($1::text[]))
-  AND (org_id, workspace_id, origin_id, record_id) > ($2::text, $3::text, $4::text, $5::text)
+WHERE ${SCOPE} AND (org_id, workspace_id, origin_id, record_id) > ($2::text, $3::text, $4::text, $5::text)
 ORDER BY org_id, workspace_id, origin_id, record_id
 LIMIT $6::int`;
 
@@ -153,7 +166,42 @@ async function mapLimit<T>(items: readonly T[], limit: number, fn: (item: T) => 
   }));
 }
 
-/** One read-only snapshot; S3 written only through ledger-s3's exports. Counts only. */
+/** One user's SQL control state, as read. */
+interface UserControls {
+  tenant: LedgerTenant;
+  deletions: Map<string, [string, string][]>;
+  resets: { requestId: string; atMs: number; result: number; cold: boolean }[];
+  invalid: boolean;
+  needsReview: boolean;
+}
+
+/**
+ * SQL's controls applied to `f` with ledger-s3's rules (in place). A deletion S3 has superseded is skipped: the mirror
+ * ordered that session since (controlOrder), or S3 disabled and re-enabled it (an epoch, no tombstone).
+ */
+export function applySqlControls(f: FenceDoc, st: Pick<UserControls, "deletions" | "resets">): { changed: boolean; pairs: number; resets: number; superseded: number } {
+  let changed = false, pairs = 0, resets = 0, superseded = 0;
+  const deletions: FenceChange["deletions"] = [];
+  for (const [originId, sessions] of st.deletions) {
+    const keep = sessions.filter(([s, sid]) => {
+      const sk = sessionKeyHash(s, sid);
+      const ordered = f.controlOrder?.sessions && Object.hasOwn(f.controlOrder.sessions, originId) && Object.hasOwn(f.controlOrder.sessions[originId]!, sk);
+      const lifted = fenceEpoch(f, originId, sk) > 0 && !isDeleted(f, originId, s, sid);
+      if (ordered || lifted) { superseded++; return false; }
+      return true;
+    });
+    if (keep.length) deletions.push({ originId, sessions: keep });
+  }
+  for (const c of [{ deletions } as FenceChange, ...st.resets.map((r) => ({ reset: { requestId: r.requestId, atMs: r.atMs, result: r.result } }))]) {
+    const r = applyFenceChange(f, c);
+    changed ||= r.changed;
+    pairs += r.newlyDeleted.length;
+    if (r.reset === "recorded") resets++;
+  }
+  return { changed, pairs, resets, superseded };
+}
+
+/** Paged, short-transaction, read-only S3 ledger backfill. Counts only. */
 export async function backfillUploadFences(opts: BackfillOptions): Promise<BackfillSummary> {
   const pageSize = opts.pageSize ?? 500;
   const rowPageSize = opts.rowPageSize ?? 5_000;
@@ -181,44 +229,78 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   const io = s3LedgerObjects(store, opts.keyRoot, { ...(opts.sleep ? { sleep: opts.sleep } : {}), ...(opts.random ? { random: opts.random } : {}) });
   const summary: BackfillSummary = {
     mode: opts.dryRun ? "dry_run" : "execute", users: 0,
-    fences: { deletion_rows: 0, reset_rows: 0, created: 0, updated: 0, unchanged: 0, would_create: 0, would_update: 0, pairs_added: 0, resets_added: 0, unreadable: 0, contended: 0, tenant_invalid: 0, input_invalid: 0, failed: 0, resets_in_flight: 0 },
+    fences: { deletion_rows: 0, reset_rows: 0, created: 0, updated: 0, unchanged: 0, would_create: 0, would_update: 0, pairs_added: 0, resets_added: 0,
+      deletions_superseded: 0, cold_resets: 0, needs_review: 0, unreadable: 0, contended: 0, tenant_invalid: 0, input_invalid: 0, failed: 0, resets_in_flight: 0 },
     ownership: { rows: 0, registered: 0, would_register: 0, unchanged: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, failed: 0 },
-    revisions: { rows: 0, merged: 0, would_merge: 0, skipped_deleted: 0, seed_rows: 0, slot_rows: 0, slots_empty: 0, skipped_no_fence: 0, invalid: 0, shards: 0, failed: 0 },
+    revisions: { rows: 0, seed_rows: 0, slot_rows: 0, slots_empty: 0, merged: 0, would_merge: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, shards: 0, failed: 0 },
     sections: { fences: "not_run", ownership: "not_run", revisions: "not_run" },
   };
-  /** Each user's fence as it stands after the fence section (or as read, when that section is not run). */
-  const fences = new Map<string, FenceDoc>();
   const { sql } = opts;
 
-  await sql.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
-  try {
-    const ro = (await sql.query("SHOW transaction_read_only")).rows[0]?.transaction_read_only;
-    if (ro !== "on") throw new Error("backfill_not_read_only");
-    await sql.query(`SET LOCAL statement_timeout = ${statementTimeoutMs}`);
-    const users = (await sql.query(USERS, [orgs])).rows.map((r) => [text(r.org_id), text(r.workspace_id), text(r.user_id)] as [string, string, string]);
-    summary.users = users.length;
+  /** One short, verified read-only transaction per page (finding 8). */
+  async function readOnly(query: string, params: unknown[]): Promise<Record<string, unknown>[]> {
+    await sql.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    try {
+      const ro = (await sql.query("SHOW transaction_read_only")).rows[0]?.transaction_read_only;
+      if (ro !== "on") throw new Error("backfill_not_read_only");
+      await sql.query(`SET LOCAL statement_timeout = ${statementTimeoutMs}`);
+      return (await sql.query(query, params)).rows;
+    } finally {
+      await sql.query("ROLLBACK").catch(() => {});
+    }
+  }
 
-    // ---- fences ----
-    for (let at = 0; at < users.length; at += pageSize) {
-      const page = users.slice(at, at + pageSize);
-      const cols = [page.map((p) => p[0]), page.map((p) => p[1]), page.map((p) => p[2])];
-      type State = { tenant: LedgerTenant; deletions: Map<string, [string, string][]>; resets: { requestId: string; atMs: number; result: number }[]; invalid: boolean };
-      const states = new Map<string, State>(page.map(([o, w, u]) => [userKey(o, w, u), { tenant: { orgId: o, workspaceId: w, userId: u }, deletions: new Map(), resets: [], invalid: false }]));
-      if (sections.has("fences")) {
-        for (const r of (await sql.query(DELETIONS_FOR, cols)).rows) {
-          const st = states.get(userKey(r.org_id, r.workspace_id, r.user_id))!;
-          summary.fences.deletion_rows++;
-          if (!id(r.origin_id) || !id(r.source) || !id(r.session_id)) { st.invalid = true; continue; }
-          st.deletions.set(r.origin_id, [...(st.deletions.get(r.origin_id) ?? []), [r.source, r.session_id]]);
-        }
-        for (const r of (await sql.query(RESETS_FOR, cols)).rows) {
-          const st = states.get(userKey(r.org_id, r.workspace_id, r.user_id))!;
-          summary.fences.reset_rows++;
-          const atMs = int(r.at_ms), result = int(r.deleted);
-          if (!id(r.request_id) || atMs === undefined || result === undefined) { st.invalid = true; continue; }
-          st.resets.push({ requestId: r.request_id, atMs, result });
-        }
+  /** SQL's controls for a page of users (two short transactions). */
+  async function controlsFor(users: [string, string, string][]): Promise<Map<string, UserControls>> {
+    const cols = [users.map((p) => p[0]), users.map((p) => p[1]), users.map((p) => p[2])];
+    const states = new Map<string, UserControls>(users.map(([o, w, u]) => [userKey(o, w, u), { tenant: { orgId: o, workspaceId: w, userId: u }, deletions: new Map(), resets: [], invalid: false, needsReview: false }]));
+    for (const r of await readOnly(DELETIONS_FOR, cols)) {
+      const st = states.get(userKey(r.org_id, r.workspace_id, r.user_id))!;
+      summary.fences.deletion_rows++;
+      if (!id(r.origin_id) || !id(r.source) || !id(r.session_id)) { st.invalid = true; continue; }
+      st.deletions.set(r.origin_id, [...(st.deletions.get(r.origin_id) ?? []), [r.source, r.session_id]]);
+    }
+    for (const r of await readOnly(RESETS_FOR, cols)) {
+      const st = states.get(userKey(r.org_id, r.workspace_id, r.user_id))!;
+      summary.fences.reset_rows++;
+      const atMs = int(r.at_ms), result = int(r.deleted);
+      if (!id(r.request_id) || atMs === undefined || result === undefined) { st.invalid = true; continue; }
+      const cold = r.cold === true;
+      if (cold && r.batch_before_import === true) st.needsReview = true;
+      st.resets.push({ requestId: r.request_id, atMs: cold ? COLD_RESET_AT_MS : atMs, result, cold });
+    }
+    return states;
+  }
+
+  /** The user's fence as the later sections need it: S3's, or (dry run, not yet written) SQL's view on a new fence. */
+  async function fenceFor(tenant: LedgerTenant, cache: Map<string, Promise<FenceDoc | null>>): Promise<FenceDoc | null> {
+    const uk = userKey(tenant.orgId, tenant.workspaceId, tenant.userId);
+    if (!cache.has(uk)) cache.set(uk, (async () => {
+      try {
+        const read = await io.readFence(io.keysFor(tenant).fence);
+        if (read.state === "present") return read.fence;
+        if (!opts.dryRun) return null;
+        const st = (await controlsFor([[tenant.orgId, tenant.workspaceId, tenant.userId]])).get(uk)!;
+        if (st.invalid || st.needsReview) return null;
+        const f = newFence();
+        applySqlControls(f, st);
+        return f;
+      } catch {
+        return null;
       }
+    })());
+    return cache.get(uk)!;
+  }
+
+  // ---- fences ----
+  if (sections.has("fences")) {
+    let cursor: [string, string, string] = ["", "", ""];
+    for (;;) {
+      const page = (await readOnly(USERS_PAGE, [orgs, ...cursor, pageSize])).map((r) => [text(r.org_id), text(r.workspace_id), text(r.user_id)] as [string, string, string]);
+      if (!page.length) break;
+      cursor = page[page.length - 1]!;
+      summary.users += page.length;
+      const states = await controlsFor(page);
       await mapLimit([...states.values()], concurrency, async (st) => {
         let key: string;
         try {
@@ -227,179 +309,154 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
           summary.fences.tenant_invalid++;
           return;
         }
-        if (!sections.has("fences")) {
-          // Ownership / revisions only: use the fence an earlier run backfilled.
-          try {
-            const read = await io.readFence(key);
-            if (read.state === "present") fences.set(userKey(st.tenant.orgId, st.tenant.workspaceId, st.tenant.userId), read.fence);
-          } catch { /* counted as skipped_no_fence by the sections that need it */ }
-          return;
-        }
-        if (st.invalid) {
-          summary.fences.input_invalid++;
-          return;
-        }
-        const changes: FenceChange[] = [
-          { deletions: [...st.deletions].map(([originId, sessions]) => ({ originId, sessions })) },
-          ...st.resets.map((reset) => ({ reset })),
-        ];
-        /** ledger-s3's rules on `f` (in place). Tallies are returned, and counted once by the caller. */
-        const apply = (f: FenceDoc) => {
-          let changed = false, pairs = 0, resets = 0;
-          for (const c of changes) {
-            const r = applyFenceChange(f, c);
-            changed ||= r.changed;
-            pairs += r.newlyDeleted.length;
-            if (r.reset === "recorded") resets++;
-          }
-          return { changed, pairs, resets };
-        };
-        const tally = (t: { pairs: number; resets: number }) => { summary.fences.pairs_added += t.pairs; summary.fences.resets_added += t.resets; };
-        const uk = userKey(st.tenant.orgId, st.tenant.workspaceId, st.tenant.userId);
+        if (st.invalid) { summary.fences.input_invalid++; return; }
+        // A cold-imported reset that cannot be placed before every batch: no fence, the drain refuses (finding 8).
+        if (st.needsReview) { summary.fences.needs_review++; return; }
+        const cold = st.resets.filter((r) => r.cold).length;
         try {
           if (opts.dryRun) {
             const read = await io.readFence(key);
             const f = read.state === "present" ? structuredClone(read.fence) : newFence();
-            const t = apply(f);
-            tally(t);
+            const t = applySqlControls(f, st);
+            summary.fences.pairs_added += t.pairs;
+            summary.fences.resets_added += t.resets;
+            summary.fences.deletions_superseded += t.superseded;
+            summary.fences.cold_resets += cold;
             if (f.resetsCompleted < f.resets) summary.fences.resets_in_flight++;
             if (read.state === "absent") summary.fences.would_create++;
             else if (t.changed) summary.fences.would_update++;
             else summary.fences.unchanged++;
-            fences.set(uk, f);
             return;
           }
+          type Landed = { outcome: "created" | "updated" | "unchanged"; t: ReturnType<typeof applySqlControls>; inFlight: boolean };
           // editFence may run the edit more than once (CAS retries): only the landed attempt's result counts.
-          type Landed = { outcome: "created" | "updated" | "unchanged"; t: { changed: boolean; pairs: number; resets: number }; inFlight: boolean };
           const landed = await io.editFence<Landed>(key, (f) => {
             const absent = f.version === 0; // editFence starts an absent fence from newFence() (version 0)
-            const t = apply(f);
-            fences.set(uk, f);
+            const t = applySqlControls(f, st);
             const inFlight = f.resetsCompleted < f.resets;
             if (!t.changed && !absent) return { next: null, result: { outcome: "unchanged", t, inFlight } };
             return { next: f, result: { outcome: absent ? "created" : "updated", t, inFlight } };
           });
           summary.fences[landed.outcome]++;
-          tally(landed.t);
+          summary.fences.pairs_added += landed.t.pairs;
+          summary.fences.resets_added += landed.t.resets;
+          summary.fences.deletions_superseded += landed.t.superseded;
+          summary.fences.cold_resets += cold;
           if (landed.inFlight) summary.fences.resets_in_flight++;
         } catch (error) {
           const code = (error as { code?: unknown })?.code;
           if (code === "ledger_fence_invalid") summary.fences.unreadable++;
           else if (code === "ledger_fence_contended") summary.fences.contended++;
           else summary.fences.failed++;
-          fences.delete(uk);
         }
       });
     }
-    if (sections.has("fences")) {
-      const f = summary.fences;
-      summary.sections.fences = f.unreadable + f.contended + f.tenant_invalid + f.input_invalid + f.failed + f.resets_in_flight === 0 ? "complete" : "incomplete";
-    }
+    const f = summary.fences;
+    summary.sections.fences = f.unreadable + f.contended + f.tenant_invalid + f.input_invalid + f.failed + f.resets_in_flight + f.needs_review === 0 ? "complete" : "incomplete";
+  }
 
-    // ---- ownership ----
-    if (sections.has("ownership")) {
-      let cursor = ["", "", "", "", "", ""];
-      for (;;) {
-        const rows = (await sql.query(OWNERSHIP_PAGE, [orgs, ...cursor, rowPageSize])).rows;
-        if (!rows.length) break;
-        const last = rows[rows.length - 1]!;
-        cursor = [text(last.org_id), text(last.workspace_id), text(last.user_id), text(last.origin_id), text(last.source), text(last.session_id)];
-        await mapLimit(rows, concurrency, async (r) => {
-          summary.ownership.rows++;
-          const fence = fences.get(userKey(r.org_id, r.workspace_id, r.user_id));
-          if (!fence) { summary.ownership.skipped_no_fence++; return; }
-          if (!id(r.origin_id) || !id(r.source) || !id(r.session_id)) { summary.ownership.invalid++; return; }
-          if (isDeleted(fence, r.origin_id, r.source, r.session_id)) { summary.ownership.skipped_deleted++; return; }
-          const [, epoch, resets] = recordGeneration(fence, r.origin_id, r.source, r.session_id);
-          try {
-            const key = io.keysFor({ orgId: text(r.org_id), workspaceId: text(r.workspace_id), userId: text(r.user_id) }).owner(r.origin_id, r.source, r.session_id);
-            const stored = (await io.readOwner(key))?.doc;
-            // registerOwner keeps a stub at its current epoch (its oldest generation): nothing to do then.
-            if (stored && stored.epoch >= epoch) { summary.ownership.unchanged++; return; }
-            if (opts.dryRun) { summary.ownership.would_register++; return; }
-            await io.registerOwner(key, { v: 1, originId: r.origin_id, source: r.source, sessionId: r.session_id, epoch, resets });
-            summary.ownership.registered++;
-          } catch {
-            summary.ownership.failed++;
-          }
-        });
-      }
-      const o = summary.ownership;
-      summary.sections.ownership = o.skipped_no_fence + o.invalid + o.failed === 0 ? "complete" : "incomplete";
-    }
-
-    // ---- revisions ----
-    if (sections.has("revisions")) {
-      type Group = { key: string; fence: FenceDoc; originId: string; entries: IndexEntryInput[] };
-      /** One SQL stored revision -> an entry in its user's shard; false when skipped (counted). */
-      const add = (groups: Map<string, Group>, row: { org: unknown; ws: unknown; user: unknown; origin: unknown; record: unknown; revision: unknown; revisionId: unknown; digest: unknown; source: unknown; session: unknown }) => {
-        const fence = fences.get(userKey(row.org, row.ws, row.user));
-        if (!fence) { summary.revisions.skipped_no_fence++; return; }
-        const revision = int(row.revision);
-        if (!id(row.origin) || !id(row.record) || !id(row.source) || revision === undefined || !(row.session === null || id(row.session)) ||
-            !(row.revisionId === null || typeof row.revisionId === "string") || !(row.digest === null || typeof row.digest === "string")) { summary.revisions.invalid++; return; }
-        const sessionId = row.session as string | null;
-        if (sessionId !== null && isDeleted(fence, row.origin, row.source, sessionId)) { summary.revisions.skipped_deleted++; return; }
-        const [sessionKey, epoch, resets] = recordGeneration(fence, row.origin, row.source, sessionId);
-        const entry: IndexEntryInput = { recordId: row.record, revision, revisionId: row.revisionId as string | null, digest: row.digest as string | null, sessionKey, epoch, resets };
-        let key: string;
+  // ---- ownership ----
+  if (sections.has("ownership")) {
+    let cursor = ["", "", "", "", "", ""];
+    for (;;) {
+      const rows = await readOnly(OWNERSHIP_PAGE, [orgs, ...cursor, rowPageSize]);
+      if (!rows.length) break;
+      const last = rows[rows.length - 1]!;
+      cursor = [text(last.org_id), text(last.workspace_id), text(last.user_id), text(last.origin_id), text(last.source), text(last.session_id)];
+      const fences = new Map<string, Promise<FenceDoc | null>>();
+      await mapLimit(rows, concurrency, async (r) => {
+        summary.ownership.rows++;
+        if (!id(r.org_id) || !id(r.user_id) || typeof r.workspace_id !== "string" || !id(r.origin_id) || !id(r.source) || !id(r.session_id)) { summary.ownership.invalid++; return; }
+        const tenant = { orgId: r.org_id, workspaceId: r.workspace_id, userId: r.user_id };
+        const fence = await fenceFor(tenant, fences);
+        if (!fence) { summary.ownership.skipped_no_fence++; return; }
+        if (isDeleted(fence, r.origin_id, r.source, r.session_id)) { summary.ownership.skipped_deleted++; return; }
+        const [, epoch, resets] = recordGeneration(fence, r.origin_id, r.source, r.session_id);
         try {
-          checkIndexEntryInput(entry);
-          key = io.keysFor({ orgId: text(row.org), workspaceId: text(row.ws), userId: text(row.user) }).revisions(row.origin, row.record);
+          const key = io.keysFor(tenant).owner(r.origin_id, r.source, r.session_id);
+          const stored = (await io.readOwner(key))?.doc;
+          const machineId = liveMachineId(r.workspace_id, r.origin_id, r.user_id);
+          if (stored && stored.epoch >= epoch && stored.machineId !== undefined) { summary.ownership.unchanged++; return; }
+          if (opts.dryRun) { summary.ownership.would_register++; return; }
+          // The writer machine, as admission stamps it: the re-arm sweeper binds markers to it.
+          await io.registerOwner(key, { v: 1, originId: r.origin_id, source: r.source, sessionId: r.session_id, epoch, resets, machineId });
+          summary.ownership.registered++;
         } catch {
-          summary.revisions.invalid++;
-          return;
-        }
-        const g = groups.get(key) ?? { key, fence, originId: row.origin, entries: [] };
-        g.entries.push(entry);
-        groups.set(key, g);
-      };
-      const flush = async (groups: Map<string, Group>) => mapLimit([...groups.values()], concurrency, async (g) => {
-        if (opts.dryRun) { summary.revisions.would_merge += g.entries.length; return; }
-        try {
-          await io.mergeIndex(g.key, g.fence, g.originId, g.entries);
-          summary.revisions.merged += g.entries.length;
-          summary.revisions.shards++;
-        } catch {
-          summary.revisions.failed += g.entries.length;
+          summary.ownership.failed++;
         }
       });
-
-      // (a) ingest_record_revisions, seeded revision-only rows included.
-      let cursor = ["", "", "", ""];
-      for (;;) {
-        const rows = (await sql.query(REVISIONS_PAGE, [orgs, ...cursor, rowPageSize])).rows;
-        if (!rows.length) break;
-        const last = rows[rows.length - 1]!;
-        cursor = [text(last.org_id), text(last.workspace_id), text(last.origin_id), text(last.record_id)];
-        const groups = new Map<string, Group>();
-        for (const r of rows) {
-          summary.revisions.rows++;
-          if (r.revision_id === null && r.digest === null) summary.revisions.seed_rows++;
-          add(groups, { org: r.org_id, ws: r.workspace_id, user: r.user_id, origin: r.origin_id, record: r.record_id, revision: r.revision, revisionId: r.revision_id, digest: r.digest, source: r.source, session: r.session_id });
-        }
-        await flush(groups);
-      }
-
-      // (b) ingest_lazy_native_slots: the owner's current revision, under its session (ingest_lazy_clear's scope).
-      let slotCursor = "";
-      for (;;) {
-        const rows = (await sql.query(SLOTS_PAGE, [orgs, slotCursor, rowPageSize])).rows;
-        if (!rows.length) break;
-        slotCursor = text(rows[rows.length - 1]!.key_sha256);
-        const groups = new Map<string, Group>();
-        for (const r of rows) {
-          summary.revisions.slot_rows++;
-          if (r.current_owner === null) { summary.revisions.slots_empty++; continue; }
-          add(groups, { org: r.org_id, ws: r.workspace_id, user: r.current_owner, origin: r.origin_id, record: r.record_id, revision: r.current_revision, revisionId: null, digest: r.current_digest, source: r.current_source, session: r.current_session });
-        }
-        await flush(groups);
-      }
-      const v = summary.revisions;
-      summary.sections.revisions = v.skipped_no_fence + v.invalid + v.failed === 0 ? "complete" : "incomplete";
     }
-  } finally {
-    await sql.query("ROLLBACK").catch(() => {});
+    const o = summary.ownership;
+    summary.sections.ownership = o.skipped_no_fence + o.invalid + o.failed === 0 ? "complete" : "incomplete";
+  }
+
+  // ---- revisions ----
+  if (sections.has("revisions")) {
+    type Group = { key: string; fence: FenceDoc; originId: string; entries: IndexEntryInput[] };
+    const add = async (groups: Map<string, Group>, fences: Map<string, Promise<FenceDoc | null>>, row: { org: unknown; ws: unknown; user: unknown; origin: unknown; record: unknown; revision: unknown; revisionId: unknown; digest: unknown; source: unknown; session: unknown }) => {
+      if (!id(row.org) || !id(row.user) || typeof row.ws !== "string") { summary.revisions.invalid++; return; }
+      const fence = await fenceFor({ orgId: row.org, workspaceId: row.ws, userId: row.user }, fences);
+      if (!fence) { summary.revisions.skipped_no_fence++; return; }
+      const revision = int(row.revision);
+      if (!id(row.origin) || !id(row.record) || !id(row.source) || revision === undefined || !(row.session === null || id(row.session)) ||
+          !(row.revisionId === null || typeof row.revisionId === "string") || !(row.digest === null || typeof row.digest === "string")) { summary.revisions.invalid++; return; }
+      const sessionId = row.session as string | null;
+      if (sessionId !== null && isDeleted(fence, row.origin, row.source, sessionId)) { summary.revisions.skipped_deleted++; return; }
+      const [sessionKey, epoch, resets] = recordGeneration(fence, row.origin, row.source, sessionId);
+      const entry: IndexEntryInput = { recordId: row.record, revision, revisionId: row.revisionId as string | null, digest: row.digest as string | null, sessionKey, epoch, resets };
+      let key: string;
+      try {
+        checkIndexEntryInput(entry);
+        key = io.keysFor({ orgId: row.org, workspaceId: row.ws, userId: row.user }).revisions(row.origin, row.record);
+      } catch {
+        summary.revisions.invalid++;
+        return;
+      }
+      const g = groups.get(key) ?? { key, fence, originId: row.origin, entries: [] };
+      g.entries.push(entry);
+      groups.set(key, g);
+    };
+    const flush = (groups: Map<string, Group>) => mapLimit([...groups.values()], concurrency, async (g) => {
+      if (opts.dryRun) { summary.revisions.would_merge += g.entries.length; return; }
+      try {
+        await io.mergeIndex(g.key, g.fence, g.originId, g.entries);
+        summary.revisions.merged += g.entries.length;
+        summary.revisions.shards++;
+      } catch {
+        summary.revisions.failed += g.entries.length;
+      }
+    });
+    // (a) ingest_record_revisions, seeded revision-only rows included.
+    let cursor = ["", "", "", ""];
+    for (;;) {
+      const rows = await readOnly(REVISIONS_PAGE, [orgs, ...cursor, rowPageSize]);
+      if (!rows.length) break;
+      const last = rows[rows.length - 1]!;
+      cursor = [text(last.org_id), text(last.workspace_id), text(last.origin_id), text(last.record_id)];
+      const groups = new Map<string, Group>(), fences = new Map<string, Promise<FenceDoc | null>>();
+      for (const r of rows) {
+        summary.revisions.rows++;
+        if (r.revision_id === null && r.digest === null) summary.revisions.seed_rows++;
+        await add(groups, fences, { org: r.org_id, ws: r.workspace_id, user: r.user_id, origin: r.origin_id, record: r.record_id, revision: r.revision, revisionId: r.revision_id, digest: r.digest, source: r.source, session: r.session_id });
+      }
+      await flush(groups);
+    }
+    // (b) owned ingest_lazy_native_slots, under their owner and session (ingest_lazy_clear's scope).
+    let slotCursor = "";
+    for (;;) {
+      const rows = await readOnly(SLOTS_PAGE, [orgs, slotCursor, rowPageSize]);
+      if (!rows.length) break;
+      slotCursor = text(rows[rows.length - 1]!.key_sha256);
+      const groups = new Map<string, Group>(), fences = new Map<string, Promise<FenceDoc | null>>();
+      for (const r of rows) {
+        summary.revisions.slot_rows++;
+        if (r.current_owner === null) { summary.revisions.slots_empty++; continue; }
+        await add(groups, fences, { org: r.org_id, ws: r.workspace_id, user: r.current_owner, origin: r.origin_id, record: r.record_id, revision: r.current_revision, revisionId: null, digest: r.current_digest, source: r.current_source, session: r.current_session });
+      }
+      await flush(groups);
+    }
+    const v = summary.revisions;
+    summary.sections.revisions = v.skipped_no_fence + v.invalid + v.failed === 0 ? "complete" : "incomplete";
   }
   return summary;
 }

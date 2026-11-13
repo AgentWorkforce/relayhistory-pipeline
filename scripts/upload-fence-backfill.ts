@@ -5,8 +5,9 @@
  *
  *   stdin (one JSON line, piped from 1Password, never written to disk):
  *     {"dbUrl": "postgresql://user:password@host:port/db?sslmode=verify-full"}
- *     A read-only login is recommended; the job also opens a READ ONLY transaction, checks
- *     SHOW transaction_read_only, sets default_transaction_read_only=on, and always rolls back.
+ *     A read-only login is recommended; every page is its own short READ ONLY transaction (checked with
+ *     SHOW transaction_read_only, always rolled back; no long snapshot on the primary), and the session sets
+ *     default_transaction_read_only=on.
  *   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY [/ AWS_SESSION_TOKEN] from the environment only.
  *
  *   bun run scripts/upload-fence-backfill.ts --dry-run  --bucket <name> [--region us-east-1] [--org <org> ...]

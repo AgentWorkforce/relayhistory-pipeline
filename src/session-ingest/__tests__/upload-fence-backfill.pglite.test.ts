@@ -37,7 +37,8 @@ afterEach(async () => {
   cleanup.forEach((c) => c());
   cleanup = [];
   await db.exec(`DELETE FROM sessions.upload_deletions; DELETE FROM sessions.upload_resets; DELETE FROM sessions.ingest_session_ownership;
-    DELETE FROM sessions.ingest_record_revisions; DELETE FROM sessions.ingest_batches; DELETE FROM sessions.ingest_lazy_native_slots;`);
+    DELETE FROM sessions.ingest_record_revisions; DELETE FROM sessions.ingest_batches; DELETE FROM sessions.ingest_lazy_native_slots;
+    DELETE FROM sessions.ingest_seed_fence_baselines;`);
 });
 function scratch(): ObjectStore {
   const s = scratchStore();
@@ -123,17 +124,28 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     for (const needle of ["org-a", "ws-a", "user-1", "origin-1", "sess-1", "req-1", "96bulls"]) expect(text).not.toContain(needle);
   });
 
-  test("SQL is one read-only snapshot, checked, and always rolled back", async () => {
+  test("finding 8: no long snapshot: every page is its own short read-only transaction, checked, always rolled back", async () => {
     const store = scratch();
     await del(A, "origin-1", "claude", "sess-1");
     await own(A, "origin-1", "claude", "sess-2");
     await rev(A, "origin-1", "rec-1", 1, "claude", "sess-2");
+    await del(B, "origin-1", "claude", "sess-9");
     const log: string[] = [];
-    await run(store, {}, log);
-    expect(log[0]).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
-    expect(log[1]).toBe("SHOW transaction_read_only");
-    expect(log.at(-1)).toBe("ROLLBACK");
-    for (const s of log.slice(2, -1)) expect(s).toMatch(/^(SELECT|SET LOCAL statement_timeout = \d+$)/);
+    await run(store, { pageSize: 1, rowPageSize: 1 }, log);
+    const txs: string[][] = [];
+    for (const st of log) {
+      if (st.startsWith("BEGIN")) txs.push([]);
+      txs[txs.length - 1]!.push(st);
+    }
+    expect(txs.length).toBeGreaterThan(6); // users, controls, ownership, revisions and slots pages, each on its own
+    for (const tx of txs) {
+      expect(tx[0]).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+      expect(tx[1]).toBe("SHOW transaction_read_only");
+      expect(tx.at(-1)).toBe("ROLLBACK");
+      expect(tx.length).toBe(5); // BEGIN, SHOW, SET LOCAL, one SELECT, ROLLBACK
+      expect(tx[2]).toMatch(/^SET LOCAL statement_timeout = \d+$/);
+      expect(tx[3]).toMatch(/^SELECT/);
+    }
     const refused: string[] = [];
     const notReadOnly: BackfillSql = { async query(text) { refused.push(text); return { rows: text.startsWith("SHOW") ? [{ transaction_read_only: "off" }] : [] }; } };
     await expect(backfillUploadFences({ sql: notReadOnly, store, keyRoot: ROOT, dryRun: false })).rejects.toThrow("backfill_not_read_only");
@@ -148,7 +160,7 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     await own(A, "origin-1", "claude", "gone");
     const summary = await run(store);
     expect(summary.ownership).toMatchObject({ rows: 2, registered: 1, skipped_deleted: 1, skipped_no_fence: 0, failed: 0 });
-    expect(await ownerOf(store, A, "origin-1", "claude", "kept")).toEqual({ v: 1, originId: "origin-1", source: "claude", sessionId: "kept", epoch: 0, resets: 1 });
+    expect(await ownerOf(store, A, "origin-1", "claude", "kept")).toEqual({ v: 1, originId: "origin-1", source: "claude", sessionId: "kept", epoch: 0, resets: 1, machineId: expect.stringMatching(/^srv_[0-9a-f]{32}$/) });
     expect(await ownerOf(store, A, "origin-1", "claude", "gone")).toBeUndefined();
   });
 
@@ -268,7 +280,7 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     await rev(B, "origin-2", "rec-1", 1, "claude", "sess-1");
     const summary = await run(store);
     expect(summary.fences).toMatchObject({ unreadable: 1, input_invalid: 1 });
-    expect(summary.ownership.skipped_no_fence).toBe(1);
+    expect(summary.ownership.skipped_no_fence).toBe(2); // A's claimed session and B's revision session
     expect(summary.revisions.skipped_no_fence).toBe(1);
     expect(summary.sections).toEqual({ fences: "incomplete", ownership: "incomplete", revisions: "incomplete" });
     expect(dec.decode(await readAll(await store.get(objectKey(s3LedgerKeys(ROOT, A).fence))))).toBe(bad);
@@ -315,6 +327,52 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     expect(isDeletedForAdmission(f, "origin-1", "claude", "pending")).toBe(true); // the pending disable survives
     expect(isDeletedForAdmission(f, "origin-1", "claude", "sess-1")).toBe(true);
     expect(f.resetsCompleted).toBe(f.resets);
+  });
+
+  test("finding 3: owner stubs also for the sessions of stored revisions and owned lazy slots (SQL's reset owned set)", async () => {
+    const store = scratch();
+    await rev(A, "origin-1", "rec-1", 1, "claude", "from-revision");
+    await slot(A, "origin-1", "s0001", A.userId, "claude", "from-slot", 2, hex("2"));
+    await slot(A, "origin-1", "s0002", A.userId, "claude", null, 2, hex("3")); // session-less: no stub
+    const summary = await run(store);
+    expect(summary.ownership).toMatchObject({ rows: 2, registered: 2, failed: 0 });
+    for (const sid of ["from-revision", "from-slot"]) expect(await ownerOf(store, A, "origin-1", "claude", sid)).toMatchObject({ epoch: 0, resets: 0, machineId: expect.stringMatching(/^srv_/) });
+  });
+
+  test("finding 5: a rerun does not re-delete a session S3 re-enabled after the snapshot", async () => {
+    const store = scratch();
+    await del(A, "origin-1", "claude", "sess-1");
+    await run(store);
+    expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "sess-1")).toBe(true);
+    // The user re-enables it through the live control mirror; SQL's row is still in the (stale) snapshot.
+    await s3ControlMirror(store, ROOT).setSessionUploads({ tenant: A, originId: "origin-1", sessions: [["claude", "sess-1"]], enabled: true });
+    expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "sess-1")).toBe(false);
+    const rerun = await run(store);
+    expect(rerun.fences).toMatchObject({ deletions_superseded: 1, pairs_added: 0 });
+    expect(isDeletedForAdmission((await fenceOf(store, A))!, "origin-1", "claude", "sess-1")).toBe(false);
+  });
+
+  test("finding 8: a cold-imported reset is placed before every batch; one that cannot be is needs_review, never a drop", async () => {
+    const store = scratch();
+    // The seed's baseline import: the reset row and the baseline in one transaction (reset_at <= imported_at).
+    await db.exec(`INSERT INTO sessions.upload_resets (org_id, workspace_id, user_id, request_id, reset_at, deleted)
+                     VALUES ('org-a', 'ws-a', 'user-1', 'neon-reset', now() - interval '2 days', 4);
+                   INSERT INTO sessions.ingest_seed_fence_baselines (org_id, workspace_id, user_id, fingerprint, imported_at)
+                     VALUES ('org-a', 'ws-a', 'user-1', '${hex("f")}', now() - interval '2 days' + interval '1 second');`);
+    await batch(A, "origin-1", "after-import"); // claimed now, after the import
+    const summary = await run(store);
+    expect(summary.fences).toMatchObject({ cold_resets: 1, needs_review: 0, created: 1 });
+    expect(await fenceOf(store, A)).toMatchObject({ resets: 1, resetsCompleted: 1, lastResetAtMs: 1, resetRequests: { "neon-reset": 4 } });
+    // A user with a batch claimed at or before its import cannot have its cold reset placed: no fence, needs review.
+    await db.exec(`INSERT INTO sessions.upload_resets (org_id, workspace_id, user_id, request_id, reset_at, deleted)
+                     VALUES ('org-a', 'ws-a', 'user-2', 'neon-reset', now(), 1);
+                   INSERT INTO sessions.ingest_seed_fence_baselines (org_id, workspace_id, user_id, fingerprint, imported_at)
+                     VALUES ('org-a', 'ws-a', 'user-2', '${hex("f")}', now() + interval '1 minute');`);
+    await batch(B, "origin-1", "before-import");
+    const second = await run(store);
+    expect(second.fences.needs_review).toBe(1);
+    expect(second.sections.fences).toBe("incomplete");
+    expect(await fenceOf(store, B)).toBeNull();
   });
 
   test("a contended fence CAS retries and lands; tallies count once", async () => {
