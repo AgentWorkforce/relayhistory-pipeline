@@ -13,7 +13,7 @@
 --   psql --single-transaction -v ON_ERROR_STOP=1 -v login_verifier="$VERIFIER" -f <this file>
 --
 -- Afterwards the owner sets the production-db-readonly environment secret DB_READONLY_URL by hand from
--- the 1Password item (see runbooks/sessions-prod-db-readonly-checks.md, step 2).
+-- the 1Password item (see sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-db-readonly-checks.md, step 2).
 --
 -- Rollback: scripts/sql/db-readonly-role-nologin.sql.
 

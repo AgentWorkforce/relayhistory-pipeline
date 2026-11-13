@@ -1,11 +1,12 @@
 /** Read-only GitHub gate. Errors contain fixed codes only. */
 import {
+  releaseAnchorBranch,
   releaseInputs,
   SCHEMA_RELEASE as P,
   refuse,
 } from "../src/hoopdb/schema-release-contract.ts";
 type Obj = Record<string, any>;
-type Get = (path: string) => Promise<any>;
+export type Get = (path: string) => Promise<any>;
 /** Required push workflows on main and the job names each latest run must contain. */
 const REQUIRED_PUSH_RUNS = [
   ["ci.yml", ["checks", "session-read-worker / worker"]],
@@ -15,18 +16,21 @@ const REQUIRED_PUSH_RUNS = [
   ],
 ] as const;
 /**
- * For each required workflow, the latest push run on main with head_sha === sha
+ * For each required workflow, the latest push run on `branch` (main for the release
+ * sha, the release/schema-<slot> anchor branch for target_sha) with head_sha === sha
  * must be completed/success, and every job of that run attempt completed/success
  * with head_sha === sha, the required job names included. Refuses codes.runs or
  * codes.jobs.
  */
-async function requireGreenPushRuns(
+export async function requireGreenPushRuns(
   get: Get,
   base: string,
   sha: string,
   codes: { runs: string; jobs: string },
+  branch = "main",
+  required: ReadonlyArray<readonly [string, readonly string[]]> = REQUIRED_PUSH_RUNS,
 ) {
-  for (const [workflow, names] of REQUIRED_PUSH_RUNS) {
+  for (const [workflow, names] of required) {
     const listing = await get(
       base +
         `/actions/workflows/${workflow}/runs?event=push&head_sha=${sha}&per_page=100`,
@@ -34,7 +38,7 @@ async function requireGreenPushRuns(
     const runs = (listing.workflow_runs ?? [])
       .filter(
         (r: Obj) =>
-          r.head_sha === sha && r.head_branch === "main" && r.event === "push",
+          r.head_sha === sha && r.head_branch === branch && r.event === "push",
       )
       .sort((a: Obj, b: Obj) => b.id - a.id);
     const latest = runs[0];
@@ -93,59 +97,49 @@ export async function githubReleaseGate(
     run.run_attempt !== 1
   )
     refuse("release_run");
-  const trustedDispatcher =
-    run.actor?.type === "User" &&
-    run.actor?.login === P.dispatcher.login &&
-    run.actor?.id === P.dispatcher.id &&
-    run.triggering_actor?.type === "User" &&
-    run.triggering_actor?.login === P.dispatcher.login &&
-    run.triggering_actor?.id === P.dispatcher.id;
-  const environment = await get(base + "/environments/" + P.environment);
-  if (!Array.isArray(environment.protection_rules))
-    refuse("release_environment");
-  const reviewerRule = environment.protection_rules.find(
-    (r: Obj) => r.type === "required_reviewers",
-  );
-  const reviewers =
-    reviewerRule?.reviewers
-      ?.filter(
-        (r: Obj) => r.type === "User" && r.reviewer?.type === "User",
-      )
-      .map((r: Obj) => r.reviewer.id) ?? [];
-  if (
-    environment.name !== P.environment ||
-    !Number.isSafeInteger(environment.id) ||
-    (reviewerRule ? !reviewers.length : !trustedDispatcher) ||
-    environment.deployment_branch_policy?.protected_branches !== false ||
-    environment.deployment_branch_policy?.custom_branch_policies !== true
-  )
-    refuse("release_environment");
-  const branches = await get(
-    base +
-      "/environments/" +
-      P.environment +
-      "/deployment-branch-policies?per_page=100",
-  );
-  if (
-    branches.total_count !== 1 ||
-    branches.branch_policies?.length !== 1 ||
-    branches.branch_policies[0].name !== "main" ||
-    branches.branch_policies[0].type !== "branch"
-  )
-    refuse("release_environment_branch");
+  const trustedDispatcher = isPinnedDispatcher(run);
+  const gate = await requireProtectedEnvironment(get, base, P.environment, trustedDispatcher, {
+    environment: "release_environment",
+    branch: "release_environment_branch",
+  });
   await requireGreenPushRuns(get, base, input.sha, {
     runs: "release_ci",
     jobs: "release_ci_jobs",
   });
-  // The runtime image is published at target_sha, so its own push CI and
-  // pg-proof runs on main must be green too (first-parent history alone does
-  // not prove that a historical main commit passed its checks).
-  if (input.targetSha !== input.sha)
-    await requireGreenPushRuns(get, base, input.targetSha, {
-      runs: "release_target_ci",
-      jobs: "release_target_ci_jobs",
-    });
-  if (input.mode === "apply") {
+  // A held-step release is anchored to the protected release/schema-<slot>
+  // branch for its target: the branch must exist, be protected and have
+  // target_sha as its tip (read live, so the gate re-run under the migrator
+  // lock refuses an anchor ref that moved after the plan). The runtime image is
+  // published at target_sha, so its own push CI and pg-proof runs on that
+  // branch must be green too, exactly as strict as the release sha's on main.
+  if (input.targetSha !== input.sha) {
+    const branch = releaseAnchorBranch(input.target);
+    if (!branch) refuse("release_anchor_ref_missing");
+    const matching = await get(base + "/git/matching-refs/heads/" + branch);
+    const refs = Array.isArray(matching)
+      ? matching.filter((r: Obj) => r?.ref === "refs/heads/" + branch)
+      : [];
+    if (refs.length !== 1) refuse("release_anchor_ref_missing");
+    if (
+      refs[0].object?.type !== "commit" ||
+      refs[0].object?.sha !== input.targetSha
+    )
+      refuse("release_anchor_ref_mismatch");
+    const protection = await get(base + "/branches/" + branch);
+    if (protection?.name !== branch || protection?.protected !== true)
+      refuse("release_anchor_ref_unprotected");
+    if (protection?.commit?.sha !== input.targetSha)
+      refuse("release_anchor_ref_mismatch");
+    await requireGreenPushRuns(
+      get,
+      base,
+      input.targetSha,
+      { runs: "release_target_ci", jobs: "release_target_ci_jobs" },
+      branch,
+    );
+  }
+  // Apply and bootstrap both consume a successful same-sha plan run under 24h old.
+  if (input.mode !== "plan") {
     const plan = await get(base + "/actions/runs/" + input.planRun);
     if (
       String(plan.id) === env.GITHUB_RUN_ID ||
@@ -162,38 +156,115 @@ export async function githubReleaseGate(
     )
       refuse("release_plan_run");
   }
-  if (approved) {
-    // Private repositories on plans without environment reviewers cannot
-    // create that protection rule. In that case the first-attempt workflow
-    // dispatch itself must be made by the pinned account; reruns are refused.
-    if (reviewerRule) {
-      const history = await get(
-        base + "/actions/runs/" + env.GITHUB_RUN_ID + "/approvals",
-      );
-      if (
-        !Array.isArray(history) ||
-        !history.some(
-          (a: Obj) =>
-            a.state === "approved" &&
-            a.user?.type === "User" &&
-            reviewers.includes(a.user.id) &&
-            a.environments?.some(
-              (e: Obj) => e.id === environment.id && e.name === P.environment,
-            ),
-        )
-      )
-        refuse("release_human_approval");
-      if (
-        history.some(
-          (a: Obj) =>
-            a.state === "rejected" &&
-            a.environments?.some((e: Obj) => e.id === environment.id),
-        )
-      )
-        refuse("release_human_rejected");
-    } else if (!trustedDispatcher) refuse("release_human_dispatch");
-  }
+  if (approved)
+    await requireHumanApproval(get, base, env.GITHUB_RUN_ID!, P.environment, gate, trustedDispatcher, {
+      approval: "release_human_approval",
+      rejected: "release_human_rejected",
+      dispatch: "release_human_dispatch",
+    });
   return input;
+}
+/** Both the actor and the triggering actor of the run are the pinned human dispatcher (login, id, type User). */
+export function isPinnedDispatcher(
+  run: Obj,
+  dispatcher: { login: string; id: number } = P.dispatcher,
+): boolean {
+  return (
+    run.actor?.type === "User" &&
+    run.actor?.login === dispatcher.login &&
+    run.actor?.id === dispatcher.id &&
+    run.triggering_actor?.type === "User" &&
+    run.triggering_actor?.login === dispatcher.login &&
+    run.triggering_actor?.id === dispatcher.id
+  );
+}
+export interface EnvironmentGate {
+  environment: Obj;
+  reviewerRule: Obj | undefined;
+  reviewers: number[];
+}
+/**
+ * The named environment exists with protection rules: required User reviewers, or (no reviewer rule possible) a
+ * pinned-dispatcher run; deployments only from the single custom branch policy `main`.
+ */
+export async function requireProtectedEnvironment(
+  get: Get,
+  base: string,
+  name: string,
+  trustedDispatcher: boolean,
+  codes: { environment: string; branch: string },
+): Promise<EnvironmentGate> {
+  const environment = await get(base + "/environments/" + name);
+  if (!Array.isArray(environment.protection_rules)) refuse(codes.environment);
+  const reviewerRule = environment.protection_rules.find(
+    (r: Obj) => r.type === "required_reviewers",
+  );
+  const reviewers =
+    reviewerRule?.reviewers
+      ?.filter(
+        (r: Obj) => r.type === "User" && r.reviewer?.type === "User",
+      )
+      .map((r: Obj) => r.reviewer.id) ?? [];
+  if (
+    environment.name !== name ||
+    !Number.isSafeInteger(environment.id) ||
+    (reviewerRule ? !reviewers.length : !trustedDispatcher) ||
+    environment.deployment_branch_policy?.protected_branches !== false ||
+    environment.deployment_branch_policy?.custom_branch_policies !== true
+  )
+    refuse(codes.environment);
+  const branches = await get(
+    base + "/environments/" + name + "/deployment-branch-policies?per_page=100",
+  );
+  if (
+    branches.total_count !== 1 ||
+    branches.branch_policies?.length !== 1 ||
+    branches.branch_policies[0].name !== "main" ||
+    branches.branch_policies[0].type !== "branch"
+  )
+    refuse(codes.branch);
+  return { environment, reviewerRule, reviewers };
+}
+/**
+ * Inside the protected job. Private repositories on plans without environment reviewers cannot create that
+ * protection rule; then the first-attempt workflow dispatch itself must be made by the pinned account (reruns are
+ * refused by the caller's run_attempt check). With a reviewer rule, a pinned reviewer approved this run for this
+ * environment and nobody rejected it.
+ */
+export async function requireHumanApproval(
+  get: Get,
+  base: string,
+  runId: string,
+  name: string,
+  gate: EnvironmentGate,
+  trustedDispatcher: boolean,
+  codes: { approval: string; rejected: string; dispatch: string },
+) {
+  const { environment, reviewerRule, reviewers } = gate;
+  if (reviewerRule) {
+    const history = await get(base + "/actions/runs/" + runId + "/approvals");
+    if (
+      !Array.isArray(history) ||
+      !history.some(
+        (a: Obj) =>
+          a.state === "approved" &&
+          a.user?.type === "User" &&
+          reviewers.includes(a.user.id) &&
+          a.environments?.some(
+            (e: Obj) => e.id === environment.id && e.name === name,
+          ),
+      )
+    )
+      refuse(codes.approval);
+    if (
+      history.some(
+        (a: Obj) =>
+          a.state === "rejected" &&
+          a.environments?.some((e: Obj) => e.id === environment.id),
+      )
+    )
+      refuse(codes.rejected);
+  } else if (!trustedDispatcher) refuse(codes.dispatch);
 }
 export function githubGet(token = process.env.GITHUB_TOKEN): Get {
   if (!token) refuse("release_github_token");

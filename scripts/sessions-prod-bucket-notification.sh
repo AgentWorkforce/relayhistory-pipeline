@@ -3,7 +3,7 @@
 # (stacks/aws/session-pipeline.ts bucketNotificationConfiguration). Alchemy's
 # AWS provider declares notifications only through function bindings, so this
 # is the reviewed, checked-in way to set it; Alchemy keeps targets it does not
-# manage. Runbook: runbooks/sessions-prod-session-pipeline.md.
+# manage. Runbook: sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-session-pipeline.md.
 #
 #   scripts/sessions-prod-bucket-notification.sh            # print the wanted configuration (no AWS call)
 #   scripts/sessions-prod-bucket-notification.sh --check    # read-only: compare with the live bucket; exit 1 on drift

@@ -2,7 +2,9 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main]
+    # release/schema-*: the protected release anchor branches (a held-step target_sha
+    # needs green push runs on its own branch; scripts/schema-release-github.ts).
+    branches: [main, 'release/schema-*']
 permissions:
   contents: read
 concurrency:
@@ -46,10 +48,35 @@ jobs:
       - name: End-to-end acceptance test
         run: bun run e2e:selfhost
   unit-tests:
+    # Aggregate of the sharded root suite and the run-once steps. Keeps the job name
+    # that `checks` (and any branch protection) requires: green only when every shard
+    # and unit-tests-aux succeeded.
+    needs: [unit-tests-shard, unit-tests-aux]
+    if: ${{ always() }}
     runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
-    # The serial PGlite suite outgrew 40 minutes on GitHub-hosted runners.
-    # Preserve every test and the 30-second per-test limit below.
-    timeout-minutes: 90
+    timeout-minutes: 5
+    steps:
+      - name: Require every unit-test shard and the aux job
+        env:
+          SHARD_RESULT: ${{ needs.unit-tests-shard.result }}
+          AUX_RESULT: ${{ needs.unit-tests-aux.result }}
+        run: |
+          echo "unit-tests-shard: $SHARD_RESULT, unit-tests-aux: $AUX_RESULT"
+          test "$SHARD_RESULT" = "success"
+          test "$AUX_RESULT" = "success"
+  unit-tests-shard:
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    # The serial root suite (src/, many PGlite migration suites) outgrew 40 minutes on
+    # GitHub-hosted runners and 90 minutes under concurrent runs on 2026-11-12, so it is
+    # split into four shards by scripts/ci/unit-test-shards.ts: a deterministic greedy
+    # split over the estimated seconds in scripts/ci/unit-test-weights.json (about 25
+    # minutes of test time per shard on the measured runs). Every test file runs in
+    # exactly one shard (checked in unit-tests-aux) with the same 30-second per-test limit.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     # A real ClickHouse for the session read API's query tests
     # (src/session-read-api/__tests__/page.clickhouse.test.ts), the version the
     # search proofs pin. Test-only credentials; no production data.
@@ -91,6 +118,45 @@ jobs:
           node-version: 24
       - name: Install (root + workspaces)
         run: bun install --frozen-lockfile
+      - name: Unit tests (stack, shard ${{ matrix.shard }} of 4)
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          list="$RUNNER_TEMP/unit-test-shard-$SHARD.txt"
+          bun scripts/ci/unit-test-shards.ts --shard "$SHARD" --of 4 > "$list"
+          echo "shard $SHARD of 4: $(wc -l < "$list") test files" | tee -a "$GITHUB_STEP_SUMMARY"
+          mapfile -t files < "$list"
+          test "${#files[@]}" -gt 0
+          bun test --timeout 30000 "${files[@]}"
+  unit-tests-aux:
+    # The steps that must run exactly once beside the sharded root suite: package
+    # tests, the stack typecheck, the shard-plan check, the G4-only ingest re-runs,
+    # the stacks/ tests, the guards and the scrub bindgen receipt. None of them uses
+    # the ClickHouse service, which only the session read API suites under src/ need.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) && 'ubuntu-latest' || vars.CI_LINUX_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 45
+    steps:
+      # Check out the literal PR head commit, not GitHub's synthetic merge ref, so a green
+      # run is evidence about the exact SHA under review.
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Record the commit under test
+        env:
+          EXPECTED: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          actual="$(git rev-parse HEAD)"
+          echo "commit under test: $actual (expected $EXPECTED)" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$actual" = "$EXPECTED"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install (root + workspaces)
+        run: bun install --frozen-lockfile
       - name: Typecheck packages/pipeline
         run: bun run --filter @96bulls/pipeline typecheck
       - name: Test packages/pipeline (vitest, in-process PGlite; no real database)
@@ -101,10 +167,12 @@ jobs:
         run: bun run --filter @relayhistory/object-store test
       - name: Typecheck the stack (src, stacks, alchemy.run.ts)
         run: bunx tsc --noEmit -p tsconfig.json
-      - name: Unit tests (stack)
-        run: bun test --timeout 30000
+      - name: Shard plan covers every root test file exactly once
+        run: |
+          bun scripts/ci/unit-test-shards.ts --check --of 4
+          bun scripts/ci/unit-test-shards.ts --plan --of 4 | tee -a "$GITHUB_STEP_SUMMARY"
       # The ingest Worker on a database migrated only to the G4 set (through 043800; none of the post-G4 migrations, 043850 onward).
-      # g4-only-schema.pglite.test.ts already ran above (it pins its own cutoff); these are the existing
+      # g4-only-schema.pglite.test.ts runs in its unit-tests-shard shard (it pins its own cutoff); these are the existing
       # default-flag ingest suites re-run with the test-only cutoff (src/session-ingest/__tests__/pglite-schema.ts).
       - name: Unit tests (ingest on the G4-only migration set)
         env:
@@ -126,7 +194,7 @@ jobs:
       - name: Guard - no production deployment identifiers in engine source (src, packages, scripts)
         run: bun scripts/check-engine-identifiers.ts
       # Vendored relayscrubber bytes vs scrub-bindgen-pin.json and the release's artifact.json
-      # (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.6"). Fails on any mismatch.
+      # (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.8"). Fails on any mismatch.
       - name: Scrub bindgen receipt (vendored relayscrubber vs pin and artifact.json)
         run: bun scripts/scrub-bindgen-receipt.ts --out scrub-bindgen-receipt.json
       - name: Upload the scrub bindgen receipt

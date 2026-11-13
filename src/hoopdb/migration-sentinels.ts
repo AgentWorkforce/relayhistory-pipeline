@@ -45,6 +45,13 @@ const BUFFERED_STAGES_SESSION_FIRST_STEP =
   "upstream:20261105044040_buffered_stages_session_first.sql";
 const COORDINATION_FACT_READERS_STEP =
   "upstream:20261105047000_coordination_fact_readers.sql";
+const OPERATOR_USER_ERASE_INDEXES_STEP =
+  "upstream:20261105058000_operator_user_erase_indexes.sql";
+const fkIndex = (name: string, table: string, column: string): AdoptableIndex => ({
+  name,
+  table: `sessions.${table}`,
+  def: `CREATE INDEX ${name} ON sessions.${table} USING btree (${column})`,
+});
 const orgIndex = (table: string, columns: string): AdoptableIndex => ({
   name: `${table}_org_id_idx`,
   table: `sessions.${table}`,
@@ -96,6 +103,58 @@ export const ADOPTABLE_INDEXES: Readonly<Record<string, readonly AdoptableIndex[
       table: "sessions.session_output_facts",
       def: "CREATE INDEX session_output_facts_coordination_outcomes_idx ON sessions.session_output_facts USING btree (org_id, workspace_id, ts, row_id) WHERE (fact_kind = ANY (ARRAY['commit'::text, 'outcome'::text]))",
     },
+  ],
+  // Operator per-user erase support indexes (ten foreign-key, one un-owned-slot lookup, four key_material lookups, one ord-seat candidate-key lookup), 20261105058000 (packet:
+  // docs/packets/operator-user-erase-index-packet.md), in the step's build order.
+  [OPERATOR_USER_ERASE_INDEXES_STEP]: [
+    fkIndex("ingest_receipt_ord_seats_key_sha256_idx", "ingest_receipt_ord_seats", "key_sha256"),
+    fkIndex("ingest_receipt_record_heads_winner_key_sha256_idx", "ingest_receipt_record_heads", "winner_key_sha256"),
+    fkIndex("ingest_lazy_native_slots_current_seat_key_idx", "ingest_lazy_native_slots", "current_seat_key"),
+    fkIndex("ingest_lazy_ack_decisions_native_key_sha256_idx", "ingest_lazy_ack_decisions", "native_key_sha256"),
+    fkIndex("ingest_lazy_ack_decisions_seat_key_sha256_idx", "ingest_lazy_ack_decisions", "seat_key_sha256"),
+    {
+      name: "ingest_stage_intents_parent_stage_token_idx",
+      table: "sessions.ingest_stage_intents",
+      def: "CREATE INDEX ingest_stage_intents_parent_stage_token_idx ON sessions.ingest_stage_intents USING btree (parent_stage_token) WHERE (parent_stage_token IS NOT NULL)",
+    },
+    {
+      name: "ingest_stage_intents_gc_replacement_stage_token_idx",
+      table: "sessions.ingest_stage_intents",
+      def: "CREATE INDEX ingest_stage_intents_gc_replacement_stage_token_idx ON sessions.ingest_stage_intents USING btree (gc_replacement_stage_token) WHERE (gc_replacement_stage_token IS NOT NULL)",
+    },
+    fkIndex("ingest_stage_intents_batch_idx", "ingest_stage_intents", "org_id, workspace_id, origin_id, batch_id"),
+    {
+      name: "ingest_buffer_outbox_active_stage_token_idx",
+      table: "sessions.ingest_buffer_outbox",
+      def: "CREATE INDEX ingest_buffer_outbox_active_stage_token_idx ON sessions.ingest_buffer_outbox USING btree (active_stage_token) WHERE (active_stage_token IS NOT NULL)",
+    },
+    fkIndex("ingest_history_plans_stage_token_idx", "ingest_history_plans", "stage_token"),
+    {
+      name: "ingest_lazy_native_slots_unowned_origin_idx",
+      table: "sessions.ingest_lazy_native_slots",
+      def: "CREATE INDEX ingest_lazy_native_slots_unowned_origin_idx ON sessions.ingest_lazy_native_slots USING btree (org_id, workspace_id, origin_id) WHERE (current_owner IS NULL)",
+    },
+    {
+      name: "ingest_receipt_seats_key_material_user_idx",
+      table: "sessions.ingest_receipt_seats",
+      def: "CREATE INDEX ingest_receipt_seats_key_material_user_idx ON sessions.ingest_receipt_seats USING btree (((key_material ->> 3)), ((key_material ->> 4)), ((key_material ->> 5)))",
+    },
+    {
+      name: "ingest_receipt_seats_key_material_origin_idx",
+      table: "sessions.ingest_receipt_seats",
+      def: "CREATE INDEX ingest_receipt_seats_key_material_origin_idx ON sessions.ingest_receipt_seats USING btree (((key_material ->> 3)), ((key_material ->> 4)), ((key_material ->> 6)))",
+    },
+    {
+      name: "ingest_receipt_record_heads_key_material_user_idx",
+      table: "sessions.ingest_receipt_record_heads",
+      def: "CREATE INDEX ingest_receipt_record_heads_key_material_user_idx ON sessions.ingest_receipt_record_heads USING btree (((key_material ->> 3)), ((key_material ->> 4)), ((key_material ->> 5)))",
+    },
+    {
+      name: "ingest_receipt_record_heads_key_material_origin_idx",
+      table: "sessions.ingest_receipt_record_heads",
+      def: "CREATE INDEX ingest_receipt_record_heads_key_material_origin_idx ON sessions.ingest_receipt_record_heads USING btree (((key_material ->> 3)), ((key_material ->> 4)), ((key_material ->> 6)))",
+    },
+    fkIndex("ingest_receipt_ord_seats_candidate_key_idx", "ingest_receipt_ord_seats", "candidate_key_sha256"),
   ],
 };
 
@@ -162,6 +221,10 @@ export const ADOPTABLE_INDEX_STEPS: Readonly<Record<string, AdoptableIndexStep>>
     packet: "coordination fact-reader index packet docs/coordination-overlap-detection.md",
     replaces: [],
     creates: ["sessions.coordination_write_facts_for", "sessions.coordination_output_facts_for"],
+  },
+  [OPERATOR_USER_ERASE_INDEXES_STEP]: {
+    packet: "operator user erase index packet docs/packets/operator-user-erase-index-packet.md",
+    replaces: [],
   },
 };
 
@@ -369,6 +432,31 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
     sql: "SELECT to_regprocedure('sessions.coordination_write_facts_for(text,timestamptz,timestamptz,text,integer)') IS NOT NULL AND to_regprocedure('sessions.coordination_output_facts_for(text,timestamptz,timestamptz,text,integer)') IS NOT NULL AS applied",
   },
   "upstream:20261105056000_session_summary_activity.sql": { evidence: "function sessions.session_summary_activity_for", sql: "SELECT to_regprocedure('sessions.session_summary_activity_for(text,timestamptz,timestamptz)') IS NOT NULL AS applied" },
+  "upstream:20261105057010_upload_consent.sql": {
+    evidence: "function sessions.upload_consent_apply_v1 and table sessions.upload_consent_holds",
+    sql: "SELECT to_regprocedure('sessions.upload_consent_apply_v1(text,text,text,jsonb,boolean,bigint)') IS NOT NULL AND to_regclass('sessions.upload_consent_holds') IS NOT NULL AS applied",
+  },
+  "upstream:20261105057030_selfhost_erase_directory_membership.sql": {
+    evidence: "replacement: ingest_selfhost_set_session_uploads deletes the erased copy's directory membership rows",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_selfhost_set_session_uploads(jsonb)') AND prosecdef AND prosrc LIKE '%DELETE FROM sessions.session_directory_machines%') AS applied",
+  },
+  "upstream:20261105047030_frozen_copy_progress.sql": {
+    evidence: "table sessions.__96bulls_frozen_copy_progress and trigger ingest_privacy_authority_guard on sessions.ingest_frozen_source_receipts",
+    sql: "SELECT to_regclass('sessions.__96bulls_frozen_copy_progress') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_catalog.pg_trigger WHERE tgrelid=to_regclass('sessions.ingest_frozen_source_receipts') AND tgname='ingest_privacy_authority_guard' AND NOT tgisinternal) AS applied",
+  },
+  // Adoptable step: an unledgered "applied" here is accepted when every declared index is adoptable.
+  [OPERATOR_USER_ERASE_INDEXES_STEP]: {
+    evidence: "the sixteen operator-user-erase support indexes, exact definition, valid and ready",
+    sql: adoptableIndexesSentinel(OPERATOR_USER_ERASE_INDEXES_STEP),
+  },
+  "upstream:20261105058010_operator_user_erase.sql": {
+    evidence: "table sessions.operator_user_erasures and the erase check in sessions.ingest_lock_fences (operator per-user erase)",
+    sql: "SELECT to_regclass('sessions.operator_user_erasures') IS NOT NULL AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_lock_fences(text,text,text)') AND NOT prosecdef AND prosrc LIKE '%operator_user_erasures%') AS applied",
+  },
+  "upstream:20261105059000_ingest_publication_gcs_provider.sql": {
+    evidence: "replacement: ingest_publication_prepare and ingest_publication_publish admit storage provider gcs",
+    sql: "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_publication_prepare(jsonb)') AND prosecdef AND prosrc LIKE '%NOT IN(''s3'',''gcs'')%') AND EXISTS(SELECT 1 FROM pg_proc WHERE oid=to_regprocedure('sessions.ingest_publication_publish(jsonb)') AND prosecdef AND prosrc LIKE '%NOT IN(''s3'',''gcs'')%') AS applied",
+  },
   "96bulls:0001_96bulls_observability.sql": {
     evidence: "column sessions.pipeline_jobs.traceparent",
     sql: column("sessions.pipeline_jobs", "traceparent"),
@@ -429,6 +517,10 @@ export const MIGRATION_SENTINELS: Record<string, Sentinel> = {
   "upstream:20261105047010_buffered_exact_session_stages.sql": {
     evidence: "new exact-session stage RPC (047010)",
     sql: fn("sessions", "buffered_session_stages_for_target"),
+  },
+  "upstream:20261105047020_buffered_session_stages_paged.sql": {
+    evidence: "new paged exact-session stage RPC (047020)",
+    sql: fn("sessions", "buffered_session_stages_for_target_paged"),
   },
   "upstream:20261105046000_analysis_jobs.sql": { evidence: "table sessions.session_analysis_jobs_v2", sql: relation("sessions.session_analysis_jobs_v2") },
   // Adoptable step: an unledgered "applied" here is accepted when every declared index is adoptable.

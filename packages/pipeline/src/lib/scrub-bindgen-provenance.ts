@@ -1,6 +1,6 @@
 /**
  * Release provenance for the vendored relayscrubber package (docs/scrub-engine.md,
- * "Cutover: pinned relayscrubber 0.5.0-alpha.6", "Provenance").
+ * "Cutover: pinned relayscrubber 0.5.0-alpha.8", "Provenance").
  *
  * Node-only, build/pin-time tooling: nothing in the runtime imports this file. It proves
  * that the bytes vendored under packages/pipeline/scrub-bindgen/ are exactly the

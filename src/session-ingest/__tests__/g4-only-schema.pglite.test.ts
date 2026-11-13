@@ -148,6 +148,10 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105047000_coordination_fact_readers.sql",
       // Read-role-only exact-session buffered stage RPC; default-off and never called by the ingest Worker.
       "20261105047010_buffered_exact_session_stages.sql",
+      // Read-role-only paged exact-session buffered stage RPC (requires 047010); default-off and never called by the ingest Worker.
+      "20261105047020_buffered_session_stages_paged.sql",
+      // Owner-only frozen-copy progress table (no grant, no function) and the 041000 privacy guard trigger on frozen receipts; no G4 function names them.
+      "20261105047030_frozen_copy_progress.sql",
       // Operator per-session erase: new tables and entry points; no ingest path calls them.
       "20261105050000_operator_session_erase.sql",
       // Its fence check also replaces publication scope / buffer GC for lock order and guards live writer tables.
@@ -157,10 +161,22 @@ describe("G4-only schema: the post-G4 objects are absent", () => {
       "20261105056000_session_summary_activity.sql",
       // One read-role-only SECURITY DEFINER per-user session aggregate; no ingest path touches it.
       "20261105057000_session_directory_users_aggregate.sql",
+      // Server-owned upload consent: four new owner-only tables and two ingest-role entry points; no G4 function names them.
+      "20261105057010_upload_consent.sql",
+      // Replacement of the post-G4 self-host erase (043910, last 044070): it also deletes the erased copy's directory membership rows.
+      "20261105057030_selfhost_erase_directory_membership.sql",
+      // Sixteen support indexes for the per-user erase (foreign keys, un-owned slots, key_material, ord-seat candidate key); no function changes.
+      "20261105058000_operator_user_erase_indexes.sql",
+      // Operator per-user erase: an owner-only ledger table and entry points; it also replaces ingest_lock_fences
+      // (RH041 while the user has an active erase), the buffered GC claim (skips such a user's stages) and the two
+      // source-control begins (refused for such a user).
+      "20261105058010_operator_user_erase.sql",
+      // Publication provider: prepare and publish admit storage provider 'gcs' as well as 's3' (replacement only).
+      "20261105059000_ingest_publication_gcs_provider.sql",
     ]);
     expect(() => migrationFiles(REPO_ROOT, "20261105043800_typo.sql")).toThrow(/names no migration/);
     expect(OBJECTS.newFunctions.length).toBeGreaterThan(30);
-    expect(OBJECTS.replacedFunctions).toEqual(["buffered_session_stages_for", "buffered_sessions_for", "ingest_babysitter_retention_register", "ingest_buffer_gc_claim", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_lazy_guard", "ingest_prepare_buffer_stage", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_publish", "ingest_publication_retire_fence", "ingest_publication_scope", "ingest_require_generation"]);
+    expect(OBJECTS.replacedFunctions).toEqual(["buffered_session_stages_for", "buffered_sessions_for", "ingest_babysitter_retention_register", "ingest_buffer_gc_claim", "ingest_claim_batch_mode", "ingest_claim_buffered_batch", "ingest_commit_batch", "ingest_commit_buffered_batch", "ingest_lazy_guard", "ingest_lock_fences", "ingest_prepare_buffer_stage", "ingest_privacy_authority_begin", "ingest_publication_claim", "ingest_publication_guard_pointer", "ingest_publication_prepare", "ingest_publication_publish", "ingest_publication_retire_fence", "ingest_publication_scope", "ingest_require_generation", "ingest_source_control_begin"]);
   });
 
   test("no new table, function or column exists; the replaced RPCs exist in their prior form; no G4 body names a post-G4 object", async () => {

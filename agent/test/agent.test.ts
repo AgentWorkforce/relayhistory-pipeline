@@ -153,6 +153,17 @@ test("an automatic deploy follows only a green Agent CI run on main for main's c
   // A full deploy (the first one creates the host) only from a human dispatch.
   assert.match(deploy, /allow-restart: \$\{\{ github\.event_name == 'workflow_dispatch' && inputs\.allow_restart \}\}/);
   assert.doesNotMatch(deploy, /adopt/);
+  // This repo is public, so it cannot call layered-agents' private reusable
+  // workflow; it runs the kit's composite action from a read-only checkout.
+  const deployJob = deploy.match(/^  deploy:\n((?:    .*\n|\n)+?)(?=^  \S)/m)?.[1] ?? "";
+  assert.match(deployJob, /^    steps:$/m);
+  assert.doesNotMatch(deploy, /uses: AgentWorkforce\/layered-agents\/\.github\/workflows\//);
+  assert.match(deployJob, /^    environment: agent-deploy$/m); // part of the role's exact OIDC subject
+  assert.match(deployJob, /app-id: \$\{\{ secrets\.GH_APP_PUSHER_ID \}\}/);
+  assert.match(deployJob, /^          repositories: layered-agents\n          permission-contents: read$/m);
+  assert.match(deployJob, /^          repository: AgentWorkforce\/layered-agents\n          ref: main\n          token: \$\{\{ steps\.kit-token\.outputs\.token \}\}\n          path: \.layered-agents\n          persist-credentials: false$/m);
+  assert.equal(deployJob.match(/persist-credentials: false/g)?.length, 2);
+  assert.match(deployJob, /^        uses: \.\/\.layered-agents\/\.github\/actions\/layered-agent-deploy$/m);
   const condition = deploy.match(/^  deploy:\n(?:    .*\n)*?    if: >-\n((?:      .*\n)+)/m)?.[1]?.replace(/\s+/g, " ").trim();
   assert.equal(condition,
     "github.ref == 'refs/heads/main' && needs.changed.outputs.deploy == 'true' && (github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_sha == github.sha))");

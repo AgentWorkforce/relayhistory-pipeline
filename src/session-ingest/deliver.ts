@@ -1,4 +1,5 @@
 import type {CurrentCustodyPacket,CurrentCustodyAck} from "./custody-protocol.ts";
+import { sessionKey } from "./upload-consent.ts";
 import {validatedCustodyAck} from "./custody-ack.ts";
 /**
  * `POST /v1/delivery/batches` without Neon: every accepted batch is in S3
@@ -133,6 +134,15 @@ export interface DeliverDeps {
    * those admit nothing new.
    */
   admissionGate?: () => Promise<void>;
+  /**
+   * Upload consent (upload-consent.ts): runs on the request path AND in the async consumer, AFTER a
+   * `claimed`/`resume` claim and BEFORE any slot or S3 write, then once more right before the receipt
+   * commit, so a narrowing that lands while the batch is in flight still refuses it before it is visible.
+   * `dropped` names the sessions the claim's deletion fence acknowledges without storing (as
+   * `upload-consent.ts` `sessionKey`s). Throws `UploadConsentRequired` to refuse. A replay / replay_fast
+   * claim never calls it: those admit nothing new.
+   */
+  consentGate?: (dropped: ReadonlySet<string>, phase: "admit" | "commit") => Promise<void>;
 }
 
 /** Whether this deployment routes Babysitter upserts to retention buckets (see `DeliverDeps.babysitterRetention`). */
@@ -293,6 +303,11 @@ async function runStage<T>(name: string, work: () => Promise<T>, observe?: Stage
   }
 }
 
+/** The consent gate as its own stage: a store failure is a 503 (no ACK), never an admit. */
+function consentStage(deps: Pick<DeliverDeps, "stageLatency" | "consentGate">, dropped: ReadonlySet<string>, phase: "admit" | "commit"): Promise<void> {
+  return runStage(phase === "admit" ? "consent_gate" : "consent_commit", () => deps.consentGate!(dropped, phase), deps.stageLatency);
+}
+
 /** The stage wrapper bound to this delivery's observer (undefined, the default: no latency lines). */
 function stagesFor(deps: Pick<DeliverDeps, "stageLatency">) {
   return <T>(name: string, work: () => Promise<T>): Promise<T> => runStage(name, work, deps.stageLatency);
@@ -378,6 +393,8 @@ async function deliverPreparedCore(deps: DeliverDeps, tenant: LedgerTenant, prep
     return { custodyAck:claim.custodyAck,receipt: withLimits(prepared), outcome: "replay_fast", stats: { ...base, deleted_sessions: claim.deleted.length, stale: claim.stale.length, timing_ms: timing } };
 
   if (deps.admissionGate) await stage("admission_gate", deps.admissionGate);
+  const dropped: ReadonlySet<string> = new Set(claim.deleted.map(([s, id]) => sessionKey(s, id)));
+  if (deps.consentGate) await consentStage(deps, dropped, "admit");
   // The deletion filter (records of sessions the user deleted from this origin are
   // acknowledged, not stored) and the replay fast path (records already stored at or
   // above their revision are acknowledged, not written again).
@@ -472,6 +489,7 @@ async function writeAndCommit(
     mark("buffer_intent");
     await stage("buffer_put", () => putBufferedStage(deps.target.store,preparedStage));
     mark("buffer_put");
+    if (deps.consentGate) await consentStage(deps, new Set(deleted), "commit");
     const ack=await stage("buffer_receipt", () => deps.ledger.commitBuffered!({...attempt,stageToken:intent.stageToken}));
     let custodyAck:CurrentCustodyAck|undefined;
     if(deps.custody){try{custodyAck=validatedCustodyAck(ack,deps.custody)}catch{throw new IngestUnavailable("buffer_receipt","custody_ack_missing")}}
@@ -513,6 +531,7 @@ async function writeAndCommit(
   }
 
   const writtenSessions = sessions.filter(([s, id]) => !deleted.has(pair(s, id)));
+  if (deps.consentGate) await consentStage(deps, new Set(deleted), "commit");
   const committed = await stage("commit", () =>
     deps.ledger.commit({
       tenant,

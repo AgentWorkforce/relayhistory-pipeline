@@ -35,6 +35,11 @@ on:
           - wrong-generation
           - stale-plan
           - missing-bootstrap
+          - anchor-tampered
+          - anchor-nonlinear
+          - anchor-extra-file
+          - anchor-missing-verifier
+          - anchor-ref-moved
       expect_refusal:
         description: "Known-negative row: <stage>:<code> the run must FAIL with (e.g. R1:rehearsal_target_anchor_missing); empty = must pass"
         required: false
@@ -138,7 +143,11 @@ jobs:
   smoke:
     if: github.event_name == 'pull_request'
     name: rehearse smoke (PostgreSQL 17)
-    # GitHub-hosted on purpose, see the rehearse job.
+    # GitHub-hosted on purpose, see the rehearse job. The PR head is the release tree
+    # under rehearsal (REHEARSAL_SHA, the working directory). The driver and the contract
+    # module come from the merge ref, as the rehearse job takes them from the dispatching
+    # ref: branches cut before the driver existed are still rehearsed, and the driver
+    # under test is the one that would merge.
     runs-on: ubuntu-latest
     timeout-minutes: 45
     services:
@@ -169,13 +178,25 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
+      # github.sha is the merge commit of the head into the base, so it carries the base's
+      # driver. Same gitignored path and sparse set as the rehearse job.
+      - name: Rehearsal tooling at the merge ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: .rehearsal-tooling
+          sparse-checkout: |
+            /scripts/pg-proof/
+            /src/hoopdb/schema-release-contract.ts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
       - run: bun install --frozen-lockfile
       - name: Rehearse
         timeout-minutes: 30
-        run: bun scripts/pg-proof/schema-rehearsal.ts
+        run: bun .rehearsal-tooling/scripts/pg-proof/schema-rehearsal.ts
       - name: Check summary
         if: always()
         run: jq -e '.passed == true' rehearsal-out/summary.json

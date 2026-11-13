@@ -81,7 +81,7 @@ test('canonical image injects the immutable ACK seat before sealing raw bytes',a
   received_at:'2026-11-04T01:00:00.000Z',org_id:'org-a',workspace_id:'ws-a',origin_id:'origin-a',user_id:'user-a',groups:[['claude','session:1'] as [string,string]]},
   groups:[{source:'claude',sessionId:'session:1',lines:[line('origin-a','first ACK')]}],spec:stage};
  try{
-  const image=await preparePublicationImage(ticket,head,decoded,{bucket:'fixture',region:'us-east-1',keyRoot:'96bulls',generation:HEX},scratch.store,new AbortController().signal);
+  const image=await preparePublicationImage(ticket,head,decoded,{bucket:'fixture',region:'us-east-1',keyRoot:'96bulls',generation:HEX,provider:'s3' as const},scratch.store,new AbortController().signal);
   const raw=JSON.parse(new TextDecoder().decode(zstdDecompressSync(image.newChunk.body)).trim());
   expect(raw.accepted_seq).toBe('9007199254740994');
   expect(raw.payload.text).toBe('first ACK');
@@ -89,7 +89,7 @@ test('canonical image injects the immutable ACK seat before sealing raw bytes',a
 });
 
 test('publication RPC refuses missing, losing, or wrong-epoch ACK seat claims',async()=>{
- const target={bucket:'fixture',region:'us-east-1',keyRoot:'96bulls',generation:HEX};
+ const target={bucket:'fixture',region:'us-east-1',keyRoot:'96bulls',generation:HEX,provider:'s3' as const};
  const response=()=>({schemaGeneration:HEX,attemptToken:'abcdefab-1234-1234-1234-123456789abc',leaseToken:'11111111-1111-1111-1111-111111111111',
   leaseUntil:'2026-11-05T00:05:00.000000Z',claimToken:'33333333-3333-3333-3333-333333333333',stageToken:'22222222-2222-2222-2222-222222222222',
   tenant:{orgId:'org-a',workspaceId:'ws-a',userId:'user-a'},originId:'origin-a',batchId:'batch-a',batchDigest:HEX,

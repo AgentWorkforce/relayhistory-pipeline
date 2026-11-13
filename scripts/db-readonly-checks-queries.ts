@@ -1,6 +1,6 @@
 /**
  * Fixed query set for the read-only production database checks
- * (.github/workflows/db-readonly-checks.yml, runbooks/sessions-prod-db-readonly-checks.md).
+ * (.github/workflows/db-readonly-checks.yml, sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-db-readonly-checks.md).
  *
  * Every statement here is a static string built once from the constant name lists below. There is no
  * free-form SQL path: the runner (scripts/db-readonly-checks.ts) only executes entries of this module,
@@ -157,7 +157,7 @@ export const POLICY =
   "SELECT p.write_enabled, p.read_enabled, p.backfill_complete_at IS NOT NULL AS backfill_complete FROM sessions.ingest_claim_sessions_policy p WHERE p.singleton";
 
 /**
- * (b) reconcile counts, the shapes of docs/handoffs/ingest-claim-sessions-044080/operator-packet.md
+ * (b) reconcile counts, the shapes of sessions-pipeline-cloud:hosted-ops/preserved/docs/handoffs/ingest-claim-sessions-044080/operator-packet.md
  * steps 5 (expected_pairs/side_rows/stale_rows) and the drift check (null_accepted/drifted).
  */
 export const RECONCILE = {

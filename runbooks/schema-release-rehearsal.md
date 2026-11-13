@@ -45,7 +45,7 @@ migrator lock, so it is listed in execution order below.
 | --- | --- |
 | R0 seed | Owner, runtime and Supabase shim roles, bootstrap chain, function boundary (all from the baseline landing commit's bytes); then the landing commit's own migrator applies the baseline (see "R0 seeds with the landing migrator" below); the release code checks the ledger is exactly the landing tree's steps and digests (`rehearsal_seed_ledger`, `rehearsal_seed_ledger_digest`), those digests equal the release tree's (`rehearsal_seed_bytes_drift`), the marker is PASS at A (`rehearsal_seed_marker`) and A equals the landing `--generation` (`rehearsal_landing_generation_mismatch`); then the previous release's event-trigger body is installed (stale wrapper). R1 onward use the release sha's checkout. |
 | R7-pre | (clean runs where the baseline already has the 044030 overlap) synthetic lazy policy, seat and completeness at A; old and `{B,A}` Workers admit; the owner opens the A to B overlap. Otherwise SKIP. |
-| R1 plan | `inspectRelease` (READ ONLY; refuses `function_acl_drift`, `ledger_gap`, ...), `migrationTargetSplit` equal to an independently computed window, the target anchor at `generation`, `validateReleasePlan` on the plan built exactly as production builds it. |
+| R1 plan | `inspectRelease` (READ ONLY; refuses `function_acl_drift`, `ledger_gap`, ...), `migrationTargetSplit` equal to an independently computed window, the target commit (the release anchor on an anchor-aware release sha, see below) bound by production's `targetAnchor` at `generation`, `validateReleasePlan` on the plan built exactly as production builds it. |
 | R2 boundary | The planned boundary is safe and is still the previous body (prosrc not exact). |
 | R2-bootstrap | The release tree's bootstrap chain (`SESSION_BOOTSTRAP_FILES`, the release sha's bytes) applied before the apply; only `bulls96_analysis_admit` may appear, bare, with no memberships; no other role changes (see "R2-bootstrap" below). SKIP in the `missing-bootstrap` row. |
 | R4 apply | Production apply order (anchor helpers `targetAnchor`/`sameAnchor` imported from `scripts/schema-release-database.ts`): manifest anchor, inspection, ledger digest, boundary digest, pending window, generation, manifest, then `runMigrations` with `beforeWrite` re-anchoring and refreshing the boundary under the migrator lock, then the production read-backs and `verifyReleaseBoundary`. |
@@ -127,7 +127,9 @@ A future row that holds such a step needs a separate change before it can rehear
 | Row | `baseline` | `target` | `inject_failure` | Expected |
 | --- | --- | --- | --- | --- |
 | Release A | the production ledger tail | the Release A `RELEASE_TARGET_STEP` | `none` | R0-R7 PASS on 15/16/17; R8 SKIP `047010_not_applied` unless the window contains 047010. |
-| 047010 alone (known negative) | `upstream:20261105047000_coordination_fact_readers.sql` | `upstream:20261105047010_buffered_exact_session_stages.sql` | `none`, `expect_refusal` `R1:rehearsal_target_anchor_missing` | R1 FAIL `rehearsal_target_anchor_missing`, zero apply (R4 never runs). No first-parent commit of main has an upstream lane ending at 047010: its landing commit 0f9c360d already ends at 057000. Not expressible under the release-target contract (see Candidate anchors). |
+| 047010 alone, release sha without the anchor API (known negative) | `upstream:20261105047000_coordination_fact_readers.sql` | `upstream:20261105047010_buffered_exact_session_stages.sql` | `none`, `expect_refusal` `R1:rehearsal_target_anchor_missing` | R1 FAIL `rehearsal_target_anchor_missing`, zero apply (R4 never runs). No first-parent commit of main has an upstream lane ending at 047010: its landing commit 0f9c360d already ends at 057000. On a release sha with the anchor API this target is Release B (next row). |
+| Release B (anchor) | `upstream:20261105047000_coordination_fact_readers.sql` | `upstream:20261105047010_buffered_exact_session_stages.sql` | `none` | R1 binds `release/schema-047010` (evidence `anchorSource`: `ref` when the checkout has the protected branch, else `fixture`: A then B built locally off 113dc657) through production's `targetAnchor`; R0-R7 PASS. |
+| Release C (anchor) | as the release | `upstream:20261105050010_*` (the release's 050010 step) | `none` | R1 binds `release/schema-050010` (A, B, then the 050000 and 050010 anchors when built as a fixture); R0-R7 PASS. |
 | Release C on a pre-#534 sha (negative control) | any | any | `none`, `expect_refusal` `R0:rehearsal_release_api_missing` | R0 FAIL `rehearsal_release_api_missing`: that tree has no release-target API (`release-target.ts`, `migrationTargetSplit`; first on main at #534), so only a legacy full apply is possible. The evidence lists `fullApplyPending` and `beyondTarget`. Not a real release target: do not release from such a sha. Any sha without the exported `targetAnchor`/`sameAnchor` (added with this rehearsal) also refuses this code. |
 | Ledger gap | as the release | as the release | `ledger-gap` | `R1-ledger-gap` PASS: a seeded upstream row is removed and the plan refuses `ledger_gap`. |
 | Boundary drift | as the release | as the release | `boundary-drift` | `R4-boundary-drift` PASS: a PUBLIC EXECUTE default appears after the plan; apply refuses `function_boundary_unproven`; ledger unchanged. |
@@ -135,29 +137,57 @@ A future row that holds such a step needs a separate change before it can rehear
 | Wrong generation | as the release | as the release | `wrong-generation` | `R4-wrong-generation` PASS: a flipped target generation fails `validateReleasePlan` (`release_plan_artifact`) and `runMigrations` refuses `release_target_generation_changed` before any write; ledger, marker and boundary unchanged. |
 | Missing bootstrap | as the release (window contains 046000) | as the release | `missing-bootstrap` | `R2-bootstrap` SKIP; `R4-missing-bootstrap` PASS: the apply refuses `42704` at the first step granting to a role only the release chain creates, the target is not ledgered; then `R2-bootstrap-rerun`, `R1-rerun`, R4, R3, R5 PASS. Refuses `rehearsal_injection_unavailable` when the chain is unchanged from landing or the role already exists. |
 | Stale plan | as the release | as the release | `stale-plan` | `R4-stale-plan` PASS: the ledger changes after the plan; production `runMigrations` (given the plan's stale ledger digest, as `releaseDatabase` passes it) refuses `release_ledger_changed` under the migrator lock before `beforeWrite`, and the release script order replayed by the driver refuses it too; nothing else written. |
+| Tampered anchor | as an anchored release (held steps) | as the release | `anchor-tampered` | `R1-anchor-tampered` PASS: the anchor tip is replaced by a commit whose bootstrap chain file has other bytes; the plan refuses `release_anchor_file_drift`. |
+| Side parent / nonlinear anchor | as an anchored release | as the release | `anchor-nonlinear` | `R1-anchor-nonlinear` PASS: the anchor tip gains a second parent (the release sha); the plan refuses `release_anchor_nonlinear`. |
+| Extra file in the anchor | as an anchored release | as the release | `anchor-extra-file` | `R1-anchor-extra-file` PASS: the anchor tip adds a path outside the allowlist; the plan refuses `release_anchor_extra_file`. |
+| Missing verifier | as an anchored release | as the release | `anchor-missing-verifier` | `R1-anchor-missing-verifier` PASS: the anchor tip drops a phase 2 verifier file; the plan refuses `release_target_verifier_missing`. |
+| Anchor ref movement | as an anchored release | as the release | `anchor-ref-moved` | `R4-anchor-ref-moved` PASS: after a clean plan the anchor branch moves to a twin commit (same tree and parent); the apply's first anchor recompute refuses `release_anchor_ref_mismatch` before connecting; ledger, marker and boundary unchanged. |
 
 Run every row on all three majors (the dispatch matrix). Attach the `summary.json`
 artifacts to the release review. Pull requests touching the release path run one smoke
 row automatically (PostgreSQL 17, baseline 045030, target 047000).
 
 Injection rows expect their own stage to PASS, so leave `expect_refusal` empty for them.
+The anchor injections need held steps and a release sha with the anchor API
+(`releaseAnchorBinding`); otherwise they refuse `rehearsal_injection_unavailable`. They
+mutate only the disposable checkout's local `refs/remotes/origin/release/schema-<slot>`
+ref (the protected branch when present, or the fixture); nothing is pushed.
+
+### The target commit under the release anchor
+
+On a release sha with the anchor API, a held-step target commit must be the protected
+`release/schema-<slot>` anchor (runbooks/guarded-session-schema-release.md, "Release
+anchor"). R1 uses the branch tip from the full checkout when it exists (`anchorSource`
+`ref`). Otherwise it builds a fixture chain in the disposable checkout only
+(scripts/pg-proof/schema-rehearsal-core.ts `buildAnchorFixture`, `anchorSource`
+`fixture`): off the newest first-parent main commit (per verifier generation, down to the
+baseline's landing commit) whose lane steps are all prefix steps at the release bytes, a
+bootstrap-only anchor on that commit's newest target-lane slot, then one anchor per
+missing target-lane prefix step with a unique slot, up to the target, each at the release
+bytes (steps, their rollbacks, bootstrap files). It keeps the chain whose generation
+equals `generation` and removes the others; an existing ref is never overwritten
+(`rehearsal_anchor_fixture_conflict`). The plan then binds the tip through production's
+own `targetAnchor`, so every `release_anchor_*` refusal surfaces unchanged.
 
 ## Candidate anchors
 
 For information only; this section selects nothing. First-parent commits of main whose
-schema lanes could serve as a release target commit:
+schema lanes could serve as the main base of a release anchor (a held-step target_sha is
+always the protected anchor tip, never one of these commits):
 
 | Commit | Upstream tail | Note |
 | --- | --- | --- |
-| 113dc657 | 047000 | Release A anchor (the PR smoke generation `52a3f2f0...`). |
+| 113dc657 | 047000 | Main base of Release A: A = `release/schema-047000` with parent 113dc657, carrying #546's chain bytes (the bootstrap chain files at the release sha's bytes) and nothing else (the PR smoke generation `52a3f2f0...`). |
 | 98558d9f | 050010 | No 047010. |
 | 3e2fd7c7 | 056000 | |
 | 8f8ceaeb | 057000 | |
 | 0f9c360d and later | 057000 | With 047010. |
 
-NOT EXPRESSIBLE under the release-target contract: standalone 047010 (no commit ends
-the upstream lane at 047010) and "Release C pre-#534" (no release-target API). Any
-folded or branch-anchored release needs a separate amendment and its own approval. A
+Under the release anchor, standalone 047010 is Release B (`release/schema-047010`, parent
+the A tip) and 050010 is Release C (`release/schema-050010`, parent the B tip); see
+runbooks/guarded-session-schema-release.md "Release anchor". NOT EXPRESSIBLE: "Release C
+pre-#534" (no release-target API), and any held-step release from a release sha without
+the anchor API. A
 rehearsal of any of these rows is prerequisite proof only and authorizes nothing.
 
 ## Limits

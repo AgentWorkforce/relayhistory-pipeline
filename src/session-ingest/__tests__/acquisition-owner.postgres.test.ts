@@ -655,7 +655,10 @@ describe.skipIf(!url)("flag off, and flag on with unenrolled sources, are byte-i
    return normalize({calls:f.calls,tables});
   };
   // Drift alarm: a new migration built on 043850 is reviewed here before the baseline silently drops it.
-  expect(ON_ACQUISITION).toEqual(["20261105050010_operator_session_erase_fence_check.sql"]);
+  // 059000 re-replaces ingest_publication_publish with 043850's body (which calls ingest_acquisition_publish_check), only
+  // widening the provider predicate to admit gcs; it cannot apply without 043850, so the baseline omits it too.
+  expect(ON_ACQUISITION).toEqual(["20261105050010_operator_session_erase_fence_check.sql",
+   "20261105059000_ingest_publication_gcs_provider.sql"]);
   const withMigration=await workload(await ingest("acq_identity_a",true));
   const armed=await ingest("acq_identity_c",true);await armed.pool.query("SELECT sessions.ingest_acquisition_set_hooks(true)");
   const withFlag=await workload(armed);

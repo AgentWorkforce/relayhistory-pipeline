@@ -137,6 +137,13 @@ describe("flag on", () => {
     expect(jwksCalls()).toHaveLength(0);
   });
 
+  it("passes rth:consent (a person's confirmed upload-consent write) and still drops every unlisted scope", async () => {
+    introspect = () => Response.json(active({ scopes: ["rth:sync", "rth:consent", "rth:admin", "cli:auth"] }));
+    const response = await app()(TOKEN);
+    expect(response.status).toBe(200);
+    expect(((await response.json()) as { scopes: string[] }).scopes).toEqual(["rth:sync", "rth:consent"]);
+  });
+
   it("sends the configured secret, the token, aud and workspace, with redirect manual (never error, which workerd rejects) and a timeout signal", async () => {
     await app()(TOKEN);
     const [[url, init]] = introspectCalls() as [[string, RequestInit]];

@@ -1256,3 +1256,91 @@ describe("READ_API_OWNER_BUFFERED_INDEX_VERIFY=on: the out-of-band index check o
     expect(logs).toContainEqual(expect.objectContaining({ reason: "buffered_fenced", error_code: "index_missing" }));
   });
 });
+
+describe("READ_API_OWNER_BUFFERED_STAGES_PAGED=on: the paged 047020 stage reader through the routes", () => {
+  const SNAP = "2026-11-05T12:30:00.000Z";
+  const cursorOf = (n: number, snapshot = SNAP) => ({ v: 1, snapshot_at: snapshot, accepted_at: "2026-11-05T12:00:00Z", batch_id: `b-${n}`, stage_key: `k${n}`, stage_token: `t${n}` });
+  type Page = { stages: BufferedStageRow[]; cursor: Record<string, unknown> | null; has_more: boolean; snapshot_at: string } | Error;
+  /** Real sqlOwnerBufferedReads in paged mode over a fake runner answering one scripted envelope per RPC call. */
+  function pagedReads(pages: Page[]) {
+    const params: unknown[][] = [];
+    let n = 0;
+    const run = (async (_o: string, _w: string, work: (q: unknown) => Promise<unknown>) =>
+      work({
+        async query(sql: string, p?: unknown[]) {
+          if (!sql.includes("buffered_session_stages_for_target_paged(")) return { rows: [] };
+          params.push(p ?? []);
+          const a = pages[Math.min(n++, pages.length - 1)]!;
+          if (a instanceof Error) throw a;
+          return { rows: [a] };
+        },
+      })) as never;
+    return { reads: sqlOwnerBufferedReads(run, { exactSession: true, stagesPaged: true }), params };
+  }
+  const traversal = (rows: BufferedStageRow[], snapshot = SNAP): Page[] =>
+    rows.map((row, i) => (i < rows.length - 1 ? { stages: [row], cursor: cursorOf(i + 1, snapshot), has_more: true, snapshot_at: snapshot } : { stages: [row], cursor: null, has_more: false, snapshot_at: snapshot }));
+  async function staged(contents: string[]) {
+    const s = store();
+    const rows: BufferedStageRow[] = [];
+    for (let i = 0; i < contents.length; i++) rows.push((await putStage(s, i + 1, [turn(i, { content: contents[i] })])).row);
+    return { s, rows };
+  }
+
+  test("on: the stages of every page are served together (first traversal and recheck each walk all pages)", async () => {
+    const { s, rows } = await staged(["PAGE-ONE", "PAGE-TWO", "PAGE-THREE"]);
+    const { reads, params } = pagedReads([...traversal(rows), ...traversal(rows, "2026-11-05T12:31:00.000Z")]);
+    const r = await api({ store: s, reads }).get(T);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("x-relayhistory-buffered")).toBe("1");
+    expect((await json(r)).turns.map((t: any) => t.content)).toEqual(["PAGE-ONE", "PAGE-TWO", "PAGE-THREE"]);
+    // Two complete traversals (read + recheck), each starting from cursor NULL.
+    expect(params.map((p) => (p[10] === null ? null : JSON.parse(p[10] as string).batch_id))).toEqual([null, "b-1", "b-2", null, "b-1", "b-2"]);
+  });
+
+  test("a page error mid-way fails closed with no partial session: 501 as main on the first traversal, 503 at the recheck", async () => {
+    const { s, rows } = await staged(["PARTIAL-ONE", "PARTIAL-TWO", "PARTIAL-THREE"]);
+    const err = Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
+    for (const path of [T, M]) {
+      const main = await api({ enabled: false }).get(path);
+      const mainBody = strip(await json(main));
+      const first = traversal(rows);
+      const { get, logs } = api({ store: s, reads: pagedReads([first[0]!, err]).reads });
+      const r1 = await get(path);
+      expect(r1.status).toBe(501);
+      const t1 = await r1.text();
+      expect(strip(JSON.parse(t1))).toEqual(mainBody);
+      expect(t1).not.toContain("PARTIAL-");
+      expect(logs.find((l) => l.reason === "buffered_unverified")).toMatchObject({ error_code: "rpc_timeout" });
+      const r2 = await api({ store: s, reads: pagedReads([...first, first[0]!, err]).reads }).get(path);
+      expect(r2.status).toBe(503);
+      const t2 = await r2.text();
+      expect(JSON.parse(t2).error).toMatchObject({ code: "buffered_fenced" });
+      expect(t2).not.toContain("PARTIAL-");
+    }
+  });
+
+  test("cap overflow fails closed: a traversal that never ends is not served", async () => {
+    const { s, rows } = await staged(["ENDLESS-ONE"]);
+    const endless: Page[] = Array.from({ length: 80 }, (_, i) => ({ stages: i === 0 ? [rows[0]!] : [], cursor: cursorOf(i + 1), has_more: true, snapshot_at: SNAP }));
+    const { reads, params } = pagedReads(endless);
+    const r = await api({ store: s, reads }).get(T);
+    expect(r.status).toBe(501);
+    expect(await r.text()).not.toContain("ENDLESS-ONE");
+    expect(params).toHaveLength(64);
+  });
+
+  test("recheck difference: a fresh traversal with a different stage set is the existing changed outcome (hidden, as main)", async () => {
+    const { s, rows } = await staged(["CHANGED-ONE", "CHANGED-TWO", "CHANGED-THREE"]);
+    for (const path of [T, M]) {
+      const main = await api({ enabled: false }).get(path);
+      const mainBody = strip(await json(main));
+      for (const recheck of [traversal(rows.slice(0, 2)), traversal([rows[0]!, rows[2]!, rows[1]!].slice(0, 2)), traversal([...rows.slice(0, 2), { ...rows[2]!, stage_sha256: "f".repeat(64) }])]) {
+        const r = await api({ store: s, reads: pagedReads([...traversal(rows), ...recheck]).reads }).get(path);
+        expect(r.status).toBe(main.status);
+        const text = await r.text();
+        expect(strip(JSON.parse(text))).toEqual(mainBody);
+        expect(text).not.toContain("CHANGED-");
+      }
+    }
+  });
+});

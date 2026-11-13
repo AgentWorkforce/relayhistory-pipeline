@@ -245,3 +245,33 @@ describe("047010 exact-session deployment selection", () => {
     expect(rendered.vars.READ_API_OWNER_BUFFERED_EXACT_SESSION).toBe("on");
   });
 });
+
+
+describe("047020 paged stages deployment selection", () => {
+  test("preserve and production profile keep the live value; an explicit on is refused", async () => {
+    for (const mode of ["preserve", "profile"]) {
+      for (const enabled of [false, true]) {
+        const live = version({ ...values, READ_API_OWNER_BUFFERED_EXACT_SESSION: "on", ...(enabled ? { READ_API_OWNER_BUFFERED_STAGES_PAGED: "on" } : {}) });
+        const base = { ...env, DEPLOY_TARGET: "production", OWNER_BUFFERED: mode, OWNER_BUFFERED_EXACT_SESSION: "off", OWNER_BUFFERED_STAGES_PAGED: "off" };
+        const resolved = await resolveProfile(base, template, get(live));
+        expect(resolved.OWNER_BUFFERED_STAGES_PAGED).toBe(enabled ? "on" : "off");
+        expect(resolved.OWNER_BUFFERED_EXACT_SESSION).toBe("on");
+        const rendered = ts.parseConfigFileTextToJson("config.jsonc", renderDeployConfig(template, profileInputs({ ...base, ...resolved }))).config;
+        expect(rendered.vars.READ_API_OWNER_BUFFERED_STAGES_PAGED).toBe(enabled ? "on" : undefined);
+        await expect(resolveProfile({ ...base, OWNER_BUFFERED_STAGES_PAGED: "on" }, template, get(live))).rejects.toThrow(/feature overrides/);
+      }
+    }
+  });
+  test("a live paged flag with an unknown value is refused, never reinterpreted", async () => {
+    const live = version({ ...values, READ_API_OWNER_BUFFERED_EXACT_SESSION: "on", READ_API_OWNER_BUFFERED_STAGES_PAGED: "true" });
+    await expect(resolveProfile({ ...env, DEPLOY_TARGET: "production", OWNER_BUFFERED: "preserve" }, template, get(live))).rejects.toThrow(/unknown value/);
+  });
+  test("explicit on renders the flag only together with exact-session on", async () => {
+    const base = { ...env, DEPLOY_TARGET: "production", OWNER_BUFFERED: "on", OWNER_BUFFERED_EXACT_SESSION: "on", OWNER_BUFFERED_STAGES_PAGED: "on", OWNER_BUFFERED_S3_BUCKET: values.INGEST_S3_BUCKET, OWNER_BUFFERED_S3_REGION: values.INGEST_S3_REGION };
+    const resolved = await resolveProfile(base, template, get());
+    const rendered = ts.parseConfigFileTextToJson("config.jsonc", renderDeployConfig(template, profileInputs({ ...base, ...resolved }))).config;
+    expect(rendered.vars.READ_API_OWNER_BUFFERED_STAGES_PAGED).toBe("on");
+    expect(rendered.vars.READ_API_OWNER_BUFFERED_EXACT_SESSION).toBe("on");
+    await expect(resolveProfile({ ...base, OWNER_BUFFERED_EXACT_SESSION: "off" }, template, get())).rejects.toThrow(/stages_paged=on needs/);
+  });
+});

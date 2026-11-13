@@ -2,60 +2,117 @@
  * P1 frozen-source copy: Neon (frozen by relayhistory 0078 phase=active) -> Supabase
  * sessions.ingest_frozen_source_* (owner-only), then verify per org and seal.
  *
- * Usage (stdin: ONE JSON line {"neonOwnerUrl": "..."}; Supabase owner = the CLI temp login, SET ROLE postgres):
- *   bun scripts/frozen-source-copy.ts --plan                   read-only: per-org Neon row counts, no writes
- *   bun scripts/frozen-source-copy.ts --copy [--org X] [--concurrency 2] [--page 5000] [--max-page-ms 4000]
- *   bun scripts/frozen-source-copy.ts --seal                   verify every org (Neon vs Supabase digest) and write the seal
- *   bun scripts/frozen-source-copy.ts --repair-head --org O --workspace W --user U [--execute]
- *                                                              re-seed ONE stale mirror control head from Neon (dry run by default;
- *                                                              src/hoopdb/frozen-control-head-repair.ts has the refusal rules)
+ * Credentials: ONE JSON document on stdin (a pipe; never a terminal, file or environment variable):
+ *   {"neonOwnerUrl": "...", "supabaseOwnerUrl": "..."}   (--plan needs only neonOwnerUrl)
+ * supabaseOwnerUrl is the existing direct schema-owner login (`postgres.<project>` through the pinned session
+ * pooler); src/migration/frozen-source-copy-seal.ts validates it against the fixed schema-release pins, connects
+ * with the pinned CA, and requires current_user = session_user = the owner. Nothing is minted, stored or logged.
+ * Producer: ONLY the protected workflow .github/workflows/frozen-source-custody.yml (FROZEN_COPY_CREDENTIAL_PRODUCER,
+ * the environment secret FROZEN_COPY_CREDENTIALS piped in); docs/p1-frozen-source-custody.md.
  *
- * Idempotent and resumable: inserts are ON CONFLICT DO NOTHING keyed by the native key, progress is
- * per org (a sealed org is skipped), and the seal is written only when EVERY Neon org verifies.
- * Throttled: at most --concurrency orgs at once; a page slower than --max-page-ms backs off.
+ * Supervisor: --copy, --seal and --readback refuse frozen_copy_supervisor_missing|stale|mismatch|unqualified unless
+ * they run as that workflow's protected job and the typed approval matches what this run derives
+ * (src/migration/frozen-source-copy-supervisor.ts). COPIED / SEALED / VERIFIED are impossible without the proof.
+ *
+ * Usage:
+ *   bun scripts/frozen-source-copy.ts --plan                   read-only: per-org Neon row counts, no writes; with the
+ *                                                              owner URL also the expected copy / readback approvals
+ *   bun scripts/frozen-source-copy.ts --copy [--org X] [--concurrency 2] [--page 5000] [--max-page-ms 4000]
+ *   bun scripts/frozen-source-copy.ts --readback               read-only: every checkpoint complete, verify every org
+ *                                                              and the privacy state; VERIFIED + the manifest the seal
+ *                                                              must commit (and the expected seal approval)
+ *   bun scripts/frozen-source-copy.ts --seal                   every org x dataset checkpoint complete under this
+ *                                                              binding, verify every org and the privacy state, then
+ *                                                              seal inside the fence (sealFence); refusal = no seal row
+ *   --copy / --seal / --readback also take [--budget-ms N] (wall clock, default 6h), [--max-pages N] (pages per run,
+ *   0 = no limit; frozen_copy_page_limit) and [--receipt PATH] (new file, 0600): the job ends with ONE sanitized
+ *   receipt (frozen-source-copy-job-v3: status COPIED | SEALED | VERIFIED | REFUSED | ABORTED | UNKNOWN_COMMIT,
+ *   progress / budget / abort / unknownCommit, the sanitized supervisor block, next action). No credential, org id or
+ *   raw key in it.
+ *   bun scripts/frozen-source-copy.ts --repair-head --org O --workspace W --user U
+ *                                                              dry run only: what re-seeding ONE stale mirror control
+ *                                                              head from Neon would do (src/hoopdb/frozen-control-head-repair.ts);
+ *                                                              --execute is refused (no supervised repair action exists)
+ *
+ * Resumable: the ONLY cursor is the owner-only progress table in the target (src/migration/frozen-source-copy-progress.ts);
+ * each page and its checkpoint commit in one target transaction; a resume re-proves the frozen source, the owner and
+ * the exact binding (generation, source identity, epoch, privacy baseline, operator SHA). Absent table = refusal.
+ * Throttled: at most --concurrency orgs read at once; a page slower than --max-page-ms backs off.
+ * SIGINT/SIGTERM: stop before the next read/write, roll back what is open, receipt ABORTED; checkpoints are kept.
  * Never writes Neon. Never prints credentials.
  */
-import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import pg from "pg";
-import { SUPA_PAGE, SUPA_RECEIPTS, SUPA_CONTROL_HEADS } from "../src/migration/frozen-source-copy-queries.ts";
-import { parseCliLogin } from "../src/shared/supabase-cli-login.ts";
-import { requiredSupabaseProjectRef } from "../src/shared/deploy-target.ts";
-import { SUPABASE_PROD_CA_2021 } from "../src/session-pipeline/supabase-ca.ts";
+import { githubGet } from "./schema-release-github.ts";
+import { SUPA_PAGE, SUPA_RECEIPTS } from "../src/migration/frozen-source-copy-queries.ts";
+import { CredentialRefusal, readStdinCredentials, refuseCredentialEnv } from "../src/migration/stdin-credentials.ts";
+import {
+  FrozenCopyRefusal, FrozenCopyUnknownCommit, type FrozenCopyMode, type OrgVerification, type OwnerConnection, RECORD_COLS as COLS, SUPA_EXTRA_ORGS,
+  addDigest, emptyDigest, extraOrgRefusal, frozenCopyCredentialKeys, frozenCopyCredentials, frozenCopyNeonClientConfig, frozenCopyOwnerClientConfig,
+  neonFrozenStatus, orgParityRefusal, preRead, receiptText, requireFrozenCopyOwner, rowText, sealFence,
+  DEFAULT_BUDGET_MS, type SealResult, guardedWrite, jobBudget, buildManifest, type CutoverStatus, type PreRead,
+} from "../src/migration/frozen-source-copy-seal.ts";
+import {
+  type CopyBinding, type Dataset, type ReadbackResult, type Reconciliation, abortController, copyBinding, copyDataset, jobReceipt, progressTracker,
+  reconcileInDoubt, requireCopyComplete, requireProgressTable, requireResumeBinding, serialQueue, takeCopyOwnership,
+} from "../src/migration/frozen-source-copy-progress.ts";
+import {
+  type CustodyAction, type SupervisorFacts, type SupervisorProof, approvalText, frozenCopyOperatorSha256, sourceDescriptorSha256,
+  supervisorContextRefusal, targetDescriptorSha256, verifySupervisor,
+} from "../src/migration/frozen-source-copy-supervisor.ts";
 import { repairControlHead } from "../src/hoopdb/frozen-control-head-repair.ts";
 
-// The Supabase project is explicit operator configuration (SUPABASE_PROJECT_REF), read only when connecting.
-const HOST = "aws-0-us-east-1.pooler.supabase.com", CLI = process.env.SUPABASE_CLI ?? "/home/khaliqgant/.local/bin/supabase";
+// The workflow hands the credential document to this process through stdin only; drop the step's copy of it.
+delete process.env.FROZEN_COPY_CREDENTIALS;
 const args = process.argv.slice(2), flag = (k: string) => args.includes(k), val = (k: string, d: string) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1]! : d; };
-const mode = flag("--plan") ? "plan" : flag("--copy") ? "copy" : flag("--seal") ? "seal" : flag("--repair-head") ? "repair-head" : "";
-if (!mode) { console.error("one of --plan | --copy | --seal | --repair-head"); process.exit(64); }
+const modes = (["plan", "copy", "seal", "readback", "repair-head"] as const).filter((m) => flag("--" + m));
+if (modes.length !== 1) { console.error("exactly one of --plan | --copy | --readback | --seal | --repair-head"); process.exit(64); }
+const mode: FrozenCopyMode = modes[0]!;
+const job = mode === "copy" || mode === "seal" || mode === "readback" ? mode as CustodyAction : null;
+// A head write needs a supervised action; none exists for repair, so only its dry run may run (locally).
+if (mode === "repair-head" && flag("--execute")) { console.error("--repair-head --execute is refused: no supervised repair action exists; run the dry run"); process.exit(64); }
 const PAGE = Number(val("--page", "5000")), CONC = Number(val("--concurrency", "2")), MAX_PAGE_MS = Number(val("--max-page-ms", "4000")), ONLY = val("--org", "");
-// A subset must never become the global completeness seal.
-if (flag("--seal") && flag("--org")) {
-  console.error("--seal requires the complete source; --org is not allowed");
+const RECEIPT_PAGE = Math.min(PAGE, 1000);
+if (![PAGE, CONC, MAX_PAGE_MS].every((v) => Number.isSafeInteger(v) && v > 0)) { console.error("--page, --concurrency and --max-page-ms must be positive integers"); process.exit(64); }
+// A subset must never become the global completeness seal (nor its readback).
+if ((flag("--seal") || flag("--readback")) && flag("--org")) {
+  console.error(`--${mode} requires the complete source; --org is not allowed`);
   process.exit(64);
 }
-const { neonOwnerUrl } = JSON.parse(readFileSync(0, "utf8").split("\n")[0] || "{}");
-if (!/^postgresql:\/\/neondb_owner:.+ep-floral-pond-apkvat38/.test(neonOwnerUrl ?? "")) { console.error("neonOwnerUrl (production owner) required on stdin"); process.exit(64); }
+const BUDGET_MS = Number(val("--budget-ms", String(DEFAULT_BUDGET_MS))), RECEIPT = val("--receipt", ""), MAX_PAGES = Number(val("--max-pages", "0"));
+if (!Number.isSafeInteger(BUDGET_MS) || BUDGET_MS < 0 || !Number.isSafeInteger(MAX_PAGES) || MAX_PAGES < 0 || RECEIPT.startsWith("--")) {
+  console.error("--budget-ms and --max-pages must be non-negative integers; --receipt needs a path");
+  process.exit(64);
+}
 const log = (m: string, f: Record<string, unknown> = {}) => console.log(JSON.stringify({ at: new Date().toISOString(), m, ...f }));
 
-const neon = () => { const c = new pg.Client({ connectionString: neonOwnerUrl, ssl: { rejectUnauthorized: true }, application_name: "p1-frozen-copy-readonly", statement_timeout: 30000 }); return c; };
+/** Operator identity for the binding: the bytes of the operator's own source (driver + the modules it executes). */
+const OPERATOR_SHA = frozenCopyOperatorSha256();
+
+let neonConn: OwnerConnection | null = null, owner: OwnerConnection | null = null;
+try {
+  refuseCredentialEnv();
+  const keys = frozenCopyCredentialKeys(mode);
+  ({ neon: neonConn, owner } = frozenCopyCredentials(await readStdinCredentials(keys.required, keys.allowed), mode));
+} catch (e) {
+  if (!(e instanceof CredentialRefusal || e instanceof FrozenCopyRefusal)) throw e;
+  console.error(`credentials refused: ${e.message}`);
+  process.exit(64);
+}
+
+const neon = () => new pg.Client(frozenCopyNeonClientConfig(neonConn!));
+/**
+ * The ONE Supabase owner connection of this run (copy keeps it for the whole job). The validated owner credential is
+ * taken once and dropped from module state; the session must then be the pinned owner (no role switching anywhere).
+ */
 const supa = async () => {
-  const REF = requiredSupabaseProjectRef(process.env);
-  const login = parseCliLogin(execFileSync(CLI, ["db", "dump", "--linked", "--project-ref", REF, "--dry-run"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000 }), REF);
-  const c = new pg.Client({ host: HOST, port: 5432, database: "postgres", user: `cli_login_postgres.${REF}`, password: login.password,
-    ssl: { ca: SUPABASE_PROD_CA_2021, rejectUnauthorized: true, servername: HOST }, options: "-c statement_timeout=60000 -c lock_timeout=5000", application_name: "p1-frozen-copy" });
-  login.password = "";
-  try { await c.connect(); await c.query("SET SESSION ROLE postgres"); return c; }
+  if (!owner) throw new FrozenCopyRefusal("frozen_copy_owner_url_refused");
+  const c = new pg.Client(frozenCopyOwnerClientConfig(owner));
+  owner = null;
+  c.on("error", () => {});
+  try { await c.connect(); await requireFrozenCopyOwner(c); return c; }
   catch (error) { await c.end().catch(() => {}); throw error; }
 };
-
-// One row's canonical text: identical on both sides (built in JS from fetched values).
-const COLS = ["org_id", "workspace_id", "origin_id", "record_id", "revision_id", "revision", "digest", "kind", "source", "session_id", "operation", "user_id", "projection_accepted_seq", "catalog_accepted_seq"] as const;
-const rowText = (r: Record<string, unknown>) => JSON.stringify(COLS.map((k) => r[k] === null || r[k] === undefined ? null : String(r[k])));
-const MOD = 1n << 64n;
-const addDigest = (acc: { n: bigint; sum: bigint }, text: string) => { acc.n += 1n; acc.sum = (acc.sum + BigInt("0x" + createHash("sha256").update(text).digest("hex").slice(0, 16))) % MOD; };
 
 const NEON_PAGE = `SELECT r.org_id,r.workspace_id,r.origin_id,r.record_id,r.revision_id,r.revision,r.digest,r.kind,r.source,r.session_id,r.operation,r.user_id,
   a.accepted_seq AS projection_accepted_seq,k.accepted_seq AS catalog_accepted_seq
@@ -68,23 +125,17 @@ const NEON_PAGE = `SELECT r.org_id,r.workspace_id,r.origin_id,r.record_id,r.revi
 const NEON_RECEIPTS = `SELECT org_id,workspace_id,origin_id,batch_id,digest,receipt::text AS receipt FROM sessions.delivery_receipts
  WHERE org_id=$1 AND (workspace_id,origin_id,batch_id) > ($2,$3,$4) ORDER BY workspace_id,origin_id,batch_id LIMIT $5`;
 
-const receiptText = (r: Record<string, unknown>) => JSON.stringify([r.org_id, r.workspace_id, r.origin_id, r.batch_id, r.digest, r.receipt]);
 async function scanReceipts(c: pg.Client, sql: string, org: string, onPage: (rows: Record<string, unknown>[]) => Promise<void>) {
   let last = ["", "", ""];
   for (;;) {
     const t = Date.now();
-    const rows = (await c.query(sql, [org, ...last, Math.min(PAGE, 1000)])).rows;
+    const rows = (await c.query(sql, [org, ...last, RECEIPT_PAGE])).rows;
     if (!rows.length) return;
     await onPage(rows);
     const tail = rows[rows.length - 1]!; last = [tail.workspace_id, tail.origin_id, tail.batch_id];
     const ms = Date.now() - t; if (ms > MAX_PAGE_MS) await new Promise((r) => setTimeout(r, Math.min(ms, 15000)));
-    if (rows.length < Math.min(PAGE, 1000)) return;
+    if (rows.length < RECEIPT_PAGE) return;
   }
-}
-async function frozenPhase(n: pg.Client) {
-  const s = (await n.query("SELECT sessions.delivery_cutover_status() AS s")).rows[0].s;
-  if (s?.phase !== "active") throw new Error("neon cutover phase is not active; legacy tables are not frozen");
-  return s;
 }
 async function orgs(n: pg.Client): Promise<string[]> {
   // delivery_origins (661 rows) names every origin a record can belong to; never scan the 66M-row table for this.
@@ -104,35 +155,42 @@ async function scan(c: pg.Client, sql: string, org: string, onPage: (rows: Recor
   }
 }
 
-async function copyOrg(org: string, s: pg.Client, check: () => void) {
+/** Keyset read of one source page; a page slower than --max-page-ms backs off before returning. */
+const throttledRead = (n: pg.Client, sql: string, org: string) => async (cursor: string[], limit: number) => {
+  const t = Date.now();
+  const rows = (await n.query(sql, [org, ...cursor, limit])).rows as Record<string, unknown>[];
+  const ms = Date.now() - t; if (ms > MAX_PAGE_MS) await new Promise((r) => setTimeout(r, Math.min(ms, 15000)));
+  return rows;
+};
+const INSERT_RECORDS = `INSERT INTO sessions.ingest_frozen_source_records(${COLS.join(",")})
+  SELECT * FROM unnest($1::text[],$2::text[],$3::text[],$4::text[],$5::text[],$6::bigint[],$7::text[],$8::text[],$9::text[],$10::text[],$11::text[],$12::text[],$13::bigint[],$14::bigint[])
+  ON CONFLICT DO NOTHING`;
+const INSERT_RECEIPTS = `INSERT INTO sessions.ingest_frozen_source_receipts(org_id,workspace_id,origin_id,batch_id,digest,receipt)
+  SELECT a,b,c,d,e,f::jsonb FROM unnest($1::text[],$2::text[],$3::text[],$4::text[],$5::text[],$6::text[]) AS u(a,b,c,d,e,f) ON CONFLICT DO NOTHING`;
+const RECEIPT_COLS = ["org_id", "workspace_id", "origin_id", "batch_id", "digest", "receipt"];
+
+/** One org: records then receipts, each from its own checkpoint; every page commits with its checkpoint (copyDataset). */
+async function copyOrg(org: string, s: pg.Client, binding: CopyBinding, check: () => void, serialize: ReturnType<typeof serialQueue>) {
   check();
   const n = neon();
+  openSource++;
   try {
     await n.connect();
-    await n.query("BEGIN READ ONLY");
-    const sealed = (await s.query("SELECT 1 FROM sessions.ingest_frozen_source_org_seals WHERE org_id=$1", [org])).rows.length;
-    if (sealed) { log("org already sealed; skip", { org }); return; }
-    let copied = 0;
-    await scan(n, NEON_PAGE, org, async (rows) => {
-      check();
-      const col = (k: string) => rows.map((r) => r[k] === null || r[k] === undefined ? null : String(r[k]));
-      await s.query(`INSERT INTO sessions.ingest_frozen_source_records(${COLS.join(",")})
-        SELECT * FROM unnest($1::text[],$2::text[],$3::text[],$4::text[],$5::text[],$6::bigint[],$7::text[],$8::text[],$9::text[],$10::text[],$11::text[],$12::text[],$13::bigint[],$14::bigint[])
-        ON CONFLICT DO NOTHING`, COLS.map(col));
-      copied += rows.length;
+    await n.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    const base = { target: s, binding, org, check, serialize, progress };
+    await copyDataset({
+      ...base, dataset: "records" as Dataset, pageSize: PAGE, readPage: throttledRead(n, NEON_PAGE, org),
+      keyOf: (r) => [String(r.workspace_id), String(r.origin_id), String(r.record_id)],
+      insert: (rows) => s.query(INSERT_RECORDS, COLS.map((k) => rows.map((r) => r[k] === null || r[k] === undefined ? null : String(r[k])))),
     });
-    let receipts = 0;
-    await scanReceipts(n, NEON_RECEIPTS, org, async (rows) => {
-      check();
-      const col = (k: string) => rows.map((r) => String(r[k]));
-      await s.query(`INSERT INTO sessions.ingest_frozen_source_receipts(org_id,workspace_id,origin_id,batch_id,digest,receipt)
-        SELECT a,b,c,d,e,f::jsonb FROM unnest($1::text[],$2::text[],$3::text[],$4::text[],$5::text[],$6::text[]) AS u(a,b,c,d,e,f) ON CONFLICT DO NOTHING`,
-        ["org_id", "workspace_id", "origin_id", "batch_id", "digest", "receipt"].map(col));
-      receipts += rows.length;
+    await copyDataset({
+      ...base, dataset: "receipts" as Dataset, pageSize: RECEIPT_PAGE, readPage: throttledRead(n, NEON_RECEIPTS, org),
+      keyOf: (r) => [String(r.workspace_id), String(r.origin_id), String(r.batch_id)],
+      insert: (rows) => s.query(INSERT_RECEIPTS, RECEIPT_COLS.map((k) => rows.map((r) => String(r[k])))),
     });
     await n.query("ROLLBACK");
-    log("org copied", { org, rows: copied, receipts });
-  } finally { await n.end().catch(() => {}); }
+    progress.orgDone();
+  } finally { await n.end().catch(() => {}); openSource--; }
 }
 
 async function repairHead() {
@@ -143,103 +201,208 @@ async function repairHead() {
     await n.connect();
     const s = await supa();
     try {
-      const r = await repairControlHead(n, s, key, { dryRun: !flag("--execute") });
+      const r = await repairControlHead(n, s, key, { dryRun: true });
       log("control head repair", { ...r });
     } finally { await s.end().catch(() => {}); }
   } finally { await n.end().catch(() => {}); }
 }
 
+/** Job envelope state (copy/seal): the receipt is built from it whatever way main() ends. */
+const budget = jobBudget(BUDGET_MS);
+const abort = abortController();
+const progress = progressTracker(0);
+const closed = { completedAt: null as number | null, sourceClosed: false, targetClosed: false, writesStopped: false };
+const reconciliation = { result: "NOT_REQUIRED" as Reconciliation, readbackAt: null as number | null };
+let openSource = 0, sealResult: SealResult | null = null, readbackResult: ReadbackResult | null = null, supervisor: SupervisorProof | null = null;
+// Only the jobs that check abort take over SIGINT/SIGTERM; --plan and --repair-head keep the default (terminate).
+if (job)
+  for (const sig of ["SIGINT", "SIGTERM"] as const) process.on(sig, () => { abort.request(sig); log("abort requested", { signal: sig }); });
+const check = () => {
+  abort.check();
+  budget.check();
+  if (MAX_PAGES > 0 && progress.state.pages >= MAX_PAGES) throw new FrozenCopyRefusal("frozen_copy_page_limit", { maxPages: String(MAX_PAGES) });
+};
+
+/** Everything this run derives itself from the live source and target; the typed approval must spell exactly this. */
+const custodyFacts = (action: CustodyAction, status: CutoverStatus, b: CopyBinding): SupervisorFacts => ({
+  action, source: sourceDescriptorSha256(status), target: targetDescriptorSha256(b), epoch: b.controlEpoch, privacy: b.privacyBaselineSha256,
+  generation: b.generation, manifest: null, operator: OPERATOR_SHA, page: PAGE, maxPages: MAX_PAGES, budgetMs: BUDGET_MS,
+});
+/** The approval line a dispatcher would type for `action` (logged by --plan and --readback; no secret in it). */
+const expectedApproval = (action: CustodyAction, status: CutoverStatus, b: CopyBinding, planRun: string, manifest: string | null = null) =>
+  approvalText({ ...custodyFacts(action, status, b), manifest, sha: process.env.CUSTODY_SHA || "<sha>", planRun });
+
+/** Bounded readback of an in-doubt COMMIT on the same owner session; no answer in 5s stays PENDING (the next run's resume reads it). */
+async function readback(s: pg.Client, e: FrozenCopyUnknownCommit) {
+  reconciliation.result = await Promise.race([
+    reconcileInDoubt(s, e.context),
+    new Promise<Reconciliation>((r) => setTimeout(() => r("PENDING"), 5000).unref()),
+  ]);
+  reconciliation.readbackAt = Date.now();
+}
+
+/** The one owner session of a copy/seal job: owner identity, progress table, exclusive ownership, binding re-proof. */
+async function openJob(status: Awaited<ReturnType<typeof neonFrozenStatus>>) {
+  const s = await supa();
+  try {
+    await requireProgressTable(s);
+    await takeCopyOwnership(s);
+    const binding = await copyBinding(s, status, OPERATOR_SHA);
+    // The supervisor attestation, re-read live from GitHub with this job's token, before any write.
+    supervisor = await verifySupervisor(process.env, githubGet(process.env.GITHUB_TOKEN), custodyFacts(job!, status, binding));
+    log("supervisor attested", { ...supervisor.block });
+    progress.bind(binding);
+    const resumed = await requireResumeBinding(s, binding);
+    log("job bound", { mode, checkpoints: resumed });
+    return { s, binding, status };
+  } catch (error) { await s.end().catch(() => {}); throw error; }
+}
+
+/** --plan with the owner URL: the read-only target binding and the approvals the next dispatches must carry. */
+async function planApprovals(status: CutoverStatus) {
+  const s = await supa();
+  try {
+    const binding = await copyBinding(s, status, OPERATOR_SHA);
+    const planRun = process.env.GITHUB_RUN_ID || "<this-plan-run-id>";
+    log("expected approvals", { copy: expectedApproval("copy", status, binding, planRun), readback: expectedApproval("readback", status, binding, planRun) });
+  } finally { await s.end().catch(() => {}); }
+}
+
 async function main() {
   if (mode === "repair-head") return repairHead();
+  // Before any connection: a copy / seal / readback that is not the protected workflow's job stops here.
+  if (job) { const unsupervised = supervisorContextRefusal(process.env, job); if (unsupervised) throw unsupervised; }
   const n = neon();
+  openSource++;
   try {
     await n.connect();
     await n.query("BEGIN READ ONLY");
-    const status = await frozenPhase(n);
+    const status = await neonFrozenStatus(n);
     const all = ONLY ? [ONLY] : await orgs(n);
+    progress.state.totalOrgs = all.length;
     if (mode === "plan") {
       const est = (await n.query("SELECT reltuples::bigint AS n FROM pg_class WHERE oid='sessions.delivery_records'::regclass")).rows[0].n;
       log("plan", { phase: status.phase, epoch: status.epoch, orgs: all.length, estimatedRecords: String(est) });
+      await n.query("ROLLBACK");
+      if (owner) await planApprovals(status);
       return;
     }
     await n.query("ROLLBACK");
-    if (mode === "copy") {
-      const s = await supa();
-      try {
-        // Privacy state is tiny; copy it whole, idempotently.
-        const del = (await n.query("SELECT org_id,workspace_id,user_id,origin_id,source,session_id FROM sessions.deleted_upload_sessions")).rows;
-        for (const d of del) await s.query("INSERT INTO sessions.ingest_frozen_source_deletions VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING", [d.org_id, d.workspace_id, d.user_id, d.origin_id, d.source, d.session_id]);
-        const rs = (await n.query("SELECT org_id,workspace_id,user_id,request_id,deleted FROM sessions.session_resets")).rows;
-        for (const r of rs) await s.query("INSERT INTO sessions.ingest_frozen_source_resets VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING", [r.org_id, r.workspace_id, r.user_id, r.request_id, r.deleted]);
-        // Neon control heads written before relayhistory began mirroring them: seed the mirror so it is in lockstep.
-        const heads = (await n.query("SELECT org_id,workspace_id,user_id,epoch,version::text AS version,digest,kind,payload,pending,before_privacy,privacy_version::text AS privacy_version FROM sessions.delivery_cutover_control_heads")).rows;
-        for (const h of heads) {
-          const got = (await s.query("SELECT version::text AS version,digest,pending FROM sessions.ingest_source_control_heads WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3", [h.org_id, h.workspace_id, h.user_id])).rows[0];
-          if (got && (got.version !== h.version || got.digest !== h.digest)) throw new Error("control head mirror disagrees with Neon for a user; refusing");
-          if (!got) await s.query("INSERT INTO sessions.ingest_source_control_heads(org_id,workspace_id,user_id,epoch,version,digest,kind,payload,pending,before_privacy,privacy_version) VALUES($1,$2,$3,$4,$5::bigint,$6,$7,$8,$9,$10,$11::bigint)",
-            [h.org_id, h.workspace_id, h.user_id, h.epoch, h.version, h.digest, h.kind, JSON.stringify(h.payload), h.pending, h.before_privacy === null ? null : JSON.stringify(h.before_privacy), h.privacy_version]);
-        }
-        log("privacy copied", { deletions: del.length, resets: rs.length, controlHeads: heads.length });
-        // CLI temporary-login refreshes invalidate prior passwords. Keep one
-        // authenticated owner connection for the entire job; pg.Client queues
-        // target statements while at most CONC source readers run concurrently.
-        const queue = [...all]; let done = 0, failure: unknown;
-        const check = () => { if (failure !== undefined) throw failure; };
-        await Promise.all(Array.from({ length: Math.max(1, CONC) }, async () => {
-          try {
-            for (let org = queue.shift(); org; org = queue.shift()) {
-              check(); await copyOrg(org, s, check);
-              done++; log("progress", { done, of: all.length });
-            }
-          } catch (error) { if (failure === undefined) failure = error ?? new Error("copy_worker_failed"); }
-        }));
-        if (failure !== undefined) throw failure;
-      } finally { await s.end().catch(() => {}); }
-      return;
-    }
-    // --seal: verify every Neon org, then write org seals + the completeness seal in one transaction.
-    const s = await supa();
+    check();
+    const { s, binding } = await openJob(status);
     try {
-      const results: { org: string; n: bigint; sum: bigint }[] = [];
-      for (const org of all) {
-        const a = { n: 0n, sum: 0n }, b = { n: 0n, sum: 0n };
-        await n.query("BEGIN READ ONLY");
-        await scan(n, NEON_PAGE, org, async (rows) => { for (const r of rows) addDigest(a, rowText(r)); });
-        await n.query("ROLLBACK");
-        await scan(s, SUPA_PAGE, org, async (rows) => { for (const r of rows) addDigest(b, rowText(r)); });
-        if (a.n !== b.n || a.sum !== b.sum) throw new Error(`org ${org} mismatch: neon ${a.n}/${a.sum} supabase ${b.n}/${b.sum}`);
-        const ra = { n: 0n, sum: 0n }, rb = { n: 0n, sum: 0n };
-        await n.query("BEGIN READ ONLY");
-        await scanReceipts(n, NEON_RECEIPTS, org, async (rows) => { for (const r of rows) addDigest(ra, receiptText(r)); });
-        await n.query("ROLLBACK");
-        await scanReceipts(s, SUPA_RECEIPTS, org, async (rows) => { for (const r of rows) addDigest(rb, receiptText(r)); });
-        if (ra.n !== rb.n || ra.sum !== rb.sum) throw new Error(`org ${org} receipt mismatch: neon ${ra.n} supabase ${rb.n}`);
-        results.push({ org, n: a.n, sum: a.sum });
-        log("org verified", { org, rows: String(a.n) });
-      }
-      const extra = (await s.query("SELECT count(DISTINCT org_id)::int AS n FROM sessions.ingest_frozen_source_records WHERE NOT (org_id = ANY($1))", [all])).rows[0].n;
-      if (extra) throw new Error(`${extra} orgs in Supabase copy are not in Neon`);
-      const priv = { n: 0n, sum: 0n };
-      for (const d of (await n.query("SELECT org_id,workspace_id,user_id,origin_id,source,session_id FROM sessions.deleted_upload_sessions")).rows) addDigest(priv, JSON.stringify(Object.values(d)));
-      const privS = { n: 0n, sum: 0n };
-      for (const d of (await s.query("SELECT org_id,workspace_id,user_id,origin_id,source,session_id FROM sessions.ingest_frozen_source_deletions")).rows) addDigest(privS, JSON.stringify(Object.values(d)));
-      if (priv.n !== privS.n || priv.sum !== privS.sum) throw new Error("privacy copy mismatch");
-      const nh = (await n.query("SELECT org_id,workspace_id,user_id,version::text v,digest,pending FROM sessions.delivery_cutover_control_heads ORDER BY 1,2,3")).rows;
-      const sh = (await s.query(SUPA_CONTROL_HEADS)).rows;
-      const key = (r: any) => [r.org_id, r.workspace_id, r.user_id, r.v, r.digest, r.pending].join("|");
-      if (JSON.stringify(nh.map(key).sort()) !== JSON.stringify(sh.map(key).sort())) throw new Error("control head mirror differs from Neon");
-      const pol = (await s.query("SELECT source_identity_sha256,control_epoch,privacy_baseline_sha256 FROM sessions.ingest_lazy_policy WHERE singleton")).rows[0];
-      if (!pol || pol.control_epoch !== status.epoch || pol.privacy_baseline_sha256 !== status.privacyBaselineSha256) throw new Error("live policy does not match the Neon cutover descriptor");
-      const manifest = results.map((r) => `${r.org}\t${r.n}\t${r.sum}`).join("\n") + `\nprivacy\t${priv.n}\t${priv.sum}\n`;
-      const manifestSha = createHash("sha256").update(manifest).digest("hex");
-      await s.query("BEGIN");
-      for (const r of results) await s.query("INSERT INTO sessions.ingest_frozen_source_org_seals(org_id,record_rows,record_sum,privacy_rows,privacy_sum) VALUES($1,$2,$3,0,0) ON CONFLICT (org_id) DO UPDATE SET record_rows=EXCLUDED.record_rows,record_sum=EXCLUDED.record_sum", [r.org, String(r.n), String(r.sum)]);
-      await s.query(`INSERT INTO sessions.ingest_frozen_source_completeness(source_identity_sha256,control_epoch,privacy_baseline_sha256,org_count,record_rows,manifest_sha256,neon_snapshot)
-        VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (singleton) DO NOTHING`,
-        [pol.source_identity_sha256, pol.control_epoch, pol.privacy_baseline_sha256, results.length, String(results.reduce((a, r) => a + r.n, 0n)), manifestSha, JSON.stringify({ cutover: status, sealedFrom: "neon-frozen", privacyRows: String(priv.n) })]);
-      await s.query("COMMIT");
-      log("sealed", { orgs: results.length, manifestSha });
-    } finally { await s.end().catch(() => {}); }
-  } finally { await n.end().catch(() => {}); }
+      if (mode === "copy") await copyJob(n, s, binding, all);
+      else await sealJob(n, s, binding, all, status);
+    } catch (error) {
+      if (error instanceof FrozenCopyUnknownCommit) await readback(s, error);
+      throw error;
+    } finally {
+      closed.writesStopped = true;
+      await s.end().catch(() => {});
+      closed.targetClosed = true;
+    }
+  } finally {
+    await n.end().catch(() => {});
+    openSource--;
+    closed.sourceClosed = openSource === 0;
+    closed.completedAt = Date.now();
+  }
 }
-main().catch((e) => { log("STOPPED", { why: String(e?.message ?? e).slice(0, 300) }); process.exitCode = 1; });
+
+async function copyJob(n: pg.Client, s: pg.Client, binding: CopyBinding, all: string[]) {
+  // Privacy state is tiny; copy it whole, idempotently (autocommit ON CONFLICT DO NOTHING; parity is proven at seal).
+  const w = { phase: "copy" as const, dataset: null, checkpointSeq: null };
+  const del = (await n.query("SELECT org_id,workspace_id,user_id,origin_id,source,session_id FROM sessions.deleted_upload_sessions")).rows;
+  for (const d of del) { check(); await guardedWrite(w, () => s.query("INSERT INTO sessions.ingest_frozen_source_deletions VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING", [d.org_id, d.workspace_id, d.user_id, d.origin_id, d.source, d.session_id])); }
+  const rs = (await n.query("SELECT org_id,workspace_id,user_id,request_id,deleted FROM sessions.session_resets")).rows;
+  for (const r of rs) { check(); await guardedWrite(w, () => s.query("INSERT INTO sessions.ingest_frozen_source_resets VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING", [r.org_id, r.workspace_id, r.user_id, r.request_id, r.deleted])); }
+  // Neon control heads written before relayhistory began mirroring them: seed the mirror so it is in lockstep.
+  const heads = (await n.query("SELECT org_id,workspace_id,user_id,epoch,version::text AS version,digest,kind,payload,pending,before_privacy,privacy_version::text AS privacy_version FROM sessions.delivery_cutover_control_heads")).rows;
+  for (const h of heads) {
+    check();
+    const got = (await s.query("SELECT version::text AS version,digest,pending FROM sessions.ingest_source_control_heads WHERE org_id=$1 AND workspace_id=$2 AND user_id=$3", [h.org_id, h.workspace_id, h.user_id])).rows[0];
+    if (got && (got.version !== h.version || got.digest !== h.digest)) throw new FrozenCopyRefusal("frozen_copy_control_head_disagrees");
+    if (!got) await guardedWrite(w, () => s.query("INSERT INTO sessions.ingest_source_control_heads(org_id,workspace_id,user_id,epoch,version,digest,kind,payload,pending,before_privacy,privacy_version) VALUES($1,$2,$3,$4,$5::bigint,$6,$7,$8,$9,$10,$11::bigint)",
+      [h.org_id, h.workspace_id, h.user_id, h.epoch, h.version, h.digest, h.kind, JSON.stringify(h.payload), h.pending, h.before_privacy === null ? null : JSON.stringify(h.before_privacy), h.privacy_version]));
+  }
+  log("privacy copied", { deletions: del.length, resets: rs.length, controlHeads: heads.length });
+  // One owner connection for the whole job; serialQueue keeps each page transaction contiguous on it while at most
+  // CONC source readers run. The first failure stops every worker at its next check (before its next read/write).
+  const queue = [...all]; let failure: unknown;
+  const stop = () => { if (failure !== undefined) throw failure; check(); };
+  const serialize = serialQueue();
+  await Promise.all(Array.from({ length: CONC }, async () => {
+    try {
+      for (let org = queue.shift(); org; org = queue.shift()) {
+        await copyOrg(org, s, binding, stop, serialize);
+        log("progress", { done: progress.state.completedOrgs, of: all.length });
+      }
+    } catch (error) { if (failure === undefined) failure = error ?? new Error("copy_worker_failed"); }
+  }));
+  if (failure !== undefined) throw failure;
+}
+
+// --seal: every org x dataset checkpoint complete under THIS binding; pre-read the privacy state (it must already
+// agree), verify every Neon org, then write the org seals and the completeness seal inside the fence (sealFence).
+// --readback: the same verification, read-only; it stops before the fence and reports the manifest instead.
+async function sealJob(n: pg.Client, s: pg.Client, binding: CopyBinding, all: string[], status: CutoverStatus) {
+  await requireCopyComplete(s, binding, all);
+  const pre = await preRead(n, s);
+  const results: OrgVerification[] = [];
+  for (const org of all) {
+    check();
+    const a = emptyDigest(), b = emptyDigest(), ra = emptyDigest(), rb = emptyDigest();
+    await n.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    try {
+      await scan(n, NEON_PAGE, org, async (rows) => { for (const r of rows) addDigest(a, rowText(r)); });
+      await scanReceipts(n, NEON_RECEIPTS, org, async (rows) => { for (const r of rows) addDigest(ra, receiptText(r)); });
+    } finally { await n.query("ROLLBACK"); }
+    await scan(s, SUPA_PAGE, org, async (rows) => { for (const r of rows) addDigest(b, rowText(r)); });
+    await scanReceipts(s, SUPA_RECEIPTS, org, async (rows) => { for (const r of rows) addDigest(rb, receiptText(r)); });
+    const bad = orgParityRefusal(org, { records: a, receipts: ra }, { records: b, receipts: rb });
+    if (bad) throw bad;
+    results.push({ org, records: a, receipts: ra });
+    progress.orgDone();
+  }
+  log("orgs verified", { orgs: results.length });
+  const extra = extraOrgRefusal((await s.query(SUPA_EXTRA_ORGS, [all])).rows[0].n);
+  if (extra) throw extra;
+  if (mode === "readback") return readbackManifest(results, pre, status, binding);
+  sealResult = await sealFence(n, s, { orgs: results, pre }, { budget: check, supervisor });
+  log("sealed", { ...sealResult });
+}
+
+/** The manifest the seal fence will rebuild and must match (the seal approval binds it). */
+function readbackManifest(results: OrgVerification[], pre: PreRead, status: CutoverStatus, binding: CopyBinding) {
+  const m = buildManifest(results, pre.supa);
+  readbackResult = { manifestSha256: m.sha256, orgs: m.totals.orgs };
+  log("readback verified", { ...readbackResult, sealApproval: expectedApproval("seal", status, binding, process.env.CUSTODY_PLAN_RUN || "<plan-run-id>", m.sha256) });
+}
+
+/** The one job receipt (copy/seal): stdout always, plus a NEW 0600 file when --receipt is given. Sanitized (no org id). */
+function writeReceipt(error: unknown) {
+  if (!job) return;
+  const r = jobReceipt(job, error, {
+    startedAt: budget.startedAt,
+    finishedAt: Date.now(),
+    budget: { maxWallMs: BUDGET_MS, deadline: budget.deadline, pageSizes: { records: PAGE, receipts: RECEIPT_PAGE }, maxPages: MAX_PAGES, concurrency: CONC, maxPageMs: MAX_PAGE_MS, statementTimeoutMs: 60000, lockTimeoutMs: 5000 },
+    progress: progress.state,
+    abort: { ...abort.state, ...closed },
+    reconciliation,
+  }, sealResult, { supervisor, readback: readbackResult });
+  log("receipt", { ...r });
+  // Only COPIED / SEALED / VERIFIED exit 0 (a pass without its result or without the supervisor proof is REFUSED).
+  if (r.status !== "COPIED" && r.status !== "SEALED" && r.status !== "VERIFIED") process.exitCode = 1;
+  if (RECEIPT) {
+    try { writeFileSync(RECEIPT, JSON.stringify(r) + "\n", { flag: "wx", mode: 0o600 }); }
+    catch { log("receipt file not written", { path: RECEIPT }); process.exitCode = 1; }
+  }
+}
+main().then(() => writeReceipt(undefined), (e) => {
+  const code = e instanceof FrozenCopyRefusal || e instanceof FrozenCopyUnknownCommit ? e.code : undefined;
+  // Counts and codes only: org ids and raw keys stay in the owner-only progress table.
+  const { org: _org, ...detail } = (e instanceof FrozenCopyRefusal ? e.detail : {}) as Record<string, string>;
+  log("STOPPED", code ? { refusal: code, ...detail } : { why: String(e?.message ?? e).slice(0, 300) });
+  writeReceipt(e);
+  process.exitCode = 1;
+});

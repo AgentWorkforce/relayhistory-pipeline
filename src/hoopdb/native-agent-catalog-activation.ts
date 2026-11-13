@@ -18,6 +18,8 @@ export type NativeAgentCatalogAudit = {
   counts: Record<string, number>;
   eligible: boolean;
   activated: boolean;
+  /** Present only for an explicit fresh-install plan/apply; absent in the default mode. */
+  freshInstall?: true;
 };
 
 /**
@@ -30,15 +32,27 @@ export type NativeAgentCatalogAudit = {
  * relationship/model catalog. Its catalog_read_version/forget_tracking flags remain
  * unchanged. Empty agent arrays are valid for genuinely unnamed sessions; proving a
  * particular registered agent exists still requires the real caller's API/UI proof.
+ *
+ * `freshInstall` (default false) is an explicit operator opt-in for a brand-new
+ * self-host install: it additionally accepts a catalog that is empty everywhere
+ * (no session_directory rows at all, tombstoned or live, no live session_index
+ * pointers, every other audit count zero). An empty catalog is trivially complete
+ * and the marker is a read-side gate only, so later sessions keep projecting
+ * through the normal trigger/projector path. The mode is part of the fingerprint
+ * input, so a plan made in one mode cannot be applied in the other. With the
+ * default, the fingerprint and eligibility are unchanged (liveRows > 0 required).
  */
 export async function nativeAgentCatalogActivation(
   transact: Transact,
-  options: { mode: "selfhosted"; generation: string; applyFingerprint?: string },
+  options: { mode: "selfhosted"; generation: string; applyFingerprint?: string; freshInstall?: boolean },
 ): Promise<NativeAgentCatalogAudit> {
   if (options.mode !== "selfhosted") throw new Error("native_catalog_selfhosted_only");
   if (!/^[0-9a-f]{64}$/.test(options.generation)) throw new Error("native_catalog_generation_invalid");
   if (options.applyFingerprint !== undefined && !/^[0-9a-f]{64}$/.test(options.applyFingerprint))
     throw new Error("native_catalog_fingerprint_invalid");
+  if (options.freshInstall !== undefined && typeof options.freshInstall !== "boolean")
+    throw new Error("native_catalog_fresh_install_invalid");
+  const freshInstall = options.freshInstall === true;
   const apply = options.applyFingerprint !== undefined;
   return transact(async (tx) => {
     await tx.query(apply ? "SET TRANSACTION ISOLATION LEVEL READ COMMITTED" : "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY");
@@ -114,8 +128,17 @@ export async function nativeAgentCatalogActivation(
     const counts = count.rows[0]?.counts;
     if (!counts || Object.values(counts).some((n) => !Number.isSafeInteger(n) || n < 0))
       throw new Error("native_catalog_audit_result_invalid");
-    const fingerprint = createHash("sha256").update(JSON.stringify({ version: 1, generation: options.generation, rows: directory.rows, counts })).digest("hex");
-    const eligible = counts.liveRows > 0 && Object.entries(counts).every(([k, n]) => k === "liveRows" || n === 0);
+    // The default-mode fingerprint input is kept byte-for-byte; the opt-in mode adds
+    // a field so its plans and default-mode plans can never match each other.
+    const fingerprint = createHash("sha256").update(JSON.stringify(freshInstall
+      ? { version: 1, generation: options.generation, rows: directory.rows, counts, freshInstall: true }
+      : { version: 1, generation: options.generation, rows: directory.rows, counts })).digest("hex");
+    const othersClean = Object.entries(counts).every(([k, n]) => k === "liveRows" || n === 0);
+    // With liveRows === 0, every live session_index pointer is counted by
+    // livePointersWithoutDirectory, so othersClean also proves no live pointers.
+    // directory.rows includes tombstoned rows: an emptied install is not "fresh".
+    const emptyEverywhere = counts.liveRows === 0 && othersClean && directory.rows.length === 0;
+    const eligible = (counts.liveRows > 0 && othersClean) || (freshInstall && emptyEverywhere);
     if (apply) {
       if (fingerprint !== options.applyFingerprint) throw new Error("native_catalog_plan_changed");
       if (!eligible) throw new Error("native_catalog_projection_incomplete");
@@ -125,6 +148,9 @@ export async function nativeAgentCatalogActivation(
       );
       if (marked.rows.length !== 1) throw new Error("native_catalog_rollout_row_missing");
     }
-    return { version: 1, scope: "all_native_tenants", rows: directory.rows.length, fingerprint, counts, eligible, activated: apply };
+    return {
+      version: 1, scope: "all_native_tenants", rows: directory.rows.length, fingerprint, counts, eligible, activated: apply,
+      ...(freshInstall ? { freshInstall: true as const } : {}),
+    };
   });
 }

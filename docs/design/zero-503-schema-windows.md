@@ -243,8 +243,12 @@ To keep that one window as short as possible:
    under concurrent synthetic uploads (§4). The approved owner-apply can instead open it under its own lock
    through `generationOverlapIntegration` (`src/hoopdb/ingest-generation-overlap.ts`). That fixed entry is a
    separate reviewed change, and the stock CLI is not modified here.
-3. **Apply.** Use the normal owner-apply. Marker `(H, pending)` → `(H, pass)`. Uploads continue at G
-   throughout.
+3. **Apply.** Use the normal owner-apply. Marker `(H, pending)` → `(H, pass)`. With the stock CI path
+   (`admitDuringApply` off, pinned by `src/hoopdb/ingest-generation-overlap-operator.ts`) uploads at G are
+   refused from the pending write until the marker is PASS at H: a 503 with `Retry-After`, as long as the
+   apply. The window closes the PASS → rebind → Worker-deploy gap, not the apply interval. Uploads continue
+   at G throughout the apply only with `--admit-during-apply`, which is a separately reviewed follow-up
+   (§4 full-union rehearsal first).
 4. **Other runtime replacements.** GC and publisher, as today. The GC at G is also admitted during the
    window (same role). The publisher and history stay on exact PASS and pause, as today.
 5. **Rebind.** `ingest-generation-rebind.ts --from G --to H --execute` moves the policy and admissions and
@@ -252,8 +256,73 @@ To keep that one window as short as possible:
    admitted.
 6. **Worker cleanup.** Deploy with `expectedGeneration = H` and no overlap.
 
+**Production CI path.** For the production private-ingest Worker, steps 1 and 6 use the reviewed
+`PRIVATE_INGEST_OVERLAP` pair in `src/session-ingest/private-ingest-release.ts`, the tracked
+`overlapGeneration` and the private-ingest deploy workflow. Step 2, plus a read-only readback and an owner
+close, use `.github/workflows/ingest-generation-overlap.yml`, which calls
+`src/hoopdb/ingest-generation-overlap-operator.ts`. The pair is never a dispatch input, and
+`admitDuringApply` is always off on that path.
+
+Release contract on that path (`src/session-ingest/private-ingest-release.ts`, `scripts/private-ingest-ci.ts`):
+- The deploy confirmation is `DEPLOY 96bulls-session-ingest <sha> PLAN <plan_run>[ SHADOW <sha256>][ OVERLAP <H>]`.
+  `SHADOW` binds only to the single-generation `step-0-shadow -> step-1-custody` edge and `OVERLAP` only to a
+  tracked `overlapGeneration`, so the two never co-occur.
+- Every base phase has exactly one twin named `<phase>-overlap` that keeps the base profile and adds
+  `INGEST_ACCEPT_GENERATIONS=G,H`.
+- The gate allows only G -> G+H (step 1), G+H -> H (step 6) and the rollback G+H -> G. H -> G+H, G -> H and
+  H -> G always refuse. While the live Worker is at G+H the rollout phase is frozen: changing it refuses with
+  `private_ingest_live_transition`. `step-0-shadow-overlap` is entered only from `step-0-shadow` and leaves
+  only to `step-0-shadow` at H or G, so no overlap path skips `step-0-shadow`.
+- A live accept set the tracked profile does not declare refuses with `private_ingest_live_undeclared_overlap`;
+  a live state that matches no permitted phase refuses with `private_ingest_live_phase`.
+- Roll back G+H -> G only while the marker is still at G. Once the apply has moved it to H, finish the rebind
+  and go forward to H.
+
 If the window expires before step 5, the fence fails closed: today's outage, never a widening. Choose a TTL
 that covers steps 3–5. The maximum is 4 h.
+
+### 3.3 Admission renewal (dormant, CI-only)
+
+Buffered ingest is admitted only until `sessions.ingest_lazy_policy.valid_until` and the matching
+`sessions.ingest_buffer_admission.valid_until` rows expire; after that the guard refuses every upload.
+`.github/workflows/ingest-admission-renewal.yml` (operator `src/hoopdb/ingest-admission-renewal-operator.ts`)
+moves the policy and every admission row together, with no migration. It is **dormant**: while
+`ADMISSION_RENEWAL_ENABLED` is `false` in `src/hoopdb/admission-renewal-contract.ts`, `plan` and `renew` refuse
+and only `readback` runs. Enabling it is a separate reviewed PR, and every real run is a dispatch that Khaliq
+approves on the existing `session-schema-production` environment. Push and pull-request runs execute only the
+synthetic PGlite proof.
+
+- **readback** reports counts, canonical timestamps, digests and verdicts. It writes nothing.
+- **plan** writes nothing. Its 1-day artifact fixes `renewTo` = capture time + exactly 30 days (canonical
+  `YYYY-MM-DDTHH:MM:SS.mmmZ`) and binds the generation, the ledger proof (`ledgerTail`, `stepCount`,
+  `ledgerPrefixDigest`), old expiry, row count, the C-ordered org roster digest and a descriptor digest over every
+  immutable policy field, `updated_at` and the ledger proof.
+- **Generation.** The generation is the live readiness marker's, discovered by plan with status `pass`. It is never
+  an input and never recomputed from the checkout: `generation()` also hashes verifier files, which may change on
+  `main` without a schema change. The policy and every admission row must be at that generation.
+- **Ledger proof.** Separately, the live `sessions.__96bulls_migrations` ledger must be gap-free and
+  checksum-equal to a contiguous prefix of the dispatched SHA's schema steps, using the migrator's preflight rules
+  and codes (`ledger_unknown_step`, `ledger_gap`, `migration_changed`). A ledger longer than the dispatched tree
+  refuses as `ledger_unknown_step`. `ledgerPrefixDigest` is sha256 over the ordered `[name, sha256]` pairs of
+  that prefix, taken from the dispatched tree. The SHA binds only the audited operator and workflow and the
+  current source prefix; it is not the historical preimage of the marker generation.
+- **renew** needs a same-SHA plan run under 24 h old and this typed confirmation, byte for byte:
+  `RENEW-ADMISSION <project> <sha> GENERATION <livePassGeneration> TAIL <ledgerTail> FROM <oldValidUntil> TO <renewTo> ROWS <admissionCount> ORGS <orgsSha256> DESCRIPTOR <descriptorSha256> PLAN <planRun>`.
+  In one owner transaction (`lock_timeout` 5 s) it takes `pg_advisory_xact_lock(961996, 1)`, re-proves the
+  ledger (a different tail, count or digest refuses as `admission_renewal_ledger_drift`), then locks in the
+  ingest admission path's order: the readiness marker `FOR SHARE`, the policy `FOR UPDATE`, then
+  `LOCK TABLE sessions.ingest_buffer_admission IN SHARE ROW EXCLUSIVE MODE` (blocks concurrent org inserts,
+  allows reads), then the rows `FOR UPDATE`. Ingest locks marker, policy, then the admission table and row, and
+  takes no advisory lock, so the two cannot wait on each other in opposite orders. A marker generation other
+  than the plan's refuses as `admission_renewal_generation_stale`. It recomputes every planned value and
+  refuses on any drift, then calls `ingest_lazy_policy_set` with the unchanged identity, compare-and-sets every
+  admission row from the exact old expiry, asserts the row count, re-reads both tables and runs
+  `ingest_lazy_guard` for every org before `COMMIT`. An insert that commits first is caught by the roster
+  re-check; one that waits commits after renew and copies the renewed expiry. A 30-day sanitized receipt
+  carries no org ids.
+
+Any refusal or postcondition failure rolls the transaction back; that rollback is the only inverse. Emergency
+fail-closed expiry is a separate typed operation outside this workflow.
 
 ## 4. Limits and residual risks
 

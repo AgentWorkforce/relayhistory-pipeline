@@ -76,7 +76,9 @@ export interface PublicationCanaryPlan {
   createdAt: string;
   expiresAt: string;
   tenant: PublicationCanaryTenant;
-  target: PublicationTarget;
+  /** Plan format is unchanged: no provider. The canary is an S3-only operator proof (its frontier is
+   * S3-versioning evidence), so it publishes with provider s3 (canaryPublicationTarget). */
+  target: Omit<PublicationTarget, "provider">;
   limits: PublicationCanaryLimits;
   /** Complete bounded inventory. Cross-scope entries remain here as holds. */
   stages: PublicationCanaryStage[];
@@ -227,7 +229,14 @@ const sameBinding = (value: unknown, b: PublicationCanaryBinding) => {
       canonicalFrontierRowEqual(a.frontier.row, b.frontier.row),
   );
 };
-const targetEqual = (a: PublicationTarget, b: PublicationTarget) =>
+const canaryPublicationTarget = (target: PublicationCanaryPlan["target"]): PublicationTarget => ({
+  bucket: target.bucket,
+  region: target.region,
+  keyRoot: target.keyRoot,
+  generation: target.generation,
+  provider: "s3",
+});
+const targetEqual = (a: PublicationCanaryPlan["target"], b: PublicationCanaryPlan["target"]) =>
   a.bucket === b.bucket &&
   a.region === b.region &&
   a.keyRoot === b.keyRoot &&
@@ -406,7 +415,7 @@ export function publicationCanaryPlanDigest(plan: PublicationCanaryPlan): string
 
 export function assertPublicationCanaryPlan(
   plan: PublicationCanaryPlan,
-  target?: PublicationTarget,
+  target?: PublicationCanaryPlan["target"],
   now = Date.now(),
 ): void {
   const l = plan?.limits;
@@ -817,7 +826,7 @@ export async function runPublicationCanary(
       let io: PublicationCanaryIo | undefined;
       try {
         claimed = await deps.authority.claim(binding, signal);
-        const ticket = parsePublicationTicket(claimed.ticket, plan.target);
+        const ticket = parsePublicationTicket(claimed.ticket, canaryPublicationTarget(plan.target));
         if (!sameBinding(claimed.binding, binding) || !ticketMatches(ticket, stage, plan)) {
           const cleanup = AbortSignal.timeout(5000);
           await deps.rpc.abandon(ticket, cleanup).catch(() => {});
@@ -832,7 +841,7 @@ export async function runPublicationCanary(
         io = metered.io;
         const result = await publishBufferedStage(
           {
-            target: plan.target,
+            target: canaryPublicationTarget(plan.target),
             rpc: oneShotRpc(deps.rpc, stage.stageToken, ticket),
             store: () => metered.store,
           },

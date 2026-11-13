@@ -3,11 +3,15 @@ import { expectedSchema } from "../src/hoopdb/migrate.ts";
 import { nativeAgentCatalogActivation } from "../src/hoopdb/native-agent-catalog-activation.ts";
 import { inTransaction, openHoopDb, schemaVerdict } from "../src/shared/db.ts";
 
-const args = process.argv.slice(2);
+const argv = process.argv.slice(2);
+// Opt-in only: accepts an empty install as complete. Plan and apply must agree;
+// the mode is in the fingerprint, so a mismatched apply refuses plan_changed.
+const freshInstall = argv[argv.length - 1] === "--fresh-install";
+const args = freshInstall ? argv.slice(0, -1) : argv;
 const apply = args[0] === "--apply";
 if (!(args.length === 0 || (args.length === 1 && args[0] === "--plan") ||
       (args.length === 2 && apply && /^[0-9a-f]{64}$/.test(args[1]!)))) {
-  console.error("usage: bun scripts/native-agent-catalog-activation.ts [--plan | --apply PLAN_FINGERPRINT]");
+  console.error("usage: bun scripts/native-agent-catalog-activation.ts [--plan | --apply PLAN_FINGERPRINT] [--fresh-install]");
   process.exit(64);
 }
 if (process.env.HOOPDB_DB_MODE !== "selfhosted") {
@@ -34,6 +38,7 @@ try {
   const result = await nativeAgentCatalogActivation(transact, {
     mode: "selfhosted", generation: expected.generation,
     ...(apply ? { applyFingerprint: args[1]! } : {}),
+    ...(freshInstall ? { freshInstall: true } : {}),
   });
   console.log(JSON.stringify(result));
   if (!result.eligible) process.exitCode = 2;

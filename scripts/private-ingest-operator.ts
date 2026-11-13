@@ -60,6 +60,11 @@ import {
   SIGNING_KEY_SECRET,
 } from "../stacks/cloudflare/session-ingest.ts";
 import { sanitizePlan, captureFiles } from "../src/cli/plan-provenance.ts";
+import { requireCustodyEvidenceText } from "../src/session-ingest/private-ingest-custody-evidence.ts";
+import {
+  PRIVATE_INGEST_GENERATION_CONTRACT,
+  type PrivateIngestGenerationContract,
+} from "../src/session-ingest/private-ingest-release.ts";
 import {
   privateIngestGithubGate,
   privateIngestGithubGet,
@@ -184,6 +189,7 @@ export function assertOperatorSource(
   )
     refuse("immutable_source_or_inputs");
   const allowed = new Set(captureFiles(SESSION_INGEST_STAGE));
+  allowed.add(`docs/plans/${SESSION_INGEST_STAGE}.custody-evidence.json`);
   if (source.changedFiles.some((path) => !allowed.has(path)))
     refuse("dirty_source");
   if (!source.host) refuse("host");
@@ -807,6 +813,32 @@ export function resourcePlanView(
   }
   return lines.join("\n");
 }
+/**
+ * The only two plans that may unbind INGEST_ACCEPT_GENERATIONS, both with no overlap in the tracked
+ * profile and no accept set proposed:
+ * - closure G+H -> H (unchanged): live expected G with accepted "G,H", proposed expected H;
+ * - rollback G+H -> G (docs/design/zero-503-schema-windows.md section 3.2): only under a reviewed
+ *   PRIVATE_INGEST_OVERLAP {from: G, to: H} still bound at G, live expected G with accepted exactly
+ *   "G,H", and proposed expected G. Dormant (null) keeps today's closure-only rule.
+ */
+export function acceptGenerationsDeletionAllowed(
+  sessionIngest: CloudflareStageInputs["sessionIngest"],
+  currentEnv: Record<string, unknown> | undefined,
+  proposedEnv: Record<string, unknown> | undefined,
+  contract: PrivateIngestGenerationContract = PRIVATE_INGEST_GENERATION_CONTRACT,
+): boolean {
+  const oldExpected = currentEnv?.INGEST_EXPECT_GENERATION,
+    newExpected = proposedEnv?.INGEST_EXPECT_GENERATION,
+    oldAccepted = currentEnv?.INGEST_ACCEPT_GENERATIONS;
+  const hex = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{64}$/u.test(v);
+  if (sessionIngest.overlapGeneration !== undefined || sessionIngest.expectedGeneration !== newExpected ||
+      !hex(oldExpected) || !hex(newExpected) || proposedEnv?.INGEST_ACCEPT_GENERATIONS !== undefined)
+    return false;
+  if (oldExpected !== newExpected) return oldAccepted === `${oldExpected},${newExpected}`;
+  const pair = contract.overlap;
+  return pair !== null && contract.generation === pair.from && pair.from === oldExpected &&
+    hex(pair.to) && pair.to !== pair.from && oldAccepted === `${pair.from},${pair.to}`;
+}
 export function assertOperatorSnapshot(
   snapshot: any,
   input: CloudflareStageInputs,
@@ -902,6 +934,15 @@ export function assertOperatorSnapshot(
           name: "NEON_REPLICA",
           queue_name: input.sessionIngest.neonReplicaQueue,
         };
+      // Neon-exit profile: a NEON_REPLICA binding that would remain on the Worker (create, update or
+      // noop) is a Neon edge the Worker refuses at startup. Refused by name before the generic
+      // inventory checks. A delete row removes a stale binding (the desired transition), so it is not
+      // this refusal; it still falls through to the reviewed delete allowlist below, which today
+      // admits no NEON_REPLICA unbind (native_binding_target, fail closed).
+      if (input.sessionIngest.neonExit === "on" && row.bindings.some((b: any) =>
+        b.action !== "delete" && (b.sid === "NEON_REPLICA" ||
+          (Array.isArray(b.data?.bindings) && b.data.bindings.some((d: any) => d?.name === "NEON_REPLICA")))))
+        refuse("native_neon_exit_replica");
       const overlapDeletes = row.bindings.filter(
         (binding: any) => binding.action === "delete",
       );
@@ -917,8 +958,6 @@ export function assertOperatorSnapshot(
         if (b.action === "delete") {
           const currentEnv = row.state?.props?.env,
             proposedEnv = props.env,
-            oldExpected = currentEnv?.INGEST_EXPECT_GENERATION,
-            newExpected = proposedEnv?.INGEST_EXPECT_GENERATION,
             oldAccepted = currentEnv?.INGEST_ACCEPT_GENERATIONS;
           if (row.action !== "update" || wanted !== undefined ||
               !Array.isArray(actual) || actual.length !== 1 ||
@@ -926,24 +965,20 @@ export function assertOperatorSnapshot(
             refuse("native_binding_target");
           let deletedValue: unknown;
           if (b.sid === "INGEST_ACCEPT_GENERATIONS") {
-            // Documented G -> H generation-window closure.
-            if (input.sessionIngest.overlapGeneration !== undefined ||
-                input.sessionIngest.expectedGeneration !== newExpected ||
-                typeof oldExpected !== "string" || !/^[0-9a-f]{64}$/u.test(oldExpected) ||
-                typeof newExpected !== "string" || !/^[0-9a-f]{64}$/u.test(newExpected) ||
-                oldExpected === newExpected || oldAccepted !== `${oldExpected},${newExpected}` ||
-                proposedEnv?.INGEST_ACCEPT_GENERATIONS !== undefined)
+            // Documented G -> H generation-window closure, or the reviewed G+H -> G rollback.
+            if (!acceptGenerationsDeletionAllowed(input.sessionIngest, currentEnv, proposedEnv))
               refuse("native_binding_target");
             deletedValue = oldAccepted;
           } else if (b.sid === "INGEST_CUSTODY_SOURCE") {
-            // CI rollout rollback: step 1 -> baseline only.
+            // Native deletion must match a known custody value; the CI live-phase
+            // gate separately requires shadow -> baseline (no direct frozen skip).
             if (input.sessionIngest.custodySource !== undefined ||
                 input.sessionIngest.syncAdmissionFrozenReceipt !== undefined ||
-                currentEnv?.INGEST_CUSTODY_SOURCE !== "frozen-supabase" ||
+                (currentEnv?.INGEST_CUSTODY_SOURCE !== "shadow" && currentEnv?.INGEST_CUSTODY_SOURCE !== "frozen-supabase") ||
                 currentEnv?.INGEST_SYNC_ADMISSION_FROZEN_RECEIPT !== undefined ||
                 proposedEnv?.INGEST_CUSTODY_SOURCE !== undefined)
               refuse("native_binding_target");
-            deletedValue = "frozen-supabase";
+            deletedValue = currentEnv.INGEST_CUSTODY_SOURCE;
           } else if (b.sid === "INGEST_SYNC_ADMISSION_FROZEN_RECEIPT") {
             // CI rollout rollback: step 2 -> step 1 only.
             if (input.sessionIngest.syncAdmissionFrozenReceipt !== undefined ||
@@ -1352,6 +1387,7 @@ export async function operatorMain(argv = process.argv.slice(2)) {
   });
   const source = sourceNow();
   assertOperatorSource(options, source);
+  requireCustodyEvidenceText(readFileSync(PREFIX + ".custody-evidence.json", "utf8"));
   const secrets = {
     accountId: process.env.CLOUDFLARE_ACCOUNT_ID ?? "",
     apiToken: process.env.CLOUDFLARE_API_TOKEN ?? "",

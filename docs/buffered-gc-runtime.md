@@ -69,7 +69,7 @@ the exact separately managed GC role in the production private input
 `transcriptStore.bufferedGcRoleArn` before another whole-stack deployment. The
 production validator refuses omission so a future Lambda role-ARN cascade cannot
 silently remove that grant. See the continuity procedure in
-`runbooks/sessions-prod-transcript-store.md`. This does not create or arm a GC
+`sessions-pipeline-cloud:hosted-ops/preserved/runbooks/sessions-prod-transcript-store.md`. This does not create or arm a GC
 runtime, change credentials, or relax the existing plan/capture gate.
 
 The template is default off and has no Function URL. Its dedicated Lambda role

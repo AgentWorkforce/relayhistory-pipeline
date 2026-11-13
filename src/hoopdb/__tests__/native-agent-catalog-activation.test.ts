@@ -54,6 +54,62 @@ async function seed(
   }
 }
 
+const completedAt = async () =>
+  (await db.query<{ completed_at: unknown }>("SELECT completed_at FROM sessions.session_directory_catalog_rollout")).rows[0]!.completed_at;
+
+// These run first, while the freshly migrated install has no sessions at all.
+test("empty install without --fresh-install keeps the existing refusal", async () => {
+  const plan = await nativeAgentCatalogActivation(transact, opts);
+  expect(plan).toMatchObject({ rows: 0, eligible: false, activated: false });
+  expect(plan).not.toHaveProperty("freshInstall");
+  expect(Object.values(plan.counts).every((n) => n === 0)).toBe(true);
+  const explicitFalse = await nativeAgentCatalogActivation(transact, { ...opts, freshInstall: false });
+  expect(explicitFalse).toEqual(plan);
+  await expect(nativeAgentCatalogActivation(transact, { ...opts, applyFingerprint: plan.fingerprint })).rejects.toThrow("native_catalog_projection_incomplete");
+  expect(await completedAt()).toBeNull();
+});
+
+test("fresh-install plans and default plans cannot be applied in the other mode", async () => {
+  const fresh = await nativeAgentCatalogActivation(transact, { ...opts, freshInstall: true });
+  const normal = await nativeAgentCatalogActivation(transact, opts);
+  expect(fresh.fingerprint).not.toBe(normal.fingerprint);
+  await expect(nativeAgentCatalogActivation(transact, { ...opts, applyFingerprint: fresh.fingerprint })).rejects.toThrow("native_catalog_plan_changed");
+  await expect(nativeAgentCatalogActivation(transact, { ...opts, freshInstall: true, applyFingerprint: normal.fingerprint })).rejects.toThrow("native_catalog_plan_changed");
+  await expect(nativeAgentCatalogActivation(transact, { ...opts, freshInstall: "yes" as never })).rejects.toThrow("native_catalog_fresh_install_invalid");
+  expect(await completedAt()).toBeNull();
+});
+
+test("empty install with --fresh-install is eligible and apply sets the marker", async () => {
+  const plan = await nativeAgentCatalogActivation(transact, { ...opts, freshInstall: true });
+  expect(plan).toMatchObject({ rows: 0, eligible: true, activated: false, freshInstall: true });
+  expect(await completedAt()).toBeNull();
+  const applied = await nativeAgentCatalogActivation(transact, { ...opts, freshInstall: true, applyFingerprint: plan.fingerprint });
+  expect(applied).toMatchObject({ eligible: true, activated: true, freshInstall: true });
+  expect(await completedAt()).not.toBeNull();
+  // Restore the closed gate so the populated-install tests below start from the default state.
+  await db.exec("UPDATE sessions.session_directory_catalog_rollout SET completed_at=NULL,updated_at=now() WHERE singleton");
+});
+
+test("an emptied install (only tombstoned or pointer-only rows) is not fresh", async () => {
+  await db.query(`INSERT INTO sessions.session_index
+    (org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,
+      storage_provider,bucket,manifest_key,raw_format,trace_id,revision)
+    VALUES('org-a','ws-a','codex','pointer-only','m1','u1',now(),now(),'s3','bucket','pointer-only','jsonl',
+      '019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c19',1)`);
+  try {
+    const plan = await nativeAgentCatalogActivation(transact, { ...opts, freshInstall: true });
+    expect(plan.counts.liveRows).toBe(0);
+    expect(plan.eligible).toBe(false);
+    await expect(nativeAgentCatalogActivation(transact, { ...opts, freshInstall: true, applyFingerprint: plan.fingerprint })).rejects.toThrow("native_catalog_projection_incomplete");
+  } finally {
+    for (const t of ["session_directory_agents", "session_directory_users", "session_directory_machines", "session_directory", "session_index"])
+      await db.exec(`DELETE FROM sessions.${t} WHERE session_id='pointer-only'`);
+  }
+  for (const t of ["session_index", "session_directory", "session_directory_agents", "session_directory_users", "session_directory_machines", "session_directory_relationships"])
+    expect((await db.query(`SELECT 1 FROM sessions.${t}`)).rows).toEqual([]);
+  expect(await completedAt()).toBeNull();
+});
+
 test("native audit covers every tenant, accepts the legacy writer, and plan writes nothing", async () => {
   await seed("current", "ws-a", true, { canonicalMachineId: "canonical-m1", userId: "Unknown" });
   const machines = await db.query("SELECT machine_id FROM sessions.session_directory_machines WHERE session_id='current'");
@@ -70,6 +126,17 @@ test("native audit covers every tenant, accepts the legacy writer, and plan writ
   expect(incomplete.eligible).toBe(false);
   expect(incomplete.counts.unprojected).toBe(1);
   await expect(nativeAgentCatalogActivation(transact, { ...opts, applyFingerprint: incomplete.fingerprint })).rejects.toThrow("projection_incomplete");
+});
+
+test("non-empty install with --fresh-install behaves like the default mode", async () => {
+  const normal = await nativeAgentCatalogActivation(transact, opts);
+  const fresh = await nativeAgentCatalogActivation(transact, { ...opts, freshInstall: true });
+  expect(fresh.counts).toEqual(normal.counts);
+  expect(fresh.rows).toBe(normal.rows);
+  expect(fresh.eligible).toBe(false);
+  expect(fresh.counts.unprojected).toBe(1);
+  await expect(nativeAgentCatalogActivation(transact, { ...opts, freshInstall: true, applyFingerprint: fresh.fingerprint })).rejects.toThrow("native_catalog_projection_incomplete");
+  expect(await completedAt()).toBeNull();
 });
 
 test("a stale reviewed plan cannot activate; changing an epoch is detected", async () => {
@@ -110,6 +177,8 @@ test("complete-source repair permits activation and the real tenant-bound agent 
   const before = (await db.query("SELECT session_id,event_projection_epoch::text FROM sessions.session_directory ORDER BY session_id")).rows;
   const plan = await nativeAgentCatalogActivation(transact, opts);
   expect(plan.eligible).toBe(true);
+  const freshPlan = await nativeAgentCatalogActivation(transact, { ...opts, freshInstall: true });
+  expect(freshPlan).toMatchObject({ eligible: true, counts: plan.counts, rows: plan.rows });
   expect((await nativeAgentCatalogActivation(transact, { ...opts, applyFingerprint: plan.fingerprint })).activated).toBe(true);
   expect((await db.query("SELECT session_id,event_projection_epoch::text FROM sessions.session_directory ORDER BY session_id")).rows).toEqual(before);
   await db.exec("SET ROLE bulls96_read_api");
@@ -134,5 +203,17 @@ test("operator CLI refuses non-native targets and unsafe TLS without exposing th
     expect(child.exitCode).toBe(64);
     expect(child.stderr.toString()).not.toContain("synthetic-password");
     expect(child.stdout.toString()).toBe("");
+  }
+  // --fresh-install is accepted only as the trailing flag after --plan or --apply FINGERPRINT.
+  const env = { HOOPDB_DB_MODE: "supabase" };
+  for (const argv of [["--fresh-install"], ["--plan", "--fresh-install"], ["--apply", "a".repeat(64), "--fresh-install"]]) {
+    const child = Bun.spawnSync([process.execPath, cli, ...argv], { env });
+    expect(child.exitCode).toBe(64);
+    expect(child.stderr.toString().trim()).toBe("native_catalog_selfhosted_only");
+  }
+  for (const argv of [["--fresh-install", "--plan"], ["--plan", "--fresh-install", "--fresh-install"], ["--apply", "--fresh-install"]]) {
+    const child = Bun.spawnSync([process.execPath, cli, ...argv], { env });
+    expect(child.exitCode).toBe(64);
+    expect(child.stderr.toString()).toContain("usage:");
   }
 });

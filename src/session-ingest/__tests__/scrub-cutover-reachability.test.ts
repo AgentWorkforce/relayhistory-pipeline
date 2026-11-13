@@ -1,6 +1,6 @@
 /**
- * Negative reachability proof for the relayscrubber 0.5.0-alpha.6 cutover
- * (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.6").
+ * Negative reachability proof for the relayscrubber 0.5.0-alpha.8 cutover
+ * (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.8").
  *
  * Every TypeScript scrub/seal entry point (lib/scrub.ts and lib/pipeline/raw-chunks.ts)
  * is replaced in place by a counting spy. Then each in-scope ingress path (ingest
@@ -95,7 +95,7 @@ function publication(stage: { key: string; sha256: string; bytes: number; groupO
   const head = { groupIndex: 0, ordinals: [0], generation, prefix: `96bulls/org-a/upload-generations/g=${generation}`, headVersion: '1', revision: '1', previousKey: null, previousRawSha256: null, basePointer: null, source: 'claude', sessionId: 'session:1', physicalWorkspace: 'ws-a', physicalSource: 'claude', physicalSession: 'session_1', machineId: 'srv_fixture', fenceEpoch: '2', resetEpoch: '0' };
   const ticket = { schemaGeneration: HEX, attemptToken, leaseToken: '11111111-1111-1111-1111-111111111111', leaseUntil: '2026-11-05T00:05:00.000000Z', stageToken: '22222222-2222-2222-2222-222222222222', stageVersion: '1', outboxVersion: '1', tenant: { orgId: 'org-a', workspaceId: 'ws-a', userId: 'user-a' }, originId: 'origin-a', batchId: 'batch-a', batchDigest: HEX, claimToken: '33333333-3333-3333-3333-333333333333', stage, records: [record], receiptSeats, acceptedOrdinals: [0], heads: [head] };
   const decoded = { header: { v: 1 as const, publication_state: 'buffered' as const, claim_token: ticket.claimToken, batch_digest: HEX, received_at: '2026-11-04T01:00:00.000Z', org_id: 'org-a', workspace_id: 'ws-a', origin_id: 'origin-a', user_id: 'user-a', groups: [['claude', 'session:1'] as [string, string]] }, groups: [{ source: 'claude', sessionId: 'session:1', lines: [line] }], spec: stage };
-  return { ticket, head, decoded, target: { bucket: 'fixture', region: 'us-east-1', keyRoot: '96bulls', generation: HEX } };
+  return { ticket, head, decoded, target: { bucket: 'fixture', region: 'us-east-1', keyRoot: '96bulls', generation: HEX, provider: 's3' as const } };
 }
 async function packed(s: ObjectStore, key: string) {
   const o = await s.getObject(objectKey(key));
@@ -144,7 +144,7 @@ async function run(caller: Caller, mode: Row['mode']) {
   return { row, text: o.text };
 }
 
-describe('under the env triple (real vendored alpha.6 engine)', () => {
+describe('under the env triple (real vendored alpha.8 engine)', () => {
   for (const caller of CALLERS)
     test(`${caller}: the TS scrub/sealer is never invoked; the sealed object is the crate's (version 10)`, async () => {
       Object.assign(process.env, TRIPLE);
@@ -320,6 +320,9 @@ describe('wiring inventory is complete (source scan)', () => {
   // Matches the target shape but never seals a raw chunk.
   const NOT_SEAL_SITES = [
     ['write/export target', 'src/session-ingest/app.ts', 1], // enqueueAdmission: inbox object only
+    // Hosted upload admission: promoteUpload -> prepareForAdmission + enqueueAdmission (inbox and status
+    // objects only); the ingest Worker's admission consumer seals and writes.
+    ['write/export target', 'src/session-ingest/upload-admission-hosted.ts', 1],
   ] as const;
 
   function sources(): string[] {

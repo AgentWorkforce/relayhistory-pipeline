@@ -6,7 +6,9 @@ name: pg-proof
 on:
   pull_request:
   push:
-    branches: [main]
+    # release/schema-*: the protected release anchor branches (a held-step target_sha
+    # needs green push runs on its own branch; scripts/schema-release-github.ts).
+    branches: [main, 'release/schema-*']
 permissions:
   contents: read
 concurrency:
@@ -379,7 +381,7 @@ jobs:
         run: |
           set -o pipefail
           log=publication-pg${{ matrix.pg }}.log
-          bun test src/session-ingest/__tests__/publication.postgres.test.ts src/session-ingest/__tests__/operator-session-erase.postgres.test.ts src/session-ingest/__tests__/operator-session-erase-runtime.postgres.test.ts src/session-erase/__tests__/search-login.postgres.test.ts 2>&1 | tee "$log"
+          bun test src/session-ingest/__tests__/publication.postgres.test.ts src/session-ingest/__tests__/operator-session-erase.postgres.test.ts src/session-ingest/__tests__/operator-session-erase-runtime.postgres.test.ts src/session-erase/__tests__/search-login.postgres.test.ts src/session-erase/__tests__/user-erase.postgres.test.ts 2>&1 | tee "$log"
           # A green run must have executed tests, not skipped them.
           grep -Eq '^ *[1-9][0-9]* pass$' "$log"
           if grep -Eq '^ *[1-9][0-9]* skip$' "$log"; then echo "tests were skipped"; exit 1; fi

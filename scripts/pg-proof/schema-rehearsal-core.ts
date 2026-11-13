@@ -20,6 +20,13 @@ export const INJECTIONS = [
   "wrong-generation",
   "stale-plan",
   "missing-bootstrap",
+  // The protected release anchor (src/hoopdb/release-target.ts requireReleaseAnchor):
+  // each mutates the anchor branch's tip in the disposable checkout (mutateAnchorTip).
+  "anchor-tampered",
+  "anchor-nonlinear",
+  "anchor-extra-file",
+  "anchor-missing-verifier",
+  "anchor-ref-moved",
 ] as const;
 export type Injection = (typeof INJECTIONS)[number];
 
@@ -33,7 +40,17 @@ export const INJECTION_REFUSAL: Record<Exclude<Injection, "none">, string> = {
   // R2-bootstrap skipped: the first step granting to a role only the release tree's
   // bootstrap chain creates (046000 -> bulls96_analysis_admit) fails undefined_object.
   "missing-bootstrap": "42704",
+  // R1-anchor-*: the plan's anchor binding (production's targetAnchor) refuses the tip.
+  "anchor-tampered": "release_anchor_file_drift",
+  "anchor-nonlinear": "release_anchor_nonlinear",
+  "anchor-extra-file": "release_anchor_extra_file",
+  "anchor-missing-verifier": "release_target_verifier_missing",
+  // R4-anchor-ref-moved: planned at the tip, then the branch moves; the apply's first
+  // anchor recompute refuses before connecting.
+  "anchor-ref-moved": "release_anchor_ref_mismatch",
 };
+/** The injections that mutate the anchor tip before the plan (stage R1-<inject>). */
+export const PLAN_ANCHOR_INJECTIONS = ["anchor-tampered", "anchor-nonlinear", "anchor-extra-file", "anchor-missing-verifier"] as const;
 
 /**
  * The production apply's refusal codes, in the order scripts/schema-release-database.ts
@@ -56,6 +73,20 @@ export const PRODUCTION_APPLY_REFUSALS = [
   "release_target_readback",
   "release_target_readback",
   "release_marker",
+] as const;
+
+/**
+ * The bootstrap stage's refusal codes, in the order scripts/schema-release-database.ts
+ * raises them through refuse(...) inside validateBootstrapPlan and releaseBootstrap.
+ * The rehearsal driver does NOT replay the bootstrap stage: it rehearses the apply only.
+ * This list is a drift pin, so a new or reordered bootstrap refusal fails the unit test
+ * first; a bootstrap-stage rehearsal is a separate future change.
+ */
+export const PRODUCTION_BOOTSTRAP_REFUSALS = [
+  "release_bootstrap_approval",
+  "release_target_manifest_changed",
+  "release_bootstrap_db_mode",
+  "release_target_manifest_changed",
 ] as const;
 
 export class RehearsalRefusal extends Error {
@@ -480,6 +511,25 @@ export function errorCode(error: unknown): string {
   return typeof code === "string" && /^[a-zA-Z0-9_]{1,64}$/.test(code) ? code : "rehearsal_failed";
 }
 
+/**
+ * Evidence for a stage that failed with a production refusal: for index_prebuild_required, the
+ * refusing indexes (index, table, step) and the operator packets the message names, parsed from
+ * the migrator's fixed refusal text into identifier-shaped values only (never the raw message).
+ * Any other refusal, or a message that does not parse, gives {} as before.
+ */
+export function refusalEvidence(error: unknown): Record<string, unknown> {
+  if (errorCode(error) !== "index_prebuild_required") return {};
+  const message = (error as { message?: unknown } | null)?.message;
+  if (typeof message !== "string") return {};
+  const indexes = [
+    ...message.matchAll(/index sessions\.([a-z_][a-z0-9_]*) on (sessions\.[a-z_][a-z0-9_]*) \(((?:upstream|96bulls):[A-Za-z0-9_.-]+)\)/g),
+  ].map(([, index, table, step]) => ({ index, table, step }));
+  const packets = (/CREATE INDEX CONCURRENTLY \(([^()]*)\), then rerun/.exec(message)?.[1] ?? "")
+    .split("; ")
+    .filter((p) => /^[A-Za-z0-9 ._/#,-]{1,200}$/.test(p));
+  return indexes.length ? { indexes, packets } : {};
+}
+
 // ---- R2-bootstrap: the release tree's bootstrap chain applied before the apply.
 
 /**
@@ -611,4 +661,219 @@ export function bootstrapRefreshEvidence(x: {
     roles,
     role_count: { before: x.before.length, after: x.after.length },
   };
+}
+
+// ---- The protected release anchor in the disposable checkout ---------------------------
+
+/**
+ * Git in the release checkout through the injected Runner: its own env only (PATH, HOME,
+ * a temporary index file, a fixed fixture identity), never the working tree or the real
+ * index. Objects and refs it writes stay in the disposable checkout.
+ */
+export interface AnchorGit {
+  run: Runner;
+  repo: string;
+  env: { PATH?: string; HOME?: string };
+  /** A path in a fresh temporary directory: the only index these helpers touch. */
+  indexFile: string;
+}
+/** Remote-tracking namespace the full checkout fetches branches into (release-target.ts). */
+export const ANCHOR_REF_NAMESPACE = "refs/remotes/origin/";
+function anchorGit(x: AnchorGit, args: readonly string[]): string {
+  const r = x.run("git", args, {
+    cwd: x.repo,
+    env: {
+      PATH: x.env.PATH ?? "",
+      HOME: x.env.HOME ?? "",
+      GIT_INDEX_FILE: x.indexFile,
+      GIT_AUTHOR_NAME: "rehearsal",
+      GIT_AUTHOR_EMAIL: "rehearsal@example.invalid",
+      GIT_COMMITTER_NAME: "rehearsal",
+      GIT_COMMITTER_EMAIL: "rehearsal@example.invalid",
+      GIT_NO_LAZY_FETCH: "1",
+    },
+    timeoutMs: 60_000,
+  });
+  if (r.status !== 0) rehearsalRefuse("rehearsal_git", { command: args[0] });
+  return r.stdout;
+}
+/** The tip of `<namespace><branch>` (exact ref), or undefined. */
+export function anchorRefTip(x: AnchorGit, branch: string): string | undefined {
+  const ref = ANCHOR_REF_NAMESPACE + branch;
+  const out = anchorGit(x, ["for-each-ref", "--format=%(objectname) %(refname)", ref]);
+  const row = out.split("\n").find((l) => l.endsWith(" " + ref));
+  return row?.split(" ")[0];
+}
+interface TreeEntry {
+  mode: string;
+  oid: string;
+}
+/** path -> mode and blob oid at a commit, for exactly these paths (absent paths omitted). */
+function treeEntries(x: AnchorGit, sha: string, paths: readonly string[]): Map<string, TreeEntry> {
+  const m = new Map<string, TreeEntry>();
+  if (!paths.length) return m;
+  for (const ent of anchorGit(x, ["ls-tree", "-z", "--full-tree", sha, "--", ...paths]).split("\0")) {
+    if (!ent) continue;
+    const tab = ent.indexOf("\t");
+    const [mode, type, oid] = ent.slice(0, tab).split(" ");
+    if (type === "blob") m.set(ent.slice(tab + 1), { mode: mode!, oid: oid! });
+  }
+  return m;
+}
+/** A commit whose tree is `from`'s tree with `files` set (null removes), with these parents. */
+function commitTree(x: AnchorGit, from: string, files: ReadonlyMap<string, TreeEntry | null>, parents: readonly string[], message: string): string {
+  anchorGit(x, ["read-tree", from]);
+  for (const [path, e] of files)
+    anchorGit(x, e ? ["update-index", "--add", "--cacheinfo", `${e.mode},${e.oid},${path}`] : ["update-index", "--force-remove", "--", path]);
+  const tree = anchorGit(x, ["write-tree"]).trim();
+  return anchorGit(x, ["commit-tree", tree, ...parents.flatMap((p) => ["-p", p]), "-m", message]).trim();
+}
+/** Creates `<namespace><branch>` at sha; refuses (never overwrites) an existing ref. */
+function createAnchorRef(x: AnchorGit, branch: string, sha: string): void {
+  if (anchorRefTip(x, branch) !== undefined) rehearsalRefuse("rehearsal_anchor_fixture_conflict", { branch });
+  anchorGit(x, ["update-ref", ANCHOR_REF_NAMESPACE + branch, sha, ""]);
+}
+/** Moves `<namespace><branch>` from `from` to `to` (compare-and-swap). */
+export function moveAnchorRef(x: AnchorGit, branch: string, from: string, to: string): void {
+  anchorGit(x, ["update-ref", ANCHOR_REF_NAMESPACE + branch, to, from]);
+}
+/** Deletes fixture refs (each only if still at the fixture's sha). */
+export function removeAnchorRefs(x: AnchorGit, refs: readonly { branch: string; sha: string }[]): void {
+  for (const r of refs) anchorGit(x, ["update-ref", "-d", ANCHOR_REF_NAMESPACE + r.branch, r.sha]);
+}
+
+/**
+ * A release anchor chain built in the disposable checkout when the protected
+ * release/schema-<slot> branch for the target does not exist there (no such branch is
+ * ever created on the remote). Off the main commit `base` (whose lane steps are all
+ * prefix steps at the release bytes):
+ *  - the first commit carries the SESSION_BOOTSTRAP_FILES at the release sha's bytes; it is
+ *    its own anchor (the branch of base's newest target-lane step, when that slot is
+ *    unique) or, when that slot cannot anchor, folds into the next commit;
+ *  - then one commit per missing target-lane prefix step with a unique anchor slot, up to
+ *    the target, each adding the missing prefix steps up to it and their release
+ *    rollbacks at the release bytes; the remaining missing steps (other lanes) land in the
+ *    target's commit.
+ * Each commit's branch is created only if absent (rehearsal_anchor_fixture_conflict).
+ * Returns the target tip and every ref created (for removeAnchorRefs).
+ */
+export function buildAnchorFixture(
+  x: AnchorGit & {
+    sha: string;
+    base: string;
+    target: string;
+    /** The prefix step names, migrator order. */
+    prefix: readonly string[];
+    baseSteps: ReadonlySet<string>;
+    bootstrapFiles: readonly string[];
+    branchOf: (step: string) => string | undefined;
+    /** True when the release tree names the branch's slot exactly once. */
+    uniqueBranch: (branch: string) => boolean;
+    stepPath: (step: string) => string;
+    rollbackPath: (step: string) => string | undefined;
+  },
+): { tip: string; refs: { branch: string; sha: string }[] } {
+  if (!x.prefix.includes(x.target)) rehearsalRefuse("rehearsal_target_anchor_missing", { reason: "target_not_in_prefix" });
+  const lane = laneOf(x.target);
+  const anchorable = (step: string) => {
+    const b = x.branchOf(step);
+    return b !== undefined && x.uniqueBranch(b) ? b : undefined;
+  };
+  const missing = x.prefix.filter((n) => !x.baseSteps.has(n));
+  const releaseFiles = (paths: string[]) => {
+    const e = treeEntries(x, x.sha, paths);
+    return new Map<string, TreeEntry | null>(paths.map((p) => [p, e.get(p) ?? null]));
+  };
+  const stepFiles = (steps: string[]) => {
+    const paths = steps.map(x.stepPath);
+    const rollbacks = steps.map(x.rollbackPath).filter((p): p is string => p !== undefined);
+    const rb = treeEntries(x, x.sha, rollbacks);
+    const files = releaseFiles(paths);
+    for (const [p, e] of rb) files.set(p, e);
+    return files;
+  };
+  const refs: { branch: string; sha: string }[] = [];
+  const add = (parent: string, files: Map<string, TreeEntry | null>, branch: string) => {
+    const c = commitTree(x, parent, files, [parent], `rehearsal fixture anchor ${branch}`);
+    createAnchorRef(x, branch, c);
+    refs.push({ branch, sha: c });
+    return c;
+  };
+  try {
+    let parent = x.base;
+    let pending = releaseFiles([...x.bootstrapFiles]);
+    const newestBase = x.prefix.filter((n) => x.baseSteps.has(n) && laneOf(n) === lane).at(-1);
+    const baseBranch = newestBase !== undefined && newestBase <= x.target ? anchorable(newestBase) : undefined;
+    if (newestBase === x.target || (baseBranch && missing.length)) {
+      if (!baseBranch) rehearsalRefuse("rehearsal_target_anchor_missing", { reason: "slot" });
+      parent = add(parent, pending, baseBranch);
+      pending = new Map();
+      if (newestBase === x.target) {
+        if (missing.some((n) => laneOf(n) === lane && n < x.target)) rehearsalRefuse("rehearsal_target_anchor_missing", { reason: "gap" });
+        if (missing.length) rehearsalRefuse("rehearsal_target_anchor_missing", { reason: "other_lane_missing" });
+        return { tip: parent, refs };
+      }
+    }
+    let batch: string[] = [];
+    for (const n of missing) {
+      batch.push(n);
+      const stop = n === x.target || (laneOf(n) === lane && n < x.target && anchorable(n) !== undefined);
+      if (!stop) continue;
+      if (n === x.target) batch = [...batch, ...missing.slice(missing.indexOf(n) + 1)];
+      for (const [p, e] of stepFiles(batch)) pending.set(p, e);
+      parent = add(parent, pending, anchorable(n) ?? rehearsalRefuse("rehearsal_target_anchor_missing", { reason: "slot" }));
+      pending = new Map();
+      batch = [];
+      if (n === x.target) return { tip: parent, refs };
+    }
+    return rehearsalRefuse("rehearsal_target_anchor_missing", { reason: "target_not_missing" });
+  } catch (e) {
+    try {
+      removeAnchorRefs(x, refs);
+    } catch {}
+    throw e;
+  }
+}
+
+/**
+ * One anchor injection: a new commit for the anchor branch's tip `tip` (parent `parent`),
+ * moved onto the branch in the disposable checkout. anchor-tampered: one bootstrap file
+ * gets another blob (the first of the other bootstrap files' blobs, or the parent's, that
+ * differs); anchor-nonlinear: the same tree with a second parent (the release sha);
+ * anchor-extra-file: an extra path outside the allowlist (an existing blob);
+ * anchor-missing-verifier: one verifier file removed; anchor-ref-moved: a twin commit
+ * (same tree and parent, other message). Returns the new tip.
+ */
+export function mutateAnchorTip(
+  x: AnchorGit & {
+    sha: string;
+    branch: string;
+    tip: string;
+    inject: Injection;
+    bootstrapFiles: readonly string[];
+    verifierPath: string;
+  },
+): string {
+  const parent = anchorGit(x, ["rev-parse", "--verify", "--end-of-options", `${x.tip}^1`]).trim();
+  const label = `rehearsal injection ${x.inject}`;
+  let next: string;
+  if (x.inject === "anchor-nonlinear") next = commitTree(x, x.tip, new Map(), [parent, x.sha], label);
+  else if (x.inject === "anchor-ref-moved") next = commitTree(x, x.tip, new Map(), [parent], label);
+  else if (x.inject === "anchor-missing-verifier") next = commitTree(x, x.tip, new Map([[x.verifierPath, null]]), [parent], label);
+  else if (x.inject === "anchor-extra-file") {
+    const e = treeEntries(x, x.tip, [x.bootstrapFiles[0]!]).get(x.bootstrapFiles[0]!);
+    if (!e) rehearsalRefuse("rehearsal_injection_unavailable", { inject: x.inject });
+    next = commitTree(x, x.tip, new Map([["rehearsal-anchor-extra-file.sql", { mode: "100644", oid: e.oid }]]), [parent], label);
+  } else if (x.inject === "anchor-tampered") {
+    const victim = x.bootstrapFiles[0]!;
+    const at = treeEntries(x, x.tip, [...x.bootstrapFiles]);
+    const own = at.get(victim);
+    const other = [...x.bootstrapFiles.slice(1).map((f) => at.get(f)), treeEntries(x, parent, [victim]).get(victim)].find(
+      (e) => e !== undefined && e.oid !== own?.oid,
+    );
+    if (!other) rehearsalRefuse("rehearsal_injection_unavailable", { inject: x.inject });
+    next = commitTree(x, x.tip, new Map([[victim, { mode: own?.mode ?? "100644", oid: other.oid }]]), [parent], label);
+  } else return rehearsalRefuse("rehearsal_injection_unavailable", { inject: x.inject });
+  moveAnchorRef(x, x.branch, x.tip, next);
+  return next;
 }

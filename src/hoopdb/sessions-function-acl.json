@@ -83,6 +83,10 @@
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
     ],
+    "sessions.buffered_session_stages_for_target_paged(text,text,text,text,text,text,text,text,boolean,text,jsonb,integer)": [
+      "<owner>:EXECUTE",
+      "bulls96_read_api:EXECUTE"
+    ],
     "sessions.buffered_sessions_for(text,timestamp with time zone,text,text,integer,text,text,text,text,text,boolean,text)": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
@@ -1067,6 +1071,36 @@
     "sessions.migration_ingest_audit_append_only()": [
       "<owner>:EXECUTE"
     ],
+    "sessions.operator_user_erase_begin(text,text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_complete(text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_control_gate(text,text,text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_count(text,jsonb)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_heads_guard()": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_purge(text,text,text,text[],boolean)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_remaining(text,text,text,text[])": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_render(text)": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_seat_ambiguity(text,text,text,text[])": [
+      "<owner>:EXECUTE"
+    ],
+    "sessions.operator_user_erase_step(text,integer)": [
+      "<owner>:EXECUTE"
+    ],
     "sessions.output_facts_coverage_for(text,timestamp with time zone,timestamp with time zone)": [
       "<owner>:EXECUTE",
       "bulls96_read_api:EXECUTE"
@@ -1502,6 +1536,14 @@
     "sessions.set_session_state_for_publication(text,text,text,text,text,text,bigint,text,timestamp with time zone,text)": [
       "<owner>:EXECUTE",
       "service_role:EXECUTE"
+    ],
+    "sessions.upload_consent_apply_v1(text,text,text,jsonb,boolean,bigint)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
+    ],
+    "sessions.upload_consent_snapshot_v1(text,text,text,text,jsonb,bigint)": [
+      "<owner>:EXECUTE",
+      "bulls96_session_ingest:EXECUTE"
     ],
     "sessions.upsert_machine(text,text,text,text,text,text,timestamp with time zone)": [
       "<owner>:EXECUTE",

@@ -38,6 +38,8 @@ import {
 import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, transcriptBucketPolicy, transcriptKeyPolicy, transcriptNames } from "../transcript-store.ts";
 import { bufferedFeedConfig, bufferedFeedGateRefusal, BUFFERED_SEARCH_GATE_CONTRACT } from "../../../src/session-pipeline/buffered-search-feed.ts";
 import { bufferedErasureConfig } from "../../../src/session-pipeline/buffered-erasure-delete.ts";
+import { lambdaEnv } from "../../../src/session-pipeline/lambda.ts";
+import { NeonExitRefusal } from "../../../src/shared/neon-exit.ts";
 
 const STAGE = "aws-sessions-prod";
 const ACCOUNT = "941433935742";
@@ -214,6 +216,8 @@ describe("session pipeline: not reachable from the internet", () => {
       "aws/session-pipeline.ts: Permission(id, props as never);",
       // The read API has a Function URL by design (application auth); its props are pinned in session-read-api.test.ts.
       'aws/session-read-api.ts: Function("session-read-api", sessionReadApiFunctionProps({ stage: i.stage, names, p: i.p, ...(i.analysisBucketName ? { analysisBucketName: i.analysisBucketName } : {}) }) as never);',
+      // The upload-admission consumer (HISTORY_UPLOAD_DIRECT_INFRA=on): SQS-driven, functionUrl false (upload-inbox-infra.test.ts).
+      'aws/transcript-store.ts: Function("upload-admission", uploadAdmissionFunctionProps({ stage: i.stage, bucket: n.bucket, names: u, p: i.transcriptStore.uploadAdmission!, sse: i.transcriptStore.uploadInboxSse! }) as never)',
     ]);
   });
 });
@@ -850,5 +854,50 @@ describe("session pipeline: update with the role-ARN cascade", () => {
     // A tag change on a grant is the repo tag rename's own phase, which refuses creates.
     const tag = edit(withReadApi(), "session-pipeline-secret", "      96bulls:repo: AgentWorkforce/sessions-pipeline", () => ["  -   96bulls:repo: AgentWorkforce/sessions-pipeline", "  +   96bulls:repo: AgentWorkforce/elsewhere"]);
     expect(() => check(tag)).toThrow(/repo tag rename/);
+  });
+});
+
+describe("session pipeline: SESSIONS_NEON_EXIT (neonExit, default off)", () => {
+  const withPipeline = (sessionPipeline: unknown) =>
+    ({ ...example, transcriptStore: { ...example.transcriptStore, sessionPipeline } }) as unknown as AwsInputs & Record<string, unknown>;
+  const validate = (i: AwsInputs & Record<string, unknown>) => assertTranscriptStoreInputs(STAGE, i);
+  const env = (sp: SessionPipelineInputs) => sessionPipelineEnv({ stage: STAGE, bucket: t.bucket, names: p, p: sp }) as Record<string, string>;
+  const semanticCopy = { enabled: true, sourceId: "legacy-main" };
+
+  it("omitted: no SESSIONS_NEON_EXIT key; the env is byte-identical to a stack without the input", () => {
+    for (const sp of [{}, { searchIndex: true }, { semanticCopy }, { analysisCache: false }, { briefs: { enabled: true } }] as SessionPipelineInputs[]) {
+      expect(Object.hasOwn(env(sp), "SESSIONS_NEON_EXIT")).toBe(false);
+      expect(JSON.stringify(env(sp))).toBe(JSON.stringify(env({ ...sp, neonExit: undefined })));
+    }
+  });
+
+  it("true: exactly one more var, SESSIONS_NEON_EXIT \"true\", and the validator accepts it", () => {
+    for (const sp of [{}, { searchIndex: true }, { semanticCopy: { enabled: false, sourceId: "legacy-main" } }, { analysisCache: false }] as SessionPipelineInputs[]) {
+      expect(() => validate(withPipeline({ ...sp, neonExit: true }))).not.toThrow(/sessionPipeline/);
+      expect(env({ ...sp, neonExit: true })).toEqual({ ...env(sp), SESSIONS_NEON_EXIT: "true" });
+    }
+  });
+
+  it("refuses analysisCache: true and semanticCopy.enabled: true together with it, naming the flag", () => {
+    expect(() => validate(withPipeline({ neonExit: true, analysisCache: true }))).toThrow(
+      "transcriptStore.sessionPipeline.neonExit refuses analysisCache: true (SESSION_ANALYSIS_CACHE_ENABLED reads the Neon readonly source)");
+    expect(() => validate(withPipeline({ neonExit: true, semanticCopy }))).toThrow(
+      "transcriptStore.sessionPipeline.neonExit refuses semanticCopy.enabled: true (SESSION_SEMANTIC_COPY_ENABLED reads the Neon readonly source)");
+    // Without the profile, semantic copy stays accepted as before.
+    expect(() => validate(withPipeline({ semanticCopy }))).not.toThrow(/sessionPipeline/);
+  });
+
+  it("stack and runtime agree: the rendered env passes lambdaEnv's Neon-exit gate, and either flag on it is refused", () => {
+    // AWS_REGION is supplied by the Lambda runtime, not the stack.
+    const rendered = { ...env({ neonExit: true }), AWS_REGION: REGION };
+    expect(() => lambdaEnv(rendered)).not.toThrow();
+    for (const flag of ["SESSION_ANALYSIS_CACHE_ENABLED", "SESSION_SEMANTIC_COPY_ENABLED"])
+      expect(() => lambdaEnv({ ...rendered, [flag]: "1", SESSION_SEARCH_FEATURE_SOURCE_ID: "legacy-main" })).toThrow(NeonExitRefusal);
+  });
+
+  it("is refused for any value but true", () => {
+    for (const value of ["true", "on", false, 1, null, "", {}])
+      expect(() => validate(withPipeline({ neonExit: value }))).toThrow("transcriptStore.sessionPipeline.neonExit must be true (omit for off)");
+    expect(() => validate(withPipeline({ SESSIONS_NEON_EXIT: "true" }))).toThrow(/sessionPipeline.SESSIONS_NEON_EXIT is not a known setting/);
   });
 });
