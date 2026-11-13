@@ -1,3 +1,4 @@
+import type { S3FenceMirror } from "./ledger-s3.ts";
 import type {FrozenWitnessInput,Ledger,LedgerTenant} from "./ledger.ts";
 import {decodeCustodyEnvelope} from "./custody-wire.ts";
 import {validatedCustodyAck} from "./custody-ack.ts";
@@ -203,13 +204,15 @@ export interface IngestAppDeps {
    *   re-enable        S3 AFTER SQL, and only when SQL applied or replayed it (never for a stale ordered
    *                    control), so a late stale enable can never lift an S3 tombstone. A failed S3 write
    *                    answers 503; the retry replays SQL and lifts again.
-   * Ordered controls (identity.control) are mirrored through the fence's own ordered mark (applyOrderedControl),
-   * never the unordered calls, so a late or stale control never changes the S3 fence (an enable v5 that lands
-   * after a disable v6 is stale in S3 as in SQL). Every cheap refusal (control kind, ordered support) runs before
-   * any S3 write, and on the journaled routes the S3 write runs inside the privacy-journal bracket.
-   * Absent (the default): no S3 fence write, unchanged.
+   * Ordered controls (identity.control): SQL is the ordering authority (gap, epoch, digest), and S3 follows its
+   * verdict (ledger-s3.ts s3ControlMirror). A disable or reset is first PENDING in S3 (fail closed for admission),
+   * then SQL decides, then the verdict lands (applied / replay: the effect, in per-session order; stale: nothing);
+   * a control SQL refuses definitely is removed from S3 with no effect, and an ambiguous failure stays pending
+   * until the retry. An enable lands in S3 only after SQL applied or replayed it. So S3 is never live where SQL is
+   * deleted, and a refused control never wedges the legitimate one. Every route refusal (control kind, journal)
+   * runs before any S3 write. Absent (the default): no S3 fence write, unchanged.
    */
-  s3FenceMirror?: Pick<Ledger, "setSessionUploads" | "resetUploadedSessions" | "applyOrderedControl">;
+  s3FenceMirror?: S3FenceMirror;
   /**
    * Operator per-session erase (session-erase.ts, docs/operator-session-erase-contract.md). Absent: the
    * disabled config, so /internal/v1/session-erase/* answers 501 not_implemented and reads nothing.
@@ -903,23 +906,25 @@ export function createIngestApp(deps: IngestAppDeps) {
       // Every cheap refusal before any S3 write.
       const ordered=identity.control;
       if(ordered&&(ordered.kind!=="selection"||!deps.deliver.ledger.applyOrderedControl))throw new IngestUnavailable("fence","control_unavailable");
-      if(ordered&&deps.s3FenceMirror&&!deps.s3FenceMirror.applyOrderedControl)throw new IngestUnavailable("fence","control_unavailable");
-      // 0005: the S3 fence write, ordered through the fence's own mark for an ordered control (a stale one writes nothing).
-      const mirrorSelection=()=>mirrorFence<unknown>(identity.orgId,():Promise<unknown>=>ordered
-        ?deps.s3FenceMirror!.applyOrderedControl!({...selection,control:{...ordered,kind:"selection"}})
-        :deps.s3FenceMirror!.setSessionUploads(selection));
-      // A deletion lands in the S3 fence before SQL.
-      if (!input.enabled) await mirrorSelection();
+      const mirror=deps.s3FenceMirror;
       if(ordered){
         const control=ordered;
+        const s3Input={...selection,control:{...control,kind:"selection" as const}};
         const result=await journal(async()=>{
-          const r=orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({...selection,control:{...control,kind:"selection"},...(custody?{custody}:{})}),control);
-          // A re-enable lifts the S3 tombstone only after SQL accepted it (never for a stale ordered control), inside the journal bracket.
-          if(input.enabled&&r.control.outcome!=="stale")await mirrorSelection();
+          // SQL decides; S3 follows its verdict (s3FenceMirror). A disable is pending in S3 while SQL decides.
+          if(!input.enabled)await mirrorFence(identity.orgId,()=>mirror!.beginOrdered(s3Input));
+          let r;
+          try{r=orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({...s3Input,...(custody?{custody}:{})}),control);}
+          catch(error){if(!input.enabled&&definitelyNotApplied(error))await mirrorFence(identity.orgId,()=>mirror!.abortOrdered(s3Input));throw error;}
+          await mirrorFence(identity.orgId,()=>mirror!.finishOrdered(s3Input,r.control.outcome));
           return r;
         },(r)=>r.control.outcome);
         controlAck=result.control;custodyHeader(c,result.custodyAck);
-      }else await journal(async()=>{await deps.deliver.ledger.setSessionUploads(selection);if(input.enabled)await mirrorSelection();},()=>"applied");
+      }else{
+        // Unordered: a deletion lands in the S3 fence before SQL; a lift after it.
+        if(!input.enabled)await mirrorFence(identity.orgId,()=>mirror!.setSessionUploads(selection));
+        await journal(async()=>{await deps.deliver.ledger.setSessionUploads(selection);if(input.enabled)await mirrorFence(identity.orgId,()=>mirror!.setSessionUploads(selection));},()=>"applied");
+      }
       // A "Don't upload" is also the principal's explicit deny (every origin, every mode, kept when the mode
       // becomes "all"). Narrowing only. A re-enable never broadens consent: that needs a confirmed write.
       // Ordered controls: an applied disable is the newest intent, so it denies (also over an earlier allow).
@@ -957,19 +962,23 @@ export function createIngestApp(deps: IngestAppDeps) {
       // Every cheap refusal before any S3 write.
       const ordered=identity.control;
       if(ordered&&(ordered.kind!=="reset"||!deps.deliver.ledger.applyOrderedControl))throw new IngestUnavailable("fence","control_unavailable");
-      if(ordered&&deps.s3FenceMirror&&!deps.s3FenceMirror.applyOrderedControl)throw new IngestUnavailable("fence","control_unavailable");
-      // 0005: the reset lands in the S3 fence before SQL (idempotent by request id; ordered through the fence's
-      // mark for an ordered control, so a stale one writes nothing), inside the privacy-journal bracket: a journal
-      // refusal changes nothing in S3. An S3 failure leaves the journal mark pending (conservative: TTL, then SQL
-      // resolves it on the retry), never settled.
-      const mirrorReset=()=>mirrorFence<unknown>(identity.orgId,():Promise<unknown>=>ordered
-        ?deps.s3FenceMirror!.applyOrderedControl!({tenant,requestId:input.request_id,control:{...ordered,kind:"reset"}})
-        :deps.s3FenceMirror!.resetUploadedSessions(tenant,input.request_id));
+      // 0005: inside the privacy-journal bracket, so a journal refusal changes nothing in S3. An S3 failure leaves
+      // the journal mark pending (conservative: TTL, then SQL resolves it on the retry), never settled.
+      const mirror=deps.s3FenceMirror;
       if(ordered){
         const control=ordered;
-        const result=await journal(async()=>{await mirrorReset();return orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({tenant,requestId:input.request_id,control:{...control,kind:"reset"},...(custody?{custody}:{})}),control);},(r)=>r.control.outcome);
+        const s3Input={tenant,requestId:input.request_id,control:{...control,kind:"reset" as const}};
+        const result=await journal(async()=>{
+          // SQL decides; S3 follows its verdict. The reset is pending in S3 (every claim refused) while SQL decides.
+          await mirrorFence(identity.orgId,()=>mirror!.beginOrdered(s3Input));
+          let r;
+          try{r=orderedControlResult(await deps.deliver.ledger.applyOrderedControl!({...s3Input,...(custody?{custody}:{})}),control);}
+          catch(error){if(definitelyNotApplied(error))await mirrorFence(identity.orgId,()=>mirror!.abortOrdered(s3Input));throw error;}
+          await mirrorFence(identity.orgId,()=>mirror!.finishOrdered(s3Input,r.control.outcome));
+          return r;
+        },(r)=>r.control.outcome);
         deleted=result.deleted!;controlAck=result.control;custodyHeader(c,result.custodyAck);
-      }else deleted=await journal(async()=>{await mirrorReset();return deps.deliver.ledger.resetUploadedSessions(tenant,input.request_id);},()=>"applied");
+      }else deleted=await journal(async()=>{await mirrorFence(identity.orgId,()=>mirror!.resetUploadedSessions(tenant,input.request_id));return deps.deliver.ledger.resetUploadedSessions(tenant,input.request_id);},()=>"applied");
       emit({ route: "delivery.sessions.reset", outcome: controlAck?"control_"+controlAck.outcome:"reset", org_id: identity.orgId, deleted });
       return c.json({ reset: true, deleted,...(controlAck?{control:controlAck}:{}) });
     } catch (error) {

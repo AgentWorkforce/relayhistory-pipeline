@@ -146,10 +146,19 @@ Migration `supabase/migrations/20261104022000_session_ingest_ledger.sql`. It nev
   - Unset, empty or `off`: no S3 write, unchanged. `on`: the selection and reset routes also write the S3 upload fence that the direct-upload consumers (`ledger-s3.ts`) and the backlog drain read. Any other value refuses startup.
   - The Cloudflare stack input is `sessionIngest.s3FenceMirror: "on"`; omitted renders no var.
   - Turning it on needs Khaliq's OK. It needs the Worker's S3 credential to reach the per-user admission directory (Get and conditional Put, plus ListBucket on `…/ledger/owners/`). It is a precondition (`controlMirror: "on"`) of the fence-authority marker.
-  - Every refusal (control kind, journal) runs before any S3 write, and on journaled routes the S3 write runs inside the privacy-journal bracket.
-  - **Disable and reset:** S3 first, then SQL. A failed S3 write fails the control (503 `s3_fence_unavailable`), SQL is never called, and the ledger's code is logged (route `delivery.s3_fence_mirror`). An id the fence refuses is a 400.
-  - **Re-enable:** after SQL, and never for a stale ordered control.
-  - **Ordered controls** go through the fence's own ordered mark (`applyOrderedControl`), so a stale control writes nothing to S3 and a late lower version can never lift or set a tombstone.
+  - The route's own refusals (control kind, privacy journal) run before any S3 write, and on journaled routes the S3 write runs inside the privacy-journal bracket. SQL's refusals of an ordered control (version gap, foreign epoch, digest) come from SQL itself, after the S3 pending write described below.
+  - A failed S3 write fails the control (503 `s3_fence_unavailable`), and the ledger's code is logged (route `delivery.s3_fence_mirror`). An id the fence refuses is a 400.
+  - **Unordered controls:** a disable or reset writes S3 first, then SQL (SQL is never called after an S3 failure). A re-enable writes S3 after SQL.
+  - **Ordered controls (`identity.control`): SQL is the ordering authority, and S3 follows its verdict** (`ledger-s3.ts` `s3ControlMirror`). S3 never judges order itself: its view of the control head can lag SQL's, and it cannot check SQL's epoch or digest rules.
+    - **A disable or reset is first pending in S3** (`beginOrdered`). Admission treats a pending disable's sessions as deleted, and refuses every claim (a retry) while a reset is pending. This keeps S3 fail closed while SQL decides.
+    - **Then SQL applies or refuses it:**
+      - Applied or replay: the effect lands (`finishOrdered`).
+      - Stale: nothing lands.
+      - A definite refusal (a SQLSTATE: gap, epoch, digest): the pending entry is removed and nothing else changes (`abortOrdered`). A refused control therefore never wedges the legitimate one.
+      - An ambiguous failure: the entry stays pending (fail closed) until the retry's verdict.
+    - **A re-enable** lands in S3 only after SQL applied or replayed it.
+    - **Finalisation keeps per-session order.** An effect lands only if the control is newer than the last one applied to that session, and an enable never lands under a newer ordered reset.
+    - The result: S3 is never live where SQL is deleted. S3 may stay deleted where SQL is live only while a control is pending or a write failed, until the retry.
   - **A reset only begins in S3** (one fence CAS, no listing), so it fits the subrequest budget however many sessions the user has. The next S3-ledger claim for the user finishes it. Until then nothing is forgotten (the fence's `resetsCompleted`).
 - **Acquisition owner (dormant):** an enrolled `(org, workspace, source)` admits only the grant-holding owner of each session, and the edge answers a refusal with a typed 409. Nothing is enrolled and the switch is off. See `docs/ingest-acquisition-owner.md`.
 

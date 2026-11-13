@@ -9,7 +9,7 @@ import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import { createIngestApp, SYNC_SCOPE } from "../app.ts";
 import type { Ledger, LedgerTenant, OrderedControlInput, SelectionInput } from "../ledger.ts";
 import type { OrderedControlResult } from "../control-protocol.ts";
-import { s3Ledger, s3LedgerKeys } from "../ledger-s3.ts";
+import { s3ControlMirror, s3Ledger, s3LedgerKeys, type S3FenceMirror } from "../ledger-s3.ts";
 import { journalKey } from "../async-admission.ts";
 import { s3FenceMirrorFlag } from "../worker.ts";
 import { MemoryLedger, SIGNING_KEY, TENANT, batch, scratchStore, signedHeaders } from "./support.ts";
@@ -28,18 +28,18 @@ function setup(mirror: "s3" | "failing" | "off", ledger = new MemoryLedger(), mi
   ledger.setSessionUploads = async (i: SelectionInput) => { order.push(`sql:${i.enabled ? "enable" : "disable"}`); return sqlSelect(i); };
   const sqlReset = ledger.resetUploadedSessions.bind(ledger);
   ledger.resetUploadedSessions = async (t: LedgerTenant, r: string) => { order.push("sql:reset"); return sqlReset(t, r); };
-  const real = s3Ledger(s.store, ROOT, mirrorOpts);
+  const real = mirrorOpts.resetBeginOnly === undefined ? s3ControlMirror(s.store, ROOT) : s3Ledger(s.store, ROOT, mirrorOpts);
   const logs: Record<string, unknown>[] = [];
-  const s3FenceMirror: Pick<Ledger, "setSessionUploads" | "resetUploadedSessions" | "applyOrderedControl"> = mirror === "failing"
-    ? { setSessionUploads: async () => { order.push("s3:fail"); throw new Error("secret store path"); }, resetUploadedSessions: async () => { order.push("s3:fail"); throw new Error("x"); },
-        applyOrderedControl: async () => { order.push("s3:fail"); throw new Error("x"); } }
+  const kindOf = (i: OrderedControlInput) => "requestId" in i ? "reset" : i.enabled ? "enable" : "disable";
+  const fail = async (): Promise<never> => { order.push("s3:fail"); throw new Error("secret store path"); };
+  const ordered = real as S3FenceMirror;
+  const s3FenceMirror: S3FenceMirror = mirror === "failing"
+    ? { setSessionUploads: fail, resetUploadedSessions: fail, beginOrdered: fail, abortOrdered: fail, finishOrdered: fail }
     : { setSessionUploads: async (i) => { order.push(`s3:${i.enabled ? "enable" : "disable"}`); return real.setSessionUploads(i); },
         resetUploadedSessions: async (t, r) => { order.push("s3:reset"); return real.resetUploadedSessions(t, r); },
-        applyOrderedControl: async (i: OrderedControlInput) => {
-          const r = await real.applyOrderedControl!(i);
-          order.push(`s3:ordered:${"requestId" in i ? "reset" : i.enabled ? "enable" : "disable"}:v${i.control.version}:${r.control.outcome}`);
-          return r;
-        } };
+        beginOrdered: async (i) => { order.push(`s3:begin:${kindOf(i)}:v${i.control.version}`); return ordered.beginOrdered(i); },
+        abortOrdered: async (i) => { order.push(`s3:abort:${kindOf(i)}:v${i.control.version}`); return ordered.abortOrdered(i); },
+        finishOrdered: async (i, outcome) => { order.push(`s3:ordered:${kindOf(i)}:v${i.control.version}:${outcome}`); return ordered.finishOrdered(i, outcome); } };
   const app = createIngestApp({ deliver: { ledger, target: { store: s.store, keyRoot: ROOT } }, log: (f) => void logs.push(f), signingKey: SIGNING_KEY, ...(mirror === "off" ? {} : { s3FenceMirror }), ...appExtra });
   const post = async (path: string, value: unknown, identity: Record<string, unknown> = { ...TENANT, scopes: [SYNC_SCOPE] }) => {
     const body = JSON.stringify(value);
@@ -86,7 +86,8 @@ describe("s3FenceMirror", () => {
     await post("/v1/delivery/sessions/selection", await selection(false));
     const res = await post("/v1/delivery/sessions/selection", await selection(true), { ...TENANT, scopes: [SYNC_SCOPE], control });
     expect(res.status).toBe(200);
-    expect(order).toEqual(["s3:disable", "sql:disable"]);
+    // SQL's verdict (stale) is mirrored, and lands nothing.
+    expect(order).toEqual(["s3:disable", "sql:disable", "s3:ordered:enable:v3:stale"]);
     expect((await fence(store)).deleted).toEqual({ "origin-1": [["claude", "s1"]] });
   });
 
@@ -96,7 +97,8 @@ describe("s3FenceMirror", () => {
     expect((await post("/v1/delivery/sessions/reset", body)).status).toBe(200);
     expect((await post("/v1/delivery/sessions/reset", body)).status).toBe(200);
     expect(order).toEqual(["s3:reset", "sql:reset", "s3:reset", "sql:reset"]);
-    expect(await fence(store)).toMatchObject({ resets: 1, resetRequests: { "req-1": 0 } });
+    // The Worker's mirror only begins a reset (the next S3-ledger claim finishes it).
+    expect(await fence(store)).toMatchObject({ resets: 1, resetsCompleted: 0, resetRequests: { "req-1": null } });
   });
 
   test("absent (the default): no S3 fence object is written", async () => {
@@ -148,7 +150,8 @@ describe("s3FenceMirror: ordered controls go through the fence's ordered mark (r
     expect((await post("/v1/delivery/sessions/selection", await selection(true), as(ctl("5")))).status).toBe(200);
     expect(sql.deleted.has("s1")).toBe(true);
     expect((await fence(env.store)).deleted).toEqual({ "origin-1": [["claude", "s1"]] });
-    expect(env.order).toContain("s3:ordered:enable:v5:stale");
+    // SQL applied v5 before v6; S3 keeps per-session order, so v5's late lift does not land under v6.
+    expect(env.order).toContain("s3:ordered:enable:v5:applied");
   });
 
   test("P2: a stale ordered disable (after enable v7) writes nothing to S3", async () => {
