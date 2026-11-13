@@ -94,7 +94,7 @@ import { sessionEraseConfig, sessionEraseEnabled, SESSION_ERASE_CONFIG_INVALID, 
 import type { DeliverDeps } from "./deliver.ts";
 import type { AnalyticsPort } from "../shared/analytics.ts";
 import { WORKER_LIMITS } from "../shared/analytics-export.ts";
-import { ingestLedgerMode, s3Ledger } from "./ledger-s3.ts";
+import { ingestLedgerMode, s3ControlMirror } from "./ledger-s3.ts";
 import { AnalyticsConfigError, analyticsConfig, analyticsCounterFields, createAnalyticsSink, type AnalyticsConfig } from "../shared/analytics-config.ts";
 
 interface QueueLike<T> {
@@ -480,7 +480,7 @@ export function ingestApp(env: IngestWorkerEnv, settings: IngestSettings, run: R
     // Only the fence methods are used: the S3 ledger never admits on the Worker (INGEST_LEDGER=s3 refuses here).
     // A reset is BEGUN only (one fence CAS), so it fits any subrequest budget however many sessions the user has;
     // the next S3-ledger claim for the user (or the reset's own retry elsewhere) finishes it (ledger-s3.ts finishResets).
-    ...(settings.s3FenceMirror ? { s3FenceMirror: s3Ledger(target.store, target.keyRoot, { acceptanceMode: "canonical", resetBeginOnly: true }) } : {}),
+    ...(settings.s3FenceMirror ? { s3FenceMirror: s3ControlMirror(target.store, target.keyRoot) } : {}),
   });
 }
 

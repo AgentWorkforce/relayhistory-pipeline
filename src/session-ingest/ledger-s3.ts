@@ -132,6 +132,7 @@ export const fenceAuthorityKey = (keyRoot: string) => `${keyRoot}/.ledger/fence-
 
 type Decision = "apply" | { outcome: "replay" | "stale"; result: number };
 /** An ordered control's dedupe mark. A reset's mark names its request id: only a finish that ran it may close it. */
+export type PendingControl = { kind: "selection"; originId: string; sessions: [string, string][] } | { kind: "reset"; requestId: string };
 interface OrderedMark { epoch: string; version: string; digest: string; kind: "selection" | "reset"; result: number | null; requestId?: string }
 export interface FenceDoc {
   v: 1;
@@ -154,6 +155,15 @@ export interface FenceDoc {
   /** A reset's request id: null while it runs, then the count it tombstoned (a replay answers it). */
   resetRequests: Record<string, number | null>;
   ordered?: OrderedMark;
+  /**
+   * The Worker's fence mirror (s3ControlMirror) with SQL as the ORDERING authority: an ordered disable or reset is
+   * PENDING here from before SQL decides until its verdict lands (key `epoch:version:digest`). Admission treats a
+   * pending disable's sessions as deleted and refuses every claim while a reset is pending (fail closed); a control
+   * SQL refuses is removed with no other effect.
+   */
+  pending?: Record<string, PendingControl>;
+  /** The last ordered control (epoch, version) applied per session, and the last ordered reset: finalisation order. */
+  controlOrder?: { reset?: [string, string]; sessions?: Record<string, Record<string, [string, string]>> };
 }
 /** A fence read: ABSENT (no object) is distinct from a present fence with nothing in it. */
 export type FenceRead = { state: "absent" } | { state: "present"; fence: FenceDoc; version: ObjectVersion };
@@ -244,6 +254,12 @@ export function validFence(v: unknown): v is FenceDoc {
   if (!Object.values(v.deleted).every((list) => Array.isArray(list) && list.every(pairOk))) return false;
   if (!Object.values(v.epochs).every((m) => isObject(m) && Object.entries(m).every(([k, n]) => HEX32.test(k) && count(n)))) return false;
   if (!Object.values(v.resetRequests).every((n) => n === null || count(n))) return false;
+  const ctl = (t: unknown) => Array.isArray(t) && t.length === 2 && str(t[0]) && typeof t[1] === "string" && /^[1-9][0-9]{0,18}$/.test(t[1]);
+  if (v.pending !== undefined && !(isObject(v.pending) && !Object.hasOwn(v.pending, "__proto__") && Object.values(v.pending).every((p) => isObject(p)
+    && ((p.kind === "selection" && mapKey(p.originId) && Array.isArray(p.sessions) && p.sessions.every(pairOk)) || (p.kind === "reset" && mapKey(p.requestId)))))) return false;
+  const co = v.controlOrder;
+  if (co !== undefined && !(isObject(co) && (co.reset === undefined || ctl(co.reset)) && (co.sessions === undefined || (isObject(co.sessions)
+    && !Object.hasOwn(co.sessions, "__proto__") && Object.values(co.sessions).every((m) => isObject(m) && Object.entries(m).every(([k, t]) => HEX32.test(k) && ctl(t))))))) return false;
   const o = v.ordered;
   return o === undefined || (isObject(o) && str(o.epoch) && typeof o.version === "string" && /^[1-9][0-9]{0,18}$/.test(o.version) && str(o.digest)
     && (o.kind === "selection" || o.kind === "reset") && (o.result === null || count(o.result)) && (o.requestId === undefined || mapKey(o.requestId)));
@@ -300,6 +316,18 @@ export function fenceEpoch(fence: FenceDoc, originId: string, sessionKey: string
 export function isDeleted(fence: FenceDoc, originId: string, source: string, sessionId: string): boolean {
   return (own(fence.deleted, originId) ?? []).some(([s, id]) => s === source && id === sessionId);
 }
+/** Every session admission must treat as deleted for an origin: the tombstones plus every pending ordered disable's. */
+export function admissionDeletedPairs(fence: FenceDoc, originId: string): [string, string][] {
+  const out = [...(own(fence.deleted, originId) ?? [])];
+  for (const p of Object.values(fence.pending ?? {})) if (p.kind === "selection" && p.originId === originId) out.push(...p.sessions);
+  return out;
+}
+/** As admission sees it (the drain too): deleted, or named by a pending ordered disable. */
+export function isDeletedForAdmission(fence: FenceDoc, originId: string, source: string, sessionId: string): boolean {
+  return admissionDeletedPairs(fence, originId).some(([s, id]) => s === source && id === sessionId);
+}
+/** A pending ordered reset: admission refuses every claim (a retry) until SQL's verdict lands in the fence. */
+export const hasPendingReset = (fence: FenceDoc) => Object.values(fence.pending ?? {}).some((p) => p.kind === "reset");
 
 export interface FenceChange {
   /** Tombstone these sessions. A NEW deletion bumps the session's epoch; an existing one changes nothing. */
@@ -663,7 +691,7 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
 
   /** Claim steps (b) and (c): the deletion filter, then #250's revision rules over the origin's stored index. */
   async function judge(input: ClaimInput, keys: ReturnType<typeof s3LedgerKeys>, fence: FenceDoc) {
-    const fenced = new Set((own(fence.deleted, input.originId) ?? []).map(([s, id]) => pairId(s, id)));
+    const fenced = new Set(admissionDeletedPairs(fence, input.originId).map(([s, id]) => pairId(s, id)));
     const deleted = batchPairs(input.sessions, input.records).filter(([s, id]) => fenced.has(pairId(s, id)));
     const deletedSet = new Set(deleted.map(([s, id]) => pairId(s, id)));
     const live = input.records.map((r, ord) => ({ ...r, ord })).filter((r) => r.sessionId === null || !deletedSet.has(pairId(r.source, r.sessionId)));
@@ -875,6 +903,8 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
         // (b) + (c): the fence, then the stored revisions of what is left.
         const read = await readFence(keys.fence);
         const fence = admissionView(read);
+        // An ordered reset SQL has not decided yet (s3ControlMirror): no claim until its verdict lands (fail closed).
+        if (hasPendingReset(fence)) throw new LedgerUnavailableError("ledger_control_pending");
         // A reset begun but not finished (it crashed, or is still running): finish it before judging, so a reset is
         // never left half done by a client that stopped retrying, then claim again (backed off, with jitter: many
         // claims may race to finish it). A completion that fails (a corrupt owner stub, a store error) fails only
@@ -903,7 +933,7 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
           const next = admissionView(again);
           if (next.resets !== fence.resets || pairs.some(([s, id]) => {
             const k = sessionKeyHash(s, id);
-            return fenceEpoch(next, input.originId, k) !== fenceEpoch(fence, input.originId, k) || isDeleted(next, input.originId, s, id) !== isDeleted(fence, input.originId, s, id);
+            return fenceEpoch(next, input.originId, k) !== fenceEpoch(fence, input.originId, k) || isDeletedForAdmission(next, input.originId, s, id) !== isDeletedForAdmission(fence, input.originId, s, id);
           })) { await backoff(attempt); continue; }
         }
         // (d) The claim; committed at once when nothing needs writing (replay_fast).
@@ -943,7 +973,7 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       // Nothing to recheck only when this is the SAME fence object (instance) at the same version.
       const fencedBy = (read: FenceRead) => {
         const fence = admissionView(read);
-        const deleted = new Set((own(fence.deleted, input.originId) ?? []).map(([s, id]) => pairId(s, id)));
+        const deleted = new Set(admissionDeletedPairs(fence, input.originId).map(([s, id]) => pairId(s, id)));
         if (instanceOf(read) === snapshot.fenceInstance && fence.version === snapshot.fenceVersion) return { fence, fenced: [] as [string, string][], deleted };
         const fenced = pairs.filter(([s, id]) => deleted.has(pairId(s, id)) || fence.resets !== snapshot.resets
           || fenceEpoch(fence, input.originId, sessionKeyHash(s, id)) !== snapshot.epochs[sessionKeyHash(s, id)]);
@@ -1003,6 +1033,104 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       if (!("requestId" in input)) throw new LedgerUnavailableError("ledger_input_refused");
       const r = await applyReset(input.tenant, input.requestId, control);
       return { control: { ...control, outcome: r.outcome }, deleted: r.deleted };
+    },
+  };
+}
+
+/** The Worker's S3 fence mirror (INGEST_S3_FENCE_MIRROR): unordered controls as s3Ledger's, ordered ones by SQL's verdict. */
+export interface S3FenceMirror extends Pick<Ledger, "setSessionUploads" | "resetUploadedSessions"> {
+  /** Before SQL decides an ordered disable or reset: record it PENDING (fail closed for admission). An enable: nothing. */
+  beginOrdered(input: OrderedControlInput): Promise<void>;
+  /** SQL refused the control (definitely not applied): remove its pending entry, no other effect. */
+  abortOrdered(input: OrderedControlInput): Promise<void>;
+  /** SQL's verdict: applied or replay lands the effect (per-session order kept), stale lands nothing; pending removed. */
+  finishOrdered(input: OrderedControlInput, outcome: "applied" | "replay" | "stale"): Promise<void>;
+}
+
+/**
+ * The Worker's S3 fence mirror while SQL stays the Worker's ledger (decision 0005 "Controls"). For ORDERED controls
+ * SQL is the ordering authority (gap, epoch, digest: ingest_apply_ordered_control), and S3 only ever follows SQL's
+ * verdict, so S3 is never live where SQL is deleted:
+ *
+ *   disable / reset   beginOrdered (S3, pending: admission treats the sessions as deleted / refuses every claim)
+ *                     -> SQL -> finishOrdered with SQL's outcome, or abortOrdered when SQL refused it definitely.
+ *                     An ambiguous SQL failure leaves it pending (fail closed) until the retry's verdict.
+ *   enable            SQL -> finishOrdered (a lift lands only for applied / replay).
+ *
+ * Finalisation keeps per-session order: a session's effect lands only if the control is newer (same epoch, higher
+ * version; another epoch counts as newer) than the last one applied to that session, and an enable never lands
+ * under a newer ordered reset. A reset only BEGINS here (resetBeginOnly: one CAS, the Worker's subrequest budget);
+ * the next S3-ledger claim finishes it. Unordered controls are s3Ledger's (S3 first for a disable or reset).
+ */
+export function s3ControlMirror(store: ObjectStore, keyRoot: string, opts: Omit<S3LedgerOptions, "acceptanceMode" | "resetBeginOnly"> = {}): S3FenceMirror {
+  const ledger = s3Ledger(store, keyRoot, { ...opts, acceptanceMode: "canonical", resetBeginOnly: true });
+  const io = s3LedgerObjects(store, keyRoot, opts);
+  const nowMs = opts.nowMs ?? Date.now;
+  const parse = (input: OrderedControlInput) => {
+    let control: OrderedControl;
+    try { control = orderedControl(input.control); } catch { throw new LedgerUnavailableError("ledger_input_refused"); }
+    if ("requestId" in input ? (control.kind !== "reset" || !mapKey(input.requestId))
+      : (control.kind !== "selection" || !mapKey(input.originId) || !Array.isArray(input.sessions) || !input.sessions.every(pairOk) || typeof input.enabled !== "boolean"))
+      throw new LedgerUnavailableError("ledger_input_refused");
+    return { control, key: `${control.epoch}:${control.version}:${control.digest}`, fenceKey: io.keysFor(input.tenant).fence };
+  };
+  const newer = (a: [string, string], b: [string, string] | undefined) => !b || a[0] !== b[0] || BigInt(a[1]) > BigInt(b[1]);
+  return {
+    setSessionUploads: (input) => ledger.setSessionUploads(input),
+    resetUploadedSessions: (tenant, requestId) => ledger.resetUploadedSessions(tenant, requestId),
+    async beginOrdered(input) {
+      const { key, fenceKey } = parse(input);
+      if (!("requestId" in input) && input.enabled) return;
+      const entry: PendingControl = "requestId" in input ? { kind: "reset", requestId: input.requestId } : { kind: "selection", originId: input.originId, sessions: input.sessions.map(([a, b]) => [a, b]) };
+      await io.editFence(fenceKey, (f) => {
+        if (f.pending && Object.hasOwn(f.pending, key)) return { next: null, result: undefined };
+        (f.pending ??= {})[key] = entry;
+        return { next: f, result: undefined };
+      });
+    },
+    async abortOrdered(input) {
+      const { key, fenceKey } = parse(input);
+      if (!("requestId" in input) && input.enabled) return;
+      await io.editFence(fenceKey, (f) => {
+        if (!f.pending || !Object.hasOwn(f.pending, key)) return { next: null, result: undefined };
+        delete f.pending[key];
+        return { next: f, result: undefined };
+      });
+    },
+    async finishOrdered(input, outcome) {
+      const { control, key, fenceKey } = parse(input);
+      const at: [string, string] = [control.epoch, control.version];
+      const atMs = nowMs();
+      await io.editFence(fenceKey, (f) => {
+        let changed = false;
+        if (f.pending && Object.hasOwn(f.pending, key)) { delete f.pending[key]; changed = true; }
+        if (outcome === "stale") return { next: changed ? f : null, result: undefined };
+        const order = (f.controlOrder ??= {});
+        if ("requestId" in input) {
+          if (!Object.hasOwn(f.resetRequests, input.requestId)) { applyFenceChange(f, { reset: { requestId: input.requestId, atMs, result: null } }); changed = true; }
+          if (newer(at, order.reset)) { order.reset = at; changed = true; }
+          return { next: changed ? f : null, result: undefined };
+        }
+        const sessions = (order.sessions ??= {});
+        const perOrigin = Object.hasOwn(sessions, input.originId) ? sessions[input.originId]! : (sessions[input.originId] = {});
+        const land: [string, string][] = [];
+        for (const [src, id] of input.sessions) {
+          const k = sessionKeyHash(src, id);
+          if (!newer(at, own(perOrigin, k))) continue; // this control (a replay) or a newer one already landed for the session
+          if (input.enabled && order.reset && !newer(at, order.reset)) { perOrigin[k] = at; changed = true; continue; } // a newer reset
+          perOrigin[k] = at;
+          land.push([src, id]);
+          changed = true;
+        }
+        if (land.length) {
+          if (input.enabled) {
+            const lift = new Set(land.map(([a, b]) => pairId(a, b)));
+            const after = (own(f.deleted, input.originId) ?? []).filter(([a, b]) => !lift.has(pairId(a, b)));
+            if (after.length) f.deleted[input.originId] = after; else delete f.deleted[input.originId];
+          } else applyFenceChange(f, { deletions: [{ originId: input.originId, sessions: land }] });
+        }
+        return { next: changed ? f : null, result: undefined };
+      });
     },
   };
 }
