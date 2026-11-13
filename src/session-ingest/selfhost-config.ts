@@ -91,8 +91,17 @@
  * batch is written inline, see selfhost-server.ts), INGEST_REPLICA_MODE other than off,
  * INGEST_CUSTODY_SOURCE other than relayhistory/unset, INGEST_PRIVACY_AUTHORITY other than neon/unset,
  * INGEST_SIGNING_KEY (the relayhistory HMAC is never accepted here).
+ *
+ *   INGEST_LEDGER                    unset | "" | "sql" (default: ledger-sql.ts, unchanged) | "s3" (decision 0005:
+ *                                    every admission, the consumer and the selection / reset fences through
+ *                                    ledger-s3.ts, no SQL for upload accounting). s3 refuses the per-session erase
+ *                                    route, the operator erase runtime and INGEST_UPLOAD_CONSENT other than off.
+ *                                    Until the read side moves, s3 controls also write SQL upload_deletions (S3
+ *                                    first; ledger-s3.ts withSqlControlMirror). With HISTORY_UPLOAD_DIRECT on, no
+ *                                    admission at all until the fence-authority marker exists (FenceAuthorityDoc).
  */
 import { UPLOAD_CONSENT_VAR, uploadConsentEnforcement, type UploadConsentEnforcement } from "./upload-consent.ts";
+import { INGEST_LEDGER_VAR, ingestLedgerMode } from "./ledger-s3.ts";
 import type { CapturePolicyUploadsMode } from "./capture-policy.ts";
 import { assertDestinationUrl, destinationPolicy } from "../shared/destination-url.ts";
 import { normalizedAudience } from "@rhc/auth/relaycontrol.ts";
@@ -157,6 +166,8 @@ export interface SelfhostIngestSettings {
   eraseBytesEnabled?: true;
   /** Present only for SELFHOST_INGEST_ADMISSION=async|drain. */
   admission?: SelfhostAdmissionSettings;
+  /** INGEST_LEDGER=s3 (decision 0005): every admission and fence through ledger-s3.ts. Absent: the SQL ledger. */
+  ledger?: "s3";
   /** HISTORY_UPLOAD_DIRECT allowlist|on (upload-admission.ts). Absent: off, nothing reads the upload prefix. */
   uploadDirect?: SelfhostUploadDirectSettings;
   /** ANALYTICS_* (src/shared/analytics-config.ts, self-host profile: noop or collector). Absent = noop. */
@@ -301,6 +312,23 @@ function refuseHostedOnly(env: NodeJS.ProcessEnv): void {
   if (set("INGEST_SIGNING_KEY")) refuse("INGEST_SIGNING_KEY", "the relayhistory HMAC identity is never accepted here");
 }
 
+/**
+ * INGEST_LEDGER (decision 0005): sql (unset, the default: unchanged) or s3. With s3 this process's ONE ledger is
+ * ledger-s3.ts: the synchronous path, the async consumer, upload-inbox promotion and the selection / reset routes
+ * all admit and fence through S3, and the database is never called for upload accounting. Refused with s3: the
+ * features whose state is SQL-only (the per-session erase ledger, the operator erase runtime, upload consent).
+ */
+function selfhostLedger(env: NodeJS.ProcessEnv, s: { sessionSelection: boolean; sessionErase: { enabled: boolean }; uploadConsent: UploadConsentEnforcement; eraseRuntime: { eraseFenceEnforced?: true; eraseBytesEnabled?: true } }): "s3" | undefined {
+  let mode;
+  try { mode = ingestLedgerMode(env[INGEST_LEDGER_VAR]?.trim() === "" ? undefined : env[INGEST_LEDGER_VAR]?.trim()); } catch { throw new Error(`96bulls: ${INGEST_LEDGER_VAR} must be sql or s3`); }
+  if (mode === "sql") return undefined;
+  const refuse = (what: string) => { throw new Error(`96bulls: ${INGEST_LEDGER_VAR}=s3 refuses ${what} (its state is SQL-only)`); };
+  if (s.sessionSelection) refuse("RELAYHISTORY_SELFHOST_SESSION_SELECTION");
+  if (s.sessionErase.enabled || s.eraseRuntime.eraseFenceEnforced || s.eraseRuntime.eraseBytesEnabled) refuse("the operator session erase");
+  if (s.uploadConsent !== "off") refuse(UPLOAD_CONSENT_VAR);
+  return "s3";
+}
+
 /** Parse everything once at startup. Errors name the variable, never its value. */
 export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): SelfhostIngestConfig {
   if (!selfhostIngestEnabled(env)) return { enabled: false, port: port(env) };
@@ -329,6 +357,7 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
   const admission = selfhostAdmissionSettings(env);
   const eraseRuntime = eraseRuntimeSettings(env, sessionErase, admission);
   const uploadDirect = selfhostUploadDirectSettings(env, keyRoot, admission);
+  const ledger = selfhostLedger(env, { sessionSelection, sessionErase, uploadConsent, eraseRuntime });
   const analytics = analyticsConfig(env, "selfhost");
   const claimLockBusy = routingFlag(env[SELFHOST_CLAIM_LOCK_BUSY_VAR]);
   return {
@@ -352,5 +381,6 @@ export function selfhostIngestConfig(env: NodeJS.ProcessEnv = process.env): Self
     ...(uploadDirect ? { uploadDirect } : {}),
     ...(analytics.sink !== "noop" ? { analytics } : {}),
     ...(claimLockBusy ? { claimLockBusy: true as const } : {}),
+    ...(ledger ? { ledger } : {}),
   };
 }

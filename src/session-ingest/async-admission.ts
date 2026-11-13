@@ -122,11 +122,15 @@ export function inboxKey(keyRoot: string, tenant: LedgerTenant, originId: string
   return `${receiptDir(keyRoot, tenant, originId, receiptId)}/a=${String(receivedAtMs).padStart(15, "0")}-${nonce}.ndjson.zst`;
 }
 export const outcomeKey = (dir: string, outcome: "admitted" | "refused") => `${dir}/outcome-${outcome}.json`;
-const userDir = (keyRoot: string, tenant: LedgerTenant) =>
+/**
+ * Per (org, workspace, user): the admission directory that holds the privacy journal and, under decision
+ * 0005, the S3 upload ledger (ledger-s3.ts). Never desktop-writable.
+ */
+export const admissionUserDir = (keyRoot: string, tenant: LedgerTenant) =>
   inboxDir(keyRoot, tenant, `srv_${sha256Hex(JSON.stringify(["admission-user-v1", tenant.workspaceId, tenant.userId])).slice(0, 32)}`);
 /** Per (org, workspace, user): the privacy journal every reset / re-enable brackets. */
 export function journalKey(keyRoot: string, tenant: LedgerTenant): string {
-  return `${userDir(keyRoot, tenant)}/privacy-journal.json`;
+  return `${admissionUserDir(keyRoot, tenant)}/privacy-journal.json`;
 }
 // ---- inbox object ----
 

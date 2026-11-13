@@ -18,7 +18,9 @@
  *                         inbox objects, promote through the srv-writer layout `.admission-inbox` and
  *                         `m=srv_*`), the key (uploadInboxKeyStatements), the queue and its secret.
  *   upload-admission-secret  Secrets Manager container `96bulls/<stage>/upload-admission` (value set out
- *                         of band from 1Password: UPLOAD_WITNESS_KEY and the Cloudflare Queues token).
+ *                         of band from 1Password: UPLOAD_WITNESS_KEY only).
+ *                         Decision 0005: the consumer admits itself with the S3 upload ledger
+ *                         (INGEST_LEDGER=s3, src/session-ingest/ledger-s3.ts): no Cloudflare queue, no SQL.
  *   upload-admission      SQS queue + DLQ (S3 events from this bucket only), DLQ depth alarm.
  *   bucket notification   Id `96bulls-upload-inbox`, written together with the manifests rule by
  *                         scripts/sessions-prod-bucket-notification.sh (one Put owns both Ids).
@@ -200,12 +202,20 @@ export function desktopUploadPolicy(i: { bucketArn: string; accountId: string; r
  * SseHeaderMustNameThisKey refuse anything else. Deletes stay inbox-only (OnlyTheEraserDeletes and the inbox
  * wall), and the explicit deny keeps version history and bucket administration out of reach.
  */
+/**
+ * The fence-authority marker the consumer reads before it admits (decision 0005, ledger-s3.ts fenceAuthorityKey and
+ * FenceAuthorityDoc; INGEST_KEY_ROOT is TENANT_KEY_BASE). Read only: an operator writes it, never this role.
+ */
+export const FENCE_AUTHORITY_MARKER_KEY = `${TENANT_KEY_BASE}/.ledger/fence-authority.json`;
+
 export function uploadAdmissionBucketStatements(i: { bucketArn: string; consumerRoleArn: string; promotionObjects: string[] }) {
   const inbox = uploadInboxObjects(i.bucketArn);
   const principal = { AWS: i.consumerRoleArn };
   return [
     { Sid: "UploadAdmissionReadsTombstonesDeletesUploads", Effect: "Allow" as const, Principal: principal, Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"], Resource: [inbox] },
     { Sid: "UploadAdmissionPromotes", Effect: "Allow" as const, Principal: principal, Action: ["s3:GetObject", "s3:PutObject"], Resource: i.promotionObjects },
+    // Exactly the one marker key, GET only (no wildcard): without it every record is a retry (fails closed).
+    { Sid: "UploadAdmissionReadsFenceAuthority", Effect: "Allow" as const, Principal: principal, Action: ["s3:GetObject"], Resource: [`${i.bucketArn}/${FENCE_AUTHORITY_MARKER_KEY}`] },
     // Missing keys must answer 404 (create-only reads, the status object), as for the srv-writer: key names only.
     { Sid: "UploadAdmissionListsForMissingKeys", Effect: "Allow" as const, Principal: principal, Action: ["s3:ListBucket"], Resource: [i.bucketArn] },
     {
@@ -339,43 +349,37 @@ export function uploadInboxQueueConfiguration(queueArn: string) {
  *   allowlist           allowlist only (and required then): `org:<id>` / `ws:<id>` entries
  *                       (HISTORY_UPLOAD_DIRECT_ALLOWLIST). It must match the issuer's allowlist: a tenant the
  *                       consumer excludes waits (retry, then the DLQ), never refuses.
- *   cloudflareAccountId the Cloudflare account that owns the ingest Worker's admission queue (32 hex).
- *   admissionQueueId    the id (32 hex, not the name) of `96bulls-session-ingest-admission` in that account.
  *
- * Not inputs: UPLOAD_WITNESS_KEY and the Cloudflare Queues token live in the `upload-admission-secret`
- * container, set out of band (never in env, state or source).
+ * Not inputs: UPLOAD_WITNESS_KEY lives in the `upload-admission-secret` container, set out of band (never in
+ * env, state or source). Decision 0005 removed the Cloudflare queue hand-off: the consumer admits itself.
  */
 export interface UploadAdmissionInputs {
   direct: "off" | "allowlist" | "on";
   allowlist?: string[];
-  cloudflareAccountId: string;
-  admissionQueueId: string;
 }
 
 const ALLOWLIST_ENTRY = /^(org|ws):(?!\.)[A-Za-z0-9._-]{1,128}$/;
-const HEX32 = /^[0-9a-f]{32}$/;
 
 export function assertUploadAdmissionInputs(value: unknown, required: boolean, refuse: (why: string) => never): asserts value is UploadAdmissionInputs | undefined {
   if (value === undefined) {
-    if (required) refuse("transcriptStore.uploadAdmission is required (direct, cloudflareAccountId, admissionQueueId)");
+    if (required) refuse("transcriptStore.uploadAdmission is required (direct)");
     return;
   }
   if (value === null || typeof value !== "object" || Array.isArray(value)) return refuse("transcriptStore.uploadAdmission must be an object");
   const v = value as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "direct" && k !== "allowlist" && k !== "cloudflareAccountId" && k !== "admissionQueueId") refuse(`transcriptStore.uploadAdmission.${k} is not a known setting`);
+    if (k !== "direct" && k !== "allowlist") refuse(`transcriptStore.uploadAdmission.${k} is not a known setting`);
   if (v.direct !== "off" && v.direct !== "allowlist" && v.direct !== "on") refuse('transcriptStore.uploadAdmission.direct must be "off", "allowlist" or "on"');
   if (v.direct === "allowlist") {
     if (!Array.isArray(v.allowlist) || v.allowlist.length === 0 || v.allowlist.length > 100 || !v.allowlist.every((e) => typeof e === "string" && ALLOWLIST_ENTRY.test(e)) || new Set(v.allowlist).size !== v.allowlist.length)
       refuse("transcriptStore.uploadAdmission.allowlist must be 1-100 distinct org:<id> / ws:<id> entries with direct \"allowlist\"");
   } else if (v.allowlist !== undefined) refuse('transcriptStore.uploadAdmission.allowlist is only for direct "allowlist"');
-  if (typeof v.cloudflareAccountId !== "string" || !HEX32.test(v.cloudflareAccountId)) refuse("transcriptStore.uploadAdmission.cloudflareAccountId must be a 32-hex Cloudflare account id");
-  if (typeof v.admissionQueueId !== "string" || !HEX32.test(v.admissionQueueId)) refuse("transcriptStore.uploadAdmission.admissionQueueId must be the 32-hex Cloudflare queue id");
 }
 
 /**
  * The consumer's environment: settings and ids only (src/session-ingest/upload-admission-hosted.ts reads them).
- * HISTORY_UPLOAD_INBOX_SSE comes from uploadAdmissionEnvironment (always aws:kms on hosted).
+ * HISTORY_UPLOAD_INBOX_SSE comes from uploadAdmissionEnvironment (always aws:kms on hosted). INGEST_LEDGER is
+ * always s3: the consumer refuses to start with anything else (decision 0005).
  */
 export function uploadAdmissionFunctionEnv(i: { stage: string; bucket: string; names: UploadInboxNames; p: UploadAdmissionInputs; sse: typeof HOSTED_UPLOAD_INBOX_SSE }) {
   return {
@@ -385,10 +389,8 @@ export function uploadAdmissionFunctionEnv(i: { stage: string; bucket: string; n
     ...uploadAdmissionEnvironment(i.sse),
     UPLOAD_ADMISSION_BUCKET: i.bucket,
     UPLOAD_ADMISSION_SECRET_ID: i.names.secret,
-    UPLOAD_ADMISSION_CF_ACCOUNT_ID: i.p.cloudflareAccountId,
-    UPLOAD_ADMISSION_CF_QUEUE_ID: i.p.admissionQueueId,
     INGEST_KEY_ROOT: TENANT_KEY_BASE,
-    INGEST_ACCEPTANCE_MODE: "buffered",
+    INGEST_LEDGER: "s3",
     NODE_OPTIONS: "--enable-source-maps",
   };
 }

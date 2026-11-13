@@ -89,6 +89,8 @@ import { promoteUpload } from "./upload-admission.ts";
 import type { DeliverDeps } from "./deliver.ts";
 import { selfhostAdmissionConsumer, type SelfhostAdmissionConsumer, type SelfhostAdmissionOptions, type SelfhostAdmissionStatus } from "./selfhost-admission.ts";
 import { sqlLedger } from "./ledger-sql.ts";
+import { s3Ledger, withSqlControlMirror } from "./ledger-s3.ts";
+import type { Ledger } from "./ledger.ts";
 import type { SqlRun } from "./ledger-sql.ts";
 import { relaycontrolIngestIdentity, selfhostIntrospector } from "./selfhost-auth.ts";
 import { SELFHOST_INGEST_ROLE, selfhostIngestConfig, type SelfhostIngestSettings } from "./selfhost-config.ts";
@@ -198,11 +200,28 @@ export interface SelfhostRuntimeOptions {
 }
 
 /** The ingest app over the given parts. Canonical acceptance, inline writes, no fan-out, no replica, no custody. */
-export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect" | "capturePolicyUploads" | "uploadConsent">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
+export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect" | "capturePolicyUploads" | "uploadConsent" | "ledger">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
   const sessionSelection = settings.sessionSelection === true;
   const verified = new WeakMap<Request, IngestIdentity>();
+  // INGEST_LEDGER=s3 (decision 0005, selfhost-config.ts): ONE S3 ledger for the synchronous path, the async
+  // consumer, upload promotion and the selection / reset fences, so no admission or fence decision reads SQL.
+  // The combinations whose state is SQL-only are refused at config; refused again here for direct callers.
+  const s3 = settings.ledger === "s3";
+  if (s3 && (sessionSelection || settings.uploadConsent && settings.uploadConsent !== "off" || parts.withSessionWrites || parts.sessionEraseService))
+    throw new Error("96bulls: INGEST_LEDGER=s3 refuses SQL-only features (session selection erase, operator erase, upload consent)");
+  // With s3, controls ALSO write SQL (after S3) while the read API and the eraser still read upload_deletions
+  // (ledger-s3.ts withSqlControlMirror); claims and commits never do. Built lazily: only a control reaches SQL.
+  // With direct upload admission on, no admission until the fence-authority marker exists (FenceAuthorityDoc).
+  let sqlControls: Ledger | undefined;
+  const sqlControl = (): Ledger => (sqlControls ??= sqlLedger(parts.run, { acceptanceMode: "canonical" }));
+  const ledger: Ledger = s3
+    ? withSqlControlMirror(
+      s3Ledger(parts.store, settings.keyRoot, { acceptanceMode: "canonical", ...(settings.uploadDirect ? { fenceAuthority: "required" as const } : {}) }),
+      { setSessionUploads: (i) => sqlControl().setSessionUploads(i), resetUploadedSessions: (t, r) => sqlControl().resetUploadedSessions(t, r) },
+      parts.store, settings.keyRoot)
+    : sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection });
   const deliver: DeliverDeps = {
-    ledger: sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection }),
+    ledger,
     ...(parts.withSessionWrites ? { withSessionWrites: parts.withSessionWrites } : {}),
     acceptanceMode: "canonical",
     // SCRUB_ENGINE=wasm-bindgen: the sealer bound to the verified instance; otherwise {} (unchanged).
@@ -446,8 +465,9 @@ export function conditionalWriteProbeKey(keyRoot: string, nonce: string = crypto
  * need conditional writes the backend really honours, so prove them once or refuse to start. Sync (the default)
  * never touches the store here.
  */
-export async function admissionStartupGate(settings: Pick<SelfhostIngestSettings, "keyRoot" | "admission">, store: ObjectStore): Promise<void> {
-  if (settings.admission) await assertConditionalWrites(store, conditionalWriteProbeKey(settings.keyRoot));
+export async function admissionStartupGate(settings: Pick<SelfhostIngestSettings, "keyRoot" | "admission"> & Partial<Pick<SelfhostIngestSettings, "ledger">>, store: ObjectStore): Promise<void> {
+  // The S3 ledger (INGEST_LEDGER=s3) is create-only claims and CAS merges throughout: prove them in every mode.
+  if (settings.admission || settings.ledger === "s3") await assertConditionalWrites(store, conditionalWriteProbeKey(settings.keyRoot));
 }
 
 export type RuntimeBuilder = (settings: SelfhostIngestSettings, env: NodeJS.ProcessEnv) => Promise<SelfhostIngestRuntime>;
