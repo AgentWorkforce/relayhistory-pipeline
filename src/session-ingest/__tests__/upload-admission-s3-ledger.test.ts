@@ -36,7 +36,7 @@ const { createUploadAdmissionHandler } = await import("../upload-admission-lambd
 const { hostedUploadAdmissionRuntime } = await import("../upload-admission-hosted.ts");
 const { uploadAdmissionStatus, uploadDirectConfig, uploadStatusKey } = await import("../upload-admission.ts");
 const { journalKey, outcomeKey, receiptDir } = await import("../async-admission.ts");
-const { s3LedgerKeys } = await import("../ledger-s3.ts");
+const { fenceAuthorityKey, s3LedgerKeys } = await import("../ledger-s3.ts");
 const { encodeUploadWitness, parseUploadKey, parseUploadWitnessKey, uploadKeyPrefix, uploadObjectKey, uploadObjectSha256Hex } = await import("../upload-inbox-contract.ts");
 const { prepareDelivery } = await import("../vendor/delivery/prepare.ts");
 
@@ -76,10 +76,15 @@ async function upload(store: ObjectStore, batchId: string, records = [record({ r
   return { key, batch: b };
 }
 
-function lambda() {
+/** The operator's fence-authority marker (ledger-s3.ts FenceAuthorityDoc): without it nothing is admitted. */
+const writeAuthority = (store: ObjectStore) => store.put(objectKey(fenceAuthorityKey(ROOT)),
+  new TextEncoder().encode(JSON.stringify({ v: 1, fenceBackfill: "complete", controlMirror: "on", rearmSweeper: "live", writtenAtMs: T0 })), { contentType: "application/json" });
+
+function lambda(authority = true) {
   const s = scratchStore();
   cleanups.push(s.done);
   const store = s.store;
+  const authorityWritten = authority ? writeAuthority(store) : Promise.resolve();
   let fetched = 0;
   const lines: Record<string, unknown>[] = [];
   const handler = createUploadAdmissionHandler(hostedUploadAdmissionRuntime({
@@ -88,7 +93,7 @@ function lambda() {
     fetcher: (async () => { fetched++; throw new Error("no network on this path"); }) as never,
     nowMs: () => T0,
   }), (l) => void lines.push(l));
-  return { store, handler, lines, fetched: () => fetched };
+  return { store, handler: async (e: Parameters<typeof handler>[0]) => { await authorityWritten; return handler(e); }, lines, fetched: () => fetched };
 }
 
 describe("upload -> promoteUpload -> inline admission with the S3 ledger (decision 0005)", () => {
@@ -117,8 +122,8 @@ describe("upload -> promoteUpload -> inline admission with the S3 ledger (decisi
     const prepared = await prepareDelivery(TENANT, b);
     const keys = s3LedgerKeys(ROOT, TENANT);
     expect(await json(store, keys.batch("origin-1", "batch-e2e"))).toMatchObject({ state: "committed", digest: prepared.batchDigest, receiptId: prepared.receipt.receiptId });
-    expect(Object.keys((await json(store, keys.revisions("origin-1", "claude", "sess-1"))).records)).toEqual(["r1"]);
-    expect(Object.keys((await json(store, keys.revisions("origin-1", "claude", "sess-2"))).records)).toEqual(["r2"]);
+    expect((await json(store, keys.revisions("origin-1", "r1"))).records.r1.slice(0, 2)).toEqual([1, "r1:r1"]);
+    expect((await json(store, keys.revisions("origin-1", "r2"))).records.r2.slice(0, 2)).toEqual([1, "r2:r1"]);
 
     expect(sqlCalls).toEqual([]);
     expect(fetched()).toBe(0);
@@ -145,6 +150,20 @@ describe("upload -> promoteUpload -> inline admission with the S3 ledger (decisi
     expect(await handler({ Records: [{ messageId: "m4", body: s3Body(third.key) }] })).toEqual({ batchItemFailures: [] });
     expect(await manifests()).toBe(beforeDisabled + 1);
     expect(await json(store, s3LedgerKeys(ROOT, TENANT).batch("origin-1", "batch-b"))).toMatchObject({ state: "committed" });
+    expect(sqlCalls).toEqual([]);
+  });
+
+  test("no fence-authority marker: every record is a retry (never an admit), and the upload stays for redelivery", async () => {
+    const { store, handler, lines } = lambda(false);
+    const { key } = await upload(store, "batch-na");
+    expect(await handler({ Records: [{ messageId: "m1", body: s3Body(key) }] })).toEqual({ batchItemFailures: [{ itemIdentifier: "m1" }] });
+    expect(lines.at(-1)).toMatchObject({ failures: 1, "admission_enqueue_failed:admission_ledger_fence_authority_missing": 1 });
+    expect(await exists(store, key)).toBe(true);
+    expect(await exists(store, s3LedgerKeys(ROOT, TENANT).batch("origin-1", "batch-na"))).toBe(false);
+    expect((await listAll(store, `${ROOT}/${TENANT.orgId}/v1`)).filter((k) => k.endsWith("/manifest.json"))).toEqual([]);
+    await writeAuthority(store);
+    expect(await handler({ Records: [{ messageId: "m2", body: s3Body(key) }] })).toEqual({ batchItemFailures: [] });
+    expect(await exists(store, key)).toBe(false);
     expect(sqlCalls).toEqual([]);
   });
 
@@ -189,6 +208,7 @@ describe("self-host (ingest-edge) with INGEST_LEDGER=s3: the consumer admits thr
     const s = scratchStore();
     cleanups.push(s.done);
     const store = s.store;
+    await writeAuthority(store);
     const runCalls: string[] = [];
     const run = async (text: string) => { runCalls.push(text); throw new Error("SQL runner called on the S3 ledger path"); };
     let consumer: { scan(): Promise<void>; settle(): Promise<void> } | undefined;
@@ -219,6 +239,27 @@ describe("self-host (ingest-edge) with INGEST_LEDGER=s3: the consumer admits thr
     expect(await manifests()).toBe(2);
     expect(await json(store, s3LedgerKeys(ROOT, TENANT).batch("origin-1", "batch-selfhost-2"))).toMatchObject({ state: "committed" });
     expect(runCalls).toEqual([]);
+    expect(sqlCalls).toEqual([]);
+    await runtime.close();
+  });
+
+  test("with direct upload admission and no fence-authority marker, nothing is admitted (the upload waits)", async () => {
+    const { selfhostIngestRuntime } = await import("../selfhost-server.ts");
+    const s = scratchStore();
+    cleanups.push(s.done);
+    const store = s.store;
+    let consumer: { scan(): Promise<void>; settle(): Promise<void> } | undefined;
+    const runtime = selfhostIngestRuntime({
+      keyRoot: ROOT, maxPerUser: 4, maxPerOrg: 16, ledger: "s3",
+      admission: { mode: "async", concurrency: 2, scanIntervalMs: 15_000, maxAttempts: 20 },
+      uploadDirect: { config: uploadDirectConfig({ HISTORY_UPLOAD_DIRECT: "on" }), witnessKey: WITNESS_KEY, scanBatch: 16 },
+    }, { run: (async () => { throw new Error("SQL runner called"); }) as never, store, verify: async () => { throw new Error("unused"); }, ready: async () => true, close: async () => {} },
+    { startConsumer: false, nowMs: () => T0, onConsumer: (c) => { consumer = c; }, log: { info: () => {}, warn: () => {}, error: () => {} } as never });
+    await upload(store, "batch-selfhost-na");
+    await consumer!.scan();
+    await consumer!.settle();
+    expect(await exists(store, s3LedgerKeys(ROOT, TENANT).batch("origin-1", "batch-selfhost-na"))).toBe(false);
+    expect((await listAll(store, `${ROOT}/${TENANT.orgId}/v1`)).filter((k) => k.endsWith("/manifest.json"))).toEqual([]);
     expect(sqlCalls).toEqual([]);
     await runtime.close();
   });

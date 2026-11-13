@@ -89,7 +89,8 @@ import { promoteUpload } from "./upload-admission.ts";
 import type { DeliverDeps } from "./deliver.ts";
 import { selfhostAdmissionConsumer, type SelfhostAdmissionConsumer, type SelfhostAdmissionOptions, type SelfhostAdmissionStatus } from "./selfhost-admission.ts";
 import { sqlLedger } from "./ledger-sql.ts";
-import { s3Ledger } from "./ledger-s3.ts";
+import { s3Ledger, withSqlControlMirror } from "./ledger-s3.ts";
+import type { Ledger } from "./ledger.ts";
 import type { SqlRun } from "./ledger-sql.ts";
 import { relaycontrolIngestIdentity, selfhostIntrospector } from "./selfhost-auth.ts";
 import { SELFHOST_INGEST_ROLE, selfhostIngestConfig, type SelfhostIngestSettings } from "./selfhost-config.ts";
@@ -208,8 +209,19 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   const s3 = settings.ledger === "s3";
   if (s3 && (sessionSelection || settings.uploadConsent && settings.uploadConsent !== "off" || parts.withSessionWrites || parts.sessionEraseService))
     throw new Error("96bulls: INGEST_LEDGER=s3 refuses SQL-only features (session selection erase, operator erase, upload consent)");
+  // With s3, controls ALSO write SQL (after S3) while the read API and the eraser still read upload_deletions
+  // (ledger-s3.ts withSqlControlMirror); claims and commits never do. Built lazily: only a control reaches SQL.
+  // With direct upload admission on, no admission until the fence-authority marker exists (FenceAuthorityDoc).
+  let sqlControls: Ledger | undefined;
+  const sqlControl = (): Ledger => (sqlControls ??= sqlLedger(parts.run, { acceptanceMode: "canonical" }));
+  const ledger: Ledger = s3
+    ? withSqlControlMirror(
+      s3Ledger(parts.store, settings.keyRoot, { acceptanceMode: "canonical", ...(settings.uploadDirect ? { fenceAuthority: "required" as const } : {}) }),
+      { setSessionUploads: (i) => sqlControl().setSessionUploads(i), resetUploadedSessions: (t, r) => sqlControl().resetUploadedSessions(t, r) },
+      parts.store, settings.keyRoot)
+    : sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection });
   const deliver: DeliverDeps = {
-    ledger: s3 ? s3Ledger(parts.store, settings.keyRoot, { acceptanceMode: "canonical" }) : sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection }),
+    ledger,
     ...(parts.withSessionWrites ? { withSessionWrites: parts.withSessionWrites } : {}),
     acceptanceMode: "canonical",
     // SCRUB_ENGINE=wasm-bindgen: the sealer bound to the verified instance; otherwise {} (unchanged).

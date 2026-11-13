@@ -22,8 +22,10 @@
  *
  * Refuses to start (every record fails, then the DLQ) unless INGEST_LEDGER=s3, and with anything this path
  * cannot honour without SQL: buffered acceptance, Babysitter retention routing, a replica, upload consent
- * (its store is SQL) or a non-TypeScript scrub engine. Errors carry codes only: never a secret, key, body or
- * tenant id.
+ * (its store is SQL) or a non-TypeScript scrub engine. And it never ADMITS until an operator has written
+ * `<keyRoot>/.ledger/fence-authority.json` (ledger-s3.ts FenceAuthorityDoc: fence backfill complete, control
+ * mirror on, re-arm sweeper live): until then every record is a retry. Errors carry codes only: never a
+ * secret, key, body or tenant id.
  */
 import { zstdDecompressSync } from "node:zlib";
 import { createS3Store, type ObjectStore } from "../../packages/object-store/src/index.ts";
@@ -139,7 +141,9 @@ export function hostedUploadAdmissionRuntime(overrides: HostedRuntimeOverrides =
     const secret = parseUploadAdmissionSecret(secretText);
     const store = (overrides.store ?? createS3Store)({ bucket: config.bucket, region: config.region, credentials: async () => credentials(), fetch: fetcher });
     const deliver: DeliverDeps = {
-      ledger: s3Ledger(store, config.keyRoot, { acceptanceMode: "canonical" }),
+      // Fail closed: no admission until an operator has written the fence-authority marker (ledger-s3.ts
+      // FenceAuthorityDoc: fence backfill complete, control mirror on, re-arm sweeper live). Every record retries.
+      ledger: s3Ledger(store, config.keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required" }),
       acceptanceMode: "canonical",
       // SCRUB_ENGINE is refused above unless ts, so this is {} today; it stays wired if that ever widens.
       target: { store, keyRoot: config.keyRoot, ...routedRawChunkSealerDeps() },
