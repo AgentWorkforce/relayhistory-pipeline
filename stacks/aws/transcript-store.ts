@@ -70,6 +70,14 @@
  *                              change only alone, as its own "cross-account worker grants" phase, with the
  *                              statements byte-for-byte as built (docs/cross-account-sessions-worker.md).
  *
+ * Backlog-ops workflow roles (decision 0005; stacks/aws/backlog-ops-key-policy.ts), default OFF:
+ *
+ *   transcriptStore.backlogOpsRoles  { readRoleArn, writeRoleArn }: this account's exact
+ *                              96bulls-<stage>-backlog-ops-read/-write roles (created outside the stack). Unset:
+ *                              byte-identical key policy. Set: the key policy also carries their two via-S3
+ *                              statements. The plan contract accepts the change only alone, as its own
+ *                              "backlog ops key grants" phase (docs/backlog-ops-workflow.md).
+ *
  * Pure functions, unit-tested in stacks/aws/__tests__/transcript-store.test.ts;
  * `transcriptStoreStage` declares the resources.
  */
@@ -81,6 +89,7 @@ import { KMS_ADMIN_ACTIONS, denyInsecureTransport, trailKeyPolicy } from "./hard
 import { alchemyStatePrefix } from "./preflight.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
 import { assertBufferedGcRoleArn, bufferedGcBucketStatements, bufferedGcKeyStatements } from "./buffered-gc-policy.ts";
+import { BACKLOG_OPS_KEY_SIDS, assertBacklogOpsRoles, backlogOpsKeyStatements, backlogOpsRoleArns, type BacklogOpsRoles } from "./backlog-ops-key-policy.ts";
 import { CROSS_ACCOUNT_WORKER_BUCKET_SIDS, CROSS_ACCOUNT_WORKER_KEY_SIDS, assertCrossAccountWorkerRoleArn, crossAccountWorkerBucketStatements, crossAccountWorkerKeyStatements } from "./cross-account-worker-policy.ts";
 import {
   UPLOAD_ADMISSION_DLQ_RETENTION,
@@ -164,6 +173,12 @@ export interface TranscriptStoreInputs {
    * policies are byte-for-byte as without it.
    */
   crossAccountWorkerRoleArn?: string;
+  /**
+   * Default off. The guarded `backlog ops` workflow's two roles in THIS account (created outside the stack;
+   * docs/backlog-ops-workflow.md). Present: the key policy also carries exactly their via-S3 statements
+   * (backlog-ops-key-policy.ts). Omit: the key policy is byte-for-byte as without it.
+   */
+  backlogOpsRoles?: BacklogOpsRoles;
   /**
    * Log management events too (default true). Set false only when another trail
    * in the account already logs them (a second copy is billed).
@@ -302,9 +317,10 @@ export function assertTranscriptStoreInputs(
   if (inputs.region !== TRANSCRIPT_REGION) refuse(`transcript content must stay in ${TRANSCRIPT_REGION} (migration plan, regional boundaries), got ${inputs.region}`);
   if (inputs.partition !== TRANSCRIPT_PARTITION) refuse(`partition must be exactly ${TRANSCRIPT_PARTITION}, got ${JSON.stringify(inputs.partition)}`);
   for (const k of Object.keys(store))
-    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "uploadControlRoleArn" && k !== "uploadInboxSse" && k !== "uploadAdmission" && k !== "uploadPresignIssuer" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn" && k !== "crossAccountWorkerRoleArn") refuse(`transcriptStore.${k} is not a known setting`);
+    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "uploadControlRoleArn" && k !== "uploadInboxSse" && k !== "uploadAdmission" && k !== "uploadPresignIssuer" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn" && k !== "crossAccountWorkerRoleArn" && k !== "backlogOpsRoles") refuse(`transcriptStore.${k} is not a known setting`);
   assertBufferedGcRoleArn(store.bufferedGcRoleArn, inputs.accountId);
   if (store.crossAccountWorkerRoleArn !== undefined) assertCrossAccountWorkerRoleArn(store.crossAccountWorkerRoleArn, inputs.accountId);
+  if (store.backlogOpsRoles !== undefined) assertBacklogOpsRoles(store.backlogOpsRoles, inputs.accountId, stage);
   assertInboxAuthorityKeyRoot(store.inboxAuthorityKeyRoot, refuse);
   assertUploadControlRoleArn(store.uploadControlRoleArn, refuse);
   assertHostedUploadInboxSse(store.uploadInboxSse, false, refuse);
@@ -354,7 +370,8 @@ export type TranscriptStorePlanPhase =
   | "repo tag rename"
   | "upload inbox rollout"
   | "upload inbox update"
-  | "cross-account worker grants";
+  | "cross-account worker grants"
+  | "backlog ops key grants";
 
 /**
  * The read API's own phases (session-read-api.ts). It touches nothing else: no
@@ -834,6 +851,9 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   // and key policies update, and only by appending exactly its reviewed statements.
   const workerGrantPhase = crossAccountWorkerGrantsPhase(compact.operations, capture.detailedPlanText, refuse);
   if (workerGrantPhase) return workerGrantPhase;
+  // The backlog-ops roles' key statements (backlogOpsRoles) are added alone too: only the key policy updates.
+  const backlogOpsPhase = backlogOpsKeyGrantsPhase(compact.operations, capture.detailedPlanText, refuse);
+  if (backlogOpsPhase) return backlogOpsPhase;
   // The upload inbox (HISTORY_UPLOAD_DIRECT_INFRA=on) rolls out and updates alone.
   const uploadPhase = uploadInboxPhase(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
   if (uploadPhase) return uploadPhase;
@@ -1022,6 +1042,48 @@ function assertWorkerGrantDiff(block: readonly string[], resource: (typeof WORKE
   }
   return roleArn;
 }
+
+/**
+ * The backlog-ops key grants phase: everything noop except `transcripts-key`, whose detailed diff is the live
+ * policy (-) and the planned policy (+) where every other statement is unchanged and the only difference is
+ * both backlog-ops Sids added (backlogOpsRoles set) or both removed (unset again: the revocation path). The
+ * added statements must be byte-for-byte what backlog-ops-key-policy.ts builds for this stage's two exact roles.
+ * Like the worker grants it also guards every other phase: a key diff that adds, removes or changes a
+ * backlog-ops statement is refused unless it is exactly this phase. Undefined when the plan does not touch them.
+ */
+function backlogOpsKeyGrantsPhase(operations: ReadonlyMap<string, string>, detailedPlanText: string, refuse: (why: string) => never): TranscriptStorePlanPhase | undefined {
+  if (operations.get("transcripts-key") !== "update") return undefined;
+  const say = (why: string): never => refuse(`backlog ops key grants: ${why}`);
+  const block = planResourceBlock(detailedPlanText.split(/\r?\n/), "transcripts-key");
+  if (!block.some((l) => BACKLOG_OPS_SID_LINE.test(l))) return undefined;
+  const { live, planned } = policyDiffSides(block, say);
+  const ours = (m: Map<string, string>) => [...m].filter(([sid]) => sid.startsWith(BACKLOG_OPS_SID_PREFIX)).sort(([a], [b]) => (a < b ? -1 : 1));
+  // Statements re-rendered unchanged on both sides (another phase's cascade): not touched.
+  if (JSON.stringify(ours(live.bySid)) === JSON.stringify(ours(planned.bySid))) return undefined;
+  const changed = [...operations].filter(([, a]) => a !== "noop");
+  if (!changed.every(([r, a]) => r === "transcripts-key" && a === "update"))
+    return refuse(`backlog ops key grants must deploy alone (only transcripts-key may update): ${changed.map(([r, a]) => `${r}:${a}`).join(", ")}`);
+  if (live.header !== planned.header) say("only policy statements may change");
+  const expected: readonly string[] = BACKLOG_OPS_KEY_SIDS;
+  for (const [sid, text] of live.bySid)
+    if (planned.bySid.has(sid) ? planned.bySid.get(sid) !== text : !expected.includes(sid)) say(`existing statement ${sid} must stay byte-identical`);
+  const added = [...planned.bySid.keys()].filter((sid) => !live.bySid.has(sid)).sort();
+  const removed = [...live.bySid.keys()].filter((sid) => !planned.bySid.has(sid)).sort();
+  const exact = JSON.stringify([...expected].sort());
+  const adds = removed.length === 0 && JSON.stringify(added) === exact;
+  const removes = added.length === 0 && JSON.stringify(removed) === exact;
+  if (!adds && !removes) say(`must add (or, to revoke, remove) exactly ${expected.join(", ")}; adds ${added.join(", ") || "(none)"}, removes ${removed.join(", ") || "(none)"}`);
+  if (adds) {
+    // Rebuilt from the stage's exact role names, not from what the plan names.
+    const want = backlogOpsKeyStatements({ accountId: TRANSCRIPT_ACCOUNT_ID, stage: TRANSCRIPT_STAGE, region: TRANSCRIPT_REGION, roles: backlogOpsRoleArns(TRANSCRIPT_ACCOUNT_ID, TRANSCRIPT_STAGE) });
+    for (const statement of want)
+      if (unquoteYaml(planned.bySid.get(statement.Sid)!) !== planYaml([statement], planned.itemIndent).join("\n")) say(`${statement.Sid} must be exactly the reviewed statement`);
+  }
+  return "backlog ops key grants";
+}
+
+const BACKLOG_OPS_SID_PREFIX = "BacklogOps";
+const BACKLOG_OPS_SID_LINE = /^ {2}[+-]\s+(?:- )?Sid:\s*BacklogOps/;
 
 /**
  * The resources whose policies name the session pipeline's execution role. A pipeline
@@ -1663,7 +1725,7 @@ export function trailLogBucketPolicy(i: { bucketArn: string; trailArn: string; a
  * The eraser and every other operator role have no use of it: deleting needs no key,
  * and nobody reads transcripts with the console.
  */
-export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; bufferedGcRoleArn?: string; crossAccountWorkerRoleArn?: string; analysisResults?: boolean; readApiRoleArn?: string; uploadInbox?: { uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string } }) {
+export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; bufferedGcRoleArn?: string; crossAccountWorkerRoleArn?: string; backlogOps?: { stage: string; roles: BacklogOpsRoles }; analysisResults?: boolean; readApiRoleArn?: string; uploadInbox?: { uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string } }) {
   if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId);
   const via = {
     StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
@@ -1682,6 +1744,7 @@ export function transcriptKeyPolicy(i: { accountId: string; region: string; buck
       ...(i.bufferedGcRoleArn ? bufferedGcKeyStatements({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.bufferedGcRoleArn }) : []),
       ...(i.uploadInbox ? uploadInboxKeyStatements({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, ...i.uploadInbox }) : []),
       ...(i.crossAccountWorkerRoleArn !== undefined ? crossAccountWorkerKeyStatements({ bucketAccountId: i.accountId, region: i.region, bucketName: i.bucketName, roleArn: i.crossAccountWorkerRoleArn }) : []),
+      ...(i.backlogOps !== undefined ? backlogOpsKeyStatements({ accountId: i.accountId, stage: i.backlogOps.stage, region: i.region, roles: i.backlogOps.roles }) : []),
     ],
   };
 }
@@ -1846,6 +1909,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
     if (i.stage === TRANSCRIPT_STAGE || i.transcriptStore.bufferedGcRoleArn !== undefined)
       assertBufferedGcRoleArn(i.transcriptStore.bufferedGcRoleArn, i.accountId);
     if (i.transcriptStore.crossAccountWorkerRoleArn !== undefined) assertCrossAccountWorkerRoleArn(i.transcriptStore.crossAccountWorkerRoleArn, i.accountId);
+    if (i.transcriptStore.backlogOpsRoles !== undefined) assertBacklogOpsRoles(i.transcriptStore.backlogOpsRoles, i.accountId, i.stage);
     assertInboxAuthorityKeyRoot(i.transcriptStore.inboxAuthorityKeyRoot, (why) => { throw new Error(why); });
     const uploadDirect = i.historyUploadDirectInfra === true;
     if (i.historyUploadDirectInfra !== undefined && typeof i.historyUploadDirectInfra !== "boolean")
@@ -1995,6 +2059,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
         readerArn: reader.userArn as unknown as string,
         bufferedGcRoleArn: i.transcriptStore.bufferedGcRoleArn,
         ...(i.transcriptStore.crossAccountWorkerRoleArn !== undefined ? { crossAccountWorkerRoleArn: i.transcriptStore.crossAccountWorkerRoleArn } : {}),
+        ...(i.transcriptStore.backlogOpsRoles !== undefined ? { backlogOps: { stage: i.stage, roles: i.transcriptStore.backlogOpsRoles } } : {}),
         ...(pipelineRoleArn ? { pipelineRoleArn } : {}),
         ...(pipeline?.analysisJobs?.enabled ? { analysisResults: true } : {}),
         ...(readApiRoleArn ? { readApiRoleArn } : {}),

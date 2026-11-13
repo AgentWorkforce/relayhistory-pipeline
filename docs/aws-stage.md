@@ -884,7 +884,7 @@ accepts only the exact 13 transcript-store resources in the initial create,
 known three-resource recovery, one capture-bound post-merge remediation
 (`trail-key` and `trail-logs` update with every other resource `noop`), the
 srv-writer addition (`transcript-srv-writer` create and `transcripts-key`
-update, everything else `noop`), or final all-noop phase. Both compact and detailed plans must list the same actions and
+update, everything else `noop`), the backlog-ops key grants (below), or final all-noop phase. Both compact and detailed plans must list the same actions and
 match the exact paths and sha256 values in the approval-bound provenance. The
 capture command refuses an invalid shape before replacing the reviewed files,
 and deploy checks it again. Any other update count or resource, replacement,
@@ -903,6 +903,26 @@ from main adds none of them, and each group is then added in its own reviewed ph
 enabled unless its group is declared. A stage whose Alchemy state already holds a group must list it before its
 next plan, or that plan deletes the rule and its permission. The reconcile and brief schedules are not optional
 and are unaffected.
+
+**Backlog-ops key grants.** The guarded `backlog ops` workflow (decision 0005: fence backfill,
+accepted-stage export, drain; docs/backlog-ops-workflow.md) assumes two roles in this account,
+`96bulls-<stage>-backlog-ops-read` and `-write`, through GitHub OIDC. The roles, their trust and their
+identity policies are created outside the stack (the contract refuses adoption, and declaring them would
+collide with the live roles). The transcripts key policy delegates no key use to IAM, so the roles also
+need two key statements, and the stack owns that policy: set
+`transcriptStore.backlogOpsRoles: { "readRoleArn": "arn:aws:iam::<account>:role/96bulls-<stage>-backlog-ops-read",
+"writeRoleArn": "arn:aws:iam::<account>:role/96bulls-<stage>-backlog-ops-write" }` (exactly those two ARNs,
+nothing else is accepted) and the key policy carries `BacklogOpsReadDecryptsViaS3` (`kms:Decrypt`) and
+`BacklogOpsWriteEncryptsViaS3` (`kms:GenerateDataKey`, `kms:Decrypt`), both only via S3 in the stage's region
+(`stacks/aws/backlog-ops-key-policy.ts`). Unset, the key policy is byte-identical. The plan contract accepts the
+change only as its own "backlog ops key grants" phase: only `transcripts-key` updates, every other statement stays
+byte-identical, and both statements are added (or, to revoke, both removed) byte-for-byte as built from the
+stage's exact role names. A plan that changes these statements in any other phase is refused.
+
+The statements were first added to prod by hand (2026-11-13). Alchemy's state does not have them, so the first
+plan with the input set still shows the `transcripts-key` update adding them, which this phase accepts; applying
+it writes the same statements that are already live. Until that phase is applied, any deploy that updates
+`transcripts-key` (for example a pipeline role cascade) drops them; re-add them by hand or set the input first.
 
 **How a capture stays read-only.** `alchemy plan` against `AWS.state` is not
 read-only: Alchemy takes a lease (PUT then DELETE of `__lease__.json`) and
