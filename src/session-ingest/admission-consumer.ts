@@ -46,7 +46,7 @@ export interface AdmissionConsumerDeps {
 }
 
 export type AdmissionAction =
-  | { action: "ack"; outcome: "admitted" | "refused" | "already_terminal"; code: string; lagMs?: number }
+  | { action: "ack"; outcome: "admitted" | "refused" | "already_terminal"; code: string; lagMs?: number; timingMs?: Record<string, number> }
   | { action: "retry"; delaySeconds: number; code: string; stage?: string; error?: unknown };
 
 /** Exponential, 15 s .. 5 min, by the queue's delivery attempt (1-based). */
@@ -86,6 +86,7 @@ export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, a
     return { action: "retry", delaySeconds: 300, code: "admission_message_invalid" };
   const key = m.key;
   let raw: Uint8Array | null;
+  const readStarted = Date.now();
   try {
     raw = await readInbox(store, key, deps.decompress);
   } catch (error) {
@@ -104,7 +105,9 @@ export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, a
   const now = (deps.nowMs ?? Date.now)();
   const lagMs = Math.max(0, now - receivedAtMs);
   const dir = receiptDir(keyRoot, tenant, prepared.originId, prepared.receipt.receiptId);
-  const finish = async (state: "admitted" | "refused", code: string): Promise<AdmissionAction> => {
+  const read = Date.now() - readStarted;
+  const finish = async (state: "admitted" | "refused", code: string, delivered?: Record<string, number>): Promise<AdmissionAction> => {
+    const t = Date.now();
     try {
       await writeOutcome(store, dir, { v: 1, state, code, atMs: now });
       await tombstoneInbox(store, key);
@@ -112,7 +115,9 @@ export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, a
       // Re-running is idempotent (claim replay / the same refusal); the outcome must not be lost.
       return { action: "retry", delaySeconds: backoffSeconds(attempts), code: "outcome_unavailable", error };
     }
-    return { action: "ack", outcome: state, code, lagMs };
+    // Per-phase wall time (codes only): the inbox read, deliverPrepared's own phases, and the outcome writes.
+    const timingMs = { read, ...(delivered ?? {}), finish: Date.now() - t };
+    return { action: "ack", outcome: state, code, lagMs, timingMs };
   };
   try {
     // No age limit: an acknowledged upload stays admissible for as long as its message (or an
@@ -138,7 +143,7 @@ export async function admitMessage(deps: AdmissionConsumerDeps, body: unknown, a
         ? { consentGate: async (dropped: ReadonlySet<string>, phase: "admit" | "commit") => { await checkUploadConsent(deps.uploadConsent, tenant, prepared.originId, prepared.records, { dropped, phase, route: "admission.consumer", ...(consentCap ? { operator: consentCap } : {}) }, deps.log); } }
         : {}),
     }, tenant, prepared);
-    return finish("admitted", result.outcome);
+    return finish("admitted", result.outcome, result.stats.timing_ms);
   } catch (error) {
     const c = classify(error, attempts);
     if ("terminal" in c) return finish("refused", c.terminal);

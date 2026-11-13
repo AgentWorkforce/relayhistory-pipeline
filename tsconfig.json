@@ -60,7 +60,9 @@
     "scripts/accepted-stage-export.ts",
     "scripts/upload-fence-backfill.ts",
     "scripts/backlog-ops.ts",
-    "scripts/backlog-ops-github.ts"
+    "scripts/backlog-ops-github.ts",
+    "scripts/ledger-reshard-revisions.ts",
+    "scripts/bench/s3-ledger-admission.ts"
   ],
   "exclude": [
     "node_modules",

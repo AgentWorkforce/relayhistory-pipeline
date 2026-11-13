@@ -36,7 +36,7 @@
  */
 import type { UploadConsentConfig } from "./upload-consent.ts";
 import { zstdDecompressSync } from "node:zlib";
-import { log as sharedLog } from "../shared/log.ts";
+import { ADMISSION_PHASE_FIELDS, log as sharedLog } from "../shared/log.ts";
 import { objectKey, type ObjectStore } from "../shared/vendor.ts";
 import { admitMessage, backoffSeconds, type AdmissionAction } from "./admission-consumer.ts";
 import { INBOX_NAMESPACE, pendingAdmissions } from "./async-admission.ts";
@@ -231,7 +231,9 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     const r: AdmissionAction = await admitMessage({ mode: opts.mode, deliver: opts.deliver, custodySource: "relayhistory", decompress, nowMs: now, ...(opts.uploadConsent ? { uploadConsent: opts.uploadConsent, log: (fields: Record<string, unknown>) => logger.warn("session ingest admission", fields) } : {}) }, { v: 1, kind: "ingest-admission", key }, entry.attempts)
       .catch((error: unknown): AdmissionAction => ({ action: "retry", delaySeconds: 300, code: "admission_failed", error }));
     if (r.action === "ack") {
-      logger.info("session ingest admission", { route: "ingest.admission", outcome: r.outcome, error_code: r.code, duration_ms: Date.now() - t0, ...(r.lagMs !== undefined ? { offset: r.lagMs } : {}), attempt: entry.attempts });
+      const timing: Record<string, number> = {};
+      for (const [phase, ms] of Object.entries(r.timingMs ?? {})) { const field = ADMISSION_PHASE_FIELDS.get(phase); if (field) timing[field] = ms; }
+      logger.info("session ingest admission", { route: "ingest.admission", outcome: r.outcome, error_code: r.code, duration_ms: Date.now() - t0, ...(r.lagMs !== undefined ? { offset: r.lagMs } : {}), attempt: entry.attempts, ...timing });
       entries.delete(key);
       if (marked.delete(key)) await store.delete(objectKey(deadLetterKey(keyRoot, key))).catch(() => {});
       return;

@@ -156,7 +156,10 @@ cannot delete, one small probe object per pod start remains.
   - In `sync`, `/readyz` is unchanged apart from the added `admission: "sync"`.
 - Logs:
   - one `ingest.admission` line per attempt, with the hosted fields (`outcome`, `error_code`, `stage`,
-    `offset` = lag ms, `attempt`, `db_error_*`), plus `outcome: dead_lettered`;
+    `offset` = lag ms, `attempt`, `db_error_*`), plus `outcome: dead_lettered`; an admitted or refused
+    one also carries its wall time per phase: `admission_read_ms`, `admission_claim_ms`,
+    `admission_gate_ms`, `admission_objects_ms`, `admission_commit_ms`, `admission_finish_ms` (bounded
+    integers, `ADMISSION_PHASE_FIELDS` in `shared/log.ts`);
   - `ingest.admission_lock_alert` for 55P03 / 57014;
   - one `ingest.admission_consumer` line per scan: `admission_backlog`, `admission_oldest_age_ms`,
     `admission_dead_letters`, `admission_in_flight` (bounded integers in `shared/log.ts`), or
