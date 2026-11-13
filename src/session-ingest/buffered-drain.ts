@@ -273,6 +273,9 @@ export type ObjectOutcome =
   | "control_pending"
   | "fence_authority_missing"
   | "fence_authority_invalid"
+  | "user_hold"
+  | "user_stopped"
+  | "lock_lost"
   | "index_unreadable"
   | "write_failed"
   | "index_merge_failed"
@@ -286,7 +289,7 @@ export type ObjectOutcome =
 
 const OUTCOMES: ObjectOutcome[] = [
   "drained", "would_drain", "already_drained", "pre_reset", "redacted", "vanished", "corrupt", "key_mismatch",
-  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "control_pending", "fence_authority_missing", "fence_authority_invalid", "index_unreadable", "write_failed",
+  "ambiguous_replacement", "fence_absent", "fence_unreadable", "journal_unreadable", "privacy_control_open", "reset_undeterminable", "reset_margin", "reset_in_flight", "control_pending", "fence_authority_missing", "fence_authority_invalid", "user_hold", "user_stopped", "lock_lost", "index_unreadable", "write_failed",
   "index_merge_failed", "fence_recheck_failed", "fence_moved", "stage_unacknowledged", "stage_export_missing", "accepted_mismatch", "marker_failed", "internal_error",
 ];
 
@@ -311,6 +314,8 @@ export interface DrainSummary {
   /** Session groups written (execute) or that would be (dry run). */
   sessions_written: number;
   rearmed: number;
+  /** A hold that could not be recorded after a partial write: the operator must rerun before anything else. */
+  hold_failures: number;
   /** Orgs without a valid fence-authority marker (per-org, else deployment-wide): --execute writes nothing of them. */
   orgs_without_authority: number;
   /** Dry run with assumeEmptyFence: batches whose user had no fence, classified as if it were empty. */
@@ -325,7 +330,7 @@ function emptySummary(mode: DrainSummary["mode"]): DrainSummary {
     mode, orgs: 0, listed: 0, foreign_keys: 0,
     objects: Object.fromEntries(OUTCOMES.map((o) => [o, 0])) as Record<ObjectOutcome, number>,
     lines: { candidate: 0, written: 0, fenced: 0, stale: 0, already_stored: 0, revision_conflict: 0 },
-    sessions_written: 0, rearmed: 0, orgs_without_authority: 0, fence_assumed_empty: 0, write_failures: {}, stopped: "complete",
+    sessions_written: 0, rearmed: 0, hold_failures: 0, orgs_without_authority: 0, fence_assumed_empty: 0, write_failures: {}, stopped: "complete",
   };
 }
 
@@ -502,12 +507,34 @@ class KeyedLocks {
   }
 }
 
+// ---- per-user holds (finding 4) ----
+
+/** Fence-authority re-read interval during a run, as admission's cache. */
+export const AUTHORITY_TTL_MS = 60_000;
+export interface DrainHold { v: 1; kind: "buffered-drain-hold"; keys: string[] }
+export const drainHoldKey = (keyRoot: string, t: LedgerTenant) =>
+  `${keyRoot}/.drain/holds/${sha256Hex(JSON.stringify([t.orgId, t.workspaceId, t.userId])).slice(0, 32)}.json`;
+export function parseDrainHold(text: string): DrainHold | null {
+  try {
+    const v = JSON.parse(text) as Record<string, unknown>;
+    return isObject(v) && v.v === 1 && v.kind === "buffered-drain-hold" && Array.isArray(v.keys) && v.keys.every((k) => typeof k === "string" && parseStagedKey(k) !== null)
+      ? (v as unknown as DrainHold) : null;
+  } catch {
+    return null;
+  }
+}
+
 // ---- the run lock ----
 
-/** One drain process at a time: a create-only lease at `<keyRoot>/.drain/lock.json`, renewed by CAS. */
+/**
+ * One drain process at a time: a create-only lease at `<keyRoot>/.drain/lock.json`, renewed by CAS. Each lease takes
+ * a FENCING TOKEN one above the previous holder's; a run re-checks its lease (renewed in time, not taken over)
+ * before every mutation, and stops in-flight batches the moment it is not, so a stalled holder whose lease expired
+ * never writes beside the next one. The same lease guards the accepted-stage export (its own key).
+ */
 export const DRAIN_LOCK_TTL_MS = 15 * 60_000;
 export const drainLockKey = (keyRoot: string) => `${keyRoot}/.drain/lock.json`;
-interface DrainLockBody { v: 1; kind: "buffered-drain-lock"; holder: string; expiresAtMs: number }
+interface DrainLockBody { v: 1; kind: "buffered-drain-lock"; holder: string; expiresAtMs: number; token?: number }
 
 export class DrainLockError extends Error {
   constructor(readonly code: "drain_locked" | "drain_lock_invalid" | "drain_lock_lost") {
@@ -526,43 +553,64 @@ async function readLock(store: ObjectStore, key: string): Promise<{ body: DrainL
     throw new DrainLockError("drain_lock_invalid");
   }
   // Fail closed: a lock this code cannot read is held.
-  if (!isObject(v) || v.v !== 1 || v.kind !== "buffered-drain-lock" || typeof v.holder !== "string" || !Number.isSafeInteger(v.expiresAtMs)) throw new DrainLockError("drain_lock_invalid");
+  if (!isObject(v) || v.v !== 1 || v.kind !== "buffered-drain-lock" || typeof v.holder !== "string" || !Number.isSafeInteger(v.expiresAtMs) ||
+      (v.token !== undefined && (!Number.isSafeInteger(v.token) || (v.token as number) < 0))) throw new DrainLockError("drain_lock_invalid");
   return { body: v as unknown as DrainLockBody, version: got.version };
 }
 
 /** The dry run never writes the lock, but still refuses to run beside a live drain. */
-export async function assertDrainUnlocked(store: ObjectStore, keyRoot: string, nowMs: number): Promise<void> {
-  const held = await readLock(store, drainLockKey(keyRoot));
+export async function assertDrainUnlocked(store: ObjectStore, keyRoot: string, nowMs: number, key = drainLockKey(keyRoot)): Promise<void> {
+  const held = await readLock(store, key);
   if (held && held.body.expiresAtMs > nowMs) throw new DrainLockError("drain_locked");
 }
 
-export interface DrainLease { renew(): Promise<void>; release(): Promise<void> }
+export interface DrainLease {
+  /** The fencing token of this lease (one above the previous holder's). */
+  readonly token: number;
+  renew(): Promise<void>;
+  /** True while the last successful write of the lease is still unexpired: checked before every mutation. */
+  alive(): boolean;
+  release(): Promise<void>;
+}
 
 /** Take the lease: create-only, or CAS over an expired one. A live lease (anyone's) refuses. */
-export async function acquireDrainLock(store: ObjectStore, keyRoot: string, opts: { holder: string; ttlMs: number; now: () => number }): Promise<DrainLease> {
-  const key = drainLockKey(keyRoot);
-  const body = (expiresAtMs: number) => encoder.encode(JSON.stringify({ v: 1, kind: "buffered-drain-lock", holder: opts.holder, expiresAtMs } satisfies DrainLockBody));
+export async function acquireDrainLock(store: ObjectStore, keyRoot: string, opts: { holder: string; ttlMs: number; now: () => number; key?: string }): Promise<DrainLease> {
+  const key = opts.key ?? drainLockKey(keyRoot);
   const held = await readLock(store, key);
   if (held && held.body.expiresAtMs > opts.now()) throw new DrainLockError("drain_locked");
+  const token = (held?.body.token ?? 0) + 1;
+  const body = (expiresAtMs: number) => encoder.encode(JSON.stringify({ v: 1, kind: "buffered-drain-lock", holder: opts.holder, expiresAtMs, token } satisfies DrainLockBody));
   let version: ObjectVersion;
+  let expiresAt = opts.now() + opts.ttlMs;
+  let lost = false;
   try {
-    version = (await store.put(objectKey(key), body(opts.now() + opts.ttlMs), held ? { ifMatch: held.version, contentType: "application/json" } : { ifNoneMatch: true, contentType: "application/json" })).version;
+    version = (await store.put(objectKey(key), body(expiresAt), held ? { ifMatch: held.version, contentType: "application/json" } : { ifNoneMatch: true, contentType: "application/json" })).version;
   } catch (error) {
     // Another process took it between the read and the write.
     if (isObjectStoreError(error, "precondition_failed") || isObjectStoreError(error, "already_exists")) throw new DrainLockError("drain_locked");
     throw error;
   }
   return {
+    token,
     async renew() {
+      const next = opts.now() + opts.ttlMs;
       try {
-        version = (await store.put(objectKey(key), body(opts.now() + opts.ttlMs), { ifMatch: version, contentType: "application/json" })).version;
+        version = (await store.put(objectKey(key), body(next), { ifMatch: version, contentType: "application/json" })).version;
+        expiresAt = next;
       } catch (error) {
-        if (isObjectStoreError(error, "precondition_failed") || isObjectStoreError(error, "already_exists")) throw new DrainLockError("drain_lock_lost");
+        if (isObjectStoreError(error, "precondition_failed") || isObjectStoreError(error, "already_exists")) {
+          lost = true;
+          throw new DrainLockError("drain_lock_lost");
+        }
         throw error;
       }
     },
+    alive() {
+      return !lost && opts.now() < expiresAt;
+    },
     async release() {
       // Expire it in place (the drain never deletes). A lost lease is someone else's now: leave it.
+      if (lost) return;
       await store.put(objectKey(key), body(0), { ifMatch: version, contentType: "application/json" }).catch(() => {});
     },
   };
@@ -648,6 +696,52 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
   const orgs = orgOrder(opts.orgs);
   summary.orgs = orgs.length;
 
+  /** Admission's fence authority per org, re-read at most every AUTHORITY_TTL_MS (as admission's cache). */
+  const authorities = new Map<string, { value: Authority; at: number }>();
+  async function currentAuthority(org: string): Promise<Authority> {
+    const hit = authorities.get(org);
+    if (hit && nowMs() - hit.at < AUTHORITY_TTL_MS) return hit.value;
+    const value = await orgAuthority(opts.store, opts.keyRoot, org);
+    authorities.set(org, { value, at: nowMs() });
+    return value;
+  }
+  /** The run's lease is held and fresh: checked before every mutation (the dry run has none). */
+  const leaseOk = () => opts.dryRun || (lockLost === undefined && lease !== undefined && lease.alive());
+
+  /**
+   * Per-user hold (finding 4): a batch whose canonical write may have landed without its index entries holds its
+   * user. Until that batch drains (re-deriving those entries from the same staged lines before anything else of
+   * the user is written), every other batch of the user is `user_hold`; in the failing run the user is also
+   * `user_stopped`. Durable, so a rerun honours it; never deleted, emptied by CAS.
+   */
+  const stoppedUsers = new Set<string>();
+  const holds = new Map<string, Promise<DrainHold | "invalid" | null>>();
+  const holdKeyOf = (t: LedgerTenant) => drainHoldKey(opts.keyRoot, t);
+  const userKeyOf = (t: LedgerTenant) => JSON.stringify([t.orgId, t.workspaceId, t.userId]);
+  function readHold(t: LedgerTenant) {
+    const uk = userKeyOf(t);
+    if (!holds.has(uk)) holds.set(uk, readText(opts.store, holdKeyOf(t), 1024 * 1024).then((got) => (got ? parseDrainHold(got.text) ?? "invalid" : null), () => "invalid" as const));
+    return holds.get(uk)!;
+  }
+  async function editHold(t: LedgerTenant, edit: (keys: string[]) => string[]): Promise<void> {
+    const key = holdKeyOf(t);
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const got = await readText(store, key, 1024 * 1024);
+      const cur = got ? parseDrainHold(got.text) : null;
+      if (got && !cur) throw new Error("drain_hold_invalid");
+      const keys = edit([...(cur?.keys ?? [])]);
+      const doc: DrainHold = { v: 1, kind: "buffered-drain-hold", keys };
+      try {
+        await store.put(objectKey(key), encoder.encode(JSON.stringify(doc)), got ? { ifMatch: got.version, contentType: "application/json" } : { ifNoneMatch: true, contentType: "application/json" });
+        holds.set(userKeyOf(t), Promise.resolve(doc));
+        return;
+      } catch (error) {
+        if (!isObjectStoreError(error, "precondition_failed") && !isObjectStoreError(error, "already_exists")) throw error;
+      }
+    }
+    throw new Error("drain_hold_contended");
+  }
+
   async function* allGroups(): AsyncGenerator<BatchGroup> {
     for (const org of orgs) {
       const prefix = `${opts.keyRoot}/${org}/buffered-batches/v1`;
@@ -661,7 +755,7 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       } catch {
         complete = false;
       }
-      const authority = await orgAuthority(opts.store, opts.keyRoot, org);
+      const authority = await currentAuthority(org);
       if (authority !== "ok") summary.orgs_without_authority++;
       yield* batchGroups(opts.store, prefix, opts.startAfter, summary, complete, authority);
     }
@@ -728,9 +822,11 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
 
   async function drainGroup(group: BatchGroup) {
     // Only stages SQL acknowledged (0005 step 0b) are candidates; nothing else is even read.
-    const candidate = (key: string) => !group.markers.has(key) && group.exportComplete && group.accepted.has(key) && (opts.dryRun || group.authority === "ok");
     // Read every candidate, then decide per claim token (GC replacement detection).
     const reads = new Map<string, Read>();
+    // Re-read (at most every AUTHORITY_TTL_MS): deleting the org's or the global marker stops the run's writes.
+    const authority = opts.dryRun ? group.authority : await currentAuthority(parseStagedKey(group.lastKey.replace(/\.(drained|accepted)\.json$/, ""))!.orgId);
+    const candidate = (key: string) => !group.markers.has(key) && group.exportComplete && group.accepted.has(key) && (opts.dryRun || authority === "ok");
     for (const key of group.staged) {
       if (!candidate(key)) continue;
       try {
@@ -751,8 +847,8 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
       }
       // --execute writes only for an org admission itself would admit (the dry run still classifies, and reports
       // the org in orgs_without_authority).
-      if (!opts.dryRun && group.authority !== "ok") {
-        summary.objects[group.authority === "missing" ? "fence_authority_missing" : "fence_authority_invalid"]++;
+      if (!opts.dryRun && authority !== "ok") {
+        summary.objects[authority === "missing" ? "fence_authority_missing" : "fence_authority_invalid"]++;
         continue;
       }
       if (!group.accepted.has(key)) {
@@ -798,6 +894,11 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     const tenant: LedgerTenant = { orgId: header.org_id, workspaceId: header.workspace_id, userId: header.user_id };
     const origin = header.origin_id;
     const receivedMs = Date.parse(header.received_at);
+    const uk = userKeyOf(tenant);
+    if (stoppedUsers.has(uk)) return "user_stopped";
+    const hold = await readHold(tenant);
+    // An unreadable hold fails closed; a held user writes only its held batches until they drain.
+    if (hold === "invalid" || (hold && hold.keys.length > 0 && !hold.keys.includes(key))) return "user_hold";
     let keys: ReturnType<DrainLedger["keysFor"]>;
     let read: FenceRead;
     try {
@@ -917,6 +1018,24 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
         return "would_drain";
       }
       const snapshot = { instance: fence.instance, version: fence.version, resets: fence.resets, resetsCompleted: fence.resetsCompleted };
+      const machine = liveMachineId(header.workspace_id, origin, header.user_id);
+      /** A failure after the canonical write began: stop the user for the run, hold the batch, re-arm (finding 4). */
+      const partial = async (outcome: ObjectOutcome): Promise<ObjectOutcome> => {
+        stoppedUsers.add(uk);
+        try {
+          for (const [s, id] of writtenSessions.values()) {
+            await ledger.writeRearm(keys.rearm(origin, s, id), { originId: origin, source: s, sessionId: id, machineId: machine, workspaceId: header.workspace_id });
+            summary.rearmed++;
+          }
+        } catch { /* best effort: the hold below is what protects the index */ }
+        try {
+          await editHold(tenant, (ks) => (ks.includes(key) ? ks : [...ks, key]));
+        } catch {
+          summary.hold_failures++;
+        }
+        return outcome;
+      };
+      if (!leaseOk()) return "lock_lost";
       const epochOf = (f: FenceDoc, s: string, id: string) => fenceEpoch(f, origin, sessionKeyHash(s, id));
       // Ownership (ingest_session_ownership) BEFORE any canonical write, as the claim: a reset that begins after
       // this lists these sessions. Then the fence again: if it moved, leave the batch for a rerun.
@@ -924,7 +1043,8 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
         try {
           for (const [s, id] of writtenSessions.values()) {
             const [, epoch, resets] = recordGeneration(fence, origin, s, id);
-            await ledger.registerOwner(keys.owner(origin, s, id), { v: 1, originId: origin, source: s, sessionId: id, epoch, resets });
+            // The writer machine, as admission stamps it: the re-arm sweeper binds a marker to it.
+            await ledger.registerOwner(keys.owner(origin, s, id), { v: 1, originId: origin, source: s, sessionId: id, epoch, resets, machineId: machine });
           }
           const again = await ledger.readFence(keys.fence);
           if (again.state !== "present" || again.fence.instance !== snapshot.instance || again.fence.version !== snapshot.version) return "fence_moved";
@@ -932,20 +1052,25 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
           return "fence_recheck_failed";
         }
       }
-      let machineId = liveMachineId(header.workspace_id, origin, header.user_id);
+      let machineId = machine;
+      // The authority (cached at most AUTHORITY_TTL_MS) and the lease, once more right before the first canonical byte.
+      if (await currentAuthority(header.org_id) !== "ok") return "fence_authority_missing";
+      if (!leaseOk()) return "lock_lost";
       if (toWrite.length) {
         try {
           machineId = (await writeGroups(target, { orgId: header.org_id, workspaceId: header.workspace_id, originId: origin, userId: header.user_id, batchDigest: header.batch_digest }, toWrite, new Date(receivedMs))).machineId;
         } catch (error) {
           const code = error instanceof IngestWriteError ? error.code : "storage";
           summary.write_failures[code] = (summary.write_failures[code] ?? 0) + 1;
-          return "write_failed";
+          // Some groups may have landed: their records have no index entries until this batch drains.
+          return partial("write_failed");
         }
       }
       // The commit (ledger-s3 commit): read the fence, re-arm what it reached BEFORE any index merge, then merge
       // the rest stamped with the first read's generation; mergeIndex drops what the latest fence forgot.
       let after: FenceDoc;
       const fencedNow = new Set<string>();
+      if (!leaseOk()) return partial("lock_lost");
       try {
         const now = await ledger.readFence(keys.fence);
         const journalAfter = await ledger.readJournal(tenant);
@@ -961,21 +1086,34 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
           }
         }
         for (const [s, id] of rearm.values()) {
-          await ledger.writeRearm(keys.rearm(origin, s, id), { originId: origin, source: s, sessionId: id, machineId });
+          // As admission's commit: the marker (with the raw workspace id), then the stub binding its machine.
+          await ledger.writeRearm(keys.rearm(origin, s, id), { originId: origin, source: s, sessionId: id, machineId, workspaceId: header.workspace_id });
+          const [, epoch, resets] = recordGeneration(fence, origin, s, id);
+          await ledger.registerOwner(keys.owner(origin, s, id), { v: 1, originId: origin, source: s, sessionId: id, epoch, resets, machineId });
           summary.rearmed++;
         }
       } catch {
-        return "fence_recheck_failed";
+        return partial("fence_recheck_failed");
       }
+      if (!leaseOk()) return partial("lock_lost");
       try {
         for (const [sk, list] of entries) {
           const keep = list.filter((e) => e.sessionKey === null || ![...fencedNow].some((pk) => { const [s, id] = JSON.parse(pk) as [string, string]; return sessionKeyHash(s, id) === e.sessionKey; }));
           if (keep.length) await ledger.mergeIndex(sk, after, origin, keep);
         }
       } catch {
-        return "index_merge_failed";
+        return partial("index_merge_failed");
       }
-      if (!(await putMarker(key, sha256, "drained", counts, toWrite.length))) return "marker_failed";
+      if (!leaseOk()) return "lock_lost"; // written and merged: a rerun only re-marks it
+      if (!(await putMarker(key, sha256, "drained", counts, toWrite.length, lease?.token))) return "marker_failed";
+      // This batch's index entries are in: release its hold, if it had one.
+      if (hold && hold.keys.includes(key)) {
+        try {
+          await editHold(tenant, (ks) => ks.filter((k) => k !== key));
+        } catch {
+          summary.hold_failures++;
+        }
+      }
       addCounts(counts, toWrite.length);
       return "drained";
     } finally {
@@ -988,9 +1126,9 @@ export async function drainBufferedBatches(opts: DrainOptions): Promise<DrainSum
     summary.sessions_written += sessions;
   }
 
-  async function putMarker(key: string, sha256: string, outcome: "drained" | "pre_reset", counts: DrainSummary["lines"], sessions: number): Promise<boolean> {
+  async function putMarker(key: string, sha256: string, outcome: "drained" | "pre_reset", counts: DrainSummary["lines"], sessions: number, token?: number): Promise<boolean> {
     const at = (opts.now ?? (() => new Date()))().toISOString();
-    const body = encoder.encode(JSON.stringify({ v: 1, kind: "buffered-drained", outcome, at, staged_sha256: sha256, sessions_written: sessions, lines: counts }));
+    const body = encoder.encode(JSON.stringify({ v: 1, kind: "buffered-drained", outcome, at, staged_sha256: sha256, sessions_written: sessions, lines: counts, ...(token !== undefined ? { lease_token: token } : {}) }));
     try {
       await store.put(objectKey(key + DRAINED_SUFFIX), body, { ifNoneMatch: true, contentType: "application/json" });
       return true;

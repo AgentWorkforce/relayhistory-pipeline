@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import { zstdDecompressSync } from "node:zlib";
-import { objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
+import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
 import { BUFFER_STAGE_MAX_BYTES, prepareBufferedStage, putBufferedStage } from "../staging.ts";
 import type { Group } from "../writer.ts";
 import {
@@ -10,6 +10,7 @@ import {
   acceptedCompleteKey,
   acquireDrainLock,
   drainBufferedBatches,
+  drainHoldKey,
   drainLockKey,
   readOnlyStore,
   s3DrainLedger,
@@ -151,7 +152,7 @@ describe("buffered backlog drain (0005)", () => {
     expect(await storedEntry(store, "r1")).toEqual([1, "r1:r1", sha("r1:1"), SESS1, 0, 0]);
     expect(await storedEntry(store, "r2")).toEqual([2, "r2:r2", sha("r2:2"), SESS1, 0, 0]);
     // Ownership stubs (ledger-s3) for every written session, at the read's generation.
-    expect(await readJson(store, ownerKey("claude", "sess-1"))).toEqual({ v: 1, originId: ORIGIN, source: "claude", sessionId: "sess-1", epoch: 0, resets: 0 });
+    expect(await readJson(store, ownerKey("claude", "sess-1"))).toEqual({ v: 1, originId: ORIGIN, source: "claude", sessionId: "sess-1", epoch: 0, resets: 0, machineId: expect.stringMatching(/^srv_[0-9a-f]{32}$/) });
     expect(await exists(store, ownerKey("claude", "sess-2"))).toBe(true);
     // The summary is counts only: no key, tenant id or content.
     const text = JSON.stringify(summary);
@@ -205,7 +206,8 @@ describe("buffered backlog drain (0005)", () => {
     expect(lines.has("sess-2")).toBe(false);
     expect(await storedEntry(store, "r2")).toBeUndefined();
     expect(await storedEntry(store, "r3")).toBeUndefined();
-    expect(await exists(store, ownerKey("claude", "sess-2"))).toBe(false);
+    // As admission's commit, the re-armed session gets its stub (with the writer machine) for the sweeper.
+    expect((await readJson(store, ownerKey("claude", "sess-2"))).machineId).toMatch(/^srv_[0-9a-f]{32}$/);
     expect(await exists(store, key + DRAINED_SUFFIX)).toBe(true);
     // An earlier partial run may have written the deleted session: it is re-armed for the eraser.
     expect(summary.rearmed).toBe(1);
@@ -604,7 +606,7 @@ describe("buffered backlog drain (0005)", () => {
     await store.put(objectKey(drainLockKey(ROOT)), enc.encode(JSON.stringify({ v: 1, kind: "buffered-drain-lock", holder: "drain-other", expiresAtMs: T - 1 })));
     const summary = await run(store, { now, lockHolder: "drain-test" });
     expect(summary.objects.drained).toBe(1);
-    expect(await readJson(store, drainLockKey(ROOT))).toEqual({ v: 1, kind: "buffered-drain-lock", holder: "drain-test", expiresAtMs: 0 });
+    expect(await readJson(store, drainLockKey(ROOT))).toEqual({ v: 1, kind: "buffered-drain-lock", holder: "drain-test", expiresAtMs: 0, token: 1 });
 
     // A lock this code cannot read is treated as held.
     await store.put(objectKey(drainLockKey(ROOT)), enc.encode("{}"));
@@ -622,6 +624,100 @@ describe("buffered backlog drain (0005)", () => {
     await expect(lease.renew()).rejects.toThrow("drain_lock_lost");
     await lease.release(); // never clobbers b's lease
     expect((await readJson(store, drainLockKey(ROOT))).holder).toBe("drain-b");
+  });
+
+  test("finding 4: a partial write holds the user; a conflicting equal-revision batch never reaches canonical", async () => {
+    const store = await scratch();
+    // Batch A: sess-1 and sess-2. Batch B: the SAME record of sess-1 at the SAME revision, other content.
+    const a = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 5, digest: "a".repeat(64) }]), group("claude", "sess-2", [{ id: "r2", rev: 1 }])], { batch: "A" });
+    const b = await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 5, digest: "b".repeat(64) }])], { batch: "B" });
+    let failing = true;
+    const flaky = new Proxy(store, {
+      get(target, prop) {
+        if (prop === "put") return async (...args: Parameters<ObjectStore["put"]>) => {
+          // A non-retryable failure on sess-2's manifest: sess-1's chunk and manifest land, A's index entries do not.
+          if (failing && String(args[0]).includes("/s=sess-2/") && String(args[0]).endsWith("manifest.json")) throw new ObjectStoreError("unauthorized", "fs", "injected");
+          return target.put(...args);
+        };
+        const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof v === "function" ? (v as (...x: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    const first = await run(flaky, { concurrency: 1 });
+    expect(first.objects.write_failed).toBe(1);
+    // Whatever B's position, it is not written in that run: user_stopped (after A) or drained-before-A is impossible
+    // only if B sorts first; assert the invariant directly instead: canonical never holds B's digest for r1.
+    const contents = async () => {
+      const out: string[] = [];
+      for (const k of await allKeys(store, `${ROOT}/${TENANT.orgId}/v1`)) {
+        if (!k.includes("/raw/") || !k.includes("/s=sess-1/")) continue;
+        for (const l of dec.decode(decompress(await readAll(await store.get(objectKey(k))))).split("\n").filter(Boolean)) out.push(JSON.parse(l).payload.text);
+      }
+      return out;
+    };
+    const hold = await readJson(store, drainHoldKey(ROOT, TENANT));
+    expect(hold).toEqual({ v: 1, kind: "buffered-drain-hold", keys: [a] });
+    failing = false;
+    // Reruns: only A may write for the user until it has re-derived its index entries; then B is a conflict.
+    for (let i = 0; i < 3; i++) await run(store, { concurrency: 1 });
+    expect(await exists(store, a + DRAINED_SUFFIX)).toBe(true);
+    expect(await exists(store, b + DRAINED_SUFFIX)).toBe(true); // marked: its only record was refused as a conflict
+    expect(await contents()).toEqual(["t-r1-5"]); // one copy of r1 (A's), never B's
+    expect(await storedEntry(store, "r1")).toEqual([5, "r1:r5", "a".repeat(64), SESS1, 0, 0]);
+    expect((await readJson(store, drainHoldKey(ROOT, TENANT))).keys).toEqual([]);
+  });
+
+  test("finding 4: the lease carries a fencing token, and a stale lease stops in-flight batches before any write", async () => {
+    const store = await scratch();
+    let t = Date.parse("2030-01-05T00:00:00.000Z");
+    const first = await acquireDrainLock(store, ROOT, { holder: "drain-a", ttlMs: 60_000, now: () => t });
+    expect(first.token).toBe(1);
+    await first.release();
+    const second = await acquireDrainLock(store, ROOT, { holder: "drain-b", ttlMs: 60_000, now: () => t });
+    expect(second.token).toBe(2);
+    await second.release();
+    await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    // The clock jumps past the lease TTL while the batch is between its ownership step and its write.
+    const base = s3DrainLedger(store, ROOT);
+    const ledger: DrainLedger = { ...base, async registerOwner(k, doc) { await base.registerOwner(k, doc); t += 10 * 60_000; } };
+    const summary = await run(store, { ledger, lockTtlMs: 60_000, now: () => new Date(t) });
+    expect(summary.objects.lock_lost).toBe(1);
+    expect((await canonical(store)).size).toBe(0);
+  });
+
+  test("finding 7: the fence authority is re-read during the run (at most every 60 s)", async () => {
+    const store = await scratch();
+    for (let i = 0; i < 2; i++) await stage(store, [group("claude", `sess-${i}`, [{ id: `r${i}`, rev: 1 }])]);
+    let t = Date.parse("2030-01-05T00:00:00.000Z");
+    let groups = 0, pulled = false;
+    // The operator pulls the org's authority after the first batch (seen by the store at once); 61 s later the run sees it.
+    const watched = new Proxy(store, {
+      get(target, prop) {
+        if (prop === "getObject") return (k: Parameters<ObjectStore["getObject"]>[0]) =>
+          pulled && String(k) === orgFenceAuthorityKey(ROOT, TENANT.orgId) ? Promise.reject(new ObjectStoreError("not_found", "fs", "pulled")) : target.getObject(k);
+        const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof v === "function" ? (v as (...x: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    const summary = await run(watched, {
+      concurrency: 1, now: () => new Date(t),
+      onProgress: () => {
+        if (groups++ === 0) {
+          pulled = true;
+          t += 61_000;
+        }
+      },
+    });
+    expect(summary.objects.drained).toBe(1);
+    expect(summary.objects.fence_authority_missing).toBe(1);
+  });
+
+  test("owner stubs carry the writer machine, so the re-arm sweeper can bind the drain's markers", async () => {
+    const store = await scratch();
+    await stage(store, [group("claude", "sess-1", [{ id: "r1", rev: 1 }])]);
+    await run(store);
+    const stub = await readJson(store, ownerKey("claude", "sess-1"));
+    expect(stub.machineId).toMatch(/^srv_[0-9a-f]{32}$/);
   });
 
   test("CLI: the mode is never implied and --execute needs the KMS key", () => {
