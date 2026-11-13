@@ -336,7 +336,7 @@ describe("fences: selection, reset, and the commit's recheck", () => {
     const ledger = ledgerOn(store);
     const input = claimInput("b1", [rec("r1", 1)]);
     const c = await claimed(ledger, input);
-    expect(await json(store, keys.owner(ORIGIN, "claude", "sess-1"))).toEqual({ v: 1, originId: ORIGIN, source: "claude", sessionId: "sess-1", epoch: 0, resets: 0 });
+    expect(await json(store, keys.owner(ORIGIN, "claude", "sess-1"))).toEqual({ v: 1, originId: ORIGIN, source: "claude", sessionId: "sess-1", epoch: 0, resets: 0, machineId: MACHINE });
     expect(await ledger.resetUploadedSessions(TENANT, "req-1")).toBe(1);
     expect(await ledger.commit(commitOf(input, c.claimToken))).toEqual({ rearmed: 1 });
     expect(await exists(store, keys.rearm(ORIGIN, "claude", "sess-1"))).toBe(true);
