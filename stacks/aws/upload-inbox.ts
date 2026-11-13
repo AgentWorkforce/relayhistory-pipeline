@@ -244,7 +244,7 @@ export const denyUploadInboxStatement = (bucketArn: string) => ({
  * inbox at all, and only the consumer and the eraser delete there. This covers the pipeline
  * role, the read API, the buffered GC and every operator role, whatever their identity grants.
  */
-export function uploadInboxBucketStatements(i: { bucketArn: string; eraserArn: string; uploadRoleArn: string; consumerRoleArn: string }) {
+export function uploadInboxBucketStatements(i: { bucketArn: string; eraserArn: string; uploadRoleArn: string; consumerRoleArn: string; presignIssuerArn?: string }) {
   const inbox = uploadInboxObjects(i.bucketArn);
   return [
     {
@@ -253,7 +253,7 @@ export function uploadInboxBucketStatements(i: { bucketArn: string; eraserArn: s
       Principal: "*",
       Action: ["s3:*"],
       Resource: [inbox],
-      Condition: { ArnNotEquals: { "aws:PrincipalArn": [i.consumerRoleArn, i.uploadRoleArn, i.eraserArn] } },
+      Condition: { ArnNotEquals: { "aws:PrincipalArn": [i.consumerRoleArn, i.uploadRoleArn, i.eraserArn, ...(i.presignIssuerArn ? [i.presignIssuerArn] : [])] } },
     },
     {
       Sid: "UploadInboxOnlyEraserOrConsumerDeletes",
@@ -267,7 +267,7 @@ export function uploadInboxBucketStatements(i: { bucketArn: string; eraserArn: s
 }
 
 /** Key-policy statements (flag on). The upload role encrypts inbox objects only; the consumer reads and promotes. */
-export function uploadInboxKeyStatements(i: { accountId: string; region: string; bucketName: string; uploadRoleArn: string; consumerRoleArn: string }) {
+export function uploadInboxKeyStatements(i: { accountId: string; region: string; bucketName: string; uploadRoleArn: string; consumerRoleArn: string; presignIssuerArn?: string }) {
   const viaFor = (glob: string) => ({
     StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
     StringLike: { "kms:EncryptionContext:aws:s3:arn": `arn:aws:s3:::${i.bucketName}/${glob}` },
@@ -275,6 +275,14 @@ export function uploadInboxKeyStatements(i: { accountId: string; region: string;
   return [
     { Sid: "DesktopUploadEncryptsInboxViaS3", Effect: "Allow" as const, Principal: { AWS: i.uploadRoleArn }, Action: ["kms:GenerateDataKey", "kms:Encrypt"], Resource: "*", Condition: viaFor(`${UPLOAD_INBOX_PREFIX}*`) },
     { Sid: "UploadAdmissionEncryptsAndReadsViaS3", Effect: "Allow" as const, Principal: { AWS: i.consumerRoleArn }, Action: ["kms:GenerateDataKey", "kms:Decrypt"], Resource: "*", Condition: viaFor(`${TENANT_KEY_BASE}/*`) },
+    ...(i.presignIssuerArn
+      ? [
+          // A presigned PUT is made as the issuer user: S3 asks KMS for the inbox object's data key as that user.
+          { Sid: "PresignIssuerEncryptsInboxViaS3", Effect: "Allow" as const, Principal: { AWS: i.presignIssuerArn }, Action: ["kms:GenerateDataKey", "kms:Encrypt"], Resource: "*", Condition: viaFor(`${UPLOAD_INBOX_PREFIX}*`) },
+          // The witness seq: the issuer reads privacy journals (written SSE-KMS by the Worker / consumer).
+          { Sid: "PresignIssuerReadsJournalsViaS3", Effect: "Allow" as const, Principal: { AWS: i.presignIssuerArn }, Action: ["kms:Decrypt"], Resource: "*", Condition: viaFor(PRIVACY_JOURNAL_GLOB) },
+        ]
+      : []),
   ];
 }
 
@@ -414,5 +422,71 @@ export function uploadAdmissionMappingProps(i: { functionName: string; queueArn:
     scalingConfig: { MaximumConcurrency: UPLOAD_ADMISSION_RESERVED_CONCURRENCY },
     enabled: true,
     tags: i.tags,
+  };
+}
+
+/**
+ * The hosted presigned issuer (decision 0004 workstream 1, hosted Cloud variant; AgentWorkforce/cloud#6244).
+ * Cloud runs on Cloudflare Workers with no AWS identity to assume the desktop-upload role, so it answers
+ * `kind: "presigned"` only, signing each URL with the keys of this dedicated IAM user (keys created out of band,
+ * never in state or source). Opt in with `transcriptStore.uploadPresignIssuer: true`, read only while
+ * historyUploadDirectInfra is on.
+ *
+ * What the vendored relay-control issuer signs, and so all this user may do:
+ *   - PUT `96bulls/.upload-inbox/<org>/v1/ws=<ws>/u=<uh>/...`, query-string signed (presigned), create-only
+ *     (`If-None-Match: *`), SSE-KMS with the transcripts key, plus x-amz-checksum-sha256, content-encoding zstd
+ *     and the witness metadata (S3 verifies the checksum; the consumer refuses everything else, see the header);
+ *   - GET `96bulls/.admission-inbox/<org>/v1/ws=<ws>/m=srv_<uh>/privacy-journal.json`, header signed (a 404 is
+ *     seq 0, so it also needs ListBucket: without it S3 answers 403 and the issuer fails closed);
+ *   - KMS through S3 only: encrypt inbox objects, decrypt privacy journals (uploadInboxKeyStatements).
+ * No delete, no other read, no list outside `.admission-inbox/` when a prefix is given, nothing outside S3/KMS.
+ */
+export const PRESIGN_ISSUER_RESOURCE = "upload-presign-issuer";
+/** A presigned URL older than this is refused by IAM whatever its X-Amz-Expires (relay-control caps it lower). */
+export const PRESIGN_MAX_SIGNATURE_AGE_MS = 60 * 60 * 1000;
+export const PRIVACY_JOURNAL_GLOB = `${TENANT_KEY_BASE}/.admission-inbox/*/v1/ws=*/m=srv_*/privacy-journal.json`;
+export const presignIssuerUserName = (stage: string) => `96bulls-${stage}-upload-presign-issuer`;
+
+export function uploadPresignIssuerPolicy(i: { bucketArn: string; accountId: string; region: string; keyAlias: string }) {
+  const inbox = uploadInboxObjects(i.bucketArn);
+  const journals = `${i.bucketArn}/${PRIVACY_JOURNAL_GLOB}`;
+  return {
+    Version: "2012-10-17" as const,
+    Statement: [
+      {
+        Sid: "PresignedCreateOnlyInboxPutSseKms",
+        Effect: "Allow" as const,
+        Action: ["s3:PutObject"],
+        Resource: [inbox],
+        Condition: {
+          StringEquals: { "s3:x-amz-server-side-encryption": "aws:kms", "s3:if-none-match": "*", "s3:authType": "REST-QUERY-STRING" },
+          StringLike: { "s3:x-amz-server-side-encryption-aws-kms-key-id": keyArnPattern(i.region, i.accountId) },
+          NumericLessThanEquals: { "s3:signatureAge": String(PRESIGN_MAX_SIGNATURE_AGE_MS) },
+        },
+      },
+      { Sid: "ReadPrivacyJournals", Effect: "Allow" as const, Action: ["s3:GetObject"], Resource: [journals], Condition: { StringEquals: { "s3:authType": "REST-HEADER" } } },
+      // A missing journal must answer 404 (seq 0), not 403: S3 requires ListBucket for that.
+      { Sid: "ListForMissingJournal", Effect: "Allow" as const, Action: ["s3:ListBucket"], Resource: [i.bucketArn] },
+      {
+        Sid: "NoListingOutsideAdmissionInbox",
+        Effect: "Deny" as const,
+        Action: ["s3:ListBucket"],
+        Resource: [i.bucketArn],
+        Condition: { Null: { "s3:prefix": "false" }, StringNotLike: { "s3:prefix": `${TENANT_KEY_BASE}/.admission-inbox/*` } },
+      },
+      {
+        Sid: "UseTranscriptKeyViaS3",
+        Effect: "Allow" as const,
+        Action: ["kms:GenerateDataKey", "kms:Encrypt", "kms:Decrypt"],
+        Resource: [keyArnPattern(i.region, i.accountId)],
+        Condition: {
+          StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com` },
+          "ForAnyValue:StringEquals": { "kms:ResourceAliases": i.keyAlias },
+        },
+      },
+      { Sid: "NothingElseInS3", Effect: "Deny" as const, Action: ["s3:*"], NotResource: [inbox, journals, i.bucketArn] },
+      { Sid: "NoOtherObjectActions", Effect: "Deny" as const, NotAction: ["s3:PutObject", "s3:GetObject", "s3:ListBucket"], Resource: [inbox, journals, i.bucketArn] },
+      { Sid: "OnlyS3AndKms", Effect: "Deny" as const, NotAction: ["s3:*", "kms:*"], Resource: "*" },
+    ],
   };
 }

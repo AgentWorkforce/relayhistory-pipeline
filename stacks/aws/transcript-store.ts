@@ -80,6 +80,7 @@ import {
   UPLOAD_ADMISSION_VISIBILITY_TIMEOUT_SECONDS,
   UPLOAD_ADMISSION_ROLE_GRANT_RESOURCES,
   UPLOAD_INBOX_RESOURCES,
+  PRESIGN_ISSUER_RESOURCE,
   assertHostedUploadInboxSse,
   assertUploadAdmissionInputs,
   assertUploadControlRoleArn,
@@ -93,6 +94,8 @@ import {
   uploadAdmissionMappingProps,
   uploadAdmissionQueuePolicy,
   uploadAdmissionSecretPolicy,
+  presignIssuerUserName,
+  uploadPresignIssuerPolicy,
   uploadInboxBucketStatements,
   uploadInboxKeyStatements,
   uploadInboxNames,
@@ -170,6 +173,12 @@ export interface TranscriptStoreInputs {
    * `historyUploadDirectInfra` is on; inert otherwise (still validated).
    */
   uploadAdmission?: UploadAdmissionInputs;
+  /**
+   * Default off. `true` (with `historyUploadDirectInfra` on) declares the hosted presigned issuer: the IAM user
+   * `96bulls-<stage>-upload-presign-issuer` whose out-of-band access keys Cloud signs presigned upload URLs with
+   * (upload-inbox.ts uploadPresignIssuerPolicy). Inert while the flag is off.
+   */
+  uploadPresignIssuer?: true;
   /**
    * The session pipeline (session-pipeline.ts): S3 manifest events -> SQS -> Lambda -> Supabase
    * pointer + ClickHouse index. Omit for the store alone.
@@ -277,12 +286,13 @@ export function assertTranscriptStoreInputs(
   if (inputs.region !== TRANSCRIPT_REGION) refuse(`transcript content must stay in ${TRANSCRIPT_REGION} (migration plan, regional boundaries), got ${inputs.region}`);
   if (inputs.partition !== TRANSCRIPT_PARTITION) refuse(`partition must be exactly ${TRANSCRIPT_PARTITION}, got ${JSON.stringify(inputs.partition)}`);
   for (const k of Object.keys(store))
-    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "uploadControlRoleArn" && k !== "uploadInboxSse" && k !== "uploadAdmission" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn") refuse(`transcriptStore.${k} is not a known setting`);
+    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "uploadControlRoleArn" && k !== "uploadInboxSse" && k !== "uploadAdmission" && k !== "uploadPresignIssuer" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn") refuse(`transcriptStore.${k} is not a known setting`);
   assertBufferedGcRoleArn(store.bufferedGcRoleArn, inputs.accountId);
   assertInboxAuthorityKeyRoot(store.inboxAuthorityKeyRoot, refuse);
   assertUploadControlRoleArn(store.uploadControlRoleArn, refuse);
   assertHostedUploadInboxSse(store.uploadInboxSse, false, refuse);
   assertUploadAdmissionInputs(store.uploadAdmission, false, refuse);
+  if (store.uploadPresignIssuer !== undefined && store.uploadPresignIssuer !== true) refuse("transcriptStore.uploadPresignIssuer must be true (omit for off)");
   if (store.sessionPipeline !== undefined) assertSessionPipelineInputs(store.sessionPipeline, refuse);
   if (store.sessionReadApi !== undefined) assertSessionReadApiInputs(store.sessionReadApi, refuse);
   if (store.managementEvents !== undefined && typeof store.managementEvents !== "boolean") refuse("transcriptStore.managementEvents must be a boolean");
@@ -629,6 +639,8 @@ function expectedResources(names: Iterable<string>): readonly string[] {
     ...(withBufferedErasure ? SESSION_BUFFERED_ERASURE_DELETE_RESOURCES : []),
     ...(list.some((n) => readApi.has(n)) ? SESSION_READ_API_RESOURCES : []),
     ...(list.some((n) => (UPLOAD_INBOX_RESOURCES as readonly string[]).includes(n)) ? UPLOAD_INBOX_RESOURCES : []),
+    // Optional on top of the upload inbox (uploadPresignIssuer): expected only once listed.
+    ...(list.includes(PRESIGN_ISSUER_RESOURCE) ? [PRESIGN_ISSUER_RESOURCE] : []),
   ];
 }
 
@@ -659,7 +671,9 @@ function uploadInboxPhase(
   stateSnapshotText: string | undefined,
   refuse: (why: string) => never,
 ): TranscriptStorePlanPhase | undefined {
-  const upload = UPLOAD_INBOX_RESOURCES as readonly string[];
+  // The presigned issuer user is judged with the inbox: created in a rollout (with or after it), noop otherwise.
+  const upload: readonly string[] = operations.has(PRESIGN_ISSUER_RESOURCE) ? [...UPLOAD_INBOX_RESOURCES, PRESIGN_ISSUER_RESOURCE] : UPLOAD_INBOX_RESOURCES;
+  if (operations.has(PRESIGN_ISSUER_RESOURCE) && !UPLOAD_INBOX_RESOURCES.some((r) => operations.has(r))) refuse(`${PRESIGN_ISSUER_RESOURCE} without the upload inbox`);
   if (!upload.some((r) => operations.has(r))) return undefined;
   if (upload.every((r) => operations.get(r) === "noop")) return undefined;
   const changes = () => [...operations].filter(([, a]) => a !== "noop").map(([r, a]) => `${r}:${a}`).join(", ");
@@ -678,6 +692,7 @@ function uploadInboxPhase(
   const label = "upload inbox update";
   if (at("upload-admission") !== "update") refuse(`${label}: upload resources change without an upload-admission function update: ${changes()}`);
   if (at("desktop-upload-role") !== "noop") refuse(`${label}: the desktop-upload role changes only in a reviewed rollout: ${changes()}`);
+  if (at(PRESIGN_ISSUER_RESOURCE) !== "noop") refuse(`${label}: the presigned issuer changes only in a reviewed rollout: ${changes()}`);
   const grants = UPLOAD_ADMISSION_ROLE_GRANT_RESOURCES as readonly string[];
   for (const [r, a] of operations) {
     if (a === "noop" || r === "upload-admission" || grants.includes(r)) continue;
@@ -1343,7 +1358,7 @@ export function trailLifecycleRules() {
  * including `aws:kms` without a key id (S3 would use `aws/s3`). SSE-C is blocked
  * separately by the encryption configuration.
  */
-export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string; accountId?: string; bufferedGcRoleArn?: string; analysisDeleterArn?: string; uploadInbox?: { uploadRoleArn: string; consumerRoleArn: string } }) {
+export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string; accountId?: string; bufferedGcRoleArn?: string; analysisDeleterArn?: string; uploadInbox?: { uploadRoleArn: string; consumerRoleArn: string; presignIssuerArn?: string } }) {
   if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId ?? "");
   // The eraser+GC principal list is shared by the analysis-on and analysis-off variants of
   // the eraser-only deny below: a single control point, covered by the hardening mutations.
@@ -1473,7 +1488,7 @@ export function trailLogBucketPolicy(i: { bucketArn: string; trailArn: string; a
  * The eraser and every other operator role have no use of it: deleting needs no key,
  * and nobody reads transcripts with the console.
  */
-export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; bufferedGcRoleArn?: string; analysisResults?: boolean; readApiRoleArn?: string; uploadInbox?: { uploadRoleArn: string; consumerRoleArn: string } }) {
+export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; bufferedGcRoleArn?: string; analysisResults?: boolean; readApiRoleArn?: string; uploadInbox?: { uploadRoleArn: string; consumerRoleArn: string; presignIssuerArn?: string } }) {
   if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId);
   const via = {
     StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
@@ -1671,6 +1686,8 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       if (i.transcriptStore.uploadInboxSse !== undefined) assertHostedUploadInboxSse(i.transcriptStore.uploadInboxSse, false, refuseOff);
       assertUploadAdmissionInputs(i.transcriptStore.uploadAdmission, false, refuseOff);
     }
+    if (i.transcriptStore.uploadPresignIssuer !== undefined && i.transcriptStore.uploadPresignIssuer !== true)
+      throw new Error(`96bulls: ${i.stage}: transcriptStore.uploadPresignIssuer must be true (omit for off). Nothing was created.`);
     const n = transcriptNames(i.stage, i.accountId);
     const eraserArn = userArn(i.accountId, n.userPath, n.eraser);
     const u = uploadInboxNames(i.stage, i.accountId, i.region);
@@ -1763,11 +1780,16 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
     const uploadFn = uploadRole
       ? yield* AWS.Lambda.Function("upload-admission", uploadAdmissionFunctionProps({ stage: i.stage, bucket: n.bucket, names: u, p: i.transcriptStore.uploadAdmission!, sse: i.transcriptStore.uploadInboxSse! }) as never)
       : undefined;
+    // The hosted presigned issuer (opt-in on top of the flag): a principal the wall and the key policy name.
+    const presignIssuer = uploadFn && i.transcriptStore.uploadPresignIssuer === true
+      ? yield* user(PRESIGN_ISSUER_RESOURCE, presignIssuerUserName(i.stage), "cloud-presigns-desktop-uploads", uploadPresignIssuerPolicy({ bucketArn: n.bucketArn, accountId: i.accountId, region: i.region, keyAlias: n.keyAlias }))
+      : undefined;
     const uploadInboxRoles =
       uploadRole && uploadFn
         ? {
             uploadRoleArn: (uploadRole as unknown as { roleArn: string }).roleArn,
             consumerRoleArn: (uploadFn as unknown as { roleArn: string }).roleArn,
+            ...(presignIssuer ? { presignIssuerArn: presignIssuer.userArn as unknown as string } : {}),
           }
         : undefined;
 
@@ -1835,7 +1857,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
 
     // historyUploadDirectInfra: S3 (this bucket only) -> upload-admission queue -> the consumer
     // Lambda. Same shape as the session-events queue (session-pipeline.ts).
-    let uploadInbox: { queueUrl: string; queueArn: unknown; dlqArn: unknown; uploadRoleArn: string; consumerRoleArn: string; functionName: string; secretName: string; mappingUuid: unknown; consumerEnvironment: ReturnType<typeof uploadAdmissionEnvironment> } | undefined;
+    let uploadInbox: { queueUrl: string; queueArn: unknown; dlqArn: unknown; uploadRoleArn: string; consumerRoleArn: string; functionName: string; secretName: string; mappingUuid: unknown; presignIssuerUser?: string; consumerEnvironment: ReturnType<typeof uploadAdmissionEnvironment> } | undefined;
     if (uploadInboxRoles && uploadFn) {
       const uploadDlq = yield* AWS.SQS.Queue("upload-admission-dlq", {
         queueName: u.dlq,
@@ -1915,6 +1937,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
         functionName: u.function,
         secretName: u.secret,
         mappingUuid: (mapping as unknown as { uuid: string }).uuid,
+        ...(uploadInboxRoles.presignIssuerArn ? { presignIssuerUser: presignIssuerUserName(i.stage) } : {}),
         // The consumer function's environment carries this (uploadAdmissionFunctionEnv): HISTORY_UPLOAD_INBOX_SSE=aws:kms.
         consumerEnvironment: uploadAdmissionEnvironment(i.transcriptStore.uploadInboxSse!),
       };

@@ -123,3 +123,18 @@ describe("upload inbox update", () => {
     expect(() => check({ "upload-admission": "update", "upload-admission-dlq": "create" })).toThrow(/upload-admission-dlq may not create/);
   });
 });
+
+describe("upload presign issuer (uploadPresignIssuer)", () => {
+  const withIssuer = [...all, "upload-presign-issuer"];
+  const grants = { transcripts: "update", "transcripts-key": "update" };
+  it("is created with the inbox rollout or after it, with only the wall and key updated", () => {
+    const creates = Object.fromEntries([...UPLOAD_INBOX_RESOURCES, "upload-presign-issuer"].map((r) => [r, "create"]));
+    expect(check({ ...creates, ...grants, "transcript-writer": "update", "transcript-reader": "update", "transcript-srv-writer": "update" }, {}, ROLE, withIssuer)).toBe("upload inbox rollout");
+    expect(check({ "upload-presign-issuer": "create", ...grants }, {}, ROLE, withIssuer)).toBe("upload inbox rollout");
+    expect(check({}, {}, ROLE, withIssuer)).toBe("post-apply");
+  });
+  it("never changes in an update, and never exists without the inbox", () => {
+    expect(() => check({ "upload-admission": "update", "upload-presign-issuer": "update" }, {}, ROLE, withIssuer)).toThrow(/presigned issuer changes only in a reviewed rollout/);
+    expect(() => check({ "upload-presign-issuer": "create", ...grants }, {}, ROLE, [...store, ...SESSION_PIPELINE_RESOURCES, "upload-presign-issuer"])).toThrow(/upload-presign-issuer without the upload inbox/);
+  });
+});
