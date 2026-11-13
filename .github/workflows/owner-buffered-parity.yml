@@ -161,7 +161,7 @@ jobs:
       - name: Census, write, read back or discover owner-buffered parity (only step with the database secret)
         env:
           SUPABASE_MIGRATION_OWNER_URL: ${{ secrets.SUPABASE_MIGRATION_OWNER_URL }}
-          OWNER_PARITY_NEON_READONLY_URL: ${{ secrets.OWNER_PARITY_NEON_READONLY_URL }}
+          OWNER_PARITY_NEON_READONLY_URL: ${{ inputs.census_source == 'neon' && secrets.OWNER_PARITY_NEON_READONLY_URL || '' }}
         run: bun scripts/owner-buffered-parity-ci.ts
       - name: Publish the census artifact (census only)
         if: inputs.mode == 'census'

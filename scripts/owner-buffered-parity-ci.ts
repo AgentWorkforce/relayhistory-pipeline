@@ -727,6 +727,21 @@ export function ownerParityChildSpawn(
     input: JSON.stringify({ supabaseUrl, ...(neonUrl === undefined ? {} : { neonUrl }) }) };
 }
 
+/** Parent-only source selection: frozen mode never inspects or forwards the optional Neon secret. */
+export function ownerParityChildSpawnForDispatch(
+  env: Record<string, string | undefined>,
+  dispatch: OwnerParityDispatch,
+  supabaseUrl: string,
+  rawNeonUrl: string | undefined,
+  script?: string,
+): ReturnType<typeof ownerParityChildSpawn> {
+  const neonUrl = dispatch.censusSource === "neon"
+    ? (typeof rawNeonUrl === "string" && rawNeonUrl !== "" ? pinnedNeonReadonlyUrl(rawNeonUrl)
+      : refuseOwnerParity("owner_parity_neon_credential_missing"))
+    : undefined;
+  return ownerParityChildSpawn(env, supabaseUrl, script, neonUrl);
+}
+
 /** The child holds no credential in its environment: the URL arrives only over the stdin pipe. */
 export function refuseOwnerParityCredentialEnv(env: Record<string, string | undefined>): void {
   refuseCredentialEnv(env);
@@ -810,11 +825,7 @@ async function parent(): Promise<number> {
     const pre = ownerParityPreflight(env, roster, census);
     verifyCheckout(pre.dispatch.sha);
     if (typeof url !== "string" || url === "") refuseOwnerParity("owner_parity_credential_missing");
-    const neonUrl = pre.dispatch.censusSource === "neon"
-      ? (typeof rawNeonUrl === "string" && rawNeonUrl !== "" ? pinnedNeonReadonlyUrl(rawNeonUrl)
-        : refuseOwnerParity("owner_parity_neon_credential_missing"))
-      : undefined;
-    const spec = ownerParityChildSpawn(env, url, undefined, neonUrl);
+    const spec = ownerParityChildSpawnForDispatch(env, pre.dispatch, url, rawNeonUrl);
     return await new Promise<number>((resolve) => {
       const child = spawn(spec.command, spec.args, { cwd: ROOT, env: spec.env, stdio: ["pipe", "inherit", "inherit"] });
       child.on("error", () => resolve(1));
@@ -829,6 +840,28 @@ async function parent(): Promise<number> {
 }
 
 /** Credential child: the URL arrives over stdin only, and every session is fenced. */
+export async function requireNeonParityReadonlyIdentity(client: Queryable): Promise<void> {
+  let rows: Array<{ actor: string; login: string; db: string; ro: string; defaultRo: string;
+    rolcanlogin: boolean; rolsuper: boolean; rolcreaterole: boolean; rolcreatedb: boolean;
+    rolbypassrls: boolean; rolreplication: boolean }>;
+  try {
+    rows = (await client.query(`
+      SELECT current_user AS actor,session_user AS login,current_database() AS db,
+             current_setting('transaction_read_only') AS ro,
+             current_setting('default_transaction_read_only') AS "defaultRo",
+             r.rolcanlogin,r.rolsuper,r.rolcreaterole,r.rolcreatedb,r.rolbypassrls,r.rolreplication
+        FROM pg_roles r WHERE r.rolname=current_user`)).rows as typeof rows;
+  } catch {
+    throw new OwnerBufferedOperatorRefusal("neon_readonly_identity_unverifiable");
+  }
+  const row = rows[0];
+  if (rows.length !== 1 || row?.actor !== "relayhistory_readonly" || row.login !== "relayhistory_readonly" ||
+      row.db !== "neondb" || row.ro !== "on" || row.defaultRo !== "on" || row.rolcanlogin !== true ||
+      row.rolsuper !== false || row.rolcreaterole !== false || row.rolcreatedb !== false ||
+      row.rolbypassrls !== false || row.rolreplication !== false)
+    throw new OwnerBufferedOperatorRefusal("neon_readonly_identity_refused");
+}
+
 async function operatorChild(): Promise<number> {
   const env = process.env;
   let paths: ReturnType<typeof outputPaths> | null = null;
@@ -868,6 +901,7 @@ async function operatorChild(): Promise<number> {
       const neon = await connectNeon(neonUrl);
       try {
         await requireReadOnly(neon, "neonUrl");
+        await requireNeonParityReadonlyIdentity(neon);
         outcome = await run(neon);
       } finally {
         await neon.end().catch(() => undefined);

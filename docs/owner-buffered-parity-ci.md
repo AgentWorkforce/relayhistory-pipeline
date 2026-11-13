@@ -53,7 +53,13 @@ The generation is never an input. Census discovers the live PASS marker generati
 - `neon` reads only through `OWNER_PARITY_NEON_READONLY_URL` on the same protected environment. Before the child
   starts, the parent pins the URL to the reviewed direct endpoint, database and `relayhistory_readonly` role and
   normalizes verify-full TLS. A missing secret refuses `owner_parity_neon_credential_missing`; it never falls back
-  to the frozen copy or a runtime application role.
+  to the frozen copy or a runtime application role. After connect, the child independently proves
+  `current_user=session_user=relayhistory_readonly`, database `neondb`, both read-only settings and non-privileged
+  role attributes before any source read.
+
+`neon` is intentionally available to discovery, census and readback. G2 write uses the same Neon G1 source only
+after the separate dormant write switch is reviewed and enabled; the target is the only writable side. Creating or
+updating the protected-environment secret is a separate explicitly authorized production configuration action.
 
 ## Gates
 
@@ -204,8 +210,9 @@ discovery run carries the counts only (`found` = scanned, `equal` = canonical cu
 
 ## Credentials
 
-Only the one database step receives secrets: the existing direct-owner `SUPABASE_MIGRATION_OWNER_URL` and the
-restricted `OWNER_PARITY_NEON_READONLY_URL`. No new environment is added. The Supabase URL must retain the exact
+Only the one database step can receive secrets: the existing direct-owner `SUPABASE_MIGRATION_OWNER_URL` and,
+only when `census_source=neon`, the restricted `OWNER_PARITY_NEON_READONLY_URL`. Frozen-source runs receive an
+empty Neon variable. No new environment is added. The Supabase URL must retain the exact
 guarded-schema-release identity (`postgres.<project>`); a CLI temporary-login URL is refused rather than silently
 mixing the two owner contracts. The Neon URL is used only when `census_source=neon` and is pinned to the reviewed
 `relayhistory_readonly` target before it can reach the credential child.

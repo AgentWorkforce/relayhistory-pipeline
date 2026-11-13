@@ -60,7 +60,7 @@ type Disposition = "current" | "missing" | "stale";
  * A mock world: `buffered` is the cursor's rows, `state` the per-tenant stored row (current = byte-equal to the
  * fresh proof, stale = differs, missing = none). Generation reads can be scripted per call.
  */
-function world(state: Disposition[], opts: { extraRows?: Array<Record<string, unknown>> } = {}) {
+function world(state: Disposition[], opts: { extraRows?: Array<Record<string, unknown>>; sourceAnchor?: boolean } = {}) {
   const buffered = tenants.slice(0, state.length);
   const w = {
     generation: H("4"),
@@ -86,7 +86,8 @@ function world(state: Disposition[], opts: { extraRows?: Array<Record<string, un
   const sessions: OwnerParitySessions = {
     source: { query: async <R>(sql: string, params: unknown[] = []) => {
       w.statements.push({ session: "source", sql, params });
-      if (sql === NEON_DISCOVERY_SNAPSHOT_ANCHOR_SQL) return { rows: [{ snapshot_anchor: true }] as R[] };
+      if (sql === NEON_DISCOVERY_SNAPSHOT_ANCHOR_SQL)
+        return { rows: [{ snapshot_anchor: opts.sourceAnchor ?? true }] as R[] };
       return { rows: [] as R[] };
     } },
     enumerator: {
@@ -261,6 +262,29 @@ test("discovery with Neon holds one caller-owned read-only snapshot on each data
   const enumerator = x.w.statements.filter((s) => s.session === "enumerator").map((s) => s.sql);
   expect(enumerator[0]).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
   expect(enumerator.at(-1)).toBe("COMMIT");
+});
+
+test("Neon discovery refuses a missing source anchor with counts only and rolls both snapshots back", async () => {
+  const x = world(seven, { sourceAnchor: false });
+  const out = await discover(x, env("discovery", { OWNER_PARITY_CENSUS_SOURCE: "neon" }));
+  expect(out.receipt).toMatchObject({ status: "refused", code: "owner_parity_discovery_source_anchor",
+    counts: { scanned: 0, canonicalCurrent: 0, missing: 0, stale: 0, unparsable: 0 } });
+  expect(x.w.statements.filter((s) => s.session === "source").map((s) => s.sql)).toEqual([
+    "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", "SET LOCAL statement_timeout = '30s'",
+    NEON_DISCOVERY_SNAPSHOT_ANCHOR_SQL, "ROLLBACK",
+  ]);
+  expect(x.w.statements.filter((s) => s.session === "enumerator").at(-1)?.sql).toBe("ROLLBACK");
+  expectCountsOnly(out);
+});
+
+test("Neon discovery refuses when source and target snapshot sessions alias before any transaction", async () => {
+  const x = world(seven);
+  x.sessions.source = x.sessions.enumerator;
+  const out = await discover(x, env("discovery", { OWNER_PARITY_CENSUS_SOURCE: "neon" }));
+  expect(out.receipt).toMatchObject({ status: "refused", code: "owner_parity_discovery_session_alias",
+    counts: { scanned: 0, canonicalCurrent: 0, missing: 0, stale: 0, unparsable: 0 } });
+  expect(x.w.statements).toEqual([{ session: "target", sql: BULK_TARGET_GENERATION_SQL, params: [] }]);
+  expectCountsOnly(out);
 });
 
 test("discovery: a count other than seven refuses unexpected_scope with counts only, never digests", async () => {

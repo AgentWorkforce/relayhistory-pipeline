@@ -13,6 +13,8 @@ import {
   OWNER_PARITY_CHILD_ENV,
   ownerParityCode,
   ownerParityChildSpawn,
+  ownerParityChildSpawnForDispatch,
+  requireNeonParityReadonlyIdentity,
   refuseOwnerParityCredentialEnv,
   runOwnerParity,
   withWorkflowParityOwnerSession,
@@ -23,7 +25,9 @@ import {
 import type { ConnectedOwnerClient } from "../../hoopdb/owner-operator-apply.ts";
 import { BULK_TARGET_GENERATION_SQL, tenantSha256 } from "../../../scripts/owner-buffered-parity-operator.ts";
 import { ParityCensusRefusal, READ_OWNER_BUFFERED_PARITY_SQL, type OwnerBufferedParityProof, type ParityCensusReceipt, type ParityTenant } from "../owner-buffered-parity.ts";
-import { OWNER_PARITY_WRITE_ENABLED, ownerParityConfirmation, type OwnerParityCensusArtifact } from "../owner-buffered-parity-ci-contract.ts";
+import { OWNER_PARITY_WRITE_ENABLED, ownerParityConfirmation, ownerParityDispatch,
+  type OwnerParityCensusArtifact } from "../owner-buffered-parity-ci-contract.ts";
+import { OWNER_PARITY_CREDENTIAL_TARGET as TARGET } from "../../../scripts/owner-buffered-parity-credential-producer.ts";
 
 const H = (c: string) => c.repeat(64);
 const SHA = "5".repeat(40);
@@ -283,6 +287,50 @@ test("credential leakage: the child gets the URL on stdin only, never argv or en
   expect(() => refuseOwnerParityCredentialEnv(spec.env)).not.toThrow();
   for (const extra of [{ SUPABASE_MIGRATION_OWNER_URL: url }, { GITHUB_TOKEN: "t" }, { PGPASSWORD: "p" }])
     expect(() => refuseOwnerParityCredentialEnv({ ...spec.env, ...extra })).toThrow();
+});
+
+test("parent source routing requires a pinned Neon credential and never forwards one to frozen mode", () => {
+  const supabaseUrl = "postgresql://fixture-owner:supabase-secret@db.fixture.invalid:5432/postgres";
+  const childEnv = { PATH: "/usr/bin", HOME: "/home/runner", OWNER_PARITY_SHA: SHA };
+  const neonDispatch = ownerParityDispatch({ ...base, OWNER_PARITY_MODE: "discovery", OWNER_PARITY_CENSUS_SOURCE: "neon" }, true);
+  const frozenDispatch = ownerParityDispatch({ ...base, OWNER_PARITY_MODE: "discovery" }, true);
+
+  expect(() => ownerParityChildSpawnForDispatch(childEnv, neonDispatch, supabaseUrl, undefined))
+    .toThrow("owner_parity_neon_credential_missing");
+
+  const marker = "neon-password-must-not-escape";
+  const wrongUrl = `postgresql://${TARGET.neonRole}:${marker}@wrong.neon.tech:5432/${TARGET.neonDatabase}?sslmode=verify-full`;
+  let refused = "";
+  try {
+    ownerParityChildSpawnForDispatch(childEnv, neonDispatch, supabaseUrl, wrongUrl);
+  } catch (error) {
+    refused = JSON.stringify({ code: ownerParityCode(error) });
+  }
+  expect(refused).toBe('{"code":"neon_target_pin"}');
+  expect(refused).not.toContain(marker);
+  expect(refused).not.toContain("wrong.neon.tech");
+  expect(refused).not.toContain(TARGET.neonRole);
+
+  const frozen = ownerParityChildSpawnForDispatch(childEnv, frozenDispatch, supabaseUrl, wrongUrl);
+  expect(JSON.parse(frozen.input)).toEqual({ supabaseUrl });
+  expect(JSON.stringify([frozen.args, frozen.env, frozen.input])).not.toContain(marker);
+  expect(JSON.stringify([frozen.args, frozen.env, frozen.input])).not.toContain("wrong.neon.tech");
+});
+
+test("Neon runtime identity is the exact non-privileged relayhistory_readonly role", async () => {
+  const good = { actor: "relayhistory_readonly", login: "relayhistory_readonly", db: "neondb", ro: "on", defaultRo: "on",
+    rolcanlogin: true, rolsuper: false, rolcreaterole: false, rolcreatedb: false, rolbypassrls: false, rolreplication: false };
+  const client = (row: Record<string, unknown>) => ({ query: async () => ({ rows: [row] }) });
+  await expect(requireNeonParityReadonlyIdentity(client(good))).resolves.toBeUndefined();
+  for (const bad of [
+    { ...good, actor: "neondb_owner" }, { ...good, login: "neondb_owner" }, { ...good, db: "other" },
+    { ...good, ro: "off" }, { ...good, defaultRo: "off" }, { ...good, rolcanlogin: false },
+    { ...good, rolsuper: true }, { ...good, rolcreaterole: true }, { ...good, rolcreatedb: true },
+    { ...good, rolbypassrls: true }, { ...good, rolreplication: true },
+  ]) await expect(requireNeonParityReadonlyIdentity(client(bad)))
+    .rejects.toThrow("neon_readonly_identity_refused");
+  await expect(requireNeonParityReadonlyIdentity({ query: async () => { throw new Error("private driver detail"); } }))
+    .rejects.toThrow("neon_readonly_identity_unverifiable");
 });
 
 test("parent process: dormant write and the empty committed roster refuse before the secret is read; nothing secret is printed or written", () => {

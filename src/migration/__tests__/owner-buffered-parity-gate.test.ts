@@ -250,6 +250,8 @@ test("workflow: two pinned secrets in one step, gate without environment, proof 
   expect(workflow.match(/secrets\.[A-Z_]+/gu)).toEqual([
     "secrets.SUPABASE_MIGRATION_OWNER_URL", "secrets.OWNER_PARITY_NEON_READONLY_URL",
   ]);
+  expect([...new Set(workflow.match(/OWNER_PARITY_NEON_[A-Z0-9_]+/gu) ?? [])])
+    .toEqual(["OWNER_PARITY_NEON_READONLY_URL"]);
   expect(workflow.match(/vars\.[A-Za-z_]+/gu)).toBeNull();
   expect(workflow).toContain("options: [census, write, readback, discovery]");
   expect(workflow).toContain("options: [frozen-supabase, neon]");
@@ -284,6 +286,7 @@ test("workflow: two pinned secrets in one step, gate without environment, proof 
   // The step holding the secret runs the wrapper only; the URL never reaches argv.
   const step = workflow.slice(workflow.indexOf("only step with the database secret"), workflow.indexOf("Publish the census artifact"));
   expect(step).toContain("run: bun scripts/owner-buffered-parity-ci.ts\n");
+  expect(step).toContain("OWNER_PARITY_NEON_READONLY_URL: ${{ inputs.census_source == 'neon' && secrets.OWNER_PARITY_NEON_READONLY_URL || '' }}");
   expect(step).not.toMatch(/\$SUPABASE|\$\{SUPABASE|echo/u);
   for (const forbidden of ["supabase login", "SET ROLE", "neonUrl", "bulk", P.project]) expect(workflow).not.toContain(forbidden);
 });
