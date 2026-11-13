@@ -105,7 +105,9 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     expect(a.deleted).toEqual({ "origin-1": [["claude", "sess-1"], ["codex", "sess-2"]] });
     expect(fenceEpoch(a, "origin-1", sessionKeyHash("claude", "sess-1"))).toBe(1);
     const b = (await fenceOf(store, B))!;
-    expect(b).toMatchObject({ resets: 2, resetRequests: { "req-1": 3, "req-2": 1 }, lastResetAtMs: Date.parse("2030-01-03T00:00:00.000Z") + 1 });
+    expect(b).toMatchObject({ resets: 2, resetsCompleted: 2, resetRequests: { "req-1": 3, "req-2": 1 }, lastResetAtMs: Date.parse("2030-01-03T00:00:00.000Z") + 1 });
+    // A backfilled reset is complete by definition: entries before it are forgotten (resetsCompleted == resets).
+    for (const f of [a, b, (await fenceOf(store, C))!]) expect(f.resetsCompleted).toBe(f.resets);
     expect(await fenceOf(store, C)).toMatchObject({ resets: 0, deleted: {}, version: 1 });
     // Counts only: no tenant, session or record ids.
     const text = JSON.stringify(summary);
@@ -158,7 +160,7 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
       [{ recordId: "rec-1", revision: 9, revisionId: "rec-1:r9", digest: hex("9"), sessionKey: sessionKeyHash("claude", "sess-1"), epoch: 0, resets: 1 }]);
 
     const summary = await run(store);
-    expect(summary.revisions).toMatchObject({ rows: 4, merged: 2, skipped_deleted: 1, unrepresentable: 1, invalid: 0, failed: 0 });
+    expect(summary.revisions).toMatchObject({ rows: 4, merged: 2, skipped_deleted: 1, unrepresentable_seed: 1, invalid: 0, failed: 0 });
     // A seed-proof row #580's entry cannot express leaves the section incomplete (reported, not guessed).
     expect(summary.sections.revisions).toBe("incomplete");
     expect(await entryOf(store, A, "origin-1", "rec-1")).toEqual([9, "rec-1:r9", hex("9"), sessionKeyHash("claude", "sess-1"), 0, 1]);
@@ -241,6 +243,20 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     const second = await run(store, { sections: ["ownership"] });
     expect(second.sections.ownership).toBe("complete");
     expect(await ownerOf(store, A, "origin-1", "claude", "sess-1")).toMatchObject({ epoch: 0, resets: 1 });
+  });
+
+  test("a fence already holding a reset in flight (the mirror's) is counted and leaves the section incomplete", async () => {
+    const store = scratch();
+    await io(store).editFence(s3LedgerKeys(ROOT, A).fence, (f) => {
+      applyFenceChange(f, { reset: { requestId: "mirror-running", atMs: Date.parse("2030-01-02T00:00:00.000Z"), result: null } });
+      return { next: f, result: undefined };
+    });
+    await reset(A, "req-sql", "2030-01-03T00:00:00.000Z", 2);
+    const summary = await run(store);
+    expect(summary.fences).toMatchObject({ updated: 1, resets_added: 1, resets_in_flight: 1 });
+    expect(summary.sections.fences).toBe("incomplete");
+    const f = (await fenceOf(store, A))!;
+    expect(f.resetsCompleted).toBeLessThan(f.resets); // ledger-s3's rule: never advanced past a reset in flight
   });
 
   test("a contended fence CAS retries and lands; tallies count once", async () => {

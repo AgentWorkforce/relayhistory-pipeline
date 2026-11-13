@@ -8,7 +8,10 @@
  *              starts from `newFence()`), SQL's deletions and resets applied with `applyFenceChange` (a new
  *              deletion bumps the session's epoch; a new reset request id is recorded with its tombstone
  *              count, increments `resets` and raises `lastResetAtMs` to SQL's `reset_at`, rounded up to the
- *              ms). A user with no controls still gets an (empty) fence: the drain refuses an absent one.
+ *              ms). Each backfilled reset is recorded with its final count, so `resetsCompleted == resets`
+ *              (a backfilled reset is complete by definition); a fence that still holds a reset in flight
+ *              (the control mirror's) is counted `resets_in_flight` and leaves the section incomplete.
+ *              A user with no controls still gets an (empty) fence: the drain refuses an absent one.
  *   ownership  `ingest_session_ownership` (written at claim, so pending and committed claims alike) into the
  *              ownership stubs (`registerOwner`), at the backfilled fence's current generation
  *              (`recordGeneration`), so a later reset lists sessions owned only in SQL.
@@ -68,9 +71,11 @@ export interface BackfillSummary {
     created: number; updated: number; unchanged: number; would_create: number; would_update: number;
     pairs_added: number; resets_added: number;
     unreadable: number; contended: number; tenant_invalid: number; input_invalid: number; failed: number;
+    /** Fences left with a reset begun and not finished (resetsCompleted < resets): a mirrored reset in flight. */
+    resets_in_flight: number;
   };
   ownership: { rows: number; registered: number; would_register: number; unchanged: number; skipped_deleted: number; skipped_no_fence: number; invalid: number; failed: number };
-  revisions: { rows: number; merged: number; would_merge: number; skipped_deleted: number; skipped_no_fence: number; unrepresentable: number; invalid: number; shards: number; failed: number };
+  revisions: { rows: number; merged: number; would_merge: number; skipped_deleted: number; skipped_no_fence: number; unrepresentable_seed: number; invalid: number; shards: number; failed: number };
   /** Per section: complete (nothing skipped for want of a fence, nothing invalid or failed), incomplete, or not run. */
   sections: Record<BackfillSection, "complete" | "incomplete" | "not_run">;
 }
@@ -156,9 +161,9 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   const io = s3LedgerObjects(store, opts.keyRoot, { ...(opts.sleep ? { sleep: opts.sleep } : {}), ...(opts.random ? { random: opts.random } : {}) });
   const summary: BackfillSummary = {
     mode: opts.dryRun ? "dry_run" : "execute", users: 0,
-    fences: { deletion_rows: 0, reset_rows: 0, created: 0, updated: 0, unchanged: 0, would_create: 0, would_update: 0, pairs_added: 0, resets_added: 0, unreadable: 0, contended: 0, tenant_invalid: 0, input_invalid: 0, failed: 0 },
+    fences: { deletion_rows: 0, reset_rows: 0, created: 0, updated: 0, unchanged: 0, would_create: 0, would_update: 0, pairs_added: 0, resets_added: 0, unreadable: 0, contended: 0, tenant_invalid: 0, input_invalid: 0, failed: 0, resets_in_flight: 0 },
     ownership: { rows: 0, registered: 0, would_register: 0, unchanged: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, failed: 0 },
-    revisions: { rows: 0, merged: 0, would_merge: 0, skipped_deleted: 0, skipped_no_fence: 0, unrepresentable: 0, invalid: 0, shards: 0, failed: 0 },
+    revisions: { rows: 0, merged: 0, would_merge: 0, skipped_deleted: 0, skipped_no_fence: 0, unrepresentable_seed: 0, invalid: 0, shards: 0, failed: 0 },
     sections: { fences: "not_run", ownership: "not_run", revisions: "not_run" },
   };
   /** Each user's fence as it stands after the fence section (or as read, when that section is not run). */
@@ -237,6 +242,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
             const f = read.state === "present" ? structuredClone(read.fence) : newFence();
             const t = apply(f);
             tally(t);
+            if (f.resetsCompleted < f.resets) summary.fences.resets_in_flight++;
             if (read.state === "absent") summary.fences.would_create++;
             else if (t.changed) summary.fences.would_update++;
             else summary.fences.unchanged++;
@@ -244,16 +250,18 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
             return;
           }
           // editFence may run the edit more than once (CAS retries): only the landed attempt's result counts.
-          type Landed = { outcome: "created" | "updated" | "unchanged"; t: { changed: boolean; pairs: number; resets: number } };
+          type Landed = { outcome: "created" | "updated" | "unchanged"; t: { changed: boolean; pairs: number; resets: number }; inFlight: boolean };
           const landed = await io.editFence<Landed>(key, (f) => {
             const absent = f.version === 0; // editFence starts an absent fence from newFence() (version 0)
             const t = apply(f);
             fences.set(uk, f);
-            if (!t.changed && !absent) return { next: null, result: { outcome: "unchanged", t } };
-            return { next: f, result: { outcome: absent ? "created" : "updated", t } };
+            const inFlight = f.resetsCompleted < f.resets;
+            if (!t.changed && !absent) return { next: null, result: { outcome: "unchanged", t, inFlight } };
+            return { next: f, result: { outcome: absent ? "created" : "updated", t, inFlight } };
           });
           summary.fences[landed.outcome]++;
           tally(landed.t);
+          if (landed.inFlight) summary.fences.resets_in_flight++;
         } catch (error) {
           const code = (error as { code?: unknown })?.code;
           if (code === "ledger_fence_invalid") summary.fences.unreadable++;
@@ -265,7 +273,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     }
     if (sections.has("fences")) {
       const f = summary.fences;
-      summary.sections.fences = f.unreadable + f.contended + f.tenant_invalid + f.input_invalid + f.failed === 0 ? "complete" : "incomplete";
+      summary.sections.fences = f.unreadable + f.contended + f.tenant_invalid + f.input_invalid + f.failed + f.resets_in_flight === 0 ? "complete" : "incomplete";
     }
 
     // ---- ownership ----
@@ -312,8 +320,10 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
         const groups = new Map<string, { key: string; fence: FenceDoc; originId: string; entries: IndexEntryInput[] }>();
         for (const r of rows) {
           summary.revisions.rows++;
-          // Seed-proof rows (20261104040000) carry no revision id or digest: #580's entry cannot express them.
-          if (r.revision_id === null || r.digest === null) { summary.revisions.unrepresentable++; continue; }
+          // Seed-proof rows (20261104040000 ingest_seed_proven_records, the operator S3-proof bootstrap) carry no
+          // revision id or digest, and #580's entry cannot express them. They stand for REAL user records that
+          // SQL's #250 check uses by revision alone, so they are counted and the section stays incomplete.
+          if (r.revision_id === null || r.digest === null) { summary.revisions.unrepresentable_seed++; continue; }
           const fence = fences.get(userKey(r.org_id, r.workspace_id, r.user_id));
           if (!fence) { summary.revisions.skipped_no_fence++; continue; }
           const revision = int(r.revision);
@@ -345,7 +355,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
         });
       }
       const v = summary.revisions;
-      summary.sections.revisions = v.skipped_no_fence + v.unrepresentable + v.invalid + v.failed === 0 ? "complete" : "incomplete";
+      summary.sections.revisions = v.skipped_no_fence + v.unrepresentable_seed + v.invalid + v.failed === 0 ? "complete" : "incomplete";
     }
   } finally {
     await sql.query("ROLLBACK").catch(() => {});
