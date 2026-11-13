@@ -55,6 +55,7 @@ import { AcquisitionRefusedError } from "./acquisition-refusal.ts";
 import { parseDeliveryRequest, requireDeliveryAccount, prepareDelivery } from "./vendor/delivery/prepare.ts";
 import { decodeRecoveryEnvelope, RECOVERY_CONTENT_TYPE } from "./recovery-protocol.ts";
 import { parseTurnBatch } from "./turns.ts";
+import { HttpAdmissionStopped } from "./http-admission-stop.ts";
 import { heartbeatProgress, ProgressError, readConnection, readSessionReceipt, recordHeartbeat, type Run as OnboardingRun } from "../history-db/onboarding.ts";
 
 /**
@@ -196,6 +197,13 @@ export interface IngestAppDeps {
    * the upload-admission Lambda (hosted) or the self-host scan, never in this app.
    */
   uploadDirect?: UploadDirectConfig;
+  /**
+   * INGEST_HTTP_ADMISSION_STOPPED_ORGS (http-admission-stop.ts, decision 0005). Absent or empty: nothing
+   * changes. A listed org's every HTTP admission entry (batches, turns, recovery) answers 503
+   * delivery_unavailable with Retry-After before its body is parsed or any ledger call; controls and reads
+   * are untouched. It is the fence-authority marker's `workerHttpAdmission: "off"` precondition.
+   */
+  httpAdmissionStoppedOrgs?: ReadonlySet<string>;
   /**
    * INGEST_S3_FENCE_MIRROR=on (decision 0005 "Controls"): the S3 upload fence (ledger-s3.ts) mirrors the SQL
    * ledger's selection and reset fences, so the S3-native consumers and the backlog drain see every deletion.
@@ -370,6 +378,8 @@ function failure(c: Context<Env>, error: unknown) {
   if (safe instanceof DeliveryBusyError) c.header("Retry-After", String(safe.retryAfterSeconds));
   // Held for consent: a long wait, and the 503 keeps every released Desktop's batch on disk for the retry.
   if (safe instanceof UploadConsentRequired) c.header("Retry-After", String(safe.retryAfterSeconds));
+  // A stopped org (INGEST_HTTP_ADMISSION_STOPPED_ORGS): retry later, by which time the desktop uploads directly.
+  if (safe instanceof HttpAdmissionStopped) c.header("Retry-After", String(safe.retryAfterSeconds));
   // Acquisition refusal (design §5.6): the refused sessions sit beside `error`, not inside it.
   if (safe instanceof AcquisitionRefusedError)
     return c.json({ ...errorBody(c, safe.code, safe.message), refused: safe.refused.map((r) => ({ source: r.source, sessionId: r.sessionId, code: r.code })) }, 409);
@@ -530,6 +540,9 @@ export function createIngestApp(deps: IngestAppDeps) {
   if (asyncMode !== "off" && deps.deliver.acceptanceMode !== "buffered" && !selfhostAdmission) throw new Error("session ingest: async admission requires buffered acceptance");
   const nowMs = deps.asyncAdmission?.nowMs ?? Date.now;
   const syncFrozenReceipt = deps.syncAdmissionFrozenReceipt === "on";
+  const stoppedOrgs = deps.httpAdmissionStoppedOrgs;
+  /** INGEST_HTTP_ADMISSION_STOPPED_ORGS: throws the retryable refusal for a stopped org (no IO before it). */
+  const assertHttpAdmissionOpen = (orgId: string) => { if (stoppedOrgs?.has(orgId)) throw new HttpAdmissionStopped(); };
   /**
    * A reset or re-enable, bracketed by the privacy journal (async-admission.ts) while async admission
    * may have uploads in flight (on / drain). Only ORDERED controls: buffered SQL refuses any other
@@ -741,6 +754,7 @@ export function createIngestApp(deps: IngestAppDeps) {
       route: route === "turns.batches" ? "turns" : "delivery", outcome: ingestOutcome(native), records, durationMs: Date.now() - started,
     });
     try {
+      assertHttpAdmissionOpen(identity.orgId);
       const batch = parse(await jsonOf(c, read), identity);
       // Capture policy (capture-policy.ts): self-host identities carry the org's policy. Report logs, enforce refuses.
       const violation = uploadPolicyViolation(identity, c.req.header(CAPTURE_POLICY_REVISION_HEADER), batch);
@@ -835,6 +849,7 @@ export function createIngestApp(deps: IngestAppDeps) {
     const identity = c.get("identity");
     const fields: Record<string, unknown> = { route: "delivery.recovery", org_id: identity.orgId, workspace_id: identity.workspaceId, correlation_id: c.get("correlationId") };
     try {
+      assertHttpAdmissionOpen(identity.orgId);
       if (deps.deliver.acceptanceMode !== "buffered" || c.req.header("content-type")?.split(";")[0]?.trim() !== RECOVERY_CONTENT_TYPE)
         throw new IngestUnavailable("recovery", "recovery_wire_unavailable");
       const tenant = { orgId: identity.orgId, workspaceId: identity.workspaceId, userId: identity.userId };

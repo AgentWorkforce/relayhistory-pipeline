@@ -192,6 +192,14 @@ export interface SessionIngestInputs {
    */
   s3FenceMirror?: "on";
   /**
+   * INGEST_HTTP_ADMISSION_STOPPED_ORGS (src/session-ingest/http-admission-stop.ts, decision 0005): the orgs whose
+   * HTTP upload admission (batches, turns, recovery) answers 503 with Retry-After before any ledger call, so
+   * nothing admits them through SQL. It is the fence-authority marker's `workerHttpAdmission: "off"`
+   * precondition: deploy it, let the INGEST_ADMISSION queue drain, then run the org's backfills, then write its
+   * marker. A non-empty list of distinct org ids; omit for none (no var rendered, vars byte-identical to before).
+   */
+  httpAdmissionStoppedOrgs?: string[];
+  /**
    * SESSIONS_NEON_EXIT: the Neon-exit release profile (src/shared/neon-exit.ts, docs/neon-exit-edge-map.md).
    * The Worker then refuses every request while any Neon edge is configured, so the stack refuses the
    * same edges first (assertSessionIngestInputs mirrors worker.ts ingestSettings): replicaMode must be
@@ -229,7 +237,7 @@ const AUTHORITY_ENV_KEYS = [
   "INGEST_AUTHORITY_EXPECT_AUTH_EPOCH",
   "INGEST_AUTHORITY_EXPECT_SOURCE_IDENTITY",
 ] as const;
-const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "neonExit", "uploadConsent", "s3FenceMirror"];
+const KEYS = ["custodySource", "privacyAuthority", "expectedGeneration", "overlapGeneration", "acceptanceMode", "accountId", "hyperdriveId", "secretsStoreId", "kmsKeyArn", "maxPerUser", "maxPerOrg", "inlineMaxSessions", "replicaMode", "neonReplicaQueue", "authority", "asyncAdmission", "syncAdmissionFrozenReceipt", "claimLockBusy", "claimTimeoutBusy", "neonExit", "uploadConsent", "s3FenceMirror", "httpAdmissionStoppedOrgs"];
 
 function validAuthorityKeyRoot(value: unknown): value is string {
   if (typeof value !== "string" || !/^96bulls\/[A-Za-z0-9][A-Za-z0-9_/-]{0,151}$/.test(value) || value.endsWith("/")) return false;
@@ -347,6 +355,12 @@ export function assertSessionIngestInputs(p: unknown, refuse: (why: string) => n
     refuse('sessionIngest.uploadConsent must be "report", "hold-only" or "enforce" (omit for off)');
   if (v.s3FenceMirror !== undefined && v.s3FenceMirror !== "on")
     refuse('sessionIngest.s3FenceMirror must be "on" (omit for off)');
+  if (v.httpAdmissionStoppedOrgs !== undefined) {
+    const orgs: unknown = v.httpAdmissionStoppedOrgs;
+    // The runtime parser's rule (http-admission-stop.ts), so a list the stack accepts never refuses Worker startup.
+    if (!Array.isArray(orgs) || orgs.length === 0 || !orgs.every((o) => typeof o === "string" && /^(?!\.)[A-Za-z0-9._-]{1,128}$/.test(o)) || new Set(orgs).size !== orgs.length)
+      refuse("sessionIngest.httpAdmissionStoppedOrgs must be a non-empty list of distinct org ids (omit for none)");
+  }
 }
 
 /** A producer binding to a queue this stack does not own (no state row: never created, changed or deleted here). */
@@ -384,6 +398,7 @@ export function sessionIngestVars(p: SessionIngestInputs) {
     ...(p.neonExit === "on" ? { SESSIONS_NEON_EXIT: "true" } : {}),
     ...(p.uploadConsent ? { INGEST_UPLOAD_CONSENT: p.uploadConsent } : {}),
     ...(p.s3FenceMirror === "on" ? { INGEST_S3_FENCE_MIRROR: "on" } : {}),
+    ...(p.httpAdmissionStoppedOrgs?.length ? { INGEST_HTTP_ADMISSION_STOPPED_ORGS: p.httpAdmissionStoppedOrgs.join(",") } : {}),
   };
 }
 
