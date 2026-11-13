@@ -181,7 +181,16 @@ function validateManifest(manifest) {
       if (scenario.status === "complete" && (session.session_id === null && session.harness !== "human" || session.started_at === null)) throw new Error(`missing completed session in ${scenario.id}`);
       if (session.started_at && Date.parse(session.started_at) > Date.parse(session.ended_at)) throw new Error(`reversed times in ${scenario.id}`);
     }
-    for (const pair of scenario.pairs) if (!roles.has(pair.left) || !roles.has(pair.right)) throw new Error(`unknown pair role in ${scenario.id}`);
+    for (const pair of scenario.pairs) {
+      if (!roles.has(pair.left) || !roles.has(pair.right)) throw new Error(`unknown pair role in ${scenario.id}`);
+      if (pair.expected_confidence && !["low", "high"].includes(pair.expected_confidence)) throw new Error(`invalid expected confidence in ${scenario.id}`);
+    }
+    for (const episode of scenario.expected_episodes ?? []) {
+      if (!episode.category || !Number.isFinite(Date.parse(episode.start_turn_at))) throw new Error(`invalid episode in ${scenario.id}`);
+    }
+    for (const turn of scenario.expected_same_episode_turns ?? []) {
+      if (!Number.isFinite(Date.parse(turn.at))) throw new Error(`invalid same-episode turn in ${scenario.id}`);
+    }
   }
 }
 
@@ -242,6 +251,7 @@ for (const scenario of manifest.scenarios) {
     const left = byRole.get(pair.left), right = byRole.get(pair.right);
     const base = { scenario: scenario.id, pair: `${pair.left}:${pair.right}`, expected: pair.expected_label,
       ...evidenceGaps(scenario),
+      ...(pair.expected_confidence ? { expected_confidence: pair.expected_confidence } : {}),
       ...(pair.expected_actor_kinds ? { expected_actor_kinds: pair.expected_actor_kinds } : {}) };
     if (scenario.status !== "complete" || (!left.session_id && left.harness !== "human") || (!right.session_id && right.harness !== "human")) {
       results.push({ ...base, state: "pending" });
@@ -265,7 +275,8 @@ for (const scenario of manifest.scenarios) {
       : requiredSignalMissing(pair, counts) ? "missing_signal"
       : projectTagState ? projectTagState
       : pair.expected_label === "planned_parallel" && findings.length > 0 && findings.every((finding) => finding.score < 0.3) ? "correct_suppression"
-      : findings.some((finding) => finding.kind === pair.expected_label) ? "hit"
+      : findings.some((finding) => finding.kind === pair.expected_label && (!pair.expected_confidence || finding.confidence === pair.expected_confidence)) ? "hit"
+      : findings.some((finding) => finding.kind === pair.expected_label) ? "wrong_confidence"
       : suppressing.has(pair.expected_label) && findings.length === 0 ? "correct_absence"
       : findings.length ? "wrong_relation"
       : evidence ? "evidence_no_finding" : "unverified_no_finding";
@@ -302,21 +313,37 @@ const episodes = manifest.scenarios.filter((scenario) => scenario.expected_episo
   const duration = { observed_minutes: Number(durationMinutes.toFixed(2)), minimum_minutes: scenario.minimum_duration_minutes ?? 0,
     state: durationMinutes >= (scenario.minimum_duration_minutes ?? 0) ? "met" : "short" };
   if (!ledgerEntries) return { scenario: scenario.id, state: "ledger_unavailable", expected, duration };
-  const actual = ledgerEntries.filter((entry) => entry.session_id === session.session_id && (entry.harness ?? entry.source) === session.harness)
-    .sort((a, b) => Number(a.episode_seq) - Number(b.episode_seq)).map((entry) => entry.category);
-  return { scenario: scenario.id, state: JSON.stringify(actual) === JSON.stringify(expected) ? "hit" : "episode_mismatch", expected, actual, duration };
+  const entries = ledgerEntries.filter((entry) => entry.session_id === session.session_id && (entry.harness ?? entry.source) === session.harness)
+    .sort((a, b) => Number(a.episode_seq) - Number(b.episode_seq));
+  const actual = entries.map((entry) => entry.category);
+  const expectedStarts = scenario.expected_episodes.map((episode) => episode.start_turn_at);
+  const actualStarts = entries.map((entry) => entry.started_at ?? null);
+  const boundaryToleranceMs = 120_000;
+  const boundaryState = entries.length !== expectedStarts.length ? "count_mismatch"
+    : actualStarts.some((value) => !value || Number.isNaN(Date.parse(value))) ? "unverified"
+    : actualStarts.every((value, index) => Math.abs(Date.parse(value) - Date.parse(expectedStarts[index])) <= boundaryToleranceMs) ? "hit"
+    : "boundary_mismatch";
+  const falseSplitStarts = (scenario.expected_same_episode_turns ?? []).flatMap((turn) =>
+    actualStarts.filter((value) => value && Number.isFinite(Date.parse(value)) &&
+      Math.abs(Date.parse(value) - Date.parse(turn.at)) <= 60_000 &&
+      !expectedStarts.some((start) => Math.abs(Date.parse(value) - Date.parse(start)) <= 60_000))
+      .map((value) => ({ expected_continuation: turn.at, actual_episode_start: value })));
+  const categoryState = JSON.stringify(actual) === JSON.stringify(expected) ? "hit" : "episode_mismatch";
+  return { scenario: scenario.id, state: falseSplitStarts.length ? "false_split" : categoryState !== "hit" ? categoryState : boundaryState === "unverified" ? "boundary_unverified" : boundaryState === "boundary_mismatch" || boundaryState === "count_mismatch" ? "boundary_mismatch" : "hit",
+    expected, actual, expected_starts: expectedStarts, actual_starts: actualStarts,
+    boundary_state: boundaryState, false_split_starts: falseSplitStarts, boundary_tolerance_seconds: boundaryToleranceMs / 1000, duration };
 });
 const scenarioResults = manifest.scenarios.map((scenario) => {
   const pairs = results.filter((row) => row.scenario === scenario.id);
   const episode = episodes.find((row) => row.scenario === scenario.id);
   const states = [...pairs.map((row) => row.state), ...(episode ? [episode.state, episode.duration?.state === "short" ? "duration_short" : null].filter(Boolean) : [])];
   const outcome = states.includes("pending") ? "pending"
-    : states.some((state) => ["wrong_relation", "evidence_no_finding", "episode_mismatch"].includes(state)) ? "miss"
-    : states.some((state) => ["no_evidence", "missing_signal", "missing_project_tag", "wrong_project", "unverified_evidence", "unverified_no_finding", "ledger_unavailable", "duration_short"].includes(state)) ? "inconclusive"
+    : states.some((state) => ["wrong_relation", "wrong_confidence", "evidence_no_finding", "episode_mismatch", "boundary_mismatch", "false_split"].includes(state)) ? "miss"
+    : states.some((state) => ["no_evidence", "missing_signal", "missing_project_tag", "wrong_project", "unverified_evidence", "unverified_no_finding", "ledger_unavailable", "boundary_unverified", "duration_short"].includes(state)) ? "inconclusive"
     : "hit";
   return { scenario: scenario.id, outcome, pair_states: pairs.map((row) => row.state),
     ...evidenceGaps(scenario),
-    ...(episode ? { episode_state: episode.state, duration_state: episode.duration?.state ?? null } : {}) };
+    ...(episode ? { episode_state: episode.state, boundary_state: episode.boundary_state ?? null, duration_state: episode.duration?.state ?? null } : {}) };
 });
 console.log(JSON.stringify({ scored_at: new Date().toISOString(), window: overlaps.window, coverage: overlaps.coverage,
   replay_overrides: { branch_fallback: args.has("branch-fallback"), capture_project_count: captureProjects.size },

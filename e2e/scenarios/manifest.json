@@ -41,7 +41,6 @@
     {
       "id": "c",
       "title": "B reverts A commit",
-      "known_evidence_gaps": ["claude_commit_fact_absent"],
       "status": "complete",
       "sessions": [
         { "role": "first", "harness": "claude", "session_id": "74059fb8-2ded-4a45-8c3f-cda4be81fc24", "started_at": "2026-11-13T08:25:45.377Z", "ended_at": "2026-11-13T08:26:03.227Z", "expected_project": "a", "branch": "feat/audit-log-a1", "commit": "e5a0b6c" },
@@ -124,18 +123,26 @@
     {
       "id": "j",
       "title": "One session pivots across unrelated tasks",
+      "known_evidence_gaps": ["scrubber_redacted_project_key"],
       "minimum_duration_minutes": 15,
       "status": "complete",
       "sessions": [
-        { "role": "pivoting", "harness": "claude", "session_id": "ce507224-490e-4d1a-87be-aee8929d7656", "started_at": "2026-11-13T08:32:30.615Z", "ended_at": "2026-11-13T08:37:42.025Z", "expected_project": "a", "branch": "chore/maintenance-j1", "commits": ["e1c23ee", "d373284"] },
+        { "role": "pivoting", "harness": "codex", "session_id": "01a1d439-8535-7852-9dc2-e80892a7bfc4", "started_at": "2026-11-13T09:25:02.604Z", "ended_at": "2026-11-13T09:41:28.024Z", "expected_project": "a", "branch": "chore/maintenance-j2", "commits": ["fcc16f8", "cf6f076"], "commit_provenance": "operator committed agent edits after Git index lock was denied", "branch_transitions": [
+          { "at": "2026-11-13T09:28:08.000Z", "from": "chore/maintenance-j2", "to": "fix/flags-last-wins-j2" },
+          { "at": "2026-11-13T09:32:59.000Z", "from": "fix/flags-last-wins-j2", "to": "review/flags-env-j2" },
+          { "at": "2026-11-13T09:40:32.000Z", "from": "review/flags-env-j2", "to": "research/report-csv-j2" }
+        ] },
         { "role": "reviewed", "harness": "claude", "session_id": "0d21cfd8-ae30-44d2-90dc-73eff68b6433", "started_at": "2026-11-13T08:26:20.616Z", "ended_at": "2026-11-13T08:26:34.857Z", "expected_project": "a", "branch": "feat/flags-env-override", "commit": "9f4ba71" }
       ],
-      "pairs": [{ "left": "pivoting", "right": "reviewed", "expected_label": "none", "note": "Episode 3 reviewed the other session's diff; informational review relation, no overlap alert." }],
+      "pairs": [{ "left": "pivoting", "right": "reviewed", "expected_label": "concurrent_edit", "expected_confidence": "low", "note": "Different intent, but both unmerged branches rewrote src/flags.ts about 62 minutes apart; episode 3 also reviewed the earlier commit. This is the detector's 48-hour T3 merge-risk signal, not duplicate work." }],
       "expected_episodes": [
-        { "sequence": 1, "category": "implementation", "start_turn_at": "2026-11-13T08:32:30.691Z", "boundary_after": "CONTRIBUTING.md committed at assistant turn 08:32:37.656Z" },
-        { "sequence": 2, "category": "debugging", "start_turn_at": "2026-11-13T08:34:00.437Z", "boundary_after": "reportTitle fix committed at assistant turn 08:34:08.697Z" },
-        { "sequence": 3, "category": "review", "start_turn_at": "2026-11-13T08:36:24.048Z", "boundary_after": "review answer at assistant turn 08:36:36.836Z" },
-        { "sequence": 4, "category": "research", "start_turn_at": "2026-11-13T08:37:31.260Z", "boundary_after": "research answer at assistant turn 08:37:42.025Z" }
+        { "sequence": 1, "category": "implementation", "start_turn_at": "2026-11-13T09:25:08.988Z", "boundary_after": "counter utility and README example written; committed at 09:26:30Z" },
+        { "sequence": 2, "category": "debugging", "start_turn_at": "2026-11-13T09:28:25.543Z", "boundary_after": "duplicate flag test and fix written; committed at 09:29:33Z" },
+        { "sequence": 3, "category": "review", "start_turn_at": "2026-11-13T09:33:15.300Z", "boundary_after": "read-only review and same-task follow-up answered" },
+        { "sequence": 4, "category": "research", "start_turn_at": "2026-11-13T09:40:48.557Z", "boundary_after": "read-only CSV export design answer at 09:41:28Z" }
+      ],
+      "expected_same_episode_turns": [
+        { "at": "2026-11-13T09:35:51.049Z", "category": "review", "reason": "follow-up on the same commit's test coverage; no new episode" }
       ]
     },
     {
