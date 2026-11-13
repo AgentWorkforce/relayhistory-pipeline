@@ -272,6 +272,7 @@ describe('production constructors install the routed sealer', () => {
     ['src/session-ingest/publication-runtime.ts', /\.\.\.routedRawChunkSealerDeps\(\)/],
     ['src/session-ingest/publication-portable.ts', /\.\.\.routedRawChunkSealerDeps\(\)/],
     ['src/migration/neon-s3-sync/main.ts', /\.\.\.routedRawChunkSealerDeps\(\)/],
+    ['src/session-ingest/buffered-drain.ts', /\.\.\.routedRawChunkSealerDeps\(\)/],
   ];
   for (const [file, pattern] of WIRED)
     test(`${file} spreads routedRawChunkSealerDeps()`, () => {
@@ -303,6 +304,7 @@ describe('wiring inventory is complete (source scan)', () => {
     ['PublicationJobDeps', 'src/session-ingest/publication-runtime.ts', 1],
     ['PublicationJobDeps', 'src/session-ingest/publication-portable.ts', 1],
     ['write/export target', 'src/migration/neon-s3-sync/main.ts', 1],
+    ['write/export target', 'src/session-ingest/buffered-drain.ts', 1], // buffered backlog drain (0005)
   ] as const;
   const UNWIRED_SITES = [
     ['PublicationJobDeps', 'src/session-ingest/publication-canary.ts', 1], // row publication-canary
