@@ -1,0 +1,194 @@
+name: backlog ops
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('backlog ops {0} {1}', inputs.mode, inputs.sha) || format('backlog ops proof {0}', github.sha) }}
+
+# Guarded runs of the 0005 backlog tools against production: the fence backfill, the accepted-stage export and the S3
+# drain (docs/decisions/0005-s3-native-upload-ledger.md "The buffered backlog"; docs/backlog-ops-workflow.md; contract
+# in src/session-ingest/backlog-ops.ts). Dry modes are always allowed. Every execute is dormant until a reviewed
+# commit flips BACKLOG_OPS_EXECUTE_ENABLED, and is bound by a typed confirmation to earlier successful runs of this
+# workflow at the same commit (its dry run; the backfill; for the drain, a fresh backfill and the export after it),
+# whose receipts are checked before any credential is read. The workflow never passes --checkpoint-file,
+# --start-after or an org: a rerun is safe because the drain skips objects it already marked.
+# Push and pull_request run only the credential-free tests (no secrets, no environment).
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute]
+        default: backfill-dry
+        required: true
+      sha:
+        description: Exact current main commit (40 lowercase hex)
+        type: string
+        required: true
+      dry_run:
+        description: Execute only - the same tool's successful dry run of this workflow at the same sha; empty otherwise
+        type: string
+        default: ""
+      backfill_run:
+        description: export-execute and drain-execute - a successful backfill-execute run at the same sha (the drain's under 3h old); empty otherwise
+        type: string
+        default: ""
+      export_run:
+        description: drain-execute only - a successful export-execute run at the same sha, after the backfill; empty otherwise
+        type: string
+        default: ""
+      max_objects:
+        description: Drain modes only - per-run object budget (empty = unbounded)
+        type: string
+        default: ""
+      confirmation:
+        description: 'Execute: <MODE uppercase> <sha> DRY <dry_run> [BACKFILL <backfill_run>] [EXPORT <export_run>]. Dry modes: empty'
+        type: string
+        default: ""
+  pull_request:
+    paths:
+      - .github/workflows/backlog-ops.yml
+      - scripts/backlog-ops*.ts
+      - src/session-ingest/backlog-ops.ts
+      - src/session-ingest/__tests__/backlog-ops*
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/backlog-ops.yml
+      - scripts/backlog-ops*.ts
+      - src/session-ingest/backlog-ops.ts
+      - src/session-ingest/__tests__/backlog-ops*
+
+permissions:
+  contents: read
+  actions: read
+  deployments: read
+
+# One backlog operation at a time across every mode (the tools also hold their own S3 leases).
+# Proof runs get their own per-sha group so a push never queues behind (or cancels) a pending dispatch.
+concurrency:
+  group: ${{ github.event_name == 'workflow_dispatch' && 'guarded-backlog-ops-production' || format('backlog-ops-proof-{0}', github.sha) }}
+  cancel-in-progress: false
+
+env:
+  BACKLOG_OPS_MODE: ${{ inputs.mode }}
+  BACKLOG_OPS_SHA: ${{ inputs.sha }}
+  BACKLOG_OPS_DRY_RUN: ${{ inputs.dry_run }}
+  BACKLOG_OPS_BACKFILL_RUN: ${{ inputs.backfill_run }}
+  BACKLOG_OPS_EXPORT_RUN: ${{ inputs.export_run }}
+  BACKLOG_OPS_MAX_OBJECTS: ${{ inputs.max_objects }}
+  BACKLOG_OPS_CONFIRMATION: ${{ inputs.confirmation }}
+
+jobs:
+  proof:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without credentials
+        run: bun install --frozen-lockfile
+      - name: Contract, gate and workflow tests (no credentials)
+        run: bun test --timeout 120000 ./src/session-ingest/__tests__/backlog-ops.test.ts
+
+  # No environment here: a typo/missing environment must not auto-create an unprotected one.
+  prerequisite-gate:
+    if: github.event_name == 'workflow_dispatch' && github.repository_id == '1437714333' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      environment: ${{ steps.gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without credentials
+        run: bun install --frozen-lockfile
+      - name: Verify dormant switch, mode, bindings, exact main, dispatch identity and green CI
+        id: gate
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          bun scripts/backlog-ops-github.ts
+          echo "environment=session-schema-production" >> "$GITHUB_OUTPUT"
+
+  operate:
+    needs: prerequisite-gate
+    runs-on: ubuntu-latest
+    # Above the role session (6 hours is the hosted-runner cap): the tool cannot outlive its credentials unnoticed.
+    timeout-minutes: 355
+    permissions:
+      contents: read
+      actions: read
+      deployments: read
+      id-token: write
+    environment:
+      name: ${{ needs.prerequisite-gate.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install without credentials
+        run: bun install --frozen-lockfile
+      - name: Recheck live gates and the recorded environment approval
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bun scripts/backlog-ops-github.ts --approved
+      - name: Download the bound dry run's receipt (execute only)
+        if: endsWith(inputs.mode, '-execute')
+        uses: actions/download-artifact@v4
+        with:
+          name: backlog-ops-receipt
+          path: ${{ runner.temp }}/backlog-ops-bound/dry
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.dry_run }}
+          github-token: ${{ github.token }}
+      - name: Download the bound backfill's receipt (export-execute, drain-execute)
+        if: inputs.mode == 'export-execute' || inputs.mode == 'drain-execute'
+        uses: actions/download-artifact@v4
+        with:
+          name: backlog-ops-receipt
+          path: ${{ runner.temp }}/backlog-ops-bound/backfill
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.backfill_run }}
+          github-token: ${{ github.token }}
+      - name: Download the bound export's receipt (drain-execute)
+        if: inputs.mode == 'drain-execute'
+        uses: actions/download-artifact@v4
+        with:
+          name: backlog-ops-receipt
+          path: ${{ runner.temp }}/backlog-ops-bound/export
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.export_run }}
+          github-token: ${{ github.token }}
+      # The only step with a credential: the owner URL secret, and the OIDC token it exchanges for the mode's role.
+      # Bucket, region, key and role ARNs are the environment's protected variables. The URL reaches the tool only
+      # over its stdin pipe; the role session only in the tool's environment. Nothing credential-like is logged.
+      - name: Run the backlog tool (only step with credentials)
+        env:
+          SUPABASE_MIGRATION_OWNER_URL: ${{ (startsWith(inputs.mode, 'backfill-') || startsWith(inputs.mode, 'export-')) && secrets.SUPABASE_MIGRATION_OWNER_URL || '' }}
+          BACKLOG_OPS_BUCKET: ${{ vars.BACKLOG_OPS_BUCKET }}
+          BACKLOG_OPS_REGION: ${{ vars.BACKLOG_OPS_REGION }}
+          BACKLOG_OPS_KMS_KEY_ARN: ${{ vars.BACKLOG_OPS_KMS_KEY_ARN }}
+          BACKLOG_OPS_DRY_ROLE_ARN: ${{ vars.BACKLOG_OPS_DRY_ROLE_ARN }}
+          BACKLOG_OPS_EXECUTE_ROLE_ARN: ${{ vars.BACKLOG_OPS_EXECUTE_ROLE_ARN }}
+        run: bun scripts/backlog-ops.ts
+      - name: Publish the counts-only receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backlog-ops-receipt
+          path: ${{ runner.temp }}/backlog-ops-out/backlog-ops-receipt.json
+          if-no-files-found: ignore
+          retention-days: 30
