@@ -39,7 +39,7 @@ import {
   type ReleaseTargetBinding,
 } from "../migrate.ts";
 import { releaseAnchorBinding, releaseTargetBinding, requireTargetCommit, treeSchemaSteps, treeVerifiers, type ReleaseTargetAnchor } from "../release-target.ts";
-import { sessionsFunctionAclDrift } from "../migrate-guards.ts";
+import { createdSessionsFunctions, sessionsFunctionAclDrift } from "../migrate-guards.ts";
 import { CONSUMER_RUNTIME_FUNCTIONS, RUNTIME_APPLICATION_FUNCTIONS } from "../migrate-guards.ts";
 import { schemaVerdict, sessionsFunctionGateSql, type ExpectedSchema, type Transact } from "../../shared/db.ts";
 
@@ -749,6 +749,27 @@ test("real tree: the prefix-scoped ACL check excuses only absent functions a hel
   // A held step's function that already exists (created early) is compared exactly too.
   await s.db.exec("CREATE FUNCTION sessions.ingest_erase_fence_index_lock() RETURNS void LANGUAGE sql AS 'SELECT'; GRANT EXECUTE ON FUNCTION sessions.ingest_erase_fence_index_lock() TO history_rt");
   expect((await sessionsFunctionAclDrift(c, "history_rt", heldSql)).join(";")).toContain("sessions.ingest_erase_fence_index_lock()");
+});
+
+/** The refusal's code and message (failure() keeps only the code). */
+const refusal = (p: Promise<unknown>) =>
+  p.then(() => null, (e: { code?: string; message?: string }) => ({ code: e.code ?? "no_code", message: String(e.message) }));
+const heldSqlOf = async (held: readonly string[]) =>
+  Promise.all((await plan(SELFHOSTED)).filter((st) => held.includes(st.name)).map((st) => Bun.file(st.path).text()));
+
+test("real tree: an absent listed runtime function that no held step creates refuses function_acl_drift on a release-target run, never PASS", async () => {
+  const s = await prefixDatabase();
+  const fn = "sessions.clean_root_commit(text)";
+  expect(RUNTIME_APPLICATION_FUNCTIONS).toContain(fn);
+  expect((await s.db.query<{ sig: string }>(`SELECT oid::regprocedure::text AS sig FROM pg_proc WHERE oid = to_regprocedure('${fn}')`)).rows).toHaveLength(1);
+  // Not excused by the held scope: no held step creates it.
+  expect(createdSessionsFunctions(await heldSqlOf(s.split.held)).has(fn)).toBe(false);
+  await s.db.exec(`DROP FUNCTION ${fn}`);
+  const err = await refusal(runTarget(s.db, s));
+  expect(err?.code).toBe("function_acl_drift");
+  expect(err?.message).toContain("runtime application functions missing from the schema");
+  expect(err?.message).toContain(fn);
+  expect((await marker(s.db)).some((m) => m.status === "pass")).toBe(false);
 });
 
 test("real tree: the live gate excuses only absent signatures a held, unledgered step creates", async () => {

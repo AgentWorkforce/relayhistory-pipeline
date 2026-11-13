@@ -882,12 +882,13 @@ export async function runMigrations(
         "REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA sessions FROM PUBLIC",
       );
       if (runtime !== "dedicated") return;
-      await installRuntimeApplicationAcl(client, profile.runtimeRole);
+      await installRuntimeApplicationAcl(client, profile.runtimeRole, heldSql);
       const violations = await runtimeRoleViolations(
         client,
         runtimeCfg(profile),
         RUNTIME_TABLES,
         "post",
+        heldSql,
       );
       if (violations.length)
         throw profileError(
@@ -1069,6 +1070,7 @@ const runtimeCfg = (p: MigrationProfile) => ({
 async function installRuntimeApplicationAcl(
   client: MigrationClient,
   role: string,
+  heldSql: readonly string[] = [],
 ): Promise<void> {
   const catalog = runtimeApplicationAclCatalog();
   for (const [relation, privileges] of Object.entries(catalog.tables)) {
@@ -1085,7 +1087,27 @@ async function installRuntimeApplicationAcl(
     );
     await client.query(grant.rows[0]!.sql);
   }
+  // Release-target prefix scope, as in sessionsFunctionAclDrift: a listed function is
+  // skipped only when it is ABSENT and a held step creates it. Any other absent listed
+  // function refuses as function_acl_drift (the manifest names a function the schema
+  // lacks), before any function grant, fail-closed. Relations and sequences are
+  // granted first, unchanged.
+  const heldCreates = createdSessionsFunctions(heldSql);
+  const absent = (
+    await client.query<{ fn: string }>(
+      "SELECT x AS fn FROM unnest($1::text[]) x WHERE to_regprocedure(x) IS NULL",
+      [[...catalog.functions]],
+    )
+  ).rows.map((r) => r.fn);
+  const missing = absent.filter((fn) => !heldCreates.has(fn));
+  if (missing.length)
+    throw profileError(
+      "function_acl_drift",
+      `runtime application functions missing from the schema: ${missing.slice(0, 5).join(", ")}${missing.length > 5 ? `; and ${missing.length - 5} more` : ""}`,
+    );
+  const skip = new Set(absent);
   for (const fn of catalog.functions) {
+    if (skip.has(fn)) continue;
     const grant = await client.query<{ sql: string }>(
       "SELECT format('GRANT EXECUTE ON FUNCTION %s TO %I', $1::regprocedure, $2::text) AS sql",
       [fn, role],
