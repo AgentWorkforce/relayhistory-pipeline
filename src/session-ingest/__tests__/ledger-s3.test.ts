@@ -10,7 +10,7 @@ import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../sh
 import { deliverPrepared, IngestUnavailable } from "../deliver.ts";
 import { LedgerUnavailableError, type ClaimInput, type CommitInput, type Ledger, type LedgerRecord } from "../ledger.ts";
 import {
-  applyFenceChange, entryForgotten, fenceAuthorityKey, ingestLedgerMode, newFence, revisionShard, s3Ledger, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, withSqlControlMirror,
+  applyFenceChange, checkIndexEntryInput, entryForgotten, fenceAuthorityKey, ingestLedgerMode, newFence, revisionShard, s3Ledger, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, withSqlControlMirror,
   type FenceDoc,
 } from "../ledger-s3.ts";
 import { prepareDelivery } from "../vendor/delivery/prepare.ts";
@@ -1047,5 +1047,50 @@ describe("third review follow-ups", () => {
     now += 60_000;
     await expect(ledger.claim(claimInput("b2", [rec("r2", 1)]))).rejects.toMatchObject({ code: "ledger_fence_authority_missing" });
     expect(await ledger.commit(commitOf(a, c.claimToken))).toEqual({ rearmed: 0 });
+  });
+});
+
+describe("revision-only index entries (seeded proven records, lazy native slots)", () => {
+  const io = (store: ObjectStore) => s3LedgerObjects(store, ROOT, noSleep);
+  const absentView = newFence();
+  const entry = (recordId: string, revision: number, revisionId: string | null, digest: string | null, sessionId: string | null = "sess-1") =>
+    ({ recordId, revision, revisionId, digest, sessionKey: sessionId === null ? null : SK("claude", sessionId), epoch: 0, resets: 0 });
+
+  test("a revision-only entry judges stale by revision alone, whatever the submitted digest, as SQL's claim step (c)", async () => {
+    const store = fresh();
+    await io(store).mergeIndex(shardKey("R"), absentView, ORIGIN, [entry("R", 5, null, null)]);
+    await io(store).mergeIndex(shardKey("L"), absentView, ORIGIN, [entry("L", 3, null, hex("lazy"), null)]); // a lazy native slot: digest, no revision id
+    expect(await entryOf(store, "R")).toEqual([5, null, null, SK("claude", "sess-1"), 0, 0]);
+    expect(await entryOf(store, "L")).toEqual([3, null, hex("lazy"), null, 0, 0]);
+    const ledger = ledgerOn(store);
+    expect(await ledger.claim(claimInput("b1", [rec("R", 5, { digest: hex("any") }), rec("R", 4), rec("L", 3, { sessionId: "sess-2", digest: hex("other") })])))
+      .toMatchObject({ kind: "replay_fast", stale: [0, 1, 2] });
+    const up = claimInput("b2", [rec("R", 6)]);
+    expect(await claimed(ledger, up)).toMatchObject({ kind: "claimed", stale: [] });
+    // Max wins: the full revision 6 replaces the revision-only 5.
+    await ledger.commit(commitOf(up, (await claimed(ledger, up)).claimToken));
+    expect(await entryOf(store, "R")).toEqual([6, "R:r6", rec("R", 6).digest, SK("claude", "sess-1"), 0, 0]);
+  });
+
+  test("at an equal revision neither form overwrites the other (the stored entry is kept), and a higher one of either form wins", async () => {
+    const store = fresh();
+    await io(store).mergeIndex(shardKey("A"), absentView, ORIGIN, [entry("A", 5, "A:r5", hex("a"))]);
+    await io(store).mergeIndex(shardKey("A"), absentView, ORIGIN, [entry("A", 5, null, null)]);
+    expect(await entryOf(store, "A")).toEqual([5, "A:r5", hex("a"), SK("claude", "sess-1"), 0, 0]);
+    await io(store).mergeIndex(shardKey("B"), absentView, ORIGIN, [entry("B", 5, null, null)]);
+    await io(store).mergeIndex(shardKey("B"), absentView, ORIGIN, [entry("B", 5, "B:r5", hex("b"))]);
+    expect(await entryOf(store, "B")).toEqual([5, null, null, SK("claude", "sess-1"), 0, 0]);
+    await io(store).mergeIndex(shardKey("A"), absentView, ORIGIN, [entry("A", 6, null, null)]);
+    expect(await entryOf(store, "A")).toEqual([6, null, null, SK("claude", "sess-1"), 0, 0]);
+    // In one merge, a full entry is preferred over a revision-only one at the same revision.
+    await io(store).mergeIndex(shardKey("C"), absentView, ORIGIN, [entry("C", 2, null, null), entry("C", 2, "C:r2", hex("c"))]);
+    expect(await entryOf(store, "C")).toEqual([2, "C:r2", hex("c"), SK("claude", "sess-1"), 0, 0]);
+  });
+
+  test("malformed entries refuse (a digest that is not hex, an empty revision id)", async () => {
+    const store = fresh();
+    await expect(io(store).mergeIndex(shardKey("A"), absentView, ORIGIN, [entry("A", 1, null, "nothex")])).rejects.toMatchObject({ code: "ledger_input_refused" });
+    await expect(io(store).mergeIndex(shardKey("A"), absentView, ORIGIN, [entry("A", 1, "", null)])).rejects.toMatchObject({ code: "ledger_input_refused" });
+    expect(() => checkIndexEntryInput(entry("A", 0, null, null))).toThrow(LedgerUnavailableError);
   });
 });

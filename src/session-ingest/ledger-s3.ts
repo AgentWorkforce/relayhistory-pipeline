@@ -180,8 +180,15 @@ export interface BatchDoc {
  * it) once its generation is below the fence's for that session: a disable bumps the epoch, a reset bumps the
  * count, so a control costs one fence CAS however many records it forgets. Records with no session
  * (sessionKey null) are never forgotten by a control, as SQL keeps session-less revision rows.
+ *
+ * `revisionId` and `digest` may be null: a REVISION-ONLY entry. SQL has stored revisions without them
+ * (`ingest_seed_proven_records`, the operator bootstrap from proven canonical objects, writes no revision id or
+ * digest; buffered mode with the lazy policy judges by `ingest_lazy_native_slots`, which has a digest but no
+ * revision id), and its stale check compares the stored revision only, "whatever its digest" (claim step c,
+ * 20261105050010). So does this one: a claim judges every entry by `revision` alone. The backfill (#579) copies
+ * those rows in this form; the ingest itself always writes full entries.
  */
-export type IndexEntry = [number, string, string, string | null, number, number];
+export type IndexEntry = [number, string | null, string | null, string | null, number, number];
 export interface IndexDoc { v: 1; originId: string; shard: string; records: Record<string, IndexEntry> }
 /** The ownership stub (ingest_session_ownership): the OLDEST generation this session was claimed under at its current epoch. */
 export interface OwnerDoc { v: 1; originId: string; source: string; sessionId: string; epoch: number; resets: number }
@@ -242,8 +249,8 @@ export function validBatch(v: unknown): v is BatchDoc {
     && (v.fenceInstance === null || (typeof v.fenceInstance === "string" && TOKEN.test(v.fenceInstance))) && count(v.resets)
     && isObject(v.epochs) && Object.entries(v.epochs).every(([k, n]) => HEX32.test(k) && count(n));
 }
-const entryOk = (r: unknown): r is IndexEntry => Array.isArray(r) && r.length === 6 && Number.isSafeInteger(r[0]) && (r[0] as number) >= 1 && str(r[1])
-  && typeof r[2] === "string" && HEX64.test(r[2]) && (r[3] === null || (typeof r[3] === "string" && HEX32.test(r[3]))) && count(r[4]) && count(r[5]);
+const entryOk = (r: unknown): r is IndexEntry => Array.isArray(r) && r.length === 6 && Number.isSafeInteger(r[0]) && (r[0] as number) >= 1 && (r[1] === null || str(r[1]))
+  && (r[2] === null || (typeof r[2] === "string" && HEX64.test(r[2]))) && (r[3] === null || (typeof r[3] === "string" && HEX32.test(r[3]))) && count(r[4]) && count(r[5]);
 export function validIndex(v: unknown): v is IndexDoc {
   return isObject(v) && v.v === 1 && str(v.originId) && typeof v.shard === "string" && SHARD.test(v.shard) && isObject(v.records)
     && Object.values(v.records).every(entryOk); // record ids are read with own() and Maps only, so any id is a plain key
@@ -444,7 +451,17 @@ const PARALLEL = 6;
 /** Reset: ownership stubs read at once per LIST page. */
 const RESET_READS = 8;
 
-export interface IndexEntryInput { recordId: string; revision: number; revisionId: string; digest: string; sessionKey: string | null; epoch: number; resets: number }
+/**
+ * One entry to merge. `revisionId` / `digest` null: a revision-only entry (IndexEntry), for the backfill of SQL
+ * rows that have none (seeded proven records: both null; lazy native slots: revisionId null). Stamp the generation
+ * with recordGeneration(fence, origin, source, sessionId); a row with no session takes [null, 0, 0].
+ */
+export interface IndexEntryInput { recordId: string; revision: number; revisionId: string | null; digest: string | null; sessionKey: string | null; epoch: number; resets: number }
+
+/** Validates one IndexEntryInput (the backfill builds them from SQL rows): `ledger_input_refused` when malformed. */
+export function checkIndexEntryInput(r: IndexEntryInput): void {
+  if (!isObject(r) || !str(r.recordId) || !entryOk([r.revision, r.revisionId, r.digest, r.sessionKey, r.epoch, r.resets])) throw new LedgerUnavailableError("ledger_input_refused");
+}
 
 /**
  * The ledger's objects with their exact semantics, shared so other S3-native jobs (the backlog drain, the fence
@@ -504,7 +521,12 @@ export function s3LedgerObjects(store: ObjectStore, keyRoot: string, opts: Omit<
     const best = new Map<string, IndexEntryInput>();
     for (const r of entries) {
       const cur = best.get(r.recordId);
-      if (!cur || r.revision > cur.revision || (r.revision === cur.revision && byteCompare(r.revisionId, cur.revisionId) < 0)) best.set(r.recordId, r);
+      checkIndexEntryInput(r);
+      // Highest revision; at an equal one a full entry before a revision-only one, then revisionId byte order.
+      const better = !cur || r.revision > cur.revision || (r.revision === cur.revision && (cur.revisionId === null
+        ? r.revisionId !== null || (r.digest !== null && cur.digest === null)
+        : r.revisionId !== null && byteCompare(r.revisionId, cur.revisionId) < 0));
+      if (better) best.set(r.recordId, r);
     }
     const shard = /\/r=([0-9a-f]{2})\.json$/.exec(key)?.[1];
     if (!shard) throw new LedgerUnavailableError("ledger_input_refused");
