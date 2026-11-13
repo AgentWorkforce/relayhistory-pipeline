@@ -278,30 +278,35 @@ export async function sweepRearmMarkers(deps: { store: ObjectStore; eraser: Page
    * An UNSTAMPED stub (written before the ledger bound machines, or by older code during a rolling deploy): derive the
    * machine instead of trusting the marker. The session's canonical manifest under the marker's machine carries the
    * uploader (`extensions.96bulls.user_id`, writer.ts admittedIdentity) and its session id; the machine is accepted only
-   * when, with that user id and the marker's path workspace and origin, BOTH the marker's admission directory
-   * (admissionUserDir) and its machine (liveMachineId) are exactly what the commit computes. Nothing under the machine
-   * at all (no session dir, no pointer): `empty`, as there is nothing there to erase.
+   * when, with that user id, the marker's origin and the tenant's RAW workspace id, BOTH the marker's admission directory
+   * (admissionUserDir) and its machine (liveMachineId) are exactly what the commit computes. The raw workspace id is the
+   * marker's `workspaceId` (every commit writes it) when its layoutComponent is the path's `ws=` segment, else the
+   * segment itself (older markers; right whenever the id was layout-safe): a wrong candidate cannot reproduce both
+   * hashes, so it is never trusted on its own. `empty` only when a VERSION-AWARE strict listing (the eraser's, as the
+   * erase itself uses) finds no version and no delete marker of the session dir or its pointer under that machine.
    */
   async function derivedMachine(at: { dir: string; orgId: string; workspaceSegment: string }, m: RearmDoc): Promise<"ok" | "empty" | "unbound" | "deferred"> {
     const h = layoutComponent(m.source), s = layoutComponent(m.sessionId);
     const base = `${opts.keyRoot}/${at.orgId}/v1/ws=${at.workspaceSegment}/m=${m.machineId}/h=${h}`;
     const inSession = new RegExp(`^${escapeRe(base)}/d=\\d{4}/\\d{2}/\\d{2}/s=${escapeRe(s)}/`);
     const isManifest = new RegExp(`^${escapeRe(base)}/d=\\d{4}/\\d{2}/\\d{2}/s=${escapeRe(s)}/manifest\\.json$`);
-    let manifestKey: string | undefined, any = false, cursor: string | undefined;
+    let manifestKey: string | undefined, cursor: string | undefined;
     do {
       if (expired()) return "deferred";
       const page = await store.list(objectKey(base), cursor);
-      for (const i of page.items) {
-        const k = String(i.key);
-        if (!inSession.test(k)) continue;
-        any = true;
-        if (manifestKey === undefined && isManifest.test(k)) manifestKey = k;
-      }
+      for (const i of page.items) { const k = String(i.key); if (isManifest.test(k)) { manifestKey = k; break; } }
       cursor = manifestKey === undefined ? page.nextCursor : undefined;
     } while (cursor);
     if (manifestKey === undefined) {
-      const pointer = `${opts.keyRoot}/${at.orgId}/live-sessions/v1/ws=${at.workspaceSegment}/m=${m.machineId}/h=${h}/s=${s}.json`;
-      return !any && !(await store.head(objectKey(pointer))) ? "empty" : "unbound";
+      // No current manifest to verify against. Empty only if no version of anything of the session is left there
+      // (older versions and data behind delete markers included); otherwise it cannot be attributed: unbound.
+      if (expired()) return "deferred";
+      const authorize = async () => {};
+      const dirProof = await eraser.verifyErased(`${base}/`, { select: (v) => inSession.test(v.key), authorize, now });
+      if (dirProof.status !== "erased") return "unbound";
+      const pointerDir = `${opts.keyRoot}/${at.orgId}/live-sessions/v1/ws=${at.workspaceSegment}/m=${m.machineId}/h=${h}/`;
+      const pointerProof = await eraser.verifyErased(pointerDir, { exactKey: `${pointerDir}s=${s}.json`, authorize, now });
+      return pointerProof.status === "erased" ? "empty" : "unbound";
     }
     let identity: Record<string, unknown> | undefined;
     try {
@@ -314,8 +319,10 @@ export async function sweepRearmMarkers(deps: { store: ObjectStore; eraser: Page
     }
     const userId = identity?.user_id;
     if (typeof userId !== "string" || !userId || identity?.canonical_session_id !== m.sessionId) return "unbound";
-    const tenant = { orgId: at.orgId, workspaceId: at.workspaceSegment, userId };
-    return admissionUserDir(opts.keyRoot, tenant) === at.dir && liveMachineId(at.workspaceSegment, m.originId, userId) === m.machineId ? "ok" : "unbound";
+    const candidates = [...new Set([m.workspaceId, at.workspaceSegment])]
+      .filter((w): w is string => typeof w === "string" && w.length > 0 && layoutComponent(w) === at.workspaceSegment);
+    return candidates.some((workspaceId) => admissionUserDir(opts.keyRoot, { orgId: at.orgId, workspaceId, userId }) === at.dir
+      && liveMachineId(workspaceId, m.originId, userId) === m.machineId) ? "ok" : "unbound";
   }
 
   /** The origin's ownership stubs, read once per pass (cached), bounded by REARM_MAX_OWNER_SCAN and the deadline. */
