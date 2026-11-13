@@ -738,7 +738,7 @@ test("real tree: the prefix-scoped ACL check excuses only absent functions a hel
   // Unscoped, the full manifest names every held function as missing.
   const unscoped = await sessionsFunctionAclDrift(c, "history_rt");
   expect(unscoped.length).toBeGreaterThan(0);
-  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|upload_consent_)\w*\(.*\): missing/.test(d))).toBe(true);
+  expect(unscoped.every((d) => /^sessions\.(buffered_session_stages_for_target|ingest_operator_erase_|operator_user_erase_|ingest_operator_runtime_|ingest_erase_fence_|session_summary_activity_for|session_directory_users_for|upload_consent_|coordination_advisories_)\w*\(.*\): missing/.test(d))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.ingest_operator_runtime_upsert(jsonb,text,text): missing"))).toBe(true);
   expect(unscoped.some((d) => d.startsWith("sessions.buffered_session_stages_for_target("))).toBe(true);
   // A function a held step only replaces (it exists) is still compared exactly.
@@ -766,6 +766,28 @@ test("real tree: an absent listed runtime function that no held step creates ref
   expect(createdSessionsFunctions(await heldSqlOf(s.split.held)).has(fn)).toBe(false);
   await s.db.exec(`DROP FUNCTION ${fn}`);
   const err = await refusal(runTarget(s.db, s));
+  expect(err?.code).toBe("function_acl_drift");
+  expect(err?.message).toContain("runtime application functions missing from the schema");
+  expect(err?.message).toContain(fn);
+  expect((await marker(s.db)).some((m) => m.status === "pass")).toBe(false);
+});
+
+test("real tree: after the full tree including 062000, a dropped coordination advisories worker function refuses function_acl_drift on the next run", async () => {
+  const s = await prefixDatabase();
+  await runTarget(s.db, s);
+  const CA = "upstream:20261105062000_coordination_advisories.sql";
+  expect(s.split.held).toContain(CA);
+  const last = s.split.held.at(-1)!;
+  const tailSplit = migrationTargetSplit(s.names.map((name) => ({ name, pending: s.split.held.includes(name) })), last);
+  const full: ExpectedSchema = { ...(await expectedSchema()), dbMode: "selfhosted" };
+  await runMigrations(client(s.db), { profile: SELFHOSTED, target: last, expectedPending: tailSplit.expectedPending, targetGeneration: full.generation });
+  expect(await ledger(s.db)).toContain(CA);
+  expect(await marker(s.db)).toEqual([{ generation: full.generation, status: "pass" }]);
+  const fn = "sessions.coordination_advisories_sweep_v1()";
+  expect(RUNTIME_APPLICATION_FUNCTIONS).toContain(fn);
+  await s.db.exec(`DROP FUNCTION ${fn}`);
+  // Nothing is held now, so nothing excuses the absent function.
+  const err = await refusal(runMigrations(client(s.db), { profile: SELFHOSTED }));
   expect(err?.code).toBe("function_acl_drift");
   expect(err?.message).toContain("runtime application functions missing from the schema");
   expect(err?.message).toContain(fn);

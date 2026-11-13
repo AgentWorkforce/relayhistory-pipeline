@@ -2399,13 +2399,14 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
     const UI = "upstream:20261105058000_operator_user_erase_indexes.sql";
     const UE = "upstream:20261105058010_operator_user_erase.sql";
     const GP = "upstream:20261105059000_ingest_publication_gcs_provider.sql";
+    const CA = "upstream:20261105062000_coordination_advisories.sql";
     const names = async () => (await db.query<{ name: string }>("SELECT name FROM sessions.__96bulls_migrations")).rows.map((x) => x.name);
     const passed = async () => (await db.query<{ status: string }>("SELECT status FROM sessions.__96bulls_role_validation")).rows.every((x) => x.status === "pass");
     const rollback = async (name: string) => {
       try { return await db.exec(readFileSync(join(root, `supabase/rollbacks/${name}`), "utf8")); }
       catch (error) { await db.exec("ROLLBACK"); throw error; }
     };
-    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP]));
+    expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, TK, SL, CB, V, SF, SP, ST, CS, CR, DG, AJ, CQ, OE, EF, ER, SA, DU, UC, MB, FP, UI, UE, GP, CA]));
     expect(await names()).toEqual(expect.arrayContaining([B, J, L, R, C, D, K, P, S, E, F, T, G, Z, Y, H, N, O, Q, W, X, BK, GR, CG, SE, SL, CB, V, SF, SP, ST, CS, CR]));
     expect(await passed()).toBe(true);
     const outOfOrder = await failure(
@@ -2456,7 +2457,17 @@ describe("function boundary: ACL manifest, residual, activation gate", () => {
       const open = src.indexOf(tag, start) + tag.length;
       return src.slice(open, src.indexOf(tag, open));
     };
-    // 20261105059000 (publication provider gcs) is the newest: 058010's down refuses (55000) while it is applied; its
+    // 20261105062000 (coordination advisories) is the newest: 059000's down refuses (55000) while it is applied;
+    // its checksum-pinned down drops the five functions, the table and its ledger row, and refuses on a rerun.
+    expect(await names()).toContain(CA);
+    expect((await failure(rollback("20261105059000_ingest_publication_gcs_provider.down.sql")))?.code).toBe("55000");
+    expect(await names()).toContain(GP);
+    await rollback("20261105062000_coordination_advisories.down.sql");
+    expect(await names()).not.toContain(CA);
+    expect(await relation("sessions.coordination_advisories")).toBeNull();
+    expect((await db.query<{ n: number }>("SELECT count(*)::int n FROM pg_proc WHERE pronamespace='sessions'::regnamespace AND proname LIKE 'coordination\\_advisories\\_%'")).rows[0]!.n).toBe(0);
+    expect((await failure(rollback("20261105062000_coordination_advisories.down.sql")))?.code).toBe("55000");
+    // 20261105059000 (publication provider gcs) is then the newest: 058010's down refuses (55000) while it is applied; its
     // checksum-pinned down restores 060000's exact ingest_publication_prepare and 043850's exact
     // ingest_publication_publish (SECURITY DEFINER kept) and removes its ledger row.
     expect(await names()).toContain(GP);

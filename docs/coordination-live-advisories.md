@@ -167,6 +167,8 @@ Enabling any of them in production, provisioning the relay credential, and deplo
 Three PRs, each with tests and each doc-linked to this proposal:
 
 1. **Migration and readers.** The table, its checks and indexes, and the SECURITY DEFINER readers and writers, with role-grant, tenant-isolation, bound and retention tests. The slot comes from the registry.
+
+   **Implemented: PR 1.** Slot `20261105062000` (`supabase/migrations/20261105062000_coordination_advisories.sql`, rollback in `supabase/rollbacks/`). It adds the table and five SECURITY DEFINER functions, with PUBLIC EXECUTE revoked and no table privileges for either runtime role. The worker role `service_role` gets `sessions.coordination_advisories_upsert_v1`, `sessions.coordination_advisories_mark_delivered_v1` and `sessions.coordination_advisories_sweep_v1`. The read-API role `bulls96_read_api` gets `sessions.coordination_advisories_pending_for_v1` and `sessions.coordination_advisories_ack_v1`, which also require the read-API scope to match the requested org. Retention is a fixed 7 days in the functions. `bulls96_read_api` defaults to read-only transactions, so the PR 3 ack route must open a `READ WRITE` transaction. This enables nothing: no worker, no routes and no flags.
 2. **Worker.** `SERVICE=coordination-advisor`: candidate selection, fleet exclusion, the rubric, dedupe, cooldown, the cap, the no-downgrade rule, and the DM sender that refuses to run without its credential. Pure tests cover the rubric and limits table-driven.
 3. **Read-API routes.** The GET and ack routes, with tests for the disabled `501`, workspace attestation, canary, unsupported params, not-recipient `404`, idempotent ack and the 10-row bound.
 
