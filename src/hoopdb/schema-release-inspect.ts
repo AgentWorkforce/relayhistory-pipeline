@@ -14,7 +14,7 @@ import {
   releaseBootstrapContract,
   releaseBootstrapFiles,
 } from "./schema-release-bootstrap.ts";
-export function releaseClient(url: string | undefined) {
+export function releaseClient(url: string | undefined, opts: { keepAlive?: boolean } = {}) {
   // Individual fields prevent URL sslmode/options from replacing TLS configuration.
   const client = new pg.Client({
     ...releaseConnection(url),
@@ -27,6 +27,8 @@ export function releaseClient(url: string | undefined) {
     connectionTimeoutMillis: 10000,
     options:
       "-c statement_timeout=300000 -c lock_timeout=5000 -c idle_in_transaction_session_timeout=60000",
+    // Opt-in TCP keepalive for a session that sits silent inside one long statement (a CONCURRENTLY build).
+    ...(opts.keepAlive ? { keepAlive: true, keepAliveInitialDelayMillis: 60000 } : {}),
   });
   client.on("error", () => {}); // Never dump driver/connection errors to logs.
   return client;

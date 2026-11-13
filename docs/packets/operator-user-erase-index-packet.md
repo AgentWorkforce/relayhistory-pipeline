@@ -39,3 +39,52 @@ migration builds it itself. Every index on a populated table must be prebuilt;
 `SELECT EXISTS (SELECT 1 FROM sessions.<table>)` tells you which tables are
 populated. After the run, the verification query in the guide must return each
 prebuilt index valid, ready and live, with exactly these definitions.
+
+## Guarded workflow
+
+`.github/workflows/index-prebuild-058000.yml` runs this packet without a hand-typed
+statement. It reads the sixteen names, definitions and order from
+`ADOPTABLE_INDEXES`, and the only DDL it can run is each declared definition with
+`CONCURRENTLY` inserted. It never runs a blocking build, never sets the blocking-build
+opt-in, never drops anything and never applies the migration. It uses the same gates as
+the guarded schema release: exact live `main`, first attempt, the pinned dispatcher as
+actor and triggering actor, green push CI and pg-proof at the SHA, and the protected
+schema environment with its recorded approval. The owner credential reaches only an
+allowlisted child process, over stdin. Prebuild is dormant (`INDEX_PREBUILD_ENABLED` in
+`src/hoopdb/index-prebuild-058000.ts`). Enabling it takes a separate reviewed change.
+
+1. `census` (read-only). For each index it records: whether the table is empty,
+   absent/exact/drifted, `indisvalid`/`indisready`/`indislive`, owner, schema, definition
+   digest and any `pg_stat_progress_create_index` row. It then gives an action:
+   `present`, `deferred` (absent on an empty table, so the migration builds it),
+   `prebuild` (absent on a populated table) or `refused`. The readiness-marker generation
+   and the ledger tail and digest must not change during the census. The run publishes
+   a census artifact (kept 1 day). A `blocked` census means something needs a human:
+   an invalid, in-progress, drifted or wrong-owner object, an index of the same name in
+   another schema, or a readiness marker whose status is not `pass` (for example
+   `pending`, which can be left by a failed migration). The census still reports these.
+2. `prebuild`. It needs a census run from under 24 hours ago with verdict
+   `prebuild_required`, and a typed confirmation copied byte for byte from that census:
+   `PREBUILD-058000 <sha> GENERATION <g> TAIL <tail> LEDGER <digest> DESCRIPTOR <d> CENSUS <run> INDEXES <names>`.
+   It holds a dedicated advisory lock (try-only) and re-checks the census against the
+   live database. The readiness marker must be `pass` then and before every build. Then it builds the `prebuild` indexes one at a time, with a finite
+   statement and lock budget, and reads each one back. After every step it rewrites a
+   per-index receipt (kept 30 days). A rerun with the same census resumes: an index that
+   is already exact and valid/ready/live is accepted, and nothing else is. If a
+   statement's outcome is unknown (the connection dropped, or the server ended the
+   session, for example `57P01`), the run reads it back on a fresh session, never on the
+   failed one, and stops. It never retries. If no fresh readback is possible, the receipt
+   records `outcome_unknown` for that index and a human checks it.
+3. Apply the release. The migration adopts the prebuilt indexes and builds the
+   deferred ones on empty tables.
+4. `readback` (read-only). It passes only when all sixteen are exact, valid, ready and
+   live, and no create-index progress row exists on their tables.
+
+Before the separate change that enables prebuild: prove a long statement through the
+session pooler on a disposable or dev database (or use a proven direct owner endpoint),
+and run a guarded read-only census or readback to prove the credential hand-off.
+
+If an index is refused as invalid or in progress, follow "Failed or cancelled builds"
+in the guide by hand: check `pg_stat_progress_create_index` before dropping anything.
+Then run a new census. Dispatch steps, approvals and run records are not kept in this
+repository.
