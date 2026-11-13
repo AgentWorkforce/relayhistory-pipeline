@@ -153,7 +153,7 @@ let cleanup: (() => void)[] = [];
 afterEach(() => { cleanup.forEach((c) => c()); cleanup = []; VERDICTS.clear(); });
 /** A scratch store whose user has a backfilled, empty fence (0005 step 0), unless `fence: false`. */
 /** A valid fence-authority marker (main's OrgFenceAuthorityDoc / FenceAuthorityDoc): every precondition attested. */
-const AUTHORITY = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", workerHttpAdmission: "off", writtenAtMs: 1 };
+const AUTHORITY = { v: 1, fenceBackfill: "complete", revisionBackfill: "complete", ownershipBackfill: "complete", controlMirror: "on", rearmSweeper: "live", revisionLayout: "4096", workerHttpAdmission: "off", writtenAtMs: 1 };
 const putOrgAuthority = (store: ObjectStore, doc: unknown = { ...AUTHORITY, orgId: TENANT.orgId }) =>
   store.put(objectKey(orgFenceAuthorityKey(ROOT, TENANT.orgId)), enc.encode(JSON.stringify(doc)));
 async function scratch(opts: { fence?: boolean; exportComplete?: boolean; authority?: boolean } = {}) {

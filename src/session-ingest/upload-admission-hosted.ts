@@ -36,7 +36,7 @@ import { admitMessage } from "./admission-consumer.ts";
 import type { AdmissionMessage } from "./async-admission.ts";
 import { routingFlag } from "./babysitter-retention.ts";
 import type { DeliverDeps } from "./deliver.ts";
-import { INGEST_LEDGER_VAR, SERVER_LEDGER_PARALLEL, ingestLedgerMode, s3Ledger } from "./ledger-s3.ts";
+import { INGEST_LEDGER_VAR, ingestLedgerMode, s3Ledger, serverLedgerParallel } from "./ledger-s3.ts";
 import { uploadConsentEnforcement, UPLOAD_CONSENT_VAR } from "./upload-consent.ts";
 import type { PromoteUploadDeps, UploadDirectConfig } from "./upload-admission.ts";
 
@@ -59,6 +59,8 @@ export interface HostedUploadAdmissionConfig {
   bucket: string;
   keyRoot: string;
   secretId: string;
+  /** INGEST_LEDGER_PARALLEL (1..64), else SERVER_LEDGER_PARALLEL. */
+  ledgerParallel: number;
 }
 
 /** The hosted settings, or a coded error naming no value. */
@@ -86,7 +88,9 @@ export function hostedUploadAdmissionConfig(env: Record<string, string | undefin
   let consent;
   try { consent = uploadConsentEnforcement(env[UPLOAD_CONSENT_VAR]); } catch { return no("upload_consent_invalid"); }
   if (consent !== "off") no("upload_consent_unsupported");
-  return { region, bucket, keyRoot, secretId };
+  let ledgerParallel;
+  try { ledgerParallel = serverLedgerParallel(env); } catch { return no("ledger_parallel_invalid"); }
+  return { region, bucket, keyRoot, secretId, ledgerParallel };
 }
 
 /** The secret's exact shape. The witness key is passed through raw: promoteUpload validates it (malformed = retry). */
@@ -144,7 +148,7 @@ export function hostedUploadAdmissionRuntime(overrides: HostedRuntimeOverrides =
     const deliver: DeliverDeps = {
       // Fail closed: no admission until an operator has written the fence-authority marker (ledger-s3.ts
       // FenceAuthorityDoc: fence backfill complete, control mirror on, re-arm sweeper live). Every record retries.
-      ledger: s3Ledger(store, config.keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", parallel: SERVER_LEDGER_PARALLEL }),
+      ledger: s3Ledger(store, config.keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", parallel: config.ledgerParallel }),
       acceptanceMode: "canonical",
       // SCRUB_ENGINE is refused above unless ts, so this is {} today; it stays wired if that ever widens.
       target: { store, keyRoot: config.keyRoot, ...routedRawChunkSealerDeps() },
