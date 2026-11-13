@@ -78,8 +78,13 @@ IAM changes and applying migrations to a real database need Khaliq's explicit
 OK in his own words (AGENTS.md), however green a change is.
 
 `land.config.json` names the review flows, the CI flow, the base branch and the
-runner's commands and setup for the lander. It sets no merge policy: when and
-how to squash is the lander's own configuration and the rules above.
+runner's commands and setup for the lander. Its paths (`reviewFlows`, `ciFlow`,
+`flowsBin`) are read from, and resolved in, the lander's checkout of main (the
+trusted base), never in the change's worktree: the lander runs
+`<main>/<flowsBin> run --local-agent <main>/<ciFlow>` with the change as the
+working directory, and `npm --prefix flows ci` (`runner.setup`) runs in that
+main checkout. It sets no merge policy: when and how to squash is the lander's
+own configuration and the rules above.
 
 ## Trust
 
@@ -105,11 +110,24 @@ vouch for itself:
 - **The change's code runs without credentials.** The lanes run the change's
   tests and e2e before anyone approved it, so `lane.sh` re-executes itself
   under `env -i` with an allowlist, a scratch HOME, git's global and system
-  config off and only Docker's CLI plugins (`flows/lib/lane-env.test.mjs`).
-  Residual: a same-user process can still ask the OS keychain, and the Docker
-  socket is root-equivalent on the host. A lander host that holds a token able
-  to push main runs the lanes on a runner without it, or uses the sandbox
-  target.
+  config off, a synthetic git identity, `gh`, `op`, `security` and git's
+  keychain helpers shadowed by refusing stubs first on PATH, and only Docker's
+  CLI plugins (`flows/lib/lane-env.test.mjs`). The fleet starts every job
+  process without credential variables unless the job is gate code that needs
+  them (the GitHub gate; the reviewers' agent CLIs; BL_* only for the sandbox
+  e2e), detached so its parent is init, not the flows runner
+  (`flows/lib/fleet.mjs` `jobEnv`).
+
+  This is defence in depth, not a boundary. Code running as the same user can
+  still: read `/proc/<pid>/environ` of any of that user's processes (the flows
+  runner and daemon hold the caller's environment); read a token file or call
+  a credential tool by its absolute path (a `gh` wrapper's token file, `gh`
+  itself, which then asks the keychain); ask the OS keychain; and use the
+  Docker socket, which is root-equivalent on the host. **The rule:** lanes for
+  a change from anyone but the maintainers run on a runner (or a user) that
+  holds no token able to push main or read secrets, or use the sandbox target.
+  The lander host's own push token stays out of the lanes' reach only by that
+  separation.
 - **Publishing.** `remote-ci.mjs` (the GitHub snapshot) and the sandbox upload
   refuse machine-local state, secret-like files, production identifiers in the
   engine roots, and production identifiers on any line the change adds, using
@@ -122,11 +140,19 @@ vouch for itself:
 
 ## The CI flow
 
+The trusted form, which the lander uses: main's flows, run with the change's
+worktree as the working directory (`MAIN` is a clean checkout of `origin/main`):
+
 ```sh
-npm --prefix flows ci                     # once per checkout
-flows/node_modules/.bin/flows run --local-agent flows/ci.flow.ts --input '{}'                every round
-flows/node_modules/.bin/flows run --local-agent flows/ci.flow.ts --input '{"github":true}'   the final gate
+npm --prefix "$MAIN/flows" ci                                   # once per main checkout
+cd <change worktree>
+"$MAIN/flows/node_modules/.bin/flows" run --local-agent "$MAIN/flows/ci.flow.ts" --input '{}'                every round
+"$MAIN/flows/node_modules/.bin/flows" run --local-agent "$MAIN/flows/ci.flow.ts" --input '{"github":true}'   the final gate
 ```
+
+An author checking their own work may run the tree's own `flows/` the same way
+(`MAIN=.`); that run's gate is the change's own copy, which the report names,
+and it never counts for landing.
 
 Run it from the repository root with CI's bun (1.4.2) and node (24,
 `.github/workflows/ci.yml`) first on PATH and Docker running. It tests a

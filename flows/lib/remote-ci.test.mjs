@@ -31,6 +31,14 @@ test("the added-line identifier scan finds what a diff adds and ignores what it 
   assert.equal(scanText("x", "nothing here 123").length, 0);
   const diff = ["diff --git a/docs/x.md b/docs/x.md", "--- a/docs/x.md", "+++ b/docs/x.md", "@@ -1,0 +1,2 @@", "+harmless", "+also harmless"].join("\n");
   assert.deepEqual(scanAddedLines(diff), []);
+  // A stand-in scanner that flags "MARK": an added line whose own text starts with "++ " is scanned, not taken
+  // for a file header; removed lines are not; line numbers follow the hunk.
+  const flag = (path, text) => (text.includes("MARK") ? [{ path, line: 0, kind: "test" }] : []);
+  const tricky = [
+    "diff --git a/docs/y.md b/docs/y.md", "--- a/docs/y.md", "+++ b/docs/y.md", "@@ -3,1 +3,3 @@",
+    "-old MARK", "+fine", "+++ MARK hidden as a header", "+MARK plain",
+  ].join("\n");
+  assert.deepEqual(scanAddedLines(tricky, flag).map((h) => `${h.path}:${h.line}`), ["docs/y.md:4", "docs/y.md:5"]);
 });
 
 test("only this dispatch's newest run per workflow counts", () => {

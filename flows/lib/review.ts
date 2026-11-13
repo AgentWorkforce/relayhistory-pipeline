@@ -300,6 +300,9 @@ export async function reviewFleet(f: Ctx, opts: FleetOptions): Promise<{ paths: 
     `${opts.dir}/fleet`,
     inputs.map((input) => ({
       name: input.lens,
+      // Each reviewer is an agent CLI that needs its own login (an API key in the environment, for some CLIs):
+      // the reviewer runs are gate code from LIB, and the agents work read-only on the patch.
+      credentials: "all" as const,
       steps: [{ name: "review", command: `${flows} ${shellWord(`${FLOWS}/reviewer.flow.ts`)} --input ${shellWord(`${input.cwd}/input.json`)}` }],
     })),
     REVIEW_POLLS,

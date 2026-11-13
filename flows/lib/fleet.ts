@@ -24,6 +24,11 @@ export interface FleetStep {
 export interface FleetJob {
   name: string;
   steps: FleetStep[];
+  /**
+   * The credentials the job's process keeps (lib/fleet.mjs jobEnv): none by default; "all" for gate code that
+   * needs the caller's login (the GitHub gate), "blaxel" for the sandbox e2e.
+   */
+  credentials?: "all" | "blaxel";
 }
 
 export interface FleetResult {

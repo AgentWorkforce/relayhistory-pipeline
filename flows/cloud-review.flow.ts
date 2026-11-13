@@ -355,8 +355,24 @@ const writeAsYouGo = (aimMinutes = 8): string =>
   `Aim to finish within ${minutesWord(aimMinutes)} minutes. Write findings.json with an empty findings array first, then rewrite ` +
   "it after each finding you verify, so the file is always a valid answer if your time runs out.";
 
-const gateCommand = (path: string, files: string): string =>
-  `node flows/lib/check-findings.mjs ${shellWord(path)} ${shellWord(files)}`;
+/**
+ * The findings gate is gate code (docs/maintainer-workflow.md "Trust"): it runs from beside this module, the
+ * checkout the flow was loaded from (main's, when the lander runs main's flows), never from the reviewed tree.
+ * A Cloud bundle has no sibling lib/ (this module is bundled alone), and there the uploaded tree's flows/ IS
+ * main's: the submitter uploads main's flows/ over the change (relay-app agent/review.sh upload_manifest), so
+ * that copy is the gate. No import is needed for this: URL and import.meta are globals.
+ */
+export const MODULE_GATE = ((): string => {
+  try {
+    const url = new URL("./lib/check-findings.mjs", import.meta.url);
+    return url.protocol === "file:" ? decodeURIComponent(url.pathname) : "";
+  } catch {
+    return "";
+  }
+})();
+
+export const gateCommand = (path: string, files: string): string =>
+  `g=${shellWord(MODULE_GATE)}; { [ -n "$g" ] && [ -f "$g" ]; } || g=flows/lib/check-findings.mjs; node "$g" ${shellWord(path)} ${shellWord(files)}`;
 
 /** A reviewer's task, in lib/review.ts reviewerInputs' order; a second opinion covers the whole change. */
 export const reviewerTask = (root: string, preamble: string, lens: Lens, secondOpinion = false, aimMinutes?: number): string =>

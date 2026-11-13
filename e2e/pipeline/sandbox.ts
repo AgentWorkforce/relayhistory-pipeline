@@ -63,7 +63,10 @@ async function api(path: string, init: RequestInit & { base?: string } = {}) {
  * secret-like files, production identifiers, including any line added over the merge base with main).
  */
 async function archive(dir: string): Promise<{ sha: string; file: string }> {
-  const ci = await import("../../flows/lib/remote-ci.mjs" as string) as { snapshot: () => string; refuseToPublish: (sha: string, base: string | undefined, root: string) => Promise<string> };
+  // The publish refusals are gate code: run from the gate's flows/lib (lane.sh passes RH_GATE_LIB, the
+  // checkout the CI flow was loaded from), and from this tree's copy only when run by hand.
+  const gateLib = process.env.RH_GATE_LIB?.trim() || fileURLToPath(new URL("../../flows/lib", import.meta.url));
+  const ci = await import(`${gateLib}/remote-ci.mjs`) as { snapshot: () => string; refuseToPublish: (sha: string, base: string | undefined, root: string) => Promise<string> };
   const sha = ci.snapshot();
   let base: string | undefined;
   try { base = execFileSync("git", ["-C", ROOT, "merge-base", "origin/main", sha], { encoding: "utf8" }).trim(); } catch {}

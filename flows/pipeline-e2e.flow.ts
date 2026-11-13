@@ -37,6 +37,7 @@ export default flow<E2eInput>(
     // One job in the fleet: its polls are short, so a lost root lease is followed (lib/fleet.ts).
     const [result] = await runFleet(f, `${dir}/fleet`, [{
       name: "e2e",
+      ...(target === "sandbox" ? { credentials: "blaxel" as const } : {}),
       steps: [{ name: "pipeline e2e", command: `RELAYFLOW_STATE_DIR=${shellWord(root)} bash ${lib("lane.sh")} e2e --target ${target}${select}`, timeoutMinutes: 50 }],
     }], 27, 2);
     const report = (await f.run(`cat ${shellWord(`${dir}/report.md`)} 2>/dev/null || true`)).trim();

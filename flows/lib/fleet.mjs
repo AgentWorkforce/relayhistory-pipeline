@@ -99,6 +99,21 @@ export function stopPrevious(dir, only, kill = (pid, signal) => process.kill(pid
   if (!only || (entries.length > 0 && entries.every(([, token]) => token === only))) rmSync(pidsFile(dir), { force: true });
 }
 
+/** Variables that carry a credential, by name. */
+export const SECRET_NAME = /TOKEN|SECRET|PASSW(OR)?D|CREDENTIAL|API_?KEY|PRIVATE_KEY|SESSION_KEY|^GH_|^GITHUB_|^AWS_|^BL_|^OP_|^SSH_AUTH_SOCK$|^NPM_CONFIG_/i;
+
+/**
+ * The environment a job starts with. A job runs its steps as children, and a step running the change's code
+ * could read its parent's environment (/proc/<ppid>/environ on Linux), so a job holds no credential unless it
+ * needs one: `credentials: "all"` (the GitHub gate, which pushes and dispatches with the caller's gh login) or
+ * `"blaxel"` (the sandbox e2e: BL_API_KEY and BL_WORKSPACE only). Job processes are detached, and `start` exits,
+ * so their parent is init, not the flows runner that holds the caller's environment.
+ */
+export function jobEnv(env, credentials) {
+  if (credentials === "all") return { ...env };
+  return Object.fromEntries(Object.entries(env).filter(([name]) => !SECRET_NAME.test(name) || (credentials === "blaxel" && /^BL_(API_KEY|WORKSPACE)$/.test(name))));
+}
+
 function start(dir) {
   stopPrevious(dir);
   const jobs = jobsOf(dir);
@@ -114,6 +129,7 @@ function start(dir) {
     const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "exec", resolve(dir), String(index), token], {
       detached: true,
       stdio: "ignore",
+      env: jobEnv(process.env, jobs[index].credentials),
     });
     child.unref();
     // Recorded as each one starts, so an interrupted start leaves none unstoppable.
