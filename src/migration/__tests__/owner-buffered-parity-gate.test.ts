@@ -15,6 +15,7 @@ import {
   OWNER_PARITY_MODES,
   OWNER_PARITY_ROSTER_FILE,
   OWNER_PARITY_WORKFLOW,
+  OWNER_PARITY_BULK_WRITE_ENABLED,
   OWNER_PARITY_WRITE_ENABLED,
   OWNER_PARITY_BULK_PLAN_CONTRACT,
   keepRosterTenants,
@@ -104,6 +105,7 @@ const gate = (e: Record<string, string>, f: Fixture, enabled = true, seen?: stri
 
 test("dormant gate: write refuses before any GitHub read; read-only modes pass every gate", async () => {
   expect(OWNER_PARITY_WRITE_ENABLED).toBe(false);
+  expect(OWNER_PARITY_BULK_WRITE_ENABLED).toBe(false);
   const seen: string[] = [];
   expect(await gate(writeEnv, githubFixture(), false, seen)).toBe("owner_parity_write_dormant");
   expect(seen).toEqual([]);

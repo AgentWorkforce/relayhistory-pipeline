@@ -26,7 +26,7 @@ import {
 import type { ConnectedOwnerClient } from "../../hoopdb/owner-operator-apply.ts";
 import { BULK_TARGET_GENERATION_SQL, tenantSha256 } from "../../../scripts/owner-buffered-parity-operator.ts";
 import { ParityCensusRefusal, READ_OWNER_BUFFERED_PARITY_SQL, type OwnerBufferedParityProof, type ParityCensusReceipt, type ParityTenant } from "../owner-buffered-parity.ts";
-import { OWNER_PARITY_BULK_PLAN_CONTRACT, OWNER_PARITY_WRITE_ENABLED, ownerParityBulkConfirmation,
+import { OWNER_PARITY_BULK_PLAN_CONTRACT, OWNER_PARITY_BULK_WRITE_ENABLED, OWNER_PARITY_WRITE_ENABLED, ownerParityBulkConfirmation,
   ownerParityBulkPlanDescriptor, ownerParityConfirmation, ownerParityDispatch,
   type OwnerParityBulkPlanArtifact, type OwnerParityBulkPlanBody,
   type OwnerParityCensusArtifact } from "../owner-buffered-parity-ci-contract.ts";
@@ -298,6 +298,7 @@ test("bulk mode is unreachable and dormant write issues no statement", async () 
     expect(x.w.statements).toEqual([]);
   }
   expect(OWNER_PARITY_WRITE_ENABLED).toBe(false);
+  expect(OWNER_PARITY_BULK_WRITE_ENABLED).toBe(false);
   const c = await census();
   const x = world();
   const out = await runOwnerParity(writeEnv(c), x.sessions, { roster, runId: "202", census: c, now: () => T0, deps: x.deps });
