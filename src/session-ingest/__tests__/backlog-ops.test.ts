@@ -134,6 +134,13 @@ test("argv is fixed: never an org, checkpoint or start key; dry runs omit the ke
     for (const flag of ["--checkpoint-file", "--start-after", "--org", "--assume-empty-fence"]) expect(spec.args).not.toContain(flag);
     expect(spec.needsDb).toBe(!mode.startsWith("drain"));
     expect(spec.args.includes("--max-objects")).toBe(mode.startsWith("drain"));
+    const timeout = spec.args.indexOf("--statement-timeout-ms");
+    expect(timeout >= 0).toBe(mode.startsWith("backfill"));
+    if (mode.startsWith("backfill")) {
+      expect(spec.args.slice(timeout, timeout + 2)).toEqual(["--statement-timeout-ms", "600000"]);
+      expect(spec.args.slice(spec.args.indexOf("--page-size"), spec.args.indexOf("--page-size") + 2)).toEqual(["--page-size", "5000"]);
+      expect(spec.args.slice(spec.args.indexOf("--row-page-size"), spec.args.indexOf("--row-page-size") + 2)).toEqual(["--row-page-size", "20000"]);
+    }
     expect(backlogOpsRole(d, t)).toBe(exec ? t.executeRoleArn : t.dryRoleArn);
   }
 });

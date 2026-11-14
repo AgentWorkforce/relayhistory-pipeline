@@ -143,12 +143,21 @@ export function backlogOpsTarget(env: Record<string, string | undefined>): Backl
   return { bucket, region, kmsKeyArn, dryRoleArn, executeRoleArn };
 }
 
+/**
+ * The backfill's paging for production. Its users page is a DISTINCT over six tables, one of which (ingest_batches)
+ * has no index on the owner key, so every page scans in full: the tool's 30 s default timed out on the first page
+ * (sqlstate_57014). Fewer, larger pages and the tool's maximum per-statement timeout. Each page is still its own
+ * READ ONLY transaction.
+ */
+export const BACKLOG_OPS_BACKFILL_PAGING = ["--page-size", "5000", "--row-page-size", "20000", "--statement-timeout-ms", "600000"] as const;
+
 /** Fixed argv for the tool: never an org, a checkpoint, a start key or an unvalidated value. */
 export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget): { script: string; args: string[]; needsDb: boolean } {
   const tool = toolOf(d.mode), execute = isExecute(d.mode);
   const script = { backfill: "scripts/upload-fence-backfill.ts", export: "scripts/accepted-stage-export.ts", drain: "scripts/buffered-drain.ts" }[tool];
   const args = [execute ? "--execute" : "--dry-run", "--bucket", t.bucket, "--region", t.region,
     ...(execute ? ["--kms-key-arn", t.kmsKeyArn] : []),
+    ...(tool === "backfill" ? BACKLOG_OPS_BACKFILL_PAGING : []),
     ...(tool === "drain" && d.maxObjects !== null ? ["--max-objects", String(d.maxObjects)] : [])];
   return { script, args, needsDb: tool !== "drain" };
 }
