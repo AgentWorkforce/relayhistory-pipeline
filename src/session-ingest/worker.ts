@@ -104,6 +104,7 @@ import type { AnalyticsPort } from "../shared/analytics.ts";
 import { WORKER_LIMITS } from "../shared/analytics-export.ts";
 import { ingestLedgerMode, s3ControlMirror } from "./ledger-s3.ts";
 import { AnalyticsConfigError, analyticsConfig, analyticsCounterFields, createAnalyticsSink, type AnalyticsConfig } from "../shared/analytics-config.ts";
+import { acceptedGenerations } from "./accept-generations.ts";
 
 interface QueueLike<T> {
   send(body: T): Promise<void>;
@@ -364,22 +365,8 @@ export async function ingestSettings(env: IngestWorkerEnv): Promise<IngestSettin
   };
 }
 
-/**
- * INGEST_ACCEPT_GENERATIONS: unset, or a comma list of 1-2 distinct explicit lowercase hex64 generations that
- * includes INGEST_EXPECT_GENERATION, in buffered mode only. Anything else (a wildcard, a third value, a value
- * without the expected generation, whitespace inside a value, an explicitly empty value) is a configuration
- * error, never a silent narrowing or widening.
- */
-export function acceptedGenerations(env: Pick<IngestWorkerEnv, "INGEST_ACCEPT_GENERATIONS" | "INGEST_EXPECT_GENERATION">, acceptanceMode: string): readonly string[] | undefined {
-  const raw = env.INGEST_ACCEPT_GENERATIONS;
-  if (raw === undefined) return undefined;
-  if (acceptanceMode !== "buffered") throw new Error("session ingest: INGEST_ACCEPT_GENERATIONS needs buffered acceptance");
-  const list = raw.split(",");
-  if (list.length < 1 || list.length > 2 || !list.every((g) => /^[0-9a-f]{64}$/.test(g)) || new Set(list).size !== list.length
-      || !list.includes(env.INGEST_EXPECT_GENERATION ?? ""))
-    throw new Error("session ingest: INGEST_ACCEPT_GENERATIONS must be 1 or 2 distinct hex64 generations including INGEST_EXPECT_GENERATION");
-  return Object.freeze(list);
-}
+/** INGEST_ACCEPT_GENERATIONS parsing; defined in the grant-free accept-generations.ts (the schema rehearsal imports it there). */
+export { acceptedGenerations };
 
 function custodySourceOf(env: IngestWorkerEnv): string {
   return env.INGEST_CUSTODY_SOURCE?.trim() || "relayhistory";

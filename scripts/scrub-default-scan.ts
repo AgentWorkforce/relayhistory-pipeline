@@ -7,10 +7,12 @@
  *     preloads) and test files; the grant module is imported only by those files, the
  *     scrub-engine directory and tests (other files may import only the read-only
  *     scrubTsAllowed / scrubTsCapabilities); and no file re-exports it.
- *  1b. Module-load grants: each HOSTED_ENTRIES file imports its HOSTED_GRANT_MODULES module
- *     first, as a bare side-effect import ("hosted-grant-first"), and no other non-test file
- *     reaches a grant module through static or literal dynamic imports ("hosted-grant-reach"),
- *     so no self-host main or script gains the TS engine.
+ *  1b. Module-load grants: each HOSTED_ENTRIES file's first statement (comments skipped) is the
+ *     static bare side-effect import of its HOSTED_GRANT_MODULES module ("hosted-grant-first"; a
+ *     named, namespace or dynamic import, or the text inside a string or template, does not count),
+ *     and no other non-test file under the scan roots (scripts/pg-proof/ included) reaches a grant
+ *     module through the edges below ("hosted-grant-reach"), so no self-host main or script gains
+ *     the TS engine.
  *  1c. Deploy mains: every stacks/ `main: "..."` and wrangler*.jsonc "main" is a HOSTED_ENTRIES
  *     file ("deploy-main"); WRAPPED_HANDLERS are reachable only through their hosted wrapper.
  *  2. Preload isolation: no production source (src/, packages/<name>/src) imports a test preload.
@@ -21,16 +23,23 @@
  *     entry or wrapped handler, or is listed in ENTRY_EXEMPT with the reason it never scrubs or seals.
  *
  * Scope: tracked .ts/.mts/.mjs under src, packages, scripts, e2e, benchmarks and stacks (plain .js is
- * only the vendored wasm-bindgen glue). Edges: import/export-from, bare import, literal `import("x")`
- * and literal `require("x")`; relative and @rhc/ specifiers only.
+ * only the vendored wasm-bindgen glue). Edges: import/export-from (`import {} from "x"` is a value
+ * edge: it evaluates "x"; only `import type` and all-`type` braces are erased), bare import (with or
+ * without a semicolon), literal `import("x")`, `import(\`x\`)` with no `${`, literal `require("x")`
+ * and `createRequire(...)("x")`. Specifiers: relative, the tsconfig aliases `@rhc/*`
+ * (packages/pipeline/src) and `@rhc-object-store`, and every workspace package name
+ * (packages/<dir>/package.json "name", e.g. `@96bulls/pipeline/...`, linked into node_modules by
+ * bun workspaces); other bare specifiers are third-party and not followed.
  *
  * Known limits (heuristics, not a proof; review covers these):
  *  - G4 order: an entry passes rule 3 if it calls the initialiser anywhere, even after a seam use at
  *    module evaluation or before the call; the runtime still fails closed there (wasm-bindgen with no
  *    init answers scrubTextForLog "[scrub-unavailable]" and throws on scrubText).
- *  - G5 computed imports: `import(variable)` / `require(variable)` are invisible (known case:
- *    scripts/pg-proof/schema-rehearsal.ts imports src/session-ingest/worker.ts by a computed path from
- *    the candidate checkout; a CI-only rehearsal process that never scrubs, seals or stores data).
+ *  - Computed and indirect loads are invisible: `import(variable)`, `require(variable)`, a template
+ *    with `${...}`, a wrapper such as `const mod = (p) => import(join(ROOT, p))`, a stored
+ *    `const req = createRequire(...)` called later, and `new Worker(url)` / `Bun.spawn` of another file.
+ *    Review covers these (scripts/pg-proof/schema-rehearsal.ts loads candidate-tree modules this way
+ *    and takes acceptedGenerations from the grant-free src/session-ingest/accept-generations.ts).
  *  - G9 conditional init: an initialiser only under `if (process.env.X)` (or any branch) still counts.
  *  - Entry detection is line-anchored and regex-based: entries shaped differently (for example
  *    `export default app`, a handler exported through `export { handler }` of a local binding) are not
@@ -41,7 +50,7 @@
  *   bun scripts/scrub-default-scan.ts      exit 1 and list each violation
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -140,7 +149,14 @@ export function trackedSources(root = ROOT): Sources {
   return files;
 }
 
-const IMPORT_RE = /(?:^|\n)\s*(import|export)\s+(type\s+)?([^;]*?)\s*from\s*["']([^"']+)["']|(?:\bimport|(?<![\w.$])require)\(\s*["']([^"']+)["']\s*\)|(?:^|\n)\s*import\s+["']([^"']+)["']/g;
+/** Import edges. A statement ends at the closing quote of its specifier, not at `;`: the import/export
+ * clause may not contain a quote, backtick or `;`, nor run onto a line that starts another
+ * import/export, so a semicolon-less bare import is never folded into the next statement's `from`. */
+const IMPORT_RE = new RegExp([
+  /(?:^|\n)\s*(?<kw>import|export)\s+(?<type>type\s+)?(?<clause>(?:(?!\n\s*(?:import|export)\b)[^;"'`])*?)\s*from\s*["'](?<from>[^"']+)["']/.source,
+  /(?:\bimport\s*|(?<![\w.$])require\s*|\bcreateRequire\s*\((?:[^()]|\([^()]*\))*\)\s*)\(\s*(?:["'](?<dyn>[^"']+)["']|`(?<tpl>[^`$]+)`)\s*\)/.source,
+  /(?:^|\n)\s*import\s*["'](?<bare>[^"']+)["']/.source,
+].join("|"), "g");
 const stripComments = (src: string) => src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:"'`\\])\/\/[^\n]*/g, "$1");
 /** Comment- and string-free code (string and template bodies emptied), for name tests that a string must not satisfy. */
 const codeOnly = (src: string) => stripComments(src).replace(/`(?:\\[\s\S]|[^`\\])*`|"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'/g, '""');
@@ -149,23 +165,42 @@ type Edge = { spec: string; names: string[] | "*"; typeOnly: boolean; reexport: 
 function edges(src: string): Edge[] {
   const out: Edge[] = [];
   for (const m of src.matchAll(IMPORT_RE)) {
-    if (m[4]) {
-      const clause = m[3] ?? "";
+    const g = m.groups!;
+    if (g.from) {
+      const clause = g.clause ?? "";
       const braces = clause.match(/\{([^}]*)\}/);
+      const items = braces ? braces[1]!.split(",").map((x) => x.trim()).filter(Boolean) : [];
       const names = braces && !/\*|^\s*\w+\s*,/.test(clause.replace(braces[0], ""))
-        ? braces[1]!.split(",").map((x) => x.trim()).filter((x) => x && !x.startsWith("type ")).map((x) => x.split(/\s+as\s+/)[0]!.trim())
+        ? items.filter((x) => !x.startsWith("type ")).map((x) => x.split(/\s+as\s+/)[0]!.trim())
         : "*";
-      out.push({ spec: m[4], names, typeOnly: !!m[2] || (Array.isArray(names) && names.length === 0 && !!braces), reexport: m[1] === "export" });
-    } else out.push({ spec: (m[5] ?? m[6])!, names: "*", typeOnly: false, reexport: false });
+      // Erased at runtime: `import type`, or braces whose every name is `type`-marked. Empty braces
+      // (`import {} from "x"`) are NOT erased: the module is still evaluated.
+      const erased = !!g.type || (Array.isArray(names) && names.length === 0 && items.length > 0);
+      out.push({ spec: g.from, names, typeOnly: erased, reexport: g.kw === "export" });
+    } else out.push({ spec: (g.dyn ?? g.tpl ?? g.bare)!, names: "*", typeOnly: false, reexport: false });
   }
   return out;
 }
 
+/** Workspace package name -> repo-relative directory (root package.json "workspaces": packages/*). */
+export const WORKSPACE_PACKAGES: ReadonlyMap<string, string> = (() => {
+  const out = new Map<string, string>();
+  for (const d of existsSync(resolve(ROOT, "packages")) ? readdirSync(resolve(ROOT, "packages")) : []) {
+    const pj = resolve(ROOT, "packages", d, "package.json");
+    if (!existsSync(pj)) continue;
+    const name = (JSON.parse(readFileSync(pj, "utf8")) as { name?: unknown }).name;
+    if (typeof name === "string" && name) out.set(name, `packages/${d}`);
+  }
+  return out;
+})();
+
 function resolveSpec(files: Sources, from: string, spec: string): string | undefined {
-  let base: string;
+  let base: string | undefined;
   if (spec.startsWith("@rhc/")) base = `packages/pipeline/src/${spec.slice(5)}`;
+  else if (spec === "@rhc-object-store") base = "packages/object-store/src/index.ts";
   else if (spec.startsWith(".")) base = resolve("/", dirname(from), spec).slice(1);
-  else return undefined;
+  else for (const [name, dir] of WORKSPACE_PACKAGES) if (spec === name || spec.startsWith(`${name}/`)) { base = `${dir}${spec.slice(name.length)}`; break; }
+  if (base === undefined) return undefined;
   for (const c of [base, base.replace(/\.js$/, ".ts"), base.replace(/\.mjs$/, ".mts"), `${base}.ts`, `${base}/index.ts`]) if (files.has(c)) return c;
 }
 
@@ -260,10 +295,13 @@ export function scan(files: Sources): Violation[] {
     v.push({ rule: "hosted-grant-reach", file: f, detail: `reaches a hosted module-load TS grant (${chain.join(" -> ")}); only HOSTED_ENTRIES may` });
   }
   for (const [f, kind] of Object.entries(HOSTED_ENTRIES)) {
-    const first = edges(stripComments(files.get(f) ?? "")).find((e) => !e.typeOnly);
+    // The first statement itself (comments and a shebang skipped) must be the static bare import: an
+    // import named in a string or template, a named / namespace import, `void import(...)` or
+    // `await import(...)` does not count.
+    const first = /^\s*import\s*["']([^"']+)["']/.exec(stripComments(files.get(f) ?? "").replace(/^#![^\n]*/, ""));
     const want = HOSTED_GRANT_MODULES[kind];
-    if (!first || resolveSpec(files, f, first.spec) !== want || first.names !== "*")
-      v.push({ rule: "hosted-grant-first", file: f, detail: `first import must be the bare side-effect import of ${want}` });
+    if (!first || resolveSpec(files, f, first[1]!) !== want)
+      v.push({ rule: "hosted-grant-first", file: f, detail: `first statement must be the static bare side-effect import of ${want}` });
   }
   for (const [m, w] of Object.entries(WRAPPED_HANDLERS))
     if (!(w in HOSTED_ENTRIES) || !edges(files.get(w) ?? "").some((e) => e.reexport && resolveSpec(files, w, e.spec) === m))

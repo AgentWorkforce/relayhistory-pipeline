@@ -1145,7 +1145,10 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
 
   await stage("R6", async () => {
     const S = await mod("stacks/cloudflare/session-ingest.ts");
-    const W = await mod("src/session-ingest/worker.ts");
+    // acceptedGenerations from its grant-free module, not worker.ts: worker.ts imports the hosted-worker
+    // module-load TS grant first (docs/scrub-engine.md "Default flip"), which this process must not hold.
+    // Release trees from before the split define it only in worker.ts (and have no module-load grant).
+    const W = await mod(existsSync(join(ROOT, "src/session-ingest/accept-generations.ts")) ? "src/session-ingest/accept-generations.ts" : "src/session-ingest/worker.ts");
     // Placeholder ids only: R6 reads the generation vars, nothing else is emitted.
     const base = {
       accountId: "rehearsal-account",

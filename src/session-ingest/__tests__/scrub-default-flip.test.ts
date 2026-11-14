@@ -11,6 +11,9 @@
  * log scrub BEFORE any handler, and must resolve "ts" with that module's grant; the self-host
  * counterpart imports self-host mains and the shared lambda.ts helpers and must see no grant,
  * a refused pre-init log, and wasm-bindgen at init.
+ *
+ * The two-kind capability set (both hosted grants reported, sorted, without duplicates) is pinned
+ * in-process on ts-capability.ts in the last block.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -206,4 +209,32 @@ describe("module-load TS grant (clean child per entry, log scrub before any hand
       expect(out.grantsAtEnd).toStrictEqual([]);
     });
   }
+});
+
+// The capability set holds several kinds at once: a process holding both hosted grants (for example a
+// test importing a Lambda and a Worker entry) reports both, sorted, and a repeated grant is not
+// duplicated. In-process on ts-capability.ts; the preload's grants are restored afterwards.
+describe("TS capability set (two hosted kinds)", () => {
+  test("hosted-lambda then hosted-worker: both reported, in order, repeats not duplicated", async () => {
+    const cap = await import("../../../packages/pipeline/src/lib/scrub-engine/ts-capability.ts");
+    const before = cap.scrubTsCapabilities();
+    cap.clearScrubTsCapabilitiesForTests();
+    try {
+      cap.declareScrubTsCapability("hosted-lambda");
+      cap.declareScrubTsCapability("hosted-worker");
+      expect(cap.scrubTsCapabilities()).toStrictEqual(["hosted-lambda", "hosted-worker"]);
+      cap.declareScrubTsCapability("hosted-lambda");
+      cap.declareScrubTsCapability("hosted-worker");
+      expect(cap.scrubTsCapabilities()).toStrictEqual(["hosted-lambda", "hosted-worker"]);
+      cap.clearScrubTsCapabilitiesForTests();
+      cap.declareScrubTsCapability("hosted-worker");
+      cap.declareScrubTsCapability("hosted-lambda");
+      expect(cap.scrubTsCapabilities()).toStrictEqual(["hosted-lambda", "hosted-worker"]);
+      expect(cap.scrubTsAllowed()).toBe(true);
+    } finally {
+      cap.clearScrubTsCapabilitiesForTests();
+      for (const k of before) cap.declareScrubTsCapability(k);
+    }
+    expect(cap.scrubTsCapabilities()).toStrictEqual(before);
+  });
 });

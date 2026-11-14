@@ -198,6 +198,55 @@ describe("scrub-default-scan", () => {
     expect(rules(files)).toEqual(expect.arrayContaining([`hosted-grant-reach:${f}`]));
   });
 
+  // hosted-grant-reach edge forms: each planted import of a grant module must be seen.
+  const GRANT_REL = "../packages/pipeline/src/lib/scrub-engine/hosted-lambda-grant.ts";
+  test.each([
+    ["empty-braces import", `import {} from "${GRANT_REL}";\nexport const x = 1;\n`],
+    ["package-specifier bare import", `import "@96bulls/pipeline/src/lib/scrub-engine/hosted-lambda-grant.ts";\nexport const x = 1;\n`],
+    ["package-specifier empty-braces import", `import {} from "@96bulls/pipeline/src/lib/scrub-engine/hosted-worker-grant.ts";\nexport const x = 1;\n`],
+    ["semicolon-less bare import followed by another import", `import "${GRANT_REL}"\nimport { log } from "../src/shared/log.ts";\nexport const x = log;\n`],
+    ["template-literal dynamic import", `export const g = () => import(\`${GRANT_REL}\`);\n`],
+    ["createRequire call", `import { createRequire } from "node:module";\ncreateRequire(import.meta.url)("${GRANT_REL}");\n`],
+  ])("a planted %s of a grant module is a hosted-grant-reach violation", (_form, src) => {
+    const f = "scripts/planted-reach.ts";
+    expect(rules(plant(f, src))).toContain(`hosted-grant-reach:${f}`);
+  });
+
+  test("a planted file importing a reaching module through a semicolon-less bare import is flagged too", () => {
+    const f = "scripts/planted-reach-chain.ts";
+    const src = `import "../src/session-ingest/buffered-gc-lambda.ts"\nimport { log } from "../src/shared/log.ts"\nlog;\n`;
+    expect(rules(plant(f, src))).toContain(`hosted-grant-reach:${f}`);
+  });
+
+  test("type-only imports of a grant module and a `${...}` template are not edges", () => {
+    const f = "scripts/planted-reach-types.ts";
+    const src = `import type {} from "${GRANT_REL}";\nimport { type X } from "${GRANT_REL}";\nconst k = "lambda";\nexport const g = () => import(\`../packages/pipeline/src/lib/scrub-engine/hosted-\${k}-grant.ts\`);\n`;
+    expect(rules(plant(f, src))).not.toContain(`hosted-grant-reach:${f}`);
+  });
+
+  // hosted-grant-first: only a static bare import as the first statement counts (M1, M12, M13).
+  const GC = "src/session-ingest/buffered-gc-lambda.ts";
+  const GC_GRANT = /^import\s+"@rhc\/lib\/scrub-engine\/hosted-lambda-grant\.ts";[^\n]*\n/m;
+  test.each([
+    ["the grant import inside a template literal (M1)", (line: string) => `const s = \`\n${line}\`;\n`],
+    ["`void import(grant)` (M12)", () => `void import("@rhc/lib/scrub-engine/hosted-lambda-grant.ts");\n`],
+    ["top-level `await import(grant)` (M13)", () => `await import("@rhc/lib/scrub-engine/hosted-lambda-grant.ts");\n`],
+    ["a namespace import of the grant", () => `import * as grant from "@rhc/lib/scrub-engine/hosted-lambda-grant.ts";\n`],
+    ["an empty-braces import of the grant", () => `import {} from "@rhc/lib/scrub-engine/hosted-lambda-grant.ts";\n`],
+  ])("a hosted entry whose first statement is %s fails hosted-grant-first", (_form, first) => {
+    const files = mutate(GC, (s) => {
+      const line = s.match(GC_GRANT)![0];
+      const i = s.indexOf(line);
+      return s.slice(0, i) + first(line) + s.slice(i + line.length);
+    });
+    expect(rules(files)).toContain(`hosted-grant-first:${GC}`);
+  });
+
+  test("a semicolon-less static bare grant import first passes hosted-grant-first", () => {
+    const files = mutate(GC, (s) => s.replace(GC_GRANT, (l) => l.replace('.ts";', '.ts"')));
+    expect(rules(files)).not.toContain(`hosted-grant-first:${GC}`);
+  });
+
   test("a wrapper that stops re-exporting its handler fails", () => {
     const f = "src/session-pipeline/lambda-entry.ts";
     expect(rules(mutate(f, (s) => s.replace(/^export \{ handler \} from "\.\/lambda\.ts";\n/m, "export const handler = () => undefined;\n")))).toContain(`hosted-grant-first:${f}`);

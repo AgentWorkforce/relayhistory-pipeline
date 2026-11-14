@@ -89,7 +89,8 @@ switch (scenario) {
     out.scrub = await settle(() => scrubText("x"));
     out.log = scrubTextForLog(`token=${SECRET}`);
     out.routed = await settle(() => routedRawChunkSealer());
-    // A later grant does not lift the latch (only hosted handlers grant, at entry, before any init).
+    // A later grant does not lift the latch (in production only hosted entries grant, at module load through
+    // their first import of a hosted-*-grant.ts module, before any seam use or init).
     declareScrubTsCapability("hosted-lambda");
     out.afterGrant = await settle(initScrubEngine());
     break;

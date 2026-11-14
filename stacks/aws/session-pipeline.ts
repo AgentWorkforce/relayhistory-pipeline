@@ -16,7 +16,8 @@
  *       EventBridge rule (every minute, ENABLED only with bufferedErasureDelete.enabled) --> Lambda {"bufferedErasureDelete":true}
  *       (one bounded later-erasure delete pass over buffered rows: src/session-pipeline/buffered-erasure-delete.ts)
  *
- * The Lambda (src/session-pipeline/lambda.ts) runs the pipeline's own
+ * The Lambda (deployed main src/session-pipeline/lambda-entry.ts, a thin wrapper that imports the
+ * hosted-lambda module-load TS grant first and re-exports the handler of src/session-pipeline/lambda.ts) runs the pipeline's own
  * object-landed + session-indexed handlers (Supabase `upsert_session_index`,
  * revision-fenced), then the ClickHouse scope reconcile.
  *

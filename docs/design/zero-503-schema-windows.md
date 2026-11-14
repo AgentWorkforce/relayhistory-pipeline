@@ -188,7 +188,7 @@ Properties:
 
 ### 2.3 Worker: an explicit set of at most two generations
 
-- `INGEST_ACCEPT_GENERATIONS` (`src/session-ingest/worker.ts`, `acceptedGenerations`):
+- `INGEST_ACCEPT_GENERATIONS` (`src/session-ingest/accept-generations.ts` `acceptedGenerations`, re-exported by `worker.ts`):
   - Unset means `INGEST_EXPECT_GENERATION` only, which is today's behaviour.
   - Otherwise it is 1 or 2 comma-separated, distinct, lowercase hex64 values that must include
     `INGEST_EXPECT_GENERATION`.

@@ -47,6 +47,11 @@ describe("predicate-hook fallback before the seam loads", () => {
     expect(out.result).toBe("scrubbed");
   });
 
+  test("hosted grant with SCRUB_ENGINE=\"\" and SCRUB_ENGINE_REQUIRED=\"\" (empty counts as unset): scrubbed", () => {
+    expect(child("hosted-lambda", { SCRUB_ENGINE: "" }).result).toBe("scrubbed");
+    expect(child("hosted-worker", { SCRUB_ENGINE: "", SCRUB_ENGINE_REQUIRED: "" }).result).toBe("scrubbed");
+  });
+
   test("hosted grant with SCRUB_ENGINE=ts and SCRUB_ENGINE_REQUIRED=ts: scrubbed", () => {
     expect(child("hosted-worker", { SCRUB_ENGINE: "ts", SCRUB_ENGINE_REQUIRED: "ts" }).result).toBe("scrubbed");
   });

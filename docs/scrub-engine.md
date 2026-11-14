@@ -616,21 +616,25 @@ grant, because self-host Node services import them for helpers (`consumer-servic
 
 | Entry point (deployed module) | Module-load grant | Handler-entry grant (file:line) |
 |---|---|---|
-| Hosted ingest Worker `fetch` / `queue` (`stacks/cloudflare/session-ingest.ts` `main`) | `src/session-ingest/worker.ts:76` | `src/session-ingest/worker.ts:585` via `scrubEngineReady` (`hosted-worker`) |
+| Hosted ingest Worker `fetch` / `queue` (`stacks/cloudflare/session-ingest.ts` `main`) | `src/session-ingest/worker.ts:76` | `src/session-ingest/worker.ts:573` via `scrubEngineReady` (`hosted-worker`) |
 | Hosted session-read Worker `fetch` (`packages/session-read-worker/wrangler.jsonc`) | `packages/session-read-worker/src/index.ts:74` | `packages/session-read-worker/src/index.ts:640` (`hosted-worker`) |
 | Digest narrative Worker `fetch` (`wrangler.digest-narrative.jsonc`; not deployed by this repo) | `packages/session-read-worker/src/digest-narrative.ts:18` | `packages/session-read-worker/src/digest-narrative.ts:85` (`hosted-worker`) |
 | Read API Lambda handler (`src/session-read-api/lambda-entry.ts`) | `src/session-read-api/lambda-entry.ts:9` | `src/session-read-api/lambda.ts:743` (`hosted-lambda`) |
 | Session pipeline Lambda handler, incl. bob-costas / session-brief stages (`src/session-pipeline/lambda-entry.ts`) | `src/session-pipeline/lambda-entry.ts:9` | `src/session-pipeline/lambda.ts:882` (`hosted-lambda`) |
 | Portable Lambda zips (`src/lambda-artifact/pipeline-entry.ts`, `read-api-entry.ts`, built by `scripts/build-lambda-artifact.ts`) | line 1 of each | the wrapped `lambda.ts` handler, as above |
 | Upload admission Lambda handler | `src/session-ingest/upload-admission-lambda.ts:23` | `src/session-ingest/upload-admission-lambda.ts:55` (`hosted-lambda`) |
-| Buffered GC Lambda handler (`scripts/build-buffered-gc.ts`) | `src/session-ingest/buffered-gc-lambda.ts:2` | `src/session-ingest/buffered-gc-lambda.ts:9` (`hosted-lambda`) |
+| Buffered GC Lambda handler (`scripts/build-buffered-gc.ts`) | `src/session-ingest/buffered-gc-lambda.ts:3` | `src/session-ingest/buffered-gc-lambda.ts:10` (`hosted-lambda`) |
 | Rearm sweeper Lambda handler | `src/session-ingest/rearm-sweeper-lambda.ts:11` | `src/session-ingest/rearm-sweeper-lambda.ts:19` (`hosted-lambda`) |
 | Test preloads only | none | `scripts/test-preload/scrub-ts-capability.ts` (root `bunfig.toml` `[test] preload`), `packages/pipeline/test/setup/scrub-ts-capability.ts` (vitest `setupFiles`), `packages/session-read-worker/test/setup-env.ts:12` (`test`) |
 
-One known importer of a hosted module is invisible to the scan: `scripts/pg-proof/schema-rehearsal.ts`
-loads `src/session-ingest/worker.ts` (for `acceptedGenerations`) through a computed path into the
-candidate checkout, so that CI-only rehearsal process holds the `hosted-worker` grant. It never
-scrubs, seals or stores session data; the path is left computed so older targets still rehearse.
+No other process reaches a grant module. The schema release rehearsal
+(`scripts/pg-proof/schema-rehearsal.ts`, stage R6) needs only `acceptedGenerations`, so it loads it from
+the grant-free `src/session-ingest/accept-generations.ts` (which `worker.ts` re-exports) through its
+computed candidate-tree path, never `worker.ts`; release trees from before that split fall back to
+`worker.ts`, which there carries no module-load grant. The rehearsal process therefore holds no TS
+grant: its ingest stages (R7-pre, R7, through `prepareDelivery`) resolve the wasm-bindgen default, and
+since the rehearsal calls no `initScrubEngine`, a scrub there fails closed (`not_initialised`); it never
+scrubs with TS.
 
 Node self-host never reaches TS, even with `SCRUB_ENGINE=ts`. The large canonical read worker
 (`src/session-pipeline/large-read-main.ts`) initialises the default and fails closed
@@ -652,9 +656,17 @@ its module-load grant, any other non-test file that reaches a module-load grant,
 wrangler `main` that is not a hosted entry, a production module importing a test preload, and a
 stale exemption. Each rule has a planted-violation test; the scan is a heuristic, not a proof.
 Known limits, listed in the scan header: an initialiser anywhere in the entry counts even if a seam
-use runs first or it sits under a condition (the runtime still fails closed there); computed
-`import(x)` / `require(x)` edges and non-relative, non-`@rhc/` specifiers are not followed; entries
-shaped differently from the patterns above (for example `export default app`) are not detected.
+use runs first or it sits under a condition (the runtime still fails closed there); computed or
+indirect loads (`import(x)`, `require(x)`, a template with `${...}`, an import wrapper such as the
+rehearsal's `mod(path)`, a stored `createRequire` result called later, `new Worker(url)`) are not
+followed; entries shaped differently from the patterns above (for example `export default app`) are
+not detected. Edges that are followed: import/export-from (including `import {} from`, which still
+evaluates the module), bare imports with or without a semicolon, literal `import("x")` / `` import(`x`) ``
+/ `require("x")` / `createRequire(...)("x")`, with relative, `@rhc/*`, `@rhc-object-store` and
+workspace-package (`@96bulls/pipeline/...` and the other `packages/*` names) specifiers.
+`hosted-grant-first` requires the hosted entry's first statement to be the static bare import itself;
+a named or namespace import, `void import(...)`, `await import(...)` or the import text inside a
+template does not count.
 
 **Tests** (each in a clean child process, no preload, asserting no grant at start):
 `src/session-ingest/__tests__/scrub-default-flip.test.ts` (fixture child
