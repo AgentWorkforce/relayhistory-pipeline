@@ -103,19 +103,37 @@ export interface BackfillSummary {
 }
 
 const SCOPE = `($1::text[] IS NULL OR org_id = ANY($1::text[]))`;
-/** Users, keyset-paged (stable: org, workspace, user). */
-const USERS_PAGE = `
-SELECT DISTINCT org_id, workspace_id, user_id FROM (
-  SELECT org_id, workspace_id, user_id FROM sessions.upload_deletions WHERE ${SCOPE}
-  UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.upload_resets WHERE ${SCOPE}
-  UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.ingest_session_ownership WHERE ${SCOPE}
-  UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.ingest_record_revisions WHERE ${SCOPE}
-  UNION ALL SELECT org_id, workspace_id, user_id FROM sessions.ingest_batches WHERE ${SCOPE}
-  UNION ALL SELECT org_id, workspace_id, current_owner FROM sessions.ingest_lazy_native_slots WHERE ${SCOPE} AND current_owner IS NOT NULL
-) AS u
-WHERE (org_id, workspace_id, user_id) > ($2::text, $3::text, $4::text)
-ORDER BY org_id, workspace_id, user_id
-LIMIT $5::int`;
+/**
+ * The users, collected ONCE per run (not per page): a keyset page over a DISTINCT union of six tables re-read and
+ * re-sorted the whole (scoped) union on every page, minutes each on production. Every table but ingest_batches has an
+ * index leading with (org_id, workspace_id, <user>), so its distinct users are a loose index scan (a recursive CTE
+ * that jumps from one user to the next, one index probe per user); ingest_batches has no such index and is read once
+ * with a plain DISTINCT. The union is merged, sorted and paged in memory (a small set: one entry per user).
+ */
+const USER_SOURCES: { table: string; user: string; where?: string }[] = [
+  { table: "upload_deletions", user: "user_id" },
+  { table: "upload_resets", user: "user_id" },
+  { table: "ingest_session_ownership", user: "user_id" },
+  { table: "ingest_record_revisions", user: "user_id" },
+  { table: "ingest_lazy_native_slots", user: "current_owner", where: "current_owner IS NOT NULL" },
+];
+/** Distinct (org, workspace, user) of one indexed table, scoped to one org ($1) or every org (no $1). */
+export function usersSkipScan(src: { table: string; user: string; where?: string }, scoped: boolean): string {
+  const conds = [...(scoped ? ["org_id = $1::text"] : []), ...(src.where ? [src.where] : [])];
+  const pre = conds.length ? conds.join(" AND ") + " AND " : "";
+  const key = `org_id, workspace_id, ${src.user}`;
+  return `
+WITH RECURSIVE k AS (
+  (SELECT org_id, workspace_id, ${src.user} AS user_id FROM sessions.${src.table}
+    WHERE ${pre}(${key}) > ('', '', '') ORDER BY ${key} LIMIT 1)
+  UNION ALL
+  SELECT n.org_id, n.workspace_id, n.user_id FROM k CROSS JOIN LATERAL (
+    SELECT org_id, workspace_id, ${src.user} AS user_id FROM sessions.${src.table}
+     WHERE ${pre}(${key}) > (k.org_id, k.workspace_id, k.user_id) ORDER BY ${key} LIMIT 1) AS n
+)
+SELECT org_id, workspace_id, user_id FROM k`;
+}
+const BATCH_USERS = `SELECT DISTINCT org_id, workspace_id, user_id FROM sessions.ingest_batches WHERE ${SCOPE}`;
 /**
  * Deletions, each with the user's control watermark from the SAME snapshot (finding 8): how many control epochs the
  * user's SQL receipts span, that epoch, and the latest receipt version on it.
@@ -143,17 +161,22 @@ JOIN unnest($1::text[], $2::text[], $3::text[]) AS p(o, w, u) ON r.org_id = p.o 
 LEFT JOIN sessions.ingest_seed_fence_baselines AS bl
   ON bl.org_id = r.org_id AND bl.workspace_id = r.workspace_id AND bl.user_id = r.user_id
 ORDER BY r.org_id, r.workspace_id, r.user_id, r.reset_at, r.request_id`;
-/** The sessions SQL's reset would own (finding 3), distinct, keyset-paged. */
+/**
+ * The sessions SQL's reset would own (finding 3), distinct, keyset-paged. The cursor, order and limit sit inside each
+ * branch so each reads its own index from the cursor (ownership's primary key, revisions' session index) instead of
+ * the whole union per page. Owned lazy slots are not here: the slot pass, which reads every slot of the scope once,
+ * registers their sessions (registerSlotOwners).
+ */
+const OWN_KEY = "org_id, workspace_id, user_id, origin_id, source, session_id";
+const OWN_AFTER = "(org_id, workspace_id, user_id, origin_id, source, session_id) > ($2::text, $3::text, $4::text, $5::text, $6::text, $7::text)";
 const OWNERSHIP_PAGE = `
-SELECT DISTINCT org_id, workspace_id, user_id, origin_id, source, session_id FROM (
-  SELECT org_id, workspace_id, user_id, origin_id, source, session_id FROM sessions.ingest_session_ownership WHERE ${SCOPE}
-  UNION ALL SELECT org_id, workspace_id, user_id, origin_id, source, session_id FROM sessions.ingest_record_revisions
-   WHERE ${SCOPE} AND session_id IS NOT NULL
-  UNION ALL SELECT org_id, workspace_id, current_owner, origin_id, current_source, current_session FROM sessions.ingest_lazy_native_slots
-   WHERE ${SCOPE} AND current_owner IS NOT NULL AND current_source IS NOT NULL AND current_session IS NOT NULL
+SELECT DISTINCT ${OWN_KEY} FROM (
+  (SELECT ${OWN_KEY} FROM sessions.ingest_session_ownership WHERE ${SCOPE} AND ${OWN_AFTER} ORDER BY ${OWN_KEY} LIMIT $8::int)
+  UNION ALL
+  (SELECT DISTINCT ${OWN_KEY} FROM sessions.ingest_record_revisions
+    WHERE ${SCOPE} AND session_id IS NOT NULL AND ${OWN_AFTER} ORDER BY ${OWN_KEY} LIMIT $8::int)
 ) AS o
-WHERE (org_id, workspace_id, user_id, origin_id, source, session_id) > ($2::text, $3::text, $4::text, $5::text, $6::text, $7::text)
-ORDER BY org_id, workspace_id, user_id, origin_id, source, session_id
+ORDER BY ${OWN_KEY}
 LIMIT $8::int`;
 const SLOTS_PAGE = `
 SELECT key_sha256, org_id, workspace_id, origin_id, record_id, current_owner, current_source, current_session, current_revision, current_digest
@@ -310,12 +333,14 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   const { sql } = opts;
 
   /** One short, verified read-only transaction per page (finding 8): every query in it reads ONE snapshot. */
-  async function readOnlyAll(queries: [string, unknown[]][]): Promise<Record<string, unknown>[][]> {
+  async function readOnlyAll(queries: [string, unknown[]][], heapOnly = false): Promise<Record<string, unknown>[][]> {
     await sql.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
     try {
       const ro = (await sql.query("SHOW transaction_read_only")).rows[0]?.transaction_read_only;
       if (ro !== "on") throw new Error("backfill_not_read_only");
       await sql.query(`SET LOCAL statement_timeout = ${statementTimeoutMs}`);
+      // The block window must read the heap in order: never the org index once per window.
+      if (heapOnly) { await sql.query("SET LOCAL enable_indexscan = off"); await sql.query("SET LOCAL enable_bitmapscan = off"); }
       const out: Record<string, unknown>[][] = [];
       for (const [query, params] of queries) out.push((await sql.query(query, params)).rows);
       return out;
@@ -374,11 +399,19 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
 
   // ---- fences ----
   if (sections.has("fences")) {
-    let cursor: [string, string, string] = ["", "", ""];
-    for (;;) {
-      const page = (await readOnly(USERS_PAGE, [orgs, ...cursor, pageSize])).map((r) => [text(r.org_id), text(r.workspace_id), text(r.user_id)] as [string, string, string]);
-      if (!page.length) break;
-      cursor = page[page.length - 1]!;
+    const seen = new Map<string, [string, string, string]>();
+    const collect = (rows: Record<string, unknown>[]) => {
+      for (const r of rows) { const u: [string, string, string] = [text(r.org_id), text(r.workspace_id), text(r.user_id)]; seen.set(userKey(...u), u); }
+    };
+    for (const src of USER_SOURCES) {
+      if (orgs) for (const org of orgs) collect(await readOnly(usersSkipScan(src, true), [org]));
+      else collect(await readOnly(usersSkipScan(src, false), []));
+    }
+    collect(await readOnly(BATCH_USERS, [orgs]));
+    const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+    const users = [...seen.values()].sort((a, b) => cmp(a[0], b[0]) || cmp(a[1], b[1]) || cmp(a[2], b[2]));
+    for (let at = 0; at < users.length; at += pageSize) {
+      const page = users.slice(at, at + pageSize);
       summary.users += page.length;
       const states = await controlsFor(page);
       await mapLimit([...states.values()], concurrency, async (st) => {
@@ -438,6 +471,42 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   }
 
   // ---- ownership ----
+  /** Register one session's owner stub (the reset's scope): from the ownership page or an owned lazy slot. */
+  const ownRow = async (r: Record<string, unknown>, fences: Map<string, Promise<FenceDoc | null>>) => {
+    summary.ownership.rows++;
+    if (!id(r.org_id) || !id(r.user_id) || typeof r.workspace_id !== "string" || !id(r.origin_id) || !id(r.source) || !id(r.session_id)) { summary.ownership.invalid++; return; }
+    const tenant = { orgId: r.org_id, workspaceId: r.workspace_id, userId: r.user_id };
+    const fence = await fenceFor(tenant, fences);
+    if (!fence) { summary.ownership.skipped_no_fence++; return; }
+    if (isDeleted(fence, r.origin_id, r.source, r.session_id)) { summary.ownership.skipped_deleted++; return; }
+    const [, epoch, resets] = recordGeneration(fence, r.origin_id, r.source, r.session_id);
+    try {
+      const key = io.keysFor(tenant).owner(r.origin_id, r.source, r.session_id);
+      const stored = (await io.readOwner(key))?.doc;
+      const machineId = liveMachineId(r.workspace_id, r.origin_id, r.user_id);
+      if (stored && stored.epoch >= epoch && stored.machineId !== undefined) { summary.ownership.unchanged++; return; }
+      if (opts.dryRun) { summary.ownership.would_register++; return; }
+      // The writer machine, as admission stamps it: the re-arm sweeper binds markers to it.
+      await io.registerOwner(key, { v: 1, originId: r.origin_id, source: r.source, sessionId: r.session_id, epoch, resets, machineId });
+      summary.ownership.registered++;
+    } catch {
+      summary.ownership.failed++;
+    }
+  };
+  /** Sessions of owned lazy slots, each once per run (a session has many slots). */
+  const slotOwners = new Set<string>();
+  const registerSlotOwners = async (rows: Record<string, unknown>[]) => {
+    const fresh: Record<string, unknown>[] = [];
+    for (const r of rows) {
+      if (r.current_owner === null || r.current_source === null || r.current_session === null) continue;
+      const k = JSON.stringify([r.org_id, r.workspace_id, r.current_owner, r.origin_id, r.current_source, r.current_session]);
+      if (slotOwners.has(k)) continue;
+      slotOwners.add(k);
+      fresh.push({ org_id: r.org_id, workspace_id: r.workspace_id, user_id: r.current_owner, origin_id: r.origin_id, source: r.current_source, session_id: r.current_session });
+    }
+    const fences = new Map<string, Promise<FenceDoc | null>>();
+    await mapLimit(fresh, concurrency, (r) => ownRow(r, fences));
+  };
   if (sections.has("ownership")) {
     let cursor = ["", "", "", "", "", ""];
     for (;;) {
@@ -446,34 +515,12 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
       const last = rows[rows.length - 1]!;
       cursor = [text(last.org_id), text(last.workspace_id), text(last.user_id), text(last.origin_id), text(last.source), text(last.session_id)];
       const fences = new Map<string, Promise<FenceDoc | null>>();
-      await mapLimit(rows, concurrency, async (r) => {
-        summary.ownership.rows++;
-        if (!id(r.org_id) || !id(r.user_id) || typeof r.workspace_id !== "string" || !id(r.origin_id) || !id(r.source) || !id(r.session_id)) { summary.ownership.invalid++; return; }
-        const tenant = { orgId: r.org_id, workspaceId: r.workspace_id, userId: r.user_id };
-        const fence = await fenceFor(tenant, fences);
-        if (!fence) { summary.ownership.skipped_no_fence++; return; }
-        if (isDeleted(fence, r.origin_id, r.source, r.session_id)) { summary.ownership.skipped_deleted++; return; }
-        const [, epoch, resets] = recordGeneration(fence, r.origin_id, r.source, r.session_id);
-        try {
-          const key = io.keysFor(tenant).owner(r.origin_id, r.source, r.session_id);
-          const stored = (await io.readOwner(key))?.doc;
-          const machineId = liveMachineId(r.workspace_id, r.origin_id, r.user_id);
-          if (stored && stored.epoch >= epoch && stored.machineId !== undefined) { summary.ownership.unchanged++; return; }
-          if (opts.dryRun) { summary.ownership.would_register++; return; }
-          // The writer machine, as admission stamps it: the re-arm sweeper binds markers to it.
-          await io.registerOwner(key, { v: 1, originId: r.origin_id, source: r.source, sessionId: r.session_id, epoch, resets, machineId });
-          summary.ownership.registered++;
-        } catch {
-          summary.ownership.failed++;
-        }
-      });
+      await mapLimit(rows, concurrency, (r) => ownRow(r, fences));
     }
-    const o = summary.ownership;
-    summary.sections.ownership = o.skipped_no_fence + o.invalid + o.failed === 0 ? "complete" : "incomplete";
   }
 
-  // ---- revisions ----
-  if (sections.has("revisions")) {
+  // ---- revisions, and the slot pass shared with ownership ----
+  if (sections.has("revisions") || sections.has("ownership")) {
     type Group = { key: string; fence: FenceDoc; originId: string; entries: IndexEntryInput[] };
     const add = async (groups: Map<string, Group>, fences: Map<string, Promise<FenceDoc | null>>, row: { org: unknown; ws: unknown; user: unknown; origin: unknown; record: unknown; revision: unknown; revisionId: unknown; digest: unknown; source: unknown; session: unknown }) => {
       if (!id(row.org) || !id(row.user) || typeof row.ws !== "string") { summary.revisions.invalid++; return; }
@@ -511,6 +558,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     // (a) ingest_record_revisions, seeded revision-only rows included.
     let cursor = ["", "", "", ""];
     for (;;) {
+      if (!sections.has("revisions")) break;
       const rows = await readOnly(REVISIONS_PAGE, [orgs, ...cursor, rowPageSize]);
       if (!rows.length) break;
       const last = rows[rows.length - 1]!;
@@ -523,8 +571,11 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
       }
       await flush(groups);
     }
-    // (b) owned ingest_lazy_native_slots, under their owner and session (ingest_lazy_clear's scope).
+    // (b) owned ingest_lazy_native_slots, under their owner and session (ingest_lazy_clear's scope): first their
+    // sessions' owner stubs (the ownership section), then their revisions.
     const slotRows = async (rows: Record<string, unknown>[]) => {
+      if (sections.has("ownership")) await registerSlotOwners(rows);
+      if (!sections.has("revisions")) return;
       const groups = new Map<string, Group>(), fences = new Map<string, Promise<FenceDoc | null>>();
       for (const r of rows) {
         summary.revisions.slot_rows++;
@@ -536,7 +587,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     if (orgs) {
       // Scoped: block windows (SLOTS_WINDOW), the heap's size re-read in each window's snapshot so growth is followed.
       for (let block = 0; ; block += slotWindow) {
-        const [size, rows] = await readOnlyAll([[SLOTS_BLOCKS, []], [SLOTS_WINDOW, [orgs, `(${block},0)`, `(${block + slotWindow},0)`]]]);
+        const [size, rows] = await readOnlyAll([[SLOTS_BLOCKS, []], [SLOTS_WINDOW, [orgs, `(${block},0)`, `(${block + slotWindow},0)`]]], true);
         const blocks = int(size![0]?.blocks);
         if (blocks === undefined) throw new Error("backfill_slot_blocks_invalid");
         await slotRows(rows!);
@@ -551,8 +602,14 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
         await slotRows(rows);
       }
     }
-    const v = summary.revisions;
-    summary.sections.revisions = v.skipped_no_fence + v.invalid + v.failed === 0 ? "complete" : "incomplete";
+    if (sections.has("revisions")) {
+      const v = summary.revisions;
+      summary.sections.revisions = v.skipped_no_fence + v.invalid + v.failed === 0 ? "complete" : "incomplete";
+    }
+    if (sections.has("ownership")) {
+      const o = summary.ownership;
+      summary.sections.ownership = o.skipped_no_fence + o.invalid + o.failed === 0 ? "complete" : "incomplete";
+    }
   }
   return summary;
 }

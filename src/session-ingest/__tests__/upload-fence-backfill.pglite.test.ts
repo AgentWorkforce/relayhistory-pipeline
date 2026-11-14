@@ -155,10 +155,14 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
       expect(tx[0]).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
       expect(tx[1]).toBe("SHOW transaction_read_only");
       expect(tx.at(-1)).toBe("ROLLBACK");
-      // BEGIN, SHOW, SET LOCAL, one SELECT (two for a page's controls: deletions and resets, one snapshot), ROLLBACK
-      expect([5, 6]).toContain(tx.length);
+      // BEGIN, SHOW, SET LOCAL timeout, [a scoped slot window's two plan pins], one read (two for a page's controls:
+      // deletions and resets, one snapshot; two for a slot window: heap size and rows), ROLLBACK. A read is a SELECT
+      // or a users skip-scan (WITH RECURSIVE ... SELECT): nothing that writes.
       expect(tx[2]).toMatch(/^SET LOCAL statement_timeout = \d+$/);
-      for (const st of tx.slice(3, -1)) expect(st).toMatch(/^SELECT/);
+      const pins = tx[3] === "SET LOCAL enable_indexscan = off" ? 2 : 0;
+      if (pins) expect(tx[4]).toBe("SET LOCAL enable_bitmapscan = off");
+      expect([5, 6]).toContain(tx.length - pins);
+      for (const st of tx.slice(3 + pins, -1)) expect(st).toMatch(/^(SELECT|\s*WITH RECURSIVE k AS \()/);
     }
     const refused: string[] = [];
     const notReadOnly: BackfillSql = { async query(text) { refused.push(text); return { rows: text.startsWith("SHOW") ? [{ transaction_read_only: "off" }] : [] }; } };
@@ -296,6 +300,13 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     expect(summary.revisions).toMatchObject({ slot_rows: 100, slots_empty: 0, merged: 100, invalid: 0, failed: 0 });
     expect(summary.sections.revisions).toBe("complete");
     expect(log.filter((l) => l.includes("ctid >= $2::tid")).length).toBe(blocks);
+    // Each window's transaction pins the heap read (never the org index once per window).
+    for (let i = 0; i < log.length; i++) if (log[i]!.includes("ctid >= $2::tid")) {
+      const tx = log.slice(log.lastIndexOf("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY", i), i);
+      expect(tx).toContain("SET LOCAL enable_indexscan = off");
+      expect(tx).toContain("SET LOCAL enable_bitmapscan = off");
+    }
+    expect(summary.ownership).toMatchObject({ rows: 100, registered: 100, failed: 0 }); // the slots' sessions, from the window pass
     expect(log.some((l) => l.includes("key_sha256 > $2::text"))).toBe(false);
     expect(await entryOf(store, A, "origin-1", "w0001")).toEqual([2, null, hex("1"), sessionKeyHash("claude", "sess-1"), 0, 0]);
     expect(await fenceOf(store, C)).toBeNull();
@@ -369,6 +380,20 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     const summary = await run(store);
     expect(summary.ownership).toMatchObject({ rows: 2, registered: 2, failed: 0 });
     for (const sid of ["from-revision", "from-slot"]) expect(await ownerOf(store, A, "origin-1", "claude", sid)).toMatchObject({ epoch: 0, resets: 0, machineId: expect.stringMatching(/^srv_/) });
+  });
+
+  test("slot owners come from the slot pass: once per session, also when ownership runs without revisions", async () => {
+    const store = scratch();
+    await slot(A, "origin-1", "s0001", A.userId, "claude", "two-slots", 2, hex("2"));
+    await slot(A, "origin-1", "s0002", A.userId, "claude", "two-slots", 3, hex("3"));
+    await slot(A, "origin-1", "s0003", A.userId, "claude", "one-slot", 2, hex("4"));
+    await run(store, { sections: ["fences"] });
+    const own = await run(store, { sections: ["ownership"] });
+    expect(own.ownership).toMatchObject({ rows: 2, registered: 2, failed: 0 });
+    expect(own.sections).toEqual({ fences: "not_run", ownership: "complete", revisions: "not_run" });
+    expect(own.revisions).toMatchObject({ rows: 0, merged: 0 });
+    for (const sid of ["two-slots", "one-slot"]) expect(await ownerOf(store, A, "origin-1", "claude", sid)).toMatchObject({ epoch: 0 });
+    expect(await entryOf(store, A, "origin-1", "s0001")).toBeUndefined();
   });
 
   test("finding 5: a rerun does not re-delete a session an ordered control re-enabled after SQL's snapshot", async () => {
