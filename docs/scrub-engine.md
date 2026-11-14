@@ -708,7 +708,8 @@ the module, only `import type` and all-`type` braces are erased), `import("x")` 
 options or a trailing comma, `` import(`x`) `` and `require("x")`, plus `import.meta.require("x")`
 and `createRequire(...)("x")` from the TypeScript AST. A `?query` or `#hash` suffix is stripped
 before resolution through relative, `@rhc/*` (normalised; a path leaving `packages/pipeline/src`
-fails closed), `@rhc-object-store` and workspace-package
+fails closed, while `@rhc/.` and `@rhc/x/..` normalise to `packages/pipeline/src` itself and load `src.ts` or
+`src/index.ts` like Bun), `@rhc-object-store` and workspace-package
 (`@96bulls/pipeline/...` and the other `packages/*` names, through their `exports` when present; an
 `exports` object without `.` fails closed for the package root, which Bun 1.4.2 refuses rather than
 falling back to `main`; an explicit `exports` target gets only its literal path and, for `.js`, its
@@ -722,8 +723,9 @@ closed where Bun would silently load the index, and no `main` loads the index; f
 as `"./sub/"` and `*` patterns fail closed; a name that only shares a prefix, such as
 `@96bulls/pipeline-extra`, is third-party) specifiers. Candidates come in tiers, in the order Bun 1.4.2
 tries them for import, require, an alias and a workspace subpath: the literal path, then
-`${path}.mts` / `.ts` / `.mjs` / `.js`, then the literal's `.js` to `.ts` / `.mjs` to `.mts` sibling,
-then `${path}/index.<ext>` (`./x.ts` beside `x.ts.ts` loads `x.ts`; `./x` beside `x.ts` and
+`${path}.mts` / `.ts` / `.mjs` / `.js`, then the literal's `.js` to `.ts` sibling (and `.mjs` to `.mts` for a relative, `require` or `@rhc/` path; for a
+workspace subpath Bun tries only `.js` to `.ts`, so the scan's `.mjs` to `.mts` candidate there is a phantom
+route that fails closed in Bun), then `${path}/index.<ext>` (`./x.ts` beside `x.ts.ts` loads `x.ts`; `./x` beside `x.ts` and
 `x/index.ts` loads `x.ts`; `./x.js` beside `x.ts` and `x.js.ts` loads `x.js.ts`; `./x.js` beside `x.ts`
 and `x.js/index.ts` loads `x.ts`). A directory form, a path or `main` ending in `/` (or, for a relative
 specifier, whose last segment is `.` or `..`, such as `.` or `./x/.`), skips the `${path}.<ext>` tier:

@@ -54,11 +54,14 @@
  * condition fails closed; an exports object without "." fails closed for the package root, since Bun
  * refuses it rather than falling back to "main"; a subpath such a map lacks falls back to the package
  * directory, a safe over-approximation). Relative, `@rhc/` and workspace-subpath paths and `main` are
- * normalised (`.`, `..`); an `@rhc/` path leaving packages/pipeline/src, or a subpath, main or exports
- * target leaving its package directory, fails closed (Bun resolves an escaping main against the
- * node_modules link and loads the package index instead). Candidates come in tiers, as Bun 1.4.2 tries
+ * normalised (`.`, `..`); an `@rhc/` path leaving packages/pipeline/src fails closed (`@rhc/.` and
+ * `@rhc/x/..` normalise to packages/pipeline/src itself and load src.ts or src/index.ts like Bun; only
+ * a path outside the directory fails closed), as does a subpath, main or exports target leaving its
+ * package directory (Bun resolves an escaping main against the node_modules link and loads the package index instead). Candidates come in tiers, as Bun 1.4.2 tries
  * them for import, require, an alias and a workspace subpath: the literal path, then `${path}.<mts|ts|
- * mjs|js>`, then the literal's .js -> .ts / .mjs -> .mts sibling, then `${path}/index.<ext>` (so
+ * mjs|js>`, then the literal's .js -> .ts sibling (and .mjs -> .mts for a relative, require or `@rhc/` path; for a
+ * workspace subpath Bun tries only .js -> .ts, so the scan's .mjs -> .mts candidate there is a phantom
+ * route that fails closed in Bun), then `${path}/index.<ext>` (so
  * `./x.js` beside x.ts and x.js.ts loads x.js.ts, and beside x.ts and x.js/index.ts loads x.ts). A
  * directory form, a path ending in "/" (or, when relative, whose last segment is "." or ".."), skips
  * the `${path}.<ext>` tier: `./dir/` beside dir.ts and dir/index.ts loads dir/index.ts. An explicit
@@ -438,7 +441,8 @@ const clashOf = (p: string, mjs = true): string[] => { const s = siblingOf(p, mj
 const DIR_FORM = /\/$/;
 const RELATIVE_DIR_FORM = /(^|\/)\.\.?$|\/$/;
 /** Import tiers for `base` (Bun 1.4.2, import / require / alias / workspace subpath): the literal path,
- * then `${base}.<ext>` (not for a directory form), then the literal's .js -> .ts / .mjs -> .mts sibling,
+ * then `${base}.<ext>` (not for a directory form), then the literal's .js -> .ts / .mjs -> .mts sibling
+ * (for a workspace subpath the .mjs -> .mts candidate is a phantom route that fails closed in Bun),
  * then `${base}/index.<ext>`. */
 const importTiers = (base: string, dir = false) => {
   const sib = siblingOf(base);
@@ -626,11 +630,11 @@ export function scan(files: Sources): Violation[] {
       const competing = res.ambiguous ? `; more than one tracked candidate: ${res.ambiguous.join(", ")}` : "";
       const bare = e.spec.replace(/(?<=.)[?#][\s\S]*$/, "");
       if (!r && !e.spec.startsWith(".") && workspaceOf(files, bare))
-        v.push({ rule: "unresolved-workspace-import", file: f, detail: `imports ${e.spec}, which resolves to no single tracked source (an unknown "exports" shape, an exports object without "." for the package root, an unresolvable or non-string "main", a "main" or exports target outside the package directory, a duplicate package name, an untracked target, or ambiguous candidates${competing})` });
+        v.push({ rule: "unresolved-workspace-import", file: f, detail: `imports ${e.spec}, which resolves to no single tracked source (an unknown "exports" shape, an exports object without "." for the package root, an unresolvable or non-string "main", a "main", subpath or exports target outside the package directory, a duplicate package name, an untracked target, or ambiguous candidates${competing})` });
       else if (!r && res.ambiguous)
         v.push({ rule: "ambiguous-import", file: f, detail: `imports ${e.spec}, which has more than one tracked candidate (${res.ambiguous.join(", ")}); Bun's order differs by edge kind, so rename one` });
       else if (!r && (bare.startsWith("@rhc/") || bare === "@rhc-object-store"))
-        v.push({ rule: "unresolved-workspace-import", file: f, detail: `imports ${e.spec} through the tsconfig alias ${bare.startsWith("@rhc/") ? `@rhc/* (${ALIAS_ROOT})` : "@rhc-object-store"}, which resolves to no single tracked source (a path outside ${ALIAS_ROOT}, or an untracked target)` });
+        v.push({ rule: "unresolved-workspace-import", file: f, detail: `imports ${e.spec} through the tsconfig alias ${bare.startsWith("@rhc/") ? `@rhc/* (${ALIAS_ROOT})` : "@rhc-object-store"}, which resolves to no single tracked source ${bare.startsWith("@rhc/") ? `(a path outside ${ALIAS_ROOT}, an empty path segment, or an untracked target)` : "(an untracked target)"}` });
     }
   }
   // 1b. module-load grants: only the hosted entries reach a grant module, and each imports its own first

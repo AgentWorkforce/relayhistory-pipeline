@@ -787,4 +787,49 @@ describe("scrub-default-scan", () => {
       expect(rules(files), JSON.stringify(exports)).toStrictEqual([`unresolved-workspace-import:${f}`]);
     }
   });
+
+  test("a main naming the package directory itself (., \"\", ./lib/..) loads index.ts, never a sibling <pkg>.ts (M5)", () => {
+    const f = "scripts/planted-main-self.ts";
+    for (const main of [".", "", "./lib/.."]) {
+      const files = plantPkg({ main }, { "packages/planted-pkg.ts": INERT_DEP, [`${PKG}/index.ts`]: fwd(`${PKG}/index.ts`), [f]: useScrub("@planted/pkg") });
+      expect(resolveSpec(files, f, "@planted/pkg"), JSON.stringify(main)).toBe(`${PKG}/index.ts`);
+      expect(rules(files), JSON.stringify(main)).toStrictEqual([`entry-without-init:${f}`]);
+    }
+  });
+
+  test("a main reaching a sibling package whose name has this one as a prefix fails closed (M7)", () => {
+    const f = "scripts/planted-prefix.ts";
+    const other = "packages/planted-pkg2/a.ts";
+    const files = plantPkg({ main: "../planted-pkg2/a.ts" }, { [other]: fwd(other), [`${PKG}/index.ts`]: INERT_DEP, [f]: useScrub("@planted/pkg") });
+    expect(resolveSpec(files, f, "@planted/pkg")).toBeUndefined();
+    expect(rules(files)).toStrictEqual([`unresolved-workspace-import:${f}`]);
+  });
+
+  test("a trailing-slash package root specifier (@planted/pkg/) does not fall back to index.ts: it fails closed (M8)", () => {
+    const f = "scripts/planted-root-slash.ts";
+    // Bun loads a.ts (the main) for this specifier; the scan deliberately resolves nothing
+    const files = plantPkg({ main: "./a.ts" }, { [`${PKG}/a.ts`]: INERT_DEP, [`${PKG}/index.ts`]: fwd(`${PKG}/index.ts`), [f]: useScrub("@planted/pkg/") });
+    expect(resolveSpec(files, f, "@planted/pkg/")).toBeUndefined();
+    expect(rules(files)).toStrictEqual([`unresolved-workspace-import:${f}`]);
+  });
+
+  test("an @rhc-object-store?x import with the target untracked is one unresolved-workspace-import (M9)", () => {
+    const f = "scripts/planted-os-query.ts";
+    const files = plant(f, useScrub("@rhc-object-store?x"), new Map([...repo].filter(([k]) => k !== "packages/object-store/src/index.ts")));
+    const v = scan(files).filter((x) => x.file === f);
+    expect(v.map((x) => x.rule)).toStrictEqual(["unresolved-workspace-import"]);
+    expect(v[0]!.detail).toContain("@rhc-object-store");
+  });
+
+  test("a bare @rhc/ is the directory form: src.ts beside src/index.ts loads src/index.ts (M10)", () => {
+    const f = "scripts/planted-alias-root.ts";
+    const files = plant("packages/pipeline/src.ts", INERT_DEP, plant("packages/pipeline/src/index.ts", INERT_DEP));
+    expect(resolveSpec(files, f, "@rhc/")).toBe("packages/pipeline/src/index.ts");
+  });
+
+  test("a relative .. or ./x/.. naming a directory loads its index.ts, never the sibling r.ts (M23)", () => {
+    const files = plant("src/planted-r.ts", INERT_DEP, plant("src/planted-r/index.ts", INERT_DEP));
+    expect(resolveSpec(files, "src/planted-r/x/y.ts", "..")).toBe("src/planted-r/index.ts");
+    expect(resolveSpec(files, "src/planted-r/y.ts", "./x/..")).toBe("src/planted-r/index.ts");
+  });
 });
