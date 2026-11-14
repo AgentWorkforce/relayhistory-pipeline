@@ -25,10 +25,17 @@
  * Then, per row, the manifest must exist in the GCS Locker (HEAD through Workload Identity). A row
  * whose manifest is absent (a tombstone whose bytes are gone, a NULL manifest_key) is counted
  * `unproven` and left alone. A pod without GCS credentials fails its first HEAD before any write.
+ * Tombstones (deleted_at set) are not excluded: one whose manifest still exists is re-stamped too,
+ * which is harmless (the read API refuses a deleted row whatever its provider).
  *
  * Writes (--apply only): one autocommit UPDATE per row, re-checking in SQL every value it was
  * selected on (key, provider 's3', bucket, manifest_key, revision), so a row the consumer re-upserted
- * meanwhile is counted `raced` and kept as the consumer wrote it. statement_timeout 30s, lock_timeout
+ * meanwhile is counted `raced` and kept as the consumer wrote it. A database guard can also make the
+ * UPDATE a silent no-op (a BEFORE trigger returning NULL: ingest_erase_fence_index_guard for an
+ * erase-fenced session, ingest_publication_guard_pointer for an acquisition-owned or retired /
+ * non-live publication head). After a 0-row UPDATE the row is re-read: still unchanged ('s3', same
+ * key, bucket, manifest_key, revision) means a guard kept it, counted `guard_skipped`, not `raced`.
+ * Those rows still answer 501 and a rerun will not change them: they need an operator. statement_timeout 30s, lock_timeout
  * 1s (session-wide, reads included). The session_index triggers run as for any owner write (the history carrier sync re-keys the
  * row's carrier to gcs); a trigger refusal is counted by SQLSTATE in `refused` and the run goes on.
  * Idempotent: a rerun selects only rows still stamped 's3'.
@@ -41,8 +48,10 @@
  *   login that can UPDATE sessions.session_index (the schema owner); SESSION_POSTGRES_TLS_PROFILE as
  *   for the other self-host workloads. Run it after the fixed consumer is deployed (a consumer still on
  *   the old code keeps writing 's3' rows; a rerun picks them up).
- * Exit: 0 done; 3 incomplete (--max-pages reached, or a refused row: rerun); 2 refused or
- *   misconfigured; 4 any other error (rerun). Output: one JSON line of counts, no keys or ids.
+ * Exit: 0 done; 3 incomplete (--max-pages reached, or a refused row: rerun); 5 done, but rows a
+ *   database guard kept (guard_skipped > 0, needs_attention true): a rerun will not change them, an
+ *   operator must resolve the fence, acquisition owner or publication head first; 2 refused or
+ *   misconfigured; 4 any other error (rerun). 3 wins over 5. Output: one JSON line of counts, no keys or ids.
  */
 import { readFileSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
@@ -80,10 +89,14 @@ export interface RestampResult {
   unproven: number;
   restamped: number;
   raced: number;
+  /** 0-row UPDATEs whose row is still unchanged: a BEFORE trigger guard returned NULL. */
+  guard_skipped: number;
   refused: number;
   refused_codes: Record<string, number>;
   other_bucket_s3: number;
   complete: boolean;
+  /** True when guard_skipped rows remain: done, but those rows still serve 501. */
+  needs_attention: boolean;
 }
 
 interface Candidate {
@@ -103,6 +116,11 @@ export const UPDATE_SQL = `UPDATE sessions.session_index SET storage_provider = 
    AND storage_provider = 's3' AND bucket = $6 AND manifest_key = $7 AND revision IS NOT DISTINCT FROM $8::bigint
  RETURNING 1 AS restamped`;
 
+/** Re-read after a 0-row UPDATE: the row still exactly as selected means a guard kept it. */
+export const UNCHANGED_SQL = `SELECT 1 AS unchanged FROM sessions.session_index
+ WHERE org_id = $1 AND workspace_id = $2 AND harness = $3 AND session_id = $4 AND machine_id = $5
+   AND storage_provider = 's3' AND bucket = $6 AND manifest_key = $7 AND revision IS NOT DISTINCT FROM $8::bigint`;
+
 export const OTHER_BUCKET_SQL = `SELECT count(*)::text AS n FROM sessions.session_index
  WHERE storage_provider = 's3' AND bucket IS DISTINCT FROM $1`;
 
@@ -111,7 +129,7 @@ const SQLSTATE = /^[0-9A-Z]{5}$/;
 export async function restampIndexProvider(db: RestampDb, o: RestampOptions): Promise<RestampResult> {
   if (!o.bucket) refuse("locker_bucket_missing");
   if (!Number.isInteger(o.pageSize) || o.pageSize < 1 || o.pageSize > 1000) refuse("page_invalid");
-  const r: RestampResult = { mode: o.apply ? "apply" : "plan", scanned: 0, proven: 0, unproven: 0, restamped: 0, raced: 0, refused: 0, refused_codes: {}, other_bucket_s3: 0, complete: false };
+  const r: RestampResult = { mode: o.apply ? "apply" : "plan", scanned: 0, proven: 0, unproven: 0, restamped: 0, raced: 0, guard_skipped: 0, refused: 0, refused_codes: {}, other_bucket_s3: 0, complete: false, needs_attention: false };
   await db.query("SET statement_timeout = '30s'");
   await db.query("SET lock_timeout = '1s'");
   r.other_bucket_s3 = Number((await db.query<{ n: string }>(OTHER_BUCKET_SQL, [o.bucket])).rows[0]?.n ?? 0);
@@ -132,8 +150,10 @@ export async function restampIndexProvider(db: RestampDb, o: RestampOptions): Pr
     if (o.apply) {
       for (const row of proven) {
         try {
-          const done = await db.query(UPDATE_SQL, [row.org_id, row.workspace_id, row.harness, row.session_id, row.machine_id, o.bucket, row.manifest_key, row.revision]);
+          const params = [row.org_id, row.workspace_id, row.harness, row.session_id, row.machine_id, o.bucket, row.manifest_key, row.revision];
+          const done = await db.query(UPDATE_SQL, params);
           if (done.rows.length === 1) r.restamped++;
+          else if ((await db.query(UNCHANGED_SQL, params)).rows.length === 1) r.guard_skipped++;
           else r.raced++;
         } catch (e) {
           const code = (e as { code?: unknown })?.code;
@@ -146,6 +166,7 @@ export async function restampIndexProvider(db: RestampDb, o: RestampOptions): Pr
     o.log?.({ event: "index_provider_restamp_page", page, scanned: r.scanned, proven: r.proven, restamped: r.restamped });
     if (rows.length < o.pageSize) { r.complete = true; break; }
   }
+  r.needs_attention = r.guard_skipped > 0;
   return r;
 }
 
@@ -227,8 +248,9 @@ export async function runRestampMain(env: NodeJS.ProcessEnv, argv: readonly stri
   }
 }
 
-export function exitCodeForResult(r: RestampResult): 0 | 3 {
-  return r.complete && r.refused === 0 ? 0 : 3;
+export function exitCodeForResult(r: RestampResult): 0 | 3 | 5 {
+  if (!r.complete || r.refused > 0) return 3;
+  return r.guard_skipped > 0 ? 5 : 0;
 }
 
 export function exitCodeForError(e: unknown): 2 | 4 {
