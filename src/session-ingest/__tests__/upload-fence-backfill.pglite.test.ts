@@ -4,7 +4,7 @@ import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
-import { applyFenceChange, entryForgotten, fenceEpoch, isDeletedForAdmission, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "../ledger-s3.ts";
+import { applyFenceChange, entryForgotten, fenceEpoch, isDeletedForAdmission, revisionShard, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "../ledger-s3.ts";
 import type { OrderedControlInput } from "../ledger.ts";
 import { backfillUploadFences, type BackfillOptions, type BackfillSql } from "../upload-fence-backfill.ts";
 import { parseBackfillArgs } from "../../../scripts/upload-fence-backfill.ts";
@@ -617,6 +617,55 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     expect(summary.ownership).toMatchObject({ failed: 0, failed_codes: {} });
     expect(summary.revisions).toMatchObject({ merged: 1, failed: 0, failed_codes: {} });
     expect(await ownerOf(store, A, "origin-1", "claude", "sess-1")).toMatchObject({ epoch: expect.any(Number) });
+  });
+
+  /** A store whose `op` fails per key by `fail(key, n)` (n = calls so far for that key; undefined = pass through). */
+  const failing = (op: "getObject" | "put", fail: (key: string, n: number) => Error | undefined) => {
+    const base = scratch(), calls = new Map<string, number>();
+    const store = new Proxy(base, {
+      get(target, prop) {
+        if (prop === op) return async (...a: unknown[]) => {
+          const k = String(a[0]), n = calls.get(k) ?? 0;
+          calls.set(k, n + 1);
+          const e = fail(k, n);
+          if (e) throw e;
+          return (target[op] as (...x: unknown[]) => unknown)(...a);
+        };
+        const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    return { store, calls };
+  };
+
+  test("retried: a backend status, a plain (mid-body) error, and the fences section's own dry read", async () => {
+    await own(A, "origin-1", "claude", "sess-1");
+    await reset(A, "req-1", "2030-01-02T00:00:00.000Z");
+    const dry = (store: ObjectStore) => backfillUploadFences({ sql: recordingSql([]), store, keyRoot: ROOT, dryRun: true, sleep: async () => {} });
+    for (const make of [() => new ObjectStoreError("backend", "fs", "400 RequestTimeout"), () => new Error("socket reset mid-body")]) {
+      const { store } = failing("getObject", (k, n) => ((k.includes("/s=") || k.endsWith("upload-fences.json")) && n < 2 ? make() : undefined));
+      const out = await dry(store);
+      expect(out.sections).toEqual({ fences: "complete", ownership: "complete", revisions: "complete" });
+      expect(out.fences).toMatchObject({ would_create: 1, failed: 0, unreadable: 0 });
+      expect(out.ownership).toMatchObject({ would_register: 1, failed: 0, skipped_no_fence: 0 });
+    }
+  });
+
+  test("a contended CAS is not retried by the backfill: counted once per entry under its code", async () => {
+    // Two records in ONE revision shard, so one merge carries two entries.
+    const ids: string[] = [];
+    for (let i = 0; ids.length < 2; i++) if (revisionShard(`rec-${i}`) === revisionShard("rec-0")) ids.push(`rec-${i}`);
+    await own(A, "origin-1", "claude", "sess-1");
+    for (const id of ids) await rev(A, "origin-1", id, 1, "claude", "sess-1");
+    await run(scratch(), { sections: ["fences"] });
+    // Every shard write loses its compare-and-swap (precondition_failed): the ledger retries its CAS, then contended.
+    const { store, calls } = failing("put", (k) => (k.includes("/r=") ? new ObjectStoreError("precondition_failed", "fs", "lost race") : undefined));
+    await run(store, { sections: ["fences"] });
+    const out = await run(store, { sections: ["revisions"] });
+    expect(out.revisions).toMatchObject({ failed: 2, merged: 0, failed_codes: { ledger_revision_contended: 2 } });
+    expect(out.sections.revisions).toBe("incomplete");
+    const shardPuts = [...calls].filter(([k]) => k.includes("/r=")).map(([, n]) => n);
+    expect(shardPuts).toEqual([8]); // the ledger's own 8 CAS attempts, not 8 x STORE_ATTEMPTS
   });
 
   test("a contended fence CAS retries and lands; tallies count once", async () => {

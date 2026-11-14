@@ -210,9 +210,13 @@ ORDER BY org_id, workspace_id, origin_id, record_id
 LIMIT $6::int`;
 
 const userKey = (o: unknown, w: unknown, u: unknown) => JSON.stringify([o, w, u]);
-/** Attempts per store read (see storeRetry), and the store failures worth retrying (network, 408, 429, 5xx). */
-const STORE_READ_ATTEMPTS = 5;
-const RETRYABLE_STORE_CODES = new Set(["ledger_store_transient", "ledger_store_backend"]);
+/**
+ * Attempts per store operation (see storeRetry), and the store failures worth retrying: `transient` (network, 408,
+ * 429, 5xx), `backend` (any other backend status, e.g. S3's 400 RequestTimeout) and `error` (a non-store error, e.g.
+ * a reset while reading a 200's body). Never contended / invalid / refused codes.
+ */
+const STORE_ATTEMPTS = 5;
+const RETRYABLE_STORE_CODES = new Set(["ledger_store_transient", "ledger_store_backend", "ledger_store_error"]);
 const text = (v: unknown): string => {
   if (typeof v !== "string") throw new Error("backfill_row_invalid");
   return v;
@@ -376,9 +380,9 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     summary.ownership.failed_codes[code] = (summary.ownership.failed_codes[code] ?? 0) + 1;
   };
   /**
-   * A store operation retried with backoff on a transient store failure (a 503, a reset, a timeout), up to
-   * STORE_READ_ATTEMPTS: one transient request in tens of thousands must not leave a section incomplete (the EXECUTE
-   * receipt is what binds the chain). Only reads and the ledger's idempotent read-then-CAS operations go through it
+   * A store operation retried with backoff on a retryable store failure (RETRYABLE_STORE_CODES), up to STORE_ATTEMPTS:
+   * one transient request in tens of thousands must not leave a section incomplete (the EXECUTE receipt is what binds
+   * the chain). Only reads and the ledger's idempotent read-then-CAS operations go through it
    * (editFence, registerOwner, mergeIndex re-read and compare-and-swap, so a retry after a write that landed but
    * answered with an error converges; it may count as `unchanged` instead of `created`). Anything else (an invalid
    * document, a refused key, a contended CAS) is not retried.
@@ -389,7 +393,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
         return await read();
       } catch (error) {
         const code = (error as { code?: unknown })?.code;
-        if (attempt + 1 >= STORE_READ_ATTEMPTS || !RETRYABLE_STORE_CODES.has(code as string)) throw error;
+        if (attempt + 1 >= STORE_ATTEMPTS || !RETRYABLE_STORE_CODES.has(code as string)) throw error;
         await io.backoff(attempt);
       }
     }
