@@ -290,7 +290,7 @@ test("generation moving mid-write fails the generation postcondition and stops t
   expect(x.w.writes).toEqual([key(tenants[0]!)]);
 });
 
-test("raw bulk mode is unreachable, fixed-roster write stays dormant, and reviewed bulk recovery is enabled", async () => {
+test("raw bulk mode is unreachable and both reviewed write paths are dormant", async () => {
   for (const mode of ["bulk", "BULK", "renew"]) {
     const x = world();
     const out = await runOwnerParity({ ...base, OWNER_PARITY_MODE: mode }, x.sessions, { roster, runId: "1", writeEnabled: true, deps: x.deps });
@@ -298,7 +298,7 @@ test("raw bulk mode is unreachable, fixed-roster write stays dormant, and review
     expect(x.w.statements).toEqual([]);
   }
   expect(OWNER_PARITY_WRITE_ENABLED).toBe(false);
-  expect(OWNER_PARITY_BULK_WRITE_ENABLED).toBe(true);
+  expect(OWNER_PARITY_BULK_WRITE_ENABLED).toBe(false);
   const c = await census();
   const x = world();
   const out = await runOwnerParity(writeEnv(c), x.sessions, { roster, runId: "202", census: c, now: () => T0, deps: x.deps });

@@ -16,7 +16,7 @@ import { createHash } from "node:crypto";
 
 export const OWNER_PARITY_WRITE_ENABLED: boolean = false;
 /** Bulk recovery is enabled by a separate reviewed flip only after its dormant proof gates are green. */
-export const OWNER_PARITY_BULK_WRITE_ENABLED: boolean = true;
+export const OWNER_PARITY_BULK_WRITE_ENABLED: boolean = false;
 
 /** The roster must name exactly this many tenant digests, and every one must be found on the target ledger. */
 export const OWNER_PARITY_EXACT_COUNT = 8;

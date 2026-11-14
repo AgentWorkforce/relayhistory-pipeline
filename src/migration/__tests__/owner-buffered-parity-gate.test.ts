@@ -103,9 +103,9 @@ const writeEnv = env("write", { OWNER_PARITY_CENSUS_RUN: censusRun, OWNER_PARITY
 const gate = (e: Record<string, string>, f: Fixture, enabled = true, seen?: string[], bulkEnabled = false) =>
   code(() => ownerParityGithubGate(e, githubGet(f, seen), true, { enabled, bulkEnabled }));
 
-test("dormant fixed-roster write refuses before GitHub reads; reviewed bulk recovery and read-only modes pass", async () => {
+test("both write switches are dormant; read-only modes still pass", async () => {
   expect(OWNER_PARITY_WRITE_ENABLED).toBe(false);
-  expect(OWNER_PARITY_BULK_WRITE_ENABLED).toBe(true);
+  expect(OWNER_PARITY_BULK_WRITE_ENABLED).toBe(false);
   const seen: string[] = [];
   expect(await gate(writeEnv, githubFixture(), false, seen)).toBe("owner_parity_write_dormant");
   expect(seen).toEqual([]);
