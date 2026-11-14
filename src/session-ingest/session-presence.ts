@@ -8,10 +8,13 @@
  * SESSION_PRESENCE_COUNTS (the session is $1, the optional org scope $2::text[]) plus the distinct-org check, each in
  * its own savepoint, and ROLLBACK always. Every count is one snapshot. A count cancelled by the statement timeout
  * (sqlstate 57014) is rolled back to its savepoint and reported as null with complete=false; any other error
- * (including a lock_timeout, 55P03) refuses the run. The whole transaction also has a total budget (totalBudgetMs):
- * a statement is started only while the budget has at least SESSION_PRESENCE_MIN_TIMEOUT_MS left, and its statement
- * timeout is lowered to what is left, so the snapshot is held for at most about the budget. A statement skipped or
- * cut short by the budget is null with budget_exhausted. The publication generation marker
+ * (including a lock_timeout, 55P03) refuses the run. The whole transaction also has a total budget (totalBudgetMs),
+ * of which SESSION_PRESENCE_MARKER_RESERVE_MS (the per-statement timeout) is kept for the final marker read: the
+ * counts and the distinct-org check share the budget minus that reserve, the two marker reads may use the whole
+ * budget. A statement is started only while its share has at least SESSION_PRESENCE_MIN_TIMEOUT_MS left, and its
+ * statement timeout is lowered to what is left of its share, so the snapshot is held for at most about the budget
+ * and a count cut short by the budget never starves the final marker. A statement skipped or cut short by the
+ * budget is null with budget_exhausted. The publication generation marker
  * (SESSION_PRESENCE_GENERATION_MARKER) is read first and last; generation_stable reports whether they matched, and
  * complete=false with a fixed incomplete_reason code fails closed on an unobserved or unstable marker, more than one
  * ownership row or org, a timed-out count, or an exhausted budget. Counts are still emitted.
@@ -40,6 +43,12 @@ export const SESSION_PRESENCE_MAX_TIMEOUT_MS = 600000;
 /** Bounds of the total transaction budget (--total-budget-ms): the same range as the per-statement timeout. */
 export const SESSION_PRESENCE_MIN_BUDGET_MS = 1000;
 export const SESSION_PRESENCE_MAX_BUDGET_MS = 600000;
+/**
+ * The part of the total budget kept for the final generation marker read: the per-statement timeout itself. The
+ * counts and the distinct-org check share totalBudgetMs minus this (all skipped, budget_exhausted, when that is under
+ * SESSION_PRESENCE_MIN_TIMEOUT_MS), so the default 60000 / 180000 gives them 120 s and the final marker up to 60 s.
+ */
+export const SESSION_PRESENCE_MARKER_RESERVE_MS = (statementTimeoutMs: number): number => statementTimeoutMs;
 /** SET LOCAL lock_timeout: a count never queues behind DDL for long (55P03 refuses the run). */
 export const SESSION_PRESENCE_LOCK_TIMEOUT_MS = 5000;
 
@@ -179,8 +188,9 @@ const DISPOSITION_COLUMNS = ["heads_building", "heads_live", "heads_retired"] as
  * complete=false reasons, one fixed code, most serious first: generation_unobserved (a marker read timed out or was
  * skipped by the budget), generation_unstable (the marker differed between the first and last read; the two are
  * exclusive), multi_ownership (more than one ingest_session_ownership row, or the session id under more than one
- * org: the counts mix owners), count_timeout (a count hit the per-statement timeout and is null), budget_exhausted
- * (the total budget ran out, so a count was skipped or cut short and is null). `none` when complete.
+ * org: the counts mix owners), count_timeout (a count or the distinct-org check hit the per-statement timeout),
+ * budget_exhausted (the counts' share of the budget ran out, so a count or the distinct-org check was skipped or cut
+ * short). `none` when complete.
  */
 export const SESSION_PRESENCE_INCOMPLETE_REASONS = ["none", "generation_unobserved", "generation_unstable", "multi_ownership", "count_timeout", "budget_exhausted"] as const;
 
@@ -222,12 +232,14 @@ export async function sessionPresence(sql: PresenceSql, o: SessionPresenceOption
     await sql.query(`SET LOCAL lock_timeout = ${SESSION_PRESENCE_LOCK_TIMEOUT_MS}`);
     let current = ms;
     /**
-     * One statement in its own savepoint. null when the statement timeout (57014) cancels it (count_timeout, or
-     * budget_exhausted when the timeout had been lowered to the budget's remainder) or when the budget has less than
-     * SESSION_PRESENCE_MIN_TIMEOUT_MS left (skipped, budget_exhausted); other errors refuse.
+     * One statement in its own savepoint. `reserve` ms of the budget are not available to it: the counts and the
+     * distinct-org check pass SESSION_PRESENCE_MARKER_RESERVE_MS(ms) so the final marker keeps its full statement
+     * timeout; the marker reads pass 0. null when the statement timeout (57014) cancels it (count_timeout, or
+     * budget_exhausted when the timeout had been lowered to its share's remainder) or when its share has less than
+     * SESSION_PRESENCE_MIN_TIMEOUT_MS left (skipped, budget_exhausted); other errors (55P03 included) refuse.
      */
-    const guarded = async (text: string): Promise<Record<string, unknown> | null> => {
-      const left = budget - (now() - start);
+    const guarded = async (text: string, reserve: number): Promise<Record<string, unknown> | null> => {
+      const left = budget - reserve - (now() - start);
       if (!(left >= SESSION_PRESENCE_MIN_TIMEOUT_MS)) { exhausted = true; return null; }
       const limit = Math.min(ms, Math.floor(left));
       // Outside the savepoint, so a rollback to it never undoes the lowered timeout.
@@ -245,16 +257,17 @@ export async function sessionPresence(sql: PresenceSql, o: SessionPresenceOption
       }
     };
     const marker = async (): Promise<string | null> => {
-      const row = await guarded(SESSION_PRESENCE_GENERATION_MARKER(scoped));
+      const row = await guarded(SESSION_PRESENCE_GENERATION_MARKER(scoped), 0);
       if (row === null) return null;
       const n = Number(row.rows), m = row.marker;
       if (!Number.isSafeInteger(n) || n < 0 || typeof m !== "string" || !(n === 0 ? m === "" : /^[0-9a-f]{32}$/u.test(m)))
         fail("session_presence_marker_shape");
       return `${n}:${m}`;
     };
+    const reserve = SESSION_PRESENCE_MARKER_RESERVE_MS(ms);
     const first = await marker();
     for (const c of SESSION_PRESENCE_COUNTS) {
-      const row = await guarded(c.sql(scoped));
+      const row = await guarded(c.sql(scoped), reserve);
       if (row === null) {
         for (const k of c.columns) out[k] = null;
         continue;
@@ -265,7 +278,7 @@ export async function sessionPresence(sql: PresenceSql, o: SessionPresenceOption
         out[k] = n;
       }
     }
-    const orgsRow = await guarded(SESSION_PRESENCE_DISTINCT_ORGS(scoped));
+    const orgsRow = await guarded(SESSION_PRESENCE_DISTINCT_ORGS(scoped), reserve);
     if (orgsRow !== null) {
       const n = Number(orgsRow.distinct_orgs);
       if (!Number.isSafeInteger(n) || n < 0) fail("session_presence_count_shape");

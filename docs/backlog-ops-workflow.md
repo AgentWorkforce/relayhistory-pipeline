@@ -147,8 +147,11 @@ scans of large tenant-first tables (ownership, claim sessions, lazy slots, revis
 counts use their org-leading indexes.
 
 **Time bounds.** Each statement has a 60 s `statement_timeout` and a 5 s `lock_timeout` (a count that waits on DDL
-refuses the run with `sqlstate_55p03`). The whole transaction has a 180 s budget (`--total-budget-ms 180000`): no
-statement starts with less than 1 s left, and each statement's timeout is lowered to what is left, so the
+refuses the run with `sqlstate_55p03`). The whole transaction has a 180 s budget (`--total-budget-ms 180000`). The
+final generation marker read keeps a reserve equal to the statement timeout: the counts and the distinct-org check
+share the budget minus the statement timeout (120 s), and the final marker keeps up to the full 60 s statement
+timeout, so a count cut short by the budget still leaves the marker observable. No statement starts with less than
+1 s of its share left, and each statement's timeout is lowered to what is left of its share, so the
 `REPEATABLE READ` snapshot is held for about 3 minutes at most. Both values are fixed in the workflow's argv
 (`BACKLOG_OPS_PRESENCE_TIMEOUT`).
 
@@ -196,8 +199,9 @@ emitted.
    (the pooler did not hold the transaction on one backend). Rerun; do not read the counts.
 3. `multi_ownership`: more than one ownership row, or the session id appears under more than one org in the tables
    counted. Read the counts with care, because they span every owner. Scope with `BACKLOG_OPS_ORGS` to split them.
-4. `count_timeout`: some count hit the 60 s statement timeout and is `null`.
-5. `budget_exhausted`: the 180 s budget ran out, so the remaining counts were skipped or cut short and are `null`.
+4. `count_timeout`: a count or the distinct-org check hit the 60 s statement timeout, so it is `null` or unobserved.
+5. `budget_exhausted`: the counts' share of the 180 s budget (the budget minus the statement timeout) ran out, so a
+   count or the distinct-org check was skipped or cut short, and those counts are `null`.
    Scope the run with `BACKLOG_OPS_ORGS`.
 
 **Reading it against "No conversation recorded yet":**
