@@ -91,7 +91,7 @@ async function fixture() {
   return { db, upload, publish, sql };
 }
 
-const opts = { orgs: null, statementTimeoutMs: 60000 };
+const opts = { orgs: null, statementTimeoutMs: 60000, totalBudgetMs: 180000 };
 const ZERO = { ownership: 0, claims: 0, claim_sessions: 0, buffered_stages: 0, outbox: 0, outbox_buffered: 0, lazy_slots: 0, revisions: 0, heads: 0, published_heads: 0,
   published_objects: 0, canonical_pointers: 0, canonical_pointers_live: 0, dispositions: { heads_building: 0, heads_live: 0, heads_retired: 0 } };
 
@@ -150,6 +150,37 @@ test("seeded counts: buffered-only, then published; org scope in and out; an unk
   await f.db.query("CREATE TEMP TABLE after_presence(x int)");
 });
 
+test("predicates: the buffered-stage joins, the canonical pointer's session_id arm, and the session under two orgs", async () => {
+  const f = await fixture();
+  await f.db.query("UPDATE sessions.ingest_claim_sessions_policy SET write_enabled=true");
+  await f.upload(SESSION, 1); await f.upload(SESSION, 1); await f.upload(SESSION, 1);
+  const base = await sessionPresence(f.sql, { ...opts, session: SESSION });
+  expect([base.claims, base.buffered_stages, base.outbox, base.outbox_buffered, base.complete]).toEqual([3, 3, 3, 3, true]);
+  // b-1: the batch is no longer publication_state 'buffered' (canonical): its stage is not a buffered stage.
+  await f.db.query("UPDATE sessions.ingest_batches SET publication_state='canonical' WHERE batch_id='b-1'");
+  // b-2: the stage row's user does not match its outbox row's user: not a buffered stage of that outbox row.
+  await f.db.query("UPDATE sessions.ingest_stage_intents SET user_id='user-other' WHERE claim_token IN (SELECT claim_token FROM sessions.ingest_claim_attempts WHERE batch_id='b-2')");
+  const narrowed = await sessionPresence(f.sql, { ...opts, session: SESSION });
+  expect([narrowed.claims, narrowed.buffered_stages, narrowed.outbox, narrowed.outbox_buffered]).toEqual([3, 1, 3, 3]);
+  // A pointer that names the session only by session_id (its canonical_session_id is another id) still counts.
+  await f.publish(SESSION);
+  await f.db.query(`INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,trace_id,canonical_session_id)
+    VALUES($1,$2,'claude',$3,'m-2',$4,now(),now(),'s3','b','k2/manifest.json',gen_random_uuid(),$5)`, [TENANT.orgId, TENANT.workspaceId, SESSION, TENANT.userId, NEIGHBOUR]);
+  const pointers = await sessionPresence(f.sql, { ...opts, session: SESSION });
+  expect([pointers.canonical_pointers, pointers.canonical_pointers_live, pointers.ownership, pointers.complete, pointers.incomplete_reason]).toEqual([2, 2, 1, true, "none"]);
+  // The same session id under a second org (a session_index row only; one ownership row): multi_ownership.
+  await f.db.query(`INSERT INTO sessions.session_index(org_id,workspace_id,harness,session_id,machine_id,user_id,created_at,last_activity_at,storage_provider,bucket,manifest_key,trace_id)
+    VALUES($1,'ws-b','claude',$2,'m-9','user-9',now(),now(),'s3','b','k9/manifest.json',gen_random_uuid())`, [OTHER_ORG, SESSION]);
+  const twoOrgs = await sessionPresence(f.sql, { ...opts, session: SESSION });
+  expect([twoOrgs.ownership, twoOrgs.canonical_pointers, twoOrgs.generation_stable, twoOrgs.complete, twoOrgs.incomplete_reason]).toEqual([1, 3, true, false, "multi_ownership"]);
+  expect(Object.keys(twoOrgs).sort()).toEqual(Object.keys(pointers).sort());
+  // Scoped to one org, the session is single-org again.
+  const scoped = await sessionPresence(f.sql, { ...opts, session: SESSION, orgs: [ORG] });
+  expect([scoped.canonical_pointers, scoped.complete, scoped.incomplete_reason]).toEqual([2, true, "none"]);
+  const other = await sessionPresence(f.sql, { ...opts, session: SESSION, orgs: [OTHER_ORG] });
+  expect([other.ownership, other.canonical_pointers, other.complete, other.incomplete_reason]).toEqual([0, 1, true, "none"]);
+});
+
 test("REPEATABLE READ READ ONLY: a write inside the transaction is refused (25006) and refuses the run", async () => {
   const f = await fixture();
   let n = 0;
@@ -205,7 +236,7 @@ test("no leak: backlogOpsRun end to end; the receipt and every log line never co
     results.push(await runOnce(SESSION + " x"));                                  // malformed secret
     results.push(await runOnce(SESSION, { BACKLOG_OPS_MODE: "presence-execute" })); // execute refused
     results.push(await runOnce(SESSION, {}, async () => {                         // a tool error naming the session
-      const out = await sessionPresenceMain(["--dry-run", "--statement-timeout-ms", "120000"], JSON.stringify({ dbUrl: "x", session: SESSION }),
+      const out = await sessionPresenceMain(["--dry-run", "--statement-timeout-ms", "60000", "--total-budget-ms", "180000"], JSON.stringify({ dbUrl: "x", session: SESSION }),
         async () => ({ query: async () => { throw Object.assign(new Error(`boom ${SESSION}`), { code: "XX000" }); } }));
       return { code: out.code, stdout: out.line };
     }));

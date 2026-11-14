@@ -4,19 +4,23 @@
  * scripts/session-presence.ts, docs/backlog-ops-workflow.md "Session presence (presence-dry)").
  *
  * One transaction: BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY, SHOW transaction_read_only must be `on`, a
- * bounded SET LOCAL statement_timeout, then one parameterised COUNT per entry of SESSION_PRESENCE_COUNTS (the session
- * is $1, the optional org scope $2::text[]), each in its own savepoint, and ROLLBACK always. Every count is one
- * snapshot. A count cancelled by the statement timeout (sqlstate 57014) is rolled back to its savepoint and reported
- * as null with complete=false; any other error refuses the run. The publication generation marker
+ * bounded SET LOCAL statement_timeout and SET LOCAL lock_timeout, then one parameterised COUNT per entry of
+ * SESSION_PRESENCE_COUNTS (the session is $1, the optional org scope $2::text[]) plus the distinct-org check, each in
+ * its own savepoint, and ROLLBACK always. Every count is one snapshot. A count cancelled by the statement timeout
+ * (sqlstate 57014) is rolled back to its savepoint and reported as null with complete=false; any other error
+ * (including a lock_timeout, 55P03) refuses the run. The whole transaction also has a total budget (totalBudgetMs):
+ * a statement is started only while the budget has at least SESSION_PRESENCE_MIN_TIMEOUT_MS left, and its statement
+ * timeout is lowered to what is left, so the snapshot is held for at most about the budget. A statement skipped or
+ * cut short by the budget is null with budget_exhausted. The publication generation marker
  * (SESSION_PRESENCE_GENERATION_MARKER) is read first and last; generation_stable reports whether they matched, and
- * complete=false with a fixed incomplete_reason code fails closed on an unstable or unobserved marker, more than one
- * ownership row, or a timed-out count. Counts are still emitted.
+ * complete=false with a fixed incomplete_reason code fails closed on an unobserved or unstable marker, more than one
+ * ownership row or org, a timed-out count, or an exhausted budget. Counts are still emitted.
  *
  * Index use. Most tables are keyed tenant-first (org_id, workspace_id, user_id, ...) and have no session-first
  * index, so an UNSCOPED count of them is a sequential scan: ownership, claim_sessions, lazy_slots, revisions,
  * heads, generations and canonical pointers. That is accepted here because the tool runs on demand for one session,
  * read-only, in one REPEATABLE READ snapshot, and every count is bounded by the per-statement timeout (a count that
- * runs over is null, never a hung run). With BACKLOG_OPS_ORGS set the same counts use the org-leading index
+ * runs over is null, never a hung run) and the whole transaction by the total budget. With BACKLOG_OPS_ORGS set the same counts use the org-leading index
  * (named per count below). The claim-driven counts (claims, buffered_stages, outbox, outbox_buffered) use the
  * jsonb_path_ops GIN ingest_claim_attempts_records_gin_idx (044040) in either scope.
  *
@@ -33,6 +37,11 @@ const ORG_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
 export const SESSION_PRESENCE_MAX_ORGS = 64;
 export const SESSION_PRESENCE_MIN_TIMEOUT_MS = 1000;
 export const SESSION_PRESENCE_MAX_TIMEOUT_MS = 600000;
+/** Bounds of the total transaction budget (--total-budget-ms): the same range as the per-statement timeout. */
+export const SESSION_PRESENCE_MIN_BUDGET_MS = 1000;
+export const SESSION_PRESENCE_MAX_BUDGET_MS = 600000;
+/** SET LOCAL lock_timeout: a count never queues behind DDL for long (55P03 refuses the run). */
+export const SESSION_PRESENCE_LOCK_TIMEOUT_MS = 5000;
 
 /** `AND <alias>.org_id = ANY($2::text[])` when scoped; fixed text, never a value. */
 const org = (alias: string, scoped: boolean) => (scoped ? ` AND ${alias}.org_id = ANY($2::text[])` : "");
@@ -142,16 +151,38 @@ export const SESSION_PRESENCE_GENERATION_MARKER = (s: boolean) =>
       WHERE (coalesce(p.canonical_session_id, p.session_id) = $1::text OR p.session_id = $1::text)${org("p", s)}
    ) AS m`;
 
+/**
+ * The distinct-org check: how many DISTINCT org ids name the session across the org-bearing tables the counts read
+ * (ownership, the claims' records, claim sessions, lazy slots, revisions, heads, generations and canonical
+ * pointers). More than one means the session id is used in more than one org and the counts mix tenants: it widens
+ * multi_ownership (with ownership rows > 1). The number itself is not emitted (the receipt shape is unchanged).
+ * Same index use as those counts (unscoped = scans, bounded by the timeout and the budget).
+ */
+export const SESSION_PRESENCE_DISTINCT_ORGS = (s: boolean) =>
+  `SELECT count(DISTINCT x.org_id)::int AS distinct_orgs FROM (
+     SELECT w.org_id FROM sessions.ingest_session_ownership AS w WHERE w.session_id = $1::text${org("w", s)}
+     UNION ALL SELECT c.org_id FROM (${claimsOf(s)}) AS c
+     UNION ALL SELECT cs.org_id FROM sessions.ingest_claim_sessions AS cs WHERE cs.session_id = $1::text${org("cs", s)}
+     UNION ALL SELECT l.org_id FROM sessions.ingest_lazy_native_slots AS l
+                WHERE l.current_owner IS NOT NULL AND l.current_session = $1::text${org("l", s)}
+     UNION ALL SELECT r.org_id FROM sessions.ingest_record_revisions AS r WHERE r.session_id = $1::text${org("r", s)}
+     UNION ALL SELECT h.org_id FROM sessions.ingest_publication_heads AS h WHERE h.session_id = $1::text${org("h", s)}
+     UNION ALL SELECT g.org_id FROM sessions.ingest_publication_generations AS g WHERE g.session_id = $1::text${org("g", s)}
+     UNION ALL SELECT p.org_id FROM sessions.session_index AS p
+                WHERE (coalesce(p.canonical_session_id, p.session_id) = $1::text OR p.session_id = $1::text)${org("p", s)}
+   ) AS x`;
+
 /** heads_<state> columns that move under `dispositions` (fixed enum codes, bounded counts). */
 const DISPOSITION_COLUMNS = ["heads_building", "heads_live", "heads_retired"] as const;
 
 /**
- * complete=false reasons, one fixed code, most serious first: generation_unstable (the marker differed between the
- * first and last read), generation_unobserved (a marker read timed out), multi_ownership (more than one
- * ingest_session_ownership row: the session id is claimed by more than one org/workspace/user/origin/source, so
- * the counts mix owners), count_timeout (a count timed out and is null). `none` when complete.
+ * complete=false reasons, one fixed code, most serious first: generation_unobserved (a marker read timed out or was
+ * skipped by the budget), generation_unstable (the marker differed between the first and last read; the two are
+ * exclusive), multi_ownership (more than one ingest_session_ownership row, or the session id under more than one
+ * org: the counts mix owners), count_timeout (a count hit the per-statement timeout and is null), budget_exhausted
+ * (the total budget ran out, so a count was skipped or cut short and is null). `none` when complete.
  */
-export const SESSION_PRESENCE_INCOMPLETE_REASONS = ["none", "generation_unstable", "generation_unobserved", "multi_ownership", "count_timeout"] as const;
+export const SESSION_PRESENCE_INCOMPLETE_REASONS = ["none", "generation_unobserved", "generation_unstable", "multi_ownership", "count_timeout", "budget_exhausted"] as const;
 
 export type SessionPresenceSummary = Record<string, number | null | boolean | string | Record<string, number | null>>;
 
@@ -160,6 +191,10 @@ export interface SessionPresenceOptions {
   /** Lowercase org UUIDs (BACKLOG_OPS_ORGS) or null/empty for every org. */
   orgs?: readonly string[] | null;
   statementTimeoutMs: number;
+  /** The whole transaction's budget in ms (SESSION_PRESENCE_MIN_BUDGET_MS..SESSION_PRESENCE_MAX_BUDGET_MS). */
+  totalBudgetMs: number;
+  /** Monotonic-enough clock in ms, injectable for tests (default Date.now). */
+  now?: () => number;
 }
 
 const fail = (code: string): never => { throw new Error(code); };
@@ -171,17 +206,32 @@ export async function sessionPresence(sql: PresenceSql, o: SessionPresenceOption
     fail("session_presence_scope");
   const ms = o.statementTimeoutMs;
   if (!Number.isInteger(ms) || ms < SESSION_PRESENCE_MIN_TIMEOUT_MS || ms > SESSION_PRESENCE_MAX_TIMEOUT_MS) fail("session_presence_timeout");
+  const budget = o.totalBudgetMs;
+  if (!Number.isInteger(budget) || budget < SESSION_PRESENCE_MIN_BUDGET_MS || budget > SESSION_PRESENCE_MAX_BUDGET_MS) fail("session_presence_budget");
+  const now = o.now ?? Date.now;
   const scoped = orgs !== null, params: unknown[] = scoped ? [o.session, orgs] : [o.session];
   const out: SessionPresenceSummary = {};
-  let timedOut = false, generationStable = false;
+  let timedOut = false, exhausted = false, generationStable = false, distinctOrgs: number | null = null;
   let reason: (typeof SESSION_PRESENCE_INCOMPLETE_REASONS)[number] = "none";
+  const start = now();
   await sql.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
   try {
     const ro = await sql.query("SHOW transaction_read_only");
     if (ro.rows[0]?.transaction_read_only !== "on") fail("session_presence_not_read_only");
     await sql.query(`SET LOCAL statement_timeout = ${ms}`);
-    /** One statement in its own savepoint; null when the statement timeout (57014) cancels it, other errors refuse. */
+    await sql.query(`SET LOCAL lock_timeout = ${SESSION_PRESENCE_LOCK_TIMEOUT_MS}`);
+    let current = ms;
+    /**
+     * One statement in its own savepoint. null when the statement timeout (57014) cancels it (count_timeout, or
+     * budget_exhausted when the timeout had been lowered to the budget's remainder) or when the budget has less than
+     * SESSION_PRESENCE_MIN_TIMEOUT_MS left (skipped, budget_exhausted); other errors refuse.
+     */
     const guarded = async (text: string): Promise<Record<string, unknown> | null> => {
+      const left = budget - (now() - start);
+      if (!(left >= SESSION_PRESENCE_MIN_TIMEOUT_MS)) { exhausted = true; return null; }
+      const limit = Math.min(ms, Math.floor(left));
+      // Outside the savepoint, so a rollback to it never undoes the lowered timeout.
+      if (limit !== current) { await sql.query(`SET LOCAL statement_timeout = ${limit}`); current = limit; }
       await sql.query("SAVEPOINT session_presence_count");
       try {
         const row = (await sql.query(text, params)).rows[0] ?? {};
@@ -190,6 +240,7 @@ export async function sessionPresence(sql: PresenceSql, o: SessionPresenceOption
       } catch (e) {
         if ((e as { code?: unknown } | null)?.code !== "57014") throw e;
         await sql.query("ROLLBACK TO SAVEPOINT session_presence_count");
+        if (limit < ms) exhausted = true; else timedOut = true;
         return null;
       }
     };
@@ -205,7 +256,6 @@ export async function sessionPresence(sql: PresenceSql, o: SessionPresenceOption
     for (const c of SESSION_PRESENCE_COUNTS) {
       const row = await guarded(c.sql(scoped));
       if (row === null) {
-        timedOut = true;
         for (const k of c.columns) out[k] = null;
         continue;
       }
@@ -215,6 +265,12 @@ export async function sessionPresence(sql: PresenceSql, o: SessionPresenceOption
         out[k] = n;
       }
     }
+    const orgsRow = await guarded(SESSION_PRESENCE_DISTINCT_ORGS(scoped));
+    if (orgsRow !== null) {
+      const n = Number(orgsRow.distinct_orgs);
+      if (!Number.isSafeInteger(n) || n < 0) fail("session_presence_count_shape");
+      distinctOrgs = n;
+    }
     const last = await marker();
     if (first === null || last === null) reason = "generation_unobserved";
     else if (first !== last) reason = "generation_unstable";
@@ -222,8 +278,10 @@ export async function sessionPresence(sql: PresenceSql, o: SessionPresenceOption
   } finally {
     await sql.query("ROLLBACK").catch(() => undefined);
   }
-  if (reason === "none" && typeof out.ownership === "number" && out.ownership > 1) reason = "multi_ownership";
+  if (reason === "none" && ((typeof out.ownership === "number" && out.ownership > 1) || (distinctOrgs !== null && distinctOrgs > 1)))
+    reason = "multi_ownership";
   if (reason === "none" && timedOut) reason = "count_timeout";
+  if (reason === "none" && exhausted) reason = "budget_exhausted";
   const dispositions: Record<string, number | null> = {};
   for (const k of DISPOSITION_COLUMNS) { dispositions[k] = out[k] as number | null; delete out[k]; }
   out.dispositions = dispositions;
@@ -234,38 +292,49 @@ export async function sessionPresence(sql: PresenceSql, o: SessionPresenceOption
   return out;
 }
 
-/** The tool's argv: `--dry-run` (required; there is no execute), `--statement-timeout-ms n`, `--org <uuid>` ... */
-export interface SessionPresenceArgs { orgs: string[]; statementTimeoutMs: number }
+/**
+ * The tool's argv: `--dry-run` (required; there is no execute), `--statement-timeout-ms n`, `--total-budget-ms n`
+ * (both required, 1000..600000), `--org <uuid>` ...
+ */
+export interface SessionPresenceArgs { orgs: string[]; statementTimeoutMs: number; totalBudgetMs: number }
 export function parseSessionPresenceArgs(argv: readonly string[]): SessionPresenceArgs {
-  let dry = false, timeout: number | null = null;
+  let dry = false, timeout: number | null = null, budget: number | null = null;
   const orgs: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--dry-run" && !dry) { dry = true; continue; }
     const v = argv[i + 1];
     if (a === "--statement-timeout-ms" && timeout === null && v !== undefined && /^[1-9][0-9]{3,5}$/u.test(v)) { timeout = Number(v); i++; continue; }
+    if (a === "--total-budget-ms" && budget === null && v !== undefined && /^[1-9][0-9]{3,5}$/u.test(v)) { budget = Number(v); i++; continue; }
     if (a === "--org" && v !== undefined && ORG_UUID.test(v) && !orgs.includes(v)) { orgs.push(v); i++; continue; }
     fail("session_presence_args");
   }
   if (!dry || timeout === null || timeout < SESSION_PRESENCE_MIN_TIMEOUT_MS || timeout > SESSION_PRESENCE_MAX_TIMEOUT_MS ||
+      budget === null || budget < SESSION_PRESENCE_MIN_BUDGET_MS || budget > SESSION_PRESENCE_MAX_BUDGET_MS ||
       orgs.length > SESSION_PRESENCE_MAX_ORGS) fail("session_presence_args");
-  return { orgs: orgs.sort(), statementTimeoutMs: timeout! };
+  return { orgs: orgs.sort(), statementTimeoutMs: timeout!, totalBudgetMs: budget! };
 }
 
 /** stdin: exactly {"dbUrl": "...", "session": "..."} on one line (at most 64 KiB). */
 export function parseSessionPresenceInput(text: string): { dbUrl: string; session: string } {
   const line = text.split("\n")[0] ?? "";
-  if (line.length > 64 * 1024) fail("stdin_too_large");
+  if (line.length > 64 * 1024) fail("session_presence_stdin_too_large");
   let parsed: unknown;
-  try { parsed = JSON.parse(line); } catch { fail("stdin_invalid"); }
+  try { parsed = JSON.parse(line); } catch { fail("session_presence_stdin_invalid"); }
   const p = parsed as { dbUrl?: unknown; session?: unknown } | null;
-  if (!p || typeof p !== "object" || Array.isArray(p) || Object.keys(p).sort().join(",") !== "dbUrl,session") fail("stdin_invalid");
-  if (typeof p!.dbUrl !== "string" || !p!.dbUrl) fail("db_url_required");
+  if (!p || typeof p !== "object" || Array.isArray(p) || Object.keys(p).sort().join(",") !== "dbUrl,session") fail("session_presence_stdin_invalid");
+  if (typeof p!.dbUrl !== "string" || !p!.dbUrl) fail("session_presence_db_url_required");
   if (typeof p!.session !== "string" || p!.session === "") fail("session_presence_session_missing");
   if (!isPresenceSession(p!.session as string)) fail("session_presence_session_invalid");
   return { dbUrl: p!.dbUrl as string, session: p!.session as string };
 }
 
+/**
+ * The codeless messages that pass through as a refusal code: this tool's own session_presence_* codes, a
+ * backlog_ops_* code, or an already formed sqlstate_<5>. Any other message (a library's lowercase message can still
+ * be a value, such as a lowercase session token) is internal_error. At most 40 characters, the receipt code limit.
+ */
+const PRESENCE_REASON = /^(?:session_presence_[a-z0-9_]{1,23}|backlog_ops_[a-z0-9_]{1,28}|sqlstate_[0-9a-z]{5})$/u;
 /** A closed, redacted reason only: a pg error message can carry a host, a value or a tenant id. */
 export const presenceRedactedReason = (e: unknown): string => {
   const code = (e as { code?: unknown } | null)?.code;
@@ -273,8 +342,17 @@ export const presenceRedactedReason = (e: unknown): string => {
   if (typeof code === "string" && /^[0-9A-Z]{5}$/u.test(code)) return "sqlstate_" + code.toLowerCase();
   if ((e as { name?: unknown })?.name === "OwnerUrlError" && typeof code === "string" && /^[a-z0-9_]{1,32}$/u.test(code)) return "db_url_" + code;
   const m = (e as Error)?.message;
-  return typeof m === "string" && /^[a-z0-9_]{1,64}$/u.test(m) ? m : "internal_error";
+  return typeof m === "string" && PRESENCE_REASON.test(m) ? m : "internal_error";
 };
+
+/**
+ * The pg `options` of the presence client: the owner config's own options (idle_in_transaction_session_timeout)
+ * kept, with default_transaction_read_only=on appended. Never replaces them.
+ */
+export function presenceClientOptions(baseOptions: string | undefined): string {
+  const base = (baseOptions ?? "").trim();
+  return (base ? base + " " : "") + "-c default_transaction_read_only=on";
+}
 
 /**
  * The tool body, injectable for tests: parse argv and stdin, connect, count, and return the one stdout line
@@ -290,7 +368,7 @@ export async function sessionPresenceMain(
     const args = parseSessionPresenceArgs(argv);
     const input = parseSessionPresenceInput(stdin);
     client = await connect(input.dbUrl);
-    const summary = await sessionPresence(client, { session: input.session, orgs: args.orgs, statementTimeoutMs: args.statementTimeoutMs });
+    const summary = await sessionPresence(client, { session: input.session, orgs: args.orgs, statementTimeoutMs: args.statementTimeoutMs, totalBudgetMs: args.totalBudgetMs });
     return { line: JSON.stringify(summary), code: 0 };
   } catch (e) {
     return { line: JSON.stringify({ refused: presenceRedactedReason(e) }), code: 1 };

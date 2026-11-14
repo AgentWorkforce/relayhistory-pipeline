@@ -194,17 +194,20 @@ export const BACKLOG_OPS_BACKFILL_PAGING = ["--page-size", "5000", "--row-page-s
 export const BACKLOG_OPS_EXPORT_PAGING = ["--statement-timeout-ms", "600000"] as const;
 
 /**
- * The presence tool's per-count statement timeout. Its counts run one after another in ONE read-only transaction,
- * each in its own savepoint; a count that hits this timeout is reported as null with complete=false instead of
- * failing the run. Worst case is SESSION_PRESENCE_COUNTS x 120 s (about 20 min), well inside the 355 min job.
+ * The presence tool's per-statement timeout and total transaction budget. Its statements (the counts, the distinct-org
+ * check and the two generation marker reads) run one after another in ONE REPEATABLE READ READ ONLY transaction on
+ * the owner primary, each in its own savepoint. A statement that hits the 60 s timeout is null (count_timeout); the
+ * 180 s budget caps the whole transaction: no statement starts with less than 1 s of it left, and each statement's
+ * timeout is lowered to what is left, so the snapshot is held for about 3 min at most (budget_exhausted, counts
+ * null, otherwise). Both flags are passed explicitly.
  */
-export const BACKLOG_OPS_PRESENCE_TIMEOUT = ["--statement-timeout-ms", "120000"] as const;
+export const BACKLOG_OPS_PRESENCE_TIMEOUT = ["--statement-timeout-ms", "60000", "--total-budget-ms", "180000"] as const;
 
 /** Fixed argv for the tool: the scope's validated orgs only, never a checkpoint, a start key or an unvalidated value. */
 export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget, scope: BacklogOpsScope = { orgs: null, id: BACKLOG_OPS_SCOPE_ALL }): { script: string; args: string[]; needsDb: boolean } {
   const tool = toolOf(d.mode), execute = isExecute(d.mode);
   if (tool === "presence") {
-    // Dry only, no bucket, region or key (it reads no S3): the per-count timeout and the scope's orgs.
+    // Dry only, no bucket, region or key (it reads no S3): the per-statement timeout, the budget and the scope's orgs.
     if (execute) refuse("backlog_ops_presence_dry_only");
     return { script: "scripts/session-presence.ts", args: ["--dry-run", ...BACKLOG_OPS_PRESENCE_TIMEOUT, ...(scope.orgs ?? []).flatMap((o) => ["--org", o])], needsDb: true };
   }
