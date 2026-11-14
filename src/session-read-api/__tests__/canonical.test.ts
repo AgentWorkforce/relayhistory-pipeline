@@ -950,7 +950,7 @@ const fetchRecord = (i: number) => ({
   payload: { ts_ms: Date.parse(AT) + i, text: `turn ${i}`, role: i % 2 ? "assistant" : "user", message_id: `msg-${i}` },
 });
 /** deps over a store whose chunk reads take a few ms and are counted (peak in flight, total started). */
-function slowChunkDeps(base: CanonicalDeps, fetchConcurrency: number | undefined, abort?: AbortSignal) {
+function slowChunkDeps(base: CanonicalDeps, fetchConcurrency: number | undefined, abort?: AbortController, abortAt?: number) {
   const state = { inFlight: 0, peak: 0, started: 0 };
   const store = new Proxy(base.store, {
     get(target, prop) {
@@ -959,11 +959,12 @@ function slowChunkDeps(base: CanonicalDeps, fetchConcurrency: number | undefined
       return async (...args: Parameters<typeof target.getObject>) => {
         if (!String(args[0]).endsWith(".zst")) return target.getObject(...args);
         state.started++;
+        if (state.started === abortAt) abort?.abort();
         state.peak = Math.max(state.peak, ++state.inFlight);
         try {
           await new Promise((r) => setTimeout(r, 2));
           // Stands in for the per-request fetch bound to the route's deadline signal (service-canonical.ts).
-          abort?.throwIfAborted();
+          abort?.signal.throwIfAborted();
           return await target.getObject(...args);
         } finally { state.inFlight--; }
       };
@@ -1014,9 +1015,8 @@ test("fetchConcurrency 8: an aborted request stops the read as the sequential on
   try {
     for (const n of [undefined, 8]) {
       const controller = new AbortController();
-      const run = slowChunkDeps(deps, n, controller.signal);
+      const run = slowChunkDeps(deps, n, controller, 5);
       const pending = canonicalSnapshot(run.deps, identity).catch((e) => e);
-      setTimeout(() => controller.abort(), 12);
       // The sequential reader maps a failed chunk read to the retryable chunk_unavailable (the route answers its deadline).
       expect(await pending).toMatchObject({ code: "chunk_unavailable", retryable: true });
       const started = run.state.started;
