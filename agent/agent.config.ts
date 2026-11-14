@@ -106,11 +106,11 @@ export default defineLayeredAgent({
         id: "implement-change",
         name: "Make a code change",
         description:
-          "Implements a change in either repo through a coding subagent in its own clone, runs that repo's CI checks, and opens a pull request recorded in the ledger. Deploys, migrations, workflow dispatches, flag flips and secret or IAM changes need the owner's own OK first.",
-        tags: ["implementation", "pull-request"],
+          "Implements a change in either repo through a coding subagent in its own clone, runs that repo's CI checks, reviews the exact final diff (adversarial and contextual) and lands it by direct push to main here (pull requests are disabled on relayhistory-pipeline), by pull request in sessions-pipeline-cloud, with the evidence recorded in the ledger. Deploys, migrations, workflow dispatches, flag flips and secret or IAM changes need the owner's own OK first.",
+        tags: ["implementation", "direct-push"],
         examples: [
-          "Add a regression test for the courier's chunk retry and open a PR",
-          "Fix the flaky pg-proof test on PostgreSQL 17 and open a PR",
+          "Add a regression test for the courier's chunk retry and land it",
+          "Fix the flaky pg-proof test on PostgreSQL 17 and land it on main",
         ],
       },
     ],
