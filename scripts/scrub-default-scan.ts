@@ -31,7 +31,9 @@
  *     every workspace-package specifier resolves to exactly one tracked source
  *     ("unresolved-workspace-import" otherwise: an unknown `exports` shape, a folder mapping or
  *     pattern, an exports object without "." for the root, a non-string or unresolvable `main`, a
- *     duplicate name, ambiguous candidates or an untracked target is not silently a dead end); a
+ *     main, subpath or exports target outside the package directory, a duplicate name, ambiguous
+ *     candidates or an untracked target is not silently a dead end), and so does an `@rhc/` or
+ *     `@rhc-object-store` alias specifier that resolves to nothing (for example `@rhc/../../x`); a
  *     relative or alias specifier with more than one tracked candidate is "ambiguous-import". Every
  *     packages/<dir>/package.json is a JSON object and no two share a "name" ("unparseable" otherwise;
  *     a duplicated name resolves nowhere).
@@ -51,17 +53,28 @@
  * a folder mapping ("./sub/"), a "*" pattern, an array, a top-level condition object or another
  * condition fails closed; an exports object without "." fails closed for the package root, since Bun
  * refuses it rather than falling back to "main"; a subpath such a map lacks falls back to the package
- * directory, a safe over-approximation). Only when "exports" is absent does the root load its string
- * "main", as Bun 1.4.2 does: the literal path (a .js main also its .ts sibling; a .mjs main is not
- * rewritten), then main.js / main.ts (never .mts / .mjs), then a directory's index.js / index.ts; a
- * main that resolves to none of them, or a non-string main, fails closed where Bun would silently load
- * the index; with no main the root loads its index. Other bare specifiers (including
- * `@96bulls/pipeline-extra`, which only shares a prefix) are third-party and not followed. Candidates
- * come in tiers: the literal path and its .js -> .ts / .mjs -> .mts sibling, then an extensionless
- * path's .mts / .ts / .mjs / .js files, then the same for /index. The first tier with a tracked
- * candidate decides, and it must hold exactly one: two tracked candidates in one tier fail closed
- * ("ambiguous-import", or rule 4 for a workspace specifier), so Bun's differing orders cannot pick a
- * file the scan did not follow.
+ * directory, a safe over-approximation). Relative, `@rhc/` and workspace-subpath paths and `main` are
+ * normalised (`.`, `..`); an `@rhc/` path leaving packages/pipeline/src, or a subpath, main or exports
+ * target leaving its package directory, fails closed (Bun resolves an escaping main against the
+ * node_modules link and loads the package index instead). Candidates come in tiers, as Bun 1.4.2 tries
+ * them for import, require, an alias and a workspace subpath: the literal path, then `${path}.<mts|ts|
+ * mjs|js>`, then the literal's .js -> .ts / .mjs -> .mts sibling, then `${path}/index.<ext>` (so
+ * `./x.js` beside x.ts and x.js.ts loads x.js.ts, and beside x.ts and x.js/index.ts loads x.ts). A
+ * directory form, a path ending in "/" (or, when relative, whose last segment is "." or ".."), skips
+ * the `${path}.<ext>` tier: `./dir/` beside dir.ts and dir/index.ts loads dir/index.ts. An explicit
+ * exports target gets only the literal path and, for .js, its .ts sibling: Bun adds no extension or
+ * /index to it (an extensionless or directory target such as "./a", "./lib" or "./" throws "Cannot find
+ * module"), so such a target resolves to nothing and fails closed. Only when "exports" is absent does
+ * the root load its string "main": the literal path, then main.js / main.ts (never .mts / .mjs; skipped
+ * for a directory form such as "./lib/"), then the .ts sibling of a .js main (a .mjs main is not
+ * rewritten), then index.js / index.ts; a main that resolves to none of them, or a non-string main,
+ * fails closed where Bun would silently load the index; with no main the root loads its index. Other
+ * bare specifiers (including `@96bulls/pipeline-extra`, which only shares a prefix) are third-party and
+ * not followed. The first tier with a tracked candidate decides, and it must hold exactly one: two
+ * tracked candidates in one tier fail closed ("ambiguous-import", or rule 4 for a workspace specifier),
+ * so Bun's differing orders cannot pick a file the scan did not follow. A tracked literal beside its
+ * tracked sibling (`./x.js` with x.js and x.ts) also fails closed: Bun loads x.js, but tsc and editors
+ * read x.ts. An `@rhc/` import that resolves to nothing is rule 4 as well, not a silent dead end.
  *
  * Known limits (heuristics, not a proof; review covers these):
  *  - G4 order: an entry passes rule 3 if it calls the initialiser anywhere, even after a seam use at
@@ -399,8 +412,11 @@ const IMPORT_EXTS = ["mts", "ts", "mjs", "js"];
  * candidate in it is the file; more than one is ambiguous (fail closed). Bun's order inside a tier
  * differs by edge kind (import .mts > .ts > .mjs > .js; require / createRequire .ts > .mts, .js > .mjs;
  * a workspace specifier through node_modules .mjs > .mts > .js > .ts; `main` .js > .ts), so a tier is
- * decided only when no order is needed. */
-function pickTier(files: Sources, tiers: readonly (readonly string[])[]): Resolution {
+ * decided only when no order is needed. `clash` is a literal path and its .js -> .ts / .mjs -> .mts
+ * sibling: when both are tracked the resolution is ambiguous before any tier is tried (Bun 1.4.2 loads
+ * the literal, but tsc and editors read the sibling, so the scan fails closed instead of choosing). */
+function pickTier(files: Sources, tiers: readonly (readonly string[])[], clash: readonly string[] = []): Resolution {
+  if (clash.length === 2 && clash[0] !== clash[1] && clash.every((c) => files.has(c))) return { ambiguous: [...clash] };
   for (const tier of tiers) {
     const hits = [...new Set(tier)].filter((c) => files.has(c));
     if (hits.length === 1) return { file: hits[0] };
@@ -408,36 +424,78 @@ function pickTier(files: Sources, tiers: readonly (readonly string[])[]): Resolu
   }
   return {};
 }
-/** Import tiers for `base`: the literal path and its .js -> .ts / .mjs -> .mts sibling, then the
- * extensionless `${base}.<ext>` files, then `${base}/index.<ext>`. */
-const importTiers = (base: string) => [[base, base.replace(/\.js$/, ".ts"), base.replace(/\.mjs$/, ".mts")], IMPORT_EXTS.map((x) => `${base}.${x}`), IMPORT_EXTS.map((x) => `${base}/index.${x}`)];
-/** package.json `main` tiers (Bun 1.4.2, only when "exports" is absent): the literal path and, for a .js
- * path, its .ts sibling (a .mjs main is not rewritten to .mts); then `${main}.js` / `${main}.ts` (never
- * .mts / .mjs); then a directory's index.js / index.ts. */
-const mainTiers = (base: string) => [[base, ...(base.endsWith(".js") ? [`${base.slice(0, -3)}.ts`] : [])], [`${base}.js`, `${base}.ts`], [`${base}/index.js`, `${base}/index.ts`]];
+/** The .js -> .ts / .mjs -> .mts sibling Bun tries for a path (`mjs: false` for a `main` or an exports
+ * target, which Bun does not rewrite from .mjs), or undefined. */
+const siblingOf = (p: string, mjs = true): string | undefined => (p.endsWith(".js") ? `${p.slice(0, -3)}.ts` : mjs && p.endsWith(".mjs") ? `${p.slice(0, -4)}.mts` : undefined);
+const clashOf = (p: string, mjs = true): string[] => { const s = siblingOf(p, mjs); return s ? [p, s] : []; };
+/** A path written in directory form: it ends with "/" (`./dir/`, `@rhc/dir/`, `@p/pkg/lib/`, main
+ * `./lib/`), or, for a relative specifier only, its last segment is "." or ".." (`.`, `..`, `./x/.`).
+ * Bun 1.4.2 then skips the `${base}.<ext>` tier: `./dir/` beside dir.ts and dir/index.ts loads
+ * dir/index.ts, and `./dir/` with only dir.ts throws; the literal file and the .js -> .ts sibling still
+ * apply (`./x.js/` beside x.ts and x.js/index.ts loads x.ts). An `@rhc/` path, a workspace subpath and a
+ * `main` are normalised first, so `@rhc/x/.`, `@rhc/x/y/..` and main `./lib/.` load x.ts / lib.ts like
+ * `@rhc/x` and `./lib`. Read on the string as written, before resolve() drops the slash. */
+const DIR_FORM = /\/$/;
+const RELATIVE_DIR_FORM = /(^|\/)\.\.?$|\/$/;
+/** Import tiers for `base` (Bun 1.4.2, import / require / alias / workspace subpath): the literal path,
+ * then `${base}.<ext>` (not for a directory form), then the literal's .js -> .ts / .mjs -> .mts sibling,
+ * then `${base}/index.<ext>`. */
+const importTiers = (base: string, dir = false) => {
+  const sib = siblingOf(base);
+  return [[base], ...(dir ? [] : [IMPORT_EXTS.map((x) => `${base}.${x}`)]), ...(sib ? [[sib]] : []), IMPORT_EXTS.map((x) => `${base}/index.${x}`)];
+};
+const importResolution = (files: Sources, base: string, dir: boolean): Resolution => pickTier(files, importTiers(base, dir), clashOf(base));
+/** package.json `main` tiers (Bun 1.4.2, only when "exports" is absent): the literal path, then
+ * `${main}.js` / `${main}.ts` (never .mts / .mjs; not for a directory form), then, for a .js path, its
+ * .ts sibling (a .mjs main is not rewritten to .mts), then a directory's index.js / index.ts. */
+const mainTiers = (base: string, dir = false) => {
+  const sib = siblingOf(base, false);
+  return [[base], ...(dir ? [] : [[`${base}.js`, `${base}.ts`]]), ...(sib ? [[sib]] : []), [`${base}/index.js`, `${base}/index.ts`]];
+};
+/** An explicit "exports" target: the literal path, then, for a .js target, its .ts sibling, nothing else.
+ * Bun 1.4.2 adds no extension and no /index to an exports target and does not rewrite .mjs to .mts (an
+ * extensionless or directory target such as "./a", "./lib" or "./", or "./a.mjs" with only a.mts, throws
+ * "Cannot find module"), so a miss resolves to nothing and scan() reports it (rule 4). */
+const exportsTiers = (base: string) => { const sib = siblingOf(base, false); return [[base], ...(sib ? [[sib]] : [])]; };
+const ALIAS_ROOT = "packages/pipeline/src";
+/** `path` (repo-relative, normalised) is `dir` itself or inside it. */
+const within = (path: string, dir: string) => path === dir || path.startsWith(`${dir}/`);
 
 /** The resolution of a specifier (see Resolution). A `?query` or `#hash` suffix is dropped (Bun loads
- * the same module). A workspace package root with no "exports" loads its string `main` (mainTiers; a
+ * the same module). Relative, `@rhc/` and workspace-subpath specifiers and `main` are normalised (`..`,
+ * `.`); an `@rhc/` path leaving packages/pipeline/src, or a subpath, `main` or exports target leaving its
+ * package directory, resolves to nothing (scan() reports it; for `main` Bun would silently load the
+ * index instead). A workspace package root with no "exports" loads its string `main` (mainTiers; a
  * non-string or unresolved main fails closed, where Bun would silently load the index), else its
- * directory index; an exports object without "." resolves nowhere for the root. Every other path uses
- * importTiers. */
+ * directory index; an exports object without "." resolves nowhere for the root; an exports target uses
+ * exportsTiers. Every other path uses importTiers. A directory form (DIR_FORM) skips the extension tier. */
 export function resolveImport(files: Sources, from: string, specifier: string): Resolution {
   const spec = specifier.replace(/(?<=.)[?#][\s\S]*$/, "");
-  let base: string | undefined;
-  if (spec.startsWith("@rhc/")) base = `packages/pipeline/src/${spec.slice(5)}`;
-  else if (spec === "@rhc-object-store") base = "packages/object-store/src/index.ts";
-  else if (spec.startsWith(".")) base = resolve("/", dirname(from), spec).slice(1);
-  else {
-    const w = workspaceOf(files, spec);
-    if (!w) return {};
-    const target = exportTarget(w.ws.exports, w.subpath);
-    if (target === undefined || w.ws.duplicate) return {};
-    if (target !== "fallback") base = resolve("/", w.ws.dir, target).slice(1);
-    else if (w.subpath || w.ws.main === undefined) base = `${w.ws.dir}${w.subpath}`;
-    else if (typeof w.ws.main === "string") return pickTier(files, mainTiers(resolve("/", w.ws.dir, w.ws.main).slice(1)));
-    else return {};
+  if (spec.startsWith("@rhc/")) {
+    const rest = spec.slice(5);
+    const base = resolve("/", ALIAS_ROOT, rest).slice(1);
+    return within(base, ALIAS_ROOT) ? importResolution(files, base, rest === "" || DIR_FORM.test(rest)) : {};
   }
-  return pickTier(files, importTiers(base));
+  if (spec === "@rhc-object-store") return pickTier(files, [["packages/object-store/src/index.ts"]]);
+  if (spec.startsWith(".")) return importResolution(files, resolve("/", dirname(from), spec).slice(1), RELATIVE_DIR_FORM.test(spec));
+  const w = workspaceOf(files, spec);
+  if (!w) return {};
+  const target = exportTarget(w.ws.exports, w.subpath);
+  if (target === undefined || w.ws.duplicate) return {};
+  const inPackage = (rel: string) => resolve("/", w.ws.dir, rel).slice(1);
+  if (target !== "fallback") {
+    const base = inPackage(target);
+    return base.startsWith(`${w.ws.dir}/`) ? pickTier(files, exportsTiers(base), clashOf(base, false)) : {};
+  }
+  if (w.subpath) {
+    const base = inPackage(`.${w.subpath}`);
+    return base.startsWith(`${w.ws.dir}/`) ? importResolution(files, base, DIR_FORM.test(w.subpath)) : {};
+  }
+  if (w.ws.main === undefined) return importResolution(files, w.ws.dir, true);
+  if (typeof w.ws.main !== "string") return {};
+  const main = inPackage(w.ws.main);
+  if (!within(main, w.ws.dir)) return {};
+  return pickTier(files, mainTiers(main, main === w.ws.dir || DIR_FORM.test(w.ws.main)), clashOf(main, false));
 }
 
 /** Repo-relative tracked file a specifier loads, or undefined (third-party, unknown, unresolvable or
@@ -563,12 +621,16 @@ export function scan(files: Sources): Violation[] {
       if (r && (PRELOADS as readonly string[]).includes(r) && !isTestPath(f) && (f.startsWith("src/") || /^packages\/[^/]+\/src\//.test(f)))
         v.push({ rule: "preload-import", file: f, detail: `imports test preload ${r}` });
       // 4. a workspace import the scan cannot follow is reported, not a silent dead end; so is any
-      // other import with competing tracked candidates (Bun's order differs by edge kind)
+      // other import with competing tracked candidates (Bun's order differs by edge kind), and an alias
+      // import that resolves to nothing (a path leaving packages/pipeline/src, or an untracked target)
       const competing = res.ambiguous ? `; more than one tracked candidate: ${res.ambiguous.join(", ")}` : "";
-      if (!r && !e.spec.startsWith(".") && workspaceOf(files, e.spec.replace(/(?<=.)[?#][\s\S]*$/, "")))
-        v.push({ rule: "unresolved-workspace-import", file: f, detail: `imports ${e.spec}, which resolves to no single tracked source (an unknown "exports" shape, an exports object without "." for the package root, an unresolvable or non-string "main", a duplicate package name, an untracked target, or ambiguous candidates${competing})` });
+      const bare = e.spec.replace(/(?<=.)[?#][\s\S]*$/, "");
+      if (!r && !e.spec.startsWith(".") && workspaceOf(files, bare))
+        v.push({ rule: "unresolved-workspace-import", file: f, detail: `imports ${e.spec}, which resolves to no single tracked source (an unknown "exports" shape, an exports object without "." for the package root, an unresolvable or non-string "main", a "main" or exports target outside the package directory, a duplicate package name, an untracked target, or ambiguous candidates${competing})` });
       else if (!r && res.ambiguous)
         v.push({ rule: "ambiguous-import", file: f, detail: `imports ${e.spec}, which has more than one tracked candidate (${res.ambiguous.join(", ")}); Bun's order differs by edge kind, so rename one` });
+      else if (!r && (bare.startsWith("@rhc/") || bare === "@rhc-object-store"))
+        v.push({ rule: "unresolved-workspace-import", file: f, detail: `imports ${e.spec} through the tsconfig alias ${bare.startsWith("@rhc/") ? `@rhc/* (${ALIAS_ROOT})` : "@rhc-object-store"}, which resolves to no single tracked source (a path outside ${ALIAS_ROOT}, or an untracked target)` });
     }
   }
   // 1b. module-load grants: only the hosted entries reach a grant module, and each imports its own first

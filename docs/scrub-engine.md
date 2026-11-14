@@ -678,8 +678,10 @@ its module-load grant, any other non-test file that reaches a module-load grant,
 wrangler `main` that is not a hosted entry, a production module importing a test preload, and a
 stale exemption, on a file the transpiler cannot parse, and on a workspace-package import that resolves
 to no single tracked source (an unknown `exports` shape, a folder mapping or pattern, an `exports` object
-without `.` for the package root, a non-string or unresolvable `main`, a duplicate package name,
-ambiguous candidates or an untracked target; fail closed), on a relative or alias import with more than
+without `.` for the package root, a non-string or unresolvable `main`, a `main`, subpath or `exports`
+target outside the package directory, a duplicate package name, ambiguous candidates or an untracked
+target; fail closed), on an `@rhc/` or `@rhc-object-store` alias import that resolves to nothing, such
+as `@rhc/../../x` (also `unresolved-workspace-import`), on a relative or alias import with more than
 one tracked candidate (`ambiguous-import`), and on a `packages/*/package.json` that is not a JSON object or repeats
 another package's name (`unparseable`; a duplicated name resolves nowhere). Each rule has a
 planted-violation test; the scan is a heuristic, not a proof.
@@ -694,7 +696,8 @@ import's extensionless candidates are tried in Bun 1.4.2's import order, but the
 tracked, so the differing orders of `require` / `import.meta.require` / `createRequire` (`.ts` before
 `.mts`, `.js` before `.mjs`, `index.ts` before `index.mts`), of workspace specifiers through
 `node_modules` (`.mjs` > `.mts` > `.js` > `.ts`) and of `main` (`.js` > `.ts` only) cannot pick a
-different file; a subpath that an `exports` map lacks falls back to the package directory (a safe
+different file; a tracked literal beside its tracked sibling (`./x.js` with `x.js` and `x.ts`) fails
+closed as ambiguous, although Bun 1.4.2 loads `x.js`; a subpath that an `exports` map lacks falls back to the package directory (a safe
 over-approximation); and a relative import of a `.tsx`, `.cts`, `.cjs` or
 `.jsx` file is not tracked and is a silent dead end (none exist today). The
 rehearsal's R6 module choice is pinned separately by `src/hoopdb/__tests__/schema-rehearsal-r6.test.ts`.
@@ -704,18 +707,29 @@ regex: every static import and re-export in any spacing or position (`import{}fr
 the module, only `import type` and all-`type` braces are erased), `import("x")` with comments,
 options or a trailing comma, `` import(`x`) `` and `require("x")`, plus `import.meta.require("x")`
 and `createRequire(...)("x")` from the TypeScript AST. A `?query` or `#hash` suffix is stripped
-before resolution through relative, `@rhc/*`, `@rhc-object-store` and workspace-package
+before resolution through relative, `@rhc/*` (normalised; a path leaving `packages/pipeline/src`
+fails closed), `@rhc-object-store` and workspace-package
 (`@96bulls/pipeline/...` and the other `packages/*` names, through their `exports` when present; an
 `exports` object without `.` fails closed for the package root, which Bun 1.4.2 refuses rather than
-falling back to `main`; only when `exports` is absent does the root load its string `main`: the literal
-path (a `.js` main also its `.ts` sibling; a `.mjs` main is not rewritten to `.mts`), then `main.js` /
-`main.ts` (never `.mts` / `.mjs`), then a directory's `index.js` / `index.ts`; an unresolved or
-non-string `main` fails closed where Bun would silently load the index, and no `main` loads the index;
-folder mappings such as `"./sub/"` and `*` patterns fail closed; a name that only shares a prefix, such
-as `@96bulls/pipeline-extra`, is third-party) specifiers. Candidates come in tiers (the literal path and
-its `.js` to `.ts` / `.mjs` to `.mts` sibling, then an extensionless path's `.mts`, `.ts`, `.mjs`, `.js`
-files, then the same for `/index`); the first tier with a tracked candidate decides and must hold
-exactly one, or the import fails closed.
+falling back to `main`; an explicit `exports` target gets only its literal path and, for `.js`, its
+`.ts` sibling, because Bun adds no extension or `/index` to it: an extensionless or directory target
+such as `"./a"`, `{ ".": "./a" }`, `"./lib"` or `"./"` throws "Cannot find module" in Bun, and the scan
+resolves it to nothing and fails closed; only when `exports` is absent does the root load its string
+`main`: the literal path, then `main.js` / `main.ts` (never `.mts` / `.mjs`), then the `.ts` sibling
+of a `.js` main (a `.mjs` main is not rewritten to `.mts`), then `index.js` / `index.ts`; an
+unresolved or non-string `main`, or one outside the package directory such as `../other/a.ts`, fails
+closed where Bun would silently load the index, and no `main` loads the index; folder mappings such
+as `"./sub/"` and `*` patterns fail closed; a name that only shares a prefix, such as
+`@96bulls/pipeline-extra`, is third-party) specifiers. Candidates come in tiers, in the order Bun 1.4.2
+tries them for import, require, an alias and a workspace subpath: the literal path, then
+`${path}.mts` / `.ts` / `.mjs` / `.js`, then the literal's `.js` to `.ts` / `.mjs` to `.mts` sibling,
+then `${path}/index.<ext>` (`./x.ts` beside `x.ts.ts` loads `x.ts`; `./x` beside `x.ts` and
+`x/index.ts` loads `x.ts`; `./x.js` beside `x.ts` and `x.js.ts` loads `x.js.ts`; `./x.js` beside `x.ts`
+and `x.js/index.ts` loads `x.ts`). A directory form, a path or `main` ending in `/` (or, for a relative
+specifier, whose last segment is `.` or `..`, such as `.` or `./x/.`), skips the `${path}.<ext>` tier:
+`./dir/` beside `dir.ts` and `dir/index.ts` loads `dir/index.ts`, and main `./lib/` with only `lib.ts`
+fails closed (Bun loads the package index). The first tier with a tracked candidate decides and must
+hold exactly one, or the import fails closed.
 `hosted-grant-first` reads the TypeScript AST: after comments, a shebang and a directive prologue,
 the hosted entry's first statement must be the static bare import of its grant with no import
 attributes (`with { type: "text" }` or `assert` loads it as data and never runs the grant), and it

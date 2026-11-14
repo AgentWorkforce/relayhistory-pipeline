@@ -8,8 +8,10 @@
  * entries, workspace `exports` (an unknown shape, a folder mapping or a top-level condition object is
  * reported), package `main` (resolved like Bun 1.4.2: .js / .ts only, applied only with no `exports`),
  * malformed and duplicate package.json files, fail-closed ambiguity (two tracked candidates of one tier
- * are `ambiguous-import`, or rule 4 for a workspace specifier), rule 4 on every edge kind and in tests,
- * and the exemption-reason checks (M5b bypass, intermediate-only, extensionless paths). Known limits are
+ * are `ambiguous-import`, or rule 4 for a workspace specifier), Bun's tier order (literal, extension,
+ * .js -> .ts sibling, /index; directory forms skip the extension tier; exports targets get no extension
+ * or index), `@rhc/` normalisation and escapes, main / exports targets outside the package, rule 4 on
+ * every edge kind and in tests, and the exemption-reason checks (M5b bypass, intermediate-only, extensionless paths). Known limits are
  * listed in the scan header.
  */
 import { describe, expect, test } from "bun:test";
@@ -672,5 +674,117 @@ describe("scrub-default-scan", () => {
     const js = plantPkg({}, { [`${PKG}/a.js`]: fwd(`${PKG}/a.js`), [f]: useScrub("@planted/pkg/a") });
     expect(resolveSpec(js, f, "@planted/pkg/a")).toBe(`${PKG}/a.js`);
     expect(rules(js)).toStrictEqual([`entry-without-init:${f}`]);
+  });
+
+  // Adversarial delta 6: Bun 1.4.2 tries literal, ${base}.<ext>, the .js -> .ts sibling, then /index;
+  // a directory form skips the extension tier; @rhc/ is normalised; main / exports stay in the package.
+  test("the .js -> .ts / .mjs -> .mts sibling comes after the extension tier and before /index", () => {
+    const f = "scripts/planted-sib.ts";
+    const d = "scripts/planted-sib-dep";
+    const two = (a: string, b: string) => plant(a, INERT_DEP, plant(b, INERT_DEP));
+    // ./x.js beside x.ts and x.js.ts: Bun loads x.js.ts (import and require alike)
+    expect(resolveSpec(two(`${d}.ts`, `${d}.js.ts`), f, "./planted-sib-dep.js")).toBe(`${d}.js.ts`);
+    // ./x.mjs beside x.mts and x.mjs.ts: Bun loads x.mjs.ts
+    expect(resolveSpec(two(`${d}.mts`, `${d}.mjs.ts`), f, "./planted-sib-dep.mjs")).toBe(`${d}.mjs.ts`);
+    // ./x.js beside x.ts and x.js/index.ts: the sibling beats /index, Bun loads x.ts
+    expect(resolveSpec(two(`${d}.ts`, `${d}.js/index.ts`), f, "./planted-sib-dep.js")).toBe(`${d}.ts`);
+    // @rhc/x.js beside x.js.ts and x.ts: Bun loads x.js.ts
+    const a = "packages/pipeline/src/planted-sib-dep";
+    expect(resolveSpec(two(`${a}.js.ts`, `${a}.ts`), f, "@rhc/planted-sib-dep.js")).toBe(`${a}.js.ts`);
+    // the scan follows the file Bun loads: the entry reaches the seam only through x.js.ts
+    const files = plant(f, useScrub("./planted-sib-dep.js"), plant(`${d}.js.ts`, fwd(`${d}.js.ts`), plant(`${d}.ts`, INERT_DEP)));
+    expect(rules(files)).toStrictEqual([`entry-without-init:${f}`]);
+  });
+
+  test("main ./a.js beside a.js.ts and a.ts loads a.js.ts; exports ./a.js beside the same loads a.ts", () => {
+    const f = "scripts/planted-main-sib.ts";
+    const extra = { [`${PKG}/a.js.ts`]: INERT_DEP, [`${PKG}/a.ts`]: INERT_DEP };
+    expect(resolveSpec(plantPkg({ main: "./a.js" }, extra), f, "@planted/pkg")).toBe(`${PKG}/a.js.ts`);
+    // an exports target gets no extension tier: literal, then the .ts sibling
+    expect(resolveSpec(plantPkg({ exports: { ".": "./a.js" } }, extra), f, "@planted/pkg")).toBe(`${PKG}/a.ts`);
+  });
+
+  test("main ./lib beside lib.ts and lib/index.ts loads lib.ts: the file tier beats the index tier (N15)", () => {
+    const f = "scripts/planted-main-n15.ts";
+    const files = plantPkg({ main: "./lib" }, { [`${PKG}/lib.ts`]: fwd(`${PKG}/lib.ts`), [`${PKG}/lib/index.ts`]: INERT_DEP, [f]: useScrub("@planted/pkg") });
+    expect(resolveSpec(files, f, "@planted/pkg")).toBe(`${PKG}/lib.ts`);
+    expect(rules(files)).toStrictEqual([`entry-without-init:${f}`]);
+  });
+
+  test("a directory form (./dir/, ., ./, ../r/) loads the index, never a sibling dir.ts", () => {
+    const f = "scripts/planted-dir.ts";
+    const files = plant("scripts/planted-dir-dep.ts", INERT_DEP, plant("scripts/planted-dir-dep/index.ts", fwd("scripts/planted-dir-dep/index.ts")));
+    expect(resolveSpec(files, f, "./planted-dir-dep/")).toBe("scripts/planted-dir-dep/index.ts");
+    expect(rules(plant(f, useScrub("./planted-dir-dep/"), files))).toStrictEqual([`entry-without-init:${f}`]);
+    // `.`, `./` and `../r/` from inside r/ with r.ts beside r/index.ts load r/index.ts
+    const r = plant("scripts/planted-r.ts", INERT_DEP, plant("scripts/planted-r/index.ts", INERT_DEP));
+    for (const spec of [".", "./", "../planted-r/"]) expect(resolveSpec(r, "scripts/planted-r/main.ts", spec), spec).toBe("scripts/planted-r/index.ts");
+    // `./x/.` is a directory form too; `./dir/` with only dir.ts resolves to nothing (Bun throws)
+    expect(resolveSpec(files, f, "./planted-dir-dep/.")).toBe("scripts/planted-dir-dep/index.ts");
+    expect(resolveSpec(plant("scripts/planted-dir-only.ts", INERT_DEP), f, "./planted-dir-only/")).toBeUndefined();
+    // the directory form skips only the extension tier: ./x.js/ beside x.ts and x.js/index.ts loads x.ts
+    expect(resolveSpec(plant("scripts/planted-dir-js.ts", INERT_DEP, plant("scripts/planted-dir-js.js/index.ts", INERT_DEP)), f, "./planted-dir-js.js/")).toBe("scripts/planted-dir-js.ts");
+    // a workspace subpath in directory form
+    expect(resolveSpec(plantPkg({}, { [`${PKG}/lib.ts`]: INERT_DEP, [`${PKG}/lib/index.ts`]: INERT_DEP }), f, "@planted/pkg/lib/")).toBe(`${PKG}/lib/index.ts`);
+  });
+
+  test("main ./lib/ loads lib/index.ts, not lib.ts; with only lib.ts it fails closed (rule 4)", () => {
+    const f = "scripts/planted-main-slash.ts";
+    const both = plantPkg({ main: "./lib/" }, { [`${PKG}/lib.ts`]: INERT_DEP, [`${PKG}/lib/index.ts`]: fwd(`${PKG}/lib/index.ts`), [f]: useScrub("@planted/pkg") });
+    expect(resolveSpec(both, f, "@planted/pkg")).toBe(`${PKG}/lib/index.ts`);
+    expect(rules(both)).toStrictEqual([`entry-without-init:${f}`]);
+    const only = plantPkg({ main: "./lib/" }, { [`${PKG}/lib.ts`]: fwd(`${PKG}/lib.ts`), [`${PKG}/index.ts`]: INERT_DEP, [f]: useScrub("@planted/pkg") });
+    expect(resolveSpec(only, f, "@planted/pkg")).toBeUndefined();
+    expect(rules(only)).toStrictEqual([`unresolved-workspace-import:${f}`]);
+    // main ./lib/. is normalised to ./lib (Bun loads lib.ts)
+    expect(resolveSpec(plantPkg({ main: "./lib/." }, { [`${PKG}/lib.ts`]: INERT_DEP, [`${PKG}/lib/index.ts`]: INERT_DEP }), f, "@planted/pkg")).toBe(`${PKG}/lib.ts`);
+  });
+
+  test("@rhc/ paths are normalised: @rhc/dir/, @rhc/x/../y and @rhc/./y resolve like Bun", () => {
+    const f = "scripts/planted-alias.ts";
+    const A = "packages/pipeline/src/planted-alias";
+    const files = plant(`${A}-dir.ts`, INERT_DEP, plant(`${A}-dir/index.ts`, fwd(`${A}-dir/index.ts`), plant(`${A}-y.ts`, fwd(`${A}-y.ts`))));
+    expect(resolveSpec(files, f, "@rhc/planted-alias-dir/")).toBe(`${A}-dir/index.ts`);
+    expect(resolveSpec(files, f, "@rhc/planted-alias-dir/../planted-alias-y")).toBe(`${A}-y.ts`);
+    expect(resolveSpec(files, f, "@rhc/./planted-alias-y")).toBe(`${A}-y.ts`);
+    // only a trailing slash is a directory form for an alias: @rhc/x/. loads x.ts
+    expect(resolveSpec(files, f, "@rhc/planted-alias-dir/.")).toBe(`${A}-dir.ts`);
+    for (const spec of ["@rhc/planted-alias-dir/", "@rhc/planted-alias-dir/../planted-alias-y", "@rhc/./planted-alias-y"]) expect(rules(plant(f, useScrub(spec), files)), spec).toStrictEqual([`entry-without-init:${f}`]);
+  });
+
+  test("an @rhc/ import leaving packages/pipeline/src, or resolving to nothing, fails closed (rule 4)", () => {
+    const f = "scripts/planted-alias-escape.ts";
+    // a real file outside the alias root: Bun throws, the scan must not follow it nor stay silent
+    const files = plant("scripts/planted-alias-target.ts", fwd("scripts/planted-alias-target.ts"));
+    for (const spec of ["@rhc/../../../scripts/planted-alias-target", "@rhc/planted-alias-missing"]) {
+      const withEntry = plant(f, useScrub(spec), files);
+      expect(resolveSpec(withEntry, f, spec), spec).toBeUndefined();
+      const v = scan(withEntry);
+      expect(v.map((x) => `${x.rule}:${x.file}`), spec).toStrictEqual([`unresolved-workspace-import:${f}`]);
+      expect(v[0]!.detail, spec).toContain("@rhc/* (packages/pipeline/src)");
+    }
+  });
+
+  test("a main or exports target outside the package directory fails closed (rule 4)", () => {
+    const f = "scripts/planted-escape.ts";
+    const other = "packages/planted-other/a.ts";
+    for (const fields of [{ main: "../planted-other/a.ts" }, { exports: "../planted-other/a.ts" }, { exports: { ".": "../planted-other/a.ts" } }]) {
+      const files = plantPkg(fields, { [other]: fwd(other), [`${PKG}/index.ts`]: INERT_DEP, [f]: useScrub("@planted/pkg") });
+      expect(resolveSpec(files, f, "@planted/pkg"), JSON.stringify(fields)).toBeUndefined();
+      expect(rules(files), JSON.stringify(fields)).toStrictEqual([`unresolved-workspace-import:${f}`]);
+    }
+    // a workspace subpath leaving the package directory also fails closed
+    const sub = plantPkg({}, { [other]: fwd(other), [f]: useScrub("@planted/pkg/../planted-other/a.ts") });
+    expect(resolveSpec(sub, f, "@planted/pkg/../planted-other/a.ts")).toBeUndefined();
+    expect(rules(sub)).toStrictEqual([`unresolved-workspace-import:${f}`]);
+  });
+
+  test("an extensionless or directory exports target is a phantom route Bun refuses: it fails closed (rule 4)", () => {
+    const f = "scripts/planted-exports-ext.ts";
+    for (const exports of ["./a", { ".": "./a" }, "./lib", "./", { ".": "./a.mjs" }]) {
+      const files = plantPkg({ exports }, { [`${PKG}/a.ts`]: fwd(`${PKG}/a.ts`), [`${PKG}/a.mts`]: INERT_DEP, [`${PKG}/lib/index.ts`]: fwd(`${PKG}/lib/index.ts`), [`${PKG}/index.ts`]: fwd(`${PKG}/index.ts`), [f]: useScrub("@planted/pkg") });
+      expect(resolveSpec(files, f, "@planted/pkg"), JSON.stringify(exports)).toBeUndefined();
+      expect(rules(files), JSON.stringify(exports)).toStrictEqual([`unresolved-workspace-import:${f}`]);
+    }
   });
 });
