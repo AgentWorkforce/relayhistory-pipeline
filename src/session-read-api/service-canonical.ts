@@ -53,7 +53,7 @@
  *                             reads above (canonical-projection.ts streamManifestRecords, canonical-transcript.ts;
  *                             bounded-prefetch.ts), a plain whole number in 1..16. Unset or empty: 1, the sequential
  *                             read (byte-identical). Every per-chunk check (byte cap, stored/raw digest, scrub marker,
- *                             record counts, scope bounds, abort, source-generation re-check) still runs in chunk order;
+ *                             record counts, scope bounds, abort) still runs in chunk order;
  *                             at most N bodies (each capped at its declared stored_bytes) are held at once. A session
  *                             of ~100 chunks at ~30 ms per object (GCS) needs ~8 to fit the 3000 ms deadline.
  *                             Malformed or out of range fails startup, naming the variable (never clamped). Read only
