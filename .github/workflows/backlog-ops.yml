@@ -11,7 +11,8 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && format('backlog ops {0
 # environment SECRET BACKLOG_OPS_ORGS (a secret, not a variable, so this public repository's logs mask it): unset or
 # empty runs every org; an execute refuses unless its bound runs carry the same scope (src/session-ingest/backlog-ops.ts).
 # presence-dry is DRY ONLY (no presence-execute exists or is accepted): a counts-only look at ONE session for support
-# diagnosis, in the dry environment with the read-only role. Its session id is the dry environment's SECRET
+# diagnosis, in the dry environment with the dry AWS role; its DB login is the migration owner, read-only only by
+# default_transaction_read_only=on and a READ ONLY transaction. Its session id is the dry environment's SECRET
 # SESSION_PRESENCE_SESSION, set by the owner before the dispatch and removed after it, passed only to the tool step
 # and only for this mode; it never reaches argv, a log line or the receipt (docs/backlog-ops-workflow.md).
 # Push and pull_request run only the credential-free tests (no secrets, no environment).

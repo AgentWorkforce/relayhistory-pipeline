@@ -102,10 +102,10 @@ group, so a schema apply or rebind queues behind it. Use `max_objects` to keep d
 ## Credentials
 
 The **database** login is the environment secret `SUPABASE_MIGRATION_OWNER_URL`, the same one the schema release
-uses. It is passed only to the backfill and export modes; the drain needs no database. It is checked against the
-pinned release connection and handed to the tool in one normal form (`sslmode=verify-full`). The tools pin TLS to
-the Supabase CA themselves. The URL reaches the tool only as `{"dbUrl": …}` on its
-stdin pipe. Both tools run every page in a READ ONLY transaction.
+uses. It is passed only to the backfill, export and `presence-dry` modes; the drain needs no database. It is checked
+against the pinned release connection and handed to the tool in one normal form (`sslmode=verify-full`). The tools
+pin TLS to the Supabase CA themselves. The URL reaches the tool only on its stdin pipe, as `{"dbUrl": …}` (for
+`presence-dry`, `{"dbUrl": …, "session": …}`). Every tool runs every page in a READ ONLY transaction.
 
 **AWS** access is a GitHub OIDC token, exchanged inside the credential step for a role session through STS
 `AssumeRoleWithWebIdentity`, for at most 6 hours; the step refuses before the tool starts unless the session has at
@@ -133,25 +133,43 @@ only, in one `REPEATABLE READ READ ONLY` transaction that always ends in `ROLLBA
 object and binds no other run. The tool is `scripts/session-presence.ts` (`src/session-ingest/session-presence.ts`).
 
 **Inputs.** The `presence-dry` mode, the exact `main` sha, no `confirmation`, and no bound run ids. It runs in the dry
-environment `session-schema-production` with the read-only role and `SUPABASE_MIGRATION_OWNER_URL`. All gates above
-apply unchanged. `BACKLOG_OPS_ORGS`, if set, scopes every count to those orgs (receipt `scope` `orgs_<n>`, else `all`).
+environment `session-schema-production` with the dry (read-only) AWS role, which it does not use (it reads no S3).
+The **database** login is `SUPABASE_MIGRATION_OWNER_URL`, the migration owner, not a read-only database role. The
+run is read-only only because the tool's connection sets `default_transaction_read_only=on` (beside the owner
+config's `idle_in_transaction_session_timeout`) and every count runs in a `REPEATABLE READ READ ONLY` transaction
+that checks `SHOW transaction_read_only` and always rolls back. All gates above apply unchanged. `BACKLOG_OPS_ORGS`,
+if set, scopes every count to those orgs (receipt `scope` `orgs_<n>`, else `all`).
+
+**Scope it where you can.** Unscoped runs (no `BACKLOG_OPS_ORGS`) are allowed, but most counts are then sequential
+scans of large tenant-first tables (ownership, claim sessions, lazy slots, revisions, heads, generations and
+`session_index`) on the production primary. Set `BACKLOG_OPS_ORGS` to the session's org whenever you know it, so the
+counts use their org-leading indexes.
+
+**Time bounds.** Each statement has a 60 s `statement_timeout` and a 5 s `lock_timeout` (a count that waits on DDL
+refuses the run with `sqlstate_55p03`). The whole transaction has a 180 s budget (`--total-budget-ms 180000`): no
+statement starts with less than 1 s left, and each statement's timeout is lowered to what is left, so the
+`REPEATABLE READ` snapshot is held for about 3 minutes at most. Both values are fixed in the workflow's argv
+(`BACKLOG_OPS_PRESENCE_TIMEOUT`).
 
 **The session id is a secret.** The owner sets the environment **secret** `SESSION_PRESENCE_SESSION` on
 `session-schema-production` immediately before the dispatch and **removes it immediately after** the run. The value
 is one lowercase UUID or a `[A-Za-z0-9_-]{8,128}` token. The workflow passes it only to the credential step and only
 for `presence-dry`. That step hands it to the tool on its stdin pipe beside the database URL. It never goes into argv,
-a log line or the receipt. The refusals are fixed codes and never contain the value:
+a log line or the receipt. The tool's own refusals pass through only as `session_presence_*`, `backlog_ops_*` or
+`sqlstate_<code>`; any other error is `internal_error`. The refusals are fixed codes and never contain the value:
 
 - `backlog_ops_presence_session_missing`: the secret is unset or empty.
 - `backlog_ops_presence_session_invalid`: any other shape.
 - `backlog_ops_presence_session_unexpected`: another mode saw the secret non-empty, so remove it after the run.
+  This is defense in depth: the workflow expression already blanks the secret for every other mode, so it fires only
+  if that expression is changed or bypassed.
 - `backlog_ops_presence_dry_only`: the dispatch named `presence-execute`, or an execute path reached the presence
   tool.
 - `backlog_ops_bound_presence_receipt`: a presence receipt was bound as a dry, backfill or export run.
 
-**Receipt.** Every value is a count, `null` when that count hit the 120 s statement timeout, or a fixed code. There
-are no ids, keys, URLs, digests or content. With `BACKLOG_OPS_ORGS` unset, most counts scan their table (the tables
-are keyed tenant-first). Each one is bounded by the timeout.
+**Receipt.** Every value is a count, `null` when that count hit the 60 s statement timeout or the 180 s budget, or a
+fixed code. There are no ids, keys, URLs, digests or content. With `BACKLOG_OPS_ORGS` unset, most counts scan their
+table (the tables are keyed tenant-first). Each one is bounded by the timeout and the budget.
 
 | Field | Counts |
 | --- | --- |
@@ -166,16 +184,20 @@ are keyed tenant-first). Each one is bounded by the timeout.
 | `dispositions` | `heads_building`, `heads_live`, `heads_retired`: heads per state (the fixed `state` enum) |
 | `published_objects` | live objects of live publication generations |
 | `canonical_pointers`, `canonical_pointers_live` | `session_index` pointers the read API looks for first, and the undeleted ones |
-| `generation_stable` | whether the publication marker (heads and canonical pointers of the session) was identical when read first and last |
+| `generation_stable` | whether the publication marker (heads and canonical pointers of the session) was identical when read first and last. This is a snapshot / pooler-consistency check, not a change detector: two reads in one `REPEATABLE READ` transaction see the same snapshot, so they can differ only if the pooler did not hold the transaction on one backend. A publish during the run does not change it |
 | `complete`, `incomplete_reason` | `true` and `none`, or `false` with one of the codes below |
 
 **`incomplete_reason` codes.** When more than one applies, the first in this list is reported. The counts are still
 emitted.
 
-1. `generation_unstable`: the first and last marker reads differed.
-2. `generation_unobserved`: a marker read timed out.
-3. `multi_ownership`: more than one ownership row. Read the counts with care, because they span every owner.
-4. `count_timeout`: some count is `null`.
+1. `generation_unobserved`: a marker read timed out, or the budget ran out before the last one.
+2. `generation_unstable`: the first and last marker reads differed, so the counts did not come from one snapshot
+   (the pooler did not hold the transaction on one backend). Rerun; do not read the counts.
+3. `multi_ownership`: more than one ownership row, or the session id appears under more than one org in the tables
+   counted. Read the counts with care, because they span every owner. Scope with `BACKLOG_OPS_ORGS` to split them.
+4. `count_timeout`: some count hit the 60 s statement timeout and is `null`.
+5. `budget_exhausted`: the 180 s budget ran out, so the remaining counts were skipped or cut short and are `null`.
+   Scope the run with `BACKLOG_OPS_ORGS`.
 
 **Reading it against "No conversation recorded yet":**
 

@@ -451,6 +451,56 @@ test("gate: bound runs must be this workflow, this sha, success, attempt 1, the 
 
 // ---- workflow shape ----
 
+test("presence argv is pinned exactly: dry run, the 60 s statement timeout, the 180 s budget, then the scope's orgs", () => {
+  const t = backlogOpsTarget(target);
+  const d = backlogOpsDispatch(dispatchEnv("presence-dry"), true);
+  expect(backlogOpsToolArgs(d, t)).toEqual({ script: "scripts/session-presence.ts",
+    args: ["--dry-run", "--statement-timeout-ms", "60000", "--total-budget-ms", "180000"], needsDb: true });
+  const o1 = "00000000-0000-4000-8000-000000000001", o2 = "00000000-0000-4000-8000-000000000002";
+  expect(backlogOpsToolArgs(d, t, { orgs: [o1, o2], id: "x" })).toEqual({ script: "scripts/session-presence.ts",
+    args: ["--dry-run", "--statement-timeout-ms", "60000", "--total-budget-ms", "180000", "--org", o1, "--org", o2], needsDb: true });
+  expect(backlogOpsRole(d, t)).toBe(t.dryRoleArn);
+});
+
+test("workflow: the proof job runs the presence tests, and every presence file is in both path filters", () => {
+  const yml = readFileSync(fileURLToPath(new URL("../../../" + BACKLOG_OPS_WORKFLOW, import.meta.url)), "utf8");
+  const lines = yml.split("\n");
+  /** The list items directly under `<indent><key>:` after the line `<parent>` (comments skipped). */
+  const listAfter = (parent: string, key: string) => {
+    const from = lines.indexOf(parent);
+    expect(from).toBeGreaterThanOrEqual(0);
+    const k = lines.indexOf(key, from);
+    expect(k).toBeGreaterThan(from);
+    const items: string[] = [];
+    for (const l of lines.slice(k + 1)) {
+      if (l.trimStart().startsWith("#")) continue;
+      const m = /^      - (\S+)$/u.exec(l);
+      if (!m) break;
+      items.push(m[1]!);
+    }
+    return items;
+  };
+  const presenceFiles = ["scripts/session-presence.ts", "src/session-ingest/session-presence.ts", "src/session-ingest/__tests__/session-presence*"];
+  for (const parent of ["  pull_request:", "  push:"]) {
+    const paths = listAfter(parent, "    paths:");
+    expect(paths).toContain(BACKLOG_OPS_WORKFLOW);
+    for (const f of presenceFiles) expect(paths).toContain(f);
+  }
+  // The proof job (push / pull_request only) runs both presence test files in a step, uncommented.
+  const start = lines.indexOf("  proof:"), end = lines.findIndex((l, i) => i > start && /^  [a-z#]/u.test(l));
+  expect(start).toBeGreaterThanOrEqual(0);
+  const proof = lines.slice(start, end).filter((l) => !l.trimStart().startsWith("#"));
+  expect(proof).toContain("    if: github.event_name != 'workflow_dispatch'");
+  const step = proof.findIndex((l) => l === "      - name: Session presence counts and no-id-leak tests (in-process PGlite, no credentials)");
+  expect(step).toBeGreaterThan(0);
+  expect(proof.slice(step + 1, step + 4)).toEqual([
+    "        run: |",
+    "          bun test --timeout 300000 ./src/session-ingest/__tests__/session-presence.test.ts",
+    "          bun test --timeout 300000 ./src/session-ingest/__tests__/session-presence.pglite.test.ts",
+  ]);
+  expect(proof).toContain("        run: bun test --timeout 120000 ./src/session-ingest/__tests__/backlog-ops.test.ts");
+});
+
 test("workflow: dispatch inputs, gates, one credential step, OIDC, protected vars, counts-only receipt, one op at a time", () => {
   const yml = readFileSync(fileURLToPath(new URL("../../../" + BACKLOG_OPS_WORKFLOW, import.meta.url)), "utf8");
   const code_ = yml.split("\n").filter((l) => !l.trimStart().startsWith("#")).join("\n");
