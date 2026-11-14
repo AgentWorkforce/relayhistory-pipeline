@@ -39,7 +39,8 @@ test('built bundle embeds schema assets and boots with no supabase/ tree',()=>{
   expect(pin.wasm_sha256).toMatch(/^[0-9a-f]{64}$/);
   expect(bundle).not.toContain(pin.wasm_sha256); // nor the pin
   // lambda.ts (imported for helpers) declares its grant at handler entry only, which this entry
-  // never calls: a load-time grant would turn the run below into TypeScript and fail as worker_error.
+  // never calls; the module-load grant lives in lambda-entry.ts, which this entry never imports.
+  // A grant here would turn the run below into TypeScript and fail as worker_error.
   const on=run(['node',out],dir,{PATH,SESSION_LARGE_READ_WORKER_ENABLED:'1'});
   expect(on.code).toBe(1);expect(on.out).toBe('');
   expect(on.err).not.toContain('ENOENT');

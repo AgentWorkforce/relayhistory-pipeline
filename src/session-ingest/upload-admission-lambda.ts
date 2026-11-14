@@ -20,6 +20,7 @@
  * queue, mapping, notification and IAM. A factory that returns `witnessKey` overrides UPLOAD_WITNESS_KEY
  * from the environment (hosted never puts the key in env or state).
  */
+import "@rhc/lib/scrub-engine/hosted-lambda-grant.ts"; // FIRST import: module-load TS grant (docs/scrub-engine.md "Default flip")
 import { declareScrubTsCapability } from "@rhc/lib/scrub-engine/ts-capability.ts";
 import { promoteUpload, uploadDirectConfig, UPLOAD_WITNESS_KEY_VAR, type PromoteResult, type PromoteUploadDeps, type UploadDirectConfig } from "./upload-admission.ts";
 

@@ -15,6 +15,7 @@
  *   EXTRACTION_MODEL / EXTRACTION_API_URL  vars; defaults gpt-4o-mini / OpenAI chat completions
  * Never logs content: codes and outcomes only.
  */
+import "../../pipeline/src/lib/scrub-engine/hosted-worker-grant.ts"; // FIRST import: module-load TS grant (docs/scrub-engine.md "Default flip")
 import pg from "pg";
 import { computeStatsHash } from "../../../src/session-read-api/digest-query.ts";
 import {
@@ -25,6 +26,7 @@ import {
   type NarrativeRow,
 } from "../../../src/session-read-api/digest-narrative.ts";
 import { logLine } from "../../../src/shared/log.ts";
+import { declareScrubTsCapability } from "../../pipeline/src/lib/scrub-engine/ts-capability.ts";
 
 export interface NarrativeEnv {
   NARRATIVE_DB?: Hyperdrive;
@@ -80,6 +82,7 @@ export async function handleNarrative(request: Request, env: NarrativeEnv, ctx: 
 
 export default {
   fetch(request, env, ctx) {
+    declareScrubTsCapability("hosted-worker"); // idempotent; the module-load grant above is the primary one
     return handleNarrative(request, env, ctx);
   },
 } satisfies ExportedHandler<NarrativeEnv>;

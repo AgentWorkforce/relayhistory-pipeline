@@ -876,8 +876,9 @@ export function createPipelineLambdaHandler(options: { search?: SearchCompositio
     return pending;
   });
   return async (event: PipelineLambdaEvent): Promise<BatchResponse | { ok: boolean }> => {
-    // Hosted Lambda zip (index.mjs only, no relayscrubber artifacts): TypeScript scrub. Declared
-    // at handler entry, never module load: self-host services import this module for helpers.
+    // Hosted Lambda zip (index.mjs only, no relayscrubber artifacts): TypeScript scrub. Self-host
+    // services import this module for helpers, so it carries no module-load grant; the deployed
+    // lambda-entry.ts and the lambda-artifact wrapper grant at module load, this repeats it.
     declareScrubTsCapability("hosted-lambda");
     const invoke = (input: PipelineLambdaEvent) => dispatchLambdaEvent(input, ready);
     if (!options.runtime) return invoke(event);

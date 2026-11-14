@@ -73,6 +73,7 @@
  * Until the S3 key, the KMS key ARN and Hyperdrive are present, every request
  * is 503 `not_configured` and nothing is written.
  */
+import "@rhc/lib/scrub-engine/hosted-worker-grant.ts"; // FIRST import: module-load TS grant (docs/scrub-engine.md "Default flip")
 import { uploadConsentEnforcement, type UploadConsentEnforcement } from "./upload-consent.ts";
 import { sqlUploadConsentStore } from "./upload-consent-sql.ts";
 import pg from "pg";
@@ -576,9 +577,10 @@ const readWorkerBindgenArtifact: ReadBindgenArtifact = async () => {
  * as a code and the caller refuses the work; nothing is scrubbed by another engine.
  *
  * TS grant (docs/scrub-engine.md "Default flip"): the hosted Worker ships no relayscrubber
- * artifacts, so it declares the "hosted-worker" capability here, at handler entry (fetch and
- * queue both call this first), never at module load: self-host Node services import this
- * module for helpers and must keep the wasm-bindgen default.
+ * artifacts, so it holds the "hosted-worker" capability from module load (its first import,
+ * hosted-worker-grant.ts) and declares it again here, at handler entry (fetch and queue both
+ * call this first). Only hosted entries may import this module (scripts/scrub-default-scan.ts
+ * rule "hosted-grant-reach"), so no self-host service gains the TS engine through it.
  */
 async function scrubEngineReady(env: IngestWorkerEnv): Promise<boolean> {
   declareScrubTsCapability("hosted-worker");

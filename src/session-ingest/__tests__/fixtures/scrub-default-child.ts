@@ -130,14 +130,17 @@ switch (scenario) {
     break;
   }
   case "hosted": {
-    // Importing the hosted modules (as self-host services do for helpers) grants nothing.
-    const gc = await import("../../buffered-gc-lambda.ts");
-    const rearm = await import("../../rearm-sweeper-lambda.ts");
+    // The two handler modules that self-host services import for helpers grant nothing at import;
+    // their deployed entries are the lambda-entry.ts wrappers (scrub-entry-grant-child covers those).
     await import("../../../session-pipeline/lambda.ts");
     await import("../../../session-read-api/lambda.ts");
+    out.grantsAfterHelperImport = scrubTsCapabilities();
+    // Hosted-only Lambda modules grant at module load through their first import.
+    const gc = await import("../../buffered-gc-lambda.ts");
+    const rearm = await import("../../rearm-sweeper-lambda.ts");
     await import("../../upload-admission-lambda.ts");
     out.grantsAfterImport = scrubTsCapabilities();
-    // Handler entry declares the hosted grant (both flags off: the handlers return at once).
+    // The handler-entry grant repeats it idempotently (both flags off: the handlers return at once).
     out.gc = await gc.handler({});
     out.rearm = await rearm.handler({});
     out.grantsAfterHandler = scrubTsCapabilities();

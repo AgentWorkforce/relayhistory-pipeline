@@ -8,6 +8,7 @@
  * ones before it. The handler never accepts factories, credentials or settings from its invocation payload.
  * One EMF line per pass: counts only.
  */
+import "@rhc/lib/scrub-engine/hosted-lambda-grant.ts"; // FIRST import: module-load TS grant (docs/scrub-engine.md "Default flip")
 import { declareScrubTsCapability } from "@rhc/lib/scrub-engine/ts-capability.ts";
 import { REARM_ENABLE_FLAG, rearmSweeperEnabled } from "./rearm-sweeper-main.ts";
 

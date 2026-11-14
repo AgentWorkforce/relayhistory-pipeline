@@ -75,6 +75,8 @@ checked-in pin exactly (`bindgen_pin_not_exact` otherwise; a reordered or edited
 Every self-host `SERVICE=` entry point, and every Node tool, proof, migration or ops script that
 scrubs or seals, calls `await initScrubEngine()` before it serves or runs its job
 (`src/shared/worker.ts` `runWorker` covers the indexer, referee, bob-costas and session-brief).
+`src/cli/main.ts` initialises per subcommand, in the subcommands that scrub or seal (`seed` and
+`smoke`), not once at startup.
 `scripts/scrub-default-scan.ts` enforces this (see "Default flip"). Under the default this
 verifies the wasm-bindgen pin and vendored bytes; with `wasm` the raw-ABI pin and module. On
 failure the process exits non-zero rather than start. The ingest server's `/readyz` also requires
@@ -600,21 +602,35 @@ instance (the second call is a no-op returning it).
 **The TS grant** (`packages/pipeline/src/lib/scrub-engine/ts-capability.ts`): `declareScrubTsCapability(kind)`
 with kind `hosted-worker`, `hosted-lambda` or `test`. It is not environment-driven, is not
 re-exported from the seam or any package index, and `resetScrubEngineForTests()` clears it.
-`predicate-hook.ts` agrees with the seam before it loads (no grant: the identifier predicate fails).
-The only TS-capable entry points are these artifact-incapable hosted handlers (they ship no
-relayscrubber bytes), each declaring at handler entry, never at module load, because self-host Node
-services import the same modules for helpers:
+`predicate-hook.ts` agrees with the seam before it loads (see "Import cycle").
+The only TS-capable entry points are these artifact-incapable hosted entries (they ship no
+relayscrubber bytes). Each declares the grant **at module load**: its first import is the bare
+side-effect module `packages/pipeline/src/lib/scrub-engine/hosted-lambda-grant.ts` or
+`hosted-worker-grant.ts`, so the grant exists before any other module of its graph evaluates and a
+logger or helper that reaches the seam early (for example `scrubTextForLog`) resolves the unset
+default to `ts` instead of latching wasm-bindgen. The handler-entry declarations stay as an
+idempotent second call. The pipeline and read API `lambda.ts` modules cannot carry the module-load
+grant, because self-host Node services import them for helpers (`consumer-service.ts`,
+`large-read-main.ts`, `semantic-copy-main.ts`, `server.ts`, ...); those Lambdas therefore deploy thin
+`lambda-entry.ts` wrappers (`stacks/aws` `main`) that import the grant and re-export `handler`.
 
-| Entry point | Grant (file:line) |
-|---|---|
-| Hosted ingest Worker `fetch` / `queue` (via `scrubEngineReady`) | `src/session-ingest/worker.ts:584` (`hosted-worker`) |
-| Hosted session-read Worker `fetch` | `packages/session-read-worker/src/index.ts:638` (`hosted-worker`) |
-| Read API Lambda handler | `src/session-read-api/lambda.ts:742` (`hosted-lambda`) |
-| Session pipeline Lambda handler (incl. bob-costas / session-brief stages) | `src/session-pipeline/lambda.ts:881` (`hosted-lambda`) |
-| Upload admission Lambda handler | `src/session-ingest/upload-admission-lambda.ts:54` (`hosted-lambda`) |
-| Buffered GC Lambda handler | `src/session-ingest/buffered-gc-lambda.ts:8` (`hosted-lambda`) |
-| Rearm sweeper Lambda handler | `src/session-ingest/rearm-sweeper-lambda.ts:18` (`hosted-lambda`) |
-| Test preloads only | `scripts/test-preload/scrub-ts-capability.ts` (root `bunfig.toml` `[test] preload`), `packages/pipeline/test/setup/scrub-ts-capability.ts` (vitest `setupFiles`), `packages/session-read-worker/test/setup-env.ts:12` (`test`) |
+| Entry point (deployed module) | Module-load grant | Handler-entry grant (file:line) |
+|---|---|---|
+| Hosted ingest Worker `fetch` / `queue` (`stacks/cloudflare/session-ingest.ts` `main`) | `src/session-ingest/worker.ts:76` | `src/session-ingest/worker.ts:585` via `scrubEngineReady` (`hosted-worker`) |
+| Hosted session-read Worker `fetch` (`packages/session-read-worker/wrangler.jsonc`) | `packages/session-read-worker/src/index.ts:74` | `packages/session-read-worker/src/index.ts:640` (`hosted-worker`) |
+| Digest narrative Worker `fetch` (`wrangler.digest-narrative.jsonc`; not deployed by this repo) | `packages/session-read-worker/src/digest-narrative.ts:18` | `packages/session-read-worker/src/digest-narrative.ts:85` (`hosted-worker`) |
+| Read API Lambda handler (`src/session-read-api/lambda-entry.ts`) | `src/session-read-api/lambda-entry.ts:9` | `src/session-read-api/lambda.ts:743` (`hosted-lambda`) |
+| Session pipeline Lambda handler, incl. bob-costas / session-brief stages (`src/session-pipeline/lambda-entry.ts`) | `src/session-pipeline/lambda-entry.ts:9` | `src/session-pipeline/lambda.ts:882` (`hosted-lambda`) |
+| Portable Lambda zips (`src/lambda-artifact/pipeline-entry.ts`, `read-api-entry.ts`, built by `scripts/build-lambda-artifact.ts`) | line 1 of each | the wrapped `lambda.ts` handler, as above |
+| Upload admission Lambda handler | `src/session-ingest/upload-admission-lambda.ts:23` | `src/session-ingest/upload-admission-lambda.ts:55` (`hosted-lambda`) |
+| Buffered GC Lambda handler (`scripts/build-buffered-gc.ts`) | `src/session-ingest/buffered-gc-lambda.ts:2` | `src/session-ingest/buffered-gc-lambda.ts:9` (`hosted-lambda`) |
+| Rearm sweeper Lambda handler | `src/session-ingest/rearm-sweeper-lambda.ts:11` | `src/session-ingest/rearm-sweeper-lambda.ts:19` (`hosted-lambda`) |
+| Test preloads only | none | `scripts/test-preload/scrub-ts-capability.ts` (root `bunfig.toml` `[test] preload`), `packages/pipeline/test/setup/scrub-ts-capability.ts` (vitest `setupFiles`), `packages/session-read-worker/test/setup-env.ts:12` (`test`) |
+
+One known importer of a hosted module is invisible to the scan: `scripts/pg-proof/schema-rehearsal.ts`
+loads `src/session-ingest/worker.ts` (for `acceptedGenerations`) through a computed path into the
+candidate checkout, so that CI-only rehearsal process holds the `hosted-worker` grant. It never
+scrubs, seals or stores session data; the path is left computed so older targets still rehearse.
 
 Node self-host never reaches TS, even with `SCRUB_ENGINE=ts`. The large canonical read worker
 (`src/session-pipeline/large-read-main.ts`) initialises the default and fails closed
@@ -622,21 +638,36 @@ Node self-host never reaches TS, even with `SCRUB_ENGINE=ts`. The large canonica
 bytes or the pin digest (`src/session-pipeline/__tests__/large-read-bundle.test.ts`).
 
 **Entry inventory** (`scripts/scrub-default-scan.ts`, enforced in CI by
-`src/session-ingest/__tests__/scrub-default-scan.test.ts`): every tracked executable `.ts` entry under
-`src`, `packages`, `scripts`, `e2e` and `benchmarks` whose import graph reaches the seam must call
-`initScrubEngine(` (or `runWorker(`), or be listed in `ENTRY_EXEMPT` with a reason (GitHub-API gates,
+`src/session-ingest/__tests__/scrub-default-scan.test.ts`): every entry the scan's heuristic detects
+among tracked `.ts`, `.mts` and `.mjs` files under `src`, `packages`, `scripts`, `e2e`, `benchmarks`
+and `stacks` (`import.meta.main`, top-level await, a non-declaration top-level statement, a Worker
+`export default { fetch | queue | scheduled }`, a Lambda `export const handler` /
+`export [async] function handler`) whose static import graph reaches the seam must call
+`initScrubEngine(` (or `runWorker(`) in its code (a comment or string does not count), be a hosted
+entry or a wrapped Lambda handler, or be listed in `ENTRY_EXEMPT` with a reason (GitHub-API gates,
 bundlers, the technical-foul manifest writer, the RDS activation and claim-records archive tools,
 which import the seam graph but never scrub). It also fails on a grant declared outside the
-enumerated declarers, a grant re-exported from the seam, a production module importing a test
-preload, and a stale exemption. Each rule is mutation-tested.
+enumerated declarers, a grant re-exported from the seam, a hosted entry whose first import is not
+its module-load grant, any other non-test file that reaches a module-load grant, a stacks or
+wrangler `main` that is not a hosted entry, a production module importing a test preload, and a
+stale exemption. Each rule has a planted-violation test; the scan is a heuristic, not a proof.
+Known limits, listed in the scan header: an initialiser anywhere in the entry counts even if a seam
+use runs first or it sits under a condition (the runtime still fails closed there); computed
+`import(x)` / `require(x)` edges and non-relative, non-`@rhc/` specifiers are not followed; entries
+shaped differently from the patterns above (for example `export default app`) are not detected.
 
 **Tests** (each in a clean child process, no preload, asserting no grant at start):
 `src/session-ingest/__tests__/scrub-default-flip.test.ts` (fixture child
-`src/session-ingest/__tests__/fixtures/scrub-default-child.ts`) covers unset default with a routed
+`src/session-ingest/__tests__/fixtures/scrub-default-child.ts`, and
+`src/session-ingest/__tests__/fixtures/scrub-entry-grant-child.ts` for the per-module cases) covers unset default with a routed
 seal and readback of a fixture session body, explicit `wasm-bindgen`, explicit `wasm`, disallowed
 Node TS (test "SCRUB_ENGINE=ts without a capability grant refuses with scrub_engine_ts_not_allowed,
-sticky"), REQUIRED pass / refuse, init failure, pre-init logging, a Node service entry and the
-hosted handler-entry grant.
+sticky"), REQUIRED pass / refuse, init failure, pre-init logging, a Node service entry, the hosted
+grant, and, per hosted entry module, a log scrub before the handler runs that resolves `ts`
+(module-load grant), plus self-host mains that start with no grant and resolve wasm-bindgen.
+`src/session-ingest/__tests__/predicate-hook-fallback.test.ts` covers the pre-seam predicate fallback.
+`src/session-ingest/__tests__/scrub-default-scan.test.ts` plants a violation for each scan rule and
+each covered entry shape.
 
 **Unchanged:** the reader-first policy and its 8..10 bounds, marker and profile comparison, tagged
 refusals, the 16 MiB preflight, blank parity (U+0085, U+FEFF), empty-input refusal, non-retryable
@@ -646,10 +677,27 @@ vendored bytes, the ruleset / profile / marker (v8 and v10 reads stay compatible
 
 ### Rollback
 
-Deploy the previous image, or revert the pin (and this change), and restart. There is no
-environment switch back to TS on Node self-host: `SCRUB_ENGINE=ts` refuses there by design. On
-readers keep accepting version 10 (the self-host default, or `READER_MAX_RULESET=10`) while any
-version-10 objects remain stored: reverting the writer does not downgrade existing objects.
+Deploy the previous image, or revert this change, and restart. There is no environment switch back
+to TS on Node self-host: `SCRUB_ENGINE=ts` refuses there by design. Reverting the writer does not
+downgrade stored objects, so readers must keep accepting version 10 while any version-10 object
+remains stored. What that requires depends on the image rolled back to:
+
+- **An image that contains "self-host readers accept ruleset 10 by default"** (the commit before this
+  change): nothing to set. Unset `READER_MAX_RULESET` is the effective ceiling 10 there.
+- **An image built from that commit's parent or earlier**: REQUIRED, set `READER_MAX_RULESET=10`
+  explicitly on `SERVICE=alleyoop-ingest` (`src/alleyoop/ingest.ts`) **before** the rollback image
+  starts. On those images `src/alleyoop/manifests.ts` (`chunksAreServerSealed`) checks each listed
+  chunk's `scrub-version` against `maximum ?? DEFAULT_READER_MAX_RULESET` (8), so without it every
+  manifest that lists a version-10 chunk is answered `409 chunks_unverified`. The other Node readers
+  on those images treat unset as legacy reads (no ceiling, version 10 accepted) and need nothing
+  for reading. On those images the TS engine is the Node default again; a service that keeps the
+  opt-in wasm-bindgen triple there also needs `READER_MAX_RULESET=10`, or its `initScrubEngine`
+  refuses the version-10 pin (the pin parser's unset writer ceiling is 8) and the service fails closed.
+  Note that the explicit value also turns on the strict marker and per-chunk metadata checks for
+  alleyoop-ingest ("Explicit reader ruleset capability" below: unknown families refuse, manifests
+  above version 8 need per-chunk scrub metadata); confirm the objects it serves meet that.
+- The hosted Workers are not changed by this change (TS path, ceiling 8), so rolling it back changes
+  nothing there.
 
 ## Import cycle (why `predicate-hook.ts`)
 
@@ -664,9 +712,20 @@ dependency on the seam. The seam installs the hook at load:
 - Under `wasm` / `wasm-bindgen` (the default), the hook is the engine's `scrubText`. An
   unavailable, uninitialised or failed engine returns `undefined`, so `isSafeIdentifier` is false
   and the id is dropped.
-- Before the seam loads, the hook resolves the way the seam does: `scrubText` only in a process
-  holding a TS grant with `SCRUB_ENGINE` unset, `""` or `ts` and no `SCRUB_ENGINE_REQUIRED=wasm-bindgen`;
-  anything else (including the ungranted default) returns `undefined`.
+- Before the seam loads, the fallback answers with `scrubText` exactly where the seam's first
+  selection would pick TS without refusing: a TS grant AND `SCRUB_ENGINE` unset, `""` or `ts` AND
+  `SCRUB_ENGINE_REQUIRED` unset, `""` or `ts`. Anything else (the ungranted default; `SCRUB_ENGINE=ts`
+  without a grant; any other engine or requirement) returns `undefined`. The refusal latches live in
+  the seam only and cannot exist before it loads; the fallback never latches, and once the seam
+  loads it installs its own hook, so every later answer is the seam's.
+  `src/session-ingest/__tests__/predicate-hook-fallback.test.ts` covers this in a clean child process.
+
+**Failure mode (pre-existing, now the self-host default):** `undefined` makes the identifier
+predicate fail, so the identifier is dropped: a request carrying it answers 400, or the field is
+omitted from the output. That is how an engine fault surfaces on these paths (wasm-bindgen
+uninitialised, failed, or refused): as a 400 or a missing field, never as unscrubbed output. Before
+the default flip only opted-in wasm processes saw this; now every self-host process that reaches an
+identifier predicate before `initScrubEngine()` succeeds, or after it fails, does.
 
 ## Known non-seam uses of scrub.ts / raw-chunks.ts (allowed, documented)
 

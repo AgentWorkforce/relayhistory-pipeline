@@ -737,8 +737,9 @@ export async function handleUrlEvent(app: { fetch(req: Request): Response | Prom
 export function createReadApiLambdaHandler(composition?: SearchComposition) {
 let appPromise: Promise<App> | undefined;
 return async function readApiHandler(event: FunctionUrlEvent): Promise<FunctionUrlResult> {
-  // Hosted Lambda zip (no relayscrubber artifacts): TypeScript scrub. Handler entry only;
-  // session-read-api/server.ts and other self-host services import this module for helpers.
+  // Hosted Lambda zip (no relayscrubber artifacts): TypeScript scrub. server.ts and other
+  // self-host services import this module for helpers, so it carries no module-load grant; the
+  // deployed lambda-entry.ts and the lambda-artifact wrapper grant at module load, this repeats it.
   declareScrubTsCapability("hosted-lambda");
   let app: Awaited<NonNullable<typeof appPromise>>;
   try {

@@ -577,7 +577,7 @@ export function sessionPipelineFunctionProps(i: SessionPipelineStageInputs & { b
     functionName: names.function,
     // Relative to the repository root (bin/96bulls runs Alchemy there), so the planned
     // props are the same in every checkout and a capture never diffs on a path.
-    main: "src/session-pipeline/lambda.ts",
+    main: "src/session-pipeline/lambda-entry.ts",
     handler: "handler",
     runtime: "nodejs24.x",
     architecture: "arm64",

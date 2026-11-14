@@ -1,4 +1,5 @@
 /** EventBridge/portable Node entry. A single reviewed switch arms job+schedule. */
+import "@rhc/lib/scrub-engine/hosted-lambda-grant.ts"; // FIRST import: module-load TS grant (docs/scrub-engine.md "Default flip")
 import {BufferedGcDiagnostics,type BufferedGcPhase} from "./buffered-gc.ts";
 import {declareScrubTsCapability} from "@rhc/lib/scrub-engine/ts-capability.ts";
 export function gcEnabled(env:NodeJS.ProcessEnv):boolean{

@@ -71,6 +71,7 @@
  * all unset in wrangler.jsonc; only the deploy workflow's owner_buffered=on render
  * (scripts/render-deploy-config.ts) adds them.
  */
+import "../../pipeline/src/lib/scrub-engine/hosted-worker-grant.ts"; // FIRST import: module-load TS grant (docs/scrub-engine.md "Default flip")
 import { readerMaxRuleset } from "../../pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { declareScrubTsCapability } from "../../pipeline/src/lib/scrub-engine/ts-capability.ts";
 import pg from "pg";
@@ -633,8 +634,9 @@ function ownerBufferedEventsFlag(env: Env): boolean {
 
 export default {
   fetch(request, env, ctx) {
-    // Hosted Worker, no relayscrubber artifacts: TypeScript scrub stays here. Declared at
-    // handler entry, not module load (docs/scrub-engine.md "Default flip").
+    // Hosted Worker, no relayscrubber artifacts: TypeScript scrub stays here. The module-load
+    // grant (first import) is the primary one; this is the idempotent handler-entry repeat
+    // (docs/scrub-engine.md "Default flip").
     declareScrubTsCapability("hosted-worker");
     return handle(request, env, ctx);
   },

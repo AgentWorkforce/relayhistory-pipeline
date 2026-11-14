@@ -153,7 +153,7 @@ export function sessionReadApiEnv(i: { stage: string; names: SessionReadApiNames
 export function sessionReadApiFunctionProps(i: { stage: string; names: SessionReadApiNames; p: SessionReadApiInputs; analysisBucketName?: string }) {
   return {
     functionName: i.names.function,
-    main: "src/session-read-api/lambda.ts",
+    main: "src/session-read-api/lambda-entry.ts",
     handler: "handler",
     runtime: "nodejs24.x",
     architecture: "arm64",

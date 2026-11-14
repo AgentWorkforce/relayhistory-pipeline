@@ -4,10 +4,14 @@
  * selects the pinned wasm-bindgen engine and SCRUB_ENGINE=ts is refused
  * (`ScrubEngineConfigError`, reason `scrub_engine_ts_not_allowed`).
  *
- * - "hosted-worker" / "hosted-lambda": declared only by the enumerated hosted runtime
- *   handlers (Cloudflare Worker `fetch` / `queue`, AWS Lambda `handler`), which ship
- *   no relayscrubber artifacts. Declared at handler entry, not at module load: the
- *   self-host Node services import those modules for helpers and must never gain TS.
+ * - "hosted-worker" / "hosted-lambda": declared only for the enumerated hosted runtime
+ *   entries (Cloudflare Worker `fetch` / `queue`, AWS Lambda `handler`), which ship no
+ *   relayscrubber artifacts. Declared at module load by hosted-worker-grant.ts /
+ *   hosted-lambda-grant.ts, which each hosted entry imports first (so a seam use during
+ *   module evaluation already sees the grant), and again, idempotently, at handler entry.
+ *   Only the hosted entries may reach those grant modules; where self-host Node services
+ *   import a hosted module for helpers (the pipeline and read API lambda.ts), the deployed
+ *   entry is a thin lambda-entry.ts wrapper instead.
  * - "test": declared only by the test preloads (root bunfig.toml preload, the vitest
  *   setupFiles), never by production code.
  *
