@@ -6,8 +6,10 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && format('backlog ops {0
 # in src/session-ingest/backlog-ops.ts). Dry modes are always allowed. Every execute is dormant until a reviewed
 # commit flips BACKLOG_OPS_EXECUTE_ENABLED, and is bound by a typed confirmation to earlier successful runs of this
 # workflow at the same commit (its dry run; the backfill; for the drain, a fresh backfill and the export after it),
-# whose receipts are checked before any credential is read. The workflow never passes --checkpoint-file,
-# --start-after or an org: a rerun is safe because the drain skips objects it already marked.
+# whose receipts are checked before any credential is read. The workflow never passes --checkpoint-file or
+# --start-after: a rerun is safe because the drain skips objects it already marked. The optional org scope is the
+# environment SECRET BACKLOG_OPS_ORGS (a secret, not a variable, so this public repository's logs mask it): unset or
+# empty runs every org; an execute refuses unless its bound runs carry the same scope (src/session-ingest/backlog-ops.ts).
 # Push and pull_request run only the credential-free tests (no secrets, no environment).
 on:
   workflow_dispatch:
@@ -189,6 +191,7 @@ jobs:
           BACKLOG_OPS_KMS_KEY_ARN: ${{ vars.BACKLOG_OPS_KMS_KEY_ARN }}
           BACKLOG_OPS_DRY_ROLE_ARN: ${{ vars.BACKLOG_OPS_DRY_ROLE_ARN }}
           BACKLOG_OPS_EXECUTE_ROLE_ARN: ${{ vars.BACKLOG_OPS_EXECUTE_ROLE_ARN }}
+          BACKLOG_OPS_ORGS: ${{ secrets.BACKLOG_OPS_ORGS }}
         run: bun scripts/backlog-ops.ts
       - name: Publish the counts-only receipt
         if: always()

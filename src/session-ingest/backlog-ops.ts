@@ -18,9 +18,19 @@
  * lease (96bulls/.drain/lock.json). The workflow never passes --checkpoint-file or --start-after: the drain's
  * create-only `drained` markers make a rerun skip what is written, so a restart only re-lists.
  *
+ * Org scope (BACKLOG_OPS_ORGS): an optional environment secret on both environments (a secret, so this public
+ * repository's logs mask it): comma-separated lowercase org UUIDs; unset or empty runs every org, as before. The org
+ * ids never reach the repository, a log or a receipt: the receipt records only the scope's id (`all`, or `orgs_` +
+ * 32 hex of the sorted list's sha256). Every bound run must carry the same scope as the run it feeds, except that an
+ * unscoped (`all`) backfill or export may feed a scoped execute. A receipt from before scoping has no scope and
+ * counts as `all`. Scoping changes no tool rule: the drain still writes nothing for an org without its
+ * fence-authority marker.
+ *
  * Receipts are counts only: every leaf a number, a boolean or a short lowercase code; any other string (an id, a
  * key, a URL) refuses the receipt. Errors carry fixed codes only.
  */
+import { createHash } from "node:crypto";
+
 /** Execute modes stay refused until a reviewed commit flips this. Dry modes are always allowed. */
 export const BACKLOG_OPS_EXECUTE_ENABLED: boolean = false;
 
@@ -61,6 +71,10 @@ const REGION = /^[a-z]{2}(-gov)?-[a-z]+-[0-9]$/u;
 const KMS_KEY_ARN = /^arn:aws:kms:([a-z]{2}(?:-gov)?-[a-z]+-[0-9]):([0-9]{12}):key\/(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|mrk-[0-9a-f]{32})$/u;
 const ROLE_ARN = /^arn:aws:iam::([0-9]{12}):role\/[A-Za-z0-9+=,.@_-]{1,64}$/u;
 const CODE = /^[a-z][a-z0-9_]{0,39}$/u;
+const ORG_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+const SCOPE_ID = /^(all|orgs_[0-9a-f]{32})$/u;
+/** The most orgs one scoped run may name. */
+export const BACKLOG_OPS_MAX_ORGS = 64;
 const KEY = /^[a-z][a-z0-9_]{0,63}$/u;
 
 export class BacklogOpsRefusal extends Error {
@@ -143,6 +157,20 @@ export function backlogOpsTarget(env: Record<string, string | undefined>): Backl
   return { bucket, region, kmsKeyArn, dryRoleArn, executeRoleArn };
 }
 
+/** A run's org scope: the orgs (sorted, distinct) or null for every org, and its id for receipts. */
+export interface BacklogOpsScope { orgs: string[] | null; id: string }
+export const BACKLOG_OPS_SCOPE_ALL = "all";
+/** BACKLOG_OPS_ORGS, from the environment secret: unset or empty = every org. */
+export function backlogOpsScope(env: Record<string, string | undefined>): BacklogOpsScope {
+  const raw = (env.BACKLOG_OPS_ORGS ?? "").trim();
+  if (raw === "") return { orgs: null, id: BACKLOG_OPS_SCOPE_ALL };
+  const parts = raw.split(",");
+  if (parts.length > BACKLOG_OPS_MAX_ORGS || !parts.every((o) => ORG_UUID.test(o))) refuse("backlog_ops_scope");
+  const orgs = [...new Set(parts)].sort();
+  if (orgs.length !== parts.length) refuse("backlog_ops_scope");
+  return { orgs, id: "orgs_" + createHash("sha256").update(orgs.join(",")).digest("hex").slice(0, 32) };
+}
+
 /**
  * The backfill's paging for production. Its users page is a DISTINCT over six tables, one of which (ingest_batches)
  * has no index on the owner key, so every page scans in full: the tool's 30 s default timed out on the first page
@@ -153,14 +181,15 @@ export const BACKLOG_OPS_BACKFILL_PAGING = ["--page-size", "5000", "--row-page-s
 /** The export's per-statement timeout: its org, candidate and per-user reads over the buffer are as heavy (same 30 s default). */
 export const BACKLOG_OPS_EXPORT_PAGING = ["--statement-timeout-ms", "600000"] as const;
 
-/** Fixed argv for the tool: never an org, a checkpoint, a start key or an unvalidated value. */
-export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget): { script: string; args: string[]; needsDb: boolean } {
+/** Fixed argv for the tool: the scope's validated orgs only, never a checkpoint, a start key or an unvalidated value. */
+export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget, scope: BacklogOpsScope = { orgs: null, id: BACKLOG_OPS_SCOPE_ALL }): { script: string; args: string[]; needsDb: boolean } {
   const tool = toolOf(d.mode), execute = isExecute(d.mode);
   const script = { backfill: "scripts/upload-fence-backfill.ts", export: "scripts/accepted-stage-export.ts", drain: "scripts/buffered-drain.ts" }[tool];
   const args = [execute ? "--execute" : "--dry-run", "--bucket", t.bucket, "--region", t.region,
     ...(execute ? ["--kms-key-arn", t.kmsKeyArn] : []),
     ...(tool === "backfill" ? BACKLOG_OPS_BACKFILL_PAGING : tool === "export" ? BACKLOG_OPS_EXPORT_PAGING : []),
-    ...(tool === "drain" && d.maxObjects !== null ? ["--max-objects", String(d.maxObjects)] : [])];
+    ...(tool === "drain" && d.maxObjects !== null ? ["--max-objects", String(d.maxObjects)] : []),
+    ...(scope.orgs ?? []).flatMap((o) => ["--org", o])];
   return { script, args, needsDb: tool !== "drain" };
 }
 
@@ -190,12 +219,15 @@ export interface BacklogOpsReceipt {
   mode: BacklogOpsMode;
   sha: string;
   run: string;
+  /** The org scope's id (backlogOpsScope): `all` or `orgs_<32 hex>`; never an org id. */
+  scope: string;
   exitCode: number;
   summary: unknown;
 }
 
 /** Parse the tool's last stdout line into a counts-only receipt (or a refused one). */
-export function backlogOpsReceipt(d: BacklogOpsDispatch, run: string, exitCode: number, stdout: string): BacklogOpsReceipt {
+export function backlogOpsReceipt(d: BacklogOpsDispatch, run: string, exitCode: number, stdout: string, scope: string = BACKLOG_OPS_SCOPE_ALL): BacklogOpsReceipt {
+  if (!SCOPE_ID.test(scope)) refuse("backlog_ops_scope");
   const lines = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
   let summary: unknown = { refused: "no_summary" };
   const last = lines.at(-1);
@@ -204,21 +236,27 @@ export function backlogOpsReceipt(d: BacklogOpsDispatch, run: string, exitCode: 
     try { parsed = JSON.parse(last); } catch { parsed = undefined; }
     summary = parsed === undefined ? { refused: "summary_unparsed" } : countsOnly(parsed);
   }
-  return { contract: BACKLOG_OPS_RECEIPT_CONTRACT, mode: d.mode, sha: d.sha, run, exitCode, summary };
+  return { contract: BACKLOG_OPS_RECEIPT_CONTRACT, mode: d.mode, sha: d.sha, run, scope, exitCode, summary };
 }
 
 const obj = (v: unknown): Record<string, any> | null => (v && typeof v === "object" && !Array.isArray(v) ? v as Record<string, any> : null);
 
 /**
  * A bound run's receipt, read from its downloaded artifact. It must name that run, this commit and the expected mode,
- * have exited 0, and (per tool) pass its readiness check.
+ * have exited 0, carry the execute's org scope (a bound backfill or export may also be unscoped; a receipt without a
+ * scope is unscoped), and (per tool) pass its readiness check.
  */
-export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; sha: string; run: string }): void {
+export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; sha: string; run: string; scope?: string; kind?: "dry" | "backfill" | "export" }): void {
   let r: Record<string, any> | null;
   try { r = obj(JSON.parse(raw)); } catch { r = null; }
   if (!r || r.contract !== BACKLOG_OPS_RECEIPT_CONTRACT || r.mode !== expect.mode || r.sha !== expect.sha ||
       r.run !== expect.run || r.exitCode !== 0)
     refuse(`backlog_ops_bound_${toolOf(expect.mode)}_receipt`);
+  const want = expect.scope ?? BACKLOG_OPS_SCOPE_ALL;
+  const got = r.scope === undefined ? BACKLOG_OPS_SCOPE_ALL : r.scope;
+  if (typeof got !== "string" || !SCOPE_ID.test(got) || !SCOPE_ID.test(want) ||
+      (got !== want && !(expect.kind !== "dry" && expect.kind !== undefined && got === BACKLOG_OPS_SCOPE_ALL)))
+    refuse(`backlog_ops_bound_${toolOf(expect.mode)}_scope`);
   const s = obj(r.summary);
   if (!s || s.refused !== undefined) refuse(`backlog_ops_bound_${toolOf(expect.mode)}_refused`);
   const wantMode = isExecute(expect.mode) ? "execute" : "dry_run";

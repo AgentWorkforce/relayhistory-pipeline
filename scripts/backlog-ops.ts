@@ -27,6 +27,7 @@ import {
   backlogOpsDispatch,
   backlogOpsReceipt,
   backlogOpsRole,
+  backlogOpsScope,
   backlogOpsSessionName,
   backlogOpsTarget,
   backlogOpsToolArgs,
@@ -64,7 +65,7 @@ export function backlogOpsChildSpawn(
   aws: { accessKeyId: string; secretAccessKey: string; sessionToken: string },
   dbUrl: string | null,
 ) {
-  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t);
+  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, backlogOpsScope(env));
   if (spec.needsDb !== (dbUrl !== null)) refuse("backlog_ops_db_binding");
   const childEnv: Record<string, string> = {};
   for (const key of BACKLOG_OPS_CHILD_ENV) if (typeof env[key] === "string") childEnv[key] = env[key]!;
@@ -79,14 +80,14 @@ export function backlogOpsChildSpawn(
   };
 }
 
-/** Every bound run's receipt, from the artifacts the workflow downloaded, before any credential. */
+/** Every bound run's receipt, from the artifacts the workflow downloaded, before any credential: same org scope. */
 export function checkBoundReceipts(env: Record<string, string | undefined>, d: BacklogOpsDispatch, read = (p: string) => readFileSync(p, "utf8")) {
-  const paths = backlogOpsPaths(env);
+  const paths = backlogOpsPaths(env), scope = backlogOpsScope(env).id;
   for (const b of backlogOpsBindings(d)) {
     const path = paths.bound(b.kind);
     let raw: string;
     try { raw = read(path); } catch { return refuse(`backlog_ops_bound_${b.kind}_missing`); }
-    checkBoundReceipt(raw, { mode: b.mode, sha: d.sha, run: b.run });
+    checkBoundReceipt(raw, { mode: b.mode, sha: d.sha, run: b.run, scope, kind: b.kind });
   }
 }
 
@@ -134,7 +135,10 @@ function writePrivate(path: string, value: unknown): void {
 export async function backlogOpsRun(env: Record<string, string | undefined>) {
   const d = backlogOpsDispatch(env);
   if (env.GITHUB_SHA !== d.sha || !/^[1-9][0-9]*$/u.test(env.GITHUB_RUN_ID ?? "")) refuse("backlog_ops_checkout");
-  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t);
+  const scope = backlogOpsScope(env);
+  // GitHub masks the secret's whole value; mask each org too, so a tool line naming one org never shows it.
+  for (const org of scope.orgs ?? []) console.log(`::add-mask::${org}`);
+  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, scope);
   checkBoundReceipts(env, d);
   const paths = backlogOpsPaths(env);
   if (existsSync(paths.receipt)) refuse("backlog_ops_receipt_exists");
@@ -151,8 +155,8 @@ export async function backlogOpsRun(env: Record<string, string | undefined>) {
     p.on("close", (c) => resolve({ code: c ?? 1, stdout: out }));
   });
   let receipt;
-  try { receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code, stdout); }
-  catch (e) { receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code || 1, JSON.stringify({ refused: (e as { code?: string }).code ?? "receipt" })); }
+  try { receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code, stdout, scope.id); }
+  catch (e) { receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code || 1, JSON.stringify({ refused: (e as { code?: string }).code ?? "receipt" }), scope.id); }
   writePrivate(paths.receipt, receipt);
   console.log("backlog_ops_receipt " + JSON.stringify(receipt));
   return receipt.exitCode === 0 && code === 0 ? 0 : 1;

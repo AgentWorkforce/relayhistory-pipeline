@@ -69,6 +69,8 @@ export interface BackfillOptions {
   rowPageSize?: number;
   concurrency?: number;
   statementTimeoutMs?: number;
+  /** Heap blocks per scoped slot window (default SLOT_WINDOW_BLOCKS); tests use a small one to cross windows. */
+  slotWindowBlocks?: number;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
 }
@@ -159,6 +161,20 @@ FROM sessions.ingest_lazy_native_slots
 WHERE ${SCOPE} AND key_sha256 > $2::text
 ORDER BY key_sha256
 LIMIT $3::int`;
+/**
+ * The scoped slots read: one window of heap blocks (a TID range scan), filtered to the scope's orgs. Keyset paging on
+ * key_sha256 with an org filter walks the primary key and fetches every slot's heap tuple at random to test its org
+ * (about 21 s a page on production's tens of millions of slots, scoped or not); a block window reads the heap in
+ * order instead, so a whole pass is one sequential read. A slot rewritten during the pass can move to a block already
+ * read and be missed, so a scoped run is exact only while its orgs admit nothing: run the execute after the scope's
+ * HTTP admission stop (decision 0005's cutover order). The unscoped pass keeps the key_sha256 keyset.
+ */
+const SLOT_WINDOW_BLOCKS = 4096;
+const SLOTS_BLOCKS = `SELECT (pg_relation_size('sessions.ingest_lazy_native_slots') / current_setting('block_size')::bigint)::bigint AS blocks`;
+const SLOTS_WINDOW = `
+SELECT key_sha256, org_id, workspace_id, origin_id, record_id, current_owner, current_source, current_session, current_revision, current_digest
+FROM sessions.ingest_lazy_native_slots
+WHERE org_id = ANY($1::text[]) AND ctid >= $2::tid AND ctid < $3::tid`;
 const REVISIONS_PAGE = `
 SELECT org_id, workspace_id, origin_id, record_id, revision, revision_id, digest, user_id, source, session_id
 FROM sessions.ingest_record_revisions
@@ -261,6 +277,8 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   const rowPageSize = opts.rowPageSize ?? 5_000;
   const concurrency = opts.concurrency ?? 4;
   const statementTimeoutMs = opts.statementTimeoutMs ?? 30_000;
+  const slotWindow = opts.slotWindowBlocks ?? SLOT_WINDOW_BLOCKS;
+  if (!Number.isInteger(slotWindow) || slotWindow < 1 || slotWindow > 1_048_576) throw new Error("backfill_slot_window_invalid");
   const sections = new Set(opts.sections ?? BACKFILL_SECTIONS);
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 5_000) throw new Error("backfill_page_size_invalid");
   if (!Number.isInteger(rowPageSize) || rowPageSize < 1 || rowPageSize > 50_000) throw new Error("backfill_row_page_size_invalid");
@@ -506,11 +524,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
       await flush(groups);
     }
     // (b) owned ingest_lazy_native_slots, under their owner and session (ingest_lazy_clear's scope).
-    let slotCursor = "";
-    for (;;) {
-      const rows = await readOnly(SLOTS_PAGE, [orgs, slotCursor, rowPageSize]);
-      if (!rows.length) break;
-      slotCursor = text(rows[rows.length - 1]!.key_sha256);
+    const slotRows = async (rows: Record<string, unknown>[]) => {
       const groups = new Map<string, Group>(), fences = new Map<string, Promise<FenceDoc | null>>();
       for (const r of rows) {
         summary.revisions.slot_rows++;
@@ -518,6 +532,24 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
         await add(groups, fences, { org: r.org_id, ws: r.workspace_id, user: r.current_owner, origin: r.origin_id, record: r.record_id, revision: r.current_revision, revisionId: null, digest: r.current_digest, source: r.current_source, session: r.current_session });
       }
       await flush(groups);
+    };
+    if (orgs) {
+      // Scoped: block windows (SLOTS_WINDOW), the heap's size re-read in each window's snapshot so growth is followed.
+      for (let block = 0; ; block += slotWindow) {
+        const [size, rows] = await readOnlyAll([[SLOTS_BLOCKS, []], [SLOTS_WINDOW, [orgs, `(${block},0)`, `(${block + slotWindow},0)`]]]);
+        const blocks = int(size![0]?.blocks);
+        if (blocks === undefined) throw new Error("backfill_slot_blocks_invalid");
+        await slotRows(rows!);
+        if (block + slotWindow >= blocks) break;
+      }
+    } else {
+      let slotCursor = "";
+      for (;;) {
+        const rows = await readOnly(SLOTS_PAGE, [orgs, slotCursor, rowPageSize]);
+        if (!rows.length) break;
+        slotCursor = text(rows[rows.length - 1]!.key_sha256);
+        await slotRows(rows);
+      }
     }
     const v = summary.revisions;
     summary.sections.revisions = v.skipped_no_fence + v.invalid + v.failed === 0 ? "complete" : "incomplete";

@@ -32,6 +32,7 @@ import {
   backlogOpsReceipt,
   backlogOpsRole,
   backlogOpsRunName,
+  backlogOpsScope,
   backlogOpsTarget,
   backlogOpsToolArgs,
   checkBoundReceipt,
@@ -123,7 +124,7 @@ test("target variables are shape-checked: key in region, roles in the key's acco
   expect(codeSync(() => backlogOpsTarget({ ...target, BACKLOG_OPS_DRY_ROLE_ARN: "" }))).toBe("backlog_ops_target_roles");
 });
 
-test("argv is fixed: never an org, checkpoint or start key; dry runs omit the key; execute names it; drain gets no database", () => {
+test("argv is fixed: no org unless scoped, never a checkpoint or start key; dry runs omit the key; execute names it; drain gets no database", () => {
   const t = backlogOpsTarget(target);
   for (const mode of BACKLOG_OPS_MODES) {
     const d = backlogOpsDispatch(dispatchEnv(mode, mode.startsWith("drain") ? { BACKLOG_OPS_MAX_OBJECTS: "500" } : {}), true);
@@ -143,6 +144,29 @@ test("argv is fixed: never an org, checkpoint or start key; dry runs omit the ke
       expect(spec.args.slice(spec.args.indexOf("--row-page-size"), spec.args.indexOf("--row-page-size") + 2)).toEqual(["--row-page-size", "20000"]);
     }
     expect(backlogOpsRole(d, t)).toBe(exec ? t.executeRoleArn : t.dryRoleArn);
+  }
+});
+
+const ORG1 = "11111111-2222-4333-8444-555555555555", ORG2 = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+
+test("org scope: BACKLOG_OPS_ORGS, lowercase UUIDs only; an id (never an org) for receipts; --org per org for every tool", () => {
+  expect(backlogOpsScope({})).toEqual({ orgs: null, id: "all" });
+  expect(backlogOpsScope({ BACKLOG_OPS_ORGS: " " })).toEqual({ orgs: null, id: "all" });
+  const one = backlogOpsScope({ BACKLOG_OPS_ORGS: ORG1 });
+  expect(one.orgs).toEqual([ORG1]);
+  expect(one.id).toMatch(/^orgs_[0-9a-f]{32}$/);
+  expect(one.id).not.toContain(ORG1.slice(0, 8));
+  expect(backlogOpsScope({ BACKLOG_OPS_ORGS: `${ORG2},${ORG1}` })).toEqual(backlogOpsScope({ BACKLOG_OPS_ORGS: `${ORG1},${ORG2}` }));
+  expect(backlogOpsScope({ BACKLOG_OPS_ORGS: `${ORG1},${ORG2}` }).id).not.toBe(one.id);
+  for (const bad of [ORG2.toUpperCase(), `${ORG1}, ${ORG2}`, `${ORG1},`, `${ORG1},${ORG1}`, "org-a", "../x", `${ORG1};${ORG2}`,
+    Array.from({ length: 65 }, (_, i) => `${String(i).padStart(8, "0")}-2222-4333-8444-555555555555`).join(",")])
+    expect(codeSync(() => backlogOpsScope({ BACKLOG_OPS_ORGS: bad }))).toBe("backlog_ops_scope");
+  const t = backlogOpsTarget(target);
+  for (const mode of BACKLOG_OPS_MODES) {
+    const d = backlogOpsDispatch(dispatchEnv(mode), true);
+    const args = backlogOpsToolArgs(d, t, backlogOpsScope({ BACKLOG_OPS_ORGS: `${ORG2},${ORG1}` })).args;
+    expect(args.slice(-4)).toEqual(["--org", ORG1, "--org", ORG2]);
+    expect(backlogOpsToolArgs(d, t, backlogOpsScope({})).args).not.toContain("--org");
   }
 });
 
@@ -180,6 +204,48 @@ test("bound receipts: mode, sha, run, exit 0; backfill complete; export failed =
   expect(ok(receipt("export-execute", EXPORT, { ...exportOk, mode: "dry_run" }), "export-execute", EXPORT)).toBe("backlog_ops_bound_export_receipt");
   expect(ok(receipt("export-execute", EXPORT, { refused: "export_claim_sessions_gate_off" }), "export-execute", EXPORT)).toBe("backlog_ops_bound_export_refused");
   expect(ok("{", "export-execute", EXPORT)).toBe("backlog_ops_bound_export_receipt");
+});
+
+test("bound receipts carry the execute's scope: the dry run exactly; a backfill or export the same or unscoped", () => {
+  const scoped = backlogOpsScope({ BACKLOG_OPS_ORGS: ORG1 }).id, other = backlogOpsScope({ BACKLOG_OPS_ORGS: ORG2 }).id;
+  const withScope = (raw: string, scope?: string) => JSON.stringify({ ...JSON.parse(raw), ...(scope === undefined ? {} : { scope }) });
+  const ok = (raw: string, mode: BacklogOpsMode, run: string, scope: string, kind: "dry" | "backfill" | "export") =>
+    codeSync(() => checkBoundReceipt(raw, { mode, sha, run, scope, kind }));
+  const dry = receipt("drain-dry", DRY, { mode: "dry_run", listed: 1 });
+  expect(ok(withScope(dry, scoped), "drain-dry", DRY, scoped, "dry")).toBeNull();
+  expect(ok(withScope(dry, "all"), "drain-dry", DRY, scoped, "dry")).toBe("backlog_ops_bound_drain_scope");
+  expect(ok(withScope(dry), "drain-dry", DRY, scoped, "dry")).toBe("backlog_ops_bound_drain_scope");
+  expect(ok(withScope(dry, other), "drain-dry", DRY, scoped, "dry")).toBe("backlog_ops_bound_drain_scope");
+  expect(ok(withScope(dry, scoped), "drain-dry", DRY, "all", "dry")).toBe("backlog_ops_bound_drain_scope");
+  expect(ok(withScope(dry), "drain-dry", DRY, "all", "dry")).toBeNull(); // a receipt from before scoping is unscoped
+  const bf = receipt("backfill-execute", BACKFILL, backfillOk);
+  expect(ok(withScope(bf, "all"), "backfill-execute", BACKFILL, scoped, "backfill")).toBeNull();
+  expect(ok(withScope(bf, scoped), "backfill-execute", BACKFILL, scoped, "backfill")).toBeNull();
+  expect(ok(withScope(bf, other), "backfill-execute", BACKFILL, scoped, "backfill")).toBe("backlog_ops_bound_backfill_scope");
+  expect(ok(withScope(bf, scoped), "backfill-execute", BACKFILL, "all", "backfill")).toBe("backlog_ops_bound_backfill_scope");
+  expect(ok(withScope(bf, ORG1), "backfill-execute", BACKFILL, scoped, "backfill")).toBe("backlog_ops_bound_backfill_scope");
+  const ex = receipt("export-execute", EXPORT, exportOk);
+  expect(ok(withScope(ex, other), "export-execute", EXPORT, scoped, "export")).toBe("backlog_ops_bound_export_scope");
+  const d = backlogOpsDispatch(dispatchEnv("drain-dry"));
+  expect(backlogOpsReceipt(d, "9", 0, "{\"mode\":\"dry_run\",\"listed\":1}", scoped).scope).toBe(scoped);
+  expect(backlogOpsReceipt(d, "9", 0, "{}").scope).toBe("all");
+  expect(codeSync(() => backlogOpsReceipt(d, "9", 0, "{}", ORG1))).toBe("backlog_ops_scope");
+});
+
+test("the credential step binds every receipt to BACKLOG_OPS_ORGS's scope", () => {
+  const scoped = backlogOpsScope({ BACKLOG_OPS_ORGS: ORG1 }).id;
+  const env = { ...dispatchEnv("drain-execute"), RUNNER_TEMP: "/tmp/rt", BACKLOG_OPS_ORGS: ORG1 };
+  const put = (raw: string, scope: string) => JSON.stringify({ ...JSON.parse(raw), scope });
+  const files: Record<string, string> = {
+    "/tmp/rt/backlog-ops-bound/dry/backlog-ops-receipt.json": put(receipt("drain-dry", DRY, { mode: "dry_run", listed: 1 }), scoped),
+    "/tmp/rt/backlog-ops-bound/backfill/backlog-ops-receipt.json": put(receipt("backfill-execute", BACKFILL, backfillOk), "all"),
+    "/tmp/rt/backlog-ops-bound/export/backlog-ops-receipt.json": put(receipt("export-execute", EXPORT, exportOk), scoped),
+  };
+  const read = (p: string) => files[p]!;
+  const d = backlogOpsDispatch(env, true);
+  expect(codeSync(() => checkBoundReceipts(env, d, read))).toBeNull();
+  expect(codeSync(() => checkBoundReceipts({ ...env, BACKLOG_OPS_ORGS: "" }, d, read))).toBe("backlog_ops_bound_drain_scope");
+  expect(codeSync(() => checkBoundReceipts({ ...env, BACKLOG_OPS_ORGS: ORG2 }, d, read))).toBe("backlog_ops_bound_drain_scope");
 });
 
 test("the credential step checks every bound receipt before any credential, from the downloaded paths", () => {
@@ -402,8 +468,11 @@ test("workflow: dispatch inputs, gates, one credential step, OIDC, protected var
   // Only the operate job may mint an OIDC token.
   expect(code_.match(/id-token: write/g)?.length).toBe(1);
   expect(yml).toContain("id-token: write");
-  // The secret appears exactly once, only for the database tools, in the one credential step.
-  expect(yml.match(/secrets\./g)?.length).toBe(1);
+  // Two secrets, both only in the one credential step: the owner URL (database tools only) and the org scope (a
+  // secret, never a variable, so this public repository's logs mask the org ids).
+  expect(yml.match(/secrets\./g)?.length).toBe(2);
+  expect(yml).toContain("BACKLOG_OPS_ORGS: ${{ secrets.BACKLOG_OPS_ORGS }}");
+  expect(yml).not.toContain("vars.BACKLOG_OPS_ORGS");
   expect(yml).toContain("SUPABASE_MIGRATION_OWNER_URL: ${{ (startsWith(inputs.mode, 'backfill-') || startsWith(inputs.mode, 'export-')) && secrets.SUPABASE_MIGRATION_OWNER_URL || '' }}");
   for (const v of ["BACKLOG_OPS_BUCKET", "BACKLOG_OPS_REGION", "BACKLOG_OPS_KMS_KEY_ARN", "BACKLOG_OPS_DRY_ROLE_ARN", "BACKLOG_OPS_EXECUTE_ROLE_ARN"])
     expect(yml).toContain(`${v}: \${{ vars.${v} }}`);

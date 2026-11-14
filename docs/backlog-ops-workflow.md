@@ -41,7 +41,24 @@ fence. The gate requires the drain's bound backfill to be under 3 hours old and 
 after that backfill.
 
 To drain in slices, give `max_objects` and rerun `drain-execute`. Each rerun skips what earlier runs wrote, using
-the create-only `drained` markers. The workflow never passes `--checkpoint-file`, `--start-after` or an org.
+the create-only `drained` markers. The workflow never passes `--checkpoint-file` or `--start-after`.
+
+## Org scope
+
+A run can be limited to some orgs with the environment **secret** `BACKLOG_OPS_ORGS`, set on both
+`session-schema-production` (dry runs) and `session-backlog-execute` (executes): comma-separated lowercase org UUIDs,
+no spaces, at most 64. Unset or empty runs every org, as before. It is a secret rather than a variable so this public
+repository's logs mask the ids; the receipt records only the scope's id (`all`, or `orgs_` and 32 hex of a sha256 of
+the sorted list).
+
+- The workflow passes each org to the tool as `--org`. The tools' own rules are unchanged: the drain still writes
+  nothing for an org without its fence-authority marker.
+- An execute refuses unless its dry run has the same scope. A bound backfill or export must have the same scope or
+  be unscoped. A receipt from before scoping counts as unscoped. So change the secret only between complete
+  sequences, and set it on both environments to the same value.
+- A scoped backfill reads `ingest_lazy_native_slots` in heap block windows (one sequential pass) instead of walking
+  the primary key, which fetched every slot at random to test its org. A slot rewritten during the pass can be
+  missed, so run a scoped backfill-execute after the scope's HTTP admission stop (decision 0005's cutover order).
 
 ## Gates
 
