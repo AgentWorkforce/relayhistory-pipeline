@@ -1528,6 +1528,73 @@ describe("the ordered migration lanes: contiguous prefixes, no unledgered footpr
     });
   });
 
+  // The 2026.11.1 image recorded these 92 steps; 20261105047030 was added after it shipped and
+  // sorts before steps it recorded (MIGRATION_LATE_INSERTIONS). Every 11.1 database must upgrade.
+  const LEDGER_11_1: string[] = JSON.parse(
+    readFileSync(join(import.meta.dir, "fixtures/released-ledgers/2026.11.1.json"), "utf8"),
+  ).steps;
+  const LATE = "upstream:20261105047030_frozen_copy_progress.sql";
+  const image11_1 = async (extra: string[] = []) => {
+    const keep = new Set([...LEDGER_11_1, ...extra]);
+    return (await plan(LOCAL)).filter(
+      (step) =>
+        !step.name.startsWith("verify:") &&
+        (!(step.name.startsWith("upstream:") || step.name.startsWith("96bulls:")) || keep.has(step.name)),
+    );
+  };
+  const schemaRows = async (db: PGlite) =>
+    (
+      await db.query<{ name: string }>(
+        "SELECT name FROM sessions.__96bulls_migrations WHERE name LIKE 'upstream:%' OR name LIKE '96bulls:%' ORDER BY name",
+      )
+    ).rows.map((r) => r.name);
+
+  test("a 2026.11.1 ledger (047030 missing before recorded steps) upgrades end to end: 047030 applied, ledger complete", async () => {
+    expect(LEDGER_11_1).toHaveLength(92);
+    expect(LEDGER_11_1).not.toContain(LATE);
+    const db = await fresh();
+    expect(
+      await failure(runMigrations(client(db), { profile: { ...LOCAL, verify: false }, steps: await image11_1() })),
+    ).toBeNull();
+    expect(await schemaRows(db)).toEqual([...LEDGER_11_1].sort());
+
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+    const all = (await plan(LOCAL))
+      .map((s) => s.name)
+      .filter((n) => n.startsWith("upstream:") || n.startsWith("96bulls:"))
+      .sort();
+    expect(await schemaRows(db)).toEqual(all);
+    expect(
+      (await db.query<{ t: string | null }>("SELECT to_regclass('sessions.__96bulls_frozen_copy_progress')::text AS t")).rows[0]?.t,
+    ).toBe("sessions.__96bulls_frozen_copy_progress");
+    expect(await schemaVerdict(await expectedSchema(), transact(db))).toEqual({ ok: true });
+    // And the upgraded ledger is an ordinary complete prefix from now on.
+    expect(await failure(runMigrations(client(db), { profile: LOCAL }))).toBeNull();
+  });
+
+  test("the 047030 allowance stays strict: with a step after 2026.11.1's last recorded, its absence is ledger_gap", async () => {
+    const db = await fresh();
+    await runMigrations(client(db), {
+      profile: { ...LOCAL, verify: false },
+      steps: await image11_1(["upstream:20261105057030_selfhost_erase_directory_membership.sql"]),
+    });
+    const before = await snapshot(db);
+    const error = await failure(runMigrations(client(db), { profile: LOCAL }));
+    expect(error?.code).toBe("ledger_gap");
+    expect(error?.message).toContain(LATE);
+    expect(await snapshot(db)).toEqual(before);
+  });
+
+  test("the 047030 allowance is bound to the reviewed bytes and to its shipped range", () => {
+    const lane = [LATE, "upstream:20261105050000_operator_session_erase.sql", "upstream:20261105057010_upload_consent.sql", "upstream:20261105057030_selfhost_erase_directory_membership.sql"];
+    const reviewed = migrateGuards.MIGRATION_LATE_INSERTIONS[0]!.sha;
+    const ledger = new Map([[lane[1]!, "x"], [lane[2]!, "x"]]);
+    expect([...migrateGuards.lateInsertionsAllowed(lane, ledger, () => reviewed)]).toEqual([LATE]);
+    expect([...migrateGuards.lateInsertionsAllowed(lane, ledger, () => "edited")]).toEqual([]);
+    expect([...migrateGuards.lateInsertionsAllowed(lane, new Map([...ledger, [lane[3]!, "x"]]), () => reviewed)]).toEqual([]);
+    expect([...migrateGuards.lateInsertionsAllowed(lane, new Map([...ledger, [LATE, "x"]]), () => reviewed)]).toEqual([]);
+  });
+
   test("a contiguous prefix whose unrecorded later steps were applied anyway: refused, nothing marked", async () => {
     const db = await fresh();
     await runMigrations(client(db), { profile: LOCAL });

@@ -87,6 +87,48 @@ export const MIGRATION_RENAME_ALIASES = [
   },
 ] as const;
 
+// A step inserted into its lane AFTER later steps of that lane had already shipped. The
+// 2026.11.1 image (source 4f32501a) recorded every upstream step through
+// 20261105057010_upload_consent; 20261105047030_frozen_copy_progress was added a day later
+// (d2ed4e70) and sorts before 050000, so every database that image migrated has a hole
+// before steps it already recorded, and the contiguous-prefix guard refused the upgrade
+// (ledger_gap). The one exception: the step may be unrecorded while later steps of its lane
+// are recorded, as long as no recorded step sorts after `shipped_through` (the last step
+// that shipped before it existed) and the file is exactly `sha` (the reviewed bytes, so an
+// edit can't ride this). The migrator then applies it in its normal order, before the
+// steps that are still pending. Safe after 050000-057010: it creates one new owner-only
+// table and one statement trigger on sessions.ingest_frozen_source_receipts (010000) that
+// calls sessions.ingest_privacy_authority_guard() (041000); no step after it reads,
+// alters or replaces any of them. Any other gap, or this one with a later step recorded,
+// still refuses. Pinned by __tests__/fixtures/released-ledgers/2026.11.1.json.
+export const MIGRATION_LATE_INSERTIONS = [
+  {
+    migration: "upstream:20261105047030_frozen_copy_progress.sql",
+    sha: "95cca210dd449c8dab40169fafdba7d0cf2d0e84d925b0d576b80cfa145e86cd",
+    shipped_through: "upstream:20261105057010_upload_consent.sql",
+  },
+] as const;
+
+/**
+ * The late insertions this ledger may lack: unrecorded, the step file exactly the reviewed
+ * sha, and nothing recorded in its lane beyond `shipped_through`. `sha` maps a step name to
+ * its file's sha256.
+ */
+export function lateInsertionsAllowed(
+  laneSteps: readonly string[],
+  ledger: ReadonlyMap<string, string>,
+  sha: (name: string) => string | undefined,
+): Set<string> {
+  const allowed = new Set<string>();
+  for (const l of MIGRATION_LATE_INSERTIONS) {
+    if (!laneSteps.includes(l.migration) || ledger.has(l.migration)) continue;
+    if (sha(l.migration) !== l.sha) continue;
+    if (laneSteps.some((n) => n > l.shipped_through && ledger.has(n))) continue;
+    allowed.add(l.migration);
+  }
+  return allowed;
+}
+
 export type MigrationAlias = (typeof MIGRATION_CHECKSUM_ALIASES)[number];
 
 export function migrationChecksumMatches(
@@ -1406,8 +1448,17 @@ export async function sequencePreflight(
       "ledger_gap",
       `${recordedBulls[0]} is recorded without any upstream migration; nothing is marked, see the runbook decision point`,
     );
+  const sql = await Promise.all(
+    schemaSteps.map((s) => readFile(s.path, "utf8")),
+  );
+  const fileSha = new Map(
+    names.map((n, i) => [n, createHash("sha256").update(sql[i]!).digest("hex")] as const),
+  );
   for (const lane of lanes) {
-    const ordered = laneNames(lane);
+    // A reviewed late insertion (MIGRATION_LATE_INSERTIONS) may be missing from an older
+    // image's prefix; it is applied in order like any pending step.
+    const late = lateInsertionsAllowed(laneNames(lane), ledger, (n) => fileSha.get(n));
+    const ordered = laneNames(lane).filter((n) => !late.has(n));
     let k = 0;
     while (k < ordered.length && ledger.has(ordered[k]!)) k++;
     const beyond = ordered.slice(k).find((name) => ledger.has(name));
@@ -1417,12 +1468,9 @@ export async function sequencePreflight(
         `${ordered[k]} is not recorded but ${beyond} is; ${lane.slice(0, -1)} migrations must be one contiguous prefix, nothing is marked, see the runbook decision point`,
       );
   }
-  const sql = await Promise.all(
-    schemaSteps.map((s) => readFile(s.path, "utf8")),
-  );
   for (let i = 0; i < names.length; i++) {
     if (!ledger.has(names[i]!)) continue;
-    const sha = createHash("sha256").update(sql[i]!).digest("hex");
+    const sha = fileSha.get(names[i]!)!;
     if (!migrationChecksumMatches(names[i]!, ledger.get(names[i]!)!, sha))
       throw guardError(
         "migration_changed",
