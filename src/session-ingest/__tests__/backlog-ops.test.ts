@@ -73,8 +73,8 @@ const dispatchEnv = (mode: BacklogOpsMode, extra: Record<string, string> = {}) =
 
 // ---- dispatch ----
 
-test("six modes; executes are dormant and refuse before anything else while disabled", () => {
-  expect([...BACKLOG_OPS_MODES]).toEqual(["backfill-dry", "backfill-execute", "export-dry", "export-execute", "drain-dry", "drain-execute"]);
+test("seven modes (presence dry only); executes are dormant and refuse before anything else while disabled", () => {
+  expect([...BACKLOG_OPS_MODES]).toEqual(["backfill-dry", "backfill-execute", "export-dry", "export-execute", "drain-dry", "drain-execute", "presence-dry"]);
   expect(BACKLOG_OPS_EXECUTE_ENABLED).toBe(false);
   for (const mode of BACKLOG_OPS_MODES) {
     const exec = mode.endsWith("-execute");
@@ -126,7 +126,8 @@ test("target variables are shape-checked: key in region, roles in the key's acco
 
 test("argv is fixed: no org unless scoped, never a checkpoint or start key; dry runs omit the key; execute names it; drain gets no database", () => {
   const t = backlogOpsTarget(target);
-  for (const mode of BACKLOG_OPS_MODES) {
+  // presence-dry's argv has its own test (session-presence.test.ts).
+  for (const mode of BACKLOG_OPS_MODES.filter((m) => !m.startsWith("presence-"))) {
     const d = backlogOpsDispatch(dispatchEnv(mode, mode.startsWith("drain") ? { BACKLOG_OPS_MAX_OBJECTS: "500" } : {}), true);
     const spec = backlogOpsToolArgs(d, t);
     const exec = mode.endsWith("-execute");
@@ -453,7 +454,7 @@ test("gate: bound runs must be this workflow, this sha, success, attempt 1, the 
 test("workflow: dispatch inputs, gates, one credential step, OIDC, protected vars, counts-only receipt, one op at a time", () => {
   const yml = readFileSync(fileURLToPath(new URL("../../../" + BACKLOG_OPS_WORKFLOW, import.meta.url)), "utf8");
   const code_ = yml.split("\n").filter((l) => !l.trimStart().startsWith("#")).join("\n");
-  expect(yml).toContain("options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute]");
+  expect(yml).toContain("options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute, presence-dry]");
   expect(yml).toContain("run-name: ${{ github.event_name == 'workflow_dispatch' && format('backlog ops {0} {1}', inputs.mode, inputs.sha)");
   expect(backlogOpsRunName("drain-dry", sha)).toBe(`backlog ops drain-dry ${sha}`);
   // Dispatches serialise with every guarded production operator on the owner database.
@@ -468,12 +469,13 @@ test("workflow: dispatch inputs, gates, one credential step, OIDC, protected var
   // Only the operate job may mint an OIDC token.
   expect(code_.match(/id-token: write/g)?.length).toBe(1);
   expect(yml).toContain("id-token: write");
-  // Two secrets, both only in the one credential step: the owner URL (database tools only) and the org scope (a
-  // secret, never a variable, so this public repository's logs mask the org ids).
-  expect(yml.match(/secrets\./g)?.length).toBe(2);
+  // Three secrets, all only in the one credential step: the owner URL (database tools only), the org scope (a
+  // secret, never a variable, so this public repository's logs mask the org ids) and presence-dry's session id.
+  expect(yml.match(/secrets\./g)?.length).toBe(3);
   expect(yml).toContain("BACKLOG_OPS_ORGS: ${{ secrets.BACKLOG_OPS_ORGS }}");
   expect(yml).not.toContain("vars.BACKLOG_OPS_ORGS");
-  expect(yml).toContain("SUPABASE_MIGRATION_OWNER_URL: ${{ (startsWith(inputs.mode, 'backfill-') || startsWith(inputs.mode, 'export-')) && secrets.SUPABASE_MIGRATION_OWNER_URL || '' }}");
+  expect(yml).toContain("SUPABASE_MIGRATION_OWNER_URL: ${{ (startsWith(inputs.mode, 'backfill-') || startsWith(inputs.mode, 'export-') || inputs.mode == 'presence-dry') && secrets.SUPABASE_MIGRATION_OWNER_URL || '' }}");
+  expect(yml).toContain("SESSION_PRESENCE_SESSION: ${{ inputs.mode == 'presence-dry' && secrets.SESSION_PRESENCE_SESSION || '' }}");
   for (const v of ["BACKLOG_OPS_BUCKET", "BACKLOG_OPS_REGION", "BACKLOG_OPS_KMS_KEY_ARN", "BACKLOG_OPS_DRY_ROLE_ARN", "BACKLOG_OPS_EXECUTE_ROLE_ARN"])
     expect(yml).toContain(`${v}: \${{ vars.${v} }}`);
   expect(yml).not.toContain("configure-aws-credentials");

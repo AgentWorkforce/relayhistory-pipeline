@@ -12,6 +12,11 @@
  * against the pinned release connection (releaseConnection) and handed to the tool in one normal form
  * (sslmode=verify-full; ownerClientConfig pins TLS to the Supabase CA itself and never forwards channel_binding).
  *
+ * presence-dry (dry only) also reads the dry environment's secret SESSION_PRESENCE_SESSION (backlogOpsPresenceSession:
+ * one lowercase UUID or [A-Za-z0-9_-]{8,128} token, refused with fixed codes otherwise) and hands it to the tool only
+ * in the same stdin payload, {"dbUrl": ..., "session": ...}. The value is never printed, masked by an echoed command,
+ * put in argv or written to the receipt; every other mode refuses a non-empty value.
+ *
  * The child's single stdout summary line becomes a counts-only receipt (any non-code string refuses it), written to
  * $RUNNER_TEMP/backlog-ops-out and echoed to the log. The step's exit code is the tool's.
  */
@@ -25,6 +30,7 @@ import {
   BACKLOG_OPS_SESSION_SECONDS,
   backlogOpsBindings,
   backlogOpsDispatch,
+  backlogOpsPresenceSession,
   backlogOpsReceipt,
   backlogOpsRole,
   backlogOpsScope,
@@ -64,9 +70,12 @@ export function backlogOpsChildSpawn(
   d: BacklogOpsDispatch,
   aws: { accessKeyId: string; secretAccessKey: string; sessionToken: string },
   dbUrl: string | null,
+  session: string | null = null,
 ) {
   const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, backlogOpsScope(env));
   if (spec.needsDb !== (dbUrl !== null)) refuse("backlog_ops_db_binding");
+  // The session reaches the presence tool, and only it, beside the URL on stdin.
+  if ((d.mode === "presence-dry") !== (session !== null) || (session !== null && dbUrl === null)) refuse("backlog_ops_session_binding");
   const childEnv: Record<string, string> = {};
   for (const key of BACKLOG_OPS_CHILD_ENV) if (typeof env[key] === "string") childEnv[key] = env[key]!;
   childEnv.AWS_ACCESS_KEY_ID = aws.accessKeyId;
@@ -76,7 +85,7 @@ export function backlogOpsChildSpawn(
     command: process.execPath,
     args: [join(ROOT, spec.script), ...spec.args],
     env: childEnv,
-    input: dbUrl === null ? null : JSON.stringify({ dbUrl }) + "\n",
+    input: dbUrl === null ? null : JSON.stringify(session === null ? { dbUrl } : { dbUrl, session }) + "\n",
   };
 }
 
@@ -132,21 +141,10 @@ function writePrivate(path: string, value: unknown): void {
   renameSync(temp, path);
 }
 
-export async function backlogOpsRun(env: Record<string, string | undefined>) {
-  const d = backlogOpsDispatch(env);
-  if (env.GITHUB_SHA !== d.sha || !/^[1-9][0-9]*$/u.test(env.GITHUB_RUN_ID ?? "")) refuse("backlog_ops_checkout");
-  const scope = backlogOpsScope(env);
-  // GitHub masks the secret's whole value; mask each org too, so a tool line naming one org never shows it.
-  for (const org of scope.orgs ?? []) console.log(`::add-mask::${org}`);
-  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, scope);
-  checkBoundReceipts(env, d);
-  const paths = backlogOpsPaths(env);
-  if (existsSync(paths.receipt)) refuse("backlog_ops_receipt_exists");
-  // Credentials from here on: the database URL (backfill, export) and the role session.
-  const dbUrl = spec.needsDb ? toolDbUrl(env.SUPABASE_MIGRATION_OWNER_URL) : null;
-  const aws = await assumeRole(env, backlogOpsRole(d, t), t.region, backlogOpsSessionName(d.mode, env.GITHUB_RUN_ID!));
-  const child = backlogOpsChildSpawn(env, d, aws, dbUrl);
-  const { code, stdout } = await new Promise<{ code: number; stdout: string }>((resolve) => {
+export type ChildSpec = ReturnType<typeof backlogOpsChildSpawn>;
+/** Run the tool child: stdin from the spec, stdout collected (bounded), stderr to the step log. */
+function runChild(child: ChildSpec): Promise<{ code: number; stdout: string }> {
+  return new Promise((resolve) => {
     const p = spawn(child.command, child.args, { cwd: ROOT, env: child.env, stdio: [child.input === null ? "ignore" : "pipe", "pipe", "inherit"] });
     let out = "";
     p.stdout!.on("data", (chunk: Buffer) => { if (out.length < STDOUT_LIMIT) out += chunk.toString("utf8"); });
@@ -154,6 +152,29 @@ export async function backlogOpsRun(env: Record<string, string | undefined>) {
     p.on("error", () => resolve({ code: 1, stdout: "" }));
     p.on("close", (c) => resolve({ code: c ?? 1, stdout: out }));
   });
+}
+
+export async function backlogOpsRun(
+  env: Record<string, string | undefined>,
+  deps: { fetcher?: typeof fetch; runChild?: (child: ChildSpec) => Promise<{ code: number; stdout: string }> } = {},
+) {
+  const d = backlogOpsDispatch(env);
+  if (env.GITHUB_SHA !== d.sha || !/^[1-9][0-9]*$/u.test(env.GITHUB_RUN_ID ?? "")) refuse("backlog_ops_checkout");
+  // presence-dry's session id (and, for every other mode, that none was passed), before any credential. Never logged:
+  // GitHub masks the secret's value, and no ::add-mask:: line is echoed for it.
+  const session = backlogOpsPresenceSession(env, d);
+  const scope = backlogOpsScope(env);
+  // GitHub masks the secret's whole value; mask each org too, so a tool line naming one org never shows it.
+  for (const org of scope.orgs ?? []) console.log(`::add-mask::${org}`);
+  const t = backlogOpsTarget(env), spec = backlogOpsToolArgs(d, t, scope);
+  checkBoundReceipts(env, d);
+  const paths = backlogOpsPaths(env);
+  if (existsSync(paths.receipt)) refuse("backlog_ops_receipt_exists");
+  // Credentials from here on: the database URL (backfill, export, presence) and the role session.
+  const dbUrl = spec.needsDb ? toolDbUrl(env.SUPABASE_MIGRATION_OWNER_URL) : null;
+  const aws = await assumeRole(env, backlogOpsRole(d, t), t.region, backlogOpsSessionName(d.mode, env.GITHUB_RUN_ID!), deps.fetcher);
+  const child = backlogOpsChildSpawn(env, d, aws, dbUrl, session);
+  const { code, stdout } = await (deps.runChild ?? runChild)(child);
   let receipt;
   try { receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code, stdout, scope.id); }
   catch (e) { receipt = backlogOpsReceipt(d, env.GITHUB_RUN_ID!, code || 1, JSON.stringify({ refused: (e as { code?: string }).code ?? "receipt" }), scope.id); }

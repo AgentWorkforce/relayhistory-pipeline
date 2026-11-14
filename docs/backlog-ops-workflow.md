@@ -21,9 +21,13 @@ See [decision 0005](decisions/0005-s3-native-upload-ledger.md), "The buffered ba
 | `export-execute` | accepted sidecars, per-org completion | `DRY <export-dry run> BACKFILL <backfill-execute run>` |
 | `drain-dry` | nothing | none |
 | `drain-execute` | canonical layout, index, re-arm and drained markers | `DRY <drain-dry run> BACKFILL <backfill-execute run> EXPORT <export-execute run>` |
+| `presence-dry` | nothing (dry only; there is no `presence-execute`) | none |
 
 The confirmation is exactly `<MODE uppercase> <sha> DRY <id> [BACKFILL <id>] [EXPORT <id>]`, for example
 `DRAIN-EXECUTE <sha> DRY 111 BACKFILL 222 EXPORT 333`.
+
+`presence-dry` is outside the sequence: a diagnostic for one session, described in
+[Session presence (presence-dry)](#session-presence-presence-dry).
 
 Run them in this order, all at the same `main` commit:
 
@@ -120,6 +124,69 @@ They are shape-checked: the key must be in the region, and both roles must be in
 
 Receipts are counts only. Every leaf is a number, a boolean or a short lowercase code; any other string, such as an
 id, a key or a URL, refuses the receipt. They are kept for 30 days as the `backlog-ops-receipt` artifact.
+
+## Session presence (presence-dry)
+
+**Purpose.** Support diagnosis of ONE session whose dashboard shows "No conversation recorded yet": it counts how
+far the session's rows got through ingest, the owner buffer, custody and publication. It reads the owner database
+only, in one `REPEATABLE READ READ ONLY` transaction that always ends in `ROLLBACK`. It writes nothing, reads no S3
+object and binds no other run. The tool is `scripts/session-presence.ts` (`src/session-ingest/session-presence.ts`).
+
+**Inputs.** The `presence-dry` mode, the exact `main` sha, no `confirmation`, and no bound run ids. It runs in the dry
+environment `session-schema-production` with the read-only role and `SUPABASE_MIGRATION_OWNER_URL`. All gates above
+apply unchanged. `BACKLOG_OPS_ORGS`, if set, scopes every count to those orgs (receipt `scope` `orgs_<n>`, else `all`).
+
+**The session id is a secret.** The owner sets the environment **secret** `SESSION_PRESENCE_SESSION` on
+`session-schema-production` immediately before the dispatch and **removes it immediately after** the run. The value
+is one lowercase UUID or a `[A-Za-z0-9_-]{8,128}` token. The workflow passes it only to the credential step and only
+for `presence-dry`. That step hands it to the tool on its stdin pipe beside the database URL. It never goes into argv,
+a log line or the receipt. The refusals are fixed codes and never contain the value:
+
+- `backlog_ops_presence_session_missing`: the secret is unset or empty.
+- `backlog_ops_presence_session_invalid`: any other shape.
+- `backlog_ops_presence_session_unexpected`: another mode saw the secret non-empty, so remove it after the run.
+- `backlog_ops_presence_dry_only`: the dispatch named `presence-execute`, or an execute path reached the presence
+  tool.
+- `backlog_ops_bound_presence_receipt`: a presence receipt was bound as a dry, backfill or export run.
+
+**Receipt.** Every value is a count, `null` when that count hit the 120 s statement timeout, or a fixed code. There
+are no ids, keys, URLs, digests or content. With `BACKLOG_OPS_ORGS` unset, most counts scan their table (the tables
+are keyed tenant-first). Each one is bounded by the timeout.
+
+| Field | Counts |
+| --- | --- |
+| `ownership` | `ingest_session_ownership` rows naming the session (1 is normal) |
+| `claims` | accepted upload claims (`ingest_claim_attempts`) whose records name the session |
+| `claim_sessions` | `ingest_claim_sessions` rows (the v2 reader's session index, written only once its policy enables writes) |
+| `buffered_stages` | owner-buffered stage rows of those claims that the buffered reader could serve. This is an upper bound, because the reader's runtime gates are not evaluated |
+| `outbox`, `outbox_buffered` | publication outbox rows of those batches, in any state and still `buffered` |
+| `lazy_slots` | `ingest_lazy_native_slots` currently owned by the session |
+| `revisions` | `ingest_record_revisions` of the session |
+| `heads`, `published_heads` | `ingest_publication_heads` rows, and the published ones (`live` or carrying a current pointer) |
+| `dispositions` | `heads_building`, `heads_live`, `heads_retired`: heads per state (the fixed `state` enum) |
+| `published_objects` | live objects of live publication generations |
+| `canonical_pointers`, `canonical_pointers_live` | `session_index` pointers the read API looks for first, and the undeleted ones |
+| `generation_stable` | whether the publication marker (heads and canonical pointers of the session) was identical when read first and last |
+| `complete`, `incomplete_reason` | `true` and `none`, or `false` with one of the codes below |
+
+**`incomplete_reason` codes.** When more than one applies, the first in this list is reported. The counts are still
+emitted.
+
+1. `generation_unstable`: the first and last marker reads differed.
+2. `generation_unobserved`: a marker read timed out.
+3. `multi_ownership`: more than one ownership row. Read the counts with care, because they span every owner.
+4. `count_timeout`: some count is `null`.
+
+**Reading it against "No conversation recorded yet":**
+
+| Shape | Meaning |
+| --- | --- |
+| everything 0 | Nothing arrived for this session id, or it arrived under another org (check `BACKLOG_OPS_ORGS`) or another id. Look at the uploader. |
+| `ownership` 1, `claims` > 0, `buffered_stages` > 0, `published_heads` 0 | An unpublished buffered stage: accepted and buffered, never published. The page can show it only through the owner-buffered reader (flag, allowlist and admission), and after that only through the drain. |
+| `buffered_stages` 0, `outbox` > 0, `outbox_buffered` 0, `published_heads` 0 | The buffer left the outbox without a publication. Check the drain and publisher receipts. |
+| `published_heads` > 0, `canonical_pointers_live` 0 | Published, but there is no live canonical pointer for the read API. Check the index step, or a tombstone if `canonical_pointers` > 0. |
+| `canonical_pointers_live` > 0 | The data is published and indexed. Look at the read path and access (org, workspace, user), not ingest. |
+| `heads_retired` > 0 and no live head | The session's publication was retired (deleted or reset). |
 
 ## IAM
 

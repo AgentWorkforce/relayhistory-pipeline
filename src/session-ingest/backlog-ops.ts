@@ -28,6 +28,14 @@
  *
  * Receipts are counts only: every leaf a number, a boolean or a short lowercase code; any other string (an id, a
  * key, a URL) refuses the receipt. Errors carry fixed codes only.
+ *
+ * presence-dry (scripts/session-presence.ts, src/session-ingest/session-presence.ts) is a seventh, DRY-ONLY mode: a
+ * counts-only look at ONE session for support diagnosis ("No conversation recorded yet"). There is no
+ * presence-execute: the dispatch refuses it with backlog_ops_presence_dry_only before anything else, and every
+ * execute-only path refuses the presence tool again. It binds nothing, runs in the dry environment with the read-only
+ * role, and takes its session id only from the dry environment's secret SESSION_PRESENCE_SESSION
+ * (backlogOpsPresenceSession), handed to the tool on its stdin pipe beside the database URL, never argv, a log or the
+ * receipt.
  */
 import { createHash } from "node:crypto";
 
@@ -36,10 +44,12 @@ export const BACKLOG_OPS_EXECUTE_ENABLED: boolean = false;
 
 export const BACKLOG_OPS_WORKFLOW = ".github/workflows/backlog-ops.yml";
 export const BACKLOG_OPS_MODES = [
-  "backfill-dry", "backfill-execute", "export-dry", "export-execute", "drain-dry", "drain-execute",
+  "backfill-dry", "backfill-execute", "export-dry", "export-execute", "drain-dry", "drain-execute", "presence-dry",
 ] as const;
 export type BacklogOpsMode = (typeof BACKLOG_OPS_MODES)[number];
-export type BacklogOpsTool = "backfill" | "export" | "drain";
+export type BacklogOpsTool = "backfill" | "export" | "drain" | "presence";
+/** Tools with a dry mode only: no `<tool>-execute` exists, is accepted or can be enabled. */
+export const BACKLOG_OPS_DRY_ONLY_TOOLS: readonly BacklogOpsTool[] = ["presence"];
 /** The receipt artifact of every run (retention 30 days) and its single file. */
 export const BACKLOG_OPS_RECEIPT_ARTIFACT = "backlog-ops-receipt";
 export const BACKLOG_OPS_RECEIPT_FILE = "backlog-ops-receipt.json";
@@ -119,6 +129,8 @@ export function backlogOpsDispatch(
   enabled: boolean = BACKLOG_OPS_EXECUTE_ENABLED,
 ): BacklogOpsDispatch {
   const mode = env.BACKLOG_OPS_MODE ?? "", sha = env.BACKLOG_OPS_SHA ?? "";
+  // A dry-only tool's execute is not a mode: refused with its own code, before the dormant switch is even read.
+  if (BACKLOG_OPS_DRY_ONLY_TOOLS.some((t) => mode === `${t}-execute`)) refuse("backlog_ops_presence_dry_only");
   const dryRun = env.BACKLOG_OPS_DRY_RUN ?? "", backfillRun = env.BACKLOG_OPS_BACKFILL_RUN ?? "",
     exportRun = env.BACKLOG_OPS_EXPORT_RUN ?? "", maxObjects = env.BACKLOG_OPS_MAX_OBJECTS ?? "",
     confirmation = env.BACKLOG_OPS_CONFIRMATION ?? "";
@@ -181,9 +193,21 @@ export const BACKLOG_OPS_BACKFILL_PAGING = ["--page-size", "5000", "--row-page-s
 /** The export's per-statement timeout: its org, candidate and per-user reads over the buffer are as heavy (same 30 s default). */
 export const BACKLOG_OPS_EXPORT_PAGING = ["--statement-timeout-ms", "600000"] as const;
 
+/**
+ * The presence tool's per-count statement timeout. Its counts run one after another in ONE read-only transaction,
+ * each in its own savepoint; a count that hits this timeout is reported as null with complete=false instead of
+ * failing the run. Worst case is SESSION_PRESENCE_COUNTS x 120 s (about 20 min), well inside the 355 min job.
+ */
+export const BACKLOG_OPS_PRESENCE_TIMEOUT = ["--statement-timeout-ms", "120000"] as const;
+
 /** Fixed argv for the tool: the scope's validated orgs only, never a checkpoint, a start key or an unvalidated value. */
 export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget, scope: BacklogOpsScope = { orgs: null, id: BACKLOG_OPS_SCOPE_ALL }): { script: string; args: string[]; needsDb: boolean } {
   const tool = toolOf(d.mode), execute = isExecute(d.mode);
+  if (tool === "presence") {
+    // Dry only, no bucket, region or key (it reads no S3): the per-count timeout and the scope's orgs.
+    if (execute) refuse("backlog_ops_presence_dry_only");
+    return { script: "scripts/session-presence.ts", args: ["--dry-run", ...BACKLOG_OPS_PRESENCE_TIMEOUT, ...(scope.orgs ?? []).flatMap((o) => ["--org", o])], needsDb: true };
+  }
   const script = { backfill: "scripts/upload-fence-backfill.ts", export: "scripts/accepted-stage-export.ts", drain: "scripts/buffered-drain.ts" }[tool];
   const args = [execute ? "--execute" : "--dry-run", "--bucket", t.bucket, "--region", t.region,
     ...(execute ? ["--kms-key-arn", t.kmsKeyArn] : []),
@@ -194,7 +218,31 @@ export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget, s
 }
 
 /** The role for a mode: dry modes get the read-only role, executes the writer role. */
-export const backlogOpsRole = (d: BacklogOpsDispatch, t: BacklogOpsTarget) => (isExecute(d.mode) ? t.executeRoleArn : t.dryRoleArn);
+export const backlogOpsRole = (d: BacklogOpsDispatch, t: BacklogOpsTarget) => {
+  if (isExecute(d.mode) && BACKLOG_OPS_DRY_ONLY_TOOLS.includes(toolOf(d.mode))) refuse("backlog_ops_presence_dry_only");
+  return isExecute(d.mode) ? t.executeRoleArn : t.dryRoleArn;
+};
+
+/**
+ * presence-dry's one session id, from the dry environment's secret SESSION_PRESENCE_SESSION (trimmed as
+ * BACKLOG_OPS_ORGS is): a lowercase UUID or a bounded [A-Za-z0-9_-]{8,128} token. Missing or empty refuses
+ * backlog_ops_presence_session_missing, any other shape backlog_ops_presence_session_invalid; the value is never in
+ * an error. Every other mode must see it empty (the workflow passes it only to presence-dry):
+ * backlog_ops_presence_session_unexpected. Returns null for those modes.
+ */
+export const SESSION_PRESENCE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+export const SESSION_PRESENCE_TOKEN = /^[A-Za-z0-9_-]{8,128}$/u;
+export const isPresenceSession = (v: string) => SESSION_PRESENCE_UUID.test(v) || SESSION_PRESENCE_TOKEN.test(v);
+export function backlogOpsPresenceSession(env: Record<string, string | undefined>, d: Pick<BacklogOpsDispatch, "mode">): string | null {
+  const raw = (env.SESSION_PRESENCE_SESSION ?? "").trim();
+  if (toolOf(d.mode) !== "presence") {
+    if (raw !== "") refuse("backlog_ops_presence_session_unexpected");
+    return null;
+  }
+  if (raw === "") refuse("backlog_ops_presence_session_missing");
+  if (!isPresenceSession(raw)) refuse("backlog_ops_presence_session_invalid");
+  return raw;
+}
 
 /**
  * Counts only: every key a lowercase identifier, every leaf a finite number, a boolean, null or a short lowercase
@@ -247,6 +295,8 @@ const obj = (v: unknown): Record<string, any> | null => (v && typeof v === "obje
  * scope is unscoped), and (per tool) pass its readiness check.
  */
 export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; sha: string; run: string; scope?: string; kind?: "dry" | "backfill" | "export" }): void {
+  // A presence receipt never feeds an execute (presence binds nothing and nothing binds it).
+  if (toolOf(expect.mode) === "presence") refuse("backlog_ops_bound_presence_receipt");
   let r: Record<string, any> | null;
   try { r = obj(JSON.parse(raw)); } catch { r = null; }
   if (!r || r.contract !== BACKLOG_OPS_RECEIPT_CONTRACT || r.mode !== expect.mode || r.sha !== expect.sha ||
@@ -278,6 +328,10 @@ export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; s
 /** Which earlier runs an execute binds, with the mode each must have been. */
 export function backlogOpsBindings(d: BacklogOpsDispatch): Array<{ run: string; mode: BacklogOpsMode; kind: "dry" | "backfill" | "export" }> {
   const tool = toolOf(d.mode), out: Array<{ run: string; mode: BacklogOpsMode; kind: "dry" | "backfill" | "export" }> = [];
+  if (tool === "presence") {
+    if (d.dryRun || d.backfillRun || d.exportRun) refuse("backlog_ops_bindings");
+    return out;
+  }
   if (d.dryRun) out.push({ run: d.dryRun, mode: `${tool}-dry` as BacklogOpsMode, kind: "dry" });
   if (d.backfillRun) out.push({ run: d.backfillRun, mode: "backfill-execute", kind: "backfill" });
   if (d.exportRun) out.push({ run: d.exportRun, mode: "export-execute", kind: "export" });

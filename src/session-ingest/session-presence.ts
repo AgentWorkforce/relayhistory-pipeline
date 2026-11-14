@@ -1,0 +1,300 @@
+/**
+ * Counts-only presence of ONE session across the ingest, buffer, custody and publication tables, for support
+ * diagnosis of a dashboard that shows "No conversation recorded yet" (backlog-ops mode presence-dry,
+ * scripts/session-presence.ts, docs/backlog-ops-workflow.md "Session presence (presence-dry)").
+ *
+ * One transaction: BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY, SHOW transaction_read_only must be `on`, a
+ * bounded SET LOCAL statement_timeout, then one parameterised COUNT per entry of SESSION_PRESENCE_COUNTS (the session
+ * is $1, the optional org scope $2::text[]), each in its own savepoint, and ROLLBACK always. Every count is one
+ * snapshot. A count cancelled by the statement timeout (sqlstate 57014) is rolled back to its savepoint and reported
+ * as null with complete=false; any other error refuses the run. The publication generation marker
+ * (SESSION_PRESENCE_GENERATION_MARKER) is read first and last; generation_stable reports whether they matched, and
+ * complete=false with a fixed incomplete_reason code fails closed on an unstable or unobserved marker, more than one
+ * ownership row, or a timed-out count. Counts are still emitted.
+ *
+ * Index use. Most tables are keyed tenant-first (org_id, workspace_id, user_id, ...) and have no session-first
+ * index, so an UNSCOPED count of them is a sequential scan: ownership, claim_sessions, lazy_slots, revisions,
+ * heads, generations and canonical pointers. That is accepted here because the tool runs on demand for one session,
+ * read-only, in one REPEATABLE READ snapshot, and every count is bounded by the per-statement timeout (a count that
+ * runs over is null, never a hung run). With BACKLOG_OPS_ORGS set the same counts use the org-leading index
+ * (named per count below). The claim-driven counts (claims, buffered_stages, outbox, outbox_buffered) use the
+ * jsonb_path_ops GIN ingest_claim_attempts_records_gin_idx (044040) in either scope.
+ *
+ * The output never carries the session id, an org id, a key or a URL: numbers, booleans and the scope code only,
+ * and the caller still passes it through countsOnly().
+ */
+import { isPresenceSession } from "./backlog-ops.ts";
+
+export interface PresenceSql {
+  query(text: string, params?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>;
+}
+
+const ORG_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+export const SESSION_PRESENCE_MAX_ORGS = 64;
+export const SESSION_PRESENCE_MIN_TIMEOUT_MS = 1000;
+export const SESSION_PRESENCE_MAX_TIMEOUT_MS = 600000;
+
+/** `AND <alias>.org_id = ANY($2::text[])` when scoped; fixed text, never a value. */
+const org = (alias: string, scoped: boolean) => (scoped ? ` AND ${alias}.org_id = ANY($2::text[])` : "");
+/** The claims whose records name the session (any source): ingest_claim_attempts_records_gin_idx. */
+const claimsOf = (scoped: boolean) =>
+  `SELECT a.claim_token, a.org_id, a.workspace_id, a.origin_id, a.batch_id
+     FROM sessions.ingest_claim_attempts AS a
+    WHERE jsonb_typeof(a.records) = 'array'
+      AND a.records @> jsonb_build_array(jsonb_build_object('session_id', $1::text))${org("a", scoped)}`;
+
+export interface PresenceCount { columns: readonly string[]; sql: (scoped: boolean) => string }
+
+/**
+ * Each count, its table and its index (unscoped / scoped). Columns are the summary keys it fills.
+ */
+export const SESSION_PRESENCE_COUNTS: readonly PresenceCount[] = [
+  // ingest_session_ownership: rows naming the session (one per org/ws/user/origin/source; 1 is the normal case).
+  // PK (org_id, workspace_id, user_id, origin_id, source, session_id): unscoped = scan; scoped = PK org prefix.
+  { columns: ["ownership"], sql: (s) =>
+    `SELECT count(*)::int AS ownership FROM sessions.ingest_session_ownership AS w WHERE w.session_id = $1::text${org("w", s)}` },
+  // ingest_claim_attempts: accepted upload claims whose records name the session. GIN (records jsonb_path_ops).
+  { columns: ["claims"], sql: (s) => `SELECT count(*)::int AS claims FROM (${claimsOf(s)}) AS c` },
+  // ingest_claim_sessions (044080, the v2 reader's session index): ingest_claim_sessions_session_idx
+  // (org_id, workspace_id, user_id, source, session_id): unscoped = scan; scoped = index org prefix.
+  { columns: ["claim_sessions"], sql: (s) =>
+    `SELECT count(*)::int AS claim_sessions FROM sessions.ingest_claim_sessions AS cs WHERE cs.session_id = $1::text${org("cs", s)}` },
+  // Owner-buffered stage rows: ingest_stage_intents of those claims (UNIQUE (claim_token, stage_key)) that are the
+  // active stage of a buffered ingest_buffer_outbox row (ingest_buffer_outbox_active_stage_token_idx) of a committed,
+  // still-buffered ingest_batches row (PK). The structural predicates of the 047010 reader's candidate set; the
+  // reader's runtime gates (owner-buffered flag and workspace allowlist, admission epoch, resets, deletions, ancestor
+  // checks) are not evaluated, so this is an upper bound on what the reader can serve.
+  { columns: ["buffered_stages"], sql: (s) =>
+    `SELECT count(DISTINCT st.stage_token)::int AS buffered_stages
+       FROM (${claimsOf(s)}) AS c
+       JOIN sessions.ingest_stage_intents AS st ON st.claim_token = c.claim_token
+       JOIN sessions.ingest_buffer_outbox AS o ON o.active_stage_token = st.stage_token
+       JOIN sessions.ingest_batches AS b
+         ON b.org_id = o.org_id AND b.workspace_id = o.workspace_id AND b.origin_id = o.origin_id AND b.batch_id = o.batch_id
+      WHERE st.receipt_state = 'acknowledged' AND st.cleanup_state <> 'redacted'
+        AND o.state = 'buffered' AND o.user_id = st.user_id
+        AND b.state = 'committed' AND b.publication_state = 'buffered' AND b.committed_at IS NOT NULL` },
+  // ingest_buffer_outbox rows (publication outbox, any state, and those still `buffered`) of the batches those claims
+  // name: outbox PK (org_id, workspace_id, origin_id, batch_id).
+  { columns: ["outbox", "outbox_buffered"], sql: (s) =>
+    `SELECT count(*)::int AS outbox, (count(*) FILTER (WHERE o.state = 'buffered'))::int AS outbox_buffered
+       FROM sessions.ingest_buffer_outbox AS o
+      WHERE (o.org_id, o.workspace_id, o.origin_id, o.batch_id) IN (SELECT c.org_id, c.workspace_id, c.origin_id, c.batch_id FROM (${claimsOf(s)}) AS c)` },
+  // ingest_lazy_native_slots currently owned by the session. No index on current_session: unscoped = scan (the
+  // largest table; bounded by the timeout, null if it runs over); scoped = ingest_lazy_native_slots_org_id_idx (org_id).
+  { columns: ["lazy_slots"], sql: (s) =>
+    `SELECT count(*)::int AS lazy_slots FROM sessions.ingest_lazy_native_slots AS l
+      WHERE l.current_owner IS NOT NULL AND l.current_session = $1::text${org("l", s)}` },
+  // ingest_record_revisions of the session. ingest_record_revisions_session_idx
+  // (org_id, workspace_id, user_id, origin_id, source, session_id): unscoped = scan; scoped = index org prefix.
+  { columns: ["revisions"], sql: (s) =>
+    `SELECT count(*)::int AS revisions FROM sessions.ingest_record_revisions AS r WHERE r.session_id = $1::text${org("r", s)}` },
+  // ingest_publication_heads: every head, and the published ones (state live or a current pointer key), as the
+  // reader's published exclusion counts them. PK (org_id, ws, user, origin, source, session_id): unscoped = scan.
+  // The three heads_<state> columns are the `dispositions` leaf: ingest_publication_heads.state is the fixed CHECK
+  // enum building|live|retired (20261104060000_ingest_canonical_publication, unchanged since), so each is a bounded count.
+  { columns: ["heads", "published_heads", "heads_building", "heads_live", "heads_retired"], sql: (s) =>
+    `SELECT count(*)::int AS heads, (count(*) FILTER (WHERE h.state = 'live' OR h.current_key IS NOT NULL))::int AS published_heads,
+            (count(*) FILTER (WHERE h.state = 'building'))::int AS heads_building,
+            (count(*) FILTER (WHERE h.state = 'live'))::int AS heads_live,
+            (count(*) FILTER (WHERE h.state = 'retired'))::int AS heads_retired
+       FROM sessions.ingest_publication_heads AS h WHERE h.session_id = $1::text${org("h", s)}` },
+  // ingest_publication_objects still live in a live ingest_publication_generations row of the session. Generations:
+  // unscoped = scan, scoped = ingest_publication_generations_org_id_idx; objects by ingest_publication_objects_cleanup_idx
+  // (generation, cleanup_state, object_key).
+  { columns: ["published_objects"], sql: (s) =>
+    `SELECT count(*)::int AS published_objects
+       FROM sessions.ingest_publication_generations AS g
+       JOIN sessions.ingest_publication_objects AS po ON po.generation = g.generation AND po.cleanup_state = 'live'
+      WHERE g.session_id = $1::text AND g.state = 'live'${org("g", s)}` },
+  // sessions.session_index: the canonical pointers the read API's turns/metadata routes look for first
+  // (session-turns-source.ts SESSION_HARNESSES_SQL: session_id or canonical_session_id), and the live ones
+  // (deleted_at IS NULL). si_session (org_id, session_id): unscoped = scan; scoped = si_session for session_id, the
+  // canonical_session_id arm filtered within the org (bounded by the timeout).
+  { columns: ["canonical_pointers", "canonical_pointers_live"], sql: (s) =>
+    `SELECT count(*)::int AS canonical_pointers, (count(*) FILTER (WHERE p.deleted_at IS NULL))::int AS canonical_pointers_live
+       FROM sessions.session_index AS p
+      WHERE (coalesce(p.canonical_session_id, p.session_id) = $1::text OR p.session_id = $1::text)${org("p", s)}` },
+];
+
+/**
+ * The publication generation marker, read as the FIRST and the LAST statement of the transaction and compared
+ * in-process (generation_stable). It is what the publisher advances and the reader pins:
+ *  - every ingest_publication_heads row of the session: (generation, pointer_revision, row_version, state,
+ *    current_key), the publisher's per-session head (20261104060000), which the deliver path binds a claim to;
+ *  - every sessions.session_index pointer of the session (manifest_key, revision, content_sha256, deleted_at), the
+ *    inputs of the read API's canonicalSourceGeneration (session-read-api/canonical.ts), which the reader compares
+ *    before and after a read (source_generation_changed).
+ * The rows are folded to ONE md5 in SQL; the digest is compared and dropped, never returned, logged or written (it
+ * is derived from keys). Under REPEATABLE READ both reads see one snapshot, so a mismatch means the counts did not
+ * come from one snapshot (for example a pooler that does not hold the transaction): fail closed with
+ * complete=false. Same index use as the heads and canonical_pointers counts (unscoped = scan, bounded by the timeout).
+ */
+export const SESSION_PRESENCE_GENERATION_MARKER = (s: boolean) =>
+  `SELECT count(*)::int AS rows, coalesce(md5(string_agg(m.x, ',' ORDER BY m.x)), '') AS marker FROM (
+     SELECT 'h' || (h.org_id, h.workspace_id, h.user_id, h.origin_id, h.source, h.generation, h.pointer_revision,
+                    h.row_version, h.state, h.current_key)::text AS x
+       FROM sessions.ingest_publication_heads AS h WHERE h.session_id = $1::text${org("h", s)}
+     UNION ALL
+     SELECT 'p' || (p.org_id, p.workspace_id, p.harness, p.session_id, p.machine_id, p.manifest_key, p.revision,
+                    p.content_sha256, p.deleted_at)::text AS x
+       FROM sessions.session_index AS p
+      WHERE (coalesce(p.canonical_session_id, p.session_id) = $1::text OR p.session_id = $1::text)${org("p", s)}
+   ) AS m`;
+
+/** heads_<state> columns that move under `dispositions` (fixed enum codes, bounded counts). */
+const DISPOSITION_COLUMNS = ["heads_building", "heads_live", "heads_retired"] as const;
+
+/**
+ * complete=false reasons, one fixed code, most serious first: generation_unstable (the marker differed between the
+ * first and last read), generation_unobserved (a marker read timed out), multi_ownership (more than one
+ * ingest_session_ownership row: the session id is claimed by more than one org/workspace/user/origin/source, so
+ * the counts mix owners), count_timeout (a count timed out and is null). `none` when complete.
+ */
+export const SESSION_PRESENCE_INCOMPLETE_REASONS = ["none", "generation_unstable", "generation_unobserved", "multi_ownership", "count_timeout"] as const;
+
+export type SessionPresenceSummary = Record<string, number | null | boolean | string | Record<string, number | null>>;
+
+export interface SessionPresenceOptions {
+  session: string;
+  /** Lowercase org UUIDs (BACKLOG_OPS_ORGS) or null/empty for every org. */
+  orgs?: readonly string[] | null;
+  statementTimeoutMs: number;
+}
+
+const fail = (code: string): never => { throw new Error(code); };
+
+export async function sessionPresence(sql: PresenceSql, o: SessionPresenceOptions): Promise<SessionPresenceSummary> {
+  if (typeof o.session !== "string" || !isPresenceSession(o.session)) fail("session_presence_session_invalid");
+  const orgs = o.orgs && o.orgs.length ? [...o.orgs] : null;
+  if (orgs && (orgs.length > SESSION_PRESENCE_MAX_ORGS || new Set(orgs).size !== orgs.length || !orgs.every((x) => ORG_UUID.test(x))))
+    fail("session_presence_scope");
+  const ms = o.statementTimeoutMs;
+  if (!Number.isInteger(ms) || ms < SESSION_PRESENCE_MIN_TIMEOUT_MS || ms > SESSION_PRESENCE_MAX_TIMEOUT_MS) fail("session_presence_timeout");
+  const scoped = orgs !== null, params: unknown[] = scoped ? [o.session, orgs] : [o.session];
+  const out: SessionPresenceSummary = {};
+  let timedOut = false, generationStable = false;
+  let reason: (typeof SESSION_PRESENCE_INCOMPLETE_REASONS)[number] = "none";
+  await sql.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+  try {
+    const ro = await sql.query("SHOW transaction_read_only");
+    if (ro.rows[0]?.transaction_read_only !== "on") fail("session_presence_not_read_only");
+    await sql.query(`SET LOCAL statement_timeout = ${ms}`);
+    /** One statement in its own savepoint; null when the statement timeout (57014) cancels it, other errors refuse. */
+    const guarded = async (text: string): Promise<Record<string, unknown> | null> => {
+      await sql.query("SAVEPOINT session_presence_count");
+      try {
+        const row = (await sql.query(text, params)).rows[0] ?? {};
+        await sql.query("RELEASE SAVEPOINT session_presence_count");
+        return row;
+      } catch (e) {
+        if ((e as { code?: unknown } | null)?.code !== "57014") throw e;
+        await sql.query("ROLLBACK TO SAVEPOINT session_presence_count");
+        return null;
+      }
+    };
+    const marker = async (): Promise<string | null> => {
+      const row = await guarded(SESSION_PRESENCE_GENERATION_MARKER(scoped));
+      if (row === null) return null;
+      const n = Number(row.rows), m = row.marker;
+      if (!Number.isSafeInteger(n) || n < 0 || typeof m !== "string" || !(n === 0 ? m === "" : /^[0-9a-f]{32}$/u.test(m)))
+        fail("session_presence_marker_shape");
+      return `${n}:${m}`;
+    };
+    const first = await marker();
+    for (const c of SESSION_PRESENCE_COUNTS) {
+      const row = await guarded(c.sql(scoped));
+      if (row === null) {
+        timedOut = true;
+        for (const k of c.columns) out[k] = null;
+        continue;
+      }
+      for (const k of c.columns) {
+        const n = Number(row[k]);
+        if (!Number.isSafeInteger(n) || n < 0) fail("session_presence_count_shape");
+        out[k] = n;
+      }
+    }
+    const last = await marker();
+    if (first === null || last === null) reason = "generation_unobserved";
+    else if (first !== last) reason = "generation_unstable";
+    generationStable = first !== null && first === last;
+  } finally {
+    await sql.query("ROLLBACK").catch(() => undefined);
+  }
+  if (reason === "none" && typeof out.ownership === "number" && out.ownership > 1) reason = "multi_ownership";
+  if (reason === "none" && timedOut) reason = "count_timeout";
+  const dispositions: Record<string, number | null> = {};
+  for (const k of DISPOSITION_COLUMNS) { dispositions[k] = out[k] as number | null; delete out[k]; }
+  out.dispositions = dispositions;
+  out.scope = scoped ? `orgs_${orgs!.length}` : "all";
+  out.generation_stable = generationStable;
+  out.complete = reason === "none";
+  out.incomplete_reason = reason;
+  return out;
+}
+
+/** The tool's argv: `--dry-run` (required; there is no execute), `--statement-timeout-ms n`, `--org <uuid>` ... */
+export interface SessionPresenceArgs { orgs: string[]; statementTimeoutMs: number }
+export function parseSessionPresenceArgs(argv: readonly string[]): SessionPresenceArgs {
+  let dry = false, timeout: number | null = null;
+  const orgs: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === "--dry-run" && !dry) { dry = true; continue; }
+    const v = argv[i + 1];
+    if (a === "--statement-timeout-ms" && timeout === null && v !== undefined && /^[1-9][0-9]{3,5}$/u.test(v)) { timeout = Number(v); i++; continue; }
+    if (a === "--org" && v !== undefined && ORG_UUID.test(v) && !orgs.includes(v)) { orgs.push(v); i++; continue; }
+    fail("session_presence_args");
+  }
+  if (!dry || timeout === null || timeout < SESSION_PRESENCE_MIN_TIMEOUT_MS || timeout > SESSION_PRESENCE_MAX_TIMEOUT_MS ||
+      orgs.length > SESSION_PRESENCE_MAX_ORGS) fail("session_presence_args");
+  return { orgs: orgs.sort(), statementTimeoutMs: timeout! };
+}
+
+/** stdin: exactly {"dbUrl": "...", "session": "..."} on one line (at most 64 KiB). */
+export function parseSessionPresenceInput(text: string): { dbUrl: string; session: string } {
+  const line = text.split("\n")[0] ?? "";
+  if (line.length > 64 * 1024) fail("stdin_too_large");
+  let parsed: unknown;
+  try { parsed = JSON.parse(line); } catch { fail("stdin_invalid"); }
+  const p = parsed as { dbUrl?: unknown; session?: unknown } | null;
+  if (!p || typeof p !== "object" || Array.isArray(p) || Object.keys(p).sort().join(",") !== "dbUrl,session") fail("stdin_invalid");
+  if (typeof p!.dbUrl !== "string" || !p!.dbUrl) fail("db_url_required");
+  if (typeof p!.session !== "string" || p!.session === "") fail("session_presence_session_missing");
+  if (!isPresenceSession(p!.session as string)) fail("session_presence_session_invalid");
+  return { dbUrl: p!.dbUrl as string, session: p!.session as string };
+}
+
+/** A closed, redacted reason only: a pg error message can carry a host, a value or a tenant id. */
+export const presenceRedactedReason = (e: unknown): string => {
+  const code = (e as { code?: unknown } | null)?.code;
+  // Lowercased: the receipt admits only lowercase codes, and SQLSTATEs such as XX000 or 42P01 carry letters.
+  if (typeof code === "string" && /^[0-9A-Z]{5}$/u.test(code)) return "sqlstate_" + code.toLowerCase();
+  if ((e as { name?: unknown })?.name === "OwnerUrlError" && typeof code === "string" && /^[a-z0-9_]{1,32}$/u.test(code)) return "db_url_" + code;
+  const m = (e as Error)?.message;
+  return typeof m === "string" && /^[a-z0-9_]{1,64}$/u.test(m) ? m : "internal_error";
+};
+
+/**
+ * The tool body, injectable for tests: parse argv and stdin, connect, count, and return the one stdout line
+ * (the summary, or {"refused": <code>}) and the exit code. Nothing else is written.
+ */
+export async function sessionPresenceMain(
+  argv: readonly string[],
+  stdin: string,
+  connect: (dbUrl: string) => Promise<PresenceSql & { end?: () => Promise<unknown> }>,
+): Promise<{ line: string; code: number }> {
+  let client: (PresenceSql & { end?: () => Promise<unknown> }) | undefined;
+  try {
+    const args = parseSessionPresenceArgs(argv);
+    const input = parseSessionPresenceInput(stdin);
+    client = await connect(input.dbUrl);
+    const summary = await sessionPresence(client, { session: input.session, orgs: args.orgs, statementTimeoutMs: args.statementTimeoutMs });
+    return { line: JSON.stringify(summary), code: 0 };
+  } catch (e) {
+    return { line: JSON.stringify({ refused: presenceRedactedReason(e) }), code: 1 };
+  } finally {
+    await client?.end?.().catch(() => undefined);
+  }
+}
