@@ -143,6 +143,40 @@ export function searchIndexLimits(replayPagesEnabled: boolean): SearchIndexLimit
   return { ...(replayPagesEnabled ? REPLAY_SEARCH_INDEX_LIMITS : SEARCH_INDEX_DEFAULT_LIMITS) };
 }
 
+/**
+ * Operator overrides for the indexer SERVICE (consumer-service.ts), which has no
+ * large-read handoff: a scope above `maxScopeBytes` / `maxScopeEvents` is marked partial,
+ * and one partial session makes the read API refuse every workspace search (501
+ * `session_partial`) with no fallback on a self-host install. Raising the limits lets an
+ * operator who sized the pod's memory for it index such a session.
+ *
+ *   SEARCH_INDEX_MAX_SCOPE_BYTES   raw bytes of one scope, default 64 MiB
+ *   SEARCH_INDEX_MAX_SCOPE_EVENTS  records of one scope, default 100000
+ *   SEARCH_INDEX_MAX_ROWS          index rows compared for one scope, default 500000
+ *
+ * Each is a positive integer no larger than the replay bound (256 MiB / 1M / 1M), the
+ * largest scope the index pass is written for. Unset or empty keeps the default. Any
+ * other value fails startup: a typo must not silently mean the default.
+ */
+export function searchIndexLimitsFromEnv(env: Record<string, string | undefined>): Partial<SearchIndexLimits> {
+  const read = (name: string, ceiling: number): number | undefined => {
+    const raw = env[name];
+    if (raw === undefined || raw === "") return undefined;
+    if (!/^[1-9][0-9]{0,15}$/.test(raw)) throw new Error(`${name} must be a positive integer`);
+    const value = Number(raw);
+    if (value > ceiling) throw new Error(`${name} must be at most ${ceiling}`);
+    return value;
+  };
+  const maxScopeBytes = read("SEARCH_INDEX_MAX_SCOPE_BYTES", REPLAY_SEARCH_INDEX_LIMITS.maxScopeBytes);
+  const maxScopeEvents = read("SEARCH_INDEX_MAX_SCOPE_EVENTS", REPLAY_SEARCH_INDEX_LIMITS.maxScopeEvents);
+  const maxRows = read("SEARCH_INDEX_MAX_ROWS", REPLAY_SEARCH_INDEX_LIMITS.maxRows);
+  return {
+    ...(maxScopeBytes === undefined ? {} : { maxScopeBytes }),
+    ...(maxScopeEvents === undefined ? {} : { maxScopeEvents }),
+    ...(maxRows === undefined ? {} : { maxRows }),
+  };
+}
+
 export interface SearchIndexResult {
   manifests: number;
   rows: number;

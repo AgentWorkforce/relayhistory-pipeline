@@ -67,7 +67,7 @@ import {
 import { processBatch, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { postgresOutputFactsStore } from "./output-facts-store.ts";
-import type { SearchIndexDeps } from "./search-index.ts";
+import { searchIndexLimitsFromEnv, type SearchIndexDeps } from "./search-index.ts";
 import {
   ingestLoginIdentity,
   type IngestLoginIdentityRefusal,
@@ -1109,6 +1109,8 @@ export function refuseStartupOptions(url: string): void {
 
 export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never> {
   const maximum = readerMaxRuleset(env);
+  // Checked before any connection opens: a bad limit fails startup.
+  const searchLimits = searchIndexLimitsFromEnv(env);
   const config = consumerServiceConfig(env);
   if (!config.enabled) {
     // Dormant but observable, like the read API: no database, no polling, a
@@ -1200,6 +1202,7 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
     adapter: binding,
     readerMaxRuleset: maximum,
     prefixFor: (orgId) => `${config.keyPrefix}/${orgId}`,
+    ...(Object.keys(searchLimits).length ? { limits: searchLimits } : {}),
     ...outputFactsDeps(config),
   };
 
