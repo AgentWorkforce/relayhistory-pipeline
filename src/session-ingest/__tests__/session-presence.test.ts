@@ -165,16 +165,22 @@ test("tool argv and stdin: fixed shapes, fixed codes, the session never in an er
 /**
  * A fake client: records statements, answers counts with `n`, the marker with markers[i], the distinct-org check with
  * `orgs` (default 1), and can fail chosen queries. `cost(text)` ms are added to `clock.t` per statement (no sleeping).
+ * Realistic cancels: it tracks the active SET LOCAL statement_timeout; a statement whose cost is over it, or one that
+ * `fail` cancels with 57014, is cancelled (57014) and charges exactly that limit to the clock, as postgres would.
  */
 function fake(o: { n?: number; ro?: string; markers?: Array<{ rows: number; marker: string }>; fail?: (text: string) => unknown; ownership?: number;
   orgs?: number; clock?: { t: number }; cost?: (text: string) => number } = {}) {
   const log: Array<{ text: string; params?: unknown[] }> = [];
-  let marks = 0;
+  let marks = 0, limit = Number.POSITIVE_INFINITY;
   const sql: PresenceSql = {
     async query(text, params) {
       log.push({ text, params });
-      if (o.clock) o.clock.t += o.cost?.(text) ?? 0;
-      const err = o.fail?.(text);
+      const set = /^SET LOCAL statement_timeout = ([0-9]+)$/u.exec(text);
+      if (set) limit = Number(set[1]);
+      let err = o.fail?.(text);
+      const cost = o.cost?.(text) ?? 0;
+      if (!err && cost > limit) err = timeout;
+      if (o.clock) o.clock.t += (err as { code?: unknown } | null)?.code === "57014" ? limit : cost;
       if (err) throw err;
       if (text === "SHOW transaction_read_only") return { rows: [{ transaction_read_only: o.ro ?? "on" }] };
       if (text.includes("AS marker")) return { rows: [(o.markers ?? [])[marks++] ?? { rows: 0, marker: "" }] };
@@ -292,75 +298,129 @@ test("input checks in the library itself: session, scope and timeout", async () 
 const isCount = (x: string) => SESSION_PRESENCE_COUNTS.some((c) => c.sql(false) === x);
 const countIndex = (x: string) => SESSION_PRESENCE_COUNTS.findIndex((c) => c.sql(false) === x);
 
-test("budget: counts that would start past the budget are skipped (null, budget_exhausted); the last marker still runs", async () => {
-  // Every count burns 20 s; the budget is 100 s, the per-statement timeout 60 s. The first marker is free.
+test("budget: the counts share the budget minus the statement timeout; skipped counts are budget_exhausted; the last marker still runs", async () => {
+  // Every count burns 20 s; the budget is 100 s, the per-statement timeout 60 s, so the counts share 40 s and the last
+  // marker keeps 60 s. The first marker is free.
   const clock = { t: 1_000_000 };
   const f = fake({ markers: [M("a"), M("a")], clock, cost: (x) => (isCount(x) ? 20_000 : 0) });
   const out = await sessionPresence(f.sql, { ...opts, totalBudgetMs: 100_000, now: () => clock.t });
   const texts = f.log.map((l) => l.text);
   const ran = texts.filter(isCount).map(countIndex);
-  // 5 counts burn the whole 100 s; nothing else starts (the distinct-org check and the last marker included).
-  expect(ran).toEqual([0, 1, 2, 3, 4]);
-  expect([out.ownership, out.claims, out.claim_sessions, out.buffered_stages, out.outbox, out.outbox_buffered]).toEqual([1, 1, 1, 1, 1, 1]);
-  expect([out.lazy_slots, out.revisions, out.heads, out.published_heads, out.published_objects, out.canonical_pointers, out.canonical_pointers_live])
-    .toEqual([null, null, null, null, null, null, null]);
+  // 2 counts burn the counts' 40 s; no further count or the distinct-org check starts. The last marker does.
+  expect(ran).toEqual([0, 1]);
+  expect([out.ownership, out.claims]).toEqual([1, 1]);
+  expect([out.claim_sessions, out.buffered_stages, out.outbox, out.outbox_buffered, out.lazy_slots, out.revisions, out.heads, out.published_heads,
+    out.published_objects, out.canonical_pointers, out.canonical_pointers_live]).toEqual([null, null, null, null, null, null, null, null, null, null, null]);
   expect(out.dispositions).toEqual({ heads_building: null, heads_live: null, heads_retired: null });
-  expect(texts.filter((t) => t.includes("AS marker")).length).toBe(1);
+  expect(texts.filter((t) => t.includes("AS marker")).length).toBe(2);
   expect(texts).not.toContain(SESSION_PRESENCE_DISTINCT_ORGS(false));
-  expect([out.generation_stable, out.complete, out.incomplete_reason]).toEqual([false, false, "generation_unobserved"]);
+  expect([out.generation_stable, out.complete, out.incomplete_reason]).toEqual([true, false, "budget_exhausted"]);
+  expect(texts.filter((t) => t.startsWith("SET LOCAL statement_timeout"))).toEqual(
+    ["SET LOCAL statement_timeout = 60000", "SET LOCAL statement_timeout = 40000", "SET LOCAL statement_timeout = 20000", "SET LOCAL statement_timeout = 60000"]);
   expect(texts.at(-1)).toBe("ROLLBACK");
 
-  // Budget pressure without exhaustion: later statements get a lowered timeout, everything runs and matches.
+  // Budget pressure without exhaustion: later counts get a lowered timeout, the last marker its full 60 s again.
   const c2 = { t: 0 };
   let counts = 0;
   const g = fake({ markers: [M("a"), M("a")], clock: c2, cost: (x) => (isCount(x) && ++counts <= 3 ? 30_000 : 0) });
-  const out2 = await sessionPresence(g.sql, { ...opts, totalBudgetMs: 95_000, now: () => c2.t });
-  // 3 counts burn 90 s; 5 s are left, so every later statement gets SET LOCAL statement_timeout = <left>.
+  const out2 = await sessionPresence(g.sql, { ...opts, totalBudgetMs: 155_000, now: () => c2.t });
+  // The counts share 95 s; 3 counts burn 90 s; 5 s are left, so the rest get SET LOCAL statement_timeout = 5000.
   expect(out2.ownership).toBe(1); expect(out2.claims).toBe(1); expect(out2.claim_sessions).toBe(1); expect(out2.buffered_stages).toBe(1);
-  expect(g.log.map((l) => l.text)).toContain("SET LOCAL statement_timeout = 5000");
+  const gt = g.log.map((l) => l.text);
+  expect(gt).toContain("SET LOCAL statement_timeout = 5000");
+  expect(gt.slice(gt.lastIndexOf("SET LOCAL statement_timeout = 60000") + 1, gt.lastIndexOf("SET LOCAL statement_timeout = 60000") + 3))
+    .toEqual(["SAVEPOINT session_presence_count", SESSION_PRESENCE_GENERATION_MARKER(false)]);
   expect([out2.generation_stable, out2.complete, out2.incomplete_reason]).toEqual([true, true, "none"]);
 
-  // The lowered timeout cancels a statement: that is budget_exhausted, not count_timeout; the last marker still runs.
+  // The lowered timeout cancels a count: that is budget_exhausted, not count_timeout; the last marker still runs.
   const c3 = { t: 0 };
   const h = fake({ markers: [M("a"), M("a")], clock: c3, cost: (x) => (x === SESSION_PRESENCE_COUNTS[0]!.sql(false) ? 57_000 : 0),
     fail: (x) => (x === SESSION_PRESENCE_COUNTS[1]!.sql(false) ? timeout : null) });
-  const out3 = await sessionPresence(h.sql, { ...opts, totalBudgetMs: 70_000, now: () => c3.t });
+  const out3 = await sessionPresence(h.sql, { ...opts, totalBudgetMs: 130_000, now: () => c3.t });
   expect(h.log.map((l) => l.text)).toContain("SET LOCAL statement_timeout = 13000");
+  expect(out3.ownership).toBe(1);
   expect(out3.claims).toBeNull();
   expect([out3.generation_stable, out3.complete, out3.incomplete_reason]).toEqual([true, false, "budget_exhausted"]);
   // The SET LOCAL is outside the savepoint, so ROLLBACK TO SAVEPOINT keeps the lowered timeout.
   const ht = h.log.map((l) => l.text), set = ht.indexOf("SET LOCAL statement_timeout = 13000");
   expect(ht[set + 1]).toBe("SAVEPOINT session_presence_count");
 
-  const c4 = { t: 0 };
-  // (count_timeout vs budget_exhausted precedence: next test.)
-  const k = fake({ markers: [M("a"), M("a")], clock: c4, cost: (x) => (x === SESSION_PRESENCE_COUNTS.at(-1)!.sql(false) ? 200_000 : 0) });
-  // The last count burns past the budget: the distinct-org check and the last marker are skipped.
-  const out4 = await sessionPresence(k.sql, { ...opts, totalBudgetMs: 180_000, now: () => c4.t });
-  expect(out4.incomplete_reason).toBe("generation_unobserved");
-  // Less than 1 s left is a skip, not a 999 ms statement.
+  // Less than 1 s left of the counts' share is a skip, not a 999 ms statement.
   const c5 = { t: 0 };
-  const both = fake({ markers: [M("a"), M("a")], clock: c5, cost: (x) => (x === SESSION_PRESENCE_COUNTS[2]!.sql(false) ? 179_001 : 0),
+  const both = fake({ markers: [M("a"), M("a")], clock: c5, cost: (x) => (x === SESSION_PRESENCE_COUNTS[1]!.sql(false) ? 59_001 : 0),
     fail: (x) => (x === SESSION_PRESENCE_COUNTS[0]!.sql(false) ? timeout : null) });
   const out5 = await sessionPresence(both.sql, { ...opts, totalBudgetMs: 180_000, now: () => c5.t });
-  expect([out5.ownership, out5.claims, out5.claim_sessions, out5.buffered_stages]).toEqual([null, 1, 1, null]);
+  // ownership: cancelled at the full 60 s (count_timeout); claims: 59.001 s; 999 ms of the counts' 120 s are left.
+  expect([out5.ownership, out5.claims, out5.claim_sessions, out5.buffered_stages]).toEqual([null, 1, null, null]);
   expect(both.log.map((l) => l.text).filter((t) => t.startsWith("SET LOCAL statement_timeout"))).toEqual(["SET LOCAL statement_timeout = 60000"]);
-  expect(out5.incomplete_reason).toBe("generation_unobserved");
+  expect([out5.generation_stable, out5.incomplete_reason]).toEqual([true, "count_timeout"]);
+
+  // A budget under the statement timeout plus 1 s leaves the counts nothing: all skipped, both markers still run.
+  const c6 = { t: 0 };
+  const tiny = fake({ markers: [M("a"), M("a")], clock: c6 });
+  const out6 = await sessionPresence(tiny.sql, { ...opts, totalBudgetMs: 60_500, now: () => c6.t });
+  expect(tiny.log.map((l) => l.text).filter(isCount)).toEqual([]);
+  expect(tiny.log.map((l) => l.text).filter((t) => t.includes("AS marker")).length).toBe(2);
+  expect([out6.ownership, out6.generation_stable, out6.incomplete_reason]).toEqual([null, true, "budget_exhausted"]);
+});
+
+test("budget (realistic cancels, default 60 s / 180 s): counts cut short by the budget are budget_exhausted with the final marker observed", async () => {
+  // (a) The first marker takes 30 s, each count 55 s (under the 60 s timeout, over what is left once the counts'
+  // 120 s run low). Count 0 runs (t=85 s); count 1 gets the 35 s that are left and is cancelled at exactly 35 s
+  // (t=120 s); the rest are skipped. The final marker keeps its 60 s and is observed.
+  const c = { t: 0 };
+  let marks = 0;
+  const f = fake({ markers: [M("a"), M("a")], clock: c,
+    cost: (x) => (isCount(x) ? 55_000 : x.includes("AS marker") && marks++ === 0 ? 30_000 : 0) });
+  const out = await sessionPresence(f.sql, { ...opts, now: () => c.t });
+  const texts = f.log.map((l) => l.text);
+  expect(texts.filter(isCount).map(countIndex)).toEqual([0, 1]);
+  expect(texts).toContain("SET LOCAL statement_timeout = 35000");
+  expect([out.ownership, out.claims, out.claim_sessions]).toEqual([1, null, null]);
+  expect(texts.filter((t) => t.includes("AS marker")).length).toBe(2);
+  expect(texts.at(-5)).toBe("SET LOCAL statement_timeout = 60000");
+  expect(texts.at(-3)).toBe(SESSION_PRESENCE_GENERATION_MARKER(false));
+  expect(texts.at(-2)).toBe("RELEASE SAVEPOINT session_presence_count");
+  expect([out.generation_stable, out.complete, out.incomplete_reason]).toEqual([true, false, "budget_exhausted"]);
+  expect(c.t).toBe(120_000);
+
+  // (b) A count that runs into the full 60 s statement timeout while budget remains is count_timeout (cancelled at
+  // exactly 60 s); the distinct-org check and the final marker still run.
+  const c2 = { t: 0 };
+  const g = fake({ markers: [M("a"), M("a")], clock: c2, cost: (x) => (x === SESSION_PRESENCE_COUNTS.at(-1)!.sql(false) ? 200_000 : 0) });
+  const out2 = await sessionPresence(g.sql, { ...opts, now: () => c2.t });
+  expect(c2.t).toBe(60_000);
+  expect([out2.canonical_pointers, out2.canonical_pointers_live]).toEqual([null, null]);
+  expect(g.log.map((l) => l.text)).toContain(SESSION_PRESENCE_DISTINCT_ORGS(false));
+  expect([out2.generation_stable, out2.complete, out2.incomplete_reason]).toEqual([true, false, "count_timeout"]);
+
+  // (c) The final marker itself times out (after a count was cut short by the budget): generation_unobserved wins.
+  const c3 = { t: 0 };
+  let m3 = 0;
+  const h = fake({ markers: [M("a"), M("a")], clock: c3,
+    cost: (x) => (isCount(x) ? 50_000 : x.includes("AS marker") && m3++ === 1 ? 70_000 : 0) });
+  const out3 = await sessionPresence(h.sql, { ...opts, now: () => c3.t });
+  expect(h.log.map((l) => l.text)).toContain("SET LOCAL statement_timeout = 20000");
+  expect(h.log.map((l) => l.text).filter((t) => t.includes("AS marker")).length).toBe(2);
+  expect([out3.generation_stable, out3.complete, out3.incomplete_reason]).toEqual([false, false, "generation_unobserved"]);
+  expect(h.log.at(-1)!.text).toBe("ROLLBACK");
 });
 
 test("budget: reason precedence generation_unobserved > generation_unstable > multi_ownership > count_timeout > budget_exhausted", async () => {
   expect([...SESSION_PRESENCE_INCOMPLETE_REASONS]).toEqual(["none", "generation_unobserved", "generation_unstable", "multi_ownership", "count_timeout", "budget_exhausted"]);
-  // Skip exactly the distinct-org check by budget (the last marker still fits): budget_exhausted alone.
+  // Default 60 s / 180 s (the counts share 120 s): the last three counts burn 39.5 s each, so 1.5 s are left for the
+  // distinct-org check, which is cancelled at that lowered limit (budget). The last marker keeps its 60 s.
+  const last3 = SESSION_PRESENCE_COUNTS.slice(-3).map((c) => c.sql(false));
   const run = async (o: Parameters<typeof fake>[0]) => {
     const c = { t: 0 };
-    const f = fake({ markers: [M("a"), M("a")], ...o, clock: c, cost: (x) => (x === SESSION_PRESENCE_COUNTS.at(-1)!.sql(false) ? 98_500 : 0) });
-    // After the last count 1.5 s are left: the distinct-org check gets 1500 ms and is cancelled (budget).
-    return sessionPresence(f.sql, { ...opts, totalBudgetMs: 100_000, now: () => c.t });
+    const f = fake({ markers: [M("a"), M("a")], ...o, clock: c, cost: (x) => (last3.includes(x) ? 39_500 : 0) });
+    return sessionPresence(f.sql, { ...opts, now: () => c.t });
   };
   const budgetOnly = await run({ fail: (x) => (x.includes("AS distinct_orgs") ? timeout : null) });
   expect([budgetOnly.generation_stable, budgetOnly.incomplete_reason]).toEqual([true, "budget_exhausted"]);
+  // With a count cancelled at the full 60 s first (revisions precedes the last three): count_timeout outranks.
   const withTimeout = await run({ fail: (x) => (x.includes("AS distinct_orgs") || x.includes("ingest_record_revisions") && !x.includes("AS marker") ? timeout : null) });
-  expect(withTimeout.incomplete_reason).toBe("count_timeout");
+  expect([withTimeout.generation_stable, withTimeout.incomplete_reason]).toEqual([true, "count_timeout"]);
   const withOwners = await run({ ownership: 2, fail: (x) => (x.includes("AS distinct_orgs") || x.includes("ingest_record_revisions") && !x.includes("AS marker") ? timeout : null) });
   expect(withOwners.incomplete_reason).toBe("multi_ownership");
   const unstable = await run({ ownership: 2, markers: [M("a"), M("b")], fail: (x) => (x.includes("AS distinct_orgs") ? timeout : null) });
@@ -424,4 +484,19 @@ test("receipt: the summary passes countsOnly; the tool's refusal lines are codes
   const badArgs = await sessionPresenceMain([], "", async () => fake().sql);
   expect(badArgs).toEqual({ line: JSON.stringify({ refused: "session_presence_args" }), code: 1 });
   for (const out of [pgErr, lettered, odd, badArgs]) expect(countsOnly(backlogOpsReceipt(d, "9", out.code, out.line).summary)).toEqual(JSON.parse(out.line));
+});
+
+test("a lock_timeout (55P03) on a count refuses the whole run: one code line, exit 1, ROLLBACK last, no session", async () => {
+  // The pg message can carry a value; the refusal line must not.
+  const lock = Object.assign(new Error(`canceling statement due to lock timeout on a row for ${SESSION}`), { code: "55P03" });
+  const f = fake({ markers: [M("a"), M("a")], fail: (x) => (x === SESSION_PRESENCE_COUNTS[3]!.sql(false) ? lock : null) });
+  const out = await sessionPresenceMain(ARGV, JSON.stringify({ dbUrl: "postgresql://x", session: SESSION }), async () => f.sql);
+  expect(out.line).toBe('{"refused":"sqlstate_55p03"}');
+  expect(out.code).toBe(1);
+  expect(out.line).not.toContain(SESSION);
+  expect(f.log.at(-1)!.text).toBe("ROLLBACK");
+  // Refused at that count: no later count, no distinct-org check, no second marker.
+  const texts = f.log.map((l) => l.text);
+  expect(texts.filter(isCount).map(countIndex)).toEqual([0, 1, 2, 3]);
+  expect(texts.filter((t) => t.includes("AS marker")).length).toBe(1);
 });

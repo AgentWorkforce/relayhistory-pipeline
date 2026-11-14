@@ -197,9 +197,11 @@ export const BACKLOG_OPS_EXPORT_PAGING = ["--statement-timeout-ms", "600000"] as
  * The presence tool's per-statement timeout and total transaction budget. Its statements (the counts, the distinct-org
  * check and the two generation marker reads) run one after another in ONE REPEATABLE READ READ ONLY transaction on
  * the owner primary, each in its own savepoint. A statement that hits the 60 s timeout is null (count_timeout); the
- * 180 s budget caps the whole transaction: no statement starts with less than 1 s of it left, and each statement's
- * timeout is lowered to what is left, so the snapshot is held for about 3 min at most (budget_exhausted, counts
- * null, otherwise). Both flags are passed explicitly.
+ * 180 s budget caps the whole transaction. The final marker read keeps a reserve equal to the statement timeout, so
+ * the counts and the distinct-org check share the budget minus the statement timeout (120 s) and the final marker
+ * keeps up to 60 s. No statement starts with less than 1 s of its share left, and each statement's timeout is lowered
+ * to what is left of its share, so the snapshot is held for about 3 min at most (budget_exhausted, counts null,
+ * otherwise). Both flags are passed explicitly.
  */
 export const BACKLOG_OPS_PRESENCE_TIMEOUT = ["--statement-timeout-ms", "60000", "--total-budget-ms", "180000"] as const;
 
