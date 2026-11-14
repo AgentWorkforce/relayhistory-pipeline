@@ -123,9 +123,9 @@ describe("alpha.9 pin and vendored bytes", () => {
 });
 
 describe("reader-first ceiling", () => {
-  it("READER_MAX_RULESET unset (default 8) refuses the pin: bindgen_ruleset_above_reader_ceiling", async () => {
+  it("READER_MAX_RULESET=8 refuses the pin (and the pin parser's default stays 8): bindgen_ruleset_above_reader_ceiling", async () => {
     expect(() => parseScrubBindgenPin(PIN)).toThrow(expect.objectContaining({ reason: "bindgen_ruleset_above_reader_ceiling" }));
-    const error = await initError({ env: { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen" } });
+    const error = await initError({ env: { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen", READER_MAX_RULESET: "8" } });
     expect((error as ScrubEngineUnavailable).reason).toBe("bindgen_ruleset_above_reader_ceiling");
     expect(scrubEngineReady()).toBe(false);
   });

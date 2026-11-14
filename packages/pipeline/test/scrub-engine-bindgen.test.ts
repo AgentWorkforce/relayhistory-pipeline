@@ -343,8 +343,8 @@ describe("wasm-bindgen: placeholder and malformed pins are refused by name", () 
     expect(parseScrubBindgenPin(pinFile, 10).package_version).toBe("0.5.0-alpha.9");
   });
 
-  it("SCRUB_ENGINE=wasm-bindgen with the checked-in pin and default reader is unavailable, and every call site refuses", async () => {
-    const error = await initError({ env: { SCRUB_ENGINE: "wasm-bindgen" } });
+  it("SCRUB_ENGINE=wasm-bindgen with the checked-in pin and an explicit reader ceiling of 8 is unavailable, and every call site refuses", async () => {
+    const error = await initError({ env: { SCRUB_ENGINE: "wasm-bindgen", READER_MAX_RULESET: "8" } });
     expect(error).toBeInstanceOf(ScrubEngineUnavailable);
     expect((error as ScrubEngineUnavailable).reason).toBe("bindgen_ruleset_above_reader_ceiling");
     expect((error as Error).message).toBe("the scrub engine is unavailable (bindgen_ruleset_above_reader_ceiling)");
@@ -877,13 +877,25 @@ describe("wasm-bindgen: Workers compiled-module path (createCompiledBindgenEngin
 describe("reader-first writer initialization gate", () => {
   const future = { ...MANIFEST, rulesetVersion: 10, scrubProfile: "relayhistory-secrets-v10" };
   const futurePin = () => makePin({ scrub_profile: bindgenProfile(future) }, { rulesetVersion: 10, scrubProfile: future.scrubProfile });
-  it("Node refuses above-ceiling pins before loading and accepts only after explicit reader configuration", async () => {
+  it("Node refuses above-ceiling pins before loading at an explicit ceiling of 8, and accepts at an explicit 10", async () => {
     const s = setup({ pin: futurePin(), glue: { manifest: future } });
-    await expect(initScrubEngine(s.options)).rejects.toMatchObject({ reason: "bindgen_ruleset_above_reader_ceiling" });
+    await expect(initScrubEngine({ ...s.options, env: { SCRUB_ENGINE: "wasm-bindgen", READER_MAX_RULESET: "8" } })).rejects.toMatchObject({ reason: "bindgen_ruleset_above_reader_ceiling" });
     expect(s.reads).toEqual([]);
     const engine = await initScrubEngine({ ...s.options, env: { SCRUB_ENGINE: "wasm-bindgen", READER_MAX_RULESET: "10" } });
     expect(engine.rulesetVersion).toBe(10);
     expect(s.reads).toHaveLength(3);
+  });
+  it("Node: READER_MAX_RULESET unset resolves to the self-host ceiling 10 and admits a version-10 pin", async () => {
+    const s = setup({ pin: futurePin(), glue: { manifest: future } });
+    const engine = await initScrubEngine({ ...s.options, env: { SCRUB_ENGINE: "wasm-bindgen" } });
+    expect(engine.rulesetVersion).toBe(10);
+    expect(s.reads).toHaveLength(3);
+  });
+  it("a hosted caller with READER_MAX_RULESET unset keeps ceiling 8 and refuses before loading", async () => {
+    const s = setup({ pin: futurePin(), glue: { manifest: future } });
+    await expect(initScrubEngine({ ...s.options, env: { SCRUB_ENGINE: "wasm-bindgen" }, bindgen: { ...s.options.bindgen, hostedReaderCeiling: true } }))
+      .rejects.toMatchObject({ reason: "bindgen_ruleset_above_reader_ceiling" });
+    expect(s.reads).toEqual([]);
   });
   it("compiled-module initialization applies the same ceiling before glue initialization", () => {
     const glue = glueDouble({ manifest: future });

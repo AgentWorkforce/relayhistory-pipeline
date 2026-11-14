@@ -141,15 +141,25 @@ describe("not ready under SCRUB_ENGINE_REQUIRED=wasm-bindgen: ingress refuses", 
     expect(scrubEngineReady()).toBe(false);
   });
 
-  for (const ceiling of [undefined, "8", "9"])
-    it(`READER_MAX_RULESET ${ceiling ?? "unset"}: bindgen_ruleset_above_reader_ceiling`, async () => {
-      const env: Record<string, string> = { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen" };
-      if (ceiling) env.READER_MAX_RULESET = ceiling;
+  for (const ceiling of ["8", "9"])
+    it(`READER_MAX_RULESET ${ceiling}: bindgen_ruleset_above_reader_ceiling`, async () => {
+      const env: Record<string, string> = { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen", READER_MAX_RULESET: ceiling };
       delete process.env.READER_MAX_RULESET;
-      if (ceiling) process.env.READER_MAX_RULESET = ceiling;
+      process.env.READER_MAX_RULESET = ceiling;
       await expect(initScrubEngine({ env })).rejects.toMatchObject({ reason: "bindgen_ruleset_above_reader_ceiling" });
       await expectRefusing("bindgen_ruleset_above_reader_ceiling");
     });
+
+  it("READER_MAX_RULESET unset: the self-host ceiling (10) admits the pin; a hosted caller keeps 8 and refuses", async () => {
+    delete process.env.READER_MAX_RULESET;
+    const env = { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen" };
+    await expect(initScrubEngine({ env, bindgen: { hostedReaderCeiling: true } })).rejects.toMatchObject({ reason: "bindgen_ruleset_above_reader_ceiling" });
+    await expectRefusing("bindgen_ruleset_above_reader_ceiling");
+    resetScrubEngineForTests();
+    const engine = await initScrubEngine({ env });
+    expect(engine.marker.version).toBe(10);
+    expect(scrubEngineReady()).toBe(true);
+  });
 
   it("a pin that verifies the same bytes but is not the checked-in pin: bindgen_pin_not_exact", async () => {
     const pin = reorderedPin();

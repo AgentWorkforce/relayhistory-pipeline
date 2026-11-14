@@ -4,6 +4,15 @@ import { PipelineError } from "../pipeline/errors.js";
 
 export const DEFAULT_READER_MAX_RULESET = 8;
 export const SUPPORTED_READER_MAX_RULESET = 10;
+/**
+ * The ceiling a self-host (Node / Bun) process uses where it needs one and READER_MAX_RULESET
+ * is unset: the alleyoop courier's per-chunk version check and the wasm-bindgen writer gate in
+ * `initScrubEngine`. Every Node reader in "Reader-first rollout" (docs/scrub-engine.md) accepts
+ * ruleset <= 10. It does NOT change `readerMaxRuleset()` (unset stays legacy reads), the 8..10
+ * bounds of an explicit READER_MAX_RULESET, the pre-metadata cutoff
+ * (DEFAULT_READER_MAX_RULESET) or any Worker ceiling.
+ */
+export const DEFAULT_SELF_HOST_READER_MAX_RULESET = SUPPORTED_READER_MAX_RULESET;
 
 function invalidConfig(): never {
   throw new Error("READER_MAX_RULESET must be an integer from 8 through 10");
@@ -19,6 +28,18 @@ export function parseReaderMaxRuleset(value: unknown): number | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value)) invalidConfig();
   return checkedReaderMaxRuleset(Number(value));
+}
+
+/**
+ * The one effective-ceiling function for the places that need a number where READER_MAX_RULESET
+ * may be unset (the alleyoop per-chunk check, the wasm-bindgen writer gate). An explicit
+ * READER_MAX_RULESET always wins (explicit 8 makes the version-10 writer gate refuse). Unset
+ * resolves to DEFAULT_SELF_HOST_READER_MAX_RULESET (10) for self-host, and to
+ * DEFAULT_READER_MAX_RULESET (8) for a hosted caller, whose ceilings are unchanged.
+ */
+export function effectiveReaderMaxRuleset(explicit: number | undefined, opts: { hosted?: boolean } = {}): number {
+  if (explicit !== undefined) return checkedReaderMaxRuleset(explicit);
+  return opts.hosted ? DEFAULT_READER_MAX_RULESET : DEFAULT_SELF_HOST_READER_MAX_RULESET;
 }
 
 /** Workers pass their bindings explicitly. Node services default to their process environment. */

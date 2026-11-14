@@ -57,7 +57,7 @@ same way, so `scrubText`, `scrubRecords`, `activeScrubMarker` and sealing refuse
 `scrubEngineReady()` is false (ingest `/readyz` stays not-ready), `scrubTextForLog` returns
 `[scrub-unavailable]` and `isSafeIdentifier` is false. Nothing falls back to TypeScript. A
 matching requirement adds nothing: with `wasm-bindgen` the existing pin and artifact refusals
-(for example `bindgen_ruleset_above_reader_ceiling` without `READER_MAX_RULESET=10`, or
+(for example `bindgen_ruleset_above_reader_ceiling` under an explicit `READER_MAX_RULESET` of 8 or 9, or
 `bindgen_sha256_mismatch_wasm`) still apply unchanged, before any glue import. In addition, with
 `SCRUB_ENGINE_REQUIRED=wasm-bindgen` the active instance must have been verified against the
 checked-in pin exactly (`bindgen_pin_not_exact` otherwise; a reordered or edited pin object is not exact). Only
@@ -180,7 +180,9 @@ metadata `scrub-ruleset` / `scrub-version`, manifests and summary `scrub_version
   and courier admission checks. An explicit `READER_MAX_RULESET` enables the independent
   family/version and per-chunk policy described below; it never changes TS writer stamps.
   A wasm cutover above 8 still requires a coordinated reader-first rollout. The pin refuses
-  a writer ruleset below 8 or above its configured ceiling (default writer gate: 8).
+  a writer ruleset below 8 or above its effective ceiling (`effectiveReaderMaxRuleset` in
+  `reader-policy.ts`: an explicit `READER_MAX_RULESET` first; unset is 10 on self-host and 8 for
+  the hosted ingest Worker).
 
 ## Cutover rule
 
@@ -241,7 +243,8 @@ cutover is not planned to use it.
 
 `packages/pipeline/scrub-bindgen-pin.json` pins relayscrubber `0.5.0-alpha.9` (see "Cutover:
 pinned relayscrubber 0.5.0-alpha.9" for the values, the env triple and what refuses when).
-Selecting `wasm-bindgen` without `READER_MAX_RULESET=10` makes `initScrubEngine` throw
+Selecting `wasm-bindgen` under an explicit `READER_MAX_RULESET` of 8 or 9 (or on the hosted ingest
+Worker, whose unset ceiling stays 8) makes `initScrubEngine` throw
 `ScrubEngineUnavailable(bindgen_ruleset_above_reader_ceiling)`, and every call site then
 refuses as described in "Fail-closed rules".
 
@@ -511,7 +514,7 @@ wired or unwired. `scripts/scrub-cutover-reachability.ts` runs it and writes a J
 
 | Condition | Result |
 |---|---|
-| `SCRUB_ENGINE=wasm-bindgen`, `READER_MAX_RULESET` unset, `8` or `9` | `bindgen_ruleset_above_reader_ceiling`, before any artifact read |
+| `SCRUB_ENGINE=wasm-bindgen`, `READER_MAX_RULESET` explicitly `8` or `9` (or unset on the hosted ingest Worker) | `bindgen_ruleset_above_reader_ceiling`, before any artifact read |
 | A vendored file missing / empty | `bindgen_artifact_missing_<wasm|glue|loader>` |
 | A vendored file's bytes differ from the pin | `bindgen_sha256_mismatch_<name>` |
 | Relative `SCRUB_BINDGEN_DIR` | `bindgen_dir_invalid` |
@@ -654,9 +657,9 @@ is the fail-closed outcome.
 
 Canonical record/transcript readers, export readers, the indexing consumer, brief input and manifest/chunk admission use this policy only when explicitly configured. Unknown families and versions outside 1 through the configured maximum refuse before record parsing. A manifest records the **lowest** chunk ruleset, so per-chunk metadata is also checked. Readers bind that metadata to the same GET response as the body and cancel refused bodies before consuming them. Historical metadata-free chunks at versions through 8 keep their existing read contract; newer manifest versions require per-chunk scrub metadata. A declared chunk version cannot fall below the manifest minimum.
 
-Node services validate the setting at startup and thread it into canonical reads. Alleyoop also forwards it through its real app bindings. Canonical and timing Worker routes validate their own bindings rather than consulting a Node process environment. Offline seed readers receive an explicit optional policy in their dependencies. An unset policy does not add a marker check to any of these paths. The wasm-bindgen pin parser retains a separate default writer ceiling of 8 and refuses a writer above its explicitly configured ceiling before reading artifacts or initializing glue. Compiled-module callers must pass their verified reader ceiling explicitly when it exceeds the default. The raw ABI path remains unpinned and outside this first cutover.
+Node services validate the setting at startup and thread it into canonical reads. Alleyoop also forwards it through its real app bindings. Canonical and timing Worker routes validate their own bindings rather than consulting a Node process environment. Offline seed readers receive an explicit optional policy in their dependencies. An unset policy does not add a marker check to any of these paths. The wasm-bindgen pin parser retains a separate default writer ceiling of 8 and refuses a writer above its ceiling before reading artifacts or initializing glue; `initScrubEngine` passes it the effective ceiling (`effectiveReaderMaxRuleset`: explicit `READER_MAX_RULESET` first, unset = `DEFAULT_SELF_HOST_READER_MAX_RULESET` (10) on Node / Bun, 8 for the hosted ingest Worker via `hostedReaderCeiling`). The alleyoop courier's per-chunk version check uses the same function. Compiled-module callers must pass their verified reader ceiling explicitly when it exceeds the default. The raw ABI path remains unpinned and outside this first cutover.
 
-Operationally, deploy and verify every relevant reader with ceiling 10 **while the Rust engine remains off**, then qualify and enable the matching writer. Before enabling a v10 writer/pin, explicitly set the ceiling on every Node process that initializes the scrub engine, including one-shot consumer/output-facts bootstrap, migration and eraser Jobs; a missing Job setting must continue to refuse the v10 pin. Configuration in one process does not prove that a remote fleet has been upgraded. Keep the reader ceiling at 10 on rollback while version-10 objects remain stored; reverting a writer does not downgrade existing objects. Existing artifact-page formats do not change. This source change does not satisfy the remaining package safety, provenance, error-tagging, Worker build-binding or persistence-routing gates.
+Operationally, deploy and verify every relevant reader with ceiling 10 **while the Rust engine remains off**, then qualify and enable the matching writer. Self-host readers accept ruleset 10 by default (see "Self-host default reader ceiling" below): an unset `READER_MAX_RULESET` no longer refuses the v10 pin on Node / Bun. An operator who explicitly sets `READER_MAX_RULESET=8` (or 9) on a process keeps that process refusing the v10 pin. Configuration in one process does not prove that a remote fleet has been upgraded. Keep the reader ceiling at 10 on rollback while version-10 objects remain stored; reverting a writer does not downgrade existing objects. Existing artifact-page formats do not change. This source change does not satisfy the remaining package safety, provenance, error-tagging, Worker build-binding or persistence-routing gates.
 
 
 ### Reader-first rollout: entrypoints honouring READER_MAX_RULESET
@@ -690,8 +693,22 @@ writer permission. Cloudflare Worker routes validate their own bindings and are 
 | `src/smoke/e2e.ts` | smoke harness leak check over its own fixture | n/a (test harness) | unchanged |
 
 `RelayhistoryExportTransform` has no production constructor; any future one must pass the
-ceiling. Before enabling a v10 writer, set `READER_MAX_RULESET` on each process above, including
-the pipeline Lambda, the large-read Job and bob-costas.
+ceiling. An explicit `READER_MAX_RULESET` on any process above is still honoured exactly.
+
+### Self-host default reader ceiling
+
+`DEFAULT_SELF_HOST_READER_MAX_RULESET` (10, `reader-policy.ts`) is the ceiling where a self-host
+process needs a number and `READER_MAX_RULESET` is unset; `effectiveReaderMaxRuleset` is the one
+function that resolves it (explicit value first). It applies to exactly two places: the alleyoop
+courier's per-chunk `scrub-version` check (`src/alleyoop/manifests.ts`, `chunksAreServerSealed`)
+and the wasm-bindgen writer gate in `initScrubEngine`. Every other reader in the table above keeps
+legacy reads when unset (no ceiling, so ruleset 10 is accepted) or, when set explicitly, the exact
+8..10 policy. `DEFAULT_READER_MAX_RULESET` stays 8: it is the pin parser's default, the
+metadata-free legacy cutoff and the hosted ingest Worker's unset writer gate. No deployed config,
+stack or Dockerfile sets `READER_MAX_RULESET`, so no deployed reader meets version-10 objects at an
+effective ceiling of 8 unless an operator sets 8 explicitly. Tests: `reader-scrub-policy.test.ts`
+(limit-1 / limit / limit+1 at unset, explicit 8 and explicit 10) and
+`src/alleyoop/__tests__/manifests.test.ts` ("self-host reader ceiling").
 
 
 ### Configuration failure runbook

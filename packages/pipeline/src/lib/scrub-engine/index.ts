@@ -27,7 +27,7 @@
  */
 import { ScrubberError } from "./scrubber-error.js";
 export { ScrubberError, SCRUBBER_CALL_REFUSAL_CODES, type ScrubberDisposition, type ScrubberErrorCode } from "./scrubber-error.js";
-import { readerMaxRuleset } from "./reader-policy.js";
+import { effectiveReaderMaxRuleset, readerMaxRuleset } from "./reader-policy.js";
 import { sealRawChunk as sealRawChunkTs, type SealRawChunk, type SealedChunk } from "../pipeline/raw-chunks.js";
 import type { ObjectStore } from "../pipeline/object-layout.js";
 import { bindEngineRawSealer, type BoundRawChunkSealer } from "../pipeline/engine-raw-chunks.js";
@@ -228,6 +228,11 @@ export interface InitScrubEngineOptions {
     pin?: unknown;
     readArtifact?: ReadBindgenArtifact;
     importGlue?: ImportBindgenGlue;
+    /**
+     * A hosted caller (the Cloudflare ingest Worker): an unset READER_MAX_RULESET keeps the
+     * hosted reader ceiling (8) at the writer gate instead of the self-host ceiling (10).
+     */
+    hostedReaderCeiling?: boolean;
   };
 }
 
@@ -279,7 +284,9 @@ async function initBindgen(env: ScrubEngineEnv | undefined, o: NonNullable<InitS
     const checkedIn = await loadScrubBindgenPin();
     const pin = "pin" in o ? o.pin : checkedIn;
     const engine = await initBindgenScrubEngine({
-      readerMaxRuleset: readerMaxRuleset(env),
+      // An explicit READER_MAX_RULESET is honoured first (8 or 9 still refuse the version-10
+      // pin); unset is the self-host ceiling (10), or 8 for a hosted caller. See effectiveReaderMaxRuleset.
+      readerMaxRuleset: effectiveReaderMaxRuleset(readerMaxRuleset(env), { hosted: o.hostedReaderCeiling === true }),
       pin,
       readArtifact: o.readArtifact ?? bindgenFileReader(env?.SCRUB_BINDGEN_DIR),
       importGlue: o.importGlue,

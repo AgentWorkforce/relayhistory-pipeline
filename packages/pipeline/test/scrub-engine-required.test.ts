@@ -167,8 +167,8 @@ describe("SCRUB_ENGINE_REQUIRED refuses another selection", () => {
 });
 
 describe("SCRUB_ENGINE_REQUIRED=wasm-bindgen does not bypass the bindgen refusals", () => {
-  it("checked-in alpha.9 pin without READER_MAX_RULESET=10: the reader-ceiling refusal stands, never TypeScript", async () => {
-    const env = { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen" };
+  it("checked-in alpha.9 pin with an explicit READER_MAX_RULESET=8: the reader-ceiling refusal stands, never TypeScript", async () => {
+    const env = { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen", READER_MAX_RULESET: "8" };
     const error = await initScrubEngine({ env }).then(() => null, (e: unknown) => e);
     expect(error).toBeInstanceOf(ScrubEngineUnavailable);
     expect((error as ScrubEngineUnavailable).reason).toBe("bindgen_ruleset_above_reader_ceiling");

@@ -856,6 +856,26 @@ test("manifest admission respects mixed-version chunk metadata without changing 
 });
 
 
+test("self-host reader ceiling: unset admits up to 10 (limit-1, limit) and refuses 11; explicit 8 and 10 are honoured", async () => {
+  const f = await fixture(); const manifest = await f.build(1);
+  const chunk = manifest.raw.chunks[0]!;
+  const { rawChunkKey, readAll } = await import("../../shared/vendor.ts");
+  const key = rawChunkKey(f.location, chunk.seq, chunk.start_offset, chunk.sha256, manifest.raw.format);
+  const object = await f.store.getObject(key); const bytes = await readAll(object.body);
+  const metadata = { ...object.meta.metadata }; delete metadata["content-sha256"];
+  const raw = { store: f.store, provider: "fs" as const, bucket: "raw" };
+  const cases: Array<[version: string, maximum: number | undefined, accepted: boolean]> = [
+    ["9", undefined, true], ["10", undefined, true], ["11", undefined, false],
+    ["8", 8, true], ["9", 8, false], ["10", 8, false],
+    ["9", 10, true], ["10", 10, true], ["11", 10, false],
+  ];
+  for (const [version, maximum, accepted] of cases) {
+    await f.store.put(key, bytes, { metadata: { ...metadata, "scrub-version": version } });
+    expect(`${version}@${maximum ?? "unset"}: ${await chunksAreServerSealed(raw, manifest, undefined, maximum)}`).toBe(`${version}@${maximum ?? "unset"}: ${accepted}`);
+  }
+});
+
+
 test("unset courier policy preserves main's empty-manifest and numeric metadata admission",async()=>{
  const f=await fixture();const manifest=await f.build(1);const raw={store:f.store,provider:"fs" as const,bucket:"raw"};
  for(const [marker, accepted] of [

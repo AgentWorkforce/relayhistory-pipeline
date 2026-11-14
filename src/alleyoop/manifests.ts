@@ -1,5 +1,5 @@
 import { PipelineError } from "../../packages/pipeline/src/lib/pipeline/errors.ts";
-import { assertReaderScrubMarker, assertReaderChunkMetadata, readerMaxRuleset, DEFAULT_READER_MAX_RULESET } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
+import { assertReaderScrubMarker, assertReaderChunkMetadata, readerMaxRuleset, effectiveReaderMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { Hono, type Context, type MiddlewareHandler } from "hono";
 import { createMiddleware } from "hono/factory";
 import {
@@ -693,7 +693,7 @@ export async function chunksAreServerSealed(
           // manifest's version and no newer than this server's.
           Number(meta.metadata["scrub-version"]) >= scrub.version &&
           Number.isSafeInteger(Number(meta.metadata["scrub-version"])) &&
-          Number(meta.metadata["scrub-version"]) <= (maximum ?? DEFAULT_READER_MAX_RULESET) &&
+          Number(meta.metadata["scrub-version"]) <= effectiveReaderMaxRuleset(maximum) &&
           meta.metadata["trace-id"] === manifest.trace_id
         );
       }),

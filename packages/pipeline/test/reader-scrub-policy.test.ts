@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assertReaderScrubMarker, parseReaderMaxRuleset, readerChunkBody, readerMaxRuleset } from "../src/lib/scrub-engine/reader-policy.js";
+import { DEFAULT_READER_MAX_RULESET, DEFAULT_SELF_HOST_READER_MAX_RULESET, assertReaderScrubMarker, effectiveReaderMaxRuleset, parseReaderMaxRuleset, readerChunkBody, readerMaxRuleset } from "../src/lib/scrub-engine/reader-policy.js";
 import { bindgenProfile, parseScrubBindgenPin } from "../src/lib/scrub-engine/bindgen-engine.js";
 import { SCRUB_RULESET_VERSION } from "../src/lib/pipeline/raw-chunks.js";
 
@@ -24,6 +24,30 @@ describe("reader ruleset capability independent of writer stamps", () => {
       expect(String(error)).not.toContain("SYNTH_PRIVATE");
     });
   }
+
+  it("effective ceiling: explicit READER_MAX_RULESET wins; unset is 10 for self-host and 8 for a hosted caller", () => {
+    expect(DEFAULT_READER_MAX_RULESET).toBe(8);
+    expect(DEFAULT_SELF_HOST_READER_MAX_RULESET).toBe(10);
+    expect(effectiveReaderMaxRuleset(undefined)).toBe(10);
+    expect(effectiveReaderMaxRuleset(undefined, { hosted: true })).toBe(8);
+    for (const explicit of [8, 9, 10]) {
+      expect(effectiveReaderMaxRuleset(explicit)).toBe(explicit);
+      expect(effectiveReaderMaxRuleset(explicit, { hosted: true })).toBe(explicit);
+    }
+    expect(effectiveReaderMaxRuleset(readerMaxRuleset({ READER_MAX_RULESET: "8" }))).toBe(8);
+    expect(effectiveReaderMaxRuleset(readerMaxRuleset({}))).toBe(10);
+    // Out-of-capability explicit values are never silently clamped.
+    for (const bad of [7, 11, 9.5]) expect(() => effectiveReaderMaxRuleset(bad)).toThrow("READER_MAX_RULESET must be an integer from 8 through 10");
+  });
+  it("writer gate at the effective ceiling: limit-1 / limit / limit+1 for unset, explicit 8 and explicit 10", () => {
+    for (const [explicit, limit] of [[undefined, 10], [8, 8], [10, 10]] as const) {
+      const ceiling = effectiveReaderMaxRuleset(explicit);
+      expect(ceiling).toBe(limit);
+      if (limit - 1 >= 8) expect(parseScrubBindgenPin(pin(limit - 1), ceiling).manifest.rulesetVersion).toBe(limit - 1);
+      expect(parseScrubBindgenPin(pin(limit), ceiling).manifest.rulesetVersion).toBe(limit);
+      expect(() => parseScrubBindgenPin(pin(limit + 1), ceiling)).toThrow(expect.objectContaining({ reason: "bindgen_ruleset_above_reader_ceiling" }));
+    }
+  });
 
   function pin(version: number) {
     const manifest = { schema: 3, ruleset: "relayhistory-scrub", rulesetVersion: version, rulesetSourceSha256: "1".repeat(64), crateVersion: "0.0.0-inert-test", abiVersion: 2, policy: "secrets", redactionToken: "[REDACTED]", scrubProfile: `relayhistory-secrets-v${version}` };

@@ -576,7 +576,7 @@ const readWorkerBindgenArtifact: ReadBindgenArtifact = async () => {
  */
 async function scrubEngineReady(env: IngestWorkerEnv): Promise<boolean> {
   try {
-    await initScrubEngine({ env, loadArtifact: loadWorkerScrubWasm, bindgen: { readArtifact: readWorkerBindgenArtifact } });
+    await initScrubEngine({ env, loadArtifact: loadWorkerScrubWasm, bindgen: { readArtifact: readWorkerBindgenArtifact, hostedReaderCeiling: true } });
     return true;
   } catch (error) {
     log.error("session ingest scrub engine unavailable", { error_code: (error as { code?: string }).code ?? "scrub_engine_unavailable" });
