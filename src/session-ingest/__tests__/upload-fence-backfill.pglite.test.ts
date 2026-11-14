@@ -382,6 +382,44 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     for (const sid of ["from-revision", "from-slot"]) expect(await ownerOf(store, A, "origin-1", "claude", sid)).toMatchObject({ epoch: 0, resets: 0, machineId: expect.stringMatching(/^srv_/) });
   });
 
+  test("a session in ownership AND an owned slot is visited once (counters are per session)", async () => {
+    const store = scratch();
+    await own(A, "origin-1", "claude", "both");
+    await rev(A, "origin-1", "rec-9", 1, "claude", "both");
+    await slot(A, "origin-1", "s0001", A.userId, "claude", "both", 2, hex("2"));
+    await slot(A, "origin-1", "s0002", A.userId, "claude", "slot-only", 2, hex("3"));
+    for (const orgs of [undefined, ["org-a"]]) {
+      const dry = await backfillUploadFences({ sql: recordingSql([]), store, keyRoot: ROOT, dryRun: true, sleep: async () => {}, ...(orgs ? { orgs } : {}) });
+      expect(dry.ownership).toMatchObject({ rows: 2, would_register: 2, skipped_no_fence: 0, failed: 0 });
+    }
+  });
+
+  test("users: a cleared (owner-less) slot is no user; a scoped run reads no other org's batch users", async () => {
+    const store = scratch();
+    await slot(A, "origin-1", "s0001", null, null, null, null, null);
+    expect((await run(store, { sections: ["fences"] })).users).toBe(0);
+    await batch(C, "origin-1", "b-1");
+    await batch(A, "origin-1", "b-2");
+    expect((await run(store, { sections: ["fences"], orgs: ["org-a"] })).users).toBe(1);
+    expect(await fenceOf(store, C)).toBeNull();
+    expect((await run(store, { sections: ["fences"] })).users).toBe(2);
+  });
+
+  test("concurrent dry-run fence reads never interleave transactions on the one connection", async () => {
+    const store = scratch();
+    for (let i = 0; i < 12; i++) await own({ ...A, userId: `user-${i}` }, "origin-1", "claude", `sess-${i}`);
+    const log: string[] = [], inner = recordingSql(log);
+    // Every statement yields first, as a real connection does, so the 8 workers really overlap.
+    const slow: BackfillSql = { async query(text, params) { await new Promise((r) => setTimeout(r, 2)); return inner.query(text, params); } };
+    await backfillUploadFences({ sql: slow, store, keyRoot: ROOT, dryRun: true, concurrency: 8, sleep: async () => {}, sections: ["ownership"] });
+    let open = false;
+    for (const st of log) {
+      if (st.startsWith("BEGIN")) { expect(open).toBe(false); open = true; }
+      else if (st === "ROLLBACK") { expect(open).toBe(true); open = false; }
+      else expect(open).toBe(true); // every read inside a transaction: never autocommit, never unbounded
+    }
+  });
+
   test("slot owners come from the slot pass: once per session, also when ownership runs without revisions", async () => {
     const store = scratch();
     await slot(A, "origin-1", "s0001", A.userId, "claude", "two-slots", 2, hex("2"));

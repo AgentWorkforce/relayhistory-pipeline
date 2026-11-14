@@ -30,9 +30,9 @@
  *              `ingest_record_revisions` (seeded rows as revision-only entries) and owned `ingest_lazy_native_slots`
  *              (under the slot's owner and session, so S3 forgets them exactly when SQL's `ingest_lazy_clear` does).
  *
- * SQL (finding 8): no long snapshot and nothing held whole in memory. Every page is its own short `BEGIN ISOLATION
- * LEVEL REPEATABLE READ READ ONLY` transaction, checked with `SHOW transaction_read_only`, always ended by ROLLBACK;
- * SELECTs only, keyset-paged in a stable order, optionally scoped to orgs. Fences are read from S3 per page.
+ * SQL (finding 8): no long snapshot, and only small per-run sets in memory (one entry per user, one per owned
+ * session). Every page is its own short `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` transaction, checked
+ * with `SHOW transaction_read_only`, always ended by ROLLBACK, one at a time on the connection; SELECTs only, keyset-paged in a stable order, optionally scoped to orgs. Fences are read from S3 per page.
  *
  * Fail closed: an unreadable fence is never rewritten; a user with any unrepresentable row gets no fence. Each
  * section reports `complete` only when nothing was skipped for want of a fence, needed review, was invalid or failed.
@@ -333,7 +333,15 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   const { sql } = opts;
 
   /** One short, verified read-only transaction per page (finding 8): every query in it reads ONE snapshot. */
-  async function readOnlyAll(queries: [string, unknown[]][], heapOnly = false): Promise<Record<string, unknown>[][]> {
+  // One transaction at a time on the single connection: concurrent fenceFor reads (mapLimit) must never interleave
+  // their BEGIN/ROLLBACK, or a peer's ROLLBACK would leave this one's reads in autocommit, unbounded, mixed snapshots.
+  let txTail: Promise<unknown> = Promise.resolve();
+  function readOnlyAll(queries: [string, unknown[]][], heapOnly = false): Promise<Record<string, unknown>[][]> {
+    const run = txTail.then(() => readOnlyTx(queries, heapOnly));
+    txTail = run.catch(() => {});
+    return run;
+  }
+  async function readOnlyTx(queries: [string, unknown[]][], heapOnly: boolean): Promise<Record<string, unknown>[][]> {
     await sql.query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
     try {
       const ro = (await sql.query("SHOW transaction_read_only")).rows[0]?.transaction_read_only;
@@ -493,16 +501,22 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
       summary.ownership.failed++;
     }
   };
-  /** Sessions of owned lazy slots, each once per run (a session has many slots). */
+  /**
+   * Every session already visited this run (an ownership page or an owned slot), so each is counted and written once:
+   * a session can be in ingest_session_ownership or a revision AND be an owned slot, and a session has many slots.
+   * One short key per session of the scope, held for the run.
+   */
+  const ownerKey = (r: Record<string, unknown>) => JSON.stringify([r.org_id, r.workspace_id, r.user_id, r.origin_id, r.source, r.session_id]);
   const slotOwners = new Set<string>();
   const registerSlotOwners = async (rows: Record<string, unknown>[]) => {
     const fresh: Record<string, unknown>[] = [];
     for (const r of rows) {
       if (r.current_owner === null || r.current_source === null || r.current_session === null) continue;
-      const k = JSON.stringify([r.org_id, r.workspace_id, r.current_owner, r.origin_id, r.current_source, r.current_session]);
+      const row = { org_id: r.org_id, workspace_id: r.workspace_id, user_id: r.current_owner, origin_id: r.origin_id, source: r.current_source, session_id: r.current_session };
+      const k = ownerKey(row);
       if (slotOwners.has(k)) continue;
       slotOwners.add(k);
-      fresh.push({ org_id: r.org_id, workspace_id: r.workspace_id, user_id: r.current_owner, origin_id: r.origin_id, source: r.current_source, session_id: r.current_session });
+      fresh.push(row);
     }
     const fences = new Map<string, Promise<FenceDoc | null>>();
     await mapLimit(fresh, concurrency, (r) => ownRow(r, fences));
@@ -515,6 +529,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
       const last = rows[rows.length - 1]!;
       cursor = [text(last.org_id), text(last.workspace_id), text(last.user_id), text(last.origin_id), text(last.source), text(last.session_id)];
       const fences = new Map<string, Promise<FenceDoc | null>>();
+      for (const r of rows) slotOwners.add(ownerKey(r));
       await mapLimit(rows, concurrency, (r) => ownRow(r, fences));
     }
   }
