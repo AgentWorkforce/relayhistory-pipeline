@@ -595,6 +595,30 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     expect(denied.ownership).toMatchObject({ failed: 2, failed_codes: { ledger_store_unauthorized: 2 } });
   });
 
+  test("execute: owner, revision-shard and fence writes ride out transient store failures", async () => {
+    const base = scratch(), left = new Map<string, number>();
+    // Every put fails twice per key with a transient error, then lands.
+    const store = new Proxy(base, {
+      get(target, prop) {
+        if (prop === "put") return async (...a: Parameters<ObjectStore["put"]>) => {
+          const k = String(a[0]), n = left.get(k) ?? 2;
+          if (n > 0) { left.set(k, n - 1); throw new ObjectStoreError("transient", "fs", "503"); }
+          return target.put(...a);
+        };
+        const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    await del(A, "origin-1", "claude", "sess-x");
+    await own(A, "origin-1", "claude", "sess-1");
+    await rev(A, "origin-1", "rec-1", 1, "claude", "sess-1");
+    const summary = await run(store);
+    expect(summary.sections).toEqual({ fences: "complete", ownership: "complete", revisions: "complete" });
+    expect(summary.ownership).toMatchObject({ failed: 0, failed_codes: {} });
+    expect(summary.revisions).toMatchObject({ merged: 1, failed: 0, failed_codes: {} });
+    expect(await ownerOf(store, A, "origin-1", "claude", "sess-1")).toMatchObject({ epoch: expect.any(Number) });
+  });
+
   test("a contended fence CAS retries and lands; tallies count once", async () => {
     const base = scratch();
     let fail = 1;

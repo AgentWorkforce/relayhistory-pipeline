@@ -41,7 +41,7 @@
 import type { ObjectStore } from "../shared/vendor.ts";
 import {
   applyFenceChange, checkIndexEntryInput, fenceEpoch, isDeleted, newFence, recordGeneration, s3LedgerObjects, sessionKeyHash,
-  type FenceChange, type FenceDoc, type IndexEntryInput,
+  type FenceChange, type FenceDoc, type IndexEntryInput, type OwnerDoc,
 } from "./ledger-s3.ts";
 import type { LedgerTenant } from "./ledger.ts";
 import { liveMachineId } from "./writer.ts";
@@ -100,6 +100,8 @@ export interface BackfillSummary {
     rows: number; seed_rows: number;
     slot_rows: number; slots_empty: number;
     merged: number; would_merge: number; skipped_deleted: number; skipped_no_fence: number; invalid: number; shards: number; failed: number;
+    /** `failed` by error code, as ownership's. */
+    failed_codes: Record<string, number>;
   };
   sections: Record<BackfillSection, "complete" | "incomplete" | "not_run">;
 }
@@ -332,7 +334,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     fences: { deletion_rows: 0, reset_rows: 0, created: 0, updated: 0, unchanged: 0, would_create: 0, would_update: 0, pairs_added: 0, resets_added: 0,
       deletions_superseded: 0, deletions_unproven: 0, cold_resets: 0, needs_review: 0, unreadable: 0, contended: 0, tenant_invalid: 0, input_invalid: 0, failed: 0, resets_in_flight: 0 },
     ownership: { rows: 0, registered: 0, would_register: 0, unchanged: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, failed: 0, failed_codes: {} },
-    revisions: { rows: 0, seed_rows: 0, slot_rows: 0, slots_empty: 0, merged: 0, would_merge: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, shards: 0, failed: 0 },
+    revisions: { rows: 0, seed_rows: 0, slot_rows: 0, slots_empty: 0, merged: 0, would_merge: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, shards: 0, failed: 0, failed_codes: {} },
     sections: { fences: "not_run", ownership: "not_run", revisions: "not_run" },
   };
   const { sql } = opts;
@@ -374,9 +376,12 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     summary.ownership.failed_codes[code] = (summary.ownership.failed_codes[code] ?? 0) + 1;
   };
   /**
-   * A READ from the store, retried with backoff on a transient store failure (a 503, a reset, a timeout), up to
-   * STORE_READ_ATTEMPTS: one transient GET in tens of thousands must not leave the section incomplete. Anything else
-   * (an invalid document, a refused key) is not retried. Writes are not retried here (their CAS has its own rules).
+   * A store operation retried with backoff on a transient store failure (a 503, a reset, a timeout), up to
+   * STORE_READ_ATTEMPTS: one transient request in tens of thousands must not leave a section incomplete (the EXECUTE
+   * receipt is what binds the chain). Only reads and the ledger's idempotent read-then-CAS operations go through it
+   * (editFence, registerOwner, mergeIndex re-read and compare-and-swap, so a retry after a write that landed but
+   * answered with an error converges; it may count as `unchanged` instead of `created`). Anything else (an invalid
+   * document, a refused key, a contended CAS) is not retried.
    */
   const storeRetry = async <R>(read: () => Promise<R>): Promise<R> => {
     for (let attempt = 0; ; attempt++) {
@@ -389,7 +394,6 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
       }
     }
   };
-  /** Register one session's owner stub (the reset's scope): from the ownership page or an owned lazy slot. */
 
   /**
    * SQL's controls for a page of users: deletions and resets in ONE read-only snapshot (third review), so a reset is
@@ -469,7 +473,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
         const cold = st.resets.filter((r) => r.cold).length;
         try {
           if (opts.dryRun) {
-            const read = await io.readFence(key);
+            const read = await storeRetry(() => io.readFence(key));
             const f = read.state === "present" ? structuredClone(read.fence) : newFence();
             const t = applySqlControls(f, st);
             summary.fences.pairs_added += t.pairs;
@@ -485,13 +489,13 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
           }
           type Landed = { outcome: "created" | "updated" | "unchanged"; t: ReturnType<typeof applySqlControls>; inFlight: boolean };
           // editFence may run the edit more than once (CAS retries): only the landed attempt's result counts.
-          const landed = await io.editFence<Landed>(key, (f) => {
+          const landed = await storeRetry(() => io.editFence<Landed>(key, (f) => {
             const absent = f.version === 0; // editFence starts an absent fence from newFence() (version 0)
             const t = applySqlControls(f, st);
             const inFlight = f.resetsCompleted < f.resets;
             if (!t.changed && !absent) return { next: null, result: { outcome: "unchanged", t, inFlight } };
             return { next: f, result: { outcome: absent ? "created" : "updated", t, inFlight } };
-          });
+          }));
           summary.fences[landed.outcome]++;
           summary.fences.pairs_added += landed.t.pairs;
           summary.fences.resets_added += landed.t.resets;
@@ -512,6 +516,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   }
 
   // ---- ownership ----
+  /** Register one session's owner stub (the reset's scope): from the ownership page or an owned lazy slot. */
   const ownRow = async (r: Record<string, unknown>, fences: Map<string, Promise<FenceDoc | null>>) => {
     summary.ownership.rows++;
     if (!id(r.org_id) || !id(r.user_id) || typeof r.workspace_id !== "string" || !id(r.origin_id) || !id(r.source) || !id(r.session_id)) { summary.ownership.invalid++; return; }
@@ -533,7 +538,8 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
       if (stored && stored.epoch >= epoch && stored.machineId !== undefined) { summary.ownership.unchanged++; return; }
       if (opts.dryRun) { summary.ownership.would_register++; return; }
       // The writer machine, as admission stamps it: the re-arm sweeper binds markers to it.
-      await io.registerOwner(key, { v: 1, originId: r.origin_id, source: r.source, sessionId: r.session_id, epoch, resets, machineId });
+      const stub: OwnerDoc = { v: 1, originId: r.origin_id, source: r.source, sessionId: r.session_id, epoch, resets, machineId };
+      await storeRetry(() => io.registerOwner(key, stub));
       summary.ownership.registered++;
     } catch (error) {
       failOwner(failureCode(error));
@@ -601,11 +607,13 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     const flush = (groups: Map<string, Group>) => mapLimit([...groups.values()], concurrency, async (g) => {
       if (opts.dryRun) { summary.revisions.would_merge += g.entries.length; return; }
       try {
-        await io.mergeIndex(g.key, g.fence, g.originId, g.entries);
+        await storeRetry(() => io.mergeIndex(g.key, g.fence, g.originId, g.entries));
         summary.revisions.merged += g.entries.length;
         summary.revisions.shards++;
-      } catch {
+      } catch (error) {
+        const code = failureCode(error);
         summary.revisions.failed += g.entries.length;
+        summary.revisions.failed_codes[code] = (summary.revisions.failed_codes[code] ?? 0) + g.entries.length;
       }
     });
     // (a) ingest_record_revisions, seeded revision-only rows included.
