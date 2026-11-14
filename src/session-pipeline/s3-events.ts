@@ -13,8 +13,15 @@
  *
  * The scheduled reconcile puts `{"reconcile":{"key","etag","version"}}` bodies
  * on the same queue, so its work takes the same path, retries and DLQ.
+ *
+ * `provider` is the Locker the consumer reads the manifest from (its
+ * ManifestReader's provider), stamped on every event and from there on the
+ * session_index row's storage_provider. It defaults to "s3", the AWS Lambda
+ * behaviour; the self-host consumer passes the Locker's provider (gcs on a GCS
+ * install), so the read API, which refuses a row whose provider is not its own
+ * Locker's, can serve what the consumer indexed.
  */
-import type { ObjectLanded } from "@rhc/lib/pipeline/adapter.ts";
+import type { ObjectLanded, StorageProvider } from "@rhc/lib/pipeline/adapter.ts";
 
 export const RECONCILE_BODY_KEY = "reconcile";
 
@@ -47,7 +54,7 @@ export function decodeS3Key(raw: string): string | null {
   }
 }
 
-function fromRecord(record: S3Record): LandedEvent | null {
+function fromRecord(record: S3Record, provider: StorageProvider): LandedEvent | null {
   if (record.eventSource !== "aws:s3" || typeof record.eventName !== "string") return null;
   const name = record.eventName;
   const created = name.startsWith("ObjectCreated:");
@@ -59,7 +66,7 @@ function fromRecord(record: S3Record): LandedEvent | null {
   if (!key) return null;
   const bucket = record.s3?.bucket?.name;
   return {
-    provider: "s3",
+    provider,
     key,
     ...(typeof bucket === "string" ? { bucket } : {}),
     ...(created && typeof object.eTag === "string" && object.eTag ? { etag: object.eTag.replace(/^"|"$/g, "") } : {}),
@@ -72,7 +79,7 @@ function fromRecord(record: S3Record): LandedEvent | null {
 }
 
 /** Parse one SQS message body. Never throws. */
-export function parseQueueBody(body: string): ParsedBody {
+export function parseQueueBody(body: string, provider: StorageProvider = "s3"): ParsedBody {
   let value: unknown;
   try {
     value = JSON.parse(body);
@@ -89,7 +96,7 @@ export function parseQueueBody(body: string): ParsedBody {
       kind: "events",
       events: [
         {
-          provider: "s3",
+          provider,
           key: reconcile.key,
           ...(typeof reconcile.etag === "string" && reconcile.etag ? { etag: reconcile.etag } : {}),
           ...(typeof reconcile.version === "string" && reconcile.version ? { version: reconcile.version } : {}),
@@ -100,7 +107,7 @@ export function parseQueueBody(body: string): ParsedBody {
   if (!Array.isArray(v.Records)) return { kind: "invalid" };
   const events: LandedEvent[] = [];
   for (const record of v.Records as S3Record[]) {
-    const event = record && typeof record === "object" ? fromRecord(record) : null;
+    const event = record && typeof record === "object" ? fromRecord(record, provider) : null;
     if (event) events.push(event);
   }
   return { kind: "events", events };

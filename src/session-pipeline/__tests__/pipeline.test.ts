@@ -30,7 +30,7 @@ import { indexSearchScope, type SearchIndexDeps } from "../search-index.ts";
 import { processBatch, type ConsumerDeps } from "../consumer.ts";
 import { droppedFanout, type SessionScope } from "../pointer.ts";
 import { memoryLock } from "./support.ts";
-import { RECONCILE_DEADLINE_MS, lambdaEnv, reconcileRecent } from "../lambda.ts";
+import { RECONCILE_DEADLINE_MS, lambdaEnv, reconcileRecent, runtimeFromSecret } from "../lambda.ts";
 import { PGlite } from "@electric-sql/pglite";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { createSearchIndexRegistry } from "@rhc/adapters/defaults.ts";
@@ -40,6 +40,7 @@ import { writerTransactionSql } from "../transaction-sql.ts";
 import { createReadApi, AuthError } from "../../session-read-api/app.ts";
 import type { SearchProjectionState } from "../search-adapter.ts";
 import { postgresOutputFactsStore, type OutputFactsStore } from "../output-facts-store.ts";
+import { lockerProvider } from "../../shared/locker-selection.ts";
 
 const TRACE = "019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18";
 const NOW = new Date("2026-11-01T12:00:00.000Z");
@@ -863,6 +864,64 @@ describe("search index: a busy session is requeued, not waited on (review #2 N2)
     busy = false;
     await processBatch([{ messageId: "m2", body: put }], deps);
     expect(ch.final()).toHaveLength(1);
+  });
+});
+
+describe("consumer events carry the Locker's provider into session_index (GCS self-host)", () => {
+  // The row the pointer stage hands to upsert_session_index, for one body read through a
+  // reader built the way consumer-service does it (lockerManifestReader: the provider is
+  // lockerProvider(env)) and the Lambda does it (provider pinned to s3).
+  async function stampedProvider(provider: ReturnType<typeof lockerProvider>, body: (key: string) => string) {
+    const key = await writeSession("srv_bb", [event("r1", "1", Date.parse(AT), "hello")]);
+    const rows: { storage_provider: string; bucket: string }[] = [];
+    const sb = fakeSupabase(() => [key]);
+    const tx: SqlExecutor = {
+      async query<R>(text: string, params?: unknown[]) {
+        if (text.includes("upsert_session_index")) rows.push(...(JSON.parse(String(params![0])) as typeof rows));
+        return sb.tx.query<R>(text, params);
+      },
+    };
+    const db = { ...tx, pool: undefined, end: async () => {} } as unknown as HoopDb;
+    const bindings = { PIPELINE_ORG_FROM_PREFIX: "true", PIPELINE_KEY_PREFIX: "96bulls" };
+    const located = objectStoreManifestReader(store, { provider, bucket: "bucket" });
+    const deps: ConsumerDeps = {
+      pointer: { db, lock: memoryLock(), reader: located, exists: async (k) => (await store.head(objectKey(k))) !== undefined, orgs: prefixOrgResolver, allowPrefix: (prefix, org) => prefixAllowed(bindings, prefix, org), fanout: droppedFanout },
+    };
+    expect((await processBatch([{ messageId: "m", body: body(key) }], deps)).batchItemFailures).toEqual([]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.bucket).toBe("bucket");
+    return rows[0]!.storage_provider;
+  }
+  const reconcile = (key: string) => JSON.stringify({ reconcile: { key, etag: "e" } });
+  const s3Record = (key: string) =>
+    JSON.stringify({ Records: [{ eventSource: "aws:s3", eventName: "ObjectCreated:Put", eventTime: AT, s3: { bucket: { name: "bucket" }, object: { key, eTag: "e", sequencer: "01" } } }] });
+
+  test("LOCKER_PROVIDER=gcs: a reconcile body (the self-host consumer's only input) is stamped gcs", async () => {
+    expect(await stampedProvider(lockerProvider({ LOCKER_PROVIDER: "gcs" }), reconcile)).toBe("gcs");
+  });
+
+  test("LOCKER_PROVIDER=gcs: an S3-shaped record read through the GCS Locker is stamped gcs too", async () => {
+    expect(await stampedProvider(lockerProvider({ LOCKER_PROVIDER: "gcs" }), s3Record)).toBe("gcs");
+  });
+
+  test("LOCKER_PROVIDER unset or s3 (MinIO, EKS self-host): still s3", async () => {
+    for (const env of [{}, { LOCKER_PROVIDER: "s3" }, { LOCKER_PROVIDER: " s3 " }]) {
+      expect(await stampedProvider(lockerProvider(env), reconcile)).toBe("s3");
+      expect(await stampedProvider(lockerProvider(env), s3Record)).toBe("s3");
+    }
+  });
+
+  test("the AWS Lambda runtime's reader stays pinned to s3", () => {
+    const env = lambdaEnv({
+      AWS_REGION: "us-east-1", PIPELINE_RAW_S3_BUCKET: "bucket", PIPELINE_KEY_PREFIX: "96bulls", PIPELINE_ORG_FROM_PREFIX: "true",
+      SESSION_PIPELINE_SECRET_ARN: "arn", SESSION_PIPELINE_QUEUE_URL: "https://sqs", LOCKER_PROVIDER: "gcs",
+    });
+    const rt = runtimeFromSecret(env, JSON.stringify({ hoopdb_url: "postgresql://synthetic.invalid/fixture" }), "synthetic-generation");
+    expect(rt.deps.pointer.reader.provider).toBe("s3");
+  });
+
+  test("no Azure Locker exists: LOCKER_PROVIDER=azure is refused, never stamped", () => {
+    expect(() => lockerProvider({ LOCKER_PROVIDER: "azure" })).toThrow("LOCKER_PROVIDER must be s3 or gcs");
   });
 });
 

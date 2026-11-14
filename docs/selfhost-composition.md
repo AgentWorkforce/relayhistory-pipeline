@@ -72,6 +72,14 @@ dormant; any other value fails startup.
   read API: the publisher stamps that provider on every published row, the read
   API refuses rows stamped with another provider, and the SQL admits `s3` and
   `gcs` from migration `20261105059000` onward. Unset means `s3`.
+  The pipeline consumer (`SERVICE=session-pipeline-consumer`) stamps its
+  Locker's provider on the session_index rows it writes, so it needs
+  `LOCKER_PROVIDER=gcs` too. Rows an older consumer stamped `s3` on a GCS
+  install stay unreadable (501 `unsupported_by_backend`) until
+  `src/session-pipeline/index-provider-restamp.ts` re-stamps them: plan by
+  default, `--apply` to write, refused unless the Locker is GCS, and it
+  re-stamps only rows in `LOCKER_BUCKET` whose manifest the GCS Locker holds.
+  Its header lists the env, the owner login it needs and the exit codes.
 
 ### `SERVICE=session-erase-bytes`
 

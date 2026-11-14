@@ -57,7 +57,9 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
   const failed = new Set<string>();
   const byKey = new Map<string, { event: LandedEvent; messageIds: string[] }>();
   for (const record of records) {
-    const parsed = parseQueueBody(record.body);
+    // Events carry the provider of the Locker the pointer stage reads from (s3 on the
+    // Lambda, LOCKER_PROVIDER on self-host), which is what the row's storage_provider records.
+    const parsed = parseQueueBody(record.body, deps.pointer.reader.provider);
     if (parsed.kind === "test") continue;
     if (parsed.kind === "invalid") {
       // Never succeeds on retry; the DLQ keeps it for an operator.
