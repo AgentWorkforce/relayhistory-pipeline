@@ -40,8 +40,8 @@
  *                 kept session), read BEFORE the SQL snapshot of the verdict (a candidate page lists the users first):
  *                 the drain refuses a stage when any of these has moved since (`fence_moved_since_export`), so a
  *                 control that lands after the fence read, during the snapshot or before the drain, is honoured. A
- *                 row whose user was not read first (it entered the page range in between) is `fence_late`: no
- *                 sidecar, and the org stays incomplete.
+ *                 row whose user was not read first is `fence_late`: no sidecar, and the org stays incomplete (a
+ *                 guard: each verdict page takes exactly the keys whose users were just read, so it should not occur).
  *   per stage     a sidecar `<stage key>.accepted.json` (v2): {stage_sha256, live, kept: per object group the line
  *                 indexes SQL keeps, fence}. Replaced by CAS when a rerun's verdict differs.
  *   superseded    a create-only `<stage key>.superseded.json` for an earlier LIVE sidecar whose stage is no longer a
@@ -62,8 +62,8 @@
  *     erase deleted their fences: `fence_absent`).
  *
  * SQL: every page is its own short `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` transaction, checked with
- * `SHOW transaction_read_only` and always ended by ROLLBACK; SELECTs only, keyset-paged by stage key, optionally scoped
- * to a set of orgs. Counts only: never a key, tenant id or hash.
+ * `SHOW transaction_read_only` and always ended by ROLLBACK; SELECTs only: the candidate keys read once, then a
+ * verdict per page of those keys, optionally scoped to a set of orgs. Counts only: never a key, tenant id or hash.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { isObjectStoreError, objectKey, readAll, type ObjectStore, type ObjectVersion } from "../shared/vendor.ts";
@@ -130,8 +130,8 @@ export interface ExportSummary {
   /** Not live because the reader's per-user gate is closed, by reason (stages, not users). */
   gated: Partial<Record<GateReason, number>>;
   /**
-   * A row of a user whose S3 fence was not read before the verdict snapshot (the stage entered the page range between
-   * the two reads): no sidecar, and the org stays incomplete until a rerun.
+   * A row of a user whose S3 fence was not read before the verdict snapshot: no sidecar, and the org stays incomplete
+   * until a rerun. A guard: a verdict page takes exactly the keys whose users were just read.
    */
   fence_late: number;
   /** Earlier live sidecars of stages no longer candidates: create-only superseded records written / that would be. */
@@ -159,9 +159,10 @@ SELECT coalesce(bool_or(cp.read_enabled AND cp.write_enabled AND cp.backfill_com
  * Every candidate key and its user, read ONCE per run (one read-only transaction), then paged in memory. Per page the
  * export reads those users' S3 fences BEFORE SQL's verdict over exactly those keys (finding 6). A keyset page here
  * re-joined every buffered outbox row with its batch and sorted them on every page (about 23 s a page on production);
- * collected once it is one such join. A stage that becomes a candidate after this read is not in this run: its
- * object stays stage_export_missing for the drain (refused, never lost) until a later export, which is why the drain
- * needs an export after its backfill and why a scoped run follows the scope's HTTP admission stop.
+ * collected once it is one such join. A stage that becomes a candidate after this read is not in this run: it gets
+ * no sidecar, and once this run completes the org the drain records it `stage_unacknowledged` (refused, never written;
+ * terminal for that generation) until a later export covers it. Hence the drain needs an export after its backfill,
+ * and a scoped run follows the scope's HTTP admission stop.
  */
 export const CANDIDATE_KEYS = `
 SELECT s.stage_key, s.org_id, s.workspace_id, s.user_id${CANDIDATE_FROM}
@@ -509,7 +510,7 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
     };
     const candidates = (await readOnly(() => sql.query(CANDIDATE_KEYS, [orgScope]))).rows;
     for (let at = 0; at < candidates.length; at += pageSize) {
-      // Finding 6: the page's users and their S3 fences FIRST, then SQL's verdict over the same key range. A control
+      // Finding 6: the page's users and their S3 fences FIRST, then SQL's verdict over exactly these keys. A control
       // landing after the fence read moves the fence past what the sidecar records, so the drain refuses
       // (fence_moved_since_export); read the other way round, the sidecar could carry the post-control fence beside a
       // pre-control verdict.
