@@ -242,6 +242,34 @@ describe("S3 head/getObject: server-side encryption in ObjectMeta", () => {
   });
 });
 
+describe("S3 getObject: stored bytes, never a fetch-decoded body", () => {
+  it("asks for Content-Encoding identity, so an object PUT with an encoding is read as stored", async () => {
+    const { createS3Store } = await import("../src/s3.js");
+    const { createServer } = await import("node:http");
+    const { gzipSync } = await import("node:zlib");
+    // fetch decodes gzip (and zstd on Bun) from the Content-Encoding header; the desktop's inbox
+    // objects are stored with `content-encoding: zstd`, and their digest is over the stored frame.
+    const stored = new Uint8Array(gzipSync(new TextEncoder().encode("frame ".repeat(64))));
+    let asked: string | null = "unset";
+    const server = createServer((req, res) => {
+      asked = new URL(req.url ?? "/", "http://x").searchParams.get("response-content-encoding");
+      res.writeHead(200, { "content-encoding": asked ?? "gzip", etag: '"e"', "content-length": String(stored.length) });
+      res.end(Buffer.from(stored));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+    try {
+      const { port } = server.address() as { port: number };
+      const s = createS3Store({ bucket: "b", region: "us-east-1", endpoint: `http://127.0.0.1:${port}`, credentials: { accessKeyId: "k", secretAccessKey: "s" } });
+      const got = await s.getObject(objectKey("a/b.json.zst"));
+      const bytes = new Uint8Array(await new Response(got.body).arrayBuffer());
+      expect(asked).toBe("identity");
+      expect(bytes).toEqual(stored);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+});
+
 describe("S3 put: abort signal and the created version id", () => {
   it("passes the caller's signal to the request and returns x-amz-version-id", async () => {
     const { createS3Store } = await import("../src/s3.js");
