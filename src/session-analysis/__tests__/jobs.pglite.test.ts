@@ -3,7 +3,7 @@
  * harness): relayhistory's admission outcomes and limits, the v1 read projection for
  * native and backfilled rows, the read role guard, erasure, and the worker lease.
  */
-import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, setSystemTime, test } from "bun:test";
 import type { PGlite } from "@electric-sql/pglite";
 import { database, hoopDb, pointer, KEY } from "../../session-brief/__tests__/harness.ts";
 import { postgresAnalysisJobStore, sweepAnalysisTickets } from "../store.ts";
@@ -83,6 +83,7 @@ const age = (table: string, interval: string) =>
   pg.query(`UPDATE sessions.${table} SET created_at = created_at - $1::interval`, [interval]);
 
 afterEach(async () => {
+  setSystemTime(); // back to the real clock (a no-op unless a test pinned it)
   await pg.close();
 });
 
@@ -122,6 +123,13 @@ describe("analysis_request_v1", () => {
   });
 
   test("relayhistory limits: 2-minute throttle, 30 per session per day, 20 other sessions per org per day", async () => {
+    // analysis_request_v1 counts "today" from SQL now() (UTC day start) and throttles on now() - 2 minutes,
+    // so just after UTC midnight no fixture is both today and unthrottled (failed at 00:02:28Z). PGlite
+    // reads the JS clock: pin it (frozen) to the next 12:00Z, mid UTC day and after every beforeEach row.
+    const noon = new Date();
+    noon.setUTCHours(12, 0, 0, 0);
+    if (noon.getTime() < Date.now()) noon.setUTCDate(noon.getUTCDate() + 1);
+    setSystemTime(noon);
     const first = await request();
     await pg.query("UPDATE sessions.session_analysis_jobs_v2 SET status = 'failed', last_error = 'model_refusal'");
     // Throttled: the latest request, even failed.
