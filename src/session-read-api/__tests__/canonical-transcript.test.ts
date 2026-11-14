@@ -15,14 +15,16 @@ const KEY={orgId:ID.orgId,workspaceId:ID.workspaceId,harness:ID.source,sessionId
 const LOC={prefix:"org-a",workspaceId:"ws-a",machineId:"m-1",harness:"claude",sessionId:"s-1",startDate:"2026-10-29"};
 const AT="2026-10-29T10:00:00.000Z", hash=(b:Uint8Array)=>createHash("sha256").update(b).digest("hex");
 const messages=[{type:"user",sessionId:"s-1",uuid:"u1",timestamp:AT,message:{role:"user",content:[{type:"text",text:"Investigate the owned queue race."}]}},{type:"assistant",sessionId:"s-1",uuid:"a1",timestamp:"2026-10-29T10:00:01.000Z",message:{role:"assistant",content:[{type:"text",text:"Awaiting the lease fixed the race."}],model:"fixture"}}];
-async function fixture(raw=new TextEncoder().encode(messages.map(x=>JSON.stringify(x)).join("\n")+"\n"),split?:number,declaredRecords=messages.length,session="s-1"){
+async function fixture(raw=new TextEncoder().encode(messages.map(x=>JSON.stringify(x)).join("\n")+"\n"),split?:number|number[],declaredRecords=messages.length,session="s-1"){
  const location={...LOC,sessionId:session};
  const store=createFsStore({root:mkdtempSync(join(tmpdir(),"canonical-jsonl-"))});
  const chunks=[];let offset=0;
- for(const [seq,bytes] of (split===undefined?[raw]:[raw.slice(0,split),raw.slice(split)]).entries()){
+ // An array split: chunk boundaries at those offsets, each chunk declaring the records it ends.
+ const pieces=split===undefined?[raw]:Array.isArray(split)?[0,...split].map((at,i,all)=>raw.slice(at,all[i+1]??raw.length)):[raw.slice(0,split),raw.slice(split)];
+ for(const [seq,bytes] of pieces.entries()){
   const stored=new Uint8Array(zstdCompressSync(bytes)),digest=hash(bytes);
   await store.put(rawChunkKey(location,seq,offset,digest,"jsonl"),stored);
-  chunks.push({seq,epoch:0,start_offset:offset,bytes:bytes.length,stored_bytes:stored.length,sha256:digest,sha256_8:digest.slice(0,8),stored_sha256:hash(stored),stored_raw_bytes:bytes.length,raw_sha256:digest,compression:"zstd",records:seq===0&&split!==undefined?0:declaredRecords});offset+=bytes.length;
+  chunks.push({seq,epoch:0,start_offset:offset,bytes:bytes.length,stored_bytes:stored.length,sha256:digest,sha256_8:digest.slice(0,8),stored_sha256:hash(stored),stored_raw_bytes:bytes.length,raw_sha256:digest,compression:"zstd",records:Array.isArray(split)?bytes.filter(b=>b===10).length:seq===0&&split!==undefined?0:declaredRecords});offset+=bytes.length;
  }
  const manifest={schema_v:1,layout:"v1",trace_id:"019a1f3c-8e2b-7c41-9d3a-5b6f0e2a7c18",revision:1,created_at:AT,updated_at:AT,session:{workspace_id:"ws-a",machine_id:"m-1",harness:"claude",session_id:session,started_at:AT},writer:{delivery_instance_id:"m-1",plugin_version:"test"},raw:{owner:"m-1",state:"open",updated_at:AT,format:"jsonl",compression:"zstd",chunk_count:chunks.length,raw_bytes:raw.length,stored_bytes:chunks.reduce((n,c)=>n+c.stored_bytes,0),content_sha256:await computeContentSha256(chunks as never),epoch:0,epochs:[{epoch:0,opened_at:AT,reason:"initial",first_seq:0,opened_by:"m-1"}],next_offset:raw.length,chunks,scrub:{ruleset:"relayhistory-scrub",version:1}},extensions:{"96bulls":{user_id:"u-1"}}} as unknown as ManifestV1;
  const path=manifestKey(location);let reads=0;
@@ -125,4 +127,48 @@ test("unset JSONL policy retains main's version-9 and foreign-family transcript 
   expect((await canonicalTranscriptSnapshot(f.deps,ID))?.records).toEqual(baseline?.records);
   await expect(canonicalTranscriptSnapshot({...f.deps,readerMaxRuleset:8},ID)).rejects.toMatchObject({code:"scrub_ruleset_unsupported"});
  }
+});
+
+/** READ_API_CANONICAL_FETCH_CONCURRENCY (CanonicalDeps.fetchConcurrency, bounded-prefetch.ts) on the JSONL reader. */
+async function manyChunks(n=40){
+ // n chunks of one record each, the last record split across two chunks so a line still crosses a boundary.
+ const rows=Array.from({length:n},(_,i)=>({...messages[i%2]!,uuid:`m${i}`}));const lines=rows.map(x=>JSON.stringify(x)+"\n");
+ const raw=new TextEncoder().encode(lines.join(""));const cuts:number[]=[];let at=0;for(const l of lines.slice(0,-1)){at+=new TextEncoder().encode(l).length;cuts.push(at);}cuts.push(at+5);
+ return fixture(raw,cuts);
+}
+function slow(deps:CanonicalDeps,fetchConcurrency?:number,abort?:AbortController,abortAt?:number){
+ const state={inFlight:0,peak:0,started:0};
+ const store=new Proxy(deps.store,{get(target,prop){const v=Reflect.get(target,prop);if(prop!=='getObject')return typeof v==='function'?v.bind(target):v;
+  return async(...args:Parameters<typeof target.getObject>)=>{if(!String(args[0]).endsWith('.zst'))return target.getObject(...args);state.started++;if(state.started===abortAt)abort?.abort();state.peak=Math.max(state.peak,++state.inFlight);try{await new Promise(r=>setTimeout(r,2));return await target.getObject(...args);}finally{state.inFlight--;}};}});
+ return {state,deps:{...deps,store,...(fetchConcurrency!==undefined?{fetchConcurrency}:{})} as CanonicalDeps};
+}
+function watchUnhandled(){const seen:unknown[]=[];const on=(r:unknown)=>{seen.push(r)};process.on("unhandledRejection",on);return {seen,off:()=>process.off("unhandledRejection",on)};}
+test("fetchConcurrency 8 over 41 chunks yields the sequential records, at most 8 chunk reads in flight",async()=>{
+ const f=await manyChunks();expect(f.manifest.raw.chunks).toHaveLength(41);
+ const one=slow(f.deps),par=slow(f.deps,8);
+ const sequential=await canonicalTranscriptSnapshot(one.deps,ID);expect(sequential?.records).toHaveLength(40);expect(one.state.peak).toBe(1);
+ expect(await canonicalTranscriptSnapshot(par.deps,ID)).toEqual(sequential);expect(par.state.peak).toBeGreaterThan(1);expect(par.state.peak).toBeLessThanOrEqual(8);expect(par.state.started).toBe(41);
+ const explicitOne=slow(f.deps,1);expect(await canonicalTranscriptSnapshot(explicitOne.deps,ID)).toEqual(sequential);expect(explicitOne.state.peak).toBe(1);
+});
+test("fetchConcurrency 8: a digest-mismatched middle chunk still refuses transcript_chunk_digest_mismatch, no unhandled rejection",async()=>{
+ const f=await manyChunks();const c=f.manifest.raw.chunks[20]!;await f.store.put(rawChunkKey(LOC,c.seq,c.start_offset,c.sha256,'jsonl'),new Uint8Array([1,2,3]));
+ const watch=watchUnhandled();
+ try{
+  await expect(canonicalTranscriptSnapshot(f.deps,ID)).rejects.toMatchObject({reason:'transcript_chunk_digest_mismatch'});
+  const par=slow(f.deps,8);await expect(canonicalTranscriptSnapshot(par.deps,ID)).rejects.toMatchObject({reason:'transcript_chunk_digest_mismatch'});
+  expect(par.state.started).toBeLessThanOrEqual(21+7);await new Promise(r=>setTimeout(r,30));expect(par.state.inFlight).toBe(0);expect(watch.seen).toEqual([]);
+ }finally{watch.off();}
+});
+test("fetchConcurrency 8: an aborted signal still stops with the AbortError, starting no chunk read after the abort",async()=>{
+ const f=await manyChunks();const watch=watchUnhandled();
+ try{
+  for(const n of [undefined,8]){
+   const controller=new AbortController();const run=slow(f.deps,n,controller,10);
+   const error=await canonicalTranscriptSnapshot(run.deps,ID,controller.signal).catch(e=>e);
+   expect(error).toBeInstanceOf(DOMException);expect((error as DOMException).name).toBe('AbortError');
+   const started=run.state.started;expect(started).toBeLessThanOrEqual(10+(n??1)-1);
+   await new Promise(r=>setTimeout(r,30));expect(run.state.started).toBe(started);expect(run.state.inFlight).toBe(0);
+  }
+  expect(watch.seen).toEqual([]);
+ }finally{watch.off();}
 });

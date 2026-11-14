@@ -49,6 +49,15 @@
  *                             (byte-identical); malformed or out of range fails startup, naming the variable (never
  *                             clamped). Keep it below the ingress/proxy read timeout (stock ingress-nginx: 60 s). Read
  *                             only here, so never on the hosted Worker/Lambda, which keep 3000.
+ *   READ_API_CANONICAL_FETCH_CONCURRENCY              canonical chunk bodies fetched in flight per manifest by the
+ *                             reads above (canonical-projection.ts streamManifestRecords, canonical-transcript.ts;
+ *                             bounded-prefetch.ts), a plain whole number in 1..16. Unset or empty: 1, the sequential
+ *                             read (byte-identical). Every per-chunk check (byte cap, stored/raw digest, scrub marker,
+ *                             record counts, scope bounds, abort, source-generation re-check) still runs in chunk order;
+ *                             at most N bodies (each capped at its declared stored_bytes) are held at once. A session
+ *                             of ~100 chunks at ~30 ms per object (GCS) needs ~8 to fit the 3000 ms deadline.
+ *                             Malformed or out of range fails startup, naming the variable (never clamped). Read only
+ *                             here, so never on the hosted Worker/Lambda, which stay sequential.
  *
  * The store is built by src/shared/locker.ts buildLockerStore, the builder
  * every other service uses, so credentials, provider selection and egress rules
@@ -147,6 +156,24 @@ export function canonicalDeadlineMs(env: NodeJS.ProcessEnv): number | undefined 
   return value;
 }
 
+/** READ_API_CANONICAL_FETCH_CONCURRENCY bounds: 1 (sequential, the default) up to 16 chunk fetches in flight. */
+export const CANONICAL_FETCH_CONCURRENCY_MIN = 1, CANONICAL_FETCH_CONCURRENCY_MAX = 16;
+
+/**
+ * The self-host canonical chunk-fetch concurrency (see the header): 1 when unset or empty (sequential, unchanged).
+ * Throws at startup on a malformed or out-of-range value, naming the variable and its range (not the value); never
+ * clamps.
+ */
+export function canonicalFetchConcurrency(env: NodeJS.ProcessEnv): number {
+  const raw = env.READ_API_CANONICAL_FETCH_CONCURRENCY;
+  if (raw === undefined || raw === "") return CANONICAL_FETCH_CONCURRENCY_MIN;
+  const m = /^([1-9][0-9]?)$/u.exec(raw);
+  const value = m ? Number(m[1]) : NaN;
+  if (!Number.isSafeInteger(value) || value < CANONICAL_FETCH_CONCURRENCY_MIN || value > CANONICAL_FETCH_CONCURRENCY_MAX)
+    throw new Error(`session read api: READ_API_CANONICAL_FETCH_CONCURRENCY must be a whole number in ${CANONICAL_FETCH_CONCURRENCY_MIN}..${CANONICAL_FETCH_CONCURRENCY_MAX}`);
+  return value;
+}
+
 /**
  * The canonical source for the service, or undefined when LOCKER_BUCKET is unset
  * (the routes then answer 501 `*_not_configured`, unchanged). Throws at startup
@@ -183,11 +210,13 @@ export async function serviceCanonicalDeps(
   // Self-host only; absent when unset, so every route keeps its `?? 3000` default (see the header).
   const deadlineMs = canonicalDeadlineMs(env);
   const deadline = deadlineMs !== undefined ? { deadlineMs } : {};
+  // Self-host only; 1 (unset) leaves CanonicalDeps without the field: the sequential read, as before.
+  const fetchConcurrency = canonicalFetchConcurrency(env);
   function deps(signal: AbortSignal): CanonicalDeps {
     // Every object read of this request is aborted at the route's deadline.
     const bounded: typeof fetch = (input, init) => fetcher(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, signal]) : signal });
     const raw = buildLockerStore(env, { fetch: bounded, ...(credentials ? { credentials } : {}), ...(gcsToken ? { gcsToken } : {}) });
-    return { readerMaxRuleset: maximum, store: raw.store, provider: raw.provider, bucket: raw.bucket, prefix, pointers: pointers.pointers, decompress, ...(pinLaggingPointer ? { pinLaggingPointer } : {}) };
+    return { readerMaxRuleset: maximum, store: raw.store, provider: raw.provider, bucket: raw.bucket, prefix, pointers: pointers.pointers, decompress, ...(pinLaggingPointer ? { pinLaggingPointer } : {}), ...(fetchConcurrency > 1 ? { fetchConcurrency } : {}) };
   }
   async function source(identity: CanonicalIdentity, signal: AbortSignal): Promise<CanonicalRows & { generation: string; exists: boolean }> {
     const snapshot = await canonicalSnapshot(deps(signal), identity, scope);

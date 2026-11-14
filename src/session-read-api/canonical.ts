@@ -83,6 +83,13 @@ export interface CanonicalDeps {
    * pinnedToPointer. Unset: any difference is `manifest_mismatch`, as before.
    */
   pinLaggingPointer?: boolean;
+  /**
+   * Self-host only (serviceCanonicalDeps, READ_API_CANONICAL_FETCH_CONCURRENCY, 1..16):
+   * chunk bodies prefetched in flight per manifest (bounded-prefetch.ts), consumed and
+   * checked strictly in order. Unset (every hosted Worker/Lambda caller): 1, the
+   * sequential read, exactly as before.
+   */
+  fetchConcurrency?: number;
 }
 export const CANONICAL_SCOPE_BYTES = 16 * 1024 * 1024;
 const MAX_POINTERS = 64; // RPC has LIMIT 64 without a sentinel: refuse the boundary.
@@ -260,6 +267,7 @@ async function snapshotWithLimits(
               .join("/")
           : (deps.prefix.PIPELINE_KEY_PREFIX ?? ""),
       decompress: deps.decompress,
+      ...(deps.fetchConcurrency !== undefined ? { fetchConcurrency: deps.fetchConcurrency } : {}),
       reader: {
         ...reader,
         async read(key) {

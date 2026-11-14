@@ -1,11 +1,12 @@
 /** Strict native transcript input for briefs. The public canonical record-stream
  * APIs stay ndjson-only. Nothing here relabels stored bytes or skips bad JSON. */
-import { assertReaderScrubMarker, readerChunkBody } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
+import { assertReaderScrubMarker } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { createHash } from "node:crypto";
 import { chunkKeys, isManifestRest, parseSessionKey, type ManifestV1 } from "../../packages/object-store/src/index.ts";
-import { objectStoreManifestReader, prefixAllowed, readCapped } from "../../packages/pipeline/src/lib/pipeline/adapter.ts";
+import { objectStoreManifestReader, prefixAllowed } from "../../packages/pipeline/src/lib/pipeline/adapter.ts";
 import { canonicalManifestIdentity } from "../shared/manifest-identity.ts";
 import { manifestUserId } from "./canonical-projection.ts";
+import { boundedPrefetch, readChunkBody } from "./bounded-prefetch.ts";
 import { CANONICAL_SCOPE_BYTES, CanonicalReadError, canonicalSourceGeneration, checkedCanonicalPointers, type CanonicalDeps, type CanonicalIdentity } from "./canonical.ts";
 
 const MAX_RECORDS = 100000;
@@ -69,20 +70,30 @@ export async function canonicalTranscriptSnapshot(deps: CanonicalDeps, identity:
         refuse("transcript_session_mismatch");
       records.push({ machineId, index: ++index, record });
     };
-    for (const { entry, key } of chunks) {
+    // deps.fetchConcurrency (self-host READ_API_CANONICAL_FETCH_CONCURRENCY; absent: 1, strictly sequential as
+    // before) prefetches chunk bodies (bounded-prefetch.ts); the abort, size and digest checks still run per chunk
+    // in order. An oversized chunk, or any chunk after the request aborted, is never fetched.
+    const tooLarge = (entry: (typeof chunks)[number]["entry"]) => entry.stored_bytes > CANONICAL_SCOPE_BYTES || (entry.stored_raw_bytes ?? entry.bytes) > CANONICAL_SCOPE_BYTES;
+    const bodies = boundedPrefetch(chunks, deps.fetchConcurrency ?? 1, async ({ entry, key }, stop) => {
       signal?.throwIfAborted();
-      if (entry.stored_bytes > CANONICAL_SCOPE_BYTES || (entry.stored_raw_bytes ?? entry.bytes) > CANONICAL_SCOPE_BYTES) refuse("transcript_chunk_too_large");
-      const stored = await readCapped(await readerChunkBody(await deps.store.getObject(key), manifest.raw.scrub, deps.readerMaxRuleset), entry.stored_bytes);
-      if (!stored || stored.byteLength !== entry.stored_bytes || hash(stored) !== entry.stored_sha256) refuse("transcript_chunk_digest_mismatch");
-      let raw: Uint8Array;
-      try { raw = deps.decompress(stored, entry.stored_raw_bytes ?? CANONICAL_SCOPE_BYTES); } catch { refuse("transcript_chunk_decompress_failed"); }
-      if ((entry.stored_raw_bytes !== undefined && raw.byteLength !== entry.stored_raw_bytes) || (entry.raw_sha256 !== undefined && hash(raw) !== entry.raw_sha256)) refuse("transcript_chunk_digest_mismatch");
-      actualBytes += raw.byteLength;
-      if (actualBytes > CANONICAL_SCOPE_BYTES) refuse("transcript_scope_too_large");
-      try { pending += decoder.decode(raw, { stream: true }); } catch { refuse("transcript_utf8_invalid"); }
-      let newline: number;
-      while ((newline = pending.indexOf("\n")) !== -1) { consume(pending.slice(0,newline)); pending = pending.slice(newline+1); }
-    }
+      return tooLarge(entry) ? null : readChunkBody(deps.store, key, manifest.raw.scrub, deps.readerMaxRuleset, entry.stored_bytes, stop);
+    });
+    try {
+      for (const { entry } of chunks) {
+        signal?.throwIfAborted();
+        if (tooLarge(entry)) refuse("transcript_chunk_too_large");
+        const stored = (await bodies.next()).value ?? null;
+        if (!stored || stored.byteLength !== entry.stored_bytes || hash(stored) !== entry.stored_sha256) refuse("transcript_chunk_digest_mismatch");
+        let raw: Uint8Array;
+        try { raw = deps.decompress(stored, entry.stored_raw_bytes ?? CANONICAL_SCOPE_BYTES); } catch { refuse("transcript_chunk_decompress_failed"); }
+        if ((entry.stored_raw_bytes !== undefined && raw.byteLength !== entry.stored_raw_bytes) || (entry.raw_sha256 !== undefined && hash(raw) !== entry.raw_sha256)) refuse("transcript_chunk_digest_mismatch");
+        actualBytes += raw.byteLength;
+        if (actualBytes > CANONICAL_SCOPE_BYTES) refuse("transcript_scope_too_large");
+        try { pending += decoder.decode(raw, { stream: true }); } catch { refuse("transcript_utf8_invalid"); }
+        let newline: number;
+        while ((newline = pending.indexOf("\n")) !== -1) { consume(pending.slice(0,newline)); pending = pending.slice(newline+1); }
+      }
+    } finally { await bodies.return(); } // stops the prefetch on refusal/abort; siblings never reject unhandled
     try { pending += decoder.decode(); } catch { refuse("transcript_utf8_invalid"); }
     consume(pending);
     if (chunks.every(({entry:c}) => c.records !== undefined) && index !== chunks.reduce((n,{entry:c}) => n + c.records!, 0)) refuse("transcript_record_count_mismatch");
