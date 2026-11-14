@@ -189,7 +189,10 @@ export function backlogOpsScope(env: Record<string, string | undefined>): Backlo
  * (sqlstate_57014). Fewer, larger pages and the tool's maximum per-statement timeout. Each page is still its own
  * READ ONLY transaction.
  */
-export const BACKLOG_OPS_BACKFILL_PAGING = ["--page-size", "5000", "--row-page-size", "20000", "--statement-timeout-ms", "600000"] as const;
+// --concurrency 16 (the tool's MAX_BACKFILL_CONCURRENCY): the scoped execute at the default 4 took over 3 h writing ~10.8M
+// revision entries, and the drain needs its bound backfill-execute under 3 h old (BACKLOG_OPS_FRESH_BACKFILL_MS). S3
+// writes are per-key CAS with no shared hot key; SQL reads stay one transaction at a time on the connection.
+export const BACKLOG_OPS_BACKFILL_PAGING = ["--page-size", "5000", "--row-page-size", "20000", "--statement-timeout-ms", "600000", "--concurrency", "16"] as const;
 /** The export's per-statement timeout: its org, candidate and per-user reads over the buffer are as heavy (same 30 s default). */
 export const BACKLOG_OPS_EXPORT_PAGING = ["--statement-timeout-ms", "600000"] as const;
 
