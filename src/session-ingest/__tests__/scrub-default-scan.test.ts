@@ -4,10 +4,12 @@
  * clean copy of the tracked sources makes the scan fail with that rule. Entry-shape coverage
  * (G1 .mjs, G2 Worker default export, G8 Lambda handler export, S11 `const x = await`), the
  * engine-running-name check (S9), require edges (G3) and string-only initialisers (G6) are
- * planted too. Known limits are listed in the scan header.
+ * planted too, as are directory imports (N14), extensionless .mts/.mjs/.js resolution, plain .js
+ * entries, workspace `exports` (an unknown shape is reported) and the exemption-reason checks
+ * (M5b bypass, intermediate-only, extensionless paths). Known limits are listed in the scan header.
  */
 import { describe, expect, test } from "bun:test";
-import { edges, ENTRY_EXEMPT, HOSTED_ENTRIES, HOSTED_GRANT_MODULES, isExecutableEntry, isHandlerEntry, resolveSpec, scan, seamChain, trackedSources, TS_CAPABILITY_DECLARERS, type Sources } from "../../../scripts/scrub-default-scan.ts";
+import { edges, ENTRY_EXEMPT, HOSTED_ENTRIES, HOSTED_GRANT_MODULES, isExecutableEntry, isHandlerEntry, REASON_PATH_RE, resolveSpec, scan, seamChain, trackedSources, TS_CAPABILITY_DECLARERS, type Sources } from "../../../scripts/scrub-default-scan.ts";
 
 const repo = trackedSources();
 const mutate = (path: string, edit: (src: string) => string): Sources => {
@@ -327,11 +329,11 @@ describe("scrub-default-scan", () => {
 
   // ENTRY_EXEMPT reasons that name a repo path are checked against the graph.
   test("every repo path named in an exemption reason is a tracked source every seam route passes through", () => {
-    const named = Object.entries(ENTRY_EXEMPT).flatMap(([f, why]) => (why.match(/\b(?:src|packages|scripts|e2e|benchmarks|stacks)\/[\w./-]+\.(?:m?ts|mjs)\b/g) ?? []).map((p) => [f, p] as const));
+    const named = Object.entries(ENTRY_EXEMPT).flatMap(([f, why]) => (why.match(REASON_PATH_RE) ?? []).map((p) => [f, p] as const));
     expect(named.length).toBeGreaterThan(0);
     for (const [f, p] of named) {
       expect(repo.has(p), `${f}: ${p}`).toBe(true);
-      expect(seamChain(repo, f)!, `${f}: ${p}`).toContain(p);
+      expect(seamChain(repo, f)!.slice(1, -1), `${f}: ${p}`).toContain(p);
       expect(seamChain(repo, f, new Set([p])), `${f}: ${p}`).toBeUndefined();
     }
   });
@@ -357,5 +359,105 @@ describe("scrub-default-scan", () => {
     expect(rules(mutate(GC, (s) => `#!/usr/bin/env node\n${s}`))).not.toContain(`hosted-grant-first:${GC}`);
     for (const before of ["/* header */\n", "\"use strict\";\n"])
       expect(rules(mutate(GC, (s) => s.replace(GC_GRANT, (line) => `${before}${line}`)))).not.toContain(`hosted-grant-first:${GC}`);
+  });
+  // F3: exemption reasons must cite real files that are intermediate modules every seam route passes.
+  const LARGE = "scripts/build-large-read-worker.ts";
+  const staleDetails = (files: Sources, f: string) => scan(files).filter((v) => v.file === f && v.rule === "stale-exemption").map((v) => v.detail);
+  const withReason = <T>(f: string, reason: string, run: () => T): T => {
+    const table = ENTRY_EXEMPT as Record<string, string>;
+    const before = table[f]!;
+    table[f] = reason;
+    try {
+      return run();
+    } finally {
+      table[f] = before;
+    }
+  };
+
+  test("an exempt entry whose seam route passes the named paths but has a longer bypass is reported stale (M5b)", () => {
+    // The first (shortest) chain still runs through the named paths; only the avoid check finds the bypass.
+    const hops = ["a", "b", "c", "d", "e"].map((h) => `scripts/planted-bypass-${h}.ts`);
+    let files = mutate(LARGE, (s) => `${s}\nimport "./planted-bypass-a.ts";\n`);
+    hops.forEach((h, i) => { files = plant(h, i < hops.length - 1 ? `export * from "./planted-bypass-${"abcde"[i + 1]}.ts";\n` : `export { scrubText } from "../${SEAM}.ts";\n`, files); });
+    expect(seamChain(files, LARGE)).toStrictEqual(seamChain(repo, LARGE));
+    expect(seamChain(files, LARGE, new Set(["src/shared/log.ts"]))).toContain(hops[0]);
+    expect(staleDetails(files, LARGE).join("\n")).toContain("not every route from the entry to the seam passes through it");
+  });
+
+  test("a reason naming the seam module or the entry itself is reported stale (intermediate only)", () => {
+    const chain = seamChain(repo, LARGE)!;
+    for (const named of [chain.at(-1)!, "packages/pipeline/src/lib/scrub.ts", LARGE]) {
+      const details = withReason(LARGE, `bundler: reaches the seam only through ${named}, never called`, () => staleDetails(repo, LARGE));
+      expect(details.join("\n"), named).toContain(`reason names ${named}, but the reason must name an intermediate module`);
+    }
+  });
+
+  test("a reason naming a tracked file off the seam route is reported stale", () => {
+    expect(withReason(LARGE, "bundler: reaches the seam only through src/session-ingest/accept-generations.ts", () => staleDetails(repo, LARGE)).join("\n")).toContain("must name an intermediate module");
+  });
+
+  test("a reason path written without an extension (or not tracked) is checked and reported stale", () => {
+    expect("through src/shared/log, never".match(REASON_PATH_RE)).toStrictEqual(["src/shared/log"]);
+    expect("ends a sentence at src/shared/log.ts.".match(REASON_PATH_RE)).toStrictEqual(["src/shared/log.ts"]);
+    for (const named of ["src/shared/log", "stacks/aws/derived-schema-build", "src/shared/no-such-file.ts"]) {
+      const details = withReason(LARGE, `bundler: reaches the seam only through ${named}, never called`, () => staleDetails(repo, LARGE));
+      expect(details.join("\n"), named).toContain(`reason names ${named}, which is not a tracked source`);
+    }
+  });
+
+  // N14: a directory import resolves to its index module.
+  test("an entry reaching the seam through a directory import fails", () => {
+    const f = "scripts/planted-n14.ts";
+    const files = plant(f, `import { scrubText } from "./planted-n14-dir";\nconsole.log(scrubText("a"));\n`, plant("scripts/planted-n14-dir/index.ts", `export { scrubText } from "../../${SEAM}.ts";\n`));
+    expect(seamChain(files, f)).toStrictEqual([f, "scripts/planted-n14-dir/index.ts", `${SEAM}.ts`]);
+    expect(rules(files)).toContain(`entry-without-init:${f}`);
+  });
+
+  // F2a: extensionless specifiers follow Bun's order (.mts, .ts, .mjs, .js, then /index.*).
+  test("resolveSpec resolves extensionless specifiers to .mts, .mjs and .js and index files in Bun's order", () => {
+    const one = (path: string) => plant(path, "export const x = 1;\n");
+    for (const ext of ["mts", "ts", "mjs", "js"]) {
+      expect(resolveSpec(one(`scripts/planted-r.${ext}`), "scripts/x.ts", "./planted-r")).toBe(`scripts/planted-r.${ext}`);
+      expect(resolveSpec(one(`scripts/planted-r/index.${ext}`), "scripts/x.ts", "./planted-r")).toBe(`scripts/planted-r/index.${ext}`);
+    }
+    const order = ["mts", "ts", "mjs", "js"];
+    for (let i = 0; i < order.length; i++) {
+      let files: Sources = repo;
+      for (const ext of order.slice(i)) files = plant(`scripts/planted-r.${ext}`, "export const x = 1;\n", files);
+      expect(resolveSpec(plant("scripts/planted-r/index.mts", "", files), "scripts/x.ts", "./planted-r")).toBe(`scripts/planted-r.${order[i]}`);
+    }
+  });
+
+  // F2b: plain .js sources are scanned, except the vendored wasm-bindgen glue.
+  test("a planted .js entry reaching the seam fails; the vendored glue is not scanned", () => {
+    const f = "scripts/planted-js.js";
+    expect(rules(plant(f, `import { scrubText } from "../${SEAM}.js";\nconsole.log(scrubText("a"));\n`))).toContain(`entry-without-init:${f}`);
+    expect([...repo.keys()].filter((k) => k.endsWith(".js"))).toStrictEqual([]);
+  });
+
+  // F2c: a workspace package's "exports" is followed; a shape the scan cannot read is reported.
+  test("resolveSpec follows a workspace package's exports", () => {
+    expect(resolveSpec(repo, "scripts/x.ts", "@96bulls/coordination-detect")).toBe("packages/coordination-detect/src/index.ts");
+    const pkg = (exports: unknown) => plant("packages/planted-pkg/src/sub.ts", "export const y = 1;\n", plant("packages/planted-pkg/src/main.ts", "export const x = 1;\n", plant("packages/planted-pkg/package.json", JSON.stringify({ name: "@planted/pkg", exports }))));
+    expect(resolveSpec(pkg("./src/main.ts"), "scripts/x.ts", "@planted/pkg")).toBe("packages/planted-pkg/src/main.ts");
+    const map = pkg({ ".": { types: "./x.d.ts", bun: "./src/main.ts" }, "./sub": "./src/sub.ts" });
+    expect(resolveSpec(map, "scripts/x.ts", "@planted/pkg")).toBe("packages/planted-pkg/src/main.ts");
+    expect(resolveSpec(map, "scripts/x.ts", "@planted/pkg/sub")).toBe("packages/planted-pkg/src/sub.ts");
+    expect(resolveSpec(map, "scripts/x.ts", "@planted/pkg/src/sub")).toBe("packages/planted-pkg/src/sub.ts");
+    expect(resolveSpec(pkg({ ".": { import: "./src/main.ts", default: "./src/sub.ts" } }), "scripts/x.ts", "@planted/pkg")).toBe("packages/planted-pkg/src/main.ts");
+  });
+
+  test.each([
+    ["an array", ["./src/index.ts"]],
+    ["a pattern subpath", { "./*": "./src/*.ts" }],
+    ["a node condition first", { ".": { node: "./src/index.ts", import: "./src/index.ts" } }],
+    ["a nested condition", { ".": { import: { bun: "./src/index.ts" } } }],
+    ["an untracked target", { ".": "./dist/index.js" }],
+  ])("an entry importing a workspace package whose exports is %s is reported, not silently unfollowed", (_shape, exports) => {
+    const f = "scripts/planted-exports.ts";
+    let files = plant("packages/planted-pkg/package.json", JSON.stringify({ name: "@planted/pkg", exports }));
+    files = plant("packages/planted-pkg/src/index.ts", `export { scrubText } from "../../pipeline/src/lib/scrub-engine/index.ts";\n`, files);
+    files = plant(f, `import { scrubText } from "@planted/pkg";\nconsole.log(scrubText("a"));\n`, files);
+    expect(rules(files)).toContain(`unresolved-workspace-import:${f}`);
   });
 });

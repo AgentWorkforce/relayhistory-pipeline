@@ -24,12 +24,15 @@
  *     or a Lambda `export const|function handler`) whose static import graph reaches the scrub seam
  *     calls initScrubEngine( or runWorker( in its code (not in a comment or string), is a hosted
  *     entry or wrapped handler, or is listed in ENTRY_EXEMPT with the reason it never scrubs or seals.
- *     A repo path named in an ENTRY_EXEMPT reason must be a tracked source that every route from the
- *     entry to the seam passes through ("stale-exemption" otherwise).
- *  4. Every scanned file can be read by the transpiler ("unparseable" otherwise: fail closed).
+ *     A repo path named in an ENTRY_EXEMPT reason (with or without an extension) must be a tracked
+ *     source, an intermediate module of the entry's seam route (not the entry or a seam module), and
+ *     one that every route from the entry to the seam passes through ("stale-exemption" otherwise).
+ *  4. Every scanned file can be read by the transpiler ("unparseable" otherwise: fail closed), and
+ *     every workspace-package specifier resolves to a tracked source ("unresolved-workspace-import"
+ *     otherwise: an unknown `exports` shape or an untracked target is not silently a dead end).
  *
- * Scope: tracked .ts/.mts/.mjs under src, packages, scripts, e2e, benchmarks and stacks (plain .js is
- * only the vendored wasm-bindgen glue). Edges are the module loads Bun.Transpiler.scanImports reports
+ * Scope: tracked .ts/.mts/.mjs/.js under src, packages, scripts, e2e, benchmarks and stacks, except the
+ * vendored wasm-bindgen glue under packages/pipeline/scrub-bindgen/ (data). Edges are the module loads Bun.Transpiler.scanImports reports
  * (the transpiler's own parse, after the shebang line is blanked): static imports and re-exports in any
  * spacing or position (`import{}from"x"`, `export*from"x"`, mid-line, after a comment, unicode escapes
  * decoded; `import {} from "x"` is a value edge, only `import type` and all-`type` braces are erased),
@@ -38,7 +41,9 @@
  * with a literal. Specifiers lose a `?query` / `#hash` suffix and resolve when relative, through the
  * tsconfig aliases `@rhc/*` (packages/pipeline/src) and `@rhc-object-store`, or through a workspace
  * package name (packages/<dir>/package.json "name", e.g. `@96bulls/pipeline/...`, linked into
- * node_modules by bun workspaces); other bare specifiers are third-party and not followed.
+ * node_modules by bun workspaces; its "exports" is followed when present); other bare specifiers are
+ * third-party and not followed. An extensionless path tries Bun's order: .mts, .ts, .mjs, .js, then
+ * the same for /index.
  *
  * Known limits (heuristics, not a proof; review covers these):
  *  - G4 order: an entry passes rule 3 if it calls the initialiser anywhere, even after a seam use at
@@ -47,8 +52,8 @@
  *  - Computed and variable loads are invisible: `import(variable)`, `require(variable)`,
  *    `import.meta.require(variable)`, a template with `${...}`, a wrapper such as
  *    `const mod = (p) => import(join(ROOT, p))`, a stored `const req = createRequire(...)` called
- *    later, `require.resolve`, `module.require`, and `new Worker(url)` / `Bun.spawn` / a child
- *    process of another file.
+ *    later, `new Function(...)` / `eval(...)`, `require.resolve`, `module.require`, and
+ *    `new Worker(url)` / `Bun.spawn` / a child process of another file.
  *    Review covers these (scripts/pg-proof/schema-rehearsal.ts loads candidate-tree modules this way
  *    and takes acceptedGenerations from the grant-free src/session-ingest/accept-generations.ts;
  *    src/hoopdb/__tests__/schema-rehearsal-r6.test.ts pins that choice).
@@ -56,8 +61,8 @@
  *    code edge (conservative: it may report a chain that never evaluates "y").
  *  - G9 conditional init: an initialiser only under `if (process.env.X)` (or any branch) still counts
  *    (src/session-ingest/publication-main.ts initialises only for an enabled publish run, by design).
- *  - The ENTRY_EXEMPT path check reads only repo-relative paths with an extension under the scan
- *    roots; prose such as "the logger" is not checked.
+ *  - The ENTRY_EXEMPT path check reads only repo-relative paths under the scan roots (an extensionless
+ *    one must still name a tracked source, so it fails); prose such as "the logger" is not checked.
  *  - Entry detection is line-anchored and regex-based: entries shaped differently (for example
  *    `export default app`, a handler exported through `export { handler }` of a local binding) are not
  *    detected as entries; their wiring is covered by rule 1c when they are deployed from stacks/wrangler.
@@ -67,7 +72,7 @@
  *   bun scripts/scrub-default-scan.ts      exit 1 and list each violation
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
@@ -145,8 +150,10 @@ export const ENTRY_EXEMPT: Readonly<Record<string, string>> = {
   "scripts/ops/claim-records-archive.ts": "uses only rawZstdFrame (zstd framing) from raw-chunks; never scrubs or seals",
 };
 
-/** A repo path named in an ENTRY_EXEMPT reason (checked against the graph by the scan). */
-const REASON_PATH_RE = /\b(?:src|packages|scripts|e2e|benchmarks|stacks)\/[\w./-]+\.(?:m?ts|mjs)\b/g;
+/** A repo path named in an ENTRY_EXEMPT reason, with or without an extension (checked against the
+ * tracked sources and the graph by the scan; it ends at a word character, so a trailing "." or "/"
+ * is not part of it). */
+export const REASON_PATH_RE = /\b(?:src|packages|scripts|e2e|benchmarks|stacks)\/[\w./-]*\w/g;
 
 /** Files the entry heuristic flags that are not executable entries (with why). */
 export const NOT_ENTRIES: Readonly<Record<string, string>> = {
@@ -154,20 +161,26 @@ export const NOT_ENTRIES: Readonly<Record<string, string>> = {
 };
 
 const SCAN_ROOTS = ["src", "packages", "scripts", "e2e", "benchmarks", "stacks"];
-/** Source extensions scanned. Plain .js is not: the only tracked .js under the roots is the vendored
- * wasm-bindgen glue (packages/pipeline/scrub-bindgen), which is data, not an entry. */
-const SOURCE_EXTS = ["ts", "mts", "mjs"];
-const SOURCE_RE = /\.(m?ts|mjs)$/;
-const isTestPath = (f: string) => /(^|\/)(__tests__|test|tests)\//.test(f) || /\.(test|spec)\.(m?ts|mjs)$/.test(f);
+/** Source extensions scanned. VENDORED (the wasm-bindgen glue, today the only tracked .js under the
+ * roots) is data, not source, and is not scanned. */
+const SOURCE_EXTS = ["ts", "mts", "mjs", "js"];
+const SOURCE_RE = /\.(m?ts|m?js)$/;
+const VENDORED = "packages/pipeline/scrub-bindgen/";
+const isTestPath = (f: string) => /(^|\/)(__tests__|test|tests)\//.test(f) || /\.(test|spec)\.(m?ts|m?js)$/.test(f);
+const PACKAGE_JSON_RE = /^packages\/[^/]+\/package\.json$/;
 
 export type Sources = Map<string, string>;
 
-/** Tracked and new (not ignored) .ts/.mts/.mjs sources under the scan roots, plus every wrangler*.jsonc
- * (for its `main`), relative to the repo root. */
+/** Tracked and new (not ignored) .ts/.mts/.mjs/.js sources under the scan roots (VENDORED excluded),
+ * every wrangler*.jsonc (for its `main`) and every packages/<dir>/package.json (the workspace packages),
+ * relative to the repo root. */
 export function trackedSources(root = ROOT): Sources {
-  const out = execFileSync("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ...SCAN_ROOTS.flatMap((r) => SOURCE_EXTS.map((x) => `${r}/*.${x}`)), "wrangler*.jsonc", "*/wrangler*.jsonc"], { cwd: root, encoding: "utf8" });
+  const out = execFileSync("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", ...SCAN_ROOTS.flatMap((r) => SOURCE_EXTS.map((x) => `${r}/*.${x}`)), "wrangler*.jsonc", "*/wrangler*.jsonc", "packages/*/package.json"], { cwd: root, encoding: "utf8" });
   const files = new Map<string, string>();
-  for (const f of out.split("\0")) if (f && !f.endsWith(".d.ts") && existsSync(resolve(root, f))) files.set(f, readFileSync(resolve(root, f), "utf8"));
+  for (const f of out.split("\0")) {
+    if (!f || f.endsWith(".d.ts") || f.startsWith(VENDORED) || (f.endsWith("package.json") && !PACKAGE_JSON_RE.test(f))) continue;
+    if (existsSync(resolve(root, f))) files.set(f, readFileSync(resolve(root, f), "utf8"));
+  }
   return files;
 }
 
@@ -270,29 +283,68 @@ const stripComments = (src: string) => src.replace(TOKENS, (m) => (m[0] === "/" 
 /** Comment- and string-free code (string and template bodies emptied), for name tests that a string must not satisfy. */
 const codeOnly = (src: string) => src.replace(TOKENS, (m) => (m[0] === "/" ? dropComment(m) : '""'));
 
-/** Workspace package name -> repo-relative directory (root package.json "workspaces": packages/*). */
-export const WORKSPACE_PACKAGES: ReadonlyMap<string, string> = (() => {
-  const out = new Map<string, string>();
-  for (const d of existsSync(resolve(ROOT, "packages")) ? readdirSync(resolve(ROOT, "packages")) : []) {
-    const pj = resolve(ROOT, "packages", d, "package.json");
-    if (!existsSync(pj)) continue;
-    const name = (JSON.parse(readFileSync(pj, "utf8")) as { name?: unknown }).name;
-    if (typeof name === "string" && name) out.set(name, `packages/${d}`);
+type Workspace = { readonly dir: string; readonly exports: unknown };
+const workspaceCache = new WeakMap<Sources, ReadonlyMap<string, Workspace>>();
+/** Workspace package name -> repo-relative directory and "exports" (root package.json "workspaces":
+ * packages/*), read from the packages/<dir>/package.json entries of `files`. */
+export function workspacePackages(files: Sources): ReadonlyMap<string, Workspace> {
+  let out = workspaceCache.get(files) as Map<string, Workspace> | undefined;
+  if (out) return out;
+  out = new Map();
+  for (const [f, src] of files) {
+    if (!PACKAGE_JSON_RE.test(f)) continue;
+    const pj = JSON.parse(src) as { name?: unknown; exports?: unknown };
+    if (typeof pj.name === "string" && pj.name) out.set(pj.name, { dir: f.slice(0, -"/package.json".length), exports: pj.exports });
   }
+  workspaceCache.set(files, out);
   return out;
-})();
+}
+
+/** The workspace package a bare specifier names, with its subpath ("" or "/x"), or undefined. */
+function workspaceOf(files: Sources, spec: string): { name: string; ws: Workspace; subpath: string } | undefined {
+  for (const [name, ws] of workspacePackages(files)) if (spec === name || spec.startsWith(`${name}/`)) return { name, ws, subpath: spec.slice(name.length) };
+}
+
+/** The package-relative target "exports" maps `subpath` to: a string, or the first `bun` / `import` /
+ * `default` of a condition object (`types` skipped); "fallback" when the field is absent or a subpath
+ * map lacks the key (then `${dir}${subpath}` is tried, as before); undefined for any other shape
+ * (patterns, arrays, other conditions such as `node` or `require`): fail closed, the scan reports it. */
+function exportTarget(exports: unknown, subpath: string): string | "fallback" | undefined {
+  const key = `.${subpath}`;
+  const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+  const pick = (v: unknown): string | undefined => {
+    if (typeof v === "string") return v;
+    if (!isObject(v)) return undefined;
+    for (const [k, t] of Object.entries(v)) {
+      if (k === "types") continue;
+      return (k === "bun" || k === "import" || k === "default") && typeof t === "string" ? t : undefined;
+    }
+  };
+  if (exports === undefined) return "fallback";
+  if (typeof exports === "string") return key === "." ? exports : "fallback";
+  if (!isObject(exports)) return undefined;
+  const keys = Object.keys(exports);
+  if (keys.length && keys.every((k) => k === "." || (k.startsWith("./") && !k.includes("*")))) return key in exports ? pick(exports[key]) : "fallback";
+  return undefined;
+}
 
 /** Repo-relative tracked file a specifier loads, or undefined (third-party / unknown). A `?query` or
- * `#hash` suffix is dropped (Bun loads the same module). */
+ * `#hash` suffix is dropped (Bun loads the same module). An extensionless path tries Bun's own order
+ * (.mts before .ts, then .mjs, .js; then the same for /index). */
 export function resolveSpec(files: Sources, from: string, specifier: string): string | undefined {
   const spec = specifier.replace(/(?<=.)[?#][\s\S]*$/, "");
   let base: string | undefined;
   if (spec.startsWith("@rhc/")) base = `packages/pipeline/src/${spec.slice(5)}`;
   else if (spec === "@rhc-object-store") base = "packages/object-store/src/index.ts";
   else if (spec.startsWith(".")) base = resolve("/", dirname(from), spec).slice(1);
-  else for (const [name, dir] of WORKSPACE_PACKAGES) if (spec === name || spec.startsWith(`${name}/`)) { base = `${dir}${spec.slice(name.length)}`; break; }
-  if (base === undefined) return undefined;
-  for (const c of [base, base.replace(/\.js$/, ".ts"), base.replace(/\.mjs$/, ".mts"), `${base}.ts`, `${base}/index.ts`]) if (files.has(c)) return c;
+  else {
+    const w = workspaceOf(files, spec);
+    if (!w) return undefined;
+    const target = exportTarget(w.ws.exports, w.subpath);
+    if (target === undefined) return undefined;
+    base = target === "fallback" ? `${w.ws.dir}${w.subpath}` : resolve("/", w.ws.dir, target).slice(1);
+  }
+  for (const c of [base, base.replace(/\.js$/, ".ts"), base.replace(/\.mjs$/, ".mts"), ...["mts", "ts", "mjs", "js"].map((x) => `${base}.${x}`), ...["mts", "ts", "mjs", "js"].map((x) => `${base}/index.${x}`)]) if (files.has(c)) return c;
 }
 
 /** Names whose import alone never runs the engine (init, readiness, error classes, test reset, the size constant). */
@@ -381,7 +433,7 @@ function hostedGrantFirstProblem(files: Sources, f: string, want: string): strin
   if (!first || first.kind !== "import" || resolveSpec(files, f, first.spec) !== want) return `${need} (the first module load is ${first ? first.spec : "none"})`;
 }
 
-export type Violation = { rule: "ts-capability-declarer" | "ts-capability-importer" | "ts-capability-reexport" | "preload-import" | "hosted-grant-reach" | "hosted-grant-first" | "deploy-main" | "entry-without-init" | "stale-exemption" | "unparseable"; file: string; detail: string };
+export type Violation = { rule: "ts-capability-declarer" | "ts-capability-importer" | "ts-capability-reexport" | "preload-import" | "hosted-grant-reach" | "hosted-grant-first" | "deploy-main" | "entry-without-init" | "stale-exemption" | "unparseable" | "unresolved-workspace-import"; file: string; detail: string };
 
 export function scan(files: Sources): Violation[] {
   const v: Violation[] = [];
@@ -409,6 +461,9 @@ export function scan(files: Sources): Violation[] {
       // 2. preloads stay out of production sources
       if (r && (PRELOADS as readonly string[]).includes(r) && !isTestPath(f) && (f.startsWith("src/") || /^packages\/[^/]+\/src\//.test(f)))
         v.push({ rule: "preload-import", file: f, detail: `imports test preload ${r}` });
+      // 4. a workspace import the scan cannot follow is reported, not a silent dead end
+      if (!r && !e.spec.startsWith(".") && workspaceOf(files, e.spec.replace(/(?<=.)[?#][\s\S]*$/, "")))
+        v.push({ rule: "unresolved-workspace-import", file: f, detail: `imports ${e.spec}, which resolves to no tracked source (unknown "exports" shape or untracked target)` });
     }
   }
   // 1b. module-load grants: only the hosted entries reach a grant module, and each imports its own first
@@ -441,10 +496,12 @@ export function scan(files: Sources): Violation[] {
     if (chain && !inits && !exempt && !(f in HOSTED_ENTRIES) && !(f in WRAPPED_HANDLERS)) v.push({ rule: "entry-without-init", file: f, detail: `reaches the seam (${chain.join(" -> ")}) without initScrubEngine(, runWorker( or a hosted module-load grant` });
     if (exempt && !chain) v.push({ rule: "stale-exemption", file: f, detail: "exempt but no longer reaches the seam; drop the exemption" });
     // A repo path named in an exemption reason is a claim about the graph: the entry reaches the seam
-    // only through it, so every route from the entry to the seam must pass through it.
+    // only through it, so it must be an intermediate module of the seam route (not the entry or the
+    // seam itself, which every route trivially passes) and every route must pass through it.
     if (exempt && chain) for (const named of exempt.match(REASON_PATH_RE) ?? []) {
-      if (!files.has(named)) v.push({ rule: "stale-exemption", file: f, detail: `reason names ${named}, which is not a tracked source` });
-      else if (!chain.includes(named) || seamChain(files, f, new Set([named]))) v.push({ rule: "stale-exemption", file: f, detail: `reason names ${named}, but not every route from the entry to the seam passes through it (${(seamChain(files, f, new Set([named])) ?? chain).join(" -> ")})` });
+      if (!files.has(named)) v.push({ rule: "stale-exemption", file: f, detail: `reason names ${named}, which is not a tracked source (cite the file with its extension)` });
+      else if (!chain.slice(1, -1).includes(named)) v.push({ rule: "stale-exemption", file: f, detail: `reason names ${named}, but the reason must name an intermediate module of the route from the entry to the seam (${chain.join(" -> ")})` });
+      else if (seamChain(files, f, new Set([named]))) v.push({ rule: "stale-exemption", file: f, detail: `reason names ${named}, but not every route from the entry to the seam passes through it (${seamChain(files, f, new Set([named]))!.join(" -> ")})` });
     }
   }
   for (const f of Object.keys(ENTRY_EXEMPT)) if (!files.has(f) || !isExecutableEntry(f, files.get(f)!)) v.push({ rule: "stale-exemption", file: f, detail: "exempt file is not an executable entry" });

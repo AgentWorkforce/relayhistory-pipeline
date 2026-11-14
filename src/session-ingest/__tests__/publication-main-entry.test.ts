@@ -7,7 +7,8 @@
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { publicationEntry, publicationMain } from "../publication-main.ts";
+import { initScrubEngine as seamInitScrubEngine } from "../../../packages/pipeline/src/lib/scrub-engine/index.ts";
+import { initScrubEngine, publicationEntry, publicationMain } from "../publication-main.ts";
 
 const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 
@@ -77,4 +78,9 @@ test("the module runs publicationEntry (not publicationMain) under import.meta.m
   expect(src).toMatch(/^if\(import\.meta\.main\)publicationEntry\(\)\.catch\(/m);
   expect(src).not.toMatch(/import\.meta\.main\)\s*publicationMain\(/);
   expect(src).toMatch(/\{init:\(\)=>initScrubEngine\(\),main:publicationMain\}/);
+});
+
+test("publication-main re-exports the seam's own initScrubEngine (the compiled-mode proof initialises the bundle's copy through it)", () => {
+  expect(typeof initScrubEngine).toBe("function");
+  expect(initScrubEngine).toBe(seamInitScrubEngine);
 });

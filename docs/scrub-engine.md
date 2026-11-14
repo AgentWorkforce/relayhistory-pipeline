@@ -639,11 +639,21 @@ scrubs with TS.
 Node self-host never reaches TS, even with `SCRUB_ENGINE=ts`. The large canonical read worker
 (`src/session-pipeline/large-read-main.ts`) initialises the default and fails closed
 (`scrub_engine_unavailable`) where the vendored bytes are absent; its bundle never contains the wasm
-bytes or the pin digest (`src/session-pipeline/__tests__/large-read-bundle.test.ts`).
+bytes or the pin digest (`src/session-pipeline/__tests__/large-read-bundle.test.ts`). The compiled
+canonical publication zip (`scripts/build-canonical-publication.ts`, `node index.mjs`) is the same: it
+bundles only `index.mjs` and `package.json`, and the engine resolves the pin
+(`packages/pipeline/scrub-bindgen-pin.json`) and the default artifact directory relative to its own
+module location (`SCRUB_BINDGEN_DIR` overrides only the artifact directory), so an enabled publish run
+of the zip fails closed at startup with `scrub_engine_unavailable` (`bindgen_pin_unreadable`) unless the
+pinned wasm-bindgen package is reachable from the bundle's location; a disabled run and `--gc` are
+unaffected. The compiled-mode proof (`scripts/proof-canonical-publication.ts`,
+`PUBLICATION_COMPILED_BUNDLE`) therefore cannot pass without the pin and bytes present, and cannot
+false-pass.
 
 **Entry inventory** (`scripts/scrub-default-scan.ts`, enforced in CI by
 `src/session-ingest/__tests__/scrub-default-scan.test.ts`): every entry the scan's heuristic detects
-among tracked `.ts`, `.mts` and `.mjs` files under `src`, `packages`, `scripts`, `e2e`, `benchmarks`
+among tracked `.ts`, `.mts`, `.mjs` and `.js` files (the vendored wasm-bindgen glue under
+`packages/pipeline/scrub-bindgen/` excepted) under `src`, `packages`, `scripts`, `e2e`, `benchmarks`
 and `stacks` (`import.meta.main`, top-level await, a non-declaration top-level statement, a Worker
 `export default { fetch | queue | scheduled }`, a Lambda `export const handler` /
 `export [async] function handler`) whose static import graph reaches the seam must call
@@ -651,8 +661,9 @@ and `stacks` (`import.meta.main`, top-level await, a non-declaration top-level s
 entry or a wrapped Lambda handler, or be listed in `ENTRY_EXEMPT` with a reason (GitHub-API gates,
 bundlers, the technical-foul manifest writer, the RDS activation and claim-records archive tools, and
 the Alchemy IaC program `stacks/aws/alchemy.aws.run.ts`, which import the seam graph but never scrub).
-A repo path named in an exemption reason must be a tracked source that every route from the entry to
-the seam passes through, so a reason cannot cite a path the graph does not use. The host publication
+A repo path named in an exemption reason (with or without an extension) must be a tracked source, an
+intermediate module of the entry's seam route (not the entry or a seam module), and one that every route
+from the entry to the seam passes through, so a reason cannot cite a path the graph does not use. The host publication
 CLI `src/session-ingest/publication-main.ts` initialises the engine under `import.meta.main` before
 its first publish cycle (importing the module initialises nothing; a disabled run, `--gc` and
 invalid arguments never need the engine), and `scripts/proof-canonical-publication.ts` initialises
@@ -661,13 +672,14 @@ publication-main) before it seals. It also fails on a grant declared outside the
 enumerated declarers, a grant re-exported from the seam, a hosted entry whose first import is not
 its module-load grant, any other non-test file that reaches a module-load grant, a stacks or
 wrangler `main` that is not a hosted entry, a production module importing a test preload, and a
-stale exemption, and on a file the transpiler cannot parse (fail closed). Each rule has a
+stale exemption, on a file the transpiler cannot parse, and on a workspace-package import that resolves
+to no tracked source (an unknown `exports` shape or an untracked target; fail closed). Each rule has a
 planted-violation test; the scan is a heuristic, not a proof.
 Known limits, listed in the scan header: an initialiser anywhere in the entry counts even if a seam
 use runs first or it sits under a condition (the runtime still fails closed there); computed and
 variable loads stay invisible (`import(x)`, `require(x)`, `import.meta.require(x)`, a template with
 `${...}`, an import wrapper such as the rehearsal's `mod(path)`, a stored `createRequire` result
-called later, `require.resolve`, `new Worker(url)`, `Bun.spawn` of another file); entries shaped
+called later, `new Function(...)` / `eval(...)`, `require.resolve`, `new Worker(url)`, `Bun.spawn` of another file); entries shaped
 differently from the patterns above (for example `export default app`) are not detected. The
 rehearsal's R6 module choice is pinned separately by `src/hoopdb/__tests__/schema-rehearsal-r6.test.ts`.
 Edges are read by `Bun.Transpiler.scanImports`, the transpiler's own parse rather than a line
@@ -677,7 +689,9 @@ the module, only `import type` and all-`type` braces are erased), `import("x")` 
 options or a trailing comma, `` import(`x`) `` and `require("x")`, plus `import.meta.require("x")`
 and `createRequire(...)("x")` from the TypeScript AST. A `?query` or `#hash` suffix is stripped
 before resolution through relative, `@rhc/*`, `@rhc-object-store` and workspace-package
-(`@96bulls/pipeline/...` and the other `packages/*` names) specifiers.
+(`@96bulls/pipeline/...` and the other `packages/*` names, through their `exports` when present)
+specifiers; an extensionless path tries Bun's order (`.mts`, `.ts`, `.mjs`, `.js`, then the same for
+`/index`).
 `hosted-grant-first` reads the TypeScript AST: after comments, a shebang and a directive prologue,
 the hosted entry's first statement must be the static bare import of its grant with no import
 attributes (`with { type: "text" }` or `assert` loads it as data and never runs the grant), and it

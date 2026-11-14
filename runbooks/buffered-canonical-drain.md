@@ -115,6 +115,9 @@ false when absent. Disabled returns before config, credentials, DB or storage.
 `node index.mjs --continuous` drains while work exists and polls after5seconds
 idle. `node index.mjs --gc --continuous` independently erases retired generations.
 Stopping publication must leave erasure armed and monitored.
+An enabled publish run needs the pinned wasm-bindgen package reachable from the
+bundle's location; otherwise it exits at startup with `scrub_engine_unavailable`
+(docs/scrub-engine.md, "Default flip"). A disabled run and `--gc` do not need it.
 
 `bun scripts/build-canonical-publication.ts /home/khaliqgant/relay-briefs/<artifact>`
 requires a clean worktree, captures the compiled migration generation and all
