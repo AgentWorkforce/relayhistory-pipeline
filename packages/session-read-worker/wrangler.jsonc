@@ -61,6 +61,11 @@
     // Overlaps view is a separate, default-off dashboard setting). Read-only, workspace-scoped,
     // computed on request from existing ClickHouse facts; no migration on this backend.
     "READ_API_COORDINATION_OVERLAPS_ENABLED": "true",
+    // Exactly "true" serves the GET /v1/canonical routes (src/canonical.ts gate; see
+    // docs/canonical-session-read.md); any other value answers 503 session_read_unavailable.
+    // Live on the hosted Reader since 2026-11-14 16:39Z (Khaliq); the deploy preserve check
+    // ("Preserve would change or drop live setting") refuses a profile that diverges from live.
+    "CANONICAL_READ_ENABLED": "true",
     // The brief-titles allowlist (F2, GET /v1/sessions/titles). Empty = every workspace gets
     // 501 brief_titles_workspace_not_enabled; "*" = all; else comma-separated workspace ids.
     // The deploy workflow sets it from vars.SESSION_READ_BRIEF_TITLES_WORKSPACES (unset = empty).
