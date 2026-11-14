@@ -389,7 +389,9 @@ Unset `LOCKER_PROVIDER` stays S3, which is local MinIO, production AWS S3, and
 the EKS proof. `LOCKER_PROVIDER=gcs` builds the GCS adapter and takes a token
 from the GKE metadata server. The portable publisher reads the same variable
 and stamps it on every published row (migration `20261105059000` lets the SQL
-accept `gcs`), so set it on the publisher workload as well as on the read API. HMAC keys on GCS are refused, and an S3 client
+accept `gcs`), so set it on the publisher workload as well as on the read API. The pipeline consumer stamps the same
+provider on the rows it indexes, so set it there too; rows an older consumer stamped `s3` are re-stamped by
+`src/session-pipeline/index-provider-restamp.ts` (dry run by default; see `docs/selfhost-composition.md`). HMAC keys on GCS are refused, and an S3 client
 pointed at `storage.googleapis.com` is refused. `rawStoreFromEnv` follows that
 choice: unset and `s3` stay S3, `r2` stays R2, and `PIPELINE_RAW_PROVIDER=gcs`
 builds the GCS adapter when the bucket is set and HMAC keys are absent. Any

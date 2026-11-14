@@ -450,7 +450,8 @@ describe("buffered-stage search feed", () => {
     const mem = memorySource([{ candidate: { stageToken: t, createdAt: "x", tenant: { orgId: ORG, workspaceId: WS, userId: USER }, originId: ORIGIN, batchId: "b" }, state: () => ({ ...liveState(prepared, t, "x"), status, reason: status === "pending" ? "stage_preparing" : null }) }]);
     const requeued: string[] = [];
     const pointerCalls: string[] = [];
-    const pointer = { db: { query: async () => { pointerCalls.push("q"); return { rows: [] }; } } } as never;
+    // processBatch reads the reader's provider to stamp parsed events; the pointer stage itself is never reached.
+    const pointer = { db: { query: async () => { pointerCalls.push("q"); return { rows: [] }; } }, reader: { provider: "s3" } } as never;
     const deps = { pointer, bufferedFeed: feedDeps(mem.source, store, ch.ch), requeue: async (k: string) => { requeued.push(k); } };
     expect(await processBatch([{ messageId: "m1", body }], deps)).toEqual({ batchItemFailures: [] });
     expect(requeued).toEqual([prepared.spec.key]);
@@ -460,7 +461,7 @@ describe("buffered-stage search feed", () => {
     expect(pointerCalls).toEqual([]);
     // Unarmed: the feed source is never consulted.
     mem.calls.length = 0;
-    await processBatch([{ messageId: "m3", body }], { pointer: { db: { query: async () => ({ rows: [] }) }, lock: async (_s: unknown, w: () => unknown) => w(), reader: { read: async () => null }, exists: async () => false, orgs: async () => null, allowPrefix: () => false, fanout: { send: async () => {} } } as never });
+    await processBatch([{ messageId: "m3", body }], { pointer: { db: { query: async () => ({ rows: [] }) }, lock: async (_s: unknown, w: () => unknown) => w(), reader: { provider: "s3", read: async () => null }, exists: async () => false, orgs: async () => null, allowPrefix: () => false, fanout: { send: async () => {} } } as never });
     expect(mem.calls).toEqual([]);
   });
 

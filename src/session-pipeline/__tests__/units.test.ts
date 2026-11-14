@@ -116,6 +116,20 @@ describe("S3 event notifications", () => {
     });
   });
 
+  test("events carry the provider they are parsed for; omitted, s3 (the Lambda's)", () => {
+    const put = s3Body("ObjectCreated:Put", { key: "a", eTag: "e", sequencer: "01" });
+    const del = s3Body("ObjectRemoved:Delete", { key: "a", sequencer: "02" });
+    const rec = JSON.stringify({ reconcile: { key: KEY, etag: "e" } });
+    for (const provider of ["gcs", "s3"] as const) {
+      for (const body of [put, del, rec]) {
+        const parsed = parseQueueBody(body, provider);
+        expect(parsed.kind).toBe("events");
+        if (parsed.kind === "events") expect(parsed.events.map((e) => e.provider)).toEqual([provider]);
+      }
+    }
+    for (const body of [put, del, rec]) expect(parseQueueBody(body)).toEqual(parseQueueBody(body, "s3"));
+  });
+
   test("key decoding and sequencer order", () => {
     expect(decodeS3Key("a+b%2Bc")).toBe("a b+c");
     expect(decodeS3Key("%E0%A4%A")).toBeNull();
