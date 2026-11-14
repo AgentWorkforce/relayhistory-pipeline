@@ -171,6 +171,23 @@ export function sessionQueryEnabled(env: NodeJS.ProcessEnv): boolean {
   return true;
 }
 
+export const READ_API_SEARCH_PARTIAL_SESSIONS_VAR = "READ_API_SEARCH_PARTIAL_SESSIONS";
+
+/**
+ * READ_API_SEARCH_PARTIAL_SESSIONS (default "refuse"): what a workspace search does while a
+ * session of its workspace is partial. "refuse" (also unset or "") keeps the 501
+ * `session_partial`, for a caller that falls back to relayhistory. "skip" answers from the
+ * index and reports the partial sessions in the reply: for an install with no fallback, where
+ * the refusal turns search off for the whole workspace. Anything else refuses startup, naming
+ * the variable and never its value.
+ */
+export function searchSkipsPartialSessions(env: NodeJS.ProcessEnv): boolean {
+  const raw = env[READ_API_SEARCH_PARTIAL_SESSIONS_VAR];
+  if (raw === undefined || raw === "" || raw === "refuse") return false;
+  if (raw !== "skip") throw new Error(`session read api: ${READ_API_SEARCH_PARTIAL_SESSIONS_VAR} must be unset, "", "refuse" or "skip"`);
+  return true;
+}
+
 function internalSecret(env: NodeJS.ProcessEnv, name: string): string | undefined {
   const raw = env[name];
   if (raw === undefined || raw === "") return undefined;
@@ -543,6 +560,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   const completeSinceMs = parseCompleteSince(env.READ_API_COMPLETE_SINCE);
   const selfhostReadApi = parseSelfhostReadApi(env);
   const sessionQuery = sessionQueryEnabled(env);
+  const searchSkipPartial = searchSkipsPartialSessions(env);
   const loginSync = parseSelfhostLoginSync(env);
   const facts = factsBackends(env, entry);
   const coordinationEnabled = coordinationOverlapsEnabled(env[READ_API_COORDINATION_OVERLAPS_ENABLED]);
@@ -660,6 +678,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
     ...(canonical ? { timing: canonical.timing, turns: canonical.turns, canonicalEvents: canonical.events } : {}),
     ...eventMessageIdDeps(env, canonical?.turns),
     ...(sessionQuery ? { sessionQuery: true } : {}),
+    ...(searchSkipPartial ? { searchSkipsPartialSessions: true } : {}),
     ...outputDeps,
     ...digestDeps,
     ...coordinationDeps,

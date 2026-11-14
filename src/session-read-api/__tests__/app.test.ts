@@ -44,7 +44,7 @@ function stubCh(rows: { candidates?: unknown[]; newest?: unknown[]; partial?: st
   return { ch, queries, eventQueries };
 }
 
-function api(over: { identity?: VerifiedIdentity; completeSinceMs?: number; ch?: ClickHouseClient; liveness?: ReturnType<typeof memoryLiveness>["liveness"]; verify?: (t: string) => Promise<VerifiedIdentity> } = {}) {
+function api(over: { identity?: VerifiedIdentity; completeSinceMs?: number; ch?: ClickHouseClient; liveness?: ReturnType<typeof memoryLiveness>["liveness"]; verify?: (t: string) => Promise<VerifiedIdentity>; searchSkipsPartialSessions?: boolean } = {}) {
   const logs: Record<string, unknown>[] = [];
   const app = createReadApi({
     verify: over.verify ?? (async (t) => {
@@ -54,6 +54,7 @@ function api(over: { identity?: VerifiedIdentity; completeSinceMs?: number; ch?:
     ch: over.ch ?? stubCh().ch,
     liveness: over.liveness ?? memoryLiveness({ createdAt: { "codex\u0000s-1": Date.parse("2026-10-01T00:00:00Z") } }).liveness,
     completeSinceMs: over.completeSinceMs ?? 0,
+    ...(over.searchSkipsPartialSessions ? { searchSkipsPartialSessions: true } : {}),
     log: (f) => logs.push(f),
   });
   const get = (path: string, token: string | null = "good") =>
@@ -223,6 +224,29 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
     expect((await body(r)).error.reason).toBe("session_partial");
     expect(pointerHere.eventQueries()).toHaveLength(0);
     expect(pointers.calls.livePointerSessions).toEqual([["s-1", "s-elsewhere"]]);
+  });
+
+  test("with searchSkipsPartialSessions a workspace search answers and names the partial sessions", async () => {
+    const rowHere = stubCh({ partial: ["s-row", "s-elsewhere"], partialInWorkspace: ["s-row"] });
+    let r = await api({ ch: rowHere.ch, liveness: memoryLiveness().liveness, searchSkipsPartialSessions: true }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
+    expect(r.status).toBe(200);
+    expect(r.headers.get("X-Sessions-Read-Incomplete")).toBe("session_partial");
+    expect((await body(r)).incomplete).toEqual({ reason: "session_partial", sessions: ["s-row"] });
+    expect(rowHere.eventQueries()).toHaveLength(1);
+    // More partial sessions than one check lists: answered, and said to be unbounded.
+    const many = Array.from({ length: PARTIAL_SESSIONS_CAP + 1 }, (_, i) => `s-other-${i}`);
+    r = await api({ ch: stubCh({ partial: many }).ch, liveness: memoryLiveness().liveness, searchSkipsPartialSessions: true }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
+    expect(r.status).toBe(200);
+    expect((await body(r)).incomplete).toEqual({ reason: "session_partial_unbounded" });
+    // No partial session: the reply is exactly as without the setting.
+    r = await api({ ch: stubCh().ch, searchSkipsPartialSessions: true }).get("/v1/events?workspace=ws-a&q=needle&limit=20");
+    expect(r.status).toBe(200);
+    expect(r.headers.get("X-Sessions-Read-Incomplete")).toBeNull();
+    expect("incomplete" in (await body(r))).toBe(false);
+    // A session-scoped read of a partial session still refuses.
+    r = await api({ ch: stubCh({ partial: ["s-1"] }).ch, searchSkipsPartialSessions: true }).get("/v1/sessions/s-1/events?workspace=ws-a");
+    expect(r.status).toBe(501);
+    expect((await body(r)).error.reason).toBe("session_partial");
   });
 
   test("partial sessions of other workspaces of the org do not stop this workspace's search", async () => {

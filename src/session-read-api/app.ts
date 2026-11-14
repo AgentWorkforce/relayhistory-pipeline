@@ -281,6 +281,13 @@ export interface ReadApiDeps {
    * functions (migration 20261105046010). Absent/false: both keep their 501 `param_q`, unchanged.
    */
   sessionQuery?: boolean;
+  /**
+   * READ_API_SEARCH_PARTIAL_SESSIONS=skip: a workspace search answers from the index while a
+   * session of its workspace is partial, and names what it could not cover in `incomplete`
+   * (and the X-Sessions-Read-Incomplete header). Absent/false: the 501 `session_partial` /
+   * `session_partial_unbounded`, unchanged. A session-scoped read is never affected.
+   */
+  searchSkipsPartialSessions?: boolean;
   /** READ_API_CORS_ALLOWED_ORIGINS, service entry only: exact origins GET read routes answer CORS for. Absent/empty = no CORS. */
   corsAllowedOrigins?: ReadonlySet<string>;
 }
@@ -968,10 +975,23 @@ export function createReadApi(deps: ReadApiDeps) {
       // lacks, so the search starts at relayhistory. Partial sessions of other
       // workspaces of the org cannot hold this workspace's rows and do not count
       // (page.ts partialSessionsInWorkspace says how one is attributed).
+      // With searchSkipsPartialSessions the search answers anyway and says so:
+      // an install with no relayhistory has nowhere to fall back to, and one
+      // partial session would otherwise turn search off for the workspace.
+      let incomplete: { reason: "session_partial" | "session_partial_unbounded"; sessions?: string[] } | undefined;
       if (cursor === undefined) {
         const partials = await partialSessionsInWorkspace(pageDeps(), identity.orgId, identity.workspaceId);
-        if (partials.overflow) throw unsupported("session_partial_unbounded");
-        if (partials.sessions.length > 0) throw unsupported("session_partial");
+        if (deps.searchSkipsPartialSessions === true) {
+          if (partials.overflow) incomplete = { reason: "session_partial_unbounded" };
+          else if (partials.sessions.length > 0) incomplete = { reason: "session_partial", sessions: partials.sessions };
+        } else {
+          if (partials.overflow) throw unsupported("session_partial_unbounded");
+          if (partials.sessions.length > 0) throw unsupported("session_partial");
+        }
+      }
+      if (incomplete) {
+        log({ route: c.req.routePath, reason: `${incomplete.reason}_skipped`, status: 200, correlation_id: c.get("correlationId") });
+        c.header("X-Sessions-Read-Incomplete", incomplete.reason);
       }
       const page = await gatedPage(c, base);
       if (belowFloor && page.nextCursor === null) {
@@ -984,7 +1004,7 @@ export function createReadApi(deps: ReadApiDeps) {
         c.header("X-Sessions-Read-Continuation", "history_floor");
         return c.json({ events: page.events, nextCursor: null, continuation, correlationId: c.get("correlationId") });
       }
-      return c.json({ events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
+      return c.json({ events: page.events, nextCursor: page.nextCursor, ...(incomplete ? { incomplete } : {}), correlationId: c.get("correlationId") });
     } catch (error) {
       return fail(c, error);
     }
