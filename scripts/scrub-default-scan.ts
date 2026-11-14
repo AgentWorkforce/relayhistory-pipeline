@@ -28,10 +28,13 @@
  *     source, an intermediate module of the entry's seam route (not the entry or a seam module), and
  *     one that every route from the entry to the seam passes through ("stale-exemption" otherwise).
  *  4. Every scanned file can be read by the transpiler ("unparseable" otherwise: fail closed), and
- *     every workspace-package specifier resolves to a tracked source ("unresolved-workspace-import"
- *     otherwise: an unknown `exports` shape, a folder mapping or pattern, a non-string `main` or an
- *     untracked target is not silently a dead end). Every packages/<dir>/package.json is a JSON object
- *     and no two share a "name" ("unparseable" otherwise; a duplicated name resolves nowhere).
+ *     every workspace-package specifier resolves to exactly one tracked source
+ *     ("unresolved-workspace-import" otherwise: an unknown `exports` shape, a folder mapping or
+ *     pattern, an exports object without "." for the root, a non-string or unresolvable `main`, a
+ *     duplicate name, ambiguous candidates or an untracked target is not silently a dead end); a
+ *     relative or alias specifier with more than one tracked candidate is "ambiguous-import". Every
+ *     packages/<dir>/package.json is a JSON object and no two share a "name" ("unparseable" otherwise;
+ *     a duplicated name resolves nowhere).
  *
  * Scope: tracked .ts/.mts/.mjs/.js under src, packages, scripts, e2e, benchmarks and stacks, except the
  * vendored wasm-bindgen glue under packages/pipeline/scrub-bindgen/ (data). Edges are the module loads Bun.Transpiler.scanImports reports
@@ -46,10 +49,19 @@
  * node_modules by bun workspaces; its "exports" is followed when present: a string, or exact "./x" keys
  * whose value is a string or a condition object whose first non-`types` key is bun / import / default;
  * a folder mapping ("./sub/"), a "*" pattern, an array, a top-level condition object or another
- * condition fails closed; with no "." export the package root loads its string "main", else its
- * index); other bare specifiers (including `@96bulls/pipeline-extra`, which only shares a prefix) are
- * third-party and not followed. The literal path is tried first, then a .js / .mjs path's .ts / .mts
- * sibling; an extensionless path then tries Bun's import order: .mts, .ts, .mjs, .js, then the same for /index.
+ * condition fails closed; an exports object without "." fails closed for the package root, since Bun
+ * refuses it rather than falling back to "main"; a subpath such a map lacks falls back to the package
+ * directory, a safe over-approximation). Only when "exports" is absent does the root load its string
+ * "main", as Bun 1.4.2 does: the literal path (a .js main also its .ts sibling; a .mjs main is not
+ * rewritten), then main.js / main.ts (never .mts / .mjs), then a directory's index.js / index.ts; a
+ * main that resolves to none of them, or a non-string main, fails closed where Bun would silently load
+ * the index; with no main the root loads its index. Other bare specifiers (including
+ * `@96bulls/pipeline-extra`, which only shares a prefix) are third-party and not followed. Candidates
+ * come in tiers: the literal path and its .js -> .ts / .mjs -> .mts sibling, then an extensionless
+ * path's .mts / .ts / .mjs / .js files, then the same for /index. The first tier with a tracked
+ * candidate decides, and it must hold exactly one: two tracked candidates in one tier fail closed
+ * ("ambiguous-import", or rule 4 for a workspace specifier), so Bun's differing orders cannot pick a
+ * file the scan did not follow.
  *
  * Known limits (heuristics, not a proof; review covers these):
  *  - G4 order: an entry passes rule 3 if it calls the initialiser anywhere, even after a seam use at
@@ -72,9 +84,11 @@
  *  - Entry detection is line-anchored and regex-based: entries shaped differently (for example
  *    `export default app`, a handler exported through `export { handler }` of a local binding) are not
  *    detected as entries; their wiring is covered by rule 1c when they are deployed from stacks/wrangler.
- *  - Resolution order is Bun 1.4.2's import order for every edge kind; `require`, `import.meta.require`
- *    and `createRequire` try .ts before .mts, .js before .mjs and index.ts before index.mts, so the scan
- *    can pick the other sibling for a require when both x.ts and x.mts (or x.js and x.mjs) are tracked.
+ *  - A relative import's extensionless candidates follow Bun 1.4.2's import order (.mts, .ts, .mjs, .js),
+ *    but `require` / `import.meta.require` / `createRequire` (.ts before .mts, .js before .mjs, index.ts
+ *    before index.mts), a workspace specifier through node_modules (.mjs > .mts > .js > .ts) and `main`
+ *    (.js > .ts only) order them differently; the scan therefore fails closed ("ambiguous-import" /
+ *    rule 4) whenever more than one candidate of a tier is tracked, instead of picking by order.
  *  - Only .ts/.mts/.mjs/.js are tracked: a relative import of a .tsx, .cts, .cjs or .jsx file resolves to
  *    nothing and is a silent dead end (none exist under the scan roots today).
  *  - Rule 1c reads wrangler*.jsonc only; packages/amp-transport-worker/wrangler.template.json (plain
@@ -351,10 +365,12 @@ function workspaceOf(files: Sources, spec: string): { name: string; ws: Workspac
 
 /** The package-relative target "exports" maps `subpath` to: a string, or the first non-`types` condition
  * of a condition object (Bun follows key order) when it is `bun` / `import` / `default` with a string
- * value; "fallback" when the field is absent or a subpath map lacks the key (then resolveSpec tries
- * `main` for the package root, else `${dir}${subpath}`); undefined for any other shape (a folder
- * mapping `"./sub/"`, a `*` pattern, an array, a top-level condition object, other conditions such as
- * `node` or `require`): fail closed, the scan reports it. */
+ * value; "fallback" when the field is absent (then resolveSpec tries `main` for the package root, else
+ * `${dir}${subpath}`) or a string / subpath map lacks a non-root subpath (`${dir}${subpath}`, a safe
+ * over-approximation: Bun may refuse it); undefined for an exports object without "." when the root is
+ * imported (Bun 1.4.2 refuses the root, it does not fall back to `main`) and for any other shape (a
+ * folder mapping `"./sub/"`, a `*` pattern, an array, a top-level condition object, other conditions
+ * such as `node` or `require`): fail closed, the scan reports it. */
 function exportTarget(exports: unknown, subpath: string): string | "fallback" | undefined {
   const key = `.${subpath}`;
   const pick = (v: unknown): string | undefined => {
@@ -369,16 +385,43 @@ function exportTarget(exports: unknown, subpath: string): string | "fallback" | 
   if (typeof exports === "string") return key === "." ? exports : "fallback";
   if (!isObject(exports)) return undefined;
   const keys = Object.keys(exports);
-  if (keys.length && keys.every((k) => k === "." || (k.startsWith("./") && !k.includes("*") && !k.endsWith("/")))) return key in exports ? pick(exports[key]) : "fallback";
+  if (keys.length && keys.every((k) => k === "." || (k.startsWith("./") && !k.includes("*") && !k.endsWith("/")))) return key in exports ? pick(exports[key]) : subpath ? "fallback" : undefined;
   return undefined;
 }
 
-/** Repo-relative tracked file a specifier loads, or undefined (third-party / unknown). A `?query` or
- * `#hash` suffix is dropped (Bun loads the same module). A workspace package root with no "." export
- * loads its string `main` (any other `main` fails closed), else its directory index. The literal path
- * is tried first, then an extensionless path in Bun's import order (.mts before .ts, then .mjs, .js;
- * then the same for /index). */
-export function resolveSpec(files: Sources, from: string, specifier: string): string | undefined {
+/** How a specifier resolves: `file` is the one tracked source it loads; `ambiguous` lists the tracked
+ * candidates that compete in the deciding tier (then there is no `file`: fail closed). Neither is set
+ * for a third-party, unknown or unresolvable specifier. */
+export type Resolution = { readonly file?: string; readonly ambiguous?: readonly string[] };
+
+const IMPORT_EXTS = ["mts", "ts", "mjs", "js"];
+/** Candidate tiers, tried in order: the first tier with a tracked candidate decides. Exactly one tracked
+ * candidate in it is the file; more than one is ambiguous (fail closed). Bun's order inside a tier
+ * differs by edge kind (import .mts > .ts > .mjs > .js; require / createRequire .ts > .mts, .js > .mjs;
+ * a workspace specifier through node_modules .mjs > .mts > .js > .ts; `main` .js > .ts), so a tier is
+ * decided only when no order is needed. */
+function pickTier(files: Sources, tiers: readonly (readonly string[])[]): Resolution {
+  for (const tier of tiers) {
+    const hits = [...new Set(tier)].filter((c) => files.has(c));
+    if (hits.length === 1) return { file: hits[0] };
+    if (hits.length > 1) return { ambiguous: hits };
+  }
+  return {};
+}
+/** Import tiers for `base`: the literal path and its .js -> .ts / .mjs -> .mts sibling, then the
+ * extensionless `${base}.<ext>` files, then `${base}/index.<ext>`. */
+const importTiers = (base: string) => [[base, base.replace(/\.js$/, ".ts"), base.replace(/\.mjs$/, ".mts")], IMPORT_EXTS.map((x) => `${base}.${x}`), IMPORT_EXTS.map((x) => `${base}/index.${x}`)];
+/** package.json `main` tiers (Bun 1.4.2, only when "exports" is absent): the literal path and, for a .js
+ * path, its .ts sibling (a .mjs main is not rewritten to .mts); then `${main}.js` / `${main}.ts` (never
+ * .mts / .mjs); then a directory's index.js / index.ts. */
+const mainTiers = (base: string) => [[base, ...(base.endsWith(".js") ? [`${base.slice(0, -3)}.ts`] : [])], [`${base}.js`, `${base}.ts`], [`${base}/index.js`, `${base}/index.ts`]];
+
+/** The resolution of a specifier (see Resolution). A `?query` or `#hash` suffix is dropped (Bun loads
+ * the same module). A workspace package root with no "exports" loads its string `main` (mainTiers; a
+ * non-string or unresolved main fails closed, where Bun would silently load the index), else its
+ * directory index; an exports object without "." resolves nowhere for the root. Every other path uses
+ * importTiers. */
+export function resolveImport(files: Sources, from: string, specifier: string): Resolution {
   const spec = specifier.replace(/(?<=.)[?#][\s\S]*$/, "");
   let base: string | undefined;
   if (spec.startsWith("@rhc/")) base = `packages/pipeline/src/${spec.slice(5)}`;
@@ -386,15 +429,21 @@ export function resolveSpec(files: Sources, from: string, specifier: string): st
   else if (spec.startsWith(".")) base = resolve("/", dirname(from), spec).slice(1);
   else {
     const w = workspaceOf(files, spec);
-    if (!w) return undefined;
+    if (!w) return {};
     const target = exportTarget(w.ws.exports, w.subpath);
-    if (target === undefined || w.ws.duplicate) return undefined;
+    if (target === undefined || w.ws.duplicate) return {};
     if (target !== "fallback") base = resolve("/", w.ws.dir, target).slice(1);
     else if (w.subpath || w.ws.main === undefined) base = `${w.ws.dir}${w.subpath}`;
-    else if (typeof w.ws.main === "string") base = resolve("/", w.ws.dir, w.ws.main).slice(1);
-    else return undefined;
+    else if (typeof w.ws.main === "string") return pickTier(files, mainTiers(resolve("/", w.ws.dir, w.ws.main).slice(1)));
+    else return {};
   }
-  for (const c of [base, base.replace(/\.js$/, ".ts"), base.replace(/\.mjs$/, ".mts"), ...["mts", "ts", "mjs", "js"].map((x) => `${base}.${x}`), ...["mts", "ts", "mjs", "js"].map((x) => `${base}/index.${x}`)]) if (files.has(c)) return c;
+  return pickTier(files, importTiers(base));
+}
+
+/** Repo-relative tracked file a specifier loads, or undefined (third-party, unknown, unresolvable or
+ * ambiguous: see resolveImport). */
+export function resolveSpec(files: Sources, from: string, specifier: string): string | undefined {
+  return resolveImport(files, from, specifier).file;
 }
 
 /** Names whose import alone never runs the engine (init, readiness, error classes, test reset, the size constant). */
@@ -483,7 +532,7 @@ function hostedGrantFirstProblem(files: Sources, f: string, want: string): strin
   if (!first || first.kind !== "import" || resolveSpec(files, f, first.spec) !== want) return `${need} (the first module load is ${first ? first.spec : "none"})`;
 }
 
-export type Violation = { rule: "ts-capability-declarer" | "ts-capability-importer" | "ts-capability-reexport" | "preload-import" | "hosted-grant-reach" | "hosted-grant-first" | "deploy-main" | "entry-without-init" | "stale-exemption" | "unparseable" | "unresolved-workspace-import"; file: string; detail: string };
+export type Violation = { rule: "ts-capability-declarer" | "ts-capability-importer" | "ts-capability-reexport" | "preload-import" | "hosted-grant-reach" | "hosted-grant-first" | "deploy-main" | "entry-without-init" | "stale-exemption" | "unparseable" | "unresolved-workspace-import" | "ambiguous-import"; file: string; detail: string };
 
 export function scan(files: Sources): Violation[] {
   // 4. a package.json that is not a JSON object, or repeats a workspace name, is reported (fail closed)
@@ -502,7 +551,8 @@ export function scan(files: Sources): Violation[] {
     if (/declareScrubTsCapability\s*\(/.test(src.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, "")) && f !== GRANT_MODULE && !TS_CAPABILITY_DECLARERS.includes(f) && !isTestPath(f))
       v.push({ rule: "ts-capability-declarer", file: f, detail: "declares a TS capability outside the hosted entries, test preloads and tests" });
     for (const e of fileEdges) {
-      const r = resolveSpec(files, f, e.spec);
+      const res = resolveImport(files, f, e.spec);
+      const r = res.file;
       if (r === GRANT_MODULE) {
         if (e.reexport) v.push({ rule: "ts-capability-reexport", file: f, detail: `re-exports ${GRANT_MODULE}` });
         const allowed = TS_CAPABILITY_DECLARERS.includes(f) || (SEAM_MODULES as readonly string[]).includes(f) || f.startsWith("packages/pipeline/src/lib/scrub-engine/") || isTestPath(f);
@@ -512,9 +562,13 @@ export function scan(files: Sources): Violation[] {
       // 2. preloads stay out of production sources
       if (r && (PRELOADS as readonly string[]).includes(r) && !isTestPath(f) && (f.startsWith("src/") || /^packages\/[^/]+\/src\//.test(f)))
         v.push({ rule: "preload-import", file: f, detail: `imports test preload ${r}` });
-      // 4. a workspace import the scan cannot follow is reported, not a silent dead end
+      // 4. a workspace import the scan cannot follow is reported, not a silent dead end; so is any
+      // other import with competing tracked candidates (Bun's order differs by edge kind)
+      const competing = res.ambiguous ? `; more than one tracked candidate: ${res.ambiguous.join(", ")}` : "";
       if (!r && !e.spec.startsWith(".") && workspaceOf(files, e.spec.replace(/(?<=.)[?#][\s\S]*$/, "")))
-        v.push({ rule: "unresolved-workspace-import", file: f, detail: `imports ${e.spec}, which resolves to no tracked source (unknown "exports" shape or untracked target)` });
+        v.push({ rule: "unresolved-workspace-import", file: f, detail: `imports ${e.spec}, which resolves to no single tracked source (an unknown "exports" shape, an exports object without "." for the package root, an unresolvable or non-string "main", a duplicate package name, an untracked target, or ambiguous candidates${competing})` });
+      else if (!r && res.ambiguous)
+        v.push({ rule: "ambiguous-import", file: f, detail: `imports ${e.spec}, which has more than one tracked candidate (${res.ambiguous.join(", ")}); Bun's order differs by edge kind, so rename one` });
     }
   }
   // 1b. module-load grants: only the hosted entries reach a grant module, and each imports its own first

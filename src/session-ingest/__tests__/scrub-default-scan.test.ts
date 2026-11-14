@@ -6,11 +6,14 @@
  * engine-running-name check (S9), require edges (G3) and string-only initialisers (G6) are
  * planted too, as are directory imports (N14), extensionless .mts/.mjs/.js resolution, plain .js
  * entries, workspace `exports` (an unknown shape, a folder mapping or a top-level condition object is
- * reported), package `main`, malformed and duplicate package.json files, literal-before-rewrite and
- * extension order, rule 4 on every edge kind and in tests, and the exemption-reason checks (M5b
- * bypass, intermediate-only, extensionless paths). Known limits are listed in the scan header.
+ * reported), package `main` (resolved like Bun 1.4.2: .js / .ts only, applied only with no `exports`),
+ * malformed and duplicate package.json files, fail-closed ambiguity (two tracked candidates of one tier
+ * are `ambiguous-import`, or rule 4 for a workspace specifier), rule 4 on every edge kind and in tests,
+ * and the exemption-reason checks (M5b bypass, intermediate-only, extensionless paths). Known limits are
+ * listed in the scan header.
  */
 import { describe, expect, test } from "bun:test";
+import { dirname, relative } from "node:path";
 import { edges, ENTRY_EXEMPT, HOSTED_ENTRIES, HOSTED_GRANT_MODULES, isExecutableEntry, isHandlerEntry, REASON_PATH_RE, resolveSpec, scan, seamChain, trackedSources, TS_CAPABILITY_DECLARERS, type Sources } from "../../../scripts/scrub-default-scan.ts";
 
 const repo = trackedSources();
@@ -415,8 +418,8 @@ describe("scrub-default-scan", () => {
     expect(rules(files)).toContain(`entry-without-init:${f}`);
   });
 
-  // F2a: extensionless specifiers follow Bun's order (.mts, .ts, .mjs, .js, then /index.*).
-  test("resolveSpec resolves extensionless specifiers to .mts, .mjs and .js and index files in Bun's order", () => {
+  // F2a: extensionless specifiers resolve to .mts, .ts, .mjs, .js, then /index.*; two tracked candidates of one tier fail closed.
+  test("resolveSpec resolves extensionless specifiers to .mts, .mjs and .js and index files; competing candidates fail closed", () => {
     const one = (path: string) => plant(path, "export const x = 1;\n");
     for (const ext of ["mts", "ts", "mjs", "js"]) {
       expect(resolveSpec(one(`scripts/planted-r.${ext}`), "scripts/x.ts", "./planted-r")).toBe(`scripts/planted-r.${ext}`);
@@ -426,7 +429,8 @@ describe("scrub-default-scan", () => {
     for (let i = 0; i < order.length; i++) {
       let files: Sources = repo;
       for (const ext of order.slice(i)) files = plant(`scripts/planted-r.${ext}`, "export const x = 1;\n", files);
-      expect(resolveSpec(plant("scripts/planted-r/index.mts", "", files), "scripts/x.ts", "./planted-r")).toBe(`scripts/planted-r.${order[i]}`);
+      // A file tier with a tracked candidate decides over the index tier; more than one tracked file fails closed.
+      expect(resolveSpec(plant("scripts/planted-r/index.mts", "", files), "scripts/x.ts", "./planted-r")).toBe(i === order.length - 1 ? `scripts/planted-r.${order[i]}` : undefined);
     }
   });
 
@@ -493,21 +497,25 @@ describe("scrub-default-scan", () => {
     expect(rules(plant(t, `import { x } from "@96bulls/pipeline/missing";\nconsole.log(x);\n`))).toStrictEqual([`unresolved-workspace-import:${t}`]);
   });
 
-  test("a literal ./x.js loads x.js before x.ts; an extensionless ./x prefers .mts over .ts and .ts over .js (O4/O6)", () => {
+  test("a literal ./x.js beside x.ts, and an extensionless ./x with .mts + .ts or .ts + .js, are ambiguous-import (O4/O6)", () => {
     const f = "scripts/planted-o.ts";
     const dep = "scripts/planted-o-dep";
-    // ./dep.js: the tracked .js is loaded (inert), not the .ts that reaches the seam.
-    const literal = plant(f, useScrub("./planted-o-dep.js"), plant(`${dep}.ts`, `export { scrubText } from "../${SEAM}.ts";\n`, plant(`${dep}.js`, INERT_DEP)));
-    expect(resolveSpec(literal, f, "./planted-o-dep.js")).toBe(`${dep}.js`);
-    expect(rules(literal)).toStrictEqual([]);
-    // ./dep with .ts and .mts: .mts (reaches the seam) wins over .ts (inert).
-    const mts = plant(f, useScrub("./planted-o-dep"), plant(`${dep}.mts`, `export { scrubText } from "../${SEAM}.ts";\n`, plant(`${dep}.ts`, INERT_DEP)));
-    expect(resolveSpec(mts, f, "./planted-o-dep")).toBe(`${dep}.mts`);
-    expect(rules(mts)).toStrictEqual([`entry-without-init:${f}`]);
-    // ./dep with .ts and .js: .ts (reaches the seam) wins over .js (inert).
-    const ts = plant(f, useScrub("./planted-o-dep"), plant(`${dep}.ts`, `export { scrubText } from "../${SEAM}.ts";\n`, plant(`${dep}.js`, INERT_DEP)));
-    expect(resolveSpec(ts, f, "./planted-o-dep")).toBe(`${dep}.ts`);
-    expect(rules(ts)).toStrictEqual([`entry-without-init:${f}`]);
+    const cases: [string, string, string, string][] = [
+      ["./planted-o-dep.js", `${dep}.js`, `${dep}.ts`, "literal and its .ts sibling"],
+      ["./planted-o-dep", `${dep}.ts`, `${dep}.mts`, ".ts and .mts"],
+      ["./planted-o-dep", `${dep}.ts`, `${dep}.js`, ".ts and .js"],
+    ];
+    for (const [spec, a, b, why] of cases) {
+      const files = plant(f, useScrub(spec), plant(a, `export { scrubText } from "../${SEAM}.ts";\n`, plant(b, INERT_DEP)));
+      expect(resolveSpec(files, f, spec), why).toBeUndefined();
+      const v = scan(files);
+      expect(v.map((x) => `${x.rule}:${x.file}`), why).toStrictEqual([`ambiguous-import:${f}`]);
+      expect(v[0]!.detail, why).toContain(a);
+      expect(v[0]!.detail, why).toContain(b);
+    }
+    // A single tracked candidate still resolves: the literal .js alone, or its .ts sibling alone.
+    expect(resolveSpec(plant(`${dep}.js`, INERT_DEP), f, "./planted-o-dep.js")).toBe(`${dep}.js`);
+    expect(resolveSpec(plant(`${dep}.ts`, INERT_DEP), f, "./planted-o-dep.js")).toBe(`${dep}.ts`);
   });
 
   test("a top-level condition object as exports fails closed (X8)", () => {
@@ -530,10 +538,10 @@ describe("scrub-default-scan", () => {
     const viaMain = plantPkg({ main: "./src/main.ts" }, extra);
     expect(resolveSpec(viaMain, f, "@planted/pkg")).toBe("packages/planted-pkg/src/main.ts");
     expect(rules(viaMain)).toStrictEqual([`entry-without-init:${f}`]);
-    // An object exports without "." also falls back to main for the package root.
+    // An exports object without "." refuses the package root (Bun 1.4.2): it does not fall back to main.
     const noDot = plantPkg({ main: "src/main", exports: { "./x": "./src/main.ts" } }, extra);
-    expect(resolveSpec(noDot, f, "@planted/pkg")).toBe("packages/planted-pkg/src/main.ts");
-    expect(rules(noDot)).toStrictEqual([`entry-without-init:${f}`]);
+    expect(resolveSpec(noDot, f, "@planted/pkg")).toBeUndefined();
+    expect(rules(noDot)).toStrictEqual([`unresolved-workspace-import:${f}`]);
     for (const main of [["./src/main.ts"], 5, null, "./dist/main.js"]) {
       const files = plantPkg({ main }, extra);
       expect(resolveSpec(files, f, "@planted/pkg"), JSON.stringify(main)).toBeUndefined();
@@ -563,5 +571,106 @@ describe("scrub-default-scan", () => {
     const v = scan(files);
     expect(v.map((x) => `${x.rule}:${x.file}`)).toStrictEqual([`unparseable:${dup}`, `unresolved-workspace-import:${f}`]);
     expect(v[0]!.detail).toContain("duplicate workspace package name @planted/pkg (also packages/planted-pkg/package.json)");
+  });
+
+  // Adversarial delta 5: `main` resolves like Bun 1.4.2 and competing candidates fail closed.
+  const PKG = "packages/planted-pkg";
+  /** A module at `from` that re-exports the engine-running scrubText from the seam. */
+  const fwd = (from: string) => {
+    const rel = relative(dirname(from), `${SEAM}.ts`);
+    return `export { scrubText } from "${rel.startsWith(".") ? rel : `./${rel}`}";\n`;
+  };
+  test("an extensionless main tries only .js then .ts: a.mts beside a decoy index.ts fails closed", () => {
+    const f = "scripts/planted-main-ext.ts";
+    const files = plantPkg({ main: "./a" }, { [`${PKG}/a.mts`]: fwd(`${PKG}/a.mts`), [`${PKG}/index.ts`]: INERT_DEP, [f]: useScrub("@planted/pkg") });
+    expect(resolveSpec(files, f, "@planted/pkg")).toBeUndefined();
+    expect(rules(files)).toStrictEqual([`unresolved-workspace-import:${f}`]);
+    for (const ext of ["js", "ts"]) expect(resolveSpec(plantPkg({ main: "./a" }, { [`${PKG}/a.${ext}`]: fwd(`${PKG}/a.${ext}`) }), f, "@planted/pkg"), ext).toBe(`${PKG}/a.${ext}`);
+    expect(resolveSpec(plantPkg({ main: "./a" }, { [`${PKG}/a.mjs`]: fwd(`${PKG}/a.mjs`) }), f, "@planted/pkg")).toBeUndefined();
+  });
+
+  test("main ./a.mjs is not rewritten to a.mts; main ./a.js loads a.ts when only a.ts is tracked", () => {
+    const f = "scripts/planted-main-mjs.ts";
+    const mjs = plantPkg({ main: "./a.mjs" }, { [`${PKG}/a.mts`]: fwd(`${PKG}/a.mts`), [f]: useScrub("@planted/pkg") });
+    expect(resolveSpec(mjs, f, "@planted/pkg")).toBeUndefined();
+    expect(rules(mjs)).toStrictEqual([`unresolved-workspace-import:${f}`]);
+    const js = plantPkg({ main: "./a.js" }, { [`${PKG}/a.ts`]: fwd(`${PKG}/a.ts`), [f]: useScrub("@planted/pkg") });
+    expect(resolveSpec(js, f, "@planted/pkg")).toBe(`${PKG}/a.ts`);
+    expect(rules(js)).toStrictEqual([`entry-without-init:${f}`]);
+  });
+
+  test("a main naming a directory loads its index.ts; index.mts alone fails closed", () => {
+    const f = "scripts/planted-main-dir.ts";
+    expect(resolveSpec(plantPkg({ main: "./lib" }, { [`${PKG}/lib/index.ts`]: fwd(`${PKG}/lib/index.ts`) }), f, "@planted/pkg")).toBe(`${PKG}/lib/index.ts`);
+    expect(resolveSpec(plantPkg({ main: "./lib" }, { [`${PKG}/lib/index.mts`]: fwd(`${PKG}/lib/index.mts`) }), f, "@planted/pkg")).toBeUndefined();
+  });
+
+  test("a main with both a.js and a.ts tracked is ambiguous and fails closed (rule 4)", () => {
+    const f = "scripts/planted-main-both.ts";
+    for (const main of ["./a", "./a.js"]) {
+      const files = plantPkg({ main }, { [`${PKG}/a.js`]: INERT_DEP, [`${PKG}/a.ts`]: fwd(`${PKG}/a.ts`), [f]: useScrub("@planted/pkg") });
+      expect(resolveSpec(files, f, "@planted/pkg"), main).toBeUndefined();
+      const v = scan(files);
+      expect(v.map((x) => `${x.rule}:${x.file}`), main).toStrictEqual([`unresolved-workspace-import:${f}`]);
+      expect(v[0]!.detail, main).toContain(`${PKG}/a.js, ${PKG}/a.ts`);
+    }
+  });
+
+  test("an exports object without \".\" plus a main fails closed for the root (rule 4)", () => {
+    const f = "scripts/planted-nodot.ts";
+    const files = plantPkg({ main: "./src/main.ts", exports: { "./sub": "./src/sub.ts" } }, { [`${PKG}/src/main.ts`]: fwd(`${PKG}/src/main.ts`), [`${PKG}/src/sub.ts`]: INERT_DEP, [f]: useScrub("@planted/pkg") });
+    expect(resolveSpec(files, f, "@planted/pkg")).toBeUndefined();
+    expect(rules(files)).toStrictEqual([`unresolved-workspace-import:${f}`]);
+    expect(resolveSpec(files, f, "@planted/pkg/sub")).toBe(`${PKG}/src/sub.ts`);
+  });
+
+  test("a subpath import of a package with a main does not use the main (M7)", () => {
+    const f = "scripts/planted-m7.ts";
+    const files = plantPkg({ main: "./src/main.ts" }, { [`${PKG}/src/main.ts`]: fwd(`${PKG}/src/main.ts`), [`${PKG}/src/sub.ts`]: INERT_DEP, [f]: useScrub("@planted/pkg/src/sub") });
+    expect(resolveSpec(files, f, "@planted/pkg/src/sub")).toBe(`${PKG}/src/sub.ts`);
+    expect(rules(files)).toStrictEqual([]);
+  });
+
+  test.each([["null", null], ["an array", []], ["a string", "x"]])("a package.json that is %s is unparseable: not a JSON object (M8)", (_what, pj) => {
+    const bad = "packages/planted-bad/package.json";
+    expect(scan(plant(bad, JSON.stringify(pj)))).toStrictEqual([{ rule: "unparseable", file: bad, detail: "package.json is not a JSON object" }]);
+  });
+
+  test("an ambiguous relative, alias or require import (x.ts + x.mts) is ambiguous-import naming both", () => {
+    const f = "scripts/planted-amb.ts";
+    const both = (base: string, files: Sources = repo) => plant(`${base}.ts`, INERT_DEP, plant(`${base}.mts`, fwd(`${base}.mts`), files));
+    for (const [spec, base, src] of [
+      ["./planted-amb-dep", "scripts/planted-amb-dep", useScrub("./planted-amb-dep")],
+      ["@rhc/planted-amb-dep", "packages/pipeline/src/planted-amb-dep", useScrub("@rhc/planted-amb-dep")],
+      ["./planted-amb-dep", "scripts/planted-amb-dep", `const { scrubText } = require("./planted-amb-dep");\nconsole.log(scrubText("a"));\n`],
+    ] as const) {
+      const files = plant(f, src, both(base));
+      expect(resolveSpec(files, f, spec), spec).toBeUndefined();
+      const v = scan(files);
+      expect(v.map((x) => `${x.rule}:${x.file}`), spec).toStrictEqual([`ambiguous-import:${f}`]);
+      expect(v[0]!.detail, spec).toContain(`${base}.mts`);
+      expect(v[0]!.detail, spec).toContain(`${base}.ts`);
+    }
+  });
+
+  test("an ambiguous workspace subpath (a.mjs + a.ts) and a root with index.ts + index.js fail closed (rule 4)", () => {
+    const f = "scripts/planted-ws-amb.ts";
+    const sub = plantPkg({}, { [`${PKG}/a.mjs`]: INERT_DEP, [`${PKG}/a.ts`]: fwd(`${PKG}/a.ts`), [f]: useScrub("@planted/pkg/a") });
+    expect(resolveSpec(sub, f, "@planted/pkg/a")).toBeUndefined();
+    expect(rules(sub)).toStrictEqual([`unresolved-workspace-import:${f}`]);
+    const root = plantPkg({}, { [`${PKG}/index.ts`]: fwd(`${PKG}/index.ts`), [`${PKG}/index.js`]: INERT_DEP, [f]: useScrub("@planted/pkg") });
+    expect(resolveSpec(root, f, "@planted/pkg")).toBeUndefined();
+    expect(rules(root)).toStrictEqual([`unresolved-workspace-import:${f}`]);
+  });
+
+  test("a single tracked candidate in any position still resolves", () => {
+    const f = "scripts/planted-single.ts";
+    for (const ext of ["mts", "ts", "mjs", "js"]) {
+      expect(resolveSpec(plantPkg({}, { [`${PKG}/a.${ext}`]: fwd(`${PKG}/a.${ext}`) }), f, "@planted/pkg/a"), ext).toBe(`${PKG}/a.${ext}`);
+      expect(resolveSpec(plantPkg({}, { [`${PKG}/index.${ext}`]: fwd(`${PKG}/index.${ext}`) }), f, "@planted/pkg"), ext).toBe(`${PKG}/index.${ext}`);
+    }
+    const js = plantPkg({}, { [`${PKG}/a.js`]: fwd(`${PKG}/a.js`), [f]: useScrub("@planted/pkg/a") });
+    expect(resolveSpec(js, f, "@planted/pkg/a")).toBe(`${PKG}/a.js`);
+    expect(rules(js)).toStrictEqual([`entry-without-init:${f}`]);
   });
 });

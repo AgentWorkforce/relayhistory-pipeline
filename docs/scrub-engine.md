@@ -677,8 +677,10 @@ enumerated declarers, a grant re-exported from the seam, a hosted entry whose fi
 its module-load grant, any other non-test file that reaches a module-load grant, a stacks or
 wrangler `main` that is not a hosted entry, a production module importing a test preload, and a
 stale exemption, on a file the transpiler cannot parse, and on a workspace-package import that resolves
-to no tracked source (an unknown `exports` shape, a folder mapping or pattern, a non-string `main` or an
-untracked target; fail closed), and on a `packages/*/package.json` that is not a JSON object or repeats
+to no single tracked source (an unknown `exports` shape, a folder mapping or pattern, an `exports` object
+without `.` for the package root, a non-string or unresolvable `main`, a duplicate package name,
+ambiguous candidates or an untracked target; fail closed), on a relative or alias import with more than
+one tracked candidate (`ambiguous-import`), and on a `packages/*/package.json` that is not a JSON object or repeats
 another package's name (`unparseable`; a duplicated name resolves nowhere). Each rule has a
 planted-violation test; the scan is a heuristic, not a proof.
 Known limits, listed in the scan header: an initialiser anywhere in the entry counts even if a seam
@@ -686,10 +688,14 @@ use runs first or it sits under a condition (the runtime still fails closed ther
 variable loads stay invisible (`import(x)`, `require(x)`, `import.meta.require(x)`, a template with
 `${...}`, an import wrapper such as the rehearsal's `mod(path)`, a stored `createRequire` result
 called later, `new Function(...)` / `eval(...)`, `require.resolve`, `new Worker(url)`, `Bun.spawn` of another file); entries shaped
-differently from the patterns above (for example `export default app`) are not detected; every edge
-uses Bun's import resolution order, although `require`, `import.meta.require` and `createRequire` try
-`.ts` before `.mts`, `.js` before `.mjs` and `index.ts` before `index.mts` on Bun 1.4.2 (this matters
-only when sibling `x.ts` and `x.mts` both exist); and a relative import of a `.tsx`, `.cts`, `.cjs` or
+differently from the patterns above (for example `export default app`) are not detected; a relative
+import's extensionless candidates are tried in Bun 1.4.2's import order, but the scan fails closed
+(`ambiguous-import`, or rule 4 for a workspace specifier) whenever more than one candidate of a tier is
+tracked, so the differing orders of `require` / `import.meta.require` / `createRequire` (`.ts` before
+`.mts`, `.js` before `.mjs`, `index.ts` before `index.mts`), of workspace specifiers through
+`node_modules` (`.mjs` > `.mts` > `.js` > `.ts`) and of `main` (`.js` > `.ts` only) cannot pick a
+different file; a subpath that an `exports` map lacks falls back to the package directory (a safe
+over-approximation); and a relative import of a `.tsx`, `.cts`, `.cjs` or
 `.jsx` file is not tracked and is a silent dead end (none exist today). The
 rehearsal's R6 module choice is pinned separately by `src/hoopdb/__tests__/schema-rehearsal-r6.test.ts`.
 Edges are read by `Bun.Transpiler.scanImports`, the transpiler's own parse rather than a line
@@ -699,11 +705,17 @@ the module, only `import type` and all-`type` braces are erased), `import("x")` 
 options or a trailing comma, `` import(`x`) `` and `require("x")`, plus `import.meta.require("x")`
 and `createRequire(...)("x")` from the TypeScript AST. A `?query` or `#hash` suffix is stripped
 before resolution through relative, `@rhc/*`, `@rhc-object-store` and workspace-package
-(`@96bulls/pipeline/...` and the other `packages/*` names, through their `exports` when present; with
-no `.` export the package root loads its string `main`, else its index; folder mappings such as
-`"./sub/"` and `*` patterns fail closed; a name that only shares a prefix, such as
-`@96bulls/pipeline-extra`, is third-party) specifiers; the literal path is tried first, then an
-extensionless path tries Bun's order (`.mts`, `.ts`, `.mjs`, `.js`, then the same for `/index`).
+(`@96bulls/pipeline/...` and the other `packages/*` names, through their `exports` when present; an
+`exports` object without `.` fails closed for the package root, which Bun 1.4.2 refuses rather than
+falling back to `main`; only when `exports` is absent does the root load its string `main`: the literal
+path (a `.js` main also its `.ts` sibling; a `.mjs` main is not rewritten to `.mts`), then `main.js` /
+`main.ts` (never `.mts` / `.mjs`), then a directory's `index.js` / `index.ts`; an unresolved or
+non-string `main` fails closed where Bun would silently load the index, and no `main` loads the index;
+folder mappings such as `"./sub/"` and `*` patterns fail closed; a name that only shares a prefix, such
+as `@96bulls/pipeline-extra`, is third-party) specifiers. Candidates come in tiers (the literal path and
+its `.js` to `.ts` / `.mjs` to `.mts` sibling, then an extensionless path's `.mts`, `.ts`, `.mjs`, `.js`
+files, then the same for `/index`); the first tier with a tracked candidate decides and must hold
+exactly one, or the import fails closed.
 `hosted-grant-first` reads the TypeScript AST: after comments, a shebang and a directive prologue,
 the hosted entry's first statement must be the static bare import of its grant with no import
 attributes (`with { type: "text" }` or `assert` loads it as data and never runs the grant), and it
