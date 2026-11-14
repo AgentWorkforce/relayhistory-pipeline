@@ -4,6 +4,7 @@
 import{publicationEnabled,runCanonicalPublicationRuntime}from'./publication-runtime.ts';
 import{runPortablePublicationRuntime}from'./publication-portable.ts';
 import{publicationTargetKind}from'./publication-target.ts';
+import{initScrubEngine}from'../../packages/pipeline/src/lib/scrub-engine/index.ts';
 /** Optional in-process hooks (publication-service.ts): a cycle observer and an external stop. */
 export interface PublicationMainHooks{onCycle?:(counts:Record<string,unknown>)=>void;signal?:AbortSignal}
 export async function publicationMain(args=process.argv.slice(2),env=process.env,hooks:PublicationMainHooks={}){
@@ -29,7 +30,17 @@ export async function publicationMain(args=process.argv.slice(2),env=process.env
  }while(!controller.signal.aborted);return{enabled:true,cycles};}
  finally{controller.abort();process.removeListener('SIGTERM',stop);process.removeListener('SIGINT',stop);hooks.signal?.removeEventListener('abort',stop);}
 }
-if(import.meta.main)publicationMain().catch(error=>{
+/** The CLI entry (docs/scrub-engine.md): with publish enabled, select and (for wasm) verify the
+ * pinned scrub engine before the first cycle seals anything; both targets seal through the seam.
+ * Invalid arguments, a disabled run and `--gc` (which never seals) return or fail exactly as
+ * publicationMain does, without engine artifacts, so stopping publication or running GC alone
+ * never depends on the scrub engine. Importing this module initialises nothing. */
+export async function publicationEntry(args=process.argv.slice(2),env=process.env,
+ deps:{init:()=>Promise<unknown>;main:typeof publicationMain}={init:()=>initScrubEngine(),main:publicationMain}){
+ if(args.every(x=>['--gc','--continuous'].includes(x))&&!args.includes('--gc')&&publicationEnabled(env,'publish'))await deps.init();
+ return await deps.main(args,env);
+}
+if(import.meta.main)publicationEntry().catch(error=>{
  const raw=error?.code;const code=typeof raw==='string'&&/^[A-Za-z0-9_]{1,64}$/.test(raw)?raw:'publication_failed';
  console.error(JSON.stringify({kind:'canonical-publication',healthy:false,code}));process.exitCode=1;
 });
@@ -37,3 +48,6 @@ if(import.meta.main)publicationMain().catch(error=>{
 // Offline bundle proofs import the real runtime with injected owned factories.
 // The CLI never accepts factories, credentials, or endpoints from argv/input.
 export{runCanonicalPublicationRuntime}from'./publication-runtime.ts';
+// A compiled bundle carries its own copy of the seam: a proof that seals through the bundle must
+// initialise that copy, not the source tree's (scripts/proof-canonical-publication.ts).
+export{initScrubEngine};

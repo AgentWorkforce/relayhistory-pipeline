@@ -7,7 +7,7 @@
  * planted too. Known limits are listed in the scan header.
  */
 import { describe, expect, test } from "bun:test";
-import { ENTRY_EXEMPT, HOSTED_ENTRIES, HOSTED_GRANT_MODULES, isExecutableEntry, isHandlerEntry, scan, seamChain, trackedSources, TS_CAPABILITY_DECLARERS, type Sources } from "../../../scripts/scrub-default-scan.ts";
+import { edges, ENTRY_EXEMPT, HOSTED_ENTRIES, HOSTED_GRANT_MODULES, isExecutableEntry, isHandlerEntry, resolveSpec, scan, seamChain, trackedSources, TS_CAPABILITY_DECLARERS, type Sources } from "../../../scripts/scrub-default-scan.ts";
 
 const repo = trackedSources();
 const mutate = (path: string, edit: (src: string) => string): Sources => {
@@ -260,5 +260,102 @@ describe("scrub-default-scan", () => {
   test("a wrangler main pointed at a non-hosted module fails", () => {
     const f = "packages/session-read-worker/wrangler.jsonc";
     expect(rules(mutate(f, (s) => s.replace(/("main"\s*:\s*")[^"]+"/, '$1src/planted.ts"')))).toContain(`deploy-main:${f}`);
+  });
+
+  // hosted-grant-reach: forms a line-anchored regex parser misses. Edges come from
+  // Bun.Transpiler.scanImports (plus import.meta.require / createRequire), so each must be seen.
+  test.each([
+    ["compact empty-braces import", `import{}from"${GRANT_REL}";\nexport const x = 1;\n`],
+    ["compact namespace import", `import*as g from"${GRANT_REL}";\nexport const x = g;\n`],
+    ["compact star re-export", `export*from"${GRANT_REL}";\n`],
+    ["compact empty-braces re-export", `export{}from"${GRANT_REL}";\n`],
+    ["bare import after a statement on the same line", `const a = 1; import "${GRANT_REL}";\nexport const x = a;\n`],
+    ["bare import after a block comment on the same line", `/* x */ import "${GRANT_REL}";\nexport const x = 1;\n`],
+    ["dynamic import with a comment before the specifier", `await import(/* c */ "${GRANT_REL}");\n`],
+    ["dynamic import with an options argument", `await import("${GRANT_REL}", {});\n`],
+    ["dynamic import with a trailing comma", `await import("${GRANT_REL}",);\n`],
+    ["import.meta.require", `import.meta.require("${GRANT_REL}");\n`],
+    ["unicode escape in the specifier", `import "${GRANT_REL.replace("hosted", "\\u0068osted")}";\nexport const x = 1;\n`],
+    ["query suffix on the specifier", `import "${GRANT_REL}?x=1";\nexport const x = 1;\n`],
+    ["hash suffix on the specifier", `import "${GRANT_REL}#h";\nexport const x = 1;\n`],
+    ["indented bare import", `if (true) {}\n   import "${GRANT_REL}";\n`],
+    ["bare import after a shebang and a directive", `#!/usr/bin/env bun\n"use strict";\nimport "${GRANT_REL}";\n`],
+  ])("a planted %s of a grant module is a hosted-grant-reach violation", (_form, src) => {
+    const f = "scripts/planted-reach.ts";
+    expect(rules(plant(f, src))).toContain(`hosted-grant-reach:${f}`);
+  });
+
+  test("the unicode-escape plant really contains an escape (not a decoded character)", () => {
+    expect(`"${GRANT_REL.replace("hosted", "\\u0068osted")}"`).toContain("\\u0068osted");
+  });
+
+  test("resolveSpec strips a query or hash suffix and resolves the tsconfig aliases (N8)", () => {
+    expect(resolveSpec(repo, "scripts/x.ts", `${GRANT_REL}?x=1`)).toBe("packages/pipeline/src/lib/scrub-engine/hosted-lambda-grant.ts");
+    expect(resolveSpec(repo, "scripts/x.ts", `${GRANT_REL}#h`)).toBe("packages/pipeline/src/lib/scrub-engine/hosted-lambda-grant.ts");
+    expect(resolveSpec(repo, "scripts/x.ts", "@rhc-object-store")).toBe("packages/object-store/src/index.ts");
+    expect(resolveSpec(repo, "scripts/x.ts", "@rhc/lib/scrub-engine/index.ts")).toBe(`${SEAM}.ts`);
+  });
+
+  // N10 and the parser: edges read like the module loader, not like a line regex.
+  test.each([
+    ["an indented bare import", `   import "./x.ts";\n`, "import"],
+    ["a compact bare import", `import"./x.ts";\n`, "import"],
+    ["a compact named import", `import{x}from'./x.ts';\nx;\n`, "import"],
+    ["a compact named re-export", `export{x}from'./x.ts';\n`, "import"],
+    ["a bare import after a shebang", `#!/usr/bin/env bun\nimport "./x.ts";\n`, "import"],
+    ["a bare import after \"use strict\"", `"use strict";\nimport "./x.ts";\n`, "import"],
+    ["import.meta.require", `import.meta.require("./x.ts");\n`, "require"],
+    ["createRequire(...)(x)", `import { createRequire } from "node:module";\ncreateRequire(import.meta.url)("./x.ts");\n`, "require"],
+  ])("edges() sees %s", (_form, src, kind) => {
+    expect(edges(src).filter((e) => e.spec === "./x.ts").map((e) => e.kind)).toStrictEqual([kind]);
+  });
+
+  test("edges() ignores import text in strings, templates and comments, and type-only imports", () => {
+    expect(edges(`const s = 'import "./a.ts"';\nconst t = \`\nimport "./b.ts"\n\`;\n// import "./c.ts"\n/* import "./d.ts" */\nimport type { T } from "./e.ts";\nimport { type U } from "./f.ts";\n`)).toStrictEqual([]);
+  });
+
+  test("a compact named import of an engine-running seam name in an entry needs an initialiser", () => {
+    const f = "scripts/planted-compact.ts";
+    expect(rules(plant(f, `import{scrubText}from'../${SEAM}.ts';\nawait scrubText("a");\n`))).toContain(`entry-without-init:${f}`);
+    expect(seamChain(plant(f, `import{scrubText}from'../${SEAM}.ts';\nawait scrubText("a");\n`), f)).toStrictEqual([f, `${SEAM}.ts`]);
+  });
+
+  test("a file the transpiler cannot scan is reported, not treated as edge-free", () => {
+    const f = "scripts/planted-unparseable.ts";
+    expect(rules(plant(f, `import { scrubText } from "../${SEAM}.ts";\nconst = ;\nawait scrubText("a");\n`))).toContain(`unparseable:${f}`);
+  });
+
+  // ENTRY_EXEMPT reasons that name a repo path are checked against the graph.
+  test("every repo path named in an exemption reason is a tracked source every seam route passes through", () => {
+    const named = Object.entries(ENTRY_EXEMPT).flatMap(([f, why]) => (why.match(/\b(?:src|packages|scripts|e2e|benchmarks|stacks)\/[\w./-]+\.(?:m?ts|mjs)\b/g) ?? []).map((p) => [f, p] as const));
+    expect(named.length).toBeGreaterThan(0);
+    for (const [f, p] of named) {
+      expect(repo.has(p), `${f}: ${p}`).toBe(true);
+      expect(seamChain(repo, f)!, `${f}: ${p}`).toContain(p);
+      expect(seamChain(repo, f, new Set([p])), `${f}: ${p}`).toBeUndefined();
+    }
+  });
+
+  test.each(["scripts/build-large-read-worker.ts", "stacks/aws/alchemy.aws.run.ts"])("an exempt %s given a seam route that bypasses the paths its reason names is reported stale", (f) => {
+    const files = mutate(f, (s) => `import { scrubTextForLog } from "../${f.startsWith("stacks/") ? "../" : ""}${SEAM}.ts";\n${s}`);
+    expect(scan(files).filter((v) => v.file === f).map((v) => v.rule)).toContain("stale-exemption");
+  });
+
+  // hosted-grant-first is read from the TypeScript AST and the transpiler's first load.
+  test.each([
+    ["an import hidden from a comment stripper by `// /*` above the grant", (line: string) => `// /*\nimport "./evil.ts";\n// */\n${line}`],
+    ["the grant imported with `with { type: \"text\" }`", (line: string) => line.replace(/";/, '" with { type: "text" };')],
+    ["the grant imported with `assert { type: \"json\" }`", (line: string) => line.replace(/";/, '" assert { type: "json" };')],
+    ["a named import on the same line before the grant", (line: string) => `import { log } from "../shared/log.ts"; ${line}`],
+    ["a directive followed by a different import", (line: string) => `"use strict";\nimport "./publication-main.ts";\n${line}`],
+  ])("a hosted entry with %s fails hosted-grant-first", (_form, edit) => {
+    const files = mutate(GC, (s) => s.replace(GC_GRANT, (line) => edit(line)));
+    expect(rules(files)).toContain(`hosted-grant-first:${GC}`);
+  });
+
+  test("the grant first after a shebang, a comment or a directive prologue passes hosted-grant-first", () => {
+    expect(rules(mutate(GC, (s) => `#!/usr/bin/env node\n${s}`))).not.toContain(`hosted-grant-first:${GC}`);
+    for (const before of ["/* header */\n", "\"use strict\";\n"])
+      expect(rules(mutate(GC, (s) => s.replace(GC_GRANT, (line) => `${before}${line}`)))).not.toContain(`hosted-grant-first:${GC}`);
   });
 });

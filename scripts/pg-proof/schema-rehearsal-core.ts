@@ -877,3 +877,12 @@ export function mutateAnchorTip(
   moveAnchorRef(x, x.branch, x.tip, next);
   return next;
 }
+
+/** R6 reads acceptedGenerations from its grant-free module. worker.ts imports the hosted-worker
+ * module-load TS grant first (docs/scrub-engine.md "Default flip"), which the rehearsal process must
+ * not hold, so worker.ts is loaded only for release trees from before the split (no grant there). */
+export const R6_ACCEPT_GENERATIONS_MODULE = "src/session-ingest/accept-generations.ts";
+export const R6_LEGACY_ACCEPT_GENERATIONS_MODULE = "src/session-ingest/worker.ts";
+export function r6AcceptGenerationsModule(treeHas: (rel: string) => boolean): string {
+  return treeHas(R6_ACCEPT_GENERATIONS_MODULE) ? R6_ACCEPT_GENERATIONS_MODULE : R6_LEGACY_ACCEPT_GENERATIONS_MODULE;
+}

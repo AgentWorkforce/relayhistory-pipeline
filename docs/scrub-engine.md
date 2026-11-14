@@ -649,24 +649,40 @@ and `stacks` (`import.meta.main`, top-level await, a non-declaration top-level s
 `export [async] function handler`) whose static import graph reaches the seam must call
 `initScrubEngine(` (or `runWorker(`) in its code (a comment or string does not count), be a hosted
 entry or a wrapped Lambda handler, or be listed in `ENTRY_EXEMPT` with a reason (GitHub-API gates,
-bundlers, the technical-foul manifest writer, the RDS activation and claim-records archive tools,
-which import the seam graph but never scrub). It also fails on a grant declared outside the
+bundlers, the technical-foul manifest writer, the RDS activation and claim-records archive tools, and
+the Alchemy IaC program `stacks/aws/alchemy.aws.run.ts`, which import the seam graph but never scrub).
+A repo path named in an exemption reason must be a tracked source that every route from the entry to
+the seam passes through, so a reason cannot cite a path the graph does not use. The host publication
+CLI `src/session-ingest/publication-main.ts` initialises the engine under `import.meta.main` before
+its first publish cycle (importing the module initialises nothing; a disabled run, `--gc` and
+invalid arguments never need the engine), and `scripts/proof-canonical-publication.ts` initialises
+both the source seam and, for `PUBLICATION_COMPILED_BUNDLE`, the bundle's own copy (re-exported by
+publication-main) before it seals. It also fails on a grant declared outside the
 enumerated declarers, a grant re-exported from the seam, a hosted entry whose first import is not
 its module-load grant, any other non-test file that reaches a module-load grant, a stacks or
 wrangler `main` that is not a hosted entry, a production module importing a test preload, and a
-stale exemption. Each rule has a planted-violation test; the scan is a heuristic, not a proof.
+stale exemption, and on a file the transpiler cannot parse (fail closed). Each rule has a
+planted-violation test; the scan is a heuristic, not a proof.
 Known limits, listed in the scan header: an initialiser anywhere in the entry counts even if a seam
-use runs first or it sits under a condition (the runtime still fails closed there); computed or
-indirect loads (`import(x)`, `require(x)`, a template with `${...}`, an import wrapper such as the
-rehearsal's `mod(path)`, a stored `createRequire` result called later, `new Worker(url)`) are not
-followed; entries shaped differently from the patterns above (for example `export default app`) are
-not detected. Edges that are followed: import/export-from (including `import {} from`, which still
-evaluates the module), bare imports with or without a semicolon, literal `import("x")` / `` import(`x`) ``
-/ `require("x")` / `createRequire(...)("x")`, with relative, `@rhc/*`, `@rhc-object-store` and
-workspace-package (`@96bulls/pipeline/...` and the other `packages/*` names) specifiers.
-`hosted-grant-first` requires the hosted entry's first statement to be the static bare import itself;
-a named or namespace import, `void import(...)`, `await import(...)` or the import text inside a
-template does not count.
+use runs first or it sits under a condition (the runtime still fails closed there); computed and
+variable loads stay invisible (`import(x)`, `require(x)`, `import.meta.require(x)`, a template with
+`${...}`, an import wrapper such as the rehearsal's `mod(path)`, a stored `createRequire` result
+called later, `require.resolve`, `new Worker(url)`, `Bun.spawn` of another file); entries shaped
+differently from the patterns above (for example `export default app`) are not detected. The
+rehearsal's R6 module choice is pinned separately by `src/hoopdb/__tests__/schema-rehearsal-r6.test.ts`.
+Edges are read by `Bun.Transpiler.scanImports`, the transpiler's own parse rather than a line
+regex: every static import and re-export in any spacing or position (`import{}from"x"`,
+`export*from"x"`, mid-line, after a comment, with unicode escapes; `import {} from` still evaluates
+the module, only `import type` and all-`type` braces are erased), `import("x")` with comments,
+options or a trailing comma, `` import(`x`) `` and `require("x")`, plus `import.meta.require("x")`
+and `createRequire(...)("x")` from the TypeScript AST. A `?query` or `#hash` suffix is stripped
+before resolution through relative, `@rhc/*`, `@rhc-object-store` and workspace-package
+(`@96bulls/pipeline/...` and the other `packages/*` names) specifiers.
+`hosted-grant-first` reads the TypeScript AST: after comments, a shebang and a directive prologue,
+the hosted entry's first statement must be the static bare import of its grant with no import
+attributes (`with { type: "text" }` or `assert` loads it as data and never runs the grant), and it
+must be the first load the transpiler reports; a named or namespace import, `void import(...)`,
+`await import(...)`, or import text inside a string, template or comment does not count.
 
 **Tests** (each in a clean child process, no preload, asserting no grant at start):
 `src/session-ingest/__tests__/scrub-default-flip.test.ts` (fixture child

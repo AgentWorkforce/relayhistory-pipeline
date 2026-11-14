@@ -95,6 +95,7 @@ import {
   legacyForecast,
   materializeLanding,
   MAX_POSTMASTER_AGE_SECONDS,
+  r6AcceptGenerationsModule,
   RehearsalRefusal,
   rehearsalPassed,
   rehearsalRefuse,
@@ -1145,10 +1146,8 @@ async function run(report: (i: RehearsalInputs, pgMajor: string) => void) {
 
   await stage("R6", async () => {
     const S = await mod("stacks/cloudflare/session-ingest.ts");
-    // acceptedGenerations from its grant-free module, not worker.ts: worker.ts imports the hosted-worker
-    // module-load TS grant first (docs/scrub-engine.md "Default flip"), which this process must not hold.
-    // Release trees from before the split define it only in worker.ts (and have no module-load grant).
-    const W = await mod(existsSync(join(ROOT, "src/session-ingest/accept-generations.ts")) ? "src/session-ingest/accept-generations.ts" : "src/session-ingest/worker.ts");
+    // acceptedGenerations from its grant-free module, not worker.ts (r6AcceptGenerationsModule).
+    const W = await mod(r6AcceptGenerationsModule((rel) => existsSync(join(ROOT, rel))));
     // Placeholder ids only: R6 reads the generation vars, nothing else is emitted.
     const base = {
       accountId: "rehearsal-account",

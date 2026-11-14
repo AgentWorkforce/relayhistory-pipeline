@@ -20,11 +20,15 @@ import{createFsStore}from'../packages/object-store/src/fs.ts';
 import{indexPointer,droppedFanout}from'../src/session-pipeline/pointer.ts';
 import{readCanonicalScope}from'../src/session-read-api/canonical-projection.ts';
 import{readerMaxRuleset}from'../packages/pipeline/src/lib/scrub-engine/reader-policy.ts';
+import{initScrubEngine}from'../packages/pipeline/src/lib/scrub-engine/index.ts';
 import{zstdDecompressSync}from'node:zlib';
 import{deliveryAccount,prepareDelivery}from'../src/session-ingest/vendor/delivery/prepare.ts';
 import{DELIVERY_MAPPING_VERSION,type HistoryExportBatch}from'../src/session-ingest/vendor/delivery/delivery-contracts.ts';
 const out=process.env.PUBLICATION_PROOF_OUT??'';
 if(process.env.PUBLICATION_DISPOSABLE!=='1'||!out.startsWith('/home/khaliqgant/relay-briefs/canonical-publication-'))throw Error('owned_disposable_only');
+// SCRUB_ENGINE (docs/scrub-engine.md): the runtime case seals through the seam, so select (and for
+// wasm verify) the pinned engine before anything else runs.
+await initScrubEngine();
 function port(name:string,key:string){const d=JSON.parse(execFileSync('docker',['inspect',name],{encoding:'utf8'}))[0];
  if(d.Config.Labels['com.96bulls.proof']!=='canonical-publisher')throw Error('container_owner');const p=d.NetworkSettings.Ports[key][0];if(p.HostIp!=='127.0.0.1')throw Error('loopback_only');return Number(p.HostPort);}
 mkdirSync(out,{recursive:false,mode:0o700});
@@ -144,7 +148,11 @@ try{
    pool:()=>new pg.Pool({...cfg(database,'bulls96_session_ingest'),max:4}),store:()=>store,eraser:()=>eraser};
   const compiled=process.env.PUBLICATION_COMPILED_BUNDLE;
   if(compiled&&!compiled.startsWith('/home/khaliqgant/relay-briefs/canonical-publication-'))throw Error('owned_bundle_path');
-  const runtime=compiled?(await import('file://'+compiled)).runCanonicalPublicationRuntime:runCanonicalPublicationRuntime;
+  const bundle=compiled?await import('file://'+compiled):undefined;
+  // The bundle seals through its own copy of the seam (publication-main re-exports its initialiser).
+  // Held by reference so the scan's initialiser check still reflects the source-seam call above.
+  if(bundle){const initBundle:unknown=bundle.initScrubEngine;if(typeof initBundle!=='function')throw Error('compiled_bundle_init');await initBundle();}
+  const runtime=bundle?bundle.runCanonicalPublicationRuntime:runCanonicalPublicationRuntime;
   const r=await runtime(env,'publish',overrides);assert(r.enabled&&r.published>=1,'actual_runtime_publish');
   const p=await f.row();assert(p?.deleted_at===null,'runtime_pointer');
   await f.disable();await f.enable();
