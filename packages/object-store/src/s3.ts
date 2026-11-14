@@ -221,7 +221,14 @@ class S3Transport implements Transport {
   async getObject(key: ObjectKey, range?: ByteRange): Promise<GetObject> {
     const headers = new Headers();
     if (range) headers.set("range", `bytes=${range.start}-${range.end - 1}`);
-    const res = await this.#request(key, "GET", this.#url(key), headers);
+    // The stored bytes, never a decoded view. An object PUT with `Content-Encoding` (the desktop's
+    // direct-upload inbox objects carry `zstd`) comes back with that header, and fetch (Bun's,
+    // and undici's for the encodings it knows) decodes the body, so a digest of what was stored
+    // (upload-inbox-contract.ts checkUploadObjectBytes) would see other bytes. The signed
+    // `response-content-encoding=identity` override makes S3 (and MinIO) answer `identity`.
+    const url = this.#url(key);
+    url.searchParams.set("response-content-encoding", "identity");
+    const res = await this.#request(key, "GET", url, headers);
     if (!res.ok || !res.body)
       throw errorForStatus(BACKEND, key, res.status, await errorBody(res));
     return {

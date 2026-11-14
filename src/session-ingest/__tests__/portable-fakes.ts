@@ -94,7 +94,10 @@ export class MinioShapedS3 {
     if (!scope.startsWith(`${this.accessKeyId}/`) || !scope.endsWith(`/${this.region}/s3/aws4_request`) || !headers.get("x-amz-content-sha256"))
       return new Response("<Error><Code>SignatureDoesNotMatch</Code></Error>", { status: 403 });
     if (bucket !== this.bucket) return new Response("<Error><Code>NoSuchBucket</Code></Error>", { status: 404 });
-    if (!key || url.search) return new Response("<Error><Code>NotImplemented</Code></Error>", { status: 501 });
+    // A GET may carry the signed `response-content-encoding` override (S3Store.getObject asks for identity); nothing else.
+    const query = [...url.searchParams.keys()];
+    const overrideOnly = method === "GET" && query.length === 1 && query[0] === "response-content-encoding";
+    if (!key || (url.search && !overrideOnly)) return new Response("<Error><Code>NotImplemented</Code></Error>", { status: 501 });
     const existing = this.objects.get(key);
     const respond = (o: StoredObject, body: boolean) => {
       const h = new Headers({ etag: o.etag, "x-amz-version-id": o.version, "content-length": String(o.body.byteLength), "content-type": o.contentType, "last-modified": new Date(0).toUTCString() });
