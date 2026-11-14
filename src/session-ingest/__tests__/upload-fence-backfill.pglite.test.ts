@@ -548,6 +548,53 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     expect(await fenceOf(store, B)).toBeNull();
   });
 
+  test("owner and fence reads retry a transient store failure; a lasting one is counted by its code", async () => {
+    // getObject fails `budget` times per key with `code`, for owner stubs and fences only.
+    const flaky = (code: "transient" | "unauthorized", budget: number, fences = true) => {
+      const base = scratch(), left = new Map<string, number>();
+      const store = new Proxy(base, {
+        get(target, prop) {
+          if (prop === "getObject") return async (...a: Parameters<ObjectStore["getObject"]>) => {
+            const k = String(a[0]);
+            if (k.includes("/s=") || (fences && k.endsWith("upload-fences.json"))) {
+              const n = left.get(k) ?? budget;
+              if (n > 0) { left.set(k, n - 1); throw new ObjectStoreError(code, "fs", "flaky"); }
+            }
+            return target.getObject(...a);
+          };
+          const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+          return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+        },
+      });
+      return store;
+    };
+    await own(A, "origin-1", "claude", "sess-1");
+    await own(A, "origin-1", "claude", "sess-2");
+    const dry = (store: ObjectStore) => backfillUploadFences({ sql: recordingSql([]), store, keyRoot: ROOT, dryRun: true, sleep: async () => {}, sections: ["ownership"] });
+    // Two transient failures per key, then success: nothing failed, the section complete.
+    const ok = await dry(flaky("transient", 2));
+    expect(ok.ownership).toMatchObject({ rows: 2, would_register: 2, failed: 0, skipped_no_fence: 0, failed_codes: {} });
+    expect(ok.sections.ownership).toBe("complete");
+    // Past the attempt budget: counted by code, the section incomplete.
+    const owners = flaky("transient", 0), stuck = new Proxy(owners, {
+      get(target, prop) {
+        if (prop === "getObject") return async (...a: Parameters<ObjectStore["getObject"]>) => {
+          if (String(a[0]).includes("/s=")) throw new ObjectStoreError("transient", "fs", "down");
+          return target.getObject(...a);
+        };
+        const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    const bad = await dry(stuck);
+    expect(bad.ownership).toMatchObject({ failed: 2, failed_codes: { ledger_store_transient: 2 } });
+    expect(bad.sections.ownership).toBe("incomplete");
+    // Not retryable (unauthorized) on the owner read: one attempt, counted under its own code. (A failed FENCE read
+    // leaves the user without a fence instead: skipped_no_fence, incomplete either way.)
+    const denied = await dry(flaky("unauthorized", 1, false));
+    expect(denied.ownership).toMatchObject({ failed: 2, failed_codes: { ledger_store_unauthorized: 2 } });
+  });
+
   test("a contended fence CAS retries and lands; tallies count once", async () => {
     const base = scratch();
     let fail = 1;

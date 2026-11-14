@@ -93,7 +93,9 @@ export interface BackfillSummary {
     unreadable: number; contended: number; tenant_invalid: number; input_invalid: number; failed: number;
     resets_in_flight: number;
   };
-  ownership: { rows: number; registered: number; would_register: number; unchanged: number; skipped_deleted: number; skipped_no_fence: number; invalid: number; failed: number };
+  ownership: { rows: number; registered: number; would_register: number; unchanged: number; skipped_deleted: number; skipped_no_fence: number; invalid: number; failed: number;
+    /** `failed` by error code (fixed lowercase codes, never a message): the receipt says why, not just how many. */
+    failed_codes: Record<string, number> };
   revisions: {
     rows: number; seed_rows: number;
     slot_rows: number; slots_empty: number;
@@ -206,6 +208,9 @@ ORDER BY org_id, workspace_id, origin_id, record_id
 LIMIT $6::int`;
 
 const userKey = (o: unknown, w: unknown, u: unknown) => JSON.stringify([o, w, u]);
+/** Attempts per store read (see storeRetry), and the store failures worth retrying (network, 408, 429, 5xx). */
+const STORE_READ_ATTEMPTS = 5;
+const RETRYABLE_STORE_CODES = new Set(["ledger_store_transient", "ledger_store_backend"]);
 const text = (v: unknown): string => {
   if (typeof v !== "string") throw new Error("backfill_row_invalid");
   return v;
@@ -326,7 +331,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     mode: opts.dryRun ? "dry_run" : "execute", users: 0,
     fences: { deletion_rows: 0, reset_rows: 0, created: 0, updated: 0, unchanged: 0, would_create: 0, would_update: 0, pairs_added: 0, resets_added: 0,
       deletions_superseded: 0, deletions_unproven: 0, cold_resets: 0, needs_review: 0, unreadable: 0, contended: 0, tenant_invalid: 0, input_invalid: 0, failed: 0, resets_in_flight: 0 },
-    ownership: { rows: 0, registered: 0, would_register: 0, unchanged: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, failed: 0 },
+    ownership: { rows: 0, registered: 0, would_register: 0, unchanged: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, failed: 0, failed_codes: {} },
     revisions: { rows: 0, seed_rows: 0, slot_rows: 0, slots_empty: 0, merged: 0, would_merge: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, shards: 0, failed: 0 },
     sections: { fences: "not_run", ownership: "not_run", revisions: "not_run" },
   };
@@ -357,6 +362,34 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     }
   }
   const readOnly = async (query: string, params: unknown[]) => (await readOnlyAll([[query, params]]))[0]!;
+
+  /** A failure's code for the receipt: the error's own short code, lowercased; never its message. */
+  const failureCode = (error: unknown): string => {
+    const raw = (error as { code?: unknown })?.code;
+    const code = typeof raw === "string" ? raw.toLowerCase().replace(/[^a-z0-9_]/g, "_").slice(0, 40) : "";
+    return /^[a-z]/.test(code) ? code : "error";
+  };
+  const failOwner = (code: string) => {
+    summary.ownership.failed++;
+    summary.ownership.failed_codes[code] = (summary.ownership.failed_codes[code] ?? 0) + 1;
+  };
+  /**
+   * A READ from the store, retried with backoff on a transient store failure (a 503, a reset, a timeout), up to
+   * STORE_READ_ATTEMPTS: one transient GET in tens of thousands must not leave the section incomplete. Anything else
+   * (an invalid document, a refused key) is not retried. Writes are not retried here (their CAS has its own rules).
+   */
+  const storeRetry = async <R>(read: () => Promise<R>): Promise<R> => {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await read();
+      } catch (error) {
+        const code = (error as { code?: unknown })?.code;
+        if (attempt + 1 >= STORE_READ_ATTEMPTS || !RETRYABLE_STORE_CODES.has(code as string)) throw error;
+        await io.backoff(attempt);
+      }
+    }
+  };
+  /** Register one session's owner stub (the reset's scope): from the ownership page or an owned lazy slot. */
 
   /**
    * SQL's controls for a page of users: deletions and resets in ONE read-only snapshot (third review), so a reset is
@@ -390,7 +423,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     const uk = userKey(tenant.orgId, tenant.workspaceId, tenant.userId);
     if (!cache.has(uk)) cache.set(uk, (async () => {
       try {
-        const read = await io.readFence(io.keysFor(tenant).fence);
+        const read = await storeRetry(() => io.readFence(io.keysFor(tenant).fence));
         if (read.state === "present") return read.fence;
         if (!opts.dryRun) return null;
         const st = (await controlsFor([[tenant.orgId, tenant.workspaceId, tenant.userId]])).get(uk)!;
@@ -479,7 +512,6 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   }
 
   // ---- ownership ----
-  /** Register one session's owner stub (the reset's scope): from the ownership page or an owned lazy slot. */
   const ownRow = async (r: Record<string, unknown>, fences: Map<string, Promise<FenceDoc | null>>) => {
     summary.ownership.rows++;
     if (!id(r.org_id) || !id(r.user_id) || typeof r.workspace_id !== "string" || !id(r.origin_id) || !id(r.source) || !id(r.session_id)) { summary.ownership.invalid++; return; }
@@ -488,17 +520,23 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     if (!fence) { summary.ownership.skipped_no_fence++; return; }
     if (isDeleted(fence, r.origin_id, r.source, r.session_id)) { summary.ownership.skipped_deleted++; return; }
     const [, epoch, resets] = recordGeneration(fence, r.origin_id, r.source, r.session_id);
+    let key: string, machineId: string;
     try {
-      const key = io.keysFor(tenant).owner(r.origin_id, r.source, r.session_id);
-      const stored = (await io.readOwner(key))?.doc;
-      const machineId = liveMachineId(r.workspace_id, r.origin_id, r.user_id);
+      key = io.keysFor(tenant).owner(r.origin_id, r.source, r.session_id);
+      machineId = liveMachineId(r.workspace_id, r.origin_id, r.user_id);
+    } catch {
+      failOwner("key_invalid");
+      return;
+    }
+    try {
+      const stored = (await storeRetry(() => io.readOwner(key)))?.doc;
       if (stored && stored.epoch >= epoch && stored.machineId !== undefined) { summary.ownership.unchanged++; return; }
       if (opts.dryRun) { summary.ownership.would_register++; return; }
       // The writer machine, as admission stamps it: the re-arm sweeper binds markers to it.
       await io.registerOwner(key, { v: 1, originId: r.origin_id, source: r.source, sessionId: r.session_id, epoch, resets, machineId });
       summary.ownership.registered++;
-    } catch {
-      summary.ownership.failed++;
+    } catch (error) {
+      failOwner(failureCode(error));
     }
   };
   /**
