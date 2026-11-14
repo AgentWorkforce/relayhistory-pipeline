@@ -938,3 +938,93 @@ test("unset canonical record policy retains main's version-9 and foreign-family 
   await expect(canonicalSnapshot({...deps,readerMaxRuleset:8},identity)).rejects.toMatchObject({reason:"canonical_projection_incomplete"});
  }
 });
+
+/** READ_API_CANONICAL_FETCH_CONCURRENCY (CanonicalDeps.fetchConcurrency, bounded-prefetch.ts). */
+const fetchRecord = (i: number) => ({
+  kind: "session_event",
+  origin_id: "origin",
+  record_id: `r${i}`,
+  revision: "1",
+  operation: "upsert",
+  received_at: AT,
+  payload: { ts_ms: Date.parse(AT) + i, text: `turn ${i}`, role: i % 2 ? "assistant" : "user", message_id: `msg-${i}` },
+});
+/** deps over a store whose chunk reads take a few ms and are counted (peak in flight, total started). */
+function slowChunkDeps(base: CanonicalDeps, fetchConcurrency: number | undefined, abort?: AbortSignal) {
+  const state = { inFlight: 0, peak: 0, started: 0 };
+  const store = new Proxy(base.store, {
+    get(target, prop) {
+      const v = Reflect.get(target, prop);
+      if (prop !== "getObject") return typeof v === "function" ? v.bind(target) : v;
+      return async (...args: Parameters<typeof target.getObject>) => {
+        if (!String(args[0]).endsWith(".zst")) return target.getObject(...args);
+        state.started++;
+        state.peak = Math.max(state.peak, ++state.inFlight);
+        try {
+          await new Promise((r) => setTimeout(r, 2));
+          // Stands in for the per-request fetch bound to the route's deadline signal (service-canonical.ts).
+          abort?.throwIfAborted();
+          return await target.getObject(...args);
+        } finally { state.inFlight--; }
+      };
+    },
+  });
+  return { state, deps: { ...base, store, ...(fetchConcurrency !== undefined ? { fetchConcurrency } : {}) } as CanonicalDeps };
+}
+test("fetchConcurrency 8 over 48 chunks: identical rows to the sequential read, at most 8 chunk reads in flight", async () => {
+  await replaceCanonicalChunks(Array.from({ length: 48 }, (_, c) => [fetchRecord(2 * c), fetchRecord(2 * c + 1)]));
+  const seq = slowChunkDeps(deps, undefined), one = slowChunkDeps(deps, 1), par = slowChunkDeps(deps, 8);
+  const sequential = await canonicalSnapshot(seq.deps, identity);
+  expect(sequential.rows.filter((r) => r.table === "convergence_events")).toHaveLength(96);
+  expect(seq.state.peak).toBe(1);
+  expect(await canonicalSnapshot(one.deps, identity)).toEqual(sequential);
+  expect(one.state.peak).toBe(1);
+  expect(await canonicalSnapshot(par.deps, identity)).toEqual(sequential);
+  expect(par.state.peak).toBeGreaterThan(1);
+  expect(par.state.peak).toBeLessThanOrEqual(8);
+  expect(par.state.started).toBe(48);
+});
+test("fetchConcurrency 8: a digest-mismatched middle chunk refuses with the sequential read's code; no unhandled rejection", async () => {
+  await replaceCanonicalChunks(Array.from({ length: 40 }, (_, c) => [fetchRecord(c)]));
+  const m: any = await new Response(await deps.store.get(objectKey(manifestKey(location)))).json();
+  const c = m.raw.chunks[20];
+  await deps.store.put(rawChunkKey(location, c.seq, c.start_offset, c.sha256, "ndjson"), new Uint8Array(zstdCompressSync(new TextEncoder().encode("{}\n"))), {});
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const sequential = await canonicalSnapshot(deps, identity).catch((e) => e);
+    expect(sequential).toMatchObject({ reason: "canonical_projection_incomplete", details: ["chunk_digest_mismatch"] });
+    const par = slowChunkDeps(deps, 8);
+    const parallel = await canonicalSnapshot(par.deps, identity).catch((e) => e);
+    expect(parallel).toBeInstanceOf(CanonicalReadError);
+    expect({ reason: parallel.reason, status: parallel.status, details: parallel.details }).toEqual({ reason: sequential.reason, status: sequential.status, details: sequential.details });
+    // Chunk 20 refused: chunks past the window were never requested.
+    expect(par.state.started).toBeLessThanOrEqual(21 + 7);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(par.state.inFlight).toBe(0);
+    expect(unhandled).toEqual([]);
+  } finally { process.off("unhandledRejection", onUnhandled); }
+});
+test("fetchConcurrency 8: an aborted request stops the read as the sequential one does, starting no further chunk reads", async () => {
+  await replaceCanonicalChunks(Array.from({ length: 40 }, (_, c) => [fetchRecord(c)]));
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    for (const n of [undefined, 8]) {
+      const controller = new AbortController();
+      const run = slowChunkDeps(deps, n, controller.signal);
+      const pending = canonicalSnapshot(run.deps, identity).catch((e) => e);
+      setTimeout(() => controller.abort(), 12);
+      // The sequential reader maps a failed chunk read to the retryable chunk_unavailable (the route answers its deadline).
+      expect(await pending).toMatchObject({ code: "chunk_unavailable", retryable: true });
+      const started = run.state.started;
+      expect(started).toBeLessThan(40);
+      await new Promise((r) => setTimeout(r, 30));
+      expect(run.state.started).toBe(started);
+      expect(run.state.inFlight).toBe(0);
+    }
+    expect(unhandled).toEqual([]);
+  } finally { process.off("unhandledRejection", onUnhandled); }
+});
