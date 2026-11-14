@@ -170,6 +170,64 @@ function overlapShape(profile: Record<string, unknown>): string | undefined {
   return value;
 }
 
+/**
+ * Decision 0005 cutover controls. They ride on whatever rollout phase is live and never select one:
+ *   s3FenceMirror             "on" only (omit for off): INGEST_S3_FENCE_MIRROR, the fence-authority marker's
+ *                             controlMirror precondition.
+ *   httpAdmissionStoppedOrgs  a non-empty list of distinct lowercase org UUIDs (omit for none):
+ *                             INGEST_HTTP_ADMISSION_STOPPED_ORGS, the marker's workerHttpAdmission "off" precondition.
+ * Neither is ever tracked in config/cloudflare/private-ingest-production.json (public repository): CI supplies them
+ * from the protected environment's variables (privateIngestCutoverFromEnv), as it supplies kmsKeyArn.
+ */
+export const PRIVATE_INGEST_CUTOVER_KEYS = ["s3FenceMirror", "httpAdmissionStoppedOrgs"] as const;
+export type PrivateIngestCutover = { s3FenceMirror?: "on"; httpAdmissionStoppedOrgs?: string[] };
+const STOPPED_ORG = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+
+function checkedCutover(profile: Record<string, unknown>, live = false): PrivateIngestCutover {
+  const mirror = profile.s3FenceMirror, orgs = profile.httpAdmissionStoppedOrgs;
+  if (mirror !== undefined && mirror !== "on")
+    privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_fence_mirror");
+  if (orgs !== undefined && (!Array.isArray(orgs) || orgs.length === 0 || new Set(orgs).size !== orgs.length ||
+      orgs.some((org) => typeof org !== "string" || !STOPPED_ORG.test(org))))
+    privateIngestRefuse(live ? "private_ingest_live_cutover" : "private_ingest_profile_stopped_orgs");
+  return {
+    ...(mirror === "on" ? { s3FenceMirror: "on" as const } : {}),
+    ...(orgs === undefined ? {} : { httpAdmissionStoppedOrgs: [...(orgs as string[])] }),
+  };
+}
+
+/**
+ * The cutover controls from the protected environment's variables. Unset or empty: the control is off.
+ *   PRIVATE_INGEST_S3_FENCE_MIRROR             "on" or unset/empty; anything else refuses.
+ *   PRIVATE_INGEST_HTTP_ADMISSION_STOPPED_ORGS comma-separated org UUIDs or unset/empty; whitespace around an
+ *                                              entry is not accepted, so a typo never silently drops an org.
+ */
+export function privateIngestCutoverFromEnv(env: Record<string, string | undefined>): PrivateIngestCutover {
+  const mirror = env.PRIVATE_INGEST_S3_FENCE_MIRROR ?? "", orgs = env.PRIVATE_INGEST_HTTP_ADMISSION_STOPPED_ORGS ?? "";
+  if (mirror !== "" && mirror !== "on") privateIngestRefuse("private_ingest_profile_fence_mirror");
+  return checkedCutover({
+    ...(mirror === "on" ? { s3FenceMirror: "on" } : {}),
+    ...(orgs === "" ? {} : { httpAdmissionStoppedOrgs: orgs.split(",") }),
+  });
+}
+
+/** The cutover controls a live version carries (its plain-text INGEST_* bindings), shape-checked. */
+function liveCutover(version: CloudflareWorkerVersion): PrivateIngestCutover {
+  const bindings = Array.isArray(version.resources?.bindings) ? version.resources.bindings : [];
+  const text = (name: string) => {
+    const rows = bindings.filter((binding) => binding.name === name);
+    if (rows.length === 0) return undefined;
+    if (rows.length !== 1 || rows[0]!.type !== "plain_text" || typeof rows[0]!.text !== "string")
+      privateIngestRefuse("private_ingest_live_cutover");
+    return rows[0]!.text as string;
+  };
+  const mirror = text("INGEST_S3_FENCE_MIRROR"), orgs = text("INGEST_HTTP_ADMISSION_STOPPED_ORGS");
+  return checkedCutover({
+    ...(mirror === undefined ? {} : { s3FenceMirror: mirror }),
+    ...(orgs === undefined ? {} : { httpAdmissionStoppedOrgs: orgs.split(",") }),
+  }, true);
+}
+
 const KMS_ARN = /^arn:aws:kms:us-east-1:[0-9]{12}:key\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 /** Exact tracked production profile. A newly added stack option is off until this contract reviews it. */
@@ -193,9 +251,11 @@ export function privateIngestReleasePhase(
     "asyncAdmission",
     "syncAdmissionFrozenReceipt",
     "overlapGeneration",
+    ...PRIVATE_INGEST_CUTOVER_KEYS,
   ]);
   if (Object.keys(profile).some((key) => !allowed.has(key)))
     privateIngestRefuse("private_ingest_profile_extra");
+  checkedCutover(profile);
   if (overlap !== undefined) {
     if (c.overlap === null) privateIngestRefuse("private_ingest_profile_overlap_unreviewed");
     // The pair is only offered while the reviewed expected generation is still G.
@@ -446,13 +506,18 @@ export function privateIngestTransitionReadback(
     privateIngestRefuse("private_ingest_live_undeclared_overlap");
   const label = (generation: string): PrivateIngestGenerationState =>
     c.overlap === null || generation === c.overlap.from ? "G" : "H";
+  // The cutover controls are orthogonal to the rollout phase: the live ones join every candidate, so the
+  // phase is read the same with or without them, and a deploy may add, change or remove them freely.
+  const cutover = liveCutover(version);
+  const withCutover = (profile: CloudflareStageInputs): CloudflareStageInputs =>
+    ({ ...profile, sessionIngest: { ...profile.sessionIngest, ...cutover } });
   const candidates: Array<[PrivateIngestBasePhase, PrivateIngestGenerationState, boolean, CloudflareStageInputs]> = [];
   for (const base of BASE_PHASES) {
-    candidates.push([base, label(c.generation), false, profileFor(base, kmsKeyArn, c.generation)]);
+    candidates.push([base, label(c.generation), false, withCutover(profileFor(base, kmsKeyArn, c.generation))]);
     if (c.overlap !== null) {
       const other = c.generation === c.overlap.from ? c.overlap.to : c.overlap.from;
-      candidates.push([base, label(other), false, profileFor(base, kmsKeyArn, other)]);
-      candidates.push([base, "G+H", true, profileFor(base, kmsKeyArn, c.overlap.from, c.overlap.to)]);
+      candidates.push([base, label(other), false, withCutover(profileFor(base, kmsKeyArn, other))]);
+      candidates.push([base, "G+H", true, withCutover(profileFor(base, kmsKeyArn, c.overlap.from, c.overlap.to))]);
     }
   }
   const matches = candidates.filter(([, , , candidate]) => {

@@ -328,6 +328,16 @@ function operatorBindingRenderDiagnostic(
     expectedBindings: bindings.map(({ sid, action }) => ({ sid, action })),
   };
 }
+/**
+ * The retained artifact of a public repository never lists production org ids: the decision 0005 stop list
+ * (protected-environment variable, never tracked) is reduced to its count. The digests bind the unredacted inputs.
+ */
+export function redactStoppedOrgs(sessionIngest: Record<string, unknown>): Record<string, unknown> {
+  const orgs = sessionIngest.httpAdmissionStoppedOrgs;
+  return Array.isArray(orgs)
+    ? { ...sessionIngest, httpAdmissionStoppedOrgs: `redacted: ${orgs.length} org(s) from the protected environment` }
+    : sessionIngest;
+}
 export function operatorSafePlans(
   plans: OperatorPlans,
   secrets: OperatorSecrets,
@@ -1519,7 +1529,7 @@ export async function operatorMain(argv = process.argv.slice(2)) {
       [
         "inputs.sanitized.json",
         JSON.stringify(
-          { sessionIngest: JSON.parse(inputText).sessionIngest },
+          { sessionIngest: redactStoppedOrgs(JSON.parse(inputText).sessionIngest) },
           null,
           2,
         ) + "\n",

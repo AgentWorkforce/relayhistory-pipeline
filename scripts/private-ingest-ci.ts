@@ -7,7 +7,9 @@ import { inputsDigest } from "../stacks/aws/deploy-guard.ts";
 import { EXECUTION_EXCEPTION } from "./private-ingest-operator.ts";
 import {
   PRIVATE_INGEST_RELEASE as P,
+  PRIVATE_INGEST_CUTOVER_KEYS,
   privateIngestActiveVersion,
+  privateIngestCutoverFromEnv,
   privateIngestRefuse,
   privateIngestReleasePhase,
   privateIngestReleaseInputs,
@@ -45,8 +47,13 @@ function trackedInput(): { text: string; input: CloudflareStageInputs } {
   if (tracked.approval !== undefined) privateIngestRefuse("private_ingest_tracked_approval");
   if (Object.hasOwn(tracked.sessionIngest as object, "kmsKeyArn"))
     privateIngestRefuse("private_ingest_tracked_target");
+  // The decision 0005 cutover controls name production orgs, so they are never tracked (public repository):
+  // the protected environment's variables supply them, like the KMS target.
+  if (PRIVATE_INGEST_CUTOVER_KEYS.some((key) => Object.hasOwn(tracked.sessionIngest as object, key)))
+    privateIngestRefuse("private_ingest_tracked_cutover");
   const kmsKeyArn = process.env.PRIVATE_INGEST_KMS_KEY_ARN ?? "";
-  const input = { ...tracked, sessionIngest: { ...tracked.sessionIngest, kmsKeyArn } };
+  const cutover = privateIngestCutoverFromEnv(process.env);
+  const input = { ...tracked, sessionIngest: { ...tracked.sessionIngest, kmsKeyArn, ...cutover } };
   const text = JSON.stringify(input, null, 2) + "\n";
   assertCloudflareStage("cf-sessions-prod", "plan", input, {
     CLOUDFLARE_ACCOUNT_ID: P.accountId,

@@ -2,8 +2,9 @@ name: deploy private-ingest worker
 run-name: private-ingest ${{ inputs.mode }} ${{ inputs.sha }}
 
 # Production deploys are CI-only. The desired profile lives in
-# config/cloudflare/private-ingest-production.json plus the protected environment target; workflow
-# inputs cannot alter either. A deploy
+# config/cloudflare/private-ingest-production.json plus the protected environment's variables (the KMS
+# target and the decision 0005 cutover controls, which name production orgs and are never tracked);
+# workflow inputs cannot alter either. A deploy
 # consumes a successful plan artifact from this exact main SHA, re-plans against live Alchemy
 # state, refuses drift/collateral binding changes, applies once, then verifies the current
 # deployment's sole 100% Worker version and its complete INGEST_* profile.
@@ -79,6 +80,11 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: f7232cb80f6fab86a95426302af243e4
       PRIVATE_INGEST_STATE_URL: ${{ vars.PRIVATE_INGEST_STATE_URL }}
       PRIVATE_INGEST_KMS_KEY_ARN: ${{ vars.PRIVATE_INGEST_KMS_KEY_ARN }}
+      # Decision 0005 cutover controls (private-ingest-release.ts privateIngestCutoverFromEnv). Unset or empty = off.
+      # Protected-environment variables, never tracked: the org list names production tenants. A plan and its
+      # deploy bind the same values through the staged inputs digest.
+      PRIVATE_INGEST_S3_FENCE_MIRROR: ${{ vars.PRIVATE_INGEST_S3_FENCE_MIRROR }}
+      PRIVATE_INGEST_HTTP_ADMISSION_STOPPED_ORGS: ${{ vars.PRIVATE_INGEST_HTTP_ADMISSION_STOPPED_ORGS }}
     steps:
       - uses: actions/checkout@v4
         with:
