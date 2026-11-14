@@ -365,7 +365,9 @@ only) and keep it below the ingress/proxy read timeout (stock ingress-nginx is 6
 first. On an object store with per-object latency (GCS, remote S3), also set `READ_API_CANONICAL_FETCH_CONCURRENCY`
 (1..16, default 1; 8 is recommended) so up to that many chunks are fetched at once while they are still processed
 in manifest order; it holds up to that many chunk bodies (each at most 16 MiB stored) at once, so keep the pod
-memory limit in step. The hosted Worker/Lambda deadline stays 3000 ms and their chunk reads stay sequential.
+memory limit in step. The session-brief worker's transcript source reads the same variable through
+`serviceCanonicalDeps` (`src/session-brief/canonical-input.ts`), where a bad value fails the first brief rather than
+startup, like the other `READ_API_CANONICAL_*` settings. The hosted Worker/Lambda deadline stays 3000 ms and their chunk reads stay sequential.
 
 `SESSION_ERASE_BYTES_ENABLED` is the one exception to the `true` rule above:
 the operator-erase contract fixes the literal `1`. `true` is not accepted; it
