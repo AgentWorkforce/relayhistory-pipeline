@@ -10,13 +10,17 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && format('backlog ops {0
 # --start-after: a rerun is safe because the drain skips objects it already marked. The optional org scope is the
 # environment SECRET BACKLOG_OPS_ORGS (a secret, not a variable, so this public repository's logs mask it): unset or
 # empty runs every org; an execute refuses unless its bound runs carry the same scope (src/session-ingest/backlog-ops.ts).
+# presence-dry is DRY ONLY (no presence-execute exists or is accepted): a counts-only look at ONE session for support
+# diagnosis, in the dry environment with the read-only role. Its session id is the dry environment's SECRET
+# SESSION_PRESENCE_SESSION, set by the owner before the dispatch and removed after it, passed only to the tool step
+# and only for this mode; it never reaches argv, a log line or the receipt (docs/backlog-ops-workflow.md).
 # Push and pull_request run only the credential-free tests (no secrets, no environment).
 on:
   workflow_dispatch:
     inputs:
       mode:
         type: choice
-        options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute]
+        options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute, presence-dry]
         default: backfill-dry
         required: true
       sha:
@@ -49,6 +53,9 @@ on:
       - scripts/backlog-ops*.ts
       - src/session-ingest/backlog-ops.ts
       - src/session-ingest/__tests__/backlog-ops*
+      - scripts/session-presence.ts
+      - src/session-ingest/session-presence.ts
+      - src/session-ingest/__tests__/session-presence*
   push:
     branches: [main]
     paths:
@@ -56,6 +63,9 @@ on:
       - scripts/backlog-ops*.ts
       - src/session-ingest/backlog-ops.ts
       - src/session-ingest/__tests__/backlog-ops*
+      - scripts/session-presence.ts
+      - src/session-ingest/session-presence.ts
+      - src/session-ingest/__tests__/session-presence*
 
 permissions:
   contents: read
@@ -97,6 +107,10 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Contract, gate and workflow tests (no credentials)
         run: bun test --timeout 120000 ./src/session-ingest/__tests__/backlog-ops.test.ts
+      - name: Session presence counts and no-id-leak tests (in-process PGlite, no credentials)
+        run: |
+          bun test --timeout 300000 ./src/session-ingest/__tests__/session-presence.test.ts
+          bun test --timeout 300000 ./src/session-ingest/__tests__/session-presence.pglite.test.ts
 
   # No environment here: a typo/missing environment must not auto-create an unprotected one.
   prerequisite-gate:
@@ -182,10 +196,12 @@ jobs:
       # job's other steps (checkout, setup-bun, install, gate, download-artifact) could request a token too. That is
       # why only this job has id-token: write, the write role trusts only the execute environment's subject, and
       # every action is first-party. Bucket, region, key and role ARNs are the environment's protected variables. The
-      # URL reaches the tool only over its stdin pipe; the role session only in the tool's environment.
+      # URL reaches the tool only over its stdin pipe; the role session only in the tool's environment. The presence
+      # session id is given to this step only, for presence-dry only, and reaches the tool on the same stdin pipe.
       - name: Run the backlog tool (the only step holding the DB secret or the role session)
         env:
-          SUPABASE_MIGRATION_OWNER_URL: ${{ (startsWith(inputs.mode, 'backfill-') || startsWith(inputs.mode, 'export-')) && secrets.SUPABASE_MIGRATION_OWNER_URL || '' }}
+          SUPABASE_MIGRATION_OWNER_URL: ${{ (startsWith(inputs.mode, 'backfill-') || startsWith(inputs.mode, 'export-') || inputs.mode == 'presence-dry') && secrets.SUPABASE_MIGRATION_OWNER_URL || '' }}
+          SESSION_PRESENCE_SESSION: ${{ inputs.mode == 'presence-dry' && secrets.SESSION_PRESENCE_SESSION || '' }}
           BACKLOG_OPS_BUCKET: ${{ vars.BACKLOG_OPS_BUCKET }}
           BACKLOG_OPS_REGION: ${{ vars.BACKLOG_OPS_REGION }}
           BACKLOG_OPS_KMS_KEY_ARN: ${{ vars.BACKLOG_OPS_KMS_KEY_ARN }}
