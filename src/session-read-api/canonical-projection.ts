@@ -1,6 +1,6 @@
 /** Shared canonical S3 reader/projection. The live CH writer and read Worker
  * invoke this same implementation; neither maintains a shadow event mapping. */
-import { assertReaderScrubMarker, readerChunkBody } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
+import { assertReaderScrubMarker } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { canonicalDirectoryValues } from "./canonical-directory-values.ts";
 import { createHash } from "node:crypto";
 import {
@@ -25,10 +25,8 @@ import {
   type ManifestV1,
   type ObjectStore,
 } from "../../packages/object-store/src/index.ts";
-import {
-  readCapped,
-  type ManifestReader,
-} from "../../packages/pipeline/src/lib/pipeline/adapter.ts";
+import { type ManifestReader } from "../../packages/pipeline/src/lib/pipeline/adapter.ts";
+import { boundedPrefetch, readChunkBody } from "./bounded-prefetch.ts";
 import {
   toIndexRow,
   type IndexRow,
@@ -60,6 +58,8 @@ interface SearchIndexDeps {
   store: ObjectStore;
   prefixFor: (orgId: string) => string;
   decompress: (stored: Uint8Array, maxBytes: number) => Uint8Array;
+  /** Self-host READ_API_CANONICAL_FETCH_CONCURRENCY (CanonicalDeps.fetchConcurrency); absent: 1, sequential. */
+  fetchConcurrency?: number;
 }
 interface SearchIndexLimits {
   maxScopeBytes: number;
@@ -102,14 +102,21 @@ export async function readManifestRecords(
   decompress: (stored: Uint8Array, maxOutputLength: number) => Uint8Array,
   maxRecords = Number.POSITIVE_INFINITY,
   maximum?: number,
+  fetchConcurrency = 1,
 ): Promise<RelayhistoryStreamRecord[]> {
   const rows: RelayhistoryStreamRecord[] = [];
-  for await (const row of streamManifestRecords(manifest, store, prefix, decompress, maxRecords, maximum))
+  for await (const row of streamManifestRecords(manifest, store, prefix, decompress, maxRecords, maximum, fetchConcurrency))
     rows.push(row);
   return rows;
 }
 
-/** Bounded chunk-by-chunk reader; proofs need not retain full session payloads. */
+/**
+ * Bounded chunk-by-chunk reader; proofs need not retain full session payloads.
+ * fetchConcurrency (self-host READ_API_CANONICAL_FETCH_CONCURRENCY via
+ * SearchIndexDeps; default 1 = strictly sequential, as before) prefetches up to
+ * that many chunk bodies (bounded-prefetch.ts); every check below still runs per
+ * chunk in manifest order, so the first failing chunk refuses with the same code.
+ */
 export async function* streamManifestRecords(
   manifest: ManifestV1,
   store: ObjectStore,
@@ -117,6 +124,7 @@ export async function* streamManifestRecords(
   decompress: (stored: Uint8Array, maxOutputLength: number) => Uint8Array,
   maxRecords = Number.POSITIVE_INFINITY,
   maximum?: number,
+  fetchConcurrency = 1,
 ): AsyncGenerator<RelayhistoryStreamRecord> {
   assertReaderScrubMarker(manifest.raw.scrub, maximum);
   if (manifest.raw.format !== "ndjson")
@@ -126,83 +134,92 @@ export async function* streamManifestRecords(
       false,
     );
   let records = 0;
-  for (const { entry, key } of chunkKeys(manifest, { prefix })) {
-    if (
-      entry.stored_bytes > MAX_CHUNK_BYTES ||
-      (entry.stored_raw_bytes ?? entry.bytes) > MAX_CHUNK_BYTES
-    )
-      throw new PipelineError(
-        "chunk_too_large",
-        "a raw chunk exceeds the index limit",
-        false,
-      );
-    let stored: Uint8Array | null;
-    try {
-      stored = await readCapped(await readerChunkBody(await store.getObject(key), manifest.raw.scrub, maximum), entry.stored_bytes);
-    } catch (error) {
-      if (error instanceof PipelineError) throw error;
-      if ((error as { code?: unknown } | null)?.code === "not_found")
+  const chunks = chunkKeys(manifest, { prefix });
+  const tooLarge = (entry: (typeof chunks)[number]["entry"]) =>
+    entry.stored_bytes > MAX_CHUNK_BYTES ||
+    (entry.stored_raw_bytes ?? entry.bytes) > MAX_CHUNK_BYTES;
+  // An oversized chunk is never fetched (null); the loop refuses it at its position.
+  const bodies = boundedPrefetch(chunks, fetchConcurrency, ({ entry, key }, stop) =>
+    tooLarge(entry) ? Promise.resolve(null) : readChunkBody(store, key, manifest.raw.scrub, maximum, entry.stored_bytes, stop));
+  try {
+    for (const { entry } of chunks) {
+      if (tooLarge(entry))
         throw new PipelineError(
-          "chunk_missing",
-          "a listed raw chunk is missing",
+          "chunk_too_large",
+          "a raw chunk exceeds the index limit",
+          false,
+        );
+      let stored: Uint8Array | null;
+      try {
+        stored = (await bodies.next()).value ?? null;
+      } catch (error) {
+        if (error instanceof PipelineError) throw error;
+        if ((error as { code?: unknown } | null)?.code === "not_found")
+          throw new PipelineError(
+            "chunk_missing",
+            "a listed raw chunk is missing",
+            true,
+          );
+        throw new PipelineError(
+          "chunk_unavailable",
+          "a raw chunk read failed",
           true,
         );
-      throw new PipelineError(
-        "chunk_unavailable",
-        "a raw chunk read failed",
-        true,
-      );
-    }
-    if (
-      !stored ||
-      stored.byteLength !== entry.stored_bytes ||
-      sha256(stored) !== entry.stored_sha256
-    )
-      throw new PipelineError(
-        "chunk_digest_mismatch",
-        "a raw chunk has the wrong stored digest",
-        false,
-      );
-    let raw: Uint8Array;
-    try {
-      raw = decompress(stored, entry.stored_raw_bytes ?? MAX_CHUNK_BYTES);
-    } catch (error) {
-      if (error instanceof PipelineError) throw error;
-      throw new PipelineError(
-        "chunk_decompress_failed",
-        "a raw chunk is not valid zstd",
-        false,
-      );
-    }
-    if (entry.raw_sha256 && sha256(raw) !== entry.raw_sha256)
-      throw new PipelineError(
-        "chunk_digest_mismatch",
-        "a raw chunk has the wrong raw digest",
-        false,
-      );
-    let text: string;
-    try {
-      text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
-        raw,
-      );
-    } catch {
-      throw new PipelineError(
-        "chunk_not_utf8",
-        "a raw chunk is not UTF-8",
-        false,
-      );
-    }
-    for (const line of text.split("\n"))
-      if (line) {
-        if (records >= maxRecords)
-          throw new PipelineError(
-            "scope_too_large",
-            "actual canonical record count exceeds scope limit",
-            false,
-          );
-        records += 1;
-        yield parseRelayhistoryRecord(line);
       }
+      if (
+        !stored ||
+        stored.byteLength !== entry.stored_bytes ||
+        sha256(stored) !== entry.stored_sha256
+      )
+        throw new PipelineError(
+          "chunk_digest_mismatch",
+          "a raw chunk has the wrong stored digest",
+          false,
+        );
+      let raw: Uint8Array;
+      try {
+        raw = decompress(stored, entry.stored_raw_bytes ?? MAX_CHUNK_BYTES);
+      } catch (error) {
+        if (error instanceof PipelineError) throw error;
+        throw new PipelineError(
+          "chunk_decompress_failed",
+          "a raw chunk is not valid zstd",
+          false,
+        );
+      }
+      if (entry.raw_sha256 && sha256(raw) !== entry.raw_sha256)
+        throw new PipelineError(
+          "chunk_digest_mismatch",
+          "a raw chunk has the wrong raw digest",
+          false,
+        );
+      let text: string;
+      try {
+        text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(
+          raw,
+        );
+      } catch {
+        throw new PipelineError(
+          "chunk_not_utf8",
+          "a raw chunk is not UTF-8",
+          false,
+        );
+      }
+      for (const line of text.split("\n"))
+        if (line) {
+          if (records >= maxRecords)
+            throw new PipelineError(
+              "scope_too_large",
+              "actual canonical record count exceeds scope limit",
+              false,
+            );
+          records += 1;
+          yield parseRelayhistoryRecord(line);
+        }
+    }
+  } finally {
+    // Stops the prefetch on refusal or an early consumer stop (no unhandled sibling rejections).
+    await bodies.return();
   }
 }
 
@@ -491,6 +508,7 @@ export async function readCanonicalScope(
         decompress,
         limits.maxScopeEvents - parsedRecords,
         deps.readerMaxRuleset,
+        deps.fetchConcurrency,
       );
       parsedRecords += records.length;
       parts.push({ manifest, records, userId: manifestUserId(manifest) });
