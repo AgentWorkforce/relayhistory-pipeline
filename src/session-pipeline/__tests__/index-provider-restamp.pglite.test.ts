@@ -49,7 +49,7 @@ const providers = async () => Object.fromEntries((await pg.query<{ session_id: s
 const snapshot = async () => (await pg.query("SELECT * FROM sessions.session_index ORDER BY session_id")).rows;
 
 // In the GCS Locker: s-live-1, s-live-2, s-live-3 (and s-gcs). Not: s-gone (tombstone bytes erased).
-const inLocker = new Set(["s-live-1", "s-live-2", "s-live-3", "s-gcs", "s-other"].map(manifest));
+const inLocker = new Set(["s-live-1", "s-live-2", "s-live-3", "s-gcs", "s-other", "s-fenced"].map(manifest));
 const exists = async (key: string) => inLocker.has(key);
 
 beforeEach(async () => {
@@ -66,7 +66,7 @@ describe("restampIndexProvider (real migrations)", () => {
   test("plan writes nothing and counts what apply would do", async () => {
     const before = await snapshot();
     const r = await restampIndexProvider(db, { bucket: BUCKET, apply: false, pageSize: 200, exists });
-    expect(r).toEqual({ mode: "plan", scanned: 4, proven: 3, unproven: 1, restamped: 0, raced: 0, refused: 0, refused_codes: {}, other_bucket_s3: 1, complete: true });
+    expect(r).toEqual({ mode: "plan", scanned: 4, proven: 3, unproven: 1, restamped: 0, raced: 0, guard_skipped: 0, refused: 0, refused_codes: {}, other_bucket_s3: 1, complete: true, needs_attention: false });
     expect(await snapshot()).toEqual(before);
   });
 
@@ -102,8 +102,24 @@ describe("restampIndexProvider (real migrations)", () => {
       return exists(key);
     };
     const r = await restampIndexProvider(db, { bucket: BUCKET, apply: true, pageSize: 200, exists: racing });
-    expect(r).toMatchObject({ restamped: 2, raced: 1 });
+    expect(r).toMatchObject({ restamped: 2, raced: 1, guard_skipped: 0, needs_attention: false });
+    expect(exitCodeForResult(r)).toBe(0);
     expect((await providers())["s-live-2"]).toBe("s3");
+  });
+
+  test("an erase-fenced row the guard silently keeps is guard_skipped (not raced), exit 5, and stays so on rerun", async () => {
+    // ingest_erase_fence_index_guard returns NULL for a live row of a fenced session: the UPDATE affects 0 rows.
+    // Fences cannot be deleted, so this test fences a session no other test uses (row first: the guard drops a fenced INSERT).
+    await insert("s-fenced", "s3", BUCKET);
+    await pg.query("INSERT INTO sessions.session_erasure_fences(org_id,workspace_id,source,session_id) VALUES('org-a','ws-a','claude','s-fenced')");
+    const r = await restampIndexProvider(db, { bucket: BUCKET, apply: true, pageSize: 200, exists });
+    expect(r).toMatchObject({ restamped: 3, raced: 0, guard_skipped: 1, refused: 0, complete: true, needs_attention: true });
+    expect(exitCodeForResult(r)).toBe(5);
+    expect((await providers())["s-fenced"]).toBe("s3");
+    const again = await restampIndexProvider(db, { bucket: BUCKET, apply: true, pageSize: 200, exists });
+    expect(again).toMatchObject({ restamped: 0, raced: 0, guard_skipped: 1, needs_attention: true });
+    // An incomplete run says rerun first (3), even with guard-skipped rows.
+    expect(exitCodeForResult({ ...again, complete: false })).toBe(3);
   });
 
   test("a Locker that cannot answer fails the page before any write", async () => {
