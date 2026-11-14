@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { runMigrations, generation } from "../../src/hoopdb/migrate.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../../src/hoopdb/session-bootstrap-chain.ts";
+import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 if (process.env.PGPROOF_AUTH_UPGRADE_DISPOSABLE !== "1")
   throw Error("disposable cluster opt-in required");
 const root = fileURLToPath(new URL("../..", import.meta.url));
@@ -105,6 +106,8 @@ const guardSql = () => {
   ] as const;
 };
 try {
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  await initScrubEngine();
   await check("fresh_T0_exact_target_setup", async () => {
     const c = await database("t0");
     try {

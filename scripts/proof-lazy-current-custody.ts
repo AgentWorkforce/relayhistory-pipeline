@@ -9,6 +9,9 @@ import {createS3Store} from "../src/shared/vendor.ts";
 import {deliveryAccount,prepareDelivery as targetPrepare} from "../src/session-ingest/vendor/delivery/prepare.ts";
 import {DELIVERY_MAPPING_VERSION} from "../src/session-ingest/vendor/delivery/delivery-contracts.ts";
 import {signRequest} from "../packages/object-store/src/sigv4.ts";
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 const target=process.cwd(),source="/home/khaliqgant/Projects/AgentWorkforce/relayhistory-cloud-worktrees/delivery-current-custody-witness-20261104",sourceHead="559ca6268146ccbc22195c90899b2cf4ed44332f";
 const artifact=process.env.LAZY_CUSTODY_SOURCE_BUNDLE??"";
 if(process.env.LAZY_CUSTODY_DISPOSABLE!=="1"||!artifact.startsWith("/home/khaliqgant/relay-briefs/ordered-router-fixture-lazy"))throw Error("owned_only");

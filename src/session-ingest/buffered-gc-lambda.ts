@@ -1,9 +1,11 @@
 /** EventBridge/portable Node entry. A single reviewed switch arms job+schedule. */
 import {BufferedGcDiagnostics,type BufferedGcPhase} from "./buffered-gc.ts";
+import {declareScrubTsCapability} from "@rhc/lib/scrub-engine/ts-capability.ts";
 export function gcEnabled(env:NodeJS.ProcessEnv):boolean{
  const v=env.INGEST_GC_ENABLED??"false";if(v!=="true"&&v!=="false")throw Error("gc_enabled_invalid");return v==="true";
 }
 export async function handler(_event:unknown={},_context?:unknown){
+ declareScrubTsCapability("hosted-lambda"); // hosted Lambda zip, no relayscrubber artifacts (docs/scrub-engine.md "Default flip")
  if(!gcEnabled(process.env))return{enabled:false};
  const diagnostics=new BufferedGcDiagnostics();
  const name=process.env.AWS_LAMBDA_FUNCTION_NAME??"buffered-gc";

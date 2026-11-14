@@ -6,7 +6,11 @@ import { log } from "../shared/log.ts";
 import { keyringFromEnv } from "../shared/keyring.ts";
 import { summarySweep } from "./sweep.ts";
 import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
+import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 
+// Scrub engine (docs/scrub-engine.md, "Default flip"): initialise before the first log line below, which
+// would otherwise be emitted as [scrub-unavailable]; runWorker's own initScrubEngine() then shares this instance.
+await initScrubEngine();
 const raw = lockerStore();
 // BOB_COSTAS_MODEL / OPENAI_BASE_URL are validated here, so a bad value fails at startup.
 const summarizer = summarizerFromEnv();

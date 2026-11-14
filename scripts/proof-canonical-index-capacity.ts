@@ -9,6 +9,9 @@ import {indexSearchScope,REPLAY_SEARCH_INDEX_LIMITS} from "../src/session-pipeli
 import {produceCanonicalReplay} from "../src/session-pipeline/replay-publication.ts";
 import {readerMaxRuleset} from "../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import {recordingReplayClickHouse} from "../src/session-pipeline/__tests__/replay-clickhouse-fixture.ts";
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 const args=process.argv.slice(2),arg=(name:string)=>{const i=args.indexOf(name);return i<0?undefined:args[i+1]};
 const input=arg("--source"),outputArg=arg("--out");if(!input||!outputArg)throw Error("requires --source <existing-synthetic-fixture> --out <new-empty-directory>");
 const output=resolve(outputArg);await mkdir(output,{recursive:true});if((await readdir(output)).length)throw Error("output must be empty");

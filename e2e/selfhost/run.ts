@@ -8,6 +8,7 @@
  */
 import { buildImage, createStack, DEFAULT_IMAGE } from "./stack.ts";
 import { runAcceptance, type Check } from "./acceptance.ts";
+import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 
 const line = (c: Check) => console.log(`${c.result.padEnd(7)} ${c.name}  ${c.detail}`);
 let failed = false;
@@ -32,6 +33,8 @@ const dumpLogs = () => {
   }
 };
 try {
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  await initScrubEngine();
   console.log("starting stack ...");
   // A crashed earlier run must not leak its volumes into this one.
   stack.compose(["down", "-v", "--remove-orphans"], { quiet: true, allowFail: true });

@@ -45,6 +45,7 @@ import {
   type ScrubEngineFailure,
   type ScrubWasmArtifact,
 } from "../src/lib/scrub-engine/index.js";
+import { declareScrubTsCapability } from "../src/lib/scrub-engine/ts-capability.js";
 import { ABI_STATUS, REQUIRED_EXPORTS, WASM_ABI_VERSION } from "../src/lib/scrub-engine/wasm-abi.js";
 import pinFile from "../scrub-wasm-pin.json";
 
@@ -241,7 +242,15 @@ async function mirrorEngine(o: MirrorOptions = {}): Promise<ScrubEngine> {
 
 // ---------------------------------------------------------------- parity harness
 
-beforeEach(() => resetScrubEngineForTests());
+// This file compares the TypeScript engine as a hosted entry runs it: each case starts in a
+// granted process (the reset clears grants; "test" stands in for a hosted handler's grant).
+// The ungranted default (wasm-bindgen) is asserted in "selection" below and in
+// scrub-engine-required.test.ts / src/session-ingest/__tests__/scrub-default-flip.test.ts.
+const grantTs = () => declareScrubTsCapability("test");
+beforeEach(() => {
+  resetScrubEngineForTests();
+  grantTs();
+});
 afterEach(() => resetScrubEngineForTests());
 
 /** A `ScrubEngine` view of the module-level seam functions, so the seam itself is what is compared. */
@@ -392,10 +401,41 @@ describe("selection", () => {
   it('"" and "ts" are the TypeScript engine', () => {
     expect(selectScrubEngine({ SCRUB_ENGINE: "" })).toBe("ts");
     resetScrubEngineForTests();
+    grantTs();
     expect(selectScrubEngine({ SCRUB_ENGINE: "ts" })).toBe("ts");
   });
 
-  it("with nothing selected, the first scrub call selects from process.env (unset: TypeScript)", () => {
+  it('without a grant: unset and "" are wasm-bindgen (the default); "ts" refuses with scrub_engine_ts_not_allowed, sticky', async () => {
+    resetScrubEngineForTests();
+    expect(selectScrubEngine({})).toBe("wasm-bindgen");
+    resetScrubEngineForTests();
+    expect(selectScrubEngine({ SCRUB_ENGINE: "" })).toBe("wasm-bindgen");
+    resetScrubEngineForTests();
+    expect(() => selectScrubEngine({ SCRUB_ENGINE: "ts" })).toThrow(expect.objectContaining({ reason: "scrub_engine_ts_not_allowed" }));
+    grantTs(); // a grant arriving after the refusal does not reopen it
+    expect(() => selectScrubEngine({ SCRUB_ENGINE: "ts" })).toThrow(expect.objectContaining({ reason: "scrub_engine_ts_not_allowed" }));
+    expect(() => selectScrubEngine({})).toThrow(expect.objectContaining({ reason: "scrub_engine_ts_not_allowed" }));
+    await expect(initScrubEngine({ env: {} })).rejects.toMatchObject({ reason: "scrub_engine_ts_not_allowed" });
+    expect(() => seam.scrubText("token=abc")).toThrow(ScrubEngineConfigError);
+    expect(seam.scrubTextForLog("token=abc")).toBe(SCRUB_UNAVAILABLE_LOG_TEXT);
+    expect(scrubEngineReady()).toBe(false);
+    expect(isSafeIdentifier("0190a8f2-7c1e-7d3a-9b2f-1c2d3e4f5a6b")).toBe(false);
+  });
+
+  it("without a grant, the first scrub call selects wasm-bindgen from process.env and refuses (not_initialised), never TypeScript", () => {
+    resetScrubEngineForTests();
+    const saved = process.env.SCRUB_ENGINE;
+    delete process.env.SCRUB_ENGINE;
+    try {
+      expect(() => seam.scrubText("plain")).toThrow(expect.objectContaining({ reason: "not_initialised" }));
+      expect(seam.scrubTextForLog("token=abc")).toBe(SCRUB_UNAVAILABLE_LOG_TEXT);
+      expect(isSafeIdentifier("0190a8f2-7c1e-7d3a-9b2f-1c2d3e4f5a6b")).toBe(false);
+    } finally {
+      if (saved !== undefined) process.env.SCRUB_ENGINE = saved;
+    }
+  });
+
+  it("with nothing selected, the first scrub call selects from process.env (unset in a granted process: TypeScript)", () => {
     const saved = process.env.SCRUB_ENGINE;
     delete process.env.SCRUB_ENGINE;
     try {
@@ -431,6 +471,7 @@ describe("selection", () => {
     await expect(initScrubEngine(mirrorInit())).rejects.toBeInstanceOf(ScrubEngineConfigError);
     expect(seam.activeScrubEngine()).toBe(tsScrubEngine);
     resetScrubEngineForTests();
+    grantTs();
     await initScrubEngine(mirrorInit());
     expect(() => selectScrubEngine({})).toThrow(ScrubEngineConfigError);
     expect(seam.activeScrubEngine().kind).toBe("wasm");

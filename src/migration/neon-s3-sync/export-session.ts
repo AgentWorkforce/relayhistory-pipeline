@@ -52,7 +52,7 @@ export const EXPORT_MARKER = "client.relayhistory_export";
 const SESSION_EXT = "96bulls";
 
 export interface ExportTarget {
-  /** Set by routedRawChunkSealerDeps() under SCRUB_ENGINE=wasm-bindgen; absent → seam sealRawChunk (TS by default; refuses non-TS engines). */
+  /** Set by routedRawChunkSealerDeps() when the resolved kind is wasm-bindgen (the default; docs/scrub-engine.md "Default flip"); absent → seam sealRawChunk (TS only in a granted hosted/test process; refuses otherwise). */
   rawChunkSealer?: BoundRawChunkSealer;
   store: ObjectStore;
   /** Deployment key root; objects land under `{keyRoot}/{org}/v1/...`. */

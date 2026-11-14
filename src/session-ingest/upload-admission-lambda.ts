@@ -20,6 +20,7 @@
  * queue, mapping, notification and IAM. A factory that returns `witnessKey` overrides UPLOAD_WITNESS_KEY
  * from the environment (hosted never puts the key in env or state).
  */
+import { declareScrubTsCapability } from "@rhc/lib/scrub-engine/ts-capability.ts";
 import { promoteUpload, uploadDirectConfig, UPLOAD_WITNESS_KEY_VAR, type PromoteResult, type PromoteUploadDeps, type UploadDirectConfig } from "./upload-admission.ts";
 
 export interface SqsRecordLike { messageId?: unknown; body?: unknown }
@@ -50,6 +51,7 @@ const defaultLog: Log = (line) => console.log(JSON.stringify({ route: "upload.ad
 export function createUploadAdmissionHandler(runtime: UploadAdmissionRuntimeFactory | undefined, log: Log = defaultLog) {
   let deps: ReturnType<UploadAdmissionRuntimeFactory> | undefined;
   return async function handler(event: unknown, _context?: unknown): Promise<UploadAdmissionBatchResponse> {
+    declareScrubTsCapability("hosted-lambda"); // hosted Lambda zip, no relayscrubber artifacts (docs/scrub-engine.md "Default flip")
     const records: SqsRecordLike[] = Array.isArray((event as { Records?: unknown } | null)?.Records) ? (event as { Records: SqsRecordLike[] }).Records : [];
     const ids = records.map((r) => (typeof r?.messageId === "string" ? r.messageId : ""));
     const failAll = (code: string, cause?: string) => {

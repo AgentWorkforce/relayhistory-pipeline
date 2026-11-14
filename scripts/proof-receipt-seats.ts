@@ -15,6 +15,9 @@ import {createS3Eraser} from "../src/migration/neon-s3-erasure/eraser.ts";
 import {sqlBufferedGcLedger,collectBufferedTicket} from "../src/session-ingest/buffered-gc.ts";
 import {deliveryAccount} from "../src/session-ingest/vendor/delivery/prepare.ts";
 import {DELIVERY_MAPPING_VERSION,type HistoryExportRecord,type HistoryExportBatch} from "../src/session-ingest/vendor/delivery/delivery-contracts.ts";
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 const out=process.env.RECEIPT_SEAT_PROOF_OUT??"";
 if(process.env.RECEIPT_SEAT_DISPOSABLE!=="1"||!out.startsWith("/home/khaliqgant/relay-briefs/receipt-seats-proof-"))throw Error("owned_only");
 function port(name:string,label:string,key:string){

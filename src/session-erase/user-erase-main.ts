@@ -19,6 +19,7 @@
  * 2 refused or misconfigured (do not retry unchanged); 4 failed with any other error (rerun).
  * Output: one JSON result line with counts only. Runbook: docs/operator-user-erase.md.
  */
+import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { readFileSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import pg from "pg";
@@ -147,7 +148,8 @@ if (import.meta.main) {
     const path = requestPath(process.argv.slice(2), process.env);
     return path ? readBounded(path) : readStdin();
   };
-  runUserEraseMain(process.env, request)
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  initScrubEngine().then(() => runUserEraseMain(process.env, request))
     .then((r) => {
       console.log(JSON.stringify(r));
       process.exit(exitCodeForResult(r));

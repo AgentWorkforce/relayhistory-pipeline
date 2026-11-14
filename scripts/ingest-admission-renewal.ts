@@ -8,6 +8,7 @@
  * Writes the plan artifact file (plan mode) and a sanitized receipt (always, REFUSED on error); errors print a fixed
  * code only. Nothing here runs unless the workflow is dispatched.
  */
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { releaseClient, releaseErrorCode, requireReleaseOwner } from "../src/hoopdb/schema-release-inspect.ts";
@@ -51,7 +52,8 @@ async function main() {
 }
 
 if (import.meta.main)
-  main().catch((error) => {
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  initScrubEngine().then(() => main()).catch((error) => {
     const code = releaseErrorCode(error);
     write(RECEIPT, {
       status: "ADMISSION_RENEWAL_REFUSED", mode: process.env.RENEWAL_MODE === "plan" || process.env.RENEWAL_MODE === "renew" ||

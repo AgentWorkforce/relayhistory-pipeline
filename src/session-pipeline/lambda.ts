@@ -91,6 +91,7 @@ import { briefTick } from "../session-brief/worker.ts";
 import { analysisConfig, analysisTick } from "../session-analysis/worker.ts";
 import { zstdDecompressSync } from "node:zlib";
 import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
+import { declareScrubTsCapability } from "../../packages/pipeline/src/lib/scrub-engine/ts-capability.ts";
 import { createS3Eraser } from "../migration/neon-s3-erasure/eraser.ts";
 import{derivedSchemaAssets}from "./derived-schema.ts";
 import { validateAdapterEnv } from "@rhc/adapters/registry.ts";
@@ -875,6 +876,9 @@ export function createPipelineLambdaHandler(options: { search?: SearchCompositio
     return pending;
   });
   return async (event: PipelineLambdaEvent): Promise<BatchResponse | { ok: boolean }> => {
+    // Hosted Lambda zip (index.mjs only, no relayscrubber artifacts): TypeScript scrub. Declared
+    // at handler entry, never module load: self-host services import this module for helpers.
+    declareScrubTsCapability("hosted-lambda");
     const invoke = (input: PipelineLambdaEvent) => dispatchLambdaEvent(input, ready);
     if (!options.runtime) return invoke(event);
     try {

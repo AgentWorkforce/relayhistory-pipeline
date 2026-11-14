@@ -15,6 +15,7 @@
  * by the store), the same helper as the re-arm sweeper and every Locker client, so it runs as a one-off Job on a pod's
  * service account. Credentials are never logged. Prints one JSON summary per org: counts only, never keys or ids.
  */
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { parseArgs } from "node:util";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
 import { reshardRevisions } from "../src/session-ingest/revision-reshard.ts";
@@ -71,6 +72,8 @@ if (import.meta.main) {
     console.error(JSON.stringify({ refused: typeof m === "string" && /^[a-z0-9_]{1,64}$/.test(m) ? m : "credentials_unavailable" }));
     process.exit(2);
   }
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  await initScrubEngine();
   const keyRoot = values["key-root"]!;
   const store = createS3Store({
     bucket: values.bucket, region: values.region!,

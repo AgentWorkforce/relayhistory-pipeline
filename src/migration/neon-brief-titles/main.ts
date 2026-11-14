@@ -21,6 +21,7 @@
  * The report is JSON on stdout: counts, skip reasons and (verify) up to 20 keys per class.
  * No title, description or URL is ever printed.
  */
+import { initScrubEngine } from "../../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { readFileSync } from "node:fs";
 import pg from "pg";
 import { sessionReadOnly } from "../neon-s3-sync/neon-reader.ts";
@@ -74,7 +75,8 @@ export async function main(argv = process.argv): Promise<void> {
 }
 
 if (import.meta.main) {
-  main().catch((error: unknown) => {
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  initScrubEngine().then(() => main()).catch((error: unknown) => {
     // The message only: pg errors can quote values, so the code and a fixed text are printed.
     const code = (error as { code?: string })?.code;
     process.stderr.write(`${JSON.stringify({ error: code ?? (error instanceof Error ? error.message : "failed") })}\n`);

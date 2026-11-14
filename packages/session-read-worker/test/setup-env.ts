@@ -4,6 +4,12 @@
  * come from this run's bindings (vitest.config.ts), set before any suite loads.
  */
 import { env } from "cloudflare:workers";
+import { declareScrubTsCapability } from "../../pipeline/src/lib/scrub-engine/ts-capability.ts";
+
+// The deployed Worker declares "hosted-worker" at fetch entry; suites that call the app
+// below the fetch handler keep TypeScript scrub through this test grant
+// (docs/scrub-engine.md "Default flip").
+declareScrubTsCapability("test");
 
 const e = env as unknown as Record<string, string>;
 process.env.READ_API_TEST_CLICKHOUSE_URL = e.CLICKHOUSE_URL;

@@ -82,6 +82,7 @@ import { createS3Store, objectKey, type ObjectStore } from "../shared/vendor.ts"
 import { log } from "../shared/log.ts";
 import { ScrubEngineUnavailable, initScrubEngine, type LoadScrubWasmArtifact } from "@rhc/lib/scrub-engine/index.ts";
 import type { ReadBindgenArtifact } from "@rhc/lib/scrub-engine/bindgen-engine.ts";
+import { declareScrubTsCapability } from "@rhc/lib/scrub-engine/ts-capability.ts";
 import { dbClientErrorFields } from "./db-error-class.ts";
 import { assertNoNeonEdge, neonExitProfile, NeonExitRefusal } from "../shared/neon-exit.ts";
 import { createIngestApp } from "./app.ts";
@@ -109,7 +110,7 @@ interface QueueLike<T> {
 }
 
 export interface IngestWorkerEnv {
-  /** Unset / "ts" (default): the TypeScript scrubber. "wasm": the pinned relayscrubber module only (docs/scrub-engine.md). */
+  /** Unset / "ts" (default here; the Worker holds a TS grant): the TypeScript scrubber. "wasm": the pinned relayscrubber module only (docs/scrub-engine.md). */
   SCRUB_ENGINE?: string;
   HYPERDRIVE?: { connectionString: string };
   INGEST_FANOUT?: QueueLike<FanoutMessage>;
@@ -573,8 +574,14 @@ const readWorkerBindgenArtifact: ReadBindgenArtifact = async () => {
  * Select the scrub engine for this isolate (once) and, for wasm, verify it. Unset or "ts":
  * no I/O, always true, so the hosted Worker behaves exactly as before. A failure is logged
  * as a code and the caller refuses the work; nothing is scrubbed by another engine.
+ *
+ * TS grant (docs/scrub-engine.md "Default flip"): the hosted Worker ships no relayscrubber
+ * artifacts, so it declares the "hosted-worker" capability here, at handler entry (fetch and
+ * queue both call this first), never at module load: self-host Node services import this
+ * module for helpers and must keep the wasm-bindgen default.
  */
 async function scrubEngineReady(env: IngestWorkerEnv): Promise<boolean> {
+  declareScrubTsCapability("hosted-worker");
   try {
     await initScrubEngine({ env, loadArtifact: loadWorkerScrubWasm, bindgen: { readArtifact: readWorkerBindgenArtifact, hostedReaderCeiling: true } });
     return true;

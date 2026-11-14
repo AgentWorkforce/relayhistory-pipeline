@@ -11,6 +11,7 @@
  *   bun scripts/history-owner-apply.ts plan  --source-sha <40hex>
  *   bun scripts/history-owner-apply.ts apply --source-sha <40hex> --plan-sha <64hex> --approval-sha <64hex>
  */
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
@@ -123,7 +124,8 @@ async function main(argv = process.argv.slice(2)) {
 }
 
 if (import.meta.main)
-  main().then((r) => console.log(JSON.stringify(r))).catch((error) => {
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  initScrubEngine().then(() => main()).then((r) => console.log(JSON.stringify(r))).catch((error) => {
     const code = typeof error?.code === "string" && /^[A-Za-z0-9_]{1,64}$/.test(error.code) ? error.code : "history_apply_failed";
     console.log(JSON.stringify({ status: "refused", code }));
     process.exitCode = 1;

@@ -1,4 +1,5 @@
 /** Only the protected workflow's single secret-scoped step invokes this entry point. */
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { execFileSync } from "node:child_process";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import {
@@ -479,7 +480,8 @@ export async function releaseDatabase() {
   }
 }
 if (import.meta.main)
-  releaseDatabase().catch((error) => {
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  initScrubEngine().then(() => releaseDatabase()).catch((error) => {
     // A SQL error's message/detail/hint can contain values; emit only a code.
     const code = releaseErrorCode(error);
     console.error(code);

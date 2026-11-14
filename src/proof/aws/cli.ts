@@ -31,6 +31,7 @@
  * PROOF_TRANSCRIPT_TENANT_CREDENTIALS, PROOF_TRANSCRIPT_WRITER).
  * Exit code: 0 pass, 1 fail, 2 usage/guard refusal, 3 incomplete.
  */
+import { initScrubEngine } from "../../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -358,7 +359,8 @@ export async function main(argv: readonly string[], env: Record<string, string |
   return report.verdict === "pass" ? 0 : report.verdict === "fail" ? 1 : 3;
 }
 
-if (import.meta.main) process.exit(await main(process.argv.slice(2)));
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+if (import.meta.main) process.exit(await initScrubEngine().then(() => main(process.argv.slice(2))));
 
 /** Report provenance. Chart digests are read from the public chart index only on non-dry runs. */
 async function reportProvenance(cfg: ProofConfig, args: Args, plan: StagePlan | undefined): Promise<ReportProvenance> {

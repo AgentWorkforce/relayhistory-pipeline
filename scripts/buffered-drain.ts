@@ -42,6 +42,7 @@
  * (`checkpoint_invalid`, for example one written by an older drain) is safe to delete: rerun without it, and the
  * create-only `drained` markers skip every object already written, so a restart only re-lists.
  */
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { zstdDecompressSync } from "node:zlib";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
@@ -215,6 +216,8 @@ if (import.meta.main) {
   }
   const credentials: AwsCredentials = { accessKeyId, secretAccessKey, ...(process.env.AWS_SESSION_TOKEN ? { sessionToken: process.env.AWS_SESSION_TOKEN } : {}) };
   try {
+    // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+    await initScrubEngine();
     const store = createS3Store({
       bucket: args.bucket, region: args.region, credentials,
       ...(args.mode === "execute" ? { serverSideEncryption: "aws:kms" as const, sseKmsKeyId: args.kmsKeyArn! } : {}),

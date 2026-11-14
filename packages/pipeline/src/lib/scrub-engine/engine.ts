@@ -70,6 +70,7 @@ export interface ScrubEngine {
  * - engine_refused: the instance returned an unexpected status for one call
  * - seal_path_not_routed: `sealRawChunk` can only run the TypeScript engine (it lives in pinned raw-chunks.ts)
  * - engine_selection_required: SCRUB_ENGINE_REQUIRED names another engine than the one SCRUB_ENGINE selects
+ * - scrub_engine_ts_not_allowed: SCRUB_ENGINE=ts in a process without a TS grant (ts-capability.ts)
  * - bindgen_*: SCRUB_ENGINE=wasm-bindgen (bindgen-engine.ts); see `BindgenFailure`
  */
 export type ScrubEngineFailure =
@@ -87,6 +88,7 @@ export type ScrubEngineFailure =
   | "engine_refused"
   | "seal_path_not_routed"
   | "engine_selection_required"
+  | "scrub_engine_ts_not_allowed"
   | BindgenFailure;
 
 /** The three verified byte artifacts of the wasm-bindgen package. */
@@ -169,11 +171,13 @@ export class ScrubEngineUnavailable extends PipelineError {
 
 /**
  * SCRUB_ENGINE (or SCRUB_ENGINE_REQUIRED) holds a value other than unset, "", "ts", "wasm" or
- * "wasm-bindgen", a second selection disagrees, or SCRUB_ENGINE_REQUIRED names another engine
- * than the selected one (`reason: "engine_selection_required"`). Startup fails.
+ * "wasm-bindgen", a second selection disagrees, SCRUB_ENGINE_REQUIRED names another engine
+ * than the selected one (`reason: "engine_selection_required"`), or SCRUB_ENGINE=ts in a
+ * process without a TS grant (`reason: "scrub_engine_ts_not_allowed"`). Startup fails.
+ * Both reasons are sticky for the process.
  */
 export class ScrubEngineConfigError extends PipelineError {
-  constructor(message: string, readonly reason?: "engine_selection_required") {
+  constructor(message: string, readonly reason?: "engine_selection_required" | "scrub_engine_ts_not_allowed") {
     super("scrub_engine_invalid", message, false);
     this.name = "ScrubEngineConfigError";
   }

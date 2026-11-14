@@ -83,7 +83,7 @@ export class IngestWriteError extends Error {
 }
 
 export interface WriteTarget {
-  /** Set by routedRawChunkSealerDeps() under SCRUB_ENGINE=wasm-bindgen; absent → seam sealRawChunk (TS by default; refuses non-TS engines). */
+  /** Set by routedRawChunkSealerDeps() when the resolved kind is wasm-bindgen (the default; docs/scrub-engine.md "Default flip"); absent → seam sealRawChunk (TS only in a granted hosted/test process; refuses otherwise). */
   rawChunkSealer?: BoundRawChunkSealer;
   store: ObjectStore;
   keyRoot: string;

@@ -48,6 +48,7 @@
  * Khaliq's direct production approval; the flag is an accidental-execution
  * guard, not approval by itself.
  */
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import pg from "pg";
@@ -520,6 +521,13 @@ async function main(): Promise<number> {
   } catch (error) {
     output({ status: "refused", code: error instanceof OwnerBufferedOperatorRefusal ? error.code : "usage" });
     return 64;
+  }
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  try {
+    await initScrubEngine();
+  } catch {
+    output({ status: "refused", code: "scrub_engine_unavailable" });
+    return 1;
   }
   const clients: pg.Client[] = [];
   // Neon-mode receipts are byte-for-byte the pre-edge-5 shape; frozen mode appends its source.

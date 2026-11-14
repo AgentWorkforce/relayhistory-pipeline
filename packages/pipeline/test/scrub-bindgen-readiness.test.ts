@@ -6,7 +6,9 @@
  * ceiling refusal, a non-exact pin, poison, or no init at all: not ready, the routed
  * sealer refuses (so a production constructor fails at startup), the unrouted seam
  * refuses, and the HTTP ingress answers 503 scrub_unavailable with nothing stored.
- * With the knob unset nothing changes: TS engine, no routed sealer.
+ * Default flip: with SCRUB_ENGINE unset the same pinned engine is selected (a routed sealer,
+ * version 10, fail closed until initialised); only a granted (hosted) process keeps the TS
+ * engine with no routed sealer. The reset in beforeEach clears the test preload's grant.
  */
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -27,6 +29,7 @@ import {
   scrubEngineReady,
   sealRawChunk,
 } from "../src/lib/scrub-engine/index.js";
+import { declareScrubTsCapability } from "../src/lib/scrub-engine/ts-capability.js";
 import { PIN, TRIPLE, faultGlue, sealInput, tempStores } from "./support/real-bindgen.js";
 
 const enc = new TextEncoder();
@@ -192,9 +195,49 @@ describe("not ready under SCRUB_ENGINE_REQUIRED=wasm-bindgen: ingress refuses", 
   });
 });
 
-describe("default (knob unset) is unchanged", () => {
+describe("default flip (no env at all): the pinned engine, routed, fail closed until initialised", () => {
+  for (const value of [undefined, ""])
+    it(`SCRUB_ENGINE=${JSON.stringify(value)}: refuses before init; initScrubEngine() selects wasm-bindgen, routes the sealer and seals version 10`, async () => {
+      if (value !== undefined) process.env.SCRUB_ENGINE = value;
+      // Before init: every surface refuses (the constructor fails at startup), nothing is TS.
+      await expectRefusing("not_initialised");
+      const engine = await initScrubEngine();
+      expect(engine.kind).toBe("wasm-bindgen");
+      expect(engine.marker).toStrictEqual({ ruleset: "relayhistory-scrub", version: 10, profile: "relayhistory-secrets-v10" });
+      expect(scrubEngineReady()).toBe(true);
+      const sealer = routedRawChunkSealer()!;
+      expect(sealer).toBeTypeOf("function");
+      expect(routedRawChunkSealerDeps()).toStrictEqual({ rawChunkSealer: sealer });
+      const { response, store } = await ingress(routedRawChunkSealerDeps());
+      expect(response.status).toBe(201);
+      expect(((await response.json()) as { scrub: unknown }).scrub).toMatchObject({ version: 10, profile: "relayhistory-secrets-v10" });
+      expect(store.puts).toHaveLength(1);
+      // The unrouted TS seal path still refuses under the default.
+      await expect(sealRawChunk(await stores.store(), sealInput(enc.encode(LINE)))).rejects.toMatchObject({ reason: "seal_path_not_routed" });
+    });
+
+  it('SCRUB_ENGINE="ts" without a grant: scrub_engine_ts_not_allowed, sticky, nothing stored', async () => {
+    process.env.SCRUB_ENGINE = "ts";
+    await expect(initScrubEngine()).rejects.toMatchObject({ reason: "scrub_engine_ts_not_allowed" });
+    const refusal = expect.objectContaining({ reason: "scrub_engine_ts_not_allowed", code: "scrub_engine_invalid", retryable: false });
+    expect(scrubEngineReady()).toBe(false);
+    expect(() => activeScrubEngine()).toThrow(refusal);
+    expect(() => routedRawChunkSealer()).toThrow(refusal);
+    const store = await stores.store();
+    await expect(sealRawChunk(store, sealInput(enc.encode(LINE)))).rejects.toMatchObject({ reason: "scrub_engine_ts_not_allowed" });
+    expect(store.puts).toEqual([]);
+    // A config error, like the SCRUB_ENGINE_REQUIRED refusal: the route's existing 400 mapping; nothing stored.
+    const { response, store: s2 } = await ingress();
+    expect(response.status).toBe(400);
+    expect(s2.puts).toEqual([]);
+    await expect(initScrubEngine()).rejects.toMatchObject({ reason: "scrub_engine_ts_not_allowed" });
+  });
+});
+
+describe("granted (hosted) process: knob unset is unchanged", () => {
   for (const value of [undefined, "", "ts"])
     it(`SCRUB_ENGINE=${JSON.stringify(value)}: TS engine, no routed sealer, deps {} and ready`, async () => {
+      declareScrubTsCapability("test");
       if (value !== undefined) process.env.SCRUB_ENGINE = value;
       expect(routedRawChunkSealer()).toBeUndefined();
       expect(routedRawChunkSealerDeps()).toStrictEqual({});

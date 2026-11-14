@@ -6,6 +6,9 @@ import {join} from "node:path";
 import {generation as schemaGeneration} from "../src/hoopdb/migrate.ts";
 import {SESSION_BOOTSTRAP_FILES} from "../src/hoopdb/session-bootstrap-chain.ts";
 import {createHash,randomUUID} from "node:crypto";
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 const out=process.env.BUFFER_GC_PROOF_OUT??"";
 if(process.env.BUFFER_GC_DISPOSABLE!=="1"||!out.startsWith("/home/khaliqgant/relay-briefs/buffer-gc-real-"))throw new Error("disposable_only");
 const info=JSON.parse(execFileSync("docker",["inspect","ingest-seed-proof-pg17-20261104"],{encoding:"utf8"}))[0];

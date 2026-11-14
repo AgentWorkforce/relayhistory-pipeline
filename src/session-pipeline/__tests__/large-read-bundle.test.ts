@@ -29,9 +29,24 @@ test('built bundle embeds schema assets and boots with no supabase/ tree',()=>{
   const off=run(['node',out],dir,{PATH});
   expect(off.err).toBe('');expect(off.code).toBe(0);
   expect(JSON.parse(off.out)).toMatchObject({message:'large canonical worker',enabled:false,processed:0});
+  // Default flip (docs/scrub-engine.md): no TypeScript grant in this image and no relayscrubber
+  // artifacts in the bundle, so an enabled run fails closed at initScrubEngine, before the runtime
+  // factory (which would fail as worker_error on the missing env) and before any connection.
+  const wasm=readFileSync(join(root,'packages/pipeline/scrub-bindgen/generated/relayscrubber_bg.wasm'));
+  const pin=JSON.parse(readFileSync(join(root,'packages/pipeline/scrub-bindgen-pin.json'),'utf8'));
+  expect(bundle).not.toContain(wasm.subarray(0,48).toString('base64'));
+  expect(bundle).not.toContain(wasm.subarray(1024,1072).toString('base64'));
+  expect(pin.wasm_sha256).toMatch(/^[0-9a-f]{64}$/);
+  expect(bundle).not.toContain(pin.wasm_sha256); // nor the pin
+  // lambda.ts (imported for helpers) declares its grant at handler entry only, which this entry
+  // never calls: a load-time grant would turn the run below into TypeScript and fail as worker_error.
   const on=run(['node',out],dir,{PATH,SESSION_LARGE_READ_WORKER_ENABLED:'1'});
   expect(on.code).toBe(1);expect(on.out).toBe('');
   expect(on.err).not.toContain('ENOENT');
-  expect(JSON.parse(on.err)).toEqual({message:'large canonical worker failed',code:'worker_error'});
+  expect(JSON.parse(on.err)).toEqual({message:'large canonical worker failed',code:'scrub_engine_unavailable'});
+  // SCRUB_ENGINE=ts is refused here too (no grant), never TypeScript.
+  const ts=run(['node',out],dir,{PATH,SESSION_LARGE_READ_WORKER_ENABLED:'1',SCRUB_ENGINE:'ts'});
+  expect(ts.code).toBe(1);expect(ts.out).toBe('');
+  expect(JSON.parse(ts.err)).toEqual({message:'large canonical worker failed',code:'scrub_engine_invalid'});
  }finally{rmSync(dir,{recursive:true,force:true})}
 },60000);

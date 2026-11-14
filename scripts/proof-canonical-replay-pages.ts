@@ -6,6 +6,9 @@ import {replayDatabase,exportReplayFixture,createFsStore,REPLAY_FIXTURE_IDENTITY
 import {objectKey,readAll} from '../packages/object-store/src/index.ts';
 import {produceCanonicalReplay} from '../src/session-pipeline/replay-publication.ts';
 import {readerMaxRuleset} from '../packages/pipeline/src/lib/scrub-engine/reader-policy.ts';
+import { initScrubEngine } from '../packages/pipeline/src/lib/scrub-engine/index.ts';
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 const args=process.argv.slice(2),outAt=args.indexOf('--out'),eventsAt=args.indexOf('--events');
 if(outAt<0||!args[outAt+1])throw Error('proof requires --out <new-empty-local-directory>');
 const output=resolve(args[outAt+1]!),count=eventsAt<0?300001:Number(args[eventsAt+1]);

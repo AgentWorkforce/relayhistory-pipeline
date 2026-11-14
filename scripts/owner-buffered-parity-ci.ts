@@ -28,6 +28,7 @@
  * `--proof` runs the synthetic PGlite proof (all migrations, 7 roster tenants + 2 others) with no credentials.
  * `--discovery-summary` (no credentials) re-validates the discovery receipt and appends it to the job summary.
  */
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -1389,6 +1390,8 @@ function dieQuietly(): never {
 if (import.meta.main) {
   process.on("uncaughtException", dieQuietly);
   process.on("unhandledRejection", dieQuietly);
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  await initScrubEngine().catch(dieQuietly);
   if (process.argv.includes("--proof")) {
     const result = await ownerParityProof();
     for (const c of result.cases) console.log(`${c.pass ? "PASS" : "FAIL"} ${c.name}${c.detail ? ` | ${c.detail}` : ""}`);

@@ -11,6 +11,9 @@ import { parseCliLogin } from "../src/shared/supabase-cli-login.ts";
 import { requiredSupabaseProjectRef } from "../src/shared/deploy-target.ts";
 import { SUPABASE_PROD_CA_2021 } from "../src/session-pipeline/supabase-ca.ts";
 import { rebindIngestGeneration } from "../src/hoopdb/ingest-generation-rebind.ts";
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 // The Supabase project is explicit operator configuration (SUPABASE_PROJECT_REF), with no default.
 const HOST = "aws-0-us-east-1.pooler.supabase.com";
 const a = process.argv.slice(2), get = (k: string) => { const i = a.indexOf(k); return i >= 0 ? a[i + 1] : undefined; };

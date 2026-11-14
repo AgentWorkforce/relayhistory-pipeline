@@ -5,11 +5,13 @@
  * `PipelineError` uninitialised when the seam's error classes extend it.
  *
  * The seam (index.ts) installs the hook when it is loaded. Until then the selection
- * is read the way the seam reads it: unset, "" or "ts" is scrub.ts `scrubText`,
- * exactly as before; anything else returns undefined, so the predicate fails and
- * the identifier is dropped (never the TypeScript engine under SCRUB_ENGINE=wasm).
+ * is read the way the seam resolves it: scrub.ts `scrubText` only in a process holding
+ * a TS grant (ts-capability.ts) with SCRUB_ENGINE unset, "" or "ts" and no
+ * SCRUB_ENGINE_REQUIRED=wasm-bindgen; anything else (including the ungranted default,
+ * wasm-bindgen) returns undefined, so the predicate fails and the identifier is dropped.
  */
 import { scrubText } from "../scrub.js";
+import { scrubTsAllowed } from "./ts-capability.js";
 
 type PredicateScrub = (value: string) => string | undefined;
 let hook: PredicateScrub | undefined;
@@ -22,6 +24,8 @@ export function installPredicateScrub(fn: PredicateScrub): void {
 /** The scrubbed text, or undefined when the selected engine cannot scrub it. */
 export function predicateScrubText(value: string): string | undefined {
   if (hook) return hook(value);
-  const selected = (globalThis as { process?: { env?: { SCRUB_ENGINE?: string } } }).process?.env?.SCRUB_ENGINE;
-  return selected === undefined || selected === "" || selected === "ts" ? scrubText(value) : undefined;
+  const env = (globalThis as { process?: { env?: { SCRUB_ENGINE?: string; SCRUB_ENGINE_REQUIRED?: string } } }).process?.env;
+  const selected = env?.SCRUB_ENGINE;
+  const ts = selected === "ts" || ((selected === undefined || selected === "") && env?.SCRUB_ENGINE_REQUIRED !== "wasm-bindgen");
+  return ts && scrubTsAllowed() ? scrubText(value) : undefined;
 }

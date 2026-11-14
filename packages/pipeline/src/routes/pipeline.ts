@@ -89,7 +89,7 @@ const KEY_ATTRS = new Set(["destination", "chunk", "seq", "offset"]);
 const PROTOTYPE_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 export interface PipelineRouteDeps {
-  /** Set by routedRawChunkSealerDeps() under SCRUB_ENGINE=wasm-bindgen; absent → seam sealRawChunk (TS by default; refuses non-TS engines). */
+  /** Set by routedRawChunkSealerDeps() when the resolved kind is wasm-bindgen (the default; docs/scrub-engine.md "Default flip"); absent → seam sealRawChunk (TS only in a granted hosted/test process; refuses otherwise). */
   rawChunkSealer?: BoundRawChunkSealer;
   /** Authoritative manifest reads for the manifest POST; absent: validate the posted copy. */
   manifests?(env: Bindings): ManifestReader | undefined;

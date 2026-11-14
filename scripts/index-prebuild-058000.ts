@@ -15,6 +15,7 @@
  * prebuild rewrites after every per-index state change so a killed job still uploads how far it got. Nothing
  * credential-like is logged or written; errors print fixed codes only.
  */
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -203,5 +204,7 @@ function dieQuietly(): never {
 if (import.meta.main) {
   process.on("uncaughtException", dieQuietly);
   process.on("unhandledRejection", dieQuietly);
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  await initScrubEngine().catch(dieQuietly);
   process.exit(process.argv.includes(CHILD_FLAG) ? await operatorChild() : await parent());
 }

@@ -8,6 +8,9 @@ import {projectSessionDirectory} from "../src/hoopdb/session-directory-projector
 import {analysisSnapshotJson} from "../src/session-read-api/session-analysis-artifact.ts";
 import {artifactDigest} from "../src/session-pipeline/replay-pages.ts";
 import {analysisRefreshTick} from "../src/session-pipeline/analysis-refresh.ts";
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 const outArg=process.argv[process.argv.indexOf("--out")+1];if(!process.argv.includes("--out")||!outArg)throw Error("requires --out <new-empty-directory>");const output=resolve(outArg);await mkdir(output,{recursive:true});if((await readdir(output)).length)throw Error("output must be empty");
 const legacy=await legacyAnalysisOracle(),supabase=await replayDatabase(),store=createFsStore({root:join(output,"objects")});
 try{

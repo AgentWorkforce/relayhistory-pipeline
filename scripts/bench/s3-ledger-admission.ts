@@ -15,6 +15,9 @@ import { deliverPrepared } from "../../src/session-ingest/deliver.ts";
 import { REVISION_SHARDS, s3Ledger, s3LedgerKeys, sessionKeyHash } from "../../src/session-ingest/ledger-s3.ts";
 import { prepareDelivery, deliveryAccount } from "../../src/session-ingest/vendor/delivery/prepare.ts";
 import { DELIVERY_MAPPING_VERSION, type HistoryExportRecord } from "../../src/session-ingest/vendor/delivery/delivery-contracts.ts";
+import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 
 const { values } = parseArgs({ options: {
   existing: { type: "string", default: "210000" }, records: { type: "string", default: "50" },

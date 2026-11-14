@@ -15,6 +15,7 @@
  * E2E_SKIP_BUILD=1 reuses a built image (E2E_IMAGE, default 96bulls/services:e2e); otherwise each run builds
  * and removes its own `96bulls/services:e2e-<project>`.
  */
+import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
@@ -137,6 +138,8 @@ async function local(): Promise<boolean> {
 if (import.meta.main) {
   let ok = false;
   try {
+    // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+    await initScrubEngine();
     ok = target === "local" ? await local() : await (await import("./sandbox.ts")).runInSandbox({ steps: wanted, reportDir: reportDir() });
   } catch (error) {
     console.error(`pipeline e2e (${target}): ${(error as Error).message}`);

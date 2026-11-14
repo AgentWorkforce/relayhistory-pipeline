@@ -2,6 +2,7 @@
  * PLAN ONLY. For an operator's reviewed SSH session when protected GitHub reviewers
  * are unavailable. There is deliberately no migration/apply branch or fallback.
  */
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { execFileSync } from "node:child_process";
 import {
   generation,
@@ -91,7 +92,8 @@ export async function operatorPlan() {
   }
 }
 if (import.meta.main)
-  operatorPlan().catch((error) => {
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  initScrubEngine().then(() => operatorPlan()).catch((error) => {
     console.log(
       JSON.stringify({
         version: 1,

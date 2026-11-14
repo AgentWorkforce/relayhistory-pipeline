@@ -72,6 +72,7 @@
  * (scripts/render-deploy-config.ts) adds them.
  */
 import { readerMaxRuleset } from "../../pipeline/src/lib/scrub-engine/reader-policy.ts";
+import { declareScrubTsCapability } from "../../pipeline/src/lib/scrub-engine/ts-capability.ts";
 import pg from "pg";
 import { Decompress, decompress } from "fzstd";
 import { canonicalAnalysisHandle } from "./analysis-cache.ts";
@@ -632,6 +633,9 @@ function ownerBufferedEventsFlag(env: Env): boolean {
 
 export default {
   fetch(request, env, ctx) {
+    // Hosted Worker, no relayscrubber artifacts: TypeScript scrub stays here. Declared at
+    // handler entry, not module load (docs/scrub-engine.md "Default flip").
+    declareScrubTsCapability("hosted-worker");
     return handle(request, env, ctx);
   },
 } satisfies ExportedHandler<Env>;

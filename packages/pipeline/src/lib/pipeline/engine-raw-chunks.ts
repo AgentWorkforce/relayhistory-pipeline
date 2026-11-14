@@ -1,8 +1,8 @@
-/** Injected-engine raw sealer. Default off: only SCRUB_ENGINE=wasm-bindgen routes
- * here, through routedRawChunkSealer() in scrub-engine/index.ts, which binds this to
- * the verified pinned relayscrubber 0.5.0-alpha.9 instance (docs/scrub-engine.md,
- * "Cutover"). This module, the pin and the vendored bytes are digested in the
- * separate technical-foul-cutover.json entry. The historical TS sealer stays frozen.
+/** Injected-engine raw sealer: the default seal path. With SCRUB_ENGINE unset (or
+ * wasm-bindgen) and no hosted TS grant, routedRawChunkSealer() in scrub-engine/index.ts
+ * binds this to the verified pinned relayscrubber 0.5.0-alpha.9 instance
+ * (docs/scrub-engine.md, "Default flip"). This module, the pin and the vendored bytes are
+ * digested in the separate technical-foul-cutover.json entry. The historical TS sealer stays frozen.
  */
 import { sha256Hex } from "../../../../object-store/src/crypto.js";
 import { preflightScrubRecords, MAX_STREAM_BYTES } from "../scrub-engine/bindgen-admission.js";

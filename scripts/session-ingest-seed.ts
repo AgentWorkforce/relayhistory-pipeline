@@ -4,6 +4,7 @@
  * Requires reviewed raw S3 GetObject/KMS decrypt, seeder SET ROLE, and (execute only)
  * readonly Neon SELECT on deletion/reset fences. No transcript rows are read from Neon.
  */
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { readerMaxRuleset } from "../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
@@ -129,7 +130,8 @@ export async function main(){
   console.log(JSON.stringify({outcome:execute?"proof_seeded":"proof_preview",...result,fences}));
  }finally{await Promise.allSettled([supa.end(),...(neon?[neon.end()]:[])])}
 }
-if(import.meta.main)main().catch(error=>{
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+if(import.meta.main)initScrubEngine().then(()=>main()).catch(error=>{
  const code=typeof error?.code==="string"&&/^[A-Za-z0-9_]{1,64}$/.test(error.code)?error.code:"seed_failed";
  console.error(JSON.stringify({outcome:"refused",code}));process.exitCode=1;
 });

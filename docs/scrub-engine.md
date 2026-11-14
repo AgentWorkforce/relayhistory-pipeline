@@ -1,12 +1,13 @@
-# Scrub engine seam (TypeScript today, relayscrubber wasm later)
+# Scrub engine seam (relayscrubber wasm-bindgen by default, TypeScript on hosted entries)
 
-Status: seam only. The default engine is the TypeScript scrubber
-(`packages/pipeline/src/lib/scrub.ts`, ruleset `relayhistory-scrub` version 8, plus
-`scrubRecords`/`scrubLong`/`sealRawChunk` in `packages/pipeline/src/lib/pipeline/raw-chunks.ts`).
-The raw-ABI pin (`scrub-wasm-pin.json`) is still a placeholder that refuses to load. The
-wasm-bindgen pin is the exact relayscrubber `0.5.0-alpha.9` package, vendored byte-for-byte under
-`packages/pipeline/scrub-bindgen/`, and is used only under the opt-in env triple described in
-"Cutover: pinned relayscrubber 0.5.0-alpha.9". With `SCRUB_ENGINE` unset, `""` or `ts` nothing changes.
+Status: the DEFAULT engine is the pinned relayscrubber `0.5.0-alpha.9` wasm-bindgen package,
+vendored byte-for-byte under `packages/pipeline/scrub-bindgen/` (ruleset `relayhistory-scrub`
+version 10, profile `relayhistory-secrets-v10`). With `SCRUB_ENGINE` unset or `""` a process
+selects it and fails closed if it cannot verify it (see "Default flip"). The TypeScript scrubber
+(`packages/pipeline/src/lib/scrub.ts`, ruleset version 8, plus `scrubRecords`/`scrubLong`/`sealRawChunk`
+in `packages/pipeline/src/lib/pipeline/raw-chunks.ts`) runs only in the enumerated hosted Worker /
+Lambda handlers and the test preloads, which hold a code-level grant. The raw-ABI pin
+(`scrub-wasm-pin.json`) is still a placeholder that refuses to load.
 
 Code: `packages/pipeline/src/lib/scrub-engine/`
 
@@ -17,6 +18,7 @@ Code: `packages/pipeline/src/lib/scrub-engine/`
 | `wasm-engine.ts` | Pin parsing, artifact verification, `WasmScrubEngine` |
 | `index.ts` | `selectScrubEngine`, `initScrubEngine`, `activeScrubEngine`, the sync call-site accessors |
 | `predicate-hook.ts` | Late-bound `scrubText` for `trace.ts` `isSafeIdentifier` (import-cycle break, see below) |
+| `ts-capability.ts` | The non-env TS grant (`declareScrubTsCapability`); see "Default flip" |
 | `packages/pipeline/scrub-wasm-pin.json` | The pin |
 | `bindgen-engine.ts` | `SCRUB_ENGINE=wasm-bindgen`: pin parsing, verified glue import, manifest check, `createCompiledBindgenEngine` (see "wasm-bindgen path") |
 | `packages/pipeline/scrub-bindgen-pin.json` | The wasm-bindgen pin (relayscrubber `0.5.0-alpha.9`) |
@@ -31,22 +33,29 @@ Tests: `packages/pipeline/test/scrub-engine-parity.test.ts`, `packages/pipeline/
 
 | Value | Engine |
 |---|---|
-| unset, `""` or `ts` | TypeScript, byte-identical to main. No I/O, nothing to initialise. |
+| unset or `""`, no TS grant (every Node / Bun self-host process and tool) | The pinned `@agentworkforce/relayscrubber` wasm-bindgen package, exactly as `wasm-bindgen`. Needs `initScrubEngine()`; fails closed. |
+| unset or `""`, TS grant (hosted Worker / Lambda handler, test preload) | TypeScript, byte-identical to main. No I/O, nothing to initialise. |
+| `ts`, TS grant | TypeScript. |
+| `ts`, no TS grant | `ScrubEngineConfigError` (`scrub_engine_invalid`, reason `scrub_engine_ts_not_allowed`), latched for the process. |
 | `wasm` | The pinned relayscrubber artifact only (raw ABI v1). |
 | `wasm-bindgen` | The pinned `@agentworkforce/relayscrubber` wasm-bindgen package only. See "wasm-bindgen path". |
 | anything else | `ScrubEngineConfigError` (`scrub_engine_invalid`): startup fails. |
+
+The grant and the entry points that hold it are in "Default flip".
 
 The selection is made once. A second, conflicting selection in the same process throws.
 `""` is treated as unset because Compose and Helm emit it for an unset variable.
 
 ### Required engine (`SCRUB_ENGINE_REQUIRED`, default off)
 
-`SCRUB_ENGINE_REQUIRED` is an operator assertion about `SCRUB_ENGINE`. It never selects an
-engine and never changes the default.
+`SCRUB_ENGINE_REQUIRED` is an operator assertion about `SCRUB_ENGINE`. It selects nothing on its
+own, with one exception: `SCRUB_ENGINE_REQUIRED=wasm-bindgen` overrides a TS grant, so unset
+`SCRUB_ENGINE` then resolves to wasm-bindgen even in a granted process. With `SCRUB_ENGINE` unset
+and no grant it passes (the default already resolves to wasm-bindgen).
 
 | `SCRUB_ENGINE_REQUIRED` | Effect |
 |---|---|
-| unset or `""` | No check. Behaviour is byte-identical to main, including lazy TS selection. |
+| unset or `""` | No check. |
 | `ts`, `wasm` or `wasm-bindgen` | The resolved `SCRUB_ENGINE` kind (and any selection already made in the process) must equal it. |
 | anything else | `ScrubEngineConfigError` at selection; this does not latch. |
 
@@ -63,10 +72,13 @@ matching requirement adds nothing: with `wasm-bindgen` the existing pin and arti
 checked-in pin exactly (`bindgen_pin_not_exact` otherwise; a reordered or edited pin object is not exact). Only
 `resetScrubEngineForTests()` clears the latch. Deploy bindings for this variable are not added.
 
-Every self-host `SERVICE=` entry point calls `await initScrubEngine()` before it serves or
-runs its job (`src/shared/worker.ts` `runWorker` covers the indexer, referee, bob-costas and
-session-brief). With `wasm` this verifies the pin and the module. On failure the process exits
-non-zero rather than start. The ingest server's `/readyz` also requires `scrubEngineReady()`.
+Every self-host `SERVICE=` entry point, and every Node tool, proof, migration or ops script that
+scrubs or seals, calls `await initScrubEngine()` before it serves or runs its job
+(`src/shared/worker.ts` `runWorker` covers the indexer, referee, bob-costas and session-brief).
+`scripts/scrub-default-scan.ts` enforces this (see "Default flip"). Under the default this
+verifies the wasm-bindgen pin and vendored bytes; with `wasm` the raw-ABI pin and module. On
+failure the process exits non-zero rather than start. The ingest server's `/readyz` also requires
+`scrubEngineReady()`.
 
 ## Fail-closed rules (SCRUB_ENGINE=wasm)
 
@@ -186,7 +198,8 @@ metadata `scrub-ruleset` / `scrub-version`, manifests and summary `scrub_version
 
 ## Cutover rule
 
-1. While `SCRUB_ENGINE` is unset or `ts`, all output is byte-identical to main. `technical-foul.json`
+1. In a process holding a TS grant with `SCRUB_ENGINE` unset or `ts`, all output is byte-identical to main
+   (the hosted entries; Node self-host defaults to wasm-bindgen since "Default flip"). `technical-foul.json`
    still pins the bytes of `scrub.ts` and the raw-chunks segmenter, and this change did not alter them.
 2. **The first deployable cutover makes the pinned wasm mandatory.** The services image and Worker
    ship with `SCRUB_ENGINE=wasm` and a real pin. From then on, `scrub.ts` is the **frozen oracle**:
@@ -222,17 +235,20 @@ metadata `scrub-ruleset` / `scrub-version`, manifests and summary `scrub_version
   With `SCRUB_ENGINE=wasm`, every request is answered `503 not_configured` and every queue message
   is retried after 300 s. Nothing is scrubbed by another engine.
 - **Seam changes must not change hosted Worker behaviour with `SCRUB_ENGINE` unset.**
-  - With it unset, `initScrubEngine` returns `tsScrubEngine` with no I/O. The Worker's readiness
-    check is always true.
+  - The Worker declares the `hosted-worker` TS grant at handler entry ("Default flip"). With
+    `SCRUB_ENGINE` unset, `initScrubEngine` then returns `tsScrubEngine` with no I/O. The
+    Worker's readiness check is always true.
   - Module evaluation does not touch `import.meta.url`. The wasm file path is resolved only
     inside the Node/Bun loader.
   - Every call site gets the same TS functions as before.
   - `worker-bundle.test.ts` and the existing Worker tests pass unchanged.
-- The Lambda handlers (read API, pipeline, bob-costas) do not call `initScrubEngine`. Under `ts`
-  they resolve lazily, as before. Under `wasm` they would refuse with `not_initialised`, which is
-  fail-closed. They are hosted-only and out of scope for the self-host cutover.
+- The Lambda handlers (read API, pipeline incl. the bob-costas stage, upload admission, buffered
+  GC, rearm sweeper) declare the `hosted-lambda` TS grant at handler entry and do not call
+  `initScrubEngine`. Unset or `ts` then resolves lazily to TypeScript, as before. Under `wasm` they
+  would refuse with `not_initialised`, which is fail-closed. They are hosted-only and out of scope
+  for the self-host cutover.
 
-## wasm-bindgen path (`SCRUB_ENGINE=wasm-bindgen`, default off)
+## wasm-bindgen path (`SCRUB_ENGINE=wasm-bindgen`, the default)
 
 A third engine for the relayscrubber package as published by wasm-bindgen: generated
 `relayscrubber_bg.wasm`, the generated JS glue `relayscrubber.js`, and the package
@@ -380,8 +396,9 @@ Worker bundle qualification remains open (Workers are excluded from the cutover)
 
 ## Cutover: pinned relayscrubber 0.5.0-alpha.9
 
-Opt-in only. With `SCRUB_ENGINE` unset, `""` or `ts` every path is byte-identical to before:
-the TS engine, the TS `sealRawChunk`, ruleset `relayhistory-scrub` version 8, and
+The default since "Default flip" (below): with `SCRUB_ENGINE` unset or `""` every Node / Bun
+process runs this engine. Only a process holding a TS grant (hosted Worker / Lambda handlers, test
+preloads) keeps the TS engine, the TS `sealRawChunk` and ruleset version 8; there
 `routedRawChunkSealerDeps()` returns `{}` so every constructor's object is unchanged.
 
 ### Pin (`packages/pipeline/scrub-bindgen-pin.json`)
@@ -469,18 +486,24 @@ Provenance checks:
 
 ### Env triple (AA self-host services image)
 
+No binding is needed any more: unset `SCRUB_ENGINE`, unset `SCRUB_ENGINE_REQUIRED` and unset
+`READER_MAX_RULESET` (self-host effective ceiling 10, `effectiveReaderMaxRuleset`) select this
+engine. The former opt-in triple is still accepted and selects exactly the same engine:
+
 ```
 SCRUB_ENGINE=wasm-bindgen
-SCRUB_ENGINE_REQUIRED=wasm-bindgen
+SCRUB_ENGINE_REQUIRED=wasm-bindgen   # optional pin: refuses any other kind, overrides a TS grant
 READER_MAX_RULESET=10
 ```
 
-No other binding is needed. `READER_MAX_RULESET=10` must already be live on every reader
-(reader-first, see "Reader-first rollout") before any process runs the triple.
+`technical-foul-cutover.json` records this as `envTriple` with every value `null` (unset). Readers
+accept version 10 by default (reader-first, see "Self-host default reader ceiling") before any
+writer stamps it.
 
 ### Routing
 
-Under the triple, `routedRawChunkSealer()` (`scrub-engine/index.ts`) returns a sealer bound with
+When the resolved kind is wasm-bindgen (the default, or the explicit triple), `routedRawChunkSealer()`
+(`scrub-engine/index.ts`) uses the resolved kind, never a raw env comparison, and returns a sealer bound with
 `bindEngineRawSealer` to the exact verified instance `initScrubEngine` installed, cached per
 instance. `routedRawChunkSealerDeps()` spreads it into each production constructor after
 `initScrubEngine` has resolved:
@@ -492,7 +515,7 @@ instance. `routedRawChunkSealerDeps()` spreads it into each production construct
 | `src/migration/neon-s3-sync/export-session.ts` | `src/migration/neon-s3-sync/main.ts` `Syncer` target (initialises the engine first under `wasm-bindgen`) |
 | `packages/pipeline/src/routes/pipeline.ts` | `src/alleyoop/ingest.ts` `createPipelineRoutes` |
 
-Callers that reach the seam with no bound sealer are **unwired, refuses under the triple**
+Callers that reach the seam with no bound sealer are **unwired, refuses under the default**
 (`seal_path_not_routed`, zero TS sealer calls, nothing stored):
 
 | Unwired call site | Why |
@@ -504,8 +527,11 @@ Callers that reach the seam with no bound sealer are **unwired, refuses under th
 The seam's `sealRawChunk` keeps refusing non-TS engines (`seal_path_not_routed`), so any call site
 that is not wired refuses instead of falling back. There is no TS or raw fallback on the selected path.
 `src/session-ingest/__tests__/scrub-cutover-reachability.test.ts` drives all four wired paths end to end
-and proves zero TS scrub/sealer calls under the triple, with a positive control under the default. It
-also drives the three unwired callers under the triple and asserts each refuses with
+and proves zero TS scrub/sealer calls with `SCRUB_ENGINE`, `SCRUB_ENGINE_REQUIRED` and
+`READER_MAX_RULESET` unset and no TS grant (the default), with a positive control in a process
+holding the hosted TS grant with the knob unset, and `SCRUB_ENGINE=ts` rows without a grant that
+refuse with `scrub_engine_ts_not_allowed`. It also drives the three unwired callers under the
+default and asserts each refuses with
 `seal_path_not_routed` and stores nothing, and a source scan fails if any `?? sealRawChunk` fallback or
 `DeliverDeps` / `PipelineRouteDeps` / publication-deps / write-target constructor is not classified as
 wired or unwired. `scripts/scrub-cutover-reachability.ts` runs it and writes a JSON report.
@@ -523,6 +549,8 @@ wired or unwired. `scripts/scrub-cutover-reachability.ts` runs it and writes a J
 | Instance manifest differs from the pin | `bindgen_manifest_mismatch_<field>` / `bindgen_profile_mismatch` |
 | `SCRUB_ENGINE_REQUIRED=wasm-bindgen` and the instance was verified against another pin | `bindgen_pin_not_exact` |
 | `SCRUB_ENGINE_REQUIRED=wasm-bindgen` and `SCRUB_ENGINE` is anything else | `engine_selection_required` (latched) |
+| `SCRUB_ENGINE=ts` in a process without a TS grant (any Node / Bun self-host process or tool) | `ScrubEngineConfigError` `scrub_engine_ts_not_allowed` (latched) |
+| Scrub / log / seal call before `initScrubEngine` resolved (default) | scrub and seal throw `not_initialised`; `scrubTextForLog` returns `[scrub-unavailable]`; nothing latched |
 | Recognised tagged call refusal from the crate | that one call refuses (nonretryable `ScrubberError`); the instance stays healthy |
 | `WebAssembly.RuntimeError`, `RangeError`, or any unrecognised throw / malformed result | instance poisoned (sticky `scrubber_instance_poisoned`) |
 | Blank-only input (Rust `White_Space`, incl. U+0085) | refused at admission, engine not called, not poisoned |
@@ -546,10 +574,81 @@ answers `503 not_configured` rather than reading any bytes. No Worker config set
 `src/session-ingest/__tests__/worker-scrub-cutover-exclusion.test.ts` guards that the Worker never
 claims scrub version 10 (behaviour, bundle contents, sources and configs).
 
+### Default flip
+
+Since this change the pinned wasm-bindgen engine is the default scrub path; the opt-in triple is
+no longer needed (it still works, unchanged).
+
+**Resolution** (`resolveScrubEngineKind`, `packages/pipeline/src/lib/scrub-engine/index.ts:189`):
+
+| `SCRUB_ENGINE` | TS grant | `SCRUB_ENGINE_REQUIRED` | Kind |
+|---|---|---|---|
+| unset / `""` | none | unset or `wasm-bindgen` | wasm-bindgen |
+| unset / `""` | present | unset | ts |
+| unset / `""` | present | `wasm-bindgen` | wasm-bindgen (REQUIRED overrides the grant) |
+| `ts` | present | unset or `ts` | ts |
+| `ts` | none | any | refuses: `ScrubEngineConfigError`, `scrub_engine_invalid`, reason `scrub_engine_ts_not_allowed` (latched; a grant made later does not lift it) |
+| any | any | a different kind | refuses: reason `engine_selection_required` (latched) |
+
+Unset fails closed: an init failure (missing / mismatched vendored bytes, pin, manifest, profile,
+reader ceiling) throws `ScrubEngineUnavailable` with the existing reason, `scrubEngineReady()` is
+false, the failure is sticky for the process, and there is never a TS or raw fallback. A scrub or
+log call before init refuses (`scrubTextForLog` returns `[scrub-unavailable]`) but latches nothing,
+so the later same-kind `initScrubEngine()` still succeeds. Two initialisers in one process share one
+instance (the second call is a no-op returning it).
+
+**The TS grant** (`packages/pipeline/src/lib/scrub-engine/ts-capability.ts`): `declareScrubTsCapability(kind)`
+with kind `hosted-worker`, `hosted-lambda` or `test`. It is not environment-driven, is not
+re-exported from the seam or any package index, and `resetScrubEngineForTests()` clears it.
+`predicate-hook.ts` agrees with the seam before it loads (no grant: the identifier predicate fails).
+The only TS-capable entry points are these artifact-incapable hosted handlers (they ship no
+relayscrubber bytes), each declaring at handler entry, never at module load, because self-host Node
+services import the same modules for helpers:
+
+| Entry point | Grant (file:line) |
+|---|---|
+| Hosted ingest Worker `fetch` / `queue` (via `scrubEngineReady`) | `src/session-ingest/worker.ts:584` (`hosted-worker`) |
+| Hosted session-read Worker `fetch` | `packages/session-read-worker/src/index.ts:638` (`hosted-worker`) |
+| Read API Lambda handler | `src/session-read-api/lambda.ts:742` (`hosted-lambda`) |
+| Session pipeline Lambda handler (incl. bob-costas / session-brief stages) | `src/session-pipeline/lambda.ts:881` (`hosted-lambda`) |
+| Upload admission Lambda handler | `src/session-ingest/upload-admission-lambda.ts:54` (`hosted-lambda`) |
+| Buffered GC Lambda handler | `src/session-ingest/buffered-gc-lambda.ts:8` (`hosted-lambda`) |
+| Rearm sweeper Lambda handler | `src/session-ingest/rearm-sweeper-lambda.ts:18` (`hosted-lambda`) |
+| Test preloads only | `scripts/test-preload/scrub-ts-capability.ts` (root `bunfig.toml` `[test] preload`), `packages/pipeline/test/setup/scrub-ts-capability.ts` (vitest `setupFiles`), `packages/session-read-worker/test/setup-env.ts:12` (`test`) |
+
+Node self-host never reaches TS, even with `SCRUB_ENGINE=ts`. The large canonical read worker
+(`src/session-pipeline/large-read-main.ts`) initialises the default and fails closed
+(`scrub_engine_unavailable`) where the vendored bytes are absent; its bundle never contains the wasm
+bytes or the pin digest (`src/session-pipeline/__tests__/large-read-bundle.test.ts`).
+
+**Entry inventory** (`scripts/scrub-default-scan.ts`, enforced in CI by
+`src/session-ingest/__tests__/scrub-default-scan.test.ts`): every tracked executable `.ts` entry under
+`src`, `packages`, `scripts`, `e2e` and `benchmarks` whose import graph reaches the seam must call
+`initScrubEngine(` (or `runWorker(`), or be listed in `ENTRY_EXEMPT` with a reason (GitHub-API gates,
+bundlers, the technical-foul manifest writer, the RDS activation and claim-records archive tools,
+which import the seam graph but never scrub). It also fails on a grant declared outside the
+enumerated declarers, a grant re-exported from the seam, a production module importing a test
+preload, and a stale exemption. Each rule is mutation-tested.
+
+**Tests** (each in a clean child process, no preload, asserting no grant at start):
+`src/session-ingest/__tests__/scrub-default-flip.test.ts` (fixture child
+`src/session-ingest/__tests__/fixtures/scrub-default-child.ts`) covers unset default with a routed
+seal and readback of a fixture session body, explicit `wasm-bindgen`, explicit `wasm`, disallowed
+Node TS (test "SCRUB_ENGINE=ts without a capability grant refuses with scrub_engine_ts_not_allowed,
+sticky"), REQUIRED pass / refuse, init failure, pre-init logging, a Node service entry and the
+hosted handler-entry grant.
+
+**Unchanged:** the reader-first policy and its 8..10 bounds, marker and profile comparison, tagged
+refusals, the 16 MiB preflight, blank parity (U+0085, U+FEFF), empty-input refusal, non-retryable
+oversize, shared poison, the seam's `sealRawChunk` refusal (`seal_path_not_routed`), the pin and the
+vendored bytes, the ruleset / profile / marker (v8 and v10 reads stay compatible), and
+`technical-foul.json`.
+
 ### Rollback
 
-Unset the env triple on the writers and restart (every path returns to the TS engine and
-version 8), then revert this change. On readers keep `READER_MAX_RULESET=10` while any
+Deploy the previous image, or revert the pin (and this change), and restart. There is no
+environment switch back to TS on Node self-host: `SCRUB_ENGINE=ts` refuses there by design. On
+readers keep accepting version 10 (the self-host default, or `READER_MAX_RULESET=10`) while any
 version-10 objects remain stored: reverting the writer does not downgrade existing objects.
 
 ## Import cycle (why `predicate-hook.ts`)
@@ -562,10 +661,12 @@ A static import of the seam from `trace.ts` would form the cycle
 dependency on the seam. The seam installs the hook at load:
 
 - Under `ts`, the hook is exactly `scrubText`.
-- Under `wasm`, the hook is the engine's `scrubText`. An unavailable or failed engine returns
-  `undefined`, so `isSafeIdentifier` is false and the id is dropped.
-- Before the seam loads, the hook reads `SCRUB_ENGINE` the same way: unset, `""` or `ts` uses
-  `scrubText`, and anything else returns `undefined`.
+- Under `wasm` / `wasm-bindgen` (the default), the hook is the engine's `scrubText`. An
+  unavailable, uninitialised or failed engine returns `undefined`, so `isSafeIdentifier` is false
+  and the id is dropped.
+- Before the seam loads, the hook resolves the way the seam does: `scrubText` only in a process
+  holding a TS grant with `SCRUB_ENGINE` unset, `""` or `ts` and no `SCRUB_ENGINE_REQUIRED=wasm-bindgen`;
+  anything else (including the ungranted default) returns `undefined`.
 
 ## Known non-seam uses of scrub.ts / raw-chunks.ts (allowed, documented)
 
@@ -659,7 +760,7 @@ Canonical record/transcript readers, export readers, the indexing consumer, brie
 
 Node services validate the setting at startup and thread it into canonical reads. Alleyoop also forwards it through its real app bindings. Canonical and timing Worker routes validate their own bindings rather than consulting a Node process environment. Offline seed readers receive an explicit optional policy in their dependencies. An unset policy does not add a marker check to any of these paths. The wasm-bindgen pin parser retains a separate default writer ceiling of 8 and refuses a writer above its ceiling before reading artifacts or initializing glue; `initScrubEngine` passes it the effective ceiling (`effectiveReaderMaxRuleset`: explicit `READER_MAX_RULESET` first, unset = `DEFAULT_SELF_HOST_READER_MAX_RULESET` (10) on Node / Bun, 8 for the hosted ingest Worker via `hostedReaderCeiling`). The alleyoop courier's per-chunk version check uses the same function. Compiled-module callers must pass their verified reader ceiling explicitly when it exceeds the default. The raw ABI path remains unpinned and outside this first cutover.
 
-Operationally, deploy and verify every relevant reader with ceiling 10 **while the Rust engine remains off**, then qualify and enable the matching writer. Self-host readers accept ruleset 10 by default (see "Self-host default reader ceiling" below): an unset `READER_MAX_RULESET` no longer refuses the v10 pin on Node / Bun. An operator who explicitly sets `READER_MAX_RULESET=8` (or 9) on a process keeps that process refusing the v10 pin. Configuration in one process does not prove that a remote fleet has been upgraded. Keep the reader ceiling at 10 on rollback while version-10 objects remain stored; reverting a writer does not downgrade existing objects. Existing artifact-page formats do not change. This source change does not satisfy the remaining package safety, provenance, error-tagging, Worker build-binding or persistence-routing gates.
+Operationally, deploy and verify every relevant reader with ceiling 10 **while the Rust engine remains off**, then qualify and enable the matching writer. Since "Default flip" the writer is on by default in every Node / Bun self-host process, so an image carrying it may only be deployed where every reader of its objects already accepts 10 (the self-host default below, or an explicit `READER_MAX_RULESET=10`). Self-host readers accept ruleset 10 by default (see "Self-host default reader ceiling" below): an unset `READER_MAX_RULESET` no longer refuses the v10 pin on Node / Bun. An operator who explicitly sets `READER_MAX_RULESET=8` (or 9) on a process keeps that process refusing the v10 pin. Configuration in one process does not prove that a remote fleet has been upgraded. Keep the reader ceiling at 10 on rollback while version-10 objects remain stored; reverting a writer does not downgrade existing objects. Existing artifact-page formats do not change. This source change does not satisfy the remaining package safety, provenance, error-tagging, Worker build-binding or persistence-routing gates.
 
 
 ### Reader-first rollout: entrypoints honouring READER_MAX_RULESET

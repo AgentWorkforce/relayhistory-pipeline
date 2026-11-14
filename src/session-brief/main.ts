@@ -12,7 +12,11 @@ import { createAnalysisTransport } from "./engine/transport.ts";
 import { briefTick } from "./worker.ts";
 import { canonicalBriefInputFromEnv } from "./canonical-input.ts";
 import { briefCollectorFetch } from "./analytics-transport.ts";
+import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 
+// Scrub engine (docs/scrub-engine.md, "Default flip"): initialise before the first log line below, which
+// would otherwise be emitted as [scrub-unavailable]; runWorker's own initScrubEngine() then shares this instance.
+await initScrubEngine();
 const config = briefConfig();
 const analyticsSettings = analyticsConfig(process.env, "selfhost");
 const fetchCollector = briefCollectorFetch(analyticsSettings);

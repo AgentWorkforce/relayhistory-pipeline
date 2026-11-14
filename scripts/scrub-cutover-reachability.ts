@@ -7,11 +7,14 @@
  * other tests), which drives the ingest writer, publication image, routes/pipeline
  * and neon-s3-sync export with every TS scrub/seal entry point spied, then rechecks
  * its JSON rows here:
- *   - cutover (SCRUB_ENGINE=wasm-bindgen + SCRUB_ENGINE_REQUIRED=wasm-bindgen +
- *     READER_MAX_RULESET=10): routed sealer installed, zero TS calls, scrub version 10,
+ *   - cutover (the default: SCRUB_ENGINE, SCRUB_ENGINE_REQUIRED and READER_MAX_RULESET
+ *     unset, no TS capability): routed sealer installed, zero TS calls, scrub version 10,
  *     crate profile, the fixture secret absent from the sealed bytes;
- *   - control (knob unset): no routed sealer, the TS sealer ran, version 8, no profile;
- *   - unwired (under the triple; publication canary, default pipelineRoutes, Worker
+ *   - ts-refused (SCRUB_ENGINE=ts without a TS capability, i.e. a Node self-host entry):
+ *     refused with scrub_engine_ts_not_allowed, zero TS calls, no raw object written;
+ *   - control (hosted TS capability, knob unset): no routed sealer, the TS sealer ran,
+ *     version 8, no profile;
+ *   - unwired (under the default; publication canary, default pipelineRoutes, Worker
  *     deliverDepsFor): the seam refused exactly once with seal_path_not_routed, zero TS
  *     calls, no raw object written.
  * The same test file also scans the sources so every seal-capable construction is
@@ -35,12 +38,12 @@ const raw = `${out}.rows.json`;
 rmSync(raw, { force: true });
 
 const env: Record<string, string | undefined> = { ...process.env, SCRUB_REACHABILITY_REPORT: raw };
-// The test sets the triple itself; an inherited selection must not leak in.
+// The test sets each mode's env itself; an inherited selection must not leak in.
 for (const k of ["SCRUB_ENGINE", "SCRUB_ENGINE_REQUIRED", "READER_MAX_RULESET", "SCRUB_BINDGEN_DIR"]) delete env[k];
 const run = spawnSync(process.execPath, ["test", "--timeout", "300000", TEST], { cwd: ROOT, env, encoding: "utf8" });
 const failures: string[] = [];
 if (run.status !== 0) failures.push(`test run exited ${run.status}: ${(run.stderr || run.stdout).split("\n").filter((l) => /fail|error/i.test(l)).slice(0, 20).join(" | ")}`);
-const rows: { caller: string; mode: string; routedSealer: boolean; tsCalls: Record<string, number>; scrubVersion?: string; scrubProfile?: string; secretInSealedBytes?: boolean; seamRefusals?: string[]; rawObjectsWritten?: number }[] = existsSync(raw) ? JSON.parse(readFileSync(raw, "utf8")).rows : [];
+const rows: { caller: string; mode: string; routedSealer: boolean; tsCalls: Record<string, number>; scrubVersion?: string; scrubProfile?: string; secretInSealedBytes?: boolean; seamRefusals?: string[]; outcome?: string; rawObjectsWritten?: number }[] = existsSync(raw) ? JSON.parse(readFileSync(raw, "utf8")).rows : [];
 rmSync(raw, { force: true });
 
 for (const mode of ["cutover", "control"])
@@ -54,11 +57,19 @@ for (const mode of ["cutover", "control"])
       if (row.scrubVersion !== "10" || row.scrubProfile !== "relayhistory-secrets-v10") failures.push(`${mode}/${caller}: marker ${row.scrubVersion}/${row.scrubProfile}`);
       if (row.secretInSealedBytes) failures.push(`${mode}/${caller}: secret survived sealing`);
     } else {
-      if (row.routedSealer) failures.push(`${mode}/${caller}: routed sealer installed with the knob unset`);
+      if (row.routedSealer) failures.push(`${mode}/${caller}: routed sealer installed in the hosted TS process`);
       if (!(row.tsCalls["raw-chunks.ts#sealRawChunk"]! >= 1)) failures.push(`${mode}/${caller}: TS sealer not used`);
       if (row.scrubVersion !== "8" || row.scrubProfile !== undefined) failures.push(`${mode}/${caller}: marker ${row.scrubVersion}/${row.scrubProfile}`);
     }
   }
+for (const caller of CALLERS) {
+  const row = rows.find((r) => r.caller === caller && r.mode === "ts-refused");
+  if (!row) { failures.push(`ts-refused/${caller}: no row`); continue; }
+  const ts = Object.values(row.tsCalls).reduce((a, b) => a + b, 0);
+  if (ts !== 0) failures.push(`ts-refused/${caller}: ${ts} TS scrub/seal calls`);
+  if (row.outcome !== "scrub_engine_ts_not_allowed") failures.push(`ts-refused/${caller}: outcome ${row.outcome}`);
+  if (row.rawObjectsWritten !== 0) failures.push(`ts-refused/${caller}: ${row.rawObjectsWritten} raw objects written`);
+}
 for (const caller of UNWIRED) {
   const row = rows.find((r) => r.caller === caller && r.mode === "unwired");
   if (!row) { failures.push(`unwired/${caller}: no row`); continue; }

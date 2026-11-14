@@ -12,6 +12,9 @@ import {deliveryAccount} from "../src/session-ingest/vendor/delivery/prepare.ts"
 import {DELIVERY_MAPPING_VERSION} from "../src/session-ingest/vendor/delivery/delivery-contracts.ts";
 import type {OrderedControl} from "../src/session-ingest/control-protocol.ts";
 import type {SelectionInput,LedgerTenant} from "../src/session-ingest/ledger.ts";
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 const out=process.env.ORDERED_CONTROL_PROOF_OUT??"";
 if(process.env.ORDERED_CONTROL_DISPOSABLE!=="1"||!out.startsWith("/home/khaliqgant/relay-briefs/ordered-controls-proof-"))throw Error("owned_only");
 const inspect=JSON.parse(execFileSync("docker",["inspect","ordered-controls-pg17-20261104"],{encoding:"utf8"}))[0];

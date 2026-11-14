@@ -37,7 +37,7 @@ import { sha256Hex } from "../../packages/object-store/src/crypto.ts";
 import { createOpenSearchCapableSearchIndexRegistry } from "../../packages/pipeline/src/adapters/defaults.ts";
 import { syntheticDoc } from "../../packages/pipeline/src/search-index/conformance.ts";
 import { matchesQuery, positionOf } from "../../packages/pipeline/src/search-index/contracts.ts";
-import { scrubRecords } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
+import { scrubRecords, initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import type { SqlExecutor } from "../../packages/pipeline/src/lib/pipeline/queue.ts";
 import { PLANTED_CONTENT_MARKER, PLANTED_SECRETS } from "../../src/concourse/seed.ts";
 import { composeSearchService } from "../../src/shared/search-composition.ts";
@@ -55,6 +55,8 @@ import type { SessionScope } from "../../src/session-pipeline/pointer.ts";
 import type { SearchProjectionState } from "../../src/session-pipeline/search-adapter.ts";
 import { indexSearchScope } from "../../src/session-pipeline/search-index.ts";
 import { readerMaxRuleset } from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 
 const URL_ = process.env.SEARCH_INDEX_OPENSEARCH_TEST_URL?.trim();
 const DIALECT = process.env.SEARCH_INDEX_OPENSEARCH_TEST_DIALECT?.trim() || "opensearch";

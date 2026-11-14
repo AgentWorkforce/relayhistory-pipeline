@@ -2,6 +2,9 @@
 import {mkdir,readdir,writeFile} from "node:fs/promises";import {join,resolve} from "node:path";import {execFileSync} from "node:child_process";
 import {legacyAnalysisOracle} from "../src/session-pipeline/__tests__/analysis-oracle-fixture.ts";
 import {replayDatabase,addReplayPointer,createFsStore,REPLAY_FIXTURE_IDENTITY as identity} from "../src/session-pipeline/__tests__/replay-fixture.ts";
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 import {projectSessionDirectory} from "../src/hoopdb/session-directory-projector.ts";import {analysisRefreshTick} from "../src/session-pipeline/analysis-refresh.ts";
 import {analysisSnapshotJson} from "../src/session-read-api/session-analysis-artifact.ts";import {artifactDigest} from "../src/session-pipeline/replay-pages.ts";
 const arg=process.argv.indexOf("--out");if(arg<0||!process.argv[arg+1])throw Error("--out required");const out=resolve(process.argv[arg+1]!);await mkdir(out,{recursive:true});if((await readdir(out)).length)throw Error("output must be empty");

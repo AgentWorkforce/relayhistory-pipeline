@@ -22,6 +22,9 @@ import {deliveryAccount} from "../src/session-ingest/vendor/delivery/prepare.ts"
 import {DELIVERY_MAPPING_VERSION,type HistoryExportBatch} from "../src/session-ingest/vendor/delivery/delivery-contracts.ts";
 import {runBufferedGcJob as sourceJob} from "../src/session-ingest/buffered-gc-job.ts";
 import {SemanticPostgresExecutor} from "../src/search-features/semantic-copy-postgres.ts";
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 const out=process.env.GC_RUNTIME_PROOF_OUT??"";
 const jobBundle=process.env.GC_RUNTIME_JOB_BUNDLE;
 if(jobBundle&&!/^\/home\/khaliqgant\/relay-briefs\/gc-runtime-build-[A-Za-z0-9_-]+\/bundle\/index\.mjs$/.test(jobBundle))throw Error("owned_bundle_only");

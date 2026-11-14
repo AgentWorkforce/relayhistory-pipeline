@@ -29,6 +29,7 @@
  * the ingest login) arrives as the optional "retentionDatabaseUrl" field of the same stdin
  * credential JSON, required only when the phase is not off.
  */
+import { initScrubEngine } from "../../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import type { Queryable } from "../relayhistory-export.ts";
 import { sessionReadOnly } from "../neon-s3-sync/neon-reader.ts";
 import { SyncState, obligationsFlag } from "../neon-s3-sync/state.ts";
@@ -144,7 +145,8 @@ export async function main() {
 }
 
 if (import.meta.main)
-  main().catch((error) => {
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  initScrubEngine().then(() => main()).catch((error) => {
     log({ message: "exit on error", error_code: errorCode(error) });
     process.exit(1);
   });

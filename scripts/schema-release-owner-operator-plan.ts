@@ -1,4 +1,5 @@
 /** PLAN ONLY through the operator's existing Supabase CLI passwordless session. */
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { execFileSync } from "node:child_process";
 import pg from "pg";
 import { generation, inspectMigrations, migrationProfile, schemaStepDigests } from "../src/hoopdb/migrate.ts";
@@ -70,4 +71,5 @@ export async function operatorOwnerPlan() {
     console.log(JSON.stringify({ version: 1, status: "planned_readonly_not_apply_approval", at: new Date().toISOString(), project: PROJECT, sourceSha: input.sha, boundary: "global-default-revoke", existingEventTriggerMatchesSource: trigger.satisfied, ...report, bootstrap }));
   });
 }
-if (import.meta.main) operatorOwnerPlan().catch(error => { const code = typeof error?.code === "string" && /^[A-Za-z0-9_]{1,64}$/u.test(error.code) ? error.code : "operator_plan_failed"; console.log(JSON.stringify({ status: "refused", code })); process.exitCode = 1; });
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+if (import.meta.main) initScrubEngine().then(() => operatorOwnerPlan()).catch(error => { const code = typeof error?.code === "string" && /^[A-Za-z0-9_]{1,64}$/u.test(error.code) ? error.code : "operator_plan_failed"; console.log(JSON.stringify({ status: "refused", code })); process.exitCode = 1; });

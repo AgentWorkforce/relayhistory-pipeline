@@ -8,6 +8,7 @@ import {runLargeReadOnce,type LargeReadDeps} from "./large-read-worker.ts";
 import {errorFields,log} from "../shared/log.ts";
 import {classifyReplayFailure} from "./replay-publication.ts";
 import {readerMaxRuleset} from "../../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
+import {initScrubEngine} from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 export interface LargeReadRuntime { deps:LargeReadDeps;close:()=>Promise<void> }
 export function largeReadRuntime(env:NodeJS.ProcessEnv):LargeReadRuntime{
  const need=(key:string)=>{const value=env[key];if(!value)throw new Error(`large worker missing ${key}`);return value};
@@ -25,6 +26,10 @@ export function largeReadRuntime(env:NodeJS.ProcessEnv):LargeReadRuntime{
 export async function largeReadMain(env:NodeJS.ProcessEnv=process.env,factory:(env:NodeJS.ProcessEnv)=>LargeReadRuntime=largeReadRuntime){
  if(env.SESSION_LARGE_READ_WORKER_ENABLED!=="1")return {enabled:false,processed:0,published:0,failed:0,scanned:0,cycleComplete:false};
  const maxJobs=Number(env.SESSION_LARGE_READ_MAX_JOBS??"1");if(!Number.isInteger(maxJobs)||maxJobs<1||maxJobs>10)throw new Error("large worker invalid job bound");
+ // No TS grant here (docs/scrub-engine.md "Default flip"): the default wasm-bindgen engine is
+ // initialised before any connection opens. This image ships only large-read-main.mjs, no
+ // relayscrubber artifacts, so an enabled run fails closed here until it does.
+ await initScrubEngine({env});
  const runtime=factory(env),stop=new AbortController(),terminate=()=>stop.abort(),timer=setTimeout(terminate,30*60*1000);
  process.once("SIGTERM",terminate);process.once("SIGINT",terminate);
  let processed=0,published=0,failed=0,scanned=0,cycleComplete=false,scanPages=0,discoveryFailures=0,discoveryScopesFailed=0,discoveryScopesSkipped=0;

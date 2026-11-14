@@ -5,6 +5,7 @@
  * extra session carries shape-only fake secrets so the smoke test can prove
  * Technical Foul scrubbed them before they reached the Locker.
  */
+import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -132,6 +133,8 @@ async function syncConcourse(opts: { home: string; dbPath: string; bin?: string 
 }
 
 if (import.meta.main) {
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  await initScrubEngine();
   const dir = process.argv[2] ?? join(ROOT, ".96bulls/local/concourse");
   const r = await seedConcourse({ dir, fresh: process.argv.includes("--fresh") });
   console.log(JSON.stringify({ dbPath: r.dbPath, sessions: r.sessions.map((s) => s.sessionId) }, null, 2));

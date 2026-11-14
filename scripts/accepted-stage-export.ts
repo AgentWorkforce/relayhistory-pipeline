@@ -27,6 +27,7 @@
  *
  * Output: one JSON line of counts only (never a key, tenant id, hash or URL).
  */
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { readFileSync } from "node:fs";
 import pg from "pg";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
@@ -110,6 +111,8 @@ if (import.meta.main) {
   }
   let client: pg.Client | undefined;
   try {
+    // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+    await initScrubEngine();
     const accessKeyId = process.env.AWS_ACCESS_KEY_ID, secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
     if (!accessKeyId || !secretAccessKey) throw new Error("aws_credentials_required");
     const line = readFileSync(0, "utf8").split("\n")[0] ?? "";

@@ -28,6 +28,7 @@
  * incomplete or any marker failed (rerun), 2 refused / misconfigured, 4 any other failure. One JSON line per pass, counts
  * and codes only.
  */
+import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { readFileSync, statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { createS3Store } from "../../packages/object-store/src/index.ts";
@@ -233,11 +234,12 @@ if (import.meta.main) {
     process.on("SIGTERM", halt);
     process.on("SIGINT", halt);
     const sleep = (ms: number) => new Promise<void>((r) => { const t = setTimeout(r, ms); wake = () => { clearTimeout(t); r(); }; });
-    runRearmSweeperLoop(process.env, argv, (l) => console.log(JSON.stringify(l)), () => stop, sleep)
+    // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+    initScrubEngine().then(() => runRearmSweeperLoop(process.env, argv, (l) => console.log(JSON.stringify(l)), () => stop, sleep))
       .then(() => process.exit(0))
       .catch((e) => { console.error(JSON.stringify(errorLine(e))); process.exit(exitCodeForError(e)); });
   } else {
-    runRearmSweeperPass(process.env, argv)
+    initScrubEngine().then(() => runRearmSweeperPass(process.env, argv))
       .then(({ output }) => { console.log(JSON.stringify({ event: "rearm_sweep", ...output })); process.exit(exitCodeForPass(output)); })
       .catch((e) => { console.error(JSON.stringify(errorLine(e))); process.exit(exitCodeForError(e)); });
   }

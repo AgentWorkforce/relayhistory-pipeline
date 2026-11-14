@@ -9,6 +9,7 @@
  *      container log; the session uuid and trace id tie the services together;
  *   4. the trace endpoint reports the session as landed.
  */
+import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -211,6 +212,8 @@ export async function runSmoke(stage: string): Promise<boolean> {
 }
 
 if (import.meta.main) {
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  await initScrubEngine();
   const ok = await runSmoke(process.argv[2] ?? "local");
   process.exit(ok ? 0 : 1);
 }

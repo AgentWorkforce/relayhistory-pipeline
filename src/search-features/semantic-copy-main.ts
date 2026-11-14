@@ -1,3 +1,4 @@
+import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import {SemanticPostgresExecutor} from "./semantic-copy-postgres.ts";
 /** Portable explicit Node entry; disabled startup opens no client or credential. */
 import { analysisSourceReadonlyUrl, parseSecret } from "../session-pipeline/lambda.ts";
@@ -23,6 +24,7 @@ export async function semanticCopyMain(env: NodeJS.ProcessEnv = process.env, fac
 finally {
     await r.close();
 } }
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
 if (import.meta.main)
-    semanticCopyMain().then(r => { console.info(JSON.stringify({ message: "semantic copier", ...r })); if ("failed" in r && r.failed)
+    initScrubEngine().then(() => semanticCopyMain()).then(r => { console.info(JSON.stringify({ message: "semantic copier", ...r })); if ("failed" in r && r.failed)
         process.exitCode = 1; }).catch(() => { console.error(JSON.stringify({ message: "semantic copier failed", code: "semantic_copy_failed" })); process.exitCode = 1; });

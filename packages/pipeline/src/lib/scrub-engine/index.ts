@@ -3,24 +3,29 @@
  * functions here; docs/scrub-engine.md has the design, the ABI contract and the
  * reachability matrix.
  *
- * - `SCRUB_ENGINE` unset, "" or "ts": the TypeScript engine, byte-identical to
- *   calling scrub.ts / raw-chunks.ts directly (this is today's behaviour).
- * - `SCRUB_ENGINE=wasm-bindgen`: the pinned relayscrubber wasm-bindgen package
- *   (bindgen-engine.ts, scrub-bindgen-pin.json), with the same fail-closed rules.
- *   This is the first-cutover path; the raw ABI v1 `wasm` path stays in place.
- * - `SCRUB_ENGINE=wasm`: the pinned relayscrubber artifact only. Until
- *   `initScrubEngine` has succeeded, and for good after the instance traps,
- *   every scrub call throws a typed, content-free error. There is no fallback to
- *   the TypeScript engine and no raw passthrough.
+ * - `SCRUB_ENGINE` unset or "" (the DEFAULT) or `SCRUB_ENGINE=wasm-bindgen`: the pinned
+ *   relayscrubber wasm-bindgen package (bindgen-engine.ts, scrub-bindgen-pin.json).
+ *   Until `initScrubEngine` has verified it, and for good after the instance is
+ *   poisoned, every scrub call throws a typed, content-free error: never TypeScript,
+ *   never a raw passthrough. Self-host processes call `initScrubEngine()` at startup.
+ * - The TypeScript engine (byte-identical to scrub.ts / raw-chunks.ts) runs only in a
+ *   process holding a code-level grant (ts-capability.ts `declareScrubTsCapability`):
+ *   the enumerated hosted Worker / Lambda handlers, which ship no relayscrubber
+ *   artifacts, and the test preloads. There, unset, "" or "ts" select TypeScript.
+ *   Without a grant, `SCRUB_ENGINE=ts` refuses at selection
+ *   (`ScrubEngineConfigError`, reason `scrub_engine_ts_not_allowed`), sticky for the
+ *   process. docs/scrub-engine.md "Default flip" lists the granted entry points.
+ * - `SCRUB_ENGINE=wasm`: the raw ABI v1 path, unchanged.
  * - Anything else: `ScrubEngineConfigError` at selection (startup fails).
  *
- * `SCRUB_ENGINE_REQUIRED` (default off): unset or "" imposes nothing (today's
- * behaviour). Set to exactly "ts", "wasm" or "wasm-bindgen", it refuses any
- * selection whose SCRUB_ENGINE kind differs (unset SCRUB_ENGINE is "ts") with
+ * `SCRUB_ENGINE_REQUIRED` (default off): unset or "" imposes nothing. Set to exactly
+ * "ts", "wasm" or "wasm-bindgen", it refuses any selection whose resolved kind
+ * differs with
  * `ScrubEngineConfigError` reason `engine_selection_required`, and that refusal
  * is sticky for the process: every later selection and scrub call refuses too,
  * so a deployment that requires the wasm path never silently runs TypeScript.
- * It only refuses; it never selects or initialises anything.
+ * `SCRUB_ENGINE_REQUIRED=wasm-bindgen` overrides any TS grant: unset SCRUB_ENGINE then
+ * resolves to wasm-bindgen even in a granted process. Otherwise it only refuses.
  *
  * The selection is read once per process (isolate); a later, different
  * selection throws rather than switching engines.
@@ -28,6 +33,7 @@
 import { ScrubberError } from "./scrubber-error.js";
 export { ScrubberError, SCRUBBER_CALL_REFUSAL_CODES, type ScrubberDisposition, type ScrubberErrorCode } from "./scrubber-error.js";
 import { effectiveReaderMaxRuleset, readerMaxRuleset } from "./reader-policy.js";
+import { clearScrubTsCapabilitiesForTests, scrubTsAllowed } from "./ts-capability.js";
 import { sealRawChunk as sealRawChunkTs, type SealRawChunk, type SealedChunk } from "../pipeline/raw-chunks.js";
 import type { ObjectStore } from "../pipeline/object-layout.js";
 import { bindEngineRawSealer, type BoundRawChunkSealer } from "../pipeline/engine-raw-chunks.js";
@@ -138,11 +144,12 @@ export const SCRUB_WASM_PATH = "../../../scrub-wasm/relayscrubber.wasm";
 // import.meta.url, and module evaluation must not depend on it (hosted Worker unchanged).
 
 interface ScrubEngineEnv {
+  /** Unset or "": wasm-bindgen (TypeScript only in a granted process). See the module header. */
   SCRUB_ENGINE?: string | undefined;
   /**
    * Default off. Unset or "": no requirement. "ts" | "wasm" | "wasm-bindgen": selection
    * refuses (ScrubEngineConfigError, reason "engine_selection_required") unless the
-   * SCRUB_ENGINE kind (unset = "ts") is exactly this one. Anything else is a config error.
+   * resolved SCRUB_ENGINE kind is exactly this one. Anything else is a config error.
    */
   SCRUB_ENGINE_REQUIRED?: string | undefined;
   READER_MAX_RULESET?: string | undefined;
@@ -156,17 +163,58 @@ let lastFailure: ScrubEngineFailure | undefined;
 let pending: Promise<ScrubEngine> | undefined;
 /** Sticky for the process: a refused SCRUB_ENGINE_REQUIRED selection is never followed by a TS fallback. */
 let requiredRefused = false;
+/** Sticky for the process: SCRUB_ENGINE=ts without a TS grant is never followed by any engine. */
+let tsRefused = false;
 /** The SCRUB_ENGINE_REQUIRED kind a selection was made under (sticky once set). */
 let requiredKind: ScrubEngineKind | undefined;
 /** The active wasm-bindgen instance was verified against the checked-in pin (not a test pin). */
 let activePinExact = false;
 
-/** Parse SCRUB_ENGINE. Exact and case-sensitive; "" counts as unset. */
-export function parseScrubEngineKind(value: string | undefined): ScrubEngineKind {
-  if (value === undefined || value === "" || value === "ts") return "ts";
-  if (value === "wasm") return "wasm";
-  if (value === "wasm-bindgen") return "wasm-bindgen";
-  throw new ScrubEngineConfigError(`SCRUB_ENGINE must be unset, "ts", "wasm" or "wasm-bindgen"`);
+/**
+ * Resolve SCRUB_ENGINE. Exact and case-sensitive; "" counts as unset.
+ *
+ * - unset / "": "ts" in a process holding a TS grant, otherwise "wasm-bindgen" (the default).
+ * - "ts": "ts" with a grant; without one, ScrubEngineConfigError `scrub_engine_ts_not_allowed`.
+ * - "wasm" / "wasm-bindgen": that kind, grant or not.
+ * - `required` = "wasm-bindgen" overrides the grant for an unset value.
+ */
+export function parseScrubEngineKind(value: string | undefined, required?: ScrubEngineKind): ScrubEngineKind {
+  const kind = resolveScrubEngineKind(value, required);
+  if (kind === "ts_not_allowed") refuseTsSelection();
+  if (kind === undefined) throw new ScrubEngineConfigError(`SCRUB_ENGINE must be unset, "ts", "wasm" or "wasm-bindgen"`);
+  return kind;
+}
+
+/** The pure resolution rule behind parseScrubEngineKind: no latch, never throws. */
+function resolveScrubEngineKind(value: string | undefined, required?: ScrubEngineKind): ScrubEngineKind | "ts_not_allowed" | undefined {
+  if (value === undefined || value === "") return scrubTsAllowed() && required !== "wasm-bindgen" ? "ts" : "wasm-bindgen";
+  if (value === "ts") return scrubTsAllowed() ? "ts" : "ts_not_allowed";
+  if (value === "wasm" || value === "wasm-bindgen") return value;
+  return undefined;
+}
+
+/**
+ * The kind `selectScrubEngine(env)` would pick, without selecting or latching anything;
+ * undefined where selection would throw (that call then fails where it always did).
+ */
+function peekScrubEngineKind(env: ScrubEngineEnv | undefined): ScrubEngineKind | undefined {
+  let required: ScrubEngineKind | undefined;
+  try {
+    required = parseScrubEngineRequired(env?.SCRUB_ENGINE_REQUIRED);
+  } catch {
+    return undefined;
+  }
+  const kind = resolveScrubEngineKind(env?.SCRUB_ENGINE, required);
+  return kind === "ts_not_allowed" ? undefined : kind;
+}
+
+function refuseTsSelection(): never {
+  tsRefused = true;
+  lastFailure = "scrub_engine_ts_not_allowed";
+  throw new ScrubEngineConfigError(
+    "SCRUB_ENGINE=ts is not allowed in this process (scrub_engine_ts_not_allowed)",
+    "scrub_engine_ts_not_allowed",
+  );
 }
 
 /** Parse SCRUB_ENGINE_REQUIRED. Exact and case-sensitive; unset or "" = no requirement. */
@@ -193,10 +241,17 @@ function refuseRequiredSelection(): never {
  */
 export function selectScrubEngine(env: ScrubEngineEnv | undefined): ScrubEngineKind {
   if (requiredRefused) refuseRequiredSelection();
+  if (tsRefused) refuseTsSelection();
   const required = parseScrubEngineRequired(env?.SCRUB_ENGINE_REQUIRED);
-  const kind = parseScrubEngineKind(env?.SCRUB_ENGINE);
-  if (required !== undefined && (kind !== required || (selected !== undefined && selected !== required)))
+  const resolved = resolveScrubEngineKind(env?.SCRUB_ENGINE, required);
+  if (resolved === undefined) parseScrubEngineKind(env?.SCRUB_ENGINE, required); // throws the invalid-value error
+  // A requirement compares the named kind: SCRUB_ENGINE=ts is "ts" here even without a grant,
+  // so REQUIRED=wasm-bindgen with SCRUB_ENGINE=ts keeps its engine_selection_required latch.
+  const named = resolved === "ts_not_allowed" ? "ts" : resolved;
+  if (required !== undefined && (named !== required || (selected !== undefined && selected !== required)))
     refuseRequiredSelection();
+  if (resolved === "ts_not_allowed") refuseTsSelection();
+  const kind = resolved as ScrubEngineKind;
   if (required !== undefined) requiredKind = required;
   if (selected !== undefined && selected !== kind)
     throw new ScrubEngineConfigError(`SCRUB_ENGINE was already selected as "${selected}"`);
@@ -307,11 +362,14 @@ async function initBindgen(env: ScrubEngineEnv | undefined, o: NonNullable<InitS
 
 /**
  * The engine scrub calls use. Synchronous: with nothing selected yet it selects
- * from `process.env` (unset there means TypeScript, today's behaviour); with
- * wasm selected and not initialised (or failed) it throws ScrubEngineUnavailable.
+ * from `process.env` (unset there is wasm-bindgen unless the process holds a TS
+ * grant). The lazy selection records only the kind, no failure, so a later
+ * same-kind `initScrubEngine` still initialises; a different kind then throws.
+ * With wasm selected and not initialised (or failed) it throws ScrubEngineUnavailable.
  */
 export function activeScrubEngine(): ScrubEngine {
   if (requiredRefused) refuseRequiredSelection();
+  if (tsRefused) refuseTsSelection();
   if (selected === undefined) selectScrubEngine(processEnv());
   if (selected === "ts") return tsScrubEngine;
   const engine = active as (ScrubEngine & { failed?: boolean }) | undefined;
@@ -343,9 +401,13 @@ export function resetScrubEngineForTests(): void {
   lastFailure = undefined;
   pending = undefined;
   requiredRefused = false;
+  tsRefused = false;
   requiredKind = undefined;
   activePinExact = false;
   resetBindgenScrubEngineForTests();
+  // Grants too: a test that needs TypeScript after a reset declares it again
+  // (test preloads export the helper); production never resets.
+  clearScrubTsCapabilitiesForTests();
 }
 
 export const scrubText = (value: string): string => activeScrubEngine().scrubText(value);
@@ -419,10 +481,16 @@ const boundSealers = new WeakMap<ScrubEngine, BoundRawChunkSealer>();
  * The raw-chunk sealer a production constructor installs as `rawChunkSealer`
  * (docs/scrub-engine.md, "Cutover: pinned relayscrubber 0.5.0-alpha.9").
  *
- * - SCRUB_ENGINE unset, "" or "ts" (and the raw-ABI "wasm"): `undefined`, with no
- *   selection or any other side effect, so the constructor's object is exactly
- *   today's and the call site keeps using `sealRawChunk` above.
- * - SCRUB_ENGINE=wasm-bindgen: a sealer bound (`bindEngineRawSealer`) to the exact
+ * The kind is the RESOLVED one: the selected kind, or with nothing selected yet the kind
+ * `selectScrubEngine(process.env)` would pick (same rule, no latch): unset is wasm-bindgen
+ * unless the process holds a TS grant.
+ *
+ * - Resolved "ts" (a granted hosted entry) or the raw-ABI "wasm": `undefined`, so the
+ *   constructor's object is exactly today's and the call site keeps using `sealRawChunk`.
+ * - A value selection would refuse (invalid, or "ts" without a grant): `undefined` with no
+ *   side effect; the seam `sealRawChunk` then refuses through `activeScrubEngine`, so it
+ *   fails where it does today and never seals with TypeScript.
+ * - Resolved wasm-bindgen (the default): a sealer bound (`bindEngineRawSealer`) to the exact
  *   verified instance `initScrubEngine` installed. Throws, like `activeScrubEngine`,
  *   when that instance is not initialised, failed verification, is poisoned, or is
  *   not the checked-in pin under SCRUB_ENGINE_REQUIRED=wasm-bindgen. Call it after
@@ -430,9 +498,9 @@ const boundSealers = new WeakMap<ScrubEngine, BoundRawChunkSealer>();
  */
 export function routedRawChunkSealer(): BoundRawChunkSealer | undefined {
   if (requiredRefused) refuseRequiredSelection();
-  // Exact match only: any other value (unset, "", "ts", "wasm", or invalid) leaves the
-  // constructor's object as it is today; invalid values still fail where they do today.
-  const kind = selected ?? (processEnv()?.SCRUB_ENGINE === "wasm-bindgen" ? "wasm-bindgen" : undefined);
+  if (tsRefused) refuseTsSelection();
+  // The resolved kind, never a raw env comparison (an unset value is the wasm-bindgen default).
+  const kind = selected ?? peekScrubEngineKind(processEnv());
   if (kind !== "wasm-bindgen") return undefined;
   const engine = activeScrubEngine() as ScrubEngine & { readonly failed: boolean };
   // Only the instance initBindgen installed reaches here (activeScrubEngine never returns another).

@@ -8,12 +8,14 @@
  * ones before it. The handler never accepts factories, credentials or settings from its invocation payload.
  * One EMF line per pass: counts only.
  */
+import { declareScrubTsCapability } from "@rhc/lib/scrub-engine/ts-capability.ts";
 import { REARM_ENABLE_FLAG, rearmSweeperEnabled } from "./rearm-sweeper-main.ts";
 
 /** Stop listing this long before the Lambda's own deadline (one page's markers must still finish). */
 export const REARM_LAMBDA_RESERVE_MS = 60_000;
 
 export async function handler(_event: unknown = {}, context?: { getRemainingTimeInMillis?: () => number }) {
+  declareScrubTsCapability("hosted-lambda"); // hosted Lambda zip, no relayscrubber artifacts (docs/scrub-engine.md "Default flip")
   if (!rearmSweeperEnabled(process.env)) return { enabled: false };
   if ((process.env.INGEST_REARM_CREDENTIALS ?? "role") !== "role") throw Error("rearm_sweep_credentials_refused");
   const name = process.env.AWS_LAMBDA_FUNCTION_NAME ?? "rearm-sweeper";

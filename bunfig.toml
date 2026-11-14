@@ -1,2 +1,5 @@
 [test]
 root = "src"
+# TypeScript-scrub grant for tests ("test" kind only); see the file. Clean-process tests
+# run without it to assert the production default (docs/scrub-engine.md "Default flip").
+preload = ["./scripts/test-preload/scrub-ts-capability.ts"]

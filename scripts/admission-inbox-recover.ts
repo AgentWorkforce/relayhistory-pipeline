@@ -15,6 +15,7 @@
  * It writes nothing and prints only object keys (tenant ids and hashes, no content). Every argument
  * that reaches the request host is validated strictly before any credential is read.
  */
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { createS3Store, type ObjectStore } from "../src/shared/vendor.ts";
 import { pendingAdmissions } from "../src/session-ingest/async-admission.ts";
 
@@ -58,6 +59,8 @@ if (import.meta.main) {
     console.error("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY must be set in the environment");
     process.exit(2);
   }
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  await initScrubEngine();
   const store = createS3Store({
     bucket: args.bucket,
     region: args.region,

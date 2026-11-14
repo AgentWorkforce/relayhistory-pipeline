@@ -22,6 +22,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { generateLocalKeys, mintToken } from "../alleyoop/auth.ts";
 import { seedConcourse } from "../concourse/seed.ts";
+import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { planChildExitCode, planChildMustFailClosed } from "./plan-exit.ts";
 import { awsInvocation } from "./aws.ts";
 import { sandboxAlchemyEnv } from "./sandbox-credentials.ts";
@@ -226,6 +227,8 @@ async function readiness(stage: string) {
 }
 
 async function seed(stage: string, fresh: boolean) {
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  await initScrubEngine();
   const inputs = loadInputs(stage);
   const r = await seedConcourse({ dir: inputs.concourseDir, fresh });
   writeFileSync(join(stageDir(stage), "seed.json"), JSON.stringify({ seededAt: new Date().toISOString(), ...r }, null, 2));
@@ -382,6 +385,7 @@ async function main() {
     case "smoke": {
       const stage = requireLocalStage(stageArg);
       const { runSmoke } = await import("../smoke/e2e.ts");
+      await initScrubEngine();
       const ok = await runSmoke(stage);
       process.exit(ok ? 0 : 1);
     }

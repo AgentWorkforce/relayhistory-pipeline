@@ -1,13 +1,15 @@
 # Injected-engine raw sealing scaffold
 
-Status (cutover, pinned to relayscrubber `0.5.0-alpha.9`; first routed with `0.5.0-alpha.4`): the sealer is now routed in production, opt-in only.
-Under `SCRUB_ENGINE=wasm-bindgen` + `SCRUB_ENGINE_REQUIRED=wasm-bindgen` +
-`READER_MAX_RULESET=10`, `routedRawChunkSealer()` in `scrub-engine/index.ts` binds
-this sealer to the verified relayscrubber `0.5.0-alpha.9` instance and the four
-production constructors inject it (see docs/scrub-engine.md, "Cutover: pinned
+Status (cutover, pinned to relayscrubber `0.5.0-alpha.9`; first routed with `0.5.0-alpha.4`): the sealer is routed in production and is the DEFAULT seal path (docs/scrub-engine.md, "Default flip").
+With `SCRUB_ENGINE` unset (or the former opt-in triple `SCRUB_ENGINE=wasm-bindgen` +
+`SCRUB_ENGINE_REQUIRED=wasm-bindgen` + `READER_MAX_RULESET=10`) in any process without a
+TS grant, `routedRawChunkSealer()` in `scrub-engine/index.ts` resolves the kind to
+wasm-bindgen, binds this sealer to the verified relayscrubber `0.5.0-alpha.9` instance and
+the four production constructors inject it (see docs/scrub-engine.md, "Cutover: pinned
 relayscrubber 0.5.0-alpha.9"). The seam's own `sealRawChunk` still refuses non-TS
-engines with `seal_path_not_routed`, so an unwired call site refuses. With the
-default (unset/`ts`) nothing here is reached. The cutover's provenance is the new
+engines with `seal_path_not_routed`, so an unwired call site refuses. Only the enumerated
+hosted Worker / Lambda handlers (which ship no relayscrubber artifacts) and the test
+preloads hold the TS grant; there nothing here is reached. The cutover's provenance is the
 `packages/pipeline/technical-foul-cutover.json` entry; the historical TypeScript
 manifest (`technical-foul.json`) and `raw-chunks.ts` are unchanged. It does not
 qualify an image; image qualification and live acceptance remain separate.
@@ -62,7 +64,7 @@ The four real ports accept an explicit bound-sealer dependency:
   metadata-only and may already have been created before sealing.
 - Publication image: captures exact sealed bytes and options; durable
   publication uses those bytes/options after its prepare/register protocol.
-- Migration export: its default TS stamps and prior-chunk reuse stay unchanged.
+- Migration export: its TS stamps (granted test processes only since the default flip) and prior-chunk reuse stay unchanged.
   Explicit injection initializes the writer version from the bound marker,
   bypasses the prior-manifest shortcut so retention goes through the sealer,
   and checks returned versions against that bound writer. This audits the

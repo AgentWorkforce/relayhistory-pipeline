@@ -5,6 +5,9 @@ import {replayDatabase,exportReplayFixture,createFsStore,REPLAY_FIXTURE_IDENTITY
 import {produceCanonicalReplay} from "../src/session-pipeline/replay-publication.ts";
 import {readerMaxRuleset} from "../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
 import {objectKey,readAll} from "../packages/object-store/src/index.ts";
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 const output=resolve(process.argv[2]??"");
 if(!process.argv[2])throw Error("output required");
 await mkdir(output,{recursive:true});if((await readdir(output)).length)throw Error("output must be empty");

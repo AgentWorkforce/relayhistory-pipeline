@@ -61,6 +61,7 @@ import {
   supervisorContextRefusal, targetDescriptorSha256, verifySupervisor,
 } from "../src/migration/frozen-source-copy-supervisor.ts";
 import { repairControlHead } from "../src/hoopdb/frozen-control-head-repair.ts";
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 
 // The workflow hands the credential document to this process through stdin only; drop the step's copy of it.
 delete process.env.FROZEN_COPY_CREDENTIALS;
@@ -272,6 +273,8 @@ async function main() {
   if (mode === "repair-head") return repairHead();
   // Before any connection: a copy / seal / readback that is not the protected workflow's job stops here.
   if (job) { const unsupervised = supervisorContextRefusal(process.env, job); if (unsupervised) throw unsupervised; }
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  await initScrubEngine();
   const n = neon();
   openSource++;
   try {

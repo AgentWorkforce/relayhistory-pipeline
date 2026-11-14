@@ -34,6 +34,9 @@ import { inTransaction, openHoopDb, schemaVerdict } from "../../src/shared/db.ts
 import { expectedSchema, generation, migrationProfile } from "../../src/hoopdb/migrate.ts";
 import { functionBoundaryEvidence } from "../../src/hoopdb/migrate-guards.ts";
 import { SESSION_BOOTSTRAP_FILES } from "../../src/hoopdb/session-bootstrap-chain.ts";
+import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const HOST = process.env.PGPROOF_HOST ?? "127.0.0.1";

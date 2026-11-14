@@ -12,6 +12,7 @@ import { captureSeedScopeExportEvidence, createS3FrontierVersioningReader, type 
 import { evaluateCanonicalFrontier, frontierCanonicalJson, frontierSha256 } from "../src/session-ingest/frontier-plan.ts";
 import type { SeedSql } from "../src/session-ingest/seed.ts";
 import { readerMaxRuleset } from "../packages/pipeline/src/lib/scrub-engine/reader-policy.ts";
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 
 const PROTOCOL = "canonical-frontier-readonly-capture-runner-v1";
 const MAX_CONFIG = 1024 * 1024;
@@ -119,6 +120,8 @@ function readOnlyObjectStore(store: ObjectStore): ObjectStore {
 
 let sourceClient: pg.Client | undefined, seedClient: pg.Client | undefined;
 try {
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  await initScrubEngine();
   const paths = args(process.argv.slice(2));
   const input = config(JSON.parse(await stdinCapped()));
   await mkdir(paths.cacheDir, { recursive: true, mode: 0o700 });

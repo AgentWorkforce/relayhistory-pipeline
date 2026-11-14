@@ -210,10 +210,10 @@ export function stateForRun(execute: boolean, statePath: string, scratchDir = `$
 }
 
 export async function main() {
-  // SCRUB_ENGINE=wasm-bindgen (docs/scrub-engine.md, "Cutover"): verify the pinned engine before the
-  // state lock or any connection, so export sealing runs on the bound sealer. Any other value: no
-  // call, exactly as before (the seam selects lazily on the first seal and refuses non-TS there).
-  if (process.env.SCRUB_ENGINE === "wasm-bindgen") await initScrubEngine();
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): select and verify the pinned wasm-bindgen
+  // engine (the default) before the state lock or any connection, so export sealing runs on the bound
+  // sealer. Unconditional: SCRUB_ENGINE=ts refuses here (scrub_engine_ts_not_allowed), never TS.
+  await initScrubEngine();
   const execute = flag("execute");
   const urlFile = env("NEON_URL_FILE");
   const url = urlFile ? readFileSync(urlFile, "utf8").trim() : env("NEON_URL");

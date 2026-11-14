@@ -38,6 +38,7 @@ import {
   type ScrubEngineFailure,
 } from "../src/lib/scrub-engine/index.js";
 import { importGlueFromVerifiedBytes, initBindgenScrubEngine } from "../src/lib/scrub-engine/bindgen-engine.js";
+import { declareScrubTsCapability } from "../src/lib/scrub-engine/ts-capability.js";
 import pinFile from "../scrub-bindgen-pin.json";
 
 /** The placeholder pin checked in before the alpha.4 cutover (kept here as a refusal fixture). */
@@ -684,7 +685,16 @@ describe("wasm-bindgen: double and concurrent init", () => {
 // ---------------------------------------------------------------- selection
 
 describe("wasm-bindgen: selection", () => {
-  it("SCRUB_ENGINE unset is still the TypeScript engine, byte-identical", async () => {
+  it("SCRUB_ENGINE unset without a TS grant is the pinned wasm-bindgen engine (the default), never TypeScript", async () => {
+    const s = setup();
+    const engine = await initScrubEngine({ ...s.options, env: {} });
+    expect(engine.kind).toBe("wasm-bindgen");
+    expect(engine).not.toBe(tsScrubEngine);
+    expect(seam.activeScrubEngine()).toBe(engine);
+  });
+
+  it("SCRUB_ENGINE unset in a granted (hosted) process is still the TypeScript engine, byte-identical", async () => {
+    declareScrubTsCapability("test");
     expect(await initScrubEngine({ env: {} })).toBe(tsScrubEngine);
     const input = `Authorization: Bearer ${"z".repeat(40)} someone@example.com`;
     expect(seam.scrubText(input)).toBe(tsScrubText(input));
@@ -700,6 +710,9 @@ describe("wasm-bindgen: selection", () => {
     resetScrubEngineForTests();
     expect(selectScrubEngine({ SCRUB_ENGINE: "wasm-bindgen" })).toBe("wasm-bindgen");
     expect(() => selectScrubEngine({ SCRUB_ENGINE: "wasm" })).toThrow(ScrubEngineConfigError);
+    // Unset is the same kind (the default) without a grant; with one it is TypeScript and conflicts.
+    expect(selectScrubEngine({})).toBe("wasm-bindgen");
+    declareScrubTsCapability("test");
     expect(() => selectScrubEngine({})).toThrow(ScrubEngineConfigError);
   });
 
@@ -910,8 +923,15 @@ describe("reader-first writer initialization gate", () => {
 
 
 it("reader capability alone never selects or relabels the TS writer", async () => {
+  declareScrubTsCapability("test"); // TypeScript exists only in a granted (hosted) process
   const engine = await initScrubEngine({ env: { SCRUB_ENGINE: "ts", READER_MAX_RULESET: "10" } });
   expect(engine.kind).toBe("ts"); expect(engine.rulesetVersion).toBe(8);
+});
+
+it("reader capability never grants TypeScript: SCRUB_ENGINE=ts without a grant refuses (scrub_engine_ts_not_allowed)", async () => {
+  const error = await initScrubEngine({ env: { SCRUB_ENGINE: "ts", READER_MAX_RULESET: "10" } }).then(() => null, (e: unknown) => e);
+  expect(error).toBeInstanceOf(ScrubEngineConfigError);
+  expect((error as ScrubEngineConfigError).reason).toBe("scrub_engine_ts_not_allowed");
 });
 
 

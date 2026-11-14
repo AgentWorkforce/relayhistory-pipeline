@@ -40,6 +40,9 @@ import {
 import { gateOpen, workerTick } from "../../src/shared/worker.ts";
 import { hoopdbModeEnv } from "../../stacks/aws/eks.ts";
 import { gcpHoopdbModeEnv } from "../../stacks/gcp/config.ts";
+import { initScrubEngine } from "../../packages/pipeline/src/lib/scrub-engine/index.ts";
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
 const HOST = process.env.PGPROOF_HOST ?? "127.0.0.1";

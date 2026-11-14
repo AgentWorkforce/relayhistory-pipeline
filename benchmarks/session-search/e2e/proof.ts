@@ -26,6 +26,9 @@ import { liveKey, searchApp } from "./product.ts";
 import { applyShape, checkShapeFile } from "./shape.ts";
 import { ClickHouseHttp, installSchema, SessionSearchStore, type Scope, type SearchHit } from "./store.ts";
 import { NEEDLES, Oracle, oracleKey, QUERY_SET_VERSION, transcriptBatches } from "./transcripts.ts";
+import { initScrubEngine } from "../../../packages/pipeline/src/lib/scrub-engine/index.ts";
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 
 const url = process.env.BENCH_CH_URL ?? "http://127.0.0.1:8123";
 const scaleName = process.env.BENCH_SCALE ?? "test";

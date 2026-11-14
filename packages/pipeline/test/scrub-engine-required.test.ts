@@ -6,6 +6,8 @@
  * through the bindgen refusals, and under it only the exact checked-in pin is ready.
  * Module state (`selected`, the sticky refusal) is reset per case by resetScrubEngineForTests,
  * as in scrub-engine-bindgen.test.ts; process.env is saved and restored around each case.
+ * The reset also clears the test preload's TS grant, so every case runs with production
+ * semantics (unset SCRUB_ENGINE = wasm-bindgen) unless it calls `grantTs()` (a hosted entry).
  */
 import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -28,6 +30,12 @@ import {
   selectScrubEngine,
   tsScrubEngine,
 } from "../src/lib/scrub-engine/index.js";
+import { declareScrubTsCapability } from "../src/lib/scrub-engine/ts-capability.js";
+
+/** What a hosted Worker / Lambda handler holds (the "test" kind stands in for it). */
+const grantTs = () => declareScrubTsCapability("test");
+const isTsNotAllowed = (e: unknown) =>
+  e instanceof ScrubEngineConfigError && e.reason === "scrub_engine_ts_not_allowed" && e.code === "scrub_engine_invalid" && e.retryable === false;
 
 const enc = new TextEncoder();
 const sha = (b: Uint8Array) => createHash("sha256").update(b).digest("hex");
@@ -84,33 +92,78 @@ describe("parseScrubEngineRequired", () => {
     expect(() => selectScrubEngine({ SCRUB_ENGINE: "ts", SCRUB_ENGINE_REQUIRED: "yes" })).toThrow(
       expect.objectContaining({ code: "scrub_engine_invalid", reason: undefined }),
     );
+    // Unlatched: the default (wasm-bindgen) is selected, uninitialised, not a requirement refusal.
+    expect(selectScrubEngine({})).toBe("wasm-bindgen");
+    expect(() => activeScrubEngine()).toThrow(expect.objectContaining({ reason: "not_initialised" }));
+    resetScrubEngineForTests();
+    grantTs();
+    expect(await captureRejection(initScrubEngine({ env: { SCRUB_ENGINE_REQUIRED: "WASM-BINDGEN" } }))).toBeInstanceOf(ScrubEngineConfigError);
     expect(selectScrubEngine({})).toBe("ts");
     expect(activeScrubEngine()).toBe(tsScrubEngine);
   });
 });
 
-describe("SCRUB_ENGINE_REQUIRED unset: today's behaviour", () => {
-  for (const required of [undefined, ""])
-    it(`required=${JSON.stringify(required)}: SCRUB_ENGINE unset selects TypeScript and is ready`, async () => {
+describe("SCRUB_ENGINE_REQUIRED unset: the default (wasm-bindgen; TypeScript only with a grant)", () => {
+  for (const required of [undefined, ""]) {
+    it(`required=${JSON.stringify(required)}: SCRUB_ENGINE unset selects the pinned wasm-bindgen engine and is ready`, async () => {
+      expect((await initScrubEngine({ env: { SCRUB_ENGINE_REQUIRED: required } })).kind).toBe("wasm-bindgen");
+      expect(activeScrubEngine().kind).toBe("wasm-bindgen");
+      expect(scrubEngineReady()).toBe(true);
+    });
+    it(`required=${JSON.stringify(required)} in a granted (hosted) process: SCRUB_ENGINE unset selects TypeScript and is ready`, async () => {
+      grantTs();
       expect(await initScrubEngine({ env: { SCRUB_ENGINE_REQUIRED: required } })).toBe(tsScrubEngine);
       expect(activeScrubEngine()).toBe(tsScrubEngine);
       expect(scrubEngineReady()).toBe(true);
     });
+  }
 
-  it("process.env without the knob: activeScrubEngine still selects TypeScript lazily", () => {
+  it("process.env without the knob: activeScrubEngine lazily selects wasm-bindgen and refuses until initialised (never TypeScript)", () => {
+    expect(() => activeScrubEngine()).toThrow(expect.objectContaining({ reason: "not_initialised" }));
+    expect(scrubEngineReady()).toBe(false);
+    expect(scrubTextForLog("token=abc")).toBe(SCRUB_UNAVAILABLE_LOG_TEXT);
+  });
+
+  it("process.env without the knob in a granted process: activeScrubEngine selects TypeScript lazily", () => {
+    grantTs();
     expect(activeScrubEngine()).toBe(tsScrubEngine);
     expect(scrubEngineReady()).toBe(true);
   });
 });
 
 describe("SCRUB_ENGINE_REQUIRED matching SCRUB_ENGINE", () => {
-  it("required=ts with SCRUB_ENGINE unset, empty or ts selects TypeScript", async () => {
+  it("required=ts with SCRUB_ENGINE unset, empty or ts selects TypeScript in a granted process", async () => {
     for (const engine of [undefined, "", "ts"]) {
       resetScrubEngineForTests();
+      grantTs();
       expect(await initScrubEngine({ env: { SCRUB_ENGINE: engine, SCRUB_ENGINE_REQUIRED: "ts" } })).toBe(tsScrubEngine);
       expect(scrubEngineReady()).toBe(true);
     }
   });
+
+  it("required=ts without a grant: unset/empty resolve to wasm-bindgen (requirement refusal), ts is not allowed; both sticky", async () => {
+    for (const engine of [undefined, ""]) {
+      resetScrubEngineForTests();
+      expect(isRequiredRefusal(await captureRejection(initScrubEngine({ env: { SCRUB_ENGINE: engine, SCRUB_ENGINE_REQUIRED: "ts" } })))).toBe(true);
+      await expectRequiredRefusalEverywhere();
+    }
+    resetScrubEngineForTests();
+    expect(isTsNotAllowed(await captureRejection(initScrubEngine({ env: { SCRUB_ENGINE: "ts", SCRUB_ENGINE_REQUIRED: "ts" } })))).toBe(true);
+    expect(() => activeScrubEngine()).toThrow(expect.objectContaining({ reason: "scrub_engine_ts_not_allowed" }));
+    expect(scrubEngineReady()).toBe(false);
+  });
+
+  for (const engine of [undefined, ""])
+    it(`required=wasm-bindgen with SCRUB_ENGINE=${JSON.stringify(engine)} passes (the default), and overrides a TS grant`, async () => {
+      for (const granted of [false, true]) {
+        resetScrubEngineForTests();
+        if (granted) grantTs();
+        const e = await initScrubEngine({ env: { SCRUB_ENGINE: engine, SCRUB_ENGINE_REQUIRED: "wasm-bindgen" } });
+        expect(e.kind, `granted=${granted}`).toBe("wasm-bindgen");
+        expect(activeScrubEngine()).toBe(e);
+        expect(scrubEngineReady()).toBe(true);
+      }
+    });
 
   it("required=wasm-bindgen with a verified test-double pin (not the checked-in pin) is NOT ready: bindgen_pin_not_exact", async () => {
     const bytes = { wasm: enc.encode("synthetic wasm"), glue: enc.encode("synthetic glue"), loader: enc.encode("synthetic loader") };
@@ -130,9 +183,11 @@ describe("SCRUB_ENGINE_REQUIRED matching SCRUB_ENGINE", () => {
 
 describe("SCRUB_ENGINE_REQUIRED refuses another selection", () => {
   const mismatches: [string | undefined, string][] = [
-    [undefined, "wasm-bindgen"], ["", "wasm-bindgen"], ["ts", "wasm-bindgen"], ["wasm", "wasm-bindgen"],
-    [undefined, "wasm"], ["wasm-bindgen", "wasm"],
-    ["wasm", "ts"], ["wasm-bindgen", "ts"],
+    // Granted or not, a named kind that differs refuses (SCRUB_ENGINE=ts is "ts" here even
+    // without a grant). Unset with a requirement other than wasm-bindgen: the default differs.
+    ["ts", "wasm-bindgen"], ["wasm", "wasm-bindgen"],
+    [undefined, "wasm"], ["", "wasm"], ["wasm-bindgen", "wasm"], ["ts", "wasm"],
+    ["wasm", "ts"], ["wasm-bindgen", "ts"], [undefined, "ts"], ["", "ts"],
   ];
   for (const [engine, required] of mismatches)
     it(`SCRUB_ENGINE=${JSON.stringify(engine)} SCRUB_ENGINE_REQUIRED=${required}: initScrubEngine refuses and nothing runs`, async () => {
@@ -140,26 +195,37 @@ describe("SCRUB_ENGINE_REQUIRED refuses another selection", () => {
       await expectRequiredRefusalEverywhere();
     });
 
+  // In a granted (hosted) process unset/empty is TypeScript, so a wasm requirement still refuses.
+  for (const [engine, required] of [[undefined, "wasm"], ["", "wasm"], ["ts", "wasm-bindgen"]] as const)
+    it(`granted: SCRUB_ENGINE=${JSON.stringify(engine)} SCRUB_ENGINE_REQUIRED=${required}: initScrubEngine refuses and nothing runs`, async () => {
+      grantTs();
+      expect(isRequiredRefusal(await captureRejection(initScrubEngine({ env: { SCRUB_ENGINE: engine, SCRUB_ENGINE_REQUIRED: required } })))).toBe(true);
+      await expectRequiredRefusalEverywhere();
+    });
+
   it("selectScrubEngine refuses directly with the same reason", () => {
-    expect(() => selectScrubEngine({ SCRUB_ENGINE_REQUIRED: "wasm-bindgen" })).toThrow(expect.objectContaining({ reason: "engine_selection_required" }));
+    expect(() => selectScrubEngine({ SCRUB_ENGINE_REQUIRED: "wasm" })).toThrow(expect.objectContaining({ reason: "engine_selection_required" }));
     expect(scrubEngineReady()).toBe(false);
   });
 
-  it("from process.env: activeScrubEngine refuses instead of lazily selecting TypeScript", async () => {
-    process.env.SCRUB_ENGINE_REQUIRED = "wasm-bindgen";
+  it("from process.env: activeScrubEngine refuses instead of lazily selecting any engine", async () => {
+    process.env.SCRUB_ENGINE_REQUIRED = "wasm";
     expect(() => activeScrubEngine()).toThrow(ScrubEngineConfigError);
     await expectRequiredRefusalEverywhere();
   });
 
-  it("the refusal is sticky: a later explicit TS selection, or an env without the knob, never returns TypeScript", async () => {
-    expect(isRequiredRefusal(await captureRejection(initScrubEngine({ env: { SCRUB_ENGINE_REQUIRED: "wasm-bindgen" } })))).toBe(true);
+  it("the refusal is sticky: a later explicit TS selection, a later default, or an env without the knob, never returns an engine", async () => {
+    expect(isRequiredRefusal(await captureRejection(initScrubEngine({ env: { SCRUB_ENGINE_REQUIRED: "wasm" } })))).toBe(true);
+    grantTs(); // not even a grant arriving later reopens it
     expect(() => selectScrubEngine({ SCRUB_ENGINE: "ts" })).toThrow(ScrubEngineConfigError);
     expect(() => selectScrubEngine({})).toThrow(ScrubEngineConfigError);
     expect(isRequiredRefusal(await captureRejection(initScrubEngine({ env: {} })))).toBe(true);
+    expect(isRequiredRefusal(await captureRejection(initScrubEngine({ env: { SCRUB_ENGINE_REQUIRED: "wasm-bindgen" } })))).toBe(true);
     await expectRequiredRefusalEverywhere();
   });
 
-  it("an engine already selected as TypeScript is refused once a requirement for another kind arrives", async () => {
+  it("an engine already selected as TypeScript (granted) is refused once a requirement for another kind arrives", async () => {
+    grantTs();
     expect(activeScrubEngine()).toBe(tsScrubEngine);
     expect(isRequiredRefusal(await captureRejection(initScrubEngine({ env: { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen" } })))).toBe(true);
     await expectRequiredRefusalEverywhere();

@@ -8,6 +8,7 @@
  * afterwards), and a refusal on drift that leaves both tables unchanged. Synthetic identifiers and a fixture project
  * ref only. Exports the cached fixture the pglite test reuses. Run: bun scripts/ingest-admission-renewal-ci.ts
  */
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
@@ -159,7 +160,8 @@ async function main() {
 }
 
 if (import.meta.main)
-  main().catch((error) => {
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  initScrubEngine().then(() => main()).catch((error) => {
     console.error((error as Error).message);
     process.exitCode = 1;
   });

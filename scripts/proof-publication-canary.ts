@@ -25,6 +25,9 @@ import { canonicalArtifactPage } from "../src/session-read-api/canonical-artifac
 import { readCanonicalHistoryPage, type CanonicalHistoryAdapterConfig } from "../src/session-read-api/canonical-history-adapter.ts";
 import { deliveryAccount } from "../src/session-ingest/vendor/delivery/prepare.ts";
 import { DELIVERY_MAPPING_VERSION, type HistoryExportBatch } from "../src/session-ingest/vendor/delivery/delivery-contracts.ts";
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 
 const out = process.env.PUBLICATION_CANARY_PROOF_OUT ?? "";
 const pgName = process.env.PUBLICATION_CANARY_PG_CONTAINER ?? "";

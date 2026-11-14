@@ -1,4 +1,5 @@
 /** Separate existing-owner apply entry; 200's PLAN ONLY helper is untouched. */
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 import { execFileSync } from "node:child_process";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -186,7 +187,8 @@ export async function ownerApplyMain(argv = process.argv.slice(2), integration?:
   });
 }
 if (import.meta.main)
-  ownerApplyMain()
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  initScrubEngine().then(() => ownerApplyMain())
     .then((report) => console.log(JSON.stringify(report)))
     .catch((error) => {
       console.log(

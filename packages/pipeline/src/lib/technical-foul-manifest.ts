@@ -104,7 +104,15 @@ export interface TechnicalFoulCutoverManifest {
   schema: 1;
   entry: "cutover-relayscrubber-0.5.0-alpha.9";
   engine: "wasm-bindgen";
-  envTriple: { SCRUB_ENGINE: "wasm-bindgen"; SCRUB_ENGINE_REQUIRED: "wasm-bindgen"; READER_MAX_RULESET: "10" };
+  /**
+   * The environment that selects this engine. Since the default flip (docs/scrub-engine.md,
+   * "Default flip") it is the default: null = unset. Unset SCRUB_ENGINE selects wasm-bindgen
+   * (fail closed); SCRUB_ENGINE_REQUIRED is an optional pin; unset READER_MAX_RULESET resolves
+   * to the self-host effective ceiling 10 (`effectiveReaderMaxRuleset`). Explicit
+   * SCRUB_ENGINE=wasm-bindgen / SCRUB_ENGINE_REQUIRED=wasm-bindgen / READER_MAX_RULESET=10
+   * select the same engine.
+   */
+  envTriple: { SCRUB_ENGINE: null; SCRUB_ENGINE_REQUIRED: null; READER_MAX_RULESET: null };
   package: string;
   packageVersion: string;
   pinPath: string;
@@ -174,7 +182,7 @@ export function computeCutoverManifest(): TechnicalFoulCutoverManifest {
     schema: 1,
     entry: "cutover-relayscrubber-0.5.0-alpha.9",
     engine: "wasm-bindgen",
-    envTriple: { SCRUB_ENGINE: "wasm-bindgen", SCRUB_ENGINE_REQUIRED: "wasm-bindgen", READER_MAX_RULESET: "10" },
+    envTriple: { SCRUB_ENGINE: null, SCRUB_ENGINE_REQUIRED: null, READER_MAX_RULESET: null },
     package: pin.package,
     packageVersion: pin.package_version,
     pinPath: PIN_PATH,

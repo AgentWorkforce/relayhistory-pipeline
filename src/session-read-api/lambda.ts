@@ -56,6 +56,7 @@ import { awsJsonCall, lambdaCredentials } from "../session-pipeline/aws-json.ts"
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
 import { PIPELINE_RUNTIMES, validateAdapterEnv } from "@rhc/adapters/registry.ts";
+import { declareScrubTsCapability } from "@rhc/lib/scrub-engine/ts-capability.ts";
 import { createClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { createReadApi, parseDirectoryWorkspaces, type ReadApiDeps } from "./app.ts";
 import { sqlDirectory } from "./directory.ts";
@@ -736,6 +737,9 @@ export async function handleUrlEvent(app: { fetch(req: Request): Response | Prom
 export function createReadApiLambdaHandler(composition?: SearchComposition) {
 let appPromise: Promise<App> | undefined;
 return async function readApiHandler(event: FunctionUrlEvent): Promise<FunctionUrlResult> {
+  // Hosted Lambda zip (no relayscrubber artifacts): TypeScript scrub. Handler entry only;
+  // session-read-api/server.ts and other self-host services import this module for helpers.
+  declareScrubTsCapability("hosted-lambda");
   let app: Awaited<NonNullable<typeof appPromise>>;
   try {
     appPromise ??= buildApp(process.env, composition);

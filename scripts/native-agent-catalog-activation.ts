@@ -2,6 +2,7 @@
 import { expectedSchema } from "../src/hoopdb/migrate.ts";
 import { nativeAgentCatalogActivation } from "../src/hoopdb/native-agent-catalog-activation.ts";
 import { inTransaction, openHoopDb, schemaVerdict } from "../src/shared/db.ts";
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 
 const argv = process.argv.slice(2);
 // Opt-in only: accepts an empty install as complete. Plan and apply must agree;
@@ -21,6 +22,8 @@ if (process.env.HOOPDB_DB_MODE !== "selfhosted") {
 // configured via NODE_EXTRA_CA_CERTS, never by turning certificate checks off.
 let secure = false;
 try {
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  await initScrubEngine();
   const url = new URL(process.env.HOOPDB_URL ?? "");
   secure = ["postgres:", "postgresql:"].includes(url.protocol) &&
     url.searchParams.getAll("sslmode").length === 1 &&

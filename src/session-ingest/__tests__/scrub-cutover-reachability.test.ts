@@ -8,16 +8,21 @@
  * to end against scratch stores with the sealer the production constructors install
  * (`routedRawChunkSealerDeps()`):
  *
- * - under SCRUB_ENGINE=wasm-bindgen + SCRUB_ENGINE_REQUIRED=wasm-bindgen +
- *   READER_MAX_RULESET=10, with the REAL vendored engine, no TS entry point runs and
- *   every sealed object carries scrub version 10 and the crate profile;
- * - with the knob unset (positive control), the same drivers seal through the TS path
- *   (the spies count) with scrub version 8 and no profile, exactly as today;
+ * - cutover = the DEFAULT: SCRUB_ENGINE, SCRUB_ENGINE_REQUIRED and READER_MAX_RULESET
+ *   all unset, no TS capability granted (the reset clears the test preload's grant), with
+ *   the REAL vendored engine: no TS entry point runs and every sealed object carries scrub
+ *   version 10 and the crate profile ("Default flip" in docs/scrub-engine.md);
+ * - SCRUB_ENGINE=ts in a process without a TS capability (a Node self-host entry): every
+ *   driver refuses with scrub_engine_ts_not_allowed before sealing, zero TS calls, no raw
+ *   object;
+ * - positive control: a process holding the hosted TS capability with the knob unset
+ *   (what the hosted Worker/Lambda entries declare) seals through the TS path (the spies
+ *   count) with scrub version 8 and no profile, exactly as before the flip;
  * - the production call sites that do NOT install the routed sealer (publication canary,
  *   the default `pipelineRoutes` mounted by packages/pipeline/src/app.ts, the ingest
- *   Worker's `deliverDepsFor`) are driven under the triple too: each refuses with
+ *   Worker's `deliverDepsFor`) are driven under the default too: each refuses with
  *   `seal_path_not_routed` at the seam, makes zero TS scrub/seal calls and writes no raw
- *   object ("unwired, refuses under the triple" in docs/scrub-engine.md);
+ *   object ("unwired, refuses" in docs/scrub-engine.md);
  * - a source scan proves the lists are complete: every `?? sealRawChunk` fallback and
  *   every constructor of DeliverDeps / PipelineRouteDeps / PublicationJobDeps / a write
  *   target is classified as wired (spreads routedRawChunkSealerDeps()) or unwired-refuses.
@@ -39,6 +44,7 @@ import { readAll, objectKey, type ObjectStore } from '../../../packages/object-s
 import {
   activeScrubEngine, initScrubEngine, resetScrubEngineForTests, routedRawChunkSealerDeps, sealRawChunk as seam, scrubEngineReady,
 } from '../../../packages/pipeline/src/lib/scrub-engine/index.ts';
+import { declareScrubTsCapability, scrubTsCapabilities } from '../../../packages/pipeline/src/lib/scrub-engine/ts-capability.ts';
 import { writeGroups } from '../writer.ts';
 import { preparePublicationImage, writePublicationImage } from '../publication-image.ts';
 import { parseReceiptSeatSnapshot } from '../publication-seats.ts';
@@ -48,8 +54,13 @@ import { deliverDepsFor } from '../worker.ts';
 import { exportUnit } from '../../migration/neon-s3-sync/export-session.ts';
 import { scratchStore } from './support.ts';
 
-const TRIPLE = { SCRUB_ENGINE: 'wasm-bindgen', SCRUB_ENGINE_REQUIRED: 'wasm-bindgen', READER_MAX_RULESET: '10' } as const;
-const KEYS = [...Object.keys(TRIPLE), 'SCRUB_BINDGEN_DIR', 'S3X_OBLIGATIONS'] as const;
+const KEYS = ['SCRUB_ENGINE', 'SCRUB_ENGINE_REQUIRED', 'READER_MAX_RULESET', 'SCRUB_BINDGEN_DIR', 'S3X_OBLIGATIONS'] as const;
+/** The default: no scrub env at all and no TS capability (resetScrubEngineForTests clears grants). */
+function unsetDefault() {
+  for (const k of KEYS) delete process.env[k];
+  resetScrubEngineForTests();
+  expect(scrubTsCapabilities()).toStrictEqual([]);
+}
 const PROFILE = 'relayhistory-secrets-v10';
 const SECRET = 'AKIAIOSFODNN7EXAMPLE';
 const enc = new TextEncoder(), HEX = 'a'.repeat(64), OTHER = 'b'.repeat(64);
@@ -130,7 +141,7 @@ async function drive(caller: Caller, s: ObjectStore): Promise<string> {
   return r.manifests[0]!.referenced.find((k: string) => k.includes('/raw/'))!;
 }
 
-interface Row { caller: Caller | Unwired; mode: 'cutover' | 'control' | 'unwired'; routedSealer: boolean; tsCalls: Record<string, number>; scrubVersion?: string | undefined; scrubProfile?: string | undefined; secretInSealedBytes?: boolean; seamRefusals?: string[]; outcome?: string; rawObjectsWritten?: number }
+interface Row { caller: Caller | Unwired; mode: 'cutover' | 'control' | 'unwired' | 'ts-refused'; routedSealer: boolean; tsCalls: Record<string, number>; scrubVersion?: string | undefined; scrubProfile?: string | undefined; secretInSealedBytes?: boolean; seamRefusals?: string[]; outcome?: string; rawObjectsWritten?: number }
 const rows: Row[] = [];
 
 async function run(caller: Caller, mode: Row['mode']) {
@@ -144,12 +155,10 @@ async function run(caller: Caller, mode: Row['mode']) {
   return { row, text: o.text };
 }
 
-describe('under the env triple (real vendored alpha.9 engine)', () => {
+describe('default (scrub env unset, no TS capability; real vendored alpha.9 engine)', () => {
   for (const caller of CALLERS)
     test(`${caller}: the TS scrub/sealer is never invoked; the sealed object is the crate's (version 10)`, async () => {
-      Object.assign(process.env, TRIPLE);
-      delete process.env.SCRUB_BINDGEN_DIR;
-      resetScrubEngineForTests();
+      unsetDefault();
       await initScrubEngine(); // production path: process.env, default vendored dir, default glue importer
       expect(activeScrubEngine().kind).toBe('wasm-bindgen');
       expect(scrubEngineReady()).toBe(true);
@@ -163,8 +172,7 @@ describe('under the env triple (real vendored alpha.9 engine)', () => {
     });
 
   test('an unwired call site (no rawChunkSealer) refuses seal_path_not_routed and still never reaches TS', async () => {
-    Object.assign(process.env, TRIPLE);
-    resetScrubEngineForTests();
+    unsetDefault();
     await initScrubEngine();
     resetCounts();
     const s = scratch();
@@ -174,7 +182,7 @@ describe('under the env triple (real vendored alpha.9 engine)', () => {
   });
 });
 
-// ---- unwired production call sites: driven under the triple, each must refuse at the seam.
+// ---- unwired production call sites: driven under the default, each must refuse at the seam.
 type Unwired = 'publication-canary' | 'routes/pipeline-default' | 'worker-deliverDepsFor';
 const UNWIRED_CALLERS: Unwired[] = ['publication-canary', 'routes/pipeline-default', 'worker-deliverDepsFor'];
 const rawKeys = async (s: ObjectStore) => (await s.list(objectKey('96bulls'))).items.map((i) => String(i.key)).filter((k) => k.includes('/raw/'));
@@ -211,7 +219,7 @@ async function driveUnwired(caller: Unwired, s: ObjectStore): Promise<string> {
   return `rejected ${error?.reason}`;
 }
 
-describe('unwired call sites refuse under the env triple', () => {
+describe('unwired call sites refuse under the default', () => {
   const EXPECTED_OUTCOME: Record<Unwired, string> = {
     // publishBufferedStage maps the seam's PipelineError code; the seam spy records the reason.
     'publication-canary': 'rejected scrub_engine_unavailable',
@@ -220,9 +228,7 @@ describe('unwired call sites refuse under the env triple', () => {
   };
   for (const caller of UNWIRED_CALLERS)
     test(`${caller}: refuses seal_path_not_routed, zero TS scrub/seal calls, no raw object`, async () => {
-      Object.assign(process.env, TRIPLE);
-      delete process.env.SCRUB_BINDGEN_DIR;
-      resetScrubEngineForTests();
+      unsetDefault();
       await initScrubEngine();
       expect(activeScrubEngine().kind).toBe('wasm-bindgen');
       const s = scratch();
@@ -246,11 +252,28 @@ describe('unwired call sites refuse under the env triple', () => {
     });
 });
 
-describe('positive control: knob unset (today\'s behaviour)', () => {
+describe('SCRUB_ENGINE=ts without a TS capability (Node self-host) refuses', () => {
+  for (const caller of CALLERS)
+    test(`${caller}: scrub_engine_ts_not_allowed before any seal, zero TS scrub/seal calls, no raw object`, async () => {
+      unsetDefault();
+      process.env.SCRUB_ENGINE = 'ts';
+      await expect(initScrubEngine()).rejects.toMatchObject({ code: 'scrub_engine_invalid', reason: 'scrub_engine_ts_not_allowed' });
+      const s = scratch();
+      resetCounts();
+      const outcome = await drive(caller, s).then(() => 'sealed', (e: unknown) => String((e as { reason?: unknown }).reason));
+      const row: Row = { caller, mode: 'ts-refused', routedSealer: false, tsCalls: { ...counts }, outcome, rawObjectsWritten: (await rawKeys(s)).length };
+      rows.push(row);
+      expect(outcome).toBe('scrub_engine_ts_not_allowed');
+      expect(row.tsCalls).toStrictEqual(Object.fromEntries(Object.keys(counts).map((k) => [k, 0])));
+      expect(row.rawObjectsWritten).toBe(0);
+    });
+});
+
+describe('positive control: hosted TS capability, knob unset (the hosted entries)', () => {
   for (const caller of CALLERS)
     test(`${caller}: no routed sealer; the TS sealer runs (version 8, no profile)`, async () => {
-      for (const k of KEYS) delete process.env[k];
-      resetScrubEngineForTests();
+      unsetDefault();
+      declareScrubTsCapability('test'); // stands in for the hosted-worker / hosted-lambda declaration
       expect(await initScrubEngine()).toBe(activeScrubEngine());
       expect(activeScrubEngine().kind).toBe('ts');
       const { row } = await run(caller, 'control');
@@ -378,5 +401,5 @@ afterAll(() => {
   mock.module('../../../packages/pipeline/src/lib/scrub.ts', () => TS_SCRUB);
   const out = process.env.SCRUB_REACHABILITY_REPORT;
   if (!out) return;
-  writeFileSync(out, JSON.stringify({ schema: 1, triple: TRIPLE, tsEntryPoints: TS_ENTRY_POINTS, rows }, null, 2) + '\n');
+  writeFileSync(out, JSON.stringify({ schema: 2, cutoverEnv: 'SCRUB_ENGINE, SCRUB_ENGINE_REQUIRED, READER_MAX_RULESET unset; no TS capability', tsEntryPoints: TS_ENTRY_POINTS, rows }, null, 2) + '\n');
 });

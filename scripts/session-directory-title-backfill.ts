@@ -25,6 +25,7 @@ import { requiredSupabaseProjectRef } from "../src/shared/deploy-target.ts";
 import { SUPABASE_PROD_CA_2021 } from "../src/session-pipeline/supabase-ca.ts";
 import { sessionReadOnly } from "../src/migration/neon-s3-sync/neon-reader.ts";
 import { backfillDirectoryTitles } from "../src/hoopdb/session-directory-title-backfill.ts";
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
 
 // The Supabase project is explicit operator configuration (SUPABASE_PROJECT_REF), read only when connecting.
 const HOST = "aws-0-us-east-1.pooler.supabase.com", CLI = process.env.SUPABASE_CLI ?? "/home/khaliqgant/.local/bin/supabase";
@@ -46,6 +47,8 @@ const supa = new pg.Client({ host: HOST, port: 5432, database: "postgres", user:
   ssl: { ca: SUPABASE_PROD_CA_2021, rejectUnauthorized: true, servername: HOST }, options: "-c statement_timeout=60000 -c lock_timeout=5000", application_name: "p3b-title-backfill" });
 login.password = "";
 try {
+  // Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+  await initScrubEngine();
   await neon.connect();
   await sessionReadOnly(neon);
   await supa.connect();

@@ -24,6 +24,9 @@ import {deliverBatch} from "../src/session-ingest/deliver.ts";
 import {prepareDelivery,deliveryAccount} from "../src/session-ingest/vendor/delivery/prepare.ts";
 import {DELIVERY_MAPPING_VERSION,type HistoryExportBatch} from "../src/session-ingest/vendor/delivery/delivery-contracts.ts";
 import {writeBatchObjects,type WriteResult} from "../src/session-ingest/writer.ts";
+import { initScrubEngine } from "../packages/pipeline/src/lib/scrub-engine/index.ts";
+// Scrub engine (docs/scrub-engine.md, "Default flip"): the pinned wasm-bindgen engine, read from the repo checkout.
+await initScrubEngine();
 const root=process.cwd(),out=process.env.SEED_PROOF_OUT??"";
 const fail=(code:string):never=>{throw Object.assign(new Error(code),{code})};
 const assert=(value:unknown,code:string)=>{if(!value)fail(code)};
