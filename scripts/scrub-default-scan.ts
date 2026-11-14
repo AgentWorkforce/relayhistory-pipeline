@@ -29,7 +29,9 @@
  *     one that every route from the entry to the seam passes through ("stale-exemption" otherwise).
  *  4. Every scanned file can be read by the transpiler ("unparseable" otherwise: fail closed), and
  *     every workspace-package specifier resolves to a tracked source ("unresolved-workspace-import"
- *     otherwise: an unknown `exports` shape or an untracked target is not silently a dead end).
+ *     otherwise: an unknown `exports` shape, a folder mapping or pattern, a non-string `main` or an
+ *     untracked target is not silently a dead end). Every packages/<dir>/package.json is a JSON object
+ *     and no two share a "name" ("unparseable" otherwise; a duplicated name resolves nowhere).
  *
  * Scope: tracked .ts/.mts/.mjs/.js under src, packages, scripts, e2e, benchmarks and stacks, except the
  * vendored wasm-bindgen glue under packages/pipeline/scrub-bindgen/ (data). Edges are the module loads Bun.Transpiler.scanImports reports
@@ -41,9 +43,13 @@
  * with a literal. Specifiers lose a `?query` / `#hash` suffix and resolve when relative, through the
  * tsconfig aliases `@rhc/*` (packages/pipeline/src) and `@rhc-object-store`, or through a workspace
  * package name (packages/<dir>/package.json "name", e.g. `@96bulls/pipeline/...`, linked into
- * node_modules by bun workspaces; its "exports" is followed when present); other bare specifiers are
- * third-party and not followed. An extensionless path tries Bun's order: .mts, .ts, .mjs, .js, then
- * the same for /index.
+ * node_modules by bun workspaces; its "exports" is followed when present: a string, or exact "./x" keys
+ * whose value is a string or a condition object whose first non-`types` key is bun / import / default;
+ * a folder mapping ("./sub/"), a "*" pattern, an array, a top-level condition object or another
+ * condition fails closed; with no "." export the package root loads its string "main", else its
+ * index); other bare specifiers (including `@96bulls/pipeline-extra`, which only shares a prefix) are
+ * third-party and not followed. The literal path is tried first, then a .js / .mjs path's .ts / .mts
+ * sibling; an extensionless path then tries Bun's import order: .mts, .ts, .mjs, .js, then the same for /index.
  *
  * Known limits (heuristics, not a proof; review covers these):
  *  - G4 order: an entry passes rule 3 if it calls the initialiser anywhere, even after a seam use at
@@ -66,6 +72,11 @@
  *  - Entry detection is line-anchored and regex-based: entries shaped differently (for example
  *    `export default app`, a handler exported through `export { handler }` of a local binding) are not
  *    detected as entries; their wiring is covered by rule 1c when they are deployed from stacks/wrangler.
+ *  - Resolution order is Bun 1.4.2's import order for every edge kind; `require`, `import.meta.require`
+ *    and `createRequire` try .ts before .mts, .js before .mjs and index.ts before index.mts, so the scan
+ *    can pick the other sibling for a require when both x.ts and x.mts (or x.js and x.mjs) are tracked.
+ *  - Only .ts/.mts/.mjs/.js are tracked: a relative import of a .tsx, .cts, .cjs or .jsx file resolves to
+ *    nothing and is a silent dead end (none exist under the scan roots today).
  *  - Rule 1c reads wrangler*.jsonc only; packages/amp-transport-worker/wrangler.template.json (plain
  *    .json) is not checked, and its main does not reach the seam.
  *
@@ -283,21 +294,54 @@ const stripComments = (src: string) => src.replace(TOKENS, (m) => (m[0] === "/" 
 /** Comment- and string-free code (string and template bodies emptied), for name tests that a string must not satisfy. */
 const codeOnly = (src: string) => src.replace(TOKENS, (m) => (m[0] === "/" ? dropComment(m) : '""'));
 
-type Workspace = { readonly dir: string; readonly exports: unknown };
-const workspaceCache = new WeakMap<Sources, ReadonlyMap<string, Workspace>>();
-/** Workspace package name -> repo-relative directory and "exports" (root package.json "workspaces":
- * packages/*), read from the packages/<dir>/package.json entries of `files`. */
-export function workspacePackages(files: Sources): ReadonlyMap<string, Workspace> {
-  let out = workspaceCache.get(files) as Map<string, Workspace> | undefined;
-  if (out) return out;
-  out = new Map();
+const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** A workspace package: its directory, "exports" and "main" as written. `duplicate` marks a name two
+ * package.json files claim: it resolves nowhere (fail closed; scan() reports the second file). */
+type Workspace = { readonly dir: string; readonly exports: unknown; readonly main: unknown; readonly duplicate?: true };
+type WorkspaceIndex = { readonly packages: ReadonlyMap<string, Workspace>; readonly problems: readonly Violation[] };
+const workspaceCache = new WeakMap<Sources, WorkspaceIndex>();
+/** The packages/<dir>/package.json entries of `files` (root package.json "workspaces": packages/*), read
+ * once: name -> package, plus an "unparseable" violation for each file that is not a JSON object (it is
+ * skipped) and for each later file repeating a name (that name is then a duplicate and never resolves). */
+function workspaceIndex(files: Sources): WorkspaceIndex {
+  const cached = workspaceCache.get(files);
+  if (cached) return cached;
+  const packages = new Map<string, Workspace>();
+  const firstFile = new Map<string, string>();
+  const problems: Violation[] = [];
   for (const [f, src] of files) {
     if (!PACKAGE_JSON_RE.test(f)) continue;
-    const pj = JSON.parse(src) as { name?: unknown; exports?: unknown };
-    if (typeof pj.name === "string" && pj.name) out.set(pj.name, { dir: f.slice(0, -"/package.json".length), exports: pj.exports });
+    let pj: unknown;
+    try {
+      pj = JSON.parse(src);
+    } catch {
+      problems.push({ rule: "unparseable", file: f, detail: "package.json is not valid JSON" });
+      continue;
+    }
+    if (!isObject(pj)) {
+      problems.push({ rule: "unparseable", file: f, detail: "package.json is not a JSON object" });
+      continue;
+    }
+    if (typeof pj.name !== "string" || !pj.name) continue;
+    const dir = f.slice(0, -"/package.json".length);
+    const first = firstFile.get(pj.name);
+    if (first) {
+      problems.push({ rule: "unparseable", file: f, detail: `duplicate workspace package name ${pj.name} (also ${first}); the name resolves to nothing until one is renamed` });
+      packages.set(pj.name, { dir, exports: undefined, main: undefined, duplicate: true });
+      continue;
+    }
+    firstFile.set(pj.name, f);
+    packages.set(pj.name, { dir, exports: pj.exports, main: pj.main });
   }
-  workspaceCache.set(files, out);
-  return out;
+  const index = { packages, problems };
+  workspaceCache.set(files, index);
+  return index;
+}
+
+/** Workspace package name -> repo-relative directory, "exports" and "main". */
+export function workspacePackages(files: Sources): ReadonlyMap<string, Workspace> {
+  return workspaceIndex(files).packages;
 }
 
 /** The workspace package a bare specifier names, with its subpath ("" or "/x"), or undefined. */
@@ -305,13 +349,14 @@ function workspaceOf(files: Sources, spec: string): { name: string; ws: Workspac
   for (const [name, ws] of workspacePackages(files)) if (spec === name || spec.startsWith(`${name}/`)) return { name, ws, subpath: spec.slice(name.length) };
 }
 
-/** The package-relative target "exports" maps `subpath` to: a string, or the first `bun` / `import` /
- * `default` of a condition object (`types` skipped); "fallback" when the field is absent or a subpath
- * map lacks the key (then `${dir}${subpath}` is tried, as before); undefined for any other shape
- * (patterns, arrays, other conditions such as `node` or `require`): fail closed, the scan reports it. */
+/** The package-relative target "exports" maps `subpath` to: a string, or the first non-`types` condition
+ * of a condition object (Bun follows key order) when it is `bun` / `import` / `default` with a string
+ * value; "fallback" when the field is absent or a subpath map lacks the key (then resolveSpec tries
+ * `main` for the package root, else `${dir}${subpath}`); undefined for any other shape (a folder
+ * mapping `"./sub/"`, a `*` pattern, an array, a top-level condition object, other conditions such as
+ * `node` or `require`): fail closed, the scan reports it. */
 function exportTarget(exports: unknown, subpath: string): string | "fallback" | undefined {
   const key = `.${subpath}`;
-  const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
   const pick = (v: unknown): string | undefined => {
     if (typeof v === "string") return v;
     if (!isObject(v)) return undefined;
@@ -324,13 +369,15 @@ function exportTarget(exports: unknown, subpath: string): string | "fallback" | 
   if (typeof exports === "string") return key === "." ? exports : "fallback";
   if (!isObject(exports)) return undefined;
   const keys = Object.keys(exports);
-  if (keys.length && keys.every((k) => k === "." || (k.startsWith("./") && !k.includes("*")))) return key in exports ? pick(exports[key]) : "fallback";
+  if (keys.length && keys.every((k) => k === "." || (k.startsWith("./") && !k.includes("*") && !k.endsWith("/")))) return key in exports ? pick(exports[key]) : "fallback";
   return undefined;
 }
 
 /** Repo-relative tracked file a specifier loads, or undefined (third-party / unknown). A `?query` or
- * `#hash` suffix is dropped (Bun loads the same module). An extensionless path tries Bun's own order
- * (.mts before .ts, then .mjs, .js; then the same for /index). */
+ * `#hash` suffix is dropped (Bun loads the same module). A workspace package root with no "." export
+ * loads its string `main` (any other `main` fails closed), else its directory index. The literal path
+ * is tried first, then an extensionless path in Bun's import order (.mts before .ts, then .mjs, .js;
+ * then the same for /index). */
 export function resolveSpec(files: Sources, from: string, specifier: string): string | undefined {
   const spec = specifier.replace(/(?<=.)[?#][\s\S]*$/, "");
   let base: string | undefined;
@@ -341,8 +388,11 @@ export function resolveSpec(files: Sources, from: string, specifier: string): st
     const w = workspaceOf(files, spec);
     if (!w) return undefined;
     const target = exportTarget(w.ws.exports, w.subpath);
-    if (target === undefined) return undefined;
-    base = target === "fallback" ? `${w.ws.dir}${w.subpath}` : resolve("/", w.ws.dir, target).slice(1);
+    if (target === undefined || w.ws.duplicate) return undefined;
+    if (target !== "fallback") base = resolve("/", w.ws.dir, target).slice(1);
+    else if (w.subpath || w.ws.main === undefined) base = `${w.ws.dir}${w.subpath}`;
+    else if (typeof w.ws.main === "string") base = resolve("/", w.ws.dir, w.ws.main).slice(1);
+    else return undefined;
   }
   for (const c of [base, base.replace(/\.js$/, ".ts"), base.replace(/\.mjs$/, ".mts"), ...["mts", "ts", "mjs", "js"].map((x) => `${base}.${x}`), ...["mts", "ts", "mjs", "js"].map((x) => `${base}/index.${x}`)]) if (files.has(c)) return c;
 }
@@ -436,7 +486,8 @@ function hostedGrantFirstProblem(files: Sources, f: string, want: string): strin
 export type Violation = { rule: "ts-capability-declarer" | "ts-capability-importer" | "ts-capability-reexport" | "preload-import" | "hosted-grant-reach" | "hosted-grant-first" | "deploy-main" | "entry-without-init" | "stale-exemption" | "unparseable" | "unresolved-workspace-import"; file: string; detail: string };
 
 export function scan(files: Sources): Violation[] {
-  const v: Violation[] = [];
+  // 4. a package.json that is not a JSON object, or repeats a workspace name, is reported (fail closed)
+  const v: Violation[] = [...workspaceIndex(files).problems];
   for (const [f, src] of files) {
     if (!SOURCE_RE.test(f)) continue;
     let fileEdges: Edge[];

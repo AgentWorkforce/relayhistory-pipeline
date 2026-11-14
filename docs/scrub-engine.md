@@ -643,10 +643,14 @@ bytes or the pin digest (`src/session-pipeline/__tests__/large-read-bundle.test.
 canonical publication zip (`scripts/build-canonical-publication.ts`, `node index.mjs`) is the same: it
 bundles only `index.mjs` and `package.json`, and the engine resolves the pin
 (`packages/pipeline/scrub-bindgen-pin.json`) and the default artifact directory relative to its own
-module location (`SCRUB_BINDGEN_DIR` overrides only the artifact directory), so an enabled publish run
-of the zip fails closed at startup with `scrub_engine_unavailable` (`bindgen_pin_unreadable`) unless the
-pinned wasm-bindgen package is reachable from the bundle's location; a disabled run and `--gc` are
-unaffected. The compiled-mode proof (`scripts/proof-canonical-publication.ts`,
+module location. An enabled publish run of the zip therefore needs, relative to `index.mjs`, the pin
+file at `../../../scrub-bindgen-pin.json` and the artifact directory at `../../../scrub-bindgen/`
+(`SCRUB_BINDGEN_DIR`, absolute, overrides only the artifact directory, never the pin). Without them it
+fails closed at startup: the CLI prints only
+`{"kind":"canonical-publication","healthy":false,"code":"scrub_engine_unavailable"}` (stderr) and
+exits 1; the reason (`bindgen_pin_unreadable` for a missing pin) is what `initScrubEngine()` reports
+when called directly. A disabled run and `--gc` are unaffected. The compiled-mode proof
+(`scripts/proof-canonical-publication.ts`,
 `PUBLICATION_COMPILED_BUNDLE`) therefore cannot pass without the pin and bytes present, and cannot
 false-pass.
 
@@ -673,14 +677,20 @@ enumerated declarers, a grant re-exported from the seam, a hosted entry whose fi
 its module-load grant, any other non-test file that reaches a module-load grant, a stacks or
 wrangler `main` that is not a hosted entry, a production module importing a test preload, and a
 stale exemption, on a file the transpiler cannot parse, and on a workspace-package import that resolves
-to no tracked source (an unknown `exports` shape or an untracked target; fail closed). Each rule has a
+to no tracked source (an unknown `exports` shape, a folder mapping or pattern, a non-string `main` or an
+untracked target; fail closed), and on a `packages/*/package.json` that is not a JSON object or repeats
+another package's name (`unparseable`; a duplicated name resolves nowhere). Each rule has a
 planted-violation test; the scan is a heuristic, not a proof.
 Known limits, listed in the scan header: an initialiser anywhere in the entry counts even if a seam
 use runs first or it sits under a condition (the runtime still fails closed there); computed and
 variable loads stay invisible (`import(x)`, `require(x)`, `import.meta.require(x)`, a template with
 `${...}`, an import wrapper such as the rehearsal's `mod(path)`, a stored `createRequire` result
 called later, `new Function(...)` / `eval(...)`, `require.resolve`, `new Worker(url)`, `Bun.spawn` of another file); entries shaped
-differently from the patterns above (for example `export default app`) are not detected. The
+differently from the patterns above (for example `export default app`) are not detected; every edge
+uses Bun's import resolution order, although `require`, `import.meta.require` and `createRequire` try
+`.ts` before `.mts`, `.js` before `.mjs` and `index.ts` before `index.mts` on Bun 1.4.2 (this matters
+only when sibling `x.ts` and `x.mts` both exist); and a relative import of a `.tsx`, `.cts`, `.cjs` or
+`.jsx` file is not tracked and is a silent dead end (none exist today). The
 rehearsal's R6 module choice is pinned separately by `src/hoopdb/__tests__/schema-rehearsal-r6.test.ts`.
 Edges are read by `Bun.Transpiler.scanImports`, the transpiler's own parse rather than a line
 regex: every static import and re-export in any spacing or position (`import{}from"x"`,
@@ -689,9 +699,11 @@ the module, only `import type` and all-`type` braces are erased), `import("x")` 
 options or a trailing comma, `` import(`x`) `` and `require("x")`, plus `import.meta.require("x")`
 and `createRequire(...)("x")` from the TypeScript AST. A `?query` or `#hash` suffix is stripped
 before resolution through relative, `@rhc/*`, `@rhc-object-store` and workspace-package
-(`@96bulls/pipeline/...` and the other `packages/*` names, through their `exports` when present)
-specifiers; an extensionless path tries Bun's order (`.mts`, `.ts`, `.mjs`, `.js`, then the same for
-`/index`).
+(`@96bulls/pipeline/...` and the other `packages/*` names, through their `exports` when present; with
+no `.` export the package root loads its string `main`, else its index; folder mappings such as
+`"./sub/"` and `*` patterns fail closed; a name that only shares a prefix, such as
+`@96bulls/pipeline-extra`, is third-party) specifiers; the literal path is tried first, then an
+extensionless path tries Bun's order (`.mts`, `.ts`, `.mjs`, `.js`, then the same for `/index`).
 `hosted-grant-first` reads the TypeScript AST: after comments, a shebang and a directive prologue,
 the hosted entry's first statement must be the static bare import of its grant with no import
 attributes (`with { type: "text" }` or `assert` loads it as data and never runs the grant), and it

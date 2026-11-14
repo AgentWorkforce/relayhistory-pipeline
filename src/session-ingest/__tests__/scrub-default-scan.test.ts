@@ -5,8 +5,10 @@
  * (G1 .mjs, G2 Worker default export, G8 Lambda handler export, S11 `const x = await`), the
  * engine-running-name check (S9), require edges (G3) and string-only initialisers (G6) are
  * planted too, as are directory imports (N14), extensionless .mts/.mjs/.js resolution, plain .js
- * entries, workspace `exports` (an unknown shape is reported) and the exemption-reason checks
- * (M5b bypass, intermediate-only, extensionless paths). Known limits are listed in the scan header.
+ * entries, workspace `exports` (an unknown shape, a folder mapping or a top-level condition object is
+ * reported), package `main`, malformed and duplicate package.json files, literal-before-rewrite and
+ * extension order, rule 4 on every edge kind and in tests, and the exemption-reason checks (M5b
+ * bypass, intermediate-only, extensionless paths). Known limits are listed in the scan header.
  */
 import { describe, expect, test } from "bun:test";
 import { edges, ENTRY_EXEMPT, HOSTED_ENTRIES, HOSTED_GRANT_MODULES, isExecutableEntry, isHandlerEntry, REASON_PATH_RE, resolveSpec, scan, seamChain, trackedSources, TS_CAPABILITY_DECLARERS, type Sources } from "../../../scripts/scrub-default-scan.ts";
@@ -459,5 +461,107 @@ describe("scrub-default-scan", () => {
     files = plant("packages/planted-pkg/src/index.ts", `export { scrubText } from "../../pipeline/src/lib/scrub-engine/index.ts";\n`, files);
     files = plant(f, `import { scrubText } from "@planted/pkg";\nconsole.log(scrubText("a"));\n`, files);
     expect(rules(files)).toContain(`unresolved-workspace-import:${f}`);
+  });
+
+  // Resolver review items (W1, R2, R3, O4/O6, X8, V3, main, folder mappings, package.json validation).
+  const FWD = `export { scrubText } from "../../pipeline/src/lib/scrub-engine/index.ts";\n`;
+  const INERT_DEP = "export const scrubText = (s: string) => s;\n";
+  const useScrub = (spec: string) => `import { scrubText } from "${spec}";\nconsole.log(scrubText("a"));\n`;
+  /** packages/planted-pkg with the given package.json fields and extra files. */
+  const plantPkg = (fields: Record<string, unknown>, extra: Record<string, string> = {}, base: Sources = repo): Sources => {
+    let files = plant("packages/planted-pkg/package.json", JSON.stringify({ name: "@planted/pkg", ...fields }), base);
+    for (const [k, src] of Object.entries(extra)) files = plant(k, src, files);
+    return files;
+  };
+
+  test("a specifier that only shares a workspace name's prefix is third-party: not followed, no rule 4 (W1)", () => {
+    const f = "scripts/planted-w1.ts";
+    const files = plant(f, `import { x } from "@96bulls/pipeline-extra";\nimport { y } from "@96bulls/pipeline-extra/sub";\nconsole.log(x, y);\n`);
+    expect(resolveSpec(files, f, "@96bulls/pipeline-extra")).toBeUndefined();
+    expect(rules(files)).toStrictEqual([]);
+  });
+
+  test("rule 4 fires on a dynamic import and a require of an unresolvable workspace subpath (R2)", () => {
+    const d = "scripts/planted-r2-dynamic.ts";
+    const r = "scripts/planted-r2-require.ts";
+    expect(rules(plant(d, `await import("@96bulls/pipeline/missing");\n`))).toStrictEqual([`unresolved-workspace-import:${d}`]);
+    expect(rules(plant(r, `const m = require("@96bulls/pipeline/missing");\nconsole.log(m);\n`))).toStrictEqual([`unresolved-workspace-import:${r}`]);
+  });
+
+  test("rule 4 fires in a test file too (R3)", () => {
+    const t = "scripts/__tests__/planted-r3.test.ts";
+    expect(rules(plant(t, `import { x } from "@96bulls/pipeline/missing";\nconsole.log(x);\n`))).toStrictEqual([`unresolved-workspace-import:${t}`]);
+  });
+
+  test("a literal ./x.js loads x.js before x.ts; an extensionless ./x prefers .mts over .ts and .ts over .js (O4/O6)", () => {
+    const f = "scripts/planted-o.ts";
+    const dep = "scripts/planted-o-dep";
+    // ./dep.js: the tracked .js is loaded (inert), not the .ts that reaches the seam.
+    const literal = plant(f, useScrub("./planted-o-dep.js"), plant(`${dep}.ts`, `export { scrubText } from "../${SEAM}.ts";\n`, plant(`${dep}.js`, INERT_DEP)));
+    expect(resolveSpec(literal, f, "./planted-o-dep.js")).toBe(`${dep}.js`);
+    expect(rules(literal)).toStrictEqual([]);
+    // ./dep with .ts and .mts: .mts (reaches the seam) wins over .ts (inert).
+    const mts = plant(f, useScrub("./planted-o-dep"), plant(`${dep}.mts`, `export { scrubText } from "../${SEAM}.ts";\n`, plant(`${dep}.ts`, INERT_DEP)));
+    expect(resolveSpec(mts, f, "./planted-o-dep")).toBe(`${dep}.mts`);
+    expect(rules(mts)).toStrictEqual([`entry-without-init:${f}`]);
+    // ./dep with .ts and .js: .ts (reaches the seam) wins over .js (inert).
+    const ts = plant(f, useScrub("./planted-o-dep"), plant(`${dep}.ts`, `export { scrubText } from "../${SEAM}.ts";\n`, plant(`${dep}.js`, INERT_DEP)));
+    expect(resolveSpec(ts, f, "./planted-o-dep")).toBe(`${dep}.ts`);
+    expect(rules(ts)).toStrictEqual([`entry-without-init:${f}`]);
+  });
+
+  test("a top-level condition object as exports fails closed (X8)", () => {
+    const f = "scripts/planted-x8.ts";
+    const files = plantPkg({ exports: { import: "./src/main.ts", require: "./src/main.cjs" } }, { "packages/planted-pkg/src/main.ts": FWD, [f]: useScrub("@planted/pkg") });
+    expect(resolveSpec(files, f, "@planted/pkg")).toBeUndefined();
+    expect(rules(files)).toStrictEqual([`unresolved-workspace-import:${f}`]);
+  });
+
+  test("a .test.js file is a test path, not an entry (V3)", () => {
+    const f = "scripts/planted-v3.test.js";
+    const files = plant(f, useScrub(`../${SEAM}.ts`));
+    expect(isExecutableEntry(f, files.get(f)!)).toBe(false);
+    expect(rules(files)).toStrictEqual([]);
+  });
+
+  test("a package with no exports resolves through a string main, not a decoy index; any other main fails closed", () => {
+    const f = "scripts/planted-main.ts";
+    const extra = { "packages/planted-pkg/src/main.ts": FWD, "packages/planted-pkg/index.ts": INERT_DEP, [f]: useScrub("@planted/pkg") };
+    const viaMain = plantPkg({ main: "./src/main.ts" }, extra);
+    expect(resolveSpec(viaMain, f, "@planted/pkg")).toBe("packages/planted-pkg/src/main.ts");
+    expect(rules(viaMain)).toStrictEqual([`entry-without-init:${f}`]);
+    // An object exports without "." also falls back to main for the package root.
+    const noDot = plantPkg({ main: "src/main", exports: { "./x": "./src/main.ts" } }, extra);
+    expect(resolveSpec(noDot, f, "@planted/pkg")).toBe("packages/planted-pkg/src/main.ts");
+    expect(rules(noDot)).toStrictEqual([`entry-without-init:${f}`]);
+    for (const main of [["./src/main.ts"], 5, null, "./dist/main.js"]) {
+      const files = plantPkg({ main }, extra);
+      expect(resolveSpec(files, f, "@planted/pkg"), JSON.stringify(main)).toBeUndefined();
+      expect(rules(files), JSON.stringify(main)).toStrictEqual([`unresolved-workspace-import:${f}`]);
+    }
+  });
+
+  test("a folder mapping in exports fails closed even when a decoy file matches the subpath", () => {
+    const f = "scripts/planted-folder.ts";
+    const files = plantPkg({ exports: { ".": "./src/a.ts", "./sub/": "./src/" } }, { "packages/planted-pkg/src/a.ts": FWD, "packages/planted-pkg/sub/a.ts": INERT_DEP, [f]: useScrub("@planted/pkg/sub/a.ts") });
+    expect(resolveSpec(files, f, "@planted/pkg/sub/a.ts")).toBeUndefined();
+    expect(rules(files)).toStrictEqual([`unresolved-workspace-import:${f}`]);
+  });
+
+  test("a malformed package.json is reported unparseable and the scan does not throw", () => {
+    const bad = "packages/planted-bad/package.json";
+    const files = plant(bad, "{ not json");
+    expect(scan(files)).toStrictEqual([{ rule: "unparseable", file: bad, detail: "package.json is not valid JSON" }]);
+    expect(resolveSpec(files, "scripts/x.ts", "@96bulls/coordination-detect")).toBe("packages/coordination-detect/src/index.ts");
+  });
+
+  test("a duplicate workspace package name is reported and the name resolves nowhere", () => {
+    const f = "scripts/planted-dup.ts";
+    const dup = "packages/planted-pkh/package.json";
+    const files = plant(f, useScrub("@planted/pkg"), plant(dup, JSON.stringify({ name: "@planted/pkg", exports: "./src/main.ts" }), plantPkg({ exports: "./src/main.ts" }, { "packages/planted-pkg/src/main.ts": FWD, "packages/planted-pkh/src/main.ts": FWD, "packages/planted-pkg/index.ts": FWD, "packages/planted-pkh/index.ts": FWD })));
+    expect(resolveSpec(files, f, "@planted/pkg")).toBeUndefined();
+    const v = scan(files);
+    expect(v.map((x) => `${x.rule}:${x.file}`)).toStrictEqual([`unparseable:${dup}`, `unresolved-workspace-import:${f}`]);
+    expect(v[0]!.detail).toContain("duplicate workspace package name @planted/pkg (also packages/planted-pkg/package.json)");
   });
 });
