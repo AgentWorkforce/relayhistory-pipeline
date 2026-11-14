@@ -150,6 +150,8 @@ export function backlogOpsTarget(env: Record<string, string | undefined>): Backl
  * READ ONLY transaction.
  */
 export const BACKLOG_OPS_BACKFILL_PAGING = ["--page-size", "5000", "--row-page-size", "20000", "--statement-timeout-ms", "600000"] as const;
+/** The export's per-statement timeout: its org, candidate and per-user reads over the buffer are as heavy (same 30 s default). */
+export const BACKLOG_OPS_EXPORT_PAGING = ["--statement-timeout-ms", "600000"] as const;
 
 /** Fixed argv for the tool: never an org, a checkpoint, a start key or an unvalidated value. */
 export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget): { script: string; args: string[]; needsDb: boolean } {
@@ -157,7 +159,7 @@ export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget): 
   const script = { backfill: "scripts/upload-fence-backfill.ts", export: "scripts/accepted-stage-export.ts", drain: "scripts/buffered-drain.ts" }[tool];
   const args = [execute ? "--execute" : "--dry-run", "--bucket", t.bucket, "--region", t.region,
     ...(execute ? ["--kms-key-arn", t.kmsKeyArn] : []),
-    ...(tool === "backfill" ? BACKLOG_OPS_BACKFILL_PAGING : []),
+    ...(tool === "backfill" ? BACKLOG_OPS_BACKFILL_PAGING : tool === "export" ? BACKLOG_OPS_EXPORT_PAGING : []),
     ...(tool === "drain" && d.maxObjects !== null ? ["--max-objects", String(d.maxObjects)] : [])];
   return { script, args, needsDb: tool !== "drain" };
 }
