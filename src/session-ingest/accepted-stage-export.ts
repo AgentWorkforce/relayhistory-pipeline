@@ -156,15 +156,17 @@ SELECT coalesce(bool_or(cp.read_enabled AND cp.write_enabled AND cp.backfill_com
   FROM sessions.ingest_claim_sessions_policy AS cp WHERE cp.singleton`;
 
 /**
- * A page's candidate keys and users, BEFORE the verdict snapshot (finding 6): the export reads these users' S3 fences
- * first, then takes SQL's verdict over the same key range.
+ * Every candidate key and its user, read ONCE per run (one read-only transaction), then paged in memory. Per page the
+ * export reads those users' S3 fences BEFORE SQL's verdict over exactly those keys (finding 6). A keyset page here
+ * re-joined every buffered outbox row with its batch and sorted them on every page (about 23 s a page on production);
+ * collected once it is one such join. A stage that becomes a candidate after this read is not in this run: its
+ * object stays stage_export_missing for the drain (refused, never lost) until a later export, which is why the drain
+ * needs an export after its backfill and why a scoped run follows the scope's HTTP admission stop.
  */
-export const CANDIDATE_PAGE = `
+export const CANDIDATE_KEYS = `
 SELECT s.stage_key, s.org_id, s.workspace_id, s.user_id${CANDIDATE_FROM}
      AND ($1::text[] IS NULL OR o.org_id = ANY($1::text[]))
-     AND s.stage_key > $2::text
-   ORDER BY s.stage_key
-   LIMIT $3::int`;
+   ORDER BY s.stage_key`;
 
 /** Which of these stage keys are candidates now (the stale-sidecar pass, finding 7). */
 export const CANDIDATES_IN = `
@@ -209,9 +211,7 @@ WITH pol AS MATERIALIZED (
           AND jsonb_typeof(s.group_ordinals) = 'array' AND a.reset_epoch IS NOT NULL) AS shape_ok
 ${CANDIDATE_FROM}
      AND ($1::text[] IS NULL OR o.org_id = ANY($1::text[]))
-     AND s.stage_key > $2::text AND s.stage_key <= $4::text
-   ORDER BY s.stage_key
-   LIMIT $3::int
+     AND s.stage_key = ANY($2::text[])
 ), users AS MATERIALIZED (
   SELECT DISTINCT c.org_id, c.workspace_id, c.user_id FROM cand AS c
 ), gate AS MATERIALIZED (
@@ -357,7 +357,7 @@ ${CANDIDATE_FROM}
       ON fv.org_id = st.org_id AND fv.workspace_id = st.workspace_id AND fv.user_id = st.user_id AND fv.origin_id = st.origin_id
      AND fv.source = rc.source AND fv.session_id = rc.session_id
    WHERE NOT EXISTS (SELECT 1 FROM bad_stage AS bs WHERE bs.stage_token = gr.stage_token)
-), kept AS (
+), kept AS MATERIALIZED (
   SELECT j.stage_token, j.group_index, min(j.source) AS source, min(j.session_id) AS session_id,
          array_agg(j.ord ORDER BY j.ord) FILTER (WHERE j.live) AS ords
     FROM judged AS j JOIN stg AS st ON st.stage_token = j.stage_token
@@ -366,13 +366,19 @@ ${CANDIDATE_FROM}
      AND count(DISTINCT j.source) = 1 AND count(DISTINCT j.session_id) = 1
      AND count(*) FILTER (WHERE j.live) > 0
      AND (st.lazy OR count(*) FILTER (WHERE j.live) = count(*))
+), kept_json AS MATERIALIZED (
+  -- Each stage's kept groups, aggregated once for the page (a per-stage correlated subquery here re-evaluated
+  -- judged -> grp -> stg for every stage: quadratic in the page, ~72 ms a stage on production).
+  SELECT k.stage_token,
+         jsonb_agg(jsonb_build_object('group', k.group_index, 'ords', to_jsonb(k.ords), 'source', k.source, 'session', k.session_id)) AS kept
+    FROM kept AS k GROUP BY k.stage_token
 )
 SELECT st.stage_key, st.stage_sha256, st.claim_token::text AS claim_token, st.org_id, st.workspace_id, st.user_id,
        st.origin_id, st.digest, st.group_ordinals, st.v2, st.gate_reason,
        (so.ok AND NOT EXISTS (SELECT 1 FROM bad_stage AS bs WHERE bs.stage_token = st.stage_token)) AS stage_ok,
-       coalesce((SELECT jsonb_agg(jsonb_build_object('group', k.group_index, 'ords', to_jsonb(k.ords), 'source', k.source, 'session', k.session_id))
-                   FROM kept AS k WHERE k.stage_token = st.stage_token), '[]'::jsonb) AS kept
+       coalesce(kj.kept, '[]'::jsonb) AS kept
   FROM stg AS st JOIN stage_ok AS so ON so.stage_token = st.stage_token
+  LEFT JOIN kept_json AS kj ON kj.stage_token = st.stage_token
  ORDER BY st.stage_key`;
 
 async function mapLimit<T>(items: readonly T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
@@ -501,15 +507,13 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
       })());
       return fences.get(k)!;
     };
-    let cursor = "";
-    for (;;) {
+    const candidates = (await readOnly(() => sql.query(CANDIDATE_KEYS, [orgScope]))).rows;
+    for (let at = 0; at < candidates.length; at += pageSize) {
       // Finding 6: the page's users and their S3 fences FIRST, then SQL's verdict over the same key range. A control
       // landing after the fence read moves the fence past what the sidecar records, so the drain refuses
       // (fence_moved_since_export); read the other way round, the sidecar could carry the post-control fence beside a
       // pre-control verdict.
-      const page = (await readOnly(() => sql.query(CANDIDATE_PAGE, [orgScope, cursor, pageSize]))).rows;
-      if (!page.length) break;
-      const upper = String(page[page.length - 1]!.stage_key);
+      const page = candidates.slice(at, at + pageSize);
       fences = new Map();
       const userKey = (r: Record<string, unknown>) => JSON.stringify([r.org_id, r.workspace_id, r.user_id]);
       const preRead = new Set<string>();
@@ -518,10 +522,9 @@ export async function exportAcceptedStages(opts: ExportOptions): Promise<ExportS
         preRead.add(userKey(r));
         await fenceOf(r.org_id, r.workspace_id, r.user_id);
       });
-      const rows = (await readOnly(() => sql.query(VERDICT_PAGE, [orgScope, cursor, pageSize, upper]))).rows;
+      const rows = (await readOnly(() => sql.query(VERDICT_PAGE, [orgScope, page.map((r) => String(r.stage_key))]))).rows;
       // The v2 gate turned off mid-export: stop before writing this page.
       if (rows.some((r) => r.v2 !== true)) throw new ExportError("export_claim_sessions_gate_off");
-      cursor = rows.length ? String(rows[rows.length - 1]!.stage_key) : upper;
       await mapLimit(rows, concurrency, async (r) => {
         summary.rows++;
         const org = typeof r.org_id === "string" ? r.org_id : "";

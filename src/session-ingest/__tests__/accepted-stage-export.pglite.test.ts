@@ -270,6 +270,33 @@ describe("accepted-stage export (0005 step 0b): SQL's own verdict per stage", ()
     for (const s of [preparing, inactive, pending]) expect(await exists(store, s.key + ACCEPTED_SUFFIX)).toBe(false);
   });
 
+  test("perf shape: candidates read once, each verdict page probes exactly its keys; same result at any page size", async () => {
+    // Mixed stages (SQL seeded once): four single-group, one two-group, one hidden by a deletion.
+    const keys: string[] = [];
+    for (let i = 0; i < 4; i++) keys.push((await seed(A, [{ source: "claude", session: `s${i}`, records: [{ id: `r${i}`, rev: 1 }] }])).key);
+    keys.push((await seed(A, [{ source: "claude", session: "g1", records: [{ id: "x", rev: 1 }, { id: "y", rev: 1 }] }, { source: "claude", session: "g2", records: [{ id: "z", rev: 1 }] }])).key);
+    await db.query("INSERT INTO sessions.upload_deletions (org_id, workspace_id, user_id, origin_id, source, session_id) VALUES ($1,$2,$3,$4,'claude','s2')", [A.orgId, A.workspaceId, A.userId, ORIGIN]);
+    await prove(A); // the deletion moved the user's deletion set: re-prove parity, as the writer would
+    const results: unknown[] = [];
+    for (const pageSize of [1, 2, 1000]) {
+      const store = scratch();
+      await backfillFence(store, A);
+      const log: string[] = [];
+      const summary = await run(store, { pageSize }, log);
+      // One candidate read for the whole run, then one verdict per page (ceil(5 / pageSize)).
+      expect(log.filter((l) => l.startsWith("SELECT s.stage_key, s.org_id")).length).toBe(1);
+      expect(log.filter((l) => l.startsWith("WITH pol")).length).toBe(Math.ceil(5 / pageSize));
+      expect(log.some((l) => l.includes("s.stage_key > $2"))).toBe(false);
+      const { orgs: _o, ...rest } = summary as Record<string, unknown>;
+      results.push({ summary: rest, markers: await Promise.all(keys.map(async (k) => { const v = await verdict(store, k); return v && { live: v.live, kept: v.kept }; })) });
+    }
+    expect(results[1]).toEqual(results[0]);
+    expect(results[2]).toEqual(results[0]);
+    expect(results[0]).toMatchObject({ summary: { rows: 5, live: 4, not_live: 1, failed: 0, fence_late: 0, invalid: 0 } });
+    // The two-group stage keeps both groups (aggregated once per page, not per stage).
+    expect((results[0] as { markers: unknown[] }).markers[4]).toEqual({ live: true, kept: [[0, 1], [0]] });
+  });
+
   test("SQL: every page its own short read-only transaction, checked, always rolled back", async () => {
     const store = scratch();
     await backfillFence(store, A);
