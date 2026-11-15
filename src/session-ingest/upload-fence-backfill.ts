@@ -656,14 +656,15 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
 
   // ---- revisions, and the slot pass shared with ownership ----
   if (sections.has("revisions") || sections.has("ownership")) {
-    type Group = { key: string; tenant: LedgerTenant; originId: string; entries: IndexEntryInput[]; records: Set<string> };
+    type Group = { key: string; tenant: LedgerTenant; originId: string; batches: IndexEntryInput[][]; batch: number; entries: number };
     /**
      * One pass's buffer: shard groups gathered across pages and windows, merged together when `entries` reaches the
-     * budget, before a record repeats in a shard (so mergeIndex's in-call choice never replaces the stored-vs-incoming
-     * rule between two SQL rows of one record), and at the end of each source.
+     * budget and at the end of each source. Each page or window stays its own batch inside a group
+     * (mergeIndexBatches), so a record seen in several windows (a record has one slot per source identity and control
+     * epoch) is merged exactly as one mergeIndex call per window would, with one shard read and write.
      */
-    type Buffer = { groups: Map<string, Group>; entries: number };
-    const newBuffer = (): Buffer => ({ groups: new Map(), entries: 0 });
+    type Buffer = { groups: Map<string, Group>; entries: number; batch: number };
+    const newBuffer = (): Buffer => ({ groups: new Map(), entries: 0, batch: 0 });
     const add = async (buf: Buffer, fences: Map<string, Promise<FenceDoc | null>>, row: { org: unknown; ws: unknown; user: unknown; origin: unknown; record: unknown; revision: unknown; revisionId: unknown; digest: unknown; source: unknown; session: unknown }) => {
       if (!id(row.org) || !id(row.user) || typeof row.ws !== "string") { summary.revisions.invalid++; return; }
       const fence = await fenceFor({ orgId: row.org, workspaceId: row.ws, userId: row.user }, fences);
@@ -683,11 +684,11 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
         summary.revisions.invalid++;
         return;
       }
-      if (buf.groups.get(key)?.records.has(entry.recordId)) await flush(buf);
       const tenant = { orgId: row.org, workspaceId: row.ws, userId: row.user };
-      const g = buf.groups.get(key) ?? { key, tenant, originId: row.origin, entries: [], records: new Set<string>() };
-      g.entries.push(entry);
-      g.records.add(entry.recordId);
+      const g = buf.groups.get(key) ?? { key, tenant, originId: row.origin, batches: [], batch: -1, entries: 0 };
+      if (g.batch !== buf.batch) { g.batches.push([]); g.batch = buf.batch; }
+      g.batches[g.batches.length - 1]!.push(entry);
+      g.entries++;
       buf.groups.set(key, g);
       if (++buf.entries >= mergeBuffer) await flush(buf);
     };
@@ -702,21 +703,21 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
       buf.entries = 0;
       const fresh = new Map<string, Promise<FenceDoc | null>>();
       await mapLimit(groups, concurrency, async (g) => {
-      if (opts.dryRun) { summary.revisions.would_merge += g.entries.length; return; }
+      if (opts.dryRun) { summary.revisions.would_merge += g.entries; return; }
       const fence = await fenceFor(g.tenant, fresh);
       if (!fence) {
-        summary.revisions.failed += g.entries.length;
-        summary.revisions.failed_codes.fence_unreadable = (summary.revisions.failed_codes.fence_unreadable ?? 0) + g.entries.length;
+        summary.revisions.failed += g.entries;
+        summary.revisions.failed_codes.fence_unreadable = (summary.revisions.failed_codes.fence_unreadable ?? 0) + g.entries;
         return;
       }
       try {
-        await storeRetry(() => io.mergeIndex(g.key, fence, g.originId, g.entries));
-        summary.revisions.merged += g.entries.length;
+        await storeRetry(() => io.mergeIndexBatches(g.key, fence, g.originId, g.batches));
+        summary.revisions.merged += g.entries;
         summary.revisions.shards++;
       } catch (error) {
         const code = failureCode(error);
-        summary.revisions.failed += g.entries.length;
-        summary.revisions.failed_codes[code] = (summary.revisions.failed_codes[code] ?? 0) + g.entries.length;
+        summary.revisions.failed += g.entries;
+        summary.revisions.failed_codes[code] = (summary.revisions.failed_codes[code] ?? 0) + g.entries;
       }
       });
     }
@@ -730,6 +731,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
       const last = rows[rows.length - 1]!;
       cursor = [text(last.org_id), text(last.workspace_id), text(last.origin_id), text(last.record_id)];
       const fences = new Map<string, Promise<FenceDoc | null>>();
+      revisionBuf.batch++;
       for (const r of rows) {
         summary.revisions.rows++;
         if (r.revision_id === null && r.digest === null) summary.revisions.seed_rows++;
@@ -744,6 +746,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
       if (sections.has("ownership")) await registerSlotOwners(rows);
       if (!sections.has("revisions")) return;
       const fences = new Map<string, Promise<FenceDoc | null>>();
+      slotBuf.batch++;
       for (const r of rows) {
         summary.revisions.slot_rows++;
         if (r.current_owner === null) { summary.revisions.slots_empty++; continue; }

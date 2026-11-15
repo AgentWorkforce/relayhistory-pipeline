@@ -4,7 +4,7 @@ import { PGlite } from "@electric-sql/pglite";
 import { btree_gin } from "@electric-sql/pglite/contrib/btree_gin";
 import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
 import { ObjectStoreError, objectKey, readAll, type ObjectStore } from "../../shared/vendor.ts";
-import { applyFenceChange, entryForgotten, fenceEpoch, isDeletedForAdmission, revisionShard, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "../ledger-s3.ts";
+import { applyFenceChange, entryForgotten, fenceEpoch, isDeletedForAdmission, newFence, revisionShard, s3ControlMirror, s3LedgerKeys, s3LedgerObjects, sessionKeyHash, type FenceDoc } from "../ledger-s3.ts";
 import type { OrderedControlInput } from "../ledger.ts";
 import { backfillUploadFences, type BackfillOptions, type BackfillSql } from "../upload-fence-backfill.ts";
 import { parseBackfillArgs } from "../../../scripts/upload-fence-backfill.ts";
@@ -337,7 +337,7 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
         return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
       },
     });
-    return { store, puts };
+    return { store, puts, gets };
   };
   const shardPuts = (puts: Map<string, number>) => [...puts].filter(([k]) => /\/r=[0-9a-f]{3}\.json$/.test(k));
 
@@ -365,6 +365,59 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     }
     expect(await entryOf(small.store, A, "origin-2", "n0059")).toEqual(await entryOf(one.store, A, "origin-2", "n0059"));
     for (const bad of [0, 1.5, 50_000_001]) await expect(run(scratch(), { mergeBufferEntries: bad })).rejects.toThrow("backfill_merge_buffer_invalid");
+  });
+
+  test("merge buffer: a record with several slots (one per source identity) merges once per window, no early flush", async () => {
+    /** A slot with its own key and source identity: one record can own several (one per source identity and epoch). */
+    const slotOf = (record: string, seed: string, revision: number) =>
+      q(`INSERT INTO sessions.ingest_lazy_native_slots (key_sha256, key_material, org_id, workspace_id, origin_id, record_id, source_identity_sha256, control_epoch,
+           initialized_witness_sha256, current_owner, current_source, current_session, current_revision, current_digest, current_reset_epoch, current_fence_epoch)
+         VALUES ($1, '[]'::jsonb, $2, $3, 'origin-1', $4, $5, $6, $6, $7, 'claude', 'sess-1', $8, $9, 0, 0)`,
+        [createHash("sha256").update(`${record}/${seed}`).digest("hex"), A.orgId, A.workspaceId, record, createHash("sha256").update(seed).digest("hex"), hex("e"), A.userId, revision, hex(String(revision % 10))]);
+    // dup-1: three slots side by side (one window); dup-2: slots far apart (separate 1-block windows), filler between.
+    await slotOf("dup-1", "s1", 3);
+    await slotOf("dup-1", "s2", 7);
+    await slotOf("dup-1", "s3", 5);
+    await slotOf("dup-2", "s1", 4);
+    for (let i = 0; i < 120; i++) await slotOf(`fill-${i}`, "s1", i + 1);
+    await slotOf("dup-2", "s2", 9);
+    for (let i = 120; i < 240; i++) await slotOf(`fill-${i}`, "s1", i + 1);
+    await slotOf("dup-2", "s3", 6);
+    const c = counted();
+    const summary = await run(c.store, { orgs: ["org-a"], slotWindowBlocks: 1 });
+    expect(summary.revisions).toMatchObject({ slot_rows: 246, merged: 246, failed: 0 });
+    expect(summary.sections.revisions).toBe("complete");
+    const gets = new Map(c.gets); // before the reads below
+    expect(await entryOf(c.store, A, "origin-1", "dup-1")).toEqual([7, null, hex("7"), sessionKeyHash("claude", "sess-1"), 0, 0]);
+    expect(await entryOf(c.store, A, "origin-1", "dup-2")).toEqual([9, null, hex("9"), sessionKeyHash("claude", "sess-1"), 0, 0]);
+    // One merge per shard for the whole pass: each shard read once and written once, never flushed per repeat.
+    const shards = shardPuts(c.puts);
+    expect(summary.revisions.shards).toBe(shards.length);
+    expect(shards.every(([, n]) => n === 1)).toBe(true);
+    for (const [k] of shards) expect(gets.get(k)).toBe(1);
+  });
+
+  test("mergeIndexBatches: the same shard as one mergeIndex call per batch, in order", async () => {
+    const fence = newFence();
+    let seed = 7;
+    const rnd = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+    const shardOf = revisionShard("rec-0");
+    const records: string[] = [];
+    for (let i = 0; records.length < 4 && i < 200_000; i++) if (revisionShard(`rec-${i}`) === shardOf) records.push(`rec-${i}`);
+    expect(records.length).toBeGreaterThan(2);
+    for (let round = 0; round < 40; round++) {
+      const batches = Array.from({ length: 1 + rnd(4) }, () => Array.from({ length: rnd(6) }, () => {
+        const full = rnd(2) === 0;
+        return { recordId: records[rnd(records.length)]!, revision: 1 + rnd(4), revisionId: full ? `id-${rnd(3)}` : null,
+          digest: full || rnd(2) === 0 ? hex(String(rnd(3))) : null, sessionKey: sessionKeyHash("claude", `s-${rnd(2)}`), epoch: 0, resets: 0 };
+      }));
+      const key = s3LedgerKeys(ROOT, A).revisions("origin-9", records[0]!);
+      const one = scratch(), two = scratch();
+      for (const st of [one, two]) await io(st).mergeIndex(key, fence, "origin-9", [{ recordId: records[1]!, revision: 2, revisionId: "id-0", digest: hex("1"), sessionKey: sessionKeyHash("claude", "s-0"), epoch: 0, resets: 0 }]);
+      for (const b of batches) await io(one).mergeIndex(key, fence, "origin-9", b);
+      await io(two).mergeIndexBatches(key, fence, "origin-9", batches);
+      expect((await io(two).readIndex(key))?.doc.records).toEqual((await io(one).readIndex(key))?.doc.records);
+    }
   });
 
   test("merge buffer: the fence is read again at merge time; unreadable then, nothing merges (incomplete)", async () => {

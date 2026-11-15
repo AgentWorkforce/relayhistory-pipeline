@@ -698,35 +698,50 @@ export function s3LedgerObjects(store: ObjectStore, keyRoot: string, opts: Omit<
   const readIndex = (key: string) => readDoc(store, key, validIndex, "ledger_revision_index_invalid");
 
   /** Merge entries into one origin's index shard (see the header). `fence` is the caller's latest fence read. */
-  async function mergeIndex(key: string, fence: FenceDoc, originId: string, entries: IndexEntryInput[]): Promise<void> {
-    const best = new Map<string, IndexEntryInput>();
-    for (const r of entries) {
-      const cur = best.get(r.recordId);
-      checkIndexEntryInput(r);
-      // Highest revision; at an equal one a full entry before a revision-only one, then revisionId byte order.
-      const better = !cur || r.revision > cur.revision || (r.revision === cur.revision && (cur.revisionId === null
-        ? r.revisionId !== null || (r.digest !== null && cur.digest === null)
-        : r.revisionId !== null && byteCompare(r.revisionId, cur.revisionId) < 0));
-      if (better) best.set(r.recordId, r);
-    }
+  function mergeIndex(key: string, fence: FenceDoc, originId: string, entries: IndexEntryInput[]): Promise<void> {
+    return mergeIndexBatches(key, fence, originId, [entries]);
+  }
+
+  /**
+   * One read-CAS of a shard for several merges in order: each batch is chosen within itself as one mergeIndex call
+   * chooses, then applied to the result of the batches before it under the stored-vs-incoming rule, exactly as
+   * `batches.length` sequential mergeIndex calls under the same fence would leave the shard, with one write.
+   */
+  async function mergeIndexBatches(key: string, fence: FenceDoc, originId: string, batches: IndexEntryInput[][]): Promise<void> {
     const shard = /\/r=([0-9a-f]{3})\.json$/.exec(key)?.[1];
     if (!shard) throw new LedgerUnavailableError("ledger_input_refused");
-    for (const r of best.values()) if (revisionShard(r.recordId) !== shard) throw new LedgerUnavailableError("ledger_input_refused");
+    const chosen: Map<string, IndexEntryInput>[] = [];
+    for (const entries of batches) {
+      const best = new Map<string, IndexEntryInput>();
+      for (const r of entries) {
+        const cur = best.get(r.recordId);
+        checkIndexEntryInput(r);
+        // Highest revision; at an equal one a full entry before a revision-only one, then revisionId byte order.
+        const better = !cur || r.revision > cur.revision || (r.revision === cur.revision && (cur.revisionId === null
+          ? r.revisionId !== null || (r.digest !== null && cur.digest === null)
+          : r.revisionId !== null && byteCompare(r.revisionId, cur.revisionId) < 0));
+        if (better) best.set(r.recordId, r);
+      }
+      for (const r of best.values()) if (revisionShard(r.recordId) !== shard) throw new LedgerUnavailableError("ledger_input_refused");
+      chosen.push(best);
+    }
     for (let attempt = 0; attempt < attempts; attempt++) {
       const got = await readIndex(key);
       if (got && (got.doc.originId !== originId || got.doc.shard !== shard)) throw new LedgerUnavailableError("ledger_revision_index_invalid");
       const map = new Map<string, IndexEntry>(got ? Object.entries(got.doc.records) : []);
       let changed = false;
       for (const [id, e] of map) if (entryForgotten(fence, originId, e)) { map.delete(id); changed = true; }
-      for (const [id, r] of best) {
-        const n: IndexEntry = [r.revision, r.revisionId, r.digest, r.sessionKey, r.epoch, r.resets];
-        if (entryForgotten(fence, originId, n)) continue; // these records predate a control: never stored
-        const s = map.get(id);
-        let take: boolean;
-        if (!s) take = true;
-        else if (s[3] === n[3] && (s[4] !== n[4] || s[5] !== n[5])) take = genNewer({ epoch: n[4], resets: n[5] }, { epoch: s[4], resets: s[5] });
-        else take = n[0] > s[0]; // #250: an equal revision keeps the stored entry, whichever session wrote it
-        if (take) { map.set(id, n); changed = true; }
+      for (const best of chosen) {
+        for (const [id, r] of best) {
+          const n: IndexEntry = [r.revision, r.revisionId, r.digest, r.sessionKey, r.epoch, r.resets];
+          if (entryForgotten(fence, originId, n)) continue; // these records predate a control: never stored
+          const s = map.get(id);
+          let take: boolean;
+          if (!s) take = true;
+          else if (s[3] === n[3] && (s[4] !== n[4] || s[5] !== n[5])) take = genNewer({ epoch: n[4], resets: n[5] }, { epoch: s[4], resets: s[5] });
+          else take = n[0] > s[0]; // #250: an equal revision keeps the stored entry, whichever session wrote it
+          if (take) { map.set(id, n); changed = true; }
+        }
       }
       if (!changed) return;
       const doc: IndexDoc = { v: 1, originId, shard, records: Object.fromEntries(map) };
@@ -812,7 +827,7 @@ export function s3LedgerObjects(store: ObjectStore, keyRoot: string, opts: Omit<
     return out;
   }
 
-  return { attempts, parallel, backoff, nowMs, keysFor, readFence, editFence, readIndex, mergeIndex, readOwner, registerOwner, listOwners, writeRearm, readBatch };
+  return { attempts, parallel, backoff, nowMs, keysFor, readFence, editFence, readIndex, mergeIndex, mergeIndexBatches, readOwner, registerOwner, listOwners, writeRearm, readBatch };
 }
 
 export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOptions = {}): Ledger {
