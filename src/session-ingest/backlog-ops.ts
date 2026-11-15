@@ -237,8 +237,14 @@ export function backlogOpsScope(env: Record<string, string | undefined>): Backlo
 // revision entries, and the drain needs its bound backfill-execute under 3 h old (BACKLOG_OPS_FRESH_BACKFILL_MS). S3
 // writes are per-key CAS with no shared hot key; SQL reads stay one transaction at a time on the connection.
 export const BACKLOG_OPS_BACKFILL_PAGING = ["--page-size", "5000", "--row-page-size", "20000", "--statement-timeout-ms", "600000", "--concurrency", "16"] as const;
-/** The export's per-statement timeout: its org, candidate and per-user reads over the buffer are as heavy (same 30 s default). */
-export const BACKLOG_OPS_EXPORT_PAGING = ["--statement-timeout-ms", "600000"] as const;
+/**
+ * The export's per-statement timeout (its reads over the buffer are as heavy as the backfill's), a 250-key page and the
+ * tool's MAX_EXPORT_CONCURRENCY. VERDICT_PAGE's per-stage work (the judged/kept CTEs filter materialized CTEs by
+ * stage_token) grows with the page squared, so the whole export grows with the page size: the default 1000-key page
+ * ran a scoped export-dry past the 355-min job limit, where 500 keys measured ~5 s a page on production. 250 keys
+ * keeps each page short and the total near an hour; 16 overlaps the per-stage marker GETs.
+ */
+export const BACKLOG_OPS_EXPORT_PAGING = ["--statement-timeout-ms", "600000", "--page-size", "250", "--concurrency", "16"] as const;
 
 /**
  * The presence tool's per-statement timeout and total transaction budget. Its statements (the counts, the distinct-org
