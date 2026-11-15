@@ -257,12 +257,22 @@ test("the credential step binds every receipt to BACKLOG_OPS_ORGS's scope", () =
   const put = (raw: string, scope: string) => JSON.stringify({ ...JSON.parse(raw), scope });
   const files: Record<string, string> = {
     "/tmp/rt/backlog-ops-bound/dry/backlog-ops-receipt.json": put(receipt("drain-dry", DRY, { mode: "dry_run", listed: 1 }), scoped),
-    "/tmp/rt/backlog-ops-bound/backfill/backlog-ops-receipt.json": put(receipt("backfill-execute", BACKFILL, backfillOk), "all"),
+    "/tmp/rt/backlog-ops-bound/backfill/backlog-ops-receipt.json": put(receipt("backfill-execute", BACKFILL, backfillOk), scoped),
     "/tmp/rt/backlog-ops-bound/export/backlog-ops-receipt.json": put(receipt("export-execute", EXPORT, exportOk), scoped),
   };
   const read = (p: string) => files[p]!;
   const d = backlogOpsDispatch(env, true);
   expect(codeSync(() => checkBoundReceipts(env, d, read))).toBeNull();
+  // The drain's BACKFILL needs EXACTLY the drain's scope: an unscoped (all-orgs) backfill never satisfies a scoped drain.
+  const unscopedBackfill = { ...files, "/tmp/rt/backlog-ops-bound/backfill/backlog-ops-receipt.json": put(receipt("backfill-execute", BACKFILL, backfillOk), "all") };
+  expect(codeSync(() => checkBoundReceipts(env, d, (p: string) => unscopedBackfill[p]!))).toBe("backlog_ops_bound_backfill_scope");
+  // ... while an export-execute may still bind an unscoped backfill (export verdicts are per stage).
+  const exEnv = { ...dispatchEnv("export-execute"), RUNNER_TEMP: "/tmp/rt", BACKLOG_OPS_ORGS: ORG1 };
+  const exFiles: Record<string, string> = {
+    "/tmp/rt/backlog-ops-bound/dry/backlog-ops-receipt.json": put(receipt("export-dry", DRY, { ...exportOk, mode: "dry_run" }), scoped),
+    "/tmp/rt/backlog-ops-bound/backfill/backlog-ops-receipt.json": put(receipt("backfill-execute", BACKFILL, backfillOk), "all"),
+  };
+  expect(codeSync(() => checkBoundReceipts(exEnv, backlogOpsDispatch(exEnv, true), (p: string) => exFiles[p]!))).toBeNull();
   expect(codeSync(() => checkBoundReceipts({ ...env, BACKLOG_OPS_ORGS: "" }, d, read))).toBe("backlog_ops_bound_drain_scope");
   expect(codeSync(() => checkBoundReceipts({ ...env, BACKLOG_OPS_ORGS: ORG2 }, d, read))).toBe("backlog_ops_bound_drain_scope");
 });

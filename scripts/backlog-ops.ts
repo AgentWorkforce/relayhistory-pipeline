@@ -102,7 +102,9 @@ export function checkBoundReceipts(env: Record<string, string | undefined>, d: B
     const path = paths.bound(b.kind);
     let raw: string;
     try { raw = read(path); } catch { return refuse(`backlog_ops_bound_${b.kind}_missing`); }
-    checkBoundReceipt(raw, { mode: b.mode, sha: d.sha, run: b.run, scope, kind: b.kind });
+    // The drain's BACKFILL and FULL: exactly the drain's scope (never an unscoped run standing in for a scoped drain).
+    const exact = d.mode === "drain-execute" && (b.kind === "backfill" || b.kind === "full");
+    checkBoundReceipt(raw, { mode: b.mode, sha: d.sha, run: b.run, scope, kind: b.kind, exact });
     raws[b.kind] = raw;
   }
   if (d.fullBackfillRun !== null) {
