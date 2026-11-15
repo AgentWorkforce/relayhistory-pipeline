@@ -141,7 +141,9 @@ if (import.meta.main) {
     let dbUrl = (parsed as { dbUrl?: unknown } | null)?.dbUrl;
     if (typeof dbUrl !== "string" || !dbUrl || Object.keys(parsed as object).length !== 1) throw new Error("db_url_required");
     // Discrete pinned fields only (verified TLS, no PG* env or .pgpass fallback), and read-only by default.
-    client = new pg.Client({ ...ownerClientConfig(dbUrl, "96bulls-upload-fence-backfill"), options: "-c default_transaction_read_only=on",
+    // Keep the base options (idle_in_transaction_session_timeout) and add read-only by default.
+    const base = ownerClientConfig(dbUrl, "96bulls-upload-fence-backfill");
+    client = new pg.Client({ ...base, options: `${base.options ?? ""} -c default_transaction_read_only=on`.trim(),
       keepAlive: true, keepAliveInitialDelayMillis: 10_000 });
     dbUrl = "";
     client.on("error", () => {});
