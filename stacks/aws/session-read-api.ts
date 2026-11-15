@@ -48,6 +48,17 @@ export interface SessionReadApiInputs {
   reservedConcurrency?: number | "none";
   /** Lane F1: serve GET/POST /v1/sessions/:id/analysis from the transcript bucket. Default off. */
   analysisBucket?: boolean;
+  /**
+   * Serve the native session summary reads (GET /v1/sessions/:id/summary and the summary activity; the function
+   * gets READ_API_BRIEF_SUMMARY_ENABLED=true). Default off: absent, the env is unchanged and those reads stay 501
+   * `summary_not_configured`. Needs sessions.session_briefs and 20261105056000 applied, or those reads 501 anyway.
+   */
+  briefSummary?: boolean;
+  /**
+   * Serve GET /v1/sessions?includeShortSummary=recorded (READ_API_LIST_SHORT_SUMMARY_ENABLED=true). Default off:
+   * absent, the param stays 501 `param_includeShortSummary` and the list shape is unchanged either way.
+   */
+  listShortSummary?: boolean;
 }
 
 export const SESSION_READ_API_RESOURCES = [
@@ -76,13 +87,16 @@ export function assertSessionReadApiInputs(p: unknown, refuse: (why: string) => 
     refuse("transcriptStore.sessionReadApi must be a plain object");
   const v = p as Record<string, unknown>;
   for (const k of Object.keys(v))
-    if (k !== "completeSince" && k !== "origin" && k !== "reservedConcurrency" && k !== "analysisBucket") refuse(`transcriptStore.sessionReadApi.${k} is not a known setting`);
+    if (k !== "completeSince" && k !== "origin" && k !== "reservedConcurrency" && k !== "analysisBucket" && k !== "briefSummary" && k !== "listShortSummary")
+      refuse(`transcriptStore.sessionReadApi.${k} is not a known setting`);
   if (typeof v.completeSince !== "string" || (v.completeSince !== "epoch" && !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(v.completeSince)))
     refuse('transcriptStore.sessionReadApi.completeSince must be an ISO UTC timestamp or "epoch"');
   if (v.origin !== undefined && (typeof v.origin !== "string" || !ORIGIN.test(v.origin)))
     refuse("transcriptStore.sessionReadApi.origin must be this function's us-east-1 Function URL origin (no path)");
   if (v.analysisBucket !== undefined && typeof v.analysisBucket !== "boolean")
     refuse("transcriptStore.sessionReadApi.analysisBucket must be a boolean");
+  for (const k of ["briefSummary", "listShortSummary"] as const)
+    if (v[k] !== undefined && typeof v[k] !== "boolean") refuse(`transcriptStore.sessionReadApi.${k} must be a boolean`);
   if (v.reservedConcurrency !== undefined && v.reservedConcurrency !== "none" && !(Number.isInteger(v.reservedConcurrency) && (v.reservedConcurrency as number) >= 2 && (v.reservedConcurrency as number) <= 50))
     refuse('transcriptStore.sessionReadApi.reservedConcurrency must be an integer from 2 to 50, or "none" (only below the default account quota)');
 }
@@ -135,6 +149,10 @@ export function sessionReadApiEnv(i: { stage: string; names: SessionReadApiNames
     RELAYAUTH_ISSUER: RELAYAUTH_PROD_ISSUER,
     // Lane F1: present only when analysisBucket is on, so existing deploys see no env change.
     ...(i.p.analysisBucket && i.analysisBucketName ? { READ_API_ANALYSIS_BUCKET: i.analysisBucketName } : {}),
+    // Summary reads: present only when switched on (exactly "true", src/session-read-api/config.ts), so existing
+    // deploys see no env change; switching either on is a "session read api update" phase on its own.
+    ...(i.p.briefSummary === true ? { READ_API_BRIEF_SUMMARY_ENABLED: "true" } : {}),
+    ...(i.p.listShortSummary === true ? { READ_API_LIST_SHORT_SUMMARY_ENABLED: "true" } : {}),
     NODE_OPTIONS: "--enable-source-maps",
   };
 }

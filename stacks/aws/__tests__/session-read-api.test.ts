@@ -147,6 +147,26 @@ describe("session read api: inputs, grants and env", () => {
     // RELAYAUTH_JWKS_URL is a public key-set location, not a credential; every other *URL stays banned.
     expect(Object.keys(env).filter((k) => k !== "RELAYAUTH_JWKS_URL").some((k) => /PASSWORD|KEY$|TOKEN|URL$/.test(k))).toBe(false);
   });
+
+  test("summary reads: env present only when switched on, exactly \"true\"; inputs are booleans", () => {
+    const names = sessionReadApiNames(STAGE);
+    for (const p of [{ completeSince: "epoch" }, { completeSince: "epoch", briefSummary: false, listShortSummary: false }]) {
+      const env = sessionReadApiEnv({ stage: STAGE, names, p }) as Record<string, string>;
+      expect("READ_API_BRIEF_SUMMARY_ENABLED" in env).toBe(false);
+      expect("READ_API_LIST_SHORT_SUMMARY_ENABLED" in env).toBe(false);
+    }
+    const on = sessionReadApiEnv({ stage: STAGE, names, p: { completeSince: "epoch", briefSummary: true, listShortSummary: true } }) as Record<string, string>;
+    expect(on.READ_API_BRIEF_SUMMARY_ENABLED).toBe("true");
+    expect(on.READ_API_LIST_SHORT_SUMMARY_ENABLED).toBe("true");
+    const one = sessionReadApiEnv({ stage: STAGE, names, p: { completeSince: "epoch", listShortSummary: true } }) as Record<string, string>;
+    expect("READ_API_BRIEF_SUMMARY_ENABLED" in one).toBe(false);
+    expect(one.READ_API_LIST_SHORT_SUMMARY_ENABLED).toBe("true");
+    const refuse = (why: string): never => { throw new Error(why); };
+    assertSessionReadApiInputs({ completeSince: "epoch", briefSummary: true, listShortSummary: false }, refuse);
+    for (const bad of ["true", 1, null])
+      for (const k of ["briefSummary", "listShortSummary"])
+        expect(() => assertSessionReadApiInputs({ completeSince: "epoch", [k]: bad }, refuse)).toThrow(new RegExp(`${k} must be a boolean`));
+  });
 });
 
 describe("session read api: reserved concurrency and alarms", () => {
