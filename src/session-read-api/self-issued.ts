@@ -181,6 +181,17 @@ function labelField(body: Record<string, unknown>): string | null {
   return label;
 }
 
+const MEMBER_ROLES = ["owner", "admin", "member"] as const;
+
+/**
+ * Control may send the caller's org role (SESSION_READ_MINT_INCLUDE_ROLE) so a gateway in front of
+ * this API can record it with the minted token. Optional, validated, and not stored or echoed here.
+ */
+function roleField(body: Record<string, unknown>): void {
+  const role = body.role;
+  if (role !== undefined && !(MEMBER_ROLES as readonly unknown[]).includes(role)) throw bad(`role must be one of ${MEMBER_ROLES.join(", ")}`);
+}
+
 /** Scope is fixed: exactly ["rth:read"], never widened or narrowed by a caller. */
 function requireReadScope(body: Record<string, unknown>): void {
   const scopes = body.scopes;
@@ -241,7 +252,8 @@ export function registerSelfIssuedRoutes(app: Hono<any>, deps: SelfIssuedDeps, l
   });
 
   app.post(SESSIONS_PATH, limit, internal(async (c, body) => {
-    onlyFields(body, ["userId", "orgId", "workspaceId", "audience", "scopes", "label"]);
+    onlyFields(body, ["userId", "orgId", "workspaceId", "role", "audience", "scopes", "label"]);
+    roleField(body);
     const identity = { userId: idField(body, "userId"), orgId: idField(body, "orgId"), workspaceId: idField(body, "workspaceId") };
     const audience = requireAudience(body, deps);
     requireReadScope(body);
@@ -260,7 +272,8 @@ export function registerSelfIssuedRoutes(app: Hono<any>, deps: SelfIssuedDeps, l
   }));
 
   app.post(REFRESH_PATH, limit, internal(async (c, body) => {
-    onlyFields(body, ["refreshToken", "userId", "orgId", "workspaceId", "audience", "scopes", "label"]);
+    onlyFields(body, ["refreshToken", "userId", "orgId", "workspaceId", "role", "audience", "scopes", "label"]);
+    roleField(body);
     const identity = { userId: idField(body, "userId"), orgId: idField(body, "orgId"), workspaceId: idField(body, "workspaceId") };
     const audience = requireAudience(body, deps);
     requireReadScope(body);

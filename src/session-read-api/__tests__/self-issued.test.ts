@@ -145,6 +145,32 @@ describe("internal secret", () => {
   });
 });
 
+describe("caller role", () => {
+  test("issue and refresh accept an optional owner, admin or member role, and do not echo it", async () => {
+    const { post, mem } = api();
+    for (const role of ["owner", "admin", "member"]) {
+      const r = await post(ISSUE, { ...issueBody(), role });
+      expect(r.status).toBe(201);
+      const pair = await json(r);
+      expect("role" in pair).toBe(false);
+      const next = await post(REFRESH, { ...issueBody(), role, refreshToken: pair.refreshToken });
+      expect(next.status).toBe(200);
+      expect("role" in (await json(next))).toBe(false);
+    }
+    expect(JSON.stringify([...mem.rows.values()])).not.toContain("admin");
+  });
+
+  test("any other role value is 400 on issue and refresh", async () => {
+    const { post } = api();
+    const pair = await json(await post(ISSUE, issueBody()));
+    for (const role of ["superuser", "", "Owner", null, 1, ["owner"]]) {
+      expect((await post(ISSUE, { ...issueBody(), role })).status).toBe(400);
+      expect((await post(REFRESH, { ...issueBody(), role, refreshToken: pair.refreshToken })).status).toBe(400);
+    }
+    expect((await post(ISSUE, { ...issueBody(), other: "x" })).status).toBe(400);
+  });
+});
+
 describe("refresh", () => {
   test("rotates; the old pair stops working", async () => {
     const { post, get } = api();
