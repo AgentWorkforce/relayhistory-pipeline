@@ -6,6 +6,13 @@
  * model id and token counts only, never prompts or outputs.
  */
 import { scrubText } from "../shared/vendor.ts";
+import {
+  TRANSCRIPT_TEXT_PART_TYPES,
+  codexMessage,
+  codexToolCall,
+  codexTurnModel,
+  isCodexInjectedContext,
+} from "../shared/codex-transcript.ts";
 
 export interface SessionDigest {
   harness: string;
@@ -55,6 +62,10 @@ export function digestRecords(harness: string, lines: string[]): SessionDigest {
       d.firstTs ??= ts;
       d.lastTs = ts;
     }
+    if (rec.type === "response_item" || rec.type === "turn_context") {
+      digestCodexRecord(d, rec);
+      continue;
+    }
     const msg = rec.message as Record<string, unknown> | undefined;
     const role = (msg?.role ?? rec.role ?? rec.type) as string | undefined;
     const content = msg?.content ?? rec.content;
@@ -72,10 +83,37 @@ export function digestRecords(harness: string, lines: string[]): SessionDigest {
   return d;
 }
 
-function textOf(content: unknown): string | undefined {
+/**
+ * A Codex rollout record (`shared/codex-transcript.ts`): user and assistant messages,
+ * `function_call` and `custom_tool_call` tool names, and the model from `turn_context`.
+ * Developer messages and the context Codex injects as user messages are not turns.
+ */
+function digestCodexRecord(d: SessionDigest, rec: Record<string, unknown>): void {
+  const model = codexTurnModel(rec);
+  if (model) {
+    if (!d.models.includes(model)) d.models.push(model);
+    return;
+  }
+  const tool = codexToolCall(rec);
+  if (tool) {
+    d.toolCalls[tool] = (d.toolCalls[tool] ?? 0) + 1;
+    return;
+  }
+  const message = codexMessage(rec);
+  if (message?.role === "user") {
+    const text = textOf(message.content, TRANSCRIPT_TEXT_PART_TYPES);
+    if (text?.trim() && !isCodexInjectedContext(text)) d.userTurns.push(text);
+  } else if (message?.role === "assistant") {
+    d.assistantTurns += 1;
+  }
+}
+
+function textOf(content: unknown, partTypes: readonly string[] = ["text"]): string | undefined {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
-    const parts = (content as Record<string, unknown>[]).filter((p) => p?.type === "text" && typeof p.text === "string").map((p) => p.text as string);
+    const parts = (content as Record<string, unknown>[])
+      .filter((p) => partTypes.includes(String(p?.type)) && typeof p.text === "string")
+      .map((p) => p.text as string);
     return parts.length ? parts.join(" ") : undefined;
   }
   return undefined;
