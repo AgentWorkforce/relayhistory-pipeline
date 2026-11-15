@@ -156,13 +156,14 @@ describe("promoteUpload: the contract vectors", () => {
     expect(await exists(store, key)).toBe(false);
   });
 
-  test("within the skew allowance after exp is still valid; a LastModified in the future never extends it", async () => {
+  test("within the skew allowance after exp is still valid; a LastModified ahead of now is capped at now", async () => {
     const { store, putAt } = counted();
     const key = V.objectKey as string;
     await store.put(objectKey(key), new Uint8Array(Buffer.from(V.object.objectBytesBase64, "base64")), { metadata: { "relay-witness": V.witness.token } });
     await setJournal(store, V.inputs.keyRoot, VTENANT, 7);
     const exp = V.witness.payload.exp * 1000;
-    // A LastModified far ahead of this consumer's clock is capped at now: now past exp + skew refuses.
+    // A LastModified far ahead of this consumer's clock is capped at now; with now past exp + skew it refuses
+    // (as it would uncapped: this case does not depend on the cap; the next test does).
     putAt.ms = exp + 10 * UPLOAD_WITNESS_PUT_SKEW_MS;
     const late = deps(store, { nowMs: () => exp + UPLOAD_WITNESS_PUT_SKEW_MS }, V.inputs.keyRoot);
     expect(await promoteUpload(key, late.d)).toEqual({ action: "ack", outcome: "refused", code: "upload_witness_expired" });
@@ -172,6 +173,19 @@ describe("promoteUpload: the contract vectors", () => {
     p2.ms = exp + UPLOAD_WITNESS_PUT_SKEW_MS - 1000;
     const ok = deps(s2, { nowMs: () => exp + 3_600_000 }, V.inputs.keyRoot);
     expect(await promoteUpload(key, ok.d)).toEqual({ action: "ack", outcome: "handed_off" });
+  });
+
+  test("a store clock running fast (LastModified past exp + skew, now before exp) is capped at now: handed off, not refused", async () => {
+    const { store, putAt } = counted();
+    const key = V.objectKey as string;
+    await store.put(objectKey(key), new Uint8Array(Buffer.from(V.object.objectBytesBase64, "base64")), { metadata: { "relay-witness": V.witness.token } });
+    await setJournal(store, V.inputs.keyRoot, VTENANT, 7);
+    const exp = V.witness.payload.exp * 1000;
+    putAt.ms = exp + 2 * UPLOAD_WITNESS_PUT_SKEW_MS;
+    // Uncapped this would refuse (and delete); the cap judges it at now, which is still before exp.
+    const { d, sent } = deps(store, { nowMs: () => exp - 60_000 }, V.inputs.keyRoot);
+    expect(await promoteUpload(key, d)).toEqual({ action: "ack", outcome: "handed_off" });
+    expect(sent).toHaveLength(1);
   });
 
   test("no usable LastModified (absent: epoch 0) is a retry, never a refusal; the upload stays", async () => {

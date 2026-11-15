@@ -323,7 +323,12 @@ export async function promoteUpload(key: string, deps: PromoteUploadDeps): Promi
   // PUT may happen, not when this consumer gets to it: expiry is judged at the time the store accepted the
   // PUT (LastModified, from the same response), with UPLOAD_WITNESS_PUT_SKEW_MS of clock skew. Judging it
   // at promotion time refused (and deleted) every upload that waited in a backlog longer than the TTL.
-  // No usable LastModified: retry, never refuse.
+  // No usable LastModified: retry, never refuse. This gate runs before the MAC check on purpose: without a
+  // trustworthy PUT time no expiry verdict is possible, and a refusal deletes the bytes, so the only safe
+  // answer is a retry (every real store sends Last-Modified; the retry count shows in upload_results).
+  // LastModified is capped at this consumer's now: the cap can only admit MORE uploads, never fewer. It keeps
+  // a store clock running fast from turning a valid witness into a wrongful refusal (and deletion).
+  // The hosted Lambda path (upload-admission-lambda.ts) calls this same function, so it carries the same rule.
   const putAtMs = object.meta.lastModified instanceof Date ? object.meta.lastModified.getTime() : Number.NaN;
   if (!Number.isFinite(putAtMs) || putAtMs <= 0) {
     await cancel();

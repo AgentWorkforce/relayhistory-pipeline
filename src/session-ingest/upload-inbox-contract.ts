@@ -50,7 +50,7 @@ export const UPLOAD_REFUSAL_CODES = [
   "upload_key_invalid", //            the key does not parse under the upload-inbox grammar
   "upload_unencrypted", //            HISTORY_UPLOAD_INBOX_SSE=aws:kms and the object was stored without SSE-KMS
   "upload_witness_invalid", //        witness missing, malformed, not exact-keys, or its MAC does not verify
-  "upload_witness_expired", //        witness `exp` is at or before the consumer's clock
+  "upload_witness_expired", //        witness `exp` is at or before the PUT time (LastModified, capped at now, less the skew allowance)
   "upload_tenant_mismatch", //        key (org, ws, uh) differs from the witness (org, ws, hash(user))
   "upload_witness_seq_mismatch", //   key `w<seq>` differs from the witness seq, or the seq is ahead of the journal
   "delivery_too_large", //            object over MAX_DELIVERY_BYTES, or decoded/prepared delivery over its limits

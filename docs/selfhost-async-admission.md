@@ -208,6 +208,8 @@ anything else is off, and the code default is off. `e2e/selfhost/compose.yaml` s
 | `SELFHOST_UPLOAD_PROMOTE_CONCURRENCY` (`HISTORY_UPLOAD_DIRECT` allowlist/on) | 1..64: promotions in flight at once within a scan | 8 |
 | `READ_API_CANONICAL_PIN_LAGGING_POINTER` (read API, not ingest) | exactly `true`, anything else is off | off |
 
+To restore the pre-2026-11-15 promotion shape (serial, 16 per scan), set `SELFHOST_UPLOAD_PROMOTE_CONCURRENCY=1` and `SELFHOST_UPLOAD_SCAN_BATCH=16`. The expiry rule (judged at the PUT time) has no switch: judging it at promotion time deleted valid uploads.
+
 The knobs are read only in `async` and `drain`. No new secret, role, grant, migration or bucket
 setting is needed. The Locker credential must be able to put, get and list under `<keyRoot>/`,
 including the dot-prefixed `.admission-inbox`, `.admission-dlq` and `.admission-probe` roots, which

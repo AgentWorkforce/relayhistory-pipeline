@@ -27,7 +27,8 @@
  *
  * Upload inbox (HISTORY_UPLOAD_DIRECT allowlist|on only, `uploadInbox`): after the admission pass, the same
  * scan lists `<keyRoot>/.upload-inbox/` and runs promoteUpload (upload-admission.ts) on at most `batchSize`
- * due objects, one at a time, with per-object backoff (backoffSeconds) after a retry. A hand-off writes an
+ * due objects, chosen fairly across uploading origins (oldest first) and run with bounded concurrency
+ * (SELFHOST_UPLOAD_PROMOTE_CONCURRENCY), with per-object backoff (backoffSeconds) after a retry. A hand-off writes an
  * admission-inbox object and notifies this consumer, which admits it like any other. Off: the prefix is
  * never listed.
  *
@@ -176,12 +177,12 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
         uploadBackoff.set(key, { attempts, notBefore: now() + (r.action === "invalid" ? 300 : backoffSeconds(attempts)) * 1000 });
       };
       // Bounded concurrency: `concurrency` workers share one cursor over the chosen keys.
-      let next = 0;
+      let next = 0, promoted = 0;
       const workerCount = Math.min(Math.max(1, Math.floor(upload.concurrency ?? 1)), chosen.length);
       await Promise.all(Array.from({ length: workerCount }, async () => {
-        while (!stopped && next < chosen.length) await promoteOne(chosen[next++]!);
+        // `promoted` counts only attempts actually started: stop() can cut a pass short.
+        while (!stopped && next < chosen.length) { promoted++; await promoteOne(chosen[next++]!); }
       }));
-      const promoted = chosen.length;
       if (promoted > 0) logger.info("session ingest upload admission", { route: "ingest.upload_admission", outcome: "ok", promoted, waiting: uploadBackoff.size,
         upload_due: due.length, upload_origins: new Set(due.map((c) => c.origin)).size, upload_results: uploadResultsField(counts), duration_ms: Date.now() - t0, ...counts });
     } catch (error) {
