@@ -127,11 +127,11 @@ export interface ExportedScope {
 }
 
 /** Exports `lines` (one manifest per machine) into a temporary fs store. */
-export async function exportStreamScope(lines: Line[], maxChunkBytes = 1500): Promise<ExportedScope> {
+export async function exportStreamScope(lines: Line[], maxChunkBytes = 1500, id: typeof ID = ID): Promise<ExportedScope> {
   const root = await mkdtemp(join(tmpdir(), "stream-parity-"));
   const store = createFsStore({ root });
   const unit: SessionUnit = {
-    orgId: ID.orgId, workspaceId: ID.workspaceId, source: ID.source, sessionId: ID.sessionId,
+    orgId: id.orgId, workspaceId: id.workspaceId, source: id.source, sessionId: id.sessionId,
     firstMs: T0, lastMs: T0 + 60_000, machineIds: [], totals: {},
   };
   const encoder = new TextEncoder();

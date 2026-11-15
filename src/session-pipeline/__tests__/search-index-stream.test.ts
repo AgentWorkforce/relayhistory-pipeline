@@ -14,7 +14,7 @@ import { TENANT_SETTINGS_SQL, type TenantSqlRunner } from "@rhc/search-index/pos
 import type { SqlExecutor } from "@rhc/lib/pipeline/queue.ts";
 import { composeSearchService } from "../../shared/search-composition.ts";
 import type { SearchProjectionState } from "../search-adapter.ts";
-import { indexSearchScope, searchIndexStreamFromEnv, type SearchIndexDeps } from "../search-index.ts";
+import { indexSearchScope, searchIndexStreamDefaultsWarning, searchIndexStreamFromEnv, type SearchIndexDeps } from "../search-index.ts";
 import { STREAM_READ_BYTES_BUDGET, STREAM_SOURCE_CHANGED } from "../../session-read-api/canonical-stream-projection.ts";
 import {
   SCOPE, T0, activity, decompress, exportStreamScope, generate, prefixFor, type ExportedScope, type Line,
@@ -157,7 +157,7 @@ function withoutRawDigests(reader: ManifestReader): ManifestReader {
   } as ManifestReader;
 }
 
-test("streaming on: a source that changes before regeneration writes no rows, deletes nothing and owes a pass", async () => {
+test("streaming on: a source that changes during regeneration keeps the verified rows it wrote, deletes nothing and owes a pass", async () => {
   const lines = [...generate(35), activity("machine:0", "capacity:marker", "session_event", "marked", T0 + 3000, { role: "user", text: "MARKER-A" }, "1", 999)];
   const x = await scope(lines);
   let calls = 0;
@@ -169,16 +169,63 @@ test("streaming on: a source that changes before regeneration writes no rows, de
     const text = new TextDecoder().decode(raw);
     return text.includes("MARKER-A") ? new TextEncoder().encode(text.replace("MARKER-A", "MARKER-B")) : raw;
   };
-  const b = await backend(x, { limits: TINY, stream: UNLIMITED, decompress: changing, reader: withoutRawDigests(x.reader) });
+  // One row per write: the rows pass 4 regenerates before it reaches the change are written.
+  const b = await backend(x, { limits: { ...TINY, insertBatch: 1 }, stream: UNLIMITED, decompress: changing, reader: withoutRawDigests(x.reader) });
   // The whole-read sizing reads no chunk; passes 1 to 3 read every chunk once, pass 4 sees the change.
   const chunks = await Promise.all(x.keys.map(async (k) => (await x.reader.read(k))!.manifest.raw.chunks.length));
   after = 3 * chunks.reduce((a, n) => a + n, 0);
   const s = await indexSearchScope(SCOPE, b.deps);
   expect(calls).toBeGreaterThan(after); // pass 4 ran
-  expect(s).toMatchObject({ complete: false, inserted: 0, deleted: 0, reasons: [STREAM_SOURCE_CHANGED] });
-  expect(await b.scan()).toEqual([]);
+  expect(s).toMatchObject({ complete: false, deleted: 0, reasons: [STREAM_SOURCE_CHANGED] });
+  expect(s.inserted).toBeGreaterThan(0);
+  expect((await b.scan()).length).toBe(s.inserted); // only verified rows, each one pass 3 wanted
   expect(b.directory).toEqual([]);
   expect(b.recorded).toEqual([expect.objectContaining({ complete: false })]);
+  expect(b.sb.calls.some((c) => c.includes("event_projection_ready"))).toBe(true); // directory invalidated
+  // A rerun over a settled source repairs the scope: it matches a whole read.
+  after = Number.POSITIVE_INFINITY;
+  calls = Number.NEGATIVE_INFINITY;
+  const again = await indexSearchScope(SCOPE, b.deps);
+  expect(again).toMatchObject({ complete: true, reasons: [] });
+  const whole = await backend(x, {});
+  expect(await indexSearchScope(SCOPE, whole.deps)).toMatchObject({ complete: true });
+  expect(await b.scan()).toEqual(await whole.scan());
+}, 60_000);
+
+test("streaming on: the stream keeps its transaction busy between the reads of every pass", async () => {
+  const x = await scope(generate(31));
+  const pings = () => b.sb.calls.filter((c) => c === "SELECT 1 AS stream_keepalive").length;
+  const seen: number[] = [];
+  const counting = (stored: Uint8Array, max: number) => {
+    seen.push(pings());
+    return decompress(stored, max);
+  };
+  const b = await backend(x, { limits: TINY, stream: UNLIMITED, decompress: counting, streamKeepaliveMs: 0 });
+  const s = await indexSearchScope(SCOPE, b.deps);
+  expect(s).toMatchObject({ complete: true, stream: { passes: 4 } });
+  const chunks = (await Promise.all(x.keys.map(async (k) => (await x.reader.read(k))!.manifest.raw.chunks.length))).reduce((a, n) => a + n, 0);
+  expect(seen.length).toBe(4 * chunks);
+  // Every chunk read after the first follows a ping: no pass, and no gap between passes, is quiet.
+  for (let i = 1; i < seen.length; i++) expect({ i, more: seen[i]! > seen[i - 1]! }).toEqual({ i, more: true });
+  // Throttled: with a long interval only the first record pings.
+  const quiet = await backend(x, { limits: TINY, stream: UNLIMITED, streamKeepaliveMs: 1e12 });
+  expect(await indexSearchScope(SCOPE, quiet.deps)).toMatchObject({ complete: true });
+  expect(quiet.sb.calls.filter((c) => c === "SELECT 1 AS stream_keepalive").length).toBe(1);
+}, 60_000);
+
+test("streaming on: a failed keepalive ends the pass with its error, not a read code", async () => {
+  const x = await scope(generate(37));
+  const b = await backend(x, { limits: TINY, stream: UNLIMITED });
+  const lost = new Error("terminating connection due to idle-in-transaction timeout");
+  const deps: SearchIndexDeps = {
+    ...b.deps,
+    transact: (work) => b.sb.transact((tx) => work({
+      query: (text: string, params?: unknown[]) => (text.includes("stream_keepalive") ? Promise.reject(lost) : tx.query(text, params)),
+    } as SqlExecutor)),
+  };
+  await expect(indexSearchScope(SCOPE, deps)).rejects.toBe(lost);
+  expect(await b.scan()).toEqual([]);
+  expect(b.recorded).toEqual([]);
 }, 60_000);
 
 test("SEARCH_INDEX_STREAMING_ENABLED and the read budgets are validated", () => {
@@ -216,4 +263,19 @@ test("SEARCH_INDEX_STREAMING_ENABLED and the read budgets are validated", () => 
     expect(message).toStartWith(`pipeline consumer: ${name} must be`);
     expect(message).not.toContain(value); // never echoes the value
   }
+});
+
+test("streaming on with both budgets at their defaults warns at startup; a raised budget does not", () => {
+  const MiB = 1024 * 1024;
+  const limits = { maxScopeBytes: 64 * MiB, maxScopeEvents: 100_000 };
+  const on = { SEARCH_INDEX_STREAMING_ENABLED: "true" };
+  const warn = (env: Record<string, string>, l: typeof limits = limits) => searchIndexStreamDefaultsWarning(searchIndexStreamFromEnv(env, l, false), l);
+  expect(warn({})).toBeUndefined(); // off
+  expect(warn(on)).toEqual({ max_read_bytes: 256 * MiB, max_read_events: 400_000, largest_streamed_scope_bytes: 64 * MiB, largest_streamed_scope_events: 100_000 });
+  // Set to the default values is still the defaults.
+  expect(warn({ ...on, SEARCH_INDEX_STREAM_MAX_READ_BYTES: "256MiB", SEARCH_INDEX_STREAM_MAX_READ_EVENTS: "400000" })).toBeDefined();
+  expect(warn({ ...on, SEARCH_INDEX_STREAM_MAX_READ_BYTES: "2GiB" })).toBeUndefined();
+  expect(warn({ ...on, SEARCH_INDEX_STREAM_MAX_READ_EVENTS: "2000000" })).toBeUndefined();
+  // At 500,000 records and more the default events budget is the 2,000,000 cap: still no scope fits.
+  expect(warn(on, { maxScopeBytes: 64 * MiB, maxScopeEvents: 500_000 })).toMatchObject({ max_read_events: 2_000_000, largest_streamed_scope_events: 500_000 });
 });

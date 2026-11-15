@@ -124,6 +124,8 @@ export interface SearchIndexDeps {
    * partial exactly as before, and every other scope never reaches the streaming reader.
    */
   stream?: StreamReadLimits;
+  /** Tests only: how often the streaming reader keeps its transaction busy (default 20 s). */
+  streamKeepaliveMs?: number;
 }
 
 export interface SearchIndexLimits {
@@ -535,6 +537,9 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
   });
 }
 
+/** The streaming reader's keepalive interval: a third of the consumer pool's 60 s idle timeout. */
+const STREAM_KEEPALIVE_MS = 20_000;
+
 /**
  * The reconcile of `indexSearchScope` for a scope the whole read refused as too large, from
  * the streaming reader: the same rows, deletes, directory metadata, catalog and state, with
@@ -558,7 +563,12 @@ async function streamedReconcile(
 ): Promise<SearchIndexResult> {
   const read = await streamCanonicalScope(
     scope, admitted,
-    { readerMaxRuleset: deps.readerMaxRuleset, store: deps.store, prefixFor: deps.prefixFor.bind(deps), decompress: deps.decompress ?? defaultDecompress },
+    {
+      readerMaxRuleset: deps.readerMaxRuleset, store: deps.store, prefixFor: deps.prefixFor.bind(deps), decompress: deps.decompress ?? defaultDecompress,
+      // The consumer pool ends a transaction idle for 60 s (lambda.ts): passes 1 to 3 read S3
+      // without a query, so keep it busy well inside that.
+      keepalive: { everyMs: deps.streamKeepaliveMs ?? STREAM_KEEPALIVE_MS, ping: async () => void (await tx.query("SELECT 1 AS stream_keepalive")) },
+    },
     budget, version, fromMs,
   );
   const stream = () => ({ passes: read.meter.passes, chunks: read.meter.chunks, bytes: read.meter.bytes, events: read.meter.events });
@@ -650,10 +660,10 @@ async function streamedReconcile(
  * Unset, each budget is four times the effective whole-read bound (one read per pass), capped
  * at the large-read profile (2 GiB / 2,000,000); set, it must lie between that default and
  * the cap. A scope whose declared size times four exceeds a budget is never streamed: with
- * the defaults that is nearly every scope past the whole-read bound, so an operator raises
- * the bytes budget (to the 2 GiB cap: scopes up to 512 MiB) with the pod's memory in mind
- * only for chunk-sized buffers. Refused with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true: the
- * facts are built from a whole read. Errors name the variable and its range, never the value.
+ * both defaults that is every scope past the whole-read bound (searchIndexStreamDefaultsWarning
+ * logs it at startup), so an operator raises both budgets (at the caps: scopes up to 512 MiB
+ * and 500,000 records), sizing the pod for one chunk plus about 1 KB of keys per record.
+ * Refused with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true: the facts are built from a whole read. Errors name the variable and its range, never the value.
  */
 export function searchIndexStreamFromEnv(
   env: Record<string, string | undefined>,
@@ -666,8 +676,8 @@ export function searchIndexStreamFromEnv(
   if (outputFacts)
     throw new Error("pipeline consumer: SEARCH_INDEX_STREAMING_ENABLED=true cannot be combined with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true");
   const MiB = 1024 * 1024;
-  const effective = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...limits };
   const cap = STREAM_READ_CEILING;
+  const defaults = searchIndexStreamDefaults(limits);
   const fmt = (bytes: boolean, n: number) => (bytes ? `${n / MiB}MiB` : String(n));
   const read = (name: string, bytes: boolean, min: number, max: number): number => {
     const raw = env[name];
@@ -679,8 +689,40 @@ export function searchIndexStreamFromEnv(
     return value;
   };
   return {
-    maxReadBytes: read("SEARCH_INDEX_STREAM_MAX_READ_BYTES", true, Math.min(STREAM_PASSES * effective.maxScopeBytes, cap.maxReadBytes), cap.maxReadBytes),
-    maxReadEvents: read("SEARCH_INDEX_STREAM_MAX_READ_EVENTS", false, Math.min(STREAM_PASSES * effective.maxScopeEvents, cap.maxReadEvents), cap.maxReadEvents),
+    maxReadBytes: read("SEARCH_INDEX_STREAM_MAX_READ_BYTES", true, defaults.maxReadBytes, cap.maxReadBytes),
+    maxReadEvents: read("SEARCH_INDEX_STREAM_MAX_READ_EVENTS", false, defaults.maxReadEvents, cap.maxReadEvents),
+  };
+}
+
+/** The default (and smallest accepted) streaming budgets for the effective whole-read `limits`. */
+export function searchIndexStreamDefaults(limits: Partial<SearchIndexLimits>): StreamReadLimits {
+  const effective = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...limits };
+  return {
+    maxReadBytes: Math.min(STREAM_PASSES * effective.maxScopeBytes, STREAM_READ_CEILING.maxReadBytes),
+    maxReadEvents: Math.min(STREAM_PASSES * effective.maxScopeEvents, STREAM_READ_CEILING.maxReadEvents),
+  };
+}
+
+/**
+ * The startup warning for streaming on with both budgets at their defaults, or undefined.
+ * Every scope the streaming reader takes is past the whole-read bound, and it needs four
+ * times its size within each budget: at the defaults (four whole reads, or the cap once a
+ * bound reaches 512 MiB / 500,000) no scope fits, so none streams; one whose chunks do not
+ * declare their record counts is refused only after a full first pass under the scope's
+ * locks. Raise SEARCH_INDEX_STREAM_MAX_READ_BYTES and _EVENTS toward the cap.
+ */
+export function searchIndexStreamDefaultsWarning(
+  stream: StreamReadLimits | undefined,
+  limits: Partial<SearchIndexLimits>,
+): Record<string, number> | undefined {
+  if (!stream) return undefined;
+  const defaults = searchIndexStreamDefaults(limits);
+  if (stream.maxReadBytes !== defaults.maxReadBytes || stream.maxReadEvents !== defaults.maxReadEvents) return undefined;
+  return {
+    max_read_bytes: stream.maxReadBytes,
+    max_read_events: stream.maxReadEvents,
+    largest_streamed_scope_bytes: Math.floor(stream.maxReadBytes / STREAM_PASSES),
+    largest_streamed_scope_events: Math.floor(stream.maxReadEvents / STREAM_PASSES),
   };
 }
 

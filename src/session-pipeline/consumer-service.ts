@@ -67,7 +67,7 @@ import {
 import { processBatch, type ConsumerDeps, type QueueRecord } from "./consumer.ts";
 import { RECONCILE_BODY_KEY } from "./s3-events.ts";
 import { postgresOutputFactsStore } from "./output-facts-store.ts";
-import { searchIndexLimitsFromEnv, searchIndexStreamFromEnv, type SearchIndexDeps } from "./search-index.ts";
+import { searchIndexLimitsFromEnv, searchIndexStreamDefaultsWarning, searchIndexStreamFromEnv, type SearchIndexDeps } from "./search-index.ts";
 import {
   ingestLoginIdentity,
   type IngestLoginIdentityRefusal,
@@ -1138,6 +1138,11 @@ export async function serve(env: NodeJS.ProcessEnv = process.env): Promise<never
   // scope past the whole-read bound, within SEARCH_INDEX_STREAM_MAX_READ_* (search-index.ts
   // searchIndexStreamFromEnv). Off returns undefined and the search deps carry no `stream`.
   const searchStream = searchIndexStreamFromEnv(env, searchLimits, config.outputFacts);
+  const streamDefaults = searchIndexStreamDefaultsWarning(searchStream, searchLimits);
+  if (streamDefaults)
+    log.warn("pipeline consumer streaming reconcile on with default read budgets: no scope past the whole-read bound fits them", {
+      service: "session-pipeline-consumer", ...streamDefaults,
+    });
   // Dormant never opens a database, so smuggled startup options there are
   // inert; the live path below refuses both halves before any pool is created.
   refuseStartupOptions(config.secret.hoopdb_url);

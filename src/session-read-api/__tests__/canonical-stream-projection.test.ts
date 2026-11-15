@@ -39,8 +39,8 @@ interface Fixture {
   streamDeps: StreamDeps;
 }
 
-async function fixture(lines: Line[], maxChunkBytes = 1500, wrap?: (d: StreamDeps["decompress"]) => StreamDeps["decompress"]): Promise<Fixture> {
-  const x = await exportStreamScope(lines, maxChunkBytes);
+async function fixture(lines: Line[], maxChunkBytes = 1500, wrap?: (d: StreamDeps["decompress"]) => StreamDeps["decompress"], id: typeof ID = ID): Promise<Fixture> {
+  const x = await exportStreamScope(lines, maxChunkBytes, id);
   cleanup.push(x.dispose);
   return {
     keys: x.keys,
@@ -50,12 +50,12 @@ async function fixture(lines: Line[], maxChunkBytes = 1500, wrap?: (d: StreamDep
   };
 }
 
-async function whole(f: Fixture): Promise<ScopeRead> {
-  return readCanonicalScope(SCOPE, f.keys, f.readDeps, BIG, VERSION, f.canonicalId);
+async function whole(f: Fixture, scope = SCOPE): Promise<ScopeRead> {
+  return readCanonicalScope(scope, f.keys, f.readDeps, BIG, VERSION, f.canonicalId);
 }
 
-async function admitted(f: Fixture): Promise<NonNullable<ScopeRead["admitted"]>> {
-  const read = await readCanonicalScope(SCOPE, f.keys, f.readDeps, TINY, VERSION, f.canonicalId);
+async function admitted(f: Fixture, scope = SCOPE): Promise<NonNullable<ScopeRead["admitted"]>> {
+  const read = await readCanonicalScope(scope, f.keys, f.readDeps, TINY, VERSION, f.canonicalId);
   expect(read).toMatchObject({ partial: true, complete: false, reasons: ["scope_too_large"] });
   return read.admitted!;
 }
@@ -73,9 +73,9 @@ async function regenerateAll(s: StreamedScope, batch = 7): Promise<IndexRow[]> {
 }
 
 /** The streamed read equals the whole read: what it would write and what it would record. */
-async function expectParity(f: Fixture, fromMs = 0): Promise<{ w: ScopeRead; s: StreamedScope }> {
-  const w = await whole(f);
-  const s = await streamCanonicalScope(SCOPE, await admitted(f), f.streamDeps, UNLIMITED, VERSION, fromMs);
+async function expectParity(f: Fixture, fromMs = 0, scope = SCOPE): Promise<{ w: ScopeRead; s: StreamedScope }> {
+  const w = await whole(f, scope);
+  const s = await streamCanonicalScope(scope, await admitted(f, scope), f.streamDeps, UNLIMITED, VERSION, fromMs);
   expect({ complete: s.complete, reasons: s.reasons }).toEqual({ complete: w.complete, reasons: w.reasons });
   expect(s.partial).toBe(false);
   expect(s.manifests).toBe(w.manifests);
@@ -151,6 +151,54 @@ test("an activity line that replaces a direct line with the same key keeps parit
   expect(w.complete).toBe(true);
 }, 30_000);
 
+test("edge records keep parity: codex tool captures, legacy, cross-origin and missing accepted_seq", async () => {
+  const CODEX = { ...ID, source: "codex" };
+  const scope = { ...SCOPE, harness: "codex" };
+  const origin = "capacity:codex";
+  const machine = deliveryMachine(ID.workspaceId, origin);
+  const codex = { source: "codex", session_id: "codex-native", message_id: "call-msg" };
+  const lines: Line[] = [
+    // A codex tool call and the assistant tool_use event it names: the activity row takes the tool name.
+    activity(machine, origin, "tool_call", "call-1", T0, { ...codex, name: "Bash", input: { cmd: "ls" } }, "1", 1),
+    activity(machine, origin, "session_event", "use-1", T0 + 100, { ...codex, kind: "tool_use", role: "assistant", text: "run" }, "1", 2),
+    // A direct line whose delivery_record_id names that event: the whole read never applies a
+    // capture to a direct group, so neither may the stream (lead P3-1).
+    direct(machine, `${machine}:direct-1`, T0 + 200, { source: "codex", kind: "session_event", delivery_record_id: "use-1" }),
+    // One record id from two origins: the later accepted contender wins.
+    activity(machine, origin, "session_event", "shared-id", T0 + 300, { role: "user", text: "first origin" }, "1", 3),
+    activity(machine, "capacity:other", "session_event", "shared-id", T0 + 400, { role: "user", text: "second origin" }, "1", 4),
+    // No accepted_seq and no contender: kept.
+    activity(machine, origin, "session_event", "unsequenced", T0 + 500, { role: "assistant", text: "no seat" }),
+    // A legacy record with a direct line's seat: a legacy kind never contends.
+    { machine, record: { kind: "legacy_scope", origin_id: `machine:${machine}`, record_id: `${machine}:direct-1`, revision: "1", operation: "upsert", received_at: new Date(T0).toISOString(), payload: { note: "legacy" } } },
+  ].map((l) => (l.record.kind === "convergence_event" ? { ...l, record: { ...l.record, payload: { ...l.record.payload, source: "codex" } } } : l));
+  const f = await fixture(lines, 1500, undefined, CODEX);
+  const { w, s } = await expectParity(f, 0, scope);
+  expect(w.complete).toBe(true);
+  const rows = await regenerateAll(s);
+  expect(rows.length).toBe(5);
+  // The capture reached the activity tool_use row and not the direct row naming the same event.
+  const byId = (suffix: string) => w.rows.find((r) => r.event_id.endsWith(`:${suffix}`)) as unknown as Record<string, unknown>;
+  expect(byId("use-1")).toMatchObject({ type: "tool_use", tool_name: "Bash" });
+  expect(byId("direct-1")).toMatchObject({ type: "assistant", tool_name: "" });
+  // The later accepted of the two origins wins; the legacy record projects no row.
+  expect(w.rows.filter((r) => r.event_id.endsWith(":shared-id")).length).toBe(1);
+  expect(byId("unsequenced")).toBeDefined();
+  const missing = await fixture([
+    ...lines.slice(0, 3),
+    activity(machine, origin, "session_event", "unseated", T0 + 600, { role: "user", text: "a" }),
+    activity(machine, "capacity:other", "session_event", "unseated", T0 + 700, { role: "user", text: "b" }),
+  ], 1500, undefined, CODEX);
+  // Contending ids without acceptance seats: both reads stop incomplete on the same code (the
+  // whole read goes on and may list more codes; the stream stops at the first, as documented).
+  const mw = await whole(missing, scope);
+  const ms = await streamCanonicalScope(scope, await admitted(missing, scope), missing.streamDeps, UNLIMITED, VERSION, 0);
+  expect(mw.complete).toBe(false);
+  expect(ms).toMatchObject({ complete: false, partial: false });
+  expect(mw.reasons).toContain("relayhistory_acceptance_missing");
+  expect(ms.reasons).toContain("relayhistory_acceptance_missing");
+}, 30_000);
+
 test("the up-front budget check refuses before reading: both codes", async () => {
   const f = await fixture(generate(5));
   const a = await admitted(f);
@@ -186,6 +234,57 @@ test("undeclared record counts: the events budget stops the stream mid-read, and
   expect(fits.complete).toBe(true);
   await regenerateAll(fits);
   expect(fits.meter.events).toBe(total * 4);
+}, 30_000);
+
+test("a chunk declared larger than it reads is budgeted for pass 4 after pass 1 (lead P3-3)", async () => {
+  const sizes: number[] = [];
+  const f = await fixture(generate(12), 900, (d) => (stored, max) => {
+    const raw = d(stored, max);
+    sizes.push(raw.length);
+    return raw;
+  });
+  const a = await admitted(f);
+  const n = a.reduce((k, { manifest }) => k + manifest.raw.chunks.length, 0);
+  const probe = await streamCanonicalScope(SCOPE, a, f.streamDeps, UNLIMITED, VERSION, 0);
+  expect(probe.complete).toBe(true);
+  expect(n).toBeGreaterThan(3);
+  const actual = sizes.slice(0, n);
+  const A = actual.reduce((x, y) => x + y, 0);
+  const last = actual[n - 1]!;
+  // Every chunk declares 1 byte but the last, which declares `gap` more than it reads: the
+  // declared total still fits four reads, and so do four actual reads.
+  const gap = A - last - (n - 1);
+  expect(gap).toBeGreaterThan(0);
+  let seen = 0;
+  const skewed = a.map(({ manifest, key }) => ({
+    key,
+    manifest: {
+      ...manifest,
+      raw: {
+        ...manifest.raw,
+        chunks: manifest.raw.chunks.map(({ stored_raw_bytes: _s, ...c }) => ({ ...c, bytes: ++seen === n ? last + gap : 1 })),
+      },
+    } as ManifestV1,
+  }));
+  const budget = { maxReadBytes: 4 * A, maxReadEvents: 1 << 24 };
+  const s = await streamCanonicalScope(SCOPE, skewed, f.streamDeps, budget, VERSION, 0);
+  // Pass 4's check of the last chunk would ask for 3A + (A - last) + last + gap > 4A: refused now.
+  expect(s).toMatchObject({ complete: false, partial: true, reasons: ["scope_too_large", STREAM_READ_BYTES_BUDGET] });
+  expect(s.meter.passes).toBe(1);
+  expect(s.meter.peak).toBe(A + gap);
+  // Declared exactly as read, the last pass fits the budget to the byte.
+  seen = 0;
+  const fits = a.map(({ manifest, key }) => ({
+    key,
+    manifest: {
+      ...manifest,
+      raw: { ...manifest.raw, chunks: manifest.raw.chunks.map(({ stored_raw_bytes: _s, ...c }) => ({ ...c, bytes: ++seen === n ? last : 1 })) },
+    } as ManifestV1,
+  }));
+  const ok = await streamCanonicalScope(SCOPE, fits, f.streamDeps, budget, VERSION, 0);
+  expect(ok.complete).toBe(true);
+  await regenerateAll(ok);
+  expect(ok.meter.passes).toBe(4);
 }, 30_000);
 
 test("the read meter checks a chunk before reading it and its decompressed size after", () => {

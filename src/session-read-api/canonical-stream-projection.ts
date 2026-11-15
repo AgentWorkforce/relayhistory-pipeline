@@ -85,6 +85,13 @@ export interface StreamDeps {
   store: ObjectStore;
   prefixFor: (orgId: string) => string;
   decompress: (stored: Uint8Array, maxBytes: number) => Uint8Array;
+  /**
+   * Run between records at most every `everyMs` (by `now`, default Date.now): the caller's
+   * transaction stays busy while passes 1 to 3 read without querying it, so an
+   * idle_in_transaction_session_timeout cannot end it. A failure ends the read with that
+   * error, unchanged.
+   */
+  keepalive?: { everyMs: number; ping: () => Promise<void>; now?: () => number };
 }
 
 export const STREAM_READ_BYTES_BUDGET = "stream_read_bytes_budget";
@@ -103,6 +110,13 @@ export const STREAM_PASSES = 4;
 export class StreamBudgetError extends PipelineError {
   constructor(readonly budget: typeof STREAM_READ_BYTES_BUDGET | typeof STREAM_READ_EVENTS_BUDGET) {
     super("scope_too_large", `the streaming read budget ran out (${budget})`, false);
+  }
+}
+
+/** The keepalive failed: its error ends the read as it is, never as a read code. */
+class KeepaliveFailed extends Error {
+  constructor(readonly failure: unknown) {
+    super("stream keepalive failed");
   }
 }
 
@@ -127,10 +141,16 @@ export class StreamReadMeter implements ChunkReadObserver {
   events = 0;
   chunks = 0;
   passes = 0;
+  /**
+   * The most any chunk check has asked for so far: bytes read before it plus its declared
+   * size. After pass 1 this bounds what the same chunk checks need in a later pass.
+   */
+  peak = 0;
   constructor(readonly limits: StreamReadLimits) {}
   chunk(entry: Readonly<{ bytes: number; stored_raw_bytes?: number }>): void {
-    if (this.bytes + Math.max(entry.bytes, entry.stored_raw_bytes ?? 0) > this.limits.maxReadBytes)
-      throw new StreamBudgetError(STREAM_READ_BYTES_BUDGET);
+    const need = this.bytes + Math.max(entry.bytes, entry.stored_raw_bytes ?? 0);
+    if (need > this.limits.maxReadBytes) throw new StreamBudgetError(STREAM_READ_BYTES_BUDGET);
+    if (need > this.peak) this.peak = need;
     this.chunks += 1;
   }
   decompressed(bytes: number): void {
@@ -255,6 +275,19 @@ export async function streamCanonicalScope(
   const upFront = overBudget(declaredBytes, declaredEvents);
   if (upFront) return budgetStop(upFront);
 
+  const keep = deps.keepalive;
+  const clock = keep?.now ?? Date.now;
+  let pinged = Number.NEGATIVE_INFINITY; // the first record pings: the read before this one may have been long
+  async function keepalive(): Promise<void> {
+    if (!keep || clock() - pinged < keep.everyMs) return;
+    try {
+      await keep.ping();
+    } catch (error) {
+      throw new KeepaliveFailed(error);
+    }
+    pinged = clock();
+  }
+
   async function* read(): AsyncGenerator<{ part: number; record: RelayhistoryStreamRecord }> {
     meter.passes += 1;
     for (let part = 0; part < admitted.length; part++) {
@@ -269,6 +302,7 @@ export async function streamCanonicalScope(
         meter,
       )) {
         meter.record();
+        await keepalive();
         yield { part, record };
       }
     }
@@ -278,6 +312,7 @@ export async function streamCanonicalScope(
     try {
       return await run();
     } catch (error) {
+      if (error instanceof KeepaliveFailed) throw error.failure;
       if (error instanceof StreamBudgetError || error instanceof StreamStop) throw error;
       if (error instanceof PipelineError && error.retryable) throw error;
       throw new StreamStop(codeOf(error, "manifest_unreadable"));
@@ -329,8 +364,14 @@ export async function streamCanonicalScope(
         } else if (userIds[part] || prior === undefined) ownerByEvent.set(identity, part);
       }
     });
-    // The declared sizes may undercount (records are optional): check what pass 1 read.
-    const actual = overBudget(meter.bytes, meter.events);
+    // The declared sizes may undercount (records are optional): check what pass 1 read. Each
+    // later pass checks every chunk's declared size against what was read before it, so the
+    // last pass needs three passes' bytes plus pass 1's peak: a chunk declared larger than it
+    // reads must not pass here and then stop pass 4 after some rows were written.
+    const actual =
+      meter.bytes * (STREAM_PASSES - 1) + Math.max(meter.bytes, meter.peak) > limits.maxReadBytes
+        ? STREAM_READ_BYTES_BUDGET
+        : overBudget(0, meter.events);
     if (actual) return budgetStop(actual);
     try {
       winners = relayhistoryNewestAcrossOrigins(seats.values())
@@ -563,7 +604,9 @@ export async function streamCanonicalScope(
       try {
         const owner = ownerByEvent.get(JSON.stringify([row.machine_id, row.delivery_record_id]));
         const found = owner === undefined ? undefined : { userId: userIds[owner]!, sessionId: identities[owner]!.sessionId };
-        const toolName = row.kind === "session_event" && typeof row.delivery_record_id === "string"
+        // The whole read takes the captures from each group's own records: only the
+        // activity group holds tool calls, so a direct group's rows never take one.
+        const toolName = rank === D && row.kind === "session_event" && typeof row.delivery_record_id === "string"
           ? captures.get(JSON.stringify([row.machine_id, row.delivery_record_id])) : undefined;
         const canonicalRow = {
           ...row,
