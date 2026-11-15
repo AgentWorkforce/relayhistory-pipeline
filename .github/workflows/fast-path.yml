@@ -1,0 +1,508 @@
+# Fast path: run the ci.yml checks and publish the services image on Blacksmith
+# runners, outside the shared GitHub-hosted queue. Only Khaliq may dispatch it
+# (publish-image.yml's dispatcher restriction), and nothing runs until he
+# approves the fast-path environment.
+#
+# Checks (the lanes the ci.yml `checks` gate requires, plus the amp image and
+# session read Worker checks): the four unit-test shards, unit-tests-aux,
+# aws-hardening-mutations, selfhost-e2e, amp-transport-image and
+# session-read-worker, all at the SHA resolved once from `ref`. Any ref may be
+# checked; only a commit on main is published.
+#
+# Publishes, mirroring publish-image.yml: from a main dispatch, in the
+# fast-path-publish environment (Khaliq approves it too), a linux/amd64+linux/arm64
+# OCI index of docker/services.Dockerfile with SBOM and max-mode provenance,
+# signed with a keyless Sigstore build-provenance attestation that names this
+# workflow and the built commit, verified, then copied with skopeo to every
+# repository publish-image.yml copies to (read from
+# scripts/copy-reviewed-image.py) as fast-<sha> only, and recorded in an
+# unsigned JSON receipt uploaded with the signed bundle. The publish job never
+# runs in image-publish: cloud publisher roles trust that environment's OIDC
+# subject, and GHCR needs only github.token. Guards kept from publish-image.yml: Khaliq as actor and
+# triggering actor, dispatch from main, trusted scripts from the workflow
+# commit, the source commit on current main (verifyAncestry, rechecked before
+# the registry copy), the index digest checked before signing and after the
+# copy, and credentials only in sealed memory. Not kept: the typed
+# confirmation (the fast-path approval replaces it), the "successful main CI
+# run" check (the fast path runs those lanes itself instead of waiting on the
+# hosted queue), and the reviewed-source attestation (a fast build is not a
+# reviewed release). It never pushes or moves sha-<sha>, :latest or a release
+# tag, and refuses an existing fast-<sha> unless it already names the signed
+# digest (so a partial copy can be retried). A dispatch from a non-main ref
+# for a commit on main fails at once: dispatch from main to publish it. The ECR and Artifact Registry
+# publishes are separate workflows with their own pinned publisher identities
+# and are not part of this path. Pin the digest printed in the run summary.
+name: fast-path
+run-name: fast-path ${{ inputs.ref }} (${{ inputs.reason }})
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to build (a review branch is fine)
+        required: true
+        default: main
+      reason:
+        description: Why this needs the fast path
+        required: true
+permissions:
+  contents: read
+# run_id keeps a run that waits for approval from displacing (cancelling) another
+# pending dispatch of the same ref.
+concurrency:
+  group: fast-path-${{ inputs.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
+env:
+  IMAGE: ghcr.io/agentworkforce/sessions-pipeline
+jobs:
+  approve:
+    if: ${{ github.actor == 'khaliqgant' && github.triggering_actor == 'khaliqgant' }}
+    environment: fast-path
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+      on_main: ${{ steps.sha.outputs.on_main }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          submodules: false
+          persist-credentials: false
+      - id: sha
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          on_main=false
+          if git merge-base --is-ancestor "$sha" origin/main; then on_main=true; fi
+          if [ "$on_main" = true ] && [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::$sha is on main but this run was dispatched from $GITHUB_REF; dispatch from main to publish it."
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "on_main=$on_main" >> "$GITHUB_OUTPUT"
+          echo "fast path for $sha (on main: $on_main)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  unit-tests-shard:
+    needs: approve
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.8.34.13
+        env:
+          CLICKHOUSE_PASSWORD: ci-only
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --password ci-only -q 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      READ_API_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+      READ_API_TEST_CLICKHOUSE_PASSWORD: ci-only
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ needs.approve.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+          # Never save the bun download into the cache CI restores.
+          no-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - name: Unit tests (stack, shard ${{ matrix.shard }} of 4)
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          list="$RUNNER_TEMP/unit-test-shard-$SHARD.txt"
+          bun scripts/ci/unit-test-shards.ts --shard "$SHARD" --of 4 > "$list"
+          echo "shard $SHARD of 4: $(wc -l < "$list") test files" | tee -a "$GITHUB_STEP_SUMMARY"
+          mapfile -t files < "$list"
+          test "${#files[@]}" -gt 0
+          bun test --timeout 30000 "${files[@]}"
+
+  unit-tests-aux:
+    needs: approve
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ needs.approve.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+          # Never save the bun download into the cache CI restores.
+          no-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - name: Typecheck packages/pipeline
+        run: bun run --filter ./packages/pipeline typecheck
+      - name: Test packages/pipeline
+        run: bun run --filter ./packages/pipeline test
+      - name: Build packages/object-store
+        run: bun run --filter @relayhistory/object-store build
+      - name: Test packages/object-store
+        run: bun run --filter @relayhistory/object-store test
+      - name: Typecheck the stack (src, stacks, alchemy.run.ts)
+        run: bunx tsc --noEmit -p tsconfig.json
+      - name: Shard plan covers every root test file exactly once
+        run: bun scripts/ci/unit-test-shards.ts --check --of 4
+      - name: Unit tests (ingest on the G4-only migration set)
+        env:
+          HOOPDB_MIGRATE_UNTIL: 20261105043800_lazy_ack_clock_no_key_update.sql
+        run: |
+          for suite in ledger turns ordered-controls custody-baseline lazy-custody frozen-custody first-ack-seats; do
+            bun test --timeout 30000 "src/session-ingest/__tests__/${suite}.pglite.test.ts"
+          done
+      - name: Unit tests (IaC values, stacks/)
+        run: bun test --timeout 30000 ./stacks
+      - name: Guard - no Helm hooks in any chart or manifest in this repo
+        run: |
+          key="helm.sh/ho""ok"
+          ! grep -rn "$key" --include='*.yaml' --include='*.yml' --include='*.tpl' . --exclude-dir=node_modules --exclude-dir=vendor --exclude-dir=.github || (echo "helm hooks are not allowed (Alchemy renders --no-hooks)"; exit 1)
+      - name: Guard - nothing secret-like committed
+        run: |
+          ! git ls-files | grep -E '(^|/)(\.env|inputs\.json|.*\.pem)$' || (echo "secret-like file tracked"; exit 1)
+      - name: Guard - no production deployment identifiers in engine source
+        run: bun scripts/check-engine-identifiers.ts
+      - name: Scrub bindgen receipt
+        run: bun scripts/scrub-bindgen-receipt.ts --out scrub-bindgen-receipt.json
+
+  aws-hardening-mutations:
+    needs: approve
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 40
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.8.34.13
+        env:
+          CLICKHOUSE_PASSWORD: ci-only
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --password ci-only -q 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      READ_API_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+      READ_API_TEST_CLICKHOUSE_PASSWORD: ci-only
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ needs.approve.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+          # Never save the bun download into the cache CI restores.
+          no-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - run: bun run --filter @relayhistory/object-store build
+      - name: AWS hardening mutation check
+        run: bun scripts/aws-hardening-mutations.ts
+      - name: Verify mutations restored their source files
+        run: git diff --exit-code
+
+  selfhost-e2e:
+    needs: approve
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ needs.approve.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+          # Never save the bun download into the cache CI restores.
+          no-cache: true
+      - run: bun install --frozen-lockfile
+      - run: bun run e2e:selfhost
+
+  amp-transport-image:
+    needs: approve
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ needs.approve.outputs.sha }}
+          persist-credentials: false
+      - run: docker build --file docker/services.Dockerfile --tag amp-transport-ci .
+      - name: Verify process isolation in the Linux image without network access
+        run: docker run --rm --network none --entrypoint bun amp-transport-ci test src/amp
+
+  session-read-worker:
+    needs: approve
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.8.34.13
+        env:
+          CLICKHOUSE_PASSWORD: ci-only
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --password ci-only -q 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      READ_API_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+      READ_API_TEST_CLICKHOUSE_PASSWORD: ci-only
+      READ_WORKER_TEST_PG_URL: postgresql://postgres:ci-only@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ needs.approve.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+          # Never save the bun download into the cache CI restores.
+          no-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - run: bun run --filter ./packages/session-read-worker typecheck
+      - run: bun run --filter ./packages/session-read-worker test
+      - name: Bundle exactly as a deploy would (wrangler dry run)
+        working-directory: packages/session-read-worker
+        run: bunx wrangler deploy --dry-run --outdir "$RUNNER_TEMP/session-read-worker-dist"
+
+
+  publish:
+    needs: [approve, unit-tests-shard, unit-tests-aux, aws-hardening-mutations, selfhost-e2e, amp-transport-image, session-read-worker]
+    # publish-image.yml's dispatcher restriction, repeated here so a re-run of
+    # only this job cannot skip it; only a commit already on main is published.
+    if: ${{ needs.approve.outputs.on_main == 'true' && github.ref == 'refs/heads/main' && github.actor == 'khaliqgant' && github.triggering_actor == 'khaliqgant' }}
+    # Not image-publish: cloud publisher roles trust that environment's OIDC
+    # subject. id-token is only for keyless Sigstore signing.
+    environment: fast-path-publish
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 40
+    # One publish per SHA at a time, so the existing-tag probe cannot race.
+    concurrency:
+      group: fast-path-publish-${{ needs.approve.outputs.sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      SOURCE_SHA: ${{ needs.approve.outputs.sha }}
+      WORKFLOW_SHA: ${{ github.sha }}
+    steps:
+      # Keep the verifier and copy helper from the trusted workflow commit, not the image source.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          path: .publisher
+          persist-credentials: false
+          submodules: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.approve.outputs.sha }}
+          path: .source
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: Require the source commit on current main
+        working-directory: .source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          node --input-type=module <<'JS'
+          const { verifyAncestry } = await import(process.env.GITHUB_WORKSPACE + "/.publisher/scripts/check-image-release.mjs");
+          verifyAncestry(process.env.SOURCE_SHA);
+          console.log("source " + process.env.SOURCE_SHA + " is on current main");
+          JS
+      - name: Install OCI copy tool
+        run: sudo apt-get update && sudo apt-get install --yes skopeo
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Build without registry writes (amd64 + arm64)
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .source
+          file: .source/docker/services.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          outputs: type=oci,dest=${{ runner.temp }}/services.oci.tar
+          tags: ${{ env.IMAGE }}:fast-${{ needs.approve.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.approve.outputs.sha }}
+          provenance: mode=max
+          sbom: true
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
+      - name: Sign and verify the exact OCI index before registry writes
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          tar -xOf "$RUNNER_TEMP/services.oci.tar" "blobs/sha256/${IMAGE_DIGEST#sha256:}" > "$RUNNER_TEMP/services-index.json"
+          test "sha256:$(sha256sum "$RUNNER_TEMP/services-index.json" | cut -d' ' -f1)" = "$IMAGE_DIGEST"
+          repo_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          workflow="$repo_url/.github/workflows/fast-path.yml"
+          jq -n --arg repo "$repo_url" --arg src "$SOURCE_SHA" --arg wf "$workflow@$WORKFLOW_SHA" \
+            --arg inv "$repo_url/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" --arg image "$IMAGE" '{
+              buildDefinition: {
+                buildType: "https://agentrelay.com/builders/services-image-fast-path/v1",
+                externalParameters: { repository: $repo, source_sha: $src, image: $image, tag: ("fast-" + $src) },
+                resolvedDependencies: [{ uri: ("git+" + $repo), digest: { gitCommit: $src } }]
+              },
+              runDetails: { builder: { id: $wf }, metadata: { invocationId: $inv } }
+            }' > "$RUNNER_TEMP/build-predicate.json"
+          cosign attest-blob --yes --type https://slsa.dev/provenance/v1 \
+            --predicate "$RUNNER_TEMP/build-predicate.json" \
+            --bundle "$RUNNER_TEMP/build-provenance.sigstore.json" "$RUNNER_TEMP/services-index.json"
+          cosign verify-blob-attestation --bundle "$RUNNER_TEMP/build-provenance.sigstore.json" \
+            --type https://slsa.dev/provenance/v1 \
+            --certificate-identity "$workflow@refs/heads/main" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            --certificate-github-workflow-ref refs/heads/main \
+            --certificate-github-workflow-sha "$WORKFLOW_SHA" \
+            --certificate-github-workflow-trigger workflow_dispatch \
+            "$RUNNER_TEMP/services-index.json"
+      - name: Recheck the source, then copy the signed index as fast-<sha> to every publish-image.yml repository
+        working-directory: .source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'JS'
+          const { verifyAncestry } = await import(process.env.GITHUB_WORKSPACE + "/.publisher/scripts/check-image-release.mjs");
+          verifyAncestry(process.env.SOURCE_SHA);
+          console.log("source " + process.env.SOURCE_SHA + " is on current main");
+          JS
+          python3 -I - "$GITHUB_WORKSPACE/.publisher/scripts/copy-reviewed-image.py" <<'PY'
+          import hashlib, importlib.util, os, re, subprocess, sys
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location("copy_reviewed_image", sys.argv[1])
+          helper = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(helper)
+          env = os.environ
+          source, digest, actor, token = (env.get(k, "") for k in ["SOURCE_SHA", "IMAGE_DIGEST", "GITHUB_ACTOR", "GH_TOKEN"])
+          root = Path(env.get("RUNNER_TEMP", "."))
+          if not re.fullmatch(r"[a-f0-9]{40}", source) or not re.fullmatch(r"sha256:[a-f0-9]{64}", digest):
+              sys.exit("Exact source and signed digest required")
+          if actor != "khaliqgant" or not token or not root.is_absolute() or not (root / "services.oci.tar").is_file():
+              sys.exit("Approved actor, credential and OCI archive required")
+          allowed = {"PATH", "HOME", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY",
+                     "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"}
+          child_env = {key: value for key, value in env.items() if key in allowed}
+          with helper.memory_auth(actor, token) as (descriptor, path):
+              options = {"pass_fds": (descriptor,), "env": child_env, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+              targets = [f"docker://{repository}:fast-{source}" for repository in helper.REPOSITORIES]
+              pending = []
+              for number, target in enumerate(targets, 1):
+                  probe = subprocess.run(["skopeo", "inspect", "--raw", "--authfile", path, target], **options)
+                  if probe.returncode == 0:
+                      # A retry after a partial copy: the same signed index is already there.
+                      if "sha256:" + hashlib.sha256(probe.stdout).hexdigest() == digest:
+                          print(f"repository {number} already holds the signed index; skipping")
+                          continue
+                      sys.exit(f"repository {number} already has a different fast-{source}; refusing to overwrite")
+                  if not re.search(rb"manifest unknown|name unknown|not found", probe.stderr, re.I):
+                      sys.exit(f"could not prove fast-{source} is absent in repository {number}; failing closed")
+                  pending.append(target)
+              for target in pending:
+                  subprocess.run(["skopeo", "copy", "--all", "--preserve-digests", "--authfile", path,
+                                  f"oci-archive:{root / 'services.oci.tar'}", target], check=True, **options)
+                  result = subprocess.run(["skopeo", "inspect", "--raw", "--authfile", path, target], check=True, **options)
+                  if "sha256:" + hashlib.sha256(result.stdout).hexdigest() != digest:
+                      sys.exit("Registry index does not match the signed digest")
+          print(f"Copied and verified the signed index to {len(targets)} repositories as fast-{source}")
+          PY
+      - name: Record the fast-path receipt
+        env:
+          REF: ${{ inputs.ref }}
+          REASON: ${{ inputs.reason }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          jq -n --arg image "$IMAGE@$IMAGE_DIGEST" --arg src "$SOURCE_SHA" --arg wf "$WORKFLOW_SHA" \
+            --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" --arg tag "fast-$SOURCE_SHA" '{
+              repository: "https://github.com/AgentWorkforce/relayhistory-pipeline", workflow: "fast-path.yml",
+              image: $image, tag: $tag, source_sha: $src, workflow_sha: $wf, source_ref: "refs/heads/main",
+              attestation_backend: "sigstore", reviewed_release: false, publish_run_id: $run, publish_run_attempt: $attempt
+            }' > "$RUNNER_TEMP/fast-path-receipt.json"
+          {
+            echo "### sessions-pipeline fast path"
+            echo "- ref: \`$REF\` at \`$SOURCE_SHA\` (workflow \`$WORKFLOW_SHA\`)"
+            echo "- reason: $REASON"
+            echo "- image: \`$IMAGE@$IMAGE_DIGEST\`, tag fast-$SOURCE_SHA; the same signed index is also in the legacy repository publish-image.yml copies to"
+            echo "- signed build provenance names fast-path.yml; not a reviewed release (no reviewed-source attestation)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fast-path-receipt-${{ needs.approve.outputs.sha }}
+          path: |
+            ${{ runner.temp }}/fast-path-receipt.json
+            ${{ runner.temp }}/services-index.json
+            ${{ runner.temp }}/build-provenance.sigstore.json
+          if-no-files-found: error
+
+  checks-only:
+    needs: approve
+    if: ${{ needs.approve.outputs.on_main != 'true' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - name: Summary
+        env:
+          SHA: ${{ needs.approve.outputs.sha }}
+        run: |
+          echo "- $SHA is not on main, so checks only and nothing published" >> "$GITHUB_STEP_SUMMARY"
