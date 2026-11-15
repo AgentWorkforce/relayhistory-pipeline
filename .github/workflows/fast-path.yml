@@ -10,13 +10,15 @@
 # checked; only a commit on main is published.
 #
 # Publishes, mirroring publish-image.yml: from a main dispatch, in the
-# image-publish environment (its own rules apply), a linux/amd64+linux/arm64
+# fast-path-publish environment (Khaliq approves it too), a linux/amd64+linux/arm64
 # OCI index of docker/services.Dockerfile with SBOM and max-mode provenance,
 # signed with a keyless Sigstore build-provenance attestation that names this
 # workflow and the built commit, verified, then copied with skopeo to every
 # repository publish-image.yml copies to (read from
-# scripts/copy-reviewed-image.py) as fast-<sha> only, and recorded in a signed
-# receipt artifact. Guards kept from publish-image.yml: Khaliq as actor and
+# scripts/copy-reviewed-image.py) as fast-<sha> only, and recorded in an
+# unsigned JSON receipt uploaded with the signed bundle. The publish job never
+# runs in image-publish: cloud publisher roles trust that environment's OIDC
+# subject, and GHCR needs only github.token. Guards kept from publish-image.yml: Khaliq as actor and
 # triggering actor, dispatch from main, trusted scripts from the workflow
 # commit, the source commit on current main (verifyAncestry, rechecked before
 # the registry copy), the index digest checked before signing and after the
@@ -25,7 +27,9 @@
 # run" check (the fast path runs those lanes itself instead of waiting on the
 # hosted queue), and the reviewed-source attestation (a fast build is not a
 # reviewed release). It never pushes or moves sha-<sha>, :latest or a release
-# tag, and refuses an existing fast-<sha>. The ECR and Artifact Registry
+# tag, and refuses an existing fast-<sha> unless it already names the signed
+# digest (so a partial copy can be retried). A dispatch from a non-main ref
+# for a commit on main fails at once: dispatch from main to publish it. The ECR and Artifact Registry
 # publishes are separate workflows with their own pinned publisher identities
 # and are not part of this path. Pin the digest printed in the run summary.
 name: fast-path
@@ -71,6 +75,10 @@ jobs:
           sha=$(git rev-parse HEAD)
           on_main=false
           if git merge-base --is-ancestor "$sha" origin/main; then on_main=true; fi
+          if [ "$on_main" = true ] && [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "::error::$sha is on main but this run was dispatched from $GITHUB_REF; dispatch from main to publish it."
+            exit 1
+          fi
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "on_main=$on_main" >> "$GITHUB_OUTPUT"
           echo "fast path for $sha (on main: $on_main)" | tee -a "$GITHUB_STEP_SUMMARY"
@@ -309,9 +317,15 @@ jobs:
     # publish-image.yml's dispatcher restriction, repeated here so a re-run of
     # only this job cannot skip it; only a commit already on main is published.
     if: ${{ needs.approve.outputs.on_main == 'true' && github.ref == 'refs/heads/main' && github.actor == 'khaliqgant' && github.triggering_actor == 'khaliqgant' }}
-    environment: image-publish
+    # Not image-publish: cloud publisher roles trust that environment's OIDC
+    # subject. id-token is only for keyless Sigstore signing.
+    environment: fast-path-publish
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 40
+    # One publish per SHA at a time, so the existing-tag probe cannot race.
+    concurrency:
+      group: fast-path-publish-${{ needs.approve.outputs.sha }}
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
@@ -321,20 +335,20 @@ jobs:
       WORKFLOW_SHA: ${{ github.sha }}
     steps:
       # Keep the verifier and copy helper from the trusted workflow commit, not the image source.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.sha }}
           path: .publisher
           persist-credentials: false
           submodules: false
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ needs.approve.outputs.sha }}
           path: .source
           fetch-depth: 0
           persist-credentials: false
           submodules: false
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
       - name: Require the source commit on current main
@@ -350,11 +364,11 @@ jobs:
           JS
       - name: Install OCI copy tool
         run: sudo apt-get update && sudo apt-get install --yes skopeo
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: Build without registry writes (amd64 + arm64)
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .source
           file: .source/docker/services.Dockerfile
@@ -432,13 +446,19 @@ jobs:
           with helper.memory_auth(actor, token) as (descriptor, path):
               options = {"pass_fds": (descriptor,), "env": child_env, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
               targets = [f"docker://{repository}:fast-{source}" for repository in helper.REPOSITORIES]
-              for target in targets:
+              pending = []
+              for number, target in enumerate(targets, 1):
                   probe = subprocess.run(["skopeo", "inspect", "--raw", "--authfile", path, target], **options)
                   if probe.returncode == 0:
-                      sys.exit(f"repository {targets.index(target) + 1} already has fast-{source}; pin its digest instead")
+                      # A retry after a partial copy: the same signed index is already there.
+                      if "sha256:" + hashlib.sha256(probe.stdout).hexdigest() == digest:
+                          print(f"repository {number} already holds the signed index; skipping")
+                          continue
+                      sys.exit(f"repository {number} already has a different fast-{source}; refusing to overwrite")
                   if not re.search(rb"manifest unknown|name unknown|not found", probe.stderr, re.I):
-                      sys.exit(f"could not prove fast-{source} is absent in repository {targets.index(target) + 1}; failing closed")
-              for target in targets:
+                      sys.exit(f"could not prove fast-{source} is absent in repository {number}; failing closed")
+                  pending.append(target)
+              for target in pending:
                   subprocess.run(["skopeo", "copy", "--all", "--preserve-digests", "--authfile", path,
                                   f"oci-archive:{root / 'services.oci.tar'}", target], check=True, **options)
                   result = subprocess.run(["skopeo", "inspect", "--raw", "--authfile", path, target], check=True, **options)
