@@ -34,7 +34,7 @@ still a claim, a stage intent and a receipt ACK in Postgres. The fix is to stop 
 | In-batch revision reuse: 409 `record_revision` | Computed from the batch alone. It never needed stored state. |
 | Deletion fences and resets (`upload_deletions`, `upload_resets`) | One **fence object** per user, edited with CAS. The claim reads it to get `deleted` and `resets`. |
 | Fence recheck at commit, erasure re-arm (`upload_erasure_rearm`) | The commit re-reads the fence. If a reset, or a deletion of a written session, landed in between, it writes a **re-arm marker** for the eraser. That is today's `rearmed` semantics. |
-| Tenant slots (`acquireSlot`) | None. The Lambda's reserved concurrency (4) and SQS batch size 1 bound it. Self-host is bounded by its scheduler. |
+| Tenant slots (`acquireSlot`) | No slot table. Self-host (ingest-edge): an in-process limiter per replica (`tenant-limiter.ts`) caps concurrent admissions per org and per (org, user) at `INGEST_MAX_PER_USER` / `INGEST_MAX_PER_ORG`, with the SQL lease's 90 s TTL and its 429 `delivery_busy` refusal; the async consumer defers at the cap (amended 2026-11-15). The Lambda: its reserved concurrency (4) and SQS batch size 1 bound it. |
 | Outbox and publisher (`ingest_buffer_outbox`, `ingest_publication_*`) | **None.** The consumer writes the canonical layout directly (`writeBatchObjects`, inline mode). The existing `manifest.json` bucket notification drives the indexer, as it did before Nov 5. |
 | Privacy journal, admission status, outcomes | Already S3. Unchanged. |
 

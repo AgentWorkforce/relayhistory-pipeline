@@ -90,6 +90,7 @@ import type { DeliverDeps } from "./deliver.ts";
 import { selfhostAdmissionConsumer, type SelfhostAdmissionConsumer, type SelfhostAdmissionOptions, type SelfhostAdmissionStatus } from "./selfhost-admission.ts";
 import { sqlLedger } from "./ledger-sql.ts";
 import { s3Ledger, serverLedgerParallel, withSqlControlMirror } from "./ledger-s3.ts";
+import { tenantLimiter } from "./tenant-limiter.ts";
 import type { Ledger } from "./ledger.ts";
 import type { SqlRun } from "./ledger-sql.ts";
 import { relaycontrolIngestIdentity, selfhostIntrospector } from "./selfhost-auth.ts";
@@ -210,7 +211,8 @@ export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run
   let sqlControls: Ledger | undefined;
   const sqlControl = (): Ledger => (sqlControls ??= sqlLedger(parts.run, { acceptanceMode: "canonical" }));
   return withSqlControlMirror(
-    s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false, parallel: serverLedgerParallel(process.env) }),
+    // One tenant limiter per process (replica): INGEST_MAX_PER_USER / _ORG cap its in-flight admissions in memory.
+    s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false, parallel: serverLedgerParallel(process.env), tenantLimiter: tenantLimiter() }),
     { setSessionUploads: (i) => sqlControl().setSessionUploads(i), resetUploadedSessions: (t, r) => sqlControl().resetUploadedSessions(t, r) },
     parts.store, keyRoot);
 }
@@ -284,6 +286,8 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
     mode, deliver, concurrency: admission.concurrency, scanIntervalMs: admission.scanIntervalMs, maxAttempts: admission.maxAttempts,
     ...(options.nowMs ? { nowMs: options.nowMs } : {}), ...(options.log ? { log: options.log } : {}), ...(uploadInbox ? { uploadInbox } : {}),
     ...uploadConsent,
+    // INGEST_LEDGER=s3: the per-replica tenant limit defers an object (never dead-letters it).
+    ...(s3 ? { deferTenantLimit: true } : {}),
   });
   options.onConsumer?.(consumer);
   const app = withSelfhostCapabilities(createIngestApp({

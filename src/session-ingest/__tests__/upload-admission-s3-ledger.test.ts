@@ -295,7 +295,7 @@ describe("self-host (ingest-edge) with INGEST_LEDGER=s3: the consumer admits thr
   test("the synchronous runtime (no admission mode, no direct upload) is built on that gated ledger", async () => {
     const src = readFileSync(join(import.meta.dir, "../selfhost-server.ts"), "utf8");
     expect(src).toContain('const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts) : sqlLedger(');
-    expect(src).toContain('s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false, parallel: serverLedgerParallel(process.env) })');
+    expect(src).toContain('s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false, parallel: serverLedgerParallel(process.env), tenantLimiter: tenantLimiter() })');
   });
 
   test("a direct caller cannot combine the S3 ledger with a SQL-only feature", async () => {
