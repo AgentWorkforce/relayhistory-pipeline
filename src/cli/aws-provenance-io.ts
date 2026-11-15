@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { mkdtempSync, rmSync } from "node:fs";
 import { awsInvocation } from "./aws.ts";
 import { assertTranscriptStorePlanContract, TRANSCRIPT_STAGE } from "../../stacks/aws/transcript-store.ts";
+import { assertCleanPreApply, awsCliRun, preApplyReport } from "../../stacks/aws/adopt-identities-live.ts";
 
 type Env = Record<string, string | undefined>;
 const run = (cmd: string, args: string[], cwd: string, baseEnv: Env = process.env) => {
@@ -86,6 +87,9 @@ export function capturePlan(root: string, stage: string, env: Env) {
   // Every version and delete marker must be unchanged: no write at all in the window, by anyone.
   const after = observeStateAt(root, inputs.accountId, inputs.region, stage, pippen, env);
   if (after.versionsDigest !== state.versionsDigest) throw new Error("Alchemy state bucket changed during the capture (a version or delete marker appeared); capture again");
+  // Adopted identities: the plan cannot show live drift, so the live diff is part of the capture (read calls only).
+  const adopt = stage === TRANSCRIPT_STAGE && (inputs as { transcriptStore?: { adoptIdentities?: unknown } }).transcriptStore?.adoptIdentities !== undefined;
+  const preApplySha256 = adopt ? assertCleanPreApply(preApplyReport(inputs, awsCliRun(env)), "capture") : undefined;
   const p = planPaths(root, stage);
   mkdirSync(p.dir, { recursive: true });
   const sanitized = `${JSON.stringify(sanitizeInputs(inputs), null, 2)}\n`;
@@ -121,6 +125,7 @@ export function capturePlan(root: string, stage: string, env: Env) {
       detailed: { path: `docs/plans/${stage}.plan.detailed.txt`, sha256: sha256(detailed) },
     },
     summary: /Plan: .*/.exec(plan)?.[0] ?? "no summary line",
+    ...(preApplySha256 ? { adoptIdentities: { preApplySha256 } } : {}),
     note: "Planned against a read-only snapshot of the state (GETs pinned to version ids, in-memory Alchemy state): no state-bucket writes, no lease. The version listing (all versions and delete markers) was identical before and after. AWS provider reads only (Describe/List/Get). `96bulls up` re-checks everything before any change.",
   };
   const provenanceText = `${JSON.stringify(record, null, 2)}\n`;
