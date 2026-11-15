@@ -44,8 +44,22 @@ export async function inTransaction<T>(db: Pick<HoopDb, "pool">, work: (tx: SqlE
   }
 }
 
+export const HOOPDB_POOL_MAX_ENV = "HOOPDB_POOL_MAX";
+const HOOPDB_POOL_MAX_DEFAULT = 8;
+
+/** Strict: unset is 8, otherwise a plain decimal 1..64; anything else throws (never clamps, never echoes the value). */
+function hoopDbPoolMax(raw: string | undefined): number {
+  if (raw === undefined) return HOOPDB_POOL_MAX_DEFAULT;
+  if (/^[1-9][0-9]{0,2}$/.test(raw)) {
+    const n = Number(raw);
+    if (n >= 1 && n <= 64) return n;
+  }
+  throw new Error(`96bulls: ${HOOPDB_POOL_MAX_ENV} must be an integer from 1 to 64 (plain decimal digits) when set`);
+}
+
 export function openHoopDb(url = required("HOOPDB_URL")): HoopDb {
-  const pool = new pg.Pool({ connectionString: url, max: 8, application_name: process.env.OTEL_SERVICE_NAME ?? "96bulls" });
+  const max = hoopDbPoolMax(process.env[HOOPDB_POOL_MAX_ENV]);
+  const pool = new pg.Pool({ connectionString: url, max, application_name: process.env.OTEL_SERVICE_NAME ?? "96bulls" });
   pool.on("error", (err) => log.error("hoopdb pool error", { error_code: (err as { code?: string }).code ?? "pool_error" }));
   return {
     pool,
