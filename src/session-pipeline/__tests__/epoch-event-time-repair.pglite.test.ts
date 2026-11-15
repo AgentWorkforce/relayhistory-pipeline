@@ -16,6 +16,8 @@ import { directoryEventsFromProjection, writeDirectoryEvents } from "../../hoopd
 import { projectSessionDirectory } from "../../hoopdb/session-directory-projector.ts";
 import {
   EpochRepairRefused,
+  decodeCursor,
+  encodeCursor,
   epochRepairArgs,
   epochRepairDatabaseUrl,
   exitCodeForError,
@@ -158,12 +160,36 @@ describe("repairEpochEventTimes (real migrations)", () => {
     expect(r).toMatchObject({ affected: 4, markable: 2 });
   });
 
-  test("--max-pages stops early and reports incomplete (exit 3); resuming finishes", async () => {
-    const r = await repairEpochEventTimes(db, { apply: true, pageSize: 1, maxPages: 2 });
-    expect(r).toMatchObject({ complete: false, marked: 1 });
-    expect(exitCodeForResult(r)).toBe(3);
-    const rest = await repairEpochEventTimes(db, { apply: true, pageSize: 1 });
-    expect(rest).toMatchObject({ complete: true, marked: 1 });
+  test("--max-pages stops early (exit 3) with a cursor; resuming WITH --max-pages makes progress and finishes", async () => {
+    // Empty workspaces ahead of the affected ones never use up --max-pages.
+    for (const ws of ["ws-0", "ws-00", "ws-000"]) await seed(ws, "s-clean", [REAL]);
+    const seen: number[] = [];
+    let after: ReturnType<typeof decodeCursor> | undefined;
+    let r = await repairEpochEventTimes(db, { apply: true, pageSize: 1, maxPages: 2 });
+    for (let run = 0; run < 10; run++) {
+      seen.push(r.marked + r.already_pending + r.not_live);
+      if (r.complete) break;
+      expect(exitCodeForResult(r)).toBe(3);
+      expect(typeof r.next_after).toBe("string");
+      after = decodeCursor(r.next_after!);
+      r = await repairEpochEventTimes(db, { apply: true, pageSize: 1, maxPages: 2, after });
+    }
+    expect(r.complete).toBe(true);
+    expect(r.next_after).toBeUndefined();
+    expect(exitCodeForResult(r)).toBe(0);
+    // ws-a s-bug, s-gone | ws-a s-pending, ws-b s-bug-b: two capped runs, each scope handled once.
+    expect(seen).toEqual([2, 2]);
+    expect((await directory()).filter((d) => d.session_id.startsWith("s-bug")).every((d) => !d.ready)).toBe(true);
+    const again = await repairEpochEventTimes(db, { apply: true, pageSize: 1, maxPages: 2 });
+    expect(again).toMatchObject({ marked: 0, complete: false });
+  });
+
+  test("a cursor resumes strictly after its scope, and round-trips", async () => {
+    const all = await repairEpochEventTimes(db, { apply: false, pageSize: 200 });
+    expect(all.affected).toBe(4);
+    const rest = await repairEpochEventTimes(db, { apply: false, pageSize: 200, after: ["org-a", "ws-a", "claude", "s-gone"] });
+    expect(rest).toMatchObject({ affected: 2, complete: true }); // s-pending, s-bug-b
+    expect(decodeCursor(encodeCursor(["o", "w/x", "h", "s"]))).toEqual(["o", "w/x", "h", "s"]);
   });
 
   test("a refused UPDATE is counted by SQLSTATE and exits 3", async () => {
@@ -182,8 +208,10 @@ describe("repairEpochEventTimes (real migrations)", () => {
 describe("CLI surface", () => {
   test("args: plan by default, strict flags", () => {
     expect(epochRepairArgs([])).toEqual({ apply: false, pageSize: 200 });
-    expect(epochRepairArgs(["--apply", "--page", "50", "--max-pages", "3"])).toEqual({ apply: true, pageSize: 50, maxPages: 3 });
-    for (const bad of [["--apply", "--plan"], ["--page", "0"], ["--page", "1001"], ["--page"], ["--max-pages", "0"], ["--org", "x"], ["apply"]])
+    expect(epochRepairArgs(["--apply", "--self-host-consumer", "--page", "50", "--max-pages", "3"])).toEqual({ apply: true, pageSize: 50, maxPages: 3 });
+    const cursor = encodeCursor(["org-a", "ws-a", "claude", "s1"]);
+    expect(epochRepairArgs(["--after", cursor])).toEqual({ apply: false, pageSize: 200, after: ["org-a", "ws-a", "claude", "s1"] });
+    for (const bad of [["--after"], ["--after", "!!"], ["--after", encodeCursor(["a", "b", "c"] as never)], ["--page", "1", "--page", "2"], ["--apply", "--plan"], ["--page", "0"], ["--page", "1001"], ["--page"], ["--max-pages", "0"], ["--org", "x"], ["apply"]])
       expect(() => epochRepairArgs(bad)).toThrow(EpochRepairRefused);
   });
 
@@ -191,6 +219,20 @@ describe("CLI surface", () => {
     expect(epochRepairDatabaseUrl({ EPOCH_EVENT_TIME_REPAIR_DATABASE_URL: "postgres://x" })).toBe("postgres://x");
     for (const env of [{}, { EPOCH_EVENT_TIME_REPAIR_DATABASE_URL: "" }, { EPOCH_EVENT_TIME_REPAIR_DATABASE_URL: "a", EPOCH_EVENT_TIME_REPAIR_DATABASE_URL_FILE: "/x" }, { EPOCH_EVENT_TIME_REPAIR_DATABASE_URL_FILE: "relative" }, { EPOCH_EVENT_TIME_REPAIR_DATABASE_URL_FILE: "/nonexistent/x" }])
       expect(() => epochRepairDatabaseUrl(env)).toThrow(EpochRepairRefused);
+  });
+
+  test("--apply without --self-host-consumer is refused (exit 2) before any query; plan needs no flag", async () => {
+    let queried = 0;
+    const counting: EpochRepairDb = { query: async <R>(t: string, p?: unknown[]) => { queried++; return db.query<R>(t, p); } };
+    const refused = await runEpochRepairMain({}, ["--apply"], { db: counting }).catch((e) => e);
+    expect(refused).toBeInstanceOf(EpochRepairRefused);
+    expect((refused as EpochRepairRefused).code).toBe("apply_requires_self_host_consumer");
+    expect(exitCodeForError(refused)).toBe(2);
+    expect(queried).toBe(0);
+    expect(await directory()).toHaveLength(5);
+    expect((await directory()).filter((d) => !d.ready).map((d) => d.session_id).sort()).toEqual(["s-gone", "s-pending"]);
+    const r = await runEpochRepairMain({}, ["--apply", "--self-host-consumer"], { db: counting, log: () => {} });
+    expect(r).toMatchObject({ mode: "apply", marked: 2 });
   });
 
   test("main: bad args refuse (exit 2) before any query; plan runs on the injected database", async () => {

@@ -1,6 +1,12 @@
 /**
  * Operator repair of directory sessions whose event times hold 1970-01-01 (event_ts = 'epoch').
  *
+ * SELF-HOST ONLY. Do not --apply on the hosted AWS Lambda stack: its consumer has no freshness sweep
+ * (reconcileRecent looks back only minutes; reconcileStaleProjections runs only in consumer-service.ts),
+ * so a marked session stays not ready, and its workspace's directory event reads are refused
+ * (session_directory_events_require_ready, 0A000), until that session gets a new upload. --apply is
+ * refused (exit 2) unless --self-host-consumer is also passed.
+ *
  * The relayhistory Claude parser writes ts_ms 0 for a record that carries no time. Before the fix in
  * packages/pipeline/src/lib/pipeline/relayhistory-projection.ts (activityMs), the projection took 0 as
  * 1970-01-01 and settled every timeless tool call under that event to the same instant, so the index
@@ -48,12 +54,15 @@
  *
  * Usage (a one-shot Job or exec in the services image):
  *   bun run /app/src/session-pipeline/epoch-event-time-repair.ts            plan (default): writes nothing
- *   bun run /app/src/session-pipeline/epoch-event-time-repair.ts --apply [--page 200] [--max-pages N]
+ *   bun run /app/src/session-pipeline/epoch-event-time-repair.ts --apply --self-host-consumer [--page 200] [--max-pages N] [--after CURSOR]
+ * --max-pages counts only pages that returned scopes. A run that stops early prints `next_after`, an
+ * opaque cursor (base64url of the last scope it handled); pass it as --after to resume after that scope.
  * Env: EPOCH_EVENT_TIME_REPAIR_DATABASE_URL or EPOCH_EVENT_TIME_REPAIR_DATABASE_URL_FILE (exactly one):
  *   a login that can SELECT sessions.session_directory_event_times and UPDATE sessions.session_directory
  *   (the schema owner); SESSION_POSTGRES_TLS_PROFILE as for the other self-host workloads.
- * Exit: 0 done; 3 incomplete (--max-pages reached, or a refused scope: rerun); 2 refused or
- *   misconfigured; 4 any other error (rerun). Output: one JSON line of counts, no ids.
+ * Exit: 0 done; 3 incomplete (--max-pages reached: rerun with --after next_after; or a refused scope:
+ *   rerun); 2 refused or misconfigured; 4 any other error (rerun). Output: one JSON line of counts and,
+ *   when stopped early, the opaque resume cursor.
  * Runbook: runbooks/epoch-event-time-repair.md.
  */
 import { readFileSync, statSync } from "node:fs";
@@ -75,8 +84,10 @@ export interface EpochRepairOptions {
   apply: boolean;
   /** Scopes per page, within one workspace. */
   pageSize: number;
-  /** Pages over all workspaces; unset is no limit. */
+  /** Pages that returned scopes, over all workspaces; unset is no limit. */
   maxPages?: number;
+  /** Resume strictly after this scope (a `next_after` cursor). */
+  after?: ScopeKey;
   log?: (event: Record<string, unknown>) => void;
 }
 
@@ -97,11 +108,28 @@ export interface EpochRepairResult {
   refused: number;
   refused_codes: Record<string, number>;
   complete: boolean;
+  /** Present when stopped early by --max-pages: pass it as --after to resume. */
+  next_after?: string;
+}
+
+export type ScopeKey = [orgId: string, workspaceId: string, harness: string, sessionId: string];
+
+export function encodeCursor(k: ScopeKey): string {
+  return Buffer.from(JSON.stringify(k), "utf8").toString("base64url");
+}
+
+export function decodeCursor(text: string): ScopeKey {
+  if (!/^[A-Za-z0-9_-]{1,4096}$/.test(text)) refuse("after_invalid");
+  let v: unknown;
+  try { v = JSON.parse(Buffer.from(text, "base64url").toString("utf8")); } catch { return refuse("after_invalid"); }
+  if (!Array.isArray(v) || v.length !== 4 || !v.every((x) => typeof x === "string" && x.length > 0)) refuse("after_invalid");
+  return v as ScopeKey;
 }
 
 interface Scope { org_id: string; workspace_id: string; harness: string; session_id: string; live: boolean; ready: boolean }
 
-export const WORKSPACES_SQL = `SELECT DISTINCT org_id, workspace_id FROM sessions.session_directory ORDER BY org_id, workspace_id`;
+export const WORKSPACES_SQL = `SELECT DISTINCT org_id, workspace_id FROM sessions.session_directory
+ WHERE $1::text IS NULL OR (org_id, workspace_id) >= ($1, $2) ORDER BY org_id, workspace_id`;
 
 export const PAGE_SQL = `SELECT t.org_id, t.workspace_id, t.harness, t.session_id,
        coalesce(d.deleted_at IS NULL, false) AS live, coalesce(d.event_projection_ready, false) AS ready
@@ -131,19 +159,25 @@ export async function repairEpochEventTimes(db: EpochRepairDb, o: EpochRepairOpt
   const r: EpochRepairResult = { mode: o.apply ? "apply" : "plan", workspaces: 0, affected: 0, markable: 0, marked: 0, already_pending: 0, not_live: 0, raced: 0, refused: 0, refused_codes: {}, complete: false };
   await db.query("SET statement_timeout = '30s'");
   await db.query("SET lock_timeout = '1s'");
-  const workspaces = (await db.query<{ org_id: string; workspace_id: string }>(WORKSPACES_SQL)).rows;
+  const workspaces = (await db.query<{ org_id: string; workspace_id: string }>(WORKSPACES_SQL, [o.after?.[0] ?? null, o.after?.[1] ?? null])).rows;
   let pages = 0;
   let stopped = false;
+  let last: ScopeKey | undefined;
   for (const ws of workspaces) {
     r.workspaces++;
-    let after: Scope | undefined;
+    // Resuming: inside the cursor's own workspace, continue after its scope.
+    const resume = o.after && o.after[0] === ws.org_id && o.after[1] === ws.workspace_id ? o.after : undefined;
+    let after: { harness: string; session_id: string } | undefined = resume ? { harness: resume[2], session_id: resume[3] } : undefined;
     for (;;) {
+      const rows = (await db.query<Scope>(PAGE_SQL, [ws.org_id, ws.workspace_id, after?.harness ?? null, after?.session_id ?? null, o.pageSize])).rows;
+      // A page that returned no scope is not counted: an empty workspace never uses up --max-pages.
+      if (!rows.length) break;
       if (o.maxPages !== undefined && pages >= o.maxPages) { stopped = true; break; }
       pages++;
-      const rows = (await db.query<Scope>(PAGE_SQL, [ws.org_id, ws.workspace_id, after?.harness ?? null, after?.session_id ?? null, o.pageSize])).rows;
-      if (rows.length) after = rows[rows.length - 1];
+      after = rows[rows.length - 1];
       for (const row of rows) {
         r.affected++;
+        last = [row.org_id, row.workspace_id, row.harness, row.session_id];
         if (!row.live) { r.not_live++; continue; }
         if (!row.ready) { r.already_pending++; continue; }
         r.markable++;
@@ -164,20 +198,35 @@ export async function repairEpochEventTimes(db: EpochRepairDb, o: EpochRepairOpt
     }
     if (stopped) break;
   }
+  if (stopped) {
+    // Stopped before any page of this run: resume exactly where the caller's cursor was.
+    const at = last ?? o.after;
+    if (at) r.next_after = encodeCursor(at);
+  }
   r.complete = !stopped;
   return r;
 }
 
-export function epochRepairArgs(argv: readonly string[]): { apply: boolean; pageSize: number; maxPages?: number } {
-  const known = new Set(["--apply", "--plan", "--page", "--max-pages"]);
-  const out: { apply: boolean; pageSize: number; maxPages?: number } = { apply: false, pageSize: 200 };
+export interface EpochRepairArgs { apply: boolean; pageSize: number; maxPages?: number; after?: ScopeKey }
+
+export function epochRepairArgs(argv: readonly string[]): EpochRepairArgs {
+  const known = new Set(["--apply", "--plan", "--self-host-consumer", "--page", "--max-pages", "--after"]);
+  const out: EpochRepairArgs = { apply: false, pageSize: 200 };
   let plan = false;
+  let selfHost = false;
+  const seen = new Set<string>();
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
-    if (!known.has(a)) refuse("args_invalid");
+    if (!known.has(a) || seen.has(a)) refuse("args_invalid");
+    seen.add(a);
     if (a === "--apply") out.apply = true;
     else if (a === "--plan") plan = true;
-    else {
+    else if (a === "--self-host-consumer") selfHost = true;
+    else if (a === "--after") {
+      const v = argv[++i];
+      if (v === undefined) refuse("args_invalid");
+      out.after = decodeCursor(v!);
+    } else {
       const v = argv[++i];
       if (v === undefined || !/^\d{1,4}$/.test(v)) refuse("args_invalid");
       const n = Number(v);
@@ -186,6 +235,9 @@ export function epochRepairArgs(argv: readonly string[]): { apply: boolean; page
     }
   }
   if (plan && out.apply) refuse("args_invalid");
+  // The hosted AWS Lambda consumer never re-projects a marked session on its own (no freshness sweep):
+  // marking there leaves workspace directory reads refused. The operator must say the consumer is self-host.
+  if (out.apply && !selfHost) refuse("apply_requires_self_host_consumer");
   return out;
 }
 

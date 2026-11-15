@@ -83,8 +83,11 @@ dormant; any other value fails startup.
   Sessions an older consumer projected with 1970-01-01 event times (a Claude
   record with `ts_ms` 0) are marked for re-projection by
   `src/session-pipeline/epoch-event-time-repair.ts` (plan by default,
-  `--apply` to mark); the consumer's freshness check then re-projects them.
-  See `runbooks/epoch-event-time-repair.md`.
+  `--apply --self-host-consumer` to mark); the consumer's freshness check then
+  re-projects them. **Self-host only: do not `--apply` on the hosted AWS Lambda
+  stack**, whose consumer has no freshness sweep, so marked sessions would keep
+  their workspaces' directory event reads refused until a new upload. See
+  `runbooks/epoch-event-time-repair.md`.
 
 ### `SERVICE=session-erase-bytes`
 
