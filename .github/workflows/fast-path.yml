@@ -1,0 +1,317 @@
+# Fast path: run the ci.yml checks and publish the services image on Blacksmith
+# runners, outside the shared GitHub-hosted queue. Anyone with write access
+# (people or agents) may start it; nothing runs until Khaliq approves the
+# fast-path environment.
+#
+# Checks (the lanes the ci.yml `checks` gate requires, plus the amp image and
+# session read Worker checks): the four unit-test shards, unit-tests-aux,
+# aws-hardening-mutations, selfhost-e2e, amp-transport-image and
+# session-read-worker, all at the SHA resolved once from `ref`.
+#
+# Publishes: a linux/amd64+linux/arm64 build of docker/services.Dockerfile to
+# ghcr.io/agentworkforce/sessions-pipeline tagged fast-<sha> only, with SBOM and
+# max-mode provenance. It never pushes or moves sha-<sha>, :latest or any
+# release tag, and it carries no reviewed-source attestation: it is not a
+# reviewed release and does not replace publish-image.yml. The ECR and Artifact
+# Registry copies are not pushed: those publishes run in the image-publish
+# environment with a pinned publisher identity and sha-tag-only repositories.
+# Pin the digest printed in the run summary.
+name: fast-path
+run-name: fast-path ${{ inputs.ref }} (${{ inputs.reason }})
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to build (a review branch is fine)
+        required: true
+        default: main
+      reason:
+        description: Why this needs the fast path
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: fast-path-${{ inputs.ref }}
+  cancel-in-progress: false
+env:
+  IMAGE: ghcr.io/agentworkforce/sessions-pipeline
+jobs:
+  approve:
+    environment: fast-path
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: false
+          persist-credentials: false
+      - id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  unit-tests-shard:
+    needs: approve
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.8.34.13
+        env:
+          CLICKHOUSE_PASSWORD: ci-only
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --password ci-only -q 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      READ_API_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+      READ_API_TEST_CLICKHOUSE_PASSWORD: ci-only
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ needs.approve.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - name: Unit tests (stack, shard ${{ matrix.shard }} of 4)
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          list="$RUNNER_TEMP/unit-test-shard-$SHARD.txt"
+          bun scripts/ci/unit-test-shards.ts --shard "$SHARD" --of 4 > "$list"
+          echo "shard $SHARD of 4: $(wc -l < "$list") test files" | tee -a "$GITHUB_STEP_SUMMARY"
+          mapfile -t files < "$list"
+          test "${#files[@]}" -gt 0
+          bun test --timeout 30000 "${files[@]}"
+
+  unit-tests-aux:
+    needs: approve
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ needs.approve.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - name: Typecheck packages/pipeline
+        run: bun run --filter ./packages/pipeline typecheck
+      - name: Test packages/pipeline
+        run: bun run --filter ./packages/pipeline test
+      - name: Build packages/object-store
+        run: bun run --filter @relayhistory/object-store build
+      - name: Test packages/object-store
+        run: bun run --filter @relayhistory/object-store test
+      - name: Typecheck the stack (src, stacks, alchemy.run.ts)
+        run: bunx tsc --noEmit -p tsconfig.json
+      - name: Shard plan covers every root test file exactly once
+        run: bun scripts/ci/unit-test-shards.ts --check --of 4
+      - name: Unit tests (ingest on the G4-only migration set)
+        env:
+          HOOPDB_MIGRATE_UNTIL: 20261105043800_lazy_ack_clock_no_key_update.sql
+        run: |
+          for suite in ledger turns ordered-controls custody-baseline lazy-custody frozen-custody first-ack-seats; do
+            bun test --timeout 30000 "src/session-ingest/__tests__/${suite}.pglite.test.ts"
+          done
+      - name: Unit tests (IaC values, stacks/)
+        run: bun test --timeout 30000 ./stacks
+      - name: Guard - no Helm hooks in any chart or manifest in this repo
+        run: |
+          key="helm.sh/ho""ok"
+          ! grep -rn "$key" --include='*.yaml' --include='*.yml' --include='*.tpl' . --exclude-dir=node_modules --exclude-dir=vendor --exclude-dir=.github || (echo "helm hooks are not allowed (Alchemy renders --no-hooks)"; exit 1)
+      - name: Guard - nothing secret-like committed
+        run: |
+          ! git ls-files | grep -E '(^|/)(\.env|inputs\.json|.*\.pem)$' || (echo "secret-like file tracked"; exit 1)
+      - name: Guard - no production deployment identifiers in engine source
+        run: bun scripts/check-engine-identifiers.ts
+      - name: Scrub bindgen receipt
+        run: bun scripts/scrub-bindgen-receipt.ts --out scrub-bindgen-receipt.json
+
+  aws-hardening-mutations:
+    needs: approve
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 40
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.8.34.13
+        env:
+          CLICKHOUSE_PASSWORD: ci-only
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --password ci-only -q 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      READ_API_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+      READ_API_TEST_CLICKHOUSE_PASSWORD: ci-only
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ needs.approve.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - run: bun run --filter @relayhistory/object-store build
+      - name: AWS hardening mutation check
+        run: bun scripts/aws-hardening-mutations.ts
+      - name: Verify mutations restored their source files
+        run: git diff --exit-code
+
+  selfhost-e2e:
+    needs: approve
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ needs.approve.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - run: bun install --frozen-lockfile
+      - run: bun run e2e:selfhost
+
+  amp-transport-image:
+    needs: approve
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ needs.approve.outputs.sha }}
+          persist-credentials: false
+      - run: docker build --file docker/services.Dockerfile --tag amp-transport-ci .
+      - name: Verify process isolation in the Linux image without network access
+        run: docker run --rm --network none --entrypoint bun amp-transport-ci test src/amp
+
+  session-read-worker:
+    needs: approve
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:26.8.34.13
+        env:
+          CLICKHOUSE_PASSWORD: ci-only
+          CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+        ports:
+          - 8123:8123
+        options: >-
+          --health-cmd "clickhouse-client --password ci-only -q 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: ci-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      READ_API_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+      READ_API_TEST_CLICKHOUSE_PASSWORD: ci-only
+      READ_WORKER_TEST_PG_URL: postgresql://postgres:ci-only@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ needs.approve.outputs.sha }}
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bun install --frozen-lockfile
+      - run: bun run --filter ./packages/session-read-worker typecheck
+      - run: bun run --filter ./packages/session-read-worker test
+      - name: Bundle exactly as a deploy would (wrangler dry run)
+        working-directory: packages/session-read-worker
+        run: bunx wrangler deploy --dry-run --outdir "$RUNNER_TEMP/session-read-worker-dist"
+
+  image:
+    needs: [approve, unit-tests-shard, unit-tests-aux, aws-hardening-mutations, selfhost-e2e, amp-transport-image, session-read-worker]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          ref: ${{ needs.approve.outputs.sha }}
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/services.Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:fast-${{ needs.approve.outputs.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.approve.outputs.sha }}
+          provenance: mode=max
+          sbom: true
+      - name: Summary
+        env:
+          REF: ${{ inputs.ref }}
+          SHA: ${{ needs.approve.outputs.sha }}
+          REASON: ${{ inputs.reason }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### sessions-pipeline fast path"
+            echo "- ref: \`$REF\` at \`$SHA\`"
+            echo "- reason: $REASON"
+            echo "- image: \`${IMAGE}@${DIGEST}\` (tag fast-$SHA; not a reviewed release)"
+          } >> "$GITHUB_STEP_SUMMARY"
