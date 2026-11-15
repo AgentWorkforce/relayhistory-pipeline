@@ -10,10 +10,44 @@ import { AuthError, continuationUntil, createReadApi, type VerifiedIdentity } fr
 import { relayAuthVerifier } from "../auth.ts";
 import { encodeCursor } from "../cursor.ts";
 import { handleUrlEvent, parseCompleteSince, parseReadApiSecret } from "../lambda.ts";
-import { PARTIAL_SESSIONS_CAP } from "../queries.ts";
+import { PARTIAL_SESSIONS_CAP, buildCandidateQuery } from "../queries.ts";
 import { memoryLiveness } from "./support.ts";
 
 const ID: VerifiedIdentity = { userId: "u-1", orgId: "org-a", workspaceId: "ws-a", scopes: ["rth:read"] };
+
+const EXCLUSION = "session_id NOT IN [";
+
+/**
+ * Every inlined `session_id NOT IN [...]` list of a query, decoded with ClickHouse string
+ * quoting (a backslash escapes the next character). Throws when a literal is unterminated or
+ * anything other than `,` or `]` follows one, so an id that ended its literal early fails here.
+ */
+function inlinedExclusions(query: string): string[][] {
+  const lists: string[][] = [];
+  for (let at = query.indexOf(EXCLUSION); at >= 0; at = query.indexOf(EXCLUSION, at + 1)) {
+    const ids: string[] = [];
+    let i = at + EXCLUSION.length;
+    for (;;) {
+      if (query[i] !== "'") throw new Error(`expected a string literal at ${i}`);
+      let id = "";
+      for (i++; ; ) {
+        const ch = query[i++];
+        if (ch === undefined) throw new Error("unterminated string literal");
+        if (ch === "'") break;
+        if (ch === "\\") {
+          if (query[i] === undefined) throw new Error("unterminated escape");
+          id += query[i++];
+        } else id += ch;
+      }
+      ids.push(id);
+      if (query[i] === ",") { i++; continue; }
+      if (query[i] === "]") break;
+      throw new Error(`unexpected ${JSON.stringify(query[i])} after a literal`);
+    }
+    lists.push(ids);
+  }
+  return lists;
+}
 
 /**
  * `partial`: the org's partial sessions; `partialInWorkspace`: those of them
@@ -23,7 +57,7 @@ function stubCh(rows: { candidates?: unknown[]; newest?: unknown[]; partial?: st
   const queries: string[] = [];
   /** Each query's parameters, in the order asked. */
   const params: Record<string, unknown>[] = [];
-  /** The candidate query's `excluded` (applied to its rows and the newest rows, as the SQL does unless ignoreExclusion). */
+  /** The candidate query's inlined exclusion list (applied to its rows and the newest rows, as the SQL does unless ignoreExclusion). */
   let excluded = new Set<string>();
   const keep = (list: unknown[] | undefined) => (list ?? []).filter((r) => rows.ignoreExclusion || !excluded.has((r as { session_id: string }).session_id));
   const ch: ClickHouseClient = {
@@ -43,7 +77,7 @@ function stubCh(rows: { candidates?: unknown[]; newest?: unknown[]; partial?: st
         return (rows.partial ?? []).filter((id) => session === undefined || id === session).map((session_id) => ({ session_id })) as T[];
       }
       if (query.includes("bytes_before")) return keep(rows.newest) as T[];
-      excluded = new Set((options?.params?.excluded as string[] | undefined) ?? []);
+      excluded = new Set(inlinedExclusions(query)[0] ?? []);
       return keep(rows.candidates) as T[];
     },
   };
@@ -325,14 +359,60 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
         expect(b.events.map((e: { sessionId: string; eventId: string }) => `${e.sessionId}/${e.eventId}`)).toEqual(["s-ok/e-2"]);
         expect(b.incomplete).toEqual({ reason: "session_partial", sessions: ["s-stale"] });
         expect(stub.queries.some((q) => q.includes("search_ingest_session_state"))).toBe(true);
-        // A bound Array(String) parameter on the candidate query, never inlined into the SQL.
-        expect(stub.eventQueries()[0]).toContain("session_id NOT IN {excluded:Array(String)}");
-        expect(stub.eventParams()[0]!.excluded).toEqual(["s-stale"]);
-        expect(stub.eventQueries().some((q) => q.includes("s-stale"))).toBe(false);
+        // An escaped literal in the candidate query's body, never a URL parameter.
+        expect(stub.eventQueries()[0]).toContain("session_id NOT IN ['s-stale']");
+        expect(stub.eventParams().some((p) => "excluded" in p)).toBe(false);
         // Counts only, never the ids.
         expect(logs.find((l) => l.reason === "session_partial_skipped")).toMatchObject({ status: 200, partial_sessions: 1, excluded_sessions: 1 });
         expect(JSON.stringify(logs)).not.toContain("s-stale");
       }
+    });
+
+    test("the exclusion list is inlined as escaped literals: no id ends its literal, no URL parameter", () => {
+      const ids = ["s-ok", "s'2", "s-stale'; --", "back\\", "mix\\'] OR 1=1 --", "\\'"];
+      // The escaped literals as ClickHouse reads them: every quote and backslash is escaped.
+      const literal = String.raw`['s-ok','s\'2','s-stale\'; --','back\\','mix\\\'] OR 1=1 --','\\\'']`;
+      const input = { orgId: "org-a", workspaceId: "ws-a", order: "desc" as const, limit: 20, q: "needle" };
+      for (const sessionId of [undefined, "s-1"]) {
+        const plain = buildCandidateQuery("relay_search", { ...input, sessionId });
+        const built = buildCandidateQuery("relay_search", { ...input, sessionId, excludeSessionIds: ids });
+        // One list per searched branch, each decoding back to exactly the ids.
+        const lists = inlinedExclusions(built.query);
+        expect(lists.length).toBeGreaterThan(0);
+        expect(lists.length).toBe(built.query.split("NOT IN").length - 1);
+        for (const list of lists) expect(list).toEqual(ids);
+        expect(built.query).toContain(literal);
+        // Removing the lists gives back the plain query: nothing else changed.
+        expect(built.query.split(` AND session_id NOT IN ${literal}`).join("")).toBe(plain.query);
+        // Parameters are unchanged: no `excluded`, nothing carried in the request URL.
+        expect("excluded" in built.params).toBe(false);
+        expect(built.params).toEqual(plain.params);
+      }
+      // Absent or empty adds nothing.
+      expect(buildCandidateQuery("relay_search", { ...input, excludeSessionIds: [] })).toEqual(buildCandidateQuery("relay_search", input));
+    });
+
+    test("a cursor page whose partial-sessions lookup throws is a 503 with the standard body, no detail and no header", async () => {
+      const stub = fixture();
+      const select = stub.ch.select.bind(stub.ch);
+      stub.ch.select = (async (q: string, o?: { params?: Record<string, unknown> }) => {
+        if (q.includes("search_ingest_session_state")) throw new Error("state lookup exploded s-stale secret-detail");
+        return select(q, o);
+      }) as ClickHouseClient["select"];
+      const { get, logs } = skip(stub.ch);
+      const r = await get(`${SEARCH}&cursor=${cursor}`);
+      expect(r.status).toBe(503);
+      expect(r.headers.get("X-Sessions-Read-Incomplete")).toBeNull();
+      const text = await r.text();
+      expect(text).not.toContain("exploded");
+      expect(text).not.toContain("secret-detail");
+      expect(text).not.toContain("s-stale");
+      const b = JSON.parse(text) as Record<string, any>;
+      expect(b).toEqual({ error: { code: "backend_unavailable", message: "read backend unavailable" }, correlationId: r.headers.get("x-correlation-id") });
+      // The page was never read, and nothing claims a skip.
+      expect(stub.eventQueries()).toHaveLength(0);
+      expect(logs.some((l) => String(l.reason).endsWith("_skipped"))).toBe(false);
+      expect(JSON.stringify(logs)).not.toContain("exploded");
     });
 
     test("a backend that returns an excluded session's row fails the page rather than serving it", async () => {
@@ -357,7 +437,7 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
         expect(b.incomplete).toEqual({ reason: "session_partial_unbounded" });
         // Nothing listed, so nothing excluded: rows of a partial session may remain.
         expect(b.events).toHaveLength(3);
-        expect(stub.eventQueries().some((q) => q.includes("excluded"))).toBe(false);
+        expect(stub.eventQueries().some((q) => q.includes("NOT IN"))).toBe(false);
         expect(stub.eventParams().some((p) => "excluded" in p)).toBe(false);
         expect(logs.find((l) => l.reason === "session_partial_unbounded_skipped")).toMatchObject({ status: 200, excluded_sessions: 0 });
       }

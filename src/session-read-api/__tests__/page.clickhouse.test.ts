@@ -367,4 +367,30 @@ suite("readEventPage on ClickHouse", () => {
     expect(await partialSessionsInWorkspace(deps, org, "ws-b")).toEqual({ sessions: ["dup"], overflow: false });
     expect(await partialSessionsInWorkspace(deps, org, "ws-c")).toEqual({ sessions: [], overflow: false });
   });
+
+  test("excludeSessionIds leaves out one session's rows on every page, the other session's rows all served", async () => {
+    // Its own org, so earlier tests' rows cannot match. The excluded id holds a quote and a
+    // backslash: the inlined literal must still be read as that one id by ClickHouse.
+    const org = "org-x";
+    const stale = "x-stale'\\'] OR 1=1 --";
+    await insert([
+      row({ org, session: "x-keep", id: "k1", ts: "2026-10-22 10:00:00.000", content: "exclusion needle k1" }),
+      row({ org, session: stale, id: "s1", ts: "2026-10-22 10:00:01.000", content: "exclusion needle s1" }),
+      row({ org, session: "x-keep", id: "k2", ts: "2026-10-22 10:00:02.000", content: "exclusion needle k2" }),
+      row({ org, session: stale, id: "s2", ts: "2026-10-22 10:00:03.000", content: "exclusion needle s2" }),
+      row({ org, session: "x-keep", id: "k3", ts: "2026-10-22 10:00:04.000", content: "exclusion needle k3" }),
+      row({ org, session: stale, id: "s3", ts: "2026-10-22 10:00:05.000", content: "exclusion needle s3" }),
+    ]);
+    const deps = { ch, liveness: memoryLiveness().liveness };
+    const search = q({ orgId: org, q: "exclusion needle", order: "desc", limit: 2 });
+    // Both sessions match without the exclusion.
+    expect(await all(deps, search)).toEqual(["s3", "k3", "s2", "k2", "s1", "k1"]);
+    // Excluded: only x-keep's rows, across a cursor continuation (limit 2, three rows).
+    const first = await readEventPage(deps, { ...search, excludeSessionIds: [stale] });
+    expect(first.events.map((e) => e.eventId)).toEqual(["k3", "k2"]);
+    expect(first.nextCursor).not.toBeNull();
+    expect(await all(deps, { ...search, excludeSessionIds: [stale] })).toEqual(["k3", "k2", "k1"]);
+    // Excluding the other session instead serves only the escaped id's rows.
+    expect(await all(deps, { ...search, excludeSessionIds: ["x-keep"] })).toEqual(["s3", "s2", "s1"]);
+  });
 });

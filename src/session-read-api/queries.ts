@@ -151,10 +151,13 @@ function keyPredicates(input: EventQuery, params: QueryParams): string[] {
     params.session = input.sessionId;
   }
   if (input.excludeSessionIds !== undefined && input.excludeSessionIds.length > 0) {
-    // A bound Array(String) parameter, never inlined. The newest query reads only these
-    // candidates' keys, so an excluded session's rows cannot reach the page.
-    where.push("session_id NOT IN {excluded:Array(String)}");
-    params.excluded = input.excludeSessionIds;
+    // Inlined as an escaped array literal (arrayLiteral quotes every id, so none can end the
+    // literal), like buildNewestQuery's keys: the client sends parameters in the request URL,
+    // and up to PARTIAL_SESSIONS_CAP ids could exceed a proxy's request-line limit. In the body
+    // the list counts against max_query_size (256 KiB default) once per searched branch, which
+    // 1000 UUID-length ids stay well under. The newest query reads only these candidates' keys,
+    // so an excluded session's rows cannot reach the page.
+    where.push(`session_id NOT IN ${arrayLiteral(input.excludeSessionIds)}`);
   }
   if (input.source !== undefined) {
     where.push("source = {source:String}");

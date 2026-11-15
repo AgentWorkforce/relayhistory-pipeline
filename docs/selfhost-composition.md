@@ -370,15 +370,20 @@ fall back to. Two settings, both default off and both self-host service only, ad
 `session-pipeline-consumer`, `SEARCH_INDEX_MAX_SCOPE_BYTES` (64 MiB..256 MiB, `MiB`/`GiB` suffix accepted),
 `SEARCH_INDEX_MAX_SCOPE_EVENTS` (100000..1000000) and `SEARCH_INDEX_MAX_ROWS` (500000..1000000) raise the per-scope
 index limits from their defaults (the lower bound) up to the replay bound. Raise the consumer's memory limit with
-them, because the scope is held several times over. A raised limit applies on the session's next index pass. Out of
+them, because the scope is held several times over. A raised limit needs no manual re-index: every reconcile
+tick the consumer re-sends each session the search state lists as partial, `scope_too_large` ones included, so after
+a restart with a higher limit those sessions are indexed again under it. Out of
 range or malformed fails startup before any connection opens, naming the variable only, and a dormant consumer reads
 none of them. On `session-read-api`, `READ_API_SEARCH_PARTIAL_SESSIONS=skip` lets every page of a workspace
 search answer 200 anyway, with `incomplete` (`session_partial` plus the partial `sessions`, or
 `session_partial_unbounded` with no list) and the `X-Sessions-Read-Incomplete` header. Each page, cursor pages
 included, checks again and leaves out the listed sessions' rows, so a session indexed while small and partial
 since never serves stale rows. `session_partial_unbounded` lists nothing and excludes nothing, so its pages may
-still hold stale rows. A search backend that cannot exclude sessions refuses `skip` at startup. On the Postgres search path a session waiting for its first index
-pass also counts as partial and is listed. A session-scoped read of a partial session still answers 501
+still hold stale rows. A search backend that cannot exclude sessions refuses `skip` at startup. On the Postgres or
+OpenSearch search path a session is partial while its index state is not complete and current: its first index pass
+has not run yet, it is too large for the limits (`scope_too_large`), or a new upload moved its directory epoch and the
+re-index has not run yet. So with `skip` a session that is being written to drops out of search results until its
+next index pass. A session-scoped read of a partial session still answers 501
 `session_partial`. The hosted pipeline Lambda never reads the limits, and the hosted read Lambda refuses `skip`.
 
 `SESSION_ERASE_BYTES_ENABLED` is the one exception to the `true` rule above:

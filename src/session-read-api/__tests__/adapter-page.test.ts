@@ -161,3 +161,21 @@ test("an adapter that ignores excludeSessionIds fails the page instead of servin
   expect(r.headers.get("X-Sessions-Read-Incomplete")).toBeNull();
   expect(await r.text()).not.toContain("stale-content");
 });
+
+test("READ_API_SEARCH_PARTIAL_SESSIONS=skip on the adapter path: a cursor page whose state.partials throws is a 503 with no detail and no header", async () => {
+  let queried = 0;
+  const adapter = binding(async () => { queried++; return { hits: [hit(1)] }; });
+  adapter.state.partials = async () => { throw new Error("partials exploded s-stale secret-detail"); };
+  const logs: Record<string, unknown>[] = [];
+  const app = createReadApi({ adapter, liveness, completeSinceMs: 0, searchSkipsPartialSessions: true, verify: async () => ({ ...tenant, userId: "u", scopes: ["rth:read"] }), log: fields => logs.push(fields) });
+  const cursor = encodeCursor({ tsMs: 5, sessionId: "s", source: "codex", machineId: "m", kind: "history", eventId: "e5" });
+  const r = await app.request(`/v1/events?workspace=ws-a&q=hello&limit=10&cursor=${cursor}`, { headers: { authorization: "Bearer synthetic" } });
+  expect(r.status).toBe(503);
+  expect(r.headers.get("X-Sessions-Read-Incomplete")).toBeNull();
+  const text = await r.text();
+  for (const leak of ["exploded", "secret-detail", "s-stale"]) expect(text).not.toContain(leak);
+  expect(JSON.parse(text)).toEqual({ error: { code: "backend_unavailable", message: "read backend unavailable" }, correlationId: r.headers.get("x-correlation-id") });
+  expect(queried).toBe(0);
+  expect(logs.some(l => String(l.reason).endsWith("_skipped"))).toBe(false);
+  expect(JSON.stringify(logs)).not.toContain("exploded");
+});
