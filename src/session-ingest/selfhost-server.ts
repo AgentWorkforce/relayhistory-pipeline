@@ -283,7 +283,7 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   // HISTORY_UPLOAD_DIRECT allowlist|on (selfhost-config.ts): the consumer's scan also promotes the upload inbox.
   const upload = settings.uploadDirect;
   const uploadInbox = upload
-    ? { batchSize: upload.scanBatch, promote: (key: string) => promoteUpload(key, { config: upload.config, deliver, witnessKey: upload.witnessKey, enqueue: notify, ...(options.nowMs ? { nowMs: options.nowMs } : {}) }) }
+    ? { batchSize: upload.scanBatch, concurrency: upload.promoteConcurrency, promote: (key: string) => promoteUpload(key, { config: upload.config, deliver, witnessKey: upload.witnessKey, enqueue: notify, ...(options.nowMs ? { nowMs: options.nowMs } : {}) }) }
     : undefined;
   // INGEST_S3_TENANT_LIMIT=on: the consumer has its OWN limiter pool (per replica), INGEST_MAX_PER_USER per user and
   // INGEST_ASYNC_MAX_PER_ORG (default half the consumer) per org, so one org's backlog never holds every consumer slot.

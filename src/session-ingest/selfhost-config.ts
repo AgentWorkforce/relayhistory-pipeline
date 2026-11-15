@@ -75,8 +75,9 @@
  *   With allowlist or on only:
  *   UPLOAD_WITNESS_KEY               the witness MAC key (32 bytes, unpadded base64url; Secret-injected). Never
  *                                    defaulted; missing or malformed leaves every upload pending (retried), never refused
- *   SELFHOST_UPLOAD_SCAN_BATCH       upload objects promoted per scan, 1..100, default 16 (the scan reuses
- *                                    SELFHOST_ADMISSION_SCAN_MS)
+ *   SELFHOST_UPLOAD_SCAN_BATCH       upload objects promoted per scan, 1..2000, default 256 (the scan reuses
+ *                                    SELFHOST_ADMISSION_SCAN_MS), chosen fairly across uploading origins, oldest first
+ *   SELFHOST_UPLOAD_PROMOTE_CONCURRENCY  promotions in flight at once within a scan, 1..64, default 8
  *   HISTORY_UPLOAD_INBOX_SSE         unset | "" | "none" (default: no requirement, e.g. MinIO without KMS) | "aws:kms":
  *                                    refuse (upload_unencrypted, terminal, before the witness check) an upload object
  *                                    whose own HEAD/GET lacks x-amz-server-side-encryption: aws:kms. Any other value
@@ -226,6 +227,7 @@ export interface SelfhostUploadDirectSettings {
   config: UploadDirectConfig;
   witnessKey: string | undefined;
   scanBatch: number;
+  promoteConcurrency: number;
 }
 
 /** HISTORY_UPLOAD_DIRECT: absent when off. On needs async/drain admission and a contract-form key root. */
@@ -234,7 +236,8 @@ export function selfhostUploadDirectSettings(env: NodeJS.ProcessEnv, keyRoot: st
   if (config.mode === "off") return undefined;
   if (!admission) throw new Error(`96bulls: ${UPLOAD_DIRECT_FLAG} needs ${SELFHOST_INGEST_ADMISSION_VAR}=async or drain`);
   if (!/^[a-z0-9][a-z0-9-]{0,62}$/u.test(keyRoot)) throw new Error(`96bulls: ${UPLOAD_DIRECT_FLAG} needs INGEST_KEY_ROOT of the form [a-z0-9][a-z0-9-]{0,62}`);
-  return { config, witnessKey: env[UPLOAD_WITNESS_KEY_VAR], scanBatch: bounded(env, "SELFHOST_UPLOAD_SCAN_BATCH", 16, 1, 100) };
+  return { config, witnessKey: env[UPLOAD_WITNESS_KEY_VAR], scanBatch: bounded(env, "SELFHOST_UPLOAD_SCAN_BATCH", 256, 1, 2000),
+    promoteConcurrency: bounded(env, "SELFHOST_UPLOAD_PROMOTE_CONCURRENCY", 8, 1, 64) };
 }
 
 export type SelfhostIngestConfig = { enabled: false; port: number } | ({ enabled: true } & SelfhostIngestSettings);

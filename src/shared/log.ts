@@ -42,6 +42,9 @@ export const ALLOWED_LOG_FIELDS = new Set([
   "buffered_checked", "buffered_dropped",
   // Self-host async admission consumer (src/session-ingest/selfhost-admission.ts): bounded counts only.
   "admission_backlog", "admission_oldest_age_ms", "admission_dead_letters", "admission_in_flight",
+  // ...its upload-inbox promotion pass: bounded counts, and `upload_results` (`code:n,...`, built from fixed
+  // result codes by uploadResultsField, never a key or id).
+  "promoted", "waiting", "upload_due", "upload_origins", "upload_results",
   // ...and one admission's wall time per phase (ADMISSION_PHASE_FIELDS): bounded counts only.
   ...ADMISSION_PHASE_FIELDS_LIST,
   // Search index failures (searchIndexErrorDetail): the adapter's bounded detail code only
@@ -66,6 +69,10 @@ export const BOUNDED_COUNT_FIELDS: ReadonlyMap<string, number> = new Map([
   ["admission_oldest_age_ms", 10 * 365 * 24 * 3600 * 1000],
   ["admission_dead_letters", 10_000_000],
   ["admission_in_flight", 1_000],
+  ["promoted", 100_000],
+  ["waiting", 10_000_000],
+  ["upload_due", 10_000_000],
+  ["upload_origins", 1_000_000],
   ...ADMISSION_PHASE_FIELDS_LIST.map((f): [string, number] => [f, 3_600_000]),
   ...ANALYTICS_COUNTER_FIELDS.map((f): [string, number] => [f, Number.MAX_SAFE_INTEGER]),
 ]);

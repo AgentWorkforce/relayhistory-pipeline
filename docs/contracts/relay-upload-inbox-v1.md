@@ -81,7 +81,7 @@ mac     = HMAC-SHA256(key, "relay-upload-witness-v1\n" + payloadB64url)
   1. Check the form.
   2. Compare the MAC in **constant time** (`timingSafeEqual`), before the payload is parsed.
   3. Check that the payload is in its exact form.
-  4. Check expiry: `exp <= nowSeconds` (the consumer's clock) means `upload_witness_expired`.
+  4. Check expiry: `exp <= nowSeconds` means `upload_witness_expired`. The consumer passes the time the store accepted the PUT (the object's `LastModified`, capped at its own clock), less 300 s of clock skew (`UPLOAD_WITNESS_PUT_SKEW_MS`): `exp` bounds when the desktop may write the object, not how long it may wait in the inbox. No usable `LastModified` is a retry, never a refusal.
   It returns the payload or `{code}`. This matches the repo's HMAC habit (`app.ts:77-82` signs `v1\n…`; `app.ts:96` compares in constant time).
 - **Stale witnesses refuse, never admit wrongly.** If `seq` is behind the journal at admission time, the upload is refused with `delivery_privacy_superseded`, by the existing post-claim gate `assertNoLaterPrivacyControl` (`async-admission.ts:421-434`). If `seq` is ahead of the journal, it is refused with `upload_witness_seq_mismatch`.
 - `encodeUploadWitness(key, payload)` is control's side. `readUploadWitnessUnverified(token)` lets the desktop self-check a credentials response. It never authorizes anything.
@@ -164,7 +164,7 @@ The consumer applies these checks in this order. The first failure is the upload
 | `upload_key_invalid` | the key does not parse under §1 (`parseUploadKey`) |
 | `upload_unencrypted` | the store requires SSE-KMS (`HISTORY_UPLOAD_INBOX_SSE=aws:kms`) and the object was stored without it: its own HEAD/GET response does not carry `x-amz-server-side-encryption: aws:kms`. With the setting unset, `""` or `none` (the default) nothing is required |
 | `upload_witness_invalid` | `x-amz-meta-relay-witness` missing or malformed, not the exact payload form, or the MAC does not verify |
-| `upload_witness_expired` | witness `exp` is at or before the consumer's clock |
+| `upload_witness_expired` | witness `exp` is at or before the time the PUT landed (`LastModified`, less 300 s skew) |
 | `upload_tenant_mismatch` | key (org, ws, uh) differs from the witness (org, ws, `userSegment(ws, user)`) (`bindUploadToWitness`) |
 | `upload_witness_seq_mismatch` | key `w<seq>` differs from the witness `seq`, or that seq is ahead of the user's journal |
 | `delivery_too_large` | stored object over `MAX_DELIVERY_BYTES` (`checkUploadObjectBytes`), or decoded/prepared delivery over its limits |

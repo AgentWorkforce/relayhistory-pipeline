@@ -16,7 +16,7 @@ import { INBOX_MIN_BYTES, journalKey, outcomeKey, receiptDir, type AdmissionMess
 import { DeliveryError } from "../vendor/delivery/delivery-contracts.ts";
 import { createUploadAdmissionHandler, notificationKeys, type UploadAdmissionRuntimeFactory } from "../upload-admission-lambda.ts";
 import {
-  contractCode, promoteUpload, uploadAdmissionStatus, uploadDirectConfig, uploadStatusKey, UPLOAD_DIRECT_OFF, UPLOAD_PENDING_RETRY_AFTER_SECONDS,
+  contractCode, promoteUpload, uploadAdmissionStatus, uploadDirectConfig, uploadStatusKey, UPLOAD_DIRECT_OFF, UPLOAD_PENDING_RETRY_AFTER_SECONDS, UPLOAD_WITNESS_PUT_SKEW_MS,
   type PromoteUploadDeps, type UploadDirectConfig,
 } from "../upload-admission.ts";
 import {
@@ -48,17 +48,25 @@ function counted() {
   const reads: string[] = [];
   const faults: { put?: (k: string) => boolean; get?: (k: string) => boolean; head?: (k: string) => boolean; del?: (k: string) => boolean } = {};
   const fail = (k: string) => { throw new ObjectStoreError("transient", "fs", `injected ${k.length}`); };
+  // The store's LastModified on getObject (when the PUT was accepted): fixed relative to T0, not the fs mtime
+  // (the wall clock), so the witness expiry is judged deterministically. `ms: null` = the header absent (epoch 0).
+  const putAt: { ms: number | null } = { ms: T0 - 1000 };
   const store: ObjectStore = {
     backend: inner.backend,
     head: async (k) => { reads.push(String(k)); return faults.head?.(String(k)) ? fail(String(k)) : inner.head(k); },
     get: (k, r) => { reads.push(String(k)); return inner.get(k, r); },
-    getObject: async (k, r) => { reads.push(String(k)); return faults.get?.(String(k)) ? fail(String(k)) : inner.getObject(k, r); },
+    getObject: async (k, r) => {
+      reads.push(String(k));
+      if (faults.get?.(String(k))) return fail(String(k));
+      const o = await inner.getObject(k, r);
+      return { ...o, meta: { ...o.meta, lastModified: new Date(putAt.ms ?? 0) } };
+    },
     list: async (p, c) => { reads.push(String(p)); return inner.list(p, c); },
     presignGet: (k, t) => inner.presignGet(k, t),
     put: async (k, b, o) => (faults.put?.(String(k)) ? fail(String(k)) : inner.put(k, b, o)),
     delete: async (k) => (faults.del?.(String(k)) ? fail(String(k)) : inner.delete(k)),
   };
-  return { store, reads, faults };
+  return { store, reads, faults, putAt };
 }
 
 const exists = async (store: ObjectStore, key: string) => (await store.head(objectKey(key))) !== undefined;
@@ -102,7 +110,8 @@ const statusOf = async (store: ObjectStore, key: string) => json(store, uploadSt
 
 describe("promoteUpload: the contract vectors", () => {
   test("the vector object round-trips: key parse, witness, digest, zstd, account, origin, b=; handed off at the witnessed seq", async () => {
-    const { store } = counted();
+    const { store, putAt } = counted();
+    putAt.ms = VNOW;
     const key = V.objectKey as string;
     expect(parseUploadKey(key)).toEqual(V.parsedKey);
     await store.put(objectKey(key), new Uint8Array(Buffer.from(V.object.objectBytesBase64, "base64")), { metadata: { "relay-witness": V.witness.token } });
@@ -121,16 +130,60 @@ describe("promoteUpload: the contract vectors", () => {
     expect(uploadStatusKey(parseUploadKey(key) as UploadKeyParts).startsWith(V.userSegment.journalKey.replace(/privacy-journal\.json$/, "u="))).toBe(true);
   });
 
-  test("the same vector a second later than exp is upload_witness_expired, recorded and removed", async () => {
-    const { store } = counted();
+  test("the same vector PUT after exp (past the skew allowance) is upload_witness_expired, recorded and removed", async () => {
+    const { store, putAt } = counted();
     const key = V.objectKey as string;
     await store.put(objectKey(key), new Uint8Array(Buffer.from(V.object.objectBytesBase64, "base64")), { metadata: { "relay-witness": V.witness.token } });
     await setJournal(store, V.inputs.keyRoot, VTENANT, 7);
-    const { d, sent } = deps(store, { nowMs: () => V.witness.payload.exp * 1000 }, V.inputs.keyRoot);
+    putAt.ms = V.witness.payload.exp * 1000 + UPLOAD_WITNESS_PUT_SKEW_MS;
+    const { d, sent } = deps(store, { nowMs: () => V.witness.payload.exp * 1000 + UPLOAD_WITNESS_PUT_SKEW_MS + 60_000 }, V.inputs.keyRoot);
     expect(await promoteUpload(key, d)).toEqual({ action: "ack", outcome: "refused", code: "upload_witness_expired" });
     expect(sent).toHaveLength(0);
     expect(await exists(store, key)).toBe(false);
     expect(await statusOf(store, key)).toMatchObject({ state: "refused", code: "upload_witness_expired" });
+  });
+
+  test("a witness valid when the PUT landed is promoted however long the upload waited (a backlog never expires it)", async () => {
+    const { store, putAt } = counted();
+    const key = V.objectKey as string;
+    await store.put(objectKey(key), new Uint8Array(Buffer.from(V.object.objectBytesBase64, "base64")), { metadata: { "relay-witness": V.witness.token } });
+    await setJournal(store, V.inputs.keyRoot, VTENANT, 7);
+    putAt.ms = VNOW;
+    // Promoted a day after exp: still the PUT's witness, still valid.
+    const { d, sent } = deps(store, { nowMs: () => V.witness.payload.exp * 1000 + 86_400_000 }, V.inputs.keyRoot);
+    expect(await promoteUpload(key, d)).toEqual({ action: "ack", outcome: "handed_off" });
+    expect(sent).toHaveLength(1);
+    expect(await exists(store, key)).toBe(false);
+  });
+
+  test("within the skew allowance after exp is still valid; a LastModified in the future never extends it", async () => {
+    const { store, putAt } = counted();
+    const key = V.objectKey as string;
+    await store.put(objectKey(key), new Uint8Array(Buffer.from(V.object.objectBytesBase64, "base64")), { metadata: { "relay-witness": V.witness.token } });
+    await setJournal(store, V.inputs.keyRoot, VTENANT, 7);
+    const exp = V.witness.payload.exp * 1000;
+    // A LastModified far ahead of this consumer's clock is capped at now: now past exp + skew refuses.
+    putAt.ms = exp + 10 * UPLOAD_WITNESS_PUT_SKEW_MS;
+    const late = deps(store, { nowMs: () => exp + UPLOAD_WITNESS_PUT_SKEW_MS }, V.inputs.keyRoot);
+    expect(await promoteUpload(key, late.d)).toEqual({ action: "ack", outcome: "refused", code: "upload_witness_expired" });
+    const { store: s2, putAt: p2 } = counted();
+    await s2.put(objectKey(key), new Uint8Array(Buffer.from(V.object.objectBytesBase64, "base64")), { metadata: { "relay-witness": V.witness.token } });
+    await setJournal(s2, V.inputs.keyRoot, VTENANT, 7);
+    p2.ms = exp + UPLOAD_WITNESS_PUT_SKEW_MS - 1000;
+    const ok = deps(s2, { nowMs: () => exp + 3_600_000 }, V.inputs.keyRoot);
+    expect(await promoteUpload(key, ok.d)).toEqual({ action: "ack", outcome: "handed_off" });
+  });
+
+  test("no usable LastModified (absent: epoch 0) is a retry, never a refusal; the upload stays", async () => {
+    const { store, putAt } = counted();
+    const key = V.objectKey as string;
+    await store.put(objectKey(key), new Uint8Array(Buffer.from(V.object.objectBytesBase64, "base64")), { metadata: { "relay-witness": V.witness.token } });
+    await setJournal(store, V.inputs.keyRoot, VTENANT, 7);
+    putAt.ms = null;
+    const { d, sent } = deps(store, { nowMs: () => VNOW }, V.inputs.keyRoot);
+    expect(await promoteUpload(key, d)).toMatchObject({ action: "retry", code: "upload_put_time_unavailable" });
+    expect(sent).toHaveLength(0);
+    expect(await exists(store, key)).toBe(true);
   });
 });
 
@@ -260,7 +313,7 @@ describe("promoteUpload: §6 refusals are recorded, the upload removed, nothing 
     ["no witness metadata", (s) => upload(s, { witness: null }), "upload_witness_invalid"],
     ["a witness under another key", (s) => upload(s, { witness: encodeUploadWitness(new Uint8Array(32).fill(9), { v: 1, org: "org-a", ws: "ws-a", user: "user-1", seq: 0, exp: EXP }) }), "upload_witness_invalid"],
     ["a tampered witness", async (s) => { const w = encodeUploadWitness(KEY, { v: 1, org: "org-a", ws: "ws-a", user: "user-1", seq: 0, exp: EXP }); return upload(s, { witness: w.slice(0, -2) + (w.endsWith("A") ? "BB" : "AA") }); }, "upload_witness_invalid"],
-    ["an expired witness", (s) => upload(s, { exp: Math.floor(T0 / 1000) }), "upload_witness_expired"],
+    ["a witness expired before its PUT landed", (s) => upload(s, { exp: Math.floor(T0 / 1000) - 3600 }), "upload_witness_expired"],
     ["checksum mismatch (d= is not the stored bytes' sha256)", (s) => upload(s, { digestOf: new Uint8Array([1, 2, 3]) }), "upload_digest_mismatch"],
     ["wrong encoding (plain JSON, not zstd)", (s) => upload(s, { bytes: new TextEncoder().encode('{"protocolVersion":1}') }), "unsupported_encoding"],
     ["wrong encoding (zstd magic, broken frame)", (s) => upload(s, { bytes: new Uint8Array([0x28, 0xb5, 0x2f, 0xfd, 1, 2, 3, 4, 5]) }), "unsupported_encoding"],
@@ -645,9 +698,11 @@ describe("HISTORY_UPLOAD_DIRECT parsing", () => {
     expect(selfhostUploadDirectSettings({}, ROOT, admission)).toBeUndefined();
     expect(() => selfhostUploadDirectSettings({ HISTORY_UPLOAD_DIRECT: "on" }, ROOT, undefined)).toThrow(/SELFHOST_INGEST_ADMISSION/);
     const on = selfhostUploadDirectSettings({ HISTORY_UPLOAD_DIRECT: "on", UPLOAD_WITNESS_KEY: WITNESS_KEY }, ROOT, admission)!;
-    expect([on.config.mode, on.witnessKey, on.scanBatch]).toEqual(["on", WITNESS_KEY, 16]);
-    expect(selfhostUploadDirectSettings({ HISTORY_UPLOAD_DIRECT: "on", SELFHOST_UPLOAD_SCAN_BATCH: "100" }, ROOT, admission)!.scanBatch).toBe(100);
-    for (const n of ["0", "101", "x"]) expect(() => selfhostUploadDirectSettings({ HISTORY_UPLOAD_DIRECT: "on", SELFHOST_UPLOAD_SCAN_BATCH: n }, ROOT, admission)).toThrow();
+    expect([on.config.mode, on.witnessKey, on.scanBatch, on.promoteConcurrency]).toEqual(["on", WITNESS_KEY, 256, 8]);
+    expect(selfhostUploadDirectSettings({ HISTORY_UPLOAD_DIRECT: "on", SELFHOST_UPLOAD_SCAN_BATCH: "2000" }, ROOT, admission)!.scanBatch).toBe(2000);
+    for (const n of ["0", "2001", "x"]) expect(() => selfhostUploadDirectSettings({ HISTORY_UPLOAD_DIRECT: "on", SELFHOST_UPLOAD_SCAN_BATCH: n }, ROOT, admission)).toThrow();
+    expect(selfhostUploadDirectSettings({ HISTORY_UPLOAD_DIRECT: "on", SELFHOST_UPLOAD_PROMOTE_CONCURRENCY: "64" }, ROOT, admission)!.promoteConcurrency).toBe(64);
+    for (const n of ["0", "65", "x"]) expect(() => selfhostUploadDirectSettings({ HISTORY_UPLOAD_DIRECT: "on", SELFHOST_UPLOAD_PROMOTE_CONCURRENCY: n }, ROOT, admission)).toThrow();
     expect(() => selfhostUploadDirectSettings({ HISTORY_UPLOAD_DIRECT: "on" }, "Bad_Root", admission)).toThrow();
     expect(on.config.inboxSse).toBe("none");
     expect(selfhostUploadDirectSettings({ HISTORY_UPLOAD_DIRECT: "on", HISTORY_UPLOAD_INBOX_SSE: "aws:kms" }, ROOT, admission)!.config.inboxSse).toBe("aws:kms");

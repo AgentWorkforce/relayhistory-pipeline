@@ -204,6 +204,8 @@ anything else is off, and the code default is off. `e2e/selfhost/compose.yaml` s
 | `SELFHOST_ADMISSION_CONCURRENCY` | 1..32 | 4 |
 | `SELFHOST_ADMISSION_SCAN_MS` | 1000..600000 | 15000 |
 | `SELFHOST_ADMISSION_MAX_ATTEMPTS` | 1..100 | 20 |
+| `SELFHOST_UPLOAD_SCAN_BATCH` (`HISTORY_UPLOAD_DIRECT` allowlist/on) | 1..2000: upload-inbox objects promoted per scan, fair across uploading origins (`o=`), oldest first | 256 |
+| `SELFHOST_UPLOAD_PROMOTE_CONCURRENCY` (`HISTORY_UPLOAD_DIRECT` allowlist/on) | 1..64: promotions in flight at once within a scan | 8 |
 | `READ_API_CANONICAL_PIN_LAGGING_POINTER` (read API, not ingest) | exactly `true`, anything else is off | off |
 
 The knobs are read only in `async` and `drain`. No new secret, role, grant, migration or bucket

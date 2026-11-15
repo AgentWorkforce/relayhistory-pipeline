@@ -79,7 +79,7 @@ export interface SelfhostAdmissionOptions {
   nowMs?: () => number;
   log?: Logger;
   /** HISTORY_UPLOAD_DIRECT allowlist|on: promote up to `batchSize` upload-inbox objects per scan. Absent: never listed. */
-  uploadInbox?: { promote: (key: string) => Promise<PromoteResult>; batchSize: number };
+  uploadInbox?: { promote: (key: string) => Promise<PromoteResult>; batchSize: number; concurrency?: number };
   /** INGEST_UPLOAD_CONSENT (upload-consent.ts): re-checked at admission, at the current policy. */
   uploadConsent?: UploadConsentConfig;
   /**
@@ -144,9 +144,11 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     const t0 = Date.now();
     const counts: Record<string, number> = {};
     const seen = new Set<string>();
-    let promoted = 0, cursor: string | undefined;
+    const due: UploadCandidate[] = [];
+    let cursor: string | undefined;
     const root = uploadInboxRoot(keyRoot);
     try {
+      // List the whole prefix first, so the choice below sees every due object, not only the first pages.
       do {
         // objectKey refuses a trailing slash: list the bare prefix and keep only slash-bounded keys
         // (as pendingAdmissions does), so a sibling `.upload-inbox-x/` is never promoted.
@@ -156,20 +158,32 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
           if (!key.startsWith(root)) continue;
           seen.add(key);
           const back = uploadBackoff.get(key);
-          if (promoted >= upload.batchSize || (back && back.notBefore > at)) continue;
-          promoted++;
-          const r = await upload.promote(key).catch((error: unknown): PromoteResult => ({ action: "retry", code: "promote_failed", error }));
-          const label = r.action === "ack" ? (r.code ?? r.outcome) : r.code;
-          counts[label] = (counts[label] ?? 0) + 1;
-          if (r.action === "ack") { uploadBackoff.delete(key); continue; }
-          const attempts = (back?.attempts ?? 0) + 1;
-          // invalid: not an upload key of this root; it is never promoted, so wait the longest.
-          uploadBackoff.set(key, { attempts, notBefore: now() + (r.action === "invalid" ? 300 : backoffSeconds(attempts)) * 1000 });
+          if (back && back.notBefore > at) continue;
+          due.push({ key, lastModifiedMs: item.lastModified.getTime(), origin: uploadOriginOf(key) });
         }
         cursor = page.nextCursor;
       } while (cursor && !stopped);
       for (const key of uploadBackoff.keys()) if (!seen.has(key)) uploadBackoff.delete(key);
-      if (promoted > 0) logger.info("session ingest upload admission", { route: "ingest.upload_admission", outcome: "ok", promoted, waiting: uploadBackoff.size, duration_ms: Date.now() - t0, ...counts });
+      const chosen = selectUploadsFairly(due, upload.batchSize);
+      const promoteOne = async (key: string): Promise<void> => {
+        const back = uploadBackoff.get(key);
+        const r = await upload.promote(key).catch((error: unknown): PromoteResult => ({ action: "retry", code: "promote_failed", error }));
+        const label = r.action === "ack" ? (r.code ?? r.outcome) : r.code;
+        counts[label] = (counts[label] ?? 0) + 1;
+        if (r.action === "ack") { uploadBackoff.delete(key); return; }
+        const attempts = (back?.attempts ?? 0) + 1;
+        // invalid: not an upload key of this root; it is never promoted, so wait the longest.
+        uploadBackoff.set(key, { attempts, notBefore: now() + (r.action === "invalid" ? 300 : backoffSeconds(attempts)) * 1000 });
+      };
+      // Bounded concurrency: `concurrency` workers share one cursor over the chosen keys.
+      let next = 0;
+      const workerCount = Math.min(Math.max(1, Math.floor(upload.concurrency ?? 1)), chosen.length);
+      await Promise.all(Array.from({ length: workerCount }, async () => {
+        while (!stopped && next < chosen.length) await promoteOne(chosen[next++]!);
+      }));
+      const promoted = chosen.length;
+      if (promoted > 0) logger.info("session ingest upload admission", { route: "ingest.upload_admission", outcome: "ok", promoted, waiting: uploadBackoff.size,
+        upload_due: due.length, upload_origins: new Set(due.map((c) => c.origin)).size, upload_results: uploadResultsField(counts), duration_ms: Date.now() - t0, ...counts });
     } catch (error) {
       const code = (error as { code?: unknown })?.code;
       logger.warn("session ingest upload admission", { route: "ingest.upload_admission", outcome: "scan_failed", error_code: typeof code === "string" && /^[A-Za-z0-9_]{1,64}$/.test(code) ? code : "scan_failed", duration_ms: Date.now() - t0 });
@@ -340,4 +354,44 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
     },
     status,
   };
+}
+
+/** A due upload-inbox object, as the scan's listing saw it. */
+export interface UploadCandidate { key: string; lastModifiedMs: number; origin: string }
+
+/** The `o=<originId>` segment of an upload key (the uploading machine), or "" when the key has none. */
+export function uploadOriginOf(key: string): string {
+  const m = /\/o=([^/]+)\//u.exec(key);
+  return m ? m[1]! : "";
+}
+
+/**
+ * Up to `limit` candidates, fair across origins and oldest first: each origin's objects in LastModified
+ * order (key order on a tie), then one from each origin in turn (origins ordered by their oldest object),
+ * so one origin with thousands of objects cannot starve the others.
+ */
+export function selectUploadsFairly(candidates: readonly UploadCandidate[], limit: number): string[] {
+  const byOrigin = new Map<string, UploadCandidate[]>();
+  for (const c of candidates) {
+    const list = byOrigin.get(c.origin);
+    if (list) list.push(c); else byOrigin.set(c.origin, [c]);
+  }
+  const order = (a: UploadCandidate, b: UploadCandidate) => a.lastModifiedMs - b.lastModifiedMs || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+  const queues = [...byOrigin.values()].map((q) => q.sort(order)).sort((a, b) => order(a[0]!, b[0]!));
+  const out: string[] = [];
+  for (let round = 0; out.length < limit; round++) {
+    let took = false;
+    for (const q of queues) {
+      if (out.length >= limit) break;
+      const c = q[round];
+      if (c) { out.push(c.key); took = true; }
+    }
+    if (!took) break;
+  }
+  return out;
+}
+
+/** Per-result counts as one `code:n,...` string. Codes are fixed identifiers (never keys or ids); anything else is dropped. */
+export function uploadResultsField(counts: Record<string, number>): string {
+  return Object.entries(counts).filter(([k]) => /^[A-Za-z0-9_]{1,64}$/u.test(k)).sort(([a], [b]) => (a < b ? -1 : 1)).map(([k, n]) => `${k}:${n}`).join(",");
 }

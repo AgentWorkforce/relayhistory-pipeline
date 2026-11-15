@@ -240,6 +240,9 @@ function decodeObject(bytes: Uint8Array): { value: unknown } | { code: UploadRef
   }
 }
 
+/** Clock skew allowed between the witness issuer and the store's LastModified when judging `exp` (5 min). */
+export const UPLOAD_WITNESS_PUT_SKEW_MS = 300_000;
+
 /**
  * Promote one upload object. Idempotent: a redelivery after a terminal status (or after the hand-off
  * landed) only finishes the upload object's removal and acks. Never throws for a store or queue fault
@@ -316,8 +319,17 @@ export async function promoteUpload(key: string, deps: PromoteUploadDeps): Promi
   // SSE (§6 upload_unencrypted, HISTORY_UPLOAD_INBOX_SSE): from the same response, before the witness.
   if (deps.config.inboxSse === "aws:kms" && object.meta.serverSideEncryption !== "aws:kms") return refuse("upload_unencrypted");
 
-  // Witness (§3): from the object's own metadata, the same response as the body.
-  const witness = verifyUploadWitness(witnessKey, object.meta.metadata?.["relay-witness"], Math.floor(now / 1000));
+  // Witness (§3): from the object's own metadata, the same response as the body. Its `exp` bounds when the
+  // PUT may happen, not when this consumer gets to it: expiry is judged at the time the store accepted the
+  // PUT (LastModified, from the same response), with UPLOAD_WITNESS_PUT_SKEW_MS of clock skew. Judging it
+  // at promotion time refused (and deleted) every upload that waited in a backlog longer than the TTL.
+  // No usable LastModified: retry, never refuse.
+  const putAtMs = object.meta.lastModified instanceof Date ? object.meta.lastModified.getTime() : Number.NaN;
+  if (!Number.isFinite(putAtMs) || putAtMs <= 0) {
+    await cancel();
+    return retry("upload_put_time_unavailable");
+  }
+  const witness = verifyUploadWitness(witnessKey, object.meta.metadata?.["relay-witness"], Math.floor((Math.min(putAtMs, now) - UPLOAD_WITNESS_PUT_SKEW_MS) / 1000));
   if (isUploadRefusal(witness)) return refuse(witness.code);
   const bound = bindUploadToWitness(parts, witness);
   if (isUploadRefusal(bound)) return refuse(bound.code);
