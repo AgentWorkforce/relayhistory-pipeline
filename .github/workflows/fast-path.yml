@@ -1,21 +1,33 @@
 # Fast path: run the ci.yml checks and publish the services image on Blacksmith
-# runners, outside the shared GitHub-hosted queue. Anyone with write access
-# (people or agents) may start it; nothing runs until Khaliq approves the
-# fast-path environment.
+# runners, outside the shared GitHub-hosted queue. Only Khaliq may dispatch it
+# (publish-image.yml's dispatcher restriction), and nothing runs until he
+# approves the fast-path environment.
 #
 # Checks (the lanes the ci.yml `checks` gate requires, plus the amp image and
 # session read Worker checks): the four unit-test shards, unit-tests-aux,
 # aws-hardening-mutations, selfhost-e2e, amp-transport-image and
-# session-read-worker, all at the SHA resolved once from `ref`.
+# session-read-worker, all at the SHA resolved once from `ref`. Any ref may be
+# checked; only a commit on main is published.
 #
-# Publishes: a linux/amd64+linux/arm64 build of docker/services.Dockerfile to
-# ghcr.io/agentworkforce/sessions-pipeline tagged fast-<sha> only, with SBOM and
-# max-mode provenance. It never pushes or moves sha-<sha>, :latest or any
-# release tag, and it carries no reviewed-source attestation: it is not a
-# reviewed release and does not replace publish-image.yml. The ECR and Artifact
-# Registry copies are not pushed: those publishes run in the image-publish
-# environment with a pinned publisher identity and sha-tag-only repositories.
-# Pin the digest printed in the run summary.
+# Publishes, mirroring publish-image.yml: from a main dispatch, in the
+# image-publish environment (its own rules apply), a linux/amd64+linux/arm64
+# OCI index of docker/services.Dockerfile with SBOM and max-mode provenance,
+# signed with a keyless Sigstore build-provenance attestation that names this
+# workflow and the built commit, verified, then copied with skopeo to every
+# repository publish-image.yml copies to (read from
+# scripts/copy-reviewed-image.py) as fast-<sha> only, and recorded in a signed
+# receipt artifact. Guards kept from publish-image.yml: Khaliq as actor and
+# triggering actor, dispatch from main, trusted scripts from the workflow
+# commit, the source commit on current main (verifyAncestry, rechecked before
+# the registry copy), the index digest checked before signing and after the
+# copy, and credentials only in sealed memory. Not kept: the typed
+# confirmation (the fast-path approval replaces it), the "successful main CI
+# run" check (the fast path runs those lanes itself instead of waiting on the
+# hosted queue), and the reviewed-source attestation (a fast build is not a
+# reviewed release). It never pushes or moves sha-<sha>, :latest or a release
+# tag, and refuses an existing fast-<sha>. The ECR and Artifact Registry
+# publishes are separate workflows with their own pinned publisher identities
+# and are not part of this path. Pin the digest printed in the run summary.
 name: fast-path
 run-name: fast-path ${{ inputs.ref }} (${{ inputs.reason }})
 on:
@@ -39,19 +51,29 @@ env:
   IMAGE: ghcr.io/agentworkforce/sessions-pipeline
 jobs:
   approve:
+    if: ${{ github.actor == 'khaliqgant' && github.triggering_actor == 'khaliqgant' }}
     environment: fast-path
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       sha: ${{ steps.sha.outputs.sha }}
+      on_main: ${{ steps.sha.outputs.on_main }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
+          fetch-depth: 0
           submodules: false
           persist-credentials: false
       - id: sha
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse HEAD)
+          on_main=false
+          if git merge-base --is-ancestor "$sha" origin/main; then on_main=true; fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "on_main=$on_main" >> "$GITHUB_OUTPUT"
+          echo "fast path for $sha (on main: $on_main)" | tee -a "$GITHUB_STEP_SUMMARY"
 
   unit-tests-shard:
     needs: approve
@@ -281,49 +303,186 @@ jobs:
         working-directory: packages/session-read-worker
         run: bunx wrangler deploy --dry-run --outdir "$RUNNER_TEMP/session-read-worker-dist"
 
-  image:
+
+  publish:
     needs: [approve, unit-tests-shard, unit-tests-aux, aws-hardening-mutations, selfhost-e2e, amp-transport-image, session-read-worker]
+    # publish-image.yml's dispatcher restriction, repeated here so a re-run of
+    # only this job cannot skip it; only a commit already on main is published.
+    if: ${{ needs.approve.outputs.on_main == 'true' && github.ref == 'refs/heads/main' && github.actor == 'khaliqgant' && github.triggering_actor == 'khaliqgant' }}
+    environment: image-publish
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 40
     permissions:
       contents: read
       packages: write
+      id-token: write
+    env:
+      SOURCE_SHA: ${{ needs.approve.outputs.sha }}
+      WORKFLOW_SHA: ${{ github.sha }}
     steps:
+      # Keep the verifier and copy helper from the trusted workflow commit, not the image source.
       - uses: actions/checkout@v4
         with:
-          submodules: false
-          ref: ${{ needs.approve.outputs.sha }}
+          ref: ${{ github.sha }}
+          path: .publisher
           persist-credentials: false
+          submodules: false
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.approve.outputs.sha }}
+          path: .source
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Require the source commit on current main
+        working-directory: .source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          node --input-type=module <<'JS'
+          const { verifyAncestry } = await import(process.env.GITHUB_WORKSPACE + "/.publisher/scripts/check-image-release.mjs");
+          verifyAncestry(process.env.SOURCE_SHA);
+          console.log("source " + process.env.SOURCE_SHA + " is on current main");
+          JS
+      - name: Install OCI copy tool
+        run: sudo apt-get update && sudo apt-get install --yes skopeo
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - id: build
+      - name: Build without registry writes (amd64 + arm64)
+        id: build
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: docker/services.Dockerfile
+          context: .source
+          file: .source/docker/services.Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: false
+          outputs: type=oci,dest=${{ runner.temp }}/services.oci.tar
           tags: ${{ env.IMAGE }}:fast-${{ needs.approve.outputs.sha }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.approve.outputs.sha }}
           provenance: mode=max
           sbom: true
-      - name: Summary
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
+      - name: Sign and verify the exact OCI index before registry writes
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          tar -xOf "$RUNNER_TEMP/services.oci.tar" "blobs/sha256/${IMAGE_DIGEST#sha256:}" > "$RUNNER_TEMP/services-index.json"
+          test "sha256:$(sha256sum "$RUNNER_TEMP/services-index.json" | cut -d' ' -f1)" = "$IMAGE_DIGEST"
+          repo_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          workflow="$repo_url/.github/workflows/fast-path.yml"
+          jq -n --arg repo "$repo_url" --arg src "$SOURCE_SHA" --arg wf "$workflow@$WORKFLOW_SHA" \
+            --arg inv "$repo_url/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT" --arg image "$IMAGE" '{
+              buildDefinition: {
+                buildType: "https://agentrelay.com/builders/services-image-fast-path/v1",
+                externalParameters: { repository: $repo, source_sha: $src, image: $image, tag: ("fast-" + $src) },
+                resolvedDependencies: [{ uri: ("git+" + $repo), digest: { gitCommit: $src } }]
+              },
+              runDetails: { builder: { id: $wf }, metadata: { invocationId: $inv } }
+            }' > "$RUNNER_TEMP/build-predicate.json"
+          cosign attest-blob --yes --type https://slsa.dev/provenance/v1 \
+            --predicate "$RUNNER_TEMP/build-predicate.json" \
+            --bundle "$RUNNER_TEMP/build-provenance.sigstore.json" "$RUNNER_TEMP/services-index.json"
+          cosign verify-blob-attestation --bundle "$RUNNER_TEMP/build-provenance.sigstore.json" \
+            --type https://slsa.dev/provenance/v1 \
+            --certificate-identity "$workflow@refs/heads/main" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            --certificate-github-workflow-ref refs/heads/main \
+            --certificate-github-workflow-sha "$WORKFLOW_SHA" \
+            --certificate-github-workflow-trigger workflow_dispatch \
+            "$RUNNER_TEMP/services-index.json"
+      - name: Recheck the source, then copy the signed index as fast-<sha> to every publish-image.yml repository
+        working-directory: .source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'JS'
+          const { verifyAncestry } = await import(process.env.GITHUB_WORKSPACE + "/.publisher/scripts/check-image-release.mjs");
+          verifyAncestry(process.env.SOURCE_SHA);
+          console.log("source " + process.env.SOURCE_SHA + " is on current main");
+          JS
+          python3 -I - "$GITHUB_WORKSPACE/.publisher/scripts/copy-reviewed-image.py" <<'PY'
+          import hashlib, importlib.util, os, re, subprocess, sys
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location("copy_reviewed_image", sys.argv[1])
+          helper = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(helper)
+          env = os.environ
+          source, digest, actor, token = (env.get(k, "") for k in ["SOURCE_SHA", "IMAGE_DIGEST", "GITHUB_ACTOR", "GH_TOKEN"])
+          root = Path(env.get("RUNNER_TEMP", "."))
+          if not re.fullmatch(r"[a-f0-9]{40}", source) or not re.fullmatch(r"sha256:[a-f0-9]{64}", digest):
+              sys.exit("Exact source and signed digest required")
+          if actor != "khaliqgant" or not token or not root.is_absolute() or not (root / "services.oci.tar").is_file():
+              sys.exit("Approved actor, credential and OCI archive required")
+          allowed = {"PATH", "HOME", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTP_PROXY",
+                     "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"}
+          child_env = {key: value for key, value in env.items() if key in allowed}
+          with helper.memory_auth(actor, token) as (descriptor, path):
+              options = {"pass_fds": (descriptor,), "env": child_env, "stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
+              targets = [f"docker://{repository}:fast-{source}" for repository in helper.REPOSITORIES]
+              for target in targets:
+                  probe = subprocess.run(["skopeo", "inspect", "--raw", "--authfile", path, target], **options)
+                  if probe.returncode == 0:
+                      sys.exit(f"repository {targets.index(target) + 1} already has fast-{source}; pin its digest instead")
+                  if not re.search(rb"manifest unknown|name unknown|not found", probe.stderr, re.I):
+                      sys.exit(f"could not prove fast-{source} is absent in repository {targets.index(target) + 1}; failing closed")
+              for target in targets:
+                  subprocess.run(["skopeo", "copy", "--all", "--preserve-digests", "--authfile", path,
+                                  f"oci-archive:{root / 'services.oci.tar'}", target], check=True, **options)
+                  result = subprocess.run(["skopeo", "inspect", "--raw", "--authfile", path, target], check=True, **options)
+                  if "sha256:" + hashlib.sha256(result.stdout).hexdigest() != digest:
+                      sys.exit("Registry index does not match the signed digest")
+          print(f"Copied and verified the signed index to {len(targets)} repositories as fast-{source}")
+          PY
+      - name: Record the fast-path receipt
         env:
           REF: ${{ inputs.ref }}
-          SHA: ${{ needs.approve.outputs.sha }}
           REASON: ${{ inputs.reason }}
-          DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
+          set -euo pipefail
+          jq -n --arg image "$IMAGE@$IMAGE_DIGEST" --arg src "$SOURCE_SHA" --arg wf "$WORKFLOW_SHA" \
+            --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" --arg tag "fast-$SOURCE_SHA" '{
+              repository: "https://github.com/AgentWorkforce/relayhistory-pipeline", workflow: "fast-path.yml",
+              image: $image, tag: $tag, source_sha: $src, workflow_sha: $wf, source_ref: "refs/heads/main",
+              attestation_backend: "sigstore", reviewed_release: false, publish_run_id: $run, publish_run_attempt: $attempt
+            }' > "$RUNNER_TEMP/fast-path-receipt.json"
           {
             echo "### sessions-pipeline fast path"
-            echo "- ref: \`$REF\` at \`$SHA\`"
+            echo "- ref: \`$REF\` at \`$SOURCE_SHA\` (workflow \`$WORKFLOW_SHA\`)"
             echo "- reason: $REASON"
-            echo "- image: \`${IMAGE}@${DIGEST}\` (tag fast-$SHA; not a reviewed release)"
+            echo "- image: \`$IMAGE@$IMAGE_DIGEST\`, tag fast-$SOURCE_SHA; the same signed index is also in the legacy repository publish-image.yml copies to"
+            echo "- signed build provenance names fast-path.yml; not a reviewed release (no reviewed-source attestation)"
           } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fast-path-receipt-${{ needs.approve.outputs.sha }}
+          path: |
+            ${{ runner.temp }}/fast-path-receipt.json
+            ${{ runner.temp }}/services-index.json
+            ${{ runner.temp }}/build-provenance.sigstore.json
+          if-no-files-found: error
+
+  checks-only:
+    needs: approve
+    if: ${{ needs.approve.outputs.on_main != 'true' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 5
+    steps:
+      - name: Summary
+        env:
+          SHA: ${{ needs.approve.outputs.sha }}
+        run: |
+          echo "- $SHA is not on main, so checks only and nothing published" >> "$GITHUB_STEP_SUMMARY"
