@@ -120,7 +120,8 @@ the sorted list).
   began. Each org's cutover takes its own scoped backfill-execute after its stop.
 - A scoped drain-execute WITHOUT `full_backfill_run` binds its backfill with the 3 h freshness check only: no
   fingerprint and no proof that the backfill began after the stop. An unscoped backfill is accepted there too. Keeping
-  that safe is operator order: bind only a backfill that began after the scope's stop.
+  that safe is the operator's order: bind only a backfill that began after the scope's stop. A follow-up gate change
+  will require the drain's BACKFILL and FULL receipts to carry exactly the drain's scope.
 
 ## Gates
 
