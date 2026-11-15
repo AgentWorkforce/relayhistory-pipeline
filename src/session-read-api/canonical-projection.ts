@@ -16,6 +16,7 @@ import {
   type RelayhistoryStreamRecord,
 } from "../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 import { PipelineError } from "../../packages/pipeline/src/lib/pipeline/errors.ts";
+import { messageOrigin, messageSubagent } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 import {
   chunkKeys,
   parseSessionKey,
@@ -238,6 +239,11 @@ export function projectedToNeonRow(
     row.task_ref && typeof row.task_ref === "object"
       ? (row.task_ref as Json)
       : {};
+  // Who wrote the event (message-origin.ts). The parity projection leaves both
+  // NULL or as relayhistory sent them; a value it set is kept.
+  const record = row.record && typeof row.record === "object" ? (row.record as { payload?: unknown }) : null;
+  const payload = record?.payload && typeof record.payload === "object" ? (record.payload as Json) : null;
+  const kind = String(row.kind);
   const base: Omit<NeonEventRow, "fingerprint"> = {
     org_id: scope.orgId,
     workspace_id: scope.workspaceId,
@@ -246,12 +252,12 @@ export function projectedToNeonRow(
     source: String(row.source),
     session_id: String(row.session_id),
     event_id: String(row.event_id),
-    kind: String(row.kind),
-    type: str(row.type) ?? String(row.kind),
+    kind,
+    type: str(row.type) ?? kind,
     ts_text: String(row.ts),
-    actor_name: str(row.actor_name),
+    actor_name: str(row.actor_name) ?? messageOrigin(kind, payload),
     actor_role: str(row.actor_role),
-    subagent_id: str(row.subagent_id),
+    subagent_id: str(row.subagent_id) ?? messageSubagent(kind, payload),
     project_id: str(row.project_id),
     task_title: str(row.task_title),
     task_ref: JSON.stringify(taskRef),

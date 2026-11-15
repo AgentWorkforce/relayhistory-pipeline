@@ -93,6 +93,7 @@ import { clickhouseOutputBackend, type OutputBackend } from "./output-backend.ts
 import { clickhouseDigestBackend, type DigestBackend } from "./digest-backend.ts";
 import { COORDINATION_EVIDENCE_LOOKBACK_MS, clickhouseCoordinationBackend, type CoordinationBackend } from "./coordination-backend.ts";
 import { detectCoordination } from "../../packages/coordination-detect/src/index.ts";
+import { MESSAGE_ORIGINS, isMessageOrigin, type MessageOrigin } from "../../packages/pipeline/src/lib/pipeline/message-origin.ts";
 import { READ_SETTINGS } from "./queries.ts";
 import { DigestInputError, resolveDayWindow } from "./day-window.ts";
 import { DIGEST_OMITTED_FIELDS, DigestDirectoryUnavailable, computeStatsHash } from "./digest-query.ts";
@@ -423,6 +424,17 @@ class HttpError extends Error {
 const unsupported = (reason: string, details: readonly string[] = []) =>
   new HttpError(501, "unsupported_by_backend", `not served by this backend: ${reason}`, reason, details);
 const bad = (message: string) => new HttpError(400, "bad_request", message);
+
+/**
+ * `origin` on /v1/events: only events this label wrote (message-origin.ts), e.g.
+ * `origin=human` for human-typed messages without agent-to-agent, subagent,
+ * peer or task-notification traffic. Absent or empty: no filter.
+ */
+function eventOrigin(raw: string | undefined): MessageOrigin | undefined {
+  if (raw === undefined || raw === "") return undefined;
+  if (!isMessageOrigin(raw)) throw bad(`origin must be one of ${MESSAGE_ORIGINS.join(", ")}`);
+  return raw;
+}
 
 /** relayhistory clampLimit: truncate, clamp to [1, max]; junk gives the default. */
 export function clampLimit(raw: string | undefined, fallback: number, max: number): number {
@@ -858,7 +870,7 @@ export function createReadApi(deps: ReadApiDeps) {
       const identity = c.get("identity");
       attestWorkspace(c, identity);
       rejectUnsupported(c, deps.eventMessageIds ? ["includeMessageId"] : []);
-      for (const p of ["q", "since", "until", "kind", "session", "project"]) if (c.req.queries(p)?.length) throw unsupported(`param_${p}`);
+      for (const p of ["q", "since", "until", "kind", "session", "project", "origin"]) if (c.req.queries(p)?.length) throw unsupported(`param_${p}`);
       const includeMessageId = deps.eventMessageIds !== undefined && single(c, "includeMessageId") === "true";
       const sessionId = c.req.param("sessionId");
       if (!sessionId || sessionId.length > MAX_ID_CHARS) throw bad("sessionId is not valid");
@@ -960,12 +972,16 @@ export function createReadApi(deps: ReadApiDeps) {
       const source = single(c, "source") || undefined;
       const project = single(c, "project") || undefined;
       const kind = single(c, "kind") || undefined;
+      const origin = eventOrigin(single(c, "origin"));
+      // A backend that cannot filter by who wrote an event must not answer a
+      // human-only search with agent traffic.
+      if (origin !== undefined && deps.adapter && !deps.adapter.index.capabilities().filters.includes("actor")) throw unsupported("param_origin");
       const order: "asc" | "desc" = single(c, "order") === "asc" ? "asc" : "desc";
       const sinceMs = parseTime(single(c, "since"), "since");
       const untilMs = parseTime(single(c, "until"), "until");
       const maxContent = positiveInt(single(c, "maxContent"));
       const cursor = decodeCursor(single(c, "cursor"));
-      const base: EventQuery = { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId, source, kind, projectId: project, q, sinceMs, untilMs, order, limit: 0, maxContent, cursor };
+      const base: EventQuery = { orgId: identity.orgId, workspaceId: identity.workspaceId, sessionId, source, kind, projectId: project, ...(origin === undefined ? {} : { actorName: origin }), q, sinceMs, untilMs, order, limit: 0, maxContent, cursor };
 
       if (sessionId !== undefined) {
         base.limit = clampLimit(single(c, "limit"), EVENTS_DEFAULT_LIMIT, EVENTS_MAX_LIMIT);

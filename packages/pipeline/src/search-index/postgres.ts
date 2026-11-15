@@ -268,7 +268,7 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
 
   const capabilities: SearchIndexCapabilities = Object.freeze({
     backend: "postgres",
-    filters: Object.freeze(["session", "source", "kind", "project", "since", "until", "exclude_session"] as const),
+    filters: Object.freeze(["session", "source", "kind", "project", "since", "until", "exclude_session", "actor"] as const),
     minIndexedQueryChars: 3,
     readAfterWrite: "immediate",
     synchronousErasure: true,
@@ -505,6 +505,7 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
       if (query.source !== undefined) where.push(`source = ${bind(query.source)}`);
       if (query.kind !== undefined) where.push(`kind = ${bind(query.kind)}`);
       if (query.projectId !== undefined) where.push(`project_id = ${bind(query.projectId)}`);
+      if (query.actorName !== undefined) where.push(`actor_name = ${bind(query.actorName)}`);
       if (query.sinceMs !== undefined) where.push(`ts_ms >= ${bind(query.sinceMs)}`);
       if (query.untilMs !== undefined) where.push(`ts_ms <= ${bind(query.untilMs)}`);
       if (query.q !== undefined) {

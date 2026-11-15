@@ -57,6 +57,8 @@ export interface EventQuery {
   source?: string;
   kind?: string;
   projectId?: string;
+  /** Exact actor_name: who wrote the event (`origin=` on /v1/events, message-origin.ts). */
+  actorName?: string;
   q?: string;
   /** Inclusive lower bound, epoch ms. */
   sinceMs?: number;
@@ -210,6 +212,10 @@ export function buildCandidateQuery(database: string, input: EventQuery, origin:
     where.push("project_id = {project:String}");
     params.project = input.projectId;
   }
+  if (input.actorName !== undefined) {
+    where.push("actor_name = {actor:String}");
+    params.actor = input.actorName;
+  }
   const table = qualifiedTable(database);
   const ord = orderBy(input.order);
   const select = `SELECT ts, session_id, source, machine_id, kind, event_id FROM ${table}`;
@@ -272,6 +278,10 @@ export function buildNewestQuery(database: string, input: EventQuery, candidates
   if (input.projectId !== undefined) {
     params.project = input.projectId;
     value.push("project_id = {project:String}");
+  }
+  if (input.actorName !== undefined) {
+    params.actor = input.actorName;
+    value.push("actor_name = {actor:String}");
   }
   let contentExpr = "content";
   let sizeExpr = "content_bytes";
