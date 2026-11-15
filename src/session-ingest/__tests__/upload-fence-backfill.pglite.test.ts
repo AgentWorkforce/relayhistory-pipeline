@@ -155,7 +155,7 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
       expect(tx[0]).toBe("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
       expect(tx[1]).toBe("SHOW transaction_read_only");
       expect(tx.at(-1)).toBe("ROLLBACK");
-      // BEGIN, SHOW, SET LOCAL timeout, [a scoped slot window's two plan pins], one read (two for a page's controls:
+      // BEGIN, SHOW, SET LOCAL timeout, [a slot window's two plan pins], one read (two for a page's controls:
       // deletions and resets, one snapshot; two for a slot window: heap size and rows), ROLLBACK. A read is a SELECT
       // or a users skip-scan (WITH RECURSIVE ... SELECT): nothing that writes.
       expect(tx[2]).toMatch(/^SET LOCAL statement_timeout = \d+$/);
@@ -314,6 +314,23 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     expect(await entryOf(store, A, "origin-1", "w0001")).toEqual([2, null, hex("1"), sessionKeyHash("claude", "sess-1"), 0, 0]);
     expect(await fenceOf(store, C)).toBeNull();
     await expect(run(store, { orgs: ["org-a"], slotWindowBlocks: 0 })).rejects.toThrow("backfill_slot_window_invalid");
+  });
+
+  test("unscoped: lazy slots are read in heap block windows too, every slot of every org exactly once", async () => {
+    const store = scratch();
+    for (let i = 0; i < 150; i++) {
+      await slot(i % 3 === 0 ? C : A, "origin-1", `u${String(i).padStart(4, "0")}`, i % 3 === 0 ? C.userId : A.userId, "claude", `sess-${i}`, i + 1, hex(String(i % 10)));
+    }
+    const blocks = Number((await db.query<{ n: number }>("SELECT (pg_relation_size('sessions.ingest_lazy_native_slots') / current_setting('block_size')::bigint)::int AS n")).rows[0]!.n);
+    expect(blocks).toBeGreaterThan(2);
+    const log: string[] = [];
+    const summary = await run(store, { slotWindowBlocks: 1 }, log);
+    expect(summary.revisions).toMatchObject({ slot_rows: 150, slots_empty: 0, merged: 150, invalid: 0, failed: 0 });
+    expect(summary.sections.revisions).toBe("complete");
+    expect(log.filter((l) => l.includes("ctid >= $2::tid")).length).toBe(blocks);
+    expect(log.some((l) => l.includes("key_sha256 > $2::text"))).toBe(false);
+    expect(await entryOf(store, A, "origin-1", "u0001")).toEqual([2, null, hex("1"), sessionKeyHash("claude", "sess-1"), 0, 0]);
+    expect(await entryOf(store, C, "origin-1", "u0003")).toEqual([4, null, hex("3"), sessionKeyHash("claude", "sess-3"), 0, 0]);
   });
 
   /** A store that counts puts per key and can fail getObject on a key from its nth call (undefined = pass). */

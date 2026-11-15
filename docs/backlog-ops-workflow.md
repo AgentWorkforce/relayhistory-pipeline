@@ -113,9 +113,14 @@ the sorted list).
 - An execute refuses unless its dry run has the same scope. A bound backfill or export must have the same scope or
   be unscoped. A receipt from before scoping counts as unscoped. So change the secret only between complete
   sequences, and set it on both environments to the same value.
-- A scoped backfill reads `ingest_lazy_native_slots` in heap block windows (one sequential pass) instead of walking
-  the primary key, which fetched every slot at random to test its org. A slot rewritten during the pass can be
+- Every backfill, scoped or unscoped, reads `ingest_lazy_native_slots` in heap block windows (one sequential pass)
+  instead of walking the primary key, which fetched every slot at random. A slot rewritten during the pass can be
   missed, so run a scoped backfill-execute after the scope's HTTP admission stop (decision 0005's cutover order).
+- An unscoped backfill run while orgs still admit (a pre-warm) certifies no org that was not stopped before it
+  began. Each org's cutover takes its own scoped backfill-execute after its stop.
+- A scoped drain-execute WITHOUT `full_backfill_run` binds its backfill with the 3 h freshness check only: no
+  fingerprint and no proof that the backfill began after the stop. An unscoped backfill is accepted there too. Keeping
+  that safe is operator order: bind only a backfill that began after the scope's stop.
 
 ## Gates
 

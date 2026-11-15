@@ -32,7 +32,7 @@
  *
  * SQL (finding 8): no long snapshot, and only small per-run sets in memory (one entry per user, one per owned
  * session). Every page is its own short `BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY` transaction, checked
- * with `SHOW transaction_read_only`, always ended by ROLLBACK, one at a time on the connection; SELECTs only, keyset-paged in a stable order, optionally scoped to orgs. Fences are read from S3 per page.
+ * with `SHOW transaction_read_only`, always ended by ROLLBACK, one at a time on the connection; SELECTs only, keyset-paged in a stable order (the lazy slots: heap block windows), optionally scoped to orgs. Fences are read from S3 per page.
  *
  * Fail closed: an unreadable fence is never rewritten; a user with any unrepresentable row gets no fence. Each
  * section reports `complete` only when nothing was skipped for want of a fence, needed review, was invalid or failed.
@@ -69,7 +69,7 @@ export interface BackfillOptions {
   rowPageSize?: number;
   concurrency?: number;
   statementTimeoutMs?: number;
-  /** Heap blocks per scoped slot window (default SLOT_WINDOW_BLOCKS); tests use a small one to cross windows. */
+  /** Heap blocks per slot window, scoped or not (default SLOT_WINDOW_BLOCKS); tests use a small one to cross windows. */
   slotWindowBlocks?: number;
   /**
    * Revision entries buffered across pages and windows before one merge pass (default MERGE_BUFFER_ENTRIES): each
