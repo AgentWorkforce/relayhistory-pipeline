@@ -561,13 +561,21 @@ async function streamedReconcile(
   fromMs: number,
   at: Date,
 ): Promise<SearchIndexResult> {
+  // The consumer pool ends a transaction idle for 60 s (lambda.ts). Passes 1 to 3 read S3, and
+  // the index scan and deletes run on the search backend, without querying `tx`: keep it busy
+  // well inside that, at most every STREAM_KEEPALIVE_MS, or now when `force`d.
+  const everyMs = deps.streamKeepaliveMs ?? STREAM_KEEPALIVE_MS;
+  let pinged = Number.NEGATIVE_INFINITY;
+  const keepalive = async (force = false): Promise<void> => {
+    if (!force && Date.now() - pinged < everyMs) return;
+    await tx.query("SELECT 1 AS stream_keepalive");
+    pinged = Date.now();
+  };
   const read = await streamCanonicalScope(
     scope, admitted,
     {
       readerMaxRuleset: deps.readerMaxRuleset, store: deps.store, prefixFor: deps.prefixFor.bind(deps), decompress: deps.decompress ?? defaultDecompress,
-      // The consumer pool ends a transaction idle for 60 s (lambda.ts): passes 1 to 3 read S3
-      // without a query, so keep it busy well inside that.
-      keepalive: { everyMs: deps.streamKeepaliveMs ?? STREAM_KEEPALIVE_MS, ping: async () => void (await tx.query("SELECT 1 AS stream_keepalive")) },
+      keepalive: { everyMs: 0, ping: () => keepalive() }, // throttled here, shared with the scan and deletes
     },
     budget, version, fromMs,
   );
@@ -580,7 +588,10 @@ async function streamedReconcile(
   if (!read.complete || read.directorySessionId !== pointerSnapshot.canonicalId || read.events === null)
     return owing(read.reasons.length ? read.reasons : ["canonical_metadata_incomplete"], read.partial);
 
+  // A large scan may take a while: start it with a fresh transaction and ping when it ends.
+  await keepalive(true);
   const scan = await io.scan(scope, pointerSnapshot.canonicalId, fromMs, limits.maxRows);
+  await keepalive(true);
   const truncated = scan.truncated;
   const existing = new Map<string, ScopeIdentity[]>();
   for (const r of scan.rows) {
@@ -625,7 +636,11 @@ async function streamedReconcile(
           deletes.push(c);
       }
     }
-    deletedCount = await io.remove(scope, deletes);
+    // In insert-sized batches, keeping the transaction busy between them.
+    for (let i = 0; i < deletes.length; i += limits.insertBatch) {
+      await keepalive();
+      deletedCount += await io.remove(scope, deletes.slice(i, i + limits.insertBatch));
+    }
     const directoryKey = { orgId: scope.orgId, workspaceId: scope.workspaceId, harness: scope.harness, sessionId: pointerSnapshot.canonicalId };
     const written = await (deps.writeEvents ?? writeDirectoryEvents)(tx, directoryKey, { sourceSessionId: scope.sessionId, expectedEpoch: pointerSnapshot.epoch, sources: read.sources, events: read.events });
     if (written.written) await (deps.writeCatalog ?? directoryCatalogWriter(deps.desktopCatalog === true))(tx, directoryKey, read.catalog, { expectedEpoch: pointerSnapshot.epoch, sourceSessionId: scope.sessionId });
@@ -661,9 +676,11 @@ async function streamedReconcile(
  * at the large-read profile (2 GiB / 2,000,000); set, it must lie between that default and
  * the cap. A scope whose declared size times four exceeds a budget is never streamed: with
  * both defaults that is every scope past the whole-read bound (searchIndexStreamDefaultsWarning
- * logs it at startup), so an operator raises both budgets (at the caps: scopes up to 512 MiB
- * and 500,000 records), sizing the pod for one chunk plus about 1 KB of keys per record.
- * Refused with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true: the facts are built from a whole read. Errors name the variable and its range, never the value.
+ * logs it at startup). A scope streams only when its size times four fits both budgets, so
+ * an operator raises the budget(s) its size exceeds, usually both (at the caps: scopes up to
+ * 512 MiB and 500,000 records), sizing the pod for one chunk plus about 1 KB of keys per
+ * record. Refused with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true: the facts are built from a
+ * whole read. Errors name the variable and its range, never the value.
  */
 export function searchIndexStreamFromEnv(
   env: Record<string, string | undefined>,
@@ -709,7 +726,8 @@ export function searchIndexStreamDefaults(limits: Partial<SearchIndexLimits>): S
  * times its size within each budget: at the defaults (four whole reads, or the cap once a
  * bound reaches 512 MiB / 500,000) no scope fits, so none streams; one whose chunks do not
  * declare their record counts is refused only after a full first pass under the scope's
- * locks. Raise SEARCH_INDEX_STREAM_MAX_READ_BYTES and _EVENTS toward the cap.
+ * locks. Raise SEARCH_INDEX_STREAM_MAX_READ_BYTES and/or _EVENTS (whichever the scopes'
+ * sizes exceed, usually both) toward the cap.
  */
 export function searchIndexStreamDefaultsWarning(
   stream: StreamReadLimits | undefined,

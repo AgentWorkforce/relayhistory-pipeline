@@ -207,10 +207,53 @@ test("streaming on: the stream keeps its transaction busy between the reads of e
   expect(seen.length).toBe(4 * chunks);
   // Every chunk read after the first follows a ping: no pass, and no gap between passes, is quiet.
   for (let i = 1; i < seen.length; i++) expect({ i, more: seen[i]! > seen[i - 1]! }).toEqual({ i, more: true });
-  // Throttled: with a long interval only the first record pings.
+  // Throttled: with a long interval only the first record pings, plus the two forced around the index scan.
   const quiet = await backend(x, { limits: TINY, stream: UNLIMITED, streamKeepaliveMs: 1e12 });
   expect(await indexSearchScope(SCOPE, quiet.deps)).toMatchObject({ complete: true });
-  expect(quiet.sb.calls.filter((c) => c === "SELECT 1 AS stream_keepalive").length).toBe(1);
+  expect(quiet.sb.calls.filter((c) => c === "SELECT 1 AS stream_keepalive").length).toBe(3);
+}, 60_000);
+
+const PING = "SELECT 1 AS stream_keepalive";
+/** Logs the backend's scans and deletes into the transaction's call log, to see what runs between pings. */
+function logBackend(b: Awaited<ReturnType<typeof backend>>) {
+  const index = b.adapter.index;
+  const scan = index.scanFingerprints.bind(index);
+  const remove = index.deleteEvents.bind(index);
+  index.scanFingerprints = (async (...args: Parameters<typeof scan>) => { b.sb.calls.push("SCAN"); return scan(...args); }) as typeof scan;
+  index.deleteEvents = (async (...args: Parameters<typeof remove>) => { b.sb.calls.push("DELETE"); return remove(...args); }) as typeof remove;
+}
+
+test("streaming on: the transaction is pinged around the index scan and between delete batches", async () => {
+  const x = await scope(generate(32));
+  const b = await backend(x, { limits: { ...TINY, insertBatch: 1 }, stream: UNLIMITED, streamKeepaliveMs: 1e12 });
+  expect(await indexSearchScope(SCOPE, b.deps)).toMatchObject({ complete: true });
+  const before = await b.scan();
+  const [first] = await b.docs();
+  const stale = [1, 2, 3].map((n) => ({ ...first!, eventId: `${first!.eventId}-retracted-${n}`, fingerprint: "stale", version: NOW.getTime() - 1, taskRefId: "", deliveryRecordId: "" }));
+  await b.adapter.index.upsert(stale);
+  logBackend(b);
+  b.sb.calls.length = 0;
+  // A long interval: the pings around the scan are forced, the throttled ones between deletes are not due.
+  expect(await indexSearchScope(SCOPE, b.deps)).toMatchObject({ complete: true, deleted: 3 });
+  const log = b.sb.calls.filter((c) => c === PING || c === "SCAN" || c === "DELETE");
+  expect(log).toEqual([PING, PING, "SCAN", PING, "DELETE", "DELETE", "DELETE"]);
+  expect(await b.scan()).toEqual(before);
+  // Due every time: each delete batch follows a ping.
+  await b.adapter.index.upsert(stale);
+  b.sb.calls.length = 0;
+  expect(await indexSearchScope(SCOPE, { ...b.deps, streamKeepaliveMs: 0 })).toMatchObject({ complete: true, deleted: 3 });
+  const tail = b.sb.calls.filter((c) => c === PING || c === "SCAN" || c === "DELETE");
+  expect(tail.slice(tail.indexOf("SCAN") - 1)).toEqual([PING, "SCAN", PING, PING, "DELETE", PING, "DELETE", PING, "DELETE"]);
+  expect(await b.scan()).toEqual(before);
+}, 60_000);
+
+test("streaming on: a store error while regenerating surfaces as itself, not as a read code", async () => {
+  const x = await scope(generate(31));
+  const b = await backend(x, { limits: { ...TINY, insertBatch: 1 }, stream: UNLIMITED });
+  const down = new Error("index store unavailable");
+  b.adapter.index.upsert = async () => { throw down; };
+  await expect(indexSearchScope(SCOPE, b.deps)).rejects.toBe(down);
+  expect(b.recorded).toEqual([]);
 }, 60_000);
 
 test("streaming on: a failed keepalive ends the pass with its error, not a read code", async () => {

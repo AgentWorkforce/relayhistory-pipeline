@@ -499,9 +499,10 @@ reads per chunk for flagged sessions, memory bounded by one chunk plus per-recor
 rows, deletes, directory events, catalog and search state as the whole read would with unlimited limits, and
 regenerates rows only for the identities the index lacks or holds stale, so an up-to-date session costs three
 passes. `SEARCH_INDEX_MAX_ROWS` still bounds the index scan (`search_index_truncated`). The stream runs inside the
-scope's index transaction under its advisory lock, so that lock is held for the whole read; between reads the
-stream sends `SELECT 1` on that transaction at most every 20 seconds, so a long pass does not trip the consumer
-pool's 60-second idle-in-transaction timeout.
+scope's index transaction under its advisory lock, so that lock is held for the whole read; between reads, and
+between delete batches, the stream sends `SELECT 1` on that transaction at most every 20 seconds, and always just
+before and after the index scan, so a long pass does not trip the consumer pool's 60-second idle-in-transaction
+timeout.
 
 Two budgets bound it, each summed over every pass of one scope: `SEARCH_INDEX_STREAM_MAX_READ_BYTES` (a whole
 number of bytes, optional `MiB` / `GiB` suffix) and `SEARCH_INDEX_STREAM_MAX_READ_EVENTS` (records). Unset, each
@@ -513,8 +514,8 @@ counts is refused only after a full first pass, read under the scope's lock. Wit
 every scope past the whole-read bound is refused, because a streamed scope is by definition larger than the bound
 and the defaults allow four reads of the bound; the consumer logs a warning at startup when streaming is on with
 both defaults. From `SEARCH_INDEX_MAX_SCOPE_EVENTS=500000` up the default events budget is already the 2000000 cap,
-so no larger scope streams there either. Streaming does work only once both budgets are raised: at the caps,
-scopes up to 512 MiB and 500000 records stream. Size the consumer pod for one decompressed chunk plus about 1 KB
+so no larger scope streams there either. A scope streams only when its size times four fits both budgets: raise
+the one its size exceeds, or both (usually both); at the caps, scopes up to 512 MiB and 500000 records stream. Size the consumer pod for one decompressed chunk plus about 1 KB
 of keys per record, about 0.5 GB at the 2000000-record cap, on top of its usual memory limit. A refused scope stays
 partial with `scope_too_large` first and then the budget's code, `stream_read_bytes_budget` or
 `stream_read_events_budget`, and is retried every reconcile tick like any partial session; the consumer's

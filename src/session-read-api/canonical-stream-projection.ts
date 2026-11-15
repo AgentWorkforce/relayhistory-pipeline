@@ -113,10 +113,13 @@ export class StreamBudgetError extends PipelineError {
   }
 }
 
-/** The keepalive failed: its error ends the read as it is, never as a read code. */
-class KeepaliveFailed extends Error {
+/**
+ * A callback of the caller (the keepalive ping, pass 4's write) failed: its error ends the
+ * read as it is, never as a read code.
+ */
+class CallerFailed extends Error {
   constructor(readonly failure: unknown) {
-    super("stream keepalive failed");
+    super("stream caller callback failed");
   }
 }
 
@@ -283,7 +286,7 @@ export async function streamCanonicalScope(
     try {
       await keep.ping();
     } catch (error) {
-      throw new KeepaliveFailed(error);
+      throw new CallerFailed(error);
     }
     pinged = clock();
   }
@@ -312,7 +315,7 @@ export async function streamCanonicalScope(
     try {
       return await run();
     } catch (error) {
-      if (error instanceof KeepaliveFailed) throw error.failure;
+      if (error instanceof CallerFailed) throw error.failure;
       if (error instanceof StreamBudgetError || error instanceof StreamStop) throw error;
       if (error instanceof PipelineError && error.retryable) throw error;
       throw new StreamStop(codeOf(error, "manifest_unreadable"));
@@ -729,7 +732,8 @@ export async function streamCanonicalScope(
             if (rows.length >= batch) {
               const out = rows;
               rows = [];
-              await write(out);
+              // A store error is the caller's, not the source's: it must not read as manifest_unreadable.
+              await write(out).catch((error: unknown) => { throw new CallerFailed(error); });
             }
           }
         });
