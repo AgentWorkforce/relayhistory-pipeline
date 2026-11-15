@@ -656,7 +656,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
 
   // ---- revisions, and the slot pass shared with ownership ----
   if (sections.has("revisions") || sections.has("ownership")) {
-    type Group = { key: string; tenant: LedgerTenant; fence: FenceDoc; originId: string; entries: IndexEntryInput[]; records: Set<string> };
+    type Group = { key: string; tenant: LedgerTenant; originId: string; entries: IndexEntryInput[]; records: Set<string> };
     /**
      * One pass's buffer: shard groups gathered across pages and windows, merged together when `entries` reaches the
      * budget, before a record repeats in a shard (so mergeIndex's in-call choice never replaces the stored-vs-incoming
@@ -685,7 +685,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
       }
       if (buf.groups.get(key)?.records.has(entry.recordId)) await flush(buf);
       const tenant = { orgId: row.org, workspaceId: row.ws, userId: row.user };
-      const g = buf.groups.get(key) ?? { key, tenant, fence, originId: row.origin, entries: [], records: new Set<string>() };
+      const g = buf.groups.get(key) ?? { key, tenant, originId: row.origin, entries: [], records: new Set<string>() };
       g.entries.push(entry);
       g.records.add(entry.recordId);
       buf.groups.set(key, g);
