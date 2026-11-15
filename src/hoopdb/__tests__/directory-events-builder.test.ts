@@ -187,6 +187,48 @@ describe("DirectoryEventsBuilder parity with the whole-read metadata", () => {
     expect(results).toEqual([false, true, true, false]);
   });
 
+  test("rows added out of list order with their order give the list-order metadata", () => {
+    let ties = 0;
+    let compared = 0;
+    for (let seed = 1; seed <= 600; seed++) {
+      const rows = generate(seed, true);
+      const expected = outcome(() => legacyDirectoryEventsFromProjection(rows));
+      const indexed = rows.map((row, i) => ({ row, order: i * 3 + 1 })); // distinct, ascending, not dense
+      for (const arrival of orders(indexed as unknown as Row[], seed).slice(1) as unknown as Array<typeof indexed>) {
+        const got = outcome(() => {
+          const builder = new DirectoryEventsBuilder();
+          for (const { row, order } of arrival) builder.add(row, order);
+          return builder.finish();
+        });
+        if (!("failed" in expected)) expect({ seed, ...got }).toEqual({ seed, ...expected });
+        else expect({ seed, failed: "failed" in got }).toEqual({ seed, failed: true });
+        compared += 1;
+      }
+      const seen = new Set<string>();
+      for (const r of rows) {
+        const k = `${String(r.ts)}|${String(r.event_id)}`;
+        if (seen.has(k)) ties += 1;
+        seen.add(k);
+      }
+    }
+    expect(compared).toBe(1200);
+    expect(ties).toBeGreaterThan(100); // the order only matters where rows tie
+    // Without the order the same arrivals may differ: the parameter is what restores list order.
+    let differs = 0;
+    for (let seed = 1; seed <= 600 && differs === 0; seed++) {
+      const rows = generate(seed, false);
+      const reversed = [...rows].reverse();
+      const plain = outcome(() => viaBuilder(reversed));
+      const ordered = outcome(() => {
+        const builder = new DirectoryEventsBuilder();
+        reversed.forEach((row, i) => builder.add(row, rows.length - i));
+        return builder.finish();
+      });
+      if (JSON.stringify(plain) !== JSON.stringify(ordered)) differs += 1;
+    }
+    expect(differs).toBe(1);
+  });
+
   test("a builder is used once", () => {
     const builder = new DirectoryEventsBuilder();
     builder.finish();

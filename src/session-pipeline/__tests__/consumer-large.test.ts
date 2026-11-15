@@ -26,11 +26,11 @@ async function fixture(){
  };
  const messages=[{messageId:"m1",body:JSON.stringify({reconcile:{key:source.manifests[0]!.manifestKey}})}];
  const run=async()=>{
-  const lines:any[]=[],out=process.stdout.write,err=process.stderr.write;
-  const tap=(w:any,stream:NodeJS.WriteStream)=>(chunk:any,...rest:any[])=>{for(const l of String(chunk).split("\n"))if(l.startsWith("{"))try{const j=JSON.parse(l);if(j.stage==="large-read")lines.push(j)}catch{}return w.call(stream,chunk,...rest)};
+  const lines:any[]=[],partials:any[]=[],out=process.stdout.write,err=process.stderr.write;
+  const tap=(w:any,stream:NodeJS.WriteStream)=>(chunk:any,...rest:any[])=>{for(const l of String(chunk).split("\n"))if(l.startsWith("{"))try{const j=JSON.parse(l);if(j.stage==="large-read")lines.push(j);else if(j.message==="search index partial")partials.push(j)}catch{}return w.call(stream,chunk,...rest)};
   process.stdout.write=tap(out,process.stdout) as any;process.stderr.write=tap(err,process.stderr) as any;
   const before=searches;
-  try{const r=await processBatch(messages,deps);return {failures:r.batchItemFailures.map(f=>f.itemIdentifier),searched:searches>before,lines}}
+  try{const r=await processBatch(messages,deps);return {failures:r.batchItemFailures.map(f=>f.itemIdentifier),searched:searches>before,lines,partials}}
   finally{process.stdout.write=out;process.stderr.write=err}
  };
  return {x,deps,run,source};
@@ -144,4 +144,13 @@ test("real route + real job state: a failed job is a logged gap, not silent",asy
  expect(again).toMatchObject({failures:[],searched:false});
  expect(again.lines).toEqual([expect.objectContaining({level:"warn",message:"large scope job will not be processed",state:"failed",attempt:5,reason:"large_job_failed"})]);
  for(const l of again.lines)expect(Object.keys(l).every(k=>!/text|content|payload/.test(k))).toBe(true);
+},60000);
+
+test("a partial scope's warning names the reasons the indexer returned",async()=>{
+ const f=await fixture();
+ f.deps.search={...f.deps.search,limits:{maxScopeBytes:1,maxScopeEvents:1}};
+ const r=await f.run();
+ expect(r.failures).toEqual([]);
+ expect(r.partials).toEqual([expect.objectContaining({level:"warn",stage:"search-index",reason:"scope_too_large"})]);
+ expect(r.partials[0].stream).toBeUndefined(); // only a streamed reconcile reports what it read
 },60000);

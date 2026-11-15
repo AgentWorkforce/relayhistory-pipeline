@@ -405,6 +405,7 @@ has not run yet, it is too large for the limits (`scope_too_large`), or a new up
 re-index has not run yet. So with `skip` a session that is being written to drops out of search results until its
 next index pass. A session-scoped read of a partial session still answers 501
 `session_partial`. The hosted pipeline Lambda never reads the limits, and the hosted read Lambda refuses `skip`.
+`SEARCH_INDEX_STREAMING_ENABLED=true` indexes such a session instead (see "Streaming reconcile (Phase 2)" below).
 
 `SESSION_ERASE_BYTES_ENABLED` is the one exception to the `true` rule above:
 the operator-erase contract fixes the literal `1`. `true` is not accepted; it
@@ -503,6 +504,53 @@ all set. Without them a cache hit whose stats hash matches is served and a miss
 answers `narrative.unavailable = provider_not_configured`; a cache error is
 `provider_error`, always within a 200.
 Defaults are unchanged: with neither flag set nothing new is wired.
+
+### Streaming reconcile (Phase 2)
+
+`SEARCH_INDEX_STREAMING_ENABLED` (`session-pipeline-consumer`, self-host service only, enabled consumer only,
+default off) indexes a session that is too large for one search index pass instead of marking it partial. Exactly
+`true` turns it on; unset, `""` or `false` leaves it off and the consumer reads neither budget below; any other
+value fails startup, and so does `true` together with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` (the facts are
+built from a whole read). It applies only to a scope whose whole read stopped on `scope_too_large` alone
+(above `SEARCH_INDEX_MAX_SCOPE_BYTES` / `_EVENTS`); every other scope takes the whole read as before.
+
+The streaming reader reads the scope's chunks again in several passes rather than holding them: roughly four object
+reads per chunk for flagged sessions, memory bounded by one chunk plus per-record keys. It produces the same index
+rows, deletes, directory events, catalog and search state as the whole read would with unlimited limits, and
+regenerates rows only for the identities the index lacks or holds stale, so an up-to-date session costs three
+passes. `SEARCH_INDEX_MAX_ROWS` still bounds the index scan (`search_index_truncated`). The stream runs inside the
+scope's index transaction under its advisory lock, so that lock is held for the whole read; between reads, and
+between delete batches, the stream sends `SELECT 1` on that transaction at most every 20 seconds, and always just
+before and after the index scan, so a long pass does not trip the consumer pool's 60-second idle-in-transaction
+timeout.
+
+Two budgets bound it, each summed over every pass of one scope: `SEARCH_INDEX_STREAM_MAX_READ_BYTES` (a whole
+number of bytes, optional `MiB` / `GiB` suffix) and `SEARCH_INDEX_STREAM_MAX_READ_EVENTS` (records). Unset, each
+is four times the effective whole-read bound, capped at 2 GiB / 2000000; set, it must lie between that default
+and the cap, or startup fails naming the variable and its range, never the value. A scope is refused before any
+chunk is read when its declared size times four exceeds a budget, again after the first pass from the sizes
+actually read and declared, and on any chunk or record past it. A scope whose chunks do not declare their record
+counts is refused only after a full first pass, read under the scope's lock. With both budgets at their defaults
+every scope past the whole-read bound is refused, because a streamed scope is by definition larger than the bound
+and the defaults allow four reads of the bound; the consumer logs a warning at startup when streaming is on with
+both defaults. From `SEARCH_INDEX_MAX_SCOPE_EVENTS=500000` up the default events budget is already the 2000000 cap,
+so no larger scope streams there either. A scope streams only when its size times four fits both budgets: raise
+the one its size exceeds, or both (usually both); at the caps, scopes up to 512 MiB and 500000 records stream. Size the consumer pod for one decompressed chunk plus about 1 KB
+of keys per record, about 0.5 GB at the 2000000-record cap, on top of its usual memory limit. A refused scope stays
+partial with `scope_too_large` first and then the budget's code, `stream_read_bytes_budget` or
+`stream_read_events_budget`, and is retried every reconcile tick like any partial session; the consumer's
+`search index partial` warning names those codes and, for a streamed scope, the passes, chunks, bytes and records
+it read.
+
+Streaming stops at the first read or fold error and reports that one code (for example `chunk_decompress_failed`),
+while the whole read may list more codes for the same scope. A chunk or record whose content changed between passes
+stops it with `stream_source_changed`; `stream_duplicate_event` is a defensive check that two records never produce
+one index identity, not reachable from well-formed manifests. Rows are written only in the last pass, after a
+complete verifying pass, and each insert batch commits on its own. Nothing is deleted and the directory is not marked
+current unless the streamed read was complete. A last pass that fails (a store error, or a source change seen while
+regenerating) may leave rows already written; they are rows the verify pass checked, nothing is deleted, the
+session stays partial and keeps owing a pass, and the next reconcile repairs it. The hosted pipeline Lambda never
+reads these settings.
 
 ### session-ingest admission mode (config contract)
 

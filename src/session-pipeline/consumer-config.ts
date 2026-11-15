@@ -75,6 +75,16 @@
  *                                   else fails startup before any connection opens.
  *                                   A scope above them is indexed partial. Never read
  *                                   by the hosted Lambda
+ *   SEARCH_INDEX_STREAMING_ENABLED            enabled only, default off: exactly "true"
+ *                                   streams a scope above those limits (issue 610
+ *                                   Phase 2) instead of indexing it partial; unset,
+ *                                   "" or "false" is off, anything else fails startup,
+ *                                   and "true" with RELAYHISTORY_SELFHOST_OUTPUT_FACTS
+ *                                   ="true" fails startup
+ *   SEARCH_INDEX_STREAM_MAX_READ_BYTES        streaming only: bytes / records read, summed
+ *   SEARCH_INDEX_STREAM_MAX_READ_EVENTS       over every pass of one scope (search-index.ts
+ *                                   searchIndexStreamFromEnv). Unset: 4x the limits
+ *                                   above; accepted from that up to 2 GiB / 2000000
  *   ANALYTICS_SINK                            unset | "" | "noop" (default: no analytics) |
  *                                   "collector" (one installation-scoped
  *                                   session_pipeline.index_tick_completed per completed

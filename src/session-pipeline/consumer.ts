@@ -170,7 +170,12 @@ export async function processBatch(records: readonly QueueRecord[], deps: Consum
           continue;
         }
         if (result.partial)
-          log.warn("search index partial", { stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, manifests: result.manifests, reason: "scope_too_large" });
+          log.warn("search index partial", {
+            stage: "search-index", org_id: scope.orgId, session_id: scope.sessionId, manifests: result.manifests,
+            // scope_too_large, then the streaming budget that stopped it, if one did.
+            reason: result.reasons.join(",") || "scope_too_large",
+            ...(result.stream ? { stream: result.stream } : {}),
+          });
         log.info("search index reconciled", {
           stage: "search-index",
           org_id: scope.orgId,
