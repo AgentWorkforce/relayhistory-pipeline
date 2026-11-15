@@ -143,6 +143,9 @@ keep their path unchanged either way.
 | `SEARCH_INDEX_MAX_SCOPE_BYTES` | session-pipeline consumer (self-host SERVICE only, enabled) | Raw bytes of one search index scope; above it the session is marked partial (`scope_too_large`). Bytes as a positive integer, or with a `MiB` / `GiB` suffix. Default 64 MiB; accepted 64 MiB to 256 MiB (the replay bound). The indexer holds the scope several times over in memory, so raise the pod limit with it. Needs no manual re-index: every reconcile tick (`CONSUMER_RECONCILE_EVERY_MINUTES`) the consumer re-sends each session the search state lists as partial, `scope_too_large` ones included, so after a restart with a higher limit those sessions are indexed again under it (a large backlog over several ticks; a key in retry backoff waits for it). Unset or empty is the default; malformed, below 64 MiB or above 256 MiB fails startup before any connection opens, naming the variable only. Never read by the hosted Lambda. |
 | `SEARCH_INDEX_MAX_SCOPE_EVENTS` | session-pipeline consumer (self-host SERVICE only, enabled) | Records of one search index scope, a positive integer. Default 100000; accepted 100000 to 1000000. Same partial, re-index and startup rules as `SEARCH_INDEX_MAX_SCOPE_BYTES`. Never read by the hosted Lambda. |
 | `SEARCH_INDEX_MAX_ROWS` | session-pipeline consumer (self-host SERVICE only, enabled) | Index rows compared for one scope, a positive integer. Default 500000; accepted 500000 to 1000000. Same startup rules. Never read by the hosted Lambda. |
+| `SEARCH_INDEX_STREAMING_ENABLED` | session-pipeline consumer (self-host SERVICE only, enabled) | Exactly `true` streams a scope that is too large for one index pass (`scope_too_large` alone) instead of indexing it partial; see "Streaming reconcile (Phase 2)" below. Unset, `""` or `false` is off (default) and neither budget is read; any other value, or `true` with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true`, fails startup. Never read by the hosted Lambda. |
+| `SEARCH_INDEX_STREAM_MAX_READ_BYTES` | session-pipeline consumer (streaming on only) | Bytes read for one streamed scope, summed over every pass. Bytes as a positive integer, or with a `MiB` / `GiB` suffix. Default four times the effective `SEARCH_INDEX_MAX_SCOPE_BYTES`, capped at 2 GiB; accepted from that default to 2 GiB. Past it the scope stays partial with `stream_read_bytes_budget`. Out of range or malformed fails startup, naming the variable only. |
+| `SEARCH_INDEX_STREAM_MAX_READ_EVENTS` | session-pipeline consumer (streaming on only) | Records read for one streamed scope, summed over every pass, a positive integer. Default four times the effective `SEARCH_INDEX_MAX_SCOPE_EVENTS`, capped at 2000000; accepted from that default to 2000000. Past it the scope stays partial with `stream_read_events_budget`. Same startup rules. |
 
 - **Dual accept.** A bearer starting `sh_at_` goes to relaycontrol and never to
   the RelayAuth verifiers (it is never JWT-parsed); every other bearer goes to
@@ -294,6 +297,40 @@ hostname (for example a compose service name) fails at startup with
 `basic_auth_needs_https`. No local container runs it yet, and the
 worker entry points still allow only `postgres`; the backend's proof runs against
 disposable containers (`docs/session-search-proof.md`).
+
+### Streaming reconcile (Phase 2)
+
+`SEARCH_INDEX_STREAMING_ENABLED` (`session-pipeline-consumer`, self-host service only, enabled consumer only,
+default off) indexes a session that is too large for one search index pass instead of marking it partial. Exactly
+`true` turns it on; unset, `""` or `false` leaves it off and the consumer reads neither budget below; any other
+value fails startup, and so does `true` together with `RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true` (the facts are
+built from a whole read). It applies only to a scope whose whole read stopped on `scope_too_large` alone
+(above `SEARCH_INDEX_MAX_SCOPE_BYTES` / `_EVENTS`); every other scope takes the whole read as before.
+
+The streaming reader reads the scope's chunks again in several passes rather than holding them: roughly four object
+reads per chunk for flagged sessions, memory bounded by one chunk plus per-record keys. It produces the same index
+rows, deletes, directory events, catalog and search state as the whole read would with unlimited limits, and
+regenerates rows only for the identities the index lacks or holds stale, so an up-to-date session costs three
+passes. `SEARCH_INDEX_MAX_ROWS` still bounds the index scan (`search_index_truncated`). The stream runs inside the
+scope's index transaction under its advisory lock, so that lock is held for the whole read.
+
+Two budgets bound it, each summed over every pass of one scope: `SEARCH_INDEX_STREAM_MAX_READ_BYTES` (a whole
+number of bytes, optional `MiB` / `GiB` suffix) and `SEARCH_INDEX_STREAM_MAX_READ_EVENTS` (records). Unset, each
+is four times the effective whole-read bound, capped at 2 GiB / 2000000; set, it must lie between that default
+and the cap, or startup fails naming the variable and its range, never the value. A scope is refused before any
+chunk is read when its declared size times four exceeds a budget, again after the first pass from the sizes
+actually read, and on any chunk or record past it. With the defaults that refuses nearly every scope past the
+whole-read bound, so streaming does little until the bytes budget is raised; at the 2 GiB cap, scopes up to
+512 MiB stream. A refused scope stays partial with `scope_too_large` first and then the budget's code,
+`stream_read_bytes_budget` or `stream_read_events_budget`, and is retried every reconcile tick like any partial
+session.
+
+Streaming stops at the first read or fold error and reports that one code (for example `chunk_decompress_failed`),
+while the whole read may list more codes for the same scope. A chunk or record whose content changed between passes
+stops it with `stream_source_changed`; `stream_duplicate_event` is a defensive check that two records never produce
+one index identity, not reachable from well-formed manifests. Nothing is deleted and the directory is not marked
+current unless the streamed read was complete; a failed pass keeps any rows it wrote and the session keeps owing a
+pass. The hosted pipeline Lambda never reads these settings.
 
 ## Known limits
 

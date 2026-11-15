@@ -109,6 +109,16 @@ export async function readManifestRecords(
   return rows;
 }
 
+/**
+ * Watches a chunk-by-chunk read (the streaming reconcile's read budget, issue 610
+ * Phase 2): `chunk` runs before a chunk's object is fetched, `decompressed` after
+ * it is inflated. Either may throw to stop the read.
+ */
+export interface ChunkReadObserver {
+  chunk(entry: Readonly<{ bytes: number; stored_bytes: number; stored_raw_bytes?: number; records?: number }>): void;
+  decompressed(bytes: number): void;
+}
+
 /** Bounded chunk-by-chunk reader; proofs need not retain full session payloads. */
 export async function* streamManifestRecords(
   manifest: ManifestV1,
@@ -117,6 +127,7 @@ export async function* streamManifestRecords(
   decompress: (stored: Uint8Array, maxOutputLength: number) => Uint8Array,
   maxRecords = Number.POSITIVE_INFINITY,
   maximum?: number,
+  observe?: ChunkReadObserver,
 ): AsyncGenerator<RelayhistoryStreamRecord> {
   assertReaderScrubMarker(manifest.raw.scrub, maximum);
   if (manifest.raw.format !== "ndjson")
@@ -136,6 +147,7 @@ export async function* streamManifestRecords(
         "a raw chunk exceeds the index limit",
         false,
       );
+    observe?.chunk(entry);
     let stored: Uint8Array | null;
     try {
       stored = await readCapped(await readerChunkBody(await store.getObject(key), manifest.raw.scrub, maximum), entry.stored_bytes);
@@ -174,6 +186,7 @@ export async function* streamManifestRecords(
         false,
       );
     }
+    observe?.decompressed(raw.byteLength);
     if (entry.raw_sha256 && sha256(raw) !== entry.raw_sha256)
       throw new PipelineError(
         "chunk_digest_mismatch",
@@ -374,6 +387,12 @@ export interface ScopeRead {
   /** directory_display_* code when optional display values were omitted. */
   displayOmitted?: string | null;
   sources: DirectoryEventInput["sources"];
+  /**
+   * Only on a `partial` result: the manifests admitted before sizing, in read
+   * order, so the streaming reconcile (canonical-stream-projection.ts) reads
+   * exactly what this read would have.
+   */
+  admitted?: Array<{ manifest: ManifestV1; key: string }>;
 }
 
 export async function readCanonicalScope(
@@ -479,6 +498,7 @@ export async function readCanonicalScope(
       sources: [],
       projectionRows: [],
       records: [],
+      admitted: readable.map((m) => ({ manifest: m, key: manifestKeysByBody.get(m)! })),
     };
 
   let parsedRecords = 0;
@@ -509,6 +529,7 @@ export async function readCanonicalScope(
           sources: [],
           projectionRows: [],
           records: [],
+          admitted: readable.map((m) => ({ manifest: m, key: manifestKeysByBody.get(m)! })),
         };
       if (error instanceof PipelineError && error.retryable) throw error;
       complete = false;

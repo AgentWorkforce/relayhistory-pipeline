@@ -38,6 +38,20 @@
  */
 import { ARTIFACT_MAX_SOURCE_BYTES, ARTIFACT_MAX_SOURCE_RECORDS } from "../session-read-api/canonical-artifact.ts";
 import { readCanonicalScope } from "../session-read-api/canonical-projection.ts";
+import {
+  STREAM_PASSES,
+  StreamBudgetError,
+  streamCanonicalScope,
+  streamIndexKey,
+  type StreamReadLimits,
+} from "../session-read-api/canonical-stream-projection.ts";
+import { nodeReadBudget } from "../session-read-api/node-read-profile.ts";
+
+/** The largest streaming read budget: the large-read profile's source bound. */
+export const STREAM_READ_CEILING: Readonly<StreamReadLimits> = Object.freeze({
+  maxReadBytes: nodeReadBudget("large").sourceBytes,
+  maxReadEvents: nodeReadBudget("large").sourceRecords,
+});
 export { manifestUserId, readManifestRecords, projectedToNeonRow } from "../session-read-api/canonical-projection.ts";
 import * as zlib from "node:zlib";
 import { layoutComponent } from "../shared/layout-component.ts";
@@ -102,6 +116,14 @@ export interface SearchIndexDeps {
    * Absent: no output facts function is called.
    */
   outputFactsStore?: (tx: SqlExecutor) => OutputFactsStore;
+  /**
+   * SEARCH_INDEX_STREAMING_ENABLED=true only (the self-host consumer, adapter binding, no
+   * output facts): a scope past the whole-read bound (`scope_too_large` alone) is reconciled
+   * by the streaming reader (canonical-stream-projection.ts) within these read budgets,
+   * summed over its passes, instead of being marked partial. Absent: such a scope is marked
+   * partial exactly as before, and every other scope never reaches the streaming reader.
+   */
+  stream?: StreamReadLimits;
 }
 
 export interface SearchIndexLimits {
@@ -203,6 +225,8 @@ export interface SearchIndexResult {
   partial?: boolean;
   /** Present only with `outputFacts`: fact rows inserted and deleted, and whether they are exact. */
   outputFacts?: { inserted: number; deleted: number; complete: boolean; reasons: string[] };
+  /** Present only when the streaming reader ran: what it read, summed over its passes. */
+  stream?: { passes: number; chunks: number; bytes: number; events: number };
 }
 
 interface ScopeIdentity {
@@ -381,6 +405,11 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
     }
     const fromMs = await io.fromMs(at);
     const s3 = await readCanonicalScope(scope, siblingKeys, { ...deps, decompress: deps.decompress ?? defaultDecompress }, limits, version, pointerSnapshot.canonicalId);
+    if (
+      deps.stream && deps.adapter && !deps.outputFacts && !deps.outputFactsStore && siblingKeys.length &&
+      s3.partial && s3.admitted && s3.reasons.length === 1 && s3.reasons[0] === "scope_too_large"
+    )
+      return streamedReconcile(tx, io, scope, deps, deps.stream, limits, pointerSnapshot, s3.admitted, s3.revision, version, fromMs, at);
     if(!siblingKeys.length||!s3.complete||s3.directorySessionId!==pointerSnapshot.canonicalId||s3.events===null){
       await invalidateDirectoryEvents(tx,scope);
       await io.record(scope,s3.revision,0,false,at,pointerSnapshot.canonicalId);
@@ -504,6 +533,155 @@ export async function indexSearchScope(scope: SessionScope, deps: SearchIndexDep
       ...(outputFacts ? { outputFacts } : {}),
     };
   });
+}
+
+/**
+ * The reconcile of `indexSearchScope` for a scope the whole read refused as too large, from
+ * the streaming reader: the same rows, deletes, directory metadata, catalog and state, with
+ * the rows regenerated only for the identities the index lacks. Nothing is deleted or
+ * marked current unless the streamed read was complete; a failed regeneration keeps the
+ * rows it wrote, deletes nothing and leaves the scope owing a pass.
+ */
+async function streamedReconcile(
+  tx: SqlExecutor,
+  io: SearchProjectionIo,
+  scope: SessionScope,
+  deps: SearchIndexDeps,
+  budget: StreamReadLimits,
+  limits: SearchIndexLimits,
+  pointerSnapshot: { epoch: string; canonicalId: string },
+  admitted: NonNullable<Awaited<ReturnType<typeof readCanonicalScope>>["admitted"]>,
+  revision: number,
+  version: number,
+  fromMs: number,
+  at: Date,
+): Promise<SearchIndexResult> {
+  const read = await streamCanonicalScope(
+    scope, admitted,
+    { readerMaxRuleset: deps.readerMaxRuleset, store: deps.store, prefixFor: deps.prefixFor.bind(deps), decompress: deps.decompress ?? defaultDecompress },
+    budget, version, fromMs,
+  );
+  const stream = () => ({ passes: read.meter.passes, chunks: read.meter.chunks, bytes: read.meter.bytes, events: read.meter.events });
+  const owing = async (reasons: string[], partial: boolean, inserted = 0): Promise<SearchIndexResult> => {
+    await invalidateDirectoryEvents(tx, scope);
+    await io.record(scope, revision, 0, false, at, pointerSnapshot.canonicalId);
+    return { manifests: read.manifests, rows: 0, inserted, deleted: 0, complete: false, ...(partial ? { partial: true } : {}), reasons, stream: stream() };
+  };
+  if (!read.complete || read.directorySessionId !== pointerSnapshot.canonicalId || read.events === null)
+    return owing(read.reasons.length ? read.reasons : ["canonical_metadata_incomplete"], read.partial);
+
+  const scan = await io.scan(scope, pointerSnapshot.canonicalId, fromMs, limits.maxRows);
+  const truncated = scan.truncated;
+  const existing = new Map<string, ScopeIdentity[]>();
+  for (const r of scan.rows) {
+    const key = streamIndexKey(r);
+    existing.set(key, [...(existing.get(key) ?? []), r]);
+  }
+  const toInsert = new Set<string>();
+  for (const [key, w] of read.wanted) {
+    const owner = read.owners[w.owner]!;
+    const same = existing.get(key) ?? [];
+    if (!same.some((c) => c.sessionId === owner.sessionId && c.workspaceId === owner.workspaceId && c.tsMs === w.tsMs && c.fingerprint === w.fingerprint))
+      toInsert.add(key);
+  }
+  let inserted = 0;
+  try {
+    await read.regenerate(toInsert, limits.insertBatch, async (rows) => {
+      inserted += await io.upsert(rows, scope, pointerSnapshot.canonicalId);
+    });
+  } catch (error) {
+    if (error instanceof StreamBudgetError) return owing(["scope_too_large", error.budget], true, inserted);
+    if (!(error instanceof PipelineError) || error.retryable) throw error;
+    return owing([error.code], false, inserted);
+  }
+
+  const staleWrite = inserted !== toInsert.size;
+  let complete = !truncated && !staleWrite;
+  const reasons: string[] = [];
+  let deletedCount = 0;
+  if (!complete) await invalidateDirectoryEvents(tx, scope);
+  else {
+    // As the whole read: only kinds this pass can regenerate are diffed, and a buffered-origin
+    // row with no current canonical row is kept.
+    const regenerable = new Set<string>([...S3_ACTIVITY_KINDS, ...read.kinds]);
+    const deletes: ScopeIdentity[] = [];
+    for (const [key, list] of existing) {
+      const current = read.wanted.get(key);
+      const owner = current ? read.owners[current.owner]! : undefined;
+      for (const c of list) {
+        if (!regenerable.has(c.kind)) continue;
+        if (!current && c.fingerprint.startsWith(BUFFERED_FINGERPRINT_PREFIX)) continue;
+        if (!current || owner!.sessionId !== c.sessionId || owner!.workspaceId !== c.workspaceId || current.tsMs !== c.tsMs)
+          deletes.push(c);
+      }
+    }
+    deletedCount = await io.remove(scope, deletes);
+    const directoryKey = { orgId: scope.orgId, workspaceId: scope.workspaceId, harness: scope.harness, sessionId: pointerSnapshot.canonicalId };
+    const written = await (deps.writeEvents ?? writeDirectoryEvents)(tx, directoryKey, { sourceSessionId: scope.sessionId, expectedEpoch: pointerSnapshot.epoch, sources: read.sources, events: read.events });
+    if (written.written) await (deps.writeCatalog ?? directoryCatalogWriter(deps.desktopCatalog === true))(tx, directoryKey, read.catalog, { expectedEpoch: pointerSnapshot.epoch, sourceSessionId: scope.sessionId });
+    else {
+      complete = false;
+      reasons.push("directory_event_sources_changed");
+      await invalidateDirectoryEvents(tx, scope);
+    }
+  }
+  await io.record(scope, revision, read.inWindow, complete, at, pointerSnapshot.canonicalId);
+  return {
+    manifests: read.manifests,
+    rows: read.inWindow,
+    inserted,
+    deleted: deletedCount,
+    complete,
+    reasons: [...reasons, ...(truncated ? ["search_index_truncated"] : []), ...(staleWrite ? ["search_version_conflict"] : [])],
+    stream: stream(),
+  };
+}
+
+/**
+ * Streaming reconcile budgets for the indexer SERVICE (consumer-service.ts serve() only),
+ * from the environment, given the effective whole-read `limits`:
+ *
+ *   SEARCH_INDEX_STREAMING_ENABLED      exactly "true" turns streaming on; unset, "" or "false"
+ *                                       leave it off (returns undefined); anything else fails
+ *   SEARCH_INDEX_STREAM_MAX_READ_BYTES  bytes read, summed over every pass of one scope (a whole
+ *                                       number, optional MiB / GiB suffix)
+ *   SEARCH_INDEX_STREAM_MAX_READ_EVENTS records read, summed over every pass of one scope
+ *
+ * Unset, each budget is four times the effective whole-read bound (one read per pass), capped
+ * at the large-read profile (2 GiB / 2,000,000); set, it must lie between that default and
+ * the cap. A scope whose declared size times four exceeds a budget is never streamed: with
+ * the defaults that is nearly every scope past the whole-read bound, so an operator raises
+ * the bytes budget (to the 2 GiB cap: scopes up to 512 MiB) with the pod's memory in mind
+ * only for chunk-sized buffers. Refused with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true: the
+ * facts are built from a whole read. Errors name the variable and its range, never the value.
+ */
+export function searchIndexStreamFromEnv(
+  env: Record<string, string | undefined>,
+  limits: Partial<SearchIndexLimits>,
+  outputFacts: boolean,
+): StreamReadLimits | undefined {
+  const flag = env.SEARCH_INDEX_STREAMING_ENABLED;
+  if (flag === undefined || flag === "" || flag === "false") return undefined;
+  if (flag !== "true") throw new Error("pipeline consumer: SEARCH_INDEX_STREAMING_ENABLED must be true or false");
+  if (outputFacts)
+    throw new Error("pipeline consumer: SEARCH_INDEX_STREAMING_ENABLED=true cannot be combined with RELAYHISTORY_SELFHOST_OUTPUT_FACTS=true");
+  const MiB = 1024 * 1024;
+  const effective = { ...SEARCH_INDEX_DEFAULT_LIMITS, ...limits };
+  const cap = STREAM_READ_CEILING;
+  const fmt = (bytes: boolean, n: number) => (bytes ? `${n / MiB}MiB` : String(n));
+  const read = (name: string, bytes: boolean, min: number, max: number): number => {
+    const raw = env[name];
+    if (raw === undefined || raw === "") return min;
+    const m = (bytes ? /^([1-9][0-9]{0,12})(MiB|GiB)?$/u : /^([1-9][0-9]{0,12})()$/u).exec(raw);
+    const value = m ? Number(m[1]) * (m[2] === "GiB" ? 1024 * MiB : m[2] === "MiB" ? MiB : 1) : NaN;
+    if (!Number.isSafeInteger(value) || value < min || value > max)
+      throw new Error(`pipeline consumer: ${name} must be ${bytes ? "a whole number of bytes (optional MiB or GiB suffix)" : "a whole number"} in ${fmt(bytes, min)}..${fmt(bytes, max)}`);
+    return value;
+  };
+  return {
+    maxReadBytes: read("SEARCH_INDEX_STREAM_MAX_READ_BYTES", true, Math.min(STREAM_PASSES * effective.maxScopeBytes, cap.maxReadBytes), cap.maxReadBytes),
+    maxReadEvents: read("SEARCH_INDEX_STREAM_MAX_READ_EVENTS", false, Math.min(STREAM_PASSES * effective.maxScopeEvents, cap.maxReadEvents), cap.maxReadEvents),
+  };
 }
 
 function factsScope(scope: SessionScope, canonicalId: string, projectionRows: Array<{ table: string; row: Record<string, unknown> }> = []): OutputFactsScope {

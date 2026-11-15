@@ -201,12 +201,17 @@ const TOKEN_FIELDS = [
  * points at; never a row's content.
  *
  * The rows may arrive in any order. `finish` returns exactly what
- * `directoryEventsFromProjection` returns for the same rows, and the builder
+ * `directoryEventsFromProjection` returns for the same rows in list order, and
+ * the builder
  * fails (`directory_event_metadata_invalid`, or the timestamp's own error) on
  * exactly the inputs that function fails on. A check that holds for every row
  * fails in `add`; one that depends on which row the order selects fails in
  * `finish`. With more than one fault in the input, which fault is reported can
  * depend on arrival order. Build once: `finish` ends the builder.
+ *
+ * List order only breaks ties between rows with the same time and event id. By
+ * default it is arrival order; a reader that adds rows out of list order passes
+ * each row's `order` (distinct numbers, ascending in list order) instead.
  */
 export class DirectoryEventsBuilder {
   /** sha256(identity key) -> the first row's canonical digest, or its error. */
@@ -240,7 +245,7 @@ export class DirectoryEventsBuilder {
   #anyCost = false;
   #finished = false;
 
-  add(row: Event): void {
+  add(row: Event, order?: number): void {
     if (this.#finished) throw new Error("directory_events_builder_finished");
     const key = createHash("sha256")
       .update(
@@ -268,8 +273,9 @@ export class DirectoryEventsBuilder {
     const at: Position = {
       ts,
       eventId: Buffer.from(String(row.event_id)),
-      ordinal: this.#count++,
+      ordinal: order ?? this.#count,
     };
+    this.#count += 1;
     this.#times.add(ts);
     if (!this.#first || comparePosition(at, this.#first) < 0) this.#first = at;
     if (!this.#last || comparePosition(at, this.#last) > 0) this.#last = at;
