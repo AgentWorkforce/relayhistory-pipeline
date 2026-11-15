@@ -111,7 +111,9 @@ the sorted list).
 - The workflow passes each org to the tool as `--org`. The tools' own rules are unchanged: the drain still writes
   nothing for an org without its fence-authority marker.
 - An execute refuses unless its dry run has the same scope. A bound backfill or export must have the same scope or
-  be unscoped. A receipt from before scoping counts as unscoped. So change the secret only between complete
+  be unscoped, **except the drain's BACKFILL and FULL, which must have exactly the drain's scope**: an unscoped
+  backfill (for example an all-orgs pre-warm) says nothing about a scoped org's admission stop or freshness, so it
+  can never satisfy a scoped drain. A receipt from before scoping counts as unscoped. So change the secret only between complete
   sequences, and set it on both environments to the same value.
 - A scoped backfill reads `ingest_lazy_native_slots` in heap block windows (one sequential pass) instead of walking
   the primary key, which fetched every slot at random to test its org. A slot rewritten during the pass can be

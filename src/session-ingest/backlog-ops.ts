@@ -47,7 +47,8 @@
  * repository's logs mask it): comma-separated lowercase org UUIDs; unset or empty runs every org, as before. The org
  * ids never reach the repository, a log or a receipt: the receipt records only the scope's id (`all`, or `orgs_` +
  * 32 hex of the sorted list's sha256). Every bound run must carry the same scope as the run it feeds, except that an
- * unscoped (`all`) backfill or export may feed a scoped execute. A receipt from before scoping has no scope and
+ * unscoped (`all`) backfill or export may feed a scoped execute, but never as the drain's BACKFILL or FULL (exact
+ * scope there: checkBoundReceipt `exact`). A receipt from before scoping has no scope and
  * counts as `all`. Scoping changes no tool rule: the drain still writes nothing for an org without its
  * fence-authority marker.
  *
@@ -352,10 +353,12 @@ const obj = (v: unknown): Record<string, any> | null => (v && typeof v === "obje
 /**
  * A bound run's receipt, read from its downloaded artifact. It must name that run, this commit and the expected mode,
  * have exited 0, carry the execute's org scope (a bound backfill or export may also be unscoped; a receipt without a
- * scope is unscoped), and (per tool) pass its readiness check.
+ * scope is unscoped), and (per tool) pass its readiness check. `exact`: the scope must match exactly, never widened
+ * from `all`: the drain's BACKFILL and FULL (an unscoped backfill, e.g. an all-orgs pre-warm, proves nothing about a
+ * scoped org's admission stop or freshness, so it must never satisfy a scoped drain).
  */
 export type BacklogOpsBindingKind = "dry" | "backfill" | "full" | "export";
-export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; sha: string; run: string; scope?: string; kind?: BacklogOpsBindingKind }): void {
+export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; sha: string; run: string; scope?: string; kind?: BacklogOpsBindingKind; exact?: boolean }): void {
   // A presence receipt never feeds an execute (presence binds nothing and nothing binds it).
   if (toolOf(expect.mode) === "presence") refuse("backlog_ops_bound_presence_receipt");
   let r: Record<string, any> | null;
@@ -366,7 +369,7 @@ export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; s
   const want = expect.scope ?? BACKLOG_OPS_SCOPE_ALL;
   const got = r.scope === undefined ? BACKLOG_OPS_SCOPE_ALL : r.scope;
   if (typeof got !== "string" || !SCOPE_ID.test(got) || !SCOPE_ID.test(want) ||
-      (got !== want && !(expect.kind !== "dry" && expect.kind !== undefined && got === BACKLOG_OPS_SCOPE_ALL)))
+      (got !== want && (expect.exact === true || !(expect.kind !== "dry" && expect.kind !== undefined && got === BACKLOG_OPS_SCOPE_ALL))))
     refuse(`backlog_ops_bound_${toolOf(expect.mode)}_scope`);
   const s = obj(r.summary);
   if (!s || s.refused !== undefined) refuse(`backlog_ops_bound_${toolOf(expect.mode)}_refused`);
