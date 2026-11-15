@@ -161,7 +161,10 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
       expect(tx[2]).toMatch(/^SET LOCAL statement_timeout = \d+$/);
       const pins = tx[3] === "SET LOCAL enable_indexscan = off" ? 2 : 0;
       if (pins) expect(tx[4]).toBe("SET LOCAL enable_bitmapscan = off");
-      expect([5, 6]).toContain(tx.length - pins);
+      // The run's first transaction is the input fingerprint: its three counts in one snapshot.
+      const fingerprint = tx === txs[0];
+      if (fingerprint) expect(tx.length).toBe(7);
+      else expect([5, 6]).toContain(tx.length - pins);
       for (const st of tx.slice(3 + pins, -1)) expect(st).toMatch(/^(SELECT|\s*WITH RECURSIVE k AS \()/);
     }
     const refused: string[] = [];
@@ -685,6 +688,92 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     const summary = await run(store);
     expect(fail).toBe(-1);
     expect(summary.fences).toMatchObject({ created: 1, pairs_added: 1 });
+  });
+
+  test("input fingerprint: counts only, read first in one snapshot, unchanged across runs with no change", async () => {
+    const store = scratch();
+    await own(A, "origin-1", "claude", "sess-1");
+    await rev(A, "origin-1", "rec-1", 3, "claude", "sess-1");
+    await rev(C, "origin-3", "rec-9", 1, "claude", "sess-9");
+    await slot(A, "origin-1", "rec-2", A.userId, "claude", "sess-1", 4, hex("a"));
+    await slot(A, "origin-1", "rec-3", A.userId, "claude", "sess-1", 5, hex("b"));
+    await slot(A, "origin-1", "rec-4", null, null, null, null, null); // cleared: not owned, not counted
+    const log: string[] = [];
+    const first = await run(store, {}, log);
+    const maxMs = Number((await db.query<{ ms: string }>(
+      "SELECT floor(extract(epoch FROM max(updated_at)) * 1000)::bigint::text AS ms FROM sessions.ingest_record_revisions")).rows[0]!.ms);
+    expect(first.fingerprint).toEqual({ revisions_count: 2, revisions_max_updated_ms: maxMs, ownership_count: 1, ownership_hash: expect.any(Number),
+      slots_owned_count: 2, slots_revision_sum: 9, slots_hash: expect.any(Number) });
+    for (const v of Object.values(first.fingerprint)) expect(Number.isSafeInteger(v) && v >= 0).toBe(true);
+    for (const h of [first.fingerprint.ownership_hash, first.fingerprint.slots_hash]) expect(h).toBeLessThan(2 ** 40);
+    // Read before any section: the run's first transaction holds the three counts.
+    expect(log.slice(0, 7).filter((l) => l.includes("count(*)")).length).toBe(3);
+    // Dry and execute, full and fences+ownership only: the same inputs give the same fingerprint.
+    expect((await run(store)).fingerprint).toEqual(first.fingerprint);
+    expect((await run(store, { dryRun: true })).fingerprint).toEqual(first.fingerprint);
+    expect((await run(store, { sections: ["fences", "ownership"] })).fingerprint).toEqual(first.fingerprint);
+    // Scoped: only the scope's rows.
+    expect((await run(store, { orgs: ["org-b"] })).fingerprint).toEqual({ revisions_count: 1, revisions_max_updated_ms: expect.any(Number),
+      ownership_count: 0, ownership_hash: 0, slots_owned_count: 0, slots_revision_sum: 0, slots_hash: 0 });
+  });
+
+  test("input fingerprint hashes: equal counts with a swapped ownership or slot row change the hash; NULL columns still count", async () => {
+    const store = scratch();
+    await own(A, "origin-1", "claude", "sess-1");
+    await slot(A, "origin-1", "rec-2", A.userId, "claude", null, 4, hex("a")); // owned, current_session NULL
+    const fp = async () => (await run(store, { dryRun: true })).fingerprint;
+    const base = await fp();
+    expect(base.slots_hash).not.toBe(0); // the NULL-session row is hashed, not dropped
+    // The ownership row swapped for another session: same count, other hash.
+    await db.exec("UPDATE sessions.ingest_session_ownership SET session_id = 'sess-2'");
+    const swapped = await fp();
+    expect(swapped.ownership_count).toBe(base.ownership_count);
+    expect(swapped.ownership_hash).not.toBe(base.ownership_hash);
+    // The NULL-session slot's digest changes: same count and revision sum, other hash.
+    await db.exec(`UPDATE sessions.ingest_lazy_native_slots SET current_digest = '${hex("b")}'`);
+    const redigest = await fp();
+    expect([redigest.slots_owned_count, redigest.slots_revision_sum]).toEqual([base.slots_owned_count, base.slots_revision_sum]);
+    expect(redigest.slots_hash).not.toBe(swapped.slots_hash);
+    // The NULL session filled in: other hash again.
+    await db.exec("UPDATE sessions.ingest_lazy_native_slots SET current_session = 'sess-1'");
+    expect((await fp()).slots_hash).not.toBe(redigest.slots_hash);
+    // The slot's owner swapped for another user of the same org: same count and sum, other hash.
+    const beforeOwner = await fp();
+    await db.exec(`UPDATE sessions.ingest_lazy_native_slots SET current_owner = '${B.userId}'`);
+    const owner = await fp();
+    expect(owner.slots_owned_count).toBe(beforeOwner.slots_owned_count);
+    expect(owner.slots_hash).not.toBe(beforeOwner.slots_hash);
+  });
+
+  test("input fingerprint changes with a revision row, an ownership row, or an owned slot's current_revision", async () => {
+    const store = scratch();
+    await own(A, "origin-1", "claude", "sess-1");
+    await rev(A, "origin-1", "rec-1", 3, "claude", "sess-1");
+    await slot(A, "origin-1", "rec-2", A.userId, "claude", "sess-1", 4, hex("a"));
+    const base = (await run(store, { dryRun: true })).fingerprint;
+    const fp = async () => (await run(store, { dryRun: true })).fingerprint;
+    // A revision upsert (same row count): updated_at moves.
+    await db.exec("UPDATE sessions.ingest_record_revisions SET revision = revision + 1, updated_at = updated_at + interval '1 second'");
+    const afterRev = await fp();
+    expect(afterRev.revisions_max_updated_ms).toBeGreaterThan(base.revisions_max_updated_ms);
+    expect(afterRev.revisions_count).toBe(base.revisions_count);
+    // A new revision row.
+    await rev(A, "origin-1", "rec-5", 1, "claude", "sess-1");
+    const afterNewRev = await fp();
+    expect(afterNewRev.revisions_count).toBe(base.revisions_count + 1);
+    // A new ownership row.
+    await own(A, "origin-1", "claude", "sess-2");
+    const afterOwn = await fp();
+    expect(afterOwn.ownership_count).toBe(base.ownership_count + 1);
+    expect(afterOwn).not.toEqual(afterNewRev);
+    // An owned slot's current_revision (same owned count).
+    await db.exec("UPDATE sessions.ingest_lazy_native_slots SET current_revision = current_revision + 1");
+    const afterSlot = await fp();
+    expect(afterSlot.slots_revision_sum).toBe(afterOwn.slots_revision_sum + 1);
+    expect(afterSlot.slots_owned_count).toBe(afterOwn.slots_owned_count);
+    // A new owned slot.
+    await slot(A, "origin-1", "rec-6", A.userId, "claude", "sess-1", 2, hex("c"));
+    expect((await fp()).slots_owned_count).toBe(afterSlot.slots_owned_count + 1);
   });
 
   test("CLI: the mode is never implied, --execute needs the KMS key, sections are a closed set", () => {

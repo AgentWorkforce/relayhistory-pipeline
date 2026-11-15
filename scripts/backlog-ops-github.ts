@@ -10,6 +10,18 @@
  * unexpired receipt artifact; the drain's backfill under BACKLOG_OPS_FRESH_BACKFILL_MS old and its export created
  * after that backfill. The dormant switch and the inputs are checked first, before any GitHub read. Errors carry
  * fixed codes only.
+ *
+ * Refresh (drain-execute with FULL): the drain's BACKFILL is then a backfill-refresh-execute (fences and ownership
+ * sections only) under BACKLOG_OPS_FRESH_BACKFILL_MS old, and FULL a backfill-execute at the same sha under
+ * BACKLOG_OPS_BINDING_MAX_AGE_MS old, created before the refresh; the EXPORT must be created after the refresh (it
+ * records the fence views it read), which is stricter than after FULL. The refresh's mode is in its run-name, so its
+ * display title never equals a full run's: a refresh can never satisfy a full-run binding, nor a full run a refresh
+ * binding. Why that is safe: after the scope's Worker HTTP admission stop no new upload reaches SQL for those orgs,
+ * so SQL's revisions, ownership rows and owned lazy slots should not advance, and the full run's revision shards and
+ * owner stubs stay valid for its 24 h window; only the fences (deletions and resets) and ownership can still move,
+ * and the refresh re-runs exactly those. The credential step proves the rest unchanged before any credential is read
+ * (a writer that still moved one of those rows changes it): the two receipts' input fingerprints must be equal
+ * (checkRefreshFingerprint, backlog_ops_backfill_stale).
  */
 import { appendFileSync } from "node:fs";
 import { PRIVATE_INGEST_RELEASE } from "../src/session-ingest/private-ingest-release.ts";
@@ -83,6 +95,9 @@ export async function backlogOpsGithubGate(
   }
   // The drain's export ran after its backfill (the export reads the fences the backfill wrote).
   if (input.mode === "drain-execute" && !(created.export! > created.backfill!)) refuse("backlog_ops_gate_order");
+  // With FULL, the refresh refreshes it: FULL was created first.
+  if (input.mode === "drain-execute" && input.fullBackfillRun !== null && !(created.full! < created.backfill!))
+    refuse("backlog_ops_gate_full_order");
   if (approved)
     await requireHumanApproval(get, base, env.GITHUB_RUN_ID!, environment, gate, true, {
       approval: "backlog_ops_gate_human_approval",

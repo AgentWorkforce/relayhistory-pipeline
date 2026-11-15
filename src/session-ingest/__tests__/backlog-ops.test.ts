@@ -21,11 +21,13 @@ import {
   BACKLOG_OPS_DRY_ENVIRONMENT,
   BACKLOG_OPS_EXECUTE_ENABLED,
   BACKLOG_OPS_EXECUTE_ENVIRONMENT,
+  BACKLOG_OPS_FINGERPRINT_FIELDS,
   BACKLOG_OPS_MIN_SESSION_REMAINING_MS,
   BACKLOG_OPS_MODES,
   BACKLOG_OPS_RECEIPT_ARTIFACT,
   BACKLOG_OPS_RECEIPT_CONTRACT,
   BACKLOG_OPS_WORKFLOW,
+  backlogOpsBindings,
   backlogOpsConfirmation,
   backlogOpsDispatch,
   backlogOpsEnvironment,
@@ -36,13 +38,14 @@ import {
   backlogOpsTarget,
   backlogOpsToolArgs,
   checkBoundReceipt,
+  checkRefreshFingerprint,
   checkStsExpiration,
   countsOnly,
   parseStsCredentials,
   type BacklogOpsMode,
 } from "../backlog-ops.ts";
 
-const sha = "1".repeat(40), DRY = "111", BACKFILL = "222", EXPORT = "333";
+const sha = "1".repeat(40), DRY = "111", BACKFILL = "222", EXPORT = "333", FULL = "444";
 const code = async (fn: () => unknown) => {
   try { await fn(); return null; } catch (e) { return (e as { code?: string }).code ?? String(e); }
 };
@@ -73,8 +76,9 @@ const dispatchEnv = (mode: BacklogOpsMode, extra: Record<string, string> = {}) =
 
 // ---- dispatch ----
 
-test("seven modes (presence dry only); executes are enabled, and refuse before anything else while disabled", () => {
-  expect([...BACKLOG_OPS_MODES]).toEqual(["backfill-dry", "backfill-execute", "export-dry", "export-execute", "drain-dry", "drain-execute", "presence-dry"]);
+test("nine modes (presence dry only; the backfill refresh's own two); executes are enabled, and refuse before anything else while disabled", () => {
+  expect([...BACKLOG_OPS_MODES]).toEqual(["backfill-dry", "backfill-execute", "export-dry", "export-execute", "drain-dry", "drain-execute", "presence-dry",
+    "backfill-refresh-dry", "backfill-refresh-execute"]);
   expect(BACKLOG_OPS_EXECUTE_ENABLED).toBe(true);
   for (const mode of BACKLOG_OPS_MODES) {
     const exec = mode.endsWith("-execute");
@@ -146,6 +150,15 @@ test("argv is fixed: no org unless scoped, never a checkpoint or start key; dry 
       expect(spec.args.slice(spec.args.indexOf("--concurrency"), spec.args.indexOf("--concurrency") + 2)).toEqual(["--concurrency", "16"]);
     }
     expect(backlogOpsRole(d, t)).toBe(exec ? t.executeRoleArn : t.dryRoleArn);
+    // Only a refresh names sections: exactly fences and ownership, never revisions.
+    const section = spec.args.indexOf("--section");
+    expect(section >= 0).toBe(mode.startsWith("backfill-refresh-"));
+    if (section >= 0) {
+      expect(spec.args.slice(section, section + 4)).toEqual(["--section", "fences", "--section", "ownership"]);
+      expect(spec.args.filter((a) => a === "--section").length).toBe(2);
+      expect(spec.args).not.toContain("revisions");
+      expect(spec.script).toBe("scripts/upload-fence-backfill.ts");
+    }
   }
 });
 
@@ -336,8 +349,8 @@ function githubFixture(mode: BacklogOpsMode) {
     status: "completed", conclusion: "success", actor: { ...actor }, triggering_actor: { ...actor },
     display_title: backlogOpsRunName(m, sha), created_at: new Date(now - ageMs).toISOString(),
   });
-  const tool = mode.split("-")[0] as "backfill" | "export" | "drain";
   return {
+    mk: bound,
     ref: { object: { sha } },
     run: { id: 100, head_sha: sha, head_branch: "main", event: "workflow_dispatch", path: BACKLOG_OPS_WORKFLOW, run_attempt: 1,
       actor, triggering_actor: { ...actor }, display_title: backlogOpsRunName(mode, sha) },
@@ -349,11 +362,11 @@ function githubFixture(mode: BacklogOpsMode) {
       .map((name) => ({ name, head_sha: sha, status: "completed", conclusion: "success" })) },
     approvals: [] as any[],
     bound: {
-      [DRY]: bound(DRY, `${tool}-dry` as BacklogOpsMode, 3 * 3600_000),
+      [DRY]: bound(DRY, mode.replace(/-execute$/u, "-dry") as BacklogOpsMode, 3 * 3600_000),
       [BACKFILL]: bound(BACKFILL, "backfill-execute", 2 * 3600_000),
       [EXPORT]: bound(EXPORT, "export-execute", 3600_000),
     } as Record<string, any>,
-    artifacts: { [DRY]: 1, [BACKFILL]: 1, [EXPORT]: 1 } as Record<string, number>,
+    artifacts: { [DRY]: 1, [BACKFILL]: 1, [EXPORT]: 1, [FULL]: 1 } as Record<string, number>,
     expired: false,
     artifactsTotalDelta: 0,
   };
@@ -364,7 +377,7 @@ const githubGet = (f: Fixture, seen: string[] = []) => async (path: string): Pro
   if (path.endsWith("/git/ref/heads/main")) return f.ref;
   if (path.endsWith("/actions/runs/100")) return f.run;
   if (path.endsWith("/actions/runs/100/approvals")) return f.approvals;
-  for (const id of [DRY, BACKFILL, EXPORT]) {
+  for (const id of [DRY, BACKFILL, EXPORT, FULL]) {
     if (path.endsWith(`/actions/runs/${id}`)) return f.bound[id];
     if (path.endsWith(`/actions/runs/${id}/artifacts?per_page=100`))
       return { total_count: f.artifacts[id]! + f.artifactsTotalDelta,
@@ -505,7 +518,14 @@ test("workflow: the proof job runs the presence tests, and every presence file i
 test("workflow: dispatch inputs, gates, one credential step, OIDC, protected vars, counts-only receipt, one op at a time", () => {
   const yml = readFileSync(fileURLToPath(new URL("../../../" + BACKLOG_OPS_WORKFLOW, import.meta.url)), "utf8");
   const code_ = yml.split("\n").filter((l) => !l.trimStart().startsWith("#")).join("\n");
-  expect(yml).toContain("options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute, presence-dry]");
+  expect(yml).toContain("options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute, presence-dry, backfill-refresh-dry, backfill-refresh-execute]");
+  // The FULL binding: an input, its env, and its receipt downloaded (drain-execute with FULL only) before the tool step.
+  expect(yml).toContain("BACKLOG_OPS_FULL_BACKFILL_RUN: ${{ inputs.full_backfill_run }}");
+  expect(yml).toContain("if: inputs.mode == 'drain-execute' && inputs.full_backfill_run != ''");
+  expect(yml).toContain("run-id: ${{ inputs.full_backfill_run }}");
+  expect(yml.indexOf("backlog-ops-bound/full")).toBeLessThan(yml.indexOf("run: bun scripts/backlog-ops.ts"));
+  // The refresh's database secret: its mode starts with backfill-.
+  expect("backfill-refresh-execute".startsWith("backfill-")).toBe(true);
   expect(yml).toContain("run-name: ${{ github.event_name == 'workflow_dispatch' && format('backlog ops {0} {1}', inputs.mode, inputs.sha)");
   expect(backlogOpsRunName("drain-dry", sha)).toBe(`backlog ops drain-dry ${sha}`);
   // Dispatches serialise with every guarded production operator on the owner database.
@@ -533,7 +553,7 @@ test("workflow: dispatch inputs, gates, one credential step, OIDC, protected var
   expect(code_).not.toMatch(/checkpoint|start-after|--org/);
   expect(yml).toContain("name: backlog-ops-receipt");
   expect(yml).toContain("path: ${{ runner.temp }}/backlog-ops-out/backlog-ops-receipt.json");
-  for (const kind of ["dry", "backfill", "export"]) expect(yml).toContain(`path: \${{ runner.temp }}/backlog-ops-bound/${kind}`);
+  for (const kind of ["dry", "backfill", "full", "export"]) expect(yml).toContain(`path: \${{ runner.temp }}/backlog-ops-bound/${kind}`);
   // The proof job has no environment and no secret.
   const proof = yml.slice(yml.indexOf("  proof:"), yml.indexOf("  prerequisite-gate:"));
   expect(proof).not.toMatch(/^\s+environment:/m);
@@ -571,4 +591,178 @@ test("target: multi-region (mrk-) KMS key ids are accepted, other key-id shapes 
   const mrk = { ...target, BACKLOG_OPS_KMS_KEY_ARN: "arn:aws:kms:us-east-1:000000000000:key/mrk-" + "0".repeat(32) };
   expect(codeSync(() => backlogOpsTarget(mrk))).toBeNull();
   expect(codeSync(() => backlogOpsTarget({ ...target, BACKLOG_OPS_KMS_KEY_ARN: "arn:aws:kms:us-east-1:000000000000:key/mrk-xyz" }))).toBe("backlog_ops_target_kms");
+});
+
+// ---- refresh: backfill-refresh-dry / backfill-refresh-execute, and the drain's FULL binding ----
+
+const fingerprint = { revisions_count: 10, revisions_max_updated_ms: 1_700_000_000_000, ownership_count: 4, ownership_hash: 123_456_789,
+  slots_owned_count: 7, slots_revision_sum: 21, slots_hash: 987_654_321 };
+const fullOk = { ...backfillOk, fingerprint };
+const refreshOk = { mode: "execute", sections: { fences: "complete", ownership: "complete", revisions: "not_run" }, fingerprint };
+const drainFullEnv = (extra: Record<string, string> = {}) => dispatchEnv("drain-execute", {
+  BACKLOG_OPS_FULL_BACKFILL_RUN: FULL,
+  BACKLOG_OPS_CONFIRMATION: `DRAIN-EXECUTE ${sha} DRY ${DRY} BACKFILL ${BACKFILL} FULL ${FULL} EXPORT ${EXPORT}`, ...extra });
+
+test("refresh dispatch: its own modes; FULL only on drain-execute; exact confirmations; dormant like every execute", () => {
+  const ok = (env: Record<string, string>) => codeSync(() => backlogOpsDispatch(env, true));
+  // backfill-refresh-execute binds only its own dry run; its confirmation names its own mode.
+  const r = backlogOpsDispatch(dispatchEnv("backfill-refresh-execute"), true);
+  expect(r.confirmation).toBe(`BACKFILL-REFRESH-EXECUTE ${sha} DRY ${DRY}`);
+  expect(r.fullBackfillRun).toBeNull();
+  expect(ok(dispatchEnv("backfill-refresh-execute", { BACKLOG_OPS_CONFIRMATION: `BACKFILL-EXECUTE ${sha} DRY ${DRY}` }))).toBe("backlog_ops_confirmation");
+  expect(ok(dispatchEnv("backfill-refresh-execute", { BACKLOG_OPS_BACKFILL_RUN: BACKFILL }))).toBe("backlog_ops_backfill_run");
+  expect(ok(dispatchEnv("backfill-refresh-dry", { BACKLOG_OPS_DRY_RUN: DRY }))).toBe("backlog_ops_dry_run");
+  expect(codeSync(() => backlogOpsDispatch(dispatchEnv("backfill-refresh-execute"), false))).toBe("backlog_ops_dormant");
+  // drain-execute with FULL.
+  const d = backlogOpsDispatch(drainFullEnv(), true);
+  expect(d.fullBackfillRun).toBe(FULL);
+  expect(d.confirmation).toBe(`DRAIN-EXECUTE ${sha} DRY ${DRY} BACKFILL ${BACKFILL} FULL ${FULL} EXPORT ${EXPORT}`);
+  // Confirmation mismatches: FULL left out, misplaced, a wrong id; or FULL typed without the input.
+  for (const c of [`DRAIN-EXECUTE ${sha} DRY ${DRY} BACKFILL ${BACKFILL} EXPORT ${EXPORT}`,
+    `DRAIN-EXECUTE ${sha} DRY ${DRY} BACKFILL ${BACKFILL} EXPORT ${EXPORT} FULL ${FULL}`,
+    `DRAIN-EXECUTE ${sha} DRY ${DRY} FULL ${FULL} BACKFILL ${BACKFILL} EXPORT ${EXPORT}`,
+    `DRAIN-EXECUTE ${sha} DRY ${DRY} BACKFILL ${BACKFILL} FULL 555 EXPORT ${EXPORT}`])
+    expect(ok(drainFullEnv({ BACKLOG_OPS_CONFIRMATION: c }))).toBe("backlog_ops_confirmation");
+  expect(ok(dispatchEnv("drain-execute", { BACKLOG_OPS_CONFIRMATION: `DRAIN-EXECUTE ${sha} DRY ${DRY} BACKFILL ${BACKFILL} FULL ${FULL} EXPORT ${EXPORT}` })))
+    .toBe("backlog_ops_confirmation");
+  // FULL anywhere else, malformed, or the same run as another binding.
+  for (const mode of BACKLOG_OPS_MODES.filter((m) => m !== "drain-execute" && m !== "presence-dry"))
+    expect(ok(dispatchEnv(mode, { BACKLOG_OPS_FULL_BACKFILL_RUN: FULL }))).toBe("backlog_ops_full_backfill_run");
+  for (const bad of ["0", "abc", " 444", "4".repeat(21)]) expect(ok(drainFullEnv({ BACKLOG_OPS_FULL_BACKFILL_RUN: bad }))).toBe("backlog_ops_full_backfill_run");
+  expect(ok(drainFullEnv({ BACKLOG_OPS_FULL_BACKFILL_RUN: BACKFILL }))).toBe("backlog_ops_bindings");
+});
+
+test("refresh bindings: a refresh's DRY is a refresh dry; the drain's BACKFILL is a refresh exactly when FULL is given", () => {
+  const b = (env: Record<string, string>) => backlogOpsBindings(backlogOpsDispatch(env, true)).map((x) => [x.kind, x.mode, x.run]);
+  expect(b(dispatchEnv("backfill-refresh-execute"))).toEqual([["dry", "backfill-refresh-dry", DRY]]);
+  expect(b(dispatchEnv("backfill-execute"))).toEqual([["dry", "backfill-dry", DRY]]);
+  expect(b(dispatchEnv("export-execute"))).toEqual([["dry", "export-dry", DRY], ["backfill", "backfill-execute", BACKFILL]]);
+  expect(b(dispatchEnv("drain-execute"))).toEqual([["dry", "drain-dry", DRY], ["backfill", "backfill-execute", BACKFILL], ["export", "export-execute", EXPORT]]);
+  expect(b(drainFullEnv())).toEqual([["dry", "drain-dry", DRY], ["backfill", "backfill-refresh-execute", BACKFILL],
+    ["full", "backfill-execute", FULL], ["export", "export-execute", EXPORT]]);
+  // A hand-built dispatch cannot bind FULL elsewhere.
+  const exp = backlogOpsDispatch(dispatchEnv("export-execute"), true);
+  expect(codeSync(() => backlogOpsBindings({ ...exp, fullBackfillRun: FULL }))).toBe("backlog_ops_full_backfill_run");
+});
+
+test("refresh receipts: revisions not_run accepted only for a refresh mode; a full run never stands in for one, nor the reverse", () => {
+  const ok = (raw: string, mode: BacklogOpsMode, run: string) => codeSync(() => checkBoundReceipt(raw, { mode, sha, run, kind: "backfill" }));
+  expect(ok(receipt("backfill-refresh-execute", BACKFILL, refreshOk), "backfill-refresh-execute", BACKFILL)).toBeNull();
+  expect(ok(receipt("backfill-refresh-dry", DRY, { ...refreshOk, mode: "dry_run" }), "backfill-refresh-dry", DRY)).toBeNull();
+  // A refresh receipt offered as a full binding (export-execute's BACKFILL, the drain's FULL): its mode differs.
+  expect(ok(receipt("backfill-refresh-execute", FULL, refreshOk), "backfill-execute", FULL)).toBe("backlog_ops_bound_backfill_receipt");
+  // A refresh-shaped summary under a full mode (revisions not_run): incomplete.
+  expect(ok(receipt("backfill-execute", FULL, refreshOk), "backfill-execute", FULL)).toBe("backlog_ops_backfill_incomplete");
+  expect(ok(receipt("backfill-dry", DRY, { ...refreshOk, mode: "dry_run" }), "backfill-dry", DRY)).toBe("backlog_ops_backfill_incomplete");
+  // A full receipt offered as the refresh: its mode differs; relabelled, its revisions ran.
+  expect(ok(receipt("backfill-execute", BACKFILL, fullOk), "backfill-refresh-execute", BACKFILL)).toBe("backlog_ops_bound_backfill_receipt");
+  expect(ok(receipt("backfill-refresh-execute", BACKFILL, fullOk), "backfill-refresh-execute", BACKFILL)).toBe("backlog_ops_backfill_sections");
+  // A refresh whose fences or ownership is incomplete.
+  for (const k of ["fences", "ownership"])
+    expect(ok(receipt("backfill-refresh-execute", BACKFILL, { ...refreshOk, sections: { ...refreshOk.sections, [k]: "incomplete" } }), "backfill-refresh-execute", BACKFILL))
+      .toBe("backlog_ops_backfill_incomplete");
+});
+
+test("refresh fingerprints: equal passes; each field differing, missing, null or unsafe refuses backlog_ops_backfill_stale; same scope only", () => {
+  const ok = (full: unknown, refresh: unknown) => codeSync(() => checkRefreshFingerprint(JSON.stringify(full), JSON.stringify(refresh)));
+  const wrap = (summary: unknown, scope?: string) => ({ contract: BACKLOG_OPS_RECEIPT_CONTRACT, mode: "backfill-execute", sha, run: FULL, exitCode: 0, summary, ...(scope ? { scope } : {}) });
+  expect(ok(wrap(fullOk), wrap(refreshOk))).toBeNull();
+  expect(BACKLOG_OPS_FINGERPRINT_FIELDS.length).toBe(7);
+  for (const k of BACKLOG_OPS_FINGERPRINT_FIELDS) {
+    expect(ok(wrap(fullOk), wrap({ ...refreshOk, fingerprint: { ...fingerprint, [k]: fingerprint[k] + 1 } }))).toBe("backlog_ops_backfill_stale");
+    const { [k]: _drop, ...without } = fingerprint;
+    expect(ok(wrap({ ...fullOk, fingerprint: without }), wrap(refreshOk))).toBe("backlog_ops_backfill_stale");
+    for (const bad of [null, -1, 1.5, 2 ** 53, "1"]) expect(ok(wrap(fullOk), wrap({ ...refreshOk, fingerprint: { ...fingerprint, [k]: bad } }))).toBe("backlog_ops_backfill_stale");
+  }
+  // Either receipt without a fingerprint (an older full run): stale, never passes.
+  expect(ok(wrap(backfillOk), wrap(refreshOk))).toBe("backlog_ops_backfill_stale");
+  expect(ok(wrap(fullOk), wrap({ ...refreshOk, fingerprint: undefined }))).toBe("backlog_ops_backfill_stale");
+  expect(codeSync(() => checkRefreshFingerprint("{", JSON.stringify(wrap(refreshOk))))).toBe("backlog_ops_backfill_stale");
+  // Different scopes are not comparable.
+  const scoped = backlogOpsScope({ BACKLOG_OPS_ORGS: ORG1 }).id;
+  expect(ok(wrap(fullOk, "all"), wrap(refreshOk, scoped))).toBe("backlog_ops_bound_full_scope");
+  expect(ok(wrap(fullOk, scoped), wrap(refreshOk, scoped))).toBeNull();
+});
+
+test("the credential step checks FULL's receipt and the fingerprints before any credential, from the downloaded paths", () => {
+  const env = { ...drainFullEnv(), RUNNER_TEMP: "/tmp/rt" };
+  const bf = "/tmp/rt/backlog-ops-bound/backfill/backlog-ops-receipt.json", full = "/tmp/rt/backlog-ops-bound/full/backlog-ops-receipt.json";
+  const files: Record<string, string | undefined> = {
+    "/tmp/rt/backlog-ops-bound/dry/backlog-ops-receipt.json": receipt("drain-dry", DRY, { mode: "dry_run", listed: 1 }),
+    [bf]: receipt("backfill-refresh-execute", BACKFILL, refreshOk),
+    [full]: receipt("backfill-execute", FULL, fullOk),
+    "/tmp/rt/backlog-ops-bound/export/backlog-ops-receipt.json": receipt("export-execute", EXPORT, exportOk),
+  };
+  const read = (p: string) => { const v = files[p]; if (v === undefined) throw new Error("missing"); return v; };
+  const d = backlogOpsDispatch(env, true);
+  expect(codeSync(() => checkBoundReceipts(env, d, read))).toBeNull();
+  const swap = (path: string, raw: string | undefined) => {
+    const old = files[path];
+    files[path] = raw;
+    const c = codeSync(() => checkBoundReceipts(env, d, read));
+    files[path] = old;
+    return c;
+  };
+  // Stale: the refresh saw other inputs.
+  expect(swap(bf, receipt("backfill-refresh-execute", BACKFILL, { ...refreshOk, fingerprint: { ...fingerprint, slots_hash: 1 } }))).toBe("backlog_ops_backfill_stale");
+  // FULL from before fingerprints.
+  expect(swap(full, receipt("backfill-execute", FULL, backfillOk))).toBe("backlog_ops_backfill_stale");
+  // A refresh offered as FULL; a full run offered as the refresh.
+  expect(swap(full, receipt("backfill-refresh-execute", FULL, refreshOk))).toBe("backlog_ops_bound_backfill_receipt");
+  expect(swap(bf, receipt("backfill-execute", BACKFILL, fullOk))).toBe("backlog_ops_bound_backfill_receipt");
+  // FULL's receipt missing.
+  expect(swap(full, undefined)).toBe("backlog_ops_bound_full_missing");
+  // Without FULL, a refresh as the drain's BACKFILL is refused (that binding wants a full backfill-execute).
+  const plain = { ...dispatchEnv("drain-execute"), RUNNER_TEMP: "/tmp/rt" };
+  expect(codeSync(() => checkBoundReceipts(plain, backlogOpsDispatch(plain, true), read))).toBe("backlog_ops_bound_backfill_receipt");
+});
+
+const refreshFixture = (f: Fixture) => {
+  f.bound[BACKFILL] = f.mk(BACKFILL, "backfill-refresh-execute", 2 * 3600_000);
+  f.bound[FULL] = f.mk(FULL, "backfill-execute", 6 * 3600_000);
+};
+const hoursAgo = (h: number) => new Date(Date.now() - h * 3600_000).toISOString();
+
+test("gate, drain-execute with FULL: a fresh refresh, a full run before it under 24 h, the export after the refresh", async () => {
+  const g = (mutate: (f: Fixture) => void = () => {}) =>
+    gate("drain-execute", (f) => { refreshFixture(f); mutate(f); }, drainFullEnv());
+  expect(await g()).toBeNull();
+  const seen: string[] = [];
+  expect(await gate("drain-execute", refreshFixture, drainFullEnv(), true, seen)).toBeNull();
+  expect(seen.some((p) => p.endsWith(`/actions/runs/${FULL}`))).toBe(true);
+  expect(seen.some((p) => p.endsWith(`/actions/runs/${FULL}/artifacts?per_page=100`))).toBe(true);
+  const cases: Array<[(f: Fixture) => void, string]> = [
+    // The refresh older than 3 h.
+    [(f) => { f.bound[BACKFILL].created_at = hoursAgo(3.1); }, "backlog_ops_gate_backfill_run"],
+    // FULL older than 24 h.
+    [(f) => { f.bound[FULL].created_at = hoursAgo(24.5); }, "backlog_ops_gate_full_run"],
+    // FULL created after the refresh.
+    [(f) => { f.bound[FULL].created_at = hoursAgo(1.5); }, "backlog_ops_gate_full_order"],
+    // The export created before the refresh (although after FULL).
+    [(f) => { f.bound[EXPORT].created_at = hoursAgo(2.5); }, "backlog_ops_gate_order"],
+    // A refresh offered as FULL; a full run offered as the refresh.
+    [(f) => { f.bound[FULL].display_title = backlogOpsRunName("backfill-refresh-execute", sha); }, "backlog_ops_gate_full_run"],
+    [(f) => { f.bound[BACKFILL].display_title = backlogOpsRunName("backfill-execute", sha); }, "backlog_ops_gate_backfill_run"],
+    // FULL not a clean first-attempt success by the dispatcher, at this sha, with one receipt.
+    [(f) => { f.bound[FULL].conclusion = "failure"; }, "backlog_ops_gate_full_run"],
+    [(f) => { f.bound[FULL].run_attempt = 2; }, "backlog_ops_gate_full_run"],
+    [(f) => { f.bound[FULL].actor.login = "relay-bot"; }, "backlog_ops_gate_full_run"],
+    [(f) => { f.bound[FULL].head_sha = "b".repeat(40); }, "backlog_ops_gate_full_run"],
+    [(f) => { f.artifacts[FULL] = 0; }, "backlog_ops_gate_full_artifact"],
+  ];
+  for (const [mutate, want] of cases) expect(await g(mutate)).toBe(want);
+});
+
+test("gate: a refresh never satisfies a full-run binding, nor a full run a refresh binding", async () => {
+  const asRefresh = (f: Fixture) => { f.bound[BACKFILL] = f.mk(BACKFILL, "backfill-refresh-execute", 2 * 3600_000); };
+  // The drain without FULL, and export-execute: their BACKFILL must be a full backfill-execute.
+  expect(await gate("drain-execute", asRefresh)).toBe("backlog_ops_gate_backfill_run");
+  expect(await gate("export-execute", asRefresh)).toBe("backlog_ops_gate_backfill_run");
+  // backfill-refresh-execute's DRY must be a refresh dry, and a full backfill-execute's a full one.
+  expect(await gate("backfill-refresh-execute")).toBeNull();
+  expect(await gate("backfill-refresh-execute", (f) => { f.bound[DRY].display_title = backlogOpsRunName("backfill-dry", sha); })).toBe("backlog_ops_gate_dry_run");
+  expect(await gate("backfill-execute", (f) => { f.bound[DRY].display_title = backlogOpsRunName("backfill-refresh-dry", sha); })).toBe("backlog_ops_gate_dry_run");
+  // The run's own title must name its own mode.
+  expect(await gate("backfill-refresh-execute", (f) => { f.run.display_title = backlogOpsRunName("backfill-execute", sha); })).toBe("backlog_ops_gate_run");
+  expect(backlogOpsRunName("backfill-refresh-execute", sha)).not.toBe(backlogOpsRunName("backfill-execute", sha));
 });

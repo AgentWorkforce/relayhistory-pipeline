@@ -38,6 +38,7 @@ import {
   backlogOpsTarget,
   backlogOpsToolArgs,
   checkBoundReceipt,
+  checkRefreshFingerprint,
   checkStsExpiration,
   parseStsCredentials,
   refuseBacklogOps as refuse,
@@ -89,14 +90,24 @@ export function backlogOpsChildSpawn(
   };
 }
 
-/** Every bound run's receipt, from the artifacts the workflow downloaded, before any credential: same org scope. */
+/**
+ * Every bound run's receipt, from the artifacts the workflow downloaded, before any credential: same org scope, the
+ * binding's mode (a refresh only where the binding is one). With FULL, the refresh's input fingerprint must equal
+ * FULL's (checkRefreshFingerprint, backlog_ops_backfill_stale).
+ */
 export function checkBoundReceipts(env: Record<string, string | undefined>, d: BacklogOpsDispatch, read = (p: string) => readFileSync(p, "utf8")) {
   const paths = backlogOpsPaths(env), scope = backlogOpsScope(env).id;
+  const raws: Partial<Record<string, string>> = {};
   for (const b of backlogOpsBindings(d)) {
     const path = paths.bound(b.kind);
     let raw: string;
     try { raw = read(path); } catch { return refuse(`backlog_ops_bound_${b.kind}_missing`); }
     checkBoundReceipt(raw, { mode: b.mode, sha: d.sha, run: b.run, scope, kind: b.kind });
+    raws[b.kind] = raw;
+  }
+  if (d.fullBackfillRun !== null) {
+    if (raws.full === undefined || raws.backfill === undefined) refuse("backlog_ops_bound_full_missing");
+    checkRefreshFingerprint(raws.full, raws.backfill);
   }
 }
 

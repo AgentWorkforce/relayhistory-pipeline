@@ -104,7 +104,37 @@ export interface BackfillSummary {
     failed_codes: Record<string, number>;
   };
   sections: Record<BackfillSection, "complete" | "incomplete" | "not_run">;
+  /** The run's input fingerprint, read before any section (BackfillFingerprint). */
+  fingerprint: BackfillFingerprint;
 }
+
+/**
+ * The scope's revision-section inputs, summarised at the start of every run (dry and execute) in ONE REPEATABLE READ
+ * READ ONLY transaction (one snapshot): ingest_record_revisions (rows, and the latest updated_at in epoch ms, 0 when
+ * none: every revision upsert sets it), ingest_session_ownership (rows, and a content hash of every row's key) and
+ * the owned ingest_lazy_native_slots (rows, the sum of current_revision, and a content hash of every row's key and
+ * current custody). The backlog-ops gate lets a drain bind a fences+ownership REFRESH beside a FULL run only when the
+ * two fingerprints are equal: no revision, ownership or owned-slot row the refresh did not re-read changed since the
+ * full run began (an insert or delete moves a count; an upsert moves the revisions' max updated_at; a swapped or
+ * rewritten ownership or slot row moves its hash).
+ *
+ * Every value is a non-negative safe integer (receipts are counts only). `slots_revision_sum` is taken modulo 2^53
+ * and the two hashes are sums of Postgres's hashtext (a signed int4) normalised into [0, 2^40); all are equality
+ * checks, so the wrap loses only changes of an exact multiple of the modulus. hashtext is a server-internal hash,
+ * stable within one server but not a cross-version contract: the fingerprint is compared only between two receipts
+ * at the same commit from the same database, under 24 h apart, and is never stored outside the receipts.
+ */
+export interface BackfillFingerprint {
+  revisions_count: number;
+  revisions_max_updated_ms: number;
+  ownership_count: number;
+  ownership_hash: number;
+  slots_owned_count: number;
+  slots_revision_sum: number;
+  slots_hash: number;
+}
+export const SLOTS_REVISION_SUM_MODULUS = "9007199254740992"; // 2^53
+export const FINGERPRINT_HASH_MODULUS = "1099511627776"; // 2^40
 
 const SCOPE = `($1::text[] IS NULL OR org_id = ANY($1::text[]))`;
 /**
@@ -208,6 +238,23 @@ FROM sessions.ingest_record_revisions
 WHERE ${SCOPE} AND (org_id, workspace_id, origin_id, record_id) > ($2::text, $3::text, $4::text, $5::text)
 ORDER BY org_id, workspace_id, origin_id, record_id
 LIMIT $6::int`;
+
+/** The fingerprint's three reads (BackfillFingerprint), run in one read-only transaction, so one snapshot. */
+const FINGERPRINT_REVISIONS = `
+SELECT count(*)::bigint AS n, coalesce(floor(extract(epoch FROM max(updated_at)) * 1000), 0)::bigint AS max_ms
+FROM sessions.ingest_record_revisions WHERE ${SCOPE}`;
+/** A row-content hash sum in [0, 2^40): hashtext is a signed int4 and % keeps the sign, so it is normalised. */
+const hashSum = (row: string) =>
+  `(((coalesce(sum(hashtext(${row})::bigint), 0) % ${FINGERPRINT_HASH_MODULUS}) + ${FINGERPRINT_HASH_MODULUS}) % ${FINGERPRINT_HASH_MODULUS})::bigint`;
+const FINGERPRINT_OWNERSHIP = `
+SELECT count(*)::bigint AS n,
+       ${hashSum("concat_ws(E'\\t', org_id, workspace_id, user_id, origin_id, source, session_id)")} AS h
+FROM sessions.ingest_session_ownership WHERE ${SCOPE}`;
+// Every nullable column coalesced to a fixed sentinel, so a NULL keeps its position and the row still counts.
+const FINGERPRINT_SLOTS = `
+SELECT count(*)::bigint AS n, (coalesce(sum(current_revision), 0) % ${SLOTS_REVISION_SUM_MODULUS})::bigint AS rev_sum,
+       ${hashSum("concat_ws(E'\\t', key_sha256, current_owner, coalesce(current_source, '~'), coalesce(current_session, '~'), coalesce(current_revision::text, '~'), coalesce(current_digest, '~'))")} AS h
+FROM sessions.ingest_lazy_native_slots WHERE ${SCOPE} AND current_owner IS NOT NULL`;
 
 const userKey = (o: unknown, w: unknown, u: unknown) => JSON.stringify([o, w, u]);
 /**
@@ -340,6 +387,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
     ownership: { rows: 0, registered: 0, would_register: 0, unchanged: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, failed: 0, failed_codes: {} },
     revisions: { rows: 0, seed_rows: 0, slot_rows: 0, slots_empty: 0, merged: 0, would_merge: 0, skipped_deleted: 0, skipped_no_fence: 0, invalid: 0, shards: 0, failed: 0, failed_codes: {} },
     sections: { fences: "not_run", ownership: "not_run", revisions: "not_run" },
+    fingerprint: { revisions_count: 0, revisions_max_updated_ms: 0, ownership_count: 0, ownership_hash: 0, slots_owned_count: 0, slots_revision_sum: 0, slots_hash: 0 },
   };
   const { sql } = opts;
 
@@ -444,6 +492,16 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
       }
     })());
     return cache.get(uk)!;
+  }
+
+  // ---- input fingerprint: before any section, one snapshot, every value a safe integer or the run refuses ----
+  {
+    const [revs, owns, slots] = await readOnlyAll([[FINGERPRINT_REVISIONS, [orgs]], [FINGERPRINT_OWNERSHIP, [orgs]], [FINGERPRINT_SLOTS, [orgs]]]);
+    const values = [int(revs![0]?.n), int(revs![0]?.max_ms), int(owns![0]?.n), int(owns![0]?.h), int(slots![0]?.n), int(slots![0]?.rev_sum), int(slots![0]?.h)];
+    if (values.some((v) => v === undefined)) throw new Error("backfill_fingerprint_invalid");
+    const [revisionsCount, maxMs, ownershipCount, ownershipHash, slotsCount, revisionSum, slotsHash] = values as number[];
+    summary.fingerprint = { revisions_count: revisionsCount!, revisions_max_updated_ms: maxMs!, ownership_count: ownershipCount!,
+      ownership_hash: ownershipHash!, slots_owned_count: slotsCount!, slots_revision_sum: revisionSum!, slots_hash: slotsHash! };
   }
 
   // ---- fences ----

@@ -17,32 +17,81 @@ See [decision 0005](decisions/0005-s3-native-upload-ledger.md), "The buffered ba
 | --- | --- | --- |
 | `backfill-dry` | nothing | none |
 | `backfill-execute` | fences, owner stubs, revision shards | `DRY <backfill-dry run>` |
+| `backfill-refresh-dry` | nothing (fences and ownership sections only) | none |
+| `backfill-refresh-execute` | fences, owner stubs (no revisions section) | `DRY <backfill-refresh-dry run>` |
 | `export-dry` | nothing | none |
 | `export-execute` | accepted sidecars, per-org completion | `DRY <export-dry run> BACKFILL <backfill-execute run>` |
 | `drain-dry` | nothing | none |
-| `drain-execute` | canonical layout, index, re-arm and drained markers | `DRY <drain-dry run> BACKFILL <backfill-execute run> EXPORT <export-execute run>` |
+| `drain-execute` | canonical layout, index, re-arm and drained markers | `DRY <drain-dry run> BACKFILL <backfill-execute run> EXPORT <export-execute run>`, or with a refresh `DRY <drain-dry run> BACKFILL <backfill-refresh-execute run> FULL <backfill-execute run> EXPORT <export-execute run>` |
 | `presence-dry` | nothing (dry only; there is no `presence-execute`) | none |
 
-The confirmation is exactly `<MODE uppercase> <sha> DRY <id> [BACKFILL <id>] [EXPORT <id>]`, for example
-`DRAIN-EXECUTE <sha> DRY 111 BACKFILL 222 EXPORT 333`.
+The confirmation is exactly `<MODE uppercase> <sha> DRY <id> [BACKFILL <id>] [FULL <id>] [EXPORT <id>]`, for example
+`DRAIN-EXECUTE <sha> DRY 111 BACKFILL 222 FULL 444 EXPORT 333` or `BACKFILL-REFRESH-EXECUTE <sha> DRY 555`. `FULL` is
+the `full_backfill_run` input, accepted on `drain-execute` only.
 
 `presence-dry` is outside the sequence: a diagnostic for one session, described in
 [Session presence (presence-dry)](#session-presence-presence-dry).
 
-Run them in this order, all at the same `main` commit:
+Run them in this order, all at the same `main` commit, after the scope's Worker HTTP admission stop:
 
 1. `backfill-dry`
-2. `backfill-execute`
+2. `backfill-execute` (the FULL run; about 3-5 hours scoped)
 3. `export-dry`
-4. `export-execute`
-5. `drain-dry`
-6. `backfill-execute` again
-7. `export-execute` again
-8. `drain-execute`
+4. `drain-dry`
+5. `backfill-refresh-dry`
+6. `backfill-refresh-execute` (the refresh: fences and ownership only)
+7. `export-execute`, binding the FULL `backfill-execute` as `BACKFILL`
+8. `drain-execute` with `DRY` the drain-dry, `BACKFILL` the refresh, `FULL` the full run, `EXPORT` step 7
 
-The drain needs a backfill rerun immediately before it, because a control made after a backfill is not in the
-fence. The gate requires the drain's bound backfill to be under 3 hours old and its export to have been created
-after that backfill.
+The drain needs a fresh backfill, because a control (a deletion or reset) made after a backfill is not in the fence.
+A full `backfill-execute` now takes longer than the drain's 3 hour window (its revisions section reads and
+compare-and-swaps millions of shards; even a no-op rerun reads them all), so the drain binds a fresh refresh beside
+the full run it refreshes. Without `FULL`, the drain's rule is unchanged: its `BACKFILL` must be a full
+`backfill-execute` under 3 hours old with every section complete.
+
+### The refresh and its staleness rule
+
+With `FULL`, the gate requires:
+
+| Bound run | Mode | Age | Order | Receipt |
+| --- | --- | --- | --- | --- |
+| `BACKFILL` | `backfill-refresh-execute` | under 3 h | after `FULL` | `fences` and `ownership` complete, `revisions` `not_run` |
+| `FULL` | `backfill-execute` | under 24 h | before `BACKFILL` | every section complete |
+| `EXPORT` | `export-execute` | under 24 h | after `BACKFILL` (the export records the fence views it read) | as for every export |
+
+The refresh has its own modes, so its run-name (`backlog ops backfill-refresh-execute <sha>`) and its receipt's
+`mode` both differ from a full run's. It can never satisfy a full-run binding (`export-execute`'s `BACKFILL`, the
+drain's `FULL`, or the drain's `BACKFILL` without `FULL`), and a full run can never satisfy a refresh binding.
+`revisions` `not_run` is accepted only in a refresh mode's receipt; every other backfill receipt needs all three
+sections complete.
+
+**Why a refresh is enough.** After the scope's Worker HTTP admission stop, no new upload reaches SQL for those orgs,
+so nothing should write a revision, an ownership row or an owned lazy slot for them (admission, and the SQL publish
+and seed paths that follow from what it admitted, write them), and the full run's revision shards and owner stubs stay
+valid for its 24 hour binding window. If any writer still moves one of those rows, the fingerprint below changes and
+the drain refuses. Only the controls can still move (deletions and resets,
+which also clear slots and revisions), and they reach the drain only through the fences. The refresh re-runs exactly
+the fences and ownership sections.
+
+**The fingerprint proves the rest is unchanged.** Every backfill run (dry and execute, full and refresh) first reads,
+in one `REPEATABLE READ READ ONLY` transaction, an input `fingerprint` of its scope, all non-negative safe integers:
+
+| Field | Value |
+| --- | --- |
+| `revisions_count` | `ingest_record_revisions` rows |
+| `revisions_max_updated_ms` | the latest `updated_at` of those rows, epoch milliseconds (every revision upsert sets it); 0 when none |
+| `ownership_count`, `ownership_hash` | `ingest_session_ownership` rows, and the sum of `hashtext` of each row's key, in [0, 2^40) |
+| `slots_owned_count`, `slots_revision_sum` | owned `ingest_lazy_native_slots` rows, and the sum of `current_revision` modulo 2^53 |
+| `slots_hash` | the sum of `hashtext` of each owned slot's key and current custody (owner, source, session, revision, digest; a NULL column hashed as a fixed sentinel), in [0, 2^40) |
+
+Before any credential is read, the credential step requires `FULL`'s and the refresh's fingerprints to be equal, field
+by field, over the same org scope. A difference, or either receipt without a fingerprint (for example a full run from
+before this field), refuses the drain with `backlog_ops_backfill_stale`: run a new full `backfill-execute`. The
+counts catch an insert or delete, the max `updated_at` an upsert, and the hashes a row swapped or rewritten at an
+equal count. `hashtext` is a server-internal hash, stable within one server but not a cross-version contract: the
+fingerprint is compared only between two receipts at the same commit from the same database, under 24 hours apart,
+and is never stored outside the receipts. The sums wrap at their modulus, so a change of an exact multiple of it is
+not seen.
 
 To drain in slices, give `max_objects` and rerun `drain-execute`. Each rerun skips what earlier runs wrote, using
 the create-only `drained` markers. The workflow never passes `--checkpoint-file` or `--start-after`.
@@ -85,9 +134,10 @@ Every execute additionally needs all of the following:
   dispatcher, of the expected mode, under 24 hours old, with exactly one unexpired receipt artifact.
 - **Receipts, checked before any credential is read:**
   - every bound receipt exited 0;
-  - the backfill's `sections` are all `complete`. A backfill-execute therefore cannot pass while any user is
-    `needs_review`: the backfill leaves that section incomplete until the user is resolved, and every later execute
-    stays blocked until then;
+  - the backfill's `sections` are all `complete` (a refresh's: `fences` and `ownership` complete, `revisions`
+    `not_run`). A backfill-execute therefore cannot pass while any user is `needs_review`: the backfill leaves that
+    section incomplete until the user is resolved, and every later execute stays blocked until then;
+  - with `FULL`, the refresh's input fingerprint equals the full run's (`backlog_ops_backfill_stale` otherwise);
   - the export has `failed = 0`, `fence_late = 0` and `orgs.incomplete = 0`.
 - **The tools' own refusals:**
   - the export refuses while the v2 claim-sessions reader gate is off (`export_claim_sessions_gate_off`);

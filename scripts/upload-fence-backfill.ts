@@ -21,7 +21,9 @@
  *
  * Output: one JSON line of counts only (never a tenant id, session id, key or URL), with each section's
  * completion (`sections.fences|ownership|revisions`: complete | incomplete | not_run), which the
- * fence-authority marker's `fenceBackfill` / `ownershipBackfill` / `revisionBackfill` record.
+ * fence-authority marker's `fenceBackfill` / `ownershipBackfill` / `revisionBackfill` record, and the run's input
+ * `fingerprint` (counts and content hashes of the revision, ownership and owned-slot rows, read first in one
+ * read-only snapshot; BackfillFingerprint), which the backlog-ops drain compares between a full run and a refresh.
  */
 import { readFileSync } from "node:fs";
 import pg from "pg";

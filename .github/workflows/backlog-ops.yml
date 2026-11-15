@@ -7,7 +7,9 @@ run-name: ${{ github.event_name == 'workflow_dispatch' && format('backlog ops {0
 # commit flips BACKLOG_OPS_EXECUTE_ENABLED, and is bound by a typed confirmation to earlier successful runs of this
 # workflow at the same commit (its dry run; the backfill; for the drain, a fresh backfill and the export after it),
 # whose receipts are checked before any credential is read. The workflow never passes --checkpoint-file or
-# --start-after: a rerun is safe because the drain skips objects it already marked. The optional org scope is the
+# --start-after: a rerun is safe because the drain skips objects it already marked. backfill-refresh-dry/-execute run
+# the backfill's fences and ownership sections only; a drain may bind a fresh refresh beside the full backfill-execute
+# it refreshes (full_backfill_run) when the two receipts' input fingerprints are equal. The optional org scope is the
 # environment SECRET BACKLOG_OPS_ORGS (a secret, not a variable, so this public repository's logs mask it): unset or
 # empty runs every org; an execute refuses unless its bound runs carry the same scope (src/session-ingest/backlog-ops.ts).
 # presence-dry is DRY ONLY (no presence-execute exists or is accepted): a counts-only look at ONE session for support
@@ -21,7 +23,7 @@ on:
     inputs:
       mode:
         type: choice
-        options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute, presence-dry]
+        options: [backfill-dry, backfill-execute, export-dry, export-execute, drain-dry, drain-execute, presence-dry, backfill-refresh-dry, backfill-refresh-execute]
         default: backfill-dry
         required: true
       sha:
@@ -40,12 +42,16 @@ on:
         description: drain-execute only - a successful export-execute run at the same sha, after the backfill; empty otherwise
         type: string
         default: ""
+      full_backfill_run:
+        description: drain-execute only, optional - the full backfill-execute (under 24h old) that backfill_run, then a backfill-refresh-execute, refreshes; empty otherwise
+        type: string
+        default: ""
       max_objects:
         description: Drain modes only - per-run object budget (empty = unbounded)
         type: string
         default: ""
       confirmation:
-        description: 'Execute: <MODE uppercase> <sha> DRY <dry_run> [BACKFILL <backfill_run>] [EXPORT <export_run>]. Dry modes: empty'
+        description: 'Execute: <MODE uppercase> <sha> DRY <dry_run> [BACKFILL <backfill_run>] [FULL <full_backfill_run>] [EXPORT <export_run>]. Dry modes: empty'
         type: string
         default: ""
   pull_request:
@@ -87,6 +93,7 @@ env:
   BACKLOG_OPS_DRY_RUN: ${{ inputs.dry_run }}
   BACKLOG_OPS_BACKFILL_RUN: ${{ inputs.backfill_run }}
   BACKLOG_OPS_EXPORT_RUN: ${{ inputs.export_run }}
+  BACKLOG_OPS_FULL_BACKFILL_RUN: ${{ inputs.full_backfill_run }}
   BACKLOG_OPS_MAX_OBJECTS: ${{ inputs.max_objects }}
   BACKLOG_OPS_CONFIRMATION: ${{ inputs.confirmation }}
 
@@ -182,6 +189,15 @@ jobs:
           path: ${{ runner.temp }}/backlog-ops-bound/backfill
           repository: ${{ github.repository }}
           run-id: ${{ inputs.backfill_run }}
+          github-token: ${{ github.token }}
+      - name: Download the bound full backfill's receipt (drain-execute with full_backfill_run)
+        if: inputs.mode == 'drain-execute' && inputs.full_backfill_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: backlog-ops-receipt
+          path: ${{ runner.temp }}/backlog-ops-bound/full
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.full_backfill_run }}
           github-token: ${{ github.token }}
       - name: Download the bound export's receipt (drain-execute)
         if: inputs.mode == 'drain-execute'

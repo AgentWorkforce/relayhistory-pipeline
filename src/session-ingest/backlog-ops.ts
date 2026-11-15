@@ -11,7 +11,31 @@
  *   export-execute    DRY <export-dry run> BACKFILL <backfill-execute run>
  *   drain-execute     DRY <drain-dry run>  BACKFILL <backfill-execute run> EXPORT <export-execute run>
  * The drain's BACKFILL must be fresh (BACKLOG_OPS_FRESH_BACKFILL_MS) and its EXPORT must come after it, because a
- * control made after a backfill is not in the fence (the drain's own --execute precondition). The receipts of the
+ * control made after a backfill is not in the fence (the drain's own --execute precondition).
+ *
+ * Refresh: a full backfill-execute takes longer than the drain's freshness window (its revisions section reads and
+ * CAS-writes millions of shards), so the drain may instead bind a fresh REFRESH, its own two modes, which run the
+ * backfill's fences and ownership sections only, beside the FULL backfill-execute it refreshes:
+ *   backfill-refresh-dry      (binds nothing)
+ *   backfill-refresh-execute  DRY <backfill-refresh-dry run>
+ *   drain-execute             DRY <drain-dry run> BACKFILL <backfill-refresh-execute run> FULL <backfill-execute run> EXPORT <export-execute run>
+ * A refresh's mode is in its run-name (display title) and its receipt's `mode`, so it can never satisfy a full-run
+ * binding (export-execute's BACKFILL, the drain's FULL, or the drain's BACKFILL without FULL), nor a full run a
+ * refresh binding. Its receipt must show fences and ownership complete and revisions not_run; every backfill-execute
+ * receipt must show all three complete.
+ * Why that is enough: after the scope's Worker HTTP admission stop (decision 0005's cutover order), no new upload
+ * reaches SQL for those orgs, so nothing should write a revision, an ownership row or an owned lazy slot for them
+ * (admission, and the SQL publish and seed paths that follow from what it admitted, write them); the full run's
+ * revision shards and owner stubs then stay valid for its 24 h binding window. If any writer still moves one of those
+ * rows, the fingerprint changes and the drain refuses: the argument is checked, not assumed. Only the controls can still move
+ * (deletions and resets, which also clear slots and revisions), and they reach the drain only through the fences; the
+ * refresh re-runs exactly the fences and ownership sections. The input fingerprint (upload-fence-backfill.ts
+ * BackfillFingerprint: counts, the revisions' latest updated_at, the revision sum and content hashes of the ownership
+ * and owned-slot rows, read at each run's start in one snapshot) proves that assumption: FULL's and the refresh's must
+ * be equal, field by field, or the drain refuses with backlog_ops_backfill_stale before any credential is read (also
+ * when either receipt has no fingerprint, e.g. one from before this field). FULL must be under
+ * BACKLOG_OPS_BINDING_MAX_AGE_MS old and created before the refresh; the refresh under BACKLOG_OPS_FRESH_BACKFILL_MS
+ * old; the EXPORT created after the refresh (it records the fence views it read). The receipts of the
  * bound runs are downloaded and checked before any credential is read: every backfill section complete; the export
  * with failed = fence_late = orgs.incomplete = 0. The tools enforce the rest themselves: the export refuses while
  * the v2 claim-sessions reader gate is off (export_claim_sessions_gate_off), and the drain refuses beside a live
@@ -45,8 +69,16 @@ export const BACKLOG_OPS_EXECUTE_ENABLED: boolean = true;
 export const BACKLOG_OPS_WORKFLOW = ".github/workflows/backlog-ops.yml";
 export const BACKLOG_OPS_MODES = [
   "backfill-dry", "backfill-execute", "export-dry", "export-execute", "drain-dry", "drain-execute", "presence-dry",
+  "backfill-refresh-dry", "backfill-refresh-execute",
 ] as const;
 export type BacklogOpsMode = (typeof BACKLOG_OPS_MODES)[number];
+/** The backfill's fences+ownership refresh (its tool is `backfill`; see the header). */
+export const isRefresh = (mode: BacklogOpsMode) => mode.startsWith("backfill-refresh-");
+/** The input fingerprint every backfill receipt carries (upload-fence-backfill.ts BackfillFingerprint), field by field. */
+export const BACKLOG_OPS_FINGERPRINT_FIELDS = [
+  "revisions_count", "revisions_max_updated_ms", "ownership_count", "ownership_hash",
+  "slots_owned_count", "slots_revision_sum", "slots_hash",
+] as const;
 export type BacklogOpsTool = "backfill" | "export" | "drain" | "presence";
 /** Tools with a dry mode only: no `<tool>-execute` exists, is accepted or can be enabled. */
 export const BACKLOG_OPS_DRY_ONLY_TOOLS: readonly BacklogOpsTool[] = ["presence"];
@@ -102,6 +134,8 @@ function refuse(code: string): never {
 
 export const toolOf = (mode: BacklogOpsMode): BacklogOpsTool => mode.split("-")[0] as BacklogOpsTool;
 export const isExecute = (mode: BacklogOpsMode) => mode.endsWith("-execute");
+/** An execute's own dry mode (`backfill-refresh-execute` -> `backfill-refresh-dry`). */
+export const dryModeOf = (mode: BacklogOpsMode) => mode.replace(/-execute$/u, "-dry") as BacklogOpsMode;
 
 export interface BacklogOpsDispatch {
   mode: BacklogOpsMode;
@@ -112,15 +146,22 @@ export interface BacklogOpsDispatch {
   backfillRun: string | null;
   /** drain-execute: a successful export-execute at this commit, after the backfill. */
   exportRun: string | null;
+  /**
+   * drain-execute only, optional: the FULL backfill-execute that `backfillRun` (then a backfill-refresh-execute)
+   * refreshes. Null: the drain's backfill is a full backfill-execute, as before.
+   */
+  fullBackfillRun: string | null;
   /** Drain modes only: the per-run object budget (empty = unbounded). */
   maxObjects: number | null;
   confirmation: string;
 }
 
 /** The typed binding an execute must carry, exactly. */
-export function backlogOpsConfirmation(d: Pick<BacklogOpsDispatch, "mode" | "sha" | "dryRun" | "backfillRun" | "exportRun">): string {
+export function backlogOpsConfirmation(d: Pick<BacklogOpsDispatch, "mode" | "sha" | "dryRun" | "backfillRun" | "exportRun"> &
+  Partial<Pick<BacklogOpsDispatch, "fullBackfillRun">>): string {
   return [d.mode.toUpperCase(), d.sha, "DRY", d.dryRun,
-    ...(d.backfillRun ? ["BACKFILL", d.backfillRun] : []), ...(d.exportRun ? ["EXPORT", d.exportRun] : [])].join(" ");
+    ...(d.backfillRun ? ["BACKFILL", d.backfillRun] : []), ...(d.fullBackfillRun ? ["FULL", d.fullBackfillRun] : []),
+    ...(d.exportRun ? ["EXPORT", d.exportRun] : [])].join(" ");
 }
 
 /** The dispatch inputs, checked before any GitHub read or credential. */
@@ -133,7 +174,7 @@ export function backlogOpsDispatch(
   if (BACKLOG_OPS_DRY_ONLY_TOOLS.some((t) => mode === `${t}-execute`)) refuse("backlog_ops_presence_dry_only");
   const dryRun = env.BACKLOG_OPS_DRY_RUN ?? "", backfillRun = env.BACKLOG_OPS_BACKFILL_RUN ?? "",
     exportRun = env.BACKLOG_OPS_EXPORT_RUN ?? "", maxObjects = env.BACKLOG_OPS_MAX_OBJECTS ?? "",
-    confirmation = env.BACKLOG_OPS_CONFIRMATION ?? "";
+    fullBackfillRun = env.BACKLOG_OPS_FULL_BACKFILL_RUN ?? "", confirmation = env.BACKLOG_OPS_CONFIRMATION ?? "";
   if (!(BACKLOG_OPS_MODES as readonly string[]).includes(mode) || !SHA40.test(sha)) refuse("backlog_ops_inputs");
   const m = mode as BacklogOpsMode, tool = toolOf(m), execute = isExecute(m);
   if (execute && enabled !== true) refuse("backlog_ops_dormant");
@@ -141,16 +182,18 @@ export function backlogOpsDispatch(
   if (execute ? !RUN_ID.test(dryRun) : dryRun !== "") refuse("backlog_ops_dry_run");
   if (wantsBackfill ? !RUN_ID.test(backfillRun) : backfillRun !== "") refuse("backlog_ops_backfill_run");
   if (wantsExport ? !RUN_ID.test(exportRun) : exportRun !== "") refuse("backlog_ops_export_run");
+  // FULL: drain-execute only, and optional there (absent = the drain's backfill is a full one, as before).
+  if (fullBackfillRun !== "" && (m !== "drain-execute" || !RUN_ID.test(fullBackfillRun))) refuse("backlog_ops_full_backfill_run");
   let budget: number | null = null;
   if (maxObjects !== "") {
     if (tool !== "drain" || !/^[1-9][0-9]{0,6}$/u.test(maxObjects) || Number(maxObjects) > BACKLOG_OPS_MAX_OBJECTS_CEILING)
       refuse("backlog_ops_max_objects");
     budget = Number(maxObjects);
   }
-  const runs = [dryRun, backfillRun, exportRun].filter((r) => r !== "");
+  const runs = [dryRun, backfillRun, exportRun, fullBackfillRun].filter((r) => r !== "");
   if (new Set(runs).size !== runs.length) refuse("backlog_ops_bindings");
-  const d = { mode: m, sha, dryRun: execute ? dryRun : null, backfillRun: wantsBackfill ? backfillRun : null,
-    exportRun: wantsExport ? exportRun : null, maxObjects: budget, confirmation };
+  const d: BacklogOpsDispatch = { mode: m, sha, dryRun: execute ? dryRun : null, backfillRun: wantsBackfill ? backfillRun : null,
+    exportRun: wantsExport ? exportRun : null, fullBackfillRun: fullBackfillRun === "" ? null : fullBackfillRun, maxObjects: budget, confirmation };
   if (execute ? confirmation !== backlogOpsConfirmation(d) : confirmation !== "") refuse("backlog_ops_confirmation");
   return d;
 }
@@ -220,6 +263,8 @@ export function backlogOpsToolArgs(d: BacklogOpsDispatch, t: BacklogOpsTarget, s
   const args = [execute ? "--execute" : "--dry-run", "--bucket", t.bucket, "--region", t.region,
     ...(execute ? ["--kms-key-arn", t.kmsKeyArn] : []),
     ...(tool === "backfill" ? BACKLOG_OPS_BACKFILL_PAGING : tool === "export" ? BACKLOG_OPS_EXPORT_PAGING : []),
+    // A refresh: the fences and ownership sections only (the tool's closed --section set); a full run passes none (all).
+    ...(isRefresh(d.mode) ? ["--section", "fences", "--section", "ownership"] : []),
     ...(tool === "drain" && d.maxObjects !== null ? ["--max-objects", String(d.maxObjects)] : []),
     ...(scope.orgs ?? []).flatMap((o) => ["--org", o])];
   return { script, args, needsDb: tool !== "drain" };
@@ -302,7 +347,8 @@ const obj = (v: unknown): Record<string, any> | null => (v && typeof v === "obje
  * have exited 0, carry the execute's org scope (a bound backfill or export may also be unscoped; a receipt without a
  * scope is unscoped), and (per tool) pass its readiness check.
  */
-export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; sha: string; run: string; scope?: string; kind?: "dry" | "backfill" | "export" }): void {
+export type BacklogOpsBindingKind = "dry" | "backfill" | "full" | "export";
+export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; sha: string; run: string; scope?: string; kind?: BacklogOpsBindingKind }): void {
   // A presence receipt never feeds an execute (presence binds nothing and nothing binds it).
   if (toolOf(expect.mode) === "presence") refuse("backlog_ops_bound_presence_receipt");
   let r: Record<string, any> | null;
@@ -322,7 +368,15 @@ export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; s
   const tool = toolOf(expect.mode);
   if (tool === "backfill") {
     const sec = obj(s.sections);
-    if (!sec || ["fences", "ownership", "revisions"].some((k) => sec[k] !== "complete")) refuse("backlog_ops_backfill_incomplete");
+    if (!sec) refuse("backlog_ops_backfill_incomplete");
+    if (isRefresh(expect.mode)) {
+      // A refresh (receipt mode backfill-refresh-*, checked above): fences and ownership complete, revisions NOT RUN.
+      if (sec.fences !== "complete" || sec.ownership !== "complete") refuse("backlog_ops_backfill_incomplete");
+      if (sec.revisions !== "not_run") refuse("backlog_ops_backfill_sections");
+    } else if (["fences", "ownership", "revisions"].some((k) => sec[k] !== "complete")) {
+      // Every other backfill receipt: all three complete.
+      refuse("backlog_ops_backfill_incomplete");
+    }
   }
   if (tool === "export") {
     const orgs = obj(s.orgs);
@@ -333,17 +387,48 @@ export function checkBoundReceipt(raw: string, expect: { mode: BacklogOpsMode; s
   }
 }
 
-/** Which earlier runs an execute binds, with the mode each must have been. */
-export function backlogOpsBindings(d: BacklogOpsDispatch): Array<{ run: string; mode: BacklogOpsMode; kind: "dry" | "backfill" | "export" }> {
-  const tool = toolOf(d.mode), out: Array<{ run: string; mode: BacklogOpsMode; kind: "dry" | "backfill" | "export" }> = [];
+/**
+ * Which earlier runs an execute binds, with the mode each must have been. An execute's DRY is its own dry mode (a
+ * refresh's is backfill-refresh-dry). The drain's BACKFILL is a backfill-refresh-execute exactly when FULL is given;
+ * FULL, like export-execute's BACKFILL, is always a full backfill-execute.
+ */
+export interface BacklogOpsBinding { run: string; mode: BacklogOpsMode; kind: BacklogOpsBindingKind }
+export function backlogOpsBindings(d: BacklogOpsDispatch): BacklogOpsBinding[] {
+  const tool = toolOf(d.mode), out: BacklogOpsBinding[] = [];
   if (tool === "presence") {
-    if (d.dryRun || d.backfillRun || d.exportRun) refuse("backlog_ops_bindings");
+    if (d.dryRun || d.backfillRun || d.exportRun || d.fullBackfillRun) refuse("backlog_ops_bindings");
     return out;
   }
-  if (d.dryRun) out.push({ run: d.dryRun, mode: `${tool}-dry` as BacklogOpsMode, kind: "dry" });
-  if (d.backfillRun) out.push({ run: d.backfillRun, mode: "backfill-execute", kind: "backfill" });
+  // Re-checked (backlogOpsDispatch already refuses it), so a hand-built dispatch cannot bind FULL anywhere else.
+  if (d.fullBackfillRun && (d.mode !== "drain-execute" || !d.backfillRun)) refuse("backlog_ops_full_backfill_run");
+  if (d.dryRun) out.push({ run: d.dryRun, mode: dryModeOf(d.mode), kind: "dry" });
+  if (d.backfillRun) out.push({ run: d.backfillRun, mode: d.fullBackfillRun ? "backfill-refresh-execute" : "backfill-execute", kind: "backfill" });
+  if (d.fullBackfillRun) out.push({ run: d.fullBackfillRun, mode: "backfill-execute", kind: "full" });
   if (d.exportRun) out.push({ run: d.exportRun, mode: "export-execute", kind: "export" });
   return out;
+}
+
+/**
+ * The input fingerprints of FULL and of the refresh (the drain's BACKFILL): every field present in both as a
+ * non-negative safe integer, and equal. Anything else (a field missing, null or not a safe integer, a receipt without
+ * a fingerprint at all, or any difference) refuses backlog_ops_backfill_stale: a revision, ownership or owned-slot row
+ * changed after the full run began, which the refresh did not re-read, or it cannot be shown that none did. Both
+ * fingerprints come from the same database and the same commit, under 24 h apart (hashtext is not a cross-version
+ * contract). Called after checkBoundReceipt has accepted both receipts; also refuses unless both have one scope.
+ */
+export function checkRefreshFingerprint(fullRaw: string, refreshRaw: string): void {
+  const read = (raw: string) => {
+    let r: Record<string, any> | null;
+    try { r = obj(JSON.parse(raw)); } catch { r = null; }
+    const f = obj(obj(r?.summary)?.fingerprint);
+    if (!r || !f || !BACKLOG_OPS_FINGERPRINT_FIELDS.every((k) => Number.isSafeInteger(f[k]) && f[k] >= 0))
+      refuse("backlog_ops_backfill_stale");
+    return { scope: r.scope === undefined ? BACKLOG_OPS_SCOPE_ALL : r.scope, f };
+  };
+  const full = read(fullRaw), refresh = read(refreshRaw);
+  // Fingerprints are comparable only over the same scope.
+  if (full.scope !== refresh.scope) refuse("backlog_ops_bound_full_scope");
+  if (BACKLOG_OPS_FINGERPRINT_FIELDS.some((k) => full.f[k] !== refresh.f[k])) refuse("backlog_ops_backfill_stale");
 }
 
 /** The run-name the workflow gives every dispatch: the gate reads a bound run's mode back from it. */
