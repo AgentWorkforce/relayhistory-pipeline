@@ -40,9 +40,9 @@ describe("inbox bridge grants: input", () => {
       expect(s.Effect).toBe("Allow");
       expect(s.Principal).toEqual({ AWS: bridge });
       expect(s.Condition.StringEquals).toEqual({ "kms:ViaService": "s3.us-east-1.amazonaws.com", "kms:CallerAccount": accountId });
-      for (const a of s.Action) expect(["kms:GenerateDataKey", "kms:Encrypt", "kms:Decrypt"]).toContain(a);
+      for (const a of s.Action) expect(["kms:GenerateDataKey", "kms:Decrypt"]).toContain(a);
     }
-    expect(st[0]!.Action).toEqual(["kms:GenerateDataKey", "kms:Encrypt"]);
+    expect(st[0]!.Action).toEqual(["kms:GenerateDataKey"]);
     expect(st[0]!.Condition.StringLike["kms:EncryptionContext:aws:s3:arn"]).toBe("arn:aws:s3:::synthetic-bucket/96bulls/.upload-inbox/*");
     expect(st[1]!.Condition.StringLike["kms:EncryptionContext:aws:s3:arn"]).toMatch(/\/privacy-journal\.json$/);
     expect(st[2]!.Condition.StringLike["kms:EncryptionContext:aws:s3:arn"]).toBe("arn:aws:s3:::synthetic-bucket/96bulls/.ledger/fence-authority/*");
@@ -67,7 +67,8 @@ const STORE = [
 ];
 const RESOURCES = [...STORE, ...SESSION_PIPELINE_RESOURCES, ...UPLOAD_INBOX_RESOURCES];
 const h = (t: string) => createHash("sha256").update(t).digest("hex");
-const scalar = (x: unknown) => typeof x === "string" && /^[A-Za-z][A-Za-z0-9:_./*=-]*$/.test(x) ? x : JSON.stringify(x);
+// Alchemy prints "(known after apply)" unquoted (the role-ARN cascade's placeholder).
+const scalar = (x: unknown) => x === "(known after apply)" || (typeof x === "string" && /^[A-Za-z][A-Za-z0-9:_./*=-]*$/.test(x)) ? String(x) : JSON.stringify(x);
 function yaml(v: unknown, indent: number): string[] {
   const pad = " ".repeat(indent);
   if (Array.isArray(v)) return v.flatMap((item) => {
@@ -155,9 +156,16 @@ describe("inbox bridge grants plan phase", () => {
     expect(() => check(blocks([lb, pb], [lk, pk]), { ...both, "transcript-reader": "update" })).toThrow(/must deploy alone/);
   });
 
-  it("a wall and key re-rendered with the bridge already on them is not this phase (the role-ARN cascade)", () => {
+  it("a wall and key re-rendered with the bridge already on them is not this phase: the role-ARN cascade is the upload inbox update", () => {
     const cascade = (p: unknown) => JSON.parse(JSON.stringify(p).replaceAll(consumer, "(known after apply)"));
-    const result = () => check(blocks([pb, cascade(pb)], [pk, cascade(pk)]), { ...both, "upload-admission": "update" });
-    expect(result).not.toThrow(/inbox bridge grants/);
+    expect(check(blocks([pb, cascade(pb)], [pk, cascade(pk)]), { ...both, "upload-admission": "update" })).toBe("upload inbox update");
+  });
+
+  it("a transcripts update that leaves the policy unchanged (printed unmarked, bridge already on it) is not this phase", () => {
+    const unmarked = [
+      "  [transcripts] update", "  properties:", `    bucketName: ${P.bucket}`, "    policy:", ...yaml(pb, 6),
+      ...mark("-", ["    tags: a"]), ...mark("+", ["    tags: b"]),
+    ];
+    expect(() => check({ transcripts: unmarked }, { transcripts: "update" })).not.toThrow(/inbox bridge grants/);
   });
 });

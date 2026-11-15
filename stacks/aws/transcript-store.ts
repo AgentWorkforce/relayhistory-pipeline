@@ -1128,7 +1128,9 @@ function inboxBridgeGrantsPhase(operations: ReadonlyMap<string, string>, detaile
   const bridgeLines = (text: string | undefined) => (text === undefined ? [] : unquoteYaml(text).split("\n").filter((l) => INBOX_BRIDGE_ENTRY.test(l)));
   const block = (r: string) => (operations.get(r) === "update" ? planResourceBlock(lines, r) : []);
   const bucketBlock = block("transcripts"), keyBlock = block("transcripts-key");
-  const bucket = bucketBlock.some((l) => l.includes("-inbox-bridge")) ? policyDiffSides(bucketBlock, say("transcripts")) : undefined;
+  // Marked (changed) lines only, as the other grant phases: an update that leaves the policy unchanged prints it
+  // unmarked, and with the bridge already live that must not be judged here.
+  const bucket = bucketBlock.some((l) => /^ {2}[+-] /.test(l) && l.includes("-inbox-bridge")) ? policyDiffSides(bucketBlock, say("transcripts")) : undefined;
   const key = keyBlock.some((l) => INBOX_BRIDGE_SID_LINE.test(l)) ? policyDiffSides(keyBlock, say("transcripts-key")) : undefined;
   const ours = (m: Map<string, string>) => JSON.stringify([...m].filter(([sid]) => sid.startsWith(INBOX_BRIDGE_SID_PREFIX)).sort(([a], [b]) => (a < b ? -1 : 1)));
   const wallLive = bucket?.live.bySid.get(INBOX_WALL_SID), wallPlanned = bucket?.planned.bySid.get(INBOX_WALL_SID);

@@ -26,8 +26,9 @@
  *                         scripts/sessions-prod-bucket-notification.sh (one Put owns both Ids).
  *
  * The inbox is walled off in both directions: the bucket policy denies `s3:*` on it to every
- * principal but the two roles above and the eraser, and the writer, reader and srv-writer users
- * carry an explicit identity Deny as well.
+ * principal but the two roles above, the eraser, the presigned issuer and (opt-in, inboxBridgeArn)
+ * the relayhistory-cloud inbox bridge user, and the writer, reader and srv-writer users carry an
+ * explicit identity Deny as well.
  *
  * Not expressible in IAM (enforced by the consumer instead, decision 0004 refusal codes):
  * the `x-amz-checksum-sha256` value (`upload_digest_mismatch`) and `Content-Encoding: zstd`
@@ -253,11 +254,6 @@ export const denyUploadInboxStatement = (bucketArn: string) => ({
   Resource: [uploadInboxObjects(bucketArn)],
 });
 
-/**
- * Bucket-policy statements (flag on): only the two inbox roles and the eraser touch the
- * inbox at all, and only the consumer and the eraser delete there. This covers the pipeline
- * role, the read API, the buffered GC and every operator role, whatever their identity grants.
- */
 // ---- the old-desktop inbox bridge (relayhistory-cloud lib/inbox-bridge.ts), default off ----
 
 /**
@@ -289,12 +285,19 @@ export function inboxBridgeKeyStatements(i: { accountId: string; region: string;
   });
   const Principal = { AWS: i.inboxBridgeArn };
   return [
-    { Sid: "InboxBridgeEncryptsInboxViaS3", Effect: "Allow" as const, Principal, Action: ["kms:GenerateDataKey", "kms:Encrypt"], Resource: "*", Condition: viaFor(`${UPLOAD_INBOX_PREFIX}*`) },
+    // A single SSE-KMS PUT needs only GenerateDataKey (no Encrypt; no Decrypt: the bridge never uses multipart).
+    { Sid: "InboxBridgeEncryptsInboxViaS3", Effect: "Allow" as const, Principal, Action: ["kms:GenerateDataKey"], Resource: "*", Condition: viaFor(`${UPLOAD_INBOX_PREFIX}*`) },
     { Sid: "InboxBridgeReadsJournalsViaS3", Effect: "Allow" as const, Principal, Action: ["kms:Decrypt"], Resource: "*", Condition: viaFor(PRIVACY_JOURNAL_GLOB) },
     { Sid: "InboxBridgeReadsFenceAuthorityViaS3", Effect: "Allow" as const, Principal, Action: ["kms:Decrypt"], Resource: "*", Condition: viaFor(FENCE_AUTHORITY_ORG_MARKERS) },
   ];
 }
 
+/**
+ * Bucket-policy statements (flag on): only the inbox's principals (the consumer, the upload role, the eraser,
+ * the presigned issuer and, opt-in, the inbox bridge) touch the inbox at all, and only the consumer and the
+ * eraser delete there. This covers the pipeline role, the read API, the buffered GC and every operator role,
+ * whatever their identity grants.
+ */
 export function uploadInboxBucketStatements(i: { bucketArn: string; eraserArn: string; uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string; inboxBridgeArn?: string }) {
   const inbox = uploadInboxObjects(i.bucketArn);
   return [
