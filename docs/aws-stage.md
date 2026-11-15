@@ -884,11 +884,11 @@ accepts only the exact 13 transcript-store resources in the initial create,
 known three-resource recovery, one capture-bound post-merge remediation
 (`trail-key` and `trail-logs` update with every other resource `noop`), the
 srv-writer addition (`transcript-srv-writer` create and `transcripts-key`
-update, everything else `noop`), the backlog-ops key grants (below), the inbox bridge grants (below), or final all-noop phase. Both compact and detailed plans must list the same actions and
+update, everything else `noop`), the backlog-ops key grants (below), the inbox bridge grants (below), the adopt identities phase (below), or final all-noop phase. Both compact and detailed plans must list the same actions and
 match the exact paths and sha256 values in the approval-bound provenance. The
 capture command refuses an invalid shape before replacing the reviewed files,
 and deploy checks it again. Any other update count or resource, replacement,
-deletion, import or adoption is rejected. A direct AWS repair does not update
+deletion, import or adoption is rejected, except the `adopted` action of the adopt identities phase. A direct AWS repair does not update
 Alchemy's persisted `oldProps`; the exact two-update Alchemy reconciliation is
 still required, followed by a fresh exact all-noop capture. `NON_DESTROYABLE`
 only blocks the explicit destroy command; it does not stop an ordinary deploy
@@ -907,8 +907,7 @@ and are unaffected.
 **Backlog-ops key grants.** The guarded `backlog ops` workflow (decision 0005: fence backfill,
 accepted-stage export, drain; docs/backlog-ops-workflow.md) assumes two roles in this account,
 `96bulls-<stage>-backlog-ops-read` and `-write`, through GitHub OIDC. The roles, their trust and their
-identity policies are created outside the stack (the contract refuses adoption, and declaring them would
-collide with the live roles). The transcripts key policy delegates no key use to IAM, so the roles also
+identity policies were created outside the stack; they can be brought into it by adoption (below). The transcripts key policy delegates no key use to IAM, so the roles also
 need two key statements, and the stack owns that policy: set
 `transcriptStore.backlogOpsRoles: { "readRoleArn": "arn:aws:iam::<account>:role/96bulls-<stage>-backlog-ops-read",
 "writeRoleArn": "arn:aws:iam::<account>:role/96bulls-<stage>-backlog-ops-write" }` (exactly those two ARNs,
@@ -943,6 +942,55 @@ IAM. So with the upload inbox on, set `transcriptStore.inboxBridgeUserArn:
 
   A plan that changes the bridge's wall entry or key statements in any other phase is refused. Like every phase
   it is judged against Alchemy's state, not the live policies.
+
+**Adopt identities.** The IAM identities created by hand outside the stack are declared in it by
+adoption, in place: Alchemy reads the live identity and keeps it (same ARN, unique id, trust, access keys), so
+nothing is replaced (`stacks/aws/adopt-identities.ts`). Set `transcriptStore.adoptIdentities` with one or more
+groups; unset, nothing is declared and every other resource is byte-identical:
+
+- `"githubOidcProvider": true`: the GitHub Actions OIDC provider (`token.actions.githubusercontent.com`, client
+  id `sts.amazonaws.com`; thumbprints stay AWS-managed).
+- `"backlogOpsRoles": { "read": { "inlinePolicies": {...}, "description"?: "..." }, "write": {...} }`: the roles
+  `96bulls-<stage>-backlog-ops-read` and `-write` at `/`, 6 h sessions, trusted only for this repository's
+  `session-schema-production` (read) and `session-backlog-execute` (write) environment subjects. The repository
+  does not record their identity policies, so paste each role's live inline policies (`aws iam get-role-policy`)
+  and its description, if it has one. The stack refuses a pasted policy that allows more than backlog-ops needs:
+  List/Get on the transcripts bucket (plus Put for the writer), and Decrypt (plus GenerateDataKey) on a key in
+  this account and region, only with `kms:ViaService` = `s3.<region>.amazonaws.com`. A role with an attached managed policy cannot be adopted as is.
+- `"uploadPresignIssuer": true`: the user `96bulls-<stage>-upload-presign-issuer` at `/96bulls/` and its managed
+  policy of the same name at `/` (`uploadPresignIssuerPolicy`). Identity only: the wall entry and key statements
+  naming it are a separate input. Refused together with `transcriptStore.uploadPresignIssuer` (the same user).
+- `"inboxBridge": true`: the user `96bulls-<stage>-inbox-bridge` at `/` and its managed policy of the same name at
+  `/`: exactly relayhistory-cloud `docs/ops/inbox-bridge-iam-policy.json`, rendered with the stage's bucket, key
+  root, key ARN and region.
+
+No access key, login profile or permissions boundary is declared: keys stay in 1Password. Every adopted resource
+is retained, so unsetting a group later only drops it from state.
+
+**Adoption converges, so prove the declaration first.** On apply, Alchemy reconciles each identity to the
+declaration: it detaches managed policies and deletes inline policies that are not declared, rewrites a trust or
+policy that differs, publishes a new default version of a managed policy whose document is not byte-identical,
+and drops tags it does not set. The plan does not show any of that (an adoption is planned against the
+declaration itself). So, before capturing the plan, run the read-only pre-apply diff with the stage inputs and
+read-only credentials for the account:
+
+    bun scripts/adopt-identities-preapply.ts [--inputs .96bulls/aws-sessions-prod/aws-inputs.json]
+
+It fetches each identity the inputs adopt with IAM and KMS get/list/describe calls only, renders the same
+identities as the stack, and exits 1 on any difference (it names fields, never document contents): an identity
+missing (the apply would create one), a path, trust, inline or attached policy, permissions boundary, session
+length or description that differs, or a tag key the stack does not set (it sets `96bulls:stack`,
+`96bulls:component`, `96bulls:repo`, `96bulls:purpose` on the users and roles, and Alchemy's `alchemy::*`). A managed policy
+that is equivalent but not byte-identical is refused too, unless `--allow-equivalent-policy-version` is given;
+then the apply publishes an equivalent new default version. Fix the inputs (or, for a tag, the live identity) and
+run it again until it exits 0. Only then capture.
+
+The plan contract accepts `adopted` only as its own "adopt identities" phase: every listed adopted-identity
+resource is `adopted` or `noop` (at least one adopted), every other resource is `noop`, each group is planned whole,
+and each adopted resource shows no declared property changes in the detailed plan. `adopted` on any other
+resource is refused in every phase, and outside this phase an adopted-identity resource may only be `noop`: a
+`create` means the live identity is gone, and an update or replacement needs its own reviewed phase. The next
+capture after the apply must show them all `noop`. Deploying still needs Khaliq's explicit OK.
 
 **How a capture stays read-only.** `alchemy plan` against `AWS.state` is not
 read-only: Alchemy takes a lease (PUT then DELETE of `__lease__.json`) and

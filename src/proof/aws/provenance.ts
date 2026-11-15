@@ -40,8 +40,9 @@ export const ACCEPTED_PLAN_OPS = ["create", "noop"] as const;
  * Resources a reviewed stage change may update (the two-tenant change in #75
  * updates the umbrella release and the AlleyOop role). Naming them is never
  * enough: updates are admitted only with an approval bound to the exact
- * capture (PlanUpdateApproval). Replace, delete, import and adopt are refused
- * unconditionally.
+ * capture (PlanUpdateApproval). Replace, delete, import and adopt (Alchemy's
+ * `adopted` included) are refused unconditionally: adoption is accepted only by
+ * the aws-sessions-prod contract's own "adopt identities" phase, never here.
  */
 export const REVIEWED_PLAN_UPDATES = ["96bulls", "alleyoop-role"] as const;
 

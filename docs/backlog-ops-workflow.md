@@ -277,6 +277,10 @@ environment are not done yet** (see "Still to apply" below). The two key stateme
 `aws-sessions-prod` stack deploy until the backlog-ops key phase (`transcriptStore.backlogOpsRoles`) lands and is
 set in the stage inputs; until then, re-add them after any stack deploy.
 
+The provider and both roles can be declared in the `aws-sessions-prod` stack by adoption in place
+(`transcriptStore.adoptIdentities`, docs/aws-stage.md "Adopt identities"), after the read-only pre-apply diff
+(`scripts/adopt-identities-preapply.ts`) shows the declaration equals what is live.
+
 No existing principal covers the drain's writes: the transcripts key policy grants key use only to named principals,
 and the srv-writer and writer policies are prefix-scoped. So the workflow needs, in the sessions-prod account:
 

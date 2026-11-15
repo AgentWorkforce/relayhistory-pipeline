@@ -34,8 +34,9 @@ describe("(1) the stage plan must be create/noop only", () => {
     if ("error" in ops) throw new Error(ops.error);
     expect(planOpsIssues(ops)).toEqual(["plan would replace 1 resource(s)", "plan would replace [ingest-cert-validation]"]);
   });
-  test("update / delete / import / adopt are each rejected", () => {
-    for (const op of ["update", "delete", "import", "adopt"]) {
+  test("update / delete / import / adopt / adopted are each rejected", () => {
+    // `adopted` is Alchemy's adoption action: only the aws-sessions-prod contract's "adopt identities" phase takes it.
+    for (const op of ["update", "delete", "import", "adopt", "adopted"]) {
       const ops = parsePlanOps(`Plan: 1 to create, 1 to ${op}\n[cluster] create\n[locker] ${op}\n`);
       if ("error" in ops) throw new Error(ops.error);
       expect(planOpsIssues(ops).length).toBeGreaterThan(0);
