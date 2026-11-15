@@ -42,6 +42,7 @@ import {
   type SessionSummaryInput,
 } from "./engine/summary-contract.ts";
 import { summaryInput } from "./engine/summary-input.ts";
+import { TRANSCRIPT_TEXT_PART_TYPES, codexMessage } from "../shared/codex-transcript.ts";
 
 /** One live pointer of the logical session, from sessions.session_index. */
 export interface BriefPointer {
@@ -150,7 +151,7 @@ function textParts(content: unknown): string | null {
     .filter(
       (part): part is Row =>
         isObject(part) &&
-        ["text", "input_text", "output_text"].includes(String(part.type)) &&
+        TRANSCRIPT_TEXT_PART_TYPES.includes(String(part.type)) &&
         typeof part.text === "string",
     )
     .map((part) => part.text as string);
@@ -166,16 +167,15 @@ export function eventFromTranscriptRecord(
   index: number,
 ): Omit<NormalizedEvent, "id"> | null {
   if (record.isSidechain === true || record.isMeta === true) return null;
-  const payload = isObject(record.payload) ? record.payload : null;
   const message = isObject(record.message) ? record.message : null;
+  const codex = message ? null : codexMessage(record);
   let role: unknown;
   let content: unknown;
   if (message) {
     role = message.role ?? record.type;
     content = message.content;
-  } else if (payload && payload.type === "message") {
-    role = payload.role;
-    content = payload.content;
+  } else if (codex) {
+    ({ role, content } = codex);
   } else {
     role = record.role;
     content = record.content;

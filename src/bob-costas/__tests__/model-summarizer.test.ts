@@ -8,6 +8,7 @@ import {
   summarizerFromEnv,
 } from "../model-summarizer.ts";
 import { digestRecords, extractiveSummarizer, type SessionDigest, type SummaryContext } from "../summarizer.ts";
+import { CODEX_FIRST_PROMPT, codexRollout } from "./fixtures/codex-rollout.ts";
 
 const AWS_KEY = "AKIAIOSFODNN7EXAMPLE";
 const EMAIL = "someone@example.com";
@@ -122,6 +123,14 @@ describe("summarizerFromEnv selection", () => {
 });
 
 describe("prompts", () => {
+  test("a Codex rollout reaches the model with its turns, prompt, tools and model", () => {
+    const input = JSON.parse(buildModelRequest("long", digestRecords("codex", codexRollout), modelSummarizerConfig("m1", {})).input);
+    expect(input.user_turn_count).toBe(2);
+    expect(input.assistant_turn_count).toBe(3);
+    expect(input.user_turns[0]).toBe(CODEX_FIRST_PROMPT);
+    expect(input.tool_calls).toEqual([{ name: "shell", count: 2 }, { name: "apply_patch", count: 1 }]);
+    expect(input.models).toEqual(["gpt-5-codex"]);
+  });
   for (const kind of ["short", "long"] as const) {
     test(`${kind} prompt carries the scrubbed digest fields and no raw secrets`, () => {
       const req = buildModelRequest(kind, digest, modelSummarizerConfig("m1", {}));

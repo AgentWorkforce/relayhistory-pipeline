@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { digestRecords, extractiveSummarizer } from "../summarizer.ts";
+import { CODEX_FIRST_PROMPT, CODEX_SECOND_PROMPT, codexRollout } from "./fixtures/codex-rollout.ts";
 
 const lines = [
   JSON.stringify({ type: "user", message: { role: "user", content: "Please fix the login bug" }, timestamp: "2026-10-28T10:00:00Z" }),
@@ -29,3 +30,30 @@ describe("bob costas extractive summariser", () => {
     expect(s.text).not.toContain("a@b.com");
   });
 });
+
+describe("bob costas digest of a Codex rollout", () => {
+  test("counts user and assistant turns, tools and the model from response_item and turn_context records", () => {
+    const d = digestRecords("codex", codexRollout);
+    expect(d.records).toBe(codexRollout.length);
+    // Developer messages, AGENTS.md and environment context are not user turns.
+    expect(d.userTurns).toEqual([CODEX_FIRST_PROMPT, CODEX_SECOND_PROMPT]);
+    expect(d.assistantTurns).toBe(3);
+    expect(d.toolCalls).toEqual({ shell: 2, apply_patch: 1 });
+    expect(d.models).toEqual(["gpt-5-codex"]);
+    expect(d.firstTs).toBe("2026-11-07T12:49:08.000Z");
+    expect(d.lastTs).toBe("2026-11-07T12:50:05.000Z");
+  });
+  test("the fallback summary names the first prompt and real counts", async () => {
+    const s = await extractiveSummarizer.summarize("short", digestRecords("codex", codexRollout));
+    expect(s.text).toBe(`codex: "${CODEX_FIRST_PROMPT}" — 2 user turns, 3 assistant turns, tools: shell×2, apply_patch×1.`);
+    const long = await extractiveSummarizer.summarize("long", digestRecords("codex", codexRollout));
+    expect(long.text).toContain("- Models: gpt-5-codex");
+    expect(long.text).toContain(`1. ${CODEX_FIRST_PROMPT}`);
+  });
+  test("a Claude-shaped record that happens to carry a payload is still read the Claude way", () => {
+    const d = digestRecords("claude", [JSON.stringify({ type: "user", message: { role: "user", content: "hi" }, payload: { type: "message", role: "assistant" } })]);
+    expect(d.userTurns).toEqual(["hi"]);
+    expect(d.assistantTurns).toBe(0);
+  });
+});
+
