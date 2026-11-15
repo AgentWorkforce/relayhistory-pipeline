@@ -3,7 +3,7 @@
  * (decision 0001: production AWS is S3 only; the migration plan's S5/S6/P9).
  *
  * A stage with `transcriptStore` in its inputs declares this and nothing else
- * from the AWS baseline: no Locker, no ECR, no GitHub OIDC, no EKS, no Supabase.
+ * from the AWS baseline: no Locker, no ECR, no GitHub OIDC (only an adopted one: adoptIdentities), no EKS, no Supabase.
  *
  *   transcripts bucket   96bulls-<stage>-transcripts-<account>   versioned, SSE-KMS (own CMK, no bucket key),
  *                        bucket-owner-enforced, no public access, TLS 1.2+ only, Object Lock off,
@@ -86,6 +86,14 @@
  *                              its three via-S3 statements. The plan contract accepts the change only alone, as its
  *                              own "inbox bridge grants" phase.
  *
+ * The identities created by hand outside the stack (stacks/aws/adopt-identities.ts), default OFF:
+ *
+ *   transcriptStore.adoptIdentities  { githubOidcProvider?, backlogOpsRoles?, uploadPresignIssuer?, inboxBridge? }:
+ *                              each group declares those live identities, adopted in place (never replaced) and
+ *                              retained on removal; no access keys. Unset: nothing declared, every other resource
+ *                              byte-identical. The plan contract accepts the `adopted` action only for them, alone, as
+ *                              its own "adopt identities" phase, after scripts/adopt-identities-preapply.ts is clean.
+ *
  * Pure functions, unit-tested in stacks/aws/__tests__/transcript-store.test.ts;
  * `transcriptStoreStage` declares the resources.
  */
@@ -97,6 +105,7 @@ import { KMS_ADMIN_ACTIONS, denyInsecureTransport, trailKeyPolicy } from "./hard
 import { alchemyStatePrefix } from "./preflight.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
 import { assertBufferedGcRoleArn, bufferedGcBucketStatements, bufferedGcKeyStatements } from "./buffered-gc-policy.ts";
+import { ADOPTED_IDENTITY_GROUPS, ADOPTED_IDENTITY_RESOURCES, adoptedIdentities, assertAdoptIdentitiesInputs, declareAdoptedIdentities, type AdoptIdentitiesInputs } from "./adopt-identities.ts";
 import { BACKLOG_OPS_KEY_SIDS, assertBacklogOpsRoles, backlogOpsKeyStatements, backlogOpsRoleArns, type BacklogOpsRoles } from "./backlog-ops-key-policy.ts";
 import { CROSS_ACCOUNT_WORKER_BUCKET_SIDS, CROSS_ACCOUNT_WORKER_KEY_SIDS, assertCrossAccountWorkerRoleArn, crossAccountWorkerBucketStatements, crossAccountWorkerKeyStatements } from "./cross-account-worker-policy.ts";
 import {
@@ -197,6 +206,12 @@ export interface TranscriptStoreInputs {
    * policy carries its via-S3 statements (inboxBridgeKeyStatements). Omit: both policies byte-for-byte as without it.
    */
   inboxBridgeUserArn?: string;
+  /**
+   * Default off. The IAM identities created by hand outside the stack, adopted in place (adopt-identities.ts):
+   * the GitHub OIDC provider, the backlog-ops roles (their inline policies pasted from live), the presigned issuer
+   * user and the inbox bridge user, each with its managed policy. Omit: nothing is declared.
+   */
+  adoptIdentities?: AdoptIdentitiesInputs;
   /**
    * Log management events too (default true). Set false only when another trail
    * in the account already logs them (a second copy is billed).
@@ -335,7 +350,7 @@ export function assertTranscriptStoreInputs(
   if (inputs.region !== TRANSCRIPT_REGION) refuse(`transcript content must stay in ${TRANSCRIPT_REGION} (migration plan, regional boundaries), got ${inputs.region}`);
   if (inputs.partition !== TRANSCRIPT_PARTITION) refuse(`partition must be exactly ${TRANSCRIPT_PARTITION}, got ${JSON.stringify(inputs.partition)}`);
   for (const k of Object.keys(store))
-    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "uploadControlRoleArn" && k !== "uploadInboxSse" && k !== "uploadAdmission" && k !== "uploadPresignIssuer" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn" && k !== "crossAccountWorkerRoleArn" && k !== "backlogOpsRoles" && k !== "inboxBridgeUserArn") refuse(`transcriptStore.${k} is not a known setting`);
+    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "uploadControlRoleArn" && k !== "uploadInboxSse" && k !== "uploadAdmission" && k !== "uploadPresignIssuer" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn" && k !== "crossAccountWorkerRoleArn" && k !== "backlogOpsRoles" && k !== "inboxBridgeUserArn" && k !== "adoptIdentities") refuse(`transcriptStore.${k} is not a known setting`);
   assertBufferedGcRoleArn(store.bufferedGcRoleArn, inputs.accountId);
   if (store.crossAccountWorkerRoleArn !== undefined) assertCrossAccountWorkerRoleArn(store.crossAccountWorkerRoleArn, inputs.accountId);
   if (store.backlogOpsRoles !== undefined) assertBacklogOpsRoles(store.backlogOpsRoles, inputs.accountId, stage);
@@ -344,6 +359,7 @@ export function assertTranscriptStoreInputs(
     // The wall and its key grants exist only with the upload inbox: a bridge principal without it would be inert.
     if (store.uploadAdmission === undefined) refuse("transcriptStore.inboxBridgeUserArn needs the upload inbox (transcriptStore.uploadAdmission)");
   }
+  assertStoreAdoptIdentities(store, stage, inputs.accountId, inputs.region, refuse);
   assertInboxAuthorityKeyRoot(store.inboxAuthorityKeyRoot, refuse);
   assertUploadControlRoleArn(store.uploadControlRoleArn, refuse);
   assertHostedUploadInboxSse(store.uploadInboxSse, false, refuse);
@@ -358,6 +374,15 @@ export function assertTranscriptStoreInputs(
   // S3 only: production AWS is S3 (decision 0001), and nothing here may empty a bucket.
   for (const k of ["eks", "supabase", "teardown", "accountShared", "lockerNoncurrentVersionDays", "hoopdbSecretArn"] as const)
     if (inputs[k] !== undefined) refuse(`${k} is not allowed (S3 only; never purged on destroy)`);
+}
+
+/** adoptIdentities, and never with the stack's own presigned issuer: one live user may not be declared twice. */
+function assertStoreAdoptIdentities(store: TranscriptStoreInputs, stage: string, accountId: string, region: string, refuse: (why: string) => never) {
+  const n = transcriptNames(stage, accountId);
+  const adopt = assertAdoptIdentitiesInputs(store.adoptIdentities, { accountId, region, bucketName: n.bucket }, refuse);
+  if (adopt?.uploadPresignIssuer && store.uploadPresignIssuer !== undefined)
+    refuse("transcriptStore.adoptIdentities.uploadPresignIssuer and transcriptStore.uploadPresignIssuer declare the same user: set one");
+  return adopt;
 }
 
 const TRANSCRIPT_RESOURCES = [
@@ -395,7 +420,8 @@ export type TranscriptStorePlanPhase =
   | "upload inbox update"
   | "cross-account worker grants"
   | "backlog ops key grants"
-  | "inbox bridge grants";
+  | "inbox bridge grants"
+  | "adopt identities";
 
 /**
  * The read API's own phases (session-read-api.ts). It touches nothing else: no
@@ -705,6 +731,8 @@ function expectedResources(names: Iterable<string>): readonly string[] {
     ...(list.some((n) => (UPLOAD_INBOX_RESOURCES as readonly string[]).includes(n)) ? uploadInboxExpected(list) : []),
     // Optional on top of the upload inbox (uploadPresignIssuer): expected only once listed.
     ...(list.includes(PRESIGN_ISSUER_RESOURCE) ? [PRESIGN_ISSUER_RESOURCE] : []),
+    // Adopted identities (adoptIdentities): a group's resources are planned together, once any is listed.
+    ...Object.values(ADOPTED_IDENTITY_GROUPS).flatMap((group): readonly string[] => (group.some((r: string) => list.includes(r)) ? group : [])),
   ];
 }
 
@@ -802,8 +830,10 @@ function transcriptPlanOperations(text: string, label: "compact" | "detailed", r
   const expected = new Set<string>(expectedResources(operations.keys()));
   for (const resource of operations.keys()) if (!expected.has(resource)) refuse(`${label} plan: unexpected resource ${resource}`);
   for (const resource of expected) if (!operations.has(resource)) refuse(`${label} plan: missing resource ${resource}`);
+  // `adopted` only for the adopted identities (judged by adoptIdentitiesPhase); everywhere else it is forbidden.
   for (const [resource, action] of operations)
-    if (action !== "create" && action !== "update" && action !== "noop") refuse(`${label} plan: ${resource} has forbidden action ${action}`);
+    if (action !== "create" && action !== "update" && action !== "noop" && !(action === "adopted" && ADOPTED_IDENTITY_RESOURCES.includes(resource)))
+      refuse(`${label} plan: ${resource} has forbidden action ${action}`);
 
   const actualCounts = new Map<string, number>();
   for (const action of operations.values()) if (action !== "noop") actualCounts.set(action, (actualCounts.get(action) ?? 0) + 1);
@@ -866,6 +896,9 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   if (provenance.outputs.detailed.sha256 !== sha256(capture.detailedPlanText)) refuse("detailed plan does not match its provenance sha256");
   if (provenance.summary !== compact.summary) refuse("provenance summary does not match the plan summary");
 
+  // Adopted identities: `adopted` alone, before any other phase; otherwise they must be noop.
+  const adoptPhase = adoptIdentitiesPhase(compact.operations, capture.detailedPlanText, refuse);
+  if (adoptPhase) return adoptPhase;
   // The repository rename re-tags the stack: judged on its own (assertRepoTagRenameDiff), before any other phase.
   if (planTouchesRepoTag(capture.detailedPlanText)) {
     assertRepoTagRenameDiff(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
@@ -975,6 +1008,40 @@ function crossAccountWorkerGrantsPhase(operations: ReadonlyMap<string, string>, 
   const roles = new Set(updated.map((r) => assertWorkerGrantDiff(planResourceBlock(lines, r), r, say(r))).filter((v): v is string => v !== undefined));
   if (roles.size > 1) return refuse("cross-account worker grants: the bucket and key policies must name the same role");
   return "cross-account worker grants";
+}
+
+/**
+ * The adopt identities phase (adopt-identities.ts): every listed adopted-identity resource is `adopted` or noop (at
+ * least one adopted: the first apply, or the rest after a partial one), and every other resource is noop. In the
+ * detailed plan each adopted resource shows no declared property changes (Alchemy plans an adoption against the
+ * declaration itself; the live-vs-declared proof is scripts/adopt-identities-preapply.ts). Outside this phase an
+ * adopted-identity resource may only be noop (or, in a repo tag rename, a tag-only update): never created (that
+ * would mean the live identity is gone), updated or replaced, so a later change to one needs its own reviewed
+ * phase. Undefined when nothing is adopted.
+ */
+function adoptIdentitiesPhase(operations: ReadonlyMap<string, string>, detailedPlanText: string, refuse: (why: string) => never): TranscriptStorePlanPhase | undefined {
+  const listed = ADOPTED_IDENTITY_RESOURCES.filter((r) => operations.has(r));
+  const describe = () => [...operations].filter(([, a]) => a !== "noop").map(([r, a]) => `${r}:${a}`).join(", ");
+  // A reviewed repo tag rename re-tags them in place too: assertRepoTagRenameDiff judges those updates (tags only).
+  const retag = planTouchesRepoTag(detailedPlanText);
+  for (const r of listed) {
+    const a = operations.get(r)!;
+    if (a !== "noop" && a !== "adopted" && !(a === "update" && retag)) refuse(`adopt identities: ${r} may only be adopted (in its own phase) or noop, not ${a}`);
+  }
+  const adopted = listed.filter((r) => operations.get(r) === "adopted");
+  if (adopted.length === 0) return undefined;
+  for (const [r, a] of operations) if (a !== "noop" && !adopted.includes(r)) refuse(`adopt identities must deploy alone (every other resource noop): ${describe()}`);
+  const lines = detailedPlanText.split(/\r?\n/);
+  for (const r of adopted) {
+    const start = lines.findIndex((l) => new RegExp(`^\\s*\\[${r.replace(/[-]/g, "\\-")}\\]\\s+adopted\\s*$`).test(l));
+    if (start < 0) refuse(`adopt identities: the detailed plan has no adopted block for ${r}`);
+    const rest = lines.slice(start + 1);
+    const end = rest.findIndex((l) => /^\s*\[[^\]]+\]\s+\S+\s*$/.test(l));
+    const body = (end < 0 ? rest : rest.slice(0, end)).filter((l) => l.trim() !== "");
+    if (body.length !== 1 || body[0]!.trim() !== "no declared property changes")
+      refuse(`adopt identities: ${r} must adopt with no declared property changes (the declaration is what is live)`);
+  }
+  return "adopt identities";
 }
 
 const WORKER_POLICY_RESOURCES = ["transcripts", "transcripts-key"] as const;
@@ -2011,6 +2078,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
     if (i.transcriptStore.crossAccountWorkerRoleArn !== undefined) assertCrossAccountWorkerRoleArn(i.transcriptStore.crossAccountWorkerRoleArn, i.accountId);
     if (i.transcriptStore.backlogOpsRoles !== undefined) assertBacklogOpsRoles(i.transcriptStore.backlogOpsRoles, i.accountId, i.stage);
     assertInboxAuthorityKeyRoot(i.transcriptStore.inboxAuthorityKeyRoot, (why) => { throw new Error(why); });
+    const adopt = assertStoreAdoptIdentities(i.transcriptStore, i.stage, i.accountId, i.region, (why) => { throw new Error(`96bulls: ${i.stage}: ${why}. Nothing was created.`); });
     const uploadDirect = i.historyUploadDirectInfra === true;
     if (i.historyUploadDirectInfra !== undefined && typeof i.historyUploadDirectInfra !== "boolean")
       throw new Error("96bulls: historyUploadDirectInfra must be a boolean. Nothing was created.");
@@ -2177,6 +2245,13 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
       tags: { ...i.tags("kms"), "96bulls:audit-trail": trail.trailName as unknown as string },
     });
     yield* AWS.KMS.Alias("transcripts-key-alias", { aliasName: n.keyAlias, targetKeyId: key.keyId });
+
+    // adoptIdentities: the hand-made identities, adopted in place (after the key: the bridge's policy names it).
+    if (adopt)
+      yield* declareAdoptedIdentities(
+        adoptedIdentities(adopt, { stage: i.stage, accountId: i.accountId, region: i.region, bucketName: n.bucket, keyAlias: n.keyAlias, keyArn: key.keyArn as unknown as string }),
+        i.tags,
+      );
 
     const accessLogs = yield* AWS.S3.Bucket("access-logs", {
       bucketName: n.accessLogBucket,

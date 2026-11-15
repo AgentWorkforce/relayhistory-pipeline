@@ -1,0 +1,98 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InboxWriteCreateOnlySseKms",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::<BUCKET>/<KEY_ROOT>/.upload-inbox/*",
+      "Condition": {
+        "StringEquals": {
+          "s3:if-none-match": "*",
+          "s3:x-amz-server-side-encryption": "aws:kms",
+          "s3:x-amz-server-side-encryption-aws-kms-key-id": "<KMS_KEY_ARN>"
+        }
+      }
+    },
+    {
+      "Sid": "ReadGateAndJournals",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": [
+        "arn:aws:s3:::<BUCKET>/<KEY_ROOT>/.ledger/fence-authority/*",
+        "arn:aws:s3:::<BUCKET>/<KEY_ROOT>/.admission-inbox/*/privacy-journal.json"
+      ]
+    },
+    {
+      "Sid": "ProveAbsenceOfOneKey",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<BUCKET>",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "<KEY_ROOT>/.ledger/fence-authority/*.json",
+            "<KEY_ROOT>/.admission-inbox/*/privacy-journal.json"
+          ]
+        },
+        "NumericLessThanEquals": {
+          "s3:max-keys": "1"
+        }
+      }
+    },
+    {
+      "Sid": "EncryptInboxWritesViaS3",
+      "Effect": "Allow",
+      "Action": "kms:GenerateDataKey",
+      "Resource": "<KMS_KEY_ARN>",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "s3.<REGION>.amazonaws.com"
+        },
+        "StringLike": {
+          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::<BUCKET>/<KEY_ROOT>/.upload-inbox/*"
+        }
+      }
+    },
+    {
+      "Sid": "DecryptGateAndJournalsViaS3",
+      "Effect": "Allow",
+      "Action": "kms:Decrypt",
+      "Resource": "<KMS_KEY_ARN>",
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "s3.<REGION>.amazonaws.com"
+        },
+        "StringLike": {
+          "kms:EncryptionContext:aws:s3:arn": [
+            "arn:aws:s3:::<BUCKET>/<KEY_ROOT>/.ledger/fence-authority/*",
+            "arn:aws:s3:::<BUCKET>/<KEY_ROOT>/.admission-inbox/*/privacy-journal.json"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "NothingElseInS3",
+      "Effect": "Deny",
+      "Action": "s3:*",
+      "NotResource": [
+        "arn:aws:s3:::<BUCKET>/<KEY_ROOT>/.upload-inbox/*",
+        "arn:aws:s3:::<BUCKET>/<KEY_ROOT>/.ledger/fence-authority/*",
+        "arn:aws:s3:::<BUCKET>/<KEY_ROOT>/.admission-inbox/*/privacy-journal.json",
+        "arn:aws:s3:::<BUCKET>"
+      ]
+    },
+    {
+      "Sid": "NoOtherS3Actions",
+      "Effect": "Deny",
+      "NotAction": ["s3:PutObject", "s3:GetObject", "s3:ListBucket"],
+      "Resource": "arn:aws:s3:::*"
+    },
+    {
+      "Sid": "OnlyS3AndKms",
+      "Effect": "Deny",
+      "NotAction": ["s3:*", "kms:*"],
+      "Resource": "*"
+    }
+  ]
+}

@@ -2,9 +2,9 @@
  * accepted-stage export and the buffered drain, run from GitHub, never from an operator's machine).
  *
  * The two roles, their GitHub OIDC trust and their identity policies live OUTSIDE this stack (created by
- * hand in the transcript account with Khaliq's OK, 2026-11-13; docs/backlog-ops-workflow.md). The stack does
- * not declare them: the plan contract refuses adoption and imports, and creating them here would collide
- * with the live roles. The transcripts key policy delegates no key use to IAM, though, so the roles also need
+ * hand in the transcript account with Khaliq's OK, 2026-11-13; docs/backlog-ops-workflow.md). They can be
+ * declared only by adoption in place (adopt-identities.ts, transcriptStore.adoptIdentities.backlogOpsRoles, its
+ * own plan phase); creating them would collide with the live roles. The transcripts key policy delegates no key use to IAM, though, so the roles also need
  * statements on the key, and this stack owns that policy: a hand-merged statement is dropped by the next
  * deploy that updates the key. So the two key statements are declared here, from the role ARNs.
  *

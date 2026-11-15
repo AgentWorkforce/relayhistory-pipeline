@@ -259,8 +259,8 @@ export const denyUploadInboxStatement = (bucketArn: string) => ({
 /**
  * The relayhistory-cloud Worker's bridge for Desktops older than 2026.11.4: it writes their POSTed batches into
  * this inbox as contract objects (relay-upload-inbox-v1), as the presigned issuer's desktops do. Its IAM user
- * lives OUTSIDE this stack (created by hand with Khaliq's OK, like the backlog-ops roles), so the stack only names
- * it: on the inbox wall (otherwise the wall denies it every inbox action) and on the key (this key policy
+ * was created OUTSIDE this stack (by hand with Khaliq's OK, like the backlog-ops roles; adopt-identities.ts can adopt
+ * it and its managed policy in place), so these grants only name it: on the inbox wall (otherwise the wall denies it every inbox action) and on the key (this key policy
  * delegates nothing to IAM). Unset: both policies are byte-for-byte as without it. Its identity policy is
  * relayhistory-cloud docs/ops/inbox-bridge-iam-policy.json.
  */
