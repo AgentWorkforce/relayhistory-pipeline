@@ -655,6 +655,8 @@ export function checkIndexEntryInput(r: IndexEntryInput): void {
  *   mergeIndex(key, fence, origin, entries)  per record: a same-session newer generation wins, else the max
  *                                       revision; an equal revision keeps the stored entry; entries the fence
  *                                       has forgotten are dropped (both stored and incoming). CAS-retried.
+ *   mergeIndexBatches(key, fence, origin, batches)  one read-CAS applying the batches in order, each chosen as one
+ *                                       mergeIndex call chooses: what one mergeIndex per batch would leave, one write
  *   registerOwner(key, doc)           the ownership stub, kept at its oldest generation of its current epoch
  *   writeRearm(key, marker)             the re-arm marker for the eraser: created, or re-armed (If-Match) when present
  *   readBatch(key)                      a batch record, or null when absent

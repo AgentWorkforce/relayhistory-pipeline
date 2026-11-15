@@ -383,6 +383,9 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     await slotOf("dup-2", "s2", 9);
     for (let i = 120; i < 240; i++) await slotOf(`fill-${i}`, "s1", i + 1);
     await slotOf("dup-2", "s3", 6);
+    // dup-2's three slots really sit in three different heap blocks (so three 1-block windows).
+    const blocksOf = await db.query<{ n: number }>("SELECT count(DISTINCT (ctid::text::point)[0])::int AS n FROM sessions.ingest_lazy_native_slots WHERE record_id = 'dup-2'");
+    expect(blocksOf.rows[0]!.n).toBe(3);
     const c = counted();
     const summary = await run(c.store, { orgs: ["org-a"], slotWindowBlocks: 1 });
     expect(summary.revisions).toMatchObject({ slot_rows: 246, merged: 246, failed: 0 });
@@ -398,26 +401,40 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
   });
 
   test("mergeIndexBatches: the same shard as one mergeIndex call per batch, in order", async () => {
-    const fence = newFence();
-    let seed = 7;
-    const rnd = (n: number) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+    // A fence with one completed reset: entries at resets 0 are forgotten, so the drop path runs too.
+    const fence = { ...newFence(), resetsCompleted: 1 } as FenceDoc;
+    let seed = 0x9e3779b9;
+    const rnd = (n: number) => { // xorshift32: every bit is usable
+      seed ^= seed << 13; seed >>>= 0; seed ^= seed >>> 17; seed ^= seed << 5; seed >>>= 0;
+      return seed % n;
+    };
     const shardOf = revisionShard("rec-0");
     const records: string[] = [];
-    for (let i = 0; records.length < 4 && i < 200_000; i++) if (revisionShard(`rec-${i}`) === shardOf) records.push(`rec-${i}`);
-    expect(records.length).toBeGreaterThan(2);
-    for (let round = 0; round < 40; round++) {
-      const batches = Array.from({ length: 1 + rnd(4) }, () => Array.from({ length: rnd(6) }, () => {
-        const full = rnd(2) === 0;
-        return { recordId: records[rnd(records.length)]!, revision: 1 + rnd(4), revisionId: full ? `id-${rnd(3)}` : null,
-          digest: full || rnd(2) === 0 ? hex(String(rnd(3))) : null, sessionKey: sessionKeyHash("claude", `s-${rnd(2)}`), epoch: 0, resets: 0 };
-      }));
+    for (let i = 0; records.length < 3 && i < 200_000; i++) if (revisionShard(`rec-${i}`) === shardOf) records.push(`rec-${i}`);
+    expect(records.length).toBe(3);
+    const sessions = [sessionKeyHash("claude", "s-0"), sessionKeyHash("claude", "s-1"), null];
+    const entry = () => {
+      const full = rnd(2) === 0;
+      return { recordId: records[rnd(records.length)]!, revision: 1 + rnd(4), revisionId: full ? `id-${rnd(3)}` : null,
+        digest: full || rnd(2) === 0 ? hex(String(rnd(3))) : null, sessionKey: sessions[rnd(3)]!, epoch: rnd(3), resets: rnd(3) };
+    };
+    let multi = 0, crossRepeat = 0;
+    for (let round = 0; round < 200; round++) {
+      const batches = Array.from({ length: 1 + rnd(4) }, () => Array.from({ length: rnd(6) }, entry));
+      if (batches.length > 1) multi++;
+      const seen = batches.map((b) => new Set(b.map((e) => e.recordId)));
+      if (seen.some((a, i) => seen.some((b, j) => j > i && [...a].some((r) => b.has(r))))) crossRepeat++;
       const key = s3LedgerKeys(ROOT, A).revisions("origin-9", records[0]!);
       const one = scratch(), two = scratch();
-      for (const st of [one, two]) await io(st).mergeIndex(key, fence, "origin-9", [{ recordId: records[1]!, revision: 2, revisionId: "id-0", digest: hex("1"), sessionKey: sessionKeyHash("claude", "s-0"), epoch: 0, resets: 0 }]);
+      const start = Array.from({ length: 3 }, entry).map((e) => ({ ...e, resets: 1 + rnd(2) })); // a non-empty, kept shard
+      for (const st of [one, two]) await io(st).mergeIndex(key, fence, "origin-9", start);
       for (const b of batches) await io(one).mergeIndex(key, fence, "origin-9", b);
       await io(two).mergeIndexBatches(key, fence, "origin-9", batches);
       expect((await io(two).readIndex(key))?.doc.records).toEqual((await io(one).readIndex(key))?.doc.records);
     }
+    // The generator really reaches the multi-batch path and repeats records across batches.
+    expect(multi).toBeGreaterThan(100);
+    expect(crossRepeat).toBeGreaterThan(50);
   });
 
   test("merge buffer: the fence is read again at merge time; unreadable then, nothing merges (incomplete)", async () => {
