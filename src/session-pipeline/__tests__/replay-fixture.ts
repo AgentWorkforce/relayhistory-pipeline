@@ -10,7 +10,10 @@ import { exportUnit } from "../../migration/neon-s3-sync/export-session.ts";
 import type { SessionUnit } from "../../migration/neon-s3-sync/neon-reader.ts";
 import type { RelayhistoryStreamRecord } from "../../../packages/pipeline/src/lib/pipeline/relayhistory-transform.ts";
 export const REPLAY_FIXTURE_IDENTITY = { orgId:"org_replay",workspaceId:"ws_replay",source:"claude",sessionId:"large:replay" };
-export const REPLAY_FIXTURE_AT = "2026-11-01T10:00:00.000Z";
+// Rolling, not a fixed date: the search indexer only keeps rows inside its coverage window
+// (DEFAULT_WINDOW_DAYS = 14 before now), so a fixed timestamp stops producing index rows two
+// weeks later. Yesterday 10:00 UTC stays inside the window, in the past, and on one UTC day.
+export const REPLAY_FIXTURE_AT = new Date(Math.floor(Date.now() / 86_400_000) * 86_400_000 - 86_400_000 + 36_000_000).toISOString();
 const executor = (pg: PGlite) => ({ async query<T>(sql:string,params?:unknown[]) { if(params?.length)return pg.query<T>(sql,params);const r=await pg.exec(sql);return {rows:(r.at(-1)?.rows??[]) as T[]}; } });
 export async function replayDatabase() {
  const pg = new PGlite({extensions:{btree_gin,pg_trgm}});
