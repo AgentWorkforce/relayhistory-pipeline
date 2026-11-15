@@ -25,6 +25,12 @@ export const CONTENT_PREFIX_CHARS = 4096;
 export const MAX_QUERY_CHARS = 500;
 export const MAX_PAGE_LIMIT = 1000;
 export const MAX_UPSERT_BATCH = 5000;
+/**
+ * The longest SearchQuery.excludeSessionIds list. Equals the read API's
+ * PARTIAL_SESSIONS_CAP (src/session-read-api/queries.ts): the read API excludes
+ * at most the partial sessions one check lists.
+ */
+export const MAX_EXCLUDED_SESSIONS = 1000;
 
 export interface SearchTenant {
   readonly orgId: string;
@@ -88,11 +94,24 @@ export interface SearchScope extends SearchTenant {
   readonly sessionIds: readonly string[];
 }
 
-export type SearchFilter = "session" | "source" | "kind" | "project" | "since" | "until";
+/**
+ * `exclude_session`: the adapter applies SearchQuery.excludeSessionIds. An
+ * adapter that does not declare it may ignore the field, so a caller that
+ * relies on exclusion must check for it before serving (the read API refuses
+ * READ_API_SEARCH_PARTIAL_SESSIONS=skip at startup without it).
+ */
+export type SearchFilter = "session" | "source" | "kind" | "project" | "since" | "until" | "exclude_session";
 
 export interface SearchQuery {
   readonly tenant: SearchTenant;
   readonly sessionId?: string;
+  /**
+   * No row of these sessions is returned, whatever the other filters say (a
+   * query whose sessionId is listed here answers no rows). At most
+   * MAX_EXCLUDED_SESSIONS ids; absent or empty excludes nothing. Applied only
+   * by an adapter declaring the `exclude_session` filter.
+   */
+  readonly excludeSessionIds?: readonly string[];
   readonly source?: string;
   readonly kind?: string;
   readonly projectId?: string;
@@ -264,6 +283,10 @@ export function assertQuery(query: SearchQuery): void {
   }
   for (const id of [query.sessionId, query.source, query.kind, query.projectId]) {
     if (id !== undefined && !nonEmpty(id)) throw new SearchIndexError("invalid_argument");
+  }
+  const excluded = query.excludeSessionIds;
+  if (excluded !== undefined && (!Array.isArray(excluded) || excluded.length > MAX_EXCLUDED_SESSIONS || !excluded.every((id) => nonEmpty(id)))) {
+    throw new SearchIndexError("invalid_argument");
   }
   for (const bound of [query.sinceMs, query.untilMs]) {
     if (bound !== undefined && !Number.isSafeInteger(bound)) throw new SearchIndexError("invalid_argument");

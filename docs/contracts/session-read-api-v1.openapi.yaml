@@ -249,11 +249,14 @@ paths:
         Workspace search is newest first and at most 100 per page. A page that
         reaches the history floor carries `X-Sessions-Read-Continuation:
         history_floor` and a `continuation` object. Self-host service with
-        `READ_API_SEARCH_PARTIAL_SESSIONS=skip` only: the first page of a
-        workspace search answered while sessions of the workspace are partial
-        carries `X-Sessions-Read-Incomplete: <reason>` and an `incomplete`
-        object; cursor pages never do. Otherwise (the default) that first page
-        is 501 `session_partial` / `session_partial_unbounded`.
+        `READ_API_SEARCH_PARTIAL_SESSIONS=skip` only: every page of a
+        workspace search (cursor pages included) answered while sessions of
+        the workspace are partial carries `X-Sessions-Read-Incomplete:
+        <reason>` and an `incomplete` object, and holds no row of the listed
+        sessions. `session_partial_unbounded` lists and excludes nothing, so
+        its pages may hold stale rows of a partial session. Otherwise (the
+        default) the first page is 501 `session_partial` /
+        `session_partial_unbounded`.
       parameters:
         - $ref: "#/components/parameters/workspace"
         - {name: q, in: query, description: Search text. Required without session., schema: {type: string, maxLength: 500}}
@@ -287,7 +290,7 @@ paths:
                       until: {type: string}
                   incomplete:
                     type: object
-                    description: Self-host `READ_API_SEARCH_PARTIAL_SESSIONS=skip`, first search page only. `sessions` is absent for `session_partial_unbounded`.
+                    description: Self-host `READ_API_SEARCH_PARTIAL_SESSIONS=skip`, on every search page, checked again per page. The page holds no row of the listed `sessions`. `sessions` is absent for `session_partial_unbounded`, which excludes nothing, so stale rows may remain.
                     required: [reason]
                     properties:
                       reason: {type: string, enum: [session_partial, session_partial_unbounded]}

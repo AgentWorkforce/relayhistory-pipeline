@@ -57,6 +57,7 @@ import { log } from "../shared/log.ts";
 import { awsJsonCall, lambdaCredentials } from "../session-pipeline/aws-json.ts";
 import { postgresConnectionString, postgresTlsOptions } from "../shared/postgres-tls.ts";
 import { composeSearchService, searchSecret, type SearchComposition } from "../shared/search-composition.ts";
+import type { SearchServiceBinding } from "../session-pipeline/search-adapter.ts";
 import { PIPELINE_RUNTIMES, validateAdapterEnv } from "@rhc/adapters/registry.ts";
 import { createClickHouseClient } from "../session-pipeline/vendor/search-index/clickhouse.ts";
 import { createReadApi, parseDirectoryWorkspaces, type ReadApiDeps } from "./app.ts";
@@ -179,8 +180,8 @@ export const READ_API_SEARCH_PARTIAL_SESSIONS_VAR = "READ_API_SEARCH_PARTIAL_SES
  * READ_API_SEARCH_PARTIAL_SESSIONS (default "refuse"; self-host SERVICE only): what a workspace
  * search does while a session of its workspace is partial. "refuse" (also unset or "") keeps the
  * 501 `session_partial` / `session_partial_unbounded`, for a caller that falls back to
- * relayhistory. "skip" answers the first page from the index and reports the partial sessions in
- * `incomplete` (and X-Sessions-Read-Incomplete): for an install with no fallback, where the
+ * relayhistory. "skip" answers every page from the index without the partial sessions' rows and
+ * reports them in `incomplete` (and X-Sessions-Read-Incomplete): for an install with no fallback, where the
  * refusal turns search off for the whole workspace. The hosted Lambda has that fallback, so
  * "skip" there refuses startup rather than being ignored (as factsBackends does for postgres).
  * Anything else refuses startup, naming the variable and never its value.
@@ -191,6 +192,18 @@ export function searchSkipsPartialSessions(env: NodeJS.ProcessEnv, entry: ReadAp
   if (raw !== "skip") throw new Error(`session read api: ${READ_API_SEARCH_PARTIAL_SESSIONS_VAR} must be unset, "", "refuse" or "skip"`);
   if (entry !== "service") throw new Error(`session read api: ${READ_API_SEARCH_PARTIAL_SESSIONS_VAR} other than "refuse" is served only by the self-host service`);
   return true;
+}
+
+/**
+ * READ_API_SEARCH_PARTIAL_SESSIONS=skip leaves the partial sessions' rows out of every page
+ * (SearchQuery.excludeSessionIds). A portable adapter that does not declare the
+ * `exclude_session` filter may ignore that field and serve their stale rows, so skip
+ * refuses startup with it rather than answering from them. The ClickHouse binding
+ * (no adapter) always excludes (queries.ts keyPredicates).
+ */
+export function assertSkipExcludes(adapter: SearchServiceBinding): void {
+  if (!adapter.index.capabilities().filters.includes("exclude_session"))
+    throw new Error(`session read api: ${READ_API_SEARCH_PARTIAL_SESSIONS_VAR}=skip needs a search backend that excludes sessions; ${adapter.index.backend} does not`);
 }
 
 function internalSecret(env: NodeJS.ProcessEnv, name: string): string | undefined {
@@ -640,6 +653,7 @@ export async function readApiDepsFromSecret(secretText: string, env: NodeJS.Proc
   if (entry === "service" || backend !== "clickhouse") await assertReaderRole(pool, { supabase: (env.SESSION_POSTGRES_TLS_PROFILE ?? "supabase") === "supabase" });
   const adapter = backend === "clickhouse" ? undefined : composeSearchService(composition!, { env, sql: pool, secrets: searchSecret(secret.search) }, "reader", poolTenantRunner(pool as never));
   if (adapter && await adapter.state.fromMs(new Date()) > completeSinceMs) throw new Error("read history floor is below search coverage");
+  if (searchSkipPartial && adapter) assertSkipExcludes(adapter);
   // The self-host service only: canonical S3 (LOCKER_*) behind timing, turns,
   // metadata and catalog. The hosted Lambda never builds it (those routes keep
   // their 501 `*_not_configured` there).

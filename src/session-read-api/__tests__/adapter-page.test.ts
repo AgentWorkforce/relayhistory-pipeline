@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { PGlite } from "@electric-sql/pglite";
+import { pg_trgm } from "@electric-sql/pglite/contrib/pg_trgm";
+import { createPostgresSearchIndex, TENANT_SETTINGS_SQL, type SqlClient } from "@rhc/search-index/postgres.ts";
 import { comparePositions, type SearchHit, type SearchIndexAdapter, type SearchQuery } from "@rhc/search-index/contracts.ts";
 import { createReadApi } from "../app.ts";
 import { encodeCursor } from "../cursor.ts";
@@ -86,4 +89,75 @@ test("READ_API_SEARCH_PARTIAL_SESSIONS=skip on the adapter path: overflow answer
   expect(r.status).toBe(501);
   expect((await r.json() as any).error.reason).toBe("session_partial");
   expect(r.headers.get("X-Sessions-Read-Incomplete")).toBeNull();
+});
+
+test("READ_API_SEARCH_PARTIAL_SESSIONS=skip over postgres: a stale partial session's rows are left out of every page", async () => {
+  const db = new PGlite({ extensions: { pg_trgm } });
+  await db.exec("CREATE EXTENSION pg_trgm");
+  const index = createPostgresSearchIndex({ client: db as unknown as SqlClient, tenantRunner: (o, w, work) => db.transaction(async tx => { await tx.query(TENANT_SETTINGS_SQL, [o, w]); return work(tx as unknown as SqlClient); }) });
+  await index.ensureSchema();
+  // "s-stale" was indexed while small and has since grown past the bound: partial, its rows stale.
+  const doc = (sessionId: string, n: number) => ({ ...hit(n), sessionId, eventId: `${sessionId}-${n}`, content: "needle", taskRefId: "", deliveryRecordId: "", fingerprint: `fp-${n}`, version: 1 });
+  await index.upsert([doc("s-ok", 1), doc("s-stale", 2), doc("s-ok", 3), doc("s-stale", 4), doc("s-ok", 5), doc("s-stale", 6)]);
+  const queries: SearchQuery[] = [];
+  let partials: { sessions: string[]; overflow: boolean } = { sessions: ["s-stale"], overflow: false };
+  const adapter: SearchServiceBinding = {
+    index: { ...index, query: (q, context) => { queries.push(q); return index.query(q, context); } },
+    state: { async fromMs() { return 0; }, async record() {}, async partials() { return partials; } },
+  };
+  const logs: Record<string, unknown>[] = [];
+  const app = createReadApi({ adapter, liveness, completeSinceMs: 0, searchSkipsPartialSessions: true, verify: async () => ({ ...tenant, userId: "u", scopes: ["rth:read"] }), log: fields => logs.push(fields) });
+  const get = (path: string) => app.request(path, { headers: { authorization: "Bearer synthetic" } });
+  const pages = async () => {
+    const seen: { events: string[]; header: string | null; incomplete: unknown }[] = [];
+    let cursor: string | null = null;
+    do {
+      const r = await get(`/v1/events?workspace=ws-a&q=needle&limit=2${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+      expect(r.status).toBe(200);
+      const b = await r.json() as any;
+      seen.push({ events: b.events.map((e: { eventId: string }) => e.eventId), header: r.headers.get("X-Sessions-Read-Incomplete"), incomplete: b.incomplete });
+      cursor = b.nextCursor;
+    } while (cursor && seen.length < 10);
+    return seen;
+  };
+  const listed = await pages();
+  expect(listed.flatMap(p => p.events)).toEqual(["s-ok-5", "s-ok-3", "s-ok-1"]);
+  expect(listed.length).toBeGreaterThanOrEqual(2);
+  for (const page of listed) {
+    expect(page.header).toBe("session_partial");
+    expect(page.incomplete).toEqual({ reason: "session_partial", sessions: ["s-stale"] });
+  }
+  expect(queries.every(q => JSON.stringify(q.excludeSessionIds) === JSON.stringify(["s-stale"]))).toBe(true);
+  expect(logs.filter(l => l.reason === "session_partial_skipped").every(l => l.excluded_sessions === 1)).toBe(true);
+  expect(JSON.stringify(logs)).not.toContain("s-stale");
+  // The partial set is recomputed per page: once the session completes, the next pages hold its rows again.
+  partials = { sessions: [], overflow: false };
+  queries.length = 0;
+  const done = await pages();
+  expect(done.flatMap(p => p.events)).toEqual(["s-stale-6", "s-ok-5", "s-stale-4", "s-ok-3", "s-stale-2", "s-ok-1"]);
+  expect(done.every(p => p.header === null && p.incomplete === undefined)).toBe(true);
+  expect(queries.every(q => !("excludeSessionIds" in q))).toBe(true);
+  // Unbounded: nothing is listed, so nothing is excluded; every page says so.
+  partials = { sessions: ["s-stale"], overflow: true };
+  queries.length = 0;
+  const unbounded = await pages();
+  expect(unbounded.flatMap(p => p.events)).toHaveLength(6);
+  expect(unbounded.every(p => p.header === "session_partial_unbounded" && JSON.stringify(p.incomplete) === JSON.stringify({ reason: "session_partial_unbounded" }))).toBe(true);
+  expect(queries.every(q => !("excludeSessionIds" in q))).toBe(true);
+  // A search scoped to the excluded session keeps its 501 (the session check runs first).
+  partials = { sessions: ["s-stale"], overflow: false };
+  const scoped = await get("/v1/events?workspace=ws-a&session=s-stale&q=needle&limit=2");
+  expect(scoped.status).toBe(501);
+  expect((await scoped.json() as any).error.reason).toBe("session_partial");
+  await db.close();
+});
+
+test("an adapter that ignores excludeSessionIds fails the page instead of serving the excluded session's rows", async () => {
+  const adapter = binding(async () => ({ hits: [{ ...hit(2), sessionId: "s-stale", content: "stale-content" }, hit(1)] }));
+  adapter.state.partials = async () => ({ sessions: ["s-stale"], overflow: false });
+  const app = createReadApi({ adapter, liveness, completeSinceMs: 0, searchSkipsPartialSessions: true, verify: async () => ({ ...tenant, userId: "u", scopes: ["rth:read"] }), log: () => {} });
+  const r = await app.request("/v1/events?workspace=ws-a&q=hello&limit=10", { headers: { authorization: "Bearer synthetic" } });
+  expect(r.status).toBe(503);
+  expect(r.headers.get("X-Sessions-Read-Incomplete")).toBeNull();
+  expect(await r.text()).not.toContain("stale-content");
 });

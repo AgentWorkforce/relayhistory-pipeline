@@ -268,7 +268,7 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
 
   const capabilities: SearchIndexCapabilities = Object.freeze({
     backend: "postgres",
-    filters: Object.freeze(["session", "source", "kind", "project", "since", "until"] as const),
+    filters: Object.freeze(["session", "source", "kind", "project", "since", "until", "exclude_session"] as const),
     minIndexedQueryChars: 3,
     readAfterWrite: "immediate",
     synchronousErasure: true,
@@ -498,6 +498,10 @@ export function createPostgresSearchIndex(config: PostgresSearchIndexConfig): Se
       };
       const where = ["org_id = $1", "workspace_id = $2"];
       if (query.sessionId !== undefined) where.push(`session_id = ${bind(query.sessionId)}`);
+      // One bound text[] (never interpolated); composes with session_id above, so an
+      // excluded sessionId answers no rows.
+      if (query.excludeSessionIds !== undefined && query.excludeSessionIds.length > 0)
+        where.push(`session_id <> ALL(${bind([...query.excludeSessionIds])}::text[])`);
       if (query.source !== undefined) where.push(`source = ${bind(query.source)}`);
       if (query.kind !== undefined) where.push(`kind = ${bind(query.kind)}`);
       if (query.projectId !== undefined) where.push(`project_id = ${bind(query.projectId)}`);

@@ -372,10 +372,12 @@ fall back to. Two settings, both default off and both self-host service only, ad
 index limits from their defaults (the lower bound) up to the replay bound. Raise the consumer's memory limit with
 them, because the scope is held several times over. A raised limit applies on the session's next index pass. Out of
 range or malformed fails startup before any connection opens, naming the variable only, and a dormant consumer reads
-none of them. On `session-read-api`, `READ_API_SEARCH_PARTIAL_SESSIONS=skip` lets the first page of a workspace
+none of them. On `session-read-api`, `READ_API_SEARCH_PARTIAL_SESSIONS=skip` lets every page of a workspace
 search answer 200 anyway, with `incomplete` (`session_partial` plus the partial `sessions`, or
-`session_partial_unbounded` with no list) and the `X-Sessions-Read-Incomplete` header. Cursor pages never report
-it, so a client keeps what the first page said. On the Postgres search path a session waiting for its first index
+`session_partial_unbounded` with no list) and the `X-Sessions-Read-Incomplete` header. Each page, cursor pages
+included, checks again and leaves out the listed sessions' rows, so a session indexed while small and partial
+since never serves stale rows. `session_partial_unbounded` lists nothing and excludes nothing, so its pages may
+still hold stale rows. A search backend that cannot exclude sessions refuses `skip` at startup. On the Postgres search path a session waiting for its first index
 pass also counts as partial and is listed. A session-scoped read of a partial session still answers 501
 `session_partial`. The hosted pipeline Lambda never reads the limits, and the hosted read Lambda refuses `skip`.
 

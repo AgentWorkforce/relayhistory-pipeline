@@ -11,8 +11,10 @@
  *
  * Layout follows the postgres adapter: one index (`<prefix>-transcript-events`)
  * holds every tenant, and every read or delete carries org + workspace as
- * `filter` clauses (never `should`). A document's `_id` is a SHA-256 over the
- * tenant + position key, so an upsert of the same key replaces the row.
+ * `filter` clauses (never `should`). A query's excludeSessionIds is the one
+ * `must_not` (a `terms` clause), which can only remove rows. A document's `_id`
+ * is a SHA-256 over the tenant + position key, so an upsert of the same key
+ * replaces the row.
  *
  * q semantics are exact, not analyzer-based: the contract's JavaScript
  * lowercase of the content prefix (first CONTENT_PREFIX_CHARS code points) and
@@ -558,7 +560,7 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
 
   const capabilities: SearchIndexCapabilities = Object.freeze({
     backend: "opensearch",
-    filters: Object.freeze(["session", "source", "kind", "project", "since", "until"] as const),
+    filters: Object.freeze(["session", "source", "kind", "project", "since", "until", "exclude_session"] as const),
     // No q length is an indexed lookup: a short q walks the folded terms (leading
     // wildcard), a long one is a per-candidate script filter.
     minIndexedQueryChars: Number.MAX_SAFE_INTEGER,
@@ -794,13 +796,15 @@ export function createOpenSearchSearchIndex(config: OpenSearchSearchIndexConfig)
         // script) nested INSIDE `filter`, so it can only narrow the tenant's rows.
         filter.push(qFilter(query.q.toLowerCase()));
       }
+      const excluded = query.excludeSessionIds !== undefined && query.excludeSessionIds.length > 0 ? [...query.excludeSessionIds] : undefined;
       const c = query.cursor;
       const sources = await search(
         {
           size: query.limit + 1,
           track_total_hits: false,
           _source: HIT_FIELDS,
-          query: { bool: { filter } },
+          // Exclusion is a `must_not` terms clause beside `filter`: it can only remove rows.
+          query: { bool: { filter, ...(excluded ? { must_not: [{ terms: { session_id: excluded } }] } : {}) } },
           sort: sortClause(query.order),
           ...(c ? { search_after: [c.tsMs, c.sessionId, c.source, c.machineId, c.kind, c.eventId] } : {}),
         },

@@ -48,6 +48,12 @@ export interface EventQuery {
   orgId: string;
   workspaceId: string;
   sessionId?: string;
+  /**
+   * READ_API_SEARCH_PARTIAL_SESSIONS=skip only: no row of these sessions is a candidate
+   * (at most PARTIAL_SESSIONS_CAP). Absent or empty adds no predicate, so the SQL and
+   * its parameters are unchanged.
+   */
+  excludeSessionIds?: string[];
   source?: string;
   kind?: string;
   projectId?: string;
@@ -143,6 +149,12 @@ function keyPredicates(input: EventQuery, params: QueryParams): string[] {
   if (input.sessionId !== undefined) {
     where.push("session_id = {session:String}");
     params.session = input.sessionId;
+  }
+  if (input.excludeSessionIds !== undefined && input.excludeSessionIds.length > 0) {
+    // A bound Array(String) parameter, never inlined. The newest query reads only these
+    // candidates' keys, so an excluded session's rows cannot reach the page.
+    where.push("session_id NOT IN {excluded:Array(String)}");
+    params.excluded = input.excludeSessionIds;
   }
   if (input.source !== undefined) {
     where.push("source = {source:String}");

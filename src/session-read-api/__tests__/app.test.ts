@@ -19,14 +19,20 @@ const ID: VerifiedIdentity = { userId: "u-1", orgId: "org-a", workspaceId: "ws-a
  * `partial`: the org's partial sessions; `partialInWorkspace`: those of them
  * with a row in the token's workspace (the search check's `in_workspace`).
  */
-function stubCh(rows: { candidates?: unknown[]; newest?: unknown[]; partial?: string[]; partialInWorkspace?: string[]; fail?: Error } = {}) {
+function stubCh(rows: { candidates?: unknown[]; newest?: unknown[]; partial?: string[]; partialInWorkspace?: string[]; fail?: Error; ignoreExclusion?: boolean } = {}) {
   const queries: string[] = [];
+  /** Each query's parameters, in the order asked. */
+  const params: Record<string, unknown>[] = [];
+  /** The candidate query's `excluded` (applied to its rows and the newest rows, as the SQL does unless ignoreExclusion). */
+  let excluded = new Set<string>();
+  const keep = (list: unknown[] | undefined) => (list ?? []).filter((r) => rows.ignoreExclusion || !excluded.has((r as { session_id: string }).session_id));
   const ch: ClickHouseClient = {
     database: "relay_search",
     async command() {},
     async insert() {},
     async select<T>(query: string, options?: { params?: Record<string, unknown> }) {
       queries.push(query);
+      params.push({ ...(options?.params ?? {}) });
       if (rows.fail) throw rows.fail;
       if (query.includes("in_workspace")) {
         const inWs = new Set(rows.partialInWorkspace ?? []);
@@ -36,12 +42,16 @@ function stubCh(rows: { candidates?: unknown[]; newest?: unknown[]; partial?: st
         const session = options?.params?.session;
         return (rows.partial ?? []).filter((id) => session === undefined || id === session).map((session_id) => ({ session_id })) as T[];
       }
-      return ((query.includes("bytes_before") ? rows.newest : rows.candidates) ?? []) as T[];
+      if (query.includes("bytes_before")) return keep(rows.newest) as T[];
+      excluded = new Set((options?.params?.excluded as string[] | undefined) ?? []);
+      return keep(rows.candidates) as T[];
     },
   };
   /** Queries against transcript_events only (the partial-session checks read the state table). */
   const eventQueries = () => queries.filter((q) => !q.includes("search_ingest_session_state"));
-  return { ch, queries, eventQueries };
+  /** The parameters of those queries, in the same order. */
+  const eventParams = () => params.filter((_, i) => !queries[i]!.includes("search_ingest_session_state"));
+  return { ch, queries, eventQueries, params, eventParams };
 }
 
 function api(over: { identity?: VerifiedIdentity; completeSinceMs?: number; ch?: ClickHouseClient; liveness?: ReturnType<typeof memoryLiveness>["liveness"]; verify?: (t: string) => Promise<VerifiedIdentity>; searchSkipsPartialSessions?: boolean; corsAllowedOrigins?: ReadonlySet<string> } = {}) {
@@ -295,16 +305,106 @@ describe("partial sessions (search_ingest_session_state.needs_full = 1)", () => 
       expect("partial_sessions" in entry!).toBe(false);
     });
 
-    test("cursor pages are unaffected: no check, no field, no header", async () => {
-      const stub = stubCh({ partial: ["s-1"], partialInWorkspace: ["s-1"] });
-      const { get, logs } = skip(stub.ch);
-      const cursor = encodeCursor({ tsMs: 5, sessionId: "s-1", source: "codex", machineId: "m-1", kind: "message", eventId: "e-1" });
+    // Rows of a session indexed while small, then partial (grown past the bound): stale.
+    const row = (session_id: string, event_id: string, ts: string) => {
+      const cand = { ts_ms: Date.parse(ts), session_id, source: "codex", machine_id: "m-1", kind: "message", event_id };
+      return { cand, newest: { ...cand, org_id: "org-a", workspace_id: "ws-a", type: "assistant", user_id: "u-1", actor_name: "", actor_role: "", subagent_id: "", project_id: "", task_title: "", task_ref: "", tags: [], files_touched: [], tool_name: "", tool_status: "", content: "needle", in_budget: 1, origin: "canonical", origin_claim_token: "" } };
+    };
+    const rows = [row("s-stale", "e-3", "2026-10-03T00:00:00Z"), row("s-ok", "e-2", "2026-10-02T00:00:00Z"), row("s-stale", "e-1", "2026-10-01T00:00:00Z")];
+    const fixture = (extra: Parameters<typeof stubCh>[0] = {}) => stubCh({ candidates: rows.map((r) => r.cand), newest: rows.map((r) => r.newest), partial: ["s-stale"], partialInWorkspace: ["s-stale"], ...extra });
+    const cursor = encodeCursor({ tsMs: Date.parse("2026-10-04T00:00:00Z"), sessionId: "s-ok", source: "codex", machineId: "m-1", kind: "message", eventId: "e-9" });
+
+    test("every page is checked again, leaves out the partial sessions' rows and carries the field and header", async () => {
+      for (const page of [SEARCH, `${SEARCH}&cursor=${cursor}`]) {
+        const stub = fixture();
+        const { get, logs } = skip(stub.ch);
+        const r = await get(page);
+        expect(r.status).toBe(200);
+        expect(r.headers.get("X-Sessions-Read-Incomplete")).toBe("session_partial");
+        const b = await body(r);
+        expect(b.events.map((e: { sessionId: string; eventId: string }) => `${e.sessionId}/${e.eventId}`)).toEqual(["s-ok/e-2"]);
+        expect(b.incomplete).toEqual({ reason: "session_partial", sessions: ["s-stale"] });
+        expect(stub.queries.some((q) => q.includes("search_ingest_session_state"))).toBe(true);
+        // A bound Array(String) parameter on the candidate query, never inlined into the SQL.
+        expect(stub.eventQueries()[0]).toContain("session_id NOT IN {excluded:Array(String)}");
+        expect(stub.eventParams()[0]!.excluded).toEqual(["s-stale"]);
+        expect(stub.eventQueries().some((q) => q.includes("s-stale"))).toBe(false);
+        // Counts only, never the ids.
+        expect(logs.find((l) => l.reason === "session_partial_skipped")).toMatchObject({ status: 200, partial_sessions: 1, excluded_sessions: 1 });
+        expect(JSON.stringify(logs)).not.toContain("s-stale");
+      }
+    });
+
+    test("a backend that returns an excluded session's row fails the page rather than serving it", async () => {
+      const { get } = skip(fixture({ ignoreExclusion: true }).ch);
+      for (const page of [SEARCH, `${SEARCH}&cursor=${cursor}`]) {
+        const r = await get(page);
+        expect(r.status).toBe(500);
+        expect(r.headers.get("X-Sessions-Read-Incomplete")).toBeNull();
+        expect(JSON.stringify(await body(r))).not.toContain("s-stale");
+      }
+    });
+
+    test("unbounded: every page says so, with no list and no exclusion", async () => {
+      const many = Array.from({ length: PARTIAL_SESSIONS_CAP + 1 }, (_, i) => `s-other-${i}`);
+      for (const page of [SEARCH, `${SEARCH}&cursor=${cursor}`]) {
+        const stub = fixture({ partial: many, partialInWorkspace: many });
+        const { get, logs } = skip(stub.ch);
+        const r = await get(page);
+        expect(r.status).toBe(200);
+        expect(r.headers.get("X-Sessions-Read-Incomplete")).toBe("session_partial_unbounded");
+        const b = await body(r);
+        expect(b.incomplete).toEqual({ reason: "session_partial_unbounded" });
+        // Nothing listed, so nothing excluded: rows of a partial session may remain.
+        expect(b.events).toHaveLength(3);
+        expect(stub.eventQueries().some((q) => q.includes("excluded"))).toBe(false);
+        expect(stub.eventParams().some((p) => "excluded" in p)).toBe(false);
+        expect(logs.find((l) => l.reason === "session_partial_unbounded_skipped")).toMatchObject({ status: 200, excluded_sessions: 0 });
+      }
+    });
+
+    test("with no partial session every page's queries and reply equal the setting off", async () => {
+      for (const page of [SEARCH, `${SEARCH}&cursor=${cursor}`]) {
+        const on = fixture({ partial: [], partialInWorkspace: [] });
+        const off = fixture({ partial: [], partialInWorkspace: [] });
+        const a = await skip(on.ch).get(page);
+        const b = await api({ ch: off.ch, liveness: memoryLiveness().liveness }).get(page);
+        expect(a.status).toBe(200);
+        expect(a.headers.get("X-Sessions-Read-Incomplete")).toBeNull();
+        const strip = (t: string) => t.replace(/"correlationId":"[^"]*"/, "");
+        expect(strip(await a.text())).toBe(strip(await b.text()));
+        expect(on.eventQueries()).toEqual(off.eventQueries());
+        expect(on.eventParams()).toEqual(off.eventParams());
+      }
+    });
+
+    test("a cursor page that ends at the history floor carries the continuation and the field", async () => {
+      const stub = fixture();
+      const { get } = skip(stub.ch, { completeSinceMs: Date.parse("2026-09-01T00:00:00Z") });
       const r = await get(`${SEARCH}&cursor=${cursor}`);
       expect(r.status).toBe(200);
-      expect(r.headers.get("X-Sessions-Read-Incomplete")).toBeNull();
-      expect("incomplete" in (await body(r))).toBe(false);
-      expect(stub.queries.some((q) => q.includes("search_ingest_session_state"))).toBe(false);
-      expect(logs.some((l) => String(l.reason).endsWith("_skipped"))).toBe(false);
+      expect(r.headers.get("X-Sessions-Read-Continuation")).toBe("history_floor");
+      expect(r.headers.get("X-Sessions-Read-Incomplete")).toBe("session_partial");
+      const b = await body(r);
+      expect(b.continuation).toMatchObject({ backend: "relayhistory", reason: "history_floor" });
+      expect(b.incomplete).toEqual({ reason: "session_partial", sessions: ["s-stale"] });
+      expect(b.events.map((e: { sessionId: string }) => e.sessionId)).toEqual(["s-ok"]);
+    });
+
+    test("with the setting off a cursor page is unchanged: no check, no exclusion, no field, no header", async () => {
+      for (const over of [{}, { searchSkipsPartialSessions: false }]) {
+        const stub = fixture();
+        const { get, logs } = api({ ch: stub.ch, liveness: memoryLiveness().liveness, ...over });
+        const r = await get(`${SEARCH}&cursor=${cursor}`);
+        expect(r.status).toBe(200);
+        expect(r.headers.get("X-Sessions-Read-Incomplete")).toBeNull();
+        const b = await body(r);
+        expect("incomplete" in b).toBe(false);
+        expect(b.events).toHaveLength(3);
+        expect(stub.queries.some((q) => q.includes("search_ingest_session_state"))).toBe(false);
+        expect(stub.eventParams().some((p) => "excluded" in p)).toBe(false);
+        expect(logs.some((l) => String(l.reason).endsWith("_skipped"))).toBe(false);
+      }
     });
 
     test("a session-scoped read of a partial session is still 501", async () => {

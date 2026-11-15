@@ -231,6 +231,21 @@ describe("opensearch adapter request shapes", () => {
     expect(body._source).not.toContain("fingerprint");
   });
 
+  it("excludes sessions with one must_not terms clause beside the filters, and only when the list is non-empty", async () => {
+    const { calls, fetch } = fake(() => json(200, { timed_out: false, _shards: { failed: 0 }, hits: { hits: [] } }));
+    const a = createOpenSearchSearchIndex({ url: BASE, fetch });
+    await a.query({ tenant, sessionId: "s-1", order: "asc", limit: 5, excludeSessionIds: ["s-1", "s-2"] });
+    const body = JSON.parse(calls[0]!.body!);
+    expect(Object.keys(body.query.bool)).toEqual(["filter", "must_not"]);
+    expect(body.query.bool.must_not).toEqual([{ terms: { session_id: ["s-1", "s-2"] } }]);
+    expect(body.query.bool.filter).toContainEqual({ term: { session_id: "s-1" } });
+    for (const excludeSessionIds of [undefined, []]) {
+      await a.query({ tenant, order: "asc", limit: 5, ...(excludeSessionIds ? { excludeSessionIds } : {}) });
+      expect(Object.keys(JSON.parse(calls.at(-1)!.body!).query.bool)).toEqual(["filter"]);
+    }
+    expect(a.capabilities().filters).toContain("exclude_session");
+  });
+
   it("sends a folded q of up to WILDCARD_MAX_LITERAL_BYTES as wildcards and a longer one as a params-bound script", async () => {
     const { calls, fetch } = fake(() => json(200, { timed_out: false, _shards: { failed: 0 }, hits: { hits: [] } }));
     const a = createOpenSearchSearchIndex({ url: BASE, fetch });

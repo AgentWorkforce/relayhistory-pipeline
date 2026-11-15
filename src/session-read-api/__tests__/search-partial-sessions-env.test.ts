@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import pg from "pg";
-import { READ_API_SEARCH_PARTIAL_SESSIONS_VAR, readApiDepsFromSecret, searchSkipsPartialSessions } from "../lambda.ts";
+import { createOpenSearchSearchIndex } from "@rhc/search-index/opensearch.ts";
+import { createPostgresSearchIndex, type SqlClient } from "@rhc/search-index/postgres.ts";
+import type { SearchIndexAdapter } from "@rhc/search-index/contracts.ts";
+import type { SearchServiceBinding } from "../../session-pipeline/search-adapter.ts";
+import { READ_API_SEARCH_PARTIAL_SESSIONS_VAR, assertSkipExcludes, readApiDepsFromSecret, searchSkipsPartialSessions } from "../lambda.ts";
 
 const env = (value?: string) => (value === undefined ? {} : { [READ_API_SEARCH_PARTIAL_SESSIONS_VAR]: value }) as NodeJS.ProcessEnv;
 const INVALID = `session read api: ${READ_API_SEARCH_PARTIAL_SESSIONS_VAR} must be unset, "", "refuse" or "skip"`;
@@ -28,6 +32,22 @@ describe("searchSkipsPartialSessions", () => {
         expect(message).toBe(INVALID);
       }
     }
+  });
+});
+
+describe("assertSkipExcludes", () => {
+  const bind = (index: SearchIndexAdapter): SearchServiceBinding => ({ index, state: { async fromMs() { return 0; }, async record() {}, async partials() { return { sessions: [], overflow: false }; } } });
+
+  test("the postgres and opensearch backends exclude sessions, so skip starts", () => {
+    const client = { async query() { return { rows: [] }; } } as unknown as SqlClient;
+    expect(() => assertSkipExcludes(bind(createPostgresSearchIndex({ client })))).not.toThrow();
+    expect(() => assertSkipExcludes(bind(createOpenSearchSearchIndex({ url: "http://search.test:9200", fetch: async () => new Response("{}") })))).not.toThrow();
+  });
+
+  test("a backend that cannot exclude refuses skip at startup, naming the variable", () => {
+    const filters = ["session", "source", "kind", "project", "since", "until"] as const;
+    const index = { backend: "partial-backend", capabilities: () => ({ backend: "partial-backend", filters }) } as unknown as SearchIndexAdapter;
+    expect(() => assertSkipExcludes(bind(index))).toThrow(`session read api: ${READ_API_SEARCH_PARTIAL_SESSIONS_VAR}=skip needs a search backend that excludes sessions; partial-backend does not`);
   });
 });
 

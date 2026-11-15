@@ -15,6 +15,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   CONTENT_PREFIX_CHARS,
+  MAX_EXCLUDED_SESSIONS,
   SearchIndexError,
   comparePositions,
   matchesQuery,
@@ -156,6 +157,32 @@ export function searchIndexConformance(name: string, factory: () => Promise<Conf
       expect(await ids({ projectId: "p2" })).toEqual(["c", "d"]);
       expect(await ids({ sinceMs: t + 1, untilMs: t + 2 })).toEqual(["b", "c"]);
       expect(await ids({ sessionId: "s1", source: "claude", projectId: "p2" })).toEqual(["d"]);
+    });
+
+    it("excludeSessionIds removes those sessions on every page and composes with the session filter", async () => {
+      // Optional filter: an adapter that does not declare it may ignore the field
+      // (and the read API refuses READ_API_SEARCH_PARTIAL_SESSIONS=skip for it).
+      if (!a.capabilities().filters.includes("exclude_session")) return;
+      const org = `org-${rand()}`;
+      const t = 1_767_225_600_000;
+      const docs = Array.from({ length: 9 }, (_, i) =>
+        syntheticDoc({ orgId: org, eventId: `x${i}`, tsMs: t + i, sessionId: `s${i % 3}`, content: "needle" }));
+      await a.upsert(docs);
+      const tenant = { orgId: org, workspaceId: "ws-a" };
+      const ids = (hits: readonly SearchHit[]) => hits.map((h) => h.eventId);
+      const kept = docs.filter((d) => d.sessionId !== "s1").map((d) => d.eventId);
+      // An id that would end an interpolated literal is only a value.
+      for (const limit of [1, 2, 50]) {
+        expect(ids(await allPages(a, { tenant, order: "asc", limit, q: "needle", excludeSessionIds: ["s1", "s'2"] }))).toEqual(kept);
+      }
+      expect(ids(await allPages(a, { tenant, order: "asc", limit: 2, excludeSessionIds: ["s1", "s2"] }))).toEqual(["x0", "x3", "x6"]);
+      // A query for an excluded session answers no rows, not an error.
+      expect((await a.query({ tenant, order: "asc", limit: 50, sessionId: "s1", excludeSessionIds: ["s1"] })).hits).toEqual([]);
+      expect(ids((await a.query({ tenant, order: "asc", limit: 50, sessionId: "s0", excludeSessionIds: ["s1"] })).hits)).toEqual(["x0", "x3", "x6"]);
+      // Empty excludes nothing; the cap is accepted.
+      expect(await allPages(a, { tenant, order: "asc", limit: 50, excludeSessionIds: [] })).toHaveLength(9);
+      const atCap = Array.from({ length: MAX_EXCLUDED_SESSIONS }, (_, i) => (i === 0 ? "s0" : `none-${i}`));
+      expect(ids(await allPages(a, { tenant, order: "asc", limit: 50, excludeSessionIds: atCap })).sort()).toEqual(docs.filter((d) => d.sessionId !== "s0").map((d) => d.eventId).sort());
     });
 
     it("pages in exact (ts, session, source, machine, kind, event) order with no gaps or repeats", async () => {
@@ -321,6 +348,9 @@ export function searchIndexConformance(name: string, factory: () => Promise<Conf
       await bad(a.query({ tenant, order: "asc", limit: 0 }));
       await bad(a.query({ tenant, order: "asc", limit: 1, q: "" }));
       await bad(a.query({ tenant, order: "sideways" as "asc", limit: 1 }));
+      await bad(a.query({ tenant, order: "asc", limit: 1, excludeSessionIds: Array.from({ length: MAX_EXCLUDED_SESSIONS + 1 }, (_, i) => `s-${i}`) }));
+      await bad(a.query({ tenant, order: "asc", limit: 1, excludeSessionIds: ["s-1", ""] }));
+      await bad(a.query({ tenant, order: "asc", limit: 1, excludeSessionIds: "s-1" as unknown as string[] }));
       await bad(a.upsert([{ ...syntheticDoc({ orgId: "org-x" }), tsMs: 1.5 }]));
       await bad(a.eraseScope({ ...tenant, source: "claude", sessionIds: [] }));
     });

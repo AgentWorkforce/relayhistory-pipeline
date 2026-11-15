@@ -283,8 +283,8 @@ export interface ReadApiDeps {
   sessionQuery?: boolean;
   /**
    * READ_API_SEARCH_PARTIAL_SESSIONS=skip: a workspace search answers from the index while a
-   * session of its workspace is partial, and names what it could not cover in `incomplete`
-   * (and the X-Sessions-Read-Incomplete header), on the first page only. Absent/false: the 501
+   * session of its workspace is partial, leaves out the partial sessions' rows, and names them in
+   * `incomplete` (and the X-Sessions-Read-Incomplete header), on every page. Absent/false: the 501
    * `session_partial` / `session_partial_unbounded`, unchanged. A session-scoped read is never
    * affected. Wired by the self-host service only (lambda.ts searchSkipsPartialSessions).
    */
@@ -391,11 +391,12 @@ export interface Continuation {
 }
 
 /**
- * READ_API_SEARCH_PARTIAL_SESSIONS=skip only (ReadApiDeps.searchSkipsPartialSessions): the first
- * page of a workspace search answered while partial sessions belong to the workspace. `sessions`
- * names them (at most PARTIAL_SESSIONS_CAP); `session_partial_unbounded` means the check found more
- * than it lists and carries no `sessions`. Cursor pages never carry it; the response also has
- * `X-Sessions-Read-Incomplete: <reason>`.
+ * READ_API_SEARCH_PARTIAL_SESSIONS=skip only (ReadApiDeps.searchSkipsPartialSessions): a page of
+ * a workspace search answered while partial sessions belong to the workspace. `sessions` names
+ * them (at most PARTIAL_SESSIONS_CAP) and the page holds none of their rows;
+ * `session_partial_unbounded` means the check found more than it lists, carries no `sessions`
+ * and excludes nothing, so stale rows of a partial session may remain. Every page is checked
+ * again and carries it; the response also has `X-Sessions-Read-Incomplete: <reason>`.
  */
 export interface SearchIncomplete {
   reason: "session_partial" | "session_partial_unbounded";
@@ -990,17 +991,25 @@ export function createReadApi(deps: ReadApiDeps) {
       // (page.ts partialSessionsInWorkspace says how one is attributed).
       // With searchSkipsPartialSessions the search answers anyway and says so:
       // an install with no relayhistory has nowhere to fall back to, and one
-      // partial session would otherwise turn search off for the workspace.
+      // partial session would otherwise turn search off for the workspace. The
+      // check runs on EVERY page (one state query) and the listed sessions' rows
+      // are excluded, so a session indexed while small that later grew past the
+      // bound never serves its stale rows on any page. Recomputed, not carried in
+      // the cursor: the list can be PARTIAL_SESSIONS_CAP ids long, and a cursor
+      // copy would go stale. Above the cap nothing is listed, so nothing can be
+      // excluded: that answer is session_partial_unbounded and may hold stale rows.
       let incomplete: SearchIncomplete | undefined;
-      if (cursor === undefined) {
+      if (deps.searchSkipsPartialSessions === true) {
         const partials = await partialSessionsInWorkspace(pageDeps(), identity.orgId, identity.workspaceId);
-        if (deps.searchSkipsPartialSessions === true) {
-          if (partials.overflow) incomplete = { reason: "session_partial_unbounded" };
-          else if (partials.sessions.length > 0) incomplete = { reason: "session_partial", sessions: partials.sessions };
-        } else {
-          if (partials.overflow) throw unsupported("session_partial_unbounded");
-          if (partials.sessions.length > 0) throw unsupported("session_partial");
+        if (partials.overflow) incomplete = { reason: "session_partial_unbounded" };
+        else if (partials.sessions.length > 0) {
+          incomplete = { reason: "session_partial", sessions: partials.sessions };
+          base.excludeSessionIds = partials.sessions;
         }
+      } else if (cursor === undefined) {
+        const partials = await partialSessionsInWorkspace(pageDeps(), identity.orgId, identity.workspaceId);
+        if (partials.overflow) throw unsupported("session_partial_unbounded");
+        if (partials.sessions.length > 0) throw unsupported("session_partial");
       }
       const page = await gatedPage(c, base);
       if (belowFloor && page.nextCursor === null) {
@@ -1011,12 +1020,14 @@ export function createReadApi(deps: ReadApiDeps) {
         log({ route: c.req.routePath, reason: "history_floor_continuation", status: 200, correlation_id: c.get("correlationId") });
         // Flags the page so the caller finishes it without parsing every page body.
         c.header("X-Sessions-Read-Continuation", "history_floor");
+        if (incomplete) {
+          skippedPartials(c, incomplete);
+          return c.json({ events: page.events, nextCursor: null, continuation, incomplete, correlationId: c.get("correlationId") });
+        }
         return c.json({ events: page.events, nextCursor: null, continuation, correlationId: c.get("correlationId") });
       }
       if (incomplete) {
-        // Only on the answered page: an error after the check (history floor, backend) carries neither.
-        log({ route: c.req.routePath, reason: `${incomplete.reason}_skipped`, status: 200, ...(incomplete.sessions ? { partial_sessions: incomplete.sessions.length } : {}), correlation_id: c.get("correlationId") });
-        c.header("X-Sessions-Read-Incomplete", incomplete.reason);
+        skippedPartials(c, incomplete);
         return c.json({ events: page.events, nextCursor: page.nextCursor, incomplete, correlationId: c.get("correlationId") });
       }
       return c.json({ events: page.events, nextCursor: page.nextCursor, correlationId: c.get("correlationId") });
@@ -1024,6 +1035,15 @@ export function createReadApi(deps: ReadApiDeps) {
       return fail(c, error);
     }
   });
+
+  /**
+   * A skipped search page's log line and header. Only on an answered page: an error after the
+   * check (history floor, backend) carries neither. Counts only, never the session ids.
+   */
+  function skippedPartials(c: Context, incomplete: SearchIncomplete): void {
+    log({ route: c.req.routePath, reason: `${incomplete.reason}_skipped`, status: 200, ...(incomplete.sessions ? { partial_sessions: incomplete.sessions.length } : {}), excluded_sessions: incomplete.sessions?.length ?? 0, correlation_id: c.get("correlationId") });
+    c.header("X-Sessions-Read-Incomplete", incomplete.reason);
+  }
 
   /** The P3 canary allowlist (READ_API_DIRECTORY_WORKSPACES), shared by the directory and timing routes. */
   function requireCanary(identity: VerifiedIdentity, route: "directory" | "timing" | "turns" | "analysis" | "output" | "digest" | "coordination" | "catalog" | "login" | "summary"): void {

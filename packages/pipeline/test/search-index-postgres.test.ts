@@ -80,6 +80,38 @@ describe("postgres search index specifics", () => {
     await db.close();
   });
 
+  it("binds excludeSessionIds as one text[] parameter, never in the SQL text, and only when non-empty", async () => {
+    const db = new PGlite({ extensions: { pg_trgm } });
+    await db.exec("CREATE EXTENSION IF NOT EXISTS pg_trgm");
+    const seen: { text: string; params: unknown[] }[] = [];
+    const capturing: TenantSqlRunner = (orgId, workspaceId, work) =>
+      db.transaction(async (tx) => {
+        await tx.query(TENANT_SETTINGS_SQL, [orgId, workspaceId]);
+        return work({ query: (text: string, params?: unknown[]) => { seen.push({ text, params: params ?? [] }); return tx.query(text, params); } } as unknown as SqlClient);
+      });
+    const adapter = createPostgresSearchIndex({ client: db as unknown as SqlClient, tenantRunner: capturing });
+    await adapter.ensureSchema();
+    await adapter.upsert([syntheticDoc({ orgId: "org-a", sessionId: "s-keep", eventId: "k" }), syntheticDoc({ orgId: "org-a", sessionId: "s-stale'; --", eventId: "x" })]);
+    const tenant = { orgId: "org-a", workspaceId: "ws-a" };
+    const select = () => seen.filter((s) => s.text.includes("ORDER BY")).at(-1)!;
+    seen.length = 0;
+    const page = await adapter.query({ tenant, order: "asc", limit: 10, excludeSessionIds: ["s-stale'; --"] });
+    expect(page.hits.map((h) => h.eventId)).toEqual(["k"]);
+    const { text, params } = select();
+    expect(text).toMatch(/session_id <> ALL\(\$\d+::text\[\]\)/);
+    expect(text).not.toContain("s-stale");
+    expect(params).toContainEqual(["s-stale'; --"]);
+    // Absent or empty: the statement and parameters are exactly those without the field.
+    seen.length = 0;
+    await adapter.query({ tenant, order: "asc", limit: 10 });
+    const plain = select();
+    seen.length = 0;
+    await adapter.query({ tenant, order: "asc", limit: 10, excludeSessionIds: [] });
+    expect(select()).toEqual(plain);
+    expect(plain.text).not.toContain("ALL(");
+    await db.close();
+  });
+
   it("a client outside a transaction never silently erases, deletes or reads nothing: it throws tenant_unbound", async () => {
     // The tenant settings are transaction-local; in autocommit they lapse
     // before the next statement, and under forced RLS a DELETE would match

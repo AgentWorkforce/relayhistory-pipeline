@@ -212,6 +212,7 @@ async function finishPage(deps: PageDeps, input: EventQuery, { candidates, rows 
     if (r.org_id !== input.orgId || r.workspace_id !== input.workspaceId) throw new TenantMismatchError();
     if (input.sessionId !== undefined && r.session_id !== input.sessionId) throw new TenantMismatchError();
     if (input.source !== undefined && r.source !== input.source) throw new TenantMismatchError();
+    if (input.excludeSessionIds?.includes(r.session_id)) throw new TenantMismatchError();
   }
 
   let kept = rows;
@@ -344,6 +345,7 @@ async function readAdapterPage(deps: PageDeps, input: EventQuery): Promise<Event
   await assertCoverage(deps);
   const page = await deadline(deps, signal => deps.adapter!.index.query({
     tenant: { orgId: input.orgId, workspaceId: input.workspaceId }, sessionId: input.sessionId,
+    ...(input.excludeSessionIds !== undefined && input.excludeSessionIds.length > 0 ? { excludeSessionIds: input.excludeSessionIds } : {}),
     source: input.source, kind: input.kind, projectId: input.projectId, q: input.q,
     sinceMs: input.sinceMs, untilMs: input.untilMs, order: input.order, cursor: input.cursor,
     limit: input.limit, ...(input.maxContent === undefined ? {} : { maxContentChars: input.maxContent + 1 }),
@@ -354,6 +356,8 @@ async function readAdapterPage(deps: PageDeps, input: EventQuery): Promise<Event
   for (const hit of page.hits) {
     assertPosition(hit);
     if (hit.orgId !== input.orgId || hit.workspaceId !== input.workspaceId || input.sessionId !== undefined && hit.sessionId !== input.sessionId || input.source !== undefined && hit.source !== input.source) throw new TenantMismatchError();
+    // An adapter that ignored the exclusion would serve a partial session's stale rows.
+    if (input.excludeSessionIds?.includes(hit.sessionId)) throw new SearchIndexError("unavailable", true);
     if (input.kind !== undefined && hit.kind !== input.kind || input.projectId !== undefined && hit.projectId !== input.projectId || input.sinceMs !== undefined && hit.tsMs < input.sinceMs || input.untilMs !== undefined && hit.tsMs > input.untilMs || previous && !advances(hit, previous)) throw new SearchIndexError("unavailable", true);
     previous = hit;
   }
