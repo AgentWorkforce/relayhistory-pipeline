@@ -41,6 +41,10 @@ export default defineLayeredAgent({
   // The first repo is the lead's working directory and the ledger's
   // repository (LEDGER_REPO=~/build/sessions-pipeline).
   repos: ["AgentWorkforce/sessions-pipeline", "AgentWorkforce/sessions-pipeline-cloud"],
+  // New issues in either repo wake the lead, which DMs khaliq-gant on the
+  // relay (module 0.1.20, "New-issue watch"). Rendered to issue-watch.json
+  // and delivered by hot update, never in the user data.
+  issueWatch: { repos: ["AgentWorkforce/relayhistory-pipeline", "AgentWorkforce/sessions-pipeline-cloud"], notify: "khaliq-gant" },
   relayDescription: "sessions-pipeline layered lead (EC2, Fable)",
   names: { platformPrefix: `/relaycast-agent-host/${stage}` },
   // The Agent Relay sessions MCP (module 0.1.9): the lead can search and read

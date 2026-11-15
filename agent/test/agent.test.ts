@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
-import { AGENT_CARD_FILE, EC2_USER_DATA_ENCODED_LIMIT, RELAY_SESSIONS_KIT_FILES, WORKER_KIT_FILES, decide, fileReader, hostBoundaryPolicy, hostRolePolicy, hostRoleProps, hostTemplate, networkParams, renderAgentCard, userDataBase64 } from "@agentworkforce/layered-agent";
+import { AGENT_CARD_FILE, EC2_USER_DATA_ENCODED_LIMIT, ISSUE_WATCH_FILE, ISSUE_WATCH_KIT_FILES, RELAY_SESSIONS_KIT_FILES, WORKER_KIT_FILES, decide, fileReader, hostBoundaryPolicy, hostRolePolicy, hostRoleProps, hostTemplate, networkParams, renderAgentCard, renderIssueWatch, userDataBase64 } from "@agentworkforce/layered-agent";
 import agent from "../agent.config.ts";
 
 const AGENT_DIR = fileURLToPath(new URL("..", import.meta.url));
@@ -94,12 +94,13 @@ test(`user data: under ${USER_DATA_BUDGET} bytes encoded (EC2 caps it at ${EC2_U
   assert.ok(encoded.length < USER_DATA_BUDGET, `user data is ${encoded.length} bytes encoded`);
   const script = gunzipSync(Buffer.from(encoded, "base64")).toString("utf8");
   // The optional kit files (headless supervisor, delegation, workers, relay
-  // sessions) are not in user data; they reach the host over SSM in the hot
-  // update after first boot (kit 0.1.10; headless.py and delegation.md since
-  // 0.1.12). The kit's OPTIONAL_KIT_FILES, which its own test/host.test.ts and
+  // sessions, issue watch) are not in user data; they reach the host over SSM
+  // in the hot update after first boot (kit 0.1.10; headless.py and
+  // delegation.md since 0.1.12; issue-watch.sh since 0.1.20). The kit's
+  // OPTIONAL_KIT_FILES, which its own test/host.test.ts and
   // test/fresh-host.test.ts use, is not exported, so those two are listed here.
-  const optional: readonly string[] = ["headless.py", "delegation.md", ...WORKER_KIT_FILES, ...RELAY_SESSIONS_KIT_FILES];
-  // The generated card file (module 0.1.17) travels by hot update, never in user data.
+  const optional: readonly string[] = ["headless.py", "delegation.md", ...WORKER_KIT_FILES, ...RELAY_SESSIONS_KIT_FILES, ...ISSUE_WATCH_KIT_FILES];
+  // The generated card (module 0.1.17) and issue-watch (0.1.20) files travel by hot update, never in user data.
   for (const f of agent.files) if (f.source !== "generated" && !optional.includes(f.name)) assert.ok(script.includes(`cat > /opt/agent-host/${f.name} <<'`), f.name);
   for (const f of optional) assert.ok(!script.includes(`/opt/agent-host/${f} <<'`), `${f} is not in user data`);
   assert.doesNotMatch(script, /sk-ant-|ghp_|ghs_|gho_|github_pat_|BEGIN [A-Z ]*PRIVATE KEY/);
@@ -118,9 +119,18 @@ test("the A2A card renders within the relay's limits, one skill per kind of work
   assert.equal(card.documentation_url, "https://github.com/AgentWorkforce/relayhistory-pipeline");
   assert.match(card.version, /^[0-9a-f]{12}$/);
   assert.equal(agent.generated[AGENT_CARD_FILE], rendered);
-  assert.deepEqual(agent.files.filter((f) => f.source === "generated"), [{ name: AGENT_CARD_FILE, source: "generated" }]);
+  assert.deepEqual(agent.files.filter((f) => f.source === "generated"), [{ name: AGENT_CARD_FILE, source: "generated" }, { name: ISSUE_WATCH_FILE, source: "generated" }]);
   const script = gunzipSync(Buffer.from(userDataBase64(agent, read), "base64")).toString("utf8");
   assert.ok(!script.includes(`/opt/agent-host/${AGENT_CARD_FILE}`), "the card never rides in user data");
+});
+
+test("new-issue watch: both repos, to khaliq-gant, generated and kept out of user data", () => {
+  assert.deepEqual(agent.input.issueWatch, { repos: ["AgentWorkforce/relayhistory-pipeline", "AgentWorkforce/sessions-pipeline-cloud"], notify: "khaliq-gant" });
+  assert.equal(agent.generated[ISSUE_WATCH_FILE], renderIssueWatch(agent.input.issueWatch!));
+  assert.deepEqual(JSON.parse(agent.generated[ISSUE_WATCH_FILE]!).globs, ["/github/repos/AgentWorkforce/relayhistory-pipeline/issues/**", "/github/repos/AgentWorkforce/sessions-pipeline-cloud/issues/**"]);
+  for (const name of ISSUE_WATCH_KIT_FILES) assert.ok(agent.files.some((f) => f.name === name && f.source === "kit"), `${name} is a kit file`);
+  const script = gunzipSync(Buffer.from(userDataBase64(agent, read), "base64")).toString("utf8");
+  assert.ok(!script.includes(`cat > /opt/agent-host/${ISSUE_WATCH_FILE}`), "the watch never rides in user data");
 });
 
 test("the lead runs on Fable: the rendered lead unit starts the kit's lead-run.sh, which runs the kit's headless supervisor with --model claude-fable-5-1", () => {
