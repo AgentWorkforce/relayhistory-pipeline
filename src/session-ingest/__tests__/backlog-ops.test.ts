@@ -143,7 +143,11 @@ test("argv is fixed: no org unless scoped, never a checkpoint or start key; dry 
     const timeout = spec.args.indexOf("--statement-timeout-ms");
     expect(timeout >= 0).toBe(!mode.startsWith("drain"));
     if (timeout >= 0) expect(spec.args.slice(timeout, timeout + 2)).toEqual(["--statement-timeout-ms", "600000"]);
-    expect(spec.args.includes("--page-size")).toBe(mode.startsWith("backfill"));
+    expect(spec.args.includes("--page-size")).toBe(!mode.startsWith("drain"));
+    if (mode.startsWith("export")) {
+      expect(spec.args.slice(spec.args.indexOf("--page-size"), spec.args.indexOf("--page-size") + 2)).toEqual(["--page-size", "250"]);
+      expect(spec.args.slice(spec.args.indexOf("--concurrency"), spec.args.indexOf("--concurrency") + 2)).toEqual(["--concurrency", "16"]);
+    }
     if (mode.startsWith("backfill")) {
       expect(spec.args.slice(spec.args.indexOf("--page-size"), spec.args.indexOf("--page-size") + 2)).toEqual(["--page-size", "5000"]);
       expect(spec.args.slice(spec.args.indexOf("--row-page-size"), spec.args.indexOf("--row-page-size") + 2)).toEqual(["--row-page-size", "20000"]);
