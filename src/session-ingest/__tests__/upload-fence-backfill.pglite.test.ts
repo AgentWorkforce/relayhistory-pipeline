@@ -316,6 +316,85 @@ describe("S3 ledger backfill (0005 step 0, #580 formats)", () => {
     await expect(run(store, { orgs: ["org-a"], slotWindowBlocks: 0 })).rejects.toThrow("backfill_slot_window_invalid");
   });
 
+  /** A store that counts puts per key and can fail getObject on a key from its nth call (undefined = pass). */
+  const counted = (failGet?: (key: string, n: number) => Error | undefined) => {
+    const base = scratch(), puts = new Map<string, number>(), gets = new Map<string, number>();
+    const store = new Proxy(base, {
+      get(target, prop) {
+        if (prop === "put") return async (...a: Parameters<ObjectStore["put"]>) => {
+          const r = await target.put(...a);
+          puts.set(String(a[0]), (puts.get(String(a[0])) ?? 0) + 1);
+          return r;
+        };
+        if (prop === "getObject") return async (...a: Parameters<ObjectStore["getObject"]>) => {
+          const k = String(a[0]), n = (gets.get(k) ?? 0) + 1;
+          gets.set(k, n);
+          const e = failGet?.(k, n);
+          if (e) throw e;
+          return target.getObject(...a);
+        };
+        const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    return { store, puts };
+  };
+  const shardPuts = (puts: Map<string, number>) => [...puts].filter(([k]) => /\/r=[0-9a-f]{3}\.json$/.test(k));
+
+  test("merge buffer: block windows and pages are merged together, each shard written once per pass", async () => {
+    for (let i = 0; i < 150; i++) {
+      await slot(A, "origin-1", `m${String(i).padStart(4, "0")}`, A.userId, "claude", `sess-${i % 5}`, i + 1, hex(String(i % 10)));
+      if (i < 60) await rev(A, "origin-2", `n${String(i).padStart(4, "0")}`, i + 1, "claude", "sess-r");
+    }
+    const one = counted();
+    const summary = await run(one.store, { orgs: ["org-a"], slotWindowBlocks: 1, rowPageSize: 7 });
+    expect(summary.revisions).toMatchObject({ slot_rows: 150, rows: 60, merged: 210, failed: 0 });
+    expect(summary.sections.revisions).toBe("complete");
+    const shards = shardPuts(one.puts);
+    expect(shards.length).toBe(summary.revisions.shards);
+    expect(shards.every(([, n]) => n === 1)).toBe(true); // one write per shard, not one per window or page
+
+    // A small budget merges in several passes and stores the same entries.
+    const small = counted();
+    const again = await run(small.store, { orgs: ["org-a"], slotWindowBlocks: 1, rowPageSize: 7, mergeBufferEntries: 16 });
+    expect(again.revisions).toMatchObject({ merged: 210, failed: 0 });
+    expect(again.revisions.shards).toBeGreaterThan(summary.revisions.shards);
+    for (let i = 0; i < 150; i += 13) {
+      const r = `m${String(i).padStart(4, "0")}`;
+      expect(await entryOf(small.store, A, "origin-1", r)).toEqual(await entryOf(one.store, A, "origin-1", r));
+    }
+    expect(await entryOf(small.store, A, "origin-2", "n0059")).toEqual(await entryOf(one.store, A, "origin-2", "n0059"));
+    for (const bad of [0, 1.5, 50_000_001]) await expect(run(scratch(), { mergeBufferEntries: bad })).rejects.toThrow("backfill_merge_buffer_invalid");
+  });
+
+  test("merge buffer: the fence is read again at merge time; unreadable then, nothing merges (incomplete)", async () => {
+    await del(A, "origin-1", "claude", "sess-gone");
+    for (let i = 0; i < 20; i++) await slot(A, "origin-1", `f${i}`, A.userId, "claude", "sess-1", i + 1, hex("b"));
+    const fenceKey = String(objectKey(s3LedgerKeys(ROOT, A).fence));
+    let fenceWritten = false;
+    // The fence section writes the fence; the slot pass reads it, then the merge reads it again. Fail only reads
+    // after the write and past the slot pass's (a slot-pass failure would count skipped_no_fence, not this code).
+    const c = counted((k, n) => {
+      if (k !== fenceKey) return undefined;
+      return fenceWritten && n > 2 ? new ObjectStoreError("unauthorized", "fs", "403") : undefined;
+    });
+    const store = new Proxy(c.store, {
+      get(target, prop) {
+        if (prop === "put") return async (...a: Parameters<ObjectStore["put"]>) => {
+          const r = await (target.put as ObjectStore["put"])(...a);
+          if (String(a[0]) === fenceKey) fenceWritten = true;
+          return r;
+        };
+        const v = (target as unknown as Record<PropertyKey, unknown>)[prop];
+        return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+      },
+    });
+    const summary = await run(store, { orgs: ["org-a"], sections: ["fences", "revisions"] });
+    expect(summary.revisions).toMatchObject({ slot_rows: 20, merged: 0, failed: 20, failed_codes: { fence_unreadable: 20 } });
+    expect(summary.sections.revisions).toBe("incomplete");
+    expect(shardPuts(c.puts)).toEqual([]);
+  });
+
   test("fail closed: an unreadable fence is never rewritten; an unrepresentable row leaves the user without a fence", async () => {
     const store = scratch();
     const bad = "{\"v\":1,\"resets\":\"x\"}";

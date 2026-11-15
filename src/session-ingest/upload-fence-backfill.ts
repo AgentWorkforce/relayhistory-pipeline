@@ -71,6 +71,11 @@ export interface BackfillOptions {
   statementTimeoutMs?: number;
   /** Heap blocks per scoped slot window (default SLOT_WINDOW_BLOCKS); tests use a small one to cross windows. */
   slotWindowBlocks?: number;
+  /**
+   * Revision entries buffered across pages and windows before one merge pass (default MERGE_BUFFER_ENTRIES): each
+   * shard is read and written once per pass, not once per page or window.
+   */
+  mergeBufferEntries?: number;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
 }
@@ -228,6 +233,8 @@ LIMIT $3::int`;
  * HTTP admission stop (decision 0005's cutover order). The unscoped pass keeps the key_sha256 keyset.
  */
 const SLOT_WINDOW_BLOCKS = 4096;
+/** About 4M entries (a few GB of heap) per merge pass; a 10M-slot org merges in three passes. */
+const MERGE_BUFFER_ENTRIES = 4_000_000;
 const SLOTS_BLOCKS = `SELECT (pg_relation_size('sessions.ingest_lazy_native_slots') / current_setting('block_size')::bigint)::bigint AS blocks`;
 const SLOTS_WINDOW = `
 SELECT key_sha256, org_id, workspace_id, origin_id, record_id, current_owner, current_source, current_session, current_revision, current_digest
@@ -365,6 +372,8 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
   const statementTimeoutMs = opts.statementTimeoutMs ?? 30_000;
   const slotWindow = opts.slotWindowBlocks ?? SLOT_WINDOW_BLOCKS;
   if (!Number.isInteger(slotWindow) || slotWindow < 1 || slotWindow > 1_048_576) throw new Error("backfill_slot_window_invalid");
+  const mergeBuffer = opts.mergeBufferEntries ?? MERGE_BUFFER_ENTRIES;
+  if (!Number.isInteger(mergeBuffer) || mergeBuffer < 1 || mergeBuffer > 50_000_000) throw new Error("backfill_merge_buffer_invalid");
   const sections = new Set(opts.sections ?? BACKFILL_SECTIONS);
   if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 5_000) throw new Error("backfill_page_size_invalid");
   if (!Number.isInteger(rowPageSize) || rowPageSize < 1 || rowPageSize > 50_000) throw new Error("backfill_row_page_size_invalid");
@@ -647,8 +656,15 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
 
   // ---- revisions, and the slot pass shared with ownership ----
   if (sections.has("revisions") || sections.has("ownership")) {
-    type Group = { key: string; fence: FenceDoc; originId: string; entries: IndexEntryInput[] };
-    const add = async (groups: Map<string, Group>, fences: Map<string, Promise<FenceDoc | null>>, row: { org: unknown; ws: unknown; user: unknown; origin: unknown; record: unknown; revision: unknown; revisionId: unknown; digest: unknown; source: unknown; session: unknown }) => {
+    type Group = { key: string; tenant: LedgerTenant; fence: FenceDoc; originId: string; entries: IndexEntryInput[]; records: Set<string> };
+    /**
+     * One pass's buffer: shard groups gathered across pages and windows, merged together when `entries` reaches the
+     * budget, before a record repeats in a shard (so mergeIndex's in-call choice never replaces the stored-vs-incoming
+     * rule between two SQL rows of one record), and at the end of each source.
+     */
+    type Buffer = { groups: Map<string, Group>; entries: number };
+    const newBuffer = (): Buffer => ({ groups: new Map(), entries: 0 });
+    const add = async (buf: Buffer, fences: Map<string, Promise<FenceDoc | null>>, row: { org: unknown; ws: unknown; user: unknown; origin: unknown; record: unknown; revision: unknown; revisionId: unknown; digest: unknown; source: unknown; session: unknown }) => {
       if (!id(row.org) || !id(row.user) || typeof row.ws !== "string") { summary.revisions.invalid++; return; }
       const fence = await fenceFor({ orgId: row.org, workspaceId: row.ws, userId: row.user }, fences);
       if (!fence) { summary.revisions.skipped_no_fence++; return; }
@@ -667,14 +683,34 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
         summary.revisions.invalid++;
         return;
       }
-      const g = groups.get(key) ?? { key, fence, originId: row.origin, entries: [] };
+      if (buf.groups.get(key)?.records.has(entry.recordId)) await flush(buf);
+      const tenant = { orgId: row.org, workspaceId: row.ws, userId: row.user };
+      const g = buf.groups.get(key) ?? { key, tenant, fence, originId: row.origin, entries: [], records: new Set<string>() };
       g.entries.push(entry);
-      groups.set(key, g);
+      g.records.add(entry.recordId);
+      buf.groups.set(key, g);
+      if (++buf.entries >= mergeBuffer) await flush(buf);
     };
-    const flush = (groups: Map<string, Group>) => mapLimit([...groups.values()], concurrency, async (g) => {
+    /**
+     * Merge a buffer and empty it. A buffered group may have waited across windows, so each tenant's fence is read
+     * again here (once per pass) and the merge runs under that one: mergeIndex then drops what a control written since
+     * has forgotten. A fence that cannot be read now fails its groups (incomplete), never merges under the stale one.
+     */
+    async function flush(buf: Buffer): Promise<void> {
+      const groups = [...buf.groups.values()];
+      buf.groups = new Map();
+      buf.entries = 0;
+      const fresh = new Map<string, Promise<FenceDoc | null>>();
+      await mapLimit(groups, concurrency, async (g) => {
       if (opts.dryRun) { summary.revisions.would_merge += g.entries.length; return; }
+      const fence = await fenceFor(g.tenant, fresh);
+      if (!fence) {
+        summary.revisions.failed += g.entries.length;
+        summary.revisions.failed_codes.fence_unreadable = (summary.revisions.failed_codes.fence_unreadable ?? 0) + g.entries.length;
+        return;
+      }
       try {
-        await storeRetry(() => io.mergeIndex(g.key, g.fence, g.originId, g.entries));
+        await storeRetry(() => io.mergeIndex(g.key, fence, g.originId, g.entries));
         summary.revisions.merged += g.entries.length;
         summary.revisions.shards++;
       } catch (error) {
@@ -682,35 +718,37 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
         summary.revisions.failed += g.entries.length;
         summary.revisions.failed_codes[code] = (summary.revisions.failed_codes[code] ?? 0) + g.entries.length;
       }
-    });
+      });
+    }
     // (a) ingest_record_revisions, seeded revision-only rows included.
     let cursor = ["", "", "", ""];
+    const revisionBuf = newBuffer();
     for (;;) {
       if (!sections.has("revisions")) break;
       const rows = await readOnly(REVISIONS_PAGE, [orgs, ...cursor, rowPageSize]);
       if (!rows.length) break;
       const last = rows[rows.length - 1]!;
       cursor = [text(last.org_id), text(last.workspace_id), text(last.origin_id), text(last.record_id)];
-      const groups = new Map<string, Group>(), fences = new Map<string, Promise<FenceDoc | null>>();
+      const fences = new Map<string, Promise<FenceDoc | null>>();
       for (const r of rows) {
         summary.revisions.rows++;
         if (r.revision_id === null && r.digest === null) summary.revisions.seed_rows++;
-        await add(groups, fences, { org: r.org_id, ws: r.workspace_id, user: r.user_id, origin: r.origin_id, record: r.record_id, revision: r.revision, revisionId: r.revision_id, digest: r.digest, source: r.source, session: r.session_id });
+        await add(revisionBuf, fences, { org: r.org_id, ws: r.workspace_id, user: r.user_id, origin: r.origin_id, record: r.record_id, revision: r.revision, revisionId: r.revision_id, digest: r.digest, source: r.source, session: r.session_id });
       }
-      await flush(groups);
     }
+    await flush(revisionBuf);
     // (b) owned ingest_lazy_native_slots, under their owner and session (ingest_lazy_clear's scope): first their
     // sessions' owner stubs (the ownership section), then their revisions.
+    const slotBuf = newBuffer();
     const slotRows = async (rows: Record<string, unknown>[]) => {
       if (sections.has("ownership")) await registerSlotOwners(rows);
       if (!sections.has("revisions")) return;
-      const groups = new Map<string, Group>(), fences = new Map<string, Promise<FenceDoc | null>>();
+      const fences = new Map<string, Promise<FenceDoc | null>>();
       for (const r of rows) {
         summary.revisions.slot_rows++;
         if (r.current_owner === null) { summary.revisions.slots_empty++; continue; }
-        await add(groups, fences, { org: r.org_id, ws: r.workspace_id, user: r.current_owner, origin: r.origin_id, record: r.record_id, revision: r.current_revision, revisionId: null, digest: r.current_digest, source: r.current_source, session: r.current_session });
+        await add(slotBuf, fences, { org: r.org_id, ws: r.workspace_id, user: r.current_owner, origin: r.origin_id, record: r.record_id, revision: r.current_revision, revisionId: null, digest: r.current_digest, source: r.current_source, session: r.current_session });
       }
-      await flush(groups);
     };
     if (orgs) {
       // Scoped: block windows (SLOTS_WINDOW), the heap's size re-read in each window's snapshot so growth is followed.
@@ -730,6 +768,7 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
         await slotRows(rows);
       }
     }
+    await flush(slotBuf);
     if (sections.has("revisions")) {
       const v = summary.revisions;
       summary.sections.revisions = v.skipped_no_fence + v.invalid + v.failed === 0 ? "complete" : "incomplete";
