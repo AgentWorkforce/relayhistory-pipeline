@@ -119,3 +119,49 @@ describe("ledger-s3.ts acquireSlot / releaseSlot", () => {
     }
   });
 });
+
+describe("INGEST_S3_TENANT_LIMIT / INGEST_ASYNC_MAX_PER_ORG config (selfhost-config.ts)", () => {
+  const enabled = {
+    RELAYHISTORY_SELFHOST_INGEST: "true", RELAYHISTORY_INGEST_ORIGIN: "https://history.selfhost.test",
+    RELAYCONTROL_INTROSPECT_URL: "https://control.selfhost.test", RELAYCONTROL_INTROSPECT_SECRET: "s",
+    RELAYHISTORY_INGEST_DATABASE_URL: "postgresql://bulls96_session_ingest:pw@db.internal:5432/postgres",
+    SESSION_POSTGRES_TLS_PROFILE: "supabase", LOCKER_BUCKET: "transcripts", INGEST_LEDGER: "s3",
+  };
+  const async = { ...enabled, SELFHOST_INGEST_ADMISSION: "async" };
+
+  test("off: unset, empty or off leaves the settings exactly as before (no s3TenantLimit field)", async () => {
+    const { selfhostIngestConfig } = await import("../selfhost-config.ts");
+    for (const env of [enabled, async]) {
+      const base = selfhostIngestConfig(env);
+      expect(Object.hasOwn(base, "s3TenantLimit")).toBe(false);
+      for (const v of ["", "off"]) expect(selfhostIngestConfig({ ...env, INGEST_S3_TENANT_LIMIT: v })).toEqual(base);
+    }
+  });
+
+  test("on: exactly on; the async per-org cap defaults to max(1, floor(concurrency / 2)) only when unset", async () => {
+    const { selfhostIngestConfig } = await import("../selfhost-config.ts");
+    expect(selfhostIngestConfig({ ...enabled, INGEST_S3_TENANT_LIMIT: "on" }).s3TenantLimit).toEqual({});
+    expect(selfhostIngestConfig({ ...async, INGEST_S3_TENANT_LIMIT: "on" }).s3TenantLimit).toEqual({ asyncMaxPerOrg: 2 });
+    for (const [c, want] of [["1", 1], ["3", 1], ["8", 4], ["32", 16]] as const)
+      expect(selfhostIngestConfig({ ...async, INGEST_S3_TENANT_LIMIT: "on", SELFHOST_ADMISSION_CONCURRENCY: c }).s3TenantLimit).toEqual({ asyncMaxPerOrg: want });
+    expect(selfhostIngestConfig({ ...async, INGEST_S3_TENANT_LIMIT: "on", SELFHOST_ADMISSION_CONCURRENCY: "8", INGEST_ASYNC_MAX_PER_ORG: "8" }).s3TenantLimit).toEqual({ asyncMaxPerOrg: 8 });
+  });
+
+  test("invalid values refuse startup, naming the variable only", async () => {
+    const { selfhostIngestConfig } = await import("../selfhost-config.ts");
+    for (const v of ["ON", "On", " on", "true", "1", "yes"]) expect(() => selfhostIngestConfig({ ...enabled, INGEST_S3_TENANT_LIMIT: v })).toThrow(/^96bulls: INGEST_S3_TENANT_LIMIT must be off or on$/);
+    expect(() => selfhostIngestConfig({ ...enabled, INGEST_LEDGER: "sql", INGEST_S3_TENANT_LIMIT: "on" })).toThrow(/INGEST_S3_TENANT_LIMIT=on needs INGEST_LEDGER=s3/);
+    // INGEST_ASYNC_MAX_PER_ORG sits behind the flag and async admission, and is bounded 1..concurrency.
+    expect(() => selfhostIngestConfig({ ...async, INGEST_ASYNC_MAX_PER_ORG: "2" })).toThrow(/INGEST_ASYNC_MAX_PER_ORG needs INGEST_S3_TENANT_LIMIT=on/);
+    expect(() => selfhostIngestConfig({ ...enabled, INGEST_S3_TENANT_LIMIT: "on", INGEST_ASYNC_MAX_PER_ORG: "2" })).toThrow(/INGEST_ASYNC_MAX_PER_ORG needs SELFHOST_INGEST_ADMISSION=async or drain/);
+    for (const v of ["0", "5", "-1", "2.5", "two"])
+      expect(() => selfhostIngestConfig({ ...async, INGEST_S3_TENANT_LIMIT: "on", INGEST_ASYNC_MAX_PER_ORG: v })).toThrow(/^96bulls: INGEST_ASYNC_MAX_PER_ORG must be an integer from 1 to 4$/);
+  });
+
+  test("the runtime refuses the flag without the S3 ledger (direct callers)", async () => {
+    const { selfhostIngestRuntime } = await import("../selfhost-server.ts");
+    expect(() => selfhostIngestRuntime({ keyRoot: "96bulls", maxPerUser: 4, maxPerOrg: 32, admission: undefined, s3TenantLimit: {} },
+      { run: (async () => { throw new Error("unused"); }) as never, store: {} as never, verify: async () => { throw new Error("unused"); }, ready: async () => true, close: async () => {} }))
+      .toThrow(/INGEST_S3_TENANT_LIMIT=on needs INGEST_LEDGER=s3/);
+  });
+});

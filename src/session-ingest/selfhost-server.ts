@@ -90,11 +90,11 @@ import type { DeliverDeps } from "./deliver.ts";
 import { selfhostAdmissionConsumer, type SelfhostAdmissionConsumer, type SelfhostAdmissionOptions, type SelfhostAdmissionStatus } from "./selfhost-admission.ts";
 import { sqlLedger } from "./ledger-sql.ts";
 import { s3Ledger, serverLedgerParallel, withSqlControlMirror } from "./ledger-s3.ts";
-import { tenantLimiter } from "./tenant-limiter.ts";
+import { tenantLimiter, type TenantLimiter } from "./tenant-limiter.ts";
 import type { Ledger } from "./ledger.ts";
 import type { SqlRun } from "./ledger-sql.ts";
 import { relaycontrolIngestIdentity, selfhostIntrospector } from "./selfhost-auth.ts";
-import { SELFHOST_INGEST_ROLE, selfhostIngestConfig, type SelfhostIngestSettings } from "./selfhost-config.ts";
+import { SELFHOST_INGEST_ROLE, defaultAsyncMaxPerOrg, selfhostIngestConfig, type SelfhostIngestSettings } from "./selfhost-config.ts";
 import { isSessionErasePath } from "./session-erase.ts";
 import type { SessionEraseService } from "./session-erase.ts";
 import { buildSelfhostEraseRuntime } from "../session-erase/selfhost-runtime.ts";
@@ -207,18 +207,18 @@ export interface SelfhostRuntimeOptions {
  * (withSqlControlMirror), while the read API and the eraser still read upload_deletions; claims and commits never
  * do. The SQL ledger is built lazily, so only a control reaches SQL.
  */
-export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run" | "store">): Ledger {
+export function selfhostS3Ledger(keyRoot: string, parts: Pick<RuntimeParts, "run" | "store">, limiter?: TenantLimiter): Ledger {
   let sqlControls: Ledger | undefined;
   const sqlControl = (): Ledger => (sqlControls ??= sqlLedger(parts.run, { acceptanceMode: "canonical" }));
   return withSqlControlMirror(
-    // One tenant limiter per process (replica): INGEST_MAX_PER_USER / _ORG cap its in-flight admissions in memory.
-    s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false, parallel: serverLedgerParallel(process.env), tenantLimiter: tenantLimiter() }),
+    // INGEST_S3_TENANT_LIMIT=on: the synchronous path's tenant limiter (one per process / replica). Off: no limiter, unchanged.
+    s3Ledger(parts.store, keyRoot, { acceptanceMode: "canonical", fenceAuthority: "required", claimCompletesResets: false, parallel: serverLedgerParallel(process.env), ...(limiter ? { tenantLimiter: limiter } : {}) }),
     { setSessionUploads: (i) => sqlControl().setSessionUploads(i), resetUploadedSessions: (t, r) => sqlControl().resetUploadedSessions(t, r) },
     parts.store, keyRoot);
 }
 
 /** The ingest app over the given parts. Canonical acceptance, inline writes, no fan-out, no replica, no custody. */
-export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect" | "capturePolicyUploads" | "uploadConsent" | "ledger">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
+export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "keyRoot" | "maxPerUser" | "maxPerOrg" | "admission"> & Partial<Pick<SelfhostIngestSettings, "sessionSelection" | "sessionErase" | "heartbeatAccept" | "claimLockBusy" | "uploadDirect" | "capturePolicyUploads" | "uploadConsent" | "ledger" | "s3TenantLimit">>, parts: RuntimeParts, options: SelfhostRuntimeOptions = {}): SelfhostIngestRuntime {
   const sessionSelection = settings.sessionSelection === true;
   const verified = new WeakMap<Request, IngestIdentity>();
   // INGEST_LEDGER=s3 (decision 0005, selfhost-config.ts): ONE S3 ledger for the synchronous path, the async
@@ -227,7 +227,10 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   const s3 = settings.ledger === "s3";
   if (s3 && (sessionSelection || settings.uploadConsent && settings.uploadConsent !== "off" || parts.withSessionWrites || parts.sessionEraseService))
     throw new Error("96bulls: INGEST_LEDGER=s3 refuses SQL-only features (session selection erase, operator erase, upload consent)");
-  const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts) : sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection });
+  // INGEST_S3_TENANT_LIMIT=on (selfhost-config.ts): needs the S3 ledger; refused again here for direct callers.
+  const tenantLimit = settings.s3TenantLimit;
+  if (tenantLimit && !s3) throw new Error("96bulls: INGEST_S3_TENANT_LIMIT=on needs INGEST_LEDGER=s3");
+  const ledger: Ledger = s3 ? selfhostS3Ledger(settings.keyRoot, parts, tenantLimit ? tenantLimiter() : undefined) : sqlLedger(parts.run, { acceptanceMode: "canonical", selfhostSelectionErase: sessionSelection });
   const deliver: DeliverDeps = {
     ledger,
     ...(parts.withSessionWrites ? { withSessionWrites: parts.withSessionWrites } : {}),
@@ -282,12 +285,21 @@ export function selfhostIngestRuntime(settings: Pick<SelfhostIngestSettings, "ke
   const uploadInbox = upload
     ? { batchSize: upload.scanBatch, promote: (key: string) => promoteUpload(key, { config: upload.config, deliver, witnessKey: upload.witnessKey, enqueue: notify, ...(options.nowMs ? { nowMs: options.nowMs } : {}) }) }
     : undefined;
+  // INGEST_S3_TENANT_LIMIT=on: the consumer has its OWN limiter pool (per replica), INGEST_MAX_PER_USER per user and
+  // INGEST_ASYNC_MAX_PER_ORG (default half the consumer) per org, so one org's backlog never holds every consumer slot.
+  // Only the slot calls differ: every other ledger method is the same S3 ledger.
+  const asyncLimiter = tenantLimit ? tenantLimiter() : undefined;
+  const consumerDeliver: DeliverDeps = asyncLimiter ? {
+    ...deliver,
+    ledger: { ...ledger, acquireSlot: async (request) => asyncLimiter.acquire(request), releaseSlot: async (tenant, holder) => asyncLimiter.release(tenant, holder) },
+    slots: { maxPerUser: settings.maxPerUser, maxPerOrg: tenantLimit!.asyncMaxPerOrg ?? defaultAsyncMaxPerOrg(admission.concurrency), ttlSeconds: 90 },
+  } : deliver;
   const consumer: SelfhostAdmissionConsumer = selfhostAdmissionConsumer({
-    mode, deliver, concurrency: admission.concurrency, scanIntervalMs: admission.scanIntervalMs, maxAttempts: admission.maxAttempts,
+    mode, deliver: consumerDeliver, concurrency: admission.concurrency, scanIntervalMs: admission.scanIntervalMs, maxAttempts: admission.maxAttempts,
     ...(options.nowMs ? { nowMs: options.nowMs } : {}), ...(options.log ? { log: options.log } : {}), ...(uploadInbox ? { uploadInbox } : {}),
     ...uploadConsent,
-    // INGEST_LEDGER=s3: the per-replica tenant limit defers an object (never dead-letters it).
-    ...(s3 ? { deferTenantLimit: true } : {}),
+    // INGEST_S3_TENANT_LIMIT=on: the per-replica tenant limit defers an object (never dead-letters it). Off: unchanged.
+    ...(asyncLimiter ? { deferTenantLimit: true } : {}),
   });
   options.onConsumer?.(consumer);
   const app = withSelfhostCapabilities(createIngestApp({

@@ -1,8 +1,9 @@
 /**
  * Per-tenant upload limits for INGEST_LEDGER=s3 (decision 0005 amendment): the S3 ledger has no slot table, so
- * this process counts its own in-flight admissions. One limiter per ingest-edge replica (selfhostS3Ledger), keyed
- * by org and by (org, user), capping CONCURRENT in-flight admissions at INGEST_MAX_PER_USER / INGEST_MAX_PER_ORG
- * (defaults 4 / 32, the SQL lease's). The caps are PER REPLICA: N replicas admit up to N x the cap for one
+ * this process counts its own in-flight admissions. Behind INGEST_S3_TENANT_LIMIT=on (default off). Per ingest-edge
+ * replica: one limiter for the synchronous path (selfhostS3Ledger: INGEST_MAX_PER_USER / INGEST_MAX_PER_ORG,
+ * defaults 4 / 32, the SQL lease's) and one for the async consumer (INGEST_MAX_PER_USER / INGEST_ASYNC_MAX_PER_ORG),
+ * each keyed by org and by (org, user), capping CONCURRENT in-flight admissions. The caps are PER REPLICA: N replicas admit up to N x the cap for one
  * tenant. No database, no network: an acquire or a release never waits on anything and never fails for a
  * store fault, so Supabase can never block or bottleneck an upload through it.
  *
@@ -13,7 +14,7 @@
  *   - a lease expires by TTL (deliver deps: 90 s), so a release lost to a hang frees itself.
  * Unlike the SQL lease it is exact, not soft: acquire is synchronous, so two racing acquires cannot both pass.
  * deliver.ts releases in `finally` on every path (success, refusal, throw); the TTL covers a promise that never
- * settles. Memory is bounded by the leases alive: expired ones are swept on every acquire of their org and in a
+ * settles; it also frees a slot whose admission is still running after the TTL (a brief over-admission). Memory is bounded by the leases alive: expired ones are swept on every acquire of their org and in a
  * full sweep at most once a TTL floor, and an org with no lease has no entry.
  */
 import type { LedgerTenant, SlotRequest, SlotResult } from "./ledger.ts";
