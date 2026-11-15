@@ -30,8 +30,10 @@ on:
         required: true
 permissions:
   contents: read
+# run_id keeps a run that waits for approval from displacing (cancelling) another
+# pending dispatch of the same ref.
 concurrency:
-  group: fast-path-${{ inputs.ref }}
+  group: fast-path-${{ inputs.ref }}-${{ github.run_id }}
   cancel-in-progress: false
 env:
   IMAGE: ghcr.io/agentworkforce/sessions-pipeline
@@ -84,6 +86,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
+          # Never save the bun download into the cache CI restores.
+          no-cache: true
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -112,6 +116,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
+          # Never save the bun download into the cache CI restores.
+          no-cache: true
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -178,6 +184,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
+          # Never save the bun download into the cache CI restores.
+          no-cache: true
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -201,6 +209,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
+          # Never save the bun download into the cache CI restores.
+          no-cache: true
       - run: bun install --frozen-lockfile
       - run: bun run e2e:selfhost
 
@@ -259,6 +269,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.2
+          # Never save the bun download into the cache CI restores.
+          no-cache: true
       - uses: actions/setup-node@v4
         with:
           node-version: 24
