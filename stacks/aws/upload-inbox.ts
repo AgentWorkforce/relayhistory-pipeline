@@ -258,7 +258,44 @@ export const denyUploadInboxStatement = (bucketArn: string) => ({
  * inbox at all, and only the consumer and the eraser delete there. This covers the pipeline
  * role, the read API, the buffered GC and every operator role, whatever their identity grants.
  */
-export function uploadInboxBucketStatements(i: { bucketArn: string; eraserArn: string; uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string }) {
+// ---- the old-desktop inbox bridge (relayhistory-cloud lib/inbox-bridge.ts), default off ----
+
+/**
+ * The relayhistory-cloud Worker's bridge for Desktops older than 2026.11.4: it writes their POSTed batches into
+ * this inbox as contract objects (relay-upload-inbox-v1), as the presigned issuer's desktops do. Its IAM user
+ * lives OUTSIDE this stack (created by hand with Khaliq's OK, like the backlog-ops roles), so the stack only names
+ * it: on the inbox wall (otherwise the wall denies it every inbox action) and on the key (this key policy
+ * delegates nothing to IAM). Unset: both policies are byte-for-byte as without it. Its identity policy is
+ * relayhistory-cloud docs/ops/inbox-bridge-iam-policy.json.
+ */
+export const INBOX_BRIDGE_KEY_SIDS = ["InboxBridgeEncryptsInboxViaS3", "InboxBridgeReadsJournalsViaS3", "InboxBridgeReadsFenceAuthorityViaS3"] as const;
+
+/** The only accepted bridge principal: this account's user named for the stage. */
+export const inboxBridgeUserArn = (accountId: string, stage: string) => `arn:aws:iam::${accountId}:user/96bulls-${stage}-inbox-bridge`;
+
+const INBOX_BRIDGE_MESSAGE = "transcriptStore.inboxBridgeUserArn must be exactly this account's 96bulls-<stage>-inbox-bridge user (omit for none)";
+
+/** Exactly the stage's bridge user in this account. Fails closed. */
+export function assertInboxBridgeUserArn(value: unknown, accountId: string, stage: string): string {
+  if (!/^\d{12}$/.test(accountId) || !/^[a-z0-9-]{1,40}$/.test(stage) || value !== inboxBridgeUserArn(accountId, stage)) throw new Error(INBOX_BRIDGE_MESSAGE);
+  return value;
+}
+
+/** The bridge's key statements: encrypt its inbox writes, decrypt the journals and fence-authority markers it reads. Via S3, this account. */
+export function inboxBridgeKeyStatements(i: { accountId: string; region: string; bucketName: string; inboxBridgeArn: string }) {
+  const viaFor = (glob: string) => ({
+    StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
+    StringLike: { "kms:EncryptionContext:aws:s3:arn": `arn:aws:s3:::${i.bucketName}/${glob}` },
+  });
+  const Principal = { AWS: i.inboxBridgeArn };
+  return [
+    { Sid: "InboxBridgeEncryptsInboxViaS3", Effect: "Allow" as const, Principal, Action: ["kms:GenerateDataKey", "kms:Encrypt"], Resource: "*", Condition: viaFor(`${UPLOAD_INBOX_PREFIX}*`) },
+    { Sid: "InboxBridgeReadsJournalsViaS3", Effect: "Allow" as const, Principal, Action: ["kms:Decrypt"], Resource: "*", Condition: viaFor(PRIVACY_JOURNAL_GLOB) },
+    { Sid: "InboxBridgeReadsFenceAuthorityViaS3", Effect: "Allow" as const, Principal, Action: ["kms:Decrypt"], Resource: "*", Condition: viaFor(FENCE_AUTHORITY_ORG_MARKERS) },
+  ];
+}
+
+export function uploadInboxBucketStatements(i: { bucketArn: string; eraserArn: string; uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string; inboxBridgeArn?: string }) {
   const inbox = uploadInboxObjects(i.bucketArn);
   return [
     {
@@ -267,7 +304,8 @@ export function uploadInboxBucketStatements(i: { bucketArn: string; eraserArn: s
       Principal: "*",
       Action: ["s3:*"],
       Resource: [inbox],
-      Condition: { ArnNotEquals: { "aws:PrincipalArn": [i.consumerRoleArn, ...(i.uploadRoleArn ? [i.uploadRoleArn] : []), i.eraserArn, ...(i.presignIssuerArn ? [i.presignIssuerArn] : [])] } },
+      // The bridge (inboxBridgeArn) last, so its addition or removal is one list line in a plan diff.
+      Condition: { ArnNotEquals: { "aws:PrincipalArn": [i.consumerRoleArn, ...(i.uploadRoleArn ? [i.uploadRoleArn] : []), i.eraserArn, ...(i.presignIssuerArn ? [i.presignIssuerArn] : []), ...(i.inboxBridgeArn ? [i.inboxBridgeArn] : [])] } },
     },
     {
       Sid: "UploadInboxOnlyEraserOrConsumerDeletes",
@@ -281,7 +319,7 @@ export function uploadInboxBucketStatements(i: { bucketArn: string; eraserArn: s
 }
 
 /** Key-policy statements (flag on). The upload role encrypts inbox objects only; the consumer reads and promotes. */
-export function uploadInboxKeyStatements(i: { accountId: string; region: string; bucketName: string; uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string }) {
+export function uploadInboxKeyStatements(i: { accountId: string; region: string; bucketName: string; uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string; inboxBridgeArn?: string }) {
   const viaFor = (glob: string) => ({
     StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
     StringLike: { "kms:EncryptionContext:aws:s3:arn": `arn:aws:s3:::${i.bucketName}/${glob}` },
@@ -298,6 +336,7 @@ export function uploadInboxKeyStatements(i: { accountId: string; region: string;
           { Sid: "PresignIssuerReadsJournalsViaS3", Effect: "Allow" as const, Principal: { AWS: i.presignIssuerArn }, Action: ["kms:Decrypt"], Resource: "*", Condition: viaFor(PRIVACY_JOURNAL_GLOB) },
         ]
       : []),
+    ...(i.inboxBridgeArn ? inboxBridgeKeyStatements({ accountId: i.accountId, region: i.region, bucketName: i.bucketName, inboxBridgeArn: i.inboxBridgeArn }) : []),
   ];
 }
 

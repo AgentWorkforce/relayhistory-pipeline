@@ -78,6 +78,14 @@
  *                              statements. The plan contract accepts the change only alone, as its own
  *                              "backlog ops key grants" phase (docs/backlog-ops-workflow.md).
  *
+ * The old-desktop inbox bridge (relayhistory-cloud lib/inbox-bridge.ts; stacks/aws/upload-inbox.ts), default OFF:
+ *
+ *   transcriptStore.inboxBridgeUserArn  this account's exact 96bulls-<stage>-inbox-bridge user (created outside the
+ *                              stack). Needs the upload inbox. Unset: byte-identical policies. Set: the inbox wall
+ *                              also exempts it (one more ArnNotEquals entry, last) and the key policy also carries
+ *                              its three via-S3 statements. The plan contract accepts the change only alone, as its
+ *                              own "inbox bridge grants" phase.
+ *
  * Pure functions, unit-tested in stacks/aws/__tests__/transcript-store.test.ts;
  * `transcriptStoreStage` declares the resources.
  */
@@ -102,6 +110,10 @@ import {
   assertHostedUploadInboxSse,
   assertUploadAdmissionInputs,
   assertUploadControlRoleArn,
+  assertInboxBridgeUserArn,
+  inboxBridgeKeyStatements,
+  inboxBridgeUserArn,
+  INBOX_BRIDGE_KEY_SIDS,
   denyUploadInboxStatement,
   desktopUploadPolicy,
   desktopUploadTrustPolicy,
@@ -179,6 +191,12 @@ export interface TranscriptStoreInputs {
    * (backlog-ops-key-policy.ts). Omit: the key policy is byte-for-byte as without it.
    */
   backlogOpsRoles?: BacklogOpsRoles;
+  /**
+   * Default off. The relayhistory-cloud inbox bridge's IAM user in THIS account (created outside the stack;
+   * upload-inbox.ts inboxBridgeUserArn). Needs the upload inbox. Present: the inbox wall exempts it and the key
+   * policy carries its via-S3 statements (inboxBridgeKeyStatements). Omit: both policies byte-for-byte as without it.
+   */
+  inboxBridgeUserArn?: string;
   /**
    * Log management events too (default true). Set false only when another trail
    * in the account already logs them (a second copy is billed).
@@ -317,10 +335,15 @@ export function assertTranscriptStoreInputs(
   if (inputs.region !== TRANSCRIPT_REGION) refuse(`transcript content must stay in ${TRANSCRIPT_REGION} (migration plan, regional boundaries), got ${inputs.region}`);
   if (inputs.partition !== TRANSCRIPT_PARTITION) refuse(`partition must be exactly ${TRANSCRIPT_PARTITION}, got ${JSON.stringify(inputs.partition)}`);
   for (const k of Object.keys(store))
-    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "uploadControlRoleArn" && k !== "uploadInboxSse" && k !== "uploadAdmission" && k !== "uploadPresignIssuer" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn" && k !== "crossAccountWorkerRoleArn" && k !== "backlogOpsRoles") refuse(`transcriptStore.${k} is not a known setting`);
+    if (k !== "managementEvents" && k !== "auditPrincipalArn" && k !== "inboxAuthorityKeyRoot" && k !== "uploadControlRoleArn" && k !== "uploadInboxSse" && k !== "uploadAdmission" && k !== "uploadPresignIssuer" && k !== "sessionPipeline" && k !== "sessionReadApi" && k !== "bufferedGcRoleArn" && k !== "crossAccountWorkerRoleArn" && k !== "backlogOpsRoles" && k !== "inboxBridgeUserArn") refuse(`transcriptStore.${k} is not a known setting`);
   assertBufferedGcRoleArn(store.bufferedGcRoleArn, inputs.accountId);
   if (store.crossAccountWorkerRoleArn !== undefined) assertCrossAccountWorkerRoleArn(store.crossAccountWorkerRoleArn, inputs.accountId);
   if (store.backlogOpsRoles !== undefined) assertBacklogOpsRoles(store.backlogOpsRoles, inputs.accountId, stage);
+  if (store.inboxBridgeUserArn !== undefined) {
+    assertInboxBridgeUserArn(store.inboxBridgeUserArn, inputs.accountId, stage);
+    // The wall and its key grants exist only with the upload inbox: a bridge principal without it would be inert.
+    if (store.uploadAdmission === undefined) refuse("transcriptStore.inboxBridgeUserArn needs the upload inbox (transcriptStore.uploadAdmission)");
+  }
   assertInboxAuthorityKeyRoot(store.inboxAuthorityKeyRoot, refuse);
   assertUploadControlRoleArn(store.uploadControlRoleArn, refuse);
   assertHostedUploadInboxSse(store.uploadInboxSse, false, refuse);
@@ -371,7 +394,8 @@ export type TranscriptStorePlanPhase =
   | "upload inbox rollout"
   | "upload inbox update"
   | "cross-account worker grants"
-  | "backlog ops key grants";
+  | "backlog ops key grants"
+  | "inbox bridge grants";
 
 /**
  * The read API's own phases (session-read-api.ts). It touches nothing else: no
@@ -854,6 +878,9 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   // The backlog-ops roles' key statements (backlogOpsRoles) are added alone too: only the key policy updates.
   const backlogOpsPhase = backlogOpsKeyGrantsPhase(compact.operations, capture.detailedPlanText, refuse);
   if (backlogOpsPhase) return backlogOpsPhase;
+  // The inbox bridge's wall entry and key statements (inboxBridgeUserArn) are added alone too.
+  const inboxBridgePhase = inboxBridgeGrantsPhase(compact.operations, capture.detailedPlanText, refuse);
+  if (inboxBridgePhase) return inboxBridgePhase;
   // The upload inbox (HISTORY_UPLOAD_DIRECT_INFRA=on) rolls out and updates alone.
   const uploadPhase = uploadInboxPhase(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, refuse);
   if (uploadPhase) return uploadPhase;
@@ -1081,6 +1108,77 @@ function backlogOpsKeyGrantsPhase(operations: ReadonlyMap<string, string>, detai
   }
   return "backlog ops key grants";
 }
+
+/**
+ * The inbox bridge grants phase: everything noop except `transcripts` and `transcripts-key`, both updated. The
+ * bucket diff changes only the inbox wall (UploadInboxOnlyItsRoles), by exactly one ArnNotEquals entry: this
+ * stage's bridge user, added (inboxBridgeUserArn set) or removed (unset again: the revocation path); every other
+ * statement is byte-identical. The key diff adds (or removes) exactly the three InboxBridge Sids, byte-for-byte
+ * what upload-inbox.ts inboxBridgeKeyStatements builds for that user. Both move in the same direction.
+ *
+ * It guards every other phase too: a plan that changes the number of bridge entries on the wall, or any
+ * InboxBridge key statement, is refused unless it is exactly this phase, so the bridge never rides along in an
+ * upload inbox rollout or update. A wall re-rendered with the bridge already on it (the consumer's role-ARN
+ * cascade) is not this phase. Undefined when the plan does not touch the bridge.
+ */
+function inboxBridgeGrantsPhase(operations: ReadonlyMap<string, string>, detailedPlanText: string, refuse: (why: string) => never): TranscriptStorePlanPhase | undefined {
+  const lines = detailedPlanText.split(/\r?\n/);
+  const say = (r: string) => (why: string): never => refuse(`inbox bridge grants: ${r}: ${why}`);
+  const want = inboxBridgeUserArn(TRANSCRIPT_ACCOUNT_ID, TRANSCRIPT_STAGE);
+  const bridgeLines = (text: string | undefined) => (text === undefined ? [] : unquoteYaml(text).split("\n").filter((l) => INBOX_BRIDGE_ENTRY.test(l)));
+  const block = (r: string) => (operations.get(r) === "update" ? planResourceBlock(lines, r) : []);
+  const bucketBlock = block("transcripts"), keyBlock = block("transcripts-key");
+  const bucket = bucketBlock.some((l) => l.includes("-inbox-bridge")) ? policyDiffSides(bucketBlock, say("transcripts")) : undefined;
+  const key = keyBlock.some((l) => INBOX_BRIDGE_SID_LINE.test(l)) ? policyDiffSides(keyBlock, say("transcripts-key")) : undefined;
+  const ours = (m: Map<string, string>) => JSON.stringify([...m].filter(([sid]) => sid.startsWith(INBOX_BRIDGE_SID_PREFIX)).sort(([a], [b]) => (a < b ? -1 : 1)));
+  const wallLive = bucket?.live.bySid.get(INBOX_WALL_SID), wallPlanned = bucket?.planned.bySid.get(INBOX_WALL_SID);
+  const bucketTouched = bucket !== undefined && bridgeLines(wallLive).length !== bridgeLines(wallPlanned).length;
+  const keyTouched = key !== undefined && ours(key.live.bySid) !== ours(key.planned.bySid);
+  if (!bucketTouched && !keyTouched) return undefined;
+  const changed = [...operations].filter(([, a]) => a !== "noop");
+  if (!changed.every(([r, a]) => (r === "transcripts" || r === "transcripts-key") && a === "update"))
+    return refuse(`inbox bridge grants must deploy alone (only transcripts and transcripts-key may update): ${changed.map(([r, a]) => `${r}:${a}`).join(", ")}`);
+  if (!bucketTouched || !keyTouched) return refuse("inbox bridge grants: the wall entry and the key statements change together");
+
+  // Bucket: one wall entry, nothing else.
+  const b = bucket!, sayB = say("transcripts");
+  if (b.live.header !== b.planned.header) sayB("only policy statements may change");
+  if (JSON.stringify([...b.live.bySid.keys()].sort()) !== JSON.stringify([...b.planned.bySid.keys()].sort())) sayB("no statement may be added or removed");
+  for (const [sid, text] of b.live.bySid) if (sid !== INBOX_WALL_SID && b.planned.bySid.get(sid) !== text) sayB(`existing statement ${sid} must stay byte-identical`);
+  const liveWall = unquoteYaml(wallLive!).split("\n"), plannedWall = unquoteYaml(wallPlanned!).split("\n");
+  const adds = bridgeLines(wallLive).length === 0 && bridgeLines(wallPlanned).length === 1;
+  const removes = bridgeLines(wallLive).length === 1 && bridgeLines(wallPlanned).length === 0;
+  if (!adds && !removes) sayB("the wall must gain (or, to revoke, lose) exactly one bridge entry");
+  const [longer, shorter] = adds ? [plannedWall, liveWall] : [liveWall, plannedWall];
+  const entry = longer.find((l) => INBOX_BRIDGE_ENTRY.test(l))!;
+  if (entry.trim() !== `- ${want}`) sayB(`the bridge entry must be exactly ${want}`);
+  if (JSON.stringify(longer.filter((l) => l !== entry)) !== JSON.stringify(shorter)) sayB(`${INBOX_WALL_SID} may change only by the bridge entry`);
+
+  // Key: exactly the three statements, in the same direction.
+  const k = key!, sayK = say("transcripts-key");
+  if (k.live.header !== k.planned.header) sayK("only policy statements may change");
+  const expected: readonly string[] = INBOX_BRIDGE_KEY_SIDS;
+  for (const [sid, text] of k.live.bySid)
+    if (k.planned.bySid.has(sid) ? k.planned.bySid.get(sid) !== text : !expected.includes(sid)) sayK(`existing statement ${sid} must stay byte-identical`);
+  const added = [...k.planned.bySid.keys()].filter((sid) => !k.live.bySid.has(sid)).sort();
+  const removed = [...k.live.bySid.keys()].filter((sid) => !k.planned.bySid.has(sid)).sort();
+  const exact = JSON.stringify([...expected].sort());
+  const keyAdds = removed.length === 0 && JSON.stringify(added) === exact;
+  const keyRemoves = added.length === 0 && JSON.stringify(removed) === exact;
+  if (!(adds ? keyAdds : keyRemoves)) sayK(`must ${adds ? "add" : "remove"} exactly ${expected.join(", ")} with the wall entry; adds ${added.join(", ") || "(none)"}, removes ${removed.join(", ") || "(none)"}`);
+  if (adds) {
+    const n = transcriptNames(TRANSCRIPT_STAGE, TRANSCRIPT_ACCOUNT_ID);
+    for (const statement of inboxBridgeKeyStatements({ accountId: TRANSCRIPT_ACCOUNT_ID, region: TRANSCRIPT_REGION, bucketName: n.bucket, inboxBridgeArn: want }))
+      if (unquoteYaml(k.planned.bySid.get(statement.Sid)!) !== planYaml([statement], k.planned.itemIndent).join("\n")) sayK(`${statement.Sid} must be exactly the reviewed statement`);
+  }
+  return "inbox bridge grants";
+}
+
+const INBOX_WALL_SID = "UploadInboxOnlyItsRoles";
+const INBOX_BRIDGE_SID_PREFIX = "InboxBridge";
+const INBOX_BRIDGE_SID_LINE = /^ {2}[+-]\s+(?:- )?Sid:\s*InboxBridge/;
+/** Any stage's or account's bridge user in a list entry: the guard counts them all, the check then pins this stage's. */
+const INBOX_BRIDGE_ENTRY = /^\s*(?:[+-]\s+)?- arn:aws:iam::\d{12}:user\/96bulls-[a-z0-9-]+-inbox-bridge\s*$/;
 
 const BACKLOG_OPS_SID_PREFIX = "BacklogOps";
 const BACKLOG_OPS_SID_LINE = /^ {2}[+-]\s+(?:- )?Sid:\s*BacklogOps/;
@@ -1594,7 +1692,7 @@ export function trailLifecycleRules() {
  * including `aws:kms` without a key id (S3 would use `aws/s3`). SSE-C is blocked
  * separately by the encryption configuration.
  */
-export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string; accountId?: string; bufferedGcRoleArn?: string; crossAccountWorkerRoleArn?: string; analysisDeleterArn?: string; uploadInbox?: { uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string } }) {
+export function transcriptBucketPolicy(i: { bucketArn: string; keyArn: string; eraserArn: string; accountId?: string; bufferedGcRoleArn?: string; crossAccountWorkerRoleArn?: string; analysisDeleterArn?: string; uploadInbox?: { uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string; inboxBridgeArn?: string } }) {
   if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId ?? "");
   // The eraser+GC principal list is shared by the analysis-on and analysis-off variants of
   // the eraser-only deny below: a single control point, covered by the hardening mutations.
@@ -1725,7 +1823,7 @@ export function trailLogBucketPolicy(i: { bucketArn: string; trailArn: string; a
  * The eraser and every other operator role have no use of it: deleting needs no key,
  * and nobody reads transcripts with the console.
  */
-export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; bufferedGcRoleArn?: string; crossAccountWorkerRoleArn?: string; backlogOps?: { stage: string; roles: BacklogOpsRoles }; analysisResults?: boolean; readApiRoleArn?: string; uploadInbox?: { uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string } }) {
+export function transcriptKeyPolicy(i: { accountId: string; region: string; bucketName: string; writerArn: string; srvWriterArn: string; readerArn: string; pipelineRoleArn?: string; bufferedGcRoleArn?: string; crossAccountWorkerRoleArn?: string; backlogOps?: { stage: string; roles: BacklogOpsRoles }; analysisResults?: boolean; readApiRoleArn?: string; uploadInbox?: { uploadRoleArn?: string; consumerRoleArn: string; presignIssuerArn?: string; inboxBridgeArn?: string } }) {
   if (i.bufferedGcRoleArn !== undefined) assertBufferedGcRoleArn(i.bufferedGcRoleArn, i.accountId);
   const via = {
     StringEquals: { "kms:ViaService": `s3.${i.region}.amazonaws.com`, "kms:CallerAccount": i.accountId },
@@ -1914,6 +2012,12 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
     const uploadDirect = i.historyUploadDirectInfra === true;
     if (i.historyUploadDirectInfra !== undefined && typeof i.historyUploadDirectInfra !== "boolean")
       throw new Error("96bulls: historyUploadDirectInfra must be a boolean. Nothing was created.");
+    if (i.transcriptStore.inboxBridgeUserArn !== undefined) {
+      assertInboxBridgeUserArn(i.transcriptStore.inboxBridgeUserArn, i.accountId, i.stage);
+      // The wall and the key grants it joins exist only with the upload inbox and one of its principals.
+      if (!uploadDirect || (i.transcriptStore.uploadControlRoleArn === undefined && i.transcriptStore.uploadPresignIssuer !== true))
+        throw new Error("96bulls: transcriptStore.inboxBridgeUserArn needs the upload inbox (historyUploadDirectInfra on, with a presigned issuer or an upload role). Nothing was created.");
+    }
     if (uploadDirect) {
       const refuse = (why: string): never => { throw new Error(`96bulls: ${i.stage} historyUploadDirectInfra is on: ${why}. Nothing was created.`); };
       assertUploadControlRoleArn(i.transcriptStore.uploadControlRoleArn, refuse);
@@ -2035,6 +2139,7 @@ export const transcriptStoreStage = (i: TranscriptStageInputs) =>
             ...(uploadRole ? { uploadRoleArn: (uploadRole as unknown as { roleArn: string }).roleArn } : {}),
             consumerRoleArn: (uploadFn as unknown as { roleArn: string }).roleArn,
             ...(presignIssuer ? { presignIssuerArn: presignIssuer.userArn as unknown as string } : {}),
+            ...(i.transcriptStore.inboxBridgeUserArn !== undefined ? { inboxBridgeArn: i.transcriptStore.inboxBridgeUserArn } : {}),
           }
         : undefined;
 
