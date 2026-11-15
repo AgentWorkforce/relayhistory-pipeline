@@ -359,6 +359,27 @@ describe("adopt identities: the live diff (read calls only)", () => {
   });
 });
 
+describe("adopt identities: the capture and the deploy run the live diff", () => {
+  const source = (rel: string) => readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8");
+  const stack = source("../alchemy.aws.run.ts"), capture = source("../../../src/cli/aws-provenance-io.ts");
+
+  it("the capture runs the live diff before it writes the reviewed files, and records its hash", () => {
+    const at = capture.indexOf('const preApplySha256 = adopt ? assertCleanPreApply(preApplyReport(inputs, awsCliRun(env)), "capture") : undefined;');
+    expect(at).toBeGreaterThan(0);
+    expect(at).toBeLessThan(capture.indexOf("writeFileSync(p.plan, plan)"));
+    expect(capture).toContain("...(preApplySha256 ? { adoptIdentities: { preApplySha256 } } : {}),");
+  });
+
+  it("the deploy re-runs the live diff for the adopt phase and requires the recorded hash", () => {
+    const phase = stack.indexOf('if (phase === "adopt identities") {');
+    const rerun = stack.indexOf('if (assertCleanPreApply(preApplyReport(inputs, awsCliRun(process.env)), "deploy") !== recorded)');
+    expect(phase).toBeGreaterThan(0);
+    expect(rerun).toBeGreaterThan(phase);
+    expect(rerun).toBeLessThan(stack.indexOf("verifyDeployCapture("));
+    expect(stack).toContain("const recorded = (JSON.parse(provenanceText) as { adoptIdentities?: { preApplySha256?: string } }).adoptIdentities?.preApplySha256;");
+  });
+});
+
 // ---- plan contract ----
 const STORE = [
   "access-logs", "budget", "trail", "trail-key", "trail-key-alias", "trail-logs",
