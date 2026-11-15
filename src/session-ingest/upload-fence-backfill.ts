@@ -218,19 +218,16 @@ SELECT DISTINCT ${OWN_KEY} FROM (
 ) AS o
 ORDER BY ${OWN_KEY}
 LIMIT $8::int`;
-const SLOTS_PAGE = `
-SELECT key_sha256, org_id, workspace_id, origin_id, record_id, current_owner, current_source, current_session, current_revision, current_digest
-FROM sessions.ingest_lazy_native_slots
-WHERE ${SCOPE} AND key_sha256 > $2::text
-ORDER BY key_sha256
-LIMIT $3::int`;
 /**
- * The scoped slots read: one window of heap blocks (a TID range scan), filtered to the scope's orgs. Keyset paging on
+ * The slots read: one window of heap blocks (a TID range scan), filtered to the scope's orgs when scoped. Keyset paging on
  * key_sha256 with an org filter walks the primary key and fetches every slot's heap tuple at random to test its org
  * (about 21 s a page on production's tens of millions of slots, scoped or not); a block window reads the heap in
  * order instead, so a whole pass is one sequential read. A slot rewritten during the pass can move to a block already
  * read and be missed, so a scoped run is exact only while its orgs admit nothing: run the execute after the scope's
- * HTTP admission stop (decision 0005's cutover order). The unscoped pass keeps the key_sha256 keyset.
+ * HTTP admission stop (decision 0005's cutover order). The unscoped pass reads the same windows: run while other orgs
+ * still admit, it pre-warms their shards and may miss their moved slots, so it certifies no org that was not stopped
+ * before it began. Each org's cutover still takes a full run after its own stop (merges of what the pre-warm already
+ * stored change nothing, so that run is mostly reads).
  */
 const SLOT_WINDOW_BLOCKS = 4096;
 /** About 4M entries (a few GB of heap) per merge pass; a 10M-slot org merges in three passes. */
@@ -239,7 +236,7 @@ const SLOTS_BLOCKS = `SELECT (pg_relation_size('sessions.ingest_lazy_native_slot
 const SLOTS_WINDOW = `
 SELECT key_sha256, org_id, workspace_id, origin_id, record_id, current_owner, current_source, current_session, current_revision, current_digest
 FROM sessions.ingest_lazy_native_slots
-WHERE org_id = ANY($1::text[]) AND ctid >= $2::tid AND ctid < $3::tid`;
+WHERE ($1::text[] IS NULL OR org_id = ANY($1::text[])) AND ctid >= $2::tid AND ctid < $3::tid`;
 const REVISIONS_PAGE = `
 SELECT org_id, workspace_id, origin_id, record_id, revision, revision_id, digest, user_id, source, session_id
 FROM sessions.ingest_record_revisions
@@ -753,23 +750,15 @@ export async function backfillUploadFences(opts: BackfillOptions): Promise<Backf
         await add(slotBuf, fences, { org: r.org_id, ws: r.workspace_id, user: r.current_owner, origin: r.origin_id, record: r.record_id, revision: r.current_revision, revisionId: null, digest: r.current_digest, source: r.current_source, session: r.current_session });
       }
     };
-    if (orgs) {
-      // Scoped: block windows (SLOTS_WINDOW), the heap's size re-read in each window's snapshot so growth is followed.
-      for (let block = 0; ; block += slotWindow) {
-        const [size, rows] = await readOnlyAll([[SLOTS_BLOCKS, []], [SLOTS_WINDOW, [orgs, `(${block},0)`, `(${block + slotWindow},0)`]]], true);
-        const blocks = int(size![0]?.blocks);
-        if (blocks === undefined) throw new Error("backfill_slot_blocks_invalid");
-        await slotRows(rows!);
-        if (block + slotWindow >= blocks) break;
-      }
-    } else {
-      let slotCursor = "";
-      for (;;) {
-        const rows = await readOnly(SLOTS_PAGE, [orgs, slotCursor, rowPageSize]);
-        if (!rows.length) break;
-        slotCursor = text(rows[rows.length - 1]!.key_sha256);
-        await slotRows(rows);
-      }
+    // Block windows (SLOTS_WINDOW), scoped or not: a TID range reads the heap in order, where keyset paging on
+    // key_sha256 cost about 21 s a page on production's tens of millions of slots. The heap's size is re-read in each
+    // window's snapshot so growth is followed.
+    for (let block = 0; ; block += slotWindow) {
+      const [size, rows] = await readOnlyAll([[SLOTS_BLOCKS, []], [SLOTS_WINDOW, [orgs ?? null, `(${block},0)`, `(${block + slotWindow},0)`]]], true);
+      const blocks = int(size![0]?.blocks);
+      if (blocks === undefined) throw new Error("backfill_slot_blocks_invalid");
+      await slotRows(rows!);
+      if (block + slotWindow >= blocks) break;
     }
     await flush(slotBuf);
     if (sections.has("revisions")) {
