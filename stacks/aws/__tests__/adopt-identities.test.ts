@@ -15,7 +15,8 @@ import {
 import { SESSION_PIPELINE_RESOURCES } from "../session-pipeline.ts";
 import { assertTranscriptStoreInputs, assertTranscriptStorePlanContract, TRANSCRIPT_ACCOUNT_ID, TRANSCRIPT_REGION, TRANSCRIPT_STAGE, transcriptNames } from "../transcript-store.ts";
 import { uploadPresignIssuerPolicy } from "../upload-inbox.ts";
-import { preApplyReport, type Run } from "../../../scripts/adopt-identities-preapply.ts";
+import { alchemyStatePrefix } from "../preflight.ts";
+import { assertCleanPreApply, canonicalJson, preApplyReport, type Run } from "../adopt-identities-live.ts";
 
 // Synthetic placeholders only (public repo), except the production stage constants the contract is pinned to.
 const accountId = "111122223333", region = "us-east-1", stage = "synthetic";
@@ -24,16 +25,21 @@ const keyAlias = `alias/96bulls-${stage}-transcripts`, keyArn = `arn:aws:kms:${r
 const ctx = { stage, accountId, region, bucketName, keyAlias, keyArn };
 const refuse = (why: string): never => { throw new Error(why); };
 
-const readPolicy = { Version: "2012-10-17" as const, Statement: [
-  { Sid: "List", Effect: "Allow", Action: "s3:ListBucket", Resource: bucketArn },
-  { Sid: "Get", Effect: "Allow", Action: ["s3:GetObject"], Resource: `${bucketArn}/96bulls/*` },
-  { Sid: "Key", Effect: "Allow", Action: "kms:Decrypt", Resource: keyArn, Condition: { StringEquals: { "kms:ViaService": `s3.${region}.amazonaws.com` } } },
-] };
-const writePolicy = { Version: "2012-10-17" as const, Statement: [...readPolicy.Statement,
-  { Sid: "Put", Effect: "Allow", Action: "s3:PutObject", Resource: `${bucketArn}/96bulls/*`, Condition: { StringEquals: { "s3:x-amz-server-side-encryption": "aws:kms" } } },
-  { Sid: "Encrypt", Effect: "Allow", Action: "kms:GenerateDataKey", Resource: keyArn, Condition: { StringEquals: { "kms:ViaService": `s3.${region}.amazonaws.com` } } },
-  { Sid: "NoDelete", Effect: "Deny", Action: "s3:Delete*", Resource: "*" },
-] };
+const rolePolicies = (bucket: string, key: string) => {
+  const read = { Version: "2012-10-17" as const, Statement: [
+    { Sid: "List", Effect: "Allow", Action: "s3:ListBucket", Resource: `arn:aws:s3:::${bucket}` },
+    { Sid: "Get", Effect: "Allow", Action: ["s3:GetObject"], Resource: `arn:aws:s3:::${bucket}/96bulls/*` },
+    { Sid: "Key", Effect: "Allow", Action: "kms:Decrypt", Resource: key, Condition: { StringEquals: { "kms:ViaService": `s3.${region}.amazonaws.com` } } },
+  ] };
+  const write = { Version: "2012-10-17" as const, Statement: [...read.Statement,
+    { Sid: "Put", Effect: "Allow", Action: "s3:PutObject", Resource: `arn:aws:s3:::${bucket}/96bulls/*`,
+      Condition: { StringEquals: { "s3:x-amz-server-side-encryption": "aws:kms", "s3:x-amz-server-side-encryption-aws-kms-key-id": key } } },
+    { Sid: "Encrypt", Effect: "Allow", Action: "kms:GenerateDataKey", Resource: key, Condition: { StringEquals: { "kms:ViaService": `s3.${region}.amazonaws.com` } } },
+    { Sid: "NoDelete", Effect: "Deny", Action: "s3:Delete*", Resource: "*" },
+  ] };
+  return { read, write };
+};
+const { read: readPolicy, write: writePolicy } = rolePolicies(bucketName, keyArn);
 const all: AdoptIdentitiesInputs = {
   githubOidcProvider: true,
   backlogOpsRoles: { read: { inlinePolicies: { "backlog-ops-read": readPolicy } }, write: { inlinePolicies: { "backlog-ops-write": writePolicy }, description: "synthetic description" } },
@@ -58,32 +64,50 @@ describe("adopt identities: input", () => {
     expect(() => check({ backlogOpsRoles: { ...all.backlogOpsRoles, extra: {} } })).toThrow(/exactly \{ read, write \}/);
   });
 
-  it("refuses role policies that leave backlog-ops' needs or are not plain IAM documents", () => {
-    const withRead = (statement: Record<string, unknown> | Record<string, unknown>[], extra: Record<string, unknown> = {}) =>
-      check({ backlogOpsRoles: { write: all.backlogOpsRoles!.write, read: { inlinePolicies: { p: { Version: "2012-10-17", Statement: [statement].flat() } }, ...extra } } });
+  it("refuses role policies that leave backlog-ops' documented needs or are not plain IAM documents", () => {
+    const withRead = (statement: Record<string, unknown> | Record<string, unknown>[], extra: Record<string, unknown> = {}, key?: string) =>
+      assertAdoptIdentitiesInputs({ backlogOpsRoles: { write: all.backlogOpsRoles!.write, read: { inlinePolicies: { p: { Version: "2012-10-17", Statement: [statement].flat() } }, ...extra } } },
+        { accountId, region, bucketName, ...(key ? { keyArn: key } : {}) }, refuse);
+    const withWrite = (statement: Record<string, unknown>) =>
+      check({ backlogOpsRoles: { read: all.backlogOpsRoles!.read, write: { inlinePolicies: { p: { Version: "2012-10-17", Statement: [statement] } } } } });
     const ok = { Effect: "Allow", Action: "s3:GetObject", Resource: `${bucketArn}/96bulls/*` };
     const via = { StringEquals: { "kms:ViaService": `s3.${region}.amazonaws.com` } };
+    const sse = { StringEquals: { "s3:x-amz-server-side-encryption": "aws:kms", "s3:x-amz-server-side-encryption-aws-kms-key-id": keyArn } };
     expect(() => withRead(ok)).not.toThrow();
     for (const [bad, why] of [
       [{ ...ok, Action: "s3:PutObject" }, /read role may be allowed only/],
       [{ ...ok, Action: "s3:DeleteObject" }, /read role may be allowed only/],
       [{ ...ok, Action: "s3:*" }, /read role may be allowed only/],
       [{ ...ok, Action: "*" }, /read role may be allowed only/],
-      [{ ...ok, Resource: "*" }, /must name the transcripts bucket/],
-      [{ ...ok, Resource: "arn:aws:s3:::other-bucket/*" }, /must name the transcripts bucket/],
-      [{ ...ok, Resource: `${bucketArn}-suffix/*` }, /must name the transcripts bucket/],
-      [{ Effect: "Allow", Action: "kms:Decrypt", Resource: `arn:aws:kms:${region}:444455556666:key/x`, Condition: via }, /a key in this account and region/],
-      [{ Effect: "Allow", Action: "kms:Decrypt", Resource: `arn:aws:kms:eu-west-1:${accountId}:key/x`, Condition: via }, /a key in this account and region/],
+      [{ ...ok, Resource: "*" }, /only on exactly/],
+      [{ ...ok, Resource: `${bucketArn}/*` }, /only on exactly/],
+      [{ ...ok, Resource: bucketArn }, /only on exactly/],
+      [{ ...ok, Resource: "arn:aws:s3:::other-bucket/96bulls/*" }, /only on exactly/],
+      [{ Effect: "Allow", Action: "s3:ListBucket", Resource: `${bucketArn}/96bulls/*` }, /ListBucket only on the transcripts bucket itself/],
+      [{ Effect: "Allow", Action: "kms:Decrypt", Resource: `arn:aws:kms:${region}:444455556666:key/x`, Condition: via }, /only on the transcripts key/],
+      [{ Effect: "Allow", Action: "kms:Decrypt", Resource: `arn:aws:kms:eu-west-1:${accountId}:key/x`, Condition: via }, /only on the transcripts key/],
+      [{ Effect: "Allow", Action: "kms:Decrypt", Resource: "*", Condition: via }, /only on the transcripts key/],
       [{ Effect: "Allow", Action: "kms:Decrypt", Resource: keyArn }, /kms:ViaService/],
       [{ Effect: "Allow", Action: "kms:Decrypt", Resource: keyArn, Condition: { StringEquals: { "kms:ViaService": "s3.eu-west-1.amazonaws.com" } } }, /kms:ViaService/],
       [{ Effect: "Allow", Action: "kms:Decrypt", Resource: keyArn, Condition: { StringLike: { "kms:ViaService": "*" } } }, /kms:ViaService/],
-      [{ Effect: "Allow", Action: ["s3:GetObject", "kms:Decrypt"], Resource: keyArn, Condition: via }, /must name the transcripts bucket/],
+      [{ Effect: "Allow", Action: ["s3:GetObject", "kms:Decrypt"], Resource: keyArn, Condition: via }, /only on exactly/],
       [{ Effect: "Allow", NotAction: "s3:DeleteObject", Resource: bucketArn }, /no NotAction/],
       [{ ...ok, NotResource: bucketArn, Resource: undefined }, /no NotAction, no NotResource/],
       [{ ...ok, Principal: "*" }, /may not carry Principal/],
       [{ ...ok, Effect: "allow" }, /Effect must be Allow or Deny/],
       [{ ...ok, Action: [] }, /at least one action/],
     ] as const) expect(() => withRead(bad as never)).toThrow(why);
+    // Once the key's live ARN is known, only that key.
+    const otherKey = `arn:aws:kms:${region}:${accountId}:key/11111111-1111-1111-1111-111111111111`;
+    expect(() => withRead({ Effect: "Allow", Action: "kms:Decrypt", Resource: otherKey, Condition: via })).not.toThrow();
+    expect(() => withRead({ Effect: "Allow", Action: "kms:Decrypt", Resource: otherKey, Condition: via }, {}, keyArn)).toThrow(/only on the transcripts key/);
+    // The writer's Put: exactly the prefix, SSE-KMS with the transcripts key.
+    const put = { Effect: "Allow", Action: "s3:PutObject", Resource: `${bucketArn}/96bulls/*`, Condition: sse };
+    expect(() => withWrite(put)).not.toThrow();
+    expect(() => withWrite({ ...put, Condition: undefined })).toThrow(/s3:PutObject needs/);
+    expect(() => withWrite({ ...put, Condition: { StringEquals: { "s3:x-amz-server-side-encryption": "aws:kms" } } })).toThrow(/s3:PutObject needs/);
+    expect(() => withWrite({ ...put, Condition: { StringEquals: { "s3:x-amz-server-side-encryption": "AES256", "s3:x-amz-server-side-encryption-aws-kms-key-id": keyArn } } })).toThrow(/s3:PutObject needs/);
+    expect(() => withWrite({ ...put, Resource: `${bucketArn}/*` })).toThrow(/only on exactly/);
     // The writer may Put and GenerateDataKey; Deny statements only narrow.
     expect(() => check({ backlogOpsRoles: all.backlogOpsRoles })).not.toThrow();
     expect(() => withRead({ Effect: "Deny", NotAction: "s3:GetObject", NotResource: "*" })).not.toThrow();
@@ -100,6 +124,9 @@ describe("adopt identities: input", () => {
     expect(() => assertTranscriptStoreInputs(TRANSCRIPT_STAGE, prod({ adoptIdentities: { githubOidcProvider: true, uploadPresignIssuer: true, inboxBridge: true } }))).not.toThrow();
     expect(() => assertTranscriptStoreInputs(TRANSCRIPT_STAGE, prod({ adoptIdentities: {} }))).toThrow(/at least one identity group/);
     expect(() => assertTranscriptStoreInputs(TRANSCRIPT_STAGE, prod({ adoptIdentities: { uploadPresignIssuer: true }, uploadPresignIssuer: true }))).toThrow(/declare the same user/);
+    // The bridge the grants name must be the adopted one (both are pinned to the stage's exact user).
+    const bridge = `arn:aws:iam::${TRANSCRIPT_ACCOUNT_ID}:user/96bulls-${TRANSCRIPT_STAGE}-inbox-bridge`;
+    expect(() => assertTranscriptStoreInputs(TRANSCRIPT_STAGE, prod({ adoptIdentities: { inboxBridge: true }, inboxBridgeUserArn: bridge, uploadAdmission: { synthetic: true } }))).not.toThrow(/adopted bridge/);
   });
 });
 
@@ -219,17 +246,16 @@ const liveOf = (r: RenderedIdentity): LiveIdentity => {
 describe("adopt identities: the pre-apply diff", () => {
   const rendered = adoptedIdentities(all, ctx);
   const at = (resource: string) => rendered.find((x) => x.resource === resource)!;
-  const diff = (resource: string, patch: (l: any) => any, o = {}) => adoptedIdentityDifferences(at(resource), patch({ ...liveOf(at(resource)) }), o);
+  const diff = (resource: string, patch: (l: any) => any) => adoptedIdentityDifferences(at(resource), patch({ ...liveOf(at(resource)) }));
 
   it("a live identity equal to the declaration is clean (one-item lists and key order do not matter for roles)", () => {
-    for (const r of rendered) expect(adoptedIdentityDifferences(r, liveOf(r))).toEqual({ differences: [], notes: [] });
+    for (const r of rendered) expect(adoptedIdentityDifferences(r, liveOf(r))).toEqual([]);
     const role = at("adopted-backlog-ops-read") as any;
     const reordered = { ...liveOf(role), trust: { Statement: [{ ...role.trust.Statement[0], Action: "sts:AssumeRoleWithWebIdentity" }], Version: "2012-10-17" } };
-    expect(adoptedIdentityDifferences(role, reordered as LiveIdentity).differences).toEqual([]);
-    expect(diff("adopted-github-oidc", (l) => ({ ...l, url: "https://token.actions.githubusercontent.com" })).differences).toEqual([]);
-    const retagged = diff("adopted-presign-issuer", (l) => ({ ...l, tags: { "alchemy::id": "x", "96bulls:purpose": "other" } }));
-    expect(retagged.differences).toEqual([]);
-    expect(retagged.notes).toEqual([]);
+    expect(adoptedIdentityDifferences(role, reordered as LiveIdentity)).toEqual([]);
+    expect(diff("adopted-github-oidc", (l) => ({ ...l, url: "https://token.actions.githubusercontent.com" }))).toEqual([]);
+    expect(diff("adopted-presign-issuer", (l) => ({ ...l, tags: { "alchemy::id": "x", "96bulls:purpose": "other" } }))).toEqual([]);
+    expect(diff("adopted-presign-issuer-policy", (l) => ({ ...l, tags: { "alchemy::stack": "x", "96bulls:repo": "r" } }))).toEqual([]);
   });
 
   it("refuses everything the apply would change", () => {
@@ -239,6 +265,8 @@ describe("adopt identities: the pre-apply diff", () => {
       ["adopted-github-oidc", (l) => ({ ...l, url: "other.example" }), /^url$/],
       ["adopted-github-oidc", (l) => ({ ...l, tags: { owner: "x" } }), /tag owner would be removed/],
       ["adopted-github-oidc", (l) => ({ ...l, tags: { "96bulls:purpose": "x" } }), /tag 96bulls:purpose would be removed/],
+      ["adopted-github-oidc", (l) => ({ ...l, tags: { "alchemy::id": "x" } }), /tag alchemy::id would be removed/],
+      ["adopted-inbox-bridge-policy", (l) => ({ ...l, tags: { "96bulls:purpose": "x" } }), /tag 96bulls:purpose would be removed/],
       ["adopted-backlog-ops-read", (l) => ({ ...l, tags: { "96bulls:owner": "x" } }), /tag 96bulls:owner would be removed/],
       ["adopted-backlog-ops-read", (l) => ({ ...l, trust: { ...l.trust, Statement: [{ ...l.trust.Statement[0], Condition: { StringLike: { "token.actions.githubusercontent.com:sub": "repo:*" } } }] } }), /trust policy/],
       ["adopted-backlog-ops-read", (l) => ({ ...l, inlinePolicies: { ...l.inlinePolicies, extra: readPolicy } }), /inline policy extra \(the apply would delete it\)/],
@@ -256,24 +284,21 @@ describe("adopt identities: the pre-apply diff", () => {
       ["adopted-inbox-bridge-policy", (l) => ({ ...l, path: "/96bulls/" }), /path/],
       ["adopted-inbox-bridge-policy", (l) => ({ ...l, document: { ...l.document, Statement: l.document.Statement.slice(1) } }), /^document$/],
     ];
-    for (const [resource, patch, why] of cases) expect(diff(resource, patch).differences.join("\n")).toMatch(why);
+    for (const [resource, patch, why] of cases) expect(diff(resource, patch).join("\n")).toMatch(why);
   });
 
-  it("a managed policy equivalent but not byte-identical is refused unless explicitly allowed (then a note)", () => {
+  it("a managed policy equivalent but not byte-identical is refused (the apply would publish a new default version)", () => {
     const reorder = (l: any) => ({ ...l, document: { Statement: l.document.Statement, Version: l.document.Version } });
-    expect(diff("adopted-inbox-bridge-policy", reorder).differences).toEqual(["document: equivalent but not byte-identical (the apply would publish a new default version)"]);
-    const allowed = diff("adopted-inbox-bridge-policy", reorder, { allowEquivalentPolicyVersion: true });
-    expect(allowed.differences).toEqual([]);
-    expect(allowed.notes.length).toBe(1);
+    expect(diff("adopted-inbox-bridge-policy", reorder)).toEqual(["document: equivalent but not byte-identical (the apply would publish a new default version)"]);
   });
 });
 
-describe("adopt identities: the pre-apply script (read calls only)", () => {
+describe("adopt identities: the live diff (read calls only)", () => {
   const prodNames = transcriptNames(TRANSCRIPT_STAGE, accountId);
   const prodKey = `arn:aws:kms:${region}:${accountId}:key/synthetic`;
   const rendered = adoptedIdentities(all, { stage: TRANSCRIPT_STAGE, accountId, region, bucketName: prodNames.bucket, keyAlias: prodNames.keyAlias, keyArn: prodKey });
-  const roleInputs = { read: { inlinePolicies: { p: { Version: "2012-10-17", Statement: [{ Effect: "Allow", Action: "s3:GetObject", Resource: `${prodNames.bucketArn}/*` }] } } },
-    write: { inlinePolicies: { p: { Version: "2012-10-17", Statement: [{ Effect: "Allow", Action: "s3:PutObject", Resource: `${prodNames.bucketArn}/*` }] } } } };
+  const prodPolicies = rolePolicies(prodNames.bucket, prodKey);
+  const roleInputs = { read: { inlinePolicies: { p: prodPolicies.read } }, write: { inlinePolicies: { p: prodPolicies.write } } };
   const inputs = { accountId, region, transcriptStore: { adoptIdentities: { ...all, backlogOpsRoles: roleInputs } } };
   const fake = (o: { account?: string; missing?: string; tamper?: (args: string[], out: any) => any } = {}): Run & { calls: string[][] } => {
     const calls: string[][] = [];
@@ -309,6 +334,11 @@ describe("adopt identities: the pre-apply script (read calls only)", () => {
     const run = fake();
     const report = preApplyReport(inputs, run);
     expect(report.adoptIdentitiesPreApply).toBe("clean");
+    // A stable hash: the same inputs and live state give the same report hash, whatever the key order.
+    expect(report.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(preApplyReport(inputs, fake()).sha256).toBe(report.sha256);
+    expect(assertCleanPreApply(report, "capture")).toBe(report.sha256);
+    expect(canonicalJson({ b: 1, a: { d: 2, c: [3, { f: 4, e: 5 }] } })).toBe('{"a":{"c":[3,{"e":5,"f":4}],"d":2},"b":1}');
     expect(report.resources.map((r) => r.resource)).toEqual([...ADOPTED_IDENTITY_RESOURCES]);
     for (const args of run.calls) expect(args[1]).toMatch(/^(get|list|describe)-/);
   });
@@ -317,6 +347,11 @@ describe("adopt identities: the pre-apply script (read calls only)", () => {
     const tampered = preApplyReport(inputs, fake({ tamper: (args, v) => (args[1] === "list-attached-user-policies" ? { AttachedPolicies: [] } : v) }));
     expect(tampered.adoptIdentitiesPreApply).toBe("refused");
     expect(tampered.resources.find((r) => r.resource === "adopted-inbox-bridge")!.differences).toEqual(["attached managed policies (the apply would attach or detach)"]);
+    expect(tampered.sha256).not.toBe(preApplyReport(inputs, fake()).sha256);
+    expect(() => assertCleanPreApply(tampered, "capture")).toThrow(/capture: the live identities differ from the declaration.*adopted-inbox-bridge: attached managed policies/);
+    // The pasted role policies must name the live transcripts key exactly.
+    const otherKey = { ...inputs, transcriptStore: { adoptIdentities: { backlogOpsRoles: { read: { inlinePolicies: { p: rolePolicies(prodNames.bucket, `arn:aws:kms:${region}:${accountId}:key/other`).read } }, write: roleInputs.write } } } };
+    expect(() => preApplyReport(otherKey, fake())).toThrow(/only on the transcripts key/);
     const missing = preApplyReport(inputs, fake({ missing: `96bulls-${TRANSCRIPT_STAGE}-backlog-ops-write` }));
     expect(missing.resources.find((r) => r.resource === "adopted-backlog-ops-write")!.differences).toEqual(["role does not exist (the apply would create a new one)"]);
     expect(() => preApplyReport(inputs, fake({ account: "444455556666" }))).toThrow(/another account/);
@@ -331,7 +366,8 @@ const STORE = [
   "transcripts-key", "transcripts-key-alias",
 ];
 const h = (t: string) => createHash("sha256").update(t).digest("hex");
-function contract(actions: Record<string, string>, o: { listed?: readonly string[]; blocks?: Record<string, string[]>; summary?: string } = {}) {
+const PRE_APPLY = { preApplySha256: "a".repeat(64) };
+function contract(actions: Record<string, string>, o: { listed?: readonly string[]; blocks?: Record<string, string[]>; summary?: string; adoptIdentities?: unknown; stateSnapshotText?: string } = {}) {
   const resources = [...STORE, ...SESSION_PIPELINE_RESOURCES, ...(o.listed ?? ADOPTED_IDENTITY_RESOURCES)];
   const counts = new Map<string, number>();
   for (const a of Object.values(actions)) if (a !== "noop") counts.set(a, (counts.get(a) ?? 0) + 1);
@@ -342,10 +378,11 @@ function contract(actions: Record<string, string>, o: { listed?: readonly string
     if (o.blocks?.[r]) return o.blocks[r]!.join("\n");
     return a === "adopted" ? `\n[${r}] adopted\n  no declared property changes` : `[${r}] ${a}`;
   }).join("\n")}\n`;
-  const provenanceText = JSON.stringify({ schema: 1, stage: TRANSCRIPT_STAGE, summary,
+  const provenanceText = JSON.stringify({ schema: 1, stage: TRANSCRIPT_STAGE, summary, ...("adoptIdentities" in o ? (o.adoptIdentities === undefined ? {} : { adoptIdentities: o.adoptIdentities }) : { adoptIdentities: PRE_APPLY }),
     outputs: { plan: { path: `docs/plans/${TRANSCRIPT_STAGE}.plan.txt`, sha256: h(compact) }, detailed: { path: `docs/plans/${TRANSCRIPT_STAGE}.plan.detailed.txt`, sha256: h(detailed) } } });
-  return assertTranscriptStorePlanContract(compact, { detailedPlanText: detailed, provenanceText });
+  return assertTranscriptStorePlanContract(compact, { detailedPlanText: detailed, provenanceText, ...(o.stateSnapshotText !== undefined ? { stateSnapshotText: o.stateSnapshotText } : {}) });
 }
+const snapshot = (rows: Record<string, Record<string, unknown>>) => JSON.stringify({ objects: Object.entries(rows).map(([r, row]) => ({ key: `${alchemyStatePrefix(TRANSCRIPT_STAGE)}/${r}.json`, text: JSON.stringify(row) })) });
 const adoptAll = Object.fromEntries(ADOPTED_IDENTITY_RESOURCES.map((r) => [r, "adopted"]));
 
 describe("adopt identities plan phase", () => {
@@ -353,6 +390,27 @@ describe("adopt identities plan phase", () => {
     expect(contract(adoptAll)).toBe("adopt identities");
     expect(contract({ "adopted-inbox-bridge": "adopted" })).toBe("adopt identities");
     expect(contract({ "adopted-inbox-bridge-policy": "adopted", "adopted-inbox-bridge": "adopted" }, { listed: ADOPTED_IDENTITY_GROUPS.inboxBridge })).toBe("adopt identities");
+  });
+
+  it("needs the capture's clean live diff in the provenance", () => {
+    for (const bad of [undefined, {}, { preApplySha256: "" }, { preApplySha256: "A".repeat(64) }, { preApplySha256: 1 }])
+      expect(() => contract(adoptAll, { adoptIdentities: bad })).toThrow(/no clean live diff/);
+    // Other phases do not need it.
+    expect(contract({}, { adoptIdentities: undefined })).toBe("post-apply");
+  });
+
+  it("an interrupted adoption resumes as an update, only when the snapshot shows it mid-adoption", () => {
+    const updating = { "adopted-inbox-bridge": { status: "updating", adopting: true } };
+    const blocks = { "adopted-inbox-bridge": ["[adopted-inbox-bridge] update", "  no declared property changes"] };
+    expect(contract({ "adopted-inbox-bridge": "update" }, { blocks, stateSnapshotText: snapshot(updating) })).toBe("adopt identities");
+    expect(contract({ "adopted-inbox-bridge": "update", "adopted-inbox-bridge-policy": "adopted" }, { blocks, stateSnapshotText: snapshot(updating) })).toBe("adopt identities");
+    for (const row of [{ status: "updated" }, { status: "updating" }, { status: "updating", adopting: "true" }])
+      expect(() => contract({ "adopted-inbox-bridge": "update" }, { blocks, stateSnapshotText: snapshot({ "adopted-inbox-bridge": row }) })).toThrow(/only an interrupted adoption resumes/);
+    expect(() => contract({ "adopted-inbox-bridge": "update" }, { blocks, stateSnapshotText: snapshot({}) })).toThrow(/only an interrupted adoption resumes/);
+    // With property changes, or beside another change, or without the live diff: refused.
+    expect(() => contract({ "adopted-inbox-bridge": "update" }, { blocks: { "adopted-inbox-bridge": ["[adopted-inbox-bridge] update", "  - path: /", "  + path: /x/"] }, stateSnapshotText: snapshot(updating) })).toThrow(/no declared property changes/);
+    expect(() => contract({ "adopted-inbox-bridge": "update", "transcripts-key": "update" }, { blocks, stateSnapshotText: snapshot(updating) })).toThrow(/must deploy alone/);
+    expect(() => contract({ "adopted-inbox-bridge": "update" }, { blocks, stateSnapshotText: snapshot(updating), adoptIdentities: undefined })).toThrow(/no clean live diff/);
   });
 
   it("once adopted (all noop) the plan is judged as before", () => {
@@ -373,14 +431,15 @@ describe("adopt identities plan phase", () => {
   });
 
   it("an adopted-identity resource is never created, updated, replaced or deleted", () => {
-    for (const a of ["create", "update"]) expect(() => contract({ "adopted-backlog-ops-read": a })).toThrow(/may only be adopted \(in its own phase\) or noop/);
+    expect(() => contract({ "adopted-backlog-ops-read": "create" })).toThrow(/may only be adopted \(in its own phase\) or noop/);
+    expect(() => contract({ "adopted-backlog-ops-read": "update" }, { stateSnapshotText: snapshot({}) })).toThrow(/may only be adopted \(in its own phase\) or noop/);
     for (const a of ["replace", "delete", "adopt", "import"]) expect(() => contract({ "adopted-backlog-ops-read": a })).toThrow(/forbidden action/);
   });
 
   it("a repo tag rename may re-tag an adopted identity in place (judged by the rename phase), never adopt beside it", () => {
     const retag = ["[adopted-inbox-bridge] update", "  properties:", "  - " + "  96bulls:repo: AgentWorkforce/96BullSessions", "  + " + "  96bulls:repo: AgentWorkforce/sessions-pipeline"];
     expect(() => contract({ "adopted-inbox-bridge": "update" }, { blocks: { "adopted-inbox-bridge": retag } })).not.toThrow(/may only be adopted/);
-    expect(() => contract({ "adopted-inbox-bridge": "update" })).toThrow(/may only be adopted \(in its own phase\) or noop, not update/);
+    expect(() => contract({ "adopted-inbox-bridge": "update" }, { stateSnapshotText: snapshot({}) })).toThrow(/may only be adopted \(in its own phase\) or noop, not update/);
     expect(() => contract({ "adopted-inbox-bridge": "update", "adopted-inbox-bridge-policy": "adopted" }, { blocks: { "adopted-inbox-bridge": retag } })).toThrow(/adopt identities must deploy alone/);
   });
 

@@ -46,6 +46,7 @@ import { assertSandboxAlchemyCredentials } from "./sandbox-credentials.ts";
 import { spawnSync } from "node:child_process";
 import { Project as SupabaseProject, SupabaseProvider } from "../supabase/project.ts";
 import { assertTranscriptStorePlanContract, TRANSCRIPT_STAGE, transcriptStoreStage } from "./transcript-store.ts";
+import { assertCleanPreApply, awsCliRun, preApplyReport } from "./adopt-identities-live.ts";
 import { parseHistoryUploadDirectInfra } from "./upload-inbox.ts";
 
 const ROOT = fileURLToPath(new URL("../..", import.meta.url));
@@ -86,7 +87,15 @@ function readInputs(stage: string): AwsInputs & { mode: AwsMode } {
       throw new Error(`96bulls: deploy needs the reviewed capture docs/plans/${stage}.{provenance.json,plan.txt,plan.detailed.txt}. Nothing was changed.`);
     }
     assertApprovalBinding(inputs.approval?.capture, { provenanceText, planText, inputsText });
-    if (stage === TRANSCRIPT_STAGE) assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText, uploadInputs: inputs.transcriptStore ?? {} });
+    if (stage === TRANSCRIPT_STAGE) {
+      const phase = assertTranscriptStorePlanContract(planText, { detailedPlanText, provenanceText, uploadInputs: inputs.transcriptStore ?? {} });
+      // The adoption rewrites live identities to the declaration: the live diff must still be clean, and the same.
+      if (phase === "adopt identities") {
+        const recorded = (JSON.parse(provenanceText) as { adoptIdentities?: { preApplySha256?: string } }).adoptIdentities?.preApplySha256;
+        if (assertCleanPreApply(preApplyReport(inputs, awsCliRun(process.env)), "deploy") !== recorded)
+          throw new Error("96bulls: adopt identities: the live identities changed since the capture (live diff hash differs); capture again. Nothing was changed.");
+      }
+    }
     // And this deploy really is that capture: source commit and tree, live state, plan files,
     // inputs. Here, not only in bin/96bulls, so a direct `alchemy deploy` is held to it too.
     verifyDeployCapture(

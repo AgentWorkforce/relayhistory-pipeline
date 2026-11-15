@@ -92,7 +92,8 @@
  *                              each group declares those live identities, adopted in place (never replaced) and
  *                              retained on removal; no access keys. Unset: nothing declared, every other resource
  *                              byte-identical. The plan contract accepts the `adopted` action only for them, alone, as
- *                              its own "adopt identities" phase, after scripts/adopt-identities-preapply.ts is clean.
+ *                              its own "adopt identities" phase, bound to a clean live diff (adopt-identities-live.ts)
+ *                              recorded by the capture and re-run by the deploy.
  *
  * Pure functions, unit-tested in stacks/aws/__tests__/transcript-store.test.ts;
  * `transcriptStoreStage` declares the resources.
@@ -105,7 +106,7 @@ import { KMS_ADMIN_ACTIONS, denyInsecureTransport, trailKeyPolicy } from "./hard
 import { alchemyStatePrefix } from "./preflight.ts";
 import { TENANT_KEY_BASE } from "./tenants.ts";
 import { assertBufferedGcRoleArn, bufferedGcBucketStatements, bufferedGcKeyStatements } from "./buffered-gc-policy.ts";
-import { ADOPTED_IDENTITY_GROUPS, ADOPTED_IDENTITY_RESOURCES, adoptedIdentities, assertAdoptIdentitiesInputs, declareAdoptedIdentities, type AdoptIdentitiesInputs } from "./adopt-identities.ts";
+import { ADOPTED_IDENTITY_GROUPS, ADOPTED_IDENTITY_RESOURCES, adoptedIdentities, assertAdoptIdentitiesInputs, declareAdoptedIdentities, inboxBridgeUserName, type AdoptIdentitiesInputs } from "./adopt-identities.ts";
 import { BACKLOG_OPS_KEY_SIDS, assertBacklogOpsRoles, backlogOpsKeyStatements, backlogOpsRoleArns, type BacklogOpsRoles } from "./backlog-ops-key-policy.ts";
 import { CROSS_ACCOUNT_WORKER_BUCKET_SIDS, CROSS_ACCOUNT_WORKER_KEY_SIDS, assertCrossAccountWorkerRoleArn, crossAccountWorkerBucketStatements, crossAccountWorkerKeyStatements } from "./cross-account-worker-policy.ts";
 import {
@@ -382,6 +383,9 @@ function assertStoreAdoptIdentities(store: TranscriptStoreInputs, stage: string,
   const adopt = assertAdoptIdentitiesInputs(store.adoptIdentities, { accountId, region, bucketName: n.bucket }, refuse);
   if (adopt?.uploadPresignIssuer && store.uploadPresignIssuer !== undefined)
     refuse("transcriptStore.adoptIdentities.uploadPresignIssuer and transcriptStore.uploadPresignIssuer declare the same user: set one");
+  // The bridge the grants name and the bridge adopted are one user.
+  if (adopt?.inboxBridge && store.inboxBridgeUserArn !== undefined && store.inboxBridgeUserArn !== `arn:aws:iam::${accountId}:user/${inboxBridgeUserName(stage)}`)
+    refuse("transcriptStore.inboxBridgeUserArn must name the adopted bridge user (adoptIdentities.inboxBridge)");
   return adopt;
 }
 
@@ -897,7 +901,7 @@ export function assertTranscriptStorePlanContract(planText: string, capture: Tra
   if (provenance.summary !== compact.summary) refuse("provenance summary does not match the plan summary");
 
   // Adopted identities: `adopted` alone, before any other phase; otherwise they must be noop.
-  const adoptPhase = adoptIdentitiesPhase(compact.operations, capture.detailedPlanText, refuse);
+  const adoptPhase = adoptIdentitiesPhase(compact.operations, capture.detailedPlanText, capture.stateSnapshotText, provenance, refuse);
   if (adoptPhase) return adoptPhase;
   // The repository rename re-tags the stack: judged on its own (assertRepoTagRenameDiff), before any other phase.
   if (planTouchesRepoTag(capture.detailedPlanText)) {
@@ -1012,36 +1016,64 @@ function crossAccountWorkerGrantsPhase(operations: ReadonlyMap<string, string>, 
 
 /**
  * The adopt identities phase (adopt-identities.ts): every listed adopted-identity resource is `adopted` or noop (at
- * least one adopted: the first apply, or the rest after a partial one), and every other resource is noop. In the
- * detailed plan each adopted resource shows no declared property changes (Alchemy plans an adoption against the
- * declaration itself; the live-vs-declared proof is scripts/adopt-identities-preapply.ts). Outside this phase an
- * adopted-identity resource may only be noop (or, in a repo tag rename, a tag-only update): never created (that
- * would mean the live identity is gone), updated or replaced, so a later change to one needs its own reviewed
- * phase. Undefined when nothing is adopted.
+ * least one adopted: the first apply, or the rest after a partial one), and every other resource is noop. Alchemy
+ * plans an adoption against the declaration itself, so the plan cannot show live drift: the phase is accepted only
+ * with the capture's live diff recorded clean in the provenance (`adoptIdentities.preApplySha256`,
+ * adopt-identities-live.ts), and the deploy re-runs that diff and refuses unless it is clean with the same hash.
+ * In the detailed plan each adopted resource shows no declared property changes.
+ *
+ * Recovery: an apply interrupted mid-adoption leaves the resource `updating` (adopting) in state, and the next plan
+ * shows it as `update`. That update is accepted here, as the same phase, only when the capture's state snapshot has
+ * the resource exactly so and its detailed block shows no declared property changes.
+ *
+ * Outside this phase an adopted-identity resource may only be noop (or, in a repo tag rename, a tag-only update):
+ * never created (that would mean the live identity is gone), updated, replaced or deleted (un-adopting is its own
+ * reviewed change). Undefined when nothing is adopted.
  */
-function adoptIdentitiesPhase(operations: ReadonlyMap<string, string>, detailedPlanText: string, refuse: (why: string) => never): TranscriptStorePlanPhase | undefined {
+function adoptIdentitiesPhase(operations: ReadonlyMap<string, string>, detailedPlanText: string, stateSnapshotText: string | undefined, provenance: Provenance & { adoptIdentities?: { preApplySha256?: unknown } }, refuse: (why: string) => never): TranscriptStorePlanPhase | undefined {
   const listed = ADOPTED_IDENTITY_RESOURCES.filter((r) => operations.has(r));
   const describe = () => [...operations].filter(([, a]) => a !== "noop").map(([r, a]) => `${r}:${a}`).join(", ");
   // A reviewed repo tag rename re-tags them in place too: assertRepoTagRenameDiff judges those updates (tags only).
   const retag = planTouchesRepoTag(detailedPlanText);
+  const resumed = listed.filter((r) => operations.get(r) === "update" && !retag);
   for (const r of listed) {
     const a = operations.get(r)!;
-    if (a !== "noop" && a !== "adopted" && !(a === "update" && retag)) refuse(`adopt identities: ${r} may only be adopted (in its own phase) or noop, not ${a}`);
+    if (a !== "noop" && a !== "adopted" && a !== "update") refuse(`adopt identities: ${r} may only be adopted (in its own phase) or noop, not ${a}`);
   }
+  for (const r of resumed)
+    if (stateSnapshotText !== undefined && !adoptionInterrupted(stateSnapshotText, r))
+      refuse(`adopt identities: ${r} may only be adopted (in its own phase) or noop, not update (only an interrupted adoption resumes as an update)`);
   const adopted = listed.filter((r) => operations.get(r) === "adopted");
-  if (adopted.length === 0) return undefined;
-  for (const [r, a] of operations) if (a !== "noop" && !adopted.includes(r)) refuse(`adopt identities must deploy alone (every other resource noop): ${describe()}`);
+  if (adopted.length === 0 && resumed.length === 0) return undefined;
+  const ours = [...adopted, ...resumed];
+  for (const [r, a] of operations) if (a !== "noop" && !ours.includes(r)) refuse(`adopt identities must deploy alone (every other resource noop): ${describe()}`);
   const lines = detailedPlanText.split(/\r?\n/);
-  for (const r of adopted) {
-    const start = lines.findIndex((l) => new RegExp(`^\\s*\\[${r.replace(/[-]/g, "\\-")}\\]\\s+adopted\\s*$`).test(l));
-    if (start < 0) refuse(`adopt identities: the detailed plan has no adopted block for ${r}`);
+  for (const r of ours) {
+    const action = operations.get(r)!;
+    const start = lines.findIndex((l) => new RegExp(`^\\s*\\[${r.replace(/[-]/g, "\\-")}\\]\\s+${action}\\s*$`).test(l));
+    if (start < 0) refuse(`adopt identities: the detailed plan has no ${action} block for ${r}`);
     const rest = lines.slice(start + 1);
     const end = rest.findIndex((l) => /^\s*\[[^\]]+\]\s+\S+\s*$/.test(l));
     const body = (end < 0 ? rest : rest.slice(0, end)).filter((l) => l.trim() !== "");
     if (body.length !== 1 || body[0]!.trim() !== "no declared property changes")
       refuse(`adopt identities: ${r} must adopt with no declared property changes (the declaration is what is live)`);
   }
+  if (typeof provenance.adoptIdentities?.preApplySha256 !== "string" || !/^[0-9a-f]{64}$/.test(provenance.adoptIdentities.preApplySha256))
+    refuse("adopt identities: the provenance has no clean live diff (adoptIdentities.preApplySha256): capture with the inputs' adoptIdentities set");
   return "adopt identities";
+}
+
+/** The capture's state snapshot has `resource` mid-adoption: `updating` with `adopting` set (an interrupted apply). */
+function adoptionInterrupted(stateSnapshotText: string, resource: string): boolean {
+  try {
+    const objects = (JSON.parse(stateSnapshotText) as { objects?: Array<{ key: string; text: string }> }).objects ?? [];
+    const hits = objects.filter((o) => o.key === `${alchemyStatePrefix(TRANSCRIPT_STAGE)}/${resource}.json`);
+    if (hits.length !== 1) return false;
+    const row = JSON.parse(hits[0]!.text) as { status?: unknown; adopting?: unknown };
+    return row.status === "updating" && row.adopting === true;
+  } catch {
+    return false;
+  }
 }
 
 const WORKER_POLICY_RESOURCES = ["transcripts", "transcripts-key"] as const;

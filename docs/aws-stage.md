@@ -954,9 +954,12 @@ groups; unset, nothing is declared and every other resource is byte-identical:
   `96bulls-<stage>-backlog-ops-read` and `-write` at `/`, 6 h sessions, trusted only for this repository's
   `session-schema-production` (read) and `session-backlog-execute` (write) environment subjects. The repository
   does not record their identity policies, so paste each role's live inline policies (`aws iam get-role-policy`)
-  and its description, if it has one. The stack refuses a pasted policy that allows more than backlog-ops needs:
-  List/Get on the transcripts bucket (plus Put for the writer), and Decrypt (plus GenerateDataKey) on a key in
-  this account and region, only with `kms:ViaService` = `s3.<region>.amazonaws.com`. A role with an attached managed policy cannot be adopted as is.
+  and its description, if it has one. The stack refuses a pasted policy that allows more than
+  docs/backlog-ops-workflow.md "IAM" documents: `s3:ListBucket` on the bucket itself, `s3:GetObject` (and, for the
+  writer, `s3:PutObject` with `s3:x-amz-server-side-encryption` = `aws:kms` and the transcripts key) on exactly
+  `<bucket>/96bulls/*`, and `kms:Decrypt` (writer: also `kms:GenerateDataKey`) on the transcripts key with
+  `kms:ViaService` = `s3.<region>.amazonaws.com`. The live diff checks the key against the key's live ARN. A role
+  with an attached managed policy cannot be adopted as is.
 - `"uploadPresignIssuer": true`: the user `96bulls-<stage>-upload-presign-issuer` at `/96bulls/` and its managed
   policy of the same name at `/` (`uploadPresignIssuerPolicy`). Identity only: the wall entry and key statements
   naming it are a separate input. Refused together with `transcriptStore.uploadPresignIssuer` (the same user).
@@ -965,32 +968,41 @@ groups; unset, nothing is declared and every other resource is byte-identical:
   root, key ARN and region.
 
 No access key, login profile or permissions boundary is declared: keys stay in 1Password. Every adopted resource
-is retained, so unsetting a group later only drops it from state.
+is retained, so a deletion never deletes the identity. Un-adopting is not automatic: unsetting a group plans its
+resources as deleted or orphaned, which the contract refuses, so it needs its own reviewed phase.
 
-**Adoption converges, so prove the declaration first.** On apply, Alchemy reconciles each identity to the
+**Adoption converges, so the live diff is part of the capture.** On apply, Alchemy reconciles each identity to the
 declaration: it detaches managed policies and deletes inline policies that are not declared, rewrites a trust or
-policy that differs, publishes a new default version of a managed policy whose document is not byte-identical,
-and drops tags it does not set. The plan does not show any of that (an adoption is planned against the
-declaration itself). So, before capturing the plan, run the read-only pre-apply diff with the stage inputs and
-read-only credentials for the account:
+policy that differs, publishes a new default version of a managed policy whose document is not byte-identical
+(pruning the oldest at five), and drops tag keys it does not set. The plan cannot show any of that (an adoption is
+planned against the declaration itself). So with `adoptIdentities` in the inputs, `96bulls plan aws-sessions-prod
+--capture` runs the live diff (`stacks/aws/adopt-identities-live.ts`, IAM/STS/KMS get/list/describe calls only)
+and refuses before writing anything on any difference; a clean run's stable report hash goes into the provenance
+as `adoptIdentities.preApplySha256`, which the approval binds. The contract accepts the phase only with it, and the
+deploy runs the diff again and refuses unless it is clean with the same hash. A difference is: an identity missing
+(the apply would create one); a path, trust, inline or attached policy, permissions boundary, session length or
+description that differs; a managed policy document that is not byte-identical (even if equivalent); or a tag key
+the declaration does not set (`96bulls:stack`, `96bulls:component`, `96bulls:repo`; `96bulls:purpose` on users and
+roles; Alchemy's `alchemy::*` everywhere but the OIDC provider). To see it before capturing:
 
     bun scripts/adopt-identities-preapply.ts [--inputs .96bulls/aws-sessions-prod/aws-inputs.json]
 
-It fetches each identity the inputs adopt with IAM and KMS get/list/describe calls only, renders the same
-identities as the stack, and exits 1 on any difference (it names fields, never document contents): an identity
-missing (the apply would create one), a path, trust, inline or attached policy, permissions boundary, session
-length or description that differs, or a tag key the stack does not set (it sets `96bulls:stack`,
-`96bulls:component`, `96bulls:repo`, `96bulls:purpose` on the users and roles, and Alchemy's `alchemy::*`). A managed policy
-that is equivalent but not byte-identical is refused too, unless `--allow-equivalent-policy-version` is given;
-then the apply publishes an equivalent new default version. Fix the inputs (or, for a tag, the live identity) and
-run it again until it exits 0. Only then capture.
+It prints the report (field names, never document contents) and its sha256, and exits 1 on any difference. Fix
+the inputs (or, for a tag, the live identity) until it exits 0.
 
 The plan contract accepts `adopted` only as its own "adopt identities" phase: every listed adopted-identity
 resource is `adopted` or `noop` (at least one adopted), every other resource is `noop`, each group is planned whole,
-and each adopted resource shows no declared property changes in the detailed plan. `adopted` on any other
-resource is refused in every phase, and outside this phase an adopted-identity resource may only be `noop`: a
-`create` means the live identity is gone, and an update or replacement needs its own reviewed phase. The next
-capture after the apply must show them all `noop`. Deploying still needs Khaliq's explicit OK.
+each adopted resource shows no declared property changes in the detailed plan, and the provenance carries the clean
+live diff. `adopted` on any other resource is refused in every phase. Outside this phase an adopted-identity
+resource may only be `noop` (or a tag-only update inside a repo tag rename): a `create` means the live identity is
+gone, and any other change needs its own reviewed phase. The next capture after the apply must show them all
+`noop`. Deploying still needs Khaliq's explicit OK.
+
+**An interrupted adoption.** If the apply fails part way, the resources it reached are `noop` next time, the ones
+it did not reach are still `adopted`, and one it was reconciling stays `updating` (adopting) in Alchemy's state and
+plans as `update`. Capture again: the contract accepts that `update` as the same phase only when the capture's
+state snapshot has the resource `updating` with `adopting` set, its detailed block shows no declared property
+changes, and the live diff is clean. Deploy it the same way (a new approval for the new capture).
 
 **How a capture stays read-only.** `alchemy plan` against `AWS.state` is not
 read-only: Alchemy takes a lease (PUT then DELETE of `__lease__.json`) and

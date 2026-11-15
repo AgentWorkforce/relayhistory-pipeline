@@ -8,9 +8,8 @@
  *   backlogOpsRoles      96bulls-<stage>-backlog-ops-read / -write (path /), trusted only for this repository's
  *                        session-schema-production (read) and session-backlog-execute (write) environment
  *                        subjects, 6 h sessions. The repository records no identity policy for them, so the inline
- *                        policies come from the private stage inputs, pasted from the live roles after the
- *                        pre-apply diff, and are refused unless they stay inside backlog-ops' needs (List/Get under
- *                        the transcripts bucket, plus Put for the writer; KMS on this region's keys only).
+ *                        policies come from the private stage inputs, pasted from the live roles, and are refused
+ *                        unless they stay inside backlog-ops' documented needs (assertAdoptedRolePolicies).
  *   uploadPresignIssuer  the user 96bulls-<stage>-upload-presign-issuer (path /96bulls/) and its managed policy of
  *                        the same name (path /): upload-inbox.ts uploadPresignIssuerPolicy. Identity only: the wall
  *                        entry and key statements that name it are a separate input.
@@ -20,11 +19,12 @@
  * Adoption is in place: Alchemy reads the live identity, keeps it (same ARN, unique id, access keys and trust), and
  * reconciles it to the declaration. The reconcile CONVERGES: it detaches managed policies and deletes inline
  * policies that are not declared, rewrites a trust or a policy that differs, and drops tags it does not set. So the
- * declaration must equal the live identity, and scripts/adopt-identities-preapply.ts proves that read-only before
- * the plan is captured (docs/aws-stage.md "Adopt identities"). No access key is declared: keys stay in 1Password.
+ * declaration must equal the live identity. The live diff (adopt-identities-live.ts) proves that read-only inside
+ * the plan capture, whose provenance records its report hash, and again before the deploy, which refuses unless the
+ * hash is the same (docs/aws-stage.md "Adopt identities"). No access key is declared: keys stay in 1Password.
  *
- * Every adopted resource is retained (RemovalPolicy.retain): unsetting a group later drops it from state and leaves
- * the identity alone. The roles carry no Alchemy ownership tags, so only they need adopt(true); users, managed
+ * Every adopted resource is retained (RemovalPolicy.retain), so its deletion never deletes the identity; unsetting a
+ * group plans as a deletion, which the contract refuses, so un-adopting needs its own reviewed phase. The roles carry no Alchemy ownership tags, so only they need adopt(true); users, managed
  * policies and the OIDC provider have no ownership check in Alchemy and are adopted silently.
  *
  * The plan contract (transcript-store.ts) accepts the `adopted` action only here, as its own "adopt identities"
@@ -88,14 +88,24 @@ const ROLE_ACTIONS = {
 const POLICY_NAME = /^[A-Za-z0-9+=,.@_-]{1,128}$/;
 const STATEMENT_KEYS = new Set(["Sid", "Effect", "Action", "NotAction", "Resource", "NotResource", "Condition"]);
 
+/** The validation context: the stage's bucket, and the transcripts key's ARN once known (the pre-apply diff). */
+export interface RolePolicyContext { accountId: string; region: string; bucketName: string; keyArn?: string }
+
 /**
- * A backlog-ops role's pasted inline policies: well-formed IAM documents whose Allow statements grant only that
- * mode's actions, each on the stage's transcripts bucket (s3) or on a key in this account and region (kms), and
- * every KMS grant only through S3 in the region (kms:ViaService), so a key is usable only for objects the role can
- * already read or write in the bucket. Deny statements may say anything (they only narrow). No Principal, no
- * NotAction/NotResource on an Allow, no wildcard.
+ * A backlog-ops role's pasted inline policies, held to what docs/backlog-ops-workflow.md ("IAM") says the roles may
+ * do. Every Allow statement names its actions and resources (no NotAction, no NotResource, no Principal), and each
+ * action only on its documented resource:
+ *   s3:ListBucket                 the transcripts bucket itself;
+ *   s3:GetObject, s3:PutObject    exactly `<bucket>/96bulls/*` (the one documented wildcard);
+ *   s3:PutObject                  (writer only) with StringEquals s3:x-amz-server-side-encryption = aws:kms and
+ *                                 s3:x-amz-server-side-encryption-aws-kms-key-id = the transcripts key;
+ *   kms:Decrypt, kms:GenerateDataKey (the latter writer only)  the transcripts key, with StringEquals
+ *                                 kms:ViaService = s3.<region>.amazonaws.com.
+ * "The transcripts key" is its exact ARN when `keyArn` is given (the pre-apply diff and the capture, which resolve
+ * the key's alias live), and otherwise a key ARN in this account and region (the stack's input check, before the
+ * key's ARN is known). Deny statements may say anything: they only narrow.
  */
-export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write", c: { accountId: string; region: string; bucketName: string }, refuse: (why: string) => never): AdoptedRolePolicies {
+export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write", c: RolePolicyContext, refuse: (why: string) => never): AdoptedRolePolicies {
   const at = `transcriptStore.adoptIdentities.backlogOpsRoles.${mode}`;
   if (!plain(value)) return refuse(`${at} must be { inlinePolicies, description? }`);
   for (const k of Object.keys(value)) if (k !== "inlinePolicies" && k !== "description") refuse(`${at}.${k} is not a known setting`);
@@ -104,7 +114,9 @@ export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write"
   const policies = value.inlinePolicies;
   if (!plain(policies) || Object.keys(policies).length === 0 || Object.keys(policies).length > 10) return refuse(`${at}.inlinePolicies must map 1-10 policy names to the live documents`);
   const bucketArn = `arn:aws:s3:::${c.bucketName}`;
-  const keyArn = new RegExp(`^arn:aws:kms:${c.region}:${c.accountId}:key/[A-Za-z0-9-]{1,64}$`);
+  const objects = `${bucketArn}/${TENANT_KEY_BASE}/*`;
+  const keyPattern = new RegExp(`^arn:aws:kms:${c.region}:${c.accountId}:key/[A-Za-z0-9-]{1,64}$`);
+  const isKey = (r: unknown) => typeof r === "string" && (c.keyArn !== undefined ? r === c.keyArn : keyPattern.test(r));
   const allowed: readonly string[] = ROLE_ACTIONS[mode];
   for (const [name, doc] of Object.entries(policies)) {
     const p = `${at}.inlinePolicies[${JSON.stringify(name)}]`;
@@ -122,15 +134,18 @@ export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write"
       const actions = list(s.Action), resources = list(s.Resource);
       if (actions.length === 0 || resources.length === 0) refuse(`${p}: an Allow statement names at least one action and resource`);
       for (const a of actions) if (typeof a !== "string" || !allowed.includes(a)) refuse(`${p}: the ${mode} role may be allowed only ${allowed.join(", ")}`);
-      const via = plain(s.Condition) && plain(s.Condition.StringEquals) ? s.Condition.StringEquals["kms:ViaService"] : undefined;
-      if ((actions as string[]).some((a) => a.startsWith("kms:")) && via !== `s3.${c.region}.amazonaws.com`)
-        refuse(`${p}: a KMS grant must be conditioned on StringEquals kms:ViaService s3.${c.region}.amazonaws.com`);
-      for (const r of resources) {
-        if (typeof r !== "string") refuse(`${p}: resources are strings`);
-        const s3 = r === bucketArn || (r as string).startsWith(`${bucketArn}/`);
-        const kms = keyArn.test(r as string);
-        for (const a of actions as string[])
-          if (a.startsWith("s3:") ? !s3 : !kms) refuse(`${p}: ${a} must name the transcripts bucket (s3) or a key in this account and region (kms)`);
+      const equals = plain(s.Condition) && plain(s.Condition.StringEquals) ? (s.Condition.StringEquals as Record<string, unknown>) : {};
+      for (const a of actions as string[]) {
+        if (a === "s3:ListBucket") {
+          if (!resources.every((r) => r === bucketArn)) refuse(`${p}: s3:ListBucket only on the transcripts bucket itself`);
+        } else if (a === "s3:GetObject" || a === "s3:PutObject") {
+          if (!resources.every((r) => r === objects)) refuse(`${p}: ${a} only on exactly ${objects}`);
+          if (a === "s3:PutObject" && (equals["s3:x-amz-server-side-encryption"] !== "aws:kms" || !isKey(equals["s3:x-amz-server-side-encryption-aws-kms-key-id"])))
+            refuse(`${p}: s3:PutObject needs StringEquals s3:x-amz-server-side-encryption aws:kms and s3:x-amz-server-side-encryption-aws-kms-key-id the transcripts key`);
+        } else {
+          if (!resources.every(isKey)) refuse(`${p}: ${a} only on the transcripts key`);
+          if (equals["kms:ViaService"] !== `s3.${c.region}.amazonaws.com`) refuse(`${p}: ${a} needs StringEquals kms:ViaService s3.${c.region}.amazonaws.com`);
+        }
       }
     }
   }
@@ -138,7 +153,7 @@ export function assertAdoptedRolePolicies(value: unknown, mode: "read" | "write"
 }
 
 /** `transcriptStore.adoptIdentities`: at least one group (omit the whole input for none), each exactly as documented. */
-export function assertAdoptIdentitiesInputs(value: unknown, c: { accountId: string; region: string; bucketName: string }, refuse: (why: string) => never): AdoptIdentitiesInputs | undefined {
+export function assertAdoptIdentitiesInputs(value: unknown, c: RolePolicyContext, refuse: (why: string) => never): AdoptIdentitiesInputs | undefined {
   if (value === undefined) return undefined;
   if (!plain(value) || Object.keys(value).length === 0) return refuse("transcriptStore.adoptIdentities must name at least one identity group (omit it for none)");
   for (const k of Object.keys(value)) if (!(k in ADOPTED_IDENTITY_GROUPS)) refuse(`transcriptStore.adoptIdentities.${k} is not a known identity group`);
@@ -317,10 +332,19 @@ export const declareAdoptedIdentities = (identities: readonly RenderedIdentity[]
     }
   });
 
-// ---- the pre-apply diff (scripts/adopt-identities-preapply.ts fetches; this judges) ----
+// ---- the live diff (adopt-identities-live.ts fetches; this judges) ----
 
-/** The tag keys the stack's declaration sets (alchemy.aws.run.ts tags(), plus Alchemy's ownership tags; OIDC has none of those). */
-const STACK_TAG_KEYS = ["96bulls:stack", "96bulls:component", "96bulls:repo", "alchemy::stack", "alchemy::stage", "alchemy::id"] as const;
+/**
+ * The tag keys each declaration sets: the stack's tags (alchemy.aws.run.ts tags()), `96bulls:purpose` on the users and
+ * roles, and Alchemy's `alchemy::*` ownership tags, which its OIDC provider reconcile does not set.
+ */
+export function stackTagKeys(kind: RenderedIdentity["kind"]): ReadonlySet<string> {
+  return new Set<string>([
+    "96bulls:stack", "96bulls:component", "96bulls:repo",
+    ...(kind === "role" || kind === "user" ? ["96bulls:purpose"] : []),
+    ...(kind === "oidc-provider" ? [] : ["alchemy::stack", "alchemy::stage", "alchemy::id"]),
+  ]);
+}
 
 /** What the operator's read-only IAM calls return for one identity; `exists: false` for NoSuchEntity. */
 export type LiveIdentity =
@@ -345,30 +369,27 @@ export const normalizedPolicy = (doc: unknown) => AWS.IAM.normalizePolicyDocumen
 
 /**
  * Every way the apply would change the live identity, as short field paths (never document contents). Empty means
- * adopting it changes nothing but the stack's own tags. `allowEquivalentPolicyVersion`: a managed policy whose live
- * document differs from the rendered one only in key order or one-item lists (the apply would publish an equivalent
- * new default version) is reported as a note, not a difference.
+ * adopting it writes nothing but the stack's own tags. A managed policy document must be byte-identical as JSON (the
+ * apply compares it that way and otherwise publishes a new default version, pruning the oldest at five).
  */
-export function adoptedIdentityDifferences(r: RenderedIdentity, live: LiveIdentity, o: { allowEquivalentPolicyVersion?: boolean } = {}): { differences: string[]; notes: string[] } {
-  const differences: string[] = [], notes: string[] = [];
-  if (!live.exists) return { differences: [`${r.kind} does not exist (the apply would create a new one)`], notes };
-  // The reconcile drops every live tag the stack does not set; a tag it sets keeps its key, its value is the stack's.
-  const setKeys = new Set<string>([...STACK_TAG_KEYS, ...(r.kind === "role" || r.kind === "user" ? ["96bulls:purpose"] : [])]);
+export function adoptedIdentityDifferences(r: RenderedIdentity, live: LiveIdentity): string[] {
+  const differences: string[] = [];
+  if (!live.exists) return [`${r.kind} does not exist (the apply would create a new one)`];
+  // The reconcile drops every live tag key the stack does not set (a key it sets gets the stack's value).
+  const setKeys = stackTagKeys(r.kind);
   for (const k of Object.keys(live.tags).sort()) if (!setKeys.has(k)) differences.push(`tag ${k} would be removed`);
   const same = (a: unknown, b: unknown) => normalizedPolicy(a) === normalizedPolicy(b);
   const sameSet = (a: readonly string[] = [], b: readonly string[] = []) => JSON.stringify([...a].sort()) === JSON.stringify([...b].sort());
   if (r.kind === "oidc-provider") {
     if (live.url !== r.host && live.url !== r.url) differences.push("url");
     if (!sameSet(live.clientIDList, r.clientIDList)) differences.push("clientIDList (the apply would add or remove client ids)");
-    return { differences, notes };
+    return differences;
   }
   if (r.kind === "managed-policy") {
     if ((live.path ?? "/") !== r.path) differences.push("path (the apply would create a new policy)");
-    if (JSON.stringify(live.document ?? null) !== JSON.stringify(r.document)) {
-      if (same(live.document, r.document) && o.allowEquivalentPolicyVersion) notes.push("document: equivalent, but not byte-identical (the apply publishes an equivalent new default version)");
-      else differences.push(same(live.document, r.document) ? "document: equivalent but not byte-identical (the apply would publish a new default version)" : "document");
-    }
-    return { differences, notes };
+    if (JSON.stringify(live.document ?? null) !== JSON.stringify(r.document))
+      differences.push(same(live.document, r.document) ? "document: equivalent but not byte-identical (the apply would publish a new default version)" : "document");
+    return differences;
   }
   if ((live.path ?? "/") !== r.path) differences.push("path (the plan would replace it)");
   if (live.permissionsBoundary !== undefined) differences.push("permissionsBoundary (the apply would delete it)");
@@ -385,5 +406,5 @@ export function adoptedIdentityDifferences(r: RenderedIdentity, live: LiveIdenti
     if (live.maxSessionDuration !== r.maxSessionDurationSeconds) differences.push("maxSessionDuration");
     if ((live.description ?? undefined) !== r.description) differences.push("description");
   }
-  return { differences, notes };
+  return differences;
 }

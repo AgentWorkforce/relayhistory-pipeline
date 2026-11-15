@@ -49,6 +49,12 @@ export interface Provenance {
   outputs: { plan: { path: string; sha256: string }; detailed: { path: string; sha256: string } };
   summary: string;
   note: string;
+  /**
+   * aws-sessions-prod with transcriptStore.adoptIdentities: the sha256 of the clean live diff the capture ran
+   * (stacks/aws/adopt-identities-live.ts). The "adopt identities" phase needs it; the deploy re-runs the diff and
+   * refuses unless it is clean with this hash.
+   */
+  adoptIdentities?: { preApplySha256: string };
 }
 
 export interface VersionListing {
