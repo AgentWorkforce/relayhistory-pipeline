@@ -45,7 +45,8 @@
  *     EKS Pod Identity, or LOCKER_PROVIDER=gcs)   the object store, exactly as every other self-host
  *                                    service builds it (src/shared/locker.ts)
  *   INGEST_KEY_ROOT                  object key root, default "96bulls" (same as the Worker)
- *   INGEST_MAX_PER_USER / INGEST_MAX_PER_ORG   in-flight batch slots, defaults 4 / 32 (same as the Worker)
+ *   INGEST_MAX_PER_USER / INGEST_MAX_PER_ORG   in-flight batch slots, defaults 4 / 32 (same as the Worker). With
+ *                                    INGEST_LEDGER=s3: an in-memory limit PER REPLICA (tenant-limiter.ts), no SQL
  *   RELAYHISTORY_INGEST_PG_POOL_MAX  pool size, 1..32, default 4
  *   INGEST_CLAIM_LOCK_BUSY           unset/off (default) | on (any case, trimmed; the Worker's routingFlag, so any
  *                                    other value is off, as on the Worker): a claim that loses its lock wait

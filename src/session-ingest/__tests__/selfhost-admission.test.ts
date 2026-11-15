@@ -236,3 +236,42 @@ describe("#405 INGEST_CLAIM_LOCK_BUSY through the self-host consumer", () => {
     await consumer.stop();
   });
 });
+
+describe("deferTenantLimit (INGEST_LEDGER=s3 only)", () => {
+  async function run(deferTenantLimit: boolean | undefined) {
+    const fs = scratchStore();
+    cleanups.push(fs.done);
+    const ledger = new MemoryLedger();
+    ledger.acquireSlot = async () => ({ ok: false, retryAfterSeconds: 7 });
+    const prepared = await prepareDelivery(TENANT, await batch([record({ record_id: "slot-1" })]));
+    const clock = Date.now();
+    const key = await enqueueAdmission({ store: fs.store, keyRoot: "96bulls", enqueue: async () => {} }, TENANT, prepared, clock, 0);
+    const lines: Record<string, unknown>[] = [];
+    const sink = (_m: string, f: Record<string, unknown> = {}) => void lines.push(f);
+    const consumer = selfhostAdmissionConsumer({
+      mode: "on", concurrency: 1, scanIntervalMs: 15_000, maxAttempts: 1, nowMs: () => clock, log: { info: sink, warn: sink, error: sink },
+      deliver: { ledger, acceptanceMode: "canonical", target: { store: fs.store, keyRoot: "96bulls" }, slots: { maxPerUser: 4, maxPerOrg: 32, ttlSeconds: 90 } },
+      ...(deferTenantLimit === undefined ? {} : { deferTenantLimit }),
+    });
+    await consumer.scan();
+    await consumer.settle();
+    const dead = await fs.store.head(deadLetterKey("96bulls", key) as never);
+    await consumer.stop();
+    return { lines: lines.filter((l) => l.route === "ingest.admission").map(({ duration_ms: _d, ...rest }) => rest), dead };
+  }
+
+  test("absent (the SQL ledger): a slot refusal is an ordinary retry that counts toward maxAttempts, unchanged", async () => {
+    const r = await run(undefined);
+    expect(r.lines).toEqual([
+      { route: "ingest.admission", outcome: "retry", error_code: "delivery_busy", attempt: 1 },
+      { route: "ingest.admission", outcome: "dead_lettered", error_code: "delivery_busy", attempt: 1 },
+    ]);
+    expect(r.dead).toBeDefined();
+  });
+
+  test("true: a slot refusal defers the object (no attempt consumed, never dead-lettered)", async () => {
+    const r = await run(true);
+    expect(r.lines).toEqual([{ route: "ingest.admission", outcome: "deferred", error_code: "tenant_limit", attempt: 1 }]);
+    expect(r.dead).toBeUndefined();
+  });
+});

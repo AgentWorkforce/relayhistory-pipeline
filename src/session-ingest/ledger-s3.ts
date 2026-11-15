@@ -88,6 +88,7 @@ import {
 } from "./ledger.ts";
 import { MAX_DELIVERY_CONFLICTS } from "./vendor/delivery/delivery-contracts.ts";
 import { assertTenantSegment, backoffMs, liveMachineId } from "./writer.ts";
+import type { TenantLimiter } from "./tenant-limiter.ts";
 
 // ---- INGEST_LEDGER ----
 
@@ -602,6 +603,13 @@ export interface S3LedgerOptions {
    * it, and until then every entry is judged as before (resetsCompleted). Its answer counts nothing (0).
    */
   resetBeginOnly?: boolean;
+  /**
+   * The per-tenant upload limit (tenant-limiter.ts): `acquireSlot` / `releaseSlot` count this process's in-flight
+   * admissions per org and per (org, user), with no store or database call. Self-host (selfhostS3Ledger) always
+   * sets one per replica. Absent: no limit (the hosted Lambda: reserved concurrency and SQS batch size 1 bound it,
+   * and its deliver deps take no slot).
+   */
+  tenantLimiter?: TenantLimiter;
   nowMs?: () => number;
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
@@ -1252,9 +1260,10 @@ export function s3Ledger(store: ObjectStore, keyRoot: string, opts: S3LedgerOpti
       return { rearmed: fenced.length };
     },
 
-    // Decision 0005: no tenant slots. The Lambda's reserved concurrency and SQS batch size bound it.
-    async acquireSlot() { return { ok: true }; },
-    async releaseSlot() {},
+    // Decision 0005: no slot table. With a tenant limiter (self-host), an in-process cap per replica; without one
+    // (the hosted Lambda), none: its reserved concurrency and SQS batch size bound it.
+    async acquireSlot(request) { return opts.tenantLimiter ? opts.tenantLimiter.acquire(request) : { ok: true }; },
+    async releaseSlot(tenant, holder) { opts.tenantLimiter?.release(tenant, holder); },
 
     async setSessionUploads(input: SelectionInput): Promise<void> {
       await applySelection(input);

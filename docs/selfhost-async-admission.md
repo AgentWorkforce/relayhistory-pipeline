@@ -72,7 +72,9 @@ There is no queue self-host. The consumer runs in the same Node process, and eve
 - **Bounded.** `SELFHOST_ADMISSION_CONCURRENCY` (default 4) objects in flight per process, oldest
   upload first. Each object backs off on its own: the hosted 15 s to 5 min by attempt, the slot's
   `Retry-After`, 15 s for a pending privacy control, 5 min for a malformed object. The tenant slots
-  (`INGEST_MAX_PER_USER` / `_ORG`) still apply inside the claim.
+  (`INGEST_MAX_PER_USER` / `_ORG`) still apply inside the claim. With `INGEST_LEDGER=s3` they are the
+  per-replica in-memory limit (`tenant-limiter.ts`, `docs/selfhost-composition.md` section 5), and a
+  refusal at the cap is a deferral that does not count toward the dead-letter attempts.
 - **Dead letters.** After `SELFHOST_ADMISSION_MAX_ATTEMPTS` failures (default 20, the hosted queue's
   max retries) in one process, the consumer writes a marker at
   `<keyRoot>/.admission-dlq/<the inbox path>.json` holding `{v, kind, code, attempts, atMs}`. It holds

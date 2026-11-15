@@ -43,6 +43,7 @@ import { INBOX_NAMESPACE, pendingAdmissions } from "./async-admission.ts";
 import { lockAlertFields } from "./app.ts";
 import type { DeliverDeps } from "./deliver.ts";
 import { uploadInboxRoot, type PromoteResult } from "./upload-admission.ts";
+import { DeliveryBusyError } from "./vendor/delivery/delivery-contracts.ts";
 
 export const DEAD_LETTER_NAMESPACE = ".admission-dlq";
 export const DEAD_LETTER_RETENTION_MS = 14 * 24 * 3600 * 1000;
@@ -81,6 +82,13 @@ export interface SelfhostAdmissionOptions {
   uploadInbox?: { promote: (key: string) => Promise<PromoteResult>; batchSize: number };
   /** INGEST_UPLOAD_CONSENT (upload-consent.ts): re-checked at admission, at the current policy. */
   uploadConsent?: UploadConsentConfig;
+  /**
+   * INGEST_LEDGER=s3 (tenant-limiter.ts): a refusal by the per-replica tenant limit (429 `delivery_busy`, lock
+   * `tenant_slots`) is a DEFERRAL: the object stays in the inbox, is retried after the limit's Retry-After, and the
+   * attempt does not count toward `maxAttempts`, so a busy tenant is never dead-lettered. Absent (the SQL ledger):
+   * a slot refusal is an ordinary retry, unchanged.
+   */
+  deferTenantLimit?: boolean;
 }
 
 export interface SelfhostAdmissionStatus {
@@ -236,6 +244,13 @@ export function selfhostAdmissionConsumer(opts: SelfhostAdmissionOptions): Selfh
       logger.info("session ingest admission", { route: "ingest.admission", outcome: r.outcome, error_code: r.code, duration_ms: Date.now() - t0, ...(r.lagMs !== undefined ? { offset: r.lagMs } : {}), attempt: entry.attempts, ...timing });
       entries.delete(key);
       if (marked.delete(key)) await store.delete(objectKey(deadLetterKey(keyRoot, key))).catch(() => {});
+      return;
+    }
+    if (opts.deferTenantLimit && r.error instanceof DeliveryBusyError && r.error.lock === "tenant_slots") {
+      // At the tenant cap: wait for a slot. Nothing was written past the pending claim, which the retry resumes.
+      entry.attempts -= 1;
+      entry.notBefore = now() + r.delaySeconds * 1000;
+      logger.info("session ingest admission", { route: "ingest.admission", outcome: "deferred", error_code: "tenant_limit", duration_ms: Date.now() - t0, attempt: entry.attempts + 1 });
       return;
     }
     const fields: Record<string, unknown> = { route: "ingest.admission", outcome: "retry", error_code: r.code, ...(r.stage ? { stage: r.stage } : {}), duration_ms: Date.now() - t0, attempt: entry.attempts };
