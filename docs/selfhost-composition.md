@@ -80,6 +80,11 @@ dormant; any other value fails startup.
   default, `--apply` to write, refused unless the Locker is GCS, and it
   re-stamps only rows in `LOCKER_BUCKET` whose manifest the GCS Locker holds.
   Its header lists the env, the owner login it needs and the exit codes.
+  Sessions an older consumer projected with 1970-01-01 event times (a Claude
+  record with `ts_ms` 0) are marked for re-projection by
+  `src/session-pipeline/epoch-event-time-repair.ts` (plan by default,
+  `--apply` to mark); the consumer's freshness check then re-projects them.
+  See `runbooks/epoch-event-time-repair.md`.
 
 ### `SERVICE=session-erase-bytes`
 
