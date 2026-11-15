@@ -148,7 +148,7 @@ describe("session read api: inputs, grants and env", () => {
     expect(Object.keys(env).filter((k) => k !== "RELAYAUTH_JWKS_URL").some((k) => /PASSWORD|KEY$|TOKEN|URL$/.test(k))).toBe(false);
   });
 
-  test("summary reads: env present only when switched on, exactly \"true\"; inputs are booleans", () => {
+  it("summary reads: env present only when switched on, exactly \"true\"; inputs are booleans", () => {
     const names = sessionReadApiNames(STAGE);
     for (const p of [{ completeSince: "epoch" }, { completeSince: "epoch", briefSummary: false, listShortSummary: false }]) {
       const env = sessionReadApiEnv({ stage: STAGE, names, p }) as Record<string, string>;
